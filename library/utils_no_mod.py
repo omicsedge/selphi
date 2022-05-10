@@ -192,19 +192,19 @@ def create_composite_ref_panel(
 
     ordered_hap_indices = {}
     ordered_matches = {}
-    lengtho = 1000
+    lengtho = 100
 
     for i in trange(0, BJ.shape[1]):
         y = np.where(
             BJ[:,i] >= np.percentile(BJ[:,i],0)
         )[0]
-        if i < 14700 and i > 100:
-            y =  np.where(
-                BJ[y,i] >= 10
-            )[0]
-            y =  np.where(
-                BI[y,i] >= 10
-            )[0]
+        # if i < 14700 and i > 100:
+        #     y =  np.where(
+        #         BJ[y,i] >= 10
+        #     )[0]
+        #     y =  np.where(
+        #         BI[y,i] >= 10
+        #     )[0]
         if len(list(y)) < 5:
             y =  np.where(
                 BJ[:,i] >= 0
@@ -231,13 +231,13 @@ def create_composite_ref_panel(
 
     for i in trange(0, BI.shape[1]):
         y = np.where(BI[:,i] >= np.percentile(BI[:,i],0))[0]
-        if i < 14700 and i > 100:
-            y =  np.where(
-                BI[y,i] >= 10
-            )[0]
-            y =  np.where(
-                BJ[y,i] >= 10
-            )[0]
+        # if i < 14700 and i > 100:
+        #     y =  np.where(
+        #         BI[y,i] >= 10
+        #     )[0]
+        #     y =  np.where(
+        #         BJ[y,i] >= 10
+        #     )[0]
         if len(list(y)) < 5:
             y =  np.where(
                 BI[:,i] >= 0
@@ -267,12 +267,12 @@ def create_composite_ref_panel(
         indicies_max_matches, np.where(indicies_max_matches == 0), axis=0
     )
 
-    full_constructed_panel = np.zeros(
-        (1647102, haploid_number + len(indicies_max_matches)), dtype=np.int16
-    )
-    matches_for_haps = np.ones(
-        (1647102, haploid_number + len(indicies_max_matches)), dtype=np.int16
-    )
+    # full_constructed_panel = np.zeros(
+    #     (1647102, haploid_number + len(indicies_max_matches)), dtype=np.int16
+    # )
+    # matches_for_haps = np.ones(
+    #     (1647102, haploid_number + len(indicies_max_matches)), dtype=np.int16
+    # )
     all_haps = []
     for co, starting_idx in enumerate(tqdm(indicies_max_matches)):
         final_haps = []
@@ -302,27 +302,27 @@ def create_composite_ref_panel(
         # print(final_haps)
         all_haps.append(final_haps)
         # print(final_haps)
-        full_constructed_panel[:, co] = construct_full_hap(
-            original_ref_panel, original_indicies, final_haps
-        )
-        matches_for_haps[:, co] = construct_full_hap_matches(
-            matches_for_haps, original_indicies, final_haps
-        )
+        # full_constructed_panel[:, co] = construct_full_hap(
+        #     original_ref_panel, original_indicies, final_haps
+        # )
+        # matches_for_haps[:, co] = construct_full_hap_matches(
+        #     matches_for_haps, original_indicies, final_haps
+        # )
 
-    for j in trange(
-        len(indicies_max_matches), len(indicies_max_matches) + haploid_number
-    ):
-        haps_matches_tuple_list = recursive_again(BJ, 0, 0, [])
-        # print(haps_matches_tuple_list)
-        # break
-        full_constructed_panel[:, j] = construct_full_hap(
-            original_ref_panel, original_indicies, haps_matches_tuple_list
-        )
-        matches_for_haps[:, j] = construct_full_hap_matches(
-            matches_for_haps, original_indicies, haps_matches_tuple_list
-        )
-        all_haps.append(haps_matches_tuple_list)
-    return (all_haps, full_constructed_panel, matches_for_haps)
+    # for j in trange(
+    #     len(indicies_max_matches), len(indicies_max_matches) + haploid_number
+    # ):
+    #     haps_matches_tuple_list = recursive_again(BJ, 0, 0, [])
+    #     # print(haps_matches_tuple_list)
+    #     # break
+    #     full_constructed_panel[:, j] = construct_full_hap(
+    #         original_ref_panel, original_indicies, haps_matches_tuple_list
+    #     )
+    #     matches_for_haps[:, j] = construct_full_hap_matches(
+    #         matches_for_haps, original_indicies, haps_matches_tuple_list
+    #     )
+    #     all_haps.append(haps_matches_tuple_list)
+    return (all_haps, None, None)
 
 
 def create_weight_matrix(all_haps):
@@ -379,10 +379,10 @@ def interpolate_(
     full_constructed_panel = np.zeros((1647102, 2), dtype=np.float32)
 
 
-    for i in trange(0,1000):
+    for i in trange(0,14777):
         temp_haps = []
         for j in range(0,weight_matrix.shape[0]):
-            if weight_matrix[j, i+1] == 0 and weight_matrix[j, i] == 0:
+            if weight_matrix[j, i+1] < 1/weight_matrix.shape[0] and weight_matrix[j, i] < 1/weight_matrix.shape[0]:
                 continue
             # if (weight_matrix[j, i],weight_matrix[j, i+1]) in temp_haps:
             #     continue
