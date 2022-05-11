@@ -12,6 +12,24 @@ except ModuleNotFoundError:
 ordered_matches = OrderedDict()
 ordered_matches_reverse = OrderedDict()
 
+def get_best_break_points(ordered_matches, BJ, num=25):
+    haps = [ordered_matches[x][0] for x in range(0,len(ordered_matches.keys()))]
+    temp = []
+    haps_ = []
+    for i in haps:
+        if i not in temp:
+            temp.append(i)
+            haps_.append(i)
+        else:
+            haps_.append(-1)
+    matches = []
+    for c,i in enumerate(haps_):
+        if i != -1:
+            matches.append(BJ[i,c])
+        else:
+            matches.append(-1)
+    return list(np.argsort(np.array(matches)))[::-1][:num]
+
 
 def recursive_again(
     BJ,
@@ -192,7 +210,7 @@ def create_composite_ref_panel(
 
     ordered_hap_indices = {}
     ordered_matches = {}
-    lengtho = 100
+    lengtho = 25
 
     for i in trange(0, BJ.shape[1]):
         y = np.where(
@@ -262,6 +280,7 @@ def create_composite_ref_panel(
             int(dd[0]) for e in sorted_by_second for dd in sorted_by_second[e]
         ]
 
+    indicies_max_matches = get_best_break_points(ordered_matches, BJ)
     indicies_max_matches = np.array(indicies_max_matches)
     indicies_max_matches = np.delete(
         indicies_max_matches, np.where(indicies_max_matches == 0), axis=0
@@ -406,6 +425,120 @@ def interpolate_(
             )
     result = (full_constructed_panel[:,0] > full_constructed_panel[:,1]).astype(np.int16)
     return result
+
+#####################################
+###          DATA_LOAD            ###
+###                               ###
+#####################################
+import collections
+
+def list_duplicates_of(seq,item):
+    start_at = -1
+    locs = []
+    while True:
+        try:
+            loc = seq.index(item,start_at+1)
+        except ValueError:
+            break
+        else:
+            locs.append(loc)
+            start_at = loc
+    return locs
+
+def deduplicate(chip_id_list, full_id_list, chip_positions):
+    duplicate_pos = ([item for item, count in collections.Counter(chip_positions).items() if count > 1])
+    duplicate_indexs = []
+    none = [[duplicate_indexs.append(y) for y in list_duplicates_of(chip_positions, x)] for x in duplicate_pos]
+    chip_id_list = list(np.delete(np.array(chip_id_list),duplicate_indexs))
+    original_indicies = [full_id_list.index(x) for x in chip_id_list]
+    return (chip_id_list, original_indicies)
+
+
+#####################################
+###          PLOT_RESULTS         ###
+###                               ###
+#####################################
+import pandas as pd
+import pickle
+import matplotlib.pyplot as plt
+from matplotlib.pyplot import figure
+from data_utils import get_sample_index
+
+def get_beagle_res(file_name):
+    beagle_array = pd.read_csv(file_name, sep="\t", header=None, comment="#")
+    beagle_array.drop([0,1,3,4,5,6,7,8],axis=1,inplace=True)
+    concat_beagle = pd.concat([
+        beagle_array.applymap(lambda x: str(x).split(":")[0].replace("/","|").split("|")[0]),
+        beagle_array.applymap(lambda x: str(x).split(":")[0].replace("/","|").split("|")[-1]),
+    ],axis=1)
+    concat_beagle.drop([2],axis=1,inplace=True)
+    concat_beagle.columns = [0,1]
+    return concat_beagle
+
+def plot_results(
+    samples,
+    folder_dict,
+    ref_panel_full_array_full,
+    target_full_array,
+    original_indicies,
+):
+
+    START = 0
+    END = -1
+    for c, sample in enumerate(samples):
+        sample_index = get_sample_index(sample)
+        target_full_array[:,0] = ref_panel_full_array_full[:,sample_index[0]]
+        target_full_array[:,1] = ref_panel_full_array_full[:,sample_index[1]]
+
+        indicies_for_comparison = np.where(
+        (np.sum(ref_panel_full_array_full,axis=1) >0) & 
+        # (np.sum(ref_panel_full_array_full,axis=1) > 0)  &
+        (np.sum(target_full_array,axis=1) >= 0))[0]
+        combined_target_full = target_full_array[:,0] + target_full_array[:,1]
+
+        print(sample)
+        results = {}
+        res = {}
+        new_x = target_full_array[:,0] + target_full_array[:,1]
+        for key in folder_dict.keys():
+            if key != "beagle":
+                with open(f"{folder_dict[key]}saved_dictionary_{sample}_new_method.pkl", "rb") as fp:   # Unpickling
+                    results[key] = pickle.load(fp)
+            else:
+                results[key] = get_beagle_res(f"{folder_dict[key]}{sample}_BEAGLE_5.4_mapYES_neYES.vcf.gz")
+                beagle_0 = results[key][0].to_numpy().astype(int)
+                beagle_1 = results[key][1].to_numpy().astype(int)
+                results[key] = {sample:[beagle_0,beagle_1]}
+            
+            arr__1 = results[key][sample][0]
+            arr__2 = results[key][sample][1]
+            # arr__1[original_indicies] = target_full_array[original_indicies,0]
+            # arr__2[original_indicies] = target_full_array[original_indicies,1]
+
+            y = arr__1 + arr__2
+            print(f"COMBINED {key} ERROR: {int(y.shape - np.sum(new_x == y))}\nTOTAL IMPUTED SEGMENT LENGTH: {y.shape[0]}")
+            print()
+            combined_results = arr__1 + arr__2
+            
+            STEP_LENGTH = 500
+            MAX_LENGTH = y.shape[0]-STEP_LENGTH
+            lengths = list(range(STEP_LENGTH,MAX_LENGTH,STEP_LENGTH))
+            for LENGTH in lengths:
+                res.setdefault(key, []).append(LENGTH - np.sum( combined_target_full[:LENGTH] == combined_results[:LENGTH] ))
+
+        fig, ax = plt.subplots(figsize=(16,8))    # to create the picture plot empty  
+        for key in folder_dict.keys(): 
+            
+            plt.plot(lengths, res[key], label = f"{key}")
+
+        ax.set_xlabel("Segment Lengths",fontsize=10)
+        ax.set_ylabel("Wrongly imputed variants",fontsize=10)
+        plt.rcParams['axes.facecolor']='white'
+        plt.rcParams['savefig.facecolor']='white'
+        plt.legend()
+
+        plt.show()
+            # plt.savefig(f'image_name_{sample}_new.jpg',format="jpg",dpi=200,transparent=True,bbox_inches='tight')
 
 #####################################
 ###            B-PBWT             ###
