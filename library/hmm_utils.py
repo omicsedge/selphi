@@ -128,7 +128,7 @@ def pRecomb(
     ordered_matches,
     BJ,
     distances_cm,
-    num_hid=7000,
+    num_hid=6400,
     ne=1000000,
     ):
     """

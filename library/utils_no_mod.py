@@ -1,3 +1,4 @@
+#from black import Result
 from hmm_utils import forward, create_composite_chip_panel
 import numpy as np
 from tqdm import trange, tqdm
@@ -12,7 +13,7 @@ except ModuleNotFoundError:
 ordered_matches = OrderedDict()
 ordered_matches_reverse = OrderedDict()
 
-def get_best_break_points(ordered_matches, BJ, num=25):
+def get_best_break_points(ordered_matches, BJ, num=200, sep=50):
     haps = [ordered_matches[x][0] for x in range(0,len(ordered_matches.keys()))]
     temp = []
     haps_ = []
@@ -28,7 +29,16 @@ def get_best_break_points(ordered_matches, BJ, num=25):
             matches.append(BJ[i,c])
         else:
             matches.append(-1)
-    return list(np.argsort(np.array(matches)))[::-1][:num]
+    indicies_max_matches_set = list(np.argsort(np.array(matches)))[::-1]
+    indicies_max_matches_set_new = []
+    for c,i in enumerate(indicies_max_matches_set):
+            flago = True
+            for j in range(0,c):
+                if abs(indicies_max_matches_set[j] - i) < sep:
+                    flago = False
+            if flago:
+                indicies_max_matches_set_new.append(i)
+    return indicies_max_matches_set_new[:num]
 
 
 def recursive_again(
@@ -210,7 +220,7 @@ def create_composite_ref_panel(
 
     ordered_hap_indices = {}
     ordered_matches = {}
-    lengtho = 25
+    lengtho = 13
 
     for i in trange(0, BJ.shape[1]):
         y = np.where(
@@ -490,34 +500,44 @@ def plot_results(
         target_full_array[:,0] = ref_panel_full_array_full[:,sample_index[0]]
         target_full_array[:,1] = ref_panel_full_array_full[:,sample_index[1]]
 
+        print(sample)
+
+        control = get_beagle_res(f"/home/ec2-user/adriano/imputation/phase3/selphi-2/data/validation_data/genome_individuals/{sample}.individual.30x.full_genome_20.vcf.gz")
+        control_0 = control[0].to_numpy().astype(int)
+        control_1 = control[1].to_numpy().astype(int)
+
+        if np.array_equal(target_full_array[:,0],control_0) and np.array_equal(target_full_array[:,1],control_1):
+            print("Control Passed! all good! :)") 
+        else:
+            print("ERROR: Beagle and Selphi are using 2 different input data. Results will be misleading! :(")
+
         indicies_for_comparison = np.where(
         (np.sum(ref_panel_full_array_full,axis=1) >0) & 
         # (np.sum(ref_panel_full_array_full,axis=1) > 0)  &
         (np.sum(target_full_array,axis=1) >= 0))[0]
         combined_target_full = target_full_array[:,0] + target_full_array[:,1]
 
-        print(sample)
         results = {}
         res = {}
         new_x = target_full_array[:,0] + target_full_array[:,1]
+
         for key in folder_dict.keys():
             if key != "beagle":
                 with open(f"{folder_dict[key]}saved_dictionary_{sample}_new_method.pkl", "rb") as fp:   # Unpickling
                     results[key] = pickle.load(fp)
             else:
-                results[key] = get_beagle_res(f"{folder_dict[key]}{sample}_BEAGLE_5.4_mapYES_neYES.vcf.gz")
+                results[key] = get_beagle_res(f"{folder_dict[key]}{sample}_BEAGLE_5.4_mapYES_neYES_validated.vcf.gz")
                 beagle_0 = results[key][0].to_numpy().astype(int)
                 beagle_1 = results[key][1].to_numpy().astype(int)
                 results[key] = {sample:[beagle_0,beagle_1]}
-            
+
             arr__1 = results[key][sample][0]
             arr__2 = results[key][sample][1]
             # arr__1[original_indicies] = target_full_array[original_indicies,0]
             # arr__2[original_indicies] = target_full_array[original_indicies,1]
 
             y = arr__1 + arr__2
-            print(f"COMBINED {key} ERROR: {int(y.shape - np.sum(new_x == y))}\nTOTAL IMPUTED SEGMENT LENGTH: {y.shape[0]}")
-            print()
+            print(f"COMBINED {key} ERROR: {int(y.shape - np.sum(new_x == y))}")
             combined_results = arr__1 + arr__2
             
             STEP_LENGTH = 500
@@ -525,7 +545,7 @@ def plot_results(
             lengths = list(range(STEP_LENGTH,MAX_LENGTH,STEP_LENGTH))
             for LENGTH in lengths:
                 res.setdefault(key, []).append(LENGTH - np.sum( combined_target_full[:LENGTH] == combined_results[:LENGTH] ))
-
+        print()
         fig, ax = plt.subplots(figsize=(16,8))    # to create the picture plot empty  
         for key in folder_dict.keys(): 
             
