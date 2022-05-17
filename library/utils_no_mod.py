@@ -13,7 +13,7 @@ except ModuleNotFoundError:
 ordered_matches = OrderedDict()
 ordered_matches_reverse = OrderedDict()
 
-def get_best_break_points(ordered_matches, BJ, num=200, sep=50):
+def get_best_break_points(ordered_matches, BJ, num=400, sep=15):
     haps = [ordered_matches[x][0] for x in range(0,len(ordered_matches.keys()))]
     temp = []
     haps_ = []
@@ -73,13 +73,13 @@ def recursive_again(
 
 def reverse_recursive_again(
     BI,
-    starting_index=14777,
+    starting_index=None,
     number_of_matches=0,
     haps_matches_tuple_list=[],
 ):
     global ordered_matches_reverse
 
-    if starting_index == 14777 and number_of_matches == 0:
+    if starting_index == BI.shape[1] - 1 and number_of_matches == 0:
         current_index = BI.shape[1] - 1
     else:
         current_index = int(starting_index - number_of_matches)
@@ -111,6 +111,7 @@ def reverse_recursive_again(
 
 def construct_full_hap(original_ref_panel, original_indicies, haps_matches_tuple_list):
     """ """
+    num_chip = len(original_indicies)
     full_constructed_hap = []
     full_constructed_hap.append(
         original_ref_panel[
@@ -123,7 +124,7 @@ def construct_full_hap(original_ref_panel, original_indicies, haps_matches_tuple
         # print(current_index)
         # print(matches)
         # print('--')
-        if current_index + matches != 14778:
+        if current_index + matches != num_chip:
             full_constructed_hap.append(
                 original_ref_panel[
                     original_indicies[current_index] : original_indicies[
@@ -157,6 +158,7 @@ def construct_full_hap_matches(
     original_ref_panel, original_indicies, haps_matches_tuple_list
 ):
     """ """
+    num_chip = len(original_indicies)
     hap = original_ref_panel.shape[1] - 1
     full_constructed_hap = []
     full_constructed_hap.append(
@@ -171,7 +173,7 @@ def construct_full_hap_matches(
         # print(current_index)
         # print(matches)
         # print('--')
-        if current_index + matches != 14778:
+        if current_index + matches != num_chip:
             full_constructed_hap.append(
                 original_ref_panel[
                     original_indicies[current_index] : original_indicies[
@@ -220,23 +222,12 @@ def create_composite_ref_panel(
 
     ordered_hap_indices = {}
     ordered_matches = {}
-    lengtho = 13
+    lengtho = 9
 
     for i in trange(0, BJ.shape[1]):
         y = np.where(
             BJ[:,i] >= np.percentile(BJ[:,i],0)
         )[0]
-        # if i < 14700 and i > 100:
-        #     y =  np.where(
-        #         BJ[y,i] >= 10
-        #     )[0]
-        #     y =  np.where(
-        #         BI[y,i] >= 10
-        #     )[0]
-        if len(list(y)) < 5:
-            y =  np.where(
-                BJ[:,i] >= 0
-            )[0]
         x = BJ[y, i]
         new_index = y[np.argsort(x)[::-1]]  # Descending
         ordered_matches[i] = BJ[new_index, i][:lengtho]
@@ -259,13 +250,6 @@ def create_composite_ref_panel(
 
     for i in trange(0, BI.shape[1]):
         y = np.where(BI[:,i] >= np.percentile(BI[:,i],0))[0]
-        # if i < 14700 and i > 100:
-        #     y =  np.where(
-        #         BI[y,i] >= 10
-        #     )[0]
-        #     y =  np.where(
-        #         BJ[y,i] >= 10
-        #     )[0]
         if len(list(y)) < 5:
             y =  np.where(
                 BI[:,i] >= 0
@@ -354,9 +338,9 @@ def create_composite_ref_panel(
     return (all_haps, None, None)
 
 
-def create_weight_matrix(all_haps):
+def create_weight_matrix(all_haps, num_chip=14778):
 
-    composite_chip_panel, composite_chip_matches = create_composite_chip_panel(all_haps, 14778)
+    composite_chip_panel, composite_chip_matches = create_composite_chip_panel(all_haps, num_chip)
     weight_matrix_lists = []
     # weight_matrix_lists.append(np.full((composite_chip_matches.shape[0],1), 1/composite_chip_matches.shape[0]))
     [weight_matrix_lists.append(np.expand_dims((composite_chip_matches[:,i]/sum(composite_chip_matches[:,i])),axis=1)) for i in range(0,composite_chip_matches.shape[1])]
@@ -368,8 +352,9 @@ def interpolate(
     original_indicies,
     original_ref_panel,
 ):  
+    num_chip = len(original_indicies)
     full_constructed_panel = np.zeros((1647102, 2), dtype=np.float32)
-    composite_chip_panel, weight_matrix = create_weight_matrix(all_haps)
+    composite_chip_panel, weight_matrix = create_weight_matrix(all_haps,num_chip)
 
 
     for i in trange(0,weight_matrix.shape[1]-1):
@@ -405,10 +390,11 @@ def interpolate_(
     original_indicies,
     original_ref_panel,
 ):  
+    num_chip = len(original_indicies)
     full_constructed_panel = np.zeros((1647102, 2), dtype=np.float32)
 
 
-    for i in trange(0,14777):
+    for i in trange(0,num_chip-1):
         temp_haps = []
         for j in range(0,weight_matrix.shape[0]):
             if weight_matrix[j, i+1] < 1/weight_matrix.shape[0] and weight_matrix[j, i] < 1/weight_matrix.shape[0]:

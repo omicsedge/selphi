@@ -9,7 +9,7 @@ def get_transition_matrix(
     states_1,
     states_2,
     chip_positions_dedup,
-    num_hid=6400,
+    num_hid=5000,
     ne=1000000,
     reverse=False
     ):
@@ -128,17 +128,18 @@ def pRecomb(
     ordered_matches,
     BJ,
     distances_cm,
+    recomb_intensity,
+    max_intensity,
+    min_intensity,
     num_hid=6400,
     ne=1000000,
     ):
     """
     pRecomb betweem obs and and obs-1
     """
-    # param = max([len(np.unique(BJ[ordered_matches[x],x])) for x in range(obs,obs+1)])*2.5
+    if obs < 7000 and obs > 5000:
+        num_hid = 300
     N = num_hid
-    # dm = (
-    #     int(chip_positions_dedup[obs]) - int(chip_positions_dedup[obs -1])
-    # ) * (1/1000000)
     dm = distances_cm[obs] - distances_cm[obs-1]
     if dm == 0:
         dm = 0.0000001
@@ -147,7 +148,7 @@ def pRecomb(
         
     return tao_m
 
-def setFwdValues(num_obs, ordered_matches, chip_positions_dedup,BI, BJ,pnoerr_matrix,distances_cm):
+def setFwdValues(num_obs, ordered_matches, chip_positions_dedup,BI, BJ,pnoerr_matrix,distances_cm, recomb_intensity):
     """
     set forward values
     """
@@ -166,7 +167,7 @@ def setFwdValues(num_obs, ordered_matches, chip_positions_dedup,BI, BJ,pnoerr_ma
         # match_sum = []
         # _ = [match_sum.append(int(BJ[ordered_matches[m][x], m])) for x in range(0,len(ordered_matches[m]))]
         #endmymod
-        pRecomb_var = pRecomb(m, chip_positions_dedup, ordered_matches,BJ,distances_cm)
+        pRecomb_var = pRecomb(m, chip_positions_dedup, ordered_matches,BJ,distances_cm,recomb_intensity,None,None)
         shift = pRecomb_var/nHaps
         scale = (1 - pRecomb_var)/lastSum
         # sum = 0
@@ -200,7 +201,7 @@ def setFwdValues(num_obs, ordered_matches, chip_positions_dedup,BI, BJ,pnoerr_ma
         lastSum = sum(alpha[m,:])
     return alpha
 
-def setBwdValues(alpha, num_obs, ordered_matches, chip_positions_dedup, BJ,pnoerr_matrix,distances_cm):
+def setBwdValues(alpha, num_obs, ordered_matches, chip_positions_dedup, BJ,pnoerr_matrix,distances_cm, recomb_intensity):
     """
     set backward values
     """
@@ -213,7 +214,7 @@ def setBwdValues(alpha, num_obs, ordered_matches, chip_positions_dedup, BJ,pnoer
     pErr = 0.0001
     pNoErr = 1 - pErr
     for m in trange(end - 2, 0, -1):
-        pRecomb_var = pRecomb(m + 1, chip_positions_dedup, ordered_matches,BJ,distances_cm)
+        pRecomb_var = pRecomb(m + 1, chip_positions_dedup, ordered_matches,BJ,distances_cm,recomb_intensity,None,None)
         shift = pRecomb_var/nHaps
         scale = (1 - pRecomb_var)/lastSum
         bwdValSum = 0
