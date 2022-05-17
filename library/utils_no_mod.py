@@ -223,7 +223,7 @@ def create_composite_ref_panel(
     ordered_hap_indices = {}
     ordered_matches = {}
     lengtho = 9
-
+    matches = BI[:,:] - 1 + BJ[:,:]
     for i in trange(0, BJ.shape[1]):
         y = np.where(
             BJ[:,i] >= np.percentile(BJ[:,i],0)
