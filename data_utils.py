@@ -1,3 +1,8 @@
+import os
+from functools import lru_cache
+import csv
+from typing import Tuple
+
 import numpy as np
 import pandas as pd
 import zarr
@@ -72,24 +77,33 @@ def remove_sample_from_ref(
 
     return ref_numpy_arr
 
+@lru_cache(100)
+def _load_samples_list(samples_list_path: str):
+    with open(samples_list_path) as f:
+        return f.read().splitlines()
 
 def get_sample_index(
     sample_name,
     samples_txt_path="./data/samples_HG00096_REMOVED.txt",
-):
-    """ """
-    df = pd.read_csv(samples_txt_path, header=None)
-    # print(df.shape[0])
-    indexes = df.index[df[0] == sample_name].tolist()
-    indexes.append(indexes[0] + df.shape[0])
-
-    return indexes
+) -> Tuple[int, int]:
+    """
+    kukrefactored
+    Returns a tuple of two values:
+     - the index of the given sample name from the samples list of size `n` from a given file,
+     - the same index + n
+    """
+    samples_list = _load_samples_list(os.path.abspath(samples_txt_path))
+    try:
+        index = samples_list.index(sample_name)
+    except ValueError as e:
+        raise ValueError(f'given sample name {sample_name} is missing from the samples list at "{samples_txt_path}"') from e
+    return (index, len(samples_list) + index)
 
 def remove_all_samples(
     ref_numpy_arr,
     ref_samples="./new_data/SI_data/samples.txt",
     samples_tobe_removed="./data/beagle_data/imputed_samples.txt"
-):
+) -> np.ndarray:
     indexes = []
     with open(samples_tobe_removed, mode="r") as f:
         lines = f.readlines()

@@ -1,4 +1,5 @@
 
+import numpy as np
 from hmm_utils import setFwdValues, setBwdValues
 from utils import (
     interpolate_parallel,
@@ -40,7 +41,7 @@ def run_hmm(
         post = setBwdValues(
             alpha.copy(), num_obs, ordered_hap_indices, length_matches_normalized, distances_cm, num_hid=num_hid
         )
-        resultoo_fb = interpolate_parallel_packed(post.T, original_indicies, ref_panel_full_array, chr_length, start_imputation, end_imputation)
+        resultoo_fb: np.ndarray = interpolate_parallel_packed(post.T, original_indicies, ref_panel_full_array, chr_length, start_imputation, end_imputation)
     else:
         return None
     return resultoo_fb

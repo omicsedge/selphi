@@ -1,3 +1,5 @@
+import os
+
 #from black import Result
 import numpy as np
 from tqdm import trange, tqdm
@@ -669,3 +671,36 @@ def get_matches_indices(ppa_matrix, div_matrix, target=6401):
         forward_pbwt_matches[:, i] = replace_col(div_matrix[:, i], i, hap_index)
         forward_pbwt_hap_indices.append(hap_index)
     return (forward_pbwt_matches.astype(int), forward_pbwt_hap_indices)
+
+
+def forced_open(file, mode='r'):
+    """
+    Wrapper around standard python `open`.
+    If the file's leaf directory doesn't exist, it creates all intermediate-level directories.
+    """
+    the_dir = os.path.dirname(os.path.abspath(file))
+    if not os.path.isdir(the_dir):
+        os.makedirs(the_dir)
+    return open(file, mode)
+
+def skip_duplicates(seq):
+    """Returns a list of only first occurrences of unique values from the input sequence"""
+    seen = set()
+    seen_add = seen.add
+    return [x for x in seq if not (x in seen or seen_add(x))]
+
+def get_std(avg_length, a=25):
+    # convert average length into number on x axis
+    rmin_ = 10000
+    rmax_ = 1
+    tmin_ = 0
+    tmax_ = 1
+    avg_length = ((avg_length - rmin_)/(rmax_ - rmin_)) * (tmax_ - tmin_) + tmin_
+
+    std_not_normed = a*avg_length**(a-1.)
+
+    rmin_ = 0
+    rmax_ = a*1**(a-1.)
+    tmin_ = 0.2
+    tmax_ = 3
+    return ((std_not_normed - rmin_)/(rmax_ - rmin_)) * (tmax_ - tmin_) + tmin_
