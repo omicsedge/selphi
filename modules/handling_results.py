@@ -5,9 +5,9 @@ import zarr
 import pickle
 from tqdm import trange
 
-from data_utils import get_sample_index, remove_all_samples
-from hmm_utils import setFwdValues, setBwdValues
-from utils import (
+from modules.data_utils import get_sample_index, remove_all_samples
+from modules.hmm_utils import setFwdValues, setBwdValues
+from modules.utils import (
     interpolate_parallel,
     interpolate_parallel_packed,
     BidiBurrowsWheelerLibrary,
@@ -23,7 +23,7 @@ def save_imputation_results(
     full_res_sample: np.ndarray,
     filepath: str,
 ):
-    with open(filepath, 'wb') as f:
+    with forced_open(filepath, 'wb') as f:
         pickle.dump(full_res_sample, f)
     # with open(f'./method_first_draft/saved_dictionary_{str(sample)}_new_method_{chrom}.pkl', 'wb') as f:
     #     pickle.dump(full_res__NEW[sample], f)
