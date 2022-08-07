@@ -101,7 +101,7 @@ def get_sample_index(
 
 def remove_all_samples(
     ref_numpy_arr,
-    ref_samples="./new_data/SI_data/samples.txt",
+    ref_samples="./data/SI_data/samples.txt",
     samples_tobe_removed="./data/beagle_data/imputed_samples.txt"
 ) -> np.ndarray:
     indexes = []

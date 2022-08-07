@@ -5,9 +5,9 @@ import zarr
 import pickle
 from tqdm import trange
 
-from data_utils import get_sample_index, remove_all_samples
-from hmm_utils import setFwdValues, setBwdValues
-from utils import (
+from modules.data_utils import get_sample_index, remove_all_samples
+from modules.hmm_utils import setFwdValues, setBwdValues
+from modules.utils import (
     interpolate_parallel,
     interpolate_parallel_packed,
     BidiBurrowsWheelerLibrary,
@@ -151,7 +151,7 @@ def load_sample(
      - the reference panel haploids + the test sample (2 haploids) (chip sites only)
 
     """
-    sample_index = get_sample_index(sample, samples_txt_path=f"./new_data/SI_data/samples.txt")
+    sample_index = get_sample_index(sample, samples_txt_path=f"./data/SI_data/samples.txt")
     target_full_array = np.zeros((chr_length,2))
     target_full_array[:,0] = np.unpackbits(ref_panel_full_array_full_packed[:,sample_index[0]])[:chr_length]
     target_full_array[:,1] = np.unpackbits(ref_panel_full_array_full_packed[:,sample_index[1]])[:chr_length]

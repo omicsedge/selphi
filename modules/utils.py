@@ -1,3 +1,4 @@
+from modules.data_utils import get_sample_index
 import os
 
 #from black import Result
@@ -110,7 +111,7 @@ def interpolate_parallel(
         
     result_2 = (full_constructed_panel[:,0] > full_constructed_panel[:,1]).astype(np.int16)[original_indicies[-1]:]
     #####################
-    X =  np.concatenate([result_1, *Parallel(n_jobs=8)(delayed(parallel_interpolate)(start, end) for (start, end) in list(chunks(range(0, weight_matrix.shape[1]), 2000))), result_2])
+    X =  np.concatenate([result_1, *Parallel(n_jobs=8)(delayed(parallel_interpolate)(start, end) for (start, end) in list(chunks(range(0, weight_matrix.shape[1]), 5000))), result_2])
     return X
 
 
@@ -230,7 +231,7 @@ def interpolate_parallel_packed(
         
     result_2 = (full_constructed_panel[:,0] > full_constructed_panel[:,1]).astype(np.int16)[original_indicies[-1]:]
     #####################
-    X =  np.concatenate([result_1, *Parallel(n_jobs=8)(delayed(parallel_interpolate)(start, end) for (start, end) in list(chunks(range(0, weight_matrix.shape[1]), 2000))), result_2])
+    X =  np.concatenate([result_1, *Parallel(n_jobs=8)(delayed(parallel_interpolate)(start, end) for (start, end) in list(chunks(range(0, weight_matrix.shape[1]), 5000))), result_2])
     return X
 
 #####################################
@@ -269,7 +270,6 @@ import pandas as pd
 import pickle
 import matplotlib.pyplot as plt
 from matplotlib.pyplot import figure
-from data_utils import get_sample_index
 
 def get_beagle_res(file_name):
     beagle_array = pd.read_csv(file_name, sep="\t", header=None, comment="#")
@@ -309,19 +309,6 @@ def plot_results(
         table.loc[c,"Population"] = population
         table.loc[c,"SuperPopulation"] = superPopulation
 
-        # control = get_beagle_res(f"/home/ec2-user/adriano/imputation/phase3/selphi-2/data/validation_data/genome_individuals/{sample}.individual.30x.full_genome_20.vcf.gz")
-        # control_0 = control[0].to_numpy().astype(int)
-        # control_1 = control[1].to_numpy().astype(int)
-
-        # if np.array_equal(target_full_array[:,0],control_0) and np.array_equal(target_full_array[:,1],control_1):
-        #     print("Control: Passed!") 
-        # else:
-        #     print("Control: Failed! \nERROR: Beagle and Selphi are using 2 different input data. Results will be misleading! :(")
-
-        indicies_for_comparison = np.where(
-        (np.sum(ref_panel_full_array_full,axis=1) >0) & 
-        # (np.sum(ref_panel_full_array_full,axis=1) > 0)  &
-        (np.sum(target_full_array,axis=1) >= 0))[0]
         combined_target_full = target_full_array[:,0] + target_full_array[:,1]
 
         results = {}
