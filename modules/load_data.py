@@ -1,3 +1,4 @@
+from functools import lru_cache
 from typing import Dict, List, Literal
 import pandas as pd
 import numpy as np
@@ -126,6 +127,37 @@ def load_reference_panels(
     return ref_panel_full_array_full_packed, ref_panel_full_array, ref_panel_chip_array
 
 
+def load_chip_reference_panel(
+    chip_sites_dataset_file: str,
+):
+    """
+    Loads the reference panel without test samples (i.e. reference panel with chip sites only)
+    """
+    ref_panel_chip_array: np.ndarray = zarr.load(chip_sites_dataset_file) # type: ignore # enforce the type
+
+    return ref_panel_chip_array
+
+@lru_cache(1)
+def load_full_reference_panels(
+    full_dataset_file: str,
+    ref_samples_list_file: str,
+    samples_tobe_removed_list_file: str,
+):
+    """
+    Loads/creates 2 datasets:
+     - the full packed original full-sequenced dataset (includes true test samples)
+     - the same dataset, but without test samples (i.e. full-sequenced reference panel)
+    """
+    #1
+    ref_panel_full_array_full_packed: np.ndarray = zarr.load(full_dataset_file) # type: ignore # enforce the type
+    #2
+    ref_panel_full_array = remove_all_samples(ref_panel_full_array_full_packed, ref_samples_list_file, samples_tobe_removed_list_file)
+
+    assert ref_panel_full_array.shape[0] == ref_panel_full_array_full_packed.shape[0] # number of sites
+    assert ref_panel_full_array.shape[1] <= ref_panel_full_array_full_packed.shape[1] # number of samples
+    return ref_panel_full_array_full_packed, ref_panel_full_array
+
+
 
 
 ######################################
@@ -162,4 +194,49 @@ def load_sample(
     print("Concatenated shape (the reference panel haploids + the test sample (chip sites only)): ", combined_ref_panel_chip.shape)
 
     return target_full_array, target_chip_array, combined_ref_panel_chip
+
+
+
+
+
+def load_sample_chipsites(
+    sample: str,
+    chr_length: int,
+    original_indicies: List[int],
+    ref_panel_full_array_full_packed: np.ndarray,
+    ref_panel_chip_array: np.ndarray,
+    target_full_array: np.ndarray,
+):
+    """
+
+
+    """
+
+    target_chip_array: np.ndarray = target_full_array[original_indicies,:]
+    combined_ref_panel_chip: np.ndarray = np.concatenate([ref_panel_chip_array,target_chip_array],axis=1)
+
+    print("Concatenated shape (the reference panel haploids + the test sample (chip sites only)): ", combined_ref_panel_chip.shape)
+
+    return target_chip_array, combined_ref_panel_chip
+
+
+def load_sample_fullsequence(
+    sample: str,
+    chr_length: int,
+    original_indicies: List[int],
+    ref_panel_full_array_full_packed: np.ndarray,
+    ref_panel_chip_array: np.ndarray,
+):
+    """
+
+
+    """
+    sample_index = get_sample_index(sample, samples_txt_path=f"./data/SI_data/samples.txt")
+    target_full_array = np.zeros((chr_length,2))
+    target_full_array[:,0] = np.unpackbits(ref_panel_full_array_full_packed[:,sample_index[0]])[:chr_length]
+    target_full_array[:,1] = np.unpackbits(ref_panel_full_array_full_packed[:,sample_index[1]])[:chr_length]
+
+    return target_full_array
+
+
 

@@ -457,7 +457,7 @@ def plot_results(
 
 
 class BidiBurrowsWheelerLibrary:
-    def __init__(self, haplotypeList, Target):
+    def __init__(self, haplotypeList: np.ndarray, Target: int):
         self.library_back = createBWLibrary(np.array(haplotypeList))
         self.library_forw = createBWLibrary(np.flip(np.array(haplotypeList), axis=1))
         self.hapList = haplotypeList

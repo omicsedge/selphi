@@ -3,7 +3,7 @@ from typing import IO
 import time
 
 
-def open_kuklog(file, mode='a'):
+def open_kuklog(file, mode='w'):
     """
     Wrapper around standard python `open`.
     If the file's leaf directory doesn't exist, it creates all intermediate-level directories.
