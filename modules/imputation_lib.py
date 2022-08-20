@@ -15,6 +15,7 @@ from modules.utils import (
     skip_duplicates,
     forced_open
 )
+from modules.kuklog import kuklog_timestamp
 
 
 
@@ -22,6 +23,7 @@ def BiDiPBWT(
     combined_ref_panel_chip: np.ndarray,
     ref_panel_chip_array: np.ndarray,
     hap: Literal[0,1],
+    kuklog_timestamp_func = lambda s: None,
 ):
     """
     Call BiDiPBWT - the main data structure for imputation.
@@ -31,13 +33,16 @@ def BiDiPBWT(
      - `combined_ref_panel_chip` - the same reference panel but with the test sample (+2 haploids) (chip sites only)
     """
     bidi_pbwt = BidiBurrowsWheelerLibrary(combined_ref_panel_chip.T.astype(np.int8), ref_panel_chip_array.shape[1]+hap)
+    kuklog_timestamp_func(f"1 - instantiated library with the data")
     ppa_matrix = bidi_pbwt.getForward_Ppa()
     div_matrix = bidi_pbwt.getForward_Div()
     rev_ppa_matrix = bidi_pbwt.getBackward_Ppa()
     rev_div_matrix = bidi_pbwt.getBackward_Div()
+    kuklog_timestamp_func(f"2 - got forward and backward PPA and DEV matrices")
 
     forward_pbwt_matches, forward_pbwt_hap_indices = bidi_pbwt.getForward_matches_indices()
     backward_pbwt_matches, backward_pbwt_hap_indices = bidi_pbwt.getBackward_matches_indices()
+    kuklog_timestamp_func(f"3 - calculated matches_indices")
 
     num_chip_vars = ppa_matrix.shape[1]
     num_hid = ref_panel_chip_array.shape[1]
@@ -46,6 +51,8 @@ def BiDiPBWT(
     BJ = np.zeros((num_hid,num_chip_vars))
 
     print("Build BI BJ: main imputation DS")
+    # forward_pbwt_index = ppa_matrix.argsort(axis=0)
+    # backward_pbwt_index = np.flip(rev_ppa_matrix, axis=1).argsort(axis=0)
     for chip_var in trange(0,num_chip_vars):
         forward_pbwt_matches_=forward_pbwt_matches[:,chip_var]
         forward_pbwt_index=ppa_matrix[:,chip_var]
@@ -53,7 +60,25 @@ def BiDiPBWT(
         backward_pbwt_index=np.flip(rev_ppa_matrix, axis=1)[:,chip_var]
         BI[:,chip_var] = forward_pbwt_matches_[forward_pbwt_index.argsort()][:num_hid]
         BJ[:,chip_var] = backward_pbwt_matches_[backward_pbwt_index.argsort()][:num_hid]
+    kuklog_timestamp_func(f"4 - calculated BI & BJ")
 
+    # BI_new = np.zeros((num_hid,num_chip_vars))
+    # BJ_new = np.zeros((num_hid,num_chip_vars))
+    # forward_pbwt_index = ppa_matrix.argsort(axis=0)
+    # backward_pbwt_index = np.flip(rev_ppa_matrix, axis=1).argsort(axis=0)
+    # for chip_var in range(0,num_chip_vars):
+    #     BI_new[:,chip_var] = forward_pbwt_matches[:,chip_var][forward_pbwt_index[:, chip_var]][:num_hid]
+    #     BJ_new[:,chip_var] = backward_pbwt_matches[:,chip_var][backward_pbwt_index[:, chip_var]][:num_hid]
+
+
+    # ppa_matrix                     .argsort(axis=0)[:, chip_var]
+    # np.flip(rev_ppa_matrix, axis=1).argsort(axis=0)[:, chip_var]
+
+    # forward_pbwt_matches [ppa_matrix                     .argsort(axis=0)]
+    # backward_pbwt_matches[np.flip(rev_ppa_matrix, axis=1).argsort(axis=0)]
+
+    # BI = forward_pbwt_matches [forward_pbwt_index.argsort()][:num_hid]
+    # BJ = backward_pbwt_matches[backward_pbwt_index.argsort()][:num_hid]
 
     """
     Data cleaning: If a chip variant doesn't have _any_ matches in the reference panel,
@@ -66,6 +91,7 @@ def BiDiPBWT(
             BI[:,chip_var] = 1
             BJ[:,chip_var] = 1
 
+    kuklog_timestamp_func(f"5 - cleaned up BI & BJ")
 
     return BI, BJ
 
@@ -289,6 +315,7 @@ def run_hmm(
     end_range=10000,
     start_imputation=0,
     end_imputation=-1,
+    kuklog_timestamp_func=lambda s: None,
 ):
     """
     RUNs the forward and backward runs of the forward-backward algorithm
@@ -301,10 +328,13 @@ def run_hmm(
         alpha = setFwdValues(
             num_obs, ordered_hap_indices, length_matches_normalized, distances_cm, num_hid=num_hid
         )
+        kuklog_timestamp_func(f"forward values")
         post = setBwdValues(
             alpha.copy(), num_obs, ordered_hap_indices, length_matches_normalized, distances_cm, num_hid=num_hid
         )
+        kuklog_timestamp_func(f"backward values")
         resultoo_fb: np.ndarray = interpolate_parallel_packed(post.T, original_indicies, ref_panel_full_array, chr_length, start_imputation, end_imputation)
+        kuklog_timestamp_func(f"imputation via interpolate")
     else:
         return None
     return resultoo_fb

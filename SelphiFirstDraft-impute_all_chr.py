@@ -1,5 +1,6 @@
+# from modules.devutils import pickle_dump, var_dump
 from modules.kuklog import open_kuklog, kuklog_timestamp, close_kuklog
-KUKLOG = open_kuklog("chr20_benchmark_timestamps.tsv")
+KUKLOG = open_kuklog("checkpoints.tsv")
 
 from typing import Dict, List, Literal, Tuple
 import pandas as pd
@@ -12,8 +13,11 @@ from modules.load_data import (
     load_variants_ids,
     load_and_interpolate_genetic_map,
     load_reference_panels,
+    load_chip_reference_panel,
 
     load_sample,
+
+    load_full_reference_panels,
 )
 
 from modules.imputation_lib import (
@@ -40,18 +44,15 @@ chrom = "chr20"
 SI_data_folder = f"./data/SI_data/{chrom}"
 
 kuklog_timestamp("loaded libraries", KUKLOG)
-# chr20: 160 MB
 
 
 samples = load_test_samples_names()
-# chr20: 165 MB
 chip_id_list, full_id_list, original_indicies = load_variants_ids(
     chip_id_list_file       = f"{SI_data_folder}/chip_id_list.txt",
     full_id_list_file       = f"{SI_data_folder}/full_id_list_full.txt",
     original_indicies_file  = f"{SI_data_folder}/original_indicies_full.txt",
 )
 kuklog_timestamp("loaded datasets_metadata", KUKLOG)
-# chr20: 290 MB
 num_obs = len(chip_id_list)
 chr_length = len(full_id_list)
 
@@ -60,7 +61,6 @@ chip_BP_positions, chip_cM_coordinates = load_and_interpolate_genetic_map(
     chip_id_list = chip_id_list,
 )
 kuklog_timestamp("loaded and interpolated genetic map", KUKLOG)
-# chr20: 312 MB
 
 ref_panel_full_array_full_packed, ref_panel_full_array, ref_panel_chip_array = load_reference_panels(
     full_dataset_file = f"{SI_data_folder}/reference_panel.30x.hg38_{chrom}_noinfo_full_nppacked.zip",
@@ -69,7 +69,6 @@ ref_panel_full_array_full_packed, ref_panel_full_array, ref_panel_chip_array = l
     samples_tobe_removed_list_file = "./data/beagle_data/imputed_samples.txt",
 )
 kuklog_timestamp("loaded reference panels", KUKLOG)
-# chr20: 2'850 MB
 
 
 CHUNK_SIZE = num_obs # number of chip variants
@@ -89,40 +88,41 @@ for sample in samples[12:13]:
         ref_panel_full_array_full_packed,
         ref_panel_chip_array,
     )
+    # var_dump(f"{sample}/00_target_full_array.pkl", target_full_array)
+    # var_dump(f"{sample}/00_target_chip_array.pkl", target_chip_array)
+    # var_dump(f"{sample}/00_combined_ref_panel_chip.pkl", combined_ref_panel_chip)
     kuklog_timestamp("loaded sample", KUKLOG)
-    # chr20: 3'585 MB
 
     full_res_: Dict[str, np.ndarray] = {}
 
     for hap in HAPS:
 
+        kuklog_timestamp_func = lambda s: kuklog_timestamp(f"hap{hap}: BiDiPBWT: {s}", KUKLOG)
         BI, BJ = BiDiPBWT(
             combined_ref_panel_chip,
             ref_panel_chip_array,
             hap,
+            kuklog_timestamp_func,
         )
+        # var_dump(f"{sample}/{hap}/01_BI.pkl", BI)
+        # var_dump(f"{sample}/{hap}/01_BJ.pkl", BJ)
         kuklog_timestamp(f"hap{hap}: ran BiDiPBWT", KUKLOG)
-        # chr20: 4'997 MB
-        # chr20, hap1: peak - 15'600 MB
-        # chr20, hap1: at the end - 6'460 MB
         matches, composite_, comp_matches_hybrid = create_composite_ref_panel(
             BI,
             BJ,
             fl=13,
         )
+        # var_dump(f"{sample}/{hap}/02_matches.pkl", matches)
+        # var_dump(f"{sample}/{hap}/02_composite_.pkl", composite_)
+        # var_dump(f"{sample}/{hap}/02_comp_matches_hybrid.pkl", comp_matches_hybrid)
         kuklog_timestamp(f"hap{hap}: created first composite ref panel", KUKLOG)
-        # chr20: 6'410 MB
-        # chr20, hap1: peak - 8'500 MB
-        # chr20, hap1: at the end - 6'420 MB
         haps_freqs_array_norm_dict = calculate_haploid_frequencies(
             matches,
             comp_matches_hybrid,
             CHUNK_SIZE,
         )
+        # var_dump(f"{sample}/{hap}/03_haps_freqs_array_norm_dict.pkl", haps_freqs_array_norm_dict)
         kuklog_timestamp(f"hap{hap}: calculated 1st filter: haploid frequencies", KUKLOG)
-        # chr20: 6'410 MB
-        # chr20, hap1: peak - 6'410 MB
-        # chr20, hap1: at the end - 6'200 MB
         nc_thresh = calculate_haploid_count_threshold(
             matches,
             composite_,
@@ -130,10 +130,8 @@ for sample in samples[12:13]:
             haps_freqs_array_norm_dict,
             CHUNK_SIZE,
         )
+        # var_dump(f"{sample}/{hap}/04_nc_thresh.pkl", nc_thresh)
         kuklog_timestamp(f"hap{hap}: calculated 2nd filter: haploid count threshold", KUKLOG)
-        # chr20: 6'410 MB
-        # chr20, hap1: peak - 7'400 MB
-        # chr20, hap1: at the end - 6'200 MB
         composite_ = apply_filters_to_composite_panel_mask(
             matches,
             composite_,
@@ -147,21 +145,23 @@ for sample in samples[12:13]:
 
             CHUNK_SIZE,
         )
+        # var_dump(f"{sample}/{hap}/05_composite_.pkl", composite_)
         kuklog_timestamp(f"hap{hap}: applied the 2 filters", KUKLOG)
-        # chr20: 6'395 MB
-        # chr20, hap1: peak - 6'200 MB
-        # chr20, hap1: at the end - 6'200 MB
         """
         Adriano is working here
         """
+        # ordered_matches_test__ = form_haploid_ids_lists(
+        #     matches,
+        #     composite_,
+        # )
         ordered_matches_test__, length_matches_normalized = form_haploid_ids_lists(
             matches,
             composite_,
         )
+        # var_dump(f"{sample}/{hap}/06_ordered_matches_test__.pkl", ordered_matches_test__)
         kuklog_timestamp(f"hap{hap}: form haploid ids list", KUKLOG)
-        # chr20: 6'420 MB
-        # chr20, hap1: peak - 6'200 MB
-        # chr20, hap1: at the end - 6'200 MB
+
+        kuklog_timestamp_func = lambda s: kuklog_timestamp(f"hap{hap}: f-b & imputation: {s}", KUKLOG)
         resultoo_fb = run_hmm(
             original_indicies, # common
             ref_panel_full_array, # common
@@ -173,12 +173,10 @@ for sample in samples[12:13]:
             length_matches_normalized, # haploid-specific
             chr_length, # common
             num_hid=matches.shape[0], # haploid-specific
+            kuklog_timestamp_func=kuklog_timestamp_func,
         )
+        # var_dump(f"{sample}/{hap}/07_resultoo_fb.pkl", resultoo_fb)
         kuklog_timestamp(f"hap{hap}: ran forward backward and imputation", KUKLOG)
-        # chr20: 7'830 MB - peak
-        # chr20: 6'460 MB - at the end
-        # chr20, hap1: peak - 7'550 MB
-        # chr20, hap1: at the end - 6'100 MB
 
         if resultoo_fb is None:
             raise RuntimeError(f"run_hmm returned `None` instead of a numpy array")
