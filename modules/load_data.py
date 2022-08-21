@@ -184,7 +184,7 @@ def load_sample(
 
     """
     sample_index = get_sample_index(sample, samples_txt_path=f"./data/SI_data/samples.txt")
-    target_full_array = np.zeros((chr_length,2))
+    target_full_array = np.zeros((chr_length, 2), dtype=np.int8)
     target_full_array[:,0] = np.unpackbits(ref_panel_full_array_full_packed[:,sample_index[0]])[:chr_length]
     target_full_array[:,1] = np.unpackbits(ref_panel_full_array_full_packed[:,sample_index[1]])[:chr_length]
 
