@@ -29,7 +29,6 @@ def pRecomb(
 def setFwdValues(
     num_obs,
     ordered_matches,
-    length_matches_normalized,
     distances_cm,
     variable_range=False,
     N_range=None,
@@ -61,7 +60,7 @@ def setFwdValues(
         scale = (1 - pRecomb_var) / lastSum
         em = np.zeros((nRefHaps,))
         em = em + pErr
-        em[ordered_matches[m]] = -np.array(length_matches_normalized[m]) + pNoErr
+        em[ordered_matches[m]] = pNoErr
         alpha[m, :] = em * (1 * alpha[m - 1, :] + shift)
         lastSum = sum(alpha[m, :])
     return alpha
@@ -71,7 +70,6 @@ def setBwdValues(
     alpha,
     num_obs,
     ordered_matches,
-    length_matches_normalized,
     distances_cm,
     variable_range=False,
     N_range=None,
@@ -105,7 +103,7 @@ def setBwdValues(
         stateSum = sum(alpha[m, :])
         em = np.zeros((nRefHaps,))
         em = em + pErr
-        em[ordered_matches[m-1]] = -np.array(length_matches_normalized[m-1]) + pNoErr
+        em[ordered_matches[m-1]] = pNoErr
         beta[:, 0] = beta[:, 0] * em
         alpha[m, :] = alpha[m, :] / stateSum
     return alpha

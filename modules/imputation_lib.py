@@ -281,22 +281,8 @@ def form_haploid_ids_lists(
         comp_to_plot[ordered_matches_test__[i],i] = 1
         if len(ordered_matches_test__[i]) == 0:
             ordered_matches_test__[i] = list(np.where(matches[:,i] != 0)[0])
-    
-    # useless block: calculates a dictionary which value doesn't affect calculations
-    length_matches = {}
-    length_matches_normalized: Dict[int, List] = {}
-    for i in range(0,matches.shape[1]):
-        for j in ordered_matches_test__[i]:
-            length_matches.setdefault(i, []).append(int(matches[j, i]))
-        rmin = min(length_matches[i])
-        rmax = max(length_matches[i])
-        if rmax == rmin:
-            rmin = rmin-1
-        tmin = 0
-        tmax = 0
-        length_matches_normalized[i] = list(np.round((((np.array(length_matches[i]) - rmin)/(rmax - rmin)) * (tmax - tmin) + tmin),5))
-    
-    return ordered_matches_test__, length_matches_normalized
+
+    return ordered_matches_test__
 
 
 def run_hmm(
@@ -307,7 +293,6 @@ def run_hmm(
     distances_cm,
     BI,
     BJ,
-    length_matches_normalized,
     chr_length,
     num_hid=9000,
     variable_range=False,
@@ -326,11 +311,11 @@ def run_hmm(
 
     if not variable_range:
         alpha = setFwdValues(
-            num_obs, ordered_hap_indices, length_matches_normalized, distances_cm, num_hid=num_hid
+            num_obs, ordered_hap_indices, distances_cm, num_hid=num_hid
         )
         kuklog_timestamp_func(f"forward values")
         post = setBwdValues(
-            alpha.copy(), num_obs, ordered_hap_indices, length_matches_normalized, distances_cm, num_hid=num_hid
+            alpha.copy(), num_obs, ordered_hap_indices, distances_cm, num_hid=num_hid
         )
         kuklog_timestamp_func(f"backward values")
         resultoo_fb: np.ndarray = interpolate_parallel_packed(post.T, original_indicies, ref_panel_full_array, chr_length, start_imputation, end_imputation)
@@ -356,13 +341,12 @@ def run_hmm_variable_N(
     """
 
     alpha = setFwdValues(
-        num_obs, ordered_hap_indices, length_matches_normalized, distances_cm, variable_range=True, N_range=N_range
+        num_obs, ordered_hap_indices, distances_cm, variable_range=True, N_range=N_range
     )
     post = setBwdValues(
         alpha.copy(),
         num_obs,
         ordered_hap_indices,
-        length_matches_normalized,
         distances_cm,
         variable_range=True,
         N_range=N_range,
