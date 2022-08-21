@@ -487,17 +487,16 @@ class BidiBurrowsWheelerLibrary:
         )
 
     def getBackward_matches_indices(self):
+        matches_indices = get_matches_indices(
+            self.getBackward_Ppa(), self.getBackward_Div(), self.target
+        )
         return np.flip(
-            get_matches_indices(
-                self.getBackward_Ppa(), self.getBackward_Div(), self.target
-            )[0],
+            matches_indices[0],
             axis=1,
         ), list(
             np.flip(
                 np.array(
-                    get_matches_indices(
-                        self.getBackward_Ppa(), self.getBackward_Div(), self.target
-                    )[1]
+                    matches_indices[1]
                 )
             )
         )
