@@ -154,7 +154,7 @@ for sample in samples[12:13]:
         #     matches,
         #     composite_,
         # )
-        ordered_matches_test__, length_matches_normalized = form_haploid_ids_lists(
+        ordered_matches_test__ = form_haploid_ids_lists(
             matches,
             composite_,
         )
@@ -169,8 +169,6 @@ for sample in samples[12:13]:
             ordered_matches_test__, # haploid-specific
             chip_cM_coordinates,  # common
             BI, BJ, # unused
-            # THIS VARIABLE IS USELESS, YOU CAN REFACTOR AND REMOVE
-            length_matches_normalized, # haploid-specific
             chr_length, # common
             num_hid=matches.shape[0], # haploid-specific
             kuklog_timestamp_func=kuklog_timestamp_func,
