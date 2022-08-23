@@ -1,5 +1,6 @@
 import os
 
+import numpy as np
 import pickle
 
 
@@ -26,3 +27,23 @@ def var_dump(path: str, obj):
     pickle_dump(obj, f"intermediate_variables_dump/{path}")
 def var_load(path: str):
     return pickle_load(f"intermediate_variables_dump/{path}")
+
+def nptype(array: np.ndarray):
+    if len(array.shape) == 0:
+        el = array
+    elif len(array.shape) == 1:
+        el = array[0]
+    elif len(array.shape) == 2:
+        el = array[0][0]
+    elif len(array.shape) == 3:
+        el = array[0][0][0]
+    else:
+        print('nptype: wtf')
+        return
+    print(f'vals: shape={array.shape}, span=[{array.min()}, {array.max()}]')
+    t = type(el)
+    try:
+        print(f'type: {t}, span=[{np.iinfo(t).min}, {np.iinfo(t).max}]')
+    except:
+        print(f'type: {t}, span=[{np.finfo(t).min}, {np.finfo(t).max}]')
+

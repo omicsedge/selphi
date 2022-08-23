@@ -1,4 +1,4 @@
-# from modules.devutils import pickle_dump, var_dump
+from modules.devutils import nptype, pickle_dump, var_dump, var_load
 from modules.kuklog import open_kuklog, kuklog_timestamp, close_kuklog
 KUKLOG = open_kuklog("checkpoints.tsv")
 
@@ -150,10 +150,6 @@ for sample in samples[12:13]:
         """
         Adriano is working here
         """
-        # ordered_matches_test__ = form_haploid_ids_lists(
-        #     matches,
-        #     composite_,
-        # )
         ordered_matches_test__ = form_haploid_ids_lists(
             matches,
             composite_,
@@ -173,7 +169,7 @@ for sample in samples[12:13]:
             num_hid=matches.shape[0], # haploid-specific
             kuklog_timestamp_func=kuklog_timestamp_func,
         )
-        # var_dump(f"{sample}/{hap}/07_resultoo_fb.pkl", resultoo_fb)
+        # var_dump(f"opts01-04/{sample}/{hap}/07_resultoo_fb.pkl", resultoo_fb)
         kuklog_timestamp(f"hap{hap}: ran forward backward and imputation", KUKLOG)
 
         if resultoo_fb is None:
@@ -201,6 +197,7 @@ for sample in samples[12:13]:
                 target_full_array,
             ))
             kuklog_timestamp(f"saved the results", KUKLOG)
+
 
 
 print("--- Total time: %s seconds ---" % (time.time() - start_time))
