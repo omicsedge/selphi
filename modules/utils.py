@@ -5,13 +5,13 @@ import os
 import numpy as np
 from tqdm import trange, tqdm
 from collections import OrderedDict
-from numba import njit, int8, int64
+from numba import njit, int8, int16, int32, int64
 
 
 try:
     from numba.experimental import jitclass
 except ModuleNotFoundError:
-    from numba import jitclass
+    from numba import jitclass # type: ignore
 
 
 def interpolate_parallel(
@@ -171,7 +171,10 @@ def interpolate_parallel_packed(
                     np.logical_not(unpack(original_ref_panel, j, original_indicies[i], original_indicies[i+1], chr_length)) * probs+
                     full_constructed_panel[original_indicies[i]:original_indicies[i+1],1]
                 )
-        result = (full_constructed_panel[:,0] > full_constructed_panel[:,1]).astype(np.int16)[original_indicies[start]:original_indicies[end]]
+        result = (
+            (full_constructed_panel[:,0] > full_constructed_panel[:,1])[original_indicies[start]:original_indicies[end]].astype(np.int16)
+        ).astype(np.bool_)
+
         return result
     def chunks(lst, n):
         """Yield successive n-sized chunks from lst."""
@@ -204,7 +207,9 @@ def interpolate_parallel_packed(
             full_constructed_panel[0:original_indicies[i],1]
         )
         
-    result_1 = (full_constructed_panel[:,0] > full_constructed_panel[:,1]).astype(np.int16)[0:original_indicies[i]]
+    result_1 = (
+        (full_constructed_panel[:,0] > full_constructed_panel[:,1])[0:original_indicies[i]].astype(np.int16)
+    ).astype(np.bool_)
     ###########################################
     temp_haps = []
 
@@ -229,7 +234,9 @@ def interpolate_parallel_packed(
             full_constructed_panel[original_indicies[-1]:,1]
         )
         
-    result_2 = (full_constructed_panel[:,0] > full_constructed_panel[:,1]).astype(np.int16)[original_indicies[-1]:]
+    result_2 = (
+        (full_constructed_panel[:,0] > full_constructed_panel[:,1])[original_indicies[-1]:].astype(np.int16)
+    ).astype(np.bool_)
     #####################
     X =  np.concatenate([result_1, *Parallel(n_jobs=8)(delayed(parallel_interpolate)(start, end) for (start, end) in list(chunks(range(0, weight_matrix.shape[1]), 5000))), result_2])
     return X
@@ -279,7 +286,7 @@ def get_beagle_res(file_name):
         beagle_array.applymap(lambda x: str(x).split(":")[0].replace("/","|").split("|")[-1]),
     ],axis=1)
     concat_beagle.drop([2],axis=1,inplace=True)
-    concat_beagle.columns = [0,1]
+    concat_beagle.columns = [0,1] # type: ignore
     return concat_beagle
 
 def plot_results(
@@ -356,12 +363,12 @@ def plot_results(
         fig, ax = plt.subplots(figsize=(16,8))    # to create the picture plot empty  
         for key in folder_dict.keys(): 
             
-            plt.plot(lengths, res[key], label = f"{key}")
+            plt.plot(lengths, res[key], label = f"{key}") # type: ignore
 
         ax.set_xlabel("Segment Lengths",fontsize=10)
         ax.set_ylabel("Wrongly imputed variants",fontsize=10)
-        plt.rcParams['axes.facecolor']='white'
-        plt.rcParams['savefig.facecolor']='white'
+        plt.rcParams['axes.facecolor']='white' # type: ignore
+        plt.rcParams['savefig.facecolor']='white' # type: ignore
         plt.legend()
 
         plt.show()
@@ -473,12 +480,12 @@ class BidiBurrowsWheelerLibrary:
 
     def getForward_Div(self):
         return np.full(
-            self.Shape, np.arange(1, self.Shape[1] + 1), dtype=np.int64
+            self.Shape, np.arange(1, self.Shape[1] + 1), dtype=self.library_forw.div.dtype.type
         ) - np.flip(self.library_forw.div, axis=1)
 
     def getBackward_Div(self):
         return np.full(
-            self.Shape, np.arange(1, self.Shape[1] + 1), dtype=np.int64
+            self.Shape, np.arange(1, self.Shape[1] + 1), dtype=self.library_back.div.dtype.type
         ) - np.flip(self.library_back.div, axis=1)
 
     def getForward_matches_indices(self):
@@ -503,24 +510,15 @@ class BidiBurrowsWheelerLibrary:
 
 
 jit_BidiBurrowsWheelerLibrary_s = OrderedDict()
-jit_BidiBurrowsWheelerLibrary_s["ppa"] = int64[:, :]
-jit_BidiBurrowsWheelerLibrary_s["div"] = int64[:, :]
-jit_BidiBurrowsWheelerLibrary_s["zeroOccPrev"] = int64[:, :]
-jit_BidiBurrowsWheelerLibrary_s["nZeros"] = int64[:]
-jit_BidiBurrowsWheelerLibrary_s["haps"] = int8[:, :]
+jit_BidiBurrowsWheelerLibrary_s["ppa"] = int16[:, :]
+jit_BidiBurrowsWheelerLibrary_s["div"] = int32[:, :]
 
 
 @jitclass(jit_BidiBurrowsWheelerLibrary_s)
 class jit_BidiBurrowsWheelerLibrary:
-    def __init__(self, ppa, div, nZeros, zeroOccPrev, haps):
+    def __init__(self, ppa, div):
         self.ppa = ppa
         self.div = div
-        self.nZeros = nZeros
-        self.zeroOccPrev = zeroOccPrev
-        self.haps = haps
-
-    def getValues(self):
-        return (self.ppa, self.div, self.nZeros, self.zeroOccPrev, self.haps)
 
 
 @njit
@@ -533,15 +531,15 @@ def createBWLibrary(haps):
 
     nHaps = haps.shape[0]
     nLoci = haps.shape[1]
-    ppa = np.full(haps.shape, 0, dtype=np.int64)
-    div = np.full(haps.shape, 0, dtype=np.int64)
+    ppa = np.full(haps.shape, 0, dtype=np.int16)
+    div = np.full(haps.shape, 0, dtype=np.int32)
 
-    nZerosArray = np.full(nLoci, 0, dtype=np.int64)
+    nZerosArray = np.full(nLoci, 0, dtype=np.int16)
 
-    zeros = np.full(nHaps, 0, dtype=np.int64)
-    ones = np.full(nHaps, 0, dtype=np.int64)
-    dZeros = np.full(nHaps, 0, dtype=np.int64)
-    dOnes = np.full(nHaps, 0, dtype=np.int64)
+    zeros = np.full(nHaps, 0, dtype=np.int16)
+    ones = np.full(nHaps, 0, dtype=np.int16)
+    dZeros = np.full(nHaps, 0, dtype=np.int32)
+    dOnes = np.full(nHaps, 0, dtype=np.int32)
 
     nZeros = 0
     nOnes = 0
@@ -571,10 +569,10 @@ def createBWLibrary(haps):
     nZerosArray[nLoci - 1] = nZeros
 
     for i in range(nLoci - 2, -1, -1):
-        zeros = np.full(nHaps, 0, dtype=np.int64)
-        ones = np.full(nHaps, 0, dtype=np.int64)
-        dZeros = np.full(nHaps, 0, dtype=np.int64)
-        dOnes = np.full(nHaps, 0, dtype=np.int64)
+        zeros = np.full(nHaps, 0, dtype=np.int16)
+        ones = np.full(nHaps, 0, dtype=np.int16)
+        dZeros = np.full(nHaps, 0, dtype=np.int32)
+        dOnes = np.full(nHaps, 0, dtype=np.int32)
 
         nZeros = 0
         nOnes = 0
@@ -608,7 +606,7 @@ def createBWLibrary(haps):
 
     # I'm going to be a wee bit sloppy in creating zeroOccPrev
     # Not defined at 0 so start at 1.
-    zeroOccPrev = np.full(haps.shape, 0, dtype=np.int64)
+    zeroOccPrev = np.full(haps.shape, 0, dtype=np.int16)
 
     for i in range(1, nLoci):
         count = 0
@@ -617,7 +615,7 @@ def createBWLibrary(haps):
                 count += 1
             zeroOccPrev[j, i] = count
 
-    library = jit_BidiBurrowsWheelerLibrary(ppa, div, nZerosArray, zeroOccPrev, haps)
+    library = jit_BidiBurrowsWheelerLibrary(ppa, div)
     return library
 
 
@@ -650,13 +648,13 @@ def replace_col(array, col_index, hap_index):
 
 # Function to replace values with match lengths
 def get_matches_indices(ppa_matrix, div_matrix, target=6401):
-    forward_pbwt_matches = np.zeros(ppa_matrix.shape)
+    forward_pbwt_matches = np.zeros(ppa_matrix.shape, dtype=np.int32)
     forward_pbwt_hap_indices = list()
     for i in range(0, forward_pbwt_matches.shape[1]):
         hap_index = int(np.where(ppa_matrix[:, i] == target)[0])
         forward_pbwt_matches[:, i] = replace_col(div_matrix[:, i], i, hap_index)
         forward_pbwt_hap_indices.append(hap_index)
-    return (forward_pbwt_matches.astype(int), forward_pbwt_hap_indices)
+    return (forward_pbwt_matches, forward_pbwt_hap_indices)
 
 
 def forced_open(file, mode='r'):
