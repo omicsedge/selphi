@@ -187,9 +187,9 @@ def plot_benchmark_logs(benchmarks: List[benchmark_logs], title: str, filename: 
 
 benchmarks = {
     # 0: benchmark_logs(
-    #     name='v2022.07.28',
+    #     name='v2022.07.28_very-1st-run',
     #     dirname='memory-benchmark_2022.07.26-kukrefactored_chr20',
-    #     color='#2f3fbf',
+    #     color='#000000',
     # ),
     # 1: benchmark_logs(
     #     name='v2022.07.28 extended log',
@@ -239,11 +239,11 @@ benchmarks = {
 
 
 
-    0: benchmark_logs(
-        name='v2022.07.28',
-        dirname='memory-benchmark_2022.07.26-kukrefactored_chr20',
-        color='#af6f2fbf',
-    ),
+    # 0: benchmark_logs(
+    #     name='v2022.07.28',
+    #     dirname='memory-benchmark_2022.07.26-kukrefactored_chr20',
+    #     color='#af6f2fbf',
+    # ),
     # 2: benchmark_logs(
     #     name='v2022.07.28 opt1',
     #     dirname='memory-benchmark_2022.07.26-kukrefactored_chr20_opt1',
@@ -256,11 +256,11 @@ benchmarks = {
     #     dirname='memory-benchmark_2022.07.26-kukrefactored_chr20_opt1',
     #     color='#af6f2fbf',
     # ),
-    3: benchmark_logs(
-        name='v2022.07.28 opts01-02',
-        dirname='memory-benchmark_2022.07.26-kukrefactored_chr20_opts01-02',
-        color='#2f3fbf',
-    ),
+    # 3: benchmark_logs(
+    #     name='v2022.07.28 opts01-02',
+    #     dirname='memory-benchmark_2022.07.26-kukrefactored_chr20_opts01-02',
+    #     color='#2f3fbf',
+    # ),
 
 
     # 9: benchmark_logs(
@@ -273,11 +273,81 @@ benchmarks = {
     #     dirname='memory-benchmark_2022.07.26-kukrefactored_chr20_opts01-03_e',
     #     color='#2f3fbf',
     # ),
+
+
+    # 10: benchmark_logs(
+    #     name='v2022.07.28',
+    #     dirname='memory-benchmark_2022-07-26-kukrefactored_2022-08-22',
+    #     color='#cf4f2fbf',
+    # ),
+    # 11: benchmark_logs(
+    #     name='v2022.07.28_b',
+    #     dirname='memory-benchmark_2022-07-26-kukrefactored_2022-08-22_b',
+    #     color='#af6f2fbf',
+    # ),
+    # 12: benchmark_logs(
+    #     name='v2022.07.28_c',
+    #     dirname='memory-benchmark_2022-07-26-kukrefactored_2022-08-22_c',
+    #     color='#8f8f2fbf',
+    # ),
+    # 13: benchmark_logs(
+    #     name='v2022.07.28 opts01-04',
+    #     dirname='memory-benchmark_opts01-04_2022-08-22',
+    #     color='#2f1fdf',
+    # ),
+    # 14: benchmark_logs(
+    #     name='v2022.07.28 opts01-04_b',
+    #     dirname='memory-benchmark_opts01-04_2022-08-22_b',
+    #     color='#1f3fbf',
+    # ),
+    # 15: benchmark_logs(
+    #     name='v2022.07.28 opts01-04_c',
+    #     dirname='memory-benchmark_opts01-04_2022-08-22_c',
+    #     color='#0f5f9f',
+    # ),
+
+    12: benchmark_logs(
+        name='v2022.07.28',
+        dirname='memory-benchmark_2022-07-26-kukrefactored_2022-08-22_c',
+        color='#af6f2fbf',
+    ),
+    15: benchmark_logs(
+        name='v2022.07.28 opts01-04',
+        dirname='memory-benchmark_opts01-04_2022-08-22_c',
+        color='#2f3fbf',
+    ),
+
+
+    # 16: benchmark_logs(
+    #     name='v2022.07.28',
+    #     dirname='memory-benchmark_v2022.07.26-kukrefactored_2022-08-22-pack1',
+    #     color='#ef2f2fbf',
+    # ),
+    # 17: benchmark_logs(
+    #     name='v2022.07.28 opt1',
+    #     dirname='memory-benchmark_opt01_2022-08-22-pack1',
+    #     color='#cf4f2fbf',
+    # ),
+    # 18: benchmark_logs(
+    #     name='v2022.07.28 opts01-02',
+    #     dirname='memory-benchmark_opts01-02_2022-08-22-pack1',
+    #     color='#af6f2fbf',
+    # ),
+    # 19: benchmark_logs(
+    #     name='v2022.07.28 opts01-03',
+    #     dirname='memory-benchmark_opts01-03_2022-08-22-pack1',
+    #     color='#8f8f2fbf',
+    # ),
+    # 20: benchmark_logs(
+    #     name='v2022.07.28 opts01-04',
+    #     dirname='memory-benchmark_opts01-04_2022-08-22-pack1',
+    #     color='#2f3fbf',
+    # ),
 }
 
 plot_benchmark_logs(
     [b for b in benchmarks.values()],
     title='selphi chr20',
-    filename="benchmarks_plot_opts01-02b.png",
+    filename="benchmarks_plot_opts01-04_show.png",
 )
 
