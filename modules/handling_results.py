@@ -48,8 +48,8 @@ def genotype_imputation_accuracy(
     Returns number of individual mismatching unphased genotypes of an imputed sample
         with the true sample
     """
-    arr__1 = full_res_sample[0]
-    arr__2 = full_res_sample[1]
+    arr__1 = full_res_sample[0].astype(np.int8)
+    arr__2 = full_res_sample[1].astype(np.int8)
     final_arr = arr__1 + arr__2
 
     y_1 = target_full_array[:, 0]

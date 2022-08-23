@@ -35,9 +35,9 @@ def BiDiPBWT(
     bidi_pbwt = BidiBurrowsWheelerLibrary(combined_ref_panel_chip.T.astype(np.int8), ref_panel_chip_array.shape[1]+hap)
     kuklog_timestamp_func(f"1 - instantiated library with the data")
     ppa_matrix = bidi_pbwt.getForward_Ppa()
-    div_matrix = bidi_pbwt.getForward_Div()
+    # div_matrix = bidi_pbwt.getForward_Div()
     rev_ppa_matrix = bidi_pbwt.getBackward_Ppa()
-    rev_div_matrix = bidi_pbwt.getBackward_Div()
+    # rev_div_matrix = bidi_pbwt.getBackward_Div()
     kuklog_timestamp_func(f"2 - got forward and backward PPA and DEV matrices")
 
     forward_pbwt_matches, forward_pbwt_hap_indices = bidi_pbwt.getForward_matches_indices()
@@ -47,8 +47,8 @@ def BiDiPBWT(
     num_chip_vars = ppa_matrix.shape[1]
     num_hid = ref_panel_chip_array.shape[1]
 
-    BI = np.zeros((num_hid,num_chip_vars))
-    BJ = np.zeros((num_hid,num_chip_vars))
+    BI = np.zeros((num_hid,num_chip_vars), dtype=np.int32)
+    BJ = np.zeros((num_hid,num_chip_vars), dtype=np.int32)
 
     print("Build BI BJ: main imputation DS")
     # forward_pbwt_index = ppa_matrix.argsort(axis=0)
@@ -116,7 +116,7 @@ def create_composite_ref_panel(
     fl = 13 
 
     print("Creating initial composite panel")
-    composite_ = np.zeros(matches.shape) # mask (only 0s and 1s)
+    composite_ = np.zeros(matches.shape, dtype=np.bool_) # mask (only 0s and 1s)
     best_matches = {}
     for chip_index in trange(0, matches.shape[1]):
         best_matches[chip_index] = list(np.argsort(matches[:,chip_index])[::-1][:fl])
@@ -124,7 +124,7 @@ def create_composite_ref_panel(
             composite_[hap_index ,chip_index:int(chip_index + BJ[hap_index, chip_index])] = 1
             composite_[hap_index ,int(chip_index - BI[hap_index, chip_index] + 1):chip_index+1] = 1
 
-    comp_matches_hybrid: np.ndarray = (composite_ * matches).astype(int)
+    comp_matches_hybrid: np.ndarray = (composite_ * matches).astype(matches.dtype.type)
 
     return matches, composite_, comp_matches_hybrid
 
@@ -198,7 +198,7 @@ def calculate_haploid_count_threshold(
 
     # 1. STD_THRESH
     averages = []
-    hybrid = (composite_ * matches).astype(int)
+    hybrid = (composite_ * matches).astype(matches.dtype.type)
     for i in range(0,matches.shape[1]):
         averages.append(np.average(hybrid[np.flatnonzero(hybrid[:,i]),i]))
 
@@ -245,7 +245,7 @@ def apply_filters_to_composite_panel_mask(
      - number of matches for each chip site in the composite ref panel (`haps_freqs_array_norm_dict`)
      - estimated number of haploids that should be taken for each chip site (`nc_thresh`)
     """
-    composite_ = np.zeros(matches.shape)
+    composite_ = np.zeros(matches.shape, dtype=np.bool_)
     best_matches = {}
     for chip_index in trange(0, matches.shape[1]):
         chunk_index = int(chip_index//CHUNK_SIZE)
@@ -270,7 +270,7 @@ def form_haploid_ids_lists(
     Also, calculates a useless dict `length_matches_normalized` which value doesn't affect downstream calculations
     """
     ordered_matches_test__: Dict[int, List] = {} # a list of ids of haploids taken for each chip variant
-    comp_to_plot = np.zeros(composite_.shape)
+    comp_to_plot = np.zeros(composite_.shape, dtype=np.bool_)
     for i in trange(matches.shape[1]):
         xooi = matches[:,i]
         sorting_key = list(xooi.argsort()[::-1])
