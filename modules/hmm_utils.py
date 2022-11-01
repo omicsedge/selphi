@@ -14,10 +14,11 @@ def pRecomb(
     """
     pRecomb betweem obs and and obs-1
     """
-    if not variable_range:
-        N = num_hid
-    else:
-        N = N_range[obs - 1]
+    # if not variable_range:
+    #     N = num_hid
+    # else:
+    #     N = N_range[obs - 1]
+    N = num_hid
     dm = distances_cm[obs] - distances_cm[obs - 1]
     if dm == 0:
         dm = 0.0000001
@@ -27,6 +28,7 @@ def pRecomb(
 
 
 def setFwdValues(
+    alpha: np.ndarray,
     num_obs,
     ordered_matches,
     distances_cm,
@@ -41,13 +43,15 @@ def setFwdValues(
     lastSum = 1
     start = 0
     end = num_obs
-    alpha = np.zeros((num_obs, nRefHaps))
-    alpha[start, ordered_matches[0]] = 1 / len(ordered_matches[0])
     nHaps = [len(np.unique(ordered_matches[x])) for x in range(0, num_obs)]
     pErr = 0.0001
     pNoErr = 1 - pErr
 
-    for m in trange(1, end):
+    alpha[0, :] = 1 / alpha.shape[1]
+
+    alpha[1, ordered_matches[0]] = 1 / len(ordered_matches[0])
+
+    for m in trange(start+1, end):
         pRecomb_var = pRecomb(
             m,
             distances_cm,
@@ -55,14 +59,17 @@ def setFwdValues(
             N_range=N_range,
             num_hid=num_hid,
         )
-        shift = np.zeros((nRefHaps,))
+        shift = np.zeros((nRefHaps,), dtype=np.float64)
         shift[ordered_matches[m]] = pRecomb_var / nHaps[m]
         scale = (1 - pRecomb_var) / lastSum
-        em = np.zeros((nRefHaps,))
+        em = np.zeros((nRefHaps,), dtype=np.float64) # maybe no need to cr8 an array, just use pErr
         em = em + pErr
         em[ordered_matches[m]] = pNoErr
-        alpha[m, :] = em * (1 * alpha[m - 1, :] + shift)
-        lastSum = sum(alpha[m, :])
+        alpha[m+1, :] = em * (1 * alpha[m+1 - 1, :] + shift)
+        lastSum = sum(alpha[m+1, :])
+
+    alpha[-1, :] = 1 / alpha.shape[1]
+
     return alpha
 
 
@@ -81,7 +88,7 @@ def setBwdValues(
     nRefHaps = num_hid
     lastSum = 1
     end = num_obs
-    beta = np.zeros((nRefHaps, 1))
+    beta = np.zeros((nRefHaps, 1), dtype=np.float64)
     nHaps = [len(np.unique(ordered_matches[x])) for x in range(0, num_obs)]
     beta[:, 0] = 1 / nHaps[-1]
     pErr = 0.0001
@@ -94,16 +101,16 @@ def setBwdValues(
             N_range=N_range,
             num_hid=num_hid,
         )
-        shift = np.zeros((nRefHaps,))
+        shift = np.zeros((nRefHaps,), dtype=np.float64)
         shift[ordered_matches[m]] = pRecomb_var / nHaps[m]
         scale = (1 - pRecomb_var) / lastSum
         stateSum = 0
         beta[:, 0] = 1 * beta[:, 0] + shift
-        alpha[m, :] = alpha[m, :] * beta[:, 0]
-        stateSum = sum(alpha[m, :])
-        em = np.zeros((nRefHaps,))
+        alpha[m+1, :] = alpha[m+1, :] * beta[:, 0]
+        stateSum = sum(alpha[m+1, :])
+        em = np.zeros((nRefHaps,), dtype=np.float64)  # maybe no need to cr8 an array, just use pErr
         em = em + pErr
         em[ordered_matches[m-1]] = pNoErr
         beta[:, 0] = beta[:, 0] * em
-        alpha[m, :] = alpha[m, :] / stateSum
+        alpha[m+1, :] = alpha[m+1, :] / stateSum
     return alpha

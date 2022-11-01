@@ -1,20 +1,19 @@
 from functools import lru_cache
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, OrderedDict
+import os
+from collections import OrderedDict
+
+
 import pandas as pd
 import numpy as np
 import zarr
 import pickle
 from tqdm import trange
 
-from modules.data_utils import get_sample_index, remove_all_samples
-from modules.hmm_utils import setFwdValues, setBwdValues
+
+from modules.data_utils import get_sample_index, remove_all_samples, load_samples_list
 from modules.utils import (
-    interpolate_parallel,
-    interpolate_parallel_packed,
-    BidiBurrowsWheelerLibrary,
-    get_std,
-    skip_duplicates,
-    forced_open
+    vcf_haploid_order_to_internal,
 )
 
 
@@ -29,18 +28,35 @@ from modules.utils import (
 
 
 
-def load_test_samples_names(
-    path:str = "./data/beagle_data/imputed_samples.txt"
+def load_test_samples_indices(
+    test_samples_names_path:str = "./data/beagle_data/imputed_samples.txt",
+    all_samples_names_path:str = "./data/SI_data/samples.txt",
 ):
     """
-    
-    """
-    with open(path, mode="r") as f:
-        lines = f.readlines()
-    sample_names = skip_duplicates([line.strip() for line in lines])
+    Creates two dictionaries:
+     - one maps test sample names to their corresponding indicies in the full reference panel,
+     - another one maps all other sample names that are used as the actual reference panel
 
-    return sample_names
-    print(len(samples))
+    Makes sure the test samples are ordered as in the file
+    """
+    test_samples_list = load_samples_list(os.path.abspath(test_samples_names_path)) # abspath is needed for proper caching
+    full_samples_list = load_samples_list(os.path.abspath(all_samples_names_path))  # abspath is needed for proper caching
+
+    test_samples_indices: OrderedDict[str,int] = OrderedDict()
+    refpan_samples_indices: OrderedDict[str,int] = OrderedDict()
+
+    for idx, smpl in enumerate(full_samples_list):
+        if smpl in test_samples_list:
+            # test_samples_indices[smpl] = idx
+            pass
+        else:
+            refpan_samples_indices[smpl] = idx
+
+    for idx, smpl in enumerate(test_samples_list):
+        test_samples_indices[smpl] = full_samples_list.index(smpl)
+
+    return test_samples_indices, refpan_samples_indices
+
 
 
 def load_variants_ids(
@@ -89,14 +105,14 @@ def load_and_interpolate_genetic_map(
     chip_BP_positions = [int(x.split('-')[1]) for x in chip_id_list]
 
     genetic_map = pd.read_csv(genetic_map_path, sep=" ", comment="#",header=None,usecols=[0,2,3])
-    genetic_map.columns = ['chr','cM','pos']
+    genetic_map.columns = ['chr','cM','pos'] # type: ignore
     genetic_map.set_index('pos',inplace=True)
     genetic_map = genetic_map.join(pd.DataFrame(chip_BP_positions).set_index(0),how='outer')
     genetic_map['cM'] = genetic_map['cM'].interpolate('index').fillna(method='bfill')
     genetic_map['chr'] = genetic_map.chr.fillna(20.0).astype(int)
     genetic_map = genetic_map.reset_index().rename({'index':'pos'},axis=1)
     genetic_map = genetic_map[genetic_map['pos'].isin(chip_BP_positions)].reset_index(drop=True)
-    chip_cM_coordinates = genetic_map.cM
+    chip_cM_coordinates = genetic_map.cM # type: ignore
     chip_cM_coordinates: List[float] = list(chip_cM_coordinates)
 
     assert len(chip_cM_coordinates) == len(chip_BP_positions)
@@ -129,13 +145,28 @@ def load_reference_panels(
 
 def load_chip_reference_panel(
     chip_sites_dataset_file: str,
+    refpan_haploid_indices: List[int],
 ):
     """
-    Loads the reference panel without test samples (i.e. reference panel with chip sites only)
+    Loads/creates 2 chip-sites datasets:
+     - the full reference panel (includes test samples) 
+     - the "blank" "combined" reference panel: 
+          the reference panel without test samples, with 2 blank places for the input sample haploids
     """
-    ref_panel_chip_array: np.ndarray = zarr.load(chip_sites_dataset_file) # type: ignore # enforce the type
+    #1
+    full_ref_panel_chip_array: np.ndarray = zarr.load(chip_sites_dataset_file) # type: ignore # enforce the type
 
-    return ref_panel_chip_array
+    #2
+    num_hid = len(refpan_haploid_indices)
+    blank_combined_ref_panel_chip: np.ndarray = np.zeros(
+        (full_ref_panel_chip_array.shape[0], num_hid+2),
+        dtype=full_ref_panel_chip_array.dtype.type
+    )
+    internal_order = [vcf_haploid_order_to_internal(i, int(num_hid/2)) for i in range(num_hid)]
+    blank_combined_ref_panel_chip[:, :num_hid] = full_ref_panel_chip_array[:, refpan_haploid_indices][:, internal_order]
+
+    return full_ref_panel_chip_array, blank_combined_ref_panel_chip
+
 
 @lru_cache(1)
 def load_full_reference_panels(
@@ -199,25 +230,22 @@ def load_sample(
 
 
 
-def load_sample_chipsites(
-    sample: str,
-    chr_length: int,
-    original_indicies: List[int],
-    ref_panel_full_array_full_packed: np.ndarray,
+def combine_ref_panel_chip(
+    test_sample_index: int,
+    full_ref_panel_chip_array: np.ndarray,
     ref_panel_chip_array: np.ndarray,
-    target_full_array: np.ndarray,
 ):
     """
+    Creates a "combined" reference panel with chip sites, consisting of
+        the reference panel haploids + the test sample.
 
-
+    Do not use, it's suboptimal.
     """
 
-    target_chip_array: np.ndarray = target_full_array[original_indicies,:]
+    target_chip_array: np.ndarray = full_ref_panel_chip_array[:,test_sample_index]
     combined_ref_panel_chip: np.ndarray = np.concatenate([ref_panel_chip_array,target_chip_array],axis=1)
-
     print("Concatenated shape (the reference panel haploids + the test sample (chip sites only)): ", combined_ref_panel_chip.shape)
-
-    return target_chip_array, combined_ref_panel_chip
+    return combined_ref_panel_chip
 
 
 def load_sample_fullsequence(
@@ -228,8 +256,9 @@ def load_sample_fullsequence(
     ref_panel_chip_array: np.ndarray,
 ):
     """
+    Old
 
-
+    Do not use
     """
     sample_index = get_sample_index(sample, samples_txt_path=f"./data/SI_data/samples.txt")
     target_full_array = np.zeros((chr_length,2))

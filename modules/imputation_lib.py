@@ -5,23 +5,25 @@ import zarr
 import pickle
 from tqdm import trange
 
-from modules.data_utils import get_sample_index, remove_all_samples
+# from modules.data_utils import get_sample_index, remove_all_samples
 from modules.hmm_utils import setFwdValues, setBwdValues
 from modules.utils import (
     interpolate_parallel,
-    interpolate_parallel_packed,
+    impute_interpolate,
+    interpolate_parallel_packed_prev,
+    interpolate_parallel_packed_old,
     BidiBurrowsWheelerLibrary,
     get_std,
-    skip_duplicates,
-    forced_open
 )
-from modules.kuklog import kuklog_timestamp
+# from modules.kuklog import kuklog_timestamp
+# from modules.devutils import var_dump # separate line so i can comment/uncomment var_dump lines conveniently
+# from modules.devutils import var_load # separate line so i can comment/uncomment var_load lines conveniently
 
 
 
 def BiDiPBWT(
     combined_ref_panel_chip: np.ndarray,
-    ref_panel_chip_array: np.ndarray,
+    num_hid: int,
     hap: Literal[0,1],
     kuklog_timestamp_func = lambda s: None,
 ):
@@ -32,7 +34,7 @@ def BiDiPBWT(
      - `ref_panel_chip_array` - the reference panel without test samples with chip sites only
      - `combined_ref_panel_chip` - the same reference panel but with the test sample (+2 haploids) (chip sites only)
     """
-    bidi_pbwt = BidiBurrowsWheelerLibrary(combined_ref_panel_chip.T.astype(np.int8), ref_panel_chip_array.shape[1]+hap)
+    bidi_pbwt = BidiBurrowsWheelerLibrary(combined_ref_panel_chip.T.astype(np.int8), num_hid+hap)
     kuklog_timestamp_func(f"1 - instantiated library with the data")
     ppa_matrix = bidi_pbwt.getForward_Ppa()
     # div_matrix = bidi_pbwt.getForward_Div()
@@ -45,7 +47,7 @@ def BiDiPBWT(
     kuklog_timestamp_func(f"3 - calculated matches_indices")
 
     num_chip_vars = ppa_matrix.shape[1]
-    num_hid = ref_panel_chip_array.shape[1]
+    # num_hid = ref_panel_chip_array.shape[1]
 
     BI = np.zeros((num_hid,num_chip_vars), dtype=np.int32)
     BJ = np.zeros((num_hid,num_chip_vars), dtype=np.int32)
@@ -62,6 +64,9 @@ def BiDiPBWT(
         BJ[:,chip_var] = backward_pbwt_matches_[backward_pbwt_index.argsort()][:num_hid]
     kuklog_timestamp_func(f"4 - calculated BI & BJ")
 
+    """
+    Naive pathetic attempt to vectorize the calculation of BI and BJ 
+    """
     # BI_new = np.zeros((num_hid,num_chip_vars))
     # BJ_new = np.zeros((num_hid,num_chip_vars))
     # forward_pbwt_index = ppa_matrix.argsort(axis=0)
@@ -69,7 +74,6 @@ def BiDiPBWT(
     # for chip_var in range(0,num_chip_vars):
     #     BI_new[:,chip_var] = forward_pbwt_matches[:,chip_var][forward_pbwt_index[:, chip_var]][:num_hid]
     #     BJ_new[:,chip_var] = backward_pbwt_matches[:,chip_var][backward_pbwt_index[:, chip_var]][:num_hid]
-
 
     # ppa_matrix                     .argsort(axis=0)[:, chip_var]
     # np.flip(rev_ppa_matrix, axis=1).argsort(axis=0)[:, chip_var]
@@ -79,6 +83,7 @@ def BiDiPBWT(
 
     # BI = forward_pbwt_matches [forward_pbwt_index.argsort()][:num_hid]
     # BJ = backward_pbwt_matches[backward_pbwt_index.argsort()][:num_hid]
+
 
     """
     Data cleaning: If a chip variant doesn't have _any_ matches in the reference panel,
@@ -113,7 +118,6 @@ def create_composite_ref_panel(
      - `comp_matches_hybrid` - `matches` masked with `composite_`
     """
     matches: np.ndarray = BI + BJ -1
-    fl = 13 
 
     print("Creating initial composite panel")
     composite_ = np.zeros(matches.shape, dtype=np.bool_) # mask (only 0s and 1s)
@@ -266,10 +270,8 @@ def form_haploid_ids_lists(
     """
     Forms a list of ids of haploids taken for each chip variant
         in a dict `ordered_matches_test__`
-
-    Also, calculates a useless dict `length_matches_normalized` which value doesn't affect downstream calculations
     """
-    ordered_matches_test__: Dict[int, List] = {} # a list of ids of haploids taken for each chip variant
+    ordered_matches_test__: Dict[int, List[np.int64]] = {} # a list of ids of haploids taken for each chip variant
     comp_to_plot = np.zeros(composite_.shape, dtype=np.bool_)
     for i in trange(matches.shape[1]):
         xooi = matches[:,i]
@@ -286,14 +288,17 @@ def form_haploid_ids_lists(
 
 
 def run_hmm(
-    original_indicies,
-    ref_panel_full_array,
-    num_obs,
-    ordered_hap_indices,
-    distances_cm,
+    original_indicies: List[int],
+    full_full_ref_panel_vcfgz_path: str,
+    num_obs: int,
+    ordered_hap_indices_list: List[Dict[int, List[np.int64]]],
+    distances_cm: List[float],
     BI,
     BJ,
-    chr_length,
+    chr_length: int,
+    imputing_samples_haploids_indices: List[int],
+    reference_haploids_indices: List[int],
+    internal_haploid_order: List[int],
     num_hid=9000,
     variable_range=False,
     start_range=2000,
@@ -306,23 +311,47 @@ def run_hmm(
     RUNs the forward and backward runs of the forward-backward algorithm
     """
 
+
+    # ordered_hap_indices_list = ordered_matches_list
+    # distances_cm = chip_cM_coordinates
+    # imputing_samples_haploids_indices = imputing_samples_haploids_indices 
+    # reference_haploids_indices = refpan_haploid_indices
+
+
     if end_imputation == -1:
         end_imputation = len(original_indicies) -1
 
     if not variable_range:
-        alpha = setFwdValues(
-            num_obs, ordered_hap_indices, distances_cm, num_hid=num_hid
-        )
-        kuklog_timestamp_func(f"forward values")
-        post = setBwdValues(
-            alpha.copy(), num_obs, ordered_hap_indices, distances_cm, num_hid=num_hid
-        )
-        kuklog_timestamp_func(f"backward values")
-        resultoo_fb: np.ndarray = interpolate_parallel_packed(post.T, original_indicies, ref_panel_full_array, chr_length, start_imputation, end_imputation)
+
+        print("running forward and backward algorithms for all input haploids")
+        weight_matrices: List[np.ndarray] = []
+
+        for ordered_hap_indices in ordered_hap_indices_list:
+            alpha = np.zeros((num_obs+2, num_hid), dtype=np.float64)
+            alpha = setFwdValues(
+                alpha, num_obs, ordered_hap_indices, distances_cm, num_hid=num_hid
+            )
+            kuklog_timestamp_func(f"forward values")
+            post = setBwdValues(
+                alpha, num_obs, ordered_hap_indices, distances_cm, num_hid=num_hid
+            )
+            weight_matrices.append(post.T)
+            kuklog_timestamp_func(f"backward values")
+
+        print("imputing/interpolating")
+        # smpls2takeA = np.array([len(ordered_hap_indices[i]) for i in range(len(ordered_hap_indices))])
+        # smpls2takeB = post.astype(bool).sum(axis=1)
+        # for hap in [0,1]:
+        #     var_dump(f"opts01-05_dev1.3.1/HG02330/{hap}/07_weight_matrix.pkl", weight_matrices[hap])
+        #     # post_true = var_load(f"opts01-04_dev1/HG02330/{hap}/07_post.pkl")
+        #     print(f"dumped weight_matrix for HG02330/{hap}")
+        # exit(0)
+        resultsoo_fb, target_full_array = impute_interpolate(weight_matrices, original_indicies, full_full_ref_panel_vcfgz_path, chr_length, start_imputation, end_imputation, imputing_samples_haploids_indices, reference_haploids_indices, internal_haploid_order)
         kuklog_timestamp_func(f"imputation via interpolate")
     else:
+        raise RuntimeError("this condition under run_hmm shouldn't have happened")
         return None
-    return resultoo_fb
+    return resultsoo_fb, target_full_array
 
 
 def run_hmm_variable_N(
@@ -339,6 +368,7 @@ def run_hmm_variable_N(
     """
     RUNs the forward and backward runs of the forward-backward algorithm
     """
+    raise NotImplementedError("This function needs changing in accord to the updates of the f-b algo and interpolation imputation part since opt04 (stage #1 of optimizations)")
 
     alpha = setFwdValues(
         num_obs, ordered_hap_indices, distances_cm, variable_range=True, N_range=N_range
