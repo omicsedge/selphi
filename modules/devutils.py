@@ -19,7 +19,7 @@ def pickle_dump(obj, path: str):
         pickle.dump(obj, f)
         return path
 def pickle_load(path: str):
-    with forced_open(path, "rb") as f:
+    with open(path, "rb") as f:
         return pickle.load(f)
 
 
