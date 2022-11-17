@@ -3,6 +3,9 @@
 #include <boost/iostreams/filtering_streambuf.hpp>
 #include <boost/iostreams/copy.hpp>
 #include <boost/iostreams/filter/gzip.hpp>
+#include <boost/range/adaptor/strided.hpp>
+#include <boost/range/algorithm/copy.hpp>
+#include <boost/assign.hpp>
 #include <zlib.h> // https://refspecs.linuxbase.org/LSB_3.0.0/LSB-Core-generic/LSB-Core-generic/zlib-gzgets-1.html
 #include <bits/stdc++.h>
 
@@ -10,7 +13,28 @@
 #define N_SAMPLES 3202
 #define N_HAPLOIDS N_SAMPLES*2
 #define N_CHARS_ROW_MAX N_HAPLOIDS*2 + 4000 // THIS SHOULD BE DYNAMICALLY DECIDED
-// #define N_FULL_SEQ_VARIANTS 1647102
+
+const int CACHE_LINE_LEN = 1000000;
+char cache_line[CACHE_LINE_LEN];
+int metadata_columns = 0;
+const int* metadata_columns_global_p = &metadata_columns;
+
+
+template <typename T> // T models Any
+struct static_cast_func {
+    template <typename T1> // T1 models type statically convertible to T
+    T operator()(const T1& x) const { return static_cast<T>(x); }
+};
+
+
+
+template< typename T, int N >
+struct EveryNth {
+    bool operator()(const T&) { return m_count++ % N == 0; }
+    EveryNth() : m_count(0) {}
+    private:
+    int m_count;
+};
 
 
 
@@ -28,11 +52,12 @@ struct noGenotypesException : public std::exception {
 
 
 
-std::vector< char > readline( gzFile f ) {
-    std::vector< char > v( N_CHARS_ROW_MAX );
+int readline_arr( gzFile f ) {
+    // std::vector< char > v( N_CHARS_ROW_MAX );
     unsigned pos = 0;
+    unsigned size = 0;
     for ( ;; ) {
-        if ( gzgets( f, &v[ pos ], v.size() - pos ) == 0 ) {
+        if ( gzgets( f, &cache_line[ pos ], CACHE_LINE_LEN - pos ) == 0 ) {
             // end-of-file or error
 
             if (gzeof(f)){
@@ -46,25 +71,27 @@ std::vector< char > readline( gzFile f ) {
             }
             break;
         }
-        unsigned read = strlen( &v[ pos ] );
-        if ( v[ pos + read - 1 ] == '\n' ) {
-            if ( pos + read >= 2 && v[ pos + read - 2 ] == '\r' ) {
+        unsigned read = strlen( &cache_line[ pos ] );
+        if ( cache_line[ pos + read - 1 ] == '\n' ) {
+            if ( pos + read >= 2 && cache_line[ pos + read - 2 ] == '\r' ) {
                 pos = pos + read - 2;
             } else {
                 pos = pos + read - 1;
             }
             break;
         }
-        if ( read == 0 || pos + read < v.size() - 1 ) {
+        if ( read == 0 || pos + read < CACHE_LINE_LEN - 1 ) {
             pos = read + pos;
             break;
         }
-        pos = v.size() - 1;
-        v.resize( v.size() * 2 );
+        pos = CACHE_LINE_LEN - 1;
+        size = CACHE_LINE_LEN * 2;
     }
-    v.resize( pos );
-    return v;
+    size = pos;
+    return size;
 }
+
+
 
 
 
@@ -73,93 +100,58 @@ int8_t get_haploid_from_line(
     int metadata_columns,
     int haploid_i
 ){
+    const int metadata_cols = *metadata_columns_global_p;
+
     int metadata = 0;
     int i = 0;
     while (true){
-        if (i == metadata_columns)
+        if (i == metadata_cols)
             break;
-        if (line[metadata] == '\t')
+        if (cache_line[metadata] == '\t')
             i++;
         metadata++;
     }
 
     return static_cast<int8_t>(
-        line[metadata + (haploid_i * 2)] - '0'
+        cache_line[metadata + (haploid_i * 2)] - '0'
     );
 }
+
 
 
 void populate_array_from_line(
     int8_t* arr,
     std::vector<char> line,
-    long long int total_haploids,
-    int metadata_columns,
-    long long int line_i
+    const long long int total_haploids,
+    const int metadata_columns,
+    const long long int line_i
 ){
-    char* line_array = &line[0];
+    const int metadata_cols = *metadata_columns_global_p;
 
     int metadata = 0;
     {
         int i = 0;
         while (true){
-            if (i == metadata_columns)
-                break;
-            if (line_array[metadata] == '\t')
+            if (cache_line[metadata] == '\t')
                 i++;
+                if (i == metadata_cols)
+                    break;
             metadata++;
         }
+        metadata++;
     }
 
-    long long int z = line_i*total_haploids;
+    const long long int z = line_i * (total_haploids);
+    int8_t* arr_shifted = &arr[z]; // skipped rows above
+
+    const char* cache_line_shifted = &cache_line[metadata]; // skipped metadata columns
 
     for (int i = 0; i < total_haploids; i++){
-        *(arr + z + i) = static_cast<int8_t>(line_array[metadata + (i * 2)] - '0');
+        arr_shifted[i] = cache_line_shifted[(i * 2)] - '0';
     }
 
-    /*
-    even/odd                 eoeoeoeoeoeoeoeoeoeoeoeoe
-    tens                               111111111122222
-    units                    0123456789012345678901234
-                             |                      ||
-                             v                      vv
-    mmmmmmmmmmmmmmmmmmmmmmmmm0|1 0|0 0|0 0|0 1|0 0|1$
-                             ^                       ^
-                             |                       |
-                        int metadata            line.size()
-
-    [space denotes a tab, $ denotes a newline]
-
-    this structure should guarantee `(line.size() - metadata) % 2 == 0`
-    */
-    // std::size_t n = (line.size()+static_cast<std::size_t>(1)-metadata) / static_cast<std::size_t>(2);
-    // for (long long int i = 0; i < n; i++){
-    //     *(arr + z + i) = static_cast<int8_t>(line[metadata + (i * 2)] - '0');
-    // }
-
-    // long long int  n = static_cast<long long int>(
-    //     (line.size()+static_cast<std::size_t>(1)-metadata)
-    //             / static_cast<std::size_t>(2)
-    // );
-    // for (int i = 0; i < std::min(total_haploids, n); i++){
-    //     *(arr + z + i) = static_cast<int8_t>(line[metadata + (i * 2)] - '0');
-    // }
-
-
-    // return static_cast<int8_t>(
-    //     line[metadata + (haploid_i * 2)] - '0'
-    // );
 
 }
-
-
-
-void cout_vect(std::vector<char> vec){
-    for (char i : vec)
-        std::cout << i;
-    std::cout << "[size: " << vec.size() << "]";
-    std::cout << std::endl;
-}
-
 
 
 
@@ -174,11 +166,17 @@ bool is_genotype(const std::vector<char> line, int start){
 
 
 
+
 enum file_state {
     closed,
     opened,
 };
 
+
+struct vcfTableParams {
+    const int * metadata_cols;
+    const long long * total_haps;
+};
 
 class vcfgz_reader {
     const char* file_path;
@@ -192,6 +190,13 @@ class vcfgz_reader {
 
     char* table_header;
 
+    const int* metadata_columns_p;
+    const long long* total_haploids_p;
+
+
+    int line_len;
+    int first_data_line_len;
+
 
     private:
         void open(const char* path){
@@ -202,15 +207,17 @@ class vcfgz_reader {
             this->header_row_i = 0;
             this->header_read = false;
         }
-        void read_vcfheader(){
+
+        vcfTableParams read_vcfheader(){
+
             while (true) {
-                this->line_v = readline(this->ref_panel);
+                this->line_len = readline_arr(this->ref_panel);
 
                 // vcf header are lines at the beginning that start with two hashes ##
                 // table header is the line that comes after the vcf header and start with one hash #
                 // next comes the table data
-                if (this->line_v[0] == '#'){
-                    if (this->line_v[1] != '#'){
+                if (cache_line[0] == '#'){
+                    if (cache_line[1] != '#'){
                         this->table_header = this->line_arr;
                     }
                     this->header_row_i++;
@@ -222,36 +229,27 @@ class vcfgz_reader {
 
 
             this->table_header;
-            const std::vector<char> first_data_line = this->line_v;
-            const char* first_data_line_arr = this->line_arr;
+            const std::vector<char> first_data_line(cache_line, cache_line+this->line_len);
+            this->first_data_line_len = this->line_len;
 
             bool there_are_genotypes = false;
             int number_of_genotypes = 0;
             this->metadata_columns = 1;
             this->total_haploids = 0;
 
-            std::size_t first_data_line_len = first_data_line.size();
-
-            // std::cout << "this->header_row_i = " << this->header_row_i << std::endl;
-            // std::cout << "this->table_header = " << this->table_header << std::endl;
-            // std::cout << "this->table_header = " << this->table_header << std::endl;
-
-            // std::cout << "FIRST DATA LINE: ";
-            // cout_vect(first_data_line);
-
             int n_cols = 1;
 
             std::vector<char> slice;
-            for (std::size_t i = 0; i < first_data_line_len; i++){
+            for (std::size_t i = 0; i < this->first_data_line_len; i++){
                 if (first_data_line[i] == '\t'){
                     n_cols++;
                     slice = std::vector<char>(first_data_line.begin()+i+1, first_data_line.begin()+i+4);
                     if (
                         ( // next 3 characters are the genotype entry (e.g. '0|0')
-                            i+3 < first_data_line_len &&
+                            i+3 < this->first_data_line_len &&
                             is_genotype(first_data_line, i+1)
                         ) && ( // AND these 3 characters are the entire field
-                            i+4 == first_data_line_len ||  
+                            i+4 == this->first_data_line_len ||  
                             first_data_line[i+4] == '\n' ||
                             first_data_line[i+4] == '\r' ||
                             first_data_line[i+4] == '\t'   
@@ -265,30 +263,32 @@ class vcfgz_reader {
                 }
             }
 
-            // std::cout << "this->metadata_columns = " << this->metadata_columns << std::endl;
-            // std::cout << "number_of_genotypes = " << number_of_genotypes << std::endl;
-
             if (number_of_genotypes == 0){
                 throw noGenotypesException();
             }
 
             this->total_haploids = number_of_genotypes*2;
 
-            // std::cout << "total_haploids   = " << this->total_haploids   << std::endl;
-            // std::cout << "metadata_columns = " << this->metadata_columns << std::endl;
+            static const long long total_haps = this->total_haploids;
+
+            static const int metadata_cols = this->metadata_columns;
+            metadata_columns_global_p = &this->metadata_columns;
+
+            return { &metadata_cols, &total_haps };
+
         }
 
-        void read_header(){
-            while (true) {
-                this->line_v = readline(this->ref_panel);
-                if (this->line_v[0] == '#'){
-                    this->header_row_i++;
-                } else {
-                    this->header_read = true;
-                    break;
-                }
-            }
-        }
+        // void read_header(){
+        //     while (true) {
+        //         this->line_v = readline(this->ref_panel);
+        //         if (this->line_v[0] == '#'){
+        //             this->header_row_i++;
+        //         } else {
+        //             this->header_read = true;
+        //             break;
+        //         }
+        //     }
+        // }
 
 
     public:
@@ -301,7 +301,9 @@ class vcfgz_reader {
 
             std::vector<char> v(N_CHARS_ROW_MAX);
             this->line_v = v;
-            this->read_vcfheader();
+            vcfTableParams params = this->read_vcfheader();
+            this->metadata_columns_p = params.metadata_cols;
+            this->total_haploids_p = params.total_haps;
         }
         ~vcfgz_reader(){
             if (this->state == opened){
@@ -329,12 +331,12 @@ class vcfgz_reader {
 
             try {
                 if (! this->header_read)
-                    this->read_header();
+                    this->read_vcfheader();
 
                 for (i = 0; i < n; i++){
                     segm[i] = get_haploid_from_line(this->line_v, this->metadata_columns, haploid);
                     this->table_row_i++;
-                    this->line_v = readline(this->ref_panel);
+                    this->line_len = readline_arr(this->ref_panel);
                 }
             } catch (gzReadPastEOF& e) {
                 this->close();
@@ -347,7 +349,6 @@ class vcfgz_reader {
         int readlines(
             int8_t* table,
             long long int n
-            // long long int total_haploids
         ){
             if (n < 0)
                 throw std::invalid_argument("`n` has to be an non-negative integer");
@@ -364,7 +365,7 @@ class vcfgz_reader {
                 for (i = 0; i < n; i++){
                     populate_array_from_line(table, this->line_v, this->total_haploids, this->metadata_columns, i);
                     this->table_row_i++;
-                    this->line_v = readline(this->ref_panel);
+                    this->line_len = readline_arr(this->ref_panel);
                 }
             } catch (gzReadPastEOF& e) {
                 this->close();
