@@ -13,18 +13,20 @@ import zarr
 import pickle
 from tqdm import trange
 
-from modules.utils import vcf_haploid_order_to_internal
+from modules.utils import vcf_haploid_order_to_internal, BInBJ_paired, BInBJ_both
 
 from modules.load_data import (
     load_test_samples_indices,
     load_variants_ids,
     load_and_interpolate_genetic_map,
     load_chip_reference_panel,
+    load_chip_reference_panel_combined,
 )
 
 from modules.imputation_lib import (
     BiDiPBWT,
     create_composite_ref_panel,
+    run_BiDiPBWT_and_cr8_composite_refpanel,
     calculate_haploid_frequencies,
     calculate_haploid_count_threshold,
     apply_filters_to_composite_panel_mask,
@@ -82,13 +84,12 @@ print("loaded and interpolated genetic map")
 
 num_hid = len(refpan_haploid_indices) # number of reference panel haploids
 internal_haploid_order = [vcf_haploid_order_to_internal(i, int(num_hid/2)) for i in range(num_hid)]
-full_ref_panel_chip_array, combined_ref_panel_chip = load_chip_reference_panel(
-    chip_sites_dataset_file = f"./data/full_ref_panel/{chrom}/reference_panel.30x.hg38_{chrom}.chip-sites.zip",
-    refpan_haploid_indices = refpan_haploid_indices,
-)
-kuklog_timestamp("loaded reference panels", KUKLOG)
-print("loaded reference panels")
-
+# full_ref_panel_chip_array, combined_ref_panel_chip = load_chip_reference_panel(
+#     chip_sites_dataset_file = f"./data/full_ref_panel/{chrom}/reference_panel.30x.hg38_{chrom}.chip-sites.zip",
+#     refpan_haploid_indices = refpan_haploid_indices,
+# )
+# kuklog_timestamp("loaded reference panels", KUKLOG)
+# print("loaded reference panels")
 
 
 import sys
@@ -113,14 +114,11 @@ HAPS: List[Literal[0,1]] = [0,1]
 import time
 start_time = time.time()
 
+last_sample = samples[test_sample_to-1]
 for the_sample in samples[test_sample_from:test_sample_to]:
-
-
 
     ordered_matches_list: List[Dict[int, List[np.int64]]] = []
     imputing_samples: OrderedDict_type[str, OrderedDict_type[Literal[0,1], Literal[True]]] = OrderedDict()
-
-
 
     full_res_: Dict[str, np.ndarray] = {}
 
@@ -133,8 +131,15 @@ for the_sample in samples[test_sample_from:test_sample_to]:
         start_sample_time = time.time()
         print(f"{sample} (#{sample_global_index})")
 
-        # set the two last haploids in the "combined" ref panel to the input sample's two haploids
-        combined_ref_panel_chip[:,-2:] = full_ref_panel_chip_array[:,2*sample_global_index : 2*sample_global_index+2]
+        # # set the two last haploids in the "combined" ref panel to the input sample's two haploids
+        # combined_ref_panel_chip[:,-2:] = full_ref_panel_chip_array[:,2*sample_global_index : 2*sample_global_index+2]
+        combined_ref_panel_chip = load_chip_reference_panel_combined(
+            chip_sites_dataset_file = f"./data/full_ref_panel/{chrom}/reference_panel.30x.hg38_{chrom}.chip-sites.zip",
+            refpan_haploid_indices = refpan_haploid_indices,
+            sample_global_index=sample_global_index,
+        )
+        kuklog_timestamp("loaded reference panels", KUKLOG)
+        print("loaded reference panels")
 
         # # var_dump(f"opts01-05_dev1.1/{sample}/00_target_full_array.pkl", target_full_array)
         # # var_dump(f"opts01-05_dev1.1/{sample}/00_target_chip_array.pkl", target_chip_array)
@@ -151,11 +156,13 @@ for the_sample in samples[test_sample_from:test_sample_to]:
 
             kuklog_timestamp_func = lambda s: kuklog_timestamp(f"hap{hap}: BiDiPBWT: {s}", KUKLOG)
             BI, BJ = BiDiPBWT(
-                combined_ref_panel_chip,
+                combined_ref_panel_chip, #type:ignore # it's not unbound since we del it only after the last iteration
                 num_hid,
                 hap,
                 kuklog_timestamp_func,
             )
+            if hap == HAPS[-1]:
+                del combined_ref_panel_chip #type:ignore # it's not unbound since we del it only after the last iteration
             # var_dump(f"opts01-05_dev1.3/{sample}/{hap}/01_BI.pkl", BI)
             # var_dump(f"opts01-05_dev1.3/{sample}/{hap}/01_BJ.pkl", BJ)
             # BI_true = var_load(f"opts01-04_dev1/{sample}/{hap}/01_BI.pkl")
@@ -165,7 +172,7 @@ for the_sample in samples[test_sample_from:test_sample_to]:
             # print(f"{(BJ == BJ_true).all()=}")
             # print(f"{np.where(BJ != BJ_true)[0].shape=}")
             # exit(0)
-            kuklog_timestamp(f"hap{hap}: ran BiDiPBWT", KUKLOG)
+            kuklog_timestamp(f"hap{hap}: ran BiDiPBWT", KUKLOG) #1
             matches, composite_, comp_matches_hybrid = create_composite_ref_panel(
                 BI,
                 BJ,
@@ -178,29 +185,31 @@ for the_sample in samples[test_sample_from:test_sample_to]:
             # composite_ = var_load(f"opts01-04_dev1/{sample}/{hap}/02_composite_.pkl")
             # comp_matches_hybrid = var_load(f"opts01-04_dev1/{sample}/{hap}/02_comp_matches_hybrid.pkl")
 
-            kuklog_timestamp(f"hap{hap}: created first composite ref panel", KUKLOG)
+            kuklog_timestamp(f"hap{hap}: created first composite ref panel", KUKLOG) #2
             haps_freqs_array_norm_dict = calculate_haploid_frequencies(
-                matches,
+                matches, # X
                 comp_matches_hybrid,
                 CHUNK_SIZE,
             )
             # var_dump(f"opts01-05_dev1.3.1/{sample}/{hap}/03_haps_freqs_array_norm_dict.pkl", haps_freqs_array_norm_dict)
             # haps_freqs_array_norm_dict = var_load(f"opts01-04_dev1/{sample}/{hap}/03_haps_freqs_array_norm_dict.pkl")
-            kuklog_timestamp(f"hap{hap}: calculated 1st filter: haploid frequencies", KUKLOG)
+            kuklog_timestamp(f"hap{hap}: calculated 1st filter: haploid frequencies", KUKLOG) #3
             nc_thresh = calculate_haploid_count_threshold(
-                matches,
-                composite_,
+                matches, # likely X cuz "hybrid" is "comp_matches_hybrid"
+                composite_, # X
                 comp_matches_hybrid,
                 haps_freqs_array_norm_dict,
                 CHUNK_SIZE,
             )
+            del comp_matches_hybrid
+            del composite_
             # var_dump(f"opts01-05_dev1.3.1/{sample}/{hap}/04_nc_thresh.pkl", nc_thresh)
             # # nc_thresh = var_load(f"opts01-04_dev1/{sample}/{hap}/04_nc_thresh.pkl")
-            kuklog_timestamp(f"hap{hap}: calculated 2nd filter: haploid count threshold", KUKLOG)
+            kuklog_timestamp(f"hap{hap}: calculated 2nd filter: haploid count threshold", KUKLOG) #4
             composite_ = apply_filters_to_composite_panel_mask(
                 matches,
-                composite_,
-                comp_matches_hybrid,
+                # composite_, # X
+                # comp_matches_hybrid, # X
                 BI,
                 BJ,
 
@@ -213,11 +222,10 @@ for the_sample in samples[test_sample_from:test_sample_to]:
             # var_dump(f"opts01-05_dev1.3.1/{sample}/{hap}/05_composite_.pkl", composite_)
             del BI
             del BJ
-            del comp_matches_hybrid
             del haps_freqs_array_norm_dict
             del nc_thresh
             # # composite_ = var_load(f"opts01-04_dev1/{sample}/{hap}/05_composite_.pkl")
-            kuklog_timestamp(f"hap{hap}: applied the 2 filters", KUKLOG)
+            kuklog_timestamp(f"hap{hap}: applied the 2 filters", KUKLOG) #5
             """
             Adriano is working here
             """
@@ -244,15 +252,14 @@ for the_sample in samples[test_sample_from:test_sample_to]:
         # # del combined_ref_panel_chip
         print(f"--- {sample} time: {(time.time() - start_sample_time)} seconds ---")
 
-    # # var_dump(f"opts01-05_dev1.3.1/06_ordered_matches_list_1sample_12.pkl", ordered_matches_list)
+    # # var_dump(f"stage2/06_ordered_matches_list_1sample_12.pkl", ordered_matches_list)
+    # ordered_matches_list = var_load(f"stage2/06_ordered_matches_list_1sample_12.pkl")
     # # del full_ref_panel_chip_array
     # # ordered_matches_list = var_load(f"opts01-05_dev1.3.1/06_ordered_matches_list_1sample_12.pkl")
     # ordered_matches_list = var_load(f"opts01-05_dev1.3.1/06_ordered_matches_list_10samples_12-21.pkl")
     # # ordered_matches_list = [ordered_matches_list[0]]
     # # exit(0)
 
-    # del full_ref_panel_chip_array
-    # del combined_ref_panel_chip
 
     imputing_samples_haploids_indices: List[int] = []
     for sample, haps in imputing_samples.items():
@@ -348,7 +355,7 @@ for the_sample in samples[test_sample_from:test_sample_to]:
                     str(mismatch[0]),
                     str(mismatch[1]),
                     str(mismatch['genotype']),
-                    str(round(100 - (mismatch['genotype']/len(true_target_full_sample[0]))*100, 4)),
+                    str(round(100 - (mismatch['genotype']/len(true_target_full_sample[0]))*100, 6)),
                 ]) + '\n')
                 mismatch_log_f.flush()
 
