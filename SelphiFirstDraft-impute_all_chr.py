@@ -13,7 +13,7 @@ import zarr
 import pickle
 from tqdm import trange
 
-from modules.utils import vcf_haploid_order_to_internal, BInBJ_paired, BInBJ_both
+from modules.utils import vcf_haploid_order_to_internal
 
 from modules.load_data import (
     load_test_samples_indices,
@@ -26,6 +26,7 @@ from modules.load_data import (
 from modules.imputation_lib import (
     BiDiPBWT,
     create_composite_ref_panel,
+    create_composite_ref_panel_np,
     run_BiDiPBWT_and_cr8_composite_refpanel,
     calculate_haploid_frequencies,
     calculate_haploid_count_threshold,
@@ -173,7 +174,7 @@ for the_sample in samples[test_sample_from:test_sample_to]:
             # print(f"{np.where(BJ != BJ_true)[0].shape=}")
             # exit(0)
             kuklog_timestamp(f"hap{hap}: ran BiDiPBWT", KUKLOG) #1
-            matches, composite_, comp_matches_hybrid = create_composite_ref_panel(
+            matches, composite_, comp_matches_hybrid = create_composite_ref_panel_np(
                 BI,
                 BJ,
                 fl=13,
