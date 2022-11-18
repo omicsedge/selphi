@@ -1,15 +1,19 @@
 import math
-from tqdm import trange
+from typing import List, Set, Tuple, TypeVar, Union, Iterable, Dict, Literal
 
+from tqdm import trange
 import numpy as np
+from numba import njit
+
+
 
 def pRecomb(
-    obs,
-    distances_cm,
-    variable_range=False,
-    num_hid=9000,
-    N_range=None,
-    ne=1000000,
+    obs: int,
+    distances_cm: List[float],
+    variable_range: bool = False,
+    num_hid: int = 9000,
+    N_range: None = None,
+    ne: int = 1000000,
 ):
     """
     pRecomb betweem obs and and obs-1
@@ -29,12 +33,12 @@ def pRecomb(
 
 def setFwdValues(
     alpha: np.ndarray,
-    num_obs,
-    ordered_matches,
-    distances_cm,
-    variable_range=False,
-    N_range=None,
-    num_hid=9000,
+    num_obs: int,
+    ordered_matches: Dict[int, List[np.int64]],
+    distances_cm: List[float],
+    variable_range: bool = False,
+    N_range: None= None,
+    num_hid: int = 9000,
 ):
     """
     set forward values
@@ -74,13 +78,13 @@ def setFwdValues(
 
 
 def setBwdValues(
-    alpha,
-    num_obs,
-    ordered_matches,
-    distances_cm,
-    variable_range=False,
-    N_range=None,
-    num_hid=9000,
+    alpha: np.ndarray,
+    num_obs: int,
+    ordered_matches: Dict[int, List[np.int64]],
+    distances_cm: List[float],
+    variable_range: bool = False,
+    N_range: None= None,
+    num_hid: int = 9000,
 ):
     """
     set backward values
