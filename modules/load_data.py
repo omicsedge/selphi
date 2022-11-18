@@ -168,6 +168,33 @@ def load_chip_reference_panel(
     return full_ref_panel_chip_array, blank_combined_ref_panel_chip
 
 
+def load_chip_reference_panel_combined(
+    chip_sites_dataset_file: str,
+    refpan_haploid_indices: List[int],
+    sample_global_index: int,
+):
+    """
+    Loads and creates a chip-sites "combined" reference panel:
+     - the reference panel without test samples, but with 2 additional haploids from the input sample
+    """
+    full_ref_panel_chip_array: np.ndarray = zarr.load(chip_sites_dataset_file) # type: ignore # enforce the type
+
+    num_hid = len(refpan_haploid_indices)
+    combined_ref_panel_chip: np.ndarray = np.zeros(
+        (full_ref_panel_chip_array.shape[0], num_hid+2),
+        dtype=full_ref_panel_chip_array.dtype.type
+    )
+    internal_order = [vcf_haploid_order_to_internal(i, int(num_hid/2)) for i in range(num_hid)]
+    combined_ref_panel_chip[:, :num_hid] = full_ref_panel_chip_array[:, refpan_haploid_indices][:, internal_order]
+
+    # set the two last haploids in the "combined" ref panel to the input sample's two haploids
+    combined_ref_panel_chip[:,-2:] = full_ref_panel_chip_array[:,2*sample_global_index : 2*sample_global_index+2]
+
+    return combined_ref_panel_chip
+
+
+
+
 @lru_cache(1)
 def load_full_reference_panels(
     full_dataset_file: str,
