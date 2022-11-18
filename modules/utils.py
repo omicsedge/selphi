@@ -327,6 +327,7 @@ def impute_interpolate(
     target_full_array = np.zeros((chr_length, total_input_haploids), dtype=np.int8)
 
     refpanel = vcfgz_reader(full_full_ref_panel_vcfgz_path)
+    # refpanel = IBDs_extractor(full_full_ref_panel_vcfgz_path)
     batch_size = 15_000 # smaller batch -> less RAM usage, but more iterations (more CPU time)
 
 
@@ -388,6 +389,7 @@ def impute_interpolate(
          - end position on the fill sequence
         """
         batch, lines_read_n = refpanel.readlines(lines_n=batch_size, refill=batch)
+        # batch, lines_read_n = refpanel.readlines3(lines_n=batch_size, total_haploids_n=6404, refill=batch)
 
         batch_start_pos = batch_end_pos
         batch_end_pos   = batch_end_pos+lines_read_n
@@ -1190,50 +1192,70 @@ def plot_results(
 #####################################
 
 
-class BidiBurrowsWheelerLibrary:
-    def __init__(self, haplotypeList: np.ndarray, Target: int):
-        self.library_back = createBWLibrary(np.array(haplotypeList))
-        self.library_forw = createBWLibrary(np.flip(np.array(haplotypeList), axis=1))
-        self.hapList = haplotypeList
-        self.target = Target
-        self.Shape = self.hapList.shape
-        self.nHaps = len(haplotypeList)
 
-    def getForward_Ppa(self):
-        return np.flip(self.library_forw.ppa, axis=1)
+@njit(fastmath=True) #type:ignore # njit *is* callable
+def BInBJ(haplotypeList: np.ndarray, Target: int, num_hid: int):
+    library_forw = createBWLibrary(haplotypeList[:, ::-1])
+    library_back = createBWLibrary(haplotypeList)
+    
+    Shape = haplotypeList.shape
+    nHaps = haplotypeList.shape[0]
 
-    def getBackward_Ppa(self):
-        return np.flip(self.library_back.ppa, axis=1)
+    ppa_matrix = library_forw.ppa[:, ::-1] # using this because np.flip(a, axis=1) is not supported by numba
+    rev_ppa_matrix = library_back.ppa[:, ::-1]
 
-    def getForward_Div(self):
-        return np.full(
-            self.Shape, np.arange(1, self.Shape[1] + 1), dtype=self.library_forw.div.dtype.type
-        ) - np.flip(self.library_forw.div, axis=1)
+    num_chip_vars = ppa_matrix.shape[1]
 
-    def getBackward_Div(self):
-        return np.full(
-            self.Shape, np.arange(1, self.Shape[1] + 1), dtype=self.library_back.div.dtype.type
-        ) - np.flip(self.library_back.div, axis=1)
+    BI = np.zeros((num_hid,num_chip_vars), dtype=np.int32)
+    BJ = np.zeros((num_hid,num_chip_vars), dtype=np.int32)
 
-    def getForward_matches_indices(self):
-        return get_matches_indices(
-            self.getForward_Ppa(), self.getForward_Div(), self.target
+    for cv in range(num_chip_vars):
+        cvf = num_chip_vars - cv - 1 # chip variant flipped
+
+        div_matrix_cv = np.empty(nHaps, dtype=np.int32)
+        for i in range(nHaps):
+            div_matrix_cv[i] = 1+cv - library_forw.div[i, num_chip_vars-cv-1]
+
+        forward_pbwt_matches_ = replace_col(
+            div_matrix_cv,
+            cv,
+            np.where(ppa_matrix[:, cv] == Target)[0][0]
         )
+        forward_pbwt_index=ppa_matrix[:,cv]
 
-    def getBackward_matches_indices(self):
-        matches_indices = get_matches_indices(
-            self.getBackward_Ppa(), self.getBackward_Div(), self.target
+        rev_div_matrix_cvf = np.empty(nHaps, dtype=np.int32)
+        for i in range(nHaps):
+            rev_div_matrix_cvf[i] = 1+cvf - library_back.div[i, num_chip_vars-cvf-1]
+
+        backward_pbwt_matches_ = replace_col(
+            rev_div_matrix_cvf,
+            cvf,
+            np.where(rev_ppa_matrix[:, cvf] == Target)[0][0]
         )
-        return np.flip(
-            matches_indices[0],
-            axis=1,
-        ), list(
-            np.flip(
-                np.array(
-                    matches_indices[1]
-                )
-            )
-        )
+        backward_pbwt_index=rev_ppa_matrix[:,::-1][:,cv]
+
+        BI[:,cv] = forward_pbwt_matches_[forward_pbwt_index.argsort()][:num_hid]
+        BJ[:,cv] = backward_pbwt_matches_[backward_pbwt_index.argsort()][:num_hid]
+
+
+
+    num_chip_vars = ppa_matrix.shape[1]
+    """
+    Data cleaning: If a chip variant doesn't have _any_ matches in the reference panel,
+        then treat is as matching all the samples
+    """
+    for chip_var in range(num_chip_vars):
+
+        x = np.unique(BI[:,chip_var])
+        if len(x) == 1 and x[0] == 0:
+            BI[:,chip_var] = 1
+            BJ[:,chip_var] = 1
+
+
+
+    return BI, BJ
+
+
 
 
 jit_BidiBurrowsWheelerLibrary_s = OrderedDict()
@@ -1346,41 +1368,40 @@ def createBWLibrary(haps):
     return library
 
 
+
+"""
+because numba v0.54 and less don't support np.maximum.accumulate()
+"""
+@njit
+def numba_maximum_accumulate(A):
+    r = np.empty(len(A))
+    t = -np.inf
+    for i in range(len(A)):
+        t = np.maximum(t, A[i])
+        r[i] = t
+    return r
+
+
+@njit(fastmath=True) #type:ignore # njit *is* callable
 def replace_col(array, col_index, hap_index):
-    """
-    Expects array
-    """
+    acc = np.zeros(array.shape[0], dtype=np.int32)
+    acc[:hap_index + 1] = np.flip(numba_maximum_accumulate(np.flip(array[: hap_index + 1])))
+    acc[:hap_index] = acc[1 : hap_index + 1]
 
-    def accumelate_before(index, array):
-        arrayo = np.flip(np.maximum.accumulate(np.flip(array[: index + 1])))
-        return arrayo
+    acc[hap_index+1:] = numba_maximum_accumulate(array[hap_index + 1:])
+    return col_index + 1 - acc
 
-    def accumelate_after(index, array):
-        arrayo = np.maximum.accumulate(array[index + 1 :])
-        return arrayo
-
-    acc_before = accumelate_before(hap_index, array)
-    acc_before[:hap_index] = acc_before[1 : hap_index + 1]
-    return (
-        col_index
-        + 1
-        - np.concatenate(
-            [
-                acc_before,
-                accumelate_after(hap_index, array),
-            ]
-        )
-    )
 
 
 # Function to replace values with match lengths
+@njit(fastmath=True) #type:ignore # njit *is* callable
 def get_matches_indices(ppa_matrix, div_matrix, target=6401):
     forward_pbwt_matches = np.zeros(ppa_matrix.shape, dtype=np.int32)
-    forward_pbwt_hap_indices = list()
+    forward_pbwt_hap_indices = np.zeros(forward_pbwt_matches.shape[1], dtype=np.int64)
     for i in range(0, forward_pbwt_matches.shape[1]):
-        hap_index = int(np.where(ppa_matrix[:, i] == target)[0])
+        hap_index = np.where(ppa_matrix[:, i] == target)[0][0] # gets the first matching index (there should be only 1 though)
         forward_pbwt_matches[:, i] = replace_col(div_matrix[:, i], i, hap_index)
-        forward_pbwt_hap_indices.append(hap_index)
+        forward_pbwt_hap_indices[i] = hap_index
     return (forward_pbwt_matches, forward_pbwt_hap_indices)
 
 
