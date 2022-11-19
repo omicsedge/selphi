@@ -206,6 +206,8 @@ def plot_benchmark_logs(benchmarks: List[benchmark_logs], title: str, filename: 
 
     if filename:
         plt.savefig(filename, dpi=300)
+        print(f"plot saved to the file:")
+        print(filename)
     else:
         plt.show()
 
@@ -413,23 +415,23 @@ benchmarks = {
     #     color='#2f3fbf',
     # ),
     # 28: benchmark_logs(
-    #     name='membench_opt05_2022-09-21_05',
+    #     name='opt05_2022-09-21_05',
     #     dirname='membench_opt05_2022-09-21_05',
     #     color='#2f3fbf',
     # ),
 
 
 
-    # 2000: benchmark_logs(
-    #     name='v2022.07.28 stage#1 optim',
-    #     dirname='memory-benchmark_opts01-04_2022-08-22_c',
-    #     color='#af6f2fbf',
-    # ),
-    # 2001: benchmark_logs(
-    #     name='v2022.07.28 stage#2 optim',
-    #     dirname='membench_opt05_2022-09-21_05',
-    #     color='#2f3fbf',
-    # ),
+    ######## 2000: benchmark_logs(
+    ########     name='v2022.07.28 stage#1 optim',
+    ########     dirname='memory-benchmark_opts01-04_2022-08-22_c',
+    ########     color='#af6f2fbf',
+    ######## ),
+    ######## 2001: benchmark_logs(
+    ########     name='v2022.07.28 stage#2 optim',
+    ########     dirname='membench_opt05_2022-09-21_05',
+    ########     color='#2f3fbf',
+    ######## ),
     # 29: benchmark_logs(
     #     name='membench_opt05_2022-09-21_06',
     #     dirname='membench_opt05_2022-09-21_06',
@@ -470,11 +472,12 @@ benchmarks = {
     # ),
 
 
-    36: benchmark_logs(
-        name='membench_opt05_2022-09-21_05',
-        dirname='membench_opt05_2022-09-21_05',
-        color='#2f5fbf',
-    ),
+    # 36: benchmark_logs(
+    #     name='membench_opt05_2022-09-21_05',
+    #     dirname='membench_opt05_2022-09-21_05',
+    #     color='#2f5fbf',
+    # ),
+
     # 37: benchmark_logs(
     #     name='membench_stage2_refactored_2022-10-31_1sample',
     #     dirname='membench_stage2_refactored_2022-10-31_1sample',
@@ -595,16 +598,17 @@ benchmarks = {
     #     dirname='membench_stage2_refactored_utils-fix_2022-11-01_1sample_03',
     #     color='#4f2fbf',
     # ),
-    61: benchmark_logs(
-        name='membench_stage2_refactored_utils-fix_2022-11-01_1sample_04',
-        dirname='membench_stage2_refactored_utils-fix_2022-11-01_1sample_04',
-        color='#4f2fbf',
-    ),
-    61: benchmark_logs(
-        name='membench_stage2_refactored_ibds-extrctr_2022-11-01_1sample_02',
-        dirname='membench_stage2_refactored_ibds-extrctr_2022-11-01_1sample_02',
-        color='#b703bf',
-    ),
+
+    # 61: benchmark_logs(
+    #     name='membench_stage2_refactored_utils-fix_2022-11-01_1sample_04',
+    #     dirname='membench_stage2_refactored_utils-fix_2022-11-01_1sample_04',
+    #     color='#4f2fbf',
+    # ),
+    # 61: benchmark_logs(
+    #     name='membench_stage2_refactored_ibds-extrctr_2022-11-01_1sample_02',
+    #     dirname='membench_stage2_refactored_ibds-extrctr_2022-11-01_1sample_02',
+    #     color='#b703bf',
+    # ),
 
 
     # 2100: benchmark_logs(
@@ -617,6 +621,226 @@ benchmarks = {
     #     dirname='membench_stage2_refactored_utils-fix_2022-11-01_1sample_04',
     #     color='#4f2fbf',
     # ),
+
+
+    # 62: benchmark_logs(
+    #     name='stage2_refactored_2022-11-10_chr1_02',
+    #     dirname='membench_stage2_refactored_2022-11-10_chr1_02',
+    #     color='#2f3fbf',
+    # ),
+
+
+    # 63: benchmark_logs(
+    #     name='stage2rfct_ibdsx-sep14-rfct01_2022-11-12_1smpl_01',
+    #     dirname='membench_stage2_refactored_ibds-extrctr-sep14-refact01_2022-11-12_1sample_01',
+    #     color='#4f2fbf',
+    # ),
+
+    # 64: benchmark_logs(
+    #     name='membench_stage3-dev_2022-11-17_test01',
+    #     dirname='membench_stage3-dev_2022-11-17_test01',
+    #     color='#2f3fbf',
+    # ),
+
+    # 65: benchmark_logs(
+    #     name='membench_stage3-dev_2022-11-17_opt06',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06',
+    #     color='#6f1fbf',
+    # ),
+    #####66: benchmark_logs(
+    #####    name='membench_stage3-dev_2022-11-17_opt06-07_02',
+    #####    dirname='membench_stage3-dev_2022-11-17_opt06-07_02',
+    #####    color='#b703bf',
+    #####),
+
+
+    # 67: benchmark_logs(
+    #     name='membench_stage3-dev_2022-11-17_opt06-08_01',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08_01',
+    #     color='#ef035f',
+    # ),
+    # 68: benchmark_logs(
+    #     name='membench_stage3-dev_2022-11-17_opt06-08_02',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08_02',
+    #     color='#efa32f',
+    # ),
+    # 69: benchmark_logs(
+    #     name='membench_stage3-dev_2022-11-17_opt06-08_03',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08_03',
+    #     color='#3ff32f',
+    # ),
+
+    # 70: benchmark_logs(
+    #     name='membench_stage3-dev_2022-11-17_opt06-09_01',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-09_01',
+    #     color='#0faf8f',
+    # ),
+    # 71: benchmark_logs(
+    #     name='membench_stage3-dev_2022-11-17_opt06-09_02',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-09_02',
+    #     color='#0faf8f',
+    # ),
+    # 72: benchmark_logs(
+    #     name='membench_stage3-dev_2022-11-17_opt06-09_03',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-09_03',
+    #     color='#0faf8f',
+    # ),
+    # 73: benchmark_logs(
+    #     name='membench_stage3-dev_2022-11-17_opt06-09_04',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-09_04',
+    #     color='#0faf8f',
+    # ),
+    # 74: benchmark_logs(
+    #     name='membench_stage3-dev_2022-11-17_opt06-09_05',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-09_05',
+    #     color='#0faf8f',
+    # ),
+    # 75: benchmark_logs(
+    #     name='membench_stage3-dev_2022-11-17_opt06-09_06',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-09_06',
+    #     color='#0faf8f',
+    # ),
+    ### 76: benchmark_logs(
+    ###     name='membench_stage3-dev_2022-11-17_opt06-08_04',
+    ###     dirname='membench_stage3-dev_2022-11-17_opt06-08_04',
+    ###     color='#0f8f3f',
+    ### ),
+    ### 77: benchmark_logs(
+    ###     name='membench_stage3-dev_2022-11-17_opt06-08_05',
+    ###     dirname='membench_stage3-dev_2022-11-17_opt06-08_05',
+    ###     color='#0faf8f',
+    ### ),
+    # 78: benchmark_logs(
+    #     name='membench_stage3-dev_2022-11-17_opt06-08_05B',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08_05B',
+    #     color='#0f2fff',
+    # ),
+    ####79: benchmark_logs(
+    ####    name='membench_stage3-dev_2022-11-17_opt06-08_05D',
+    ####    dirname='membench_stage3-dev_2022-11-17_opt06-08_05D',
+    ####    color='#0f2fff',
+    ####),
+    # 2001: benchmark_logs(
+    #     name='v2022.07.28 stage#2 optim',
+    #     dirname='membench_opt05_2022-09-21_05',
+    #     color='#af6f2fbf',
+    # ),
+    # 80: benchmark_logs(
+    #     name='membench_stage3-dev_2022-11-17_opt06-08_06',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08_06',
+    #     color='#6f1fbf',
+    # ),
+    # 81: benchmark_logs(
+    #     name='membench_stage3-dev_2022-11-17_opt06-08_06B',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08_06B',
+    #     color='#2f0f6f',
+    # ),
+    # 82: benchmark_logs( # same as opt06-08_06
+    #     name='membench_stage3-dev_2022-11-17_opt06-08_07',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08_07',
+    #     color='#6f1fbf',
+    # ),
+    # 83: benchmark_logs( # same as opt06-08_06
+    #     name='membench_stage3-dev_2022-11-17_opt06-08_07B',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08_07B', 
+    #     color='#6f1fbf',
+    # ),
+    # 84: benchmark_logs(  # as opt06-08_06, but div_matrix is not precalculated fully, but for each cv under the loop 
+    #     name='membench_stage3-dev_2022-11-17_opt06-08_08',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08_08',
+    #     color='#2f0f6f',
+    # ),
+    # 85: benchmark_logs(  # as opt06-08_06, but div_matrix is not precalculated fully, but for each cv under the loop 
+    #     name='membench_stage3-dev_2022-11-17_opt06-08_08B',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08_08B',
+    #     color='#2f0f6f',
+    # ),
+    # 86: benchmark_logs(  # as opt06-08_06, but div_matrix is not precalculated fully, but for each cv under the loop 
+    #     name='membench_stage3-dev_2022-11-17_opt06-08_08C', # C is different cuz memusage is now every 0.2 sec vs 0.3 before
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08_08C',
+    #     color='#2f0f6f',
+    # ),
+
+    ####87: benchmark_logs(  # as opt06-08_06, but div_matrix is not precalculated fully, but for each cv under the loop 
+    ####    name='membench_stage3-dev_2022-11-17_opt06-08,10_01',
+    ####    dirname='membench_stage3-dev_2022-11-17_opt06-08,10_01',
+    ####    color='#b703bf',
+    ####),
+    # 88: benchmark_logs(  # as opt06-10_01, but this is with njit(fastmath=True) for all BInBJ funcs
+    #     name='membench_stage3-dev_2022-11-17_opt06-08,10_02',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08,10_02',
+    #     color='#ef035f',
+    # ),
+    # 89: benchmark_logs(  # as opt06-10_02, but BiDiPBWT is combined with create_composite_ref_panel under numba
+    #     name='membench_stage3-dev_2022-11-17_opt06-08,10_03',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08,10_03',
+    #     color='#ff330f',
+    # ),
+    # 90: benchmark_logs(  # as opt06-10_02, but BiDiPBWT calculates BI and BJ separetly via the same function
+    #     name='membench_stage3-dev_2022-11-17_opt06-08,10_04',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08,10_04',
+    #     color='#ff330f',
+    # ),
+    # 91: benchmark_logs(  # as opt06-10_01, but this is with njit(fastmath=True) for all BInBJ funcs
+    #     name='membench_stage3-dev_2022-11-17_opt06-08,10_02B',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08,10_02B',
+    #     color='#ef035f',
+    # ),
+    # 92: benchmark_logs(  # as opt06-10_02, but vectorized calculation of the initial ref panel
+    #     name='membench_stage3-dev_2022-11-17_opt06-08,10_05',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08,10_05',
+    #     color='#af830f',
+    # ),
+    # 93: benchmark_logs(  # as opt06-10_02, but vectorized+njitted calculation of the initial ref panel
+    #     name='membench_stage3-dev_2022-11-17_opt06-08,10_06',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08,10_06',
+    #     color='#af830f',
+    # ),
+    # 94: benchmark_logs(  # as opt06-10_02, but removed redundant arrays in-between filters calculations
+    #     name='membench_stage3-dev_2022-11-17_opt06-08,10_07',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08,10_07',
+    #     color='#af830f',
+    # ),
+    # 95: benchmark_logs(
+    #     name='membench_stage3-dev_2022-11-17_opt06-08,10_02C',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08,10_02C',
+    #     color='#af830f',
+    # ),
+    # 96: benchmark_logs(  # another attempt of what did in opt06-10_07
+    #     name='membench_stage3-dev_2022-11-17_opt06-08,10_08',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08,10_08',
+    #     color='#aff30f',
+    # ),
+    # 97: benchmark_logs(  # as opt06-10_02, but a bit of 07, + njitted forward and backward algos
+    #     name='membench_stage3-dev_2022-11-17_opt06-08,10_09',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08,10_09',
+    #     color='#aff30f',
+    # ),
+    # 98: benchmark_logs(  # as opt06-10_02, but a bit of 07
+    #     name='membench_stage3-dev_2022-11-17_opt06-08,10_02E',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08,10_02E',
+    #     color='#2fa30f',
+    # ),
+    # 99: benchmark_logs(  # as opt06-10_02, but a bit of 07
+    #     name='membench_stage3-dev_2022-11-17_opt06-08,10_02F',
+    #     dirname='membench_stage3-dev_2022-11-17_opt06-08,10_02F',
+    #     color='#2fa30f',
+    # ),
+
+
+
+    3000: benchmark_logs(
+        name='v2022.07.28 stage#2 optim',
+        dirname='membench_opt05_2022-09-21_05',
+        color='#af6f2fbf',
+    ),
+    3001: benchmark_logs(  # as opt06-10_01, but this is with njit(fastmath=True) for all BInBJ funcs
+        name='v2022.07.28 stage#3 optim',
+        dirname='membench_stage3-dev_2022-11-17_opt06-08,10_02B',
+        color='#2f3fbf',
+    ),
+
+
 
 
 }
@@ -751,6 +975,10 @@ plot_benchmark_logs(
     # filename="benchmarks_plot_stage2_dev1.3.1_rfctrd-clib_2022-11-01_chr20_01.png",
     # filename="benchmarks_plot_stage2_dev1.3.2-fixA_2022-11-01_chr20_01.png",
     # filename="benchmarks_plot_stage2refactored_utils-fix_2022-11-01_chr20_04_show.png",
-    filename="benchmarks_plot_stage2refactored_ibds-extrctr-utils-fix_2022-11-01_chr20_01.png",
+    # filename="benchmarks_plot_stage2refactored_ibds-extrctr-utils-fix_2022-11-01_chr20_01.png",
+    # filename="benchmarks_plot_stage2_chr1_02.png",
+    # filename="benchplot_stage3-dev_2022-11-17_test01.png",
+
+    filename="benchplot_stage3-dev_2022-11-17_opt06-08,10_02B_show.png",
 )
 
