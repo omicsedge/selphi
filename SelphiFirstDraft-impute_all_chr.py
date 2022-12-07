@@ -12,6 +12,8 @@ import numpy as np
 import zarr
 import pickle
 from tqdm import trange
+from modules.vcfgz_reader import vcfgz_reader
+
 
 from modules.utils import vcf_haploid_order_to_internal
 
@@ -38,6 +40,7 @@ from modules.imputation_lib import (
 from modules.handling_results import (
     haploid_imputation_accuracy,
     save_imputation_results,
+    save_imputation_results_tsv,
     genotype_imputation_accuracy,
 )
 
@@ -51,6 +54,7 @@ chrom = "chr20"
 SI_data_folder = f"./data/SI_data/{chrom}"
 
 full_full_ref_panel_vcfgz_path = f'./data/full_ref_panel/{chrom}/reference_panel.30x.hg38_{chrom}_noinfo.vcf.gz'
+beagle_res = f'./beagle_results/{chrom}/target_imputed/target_1300_samples_imputed_beagle5.4_22Jul22.vcf.gz'
 
 kuklog_timestamp("loaded libraries", KUKLOG)
 print("loaded libraries")
@@ -77,7 +81,7 @@ num_obs = len(chip_id_list) # number of chip sites
 chr_length = len(full_id_list)
 
 chip_BP_positions, chip_cM_coordinates = load_and_interpolate_genetic_map(
-    genetic_map_path = f"/home/nikita/s3-sd-platform-dev/efs/service/genome-files-processing/resource_files/genetic_map_plink/plink.{chrom}.GRCh38.map",
+    genetic_map_path = f"./data/genetic_map/plink.{chrom}.GRCh38.map",
     chip_id_list = chip_id_list,
 )
 kuklog_timestamp("loaded and interpolated genetic map", KUKLOG)
@@ -102,10 +106,11 @@ assert 0 <= test_sample_from < test_sample_to <= len(samples), ARG_ERROR_MSG
 
 
 mismatch_log_f = forced_open(f"mismatch-{chrom}_vcforder_samples_{test_sample_from}-{test_sample_to}.tsv", 'w')
-mismatch_log_f.write('\t'.join(['sample#', 'sample_name', 'mismatch_hap0', 'mismatch_hap1', 'mismatch_gntp', 'accuracy_gntp_perc']) + '\n')
+mismatch_log_f.write('\t'.join(['sample#', 'sample_name', 'mismatch_selphi_hap0', 'mismatch_selphi_hap1',
+    'mismatch_selphi', 'accuracy_selphi', 'mismatch_beagle_hap0', 'mismatch_beagle_hap1', 
+    'mismatch_beagle', 'accuracy_beagle']) + '\n'
+)
 mismatch_log_f.flush()
-
-
 
 
 CHUNK_SIZE = num_obs # number of chip variants
@@ -302,7 +307,10 @@ for the_sample in samples[test_sample_from:test_sample_to]:
     print("DONE")
 
     i = 0
+    test_samples_index_list = list(test_samples_index.keys())
     for sample, haps in imputing_samples.items():
+        sample_test_index = test_samples_index_list.index(sample)
+
         true_target_full_sample: List[np.ndarray] = []
         mismatch = {
             0: 0,
@@ -343,12 +351,32 @@ for the_sample in samples[test_sample_from:test_sample_to]:
                     f'./results/pickled_selphi_results/saved_dictionary_{str(sample)}_new_method_{chrom}.pkl',
                 )
 
+                save_imputation_results_tsv(
+                    sample,
+                    full_res_[sample],
+                    f'./results/stripped-vcf/{chrom}_testsample{sample_test_index:03}_{str(sample)}.tsv',
+                )
+
                 print("Full results")
                 mismatch['genotype'] = genotype_imputation_accuracy(
                     full_res_[sample],
                     true_target_full_sample[0] + true_target_full_sample[1],
                 )
                 print(f"sample {sample} imputation mismatch:", mismatch['genotype'])
+
+                if beagle_res != '':
+                    beagle_data = pd.read_table(beagle_res,skiprows=8,usecols=[sample])[sample].str.split(":",expand=True)[0].str.split('|',expand=True)
+                    beagle_dict = {
+                        0: 0,
+                        1: 0,
+                        'genotype': 0,
+                    }
+                    beagle_dict[0] = haploid_imputation_accuracy(beagle_data[0].values.astype(int), target_full_array[:,0], 0)
+                    beagle_dict[1] = haploid_imputation_accuracy(beagle_data[1].values.astype(int), target_full_array[:,1], 1)
+                    beagle_dict['genotype'] = genotype_imputation_accuracy(
+                        {0:target_full_array[:,0],1:target_full_array[:,1]},
+                        beagle_data[0].values.astype(int) + beagle_data[1].values.astype(int),
+                    )
 
                 mismatch_log_f.write('\t'.join([
                     str(samples.index(sample)),
@@ -357,6 +385,10 @@ for the_sample in samples[test_sample_from:test_sample_to]:
                     str(mismatch[1]),
                     str(mismatch['genotype']),
                     str(round(100 - (mismatch['genotype']/len(true_target_full_sample[0]))*100, 6)),
+                    str(beagle_dict[0]),
+                    str(beagle_dict[1]),
+                    str(beagle_dict['genotype']),
+                    str(round(100 - (beagle_dict['genotype']/len(true_target_full_sample[0]))*100, 6))
                 ]) + '\n')
                 mismatch_log_f.flush()
 
