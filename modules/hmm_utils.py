@@ -55,7 +55,7 @@ def setFwdValues(
 
     alpha[1, ordered_matches[0]] = 1 / len(ordered_matches[0])
 
-    for m in trange(start+1, end):
+    for m in range(start+1, end):
         pRecomb_var = pRecomb(
             m,
             distances_cm,
@@ -97,7 +97,7 @@ def setBwdValues(
     beta[:, 0] = 1 / nHaps[-1]
     pErr = 0.0001
     pNoErr = 1 - pErr
-    for m in trange(end - 2, 0, -1):
+    for m in range(end - 2, 0, -1):
         pRecomb_var = pRecomb(
             m,
             distances_cm,

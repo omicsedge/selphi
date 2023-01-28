@@ -746,7 +746,7 @@ class vcfgz_reader {
             static const int metadata_cols = this->metadata_columns;
             metadata_columns_global_p = &this->metadata_columns;
 
-            std::cout << "this->total_haploids = " << this->total_haploids << std::endl;
+            // std::cout << "this->total_haploids = " << this->total_haploids << std::endl;
 
             return { &metadata_cols, &total_haps };
 
@@ -1073,7 +1073,7 @@ extern "C" {
     }
 
     long long int get_total_haploids(vcfgz_reader *reader){
-        std::cout << "reader->total_haploids = " << reader->total_haploids << std::endl;
+        // std::cout << "reader->total_haploids = " << reader->total_haploids << std::endl;
         return reader->total_haploids;
     }
 

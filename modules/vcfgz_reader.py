@@ -40,9 +40,9 @@ class vcfgz_reader(object):
     samples: List[str]
 
     def __init__(self, ref_panel_path: str):
-        print(f"going to load lib at {LIB_PATH}")
+        # print(f"going to load lib at {LIB_PATH}")
         self.lib = cdll.LoadLibrary(LIB_PATH)
-        print(f"finished loading lib at {LIB_PATH}")
+        # print(f"finished loading lib at {LIB_PATH}")
         self.obj = self.lib.vcfgz_reader_new(ref_panel_path.encode())
         self.table_row_i = 0
         self.total_haploids_n = self.lib.get_total_haploids(self.obj) # ends at this
@@ -54,7 +54,7 @@ class vcfgz_reader(object):
         # self.table_header = string_at(table_header_p, size=table_header_len).decode("utf-8") 
         self.table_header = cache_line_copy.value[:table_header_len].decode("utf-8")
         self.samples = self.table_header.split('\t')[9:]
-        print(f"file initialized with total_haploids = {self.total_haploids_n}")
+        # print(f"file initialized with total_haploids = {self.total_haploids_n}")
 
     def __enter__(self):
         pass # file is opened at initialization
@@ -83,21 +83,21 @@ class vcfgz_reader(object):
             batch_CHR = np.char.array(np.zeros(tmp_batch_size, dtype=f'|S{CHR_COL_LEN}'))#type:ignore # char *is* a known member of np
             batch_POS = np.char.array(np.zeros(tmp_batch_size, dtype=f'|S{POS_COL_LEN}'))#type:ignore # char *is* a known member of np
             batch_VID = np.char.array(np.zeros(tmp_batch_size, dtype=f'|S{VID_COL_LEN}'))#type:ignore # char *is* a known member of np
-            print("py: initted empty char arrays")
+            # print("py: initted empty char arrays")
 
             # ctypes don't support char arrays, so we have to cast it to void* :(
             batch_CHR_p = batch_CHR.ctypes.data_as(c_void_p)
             batch_POS_p = batch_POS.ctypes.data_as(c_void_p)
             batch_VID_p = batch_VID.ctypes.data_as(c_void_p)
-            print("py: took pointers")
+            # print("py: took pointers")
 
             table_row_i: int = self.lib.readsites(self.obj, batch_CHR_p, batch_POS_p, batch_VID_p, tmp_batch_size)
-            print(f"py: finished lib.readsites() call (table_row_i = {table_row_i})")
+            # print(f"py: finished lib.readsites() call (table_row_i = {table_row_i})")
             lines_read_n = table_row_i - self.table_row_i
             self.table_row_i = table_row_i
 
             if lines_read_n < tmp_batch_size:
-                print("py: reached the end of the vcfgz file")
+                # print("py: reached the end of the vcfgz file")
                 break
 
         # nparr: np.ndarray = np.ctypeslib.as_array(array)  # type: ignore
@@ -196,7 +196,7 @@ class vcfgz_reader(object):
                 genotype_table_c,
                 self.total_haploids_n,
             )
-            print(f"py: finished lib.readsites() call (table_row_i = {table_row_i})")
+            # print(f"py: finished lib.readsites() call (table_row_i = {table_row_i})")
         else:
             table_row_i = self.table_row_i
 
@@ -264,7 +264,7 @@ class vcfgz_reader(object):
             for i, col in enumerate(metadata_cols):
                 cols_batches[i].append(col[:lines_read_n])
 
-            print(f"{(round(time.time()-start, 3))} seconds")
+            # print(f"{(round(time.time()-start, 3))} seconds")
 
         metadata_cols_full: List[np.ndarray]
         if n_batches > 1:
