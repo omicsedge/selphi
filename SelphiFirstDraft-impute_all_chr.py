@@ -373,11 +373,14 @@ def selphi(
         samples_segments.append(samples_idxs[samples_segments_points[i-1]:samples_segments_points[i]])
 
 
-    # samples_segments = [[12],[13],[14],[15],[16],[17],[18],[19]]
-    # samples_segments = [[12],[13],[14],[15]]
-    # cores = 4
 
     assert len(samples_segments) == cores > 0, f"got {len(samples_segments)=} and {cores=}"
+
+    # samples_segments = [[12],[13],[14],[15],[16],[17],[18],[19],[20],[21]]
+    # cores = 10
+    # samples_segments = [[12]]
+    # cores = 1
+
 
     total_samples_to_impute = sum([len(seg) for seg in samples_segments])
 
