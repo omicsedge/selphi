@@ -8,7 +8,7 @@ lib = $(olib_dir)/vcfgz_reader.lib
 
 vcfgz_reader_prod: $(src)
 	mkdir -p $(olib_dir) 2>/dev/null
-	g++ -g -c -fPIC $(src) -o $(o)
+	g++ -g -c -fPIC $(src) -I /usr/local/include -o $(o) -lpng -lz
 	g++ -g -shared -Wl,-soname,$(lib) -o $(lib) $(o)
 	chmod -fc a+x $(lib)
 
@@ -26,13 +26,6 @@ vcfgz_reader_test: $(src)
 	-pedantic -Wall -Wextra -Wcast-align -Wcast-qual -Wctor-dtor-privacy -Wdisabled-optimization -Wformat=2 -Winit-self -Wlogical-op -Wmissing-include-dirs -Wnoexcept -Wold-style-cast -Woverloaded-virtual -Wredundant-decls -Wshadow -Wsign-conversion -Wsign-promo -Wstrict-null-sentinel -Wstrict-overflow=5 -Wswitch-default -Wundef -Wno-unused \
 	$(src) -o $(o) -g -lboost_iostreams -lz
 	chmod -fc a+x $(o)
-
-vcfgz_reader_mac_prod: $(src)
-	mkdir -p $(olib_dir) 2>/dev/null
-	g++ -g -c -fPIC $(src) -I /usr/local/include -o $(o) -lpng -lz
-	g++ -g -shared -Wl,-soname,$(lib) -o $(lib) $(o)
-	chmod -fc a+x $(lib)
-
 
 
 # src = /home/nikita/work/test_gzip_processing_speed/src/vcfmetadata.cpp

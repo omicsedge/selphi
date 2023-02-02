@@ -51,7 +51,7 @@ Check the imputed samples at `<output-imputed-samples.vcf.gz>`
 
 ### Checking mismatch of imputed dataset with the true dataset
 ```bash
-python3 check_imputation_accuracy.py <imputed.vcf.gz> <true.vcf.gz>
+python3 check_imputation_mismatch.py <imputed.vcf.gz> <true.vcf.gz>
 ```
 
 resulting tsv table is saved at <imputed.vcf.gz>.mismatches.tsv
