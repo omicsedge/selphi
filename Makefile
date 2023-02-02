@@ -29,7 +29,7 @@ vcfgz_reader_test: $(src)
 
 vcfgz_reader_mac_prod: $(src)
 	mkdir -p $(olib_dir) 2>/dev/null
-	g++ -g -c -fPIC $(src) -I /usr/local/include -o $(o)
+	g++ -g -c -fPIC $(src) -I /usr/local/include -o $(o) -lpng -lz
 	g++ -g -shared -Wl,-soname,$(lib) -o $(lib) $(o)
 	chmod -fc a+x $(lib)
 

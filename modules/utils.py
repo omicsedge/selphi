@@ -17,7 +17,7 @@ except ModuleNotFoundError:
 
 
 from modules.data_utils import get_sample_index
-from modules.IBDs_extractor import IBDs_extractor
+# from modules.IBDs_extractor import IBDs_extractor
 # from modules.IBDs_extractor_restored_sep14 import IBDs_extractor
 from modules.vcfgz_reader import vcfgz_reader
 from modules.devutils import var_dump
@@ -293,13 +293,10 @@ def impute_interpolate(
     chr_length: int,
     start: int,
     end: int,
-    imputing_samples_haploids_indices: List[int],
-    reference_haploids_indices: List[int],
-    internal_haploid_order: List[int],
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> np.ndarray:
 
     if len(weight_matrices) == 0:
-        return np.array([]), np.array([])
+        return np.array([])
 
     """
     *n* chip sites divide the full sequence into *n+1* segments,
@@ -324,7 +321,7 @@ def impute_interpolate(
     total_input_haploids = len(weight_matrices)
 
     Xs = np.zeros((total_input_haploids, chr_length), dtype=np.int8)
-    target_full_array = np.zeros((chr_length, total_input_haploids), dtype=np.int8)
+    # target_full_array = np.zeros((chr_length, total_input_haploids), dtype=np.int8)
 
     refpanel = vcfgz_reader(full_full_ref_panel_vcfgz_path)
     # refpanel = IBDs_extractor(full_full_ref_panel_vcfgz_path)
@@ -393,7 +390,7 @@ def impute_interpolate(
 
         batch_start_pos = batch_end_pos
         batch_end_pos   = batch_end_pos+lines_read_n
-        target_full_array[batch_start_pos:batch_end_pos, :] = batch[:lines_read_n, imputing_samples_haploids_indices]
+        # target_full_array[batch_start_pos:batch_end_pos, :] = batch[:lines_read_n, imputing_samples_haploids_indices]
 
         return batch, batch_start_pos, batch_end_pos
 
@@ -471,15 +468,15 @@ def impute_interpolate(
                         probs_interpolations = [p[inter_s-sC : inter_e-sC] for p in probs_interpolations],
                         interpolated_ref_haps = interpolated_ref_haps,
                         # batch_interval = batch[inter_s-sB : inter_e-sB, reference_haploids_indices][:, internal_haploid_order],
-                        batch_interval = batch[inter_s-sB : inter_e-sB, reference_haploids_indices],
+                        batch_interval = batch[inter_s-sB : inter_e-sB],
                     )
 
-                # [some logging while not in prod]
-                if inter_e - debug_pos_counter >= 120_000:
-                    debug_pos_counter = inter_e
-                    debug_timer_round = time.time()
-                    print(f"[{(debug_timer_round - debug_timer):8.3f} s] iC={iC:6}, iB={iB:5}, intersect ({inter_s:7}, {inter_e:7}), batch({sB:7}, {eB:7}), chips({sC:7}, {eC:7})")
-                    debug_timer = debug_timer_round
+                # # [some logging while not in prod]
+                # if inter_e - debug_pos_counter >= 120_000:
+                #     debug_pos_counter = inter_e
+                #     debug_timer_round = time.time()
+                #     print(f"[{(debug_timer_round - debug_timer):8.3f} s] iC={iC:6}, iB={iB:5}, intersect ({inter_s:7}, {inter_e:7}), batch({sB:7}, {eB:7}), chips({sC:7}, {eC:7})")
+                #     debug_timer = debug_timer_round
 
                 # 4. Iteration: iterating samples chip sites interval or reading a new batch from the ref panel
                 if eB == eC:
@@ -508,7 +505,7 @@ def impute_interpolate(
 
     refpanel.close()
 
-    return Xs, target_full_array
+    return Xs
 
 
 

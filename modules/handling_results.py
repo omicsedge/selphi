@@ -18,6 +18,18 @@ def save_imputation_results(
     #     pickle.dump(full_res__NEW[sample], f)
 
 
+def save_imputed_in_stripped_vcf(
+    sample_name: str,
+    full_res_sample: np.ndarray,
+    filepath: str,
+):
+    assert len(full_res_sample) == 2, "array shape has to be a matrix with the two haploids"
+    full_res_sample = np.array(full_res_sample).T
+    with forced_open(filepath, 'wb') as f:
+        pass
+    np.savetxt(filepath, full_res_sample, delimiter="|", fmt="%d", header=sample_name, comments='')
+
+
 def haploid_imputation_accuracy(
     resultoo_fb: np.ndarray,
     target_full_array: np.ndarray,
