@@ -33,9 +33,3 @@ time { bash "${thisdir}"/extract_vcf_metadata.sh "$fullseq_refpan" ; }
 
 echo -e "done"
 
-
-# dir = f'./data/separated_datasets/chr20'
-# chipsites_input = f'data/separated_datasets/chr20/reference_panel.30x.hg38_chr20_noinfo.chipsites-292-input-samples.vcf.gz'
-# full_refpanel_vcfgz_path = f'data/separated_datasets/chr20/reference_panel.30x.hg38_chr20_noinfo.fullseq-2910-refpan-samples.vcf.gz'
-
-

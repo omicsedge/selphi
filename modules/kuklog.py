@@ -5,7 +5,6 @@ import time
 
 def open_kuklog(file, mode='w'):
     """
-    Wrapper around standard python `open`.
     If the file's leaf directory doesn't exist, it creates all intermediate-level directories.
     """
     the_dir = os.path.dirname(os.path.abspath(file))
