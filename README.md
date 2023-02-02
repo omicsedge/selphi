@@ -14,9 +14,8 @@ pickleshare | 0.7.5
 zarr | 2.9.5
 
 ## Assumptions, with which selphi imputation works
- - chip sites dataset has to have sites that are the subset of the full-sequence sites (represented in the ref panel).
- - there are no duplicates of a BP position in vcf SNPs
- - only one the same chromosome
+ - input/unimputed/chip-sites dataset has to have sites that are the subset of the sites in the reference panel
+ - there is only one and the same chromosome in both the input/unimputed/chip-sites dataset and the reference panel dataset
 
 
 ## Usage
