@@ -72,11 +72,11 @@ def BiDiPBWT(
      - `ref_panel_chip_array` - the reference panel without test samples with chip sites only
      - `combined_ref_panel_chip` - the same reference panel but with the test sample (+2 haploids) (chip sites only)
     """
-    print("Building BI and BJ: main BiDiPBWT data structures...")
+    # print("Building BI and BJ: main BiDiPBWT data structures...")
     start = time.time()
     BI_TEST, BJ_TEST = BInBJ(combined_ref_panel_chip.T.astype(np.int8), num_hid+hap, num_hid)
     # BI_TEST, BJ_TEST = BiDiPBWT_utils(combined_ref_panel_chip.T.astype(np.int8), num_hid+hap, num_hid)
-    print(f"{(time.time() - start) :8.3f} seconds")
+    # print(f"{(time.time() - start) :8.3f} seconds")
     return BI_TEST, BJ_TEST
 
 
@@ -190,10 +190,10 @@ def create_composite_ref_panel(
     """
     matches: np.ndarray = BI + BJ -1
 
-    print("Creating initial composite panel")
+    # print("Creating initial composite panel")
     composite_ = np.zeros(matches.shape, dtype=np.bool_) # mask (only 0s and 1s)
     best_matches = {}
-    for chip_index in trange(0, matches.shape[1]):
+    for chip_index in range(0, matches.shape[1]):
         best_matches[chip_index] = list(np.argsort(matches[:,chip_index])[::-1][:fl])
         for hap_index in best_matches[chip_index]:
             composite_[hap_index ,chip_index:int(chip_index + BJ[hap_index, chip_index])] = 1
@@ -222,10 +222,10 @@ def create_composite_ref_panel_np(
     """
     matches: np.ndarray = BI + BJ -1
 
-    print("Creating initial composite panel")
+    # print("Creating initial composite panel")
     composite_ = np.zeros(matches.shape, dtype=np.bool_) # mask (only 0s and 1s)
     best_matches = np.zeros((matches.shape[1], fl), dtype=np.int64)
-    for chip_index in trange(0, matches.shape[1]):
+    for chip_index in range(0, matches.shape[1]):
         best_matches[chip_index] = np.argsort(matches[:,chip_index])[::-1][:fl]
         for hap_index in best_matches[chip_index]:
             composite_[hap_index ,chip_index:(chip_index + BJ[hap_index, chip_index])] = 1
@@ -257,7 +257,7 @@ def run_BiDiPBWT_and_cr8_composite_refpanel(
      - `ref_panel_chip_array` - the reference panel without test samples with chip sites only
      - `combined_ref_panel_chip` - the same reference panel but with the test sample (+2 haploids) (chip sites only)
     """
-    print("Building BI and BJ: main BiDiPBWT data structures...")
+    # print("Building BI and BJ: main BiDiPBWT data structures...")
     # start = time.time()
     BI, BJ = BInBJ(combined_ref_panel_chip.T.astype(np.int8), num_hid+hap, num_hid)
     # print(f"{(time.time() - start) :8.3f} seconds")
@@ -277,7 +277,7 @@ def run_BiDiPBWT_and_cr8_composite_refpanel(
     """
     matches: np.ndarray = BI + BJ -1
 
-    print("Creating initial composite panel")
+    # print("Creating initial composite panel")
     composite_ = np.zeros(matches.shape, dtype=np.bool_) # mask (only 0s and 1s)
     best_matches = {}
     for chip_index in range(0, matches.shape[1]):
@@ -310,9 +310,9 @@ def calculate_haploid_frequencies(
     """
     assert 0 <= tmin < tmax <= 1, "wtf"
 
-    print("Calculating Haploid frequencies")
+    # print("Calculating Haploid frequencies")
     hap_freq = {}
-    for i in trange(0,matches.shape[1]):
+    for i in range(0,matches.shape[1]):
         chunk_index = int(i//CHUNK_SIZE)
         hap_freq.setdefault(chunk_index, {})
         
@@ -373,8 +373,8 @@ def calculate_haploid_count_threshold(
     std_ = [] # a list of stds for ^^^ numpy vectors
     final_thresh = [] # a threshold that is used to calculate nc_thresh 
     nc_thresh: List[int] = [] # how many haploids should go into each chip variant
-    print("Calculating haploid count thresholds for each chip variant")
-    for i in trange(0,matches.shape[1]):
+    # print("Calculating haploid count thresholds for each chip variant")
+    for i in range(0,matches.shape[1]):
         chunk_index = int(i//CHUNK_SIZE)
         indexoo = np.flatnonzero(comp_matches_hybrid[:,i] * haps_freqs_array_norm_dict[chunk_index])
         X = comp_matches_hybrid[indexoo,i] * haps_freqs_array_norm_dict[chunk_index][indexoo]
@@ -411,7 +411,7 @@ def apply_filters_to_composite_panel_mask(
     """
     composite_ = np.zeros(matches.shape, dtype=np.bool_)
     best_matches = {}
-    for chip_index in trange(0, matches.shape[1]):
+    for chip_index in range(0, matches.shape[1]):
         chunk_index = int(chip_index//CHUNK_SIZE)
         xooi = matches[:,chip_index] * haps_freqs_array_norm_dict[chunk_index] # using comp_matches_hybrid instead of matches may improve accuracy
         best_matches[chip_index] = list(np.argsort(xooi)[::-1][:nc_thresh[chip_index]])
@@ -433,7 +433,7 @@ def form_haploid_ids_lists(
     """
     ordered_matches_test__: Dict[int, List[np.int64]] = {} # a list of ids of haploids taken for each chip variant
     comp_to_plot = np.zeros(composite_.shape, dtype=np.bool_)
-    for i in trange(matches.shape[1]):
+    for i in range(matches.shape[1]):
         xooi = matches[:,i]
         sorting_key = list(xooi.argsort()[::-1])
     #     sorting_key = list(np.argsort(haps_freqs_array_norm)[::-1])
@@ -450,15 +450,12 @@ def form_haploid_ids_lists(
 def run_hmm(
     original_indicies: List[int],
     full_full_ref_panel_vcfgz_path: str,
-    num_obs: int,
+    chip_sites_n: int,
     ordered_hap_indices_list: List[Dict[int, List[np.int64]]],
     distances_cm: List[float],
     BI,
     BJ,
     chr_length: int,
-    imputing_samples_haploids_indices: List[int],
-    reference_haploids_indices: List[int],
-    internal_haploid_order: List[int],
     num_hid=9000,
     variable_range=False,
     start_range=2000,
@@ -483,22 +480,22 @@ def run_hmm(
 
     if not variable_range:
 
-        print("running forward and backward algorithms for all input haploids")
+        # print("running forward and backward algorithms for all input haploids")
         weight_matrices: List[np.ndarray] = []
 
         for ordered_hap_indices in ordered_hap_indices_list:
-            alpha = np.zeros((num_obs+2, num_hid), dtype=np.float64)
+            alpha = np.zeros((chip_sites_n+2, num_hid), dtype=np.float64)
             alpha = setFwdValues(
-                alpha, num_obs, ordered_hap_indices, distances_cm, num_hid=num_hid
+                alpha, chip_sites_n, ordered_hap_indices, distances_cm, num_hid=num_hid
             )
             kuklog_timestamp_func(f"forward values")
             post = setBwdValues(
-                alpha, num_obs, ordered_hap_indices, distances_cm, num_hid=num_hid
+                alpha, chip_sites_n, ordered_hap_indices, distances_cm, num_hid=num_hid
             )
             weight_matrices.append(post.T)
             kuklog_timestamp_func(f"backward values")
 
-        print("imputing/interpolating")
+        # print("imputing/interpolating")
         # smpls2takeA = np.array([len(ordered_hap_indices[i]) for i in range(len(ordered_hap_indices))])
         # smpls2takeB = post.astype(bool).sum(axis=1)
         # for hap in [0,1]:
@@ -506,12 +503,19 @@ def run_hmm(
         #     # post_true = var_load(f"opts01-04_dev1/HG02330/{hap}/07_post.pkl")
         #     print(f"dumped weight_matrix for HG02330/{hap}")
         # exit(0)
-        resultsoo_fb, target_full_array = impute_interpolate(weight_matrices, original_indicies, full_full_ref_panel_vcfgz_path, chr_length, start_imputation, end_imputation, imputing_samples_haploids_indices, reference_haploids_indices, internal_haploid_order)
+        resultsoo_fb = impute_interpolate(
+            weight_matrices,
+            original_indicies,
+            full_full_ref_panel_vcfgz_path,
+            chr_length,
+            start_imputation,
+            end_imputation
+        )
         kuklog_timestamp_func(f"imputation via interpolate")
     else:
         raise RuntimeError("this condition under run_hmm shouldn't have happened")
         return None
-    return resultsoo_fb, target_full_array
+    return resultsoo_fb
 
 
 def run_hmm_variable_N(
