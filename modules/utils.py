@@ -17,7 +17,7 @@ except ModuleNotFoundError:
 
 
 from modules.data_utils import get_sample_index
-from modules.IBDs_extractor import IBDs_extractor
+# from modules.IBDs_extractor import IBDs_extractor
 # from modules.IBDs_extractor_restored_sep14 import IBDs_extractor
 from modules.vcfgz_reader import vcfgz_reader
 from modules.devutils import var_dump
