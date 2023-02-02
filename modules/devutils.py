@@ -38,7 +38,7 @@ def nptype(array: np.ndarray):
     elif len(array.shape) == 3:
         el = array[0][0][0]
     else:
-        print('nptype: wtf')
+        print('nptype: unknown')
         return
     print(f'vals: shape={array.shape}, span=[{array.min()}, {array.max()}]')
     t = type(el)
@@ -46,4 +46,21 @@ def nptype(array: np.ndarray):
         print(f'type: {t}, span=[{np.iinfo(t).min}, {np.iinfo(t).max}]')
     except:
         print(f'type: {t}, span=[{np.finfo(t).min}, {np.finfo(t).max}]')
+
+def dbg(val, name:str):
+    if isinstance(val, np.ndarray):
+        print(f"{name} ({val.shape}) dtype={val.dtype.type}")
+    elif isinstance(val, list):
+        if len(val) > 4:
+            print(f"{name}: list[{len(val)}] = [{val[0]}, {val[1]}, {val[2]}, ...{val[-1]}]")
+        else:
+            print(f"{name} = {val}")
+    elif isinstance(val, tuple):
+        if len(val) > 4:
+            print(f"{name}: tuple[{len(val)}] = ({val[0]}, {val[1]}, {val[2]}, ...{val[-1]})")
+        else:
+            print(f"{name} = {val}")
+    else:
+        print(f"{name} = {val}")
+
 

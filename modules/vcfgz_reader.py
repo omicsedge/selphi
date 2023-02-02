@@ -8,11 +8,6 @@ import numpy as np
 LIB_PATH = './modules/vcfgz_reader.lib'
 
 
-CHR_COL_LEN = 4
-POS_COL_LEN = 11
-VID_COL_LEN = 350
-
-
 COLS_LEN = [
     4,    #0 #CHROM
     11,   #1 POS
@@ -24,9 +19,6 @@ COLS_LEN = [
     1000, #7 INFO
     50,   #8 FORMAT
 ]
-
-
-
 
 
 class vcfgz_reader(object):
@@ -48,10 +40,9 @@ class vcfgz_reader(object):
         self.total_haploids_n = self.lib.get_total_haploids(self.obj) # ends at this
 
         CACHE_LINE_LEN = self.lib.get_cache_line_len(self.obj) # type: int
-        cache_line_copy = create_string_buffer(b'\x00' * CACHE_LINE_LEN) # allocate string of NUL characters        
+        cache_line_copy = create_string_buffer(b'\x00' * CACHE_LINE_LEN) # allocate string of NUL characters
         table_header_len = self.lib.fill_table_header(self.obj, cache_line_copy)
 
-        # self.table_header = string_at(table_header_p, size=table_header_len).decode("utf-8") 
         self.table_header = cache_line_copy.value[:table_header_len].decode("utf-8")
         self.samples = self.table_header.split('\t')[9:]
         # print(f"file initialized with total_haploids = {self.total_haploids_n}")
@@ -61,49 +52,6 @@ class vcfgz_reader(object):
 
     def close(self):
         self.lib.close_(self.obj)
-
-    def read_cols123(self,
-        tmp_batch_size: int,
-        refill_CHR: Union[np.ndarray, None] = None,
-        refill_POS: Union[np.ndarray, None] = None,
-        refill_VID: Union[np.ndarray, None] = None,
-    ):
-        if tmp_batch_size <= 0:
-            raise ValueError(f"tmp_batch_size denotes the number of sites to read at a time, and has to be a positive integer")
-
-        # CHR: np.ndarray = np.char.array(np.zeros())#type:ignore # char *is* a known member of np
-        # POS: np.ndarray = np.char.array(np.zeros())#type:ignore # char *is* a known member of np
-        # VID: np.ndarray = np.char.array(np.zeros())#type:ignore # char *is* a known member of np
-
-        batch_CHR: np.ndarray
-        batch_POS: np.ndarray
-        batch_VID: np.ndarray
-
-        while (True):
-            batch_CHR = np.char.array(np.zeros(tmp_batch_size, dtype=f'|S{CHR_COL_LEN}'))#type:ignore # char *is* a known member of np
-            batch_POS = np.char.array(np.zeros(tmp_batch_size, dtype=f'|S{POS_COL_LEN}'))#type:ignore # char *is* a known member of np
-            batch_VID = np.char.array(np.zeros(tmp_batch_size, dtype=f'|S{VID_COL_LEN}'))#type:ignore # char *is* a known member of np
-            # print("py: initted empty char arrays")
-
-            # ctypes don't support char arrays, so we have to cast it to void* :(
-            batch_CHR_p = batch_CHR.ctypes.data_as(c_void_p)
-            batch_POS_p = batch_POS.ctypes.data_as(c_void_p)
-            batch_VID_p = batch_VID.ctypes.data_as(c_void_p)
-            # print("py: took pointers")
-
-            table_row_i: int = self.lib.readsites(self.obj, batch_CHR_p, batch_POS_p, batch_VID_p, tmp_batch_size)
-            # print(f"py: finished lib.readsites() call (table_row_i = {table_row_i})")
-            lines_read_n = table_row_i - self.table_row_i
-            self.table_row_i = table_row_i
-
-            if lines_read_n < tmp_batch_size:
-                # print("py: reached the end of the vcfgz file")
-                break
-
-        # nparr: np.ndarray = np.ctypeslib.as_array(array)  # type: ignore
-
-        return batch_CHR, batch_POS, batch_VID, lines_read_n
-
 
 
     def read_columns(self,
@@ -120,14 +68,29 @@ class vcfgz_reader(object):
         GENOTYPES: Union[np.ndarray, bool] = False, # a 2d array, cuz may be several columns
     ):
         """
+        Reads the opened vcf.gz file, and fills up the arrays specified in arguments.
+
         Returns 2 values:
          1. number of lines read
          2. list of arrays as per requested columns (inferred from the arguments)
 
+
         Specify any subset of possible columns (e.g. GENOTYPES=True, ID=True, QUAL=True),
             and the function will return those arrays as the second value,
         The order in which the columns arrays appear in the returned list is
-            in the order as the arguments defined here (e.g. return ID, QUAL, GENOTYPES)
+            in the order as the arguments defined here
+            (from example above: return ID, QUAL, GENOTYPES)
+
+        From returned columns arrays, make sure to only use values up to the *number of lines read*.
+        You may want to pass the previously returned array for refill
+            to prevent unnecessary copying and memory allocation and deallocation.
+        For the same reason, this function does not slice the resulting arrays,
+            but returns the *number of lines read* integer.
+
+        Note: usually the returned number of lines read would equal to the set number `lines_n=`,
+            but may be a lower number if reached the end of the file.
+
+        `if lines_read_n == 0:` is the test "if there is nothing more to read from the file"
         """
         if lines_n < 0:
             raise ValueError(f"lines_n denotes the number of lines to read, and therefore has to be a non-negative integer")
@@ -137,6 +100,7 @@ class vcfgz_reader(object):
         metadata_cols_py: List[Union[np.ndarray, Literal[False]]] = []
         metadata_cols_c: List[Union[c_void_p, Literal[None]]] = []
 
+        # parsing the input, allocating arrays where necessary
         for i, (col_i_name, col_i) in enumerate(zip(metadata_cols_names, metadata_cols_input)):
             dtype = f'|S{COLS_LEN[i]}'
             if col_i is False:
@@ -167,7 +131,6 @@ class vcfgz_reader(object):
         genotype_table_c = None
 
         for i, (col_i_name, col_i) in [(0, ('GENOTYPES', GENOTYPES))]:
-
             if col_i is False:
                 genotype_table_c = None
                 genotype_table_py = None
@@ -223,7 +186,7 @@ class vcfgz_reader(object):
         """
         Reads specific columns (or genotypes table) from all the lines in the vcf table.
 
-        `batch_size_lines` - the number of lines to read at a time. Doesn't affect the end result.
+        `batch_size_lines` - the number of lines to read at a time. Doesn't affect the returned value.
 
         Returns the list of arrays as per requested columns (inferred from the arguments)
 
@@ -281,6 +244,14 @@ class vcfgz_reader(object):
         refill: Union[np.ndarray, None] = None,
     ) -> Tuple[np.ndarray,int]:
         """
+        Reads the table of genotypes from the vcf.gz
+
+        Functionally this:
+            >>> GT_table, lines_read_n = vcfgz.readlines(1000, refill=GT_table)
+        is the same as this:
+            >>> lines_read_n, [GT_table] = vcfgz.read_columns(1000, GENOTYPES=GT_table)
+        , but the first one (this function) is a little bit faster.
+
         Note: usually the returned number of lines read would equal to the set number `lines_n=`,
             but may be a lower number if reached the end of the file.
 
@@ -315,15 +286,12 @@ class vcfgz_reader(object):
 
         return nparr, lines_read_n
 
-        # return np.ctypeslib.as_array(array), lines_read_n # type: ignore
-
 
 
 """
 unit test
 """
 if __name__ == '__main__':
-    raise RuntimeError("don't unit test")
     REF_PANEL = "/mnt/science-shared/data/users/adriano/GAIN/ref/20.reference_panel.30x.hg38.3202samples.vcf.gz"
 
     main_start = time.time()

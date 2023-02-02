@@ -14,9 +14,11 @@ pickleshare | 0.7.5
 zarr | 2.9.5
 
 ## Assumptions, with which selphi imputation works
- - chip sites dataset has to have sites that are the subset of the full-sequence sites (represented in the ref panel).
- - there are no duplicates of a BP position in vcf SNPs
- - only one the same chromosome
+ - input/unimputed/chip-sites dataset has to have sites that are the subset of the sites in the reference panel
+ - there is only one and the same chromosome in both the input/unimputed/chip-sites dataset and the reference panel dataset
+ - input samples' first site is not the first site in the reference panel. Also input samples' last site is not the last site in the reference panel. (see TODO at: `modules/utils.py:49`)
+
+If user does not make sure these assumptions hold, then undefined behavior.
 
 
 ## Usage
@@ -52,7 +54,7 @@ Check the imputed samples at `<output-imputed-samples.vcf.gz>`
 
 ### Checking mismatch of imputed dataset with the true dataset
 ```bash
-python3 check_imputation_accuracy.py <imputed.vcf.gz> <true.vcf.gz>
+python3 check_imputation_mismatch.py <imputed.vcf.gz> <true.vcf.gz>
 ```
 
 resulting tsv table is saved at <imputed.vcf.gz>.mismatches.tsv
