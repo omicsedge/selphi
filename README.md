@@ -16,6 +16,9 @@ zarr | 2.9.5
 ## Assumptions, with which selphi imputation works
  - input/unimputed/chip-sites dataset has to have sites that are the subset of the sites in the reference panel
  - there is only one and the same chromosome in both the input/unimputed/chip-sites dataset and the reference panel dataset
+ - input samples' first site is not the first site in the reference panel. Also input samples' last site is not the last site in the reference panel. (see TODO at: `modules/utils.py:49`)
+
+If user does not make sure these assumptions hold, then undefined behavior.
 
 
 ## Usage
