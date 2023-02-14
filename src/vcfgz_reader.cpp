@@ -553,7 +553,6 @@ class vcfgz_reader {
 
 extern "C" {
     vcfgz_reader* vcfgz_reader_new(const char* path){
-        std::cout << "VCFGZ_READER: opening vcfgz file at: \"" << path << "\"" << std::endl;
         return new vcfgz_reader(path);
     }
 
