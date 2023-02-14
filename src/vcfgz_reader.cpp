@@ -26,8 +26,10 @@ constexpr int COL_LEN[] = {
     50,   // FORMAT  #8
 };
 
-// for vcf FORMAT=GT, 1M cache can store a vcf row for up to about 499k samples
-const int CACHE_LINE_LEN = 1000000;
+// for vcf FORMAT=GT, 4M cache can store a vcf row for up to about 999k diploid samples
+// But the table header (which includes sample names) will take more space
+//    depending on the length of the sample names 
+const int CACHE_LINE_LEN = 4000000;
 const int METADATA_COLUMNS = 9;
 
 
