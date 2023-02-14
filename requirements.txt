@@ -1,0 +1,9 @@
+numpy
+zarr
+pandas
+tqdm
+numba
+matplotlib
+ckwrap
+cyvcf2
+joblib
