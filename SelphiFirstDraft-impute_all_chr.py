@@ -269,10 +269,10 @@ def selphi(
 
     assert len(samples_segments) == cores > 0, f"got {len(samples_segments)=} and {cores=}"
 
+    # # If you don't want selphi to run for all input samples in the vcf.gz file,
+    # #  then uncomment these lines to rewrite what samples each core should impute
     # samples_segments = [[12],[13],[14],[15],[16],[17],[18],[19],[20],[21]]
     # cores = 10
-    samples_segments = [[12]]
-    cores = 1
 
 
     total_samples_to_impute = sum([len(seg) for seg in samples_segments])
