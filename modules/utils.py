@@ -6,7 +6,7 @@ import time
 #from black import Result
 import numpy as np
 from tqdm import trange, tqdm
-from numba import njit, int8, int16, int32, int64
+from numba import njit, int8, int32, int64
 
 try:
     from numba.experimental import jitclass
@@ -439,7 +439,7 @@ def BInBJ(haplotypeList: np.ndarray, Target: int, num_hid: int):
 
 
 jit_BidiBurrowsWheelerLibrary_s = OrderedDict()
-jit_BidiBurrowsWheelerLibrary_s["ppa"] = int16[:, :]
+jit_BidiBurrowsWheelerLibrary_s["ppa"] = int32[:, :]
 jit_BidiBurrowsWheelerLibrary_s["div"] = int32[:, :]
 
 
@@ -460,13 +460,13 @@ def createBWLibrary(haps):
 
     nHaps = haps.shape[0]
     nLoci = haps.shape[1]
-    ppa = np.full(haps.shape, 0, dtype=np.int16)
+    ppa = np.full(haps.shape, 0, dtype=np.int32)
     div = np.full(haps.shape, 0, dtype=np.int32)
 
-    nZerosArray = np.full(nLoci, 0, dtype=np.int16)
+    nZerosArray = np.full(nLoci, 0, dtype=np.int32)
 
-    zeros = np.full(nHaps, 0, dtype=np.int16)
-    ones = np.full(nHaps, 0, dtype=np.int16)
+    zeros = np.full(nHaps, 0, dtype=np.int32)
+    ones = np.full(nHaps, 0, dtype=np.int32)
     dZeros = np.full(nHaps, 0, dtype=np.int32)
     dOnes = np.full(nHaps, 0, dtype=np.int32)
 
@@ -498,8 +498,8 @@ def createBWLibrary(haps):
     nZerosArray[nLoci - 1] = nZeros
 
     for i in range(nLoci - 2, -1, -1):
-        zeros = np.full(nHaps, 0, dtype=np.int16)
-        ones = np.full(nHaps, 0, dtype=np.int16)
+        zeros = np.full(nHaps, 0, dtype=np.int32)
+        ones = np.full(nHaps, 0, dtype=np.int32)
         dZeros = np.full(nHaps, 0, dtype=np.int32)
         dOnes = np.full(nHaps, 0, dtype=np.int32)
 
@@ -535,7 +535,7 @@ def createBWLibrary(haps):
 
     # I'm going to be a wee bit sloppy in creating zeroOccPrev
     # Not defined at 0 so start at 1.
-    zeroOccPrev = np.full(haps.shape, 0, dtype=np.int16)
+    zeroOccPrev = np.full(haps.shape, 0, dtype=np.int32)
 
     for i in range(1, nLoci):
         count = 0
