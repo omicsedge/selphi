@@ -26,6 +26,7 @@ If user does not make sure these assumptions hold, then undefined behavior.
 ### Compile compiled libraries
 
  - run `make`
+ - run `pip install -r requirements.txt`
 
 ### Prepare intermediate datasets
 run:
