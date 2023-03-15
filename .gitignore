@@ -57,3 +57,4 @@ __pypackages__/
 /modules/*.o
 /modules/*.lib
 
+/lib/

@@ -5,7 +5,7 @@ import time
 import numpy as np
 
 
-LIB_PATH = './modules/vcfgz_reader.lib'
+LIB_PATH = './lib/vcfgz_reader.lib'
 
 
 COLS_LEN = [
