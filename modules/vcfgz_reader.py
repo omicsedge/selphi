@@ -1,5 +1,5 @@
 from typing import List, Set, Tuple, Type, TypeVar, Union, Iterable, Dict, Literal
-from ctypes import Array, c_int8, cdll, c_longlong, CDLL, string_at, wstring_at, c_char_p, create_string_buffer, c_void_p
+from ctypes import Array, c_int8, c_int, cdll, c_longlong, CDLL, string_at, wstring_at, c_char_p, create_string_buffer, c_void_p
 import time
 
 import numpy as np
@@ -12,8 +12,8 @@ COLS_LEN = [
     4,    #0 #CHROM
     11,   #1 POS
     350,  #2 ID
-    250,  #3 REF
-    250,  #4 ALT
+    350,  #3 REF
+    350,  #4 ALT
     10,   #5 QUAL
     100,  #6 FILTER
     1000, #7 INFO
@@ -35,9 +35,15 @@ class vcfgz_reader(object):
         # print(f"going to load lib at {LIB_PATH}")
         self.lib = cdll.LoadLibrary(LIB_PATH)
         # print(f"finished loading lib at {LIB_PATH}")
-        self.obj = self.lib.vcfgz_reader_new(ref_panel_path.encode())
+
+        # self.obj = self.lib.vcfgz_reader_new(ref_panel_path.encode())
+        vcfgz_reader_constructor_wrapper = self.lib.vcfgz_reader_new
+        vcfgz_reader_constructor_wrapper.restype = c_void_p
+        # vcfgz_reader_constructor_wrapper.argtypes = [c_char_p]
+        self.obj = c_void_p(vcfgz_reader_constructor_wrapper(ref_panel_path.encode()))
+
         self.table_row_i = 0
-        self.total_haploids_n = self.lib.get_total_haploids(self.obj) # ends at this
+        self.total_haploids_n = self.lib.get_total_haploids(self.obj)
 
         CACHE_LINE_LEN = self.lib.get_cache_line_len(self.obj) # type: int
         cache_line_copy = create_string_buffer(b'\x00' * CACHE_LINE_LEN) # allocate string of NUL characters
@@ -154,7 +160,24 @@ class vcfgz_reader(object):
         table_row_i: int
 
         if lines_n > 0:
-            table_row_i = self.lib.readcolumns(self.obj, lines_n, 
+            readcolumns_wrapper = self.lib.readcolumns
+            readcolumns_wrapper.restype = c_int
+            readcolumns_wrapper.argtypes = [
+                c_void_p,
+                c_longlong,
+                c_void_p,
+                c_void_p,
+                c_void_p,
+                c_void_p,
+                c_void_p,
+                c_void_p,
+                c_void_p,
+                c_void_p,
+                c_void_p,
+                c_void_p,
+                c_longlong,
+            ]
+            table_row_i = readcolumns_wrapper(self.obj, lines_n,
                 *metadata_cols_c, # expands to 9 values
                 genotype_table_c,
                 self.total_haploids_n,
