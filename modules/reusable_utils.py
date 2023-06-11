@@ -1,6 +1,5 @@
-from typing import List, Set, Tuple, TypeVar, Union, Iterable
+from typing import List, Set, TypeVar, Iterable
 import os
-
 
 
 """
@@ -8,7 +7,7 @@ Independent or trivial utils, not related to the tool by themselves.
 """
 
 
-def forced_open(file, mode='r'):
+def forced_open(file, mode="r"):
     """
     Wrapper around standard python `open`.
     If the file's leaf directory doesn't exist, it creates all intermediate-level directories.
@@ -19,7 +18,9 @@ def forced_open(file, mode='r'):
     return open(file, mode)
 
 
-T1 = TypeVar('T1')
+T1 = TypeVar("T1")
+
+
 def omit_duplicates(seq: Iterable[T1]) -> List[T1]:
     """Returns a list of only first occurrences of unique values from the input sequence"""
     seen: Set[T1] = set()

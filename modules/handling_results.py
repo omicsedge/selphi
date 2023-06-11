@@ -1,20 +1,16 @@
-from typing import Dict, List, Literal
+from typing import Literal
 
 import numpy as np
 import pickle
 
-from modules.reusable_utils import (
-    forced_open,
-)
-
-
+from modules.reusable_utils import forced_open
 
 
 def save_imputation_results(
     full_res_sample: np.ndarray,
     filepath: str,
 ):
-    with forced_open(filepath, 'wb') as f:
+    with forced_open(filepath, "wb") as f:
         pickle.dump(full_res_sample, f)
     # with open(f'./method_first_draft/saved_dictionary_{str(sample)}_new_method_{chrom}.pkl', 'wb') as f:
     #     pickle.dump(full_res__NEW[sample], f)
@@ -25,11 +21,20 @@ def save_imputed_in_stripped_vcf(
     full_res_sample: np.ndarray,
     filepath: str,
 ):
-    assert len(full_res_sample) == 2, "array shape has to be a matrix with the two haploids"
+    assert (
+        len(full_res_sample) == 2
+    ), "array shape has to be a matrix with the two haploids"
     full_res_sample = np.array(full_res_sample).T
-    with forced_open(filepath, 'wb') as f:
+    with forced_open(filepath, "wb") as f:
         pass
-    np.savetxt(filepath, full_res_sample, delimiter="|", fmt="%d", header=sample_name, comments='')
+    np.savetxt(
+        filepath,
+        full_res_sample,
+        delimiter="|",
+        fmt="%d",
+        header=sample_name,
+        comments="",
+    )
 
 
 def haploid_imputation_accuracy(

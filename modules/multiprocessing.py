@@ -1,4 +1,4 @@
-from typing import Dict, List, Literal, Tuple, Union, OrderedDict as OrderedDict_type
+from typing import List
 import sys
 import os
 
@@ -14,28 +14,24 @@ def split_range_into_n_whole_even_subranges(range_len: int, n: int):
     """
 
     if not (0 < n <= range_len):
-        raise ValueError("`range_len` and `n` have to be positive integers, and `n` has to be no less than `range_len`")
+        raise ValueError(
+            "`range_len` and `n` have to be positive integers, and `n` has to be no less than `range_len`"
+        )
     pass
 
-    min_subrange_len: int = int(range_len/n)
-    closest_multiple: int = n*min_subrange_len
+    min_subrange_len: int = int(range_len / n)
+    closest_multiple: int = n * min_subrange_len
     mod: int = range_len - closest_multiple
-
 
     slice_idxs: List[int] = []
     slice_idxs.append(0)
-    for i in range(1, mod+1):
-        slice_idxs.append(slice_idxs[i-1] + min_subrange_len + 1)
-    for i in range(mod+1, n+1):
-        slice_idxs.append(slice_idxs[i-1] + min_subrange_len)
-
+    for i in range(1, mod + 1):
+        slice_idxs.append(slice_idxs[i - 1] + min_subrange_len + 1)
+    for i in range(mod + 1, n + 1):
+        slice_idxs.append(slice_idxs[i - 1] + min_subrange_len)
 
     return slice_idxs
 
 
-
 def mute_stdout():
-    sys.stdout = open(os.devnull, 'w')
-
-
-
+    sys.stdout = open(os.devnull, "w")

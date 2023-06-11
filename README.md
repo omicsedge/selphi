@@ -1,4 +1,4 @@
-# Selphi: BiDirection PBWT for genotype imputation
+# Selphi: PBWT for genotype imputation
 
 ## well-tested setup
 
