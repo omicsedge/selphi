@@ -1,9 +1,9 @@
-numpy
-zarr
-pandas
-tqdm
-numba
-matplotlib
-ckwrap
+cachetools
 cyvcf2
 joblib
+numba
+numpy
+pandas
+scipy
+tqdm
+zstd
