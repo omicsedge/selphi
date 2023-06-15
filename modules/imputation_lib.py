@@ -3,7 +3,6 @@ from pathlib import Path
 from datetime import datetime
 from scipy import sparse
 import numpy as np
-from tqdm import tqdm
 
 from modules.hmm_utils import pRecomb, setFwdValues_SPARSE, setBwdValues_SPARSE
 from modules.load_data import load_sparse_comp_matches_hybrid_npz
@@ -157,15 +156,13 @@ class CompositePanelMaskFilter:
         return self.stack(
             [
                 self._get_variant_coordinates(*match)
-                for match in tqdm(enumerate(self._best_matches()))
+                for match in enumerate(self._best_matches())
             ]
         )
 
     def sparse_matrix(self) -> sparse.csc_matrix:
         """Generate sparse matrix filter"""
-        print("Getting coordinates to keep: ", datetime.now())
         coordinates = self.coordinates_array()
-        print("Creating sparse matrix from coordinates: ", datetime.now())
         return sparse.coo_matrix(
             (
                 np.full_like(coordinates[:, 0], True, dtype=np.bool_),
@@ -216,8 +213,8 @@ def calculate_weights(
     comp_matches_hybrid: sparse.csc_matrix = load_sparse_comp_matches_hybrid_npz(
         *target_hap, npz_dir, fl=25
     )
-    refpan_haps_n = comp_matches_hybrid.shape[0]
     chip_sites_n = comp_matches_hybrid.shape[1]
+    ref_haps_n = comp_matches_hybrid.shape[0]
 
     haps_freqs_array_norm: np.ndarray = calculate_haploid_frequencies_SPARSE(
         comp_matches_hybrid, chip_sites_n
@@ -229,6 +226,7 @@ def calculate_weights(
         comp_matches_hybrid, haps_freqs_array_norm, nc_thresh, chip_sites_n
     ).sparse_matrix()
 
+    del comp_matches_hybrid
     del haps_freqs_array_norm
     del nc_thresh
 
@@ -239,5 +237,5 @@ def calculate_weights(
         chip_sites_n,
         ordered_hap_indices,
         chip_cM_coordinates,
-        num_hid=refpan_haps_n,
+        num_hid=ref_haps_n,
     )

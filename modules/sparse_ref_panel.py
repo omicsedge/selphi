@@ -60,7 +60,7 @@ class SparseReferencePanel:
     def __init__(self, filepath: str, cache_size: int = 2) -> None:
         self.filepath = filepath
         self.variant_dtypes = np.dtype(
-            [("chr", "<U21"), ("pos", int), ("ref", "<U21"), ("alt", "<U21")]
+            [("chr", "<U21"), ("pos", int), ("ref", "<U32"), ("alt", "<U32")]
         )
         if not os.path.exists(self.filepath):
             self._create()
@@ -323,8 +323,8 @@ class SparseReferencePanel:
         # -r includes overlapping indels, but is faster than -t, so use both
         commands = [
             (
-                f"bcftools view -r {self.chromosome}:{chunk[1]}-{chunk[2]} | "
-                f"bcftools query -f '[|%GT]\n' {bcf_path} "
+                f"bcftools view -r {self.chromosome}:{chunk[1]}-{chunk[2]} "
+                f"{bcf_path} | bcftools query -f '[|%GT]\n' "
                 f"-t {self.chromosome}:{chunk[1]}-{chunk[2]} | sed s'/|//'"
             )
             for chunk in self.chunks

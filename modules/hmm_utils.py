@@ -1,6 +1,5 @@
 from scipy import sparse
 import numpy as np
-from tqdm import trange
 from numba import njit
 
 
@@ -38,7 +37,7 @@ def setFwdValues_SPARSE(
     alpha = np.zeros((num_hid,), dtype=np.float64)
     alpha[ordered_matches[0]] = 1 / ordered_matches[0].size
 
-    for m in trange(1, num_obs):
+    for m in range(1, num_obs):
         if m % chunk_compression == 0:
             matrix_[(m // chunk_compression) - 1, :] = alpha
 
@@ -152,7 +151,7 @@ def setBwdValues_SPARSE(
     matrix__ = matrix_[:, matches]
     beta = np.full((matches.size,), 1 / nHaps[-1], dtype=np.float64)
 
-    for rci in trange(matrix__.shape[0] - 1, -1, -1):
+    for rci in range(matrix__.shape[0] - 1, -1, -1):
         aci = (rci + 1) * chunk_compression  # aci for actual_chip_index
 
         forward_decomp_block = run_forward_block(

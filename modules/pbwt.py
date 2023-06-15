@@ -2,7 +2,6 @@ import subprocess
 from pathlib import Path
 import shutil
 from typing import List
-from tempfile import mkdtemp
 from uuid import uuid4
 from math import ceil
 import hashlib
@@ -22,20 +21,21 @@ def _run_subset_pbwt(
     ref_base_path: Path,
     tmpdir: Path,
     match_length: int = 5,
-) -> str:
+) -> Path:
     tmpdir = Path(tmpdir).joinpath(str(uuid4()))
+    tmpdir.mkdir(parents=True, exist_ok=True)
     with open(tmpdir.joinpath("samples.txt"), "w") as fout:
-        fout.write("\n".join(samples))
+        fout.write("\n".join(samples) + "\n")
     subprocess.run(
         [
             pbwt_path,
             "-readVcfGT",
-            str(targets_path),
+            targets_path,
             "-selectSamples",
-            str(tmpdir.joinpath("samples.txt")),
+            tmpdir.joinpath("samples.txt"),
             "-referenceMatch",
-            str(ref_base_path),
-            match_length,
+            ref_base_path,
+            str(match_length),
         ],
         check=True,
         cwd=tmpdir,
@@ -47,6 +47,7 @@ def get_pbwt_matches(
     pbwt_path: Path,
     targets_path: Path,
     ref_base_path: Path,
+    tmpdir: Path,
     target_samples: List[str],
     match_length: int = 5,
     cores: int = 1,
@@ -56,7 +57,6 @@ def get_pbwt_matches(
     between target haplotypes and reference panel haplotypes
     and save the matches in sparse matrix npz format.
     """
-    tmpdir = Path(mkdtemp())
     n_samples = len(target_samples)
     if cores == 1 or n_samples == 1:
         # Process all samples at once and return
@@ -64,10 +64,10 @@ def get_pbwt_matches(
             [
                 pbwt_path,
                 "-readVcfGT",
-                str(targets_path),
+                targets_path,
                 "-referenceMatch",
-                str(ref_base_path),
-                match_length,
+                ref_base_path,
+                str(match_length),
             ],
             check=True,
             cwd=tmpdir,
@@ -75,15 +75,15 @@ def get_pbwt_matches(
         return tmpdir
 
     # Run pbwt in parallel if multiple samples and multiple cores
-    batch_size = ceil(n_samples // cores)
+    batch_size = ceil(n_samples / cores)
     # Filter reference pbwt so we only have to do it once
     subprocess.run(
         [
             pbwt_path,
             "-readVcfGT",
-            str(targets_path),
+            targets_path,
             "-writeSites",
-            str(tmpdir.joinpath("chipsites.txt")),
+            tmpdir.joinpath("chipsites.txt"),
         ],
         check=True,
         cwd=tmpdir,
@@ -92,11 +92,11 @@ def get_pbwt_matches(
         [
             pbwt_path,
             "-readAll",
-            str(ref_base_path),
+            ref_base_path,
             "-selectSites",
-            str(tmpdir.joinpath("chipsites.txt")),
+            tmpdir.joinpath("chipsites.txt"),
             "-writeAll",
-            str(tmpdir.joinpath("filtered_reference")),
+            tmpdir.joinpath("filtered_reference"),
         ],
         check=True,
         cwd=tmpdir,
@@ -106,7 +106,7 @@ def get_pbwt_matches(
             pbwt_path,
             targets_path,
             target_samples[start : start + batch_size],
-            str(tmpdir.joinpath("filtered_reference")),
+            tmpdir.joinpath("filtered_reference"),
             tmpdir,
             match_length,
         )

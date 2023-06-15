@@ -1,14 +1,16 @@
 from typing import List, Tuple
 from pathlib import Path
 from uuid import uuid4
+from math import ceil
+import time
 import numpy as np
 from scipy import sparse
 
 from joblib import Parallel, delayed
 from tqdm import trange
 
-from sparse_ref_panel import SparseReferencePanel
-from sparse2vcf import Sparse2vcf
+from .sparse_ref_panel import SparseReferencePanel
+from .sparse2vcf import Sparse2vcf
 
 
 def _interpolate_hap(
@@ -106,10 +108,8 @@ def interpolate_genotypes(
     ordered_weights: np.ndarray,
     output_path: Path,
     threads: int = 1,
-) -> sparse.csc_matrix:
-    # Load variants ids
-
-    # Load variant ids and positions for the reference
+) -> str:
+    # Load reference panel
     ref_haplotypes = SparseReferencePanel(str(refpanel), cache_size=4)
 
     _, wgs_idx, target_idx = np.intersect1d(
@@ -127,7 +127,9 @@ def interpolate_genotypes(
     )
     # For best performance, threads should not try to read
     # from the same ref panel chunks at the same time
-    chunk_size = (original_ref_indices.size - 1) // (ref_haplotypes.n_chunks // 10)
+    chunk_size = ceil(
+        (original_ref_indices.size - 1) / max(ref_haplotypes.n_chunks // 10, 1)
+    )
 
     results = sparse.hstack(
         Parallel(n_jobs=threads,)(
@@ -141,7 +143,9 @@ def interpolate_genotypes(
             for start in trange(0, len(intervals), chunk_size)
         )
     ).tocsc()
+    sparse.save_npz("results.npz", results)
 
+    start_time = time.time()
     # Convert sparse matrix to VCF
     # make sure path exists
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -166,5 +170,8 @@ def interpolate_genotypes(
     )
     converter = Sparse2vcf(results, target_samples, reference_ids, target_ids_2)
     converter.convert_to_vcf(output_file + ".vcf")
-    converter.compress_vcf(output_file)
-    converter.index_vcf(output_file + ".gz")
+    converter.compress_vcf(output_file + ".vcf")
+    converter.index_vcf(output_file + ".vcf.gz")
+    print("===== Time to write vcf: %s seconds =====" % (time.time() - start_time))
+
+    return output_file + ".vcf.gz"

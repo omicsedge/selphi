@@ -15,24 +15,24 @@ Usage:
 
 import subprocess
 import numpy as np
+from scipy import sparse
+from tqdm import tqdm
 
 
 class Sparse2vcf:
     """Class to convert from sparse matrix to VCF"""
 
     def __init__(self, results, target_sample_names, reference_ids, target_ids):
-        self.results = results > 0.5
+        self.results = (results > 0.5).astype(np.uint8).tocsr()
         self.target_sample_names = target_sample_names
         self.reference_ids = reference_ids
         self.target_ids = target_ids
-        self.probs = results
+        self.probs = results.tocsr()
 
     @property
     def chromosome(self) -> str:
         """Get chromosome"""
-        first_target_id = self.reference_ids[0]
-        chrom = first_target_id.split("-")[0]
-        return chrom
+        return self.reference_ids[0].split("-")[0]
 
     @property
     def num_haploids(self) -> int:
@@ -82,24 +82,19 @@ class Sparse2vcf:
         return length_chrs_hg38[self.chromosome]
 
     @property
-    def convert_sparse_to_matrix(self) -> np.array:
-        """Convert sparse matrix to dense array"""
-        return self.results.toarray().astype(np.uint8)
+    def get_gt_paternal(self) -> sparse.csr_matrix:
+        """Get genotype calls for paternal haplotype"""
+        return self.results[0::2, :]
 
     @property
-    def get_gt_paternal(self) -> np.array:
+    def get_gt_maternal(self) -> sparse.csr_matrix:
         """Get genotype calls for paternal haplotype"""
-        return self.convert_sparse_to_matrix[0::2, :]
-
-    @property
-    def get_gt_maternal(self) -> np.array:
-        """Get genotype calls for paternal haplotype"""
-        return self.convert_sparse_to_matrix[1::2, :]
+        return self.results[1::2, :]
 
     @property
     def allele_sum(self) -> np.array:
         """Get allele sum paternal and maternal"""
-        return self.get_gt_paternal + self.get_gt_maternal
+        return (self.get_gt_paternal + self.get_gt_maternal).toarray()
 
     @property
     def get_genotype_format_VCF(self) -> np.array:
@@ -110,7 +105,7 @@ class Sparse2vcf:
             np.where(
                 self.allele_sum == 2,
                 "1|1",
-                np.where(self.get_gt_paternal == 1, "1|0", "0|1"),
+                np.where(self.get_gt_paternal.toarray() == 1, "1|0", "0|1"),
             ),
         )
 
@@ -122,13 +117,13 @@ class Sparse2vcf:
     @property
     def get_AC(self) -> np.array:
         """Get AC allele count"""
-        return np.sum(self.allele_sum, axis=0)
+        return self.results.sum(axis=0).T
 
     @property
     def get_AF(self) -> np.array:
         """Get ALT allele freq"""
         Afreq = self.get_AC / self.get_AN
-        return [np.round(ele, 4) if ele != 0 else 0 for ele in Afreq]
+        return [ele.round(4)[0] if 0 < ele < 1 else int(ele) for ele in Afreq]
 
     @property
     def get_RA(self) -> np.array:
@@ -151,21 +146,16 @@ class Sparse2vcf:
         return
 
     @property
-    def convert_probs_to_matrix(self) -> np.array:
-        """Convert sparse matrix to dense array"""
-        return self.probs.toarray()
-
-    @property
-    def get_AP1(self) -> np.array:
+    def get_AP1(self) -> sparse.csr_matrix:
         """Get AP ALT dose on first haplotype"""
-        return self.convert_probs_to_matrix[0::2, :]
+        return self.probs[0::2, :]
 
     @property
-    def get_AP2(self) -> np.array:
-        return self.convert_probs_to_matrix[1::2, :]
+    def get_AP2(self) -> sparse.csr_matrix:
+        return self.probs[1::2, :]
 
     @property
-    def get_DS(self) -> np.array:
+    def get_DS(self) -> sparse.csr_matrix:
         """Get DS ALT dose"""
         return self.get_AP1 + self.get_AP2
 
@@ -175,35 +165,19 @@ class Sparse2vcf:
 
         with open(output_file, "w", buffering=1048576) as vcf_file:
             # Write VCF header
-            vcf_file.write("##fileformat=VCFv4.2\n")
-            vcf_file.write("##source=SELPHI_v1.0_1June2023.py Selfdecode™\n")
-            vcf_file.write('##FILTER=<ID=PASS,Description="All filters passed">\n')
             vcf_file.write(
+                "##fileformat=VCFv4.2\n"
+                "##source=SELPHI_v1.0_1June2023.py Selfdecode™\n"
+                '##FILTER=<ID=PASS,Description="All filters passed">\n'
                 '##INFO=<ID=IMP,Number=0,Type=Flag,Description="Imputed marker">\n'
-            )
-            vcf_file.write(
                 '##INFO=<ID=AF,Number=A,Type=Float,Description="Estimated ALT Allele Frequencies">\n'
-            )
-            vcf_file.write(
                 '##INFO=<ID=AN,Number=A,Type=Float,Description="Allele Number">\n'
-            )
-            vcf_file.write(
                 '##INFO=<ID=AC,Number=A,Type=Float,Description="Estimated Allele Count">\n'
-            )
-            # vcf_file.write('##INFO=<ID=DR2,Number=A,Type=Float,Description="Dosage R-Squared: estimated squared correlation between estimated REF dose [P(RA) + 2*P(RR)]" and the true REF dose>\n')
-            vcf_file.write(
+                # '##INFO=<ID=DR2,Number=A,Type=Float,Description="Dosage R-Squared: estimated squared correlation between estimated REF dose [P(RA) + 2*P(RR)]" and the true REF dose>\n'
                 '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
-            )
-            vcf_file.write(
                 '##FORMAT=<ID=DS,Number=A,Type=Float,Description="estimated ALT dose">\n'
-            )
-            vcf_file.write(
                 '##FORMAT=<ID=AP1,Number=A,Type=Float,Description="estimated ALT dose on first haplotype">\n'
-            )
-            vcf_file.write(
                 '##FORMAT=<ID=AP2,Number=A,Type=Float,Description="estimated ALT dose on second haplotype">\n'
-            )
-            vcf_file.write(
                 f"##contig=<ID={self.chromosome},length={self.chr_length},assembly=GRCh38,species=HomoSapiens>\n"
             )
             # Write sample IDs
@@ -218,16 +192,15 @@ class Sparse2vcf:
             AF = self.get_AF
             AC = self.get_AC
             GT = self.get_genotype_format_VCF
-            DS = self.get_DS
-            AP1 = self.get_AP1
-            AP2 = self.get_AP2
+            DS = self.get_DS.toarray()
+            AP1 = self.get_AP1.toarray()
+            AP2 = self.get_AP2.toarray()
 
             target_set = set(self.target_ids)
             # Write variant records
-            for i, idx in enumerate(self.reference_ids):
+            for i, idx in enumerate(tqdm(self.reference_ids)):
                 chrom, pos, ref, alt = idx.split("-")
                 # Convert float numbers to integers if they are integers
-                GT_str = GT[:, i]
                 DS_int = [
                     int(num) if num % 1 == 0 else np.round(num, 3) for num in DS[:, i]
                 ]
@@ -242,31 +215,20 @@ class Sparse2vcf:
                     [
                         f"{GT_s}:{DS_s}:{AP1_s}:{AP2_s}"
                         for GT_s, DS_s, AP1_s, AP2_s in zip(
-                            GT_str, DS_int, AP1_int, AP2_int
+                            GT[:, i], DS_int, AP1_int, AP2_int
                         )
                     ]
                 )
-                if idx in target_set:
-                    vcf_file.write(
-                        f"{chrom}\t{pos}\t{idx}\t{ref}\t{alt}\t.\tPASS\tAF={AF[i]};AC={AC[i]}\tGT:DS:AP1:AP2\t{vcf_FORMAT}\n"
-                    )
-                else:
-                    vcf_file.write(
-                        f"{chrom}\t{pos}\t{idx}\t{ref}\t{alt}\t.\tPASS\tAF={AF[i]};AC={AC[i]};IMP\tGT:DS:AP1:AP2\t{vcf_FORMAT}\n"
-                    )
+                vcf_INFO = f"AF={AF[i]};AC={AC[i]}"
+                if idx not in target_set:
+                    vcf_INFO += ";IMP"
+                vcf_file.write(
+                    f"{chrom}\t{pos}\t{idx}\t{ref}\t{alt}\t.\tPASS\t{vcf_INFO}\t"
+                    f"GT:DS:AP1:AP2\t{vcf_FORMAT}\n"
+                )
 
     def compress_vcf(self, vcf_file):
-        bgzip_file = vcf_file + ".gz"
-        bgzip_process = subprocess.Popen(
-            ["bgzip", vcf_file], stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        with open(bgzip_file, "wb") as compressed_file:
-            compressed_file.write(bgzip_process.communicate()[0])
+        subprocess.run(["bgzip", "-f", vcf_file], check=True)
 
     def index_vcf(self, vcf_file):
-        tabix_process = subprocess.Popen(
-            ["tabix", "-p", "vcf", vcf_file],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        tabix_process.communicate()
+        subprocess.run(["tabix", "-f", "-p", "vcf", vcf_file], check=True)

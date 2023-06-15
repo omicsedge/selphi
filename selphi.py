@@ -2,10 +2,10 @@ import os
 import sys
 import subprocess
 from pathlib import Path
-import shutil
 import time
 import argparse
 import logging
+from tempfile import TemporaryDirectory
 from joblib import Parallel, delayed
 
 import numpy as np
@@ -18,6 +18,8 @@ from modules.pbwt import get_pbwt_matches
 from modules.sparse_ref_panel import SparseReferencePanel
 
 logger = logging.getLogger("Selphi")
+logger.setLevel(level=logging.INFO)
+logger.addHandler(logging.StreamHandler(sys.stdout))
 
 
 def selphi(
@@ -26,6 +28,7 @@ def selphi(
     genetic_map_path: Path,
     output_path: Path,
     pbwt_path: Path,
+    tmpdir: Path,
     match_length: int = 5,
     cores: int = 1,
 ):
@@ -56,16 +59,25 @@ def selphi(
     # Find matches to reference panel with pbwt
     logger.info(f"Matching {len(target_samples)} sample(s) to reference panel")
     pbwt_result_path: Path = get_pbwt_matches(
-        pbwt_path, targets_path, ref_base_path, match_length, target_samples, cores
+        pbwt_path,
+        targets_path,
+        ref_base_path,
+        tmpdir,
+        target_samples,
+        match_length,
+        cores,
     )
-    logger.info(f"Finished matching sample(s) to reference panel")
-
+    logger.info("Time elapsed: %s seconds" % (time.time() - start_time))
     # Load overlapping variants
     variant_dtypes = np.dtype(
         [("chr", "<U21"), ("pos", int), ("ref", "<U21"), ("alt", "<U21")]
     )
     chip_variants = np.loadtxt(
         pbwt_result_path.joinpath("variants.txt"), dtype=variant_dtypes
+    )
+    logger.info(
+        f"Loaded {chip_variants.size} variants found in both "
+        "reference panel and target samples"
     )
     chip_BPs = [variant[1] for variant in chip_variants]
     chip_cM_coordinates: np.ndarray = load_and_interpolate_genetic_map(
@@ -75,8 +87,9 @@ def selphi(
     logger.info("Loaded and interpolated genetic map")
 
     # Calculate HMM weights from matches
-    ordered_weights = np.array(
-        Parallel(n_jobs=cores,)(
+    logger.info("Calculating weights from reference matches")
+    ordered_weights = np.asarray(
+        Parallel(n_jobs=cores, verbose=2)(
             delayed(calculate_weights)(
                 target_hap, chip_cM_coordinates, pbwt_result_path
             )
@@ -87,7 +100,7 @@ def selphi(
 
     # Interpolate genotypes
     logger.info("Interpolating genotypes at missing variants")
-    interpolate_genotypes(
+    output_file = interpolate_genotypes(
         ref_base_path.with_suffix(".srp"),
         chip_variants,
         target_samples,
@@ -95,10 +108,7 @@ def selphi(
         output_path,
         cores,
     )
-
-    # Clean up temp directory
-    shutil.rmtree(pbwt_result_path)
-
+    logger.info(f"Saved imputed genotypes to {output_file}")
     logger.info("===== Total time: %s seconds =====" % (time.time() - start_time))
 
 
@@ -140,6 +150,9 @@ if __name__ == "__main__":
         "--pbwt_path", type=str, default=".", help="path to pbwt library"
     )
     parser.add_argument(
+        "--tmp_path", type=str, help="location to create temporary directory"
+    )
+    parser.add_argument(
         "--match_length", type=int, default=5, help="minimum pbwt match length"
     )
     args = parser.parse_args()
@@ -155,7 +168,10 @@ if __name__ == "__main__":
     ref_path = Path(args.refpanel)
     ref_suffixes = ref_path.suffixes
     suffix_length = len(ref_suffixes) + sum([len(ext) for ext in ref_suffixes])
-    ref_base_path = Path(args.refpanel[:-suffix_length]).resolve()
+    if suffix_length > 0:
+        ref_base_path = Path(args.refpanel[:-suffix_length]).resolve()
+    else:
+        ref_base_path = ref_path.resolve()
 
     # Prepare reference panel if indicated
     if args.prepare_reference:
@@ -174,11 +190,11 @@ if __name__ == "__main__":
             [
                 pbwt_path,
                 "-checkpoint",
-                100000,
+                "100000",
                 "-readVcfGT",
-                str(ref_source_path),
+                ref_source_path,
                 "-writeAll",
-                str(ref_base_path),
+                ref_base_path,
             ],
             check=True,
             stdout=subprocess.PIPE,
@@ -199,12 +215,14 @@ if __name__ == "__main__":
     map_path = Path(args.map).resolve()
     output_path = Path(args.outvcf).resolve() if args.outvcf else Path(thedir)
 
-    selphi(
-        targets_path=targets_path,
-        ref_base_path=ref_base_path,
-        genetic_map_path=map_path,
-        output_path=output_path,
-        pbwt_path=pbwt_path,
-        match_length=args.match_length,
-        cores=args.cores,
-    )
+    with TemporaryDirectory(dir=args.tmp_path) as tempdir:
+        selphi(
+            targets_path=targets_path,
+            ref_base_path=ref_base_path,
+            genetic_map_path=map_path,
+            output_path=output_path,
+            pbwt_path=pbwt_path,
+            tmpdir=Path(tempdir).resolve(),
+            match_length=args.match_length,
+            cores=args.cores,
+        )

@@ -5,7 +5,6 @@ import pandas as pd
 import numpy as np
 from scipy import sparse
 from numba import njit
-from tqdm import trange
 
 ######################################
 #                                    #
@@ -70,11 +69,7 @@ def load_sparse_comp_matches_hybrid_npz(
     sample_name: str, hap: int, npz_dir: Path, fl: int = 25
 ) -> sparse.csc_matrix:
     npz_path = npz_dir.joinpath(f"parallel_haploid_mat_{sample_name}_{hap}.npz")
-
-    print("Loading sparse matrix")
     x: sparse.csc_matrix = sparse.load_npz(npz_path).tocsc()
-    print(x.shape)
-
     keep = np.vstack(
         [
             np.column_stack(
@@ -83,7 +78,7 @@ def load_sparse_comp_matches_hybrid_npz(
                     x[:, i].indices[np.argsort(x[:, i].data)[-fl:]],
                 )
             )
-            for i in trange(x.shape[1])
+            for i in range(x.shape[1])
         ]
     )
     mask = sparse.coo_matrix(
