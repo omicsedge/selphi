@@ -9,7 +9,7 @@ RUN apt-get update && apt-get -y upgrade && apt-get install -y \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 RUN apt-get update && apt-get -y upgrade && apt-get install -y \
-    git zlib1g-dev libbz2-dev liblzma-dev libzip-dev && \
+    git zlib1g-dev libbz2-dev liblzma-dev libzip-dev libcurl4-openssl-dev && \
     apt-get clean && apt-get purge && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
@@ -35,10 +35,13 @@ RUN mkdir -p /usr/src/ && \
     make && \
     chmod +x xsqueezeit && \
     cp xsqueezeit /usr/local/bin/
-RUN cd /usr/src/ && \
-    git clone git@github.com:selfdecode/pbwt.git && \
-    cd pbwt && \
+# Clone and build pbwt library in same directory to share htslib
+RUN mkdir -p -m 0600 ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
+RUN --mount=type=ssh git clone -b feat/merge-ref-target-files \
+    git+ssh://git@github.com/selfdecode/pbwt.git /usr/src/xSqueezeIt/pbwt && \
+    cd /usr/src/xSqueezeIt/pbwt && \
     make && \
+    mkdir - p /tool && \
     cp ./pbwt /tool/ && \
     cd /usr/src/ && \
     rm -r xSqueezeIt
@@ -46,9 +49,15 @@ RUN cd /usr/src/ && \
 RUN apt update
 RUN apt install -y bcftools tabix
 
+RUN apt install -y make build-essential checkinstall
+RUN apt-get install -y software-properties-common && add-apt-repository ppa:deadsnakes/ppa -y
+RUN apt-get install -y python3.8 python3.8-distutils python3.8-dev && \
+    curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py && python3.8 get-pip.py
+
 COPY requirements.txt requirements.txt
 RUN python3 -m pip install -r requirements.txt
 
 COPY . /tool/
 
-CMD echo "Run with the following command : docker run <tag> python3 /tool/selphi.py [args]"
+ENTRYPOINT [ "python3", "/tool/selphi.py" ]
+CMD [ "-h" ]

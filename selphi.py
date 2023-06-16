@@ -147,7 +147,7 @@ if __name__ == "__main__":
         help="location of vcf/bcf containing reference panel",
     )
     parser.add_argument(
-        "--pbwt_path", type=str, default=".", help="path to pbwt library"
+        "--pbwt_path", type=str, help="path to pbwt library"
     )
     parser.add_argument(
         "--tmp_path", type=str, help="location to create temporary directory"
@@ -159,7 +159,7 @@ if __name__ == "__main__":
 
     thedir = os.path.dirname(os.path.abspath(__file__))
 
-    pbwt_path = Path(args.pbwt_path).resolve()
+    pbwt_path = Path(args.pbwt_path or thedir).resolve()
     if pbwt_path.is_dir():
         pbwt_path = pbwt_path.joinpath("pbwt")
     if not pbwt_path.exists():
