@@ -162,16 +162,13 @@ if __name__ == "__main__":
     pbwt_path = Path(args.pbwt_path or thedir).resolve()
     if pbwt_path.is_dir():
         pbwt_path = pbwt_path.joinpath("pbwt")
+        if pbwt_path.is_dir():
+            pbwt_path = pbwt_path.joinpath("pbwt")
     if not pbwt_path.exists():
         raise FileNotFoundError(f"Could not locate pbwt library: {pbwt_path}")
 
-    ref_path = Path(args.refpanel)
-    ref_suffixes = ref_path.suffixes
-    suffix_length = len(ref_suffixes) + sum([len(ext) for ext in ref_suffixes])
-    if suffix_length > 0:
-        ref_base_path = Path(args.refpanel[:-suffix_length]).resolve()
-    else:
-        ref_base_path = ref_path.resolve()
+    ref_suffixes = "".join(Path(args.refpanel).suffixes)
+    ref_base_path = Path(args.refpanel.replace(ref_suffixes)).resolve()
 
     # Prepare reference panel if indicated
     if args.prepare_reference:

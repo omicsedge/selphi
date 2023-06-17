@@ -42,6 +42,13 @@ python3 selphi.py  \
 This command will generate 4 files: <refpan-samples>.pbwt, <refpan-samples>.samples, <refpan-samples>.sites, <refpan-samples>.srp. Creating these files can be time-intensive for large reference panels, so we recommend these files be saved for future use. They can also be created at the time of imputation by including the `--prepare_reference` and `--ref_source_vcf` flags.
 Multiple cores will linearly decrease the time to create the `.srp` file, but this process can be memory-intensive, limiting the number of cores that can be used.
 
+### Target samples
+
+ - Only one chromosome per file, and chromosome must match the reference panel
+ - All genotypes must be phased
+ - All variants in the target file should be found in the reference panel
+
+
 ### Selphi imputation
 ```bash
 python3 selphi.py \
@@ -55,10 +62,10 @@ python3 selphi.py \
 E.g.:
 ```bash
 python3 selphi.py \
-  --target data/separated_datasets/chr20/reference_panel.30x.hg38_chr20_noinfo.chipsites-292-input-samples.vcf.gz \
-  --refpanel data/separated_datasets/chr20/reference_panel.30x.hg38_chr20_noinfo.fullseq-2910-refpan-samples.vcf.gz \
-  --map /home/nikita/s3-sd-platform-dev/genome-files-processing/resource_files/b38.map/plink.chr20.GRCh38.map \
-  --outvcf data/separated_datasets/chr20/reference_panel.30x.hg38_chr20_noinfo.imputed-292-input-samples_NEW.vcf.gz \
+  --target chr20/reference_panel.30x.hg38_chr20_noinfo.chipsites-292-input-samples.vcf.gz \
+  --refpanel chr20/reference_panel.30x.hg38_chr20_noinfo.fullseq-2910-refpan-samples.vcf.gz \
+  --map b38.map/plink.chr20.GRCh38.map \
+  --outvcf chr20/reference_panel.30x.hg38_chr20_noinfo.imputed-292-input-samples_NEW.vcf.gz \
   --cores 8
 ```
 
@@ -86,7 +93,7 @@ DOCKER_BUILDKIT=1 docker build --ssh default -t selphi .
 ```
 
 Running the container without a command will display the help message.
-```bash
+```
 docker run selphi
 
 usage: Selphi [-h] --refpanel REFPANEL [--target TARGET] [--map MAP]

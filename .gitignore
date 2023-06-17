@@ -6,6 +6,11 @@
 **/__pycache__
 **/*.pyc
 
+# pbwt files
+pbwt/pbwt
+pbwt/version.h
+**/*.o
+
 build/
 *.egg-info
 *.egg
