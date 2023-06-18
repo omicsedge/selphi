@@ -147,8 +147,11 @@ if __name__ == "__main__":
         help="location of vcf/bcf containing reference panel",
     )
     parser.add_argument(
-        "--pbwt_path", type=str, help="path to pbwt library"
+        "--ref_source_xsi",
+        type=str,
+        help="location of xsi files containing reference panel",
     )
+    parser.add_argument("--pbwt_path", type=str, help="path to pbwt library")
     parser.add_argument(
         "--tmp_path", type=str, help="location to create temporary directory"
     )
@@ -172,35 +175,56 @@ if __name__ == "__main__":
 
     # Prepare reference panel if indicated
     if args.prepare_reference:
-        if not args.ref_source_vcf:
+        if args.ref_source_vcf:
+            ref_source_path = Path(args.ref_source_vcf).resolve()
+            source_type = "vcf"
+        elif args.ref_source_xsi:
+            ref_source_path = Path(args.ref_source_xsi).resolve()
+            source_type = "xsi"
+        else:
             raise KeyError(
-                "Reference panel vcf/bcf path (--ref_source_vcf) "
+                "Reference panel path (--ref_source_vcf or --ref_source_xsi) "
                 "required with --prepare_reference"
             )
-        ref_source_path = Path(args.ref_source_vcf).resolve()
+
         if not ref_source_path.exists():
             raise FileNotFoundError(
-                f"Could not locate reference vcf/bcf: {ref_source_path}"
+                f"Could not locate reference source file: {ref_source_path}"
             )
         # Create .pbwt files
-        subprocess.run(
-            [
-                pbwt_path,
-                "-checkpoint",
-                "100000",
-                "-readVcfGT",
-                ref_source_path,
-                "-writeAll",
-                ref_base_path,
-            ],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        if source_type == "vcf":
+            subprocess.run(
+                [
+                    pbwt_path,
+                    "-checkpoint",
+                    "100000",
+                    "-readVcfGT",
+                    ref_source_path,
+                    "-writeAll",
+                    ref_base_path,
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        else:
+            subprocess.run(
+                f"xsqueezeit -x -Ov -f {ref_source_path} | "
+                f"{pbwt_path} -checkpoint 100000 -readVcfGT - -writeAll {ref_base_path}",
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=True,
+            )
         # Create srp file
-        SparseReferencePanel(str(ref_base_path.with_suffix(".srp"))).from_bcf(
-            str(ref_source_path), threads=args.cores
-        )
+        if source_type == "vcf":
+            SparseReferencePanel(str(ref_base_path.with_suffix(".srp"))).from_bcf(
+                str(ref_source_path), threads=args.cores
+            )
+        else:
+            SparseReferencePanel(str(ref_base_path.with_suffix(".srp"))).from_xsi(
+                str(ref_source_path), threads=args.cores
+            )
         if not args.target:
             sys.exit(0)
 

@@ -60,13 +60,14 @@ class SparseReferencePanel:
     def __init__(self, filepath: str, cache_size: int = 2) -> None:
         self.filepath = filepath
         self.variant_dtypes = np.dtype(
-            [("chr", "<U21"), ("pos", int), ("ref", "<U32"), ("alt", "<U32")]
+            [("chr", "<U21"), ("pos", int), ("ref", "<U21"), ("alt", "<U21")]
         )
         if not os.path.exists(self.filepath):
             self._create()
         self.metadata = self._load_metadata()
         self.variants: np.ndarray = self._load_variants()
         self.chunks: np.ndarray = self._load_chunks()
+        self.ids: List[str] = self._load_ids()
         self._cache = LRUCache(maxsize=cache_size)
 
     def __getitem__(self, key: Tuple[Union[int, list, slice]]) -> sparse.csc_matrix:
@@ -162,15 +163,16 @@ class SparseReferencePanel:
     def _save(self, hap_dir: str):
         """Update archive"""
         self.metadata["updated_at"] = str(datetime.now())
-        haplotypes = Path(hap_dir)
         with ZipFile(self.filepath, mode="w") as archive:
             with archive.open("metadata", "w") as metadata:
                 metadata.write(compress(json.dumps(self.metadata).encode()))
             with archive.open("variants", "w") as variants:
                 variants.write(compress(self.variants.tobytes()))
+            with archive.open("IDs", "w") as ids:
+                ids.write(compress("\n".join(self.ids).encode()))
             with archive.open("chunks", "w") as chunks:
                 chunks.write(compress(self.chunks.tobytes()))
-            for file in haplotypes.iterdir():
+            for file in Path(hap_dir).iterdir():
                 archive.write(file, arcname=os.path.join("haplotypes", file.name))
 
     def _load_metadata(self) -> dict:
@@ -185,17 +187,29 @@ class SparseReferencePanel:
             with archive.open("variants") as obj:
                 return np.frombuffer(uncompress(obj.read()), dtype=self.variant_dtypes)
 
+    def _load_ids(self) -> List[str]:
+        """Load string formatted variant IDs from archive"""
+        try:
+            with ZipFile(self.filepath, mode="r") as archive:
+                with archive.open("IDs") as obj:
+                    return uncompress(obj.read()).decode().split("\n")
+        except KeyError:
+            return [
+                "-".join([str(col) for col in variant]) for variant in self.variants
+            ]
+
     def _ingest_variants(self, vcf_path: str):
         """Load variants from a vcf or bcf"""
         vcf_obj = cyvcf2.VCF(vcf_path)
-        self.variants = np.fromiter(
-            [
-                (variant.CHROM, variant.POS, variant.REF, variant.ALT[0])
-                for variant in vcf_obj
-            ],
-            dtype=self.variant_dtypes,
-        )
+        variants = [
+            (variant.CHROM, variant.POS, variant.REF, variant.ALT[0])
+            for variant in vcf_obj
+        ]
         vcf_obj.close()
+        # Store as numpy for array operations
+        self.variants = np.fromiter(variants, dtype=self.variant_dtypes)
+        # Also store as txt to avoid truncated indel alleles
+        self.ids = ["-".join([str(col) for col in line]) for line in variants]
 
         chroms = np.unique([variant[0] for variant in self.variants])
         if chroms.size > 1:

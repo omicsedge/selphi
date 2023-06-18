@@ -159,16 +159,7 @@ def interpolate_genotypes(
     if output_file.endswith(".vcf.gz"):
         output_file = output_file[:-7]
 
-    reference_ids = np.array(
-        [
-            f"{x['chr']}-{x['pos']}-{x['ref']}-{x['alt']}"
-            for x in ref_haplotypes.variants
-        ]
-    )
-    target_ids_2 = np.array(
-        [f"{x['chr']}-{x['pos']}-{x['ref']}-{x['alt']}" for x in target_ids]
-    )
-    converter = Sparse2vcf(results, target_samples, reference_ids, target_ids_2)
+    converter = Sparse2vcf(results, target_samples, ref_haplotypes.ids, wgs_idx)
     converter.convert_to_vcf(output_file + ".vcf")
     converter.compress_vcf(output_file + ".vcf")
     converter.index_vcf(output_file + ".vcf.gz")

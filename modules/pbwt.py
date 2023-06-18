@@ -37,6 +37,8 @@ def _run_subset_pbwt(
             ref_base_path,
             str(match_length),
         ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         check=True,
         cwd=tmpdir,
     )
@@ -69,6 +71,8 @@ def get_pbwt_matches(
                 ref_base_path,
                 str(match_length),
             ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             check=True,
             cwd=tmpdir,
         )
@@ -85,6 +89,8 @@ def get_pbwt_matches(
             "-writeSites",
             tmpdir.joinpath("chipsites.txt"),
         ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         check=True,
         cwd=tmpdir,
     )
@@ -98,6 +104,8 @@ def get_pbwt_matches(
             "-writeAll",
             tmpdir.joinpath("filtered_reference"),
         ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         check=True,
         cwd=tmpdir,
     )
