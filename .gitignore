@@ -63,3 +63,5 @@ __pypackages__/
 /modules/*.lib
 
 /lib/
+
+test
