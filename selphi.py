@@ -168,7 +168,7 @@ if __name__ == "__main__":
         raise FileNotFoundError(f"Could not locate pbwt library: {pbwt_path}")
 
     ref_suffixes = "".join(Path(args.refpanel).suffixes)
-    ref_base_path = Path(args.refpanel.replace(ref_suffixes)).resolve()
+    ref_base_path = Path(args.refpanel.replace(ref_suffixes, "")).resolve()
 
     # Prepare reference panel if indicated
     if args.prepare_reference:

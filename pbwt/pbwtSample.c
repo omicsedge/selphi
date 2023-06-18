@@ -56,7 +56,7 @@ char* sampleName (Sample *s) { return dictName (sampleDict, s->nameD) ; }
 
 char* popName (Sample *s) { return dictName (populationDict, s->popD) ; }
 
-PBWT *pbwtSubSample (PBWT *pOld, Array select)
+static PBWT *pbwtSubSample (PBWT *pOld, Array select)
 /* select[i] is the position in old of the i'th position in new */
 {
   if (!pOld || !pOld->yz) die ("subSample called without valid pbwt") ;

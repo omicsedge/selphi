@@ -39,17 +39,17 @@ RUN mkdir -p /usr/src/ && \
     chmod +x xsqueezeit && \
     cp xsqueezeit /usr/local/bin/
 # Build pbwt library
-RUN mkdir - p /tool
-COPY ./pbwt /tool/
+RUN mkdir -p /tool
+COPY ./pbwt /tool/pbwt
 RUN cd /tool/pbwt && HTSDIR=/usr/src/xSqueezeIt/htslib make
-
+# clean up
 RUN rm -r /usr/src/xSqueezeIt
 
 COPY requirements.txt requirements.txt
 RUN python3 -m pip install -r requirements.txt
 
 COPY *.py /tool/
-COPY ./modules /tool/
+COPY ./modules /tool/modules
 
 ENTRYPOINT [ "python3", "/tool/selphi.py" ]
 CMD [ "-h" ]

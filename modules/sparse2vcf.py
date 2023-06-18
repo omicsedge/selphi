@@ -23,16 +23,18 @@ class Sparse2vcf:
     """Class to convert from sparse matrix to VCF"""
 
     def __init__(self, results, target_sample_names, reference_ids, target_ids):
-        self.results = (results > 0.5).astype(np.uint8).tocsr()
+        self.results = results > 0.5
         self.target_sample_names = target_sample_names
         self.reference_ids = reference_ids
         self.target_ids = target_ids
-        self.probs = results.tocsr()
-
+        self.probs = results
+        
     @property
     def chromosome(self) -> str:
         """Get chromosome"""
-        return self.reference_ids[0].split("-")[0]
+        first_target_id = self.reference_ids[0]
+        chrom = first_target_id.split('-')[0]
+        return chrom
 
     @property
     def num_haploids(self) -> int:
@@ -53,61 +55,58 @@ class Sparse2vcf:
     def chr_length(self) -> str:
         """Get chromosome length for VCF"""
         length_chrs_hg38 = {
-            "1": "248956422",
-            "2": "242193529",
-            "3": "198295559",
-            "4": "190214555",
-            "5": "181538259",
-            "6": "170805979",
-            "7": "159345973",
-            "8": "145138636",
-            "9": "138394717",
-            "10": "133797422",
-            "11": "135086622",
-            "12": "133275309",
-            "13": "114364328",
-            "14": "107043718",
-            "15": "101991189",
-            "16": "90338345",
-            "17": "83257441",
-            "18": "80373285",
-            "19": "58617616",
-            "20": "64444167",
-            "21": "46709983",
-            "22": "50818468",
-            "X": "156040895",
-            "Y": "57227415",
-            "MT": "16569",
+            '1':'248956422',
+            '2':'242193529',
+            '3':'198295559',
+            '4':'190214555',
+            '5':'181538259',
+            '6':'170805979',
+            '7':'159345973',
+            '8':'145138636',
+            '9':'138394717',
+            '10':'133797422',
+            '11':'135086622',
+            '12':'133275309',
+            '13':'114364328',
+            '14':'107043718',
+            '15':'101991189',
+            '16':'90338345',
+            '17':'83257441',
+            '18':'80373285',
+            '19':'58617616',
+            '20':'64444167',
+            '21':'46709983',
+            '22':'50818468',
+            'X':'156040895',
+            'Y':'57227415',
+            'MT':'16569'
         }
         return length_chrs_hg38[self.chromosome]
 
     @property
-    def get_gt_paternal(self) -> sparse.csr_matrix:
-        """Get genotype calls for paternal haplotype"""
-        return self.results[0::2, :]
+    def convert_sparse_to_matrix(self) -> np.array:
+        """Convert sparse matrix to dense array"""
+        return self.results.toarray().astype(np.uint8)
 
     @property
-    def get_gt_maternal(self) -> sparse.csr_matrix:
+    def get_gt_paternal(self) -> np.array:
         """Get genotype calls for paternal haplotype"""
-        return self.results[1::2, :]
+        return self.convert_sparse_to_matrix[0::2, :]
+
+    @property
+    def get_gt_maternal(self) -> np.array:
+        """Get genotype calls for paternal haplotype"""
+        return self.convert_sparse_to_matrix[1::2, :]
 
     @property
     def allele_sum(self) -> np.array:
         """Get allele sum paternal and maternal"""
-        return (self.get_gt_paternal + self.get_gt_maternal).toarray()
-
+        return self.get_gt_paternal + self.get_gt_maternal
+    
     @property
     def get_genotype_format_VCF(self) -> np.array:
         """Get genotyepe calls for VCF output"""
-        return np.where(
-            self.allele_sum == 0,
-            "0|0",
-            np.where(
-                self.allele_sum == 2,
-                "1|1",
-                np.where(self.get_gt_paternal.toarray() == 1, "1|0", "0|1"),
-            ),
-        )
+        return np.where(self.allele_sum == 0,'0|0',np.where(self.allele_sum == 2,'1|1',np.where(self.get_gt_paternal == 1,'1|0','0|1')))
 
     @property
     def get_AN(self) -> int:
@@ -117,47 +116,52 @@ class Sparse2vcf:
     @property
     def get_AC(self) -> np.array:
         """Get AC allele count"""
-        return self.results.sum(axis=0).T
+        return np.sum(self.allele_sum,axis=0)
 
     @property
     def get_AF(self) -> np.array:
         """Get ALT allele freq"""
         Afreq = self.get_AC / self.get_AN
-        return [ele.round(4)[0] if 0 < ele < 1 else int(ele) for ele in Afreq]
-
+        return [np.round(ele, 4) if ele != 0 else 0 for ele in Afreq]
+    
     @property
     def get_RA(self) -> np.array:
         """Get RA prob"""
-        return
+        return 
 
     @property
     def get_RR(self) -> np.array:
         """Get RR prob"""
-        return
+        return 
 
     @property
     def get_AA(self) -> np.array:
         """Get AA prob"""
-        return
-
+        return 
+    
     @property
     def get_DR2(self) -> np.array:
         """Get DR2 imputation score"""
-        return
-
+        return 
+    
     @property
-    def get_AP1(self) -> sparse.csr_matrix:
+    def convert_probs_to_matrix(self) -> np.array:
+        """Convert sparse matrix to dense array"""
+        return self.probs.toarray()
+    
+    @property
+    def get_AP1(self) -> np.array:
         """Get AP ALT dose on first haplotype"""
-        return self.probs[0::2, :]
+        return self.convert_probs_to_matrix[0::2, :]
 
     @property
-    def get_AP2(self) -> sparse.csr_matrix:
-        return self.probs[1::2, :]
+    def get_AP2(self) -> np.array:
+        return self.convert_probs_to_matrix[1::2, :]
 
     @property
-    def get_DS(self) -> sparse.csr_matrix:
+    def get_DS(self) -> np.array:
         """Get DS ALT dose"""
-        return self.get_AP1 + self.get_AP2
+        return (self.get_AP1 + self.get_AP2) 
 
     def convert_to_vcf(self, output_file):
 
@@ -192,9 +196,9 @@ class Sparse2vcf:
             AF = self.get_AF
             AC = self.get_AC
             GT = self.get_genotype_format_VCF
-            DS = self.get_DS.toarray()
-            AP1 = self.get_AP1.toarray()
-            AP2 = self.get_AP2.toarray()
+            DS = self.get_DS
+            AP1 = self.get_AP1
+            AP2 = self.get_AP2
 
             target_set = set(self.target_ids)
             # Write variant records

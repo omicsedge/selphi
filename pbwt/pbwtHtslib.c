@@ -16,9 +16,11 @@
 #include <htslib/faidx.h>
 #include <ctype.h>		/* for toupper() */
 
+const char *pbwtHtslibVersionString(void) {
+    return hts_version();
+}
 
-static void readVcfSamples (PBWT *p, bcf_hdr_t *hr)
-{
+static void readVcfSamples (PBWT *p, bcf_hdr_t *hr) {
   int i, k ;
 
   p->samples = arrayCreate (p->M, int) ;
@@ -29,8 +31,7 @@ static void readVcfSamples (PBWT *p, bcf_hdr_t *hr)
     }
 }
 
-static int variation (PBWT *p, const char *ref, const char *alt)
-{
+static int variation (PBWT *p, const char *ref, const char *alt) {
   static char *buf = 0 ;
   static int buflen = 0 ;
   if (!buf) { buflen = 64 ; buf = myalloc (buflen, char) ; }
@@ -44,8 +45,7 @@ static int variation (PBWT *p, const char *ref, const char *alt)
   return var ;
 }
 
-PBWT *pbwtReadVcfGT (char *filename)  /* read GTs from vcf/bcf using htslib */
-{
+PBWT *pbwtReadVcfGT (char *filename) {
   int i, j ;
 
   bcf_srs_t *sr = bcf_sr_init();

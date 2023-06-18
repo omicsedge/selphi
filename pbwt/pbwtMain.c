@@ -23,7 +23,6 @@
 
 #include <math.h>
 
-
 /*********************************************************/
 
 char * commandLine = "";
@@ -40,8 +39,6 @@ static void recordCommandLine(int argc, char * argv[]) {
     strcat(commandLine, argv[i]);
   }
 }
-
-/*********************************************************/
 
 /* a couple of utilities for opening/closing files */
 #define FOPEN(name, mode) if (!strcmp(argv[1], "-")) fp = !strcmp(mode, "r") ? stdin : stdout; \

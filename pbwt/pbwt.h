@@ -90,27 +90,30 @@ typedef struct {
 PbwtCursor;
 
 /* pbwtMain.c */
-
-extern char * commandLine; /* a copy of the command line */
 extern FILE * logFile; /* log file pointer */
 
 /* pbwtCore.c */
-
 extern BOOL isCheck; /* when TRUE carry out various checks */
 extern BOOL isStats; /* when TRUE report stats in various places */
-extern DICT * variationDict; /* "xxx|yyy" where variation is from xxx to yyy in VCF */
-/* NB using a global DICT for variation means that identical variations use the same string */
+extern DICT * variationDict; 
 void pbwtInit(void);
 PBWT * pbwtCreate(int M, int N); /* OK to have N == 0 and set p->N later if not known now */
 void pbwtDestroy(PBWT * p);
 uchar ** pbwtHaplotypes(PBWT * p);
-PBWT * pbwtSelectSites(PBWT * pOld, Array sites, BOOL isKeepOld);
-PBWT * pbwtSelectSitesFillMissing(PBWT * pOld, Array sites, BOOL isKeepOld);
-PbwtCursor * pbwtCursorCreate(PBWT * p, BOOL isForwards, BOOL isStart);
+/* low level operations on packed PBWT, argument yzp in these calls */
+#define Y_SENTINEL 2 /* needed to pack efficiently */
+int pack3(uchar * yp, int M, uchar * yzp); /* pack M values from yp into yzp */
+int pack3arrayAdd(uchar * yp, int M, Array ayz); /* normally use this one */
+int unpack3(uchar * yzp, int M, uchar * yp, int * n0); /* unpack M values from yzp into yp, return number of bytes used from yzp, if (n0) write number of 0s into *n0 */
+int packCountReverse(uchar * yzp, int M); /* return number of bytes to reverse one position */
+int extendMatchForwards(uchar * yzp, int M, uchar x, int * f, int * g); /* move hit interval f,g) forwards one position, matching x */
+int extendPackedForwards(uchar * yzp, int M, int * f, uchar * zp); /* move f forwards one position */
+int extendPackedBackwards(uchar * yzp, int M, int * f, int c, uchar * zp); /* move f backwards one position - write value into *zp if zp non-zero */
+/* cursors */
 PbwtCursor * pbwtNakedCursorCreate(int M, int * aInit);
+PbwtCursor * pbwtCursorCreate(PBWT * p, BOOL isForwards, BOOL isStart);
 void pbwtCursorDestroy(PbwtCursor * u);
 void pbwtCursorForwardsA(PbwtCursor * u); /* algorithm 1 in the manuscript */
-void pbwtCursorForwardsAPacked(PbwtCursor * u); /* faster version, when have read y and set u->nBlockStart */
 void pbwtCursorBackwardsA(PbwtCursor * u); /* undo algorithm 1 */
 void pbwtCursorForwardsAD(PbwtCursor * u, int k); /* algorithm 2 in the manuscript */
 void pbwtCursorCalculateU(PbwtCursor * x); /* calculate u required for CursorMap */
@@ -120,7 +123,7 @@ void pbwtCursorReadBackwards(PbwtCursor * u); /* read and move backwards (unless
 void pbwtCursorWriteForwards(PbwtCursor * u); /* write then move forwards */
 void pbwtCursorWriteForwardsAD(PbwtCursor * u, int k);
 void pbwtCursorToAFend(PbwtCursor * u, PBWT * p); /* utility to copy final u->a to p->aFend */
-
+void pbwtCursorForwardsAPacked(PbwtCursor * u); /* faster version, when have read y and set u->nBlockStart */
 static inline int pbwtCursorMap(PbwtCursor * u, int x, int i) {
   return x ? u -> c + i - u -> u[i] : u -> u[i];
 }
@@ -134,40 +137,25 @@ static inline int pbwtCursorMapDminus(PbwtCursor * u, int x, int i, int dminus) 
     if (u -> d[i] > dminus) dminus = u -> d[i];
   return dminus;
 }
-
-/* low level operations on packed PBWT, argument yzp in these calls */
-#define Y_SENTINEL 2 /* needed to pack efficiently */
-int pack3(uchar * yp, int M, uchar * yzp); /* pack M values from yp into yzp */
-int pack3arrayAdd(uchar * yp, int M, Array ayz); /* normally use this one */
-int unpack3(uchar * yzp, int M, uchar * yp, int * n0); /* unpack M values from yzp into yp, return number of bytes used from yzp, if (n0) write number of 0s into *n0 */
-int packCountReverse(uchar * yzp, int M); /* return number of bytes to reverse one position */
-int extendMatchForwards(uchar * yzp, int M, uchar x, int * f, int * g); /* move hit interval f,g) forwards one position, matching x */
-int extendPackedForwards(uchar * yzp, int M, int * f, uchar * zp); /* move f forwards one position */
-int extendPackedBackwards(uchar * yzp, int M, int * f, int c, uchar * zp); /* move f backwards one position - write value into *zp if zp non-zero */
+PBWT * pbwtSelectSites(PBWT * pOld, Array sites, BOOL isKeepOld);
 
 /* pbwtSample.c */
-
 void sampleInit(void);
 void sampleDestroy(void);
-Sample * sample(PBWT * p, int i); /* give back Sample structure for sample i from p */
 int sampleAdd(char * name, char * father, char * mother, char * pop);
+Sample * sample(PBWT * p, int i); /* give back Sample structure for sample i from p */
 char * sampleName(Sample * s);
 char * popName(Sample * s); /* give back population name for sample i */
-PBWT * pbwtSubSample(PBWT * pOld, Array select);
 PBWT * pbwtSelectSamples(PBWT * pOld, FILE * fp);
 
 /* pbwtIO.c */
-
 extern int nCheckPoint; /* if set non-zero write pbwt and sites files every n sites when parsing external files */
-
+void pbwtCheckPoint(PbwtCursor * u, PBWT * p);
 void pbwtWriteSites(PBWT * p, FILE * fp);
 void pbwtWriteAll(PBWT * p, char * fileNameRoot);
-PBWT * pbwtRead(FILE * fp);
 Array pbwtReadSitesFile(FILE * fp, char ** chrom);
-void pbwtReadSites(PBWT * p, FILE * fp);
+Array pbwtReadSamplesFile(FILE *fp);
 PBWT * pbwtReadAll(char * fileNameRoot); /* reads .pbwt, .sites, .samples, .missing  */
-void pbwtCheckPoint(PbwtCursor * u, PBWT * p); /* need cursor to write end index */
-void pbwtWriteHaplotypes(FILE * fp, PBWT * p);
 
 /* pbwtHtslib.c */
 PBWT * pbwtReadVcfGT(char * filename); /* read GTs from vcf/bcf using htslib */

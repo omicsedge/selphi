@@ -1,12 +1,12 @@
 CFLAGS= -g -O3
 CPPFLAGS=-I$(HTSDIR)
 HTSLIB=$(HTSDIR)/libhts.a
-LDLIBS=-lpthread $(HTSLIB) -lz -lm -lbz2 -llzma -lcurl -lzip
+LDLIBS=-pthread $(HTSLIB) -lz -lm -lbz2 -llzma -lcurl -lzip
 
 all: pbwt
 
 PBWT_COMMIT_HASH = ""
-ifneq "$(wildcard .git)" ""
+ifneq "$(wildcard ../.git)" ""
 PBWT_COMMIT_HASH = $(shell git describe --always --long --dirty)
 version.h: $(if $(wildcard version.h),$(if $(findstring "$(PBWT_COMMIT_HASH)",$(shell cat version.h)),,force))
 endif

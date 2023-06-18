@@ -10,13 +10,7 @@ use File::Temp qw/ tempfile tempdir /;
 
 my $opts = parse_params();
 
-test_pbwt($opts, in=>'merge.1', out=>'merge.1.out');
-test_pbwt($opts, in=>'merge.2', out=>'merge.2.out');
-test_write_vcf($opts, in=>'merge.1', out=>'merge.1.vcf');
 test_read_vcf_gt($opts, in=>'read.vcf', out=>'write.vcf');
-test_pbwt_reference_impute($opts, in=>'refImpute.in', ref=>'OMNI', out=>'refImpute.out.vcf');
-test_merge($opts,in=>['merge.1','merge.2'],out=>'merge.12.out');
-test_merge_sites($opts,in=>['merge.1','merge.2'],out=>'merge.12.sites');
 
 print "\nNumber of tests:\n";
 printf "    total   .. %d\n", $$opts{nok}+$$opts{nfailed};
@@ -175,47 +169,8 @@ sub is_file_newer
 
 
 # The tests --------------------------
-
-sub test_pbwt
-{
-	my ($opts,%args) = @_;
-	cmd("$$opts{bin}/pbwt -readVcfq $$opts{path}/$args{in}.tab -write $$opts{tmp}/$args{in}.pbwt -writeSites $$opts{tmp}/$args{in}.sites 2>/dev/null");
-	test_cmd($opts,%args,cmd=>"$$opts{bin}/pbwt -read $$opts{tmp}/$args{in}.pbwt -haps $$opts{tmp}/$args{out}");
-}
-
-sub test_write_vcf
-{
-    my ($opts,%args) = @_;
-    test_cmd($opts,%args,cmd=>"$$opts{bin}/pbwt -read $$opts{tmp}/$args{in}.pbwt -readSites $$opts{tmp}/$args{in}.sites -writeVcf - 2>/dev/null | grep -v ^##pbwt >$$opts{tmp}/$args{out}");
-    test_cmd($opts,%args,cmd=>"$$opts{bin}/pbwt -read $$opts{tmp}/$args{in}.pbwt -readSites $$opts{tmp}/$args{in}.sites -writeVcfGz - 2>/dev/null | $$opts{bin}/pbwt -readVcfGT - -writeVcf - 2>/dev/null | grep -v ^##pbwt >$$opts{tmp}/$args{out}");
-    test_cmd($opts,%args,cmd=>"$$opts{bin}/pbwt -read $$opts{tmp}/$args{in}.pbwt -readSites $$opts{tmp}/$args{in}.sites -writeBcf - 2>/dev/null | $$opts{bin}/pbwt -readVcfGT - -writeVcf - 2>/dev/null | grep -v ^##pbwt >$$opts{tmp}/$args{out}");
-    test_cmd($opts,%args,cmd=>"$$opts{bin}/pbwt -read $$opts{tmp}/$args{in}.pbwt -readSites $$opts{tmp}/$args{in}.sites -writeBcfGz - 2>/dev/null | $$opts{bin}/pbwt -readVcfGT - -writeVcf - 2>/dev/null | grep -v ^##pbwt >$$opts{tmp}/$args{out}");
-}
-
 sub test_read_vcf_gt
 {
     my ($opts,%args) = @_;
     test_cmd($opts,%args,cmd=>"$$opts{bin}/pbwt -readVcfGT $$opts{path}/read.vcf -writeVcf - 2>/dev/null | grep -v ^##pbwt >$$opts{tmp}/$args{out}");
-}
-
-sub test_pbwt_reference_impute
-{
-    my ($opts,%args) = @_;
-    # create reference panel pbwt
-    cmd("$$opts{bin}/pbwt -readVcfGT $$opts{path}/$args{ref}.vcf -writeAll $$opts{tmp}/$args{ref} 2>/dev/null");
-    test_cmd($opts,%args,cmd=>"$$opts{bin}/pbwt -readVcfGT $$opts{path}/$args{in}.vcf -referenceImpute $$opts{tmp}/$args{ref} -writeVcf - 2>/dev/null | grep -v ^##pbwt > $$opts{tmp}/$args{out}");
-}
-
-sub test_merge
-{
-    my ($opts,%args) = @_;
-	my $files = join(' ', map( "$$opts{tmp}/$_.pbwt" , @{$args{in}}));
-	test_cmd($opts,%args,cmd=>"$$opts{bin}/pbwt -merge $files -write - 2>/dev/null | $$opts{bin}/pbwt -read - -haps $$opts{tmp}/$args{out} 2>/dev/null");
-}
-
-sub test_merge_sites
-{
-    my ($opts,%args) = @_;
-	my $files = join(' ', map( "$$opts{tmp}/$_.pbwt" , @{$args{in}}));
-	test_cmd($opts,%args,cmd=>"$$opts{bin}/pbwt -merge $files -write - -writeSites $$opts{tmp}/$args{out} 2>/dev/null");
 }

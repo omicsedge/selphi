@@ -65,7 +65,7 @@ void pbwtDestroy(PBWT * p) {
 
 /*************** make haplotypes ******************/
 
-uchar ** pbwtHaplotypes(PBWT * p) /* NB haplotypes can be space costly */ {
+uchar ** pbwtHaplotypes(PBWT * p) {
   int M = p -> M;
   int i, j, n = 0;
   int * a;
@@ -98,8 +98,8 @@ uchar ** pbwtHaplotypes(PBWT * p) /* NB haplotypes can be space costly */ {
 
 static int p3decode[128];
 #define ENCODE_MAX1 64 /* ~64 */
-#define ENCODE_MAX2((95 - 63) << 6) /* ~1k - is this 32 or 31?*/
-#define ENCODE_MAX3((127 - 96) << 11) /* ~64k - ditto */
+#define ENCODE_MAX2 ((95 - 63) << 6) /* ~1k - is this 32 or 31?*/
+#define ENCODE_MAX3 ((127 - 96) << 11) /* ~64k - ditto */
 
 static void pack3init(void) {
   int n;
@@ -108,9 +108,7 @@ static void pack3init(void) {
   for (n = 96; n < 128; ++n) p3decode[n] = (n - 96) << 11;
 }
 
-static inline int pack3Add(uchar yy, uchar * yzp, int n)
-/* local utility for pack3 */
-{
+static inline int pack3Add(uchar yy, uchar * yzp, int n) {
   uchar * yzp0 = yzp;
 
   yy <<= 7; /* first move the actual symbol to the top bit */
@@ -133,9 +131,7 @@ static inline int pack3Add(uchar yy, uchar * yzp, int n)
   return yzp - yzp0;
 }
 
-int pack3(uchar * yp, int M, uchar * yzp)
-/* pack M chars from y into yz - return number of chars added */
-{
+int pack3(uchar * yp, int M, uchar * yzp) {
   int m = 0, m0;
   uchar * yzp0 = yzp;
   uchar ym;
@@ -152,9 +148,7 @@ int pack3(uchar * yp, int M, uchar * yzp)
   return yzp - yzp0;
 }
 
-int pack3arrayAdd(uchar * yp, int M, Array ayz)
-/* pack M chars onto the end of array ayz - normally use this function */
-{
+int pack3arrayAdd(uchar * yp, int M, Array ayz) {
   long max = arrayMax(ayz);
   arrayExtend(ayz, max + M); /* ensure enough space to copy into */
   int n = pack3(yp, M, arrp(ayz, max, uchar));
@@ -162,9 +156,7 @@ int pack3arrayAdd(uchar * yp, int M, Array ayz)
   return n;
 }
 
-int unpack3(uchar * yzp, int M, uchar * yp, int * n0)
-/* unpack yz into M chars in y - return number of chars unpacked - n0 is number of 0s */
-{
+int unpack3(uchar * yzp, int M, uchar * yp, int * n0) {
   int m = 0;
   uchar * yzp0 = yzp;
   uchar yz;
@@ -189,7 +181,7 @@ int unpack3(uchar * yzp, int M, uchar * yp, int * n0)
   return yzp - yzp0;
 }
 
-int packCountReverse(uchar * yzp, int M) /* return number of bytes to reverse 1 position */ {
+int packCountReverse(uchar * yzp, int M) {
   int m = 0;
   uchar * yzp0 = yzp;
 
@@ -205,11 +197,7 @@ int packCountReverse(uchar * yzp, int M) /* return number of bytes to reverse 1 
   z >>= 7; \
   nc[z] += n
 
-int extendMatchForwards(uchar * yzp, int M, uchar x, int * f, int * g)
-/* x is value to match, [f,g) are start, end of interval */
-/* update *f and *g to new match interval, return number of bytes used from yzp */
-/* this is more or less standard FM extension, counting nc (=ACC) on fly from BWT */
-{
+int extendMatchForwards(uchar * yzp, int M, uchar x, int * f, int * g) {
   int m = 0, nc[2];
   /* macro for inner loop to move along array */
   uchar z, * yzp0 = yzp;
@@ -360,7 +348,7 @@ void pbwtCursorDestroy(PbwtCursor * u) {
   free(u);
 }
 
-void pbwtCursorForwardsA(PbwtCursor * x) /* algorithm 1 in the manuscript */ {
+void pbwtCursorForwardsA(PbwtCursor * x) {
   int u = 0, v = 0;
   int i;
 
@@ -373,7 +361,7 @@ void pbwtCursorForwardsA(PbwtCursor * x) /* algorithm 1 in the manuscript */ {
   memcpy(x -> a + u, x -> b, v * sizeof(int));
 }
 
-void pbwtCursorBackwardsA(PbwtCursor * x) /* undo algorithm 1 */ {
+void pbwtCursorBackwardsA(PbwtCursor * x) {
   int u = 0, v = 0;
   int i;
   int * t = x -> a;
@@ -387,7 +375,7 @@ void pbwtCursorBackwardsA(PbwtCursor * x) /* undo algorithm 1 */ {
       x -> a[i] = x -> b[x -> c + v++];
 }
 
-void pbwtCursorForwardsAD(PbwtCursor * x, int k) /* algorithm 2 in the manuscript */ {
+void pbwtCursorForwardsAD(PbwtCursor * x, int k) {
   int u = 0, v = 0;
   int i;
   int p = k + 1;
@@ -471,7 +459,7 @@ void pbwtCursorReadBackwards(PbwtCursor * u) /* read and go backwards (unless at
     u -> isBlockEnd = TRUE;
 }
 
-void pbwtCursorWriteForwards(PbwtCursor * u) /* write then move forwards */ {
+void pbwtCursorWriteForwards(PbwtCursor * u) {
   u -> n += pack3arrayAdd(u -> y, u -> M, u -> z);
   u -> isBlockEnd = FALSE;
   pbwtCursorForwardsA(u);
@@ -483,20 +471,14 @@ void pbwtCursorWriteForwardsAD(PbwtCursor * u, int k) {
   pbwtCursorForwardsAD(u, k);
 }
 
-void pbwtCursorToAFend(PbwtCursor * u, PBWT * p) /* utility to copy final u->a to p->aFend */ {
+void pbwtCursorToAFend(PbwtCursor * u, PBWT * p) {
   if (!p -> aFend) p -> aFend = myalloc(p -> M, int);
   memcpy(p -> aFend, u -> a, p -> M * sizeof(int));
 }
 
 /***************************************************/
 
-void pbwtCursorForwardsAPacked(PbwtCursor * u)
-/* A replacement for pbwtCursorForwardsA()
-   We need u->nBlockStart = start of the packed array corresponding to current y,
-   then copy blocks of old a into new a.
-   Unfortunately we can't do this with AD because we need the maximum of d in a block.
-*/
-{
+void pbwtCursorForwardsAPacked(PbwtCursor * u) {
   int c = 0, m = 0, n;
   uchar * zp = arrp(u -> z, u -> nBlockStart, uchar), * zp0 = zp, z;
   while (m < u -> M) {
@@ -587,10 +569,6 @@ static PBWT * selectSitesLocal(PBWT * pOld, Array sites, BOOL isKeepOld, BOOL is
 
 PBWT * pbwtSelectSites(PBWT * pOld, Array sites, BOOL isKeepOld) {
   return selectSitesLocal(pOld, sites, isKeepOld, FALSE);
-}
-
-PBWT * pbwtSelectSitesFillMissing(PBWT * pOld, Array sites, BOOL isKeepOld) {
-  return selectSitesLocal(pOld, sites, isKeepOld, TRUE);
 }
 
 /******************* end of file *******************/

@@ -126,9 +126,7 @@ static void pbwtWriteReverse (PBWT *p, FILE *fp)
   p->yz = tz ; p->aFstart = tstart ; p->aFend = tend ;
 }
 
-
-void pbwtWriteAll (PBWT *p, char *root)
-{
+void pbwtWriteAll (PBWT *p, char *root) {
   FILE *fp ;
 #define FOPEN_W(tag)  if (!(fp = fopenTag (root, tag, "w"))) die ("failed to open root.%s", tag)
   FOPEN_W("pbwt") ; pbwtWrite (p, fp) ; fclose (fp) ;
@@ -138,21 +136,20 @@ void pbwtWriteAll (PBWT *p, char *root)
   if (p->zz) { FOPEN_W("reverse") ; pbwtWriteReverse (p, fp) ; fclose (fp) ; }
 }
 
-void pbwtCheckPoint (PbwtCursor *u, PBWT *p)
-{
-  static BOOL isA = TRUE ;
-  char fileNameRoot[20] ;
+void pbwtCheckPoint(PbwtCursor * u, PBWT * p) {
+  static BOOL isA = TRUE;
+  char fileNameRoot[20];
 
-  pbwtCursorToAFend (u, p) ;
-  sprintf (fileNameRoot, "check_%c", isA ? 'A' : 'B') ;
-  pbwtWriteAll (p, fileNameRoot) ;
+  pbwtCursorToAFend(u, p);
+  sprintf(fileNameRoot, "check_%c", isA ? 'A' : 'B');
+  pbwtWriteAll(p, fileNameRoot);
 
-  isA = !isA ;
+  isA = !isA;
 }
 
 /*******************************/
 
-PBWT *pbwtRead (FILE *fp) 
+static PBWT *pbwtRead (FILE *fp) 
 {
   int m, n ;
   long nz ;
@@ -249,7 +246,7 @@ Array pbwtReadSitesFile (FILE *fp, char **chrom)
   return sites ;
 }
 
-void pbwtReadSites (PBWT *p, FILE *fp)
+static void pbwtReadSites (PBWT *p, FILE *fp)
 {
   if (!p) die ("pbwtReadSites called without a valid pbwt") ;
 
@@ -259,7 +256,7 @@ void pbwtReadSites (PBWT *p, FILE *fp)
 }
 
 
-static Array pbwtReadSamplesFile (FILE *fp) /* for now assume all samples diploid */
+Array pbwtReadSamplesFile (FILE *fp) /* for now assume all samples diploid */
 /* should add code to this to read father and mother and population
    propose to use IMPUTE2 format for this */
 {
@@ -365,28 +362,6 @@ PBWT *pbwtReadAll (char *root)
   if ((fp = fopenTag (root, "reverse","r"))) { pbwtReadReverse (p, fp) ; fclose (fp) ; }
 
   return p ;
-}
-
-/*************** write haplotypes ******************/
-
-void pbwtWriteHaplotypes (FILE *fp, PBWT *p)
-{
-  int i, j, n = 0, M = p->M ;
-  uchar *hap = myalloc (M, uchar) ;
-  PbwtCursor *u = pbwtCursorCreate (p, TRUE, TRUE) ;
-
-  for (i = 0 ; i < p->N ; ++i)
-    { for (j = 0 ; j < M ; ++j) hap[u->a[j]] = u->y[j] ;
-      for (j = 0 ; j < M ; ++j) 
-	{ if (isWriteImputeRef && j > 0) putc (' ', fp) ;
-	  putc (hap[j]?'1':'0', fp) ;
-	}
-      putc ('\n', fp) ; fflush (fp) ;
-      pbwtCursorForwardsRead (u) ;
-    }
-  free (hap) ; pbwtCursorDestroy (u) ;
-
-  fprintf (logFile, "written haplotype file: %d rows of %d\n", p->N, M) ;
 }
 
 /******************* end of file *******************/
