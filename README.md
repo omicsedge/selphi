@@ -87,9 +87,9 @@ resulting tsv table is saved at <imputed.vcf.gz>.mismatches.tsv
 
 
 ### Running with Docker
-To build the docker image, docker buildkit must be installed and you must be set up to access SelfDecode's github through ssh.
+To build the docker image:
 ```bash
-DOCKER_BUILDKIT=1 docker build --ssh default -t selphi .
+docker build -t selphi .
 ```
 
 Running the container without a command will display the help message.
