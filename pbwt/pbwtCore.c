@@ -131,7 +131,7 @@ static inline int pack3Add(uchar yy, uchar * yzp, int n) {
   return yzp - yzp0;
 }
 
-int pack3(uchar * yp, int M, uchar * yzp) {
+static int pack3(uchar * yp, int M, uchar * yzp) {
   int m = 0, m0;
   uchar * yzp0 = yzp;
   uchar ym;
@@ -179,114 +179,6 @@ int unpack3(uchar * yzp, int M, uchar * yp, int * n0) {
     die("mismatch m %d != M %d in unpack3 after unpacking %d\n", m, M, yzp - yzp0);
 
   return yzp - yzp0;
-}
-
-int packCountReverse(uchar * yzp, int M) {
-  int m = 0;
-  uchar * yzp0 = yzp;
-
-  while (m < M)
-    m += p3decode[ * --yzp & 0x7f];
-  if (m != M) die("problem in packCountReverse"); /* checking assertion */
-  return yzp0 - yzp;
-}
-
-#define EATBYTE z = * yzp++; \
-  n = p3decode[z & 0x7f]; \
-  m += n; \
-  z >>= 7; \
-  nc[z] += n
-
-int extendMatchForwards(uchar * yzp, int M, uchar x, int * f, int * g) {
-  int m = 0, nc[2];
-  /* macro for inner loop to move along array */
-  uchar z, * yzp0 = yzp;
-  int n = 0;
-
-  /* first f */
-  nc[0] = nc[1] = 0;
-  while (m <= * f) {
-    EATBYTE;
-  }
-  if (z == x)
-    *
-    f += nc[z] - m; /* equivalent to *f = nc[z] - (m - *f) */
-  else
-    *
-    f = nc[z];
-
-  /* next g */
-  if ( * g < M) /* special case g==M so we don't loop beyond M */ {
-    while (m <= * g) {
-      EATBYTE;
-    }
-    if (z == x)
-      *
-      g += nc[z] - m;
-    else
-      *
-      g = nc[z];
-  }
-
-  while (m < M) {
-    EATBYTE;
-  } /* complete reading the column */
-
-  if ( * g == M) /* here is the special case - must come after end of column */
-    *
-    g = x ? (M - nc[0]) : nc[0];
-
-  if (x) /* add on nc[0] because in block of 1s which follows 0s */ {
-    * f += nc[0];
-    * g += nc[0];
-  }
-
-  return yzp - yzp0;
-}
-
-int extendPackedForwards(uchar * yzp, int M, int * f, uchar * zp) {
-  int m = 0, nc[2], n;
-  uchar z, * yzp0 = yzp;
-
-  nc[0] = nc[1] = 0;
-  while (m <= * f) {
-    EATBYTE;
-  } /* find the block containing *f */
-  * f += nc[z] - m; /* equivalent to *f = nc[z] - (m - *f) */
-  * zp = z; /* save the value */
-  while (m < M) {
-    EATBYTE;
-  } /* complete the column */
-  if ( * zp) * f += nc[0]; /* add on c because in block of 1s which follows 0s */
-
-  return yzp - yzp0;
-}
-
-int extendPackedBackwards(uchar * yzp, int M, int * f, int c, uchar * zp) {
-  int n, m = 0, nc[2];
-  uchar z, * yzp0 = yzp, * yzp1;
-
-  while (m < M) /* first go back to start of previous block */
-    m += p3decode[ * --yzp & 0x7f];
-  yzp1 = yzp; /* record the start so we can return the difference */
-
-  m = 0;
-  nc[0] = nc[1] = 0;
-  if ( * f < c) /* it was a 0 */ {
-    while (nc[0] <= * f) {
-      EATBYTE;
-    }
-    * f += nc[1]; /* equivalent to *f = m - (nc[0] - *f) */
-    * zp = 0;
-  } else /* it was a 1 */ {
-    while (nc[1] <= * f - c) {
-      EATBYTE;
-    }
-    * f += nc[0] - c; /* equivalent to *f = m - (nc[1] - (*f-c)) */
-    * zp = 1;
-  }
-  /* we don't need to finish the block this time */
-  return yzp0 - yzp1;
 }
 
 /************ block extension algorithms, updating whole arrays ************/
@@ -361,20 +253,6 @@ void pbwtCursorForwardsA(PbwtCursor * x) {
   memcpy(x -> a + u, x -> b, v * sizeof(int));
 }
 
-void pbwtCursorBackwardsA(PbwtCursor * x) {
-  int u = 0, v = 0;
-  int i;
-  int * t = x -> a;
-  x -> a = x -> b;
-  x -> b = t; /* will copy back from b to a */
-
-  for (i = 0; i < x -> M; ++i)
-    if (x -> y[i] == 0)
-      x -> a[i] = x -> b[u++];
-    else /* y[i] == 1, since bi-allelic */
-      x -> a[i] = x -> b[x -> c + v++];
-}
-
 void pbwtCursorForwardsAD(PbwtCursor * x, int k) {
   int u = 0, v = 0;
   int i;
@@ -401,16 +279,6 @@ void pbwtCursorForwardsAD(PbwtCursor * x, int k) {
   memcpy(x -> d + u, x -> e, v * sizeof(int));
   x -> d[0] = k + 2;
   x -> d[x -> M] = k + 2; /* sentinels */
-}
-
-void pbwtCursorCalculateU(PbwtCursor * x) {
-  int i, u = 0;
-
-  for (i = 0; i < x -> M; ++i) {
-    x -> u[i] = u;
-    if (x -> y[i] == 0) ++u;
-  }
-  x -> c = x -> u[i] = u; /* need one off the end of update intervals */
 }
 
 /* We need to be careful about isBlockEnd in the routines below because when reading
@@ -447,28 +315,10 @@ void pbwtCursorForwardsReadAD(PbwtCursor * u, int k) /* AD version of the above 
     u -> isBlockEnd = FALSE; /* couldn't read in block and go to end */
 }
 
-void pbwtCursorReadBackwards(PbwtCursor * u) /* read and go backwards (unless at start) */ {
-  if (u -> isBlockEnd && u -> n) u -> n -= packCountReverse(arrp(u -> z, u -> n, uchar), u -> M);
-  if (u -> n) {
-    u -> n -= packCountReverse(arrp(u -> z, u -> n, uchar), u -> M);
-    u -> nBlockStart = u -> n;
-    unpack3(arrp(u -> z, u -> n, uchar), u -> M, u -> y, & u -> c);
-    pbwtCursorBackwardsA(u);
-    u -> isBlockEnd = FALSE;
-  } else
-    u -> isBlockEnd = TRUE;
-}
-
 void pbwtCursorWriteForwards(PbwtCursor * u) {
   u -> n += pack3arrayAdd(u -> y, u -> M, u -> z);
   u -> isBlockEnd = FALSE;
   pbwtCursorForwardsA(u);
-}
-
-void pbwtCursorWriteForwardsAD(PbwtCursor * u, int k) {
-  u -> n += pack3arrayAdd(u -> y, u -> M, u -> z);
-  u -> isBlockEnd = FALSE;
-  pbwtCursorForwardsAD(u, k);
 }
 
 void pbwtCursorToAFend(PbwtCursor * u, PBWT * p) {

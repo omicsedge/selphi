@@ -102,41 +102,18 @@ void pbwtDestroy(PBWT * p);
 uchar ** pbwtHaplotypes(PBWT * p);
 /* low level operations on packed PBWT, argument yzp in these calls */
 #define Y_SENTINEL 2 /* needed to pack efficiently */
-int pack3(uchar * yp, int M, uchar * yzp); /* pack M values from yp into yzp */
 int pack3arrayAdd(uchar * yp, int M, Array ayz); /* normally use this one */
 int unpack3(uchar * yzp, int M, uchar * yp, int * n0); /* unpack M values from yzp into yp, return number of bytes used from yzp, if (n0) write number of 0s into *n0 */
-int packCountReverse(uchar * yzp, int M); /* return number of bytes to reverse one position */
-int extendMatchForwards(uchar * yzp, int M, uchar x, int * f, int * g); /* move hit interval f,g) forwards one position, matching x */
-int extendPackedForwards(uchar * yzp, int M, int * f, uchar * zp); /* move f forwards one position */
-int extendPackedBackwards(uchar * yzp, int M, int * f, int c, uchar * zp); /* move f backwards one position - write value into *zp if zp non-zero */
 /* cursors */
 PbwtCursor * pbwtNakedCursorCreate(int M, int * aInit);
 PbwtCursor * pbwtCursorCreate(PBWT * p, BOOL isForwards, BOOL isStart);
 void pbwtCursorDestroy(PbwtCursor * u);
 void pbwtCursorForwardsA(PbwtCursor * u); /* algorithm 1 in the manuscript */
-void pbwtCursorBackwardsA(PbwtCursor * u); /* undo algorithm 1 */
-void pbwtCursorForwardsAD(PbwtCursor * u, int k); /* algorithm 2 in the manuscript */
-void pbwtCursorCalculateU(PbwtCursor * x); /* calculate u required for CursorMap */
 void pbwtCursorForwardsRead(PbwtCursor * u); /* move forwards and read (unless at end) */
 void pbwtCursorForwardsReadAD(PbwtCursor * u, int k);
-void pbwtCursorReadBackwards(PbwtCursor * u); /* read and move backwards (unless at start) */
 void pbwtCursorWriteForwards(PbwtCursor * u); /* write then move forwards */
-void pbwtCursorWriteForwardsAD(PbwtCursor * u, int k);
 void pbwtCursorToAFend(PbwtCursor * u, PBWT * p); /* utility to copy final u->a to p->aFend */
-void pbwtCursorForwardsAPacked(PbwtCursor * u); /* faster version, when have read y and set u->nBlockStart */
-static inline int pbwtCursorMap(PbwtCursor * u, int x, int i) {
-  return x ? u -> c + i - u -> u[i] : u -> u[i];
-}
-static inline int pbwtCursorMapDplus(PbwtCursor * u, int x, int i, int dplus) {
-  for (; i < u -> M && u -> y[i] != x; ++i)
-    if (u -> d[i] > dplus) dplus = u -> d[i];
-  return dplus;
-}
-static inline int pbwtCursorMapDminus(PbwtCursor * u, int x, int i, int dminus) {
-  for (--i; i >= 0 && u -> y[i] != x; --i)
-    if (u -> d[i] > dminus) dminus = u -> d[i];
-  return dminus;
-}
+/* select sites */
 PBWT * pbwtSelectSites(PBWT * pOld, Array sites, BOOL isKeepOld);
 
 /* pbwtSample.c */
