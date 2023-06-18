@@ -52,7 +52,7 @@ docker run -v /path/to/data:/data -it selphi \
   --cores <n-cores>
 ```
 
-This command will generate 4 files: <refpanel>.pbwt, <refpanel>.samples, <refpanel>.sites, <refpanel>.srp. Creating these files can be time-intensive for large reference panels, so we recommend these files be saved for future use. They can also be created at the time of imputation by including the `--prepare_reference` and `--ref_source_vcf` flags.
+This command will generate 4 files: refpanel.pbwt, refpanel.samples, refpanel.sites, refpanel.srp. Creating these files can be time-intensive for large reference panels, so we recommend these files be saved for future use. They can also be created at the time of imputation by including the `--prepare_reference` and `--ref_source_vcf` flags.
 Multiple cores will linearly decrease the time to create the `.srp` file, but this process can be memory-intensive, limiting the number of cores that can be used.
 
 ### Target samples
