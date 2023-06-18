@@ -81,4 +81,4 @@ This project is licensed under the [MIT License](link-to-license).
 
 ## Reference
 
-The full project description can be found in this [paper](link-to-paper).
+The full project description can be found in this [paper](https://docs.google.com/document/d/1oEe_JYXBMo3EBToGLrlTOYtDBpPAPAk_UnqGC1WNMiU/edit).
