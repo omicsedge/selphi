@@ -2,7 +2,6 @@ from typing import List, Tuple
 from pathlib import Path
 from uuid import uuid4
 from math import ceil
-import time
 import numpy as np
 from scipy import sparse
 
@@ -140,12 +139,19 @@ def interpolate_genotypes(
                 original_ref_indices,
                 ref_haplotypes,
             )
-            for start in trange(0, len(intervals), chunk_size)
+            for start in trange(
+                0,
+                len(intervals),
+                chunk_size,
+                desc="Interpolating genotypes at missing variants",
+                ncols=75,
+                bar_format="{desc}:\t{percentage:3.0f}% {bar}\t{elapsed}",
+                colour="#808080",
+            )
         )
     ).tocsc()
     sparse.save_npz("results.npz", results)
 
-    start_time = time.time()
     # Convert sparse matrix to VCF
     # make sure path exists
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -163,6 +169,5 @@ def interpolate_genotypes(
     converter.convert_to_vcf(output_file + ".vcf")
     converter.compress_vcf(output_file + ".vcf")
     converter.index_vcf(output_file + ".vcf.gz")
-    print("===== Time to write vcf: %s seconds =====" % (time.time() - start_time))
 
     return output_file + ".vcf.gz"

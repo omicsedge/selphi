@@ -2,11 +2,12 @@ import os
 import sys
 import subprocess
 from pathlib import Path
-import time
 import argparse
 import logging
+from datetime import datetime, timezone
 from tempfile import TemporaryDirectory
 from joblib import Parallel, delayed
+from tqdm import tqdm
 
 import numpy as np
 import cyvcf2
@@ -48,26 +49,45 @@ def selphi(
     if not genetic_map_path.exists():
         raise FileNotFoundError(f"Missing genetic map file: {genetic_map_path}")
 
-    start_time = time.time()
+    start_time = datetime.now()
+
+    # Get number of reference samples and markers
+    with open(ref_base_path.with_suffix(".samples"), "r") as fin:
+        n_ref_samples = len(list(fin.readlines()))
+    with open(ref_base_path.with_suffix(".sites"), "r") as fin:
+        n_ref_markers = len(list(fin.readlines()))
 
     # Load target samples
     vcf_obj = cyvcf2.VCF(targets_path)
     target_samples = vcf_obj.samples
+    for variant in vcf_obj:
+        chrom = variant.CHROM
+        break
+    n_target_markers = len(list(vcf_obj)) + 1  # because we already looked at one
     del vcf_obj
     target_haps = [(sample, hap) for sample in target_samples for hap in (0, 1)]
 
+    logger.info(
+        "Stats:\n"
+        f"Reference samples:\t\t{n_ref_samples}\n"
+        f"Target samples:\t\t\t{len(target_samples)}\n\n"
+        f"Reference markers:\t\t{n_ref_markers}\n"
+        f"Target markers:\t\t\t{n_target_markers}\n\n"
+        f"Chromosome: {chrom}\n\n"
+        "Process:"
+    )
+
     # Find matches to reference panel with pbwt
-    logger.info(f"Matching {len(target_samples)} sample(s) to reference panel")
     pbwt_result_path: Path = get_pbwt_matches(
         pbwt_path,
         targets_path,
         ref_base_path,
         tmpdir,
         target_samples,
+        logger,
         match_length,
         cores,
     )
-    logger.info("Time elapsed: %s seconds" % (time.time() - start_time))
     # Load overlapping variants
     variant_dtypes = np.dtype(
         [("chr", "<U21"), ("pos", int), ("ref", "<U21"), ("alt", "<U21")]
@@ -87,19 +107,23 @@ def selphi(
     logger.info("Loaded and interpolated genetic map")
 
     # Calculate HMM weights from matches
-    logger.info("Calculating weights from reference matches")
     ordered_weights = np.asarray(
-        Parallel(n_jobs=cores, verbose=2)(
+        Parallel(n_jobs=cores)(
             delayed(calculate_weights)(
                 target_hap, chip_cM_coordinates, pbwt_result_path
             )
-            for target_hap in target_haps
+            for target_hap in tqdm(
+                target_haps,
+                desc="Calculating weights with HMM",
+                ncols=75,
+                bar_format="{desc}:\t\t{percentage:3.0f}% {bar}\t{elapsed}",
+                colour="#808080",
+            )
         ),
         dtype=object,
     )
 
     # Interpolate genotypes
-    logger.info("Interpolating genotypes at missing variants")
     output_file = interpolate_genotypes(
         ref_base_path.with_suffix(".srp"),
         chip_variants,
@@ -109,13 +133,15 @@ def selphi(
         cores,
     )
     logger.info(f"Saved imputed genotypes to {output_file}")
-    logger.info("===== Total time: %s seconds =====" % (time.time() - start_time))
+    logger.info(
+        "===== Total time: %.2f seconds =====" % (datetime.now() - start_time).seconds
+    )
 
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
-        prog="Selphi", description="PBWT for genotype imputation"
+        prog="Selphi (version 1.0)", description="PBWT for genotype imputation"
     )
     parser.add_argument(
         "--refpanel",
@@ -159,8 +185,18 @@ if __name__ == "__main__":
         "--match_length", type=int, default=5, help="minimum pbwt match length"
     )
     args = parser.parse_args()
+    cmd = " \ \n".join([f"  --{k} {v}" for k, v in vars(args).items() if v is not None])
 
     thedir = os.path.dirname(os.path.abspath(__file__))
+
+    logger.info(
+        (
+            "\nSelphi (version 1.0)\n"
+            "Copyright (C) 2023 Selfdecode\nStart time: "
+            f"{datetime.now(timezone.utc).strftime('%-I:%M %p %Z on %-d %b %Y')}\n\n"
+            f"Command line: {sys.argv[0]} \ \n{cmd}\n"
+        )
+    )
 
     pbwt_path = Path(args.pbwt_path or thedir).resolve()
     if pbwt_path.is_dir():
@@ -191,7 +227,8 @@ if __name__ == "__main__":
             raise FileNotFoundError(
                 f"Could not locate reference source file: {ref_source_path}"
             )
-        # Create .pbwt files
+        # Create .pbwt and .srp files
+        logger.info("Preparing reference panel files")
         if source_type == "vcf":
             subprocess.run(
                 [
@@ -207,6 +244,9 @@ if __name__ == "__main__":
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
+            SparseReferencePanel(str(ref_base_path.with_suffix(".srp"))).from_bcf(
+                str(ref_source_path), threads=args.cores
+            )
         else:
             subprocess.run(
                 f"xsqueezeit -x -Ov -f {ref_source_path} | "
@@ -216,15 +256,10 @@ if __name__ == "__main__":
                 stderr=subprocess.PIPE,
                 shell=True,
             )
-        # Create srp file
-        if source_type == "vcf":
-            SparseReferencePanel(str(ref_base_path.with_suffix(".srp"))).from_bcf(
-                str(ref_source_path), threads=args.cores
-            )
-        else:
             SparseReferencePanel(str(ref_base_path.with_suffix(".srp"))).from_xsi(
                 str(ref_source_path), threads=args.cores
             )
+        logger.info(f"Reference panel files saved to {ref_base_path}")
         if not args.target:
             sys.exit(0)
 

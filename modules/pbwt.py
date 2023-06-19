@@ -5,6 +5,7 @@ from typing import List
 from uuid import uuid4
 from math import ceil
 import hashlib
+from logging import Logger
 
 from joblib import Parallel, delayed
 
@@ -51,6 +52,7 @@ def get_pbwt_matches(
     ref_base_path: Path,
     tmpdir: Path,
     target_samples: List[str],
+    logger: Logger,
     match_length: int = 5,
     cores: int = 1,
 ) -> Path:
@@ -62,6 +64,7 @@ def get_pbwt_matches(
     n_samples = len(target_samples)
     if cores == 1 or n_samples == 1:
         # Process all samples at once and return
+        logger.info(f"Matching {n_samples} sample(s) to reference panel")
         subprocess.run(
             [
                 pbwt_path,
@@ -81,6 +84,7 @@ def get_pbwt_matches(
     # Run pbwt in parallel if multiple samples and multiple cores
     batch_size = ceil(n_samples / cores)
     # Filter reference pbwt so we only have to do it once
+    logger.info("Filtering reference panel to match target variants")
     subprocess.run(
         [
             pbwt_path,
@@ -108,6 +112,10 @@ def get_pbwt_matches(
         stderr=subprocess.PIPE,
         check=True,
         cwd=tmpdir,
+    )
+    logger.info(
+        f"Matching {n_samples} sample(s) to reference panel "
+        f"in batches of {batch_size} samples"
     )
     dirlist: List[Path] = Parallel(n_jobs=cores,)(
         delayed(_run_subset_pbwt)(

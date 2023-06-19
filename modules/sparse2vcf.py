@@ -171,9 +171,6 @@ class Sparse2vcf:
         return self.get_AP1 + self.get_AP2
 
     def convert_to_vcf(self, output_file):
-
-        print(f"Writing {self.num_samples} samples for {self.num_variants} variants")
-
         with open(output_file, "w", buffering=1048576) as vcf_file:
             # Write VCF header
             vcf_file.write(
@@ -208,7 +205,18 @@ class Sparse2vcf:
             AP2 = self.get_AP2
 
             # Write variant records
-            for i, idx in enumerate(tqdm(self.reference_ids)):
+            for i, idx in enumerate(
+                tqdm(
+                    self.reference_ids,
+                    desc=(
+                        f"Writing {self.num_samples} sample(s) for "
+                        f"{self.num_variants} variants"
+                    ),
+                    ncols=75,
+                bar_format="{desc}:\t{percentage:3.0f}% {bar}\t{elapsed}",
+                colour="#808080",
+                )
+            ):
                 chrom, pos, ref, alt = idx.split("-")
                 # Convert float numbers to integers if they are integers
                 DS_int = [
