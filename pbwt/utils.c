@@ -38,8 +38,6 @@ void die (char *format, ...)
   fprintf (stderr, "\n") ;
   va_end (args) ;
 
-  timeUpdate (stderr) ;
-
   exit (-1) ;
 }
 
@@ -125,76 +123,11 @@ char *fgetword (FILE *f)	// pass NULL to free alloced memory
       }
     else
       { while ((isspace(*cp) || !isgraph(*cp)) && *cp != '\n' && !feof(f)) *cp = getc (f) ;
-	/* previous line was
-	while ((*cp = getc(f)) && (isspace(*cp) || !isgraph(*cp)) && *cp != '\n' && !feof(f)) ;
-	 */
 	ungetc (*cp, f) ;
 	break ;
       }
   *cp = 0 ;
   return buf ;
-}
-
-/***************** rusage for timing information ******************/
-
-#include <sys/resource.h>
-#ifndef RUSAGE_SELF     /* to prevent "RUSAGE_SELF redefined" gcc warning, fixme if this is more intricate */
-#define RUSAGE_SELF 0
-#endif
-
-#ifdef RUSAGE_STRUCTURE_DEFINITIONS
-
-struct rusage {
-  struct timeval ru_utime; /* user time used */
-  struct timeval ru_stime; /* system time used */
-  long ru_maxrss;          /* integral max resident set size */
-  long ru_ixrss;           /* integral shared text memory size */
-  long ru_idrss;           /* integral unshared data size */
-  long ru_isrss;           /* integral unshared stack size */
-  long ru_minflt;          /* page reclaims */
-  long ru_majflt;          /* page faults */
-  long ru_nswap;           /* swaps */
-  long ru_inblock;         /* block input operations */
-  long ru_oublock;         /* block output operations */
-  long ru_msgsnd;          /* messages sent */
-  long ru_msgrcv;          /* messages received */
-  long ru_nsignals;        /* signals received */
-  long ru_nvcsw;           /* voluntary context switches */
-  long ru_nivcsw;          /* involuntary context switches */
-};
-
-struct timeval {
-  time_t       tv_sec;   /* seconds since Jan. 1, 1970 */
-  suseconds_t  tv_usec;  /* and microseconds */
-} ;
-
-#endif /* RUSAGE STRUCTURE_DEFINITIONS */
-
-void timeUpdate (FILE *f)
-{
-  static BOOL isFirst = TRUE ;
-  static struct rusage rOld ;
-  struct rusage rNew ;
-  int secs, usecs ;
-
-  getrusage (RUSAGE_SELF, &rNew) ;
-  if (!isFirst)
-    { secs = rNew.ru_utime.tv_sec - rOld.ru_utime.tv_sec ;
-      usecs =  rNew.ru_utime.tv_usec - rOld.ru_utime.tv_usec ;
-      if (usecs < 0) { usecs += 1000000 ; secs -= 1 ; }
-      fprintf (f, "user\t%d.%06d", secs, usecs) ;
-      secs = rNew.ru_stime.tv_sec - rOld.ru_stime.tv_sec ;
-      usecs =  rNew.ru_stime.tv_usec - rOld.ru_stime.tv_usec ;
-      if (usecs < 0) { usecs += 1000000 ; secs -= 1 ; }
-      fprintf (f, "\tsystem\t%d.%06d", secs, usecs) ;
-      fprintf (f, "\tmax_RSS\t%ld", rNew.ru_maxrss - rOld.ru_maxrss) ;
-      fprintf (f, "\tMemory\t%li", totalAllocated) ;   
-      fputc ('\n', f) ;
-    }
-  else
-    isFirst = FALSE ;
-
-  rOld = rNew ;
 }
 
 /********************* end of file ***********************/

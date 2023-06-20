@@ -30,10 +30,7 @@ static void write_npy_header(FILE *f, char *dtype, char *shape) {
 
 static void init_array_file(char *filename) {
   FILE *f = fopen(filename, "wb");
-  if (f == NULL) {
-    printf("Could not create %s\n", filename);
-    exit(1);
-  }
+  if (f == NULL) die(" [pbwt]: Could not create %s\n", filename);
   write_npy_header(f, "<i4", "");
   fclose(f);
 }
@@ -43,19 +40,13 @@ static void create_npz_files(char *prefix, int nVar, int nRefHaps) {
   if (stat(prefix, &st) == -1) mkdir(prefix, 0700);
   // Create sparse matrix files and write headers
   FILE *f = fopen(get_path(prefix, "format.npy"), "wb");
-  if (f == NULL) {
-    printf("Could not create %s\n", get_path(prefix, "format.npy"));
-    exit(1);
-  }
+  if (f == NULL) die(" [pbwt]: Could not create %s\n", get_path(prefix, "format.npy"));
   write_npy_header(f, "|S3", "");
   fputs("coo", f);
   fclose(f);
 
   f = fopen(get_path(prefix, "shape.npy"), "wb");
-  if (f == NULL) {
-    printf("Could not create %s\n", get_path(prefix, "shape.npy"));
-    exit(1);
-  }
+  if (f == NULL) die(" [pbwt]: Could not create %s\n", get_path(prefix, "shape.npy"));
   write_npy_header(f, "<i4", "2,");
   int shape[] = {nRefHaps, nVar};
   fwrite(shape, sizeof(int), 2, f);
@@ -72,10 +63,7 @@ static void write_array(char *filename, int *data, int length) {
   for (i = 0; i < length; i++)
     data_[i] = data[i];
   FILE *f = fopen(filename, "ab");
-  if (f == NULL) {
-    printf("Error opening %s\n", filename);
-    exit(1);
-  }
+  if (f == NULL) die(" [pbwt]: Error opening %s\n", filename);
   fwrite(data_, sizeof(int), length, f);
   fclose(f);
 }
@@ -88,10 +76,7 @@ static void write_data(char *prefix, int *cols,  int *rows,  int *data, int leng
 
 static void update_npy_header(char *filename, int length) {
   FILE *f = fopen(filename, "r+b");
-  if (f == NULL) {
-    printf("Error opening %s\n", filename);
-    exit(1);
-  }
+  if (f == NULL) die(" [pbwt]: Error opening %s\n", filename);
   fseek(f, 61, SEEK_SET);
   fprintf(f, "%d,), }", length);
   fclose(f);
@@ -136,12 +121,12 @@ static void pbwtMatchTargets(PBWT * p, int minL, int nRefHaps) {
   int *matchCounts;
   matchCounts = myalloc(tArrSize, int);
   for (tHap = 0; tHap < nTargetHaps; tHap++) matchCounts[tHap] = 0;
-  printf("%d reference haplotypes, %d target haplotypes\n", nRefHaps, nTargetHaps);
+  printf(" [pbwt]: %d reference haplotypes, %d target haplotypes\n", nRefHaps, nTargetHaps);
 
   for (tHap = nRefHaps; tHap < nAllHaps; tHap++)
     create_npz_files(get_prefix(p, tHap), nVar, nRefHaps);
 
-  printf("Matching target haplotypes to reference panel\n");
+  printf(" [pbwt]: Matching target haplotypes to reference panel\n");
   for (var = 0; var <= nVar; ++var) {
     if (var < minL) {
       pbwtCursorForwardsReadAD(u, var);
@@ -203,7 +188,7 @@ static void pbwtMatchTargets(PBWT * p, int minL, int nRefHaps) {
     free(targetHaps);
     pbwtCursorForwardsReadAD(u, var);
   }
-  printf("Compressing output\n");
+  printf(" [pbwt]: Compressing output\n");
   for (tHap = nRefHaps; tHap < nAllHaps; tHap++)
     close_npz(get_prefix(p, tHap), matchCounts[(tHap - nRefHaps)]);
   pbwtCursorDestroy(u);
@@ -213,13 +198,13 @@ static void pbwtMatchTargets(PBWT * p, int minL, int nRefHaps) {
 void referenceMatch(PBWT * pTargets, char * fileNameRoot, int minL) {
   if (pTargets->M % 2) die("requires that M = %d is even", pTargets->M);
   if (!pTargets || !pTargets->yz || !pTargets->sites) 
-    die("referenceMatch called without targets pbwt with sites");
+    die(" [pbwt]: referenceMatch called without targets pbwt with sites");
 
   PBWT * pRef = pbwtReadAll(fileNameRoot);
   int nRefHaps = pRef->M;
   if (!pRef->sites) die("%s reference panel has no sites", fileNameRoot);
   if (strcmp(pTargets->chrom, pRef->chrom))
-    die("mismatching chrom in reference panel: old %s, ref %s", pTargets->chrom, pRef->chrom);
+    die(" [pbwt]: mismatching chrom in reference panel: old %s, ref %s", pTargets->chrom, pRef->chrom);
 
   // reduce both down to the intersecting sites
   pRef = pbwtSelectSites(pRef, pTargets->sites, FALSE);
@@ -231,7 +216,7 @@ void referenceMatch(PBWT * pTargets, char * fileNameRoot, int minL) {
   FILE *f = fopen("variants.txt", "wb");
   pbwtWriteSites(pAll, f);
   fclose(f);
-  printf("Merged PBWT has %d haplotypes and %d sites\n", pAll->M, pAll->N);
+  printf(" [pbwt]: Merged PBWT has %d haplotypes and %d sites\n", pAll->M, pAll->N);
 
   pbwtMatchTargets(pAll, minL, nRefHaps);
   pbwtDestroy(pAll);

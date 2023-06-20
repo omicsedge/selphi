@@ -150,7 +150,6 @@ def interpolate_genotypes(
             )
         )
     ).tocsc()
-    sparse.save_npz("results.npz", results)
 
     # Convert sparse matrix to VCF
     # make sure path exists

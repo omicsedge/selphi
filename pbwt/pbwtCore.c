@@ -392,9 +392,6 @@ static PBWT * selectSitesLocal(PBWT * pOld, Array sites, BOOL isKeepOld, BOOL is
   }
   pbwtCursorToAFend(uNew, pNew);
 
-  fprintf(logFile, "%d sites selected from %d, pbwt size for %d haplotypes is %ld\n",
-    pNew -> N, pOld -> N, pNew -> M, arrayMax(pNew -> yz));
-
   if (isKeepOld) {
     if (pOld -> samples) pNew -> samples = arrayCopy(pOld -> samples);
     if (pOld -> chrom) pNew -> chrom = strdup(pOld -> chrom);

@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 from scipy import sparse
 from numba import njit
+from tqdm import tqdm
 
 ######################################
 #                                    #
@@ -14,8 +15,7 @@ from numba import njit
 
 
 def load_and_interpolate_genetic_map(
-    genetic_map_path: str,
-    chip_BPs: List[int],
+    genetic_map_path: str, chip_BPs: List[int]
 ) -> np.ndarray:
     """
     Loads the genetic map, linearly interpolates the cM coordinates for chip BP positions.
@@ -28,24 +28,34 @@ def load_and_interpolate_genetic_map(
         - `chip_BP_positions` - chip (input) BP positions
         - `chip_cM_coordinates` - corresponding cM coordinates for the chip positions, inferred from the genetic map
     """
-
+    progress = tqdm(
+        total=4,
+        desc="Loading and interpolating genetic map",
+        ncols=75,
+        bar_format="{desc}:\t\t{percentage:3.0f}% {bar}\t{elapsed}",
+        colour="#808080",
+    )
     genetic_map = pd.read_csv(
         genetic_map_path,
         sep=" ",
         comment="#",
         header=None,
-        usecols=[0, 2, 3],
-        names=["chr", "cM", "pos"],
+        usecols=[2, 3],
+        names=["cM", "pos"],
         index_col="pos",
     )
+    progress.update(1)
     genetic_map = genetic_map.join(pd.DataFrame(chip_BPs).set_index(0), how="outer")
+    progress.update(1)
     genetic_map["cM"] = genetic_map["cM"].interpolate("index").fillna(method="bfill")
-    genetic_map["chr"] = genetic_map.chr.fillna(20.0).astype(int)
+    progress.update(1)
     genetic_map = genetic_map.reset_index().rename({"index": "pos"}, axis=1)
     genetic_map = genetic_map[genetic_map["pos"].isin(chip_BPs)].reset_index(drop=True)
     chip_cM_coordinates = genetic_map.cM.to_numpy()  # type: ignore
+    progress.update(1)
+    progress.close()
 
-    assert len(chip_cM_coordinates) == len(chip_BPs)
+    assert chip_cM_coordinates.size == len(chip_BPs)
     return chip_cM_coordinates
 
 

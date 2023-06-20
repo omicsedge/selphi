@@ -52,10 +52,8 @@ def selphi(
     start_time = datetime.now()
 
     # Get number of reference samples and markers
-    with open(ref_base_path.with_suffix(".samples"), "r") as fin:
-        n_ref_samples = len(list(fin.readlines()))
-    with open(ref_base_path.with_suffix(".sites"), "r") as fin:
-        n_ref_markers = len(list(fin.readlines()))
+    n_ref_samples = len(ref_base_path.with_suffix(".samples").read_text().splitlines())
+    n_ref_markers = len(ref_base_path.with_suffix(".sites").read_text().splitlines())
 
     # Load target samples
     vcf_obj = cyvcf2.VCF(targets_path)
@@ -78,12 +76,14 @@ def selphi(
     )
 
     # Find matches to reference panel with pbwt
+    pbwt_log = output_path.with_suffix(".log")
     pbwt_result_path: Path = get_pbwt_matches(
         pbwt_path,
         targets_path,
         ref_base_path,
         tmpdir,
         target_samples,
+        pbwt_log,
         logger,
         match_length,
         cores,
@@ -95,16 +95,11 @@ def selphi(
     chip_variants = np.loadtxt(
         pbwt_result_path.joinpath("variants.txt"), dtype=variant_dtypes
     )
-    logger.info(
-        f"Loaded {chip_variants.size} variants found in both "
-        "reference panel and target samples"
-    )
     chip_BPs = [variant[1] for variant in chip_variants]
     chip_cM_coordinates: np.ndarray = load_and_interpolate_genetic_map(
         genetic_map_path=genetic_map_path,
         chip_BPs=chip_BPs,
     )
-    logger.info("Loaded and interpolated genetic map")
 
     # Calculate HMM weights from matches
     ordered_weights = np.asarray(
@@ -134,7 +129,7 @@ def selphi(
     )
     logger.info(f"Saved imputed genotypes to {output_file}")
     logger.info(
-        "===== Total time: %.2f seconds =====" % (datetime.now() - start_time).seconds
+        "===== Total time: %d seconds =====" % (datetime.now() - start_time).seconds
     )
 
 

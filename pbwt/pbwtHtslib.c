@@ -158,9 +158,9 @@ PBWT *pbwtReadVcfGT (char *filename) {
   free (x) ; pbwtCursorDestroy (u) ;  
   free (xMissing) ;
 
-  fprintf (logFile, "read genotypes from %s with %ld sample names and %ld sites on chromosome %s: M, N are %d, %d\n", 
-         filename, arrayMax(p->samples)/2, arrayMax(p->sites), p->chrom, p->M, p->N) ;
-  if (p->missingOffset) fprintf (logFile, "%ld missing values at %d sites\n", 
+  fprintf(logFile, " [pbwt]: Read genotypes from %s with %ld haplotypes and %ld sites on chromosome %s\n", 
+         filename, p->M, p->N, p->chrom);
+  if (p->missingOffset) fprintf (logFile, " [pbwt]: %ld missing values at %d sites\n", 
          nMissing, nMissingSites) ;
 
   return p ;

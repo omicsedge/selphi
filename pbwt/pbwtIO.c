@@ -52,7 +52,7 @@ static void pbwtWrite (PBWT *p, FILE *fp) /* just writes compressed pbwt in yz *
   if (fwrite (arrp(p->yz, 0, uchar), sizeof(uchar), arrayMax(p->yz), fp) != arrayMax(p->yz))
     die ("error writing data in pbwtWrite") ;
 
-  fprintf (logFile, "written %ld chars pbwt: M, N are %d, %d\n", arrayMax(p->yz), p->M, p->N) ;
+  fprintf(logFile, " [pbwt]: Saved %d haplotypes and %d sites to file\n", p->M, p->N);
 }
 
 void pbwtWriteSites (PBWT *p, FILE *fp)
@@ -70,9 +70,6 @@ void pbwtWriteSites (PBWT *p, FILE *fp)
       fputc ('\n', fp) ;
     }
   if (ferror (fp)) die ("error writing sites file") ;
-
-  fprintf (logFile, "written %d sites from %d to %d\n", p->N, 
-	   arrp(p->sites, 0, Site)->x, arrp(p->sites, p->N-1, Site)->x) ;
 }
 
 static void pbwtWriteSamples (PBWT *p, FILE *fp)
@@ -89,8 +86,6 @@ static void pbwtWriteSamples (PBWT *p, FILE *fp)
       fputc ('\n', fp) ;
     }     
   if (ferror (fp)) die ("error writing samples file") ;
-
-  fprintf (logFile, "written %d samples\n", p->M/2) ;
 }
 
 static void writeDataOffset (FILE *fp, char *name, Array data, Array offset, int N)
@@ -106,8 +101,6 @@ static void writeDataOffset (FILE *fp, char *name, Array data, Array offset, int
     die ("error writing data in write %s", name) ;
   if (fwrite (arrp(offset, 0, long), sizeof(long), N, fp) != N)
     die ("error writing offsets in write %s", name) ;
-
-  fprintf (logFile, "written %ld chars compressed %s data\n", n, name) ;
 }
 
 static void pbwtWriteMissing (PBWT *p, FILE *fp)
@@ -192,7 +185,7 @@ static PBWT *pbwtRead (FILE *fp)
   if (fread (arrp(p->yz, 0, uchar), sizeof(uchar), nz, fp) != nz)
     die ("error reading data in pbwt file") ;
 
-  fprintf (logFile, "read pbwt %s file with %ld bytes: M, N are %d, %d\n", tag, nz, p->M, p->N) ;
+  fprintf(logFile, " [pbwt]: Read file with %d haplotypes and %d sites\n", p->M, p->N);
   return p ;
 }
 
@@ -239,9 +232,6 @@ Array pbwtReadSitesFile (FILE *fp, char **chrom)
       die ("failed to match chromosome in sites file: line %d", line) ;
 
   if (ferror (fp)) die ("error reading sites file") ;
-  
-  fprintf (logFile, "read %ld sites on chromosome %s from file\n", arrayMax(sites), *chrom) ;
-
   arrayDestroy (varTextArray) ;
   return sites ;
 }
@@ -282,9 +272,6 @@ Array pbwtReadSamplesFile (FILE *fp) /* for now assume all samples diploid */
       while (c != '\n' && !feof(fp)) c = getc(fp) ;
     }
   arrayDestroy (nameArray) ;
-
-  fprintf (logFile, "read %ld sample names\n", arrayMax(samples)) ;
-
   return samples ;
 }
 

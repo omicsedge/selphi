@@ -92,7 +92,6 @@ int main(int argc, char * argv[]) {
     fprintf(stderr, "  -referenceMatch <root> <L> find matches in reference panel longer than L\n");
   }
 
-  timeUpdate(logFile);
   while (argc) {
     if (!( ** argv == '-'))
       die("not well formed command %s\nType pbwt without arguments for help", * argv);
@@ -153,7 +152,6 @@ int main(int argc, char * argv[]) {
       argv += 3;
     } else
       die("unrecognised command %s\nType pbwt without arguments for help", * argv);
-    timeUpdate(logFile);
   }
   if (p) pbwtDestroy(p);
   if (variationDict) dictDestroy(variationDict);

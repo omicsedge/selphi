@@ -25,8 +25,7 @@ def _run_subset_pbwt(
 ) -> Path:
     tmpdir = Path(tmpdir).joinpath(str(uuid4()))
     tmpdir.mkdir(parents=True, exist_ok=True)
-    with open(tmpdir.joinpath("samples.txt"), "w") as fout:
-        fout.write("\n".join(samples) + "\n")
+    tmpdir.joinpath("samples.txt").write_text("\n".join(samples) + "\n")
     subprocess.run(
         [
             pbwt_path,
@@ -52,6 +51,7 @@ def get_pbwt_matches(
     ref_base_path: Path,
     tmpdir: Path,
     target_samples: List[str],
+    pbwt_log: Path,
     logger: Logger,
     match_length: int = 5,
     cores: int = 1,
@@ -73,9 +73,9 @@ def get_pbwt_matches(
                 "-referenceMatch",
                 ref_base_path,
                 str(match_length),
+                "-log",
+                pbwt_log,
             ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
             check=True,
             cwd=tmpdir,
         )
@@ -92,9 +92,9 @@ def get_pbwt_matches(
             targets_path,
             "-writeSites",
             tmpdir.joinpath("chipsites.txt"),
+            "-log",
+            pbwt_log,
         ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
         check=True,
         cwd=tmpdir,
     )
@@ -107,9 +107,9 @@ def get_pbwt_matches(
             tmpdir.joinpath("chipsites.txt"),
             "-writeAll",
             tmpdir.joinpath("filtered_reference"),
+            "-log",
+            pbwt_log,
         ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
         check=True,
         cwd=tmpdir,
     )
@@ -117,7 +117,7 @@ def get_pbwt_matches(
         f"Matching {n_samples} sample(s) to reference panel "
         f"in batches of {batch_size} samples"
     )
-    dirlist: List[Path] = Parallel(n_jobs=cores,)(
+    dirlist: List[Path] = Parallel(n_jobs=cores)(
         delayed(_run_subset_pbwt)(
             pbwt_path,
             targets_path,
