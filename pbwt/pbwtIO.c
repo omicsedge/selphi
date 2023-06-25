@@ -55,8 +55,7 @@ static void pbwtWrite (PBWT *p, FILE *fp) /* just writes compressed pbwt in yz *
   fprintf(logFile, " [pbwt]: Saved %d haplotypes and %d sites to file\n", p->M, p->N);
 }
 
-void pbwtWriteSites (PBWT *p, FILE *fp)
-{
+static void pbwtWriteSites (PBWT *p, FILE *fp) {
   if (!p || !p->sites) die ("pbwtWriteSites called without sites") ;
 
   int i ;
@@ -72,8 +71,7 @@ void pbwtWriteSites (PBWT *p, FILE *fp)
   if (ferror (fp)) die ("error writing sites file") ;
 }
 
-static void pbwtWriteSamples (PBWT *p, FILE *fp)
-{
+static void pbwtWriteSamples (PBWT *p, FILE *fp) {
   if (!p || !p->samples) die ("pbwtWriteSamples called without samples") ;
 
   int i ;
@@ -88,8 +86,7 @@ static void pbwtWriteSamples (PBWT *p, FILE *fp)
   if (ferror (fp)) die ("error writing samples file") ;
 }
 
-static void writeDataOffset (FILE *fp, char *name, Array data, Array offset, int N)
-{
+static void writeDataOffset (FILE *fp, char *name, Array data, Array offset, int N) {
   if (!offset || !data) die ("write %s called without data", name) ;
   int dummy = -1 ;	/* ugly hack to mark that we now use longs not ints */
   if (fwrite (&dummy, sizeof(int), 1, fp) != 1)
@@ -106,8 +103,7 @@ static void writeDataOffset (FILE *fp, char *name, Array data, Array offset, int
 static void pbwtWriteMissing (PBWT *p, FILE *fp)
 { writeDataOffset (fp, "missing", p->zMissing, p->missingOffset, p->N) ; }
 
-static void pbwtWriteReverse (PBWT *p, FILE *fp)
-{
+static void pbwtWriteReverse (PBWT *p, FILE *fp) {
   if (!p || !p->zz) die ("pbwtWriteReverse called without reverse pbwt") ;
 
   Array tz = p->yz ; p->yz = p->zz ;
@@ -142,8 +138,7 @@ void pbwtCheckPoint(PbwtCursor * u, PBWT * p) {
 
 /*******************************/
 
-static PBWT *pbwtRead (FILE *fp) 
-{
+static PBWT *pbwtRead (FILE *fp) {
   int m, n ;
   long nz ;
   PBWT *p ;
@@ -189,8 +184,7 @@ static PBWT *pbwtRead (FILE *fp)
   return p ;
 }
 
-static BOOL readMatchChrom (char **pChrom, FILE *fp)
-{
+static BOOL readMatchChrom (char **pChrom, FILE *fp) {
   char *newChrom = fgetword (fp) ;
 
   if (strcmp (newChrom, "."))
@@ -202,8 +196,23 @@ static BOOL readMatchChrom (char **pChrom, FILE *fp)
   return TRUE ;
 }
 
-Array pbwtReadSitesFile (FILE *fp, char **chrom)
-{
+Array pbwtReadFilterFile(FILE *fp, int n) {
+  char ch;
+  int j = 0;
+  Array filter = arrayCreate(n, int);
+  while (!feof(fp)) {
+    ch = fgetc(fp);
+    if (feof(fp)) break;
+    if (ch != '\n') {
+      if (j == n) die("Filter file is too big for pbwt");
+      if (ch == '1') array(filter, j++, int) = 1; else array(filter, j++, int) = 0;
+    }
+  }
+  if (j != n) die("Filter file is too small for pbwt");
+  return filter;
+}
+
+static Array pbwtReadSitesFile (FILE *fp, char **chrom) {
   char c ;
   Site *s ;
   int line = 1 ;
@@ -236,8 +245,7 @@ Array pbwtReadSitesFile (FILE *fp, char **chrom)
   return sites ;
 }
 
-static void pbwtReadSites (PBWT *p, FILE *fp)
-{
+static void pbwtReadSites (PBWT *p, FILE *fp) {
   if (!p) die ("pbwtReadSites called without a valid pbwt") ;
 
   p->sites = pbwtReadSitesFile (fp, &p->chrom) ;
@@ -275,8 +283,7 @@ Array pbwtReadSamplesFile (FILE *fp) /* for now assume all samples diploid */
   return samples ;
 }
 
-static void pbwtReadSamples (PBWT *p, FILE *fp)
-{
+static void pbwtReadSamples (PBWT *p, FILE *fp) {
   if (!p) die ("pbwtReadSamples called without a valid pbwt") ;
   Array samples = pbwtReadSamplesFile (fp) ;
   if (arrayMax(samples) != p->M/2) 
@@ -290,8 +297,7 @@ static void pbwtReadSamples (PBWT *p, FILE *fp)
   arrayDestroy (samples) ;
 }
 
-static void readDataOffset (FILE *fp, char *name, Array *data, Array *offset, int N)
-{
+static void readDataOffset (FILE *fp, char *name, Array *data, Array *offset, int N) {
   long n ;			/* size of data file */
   int dummy ; 
   if (fread (&dummy, sizeof(int), 1, fp) != 1) 
@@ -323,8 +329,7 @@ static void readDataOffset (FILE *fp, char *name, Array *data, Array *offset, in
 static void pbwtReadMissing (PBWT *p, FILE *fp)
 { readDataOffset (fp, "missing", &p->zMissing, &p->missingOffset, p->N) ; }
 
-static void pbwtReadReverse (PBWT *p, FILE *fp)
-{
+static void pbwtReadReverse (PBWT *p, FILE *fp) {
   if (!p) die ("pbwtReadReverse called without a valid pbwt") ;
 
   PBWT *q = pbwtRead (fp) ;
@@ -334,12 +339,10 @@ static void pbwtReadReverse (PBWT *p, FILE *fp)
   p->aRstart = q->aFstart ; q->aFstart = 0 ;
   p->aRend = q->aFend ; q->aFend = 0 ;
   pbwtDestroy (q) ;
- }
+}
 
-PBWT *pbwtReadAll (char *root)
-{
+PBWT *pbwtReadAll (char *root) {
   PBWT *p ;
-
   FILE *fp ;
   if ((fp = fopenTag (root, "pbwt", "r"))) { p = pbwtRead (fp) ; fclose (fp) ; } 
   else die ("failed to open %s.pbwt", root) ;
@@ -347,7 +350,6 @@ PBWT *pbwtReadAll (char *root)
   if ((fp = fopenTag (root, "samples","r"))) { pbwtReadSamples (p, fp) ; fclose (fp) ; }
   if ((fp = fopenTag (root, "missing","r"))) { pbwtReadMissing (p, fp) ; fclose (fp) ; }
   if ((fp = fopenTag (root, "reverse","r"))) { pbwtReadReverse (p, fp) ; fclose (fp) ; }
-
   return p ;
 }
 

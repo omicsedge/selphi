@@ -1,8 +1,8 @@
 from typing import Iterator, List, Tuple
 from pathlib import Path
-from datetime import datetime
 from scipy import sparse
 import numpy as np
+from tqdm import tqdm
 
 from modules.hmm_utils import pRecomb, setFwdValues_SPARSE, setBwdValues_SPARSE
 from modules.load_data import load_sparse_comp_matches_hybrid_npz

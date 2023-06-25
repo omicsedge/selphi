@@ -6,10 +6,10 @@ import numpy as np
 from scipy import sparse
 
 from joblib import Parallel, delayed
-from tqdm import trange
 
 from .sparse_ref_panel import SparseReferencePanel
 from .sparse2vcf import Sparse2vcf
+from .utils import tqdm_joblib
 
 
 def _interpolate_hap(
@@ -101,26 +101,21 @@ def interpolate(
 
 
 def interpolate_genotypes(
-    refpanel: Path,
+    ref_haplotypes: SparseReferencePanel,
     target_ids: np.ndarray,
     target_samples: List[str],
     ordered_weights: np.ndarray,
+    wgs_idx: np.ndarray,
+    target_idx: np.ndarray,
     output_path: Path,
     threads: int = 1,
 ) -> str:
-    # Load reference panel
-    ref_haplotypes = SparseReferencePanel(str(refpanel), cache_size=4)
-
-    _, wgs_idx, target_idx = np.intersect1d(
-        ref_haplotypes.variants, target_ids, return_indices=True
-    )
-
+    # Prepare intervals
     original_ref_indices = np.concatenate(
         ([0], wgs_idx, [ref_haplotypes.n_variants - 1])
     )
     # Weights matrix has extra rows at 0 and -1
     original_chip_indices = np.concatenate(([0], target_idx + 1, [target_ids.size + 1]))
-
     intervals = list(
         zip(range(original_ref_indices.size - 1), range(1, original_ref_indices.size))
     )
@@ -130,26 +125,25 @@ def interpolate_genotypes(
         (original_ref_indices.size - 1) / max(ref_haplotypes.n_chunks // 10, 1)
     )
 
-    results = sparse.hstack(
-        Parallel(n_jobs=threads,)(
-            delayed(interpolate)(
-                intervals[start : start + chunk_size],
-                ordered_weights,
-                original_chip_indices,
-                original_ref_indices,
-                ref_haplotypes,
+    with tqdm_joblib(
+        total=len(intervals) // chunk_size + 1,
+        desc="Interpolating genotypes at missing variants",
+        ncols=75,
+        bar_format="{desc}:\t{percentage:3.0f}% {bar}\t{elapsed}",
+        colour="#808080",
+    ):
+        results = sparse.hstack(
+            Parallel(n_jobs=threads,)(
+                delayed(interpolate)(
+                    intervals[start : start + chunk_size],
+                    ordered_weights,
+                    original_chip_indices,
+                    original_ref_indices,
+                    ref_haplotypes,
+                )
+                for start in range(0, len(intervals), chunk_size)
             )
-            for start in trange(
-                0,
-                len(intervals),
-                chunk_size,
-                desc="Interpolating genotypes at missing variants",
-                ncols=75,
-                bar_format="{desc}:\t{percentage:3.0f}% {bar}\t{elapsed}",
-                colour="#808080",
-            )
-        )
-    ).tocsc()
+        ).tocsc()
 
     # Convert sparse matrix to VCF
     # make sure path exists

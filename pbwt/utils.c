@@ -130,4 +130,16 @@ char *fgetword (FILE *f)	// pass NULL to free alloced memory
   return buf ;
 }
 
+/*************************************************/
+#define PBSTR "||||||||||||||||||||||||||||||||||||||||||||||||||"
+#define PBWIDTH 50
+
+void printProgress(double percentage) {
+    int val = (int) (percentage * 100);
+    int lpad = (int) (percentage * PBWIDTH);
+    int rpad = PBWIDTH - lpad;
+    printf("\r\t%3d%% [%.*s%*s]", val, lpad, PBSTR, rpad, "");
+    fflush(stdout);
+}
+
 /********************* end of file ***********************/

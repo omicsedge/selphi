@@ -4,45 +4,40 @@ import shutil
 from typing import List
 from uuid import uuid4
 from math import ceil
-import hashlib
 from logging import Logger
 
 from joblib import Parallel, delayed
+import numpy as np
 
-
-def _md5sum(filepath: Path) -> str:
-    with open(filepath, "rb") as fin:
-        return hashlib.md5(fin.read()).hexdigest()
+from modules.utils import timestamp
 
 
 def _run_subset_pbwt(
     pbwt_path: Path,
-    targets_path: Path,
     samples: List[str],
-    ref_base_path: Path,
     tmpdir: Path,
     match_length: int = 5,
 ) -> Path:
-    tmpdir = Path(tmpdir).joinpath(str(uuid4()))
-    tmpdir.mkdir(parents=True, exist_ok=True)
-    tmpdir.joinpath("samples.txt").write_text("\n".join(samples) + "\n")
+    subtmpdir = Path(tmpdir).joinpath(str(uuid4()))
+    subtmpdir.mkdir(parents=True, exist_ok=True)
+    subtmpdir.joinpath("samples.txt").write_text("\n".join(samples) + "\n")
     subprocess.run(
         [
             pbwt_path,
-            "-readVcfGT",
-            targets_path,
+            "-readAll",
+            tmpdir.joinpath("filtered_target"),
             "-selectSamples",
-            tmpdir.joinpath("samples.txt"),
+            subtmpdir.joinpath("samples.txt"),
             "-referenceMatch",
-            ref_base_path,
+            tmpdir.joinpath("filtered_reference"),
             str(match_length),
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=True,
-        cwd=tmpdir,
+        cwd=subtmpdir,
     )
-    return tmpdir
+    return subtmpdir
 
 
 def get_pbwt_matches(
@@ -51,7 +46,8 @@ def get_pbwt_matches(
     ref_base_path: Path,
     tmpdir: Path,
     target_samples: List[str],
-    pbwt_log: Path,
+    ref_filter: np.ndarray,
+    target_filter: np.ndarray,
     logger: Logger,
     match_length: int = 5,
     cores: int = 1,
@@ -61,20 +57,48 @@ def get_pbwt_matches(
     between target haplotypes and reference panel haplotypes
     and save the matches in sparse matrix npz format.
     """
+    logger.info(f"{timestamp()}: Filtering reference panel to match target variants")
+    np.savetxt(tmpdir.joinpath("ref_filter.txt"), ref_filter, fmt="%u")
+    subprocess.run(
+        [
+            pbwt_path,
+            "-readAll",
+            ref_base_path,
+            "-filterSites",
+            tmpdir.joinpath("ref_filter.txt"),
+            "-writeAll",
+            tmpdir.joinpath("filtered_reference"),
+        ],
+        check=True,
+        cwd=tmpdir,
+    )
+    logger.info(f"{timestamp()}: Filtering target samples to match reference variants")
+    np.savetxt(tmpdir.joinpath("target_filter.txt"), target_filter, fmt="%u")
+    subprocess.run(
+        [
+            pbwt_path,
+            "-readVcfGT",
+            targets_path,
+            "-filterSites",
+            tmpdir.joinpath("target_filter.txt"),
+            "-writeAll",
+            tmpdir.joinpath("filtered_target"),
+        ],
+        check=True,
+        cwd=tmpdir,
+    )
     n_samples = len(target_samples)
     if cores == 1 or n_samples == 1:
         # Process all samples at once and return
-        logger.info(f"Matching {n_samples} sample(s) to reference panel")
+        logger.info(f"{timestamp()}: Matching {n_samples} sample(s) to reference panel")
         subprocess.run(
             [
                 pbwt_path,
-                "-readVcfGT",
-                targets_path,
+                "-readAll",
+                tmpdir.joinpath("filtered_target"),
                 "-referenceMatch",
-                ref_base_path,
+                tmpdir.joinpath("filtered_reference"),
                 str(match_length),
-                "-log",
-                pbwt_log,
             ],
             check=True,
             cwd=tmpdir,
@@ -84,55 +108,21 @@ def get_pbwt_matches(
     # Run pbwt in parallel if multiple samples and multiple cores
     batch_size = ceil(n_samples / cores)
     # Filter reference pbwt so we only have to do it once
-    logger.info("Filtering reference panel to match target variants")
-    subprocess.run(
-        [
-            pbwt_path,
-            "-readVcfGT",
-            targets_path,
-            "-writeSites",
-            tmpdir.joinpath("chipsites.txt"),
-            "-log",
-            pbwt_log,
-        ],
-        check=True,
-        cwd=tmpdir,
-    )
-    subprocess.run(
-        [
-            pbwt_path,
-            "-readAll",
-            ref_base_path,
-            "-selectSites",
-            tmpdir.joinpath("chipsites.txt"),
-            "-writeAll",
-            tmpdir.joinpath("filtered_reference"),
-            "-log",
-            pbwt_log,
-        ],
-        check=True,
-        cwd=tmpdir,
-    )
     logger.info(
-        f"Matching {n_samples} sample(s) to reference panel "
+        f"{timestamp()}: Matching {n_samples} sample(s) to reference panel "
         f"in batches of {batch_size} samples"
     )
-    dirlist: List[Path] = Parallel(n_jobs=cores)(
+    _ = Parallel(n_jobs=cores)(
         delayed(_run_subset_pbwt)(
             pbwt_path,
-            targets_path,
             target_samples[start : start + batch_size],
-            tmpdir.joinpath("filtered_reference"),
             tmpdir,
             match_length,
         )
         for start in range(0, n_samples, batch_size)
     )
-    # Make sure all batch variants files are the same
-    checksums = [_md5sum(dir_.joinpath("variants.txt")) for dir_ in dirlist]
-    assert len(set(checksums)) == 1
     # Consolidate files
-    shutil.move(str(dirlist[0].joinpath("variants.txt")), str(tmpdir))
     for file in tmpdir.glob("*/*.npz"):
         shutil.move(str(file), str(tmpdir))
+    logger.info(f"{timestamp()}: Matched all samples to reference panel")
     return tmpdir

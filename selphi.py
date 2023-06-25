@@ -7,7 +7,6 @@ import logging
 from datetime import datetime, timezone
 from tempfile import TemporaryDirectory
 from joblib import Parallel, delayed
-from tqdm import tqdm
 
 import numpy as np
 import cyvcf2
@@ -17,6 +16,7 @@ from modules.interpolation import interpolate_genotypes
 from modules.load_data import load_and_interpolate_genetic_map
 from modules.pbwt import get_pbwt_matches
 from modules.sparse_ref_panel import SparseReferencePanel
+from modules.utils import timestamp, tqdm_joblib
 
 logger = logging.getLogger("Selphi")
 logger.setLevel(level=logging.INFO)
@@ -51,50 +51,67 @@ def selphi(
 
     start_time = datetime.now()
 
-    # Get number of reference samples and markers
-    n_ref_samples = len(ref_base_path.with_suffix(".samples").read_text().splitlines())
-    n_ref_markers = len(ref_base_path.with_suffix(".sites").read_text().splitlines())
+    # Load sparse reference panel
+    ref_panel = SparseReferencePanel(
+        str(ref_base_path.with_suffix(".srp")), cache_size=4
+    )
 
-    # Load target samples
+    # Load target samples and variants
+    variant_dtypes = np.dtype(
+        [("chr", "<U21"), ("pos", int), ("ref", "<U21"), ("alt", "<U21")]
+    )
     vcf_obj = cyvcf2.VCF(targets_path)
     target_samples = vcf_obj.samples
-    for variant in vcf_obj:
-        chrom = variant.CHROM
-        break
-    n_target_markers = len(list(vcf_obj)) + 1  # because we already looked at one
+    target_markers = np.array(
+        [
+            (variant.CHROM, variant.POS, variant.REF, variant.ALT[0])
+            for variant in vcf_obj
+        ],
+        dtype=variant_dtypes,
+    )
     del vcf_obj
+    if target_markers[0][0] != ref_panel.chromosome:
+        raise KeyError(
+            f"Reference panel chromosome {ref_panel.chromosome} does not match "
+            f"target samples chromosome {target_markers[0][0]}"
+        )
+    _, wgs_idx, target_idx = np.intersect1d(
+        ref_panel.variants, target_markers, return_indices=True
+    )
     target_haps = [(sample, hap) for sample in target_samples for hap in (0, 1)]
 
     logger.info(
         "Stats:\n"
-        f"Reference samples:\t\t{n_ref_samples}\n"
+        f"Reference samples:\t\t{int(ref_panel.n_haps / 2)}\n"
         f"Target samples:\t\t\t{len(target_samples)}\n\n"
-        f"Reference markers:\t\t{n_ref_markers}\n"
-        f"Target markers:\t\t\t{n_target_markers}\n\n"
-        f"Chromosome: {chrom}\n\n"
+        f"Reference markers:\t\t{ref_panel.n_variants}\n"
+        f"Target markers:\t\t\t{target_markers.size}\n\n"
+        f"Chromosome:\t{ref_panel.chromosome}\n"
+        f"Shared markers:\t{wgs_idx.size}\n\n"
         "Process:"
     )
 
+    # Make filters to select variants for pbwt
+    wgs_filter = np.zeros_like(ref_panel.variants, dtype=int)
+    wgs_filter[wgs_idx] = 1
+    target_filter = np.zeros_like(target_markers, dtype=int)
+    target_filter[target_idx] = 1
     # Find matches to reference panel with pbwt
-    pbwt_log = output_path.with_suffix(".log")
     pbwt_result_path: Path = get_pbwt_matches(
         pbwt_path,
         targets_path,
         ref_base_path,
         tmpdir,
         target_samples,
-        pbwt_log,
+        wgs_filter,
+        target_filter,
         logger,
         match_length,
         cores,
     )
-    # Load overlapping variants
-    variant_dtypes = np.dtype(
-        [("chr", "<U21"), ("pos", int), ("ref", "<U21"), ("alt", "<U21")]
-    )
-    chip_variants = np.loadtxt(
-        pbwt_result_path.joinpath("variants.txt"), dtype=variant_dtypes
-    )
+
+    # Get coordinates for overlapping variants
+    chip_variants = target_markers[target_idx]
     chip_BPs = [variant[1] for variant in chip_variants]
     chip_cM_coordinates: np.ndarray = load_and_interpolate_genetic_map(
         genetic_map_path=genetic_map_path,
@@ -102,32 +119,35 @@ def selphi(
     )
 
     # Calculate HMM weights from matches
-    ordered_weights = np.asarray(
-        Parallel(n_jobs=cores)(
-            delayed(calculate_weights)(
-                target_hap, chip_cM_coordinates, pbwt_result_path
-            )
-            for target_hap in tqdm(
-                target_haps,
-                desc="Calculating weights with HMM",
-                ncols=75,
-                bar_format="{desc}:\t\t{percentage:3.0f}% {bar}\t{elapsed}",
-                colour="#808080",
-            )
-        ),
-        dtype=object,
-    )
+    with tqdm_joblib(
+        total=len(target_haps),
+        desc="Calculating weights with HMM",
+        ncols=75,
+        bar_format="{desc}:\t\t{percentage:3.0f}% {bar}\t{elapsed}",
+        colour="#808080",
+    ):
+        ordered_weights = np.asarray(
+            Parallel(n_jobs=cores)(
+                delayed(calculate_weights)(
+                    target_hap, chip_cM_coordinates, pbwt_result_path
+                )
+                for target_hap in target_haps
+            ),
+            dtype=object,
+        )
 
     # Interpolate genotypes
     output_file = interpolate_genotypes(
-        ref_base_path.with_suffix(".srp"),
+        ref_panel,
         chip_variants,
         target_samples,
         ordered_weights,
+        wgs_idx,
+        target_idx,
         output_path,
         cores,
     )
-    logger.info(f"Saved imputed genotypes to {output_file}")
+    logger.info(f"{timestamp()}: Saved imputed genotypes to {output_file}")
     logger.info(
         "===== Total time: %d seconds =====" % (datetime.now() - start_time).seconds
     )
@@ -188,7 +208,7 @@ if __name__ == "__main__":
         (
             "\nSelphi (version 1.0)\n"
             "Copyright (C) 2023 Selfdecode\nStart time: "
-            f"{datetime.now(timezone.utc).strftime('%-I:%M %p %Z on %-d %b %Y')}\n\n"
+            f"{datetime.now(timezone.utc).strftime('%-I:%M:%S %p %Z on %-d %b %Y')}\n\n"
             f"Command line: {sys.argv[0]} \ \n{cmd}\n"
         )
     )
@@ -273,7 +293,7 @@ if __name__ == "__main__":
             genetic_map_path=map_path,
             output_path=output_path,
             pbwt_path=pbwt_path,
-            tmpdir=Path(tempdir).resolve(),
+            tmpdir=Path("/data/temp").resolve(),
             match_length=args.match_length,
             cores=args.cores,
         )

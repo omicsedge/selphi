@@ -213,8 +213,8 @@ class Sparse2vcf:
                         f"{self.num_variants} variants"
                     ),
                     ncols=75,
-                bar_format="{desc}:\t{percentage:3.0f}% {bar}\t{elapsed}",
-                colour="#808080",
+                    bar_format="{desc}:\t{percentage:3.0f}% {bar}\t{elapsed}",
+                    colour="#808080",
                 )
             ):
                 chrom, pos, ref, alt = idx.split("-")

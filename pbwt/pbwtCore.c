@@ -287,6 +287,29 @@ void pbwtCursorForwardsAD(PbwtCursor * x, int k) {
    Also when writing it is at the start of the next block, because we don't yet have the contents.
 */
 
+/***************************************************/
+
+static void pbwtCursorForwardsAPacked(PbwtCursor * u) {
+  int c = 0, m = 0, n;
+  uchar * zp = arrp(u -> z, u -> nBlockStart, uchar), * zp0 = zp, z;
+  while (m < u -> M) {
+    z = * zp++;
+    n = p3decode[z & 0x7f];
+    z >>= 7;
+    if (z)
+      memcpy(u -> b + (m - c), u -> a + m, n * sizeof(int));
+    else {
+      memcpy(u -> e + c, u -> a + m, n * sizeof(int));
+      c += n;
+    }
+    m += n;
+  }
+  if (m != u -> M) die("error in forwardsAPacked()");
+
+  memcpy(u -> a, u -> e, u -> c * sizeof(int));
+  memcpy(u -> a + u -> c, u -> b, (u -> M - u -> c) * sizeof(int));
+}
+
 void pbwtCursorForwardsRead(PbwtCursor * u) /* move forwards and read (unless at end) */ {
   pbwtCursorForwardsAPacked(u);
   if (!u -> isBlockEnd && u -> n < arrayMax(u -> z)) /* move to end of previous block */ {
@@ -328,94 +351,43 @@ void pbwtCursorToAFend(PbwtCursor * u, PBWT * p) {
 
 /***************************************************/
 
-void pbwtCursorForwardsAPacked(PbwtCursor * u) {
-  int c = 0, m = 0, n;
-  uchar * zp = arrp(u -> z, u -> nBlockStart, uchar), * zp0 = zp, z;
-  while (m < u -> M) {
-    z = * zp++;
-    n = p3decode[z & 0x7f];
-    z >>= 7;
-    if (z)
-      memcpy(u -> b + (m - c), u -> a + m, n * sizeof(int));
-    else {
-      memcpy(u -> e + c, u -> a + m, n * sizeof(int));
-      c += n;
-    }
-    m += n;
-  }
-  if (m != u -> M) die("error in forwardsAPacked()");
+PBWT * pbwtFilterSites(PBWT * pOld, Array filter) {
+  /* Provide array of 0s and 1s to filter sites from pbwt*/
+  if (arrayMax(filter) != pOld->N) die("Filter is not the same size as pbwt");
+  int i, j, newN;
+  for (j = 0; j < pOld->N; ++j) newN += * arrp(filter, j, int);
+  if (newN == pOld->N) return pOld;
 
-  memcpy(u -> a, u -> e, u -> c * sizeof(int));
-  memcpy(u -> a + u -> c, u -> b, (u -> M - u -> c) * sizeof(int));
-}
-
-/***************************************************/
-
-static PBWT * selectSitesLocal(PBWT * pOld, Array sites, BOOL isKeepOld, BOOL isFillMissing) {
-  PBWT * pNew = pbwtCreate(pOld -> M, 0);
-  int ip = 0, ia = 0, j;
-  Site * sp = arrp(pOld -> sites, ip, Site), * sa = arrp(sites, ia, Site);
+  PBWT * pNew = pbwtCreate(pOld->M, 0);
   PbwtCursor * uOld = pbwtCursorCreate(pOld, TRUE, TRUE);
   PbwtCursor * uNew = pbwtCursorCreate(pNew, TRUE, TRUE);
-  uchar * x = myalloc(pNew -> M, uchar);
+  uchar * x = myalloc(pNew->M, uchar);
 
-  pNew -> sites = arrayCreate(arrayMax(sites), Site);
-  while (ip < pOld -> N && ia < arrayMax(sites)) {
-    if (sp -> x != sa -> x) {
-      ++ip;
-      ++sp;
-      pbwtCursorForwardsRead(uOld);
-    } else if (sp -> x > sa -> x) {
-      ++ia;
-      ++sa;
-    } else {
-      char * sa_als = dictName(variationDict, sa -> varD);
-      char * sp_als = dictName(variationDict, sp -> varD);
-      BOOL noAlt = sa_als[strlen(sa_als) - 1] == '.' || sp_als[strlen(sp_als) - 1] == '.';
-      if (!noAlt && sp -> varD != sa -> varD) {
-        ++ip;
-        ++sp;
-        pbwtCursorForwardsRead(uOld);
-      } else {
-        array(pNew -> sites, pNew -> N++, Site) = * sp;
-        ++ip;
-        ++sp;
-        ++ia;
-        ++sa;
-        // 171113 if isMissing then inspect sa->freq to set major allele 
-        for (j = 0; j < pOld -> M; ++j) x[uOld -> a[j]] = uOld -> y[j];
-        pbwtCursorForwardsRead(uOld);
-        for (j = 0; j < pNew -> M; ++j) uNew -> y[j] = x[uNew -> a[j]];
-        pbwtCursorWriteForwards(uNew);
-      }
+  pNew->sites = arrayCreate(newN, Site);
+
+  for (j = 0; j < pOld->N; ++j) {
+    if (* arrp(filter, j, int) == 1) {
+      array(pNew->sites, pNew->N++, Site) = * arrp(pOld->sites, j, Site);
+      for (i = 0; i < pOld->M; ++i) x[uOld->a[i]] = uOld->y[i];
+      for (i = 0; i < pNew->M; ++i) uNew->y[i] = x[uNew->a[i]];
+      pbwtCursorWriteForwards(uNew);
     }
+    pbwtCursorForwardsRead(uOld);
+    if (j % 1000 == 0) printProgress((double) j / pOld->N);
   }
+  printProgress(1.0);
+  printf("\n");
+
   pbwtCursorToAFend(uNew, pNew);
-
-  if (isKeepOld) {
-    if (pOld -> samples) pNew -> samples = arrayCopy(pOld -> samples);
-    if (pOld -> chrom) pNew -> chrom = strdup(pOld -> chrom);
-  } else /* destroy one or the other */
-    if (pNew -> N == pOld -> N) /* no change - keep pOld as pNew */ {
-      pbwtDestroy(pNew);
-      pNew = pOld;
-    }
-  else {
-    pNew -> chrom = pOld -> chrom;
-    pOld -> chrom = 0;
-    pNew -> samples = pOld -> samples;
-    pOld -> samples = 0;
-    pbwtDestroy(pOld);
-  }
-
+  pNew->chrom = pOld->chrom;
+  pOld->chrom = 0;
+  pNew->samples = pOld->samples;
+  pOld->samples = 0;
+  pbwtDestroy(pOld);
   free(x);
   pbwtCursorDestroy(uOld);
   pbwtCursorDestroy(uNew);
   return pNew;
-}
-
-PBWT * pbwtSelectSites(PBWT * pOld, Array sites, BOOL isKeepOld) {
-  return selectSitesLocal(pOld, sites, isKeepOld, FALSE);
 }
 
 /******************* end of file *******************/

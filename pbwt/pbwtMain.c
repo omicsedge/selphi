@@ -85,9 +85,8 @@ int main(int argc, char * argv[]) {
     fprintf(stderr, "  -readAll <rootname>       read .pbwt and if present .sites, .samples, .missing\n");
     fprintf(stderr, "  -readVcfGT <file>         read GTs from vcf or bcf file; '-' for stdin vcf only ; biallelic sites only - require diploid!\n");
     fprintf(stderr, "  -checkpoint <n>           checkpoint every n sites while reading\n");
-    fprintf(stderr, "  -writeSites <file>        write sites file; '-' for stdout\n");
     fprintf(stderr, "  -writeAll <rootname>      write .pbwt and if present .sites, .samples, .missing\n");
-    fprintf(stderr, "  -selectSites <file>       select sites as in sites file\n");
+    fprintf(stderr, "  -filterSites <file>       filter sites with boolean array\n");
     fprintf(stderr, "  -selectSamples <file>     select samples as in samples file\n");
     fprintf(stderr, "  -referenceMatch <root> <L> find matches in reference panel longer than L\n");
   }
@@ -117,12 +116,6 @@ int main(int argc, char * argv[]) {
       p = pbwtReadVcfGT(argv[1]);
       argc -= 2;
       argv += 2;
-    } else if (!strcmp(argv[0], "-writeSites") && argc > 1) {
-      FOPEN("writeSites", "w");
-      pbwtWriteSites(p, fp);
-      FCLOSE;
-      argc -= 2;
-      argv += 2;
     } else if (!strcmp(argv[0], "-writeAll") && argc > 1) {
       pbwtWriteAll(p, argv[1]);
       argc -= 2;
@@ -136,14 +129,11 @@ int main(int argc, char * argv[]) {
       p = pbwtSelectSamples(p, fp);
       argc -= 2;
       argv += 2;
-    } else if (!strcmp(argv[0], "-selectSites") && argc > 1) {
-      FOPEN("selectSites", "r");
-      char * chr = 0;
-      Array sites = pbwtReadSitesFile(fp, & chr);
-      if (strcmp(chr, p -> chrom)) die("chromosome mismatch in selectSites");
-      p = pbwtSelectSites(p, sites, FALSE);
-      free(chr);
-      arrayDestroy(sites);
+    } else if (!strcmp(argv[0], "-filterSites") && argc > 1) {
+      FOPEN("filterSites", "r");
+      Array filter = pbwtReadFilterFile(fp, p->N);
+      p = pbwtFilterSites(p, filter);
+      arrayDestroy(filter);
       argc -= 2;
       argv += 2;
     } else if (!strcmp(argv[0], "-referenceMatch") && argc > 2) {

@@ -2,7 +2,7 @@
 #include <sys/stat.h>
 #include <zip.h>
 
-static char *get_prefix(PBWT *p, int index) {
+static char * get_prefix(PBWT *p, int index) {
   // Assume sample id is not more than 50 bytes
   char *sample_id = sampleName(sample(p, index));
   int strL = 54;
@@ -12,7 +12,7 @@ static char *get_prefix(PBWT *p, int index) {
   return (char *)prefix;
 }
 
-static char *get_path(char *prefix, char *basename) {
+static char * get_path(char *prefix, char *basename) {
   // Longest basename is 11 bytes
   // Assume sample id is not more than 50 bytes
   int strL = 68;
@@ -187,10 +187,14 @@ static void pbwtMatchTargets(PBWT * p, int minL, int nRefHaps) {
     free(refHaps);
     free(targetHaps);
     pbwtCursorForwardsReadAD(u, var);
+    if (var % 100 == 0) printProgress((double) var / nVar);
   }
-  printf(" [pbwt]: Compressing output\n");
+  printProgress(1.0);
+  printf("\n [pbwt]: Compressing output\n");
   for (tHap = nRefHaps; tHap < nAllHaps; tHap++)
     close_npz(get_prefix(p, tHap), matchCounts[(tHap - nRefHaps)]);
+    printProgress((double) (tHap - nRefHaps) / nTargetHaps);
+  printf("\n");
   pbwtCursorDestroy(u);
   free(matchCounts);
 }
@@ -206,16 +210,8 @@ void referenceMatch(PBWT * pTargets, char * fileNameRoot, int minL) {
   if (strcmp(pTargets->chrom, pRef->chrom))
     die(" [pbwt]: mismatching chrom in reference panel: old %s, ref %s", pTargets->chrom, pRef->chrom);
 
-  // reduce both down to the intersecting sites
-  pRef = pbwtSelectSites(pRef, pTargets->sites, FALSE);
-  pTargets = pbwtSelectSites(pTargets, pRef->sites, FALSE);
-  if (!pTargets->N) die("no overlapping sites in reference panel");
-
   PBWT * pAll = pbwtMerge2(pRef, pTargets);
   pbwtDestroy(pRef);
-  FILE *f = fopen("variants.txt", "wb");
-  pbwtWriteSites(pAll, f);
-  fclose(f);
   printf(" [pbwt]: Merged PBWT has %d haplotypes and %d sites\n", pAll->M, pAll->N);
 
   pbwtMatchTargets(pAll, minL, nRefHaps);

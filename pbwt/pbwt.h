@@ -114,7 +114,7 @@ void pbwtCursorForwardsReadAD(PbwtCursor * u, int k);
 void pbwtCursorWriteForwards(PbwtCursor * u); /* write then move forwards */
 void pbwtCursorToAFend(PbwtCursor * u, PBWT * p); /* utility to copy final u->a to p->aFend */
 /* select sites */
-PBWT * pbwtSelectSites(PBWT * pOld, Array sites, BOOL isKeepOld);
+PBWT * pbwtFilterSites(PBWT * pOld, Array filter);
 
 /* pbwtSample.c */
 void sampleInit(void);
@@ -128,10 +128,9 @@ PBWT * pbwtSelectSamples(PBWT * pOld, FILE * fp);
 /* pbwtIO.c */
 extern int nCheckPoint; /* if set non-zero write pbwt and sites files every n sites when parsing external files */
 void pbwtCheckPoint(PbwtCursor * u, PBWT * p);
-void pbwtWriteSites(PBWT * p, FILE * fp);
 void pbwtWriteAll(PBWT * p, char * fileNameRoot);
-Array pbwtReadSitesFile(FILE * fp, char ** chrom);
-Array pbwtReadSamplesFile(FILE *fp);
+Array pbwtReadFilterFile(FILE * fp, int n);
+Array pbwtReadSamplesFile(FILE * fp);
 PBWT * pbwtReadAll(char * fileNameRoot); /* reads .pbwt, .sites, .samples, .missing  */
 
 /* pbwtHtslib.c */
