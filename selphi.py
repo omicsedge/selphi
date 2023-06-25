@@ -293,7 +293,7 @@ if __name__ == "__main__":
             genetic_map_path=map_path,
             output_path=output_path,
             pbwt_path=pbwt_path,
-            tmpdir=Path("/data/temp").resolve(),
+            tmpdir=Path(tempdir).resolve(),
             match_length=args.match_length,
             cores=args.cores,
         )
