@@ -1,0 +1,9 @@
+cachetools
+cyvcf2
+joblib
+numba
+numpy
+pandas
+scipy
+tqdm
+zstd

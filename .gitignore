@@ -6,6 +6,11 @@
 **/__pycache__
 **/*.pyc
 
+# pbwt files
+pbwt/pbwt
+pbwt/version.h
+**/*.o
+
 build/
 *.egg-info
 *.egg
@@ -57,3 +62,7 @@ __pypackages__/
 /modules/*.o
 /modules/*.lib
 
+/lib/
+
+test
+.DS_Store
