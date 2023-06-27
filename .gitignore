@@ -65,3 +65,4 @@ __pypackages__/
 /lib/
 
 test
+.DS_Store
