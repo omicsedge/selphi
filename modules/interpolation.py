@@ -102,7 +102,6 @@ def interpolate(
 
 def interpolate_genotypes(
     ref_haplotypes: SparseReferencePanel,
-    target_ids: np.ndarray,
     target_samples: List[str],
     ordered_weights: np.ndarray,
     wgs_idx: np.ndarray,
@@ -111,11 +110,14 @@ def interpolate_genotypes(
     threads: int = 1,
 ) -> str:
     # Prepare intervals
+    ref_order = np.argsort(wgs_idx)
     original_ref_indices = np.concatenate(
-        ([0], wgs_idx, [ref_haplotypes.n_variants - 1])
+        ([0], wgs_idx[ref_order], [ref_haplotypes.n_variants - 1])
     )
     # Weights matrix has extra rows at 0 and -1
-    original_chip_indices = np.concatenate(([0], target_idx + 1, [target_ids.size + 1]))
+    original_chip_indices = np.concatenate(
+        ([0], np.argsort(target_idx[ref_order]) + 1, [target_idx.size + 1])
+    )
     intervals = list(
         zip(range(original_ref_indices.size - 1), range(1, original_ref_indices.size))
     )

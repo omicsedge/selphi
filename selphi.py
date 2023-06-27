@@ -57,9 +57,6 @@ def selphi(
     )
 
     # Load target samples and variants
-    variant_dtypes = np.dtype(
-        [("chr", "<U21"), ("pos", int), ("ref", "<U21"), ("alt", "<U21")]
-    )
     vcf_obj = cyvcf2.VCF(targets_path)
     target_samples = vcf_obj.samples
     target_markers = np.array(
@@ -67,7 +64,7 @@ def selphi(
             (variant.CHROM, variant.POS, variant.REF, variant.ALT[0])
             for variant in vcf_obj
         ],
-        dtype=variant_dtypes,
+        dtype=ref_panel.variant_dtypes,
     )
     del vcf_obj
     if target_markers[0][0] != ref_panel.chromosome:
@@ -112,7 +109,7 @@ def selphi(
     expected_shape = (ref_panel.n_haps, wgs_idx.size)
 
     # Get coordinates for overlapping variants
-    chip_variants = target_markers[target_idx]
+    chip_variants = target_markers[np.sort(target_idx)]
     chip_BPs = [variant[1] for variant in chip_variants]
     chip_cM_coordinates: np.ndarray = load_and_interpolate_genetic_map(
         genetic_map_path=genetic_map_path,
@@ -140,7 +137,6 @@ def selphi(
     # Interpolate genotypes
     output_file = interpolate_genotypes(
         ref_panel,
-        chip_variants,
         target_samples,
         ordered_weights,
         wgs_idx,
