@@ -1,6 +1,6 @@
 # Selphi Imputation 
 
-<img src="https://github.com/selfdecode/rd-imputation-selphi/blob/feat/pbwt-and-sparse-optimizations/icons/SDBlueIcon.svg" alt="SelfDecode" style="width: 50px; height: auto;"><img src="https://github.com/selfdecode/rd-imputation-selphi/blob/feat/pbwt-and-sparse-optimizations/icons/OmicsEdge-Logo.png" alt="OmicsEdge" style="width: 290px; height: auto;">
+<img src="https://github.com/selfdecode/rd-imputation-selphi/blob/staging/icons/SDBlueIcon.svg" alt="SelfDecode" style="width: 50px; height: auto;"><img src="https://github.com/selfdecode/rd-imputation-selphi/blob/staging/icons/OmicsEdge-Logo.png" alt="OmicsEdge" style="width: 290px; height: auto;">
 
 Selphi is a tool for genotype imputation based on PBWT (Positional Burrows-Wheeler Transform) algorithm. It provides efficient imputation of missing genotypes in a target sample dataset using a reference panel.
 
