@@ -209,11 +209,11 @@ class Sparse2vcf:
                 tqdm(
                     self.reference_ids,
                     desc=(
-                        f"Writing {self.num_samples} sample(s) for "
+                        f" [output] Writing {self.num_samples} sample(s) for "
                         f"{self.num_variants} variants"
                     ),
                     ncols=75,
-                    bar_format="{desc}:\t{percentage:3.0f}% {bar}\t{elapsed}",
+                    bar_format="{desc}:\t\t\t{percentage:3.0f}% in {elapsed}",
                     colour="#808080",
                 )
             ):

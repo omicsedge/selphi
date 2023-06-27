@@ -122,9 +122,9 @@ def selphi(
     # Calculate HMM weights from matches
     with tqdm_joblib(
         total=len(target_haps),
-        desc="Calculating weights with HMM",
-        ncols=65,
-        bar_format="{desc}:\t\t\t{percentage:3.0f}% {bar}\t{elapsed}",
+        desc=" [core] Calculating weights with HMM",
+        ncols=75,
+        bar_format="{desc}:\t\t\t\t\t{percentage:3.0f}% in {elapsed}",
         colour="#808080",
     ):
         ordered_weights = np.asarray(

@@ -127,9 +127,9 @@ def interpolate_genotypes(
 
     with tqdm_joblib(
         total=len(intervals) // chunk_size + 1,
-        desc="Interpolating genotypes at missing variants",
+        desc=" [interpolate] Interpolating genotypes at missing variants",
         ncols=75,
-        bar_format="{desc}:\t{percentage:3.0f}% {bar}\t{elapsed}",
+        bar_format="{desc}:\t\t{percentage:3.0f}% in {elapsed}",
         colour="#808080",
     ):
         results = sparse.hstack(

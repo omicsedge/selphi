@@ -30,9 +30,9 @@ def load_and_interpolate_genetic_map(
     """
     progress = tqdm(
         total=4,
-        desc="Loading and interpolating genetic map",
+        desc=" [map] Loading and interpolating genetic map",
         ncols=75,
-        bar_format="{desc}:\t\t{percentage:3.0f}% {bar}\t{elapsed}",
+        bar_format="{desc}:\t\t\t\t{percentage:3.0f}% in {elapsed}",
         colour="#808080",
     )
     genetic_map = pd.read_csv(
