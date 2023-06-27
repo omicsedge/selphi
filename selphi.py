@@ -109,6 +109,7 @@ def selphi(
         match_length,
         cores,
     )
+    expected_shape = (ref_panel.n_haps, wgs_idx.size)
 
     # Get coordinates for overlapping variants
     chip_variants = target_markers[target_idx]
@@ -129,7 +130,7 @@ def selphi(
         ordered_weights = np.asarray(
             Parallel(n_jobs=cores)(
                 delayed(calculate_weights)(
-                    target_hap, chip_cM_coordinates, pbwt_result_path
+                    target_hap, chip_cM_coordinates, pbwt_result_path, expected_shape
                 )
                 for target_hap in target_haps
             ),

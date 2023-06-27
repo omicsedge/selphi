@@ -115,6 +115,7 @@ void pbwtCursorWriteForwards(PbwtCursor * u); /* write then move forwards */
 void pbwtCursorToAFend(PbwtCursor * u, PBWT * p); /* utility to copy final u->a to p->aFend */
 /* select sites */
 PBWT * pbwtFilterSites(PBWT * pOld, Array filter);
+PBWT * pbwtMerge2(PBWT * p, PBWT * q);
 
 /* pbwtSample.c */
 void sampleInit(void);
@@ -138,8 +139,5 @@ PBWT * pbwtReadVcfGT(char * filename); /* read GTs from vcf/bcf using htslib */
 
 /* pbwtMatchTargets.c - functions for SelfDecode */
 void referenceMatch(PBWT * p, char * fileNameRoot, int minL);
-
-/* pbwtMerge.c - modified for SelfDecode */
-PBWT * pbwtMerge2(PBWT * p, PBWT * q);
 
 /******************* end of file *******************/

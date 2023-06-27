@@ -2,7 +2,6 @@ from typing import Iterator, List, Tuple
 from pathlib import Path
 from scipy import sparse
 import numpy as np
-from tqdm import tqdm
 
 from modules.hmm_utils import pRecomb, setFwdValues_SPARSE, setBwdValues_SPARSE
 from modules.load_data import load_sparse_comp_matches_hybrid_npz
@@ -173,8 +172,11 @@ class CompositePanelMaskFilter:
         ).tocsc()
 
 
-def form_haploid_ids_lists_NEW(composite_: sparse.csc_matrix) -> np.ndarray:
-    return np.array([row.indices for row in composite_.transpose()], dtype=object)
+def form_haploid_ids_lists_NEW(
+    composite_: sparse.csc_matrix, is_single: bool
+) -> np.ndarray:
+    dtype = int if is_single else object
+    return np.array([row.indices for row in composite_.transpose()], dtype=dtype)
 
 
 def run_hmm(
@@ -187,7 +189,7 @@ def run_hmm(
     Runs the forward and backward runs of the forward-backward algorithm,
         to get probabilities for imputation
     """
-    nHaps = np.array([np.unique(row).size for row in ordered_hap_indices])
+    nHaps = np.array([row.size for row in ordered_hap_indices])
     pRecomb_arr: np.ndarray = pRecomb(distances_cm, num_hid=num_hid) / nHaps
 
     matrix_ = setFwdValues_SPARSE(
@@ -204,17 +206,19 @@ def run_hmm(
 
 
 def calculate_weights(
-    target_hap: Tuple[str, int], chip_cM_coordinates: np.ndarray, npz_dir: Path
+    target_hap: Tuple[str, int],
+    chip_cM_coordinates: np.ndarray,
+    npz_dir: Path,
+    shape: Tuple[int],
 ) -> sparse.csr_matrix:
     """
     Load pbwt matches from npz and calculate weights for imputation
     Processing as one chunk (CHUNK_SIZE = chip_sites_n)
     """
     comp_matches_hybrid: sparse.csc_matrix = load_sparse_comp_matches_hybrid_npz(
-        *target_hap, npz_dir, fl=25
+        *target_hap, npz_dir, shape, fl=25
     )
-    chip_sites_n = comp_matches_hybrid.shape[1]
-    ref_haps_n = comp_matches_hybrid.shape[0]
+    ref_haps_n, chip_sites_n = comp_matches_hybrid.shape
 
     haps_freqs_array_norm: np.ndarray = calculate_haploid_frequencies_SPARSE(
         comp_matches_hybrid, chip_sites_n
@@ -222,15 +226,15 @@ def calculate_weights(
     nc_thresh: np.ndarray = calculate_haploid_count_threshold_SPARSE(
         comp_matches_hybrid, haps_freqs_array_norm, chip_sites_n
     )
-    composite_: sparse._csc.csc_matrix = CompositePanelMaskFilter(
+    composite_: sparse.csc_matrix = CompositePanelMaskFilter(
         comp_matches_hybrid, haps_freqs_array_norm, nc_thresh, chip_sites_n
     ).sparse_matrix()
 
     del comp_matches_hybrid
     del haps_freqs_array_norm
-    del nc_thresh
 
-    ordered_hap_indices = form_haploid_ids_lists_NEW(composite_)
+    ordered_hap_indices = form_haploid_ids_lists_NEW(composite_, nc_thresh.max() == 1)
+    del nc_thresh
     del composite_
 
     return run_hmm(

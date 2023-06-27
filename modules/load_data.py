@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Tuple
 from pathlib import Path
 
 import pandas as pd
@@ -76,10 +76,15 @@ def coo_to_array(rows: np.ndarray, columns: np.ndarray, data: np.ndarray) -> np.
 
 
 def load_sparse_comp_matches_hybrid_npz(
-    sample_name: str, hap: int, npz_dir: Path, fl: int = 25
+    sample_name: str, hap: int, npz_dir: Path, shape: Tuple[int], fl: int = 25
 ) -> sparse.csc_matrix:
     npz_path = npz_dir.joinpath(f"parallel_haploid_mat_{sample_name}_{hap}.npz")
     x: sparse.csc_matrix = sparse.load_npz(npz_path).tocsc()
+    if x.shape != shape:
+        raise IndexError(
+            f"Sparse matrix for {sample_name}_{hap} is the wrong shape. "
+            f"Expected shape: {shape}. Actual shape: {x.shape}"
+        )
     keep = np.vstack(
         [
             np.column_stack(

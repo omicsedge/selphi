@@ -87,6 +87,14 @@ def get_pbwt_matches(
         check=True,
         cwd=tmpdir,
     )
+    # Confirm that variant selection worked correctly
+    ref_sites = tmpdir.joinpath("filtered_reference").with_suffix(".sites").read_bytes()
+    tgt_sites = tmpdir.joinpath("filtered_target").with_suffix(".sites").read_bytes()
+    if ref_sites != tgt_sites:
+        raise IndexError(
+            "Reference and target variants could not be matched, "
+            "check that variants are sorted correctly."
+        )
     n_samples = len(target_samples)
     if cores == 1 or n_samples == 1:
         # Process all samples at once and return

@@ -19,7 +19,7 @@ force:
 test: all
 	./test/test.pl
 
-PBWT_OBJS=pbwtMain.o pbwtCore.o pbwtSample.o pbwtIO.o pbwtMatchTargets.o pbwtMerge.o pbwtHtslib.o
+PBWT_OBJS=pbwtMain.o pbwtCore.o pbwtSample.o pbwtIO.o pbwtMatchTargets.o pbwtHtslib.o
 UTILS_OBJS=hash.o dict.o array.o utils.o
 UTILS_HEADERS=utils.h array.h dict.h hash.h
 AUTOZYG_OBJS=autozygExtract.o

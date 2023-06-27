@@ -361,15 +361,15 @@ PBWT * pbwtFilterSites(PBWT * pOld, Array filter) {
   PBWT * pNew = pbwtCreate(pOld->M, 0);
   PbwtCursor * uOld = pbwtCursorCreate(pOld, TRUE, TRUE);
   PbwtCursor * uNew = pbwtCursorCreate(pNew, TRUE, TRUE);
-  uchar * x = myalloc(pNew->M, uchar);
+  uchar * yseq = myalloc(pNew->M, uchar);
 
   pNew->sites = arrayCreate(newN, Site);
 
   for (j = 0; j < pOld->N; ++j) {
     if (* arrp(filter, j, int) == 1) {
       array(pNew->sites, pNew->N++, Site) = * arrp(pOld->sites, j, Site);
-      for (i = 0; i < pOld->M; ++i) x[uOld->a[i]] = uOld->y[i];
-      for (i = 0; i < pNew->M; ++i) uNew->y[i] = x[uNew->a[i]];
+      for (i = 0; i < pOld->M; ++i) yseq[uOld->a[i]] = uOld->y[i];
+      for (i = 0; i < pNew->M; ++i) uNew->y[i] = yseq[uNew->a[i]];
       pbwtCursorWriteForwards(uNew);
     }
     pbwtCursorForwardsRead(uOld);
@@ -384,10 +384,51 @@ PBWT * pbwtFilterSites(PBWT * pOld, Array filter) {
   pNew->samples = pOld->samples;
   pOld->samples = 0;
   pbwtDestroy(pOld);
-  free(x);
+  free(yseq);
   pbwtCursorDestroy(uOld);
   pbwtCursorDestroy(uNew);
   return pNew;
+}
+
+PBWT * pbwtMerge2(PBWT * p, PBWT * q) {
+  /*Assumes same sites in pbwts*/
+  if (p->N != q->N) die("Cannot merge, PBWTs do not have the same sites");
+  int nhaps = p->M + q->M;
+  PBWT * out_pbwt = pbwtCreate(nhaps, 0);
+  uchar * yseq = myalloc(nhaps, uchar);
+  out_pbwt->yz = arrayCreate (1<<20, uchar);
+  out_pbwt->sites = arrayCreate(p->N, Site);
+  out_pbwt->chrom = strdup(p->chrom);
+
+  PbwtCursor * cursor = pbwtCursorCreate(out_pbwt, TRUE, TRUE);
+  PbwtCursor * pc = pbwtCursorCreate(p, TRUE, TRUE);
+  PbwtCursor * qc = pbwtCursorCreate(q, TRUE, TRUE);
+
+  int j, s;
+  out_pbwt->samples = arrayCreate(nhaps, int);
+  for (j = 0 ; j < p->M ; ++j)
+    array(out_pbwt->samples, j, int) = arr(p->samples, j, int);
+  for (j = p->M ; j < nhaps ; ++j)
+    array(out_pbwt->samples, j, int) = arr(q->samples, j - p->M, int);
+
+  for (s = 0; s < p->N; s++) {
+    array(out_pbwt->sites, out_pbwt->N++, Site) = * arrp(p->sites, s, Site);
+    // read and merge
+    for (j = 0; j < p->M; j++) yseq[pc->a[j]] = pc->y[j];
+    for (j = 0; j < q->M; j++) yseq[p->M + qc->a[j]] = qc->y[j];
+    // pack merged haplotypes
+    for (j = 0; j < nhaps; j++) cursor->y[j] = yseq[cursor->a[j]];
+    pbwtCursorForwardsRead(pc);
+    pbwtCursorForwardsRead(qc);
+    pbwtCursorWriteForwards(cursor);
+  }
+  pbwtCursorToAFend(cursor, out_pbwt);
+  free(yseq);
+  pbwtCursorDestroy(cursor);
+  pbwtCursorDestroy(pc);
+  pbwtCursorDestroy(qc);
+
+  return out_pbwt;
 }
 
 /******************* end of file *******************/
