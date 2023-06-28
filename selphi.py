@@ -142,6 +142,7 @@ def selphi(
         wgs_idx,
         target_idx,
         output_path,
+        tmpdir,
         cores,
     )
     logger.info(f"{timestamp()}: Saved imputed genotypes to {output_file}")

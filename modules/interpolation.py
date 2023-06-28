@@ -7,8 +7,8 @@ from scipy import sparse
 
 from joblib import Parallel, delayed
 
+from .array2vcf import VcfWriter
 from .sparse_ref_panel import SparseReferencePanel
-from .sparse2vcf import Sparse2vcf
 from .utils import tqdm_joblib
 
 
@@ -18,7 +18,7 @@ def _interpolate_hap(
     weight_matrix: sparse.csr_matrix,
     is_last: bool,
     ref_haplotypes: SparseReferencePanel,
-) -> sparse.coo_matrix:
+) -> np.ndarray:
     """
     Given haplotype weights calculated by hmm at beginning and end of interval,
     interpolate weights for each variant in the reference panel in that interval.
@@ -42,11 +42,10 @@ def _interpolate_hap(
         num=ref_pair[1] - ref_pair[0] + int(is_last),
         endpoint=False,
     )
-    alt_probs = (
+    return (
         weights
         * ref_haplotypes[ref_pair[0] : ref_pair[1] + int(is_last), ref_haps].toarray()
     ).sum(axis=1) / weights.sum(axis=1)
-    return sparse.coo_matrix(alt_probs)
 
 
 def _interpolate_interval(
@@ -55,7 +54,7 @@ def _interpolate_interval(
     original_chip_indices: np.ndarray,
     original_ref_indices: np.ndarray,
     ref_haplotypes: SparseReferencePanel,
-) -> sparse.coo_matrix:
+) -> np.ndarray:
     """
     Calculate indices for an interval and then interpolate all haplotypes
     for that interval.
@@ -65,7 +64,7 @@ def _interpolate_interval(
     ref_pair = tuple(original_ref_indices[index_pair])
     chip_pair = tuple(original_chip_indices[index_pair])
     is_last = index_pair[1] == original_ref_indices.size - 1
-    return sparse.vstack(
+    return np.column_stack(
         [
             _interpolate_hap(
                 ref_pair, chip_pair, weight_matrix, is_last, ref_haplotypes
@@ -81,12 +80,14 @@ def interpolate(
     original_chip_indices: np.ndarray,
     original_ref_indices: np.ndarray,
     ref_haplotypes: SparseReferencePanel,
-) -> sparse.coo_matrix:
+    writer: VcfWriter,
+) -> Path:
     """
     Interpolate all intervals in a list, stacking the intervals into one matrix.
     Allows for easy parallel processing of chunks of a chromosome.
+    Write chunk to file and return Path.
     """
-    return sparse.hstack(
+    alt_probs = np.row_stack(
         [
             _interpolate_interval(
                 list(index_pair),
@@ -98,6 +99,13 @@ def interpolate(
             for index_pair in index_pairs
         ]
     )
+    start = original_ref_indices[index_pairs[0][0]]
+    stop = original_ref_indices[index_pairs[-1][1]]
+    in_target = original_ref_indices[np.trim_zeros(np.unique(index_pairs), "f")] - start
+    if stop == original_ref_indices[-1]:
+        stop += 1
+        in_target = in_target[:-1]
+    return writer.write_variants(ref_haplotypes.ids[start:stop], in_target, alt_probs)
 
 
 def interpolate_genotypes(
@@ -107,8 +115,13 @@ def interpolate_genotypes(
     wgs_idx: np.ndarray,
     target_idx: np.ndarray,
     output_path: Path,
+    tmpdir: Path,
     threads: int = 1,
 ) -> str:
+    # Prepare to write results to VCF
+    writer = VcfWriter(target_samples, ref_haplotypes.chromosome, tmpdir)
+    writer.write_header()
+
     # Prepare intervals
     ref_order = np.argsort(wgs_idx)
     original_ref_indices = np.concatenate(
@@ -134,35 +147,24 @@ def interpolate_genotypes(
         bar_format="{desc}:\t\t{percentage:3.0f}% in {elapsed}",
         colour="#808080",
     ):
-        results = sparse.hstack(
-            Parallel(n_jobs=threads,)(
-                delayed(interpolate)(
-                    intervals[start : start + chunk_size],
-                    ordered_weights,
-                    original_chip_indices,
-                    original_ref_indices,
-                    ref_haplotypes,
-                )
-                for start in range(0, len(intervals), chunk_size)
+        filelist = Parallel(n_jobs=threads,)(
+            delayed(interpolate)(
+                intervals[start : start + chunk_size],
+                ordered_weights,
+                original_chip_indices,
+                original_ref_indices,
+                ref_haplotypes,
+                writer,
             )
-        ).tocsc()
+            for start in range(0, len(intervals), chunk_size)
+        )
 
-    # Convert sparse matrix to VCF
     # make sure path exists
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # If the provided output is a folder path, generate a random filename
+    # If the provided output is a directory, generate a random filename
     # this will avoid that multiple VCF creation in the same folder are overwritten
     if output_path.is_dir():
         output_path = output_path.joinpath(str(uuid4()))
 
-    output_file = str(output_path)
-    if output_file.endswith(".vcf.gz"):
-        output_file = output_file[:-7]
-
-    converter = Sparse2vcf(results, target_samples, ref_haplotypes.ids, wgs_idx)
-    converter.convert_to_vcf(output_file + ".vcf")
-    converter.compress_vcf(output_file + ".vcf")
-    converter.index_vcf(output_file + ".vcf.gz")
-
-    return output_file + ".vcf.gz"
+    return writer.complete_vcf(filelist, output_path)
