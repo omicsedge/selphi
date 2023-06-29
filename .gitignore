@@ -5,6 +5,7 @@
 **/venv
 **/__pycache__
 **/*.pyc
+*.tar
 
 # pbwt files
 pbwt/pbwt
