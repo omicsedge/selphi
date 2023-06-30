@@ -1,0 +1,132 @@
+{
+  "name": "selphi-imputation",
+  "title": "Selphi genotype imputation app",
+  "summary": " weighted-PBWT genotype imputation algorithm",
+  "dxapi": "1.0.0",
+  "version": "0.0.1",
+  "inputSpec": [
+    {
+      "name": "target",
+      "label": "target",
+      "class": "file",
+      "optional": true,
+      "patterns": [
+        "*"
+      ],
+      "help": ""
+    },
+    {
+      "name": "ref_source_vcf",
+      "label": "ref_source_vcf",
+      "class": "file",
+      "optional": true,
+      "patterns": [
+        "*"
+      ],
+      "help": ""
+    },
+    {
+      "name": "prepare_reference",
+      "label": "prepare_reference",
+      "class": "boolean",
+      "optional": true,
+      "help": ""
+    },
+    {
+      "name": "refpanel",
+      "label": "refpanel",
+      "class": "string",
+      "optional": false,
+      "help": ""
+    },
+    {
+      "name": "cores",
+      "label": "cores",
+      "class": "int",
+      "optional": true,
+      "default": 1,
+      "help": ""
+    },
+    {
+      "name": "map",
+      "label": "map",
+      "class": "file",
+      "optional": true,
+      "patterns": [
+        "*"
+      ],
+      "help": ""
+    },
+    {
+      "name": "outvcf",
+      "label": "outvcf",
+      "class": "string",
+      "optional": true,
+      "help": ""
+    },
+    {
+      "name": "match_length",
+      "label": "match_length",
+      "class": "int",
+      "optional": true,
+      "default": 5,
+      "help": ""
+    },
+    {
+      "name": "ref_source_xsi",
+      "label": "ref_source_xsi",
+      "class": "file",
+      "optional": true,
+      "patterns": [
+        "*"
+      ],
+      "help": ""
+    },
+    {
+      "name": "pbwt_path",
+      "label": "pbwt_path",
+      "class": "string",
+      "optional": true,
+      "help": ""
+    },
+    {
+      "name": "tmp_path",
+      "label": "tmp_path",
+      "class": "string",
+      "optional": true,
+      "help": ""
+    }
+  ],
+  "outputSpec": [
+    {
+      "name": "outvcf",
+      "label": "outvcf",
+      "class": "array:file",
+      "help": ""
+    }
+  ],
+  "runSpec": {
+    "timeoutPolicy": {
+      "*": {
+        "hours": 48
+      }
+    },
+    "interpreter": "python3",
+    "file": "src/selphi-imputation.py",
+    "distribution": "Ubuntu",
+    "release": "20.04",
+    "version": "0"
+  },
+  "access": {
+    "project": "CONTRIBUTE"
+  },
+  "regionalOptions": {
+    "aws:eu-west-2": {
+      "systemRequirements": {
+        "*": {
+          "instanceType": "mem2_ssd1_v2_x32"
+        }
+      }
+    }
+  }
+}
