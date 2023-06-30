@@ -36,13 +36,13 @@ def main(refpanel, cores, match_length, target=None, ref_source_vcf=None, prepar
         dxpy.download_dxfile(target.get_id(), "/target")
 
     if ref_source_vcf is not None:
-        dxpy.download_dxfile(ref_source_vcf.get_id(), "/ref_source_vcf")
+        dxpy.download_dxfile(ref_source_vcf.get_id(), "/ref_source")
 
     if map is not None:
         dxpy.download_dxfile(map.get_id(), "/map")
 
     if ref_source_xsi is not None:
-        dxpy.download_dxfile(ref_source_xsi.get_id(), "/ref_source_xsi")
+        dxpy.download_dxfile(ref_source_xsi.get_id(), "/ref_source")
 
     # Fill in your application code here.
     # Load Docker image
@@ -59,15 +59,35 @@ def main(refpanel, cores, match_length, target=None, ref_source_vcf=None, prepar
     ],shell=True)
 
     refpanel_prefix_name = os.path.basename(refpanel)
-    output_name = os.path.basename(outvcf)
-    output_folder = os.path.dirname(outvcf)
+    output_folder = os.path.dirname(refpanel)
+
+    if prepare_reference is not None and ref_source_vcf is not None:
+        _ = subprocess.check_output([
+            f"docker run -v /:/data selphi --prepare_reference --ref_source_vcf /data/ref_source --refpanel /data/reference/{refpanel_prefix_name} --cores {cores}"
+        ], shell=True)
+
+    if prepare_reference is not None and ref_source_xsi is not None:
+        _ = subprocess.check_output([
+            f"docker run -v /:/data selphi --prepare_reference --ref_source_xsi /data/ref_source --refpanel /data/reference/{refpanel_prefix_name} --cores {cores}"
+        ], shell=True)
 
     if prepare_reference is not None:
-        _ = subprocess.check_output([
-            f"docker run -v /:/data selphi --prepare_reference --ref_source_vcf {ref_source_vcf.get_id()} --refpanel /data/{refpanel_prefix_name} --cores {cores}"
-        ], shell=True)
+        results = glob.glob(f"/reference/*")
+        references_file = []
+        for reference in results:
+            file_obj = dxpy.upload_local_file(reference, project=project_id, folder=output_folder)
+            references_file.append(file_obj.get_id())
+
+        output = {}
+        output["outvcf"] = [dxpy.dxlink(item) for item in references_file]
+
+        return output
+
     else:
         
+        output_name = os.path.basename(outvcf)
+        output_folder = os.path.dirname(outvcf)
+
         dir_name = os.path.dirname(refpanel)
         for extension in ['.srp', '.pbwt', '.sites', '.samples']:
             complete_name = os.path.basename(refpanel) + extension
@@ -93,10 +113,11 @@ def main(refpanel, cores, match_length, target=None, ref_source_vcf=None, prepar
     results = glob.glob(f"/output/*")
     vcf_file = []
     for vcf in results:
-        vcf_file.append(dxpy.upload_local_file(vcf, project=project_id, folder=output_folder))
+        file_obj = dxpy.upload_local_file(vcf, project=project_id, folder=output_folder)
+        vcf_file.append(file_obj.get_id())
 
     output = {}
-    output["outvcf"] = f'/output/{output_name}.vcf.gz'
+    output["outvcf"] = [dxpy.dxlink(item) for item in vcf_file]
 
     return output
 

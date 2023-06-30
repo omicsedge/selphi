@@ -101,7 +101,7 @@
     {
       "name": "outvcf",
       "label": "outvcf",
-      "class": "string",
+      "class": "array:file",
       "help": ""
     }
   ],
