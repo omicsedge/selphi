@@ -40,20 +40,26 @@ This command generates batch inputs. The input files are specified with a regula
 **Prepare reference panel for Selphi imputation**
 ```bash
 dx run selphi-imputation \
- -iprepare_reference=True \
- -iref_source_vcf='file-id-of-source-vcf' \
- -irefpanel='/path/to/reference/prefix-name-no-extention' \
- -icores=5
+   -iprepare_reference=True \
+   -iref_source_vcf='file-id-of-source-vcf' \
+   -irefpanel='/path/to/reference/prefix-name-no-extention' \
+   -icores=10
+   --instance-type='mem2_ssd1_v2_x16' \
+   --priority low \
+   --name "selphi-imputation test"
 ```
 
 **Run Selphi imputation**
 ```bash
 dx run selphi-imputation \
-        -itarget='file-id-of-target-vcf' \
-        -irefpanel='/path/to/reference/prefix-name-no-extention' \
-        -imap='file-id-of-map-file-to-use' \
-        -icores=10 \
-        -ioutvcf='/path/to/outuput/prefix-name-no-extention' 
+   -itarget='file-id-of-target-vcf' \
+   -irefpanel='/path/to/reference/prefix-name-no-extention' \
+   -imap='file-id-of-map-file-to-use' \
+   -icores=10 \
+   -ioutvcf='/path/to/outuput/prefix-name-no-extention'
+   --instance-type='mem2_ssd1_v2_x16' \
+   --priority low \
+   --name "selphi-imputation test"
 ```
 
 **Important notes for COST**
