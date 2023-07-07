@@ -39,14 +39,19 @@ This command generates batch inputs. The input files are specified with a regula
 
 **Prepare reference panel for Selphi imputation**
 ```bash
-dx run selphi-imputation \
-   -iprepare_reference=True \
-   -iref_source_vcf='file-id-of-source-vcf' \
-   -irefpanel='/path/to/reference/prefix-name-no-extention' \
-   -icores=10
-   --instance-type='mem2_ssd1_v2_x16' \
-   --priority low \
-   --name "selphi-imputation test"
+for CHR in {1..22}; do
+    file_id=$(dx find data --name chr${CHR}_ukb_100k.xsi --brief)
+    file_id=${file_id#*:}  # Extract the file ID by removing the project ID prefix
+    dx run selphi-imputation \
+        -iprepare_reference=True \
+        -iref_source_xsi="$file_id" \
+        -irefpanel="/adriano/reference/chr${CHR}_ukb_100k" \
+        -icores=12 \
+        --instance-type="mem3_ssd2_v2_x16" \
+        --priority low \
+        --name "selphi chr${CHR} ref preparation" \
+        --yes
+done
 ```
 
 **Run Selphi imputation**

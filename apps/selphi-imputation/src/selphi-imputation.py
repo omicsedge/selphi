@@ -13,36 +13,54 @@
 
 import os, subprocess, dxpy, glob
 
+
+def get_ass_file_from_fileid(object_dnanexus, filename_extension, sep):
+    names = object_dnanexus.name
+    index_query = dxpy.find_data_objects(classname="file", name=f"{names}{sep}{filename_extension}")
+    index_object = next(index_query, None)
+
+    if index_object is not None:
+        id_index = index_object['id']
+        return dxpy.DXFile(id_index)
+    else:
+        print(f"No file found with name {names}{sep}{filename_extension}")
+
+    return None
+
+
 @dxpy.entry_point('main')
 def main(refpanel, cores, match_length, target=None, ref_source_vcf=None, prepare_reference=None, map=None, outvcf=None, ref_source_xsi=None, pbwt_path=None, tmp_path=None):
 
-    # The following line(s) initialize your data object inputs on the platform
-    # into dxpy.DXDataObject instances that you can start using immediately.
     project_id = dxpy.PROJECT_CONTEXT_ID  # Use the current project ID
 
     if target is not None:
         target = dxpy.DXFile(target)
     if ref_source_vcf is not None:
         ref_source_vcf = dxpy.DXFile(ref_source_vcf)
+
     if map is not None:
         map = dxpy.DXFile(map)
     if ref_source_xsi is not None:
         ref_source_xsi = dxpy.DXFile(ref_source_xsi)
 
-    # The following line(s) download your file inputs to the local file system
-    # using variable names for the filenames.
-
     if target is not None:
         dxpy.download_dxfile(target.get_id(), "/target")
 
     if ref_source_vcf is not None:
-        dxpy.download_dxfile(ref_source_vcf.get_id(), "/ref_source")
+        dxpy.download_dxfile(ref_source_vcf.get_id(), "/ref_source_vcf")
+        ref_source_vcf_tbi = get_ass_file_from_fileid(ref_source_vcf,'tbi','.')
+        if ref_source_vcf_tbi is not None:
+            dxpy.download_dxfile(ref_source_vcf_tbi.get_id(), "/ref_source_vcf.tbi")
 
     if map is not None:
         dxpy.download_dxfile(map.get_id(), "/map")
 
     if ref_source_xsi is not None:
-        dxpy.download_dxfile(ref_source_xsi.get_id(), "/ref_source")
+        dxpy.download_dxfile(ref_source_xsi.get_id(), "/ref_source_xsi")
+        ref_source_xsi_bcf = get_ass_file_from_fileid(ref_source_xsi,'bcf','_var.')
+        ref_source_xsi_csi = get_ass_file_from_fileid(ref_source_xsi,'csi','_var.bcf.')
+        dxpy.download_dxfile(ref_source_xsi_bcf.get_id(), "/ref_source_xsi_var.bcf")
+        dxpy.download_dxfile(ref_source_xsi_csi.get_id(), "/ref_source_xsi_var.bcf.csi")
 
     # Fill in your application code here.
     # Load Docker image
@@ -63,12 +81,12 @@ def main(refpanel, cores, match_length, target=None, ref_source_vcf=None, prepar
 
     if prepare_reference is not None and ref_source_vcf is not None:
         _ = subprocess.check_output([
-            f"docker run -v /:/data selphi --prepare_reference --ref_source_vcf /data/ref_source --refpanel /data/reference/{refpanel_prefix_name} --cores {cores}"
+            f"docker run -v /:/data selphi --prepare_reference --ref_source_vcf /data/ref_source_vcf --refpanel /data/reference/{refpanel_prefix_name} --cores {cores}"
         ], shell=True)
 
     if prepare_reference is not None and ref_source_xsi is not None:
         _ = subprocess.check_output([
-            f"docker run -v /:/data selphi --prepare_reference --ref_source_xsi /data/ref_source --refpanel /data/reference/{refpanel_prefix_name} --cores {cores}"
+            f"docker run -v /:/data selphi --prepare_reference --ref_source_xsi /data/ref_source_xsi --refpanel /data/reference/{refpanel_prefix_name} --cores {cores}"
         ], shell=True)
 
     if prepare_reference is not None:
