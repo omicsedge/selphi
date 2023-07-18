@@ -33,9 +33,9 @@ This command generates batch inputs. The input files are specified with a regula
 
 | batch ID | target |	target ID |
 |----------|--------|-----------|
-|0         | target0.vcf.gz |	project-GFX0638JzzB55yvP45JzYf6k:file-GQxBQK0JzzB88qb5v0ZpyK20 |
-|1         | target1.vcf.gz |	project-GFX0638JzzB55yvP45JzYf6k:file-GQxBQK0JzzB88qb5v0ZpyK21 |
-|2         | target2.vcf.gz |	project-GFX0638JzzB55yvP45JzYf6k:file-GQxBQK0JzzB88qb5v0ZpyK22 |
+|0         | target0.vcf.gz |	project-ID:file-ID |
+|1         | target1.vcf.gz |	project-ID:file-ID |
+|2         | target2.vcf.gz |	project-ID:file-ID |
 
 **Prepare reference panel for Selphi imputation**
 ```bash

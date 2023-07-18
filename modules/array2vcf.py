@@ -3,8 +3,9 @@ import subprocess
 from pathlib import Path
 from uuid import uuid4
 from shutil import copyfileobj
-from io import StringIO
+
 import numpy as np
+from scipy import sparse
 
 
 class VcfWriter:
@@ -94,60 +95,84 @@ class VcfWriter:
 
     def write_variants(
         self,
-        variant_ids: Union[List, np.ndarray],
+        all_variant_ids: Union[List, np.ndarray],
         target_ids: Union[List, np.ndarray],
-        probs: np.ndarray,
+        sparse_probs: sparse.csc_matrix,
     ) -> Path:
         out_path = self.tmpdir.joinpath(str(uuid4()))
-        # load metrics
-        AP1 = probs[:, 0::2]
-        AP2 = probs[:, 1::2]
-        DS = AP1 + AP2
-        GT1 = (AP1 > 0.5).astype(int)
-        GT2 = (AP2 > 0.5).astype(int)
-        AN = self.num_haplotypes
-        AC = np.sum(GT1 + GT2, axis=1)
-        AF = [int(ele) if ele % 1 == 0 else np.round(ele, 4) for ele in (AC / AN)]
-
         target_ids = set(target_ids)
 
-        # Write variant records
-        buffer = StringIO()
-        for i, idx in enumerate(variant_ids):
-            chrom, pos, ref, alt = idx.split("-")
-            vcf_INFO = f"AF={AF[i]};AC={AC[i]};AN={AN}"
-            if i not in target_ids:
-                vcf_INFO += ";IMP"
-            buffer.write(
-                "\t".join(
-                    [chrom, pos, idx, ref, alt, ".\tPASS", vcf_INFO, "GT:DS:AP1:AP2\t"]
-                )
-            )
-            # Convert float numbers to integers if they are integers
-            DS_int = [
-                int(num) if num % 1 == 0 else np.round(num, 3) for num in DS[i, :]
-            ]
-            AP1_int = [
-                int(num) if num % 1 == 0 else np.round(num, 3) for num in AP1[i, :]
-            ]
-            AP2_int = [
-                int(num) if num % 1 == 0 else np.round(num, 3) for num in AP2[i, :]
-            ]
-            # Create the formatted string for vcf_GT
-            buffer.write(
-                "\t".join(
-                    [
-                        f"{gt1}|{gt2}:{DS_s}:{AP1_s}:{AP2_s}"
-                        for gt1, gt2, DS_s, AP1_s, AP2_s in zip(
-                            GT1[i, :], GT2[i, :], DS_int, AP1_int, AP2_int
-                        )
-                    ]
-                )
-            )
-            buffer.write("\n")
+        AN = self.num_haplotypes
 
-        buffer.seek(0)
-        out_path.write_text(buffer.read())
+        with out_path.open("w") as fout:
+            # Write to file in chunks of 1000 variants
+            for start in range(0, sparse_probs.shape[0], 1000):
+                probs = sparse_probs[start : start + 1000, :].toarray()
+                variant_ids = all_variant_ids[start : start + 1000]
+
+                # load metrics
+                AP1 = probs[:, 0::2]
+                AP2 = probs[:, 1::2]
+                DS = AP1 + AP2
+                GT1 = (AP1 > 0.5).astype(int)
+                GT2 = (AP2 > 0.5).astype(int)
+                AC = np.sum(GT1 + GT2, axis=1)
+                AF = [
+                    int(ele) if ele % 1 == 0 else np.round(ele, 4) for ele in (AC / AN)
+                ]
+
+                # Write variant records
+                for i, idx in enumerate(variant_ids):
+                    chrom, pos, ref, alt = idx.split("-")
+                    vcf_INFO = f"AF={AF[i]};AC={AC[i]};AN={AN}"
+                    if i not in target_ids:
+                        vcf_INFO += ";IMP"
+                    fout.write(
+                        "\t".join(
+                            [
+                                chrom,
+                                pos,
+                                idx,
+                                ref,
+                                alt,
+                                ".\tPASS",
+                                vcf_INFO,
+                                "GT:DS:AP1:AP2\t",
+                            ]
+                        )
+                    )
+                    # Convert float numbers to integers if they are integers
+                    DS_int = [
+                        "{:.2f}".format(num).rstrip("0").rstrip(".")
+                        if num % 1 != 0
+                        else int(num)
+                        for num in DS[i, :]
+                    ]
+                    AP1_int = [
+                        "{:.2f}".format(num).rstrip("0").rstrip(".")
+                        if num % 1 != 0
+                        else int(num)
+                        for num in AP1[i, :]
+                    ]
+                    AP2_int = [
+                        "{:.2f}".format(num).rstrip("0").rstrip(".")
+                        if num % 1 != 0
+                        else int(num)
+                        for num in AP2[i, :]
+                    ]
+                    # Create the formatted string for vcf_GT
+                    fout.write(
+                        "\t".join(
+                            [
+                                f"{gt1}|{gt2}:{DS_s}:{AP1_s}:{AP2_s}"
+                                for gt1, gt2, DS_s, AP1_s, AP2_s in zip(
+                                    GT1[i, :], GT2[i, :], DS_int, AP1_int, AP2_int
+                                )
+                            ]
+                        )
+                    )
+                    fout.write("\n")
+
         self.compress(out_path)
         return out_path.with_suffix(".gz")
 

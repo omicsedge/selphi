@@ -6,13 +6,14 @@ import argparse
 import logging
 from datetime import datetime, timezone
 from tempfile import TemporaryDirectory
+from math import ceil
 from joblib import Parallel, delayed
 
 import numpy as np
 import cyvcf2
 
 from modules.imputation_lib import calculate_weights
-from modules.interpolation import interpolate_genotypes
+from modules.interpolation import Interpolator
 from modules.load_data import load_and_interpolate_genetic_map
 from modules.pbwt import get_pbwt_matches
 from modules.sparse_ref_panel import SparseReferencePanel
@@ -53,7 +54,7 @@ def selphi(
 
     # Load sparse reference panel
     ref_panel = SparseReferencePanel(
-        str(ref_base_path.with_suffix(".srp")), cache_size=4
+        str(ref_base_path.with_suffix(".srp")), cache_size=2
     )
 
     # Load target samples and variants
@@ -122,10 +123,9 @@ def selphi(
         desc=" [core] Calculating weights with HMM",
         ncols=75,
         bar_format="{desc}:\t\t\t\t\t{percentage:3.0f}% in {elapsed}",
-        colour="#808080",
     ):
-        ordered_weights = np.asarray(
-            Parallel(n_jobs=cores)(
+        ordered_weights = np.fromiter(
+            Parallel(n_jobs=cores, return_as="generator")(
                 delayed(calculate_weights)(
                     target_hap, chip_cM_coordinates, pbwt_result_path, expected_shape
                 )
@@ -135,16 +135,16 @@ def selphi(
         )
 
     # Interpolate genotypes
-    output_file = interpolate_genotypes(
+    interpolator = Interpolator(
         ref_panel,
         target_samples,
-        ordered_weights,
         wgs_idx,
         target_idx,
-        output_path,
         tmpdir,
         cores,
     )
+    output_file = interpolator.interpolate_genotypes(ordered_weights, output_path)
+
     logger.info(f"{timestamp()}: Saved imputed genotypes to {output_file}")
     logger.info(
         "===== Total time: %d seconds =====" % (datetime.now() - start_time).seconds
@@ -254,8 +254,6 @@ if __name__ == "__main__":
                     ref_base_path,
                 ],
                 check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
             )
             SparseReferencePanel(str(ref_base_path.with_suffix(".srp"))).from_bcf(
                 str(ref_source_path), threads=args.cores
@@ -265,14 +263,12 @@ if __name__ == "__main__":
                 f"xsqueezeit -x -Ov -f {ref_source_path} | "
                 f"{pbwt_path} -checkpoint 100000 -readVcfGT - -writeAll {ref_base_path}",
                 check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
                 shell=True,
             )
             SparseReferencePanel(str(ref_base_path.with_suffix(".srp"))).from_xsi(
                 str(ref_source_path), threads=args.cores
             )
-        logger.info(f"Reference panel files saved to {ref_base_path}")
+        logger.info(f"\n{timestamp()}: Reference panel files saved to {ref_base_path}")
         if not args.target:
             sys.exit(0)
 

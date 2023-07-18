@@ -159,24 +159,20 @@ class CompositePanelMaskFilter:
             ]
         )
 
-    def sparse_matrix(self) -> sparse.csc_matrix:
+    def sparse_matrix(self) -> sparse.coo_matrix:
         """Generate sparse matrix filter"""
         coordinates = self.coordinates_array()
         return sparse.coo_matrix(
             (
                 np.full_like(coordinates[:, 0], True, dtype=np.bool_),
-                ([coordinates[:, 0], coordinates[:, 1]]),
+                ([coordinates[:, 1], coordinates[:, 0]]),
             ),
-            shape=self.matches.shape,
+            shape=(self.matches.shape[1], self.matches.shape[0]),
             dtype=np.bool_,
-        ).tocsc()
+        )
 
-
-def form_haploid_ids_lists_NEW(
-    composite_: sparse.csc_matrix, is_single: bool
-) -> np.ndarray:
-    dtype = int if is_single else object
-    return np.array([row.indices for row in composite_.transpose()], dtype=dtype)
+    def haplotype_id_lists(self) -> np.ndarray:
+        return self.sparse_matrix().tolil().rows
 
 
 def run_hmm(
@@ -189,7 +185,7 @@ def run_hmm(
     Runs the forward and backward runs of the forward-backward algorithm,
         to get probabilities for imputation
     """
-    nHaps = np.array([row.size for row in ordered_hap_indices])
+    nHaps = np.array([len(row) for row in ordered_hap_indices])
     pRecomb_arr: np.ndarray = pRecomb(distances_cm, num_hid=num_hid) / nHaps
 
     matrix_ = setFwdValues_SPARSE(
@@ -216,7 +212,7 @@ def calculate_weights(
     Processing as one chunk (CHUNK_SIZE = chip_sites_n)
     """
     comp_matches_hybrid: sparse.csc_matrix = load_sparse_comp_matches_hybrid_npz(
-        *target_hap, npz_dir, shape, fl=25
+        *target_hap, npz_dir, shape
     )
     ref_haps_n, chip_sites_n = comp_matches_hybrid.shape
 
@@ -226,16 +222,13 @@ def calculate_weights(
     nc_thresh: np.ndarray = calculate_haploid_count_threshold_SPARSE(
         comp_matches_hybrid, haps_freqs_array_norm, chip_sites_n
     )
-    composite_: sparse.csc_matrix = CompositePanelMaskFilter(
+    ordered_hap_indices = CompositePanelMaskFilter(
         comp_matches_hybrid, haps_freqs_array_norm, nc_thresh, chip_sites_n
-    ).sparse_matrix()
+    ).haplotype_id_lists()
 
     del comp_matches_hybrid
     del haps_freqs_array_norm
-
-    ordered_hap_indices = form_haploid_ids_lists_NEW(composite_, nc_thresh.max() == 1)
     del nc_thresh
-    del composite_
 
     return run_hmm(
         chip_sites_n,

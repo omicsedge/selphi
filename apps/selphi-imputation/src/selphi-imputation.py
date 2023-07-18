@@ -16,11 +16,13 @@ import os, subprocess, dxpy, glob
 
 def get_ass_file_from_fileid(object_dnanexus, filename_extension, sep):
     names = object_dnanexus.name
-    index_query = dxpy.find_data_objects(classname="file", name=f"{names}{sep}{filename_extension}")
+    index_query = dxpy.find_data_objects(
+        classname="file", name=f"{names}{sep}{filename_extension}"
+    )
     index_object = next(index_query, None)
 
     if index_object is not None:
-        id_index = index_object['id']
+        id_index = index_object["id"]
         return dxpy.DXFile(id_index)
     else:
         print(f"No file found with name {names}{sep}{filename_extension}")
@@ -28,8 +30,20 @@ def get_ass_file_from_fileid(object_dnanexus, filename_extension, sep):
     return None
 
 
-@dxpy.entry_point('main')
-def main(refpanel, cores, match_length, target=None, ref_source_vcf=None, prepare_reference=None, map=None, outvcf=None, ref_source_xsi=None, pbwt_path=None, tmp_path=None):
+@dxpy.entry_point("main")
+def main(
+    refpanel,
+    cores,
+    match_length,
+    target=None,
+    ref_source_vcf=None,
+    prepare_reference=None,
+    map=None,
+    outvcf=None,
+    ref_source_xsi=None,
+    pbwt_path=None,
+    tmp_path=None,
+):
 
     project_id = dxpy.PROJECT_CONTEXT_ID  # Use the current project ID
 
@@ -48,7 +62,7 @@ def main(refpanel, cores, match_length, target=None, ref_source_vcf=None, prepar
 
     if ref_source_vcf is not None:
         dxpy.download_dxfile(ref_source_vcf.get_id(), "/ref_source_vcf")
-        ref_source_vcf_tbi = get_ass_file_from_fileid(ref_source_vcf,'tbi','.')
+        ref_source_vcf_tbi = get_ass_file_from_fileid(ref_source_vcf, "tbi", ".")
         if ref_source_vcf_tbi is not None:
             dxpy.download_dxfile(ref_source_vcf_tbi.get_id(), "/ref_source_vcf.tbi")
 
@@ -57,43 +71,47 @@ def main(refpanel, cores, match_length, target=None, ref_source_vcf=None, prepar
 
     if ref_source_xsi is not None:
         dxpy.download_dxfile(ref_source_xsi.get_id(), "/ref_source_xsi")
-        ref_source_xsi_bcf = get_ass_file_from_fileid(ref_source_xsi,'bcf','_var.')
-        ref_source_xsi_csi = get_ass_file_from_fileid(ref_source_xsi,'csi','_var.bcf.')
+        ref_source_xsi_bcf = get_ass_file_from_fileid(ref_source_xsi, "bcf", "_var.")
+        ref_source_xsi_csi = get_ass_file_from_fileid(
+            ref_source_xsi, "csi", "_var.bcf."
+        )
         dxpy.download_dxfile(ref_source_xsi_bcf.get_id(), "/ref_source_xsi_var.bcf")
         dxpy.download_dxfile(ref_source_xsi_csi.get_id(), "/ref_source_xsi_var.bcf.csi")
 
     # Fill in your application code here.
     # Load Docker image
-    _ = subprocess.check_output([
-        "docker load < /image.tar"
-    ], shell=True)
+    _ = subprocess.check_output(["docker load < /image.tar"], shell=True)
 
-    _ = subprocess.check_output([
-        "mkdir /reference"
-    ], shell=True)
+    _ = subprocess.check_output(["mkdir /reference"], shell=True)
 
-    _ = subprocess.check_output([
-        f"mkdir /output"
-    ],shell=True)
+    _ = subprocess.check_output([f"mkdir /output"], shell=True)
 
     refpanel_prefix_name = os.path.basename(refpanel)
     output_folder = os.path.dirname(refpanel)
 
     if prepare_reference is not None and ref_source_vcf is not None:
-        _ = subprocess.check_output([
-            f"docker run -v /:/data selphi --prepare_reference --ref_source_vcf /data/ref_source_vcf --refpanel /data/reference/{refpanel_prefix_name} --cores {cores}"
-        ], shell=True)
+        _ = subprocess.check_output(
+            [
+                f"docker run -v /:/data selphi --prepare_reference --ref_source_vcf /data/ref_source_vcf --refpanel /data/reference/{refpanel_prefix_name} --cores {cores}"
+            ],
+            shell=True,
+        )
 
     if prepare_reference is not None and ref_source_xsi is not None:
-        _ = subprocess.check_output([
-            f"docker run -v /:/data selphi --prepare_reference --ref_source_xsi /data/ref_source_xsi --refpanel /data/reference/{refpanel_prefix_name} --cores {cores}"
-        ], shell=True)
+        _ = subprocess.check_output(
+            [
+                f"docker run -v /:/data selphi --prepare_reference --ref_source_xsi /data/ref_source_xsi --refpanel /data/reference/{refpanel_prefix_name} --cores {cores}"
+            ],
+            shell=True,
+        )
 
     if prepare_reference is not None:
         results = glob.glob(f"/reference/*")
         references_file = []
         for reference in results:
-            file_obj = dxpy.upload_local_file(reference, project=project_id, folder=output_folder)
+            file_obj = dxpy.upload_local_file(
+                reference, project=project_id, folder=output_folder
+            )
             references_file.append(file_obj.get_id())
 
         output = {}
@@ -102,22 +120,30 @@ def main(refpanel, cores, match_length, target=None, ref_source_vcf=None, prepar
         return output
 
     else:
-        
+
         output_name = os.path.basename(outvcf)
         output_folder = os.path.dirname(outvcf)
 
         dir_name = os.path.dirname(refpanel)
-        for extension in ['.srp', '.pbwt', '.sites', '.samples']:
+        for extension in [".srp", ".pbwt", ".sites", ".samples"]:
             complete_name = os.path.basename(refpanel) + extension
-            file_obj = dxpy.find_one_data_object(classname="file", name=complete_name, folder=dir_name, project=project_id)
+            file_obj = dxpy.find_one_data_object(
+                classname="file",
+                name=complete_name,
+                folder=dir_name,
+                project=project_id,
+            )
             dxpy.download_dxfile(file_obj["id"], f"/reference/{complete_name}")
             if os.path.exists(f"/reference/{complete_name}"):
                 print(f"{complete_name} file downloaded successfully.")
             else:
                 print(f"{complete_name} file not found. Check the download process.")
-        _ = subprocess.check_output([
-            f"docker run -v /:/data selphi --target /data/target --refpanel /data/reference/{refpanel_prefix_name} --map /data/map --outvcf /data/output/{output_name} --cores {cores}"
-        ], shell=True)
+        _ = subprocess.check_output(
+            [
+                f"docker run -v /:/data selphi --target /data/target --refpanel /data/reference/{refpanel_prefix_name} --map /data/map --outvcf /data/output/{output_name} --cores {cores}"
+            ],
+            shell=True,
+        )
 
     # The following line fills in some basic dummy output and assumes
     # that you have created variables to represent your output with
@@ -138,5 +164,6 @@ def main(refpanel, cores, match_length, target=None, ref_source_vcf=None, prepar
     output["outvcf"] = [dxpy.dxlink(item) for item in vcf_file]
 
     return output
+
 
 dxpy.run()
