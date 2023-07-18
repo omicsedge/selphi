@@ -79,29 +79,12 @@ def load_sparse_comp_matches_hybrid_npz(
     sample_name: str, hap: int, npz_dir: Path, shape: Tuple[int], fl: int = 25
 ) -> sparse.csc_matrix:
     npz_path = npz_dir.joinpath(f"parallel_haploid_mat_{sample_name}_{hap}.npz")
-    x: sparse.csc_matrix = sparse.load_npz(npz_path).tocsc()
+    x: sparse.csc_matrix = sparse.load_npz(npz_path).tocoo()
     if x.shape != shape:
         raise IndexError(
             f"Sparse matrix for {sample_name}_{hap} is the wrong shape. "
             f"Expected shape: {shape}. Actual shape: {x.shape}"
         )
-    keep = np.vstack(
-        [
-            np.column_stack(
-                (
-                    np.full_like(x[:, i].data[-fl:], i),
-                    x[:, i].indices[np.argsort(x[:, i].data)[-fl:]],
-                )
-            )
-            for i in range(x.shape[1])
-        ]
-    )
-    mask = sparse.coo_matrix(
-        (np.full_like(keep[:, 0], True, dtype=np.bool_), (keep[:, 1], keep[:, 0])),
-        shape=x.shape,
-        dtype=np.bool_,
-    )
-    x = x.multiply(mask).tocoo()
 
     expanded = np.vstack(
         [_expand_match(row) for row in coo_to_array(x.row, x.col, x.data)]

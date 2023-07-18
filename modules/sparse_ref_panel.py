@@ -53,6 +53,8 @@ from joblib import Parallel, delayed
 
 import cyvcf2
 
+from .utils import tqdm_joblib
+
 
 class SparseReferencePanel:
     """Class for working with ref panels stored as sparse matrix"""
@@ -285,10 +287,16 @@ class SparseReferencePanel:
         with TemporaryDirectory() as tmpdir:
             hap_dir = os.path.join(tmpdir, "haplotypes")
             os.makedirs(hap_dir)
-            haps = Parallel(n_jobs=threads,)(
-                delayed(self._std_out_to_sparse)(command, chunk, hap_dir)
-                for chunk, command in enumerate(commands)
-            )
+            with tqdm_joblib(
+                total=len(commands),
+                desc="Saving haplotypes as sparse matrices",
+                ncols=75,
+                bar_format="{desc}:\t\t{percentage:3.0f}% in {elapsed}",
+            ):
+                haps = Parallel(n_jobs=threads,)(
+                    delayed(self._std_out_to_sparse)(command, chunk, hap_dir)
+                    for chunk, command in enumerate(commands)
+                )
             hap_counts = list(set(haps))
             assert len(hap_counts) == 1
 

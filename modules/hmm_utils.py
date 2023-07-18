@@ -35,7 +35,7 @@ def setFwdValues_SPARSE(
     pNoErr = 1 - pErr
 
     alpha = np.zeros((num_hid,), dtype=np.float64)
-    alpha[ordered_matches[0]] = 1 / ordered_matches[0].size
+    alpha[ordered_matches[0]] = 1 / len(ordered_matches[0])
 
     for m in range(1, num_obs):
         if m % chunk_compression == 0:
@@ -135,9 +135,9 @@ def setBwdValues_SPARSE(
 
     # create final weight matrix (Sparse)
     weight_matrix = sparse.lil_matrix((num_obs + 2, num_hid), dtype=np.float64)
-    weight_matrix[-1, ordered_matches[-1]] = 1 / ordered_matches[-1].size
-    weight_matrix[0, ordered_matches[0]] = 1 / ordered_matches[0].size
-    weight_matrix[1, ordered_matches[0]] = 1 / ordered_matches[0].size
+    weight_matrix[-1, ordered_matches[-1]] = 1 / len(ordered_matches[-1])
+    weight_matrix[0, ordered_matches[0]] = 1 / len(ordered_matches[0])
+    weight_matrix[1, ordered_matches[0]] = 1 / len(ordered_matches[0])
 
     pErr = 0.0001
     pNoErr = 1 - pErr
@@ -175,7 +175,7 @@ def setBwdValues_SPARSE(
 
         for fbi in range(forward_decomp_block.shape[0] - 1, -1, -1):
             temp_array = forward_decomp_block[fbi, :].copy()
-            temp_array[temp_array < 1 / num_hid] = 0
+            temp_array[temp_array < 1 / matches.size] = 0
             weight_matrix[aci + fbi, matches] = temp_array.copy()
 
     # Run Last iteration
@@ -202,7 +202,7 @@ def setBwdValues_SPARSE(
 
         # put values in the sparse matrix on the fly
         temp_array = forward_decomp_block[aci + 1, :].copy()
-        temp_array[temp_array < 1 / num_hid] = 0
+        temp_array[temp_array < 1 / matches.size] = 0
         weight_matrix[aci + 1, matches] = temp_array.copy()
 
     return weight_matrix.tocsr()
