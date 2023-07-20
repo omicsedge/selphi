@@ -29,7 +29,7 @@ static void TargetMatchArrayInit(TargetMatchArray * tma, int N, int M, int fl) {
   int i;
   MatchArray * ma;
   tma -> N = N;
-  tma -> hap_totals = myalloc(M * 1.05, int);
+  tma -> hap_totals = myalloc(M, int);
   for (i = 0; i < M; i++) tma -> hap_totals[i] = 0;
   tma -> matchArrays = arrayCreate(N, MatchArray);
   for (i = 0; i < N; i++) {
@@ -65,8 +65,8 @@ static SparseCsc * SparseCscCreate(int M, int N, int nnz) {
   csc -> N = N;
   csc -> nnz = nnz;
   if (nnz > 0) {
-    csc -> data = myalloc(nnz * 1.05, int);
-    csc -> indices = myalloc(nnz * 1.05, int);
+    csc -> data = myalloc(nnz, int);
+    csc -> indices = myalloc(nnz, int);
   }
   return csc;
 }
@@ -87,8 +87,8 @@ static void addMatch(int haplotype, int length, int var, TargetMatchArray * tma)
   MatchArray * ma = arrayp(tma -> matchArrays, var, MatchArray);
   int j = ma -> N - 1;
   if (ma -> N < ma -> fl) ma -> N++;
-  int * haplotypes = myalloc(ma -> N * 1.05, int);
-  int * lengths = myalloc(ma -> N * 1.05, int);
+  int * haplotypes = myalloc(ma -> N, int);
+  int * lengths = myalloc(ma -> N, int);
 
   while (j >= 0 && ma -> lengths[j] < length) {
     if (j + 1 < ma -> N) {
@@ -131,7 +131,7 @@ static SparseCsc * targetMatchesToCsc(TargetMatchArray * tma, int N, int M) {
   }
 
   int * indptr;
-  indptr = myalloc((N + 1) * 1.05, int);
+  indptr = myalloc(N + 1, int);
   for (i = 0; i < N; i++) {
     indptr[i] = nnz;
     nnz += arrayp(ftma -> matchArrays, i, MatchArray) -> N;
@@ -236,8 +236,6 @@ static void pbwtMatchTargets(PBWT * p, int minL, int nRefHaps) {
   int nVar = p -> N;
   int nAllHaps = u -> M;
   int nTargetHaps = nAllHaps - nRefHaps;
-  int rArrSize = nRefHaps * 1.05;
-  int tArrSize = nTargetHaps * 1.05;
   int * refHaps;
   int * targetHaps;
   printf(" [pbwt]: %d reference haplotypes, %d target haplotypes\n", nRefHaps, nTargetHaps);
@@ -252,8 +250,8 @@ static void pbwtMatchTargets(PBWT * p, int minL, int nRefHaps) {
       pbwtCursorForwardsReadAD(u, var);
       continue;
     }
-    refHaps = myalloc(rArrSize, int);
-    targetHaps = myalloc(tArrSize, int);
+    refHaps = myalloc(nRefHaps, int);
+    targetHaps = myalloc(nTargetHaps, int);
     for (hap = 0, rHap = 0, tHap = 0; hap < nAllHaps; hap++) {
       if (u -> a[hap] >= nRefHaps) {
         targetHaps[tHap] = hap;
@@ -267,7 +265,7 @@ static void pbwtMatchTargets(PBWT * p, int minL, int nRefHaps) {
       rHap = 0;
       tgt_idx = u -> a[targetHaps[tHap]] - nRefHaps;
       ib = targetHaps[tHap];
-      while (ib > refHaps[rHap]) rHap++;
+      while (ib > refHaps[rHap] && rHap < nRefHaps) rHap++;
       for (ir = rHap - 1, i0 = ib, dmin_ = 0; ir >= 0; --ir) {
         ia = refHaps[ir];
         for (id = i0; id > ia; --id)
