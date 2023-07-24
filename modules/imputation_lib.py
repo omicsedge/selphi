@@ -94,7 +94,7 @@ class CompositePanelMaskFilter:
         self.matches = matches
         self.matches_row = matches.tocsr()
         self.haps_freqs_array_norm = haps_freqs_array_norm
-        self.nc_thresh = np.clip(nc_thresh, 0, kept_matches)
+        self.nc_thresh = np.clip(nc_thresh, 1, kept_matches)
         self.CHUNK_SIZE = CHUNK_SIZE
 
     @staticmethod
