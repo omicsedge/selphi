@@ -94,11 +94,22 @@ def load_sparse_comp_matches_hybrid_npz(
     ).tocsc()
     x_lil: sparse.lil_matrix = x.tolil()
 
-    missing_counter = 0
-    for i in np.where(x.getnnz(axis=0) == 0)[0]:
+    # handle variants with no matches
+    missing: np.ndarray = np.where(x.getnnz(axis=0) == 0)[0]
+    assert missing.size < 15
+
+    if missing[0] == 0:
+        start = np.where(np.diff(missing) > 1)[0][0] + 1
+        # work backwards from first variant with a match
+        for i in missing[:start][::-1]:
+            x_lil[x[:, i + 1].indices, i] = x[:, i + 1].data + 1
+            x = x_lil.tocsc()
+    else:
+        start = 0
+
+    # work forwards, extending matches forward
+    for i in missing[start:]:
         x_lil[x[:, i - 1].indices, i] = x[:, i - 1].data + 1
         x = x_lil.tocsc()
-        missing_counter += 1
 
-    assert missing_counter < 15
     return x_lil.tocsc()
