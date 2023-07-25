@@ -180,13 +180,14 @@ def run_hmm(
     ordered_hap_indices: np.ndarray,
     distances_cm: np.ndarray,
     num_hid: int = 9000,
+    est_ne: int = 1000000,
 ) -> sparse.csr_matrix:
     """
     Runs the forward and backward runs of the forward-backward algorithm,
         to get probabilities for imputation
     """
     nHaps = np.array([len(row) for row in ordered_hap_indices])
-    pRecomb_arr: np.ndarray = pRecomb(distances_cm, num_hid=num_hid) / nHaps
+    pRecomb_arr: np.ndarray = pRecomb(distances_cm, num_hid=num_hid, ne=est_ne) / nHaps
 
     matrix_ = setFwdValues_SPARSE(
         chip_sites_n, ordered_hap_indices, pRecomb_arr, num_hid=num_hid
@@ -206,6 +207,7 @@ def calculate_weights(
     chip_cM_coordinates: np.ndarray,
     npz_dir: Path,
     shape: Tuple[int],
+    est_ne: int = 1000000,
 ) -> sparse.csr_matrix:
     """
     Load pbwt matches from npz and calculate weights for imputation
@@ -235,4 +237,5 @@ def calculate_weights(
         ordered_hap_indices,
         chip_cM_coordinates,
         num_hid=ref_haps_n,
+        est_ne=est_ne,
     )
