@@ -32,6 +32,7 @@ def selphi(
     pbwt_path: Path,
     tmpdir: Path,
     match_length: int = 5,
+    est_ne: int = 1000000,
     cores: int = 1,
 ):
     # Check if required files are available
@@ -127,7 +128,11 @@ def selphi(
         ordered_weights = np.fromiter(
             Parallel(n_jobs=cores, return_as="generator")(
                 delayed(calculate_weights)(
-                    target_hap, chip_cM_coordinates, pbwt_result_path, expected_shape
+                    target_hap,
+                    chip_cM_coordinates,
+                    pbwt_result_path,
+                    expected_shape,
+                    est_ne,
                 )
                 for target_hap in target_haps
             ),
@@ -195,7 +200,16 @@ if __name__ == "__main__":
         "--tmp_path", type=str, help="location to create temporary directory"
     )
     parser.add_argument(
-        "--match_length", type=int, default=5, help="minimum pbwt match length"
+        "--match_length",
+        type=int,
+        default=5,
+        help="minimum pbwt match length (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--est_ne",
+        type=int,
+        default=1000000,
+        help="Ne for calculating recombination probability (default: %(default)s)",
     )
     args = parser.parse_args()
     cmd = " \ \n".join([f"  --{k} {v}" for k, v in vars(args).items() if v is not None])
@@ -289,5 +303,6 @@ if __name__ == "__main__":
             pbwt_path=pbwt_path,
             tmpdir=Path(tempdir).resolve(),
             match_length=args.match_length,
+            est_ne=args.est_ne,
             cores=args.cores,
         )
