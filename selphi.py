@@ -6,7 +6,6 @@ import argparse
 import logging
 from datetime import datetime, timezone
 from tempfile import TemporaryDirectory
-from math import ceil
 from joblib import Parallel, delayed
 
 import numpy as np
@@ -118,28 +117,7 @@ def selphi(
         chip_BPs=chip_BPs,
     )
 
-    # Calculate HMM weights from matches
-    with tqdm_joblib(
-        total=len(target_haps),
-        desc=" [core] Calculating weights with HMM",
-        ncols=75,
-        bar_format="{desc}:\t\t\t\t\t{percentage:3.0f}% in {elapsed}",
-    ):
-        ordered_weights = np.fromiter(
-            Parallel(n_jobs=cores, return_as="generator")(
-                delayed(calculate_weights)(
-                    target_hap,
-                    chip_cM_coordinates,
-                    pbwt_result_path,
-                    expected_shape,
-                    est_ne,
-                )
-                for target_hap in target_haps
-            ),
-            dtype=object,
-        )
-
-    # Interpolate genotypes
+    # set up interpolation intervals
     interpolator = Interpolator(
         ref_panel,
         target_samples,
@@ -148,7 +126,29 @@ def selphi(
         tmpdir,
         cores,
     )
-    output_file = interpolator.interpolate_genotypes(ordered_weights, output_path)
+
+    # Calculate HMM weights from matches
+    with tqdm_joblib(
+        total=len(target_haps),
+        desc=" [core] Calculating weights with HMM",
+        ncols=75,
+        bar_format="{desc}:\t\t\t\t\t{percentage:3.0f}% in {elapsed}",
+    ):
+        _ = Parallel(n_jobs=cores)(
+            delayed(calculate_weights)(
+                target_hap,
+                chip_cM_coordinates,
+                pbwt_result_path,
+                expected_shape,
+                tmpdir.joinpath("weights"),
+                interpolator.breakpoints,
+                est_ne,
+            )
+            for target_hap in target_haps
+        )
+
+    # Interpolate genotypes
+    output_file = interpolator.interpolate_genotypes(output_path)
 
     logger.info(f"{timestamp()}: Saved imputed genotypes to {output_file}")
     logger.info(

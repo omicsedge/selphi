@@ -207,8 +207,10 @@ def calculate_weights(
     chip_cM_coordinates: np.ndarray,
     npz_dir: Path,
     shape: Tuple[int],
+    output_dir: Path,
+    output_breaks: List[Tuple[int]],
     est_ne: int = 1000000,
-) -> sparse.csr_matrix:
+) -> None:
     """
     Load pbwt matches from npz and calculate weights for imputation
     Processing as one chunk (CHUNK_SIZE = chip_sites_n)
@@ -232,10 +234,18 @@ def calculate_weights(
     del haps_freqs_array_norm
     del nc_thresh
 
-    return run_hmm(
+    weight_matrix = run_hmm(
         chip_sites_n,
         ordered_hap_indices,
         chip_cM_coordinates,
         num_hid=ref_haps_n,
         est_ne=est_ne,
     )
+
+    del ordered_hap_indices
+
+    for start, stop in output_breaks:
+        sparse.save_npz(
+            output_dir.joinpath(str(start), f"{target_hap[0]}_{target_hap[1]}.npz"),
+            weight_matrix[start:stop, :],
+        )
