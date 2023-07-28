@@ -320,7 +320,7 @@ class SparseReferencePanel:
     def from_xsi(
         self,
         xsi_path: str,
-        chunk_size: int = 10**4,
+        chunk_size: int = 10 ** 4,
         threads: int = 1,
         replace_file: bool = False,
     ):
@@ -356,7 +356,7 @@ class SparseReferencePanel:
     def from_bcf(
         self,
         bcf_path: str,
-        chunk_size: int = 10**4,
+        chunk_size: int = 10 ** 4,
         threads: int = 1,
         replace_file: bool = False,
     ):
