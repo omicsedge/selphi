@@ -92,6 +92,8 @@ def load_sparse_comp_matches_hybrid_npz(
     x = sparse.coo_matrix(
         (expanded[:, 2], (expanded[:, 0], expanded[:, 1])), shape=x.shape
     ).tocsc()
+    del expanded
+
     x_lil: sparse.lil_matrix = x.tolil()
 
     # handle variants with no matches
@@ -111,5 +113,5 @@ def load_sparse_comp_matches_hybrid_npz(
     for i in missing[start:]:
         x_lil[x[:, i - 1].indices, i] = x[:, i - 1].data + 1
         x = x_lil.tocsc()
-
+    del x
     return x_lil.tocsc()
