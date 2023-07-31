@@ -108,14 +108,17 @@ def selphi(
         cores,
     )
     expected_shape = (ref_panel.n_haps, wgs_idx.size)
+    del wgs_filter
+    del target_filter
 
     # Get coordinates for overlapping variants
-    chip_variants = target_markers[np.sort(target_idx)]
-    chip_BPs = [variant[1] for variant in chip_variants]
+    chip_BPs = [variant[1] for variant in target_markers[np.sort(target_idx)]]
     chip_cM_coordinates: np.ndarray = load_and_interpolate_genetic_map(
         genetic_map_path=genetic_map_path,
         chip_BPs=chip_BPs,
     )
+    del target_markers
+    del chip_BPs
 
     # set up interpolation intervals
     interpolator = Interpolator(
@@ -146,6 +149,7 @@ def selphi(
             )
             for target_hap in target_haps
         )
+    del chip_cM_coordinates
 
     # Interpolate genotypes
     output_file = interpolator.interpolate_genotypes(output_path)

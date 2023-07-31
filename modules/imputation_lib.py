@@ -24,12 +24,10 @@ def calculate_haploid_frequencies_SPARSE(
         raise ValueError(
             "tmin and tmax parameters must be between 0 and 1, and tmax has to be greater than tmin"
         )
-    data: sparse.csc_matrix = comp_matches_hybrid.copy()
-    data.eliminate_zeros()
     freqs: np.ndarray = np.vstack(
         [
-            data[:, start : start + CHUNK_SIZE].getnnz(axis=1)
-            for start in range(0, data.shape[1], CHUNK_SIZE)
+            comp_matches_hybrid[:, start : start + CHUNK_SIZE].getnnz(axis=1)
+            for start in range(0, comp_matches_hybrid.shape[1], CHUNK_SIZE)
         ]
     )
     rmin: np.ndarray = np.amin(freqs, axis=1)
@@ -91,7 +89,6 @@ class CompositePanelMaskFilter:
         CHUNK_SIZE: int,
         kept_matches: int = 50,
     ):
-        self.matches = matches
         self.matches_row = matches.tocsr()
         self.haps_freqs_array_norm = haps_freqs_array_norm
         self.nc_thresh = np.clip(nc_thresh, 1, kept_matches)
@@ -167,7 +164,7 @@ class CompositePanelMaskFilter:
                 np.full_like(coordinates[:, 0], True, dtype=np.bool_),
                 ([coordinates[:, 1], coordinates[:, 0]]),
             ),
-            shape=(self.matches.shape[1], self.matches.shape[0]),
+            shape=(self.matches_row.shape[1], self.matches_row.shape[0]),
             dtype=np.bool_,
         )
 
@@ -218,16 +215,15 @@ def calculate_weights(
     comp_matches_hybrid: sparse.csc_matrix = load_sparse_comp_matches_hybrid_npz(
         *target_hap, npz_dir, shape
     )
-    ref_haps_n, chip_sites_n = comp_matches_hybrid.shape
 
     haps_freqs_array_norm: np.ndarray = calculate_haploid_frequencies_SPARSE(
-        comp_matches_hybrid, chip_sites_n
+        comp_matches_hybrid, shape[1]
     )
     nc_thresh: np.ndarray = calculate_haploid_count_threshold_SPARSE(
-        comp_matches_hybrid, haps_freqs_array_norm, chip_sites_n
+        comp_matches_hybrid, haps_freqs_array_norm, shape[1]
     )
     ordered_hap_indices = CompositePanelMaskFilter(
-        comp_matches_hybrid, haps_freqs_array_norm, nc_thresh, chip_sites_n
+        comp_matches_hybrid, haps_freqs_array_norm, nc_thresh, shape[1]
     ).haplotype_id_lists()
 
     del comp_matches_hybrid
@@ -235,10 +231,10 @@ def calculate_weights(
     del nc_thresh
 
     weight_matrix = run_hmm(
-        chip_sites_n,
+        shape[1],
         ordered_hap_indices,
         chip_cM_coordinates,
-        num_hid=ref_haps_n,
+        num_hid=shape[0],
         est_ne=est_ne,
     )
 
