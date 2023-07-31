@@ -60,38 +60,31 @@ def load_and_interpolate_genetic_map(
 
 
 @njit
-def _expand_match(row: np.ndarray) -> np.ndarray:
+def _expand_match(row: Tuple[int]) -> np.ndarray:
     return np.vstack(
-        (
-            np.full(row[2], row[0]),
-            np.arange(row[1], row[1] + row[2]),
-            np.full(row[2], row[2]),
-        )
+        (np.arange(row[0], sum(row)), np.full(row[1], row[1]))
     ).T
-
-
-@njit
-def coo_to_array(rows: np.ndarray, columns: np.ndarray, data: np.ndarray) -> np.ndarray:
-    return np.vstack((rows, columns, data)).T
-
 
 def load_sparse_comp_matches_hybrid_npz(
     sample_name: str, hap: int, npz_dir: Path, shape: Tuple[int], fl: int = 25
 ) -> sparse.csc_matrix:
     npz_path = npz_dir.joinpath(f"parallel_haploid_mat_{sample_name}_{hap}.npz")
-    x: sparse.csc_matrix = sparse.load_npz(npz_path).tocoo()
+    x: sparse.csr_matrix = sparse.load_npz(npz_path).tocsr()
     if x.shape != shape:
         raise IndexError(
             f"Sparse matrix for {sample_name}_{hap} is the wrong shape. "
             f"Expected shape: {shape}. Actual shape: {x.shape}"
         )
 
+    indptr = np.append([0], np.cumsum(x.sum(axis=1)))
+
     expanded = np.vstack(
-        [_expand_match(row) for row in coo_to_array(x.row, x.col, x.data)]
+        [_expand_match(row) for row in zip(x.indices, x.data)]
     )
-    x = sparse.coo_matrix(
-        (expanded[:, 2], (expanded[:, 0], expanded[:, 1])), shape=x.shape
+    x = sparse.csr_matrix(
+        (expanded[:, 1], expanded[:, 0], indptr), shape=x.shape
     ).tocsc()
+    del indptr
     del expanded
 
     x_lil: sparse.lil_matrix = x.tolil()
