@@ -1,4 +1,4 @@
-from typing import Iterator, List, Tuple
+from typing import List, Tuple
 from pathlib import Path
 from scipy import sparse
 import numpy as np
@@ -69,7 +69,7 @@ def calculate_haploid_count_threshold_SPARSE(
             np.where(X.getcol(index).data >= final_thresh[index], 1, 0).sum()
             for index in range(X.shape[1])
         ]
-    )
+    ).copy()
 
 
 class CompositePanelMaskFilter:
@@ -94,10 +94,6 @@ class CompositePanelMaskFilter:
         self.nc_thresh = np.clip(nc_thresh, 1, kept_matches)
         self.CHUNK_SIZE = CHUNK_SIZE
 
-    @staticmethod
-    def stack(arrays: List[np.ndarray]) -> np.ndarray:
-        return np.concatenate(arrays, axis=0)
-
     def _normalize_matches(self) -> sparse.csc_matrix:
         """Multiply matches by normalized haplotype frequencies"""
         return sparse.hstack(
@@ -109,67 +105,55 @@ class CompositePanelMaskFilter:
             ]
         ).tocsc()
 
-    def _best_matches(self) -> Iterator[np.ndarray]:
+    def _best_matches(self) -> List[np.ndarray]:
         """Generate all best matches at all variants"""
-        return (
-            row.indices[np.argsort(row.data)[::-1][: self.nc_thresh[chip_index]]]
+        return [
+            row.indices[np.argsort(row.data)[::-1][: self.nc_thresh[chip_index]]].copy()
             for chip_index, row in enumerate(self._normalize_matches().transpose())
-        )
-
-    def _get_variant_coordinates(
-        self, chip_index: int, best_matches: np.ndarray
-    ) -> np.ndarray:
-        """Get coordinates to keep for a variant"""
-        subset: sparse.coo_matrix = self.matches_row[best_matches, :].tocoo()
-        cols_inds = subset.col
-        stepsize = 1
-        breakpoints: np.ndarray = np.where(np.diff(cols_inds) != stepsize)[0]
-        intervals: np.ndarray = np.row_stack(
-            (
-                subset.row[np.append([0], breakpoints + 1)],
-                cols_inds[np.append([0], breakpoints + 1)],
-                cols_inds[np.append(breakpoints, -1)],
-            )
-        )
-        selected: np.ndarray = intervals[
-            :,
-            np.intersect1d(
-                np.where(intervals[1, :] < chip_index + 1),
-                np.where(intervals[2, :] >= chip_index),
-            ),
         ]
-        return np.vstack(
-            (
-                np.repeat(
-                    best_matches[selected[0, :]], selected[2, :] - selected[1, :] + 1
-                ),
-                np.concatenate([np.arange(row[1], row[2] + 1) for row in selected.T]),
-            )
-        ).T
 
-    def coordinates_array(self) -> np.ndarray:
-        """Generate 2d array of coordinates to keep"""
-        return self.stack(
+    def _expand_matches(
+        self, keep: np.ndarray, hap: int, counts: np.ndarray
+    ) -> np.ndarray:
+        """Get variants to keep for a haplotype"""
+        row = self.matches_row[hap].indices
+        var_inds = np.hstack(
             [
-                self._get_variant_coordinates(*match)
-                for match in enumerate(self._best_matches())
+                run
+                for run in np.split(row, np.where(np.diff(row) != 1)[0] + 1)
+                if (np.less_equal(run[0], keep) & np.less_equal(keep, run[-1])).any()
             ]
         )
+        counts[hap] = var_inds.size
+        return var_inds
 
-    def sparse_matrix(self) -> sparse.coo_matrix:
-        """Generate sparse matrix filter"""
-        coordinates = self.coordinates_array()
-        return sparse.coo_matrix(
+    def sparse_matrix(self) -> sparse.csr_matrix:
+        best_matches = self._best_matches()
+        indptr = np.append([0], np.cumsum([len(matches) for matches in best_matches]))
+        matrix = sparse.csc_matrix(
             (
-                np.full_like(coordinates[:, 0], True, dtype=np.bool_),
-                ([coordinates[:, 1], coordinates[:, 0]]),
+                np.full(indptr[-1], True, dtype=np.bool_),
+                np.hstack(best_matches),
+                indptr,
             ),
-            shape=(self.matches_row.shape[1], self.matches_row.shape[0]),
-            dtype=np.bool_,
+            shape=self.matches_row.shape,
+        ).tocsr()
+        del best_matches
+        counts = np.zeros(self.matches_row.shape[0], dtype=int)
+        indices = np.hstack(
+            [
+                self._expand_matches(matrix[hap].indices, hap, counts)
+                for hap in np.where(matrix.getnnz(axis=1) > 0)[0]
+            ]
         )
+        indptr = np.append([0], np.cumsum(counts))
+        return sparse.csr_matrix(
+            (np.full(indptr[-1], True, dtype=np.bool_), indices, indptr),
+            shape=self.matches_row.shape,
+        ).transpose()
 
     def haplotype_id_lists(self) -> np.ndarray:
-        return self.sparse_matrix().tolil().rows
+        return self.sparse_matrix().tolil().rows.copy()
 
 
 def run_hmm(
@@ -226,10 +210,6 @@ def calculate_weights(
         comp_matches_hybrid, haps_freqs_array_norm, nc_thresh, shape[1]
     ).haplotype_id_lists()
 
-    del comp_matches_hybrid
-    del haps_freqs_array_norm
-    del nc_thresh
-
     weight_matrix = run_hmm(
         shape[1],
         ordered_hap_indices,
@@ -237,8 +217,6 @@ def calculate_weights(
         num_hid=shape[0],
         est_ne=est_ne,
     )
-
-    del ordered_hap_indices
 
     for start, stop in output_breaks:
         sparse.save_npz(

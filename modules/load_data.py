@@ -1,5 +1,6 @@
 from typing import List, Tuple
 from pathlib import Path
+from warnings import filterwarnings
 
 import pandas as pd
 import numpy as np
@@ -12,6 +13,8 @@ from tqdm import tqdm
 #            GLOBAL DATA             #
 #                                    #
 ######################################
+
+filterwarnings("ignore", category=sparse.SparseEfficiencyWarning)
 
 
 def load_and_interpolate_genetic_map(
@@ -65,7 +68,7 @@ def _expand_match(row: Tuple[int]) -> np.ndarray:
 
 
 def load_sparse_comp_matches_hybrid_npz(
-    sample_name: str, hap: int, npz_dir: Path, shape: Tuple[int], fl: int = 25
+    sample_name: str, hap: int, npz_dir: Path, shape: Tuple[int]
 ) -> sparse.csc_matrix:
     npz_path = npz_dir.joinpath(f"parallel_haploid_mat_{sample_name}_{hap}.npz")
     x: sparse.csr_matrix = sparse.load_npz(npz_path).tocsr()
@@ -76,15 +79,10 @@ def load_sparse_comp_matches_hybrid_npz(
         )
 
     indptr = np.append([0], np.cumsum(x.sum(axis=1)))
-
     expanded = np.vstack([_expand_match(row) for row in zip(x.indices, x.data)])
     x = sparse.csr_matrix(
         (expanded[:, 1], expanded[:, 0], indptr), shape=x.shape
     ).tocsc()
-    del indptr
-    del expanded
-
-    x_lil: sparse.lil_matrix = x.tolil()
 
     # handle variants with no matches
     missing: np.ndarray = np.where(x.getnnz(axis=0) == 0)[0]
@@ -94,14 +92,12 @@ def load_sparse_comp_matches_hybrid_npz(
         start = np.where(np.diff(missing) > 1)[0][0] + 1
         # work backwards from first variant with a match
         for i in missing[:start][::-1]:
-            x_lil[x[:, i + 1].indices, i] = x[:, i + 1].data + 1
-            x = x_lil.tocsc()
+            x[x[:, i + 1].indices, i] = x[:, i + 1].data + 1
     else:
         start = 0
 
     # work forwards, extending matches forward
     for i in missing[start:]:
-        x_lil[x[:, i - 1].indices, i] = x[:, i - 1].data + 1
-        x = x_lil.tocsc()
-    del x
-    return x_lil.tocsc()
+        x[x[:, i - 1].indices, i] = x[:, i - 1].data + 1
+
+    return x
