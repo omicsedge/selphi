@@ -6,7 +6,6 @@ import argparse
 import logging
 from datetime import datetime, timezone
 from tempfile import TemporaryDirectory
-from math import ceil
 from joblib import Parallel, delayed
 
 import numpy as np
@@ -109,13 +108,26 @@ def selphi(
         cores,
     )
     expected_shape = (ref_panel.n_haps, wgs_idx.size)
+    del wgs_filter
+    del target_filter
 
     # Get coordinates for overlapping variants
-    chip_variants = target_markers[np.sort(target_idx)]
-    chip_BPs = [variant[1] for variant in chip_variants]
+    chip_BPs = [variant[1] for variant in target_markers[np.sort(target_idx)]]
     chip_cM_coordinates: np.ndarray = load_and_interpolate_genetic_map(
         genetic_map_path=genetic_map_path,
         chip_BPs=chip_BPs,
+    )
+    del target_markers
+    del chip_BPs
+
+    # set up interpolation intervals
+    interpolator = Interpolator(
+        ref_panel,
+        target_samples,
+        wgs_idx,
+        target_idx,
+        tmpdir,
+        cores,
     )
 
     # Calculate HMM weights from matches
@@ -125,30 +137,22 @@ def selphi(
         ncols=75,
         bar_format="{desc}:\t\t\t\t\t{percentage:3.0f}% in {elapsed}",
     ):
-        ordered_weights = np.fromiter(
-            Parallel(n_jobs=cores, return_as="generator")(
-                delayed(calculate_weights)(
-                    target_hap,
-                    chip_cM_coordinates,
-                    pbwt_result_path,
-                    expected_shape,
-                    est_ne,
-                )
-                for target_hap in target_haps
-            ),
-            dtype=object,
+        _ = Parallel(n_jobs=cores)(
+            delayed(calculate_weights)(
+                target_hap,
+                chip_cM_coordinates,
+                pbwt_result_path,
+                expected_shape,
+                tmpdir.joinpath("weights"),
+                interpolator.breakpoints,
+                est_ne,
+            )
+            for target_hap in target_haps
         )
+    del chip_cM_coordinates
 
     # Interpolate genotypes
-    interpolator = Interpolator(
-        ref_panel,
-        target_samples,
-        wgs_idx,
-        target_idx,
-        tmpdir,
-        cores,
-    )
-    output_file = interpolator.interpolate_genotypes(ordered_weights, output_path)
+    output_file = interpolator.interpolate_genotypes(output_path)
 
     logger.info(f"{timestamp()}: Saved imputed genotypes to {output_file}")
     logger.info(

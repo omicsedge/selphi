@@ -114,7 +114,8 @@ def get_pbwt_matches(
         return tmpdir
 
     # Run pbwt in parallel if multiple samples and multiple cores
-    batch_size = ceil(n_samples / cores)
+    # limit batch size to 50 to limit memory use
+    batch_size = ceil(n_samples / (ceil(n_samples / 50 / cores) * cores))
     # Filter reference pbwt so we only have to do it once
     logger.info(
         f"{timestamp()}: Matching {n_samples} sample(s) to reference panel "
