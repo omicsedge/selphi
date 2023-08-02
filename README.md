@@ -43,6 +43,7 @@ Running the container without specifying any command will display the help messa
 - `--pbwt_path PBWT_PATH`: Path to the PBWT library.
 - `--tmp_path TMP_PATH`: Location to create a temporary directory.
 - `--match_length MATCH_LENGTH`: Minimum PBWT match length.
+- `--est_ne`: Estimated population size (default: 1000000).
 
 
 ### Prepare reference panel
