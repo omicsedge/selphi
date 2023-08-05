@@ -64,7 +64,7 @@ def load_and_interpolate_genetic_map(
 
 @njit
 def _expand_match(row: Tuple[int]) -> np.ndarray:
-    return np.vstack((np.arange(row[0], sum(row)), np.full(row[1], row[1]))).T
+    return np.vstack((np.arange(row[0], sum(row)), np.full(row[1], row[1])))
 
 
 def load_sparse_comp_matches_hybrid_npz(
@@ -79,9 +79,9 @@ def load_sparse_comp_matches_hybrid_npz(
         )
 
     indptr = np.append([0], np.cumsum(x.sum(axis=1)))
-    expanded = np.vstack([_expand_match(row) for row in zip(x.indices, x.data)])
+    expanded = np.hstack([_expand_match(row) for row in zip(x.indices, x.data)])
     x = sparse.csr_matrix(
-        (expanded[:, 1], expanded[:, 0], indptr), shape=x.shape
+        (expanded[1, :], expanded[0, :], indptr), shape=x.shape
     ).tocsc()
 
     # handle variants with no matches

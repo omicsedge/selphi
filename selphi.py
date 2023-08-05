@@ -112,13 +112,11 @@ def selphi(
     del target_filter
 
     # Get coordinates for overlapping variants
-    chip_BPs = [variant[1] for variant in target_markers[np.sort(target_idx)]]
     chip_cM_coordinates: np.ndarray = load_and_interpolate_genetic_map(
         genetic_map_path=genetic_map_path,
-        chip_BPs=chip_BPs,
+        chip_BPs=[variant[1] for variant in target_markers[np.sort(target_idx)]],
     )
     del target_markers
-    del chip_BPs
 
     # set up interpolation intervals
     interpolator = Interpolator(

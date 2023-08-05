@@ -28,13 +28,13 @@ def setFwdValues_SPARSE(
     # Create compressed forward matrix
     chunk_compression = 30
     matrix_ = sparse.lil_matrix(
-        ((num_obs - 1) // chunk_compression, num_hid), dtype=np.float64
+        ((num_obs - 1) // chunk_compression, num_hid), dtype=np.float_
     )
 
     pErr = 0.0001
     pNoErr = 1 - pErr
 
-    alpha = np.zeros((num_hid,), dtype=np.float64)
+    alpha = np.zeros((num_hid,), dtype=np.float_)
     alpha[ordered_matches[0]] = 1 / len(ordered_matches[0])
 
     for m in range(1, num_obs):
@@ -43,7 +43,7 @@ def setFwdValues_SPARSE(
 
         alpha[ordered_matches[m]] += pRecomb_arr[m]
 
-        em = np.full((num_hid,), pErr, dtype=np.float64)
+        em = np.full((num_hid,), pErr, dtype=np.float_)
         em[ordered_matches[m]] = pNoErr
         alpha = em * alpha
 
@@ -69,7 +69,7 @@ def run_forward_block(
         end = num_obs - aci
 
     num_hid = init_probs.shape[1]
-    alpha = np.zeros((end, num_hid), dtype=np.float64)
+    alpha = np.zeros((end, num_hid), dtype=np.float_)
     alpha[0, :] = init_probs
 
     pErr = 0.0001
@@ -78,11 +78,11 @@ def run_forward_block(
     for m in range(end - 1):
         aci_ = m + aci
 
-        shift = np.zeros((num_hid,), dtype=np.float64)
+        shift = np.zeros((num_hid,), dtype=np.float_)
         shift[ordered_matches_matrix[aci_, : nHaps[aci_]]] = pRecomb_arr[aci_]
 
         em = np.full(  # maybe no need to cr8 an array, just use pErr
-            (num_hid,), pErr, dtype=np.float64
+            (num_hid,), pErr, dtype=np.float_
         )
         em[ordered_matches_matrix[aci_, : nHaps[aci_]]] = pNoErr
 
@@ -109,7 +109,7 @@ def run_backward_calc(
         beta[ordered_matches_matrix[aci_, : nHaps[aci_]]] += pRecomb_arr[aci_]
         row = forward_decomp_block[fbi + 1, :] * beta
 
-        em = np.full((forward_decomp_block.shape[1],), pErr, dtype=np.float64)
+        em = np.full((forward_decomp_block.shape[1],), pErr, dtype=np.float_)
         em[ordered_matches_matrix[aci_ - 1, : nHaps[aci_ - 1]]] = pNoErr
         beta[:] = beta * em
 
@@ -130,11 +130,11 @@ def setBwdValues_SPARSE(
     chunk_compression = 30
     # reduce to only matching haplotypes
     matches = np.unique(matrix_.tocoo().col)
-    trans_ = np.zeros(num_hid, dtype=np.int32)
+    trans_ = np.zeros(num_hid, dtype=np.int_)
     trans_[matches] = np.arange(matches.size)
 
     # create final weight matrix (Sparse)
-    weight_matrix = sparse.lil_matrix((num_obs + 2, num_hid), dtype=np.float64)
+    weight_matrix = sparse.lil_matrix((num_obs + 2, num_hid), dtype=np.float_)
     weight_matrix[-1, ordered_matches[-1]] = 1 / len(ordered_matches[-1])
     weight_matrix[0, ordered_matches[0]] = 1 / len(ordered_matches[0])
     weight_matrix[1, ordered_matches[0]] = 1 / len(ordered_matches[0])
@@ -144,12 +144,12 @@ def setBwdValues_SPARSE(
 
     # Loop over the matrix_ from back to front
     # rci for reverse compressed index
-    ordered_matches_matrix = np.zeros((num_obs, nHaps.max()), dtype=np.int32)
+    ordered_matches_matrix = np.zeros((num_obs, nHaps.max()), dtype=np.int_)
     for c in range(num_obs):
         ordered_matches_matrix[c, : nHaps[c]] = trans_[ordered_matches[c]]
 
     matrix__ = matrix_[:, matches]
-    beta = np.full((matches.size,), 1 / nHaps[-1], dtype=np.float64)
+    beta = np.full((matches.size,), 1 / nHaps[-1], dtype=np.float_)
 
     for rci in range(matrix__.shape[0] - 1, -1, -1):
         aci = (rci + 1) * chunk_compression  # aci for actual_chip_index
@@ -194,7 +194,7 @@ def setBwdValues_SPARSE(
         beta[ordered_matches_matrix[aci, : nHaps[aci]]] += pRecomb_arr[aci]
         row = forward_decomp_block[aci + 1, :] * beta
 
-        em = np.full((forward_decomp_block.shape[1],), pErr, dtype=np.float64)
+        em = np.full((forward_decomp_block.shape[1],), pErr, dtype=np.float_)
         em[ordered_matches_matrix[aci - 1, : nHaps[aci - 1]]] = pNoErr
         beta[:] = beta * em
 
