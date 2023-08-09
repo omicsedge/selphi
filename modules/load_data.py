@@ -69,7 +69,7 @@ def _expand_match(row: Tuple[int]) -> np.ndarray:
 
 def load_sparse_comp_matches_hybrid_npz(
     sample_name: str, hap: int, npz_dir: Path, shape: Tuple[int]
-) -> sparse.csc_matrix:
+) -> sparse.csr_matrix:
     npz_path = npz_dir.joinpath(f"parallel_haploid_mat_{sample_name}_{hap}.npz")
     x: sparse.csr_matrix = sparse.load_npz(npz_path).tocsr()
     if x.shape != shape:
@@ -100,4 +100,4 @@ def load_sparse_comp_matches_hybrid_npz(
     for i in missing[start:]:
         x[x[:, i - 1].indices, i] = x[:, i - 1].data + 1
 
-    return x
+    return x.tocsr()

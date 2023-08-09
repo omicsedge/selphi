@@ -26,11 +26,15 @@ class Interpolator:
     ):
         self.ref_haplotypes = ref_haplotypes
         self.target_samples = target_samples
+
         ref_order = np.argsort(wgs_idx)
         self.wgs_idx = wgs_idx[ref_order]
         self.target_idx = target_idx[ref_order]
+        del ref_order
+
         self.tmpdir = tmpdir
         self.threads = threads
+
         self.chunk_size = ceil(
             (self.wgs_idx.size + 1) / max(ref_haplotypes.n_chunks // 10, 1)
         )
@@ -51,6 +55,7 @@ class Interpolator:
             for start in range(0, len(self.intervals), self.chunk_size)
         ]
         self.breakpoints = [(chunk[0][0], chunk[-1][1] + 1) for chunk in self.chunks]
+
         for start, _ in self.breakpoints:
             tmpdir.joinpath("weights", str(start)).mkdir(parents=True, exist_ok=True)
         self.writer = VcfWriter(
@@ -148,6 +153,7 @@ class Interpolator:
                 for index_pair in index_pairs
             ]
         )
+        del ordered_weights
         start = self.original_ref_indices[start_idx]
         stop = self.original_ref_indices[index_pairs[-1][1]]
         in_target = (
