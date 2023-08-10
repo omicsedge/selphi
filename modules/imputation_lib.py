@@ -8,108 +8,64 @@ from modules.load_data import load_sparse_comp_matches_hybrid_npz
 from modules.utils import get_std
 
 
-def calculate_haploid_frequencies_SPARSE(
-    comp_matches_hybrid: sparse.csc_matrix,  # Match length where there is match length else 0
-    CHUNK_SIZE: int,
-    tmin: float = 0.1,
-    tmax: float = 1,
-) -> np.ndarray:
-    """
-    First, calculates what is the number of matches for each chip variant in the new composite ref panel
-    Second, normalizes the results linearly between `tmin` and `tmax`,
-        yielding a useful multiplicative coefficient which scale down ref haploids
-            that have less total matches with the test sample
-    """
-    if not (0 <= tmin < tmax <= 1):
-        raise ValueError(
-            "tmin and tmax parameters must be between 0 and 1, and tmax has to be greater than tmin"
-        )
-    freqs: np.ndarray = np.vstack(
-        [
-            comp_matches_hybrid[:, start : start + CHUNK_SIZE].getnnz(axis=1)
-            for start in range(0, comp_matches_hybrid.shape[1], CHUNK_SIZE)
-        ]
-    )
-    rmin: np.ndarray = np.amin(freqs, axis=1)
-    rmax: np.ndarray = np.amax(freqs, axis=1)
-    return ((freqs - rmin) / (rmax - rmin)) * (tmax - tmin) + tmin
-
-
-def calculate_haploid_count_threshold_SPARSE(
-    comp_matches_hybrid: sparse.csc_matrix,
-    haps_freqs_array_norm: np.ndarray,
-    CHUNK_SIZE: int,
-) -> np.ndarray:
-    """
-    1. calculates coefficients:
-        - `std_thresh`
-        An affine transformed (squeezed, stretched, moved) power function (`get_std`),
-            which calculates a coefficient for each variant,
-                from the average matches with the new composite ref panel
-        - `lengthos`
-        - standard deviations
-    2. and uses them to calculate a final number of haploids taken for each chip index,
-        using a threshold based on
-            the number of total matches between the input sample and a reference haploid
-    """
-    averages = comp_matches_hybrid.sum(axis=0) / comp_matches_hybrid.getnnz(axis=0)
-    std_thresh: np.ndarray = get_std(np.array(averages)[0])
-    X: sparse.csc_matrix = sparse.hstack(
-        [
-            comp_matches_hybrid[
-                :, chunk * CHUNK_SIZE : (chunk + 1) * CHUNK_SIZE
-            ].multiply(sparse.csr_matrix(haps_freqs_array_norm[chunk, :]).transpose())
-            for chunk in range(haps_freqs_array_norm.shape[0])
-        ]
-    ).tocsc()
-    std_ = np.array([np.std(row.data) for row in X.transpose()])
-    final_thresh = np.array(X.max(axis=0) - std_thresh * std_)[0]
-    return np.array(
-        [
-            np.where(X.getcol(index).data >= final_thresh[index], 1, 0).sum()
-            for index in range(X.shape[1])
-        ]
-    ).copy()
-
-
 class CompositePanelMaskFilter:
     """
     Apply filters based on:
     - number of matches for each chip site in the composite ref panel
-       (`haps_freqs_array_norm_dict`)
+       (`haps_freqs_array_norm`)
     - estimated number of haploids that should be taken for each chip site
        (`nc_thresh`)
     """
 
-    def __init__(
-        self,
-        matches: sparse.csc_matrix,
-        haps_freqs_array_norm: np.ndarray,
-        nc_thresh: np.ndarray,
-        CHUNK_SIZE: int,
-        kept_matches: int = 50,
-    ):
-        self.matches_row = matches.tocsr()
-        self.haps_freqs_array_norm = haps_freqs_array_norm
-        self.nc_thresh = np.clip(nc_thresh, 1, kept_matches)
-        self.CHUNK_SIZE = CHUNK_SIZE
+    def __init__(self, matches: sparse.csr_matrix, kept_matches: int = 50):
+        self.matches_row = matches
+        self.kept_matches = kept_matches
+
+    def _haps_freqs_array_norm(
+        self, tmin: float = 0.1, tmax: float = 1
+    ) -> sparse.csc_matrix:
+        """
+        First, calculates what is the number of matches for each chip variant in
+            the new composite ref panel
+        Second, normalizes the results linearly between `tmin` and `tmax`,
+            yielding a useful multiplicative coefficient which scale down ref haploids
+            that have less total matches with the test sample
+        """
+        if not (0 <= tmin < tmax <= 1):
+            raise ValueError(
+                "tmin and tmax parameters must be between 0 and 1, "
+                "and tmax has to be greater than tmin"
+            )
+        freqs: np.ndarray = self.matches_row.getnnz(axis=1)
+        rmin: int = freqs.min()
+        rmax: int = freqs.max()
+        return sparse.csr_matrix(
+            ((freqs - rmin) / (rmax - rmin)) * (tmax - tmin) + tmin
+        ).transpose()
 
     def _normalize_matches(self) -> sparse.csc_matrix:
         """Multiply matches by normalized haplotype frequencies"""
-        return sparse.hstack(
+        return self.matches_row.multiply(self._haps_freqs_array_norm()).tocsc()
+
+    def _nc_thresh(self, X: sparse.csc_matrix) -> np.ndarray:
+        averages = self.matches_row.sum(axis=0) / self.matches_row.getnnz(axis=0)
+        std_thresh: np.ndarray = get_std(np.array(averages)[0])
+        std_ = np.array([np.std(X.getcol(index).data) for index in range(X.shape[1])])
+        final_thresh = np.array(X.max(axis=0) - std_thresh * std_)[0]
+        return np.array(
             [
-                self.matches_row[
-                    :, chunk * self.CHUNK_SIZE : (chunk + 1) * self.CHUNK_SIZE
-                ].multiply(sparse.csr_matrix(row).transpose())
-                for chunk, row in enumerate(self.haps_freqs_array_norm)
+                (X.getcol(index).data >= final_thresh[index]).sum()
+                for index in range(X.shape[1])
             ]
-        ).tocsc()
+        )
 
     def _best_matches(self) -> List[np.ndarray]:
         """Generate all best matches at all variants"""
+        normalized = self._normalize_matches()
+        nc_thresh = np.clip(self._nc_thresh(normalized), 1, self.kept_matches)
         return [
-            row.indices[np.argsort(row.data)[::-1][: self.nc_thresh[chip_index]]].copy()
-            for chip_index, row in enumerate(self._normalize_matches().transpose())
+            row.indices[np.argsort(row.data)[::-1][: nc_thresh[chip_index]]].copy()
+            for chip_index, row in enumerate(normalized.transpose())
         ]
 
     def _expand_matches(
@@ -146,6 +102,7 @@ class CompositePanelMaskFilter:
                 for hap in np.where(matrix.getnnz(axis=1) > 0)[0]
             ]
         )
+        del matrix
         indptr = np.append([0], np.cumsum(counts))
         return sparse.csr_matrix(
             (np.full(indptr[-1], True, dtype=np.bool_), indices, indptr),
@@ -196,19 +153,13 @@ def calculate_weights(
     Load pbwt matches from npz and calculate weights for imputation
     Processing as one chunk (CHUNK_SIZE = chip_sites_n)
     """
-    comp_matches_hybrid: sparse.csc_matrix = load_sparse_comp_matches_hybrid_npz(
+    comp_matches_hybrid: sparse.csr_matrix = load_sparse_comp_matches_hybrid_npz(
         *target_hap, npz_dir, shape
     )
-
-    haps_freqs_array_norm: np.ndarray = calculate_haploid_frequencies_SPARSE(
-        comp_matches_hybrid, shape[1]
-    )
-    nc_thresh: np.ndarray = calculate_haploid_count_threshold_SPARSE(
-        comp_matches_hybrid, haps_freqs_array_norm, shape[1]
-    )
     ordered_hap_indices = CompositePanelMaskFilter(
-        comp_matches_hybrid, haps_freqs_array_norm, nc_thresh, shape[1]
+        comp_matches_hybrid
     ).haplotype_id_lists()
+    del comp_matches_hybrid
 
     weight_matrix = run_hmm(
         shape[1],
@@ -217,6 +168,7 @@ def calculate_weights(
         num_hid=shape[0],
         est_ne=est_ne,
     )
+    del ordered_hap_indices
 
     for start, stop in output_breaks:
         sparse.save_npz(
