@@ -117,7 +117,7 @@ static void pbwtWriteReverse (PBWT *p, FILE *fp) {
 
 void pbwtWriteAll (PBWT *p, char *root) {
   FILE *fp ;
-#define FOPEN_W(tag)  if (!(fp = fopenTag (root, tag, "w"))) die ("failed to open root.%s", tag)
+#define FOPEN_W(tag)  if (!(fp = fopenTag (root, tag, "w"))) die ("failed to open %s.%s", root, tag)
   FOPEN_W("pbwt") ; pbwtWrite (p, fp) ; fclose (fp) ;
   if (p->sites) { FOPEN_W("sites") ; pbwtWriteSites (p, fp) ; fclose (fp) ; }
   if (p->samples) { FOPEN_W("samples") ; pbwtWriteSamples (p, fp) ; fclose (fp) ; }

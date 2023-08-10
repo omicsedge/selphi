@@ -9,7 +9,7 @@ from logging import Logger
 from joblib import Parallel, delayed
 import numpy as np
 
-from modules.utils import timestamp
+from modules.utils import timestamp, tqdm_joblib
 
 
 def _run_subset_pbwt(
@@ -114,24 +114,25 @@ def get_pbwt_matches(
         return tmpdir
 
     # Run pbwt in parallel if multiple samples and multiple cores
-    # limit batch size to 50 to limit memory use
-    batch_size = ceil(n_samples / (ceil(n_samples / 50 / cores) * cores))
-    # Filter reference pbwt so we only have to do it once
-    logger.info(
-        f"{timestamp()}: Matching {n_samples} sample(s) to reference panel "
-        f"in batches of {batch_size} samples"
-    )
-    _ = Parallel(n_jobs=cores)(
-        delayed(_run_subset_pbwt)(
-            pbwt_path,
-            target_samples[start : start + batch_size],
-            tmpdir,
-            match_length,
+    # limit batch size to store matches in up to 3.5 GB memory
+    max_size = (3.5 * 1024 ** 3) // (target_filter.sum() * 3600)
+    batch_size = ceil(n_samples / (ceil(n_samples / max_size / cores) * cores))
+    with tqdm_joblib(
+        total=ceil(n_samples / batch_size),
+        desc=f" [pbwt] Matching to reference in batches of {batch_size} sample(s)",
+        ncols=75,
+        bar_format="{desc}:\t\t{percentage:3.0f}% in {elapsed}",
+    ):
+        _ = Parallel(n_jobs=cores)(
+            delayed(_run_subset_pbwt)(
+                pbwt_path,
+                target_samples[start : start + batch_size],
+                tmpdir,
+                match_length,
+            )
+            for start in range(0, n_samples, batch_size)
         )
-        for start in range(0, n_samples, batch_size)
-    )
     # Consolidate files
     for file in tmpdir.glob("*/*.npz"):
         shutil.move(str(file), str(tmpdir))
-    logger.info(f"{timestamp()}: Matched all samples to reference panel")
     return tmpdir

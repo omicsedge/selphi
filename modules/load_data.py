@@ -80,9 +80,7 @@ def load_sparse_comp_matches_hybrid_npz(
 
     indptr = np.append([0], np.cumsum(x.sum(axis=1)))
     expanded = np.vstack([_expand_match(row) for row in zip(x.indices, x.data)])
-    x = sparse.csr_matrix(
-        (expanded[:, 1], expanded[:, 0], indptr), shape=x.shape
-    ).tocsc()
+    x = sparse.csr_matrix((expanded[:, 1], expanded[:, 0], indptr), shape=x.shape)
 
     # handle variants with no matches
     missing: np.ndarray = np.where(x.getnnz(axis=0) == 0)[0]
@@ -92,12 +90,12 @@ def load_sparse_comp_matches_hybrid_npz(
         start = np.where(np.diff(missing) > 1)[0][0] + 1
         # work backwards from first variant with a match
         for i in missing[:start][::-1]:
-            x[x[:, i + 1].indices, i] = x[:, i + 1].data + 1
+            x[x[:, i + 1].nonzero()[0], i] = x[:, i + 1].data + 1
     else:
         start = 0
 
     # work forwards, extending matches forward
     for i in missing[start:]:
-        x[x[:, i - 1].indices, i] = x[:, i - 1].data + 1
+        x[x[:, i - 1].nonzero()[0], i] = x[:, i - 1].data + 1
 
-    return x.tocsr()
+    return x
