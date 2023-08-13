@@ -1,4 +1,4 @@
-CFLAGS= -g -O3
+CFLAGS= -g -O3 --signed-char
 CPPFLAGS=-I$(HTSDIR)
 HTSLIB=$(HTSDIR)/libhts.a
 LDLIBS=-pthread $(HTSLIB) -lz -lm -lbz2 -llzma -lcurl -lzip
