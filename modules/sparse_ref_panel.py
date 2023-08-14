@@ -49,11 +49,14 @@ import numpy as np
 from scipy import sparse
 from cachetools import LRUCache, cachedmethod
 
+from tqdm import tqdm
+import concurrent.futures
 from joblib import Parallel, delayed
 
 import cyvcf2
 
 from .utils import tqdm_joblib
+
 
 
 class SparseReferencePanel:
@@ -70,6 +73,7 @@ class SparseReferencePanel:
         self.variants: np.ndarray = self._load_variants()
         self.chunks: np.ndarray = self._load_chunks()
         self.ids: List[str] = self._load_ids()
+        self.sample_ids: List[str] = self._load_sample_ids()
         self._cache = LRUCache(maxsize=cache_size)
 
     def __getitem__(self, key: Tuple[Union[int, list, slice]]) -> sparse.csc_matrix:
@@ -159,8 +163,14 @@ class SparseReferencePanel:
                 variants.write(
                     compress(np.array([], dtype=self.variant_dtypes).tobytes())
                 )
+            with archive.open("sample_ids", "w") as sample_ids_obj:
+                sample_ids_obj.write(
+                    compress("\n".join([]).encode())
+                )
             with archive.open("chunks", "w") as chunks:
-                chunks.write(compress(np.array([], dtype=int).tobytes()))
+                chunks.write(
+                    compress(np.array([], dtype=int).tobytes())
+                )
 
     def _save(self, hap_dir: str):
         """Update archive"""
@@ -174,6 +184,8 @@ class SparseReferencePanel:
                 ids.write(compress("\n".join(self.ids).encode()))
             with archive.open("chunks", "w") as chunks:
                 chunks.write(compress(self.chunks.tobytes()))
+            with archive.open("sample_ids", "w") as sample_ids_file:
+                sample_ids_file.write(compress("\n".join(self.sample_ids).encode()))
             for file in Path(hap_dir).iterdir():
                 archive.write(file, arcname=os.path.join("haplotypes", file.name))
 
@@ -199,27 +211,90 @@ class SparseReferencePanel:
             return [
                 "-".join([str(col) for col in variant]) for variant in self.variants
             ]
+    
+    def _load_sample_ids(self) -> List[str]:
+        """Load sample IDs from archive"""
+        with ZipFile(self.filepath, mode="r") as archive:
+            with archive.open("sample_ids") as obj:
+                return uncompress(obj.read()).decode().split("\n")
 
-    def _ingest_variants(self, vcf_path: str):
-        """Load variants from a vcf or bcf"""
-        vcf_obj = cyvcf2.VCF(vcf_path)
-        variants = [
-            (variant.CHROM, variant.POS, variant.REF, variant.ALT[0])
-            for variant in vcf_obj
+    def determine_chunk_ranges(self, chr_length, num_variants):
+        chr_length = int(chr_length)  
+        num_variants = int(num_variants) 
+        bp_per_variant = chr_length / num_variants
+        bp_per_chunk = bp_per_variant * self.chunk_size
+        current_start = 1
+        ranges = []
+        while current_start < chr_length:
+            end = min(current_start + bp_per_chunk, chr_length)
+            ranges.append((int(current_start), int(end)))
+            current_start = end + 1
+        '''
+        Update the last element to 999M in order to ensure that no variants 
+        are discarded due to assumptions about chromosome length
+        '''
+        ranges[-1] = (ranges[-1][0], 999_999_999)
+        return ranges
+
+    def get_vcf_stats(self, vcf_path):
+        cmd = [
+            'bcftools', 'index', '--stats', vcf_path
         ]
-        vcf_obj.close()
-        # Store as numpy for array operations
-        self.variants = np.fromiter(variants, dtype=self.variant_dtypes)
-        # Also store as txt to avoid truncated indel alleles
-        self.ids = ["-".join([str(col) for col in line]) for line in variants]
-
-        chroms = np.unique([variant[0] for variant in self.variants])
-        if chroms.size > 1:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            raise ValueError(f"Error executing bcftools: {result.stderr}")
+        lines = [line.split('\t') for line in result.stdout.splitlines()]
+        if len(lines) > 1:
             raise ValueError("Only one chromosome per file is supported")
+        chrom, chr_length, num_variants = lines[0]
+        if chr_length == '.':
+            chr_length = self.get_chromosome_length(chrom)
+        return chrom, chr_length, num_variants
+
+    def _ingest_variants(self, vcf_path: str, threads: int = os.cpu_count()):
+        chrom, chr_length, num_variants = self.get_vcf_stats(vcf_path)
+        chunk_ranges = self.determine_chunk_ranges(chr_length, num_variants)
+
+        def process_chunk(args):
+            start, end, chrom, vcf_path = args
+            cmd = [
+                'bcftools', 'query', '-r', f'{chrom}:{start}-{end}', 
+                '-f', '%CHROM\t%POS\t%REF\t%ALT\n', vcf_path
+            ]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            
+            if result.returncode != 0:
+                raise ValueError(f"Error executing bcftools: {result.stderr}")
+            
+            return [tuple(line.strip().split('\t')) for line in result.stdout.splitlines()]
+
+        # Parallel processing of chunk_ranges
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+            chunk_variants_list = list(
+                tqdm(
+                    executor.map(process_chunk, [(start, end, chrom, vcf_path) for start, end in chunk_ranges]),
+                    total=len(chunk_ranges),
+                    desc="Ingest variants from the input",
+                    ncols=75,
+                    bar_format="{desc}:\t\t\t{percentage:3.0f}% in {elapsed}"
+                )
+            )
+
+        # Flatten the list of lists
+        all_variants = [item for sublist in chunk_variants_list for item in sublist]
+
+        var_no_dup = list(dict.fromkeys(all_variants))
+
+        vcf_obj = cyvcf2.VCF(vcf_path)
+        self.sample_ids = vcf_obj.samples
+        vcf_obj.close()
+
+        self.variants = np.fromiter(var_no_dup, dtype=self.variant_dtypes)
+        self.ids = ["-".join([str(col) for col in line]) for line in var_no_dup]
 
         self.chunks = np.array(
             [
-                [idx, chunk[0][1], chunk[-1][1]]
+                [idx, int(chunk[0][1]), int(chunk[-1][1])]
                 for idx, chunk in enumerate(
                     np.split(
                         self.variants,
@@ -229,13 +304,15 @@ class SparseReferencePanel:
             ],
             dtype=int,
         )
+        
         self.metadata.update(
             {
-                "chromosome": str(chroms[0]),
+                "chromosome": str(chrom),
                 "n_variants": int(self.variants.size),
                 "min_position": int(self.variants[0][1]),
                 "max_position": int(self.variants[-1][1]),
                 "n_chunks": self.chunks.shape[0],
+                "n_samples": len(self.sample_ids),
             }
         )
 
@@ -253,6 +330,19 @@ class SparseReferencePanel:
         with ZipFile(self.filepath, mode="r") as archive:
             with archive.open(f"haplotypes/{chunk}.npz") as obj:
                 return sparse.load_npz(BytesIO(uncompress(obj.read())))
+
+    def _load_dosage(self, chunk: int) -> sparse.csc_matrix:
+        """Load a sparse matrix dosage from archived npz"""
+        loaded_chunk = self._load_haplotypes(chunk)
+        return loaded_chunk[:, ::2] + loaded_chunk[:, 1::2]
+
+    def _calculate_maf(self, chunk: int) -> np.ndarray:
+        """Calculate minor allele frequency (maf) for a given chunk."""
+        loaded_chunk = self._load_haplotypes(chunk)
+        freqs = (loaded_chunk.sum(axis=1) / self.metadata['n_haps']).A.squeeze()
+        mask = freqs > 0.5
+        freqs[mask] = 1 - freqs[mask]
+        return freqs
 
     def _std_out_to_sparse(self, command: str, chunk: int, tmpdir: str) -> tuple:
         """Convert std_out of command to sparse matrix"""
@@ -335,7 +425,7 @@ class SparseReferencePanel:
             raise FileNotFoundError(f"Missing input file: {xsi_bcf}")
         self.metadata["source_file"] = xsi_path
         self.metadata["chunk_size"] = chunk_size
-        self._ingest_variants(xsi_bcf)
+        self._ingest_variants(xsi_bcf, threads)
         self._ingest_xsi_haplotypes(xsi_path, threads)
 
         return self
@@ -372,7 +462,7 @@ class SparseReferencePanel:
 
         self.metadata["source_file"] = bcf_path
         self.metadata["chunk_size"] = chunk_size
-        self._ingest_variants(bcf_path)
+        self._ingest_variants(bcf_path, threads)
         self._ingest_bcf_haplotypes(bcf_path, threads)
 
         return self
@@ -388,9 +478,45 @@ class SparseReferencePanel:
         return self.metadata.get("n_haps", 0)
 
     @property
+    def n_samples(self) -> int:
+        """Get number of samples"""
+        return len(self.sample_ids)
+
+    @property
     def shape(self) -> int:
         """Get shape of full matrix"""
         return (self.n_variants, self.n_haps)
+
+    def get_chromosome_length(self, chrom) -> str:
+        """Get chromosome length for VCF"""
+        length_chrs_hg38 = {
+            "1": "248956422",
+            "2": "242193529",
+            "3": "198295559",
+            "4": "190214555",
+            "5": "181538259",
+            "6": "170805979",
+            "7": "159345973",
+            "8": "145138636",
+            "9": "138394717",
+            "10": "133797422",
+            "11": "135086622",
+            "12": "133275309",
+            "13": "114364328",
+            "14": "107043718",
+            "15": "101991189",
+            "16": "90338345",
+            "17": "83257441",
+            "18": "80373285",
+            "19": "58617616",
+            "20": "64444167",
+            "21": "46709983",
+            "22": "50818468",
+            "X": "156040895",
+            "Y": "57227415",
+            "MT": "16569",
+        }
+        return length_chrs_hg38.get(chrom, "")
 
     @property
     def n_chunks(self) -> int:
