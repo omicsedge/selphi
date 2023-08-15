@@ -144,6 +144,7 @@ def selphi(
                 expected_shape,
                 tmpdir.joinpath("weights"),
                 interpolator.breakpoints,
+                logger,
                 est_ne,
             )
             for target_hap in target_haps
