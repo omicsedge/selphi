@@ -78,13 +78,13 @@ class DataIngestion:
                 commands = [(
                     f"bcftools view -r {chrom}:{start}-{end} "
                     f"{vcf_path} -S {self.samples_file} | bcftools query -f '[|%GT]\n' "
-                    f"| sed s'/[|/]//'"
+                    f"| sed s'/|//' | sed s'/\//|/'g"
                 )]
             else:
                 commands = [(
                     f"bcftools view -r {chrom}:{start}-{end} "
                     f"{vcf_path} | bcftools query -f '[|%GT]\n' "
-                    f"| sed s'/|//'"
+                    f"| sed s'/|//' | sed s'/\//|/'g"
                 )]
             result = subprocess.run(commands, shell=True, stdout=subprocess.PIPE)
             return self.stdout_to_sparse(result)
