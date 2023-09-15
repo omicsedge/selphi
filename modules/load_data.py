@@ -87,7 +87,7 @@ def load_sparse_comp_matches_hybrid_npz(
     missing: np.ndarray = np.where(x.getnnz(axis=0) == 0)[0]
     if missing.size >= 15:
         logger.warning(
-            f"/nSample {sample_name} haplotype {hap} had no matches at {missing.size} variants"
+            f"\nSample {sample_name} haplotype {hap} had no matches at {missing.size} variants"
         )
 
     if missing[0] == 0:
