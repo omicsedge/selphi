@@ -1,6 +1,7 @@
 from typing import List, Tuple
 from pathlib import Path
 from warnings import filterwarnings
+from logging import Logger
 
 import pandas as pd
 import numpy as np
@@ -68,7 +69,7 @@ def _expand_match(row: Tuple[int]) -> np.ndarray:
 
 
 def load_sparse_comp_matches_hybrid_npz(
-    sample_name: str, hap: int, npz_dir: Path, shape: Tuple[int]
+    sample_name: str, hap: int, npz_dir: Path, shape: Tuple[int], logger: Logger
 ) -> sparse.csr_matrix:
     npz_path = npz_dir.joinpath(f"parallel_haploid_mat_{sample_name}_{hap}.npz")
     x: sparse.csr_matrix = sparse.load_npz(npz_path).tocsr()
@@ -84,7 +85,10 @@ def load_sparse_comp_matches_hybrid_npz(
 
     # handle variants with no matches
     missing: np.ndarray = np.where(x.getnnz(axis=0) == 0)[0]
-    assert missing.size < 15
+    if missing.size >= 15:
+        logger.warning(
+            f"\nSample {sample_name} haplotype {hap} had no matches at {missing.size} variants"
+        )
 
     if missing[0] == 0:
         start = np.where(np.diff(missing) > 1)[0][0] + 1

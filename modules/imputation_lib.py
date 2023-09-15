@@ -1,5 +1,7 @@
 from typing import List, Tuple
 from pathlib import Path
+from logging import Logger
+
 from scipy import sparse
 import numpy as np
 
@@ -22,11 +24,13 @@ class CompositePanelMaskFilter:
         target_hap: Tuple[str, int],
         npz_dir: Path,
         shape: Tuple[int],
+        logger: Logger,
         kept_matches: int = 50,
     ):
         self.target_hap = target_hap
         self.npz_dir = npz_dir
         self.shape = shape
+        self.logger = logger
         self.kept_matches = kept_matches
 
     def _haps_freqs_array_norm(
@@ -94,7 +98,7 @@ class CompositePanelMaskFilter:
 
     def sparse_matrix(self) -> sparse.csr_matrix:
         matches_row: sparse.csr_matrix = load_sparse_comp_matches_hybrid_npz(
-            *self.target_hap, self.npz_dir, self.shape
+            *self.target_hap, self.npz_dir, self.shape, self.logger
         )
         best_matches = self._best_matches(matches_row)
         indptr = np.append([0], np.cumsum([matches.size for matches in best_matches]))
@@ -160,6 +164,7 @@ def calculate_weights(
     shape: Tuple[int],
     output_dir: Path,
     output_breaks: List[Tuple[int]],
+    logger: Logger,
     est_ne: int = 1000000,
 ) -> None:
     """
@@ -167,7 +172,7 @@ def calculate_weights(
     Processing as one chunk (CHUNK_SIZE = chip_sites_n)
     """
     ordered_hap_indices = CompositePanelMaskFilter(
-        target_hap, npz_dir, shape
+        target_hap, npz_dir, shape, logger
     ).haplotype_id_lists()
 
     weight_matrix = run_hmm(
