@@ -229,21 +229,20 @@ class SparseReferencePanel:
             print(f"An error occurred: {str(e)}")
             return []
 
-    @property
-    def determine_start_position(self) -> int:
-        cmd = f'bcftools query -f "%POS\n" {self.filepath} | head -1'
+    def determine_start_position(self, vcf_path) -> int:
+        cmd = f'bcftools query -f "%POS\n" {vcf_path} | head -1'
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
         if result.returncode != 0:
             raise ValueError(f"Error executing bcftools: {result.stderr}")
         start_position = int(result.stdout.strip())
         return start_position
 
-    def determine_chunk_ranges(self, chr_length, num_variants):
+    def determine_chunk_ranges(self, vcf_path, chr_length, num_variants):
         chr_length = int(chr_length)  
         num_variants = int(num_variants) 
         bp_per_variant = chr_length / num_variants
         bp_per_chunk = bp_per_variant * self.chunk_size
-        current_start = self.determine_start_position
+        current_start = self.determine_start_position(vcf_path)
         ranges = []
         while current_start < chr_length:
             end = min(current_start + bp_per_chunk, chr_length)
@@ -273,7 +272,7 @@ class SparseReferencePanel:
 
     def _ingest_variants(self, vcf_path: str, threads: int = os.cpu_count()):
         chrom, chr_length, num_variants = self.get_vcf_stats(vcf_path)
-        chunk_ranges = self.determine_chunk_ranges(chr_length, num_variants)
+        chunk_ranges = self.determine_chunk_ranges(vcf_path, chr_length, num_variants)
 
         def process_chunk(args):
             start, end, chrom, vcf_path = args
