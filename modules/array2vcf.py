@@ -68,7 +68,7 @@ class VcfWriter:
 
     @staticmethod
     def index_vcf(vcf_file: Union[Path, str]):
-        subprocess.run(["bcfools", "index", "-f", vcf_file, "--threads", os.cpu_count() ], check=True)
+        subprocess.run(["bcftools", "index", "-f", vcf_file, "--threads", os.cpu_count() ], check=True)
 
     def write_header(self) -> Path:
         header = (
