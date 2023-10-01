@@ -28,7 +28,7 @@ class DataIngestion:
             raise FileNotFoundError(f"Missing input file: {vcf_path}")
         if not (os.path.exists(vcf_path + ".tbi") or os.path.exists(vcf_path + ".csi")):
             print(f"Indexing input file: {vcf_path}")
-            subprocess.run(f"tabix {vcf_path}", shell=True)
+            subprocess.run(f"bcftools index {vcf_path} --threads {os.cpu_count()}", shell=True)
         return vcf_path
 
     def get_ranges(self, vcf_path: str) -> List[Tuple[int, int]]:
