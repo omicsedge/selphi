@@ -477,7 +477,7 @@ class SparseReferencePanel:
             raise FileNotFoundError(f"Missing input file: {bcf_path}")
         if not (os.path.exists(bcf_path + ".tbi") or os.path.exists(bcf_path + ".csi")):
             print(f"Indexing input file: {bcf_path}")
-            subprocess.run(f"tabix {bcf_path}", shell=True)
+            subprocess.run(f"bcftools index {bcf_path} --threads {threads}", shell=True)
 
         self.metadata["source_file"] = bcf_path
         self.metadata["chunk_size"] = chunk_size
