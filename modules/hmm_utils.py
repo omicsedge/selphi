@@ -122,6 +122,7 @@ def setBwdValues_SPARSE(
     pRecomb_arr: np.ndarray,
     nHaps: np.ndarray,
     num_hid: int = 9000,
+    pErr: float = 0.0001,
 ) -> sparse.csr_matrix:
     """
     set backward values
@@ -138,7 +139,6 @@ def setBwdValues_SPARSE(
     weight_matrix[0, ordered_matches[0]] = 1 / len(ordered_matches[0])
     weight_matrix[1, ordered_matches[0]] = 1 / len(ordered_matches[0])
 
-    pErr = 0.0001
     pNoErr = 1 - pErr
 
     # Loop over the matrix_ from back to front
