@@ -10,6 +10,13 @@ from modules.load_data import load_sparse_comp_matches_hybrid_npz
 from modules.utils import get_std
 
 
+def _filter_hap_indices(row_haps: np.ndarray, kept_haps: np.ndarray) -> np.ndarray:
+    filtered = np.intersect1d(row_haps, kept_haps)
+    if filtered.size:
+        return filtered
+    return row_haps
+
+
 class CompositePanelMaskFilter:
     """
     Apply filters based on:
@@ -34,7 +41,7 @@ class CompositePanelMaskFilter:
         self.kept_matches = kept_matches
 
     def _haps_freqs_array_norm(
-        self, matches_row, tmin: float = 0.1, tmax: float = 1
+        self, matches_row: sparse.csr_matrix, tmin: float = 0.1, tmax: float = 1
     ) -> sparse.csc_matrix:
         """
         First, calculates what is the number of matches for each chip variant in
@@ -43,7 +50,7 @@ class CompositePanelMaskFilter:
             yielding a useful multiplicative coefficient which scale down ref haploids
             that have less total matches with the test sample
         """
-        if not (0 <= tmin < tmax <= 1):
+        if not 0 <= tmin < tmax <= 1:
             raise ValueError(
                 "tmin and tmax parameters must be between 0 and 1, "
                 "and tmax has to be greater than tmin"
@@ -55,31 +62,31 @@ class CompositePanelMaskFilter:
             ((freqs - rmin) / (rmax - rmin)) * (tmax - tmin) + tmin
         ).transpose()
 
-    def _normalize_matches(self, matches_row) -> sparse.csc_matrix:
+    def _normalize_matches(self, matches_row: sparse.csr_matrix) -> sparse.csc_matrix:
         """Multiply matches by normalized haplotype frequencies"""
         return matches_row.multiply(self._haps_freqs_array_norm(matches_row)).tocsc()
 
-    def _nc_thresh(self, matches_row, X: sparse.csc_matrix) -> np.ndarray:
+    def _thresh(
+        self, matches_row: sparse.csr_matrix, X: sparse.csc_matrix
+    ) -> np.ndarray:
         averages = matches_row.sum(axis=0) / matches_row.getnnz(axis=0)
-        std_thresh: np.ndarray = get_std(np.array(averages)[0])
-        std_ = np.array([np.std(X.getcol(index).data) for index in range(X.shape[1])])
-        final_thresh = np.array(X.max(axis=0) - std_thresh * std_)[0]
-        return np.array(
-            [
-                (X.getcol(index).data >= final_thresh[index]).sum()
-                for index in range(X.shape[1])
-            ]
+        std_thresh: np.ndarray = get_std(
+            np.array(averages)[0], matches_row.data.min(), self.shape[1]
         )
+        std_ = np.array([np.std(X.getcol(index).data) for index in range(X.shape[1])])
+        return np.array(X.max(axis=0) - std_thresh * std_)[0]
 
-    def _best_matches(self, matches_row) -> List[np.ndarray]:
+    def _best_matches(self, matches_row: sparse.csr_matrix) -> List[np.ndarray]:
         """Generate all best matches at all variants"""
         normalized = self._normalize_matches(matches_row)
-        nc_thresh = np.clip(
-            self._nc_thresh(matches_row, normalized), 1, self.kept_matches
-        )
+        thresh = self._thresh(matches_row, normalized)
         return [
-            row.indices[np.argsort(row.data)[::-1][: nc_thresh[chip_index]]].copy()
-            for chip_index, row in enumerate(normalized.transpose())
+            row.indices[
+                np.argsort(row.data)[::-1][
+                    : min(self.kept_matches, (row.data >= thresh[idx]).sum())
+                ]
+            ].copy()
+            for idx, row in enumerate(normalized.transpose())
         ]
 
     def _expand_matches(
@@ -101,9 +108,15 @@ class CompositePanelMaskFilter:
             *self.target_hap, self.npz_dir, self.shape, self.logger
         )
         best_matches = self._best_matches(matches_row)
-        indptr = np.append([0], np.cumsum([matches.size for matches in best_matches]))
-        indices = np.hstack(best_matches)
+        haps, counts = np.unique(np.hstack(best_matches), return_counts=True)
+        best_haps = haps[counts > 1]
+        filtered_matches = [_filter_hap_indices(row, best_haps) for row in best_matches]
         del best_matches
+        indptr = np.append(
+            [0], np.cumsum([matches.size for matches in filtered_matches])
+        )
+        indices = np.hstack(filtered_matches)
+        del filtered_matches
         matrix = sparse.csc_matrix(
             (np.full(indptr[-1], True, dtype=np.bool_), indices, indptr),
             shape=self.shape,
@@ -136,6 +149,7 @@ def run_hmm(
     distances_cm: np.ndarray,
     num_hid: int = 9000,
     est_ne: int = 1000000,
+    pErr: float = 0.0001,
 ) -> sparse.csr_matrix:
     """
     Runs the forward and backward runs of the forward-backward algorithm,
@@ -145,7 +159,7 @@ def run_hmm(
     pRecomb_arr: np.ndarray = pRecomb(distances_cm, num_hid=num_hid, ne=est_ne) / nHaps
 
     matrix_ = setFwdValues_SPARSE(
-        chip_sites_n, ordered_hap_indices, pRecomb_arr, num_hid=num_hid
+        chip_sites_n, ordered_hap_indices, pRecomb_arr, num_hid=num_hid, pErr=pErr
     )
     return setBwdValues_SPARSE(
         matrix_,
@@ -154,6 +168,7 @@ def run_hmm(
         pRecomb_arr,
         nHaps,
         num_hid=num_hid,
+        pErr=pErr,
     )
 
 
@@ -175,12 +190,17 @@ def calculate_weights(
         target_hap, npz_dir, shape, logger
     ).haplotype_id_lists()
 
+    haps, counts = np.unique(np.hstack(ordered_hap_indices), return_counts=True)
+    cutoff = np.percentile(counts, 10)
+    best_haps = haps[counts > cutoff]
+
     weight_matrix = run_hmm(
         shape[1],
-        ordered_hap_indices,
+        [_filter_hap_indices(row, best_haps) for row in ordered_hap_indices],
         chip_cM_coordinates,
         num_hid=shape[0],
         est_ne=est_ne,
+        pErr=cutoff / shape[1],
     )
     del ordered_hap_indices
 

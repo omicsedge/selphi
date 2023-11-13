@@ -8,19 +8,19 @@ def pRecomb(
     distances_cm: np.ndarray, num_hid: int = 9000, ne: int = 1000000
 ) -> np.ndarray:
     """
-    pRecomb between obs and and obs-1
+    pRecomb between obs and obs-1
     """
     dm_array = np.append([0], np.diff(distances_cm))
     dm_array[np.where(dm_array == 0)] = 0.0000001
     return 1 - np.exp((dm_array * -0.04 * ne) / num_hid)
 
 
-# @njit
 def setFwdValues_SPARSE(
     num_obs: int,  # number of variants
     ordered_matches: np.ndarray,
     pRecomb_arr: np.ndarray,
     num_hid: int = 9000,  # number of ref haplotypes
+    pErr: float = 0.0001,
 ) -> sparse.lil_matrix:
     """
     set forward values
@@ -31,7 +31,6 @@ def setFwdValues_SPARSE(
         ((num_obs - 1) // chunk_compression, num_hid), dtype=np.float64
     )
 
-    pErr = 0.0001
     pNoErr = 1 - pErr
 
     alpha = np.zeros((num_hid,), dtype=np.float64)
@@ -59,6 +58,7 @@ def run_forward_block(
     pRecomb_arr: np.ndarray,
     nHaps: np.ndarray,
     initial: bool = False,
+    pErr: float = 0.0001,
 ) -> np.ndarray:
     if (num_obs - aci) > chunk_compression:
         if not initial:
@@ -72,7 +72,6 @@ def run_forward_block(
     alpha = np.zeros((end, num_hid), dtype=np.float64)
     alpha[0, :] = init_probs
 
-    pErr = 0.0001
     pNoErr = 1 - pErr
 
     for m in range(end - 1):
@@ -99,8 +98,8 @@ def run_backward_calc(
     nHaps: np.ndarray,
     forward_decomp_block: np.ndarray,
     beta: np.ndarray,
+    pErr: float = 0.0001,
 ) -> None:
-    pErr = 0.0001
     pNoErr = 1 - pErr
 
     for fbi in range(forward_decomp_block.shape[0] - 2, -2, -1):
@@ -162,6 +161,7 @@ def setBwdValues_SPARSE(
             ordered_matches_matrix,
             pRecomb_arr,
             nHaps,
+            pErr=pErr,
         )
 
         run_backward_calc(
@@ -171,6 +171,7 @@ def setBwdValues_SPARSE(
             nHaps,
             forward_decomp_block,
             beta,
+            pErr=pErr,
         )
 
         for fbi in range(forward_decomp_block.shape[0] - 1, -1, -1):
@@ -188,6 +189,7 @@ def setBwdValues_SPARSE(
         pRecomb_arr,
         nHaps,
         initial=True,
+        pErr=pErr,
     )
 
     for aci in range(1, chunk_compression - 2):
