@@ -58,6 +58,7 @@ import cyvcf2
 from .utils import tqdm_joblib
 
 
+
 class SparseReferencePanel:
     """Class for working with ref panels stored as sparse matrix"""
 
@@ -165,7 +166,9 @@ class SparseReferencePanel:
             with archive.open("sample_ids", "w") as sample_ids_obj:
                 sample_ids_obj.write(compress("\n".join([]).encode()))
             with archive.open("chunks", "w") as chunks:
-                chunks.write(compress(np.array([], dtype=int).tobytes()))
+                chunks.write(
+                    compress(np.array([], dtype=int).tobytes())
+                )
 
     def _save(self, hap_dir: str):
         """Update archive"""
@@ -330,7 +333,6 @@ class SparseReferencePanel:
             ],
             dtype=int,
         )
-
         self.metadata.update(
             {
                 "chromosome": str(chrom),

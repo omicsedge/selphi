@@ -407,12 +407,10 @@ class CalculateMetrics:
 
     def r2(self) -> Dict[str, np.ndarray]:
         """return Pearson r2 for both per-variant and per-sample"""
-
         imputed = self._load_dosage(self.imputed)
         wgs = self._load_dosage(self.wgs)
 
         N = len(imputed[0])
-
         # Per-variant calculations
         x_sum_var = np.sum(imputed, axis=1)
         y_sum_var = np.sum(wgs, axis=1)
@@ -549,12 +547,10 @@ class CalculateMetrics:
         self.save_fscore(), self.save_accuracy(), self.save_r2(), self.save_rmse()
         return self.concatenate_files()
 
-
 def remove_duplicates(input_file, unique_folder_name):
     temp_file = os.path.join(unique_folder_name, "temp_file_duplicates.txt")
     cmd = f"awk '!seen[$0]++' {input_file} > {temp_file} && mv {temp_file} {input_file}"
     subprocess.run(cmd, shell=True, check=True)
-
 
 def concatenate_samples(file_paths: List[str]) -> pd.DataFrame:
     sample_data = []
