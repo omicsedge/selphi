@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import List, Tuple, Union
 import json
 from datetime import datetime
-from zipfile import ZipFile
+from zipfile import ZipFile, BadZipFile
 from tempfile import TemporaryDirectory
 
 from zstd import compress, uncompress
@@ -214,16 +214,35 @@ class SparseReferencePanel:
     
     def _load_sample_ids(self) -> List[str]:
         """Load sample IDs from archive"""
-        with ZipFile(self.filepath, mode="r") as archive:
-            with archive.open("sample_ids") as obj:
-                return uncompress(obj.read()).decode().split("\n")
+        try:
+            with ZipFile(self.filepath, mode="r") as archive:
+                if "sample_ids" in archive.namelist():
+                    with archive.open("sample_ids") as obj:
+                        return uncompress(obj.read()).decode().split("\n")
+                else:
+                    print("Warning: 'sample_ids' not found in the archive.")
+                    return []
+        except BadZipFile:
+            print("Error: Invalid zip archive format.")
+            return []
+        except Exception as e:
+            print(f"An error occurred: {str(e)}")
+            return []
 
-    def determine_chunk_ranges(self, chr_length, num_variants):
+    def determine_start_position(self, vcf_path) -> int:
+        cmd = f'bcftools query -f "%POS\n" {vcf_path} | head -1'
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
+        if result.returncode != 0:
+            raise ValueError(f"Error executing bcftools: {result.stderr}")
+        start_position = int(result.stdout.strip())
+        return start_position
+
+    def determine_chunk_ranges(self, vcf_path, chr_length, num_variants):
         chr_length = int(chr_length)  
         num_variants = int(num_variants) 
         bp_per_variant = chr_length / num_variants
         bp_per_chunk = bp_per_variant * self.chunk_size
-        current_start = 1
+        current_start = self.determine_start_position(vcf_path)
         ranges = []
         while current_start < chr_length:
             end = min(current_start + bp_per_chunk, chr_length)
@@ -253,7 +272,7 @@ class SparseReferencePanel:
 
     def _ingest_variants(self, vcf_path: str, threads: int = os.cpu_count()):
         chrom, chr_length, num_variants = self.get_vcf_stats(vcf_path)
-        chunk_ranges = self.determine_chunk_ranges(chr_length, num_variants)
+        chunk_ranges = self.determine_chunk_ranges(vcf_path, chr_length, num_variants)
 
         def process_chunk(args):
             start, end, chrom, vcf_path = args
@@ -458,7 +477,7 @@ class SparseReferencePanel:
             raise FileNotFoundError(f"Missing input file: {bcf_path}")
         if not (os.path.exists(bcf_path + ".tbi") or os.path.exists(bcf_path + ".csi")):
             print(f"Indexing input file: {bcf_path}")
-            subprocess.run(f"tabix {bcf_path}", shell=True)
+            subprocess.run(f"bcftools index {bcf_path} --threads {threads}", shell=True)
 
         self.metadata["source_file"] = bcf_path
         self.metadata["chunk_size"] = chunk_size

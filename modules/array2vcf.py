@@ -3,6 +3,7 @@ import subprocess
 from pathlib import Path
 from uuid import uuid4
 from shutil import copyfileobj
+import os
 
 import numpy as np
 from scipy import sparse
@@ -67,7 +68,7 @@ class VcfWriter:
 
     @staticmethod
     def index_vcf(vcf_file: Union[Path, str]):
-        subprocess.run(["tabix", "-f", "-p", "vcf", vcf_file], check=True)
+        subprocess.run(["bcftools", "index", "-f", vcf_file, "--threads", os.cpu_count() ], check=True)
 
     def write_header(self) -> Path:
         header = (
