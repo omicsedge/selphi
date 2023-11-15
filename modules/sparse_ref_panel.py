@@ -465,7 +465,7 @@ class SparseReferencePanel:
         # -r includes overlapping indels, but is faster than -t, so use both
         commands = [
             (
-                f"bcftools view -r {self.chromosome}:{chunk[1]}-{chunk[2]} --regions-overlap 0"
+                f"bcftools view -r {self.chromosome}:{chunk[1]}-{chunk[2]} --regions-overlap 0 "
                 f"{bcf_path} | bcftools query -f '[|%GT]\n' "
                 f"-t {self.chromosome}:{chunk[1]}-{chunk[2]} | sed s'/|//'"
             )
