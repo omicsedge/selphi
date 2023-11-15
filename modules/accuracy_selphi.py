@@ -84,7 +84,7 @@ class DataIngestion:
             if self.samples_file != "":
                 commands = [
                     (
-                        f"bcftools view -r {chrom}:{start}-{end} "
+                        f"bcftools view -r {chrom}:{start}-{end} --regions-overlap 0"
                         f"{vcf_path} -S {self.samples_file} | bcftools query -f '[|%GT]\n' "
                         f"| sed s'/|//' | sed s'/\//|/'g"
                     )
@@ -92,7 +92,7 @@ class DataIngestion:
             else:
                 commands = [
                     (
-                        f"bcftools view -r {chrom}:{start}-{end} "
+                        f"bcftools view -r {chrom}:{start}-{end} --regions-overlap 0"
                         f"{vcf_path} | bcftools query -f '[|%GT]\n' "
                         f"| sed s'/|//' | sed s'/\//|/'g"
                     )
