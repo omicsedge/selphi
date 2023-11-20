@@ -68,7 +68,10 @@ class VcfWriter:
 
     @staticmethod
     def index_vcf(vcf_file: Union[Path, str]):
-        subprocess.run(["bcftools", "index", "-f", vcf_file, "--threads", os.cpu_count() ], check=True)
+        subprocess.run(
+            ["bcftools", "index", "-f", vcf_file, "--threads", str(os.cpu_count())],
+            check=True,
+        )
 
     def write_header(self) -> Path:
         header = (
@@ -86,7 +89,7 @@ class VcfWriter:
             f"##contig=<ID={self.chromosome},length={self.chr_length},assembly=GRCh38,species=HomoSapiens>\n"
         )
         columns = (
-            f"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
             + "\t".join(self.target_sample_names)
             + "\n"
         )
