@@ -30,7 +30,8 @@ def load_and_interpolate_genetic_map(
 
     Returns two lists:
         - `chip_BP_positions` - chip (input) BP positions
-        - `chip_cM_coordinates` - corresponding cM coordinates for the chip positions, inferred from the genetic map
+        - `chip_cM_coordinates` - corresponding cM coordinates for the chip positions,
+             inferred from the genetic map
     """
     progress = tqdm(
         total=4,
@@ -51,7 +52,7 @@ def load_and_interpolate_genetic_map(
     progress.update(1)
     genetic_map = genetic_map.join(pd.DataFrame(chip_BPs).set_index(0), how="outer")
     progress.update(1)
-    genetic_map["cM"] = genetic_map["cM"].interpolate("index").fillna(method="bfill")
+    genetic_map["cM"] = genetic_map["cM"].interpolate("index").bfill()
     progress.update(1)
     genetic_map = genetic_map.reset_index().rename({"index": "pos"}, axis=1)
     genetic_map = genetic_map[genetic_map["pos"].isin(chip_BPs)].reset_index(drop=True)

@@ -11,7 +11,7 @@ The reference panel is stored in a zstd-compressed zip archive:
     chunks - binary array of chunks with start and stop positions
     haplotypes/* - chunks stored as boolean sparse npz files
 
-Chunks are cached when they are read into memory. While a few seconds 
+Chunks are cached when they are read into memory. While a few seconds
 processing time is required to load each chunk, consecutive reads are very fast.
 
 Files can only contain one chromosome, and variants are assumed to be sorted by position.
@@ -43,6 +43,7 @@ import json
 from datetime import datetime
 from zipfile import ZipFile, BadZipFile
 from tempfile import TemporaryDirectory
+import concurrent.futures
 
 from zstd import compress, uncompress
 import numpy as np
@@ -50,7 +51,6 @@ from scipy import sparse
 from cachetools import LRUCache, cachedmethod
 
 from tqdm import tqdm
-import concurrent.futures
 from joblib import Parallel, delayed
 
 import cyvcf2
@@ -164,9 +164,7 @@ class SparseReferencePanel:
                     compress(np.array([], dtype=self.variant_dtypes).tobytes())
                 )
             with archive.open("sample_ids", "w") as sample_ids_obj:
-                sample_ids_obj.write(
-                    compress("\n".join([]).encode())
-                )
+                sample_ids_obj.write(compress("\n".join([]).encode()))
             with archive.open("chunks", "w") as chunks:
                 chunks.write(
                     compress(np.array([], dtype=int).tobytes())
@@ -211,7 +209,7 @@ class SparseReferencePanel:
             return [
                 "-".join([str(col) for col in variant]) for variant in self.variants
             ]
-    
+
     def _load_sample_ids(self) -> List[str]:
         """Load sample IDs from archive"""
         try:
@@ -231,15 +229,17 @@ class SparseReferencePanel:
 
     def determine_start_position(self, vcf_path) -> int:
         cmd = f'bcftools query -f "%POS\n" {vcf_path} | head -1'
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True
+        )
         if result.returncode != 0:
             raise ValueError(f"Error executing bcftools: {result.stderr}")
         start_position = int(result.stdout.strip())
         return start_position
 
     def determine_chunk_ranges(self, vcf_path, chr_length, num_variants):
-        chr_length = int(chr_length)  
-        num_variants = int(num_variants) 
+        chr_length = int(chr_length)
+        num_variants = int(num_variants)
         bp_per_variant = chr_length / num_variants
         bp_per_chunk = bp_per_variant * self.chunk_size
         current_start = self.determine_start_position(vcf_path)
@@ -248,25 +248,23 @@ class SparseReferencePanel:
             end = min(current_start + bp_per_chunk, chr_length)
             ranges.append((int(current_start), int(end)))
             current_start = end + 1
-        '''
-        Update the last element to 999M in order to ensure that no variants 
-        are discarded due to assumptions about chromosome length
-        '''
+        # Update the last element to 999M in order to ensure that no variants 
+        # are discarded due to assumptions about chromosome length
         ranges[-1] = (ranges[-1][0], 999_999_999)
         return ranges
 
     def get_vcf_stats(self, vcf_path):
-        cmd = [
-            'bcftools', 'index', '--stats', vcf_path
-        ]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        cmd = ["bcftools", "index", "--stats", vcf_path]
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
         if result.returncode != 0:
             raise ValueError(f"Error executing bcftools: {result.stderr}")
-        lines = [line.split('\t') for line in result.stdout.splitlines()]
+        lines = [line.split("\t") for line in result.stdout.splitlines()]
         if len(lines) > 1:
             raise ValueError("Only one chromosome per file is supported")
         chrom, chr_length, num_variants = lines[0]
-        if chr_length == '.':
+        if chr_length == ".":
             chr_length = self.get_chromosome_length(chrom)
         return chrom, chr_length, num_variants
 
@@ -277,25 +275,37 @@ class SparseReferencePanel:
         def process_chunk(args):
             start, end, chrom, vcf_path = args
             cmd = [
-                'bcftools', 'query', '-r', f'{chrom}:{start}-{end}', 
-                '-f', '%CHROM\t%POS\t%REF\t%ALT\n', vcf_path
+                "bcftools",
+                "query",
+                "-r",
+                f"{chrom}:{start}-{end}",
+                "-f",
+                "%CHROM\t%POS\t%REF\t%ALT\n",
+                vcf_path,
             ]
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            
+            result = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+
             if result.returncode != 0:
                 raise ValueError(f"Error executing bcftools: {result.stderr}")
-            
-            return [tuple(line.strip().split('\t')) for line in result.stdout.splitlines()]
+
+            return [
+                tuple(line.strip().split("\t")) for line in result.stdout.splitlines()
+            ]
 
         # Parallel processing of chunk_ranges
         with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
             chunk_variants_list = list(
                 tqdm(
-                    executor.map(process_chunk, [(start, end, chrom, vcf_path) for start, end in chunk_ranges]),
+                    executor.map(
+                        process_chunk,
+                        [(start, end, chrom, vcf_path) for start, end in chunk_ranges],
+                    ),
                     total=len(chunk_ranges),
                     desc="Ingest variants from the input",
                     ncols=75,
-                    bar_format="{desc}:\t\t\t{percentage:3.0f}% in {elapsed}"
+                    bar_format="{desc}:\t\t\t{percentage:3.0f}% in {elapsed}",
                 )
             )
 
@@ -323,7 +333,6 @@ class SparseReferencePanel:
             ],
             dtype=int,
         )
-        
         self.metadata.update(
             {
                 "chromosome": str(chrom),
@@ -358,7 +367,7 @@ class SparseReferencePanel:
     def _calculate_maf(self, chunk: int) -> np.ndarray:
         """Calculate minor allele frequency (maf) for a given chunk."""
         loaded_chunk = self._load_haplotypes(chunk)
-        freqs = (loaded_chunk.sum(axis=1) / self.metadata['n_haps']).A.squeeze()
+        freqs = (loaded_chunk.sum(axis=1) / self.metadata["n_haps"]).A.squeeze()
         mask = freqs > 0.5
         freqs[mask] = 1 - freqs[mask]
         return freqs
@@ -402,7 +411,9 @@ class SparseReferencePanel:
                 ncols=75,
                 bar_format="{desc}:\t\t{percentage:3.0f}% in {elapsed}",
             ):
-                haps = Parallel(n_jobs=threads,)(
+                haps = Parallel(
+                    n_jobs=threads,
+                )(
                     delayed(self._std_out_to_sparse)(command, chunk, hap_dir)
                     for chunk, command in enumerate(commands)
                 )
@@ -436,7 +447,7 @@ class SparseReferencePanel:
         """Convert an xsi file to sparse matrix"""
         if self.n_variants > 0 and not replace_file:
             print("Variants have already been loaded")
-            return
+            return self
         if not os.path.exists(xsi_path):
             raise FileNotFoundError(f"Missing input file: {xsi_path}")
         xsi_bcf = xsi_path + "_var.bcf"
@@ -472,7 +483,7 @@ class SparseReferencePanel:
         """Convert a vcf/bcf file to sparse matrix"""
         if self.n_variants > 0 and not replace_file:
             print("Variants have already been loaded")
-            return
+            return self
         if not os.path.exists(bcf_path):
             raise FileNotFoundError(f"Missing input file: {bcf_path}")
         if not (os.path.exists(bcf_path + ".tbi") or os.path.exists(bcf_path + ".csi")):
