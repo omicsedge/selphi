@@ -1,6 +1,7 @@
 import os
 import sys
 import subprocess
+from hashlib import blake2b
 from pathlib import Path
 import argparse
 import logging
@@ -16,11 +17,13 @@ from modules.interpolation import Interpolator
 from modules.load_data import load_and_interpolate_genetic_map
 from modules.pbwt import get_pbwt_matches
 from modules.sparse_ref_panel import SparseReferencePanel
-from modules.utils import timestamp, tqdm_joblib
+from modules.utils import get_version, timestamp, tqdm_joblib
 
 logger = logging.getLogger("Selphi")
 logger.setLevel(level=logging.INFO)
 logger.addHandler(logging.StreamHandler(sys.stdout))
+
+version = get_version()
 
 
 def selphi(
@@ -60,13 +63,28 @@ def selphi(
     # Load target samples and variants
     vcf_obj = cyvcf2.VCF(targets_path)
     target_samples = vcf_obj.samples
-    target_markers = np.array(
-        [
-            (variant.CHROM, variant.POS, variant.REF, variant.ALT[0])
-            for variant in vcf_obj
-        ],
-        dtype=ref_panel.variant_dtypes,
-    )
+    if ref_panel.variants[0][2] not in ref_panel.ids[0]:
+        # hash alleles
+        target_markers = np.array(
+            [
+                (
+                    variant.CHROM,
+                    variant.POS,
+                    blake2b(variant.REF.encode(), digest_size=8).hexdigest(),
+                    blake2b(variant.ALT[0].encode(), digest_size=8).hexdigest(),
+                )
+                for variant in vcf_obj
+            ],
+            dtype=ref_panel.variant_dtypes,
+        )
+    else:
+        target_markers = np.array(
+            [
+                (variant.CHROM, variant.POS, variant.REF, variant.ALT[0])
+                for variant in vcf_obj
+            ],
+            dtype=ref_panel.variant_dtypes,
+        )
     del vcf_obj
     if target_markers[0][0] != ref_panel.chromosome:
         raise KeyError(
@@ -123,9 +141,11 @@ def selphi(
     interpolator = Interpolator(
         ref_panel,
         target_samples,
+        targets_path,
         wgs_idx,
         target_idx,
         tmpdir,
+        version,
         cores,
     )
 
@@ -161,9 +181,8 @@ def selphi(
 
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser(
-        prog="Selphi (version 1.0)", description="PBWT for genotype imputation"
+        prog=f"Selphi v{version}", description="PBWT for genotype imputation"
     )
     parser.add_argument(
         "--refpanel",
@@ -222,7 +241,7 @@ if __name__ == "__main__":
 
     logger.info(
         (
-            "\nSelphi (version 1.0)\n"
+            f"\nSelphi v{version}\n"
             "Copyright (C) 2023 Selfdecode\nStart time: "
             f"{datetime.now(timezone.utc).strftime('%-I:%M:%S %p %Z on %-d %b %Y')}\n\n"
             f"Command line: {sys.argv[0]} \ \n{cmd}\n"
