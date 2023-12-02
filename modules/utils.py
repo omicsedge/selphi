@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from contextlib import contextmanager
+from pathlib import Path
 
 import numpy as np
 import joblib
@@ -46,3 +47,13 @@ def tqdm_joblib(*args, **kwargs):
     finally:
         joblib.parallel.BatchCompletionCallBack = old_batch_callback
         tqdm_object.close()
+
+
+def get_version() -> str:
+    """Retrieve version from pyproject.toml"""
+    lines = Path(__file__).parents[1].joinpath("pyproject.toml").read_text().splitlines()
+    for line in lines:
+        if line.startswith("version"):
+            return line.split('"')[-2]
+    else:
+        raise Warning("Could not determine version")

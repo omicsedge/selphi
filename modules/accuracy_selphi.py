@@ -51,11 +51,9 @@ class DataIngestion:
         if chr_length == ".":
             chr_length = self.get_chromosome_length(chrom)
         self.chrom = chrom
-        return self.ranges(chrom, int(chr_length), int(num_variants))
+        return self.ranges(int(chr_length), int(num_variants))
 
-    def ranges(
-        self, chrom: str, chr_length: int, num_variants: int
-    ) -> List[Tuple[int, int]]:
+    def ranges(self, chr_length: int, num_variants: int) -> List[Tuple[int, int]]:
         bp_per_variant = chr_length / num_variants
         bp_per_chunk = bp_per_variant * self.chunk_size
         current_start = 1
@@ -180,6 +178,7 @@ class CalculateMetrics:
         sID_wgs: List[str],
         chunk_index: int,
         unique_folder_name: str,
+        consider_phasing: bool,
     ) -> None:
         self.imputed = imputed.toarray().astype(int)
         self.wgs = wgs.toarray().astype(int)
@@ -191,7 +190,8 @@ class CalculateMetrics:
         self.variant_size = self.imputed.shape[0]
         self.unique_folder_name = unique_folder_name
         self.chunk_index = chunk_index
-        self.dose_to_binary = np.array([[1, 0], [1, 1], [0, 1]])
+        self.dose_to_binary = np.array([[0, 0], [0, 1], [1, 1]])
+        self.consider_phasing = consider_phasing
         if not os.path.exists(self.unique_folder_name):
             os.makedirs(self.unique_folder_name, exist_ok=True)
 
@@ -201,12 +201,16 @@ class CalculateMetrics:
     def _compute_metrics(
         self, axis: int
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        imputed = self.dose_to_binary[
-            self._load_dosage(self.imputed).flatten()
-        ].reshape(-1, self.sample_size)
-        wgs = self.dose_to_binary[self._load_dosage(self.wgs).flatten()].reshape(
-            -1, self.sample_size
-        )
+        if self.consider_phasing:
+            imputed = self.imputed
+            wgs = self.wgs
+        else:
+            imputed = self.dose_to_binary[
+                self._load_dosage(self.imputed).flatten()
+            ].reshape(-1, self.sample_size)
+            wgs = self.dose_to_binary[self._load_dosage(self.wgs).flatten()].reshape(
+                -1, self.sample_size
+            )
 
         TP = np.sum(np.logical_and(imputed == 1, wgs == 1), axis=axis)
         TN = np.sum(np.logical_and(imputed == 0, wgs == 0), axis=axis)
@@ -235,7 +239,7 @@ class CalculateMetrics:
             }
         )
 
-        df_var.applymap(self._format_number).to_csv(fn_per_variant, index=False)
+        df_var.map(self._format_number).to_csv(fn_per_variant, index=False)
 
         df_sample = pd.DataFrame(
             {
@@ -248,7 +252,7 @@ class CalculateMetrics:
             }
         )
 
-        df_sample.applymap(self._format_number).to_csv(fn_per_sample, index=False)
+        df_sample.map(self._format_number).to_csv(fn_per_sample, index=False)
 
         del df_var
         del df_sample
@@ -317,7 +321,7 @@ class CalculateMetrics:
             }
         )
 
-        df_var.applymap(self._format_number).to_csv(fn_per_variant, index=False)
+        df_var.map(self._format_number).to_csv(fn_per_variant, index=False)
 
         df_sample = pd.DataFrame(
             {
@@ -326,7 +330,7 @@ class CalculateMetrics:
             }
         )
 
-        df_sample.applymap(self._format_number).to_csv(fn_per_sample, index=False)
+        df_sample.map(self._format_number).to_csv(fn_per_sample, index=False)
 
         del df_var
         del df_sample
@@ -392,7 +396,7 @@ class CalculateMetrics:
             }
         )
 
-        df_var.applymap(self._format_number).to_csv(fn_per_variant, index=False)
+        df_var.map(self._format_number).to_csv(fn_per_variant, index=False)
 
         df_sample = pd.DataFrame(
             {
@@ -401,7 +405,7 @@ class CalculateMetrics:
             }
         )
 
-        df_sample.applymap(self._format_number).to_csv(fn_per_sample, index=False)
+        df_sample.map(self._format_number).to_csv(fn_per_sample, index=False)
 
         del df_var
 
@@ -447,9 +451,6 @@ class CalculateMetrics:
             + 1e-15
         )
 
-        # r2_per_sample = np.divide(num_sample, den_sample) ** 2
-        # r2_per_sample = np.round(r2_per_sample, decimals=6)
-
         return {
             "r2_per_variant": r2_per_variant,
             "r2_per_sample_num": num_sample,
@@ -469,7 +470,7 @@ class CalculateMetrics:
             }
         )
 
-        df_var.applymap(self._format_number).to_csv(fn_per_variant, index=False)
+        df_var.map(self._format_number).to_csv(fn_per_variant, index=False)
 
         del df_var
 
@@ -484,10 +485,7 @@ class CalculateMetrics:
 
         # squared error summed per sample
         # sample_rmse = np.sqrt(np.mean(se, axis=0))
-        return {
-            "var_rmse": var_rmse,
-            # 'sample_rmse': sample_rmse
-        }
+        return {"var_rmse": var_rmse}
 
     def _format_number(self, x):
         if isinstance(x, int):
@@ -547,10 +545,12 @@ class CalculateMetrics:
         self.save_fscore(), self.save_accuracy(), self.save_r2(), self.save_rmse()
         return self.concatenate_files()
 
+
 def remove_duplicates(input_file, unique_folder_name):
     temp_file = os.path.join(unique_folder_name, "temp_file_duplicates.txt")
     cmd = f"awk '!seen[$0]++' {input_file} > {temp_file} && mv {temp_file} {input_file}"
     subprocess.run(cmd, shell=True, check=True)
+
 
 def concatenate_samples(file_paths: List[str]) -> pd.DataFrame:
     sample_data = []
@@ -630,10 +630,12 @@ def concatenate_samples(file_paths: List[str]) -> pd.DataFrame:
         ]
     ]
 
-    return aggregate_df.applymap(_format_number)
+    return aggregate_df.map(_format_number)
 
 
-def calculate_metrics(chunk_index, imputed, wgs, chrom, start, end, unique_folder_name):
+def calculate_metrics(
+    chunk_index, imputed, wgs, chrom, start, end, unique_folder_name, consider_phasing
+):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         vID_imputed, Haps_imputed, sID_imputed = imputed._ingest_data(
@@ -651,6 +653,7 @@ def calculate_metrics(chunk_index, imputed, wgs, chrom, start, end, unique_folde
             sID_wgs,
             chunk_index,
             unique_folder_name,
+            consider_phasing,
         ).save_metrics()
 
 
@@ -701,6 +704,12 @@ def main():
         action="store_true",
         help="If set, temporary files will not be deleted.",
     )
+    parser.add_argument(
+        "--consider_phasing",
+        dest="consider_phasing",
+        action="store_true",
+        help="If not set, 0|1 and 1|0 are treated as equal.",
+    )
 
     args = parser.parse_args()
 
@@ -736,6 +745,7 @@ def main():
                 chunk[1][0],
                 chunk[1][1],
                 unique_folder_name,
+                args.consider_phasing,
             )
             for chunk in enumerate(chunk_ranges)
         ]
@@ -772,7 +782,7 @@ def main():
 
     # drop potential duplicates between chunks
     remove_duplicates(variant_out_path, unique_folder_name)
-    # pd.read_csv(variant_out_path).drop_duplicates().to_csv(variant_out_path,index=False)
+
     concatenated_sample_df = concatenate_samples(sample_file_paths)
     concatenated_sample_df.to_csv(sample_out_path, index=False, sep="\t")
 

@@ -80,9 +80,7 @@ def run_forward_block(
         shift = np.zeros((num_hid,), dtype=np.float64)
         shift[ordered_matches_matrix[aci_, : nHaps[aci_]]] = pRecomb_arr[aci_]
 
-        em = np.full(  # maybe no need to cr8 an array, just use pErr
-            (num_hid,), pErr, dtype=np.float64
-        )
+        em = np.full((num_hid,), pErr, dtype=np.float64)
         em[ordered_matches_matrix[aci_, : nHaps[aci_]]] = pNoErr
 
         alpha[m + 1, :] = em * (alpha[m, :] + shift)
@@ -136,6 +134,7 @@ def setBwdValues_SPARSE(
     # create final weight matrix (Sparse)
     weight_matrix = sparse.lil_matrix((num_obs + 2, num_hid), dtype=np.float64)
     weight_matrix[-1, ordered_matches[-1]] = 1 / len(ordered_matches[-1])
+    weight_matrix[-2, ordered_matches[-1]] = 1 / len(ordered_matches[-1])
     weight_matrix[0, ordered_matches[0]] = 1 / len(ordered_matches[0])
     weight_matrix[1, ordered_matches[0]] = 1 / len(ordered_matches[0])
 
@@ -192,18 +191,18 @@ def setBwdValues_SPARSE(
         pErr=pErr,
     )
 
-    for aci in range(1, chunk_compression - 2):
+    for aci in range(1, chunk_compression - 1):
         beta[ordered_matches_matrix[aci, : nHaps[aci]]] += pRecomb_arr[aci]
-        row = forward_decomp_block[aci + 1, :] * beta
+        row = forward_decomp_block[aci, :] * beta
 
         em = np.full((forward_decomp_block.shape[1],), pErr, dtype=np.float64)
         em[ordered_matches_matrix[aci - 1, : nHaps[aci - 1]]] = pNoErr
         beta[:] = beta * em
 
-        forward_decomp_block[aci + 1, :] = row / sum(row)
+        forward_decomp_block[aci, :] = row / sum(row)
 
         # put values in the sparse matrix on the fly
-        temp_array = forward_decomp_block[aci + 1, :].copy()
+        temp_array = forward_decomp_block[aci, :].copy()
         temp_array[temp_array < 1 / matches.size] = 0
         weight_matrix[aci + 1, matches] = temp_array.copy()
 

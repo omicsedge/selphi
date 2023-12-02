@@ -38,6 +38,7 @@ import os
 import subprocess
 from io import BytesIO
 from pathlib import Path
+from hashlib import blake2b
 from typing import List, Tuple, Union
 import json
 from datetime import datetime
@@ -58,18 +59,23 @@ import cyvcf2
 from .utils import tqdm_joblib
 
 
-
 class SparseReferencePanel:
     """Class for working with ref panels stored as sparse matrix"""
 
     def __init__(self, filepath: str, cache_size: int = 2) -> None:
         self.filepath = filepath
-        self.variant_dtypes = np.dtype(
-            [("chr", "<U21"), ("pos", int), ("ref", "<U21"), ("alt", "<U21")]
-        )
         if not os.path.exists(self.filepath):
             self._create()
         self.metadata = self._load_metadata()
+        self.variant_dtypes = np.dtype(
+            [
+                tuple(field)
+                for field in self.metadata.get(
+                    "variant_dtypes",
+                    [("chr", "<U21"), ("pos", int), ("ref", "<U21"), ("alt", "<U21")],
+                )
+            ]
+        )
         self.variants: np.ndarray = self._load_variants()
         self.chunks: np.ndarray = self._load_chunks()
         self.ids: List[str] = self._load_ids()
@@ -160,15 +166,11 @@ class SparseReferencePanel:
                     compress(json.dumps({"created_at": str(datetime.now())}).encode())
                 )
             with archive.open("variants", "w") as variants:
-                variants.write(
-                    compress(np.array([], dtype=self.variant_dtypes).tobytes())
-                )
+                variants.write(compress(np.array([]).tobytes()))
             with archive.open("sample_ids", "w") as sample_ids_obj:
                 sample_ids_obj.write(compress("\n".join([]).encode()))
             with archive.open("chunks", "w") as chunks:
-                chunks.write(
-                    compress(np.array([], dtype=int).tobytes())
-                )
+                chunks.write(compress(np.array([], dtype=int).tobytes()))
 
     def _save(self, hap_dir: str):
         """Update archive"""
@@ -232,10 +234,9 @@ class SparseReferencePanel:
         result = subprocess.run(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True
         )
-        if result.returncode != 0:
+        if result.returncode:
             raise ValueError(f"Error executing bcftools: {result.stderr}")
-        start_position = int(result.stdout.strip())
-        return start_position
+        return int(result.stdout.strip())
 
     def determine_chunk_ranges(self, vcf_path, chr_length, num_variants):
         chr_length = int(chr_length)
@@ -248,7 +249,7 @@ class SparseReferencePanel:
             end = min(current_start + bp_per_chunk, chr_length)
             ranges.append((int(current_start), int(end)))
             current_start = end + 1
-        # Update the last element to 999M in order to ensure that no variants 
+        # Update the last element to 999M in order to ensure that no variants
         # are discarded due to assumptions about chromosome length
         ranges[-1] = (ranges[-1][0], 999_999_999)
         return ranges
@@ -258,7 +259,7 @@ class SparseReferencePanel:
         result = subprocess.run(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
-        if result.returncode != 0:
+        if result.returncode:
             raise ValueError(f"Error executing bcftools: {result.stderr}")
         lines = [line.split("\t") for line in result.stdout.splitlines()]
         if len(lines) > 1:
@@ -287,7 +288,7 @@ class SparseReferencePanel:
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
             )
 
-            if result.returncode != 0:
+            if result.returncode:
                 raise ValueError(f"Error executing bcftools: {result.stderr}")
 
             return [
@@ -318,7 +319,26 @@ class SparseReferencePanel:
         self.sample_ids = vcf_obj.samples
         vcf_obj.close()
 
-        self.variants = np.fromiter(var_no_dup, dtype=self.variant_dtypes)
+        variant_dtypes = [
+            ("chr", f"<U{len(str(chrom))}"),
+            ("pos", "int"),
+            ("ref", "<U8"),
+            ("alt", "<U8"),
+        ]
+        self.variant_dtypes = np.dtype(variant_dtypes)
+
+        self.variants = np.fromiter(
+            [
+                (
+                    row[0],
+                    int(row[1]),
+                    blake2b(row[2].encode(), digest_size=8).hexdigest(),
+                    blake2b(row[3].encode(), digest_size=8).hexdigest(),
+                )
+                for row in var_no_dup
+            ],
+            dtype=self.variant_dtypes,
+        )
         self.ids = ["-".join([str(col) for col in line]) for line in var_no_dup]
 
         self.chunks = np.array(
@@ -341,6 +361,7 @@ class SparseReferencePanel:
                 "max_position": int(self.variants[-1][1]),
                 "n_chunks": self.chunks.shape[0],
                 "n_samples": len(self.sample_ids),
+                "variant_dtypes": variant_dtypes,
             }
         )
 
@@ -348,7 +369,7 @@ class SparseReferencePanel:
         with ZipFile(self.filepath, mode="r") as archive:
             with archive.open("chunks") as obj:
                 chunks_ = np.frombuffer(uncompress(obj.read()), dtype=int)
-        if chunks_.size > 0:
+        if chunks_.size:
             return np.reshape(chunks_, (self.n_chunks, 3))
         return chunks_
 
@@ -583,7 +604,6 @@ class SparseReferencePanel:
         self, min_bp: int, max_bp: int, inclusive: bool = True
     ) -> sparse.csc_matrix:
         """Get sparse matrix of boolean genotypes in position range"""
-        if inclusive:
-            max_bp += 1
+        max_bp += int(inclusive)
         positions = np.array([variant[1] for variant in self.variants], dtype=int)
         return self[positions.searchsorted(min_bp) : positions.searchsorted(max_bp), :]
