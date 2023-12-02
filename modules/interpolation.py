@@ -19,13 +19,16 @@ class Interpolator:
         self,
         ref_haplotypes: SparseReferencePanel,
         target_samples: List[str],
+        targets_path: Path,
         wgs_idx: np.ndarray,
         target_idx: np.ndarray,
         tmpdir: Path,
+        version: str,
         threads: int = 1,
     ):
         self.ref_haplotypes = ref_haplotypes
         self.target_samples = target_samples
+        self.targets_path = targets_path
 
         ref_order = np.argsort(wgs_idx)
         self.wgs_idx = wgs_idx[ref_order]
@@ -33,6 +36,7 @@ class Interpolator:
         del ref_order
 
         self.tmpdir = tmpdir
+        self.version = version
         self.threads = threads
 
         self.chunk_size = ceil(
@@ -59,7 +63,11 @@ class Interpolator:
         for start, _ in self.breakpoints:
             tmpdir.joinpath("weights", str(start)).mkdir(parents=True, exist_ok=True)
         self.writer = VcfWriter(
-            self.target_samples, self.ref_haplotypes.chromosome, self.tmpdir
+            self.target_samples,
+            self.targets_path,
+            self.ref_haplotypes.chromosome,
+            self.tmpdir,
+            self.version,
         )
 
     def _interpolate_hap(

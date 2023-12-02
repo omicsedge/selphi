@@ -13,12 +13,19 @@ class VcfWriter:
     """Class to convert from numpy array to VCF"""
 
     def __init__(
-        self, target_sample_names: List[str], chromomsome: str, tmpdir: Union[Path, str]
+        self,
+        target_sample_names: List[str],
+        targets_path: Path,
+        chromomsome: str,
+        tmpdir: Union[Path, str],
+        version: str,
     ):
         self.target_sample_names = target_sample_names
+        self.targets_path = targets_path
         self.chromosome = chromomsome
         self.tmpdir = Path(tmpdir).joinpath(str(uuid4()))
         self.tmpdir.mkdir(parents=True, exist_ok=True)
+        self.version = version
 
     @property
     def num_samples(self) -> int:
@@ -73,10 +80,19 @@ class VcfWriter:
             check=True,
         )
 
+    def read_GTs(self, pos: Union[int, str], ref: str, alt: str) -> str:
+        """Read variant genotypes from targets file"""
+        command = (
+            f"bcftools query -f '[%GT\t]' -r {self.chromosome}:{pos} "
+            f'-i \'REF="{ref}" & ALT[0]="{alt}"\' {self.targets_path}'
+        )
+        query = subprocess.run(command, check=True, capture_output=True, shell=True)
+        return query.stdout.decode().replace("\n", "").strip()
+
     def write_header(self) -> Path:
         header = (
             "##fileformat=VCFv4.2\n"
-            "##source=SELPHI_v1.0_1June2023.py Selfdecode™\n"
+            f"##source=SELPHI_v{self.version} Selfdecode™\n"
             '##FILTER=<ID=PASS,Description="All filters passed">\n'
             '##INFO=<ID=IMP,Number=0,Type=Flag,Description="Imputed marker">\n'
             '##INFO=<ID=AF,Number=A,Type=Float,Description="Estimated ALT Allele Frequencies">\n'
@@ -129,8 +145,26 @@ class VcfWriter:
                 for i, idx in enumerate(variant_ids):
                     chrom, pos, ref, alt = idx.split("-")
                     vcf_INFO = f"AF={AF[i]};AC={AC[i]};AN={AN}"
-                    if i not in target_ids:
-                        vcf_INFO += ";IMP"
+                    if i + start in target_ids:
+                        # write chip genotypes
+                        fout.write(
+                            "\t".join(
+                                [
+                                    chrom,
+                                    pos,
+                                    idx,
+                                    ref,
+                                    alt,
+                                    ".\tPASS",
+                                    vcf_INFO,
+                                    "GT",
+                                    self.read_GTs(pos, ref, alt),
+                                ]
+                            )
+                        )
+                        fout.write("\n")
+                        continue
+                    vcf_INFO += ";IMP"
                     fout.write(
                         "\t".join(
                             [

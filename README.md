@@ -79,6 +79,15 @@ docker run -v /path/to/data:/data -it selphi \
 
 If you encounter any issues or have suggestions for improvements, please feel free to contribute by submitting a pull request or creating an issue in the GitHub repository.
 
+### Development
+
+* Make a PR with your changes.
+* Get your PR reviewed and merged.
+* Switch to master branch.
+* `poetry run cz bump`
+* `git push --follow-tags`
+* [Create new release](https://github.com/selfdecode/file-processing-docker/releases).
+
 ## Reference
 
 The full project description can be found in this [White Paper](https://docs.google.com/document/d/1oEe_JYXBMo3EBToGLrlTOYtDBpPAPAk_UnqGC1WNMiU/edit).
