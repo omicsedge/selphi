@@ -50,6 +50,7 @@ COPY requirements.txt requirements.txt
 RUN python3 -m pip install -r requirements.txt
 
 COPY *.py /tool/
+COPY *.toml /tool/
 COPY ./modules /tool/modules
 
 ENTRYPOINT [ "python3", "/tool/selphi.py" ]
