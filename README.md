@@ -16,9 +16,9 @@ It is essential to adhere to these assumptions to ensure the proper functioning 
 
 ## Installation
 
-1. Make sure you have Docker installed on your system.
-2. Build the Selphi Docker image from this repository: `docker build -t selphi . `.
-3. Run the Selphi container with the desired options to perform genotype imputation.
+1. Make sure you have Docker installed on your system
+2. Build the Selphi Docker image from this repository: ` docker build -t selphi . `
+3. Run the Selphi container with the desired options to perform genotype imputation
 
 ## Usage
 
@@ -46,7 +46,7 @@ Running the container without specifying any command will display the help messa
 - `--est_ne`: Estimated population size (default: 1000000).
 
 
-### Prepare reference panel
+### How to Prepare the reference panel
 run:
 ```bash
 docker run -v /path/to/data:/data -it selphi \
@@ -81,13 +81,19 @@ If you encounter any issues or have suggestions for improvements, please feel fr
 
 ### Development
 
-* Make a PR with your changes.
-* Get your PR reviewed and merged.
-* Switch to master branch.
+* Make a PR with your changes
+* Get your PR reviewed and merged
+* Switch to master branch
 * `poetry run cz bump`
 * `git push --follow-tags`
 * [Create new release](https://github.com/selfdecode/rd-imputation-selphi/releases).
 
 ## Reference
 
-The full project description can be found in the [PrePrint version](https://www.medrxiv.org/content/10.1101/2023.12.18.23300143v2).
+If you use Selphi in your research, please cite:
+```
+Empowering GWAS Discovery through Enhanced Genotype Imputation
+Adriano De Marino, Abdallah Amr Mahmoud, Sandra Bohn, Jon Lerga-Jaso, Biljana Novković, Charlie Manson, Salvatore Loguercio, Andrew Terpolovsky, Mykyta Matushyn, Ali Torkamani, Puya G. Yazdi
+medRxiv 2023.12.18.23300143; doi: https://doi.org/10.1101/2023.12.18.23300143
+```
+The full project description can be found in the [PrePrint version](https://www.medrxiv.org/content/10.1101/2023.12.18.23300143v2)
