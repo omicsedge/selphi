@@ -39,7 +39,7 @@ Running the container without specifying any command will display the help messa
 - `--cores CORES`: Number of available cores for parallel processing (default: 1)
 - `--prepare_reference`: Convert the reference panel to PBWT and SRP formats
 - `--ref_source_vcf REF_SOURCE_VCF`: Location of the VCF/BCF file containing the reference panel
-- `--ref_source_xsi REF_SOURCE_XSI`: location of xsi files containing reference panel, cannot be used in combination with --ref_source_vcf
+- `--ref_source_xsi REF_SOURCE_XSI`: Location of xsi files containing reference panel, cannot be used in combination with `--ref_source_vcf`
 - `--pbwt_path PBWT_PATH`: Path to the PBWT library
 - `--tmp_path TMP_PATH`: Location to create a temporary directory
 - `--match_length MATCH_LENGTH`: Minimum PBWT match length
