@@ -8,6 +8,7 @@ import logging
 from datetime import datetime, timezone
 from tempfile import TemporaryDirectory
 from joblib import Parallel, delayed
+from joblib.externals.loky.process_executor import TerminatedWorkerError
 
 import numpy as np
 import cyvcf2
@@ -36,6 +37,7 @@ def selphi(
     match_length: int = 5,
     est_ne: int = 1000000,
     cores: int = 1,
+    adjust_cores: bool = True,
 ):
     # Check if required files are available
     if not targets_path.exists():
@@ -150,25 +152,35 @@ def selphi(
     )
 
     # Calculate HMM weights from matches
-    with tqdm_joblib(
-        total=len(target_haps),
-        desc=" [core] Calculating weights with HMM",
-        ncols=75,
-        bar_format="{desc}:\t\t\t\t\t{percentage:3.0f}% in {elapsed}",
-    ):
-        _ = Parallel(n_jobs=cores)(
-            delayed(calculate_weights)(
-                target_hap,
-                chip_cM_coordinates,
-                pbwt_result_path,
-                expected_shape,
-                tmpdir.joinpath("weights"),
-                interpolator.breakpoints,
-                logger,
-                est_ne,
-            )
-            for target_hap in target_haps
-        )
+    # Reduce cores if not enough memory
+    while cores > 0:
+        try:
+            with tqdm_joblib(
+                total=len(target_haps),
+                desc=" [core] Calculating weights with HMM",
+                ncols=75,
+                bar_format="{desc}:\t\t\t\t\t{percentage:3.0f}% in {elapsed}",
+            ):
+                _ = Parallel(n_jobs=cores)(
+                    delayed(calculate_weights)(
+                        target_hap,
+                        chip_cM_coordinates,
+                        pbwt_result_path,
+                        expected_shape,
+                        tmpdir.joinpath("weights"),
+                        interpolator.breakpoints,
+                        logger,
+                        est_ne,
+                    )
+                    for target_hap in target_haps
+                )
+            break
+        except TerminatedWorkerError as exc:
+            cores -= 1
+            if not cores or not adjust_cores:
+                raise TerminatedWorkerError from exc
+            logger.info(f"HMM exceeded available memory, trying again with {cores} threads")     
+
     del chip_cM_coordinates
 
     # Interpolate genotypes
@@ -233,6 +245,11 @@ if __name__ == "__main__":
         type=int,
         default=1000000,
         help="Ne for calculating recombination probability (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--no_core_reduction",
+        action="store_true",
+        help="Exit if memory limit is exceeded instead of reducing cores (default: %(default)s)",
     )
     args = parser.parse_args()
     cmd = " \ \n".join([f"  --{k} {v}" for k, v in vars(args).items() if v is not None])
@@ -328,4 +345,5 @@ if __name__ == "__main__":
             match_length=args.match_length,
             est_ne=args.est_ne,
             cores=args.cores,
+            adjust_cores=not args.no_core_reduction,
         )
