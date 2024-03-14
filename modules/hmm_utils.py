@@ -175,7 +175,7 @@ def setBwdValues_SPARSE(
 
         for fbi in range(forward_decomp_block.shape[0] - 1, -1, -1):
             temp_array = forward_decomp_block[fbi, :].copy()
-            temp_array[temp_array < 1 / matches.size] = 0
+            temp_array[temp_array < 1 / (matches.size + 1)] = 0
             weight_matrix[aci + fbi, matches] = temp_array.copy()
 
     # Run Last iteration
@@ -203,7 +203,7 @@ def setBwdValues_SPARSE(
 
         # put values in the sparse matrix on the fly
         temp_array = forward_decomp_block[aci, :].copy()
-        temp_array[temp_array < 1 / matches.size] = 0
+        temp_array[temp_array < 1 / (matches.size + 1)] = 0
         weight_matrix[aci + 1, matches] = temp_array.copy()
 
     return weight_matrix.tocsr()

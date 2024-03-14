@@ -191,7 +191,7 @@ def calculate_weights(
     ).haplotype_id_lists()
 
     haps, counts = np.unique(np.hstack(ordered_hap_indices), return_counts=True)
-    cutoff = np.percentile(counts, 10)
+    cutoff = min(np.percentile(counts, 10), counts.max() - 1)
     best_haps = haps[counts > cutoff]
 
     weight_matrix = run_hmm(
