@@ -102,7 +102,7 @@ class SparseReferencePanel:
                     ]
                 )
             row_stop = (
-                min([key[0].stop, self.n_variants]) if key[0].stop else self.n_variants
+                min([key[0].stop, self.n_variants]) if key[0].stop is not None else self.n_variants
             )
             chunks = list(
                 range(
