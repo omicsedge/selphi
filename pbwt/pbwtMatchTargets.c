@@ -261,14 +261,14 @@ static void pbwtMatchTargets(PBWT * p, int minL, int nRefHaps) {
         rHap++;
       }
     }
-    for (tHap = 0; tHap < nTargetHaps; ++tHap) {
+    for (tHap = 0; tHap < nTargetHaps; tHap++) {
       rHap = 0;
       tgt_idx = u -> a[targetHaps[tHap]] - nRefHaps;
       ib = targetHaps[tHap];
       while (ib > refHaps[rHap] && rHap < nRefHaps) rHap++;
-      for (ir = rHap - 1, i0 = ib, dmin_ = 0; ir >= 0; --ir) {
+      for (ir = rHap - 1, i0 = ib, dmin_ = 0; ir >= 0; ir--) {
         ia = refHaps[ir];
-        for (id = i0; id > ia; --id)
+        for (id = i0; id > ia; id--)
           if (u -> d[id] > dmin_) dmin_ = u -> d[id];
         if (dmin_ <= var - minL)
           if ((u -> y[ib] != u -> y[ia]) || (var >= nVar - 1))
@@ -277,7 +277,7 @@ static void pbwtMatchTargets(PBWT * p, int minL, int nRefHaps) {
         i0 = ia;
       }
       ia = targetHaps[tHap];
-      for (ib = ia + 1, dmin = 0; ib <= refHaps[(nRefHaps - 1)]; ++ib) {
+      for (ib = ia + 1, dmin = 0; ib <= refHaps[(nRefHaps - 1)]; ib++) {
         if (u -> d[ib] > dmin) dmin = u -> d[ib];
         if (dmin <= var - minL)
           if ((u -> y[ib] != u -> y[ia]) || (var >= nVar - 1))

@@ -116,6 +116,8 @@ void pbwtCursorToAFend(PbwtCursor * u, PBWT * p); /* utility to copy final u->a 
 /* select sites */
 PBWT * pbwtFilterSites(PBWT * pOld, Array filter);
 PBWT * pbwtMerge2(PBWT * p, PBWT * q);
+/* describe matches */
+void getMatchDistribution(PBWT * p, FILE * fp);
 
 /* pbwtSample.c */
 void sampleInit(void);

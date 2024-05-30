@@ -79,16 +79,17 @@ int main(int argc, char * argv[]) {
     fprintf(stderr, "Modified and maintained by SelfDecode\n");
     fprintf(stderr, "Usage: pbwt [ -<command> [options]* ]+\n");
     fprintf(stderr, "Commands:\n");
-    fprintf(stderr, "  -log <file>               log file; '-' for stderr\n");
-    fprintf(stderr, "  -check                    do various checks\n");
-    fprintf(stderr, "  -stats                    print stats depending on commands; writes to stdout\n");
-    fprintf(stderr, "  -readAll <rootname>       read .pbwt and if present .sites, .samples, .missing\n");
-    fprintf(stderr, "  -readVcfGT <file>         read GTs from vcf or bcf file; '-' for stdin vcf only ; biallelic sites only - require diploid!\n");
-    fprintf(stderr, "  -checkpoint <n>           checkpoint every n sites while reading\n");
-    fprintf(stderr, "  -writeAll <rootname>      write .pbwt and if present .sites, .samples, .missing\n");
-    fprintf(stderr, "  -filterSites <file>       filter sites with boolean array\n");
-    fprintf(stderr, "  -selectSamples <file>     select samples as in samples file\n");
+    fprintf(stderr, "  -log <file>                log file; '-' for stderr\n");
+    fprintf(stderr, "  -check                     do various checks\n");
+    fprintf(stderr, "  -stats                     print stats depending on commands; writes to stdout\n");
+    fprintf(stderr, "  -readAll <rootname>        read .pbwt and if present .sites, .samples, .missing\n");
+    fprintf(stderr, "  -readVcfGT <file>          read GTs from vcf or bcf file; '-' for stdin uncompressed vcf only; diploid, biallelic sites only\n");
+    fprintf(stderr, "  -checkpoint <n>            checkpoint every n sites while reading\n");
+    fprintf(stderr, "  -writeAll <rootname>       write .pbwt and if present .sites, .samples, .missing\n");
+    fprintf(stderr, "  -filterSites <file>        filter sites with boolean array\n");
+    fprintf(stderr, "  -selectSamples <file>      select samples as in samples file\n");
     fprintf(stderr, "  -referenceMatch <root> <L> find matches in reference panel longer than L\n");
+    fprintf(stderr, "  -matchLengths <file>       get distribution of match lengths in reference panel\n");
   }
 
   while (argc) {
@@ -140,6 +141,11 @@ int main(int argc, char * argv[]) {
       referenceMatch(p, argv[1], atoi(argv[2]));
       argc -= 3;
       argv += 3;
+    } else if (!strcmp(argv[0], "-matchLengths") && argc > 1) {
+      FOPEN("matchLengths", "w");
+      getMatchDistribution(p, fp);
+      argc -= 2;
+      argv += 2;
     } else
       die("unrecognised command %s\nType pbwt without arguments for help", * argv);
   }

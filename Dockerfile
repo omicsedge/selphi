@@ -40,14 +40,15 @@ RUN mkdir -p /usr/src/ && \
     cp xsqueezeit /usr/local/bin/
 # Build pbwt library
 RUN mkdir -p /tool
+RUN apt install -y libssl-dev gdb
+COPY requirements.txt requirements.txt
+RUN python3 -m pip install -r requirements.txt
 COPY ./pbwt /tool/pbwt
 RUN cd /tool/pbwt && HTSDIR=/usr/src/xSqueezeIt/htslib make
 # clean up
 RUN rm -r /usr/src/xSqueezeIt
 
-RUN apt install -y  libssl-dev
-COPY requirements.txt requirements.txt
-RUN python3 -m pip install -r requirements.txt
+
 
 COPY *.py /tool/
 COPY *.toml /tool/

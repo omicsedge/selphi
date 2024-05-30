@@ -431,4 +431,44 @@ PBWT * pbwtMerge2(PBWT * p, PBWT * q) {
   return out_pbwt;
 }
 
+void getMatchDistribution(PBWT * p, FILE * fp){
+  int dmin, hap, i, ohap, var;
+  PbwtCursor * u = pbwtCursorCreate(p, TRUE, TRUE);
+
+  // set sampling interval to subsample min(500, 1% of haplotypes)
+  int s = u -> M / 500;
+  if ( s < 1 ) s = 1;
+  else if ( s > 100 ) s = 100;
+
+  int * matchCounts;
+  matchCounts = myalloc(p -> N, int);
+  for (i = 0; i < p -> N; i++) matchCounts[i] = 0;
+
+  printf("Scanning reference panel for matches\n");
+  for (var = 0; var < p -> N; ++var) {
+    if (var < 3) {
+      pbwtCursorForwardsReadAD(u, var);
+      continue;
+    }
+    for (hap = 0; hap < u -> M; hap+=s) {
+        for (ohap = hap + 1, dmin = 0; ohap < u -> M; ohap+=s) {
+          if (u -> d[ohap] > dmin) dmin = u -> d[ohap];
+          if (dmin <= var - 3)
+            if ((u -> y[ohap] != u -> y[hap]) || (var >= p -> N - 1))
+              matchCounts[var - dmin] += 1;
+        }
+    }
+    pbwtCursorForwardsReadAD(u, var);
+    printProgress((double) var / p -> N);
+  }
+  printProgress(1.0);
+  printf("\n");
+  pbwtCursorDestroy(u);
+  fprintf(fp, "Length,Frequency\n");
+  for (i = 3; i < p -> N; i++) {
+    if (matchCounts[i] > 0) fprintf(fp, "%d,%d\n", i, matchCounts[i]);
+  }
+  free(matchCounts);
+}
+
 /******************* end of file *******************/
