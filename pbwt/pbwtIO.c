@@ -52,7 +52,7 @@ static void pbwtWrite (PBWT *p, FILE *fp) /* just writes compressed pbwt in yz *
   if (fwrite (arrp(p->yz, 0, uchar), sizeof(uchar), arrayMax(p->yz), fp) != arrayMax(p->yz))
     die ("error writing data in pbwtWrite") ;
 
-  fprintf(logFile, " [pbwt]: Saved %d haplotypes and %d sites to file\n", p->M, p->N);
+  fprintf(logFile, "\n [pbwt]: Saved %d haplotypes and %d sites to file\n", p->M, p->N);
 }
 
 static void pbwtWriteSites (PBWT *p, FILE *fp) {
