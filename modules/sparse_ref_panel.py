@@ -322,8 +322,8 @@ class SparseReferencePanel:
         variant_dtypes = [
             ("chr", f"<U{len(str(chrom))}"),
             ("pos", "int"),
-            ("ref", "<U8"),
-            ("alt", "<U8"),
+            ("ref", "<U21"),
+            ("alt", "<U21"),
         ]
         self.variant_dtypes = np.dtype(variant_dtypes)
 
