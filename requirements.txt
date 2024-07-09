@@ -1,5 +1,5 @@
 cachetools
-cyvcf2==0.31.0
+cyvcf2==0.31.1
 joblib
 numba
 numpy
