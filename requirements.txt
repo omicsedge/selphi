@@ -2,7 +2,7 @@ cachetools
 cyvcf2==0.31.1
 joblib
 numba
-numpy
+numpy==1.26.4
 pandas
 scipy
 tqdm
