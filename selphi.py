@@ -192,7 +192,7 @@ def selphi(
     # Interpolate genotypes
     output_file = interpolator.interpolate_genotypes(output_path)
 
-    logger.info(f"{timestamp()}: Saved imputed genotypes to {output_file}")
+    logger.info(f"\n{timestamp()}: Saved imputed genotypes to {output_file}")
     logger.info(
         "===== Total time: %d seconds =====" % (datetime.now() - start_time).seconds
     )
