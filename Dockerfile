@@ -1,6 +1,6 @@
 FROM ubuntu:20.04
 
-ENV DEBIAN_FRONTEND noninteractive
+ENV DEBIAN_FRONTEND=noninteractive
 
 # Install required software and clean as not to make the layer dirty
 RUN apt-get update && apt-get -y upgrade && apt-get install -y \

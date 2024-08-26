@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 import subprocess
 from hashlib import blake2b
@@ -120,7 +121,7 @@ def selphi(
         pbwt_path,
         targets_path,
         ref_base_path,
-        tmpdir,
+        tmpdir.joinpath("matches"),
         target_samples,
         wgs_filter,
         target_filter,
@@ -153,7 +154,8 @@ def selphi(
 
     # Calculate HMM weights from matches
     # Reduce cores if not enough memory
-    while cores > 0:
+    hmm_cores = min(cores, len(target_haps))
+    while hmm_cores > 0:
         try:
             with tqdm_joblib(
                 total=len(target_haps),
@@ -161,7 +163,7 @@ def selphi(
                 ncols=75,
                 bar_format="{desc}:\t\t\t\t\t{percentage:3.0f}% in {elapsed}",
             ):
-                _ = Parallel(n_jobs=cores)(
+                _ = Parallel(n_jobs=hmm_cores)(
                     delayed(calculate_weights)(
                         target_hap,
                         chip_cM_coordinates,
@@ -176,17 +178,21 @@ def selphi(
                 )
             break
         except TerminatedWorkerError as exc:
-            cores -= 1
-            if not cores or not adjust_cores:
+            hmm_cores -= 1
+            if not hmm_cores or not adjust_cores:
                 raise TerminatedWorkerError from exc
-            logger.info(f"HMM exceeded available memory, trying again with {cores} threads")     
+            logger.info(
+                f"HMM exceeded available memory, trying again with {hmm_cores} threads"
+            )
 
+    if pbwt_result_path != tmpdir:
+        shutil.rmtree(pbwt_result_path, ignore_errors=True)
     del chip_cM_coordinates
 
     # Interpolate genotypes
     output_file = interpolator.interpolate_genotypes(output_path)
 
-    logger.info(f"{timestamp()}: Saved imputed genotypes to {output_file}")
+    logger.info(f"\n{timestamp()}: Saved imputed genotypes to {output_file}")
     logger.info(
         "===== Total time: %d seconds =====" % (datetime.now() - start_time).seconds
     )

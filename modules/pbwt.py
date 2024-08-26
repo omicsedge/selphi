@@ -57,6 +57,7 @@ def get_pbwt_matches(
     between target haplotypes and reference panel haplotypes
     and save the matches in sparse matrix npz format.
     """
+    tmpdir.mkdir(parents=True, exist_ok=True)
     logger.info(f"{timestamp()}: Filtering reference panel to match target variants")
     np.savetxt(tmpdir.joinpath("ref_filter.txt"), ref_filter, fmt="%u")
     subprocess.run(

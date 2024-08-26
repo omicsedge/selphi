@@ -2,6 +2,7 @@ from typing import List, Tuple
 from pathlib import Path
 from uuid import uuid4
 from math import ceil
+import shutil
 import numpy as np
 from scipy import sparse
 
@@ -171,11 +172,15 @@ class Interpolator:
         if stop == self.original_ref_indices[-1]:
             stop += 1
             in_target = in_target[:-1]
-        return self.writer.write_variants(
+        chunk_path = self.writer.write_variants(
             self.ref_haplotypes.ids[start:stop],
             in_target,
             alt_probs.transpose(),
         )
+        shutil.rmtree(
+            self.tmpdir.joinpath("weights", str(start_idx)), ignore_errors=True
+        )
+        return chunk_path
 
     def interpolate_genotypes(self, output_path: Path) -> str:
         # Prepare to write results to VCF
