@@ -1,209 +1,172 @@
+from typing import List, Tuple
+from pathlib import Path
+
 from scipy import sparse
 import numpy as np
 from numba import njit
+from zstd import compress, uncompress
 
 
 @njit
-def pRecomb(
-    distances_cm: np.ndarray, num_hid: int = 9000, ne: int = 1000000
-) -> np.ndarray:
-    """
-    pRecomb between obs and obs-1
-    """
-    dm_array = np.append([0], np.diff(distances_cm))
-    dm_array[np.where(dm_array == 0)] = 0.0000001
-    return 1 - np.exp((dm_array * -0.04 * ne) / num_hid)
-
-
-def setFwdValues_SPARSE(
-    num_obs: int,  # number of variants
-    ordered_matches: np.ndarray,
-    pRecomb_arr: np.ndarray,
-    num_hid: int = 9000,  # number of ref haplotypes
-    pErr: float = 0.0001,
-) -> sparse.lil_matrix:
-    """
-    set forward values
-    """
-    # Create compressed forward matrix
-    chunk_compression = 30
-    matrix_ = sparse.lil_matrix(
-        ((num_obs - 1) // chunk_compression, num_hid), dtype=np.float64
+def _calculate_pRecomb(
+    distances_cm: np.ndarray, nHaps: np.ndarray, num_hid: int = 9000, ne: int = 1000000
+) -> Tuple[np.ndarray]:
+    """return pRecomb between obs and obs - 1, pRecomb between obs and obs + 1"""
+    min_value = 0.0000001
+    min_recomb = [1 - np.exp((min_value * -0.04 * ne) / num_hid)]
+    dm_array = np.diff(distances_cm)
+    dm_array[dm_array == 0] = min_value
+    recomb_array = 1 - np.exp((dm_array * -0.04 * ne) / num_hid)
+    return (
+        np.append(min_recomb, recomb_array) / nHaps,
+        np.append(recomb_array, min_recomb) / nHaps,
     )
 
-    pNoErr = 1 - pErr
 
-    alpha = np.zeros((num_hid,), dtype=np.float64)
-    alpha[ordered_matches[0]] = 1 / len(ordered_matches[0])
-
-    for m in range(1, num_obs):
-        if m % chunk_compression == 0:
-            matrix_[(m // chunk_compression) - 1, :] = alpha
-
-        alpha[ordered_matches[m]] += pRecomb_arr[m]
-
-        em = np.full((num_hid,), pErr, dtype=np.float64)
-        em[ordered_matches[m]] = pNoErr
-        alpha = em * alpha
-
-    return matrix_
-
-
-def run_forward_block(
-    init_probs: np.ndarray,
-    num_obs: int,
-    aci: int,
-    chunk_compression: int,
-    ordered_matches_matrix: np.ndarray,
-    pRecomb_arr: np.ndarray,
-    nHaps: np.ndarray,
-    initial: bool = False,
-    pErr: float = 0.0001,
-) -> np.ndarray:
-    if (num_obs - aci) > chunk_compression:
-        if not initial:
-            end = chunk_compression
-        else:
-            end = chunk_compression - 1
-    else:
-        end = num_obs - aci
-
-    num_hid = init_probs.shape[1]
-    alpha = np.zeros((end, num_hid), dtype=np.float64)
-    alpha[0, :] = init_probs
-
-    pNoErr = 1 - pErr
-
-    for m in range(end - 1):
-        aci_ = m + aci
-
-        shift = np.zeros((num_hid,), dtype=np.float64)
-        shift[ordered_matches_matrix[aci_, : nHaps[aci_]]] = pRecomb_arr[aci_]
-
-        em = np.full((num_hid,), pErr, dtype=np.float64)
-        em[ordered_matches_matrix[aci_, : nHaps[aci_]]] = pNoErr
-
-        alpha[m + 1, :] = em * (alpha[m, :] + shift)
-
-    return alpha
-
-
-@njit
-def run_backward_calc(
-    aci: int,
-    pRecomb_arr: np.ndarray,
-    ordered_matches_matrix: np.ndarray,
-    nHaps: np.ndarray,
-    forward_decomp_block: np.ndarray,
-    beta: np.ndarray,
-    pErr: float = 0.0001,
-) -> None:
-    pNoErr = 1 - pErr
-
-    for fbi in range(forward_decomp_block.shape[0] - 2, -2, -1):
-        aci_ = aci + fbi
-
-        beta[ordered_matches_matrix[aci_, : nHaps[aci_]]] += pRecomb_arr[aci_]
-        row = forward_decomp_block[fbi + 1, :] * beta
-
-        em = np.full((forward_decomp_block.shape[1],), pErr, dtype=np.float64)
-        em[ordered_matches_matrix[aci_ - 1, : nHaps[aci_ - 1]]] = pNoErr
-        beta[:] = beta * em
-
-        forward_decomp_block[fbi + 1, :] = row / sum(row)
-
-
-def setBwdValues_SPARSE(
-    matrix_: sparse.lil_matrix,
-    num_obs: int,
-    ordered_matches: np.ndarray,
-    pRecomb_arr: np.ndarray,
-    nHaps: np.ndarray,
-    num_hid: int = 9000,
-    pErr: float = 0.0001,
-) -> sparse.csr_matrix:
+class HMM:
     """
-    set backward values
+    Class to compute haplotype weights for imputation
+    using forward-backward Hidden Markov Model
     """
-    chunk_compression = 30
-    # reduce to only matching haplotypes
-    matches = np.unique(matrix_.tocoo().col)
-    trans_ = np.zeros(num_hid, dtype=np.int32)
-    trans_[matches] = np.arange(matches.size)
 
-    # create final weight matrix (Sparse)
-    weight_matrix = sparse.lil_matrix((num_obs + 2, num_hid), dtype=np.float64)
-    weight_matrix[-1, ordered_matches[-1]] = 1 / len(ordered_matches[-1])
-    weight_matrix[-2, ordered_matches[-1]] = 1 / len(ordered_matches[-1])
-    weight_matrix[0, ordered_matches[0]] = 1 / len(ordered_matches[0])
-    weight_matrix[1, ordered_matches[0]] = 1 / len(ordered_matches[0])
-
-    pNoErr = 1 - pErr
-
-    # Loop over the matrix_ from back to front
-    # rci for reverse compressed index
-    ordered_matches_matrix = np.zeros((num_obs, nHaps.max()), dtype=np.int32)
-    for c in range(num_obs):
-        ordered_matches_matrix[c, : nHaps[c]] = trans_[ordered_matches[c]]
-
-    matrix__ = matrix_[:, matches]
-    beta = np.full((matches.size,), 1 / nHaps[-1], dtype=np.float64)
-
-    for rci in range(matrix__.shape[0] - 1, -1, -1):
-        aci = (rci + 1) * chunk_compression  # aci for actual_chip_index
-
-        forward_decomp_block = run_forward_block(
-            matrix__[rci, :].toarray(),
-            num_obs,
-            aci,
-            chunk_compression,
-            ordered_matches_matrix,
-            pRecomb_arr,
-            nHaps,
-            pErr=pErr,
+    def __init__(
+        self,
+        ordered_matches: np.ndarray,
+        distances_cm: np.ndarray,
+        output_dir: Path,
+        target_hap: Tuple[str, int],
+        output_breaks: List[Tuple[int]],
+        shape: Tuple[int],
+        est_ne: int = 1000000,
+        pErr: float = 0.0001,
+    ):
+        self.ordered_matches = ordered_matches
+        self.n_hid, self.n_sites = shape
+        self.nHaps = np.array([len(row) for row in ordered_matches])
+        self.f_pRecomb, self.r_pRecomb = _calculate_pRecomb(
+            distances_cm, self.nHaps, num_hid=self.n_hid, ne=est_ne
         )
+        self.pErr = pErr
+        self.pNoErr = 1 - pErr
 
-        run_backward_calc(
-            aci,
-            pRecomb_arr,
-            ordered_matches_matrix,
-            nHaps,
-            forward_decomp_block,
-            beta,
-            pErr=pErr,
-        )
+        self.basename = f"{target_hap[0]}_{target_hap[1]}.npz"
+        self.output_dir = output_dir
+        self.output_breaks = output_breaks
 
-        for fbi in range(forward_decomp_block.shape[0] - 1, -1, -1):
-            temp_array = forward_decomp_block[fbi, :].copy()
-            temp_array[temp_array < 1 / (matches.size + 1)] = 0
-            weight_matrix[aci + fbi, matches] = temp_array.copy()
+        # reduce to only matching haplotypes
+        self.matches = np.unique(np.hstack(ordered_matches))
+        trans_ = np.zeros(self.n_hid, dtype=np.int32)
+        trans_[self.matches] = np.arange(self.matches.size)
 
-    # Run Last iteration
-    forward_decomp_block = run_forward_block(
-        weight_matrix[1, matches].toarray(),
-        num_obs,
-        1,
-        chunk_compression,
-        ordered_matches_matrix,
-        pRecomb_arr,
-        nHaps,
-        initial=True,
-        pErr=pErr,
-    )
+        self.dense_matches = np.zeros((self.n_sites, self.nHaps.max()), dtype=np.int32)
+        for c in range(self.n_sites):
+            self.dense_matches[c, : self.nHaps[c]] = trans_[ordered_matches[c]]
 
-    for aci in range(1, chunk_compression - 1):
-        beta[ordered_matches_matrix[aci, : nHaps[aci]]] += pRecomb_arr[aci]
-        row = forward_decomp_block[aci, :] * beta
+    def _calculate_row(
+        self, last_row: np.ndarray, row_matches: np.ndarray, p_recomb: float
+    ) -> np.ndarray:
+        "Compute new row of alpha/beta values from existing row"
+        em = np.full_like(last_row, self.pErr)
+        em[row_matches] = self.pNoErr
+        last_row[row_matches] += p_recomb
+        return em * last_row
 
-        em = np.full((forward_decomp_block.shape[1],), pErr, dtype=np.float64)
-        em[ordered_matches_matrix[aci - 1, : nHaps[aci - 1]]] = pNoErr
-        beta[:] = beta * em
+    def _chunk_fwd_values(
+        self, init_alpha: np.ndarray, start: int, stop: int
+    ) -> np.ndarray:
+        """
+        Compute forward values for chunk of matrix and return first row of next chunk.
+        Start and stop are indices of weight matrix and are chip index + 1.
+        For the first chunk, init_alpha is 1 / nHaps for matches at first variant.
+        For all other chunks, init_alpha was calculated with start - 1 as chip_idx.
+        """
+        is_last = stop == self.output_breaks[-1][-1]
+        fwd_block = np.zeros((stop - start, self.matches.size), dtype=np.float64)
+        fwd_block[0, :] = init_alpha.copy()
 
-        forward_decomp_block[aci, :] = row / sum(row)
+        chunk_idx = 0
+        for chip_idx in range(start, stop - 1 - int(is_last)):
+            fwd_block[chunk_idx + 1, :] = self._calculate_row(
+                fwd_block[chunk_idx, :].copy(),
+                self.dense_matches[chip_idx, : self.nHaps[chip_idx]],
+                self.f_pRecomb[chip_idx],
+            )
+            chunk_idx += 1
 
-        # put values in the sparse matrix on the fly
-        temp_array = forward_decomp_block[aci, :].copy()
-        temp_array[temp_array < 1 / (matches.size + 1)] = 0
-        weight_matrix[aci + 1, matches] = temp_array.copy()
+        if is_last:
+            fwd_block[-1, self.dense_matches[-1, : self.nHaps[-1]]] = 1 / self.nHaps[-1]
 
-    return weight_matrix.tocsr()
+        init_alpha[:] = fwd_block[-1, :].copy()
+        return fwd_block
+
+    def _chunk_bwd_values(
+        self, init_beta: np.ndarray, start: int, stop: int
+    ) -> np.ndarray:
+        """
+        Compute backward values for chunk of matrix and return last row of next chunk.
+        Start and stop are indices of weight matrix and are chip index + 1.
+        For the last chunk, init_beta is 1 / nHaps in last row.
+        For all other chunks, init_beta was calculated with stop - 2 as chip_idx.
+        """
+        is_first = start == 0
+        bwd_block = np.zeros((stop - start, self.matches.size), dtype=np.float64)
+        bwd_block[-1, :] = init_beta.copy()
+
+        chunk_idx = stop - start - 1
+        for chip_idx in range(stop - 3, start - 2 + int(is_first), -1):
+            bwd_block[chunk_idx - 1, :] = self._calculate_row(
+                bwd_block[chunk_idx, :].copy(),
+                self.dense_matches[chip_idx, : self.nHaps[chip_idx]],
+                self.r_pRecomb[chip_idx],
+            )
+            chunk_idx -= 1
+
+        if is_first:
+            bwd_block[0, :] = 1 / self.nHaps[0]
+
+        init_beta[:] = bwd_block[0, :].copy()
+        return bwd_block
+
+    def run(self) -> None:
+        """
+        Runs the forward and backward runs of the forward-backward algorithm
+        """
+        # calculate forward blocks
+        alpha = np.zeros((self.matches.size,), dtype=np.float64)
+        alpha[self.dense_matches[0, : self.nHaps[0]]] = 1 / self.nHaps[0]
+        fwd_blocks = [
+            compress(self._chunk_fwd_values(alpha, *chunk).tobytes())
+            for chunk in self.output_breaks
+        ]
+
+        # move backward to calculate and save final weights
+        beta = np.full_like(alpha, 1 / self.nHaps[-1])
+        for (start, stop), fwd_block in reversed(
+            [*zip(self.output_breaks, fwd_blocks)]
+        ):
+            bwd_block = self._chunk_bwd_values(beta, start, stop)
+            weights = bwd_block * np.frombuffer(
+                uncompress(fwd_block), dtype=np.float64
+            ).reshape(bwd_block.shape)
+            if start == 0:
+                weights[0, self.dense_matches[0, : self.nHaps[0]]] = 1 / self.nHaps[0]
+                weights[1, :] = weights[0, :]
+            if stop == self.output_breaks[-1][-1]:
+                weights[-1, self.dense_matches[-1, : self.nHaps[-1]]] = (
+                    1 / self.nHaps[-1]
+                )
+                weights[-2, :] = weights[-1, :]
+
+            weights = weights / weights.sum(axis=1, keepdims=True)
+            weights[weights < 1 / (self.matches.size + 1)] = 0
+
+            # create sparse matrix of entire reference panel
+            sparse_weights = sparse.lil_matrix(
+                (weights.shape[0], self.n_hid), dtype=np.float64
+            )
+            sparse_weights[:, self.matches] = weights
+            # save to disk for interpolation
+            sparse.save_npz(
+                self.output_dir.joinpath(str(start), self.basename),
+                sparse_weights.tocsr(),
+            )

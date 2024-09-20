@@ -107,7 +107,7 @@ class Interpolator:
                 ].toarray()
             ).sum(axis=1)
             / weights.sum(axis=1),
-            dtype=np.float_,
+            dtype=np.float64,
         )
 
     def _interpolate_interval(
