@@ -12,17 +12,15 @@ from tqdm import tqdm
 def get_std(
     avg_length: np.ndarray, min_length: int, max_length: int, a: int = 25
 ) -> np.ndarray:
-    # convert average length into number on x axis
-    rmin = max_length
-    rmax = min_length
-    avg_length = (avg_length - rmin) / (rmax - rmin)
-
-    std_not_normed = a * avg_length ** (a - 1.0)
-
-    rmax_ = a * 1 ** (a - 1.0)
-    tmin_ = 0.2
-    tmax_ = 3
-    return (std_not_normed / rmax_) * (tmax_ - tmin_) + tmin_
+    """
+    Determine how many std devs to keep for each variant. Derived from:
+     std_not_normed = a * avg_length ** (a - 1.0)
+     rmax_ = a * 1 ** (a - 1.0)
+     return (std_not_normed / rmax_) * (tmax_ - tmin_) + tmin_
+    Simplified since a is positive, using tmin = 0.2 and tmax = 3 std devs.
+    """
+    avg_length = (avg_length - max_length) / (min_length - max_length)
+    return avg_length ** (a - 1.0) * 2.8 + 0.2
 
 
 def timestamp() -> str:
@@ -53,7 +51,9 @@ def tqdm_joblib(*args, **kwargs):
 
 def get_version() -> str:
     """Retrieve version from pyproject.toml"""
-    lines = Path(__file__).parents[1].joinpath("pyproject.toml").read_text().splitlines()
+    lines = (
+        Path(__file__).parents[1].joinpath("pyproject.toml").read_text().splitlines()
+    )
     for line in lines:
         if line.startswith("version"):
             return line.split('"')[-2]
