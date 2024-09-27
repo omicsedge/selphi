@@ -66,6 +66,8 @@ def selphi(
     # Load target samples and variants
     vcf_obj = cyvcf2.VCF(targets_path)
     target_samples = vcf_obj.samples
+    if not target_samples:
+        raise IndexError(f"No samples found in target vcf: {targets_path}")
     if ref_panel.variants[0][2] not in ref_panel.ids[0]:
         # hash alleles
         target_markers = np.array(
@@ -89,6 +91,8 @@ def selphi(
             dtype=ref_panel.variant_dtypes,
         )
     del vcf_obj
+    if target_markers.size == 0:
+        raise IndexError(f"No variants found in target vcf: {targets_path}")
     if target_markers[0][0] != ref_panel.chromosome:
         raise KeyError(
             f"Reference panel chromosome {ref_panel.chromosome} does not match "
