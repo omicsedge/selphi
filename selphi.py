@@ -62,6 +62,15 @@ def selphi(
     ref_panel = SparseReferencePanel(
         str(ref_base_path.with_suffix(".srp")), cache_size=2
     )
+    # Confirm that reference panel files match
+    n_pbwt_samples = ref_base_path.with_suffix(".samples").read_text().count("\n")
+    n_pbwt_vars = ref_base_path.with_suffix(".sites").read_text().count("\n")
+    if n_pbwt_samples != ref_panel.n_samples or n_pbwt_vars != ref_panel.n_variants:
+        raise ValueError(
+            f"pbwt reference panel has {n_pbwt_samples} samples and {n_pbwt_vars} "
+            f"variants while sparse reference panel has {ref_panel.n_samples} samples "
+            f"and {ref_panel.n_variants} variants"
+        )
 
     # Load target samples and variants
     vcf_obj = cyvcf2.VCF(targets_path)
