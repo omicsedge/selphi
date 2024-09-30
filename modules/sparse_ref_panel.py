@@ -34,6 +34,7 @@ sparse_matrix = ref_panel.all
 To select a part of the chromosome by position, use range:
 sparse_matrix = ref_panel.range(start_pos, end_pos)
 """
+
 import os
 import subprocess
 from io import BytesIO
@@ -88,6 +89,10 @@ class SparseReferencePanel:
             raise TypeError("Both variant and haplotype slices must be provided")
         # handle single row
         if isinstance(key[0], int):
+            if key[0] > self.n_variants - 1:
+                raise IndexError(
+                    f"Index {key[0]} out of range for {self.n_variants} variants"
+                )
             return self._load_haplotypes(key[0] // self.chunk_size)[
                 key[0] % self.chunk_size, key[1]
             ]
@@ -102,7 +107,9 @@ class SparseReferencePanel:
                     ]
                 )
             row_stop = (
-                min([key[0].stop, self.n_variants]) if key[0].stop is not None else self.n_variants
+                min([key[0].stop, self.n_variants - 1])
+                if key[0].stop is not None
+                else self.n_variants - 1
             )
             chunks = list(
                 range(
@@ -144,7 +151,9 @@ class SparseReferencePanel:
 
         chunks, splits = np.unique(rows // self.chunk_size, return_index=True)
         if any(chunk not in self.chunks[:, 0] for chunk in chunks):
-            raise IndexError("Variants index out of range")
+            raise IndexError(
+                f"Index {key[0]} out of range for {self.n_variants} variants"
+            )
 
         chunk_idx = np.split(rows % self.chunk_size, splits[1:])
 
