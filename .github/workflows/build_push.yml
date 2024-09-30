@@ -30,7 +30,7 @@ jobs:
           uses: docker/build-push-action@v6
           with:
             context: .
-            platforms: linux/amd64,linux/arm64
+            platforms: linux/amd64
             push: ${{ inputs.PUSH }}
             tags: ghcr.io/${{ github.repository }}:latest
         - if: "${{ inputs.PUSH == true }}"
