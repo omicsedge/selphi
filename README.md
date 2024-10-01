@@ -17,7 +17,7 @@ It is essential to adhere to these assumptions to ensure the proper functioning 
 ## Installation
 
 1. Make sure you have Docker installed on your system
-2. Build the Selphi Docker image from this repository: ` docker build -t selphi . `
+2. Get the prebuilt Docker image: `docker pull ghcr.io/omicsedge/selphi:latest`
 3. Run the Selphi container with the desired options to perform genotype imputation
 
 ## Usage
