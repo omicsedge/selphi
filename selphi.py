@@ -73,6 +73,15 @@ def selphi(
         )
 
     # Load target samples and variants
+    if not (
+        targets_path.with_suffix(".tbi").exists()
+        or targets_path.with_suffix(".csi").exists()
+    ):
+        logger.info(f"Indexing input file: {targets_path}")
+        subprocess.run(
+            f"bcftools index {targets_path} --threads {cores}", check=True, shell=True
+        )
+
     vcf_obj = cyvcf2.VCF(targets_path)
     target_samples = vcf_obj.samples
     if not target_samples:
