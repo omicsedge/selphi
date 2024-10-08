@@ -117,7 +117,8 @@ class SparseCompositeMatchesNpz:
             # work backwards from first variant with a match
             start = np.nonzero(np.diff(missing) > 1)[0][0] + 1
             self.starts[self.starts == start] = 0
-            self.row_indices[:start] = self.row_indices[start]
+            for i in missing[:start]:
+                self.row_indices[i] = self.row_indices[start]
             added_freq[
                 np.searchsorted(matrix.indptr, self.row_indices[start], side="right")
                 - 1
