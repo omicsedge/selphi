@@ -19,7 +19,7 @@ from modules.interpolation import Interpolator
 from modules.load_data import load_and_interpolate_genetic_map
 from modules.pbwt import get_pbwt_matches
 from modules.sparse_ref_panel import SparseReferencePanel
-from modules.utils import get_version, timestamp, tqdm_joblib
+from modules.utils import add_suffix, get_version, timestamp, tqdm_joblib
 
 logger = logging.getLogger("Selphi")
 logger.setLevel(level=logging.INFO)
@@ -43,14 +43,14 @@ def selphi(
     # Check if required files are available
     if not targets_path.exists():
         raise FileNotFoundError(f"Missing target vcf/bcf: {targets_path}")
-    if not ref_base_path.with_suffix(".pbwt").exists():
+    if not add_suffix(ref_base_path, ".pbwt").exists():
         raise FileNotFoundError(
-            f"Missing pbwt reference files: {ref_base_path.with_suffix('.pbwt')}. "
+            f"Missing pbwt reference files: {add_suffix(ref_base_path, '.pbwt')}. "
             "Use --prepare_reference to create required reference files."
         )
-    if not ref_base_path.with_suffix(".srp").exists():
+    if not add_suffix(ref_base_path, ".srp").exists():
         raise FileNotFoundError(
-            f"Missing pbwt reference files: {ref_base_path.with_suffix('.srp')}. "
+            f"Missing pbwt reference files: {add_suffix(ref_base_path, '.srp')}. "
             "Use --prepare_reference to create required reference files."
         )
     if not genetic_map_path.exists():
@@ -60,11 +60,11 @@ def selphi(
 
     # Load sparse reference panel
     ref_panel = SparseReferencePanel(
-        str(ref_base_path.with_suffix(".srp")), cache_size=2
+        str(add_suffix(ref_base_path, ".srp")), cache_size=2
     )
     # Confirm that reference panel files match
-    n_pbwt_samples = ref_base_path.with_suffix(".samples").read_text().count("\n")
-    n_pbwt_vars = ref_base_path.with_suffix(".sites").read_text().count("\n")
+    n_pbwt_samples = add_suffix(ref_base_path, ".samples").read_text().count("\n")
+    n_pbwt_vars = add_suffix(ref_base_path, ".sites").read_text().count("\n")
     if n_pbwt_samples != ref_panel.n_samples or n_pbwt_vars != ref_panel.n_variants:
         raise ValueError(
             f"pbwt reference panel has {n_pbwt_samples} samples and {n_pbwt_vars} "
@@ -74,8 +74,8 @@ def selphi(
 
     # Load target samples and variants
     if not (
-        targets_path.with_suffix(".tbi").exists()
-        or targets_path.with_suffix(".csi").exists()
+        add_suffix(targets_path, ".tbi").exists()
+        or add_suffix(targets_path, ".csi").exists()
     ):
         logger.info(f"Indexing input file: {targets_path}")
         subprocess.run(
@@ -301,8 +301,7 @@ if __name__ == "__main__":
     if not pbwt_path.exists():
         raise FileNotFoundError(f"Could not locate pbwt library: {pbwt_path}")
 
-    ref_suffixes = "".join(Path(args.refpanel).suffixes)
-    ref_base_path = Path(args.refpanel.replace(ref_suffixes, "")).resolve()
+    ref_base_path = Path(args.refpanel).resolve()
 
     # Prepare reference panel if indicated
     if args.prepare_reference:
@@ -337,7 +336,7 @@ if __name__ == "__main__":
                 ],
                 check=True,
             )
-            SparseReferencePanel(str(ref_base_path.with_suffix(".srp"))).from_bcf(
+            SparseReferencePanel(str(add_suffix(ref_base_path, ".srp"))).from_bcf(
                 str(ref_source_path), threads=args.cores
             )
         else:
@@ -347,7 +346,7 @@ if __name__ == "__main__":
                 check=True,
                 shell=True,
             )
-            SparseReferencePanel(str(ref_base_path.with_suffix(".srp"))).from_xsi(
+            SparseReferencePanel(str(add_suffix(ref_base_path, ".srp"))).from_xsi(
                 str(ref_source_path), threads=args.cores
             )
         logger.info(f"\n{timestamp()}: Reference panel files saved to {ref_base_path}")

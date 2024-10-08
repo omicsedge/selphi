@@ -8,6 +8,11 @@ import joblib
 from tqdm import tqdm
 
 
+def add_suffix(path: Path, suffix: str) -> Path:
+    """Add suffix to path without replacing existing extension"""
+    return path.with_name(path.name + suffix)
+
+
 @njit
 def get_std(
     avg_length: np.ndarray, min_length: int, max_length: int, a: int = 25
