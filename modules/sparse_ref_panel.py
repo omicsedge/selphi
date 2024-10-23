@@ -57,7 +57,7 @@ from joblib import Parallel, delayed
 
 import cyvcf2
 
-from .utils import tqdm_joblib
+from .utils import add_suffix, tqdm_joblib
 
 
 class SparseReferencePanel:
@@ -80,8 +80,18 @@ class SparseReferencePanel:
         self.variants: np.ndarray = self._load_variants()
         self.chunks: np.ndarray = self._load_chunks()
         self.ids: List[str] = self._load_ids()
+        self.original_ids: List[str] = self._load_original_ids()
         self.sample_ids: List[str] = self._load_sample_ids()
         self._cache = LRUCache(maxsize=cache_size)
+
+    def __len__(self):
+        return self.n_variants
+
+    def __repr__(self):
+        return (
+            f"SparseReferencePanel(filepath={self.filepath}, "
+            f"shape=({self.n_variants} variants, {self.n_haps} haplotypes))"
+        )
 
     def __getitem__(self, key: Tuple[Union[int, list, slice]]) -> sparse.csc_matrix:
         """Get sparse matrix of boolean genotypes"""
@@ -107,14 +117,14 @@ class SparseReferencePanel:
                     ]
                 )
             row_stop = (
-                min([key[0].stop, self.n_variants])
+                min(key[0].stop, self.n_variants)
                 if key[0].stop is not None
                 else self.n_variants
             )
             chunks = list(
                 range(
                     (key[0].start or 0) // self.chunk_size,
-                    (row_stop - 1) // self.chunk_size + 1,
+                    max(row_stop - 1, 0) // self.chunk_size + 1,
                     chunk_step,
                 )
             )
@@ -123,8 +133,12 @@ class SparseReferencePanel:
 
             if len(chunks) == 1:
                 return self._load_haplotypes(chunks[0])[
-                    key[0].start % self.chunk_size : row_stop % self.chunk_size
-                    or self.chunk_size : key[0].step,
+                    key[0].start
+                    % self.chunk_size : (
+                        row_stop % self.chunk_size
+                        if row_stop != self.chunk_size
+                        else row_stop
+                    ) : key[0].step,
                     key[1],
                 ]
 
@@ -194,6 +208,8 @@ class SparseReferencePanel:
                 variants.write(compress(self.variants.tobytes()))
             with archive.open("IDs", "w") as ids:
                 ids.write(compress("\n".join(self.ids).encode()))
+            with archive.open("original_IDs", "w") as original_ids:
+                original_ids.write(compress("\n".join(self.original_ids).encode()))
             with archive.open("chunks", "w") as chunks:
                 chunks.write(compress(self.chunks.tobytes()))
             with archive.open("sample_ids", "w") as sample_ids_file:
@@ -224,6 +240,15 @@ class SparseReferencePanel:
                 "-".join([str(col) for col in variant]) for variant in self.variants
             ]
 
+    def _load_original_ids(self) -> List[str]:
+        """Load original vcf/bcf ID field from archive"""
+        try:
+            with ZipFile(self.filepath, mode="r") as archive:
+                with archive.open("original_IDs") as obj:
+                    return uncompress(obj.read()).decode().split("\n")
+        except KeyError:
+            return self._load_ids()
+
     def _load_sample_ids(self) -> List[str]:
         """Load sample IDs from archive"""
         try:
@@ -241,18 +266,13 @@ class SparseReferencePanel:
             print(f"An error occurred: {str(e)}")
             return []
 
-    def _determine_start_position(self, vcf_path) -> int:
-        cmd = f'bcftools query -f "%POS\n" {vcf_path} | head -1'
-        result = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True
-        )
-        if result.returncode:
-            raise ValueError(f"Error executing bcftools: {result.stderr}")
-        return int(result.stdout.strip())
+    def _determine_start_position(self, vcf_path: Path) -> int:
+        for variant in cyvcf2.VCF(str(vcf_path)):
+            return variant.POS
 
-    def _determine_chunk_ranges(self, vcf_path, chr_length, num_variants):
-        chr_length = int(chr_length)
-        num_variants = int(num_variants)
+    def _determine_chunk_ranges(
+        self, vcf_path: Path, chr_length: int, num_variants: int
+    ):
         bp_per_variant = chr_length / num_variants
         bp_per_chunk = bp_per_variant * self.chunk_size
         current_start = self._determine_start_position(vcf_path)
@@ -261,28 +281,27 @@ class SparseReferencePanel:
             end = min(current_start + bp_per_chunk, chr_length)
             ranges.append((int(current_start), int(end)))
             current_start = end + 1
-        # Update the last element to 999M in order to ensure that no variants
+        # Update the last element to 100Gb in order to ensure that no variants
         # are discarded due to assumptions about chromosome length
-        ranges[-1] = (ranges[-1][0], 999_999_999)
+        ranges[-1] = (ranges[-1][0], 100000000000)
         return ranges
 
-    def _get_vcf_stats(self, vcf_path):
+    def _get_vcf_stats(self, vcf_path: Path):
         cmd = ["bcftools", "index", "--stats", vcf_path]
-        result = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode:
-            raise ValueError(f"Error executing bcftools: {result.stderr}")
+            raise ValueError(f"Error executing `{cmd}`: {result.stderr}")
         lines = [line.split("\t") for line in result.stdout.splitlines()]
         if len(lines) > 1:
             raise ValueError("Only one chromosome per file is supported")
         chrom, chr_length, num_variants = lines[0]
         if chr_length == ".":
-            chr_length = self.get_chromosome_length(chrom)
-        return chrom, chr_length, num_variants
+            chr_length = 100000000000
+        return chrom, int(chr_length), int(num_variants)
 
-    def _ingest_variants(self, vcf_path: str, threads: int = os.cpu_count()):
+    def _ingest_variants_from_vcf(self, vcf_path: Path, threads: int = os.cpu_count()):
         chrom, chr_length, num_variants = self._get_vcf_stats(vcf_path)
+        self._get_contig_field(chrom, vcf_path)
         chunk_ranges = self._determine_chunk_ranges(vcf_path, chr_length, num_variants)
 
         def process_chunk(args):
@@ -293,15 +312,13 @@ class SparseReferencePanel:
                 "-r",
                 f"{chrom}:{start}-{end}",
                 "-f",
-                "%CHROM\t%POS\t%REF\t%ALT\n",
+                "%CHROM\t%POS\t%REF\t%ALT\t%ID\n",
                 vcf_path,
             ]
-            result = subprocess.run(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
+            result = subprocess.run(cmd, capture_output=True, text=True)
 
             if result.returncode:
-                raise ValueError(f"Error executing bcftools: {result.stderr}")
+                raise ValueError(f"Error executing `{cmd}`: {result.stderr}")
 
             return [
                 tuple(line.strip().split("\t")) for line in result.stdout.splitlines()
@@ -323,14 +340,27 @@ class SparseReferencePanel:
             )
 
         # Flatten the list of lists
-        all_variants = [item for sublist in chunk_variants_list for item in sublist]
+        all_lines = [item for sublist in chunk_variants_list for item in sublist]
+        unique_lines = list(dict.fromkeys(all_lines))
+        variants = [line[:4] for line in unique_lines]
+        self.original_ids = [line[4] for line in unique_lines]
 
-        var_no_dup = list(dict.fromkeys(all_variants))
+        self.sample_ids = cyvcf2.VCF(str(vcf_path)).samples
 
-        vcf_obj = cyvcf2.VCF(vcf_path)
-        self.sample_ids = vcf_obj.samples
-        vcf_obj.close()
+        self._ingest_variants(chrom, variants)
 
+    def _ingest_variants_from_pbwt(self, bcf_path: Path):
+        """Get the variants and sample IDs from the pbwt files"""
+        self.sample_ids = bcf_path.with_suffix(".samples").read_text().splitlines()
+        variants = [
+            tuple(line.strip().split("\t"))
+            for line in bcf_path.with_suffix(".sites").read_text().splitlines()
+        ]
+        chrom = variants[0][0]
+        self._get_contig_field(chrom, bcf_path)
+        self._ingest_variants(chrom, variants)
+
+    def _ingest_variants(self, chrom: str, variants: List[Tuple[str]]):
         variant_dtypes = [
             ("chr", f"<U{len(str(chrom))}"),
             ("pos", "int"),
@@ -347,11 +377,11 @@ class SparseReferencePanel:
                     blake2b(row[2].encode(), digest_size=8).hexdigest(),
                     blake2b(row[3].encode(), digest_size=8).hexdigest(),
                 )
-                for row in var_no_dup
+                for row in variants
             ],
             dtype=self.variant_dtypes,
         )
-        self.ids = ["-".join([str(col) for col in line]) for line in var_no_dup]
+        self.ids = ["-".join([str(col) for col in line]) for line in variants]
 
         self.chunks = np.array(
             [
@@ -365,6 +395,7 @@ class SparseReferencePanel:
             ],
             dtype=int,
         )
+
         self.metadata.update(
             {
                 "chromosome": str(chrom),
@@ -376,6 +407,25 @@ class SparseReferencePanel:
                 "variant_dtypes": variant_dtypes,
             }
         )
+
+    def _ingest_original_ids(self, vcf_path: Path):
+        result = subprocess.run(
+            ["bcftools", "query", "-f", "%ID\n", vcf_path],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode:
+            raise ValueError(f"Error reading IDs with bcftools: {result.stderr}")
+
+        self.original_ids = result.stdout.splitlines()
+
+    def _get_contig_field(self, chrom: str, vcf_path: Path):
+        for line in cyvcf2.VCF(str(vcf_path)).raw_header.splitlines():
+            if line.startswith(f"##contig=<ID={chrom},"):
+                self.metadata["contig_field"] = line
+                break
+        else:
+            self.metadata["contig_field"] = f"##contig=<ID={chrom}>"
 
     def _load_chunks(self) -> np.ndarray:
         with ZipFile(self.filepath, mode="r") as archive:
@@ -407,7 +457,12 @@ class SparseReferencePanel:
 
     def _std_out_to_sparse(self, command: str, chunk: int, tmpdir: str) -> tuple:
         """Convert std_out of command to sparse matrix"""
-        result = subprocess.run(command, shell=True, stdout=subprocess.PIPE)
+        result = subprocess.run(command, shell=True, capture_output=True)
+        if result.returncode:
+            raise ValueError(f"Error executing `{command}`: {result.stderr}")
+        if result.stdout == b"":
+            raise ValueError(f"No genotypes returned by `{command}`")
+
         # account for when the same position appears in multiple chunks
         offset = 0
         if self.chunks[chunk][1] == self.chunks[chunk - 1][2]:
@@ -472,23 +527,31 @@ class SparseReferencePanel:
 
     def from_xsi(
         self,
-        xsi_path: str,
+        xsi_path: Union[str, Path],
         chunk_size: int = 10**4,
         threads: int = 1,
         replace_file: bool = False,
     ):
         """Convert an xsi file to sparse matrix"""
+        xsi_path = Path(xsi_path).resolve()
         if self.n_variants > 0 and not replace_file:
             print("Variants have already been loaded")
             return self
-        if not os.path.exists(xsi_path):
+        if not xsi_path.exists():
             raise FileNotFoundError(f"Missing input file: {xsi_path}")
-        xsi_bcf = xsi_path + "_var.bcf"
-        if not os.path.exists(xsi_bcf):
+        xsi_bcf = add_suffix(xsi_path, "_var.bcf")
+        if not xsi_bcf.exists():
             raise FileNotFoundError(f"Missing input file: {xsi_bcf}")
-        self.metadata["source_file"] = xsi_path
+        self.metadata["source_file"] = str(xsi_path)
         self.metadata["chunk_size"] = chunk_size
-        self._ingest_variants(xsi_bcf, threads)
+        if (
+            xsi_path.with_suffix(".sites").exists()
+            and xsi_path.with_suffix(".samples").exists()
+        ):
+            self._ingest_variants_from_pbwt(xsi_path)
+            self._ingest_original_ids(xsi_bcf)
+        else:
+            self._ingest_variants_from_vcf(xsi_bcf, threads)
         self._ingest_xsi_haplotypes(xsi_path, threads)
 
         return self
@@ -508,24 +571,38 @@ class SparseReferencePanel:
 
     def from_bcf(
         self,
-        bcf_path: str,
+        bcf_path: Union[str, Path],
         chunk_size: int = 10**4,
         threads: int = 1,
         replace_file: bool = False,
     ):
         """Convert a vcf/bcf file to sparse matrix"""
+        bcf_path = Path(bcf_path).resolve()
         if self.n_variants > 0 and not replace_file:
             print("Variants have already been loaded")
             return self
-        if not os.path.exists(bcf_path):
+        if not bcf_path.exists():
             raise FileNotFoundError(f"Missing input file: {bcf_path}")
-        if not (os.path.exists(bcf_path + ".tbi") or os.path.exists(bcf_path + ".csi")):
+        if not (
+            add_suffix(bcf_path, ".tbi").exists()
+            or add_suffix(bcf_path, ".csi").exists()
+        ):
             print(f"Indexing input file: {bcf_path}")
-            subprocess.run(f"bcftools index {bcf_path} --threads {threads}", shell=True)
+            subprocess.run(
+                ["bcftools", "index", bcf_path, "--threads", threads], check=True
+            )
 
-        self.metadata["source_file"] = bcf_path
+        self.metadata["source_file"] = str(bcf_path)
         self.metadata["chunk_size"] = chunk_size
-        self._ingest_variants(bcf_path, threads)
+        if (
+            bcf_path.with_suffix(".sites").exists()
+            and bcf_path.with_suffix(".samples").exists()
+            and ".vcf" not in bcf_path.suffixes
+        ):
+            self._ingest_variants_from_pbwt(bcf_path)
+            self._ingest_original_ids(bcf_path)
+        else:
+            self._ingest_variants_from_vcf(bcf_path, threads)
         self._ingest_bcf_haplotypes(bcf_path, threads)
 
         return self
@@ -550,37 +627,6 @@ class SparseReferencePanel:
         """Get shape of full matrix"""
         return (self.n_variants, self.n_haps)
 
-    def get_chromosome_length(self, chrom) -> str:
-        """Get chromosome length for VCF"""
-        length_chrs_hg38 = {
-            "1": "248956422",
-            "2": "242193529",
-            "3": "198295559",
-            "4": "190214555",
-            "5": "181538259",
-            "6": "170805979",
-            "7": "159345973",
-            "8": "145138636",
-            "9": "138394717",
-            "10": "133797422",
-            "11": "135086622",
-            "12": "133275309",
-            "13": "114364328",
-            "14": "107043718",
-            "15": "101991189",
-            "16": "90338345",
-            "17": "83257441",
-            "18": "80373285",
-            "19": "58617616",
-            "20": "64444167",
-            "21": "46709983",
-            "22": "50818468",
-            "X": "156040895",
-            "Y": "57227415",
-            "MT": "16569",
-        }
-        return length_chrs_hg38.get(chrom, "")
-
     @property
     def n_chunks(self) -> int:
         """Get number of chunks"""
@@ -600,6 +646,11 @@ class SparseReferencePanel:
     def chromosome(self) -> str:
         """Get chromosome"""
         return self.metadata.get("chromosome", "")
+
+    @property
+    def contig_field(self) -> str:
+        """Get contig field"""
+        return self.metadata.get("contig_field", "")
 
     @property
     def empty(self) -> bool:

@@ -37,38 +37,6 @@ class VcfWriter:
         """Get number of samples"""
         return self.num_samples * 2
 
-    @property
-    def chr_length(self) -> str:
-        """Get chromosome length for VCF"""
-        length_chrs_hg38 = {
-            "1": "248956422",
-            "2": "242193529",
-            "3": "198295559",
-            "4": "190214555",
-            "5": "181538259",
-            "6": "170805979",
-            "7": "159345973",
-            "8": "145138636",
-            "9": "138394717",
-            "10": "133797422",
-            "11": "135086622",
-            "12": "133275309",
-            "13": "114364328",
-            "14": "107043718",
-            "15": "101991189",
-            "16": "90338345",
-            "17": "83257441",
-            "18": "80373285",
-            "19": "58617616",
-            "20": "64444167",
-            "21": "46709983",
-            "22": "50818468",
-            "X": "156040895",
-            "Y": "57227415",
-            "MT": "16569",
-        }
-        return length_chrs_hg38.get(self.chromosome, "")
-
     @staticmethod
     def compress(file: Path):
         subprocess.run(["bgzip", "-f", file], check=True)
@@ -89,7 +57,7 @@ class VcfWriter:
         query = subprocess.run(command, check=True, capture_output=True, shell=True)
         return query.stdout.decode().replace("\n", "").strip()
 
-    def write_header(self) -> Path:
+    def write_header(self, contig_field: str) -> Path:
         header = (
             "##fileformat=VCFv4.2\n"
             f"##source=SELPHI_v{self.version} Selfdecode™\n"
@@ -102,7 +70,7 @@ class VcfWriter:
             '##FORMAT=<ID=DS,Number=A,Type=Float,Description="estimated ALT dose">\n'
             '##FORMAT=<ID=AP1,Number=A,Type=Float,Description="estimated ALT dose on first haplotype">\n'
             '##FORMAT=<ID=AP2,Number=A,Type=Float,Description="estimated ALT dose on second haplotype">\n'
-            f"##contig=<ID={self.chromosome},length={self.chr_length},assembly=GRCh38,species=HomoSapiens>\n"
+            f"{contig_field}\n"
         )
         columns = (
             "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
@@ -116,6 +84,7 @@ class VcfWriter:
     def write_variants(
         self,
         all_variant_ids: Union[List, np.ndarray],
+        original_ids: Union[List, np.ndarray],
         target_ids: Union[List, np.ndarray],
         sparse_probs: sparse.csc_matrix,
     ) -> Path:
@@ -152,7 +121,7 @@ class VcfWriter:
                                 [
                                     chrom,
                                     pos,
-                                    idx,
+                                    original_ids[i + start] or idx,
                                     ref,
                                     alt,
                                     ".\tPASS",
@@ -170,7 +139,7 @@ class VcfWriter:
                             [
                                 chrom,
                                 pos,
-                                idx,
+                                original_ids[i + start] or idx,
                                 ref,
                                 alt,
                                 ".\tPASS",

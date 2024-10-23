@@ -174,6 +174,7 @@ class Interpolator:
             in_target = in_target[:-1]
         chunk_path = self.writer.write_variants(
             self.ref_haplotypes.ids[start:stop],
+            self.ref_haplotypes.original_ids[start:stop],
             in_target,
             alt_probs.transpose(),
         )
@@ -184,7 +185,7 @@ class Interpolator:
 
     def interpolate_genotypes(self, output_path: Path) -> str:
         # Prepare to write results to VCF
-        self.writer.write_header()
+        self.writer.write_header(self.ref_haplotypes.contig_field)
 
         with tqdm_joblib(
             total=len(self.intervals) // self.chunk_size + 1,
