@@ -131,25 +131,20 @@ class SparseReferencePanel:
             if len(chunks) == 0:
                 raise IndexError("No variants to return")
 
+            chunk_row_stop = row_stop % self.chunk_size or (
+                self.chunk_size if row_stop > 0 else row_stop
+            )
+
             if len(chunks) == 1:
                 return self._load_haplotypes(chunks[0])[
-                    key[0].start
-                    % self.chunk_size : (
-                        row_stop % self.chunk_size
-                        if row_stop != self.chunk_size
-                        else row_stop
-                    ) : key[0].step,
+                    key[0].start % self.chunk_size : chunk_row_stop : key[0].step,
                     key[1],
                 ]
 
             slices = (
                 [slice(key[0].start % self.chunk_size, None, key[0].step)]
                 + [slice(None, None, key[0].step)] * (len(chunks) - 2)
-                + [
-                    slice(
-                        None, row_stop % self.chunk_size or self.chunk_size, key[0].step
-                    )
-                ]
+                + [slice(None, chunk_row_stop, key[0].step)]
             )
             return sparse.vstack(
                 [
