@@ -171,7 +171,7 @@ class SparseCompositeMatchesNpz:
             self.normed[self.row_indices[row]] >= self.threshold[row]
         ]
         haps = np.searchsorted(self.indptr, match_indices, side="right") - 1
-        return haps[np.argsort(self.normed[match_indices])[::-1]]
+        return haps[np.argsort(self.normed[match_indices], kind="stable")[::-1]]
 
     def get_hap_matches(self, hap: int) -> Iterable[Tuple[int]]:
         """Return tuples with ends of hap matches"""
