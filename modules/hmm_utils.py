@@ -157,7 +157,10 @@ class HMM:
                 )
                 weights[-2, :] = weights[-1, :]
 
-            weights = weights / weights.sum(axis=1, keepdims=True)
+            weight_sums = weights.sum(axis=1, keepdims=True)
+            weight_sums = np.where(weight_sums == 0, 1.0, weight_sums)
+            weights = weights / weight_sums
+            weights = np.round(weights, 8)
             weights[weights < 1 / (self.matches.size + 1)] = 0
 
             # create sparse matrix of entire reference panel
