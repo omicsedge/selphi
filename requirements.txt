@@ -4,6 +4,7 @@ joblib
 numba
 numpy
 pandas
+psutil
 scipy
 tqdm
 zstd

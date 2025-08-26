@@ -13,6 +13,7 @@ from joblib.externals.loky.process_executor import TerminatedWorkerError
 
 import numpy as np
 import cyvcf2
+import psutil
 
 from modules.imputation_lib import calculate_weights
 from modules.interpolation import Interpolator
@@ -26,6 +27,45 @@ logger.setLevel(level=logging.INFO)
 logger.addHandler(logging.StreamHandler(sys.stdout))
 
 version = get_version()
+
+
+def _calculate_optimal_cores(requested_cores: int, task_type: str = "general") -> int:
+    """
+    Calculate optimal number of cores based on system resources and task type.
+    
+    Args:
+        requested_cores: Number of cores requested by user
+        task_type: Type of task ("hmm", "interpolation", "general")
+    
+    Returns:
+        Optimal number of cores to use
+    """
+    # Get system information
+    cpu_count = psutil.cpu_count(logical=True)
+    available_memory_gb = psutil.virtual_memory().available / (1024**3)
+    
+    # Conservative approach: use physical cores for CPU-intensive tasks
+    physical_cores = psutil.cpu_count(logical=False) or cpu_count
+    
+    # Task-specific optimization
+    if task_type == "hmm":
+        # HMM is memory-intensive, scale cores based on available memory
+        # Rough estimate: 1GB per core for HMM calculations
+        memory_limited_cores = max(1, int(available_memory_gb * 0.8))
+        optimal_cores = min(physical_cores, memory_limited_cores)
+    elif task_type == "interpolation":
+        # Interpolation benefits from more cores but is less memory-intensive
+        optimal_cores = min(cpu_count, max(1, int(available_memory_gb * 0.6)))
+    else:
+        # General tasks: balance between CPU and memory
+        optimal_cores = min(physical_cores, max(1, int(available_memory_gb * 0.5)))
+    
+    # Respect user's request but don't exceed system capabilities
+    if requested_cores > 0:
+        optimal_cores = min(requested_cores, optimal_cores)
+    
+    # Ensure at least 1 core
+    return max(1, optimal_cores)
 
 
 def selphi(
@@ -175,8 +215,12 @@ def selphi(
     )
 
     # Calculate HMM weights from matches
-    # Reduce cores if not enough memory
-    hmm_cores = min(cores, len(target_haps))
+    # Use dynamic core allocation optimized for HMM tasks
+    optimal_hmm_cores = _calculate_optimal_cores(cores, "hmm")
+    hmm_cores = min(optimal_hmm_cores, len(target_haps))
+    
+    logger.info(f"Using {hmm_cores} cores for HMM calculations (optimized from {cores} requested)")
+    
     while hmm_cores > 0:
         try:
             with tqdm_joblib(

@@ -46,6 +46,8 @@ from datetime import datetime
 from zipfile import ZipFile, BadZipFile
 from tempfile import TemporaryDirectory
 import concurrent.futures
+import threading
+import time
 
 from zstd import compress, uncompress
 import numpy as np
@@ -63,7 +65,7 @@ from .utils import add_suffix, tqdm_joblib
 class SparseReferencePanel:
     """Class for working with ref panels stored as sparse matrix"""
 
-    def __init__(self, filepath: str, cache_size: int = 2) -> None:
+    def __init__(self, filepath: str, cache_size: int = 10) -> None:
         self.filepath = filepath
         if not os.path.exists(self.filepath):
             self._create()
@@ -83,9 +85,97 @@ class SparseReferencePanel:
         self.original_ids: List[str] = self._load_original_ids()
         self.sample_ids: List[str] = self._load_sample_ids()
         self._cache = LRUCache(maxsize=cache_size)
+        
+        # Prefetching optimization
+        self._prefetch_enabled = cache_size > 2  # Enable prefetching if cache is large enough
+        self._prefetch_executor = None
+        self._prefetch_futures = {}
+        self._access_pattern = []  # Track access patterns for intelligent prefetching
+        self._prefetch_lock = None
+        
+        if self._prefetch_enabled:
+            self._init_prefetch_resources()
 
     def __len__(self):
         return self.n_variants
+    
+    def __del__(self):
+        """Cleanup prefetch resources"""
+        self._cleanup_prefetch_resources()
+    
+    def __getstate__(self):
+        """Custom serialization for joblib compatibility"""
+        state = self.__dict__.copy()
+        # Remove non-serializable threading objects
+        state['_prefetch_executor'] = None
+        state['_prefetch_lock'] = None
+        state['_prefetch_futures'] = {}
+        return state
+    
+    def __setstate__(self, state):
+        """Custom deserialization for joblib compatibility"""
+        self.__dict__.update(state)
+        # Reinitialize threading resources if needed
+        if self._prefetch_enabled:
+            self._init_prefetch_resources()
+    
+    def _init_prefetch_resources(self):
+        """Initialize prefetch resources lazily"""
+        if not hasattr(self, '_prefetch_lock') or self._prefetch_lock is None:
+            self._prefetch_lock = threading.Lock()
+        if not hasattr(self, '_prefetch_executor') or self._prefetch_executor is None:
+            self._prefetch_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="prefetch")
+            self._start_prefetch_monitoring()
+    
+    def _cleanup_prefetch_resources(self):
+        """Clean up prefetch executor and futures"""
+        if hasattr(self, '_prefetch_enabled'):
+            self._prefetch_enabled = False
+        
+        if hasattr(self, '_prefetch_executor') and self._prefetch_executor:
+            # Cancel pending futures
+            with self._prefetch_lock:
+                for future in self._prefetch_futures.values():
+                    future.cancel()
+                self._prefetch_futures.clear()
+            
+            # Shutdown executor
+            self._prefetch_executor.shutdown(wait=False)
+            self._prefetch_executor = None
+    
+    def _adaptive_compress(self, data: bytes, nnz: int) -> bytes:
+        """Apply adaptive compression based on data characteristics"""
+        data_size = len(data)
+        
+        # Calculate sparsity ratio
+        if hasattr(self, 'chunk_size') and self.chunk_size > 0:
+            total_elements = self.chunk_size * self.n_haps if hasattr(self, 'n_haps') and self.n_haps > 0 else 1
+            sparsity_ratio = nnz / total_elements if total_elements > 0 else 0
+        else:
+            sparsity_ratio = 0.1  # Default assumption
+        
+        # Adaptive compression level based on sparsity and size
+        if sparsity_ratio < 0.01:  # Very sparse data
+            # Use higher compression for very sparse data
+            compression_level = 9
+        elif sparsity_ratio < 0.1:  # Moderately sparse
+            compression_level = 6
+        elif data_size > 1024 * 1024:  # Large chunks (>1MB)
+            # Use higher compression for large chunks
+            compression_level = 8
+        elif data_size > 100 * 1024:  # Medium chunks (>100KB)
+            compression_level = 5
+        else:  # Small chunks
+            # Use faster compression for small chunks
+            compression_level = 3
+        
+        try:
+            from zstd import compress
+            return compress(data, compression_level)
+        except ImportError:
+            # Fallback to default compression
+            from zstd import compress
+            return compress(data)
 
     def __repr__(self):
         return (
@@ -430,9 +520,108 @@ class SparseReferencePanel:
             return np.reshape(chunks_, (self.n_chunks, 3))
         return chunks_
 
+    def _start_prefetch_monitoring(self):
+        """Start monitoring access patterns for intelligent prefetching"""
+        def monitor():
+            while self._prefetch_enabled:
+                time.sleep(0.1)  # Check every 100ms
+                self._cleanup_completed_prefetches()
+        
+        monitor_thread = threading.Thread(target=monitor, daemon=True)
+        monitor_thread.start()
+    
+    def _cleanup_completed_prefetches(self):
+        """Clean up completed prefetch futures"""
+        if not self._prefetch_enabled or self._prefetch_lock is None:
+            return
+        with self._prefetch_lock:
+            completed = [chunk for chunk, future in self._prefetch_futures.items() if future.done()]
+            for chunk in completed:
+                del self._prefetch_futures[chunk]
+    
+    def _predict_next_chunks(self, current_chunk: int) -> List[int]:
+        """Predict next chunks based on access patterns"""
+        # Simple sequential prediction - can be enhanced with ML
+        candidates = []
+        
+        # Sequential access pattern
+        if current_chunk + 1 < self.n_chunks:
+            candidates.append(current_chunk + 1)
+        if current_chunk + 2 < self.n_chunks:
+            candidates.append(current_chunk + 2)
+            
+        # Look for patterns in recent access history
+        if len(self._access_pattern) >= 3:
+            recent = self._access_pattern[-3:]
+            if len(set(recent)) == len(recent):  # No duplicates, likely sequential
+                next_in_sequence = recent[-1] + (recent[-1] - recent[-2])
+                if 0 <= next_in_sequence < self.n_chunks and next_in_sequence not in candidates:
+                    candidates.append(next_in_sequence)
+        
+        return candidates[:2]  # Limit to 2 prefetch candidates
+    
+    def _prefetch_chunk(self, chunk: int):
+        """Prefetch a chunk asynchronously"""
+        if not self._prefetch_enabled:
+            return
+            
+        # Initialize prefetch resources if needed
+        if self._prefetch_lock is None or self._prefetch_executor is None:
+            self._init_prefetch_resources()
+            
+        if chunk in self._prefetch_futures:
+            return
+            
+        # Check if already in cache
+        cache_key = (chunk,)
+        if cache_key in self._cache:
+            return
+            
+        with self._prefetch_lock:
+            if chunk not in self._prefetch_futures:
+                future = self._prefetch_executor.submit(self._load_haplotypes_direct, chunk)
+                self._prefetch_futures[chunk] = future
+    
+    def _load_haplotypes_direct(self, chunk: int) -> sparse.csc_matrix:
+        """Load haplotypes directly without caching (for prefetching)"""
+        with ZipFile(self.filepath, mode="r") as archive:
+            with archive.open(f"haplotypes/{chunk}.npz") as obj:
+                return sparse.load_npz(BytesIO(uncompress(obj.read())))
+    
     @cachedmethod(lambda self: self._cache)
     def _load_haplotypes(self, chunk: int) -> sparse.csc_matrix:
-        """Load a sparse matrix from archived npz"""
+        """Load a sparse matrix from archived npz with intelligent prefetching"""
+        # Track access pattern
+        if self._prefetch_enabled:
+            # Initialize prefetch resources if needed
+            if self._prefetch_lock is None or self._prefetch_executor is None:
+                self._init_prefetch_resources()
+                
+            self._access_pattern.append(chunk)
+            if len(self._access_pattern) > 10:  # Keep only recent history
+                self._access_pattern.pop(0)
+            
+            # Check if we have a prefetched version ready
+            if self._prefetch_lock is not None:
+                with self._prefetch_lock:
+                    if chunk in self._prefetch_futures:
+                        future = self._prefetch_futures[chunk]
+                        if future.done():
+                            try:
+                                result = future.result()
+                                del self._prefetch_futures[chunk]
+                                # Trigger prefetching for predicted next chunks
+                                for next_chunk in self._predict_next_chunks(chunk):
+                                    self._prefetch_chunk(next_chunk)
+                                return result
+                            except Exception:
+                                del self._prefetch_futures[chunk]
+            
+            # Trigger prefetching for predicted next chunks
+            for next_chunk in self._predict_next_chunks(chunk):
+                self._prefetch_chunk(next_chunk)
+        
+        # Load normally
         with ZipFile(self.filepath, mode="r") as archive:
             with archive.open(f"haplotypes/{chunk}.npz") as obj:
                 return sparse.load_npz(BytesIO(uncompress(obj.read())))
@@ -479,8 +668,13 @@ class SparseReferencePanel:
         npz_ = BytesIO()
         sparse.save_npz(npz_, matrix)
         npz_.seek(0)
+        
+        # Adaptive compression based on chunk size
+        data = npz_.read()
+        compressed_data = self._adaptive_compress(data, matrix.nnz)
+        
         with open(os.path.join(tmpdir, f"{chunk}.npz"), "wb") as fout:
-            fout.write(compress(npz_.read()))
+            fout.write(compressed_data)
         return matrix.shape[1]
 
     def _ingest_haplotypes(self, commands: List[str], threads: int = 1):
