@@ -27,6 +27,7 @@ logger.addHandler(logging.StreamHandler(sys.stdout))
 
 version = get_version()
 
+
 def selphi(
     targets_path: Path,
     ref_base_path: Path,
@@ -176,7 +177,6 @@ def selphi(
     # Calculate HMM weights from matches
     # Reduce cores if not enough memory
     hmm_cores = min(cores, len(target_haps))
-    
     while hmm_cores > 0:
         try:
             with tqdm_joblib(
