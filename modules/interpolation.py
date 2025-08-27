@@ -82,12 +82,12 @@ class Interpolator:
         # Get available memory in GB
         available_memory_gb = psutil.virtual_memory().available / (1024**3)
         
-        # Base chunk size calculation (original logic)
+        # Base chunk size calculation
         base_chunk_size = ceil(
             (wgs_idx_size + 1) / max(ref_haplotypes.n_chunks // 10, 1)
         )
         
-        # Estimate memory usage per chunk (rough approximation)
+        # Estimate memory usage per chunk
         # Consider: sparse matrices, weight matrices, intermediate calculations
         estimated_memory_per_chunk_gb = (
             ref_haplotypes.n_haps * base_chunk_size * 8  # float64 weights

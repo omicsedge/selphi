@@ -90,7 +90,7 @@ class SparseReferencePanel:
         self._prefetch_enabled = cache_size > 2  # Enable prefetching if cache is large enough
         self._prefetch_executor = None
         self._prefetch_futures = {}
-        self._access_pattern = []  # Track access patterns for intelligent prefetching
+        self._access_pattern = []  # Track access patterns for prefetching
         self._prefetch_lock = None
         
         if self._prefetch_enabled:
@@ -521,7 +521,7 @@ class SparseReferencePanel:
         return chunks_
 
     def _start_prefetch_monitoring(self):
-        """Start monitoring access patterns for intelligent prefetching"""
+        """Start monitoring access patterns for prefetching"""
         def monitor():
             while self._prefetch_enabled:
                 time.sleep(0.1)  # Check every 100ms
@@ -590,7 +590,7 @@ class SparseReferencePanel:
     
     @cachedmethod(lambda self: self._cache)
     def _load_haplotypes(self, chunk: int) -> sparse.csc_matrix:
-        """Load a sparse matrix from archived npz with intelligent prefetching"""
+        """Load a sparse matrix from archived npz with prefetching"""
         # Track access pattern
         if self._prefetch_enabled:
             # Initialize prefetch resources if needed
