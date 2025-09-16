@@ -279,6 +279,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Exit if memory limit is exceeded instead of reducing cores (default: %(default)s)",
     )
+    parser.add_argument(
+        "--chunk_size",
+        type=int,
+        default=10000,
+        help="Chunk size for sparse reference panel creation (default: %(default)s)",
+    )
     args = parser.parse_args()
     cmd = " \ \n".join([f"  --{k} {v}" for k, v in vars(args).items() if v is not None])
 
@@ -337,7 +343,7 @@ if __name__ == "__main__":
                 check=True,
             )
             SparseReferencePanel(str(add_suffix(ref_base_path, ".srp"))).from_bcf(
-                str(ref_source_path), threads=args.cores
+                str(ref_source_path), chunk_size=args.chunk_size, threads=args.cores
             )
         else:
             subprocess.run(
@@ -347,7 +353,7 @@ if __name__ == "__main__":
                 shell=True,
             )
             SparseReferencePanel(str(add_suffix(ref_base_path, ".srp"))).from_xsi(
-                str(ref_source_path), threads=args.cores
+                str(ref_source_path), chunk_size=args.chunk_size, threads=args.cores
             )
         logger.info(f"\n{timestamp()}: Reference panel files saved to {ref_base_path}")
         if not args.target:
