@@ -1,6 +1,7 @@
 #include "pbwt.h"
 #include <sys/stat.h>
 #include <zip.h>
+#include <math.h>
 
 typedef struct MatchArrayStruct {
   // store matches for one target at one site //
