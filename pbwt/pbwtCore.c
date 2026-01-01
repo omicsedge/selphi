@@ -354,7 +354,7 @@ void pbwtCursorToAFend(PbwtCursor * u, PBWT * p) {
 PBWT * pbwtFilterSites(PBWT * pOld, Array filter) {
   /* Provide array of 0s and 1s to filter sites from pbwt*/
   if (arrayMax(filter) != pOld->N) die("Filter is not the same size as pbwt");
-  int i, j, newN;
+  int i, j, newN = 0;
   for (j = 0; j < pOld->N; ++j) newN += * arrp(filter, j, int);
   if (newN == pOld->N) return pOld;
 

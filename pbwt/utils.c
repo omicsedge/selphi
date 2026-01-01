@@ -117,8 +117,10 @@ char *fgetword (FILE *f)	// pass NULL to free alloced memory
       { ++cp ; ++n ;
 	if (n >= bufSize)
 	  { bufSize *= 2 ;
+	    long offset = cp - buf ;  /* save offset before realloc */
 	    if (!(buf = (char*) realloc (buf, bufSize)))
 	      die ("fgetword realloc failure requesting %d bytes", bufSize) ;
+	    cp = buf + offset ;  /* restore pointer after realloc */
 	  }
       }
     else
