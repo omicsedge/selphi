@@ -21,8 +21,8 @@ typedef struct TargetMatchArrayStruct {
 TargetMatchArray;
 
 static void clearMatchArray(MatchArray * ma) {
-  if (ma -> haplotypes) free(ma -> haplotypes);
-  if (ma -> lengths) free(ma -> lengths);
+  if (ma -> haplotypes) free(ma -> haplotypes); ma -> haplotypes = NULL;
+  if (ma -> lengths) free(ma -> lengths); ma -> lengths = NULL;
 }
 
 static void TargetMatchArrayInit(TargetMatchArray * tma, int N, int M, int fl) {
@@ -37,6 +37,8 @@ static void TargetMatchArrayInit(TargetMatchArray * tma, int N, int M, int fl) {
     ma = arrayp(tma -> matchArrays, i, MatchArray);
     ma -> fl = fl;
     ma -> N = 0;
+    ma -> haplotypes = NULL;
+    ma -> lengths = NULL;
   }
 }
 
@@ -53,7 +55,7 @@ typedef struct SparseCscStruct {
   // store data for csc matrix format //
   int M; /* number of rows*/
   int N; /* number of columns*/
-  int nnz; /* number of values */
+  int nnz; /* number of non-zero values */
   int * data; /* array of int, length nnz */
   int * indices; /* array of int, length nnz */
   int * indptr; /* array of int, length N + 1 */
@@ -64,11 +66,19 @@ static SparseCsc * SparseCscCreate(int M, int N, int nnz) {
   SparseCsc * csc = myalloc(1, SparseCsc);
   csc -> M = M;
   csc -> N = N;
-  csc -> nnz = nnz;
+  csc -> nnz = nnz;  /* number of non-zero elements */
   if (nnz > 0) {
     csc -> data = myalloc(nnz, int);
     csc -> indices = myalloc(nnz, int);
+    for (int i = 0; i < nnz; i++) {
+      csc -> data[i] = 0;
+      csc -> indices[i] = 0;
+    }
+  } else {
+    csc -> data = NULL;
+    csc -> indices = NULL;
   }
+  csc -> indptr = NULL;
   return csc;
 }
 
@@ -87,36 +97,41 @@ static void addMatch(int haplotype, int length, int var, TargetMatchArray * tma)
 
   MatchArray * ma = arrayp(tma -> matchArrays, var, MatchArray);
   int j = ma -> N - 1;
+  int oldN = ma -> N;
   if (ma -> N < ma -> fl) ma -> N++;
   int * haplotypes = myalloc(ma -> N, int);
   int * lengths = myalloc(ma -> N, int);
 
-  while (j >= 0 && ma -> lengths[j] < length) {
-    if (j + 1 < ma -> N) {
-      lengths[j + 1] = ma -> lengths[j];
-      haplotypes[j + 1] = ma -> haplotypes[j];
+  if (oldN > 0) {
+    while (j >= 0 && ma -> lengths[j] < length) { /* shift shorter matches to the right */
+      if (j + 1 < ma -> N) {
+        lengths[j + 1] = ma -> lengths[j];
+        haplotypes[j + 1] = ma -> haplotypes[j];
+      }
+      j--;
     }
-    j--;
-  }
-  while (j >= 0 && ma -> lengths[j] == length && tma -> hap_totals[ma -> haplotypes[j]] <= total) {
-    if (j + 1 < ma -> N) {
-      lengths[j + 1] = ma -> lengths[j];
-      haplotypes[j + 1] = ma -> haplotypes[j];
+    while (j >= 0 && ma -> lengths[j] == length && tma -> hap_totals[ma -> haplotypes[j]] <= total) {
+      if (j + 1 < ma -> N) {
+        lengths[j + 1] = ma -> lengths[j];
+        haplotypes[j + 1] = ma -> haplotypes[j];
+      }
+      j--;
     }
-    j--;
   }
-  if (j + 1 < ma -> N) {
+  if (j + 1 < ma -> N) { /* if there is space in the array, add the new match */
     lengths[j + 1] = length;
     haplotypes[j + 1] = haplotype;
   }
-  while (j >= 0) {
-    lengths[j] = ma -> lengths[j];
-    haplotypes[j] = ma -> haplotypes[j];
-    j--;
+  if (oldN > 0) {
+    while (j >= 0) { /* copy remaining matches to the new array */
+      lengths[j] = ma -> lengths[j];
+      haplotypes[j] = ma -> haplotypes[j];
+      j--;
+    }
+    clearMatchArray(ma);
   }
-  clearMatchArray(ma);
-  ma -> lengths = lengths;
-  ma -> haplotypes = haplotypes;
+  ma -> lengths = lengths; /* update the match array */
+  ma -> haplotypes = haplotypes; /* update the match array */
 }
 
 static SparseCsc * targetMatchesToCsc(TargetMatchArray * tma, int N, int M) {
@@ -229,6 +244,8 @@ static void write_npz(char * prefix, TargetMatchArray * tma, int N, int M) {
   snprintf(tmp_name, 84, "parallel_haploid_mat_%s.npz", prefix);
   writeSparseCsc(tmp_name, csc);
   SparseCscDestroy(csc);
+  /* prefix is allocated by get_prefix and should be freed here */
+  if (prefix) free(prefix);
 }
 
 static void pbwtMatchTargets(PBWT * p, int minL, int nRefHaps) {
@@ -290,7 +307,7 @@ static void pbwtMatchTargets(PBWT * p, int minL, int nRefHaps) {
     free(refHaps);
     free(targetHaps);
     pbwtCursorForwardsReadAD(u, var);
-    if (var % 100 == 0) printProgress((double) var / nVar);
+    if (var % 1000 == 0) printProgress((double) var / nVar);
   }
   printProgress(1.0);
   printf("\n [pbwt]: Writing output\n");
