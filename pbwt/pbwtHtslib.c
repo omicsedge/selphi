@@ -4,7 +4,7 @@
  *-------------------------------------------------------------------
  * Description: all the pbwt stuff that uses htslib, e.g. reading/writing vcf or bcf files
  *
- * This is a slimmed down version of the original pbwt repository 
+ * This is a slimmed down version of the original pbwt repository
  * with added functionality for getting all matches of a certain length
  * between target haplotypes and all haplotypes in a reference panel.
  *-------------------------------------------------------------------
@@ -36,7 +36,7 @@ static int variation (PBWT *p, const char *ref, const char *alt) {
   static int buflen = 0 ;
   if (!buf) { buflen = 64 ; buf = myalloc (buflen, char) ; }
   int var ;
-  if (strlen (ref) + strlen (alt) + 2 > buflen) 
+  if (strlen (ref) + strlen (alt) + 2 > buflen)
     { do buflen *= 2 ; while (strlen (ref) + strlen (alt) + 2 > buflen) ;
       free (buf) ; buf = myalloc (buflen, char) ;
     }
@@ -61,23 +61,23 @@ PBWT *pbwtReadVcfGT (char *filename) {
   uchar *xMissing = myalloc(p->M+1, uchar) ;
   xMissing[p->M] = Y_SENTINEL;  /* needed for efficient packing */
   long nMissing = 0;
-  int nMissingSites = 0; 
+  int nMissingSites = 0;
 
   int mgt_arr = 0, *gt_arr = NULL;
-  while (bcf_sr_next_line (sr)) 
+  while (bcf_sr_next_line (sr))
     { bcf1_t *line = bcf_sr_get_line(sr,0) ;
       const char* chrom = bcf_seqname(hr,line) ;
       if (!p->chrom) p->chrom = strdup (chrom) ;
       else if (strcmp (chrom, p->chrom)) break ;
       int pos = line->pos + 1 ;       // bcf coordinates are 0-based
-      char *ref, *REF; 
+      char *ref, *REF;
       ref = REF = strdup(line->d.allele[0]);
       while ( (*ref = toupper(*ref)) ) ++ref ;
 
       // get a copy of GTs
       int ngt = bcf_get_genotypes(hr, line, &gt_arr, &mgt_arr) ;
       if (ngt <= 0) continue ;  // it seems that -1 is used if GT is not in the FORMAT
-      if (ngt != p->M && p->M != 2*ngt) die ("%d != %d GT values at %s:%d - not haploid or diploid?", 
+      if (ngt != p->M && p->M != 2*ngt) die ("%d != %d GT values at %s:%d - not haploid or diploid?",
           ngt, p->M, chrom, pos) ;
 
       memset (xMissing, 0, p->M) ;
@@ -102,14 +102,14 @@ PBWT *pbwtReadVcfGT (char *filename) {
       else
         {
           for (i = 0 ; i < p->M ; i++)
-            { if (gt_arr[i] == bcf_int32_vector_end) 
+            { if (gt_arr[i] == bcf_int32_vector_end)
                 die ("unexpected end of genotype vector in VCF") ;
               if (gt_arr[i] == bcf_gt_missing)
                 { x[i] = 0 ; /* use ref for now */
                   xMissing[i] = 1 ;
                   ++nMissing ;
                 }
-              else 
+              else
                 x[i] = bcf_gt_allele(gt_arr[i]) ;  // convert from BCF binary to 0 or 1
             }
         }
@@ -121,7 +121,7 @@ PBWT *pbwtReadVcfGT (char *filename) {
       /* not in the REF/ALT site */
       for (i = 1 ; i < n_allele ; i++)
         {
-          char *alt, *ALT; 
+          char *alt, *ALT;
           alt = ALT = no_alt ? "." : strdup(line->d.allele[i]);
           if (!no_alt) while ( (*alt = toupper(*alt)) ) ++alt;
 
@@ -161,12 +161,12 @@ PBWT *pbwtReadVcfGT (char *filename) {
 
   if (gt_arr) free (gt_arr) ;
   bcf_sr_destroy (sr) ;
-  free (x) ; pbwtCursorDestroy (u) ;  
+  free (x) ; pbwtCursorDestroy (u) ;
   free (xMissing) ;
 
-  fprintf(logFile, " [pbwt]: Read genotypes from %s with %ld haplotypes and %ld sites on chromosome %s\n", 
+  fprintf(logFile, " [pbwt]: Read genotypes from %s with %d haplotypes and %d sites on chromosome %s\n",
          filename, p->M, p->N, p->chrom);
-  if (p->missingOffset) fprintf (logFile, " [pbwt]: %ld missing values at %d sites\n", 
+  if (p->missingOffset) fprintf (logFile, " [pbwt]: %ld missing values at %d sites\n",
          nMissing, nMissingSites) ;
 
   return p ;

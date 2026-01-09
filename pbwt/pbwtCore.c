@@ -14,7 +14,7 @@
  *-------------------------------------------------------------------
  * Description: core functions for pbwt package
  *
- * This is a slimmed down version of the original pbwt repository 
+ * This is a slimmed down version of the original pbwt repository
  * with added functionality for getting all matches of a certain length
  * between target haplotypes and all haplotypes in a reference panel.
  *-------------------------------------------------------------------
@@ -355,21 +355,26 @@ PBWT * pbwtFilterSites(PBWT * pOld, Array filter) {
   /* Provide array of 0s and 1s to filter sites from pbwt*/
   if (arrayMax(filter) != pOld->N) die("Filter is not the same size as pbwt");
   int i, j, newN = 0;
-  for (j = 0; j < pOld->N; ++j) newN += * arrp(filter, j, int);
+  /* Count the number of sites that are kept */
+  for (j = 0; j < pOld->N; j++) {
+    if (* arrp(filter, j, int) == 1) newN++;
+  }
+  /* If all sites are kept, return the original pbwt */
   if (newN == pOld->N) return pOld;
 
+  /* Create a new pbwt with the number of sites that are kept */
   PBWT * pNew = pbwtCreate(pOld->M, 0);
   PbwtCursor * uOld = pbwtCursorCreate(pOld, TRUE, TRUE);
   PbwtCursor * uNew = pbwtCursorCreate(pNew, TRUE, TRUE);
   uchar * yseq = myalloc(pNew->M, uchar);
 
   pNew->sites = arrayCreate(newN, Site);
-
-  for (j = 0; j < pOld->N; ++j) {
+  /* Copy the sites that are kept to the new pbwt */
+  for (j = 0; j < pOld->N; j++) {
     if (* arrp(filter, j, int) == 1) {
       array(pNew->sites, pNew->N++, Site) = * arrp(pOld->sites, j, Site);
-      for (i = 0; i < pOld->M; ++i) yseq[uOld->a[i]] = uOld->y[i];
-      for (i = 0; i < pNew->M; ++i) uNew->y[i] = yseq[uNew->a[i]];
+      for (i = 0; i < pOld->M; i++) yseq[uOld->a[i]] = uOld->y[i];
+      for (i = 0; i < pNew->M; i++) uNew->y[i] = yseq[uNew->a[i]];
       pbwtCursorWriteForwards(uNew);
     }
     pbwtCursorForwardsRead(uOld);
