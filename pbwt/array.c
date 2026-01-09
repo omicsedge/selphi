@@ -28,7 +28,7 @@
  *              See header file: array.h (includes lots of macros)
  * HISTORY:
  * Last edited: Oct  8 21:56 2014 (rd)
- * * Sep 19 15:41 2014 (rd): switch to long indices to avoid overflow 
+ * * Sep 19 15:41 2014 (rd): switch to long indices to avoid overflow
  * * May  5 10:55 2013 (rd): change RD address to rd@sanger.ac.uk
  * * Feb 14 11:21 2011 (rd): modified in 2009/10 by RD for stand-alone use
  * Created: Thu Dec 12 15:43:25 1989 (mieg)
@@ -122,13 +122,13 @@ void arrayDestroy (Array a)
 
 /**************/
 
-Array arrayCopy (Array a) 
+Array arrayCopy (Array a)
 {
   Array new ;
 
-  if (!arrayExists (a)) 
+  if (!arrayExists (a))
     die ("arrayCopy called on bad array %lx", (long unsigned int) a) ;
- 
+
   new = uArrayCreate (a->dim, a->size) ;
   memcpy (new->base, a->base, a->dim * a->size) ;
   new->max = a->max ;
@@ -137,7 +137,7 @@ Array arrayCopy (Array a)
 
 /******************************/
 
-void arrayExtend (Array a, long n) 
+void arrayExtend (Array a, long n)
 {
   char *new ;
 
@@ -148,12 +148,29 @@ void arrayExtend (Array a, long n)
     return ;
 
   totalAllocatedMemory -= a->dim * a->size ;
-  if (a->dim*a->size < 1 << 26)	/* 64MB */
+  if (a->dim*a->size < 67108864)	/* 64MB */
     a->dim *= 2 ;
   else
-    a->dim += 1024 + ((1 << 26) / a->size) ;
+    a->dim += 1024 + (67108864 / a->size) ;
   if (n >= a->dim)
     a->dim = n + 1 ;
+
+  /* Check for integer overflow before allocation */
+  /* _mycalloc takes (long number, int size), but calloc expects size_t */
+  /* Check if a->dim * a->size would overflow size_t or cause calloc to fail */
+  if (a->dim < 0 || a->size <= 0)
+    die("arrayExtend: invalid dimensions: dim=%ld, size=%d", a->dim, a->size);
+  /* Check for overflow: if a->dim * a->size would exceed size_t limits */
+  /* Use size_t for the check to match what calloc expects */
+  if (a->dim > 0) {
+    size_t dim_size = (size_t)a->dim;
+    size_t elem_size = (size_t)a->size;
+    size_t total_size = dim_size * elem_size;
+    /* Check for multiplication overflow */
+    if (elem_size > 0 && total_size / elem_size != dim_size)
+      die("arrayExtend: size overflow: dim=%ld, size=%d (multiplication overflow)",
+          a->dim, a->size);
+  }
 
   totalAllocatedMemory += a->dim * a->size ;
 
@@ -211,7 +228,7 @@ BOOL arrayFind(Array a, void *s, long *ip, ArrayOrder *order)
   int ord ;
   long i = 0 , j, k ;
 
-  if (!arrayExists (a)) 
+  if (!arrayExists (a))
     die ("arrayFind called on bad array %lx", (long unsigned int) a) ;
 
   j = arrayMax(a) ;
@@ -229,7 +246,7 @@ BOOL arrayFind(Array a, void *s, long *ip, ArrayOrder *order)
     { if (ip) *ip = j ;
       return FALSE ;
     }
-  
+
   if (ord == 0)
     { if (ip) *ip = j ;
       return TRUE ;
@@ -306,19 +323,19 @@ void arrayCompress(Array a)
   if (arrayMax(a) < 2)
     return ;
 
-  ab = a->base ; 
+  ab = a->base ;
   as = a->size ;
   for (i = 1, j = 0 ; i < arrayMax(a) ; i++)
     { x = ab + i * as ; y = ab + j * as ;
-      for (k = a->size ; k-- ;)		
-	if (*x++ != *y++) 
+      for (k = a->size ; k-- ;)
+	if (*x++ != *y++)
 	  goto different ;
       continue ;
-      
+
     different:
       if (i != ++j)
 	{ x = ab + i * as ; y = ab + j * as ;
-	  for (k = a->size ; k-- ;)	 
+	  for (k = a->size ; k-- ;)
 	    *y++ = *x++ ;
 	}
     }
@@ -342,7 +359,7 @@ void arrayReport (int j)
   int i ;
   Array a ;
 
-  fprintf(stderr, "Array report: %d created, %d active, %ld MB allocated\n",   
+  fprintf(stderr, "Array report: %d created, %d active, %ld MB allocated\n",
 	  totalNumberCreated, totalNumberActive, totalAllocatedMemory/(1024*1024)) ;
 
   if (reportArray)
@@ -357,13 +374,13 @@ void arrayReport (int j)
 
 /**************/
 
-void arrayStatus (int *nmadep, int *nusedp, 
+void arrayStatus (int *nmadep, int *nusedp,
 		  long *memAllocp, long *memUsedp)
-{ 
+{
   int i ;
   Array a ;
 
-  *nmadep = totalNumberCreated ; 
+  *nmadep = totalNumberCreated ;
   *nusedp = totalNumberActive ;
   *memAllocp = totalAllocatedMemory ;
   *memUsedp = 0 ;
@@ -376,4 +393,3 @@ void arrayStatus (int *nmadep, int *nusedp,
 
 /************************  end of file ********************************/
 /**********************************************************************/
- 
