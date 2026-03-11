@@ -26,12 +26,7 @@ profile_default/
 
 __pypackages__/
 
-
 /.vscode
-
-
-
-
 
 /data
 /new_data
@@ -67,3 +62,10 @@ __pypackages__/
 
 test
 .DS_Store
+
+# Install script output
+selphi_env/
+install.log
+
+# Paper directory (not part of software release)
+paper/

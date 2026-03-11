@@ -66,6 +66,7 @@ class VcfWriter:
             '##INFO=<ID=AF,Number=A,Type=Float,Description="Estimated ALT Allele Frequencies">\n'
             '##INFO=<ID=AN,Number=1,Type=Integer,Description="Allele Number">\n'
             '##INFO=<ID=AC,Number=1,Type=Integer,Description="Estimated Allele Count">\n'
+            '##INFO=<ID=DR2,Number=1,Type=Float,Description="Dosage R-squared: estimated imputation accuracy">\n'
             '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
             '##FORMAT=<ID=DS,Number=A,Type=Float,Description="estimated ALT dose">\n'
             '##FORMAT=<ID=AP1,Number=A,Type=Float,Description="estimated ALT dose on first haplotype">\n'
@@ -110,6 +111,14 @@ class VcfWriter:
                     int(ele) if ele % 1 == 0 else np.round(ele, 4) for ele in (AC / AN)
                 ]
 
+                # DR2: dosage R² = var(hap_probs) / (p*(1-p))
+                p_hat = probs.mean(axis=1)
+                var_hap = probs.var(axis=1)
+                expected_var = p_hat * (1 - p_hat)
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    dr2 = np.where(expected_var > 0, var_hap / expected_var, 0.0)
+                dr2 = np.clip(dr2, 0.0, 1.0)
+
                 # Write variant records
                 for i, idx in enumerate(variant_ids):
                     chrom, pos, ref, alt = idx.split("-")
@@ -133,7 +142,7 @@ class VcfWriter:
                         )
                         fout.write("\n")
                         continue
-                    vcf_INFO += ";IMP"
+                    vcf_INFO += f";DR2={dr2[i]:.4f};IMP"
                     fout.write(
                         "\t".join(
                             [

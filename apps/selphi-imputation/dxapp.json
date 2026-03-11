@@ -1,9 +1,9 @@
 {
   "name": "selphi-imputation",
   "title": "Selphi genotype imputation app",
-  "summary": " weighted-PBWT genotype imputation algorithm",
+  "summary": "Weighted-PBWT genotype imputation algorithm",
   "dxapi": "1.0.0",
-  "version": "0.0.1",
+  "version": "1.5.3",
   "inputSpec": [
     {
       "name": "target",
@@ -13,7 +13,7 @@
       "patterns": [
         "*"
       ],
-      "help": ""
+      "help": "Path to vcf/bcf containing target samples"
     },
     {
       "name": "ref_source_vcf",
@@ -23,21 +23,21 @@
       "patterns": [
         "*"
       ],
-      "help": ""
+      "help": "Location of vcf/bcf containing reference panel"
     },
     {
       "name": "prepare_reference",
       "label": "prepare_reference",
       "class": "boolean",
       "optional": true,
-      "help": ""
+      "help": "Convert reference panel to PBWT and SRP formats"
     },
     {
       "name": "refpanel",
       "label": "refpanel",
       "class": "string",
       "optional": false,
-      "help": ""
+      "help": "Location of reference panel files (path prefix without extension)"
     },
     {
       "name": "cores",
@@ -45,7 +45,7 @@
       "class": "int",
       "optional": true,
       "default": 1,
-      "help": ""
+      "help": "Number of cores available"
     },
     {
       "name": "map",
@@ -55,14 +55,14 @@
       "patterns": [
         "*"
       ],
-      "help": ""
+      "help": "Path to genetic map in PLINK format"
     },
     {
       "name": "outvcf",
       "label": "outvcf",
       "class": "string",
       "optional": true,
-      "help": ""
+      "help": "Path to output imputed data to compressed VCF"
     },
     {
       "name": "match_length",
@@ -70,7 +70,7 @@
       "class": "int",
       "optional": true,
       "default": 5,
-      "help": ""
+      "help": "Minimum PBWT match length"
     },
     {
       "name": "ref_source_xsi",
@@ -80,21 +80,37 @@
       "patterns": [
         "*"
       ],
-      "help": ""
-    },
-    {
-      "name": "pbwt_path",
-      "label": "pbwt_path",
-      "class": "string",
-      "optional": true,
-      "help": ""
+      "help": "Location of xsi files containing reference panel"
     },
     {
       "name": "tmp_path",
       "label": "tmp_path",
       "class": "string",
       "optional": true,
-      "help": ""
+      "help": "Location to create temporary directory"
+    },
+    {
+      "name": "est_ne",
+      "label": "est_ne",
+      "class": "int",
+      "optional": true,
+      "default": 1000000,
+      "help": "Estimated effective population size (default: 1000000)"
+    },
+    {
+      "name": "chunk_size",
+      "label": "chunk_size",
+      "class": "int",
+      "optional": true,
+      "help": "Chunk size for sparse reference panel creation (default: 10000)"
+    },
+    {
+      "name": "no_core_reduction",
+      "label": "no_core_reduction",
+      "class": "boolean",
+      "optional": true,
+      "default": false,
+      "help": "Disable automatic core reduction to limit HMM memory"
     }
   ],
   "outputSpec": [
@@ -114,8 +130,13 @@
     "interpreter": "python3",
     "file": "src/selphi-imputation.py",
     "distribution": "Ubuntu",
-    "release": "20.04",
-    "version": "0"
+    "release": "22.04",
+    "version": "0",
+    "execDepends": [
+      {"name": "bcftools"},
+      {"name": "tabix"},
+      {"name": "software-properties-common"}
+    ]
   },
   "access": {
     "project": "CONTRIBUTE"

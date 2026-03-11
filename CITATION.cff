@@ -1,0 +1,62 @@
+cff-version: 1.2.0
+title: "Selphi: Genotype Imputation via Weighted PBWT"
+message: "If you use this software, please cite it using the metadata from this file."
+type: software
+version: 1.5.3
+license: LicenseRef-NonCommercial
+repository-code: "https://github.com/omicsedge/selphi"
+url: "https://github.com/omicsedge/selphi"
+date-released: "2024-07-01"
+authors:
+  - family-names: De Marino
+    given-names: Adriano
+  - family-names: Mahmoud
+    given-names: Abdallah Amr
+  - family-names: Bohn
+    given-names: Sandra
+  - family-names: Lerga-Jaso
+    given-names: Jon
+  - family-names: Novković
+    given-names: Biljana
+  - family-names: Manson
+    given-names: Charlie
+  - family-names: Loguercio
+    given-names: Salvatore
+  - family-names: Terpolovsky
+    given-names: Andrew
+  - family-names: Matushyn
+    given-names: Mykyta
+  - family-names: Torkamani
+    given-names: Ali
+  - family-names: Yazdi
+    given-names: Puya G.
+preferred-citation:
+  type: article
+  title: "Empowering GWAS Discovery through Enhanced Genotype Imputation"
+  authors:
+    - family-names: De Marino
+      given-names: Adriano
+    - family-names: Mahmoud
+      given-names: Abdallah Amr
+    - family-names: Bohn
+      given-names: Sandra
+    - family-names: Lerga-Jaso
+      given-names: Jon
+    - family-names: Novković
+      given-names: Biljana
+    - family-names: Manson
+      given-names: Charlie
+    - family-names: Loguercio
+      given-names: Salvatore
+    - family-names: Terpolovsky
+      given-names: Andrew
+    - family-names: Matushyn
+      given-names: Mykyta
+    - family-names: Torkamani
+      given-names: Ali
+    - family-names: Yazdi
+      given-names: Puya G.
+  doi: "10.1101/2023.12.18.23300143"
+  url: "https://www.medrxiv.org/content/10.1101/2023.12.18.23300143v2"
+  year: 2023
+  journal: "medRxiv"
