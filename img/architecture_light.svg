@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 560" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <defs>
+    <marker id="arrow-l" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="none" stroke="#57606a" stroke-width="1.2"/>
+    </marker>
+    <marker id="arrow-feed-l" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="none" stroke="#0969da" stroke-width="1.2"/>
+    </marker>
+    <linearGradient id="stage-grad-l" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f6f8fa"/>
+      <stop offset="100%" stop-color="#eef1f5"/>
+    </linearGradient>
+    <filter id="glow-l">
+      <feGaussianBlur stdDeviation="2" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="880" height="560" rx="12" fill="#ffffff"/>
+
+  <!-- Title -->
+  <text x="440" y="38" text-anchor="middle" fill="#1f2328" font-size="18" font-weight="600">Selphi v1.5.3 — Pipeline Architecture</text>
+
+  <!-- ===== INPUT LAYER ===== -->
+  <!-- Target VCF -->
+  <rect x="40" y="62" width="200" height="52" rx="8" fill="#ffffff" stroke="#1a7f37" stroke-width="1.5"/>
+  <text x="140" y="84" text-anchor="middle" fill="#1a7f37" font-size="11" font-weight="600">INPUT</text>
+  <text x="140" y="101" text-anchor="middle" fill="#1f2328" font-size="13" font-weight="500">Target VCF (phased)</text>
+
+  <!-- Reference Panel -->
+  <rect x="340" y="62" width="200" height="52" rx="8" fill="#ffffff" stroke="#9a6700" stroke-width="1.5"/>
+  <text x="440" y="84" text-anchor="middle" fill="#9a6700" font-size="11" font-weight="600">REFERENCE</text>
+  <text x="440" y="101" text-anchor="middle" fill="#1f2328" font-size="13" font-weight="500">.pbwt .srp .sites .samples</text>
+
+  <!-- Genetic Map -->
+  <rect x="640" y="62" width="200" height="52" rx="8" fill="#ffffff" stroke="#57606a" stroke-width="1.5"/>
+  <text x="740" y="84" text-anchor="middle" fill="#57606a" font-size="11" font-weight="600">MAP</text>
+  <text x="740" y="101" text-anchor="middle" fill="#1f2328" font-size="13" font-weight="500">Genetic Map (PLINK)</text>
+
+  <!-- ===== STAGE 1: PBWT Matching ===== -->
+  <rect x="100" y="152" width="400" height="68" rx="10" fill="url(#stage-grad-l)" stroke="#0969da" stroke-width="1.5" filter="url(#glow-l)"/>
+  <text x="120" y="174" fill="#0969da" font-size="11" font-weight="700">STAGE 1</text>
+  <text x="300" y="174" text-anchor="middle" fill="#1f2328" font-size="14" font-weight="600">PBWT Matching</text>
+  <text x="300" y="195" text-anchor="middle" fill="#57606a" font-size="11">External pbwt binary · referenceMatch · batch parallelism</text>
+  <text x="300" y="210" text-anchor="middle" fill="#1a7f37" font-size="10">whole-chromosome · no windowing</text>
+
+  <!-- Arrow: Target → PBWT -->
+  <line x1="140" y1="114" x2="140" y2="152" stroke="#57606a" stroke-width="1.2" marker-end="url(#arrow-l)"/>
+  <!-- Arrow: Reference → PBWT -->
+  <line x1="440" y1="114" x2="440" y2="152" stroke="#0969da" stroke-width="1.2" stroke-dasharray="5,3" marker-end="url(#arrow-feed-l)"/>
+
+  <!-- ===== STAGE 2: HMM ===== -->
+  <rect x="100" y="254" width="400" height="68" rx="10" fill="url(#stage-grad-l)" stroke="#0969da" stroke-width="1.5" filter="url(#glow-l)"/>
+  <text x="120" y="276" fill="#0969da" font-size="11" font-weight="700">STAGE 2</text>
+  <text x="300" y="276" text-anchor="middle" fill="#1f2328" font-size="14" font-weight="600">Li &amp; Stephens HMM</text>
+  <text x="300" y="297" text-anchor="middle" fill="#57606a" font-size="11">Forward-backward algorithm · weighted PBWT matches</text>
+  <text x="300" y="312" text-anchor="middle" fill="#1a7f37" font-size="10">parallel per haplotype · recombination from genetic map</text>
+
+  <!-- Arrow: PBWT → HMM -->
+  <line x1="300" y1="220" x2="300" y2="254" stroke="#57606a" stroke-width="1.2" marker-end="url(#arrow-l)"/>
+  <!-- Arrow: Genetic Map → HMM -->
+  <path d="M740,114 L740,288 L500,288" fill="none" stroke="#0969da" stroke-width="1.2" stroke-dasharray="5,3" marker-end="url(#arrow-feed-l)"/>
+
+  <!-- ===== STAGE 3: Interpolation ===== -->
+  <rect x="100" y="356" width="400" height="68" rx="10" fill="url(#stage-grad-l)" stroke="#0969da" stroke-width="1.5" filter="url(#glow-l)"/>
+  <text x="120" y="378" fill="#0969da" font-size="11" font-weight="700">STAGE 3</text>
+  <text x="300" y="378" text-anchor="middle" fill="#1f2328" font-size="14" font-weight="600">Interpolation + VCF Output</text>
+  <text x="300" y="399" text-anchor="middle" fill="#57606a" font-size="11">Linear weight interpolation · SRP chunked access</text>
+  <text x="300" y="414" text-anchor="middle" fill="#1a7f37" font-size="10">parallel per chunk · allele dosages at untyped sites</text>
+
+  <!-- Arrow: HMM → Interpolation -->
+  <line x1="300" y1="322" x2="300" y2="356" stroke="#57606a" stroke-width="1.2" marker-end="url(#arrow-l)"/>
+  <!-- Arrow: Reference → Interpolation (SRP access) -->
+  <path d="M540,88 L570,88 L570,390 L500,390" fill="none" stroke="#0969da" stroke-width="1.2" stroke-dasharray="5,3" marker-end="url(#arrow-feed-l)"/>
+  <text x="578" y="248" fill="#0969da" font-size="9" transform="rotate(90,578,248)">SRP chunked access</text>
+
+  <!-- ===== OUTPUT ===== -->
+  <rect x="175" y="458" width="250" height="44" rx="8" fill="#ffffff" stroke="#1a7f37" stroke-width="1.5"/>
+  <text x="300" y="476" text-anchor="middle" fill="#1a7f37" font-size="11" font-weight="600">OUTPUT</text>
+  <text x="300" y="492" text-anchor="middle" fill="#1f2328" font-size="13" font-weight="500">Imputed VCF.gz</text>
+
+  <!-- Arrow: Interpolation → Output -->
+  <line x1="300" y1="424" x2="300" y2="458" stroke="#57606a" stroke-width="1.2" marker-end="url(#arrow-l)"/>
+
+  <!-- ===== SIDE ANNOTATIONS ===== -->
+  <!-- Key features -->
+  <rect x="640" y="152" width="210" height="108" rx="8" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+  <text x="745" y="172" text-anchor="middle" fill="#1f2328" font-size="11" font-weight="600">Key Features</text>
+  <circle cx="660" cy="194" r="4" fill="#1a7f37"/>
+  <text x="675" y="198" fill="#1f2328" font-size="10">Whole-chromosome pass</text>
+  <circle cx="660" cy="216" r="4" fill="#0969da"/>
+  <text x="675" y="220" fill="#1f2328" font-size="10">Weighted PBWT matches</text>
+  <circle cx="660" cy="238" r="4" fill="#9a6700"/>
+  <text x="675" y="242" fill="#1f2328" font-size="10">Sparse ref panel (zstd)</text>
+
+  <!-- Parameters box -->
+  <rect x="640" y="284" width="210" height="108" rx="8" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+  <text x="745" y="304" text-anchor="middle" fill="#1f2328" font-size="11" font-weight="600">Parameters</text>
+  <text x="655" y="324" fill="#57606a" font-size="10">match_length (default: 5)</text>
+  <text x="655" y="340" fill="#57606a" font-size="10">est_ne (default: 1,000,000)</text>
+  <text x="655" y="356" fill="#57606a" font-size="10">chunk_size (default: 10,000)</text>
+  <text x="655" y="372" fill="#57606a" font-size="10">cores (multiprocessing)</text>
+  <text x="655" y="388" fill="#57606a" font-size="10">no_core_reduction</text>
+
+  <!-- Footer -->
+  <text x="850" y="548" text-anchor="end" fill="#8c959f" font-size="10">Python 3.10+ · pbwt · bcftools</text>
+</svg>
