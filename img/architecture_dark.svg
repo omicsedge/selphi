@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 680" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="none" stroke="#8b949e" stroke-width="1.2"/>
+    </marker>
+    <linearGradient id="sg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1c2333"/>
+      <stop offset="100%" stop-color="#161b22"/>
+    </linearGradient>
+    <filter id="gl">
+      <feGaussianBlur stdDeviation="2" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+
+  <rect width="880" height="680" rx="12" fill="#0d1117"/>
+
+  <text x="440" y="38" text-anchor="middle" fill="#e6edf3" font-size="18" font-weight="600">Selphi — Pipeline Architecture</text>
+
+  <!-- INPUT -->
+  <rect x="40" y="66" width="220" height="52" rx="8" fill="#0d1117" stroke="#238636" stroke-width="1.5"/>
+  <text x="150" y="88" text-anchor="middle" fill="#7ee787" font-size="12" font-weight="600">INPUT</text>
+  <text x="150" y="106" text-anchor="middle" fill="#c9d1d9" font-size="14">Target VCF / BCF</text>
+
+  <rect x="330" y="66" width="220" height="52" rx="8" fill="#0d1117" stroke="#d29922" stroke-width="1.5"/>
+  <text x="440" y="88" text-anchor="middle" fill="#d29922" font-size="12" font-weight="600">REFERENCE</text>
+  <text x="440" y="106" text-anchor="middle" fill="#c9d1d9" font-size="14">SRP Panel (zstd CSC)</text>
+
+  <rect x="620" y="66" width="220" height="52" rx="8" fill="#0d1117" stroke="#8b949e" stroke-width="1.5"/>
+  <text x="730" y="88" text-anchor="middle" fill="#8b949e" font-size="12" font-weight="600">MAP</text>
+  <text x="730" y="106" text-anchor="middle" fill="#c9d1d9" font-size="14">Genetic Map (PLINK)</text>
+
+  <line x1="150" y1="118" x2="150" y2="152" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
+  <line x1="440" y1="118" x2="440" y2="152" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
+
+  <!-- BITMATRIX -->
+  <rect x="80" y="154" width="620" height="44" rx="10" fill="url(#sg)" stroke="#8b5cf6" stroke-width="1.5"/>
+  <text x="390" y="174" text-anchor="middle" fill="#a78bfa" font-size="13" font-weight="700">Bitmatrix Extraction</text>
+  <text x="390" y="190" text-anchor="middle" fill="#8b949e" font-size="12">1 bit per allele · shared between phasing and imputation</text>
+
+  <line x1="390" y1="198" x2="390" y2="228" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
+
+  <!-- PHASING AUTO-DETECT -->
+  <rect x="60" y="230" width="760" height="28" rx="6" fill="#0d1117" stroke="#1f6feb" stroke-width="1"/>
+  <text x="440" y="249" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="600">Phasing — auto: ≤50K variants → haploid · &gt;50K variants → diploid</text>
+
+  <!-- HAPLOID -->
+  <rect x="60" y="270" width="370" height="120" rx="10" fill="url(#sg)" stroke="#f97316" stroke-width="1.5" filter="url(#gl)"/>
+  <text x="245" y="295" text-anchor="middle" fill="#fb923c" font-size="14" font-weight="700">Haploid Engine</text>
+  <text x="245" y="318" text-anchor="middle" fill="#c9d1d9" font-size="13">PBWT IBS → 280 composites</text>
+  <text x="245" y="338" text-anchor="middle" fill="#c9d1d9" font-size="13">3-channel forward-backward HMM</text>
+  <text x="245" y="358" text-anchor="middle" fill="#c9d1d9" font-size="13">Greedy swap · 15 iterations</text>
+  <text x="245" y="378" text-anchor="middle" fill="#8b949e" font-size="11">Optimal for chip arrays</text>
+
+  <!-- DIPLOID -->
+  <rect x="450" y="270" width="370" height="120" rx="10" fill="url(#sg)" stroke="#3b82f6" stroke-width="1.5" filter="url(#gl)"/>
+  <text x="635" y="295" text-anchor="middle" fill="#60a5fa" font-size="14" font-weight="700">Diploid Engine</text>
+  <text x="635" y="318" text-anchor="middle" fill="#c9d1d9" font-size="13">PBWT neighbors → genotype graph</text>
+  <text x="635" y="338" text-anchor="middle" fill="#c9d1d9" font-size="13">Diplotype segment HMM (AVX-512)</text>
+  <text x="635" y="358" text-anchor="middle" fill="#c9d1d9" font-size="13">MCMC sampling · Viterbi solve</text>
+  <text x="635" y="378" text-anchor="middle" fill="#8b949e" font-size="11">Optimal for whole-genome sequencing</text>
+
+  <line x1="245" y1="390" x2="245" y2="415" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
+  <line x1="635" y1="390" x2="635" y2="415" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
+
+  <!-- BYPASS: pre-phased input skips phasing → direct to imputation -->
+  <path d="M 40 118 L 20 118 L 20 530 L 78 530" fill="none" stroke="#58a6ff" stroke-width="1.8" stroke-dasharray="6,3" marker-end="url(#arr)"/>
+  <text x="10" y="340" fill="#58a6ff" font-size="11" font-weight="600" transform="rotate(-90,10,340)" text-anchor="middle">pre-phased input → skip phasing</text>
+
+  <!-- IN-MEMORY HANDOFF -->
+  <rect x="140" y="417" width="600" height="32" rx="8" fill="#0d1117" stroke="#238636" stroke-width="1" stroke-dasharray="6,3"/>
+  <text x="440" y="438" text-anchor="middle" fill="#7ee787" font-size="12">In-memory transfer: phased haplotypes + reference bitmatrix</text>
+
+  <line x1="440" y1="449" x2="440" y2="478" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
+
+  <!-- IMPUTATION -->
+  <rect x="80" y="480" width="720" height="110" rx="10" fill="url(#sg)" stroke="#ec4899" stroke-width="1.5" filter="url(#gl)"/>
+  <text x="440" y="505" text-anchor="middle" fill="#f472b6" font-size="14" font-weight="700">Imputation Engine</text>
+  <text x="440" y="528" text-anchor="middle" fill="#c9d1d9" font-size="13">Li-Stephens PBWT forward-backward HMM</text>
+  <text x="440" y="548" text-anchor="middle" fill="#c9d1d9" font-size="13">Per-haplotype: coded-step PBWT → candidate selection → reduced panel</text>
+  <text x="440" y="568" text-anchor="middle" fill="#c9d1d9" font-size="13">f32 precision · thread-local buffers · LD-corrected genetic map</text>
+  <text x="440" y="582" text-anchor="middle" fill="#8b949e" font-size="11">Parallel dosage interpolation · streaming VCF/BCF/Parquet/PGEN output</text>
+
+  <line x1="440" y1="590" x2="440" y2="618" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
+
+  <!-- OUTPUT -->
+  <rect x="220" y="620" width="440" height="42" rx="8" fill="#0d1117" stroke="#238636" stroke-width="1.5"/>
+  <text x="440" y="640" text-anchor="middle" fill="#7ee787" font-size="12" font-weight="600">OUTPUT</text>
+  <text x="440" y="654" text-anchor="middle" fill="#c9d1d9" font-size="13">VCF.gz / BCF / Parquet / PGEN — GT · DS · AP1 · AP2</text>
+</svg>

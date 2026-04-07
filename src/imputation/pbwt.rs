@@ -1,0 +1,1144 @@
+#![allow(dead_code)]
+//! PBWT matching for imputation — forward/backward passes producing CSC match matrices.
+//!
+//! Port of `modules/pbwt_numba.py`: `_pbwt_match_targets`, `_backward_filter_all`,
+//! `_build_csc_arrays`. Different from the phasing PBWT (no coded steps, no IBS2
+//! restrictions, produces CSC sparse match matrices with match lengths).
+//!
+//! Parallelized via rayon: each target haplotype runs an independent PBWT sort.
+
+use rayon::prelude::*;
+
+// ---------------------------------------------------------------------------
+// CSC sparse match matrix
+// ---------------------------------------------------------------------------
+
+/// A CSC sparse matrix storing match lengths (int32).
+/// Shape: (n_ref, n_var) — rows are reference haplotypes, columns are chip variants.
+#[derive(Debug, Clone)]
+pub struct CscMatchMatrix {
+    /// Column pointer array, length = n_var + 1
+    pub indptr: Vec<i32>,
+    /// Row indices (reference haplotype IDs), length = nnz
+    pub indices: Vec<i32>,
+    /// Match lengths, length = nnz
+    pub data: Vec<i32>,
+    pub n_rows: usize,
+    pub n_cols: usize,
+}
+
+impl CscMatchMatrix {
+    pub fn nnz(&self) -> usize {
+        self.indices.len()
+    }
+
+    pub fn empty(n_rows: usize, n_cols: usize) -> Self {
+        CscMatchMatrix {
+            indptr: vec![0i32; n_cols + 1],
+            indices: Vec::new(),
+            data: Vec::new(),
+            n_rows,
+            n_cols,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PBWT sort update
+// ---------------------------------------------------------------------------
+
+/// PBWT prefix-sort update (port of pbwtCursorForwardsAD / _pbwt_forwards_ad).
+///
+/// Splits haplotypes by allele at position k: 0-alleles first, 1-alleles second.
+/// Updates a[], d[], a_inv[] in place.
+#[inline]
+/// PBWT sort update: partition haplotypes by allele (0 first, then 1).
+/// This is the hot inner loop — called once per variant per target.
+fn pbwt_forwards_ad(
+    a: &mut [i32], a_inv: &mut [i32], d: &mut [i32],
+    y: &[u8], b: &mut [i32], e: &mut [i32], m: usize, k: usize,
+) {
+    let mut u: usize = 0;
+    let mut v: usize = 0;
+    let mut p = k as i32 + 1;
+    let mut q = k as i32 + 1;
+    let sentinel = k as i32 + 2;
+
+    // Unrolled: process 4 elements at a time for better ILP
+    let m4 = m & !3;
+    let mut i = 0;
+    while i < m4 {
+        // Process 4 elements — compiler can schedule independent ops
+        macro_rules! step {
+            ($idx:expr) => {
+                let di = d[$idx];
+                if di > p { p = di; }
+                if di > q { q = di; }
+                let ai = a[$idx];
+                if y[$idx] == 0 {
+                    a_inv[ai as usize] = u as i32;
+                    a[u] = ai;
+                    d[u] = p;
+                    u += 1;
+                    p = 0;
+                } else {
+                    b[v] = ai;
+                    e[v] = q;
+                    v += 1;
+                    q = 0;
+                }
+            };
+        }
+        step!(i); step!(i+1); step!(i+2); step!(i+3);
+        i += 4;
+    }
+    // Remainder
+    while i < m {
+        let di = d[i];
+        if di > p { p = di; }
+        if di > q { q = di; }
+        if y[i] == 0 {
+            a_inv[a[i] as usize] = u as i32;
+            a[u] = a[i];
+            d[u] = p;
+            u += 1;
+            p = 0;
+        } else {
+            b[v] = a[i];
+            e[v] = q;
+            v += 1;
+            q = 0;
+        }
+        i += 1;
+    }
+    // Merge b into a (after u)
+    // Use copy_nonoverlapping for bulk transfer
+    unsafe {
+        std::ptr::copy_nonoverlapping(b.as_ptr(), a.as_mut_ptr().add(u), v);
+        std::ptr::copy_nonoverlapping(e.as_ptr(), d.as_mut_ptr().add(u), v);
+    }
+    for i in 0..v {
+        a_inv[b[i] as usize] = (u + i) as i32;
+    }
+    d[0] = sentinel;
+    d[m] = sentinel;
+}
+
+// ---------------------------------------------------------------------------
+// Forward pass: match finding
+// ---------------------------------------------------------------------------
+
+/// Per-target result from the forward pass.
+pub struct FwdResult {
+    /// (n_var, fl_fwd) — matched reference haplotype IDs
+    pub haps: Vec<i32>,
+    /// (n_var, fl_fwd) — match lengths
+    pub lens: Vec<i32>,
+    /// (n_var,) — number of matches stored at each variant
+    pub counts: Vec<i32>,
+}
+
+/// Pre-allocated workspace for PBWT forward pass (avoids repeated allocation).
+/// Create one per thread and reuse across targets.
+pub struct PbwtWorkspace {
+    a: Vec<i32>,
+    a_inv: Vec<i32>,
+    d: Vec<i32>,
+    y: Vec<u8>,
+    b: Vec<i32>,
+    e: Vec<i32>,
+    ht: Vec<i64>,
+}
+
+impl PbwtWorkspace {
+    pub fn new(m: usize, n_ref: usize) -> Self {
+        Self {
+            a: vec![0i32; m],
+            a_inv: vec![0i32; m],
+            d: vec![0i32; m + 1],
+            y: vec![0u8; m],
+            b: vec![0i32; m],
+            e: vec![0i32; m],
+            ht: vec![0i64; n_ref],
+        }
+    }
+
+    pub fn capacity(&self) -> usize { self.a.len() }
+
+    fn reset(&mut self, m: usize) {
+        for i in 0..m { self.a[i] = i as i32; self.a_inv[i] = i as i32; }
+        self.d.fill(0); self.d[0] = 1; self.d[m] = 1;
+        self.ht.fill(0);
+    }
+}
+
+/// PBWT forward pass using a pre-allocated workspace (zero allocations in hot path).
+pub fn pbwt_forward_with_workspace(
+    ws: &mut PbwtWorkspace,
+    alleles: &[u8],
+    n_var: usize,
+    m: usize,
+    n_ref: usize,
+    min_l: usize,
+    fl_fwd: usize,
+    target_abs: i32,
+) -> FwdResult {
+    ws.reset(m);
+
+    let mut haps = vec![0i32; n_var * fl_fwd];
+    let mut lens = vec![0i32; n_var * fl_fwd];
+    let mut counts = vec![0i32; n_var];
+
+    // Initial y
+    ws.y[..m].copy_from_slice(&alleles[..m]);
+
+    for var in 0..n_var {
+        let is_last = var >= n_var - 1;
+
+        if var >= min_l {
+            let threshold = (var - min_l) as i32;
+            let ib = ws.a_inv[target_abs as usize] as usize;
+
+            // LEFT SCAN
+            {
+                let mut dmin: i32 = 0;
+                let mut pos = ib as isize - 1;
+                while pos >= 0 {
+                    let dv = ws.d[pos as usize + 1];
+                    if dv > dmin { dmin = dv; }
+                    if dmin > threshold { break; }
+                    let hap_at_pos = ws.a[pos as usize];
+                    if hap_at_pos < n_ref as i32 {
+                        if ws.y[ib] != ws.y[pos as usize] || is_last {
+                            let mut length = var as i32 - dmin;
+                            if is_last && ws.y[ib] == ws.y[pos as usize] { length += 1; }
+                            insert_match(
+                                &mut haps, &mut lens, &mut counts, &mut ws.ht,
+                                n_var, fl_fwd, dmin as usize, hap_at_pos, length,
+                            );
+                        }
+                    }
+                    pos -= 1;
+                }
+            }
+
+            // RIGHT SCAN
+            {
+                let mut dmin: i32 = 0;
+                for pos in (ib + 1)..m {
+                    let dv = ws.d[pos];
+                    if dv > dmin { dmin = dv; }
+                    if dmin > threshold { break; }
+                    let hap_at_pos = ws.a[pos];
+                    if hap_at_pos < n_ref as i32 {
+                        if ws.y[pos] != ws.y[ib] || is_last {
+                            let mut length = var as i32 - dmin;
+                            if is_last && ws.y[ib] == ws.y[pos] { length += 1; }
+                            insert_match(
+                                &mut haps, &mut lens, &mut counts, &mut ws.ht,
+                                n_var, fl_fwd, dmin as usize, hap_at_pos, length,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        pbwt_forwards_ad(&mut ws.a, &mut ws.a_inv, &mut ws.d, &ws.y, &mut ws.b, &mut ws.e, m, var);
+
+        if var < n_var - 1 {
+            let row_base = (var + 1) * m;
+            for i in 0..m {
+                ws.y[i] = alleles[row_base + ws.a[i] as usize];
+            }
+        }
+    }
+
+    FwdResult { haps, lens, counts }
+}
+
+/// PBWT forward pass with match finding for a single target haplotype.
+///
+/// Performs the full PBWT sort across all variants, collecting top-K matches
+/// at each variant where the match length exceeds `min_l`.
+pub fn pbwt_forward_single(
+    alleles: &[u8],  // (n_var * m), row-major
+    n_var: usize,
+    m: usize,
+    n_ref: usize,
+    min_l: usize,
+    fl_fwd: usize,
+    target_abs: i32,
+) -> FwdResult {
+    let mut a: Vec<i32> = (0..m as i32).collect();
+    let mut a_inv: Vec<i32> = (0..m as i32).collect();
+    let mut d = vec![0i32; m + 1];
+    d[0] = 1;
+    d[m] = 1;
+    let mut y = vec![0u8; m];
+    let mut b_arr = vec![0i32; m];
+    let mut e_arr = vec![0i32; m];
+    let mut ht = vec![0i64; n_ref]; // haplotype totals
+
+    let mut haps = vec![0i32; n_var * fl_fwd];
+    let mut lens = vec![0i32; n_var * fl_fwd];
+    let mut counts = vec![0i32; n_var];
+
+    // Initial y from first variant
+    for i in 0..m {
+        y[i] = alleles[i]; // alleles[0, i]
+    }
+
+    for var in 0..n_var {
+        let is_last = var >= n_var - 1;
+
+        if var >= min_l {
+            let threshold = (var - min_l) as i32;
+            let ib = a_inv[target_abs as usize] as usize;
+
+            // LEFT SCAN: scan positions below target
+            {
+                let mut dmin: i32 = 0;
+                let mut pos = ib as isize - 1;
+                while pos >= 0 {
+                    let dv = d[pos as usize + 1];
+                    if dv > dmin { dmin = dv; }
+                    if dmin > threshold { break; }
+                    let hap_at_pos = a[pos as usize];
+                    if hap_at_pos < n_ref as i32 {
+                        if y[ib] != y[pos as usize] || is_last {
+                            let mut length = var as i32 - dmin;
+                            if is_last && y[ib] == y[pos as usize] {
+                                length += 1;
+                            }
+                            let ref_hap = hap_at_pos;
+                            let dmin_idx = dmin as usize;
+                            insert_match(
+                                &mut haps, &mut lens, &mut counts,
+                                &mut ht, n_var, fl_fwd,
+                                dmin_idx, ref_hap, length,
+                            );
+                        }
+                    }
+                    pos -= 1;
+                }
+            }
+
+            // RIGHT SCAN: scan positions above target
+            {
+                let mut dmin: i32 = 0;
+                for pos in (ib + 1)..m {
+                    let dv = d[pos];
+                    if dv > dmin { dmin = dv; }
+                    if dmin > threshold { break; }
+                    let hap_at_pos = a[pos];
+                    if hap_at_pos < n_ref as i32 {
+                        if y[pos] != y[ib] || is_last {
+                            let mut length = var as i32 - dmin;
+                            if is_last && y[ib] == y[pos] {
+                                length += 1;
+                            }
+                            let ref_hap = hap_at_pos;
+                            let dmin_idx = dmin as usize;
+                            insert_match(
+                                &mut haps, &mut lens, &mut counts,
+                                &mut ht, n_var, fl_fwd,
+                                dmin_idx, ref_hap, length,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort update AFTER match finding
+        pbwt_forwards_ad(&mut a, &mut a_inv, &mut d, &y, &mut b_arr, &mut e_arr, m, var);
+
+        // Read next variant's alleles in new sort order (gather with prefetch)
+        if var < n_var - 1 {
+            let row_base = (var + 1) * m;
+            let row = &alleles[row_base..row_base + m];
+            for i in 0..m {
+                y[i] = row[a[i] as usize];
+            }
+        }
+    }
+
+    FwdResult { haps, lens, counts }
+}
+
+/// Insert a match into the sorted buffer at a specific variant position.
+/// Keeps top `fl` matches by length descending, tie-break by cumulative total descending.
+/// Uses copy_within (memmove) for the shift instead of element-by-element.
+#[inline]
+fn insert_match(
+    haps: &mut [i32],   // flat (n_var, fl)
+    lens: &mut [i32],   // flat (n_var, fl)
+    counts: &mut [i32], // (n_var,)
+    ht: &mut [i64],     // haplotype totals (n_ref,)
+    n_var: usize,
+    fl: usize,
+    var: usize,
+    ref_hap: i32,
+    length: i32,
+) {
+    let _ = n_var;
+    ht[ref_hap as usize] += length as i64;
+
+    let n = counts[var] as usize;
+    let base = var * fl;
+    let h = &mut haps[base..base + fl];
+    let l = &mut lens[base..base + fl];
+
+    if n >= fl && length < l[fl - 1] {
+        return;
+    }
+
+    let total = ht[ref_hap as usize];
+    let new_n = (n + 1).min(fl);
+
+    // Find insertion position: after entries with (l > length) or (l == length && ht > total)
+    let mut j = n as isize - 1;
+    while j >= 0 && l[j as usize] < length { j -= 1; }
+    while j >= 0 && l[j as usize] == length && ht[h[j as usize] as usize] <= total { j -= 1; }
+    let insert_pos = (j + 1) as usize;
+
+    if insert_pos >= new_n {
+        counts[var] = new_n as i32;
+        return;
+    }
+
+    // Shift elements right by 1 using copy_within (memmove)
+    if insert_pos + 1 < new_n {
+        l.copy_within(insert_pos..new_n - 1, insert_pos + 1);
+        h.copy_within(insert_pos..new_n - 1, insert_pos + 1);
+    }
+    l[insert_pos] = length;
+    h[insert_pos] = ref_hap;
+    counts[var] = new_n as i32;
+}
+
+// ---------------------------------------------------------------------------
+// Shared PBWT sort: one sort pass for ALL target haplotypes
+// ---------------------------------------------------------------------------
+
+/// PBWT forward pass with shared sort state across all targets.
+/// Performs ONE PBWT sort, finding matches for a range of target haplotypes
+/// simultaneously. Sort is shared across all targets. ~10-30x faster than
+/// running per-target passes.
+///
+/// `target_offset`: first target index (0-based relative to n_ref).
+/// `n_targets`: number of targets to process in this batch.
+/// Targets are at absolute indices n_ref+target_offset..n_ref+target_offset+n_targets.
+pub fn pbwt_forward_shared(
+    alleles: &[u8],  // (n_var * m) row-major
+    n_var: usize,
+    m: usize,
+    n_ref: usize,
+    target_offset: usize,
+    n_targets: usize,
+    min_l: usize,
+    fl_fwd: usize,
+) -> Vec<FwdResult> {
+    // Shared sort state
+    let mut a: Vec<i32> = (0..m as i32).collect();
+    let mut a_inv: Vec<i32> = (0..m as i32).collect();
+    let mut d = vec![0i32; m + 1];
+    d[0] = 1; d[m] = 1;
+    let mut y = vec![0u8; m];
+    let mut b_arr = vec![0i32; m];
+    let mut e_arr = vec![0i32; m];
+
+    // Per-target match buffers
+    let mut results: Vec<FwdResult> = (0..n_targets).map(|_| FwdResult {
+        haps: vec![0i32; n_var * fl_fwd],
+        lens: vec![0i32; n_var * fl_fwd],
+        counts: vec![0i32; n_var],
+    }).collect();
+    let mut ht: Vec<Vec<i64>> = (0..n_targets).map(|_| vec![0i64; n_ref]).collect();
+
+    // Initial y from first variant
+    for i in 0..m { y[i] = alleles[i]; }
+
+    for var in 0..n_var {
+        let is_last = var >= n_var - 1;
+
+        if var >= min_l {
+            let threshold = (var - min_l) as i32;
+
+            // Parallel match-finding: each target reads shared a/d/y (immutable),
+            // writes to its own result/ht buffers (exclusive per target).
+            use rayon::prelude::*;
+            let a_ref = &a[..m];
+            let a_inv_ref = &a_inv[..m];
+            let d_ref = &d[..m + 1];
+            let y_ref = &y[..m];
+
+            results.par_iter_mut().zip(ht.par_iter_mut()).enumerate().for_each(|(tgt, (r, ht_t))| {
+                let target_abs = (n_ref + target_offset + tgt) as i32;
+                let ib = a_inv_ref[target_abs as usize] as usize;
+                let target_y = y_ref[ib];
+
+                // LEFT SCAN
+                {
+                    let mut dmin: i32 = 0;
+                    let mut pos = ib as isize - 1;
+                    while pos >= 0 {
+                        let dv = d_ref[pos as usize + 1];
+                        if dv > dmin { dmin = dv; }
+                        if dmin > threshold { break; }
+                        let hap_at_pos = a_ref[pos as usize];
+                        if hap_at_pos < n_ref as i32 {
+                            if target_y != y_ref[pos as usize] || is_last {
+                                let mut length = var as i32 - dmin;
+                                if is_last && target_y == y_ref[pos as usize] { length += 1; }
+                                insert_match(
+                                    &mut r.haps, &mut r.lens, &mut r.counts, ht_t,
+                                    n_var, fl_fwd, dmin as usize, hap_at_pos, length,
+                                );
+                            }
+                        }
+                        pos -= 1;
+                    }
+                }
+
+                // RIGHT SCAN
+                {
+                    let mut dmin: i32 = 0;
+                    for pos in (ib + 1)..m {
+                        let dv = d_ref[pos];
+                        if dv > dmin { dmin = dv; }
+                        if dmin > threshold { break; }
+                        let hap_at_pos = a_ref[pos];
+                        if hap_at_pos < n_ref as i32 {
+                            if y_ref[pos] != target_y || is_last {
+                                let mut length = var as i32 - dmin;
+                                if is_last && target_y == y_ref[pos] { length += 1; }
+                                insert_match(
+                                    &mut r.haps, &mut r.lens, &mut r.counts, ht_t,
+                                    n_var, fl_fwd, dmin as usize, hap_at_pos, length,
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Sort update ONCE (shared across all targets)
+        pbwt_forwards_ad(&mut a, &mut a_inv, &mut d, &y, &mut b_arr, &mut e_arr, m, var);
+
+        // Read next variant's alleles in new sort order (gather with prefetch)
+        if var < n_var - 1 {
+            let row_base = (var + 1) * m;
+            let row = &alleles[row_base..row_base + m];
+            for i in 0..m {
+                y[i] = row[a[i] as usize];
+            }
+        }
+    }
+
+    results
+}
+
+
+// ---------------------------------------------------------------------------
+// Backward pass: re-ranking
+// ---------------------------------------------------------------------------
+
+/// Per-target result from the backward pass.
+pub struct BwdResult {
+    /// (n_var, fl_bwd) — matched reference haplotype IDs
+    pub haps: Vec<i32>,
+    /// (n_var, fl_bwd) — match lengths
+    pub lens: Vec<i32>,
+    /// (n_var,) — number of matches stored at each variant
+    pub counts: Vec<i32>,
+}
+
+/// Backward pass filtering for a single target.
+/// Re-ranks matches from last variant to first, keeping top fl_bwd per variant.
+pub fn backward_filter_single(
+    fwd: &FwdResult,
+    n_var: usize,
+    n_ref: usize,
+    fl_fwd: usize,
+    fl_bwd: usize,
+) -> BwdResult {
+    let mut haps = vec![0i32; n_var * fl_bwd];
+    let mut lens = vec![0i32; n_var * fl_bwd];
+    let mut counts = vec![0i32; n_var];
+    let mut ht = vec![0i64; n_ref];
+
+    for var in (0..n_var).rev() {
+        let n = fwd.counts[var] as usize;
+        let fwd_base = var * fl_fwd;
+        // Process in reverse order (j from n-1 to 0) to match Python
+        for j in (0..n).rev() {
+            let ref_hap = fwd.haps[fwd_base + j];
+            let length = fwd.lens[fwd_base + j];
+            insert_match(
+                &mut haps, &mut lens, &mut counts,
+                &mut ht, n_var, fl_bwd,
+                var, ref_hap, length,
+            );
+        }
+    }
+
+    BwdResult { haps, lens, counts }
+}
+
+// ---------------------------------------------------------------------------
+// CSC construction
+// ---------------------------------------------------------------------------
+
+/// Build a CSC match matrix from backward pass results.
+pub fn build_csc_matrix(bwd: &BwdResult, n_ref: usize, n_var: usize, fl_bwd: usize) -> CscMatchMatrix {
+    // Count total nnz
+    let nnz: usize = bwd.counts.iter().map(|&c| c as usize).sum();
+    if nnz == 0 {
+        return CscMatchMatrix::empty(n_ref, n_var);
+    }
+
+    let mut indptr = Vec::with_capacity(n_var + 1);
+    let mut indices = Vec::with_capacity(nnz);
+    let mut data = Vec::with_capacity(nnz);
+
+    let mut idx = 0i32;
+    for v in 0..n_var {
+        indptr.push(idx);
+        let n = bwd.counts[v] as usize;
+        let base = v * fl_bwd;
+        for j in 0..n {
+            indices.push(bwd.haps[base + j]);
+            data.push(bwd.lens[base + j]);
+            idx += 1;
+        }
+    }
+    indptr.push(idx);
+
+    CscMatchMatrix {
+        indptr,
+        indices,
+        data,
+        n_rows: n_ref,
+        n_cols: n_var,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Run PBWT forward + backward matching for all target haplotypes.
+///
+/// # Arguments
+/// * `ref_alleles` — (n_var, n_ref) row-major u8, reference alleles at chip sites
+/// * `targ_alleles` — (n_var, n_targ_haps) row-major u8, target alleles at chip sites
+/// * `n_var` — number of chip variants
+/// * `n_ref` — number of reference haplotypes
+/// * `n_targ_haps` — number of target haplotypes
+/// * `min_l` — minimum match length
+/// * `fl_fwd` — max forward matches per variant
+/// * `fl_bwd` — max backward matches per variant (final output)
+///
+/// # Returns
+/// Vec of CscMatchMatrix, one per target haplotype (length n_targ_haps).
+pub fn pbwt_match_all(
+    ref_alleles: &[u8],   // (n_var, n_ref) row-major
+    targ_alleles: &[u8],  // (n_var, n_targ_haps) row-major
+    n_var: usize,
+    n_ref: usize,
+    n_targ_haps: usize,
+    min_l: usize,
+    fl_fwd: usize,
+    fl_bwd: usize,
+) -> Vec<CscMatchMatrix> {
+    let m = n_ref + n_targ_haps;
+
+    // Merge ref + target alleles into a single (n_var, M) array, row-major
+    let mut alleles = vec![0u8; n_var * m];
+    for var in 0..n_var {
+        let out_base = var * m;
+        let ref_base = var * n_ref;
+        alleles[out_base..out_base + n_ref].copy_from_slice(&ref_alleles[ref_base..ref_base + n_ref]);
+        let targ_base = var * n_targ_haps;
+        alleles[out_base + n_ref..out_base + m].copy_from_slice(&targ_alleles[targ_base..targ_base + n_targ_haps]);
+    }
+
+    // Parallel forward pass: one thread per target haplotype
+    let fwd_results: Vec<FwdResult> = (0..n_targ_haps)
+        .into_par_iter()
+        .map(|tgt| {
+            let target_abs = (n_ref + tgt) as i32;
+            pbwt_forward_single(&alleles, n_var, m, n_ref, min_l, fl_fwd, target_abs)
+        })
+        .collect();
+
+    // Parallel backward pass + CSC construction
+    fwd_results
+        .par_iter()
+        .map(|fwd| {
+            let bwd = backward_filter_single(fwd, n_var, n_ref, fl_fwd, fl_bwd);
+            build_csc_matrix(&bwd, n_ref, n_var, fl_bwd)
+        })
+        .collect()
+}
+
+/// Run PBWT matching for a batch of target haplotypes.
+/// This is the batch-level function called by the pipeline orchestrator.
+///
+/// `targ_batch` is a slice of the target alleles array for this batch only:
+/// (n_var, batch_haps) row-major.
+pub fn pbwt_match_batch(
+    ref_alleles: &[u8],   // (n_var, n_ref) row-major
+    targ_batch: &[u8],    // (n_var, batch_haps) row-major
+    n_var: usize,
+    n_ref: usize,
+    batch_haps: usize,
+    min_l: usize,
+    fl_fwd: usize,
+    fl_bwd: usize,
+) -> Vec<CscMatchMatrix> {
+    pbwt_match_all(ref_alleles, targ_batch, n_var, n_ref, batch_haps, min_l, fl_fwd, fl_bwd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pbwt_sort_basic() {
+        // 4 haplotypes, 3 variants
+        // h0: 0,1,0
+        // h1: 1,0,1
+        // h2: 0,0,0
+        // h3: 1,1,1
+        let m = 4;
+        let mut a: Vec<i32> = vec![0, 1, 2, 3];
+        let mut a_inv: Vec<i32> = vec![0, 1, 2, 3];
+        let mut d = vec![0i32; m + 1];
+        d[0] = 1; d[m] = 1;
+        let mut b = vec![0i32; m];
+        let mut e = vec![0i32; m];
+
+        // var 0: alleles = [0, 1, 0, 1]
+        let y = vec![0u8, 1, 0, 1];
+        pbwt_forwards_ad(&mut a, &mut a_inv, &mut d, &y, &mut b, &mut e, m, 0);
+        // After sort: 0-alleles first (h0, h2), then 1-alleles (h1, h3)
+        assert_eq!(a[0], 0);
+        assert_eq!(a[1], 2);
+        assert_eq!(a[2], 1);
+        assert_eq!(a[3], 3);
+    }
+
+    #[test]
+    fn test_insert_match_basic() {
+        let fl = 3;
+        let n_var = 2;
+        let mut haps = vec![0i32; n_var * fl];
+        let mut lens = vec![0i32; n_var * fl];
+        let mut counts = vec![0i32; n_var];
+        let mut ht = vec![0i64; 10];
+
+        // Insert 4 matches at var 0 (only 3 kept)
+        insert_match(&mut haps, &mut lens, &mut counts, &mut ht, n_var, fl, 0, 5, 10);
+        insert_match(&mut haps, &mut lens, &mut counts, &mut ht, n_var, fl, 0, 3, 20);
+        insert_match(&mut haps, &mut lens, &mut counts, &mut ht, n_var, fl, 0, 7, 5);
+        insert_match(&mut haps, &mut lens, &mut counts, &mut ht, n_var, fl, 0, 1, 15);
+
+        assert_eq!(counts[0], 3);
+        // Top 3 by length: 20, 15, 10
+        assert_eq!(lens[0], 20);
+        assert_eq!(lens[1], 15);
+        assert_eq!(lens[2], 10);
+        assert_eq!(haps[0], 3);
+        assert_eq!(haps[1], 1);
+        assert_eq!(haps[2], 5);
+    }
+
+    #[test]
+    fn test_pbwt_match_small() {
+        // Small example: 3 ref haps, 1 target, 5 variants
+        let n_ref = 3;
+        let n_targ = 1;
+        let n_var = 10;
+        let min_l = 2;
+        let fl_fwd = 10;
+        let fl_bwd = 5;
+
+        // ref alleles: 3 haps that are distinct
+        let mut ref_alleles = vec![0u8; n_var * n_ref];
+        // h0: all 0s
+        // h1: alternating
+        // h2: all 1s
+        for v in 0..n_var {
+            ref_alleles[v * n_ref + 0] = 0;
+            ref_alleles[v * n_ref + 1] = (v % 2) as u8;
+            ref_alleles[v * n_ref + 2] = 1;
+        }
+
+        // target: all 0s (should match h0 best)
+        let targ_alleles = vec![0u8; n_var * n_targ];
+
+        let results = pbwt_match_all(
+            &ref_alleles, &targ_alleles, n_var, n_ref, n_targ, min_l, fl_fwd, fl_bwd,
+        );
+
+        assert_eq!(results.len(), 1);
+        let csc = &results[0];
+        assert_eq!(csc.n_rows, n_ref);
+        assert_eq!(csc.n_cols, n_var);
+        // Should have found some matches
+        assert!(csc.nnz() > 0, "expected some matches, got nnz=0");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CodedSteps: pre-filter candidates for reduced-panel PBWT
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+
+/// Coded step partitioning: groups haplotypes by allele sequence at regular cM intervals.
+pub struct CodedSteps {
+    /// Step boundaries: step i covers chip variants [starts[i], starts[i+1])
+    pub starts: Vec<usize>,
+    /// Per-step: group_id → list of haplotype indices (absolute in merged panel)
+    pub step_groups: Vec<Vec<Vec<u32>>>,
+    /// Per-step: haplotype → group_id mapping
+    pub hap_group: Vec<Vec<u32>>,
+}
+
+/// Build coded step partitions from a merged alleles panel.
+///
+/// Divides the genetic map into steps of `step_cm` cM each. For each step,
+/// encodes each haplotype's allele sequence as a hash and groups haplotypes
+/// by identical hash (= identical allele pattern within the step).
+pub fn build_coded_steps(
+    alleles: &[u8],    // (n_var, m) row-major
+    n_var: usize,
+    m: usize,
+    chip_cm: &[f64],
+    step_cm: f64,
+) -> CodedSteps {
+    // 1. Compute step boundaries 
+    let mut starts = Vec::new();
+    if n_var == 0 || chip_cm.is_empty() {
+        return CodedSteps { starts: vec![0], step_groups: vec![], hap_group: vec![] };
+    }
+
+    let mut next_pos = chip_cm[0] + step_cm / 2.0; // first step half-length
+    starts.push(0);
+    for i in 1..n_var {
+        if chip_cm[i] >= next_pos {
+            starts.push(i);
+            next_pos = chip_cm[i] + step_cm;
+        }
+    }
+    starts.push(n_var); // sentinel
+
+    let n_steps = starts.len() - 1;
+
+    // 2. For each step, encode haplotypes and build partitions
+    let mut step_groups = Vec::with_capacity(n_steps);
+    let mut hap_group = Vec::with_capacity(n_steps);
+
+    for s in 0..n_steps {
+        let var_start = starts[s];
+        let var_end = starts[s + 1];
+        let step_len = var_end - var_start;
+
+        // Encode each haplotype's allele sequence in this step
+        let mut codes = vec![0u64; m];
+        if step_len <= 40 {
+            // Binary encoding (fits in u64 for ≤40 markers)
+            for var in var_start..var_end {
+                let row = &alleles[var * m..(var + 1) * m];
+                for h in 0..m {
+                    codes[h] = codes[h] * 2 + row[h] as u64;
+                }
+            }
+        } else {
+            // FNV-1a hash for longer steps
+            for h in 0..m { codes[h] = 0xcbf29ce484222325; } // FNV offset basis
+            for var in var_start..var_end {
+                let row = &alleles[var * m..(var + 1) * m];
+                for h in 0..m {
+                    codes[h] ^= row[h] as u64;
+                    codes[h] = codes[h].wrapping_mul(0x100000001b3); // FNV prime
+                }
+            }
+        }
+
+        // Group haplotypes by code
+        let mut code_to_group: HashMap<u64, u32> = HashMap::new();
+        let mut groups: Vec<Vec<u32>> = Vec::new();
+        let mut hg = vec![0u32; m];
+
+        for h in 0..m {
+            let gid = match code_to_group.get(&codes[h]) {
+                Some(&g) => {
+                    groups[g as usize].push(h as u32);
+                    g
+                }
+                None => {
+                    let g = groups.len() as u32;
+                    code_to_group.insert(codes[h], g);
+                    groups.push(vec![h as u32]);
+                    g
+                }
+            };
+            hg[h] = gid;
+        }
+
+        step_groups.push(groups);
+        hap_group.push(hg);
+    }
+
+    CodedSteps { starts, step_groups, hap_group }
+}
+
+/// Select candidate reference haplotypes for a target using CodedSteps partitions.
+///
+/// Iterates ALL steps, collecting ref haps that share a partition with the target
+/// at ANY step. This captures the full mosaic structure — ref haps that are
+/// IBS-similar at different positions along the chromosome.
+pub fn select_candidates(
+    coded: &CodedSteps,
+    target_hap: usize,     // absolute index in merged panel
+    n_ref: usize,          // number of reference haplotypes (hap < n_ref = ref)
+    _n_consecutive: usize, // unused (kept for API compat)
+    max_candidates: usize, // cap (default 2000)
+) -> Vec<u32> {
+    let n_steps = coded.step_groups.len();
+    if n_steps == 0 {
+        return Vec::new();
+    }
+
+    // Collect ALL ref haps that share a partition with target at ANY step
+    let mut seen = vec![false; n_ref];
+    let mut candidates = Vec::new();
+
+    for s in 0..n_steps {
+        let group_id = coded.hap_group[s][target_hap] as usize;
+        for &h in &coded.step_groups[s][group_id] {
+            if (h as usize) < n_ref && !seen[h as usize] {
+                seen[h as usize] = true;
+                candidates.push(h);
+            }
+        }
+    }
+
+    // If too many: rank by step count (IBS coverage frequency)
+    if candidates.len() > max_candidates {
+        let mut counts = vec![0u16; n_ref];
+        for s in 0..n_steps {
+            let gid = coded.hap_group[s][target_hap] as usize;
+            for &h in &coded.step_groups[s][gid] {
+                if (h as usize) < n_ref {
+                    counts[h as usize] += 1;
+                }
+            }
+        }
+        candidates.sort_unstable_by(|&a, &b| counts[b as usize].cmp(&counts[a as usize]));
+        candidates.truncate(max_candidates);
+    }
+
+    candidates.sort_unstable();
+    candidates
+}
+
+/// Select a SMALL set of high-quality candidates using IBS run length from coded steps.
+/// Instead of 2500 candidates ranked by step frequency, selects ~500 ranked by
+/// maximum consecutive IBS match length — the most relevant haplotypes for the HMM.
+/// Then PBWT runs on this small panel (~5× fewer candidates = ~5× faster).
+pub fn select_candidates_ibs_quality(
+    coded: &CodedSteps,
+    target_hap: usize,
+    n_ref: usize,
+    max_candidates: usize,
+) -> Vec<u32> {
+    let n_steps = coded.step_groups.len();
+    if n_steps == 0 { return Vec::new(); }
+
+    // Compute max consecutive IBS run length for each ref haplotype
+    let mut max_run = vec![0u16; n_ref];
+    let mut cur_run = vec![0u16; n_ref];
+
+    for s in 0..n_steps {
+        let tgt_group = coded.hap_group[s][target_hap];
+        // Reset or extend runs
+        for h in 0..n_ref {
+            if coded.hap_group[s][h as usize] == tgt_group {
+                cur_run[h] += 1;
+                if cur_run[h] > max_run[h] {
+                    max_run[h] = cur_run[h];
+                }
+            } else {
+                cur_run[h] = 0;
+            }
+        }
+    }
+
+    // Collect candidates with max_run > 0, rank by max_run descending
+    let mut candidates: Vec<(u16, u32)> = (0..n_ref as u32)
+        .filter(|&h| max_run[h as usize] > 0)
+        .map(|h| (max_run[h as usize], h))
+        .collect();
+
+    candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    candidates.truncate(max_candidates);
+
+    let mut result: Vec<u32> = candidates.iter().map(|&(_, h)| h).collect();
+    result.sort_unstable();
+    result
+}
+
+/// Build CSC match matrix from coded-step IBS matching (no PBWT needed).
+///
+/// For each candidate, checks group identity with target at each coded step.
+/// Consecutive matching steps form IBS segments. Match lengths are expanded
+/// to chip-site resolution. Much faster than per-variant PBWT (~10x) with
+/// minimal accuracy loss (resolution = step size, typically 0.05 cM).
+pub fn ibs_step_match(
+    coded: &CodedSteps,
+    candidates: &[u32],
+    target_hap: usize,
+    n_var: usize,
+    fl_fwd: usize,
+) -> CscMatchMatrix {
+    let n_steps = coded.step_groups.len();
+    let n_cand = candidates.len();
+    if n_steps == 0 || n_cand == 0 {
+        return CscMatchMatrix {
+            indptr: vec![0i32; n_var + 1], indices: vec![], data: vec![],
+            n_rows: n_cand, n_cols: n_var,
+        };
+    }
+
+    // 1. Precompute per-step consecutive IBS match length for each candidate.
+    // match_run[ci * n_steps + s] = consecutive steps ending at s where candidate
+    // shares the same coded-step group as the target.
+    let mut match_run = vec![0i32; n_cand * n_steps];
+    for ci in 0..n_cand {
+        let cand = candidates[ci] as usize;
+        for s in 0..n_steps {
+            if coded.hap_group[s][cand] == coded.hap_group[s][target_hap] {
+                match_run[ci * n_steps + s] = if s > 0 {
+                    match_run[ci * n_steps + s - 1] + 1
+                } else {
+                    1
+                };
+            }
+            // else remains 0
+        }
+    }
+
+    // 2. Precompute per-step: sorted list of (match_length, candidate_idx) for candidates
+    //    that match at that step. Only keep top fl_fwd.
+    let mut step_matches: Vec<Vec<(i32, usize)>> = Vec::with_capacity(n_steps);
+    for s in 0..n_steps {
+        let mut matches: Vec<(i32, usize)> = (0..n_cand)
+            .filter(|&ci| match_run[ci * n_steps + s] > 0)
+            .map(|ci| (match_run[ci * n_steps + s], ci))
+            .collect();
+        // Sort by match length descending, keep top fl_fwd
+        matches.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        matches.truncate(fl_fwd);
+        step_matches.push(matches);
+    }
+
+    // 3. Expand to per-site CSC matrix.
+    // Each site belongs to a step; it gets that step's matches.
+    let mut indptr = vec![0i32; n_var + 1];
+    let mut indices = Vec::new();
+    let mut data = Vec::new();
+
+    for var in 0..n_var {
+        let step = coded.starts.partition_point(|&s| s <= var).saturating_sub(1).min(n_steps - 1);
+        let step_vars = (coded.starts[step + 1] - coded.starts[step]) as i32;
+        for &(run_len, ci) in &step_matches[step] {
+            indices.push(ci as i32);
+            data.push(run_len * step_vars.max(1)); // scale to variant-level length
+        }
+        indptr[var + 1] = indices.len() as i32;
+    }
+
+    CscMatchMatrix {
+        indptr, indices, data,
+        n_rows: n_cand, n_cols: n_var,
+    }
+}
+
+/// Build coded-step binary alleles for a reduced panel.
+///
+/// For each step, each haplotype gets 0 (matches target group) or 1 (different group).
+/// Returns (coded_alleles: Vec<u8>, n_steps) where coded_alleles is (n_steps × m_red) row-major.
+pub fn build_coded_alleles_for_target(
+    coded: &CodedSteps,
+    candidates: &[u32],
+    target_hap: usize,
+    _n_ref: usize,
+) -> (Vec<u8>, usize) {
+    let n_steps = coded.step_groups.len();
+    let m_red = candidates.len() + 1; // candidates + target
+    let mut alleles = vec![0u8; n_steps * m_red];
+
+    for s in 0..n_steps {
+        let tgt_group = coded.hap_group[s][target_hap] as u32;
+        let base = s * m_red;
+        // Candidates
+        for (i, &c) in candidates.iter().enumerate() {
+            let c_group = coded.hap_group[s][c as usize];
+            alleles[base + i] = if c_group == tgt_group { 0 } else { 1 };
+        }
+        // Target is always 0 (matches itself)
+        alleles[base + candidates.len()] = 0;
+    }
+
+    (alleles, n_steps)
+}
+
+/// Expand a CSC match matrix from coded-step space to chip-site space.
+///
+/// Each match at step S is replicated to all chip sites in [starts[S], starts[S+1]).
+/// Match lengths are scaled from step units to site units.
+pub fn expand_csc_from_steps(
+    step_csc: &CscMatchMatrix,
+    coded: &CodedSteps,
+    n_var: usize,
+) -> CscMatchMatrix {
+    let n_steps = coded.starts.len() - 1;
+    assert_eq!(step_csc.n_cols, n_steps);
+
+    let mut indptr = vec![0i32; n_var + 1];
+    let mut indices = Vec::new();
+    let mut data = Vec::new();
+
+    for var in 0..n_var {
+        // Find which step this variant belongs to
+        let step = coded.starts.partition_point(|&s| s <= var).saturating_sub(1);
+        let step = step.min(n_steps - 1);
+
+        // Copy matches from this step
+        let s = step_csc.indptr[step] as usize;
+        let e = step_csc.indptr[step + 1] as usize;
+        for k in s..e {
+            indices.push(step_csc.indices[k]);
+            // Scale match length from steps to variants
+            let step_len = step_csc.data[k];
+            let var_per_step = (coded.starts[step + 1] - coded.starts[step]) as i32;
+            data.push(step_len * var_per_step.max(1));
+        }
+        indptr[var + 1] = indices.len() as i32;
+    }
+
+    CscMatchMatrix {
+        indptr,
+        indices,
+        data,
+        n_rows: step_csc.n_rows,
+        n_cols: n_var,
+    }
+}
