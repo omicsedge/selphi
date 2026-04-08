@@ -360,7 +360,10 @@ pub fn build_tbi_index(vcf_gz_path: &Path) -> io::Result<()> {
     let tbi_path = { let mut p = vcf_gz_path.as_os_str().to_owned(); p.push(".tbi"); std::path::PathBuf::from(p) };
 
     let f = std::fs::File::open(vcf_gz_path)?;
-    let mut bgzf = noodles_bgzf::io::Reader::new(BufReader::with_capacity(2 << 20, f));
+    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let wc = std::num::NonZero::new(n_threads).unwrap();
+    let mut bgzf = noodles_bgzf::io::MultithreadedReader::with_worker_count(
+        wc, BufReader::with_capacity(4 << 20, f));
 
     // Scan VCF.gz line by line, collect contig names and record positions
     struct BinData {
@@ -372,30 +375,46 @@ pub fn build_tbi_index(vcf_gz_path: &Path) -> io::Result<()> {
     let mut contig_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut ref_bins: BTreeMap<usize, BTreeMap<u32, BinData>> = BTreeMap::new();
     let mut ref_n_mapped: BTreeMap<usize, u64> = BTreeMap::new();
-    let mut ref_linear: BTreeMap<usize, Vec<u64>> = BTreeMap::new(); // linear index per ref
+    let mut ref_linear: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
 
+    // Buffered line reading (much faster than byte-by-byte)
+    let mut read_buf = vec![0u8; 256 << 10]; // 256KB read buffer
     let mut line_buf = Vec::with_capacity(4096);
-    let mut byte_buf = [0u8; 1];
+    let mut buf_pos = 0usize;
+    let mut buf_len = 0usize;
+    let mut vpos_at_buf_start: u64 = 0;
+    let mut bytes_consumed_in_block = 0usize;
 
     loop {
         // Track virtual position at start of line
         let vpos: u64 = u64::from(bgzf.virtual_position());
 
-        // Read one line
+        // Read one line using buffered approach
         line_buf.clear();
         loop {
-            match bgzf.read(&mut byte_buf) {
-                Ok(0) => break,
-                Ok(_) => {
-                    if byte_buf[0] == b'\n' { break; }
-                    line_buf.push(byte_buf[0]);
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
+            if buf_pos >= buf_len {
+                buf_len = match bgzf.read(&mut read_buf) {
+                    Ok(0) => 0,
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                };
+                buf_pos = 0;
+                if buf_len == 0 { break; }
+            }
+            // Scan for newline in buffer
+            let remaining = &read_buf[buf_pos..buf_len];
+            if let Some(nl) = remaining.iter().position(|&b| b == b'\n') {
+                line_buf.extend_from_slice(&remaining[..nl]);
+                buf_pos += nl + 1;
+                break;
+            } else {
+                line_buf.extend_from_slice(remaining);
+                buf_pos = buf_len;
             }
         }
 
-        if line_buf.is_empty() { break; } // EOF
+        if line_buf.is_empty() && buf_len == 0 { break; } // EOF
 
         // Skip header lines
         if line_buf.starts_with(b"#") {
