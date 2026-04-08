@@ -232,26 +232,37 @@ impl SrpReader {
         }
     }
 
+    /// Prefetch ALL compressed chunks from ZIP into memory (single sequential read).
     pub fn prefetch_compressed(&self) {
+        let all_ids: Vec<usize> = self.chunks.iter().map(|c| c[0] as usize).collect();
+        self.prefetch_compressed_range(&all_ids);
+    }
+
+    /// Prefetch compressed bytes for a range of chunks (single ZIP open).
+    /// Subsequent load_chunk calls decompress from RAM instead of re-opening ZIP.
+    pub fn prefetch_compressed_range(&self, chunk_ids: &[usize]) {
         let ext = if self.metadata.chunk_format == "raw" { ".bin" } else { ".npz" };
 
         let file = File::open(&self.filepath).unwrap();
         let reader = BufReader::new(file);
         let mut archive = zip::ZipArchive::new(reader).unwrap();
 
-        let mut map = HashMap::new();
-        for chunk_info in &self.chunks {
-            let chunk_id = chunk_info[0] as usize;
+        let mut cc = self.compressed_cache.lock().unwrap();
+        for &chunk_id in chunk_ids {
+            if cc.contains_key(&chunk_id) { continue; }
             let entry_name = format!("haplotypes/{}{}", chunk_id, ext);
             if let Ok(mut entry) = archive.by_name(&entry_name) {
                 let mut data = Vec::new();
                 entry.read_to_end(&mut data).unwrap();
-                map.insert(chunk_id, data);
+                cc.insert(chunk_id, data);
             }
         }
+    }
 
+    /// Clear compressed cache to free memory.
+    pub fn clear_compressed_cache(&self) {
         let mut cc = self.compressed_cache.lock().unwrap();
-        *cc = map;
+        cc.clear();
     }
 
     pub fn preload_all_chunks(&self) {
@@ -375,15 +386,21 @@ impl SrpReader {
             chunk_groups.sort_by_key(|(id, _)| *id);
         }
 
-        // Process chunks sequentially to avoid loading all into memory at once.
-        // Each chunk is loaded, processed, then dropped before the next.
-        for (chunk_id, indices) in &chunk_groups {
+        // Parallel chunk processing: each rayon task loads its own chunk from source
+        // (bypasses cache), processes it, and drops it. No global chunk accumulation.
+        let bits_base = bits.as_mut_ptr() as usize;
+        let bits_len = bits.len();
+
+        use rayon::prelude::*;
+        chunk_groups.par_iter().for_each(|(chunk_id, indices)| {
             let chunk = self.load_chunk_from_source(*chunk_id);
             let max_row = indices.iter().map(|&(_, r)| r).max().unwrap_or(0);
             let mut row_map = vec![-1i32; max_row + 1];
             for &(chip_i, local_row) in indices {
                 row_map[local_row] = chip_i as i32;
             }
+
+            let bits_slice = unsafe { std::slice::from_raw_parts_mut(bits_base as *mut u64, bits_len) };
 
             for col in 0..n_haps {
                 let word_idx = col / 64;
@@ -395,13 +412,13 @@ impl SrpReader {
                     if row <= max_row {
                         let chip_i = row_map[row];
                         if chip_i >= 0 {
-                            bits[chip_i as usize * n_words + word_idx] |= bit;
+                            bits_slice[chip_i as usize * n_words + word_idx] |= bit;
                         }
                     }
                 }
             }
-            // chunk dropped here — memory freed before next chunk
-        }
+            // chunk dropped here — each thread frees its chunk independently
+        });
 
         crate::common::HaplotypeBitmatrix::from_raw(bits, n_chip, n_haps)
     }

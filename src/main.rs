@@ -934,6 +934,18 @@ fn main() {
             h.join().expect("SRP prefetch thread panicked");
         }
 
+        // Prefetch compressed chunks for this window's interpolation range.
+        // Single ZIP read → all compressed bytes in RAM → fast decompression on demand.
+        {
+            let own_wgs_start = if window.own_chip_start == 0 { 0 } else { wgs_idx[window.own_chip_start] };
+            let own_wgs_end = if window.own_chip_end >= wgs_idx.len() { srp.n_variants() } else { wgs_idx[window.own_chip_end] };
+            let cs_sz = srp.chunk_size();
+            let first_c = own_wgs_start / cs_sz;
+            let last_c = if own_wgs_end > 0 { (own_wgs_end - 1) / cs_sz } else { 0 };
+            let cids: Vec<usize> = (first_c..=last_c).collect();
+            srp.prefetch_compressed_range(&cids);
+        }
+
         // Interpolation + output
         let t0_interp = Instant::now();
         let (cs, ce, os, oe) = (window.chip_start, window.chip_end,
@@ -972,6 +984,7 @@ fn main() {
             ).expect("Interpolation failed")
         };
         let interp_secs = t0_interp.elapsed().as_secs_f64();
+        srp.clear_compressed_cache(); // Free compressed bytes after interpolation
 
         let own_vars = window.own_chip_end - window.own_chip_start;
         let n_win = windows.len();

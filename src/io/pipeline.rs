@@ -9,6 +9,7 @@
 use std::io::{Write, BufWriter};
 use std::path::Path;
 use std::sync::Arc;
+use std::collections::HashMap;
 
 use rayon::prelude::*;
 
@@ -192,14 +193,8 @@ pub fn write_window_to_vcf(
 
     let an_str: Vec<u8> = format!("{}", n_haps).into_bytes();
 
-    // Pre-warm SRP chunk cache for the owned WGS range
-    {
-        let first_chunk = own_wgs_start / chunk_size;
-        let last_chunk = if own_wgs_end > 0 { (own_wgs_end - 1) / chunk_size } else { 0 };
-        for cid in first_chunk..=last_chunk {
-            let _ = srp.load_chunk(cid);
-        }
-    }
+    // No pre-warm: chunks loaded on demand per tile (prefetch_compressed_range in main.rs
+    // ensures compressed bytes are already in RAM for fast decompression).
 
     // Build intervals between consecutive owned chip sites.
     // Chip indices are GLOBAL but weight matrix rows are WINDOW-LOCAL.
@@ -275,15 +270,25 @@ pub fn write_window_to_vcf(
             }
         }
 
-        // Parallel tile computation with rayon
+        // Pre-load all chunks needed for this interval (avoid lock contention in par_iter)
+        let interval_first_chunk = interval.wgs_start / chunk_size;
+        let interval_last_chunk = if interval.wgs_end > 0 { (interval.wgs_end - 1) / chunk_size } else { 0 };
+        let preloaded: Vec<(usize, std::sync::Arc<crate::srp::CscChunk>)> = (interval_first_chunk..=interval_last_chunk)
+            .map(|cid| (cid, srp.load_chunk(cid)))
+            .collect();
+        let chunk_map: HashMap<usize, &crate::srp::CscChunk> = preloaded.iter()
+            .map(|(cid, arc)| (*cid, arc.as_ref()))
+            .collect();
+
+        // Parallel tile computation with rayon (no lock contention — chunks pre-loaded)
         use rayon::prelude::*;
         let tile_bufs: Vec<Vec<u8>> = tile_descs.par_iter().map(|&(ts, tile_n, global_start)| {
             let t: Vec<f32> = (0..tile_n)
                 .map(|v| (ts + v) as f32 / full_range)
                 .collect();
 
-            let alt_probs = interpolate_tile(
-                srp, &weight_refs, interval.weight_s, interval.weight_e,
+            let alt_probs = interpolate_tile_preloaded(
+                &chunk_map, &weight_refs, interval.weight_s, interval.weight_e,
                 global_start, tile_n, &t, n_haps, chunk_size,
             );
 
@@ -295,6 +300,7 @@ pub fn write_window_to_vcf(
                 chip_genotypes, &an_str, no_ap,
             )
         }).collect();
+        drop(preloaded); // Free chunks after tile processing
 
         // Send tiles in order
         for tile_buf in tile_bufs {
@@ -1175,20 +1181,39 @@ fn interpolate_tile(
     n_haps: usize,
     chunk_size: usize,
 ) -> Vec<f32> {
+    let first_chunk = global_start / chunk_size;
+    let last_chunk = (global_start + tile_n - 1) / chunk_size;
+    let chunks: Vec<(usize, Arc<crate::srp::CscChunk>)> = (first_chunk..=last_chunk)
+        .map(|cid| (cid, srp.load_chunk(cid)))
+        .collect();
+    let map: HashMap<usize, &crate::srp::CscChunk> = chunks.iter().map(|(id, a)| (*id, a.as_ref())).collect();
+    interpolate_tile_preloaded(&map, weights, chip_s, chip_e, global_start, tile_n, t, n_haps, chunk_size)
+}
+
+fn interpolate_tile_preloaded(
+    chunk_map: &HashMap<usize, &crate::srp::CscChunk>,
+    weights: &[&CsrWeights],
+    chip_s: usize,
+    chip_e: usize,
+    global_start: usize,
+    tile_n: usize,
+    t: &[f32],
+    n_haps: usize,
+    chunk_size: usize,
+) -> Vec<f32> {
     let mut alt_probs = vec![0.0f32; n_haps * tile_n];
-    let _row_end = global_start + tile_n;
 
     let first_chunk = global_start / chunk_size;
     let last_chunk = (global_start + tile_n - 1) / chunk_size;
 
     if first_chunk == last_chunk {
-        let chunk = srp.load_chunk(first_chunk);
+        let chunk = chunk_map[&first_chunk];
         let row_offset = global_start - first_chunk * chunk_size;
-        interp_kernel(weights, chip_s, chip_e, &chunk, row_offset, tile_n, t, &mut alt_probs, n_haps);
+        interp_kernel(weights, chip_s, chip_e, chunk, row_offset, tile_n, t, &mut alt_probs, n_haps);
     } else {
         let mut tile_offset = 0;
         for sid in first_chunk..=last_chunk {
-            let chunk = srp.load_chunk(sid);
+            let chunk = chunk_map[&sid];
             let chunk_start = sid * chunk_size;
             let chunk_end = chunk_start + chunk.n_rows;
             let ov_start = global_start.max(chunk_start);
@@ -1199,7 +1224,7 @@ fn interpolate_tile(
             let t_start = tile_offset;
 
             let mut sub = vec![0.0f32; n_haps * ov_n];
-            interp_kernel(weights, chip_s, chip_e, &chunk, row_offset, ov_n, &t[t_start..t_start+ov_n], &mut sub, n_haps);
+            interp_kernel(weights, chip_s, chip_e, chunk, row_offset, ov_n, &t[t_start..t_start+ov_n], &mut sub, n_haps);
 
             for h in 0..n_haps {
                 for v in 0..ov_n {
