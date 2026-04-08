@@ -220,27 +220,35 @@ fn write_bref3_block<W: Write>(
     for h in 0..n_haps { write_u16(w, hap_to_seq[h])?; }
 
     // Build seqToAllele per variant
-    let use_seq = (n_seq as usize) < n_haps / 2;
+    let use_seq = false; // Force ALLELE_CODED for compatibility (TODO: debug SEQ_CODED)
 
     for v in 0..block_n {
         let (pos, ref id, ref ref_a, ref alt_a) = block_variants[v];
 
+        // readMarker format:
+        // 1. pos (i32)
+        // 2. IDs: readByteLengthStringArray (u8 count + per string: u8 len + bytes)
+        // 3. allele_code (i8)
+        // 4. if allele_code == -1: readStringArray (i32 count + writeUTF strings) + end pos (i32)
         write_i32(w, pos)?;
 
-        if id == "." || id.is_empty() { w.write_all(&[0u8])?; }
-        else { w.write_all(&[1u8])?; write_utf(w, id)?; }
+        // IDs: readByteLengthStringArray = u8 count + count × writeUTF strings
+        if id == "." || id.is_empty() {
+            w.write_all(&[0u8])?; // 0 IDs
+        } else {
+            w.write_all(&[1u8])?; // 1 ID
+            write_utf(w, id)?;    // writeUTF (u16 len + bytes)
+        }
 
+        // Allele code + alleles
         if let Some(code) = encode_snv_allele_code(ref_a, alt_a, snv_perms) {
             w.write_all(&[code as u8])?;
         } else {
-            w.write_all(&[0xFF])?; // -1 as i8 = non-SNV marker
-            // Beagle readByteLengthStringArray: nAlleles(u8) + per allele: len(u8) + bytes
-            let n_alleles = 2u8;
-            w.write_all(&[n_alleles])?;
-            w.write_all(&[ref_a.len() as u8])?;
-            w.write_all(ref_a.as_bytes())?;
-            w.write_all(&[alt_a.len() as u8])?;
-            w.write_all(alt_a.as_bytes())?;
+            w.write_all(&[0xFF])?; // -1 as i8 = non-SNV
+            // readStringArray format: i32 count + writeUTF strings
+            write_i32(w, 2)?; // 2 alleles
+            write_utf(w, ref_a)?;
+            write_utf(w, alt_a)?;
             write_i32(w, pos + ref_a.len() as i32)?; // end position
         }
 
@@ -259,17 +267,16 @@ fn write_bref3_block<W: Write>(
             }
         } else {
             w.write_all(&[ALLELE_CODED])?;
-            let n_alt: usize = block_alleles[v].iter().filter(|&&a| a > 0).count();
-            let n_ref = n_haps - n_alt;
-            if n_ref >= n_alt {
-                write_i32(w, -1)?;
-                write_i32(w, n_alt as i32)?;
-                for h in 0..n_haps { if block_alleles[v][h] > 0 { write_i32(w, h as i32)?; } }
-            } else {
-                write_i32(w, n_ref as i32)?;
-                for h in 0..n_haps { if block_alleles[v][h] == 0 { write_i32(w, h as i32)?; } }
-                write_i32(w, -1)?;
-            }
+            // Beagle readHapCodedRec: nAlleles × readIntArray
+            // Per allele: i32 count + count × i32 hap_indices
+            // Allele 0 (REF): list of haplotypes carrying REF
+            let n_ref: usize = block_alleles[v].iter().filter(|&&a| a == 0).count();
+            write_i32(w, n_ref as i32)?;
+            for h in 0..n_haps { if block_alleles[v][h] == 0 { write_i32(w, h as i32)?; } }
+            // Allele 1 (ALT): list of haplotypes carrying ALT
+            let n_alt: usize = n_haps - n_ref;
+            write_i32(w, n_alt as i32)?;
+            for h in 0..n_haps { if block_alleles[v][h] > 0 { write_i32(w, h as i32)?; } }
         }
     }
     Ok(())
