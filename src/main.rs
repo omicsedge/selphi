@@ -1032,14 +1032,7 @@ fn main() {
             .expect("Failed to finalize output");
     }
 
-    // Auto-index output
-    if output_bcf {
-        selphi_step!("Indexing BCF...");
-        selphi::srp::csi::build_csi_index(&out_file).expect("Failed to build CSI index");
-    } else if !output_parquet && !output_pgen {
-        selphi_step!("Indexing VCF.gz...");
-        selphi::srp::csi::build_tbi_index(&out_file).expect("Failed to build TBI index");
-    }
+    // Index built inline during writing (no separate indexing step)
 
     let final_path = out_file.clone();
     selphi_step!("Output: {}", final_path.display());

@@ -573,3 +573,367 @@ pub fn build_tbi_index(vcf_gz_path: &Path) -> io::Result<()> {
 
     Ok(())
 }
+
+/// Fast TBI index building with pre-collected metadata.
+/// Only scans for virtual positions (skip parsing — metadata already known).
+pub fn build_tbi_index_with_meta(
+    vcf_gz_path: &Path,
+    contig_names: &[String],
+    record_meta: &[(String, i64, i64)], // (chrom, pos_0based, rlen)
+    tbi_path: &Path,
+) -> io::Result<()> {
+    use std::collections::BTreeMap;
+    use std::io::BufReader;
+
+    let f = std::fs::File::open(vcf_gz_path)?;
+    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let wc = std::num::NonZero::new(n_threads).unwrap();
+    let mut bgzf = noodles_bgzf::io::MultithreadedReader::with_worker_count(
+        wc, BufReader::with_capacity(4 << 20, f));
+
+    let mut contig_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, name) in contig_names.iter().enumerate() { contig_map.insert(name.clone(), i); }
+
+    struct BinDataM { loffset: u64, chunks: Vec<(u64, u64)> }
+    let mut ref_bins: BTreeMap<usize, BTreeMap<u32, BinDataM>> = BTreeMap::new();
+    let mut ref_n_mapped: BTreeMap<usize, u64> = BTreeMap::new();
+    let mut ref_linear: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
+
+    // Fast scan: read lines, only track virtual positions, use pre-collected metadata
+    let mut read_buf = vec![0u8; 256 << 10];
+    let mut line_buf = Vec::with_capacity(4096);
+    let mut buf_pos = 0usize;
+    let mut buf_len = 0usize;
+    let mut rec_idx = 0usize;
+
+    loop {
+        let vpos: u64 = u64::from(bgzf.virtual_position());
+
+        line_buf.clear();
+        loop {
+            if buf_pos >= buf_len {
+                buf_len = match bgzf.read(&mut read_buf) {
+                    Ok(0) => 0, Ok(n) => n,
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                };
+                buf_pos = 0;
+                if buf_len == 0 { break; }
+            }
+            let remaining = &read_buf[buf_pos..buf_len];
+            if let Some(nl) = remaining.iter().position(|&b| b == b'\n') {
+                line_buf.extend_from_slice(&remaining[..nl]);
+                buf_pos += nl + 1;
+                break;
+            } else {
+                line_buf.extend_from_slice(remaining);
+                buf_pos = buf_len;
+            }
+        }
+        if line_buf.is_empty() && buf_len == 0 { break; }
+        if line_buf.starts_with(b"#") { continue; }
+
+        let vpos_end: u64 = u64::from(bgzf.virtual_position());
+
+        if rec_idx >= record_meta.len() { break; }
+        let (ref chrom, pos, rlen) = record_meta[rec_idx];
+        rec_idx += 1;
+
+        let ref_id = *contig_map.get(chrom.as_str()).unwrap_or(&0);
+
+        let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, DEFAULT_DEPTH);
+        let bins = ref_bins.entry(ref_id).or_insert_with(BTreeMap::new);
+        let bin = bins.entry(bin_id).or_insert_with(|| BinDataM { loffset: vpos, chunks: vec![(vpos, vpos_end)] });
+        if let Some(last) = bin.chunks.last_mut() {
+            if vpos <= last.1 + (1 << 16) { last.1 = vpos_end; }
+            else { bin.chunks.push((vpos, vpos_end)); }
+        }
+        *ref_n_mapped.entry(ref_id).or_insert(0) += 1;
+        let lin_idx = (pos >> DEFAULT_MIN_SHIFT) as usize;
+        let lin = ref_linear.entry(ref_id).or_insert_with(Vec::new);
+        if lin_idx >= lin.len() { lin.resize(lin_idx + 1, 0); }
+        if lin[lin_idx] == 0 || vpos < lin[lin_idx] { lin[lin_idx] = vpos; }
+    }
+
+    // Write TBI
+    let n_ref = contig_names.len();
+    let mut out = Vec::with_capacity(64 * 1024);
+    out.extend_from_slice(b"TBI\x01");
+    out.extend_from_slice(&(n_ref as i32).to_le_bytes());
+    out.extend_from_slice(&2i32.to_le_bytes());
+    out.extend_from_slice(&1i32.to_le_bytes());
+    out.extend_from_slice(&2i32.to_le_bytes());
+    out.extend_from_slice(&0i32.to_le_bytes());
+    out.extend_from_slice(&35i32.to_le_bytes());
+    out.extend_from_slice(&0i32.to_le_bytes());
+    let mut names_buf = Vec::new();
+    for n in contig_names { names_buf.extend_from_slice(n.as_bytes()); names_buf.push(0); }
+    out.extend_from_slice(&(names_buf.len() as i32).to_le_bytes());
+    out.extend_from_slice(&names_buf);
+
+    for ref_id in 0..n_ref {
+        if let Some(bins) = ref_bins.get(&ref_id) {
+            let n_mapped = ref_n_mapped.get(&ref_id).copied().unwrap_or(0);
+            out.extend_from_slice(&((bins.len() as i32 + 1).to_le_bytes()));
+            for (&bid, bd) in bins {
+                out.extend_from_slice(&bid.to_le_bytes());
+                out.extend_from_slice(&(bd.chunks.len() as i32).to_le_bytes());
+                for &(b, e) in &bd.chunks { out.extend_from_slice(&b.to_le_bytes()); out.extend_from_slice(&e.to_le_bytes()); }
+            }
+            out.extend_from_slice(&37450u32.to_le_bytes());
+            out.extend_from_slice(&2i32.to_le_bytes());
+            out.extend_from_slice(&0u64.to_le_bytes()); out.extend_from_slice(&0u64.to_le_bytes());
+            out.extend_from_slice(&n_mapped.to_le_bytes()); out.extend_from_slice(&0u64.to_le_bytes());
+            if let Some(lin) = ref_linear.get(&ref_id) {
+                let mut filled = lin.clone();
+                for i in 1..filled.len() { if filled[i] == 0 { filled[i] = filled[i-1]; } }
+                out.extend_from_slice(&(filled.len() as i32).to_le_bytes());
+                for &o in &filled { out.extend_from_slice(&o.to_le_bytes()); }
+            } else { out.extend_from_slice(&0i32.to_le_bytes()); }
+        } else {
+            out.extend_from_slice(&0i32.to_le_bytes());
+            out.extend_from_slice(&0i32.to_le_bytes());
+        }
+    }
+
+    let tbi_file = std::fs::File::create(tbi_path)?;
+    let mut w = noodles_bgzf::io::Writer::new(tbi_file);
+    w.write_all(&out)?; w.try_finish()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Inline index builder: tracks virtual positions during BGZF writing
+// ---------------------------------------------------------------------------
+
+use std::collections::BTreeMap;
+
+struct InlineBinData {
+    loffset: u64,
+    chunks: Vec<(u64, u64)>,
+}
+
+enum IndexFormat { Tbi, Csi }
+
+pub struct InlineIndexBuilder {
+    format: IndexFormat,
+    contig_names: Vec<String>,
+    contig_map: std::collections::HashMap<String, usize>,
+    ref_bins: BTreeMap<usize, BTreeMap<u32, InlineBinData>>,
+    ref_n_mapped: BTreeMap<usize, u64>,
+    ref_linear: BTreeMap<usize, Vec<u64>>,
+    bcf_n_contigs: usize,
+    bcf_header_done: bool,
+}
+
+impl InlineIndexBuilder {
+    pub fn new_tbi() -> Self {
+        Self {
+            format: IndexFormat::Tbi,
+            contig_names: Vec::new(), contig_map: std::collections::HashMap::new(),
+            ref_bins: BTreeMap::new(), ref_n_mapped: BTreeMap::new(),
+            ref_linear: BTreeMap::new(), bcf_n_contigs: 0, bcf_header_done: false,
+        }
+    }
+
+    pub fn new_csi() -> Self {
+        Self {
+            format: IndexFormat::Csi,
+            contig_names: Vec::new(), contig_map: std::collections::HashMap::new(),
+            ref_bins: BTreeMap::new(), ref_n_mapped: BTreeMap::new(),
+            ref_linear: BTreeMap::new(), bcf_n_contigs: 0, bcf_header_done: false,
+        }
+    }
+
+    /// Write VCF lines, tracking virtual positions per record.
+    pub fn add_vcf_block(&mut self, buf: &[u8], writer: &mut noodles_bgzf::io::Writer<std::fs::File>) -> io::Result<()> {
+        let mut start = 0;
+        while start < buf.len() {
+            let end = buf[start..].iter().position(|&b| b == b'\n')
+                .map(|p| start + p + 1).unwrap_or(buf.len());
+            let line = &buf[start..end];
+
+            if line.starts_with(b"#") {
+                if line.starts_with(b"##contig=<ID=") {
+                    let s = b"##contig=<ID=".len();
+                    if let Some(e) = line[s..].iter().position(|&b| b == b',' || b == b'>') {
+                        let name = String::from_utf8_lossy(&line[s..s+e]).to_string();
+                        let id = self.contig_names.len();
+                        self.contig_map.insert(name.clone(), id);
+                        self.contig_names.push(name);
+                    }
+                }
+                writer.write_all(line)?;
+                start = end;
+                continue;
+            }
+
+            let vpos: u64 = u64::from(writer.virtual_position());
+            writer.write_all(line)?;
+            let vpos_end: u64 = u64::from(writer.virtual_position());
+
+            // Parse CHROM, POS, ID, REF
+            let mut tabs = [0usize; 4]; let mut nt = 0;
+            for (i, &b) in line.iter().enumerate() {
+                if b == b'\t' { if nt < 4 { tabs[nt] = i; } nt += 1; if nt >= 4 { break; } }
+            }
+            if nt >= 4 {
+                let chrom = std::str::from_utf8(&line[..tabs[0]]).unwrap_or("");
+                let pos: i64 = std::str::from_utf8(&line[tabs[0]+1..tabs[1]])
+                    .unwrap_or("0").parse().unwrap_or(0) - 1;
+                if pos >= 0 {
+                    let rlen = (tabs[3] - tabs[2] - 1).max(1) as i64;
+                    let ref_id = *self.contig_map.entry(chrom.to_string()).or_insert_with(|| {
+                        let id = self.contig_names.len();
+                        self.contig_names.push(chrom.to_string());
+                        id
+                    });
+                    self.add_record(ref_id, pos, rlen, vpos, vpos_end);
+                }
+            }
+            start = end;
+        }
+        Ok(())
+    }
+
+    /// Write BCF records, tracking virtual positions per record.
+    pub fn add_bcf_block(&mut self, buf: &[u8], writer: &mut noodles_bgzf::io::Writer<std::fs::File>) -> io::Result<()> {
+        if !self.bcf_header_done {
+            writer.write_all(buf)?;
+            if buf.len() > 9 {
+                let hlen = u32::from_le_bytes(buf[5..9].try_into().unwrap_or([0;4])) as usize;
+                if hlen > 0 && 9 + hlen <= buf.len() {
+                    let hdr_text = String::from_utf8_lossy(&buf[9..9+hlen]);
+                    self.bcf_n_contigs = hdr_text.lines().filter(|l| l.starts_with("##contig=")).count();
+                }
+            }
+            self.bcf_header_done = true;
+            return Ok(());
+        }
+
+        let mut off = 0;
+        while off + 8 <= buf.len() {
+            let ls = u32::from_le_bytes(buf[off..off+4].try_into().unwrap()) as usize;
+            let li = u32::from_le_bytes(buf[off+4..off+8].try_into().unwrap()) as usize;
+            if ls == 0 { break; }
+            let rec_end = off + 8 + ls + li;
+            if rec_end > buf.len() { break; }
+
+            let vpos: u64 = u64::from(writer.virtual_position());
+            writer.write_all(&buf[off..rec_end])?;
+            let vpos_end: u64 = u64::from(writer.virtual_position());
+
+            let shared = &buf[off+8..off+8+ls];
+            if shared.len() >= 8 {
+                let ref_id = i32::from_le_bytes(shared[0..4].try_into().unwrap()) as usize;
+                let pos = i32::from_le_bytes(shared[4..8].try_into().unwrap()) as i64;
+                self.add_record(ref_id, pos, 1, vpos, vpos_end);
+            }
+            off = rec_end;
+        }
+        if off < buf.len() { writer.write_all(&buf[off..])?; }
+        Ok(())
+    }
+
+    fn add_record(&mut self, ref_id: usize, pos: i64, rlen: i64, vpos: u64, vpos_end: u64) {
+        let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, DEFAULT_DEPTH);
+        let bins = self.ref_bins.entry(ref_id).or_insert_with(BTreeMap::new);
+        let bin = bins.entry(bin_id).or_insert_with(|| InlineBinData {
+            loffset: vpos, chunks: vec![(vpos, vpos_end)],
+        });
+        if let Some(last) = bin.chunks.last_mut() {
+            if vpos <= last.1 + (1 << 16) { last.1 = vpos_end; }
+            else { bin.chunks.push((vpos, vpos_end)); }
+        }
+        *self.ref_n_mapped.entry(ref_id).or_insert(0) += 1;
+        let lin_idx = (pos >> DEFAULT_MIN_SHIFT) as usize;
+        let lin = self.ref_linear.entry(ref_id).or_insert_with(Vec::new);
+        if lin_idx >= lin.len() { lin.resize(lin_idx + 1, 0); }
+        if lin[lin_idx] == 0 || vpos < lin[lin_idx] { lin[lin_idx] = vpos; }
+    }
+
+    pub fn write_tbi(&self, path: &Path) -> io::Result<()> {
+        let n_ref = self.contig_names.len();
+        let mut out = Vec::with_capacity(64 * 1024);
+        out.extend_from_slice(b"TBI\x01");
+        out.extend_from_slice(&(n_ref as i32).to_le_bytes());
+        out.extend_from_slice(&2i32.to_le_bytes());
+        out.extend_from_slice(&1i32.to_le_bytes());
+        out.extend_from_slice(&2i32.to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes());
+        out.extend_from_slice(&35i32.to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes());
+        let mut names_buf = Vec::new();
+        for n in &self.contig_names { names_buf.extend_from_slice(n.as_bytes()); names_buf.push(0); }
+        out.extend_from_slice(&(names_buf.len() as i32).to_le_bytes());
+        out.extend_from_slice(&names_buf);
+        self.write_ref_sections(&mut out, n_ref);
+        let f = std::fs::File::create(path)?;
+        let mut w = noodles_bgzf::io::Writer::new(f);
+        w.write_all(&out)?; w.try_finish()?;
+        Ok(())
+    }
+
+    pub fn write_csi(&self, path: &Path) -> io::Result<()> {
+        let n_ref = self.bcf_n_contigs.max(self.ref_bins.keys().map(|&k| k + 1).max().unwrap_or(0));
+        let mut out = Vec::with_capacity(64 * 1024);
+        out.extend_from_slice(b"CSI\x01");
+        out.extend_from_slice(&(DEFAULT_MIN_SHIFT as i32).to_le_bytes());
+        out.extend_from_slice(&(DEFAULT_DEPTH as i32).to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes());
+        out.extend_from_slice(&(n_ref as i32).to_le_bytes());
+        self.write_ref_sections_csi(&mut out, n_ref);
+        let f = std::fs::File::create(path)?;
+        let mut w = noodles_bgzf::io::Writer::new(f);
+        w.write_all(&out)?; w.try_finish()?;
+        Ok(())
+    }
+
+    fn write_ref_sections(&self, out: &mut Vec<u8>, n_ref: usize) {
+        for ref_id in 0..n_ref {
+            if let Some(bins) = self.ref_bins.get(&ref_id) {
+                let n_mapped = self.ref_n_mapped.get(&ref_id).copied().unwrap_or(0);
+                out.extend_from_slice(&((bins.len() as i32 + 1).to_le_bytes()));
+                for (&bid, bd) in bins {
+                    out.extend_from_slice(&bid.to_le_bytes());
+                    out.extend_from_slice(&(bd.chunks.len() as i32).to_le_bytes());
+                    for &(b, e) in &bd.chunks { out.extend_from_slice(&b.to_le_bytes()); out.extend_from_slice(&e.to_le_bytes()); }
+                }
+                out.extend_from_slice(&37450u32.to_le_bytes());
+                out.extend_from_slice(&2i32.to_le_bytes());
+                out.extend_from_slice(&0u64.to_le_bytes()); out.extend_from_slice(&0u64.to_le_bytes());
+                out.extend_from_slice(&n_mapped.to_le_bytes()); out.extend_from_slice(&0u64.to_le_bytes());
+                if let Some(lin) = self.ref_linear.get(&ref_id) {
+                    let mut filled = lin.clone();
+                    for i in 1..filled.len() { if filled[i] == 0 { filled[i] = filled[i-1]; } }
+                    out.extend_from_slice(&(filled.len() as i32).to_le_bytes());
+                    for &o in &filled { out.extend_from_slice(&o.to_le_bytes()); }
+                } else { out.extend_from_slice(&0i32.to_le_bytes()); }
+            } else {
+                out.extend_from_slice(&0i32.to_le_bytes());
+                out.extend_from_slice(&0i32.to_le_bytes());
+            }
+        }
+    }
+
+    fn write_ref_sections_csi(&self, out: &mut Vec<u8>, n_ref: usize) {
+        for ref_id in 0..n_ref {
+            if let Some(bins) = self.ref_bins.get(&ref_id) {
+                let n_mapped = self.ref_n_mapped.get(&ref_id).copied().unwrap_or(0);
+                out.extend_from_slice(&((bins.len() as i32 + 1).to_le_bytes()));
+                for (&bid, bd) in bins {
+                    out.extend_from_slice(&bid.to_le_bytes());
+                    out.extend_from_slice(&bd.loffset.to_le_bytes());
+                    out.extend_from_slice(&(bd.chunks.len() as i32).to_le_bytes());
+                    for &(b, e) in &bd.chunks { out.extend_from_slice(&b.to_le_bytes()); out.extend_from_slice(&e.to_le_bytes()); }
+                }
+                let pseudo = ((1u64 << (DEFAULT_DEPTH as u64 * 3)) - 1) / 7 + ref_id as u64;
+                out.extend_from_slice(&(pseudo as u32).to_le_bytes());
+                out.extend_from_slice(&0u64.to_le_bytes());
+                out.extend_from_slice(&2i32.to_le_bytes());
+                out.extend_from_slice(&0u64.to_le_bytes()); out.extend_from_slice(&0u64.to_le_bytes());
+                out.extend_from_slice(&n_mapped.to_le_bytes()); out.extend_from_slice(&0u64.to_le_bytes());
+            } else { out.extend_from_slice(&0i32.to_le_bytes()); }
+        }
+    }
+}

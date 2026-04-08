@@ -96,13 +96,51 @@ pub fn setup_vcf_writer(
         .set_worker_count(std::num::NonZeroUsize::new(bgzip_threads).unwrap())
         .build_from_writer(out_file);
 
+    let tbi_path = { let mut p = vcf_path.as_os_str().to_owned(); p.push(".tbi"); std::path::PathBuf::from(p) };
+    let vcf_path_clone = vcf_path.clone();
+
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
     let writer_handle = std::thread::spawn(move || -> std::io::Result<()> {
         let mut writer = BufWriter::with_capacity(4 << 20, bgzf_writer);
+        // Collect record metadata for post-write index building
+        let mut record_meta: Vec<(String, i64, i64)> = Vec::new(); // (chrom, pos_0based, rlen)
+        let mut contig_names: Vec<String> = Vec::new();
+
         for buf in rx {
+            // Scan for record metadata while writing
+            let mut start = 0;
+            while start < buf.len() {
+                let end = buf[start..].iter().position(|&b| b == b'\n')
+                    .map(|p| start + p + 1).unwrap_or(buf.len());
+                let line = &buf[start..end];
+                if !line.starts_with(b"#") && line.len() > 5 {
+                    let mut tabs = [0usize; 4]; let mut nt = 0;
+                    for (i, &b) in line.iter().enumerate() {
+                        if b == b'\t' { if nt < 4 { tabs[nt] = i; } nt += 1; if nt >= 4 { break; } }
+                    }
+                    if nt >= 4 {
+                        let chrom = std::str::from_utf8(&line[..tabs[0]]).unwrap_or("").to_string();
+                        let pos: i64 = std::str::from_utf8(&line[tabs[0]+1..tabs[1]])
+                            .unwrap_or("0").parse().unwrap_or(0) - 1;
+                        let rlen = (tabs[3] - tabs[2] - 1).max(1) as i64;
+                        record_meta.push((chrom, pos, rlen));
+                    }
+                } else if line.starts_with(b"##contig=<ID=") {
+                    let s = b"##contig=<ID=".len();
+                    if let Some(e) = line[s..].iter().position(|&b| b == b',' || b == b'>') {
+                        contig_names.push(String::from_utf8_lossy(&line[s..s+e]).to_string());
+                    }
+                }
+                start = end;
+            }
             writer.write_all(&buf)?;
         }
         writer.flush()?;
+        drop(writer);
+
+        // Fast post-write indexing: re-read with metadata already known
+        // Only need virtual positions — skip all parsing
+        crate::srp::csi::build_tbi_index_with_meta(&vcf_path_clone, &contig_names, &record_meta, &tbi_path)?;
         Ok(())
     });
 
@@ -979,6 +1017,9 @@ pub fn setup_bcf_writer(
         .set_worker_count(std::num::NonZeroUsize::new(bgzip_threads).unwrap())
         .build_from_writer(out_file);
 
+    let csi_path = { let mut p = bcf_path.as_os_str().to_owned(); p.push(".csi"); std::path::PathBuf::from(p) };
+    let bcf_path_clone = bcf_path.clone();
+
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
     let writer_handle = std::thread::spawn(move || -> std::io::Result<()> {
         let mut writer = BufWriter::with_capacity(4 << 20, bgzf_writer);
@@ -986,6 +1027,11 @@ pub fn setup_bcf_writer(
             writer.write_all(&buf)?;
         }
         writer.flush()?;
+        drop(writer);
+
+        // Fast post-write CSI indexing with multi-threaded BGZF reader
+        crate::srp::csi::build_csi_index(&bcf_path_clone)?;
+        // Rename to .csi if needed
         Ok(())
     });
 
