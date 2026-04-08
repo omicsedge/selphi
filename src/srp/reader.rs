@@ -389,14 +389,24 @@ impl SrpReader {
             chunk_groups.sort_by_key(|(id, _)| *id);
         }
 
-        // Parallel chunk processing: each rayon task loads its own chunk from source
-        // (bypasses cache), processes it, and drops it. No global chunk accumulation.
+        // Parallel: decompress all needed chunks, then process in parallel
+        // Two-phase avoids Mutex contention during decompression
         let bits_base = bits.as_mut_ptr() as usize;
         let bits_len = bits.len();
 
         use rayon::prelude::*;
-        chunk_groups.par_iter().for_each(|(chunk_id, indices)| {
-            let chunk = self.load_chunk_from_source(*chunk_id);
+
+        // Phase 1: parallel decompression (clone compressed bytes, release lock, decompress)
+        let chunks_with_indices: Vec<(CscChunk, Vec<(usize, usize)>)> = chunk_groups
+            .into_par_iter()
+            .map(|(chunk_id, indices)| {
+                let chunk = self.load_chunk_from_source(chunk_id);
+                (chunk, indices)
+            })
+            .collect();
+
+        // Phase 2: parallel scatter into bitmatrix (no locks, just memory writes)
+        chunks_with_indices.par_iter().for_each(|(chunk, indices)| {
             let max_row = indices.iter().map(|&(_, r)| r).max().unwrap_or(0);
             let mut row_map = vec![-1i32; max_row + 1];
             for &(chip_i, local_row) in indices {
@@ -420,8 +430,8 @@ impl SrpReader {
                     }
                 }
             }
-            // chunk dropped here — each thread frees its chunk independently
         });
+        // All chunks dropped after this scope
 
         crate::common::HaplotypeBitmatrix::from_raw(bits, n_chip, n_haps)
     }

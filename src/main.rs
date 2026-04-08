@@ -427,8 +427,10 @@ fn main() {
     let n_samples = sample_names.len();
     let n_haps = n_samples * 2;
 
-    // 3. Variant intersection
+    // 3. Variant intersection (merge-join on sorted positions)
+    let t0_isect = std::time::Instant::now();
     let (wgs_idx, target_idx) = intersect_variants(&srp, &target_markers);
+    selphi_debug!("  Intersect: {:.1}ms", t0_isect.elapsed().as_secs_f64() * 1000.0);
     let n_chip = wgs_idx.len();
     selphi_step!("Shared markers: {} ({:.1}% of target)",
         n_chip, n_chip as f64 / target_markers.len() as f64 * 100.0);
@@ -1255,43 +1257,41 @@ fn blake2b_hex(s: &str) -> String {
 
 /// Intersect target markers with reference panel variants.
 fn intersect_variants(srp: &SrpReader, targets: &[TargetMarker]) -> (Vec<usize>, Vec<usize>) {
-    // Build ref position lookup: pos → Vec<(ref_idx, ref_hash, alt_hash)>
-    let mut ref_by_pos: std::collections::HashMap<i64, Vec<(usize, &str, &str)>> =
-        std::collections::HashMap::new();
-    for (i, v) in srp.variants.iter().enumerate() {
-        ref_by_pos.entry(v.pos).or_default().push((i, &v.ref_allele, &v.alt_allele));
-    }
-
-    let mut wgs_idx = Vec::new();
-    let mut target_idx = Vec::new();
-
-    // Strip chr prefix for matching
     fn strip_chr(c: &str) -> &str {
         if c.starts_with("chr") { &c[3..] } else { c }
     }
     let ref_chrom = strip_chr(&srp.metadata.chromosome);
 
-    for (ti, tm) in targets.iter().enumerate() {
-        if strip_chr(&tm.chrom) != ref_chrom { continue; }
+    // Sort target indices by position for merge-join
+    let mut tgt_order: Vec<usize> = (0..targets.len())
+        .filter(|&i| strip_chr(&targets[i].chrom) == ref_chrom)
+        .collect();
+    tgt_order.sort_by_key(|&i| targets[i].pos);
 
-        if let Some(ref_entries) = ref_by_pos.get(&tm.pos) {
-            for &(ri, rref, ralt) in ref_entries {
-                if rref == tm.ref_hash && ralt == tm.alt_hash {
-                    wgs_idx.push(ri);
-                    target_idx.push(ti);
-                    break;
-                }
+    // Merge-join: both ref variants and sorted targets are in position order
+    let mut wgs_idx = Vec::with_capacity(targets.len());
+    let mut target_idx = Vec::with_capacity(targets.len());
+    let mut ri = 0usize;
+
+    for &ti in &tgt_order {
+        let tpos = targets[ti].pos;
+        // Advance ref pointer to first variant at or beyond target pos
+        while ri < srp.variants.len() && srp.variants[ri].pos < tpos { ri += 1; }
+        // Check all ref variants at this position
+        let mut rj = ri;
+        while rj < srp.variants.len() && srp.variants[rj].pos == tpos {
+            if srp.variants[rj].ref_allele == targets[ti].ref_hash
+                && srp.variants[rj].alt_allele == targets[ti].alt_hash {
+                wgs_idx.push(rj);
+                target_idx.push(ti);
+                break;
             }
+            rj += 1;
         }
     }
 
-    // Sort by wgs_idx (genomic order)
-    let mut order: Vec<usize> = (0..wgs_idx.len()).collect();
-    order.sort_by_key(|&i| wgs_idx[i]);
-    let sorted_wgs: Vec<usize> = order.iter().map(|&i| wgs_idx[i]).collect();
-    let sorted_tgt: Vec<usize> = order.iter().map(|&i| target_idx[i]).collect();
-
-    (sorted_wgs, sorted_tgt)
+    // Already sorted by wgs_idx (ref is in genomic order, merge preserves it)
+    (wgs_idx, target_idx)
 }
 
 /// Read target VCF using position+allele lists instead of SrpReader.
