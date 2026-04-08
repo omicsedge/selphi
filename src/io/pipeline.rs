@@ -286,17 +286,29 @@ pub fn write_window_to_vcf(
     let mut _t_send = 0.0f64;
     let mut _n_intervals = 0usize;
 
-    // Pre-load ALL chunks for the entire owned range ONCE with parallel decompression
+    // Sliding-window chunk loading: decompress chunks in batches, not all at once.
+    // Each batch covers a range of genomic positions. Intervals are processed in order,
+    // and chunks are loaded/freed as we advance along the chromosome.
     let t0_preload = std::time::Instant::now();
     let window_first_chunk = own_wgs_start / chunk_size;
     let window_last_chunk = if own_wgs_end > 0 { (own_wgs_end - 1) / chunk_size } else { 0 };
-    let chunk_ids: Vec<usize> = (window_first_chunk..=window_last_chunk).collect();
-    let all_preloaded: Vec<(usize, crate::srp::CscChunk)> = chunk_ids.par_iter()
+    let total_chunks = window_last_chunk - window_first_chunk + 1;
+
+    // Batch size: cap decompressed memory at ~8 GB (adaptive to chunk size)
+    // Typical chunk: ~16 MB decompressed → 8 GB / 16 MB = 500 chunks
+    let max_chunk_batch = 500usize.min(total_chunks);
+    let mut chunk_cache: HashMap<usize, crate::srp::CscChunk> = HashMap::with_capacity(max_chunk_batch);
+    let mut cache_low: usize = window_first_chunk;
+    let mut cache_high: usize = window_first_chunk;
+
+    // Preload first batch
+    let first_batch_end = (window_first_chunk + max_chunk_batch).min(window_last_chunk + 1);
+    let first_ids: Vec<usize> = (window_first_chunk..first_batch_end).collect();
+    let first_chunks: Vec<(usize, crate::srp::CscChunk)> = first_ids.par_iter()
         .map(|&cid| (cid, srp.load_chunk_from_source(cid)))
         .collect();
-    let all_chunk_map: HashMap<usize, &crate::srp::CscChunk> = all_preloaded.iter()
-        .map(|(cid, chunk)| (*cid, chunk))
-        .collect();
+    for (cid, chunk) in first_chunks { chunk_cache.insert(cid, chunk); }
+    cache_high = first_batch_end;
     _t_chunk_load = t0_preload.elapsed().as_secs_f64();
 
     for interval in &intervals {
@@ -328,7 +340,34 @@ pub fn write_window_to_vcf(
             }
         }
 
-        // Use pre-loaded chunk map (loaded once for entire window)
+        // Ensure chunks for this interval are loaded (advance sliding window)
+        let iv_first = interval.wgs_start / chunk_size;
+        let iv_last = if interval.wgs_end > 0 { (interval.wgs_end - 1) / chunk_size } else { iv_first };
+        let mut cache_changed = false;
+
+        if iv_last >= cache_high {
+            let new_high = (iv_last + 1).min(window_last_chunk + 1);
+            let load_ids: Vec<usize> = (cache_high..new_high).filter(|id| !chunk_cache.contains_key(id)).collect();
+            if !load_ids.is_empty() {
+                let t0 = std::time::Instant::now();
+                let new_chunks: Vec<(usize, crate::srp::CscChunk)> = load_ids.par_iter()
+                    .map(|&cid| (cid, srp.load_chunk_from_source(cid)))
+                    .collect();
+                for (cid, chunk) in new_chunks { chunk_cache.insert(cid, chunk); }
+                _t_chunk_load += t0.elapsed().as_secs_f64();
+                cache_changed = true;
+            }
+            cache_high = new_high;
+            let evict_below = iv_first.saturating_sub(1);
+            if evict_below > cache_low {
+                for cid in cache_low..evict_below { chunk_cache.remove(&cid); }
+                cache_low = evict_below;
+                cache_changed = true;
+            }
+        }
+
+        let chunk_map_ref: HashMap<usize, &crate::srp::CscChunk> = chunk_cache.iter()
+            .map(|(&cid, chunk)| (cid, chunk)).collect();
 
         // Parallel tile computation: interpolation + formatting
         use rayon::prelude::*;
@@ -339,7 +378,7 @@ pub fn write_window_to_vcf(
                 .collect();
 
             let alt_probs = interpolate_tile_preloaded(
-                &all_chunk_map, &weight_refs, interval.weight_s, interval.weight_e,
+                &chunk_map_ref, &weight_refs, interval.weight_s, interval.weight_e,
                 global_start, tile_n, &t, n_haps, chunk_size,
             );
 
