@@ -378,6 +378,16 @@ fn main() {
                     Path::new(source), Path::new(output), args.threads, args.chunk_size)
             };
             result.unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
+
+            // Convert to SRP v2 (flat format)
+            let srp_path = PathBuf::from(output).with_extension("srp");
+            let v2_path = PathBuf::from(output).with_extension("srp2");
+            selphi_step!("Converting to SRP v2...");
+            let v1 = selphi::srp::SrpReader::open(srp_path.to_str().unwrap(), 0);
+            selphi::srp::srp2::convert_v1_to_v2(&v1, &v2_path)
+                .unwrap_or_else(|e| { selphi_error!("SRP v2 conversion failed: {}", e); });
+            let v2_size = std::fs::metadata(&v2_path).map(|m| m.len()).unwrap_or(0);
+            selphi_step!("SRP v2: {} ({:.1} MB)", v2_path.display(), v2_size as f64 / 1e6);
         }
 
         let total = start_time.elapsed().as_secs_f64();

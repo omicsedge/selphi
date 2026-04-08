@@ -20,6 +20,7 @@ pub mod bref3;
 pub mod bref3_writer;
 pub mod bcf_reader;
 pub mod csi;
+pub mod srp2;
 pub use reader::SrpReader;
 
 use std::collections::HashMap;
