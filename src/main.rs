@@ -901,20 +901,15 @@ fn main() {
             }));
         }
 
-        // Process haplotypes in batches to limit peak memory.
-        // Each batch of n_threads haps runs in parallel, then results are extracted
-        // and the HMM temporaries (forward matrix etc.) are freed before the next batch.
+        // Process all haplotypes in a single rayon par_iter (no batch sync overhead).
+        // Each hap runs PBWT+HMM independently. Thread-local buffers reused via RefCell.
         let t0_hmm = Instant::now();
-        let batch_size = rayon::current_num_threads().max(1);
         let mut all_weights: Vec<Vec<(usize, selphi::imputation::hmm::CsrWeights)>> = Vec::with_capacity(n_haps);
 
-        for batch_start in (0..n_haps).step_by(batch_size) {
-            let batch_end = (batch_start + batch_size).min(n_haps);
-            let batch_indices: Vec<usize> = (batch_start..batch_end).collect();
-
-            let batch_results: Vec<(usize, selphi::imputation::hmm::HmmResult)> = batch_indices
-                .par_iter()
-                .map(|&tgt| {
+        {
+            let all_results: Vec<(usize, selphi::imputation::hmm::HmmResult)> = (0..n_haps)
+                .into_par_iter()
+                .map(|tgt| {
                     let prior = hap_priors[tgt].as_deref();
                     let candidates = if let Some(ref pc) = precomputed_candidates {
                         pc[tgt].clone()
@@ -1010,8 +1005,8 @@ fn main() {
                 })
                 .collect();
 
-            // Extract weights and priors from this batch, freeing HMM temporaries
-            for (tgt, r) in batch_results {
+            // Extract weights and priors
+            for (tgt, r) in all_results {
                 if let Some(post) = r.hap_posterior {
                     hap_priors[tgt] = Some(post);
                 }
