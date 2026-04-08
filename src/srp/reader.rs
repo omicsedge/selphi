@@ -371,21 +371,18 @@ impl SrpReader {
                 groups.entry(chunk_id).or_default().push((chip_i, local_row));
             }
             chunk_groups = groups.into_iter().collect();
+            chunk_groups.sort_by_key(|(id, _)| *id);
         }
 
-        let bits_base = bits.as_mut_ptr() as usize;
-        let bits_len = bits.len();
-
-        use rayon::prelude::*;
-        chunk_groups.par_iter().for_each(|(chunk_id, indices)| {
-            let chunk = self.load_chunk(*chunk_id);
+        // Process chunks sequentially to avoid loading all into memory at once.
+        // Each chunk is loaded, processed, then dropped before the next.
+        for (chunk_id, indices) in &chunk_groups {
+            let chunk = self.load_chunk_from_source(*chunk_id);
             let max_row = indices.iter().map(|&(_, r)| r).max().unwrap_or(0);
             let mut row_map = vec![-1i32; max_row + 1];
             for &(chip_i, local_row) in indices {
                 row_map[local_row] = chip_i as i32;
             }
-
-            let bits_slice = unsafe { std::slice::from_raw_parts_mut(bits_base as *mut u64, bits_len) };
 
             for col in 0..n_haps {
                 let word_idx = col / 64;
@@ -397,12 +394,13 @@ impl SrpReader {
                     if row <= max_row {
                         let chip_i = row_map[row];
                         if chip_i >= 0 {
-                            bits_slice[chip_i as usize * n_words + word_idx] |= bit;
+                            bits[chip_i as usize * n_words + word_idx] |= bit;
                         }
                     }
                 }
             }
-        });
+            // chunk dropped here — memory freed before next chunk
+        }
 
         crate::common::HaplotypeBitmatrix::from_raw(bits, n_chip, n_haps)
     }
