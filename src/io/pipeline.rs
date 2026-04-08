@@ -242,6 +242,25 @@ pub fn write_window_to_vcf(
     let mut chip_buf = Vec::with_capacity(n_samples * 20);
     let mut next_wgs = own_wgs_start;
 
+    let mut _t_chunk_load = 0.0f64;
+    let mut _t_interp = 0.0f64;
+    let mut _t_format = 0.0f64;
+    let mut _t_send = 0.0f64;
+    let mut _n_intervals = 0usize;
+
+    // Pre-load ALL chunks for the entire owned range ONCE with parallel decompression
+    let t0_preload = std::time::Instant::now();
+    let window_first_chunk = own_wgs_start / chunk_size;
+    let window_last_chunk = if own_wgs_end > 0 { (own_wgs_end - 1) / chunk_size } else { 0 };
+    let chunk_ids: Vec<usize> = (window_first_chunk..=window_last_chunk).collect();
+    let all_preloaded: Vec<(usize, crate::srp::CscChunk)> = chunk_ids.par_iter()
+        .map(|&cid| (cid, srp.load_chunk_from_source(cid)))
+        .collect();
+    let all_chunk_map: HashMap<usize, &crate::srp::CscChunk> = all_preloaded.iter()
+        .map(|(cid, chunk)| (*cid, chunk))
+        .collect();
+    _t_chunk_load = t0_preload.elapsed().as_secs_f64();
+
     for interval in &intervals {
         // Write chip sites before this interval
         while next_wgs < interval.wgs_start {
@@ -257,9 +276,10 @@ pub fn write_window_to_vcf(
         let n_total_vars = interval.wgs_end - interval.wgs_start;
         if n_total_vars == 0 { continue; }
         let full_range = n_total_vars as f32;
+        _n_intervals += 1;
 
         // Build tile descriptors
-        let mut tile_descs: Vec<(usize, usize, usize)> = Vec::new(); // (tile_start_local, tile_n, global_start)
+        let mut tile_descs: Vec<(usize, usize, usize)> = Vec::new();
         {
             let mut ts = 0;
             while ts < n_total_vars {
@@ -270,25 +290,18 @@ pub fn write_window_to_vcf(
             }
         }
 
-        // Pre-load all chunks needed for this interval (avoid lock contention in par_iter)
-        let interval_first_chunk = interval.wgs_start / chunk_size;
-        let interval_last_chunk = if interval.wgs_end > 0 { (interval.wgs_end - 1) / chunk_size } else { 0 };
-        let preloaded: Vec<(usize, std::sync::Arc<crate::srp::CscChunk>)> = (interval_first_chunk..=interval_last_chunk)
-            .map(|cid| (cid, srp.load_chunk(cid)))
-            .collect();
-        let chunk_map: HashMap<usize, &crate::srp::CscChunk> = preloaded.iter()
-            .map(|(cid, arc)| (*cid, arc.as_ref()))
-            .collect();
+        // Use pre-loaded chunk map (loaded once for entire window)
 
-        // Parallel tile computation with rayon (no lock contention — chunks pre-loaded)
+        // Parallel tile computation: interpolation + formatting
         use rayon::prelude::*;
+        let t0_tiles = std::time::Instant::now();
         let tile_bufs: Vec<Vec<u8>> = tile_descs.par_iter().map(|&(ts, tile_n, global_start)| {
             let t: Vec<f32> = (0..tile_n)
                 .map(|v| (ts + v) as f32 / full_range)
                 .collect();
 
             let alt_probs = interpolate_tile_preloaded(
-                &chunk_map, &weight_refs, interval.weight_s, interval.weight_e,
+                &all_chunk_map, &weight_refs, interval.weight_s, interval.weight_e,
                 global_start, tile_n, &t, n_haps, chunk_size,
             );
 
@@ -300,14 +313,19 @@ pub fn write_window_to_vcf(
                 chip_genotypes, &an_str, no_ap,
             )
         }).collect();
-        drop(preloaded); // Free chunks after tile processing
+        _t_interp += t0_tiles.elapsed().as_secs_f64();
 
         // Send tiles in order
+        let t0_send = std::time::Instant::now();
         for tile_buf in tile_bufs {
             tx.send(tile_buf).map_err(|e| std::io::Error::other(e.to_string()))?;
         }
+        _t_send += t0_send.elapsed().as_secs_f64();
         next_wgs = interval.wgs_end;
     }
+
+    crate::selphi_debug!("  [interp] {} intervals: chunk_load={:.1}s tiles(interp+fmt)={:.1}s send={:.1}s",
+        _n_intervals, _t_chunk_load, _t_interp, _t_send);
 
     // Write remaining chip sites in owned range
     while next_wgs < own_wgs_end {

@@ -196,7 +196,10 @@ pub fn build_csi_index(bcf_path: &Path) -> io::Result<()> {
     let csi_path = { let mut p = bcf_path.as_os_str().to_owned(); p.push(".csi"); std::path::PathBuf::from(p) };
 
     let f = std::fs::File::open(bcf_path)?;
-    let mut bgzf = noodles_bgzf::io::Reader::new(BufReader::with_capacity(2 << 20, f));
+    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let wc = std::num::NonZero::new(n_threads).unwrap();
+    let mut bgzf = noodles_bgzf::io::MultithreadedReader::with_worker_count(
+        wc, BufReader::with_capacity(4 << 20, f));
 
     // Skip BCF header
     let mut magic = [0u8; 5];

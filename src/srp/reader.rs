@@ -202,11 +202,14 @@ impl SrpReader {
         arc
     }
 
-    fn load_chunk_from_source(&self, chunk_id: usize) -> CscChunk {
+    pub(crate) fn load_chunk_from_source(&self, chunk_id: usize) -> CscChunk {
+        // Try compressed cache first — clone bytes and release lock before decompressing
         {
             let cc = self.compressed_cache.lock().unwrap();
             if let Some(data) = cc.get(&chunk_id) {
-                return self.parse_chunk(data);
+                let cloned = data.clone();
+                drop(cc); // Release lock before CPU-heavy decompression
+                return self.parse_chunk(&cloned);
             }
         }
 
