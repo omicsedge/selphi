@@ -8,7 +8,7 @@
 //!
 //! Designed for 50K+ samples: O(n_samples) memory per variant, streaming.
 
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 
 /// MAF bins matching the paper standard.
@@ -340,7 +340,8 @@ pub fn parse_vcf_line(line: &[u8], n_samples: usize, ds_buf: &mut Vec<f32>) -> O
 
 /// Parse VCF/BCF header to get sample names.
 pub fn parse_header_samples(path: &Path) -> io::Result<Vec<String>> {
-    let is_bcf = path.to_string_lossy().ends_with(".bcf");
+    let p = path.to_string_lossy();
+    let is_bcf = p.ends_with(".bcf") || p.ends_with(".bcf.gz");
 
     if is_bcf {
         let hdr = crate::srp::bcf_reader::read_header_only(path)?;
@@ -371,7 +372,242 @@ pub struct EvalCounts {
     pub n_truth_variants: u64,
 }
 
-/// Stream-merge and evaluate imputed vs truth.
+/// Variant record reader — abstracts over VCF.gz and BCF.
+/// Returns (chrom, pos, ref_allele, alt_allele) and fills dosage buffer.
+enum VariantReader {
+    Vcf {
+        reader: BufReader<noodles_bgzf::io::Reader<BufReader<std::fs::File>>>,
+        line_buf: Vec<u8>,
+        n_file_samples: usize,
+    },
+    Bcf {
+        reader: noodles_bgzf::io::Reader<BufReader<std::fs::File>>,
+        contig_names: Vec<String>,
+        gt_key: u16,
+        ds_key: Option<u16>,
+        n_file_samples: usize,
+        sb: Vec<u8>,
+        ib: Vec<u8>,
+    },
+}
+
+impl VariantReader {
+    fn open(path: &Path) -> io::Result<(Self, Vec<String>)> {
+        let is_bcf = path.to_string_lossy().ends_with(".bcf")
+            || path.to_string_lossy().ends_with(".bcf.gz");
+
+        if is_bcf {
+            let hdr = crate::srp::bcf_reader::read_header_only(path)?;
+            let f = std::fs::File::open(path)?;
+            let mut bgzf = noodles_bgzf::io::Reader::new(BufReader::with_capacity(4 << 20, f));
+            // Skip BCF header
+            let mut magic = [0u8; 5]; bgzf.read_exact(&mut magic)?;
+            let mut hlen_buf = [0u8; 4]; bgzf.read_exact(&mut hlen_buf)?;
+            let hlen = u32::from_le_bytes(hlen_buf) as usize;
+            let mut hdr_bytes = vec![0u8; hlen]; bgzf.read_exact(&mut hdr_bytes)?;
+
+            // Find DS key IDX from header
+            let hdr_text = String::from_utf8_lossy(&hdr_bytes);
+            let mut ds_key: Option<u16> = None;
+            for line in hdr_text.lines() {
+                if line.starts_with("##FORMAT=<ID=DS,") {
+                    if let Some(p) = line.find("IDX=") {
+                        let s = p + 4;
+                        let e = line[s..].find(|c: char| c == ',' || c == '>').map(|p| s + p).unwrap_or(line.len());
+                        ds_key = line[s..e].parse().ok();
+                    }
+                }
+            }
+
+            let samples = hdr.sample_names.clone();
+            let ns = hdr.n_samples;
+            Ok((VariantReader::Bcf {
+                reader: bgzf, contig_names: hdr.contig_names, gt_key: hdr.gt_key_id,
+                ds_key, n_file_samples: ns,
+                sb: Vec::with_capacity(512), ib: Vec::with_capacity(ns * 4),
+            }, samples))
+        } else {
+            let f = std::fs::File::open(path)?;
+            let bgzf = noodles_bgzf::io::Reader::new(BufReader::with_capacity(4 << 20, f));
+            let mut reader = BufReader::new(bgzf);
+            let mut samples = Vec::new();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line)? == 0 { break; }
+                if line.starts_with("#CHROM") {
+                    let fields: Vec<&str> = line.trim().split('\t').collect();
+                    if fields.len() > 9 { samples = fields[9..].iter().map(|s| s.to_string()).collect(); }
+                    break;
+                }
+            }
+            let ns = samples.len();
+            Ok((VariantReader::Vcf {
+                reader, line_buf: Vec::with_capacity(ns * 8), n_file_samples: ns,
+            }, samples))
+        }
+    }
+
+    fn n_file_samples(&self) -> usize {
+        match self {
+            VariantReader::Vcf { n_file_samples, .. } => *n_file_samples,
+            VariantReader::Bcf { n_file_samples, .. } => *n_file_samples,
+        }
+    }
+
+    /// Read next biallelic variant. Returns (chrom, pos, ref, alt) and fills ds_buf with dosages.
+    fn next_record(&mut self, ds_buf: &mut Vec<f32>) -> Option<(Vec<u8>, i64, Vec<u8>, Vec<u8>)> {
+        match self {
+            VariantReader::Vcf { reader, line_buf, n_file_samples } => {
+                loop {
+                    line_buf.clear();
+                    if reader.read_until(b'\n', line_buf).ok()? == 0 { return None; }
+                    if let Some(rec) = parse_vcf_line(line_buf, *n_file_samples, ds_buf) {
+                        return Some(rec);
+                    }
+                }
+            }
+            VariantReader::Bcf { reader, contig_names, gt_key, ds_key, n_file_samples, sb, ib } => {
+                let ns = *n_file_samples;
+                let gtk = *gt_key;
+                let dsk = *ds_key;
+                loop {
+                    // Read record header
+                    let mut lbuf = [0u8; 4];
+                    let mut total = 0;
+                    loop {
+                        match reader.read(&mut lbuf[total..]) {
+                            Ok(0) => { if total == 0 { return None; } return None; }
+                            Ok(n) => { total += n; if total == 4 { break; } }
+                            Err(_) => return None,
+                        }
+                    }
+                    let ls = u32::from_le_bytes(lbuf) as usize;
+                    if ls == 0 { return None; }
+                    let mut libuf = [0u8; 4];
+                    reader.read_exact(&mut libuf).ok()?;
+                    let li = u32::from_le_bytes(libuf) as usize;
+
+                    sb.resize(ls, 0); reader.read_exact(sb).ok()?;
+                    let ci = i32::from_le_bytes(sb[0..4].try_into().unwrap()) as usize;
+                    let pos = i32::from_le_bytes(sb[4..8].try_into().unwrap()) as i64 + 1;
+                    let na = u16::from_le_bytes(sb[18..20].try_into().unwrap()) as usize;
+
+                    ib.resize(li, 0); reader.read_exact(ib).ok()?;
+
+                    if na < 2 { continue; } // monomorphic
+                    if na > 2 { continue; } // multi-allelic — skip
+
+                    let chrom = if ci < contig_names.len() { contig_names[ci].as_bytes().to_vec() } else { format!("{}", ci).into_bytes() };
+
+                    // Parse alleles from shared data
+                    let nf = (u32::from_le_bytes(sb[20..24].try_into().unwrap()) >> 24) as usize;
+                    let mut o = 24usize;
+                    let _id = rtstr(sb, &mut o);
+                    let mut alleles = Vec::with_capacity(na);
+                    for _ in 0..na { alleles.push(rtstr_bytes(sb, &mut o)); }
+                    let ref_a = alleles.get(0).cloned().unwrap_or_default();
+                    let alt_a = alleles.get(1).cloned().unwrap_or_default();
+
+                    // Parse FORMAT fields — look for DS first, fallback to GT
+                    ds_buf.clear();
+                    let mut io2 = 0usize;
+                    let mut found_ds = false;
+                    let mut found_gt = false;
+
+                    for _ in 0..nf {
+                        if io2 >= ib.len() { break; }
+                        let k = rtint(ib, &mut io2) as u16;
+                        if io2 >= ib.len() { break; }
+                        let tb = ib[io2]; io2 += 1;
+                        let tid = tb & 0x0F;
+                        let vl = { let r = (tb >> 4) as usize; if r == 15 { rtint(ib, &mut io2) as usize } else { r } };
+                        let es = match tid { 1=>1, 2=>2, 3=>4, 5=>4, 7=>1, _=>1 };
+                        let fs = vl * es * ns;
+
+                        if dsk == Some(k) && tid == 5 && vl == 1 {
+                            // DS field: float32 per sample
+                            for si in 0..ns {
+                                let off = io2 + si * 4;
+                                if off + 4 <= ib.len() {
+                                    let v = f32::from_le_bytes(ib[off..off+4].try_into().unwrap());
+                                    ds_buf.push(v);
+                                } else {
+                                    ds_buf.push(-1.0);
+                                }
+                            }
+                            found_ds = true;
+                            io2 += fs;
+                            break;
+                        } else if k == gtk && !found_ds {
+                            // GT field: int8 per sample × ploidy
+                            let ge = (io2 + fs).min(ib.len());
+                            for si in 0..ns {
+                                let b = io2 + si * vl * es;
+                                if b + 1 < ge {
+                                    let a0 = (ib[b] >> 1).wrapping_sub(1);
+                                    let a1 = (ib[b+1] >> 1).wrapping_sub(1);
+                                    if a0 > 127 || a1 > 127 { ds_buf.push(-1.0); }
+                                    else { ds_buf.push(a0.min(1) as f32 + a1.min(1) as f32); }
+                                } else {
+                                    ds_buf.push(-1.0);
+                                }
+                            }
+                            found_gt = true;
+                            io2 += fs;
+                        } else {
+                            io2 += fs;
+                        }
+                    }
+
+                    if !found_ds && !found_gt {
+                        ds_buf.clear();
+                        ds_buf.resize(ns, -1.0);
+                    }
+                    while ds_buf.len() < ns { ds_buf.push(-1.0); }
+
+                    return Some((chrom, pos, ref_a, alt_a));
+                }
+            }
+        }
+    }
+}
+
+/// Parse BCF typed string into bytes.
+fn rtstr_bytes(buf: &[u8], o: &mut usize) -> Vec<u8> {
+    if *o >= buf.len() { return Vec::new(); }
+    let tb = buf[*o]; *o += 1;
+    let tid = tb & 0x0F;
+    let vl = { let r = (tb >> 4) as usize; if r == 15 { rtint(buf, o) as usize } else { r } };
+    if tid == 7 {
+        let e = (*o + vl).min(buf.len());
+        let s = &buf[*o..e];
+        let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
+        *o = e;
+        s[..end].to_vec()
+    } else {
+        *o += vl * match tid { 1=>1, 2=>2, 3=>4, 5=>4, _=>1 };
+        Vec::new()
+    }
+}
+
+/// Parse BCF typed string (reuse from bcf_reader pattern).
+fn rtstr(buf: &[u8], o: &mut usize) -> String {
+    String::from_utf8_lossy(&rtstr_bytes(buf, o)).to_string()
+}
+
+fn rtint(buf: &[u8], o: &mut usize) -> i32 {
+    if *o >= buf.len() { return 0; }
+    let tb = buf[*o]; *o += 1;
+    match tb & 0x0F {
+        1 => { let v = buf[*o] as i8 as i32; *o += 1; v }
+        2 => { let v = i16::from_le_bytes(buf[*o..*o+2].try_into().unwrap()) as i32; *o += 2; v }
+        3 => { let v = i32::from_le_bytes(buf[*o..*o+4].try_into().unwrap()); *o += 4; v }
+        _ => 0
+    }
+}
+
+/// Stream-merge and evaluate imputed vs truth. Supports VCF.gz and BCF.
 #[allow(unused_assignments)]
 pub fn evaluate_stream(
     imputed_path: &Path,
@@ -380,66 +616,13 @@ pub fn evaluate_stream(
 ) -> io::Result<(SiteAccumulator, SampleAccumulator, EvalCounts)> {
     let n_samples = shared_samples.len();
 
-    // Open both files as BGZF text streams
-    let imp_file = std::fs::File::open(imputed_path)?;
-    let truth_file = std::fs::File::open(truth_path)?;
+    let (mut imp_reader, imp_samples) = VariantReader::open(imputed_path)?;
+    let (mut truth_reader, truth_samples) = VariantReader::open(truth_path)?;
 
-    let is_imp_bcf = imputed_path.to_string_lossy().ends_with(".bcf");
-    let is_truth_bcf = truth_path.to_string_lossy().ends_with(".bcf");
-
-    // For BCF: decompress to get text lines won't work. Use VCF text path.
-    // For BCF input, convert via bcftools or read raw.
-    // For now: support VCF.gz only in the evaluator. BCF support via noodles later.
-    if is_imp_bcf || is_truth_bcf {
-        return Err(io::Error::new(io::ErrorKind::Unsupported,
-            "BCF input not yet supported in native evaluator. Use VCF.gz or convert with: bcftools view -Oz"));
-    }
-
-    let imp_bgzf = noodles_bgzf::io::Reader::new(BufReader::with_capacity(4 << 20, imp_file));
-    let truth_bgzf = noodles_bgzf::io::Reader::new(BufReader::with_capacity(4 << 20, truth_file));
-    let mut imp_reader = BufReader::new(imp_bgzf);
-    let mut truth_reader = BufReader::new(truth_bgzf);
-
-    // Build sample reindex maps
-    let imp_samples = {
-        let mut samples = Vec::new();
-        let mut line = String::new();
-        loop {
-            line.clear();
-            imp_reader.read_line(&mut line)?;
-            if line.starts_with("#CHROM") {
-                let fields: Vec<&str> = line.trim().split('\t').collect();
-                if fields.len() > 9 { samples = fields[9..].iter().map(|s| s.to_string()).collect(); }
-                break;
-            }
-            if line.is_empty() { break; }
-        }
-        samples
-    };
-    let truth_samples = {
-        let mut samples = Vec::new();
-        let mut line = String::new();
-        loop {
-            line.clear();
-            truth_reader.read_line(&mut line)?;
-            if line.starts_with("#CHROM") {
-                let fields: Vec<&str> = line.trim().split('\t').collect();
-                if fields.len() > 9 { samples = fields[9..].iter().map(|s| s.to_string()).collect(); }
-                break;
-            }
-            if line.is_empty() { break; }
-        }
-        samples
-    };
-
-    // Build reindex: shared_samples order → file column index
     let imp_map: std::collections::HashMap<&str, usize> = imp_samples.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
     let truth_map: std::collections::HashMap<&str, usize> = truth_samples.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
     let imp_reindex: Vec<usize> = shared_samples.iter().map(|s| imp_map[s.as_str()]).collect();
     let truth_reindex: Vec<usize> = shared_samples.iter().map(|s| truth_map[s.as_str()]).collect();
-
-    let n_imp_samples = imp_samples.len();
-    let n_truth_samples = truth_samples.len();
 
     let mut site_acc = SiteAccumulator::new();
     let mut sample_acc = SampleAccumulator::new(n_samples);
@@ -447,29 +630,14 @@ pub fn evaluate_stream(
     let mut n_imp_variants = 0u64;
     let mut n_truth_variants = 0u64;
 
-    let mut imp_line = Vec::with_capacity(n_imp_samples * 8);
-    let mut truth_line = Vec::with_capacity(n_truth_samples * 8);
-    let mut imp_ds_raw = Vec::with_capacity(n_imp_samples);
-    let mut truth_ds_raw = Vec::with_capacity(n_truth_samples);
+    let mut imp_ds_raw = Vec::with_capacity(imp_reader.n_file_samples());
+    let mut truth_ds_raw = Vec::with_capacity(truth_reader.n_file_samples());
     let mut imp_ds = vec![0.0f32; n_samples];
     let mut truth_ds = vec![0.0f32; n_samples];
 
-    // Current positions
-    let mut imp_rec: Option<(Vec<u8>, i64, Vec<u8>, Vec<u8>)> = None;
-    let mut truth_rec: Option<(Vec<u8>, i64, Vec<u8>, Vec<u8>)> = None;
-
-    // Read first records
-    let read_next_imp = |reader: &mut BufReader<_>, line: &mut Vec<u8>, ds: &mut Vec<f32>, ns: usize| -> Option<(Vec<u8>, i64, Vec<u8>, Vec<u8>)> {
-        loop {
-            line.clear();
-            if reader.read_until(b'\n', line).ok()? == 0 { return None; }
-            if let Some(rec) = parse_vcf_line(line, ns, ds) { return Some(rec); }
-        }
-    };
-
-    imp_rec = read_next_imp(&mut imp_reader, &mut imp_line, &mut imp_ds_raw, n_imp_samples);
+    let mut imp_rec = imp_reader.next_record(&mut imp_ds_raw);
     if imp_rec.is_some() { n_imp_variants += 1; }
-    truth_rec = read_next_imp(&mut truth_reader, &mut truth_line, &mut truth_ds_raw, n_truth_samples);
+    let mut truth_rec = truth_reader.next_record(&mut truth_ds_raw);
     if truth_rec.is_some() { n_truth_variants += 1; }
 
     while let (Some(imp), Some(truth)) = (&imp_rec, &truth_rec) {
@@ -477,12 +645,12 @@ pub fn evaluate_stream(
         let truth_pos = truth.1;
 
         if imp_pos < truth_pos {
-            imp_rec = read_next_imp(&mut imp_reader, &mut imp_line, &mut imp_ds_raw, n_imp_samples);
+            imp_rec = imp_reader.next_record(&mut imp_ds_raw);
             if imp_rec.is_some() { n_imp_variants += 1; }
             continue;
         }
         if imp_pos > truth_pos {
-            truth_rec = read_next_imp(&mut truth_reader, &mut truth_line, &mut truth_ds_raw, n_truth_samples);
+            truth_rec = truth_reader.next_record(&mut truth_ds_raw);
             if truth_rec.is_some() { n_truth_variants += 1; }
             continue;
         }
@@ -518,15 +686,15 @@ pub fn evaluate_stream(
         }
 
         // Advance both
-        imp_rec = read_next_imp(&mut imp_reader, &mut imp_line, &mut imp_ds_raw, n_imp_samples);
+        imp_rec = imp_reader.next_record(&mut imp_ds_raw);
         if imp_rec.is_some() { n_imp_variants += 1; }
-        truth_rec = read_next_imp(&mut truth_reader, &mut truth_line, &mut truth_ds_raw, n_truth_samples);
+        truth_rec = truth_reader.next_record(&mut truth_ds_raw);
         if truth_rec.is_some() { n_truth_variants += 1; }
     }
 
     // Count remaining variants after merge loop ends
-    while { imp_rec = read_next_imp(&mut imp_reader, &mut imp_line, &mut imp_ds_raw, n_imp_samples); imp_rec.is_some() } { n_imp_variants += 1; }
-    while { truth_rec = read_next_imp(&mut truth_reader, &mut truth_line, &mut truth_ds_raw, n_truth_samples); truth_rec.is_some() } { n_truth_variants += 1; }
+    while { imp_rec = imp_reader.next_record(&mut imp_ds_raw); imp_rec.is_some() } { n_imp_variants += 1; }
+    while { truth_rec = truth_reader.next_record(&mut truth_ds_raw); truth_rec.is_some() } { n_truth_variants += 1; }
 
     Ok((site_acc, sample_acc, EvalCounts { n_matched, n_imp_variants, n_truth_variants }))
 }
