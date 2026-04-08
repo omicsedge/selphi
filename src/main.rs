@@ -339,6 +339,21 @@ fn main() {
             selphi_step!("SRP v2: {} ({:.1} MB)", out, sz as f64 / 1e6);
             return;
         }
+        // Quick .srp → .srpt (tiled) conversion
+        if source.ends_with(".srp") && args.out.as_deref().map_or(false, |o| o.ends_with(".srpt")) {
+            let log_path = PathBuf::from(args.out.as_deref().unwrap()).with_extension("log");
+            selphi::log::init(&log_path, args.debug);
+            selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
+            rayon::ThreadPoolBuilder::new().num_threads(args.threads).build_global().ok();
+            selphi_step!("Converting SRP → tiled...");
+            let v1 = selphi::srp::SrpReader::open(source, 0);
+            let out = args.out.as_deref().unwrap();
+            selphi::srp::tiled::write_tiled(&v1, Path::new(out))
+                .unwrap_or_else(|e| { selphi_error!("Tiled conversion failed: {}", e); std::process::exit(1); });
+            let sz = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+            selphi_step!("Tiled SRP: {} ({:.1} MB)", out, sz as f64 / 1e6);
+            return;
+        }
         let is_srp_input = source.ends_with(".srp");
         let auto_output = if is_srp_input {
             Path::new(source).with_extension("bref3").to_string_lossy().to_string()
@@ -390,15 +405,25 @@ fn main() {
             };
             result.unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
 
-            // Convert to SRP v2 (flat format)
+            // Convert to flat formats
             let srp_path = PathBuf::from(output).with_extension("srp");
+            let v1 = selphi::srp::SrpReader::open(srp_path.to_str().unwrap(), 0);
+
+            // SRP v2 (flat CSC, for backward compat)
             let v2_path = PathBuf::from(output).with_extension("srp2");
             selphi_step!("Converting to SRP v2...");
-            let v1 = selphi::srp::SrpReader::open(srp_path.to_str().unwrap(), 0);
             selphi::srp::srp2::convert_v1_to_v2(&v1, &v2_path)
                 .unwrap_or_else(|e| { selphi_error!("SRP v2 conversion failed: {}", e); });
             let v2_size = std::fs::metadata(&v2_path).map(|m| m.len()).unwrap_or(0);
             selphi_step!("SRP v2: {} ({:.1} MB)", v2_path.display(), v2_size as f64 / 1e6);
+
+            // Tiled SRP (2D tiles, LZ4, for interpolation speed)
+            let tiled_path = PathBuf::from(output).with_extension("srpt");
+            selphi_step!("Converting to tiled SRP...");
+            selphi::srp::tiled::write_tiled(&v1, &tiled_path)
+                .unwrap_or_else(|e| { selphi_error!("Tiled SRP conversion failed: {}", e); });
+            let tiled_size = std::fs::metadata(&tiled_path).map(|m| m.len()).unwrap_or(0);
+            selphi_step!("Tiled SRP: {} ({:.1} MB)", tiled_path.display(), tiled_size as f64 / 1e6);
         }
 
         let total = start_time.elapsed().as_secs_f64();

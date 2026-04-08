@@ -21,6 +21,7 @@ pub mod bref3_writer;
 pub mod bcf_reader;
 pub mod csi;
 pub mod srp2;
+pub mod tiled;
 pub use reader::SrpReader;
 
 use std::collections::HashMap;
@@ -106,6 +107,72 @@ impl CscChunk {
             out[idx as usize] = 1;
         }
         out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SparseTile — 2D tiled sub-matrix for SRP tiled format
+// ---------------------------------------------------------------------------
+
+/// A tile of the tiled SRP format: CSC sub-matrix with u16 row indices.
+/// Max 1024 rows × 4096 columns. Fits in L2 cache (~500 KB at 6% density).
+#[derive(Debug)]
+pub struct SparseTile {
+    /// Column pointer array, length = n_cols + 1
+    pub indptr: Vec<u32>,
+    /// Row indices (u16 since max rows = 1024), length = nnz
+    pub indices: Vec<u16>,
+    pub n_rows: u16,
+    pub n_cols: u16,
+}
+
+/// Tile dimensions (power-of-2 for fast division via bitshift).
+pub const TILE_ROWS: usize = 1024;
+pub const TILE_COLS: usize = 4096;
+pub const TILE_ROWS_SHIFT: u32 = 10; // 1 << 10 = 1024
+pub const TILE_COLS_SHIFT: u32 = 12; // 1 << 12 = 4096
+
+impl SparseTile {
+    /// Serialize tile to bytes for compression.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let nnz = self.indices.len();
+        let size = 8 + (self.n_cols as usize + 1) * 4 + nnz * 2;
+        let mut buf = Vec::with_capacity(size);
+        buf.extend_from_slice(&self.n_rows.to_le_bytes());
+        buf.extend_from_slice(&self.n_cols.to_le_bytes());
+        buf.extend_from_slice(&(nnz as u32).to_le_bytes());
+        // pad to 8 bytes header
+        buf.extend_from_slice(&[0u8; 2]);
+        for &v in &self.indptr { buf.extend_from_slice(&v.to_le_bytes()); }
+        for &v in &self.indices { buf.extend_from_slice(&v.to_le_bytes()); }
+        buf
+    }
+
+    /// Deserialize tile from bytes.
+    pub fn from_bytes(data: &[u8]) -> Self {
+        let n_rows = u16::from_le_bytes(data[0..2].try_into().unwrap());
+        let n_cols = u16::from_le_bytes(data[2..4].try_into().unwrap());
+        let nnz = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+        let indptr_start = 8;
+        let indptr_end = indptr_start + (n_cols as usize + 1) * 4;
+        let indptr: Vec<u32> = data[indptr_start..indptr_end]
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        let indices_end = indptr_end + nnz * 2;
+        let indices: Vec<u16> = data[indptr_end..indices_end]
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        SparseTile { indptr, indices, n_rows, n_cols }
+    }
+
+    /// Get row indices for a column within this tile.
+    #[inline(always)]
+    pub fn col_range(&self, col: usize) -> (usize, usize) {
+        let lo = self.indptr[col] as usize;
+        let hi = self.indptr[col + 1] as usize;
+        (lo, hi)
     }
 }
 

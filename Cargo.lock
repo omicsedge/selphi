@@ -1575,6 +1575,7 @@ dependencies = [
  "blake2",
  "clap",
  "lazy_static",
+ "lz4_flex",
  "memmap2",
  "noodles-bcf",
  "noodles-bgzf 0.46.0",

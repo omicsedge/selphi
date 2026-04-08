@@ -30,6 +30,8 @@ pub struct SrpReader {
     /// SRP v2 mmap backend — when present, chunk loading bypasses ZIP entirely.
     v2_mmap: Option<memmap2::Mmap>,
     v2_chunk_index: Vec<(u64, u32, u32)>,  // (offset, comp_size, decomp_size)
+    /// Tiled SRP backend — when present, interpolation uses 2D tile access for L2-cache speed.
+    pub tiled: Option<super::tiled::TiledSrpReader>,
 }
 
 impl SrpReader {
@@ -118,6 +120,15 @@ impl SrpReader {
             }
         } else { (None, vec![]) };
 
+        // Check for tiled SRP (.srpt) — 2D tile format for fast interpolation
+        let tiled_path = std::path::Path::new(&filepath).with_extension("srpt");
+        let tiled = if tiled_path.exists() {
+            match super::tiled::TiledSrpReader::open(&tiled_path) {
+                Ok(t) => Some(t),
+                Err(e) => { eprintln!("  Warning: tiled SRP load failed: {}", e); None }
+            }
+        } else { None };
+
         SrpReader {
             filepath,
             metadata,
@@ -132,6 +143,7 @@ impl SrpReader {
             compressed_cache: Mutex::new(HashMap::new()),
             v2_mmap,
             v2_chunk_index,
+            tiled,
         }
     }
 
@@ -152,6 +164,7 @@ impl SrpReader {
     pub fn chunk_size(&self) -> usize { self.metadata.chunk_size }
     pub fn chromosome(&self) -> &str { &self.metadata.chromosome }
     pub fn is_v2(&self) -> bool { self.v2_mmap.is_some() }
+    pub fn is_tiled(&self) -> bool { self.tiled.is_some() }
 
     pub fn get_chunk_compressed_sizes(&self) -> Vec<f64> {
         let file = File::open(&self.filepath).unwrap();
