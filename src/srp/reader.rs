@@ -24,9 +24,12 @@ pub struct SrpReader {
     pub ids: Vec<String>,
     pub original_ids: Vec<String>,
     cache: RwLock<HashMap<usize, Arc<CscChunk>>>,
-    cache_order: Mutex<Vec<usize>>,  // LRU: oldest first
-    max_cached: usize,               // 0 = unlimited
+    cache_order: Mutex<Vec<usize>>,
+    max_cached: usize,
     compressed_cache: Mutex<HashMap<usize, Vec<u8>>>,
+    /// SRP v2 mmap backend — when present, chunk loading bypasses ZIP entirely.
+    v2_mmap: Option<memmap2::Mmap>,
+    v2_chunk_index: Vec<(u64, u32, u32)>,  // (offset, comp_size, decomp_size)
 }
 
 impl SrpReader {
@@ -93,6 +96,28 @@ impl SrpReader {
             ids.clone()
         };
 
+        // Check for SRP v2 file (.srp2) — if exists, use mmap for chunk loading
+        let v2_path = std::path::Path::new(&filepath).with_extension("srp2");
+        let (v2_mmap, v2_chunk_index) = if v2_path.exists() {
+            match std::fs::File::open(&v2_path).and_then(|f| unsafe { memmap2::Mmap::map(&f) }) {
+                Ok(mmap) if mmap.len() > 12 && &mmap[0..8] == b"SRPv2\0\0\0" => {
+                    let hdr_size = u32::from_le_bytes(mmap[8..12].try_into().unwrap()) as usize;
+                    let idx_off = 12 + hdr_size;
+                    let n_ch = u32::from_le_bytes(mmap[idx_off..idx_off+4].try_into().unwrap()) as usize;
+                    let idx_data = &mmap[idx_off+4..idx_off+4+n_ch*16];
+                    let index: Vec<(u64, u32, u32)> = (0..n_ch).map(|i| {
+                        let b = i * 16;
+                        (u64::from_le_bytes(idx_data[b..b+8].try_into().unwrap()),
+                         u32::from_le_bytes(idx_data[b+8..b+12].try_into().unwrap()),
+                         u32::from_le_bytes(idx_data[b+12..b+16].try_into().unwrap()))
+                    }).collect();
+                    eprintln!("  SRP v2 backend: {} ({} chunks, mmap)", v2_path.display(), n_ch);
+                    (Some(mmap), index)
+                }
+                _ => (None, vec![]),
+            }
+        } else { (None, vec![]) };
+
         SrpReader {
             filepath,
             metadata,
@@ -105,6 +130,8 @@ impl SrpReader {
             cache_order: Mutex::new(Vec::new()),
             max_cached: _cache_size,
             compressed_cache: Mutex::new(HashMap::new()),
+            v2_mmap,
+            v2_chunk_index,
         }
     }
 
@@ -203,16 +230,26 @@ impl SrpReader {
     }
 
     pub(crate) fn load_chunk_from_source(&self, chunk_id: usize) -> CscChunk {
-        // Try compressed cache first — clone bytes and release lock before decompressing
+        // Fast path: SRP v2 mmap — direct read from memory-mapped file, no lock
+        if let Some(ref mmap) = self.v2_mmap {
+            if chunk_id < self.v2_chunk_index.len() {
+                let (offset, comp_size, _decomp_size) = self.v2_chunk_index[chunk_id];
+                let compressed = &mmap[offset as usize..(offset as usize + comp_size as usize)];
+                return super::parse_raw_chunk(compressed);
+            }
+        }
+
+        // Try compressed cache — clone bytes and release lock before decompressing
         {
             let cc = self.compressed_cache.lock().unwrap();
             if let Some(data) = cc.get(&chunk_id) {
                 let cloned = data.clone();
-                drop(cc); // Release lock before CPU-heavy decompression
+                drop(cc);
                 return self.parse_chunk(&cloned);
             }
         }
 
+        // Fallback: read from ZIP
         let ext = if self.metadata.chunk_format == "raw" { ".bin" } else { ".npz" };
         let entry_name = format!("haplotypes/{}{}", chunk_id, ext);
 
@@ -242,8 +279,9 @@ impl SrpReader {
     }
 
     /// Prefetch compressed bytes for a range of chunks (single ZIP open).
-    /// Subsequent load_chunk calls decompress from RAM instead of re-opening ZIP.
+    /// No-op when SRP v2 mmap is available (data already memory-mapped).
     pub fn prefetch_compressed_range(&self, chunk_ids: &[usize]) {
+        if self.v2_mmap.is_some() { return; } // mmap = always prefetched
         let ext = if self.metadata.chunk_format == "raw" { ".bin" } else { ".npz" };
 
         let file = File::open(&self.filepath).unwrap();
@@ -262,8 +300,9 @@ impl SrpReader {
         }
     }
 
-    /// Clear compressed cache to free memory.
+    /// Clear compressed cache to free memory. No-op with SRP v2 mmap.
     pub fn clear_compressed_cache(&self) {
+        if self.v2_mmap.is_some() { return; }
         let mut cc = self.compressed_cache.lock().unwrap();
         cc.clear();
     }

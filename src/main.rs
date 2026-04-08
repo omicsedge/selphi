@@ -328,6 +328,17 @@ fn main() {
     }
 
     if let Some(ref source) = args.prepare_reference_from {
+        // Quick v1→v2 conversion if input is .srp and output is .srp2
+        if source.ends_with(".srp") && args.out.as_deref().map_or(false, |o| o.ends_with(".srp2")) {
+            selphi_step!("Converting SRP v1 → v2...");
+            let v1 = selphi::srp::SrpReader::open(source, 0);
+            let out = args.out.as_deref().unwrap();
+            selphi::srp::srp2::convert_v1_to_v2(&v1, Path::new(out))
+                .unwrap_or_else(|e| { selphi_error!("Conversion failed: {}", e); std::process::exit(1); });
+            let sz = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+            selphi_step!("SRP v2: {} ({:.1} MB)", out, sz as f64 / 1e6);
+            return;
+        }
         let is_srp_input = source.ends_with(".srp");
         let auto_output = if is_srp_input {
             Path::new(source).with_extension("bref3").to_string_lossy().to_string()
