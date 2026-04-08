@@ -412,7 +412,7 @@ fn main() {
     let start_time = Instant::now();
 
     // 1. Load reference panel
-    let srp = Arc::new(SrpReader::open(&args.refpanel, 4));
+    let srp = Arc::new(SrpReader::open(&args.refpanel, args.threads * 2));
     let n_ref_variants = srp.n_variants();
     let n_ref = srp.n_haps();
     let ref_positions: Vec<i64> = srp.variants.iter().map(|v| v.pos).collect();
@@ -804,12 +804,15 @@ fn main() {
                 .copy_from_slice(&targ_w[var * n_haps..(var + 1) * n_haps]);
         }
 
-        // Extract ref-only view for deduplication (compact from alleles_w)
-        let mut ref_w = vec![0u8; n_var_w * n_ref];
-        for var in 0..n_var_w {
-            ref_w[var * n_ref..(var + 1) * n_ref]
-                .copy_from_slice(&alleles_w[var * m..var * m + n_ref]);
-        }
+        // Ref-only view: pointer into alleles_w (no separate allocation)
+        // alleles_w layout: [var0: ref[0..n_ref] | targ[0..n_haps] | var1: ... ]
+        // ref_w_fn extracts ref slice for a given variant range
+        let ref_w_fn = |alleles: &[u8], n_var: usize, stride: usize, n_r: usize| -> Vec<u8> {
+            let mut rw = vec![0u8; n_var * n_r];
+            for v in 0..n_var { rw[v * n_r..(v + 1) * n_r].copy_from_slice(&alleles[v * stride..v * stride + n_r]); }
+            rw
+        };
+        let ref_w = ref_w_fn(&alleles_w, n_var_w, m, n_ref);
 
         // CodedSteps: partition all haplotypes at 0.1 cM intervals (shared)
         let coded = selphi::imputation::pbwt::build_coded_steps(&alleles_w, n_var_w, m, cm_w, 0.05);
@@ -828,87 +831,95 @@ fn main() {
         });
         let ne_w_ref = ne_w.as_deref();
 
-        let hmm_results: Vec<selphi::imputation::hmm::HmmResult> = (0..n_haps)
-            .into_par_iter()
-            .map(|tgt| {
-                let prior = hap_priors[tgt].as_deref();
-                let candidates = if let Some(ref pc) = precomputed_candidates {
-                    pc[tgt].clone()
-                } else {
-                    selphi::imputation::pbwt::select_candidates(
-                        &coded, n_ref + tgt, n_ref, 7, max_candidates,
-                    )
-                };
-                let n_cand = candidates.len();
-                if n_cand < 100 {
-                    let fwd = selphi::imputation::pbwt::pbwt_forward_single(
-                        &alleles_w, n_var_w, m, n_ref, match_length, fl_fwd,
-                        (n_ref + tgt) as i32,
-                    );
-                    let bwd = selphi::imputation::pbwt::backward_filter_single(&fwd, n_var_w, n_ref, fl_fwd, fl_bwd);
-                    let csc = selphi::imputation::pbwt::build_csc_matrix(&bwd, n_ref, n_var_w, fl_bwd);
-                    return selphi::imputation::hmm::calculate_weights(
+        // Process haplotypes in batches to limit peak memory.
+        // Each batch of n_threads haps runs in parallel, then results are extracted
+        // and the HMM temporaries (forward matrix etc.) are freed before the next batch.
+        let batch_size = rayon::current_num_threads().max(1);
+        let mut all_weights: Vec<Vec<(usize, selphi::imputation::hmm::CsrWeights)>> = Vec::with_capacity(n_haps);
+
+        for batch_start in (0..n_haps).step_by(batch_size) {
+            let batch_end = (batch_start + batch_size).min(n_haps);
+            let batch_indices: Vec<usize> = (batch_start..batch_end).collect();
+
+            let batch_results: Vec<(usize, selphi::imputation::hmm::HmmResult)> = batch_indices
+                .par_iter()
+                .map(|&tgt| {
+                    let prior = hap_priors[tgt].as_deref();
+                    let candidates = if let Some(ref pc) = precomputed_candidates {
+                        pc[tgt].clone()
+                    } else {
+                        selphi::imputation::pbwt::select_candidates(
+                            &coded, n_ref + tgt, n_ref, 7, max_candidates,
+                        )
+                    };
+                    let n_cand = candidates.len();
+                    if n_cand < 100 {
+                        let fwd = selphi::imputation::pbwt::pbwt_forward_single(
+                            &alleles_w, n_var_w, m, n_ref, match_length, fl_fwd,
+                            (n_ref + tgt) as i32,
+                        );
+                        let bwd = selphi::imputation::pbwt::backward_filter_single(&fwd, n_var_w, n_ref, fl_fwd, fl_bwd);
+                        let csc = selphi::imputation::pbwt::build_csc_matrix(&bwd, n_ref, n_var_w, fl_bwd);
+                        return (tgt, selphi::imputation::hmm::calculate_weights(
+                            &csc, cm_w, &breaks_w, n_ref,
+                            est_ne as f64, p_err, Some(&ref_w), n_var_w, None,
+                            ne_w_ref, prior, 0.0,
+                        ));
+                    }
+
+                    let m_red = n_cand + 1;
+                    thread_local! {
+                        static TL_RED: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
+                    }
+                    let mut reduced = TL_RED.with(|buf| {
+                        let mut b = buf.borrow_mut();
+                        let needed = n_var_w * m_red;
+                        if b.capacity() >= needed { b.clear(); b.resize(needed, 0u8); std::mem::take(&mut *b) }
+                        else { vec![0u8; needed] }
+                    });
+                    for var in 0..n_var_w {
+                        let src = var * m;
+                        let dst = var * m_red;
+                        for (i, &c) in candidates.iter().enumerate() { reduced[dst + i] = alleles_w[src + c as usize]; }
+                        reduced[dst + n_cand] = alleles_w[src + n_ref + tgt];
+                    }
+
+                    thread_local! {
+                        static WS: std::cell::RefCell<Option<selphi::imputation::pbwt::PbwtWorkspace>> =
+                            std::cell::RefCell::new(None);
+                    }
+                    let fwd = WS.with(|ws_cell| {
+                        let mut ws_opt = ws_cell.borrow_mut();
+                        let ws = ws_opt.get_or_insert_with(|| selphi::imputation::pbwt::PbwtWorkspace::new(m_red, n_cand));
+                        if ws.capacity() < m_red { *ws = selphi::imputation::pbwt::PbwtWorkspace::new(m_red, n_cand); }
+                        selphi::imputation::pbwt::pbwt_forward_with_workspace(ws, &reduced, n_var_w, m_red, n_cand, match_length, fl_fwd, n_cand as i32)
+                    });
+                    let bwd = selphi::imputation::pbwt::backward_filter_single(&fwd, n_var_w, n_cand, fl_fwd, fl_bwd);
+                    let mut csc = selphi::imputation::pbwt::build_csc_matrix(&bwd, n_cand, n_var_w, fl_bwd);
+
+                    TL_RED.with(|buf| { *buf.borrow_mut() = reduced; });
+                    for idx in &mut csc.indices { *idx = candidates[*idx as usize] as i32; }
+                    csc.n_rows = n_ref;
+
+                    (tgt, selphi::imputation::hmm::calculate_weights(
                         &csc, cm_w, &breaks_w, n_ref,
                         est_ne as f64, p_err, Some(&ref_w), n_var_w, None,
                         ne_w_ref, prior, 0.0,
-                    );
-                }
+                    ))
+                })
+                .collect();
 
-                let m_red = n_cand + 1;
-                thread_local! {
-                    static TL_RED: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
-                }
-                let mut reduced = TL_RED.with(|buf| {
-                    let mut b = buf.borrow_mut();
-                    let needed = n_var_w * m_red;
-                    if b.capacity() >= needed { b.clear(); b.resize(needed, 0u8); std::mem::take(&mut *b) }
-                    else { vec![0u8; needed] }
-                });
-                for var in 0..n_var_w {
-                    let src = var * m;
-                    let dst = var * m_red;
-                    for (i, &c) in candidates.iter().enumerate() { reduced[dst + i] = alleles_w[src + c as usize]; }
-                    reduced[dst + n_cand] = alleles_w[src + n_ref + tgt];
-                }
-
-                thread_local! {
-                    static WS: std::cell::RefCell<Option<selphi::imputation::pbwt::PbwtWorkspace>> =
-                        std::cell::RefCell::new(None);
-                }
-                let fwd = WS.with(|ws_cell| {
-                    let mut ws_opt = ws_cell.borrow_mut();
-                    let ws = ws_opt.get_or_insert_with(|| selphi::imputation::pbwt::PbwtWorkspace::new(m_red, n_cand));
-                    if ws.capacity() < m_red { *ws = selphi::imputation::pbwt::PbwtWorkspace::new(m_red, n_cand); }
-                    selphi::imputation::pbwt::pbwt_forward_with_workspace(ws, &reduced, n_var_w, m_red, n_cand, match_length, fl_fwd, n_cand as i32)
-                });
-                let bwd = selphi::imputation::pbwt::backward_filter_single(&fwd, n_var_w, n_cand, fl_fwd, fl_bwd);
-                let mut csc = selphi::imputation::pbwt::build_csc_matrix(&bwd, n_cand, n_var_w, fl_bwd);
-
-                TL_RED.with(|buf| { *buf.borrow_mut() = reduced; });
-                for idx in &mut csc.indices { *idx = candidates[*idx as usize] as i32; }
-                csc.n_rows = n_ref;
-
-                selphi::imputation::hmm::calculate_weights(
-                    &csc, cm_w, &breaks_w, n_ref,
-                    est_ne as f64, p_err, Some(&ref_w), n_var_w, None,
-                    ne_w_ref, prior, 0.0,
-                )
-            })
-            .collect();
-
-        // Extract weights and update cross-window priors
-        let all_weights: Vec<Vec<(usize, selphi::imputation::hmm::CsrWeights)>> = hmm_results
-            .into_iter()
-            .enumerate()
-            .map(|(tgt, r)| {
+            // Extract weights and priors from this batch, freeing HMM temporaries
+            for (tgt, r) in batch_results {
                 if let Some(post) = r.hap_posterior {
                     hap_priors[tgt] = Some(post);
                 }
-                r.weights
-            })
-            .collect();
+                all_weights.push(r.weights);
+            }
+        }
 
         drop(alleles_w);
+        drop(ref_w);
         let pbwt_hmm_secs = t0_win.elapsed().as_secs_f64();
         let pbwt_secs = pbwt_hmm_secs;
         let _hmm_secs = 0.0f64;

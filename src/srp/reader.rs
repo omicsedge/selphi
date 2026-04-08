@@ -24,6 +24,8 @@ pub struct SrpReader {
     pub ids: Vec<String>,
     pub original_ids: Vec<String>,
     cache: RwLock<HashMap<usize, Arc<CscChunk>>>,
+    cache_order: Mutex<Vec<usize>>,  // LRU: oldest first
+    max_cached: usize,               // 0 = unlimited
     compressed_cache: Mutex<HashMap<usize, Vec<u8>>>,
 }
 
@@ -100,6 +102,8 @@ impl SrpReader {
             ids,
             original_ids,
             cache: RwLock::new(HashMap::new()),
+            cache_order: Mutex::new(Vec::new()),
+            max_cached: _cache_size,
             compressed_cache: Mutex::new(HashMap::new()),
         }
     }
@@ -183,6 +187,18 @@ impl SrpReader {
 
         let mut cache = self.cache.write().unwrap();
         cache.insert(chunk_id, Arc::clone(&arc));
+
+        // LRU eviction: keep at most max_cached chunks
+        if self.max_cached > 0 {
+            let mut order = self.cache_order.lock().unwrap();
+            order.retain(|&id| id != chunk_id);
+            order.push(chunk_id);
+            while order.len() > self.max_cached {
+                let evict = order.remove(0);
+                cache.remove(&evict);
+            }
+        }
+
         arc
     }
 
@@ -239,68 +255,53 @@ impl SrpReader {
     }
 
     pub fn preload_all_chunks(&self) {
-        let ext = if self.metadata.chunk_format == "raw" { ".bin" } else { ".npz" };
-
-        let file = File::open(&self.filepath).unwrap();
-        let reader = BufReader::new(file);
-        let mut archive = zip::ZipArchive::new(reader).unwrap();
-
-        let mut raw_data: Vec<(usize, Vec<u8>)> = Vec::new();
-        for chunk_info in &self.chunks {
-            let chunk_id = chunk_info[0] as usize;
-            let entry_name = format!("haplotypes/{}{}", chunk_id, ext);
-            if let Ok(mut entry) = archive.by_name(&entry_name) {
-                let mut data = Vec::new();
-                entry.read_to_end(&mut data).unwrap();
-                raw_data.push((chunk_id, data));
-            }
-        }
-
-        let format = self.metadata.chunk_format.clone();
-        let parsed: Vec<(usize, CscChunk)> = raw_data.into_iter()
-            .map(|(id, data)| {
-                let chunk = if format == "raw" {
-                    parse_raw_chunk(&data)
-                } else {
-                    parse_npz_chunk(&data)
-                };
-                (id, chunk)
-            })
-            .collect();
-
-        let mut cache = self.cache.write().unwrap();
-        for (id, chunk) in parsed {
-            cache.insert(id, Arc::new(chunk));
-        }
+        let all_ids: Vec<usize> = self.chunks.iter().map(|c| c[0] as usize).collect();
+        self.preload_chunk_range(&all_ids);
     }
 
     pub fn preload_chunk_range(&self, chunk_ids: &[usize]) {
+        // Only preload chunks not already in cache
+        let to_load: Vec<usize> = {
+            let cache = self.cache.read().unwrap();
+            chunk_ids.iter().filter(|id| !cache.contains_key(id)).copied().collect()
+        };
+        if to_load.is_empty() { return; }
+
         let ext = if self.metadata.chunk_format == "raw" { ".bin" } else { ".npz" };
         let file = File::open(&self.filepath).unwrap();
         let reader = BufReader::new(file);
         let mut archive = zip::ZipArchive::new(reader).unwrap();
 
-        let mut raw_data: Vec<(usize, Vec<u8>)> = Vec::new();
-        for &chunk_id in chunk_ids {
+        let format = self.metadata.chunk_format.clone();
+        let mut cache = self.cache.write().unwrap();
+        let mut order = self.cache_order.lock().unwrap();
+
+        for &chunk_id in &to_load {
             let entry_name = format!("haplotypes/{}{}", chunk_id, ext);
             if let Ok(mut entry) = archive.by_name(&entry_name) {
                 let mut data = Vec::new();
                 entry.read_to_end(&mut data).unwrap();
-                raw_data.push((chunk_id, data));
+                let chunk = if format == "raw" { parse_raw_chunk(&data) } else { parse_npz_chunk(&data) };
+                cache.insert(chunk_id, Arc::new(chunk));
+                order.retain(|&id| id != chunk_id);
+                order.push(chunk_id);
             }
         }
 
-        let format = self.metadata.chunk_format.clone();
-        let mut cache = self.cache.write().unwrap();
-        for (id, data) in raw_data {
-            let chunk = if format == "raw" { parse_raw_chunk(&data) } else { parse_npz_chunk(&data) };
-            cache.insert(id, Arc::new(chunk));
+        // LRU eviction
+        if self.max_cached > 0 {
+            while order.len() > self.max_cached {
+                let evict = order.remove(0);
+                cache.remove(&evict);
+            }
         }
     }
 
     pub fn unload_chunks(&self) {
         let mut cache = self.cache.write().unwrap();
         cache.clear();
+        let mut order = self.cache_order.lock().unwrap();
+        order.clear();
     }
 
     // -- Extraction helpers --
