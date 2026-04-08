@@ -13,7 +13,7 @@ use std::collections::HashMap;
 const MAGIC_NUMBER_V3: i32 = 2055763188;
 const SEQ_CODED: u8 = 0;
 const ALLELE_CODED: u8 = 1;
-const BLOCK_SIZE: usize = 1024;
+const MAX_BLOCK_SIZE: usize = 1024;
 
 /// Write a BCF/VCF reference panel as BREF3.
 /// Uses the parallel BCF reader for fast extraction, writes BREF3 blocks sequentially.
@@ -57,8 +57,12 @@ pub fn write_bref3_from_bcf(source_path: &Path, output_path: &Path) -> io::Resul
     let mut skip_buf = [0u8; 65536];
 
     // Block accumulators
-    let mut block_alleles: Vec<Vec<u8>> = Vec::with_capacity(BLOCK_SIZE); // block_alleles[v] = alleles for all haps
-    let mut block_variants: Vec<(i32, String, String, String)> = Vec::with_capacity(BLOCK_SIZE); // (pos, id, ref, alt)
+    let mut block_alleles: Vec<Vec<u8>> = Vec::with_capacity(MAX_BLOCK_SIZE);
+    let mut block_variants: Vec<(i32, String, String, String)> = Vec::with_capacity(MAX_BLOCK_SIZE);
+    // Incremental hapToSeq tracking: pattern hash → seq_id
+    let mut pattern_map: HashMap<Vec<u8>, u16> = HashMap::new();
+    let mut hap_patterns: Vec<Vec<u8>> = Vec::new(); // per-haplotype accumulated pattern
+    let mut n_seq: u16 = 0;
     let mut chrom = String::new();
     let mut total_variants = 0u64;
 
@@ -136,15 +140,38 @@ pub fn write_bref3_from_bcf(source_path: &Path, output_path: &Path) -> io::Resul
             io2 += fs;
         }
 
+        // Update incremental hapToSeq: extend each hap's pattern with this variant's allele
+        if hap_patterns.is_empty() {
+            hap_patterns = (0..n_haps).map(|h| vec![alleles[h]]).collect();
+        } else {
+            for h in 0..n_haps { hap_patterns[h].push(alleles[h]); }
+        }
+        // Recount unique patterns
+        pattern_map.clear();
+        n_seq = 0;
+        for h in 0..n_haps {
+            if !pattern_map.contains_key(&hap_patterns[h]) {
+                pattern_map.insert(hap_patterns[h].clone(), n_seq);
+                n_seq += 1;
+            }
+        }
+
         block_alleles.push(alleles);
         block_variants.push((pos, id_str, ref_allele, alt_allele));
 
-        // Flush block when full
-        if block_alleles.len() >= BLOCK_SIZE {
+        // Flush block when n_seq grows too large or block is full
+        // Beagle closes block when n_seq approaches n_haps * 0.5
+        let should_flush = block_alleles.len() >= MAX_BLOCK_SIZE
+            || (n_seq as usize) > n_haps * 2 / 5;  // ~40% threshold
+
+        if should_flush {
             write_bref3_block(&mut w, &chrom, &block_alleles, &block_variants, n_haps, &snv_perms)?;
             total_variants += block_alleles.len() as u64;
             block_alleles.clear();
             block_variants.clear();
+            hap_patterns.clear();
+            pattern_map.clear();
+            n_seq = 0;
         }
     }
 
@@ -206,16 +233,30 @@ fn write_bref3_block<W: Write>(
         if let Some(code) = encode_snv_allele_code(ref_a, alt_a, snv_perms) {
             w.write_all(&[code as u8])?;
         } else {
-            w.write_all(&[0xFF])?;
-            write_string_array(w, &[ref_a.clone(), alt_a.clone()])?;
-            write_i32(w, pos + ref_a.len() as i32)?;
+            w.write_all(&[0xFF])?; // -1 as i8 = non-SNV marker
+            // Beagle readByteLengthStringArray: nAlleles(u8) + per allele: len(u8) + bytes
+            let n_alleles = 2u8;
+            w.write_all(&[n_alleles])?;
+            w.write_all(&[ref_a.len() as u8])?;
+            w.write_all(ref_a.as_bytes())?;
+            w.write_all(&[alt_a.len() as u8])?;
+            w.write_all(alt_a.as_bytes())?;
+            write_i32(w, pos + ref_a.len() as i32)?; // end position
         }
 
         if use_seq {
             w.write_all(&[SEQ_CODED])?;
+            // Beagle format: nAlleles(u8) + per allele: nSeq bytes (binary indicator)
+            let n_alleles = 2u8; // biallelic
+            w.write_all(&[n_alleles])?;
+            // Build seqToAllele: sta[seq] = allele index for this seq at variant v
             let mut sta = vec![0u8; n_seq as usize];
             for h in 0..n_haps { sta[hap_to_seq[h] as usize] = block_alleles[v][h]; }
-            w.write_all(&sta)?;
+            // Write per-allele binary indicators
+            for allele in 0..n_alleles {
+                let indicators: Vec<u8> = sta.iter().map(|&a| if a == allele { 1 } else { 0 }).collect();
+                w.write_all(&indicators)?;
+            }
         } else {
             w.write_all(&[ALLELE_CODED])?;
             let n_alt: usize = block_alleles[v].iter().filter(|&&a| a > 0).count();
