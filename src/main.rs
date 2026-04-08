@@ -780,12 +780,16 @@ fn main() {
     let t0_pipeline = Instant::now();
     let mut vcf_write_handle: Option<std::thread::JoinHandle<()>> = None;
     let mut prefetch_handle: Option<std::thread::JoinHandle<()>> = None;
+    let n_cores = rayon::current_num_threads();
     for (wi, window) in windows.iter().enumerate() {
         let t0_win = Instant::now();
+        let cpu0_win = selphi::log::cpu_time_secs();
         let n_var_w = window.chip_end - window.chip_start;
 
-        // Prefetch SRP chunks for NEXT window while this one does PBWT+HMM
-        if wi + 1 < windows.len() {
+        // Prefetch SRP chunks for NEXT window while this one does PBWT+HMM.
+        // Only useful for BCF/Parquet/PGEN which use load_chunk() (Arc cache).
+        // VCF pipeline has its own sliding Vec cache via load_chunk_from_source.
+        if (output_bcf || output_parquet || output_pgen) && wi + 1 < windows.len() {
             let next_w = &windows[wi + 1];
             let n_chip_total = wgs_idx.len();
             let next_own_start = if next_w.own_chip_start == 0 { 0 } else { wgs_idx[next_w.own_chip_start] };
@@ -800,45 +804,38 @@ fn main() {
             }));
         }
 
-        // Extract window sub-arrays
+        // Extract window sub-arrays — NO alleles_w materialization.
+        // Ref read from bitmatrix (1 bit/allele), target from dense array.
+        let t0_extract = Instant::now();
         let targ_w = extract_subarray(&targ_alleles, n_haps, window.chip_start, window.chip_end);
         let cm_w = &chip_cm[window.chip_start..window.chip_end];
-
-        // Build merged alleles from bitmatrix (ref) + targ_w (target)
         let m = n_ref + n_haps;
-        let mut alleles_w = vec![0u8; n_var_w * m];
-        for var in 0..n_var_w {
-            let out_base = var * m;
-            // Extract ref from bitmatrix (word-level)
+
+        // Build ref_w from bitmatrix (for HMM) — parallel over variants
+        let mut ref_w = vec![0u8; n_var_w * n_ref];
+        ref_w.par_chunks_mut(n_ref).enumerate().for_each(|(var, dst)| {
             let ci = window.chip_start + var;
             let row = ref_bm_imp.row(ci);
-            let ref_dst = &mut alleles_w[out_base..out_base + n_ref];
             for w in 0..ref_bm_imp.n_words() {
                 let mut word = row[w];
                 let base = w * 64;
                 while word != 0 {
                     let k = word.trailing_zeros() as usize;
                     let r = base + k;
-                    if r < n_ref { ref_dst[r] = 1; }
+                    if r < n_ref { unsafe { *dst.get_unchecked_mut(r) = 1; } }
                     word &= word - 1;
                 }
             }
-            alleles_w[out_base + n_ref..out_base + m]
-                .copy_from_slice(&targ_w[var * n_haps..(var + 1) * n_haps]);
-        }
+        });
 
-        // Ref-only view: pointer into alleles_w (no separate allocation)
-        // alleles_w layout: [var0: ref[0..n_ref] | targ[0..n_haps] | var1: ... ]
-        // ref_w_fn extracts ref slice for a given variant range
-        let ref_w_fn = |alleles: &[u8], n_var: usize, stride: usize, n_r: usize| -> Vec<u8> {
-            let mut rw = vec![0u8; n_var * n_r];
-            for v in 0..n_var { rw[v * n_r..(v + 1) * n_r].copy_from_slice(&alleles[v * stride..v * stride + n_r]); }
-            rw
-        };
-        let ref_w = ref_w_fn(&alleles_w, n_var_w, m, n_ref);
+        let extract_secs = t0_extract.elapsed().as_secs_f64();
+        let cpu_extract = selphi::log::cpu_time_secs();
 
-        // CodedSteps: partition all haplotypes at 0.1 cM intervals (shared)
-        let coded = selphi::imputation::pbwt::build_coded_steps(&alleles_w, n_var_w, m, cm_w, 0.05);
+        // CodedSteps: bitmatrix-native (no alleles_w needed)
+        let t0_coded = Instant::now();
+        let coded = selphi::imputation::pbwt::build_coded_steps_bm(
+            &ref_bm_imp, window.chip_start, n_var_w, n_ref, &targ_w, n_haps, cm_w, 0.05,
+        );
         let max_candidates = args.max_candidates;
         let p_err = args.p_err;
 
@@ -854,9 +851,60 @@ fn main() {
         });
         let ne_w_ref = ne_w.as_deref();
 
+        let coded_secs = t0_coded.elapsed().as_secs_f64();
+        let cpu_coded = selphi::log::cpu_time_secs();
+
+        // Start chunk pre-decompression for this window's interpolation.
+        // Runs on 4 dedicated threads during HMM (which uses rayon ~8 cores).
+        // CPU profiling: chunk_load=17% + HMM=51% = 68%, fits in 16 cores.
+        // Cap at 500 chunks to limit memory (~8GB). Remaining loaded on-demand by pipeline.
+        let mut chunk_preload_handle: Option<std::thread::JoinHandle<Vec<Option<selphi::srp::CscChunk>>>> = None;
+        if !output_bcf && !output_parquet && !output_pgen {
+            let srp_clone = Arc::clone(&srp);
+            let own_start = if window.own_chip_start == 0 { 0 } else { wgs_idx[window.own_chip_start] };
+            let own_end = if window.own_chip_end >= wgs_idx.len() { srp.n_variants() } else { wgs_idx[window.own_chip_end] };
+            let cs = srp.chunk_size();
+            let first_c = own_start / cs;
+            let last_c = if own_end > 0 { (own_end - 1) / cs } else { 0 };
+            let n_total = last_c - first_c + 1;
+            chunk_preload_handle = Some(std::thread::spawn(move || {
+                // Probe first chunk to estimate size, cap preload at ~2 GB.
+                let probe = srp_clone.load_chunk_from_source(first_c);
+                let chunk_bytes = (probe.n_cols + 1) * 4 + probe.indices.len() * 4 + 12;
+                let mem_cap = 2usize * 1024 * 1024 * 1024; // 2 GB
+                let n_preload = (mem_cap / chunk_bytes.max(1)).max(16).min(n_total);
+                let n_workers = 4.min(n_preload);
+
+                let mut chunks: Vec<Option<selphi::srp::CscChunk>> = (0..n_total).map(|_| None).collect();
+                chunks[0] = Some(probe); // reuse probed chunk
+                if n_preload <= 1 { return chunks; }
+                if n_workers <= 1 {
+                    for i in 1..n_preload { chunks[i] = Some(srp_clone.load_chunk_from_source(first_c + i)); }
+                } else {
+                    let chunks_ptr = chunks.as_mut_ptr();
+                    std::thread::scope(|s| {
+                        for worker in 0..n_workers {
+                            let srp_ref = &srp_clone;
+                            let ptr = chunks_ptr as usize;
+                            s.spawn(move || {
+                                let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut Option<selphi::srp::CscChunk>, n_total) };
+                                let mut i = if worker == 0 { n_workers } else { worker }; // worker 0 skips chunk 0 (already probed)
+                                while i < n_preload {
+                                    slice[i] = Some(srp_ref.load_chunk_from_source(first_c + i));
+                                    i += n_workers;
+                                }
+                            });
+                        }
+                    });
+                }
+                chunks
+            }));
+        }
+
         // Process haplotypes in batches to limit peak memory.
         // Each batch of n_threads haps runs in parallel, then results are extracted
         // and the HMM temporaries (forward matrix etc.) are freed before the next batch.
+        let t0_hmm = Instant::now();
         let batch_size = rayon::current_num_threads().max(1);
         let mut all_weights: Vec<Vec<(usize, selphi::imputation::hmm::CsrWeights)>> = Vec::with_capacity(n_haps);
 
@@ -876,21 +924,11 @@ fn main() {
                         )
                     };
                     let n_cand = candidates.len();
-                    if n_cand < 100 {
-                        let fwd = selphi::imputation::pbwt::pbwt_forward_single(
-                            &alleles_w, n_var_w, m, n_ref, match_length, fl_fwd,
-                            (n_ref + tgt) as i32,
-                        );
-                        let bwd = selphi::imputation::pbwt::backward_filter_single(&fwd, n_var_w, n_ref, fl_fwd, fl_bwd);
-                        let csc = selphi::imputation::pbwt::build_csc_matrix(&bwd, n_ref, n_var_w, fl_bwd);
-                        return (tgt, selphi::imputation::hmm::calculate_weights(
-                            &csc, cm_w, &breaks_w, n_ref,
-                            est_ne as f64, p_err, Some(&ref_w), n_var_w, None,
-                            ne_w_ref, prior, 0.0,
-                        ));
-                    }
+                    // Reduced array: read ref candidates from bitmatrix, target from targ_w.
+                    // Avoids materializing full alleles_w (2GB+ at scale).
+                    let m_red = if n_cand < 100 { m } else { n_cand + 1 };
+                    let is_full = n_cand < 100;
 
-                    let m_red = n_cand + 1;
                     thread_local! {
                         static TL_RED: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
                     }
@@ -900,11 +938,51 @@ fn main() {
                         if b.capacity() >= needed { b.clear(); b.resize(needed, 0u8); std::mem::take(&mut *b) }
                         else { vec![0u8; needed] }
                     });
+
+                    if is_full {
+                        // Rare: n_cand < 100, need full ref+target array.
+                        // Build from bitmatrix (cheaper than alleles_w for the full panel).
+                        for var in 0..n_var_w {
+                            let ci = window.chip_start + var;
+                            let row = ref_bm_imp.row(ci);
+                            let dst_base = var * m;
+                            let ref_dst = &mut reduced[dst_base..dst_base + n_ref];
+                            for w in 0..ref_bm_imp.n_words() {
+                                let mut word = row[w];
+                                let base = w * 64;
+                                while word != 0 {
+                                    let k = word.trailing_zeros() as usize;
+                                    let r = base + k;
+                                    if r < n_ref { ref_dst[r] = 1; }
+                                    word &= word - 1;
+                                }
+                            }
+                            reduced[dst_base + n_ref..dst_base + m]
+                                .copy_from_slice(&targ_w[var * n_haps..(var + 1) * n_haps]);
+                        }
+                        let fwd = selphi::imputation::pbwt::pbwt_forward_single(
+                            &reduced, n_var_w, m, n_ref, match_length, fl_fwd,
+                            (n_ref + tgt) as i32,
+                        );
+                        let bwd = selphi::imputation::pbwt::backward_filter_single(&fwd, n_var_w, n_ref, fl_fwd, fl_bwd);
+                        let csc = selphi::imputation::pbwt::build_csc_matrix(&bwd, n_ref, n_var_w, fl_bwd);
+                        TL_RED.with(|buf| { *buf.borrow_mut() = reduced; });
+                        return (tgt, selphi::imputation::hmm::calculate_weights(
+                            &csc, cm_w, &breaks_w, n_ref,
+                            est_ne as f64, p_err, Some(&ref_w), n_var_w, None,
+                            ne_w_ref, prior, 0.0,
+                        ));
+                    }
+
+                    // Common path: build reduced array from bitmatrix + targ_w
                     for var in 0..n_var_w {
-                        let src = var * m;
+                        let ci = window.chip_start + var;
+                        let row = ref_bm_imp.row(ci);
                         let dst = var * m_red;
-                        for (i, &c) in candidates.iter().enumerate() { reduced[dst + i] = alleles_w[src + c as usize]; }
-                        reduced[dst + n_cand] = alleles_w[src + n_ref + tgt];
+                        for (i, &c) in candidates.iter().enumerate() {
+                            reduced[dst + i] = ((row[c as usize / 64] >> (c as usize % 64)) & 1) as u8;
+                        }
+                        reduced[dst + n_cand] = targ_w[var * n_haps + tgt];
                     }
 
                     thread_local! {
@@ -941,25 +1019,22 @@ fn main() {
             }
         }
 
-        drop(alleles_w);
         drop(ref_w);
-        let pbwt_hmm_secs = t0_win.elapsed().as_secs_f64();
-        let pbwt_secs = pbwt_hmm_secs;
-        let _hmm_secs = 0.0f64;
+        let hmm_secs = t0_hmm.elapsed().as_secs_f64();
+        let cpu_hmm = selphi::log::cpu_time_secs();
+        let pbwt_secs = t0_win.elapsed().as_secs_f64();
 
-        // Wait for previous window's VCF write to finish
-        if let Some(h) = vcf_write_handle.take() {
-            h.join().expect("VCF write thread panicked");
-        }
+        // Retrieve pre-loaded chunks (were decompressing during HMM).
+        let preloaded = chunk_preload_handle.take().map(|h| h.join().expect("chunk preload panicked"));
+        let cpu_preload = selphi::log::cpu_time_secs();
 
         // Wait for prefetch of this window's chunks (should already be done)
         if let Some(h) = prefetch_handle.take() {
             h.join().expect("SRP prefetch thread panicked");
         }
 
-        // Prefetch compressed chunks for this window's interpolation range.
-        // Single ZIP read → all compressed bytes in RAM → fast decompression on demand.
-        {
+        // Prefetch compressed chunks: only needed for SRP v1 (ZIP).
+        if !srp.is_v2() && (output_bcf || output_parquet || output_pgen) {
             let own_wgs_start = if window.own_chip_start == 0 { 0 } else { wgs_idx[window.own_chip_start] };
             let own_wgs_end = if window.own_chip_end >= wgs_idx.len() { srp.n_variants() } else { wgs_idx[window.own_chip_end] };
             let cs_sz = srp.chunk_size();
@@ -969,7 +1044,7 @@ fn main() {
             srp.prefetch_compressed_range(&cids);
         }
 
-        // Interpolation + output
+        // Interpolation + output (runs BEFORE waiting for previous VCF write — no dependency)
         let t0_interp = Instant::now();
         let (cs, ce, os, oe) = (window.chip_start, window.chip_end,
                                  window.own_chip_start, window.own_chip_end);
@@ -1003,19 +1078,50 @@ fn main() {
             selphi::io::pipeline::interpolate_window_to_bytes(
                 &srp, &all_weights, cs, ce, os, oe,
                 &wgs_idx, n_samples, &targ_alleles, n_haps,
-                &sample_names, no_ap,
+                &sample_names, no_ap, preloaded,
             ).expect("Interpolation failed")
         };
         let interp_secs = t0_interp.elapsed().as_secs_f64();
-        srp.clear_compressed_cache(); // Free compressed bytes after interpolation
+        srp.clear_compressed_cache();
+
+        // Wait for previous VCF write AFTER interpolation (not before).
+        // Interpolation has no dependency on previous VCF write — they operate on different data.
+        // This overlaps W(N) interpolation with W(N-1) VCF compression.
+        let t0_wait = Instant::now();
+        if let Some(h) = vcf_write_handle.take() {
+            h.join().expect("VCF write thread panicked");
+        }
+        let vcf_wait_secs = t0_wait.elapsed().as_secs_f64();
+        let cpu_wait = selphi::log::cpu_time_secs();
 
         let own_vars = window.own_chip_end - window.own_chip_start;
         let n_win = windows.len();
         let wi_log = wi + 1;
+        {
+            let cpu_end = selphi::log::cpu_time_secs();
+            let cpu_total = cpu_end - cpu0_win;
+            let wall_total = t0_win.elapsed().as_secs_f64();
+            let cpu_pct = if wall_total > 0.01 { cpu_total / wall_total / n_cores as f64 * 100.0 } else { 0.0 };
+            let cpu_extract_d = cpu_extract - cpu0_win;
+            let cpu_coded_d = cpu_coded - cpu_extract;
+            let cpu_hmm_d = cpu_hmm - cpu_coded;
+            let cpu_preload_d = cpu_preload - cpu_hmm;
+            let cpu_interp_d = cpu_wait - cpu_preload; // interp before vcf_wait now
+            let cpu_wait_d = cpu_end - cpu_wait;
+            let pct = |cpu: f64, wall: f64| -> f64 { if wall > 0.01 { cpu / wall / n_cores as f64 * 100.0 } else { 0.0 } };
+            selphi_debug!("    W{}/{} extract={:.2}s({:.0}%) coded={:.2}s({:.0}%) hmm={:.2}s({:.0}%) interp={:.2}s({:.0}%) vcf_wait={:.2}s | total {:.0}% cpu",
+                wi_log, n_win,
+                extract_secs, pct(cpu_extract_d, extract_secs),
+                coded_secs, pct(cpu_coded_d, coded_secs),
+                hmm_secs, pct(cpu_hmm_d, hmm_secs),
+                interp_secs, pct(cpu_interp_d, interp_secs),
+                vcf_wait_secs,
+                cpu_pct);
+        }
         selphi_info!("    Window {}/{}: PBWT={:.1}s interp={:.1}s ({} vars)",
             wi_log, n_win, pbwt_secs, interp_secs, n_var_w);
 
-        // VCF write: send pre-computed bytes in background (fast, I/O only)
+        // VCF write: send pre-computed bytes in background
         let vcf_tx_clone = vcf_tx.clone();
         vcf_write_handle = Some(std::thread::spawn(move || {
             let t0_vcf = Instant::now();

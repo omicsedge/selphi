@@ -63,6 +63,34 @@ pub fn elapsed_secs() -> f64 {
     LOGGER.lock().unwrap().start.elapsed().as_secs_f64()
 }
 
+/// Total CPU time (user+system, all threads) in seconds.
+/// Reads from /proc/self/stat (fields 14+15 = utime+stime in clock ticks).
+pub fn cpu_time_secs() -> f64 {
+    if let Ok(stat) = std::fs::read_to_string("/proc/self/stat") {
+        // Fields are space-separated. Field 14 = utime, 15 = stime (1-indexed).
+        // But field 2 (comm) can contain spaces in parens, so find closing paren first.
+        if let Some(pos) = stat.rfind(')') {
+            let rest = &stat[pos + 2..]; // skip ") "
+            let fields: Vec<&str> = rest.split_whitespace().collect();
+            // Fields after comm: state(0), ppid(1), ..., utime(11), stime(12)
+            if fields.len() > 12 {
+                let utime: u64 = fields[11].parse().unwrap_or(0);
+                let stime: u64 = fields[12].parse().unwrap_or(0);
+                let ticks_per_sec = 100.0; // sysconf(_SC_CLK_TCK), almost always 100 on Linux
+                return (utime + stime) as f64 / ticks_per_sec;
+            }
+        }
+    }
+    0.0
+}
+
+/// Format CPU utilization: "X.Xs cpu (YY% of N cores)"
+pub fn fmt_cpu(wall_secs: f64, cpu_start: f64, n_cores: usize) -> String {
+    let cpu_delta = cpu_time_secs() - cpu_start;
+    let pct = if wall_secs > 0.01 { cpu_delta / wall_secs / n_cores as f64 * 100.0 } else { 0.0 };
+    format!("{:.1}s cpu ({:.0}% of {} cores)", cpu_delta, pct, n_cores)
+}
+
 /// Peak resident set size in MB (Linux /proc/self/status).
 pub fn peak_mem_mb() -> f64 {
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {

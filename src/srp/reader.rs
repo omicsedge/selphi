@@ -151,6 +151,7 @@ impl SrpReader {
     pub fn n_chunks(&self) -> usize { self.metadata.n_chunks }
     pub fn chunk_size(&self) -> usize { self.metadata.chunk_size }
     pub fn chromosome(&self) -> &str { &self.metadata.chromosome }
+    pub fn is_v2(&self) -> bool { self.v2_mmap.is_some() }
 
     pub fn get_chunk_compressed_sizes(&self) -> Vec<f64> {
         let file = File::open(&self.filepath).unwrap();
@@ -229,7 +230,7 @@ impl SrpReader {
         arc
     }
 
-    pub(crate) fn load_chunk_from_source(&self, chunk_id: usize) -> CscChunk {
+    pub fn load_chunk_from_source(&self, chunk_id: usize) -> CscChunk {
         // Fast path: SRP v2 mmap — direct read from memory-mapped file, no lock
         if let Some(ref mmap) = self.v2_mmap {
             if chunk_id < self.v2_chunk_index.len() {
@@ -428,49 +429,56 @@ impl SrpReader {
             chunk_groups.sort_by_key(|(id, _)| *id);
         }
 
-        // Parallel: decompress all needed chunks, then process in parallel
-        // Two-phase avoids Mutex contention during decompression
+        // Sliding decompress: process chunks in batches to cap peak memory.
+        // Each batch decompresses N chunks, scatters into bitmatrix, then drops
+        // before the next batch. Bitmatrix writes are non-overlapping (per chip_i).
         let bits_base = bits.as_mut_ptr() as usize;
         let bits_len = bits.len();
 
         use rayon::prelude::*;
 
-        // Phase 1: parallel decompression (clone compressed bytes, release lock, decompress)
-        let chunks_with_indices: Vec<(CscChunk, Vec<(usize, usize)>)> = chunk_groups
-            .into_par_iter()
-            .map(|(chunk_id, indices)| {
-                let chunk = self.load_chunk_from_source(chunk_id);
-                (chunk, indices)
-            })
-            .collect();
+        // ~8 GB cap: typical chunk ~20 MB decompressed → 400 chunks/batch
+        const CHUNK_BATCH: usize = 400;
 
-        // Phase 2: parallel scatter into bitmatrix (no locks, just memory writes)
-        chunks_with_indices.par_iter().for_each(|(chunk, indices)| {
-            let max_row = indices.iter().map(|&(_, r)| r).max().unwrap_or(0);
-            let mut row_map = vec![-1i32; max_row + 1];
-            for &(chip_i, local_row) in indices {
-                row_map[local_row] = chip_i as i32;
-            }
+        for batch in chunk_groups.chunks(CHUNK_BATCH) {
+            // Phase 1: parallel decompression
+            let batch_chunks: Vec<(CscChunk, &Vec<(usize, usize)>)> = batch
+                .par_iter()
+                .map(|(chunk_id, indices)| {
+                    let chunk = self.load_chunk_from_source(*chunk_id);
+                    (chunk, indices)
+                })
+                .collect();
 
-            let bits_slice = unsafe { std::slice::from_raw_parts_mut(bits_base as *mut u64, bits_len) };
+            // Phase 2: parallel scatter into bitmatrix
+            batch_chunks.par_iter().for_each(|(chunk, indices)| {
+                let indices = *indices;
+                let max_row = indices.iter().map(|&(_, r)| r).max().unwrap_or(0);
+                let mut row_map = vec![-1i32; max_row + 1];
+                for &(chip_i, local_row) in indices {
+                    row_map[local_row] = chip_i as i32;
+                }
 
-            for col in 0..n_haps {
-                let word_idx = col / 64;
-                let bit = 1u64 << (col % 64);
-                let cs = chunk.indptr[col] as usize;
-                let ce = chunk.indptr[col + 1] as usize;
-                for k in cs..ce {
-                    let row = chunk.indices[k] as usize;
-                    if row <= max_row {
-                        let chip_i = row_map[row];
-                        if chip_i >= 0 {
-                            bits_slice[chip_i as usize * n_words + word_idx] |= bit;
+                let bits_slice = unsafe { std::slice::from_raw_parts_mut(bits_base as *mut u64, bits_len) };
+
+                for col in 0..n_haps {
+                    let word_idx = col / 64;
+                    let bit = 1u64 << (col % 64);
+                    let cs = chunk.indptr[col] as usize;
+                    let ce = chunk.indptr[col + 1] as usize;
+                    for k in cs..ce {
+                        let row = chunk.indices[k] as usize;
+                        if row <= max_row {
+                            let chip_i = row_map[row];
+                            if chip_i >= 0 {
+                                bits_slice[chip_i as usize * n_words + word_idx] |= bit;
+                            }
                         }
                     }
                 }
-            }
-        });
-        // All chunks dropped after this scope
+            });
+            // batch_chunks dropped — decompressed memory freed before next batch
+        }
 
         crate::common::HaplotypeBitmatrix::from_raw(bits, n_chip, n_haps)
     }

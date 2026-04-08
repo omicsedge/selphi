@@ -9,7 +9,7 @@
 use std::io::{Write, BufWriter};
 use std::path::Path;
 use std::sync::Arc;
-use std::collections::HashMap;
+
 
 use rayon::prelude::*;
 
@@ -91,7 +91,7 @@ pub fn setup_vcf_writer(
     };
 
     let out_file = std::fs::File::create(&vcf_path)?;
-    let bgzip_threads = 8.min(n_samples.max(1));
+    let bgzip_threads = 16.min(n_samples.max(1));
     let bgzf_writer = noodles_bgzf::io::multithreaded_writer::Builder::default()
         .set_worker_count(std::num::NonZeroUsize::new(bgzip_threads).unwrap())
         .build_from_writer(out_file);
@@ -99,7 +99,7 @@ pub fn setup_vcf_writer(
     let tbi_path = { let mut p = vcf_path.as_os_str().to_owned(); p.push(".tbi"); std::path::PathBuf::from(p) };
     let vcf_path_clone = vcf_path.clone();
 
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
     let writer_handle = std::thread::spawn(move || -> std::io::Result<()> {
         let mut writer = BufWriter::with_capacity(4 << 20, bgzf_writer);
         // Collect record metadata for post-write index building
@@ -189,6 +189,7 @@ pub fn write_window_to_vcf(
     _n_haps_total: usize,
     _sample_names: &[String],
     no_ap: bool,
+    preloaded_chunks: Option<Vec<Option<crate::srp::CscChunk>>>,
 ) -> std::io::Result<()> {
     let n_haps = n_samples * 2;
     let n_ref_variants = srp.n_variants();
@@ -284,7 +285,16 @@ pub fn write_window_to_vcf(
     let mut _t_interp = 0.0f64;
     let mut _t_format = 0.0f64;
     let mut _t_send = 0.0f64;
+    let mut _t_chip = 0.0f64;
+    let mut _t_setup = 0.0f64;
+    let mut _cpu_chunk_load = 0.0f64;
+    let mut _cpu_tiles = 0.0f64;
     let mut _n_intervals = 0usize;
+    let cpu0_pipeline = crate::log::cpu_time_secs();
+    let n_cores = rayon::current_num_threads();
+    let t0_pipeline_setup = std::time::Instant::now();
+
+    _t_setup = t0_pipeline_setup.elapsed().as_secs_f64();
 
     // Sliding-window chunk loading: decompress chunks in batches, not all at once.
     // Each batch covers a range of genomic positions. Intervals are processed in order,
@@ -294,25 +304,64 @@ pub fn write_window_to_vcf(
     let window_last_chunk = if own_wgs_end > 0 { (own_wgs_end - 1) / chunk_size } else { 0 };
     let total_chunks = window_last_chunk - window_first_chunk + 1;
 
-    // Batch size: cap decompressed memory at ~8 GB (adaptive to chunk size)
-    // Typical chunk: ~16 MB decompressed → 8 GB / 16 MB = 500 chunks
-    let max_chunk_batch = 500usize.min(total_chunks);
-    let mut chunk_cache: HashMap<usize, crate::srp::CscChunk> = HashMap::with_capacity(max_chunk_batch);
+    // Memory-bounded chunk streaming: cap decompressed chunks at ~2 GB.
+    // Chunk size varies by panel (74 MB for TOPMed 171K, ~2 MB for 1KG 4.8K).
+    // Batch must be large enough for rayon parallelism (≥16).
+    // Actual cap calculated from first chunk after decompression.
+    let mem_cap_bytes: usize = 2 * 1024 * 1024 * 1024; // 2 GB
+    let max_chunk_batch = total_chunks.min(500); // initial guess, refined below
+    // Vec-indexed chunk cache: O(1) lookup by chunk_id - window_first_chunk.
+    // Eliminates per-interval HashMap rebuild (was 11873× HashMap::collect).
+    let mut chunk_cache: Vec<Option<crate::srp::CscChunk>>;
     let mut cache_low: usize = window_first_chunk;
-    let mut cache_high: usize = window_first_chunk;
+    let mut cache_high: usize;
 
-    // Preload first batch
-    let first_batch_end = (window_first_chunk + max_chunk_batch).min(window_last_chunk + 1);
-    let first_ids: Vec<usize> = (window_first_chunk..first_batch_end).collect();
-    let first_chunks: Vec<(usize, crate::srp::CscChunk)> = first_ids.par_iter()
-        .map(|&cid| (cid, srp.load_chunk_from_source(cid)))
-        .collect();
-    for (cid, chunk) in first_chunks { chunk_cache.insert(cid, chunk); }
-    cache_high = first_batch_end;
+    // Adaptive batch size from actual chunk memory.
+    // Pipeline loads/evicts in sliding window — peak = ~2× batch size.
+    let chunk_mem_bytes = {
+        let probe = srp.load_chunk_from_source(window_first_chunk);
+        let mem = (probe.n_cols + 1) * 4 + probe.indices.len() * 4 + 12;
+        mem.max(1)
+    };
+    // Fit batch within memory cap, but at least 100 for good rayon parallelism.
+    let adaptive_batch = (mem_cap_bytes / chunk_mem_bytes).max(100).min(total_chunks);
+
+    if let Some(pre) = preloaded_chunks {
+        let n_preloaded = pre.iter().take_while(|c| c.is_some()).count();
+        chunk_cache = pre;
+        cache_high = window_first_chunk + n_preloaded;
+        // Load next adaptive batch in parallel (from where preload ended).
+        let next_end = (cache_high + adaptive_batch).min(window_last_chunk + 1);
+        if next_end > cache_high {
+            let batch_ids: Vec<usize> = (cache_high..next_end)
+                .filter(|id| chunk_cache[id - window_first_chunk].is_none())
+                .collect();
+            if !batch_ids.is_empty() {
+                let batch: Vec<(usize, crate::srp::CscChunk)> = batch_ids.par_iter()
+                    .map(|&cid| (cid, srp.load_chunk_from_source(cid)))
+                    .collect();
+                for (cid, chunk) in batch { chunk_cache[cid - window_first_chunk] = Some(chunk); }
+            }
+            cache_high = next_end;
+        }
+    } else {
+        chunk_cache = (0..total_chunks).map(|_| None).collect();
+        let first_batch_end = (window_first_chunk + adaptive_batch).min(window_last_chunk + 1);
+        let first_ids: Vec<usize> = (window_first_chunk..first_batch_end).collect();
+        let first_chunks: Vec<(usize, crate::srp::CscChunk)> = first_ids.par_iter()
+            .map(|&cid| (cid, srp.load_chunk_from_source(cid)))
+            .collect();
+        for (cid, chunk) in first_chunks { chunk_cache[cid - window_first_chunk] = Some(chunk); }
+        cache_high = first_batch_end;
+    }
+    crate::selphi_debug!("  [chunks] size={:.1}MB batch={} of {} total, preloaded to {}",
+        chunk_mem_bytes as f64 / 1e6, adaptive_batch, total_chunks, cache_high - window_first_chunk);
     _t_chunk_load = t0_preload.elapsed().as_secs_f64();
+    _cpu_chunk_load = crate::log::cpu_time_secs() - cpu0_pipeline;
 
     for interval in &intervals {
         // Write chip sites before this interval
+        let t0_chip = std::time::Instant::now();
         while next_wgs < interval.wgs_start {
             if is_chip[next_wgs] {
                 let vp_idx = next_wgs - own_wgs_start;
@@ -322,6 +371,7 @@ pub fn write_window_to_vcf(
             }
             next_wgs += 1;
         }
+        _t_chip += t0_chip.elapsed().as_secs_f64();
 
         let n_total_vars = interval.wgs_end - interval.wgs_start;
         if n_total_vars == 0 { continue; }
@@ -343,42 +393,45 @@ pub fn write_window_to_vcf(
         // Ensure chunks for this interval are loaded (advance sliding window)
         let iv_first = interval.wgs_start / chunk_size;
         let iv_last = if interval.wgs_end > 0 { (interval.wgs_end - 1) / chunk_size } else { iv_first };
-        let mut cache_changed = false;
 
+        // Evict old chunks (always, even with preloaded data) to cap memory.
+        let evict_below = iv_first.saturating_sub(1);
+        if evict_below > cache_low {
+            for cid in cache_low..evict_below { chunk_cache[cid - window_first_chunk] = None; }
+            cache_low = evict_below;
+        }
+
+        // Load new chunks in parallel batches (adaptive_batch at a time for rayon parallelism).
         if iv_last >= cache_high {
-            let new_high = (iv_last + 1).min(window_last_chunk + 1);
-            let load_ids: Vec<usize> = (cache_high..new_high).filter(|id| !chunk_cache.contains_key(id)).collect();
+            let new_high = (cache_high + adaptive_batch).min(window_last_chunk + 1);
+            let load_ids: Vec<usize> = (cache_high..new_high)
+                .filter(|id| chunk_cache[id - window_first_chunk].is_none())
+                .collect();
             if !load_ids.is_empty() {
                 let t0 = std::time::Instant::now();
+                let cpu0 = crate::log::cpu_time_secs();
                 let new_chunks: Vec<(usize, crate::srp::CscChunk)> = load_ids.par_iter()
                     .map(|&cid| (cid, srp.load_chunk_from_source(cid)))
                     .collect();
-                for (cid, chunk) in new_chunks { chunk_cache.insert(cid, chunk); }
+                for (cid, chunk) in new_chunks { chunk_cache[cid - window_first_chunk] = Some(chunk); }
                 _t_chunk_load += t0.elapsed().as_secs_f64();
-                cache_changed = true;
+                _cpu_chunk_load += crate::log::cpu_time_secs() - cpu0;
             }
             cache_high = new_high;
-            let evict_below = iv_first.saturating_sub(1);
-            if evict_below > cache_low {
-                for cid in cache_low..evict_below { chunk_cache.remove(&cid); }
-                cache_low = evict_below;
-                cache_changed = true;
-            }
         }
 
-        let chunk_map_ref: HashMap<usize, &crate::srp::CscChunk> = chunk_cache.iter()
-            .map(|(&cid, chunk)| (cid, chunk)).collect();
-
         // Parallel tile computation: interpolation + formatting
+        // No HashMap rebuild — Vec-indexed O(1) chunk lookup directly.
         use rayon::prelude::*;
         let t0_tiles = std::time::Instant::now();
+        let cpu0_tiles = crate::log::cpu_time_secs();
         let tile_bufs: Vec<Vec<u8>> = tile_descs.par_iter().map(|&(ts, tile_n, global_start)| {
             let t: Vec<f32> = (0..tile_n)
                 .map(|v| (ts + v) as f32 / full_range)
                 .collect();
 
             let alt_probs = interpolate_tile_preloaded(
-                &chunk_map_ref, &weight_refs, interval.weight_s, interval.weight_e,
+                &chunk_cache, window_first_chunk, &weight_refs, interval.weight_s, interval.weight_e,
                 global_start, tile_n, &t, n_haps, chunk_size,
             );
 
@@ -391,6 +444,7 @@ pub fn write_window_to_vcf(
             )
         }).collect();
         _t_interp += t0_tiles.elapsed().as_secs_f64();
+        _cpu_tiles += crate::log::cpu_time_secs() - cpu0_tiles;
 
         // Send tiles in order
         let t0_send = std::time::Instant::now();
@@ -401,8 +455,12 @@ pub fn write_window_to_vcf(
         next_wgs = interval.wgs_end;
     }
 
-    crate::selphi_debug!("  [interp] {} intervals: chunk_load={:.1}s tiles(interp+fmt)={:.1}s send={:.1}s",
-        _n_intervals, _t_chunk_load, _t_interp, _t_send);
+    {
+        let pct = |cpu: f64, wall: f64| -> f64 { if wall > 0.01 { cpu / wall / n_cores as f64 * 100.0 } else { 0.0 } };
+        crate::selphi_debug!("  [interp] {} intervals: setup={:.2}s chunk_load={:.1}s({:.0}%cpu) chip={:.2}s tiles={:.1}s({:.0}%cpu) send={:.1}s",
+            _n_intervals, _t_setup, _t_chunk_load, pct(_cpu_chunk_load, _t_chunk_load),
+            _t_chip, _t_interp, pct(_cpu_tiles, _t_interp), _t_send);
+    }
 
     // Write remaining chip sites in owned range
     while next_wgs < own_wgs_end {
@@ -430,6 +488,7 @@ pub fn interpolate_window_to_bytes(
     wgs_idx: &[usize], n_samples: usize,
     chip_genotypes: &[u8], n_haps_total: usize,
     sample_names: &[String], no_ap: bool,
+    preloaded_chunks: Option<Vec<Option<crate::srp::CscChunk>>>,
 ) -> std::io::Result<Vec<Vec<u8>>> {
     // Create a sync channel that collects into a Vec
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
@@ -445,6 +504,7 @@ pub fn interpolate_window_to_bytes(
         &tx, srp, all_weights, win_chip_start, win_chip_end,
         own_chip_start, own_chip_end, wgs_idx, n_samples,
         chip_genotypes, n_haps_total, sample_names, no_ap,
+        preloaded_chunks,
     )?;
     drop(tx);
     Ok(collect_handle.join().unwrap())
@@ -1051,7 +1111,7 @@ pub fn setup_bcf_writer(
     };
 
     let out_file = std::fs::File::create(&bcf_path)?;
-    let bgzip_threads = 8.min(n_samples.max(1));
+    let bgzip_threads = 16.min(n_samples.max(1));
     let bgzf_writer = noodles_bgzf::io::multithreaded_writer::Builder::default()
         .set_worker_count(std::num::NonZeroUsize::new(bgzip_threads).unwrap())
         .build_from_writer(out_file);
@@ -1059,7 +1119,7 @@ pub fn setup_bcf_writer(
     let csi_path = { let mut p = bcf_path.as_os_str().to_owned(); p.push(".csi"); std::path::PathBuf::from(p) };
     let bcf_path_clone = bcf_path.clone();
 
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
     let writer_handle = std::thread::spawn(move || -> std::io::Result<()> {
         let mut writer = BufWriter::with_capacity(4 << 20, bgzf_writer);
         for buf in rx {
@@ -1286,15 +1346,43 @@ fn interpolate_tile(
 ) -> Vec<f32> {
     let first_chunk = global_start / chunk_size;
     let last_chunk = (global_start + tile_n - 1) / chunk_size;
-    let chunks: Vec<(usize, Arc<crate::srp::CscChunk>)> = (first_chunk..=last_chunk)
-        .map(|cid| (cid, srp.load_chunk(cid)))
+    let arcs: Vec<Arc<crate::srp::CscChunk>> = (first_chunk..=last_chunk)
+        .map(|cid| srp.load_chunk(cid))
         .collect();
-    let map: HashMap<usize, &crate::srp::CscChunk> = chunks.iter().map(|(id, a)| (*id, a.as_ref())).collect();
-    interpolate_tile_preloaded(&map, weights, chip_s, chip_e, global_start, tile_n, t, n_haps, chunk_size)
+    let mut alt_probs = vec![0.0f32; n_haps * tile_n];
+
+    if first_chunk == last_chunk {
+        let chunk = arcs[0].as_ref();
+        let row_offset = global_start - first_chunk * chunk_size;
+        interp_kernel(weights, chip_s, chip_e, chunk, row_offset, tile_n, t, &mut alt_probs, n_haps);
+    } else {
+        let mut tile_offset = 0;
+        for (i, sid) in (first_chunk..=last_chunk).enumerate() {
+            let chunk = arcs[i].as_ref();
+            let chunk_start = sid * chunk_size;
+            let chunk_end = chunk_start + chunk.n_rows;
+            let ov_start = global_start.max(chunk_start);
+            let ov_end = (global_start + tile_n).min(chunk_end);
+            let ov_n = ov_end - ov_start;
+            if ov_n == 0 { continue; }
+            let row_offset = ov_start - chunk_start;
+            let t_start = tile_offset;
+            let mut sub = vec![0.0f32; n_haps * ov_n];
+            interp_kernel(weights, chip_s, chip_e, chunk, row_offset, ov_n, &t[t_start..t_start+ov_n], &mut sub, n_haps);
+            for h in 0..n_haps {
+                for v in 0..ov_n {
+                    alt_probs[h * tile_n + tile_offset + v] = sub[h * ov_n + v];
+                }
+            }
+            tile_offset += ov_n;
+        }
+    }
+    alt_probs
 }
 
 fn interpolate_tile_preloaded(
-    chunk_map: &HashMap<usize, &crate::srp::CscChunk>,
+    chunk_cache: &[Option<crate::srp::CscChunk>],
+    chunk_base: usize,
     weights: &[&CsrWeights],
     chip_s: usize,
     chip_e: usize,
@@ -1310,13 +1398,13 @@ fn interpolate_tile_preloaded(
     let last_chunk = (global_start + tile_n - 1) / chunk_size;
 
     if first_chunk == last_chunk {
-        let chunk = chunk_map[&first_chunk];
+        let chunk = chunk_cache[first_chunk - chunk_base].as_ref().unwrap();
         let row_offset = global_start - first_chunk * chunk_size;
         interp_kernel(weights, chip_s, chip_e, chunk, row_offset, tile_n, t, &mut alt_probs, n_haps);
     } else {
         let mut tile_offset = 0;
         for sid in first_chunk..=last_chunk {
-            let chunk = chunk_map[&sid];
+            let chunk = chunk_cache[sid - chunk_base].as_ref().unwrap();
             let chunk_start = sid * chunk_size;
             let chunk_end = chunk_start + chunk.n_rows;
             let ov_start = global_start.max(chunk_start);

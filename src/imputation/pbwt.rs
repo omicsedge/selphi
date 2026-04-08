@@ -899,6 +899,109 @@ pub fn build_coded_steps(
     CodedSteps { starts, step_groups, hap_group }
 }
 
+/// Build coded steps directly from bitmatrix (ref) + target array (no alleles_w needed).
+/// Ref alleles read 64-at-a-time from bitmatrix words. Target from dense array.
+/// Saves ~2GB allocation for TOPMed-scale panels.
+pub fn build_coded_steps_bm(
+    bm: &crate::common::HaplotypeBitmatrix,
+    chip_start: usize,
+    n_var: usize,
+    n_ref: usize,
+    targ: &[u8],       // (n_var, n_haps) row-major
+    n_haps: usize,
+    chip_cm: &[f64],
+    step_cm: f64,
+) -> CodedSteps {
+    let m = n_ref + n_haps;
+
+    let mut starts = Vec::new();
+    if n_var == 0 || chip_cm.is_empty() {
+        return CodedSteps { starts: vec![0], step_groups: vec![], hap_group: vec![] };
+    }
+
+    let mut next_pos = chip_cm[0] + step_cm / 2.0;
+    starts.push(0);
+    for i in 1..n_var {
+        if chip_cm[i] >= next_pos {
+            starts.push(i);
+            next_pos = chip_cm[i] + step_cm;
+        }
+    }
+    starts.push(n_var);
+
+    let n_steps = starts.len() - 1;
+    let n_words = bm.n_words();
+
+    // Parallel: each step is independent (encode + group)
+    let results: Vec<(Vec<Vec<u32>>, Vec<u32>)> = (0..n_steps).into_par_iter().map(|s| {
+        let var_start = starts[s];
+        let var_end = starts[s + 1];
+        let step_len = var_end - var_start;
+
+        let mut codes = vec![0u64; m];
+        if step_len <= 40 {
+            for var in var_start..var_end {
+                let ci = chip_start + var;
+                let row = bm.row(ci);
+                for w in 0..n_words {
+                    let word = row[w];
+                    let base = w * 64;
+                    let end = (base + 64).min(n_ref);
+                    if base >= n_ref { break; }
+                    for bit in 0..(end - base) {
+                        codes[base + bit] = codes[base + bit] * 2 + ((word >> bit) & 1);
+                    }
+                }
+                let trow = &targ[var * n_haps..(var + 1) * n_haps];
+                for t in 0..n_haps {
+                    codes[n_ref + t] = codes[n_ref + t] * 2 + trow[t] as u64;
+                }
+            }
+        } else {
+            for h in 0..m { codes[h] = 0xcbf29ce484222325; }
+            for var in var_start..var_end {
+                let ci = chip_start + var;
+                let row = bm.row(ci);
+                for w in 0..n_words {
+                    let word = row[w];
+                    let base = w * 64;
+                    let end = (base + 64).min(n_ref);
+                    if base >= n_ref { break; }
+                    for bit in 0..(end - base) {
+                        codes[base + bit] ^= (word >> bit) & 1;
+                        codes[base + bit] = codes[base + bit].wrapping_mul(0x100000001b3);
+                    }
+                }
+                let trow = &targ[var * n_haps..(var + 1) * n_haps];
+                for t in 0..n_haps {
+                    codes[n_ref + t] ^= trow[t] as u64;
+                    codes[n_ref + t] = codes[n_ref + t].wrapping_mul(0x100000001b3);
+                }
+            }
+        }
+
+        let mut code_to_group: HashMap<u64, u32> = HashMap::new();
+        let mut groups: Vec<Vec<u32>> = Vec::new();
+        let mut hg = vec![0u32; m];
+        for h in 0..m {
+            let gid = match code_to_group.get(&codes[h]) {
+                Some(&g) => { groups[g as usize].push(h as u32); g }
+                None => {
+                    let g = groups.len() as u32;
+                    code_to_group.insert(codes[h], g);
+                    groups.push(vec![h as u32]);
+                    g
+                }
+            };
+            hg[h] = gid;
+        }
+        (groups, hg)
+    }).collect();
+
+    let (step_groups, hap_group): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+    CodedSteps { starts, step_groups, hap_group }
+}
+
 /// Select candidate reference haplotypes for a target using CodedSteps partitions.
 ///
 /// Iterates ALL steps, collecting ref haps that share a partition with the target
