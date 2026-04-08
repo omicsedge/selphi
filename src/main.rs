@@ -328,9 +328,14 @@ fn main() {
     }
 
     if let Some(ref source) = args.prepare_reference_from {
-        // Output: use --out if given, otherwise derive from source name (.bcf → .srp)
-        let auto_output = Path::new(source).with_extension("srp").to_string_lossy().to_string();
+        let is_srp_input = source.ends_with(".srp");
+        let auto_output = if is_srp_input {
+            Path::new(source).with_extension("bref3").to_string_lossy().to_string()
+        } else {
+            Path::new(source).with_extension("srp").to_string_lossy().to_string()
+        };
         let output = args.out.as_deref().unwrap_or(&auto_output);
+        let output_bref3 = output.ends_with(".bref3") || is_srp_input;
 
         let log_path = PathBuf::from(output).with_extension("log");
         selphi::log::init(&log_path, args.debug);
@@ -338,13 +343,14 @@ fn main() {
         let version = env!("CARGO_PKG_VERSION");
         selphi::log::print_banner(version);
 
-        // Auto-detect source format
         let is_bref3 = source.ends_with(".bref3");
-        let format_name = if is_bref3 { "BREF3" }
+        let format_name = if is_srp_input { "SRP" }
+            else if is_bref3 { "BREF3" }
             else if source.ends_with(".bcf") { "BCF" }
             else { "VCF" };
 
-        selphi_info!("  mode:     prepare-reference");
+        let mode = if output_bref3 { "export-bref3" } else { "prepare-reference" };
+        selphi_info!("  mode:     {}", mode);
         selphi_info!("  source:   {} ({})", source, format_name);
         selphi_info!("  output:   {}", output);
         selphi_info!("  threads:  {}", args.threads);
@@ -358,25 +364,21 @@ fn main() {
             .build_global()
             .ok();
 
-        let result = if is_bref3 {
-            selphi::srp::writer::build_srp_from_bref3(
-                Path::new(source),
-                Path::new(output),
-                args.threads,
-                args.chunk_size,
-            )
+        if output_bref3 {
+            // Direct BCF/VCF → BREF3 (no intermediate SRP)
+            selphi_step!("Writing BREF3...");
+            selphi::srp::bref3_writer::write_bref3_from_bcf(Path::new(source), Path::new(output))
+                .unwrap_or_else(|e| { selphi_error!("BREF3 write failed: {}", e); std::process::exit(1); });
         } else {
-            selphi::srp::writer::build_srp(
-                Path::new(source),
-                Path::new(output),
-                args.threads,
-                args.chunk_size,
-            )
-        };
-        result.unwrap_or_else(|e| {
-            selphi_error!("{}", e);
-            std::process::exit(1);
-        });
+            let result = if is_bref3 {
+                selphi::srp::writer::build_srp_from_bref3(
+                    Path::new(source), Path::new(output), args.threads, args.chunk_size)
+            } else {
+                selphi::srp::writer::build_srp(
+                    Path::new(source), Path::new(output), args.threads, args.chunk_size)
+            };
+            result.unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
+        }
 
         let total = start_time.elapsed().as_secs_f64();
         let mem = selphi::log::peak_mem_mb();

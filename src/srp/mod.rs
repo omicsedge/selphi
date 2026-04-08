@@ -17,6 +17,7 @@
 mod reader;
 pub mod writer;
 pub mod bref3;
+pub mod bref3_writer;
 pub mod bcf_reader;
 pub mod csi;
 pub use reader::SrpReader;
