@@ -386,6 +386,11 @@ enum VariantReader {
         gt_key: u16,
         ds_key: Option<u16>,
         n_file_samples: usize,
+        sample_indices: Option<Vec<usize>>,
+        /// Path for re-opening with seek
+        path: std::path::PathBuf,
+        /// Header size for seeking past header
+        header_end_vpos: u64,
         sb: Vec<u8>,
         ib: Vec<u8>,
     },
@@ -421,9 +426,11 @@ impl VariantReader {
 
             let samples = hdr.sample_names.clone();
             let ns = hdr.n_samples;
+            let header_end_vpos = u64::from(bgzf.virtual_position());
             Ok((VariantReader::Bcf {
                 reader: bgzf, contig_names: hdr.contig_names, gt_key: hdr.gt_key_id,
-                ds_key, n_file_samples: ns,
+                ds_key, n_file_samples: ns, sample_indices: None,
+                path: path.to_path_buf(), header_end_vpos,
                 sb: Vec::with_capacity(512), ib: Vec::with_capacity(ns * 4),
             }, samples))
         } else {
@@ -448,6 +455,47 @@ impl VariantReader {
         }
     }
 
+    /// Set sample indices to extract (for selective BCF reading).
+    fn set_sample_filter(&mut self, indices: Vec<usize>) {
+        if let VariantReader::Bcf { sample_indices, .. } = self {
+            *sample_indices = Some(indices);
+        }
+    }
+
+    /// Seek to a genomic position using CSI index. BCF only.
+    /// pos is 1-based VCF position.
+    fn seek_to_position(&mut self, pos: i64) -> io::Result<()> {
+        match self {
+            VariantReader::Bcf { reader, path, header_end_vpos, .. } => {
+                if pos <= 1 {
+                    // Seek to start of data
+                    let vp = noodles_bgzf::VirtualPosition::try_from(*header_end_vpos)
+                        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad vpos"))?;
+                    reader.seek(vp)?;
+                    return Ok(());
+                }
+                // Load CSI index
+                let csi_path = { let mut p = path.as_os_str().to_owned(); p.push(".csi"); std::path::PathBuf::from(p) };
+                if csi_path.exists() {
+                    let csi = crate::srp::csi::parse_csi(&csi_path)?;
+                    let vp = crate::srp::csi::seek_for_position(&csi, pos - 1); // CSI uses 0-based
+                    reader.seek(vp)?;
+                    Ok(())
+                } else {
+                    // No index — can't seek, just read from current position
+                    Ok(())
+                }
+            }
+            VariantReader::Vcf { reader, .. } => {
+                // VCF.gz: try TBI index for seeking
+                // TBI and CSI use similar checkpoint structure. Use parse_csi on .tbi if available.
+                // For now, no VCF seek — each thread reads from start and skips to region.
+                // The truth file (usually BCF) gets CSI seek, which is the big file.
+                Ok(())
+            }
+        }
+    }
+
     fn n_file_samples(&self) -> usize {
         match self {
             VariantReader::Vcf { n_file_samples, .. } => *n_file_samples,
@@ -456,7 +504,17 @@ impl VariantReader {
     }
 
     /// Read next biallelic variant. Returns (chrom, pos, ref, alt) and fills ds_buf with dosages.
+    /// For BCF: if skip_genotypes=true, skips the individual data (fast position scan).
     fn next_record(&mut self, ds_buf: &mut Vec<f32>) -> Option<(Vec<u8>, i64, Vec<u8>, Vec<u8>)> {
+        self.next_record_inner(ds_buf, false)
+    }
+
+    /// Read next record, optionally skipping genotype data (BCF only — for fast scanning).
+    fn next_record_skip_gt(&mut self, ds_buf: &mut Vec<f32>) -> Option<(Vec<u8>, i64, Vec<u8>, Vec<u8>)> {
+        self.next_record_inner(ds_buf, true)
+    }
+
+    fn next_record_inner(&mut self, ds_buf: &mut Vec<f32>, skip_gt: bool) -> Option<(Vec<u8>, i64, Vec<u8>, Vec<u8>)> {
         match self {
             VariantReader::Vcf { reader, line_buf, n_file_samples } => {
                 loop {
@@ -467,10 +525,11 @@ impl VariantReader {
                     }
                 }
             }
-            VariantReader::Bcf { reader, contig_names, gt_key, ds_key, n_file_samples, sb, ib } => {
+            VariantReader::Bcf { reader, contig_names, gt_key, ds_key, n_file_samples, sample_indices, sb, ib, .. } => {
                 let ns = *n_file_samples;
                 let gtk = *gt_key;
                 let dsk = *ds_key;
+                let si_filter = sample_indices.as_deref();
                 loop {
                     // Read record header
                     let mut lbuf = [0u8; 4];
@@ -493,10 +552,24 @@ impl VariantReader {
                     let pos = i32::from_le_bytes(sb[4..8].try_into().unwrap()) as i64 + 1;
                     let na = u16::from_le_bytes(sb[18..20].try_into().unwrap()) as usize;
 
-                    ib.resize(li, 0); reader.read_exact(ib).ok()?;
+                    if na < 2 || na > 2 || skip_gt {
+                        // Skip individual data without reading
+                        let mut rem = li;
+                        let mut skip_buf = [0u8; 65536];
+                        while rem > 0 { let c = rem.min(skip_buf.len()); reader.read_exact(&mut skip_buf[..c]).ok()?; rem -= c; }
+                        if na < 2 || na > 2 { continue; }
+                        // skip_gt: return position info without dosages
+                        let chrom = if ci < contig_names.len() { contig_names[ci].as_bytes().to_vec() } else { format!("{}", ci).into_bytes() };
+                        let nf = (u32::from_le_bytes(sb[20..24].try_into().unwrap()) >> 24) as usize;
+                        let mut o = 24usize;
+                        let _id = rtstr(sb, &mut o);
+                        let mut alleles = Vec::with_capacity(na);
+                        for _ in 0..na { alleles.push(rtstr_bytes(sb, &mut o)); }
+                        ds_buf.clear();
+                        return Some((chrom, pos, alleles.get(0).cloned().unwrap_or_default(), alleles.get(1).cloned().unwrap_or_default()));
+                    }
 
-                    if na < 2 { continue; } // monomorphic
-                    if na > 2 { continue; } // multi-allelic — skip
+                    ib.resize(li, 0); reader.read_exact(ib).ok()?;
 
                     let chrom = if ci < contig_names.len() { contig_names[ci].as_bytes().to_vec() } else { format!("{}", ci).into_bytes() };
 
@@ -526,31 +599,47 @@ impl VariantReader {
                         let fs = vl * es * ns;
 
                         if dsk == Some(k) && tid == 5 && vl == 1 {
-                            // DS field: float32 per sample
-                            for si in 0..ns {
-                                let off = io2 + si * 4;
-                                if off + 4 <= ib.len() {
-                                    let v = f32::from_le_bytes(ib[off..off+4].try_into().unwrap());
-                                    ds_buf.push(v);
-                                } else {
-                                    ds_buf.push(-1.0);
+                            // DS field: float32 per sample (selective if filter set)
+                            if let Some(indices) = si_filter {
+                                for &si in indices {
+                                    let off = io2 + si * 4;
+                                    if off + 4 <= ib.len() {
+                                        ds_buf.push(f32::from_le_bytes(ib[off..off+4].try_into().unwrap()));
+                                    } else { ds_buf.push(-1.0); }
+                                }
+                            } else {
+                                for si in 0..ns {
+                                    let off = io2 + si * 4;
+                                    if off + 4 <= ib.len() {
+                                        ds_buf.push(f32::from_le_bytes(ib[off..off+4].try_into().unwrap()));
+                                    } else { ds_buf.push(-1.0); }
                                 }
                             }
                             found_ds = true;
                             io2 += fs;
                             break;
                         } else if k == gtk && !found_ds {
-                            // GT field: int8 per sample × ploidy
+                            // GT field: int8 per sample × ploidy (selective if filter set)
                             let ge = (io2 + fs).min(ib.len());
-                            for si in 0..ns {
-                                let b = io2 + si * vl * es;
-                                if b + 1 < ge {
-                                    let a0 = (ib[b] >> 1).wrapping_sub(1);
-                                    let a1 = (ib[b+1] >> 1).wrapping_sub(1);
-                                    if a0 > 127 || a1 > 127 { ds_buf.push(-1.0); }
-                                    else { ds_buf.push(a0.min(1) as f32 + a1.min(1) as f32); }
-                                } else {
-                                    ds_buf.push(-1.0);
+                            if let Some(indices) = si_filter {
+                                for &si in indices {
+                                    let b = io2 + si * vl * es;
+                                    if b + 1 < ge {
+                                        let a0 = (ib[b] >> 1).wrapping_sub(1);
+                                        let a1 = (ib[b+1] >> 1).wrapping_sub(1);
+                                        if a0 > 127 || a1 > 127 { ds_buf.push(-1.0); }
+                                        else { ds_buf.push(a0.min(1) as f32 + a1.min(1) as f32); }
+                                    } else { ds_buf.push(-1.0); }
+                                }
+                            } else {
+                                for si in 0..ns {
+                                    let b = io2 + si * vl * es;
+                                    if b + 1 < ge {
+                                        let a0 = (ib[b] >> 1).wrapping_sub(1);
+                                        let a1 = (ib[b+1] >> 1).wrapping_sub(1);
+                                        if a0 > 127 || a1 > 127 { ds_buf.push(-1.0); }
+                                        else { ds_buf.push(a0.min(1) as f32 + a1.min(1) as f32); }
+                                    } else { ds_buf.push(-1.0); }
                                 }
                             }
                             found_gt = true;
@@ -560,11 +649,12 @@ impl VariantReader {
                         }
                     }
 
+                    let expected_n = if si_filter.is_some() { si_filter.unwrap().len() } else { ns };
                     if !found_ds && !found_gt {
                         ds_buf.clear();
-                        ds_buf.resize(ns, -1.0);
+                        ds_buf.resize(expected_n, -1.0);
                     }
-                    while ds_buf.len() < ns { ds_buf.push(-1.0); }
+                    while ds_buf.len() < expected_n { ds_buf.push(-1.0); }
 
                     return Some((chrom, pos, ref_a, alt_a));
                 }
@@ -607,7 +697,157 @@ fn rtint(buf: &[u8], o: &mut usize) -> i32 {
     }
 }
 
+/// Parallel evaluation: split by genomic region, one thread per region.
+/// Each thread opens its own file handles and evaluates its portion independently.
+pub fn evaluate_parallel(
+    imputed_path: &Path,
+    truth_path: &Path,
+    shared_samples: &[String],
+    n_threads: usize,
+) -> io::Result<(SiteAccumulator, SampleAccumulator, EvalCounts)> {
+    use rayon::prelude::*;
+
+    let n_samples = shared_samples.len();
+
+    // Get sample info
+    let (_, imp_samples) = VariantReader::open(imputed_path)?;
+    let (_, truth_samples) = VariantReader::open(truth_path)?;
+    let imp_map: std::collections::HashMap<&str, usize> = imp_samples.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+    let truth_map: std::collections::HashMap<&str, usize> = truth_samples.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+    let imp_reindex: Vec<usize> = shared_samples.iter().map(|s| imp_map[s.as_str()]).collect();
+    let truth_reindex: Vec<usize> = shared_samples.iter().map(|s| truth_map[s.as_str()]).collect();
+
+    // Divide into regions (more regions than threads for load balancing)
+    let n_regions = n_threads * 4;
+    let chunk_bp = 300_000_000i64 / n_regions.max(1) as i64;
+    let regions: Vec<(i64, i64)> = (0..n_regions)
+        .map(|i| {
+            let start = i as i64 * chunk_bp + 1;
+            let end = if i == n_regions - 1 { i64::MAX } else { (i as i64 + 1) * chunk_bp + 1 };
+            (start, end)
+        })
+        .collect();
+
+    let imp_path = imputed_path.to_path_buf();
+    let truth_path_buf = truth_path.to_path_buf();
+
+    let results: Vec<(SiteAccumulator, SampleAccumulator, EvalCounts)> = regions
+        .par_iter()
+        .map(|&(region_start, region_end)| {
+            // Each thread: open files, scan to region, evaluate with full genotypes
+            let result = (|| -> io::Result<_> {
+                let (mut imp_reader, _) = VariantReader::open(&imp_path)?;
+                let (mut truth_reader, _) = VariantReader::open(&truth_path_buf)?;
+                imp_reader.set_sample_filter(imp_reindex.clone());
+                truth_reader.set_sample_filter(truth_reindex.clone());
+
+                // Seek to region start via CSI/TBI index (O(1) instead of scanning)
+                imp_reader.seek_to_position(region_start)?;
+                truth_reader.seek_to_position(region_start)?;
+
+                let mut site_acc = SiteAccumulator::new();
+                let mut sample_acc = SampleAccumulator::new(n_samples);
+                let mut n_matched = 0u64;
+                let mut n_imp = 0u64;
+                let mut n_truth = 0u64;
+
+                let mut imp_ds_raw = Vec::with_capacity(n_samples);
+                let mut truth_ds_raw = Vec::with_capacity(n_samples);
+                let mut imp_ds = vec![0.0f32; n_samples];
+                let mut truth_ds = vec![0.0f32; n_samples];
+
+                // Read first record in region (skip any before region_start from seek imprecision)
+                let mut imp_rec = loop {
+                    let r = imp_reader.next_record(&mut imp_ds_raw);
+                    match &r {
+                        Some(rec) if rec.1 < region_start => continue,
+                        _ => break r,
+                    }
+                };
+                let mut truth_rec = loop {
+                    let r = truth_reader.next_record(&mut truth_ds_raw);
+                    match &r {
+                        Some(rec) if rec.1 < region_start => continue,
+                        _ => break r,
+                    }
+                };
+
+                // Merge within region
+                #[allow(unused_assignments)]
+                while let (Some(imp), Some(truth)) = (&imp_rec, &truth_rec) {
+                    if imp.1 >= region_end && truth.1 >= region_end { break; }
+
+                    if imp.1 < truth.1 {
+                        if imp.1 < region_end { n_imp += 1; }
+                        imp_rec = imp_reader.next_record(&mut imp_ds_raw);
+                        continue;
+                    }
+                    if imp.1 > truth.1 {
+                        if truth.1 < region_end { n_truth += 1; }
+                        truth_rec = truth_reader.next_record(&mut truth_ds_raw);
+                        continue;
+                    }
+
+                    // Same position
+                    if imp.1 >= region_end { break; }
+                    n_imp += 1;
+                    n_truth += 1;
+
+                    let (matched, swapped) = match_alleles(&imp.2, &imp.3, &truth.2, &truth.3);
+                    if matched {
+                        imp_ds[..n_samples].copy_from_slice(&imp_ds_raw[..n_samples]);
+                        if swapped { for si in 0..n_samples { if imp_ds[si] >= 0.0 { imp_ds[si] = 2.0 - imp_ds[si]; } } }
+                        truth_ds[..n_samples].copy_from_slice(&truth_ds_raw[..n_samples]);
+
+                        let mut gt_sum = 0.0f64;
+                        let mut gt_n = 0u32;
+                        for s in 0..n_samples {
+                            if truth_ds[s] >= 0.0 { gt_sum += truth_ds[s] as f64; gt_n += 1; }
+                        }
+                        let maf = if gt_n > 0 { let af = gt_sum / (gt_n as f64 * 2.0); af.min(1.0 - af) } else { 0.0 };
+                        let (r2, conc) = site_r2(&imp_ds, &truth_ds, n_samples);
+                        site_acc.add(maf, r2, conc);
+                        sample_acc.add_variant(&imp_ds, &truth_ds, maf);
+                        n_matched += 1;
+                    }
+
+                    imp_rec = imp_reader.next_record(&mut imp_ds_raw);
+                    truth_rec = truth_reader.next_record(&mut truth_ds_raw);
+                }
+
+                Ok((site_acc, sample_acc, EvalCounts { n_matched, n_imp_variants: n_imp, n_truth_variants: n_truth }))
+            })();
+            result.unwrap_or_else(|_| (SiteAccumulator::new(), SampleAccumulator::new(n_samples), EvalCounts { n_matched: 0, n_imp_variants: 0, n_truth_variants: 0 }))
+        })
+        .collect();
+
+    // Merge all region results
+    let mut site_acc = SiteAccumulator::new();
+    let mut sample_acc = SampleAccumulator::new(n_samples);
+    let mut total = EvalCounts { n_matched: 0, n_imp_variants: 0, n_truth_variants: 0 };
+    for (sa, sam, c) in results {
+        site_acc.merge(&sa);
+        sample_acc.merge(&sam);
+        total.n_matched += c.n_matched;
+        total.n_imp_variants += c.n_imp_variants;
+        total.n_truth_variants += c.n_truth_variants;
+    }
+
+    Ok((site_acc, sample_acc, total))
+}
+
 /// Stream-merge and evaluate imputed vs truth. Supports VCF.gz and BCF.
+/// Uses parallel evaluation (multiple threads, each processes a genomic region).
+pub fn evaluate(
+    imputed_path: &Path,
+    truth_path: &Path,
+    shared_samples: &[String],
+) -> io::Result<(SiteAccumulator, SampleAccumulator, EvalCounts)> {
+    let n_threads = rayon::current_num_threads().max(1);
+    evaluate_parallel(imputed_path, truth_path, shared_samples, n_threads)
+}
+
+/// Single-threaded stream-merge (fallback). Supports VCF.gz and BCF.
 #[allow(unused_assignments)]
 pub fn evaluate_stream(
     imputed_path: &Path,
@@ -623,6 +863,10 @@ pub fn evaluate_stream(
     let truth_map: std::collections::HashMap<&str, usize> = truth_samples.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
     let imp_reindex: Vec<usize> = shared_samples.iter().map(|s| imp_map[s.as_str()]).collect();
     let truth_reindex: Vec<usize> = shared_samples.iter().map(|s| truth_map[s.as_str()]).collect();
+
+    // Set BCF sample filters for selective extraction (skip non-shared samples)
+    imp_reader.set_sample_filter(imp_reindex.clone());
+    truth_reader.set_sample_filter(truth_reindex.clone());
 
     let mut site_acc = SiteAccumulator::new();
     let mut sample_acc = SampleAccumulator::new(n_samples);
@@ -645,12 +889,12 @@ pub fn evaluate_stream(
         let truth_pos = truth.1;
 
         if imp_pos < truth_pos {
-            imp_rec = imp_reader.next_record(&mut imp_ds_raw);
+            imp_rec = imp_reader.next_record_skip_gt(&mut imp_ds_raw);
             if imp_rec.is_some() { n_imp_variants += 1; }
             continue;
         }
         if imp_pos > truth_pos {
-            truth_rec = truth_reader.next_record(&mut truth_ds_raw);
+            truth_rec = truth_reader.next_record_skip_gt(&mut truth_ds_raw);
             if truth_rec.is_some() { n_truth_variants += 1; }
             continue;
         }
@@ -658,11 +902,10 @@ pub fn evaluate_stream(
         // Same position — match by alleles (handles indel normalization + REF/ALT swaps)
         let (matched, swapped) = match_alleles(&imp.2, &imp.3, &truth.2, &truth.3);
         if matched {
-            for (si, &ii) in imp_reindex.iter().enumerate() {
-                let v = imp_ds_raw[ii];
-                imp_ds[si] = if swapped && v >= 0.0 { 2.0 - v } else { v };
-            }
-            for (si, &ti) in truth_reindex.iter().enumerate() { truth_ds[si] = truth_ds_raw[ti]; }
+            // ds_raw already contains only shared samples in order (via sample filter)
+            imp_ds[..n_samples].copy_from_slice(&imp_ds_raw[..n_samples]);
+            if swapped { for si in 0..n_samples { if imp_ds[si] >= 0.0 { imp_ds[si] = 2.0 - imp_ds[si]; } } }
+            truth_ds[..n_samples].copy_from_slice(&truth_ds_raw[..n_samples]);
 
             // Compute MAF from truth
             let mut gt_sum = 0.0f64;

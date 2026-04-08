@@ -310,7 +310,7 @@ fn main() {
         }
 
         selphi_step!("Stream-merging VCFs...");
-        let (site_acc, sample_acc, counts) = selphi::eval::accuracy::evaluate_stream(
+        let (site_acc, sample_acc, counts) = selphi::eval::accuracy::evaluate(
             imp_path, truth_path, &shared,
         ).expect("Evaluation failed");
 
@@ -982,6 +982,13 @@ fn main() {
         h.join().expect("VCF write thread panicked");
     }
 
+    // Free imputation data structures before indexing/evaluation
+    drop(srp);
+    drop(targ_alleles);
+    drop(wgs_idx);
+    drop(chip_cm);
+    drop(sample_names);
+
     // 12. Finalize output
     if let Some((pg, mut pv)) = pgen_writer {
         use std::io::Write;
@@ -1031,7 +1038,7 @@ fn main() {
             if !shared.is_empty() {
                 // VCF.gz path — can stream directly
                 if final_path.to_string_lossy().ends_with(".vcf.gz") {
-                    let (site_acc, sample_acc, counts) = selphi::eval::accuracy::evaluate_stream(
+                    let (site_acc, sample_acc, counts) = selphi::eval::accuracy::evaluate(
                         &final_path, truth_path, &shared,
                     ).expect("Evaluation failed");
 
