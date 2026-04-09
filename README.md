@@ -274,7 +274,6 @@ medRxiv 2023.12.18.23300143; doi: https://doi.org/10.1101/2023.12.18.23300143
 The full project description can be found in the [PrePrint version](https://www.medrxiv.org/content/10.1101/2023.12.18.23300143v2)
 
 # Non-Commercial Use License
-### Version 1.0
 
 ## NOTICE
 This software is provided free of charge for **academic research use only**. Any use by **commercial entities, for-profit organizations, or consultants** is strictly prohibited without prior authorization. For inquiries about commercial licensing, contact **pyazdi@gmail.com**.
