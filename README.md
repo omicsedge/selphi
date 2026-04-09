@@ -20,13 +20,28 @@
 
 ## Installation
 
-Requires Rust 1.85+ (edition 2024). AVX-512 is used when available; falls back to AVX2.
+Requires Rust 1.85+ (edition 2024). No system dependencies — all compression libraries (zstd, lz4, snappy) are compiled from source.
 
 ```bash
 git clone https://github.com/omicsedge/selphi.git
 cd selphi
 cargo build --release
+# Binary: target/release/selphi
 ```
+
+Optionally install to PATH:
+```bash
+cargo install --path .
+```
+
+AVX-512 is used when available on the host CPU; falls back to AVX2 automatically.
+
+### Genetic maps
+
+Selphi requires a genetic map in PLINK format (cM positions). Beagle genetic maps work directly:
+
+- [GRCh38 genetic maps](https://bochet.gcc.biostat.washington.edu/beagle/genetic_maps/) (recommended)
+- One map file per chromosome (e.g. `plink.chr22.GRCh38.map`)
 
 ## Usage
 
