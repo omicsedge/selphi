@@ -210,7 +210,10 @@ impl SrpReader {
         let mut ocomp = vec![0u8; olen];
         f.read_exact(&mut ocomp).unwrap();
         let oraw = zstd::decode_all(Cursor::new(&ocomp)).unwrap();
-        let original_ids: Vec<String> = String::from_utf8_lossy(&oraw).split('\n').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+        let original_ids: Vec<String> = {
+            let parsed: Vec<String> = String::from_utf8_lossy(&oraw).split('\n').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+            if parsed.len() == metadata.n_variants { parsed } else { ids.clone() }
+        };
 
         // Contig field
         f.read_exact(&mut buf4).unwrap();
