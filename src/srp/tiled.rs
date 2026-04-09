@@ -138,7 +138,9 @@ pub fn write_tiled(
                 }
 
                 let tile = SparseTile { indptr, indices, n_rows: n_rows as u16, n_cols: n_cols as u16 };
-                (band, lz4_flex::compress_prepend_size(&tile.to_bytes()))
+                let raw = tile.to_bytes();
+                let compressed = zstd::encode_all(std::io::Cursor::new(&raw), 3).unwrap();
+                (band, compressed)
             }).collect();
 
             for (band, data) in band_tiles {
@@ -150,9 +152,9 @@ pub fn write_tiled(
                     // For simplicity, rebuild tile from both contributions.
                     // This happens at chunk boundaries (~2000 times, negligible).
                     let existing = SparseTile::from_bytes(
-                        &lz4_flex::decompress_size_prepended(&tile_data[idx]).unwrap());
+                        &zstd::decode_all(std::io::Cursor::new(&tile_data[idx])).unwrap());
                     let new_part = SparseTile::from_bytes(
-                        &lz4_flex::decompress_size_prepended(&data).unwrap());
+                        &zstd::decode_all(std::io::Cursor::new(&data)).unwrap());
                     // Merge: combine columns from both
                     let nc = existing.n_cols as usize;
                     let mut merged_indptr = Vec::with_capacity(nc + 1);
@@ -172,7 +174,7 @@ pub fn write_tiled(
                         indptr: merged_indptr, indices: merged_indices,
                         n_rows: existing.n_rows, n_cols: existing.n_cols,
                     };
-                    tile_data[idx] = lz4_flex::compress_prepend_size(&merged.to_bytes());
+                    tile_data[idx] = zstd::encode_all(std::io::Cursor::new(&merged.to_bytes()), 3).unwrap();
                 }
             }
         }
@@ -253,8 +255,12 @@ impl PreloadedStripes {
         let local = (stripe - self.first_stripe) * self.n_tile_cols + band;
         let (off, len) = self.offsets[local];
         let compressed = &self.buf[off..off + len];
-        let raw = lz4_flex::decompress_size_prepended(compressed)
-            .expect("LZ4 decompress failed");
+        // Auto-detect: zstd magic = 0xFD2FB528, LZ4 prepend-size starts with u32 size.
+        let raw = if compressed.len() >= 4 && compressed[0] == 0x28 && compressed[1] == 0xB5 && compressed[2] == 0x2F && compressed[3] == 0xFD {
+            zstd::decode_all(std::io::Cursor::new(compressed)).expect("zstd decompress failed")
+        } else {
+            lz4_flex::decompress_size_prepended(compressed).expect("LZ4 decompress failed")
+        };
         SparseTile::from_bytes(&raw)
     }
 
