@@ -68,8 +68,14 @@ impl SrpReader {
             }
         }
 
-        let variants_raw = Self::read_zstd_entry(&mut archive, "variants");
-        let variants = parse_variants(&variants_raw, &metadata_value, metadata.n_variants);
+        // Try fast binary variant index first, fall back to UCS-4
+        let variants = if archive.by_name("variants_bin").is_ok() {
+            let vbin_raw = Self::read_zstd_entry(&mut archive, "variants_bin");
+            Self::parse_variants_bin(&vbin_raw, metadata.n_variants)
+        } else {
+            let variants_raw = Self::read_zstd_entry(&mut archive, "variants");
+            parse_variants(&variants_raw, &metadata_value, metadata.n_variants)
+        };
 
         let chunks_raw = Self::read_zstd_entry(&mut archive, "chunks");
         let chunks = parse_chunks(&chunks_raw);
@@ -143,6 +149,28 @@ impl SrpReader {
             v2_chunk_index,
             tiled,
         }
+    }
+
+    /// Parse compact binary variant records: [pos:i64][chr_len:u8][ref_len:u8][alt_len:u8][chr][ref][alt]
+    fn parse_variants_bin(data: &[u8], n_variants: usize) -> Vec<Variant> {
+        let mut variants = Vec::with_capacity(n_variants);
+        let mut off = 0;
+        for _ in 0..n_variants {
+            if off + 11 > data.len() { break; }
+            let pos = i64::from_le_bytes(data[off..off+8].try_into().unwrap());
+            let chr_len = data[off+8] as usize;
+            let ref_len = data[off+9] as usize;
+            let alt_len = data[off+10] as usize;
+            off += 11;
+            let chr = std::str::from_utf8(&data[off..off+chr_len]).unwrap_or("").to_string();
+            off += chr_len;
+            let ref_allele = std::str::from_utf8(&data[off..off+ref_len]).unwrap_or("").to_string();
+            off += ref_len;
+            let alt_allele = std::str::from_utf8(&data[off..off+alt_len]).unwrap_or("").to_string();
+            off += alt_len;
+            variants.push(Variant { chr, pos, ref_allele, alt_allele });
+        }
+        variants
     }
 
     fn read_zstd_entry(archive: &mut zip::ZipArchive<BufReader<File>>, name: &str) -> Vec<u8> {

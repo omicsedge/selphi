@@ -390,6 +390,39 @@ fn build_srp_from_bcf_native(
     zip.write_all(&var_compressed)?;
     drop(var_compressed);
 
+    // variants_bin: compact binary variant index (pos:i64 + ref/alt length-prefixed).
+    // ~10× faster to load than UCS-4. Reader detects this entry and uses it if present.
+    {
+        let mut vbin = Vec::with_capacity(n_variants * 20);
+        for rr in &region_results {
+            if rr.meta_file.as_os_str().is_empty() { continue; }
+            let text = std::fs::read_to_string(&rr.meta_file)?;
+            for line in text.lines() {
+                let f: Vec<&str> = line.split('\t').collect();
+                if f.len() < 6 { continue; }
+                let cid: usize = f[0].parse().unwrap_or(0);
+                let chrom = if cid < contig_names.len() { &contig_names[cid] } else { f[0] };
+                let pos: i64 = f[1].parse().unwrap_or(0);
+                let ref_allele = f[2];
+                let alt_allele = f[3];
+                // Record: [pos:i64][chr_len:u8][ref_len:u8][alt_len:u8][chr bytes][ref bytes][alt bytes]
+                vbin.extend_from_slice(&pos.to_le_bytes());
+                let chr_b = chrom.as_bytes();
+                let ref_b = ref_allele.as_bytes();
+                let alt_b = alt_allele.as_bytes();
+                vbin.push(chr_b.len().min(255) as u8);
+                vbin.push(ref_b.len().min(255) as u8);
+                vbin.push(alt_b.len().min(255) as u8);
+                vbin.extend_from_slice(&chr_b[..chr_b.len().min(255)]);
+                vbin.extend_from_slice(&ref_b[..ref_b.len().min(255)]);
+                vbin.extend_from_slice(&alt_b[..alt_b.len().min(255)]);
+            }
+        }
+        let vbin_compressed = zstd::encode_all(Cursor::new(&vbin), 3)?;
+        zip.start_file("variants_bin", opts)?;
+        zip.write_all(&vbin_compressed)?;
+    }
+
     // chunks entry
     let mut cb = Vec::with_capacity(total_chunks * 24);
     for (ci, &(start_pos, end_pos)) in chunk_positions.iter().enumerate() {
@@ -575,6 +608,25 @@ fn compress_and_assemble(
     }
     zip.start_file("variants", opts)?;
     zip.write_all(&zstd::encode_all(Cursor::new(&var_buf), 3)?)?;
+
+    // variants_bin: compact binary variant index
+    {
+        let mut vbin = Vec::with_capacity(n_variants * 20);
+        for v in variants {
+            vbin.extend_from_slice(&v.pos.to_le_bytes());
+            let chr_b = v.chrom.as_bytes();
+            let ref_b = v.ref_allele.as_bytes();
+            let alt_b = v.alt_allele.as_bytes();
+            vbin.push(chr_b.len().min(255) as u8);
+            vbin.push(ref_b.len().min(255) as u8);
+            vbin.push(alt_b.len().min(255) as u8);
+            vbin.extend_from_slice(&chr_b[..chr_b.len().min(255)]);
+            vbin.extend_from_slice(&ref_b[..ref_b.len().min(255)]);
+            vbin.extend_from_slice(&alt_b[..alt_b.len().min(255)]);
+        }
+        zip.start_file("variants_bin", opts)?;
+        zip.write_all(&zstd::encode_all(Cursor::new(&vbin), 3)?)?;
+    }
 
     let mut chunks_buf = Vec::with_capacity(n_chunks * 24);
     let mut off = 0usize;
