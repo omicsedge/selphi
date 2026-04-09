@@ -233,8 +233,6 @@ pub fn write_window_to_vcf(
 
     let an_str: Vec<u8> = format!("{}", n_haps).into_bytes();
 
-    // No pre-warm: chunks loaded on demand per tile (prefetch_compressed_range in main.rs
-    // ensures compressed bytes are already in RAM for fast decompression).
 
     // Build intervals between consecutive owned chip sites.
     // Chip indices are GLOBAL but weight matrix rows are WINDOW-LOCAL.

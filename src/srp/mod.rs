@@ -346,21 +346,6 @@ pub(crate) fn parse_variants(data: &[u8], metadata: &JsonValue, n_variants: usiz
     variants
 }
 
-/// Parse the chunks array: flat i64 array reshaped to (n_chunks, 3).
-pub(crate) fn parse_chunks(data: &[u8]) -> Vec<[i64; 3]> {
-    let n_i64 = data.len() / 8;
-    let n_chunks = n_i64 / 3;
-    let mut chunks = Vec::with_capacity(n_chunks);
-    for i in 0..n_chunks {
-        let base = i * 3 * 8;
-        let id = i64::from_le_bytes(data[base..base+8].try_into().unwrap());
-        let start = i64::from_le_bytes(data[base+8..base+16].try_into().unwrap());
-        let end = i64::from_le_bytes(data[base+16..base+24].try_into().unwrap());
-        chunks.push([id, start, end]);
-    }
-    chunks
-}
-
 /// Parse a raw binary chunk after zstd decompression.
 pub(crate) fn parse_raw_chunk(compressed: &[u8]) -> CscChunk {
     let decompressed = zstd::decode_all(Cursor::new(compressed))

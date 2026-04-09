@@ -420,7 +420,7 @@ fn main() {
     let start_time = Instant::now();
 
     // 1. Load reference panel
-    let mut srp = Arc::new(SrpReader::open(&args.refpanel, args.threads * 2));
+    let srp = Arc::new(SrpReader::open(&args.refpanel, args.threads * 2));
     let n_ref_variants = srp.n_variants();
     let n_ref = srp.n_haps();
     let ref_positions: Vec<i64> = srp.variants.iter().map(|v| v.pos).collect();
@@ -496,7 +496,7 @@ fn main() {
         // For full pipeline, kept alive for imputation LD correction + candidates.
         let ref_bm_full = if !args.phase_only || engine != ResolvedEngine::Diploid {
             let bm = srp.extract_ref_alleles_bitmatrix(&wgs_idx);
-            srp.unload_chunks(); // Free decompressed chunk cache (re-loaded on demand for output)
+             // Free decompressed chunk cache (re-loaded on demand for output)
             selphi_step!("Ref bitmatrix extracted ({} chip × {} haps, {:.1} MB)",
                 n_chip, n_ref, (bm.n_words() * n_chip * 8) as f64 / 1e6);
             Some(bm)
@@ -611,11 +611,6 @@ fn main() {
     selphi_debug!("  RS cm_ld[1000]={:.15}", chip_cm[1000]);
     selphi_step!("Genetic map loaded + LD correction");
 
-    // Load tiled SRP backend if .srpt file exists.
-    // Tiled format uses sequential bulk reads (no mmap) for zero-page-fault interpolation.
-    if let Some(srp_mut) = Arc::get_mut(&mut srp) {
-        if srp_mut.load_tiled() { selphi_step!("Tiled SRP loaded (sequential I/O)"); }
-    }
 
     // 7. Auto-calibrate parameters
     let match_length = args.match_length.unwrap_or_else(|| {
@@ -772,30 +767,13 @@ fn main() {
     let mut hap_priors: Vec<Option<Vec<f64>>> = vec![None; n_haps];
     let t0_pipeline = Instant::now();
     let mut vcf_write_handle: Option<std::thread::JoinHandle<()>> = None;
-    let mut prefetch_handle: Option<std::thread::JoinHandle<()>> = None;
+    
     let n_cores = rayon::current_num_threads();
     for (wi, window) in windows.iter().enumerate() {
         let t0_win = Instant::now();
         let cpu0_win = selphi::log::cpu_time_secs();
         let n_var_w = window.chip_end - window.chip_start;
 
-        // Prefetch SRP chunks for NEXT window while this one does PBWT+HMM.
-        // Only useful for BCF/Parquet/PGEN which use load_chunk() (Arc cache).
-        // VCF pipeline has its own sliding Vec cache via load_chunk_from_source.
-        if (output_bcf || output_parquet || output_pgen) && wi + 1 < windows.len() {
-            let next_w = &windows[wi + 1];
-            let n_chip_total = wgs_idx.len();
-            let next_own_start = if next_w.own_chip_start == 0 { 0 } else { wgs_idx[next_w.own_chip_start] };
-            let next_own_end = if next_w.own_chip_end >= n_chip_total { srp.n_variants() } else { wgs_idx[next_w.own_chip_end] };
-            let cs = srp.chunk_size();
-            let first_chunk = next_own_start / cs;
-            let last_chunk = if next_own_end > 0 { (next_own_end - 1) / cs } else { 0 };
-            let chunk_ids: Vec<usize> = (first_chunk..=last_chunk).collect();
-            let srp_clone = Arc::clone(&srp);
-            prefetch_handle = Some(std::thread::spawn(move || {
-                srp_clone.preload_chunk_range(&chunk_ids);
-            }));
-        }
 
         // Extract window sub-arrays — NO alleles_w materialization.
         // Ref read from bitmatrix (1 bit/allele), target from dense array.
@@ -855,7 +833,7 @@ fn main() {
 
         if srp.is_tiled() && !output_bcf && !output_parquet && !output_pgen {
             // Preload compressed stripe data during HMM (1 thread, sequential I/O)
-            let tiled_path = std::path::Path::new(&args.refpanel).with_extension("srpt");
+            let tiled_path = std::path::Path::new(&args.refpanel).to_path_buf();
             let own_start = if window.own_chip_start == 0 { 0 } else { wgs_idx[window.own_chip_start] };
             let own_end = if window.own_chip_end >= wgs_idx.len() { srp.n_variants() } else { wgs_idx[window.own_chip_end] };
             let n_v = srp.n_variants();
@@ -1036,21 +1014,7 @@ fn main() {
             .and_then(|h| h.join().expect("stripe preload panicked"));
         let cpu_preload = selphi::log::cpu_time_secs();
 
-        // Wait for prefetch of this window's chunks (should already be done)
-        if let Some(h) = prefetch_handle.take() {
-            h.join().expect("SRP prefetch thread panicked");
-        }
-
-        // Prefetch compressed chunks: only needed for SRP v1 (ZIP).
-        if !srp.is_v2() && (output_bcf || output_parquet || output_pgen) {
-            let own_wgs_start = if window.own_chip_start == 0 { 0 } else { wgs_idx[window.own_chip_start] };
-            let own_wgs_end = if window.own_chip_end >= wgs_idx.len() { srp.n_variants() } else { wgs_idx[window.own_chip_end] };
-            let cs_sz = srp.chunk_size();
-            let first_c = own_wgs_start / cs_sz;
-            let last_c = if own_wgs_end > 0 { (own_wgs_end - 1) / cs_sz } else { 0 };
-            let cids: Vec<usize> = (first_c..=last_c).collect();
-            srp.prefetch_compressed_range(&cids);
-        }
+        
 
         // Interpolation + output (runs BEFORE waiting for previous VCF write — no dependency)
         let t0_interp = Instant::now();
@@ -1090,7 +1054,7 @@ fn main() {
             ).expect("Interpolation failed")
         };
         let interp_secs = t0_interp.elapsed().as_secs_f64();
-        srp.clear_compressed_cache();
+        
 
         // Wait for previous VCF write AFTER interpolation (not before).
         // Interpolation has no dependency on previous VCF write — they operate on different data.
