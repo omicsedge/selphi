@@ -18,21 +18,16 @@ Two phasing engines + one imputation engine in a unified pipeline.
 cargo build --release
 
 # Imputation (auto-detect phasing engine)
-target/release/selphi \
-  --refpanel data/reference/srp/chr22.srp \
-  --input input.vcf.gz \
-  --map data/maps/beagle/chr22.map \
-  --out output --threads 16
+selphi --refpanel panel.srp --input input.vcf.gz --map chr.map --out output --threads 16
 
 # Phase-only
-target/release/selphi \
-  --refpanel data/reference/srp/chr22.srp \
-  --input input.vcf.gz \
-  --map data/maps/beagle/chr22.map \
-  --out phased --threads 16 --phase-only
+selphi --refpanel panel.srp --input input.vcf.gz --map chr.map --out phased --threads 16 --phase-only
 
-# Reference panel creation (BCF, VCF.gz, or BREF3)
-target/release/selphi --prepare-reference-from panel.bcf --threads 16
+# Reference panel creation
+selphi --prepare-reference-from panel.bcf --out panel --threads 16    # BCF → .srp
+selphi --prepare-reference-from panel.vcf.gz --out panel --threads 16 # VCF → .srp
+selphi --prepare-reference-from panel.bref3 --out panel --threads 16  # BREF3 → .srp
+selphi --prepare-reference-from panel.srp --out panel.bref3           # SRP → BREF3
 ```
 
 ## Output Formats
@@ -47,8 +42,8 @@ selphi ... --out result --pgen         # PLINK2 PGEN (.pgen/.pvar/.psam)
 ## Engine Selection
 
 `--phasing-engine haploid|diploid|auto` (default: auto)
-- **Chip (up to 50K variants)** -> Haploid engine
-- **WGS (>50K variants)** -> Diploid engine
+- **Chip (up to 50K variants)** → Haploid engine
+- **WGS (>50K variants)** → Diploid engine
 
 ## Architecture
 
@@ -56,12 +51,12 @@ selphi ... --out result --pgen         # PLINK2 PGEN (.pgen/.pvar/.psam)
 Input VCF/BCF
      |
      +--- Phase (if unphased) ---------+
-     |    +-- Haploid: PBWT IBS ->     |
-     |    |   Composite HMM ->         |
+     |    +-- Haploid: PBWT IBS →      |
+     |    |   Composite HMM →          |
      |    |   Greedy swap (15 iter)    |
      |    +-- Diploid: PBWT neighbors  |
-     |        -> Genotype graph ->     |
-     |        Diplotype HMM ->         |
+     |        → Genotype graph →       |
+     |        Diplotype HMM →          |
      |        MCMC sampling (15 iter)  |
      |                                 |
      +--- ref_bm (bitmatrix, shared) --+
@@ -69,60 +64,46 @@ Input VCF/BCF
      +--- Impute ----------------------+
           +-- PBWT candidate selection
           +-- Li-Stephens fwd-bwd (f32)
-          +-- Batch-parallel tiled interpolation:
-          |     Batch intervals → par_iter tile_descs
-          |     → par_chunks_mut haps (fused scatter+divide)
-          |     Sequential pread + double-buffer I/O
+          +-- Batch-parallel tiled interpolation
           +-- Streaming output (VCF/BCF/Parquet/PGEN)
 ```
 
 ### Key Design Principles
-- **Bitmatrix-native**: 1 bit per allele throughout. No byte-per-allele arrays.
-- **Tiled interpolation**: 2D tiles (1024×4096) in L2 cache, batch-parallel intervals, 86% CPU.
+- **Bitmatrix-native**: 1 bit per allele throughout.
+- **Tiled interpolation**: 2D tiles (1024×4096) fit in L2 cache, batch-parallel intervals.
 - **Sequential I/O**: PreloadedStripes pread, double-buffer I/O, zero page faults.
-- **Unified pipeline**: Phase → impute in-memory. Single ref panel extraction.
 - **Deterministic**: Bit-identical results across runs.
-- **AVX-512 accelerated**: Diplotype HMM forward pass, auto-vectorized imputation.
-- **Streaming I/O**: Parallel BGZF compression, channel-based VCF/BCF writing.
+- **Streaming output**: Parallel BGZF compression, channel-based writing.
 
-### Reference Panel Format (SRP)
+### SRP Reference Panel Format
 
-Single `.srp` file containing everything (version 2, unified):
-- Binary variant index (instant load, no JSON parse)
-- Sample IDs, variant IDs
-- Indexed CSC chunks (mmap, for bitmatrix extraction in phasing)
-- Indexed 2D tiles (1024×4096, zstd-3, for batch-parallel interpolation)
-
-```bash
-# Generate from BCF (produces single .srp file)
-selphi --prepare-reference-from panel.bcf --out panel
-
-# Old v1 ZIP format (.srp) also supported (auto-detected by magic bytes)
-# Legacy .srp2/.srpt companion files still read if present
-```
+Single `.srp` file:
+- Binary variant index, sample IDs, variant IDs
+- 2D tiles (1024×4096, zstd-3) for interpolation and bitmatrix extraction
 
 ### Rust Modules (src/)
 
 | Module | Purpose |
 |--------|---------|
-| `main.rs` | CLI entry point, window orchestration |
+| `main.rs` | CLI, window orchestration |
 | `haploid/` | Haploid phasing engine |
 | `diploid/` | Diploid phasing engine |
 | `imputation/pbwt.rs` | PBWT matching, candidate selection |
 | `imputation/hmm.rs` | Li-Stephens HMM (f32 forward, f64 backward) |
-| `io/pipeline.rs` | Batch-parallel tiled interpolation + streaming VCF output |
-| `io/bcf_encode.rs` | Native BCF2.2 binary encoder |
-| `io/parquet_output.rs` | Apache Parquet writer (arrow-rs) |
+| `io/pipeline.rs` | Batch-parallel tiled interpolation + streaming output |
+| `io/bcf_encode.rs` | Native BCF2.2 encoder |
+| `io/parquet_output.rs` | Parquet writer (arrow-rs) |
 | `io/pgen_output.rs` | PLINK2 PGEN writer |
-| `io/bcf_writer.rs` | BGZF multi-threaded writer wrapper |
-| `srp/mod.rs` | SRP shared types (CscChunk, SparseTile, Variant) |
-| `srp/reader.rs` | SRP reader (auto-detects v1 ZIP or v2 unified) |
-| `srp/writer.rs` | SRP writer: BCF→unified SRP v2, BCF→BREF3 |
-| `srp/tiled.rs` | Tile writer + PreloadedStripes (sequential pread) |
-| `srp/bcf_reader.rs` | Native BCF2 parser (parallel regional reads) |
-| `srp/bref3.rs` | Native BREF3 reader |
+| `io/bcf_writer.rs` | BGZF multi-threaded writer |
+| `srp/mod.rs` | SRP types (CscChunk, SparseTile, Variant) |
+| `srp/reader.rs` | SRP reader |
+| `srp/writer.rs` | SRP writer (BCF/VCF/BREF3 → .srp) |
+| `srp/tiled.rs` | Tile writer + PreloadedStripes |
+| `srp/bcf_reader.rs` | Native BCF2 parser (parallel) |
+| `srp/bref3.rs` | BREF3 reader |
+| `srp/bref3_writer.rs` | BREF3 writer |
 | `srp/csi.rs` | CSI/TBI index parser + writer |
-| `eval/accuracy.rs` | Imputation accuracy evaluator (R², concordance, MAF bins) |
+| `eval/accuracy.rs` | R², concordance, MAF-binned evaluation |
 | `em.rs` | EM parameter estimation |
 | `genmap.rs` | Genetic map + LD correction |
 
@@ -138,7 +119,3 @@ chr1-3: 801 samples chip + WGS truth for R-squared evaluation.
 
 - **NEVER** add `Co-Authored-By:` lines to commits
 - All commits must appear as solely authored by the git config user.
-
-## Archive
-
-Legacy code and reference implementations are in `_archive/` (gitignored).
