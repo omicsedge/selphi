@@ -135,8 +135,6 @@ Genotyped (chip) sites are passed through with original genotypes and AF/AC/AN i
 
 For Parquet output (`--parquet`), the schema is variant-major: `CHROM`, `POS`, `ID`, `REF`, `ALT`, `AF`, `DR2`, `IMP`, then one `DS` column per sample (float32). Compression: zstd.
 
-For PGEN output (`--pgen`), hardcall genotypes are stored as 2-bit packed values. For dosage support, use VCF/BCF output and import into plink2 with `plink2 --vcf result.vcf.gz dosage=DS --make-pgen`.
-
 For SelfDecode output (`--selfdecode`), a ZIP archive is produced containing per-sample chunked Parquet files. Structure: `{sample}/chrom={chr}/{chunk}.parquet`. Schema: `pos` (int32), `rsid` (string), `ref` (string), `alt` (string), `gt` (string, e.g. "0|1"), `gt1` (int32), `gt2` (int32), `phased` (bool), `ap1` (float32), `ap2` (float32). Chunk size: 100,000 rows per file. Compression: Snappy with dictionary encoding.
 
 ## Accuracy evaluation
