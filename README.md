@@ -266,14 +266,15 @@ SRP files are created from VCF, BCF, or BREF3 using `--prepare-reference-from`. 
 ## Reference
 
 If you use Selphi in your research, please cite:
-
 ```
-De Marino A, Mahmoud AA, Bohn S, Lerga-Jaso J, Novkovic B, Manson C, Loguercio S,
-Terpolovsky A, Matushyn M, Torkamani A, Yazdi PG.
-Selphi: Empowering GWAS Discovery through Enhanced Genotype Imputation.
+Empowering GWAS Discovery through Enhanced Genotype Imputation
+Adriano De Marino, Abdallah Amr Mahmoud, Sandra Bohn, Jon Lerga-Jaso, Biljana Novković, Charlie Manson, Salvatore Loguercio, Andrew Terpolovsky, Mykyta Matushyn, Ali Torkamani, Puya G. Yazdi
 medRxiv 2023.12.18.23300143; doi: https://doi.org/10.1101/2023.12.18.23300143
 ```
+The full project description can be found in the [PrePrint version](https://www.medrxiv.org/content/10.1101/2023.12.18.23300143v2)
 
-## License
+# Non-Commercial Use License
+### Version 1.0
 
-Proprietary. Copyright SelfDecode, Inc.
+## NOTICE
+This software is provided free of charge for **academic research use only**. Any use by **commercial entities, for-profit organizations, or consultants** is strictly prohibited without prior authorization. For inquiries about commercial licensing, contact **pyazdi@gmail.com**.
