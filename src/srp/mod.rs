@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-#![allow(unused_assignments, unused_variables)]
 //! SRP (Sparse Reference Panel) reader and writer.
 //!
 //! The .srp format is a zstd-compressed ZIP archive containing:
@@ -270,51 +268,6 @@ impl SrpMetadata {
 // Variant dtype parsing + UCS-4 helpers
 // ---------------------------------------------------------------------------
 
-/// Parse the variant dtype spec from metadata to determine field sizes.
-/// Returns (chr_width, ref_width, alt_width) in UCS-4 code points.
-pub(crate) fn parse_variant_dtype(metadata: &JsonValue) -> (usize, usize, usize) {
-    if let Some(dtypes) = metadata.get("variant_dtypes").and_then(|v| v.as_array()) {
-        let mut chr_w = 21usize;
-        let mut ref_w = 21usize;
-        let mut alt_w = 21usize;
-        for field in dtypes {
-            let arr = field.as_array().unwrap();
-            let name = arr[0].as_str().unwrap();
-            let dtype = arr[1].as_str().unwrap();
-            let width = if dtype.contains('U') {
-                let n: usize = dtype.trim_start_matches('<').trim_start_matches('U').parse().unwrap_or(21);
-                n
-            } else {
-                0
-            };
-            match name {
-                "chr" => chr_w = width,
-                "ref" => ref_w = width,
-                "alt" => alt_w = width,
-                _ => {}
-            }
-        }
-        (chr_w, ref_w, alt_w)
-    } else {
-        (21, 21, 21)
-    }
-}
-
-/// Read a UCS-4 (little-endian) string from a byte slice.
-pub(crate) fn read_ucs4_string(bytes: &[u8], width_chars: usize) -> String {
-    let mut s = String::with_capacity(width_chars);
-    for i in 0..width_chars {
-        let off = i * 4;
-        if off + 4 > bytes.len() { break; }
-        let cp = u32::from_le_bytes([bytes[off], bytes[off+1], bytes[off+2], bytes[off+3]]);
-        if cp == 0 { break; }
-        if let Some(c) = char::from_u32(cp) {
-            s.push(c);
-        }
-    }
-    s
-}
-
 /// Write a string as UCS-4 LE, null-padded to `width_chars` code points.
 pub(crate) fn write_ucs4_string(s: &str, width_chars: usize) -> Vec<u8> {
     let mut buf = vec![0u8; width_chars * 4];
@@ -323,27 +276,6 @@ pub(crate) fn write_ucs4_string(s: &str, width_chars: usize) -> Vec<u8> {
         buf[i*4..i*4+4].copy_from_slice(&cp.to_le_bytes());
     }
     buf
-}
-
-/// Parse variants from the binary blob using the dtype spec.
-pub(crate) fn parse_variants(data: &[u8], metadata: &JsonValue, n_variants: usize) -> Vec<Variant> {
-    let (chr_w, ref_w, alt_w) = parse_variant_dtype(metadata);
-    let record_size = chr_w * 4 + 8 + ref_w * 4 + alt_w * 4;
-
-    let mut variants = Vec::with_capacity(n_variants);
-    for i in 0..n_variants {
-        let base = i * record_size;
-        if base + record_size > data.len() { break; }
-        let chr = read_ucs4_string(&data[base..], chr_w);
-        let pos_off = base + chr_w * 4;
-        let pos = i64::from_le_bytes(data[pos_off..pos_off+8].try_into().unwrap());
-        let ref_off = pos_off + 8;
-        let ref_allele = read_ucs4_string(&data[ref_off..], ref_w);
-        let alt_off = ref_off + ref_w * 4;
-        let alt_allele = read_ucs4_string(&data[alt_off..], alt_w);
-        variants.push(Variant { chr, pos, ref_allele, alt_allele });
-    }
-    variants
 }
 
 /// Parse a raw binary chunk after zstd decompression.

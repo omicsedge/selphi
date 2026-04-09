@@ -220,7 +220,7 @@ pub fn build_csi_index(bcf_path: &Path) -> io::Result<()> {
     // Scan records, build bin data per (ref_id, bin_id)
     // BinData: loffset (first vpos), chunks Vec<(beg, end)>, n_mapped
     struct BinData {
-        loffset: u64,
+        _loffset: u64,
         chunks: Vec<(u64, u64)>,
     }
 
@@ -273,7 +273,7 @@ pub fn build_csi_index(bcf_path: &Path) -> io::Result<()> {
         let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, DEFAULT_DEPTH);
         let bins = ref_bins.entry(chrom_id).or_insert_with(BTreeMap::new);
         let bin = bins.entry(bin_id).or_insert_with(|| BinData {
-            loffset: vpos,
+            _loffset: vpos,
             chunks: vec![(vpos, vpos_end)],
         });
 
@@ -370,7 +370,7 @@ pub fn build_tbi_index(vcf_gz_path: &Path) -> io::Result<()> {
 
     // Scan VCF.gz line by line, collect contig names and record positions
     struct BinData {
-        loffset: u64,
+        _loffset: u64,
         chunks: Vec<(u64, u64)>,
     }
 
@@ -385,8 +385,8 @@ pub fn build_tbi_index(vcf_gz_path: &Path) -> io::Result<()> {
     let mut line_buf = Vec::with_capacity(4096);
     let mut buf_pos = 0usize;
     let mut buf_len = 0usize;
-    let vpos_at_buf_start: u64 = 0;
-    let bytes_consumed_in_block = 0usize;
+    let _vpos_at_buf_start: u64 = 0;
+    let _bytes_consumed_in_block = 0usize;
 
     loop {
         // Track virtual position at start of line
@@ -468,7 +468,7 @@ pub fn build_tbi_index(vcf_gz_path: &Path) -> io::Result<()> {
         let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, DEFAULT_DEPTH);
         let bins = ref_bins.entry(ref_id).or_insert_with(BTreeMap::new);
         let bin = bins.entry(bin_id).or_insert_with(|| BinData {
-            loffset: vpos,
+            _loffset: vpos,
             chunks: vec![(vpos, vpos_end)],
         });
         if let Some(last) = bin.chunks.last_mut() {
@@ -643,7 +643,7 @@ pub fn build_tbi_index_with_meta(
 
         let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, DEFAULT_DEPTH);
         let bins = ref_bins.entry(ref_id).or_insert_with(BTreeMap::new);
-        let bin = bins.entry(bin_id).or_insert_with(|| BinDataM { loffset: vpos, chunks: vec![(vpos, vpos_end)] });
+        let bin = bins.entry(bin_id).or_insert_with(|| BinDataM { _loffset: vpos, chunks: vec![(vpos, vpos_end)] });
         if let Some(last) = bin.chunks.last_mut() {
             if vpos <= last.1 + (1 << 16) { last.1 = vpos_end; }
             else { bin.chunks.push((vpos, vpos_end)); }
@@ -839,7 +839,7 @@ impl InlineIndexBuilder {
         let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, DEFAULT_DEPTH);
         let bins = self.ref_bins.entry(ref_id).or_insert_with(BTreeMap::new);
         let bin = bins.entry(bin_id).or_insert_with(|| InlineBinData {
-            loffset: vpos, chunks: vec![(vpos, vpos_end)],
+            _loffset: vpos, chunks: vec![(vpos, vpos_end)],
         });
         if let Some(last) = bin.chunks.last_mut() {
             if vpos <= last.1 + (1 << 16) { last.1 = vpos_end; }

@@ -36,6 +36,7 @@ struct VariantRec {
 enum RecEncoding { Seq, Allele }
 
 /// Write a BCF reference panel as BREF3 with full parallelism.
+#[allow(unused_assignments)]
 pub fn write_bref3_from_bcf(source_path: &Path, output_path: &Path) -> io::Result<()> {
     use super::bcf_reader;
 
@@ -220,7 +221,7 @@ pub fn write_bref3_from_bcf(source_path: &Path, output_path: &Path) -> io::Resul
 /// Returns true if n_seq overflowed (caller must flush and retry).
 fn seq_coder_update(
     hap_to_seq: &mut [u16], n_seq: &mut u16, seq_cnt: &mut Vec<u32>,
-    alleles: &[u8], major_allele: u8, n_haps: usize, max_n_seq: u16,
+    alleles: &[u8], major_allele: u8, _n_haps: usize, max_n_seq: u16,
 ) -> bool {
     let old_n_seq = *n_seq as usize;
 

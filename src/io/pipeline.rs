@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Streaming interpolation → VCF pipeline.
 //!
 //! Processes intervals in tiles of ~2000 variants, interpolating dosages
@@ -390,7 +389,7 @@ pub fn write_window_to_vcf(
             intervals.len(), batches.len(), max_stripes_per_batch, stripe_comp as f64 / 1e3);
 
         // Batch tile descriptor: carries interval context for the par_iter
-        struct BTD { iv_local: usize, ts: usize, tile_n: usize, gs: usize, ws: usize, we: usize, full_range: f32 }
+        struct BTD { ts: usize, tile_n: usize, gs: usize, ws: usize, we: usize, full_range: f32 }
 
         // Double-buffer I/O: read batch N+1's stripes while batch N computes.
         // Background thread for next batch's pread.
@@ -471,14 +470,14 @@ pub fn write_window_to_vcf(
             // Phase 3: Flatten all tile_descs from this batch
             let mut all_descs: Vec<BTD> = Vec::new();
             let mut desc_counts: Vec<usize> = Vec::with_capacity(batch_ivs.len()); // descs per interval
-            for (li, iv) in batch_ivs.iter().enumerate() {
+            for iv in batch_ivs.iter() {
                 let n = iv.wgs_end - iv.wgs_start;
                 if n == 0 { desc_counts.push(0); continue; }
                 let mut cnt = 0;
                 let mut ts = 0;
                 while ts < n {
                     let tn = (n - ts).min(tile_size);
-                    all_descs.push(BTD { iv_local: li, ts, tile_n: tn, gs: iv.wgs_start + ts,
+                    all_descs.push(BTD { ts, tile_n: tn, gs: iv.wgs_start + ts,
                         ws: iv.weight_s, we: iv.weight_e, full_range: n as f32 });
                     ts += tn;
                     cnt += 1;
@@ -1632,105 +1631,6 @@ fn interpolate_tile_preloaded(
     }
 
     alt_probs
-}
-
-/// Scatter-accumulate sparse weights from CSC chunk into a dense output vector.
-/// Uses a pre-built row→col bitset for O(1) membership testing per (row, col).
-#[inline(always)]
-fn scatter_accumulate(
-    w: &CsrWeights,
-    range_start: usize, range_end: usize,
-    chunk: &crate::srp::CscChunk,
-    row_offset: usize, row_end: usize,
-    accum: &mut [f32],
-) {
-    let n_rows = row_end - row_offset;
-    // For small tile sizes, pre-build a column presence set per relevant row.
-    // This avoids repeated binary searches in the CSC column indices.
-    if n_rows <= 8000 && range_end > range_start {
-        // Build bitset: for each relevant row, which weight columns have allele=1?
-        // Instead, flip the loop: for each weight column, mark the rows.
-        let mut col_rows: Vec<(&[i32], f32)> = Vec::with_capacity(range_end - range_start);
-        for j in range_start..range_end {
-            let col = w.indices[j] as usize;
-            let wt = w.data[j];
-            let lo = chunk.indptr[col] as usize;
-            let hi = chunk.indptr[col + 1] as usize;
-            // Binary search for first row >= row_offset
-            let start = chunk.indices[lo..hi].partition_point(|&r| (r as usize) < row_offset);
-            let slice = &chunk.indices[lo + start..hi];
-            col_rows.push((slice, wt));
-        }
-        // Accumulate: for each column, iterate its rows
-        for (slice, wt) in &col_rows {
-            for &r in *slice {
-                let r = r as usize;
-                if r >= row_end { break; }
-                accum[r - row_offset] += wt;
-            }
-        }
-    } else {
-        // Original path for large tiles
-        for j in range_start..range_end {
-            let col = w.indices[j] as usize;
-            let wt = w.data[j];
-            let lo = chunk.indptr[col] as usize;
-            let hi = chunk.indptr[col + 1] as usize;
-            let mut left = lo;
-            let mut right = hi;
-            while left < right {
-                let mid = (left + right) >> 1;
-                if (chunk.indices[mid] as usize) < row_offset { left = mid + 1; } else { right = mid; }
-            }
-            for k in left..hi {
-                let r = chunk.indices[k] as usize;
-                if r >= row_end { break; }
-                accum[r - row_offset] += wt;
-            }
-        }
-    }
-}
-
-/// SIMD-friendly final interpolation: hap_out[v] = (sv[v] + t[v]*(ev[v]-sv[v])) / (ss + t[v]*ds)
-/// Branch-free, contiguous access — auto-vectorizes with target-cpu=native.
-#[inline(always)]
-fn interpolate_final(sv: &[f32], ev: &[f32], t: &[f32], ss: f32, ds: f32, out: &mut [f32]) {
-    let n = sv.len();
-    if ss == 0.0 && ds == 0.0 {
-        // No weights — output stays zero
-        return;
-    }
-    // Branch-free loop: compiler auto-vectorizes this to AVX2 (8 × f32 per cycle)
-    for v in 0..n {
-        let tv = t[v];
-        let num = sv[v] + tv * (ev[v] - sv[v]);
-        let den = ss + tv * ds;
-        out[v] = num / den;
-    }
-}
-
-/// Fast scatter using pre-transposed row-major chunk + dense weight lookup.
-/// Builds a dense weight vector (n_ref) once, then for each row iterates only
-/// the columns with allele=1 and accumulates via direct indexing — O(nnz_per_row).
-#[inline(always)]
-fn scatter_accumulate_transposed(
-    _w: &CsrWeights,
-    _range_start: usize, _range_end: usize,
-    row_indptr: &[i32], col_indices: &[i32],
-    n_rows: usize,
-    _n_ref: usize,
-    accum: &mut [f32],
-    wt_dense: &[f32],  // pre-built dense weight vector (n_ref)
-) {
-    for r in 0..n_rows {
-        let lo = row_indptr[r] as usize;
-        let hi = row_indptr[r + 1] as usize;
-        let mut sum = 0.0f32;
-        for k in lo..hi {
-            sum += wt_dense[col_indices[k] as usize];
-        }
-        accum[r] += sum;
-    }
 }
 
 /// Core interpolation kernel — parallel across haplotypes.

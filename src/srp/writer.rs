@@ -681,9 +681,6 @@ pub fn build_srp_unified(
     use super::{SparseTile, TILE_ROWS, TILE_COLS, parse_raw_chunk};
     use std::io::{Seek, SeekFrom, BufWriter};
 
-    let source = source_path.to_string_lossy().to_string();
-    let is_bcf = source.ends_with(".bcf");
-
     let header = bcf_reader::read_header_only(source_path)
         .map_err(|e| SrpWriterError::Io(e))?;
     let n_haps = header.n_samples * 2;

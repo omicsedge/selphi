@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-#![allow(unused_assignments, unused_variables)]
 //! Selphi — genotype imputation with integrated phasing.
 //!
 //! Standalone Rust binary. Mirrors the Python `selphi.py` CLI.
@@ -290,7 +288,7 @@ fn main() {
             .expect("Failed to read truth header");
 
         let imp_set: std::collections::HashSet<&str> = imp_samples.iter().map(|s| s.as_str()).collect();
-        let truth_set: std::collections::HashSet<&str> = truth_samples.iter().map(|s| s.as_str()).collect();
+        let _truth_set: std::collections::HashSet<&str> = truth_samples.iter().map(|s| s.as_str()).collect();
         let shared: Vec<String> = truth_samples.iter()
             .filter(|s| imp_set.contains(s.as_str()))
             .cloned().collect();
@@ -764,7 +762,7 @@ fn main() {
     // 11. Process each window: PBWT → HMM, then overlap VCF write with next window's PBWT.
     // Cross-window HMM state passthrough: forward state from window N → prior for window N+1
     let mut hap_priors: Vec<Option<Vec<f64>>> = vec![None; n_haps];
-    let t0_pipeline = Instant::now();
+    let _t0_pipeline = Instant::now();
     let mut vcf_write_handle: Option<std::thread::JoinHandle<()>> = None;
     
     let n_cores = rayon::current_num_threads();
@@ -1076,9 +1074,9 @@ fn main() {
             let cpu_extract_d = cpu_extract - cpu0_win;
             let cpu_coded_d = cpu_coded - cpu_extract;
             let cpu_hmm_d = cpu_hmm - cpu_coded;
-            let cpu_preload_d = cpu_preload - cpu_hmm;
+            let _cpu_preload_d = cpu_preload - cpu_hmm;
             let cpu_interp_d = cpu_wait - cpu_preload; // interp before vcf_wait now
-            let cpu_wait_d = cpu_end - cpu_wait;
+            let _cpu_wait_d = cpu_end - cpu_wait;
             let pct = |cpu: f64, wall: f64| -> f64 { if wall > 0.01 { cpu / wall / n_cores as f64 * 100.0 } else { 0.0 } };
             selphi_debug!("    W{}/{} extract={:.2}s({:.0}%) coded={:.2}s({:.0}%) hmm={:.2}s({:.0}%) interp={:.2}s({:.0}%) vcf_wait={:.2}s | total {:.0}% cpu",
                 wi_log, n_win,
@@ -1386,74 +1384,6 @@ fn intersect_variants(srp: &SrpReader, targets: &[TargetMarker]) -> (Vec<usize>,
 }
 
 /// Read target VCF using position+allele lists instead of SrpReader.
-/// Compute interpolation breakpoints matching Python's Interpolator.breakpoints.
-/// Groups chip-site intervals into work-balanced chunks by SRP density.
-fn compute_interpolation_breaks(
-    wgs_idx: &[usize], srp: &SrpReader, min_chunks: usize,
-) -> Vec<(usize, usize)> {
-    let n_chip = wgs_idx.len();
-    if n_chip < 2 || min_chunks < 1 {
-        return vec![(0, n_chip)];
-    }
-
-    // original_ref_indices = [0, wgs_idx[0], wgs_idx[1], ..., wgs_idx[n-1], n_variants-1]
-    let mut orig_ref = Vec::with_capacity(n_chip + 2);
-    orig_ref.push(0usize);
-    for &wi in wgs_idx { orig_ref.push(wi); }
-    orig_ref.push(srp.n_variants() - 1);
-
-    let n_intervals = orig_ref.len() - 1;
-
-    // Density weights from chunk NNZ (deterministic, compression-independent)
-    let chunk_nnz = srp.get_chunk_nnz();
-    let mean_nnz = if chunk_nnz.is_empty() { 1.0 } else {
-        chunk_nnz.iter().sum::<f64>() / chunk_nnz.len() as f64
-    };
-    let chunk_size = srp.chunk_size();
-
-    let mut interval_weights = vec![0.0f64; n_intervals];
-    for i in 0..n_intervals {
-        let ref_start = orig_ref[i];
-        let ref_end = orig_ref[i + 1];
-        let n_vars = ref_end.saturating_sub(ref_start);
-        if n_vars == 0 { continue; }
-        let first_srp = (ref_start / chunk_size).min(chunk_nnz.len().saturating_sub(1));
-        let last_srp = (ref_end / chunk_size).min(chunk_nnz.len().saturating_sub(1));
-        let avg_density: f64 = chunk_nnz[first_srp..=last_srp].iter().sum::<f64>()
-            / (last_srp - first_srp + 1) as f64 / mean_nnz;
-        interval_weights[i] = n_vars as f64 * avg_density;
-    }
-
-    let total_work: f64 = interval_weights.iter().sum();
-    let target_work = total_work / min_chunks as f64;
-
-    // Group intervals into chunks
-    let mut chunks: Vec<Vec<(usize, usize)>> = Vec::new();
-    let mut current_chunk = Vec::new();
-    let mut current_work = 0.0;
-    for i in 0..n_intervals {
-        current_chunk.push((i, i + 1));
-        current_work += interval_weights[i];
-        if current_work >= target_work {
-            chunks.push(current_chunk);
-            current_chunk = Vec::new();
-            current_work = 0.0;
-        }
-    }
-    if !current_chunk.is_empty() {
-        chunks.push(current_chunk);
-    }
-
-    // Convert to breakpoints: (first_interval_start, last_interval_end + 1)
-    // These are chip-site indices (0-based into the chip array)
-    let breaks: Vec<(usize, usize)> = chunks.iter().map(|chunk| {
-        (chunk[0].0, chunk.last().unwrap().1.min(n_chip))
-    }).collect();
-
-    selphi_debug!("  HMM breakpoints: {} blocks (min_chunks={})", breaks.len(), min_chunks);
-    breaks
-}
-
 /// Write phased-only VCF (chip sites only, GT format).
 fn write_phased_vcf(
     phased: &[u8],               // (n_chip, n_haps) row-major
