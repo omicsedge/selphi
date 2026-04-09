@@ -655,19 +655,23 @@ fn main() {
     let out_path = PathBuf::from(output_path);
     let no_ap = args.no_ap;
 
+    // Validate conflicting flags
+    if args.vcf && args.bcf {
+        eprintln!("Error: --vcf and --bcf are mutually exclusive (both use the same output channel)");
+        std::process::exit(1);
+    }
+
     // Determine active output formats:
-    //   (default) → VCF.gz only
-    //   --bcf → BCF replaces VCF (mutually exclusive: same channel)
-    //   --parquet, --pgen → additive (always combined with VCF or BCF)
-    //   --all-formats → VCF.gz + Parquet + PGEN (all format families)
-    //   Combos: --parquet --pgen → VCF + Parquet + PGEN
-    //           --bcf --parquet --pgen → BCF + Parquet + PGEN
+    //   (default) → VCF.gz (always produced unless --bcf replaces it)
+    //   --bcf → BCF replaces VCF (mutually exclusive)
+    //   --parquet, --pgen, --selfdecode → additive
+    //   --all-formats → VCF + Parquet + PGEN + SelfDecode
     let formats = selphi::io::pipeline::OutputFormats {
-        vcf: !args.bcf,  // always produce VCF unless --bcf replaces it
+        vcf: !args.bcf,
         bcf: args.bcf,
         parquet: args.parquet || args.all_formats,
         pgen: args.pgen || args.all_formats,
-        selfdecode: args.selfdecode,
+        selfdecode: args.selfdecode || args.all_formats,
     };
 
     // Primary output file (the VCF/BCF path)
