@@ -69,16 +69,31 @@ Input VCF/BCF
      +--- Impute ----------------------+
           +-- PBWT candidate selection
           +-- Li-Stephens fwd-bwd (f32)
-          +-- Fused scatter-accumulate interpolation
+          +-- Batch-parallel tiled interpolation:
+          |     Batch intervals → par_iter tile_descs
+          |     → par_chunks_mut haps (fused scatter+divide)
+          |     Sequential pread + double-buffer I/O
           +-- Streaming output (VCF/BCF/Parquet/PGEN)
 ```
 
 ### Key Design Principles
 - **Bitmatrix-native**: 1 bit per allele throughout. No byte-per-allele arrays.
-- **Unified pipeline**: Phase -> impute in-memory. Single ref panel extraction.
+- **Tiled interpolation**: 2D tiles (1024×4096) in L2 cache, batch-parallel intervals, 86% CPU.
+- **Sequential I/O**: PreloadedStripes pread, double-buffer I/O, zero page faults.
+- **Unified pipeline**: Phase → impute in-memory. Single ref panel extraction.
 - **Deterministic**: Bit-identical results across runs.
 - **AVX-512 accelerated**: Diplotype HMM forward pass, auto-vectorized imputation.
 - **Streaming I/O**: Parallel BGZF compression, channel-based VCF/BCF writing.
+
+### Reference Panel Formats
+
+| File | Purpose | Notes |
+|------|---------|-------|
+| `.srp` | Base format (ZIP, zstd chunks, JSON metadata) | Required, holds variants/IDs/samples |
+| `.srp2` | Flat indexed file (mmap for chunk loading) | Used for bitmatrix extraction |
+| `.srpt` | Tiled format (1024×4096 tiles, zstd-3) | Used for interpolation, auto-detected |
+
+Generate all three with `--prepare-reference-from panel.bcf --out panel`.
 
 ### Rust Modules (src/)
 
@@ -89,14 +104,16 @@ Input VCF/BCF
 | `diploid/` | Diploid phasing engine |
 | `imputation/pbwt.rs` | PBWT matching, candidate selection |
 | `imputation/hmm.rs` | Li-Stephens HMM (f32 forward, f64 backward) |
-| `io/pipeline.rs` | Streaming output pipeline, fused interpolation kernel |
+| `io/pipeline.rs` | Batch-parallel tiled interpolation + streaming VCF output |
 | `io/bcf_encode.rs` | Native BCF2.2 binary encoder |
 | `io/parquet_output.rs` | Apache Parquet writer (arrow-rs) |
 | `io/pgen_output.rs` | PLINK2 PGEN writer |
 | `io/bcf_writer.rs` | BGZF multi-threaded writer wrapper |
-| `srp/mod.rs` | SRP shared types (CscChunk, Variant, UCS-4) |
-| `srp/reader.rs` | SRP reader (RwLock chunk cache) |
-| `srp/writer.rs` | SRP writer (streaming assembly) |
+| `srp/mod.rs` | SRP shared types (CscChunk, SparseTile, Variant) |
+| `srp/reader.rs` | SRP v1 reader (ZIP, variants_bin fast path) |
+| `srp/writer.rs` | SRP writer (BCF→SRP, with variants_bin) |
+| `srp/tiled.rs` | Tiled SRP writer/reader (zstd-3, PreloadedStripes) |
+| `srp/srp2.rs` | SRP v2 flat format (mmap chunk access) |
 | `srp/bcf_reader.rs` | Native BCF2 parser (parallel regional reads) |
 | `srp/bref3.rs` | Native BREF3 reader |
 | `srp/csi.rs` | CSI/TBI index parser + writer |
