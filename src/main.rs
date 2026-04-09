@@ -720,6 +720,17 @@ fn main() {
         (tx, handle, ())
     };
 
+    // Log active output formats
+    {
+        let mut fmts = Vec::new();
+        if formats.vcf { fmts.push("VCF.gz"); }
+        if formats.bcf { fmts.push("BCF"); }
+        if formats.parquet { fmts.push("Parquet"); }
+        if formats.pgen { fmts.push("PGEN"); }
+        if formats.selfdecode { fmts.push("SelfDecode"); }
+        selphi_info!("  formats:  {}", fmts.join(" + "));
+    }
+
     // Compute MAF-adaptive Ne per site: rare variants need lower Ne (concentrated
     // HMM weights), common variants benefit from higher Ne (smoother transitions).
     // Crossover at ~MAF 0.5% based on sweep data.

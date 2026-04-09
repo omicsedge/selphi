@@ -292,6 +292,9 @@ impl SelfdecodeWriter {
         for s in 0..n {
             self.flush_sample(s)?;
         }
+        let total_chunks: usize = self.chunk_counts.values().sum();
+        crate::selphi_info!("  SelfDecode: {} samples, {} chunks written",
+            self.sample_names.len(), total_chunks);
         self.zip.finish().map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(())
     }

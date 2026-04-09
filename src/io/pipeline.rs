@@ -1032,9 +1032,12 @@ pub fn write_window_multiformat(
     }
 
     // ---- INTERPOLATE ONCE ----
+    let t0_interp = std::time::Instant::now();
     let interval_tiles = interpolate_window_tiles(srp, &setup, preloaded_stripes, preloaded_chunks)?;
+    let interp_secs = t0_interp.elapsed().as_secs_f64();
 
     // ---- ENCODE TO ALL ACTIVE FORMATS ----
+    let t0_encode = std::time::Instant::now();
     let mut vcf_bytes: Vec<Vec<u8>> = Vec::new();
     let mut next_wgs = setup.own_wgs_start;
 
@@ -1232,6 +1235,10 @@ pub fn write_window_multiformat(
         }
         next_wgs += 1;
     }
+
+    let encode_secs = t0_encode.elapsed().as_secs_f64();
+    crate::selphi_debug!("  [multiformat] interp={:.2}s encode={:.2}s total={:.2}s",
+        interp_secs, encode_secs, interp_secs + encode_secs);
 
     Ok(vcf_bytes)
 }
