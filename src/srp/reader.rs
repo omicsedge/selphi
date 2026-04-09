@@ -120,14 +120,12 @@ impl SrpReader {
             }
         } else { (None, vec![]) };
 
-        // Check for tiled SRP (.srpt) — 2D tile format for fast interpolation
+        // Tiled SRP loaded lazily (not at open time) to avoid double-mmap memory.
         let tiled_path = std::path::Path::new(&filepath).with_extension("srpt");
-        let tiled = if tiled_path.exists() {
-            match super::tiled::TiledSrpReader::open(&tiled_path) {
-                Ok(t) => Some(t),
-                Err(e) => { eprintln!("  Warning: tiled SRP load failed: {}", e); None }
-            }
-        } else { None };
+        let tiled = None;
+        if tiled_path.exists() {
+            eprintln!("  Tiled SRP available: {} (load deferred to interpolation)", tiled_path.display());
+        }
 
         SrpReader {
             filepath,
@@ -165,6 +163,21 @@ impl SrpReader {
     pub fn chromosome(&self) -> &str { &self.metadata.chromosome }
     pub fn is_v2(&self) -> bool { self.v2_mmap.is_some() }
     pub fn is_tiled(&self) -> bool { self.tiled.is_some() }
+
+    /// Load tiled SRP backend if .srpt file exists. Call before interpolation.
+    /// Drops v2 mmap to free memory (tiled replaces v2 for interpolation).
+    pub fn load_tiled(&mut self) -> bool {
+        if self.tiled.is_some() { return true; }
+        let tiled_path = std::path::Path::new(&self.filepath).with_extension("srpt");
+        if !tiled_path.exists() { return false; }
+        // Drop v2 mmap before loading tiled to avoid double memory
+        self.v2_mmap = None;
+        self.v2_chunk_index.clear();
+        match super::tiled::TiledSrpReader::open(&tiled_path) {
+            Ok(t) => { self.tiled = Some(t); true }
+            Err(e) => { eprintln!("  Warning: tiled SRP load failed: {}", e); false }
+        }
+    }
 
     pub fn get_chunk_compressed_sizes(&self) -> Vec<f64> {
         let file = File::open(&self.filepath).unwrap();

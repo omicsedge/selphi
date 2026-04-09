@@ -138,11 +138,10 @@ impl SparseTile {
         let nnz = self.indices.len();
         let size = 8 + (self.n_cols as usize + 1) * 4 + nnz * 2;
         let mut buf = Vec::with_capacity(size);
-        buf.extend_from_slice(&self.n_rows.to_le_bytes());
-        buf.extend_from_slice(&self.n_cols.to_le_bytes());
-        buf.extend_from_slice(&(nnz as u32).to_le_bytes());
-        // pad to 8 bytes header
-        buf.extend_from_slice(&[0u8; 2]);
+        buf.extend_from_slice(&self.n_rows.to_le_bytes());  // 2 bytes
+        buf.extend_from_slice(&self.n_cols.to_le_bytes());  // 2 bytes
+        buf.extend_from_slice(&(nnz as u32).to_le_bytes()); // 4 bytes
+        // Header = 8 bytes total. No padding needed.
         for &v in &self.indptr { buf.extend_from_slice(&v.to_le_bytes()); }
         for &v in &self.indices { buf.extend_from_slice(&v.to_le_bytes()); }
         buf

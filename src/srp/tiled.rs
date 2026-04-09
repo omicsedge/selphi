@@ -79,84 +79,105 @@ pub fn write_tiled(
     let header_compressed = zstd::encode_all(Cursor::new(&header_json), 3)
         .map_err(|e| io::Error::other(e))?;
 
-    // Process tiles stripe-by-stripe (one stripe = TILE_ROWS variants, all bands).
-    // For each stripe: load source chunks that cover it, extract tiles, compress.
-    let mut tile_data: Vec<Vec<u8>> = vec![Vec::new(); n_tiles]; // compressed tile data
+    // Process chunk-by-chunk: decompress each source chunk ONCE, tile all stripes it covers.
+    // Each source chunk (~9000 rows) covers ~9 stripes (1024 rows each).
+    let n_src_chunks = (n_variants + chunk_size - 1) / chunk_size;
+    let mut tile_data: Vec<Vec<u8>> = vec![Vec::new(); n_tiles];
 
-    for stripe in 0..n_tile_rows {
-        let var_start = stripe * TILE_ROWS;
-        let var_end = (var_start + TILE_ROWS).min(n_variants);
-        let n_rows = var_end - var_start;
+    let t0 = std::time::Instant::now();
+    for cid in 0..n_src_chunks {
+        let chunk = source.load_chunk_from_source(cid);
+        let chunk_var_start = cid * chunk_size;
+        let chunk_var_end = chunk_var_start + chunk.n_rows;
 
-        // Which source chunks cover this variant range?
-        let first_src_chunk = var_start / chunk_size;
-        let last_src_chunk = (var_end - 1) / chunk_size;
+        // Which stripes does this chunk cover?
+        let first_stripe = chunk_var_start / TILE_ROWS;
+        let last_stripe = (chunk_var_end - 1) / TILE_ROWS;
 
-        // Load source chunks in parallel
-        let src_chunks: Vec<(usize, CscChunk)> = (first_src_chunk..=last_src_chunk)
-            .into_par_iter()
-            .map(|cid| (cid, source.load_chunk_from_source(cid)))
-            .collect();
+        // For each stripe × band that overlaps this chunk, build the tile
+        for stripe in first_stripe..=last_stripe {
+            let stripe_var_start = stripe * TILE_ROWS;
+            let stripe_var_end = (stripe_var_start + TILE_ROWS).min(n_variants);
+            let ov_start = chunk_var_start.max(stripe_var_start);
+            let ov_end = chunk_var_end.min(stripe_var_end);
+            if ov_start >= ov_end { continue; }
+            let n_rows = stripe_var_end - stripe_var_start;
 
-        // For each band, extract the sub-CSC tile and compress
-        let band_tiles: Vec<Vec<u8>> = (0..n_tile_cols).into_par_iter().map(|band| {
-            let col_start = band * TILE_COLS;
-            let col_end = (col_start + TILE_COLS).min(n_haps);
-            let n_cols = col_end - col_start;
+            // Parallel across bands
+            let band_tiles: Vec<(usize, Vec<u8>)> = (0..n_tile_cols).into_par_iter().map(|band| {
+                let col_start = band * TILE_COLS;
+                let col_end = (col_start + TILE_COLS).min(n_haps);
+                let n_cols = col_end - col_start;
 
-            // Build CSC tile: for each column in [col_start, col_end), collect rows in [var_start, var_end)
-            let mut indptr = Vec::with_capacity(n_cols + 1);
-            let mut indices = Vec::new();
-            indptr.push(0u32);
+                let mut indptr = Vec::with_capacity(n_cols + 1);
+                let mut indices = Vec::new();
+                indptr.push(0u32);
 
-            for local_col in 0..n_cols {
-                let global_col = col_start + local_col;
-                // Find which source chunk(s) have data for this column + row range
-                for &(cid, ref chunk) in &src_chunks {
-                    let chunk_var_start = cid * chunk_size;
-                    let chunk_var_end = chunk_var_start + chunk.n_rows;
-                    // Overlap with [var_start, var_end)
-                    let ov_start = var_start.max(chunk_var_start);
-                    let ov_end = var_end.min(chunk_var_end);
-                    if ov_start >= ov_end { continue; }
-                    if global_col >= chunk.n_cols { continue; }
-
-                    let lo = chunk.indptr[global_col] as usize;
-                    let hi = chunk.indptr[global_col + 1] as usize;
-                    let row_slice = &chunk.indices[lo..hi];
-                    // Binary search for ov_start - chunk_var_start
-                    let local_ov_start = (ov_start - chunk_var_start) as i32;
-                    let local_ov_end = (ov_end - chunk_var_start) as i32;
-                    let start_idx = row_slice.partition_point(|&r| r < local_ov_start);
-                    for k in start_idx..row_slice.len() {
-                        let r = row_slice[k];
-                        if r >= local_ov_end { break; }
-                        // Convert to tile-local row index
-                        let global_row = chunk_var_start + r as usize;
-                        let tile_row = global_row - var_start;
-                        indices.push(tile_row as u16);
+                for local_col in 0..n_cols {
+                    let global_col = col_start + local_col;
+                    if global_col < chunk.n_cols {
+                        let lo = chunk.indptr[global_col] as usize;
+                        let hi = chunk.indptr[global_col + 1] as usize;
+                        let row_slice = &chunk.indices[lo..hi];
+                        let local_ov_start = (ov_start - chunk_var_start) as i32;
+                        let local_ov_end = (ov_end - chunk_var_start) as i32;
+                        let start_idx = row_slice.partition_point(|&r| r < local_ov_start);
+                        for k in start_idx..row_slice.len() {
+                            let r = row_slice[k];
+                            if r >= local_ov_end { break; }
+                            let global_row = chunk_var_start + r as usize;
+                            let tile_row = global_row - stripe_var_start;
+                            indices.push(tile_row as u16);
+                        }
                     }
+                    indptr.push(indices.len() as u32);
                 }
-                indptr.push(indices.len() as u32);
+
+                let tile = SparseTile { indptr, indices, n_rows: n_rows as u16, n_cols: n_cols as u16 };
+                (band, lz4_flex::compress_prepend_size(&tile.to_bytes()))
+            }).collect();
+
+            for (band, data) in band_tiles {
+                let idx = stripe * n_tile_cols + band;
+                if tile_data[idx].is_empty() {
+                    tile_data[idx] = data;
+                } else {
+                    // Stripe spans two chunks: merge by appending indices.
+                    // For simplicity, rebuild tile from both contributions.
+                    // This happens at chunk boundaries (~2000 times, negligible).
+                    let existing = SparseTile::from_bytes(
+                        &lz4_flex::decompress_size_prepended(&tile_data[idx]).unwrap());
+                    let new_part = SparseTile::from_bytes(
+                        &lz4_flex::decompress_size_prepended(&data).unwrap());
+                    // Merge: combine columns from both
+                    let nc = existing.n_cols as usize;
+                    let mut merged_indptr = Vec::with_capacity(nc + 1);
+                    let mut merged_indices = Vec::new();
+                    merged_indptr.push(0u32);
+                    for c in 0..nc {
+                        let (elo, ehi) = existing.col_range(c);
+                        for k in elo..ehi { merged_indices.push(existing.indices[k]); }
+                        let (nlo, nhi) = new_part.col_range(c);
+                        for k in nlo..nhi { merged_indices.push(new_part.indices[k]); }
+                        // Sort indices for this column (merge two sorted lists)
+                        let start = merged_indptr.last().copied().unwrap() as usize;
+                        merged_indices[start..].sort_unstable();
+                        merged_indptr.push(merged_indices.len() as u32);
+                    }
+                    let merged = SparseTile {
+                        indptr: merged_indptr, indices: merged_indices,
+                        n_rows: existing.n_rows, n_cols: existing.n_cols,
+                    };
+                    tile_data[idx] = lz4_flex::compress_prepend_size(&merged.to_bytes());
+                }
             }
-
-            let tile = SparseTile {
-                indptr,
-                indices,
-                n_rows: n_rows as u16,
-                n_cols: n_cols as u16,
-            };
-            let raw = tile.to_bytes();
-            lz4_flex::compress_prepend_size(&raw)
-        }).collect();
-
-        // Store compressed tiles
-        for (band, data) in band_tiles.into_iter().enumerate() {
-            tile_data[stripe * n_tile_cols + band] = data;
         }
 
-        if (stripe + 1) % 500 == 0 || stripe + 1 == n_tile_rows {
-            eprintln!("  Stripe {}/{} ({} vars)", stripe + 1, n_tile_rows, var_end);
+        if (cid + 1) % 100 == 0 || cid + 1 == n_src_chunks {
+            let elapsed = t0.elapsed().as_secs_f64();
+            let rate = (cid + 1) as f64 / elapsed;
+            let eta = (n_src_chunks - cid - 1) as f64 / rate;
+            eprintln!("  Chunk {}/{} ({:.0} chunks/s, ETA {:.0}s)", cid + 1, n_src_chunks, rate, eta);
         }
     }
 

@@ -458,7 +458,7 @@ fn main() {
     let start_time = Instant::now();
 
     // 1. Load reference panel
-    let srp = Arc::new(SrpReader::open(&args.refpanel, args.threads * 2));
+    let mut srp = Arc::new(SrpReader::open(&args.refpanel, args.threads * 2));
     let n_ref_variants = srp.n_variants();
     let n_ref = srp.n_haps();
     let ref_positions: Vec<i64> = srp.variants.iter().map(|v| v.pos).collect();
@@ -648,6 +648,12 @@ fn main() {
     selphi_debug!("  RS cm_ld[100]={:.15}", chip_cm[100]);
     selphi_debug!("  RS cm_ld[1000]={:.15}", chip_cm[1000]);
     selphi_step!("Genetic map loaded + LD correction");
+
+    // Tiled SRP: format ready but kernel not yet faster than CSC (mmap page faults).
+    // TODO: enable when tiled I/O is optimized (pre-load or buffered reads).
+    // if let Some(srp_mut) = Arc::get_mut(&mut srp) {
+    //     if srp_mut.load_tiled() { selphi_step!("Tiled SRP loaded"); }
+    // }
 
     // 7. Auto-calibrate parameters
     let match_length = args.match_length.unwrap_or_else(|| {

@@ -394,55 +394,83 @@ pub fn write_window_to_vcf(
         let iv_first = interval.wgs_start / chunk_size;
         let iv_last = if interval.wgs_end > 0 { (interval.wgs_end - 1) / chunk_size } else { iv_first };
 
-        // Evict old chunks (always, even with preloaded data) to cap memory.
-        let evict_below = iv_first.saturating_sub(1);
-        if evict_below > cache_low {
-            for cid in cache_low..evict_below { chunk_cache[cid - window_first_chunk] = None; }
-            cache_low = evict_below;
-        }
-
-        // Load new chunks in parallel batches (adaptive_batch at a time for rayon parallelism).
-        if iv_last >= cache_high {
-            let new_high = (cache_high + adaptive_batch).min(window_last_chunk + 1);
-            let load_ids: Vec<usize> = (cache_high..new_high)
-                .filter(|id| chunk_cache[id - window_first_chunk].is_none())
-                .collect();
-            if !load_ids.is_empty() {
-                let t0 = std::time::Instant::now();
-                let cpu0 = crate::log::cpu_time_secs();
-                let new_chunks: Vec<(usize, crate::srp::CscChunk)> = load_ids.par_iter()
-                    .map(|&cid| (cid, srp.load_chunk_from_source(cid)))
-                    .collect();
-                for (cid, chunk) in new_chunks { chunk_cache[cid - window_first_chunk] = Some(chunk); }
-                _t_chunk_load += t0.elapsed().as_secs_f64();
-                _cpu_chunk_load += crate::log::cpu_time_secs() - cpu0;
-            }
-            cache_high = new_high;
-        }
-
-        // Parallel tile computation: interpolation + formatting
-        // No HashMap rebuild — Vec-indexed O(1) chunk lookup directly.
+        // Tile computation: tiled path (L2-cache tiles) or CSC chunk path.
         use rayon::prelude::*;
         let t0_tiles = std::time::Instant::now();
         let cpu0_tiles = crate::log::cpu_time_secs();
-        let tile_bufs: Vec<Vec<u8>> = tile_descs.par_iter().map(|&(ts, tile_n, global_start)| {
-            let t: Vec<f32> = (0..tile_n)
-                .map(|v| (ts + v) as f32 / full_range)
-                .collect();
 
-            let alt_probs = interpolate_tile_preloaded(
-                &chunk_cache, window_first_chunk, &weight_refs, interval.weight_s, interval.weight_e,
-                global_start, tile_n, &t, n_haps, chunk_size,
-            );
+        // Tiled format exists but CSC is faster for now (mmap page faults on 17GB tiled file).
+        // TODO: pre-load tiled data or use buffered I/O instead of mmap random access.
+        let use_tiled = false; // srp.is_tiled();
 
-            let vp_start = global_start - own_wgs_start;
-            format_tile_batch(
-                &alt_probs, tile_n, n_haps, n_samples,
-                global_start, n_ref_variants,
-                vp_start, &vid_prefixes, &is_chip, &chip_local_idx,
-                chip_genotypes, &an_str, no_ap,
-            )
-        }).collect();
+        if !use_tiled {
+            // CSC chunk path: evict + load + scatter from 74 MB chunks
+            let evict_below = iv_first.saturating_sub(1);
+            if evict_below > cache_low {
+                for cid in cache_low..evict_below { chunk_cache[cid - window_first_chunk] = None; }
+                cache_low = evict_below;
+            }
+            if iv_last >= cache_high {
+                let new_high = (cache_high + adaptive_batch).min(window_last_chunk + 1);
+                let load_ids: Vec<usize> = (cache_high..new_high)
+                    .filter(|id| chunk_cache[id - window_first_chunk].is_none())
+                    .collect();
+                if !load_ids.is_empty() {
+                    let t0 = std::time::Instant::now();
+                    let cpu0 = crate::log::cpu_time_secs();
+                    let new_chunks: Vec<(usize, crate::srp::CscChunk)> = load_ids.par_iter()
+                        .map(|&cid| (cid, srp.load_chunk_from_source(cid)))
+                        .collect();
+                    for (cid, chunk) in new_chunks { chunk_cache[cid - window_first_chunk] = Some(chunk); }
+                    _t_chunk_load += t0.elapsed().as_secs_f64();
+                    _cpu_chunk_load += crate::log::cpu_time_secs() - cpu0;
+                }
+                cache_high = new_high;
+            }
+        }
+
+        let tile_bufs: Vec<Vec<u8>> = if use_tiled {
+            // Tiled path: parallel over intervals, sequential per-haplotype inside.
+            let tiled_ref = srp.tiled.as_ref().unwrap();
+            tile_descs.par_iter().map(|&(ts, tile_n, global_start)| {
+                let t: Vec<f32> = (0..tile_n)
+                    .map(|v| (ts + v) as f32 / full_range)
+                    .collect();
+
+                let alt_probs = interpolate_tile_tiled(
+                    tiled_ref, &weight_refs, interval.weight_s, interval.weight_e,
+                    global_start, tile_n, &t, n_haps,
+                );
+
+                let vp_start = global_start - own_wgs_start;
+                format_tile_batch(
+                    &alt_probs, tile_n, n_haps, n_samples,
+                    global_start, n_ref_variants,
+                    vp_start, &vid_prefixes, &is_chip, &chip_local_idx,
+                    chip_genotypes, &an_str, no_ap,
+                )
+            }).collect()
+        } else {
+            // CSC chunk path
+            tile_descs.par_iter().map(|&(ts, tile_n, global_start)| {
+                let t: Vec<f32> = (0..tile_n)
+                    .map(|v| (ts + v) as f32 / full_range)
+                    .collect();
+
+                let alt_probs = interpolate_tile_preloaded(
+                    &chunk_cache, window_first_chunk, &weight_refs, interval.weight_s, interval.weight_e,
+                    global_start, tile_n, &t, n_haps, chunk_size,
+                );
+
+                let vp_start = global_start - own_wgs_start;
+                format_tile_batch(
+                    &alt_probs, tile_n, n_haps, n_samples,
+                    global_start, n_ref_variants,
+                    vp_start, &vid_prefixes, &is_chip, &chip_local_idx,
+                    chip_genotypes, &an_str, no_ap,
+                )
+            }).collect()
+        };
         _t_interp += t0_tiles.elapsed().as_secs_f64();
         _cpu_tiles += crate::log::cpu_time_secs() - cpu0_tiles;
 
@@ -1651,6 +1679,179 @@ fn scatter_col_weighted(
         let r = chunk.indices[k] as usize;
         if r >= row_end { break; }
         let v = r - row_offset;
+        accum[v] += base + t[v] * slope;
+    }
+}
+
+// ============================================================================
+// Tiled interpolation kernel — L2-cache resident tiles (~500 KB each)
+// ============================================================================
+
+/// Interpolate a variant range using 2D tiled SRP format.
+/// Each tile (1024×4096) fits in L2 cache. All bands decompressed per-stripe (~21 MB in L3).
+pub fn interpolate_tile_tiled(
+    tiled: &crate::srp::tiled::TiledSrpReader,
+    weights: &[&CsrWeights],
+    chip_s: usize, chip_e: usize,
+    global_start: usize,
+    tile_n: usize,
+    t: &[f32],
+    n_haps: usize,
+) -> Vec<f32> {
+    use crate::srp::{TILE_ROWS, TILE_COLS};
+    let mut alt_probs = vec![0.0f32; n_haps * tile_n];
+    let global_end = global_start + tile_n;
+
+    let first_stripe = global_start / TILE_ROWS;
+    let last_stripe = (global_end - 1) / TILE_ROWS;
+    let n_tile_cols = tiled.n_tile_cols;
+
+    for stripe in first_stripe..=last_stripe {
+        let stripe_var_start = stripe * TILE_ROWS;
+        let stripe_var_end = (stripe_var_start + TILE_ROWS).min(tiled.n_variants());
+        let ov_start = global_start.max(stripe_var_start);
+        let ov_end = global_end.min(stripe_var_end);
+        if ov_start >= ov_end { continue; }
+        let ov_n = ov_end - ov_start;
+        let local_row_start = ov_start - stripe_var_start; // offset within tile's rows
+        let local_row_end = local_row_start + ov_n;
+        let out_offset = ov_start - global_start; // offset within output
+
+        // Decompress all bands for this stripe sequentially (avoids nested rayon deadlock).
+        // LZ4 is fast: 42 tiles × ~300 KB = ~13 MB → ~3 ms sequential.
+        let tiles: Vec<crate::srp::SparseTile> = (0..n_tile_cols)
+            .map(|band| tiled.decompress_tile(stripe, band))
+            .collect();
+
+        // Sequential scatter per haplotype (parallelism at tile_descs level, not here)
+        alt_probs.chunks_mut(tile_n)
+            .take(n_haps)
+            .enumerate()
+            .for_each(|(h, hap_out)| {
+                let w = weights[h];
+                let s1 = w.indptr[chip_s] as usize;
+                let e1 = w.indptr[chip_s + 1] as usize;
+                let s2 = w.indptr[chip_e] as usize;
+                let e2 = w.indptr[chip_e + 1] as usize;
+
+                let mut ss: f32 = 0.0;
+                for j in s1..e1 { ss += w.data[j]; }
+                let mut es: f32 = 0.0;
+                for j in s2..e2 { es += w.data[j]; }
+                let ds = es - ss;
+                if ss == 0.0 && ds == 0.0 { return; }
+
+                // Fused scatter from tiles: merge start/end weight ranges
+                let out_slice = &mut hap_out[out_offset..out_offset + ov_n];
+                let t_slice = &t[out_offset..out_offset + ov_n];
+
+                scatter_fused_tiled(
+                    w, s1, e1, s2, e2,
+                    &tiles, n_tile_cols,
+                    local_row_start, local_row_end,
+                    t_slice, out_slice,
+                );
+
+            });
+    }
+
+    // Final division: numerator / denominator for each haplotype
+    alt_probs.chunks_mut(tile_n)
+        .take(n_haps)
+        .enumerate()
+        .for_each(|(h, hap_out)| {
+            let w = weights[h];
+            let s1 = w.indptr[chip_s] as usize;
+            let e1 = w.indptr[chip_s + 1] as usize;
+            let s2 = w.indptr[chip_e] as usize;
+            let e2 = w.indptr[chip_e + 1] as usize;
+            let mut ss: f32 = 0.0;
+            for j in s1..e1 { ss += w.data[j]; }
+            let mut es: f32 = 0.0;
+            for j in s2..e2 { es += w.data[j]; }
+            let ds = es - ss;
+            if ss == 0.0 && ds == 0.0 { return; }
+            for v in 0..tile_n {
+                let den = ss + t[v] * ds;
+                if den != 0.0 { hap_out[v] /= den; }
+            }
+        });
+
+    alt_probs
+}
+
+/// Fused scatter from tiled format: merge start/end weight ranges, scatter from tiles.
+#[inline(always)]
+fn scatter_fused_tiled(
+    w: &CsrWeights,
+    s1: usize, e1: usize,
+    s2: usize, e2: usize,
+    tiles: &[crate::srp::SparseTile],
+    n_tile_cols: usize,
+    row_start: usize, row_end: usize,
+    t: &[f32],
+    accum: &mut [f32],
+) {
+    let mut i = s1;
+    let mut j = s2;
+
+    while i < e1 && j < e2 {
+        let ci = w.indices[i] as usize;
+        let cj = w.indices[j] as usize;
+
+        if ci < cj {
+            let ws = w.data[i];
+            scatter_col_tiled(tiles, ci, n_tile_cols, row_start, row_end, t, accum, ws, -ws);
+            i += 1;
+        } else if ci > cj {
+            let we = w.data[j];
+            scatter_col_tiled(tiles, cj, n_tile_cols, row_start, row_end, t, accum, 0.0, we);
+            j += 1;
+        } else {
+            let ws = w.data[i];
+            let we = w.data[j];
+            scatter_col_tiled(tiles, ci, n_tile_cols, row_start, row_end, t, accum, ws, we - ws);
+            i += 1;
+            j += 1;
+        }
+    }
+    while i < e1 {
+        let ws = w.data[i];
+        scatter_col_tiled(tiles, w.indices[i] as usize, n_tile_cols, row_start, row_end, t, accum, ws, -ws);
+        i += 1;
+    }
+    while j < e2 {
+        let we = w.data[j];
+        scatter_col_tiled(tiles, w.indices[j] as usize, n_tile_cols, row_start, row_end, t, accum, 0.0, we);
+        j += 1;
+    }
+}
+
+/// Scatter from a single column in the tiled format.
+/// Maps global column to (band, local_col), then reads from the tile's u16 indices.
+#[inline(always)]
+fn scatter_col_tiled(
+    tiles: &[crate::srp::SparseTile],
+    global_col: usize,
+    _n_tile_cols: usize,
+    row_start: usize, row_end: usize,
+    t: &[f32],
+    accum: &mut [f32],
+    base: f32, slope: f32,
+) {
+    use crate::srp::TILE_COLS;
+    let band = global_col / TILE_COLS;
+    let local_col = global_col % TILE_COLS;
+    let tile = &tiles[band];
+    if local_col >= tile.n_cols as usize { return; }
+
+    let (lo, hi) = tile.col_range(local_col);
+    let row_slice = &tile.indices[lo..hi];
+    let start = row_slice.partition_point(|&r| (r as usize) < row_start);
+    for k in start..row_slice.len() {
+        let r = row_slice[k] as usize;
+        if r >= row_end { break; }
+        let v = r - row_start;
         accum[v] += base + t[v] * slope;
     }
 }
