@@ -319,11 +319,6 @@ impl TiledSrpReader {
             }
         }).collect();
 
-        let file_size = std::fs::metadata(path)?.len();
-        let idx_mb = (n_tiles * 12) as f64 / 1e6;
-        eprintln!("  Tiled SRP: {} ({}x{} tiles, {:.1} MB file, {:.1} MB index)",
-            path.display(), n_tile_rows, n_tile_cols, file_size as f64 / 1e6, idx_mb);
-
         Ok(Self {
             file_path: path.to_path_buf(),
             n_variants, n_haps,
