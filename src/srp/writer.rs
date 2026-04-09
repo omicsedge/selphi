@@ -915,29 +915,13 @@ pub fn build_srp_unified(
     w.write_all(&(contig_bytes.len() as u32).to_le_bytes())?;
     w.write_all(contig_bytes)?;
 
-    // 8. Chunk index + data
-    w.write_all(&(total_chunks as u32).to_le_bytes())?;
-    // Write placeholder for chunk index (fill later)
-    let chunk_index_file_pos = 8 + 4 + meta_compressed.len() + 4 + vbin_compressed.len()
-        + 4 + sample_compressed.len() + 4 + ids_compressed.len()
-        + 4 + orig_compressed.len() + 4 + contig_bytes.len() + 4;
-    let chunk_idx_size = total_chunks * 16; // (offset:u64, comp:u32, decomp:u32)
-    w.write_all(&vec![0u8; chunk_idx_size])?;
-
-    // Write chunk data
-    struct ChunkEntry { offset: u64, comp_size: u32, decomp_size: u32 }
-    let mut chunk_entries = Vec::with_capacity(total_chunks);
-    let mut pos = (chunk_index_file_pos + chunk_idx_size) as u64;
-    for cc in &compressed_chunks {
-        let decomp = zstd::decode_all(Cursor::new(cc)).unwrap();
-        chunk_entries.push(ChunkEntry { offset: pos, comp_size: cc.len() as u32, decomp_size: decomp.len() as u32 });
-        w.write_all(cc)?;
-        pos += cc.len() as u64;
-    }
+    // 8. Chunk section (empty — bitmatrix uses tiles now)
+    w.write_all(&0u32.to_le_bytes())?; // n_chunks = 0
 
     // 9. Tile index + data
+    let mut pos = w.stream_position().unwrap_or(0);
     w.write_all(&(n_tiles as u32).to_le_bytes())?;
-    let tile_index_file_pos = pos as usize + 4;
+    let tile_index_file_pos = (pos + 4) as usize;
     let tile_idx_size = n_tiles * 12;
     w.write_all(&vec![0u8; tile_idx_size])?;
 
@@ -952,16 +936,8 @@ pub fn build_srp_unified(
     w.flush()?;
     drop(w);
 
-    // Fill chunk index
-    let mut file = std::fs::OpenOptions::new().write(true).open(output_path)?;
-    file.seek(SeekFrom::Start(chunk_index_file_pos as u64))?;
-    for e in &chunk_entries {
-        file.write_all(&e.offset.to_le_bytes())?;
-        file.write_all(&e.comp_size.to_le_bytes())?;
-        file.write_all(&e.decomp_size.to_le_bytes())?;
-    }
-
     // Fill tile index
+    let mut file = std::fs::OpenOptions::new().write(true).open(output_path)?;
     file.seek(SeekFrom::Start(tile_index_file_pos as u64))?;
     for e in &tile_entries {
         file.write_all(&e.offset.to_le_bytes())?;
@@ -970,10 +946,9 @@ pub fn build_srp_unified(
     file.flush()?;
 
     let file_size = std::fs::metadata(output_path)?.len();
-    let chunk_total: u64 = compressed_chunks.iter().map(|c| c.len() as u64).sum();
     let tile_total: u64 = tile_data.iter().map(|t| t.len() as u64).sum();
-    selphi_step!("SRP unified: {} ({:.1} MB, chunks={:.1} MB, tiles={:.1} MB)",
-        output_path.display(), file_size as f64 / 1e6, chunk_total as f64 / 1e6, tile_total as f64 / 1e6);
+    selphi_step!("SRP: {} ({:.1} MB, tiles={:.1} MB)",
+        output_path.display(), file_size as f64 / 1e6, tile_total as f64 / 1e6);
     Ok(())
 }
 
