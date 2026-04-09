@@ -594,7 +594,6 @@ fn main() {
     // For pre-phased input (no phasing ran), extract now.
     let ref_bm_imp = ref_bm_from_phasing.unwrap_or_else(|| {
         let bm = srp.extract_ref_alleles_bitmatrix(&wgs_idx);
-        srp.unload_chunks();
         selphi_step!("Ref bitmatrix extracted ({} chip × {} haps, {:.1} MB)",
             n_chip, n_ref, (bm.n_words() * n_chip * 8) as f64 / 1e6);
         bm

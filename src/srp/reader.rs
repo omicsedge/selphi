@@ -186,10 +186,6 @@ impl SrpReader {
         panic!("No chunk data available. Regenerate panel: selphi --prepare-reference-from panel.bcf --out panel");
     }
 
-    pub fn prefetch_compressed_range(&self, _: &[usize]) {}
-    pub fn clear_compressed_cache(&self) {}
-    pub fn unload_chunks(&self) {}
-    pub fn preload_chunk_range(&self, _: &[usize]) {}
 
     // ======================================================================
     // Bitmatrix extraction from tiles
