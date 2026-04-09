@@ -384,7 +384,6 @@ pub fn write_window_to_vcf(
             if bstart < intervals.len() { batches.push((bstart, intervals.len())); }
         }
 
-        let t0_preload = std::time::Instant::now();
         let cpu0_preload = crate::log::cpu_time_secs();
 
         let mut _t_lz4 = 0.0f64;
@@ -1324,7 +1323,7 @@ pub fn setup_bcf_writer(
         .set_worker_count(std::num::NonZeroUsize::new(bgzip_threads).unwrap())
         .build_from_writer(out_file);
 
-    let csi_path = { let mut p = bcf_path.as_os_str().to_owned(); p.push(".csi"); std::path::PathBuf::from(p) };
+    let _csi_path = { let mut p = bcf_path.as_os_str().to_owned(); p.push(".csi"); std::path::PathBuf::from(p) };
     let bcf_path_clone = bcf_path.clone();
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
@@ -1861,191 +1860,6 @@ fn scatter_col_weighted(
         let v = r - row_offset;
         accum[v] += base + t[v] * slope;
     }
-}
-
-// ============================================================================
-// Tiled interpolation kernel — L2-cache resident tiles (~500 KB each)
-// ============================================================================
-
-/// Interpolate a variant range using 2D tiled SRP format.
-/// Each tile (1024×4096) fits in L2 cache. All bands decompressed per-stripe (~21 MB in L3).
-/// Tiles are read from PreloadedStripes (sequential bulk read, no page faults).
-/// Parallelism: per-haplotype via par_chunks_mut (same as CSC interp_kernel).
-pub fn interpolate_tile_tiled(
-    preloaded: &crate::srp::tiled::PreloadedStripes,
-    weights: &[&CsrWeights],
-    chip_s: usize, chip_e: usize,
-    global_start: usize,
-    tile_n: usize,
-    t: &[f32],
-    n_haps: usize,
-) -> Vec<f32> {
-    use crate::srp::TILE_ROWS;
-    let mut alt_probs = vec![0.0f32; n_haps * tile_n];
-    let global_end = global_start + tile_n;
-
-    let first_stripe = global_start / TILE_ROWS;
-    let last_stripe = (global_end - 1) / TILE_ROWS;
-    let n_tile_cols = preloaded.n_tile_cols;
-
-    for stripe in first_stripe..=last_stripe {
-        let stripe_var_start = stripe * TILE_ROWS;
-        let stripe_var_end = (stripe_var_start + TILE_ROWS).min(preloaded.n_variants);
-        let ov_start = global_start.max(stripe_var_start);
-        let ov_end = global_end.min(stripe_var_end);
-        if ov_start >= ov_end { continue; }
-        let ov_n = ov_end - ov_start;
-        let local_row_start = ov_start - stripe_var_start;
-        let local_row_end = local_row_start + ov_n;
-        let out_offset = ov_start - global_start;
-
-        // Decompress all bands once per stripe — shared read-only across all haps.
-        // LZ4 from RAM: 42 tiles × ~300 KB = ~13 MB → ~3 ms, zero page faults.
-        let tiles: Vec<crate::srp::SparseTile> = (0..n_tile_cols)
-            .map(|band| preloaded.decompress_tile(stripe, band))
-            .collect();
-
-        // Parallel scatter across haplotypes (rayon work-stealing)
-        alt_probs.par_chunks_mut(tile_n)
-            .take(n_haps)
-            .enumerate()
-            .for_each(|(h, hap_out)| {
-                let w = weights[h];
-                let s1 = w.indptr[chip_s] as usize;
-                let e1 = w.indptr[chip_s + 1] as usize;
-                let s2 = w.indptr[chip_e] as usize;
-                let e2 = w.indptr[chip_e + 1] as usize;
-
-                let mut ss: f32 = 0.0;
-                for j in s1..e1 { ss += w.data[j]; }
-                let mut es: f32 = 0.0;
-                for j in s2..e2 { es += w.data[j]; }
-                let ds = es - ss;
-                if ss == 0.0 && ds == 0.0 { return; }
-
-                let out_slice = &mut hap_out[out_offset..out_offset + ov_n];
-                let t_slice = &t[out_offset..out_offset + ov_n];
-
-                scatter_fused_tiled(
-                    w, s1, e1, s2, e2,
-                    &tiles, n_tile_cols,
-                    local_row_start, local_row_end,
-                    t_slice, out_slice,
-                );
-            });
-    }
-
-    // Final division: parallel across haplotypes
-    alt_probs.par_chunks_mut(tile_n)
-        .take(n_haps)
-        .enumerate()
-        .for_each(|(h, hap_out)| {
-            let w = weights[h];
-            let s1 = w.indptr[chip_s] as usize;
-            let e1 = w.indptr[chip_s + 1] as usize;
-            let s2 = w.indptr[chip_e] as usize;
-            let e2 = w.indptr[chip_e + 1] as usize;
-            let mut ss: f32 = 0.0;
-            for j in s1..e1 { ss += w.data[j]; }
-            let mut es: f32 = 0.0;
-            for j in s2..e2 { es += w.data[j]; }
-            let ds = es - ss;
-            if ss == 0.0 && ds == 0.0 { return; }
-            for v in 0..tile_n {
-                let den = ss + t[v] * ds;
-                if den != 0.0 { hap_out[v] /= den; }
-            }
-        });
-
-    alt_probs
-}
-
-/// Interpolate using pre-decompressed tile cache (zero decompression overhead).
-/// Tiles are decompressed once per stripe in the pipeline loop and cached in a HashMap.
-/// Single par_chunks_mut: scatter all stripes + divide in one rayon dispatch per tile_desc.
-pub fn interpolate_tile_tiled_cached(
-    tile_cache: &std::collections::HashMap<usize, Vec<crate::srp::SparseTile>>,
-    n_variants: usize,
-    n_tile_cols: usize,
-    weights: &[&CsrWeights],
-    chip_s: usize, chip_e: usize,
-    global_start: usize,
-    tile_n: usize,
-    t: &[f32],
-    n_haps: usize,
-) -> Vec<f32> {
-    use crate::srp::TILE_ROWS;
-    let mut alt_probs = vec![0.0f32; n_haps * tile_n];
-    let global_end = global_start + tile_n;
-    let first_stripe = global_start / TILE_ROWS;
-    let last_stripe = (global_end - 1) / TILE_ROWS;
-
-    for stripe in first_stripe..=last_stripe {
-        let stripe_var_start = stripe * TILE_ROWS;
-        let stripe_var_end = (stripe_var_start + TILE_ROWS).min(n_variants);
-        let ov_start = global_start.max(stripe_var_start);
-        let ov_end = global_end.min(stripe_var_end);
-        if ov_start >= ov_end { continue; }
-        let ov_n = ov_end - ov_start;
-        let local_row_start = ov_start - stripe_var_start;
-        let local_row_end = local_row_start + ov_n;
-        let out_offset = ov_start - global_start;
-
-        // Get pre-decompressed tiles from cache (no LZ4 here)
-        let tiles = tile_cache.get(&stripe)
-            .expect("stripe not in tile_cache — preload logic bug");
-
-        // Parallel scatter across haplotypes
-        alt_probs.par_chunks_mut(tile_n)
-            .take(n_haps)
-            .enumerate()
-            .for_each(|(h, hap_out)| {
-                let w = weights[h];
-                let s1 = w.indptr[chip_s] as usize;
-                let e1 = w.indptr[chip_s + 1] as usize;
-                let s2 = w.indptr[chip_e] as usize;
-                let e2 = w.indptr[chip_e + 1] as usize;
-
-                let mut ss: f32 = 0.0;
-                for j in s1..e1 { ss += w.data[j]; }
-                let mut es: f32 = 0.0;
-                for j in s2..e2 { es += w.data[j]; }
-                let ds = es - ss;
-                if ss == 0.0 && ds == 0.0 { return; }
-
-                scatter_fused_tiled(
-                    w, s1, e1, s2, e2,
-                    tiles, n_tile_cols,
-                    local_row_start, local_row_end,
-                    &t[out_offset..out_offset + ov_n],
-                    &mut hap_out[out_offset..out_offset + ov_n],
-                );
-            });
-    }
-
-    // Final division: parallel across haplotypes
-    alt_probs.par_chunks_mut(tile_n)
-        .take(n_haps)
-        .enumerate()
-        .for_each(|(h, hap_out)| {
-            let w = weights[h];
-            let s1 = w.indptr[chip_s] as usize;
-            let e1 = w.indptr[chip_s + 1] as usize;
-            let s2 = w.indptr[chip_e] as usize;
-            let e2 = w.indptr[chip_e + 1] as usize;
-            let mut ss: f32 = 0.0;
-            for j in s1..e1 { ss += w.data[j]; }
-            let mut es: f32 = 0.0;
-            for j in s2..e2 { es += w.data[j]; }
-            let ds = es - ss;
-            if ss == 0.0 && ds == 0.0 { return; }
-            for v in 0..tile_n {
-                let den = ss + t[v] * ds;
-                if den != 0.0 { hap_out[v] /= den; }
-            }
-        });
-
-    alt_probs
 }
 
 /// Batch-parallel tiled kernel: Vec-indexed stripe cache, single par_chunks_mut dispatch.

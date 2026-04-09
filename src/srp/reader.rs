@@ -192,38 +192,7 @@ impl SrpReader {
     pub fn is_v2(&self) -> bool { self.v2_mmap.is_some() }
     pub fn is_tiled(&self) -> bool { self.tiled.is_some() }
 
-    /// Load tiled SRP backend if .srpt file exists. Call before interpolation.
-    /// Drops v2 mmap to free memory (tiled replaces v2 for interpolation).
-    pub fn load_tiled(&mut self) -> bool {
-        if self.tiled.is_some() { return true; }
-        let tiled_path = std::path::Path::new(&self.filepath).with_extension("srpt");
-        if !tiled_path.exists() { return false; }
-        // Drop v2 mmap before loading tiled to avoid double memory
-        self.v2_mmap = None;
-        self.v2_chunk_index.clear();
-        match super::tiled::TiledSrpReader::open(&tiled_path, self.metadata.n_variants, self.metadata.n_haps) {
-            Ok(t) => { self.tiled = Some(t); true }
-            Err(e) => { eprintln!("  Warning: tiled SRP load failed: {}", e); false }
-        }
-    }
-
-    pub fn get_chunk_compressed_sizes(&self) -> Vec<f64> {
-        let file = File::open(&self.filepath).unwrap();
-        let reader = BufReader::new(file);
-        let mut archive = zip::ZipArchive::new(reader).unwrap();
-        let mut sizes = Vec::new();
-        for i in 0..archive.len() {
-            if let Ok(entry) = archive.by_index_raw(i) {
-                if entry.name().starts_with("haplotypes/") {
-                    sizes.push(entry.compressed_size() as f64);
-                }
-            }
-        }
-        sizes
-    }
-
-    /// Get NNZ (non-zero count) per chunk — deterministic density metric.
-    /// Reads only the 12-byte header of each chunk (rows, cols, nnz).
+    /// Get NNZ per chunk for density weighting (EM parameter estimation).
     pub fn get_chunk_nnz(&self) -> Vec<f64> {
         let file = File::open(&self.filepath).unwrap();
         let reader = BufReader::new(file);
@@ -248,8 +217,19 @@ impl SrpReader {
         nnz_list
     }
 
-    pub fn variant_positions(&self) -> Vec<i64> {
-        self.variants.iter().map(|v| v.pos).collect()
+    /// Load tiled SRP backend if .srpt file exists. Call before interpolation.
+    /// Drops v2 mmap to free memory (tiled replaces v2 for interpolation).
+    pub fn load_tiled(&mut self) -> bool {
+        if self.tiled.is_some() { return true; }
+        let tiled_path = std::path::Path::new(&self.filepath).with_extension("srpt");
+        if !tiled_path.exists() { return false; }
+        // Drop v2 mmap before loading tiled to avoid double memory
+        self.v2_mmap = None;
+        self.v2_chunk_index.clear();
+        match super::tiled::TiledSrpReader::open(&tiled_path, self.metadata.n_variants, self.metadata.n_haps) {
+            Ok(t) => { self.tiled = Some(t); true }
+            Err(e) => { eprintln!("  Warning: tiled SRP load failed: {}", e); false }
+        }
     }
 
     // -- Chunk loading --
@@ -327,12 +307,6 @@ impl SrpReader {
         }
     }
 
-    /// Prefetch ALL compressed chunks from ZIP into memory (single sequential read).
-    pub fn prefetch_compressed(&self) {
-        let all_ids: Vec<usize> = self.chunks.iter().map(|c| c[0] as usize).collect();
-        self.prefetch_compressed_range(&all_ids);
-    }
-
     /// Prefetch compressed bytes for a range of chunks (single ZIP open).
     /// No-op when SRP v2 mmap is available (data already memory-mapped).
     pub fn prefetch_compressed_range(&self, chunk_ids: &[usize]) {
@@ -360,11 +334,6 @@ impl SrpReader {
         if self.v2_mmap.is_some() { return; }
         let mut cc = self.compressed_cache.lock().unwrap();
         cc.clear();
-    }
-
-    pub fn preload_all_chunks(&self) {
-        let all_ids: Vec<usize> = self.chunks.iter().map(|c| c[0] as usize).collect();
-        self.preload_chunk_range(&all_ids);
     }
 
     pub fn preload_chunk_range(&self, chunk_ids: &[usize]) {
@@ -410,58 +379,6 @@ impl SrpReader {
         cache.clear();
         let mut order = self.cache_order.lock().unwrap();
         order.clear();
-    }
-
-    // -- Extraction helpers --
-
-    pub fn extract_ref_alleles(&self, wgs_idx: &[usize]) -> Vec<u8> {
-        let n_chip = wgs_idx.len();
-        let n_haps = self.metadata.n_haps;
-        let chunk_size = self.metadata.chunk_size;
-        let mut out = vec![0u8; n_chip * n_haps];
-
-        let mut chunk_groups: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
-        {
-            let mut groups: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
-            for (chip_i, &wgs_i) in wgs_idx.iter().enumerate() {
-                let chunk_id = wgs_i / chunk_size;
-                let local_row = wgs_i % chunk_size;
-                groups.entry(chunk_id).or_default().push((chip_i, local_row));
-            }
-            chunk_groups = groups.into_iter().collect();
-        }
-
-        let out_base = out.as_mut_ptr() as usize;
-        let out_len = out.len();
-
-        use rayon::prelude::*;
-        chunk_groups.par_iter().for_each(|(chunk_id, indices)| {
-            let chunk = self.load_chunk(*chunk_id);
-
-            let max_row = indices.iter().map(|&(_, r)| r).max().unwrap_or(0);
-            let mut row_map = vec![-1i32; max_row + 1];
-            for &(chip_i, local_row) in indices {
-                row_map[local_row] = chip_i as i32;
-            }
-
-            let out_slice = unsafe { std::slice::from_raw_parts_mut(out_base as *mut u8, out_len) };
-
-            for col in 0..n_haps {
-                let cs = chunk.indptr[col] as usize;
-                let ce = chunk.indptr[col + 1] as usize;
-                for k in cs..ce {
-                    let row = chunk.indices[k] as usize;
-                    if row <= max_row {
-                        let chip_i = row_map[row];
-                        if chip_i >= 0 {
-                            out_slice[chip_i as usize * n_haps + col] = 1;
-                        }
-                    }
-                }
-            }
-        });
-
-        out
     }
 
     pub fn extract_ref_alleles_bitmatrix(&self, wgs_idx: &[usize]) -> crate::common::HaplotypeBitmatrix {
@@ -537,58 +454,6 @@ impl SrpReader {
         crate::common::HaplotypeBitmatrix::from_raw(bits, n_chip, n_haps)
     }
 
-    pub fn extract_column(&self, wgs_idx: &[usize], hap_col: usize) -> Vec<u8> {
-        let chunk_size = self.metadata.chunk_size;
-        let mut out = vec![0u8; wgs_idx.len()];
-
-        let mut chunk_groups: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
-        for (chip_i, &wgs_i) in wgs_idx.iter().enumerate() {
-            let chunk_id = wgs_i / chunk_size;
-            let local_row = wgs_i % chunk_size;
-            chunk_groups.entry(chunk_id).or_default().push((chip_i, local_row));
-        }
-
-        for (chunk_id, indices) in &chunk_groups {
-            let chunk = self.load_chunk(*chunk_id);
-            let col_start = chunk.indptr[hap_col] as usize;
-            let col_end = chunk.indptr[hap_col + 1] as usize;
-            let col_indices = &chunk.indices[col_start..col_end];
-
-            for &(chip_i, local_row) in indices {
-                if col_indices.binary_search(&(local_row as i32)).is_ok() {
-                    out[chip_i] = 1;
-                }
-            }
-        }
-
-        out
-    }
-
-    pub fn get_range(&self, start: usize, end: usize) -> CscChunk {
-        let chunk_size = self.metadata.chunk_size;
-        let n_haps = self.metadata.n_haps;
-        let n_rows = end - start;
-
-        let mut indptr = Vec::with_capacity(n_haps + 1);
-        let mut indices = Vec::new();
-        indptr.push(0i32);
-
-        for col in 0..n_haps {
-            for row_i in start..end {
-                let chunk_id = row_i / chunk_size;
-                let local_row = row_i % chunk_size;
-                let chunk = self.load_chunk(chunk_id);
-                let cs = chunk.indptr[col] as usize;
-                let ce = chunk.indptr[col + 1] as usize;
-                if chunk.indices[cs..ce].binary_search(&(local_row as i32)).is_ok() {
-                    indices.push((row_i - start) as i32);
-                }
-            }
-            indptr.push(indices.len() as i32);
-        }
-
-        CscChunk { indptr, indices, n_rows, n_cols: n_haps }
-    }
 }
 
 // ---------------------------------------------------------------------------

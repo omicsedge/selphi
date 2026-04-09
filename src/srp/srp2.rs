@@ -15,7 +15,7 @@
 //!   - Parallel decompression trivially with rayon
 //!   - Single file, simple format, fast to write and read
 
-use std::io::{self, Read, Write, Cursor, Seek, SeekFrom};
+use std::io::{self, Write, Cursor, Seek, SeekFrom};
 use std::path::Path;
 use std::collections::HashMap;
 use rayon::prelude::*;

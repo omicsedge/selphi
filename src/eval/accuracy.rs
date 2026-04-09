@@ -486,7 +486,7 @@ impl VariantReader {
                     Ok(())
                 }
             }
-            VariantReader::Vcf { reader, .. } => {
+            VariantReader::Vcf { reader: _, .. } => {
                 // VCF.gz: try TBI index for seeking
                 // TBI and CSI use similar checkpoint structure. Use parse_csi on .tbi if available.
                 // For now, no VCF seek — each thread reads from start and skips to region.
@@ -560,7 +560,7 @@ impl VariantReader {
                         if na < 2 || na > 2 { continue; }
                         // skip_gt: return position info without dosages
                         let chrom = if ci < contig_names.len() { contig_names[ci].as_bytes().to_vec() } else { format!("{}", ci).into_bytes() };
-                        let nf = (u32::from_le_bytes(sb[20..24].try_into().unwrap()) >> 24) as usize;
+                        let _nf = (u32::from_le_bytes(sb[20..24].try_into().unwrap()) >> 24) as usize;
                         let mut o = 24usize;
                         let _id = rtstr(sb, &mut o);
                         let mut alleles = Vec::with_capacity(na);
@@ -616,7 +616,7 @@ impl VariantReader {
                                 }
                             }
                             found_ds = true;
-                            io2 += fs;
+                            // io2 not advanced past DS field — break exits the field loop
                             break;
                         } else if k == gtk && !found_ds {
                             // GT field: int8 per sample × ploidy (selective if filter set)

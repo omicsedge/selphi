@@ -21,7 +21,7 @@ use std::io::{self, Write, BufWriter, Cursor};
 use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
-use super::{SparseTile, SrpMetadata, TILE_ROWS, TILE_COLS};
+use super::{SparseTile, TILE_ROWS, TILE_COLS};
 
 const MAGIC: &[u8; 8] = b"SRPt\0\0\0\0";
 
@@ -264,8 +264,6 @@ impl PreloadedStripes {
         stripe >= self.first_stripe && stripe < self.first_stripe + self.n_stripes
     }
 
-    /// Compressed buffer size in bytes.
-    pub fn buf_len(&self) -> usize { self.buf.len() }
 }
 
 // ============================================================================

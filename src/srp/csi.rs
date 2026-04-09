@@ -385,8 +385,8 @@ pub fn build_tbi_index(vcf_gz_path: &Path) -> io::Result<()> {
     let mut line_buf = Vec::with_capacity(4096);
     let mut buf_pos = 0usize;
     let mut buf_len = 0usize;
-    let mut vpos_at_buf_start: u64 = 0;
-    let mut bytes_consumed_in_block = 0usize;
+    let vpos_at_buf_start: u64 = 0;
+    let bytes_consumed_in_block = 0usize;
 
     loop {
         // Track virtual position at start of line
