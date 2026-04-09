@@ -1051,8 +1051,8 @@ fn main() {
 
         let vcf_bytes = selphi::io::pipeline::write_window_multiformat(
             &formats, &srp, &all_weights, cs, os, oe,
-            &wgs_idx, n_samples, &targ_alleles, n_haps,
-            &sample_names, no_ap, preloaded, preloaded_stripes,
+            &wgs_idx, n_samples, &targ_alleles,
+            no_ap, preloaded, preloaded_stripes,
             parquet_writer.as_mut().map(|(w, s)| (w, &*s)),
             pgen_writer.as_mut().map(|(p, v)| (p, v)),
             selfdecode_writer.as_mut(),

@@ -93,14 +93,14 @@ impl SampleBuffer {
         if self.pos.is_empty() { return Ok(Vec::new()); }
 
         let n = self.pos.len();
-        let pos_arr = Int32Array::from(self.pos.clone());
+        let pos_arr = Int32Array::from_iter_values(self.pos.iter().copied());
         let rsid_arr: StringArray = self.rsid.iter().map(|s| s.as_deref()).collect();
         let ref_arr: StringArray = self.ref_allele.iter().map(|s| Some(s.as_str())).collect();
         let alt_arr: StringArray = self.alt_allele.iter().map(|s| Some(s.as_str())).collect();
         let gt_arr: StringArray = self.gt.iter().map(|s| s.as_deref()).collect();
         let gt1_arr: Int32Array = self.gt1.iter().copied().collect();
         let gt2_arr: Int32Array = self.gt2.iter().copied().collect();
-        let phased_arr = BooleanArray::from(self.phased.clone());
+        let phased_arr = BooleanArray::from_iter(self.phased.iter().map(|&b| Some(b)));
         let ap1_arr: Float32Array = self.ap1.iter().copied().collect();
         let ap2_arr: Float32Array = self.ap2.iter().copied().collect();
 
@@ -249,7 +249,7 @@ impl SelfdecodeWriter {
     /// Flush one sample's buffer to a parquet file in the ZIP.
     fn flush_sample(&mut self, sample_idx: usize) -> std::io::Result<()> {
         let buf = &self.buffers[sample_idx];
-        if buf.len() == 0 { return Ok(()); }
+        if buf.pos.is_empty() { return Ok(()); }
 
         let chrom = &self.current_chrom[sample_idx];
         // Ensure chrom has 'chr' prefix for Hive-style partitioning

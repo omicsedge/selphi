@@ -603,8 +603,11 @@ fn format_tile_batch_bcf(
 }
 
 /// Format a single chip variant as BCF binary.
+/// `vi_idx`: relative index into var_infos (offset from own_wgs_start).
+/// `wgs_i`: absolute WGS index for chip_idx lookup.
 fn format_chip_bcf(
     buf: &mut Vec<u8>,
+    vi_idx: usize,
     wgs_i: usize,
     var_infos: &[super::bcf_encode::BcfVariantInfo],
     chip_gt: &[u8],
@@ -612,7 +615,7 @@ fn format_chip_bcf(
     n_haps: usize,
     n_samples: usize,
 ) {
-    let vi = &var_infos[wgs_i];
+    let vi = &var_infos[vi_idx];
     super::bcf_encode::encode_chip_record(
         buf, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
         chip_gt, chip_idx[wgs_i], n_samples, n_haps,
@@ -912,8 +915,6 @@ pub fn write_window_multiformat(
     wgs_idx: &[usize],
     n_samples: usize,
     chip_genotypes: &[u8],
-    _n_haps: usize,
-    _sample_names: &[String],
     no_ap: bool,
     preloaded_chunks: Option<Vec<Option<crate::srp::CscChunk>>>,
     preloaded_stripes: Option<crate::srp::tiled::PreloadedStripes>,
@@ -990,7 +991,7 @@ pub fn write_window_multiformat(
                     let vi = var_infos.as_ref().unwrap();
                     let mut chip_buf = Vec::with_capacity(n_samples * 16);
                     format_chip_bcf(
-                        &mut chip_buf, vp_idx, vi, chip_genotypes,
+                        &mut chip_buf, vp_idx, next_wgs, vi, chip_genotypes,
                         &setup.chip_local_idx, setup.n_haps, n_samples,
                     );
                     vcf_bytes.push(chip_buf);
@@ -1166,7 +1167,7 @@ pub fn write_window_multiformat(
                 let vi = var_infos.as_ref().unwrap();
                 let mut chip_buf = Vec::with_capacity(n_samples * 16);
                 format_chip_bcf(
-                    &mut chip_buf, vp_idx, vi, chip_genotypes,
+                    &mut chip_buf, vp_idx, next_wgs, vi, chip_genotypes,
                     &setup.chip_local_idx, setup.n_haps, n_samples,
                 );
                 vcf_bytes.push(chip_buf);
