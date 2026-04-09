@@ -220,7 +220,7 @@ pub fn build_csi_index(bcf_path: &Path) -> io::Result<()> {
     // Scan records, build bin data per (ref_id, bin_id)
     // BinData: loffset (first vpos), chunks Vec<(beg, end)>, n_mapped
     struct BinData {
-        _loffset: u64,
+        loffset: u64,
         chunks: Vec<(u64, u64)>,
     }
 
@@ -273,7 +273,7 @@ pub fn build_csi_index(bcf_path: &Path) -> io::Result<()> {
         let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, DEFAULT_DEPTH);
         let bins = ref_bins.entry(chrom_id).or_insert_with(BTreeMap::new);
         let bin = bins.entry(bin_id).or_insert_with(|| BinData {
-            _loffset: vpos,
+            loffset: vpos,
             chunks: vec![(vpos, vpos_end)],
         });
 
@@ -368,7 +368,6 @@ pub fn build_tbi_index(vcf_gz_path: &Path) -> io::Result<()> {
     let mut bgzf = noodles_bgzf::io::MultithreadedReader::with_worker_count(
         wc, BufReader::with_capacity(4 << 20, f));
 
-    // Scan VCF.gz line by line, collect contig names and record positions
     struct BinData {
         _loffset: u64,
         chunks: Vec<(u64, u64)>,
@@ -594,7 +593,7 @@ pub fn build_tbi_index_with_meta(
     let mut contig_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (i, name) in contig_names.iter().enumerate() { contig_map.insert(name.clone(), i); }
 
-    struct BinDataM { loffset: u64, chunks: Vec<(u64, u64)> }
+    struct BinDataM { _loffset: u64, chunks: Vec<(u64, u64)> }
     let mut ref_bins: BTreeMap<usize, BTreeMap<u32, BinDataM>> = BTreeMap::new();
     let mut ref_n_mapped: BTreeMap<usize, u64> = BTreeMap::new();
     let mut ref_linear: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
@@ -716,7 +715,7 @@ struct InlineBinData {
 enum IndexFormat { Tbi, Csi }
 
 pub struct InlineIndexBuilder {
-    format: IndexFormat,
+    _format: IndexFormat,
     contig_names: Vec<String>,
     contig_map: std::collections::HashMap<String, usize>,
     ref_bins: BTreeMap<usize, BTreeMap<u32, InlineBinData>>,
@@ -729,7 +728,7 @@ pub struct InlineIndexBuilder {
 impl InlineIndexBuilder {
     pub fn new_tbi() -> Self {
         Self {
-            format: IndexFormat::Tbi,
+            _format: IndexFormat::Tbi,
             contig_names: Vec::new(), contig_map: std::collections::HashMap::new(),
             ref_bins: BTreeMap::new(), ref_n_mapped: BTreeMap::new(),
             ref_linear: BTreeMap::new(), bcf_n_contigs: 0, bcf_header_done: false,
@@ -738,7 +737,7 @@ impl InlineIndexBuilder {
 
     pub fn new_csi() -> Self {
         Self {
-            format: IndexFormat::Csi,
+            _format: IndexFormat::Csi,
             contig_names: Vec::new(), contig_map: std::collections::HashMap::new(),
             ref_bins: BTreeMap::new(), ref_n_mapped: BTreeMap::new(),
             ref_linear: BTreeMap::new(), bcf_n_contigs: 0, bcf_header_done: false,
@@ -839,7 +838,7 @@ impl InlineIndexBuilder {
         let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, DEFAULT_DEPTH);
         let bins = self.ref_bins.entry(ref_id).or_insert_with(BTreeMap::new);
         let bin = bins.entry(bin_id).or_insert_with(|| InlineBinData {
-            _loffset: vpos, chunks: vec![(vpos, vpos_end)],
+            loffset: vpos, chunks: vec![(vpos, vpos_end)],
         });
         if let Some(last) = bin.chunks.last_mut() {
             if vpos <= last.1 + (1 << 16) { last.1 = vpos_end; }

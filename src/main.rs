@@ -363,21 +363,22 @@ fn main() {
             .ok();
 
         if output_bref3 {
-            // Direct BCF/VCF → BREF3 (no intermediate SRP)
             selphi_step!("Writing BREF3...");
             selphi::srp::bref3_writer::write_bref3_from_bcf(Path::new(source), Path::new(output))
                 .unwrap_or_else(|e| { selphi_error!("BREF3 write failed: {}", e); std::process::exit(1); });
         } else if is_bref3 {
-            // BREF3 → v1 ZIP + tiled (legacy — unified writer doesn't support BREF3 yet)
+            let tmp_dir = tempfile::tempdir().unwrap();
+            let tmp_path = tmp_dir.path().join("temp.srp");
             selphi::srp::writer::build_srp_from_bref3(
-                Path::new(source), Path::new(output), args.threads, args.chunk_size)
+                Path::new(source), &tmp_path, args.threads, args.chunk_size)
                 .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
-            let srp_path = PathBuf::from(output).with_extension("srp");
-            let v1 = selphi::srp::SrpReader::open(srp_path.to_str().unwrap(), 0);
-            let tiled_path = PathBuf::from(output).with_extension("srpt");
-            selphi::srp::tiled::write_tiled(&v1, &tiled_path).ok();
+            let reader = selphi::srp::SrpReader::open(tmp_path.to_str().unwrap(), 0);
+            let srp_path = if Path::new(output).extension().map_or(true, |e| e != "srp") {
+                PathBuf::from(output).with_extension("srp")
+            } else { PathBuf::from(output) };
+            selphi::srp::writer::convert_to_unified(&reader, &srp_path)
+                .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
         } else {
-            // BCF/VCF → unified SRP v2 (single file)
             let srp_path = if Path::new(output).extension().map_or(true, |e| e != "srp") {
                 PathBuf::from(output).with_extension("srp")
             } else { PathBuf::from(output) };
