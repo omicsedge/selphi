@@ -333,6 +333,7 @@ impl TiledSrpReader {
 
     pub fn n_variants(&self) -> usize { self.n_variants }
     pub fn n_haps(&self) -> usize { self.n_haps }
+    pub fn file_path(&self) -> &Path { &self.file_path }
 
     /// Estimate compressed bytes for one stripe (sum of comp_size for all bands).
     pub fn stripe_compressed_bytes(&self, stripe: usize) -> usize {

@@ -387,37 +387,80 @@ pub fn write_window_to_vcf(
         let t0_preload = std::time::Instant::now();
         let cpu0_preload = crate::log::cpu_time_secs();
 
+        let mut _t_lz4 = 0.0f64;
+
         crate::selphi_debug!("  [tiled] {} intervals → {} batches, max_stripes/batch={}, stripe_comp={:.1}KB",
             intervals.len(), batches.len(), max_stripes_per_batch, stripe_comp as f64 / 1e3);
 
         // Batch tile descriptor: carries interval context for the par_iter
         struct BTD { iv_local: usize, ts: usize, tile_n: usize, gs: usize, ws: usize, we: usize, full_range: f32 }
 
-        for &(bstart, bend) in &batches {
+        // Double-buffer I/O: read batch N+1's stripes while batch N computes.
+        // Background thread for next batch's pread.
+        let mut next_io_handle: Option<std::thread::JoinHandle<std::io::Result<crate::srp::tiled::PreloadedStripes>>> = None;
+
+        // Pre-compute stripe ranges for each batch (needed for look-ahead I/O)
+        let batch_stripe_ranges: Vec<(usize, usize, usize)> = batches.iter().map(|&(bs, be)| {
+            let ivs = &intervals[bs..be];
+            let fs = ivs[0].wgs_start / TILE_ROWS;
+            let ls = { let e = ivs.last().unwrap().wgs_end; if e > 0 { (e - 1) / TILE_ROWS } else { fs } };
+            (fs, ls, ls - fs + 1)
+        }).collect();
+
+        for (bi, &(bstart, bend)) in batches.iter().enumerate() {
             let batch_ivs = &intervals[bstart..bend];
             if batch_ivs.is_empty() { continue; }
 
-            // Phase 2: Bulk decompress stripes for this batch
-            let b_first_stripe = batch_ivs[0].wgs_start / TILE_ROWS;
-            let b_last_stripe = {
-                let last_end = batch_ivs.last().unwrap().wgs_end;
-                if last_end > 0 { (last_end - 1) / TILE_ROWS } else { b_first_stripe }
-            };
-            let b_n_stripes = b_last_stripe - b_first_stripe + 1;
+            let (b_first_stripe, b_last_stripe, b_n_stripes) = batch_stripe_ranges[bi];
 
-            // Ensure compressed data covers this range
+            // Get compressed data: from preload, from background I/O thread, or read now
             let loaded_ok = stripe_loaded.as_ref().map_or(false, |l|
                 l.contains_stripe(b_first_stripe) && l.contains_stripe(b_last_stripe));
             if !loaded_ok {
-                let needed = b_n_stripes;
-                let n = needed.max(stripe_preload_batch).min(window_last_stripe - b_first_stripe + 1);
-                let t0 = std::time::Instant::now();
-                stripe_loaded = Some(tiled.preload_stripes(b_first_stripe, n)?);
-                _t_chunk_load += t0.elapsed().as_secs_f64();
+                // Try to get from background I/O thread
+                if let Some(handle) = next_io_handle.take() {
+                    let t0 = std::time::Instant::now();
+                    match handle.join().expect("stripe I/O thread panicked") {
+                        Ok(loaded) if loaded.contains_stripe(b_first_stripe) && loaded.contains_stripe(b_last_stripe) => {
+                            stripe_loaded = Some(loaded);
+                        }
+                        _ => {
+                            // Background read was for different range, read now
+                            let needed = b_n_stripes;
+                            let n = needed.max(stripe_preload_batch).min(window_last_stripe - b_first_stripe + 1);
+                            stripe_loaded = Some(tiled.preload_stripes(b_first_stripe, n)?);
+                        }
+                    }
+                    _t_chunk_load += t0.elapsed().as_secs_f64();
+                } else {
+                    let t0 = std::time::Instant::now();
+                    let needed = b_n_stripes;
+                    let n = needed.max(stripe_preload_batch).min(window_last_stripe - b_first_stripe + 1);
+                    stripe_loaded = Some(tiled.preload_stripes(b_first_stripe, n)?);
+                    _t_chunk_load += t0.elapsed().as_secs_f64();
+                }
             }
             let loaded = stripe_loaded.as_ref().unwrap();
 
-            // Decompress all stripes for the batch in parallel (LZ4 from RAM, ~300 GB output total)
+            // Start background I/O for NEXT batch (overlaps with this batch's compute)
+            if bi + 1 < batches.len() {
+                let (next_fs, _next_ls, next_ns) = batch_stripe_ranges[bi + 1];
+                let next_covered = loaded.contains_stripe(next_fs) && loaded.contains_stripe(batch_stripe_ranges[bi + 1].1);
+                if !next_covered {
+                    let tiled_path = tiled.file_path().to_path_buf();
+                    let n_v = n_tiled_variants;
+                    let n_h = tiled.n_haps();
+                    let n_load = next_ns.max(stripe_preload_batch).min(window_last_stripe - next_fs + 1);
+                    let fs = next_fs;
+                    next_io_handle = Some(std::thread::spawn(move || {
+                        let t = crate::srp::tiled::TiledSrpReader::open(&tiled_path, n_v, n_h)?;
+                        t.preload_stripes(fs, n_load)
+                    }));
+                }
+            }
+
+            // Decompress all stripes for the batch in parallel (LZ4 from RAM)
+            let t0_lz4 = std::time::Instant::now();
             let stripe_tiles: Vec<Vec<crate::srp::SparseTile>> = (0..b_n_stripes)
                 .into_par_iter()
                 .map(|si| {
@@ -425,6 +468,8 @@ pub fn write_window_to_vcf(
                     (0..n_tile_cols).map(|band| loaded.decompress_tile(s, band)).collect()
                 })
                 .collect();
+
+            _t_lz4 += t0_lz4.elapsed().as_secs_f64();
 
             // Phase 3: Flatten all tile_descs from this batch
             let mut all_descs: Vec<BTD> = Vec::new();
@@ -499,9 +544,8 @@ pub fn write_window_to_vcf(
         _cpu_chunk_load += crate::log::cpu_time_secs() - cpu0_preload - _cpu_tiles;
 
         let pct = |cpu: f64, wall: f64| -> f64 { if wall > 0.01 { cpu / wall / n_cores as f64 * 100.0 } else { 0.0 } };
-        crate::selphi_debug!("  [interp] {} intervals: setup={:.2}s chunk_load={:.1}s({:.0}%cpu) chip={:.2}s tiles={:.1}s({:.0}%cpu) send={:.1}s",
-            _n_intervals, _t_setup, _t_chunk_load, pct(_cpu_chunk_load, _t_chunk_load),
-            _t_chip, _t_interp, pct(_cpu_tiles, _t_interp), _t_send);
+        crate::selphi_debug!("  [interp] {} intervals: io={:.1}s lz4={:.1}s tiles={:.1}s({:.0}%cpu) send={:.1}s chip={:.2}s",
+            _n_intervals, _t_chunk_load, _t_lz4, _t_interp, pct(_cpu_tiles, _t_interp), _t_send, _t_chip);
 
     } else {
         // ====================================================================
