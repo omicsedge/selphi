@@ -521,7 +521,8 @@ pub fn setup_bcf_writer(
         .set_worker_count(std::num::NonZeroUsize::new(bgzip_threads).unwrap())
         .build_from_writer(out_file);
 
-    let _csi_path = { let mut p = bcf_path.as_os_str().to_owned(); p.push(".csi"); std::path::PathBuf::from(p) };
+    // CSI index path (built inline during write)
+    let _csi_path = bcf_path.with_extension("bcf.csi");
     let bcf_path_clone = bcf_path.clone();
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
@@ -620,6 +621,42 @@ fn format_chip_bcf(
         buf, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
         chip_gt, chip_idx[wgs_i], n_samples, n_haps,
     );
+}
+
+/// Parse variant ID parts from SRP. Returns (chrom, pos_str, rsid/oid, ref, alt) or None.
+#[inline]
+fn parse_variant_parts<'a>(srp: &'a SrpReader, wgs_i: usize) -> Option<(&'a str, &'a str, &'a str, &'a str, &'a str)> {
+    let id = &srp.ids[wgs_i];
+    let parts: Vec<&str> = id.splitn(4, '-').collect();
+    if parts.len() < 4 { return None; }
+    let oid = if !srp.original_ids[wgs_i].is_empty() { &srp.original_ids[wgs_i] } else { id };
+    Some((parts[0], parts[1], oid, parts[2], parts[3]))
+}
+
+/// Fill chip genotypes for PGEN output (hardcalls + dosages).
+#[inline]
+fn fill_chip_pgen(
+    hardcalls: &mut [u8], dosages: &mut [f32],
+    chip_genotypes: &[u8], ci: usize, n_haps: usize, n_samples: usize,
+) {
+    for s in 0..n_samples {
+        let a0 = chip_genotypes[ci * n_haps + s * 2];
+        let a1 = chip_genotypes[ci * n_haps + s * 2 + 1];
+        hardcalls[s] = a0 + a1;
+        dosages[s] = hardcalls[s] as f32;
+    }
+}
+
+/// Fill chip genotypes for SelfDecode output (gt1/gt2 as i32).
+#[inline]
+fn fill_chip_sd(
+    sd_gt1: &mut [i32], sd_gt2: &mut [i32],
+    chip_genotypes: &[u8], ci: usize, n_haps: usize, n_samples: usize,
+) {
+    for s in 0..n_samples {
+        sd_gt1[s] = chip_genotypes[ci * n_haps + s * 2] as i32;
+        sd_gt2[s] = chip_genotypes[ci * n_haps + s * 2 + 1] as i32;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -955,10 +992,6 @@ pub fn write_window_multiformat(
     let mut vcf_bytes: Vec<Vec<u8>> = Vec::new();
     let mut next_wgs = setup.own_wgs_start;
 
-    // Mutable writer refs (reborrow from Option to avoid move issues)
-    let parquet_writer = parquet_writer;
-    let pgen_writer = pgen_writer;
-    // We need to pass through the mutable refs, which requires some care
     let mut pw = parquet_writer;
     let mut pgw = pgen_writer;
     let mut sdw = sd_writer;
@@ -996,41 +1029,25 @@ pub fn write_window_multiformat(
                     );
                     vcf_bytes.push(chip_buf);
                 }
-                if formats.parquet {
-                    // Chip sites are handled inside write_tile_to_parquet (they check is_chip)
-                    // No separate chip emission needed for parquet
-                }
-                if formats.pgen {
+                // Parquet: chip sites handled inside write_tile_to_parquet (is_chip check)
+                if formats.pgen || formats.selfdecode {
                     let ci = setup.chip_local_idx[next_wgs];
-                    for s in 0..n_samples {
-                        let a0 = chip_genotypes[ci * setup.n_haps + s * 2];
-                        let a1 = chip_genotypes[ci * setup.n_haps + s * 2 + 1];
-                        hardcalls[s] = a0 + a1;
-                        dosages[s] = hardcalls[s] as f32;
+                    if formats.pgen {
+                        fill_chip_pgen(&mut hardcalls, &mut dosages, chip_genotypes, ci, setup.n_haps, n_samples);
                     }
-                    let id = &srp.ids[next_wgs];
-                    let parts: Vec<&str> = id.splitn(4, '-').collect();
-                    if parts.len() >= 4 {
-                        let oid = if !srp.original_ids[next_wgs].is_empty() { &srp.original_ids[next_wgs] } else { id };
+                    if formats.selfdecode {
+                        fill_chip_sd(&mut sd_gt1, &mut sd_gt2, chip_genotypes, ci, setup.n_haps, n_samples);
+                    }
+                    if let Some((chrom, pos_str, oid, ref_a, alt_a)) = parse_variant_parts(srp, next_wgs) {
                         if let Some((ref mut pg, ref mut pv)) = pgw {
-                            super::pgen_output::write_pvar_variant(pv, parts[0], parts[1], oid, parts[2], parts[3])?;
+                            super::pgen_output::write_pvar_variant(pv, chrom, pos_str, oid, ref_a, alt_a)?;
                             pg.write_variant(&hardcalls, &dosages)?;
                         }
-                    }
-                }
-                if let Some(ref mut sd) = sdw {
-                    let ci = setup.chip_local_idx[next_wgs];
-                    for s in 0..n_samples {
-                        sd_gt1[s] = chip_genotypes[ci * setup.n_haps + s * 2] as i32;
-                        sd_gt2[s] = chip_genotypes[ci * setup.n_haps + s * 2 + 1] as i32;
-                    }
-                    let id = &srp.ids[next_wgs];
-                    let parts: Vec<&str> = id.splitn(4, '-').collect();
-                    if parts.len() >= 4 {
-                        let oid = if !srp.original_ids[next_wgs].is_empty() { &srp.original_ids[next_wgs] } else { id };
-                        let pos: i32 = parts[1].parse().unwrap_or(0);
-                        sd.write_variant(parts[0], pos, oid, parts[2], parts[3],
-                            &sd_gt1, &sd_gt2, &sd_ap1, &sd_ap2, true)?;
+                        if let Some(ref mut sd) = sdw {
+                            let pos: i32 = pos_str.parse().unwrap_or(0);
+                            sd.write_variant(chrom, pos, oid, ref_a, alt_a,
+                                &sd_gt1, &sd_gt2, &sd_ap1, &sd_ap2, true)?;
+                        }
                     }
                 }
             }
@@ -1077,72 +1094,46 @@ pub fn write_window_multiformat(
                 }
             }
 
-            // PGEN format
-            if let Some((ref mut pg, ref mut pv)) = pgw {
+            // PGEN + SelfDecode: per-variant loop (fused to avoid double iteration)
+            if formats.pgen || formats.selfdecode {
                 for v in 0..tile.tile_n {
                     let wgs_i = tile.global_start + v;
                     if wgs_i >= setup.n_ref_variants { break; }
 
-                    let id = &srp.ids[wgs_i];
-                    let parts: Vec<&str> = id.splitn(4, '-').collect();
-                    if parts.len() < 4 { continue; }
-                    let oid = if !srp.original_ids[wgs_i].is_empty() { &srp.original_ids[wgs_i] } else { id };
-
-                    if setup.is_chip[wgs_i] {
-                        let ci = setup.chip_local_idx[wgs_i];
-                        for s in 0..n_samples {
-                            let a0 = chip_genotypes[ci * setup.n_haps + s * 2];
-                            let a1 = chip_genotypes[ci * setup.n_haps + s * 2 + 1];
-                            hardcalls[s] = a0 + a1;
-                            dosages[s] = hardcalls[s] as f32;
-                        }
-                    } else {
-                        for s in 0..n_samples {
-                            let ap1 = tile.alt_probs[(s * 2) * tile.tile_n + v];
-                            let ap2 = tile.alt_probs[(s * 2 + 1) * tile.tile_n + v];
-                            let ds = ap1 + ap2;
-                            hardcalls[s] = if ds > 1.5 { 2 } else if ds > 0.5 { 1 } else { 0 };
-                            dosages[s] = ds;
-                        }
-                    }
-
-                    super::pgen_output::write_pvar_variant(pv, parts[0], parts[1], oid, parts[2], parts[3])?;
-                    pg.write_variant(&hardcalls, &dosages)?;
-                }
-            }
-
-            // SelfDecode format
-            if let Some(ref mut sd) = sdw {
-                for v in 0..tile.tile_n {
-                    let wgs_i = tile.global_start + v;
-                    if wgs_i >= setup.n_ref_variants { break; }
-
-                    let id = &srp.ids[wgs_i];
-                    let parts: Vec<&str> = id.splitn(4, '-').collect();
-                    if parts.len() < 4 { continue; }
-                    let oid = if !srp.original_ids[wgs_i].is_empty() { &srp.original_ids[wgs_i] } else { id };
-                    let pos: i32 = parts[1].parse().unwrap_or(0);
+                    let Some((chrom, pos_str, oid, ref_a, alt_a)) = parse_variant_parts(srp, wgs_i) else { continue };
                     let is_chip_var = setup.is_chip[wgs_i];
 
                     if is_chip_var {
                         let ci = setup.chip_local_idx[wgs_i];
-                        for s in 0..n_samples {
-                            sd_gt1[s] = chip_genotypes[ci * setup.n_haps + s * 2] as i32;
-                            sd_gt2[s] = chip_genotypes[ci * setup.n_haps + s * 2 + 1] as i32;
-                        }
+                        if formats.pgen { fill_chip_pgen(&mut hardcalls, &mut dosages, chip_genotypes, ci, setup.n_haps, n_samples); }
+                        if formats.selfdecode { fill_chip_sd(&mut sd_gt1, &mut sd_gt2, chip_genotypes, ci, setup.n_haps, n_samples); }
                     } else {
                         for s in 0..n_samples {
-                            let a1 = tile.alt_probs[(s * 2) * tile.tile_n + v];
-                            let a2 = tile.alt_probs[(s * 2 + 1) * tile.tile_n + v];
-                            sd_gt1[s] = if a1 > 0.5 { 1 } else { 0 };
-                            sd_gt2[s] = if a2 > 0.5 { 1 } else { 0 };
-                            sd_ap1[s] = a1;
-                            sd_ap2[s] = a2;
+                            let ap1 = tile.alt_probs[(s * 2) * tile.tile_n + v];
+                            let ap2 = tile.alt_probs[(s * 2 + 1) * tile.tile_n + v];
+                            if formats.pgen {
+                                let ds = ap1 + ap2;
+                                hardcalls[s] = if ds > 1.5 { 2 } else if ds > 0.5 { 1 } else { 0 };
+                                dosages[s] = ds;
+                            }
+                            if formats.selfdecode {
+                                sd_gt1[s] = if ap1 > 0.5 { 1 } else { 0 };
+                                sd_gt2[s] = if ap2 > 0.5 { 1 } else { 0 };
+                                sd_ap1[s] = ap1;
+                                sd_ap2[s] = ap2;
+                            }
                         }
                     }
 
-                    sd.write_variant(parts[0], pos, oid, parts[2], parts[3],
-                        &sd_gt1, &sd_gt2, &sd_ap1, &sd_ap2, is_chip_var)?;
+                    if let Some((ref mut pg, ref mut pv)) = pgw {
+                        super::pgen_output::write_pvar_variant(pv, chrom, pos_str, oid, ref_a, alt_a)?;
+                        pg.write_variant(&hardcalls, &dosages)?;
+                    }
+                    if let Some(ref mut sd) = sdw {
+                        let pos: i32 = pos_str.parse().unwrap_or(0);
+                        sd.write_variant(chrom, pos, oid, ref_a, alt_a,
+                            &sd_gt1, &sd_gt2, &sd_ap1, &sd_ap2, is_chip_var)?;
+                    }
                 }
             }
         }
@@ -1172,37 +1163,24 @@ pub fn write_window_multiformat(
                 );
                 vcf_bytes.push(chip_buf);
             }
-            if formats.pgen {
+            if formats.pgen || formats.selfdecode {
                 let ci = setup.chip_local_idx[next_wgs];
-                for s in 0..n_samples {
-                    let a0 = chip_genotypes[ci * setup.n_haps + s * 2];
-                    let a1 = chip_genotypes[ci * setup.n_haps + s * 2 + 1];
-                    hardcalls[s] = a0 + a1;
-                    dosages[s] = hardcalls[s] as f32;
+                if formats.pgen {
+                    fill_chip_pgen(&mut hardcalls, &mut dosages, chip_genotypes, ci, setup.n_haps, n_samples);
                 }
-                let id = &srp.ids[next_wgs];
-                let parts: Vec<&str> = id.splitn(4, '-').collect();
-                if parts.len() >= 4 {
-                    let oid = if !srp.original_ids[next_wgs].is_empty() { &srp.original_ids[next_wgs] } else { id };
+                if formats.selfdecode {
+                    fill_chip_sd(&mut sd_gt1, &mut sd_gt2, chip_genotypes, ci, setup.n_haps, n_samples);
+                }
+                if let Some((chrom, pos_str, oid, ref_a, alt_a)) = parse_variant_parts(srp, next_wgs) {
                     if let Some((ref mut pg, ref mut pv)) = pgw {
-                        super::pgen_output::write_pvar_variant(pv, parts[0], parts[1], oid, parts[2], parts[3])?;
+                        super::pgen_output::write_pvar_variant(pv, chrom, pos_str, oid, ref_a, alt_a)?;
                         pg.write_variant(&hardcalls, &dosages)?;
                     }
-                }
-            }
-            if let Some(ref mut sd) = sdw {
-                let ci = setup.chip_local_idx[next_wgs];
-                for s in 0..n_samples {
-                    sd_gt1[s] = chip_genotypes[ci * setup.n_haps + s * 2] as i32;
-                    sd_gt2[s] = chip_genotypes[ci * setup.n_haps + s * 2 + 1] as i32;
-                }
-                let id = &srp.ids[next_wgs];
-                let parts: Vec<&str> = id.splitn(4, '-').collect();
-                if parts.len() >= 4 {
-                    let oid = if !srp.original_ids[next_wgs].is_empty() { &srp.original_ids[next_wgs] } else { id };
-                    let pos: i32 = parts[1].parse().unwrap_or(0);
-                    sd.write_variant(parts[0], pos, oid, parts[2], parts[3],
-                        &sd_gt1, &sd_gt2, &sd_ap1, &sd_ap2, true)?;
+                    if let Some(ref mut sd) = sdw {
+                        let pos: i32 = pos_str.parse().unwrap_or(0);
+                        sd.write_variant(chrom, pos, oid, ref_a, alt_a,
+                            &sd_gt1, &sd_gt2, &sd_ap1, &sd_ap2, true)?;
+                    }
                 }
             }
         }

@@ -41,13 +41,21 @@ fn build_schema() -> Schema {
     ])
 }
 
+/// Static GT strings for zero-alloc genotype formatting (alleles always 0 or 1).
+static GT_STRS: [&str; 5] = ["0|0", "0|1", "1|0", "1|1", ".|."];
+
+#[inline]
+fn gt_str(g1: i32, g2: i32) -> &'static str {
+    match (g1, g2) { (0,0) => GT_STRS[0], (0,1) => GT_STRS[1], (1,0) => GT_STRS[2], (1,1) => GT_STRS[3], _ => GT_STRS[4] }
+}
+
 /// Per-sample row buffer.
 struct SampleBuffer {
     pos: Vec<i32>,
     rsid: Vec<Option<String>>,
     ref_allele: Vec<String>,
     alt_allele: Vec<String>,
-    gt: Vec<Option<String>>,
+    gt: Vec<&'static str>,
     gt1: Vec<Option<i32>>,
     gt2: Vec<Option<i32>>,
     phased: Vec<bool>,
@@ -97,7 +105,7 @@ impl SampleBuffer {
         let rsid_arr: StringArray = self.rsid.iter().map(|s| s.as_deref()).collect();
         let ref_arr: StringArray = self.ref_allele.iter().map(|s| Some(s.as_str())).collect();
         let alt_arr: StringArray = self.alt_allele.iter().map(|s| Some(s.as_str())).collect();
-        let gt_arr: StringArray = self.gt.iter().map(|s| s.as_deref()).collect();
+        let gt_arr: StringArray = self.gt.iter().map(|&s| Some(s)).collect();
         let gt1_arr: Int32Array = self.gt1.iter().copied().collect();
         let gt2_arr: Int32Array = self.gt2.iter().copied().collect();
         let phased_arr = BooleanArray::from_iter(self.phased.iter().map(|&b| Some(b)));
@@ -225,7 +233,7 @@ impl SelfdecodeWriter {
             buf.rsid.push(if rsid.starts_with("rs") { Some(rsid.to_string()) } else { None });
             buf.ref_allele.push(ref_allele.to_string());
             buf.alt_allele.push(alt_allele.to_string());
-            buf.gt.push(Some(format!("{}|{}", g1, g2)));
+            buf.gt.push(gt_str(g1, g2));
             buf.gt1.push(Some(g1));
             buf.gt2.push(Some(g2));
             buf.phased.push(true); // selphi always produces phased output
