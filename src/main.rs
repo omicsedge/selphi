@@ -136,6 +136,14 @@ struct Args {
     #[arg(long)]
     pgen: bool,
 
+    /// Write all formats simultaneously (VCF.gz + Parquet + PGEN)
+    #[arg(long)]
+    all_formats: bool,
+
+    /// Write SelfDecode format: per-sample chunked Parquet in a ZIP archive
+    #[arg(long)]
+    selfdecode: bool,
+
     /// Evaluate imputation accuracy: --evaluate imputed.vcf.gz --truth truth.vcf.gz --out results
     #[arg(long)]
     evaluate: Option<String>,
@@ -643,35 +651,56 @@ fn main() {
             cm_span, w.chip_end - w.chip_start);
     }
 
-    // 9. Output path setup + writer
+    // 9. Output path setup + multi-format writer
     let out_path = PathBuf::from(output_path);
     let no_ap = args.no_ap;
-    let output_bcf = args.bcf;
-    let output_parquet = args.parquet;
-    let output_pgen = args.pgen;
-    let out_file = if output_parquet { out_path.with_extension("parquet") }
-        else if output_pgen { out_path.with_extension("pgen") }
-        else if output_bcf { out_path.with_extension("bcf") }
+
+    // Determine active output formats:
+    //   (default) → VCF.gz only
+    //   --bcf → BCF replaces VCF (mutually exclusive: same channel)
+    //   --parquet, --pgen → additive (always combined with VCF or BCF)
+    //   --all-formats → VCF.gz + Parquet + PGEN (all format families)
+    //   Combos: --parquet --pgen → VCF + Parquet + PGEN
+    //           --bcf --parquet --pgen → BCF + Parquet + PGEN
+    let formats = selphi::io::pipeline::OutputFormats {
+        vcf: !args.bcf,  // always produce VCF unless --bcf replaces it
+        bcf: args.bcf,
+        parquet: args.parquet || args.all_formats,
+        pgen: args.pgen || args.all_formats,
+        selfdecode: args.selfdecode,
+    };
+
+    // Primary output file (the VCF/BCF path)
+    let out_file = if formats.bcf { out_path.with_extension("bcf") }
         else { out_path.with_extension("vcf.gz") };
 
-    // Parquet writer (separate path — not channel-based)
-    let mut parquet_writer = if output_parquet {
-        let (w, s) = selphi::io::parquet_output::setup_parquet_writer(&out_file, &sample_names)
+    // Parquet writer (independent of VCF/BCF)
+    let mut parquet_writer = if formats.parquet {
+        let pq_file = out_path.with_extension("parquet");
+        let (w, s) = selphi::io::parquet_output::setup_parquet_writer(&pq_file, &sample_names)
             .expect("Failed to setup Parquet writer");
         Some((w, s))
     } else { None };
 
     // PGEN writer (.pgen + .pvar + .psam)
-    let mut pgen_writer = if output_pgen {
-        selphi::io::pgen_output::write_psam(&out_file, &sample_names).expect("Failed to write .psam");
-        let pvar = selphi::io::pgen_output::write_pvar(&out_file).expect("Failed to write .pvar");
-        let pgen = selphi::io::pgen_output::PgenWriter::new(&out_file, n_samples).expect("Failed to create .pgen");
+    let mut pgen_writer = if formats.pgen {
+        let pgen_file = out_path.with_extension("pgen");
+        selphi::io::pgen_output::write_psam(&pgen_file, &sample_names).expect("Failed to write .psam");
+        let pvar = selphi::io::pgen_output::write_pvar(&pgen_file).expect("Failed to write .pvar");
+        let pgen = selphi::io::pgen_output::PgenWriter::new(&pgen_file, n_samples).expect("Failed to create .pgen");
         Some((pgen, pvar))
     } else { None };
 
-    // VCF/BCF channel-based writer (skipped for Parquet)
-    let (vcf_tx, vcf_writer, vcf_bgzip) = if !output_parquet {
-        if output_bcf {
+    // SelfDecode writer (per-sample chunked Parquet in ZIP)
+    let mut selfdecode_writer = if formats.selfdecode {
+        Some(selphi::io::selfdecode_output::SelfdecodeWriter::new(
+            &out_path, &sample_names, false, // filter_hom_ref disabled by default
+        ).expect("Failed to setup SelfDecode writer"))
+    } else { None };
+
+    // VCF/BCF channel-based writer (active if VCF or BCF format enabled)
+    let (vcf_tx, vcf_writer, vcf_bgzip) = if formats.vcf || formats.bcf {
+        if formats.bcf {
             selphi::io::pipeline::setup_bcf_writer(
                 n_samples, &sample_names, &srp.metadata.contig_field, version, &out_file, no_ap,
             ).expect("Failed to setup BCF writer")
@@ -681,7 +710,7 @@ fn main() {
             ).expect("Failed to setup VCF writer")
         }
     } else {
-        // Dummy sender for Parquet mode (won't be used)
+        // Dummy sender (no VCF/BCF output)
         let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
         let handle = std::thread::spawn(|| Ok(()));
         (tx, handle, ())
@@ -829,8 +858,9 @@ fn main() {
         let mut chunk_preload_handle: Option<std::thread::JoinHandle<Vec<Option<selphi::srp::CscChunk>>>> = None;
         let mut stripe_preload_handle: Option<std::thread::JoinHandle<Option<selphi::srp::tiled::PreloadedStripes>>> = None;
 
-        if srp.is_tiled() && !output_bcf && !output_parquet && !output_pgen {
+        if srp.is_tiled() {
             // Preload compressed stripe data during HMM (1 thread, sequential I/O)
+            // Enabled for ALL output formats (unified interpolation path benefits from preloading)
             let tiled_path = std::path::Path::new(&args.refpanel).to_path_buf();
             let own_start = if window.own_chip_start == 0 { 0 } else { wgs_idx[window.own_chip_start] };
             let own_end = if window.own_chip_end >= wgs_idx.len() { srp.n_variants() } else { wgs_idx[window.own_chip_end] };
@@ -846,7 +876,7 @@ fn main() {
                 let n_load = (500 * 1024 * 1024 / stripe_comp.max(1)).max(10).min(n_stripes);
                 tiled.preload_stripes(first_stripe, n_load).ok()
             }));
-        } else if !output_bcf && !output_parquet && !output_pgen {
+        } else {
             let srp_clone = Arc::clone(&srp);
             let own_start = if window.own_chip_start == 0 { 0 } else { wgs_idx[window.own_chip_start] };
             let own_end = if window.own_chip_end >= wgs_idx.len() { srp.n_variants() } else { wgs_idx[window.own_chip_end] };
@@ -1016,41 +1046,17 @@ fn main() {
 
         // Interpolation + output (runs BEFORE waiting for previous VCF write — no dependency)
         let t0_interp = Instant::now();
-        let (cs, ce, os, oe) = (window.chip_start, window.chip_end,
-                                 window.own_chip_start, window.own_chip_end);
+        let (cs, _ce, os, oe) = (window.chip_start, window.chip_end,
+                                  window.own_chip_start, window.own_chip_end);
 
-        let vcf_bytes = if output_pgen {
-            if let Some((ref mut pg, ref mut pv)) = pgen_writer {
-                selphi::io::pipeline::write_window_to_pgen(
-                    pg, pv, &srp, &all_weights, cs, ce, os, oe,
-                    &wgs_idx, n_samples, &targ_alleles, n_haps,
-                    &sample_names, no_ap,
-                ).expect("PGEN write failed");
-            }
-            Vec::new()
-        } else if output_parquet {
-            // Parquet: write directly (no channel), interpolation inside
-            if let Some((ref mut pw, ref ps)) = parquet_writer {
-                selphi::io::pipeline::write_window_to_parquet(
-                    pw, ps, &srp, &all_weights, cs, ce, os, oe,
-                    &wgs_idx, n_samples, &targ_alleles, n_haps,
-                    &sample_names, no_ap,
-                ).expect("Parquet write failed");
-            }
-            Vec::new() // No VCF bytes for Parquet mode
-        } else if output_bcf {
-            selphi::io::pipeline::interpolate_window_to_bcf_bytes(
-                &srp, &all_weights, cs, ce, os, oe,
-                &wgs_idx, n_samples, &targ_alleles, n_haps,
-                &sample_names, no_ap,
-            ).expect("Interpolation failed")
-        } else {
-            selphi::io::pipeline::interpolate_window_to_bytes(
-                &srp, &all_weights, cs, ce, os, oe,
-                &wgs_idx, n_samples, &targ_alleles, n_haps,
-                &sample_names, no_ap, preloaded, preloaded_stripes,
-            ).expect("Interpolation failed")
-        };
+        let vcf_bytes = selphi::io::pipeline::write_window_multiformat(
+            &formats, &srp, &all_weights, cs, os, oe,
+            &wgs_idx, n_samples, &targ_alleles, n_haps,
+            &sample_names, no_ap, preloaded, preloaded_stripes,
+            parquet_writer.as_mut().map(|(w, s)| (w, &*s)),
+            pgen_writer.as_mut().map(|(p, v)| (p, v)),
+            selfdecode_writer.as_mut(),
+        ).expect("Output write failed");
         let interp_secs = t0_interp.elapsed().as_secs_f64();
         
 
@@ -1116,23 +1122,32 @@ fn main() {
     drop(chip_cm);
     drop(sample_names);
 
-    // 12. Finalize output
+    // 12. Finalize all active output writers
     if let Some((pg, mut pv)) = pgen_writer {
         use std::io::Write;
         pv.flush().expect("Failed to flush .pvar");
         pg.finish().expect("Failed to finalize .pgen");
-    } else if let Some((pw, _)) = parquet_writer {
+    }
+    if let Some((pw, _)) = parquet_writer {
         selphi::io::parquet_output::finish_parquet_writer(pw)
             .expect("Failed to finalize Parquet");
-    } else {
+    }
+    if let Some(sd) = selfdecode_writer {
+        sd.finish().expect("Failed to finalize SelfDecode output");
+    }
+    if formats.vcf || formats.bcf {
         selphi::io::pipeline::finish_vcf_writer(vcf_tx, vcf_writer, vcf_bgzip)
-            .expect("Failed to finalize output");
+            .expect("Failed to finalize VCF/BCF output");
     }
 
-    // Index built inline during writing (no separate indexing step)
-
     let final_path = out_file.clone();
-    selphi_step!("Output: {}", final_path.display());
+    {
+        let mut paths = vec![format!("{}", final_path.display())];
+        if formats.parquet { paths.push(format!("{}", out_path.with_extension("parquet").display())); }
+        if formats.pgen { paths.push(format!("{}", out_path.with_extension("pgen").display())); }
+        if formats.selfdecode { paths.push(format!("{}", out_path.with_extension("selfdecode.zip").display())); }
+        selphi_step!("Output: {}", paths.join(" + "));
+    }
 
     // Inline accuracy evaluation: if --truth provided, evaluate immediately
     if let Some(ref truth) = args.truth {
