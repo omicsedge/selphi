@@ -246,21 +246,22 @@ Key design principles:
 
 ### Sparse Reference Panel (SRP format)
 
-The reference panel is stored as a ZIP archive of zstd-compressed CSC (Compressed Sparse Column) boolean chunks. Each chunk covers a contiguous block of variants (default ~10,000), enabling parallel extraction during imputation.
+Single binary file (magic `SRP\0`, version 2) with sequential length-prefixed sections:
 
-| ZIP entry | Content |
-|-----------|---------|
-| `metadata` | JSON: panel dimensions, chromosome, chunk layout, variant dtypes |
-| `variants` | Binary: per-variant chrom/pos/ref/alt in UCS-4 encoding |
-| `haplotypes/*.bin` | zstd-compressed CSC chunks (boolean: 1 = ALT allele present) |
-| `chunks` | Binary: chunk index with start/end positions |
-| `IDs` | Newline-delimited variant identifiers (chr-pos-ref-alt) |
-| `original_IDs` | Newline-delimited original VCF variant IDs |
-| `sample_ids` | Newline-delimited sample names |
+| Section | Content |
+|---------|---------|
+| Header | JSON metadata (zstd): panel dimensions, chromosome, tile layout |
+| Variants | Binary per-variant chrom/pos/ref/alt (zstd) |
+| Sample IDs | Newline-delimited sample names (zstd) |
+| IDs | Variant identifiers — chr-pos-ref-alt (zstd) |
+| Original IDs | Original VCF IDs / rsIDs (zstd) |
+| Contig field | VCF contig header line |
+| Tile index | Offset + compressed size for each 2D tile |
+| Tile data | LZ4-compressed sparse tiles (1024 rows × N haplotype bands) |
 
-SRP files are created from VCF, BCF, or BREF3 using `--prepare-reference-from`. Multi-allelic variants are preserved as boolean (any ALT = 1). The entire SRP creation pipeline is pure Rust with zero external dependencies.
+Tiles are 2D blocks (1024 variants × haplotype bands) stored as LZ4-compressed sparse format, designed for L2-cache-friendly sequential access during interpolation. The tiled layout enables batch-parallel decompression with double-buffered I/O (decompress batch N+1 while computing batch N).
 
-The BCF reader uses parallel regional reads with file-size-based work distribution across threads, CSI index seeking, and streaming assembly to keep memory usage bounded even for very large panels (tested up to 171,054 haplotypes).
+SRP files are created from VCF, BCF, or BREF3 using `--prepare-reference-from`. The entire creation pipeline is pure Rust with zero external dependencies. The BCF reader uses parallel regional reads with CSI index seeking (tested up to 171,054 haplotypes).
 
 ## Reference
 
