@@ -685,6 +685,9 @@ pub(crate) fn interpolate_window_tiles(
     let tile_size = 4000usize;
     let use_tiled = srp.is_tiled();
 
+    let n_cores = rayon::current_num_threads();
+    let pct = |cpu: f64, wall: f64| -> f64 { if wall > 0.01 { cpu / wall / n_cores as f64 * 100.0 } else { 0.0 } };
+
     if use_tiled {
         // ====================================================================
         // TILED PATH: batch-parallel intervals with stripe decompression
@@ -702,6 +705,12 @@ pub(crate) fn interpolate_window_tiles(
         let stripe_preload_batch = (comp_mem_cap / stripe_comp.max(1)).max(10)
             .min(window_last_stripe - window_first_stripe + 1);
         let mut stripe_loaded: Option<crate::srp::tiled::PreloadedStripes> = preloaded_stripes;
+
+        let mut _t_chunk_load = 0.0f64;
+        let mut _t_lz4 = 0.0f64;
+        let mut _t_interp = 0.0f64;
+        let mut _cpu_tiles = 0.0f64;
+        let mut _n_intervals = 0usize;
 
         // Partition intervals into memory-bounded batches
         let decomp_tile_bytes: usize = 500 * 1024;
@@ -732,6 +741,9 @@ pub(crate) fn interpolate_window_tiles(
             (fs, ls, ls - fs + 1)
         }).collect();
 
+        crate::selphi_debug!("  [tiled] {} intervals → {} batches, max_stripes/batch={}, stripe_comp={:.1}KB",
+            setup.intervals.len(), batches.len(), max_stripes_per_batch, stripe_comp as f64 / 1e3);
+
         // Double-buffer I/O
         let mut next_io_handle: Option<std::thread::JoinHandle<std::io::Result<crate::srp::tiled::PreloadedStripes>>> = None;
 
@@ -748,6 +760,7 @@ pub(crate) fn interpolate_window_tiles(
             let (b_first_stripe, b_last_stripe, b_n_stripes) = batch_stripe_ranges[bi];
 
             // Get compressed data
+            let t0_io = std::time::Instant::now();
             let loaded_ok = stripe_loaded.as_ref().map_or(false, |l|
                 l.contains_stripe(b_first_stripe) && l.contains_stripe(b_last_stripe));
             if !loaded_ok {
@@ -768,6 +781,7 @@ pub(crate) fn interpolate_window_tiles(
                     stripe_loaded = Some(tiled.preload_stripes(b_first_stripe, n)?);
                 }
             }
+            _t_chunk_load += t0_io.elapsed().as_secs_f64();
             let loaded = stripe_loaded.as_ref().unwrap();
 
             // Start background I/O for next batch
@@ -788,6 +802,7 @@ pub(crate) fn interpolate_window_tiles(
             }
 
             // Decompress stripes in parallel
+            let t0_lz4 = std::time::Instant::now();
             let stripe_tiles: Vec<Vec<crate::srp::SparseTile>> = (0..b_n_stripes)
                 .into_par_iter()
                 .map(|si| {
@@ -795,10 +810,12 @@ pub(crate) fn interpolate_window_tiles(
                     (0..n_tile_cols).map(|band| loaded.decompress_tile(s, band)).collect()
                 })
                 .collect();
+            _t_lz4 += t0_lz4.elapsed().as_secs_f64();
 
             // Build tile descriptors for all intervals in this batch
             let mut all_descs: Vec<BTD> = Vec::new();
             let mut desc_counts: Vec<usize> = Vec::with_capacity(batch_ivs.len());
+            _n_intervals += batch_ivs.iter().filter(|iv| iv.wgs_end > iv.wgs_start).count();
             for (_li, iv) in batch_ivs.iter().enumerate() {
                 let n = iv.wgs_end - iv.wgs_start;
                 if n == 0 { desc_counts.push(0); continue; }
@@ -817,6 +834,8 @@ pub(crate) fn interpolate_window_tiles(
             }
 
             // Single par_iter: interpolation only (no formatting)
+            let t0_tiles = std::time::Instant::now();
+            let cpu0_tiles = crate::log::cpu_time_secs();
             let all_tiles: Vec<Vec<f32>> = all_descs.par_iter().map(|desc| {
                 let t: Vec<f32> = (0..desc.tile_n)
                     .map(|v| (desc.ts + v) as f32 / desc.full_range)
@@ -827,6 +846,8 @@ pub(crate) fn interpolate_window_tiles(
                     desc.gs, desc.tile_n, &t, setup.n_haps,
                 )
             }).collect();
+            _t_interp += t0_tiles.elapsed().as_secs_f64();
+            _cpu_tiles += crate::log::cpu_time_secs() - cpu0_tiles;
 
             // Distribute results back to per-interval Vecs
             let mut buf_idx = 0;
@@ -842,6 +863,9 @@ pub(crate) fn interpolate_window_tiles(
                 buf_idx += desc_counts[li];
             }
         }
+
+        crate::selphi_debug!("  [interp] {} intervals: io={:.1}s lz4={:.1}s tiles={:.1}s({:.0}%cpu)",
+            _n_intervals, _t_chunk_load, _t_lz4, _t_interp, pct(_cpu_tiles, _t_interp));
 
         Ok(all_interval_results)
 
@@ -892,12 +916,22 @@ pub(crate) fn interpolate_window_tiles(
             cache_high = first_batch_end;
         }
 
+        crate::selphi_debug!("  [chunks] size={:.1}MB batch={} of {} total, preloaded to {}",
+            chunk_mem_bytes as f64 / 1e6, adaptive_batch, total_chunks, cache_high - window_first_chunk);
+
+        let mut _t_chunk_load = 0.0f64;
+        let mut _t_interp = 0.0f64;
+        let mut _cpu_tiles = 0.0f64;
+        let mut _cpu_chunk_load = 0.0f64;
+        let mut _n_intervals = 0usize;
+
         let mut all_interval_results: Vec<Vec<TileResult>> = Vec::with_capacity(setup.intervals.len());
 
         for interval in &setup.intervals {
             let n_total_vars = interval.wgs_end - interval.wgs_start;
             if n_total_vars == 0 { all_interval_results.push(Vec::new()); continue; }
             let full_range = n_total_vars as f32;
+            _n_intervals += 1;
 
             let mut tile_descs: Vec<(usize, usize, usize)> = Vec::new();
             { let mut ts = 0; while ts < n_total_vars { let tn = (n_total_vars - ts).min(tile_size); tile_descs.push((ts, tn, interval.wgs_start + ts)); ts += tn; } }
@@ -915,13 +949,19 @@ pub(crate) fn interpolate_window_tiles(
                 let load_ids: Vec<usize> = (cache_high..new_high)
                     .filter(|id| chunk_cache[id - window_first_chunk].is_none()).collect();
                 if !load_ids.is_empty() {
+                    let t0 = std::time::Instant::now();
+                    let cpu0 = crate::log::cpu_time_secs();
                     let new_chunks: Vec<(usize, crate::srp::CscChunk)> = load_ids.par_iter()
                         .map(|&cid| (cid, srp.load_chunk_from_source(cid))).collect();
                     for (cid, chunk) in new_chunks { chunk_cache[cid - window_first_chunk] = Some(chunk); }
+                    _t_chunk_load += t0.elapsed().as_secs_f64();
+                    _cpu_chunk_load += crate::log::cpu_time_secs() - cpu0;
                 }
                 cache_high = new_high;
             }
 
+            let t0_tiles = std::time::Instant::now();
+            let cpu0_tiles = crate::log::cpu_time_secs();
             let tiles: Vec<TileResult> = tile_descs.par_iter().map(|&(ts, tile_n, global_start)| {
                 let t: Vec<f32> = (0..tile_n).map(|v| (ts + v) as f32 / full_range).collect();
                 let alt_probs = interpolate_tile_preloaded(
@@ -931,9 +971,15 @@ pub(crate) fn interpolate_window_tiles(
                 );
                 TileResult { alt_probs, tile_n, global_start }
             }).collect();
+            _t_interp += t0_tiles.elapsed().as_secs_f64();
+            _cpu_tiles += crate::log::cpu_time_secs() - cpu0_tiles;
 
             all_interval_results.push(tiles);
         }
+
+        crate::selphi_debug!("  [interp] {} intervals: chunk_load={:.1}s({:.0}%cpu) tiles={:.1}s({:.0}%cpu)",
+            _n_intervals, _t_chunk_load, pct(_cpu_chunk_load, _t_chunk_load),
+            _t_interp, pct(_cpu_tiles, _t_interp));
 
         Ok(all_interval_results)
     }
