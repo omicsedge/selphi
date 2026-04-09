@@ -35,6 +35,13 @@ struct TileEntry {
     comp_size: u32,
 }
 
+/// Public tile entry for constructing TiledSrpReader from external index data.
+#[derive(Clone, Copy)]
+pub struct TileEntryPub {
+    pub offset: u64,
+    pub comp_size: u32,
+}
+
 // ============================================================================
 // Writer: convert from SrpReader (v1/v2) to tiled format
 // ============================================================================
@@ -328,6 +335,17 @@ impl TiledSrpReader {
             n_variants, n_haps,
             tile_index, n_tile_rows, n_tile_cols,
         })
+    }
+
+    /// Construct from pre-parsed tile index (used by unified SRP v2 reader).
+    pub fn from_entries(
+        file_path: PathBuf, n_variants: usize, n_haps: usize,
+        entries: Vec<TileEntryPub>, n_tile_rows: usize, n_tile_cols: usize,
+    ) -> Self {
+        let tile_index = entries.into_iter()
+            .map(|e| TileEntry { offset: e.offset, comp_size: e.comp_size })
+            .collect();
+        Self { file_path, n_variants, n_haps, tile_index, n_tile_rows, n_tile_cols }
     }
 
     pub fn n_variants(&self) -> usize { self.n_variants }

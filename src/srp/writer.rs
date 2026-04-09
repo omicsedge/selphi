@@ -662,6 +662,321 @@ fn compress_and_assemble(
     Ok(())
 }
 
+// ============================================================================
+// SRP Unified Format (v2): single file with chunks + tiles
+// ============================================================================
+
+/// Magic for SRP v2 unified format.
+const SRP_V2_MAGIC: &[u8; 8] = b"SRP\x00\x02\x00\x00\x00";
+
+/// Build unified SRP file from BCF source.
+/// Produces a SINGLE .srp file containing metadata, variants, chunks, and tiles.
+pub fn build_srp_unified(
+    source_path: &Path,
+    output_path: &Path,
+    _threads: usize,
+    chunk_size_override: usize,
+) -> Result<(), SrpWriterError> {
+    use super::bcf_reader;
+    use super::{SparseTile, TILE_ROWS, TILE_COLS, parse_raw_chunk};
+    use std::io::{Seek, SeekFrom, BufWriter};
+
+    let source = source_path.to_string_lossy().to_string();
+    let is_bcf = source.ends_with(".bcf");
+
+    let header = bcf_reader::read_header_only(source_path)
+        .map_err(|e| SrpWriterError::Io(e))?;
+    let n_haps = header.n_samples * 2;
+
+    let csi_path = { let mut p = source_path.as_os_str().to_owned(); p.push(".csi"); std::path::PathBuf::from(p) };
+    if !csi_path.exists() {
+        selphi_info!("  CSI index not found, building...");
+        super::csi::build_csi_index(source_path)?;
+    }
+    let csi = super::csi::parse_csi(&csi_path).map_err(|_|
+        SrpWriterError::InvalidInput("Failed to read CSI index".into()))?;
+
+    let chunk_size = if chunk_size_override > 0 { chunk_size_override } else {
+        let bpv = 0.06 * n_haps as f64 * 4.0;
+        ((10.0 * 1024.0 * 1024.0 / bpv.max(1.0)) as usize)
+            .max((csi.n_mapped as usize + 1999) / 2000).clamp(1000, 50000)
+    };
+
+    let tmp_dir = tempfile::tempdir()?;
+
+    selphi_step!("Parallel BCF read ({} threads)...", rayon::current_num_threads());
+    let (hdr, region_results) = bcf_reader::read_bcf_parallel(source_path, chunk_size, tmp_dir.path())
+        .map_err(|e| SrpWriterError::Io(e))?;
+
+    let n_variants: usize = region_results.iter().map(|r| r.n_variants).sum();
+    let total_chunks: usize = region_results.iter().map(|r| r.chunk_files.len()).sum();
+    if n_variants == 0 { return Err(SrpWriterError::NoVariants); }
+
+    // Scan meta for summary info
+    let contig_names = &hdr.contig_names;
+    let mut chromosome = String::new();
+    let mut min_pos = i64::MAX;
+    let mut max_pos = i64::MIN;
+
+    // Collect variant data for binary index + IDs
+    let mut vbin = Vec::with_capacity(n_variants * 20);
+    let mut ids = Vec::with_capacity(n_variants * 30);
+    let mut orig_ids = Vec::with_capacity(n_variants * 20);
+    let mut first_id = true;
+
+    for rr in &region_results {
+        if rr.meta_file.as_os_str().is_empty() { continue; }
+        let text = std::fs::read_to_string(&rr.meta_file)?;
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() < 6 { continue; }
+            let cid: usize = f[0].parse().unwrap_or(0);
+            let chrom = if cid < contig_names.len() { &contig_names[cid] } else { f[0] };
+            let pos: i64 = f[1].parse().unwrap_or(0);
+            let ref_allele = f[2];
+            let alt_allele = f[3];
+            let original_id = f[4];
+
+            if chromosome.is_empty() { chromosome = chrom.to_string(); }
+            if pos < min_pos { min_pos = pos; }
+            if pos > max_pos { max_pos = pos; }
+
+            // Binary variant record
+            let chr_b = chrom.as_bytes();
+            let ref_b = ref_allele.as_bytes();
+            let alt_b = alt_allele.as_bytes();
+            vbin.extend_from_slice(&pos.to_le_bytes());
+            vbin.push(chr_b.len().min(255) as u8);
+            vbin.push(ref_b.len().min(255) as u8);
+            vbin.push(alt_b.len().min(255) as u8);
+            vbin.extend_from_slice(&chr_b[..chr_b.len().min(255)]);
+            vbin.extend_from_slice(&ref_b[..ref_b.len().min(255)]);
+            vbin.extend_from_slice(&alt_b[..alt_b.len().min(255)]);
+
+            // IDs
+            if !first_id { ids.push(b'\n'); orig_ids.push(b'\n'); }
+            ids.extend_from_slice(format!("{}-{}-{}-{}", chrom, pos, ref_allele, alt_allele).as_bytes());
+            orig_ids.extend_from_slice(original_id.as_bytes());
+            first_id = false;
+        }
+    }
+
+    selphi_info!("  samples:  {} ({} haplotypes)", hdr.n_samples, n_haps);
+    selphi_info!("  variants: {} (chr{}, {}–{})", n_variants, chromosome, min_pos, max_pos);
+    selphi_info!("  chunks:   {} (chunk_size={})", total_chunks, chunk_size);
+
+    let all_row_counts: Vec<usize> = region_results.iter()
+        .flat_map(|r| r.chunk_row_counts.iter().copied()).collect();
+
+    // === Read all compressed chunks from disk ===
+    let mut compressed_chunks: Vec<Vec<u8>> = Vec::with_capacity(total_chunks);
+    for rr in &region_results {
+        for cf in &rr.chunk_files {
+            compressed_chunks.push(std::fs::read(cf)?);
+        }
+    }
+
+    // === Build tiles from chunks (same logic as write_tiled) ===
+    let n_tile_rows = (n_variants + TILE_ROWS - 1) / TILE_ROWS;
+    let n_tile_cols = (n_haps + TILE_COLS - 1) / TILE_COLS;
+    let n_tiles = n_tile_rows * n_tile_cols;
+
+    selphi_step!("Building tiles ({} tiles)...", n_tiles);
+    let mut tile_data: Vec<Vec<u8>> = vec![Vec::new(); n_tiles];
+    let t0 = std::time::Instant::now();
+
+    // Pre-compute cumulative variant starts for chunk mapping
+    let chunk_var_starts: Vec<usize> = {
+        let mut starts = Vec::with_capacity(total_chunks);
+        let mut cum = 0;
+        for rc in &all_row_counts { starts.push(cum); cum += rc; }
+        starts
+    };
+
+    for cid in 0..total_chunks {
+        let chunk = parse_raw_chunk(&compressed_chunks[cid]);
+        let chunk_var_start = chunk_var_starts[cid];
+        let chunk_var_end = chunk_var_start + chunk.n_rows;
+        let first_stripe = chunk_var_start / TILE_ROWS;
+        let last_stripe = (chunk_var_end - 1) / TILE_ROWS;
+
+        for stripe in first_stripe..=last_stripe {
+            let stripe_var_start = stripe * TILE_ROWS;
+            let stripe_var_end = (stripe_var_start + TILE_ROWS).min(n_variants);
+            let ov_start = chunk_var_start.max(stripe_var_start);
+            let ov_end = chunk_var_end.min(stripe_var_end);
+            if ov_start >= ov_end { continue; }
+            let n_rows = stripe_var_end - stripe_var_start;
+
+            let band_tiles: Vec<(usize, Vec<u8>)> = (0..n_tile_cols).into_par_iter().map(|band| {
+                let col_start = band * TILE_COLS;
+                let col_end = (col_start + TILE_COLS).min(n_haps);
+                let n_cols = col_end - col_start;
+                let mut indptr = Vec::with_capacity(n_cols + 1);
+                let mut indices = Vec::new();
+                indptr.push(0u32);
+                for lc in 0..n_cols {
+                    let gc = col_start + lc;
+                    if gc < chunk.n_cols {
+                        let lo = chunk.indptr[gc] as usize;
+                        let hi = chunk.indptr[gc + 1] as usize;
+                        let rs = &chunk.indices[lo..hi];
+                        let lov = (ov_start - chunk_var_start) as i32;
+                        let hiv = (ov_end - chunk_var_start) as i32;
+                        let si = rs.partition_point(|&r| r < lov);
+                        for k in si..rs.len() {
+                            let r = rs[k];
+                            if r >= hiv { break; }
+                            indices.push((chunk_var_start + r as usize - stripe_var_start) as u16);
+                        }
+                    }
+                    indptr.push(indices.len() as u32);
+                }
+                let tile = SparseTile { indptr, indices, n_rows: n_rows as u16, n_cols: n_cols as u16 };
+                (band, zstd::encode_all(Cursor::new(&tile.to_bytes()), 3).unwrap())
+            }).collect();
+
+            for (band, data) in band_tiles {
+                let idx = stripe * n_tile_cols + band;
+                if tile_data[idx].is_empty() {
+                    tile_data[idx] = data;
+                } else {
+                    let existing = SparseTile::from_bytes(&zstd::decode_all(Cursor::new(&tile_data[idx])).unwrap());
+                    let new_part = SparseTile::from_bytes(&zstd::decode_all(Cursor::new(&data)).unwrap());
+                    let nc = existing.n_cols as usize;
+                    let mut mi = Vec::with_capacity(nc + 1);
+                    let mut mx = Vec::new();
+                    mi.push(0u32);
+                    for c in 0..nc {
+                        let (elo, ehi) = existing.col_range(c);
+                        for k in elo..ehi { mx.push(existing.indices[k]); }
+                        let (nlo, nhi) = new_part.col_range(c);
+                        for k in nlo..nhi { mx.push(new_part.indices[k]); }
+                        let s = mi.last().copied().unwrap() as usize;
+                        mx[s..].sort_unstable();
+                        mi.push(mx.len() as u32);
+                    }
+                    let merged = SparseTile { indptr: mi, indices: mx, n_rows: existing.n_rows, n_cols: existing.n_cols };
+                    tile_data[idx] = zstd::encode_all(Cursor::new(&merged.to_bytes()), 3).unwrap();
+                }
+            }
+        }
+        if (cid + 1) % 200 == 0 || cid + 1 == total_chunks {
+            eprintln!("  Tiles: chunk {}/{} ({:.1}s)", cid + 1, total_chunks, t0.elapsed().as_secs_f64());
+        }
+    }
+
+    // === Write unified SRP file ===
+    selphi_step!("Writing unified SRP...");
+    let meta_json = serde_json::json!({
+        "version": 2, "chromosome": chromosome, "n_variants": n_variants,
+        "n_haps": n_haps, "n_samples": hdr.n_samples,
+        "n_chunks": total_chunks, "chunk_size": chunk_size,
+        "chunk_row_counts": all_row_counts,
+        "min_position": min_pos, "max_position": max_pos,
+        "contig_field": hdr.contig_field,
+        "tile_rows": TILE_ROWS, "tile_cols": TILE_COLS,
+        "n_tile_rows": n_tile_rows, "n_tile_cols": n_tile_cols,
+    });
+    let meta_compressed = zstd::encode_all(Cursor::new(meta_json.to_string().as_bytes()), 3)?;
+    let vbin_compressed = zstd::encode_all(Cursor::new(&vbin), 3)?;
+    let sample_compressed = zstd::encode_all(Cursor::new(hdr.sample_names.join("\n").as_bytes()), 3)?;
+    let ids_compressed = zstd::encode_all(Cursor::new(&ids), 3)?;
+    let orig_compressed = zstd::encode_all(Cursor::new(&orig_ids), 3)?;
+    let contig_bytes = hdr.contig_field.as_bytes();
+
+    let out = std::fs::File::create(output_path)?;
+    let mut w = BufWriter::with_capacity(4 << 20, out);
+
+    // 1. Magic
+    w.write_all(SRP_V2_MAGIC)?;
+
+    // 2. Header
+    w.write_all(&(meta_compressed.len() as u32).to_le_bytes())?;
+    w.write_all(&meta_compressed)?;
+
+    // 3. Variants binary
+    w.write_all(&(vbin_compressed.len() as u32).to_le_bytes())?;
+    w.write_all(&vbin_compressed)?;
+
+    // 4. Sample IDs
+    w.write_all(&(sample_compressed.len() as u32).to_le_bytes())?;
+    w.write_all(&sample_compressed)?;
+
+    // 5. IDs
+    w.write_all(&(ids_compressed.len() as u32).to_le_bytes())?;
+    w.write_all(&ids_compressed)?;
+
+    // 6. Original IDs
+    w.write_all(&(orig_compressed.len() as u32).to_le_bytes())?;
+    w.write_all(&orig_compressed)?;
+
+    // 7. Contig field
+    w.write_all(&(contig_bytes.len() as u32).to_le_bytes())?;
+    w.write_all(contig_bytes)?;
+
+    // 8. Chunk index + data
+    w.write_all(&(total_chunks as u32).to_le_bytes())?;
+    // Write placeholder for chunk index (fill later)
+    let chunk_index_file_pos = 8 + 4 + meta_compressed.len() + 4 + vbin_compressed.len()
+        + 4 + sample_compressed.len() + 4 + ids_compressed.len()
+        + 4 + orig_compressed.len() + 4 + contig_bytes.len() + 4;
+    let chunk_idx_size = total_chunks * 16; // (offset:u64, comp:u32, decomp:u32)
+    w.write_all(&vec![0u8; chunk_idx_size])?;
+
+    // Write chunk data
+    struct ChunkEntry { offset: u64, comp_size: u32, decomp_size: u32 }
+    let mut chunk_entries = Vec::with_capacity(total_chunks);
+    let mut pos = (chunk_index_file_pos + chunk_idx_size) as u64;
+    for cc in &compressed_chunks {
+        let decomp = zstd::decode_all(Cursor::new(cc)).unwrap();
+        chunk_entries.push(ChunkEntry { offset: pos, comp_size: cc.len() as u32, decomp_size: decomp.len() as u32 });
+        w.write_all(cc)?;
+        pos += cc.len() as u64;
+    }
+
+    // 9. Tile index + data
+    w.write_all(&(n_tiles as u32).to_le_bytes())?;
+    let tile_index_file_pos = pos as usize + 4;
+    let tile_idx_size = n_tiles * 12;
+    w.write_all(&vec![0u8; tile_idx_size])?;
+
+    struct TileEntry2 { offset: u64, comp_size: u32 }
+    let mut tile_entries = Vec::with_capacity(n_tiles);
+    pos = (tile_index_file_pos + tile_idx_size) as u64;
+    for td in &tile_data {
+        tile_entries.push(TileEntry2 { offset: pos, comp_size: td.len() as u32 });
+        w.write_all(td)?;
+        pos += td.len() as u64;
+    }
+    w.flush()?;
+    drop(w);
+
+    // Fill chunk index
+    let mut file = std::fs::OpenOptions::new().write(true).open(output_path)?;
+    file.seek(SeekFrom::Start(chunk_index_file_pos as u64))?;
+    for e in &chunk_entries {
+        file.write_all(&e.offset.to_le_bytes())?;
+        file.write_all(&e.comp_size.to_le_bytes())?;
+        file.write_all(&e.decomp_size.to_le_bytes())?;
+    }
+
+    // Fill tile index
+    file.seek(SeekFrom::Start(tile_index_file_pos as u64))?;
+    for e in &tile_entries {
+        file.write_all(&e.offset.to_le_bytes())?;
+        file.write_all(&e.comp_size.to_le_bytes())?;
+    }
+    file.flush()?;
+
+    let file_size = std::fs::metadata(output_path)?.len();
+    let chunk_total: u64 = compressed_chunks.iter().map(|c| c.len() as u64).sum();
+    let tile_total: u64 = tile_data.iter().map(|t| t.len() as u64).sum();
+    selphi_step!("SRP unified: {} ({:.1} MB, chunks={:.1} MB, tiles={:.1} MB)",
+        output_path.display(), file_size as f64 / 1e6, chunk_total as f64 / 1e6, tile_total as f64 / 1e6);
+    Ok(())
+}
+
 fn auto_chunk_size(n_variants: usize, n_haps: usize) -> usize {
     let target_bytes: f64 = 10.0 * 1024.0 * 1024.0;
     let bytes_per_var = 0.06 * n_haps as f64 * 4.0;

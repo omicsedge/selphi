@@ -205,6 +205,10 @@ pub struct SrpMetadata {
     pub chunk_format: String,
     pub chunk_cv: f64,
     pub contig_field: String,
+    /// Cumulative variant starts per chunk (for non-uniform chunk sizes).
+    /// chunk_var_starts[cid] = first variant index in chunk cid.
+    /// Empty for uniform chunk sizes (use chunk_id * chunk_size).
+    pub chunk_var_starts: Vec<usize>,
     /// Raw JSON for any extra fields
     pub raw: HashMap<String, JsonValue>,
 }
@@ -212,6 +216,17 @@ pub struct SrpMetadata {
 impl SrpMetadata {
     pub(crate) fn from_json(v: &JsonValue) -> Self {
         let obj = v.as_object().expect("metadata must be a JSON object");
+        let chunk_var_starts = if let Some(arr) = obj.get("chunk_row_counts").and_then(|v| v.as_array()) {
+            let mut starts = Vec::with_capacity(arr.len());
+            let mut cum = 0usize;
+            for val in arr {
+                starts.push(cum);
+                cum += val.as_u64().unwrap_or(0) as usize;
+            }
+            starts
+        } else {
+            Vec::new()
+        };
         Self {
             chromosome: obj.get("chromosome").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             n_variants: obj.get("n_variants").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
@@ -223,7 +238,31 @@ impl SrpMetadata {
             chunk_format: obj.get("chunk_format").and_then(|v| v.as_str()).unwrap_or("npz").to_string(),
             chunk_cv: obj.get("chunk_cv").and_then(|v| v.as_f64()).unwrap_or(0.0),
             contig_field: obj.get("contig_field").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            chunk_var_starts,
             raw: obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        }
+    }
+
+    /// Get the first variant index for a given chunk ID.
+    pub fn chunk_var_start(&self, chunk_id: usize) -> usize {
+        if !self.chunk_var_starts.is_empty() {
+            self.chunk_var_starts[chunk_id]
+        } else {
+            chunk_id * self.chunk_size
+        }
+    }
+
+    /// Find chunk ID for a given variant index.
+    pub fn variant_to_chunk(&self, wgs_i: usize) -> (usize, usize) {
+        if !self.chunk_var_starts.is_empty() {
+            // Binary search in chunk_var_starts
+            let cid = match self.chunk_var_starts.binary_search(&wgs_i) {
+                Ok(i) => i,
+                Err(i) => i.saturating_sub(1),
+            };
+            (cid, wgs_i - self.chunk_var_starts[cid])
+        } else {
+            (wgs_i / self.chunk_size, wgs_i % self.chunk_size)
         }
     }
 }

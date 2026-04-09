@@ -35,12 +35,24 @@ pub struct SrpReader {
 }
 
 impl SrpReader {
-    /// Open an existing SRP file.
+    /// Open an existing SRP file (auto-detects v1 ZIP or v2 unified format).
     pub fn open<P: AsRef<Path>>(path: P, _cache_size: usize) -> Self {
         let filepath = path.as_ref().to_string_lossy().to_string();
         let file = File::open(&filepath).unwrap_or_else(|e| {
             panic!("Cannot open SRP file {}: {}", filepath, e);
         });
+
+        // Auto-detect format: check first 8 bytes
+        let mut magic = [0u8; 8];
+        {
+            let mut f = File::open(&filepath).unwrap();
+            use std::io::Read;
+            f.read_exact(&mut magic).unwrap_or_default();
+        }
+        if &magic == b"SRP\x00\x02\x00\x00\x00" {
+            return Self::open_v2(&filepath);
+        }
+
         let reader = BufReader::new(file);
         let mut archive = zip::ZipArchive::new(reader)
             .unwrap_or_else(|e| panic!("Invalid ZIP archive {}: {}", filepath, e));
@@ -146,6 +158,123 @@ impl SrpReader {
             max_cached: _cache_size,
             compressed_cache: Mutex::new(HashMap::new()),
             v2_mmap,
+            v2_chunk_index,
+            tiled,
+        }
+    }
+
+    /// Open SRP v2 unified format (single file with chunks + tiles).
+    fn open_v2(filepath: &str) -> Self {
+        use std::io::{Read as IoRead, Seek, SeekFrom};
+        let mut f = File::open(filepath).unwrap();
+        let mut magic = [0u8; 8];
+        f.read_exact(&mut magic).unwrap();
+
+        // Header
+        let mut buf4 = [0u8; 4];
+        f.read_exact(&mut buf4).unwrap();
+        let hdr_len = u32::from_le_bytes(buf4) as usize;
+        let mut hdr_comp = vec![0u8; hdr_len];
+        f.read_exact(&mut hdr_comp).unwrap();
+        let hdr_json = zstd::decode_all(Cursor::new(&hdr_comp)).unwrap();
+        let hdr: serde_json::Value = serde_json::from_slice(&hdr_json).unwrap();
+        let metadata = SrpMetadata::from_json(&hdr);
+
+        // Variants binary
+        f.read_exact(&mut buf4).unwrap();
+        let vlen = u32::from_le_bytes(buf4) as usize;
+        let mut vcomp = vec![0u8; vlen];
+        f.read_exact(&mut vcomp).unwrap();
+        let vraw = zstd::decode_all(Cursor::new(&vcomp)).unwrap();
+        let variants = Self::parse_variants_bin(&vraw, metadata.n_variants);
+
+        // Sample IDs
+        f.read_exact(&mut buf4).unwrap();
+        let slen = u32::from_le_bytes(buf4) as usize;
+        let mut scomp = vec![0u8; slen];
+        f.read_exact(&mut scomp).unwrap();
+        let sraw = zstd::decode_all(Cursor::new(&scomp)).unwrap();
+        let sample_ids: Vec<String> = String::from_utf8_lossy(&sraw).split('\n').map(|s| s.to_string()).collect();
+
+        // IDs
+        f.read_exact(&mut buf4).unwrap();
+        let ilen = u32::from_le_bytes(buf4) as usize;
+        let mut icomp = vec![0u8; ilen];
+        f.read_exact(&mut icomp).unwrap();
+        let iraw = zstd::decode_all(Cursor::new(&icomp)).unwrap();
+        let ids: Vec<String> = String::from_utf8_lossy(&iraw).split('\n').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+
+        // Original IDs
+        f.read_exact(&mut buf4).unwrap();
+        let olen = u32::from_le_bytes(buf4) as usize;
+        let mut ocomp = vec![0u8; olen];
+        f.read_exact(&mut ocomp).unwrap();
+        let oraw = zstd::decode_all(Cursor::new(&ocomp)).unwrap();
+        let original_ids: Vec<String> = String::from_utf8_lossy(&oraw).split('\n').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+
+        // Contig field
+        f.read_exact(&mut buf4).unwrap();
+        let clen = u32::from_le_bytes(buf4) as usize;
+        let mut cbuf = vec![0u8; clen];
+        f.read_exact(&mut cbuf).unwrap();
+        // (contig_field already in metadata)
+
+        // Chunk index
+        f.read_exact(&mut buf4).unwrap();
+        let n_chunks = u32::from_le_bytes(buf4) as usize;
+        let mut cidx = vec![0u8; n_chunks * 16];
+        f.read_exact(&mut cidx).unwrap();
+        let v2_chunk_index: Vec<(u64, u32, u32)> = (0..n_chunks).map(|i| {
+            let b = i * 16;
+            (u64::from_le_bytes(cidx[b..b+8].try_into().unwrap()),
+             u32::from_le_bytes(cidx[b+8..b+12].try_into().unwrap()),
+             u32::from_le_bytes(cidx[b+12..b+16].try_into().unwrap()))
+        }).collect();
+
+        // Skip chunk data (we'll pread on demand)
+        // Find the end of chunk data by looking at the last chunk entry
+        if !v2_chunk_index.is_empty() {
+            let last = &v2_chunk_index[n_chunks - 1];
+            f.seek(SeekFrom::Start(last.0 + last.1 as u64)).unwrap();
+        }
+
+        // Tile index
+        f.read_exact(&mut buf4).unwrap();
+        let n_tiles = u32::from_le_bytes(buf4) as usize;
+        let mut tidx = vec![0u8; n_tiles * 12];
+        f.read_exact(&mut tidx).unwrap();
+
+        let n_tile_rows = hdr.get("n_tile_rows").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let n_tile_cols = hdr.get("n_tile_cols").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        // Build TiledSrpReader from tile index (no separate file!)
+        let tile_entries: Vec<super::tiled::TileEntryPub> = (0..n_tiles).map(|i| {
+            let b = i * 12;
+            super::tiled::TileEntryPub {
+                offset: u64::from_le_bytes(tidx[b..b+8].try_into().unwrap()),
+                comp_size: u32::from_le_bytes(tidx[b+8..b+12].try_into().unwrap()),
+            }
+        }).collect();
+
+        let tiled = Some(super::tiled::TiledSrpReader::from_entries(
+            filepath.into(), metadata.n_variants, metadata.n_haps, tile_entries, n_tile_rows, n_tile_cols,
+        ));
+
+        // Build chunks array (needed by some callers)
+        let chunks: Vec<[i64; 3]> = (0..n_chunks).map(|i| [i as i64, 0, 0]).collect();
+
+        // Mmap the file for chunk pread
+        let mmap_file = File::open(filepath).unwrap();
+        let mmap = unsafe { memmap2::Mmap::map(&mmap_file).ok() };
+
+        SrpReader {
+            filepath: filepath.to_string(),
+            metadata, variants, chunks, sample_ids, ids, original_ids,
+            cache: RwLock::new(HashMap::new()),
+            cache_order: Mutex::new(Vec::new()),
+            max_cached: 0,
+            compressed_cache: Mutex::new(HashMap::new()),
+            v2_mmap: mmap,
             v2_chunk_index,
             tiled,
         }
@@ -392,8 +521,7 @@ impl SrpReader {
         {
             let mut groups: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
             for (chip_i, &wgs_i) in wgs_idx.iter().enumerate() {
-                let chunk_id = wgs_i / chunk_size;
-                let local_row = wgs_i % chunk_size;
+                let (chunk_id, local_row) = self.metadata.variant_to_chunk(wgs_i);
                 groups.entry(chunk_id).or_default().push((chip_i, local_row));
             }
             chunk_groups = groups.into_iter().collect();
