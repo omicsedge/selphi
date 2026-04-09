@@ -173,7 +173,7 @@ impl SrpReader {
         // Drop v2 mmap before loading tiled to avoid double memory
         self.v2_mmap = None;
         self.v2_chunk_index.clear();
-        match super::tiled::TiledSrpReader::open(&tiled_path) {
+        match super::tiled::TiledSrpReader::open(&tiled_path, self.metadata.n_variants, self.metadata.n_haps) {
             Ok(t) => { self.tiled = Some(t); true }
             Err(e) => { eprintln!("  Warning: tiled SRP load failed: {}", e); false }
         }

@@ -649,11 +649,11 @@ fn main() {
     selphi_debug!("  RS cm_ld[1000]={:.15}", chip_cm[1000]);
     selphi_step!("Genetic map loaded + LD correction");
 
-    // Tiled SRP: format ready but kernel not yet faster than CSC (mmap page faults).
-    // TODO: enable when tiled I/O is optimized (pre-load or buffered reads).
-    // if let Some(srp_mut) = Arc::get_mut(&mut srp) {
-    //     if srp_mut.load_tiled() { selphi_step!("Tiled SRP loaded"); }
-    // }
+    // Load tiled SRP backend if .srpt file exists.
+    // Tiled format uses sequential bulk reads (no mmap) for zero-page-fault interpolation.
+    if let Some(srp_mut) = Arc::get_mut(&mut srp) {
+        if srp_mut.load_tiled() { selphi_step!("Tiled SRP loaded (sequential I/O)"); }
+    }
 
     // 7. Auto-calibrate parameters
     let match_length = args.match_length.unwrap_or_else(|| {
@@ -885,12 +885,30 @@ fn main() {
         let coded_secs = t0_coded.elapsed().as_secs_f64();
         let cpu_coded = selphi::log::cpu_time_secs();
 
-        // Start chunk pre-decompression for this window's interpolation.
-        // Runs on 4 dedicated threads during HMM (which uses rayon ~8 cores).
-        // CPU profiling: chunk_load=17% + HMM=51% = 68%, fits in 16 cores.
-        // Cap at 500 chunks to limit memory (~8GB). Remaining loaded on-demand by pipeline.
+        // Pre-load data for interpolation during HMM (overlaps I/O with compute).
+        // Tiled: sequential read of compressed stripes (~500 MB).
+        // CSC: parallel chunk decompression on 4 threads.
         let mut chunk_preload_handle: Option<std::thread::JoinHandle<Vec<Option<selphi::srp::CscChunk>>>> = None;
-        if !output_bcf && !output_parquet && !output_pgen {
+        let mut stripe_preload_handle: Option<std::thread::JoinHandle<Option<selphi::srp::tiled::PreloadedStripes>>> = None;
+
+        if srp.is_tiled() && !output_bcf && !output_parquet && !output_pgen {
+            // Preload compressed stripe data during HMM (1 thread, sequential I/O)
+            let tiled_path = std::path::Path::new(&args.refpanel).with_extension("srpt");
+            let own_start = if window.own_chip_start == 0 { 0 } else { wgs_idx[window.own_chip_start] };
+            let own_end = if window.own_chip_end >= wgs_idx.len() { srp.n_variants() } else { wgs_idx[window.own_chip_end] };
+            let n_v = srp.n_variants();
+            let n_h = srp.n_haps();
+            stripe_preload_handle = Some(std::thread::spawn(move || {
+                let tiled = selphi::srp::tiled::TiledSrpReader::open(&tiled_path, n_v, n_h).ok()?;
+                let first_stripe = own_start / 1024; // TILE_ROWS
+                let last_stripe = if own_end > 0 { (own_end - 1) / 1024 } else { 0 };
+                let n_stripes = last_stripe - first_stripe + 1;
+                // Cap at 500 MB compressed
+                let stripe_comp = tiled.stripe_compressed_bytes(first_stripe);
+                let n_load = (500 * 1024 * 1024 / stripe_comp.max(1)).max(10).min(n_stripes);
+                tiled.preload_stripes(first_stripe, n_load).ok()
+            }));
+        } else if !output_bcf && !output_parquet && !output_pgen {
             let srp_clone = Arc::clone(&srp);
             let own_start = if window.own_chip_start == 0 { 0 } else { wgs_idx[window.own_chip_start] };
             let own_end = if window.own_chip_end >= wgs_idx.len() { srp.n_variants() } else { wgs_idx[window.own_chip_end] };
@@ -1050,8 +1068,10 @@ fn main() {
         let cpu_hmm = selphi::log::cpu_time_secs();
         let pbwt_secs = t0_win.elapsed().as_secs_f64();
 
-        // Retrieve pre-loaded chunks (were decompressing during HMM).
+        // Retrieve pre-loaded data (was reading during HMM).
         let preloaded = chunk_preload_handle.take().map(|h| h.join().expect("chunk preload panicked"));
+        let preloaded_stripes = stripe_preload_handle.take()
+            .and_then(|h| h.join().expect("stripe preload panicked"));
         let cpu_preload = selphi::log::cpu_time_secs();
 
         // Wait for prefetch of this window's chunks (should already be done)
@@ -1104,7 +1124,7 @@ fn main() {
             selphi::io::pipeline::interpolate_window_to_bytes(
                 &srp, &all_weights, cs, ce, os, oe,
                 &wgs_idx, n_samples, &targ_alleles, n_haps,
-                &sample_names, no_ap, preloaded,
+                &sample_names, no_ap, preloaded, preloaded_stripes,
             ).expect("Interpolation failed")
         };
         let interp_secs = t0_interp.elapsed().as_secs_f64();

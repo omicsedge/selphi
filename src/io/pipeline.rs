@@ -190,6 +190,7 @@ pub fn write_window_to_vcf(
     _sample_names: &[String],
     no_ap: bool,
     preloaded_chunks: Option<Vec<Option<crate::srp::CscChunk>>>,
+    preloaded_stripes: Option<crate::srp::tiled::PreloadedStripes>,
 ) -> std::io::Result<()> {
     let n_haps = n_samples * 2;
     let n_ref_variants = srp.n_variants();
@@ -296,115 +297,287 @@ pub fn write_window_to_vcf(
 
     _t_setup = t0_pipeline_setup.elapsed().as_secs_f64();
 
-    // Sliding-window chunk loading: decompress chunks in batches, not all at once.
-    // Each batch covers a range of genomic positions. Intervals are processed in order,
-    // and chunks are loaded/freed as we advance along the chromosome.
-    let t0_preload = std::time::Instant::now();
-    let window_first_chunk = own_wgs_start / chunk_size;
-    let window_last_chunk = if own_wgs_end > 0 { (own_wgs_end - 1) / chunk_size } else { 0 };
-    let total_chunks = window_last_chunk - window_first_chunk + 1;
+    let use_tiled = srp.is_tiled();
+    use rayon::prelude::*;
+    use crate::srp::TILE_ROWS;
 
-    // Memory-bounded chunk streaming: cap decompressed chunks at ~2 GB.
-    // Chunk size varies by panel (74 MB for TOPMed 171K, ~2 MB for 1KG 4.8K).
-    // Batch must be large enough for rayon parallelism (≥16).
-    // Actual cap calculated from first chunk after decompression.
-    let mem_cap_bytes: usize = 2 * 1024 * 1024 * 1024; // 2 GB
-    let max_chunk_batch = total_chunks.min(500); // initial guess, refined below
-    // Vec-indexed chunk cache: O(1) lookup by chunk_id - window_first_chunk.
-    // Eliminates per-interval HashMap rebuild (was 11873× HashMap::collect).
-    let mut chunk_cache: Vec<Option<crate::srp::CscChunk>>;
-    let mut cache_low: usize = window_first_chunk;
-    let mut cache_high: usize;
+    if use_tiled {
+        // ====================================================================
+        // TILED PATH: batch-parallel intervals for maximum CPU utilization.
+        //
+        // Architecture:
+        //   1. Pre-format chip sites (once, serial)
+        //   2. Partition intervals into batches (memory-bounded)
+        //   3. Per batch: bulk decompress stripes → par_iter all tile_descs
+        //   4. Emit results in order
+        // ====================================================================
 
-    // Adaptive batch size from actual chunk memory.
-    // Pipeline loads/evicts in sliding window — peak = ~2× batch size.
-    let chunk_mem_bytes = {
-        let probe = srp.load_chunk_from_source(window_first_chunk);
-        let mem = (probe.n_cols + 1) * 4 + probe.indices.len() * 4 + 12;
-        mem.max(1)
-    };
-    // Fit batch within memory cap, but at least 100 for good rayon parallelism.
-    let adaptive_batch = (mem_cap_bytes / chunk_mem_bytes).max(100).min(total_chunks);
+        let tiled = srp.tiled.as_ref().unwrap();
+        let n_tile_cols = tiled.n_tile_cols;
+        let n_tiled_variants = tiled.n_variants();
+        let window_first_stripe = own_wgs_start / TILE_ROWS;
+        let window_last_stripe = if own_wgs_end > 0 { (own_wgs_end - 1) / TILE_ROWS } else { 0 };
 
-    if let Some(pre) = preloaded_chunks {
-        let n_preloaded = pre.iter().take_while(|c| c.is_some()).count();
-        chunk_cache = pre;
-        cache_high = window_first_chunk + n_preloaded;
-        // Load next adaptive batch in parallel (from where preload ended).
-        let next_end = (cache_high + adaptive_batch).min(window_last_chunk + 1);
-        if next_end > cache_high {
-            let batch_ids: Vec<usize> = (cache_high..next_end)
-                .filter(|id| chunk_cache[id - window_first_chunk].is_none())
-                .collect();
-            if !batch_ids.is_empty() {
-                let batch: Vec<(usize, crate::srp::CscChunk)> = batch_ids.par_iter()
-                    .map(|&cid| (cid, srp.load_chunk_from_source(cid)))
-                    .collect();
-                for (cid, chunk) in batch { chunk_cache[cid - window_first_chunk] = Some(chunk); }
-            }
-            cache_high = next_end;
-        }
-    } else {
-        chunk_cache = (0..total_chunks).map(|_| None).collect();
-        let first_batch_end = (window_first_chunk + adaptive_batch).min(window_last_chunk + 1);
-        let first_ids: Vec<usize> = (window_first_chunk..first_batch_end).collect();
-        let first_chunks: Vec<(usize, crate::srp::CscChunk)> = first_ids.par_iter()
-            .map(|&cid| (cid, srp.load_chunk_from_source(cid)))
-            .collect();
-        for (cid, chunk) in first_chunks { chunk_cache[cid - window_first_chunk] = Some(chunk); }
-        cache_high = first_batch_end;
-    }
-    crate::selphi_debug!("  [chunks] size={:.1}MB batch={} of {} total, preloaded to {}",
-        chunk_mem_bytes as f64 / 1e6, adaptive_batch, total_chunks, cache_high - window_first_chunk);
-    _t_chunk_load = t0_preload.elapsed().as_secs_f64();
-    _cpu_chunk_load = crate::log::cpu_time_secs() - cpu0_pipeline;
+        // Compressed stripe preload sizing
+        let stripe_comp = tiled.stripe_compressed_bytes(window_first_stripe);
+        let comp_mem_cap: usize = 500 * 1024 * 1024;
+        let stripe_preload_batch = (comp_mem_cap / stripe_comp.max(1)).max(10)
+            .min(window_last_stripe - window_first_stripe + 1);
+        let mut stripe_loaded: Option<crate::srp::tiled::PreloadedStripes> = preloaded_stripes;
 
-    for interval in &intervals {
-        // Write chip sites before this interval
+        // Phase 0: Pre-format chip sites per interval gap
         let t0_chip = std::time::Instant::now();
-        while next_wgs < interval.wgs_start {
-            if is_chip[next_wgs] {
-                let vp_idx = next_wgs - own_wgs_start;
-                format_chip_line_bytes(&mut chip_buf, next_wgs, vp_idx, &vid_prefixes,
-                    chip_genotypes, &chip_local_idx, n_haps, n_samples, &an_str);
-                tx.send(chip_buf.clone()).map_err(|e| std::io::Error::other(e.to_string()))?;
-            }
-            next_wgs += 1;
-        }
-        _t_chip += t0_chip.elapsed().as_secs_f64();
-
-        let n_total_vars = interval.wgs_end - interval.wgs_start;
-        if n_total_vars == 0 { continue; }
-        let full_range = n_total_vars as f32;
-        _n_intervals += 1;
-
-        // Build tile descriptors
-        let mut tile_descs: Vec<(usize, usize, usize)> = Vec::new();
+        let mut chip_gap_bufs: Vec<Vec<Vec<u8>>> = Vec::with_capacity(intervals.len() + 1);
         {
-            let mut ts = 0;
-            while ts < n_total_vars {
-                let tn = (n_total_vars - ts).min(tile_size);
-                let gs = interval.wgs_start + ts;
-                tile_descs.push((ts, tn, gs));
-                ts += tn;
+            let mut nw = own_wgs_start;
+            for interval in &intervals {
+                let mut gap = Vec::new();
+                while nw < interval.wgs_start {
+                    if is_chip[nw] {
+                        let vp_idx = nw - own_wgs_start;
+                        let mut buf = Vec::with_capacity(n_samples * 20);
+                        format_chip_line_bytes(&mut buf, nw, vp_idx, &vid_prefixes,
+                            chip_genotypes, &chip_local_idx, n_haps, n_samples, &an_str);
+                        gap.push(buf);
+                    }
+                    nw += 1;
+                }
+                chip_gap_bufs.push(gap);
+                nw = interval.wgs_end;
             }
+            // Trailing chip sites after last interval
+            let mut trailing = Vec::new();
+            while nw < own_wgs_end {
+                if is_chip[nw] {
+                    let vp_idx = nw - own_wgs_start;
+                    let mut buf = Vec::with_capacity(n_samples * 20);
+                    format_chip_line_bytes(&mut buf, nw, vp_idx, &vid_prefixes,
+                        chip_genotypes, &chip_local_idx, n_haps, n_samples, &an_str);
+                    trailing.push(buf);
+                }
+                nw += 1;
+            }
+            chip_gap_bufs.push(trailing);
+        }
+        _t_chip = t0_chip.elapsed().as_secs_f64();
+
+        // Phase 1: Partition intervals into memory-bounded batches.
+        // Each batch's decompressed tiles must fit in ~2 GB.
+        let decomp_tile_bytes: usize = 500 * 1024; // ~500 KB per tile
+        let bytes_per_stripe = n_tile_cols * decomp_tile_bytes;
+        let decomp_mem_cap: usize = 2 * 1024 * 1024 * 1024;
+        let max_stripes_per_batch = (decomp_mem_cap / bytes_per_stripe.max(1)).max(4);
+
+        let mut batches: Vec<(usize, usize)> = Vec::new(); // (start_idx, end_idx) into intervals
+        {
+            let mut bstart = 0;
+            let mut b_first_stripe = if !intervals.is_empty() { intervals[0].wgs_start / TILE_ROWS } else { 0 };
+            for i in 0..intervals.len() {
+                let iv_last = if intervals[i].wgs_end > 0 { (intervals[i].wgs_end - 1) / TILE_ROWS } else { b_first_stripe };
+                let n_stripes = iv_last - b_first_stripe + 1;
+                if n_stripes > max_stripes_per_batch && i > bstart {
+                    batches.push((bstart, i));
+                    bstart = i;
+                    b_first_stripe = intervals[i].wgs_start / TILE_ROWS;
+                }
+            }
+            if bstart < intervals.len() { batches.push((bstart, intervals.len())); }
         }
 
-        // Ensure chunks for this interval are loaded (advance sliding window)
-        let iv_first = interval.wgs_start / chunk_size;
-        let iv_last = if interval.wgs_end > 0 { (interval.wgs_end - 1) / chunk_size } else { iv_first };
+        let t0_preload = std::time::Instant::now();
+        let cpu0_preload = crate::log::cpu_time_secs();
 
-        // Tile computation: tiled path (L2-cache tiles) or CSC chunk path.
-        use rayon::prelude::*;
-        let t0_tiles = std::time::Instant::now();
-        let cpu0_tiles = crate::log::cpu_time_secs();
+        crate::selphi_debug!("  [tiled] {} intervals → {} batches, max_stripes/batch={}, stripe_comp={:.1}KB",
+            intervals.len(), batches.len(), max_stripes_per_batch, stripe_comp as f64 / 1e3);
 
-        // Tiled format exists but CSC is faster for now (mmap page faults on 17GB tiled file).
-        // TODO: pre-load tiled data or use buffered I/O instead of mmap random access.
-        let use_tiled = false; // srp.is_tiled();
+        // Batch tile descriptor: carries interval context for the par_iter
+        struct BTD { iv_local: usize, ts: usize, tile_n: usize, gs: usize, ws: usize, we: usize, full_range: f32 }
 
-        if !use_tiled {
-            // CSC chunk path: evict + load + scatter from 74 MB chunks
+        for &(bstart, bend) in &batches {
+            let batch_ivs = &intervals[bstart..bend];
+            if batch_ivs.is_empty() { continue; }
+
+            // Phase 2: Bulk decompress stripes for this batch
+            let b_first_stripe = batch_ivs[0].wgs_start / TILE_ROWS;
+            let b_last_stripe = {
+                let last_end = batch_ivs.last().unwrap().wgs_end;
+                if last_end > 0 { (last_end - 1) / TILE_ROWS } else { b_first_stripe }
+            };
+            let b_n_stripes = b_last_stripe - b_first_stripe + 1;
+
+            // Ensure compressed data covers this range
+            let loaded_ok = stripe_loaded.as_ref().map_or(false, |l|
+                l.contains_stripe(b_first_stripe) && l.contains_stripe(b_last_stripe));
+            if !loaded_ok {
+                let needed = b_n_stripes;
+                let n = needed.max(stripe_preload_batch).min(window_last_stripe - b_first_stripe + 1);
+                let t0 = std::time::Instant::now();
+                stripe_loaded = Some(tiled.preload_stripes(b_first_stripe, n)?);
+                _t_chunk_load += t0.elapsed().as_secs_f64();
+            }
+            let loaded = stripe_loaded.as_ref().unwrap();
+
+            // Decompress all stripes for the batch in parallel (LZ4 from RAM, ~300 GB output total)
+            let stripe_tiles: Vec<Vec<crate::srp::SparseTile>> = (0..b_n_stripes)
+                .into_par_iter()
+                .map(|si| {
+                    let s = b_first_stripe + si;
+                    (0..n_tile_cols).map(|band| loaded.decompress_tile(s, band)).collect()
+                })
+                .collect();
+
+            // Phase 3: Flatten all tile_descs from this batch
+            let mut all_descs: Vec<BTD> = Vec::new();
+            let mut desc_counts: Vec<usize> = Vec::with_capacity(batch_ivs.len()); // descs per interval
+            for (li, iv) in batch_ivs.iter().enumerate() {
+                let n = iv.wgs_end - iv.wgs_start;
+                if n == 0 { desc_counts.push(0); continue; }
+                let mut cnt = 0;
+                let mut ts = 0;
+                while ts < n {
+                    let tn = (n - ts).min(tile_size);
+                    all_descs.push(BTD { iv_local: li, ts, tile_n: tn, gs: iv.wgs_start + ts,
+                        ws: iv.weight_s, we: iv.weight_e, full_range: n as f32 });
+                    ts += tn;
+                    cnt += 1;
+                }
+                desc_counts.push(cnt);
+            }
+            _n_intervals += batch_ivs.iter().filter(|iv| iv.wgs_end > iv.wgs_start).count();
+
+            // Phase 4: Single par_iter over ALL descs — maximum rayon utilization
+            let t0_tiles = std::time::Instant::now();
+            let cpu0_tiles = crate::log::cpu_time_secs();
+
+            let mut all_bufs: Vec<Vec<u8>> = all_descs.par_iter().map(|desc| {
+                let t: Vec<f32> = (0..desc.tile_n)
+                    .map(|v| (desc.ts + v) as f32 / desc.full_range)
+                    .collect();
+
+                // Fused single-dispatch kernel: scatter all stripes + divide
+                let alt_probs = interpolate_tile_batch(
+                    &stripe_tiles, b_first_stripe, n_tiled_variants, n_tile_cols,
+                    &weight_refs, desc.ws, desc.we,
+                    desc.gs, desc.tile_n, &t, n_haps,
+                );
+
+                let vp_start = desc.gs - own_wgs_start;
+                format_tile_batch(
+                    &alt_probs, desc.tile_n, n_haps, n_samples,
+                    desc.gs, n_ref_variants,
+                    vp_start, &vid_prefixes, &is_chip, &chip_local_idx,
+                    chip_genotypes, &an_str, no_ap,
+                )
+            }).collect();
+
+            _t_interp += t0_tiles.elapsed().as_secs_f64();
+            _cpu_tiles += crate::log::cpu_time_secs() - cpu0_tiles;
+
+            // Phase 5: Emit in order — chip sites interleaved with tile results.
+            // par_iter preserves order, so all_bufs[0..desc_counts[0]) = interval 0's tiles, etc.
+            // Zero-copy: std::mem::take moves the Vec instead of cloning (~95 GB memcpy eliminated).
+            let t0_send = std::time::Instant::now();
+            let mut buf_idx = 0;
+            for (li, _iv) in batch_ivs.iter().enumerate() {
+                for chip_buf in &chip_gap_bufs[bstart + li] {
+                    tx.send(chip_buf.clone()).map_err(|e| std::io::Error::other(e.to_string()))?;
+                }
+                for _ in 0..desc_counts[li] {
+                    tx.send(std::mem::take(&mut all_bufs[buf_idx])).map_err(|e| std::io::Error::other(e.to_string()))?;
+                    buf_idx += 1;
+                }
+            }
+            _t_send += t0_send.elapsed().as_secs_f64();
+        }
+
+        // Trailing chip sites after all intervals
+        let t0_send = std::time::Instant::now();
+        for chip_buf in &chip_gap_bufs[intervals.len()] {
+            tx.send(chip_buf.clone()).map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
+        _t_send += t0_send.elapsed().as_secs_f64();
+        _cpu_chunk_load += crate::log::cpu_time_secs() - cpu0_preload - _cpu_tiles;
+
+        let pct = |cpu: f64, wall: f64| -> f64 { if wall > 0.01 { cpu / wall / n_cores as f64 * 100.0 } else { 0.0 } };
+        crate::selphi_debug!("  [interp] {} intervals: setup={:.2}s chunk_load={:.1}s({:.0}%cpu) chip={:.2}s tiles={:.1}s({:.0}%cpu) send={:.1}s",
+            _n_intervals, _t_setup, _t_chunk_load, pct(_cpu_chunk_load, _t_chunk_load),
+            _t_chip, _t_interp, pct(_cpu_tiles, _t_interp), _t_send);
+
+    } else {
+        // ====================================================================
+        // CSC PATH: original per-interval sliding window (unchanged)
+        // ====================================================================
+        let window_first_chunk = own_wgs_start / chunk_size;
+        let window_last_chunk = if own_wgs_end > 0 { (own_wgs_end - 1) / chunk_size } else { 0 };
+        let total_chunks = window_last_chunk - window_first_chunk + 1;
+        let mut cache_low = window_first_chunk;
+        let mut cache_high: usize;
+
+        let t0_preload = std::time::Instant::now();
+        let mem_cap_bytes: usize = 2 * 1024 * 1024 * 1024;
+        let chunk_mem_bytes = {
+            let probe = srp.load_chunk_from_source(window_first_chunk);
+            let mem = (probe.n_cols + 1) * 4 + probe.indices.len() * 4 + 12;
+            mem.max(1)
+        };
+        let adaptive_batch = (mem_cap_bytes / chunk_mem_bytes).max(100).min(total_chunks);
+        let mut chunk_cache: Vec<Option<crate::srp::CscChunk>>;
+
+        if let Some(pre) = preloaded_chunks {
+            let n_preloaded = pre.iter().take_while(|c| c.is_some()).count();
+            chunk_cache = pre;
+            cache_high = window_first_chunk + n_preloaded;
+            let next_end = (cache_high + adaptive_batch).min(window_last_chunk + 1);
+            if next_end > cache_high {
+                let batch_ids: Vec<usize> = (cache_high..next_end)
+                    .filter(|id| chunk_cache[id - window_first_chunk].is_none())
+                    .collect();
+                if !batch_ids.is_empty() {
+                    let batch: Vec<(usize, crate::srp::CscChunk)> = batch_ids.par_iter()
+                        .map(|&cid| (cid, srp.load_chunk_from_source(cid)))
+                        .collect();
+                    for (cid, chunk) in batch { chunk_cache[cid - window_first_chunk] = Some(chunk); }
+                }
+                cache_high = next_end;
+            }
+        } else {
+            chunk_cache = (0..total_chunks).map(|_| None).collect();
+            let first_batch_end = (window_first_chunk + adaptive_batch).min(window_last_chunk + 1);
+            let first_ids: Vec<usize> = (window_first_chunk..first_batch_end).collect();
+            let first_chunks: Vec<(usize, crate::srp::CscChunk)> = first_ids.par_iter()
+                .map(|&cid| (cid, srp.load_chunk_from_source(cid)))
+                .collect();
+            for (cid, chunk) in first_chunks { chunk_cache[cid - window_first_chunk] = Some(chunk); }
+            cache_high = first_batch_end;
+        }
+        crate::selphi_debug!("  [chunks] size={:.1}MB batch={} of {} total, preloaded to {}",
+            chunk_mem_bytes as f64 / 1e6, adaptive_batch, total_chunks, cache_high - window_first_chunk);
+        _t_chunk_load = t0_preload.elapsed().as_secs_f64();
+        _cpu_chunk_load = crate::log::cpu_time_secs() - cpu0_pipeline;
+
+        for interval in &intervals {
+            let t0_chip = std::time::Instant::now();
+            while next_wgs < interval.wgs_start {
+                if is_chip[next_wgs] {
+                    let vp_idx = next_wgs - own_wgs_start;
+                    format_chip_line_bytes(&mut chip_buf, next_wgs, vp_idx, &vid_prefixes,
+                        chip_genotypes, &chip_local_idx, n_haps, n_samples, &an_str);
+                    tx.send(chip_buf.clone()).map_err(|e| std::io::Error::other(e.to_string()))?;
+                }
+                next_wgs += 1;
+            }
+            _t_chip += t0_chip.elapsed().as_secs_f64();
+
+            let n_total_vars = interval.wgs_end - interval.wgs_start;
+            if n_total_vars == 0 { continue; }
+            let full_range = n_total_vars as f32;
+            _n_intervals += 1;
+
+            let mut tile_descs: Vec<(usize, usize, usize)> = Vec::new();
+            { let mut ts = 0; while ts < n_total_vars { let tn = (n_total_vars - ts).min(tile_size); tile_descs.push((ts, tn, interval.wgs_start + ts)); ts += tn; } }
+
+            let iv_first = interval.wgs_start / chunk_size;
+            let iv_last = if interval.wgs_end > 0 { (interval.wgs_end - 1) / chunk_size } else { iv_first };
             let evict_below = iv_first.saturating_sub(1);
             if evict_below > cache_low {
                 for cid in cache_low..evict_below { chunk_cache[cid - window_first_chunk] = None; }
@@ -413,92 +586,55 @@ pub fn write_window_to_vcf(
             if iv_last >= cache_high {
                 let new_high = (cache_high + adaptive_batch).min(window_last_chunk + 1);
                 let load_ids: Vec<usize> = (cache_high..new_high)
-                    .filter(|id| chunk_cache[id - window_first_chunk].is_none())
-                    .collect();
+                    .filter(|id| chunk_cache[id - window_first_chunk].is_none()).collect();
                 if !load_ids.is_empty() {
                     let t0 = std::time::Instant::now();
                     let cpu0 = crate::log::cpu_time_secs();
                     let new_chunks: Vec<(usize, crate::srp::CscChunk)> = load_ids.par_iter()
-                        .map(|&cid| (cid, srp.load_chunk_from_source(cid)))
-                        .collect();
+                        .map(|&cid| (cid, srp.load_chunk_from_source(cid))).collect();
                     for (cid, chunk) in new_chunks { chunk_cache[cid - window_first_chunk] = Some(chunk); }
                     _t_chunk_load += t0.elapsed().as_secs_f64();
                     _cpu_chunk_load += crate::log::cpu_time_secs() - cpu0;
                 }
                 cache_high = new_high;
             }
-        }
 
-        let tile_bufs: Vec<Vec<u8>> = if use_tiled {
-            // Tiled path: parallel over intervals, sequential per-haplotype inside.
-            let tiled_ref = srp.tiled.as_ref().unwrap();
-            tile_descs.par_iter().map(|&(ts, tile_n, global_start)| {
-                let t: Vec<f32> = (0..tile_n)
-                    .map(|v| (ts + v) as f32 / full_range)
-                    .collect();
-
-                let alt_probs = interpolate_tile_tiled(
-                    tiled_ref, &weight_refs, interval.weight_s, interval.weight_e,
-                    global_start, tile_n, &t, n_haps,
-                );
-
-                let vp_start = global_start - own_wgs_start;
-                format_tile_batch(
-                    &alt_probs, tile_n, n_haps, n_samples,
-                    global_start, n_ref_variants,
-                    vp_start, &vid_prefixes, &is_chip, &chip_local_idx,
-                    chip_genotypes, &an_str, no_ap,
-                )
-            }).collect()
-        } else {
-            // CSC chunk path
-            tile_descs.par_iter().map(|&(ts, tile_n, global_start)| {
-                let t: Vec<f32> = (0..tile_n)
-                    .map(|v| (ts + v) as f32 / full_range)
-                    .collect();
-
+            let t0_tiles = std::time::Instant::now();
+            let cpu0_tiles = crate::log::cpu_time_secs();
+            let tile_bufs: Vec<Vec<u8>> = tile_descs.par_iter().map(|&(ts, tile_n, global_start)| {
+                let t: Vec<f32> = (0..tile_n).map(|v| (ts + v) as f32 / full_range).collect();
                 let alt_probs = interpolate_tile_preloaded(
                     &chunk_cache, window_first_chunk, &weight_refs, interval.weight_s, interval.weight_e,
-                    global_start, tile_n, &t, n_haps, chunk_size,
-                );
-
+                    global_start, tile_n, &t, n_haps, chunk_size);
                 let vp_start = global_start - own_wgs_start;
-                format_tile_batch(
-                    &alt_probs, tile_n, n_haps, n_samples,
-                    global_start, n_ref_variants,
-                    vp_start, &vid_prefixes, &is_chip, &chip_local_idx,
-                    chip_genotypes, &an_str, no_ap,
-                )
-            }).collect()
-        };
-        _t_interp += t0_tiles.elapsed().as_secs_f64();
-        _cpu_tiles += crate::log::cpu_time_secs() - cpu0_tiles;
+                format_tile_batch(&alt_probs, tile_n, n_haps, n_samples, global_start, n_ref_variants,
+                    vp_start, &vid_prefixes, &is_chip, &chip_local_idx, chip_genotypes, &an_str, no_ap)
+            }).collect();
+            _t_interp += t0_tiles.elapsed().as_secs_f64();
+            _cpu_tiles += crate::log::cpu_time_secs() - cpu0_tiles;
 
-        // Send tiles in order
-        let t0_send = std::time::Instant::now();
-        for tile_buf in tile_bufs {
-            tx.send(tile_buf).map_err(|e| std::io::Error::other(e.to_string()))?;
+            let t0_send = std::time::Instant::now();
+            for tile_buf in tile_bufs {
+                tx.send(tile_buf).map_err(|e| std::io::Error::other(e.to_string()))?;
+            }
+            _t_send += t0_send.elapsed().as_secs_f64();
+            next_wgs = interval.wgs_end;
         }
-        _t_send += t0_send.elapsed().as_secs_f64();
-        next_wgs = interval.wgs_end;
-    }
 
-    {
         let pct = |cpu: f64, wall: f64| -> f64 { if wall > 0.01 { cpu / wall / n_cores as f64 * 100.0 } else { 0.0 } };
         crate::selphi_debug!("  [interp] {} intervals: setup={:.2}s chunk_load={:.1}s({:.0}%cpu) chip={:.2}s tiles={:.1}s({:.0}%cpu) send={:.1}s",
             _n_intervals, _t_setup, _t_chunk_load, pct(_cpu_chunk_load, _t_chunk_load),
             _t_chip, _t_interp, pct(_cpu_tiles, _t_interp), _t_send);
-    }
 
-    // Write remaining chip sites in owned range
-    while next_wgs < own_wgs_end {
-        if is_chip[next_wgs] {
-            let vp_idx = next_wgs - own_wgs_start;
-            format_chip_line_bytes(&mut chip_buf, next_wgs, vp_idx, &vid_prefixes,
-                chip_genotypes, &chip_local_idx, n_haps, n_samples, &an_str);
-            tx.send(chip_buf.clone()).map_err(|e| std::io::Error::other(e.to_string()))?;
+        while next_wgs < own_wgs_end {
+            if is_chip[next_wgs] {
+                let vp_idx = next_wgs - own_wgs_start;
+                format_chip_line_bytes(&mut chip_buf, next_wgs, vp_idx, &vid_prefixes,
+                    chip_genotypes, &chip_local_idx, n_haps, n_samples, &an_str);
+                tx.send(chip_buf.clone()).map_err(|e| std::io::Error::other(e.to_string()))?;
+            }
+            next_wgs += 1;
         }
-        next_wgs += 1;
     }
 
     Ok(())
@@ -517,8 +653,8 @@ pub fn interpolate_window_to_bytes(
     chip_genotypes: &[u8], n_haps_total: usize,
     sample_names: &[String], no_ap: bool,
     preloaded_chunks: Option<Vec<Option<crate::srp::CscChunk>>>,
+    preloaded_stripes: Option<crate::srp::tiled::PreloadedStripes>,
 ) -> std::io::Result<Vec<Vec<u8>>> {
-    // Create a sync channel that collects into a Vec
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
     let collect_handle = std::thread::spawn(move || {
         let mut bufs = Vec::new();
@@ -532,7 +668,7 @@ pub fn interpolate_window_to_bytes(
         &tx, srp, all_weights, win_chip_start, win_chip_end,
         own_chip_start, own_chip_end, wgs_idx, n_samples,
         chip_genotypes, n_haps_total, sample_names, no_ap,
-        preloaded_chunks,
+        preloaded_chunks, preloaded_stripes,
     )?;
     drop(tx);
     Ok(collect_handle.join().unwrap())
@@ -1689,8 +1825,10 @@ fn scatter_col_weighted(
 
 /// Interpolate a variant range using 2D tiled SRP format.
 /// Each tile (1024×4096) fits in L2 cache. All bands decompressed per-stripe (~21 MB in L3).
+/// Tiles are read from PreloadedStripes (sequential bulk read, no page faults).
+/// Parallelism: per-haplotype via par_chunks_mut (same as CSC interp_kernel).
 pub fn interpolate_tile_tiled(
-    tiled: &crate::srp::tiled::TiledSrpReader,
+    preloaded: &crate::srp::tiled::PreloadedStripes,
     weights: &[&CsrWeights],
     chip_s: usize, chip_e: usize,
     global_start: usize,
@@ -1698,33 +1836,33 @@ pub fn interpolate_tile_tiled(
     t: &[f32],
     n_haps: usize,
 ) -> Vec<f32> {
-    use crate::srp::{TILE_ROWS, TILE_COLS};
+    use crate::srp::TILE_ROWS;
     let mut alt_probs = vec![0.0f32; n_haps * tile_n];
     let global_end = global_start + tile_n;
 
     let first_stripe = global_start / TILE_ROWS;
     let last_stripe = (global_end - 1) / TILE_ROWS;
-    let n_tile_cols = tiled.n_tile_cols;
+    let n_tile_cols = preloaded.n_tile_cols;
 
     for stripe in first_stripe..=last_stripe {
         let stripe_var_start = stripe * TILE_ROWS;
-        let stripe_var_end = (stripe_var_start + TILE_ROWS).min(tiled.n_variants());
+        let stripe_var_end = (stripe_var_start + TILE_ROWS).min(preloaded.n_variants);
         let ov_start = global_start.max(stripe_var_start);
         let ov_end = global_end.min(stripe_var_end);
         if ov_start >= ov_end { continue; }
         let ov_n = ov_end - ov_start;
-        let local_row_start = ov_start - stripe_var_start; // offset within tile's rows
+        let local_row_start = ov_start - stripe_var_start;
         let local_row_end = local_row_start + ov_n;
-        let out_offset = ov_start - global_start; // offset within output
+        let out_offset = ov_start - global_start;
 
-        // Decompress all bands for this stripe sequentially (avoids nested rayon deadlock).
-        // LZ4 is fast: 42 tiles × ~300 KB = ~13 MB → ~3 ms sequential.
+        // Decompress all bands once per stripe — shared read-only across all haps.
+        // LZ4 from RAM: 42 tiles × ~300 KB = ~13 MB → ~3 ms, zero page faults.
         let tiles: Vec<crate::srp::SparseTile> = (0..n_tile_cols)
-            .map(|band| tiled.decompress_tile(stripe, band))
+            .map(|band| preloaded.decompress_tile(stripe, band))
             .collect();
 
-        // Sequential scatter per haplotype (parallelism at tile_descs level, not here)
-        alt_probs.chunks_mut(tile_n)
+        // Parallel scatter across haplotypes (rayon work-stealing)
+        alt_probs.par_chunks_mut(tile_n)
             .take(n_haps)
             .enumerate()
             .for_each(|(h, hap_out)| {
@@ -1741,7 +1879,6 @@ pub fn interpolate_tile_tiled(
                 let ds = es - ss;
                 if ss == 0.0 && ds == 0.0 { return; }
 
-                // Fused scatter from tiles: merge start/end weight ranges
                 let out_slice = &mut hap_out[out_offset..out_offset + ov_n];
                 let t_slice = &t[out_offset..out_offset + ov_n];
 
@@ -1751,12 +1888,11 @@ pub fn interpolate_tile_tiled(
                     local_row_start, local_row_end,
                     t_slice, out_slice,
                 );
-
             });
     }
 
-    // Final division: numerator / denominator for each haplotype
-    alt_probs.chunks_mut(tile_n)
+    // Final division: parallel across haplotypes
+    alt_probs.par_chunks_mut(tile_n)
         .take(n_haps)
         .enumerate()
         .for_each(|(h, hap_out)| {
@@ -1771,6 +1907,169 @@ pub fn interpolate_tile_tiled(
             for j in s2..e2 { es += w.data[j]; }
             let ds = es - ss;
             if ss == 0.0 && ds == 0.0 { return; }
+            for v in 0..tile_n {
+                let den = ss + t[v] * ds;
+                if den != 0.0 { hap_out[v] /= den; }
+            }
+        });
+
+    alt_probs
+}
+
+/// Interpolate using pre-decompressed tile cache (zero decompression overhead).
+/// Tiles are decompressed once per stripe in the pipeline loop and cached in a HashMap.
+/// Single par_chunks_mut: scatter all stripes + divide in one rayon dispatch per tile_desc.
+pub fn interpolate_tile_tiled_cached(
+    tile_cache: &std::collections::HashMap<usize, Vec<crate::srp::SparseTile>>,
+    n_variants: usize,
+    n_tile_cols: usize,
+    weights: &[&CsrWeights],
+    chip_s: usize, chip_e: usize,
+    global_start: usize,
+    tile_n: usize,
+    t: &[f32],
+    n_haps: usize,
+) -> Vec<f32> {
+    use crate::srp::TILE_ROWS;
+    let mut alt_probs = vec![0.0f32; n_haps * tile_n];
+    let global_end = global_start + tile_n;
+    let first_stripe = global_start / TILE_ROWS;
+    let last_stripe = (global_end - 1) / TILE_ROWS;
+
+    for stripe in first_stripe..=last_stripe {
+        let stripe_var_start = stripe * TILE_ROWS;
+        let stripe_var_end = (stripe_var_start + TILE_ROWS).min(n_variants);
+        let ov_start = global_start.max(stripe_var_start);
+        let ov_end = global_end.min(stripe_var_end);
+        if ov_start >= ov_end { continue; }
+        let ov_n = ov_end - ov_start;
+        let local_row_start = ov_start - stripe_var_start;
+        let local_row_end = local_row_start + ov_n;
+        let out_offset = ov_start - global_start;
+
+        // Get pre-decompressed tiles from cache (no LZ4 here)
+        let tiles = tile_cache.get(&stripe)
+            .expect("stripe not in tile_cache — preload logic bug");
+
+        // Parallel scatter across haplotypes
+        alt_probs.par_chunks_mut(tile_n)
+            .take(n_haps)
+            .enumerate()
+            .for_each(|(h, hap_out)| {
+                let w = weights[h];
+                let s1 = w.indptr[chip_s] as usize;
+                let e1 = w.indptr[chip_s + 1] as usize;
+                let s2 = w.indptr[chip_e] as usize;
+                let e2 = w.indptr[chip_e + 1] as usize;
+
+                let mut ss: f32 = 0.0;
+                for j in s1..e1 { ss += w.data[j]; }
+                let mut es: f32 = 0.0;
+                for j in s2..e2 { es += w.data[j]; }
+                let ds = es - ss;
+                if ss == 0.0 && ds == 0.0 { return; }
+
+                scatter_fused_tiled(
+                    w, s1, e1, s2, e2,
+                    tiles, n_tile_cols,
+                    local_row_start, local_row_end,
+                    &t[out_offset..out_offset + ov_n],
+                    &mut hap_out[out_offset..out_offset + ov_n],
+                );
+            });
+    }
+
+    // Final division: parallel across haplotypes
+    alt_probs.par_chunks_mut(tile_n)
+        .take(n_haps)
+        .enumerate()
+        .for_each(|(h, hap_out)| {
+            let w = weights[h];
+            let s1 = w.indptr[chip_s] as usize;
+            let e1 = w.indptr[chip_s + 1] as usize;
+            let s2 = w.indptr[chip_e] as usize;
+            let e2 = w.indptr[chip_e + 1] as usize;
+            let mut ss: f32 = 0.0;
+            for j in s1..e1 { ss += w.data[j]; }
+            let mut es: f32 = 0.0;
+            for j in s2..e2 { es += w.data[j]; }
+            let ds = es - ss;
+            if ss == 0.0 && ds == 0.0 { return; }
+            for v in 0..tile_n {
+                let den = ss + t[v] * ds;
+                if den != 0.0 { hap_out[v] /= den; }
+            }
+        });
+
+    alt_probs
+}
+
+/// Batch-parallel tiled kernel: Vec-indexed stripe cache, single par_chunks_mut dispatch.
+/// stripe_tiles[i] = decompressed tiles for stripe (base_stripe + i).
+/// Fuses scatter + division into one rayon dispatch per tile_desc.
+pub fn interpolate_tile_batch(
+    stripe_tiles: &[Vec<crate::srp::SparseTile>],
+    base_stripe: usize,
+    n_variants: usize,
+    n_tile_cols: usize,
+    weights: &[&CsrWeights],
+    chip_s: usize, chip_e: usize,
+    global_start: usize,
+    tile_n: usize,
+    t: &[f32],
+    n_haps: usize,
+) -> Vec<f32> {
+    use crate::srp::TILE_ROWS;
+    let mut alt_probs = vec![0.0f32; n_haps * tile_n];
+    let global_end = global_start + tile_n;
+    let first_stripe = global_start / TILE_ROWS;
+    let last_stripe = (global_end - 1) / TILE_ROWS;
+
+    // Pre-collect stripe overlap info + tile refs outside rayon (O(1) Vec access, no HashMap)
+    struct SOV<'a> { tiles: &'a [crate::srp::SparseTile], lr_start: usize, lr_end: usize, out_off: usize, ov_n: usize }
+    let sovs: Vec<SOV> = (first_stripe..=last_stripe)
+        .filter_map(|stripe| {
+            let ss = stripe * TILE_ROWS;
+            let se = (ss + TILE_ROWS).min(n_variants);
+            let os = global_start.max(ss);
+            let oe = global_end.min(se);
+            if os >= oe { return None; }
+            let ov_n = oe - os;
+            Some(SOV {
+                tiles: &stripe_tiles[stripe - base_stripe],
+                lr_start: os - ss, lr_end: os - ss + ov_n,
+                out_off: os - global_start, ov_n,
+            })
+        })
+        .collect();
+
+    // Single rayon dispatch: scatter all stripes + divide per haplotype.
+    alt_probs.par_chunks_mut(tile_n)
+        .take(n_haps)
+        .enumerate()
+        .for_each(|(h, hap_out)| {
+            let w = weights[h];
+            let s1 = w.indptr[chip_s] as usize;
+            let e1 = w.indptr[chip_s + 1] as usize;
+            let s2 = w.indptr[chip_e] as usize;
+            let e2 = w.indptr[chip_e + 1] as usize;
+            let mut ss: f32 = 0.0;
+            for j in s1..e1 { ss += w.data[j]; }
+            let mut es: f32 = 0.0;
+            for j in s2..e2 { es += w.data[j]; }
+            let ds = es - ss;
+            if ss == 0.0 && ds == 0.0 { return; }
+
+            for sov in &sovs {
+                scatter_fused_tiled(
+                    w, s1, e1, s2, e2,
+                    sov.tiles, n_tile_cols,
+                    sov.lr_start, sov.lr_end,
+                    &t[sov.out_off..sov.out_off + sov.ov_n],
+                    &mut hap_out[sov.out_off..sov.out_off + sov.ov_n],
+                );
+            }
+
             for v in 0..tile_n {
                 let den = ss + t[v] * ds;
                 if den != 0.0 { hap_out[v] /= den; }

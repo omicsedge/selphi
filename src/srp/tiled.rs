@@ -12,12 +12,16 @@
 //! Tile = CSC sub-matrix of 1024 variants × 4096 haplotypes.
 //! u16 row indices (max 1024), u32 indptr, LZ4 compression.
 //! Each tile ~500 KB decompressed — fits in L2 cache per core.
+//!
+//! I/O strategy: sequential bulk reads per batch of stripes, NOT mmap.
+//! Tiles for a stripe are contiguous in the file (row-major layout),
+//! so one pread gets all bands for a batch of stripes.
 
 use std::io::{self, Write, BufWriter, Cursor};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
-use super::{SparseTile, CscChunk, Variant, SrpMetadata, TILE_ROWS, TILE_COLS};
+use super::{SparseTile, SrpMetadata, TILE_ROWS, TILE_COLS};
 
 const MAGIC: &[u8; 8] = b"SRPt\0\0\0\0";
 
@@ -226,61 +230,87 @@ pub fn write_tiled(
 }
 
 // ============================================================================
-// Reader: mmap-based tiled SRP reader
+// PreloadedStripes: compressed tile data pre-read into RAM
+// ============================================================================
+
+/// Pre-loaded compressed tile data for a contiguous range of stripes.
+/// One sequential read from disk fills the buffer; decompress_tile reads from RAM.
+/// No page faults, no mmap — pure sequential I/O.
+pub struct PreloadedStripes {
+    buf: Vec<u8>,
+    /// (offset_in_buf, comp_size) for each tile, indexed as [(stripe - first_stripe) * n_tile_cols + band]
+    offsets: Vec<(usize, usize)>,
+    pub first_stripe: usize,
+    pub n_stripes: usize,
+    pub n_tile_cols: usize,
+    pub n_variants: usize,
+}
+
+impl PreloadedStripes {
+    /// Decompress a single tile from the pre-loaded buffer. Lock-free, no I/O.
+    #[inline]
+    pub fn decompress_tile(&self, stripe: usize, band: usize) -> SparseTile {
+        let local = (stripe - self.first_stripe) * self.n_tile_cols + band;
+        let (off, len) = self.offsets[local];
+        let compressed = &self.buf[off..off + len];
+        let raw = lz4_flex::decompress_size_prepended(compressed)
+            .expect("LZ4 decompress failed");
+        SparseTile::from_bytes(&raw)
+    }
+
+    /// Check if a stripe is within this preloaded range.
+    #[inline]
+    pub fn contains_stripe(&self, stripe: usize) -> bool {
+        stripe >= self.first_stripe && stripe < self.first_stripe + self.n_stripes
+    }
+
+    /// Compressed buffer size in bytes.
+    pub fn buf_len(&self) -> usize { self.buf.len() }
+}
+
+// ============================================================================
+// Reader: file-based tiled SRP reader (sequential I/O, no mmap)
 // ============================================================================
 
 pub struct TiledSrpReader {
-    data: memmap2::Mmap,
-    pub metadata: SrpMetadata,
-    pub variants: Vec<Variant>,
-    pub sample_ids: Vec<String>,
-    pub ids: Vec<String>,
-    pub original_ids: Vec<String>,
+    file_path: PathBuf,
+    n_variants: usize,
+    n_haps: usize,
     tile_index: Vec<TileEntry>,
     pub n_tile_rows: usize,
     pub n_tile_cols: usize,
 }
 
 impl TiledSrpReader {
-    pub fn open(path: &Path) -> io::Result<Self> {
-        let file = std::fs::File::open(path)?;
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    /// Open tiled SRP: reads only magic + tile_index (~9 MB for TOPMed).
+    /// Skips header entirely — n_variants/n_haps come from the SRP reader.
+    pub fn open(path: &Path, n_variants: usize, n_haps: usize) -> io::Result<Self> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(path)?;
 
-        if mmap.len() < 12 || &mmap[0..8] != MAGIC {
+        // Read magic
+        let mut magic = [0u8; 8];
+        file.read_exact(&mut magic)?;
+        if &magic != MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "not a tiled SRP file"));
         }
 
-        let header_size = u32::from_le_bytes(mmap[8..12].try_into().unwrap()) as usize;
-        let header_compressed = &mmap[12..12 + header_size];
-        let header_json = zstd::decode_all(Cursor::new(header_compressed))
-            .map_err(|e| io::Error::other(e))?;
-        let header: serde_json::Value = serde_json::from_slice(&header_json)
-            .map_err(|e| io::Error::other(e))?;
+        // Skip header (don't decompress — metadata comes from SRP reader)
+        let mut hdr_size_buf = [0u8; 4];
+        file.read_exact(&mut hdr_size_buf)?;
+        let header_size = u32::from_le_bytes(hdr_size_buf) as usize;
+        file.seek(SeekFrom::Current(header_size as i64))?;
 
-        let metadata = SrpMetadata::from_json(&header["metadata"]);
-        let n_tile_rows = header["metadata"]["n_tile_rows"].as_u64().unwrap_or(0) as usize;
-        let n_tile_cols = header["metadata"]["n_tile_cols"].as_u64().unwrap_or(0) as usize;
+        let n_tile_rows = (n_variants + TILE_ROWS - 1) / TILE_ROWS;
+        let n_tile_cols = (n_haps + TILE_COLS - 1) / TILE_COLS;
 
-        let variants: Vec<Variant> = header["variants"].as_array().unwrap_or(&vec![])
-            .iter()
-            .map(|v| Variant {
-                chr: v["chr"].as_str().unwrap_or("").to_string(),
-                pos: v["pos"].as_i64().unwrap_or(0),
-                ref_allele: v["ref"].as_str().unwrap_or("").to_string(),
-                alt_allele: v["alt"].as_str().unwrap_or("").to_string(),
-            })
-            .collect();
+        // Read tile index
+        let mut n_tiles_buf = [0u8; 4];
+        file.read_exact(&mut n_tiles_buf)?;
+        let n_tiles = u32::from_le_bytes(n_tiles_buf) as usize;
 
-        let sample_ids: Vec<String> = header["samples"].as_array().unwrap_or(&vec![])
-            .iter().map(|v| v.as_str().unwrap_or("").to_string()).collect();
-        let ids: Vec<String> = header["ids"].as_array().unwrap_or(&vec![])
-            .iter().map(|v| v.as_str().unwrap_or("").to_string()).collect();
-        let original_ids: Vec<String> = header["original_ids"].as_array().unwrap_or(&vec![])
-            .iter().map(|v| v.as_str().unwrap_or("").to_string()).collect();
-
-        let idx_offset = 12 + header_size;
-        let n_tiles = u32::from_le_bytes(mmap[idx_offset..idx_offset+4].try_into().unwrap()) as usize;
-        let idx_data = &mmap[idx_offset + 4..idx_offset + 4 + n_tiles * 12];
+        let mut idx_data = vec![0u8; n_tiles * 12];
+        file.read_exact(&mut idx_data)?;
         let tile_index: Vec<TileEntry> = (0..n_tiles).map(|i| {
             let base = i * 12;
             TileEntry {
@@ -289,92 +319,76 @@ impl TiledSrpReader {
             }
         }).collect();
 
-        eprintln!("  Tiled SRP backend: {} ({}×{} tiles, mmap)", path.display(), n_tile_rows, n_tile_cols);
+        let file_size = std::fs::metadata(path)?.len();
+        let idx_mb = (n_tiles * 12) as f64 / 1e6;
+        eprintln!("  Tiled SRP: {} ({}x{} tiles, {:.1} MB file, {:.1} MB index)",
+            path.display(), n_tile_rows, n_tile_cols, file_size as f64 / 1e6, idx_mb);
 
-        Ok(Self { data: mmap, metadata, variants, sample_ids, ids, original_ids, tile_index, n_tile_rows, n_tile_cols })
+        Ok(Self {
+            file_path: path.to_path_buf(),
+            n_variants, n_haps,
+            tile_index, n_tile_rows, n_tile_cols,
+        })
     }
 
-    pub fn n_variants(&self) -> usize { self.metadata.n_variants }
-    pub fn n_haps(&self) -> usize { self.metadata.n_haps }
+    pub fn n_variants(&self) -> usize { self.n_variants }
+    pub fn n_haps(&self) -> usize { self.n_haps }
 
-    /// Decompress a single tile — lock-free mmap read + LZ4 decompress.
-    #[inline]
-    pub fn decompress_tile(&self, stripe: usize, band: usize) -> SparseTile {
-        let tile_id = stripe * self.n_tile_cols + band;
-        let entry = &self.tile_index[tile_id];
-        let compressed = &self.data[entry.offset as usize..(entry.offset as usize + entry.comp_size as usize)];
-        let raw = lz4_flex::decompress_size_prepended(compressed)
-            .expect("LZ4 decompress failed");
-        SparseTile::from_bytes(&raw)
+    /// Estimate compressed bytes for one stripe (sum of comp_size for all bands).
+    pub fn stripe_compressed_bytes(&self, stripe: usize) -> usize {
+        let base = stripe * self.n_tile_cols;
+        (0..self.n_tile_cols)
+            .map(|b| self.tile_index[base + b].comp_size as usize)
+            .sum()
     }
 
-    /// Decompress all bands for a stripe in parallel.
-    pub fn decompress_stripe(&self, stripe: usize) -> Vec<SparseTile> {
-        (0..self.n_tile_cols).into_par_iter()
-            .map(|band| self.decompress_tile(stripe, band))
-            .collect()
-    }
+    /// Pre-read compressed tile data for a contiguous range of stripes.
+    /// One sequential pread — converts random mmap access into a single bulk read.
+    pub fn preload_stripes(&self, first_stripe: usize, n_stripes: usize) -> io::Result<PreloadedStripes> {
+        let last_stripe = first_stripe + n_stripes - 1;
+        let first_tile = first_stripe * self.n_tile_cols;
+        let last_tile = (last_stripe + 1) * self.n_tile_cols - 1;
 
-    /// Decompress specific bands for a stripe in parallel.
-    pub fn decompress_stripe_bands(&self, stripe: usize, bands: &[usize]) -> Vec<(usize, SparseTile)> {
-        bands.par_iter()
-            .map(|&band| (band, self.decompress_tile(stripe, band)))
-            .collect()
-    }
+        let read_start = self.tile_index[first_tile].offset;
+        let last_entry = &self.tile_index[last_tile];
+        let read_end = last_entry.offset + last_entry.comp_size as u64;
+        let read_len = (read_end - read_start) as usize;
 
-    /// Extract bitmatrix for chip sites — parallel tile-based extraction.
-    pub fn extract_ref_alleles_bitmatrix(&self, wgs_idx: &[usize]) -> crate::common::HaplotypeBitmatrix {
-        let n_chip = wgs_idx.len();
-        let n_haps = self.metadata.n_haps;
-        let n_words = (n_haps + 63) / 64;
-        let mut bits = vec![0u64; n_chip * n_words];
+        // One sequential read from disk
+        let file = std::fs::File::open(&self.file_path)?;
+        let mut buf = vec![0u8; read_len];
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            file.read_exact_at(&mut buf, read_start)?;
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::{Seek, SeekFrom, Read};
+            let mut file = file;
+            file.seek(SeekFrom::Start(read_start))?;
+            file.read_exact(&mut buf)?;
+        }
 
-        // Group chip sites by stripe
-        let mut stripe_groups: Vec<Vec<(usize, usize)>> = vec![Vec::new(); self.n_tile_rows]; // (chip_i, local_row)
-        for (chip_i, &wgs_i) in wgs_idx.iter().enumerate() {
-            let stripe = wgs_i / TILE_ROWS;
-            let local_row = (wgs_i % TILE_ROWS) as u16;
-            if stripe < self.n_tile_rows {
-                stripe_groups[stripe].push((chip_i, local_row as usize));
+        // Build offset table: map (local_stripe, band) → (offset_in_buf, comp_size)
+        let n_entries = n_stripes * self.n_tile_cols;
+        let mut offsets = Vec::with_capacity(n_entries);
+        for s in 0..n_stripes {
+            for b in 0..self.n_tile_cols {
+                let tid = (first_stripe + s) * self.n_tile_cols + b;
+                let entry = &self.tile_index[tid];
+                let local_off = (entry.offset - read_start) as usize;
+                offsets.push((local_off, entry.comp_size as usize));
             }
         }
 
-        let bits_base = bits.as_mut_ptr() as usize;
-        let bits_len = bits.len();
-
-        // Process stripes that have chip sites — parallel across stripes
-        let active_stripes: Vec<(usize, &Vec<(usize, usize)>)> = stripe_groups.iter()
-            .enumerate()
-            .filter(|(_, g)| !g.is_empty())
-            .collect();
-
-        active_stripes.par_iter().for_each(|&(stripe, chip_sites)| {
-            // Decompress all bands for this stripe
-            for band in 0..self.n_tile_cols {
-                let tile = self.decompress_tile(stripe, band);
-                let col_base = band * TILE_COLS;
-                let bits_slice = unsafe { std::slice::from_raw_parts_mut(bits_base as *mut u64, bits_len) };
-
-                for col in 0..tile.n_cols as usize {
-                    let global_hap = col_base + col;
-                    if global_hap >= n_haps { break; }
-                    let word_idx = global_hap / 64;
-                    let bit = 1u64 << (global_hap % 64);
-
-                    let (lo, hi) = tile.col_range(col);
-                    for k in lo..hi {
-                        let local_row = tile.indices[k] as usize;
-                        // Check if this row matches any chip site
-                        for &(chip_i, cr) in chip_sites {
-                            if cr == local_row {
-                                bits_slice[chip_i * n_words + word_idx] |= bit;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        crate::common::HaplotypeBitmatrix::from_raw(bits, n_chip, n_haps)
+        Ok(PreloadedStripes {
+            buf,
+            offsets,
+            first_stripe,
+            n_stripes,
+            n_tile_cols: self.n_tile_cols,
+            n_variants: self.n_variants,
+        })
     }
 }
