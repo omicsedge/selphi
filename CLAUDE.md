@@ -35,9 +35,15 @@ selphi --prepare-reference-from panel.srp --out panel.bref3           # SRP → 
 ```bash
 selphi ... --out result                # VCF.gz (default)
 selphi ... --out result --bcf          # BCF 2.2
-selphi ... --out result --parquet      # Apache Parquet (zstd)
-selphi ... --out result --pgen         # PLINK2 PGEN (.pgen/.pvar/.psam)
+selphi ... --out result --parquet      # VCF.gz + Apache Parquet (zstd, variant-major)
+selphi ... --out result --pgen         # VCF.gz + PLINK2 PGEN (.pgen/.pvar/.psam)
+selphi ... --out result --selfdecode   # VCF.gz + SelfDecode ZIP (per-sample chunked Parquet)
+selphi ... --out result --all-formats  # VCF.gz + Parquet + PGEN + SelfDecode
+selphi ... --out result --bcf --parquet --selfdecode  # Any combination (--bcf replaces VCF)
 ```
+
+Multi-format output: interpolation runs once, encoding fans out to all active formats.
+`--parquet`, `--pgen`, `--selfdecode` are additive. `--bcf` replaces VCF (mutually exclusive).
 
 ## Engine Selection
 
@@ -65,7 +71,7 @@ Input VCF/BCF
           +-- PBWT candidate selection
           +-- Li-Stephens fwd-bwd (f32)
           +-- Batch-parallel tiled interpolation
-          +-- Streaming output (VCF/BCF/Parquet/PGEN)
+          +-- Multi-format output (VCF/BCF/Parquet/PGEN/SelfDecode)
 ```
 
 ### Key Design Principles
@@ -73,6 +79,7 @@ Input VCF/BCF
 - **Tiled interpolation**: 2D tiles (1024×4096) fit in L2 cache, batch-parallel intervals.
 - **Sequential I/O**: PreloadedStripes pread, double-buffer I/O, zero page faults.
 - **Deterministic**: Bit-identical results across runs.
+- **Multi-format output**: Single interpolation pass, parallel encoding to all formats.
 - **Streaming output**: Parallel BGZF compression, channel-based writing.
 
 ### SRP Reference Panel Format
@@ -90,9 +97,10 @@ Single `.srp` file:
 | `diploid/` | Diploid phasing engine |
 | `imputation/pbwt.rs` | PBWT matching, candidate selection |
 | `imputation/hmm.rs` | Li-Stephens HMM (f32 forward, f64 backward) |
-| `io/pipeline.rs` | Batch-parallel tiled interpolation + streaming output |
+| `io/pipeline.rs` | Multi-format interpolation + output orchestrator |
 | `io/bcf_encode.rs` | Native BCF2.2 encoder |
-| `io/parquet_output.rs` | Parquet writer (arrow-rs) |
+| `io/parquet_output.rs` | Parquet writer — variant-major, multi-sample (arrow-rs) |
+| `io/selfdecode_output.rs` | SelfDecode writer — per-sample chunked Parquet in ZIP |
 | `io/pgen_output.rs` | PLINK2 PGEN writer |
 | `io/bcf_writer.rs` | BGZF multi-threaded writer |
 | `srp/mod.rs` | SRP types (CscChunk, SparseTile, Variant) |
