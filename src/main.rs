@@ -375,16 +375,11 @@ fn main() {
             selphi::srp::bref3_writer::write_bref3_from_bcf(Path::new(source), Path::new(output))
                 .unwrap_or_else(|e| { selphi_error!("BREF3 write failed: {}", e); std::process::exit(1); });
         } else if is_bref3 {
-            let tmp_dir = tempfile::tempdir().unwrap();
-            let tmp_path = tmp_dir.path().join("temp.srp");
-            selphi::srp::writer::build_srp_from_bref3(
-                Path::new(source), &tmp_path, args.threads, args.chunk_size)
-                .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
-            let reader = selphi::srp::SrpReader::open(tmp_path.to_str().unwrap(), 0);
             let srp_path = if Path::new(output).extension().map_or(true, |e| e != "srp") {
                 PathBuf::from(output).with_extension("srp")
             } else { PathBuf::from(output) };
-            selphi::srp::writer::convert_to_unified(&reader, &srp_path)
+            selphi::srp::writer::build_srp_from_bref3(
+                Path::new(source), &srp_path, args.threads, args.chunk_size)
                 .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
         } else {
             let srp_path = if Path::new(output).extension().map_or(true, |e| e != "srp") {
