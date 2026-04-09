@@ -85,15 +85,21 @@ Input VCF/BCF
 - **AVX-512 accelerated**: Diplotype HMM forward pass, auto-vectorized imputation.
 - **Streaming I/O**: Parallel BGZF compression, channel-based VCF/BCF writing.
 
-### Reference Panel Formats
+### Reference Panel Format (SRP)
 
-| File | Purpose | Notes |
-|------|---------|-------|
-| `.srp` | Base format (ZIP, zstd chunks, JSON metadata) | Required, holds variants/IDs/samples |
-| `.srp2` | Flat indexed file (mmap for chunk loading) | Used for bitmatrix extraction |
-| `.srpt` | Tiled format (1024×4096 tiles, zstd-3) | Used for interpolation, auto-detected |
+Single `.srp` file containing everything (version 2, unified):
+- Binary variant index (instant load, no JSON parse)
+- Sample IDs, variant IDs
+- Indexed CSC chunks (mmap, for bitmatrix extraction in phasing)
+- Indexed 2D tiles (1024×4096, zstd-3, for batch-parallel interpolation)
 
-Generate all three with `--prepare-reference-from panel.bcf --out panel`.
+```bash
+# Generate from BCF (produces single .srp file)
+selphi --prepare-reference-from panel.bcf --out panel
+
+# Old v1 ZIP format (.srp) also supported (auto-detected by magic bytes)
+# Legacy .srp2/.srpt companion files still read if present
+```
 
 ### Rust Modules (src/)
 
@@ -110,10 +116,9 @@ Generate all three with `--prepare-reference-from panel.bcf --out panel`.
 | `io/pgen_output.rs` | PLINK2 PGEN writer |
 | `io/bcf_writer.rs` | BGZF multi-threaded writer wrapper |
 | `srp/mod.rs` | SRP shared types (CscChunk, SparseTile, Variant) |
-| `srp/reader.rs` | SRP v1 reader (ZIP, variants_bin fast path) |
-| `srp/writer.rs` | SRP writer (BCF→SRP, with variants_bin) |
-| `srp/tiled.rs` | Tiled SRP writer/reader (zstd-3, PreloadedStripes) |
-| `srp/srp2.rs` | SRP v2 flat format (mmap chunk access) |
+| `srp/reader.rs` | SRP reader (auto-detects v1 ZIP or v2 unified) |
+| `srp/writer.rs` | SRP writer: BCF→unified SRP v2, BCF→BREF3 |
+| `srp/tiled.rs` | Tile writer + PreloadedStripes (sequential pread) |
 | `srp/bcf_reader.rs` | Native BCF2 parser (parallel regional reads) |
 | `srp/bref3.rs` | Native BREF3 reader |
 | `srp/csi.rs` | CSI/TBI index parser + writer |

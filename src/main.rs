@@ -370,14 +370,12 @@ fn main() {
             selphi::srp::bref3_writer::write_bref3_from_bcf(Path::new(source), Path::new(output))
                 .unwrap_or_else(|e| { selphi_error!("BREF3 write failed: {}", e); std::process::exit(1); });
         } else if is_bref3 {
-            // BREF3 → old SRP v1 (ZIP) + v2 + tiled (legacy path)
+            // BREF3 → v1 ZIP + tiled (legacy — unified writer doesn't support BREF3 yet)
             selphi::srp::writer::build_srp_from_bref3(
                 Path::new(source), Path::new(output), args.threads, args.chunk_size)
                 .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
             let srp_path = PathBuf::from(output).with_extension("srp");
             let v1 = selphi::srp::SrpReader::open(srp_path.to_str().unwrap(), 0);
-            let v2_path = PathBuf::from(output).with_extension("srp2");
-            selphi::srp::srp2::convert_v1_to_v2(&v1, &v2_path).ok();
             let tiled_path = PathBuf::from(output).with_extension("srpt");
             selphi::srp::tiled::write_tiled(&v1, &tiled_path).ok();
         } else {
