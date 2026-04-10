@@ -807,8 +807,6 @@ fn main() {
     // Cross-window HMM state passthrough: forward state from window N → prior for window N+1
     let mut hap_priors: Vec<Option<Vec<f64>>> = vec![None; n_haps];
     let _t0_pipeline = Instant::now();
-    let mut vcf_write_handle: Option<std::thread::JoinHandle<()>> = None;
-    
     let n_cores = rayon::current_num_threads();
     for (wi, window) in windows.iter().enumerate() {
         let t0_win = Instant::now();
@@ -1063,28 +1061,17 @@ fn main() {
         let (cs, _ce, os, oe) = (window.chip_start, window.chip_end,
                                   window.own_chip_start, window.own_chip_end);
 
-        let vcf_bytes = selphi::io::pipeline::write_window_multiformat(
+        selphi::io::pipeline::write_window_multiformat(
             &formats, &srp, &all_weights, cs, os, oe,
             &wgs_idx, n_samples, &targ_alleles,
             no_ap, preloaded, preloaded_stripes,
             parquet_writer.as_mut().map(|(w, s)| (w, &*s)),
             pgen_writer.as_mut().map(|(p, v)| (p, v)),
             selfdecode_writer.as_mut(),
+            &vcf_tx,
         ).expect("Output write failed");
         let interp_secs = t0_interp.elapsed().as_secs_f64();
-        
 
-        // Wait for previous VCF write AFTER interpolation (not before).
-        // Interpolation has no dependency on previous VCF write — they operate on different data.
-        // This overlaps W(N) interpolation with W(N-1) VCF compression.
-        let t0_wait = Instant::now();
-        if let Some(h) = vcf_write_handle.take() {
-            h.join().expect("VCF write thread panicked");
-        }
-        let vcf_wait_secs = t0_wait.elapsed().as_secs_f64();
-        let cpu_wait = selphi::log::cpu_time_secs();
-
-        let own_vars = window.own_chip_end - window.own_chip_start;
         let n_win = windows.len();
         let wi_log = wi + 1;
         {
@@ -1095,38 +1082,19 @@ fn main() {
             let cpu_extract_d = cpu_extract - cpu0_win;
             let cpu_coded_d = cpu_coded - cpu_extract;
             let cpu_hmm_d = cpu_hmm - cpu_coded;
-            let _cpu_preload_d = cpu_preload - cpu_hmm;
-            let cpu_interp_d = cpu_wait - cpu_preload; // interp before vcf_wait now
-            let _cpu_wait_d = cpu_end - cpu_wait;
+            let cpu_interp_d = cpu_end - cpu_preload;
             let pct = |cpu: f64, wall: f64| -> f64 { if wall > 0.01 { cpu / wall / n_cores as f64 * 100.0 } else { 0.0 } };
-            selphi_debug!("    W{}/{} extract={:.2}s({:.0}%) coded={:.2}s({:.0}%) hmm={:.2}s({:.0}%) interp={:.2}s({:.0}%) vcf_wait={:.2}s | total {:.0}% cpu",
+            selphi_debug!("    W{}/{} extract={:.2}s({:.0}%) coded={:.2}s({:.0}%) hmm={:.2}s({:.0}%) interp+encode={:.2}s({:.0}%) | total {:.0}% cpu",
                 wi_log, n_win,
                 extract_secs, pct(cpu_extract_d, extract_secs),
                 coded_secs, pct(cpu_coded_d, coded_secs),
                 hmm_secs, pct(cpu_hmm_d, hmm_secs),
                 interp_secs, pct(cpu_interp_d, interp_secs),
-                vcf_wait_secs,
                 cpu_pct);
         }
         selphi_info!("    Window {}/{}: PBWT={:.1}s interp={:.1}s ({} vars)",
             wi_log, n_win, pbwt_secs, interp_secs, n_var_w);
 
-        // VCF write: send pre-computed bytes in background
-        let vcf_tx_clone = vcf_tx.clone();
-        vcf_write_handle = Some(std::thread::spawn(move || {
-            let t0_vcf = Instant::now();
-            for buf in vcf_bytes {
-                vcf_tx_clone.send(buf).expect("VCF send failed");
-            }
-            let vcf_secs = t0_vcf.elapsed().as_secs_f64();
-            selphi_debug!("  W{}/{}: VCF send={:.1}s ({} owned)",
-                wi_log, n_win, vcf_secs, own_vars);
-        }));
-    }
-
-    // Wait for last window's VCF write
-    if let Some(h) = vcf_write_handle.take() {
-        h.join().expect("VCF write thread panicked");
     }
 
     // Free imputation data structures before indexing/evaluation

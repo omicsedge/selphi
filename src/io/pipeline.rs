@@ -664,8 +664,8 @@ fn fill_chip_sd(
 // ---------------------------------------------------------------------------
 
 
-/// Write one window to all active output formats, interpolating only once.
-/// Returns VCF/BCF byte buffers (empty vec if neither VCF nor BCF is active).
+/// Write one window to all active output formats.
+/// VCF/BCF bytes are sent directly to `vcf_tx` as produced — no accumulation.
 #[allow(clippy::too_many_arguments)]
 pub fn write_window_multiformat(
     formats: &OutputFormats,
@@ -683,14 +683,15 @@ pub fn write_window_multiformat(
     parquet_writer: Option<(&mut parquet::arrow::ArrowWriter<std::fs::File>, &Arc<arrow::datatypes::Schema>)>,
     pgen_writer: Option<(&mut super::pgen_output::PgenWriter, &mut BufWriter<std::fs::File>)>,
     sd_writer: Option<&mut super::selfdecode_output::SelfdecodeWriter>,
-) -> std::io::Result<Vec<Vec<u8>>> {
+    vcf_tx: &std::sync::mpsc::SyncSender<Vec<u8>>,
+) -> std::io::Result<()> {
     let setup = WindowSetup::new(
         srp, all_weights, win_chip_start,
         own_chip_start, own_chip_end, wgs_idx, n_samples,
     );
 
     if setup.intervals.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
     // BCF variant infos (only parsed if BCF format active)
@@ -714,7 +715,6 @@ pub fn write_window_multiformat(
     // Tiles are interpolated, encoded to all formats, then dropped immediately.
     // Never holds more than one batch of tiles in memory.
     let t0_pipeline = std::time::Instant::now();
-    let mut vcf_bytes: Vec<Vec<u8>> = Vec::new();
     let mut next_wgs = setup.own_wgs_start;
 
     let mut pw = parquet_writer;
@@ -738,14 +738,14 @@ pub fn write_window_multiformat(
                         let mut buf = Vec::with_capacity(n_samples * 20);
                         format_chip_line_bytes(&mut buf, next_wgs, vp_idx, &setup.vid_prefixes,
                             chip_genotypes, &setup.chip_local_idx, setup.n_haps, n_samples, &setup.an_str);
-                        vcf_bytes.push(buf);
+                        vcf_tx.send(buf).expect("VCF send failed");
                     }
                     if formats.bcf {
                         let vi = var_infos.as_ref().unwrap();
                         let mut buf = Vec::with_capacity(n_samples * 16);
                         format_chip_bcf(&mut buf, vp_idx, next_wgs, vi, chip_genotypes,
                             &setup.chip_local_idx, setup.n_haps, n_samples);
-                        vcf_bytes.push(buf);
+                        vcf_tx.send(buf).expect("VCF send failed");
                     }
                     if formats.pgen || formats.selfdecode {
                         let ci = setup.chip_local_idx[next_wgs];
@@ -773,20 +773,20 @@ pub fn write_window_multiformat(
         ($alt_probs:expr, $tile_n:expr, $global_start:expr) => {{
             if formats.vcf {
                 let vp_start = $global_start - setup.own_wgs_start;
-                vcf_bytes.push(format_tile_batch(
+                vcf_tx.send(format_tile_batch(
                     $alt_probs, $tile_n, setup.n_haps, n_samples,
                     $global_start, setup.n_ref_variants,
                     vp_start, &setup.vid_prefixes, &setup.is_chip, &setup.chip_local_idx,
-                    chip_genotypes, &setup.an_str, no_ap));
+                    chip_genotypes, &setup.an_str, no_ap)).expect("VCF send failed");
             }
             if formats.bcf {
                 let vi = var_infos.as_ref().unwrap();
                 let vi_start = $global_start - setup.own_wgs_start;
-                vcf_bytes.push(format_tile_batch_bcf(
+                vcf_tx.send(format_tile_batch_bcf(
                     $alt_probs, $tile_n, setup.n_haps, n_samples,
                     $global_start, setup.n_ref_variants,
                     vi_start, vi, &setup.is_chip, &setup.chip_local_idx,
-                    chip_genotypes, no_ap));
+                    chip_genotypes, no_ap)).expect("VCF send failed");
             }
             if let Some((ref mut writer, _)) = pw {
                 if let Some(ref sa) = schema_arc {
@@ -1019,7 +1019,7 @@ pub fn write_window_multiformat(
             cache_high = first_batch_end;
         }
 
-        for (iv_idx, interval) in setup.intervals.iter().enumerate() {
+        for (_iv_idx, interval) in setup.intervals.iter().enumerate() {
             let n_total_vars = interval.wgs_end - interval.wgs_start;
 
             emit_chip_gap!(interval.wgs_start);
@@ -1070,7 +1070,7 @@ pub fn write_window_multiformat(
     let total_secs = t0_pipeline.elapsed().as_secs_f64();
     crate::selphi_debug!("  [multiformat] interp+encode={:.2}s", total_secs);
 
-    Ok(vcf_bytes)
+    Ok(())
 }
 
 fn interpolate_tile_preloaded(
