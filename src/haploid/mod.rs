@@ -107,20 +107,30 @@ fn phase_genotypes_inner(
             i+1, chip_bp[ws], chip_bp[we-1], we-ws, ows, owe);
     }
 
-    // 2. Per-window genPos + coded steps
+    // 2. Per-window genPos + coded steps (two resolutions: adaptive step scale)
+    //
+    // Adaptive step scale: fine steps (scale=1.0, ~10 SNPs) in early iterations when
+    // phase has many errors → shorter hash windows → fewer broken matches.
+    // Coarse steps (scale=3.0, ~30 SNPs) in later iterations when phase is good →
+    // longer hash windows → more discriminative matching.
     let mut window_gen_pos: Vec<Vec<f64>> = Vec::with_capacity(n_windows);
+    // Coarse (standard)
     let mut window_coded_starts: Vec<Vec<i32>> = Vec::with_capacity(n_windows);
     let mut window_coded_ends: Vec<Vec<i32>> = Vec::with_capacity(n_windows);
     let mut window_n_steps: Vec<usize> = Vec::with_capacity(n_windows);
     let mut window_min_steps: Vec<i32> = Vec::with_capacity(n_windows);
     let mut window_step_size: Vec<usize> = Vec::with_capacity(n_windows);
+    // Fine
+    let mut window_coded_starts_fine: Vec<Vec<i32>> = Vec::with_capacity(n_windows);
+    let mut window_coded_ends_fine: Vec<Vec<i32>> = Vec::with_capacity(n_windows);
+    let mut window_n_steps_fine: Vec<usize> = Vec::with_capacity(n_windows);
+    let mut window_min_steps_fine: Vec<i32> = Vec::with_capacity(n_windows);
+    let mut window_step_size_fine: Vec<usize> = Vec::with_capacity(n_windows);
 
     for &(ws, we, _, _) in &windows {
         let w_cm = &chip_cm[ws..we];
         let w_bp = &chip_bp[ws..we];
         let w_gen_pos = window::enforce_gen_pos(w_cm, w_bp);
-        let (w_starts, w_ends) = compute_step_boundaries(&w_gen_pos, 3.0);
-        let w_n = w_starts.len();
         let w_size = we - ws;
         let mut diffs: Vec<f64> = (1..w_gen_pos.len()).map(|i| w_gen_pos[i] - w_gen_pos[i-1]).collect();
         diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -128,8 +138,18 @@ fn phase_genotypes_inner(
             let mid = diffs.len() / 2;
             if diffs.len().is_multiple_of(2) { (diffs[mid-1] + diffs[mid]) / 2.0 } else { diffs[mid] }
         };
+
+        // Coarse steps (standard, scale=3.0)
+        let (w_starts, w_ends) = compute_step_boundaries(&w_gen_pos, 3.0);
+        let w_n = w_starts.len();
         let ibs_step = (3.0 * median).max(1e-7);
-        let ms = (1.0f64 / ibs_step).round() as i32;  // debug JAR: Math.rint, no max(200) floor
+        let ms = (1.0f64 / ibs_step).round() as i32;
+
+        // Fine steps (scale=1.0)
+        let (w_starts_f, w_ends_f) = compute_step_boundaries(&w_gen_pos, 1.0);
+        let w_n_f = w_starts_f.len();
+        let ibs_step_f = (1.0 * median).max(1e-7);
+        let ms_f = (1.0f64 / ibs_step_f).round() as i32;
 
         // Debug: dump coded step boundaries for W0
         if debug::is_debug() && window_gen_pos.is_empty() {
@@ -143,12 +163,21 @@ fn phase_genotypes_inner(
                 selphi_debug!("  [DEBUG] Dumped {} coded steps to {}", w_n, path);
             }
         }
+
+        // Coarse
         window_step_size.push(w_size.div_ceil(w_n.max(1)).max(2));
-        window_gen_pos.push(w_gen_pos);
         window_coded_starts.push(w_starts);
         window_coded_ends.push(w_ends);
         window_n_steps.push(w_n);
         window_min_steps.push(ms);
+        // Fine
+        window_step_size_fine.push(w_size.div_ceil(w_n_f.max(1)).max(2));
+        window_coded_starts_fine.push(w_starts_f);
+        window_coded_ends_fine.push(w_ends_f);
+        window_n_steps_fine.push(w_n_f);
+        window_min_steps_fine.push(ms_f);
+
+        window_gen_pos.push(w_gen_pos);
     }
 
     // 3. Seed chain (deterministic LCG per window)
@@ -291,15 +320,26 @@ fn phase_genotypes_inner(
         let own_start_local = ows - ws;
         let own_end_local = owe - ws;
 
-        // Pre-compute overlap steps ONCE (invariant across iterations: genetic map doesn't change)
-        let steps_per_batch = w_n_steps.div_ceil(n_threads);
-        let n_batches = w_n_steps.div_ceil(steps_per_batch);
-        let n_overlap_steps = (0.35 / (3.0 * {
+        // Pre-compute batch parameters for BOTH step resolutions
+        let median_dist = {
             let mut dd: Vec<f64> = (1..w_cm.len()).map(|i| w_cm[i] - w_cm[i-1]).collect();
             dd.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let mid = dd.len() / 2;
             if dd.len().is_multiple_of(2) { (dd[mid-1]+dd[mid])/2.0 } else { dd[mid] }
-        }.max(1e-7))).round() as usize;
+        }.max(1e-7);
+        // Coarse batch params
+        let steps_per_batch = w_n_steps.div_ceil(n_threads);
+        let n_batches = w_n_steps.div_ceil(steps_per_batch);
+        let n_overlap_steps = (0.35 / (3.0 * median_dist)).round() as usize;
+        // Fine batch params
+        let w_n_steps_f = window_n_steps_fine[wi];
+        let steps_per_batch_f = w_n_steps_f.div_ceil(n_threads);
+        let n_batches_f = w_n_steps_f.div_ceil(steps_per_batch_f);
+        let n_overlap_steps_f = (0.35 / (1.0 * median_dist)).round() as usize;
+
+        // Adaptive step scale: fine steps for first 5 iterations (phase is uncertain,
+        // need error tolerance), coarse for remaining (phase is good, need discrimination).
+        const FINE_STEP_ITERS: usize = 5;
 
         // --- Iteration loop for this window ---
         let n_total = n_burnin + n_phasing;
@@ -312,56 +352,69 @@ fn phase_genotypes_inner(
             let lr = lr_threshold(it, n_burnin, n_phasing);
             let nc = n_candidates(it, n_burnin, n_phasing);
 
+            // Select step resolution for this iteration
+            let use_fine = it < FINE_STEP_ITERS;
+            let (it_starts, it_ends, it_n_steps, it_step_size, it_min_steps,
+                 it_spb, it_nb, it_overlap) = if use_fine {
+                (&window_coded_starts_fine[wi], &window_coded_ends_fine[wi],
+                 w_n_steps_f, window_step_size_fine[wi], window_min_steps_fine[wi],
+                 steps_per_batch_f, n_batches_f, n_overlap_steps_f)
+            } else {
+                (&window_coded_starts[wi], &window_coded_ends[wi],
+                 w_n_steps, window_step_size[wi], window_min_steps[wi],
+                 steps_per_batch, n_batches, n_overlap_steps)
+            };
+
             // Pre-compute coded step values in parallel from hap_bits
             let (w_precoded, w_pre_na) = pbwt::precompute_coded_steps_parallel(
                 &w_hap_bits, hap_byte_stride,
-                &window_coded_starts[wi], &window_coded_ends[wi], m_all);
+                it_starts, it_ends, m_all);
 
             // --- PBWT coded IBS ---
             let t_pbwt = Instant::now();
             let w_seed = window_seeds[wi] + it as i64;
 
             if debug::is_debug() && it == 0 && wi == 0 {
-                selphi_debug!("  [PBWT] n_batches={} steps_per_batch={} n_overlap={} n_steps={}",
-                    n_batches, steps_per_batch, n_overlap_steps, w_n_steps);
+                selphi_debug!("  [PBWT] n_batches={} steps_per_batch={} n_overlap={} n_steps={} fine={}",
+                    it_nb, it_spb, it_overlap, it_n_steps, use_fine);
             }
-            let w_ibs = if n_batches <= 1 {
+            let w_ibs = if it_nb <= 1 {
                 if use_bwd {
                     pbwt::pbwt_coded_ibs_bwd_batch(
                         &w_precoded, &w_pre_na, n_ref,
-                        &window_coded_starts[wi], &window_coded_ends[wi],
+                        it_starts, it_ends,
                         m_all, nc, w_seed,
-                        0, w_n_steps, w_n_steps,
+                        0, it_n_steps, it_n_steps,
                         &ibs2_off, &ibs2_start, &ibs2_end, &ibs2_other,
                         true, 0)
                 } else {
                     pbwt::pbwt_coded_ibs_fwd_batch(
                         &w_precoded, &w_pre_na, n_ref,
-                        &window_coded_starts[wi], &window_coded_ends[wi],
+                        it_starts, it_ends,
                         m_all, nc, w_seed,
-                        0, w_n_steps, 0,
+                        0, it_n_steps, 0,
                         &ibs2_off, &ibs2_start, &ibs2_end, &ibs2_other,
                         0, true, 0)
                 }
             } else {
-                // Multi-batch PBWT ( parallel batching)
-                let batches: Vec<Vec<i32>> = (0..n_batches).into_par_iter().map(|b| {
-                    let bs = b * steps_per_batch;
-                    let be = ((b + 1) * steps_per_batch).min(w_n_steps);
+                // Multi-batch PBWT (parallel batching)
+                let batches: Vec<Vec<i32>> = (0..it_nb).into_par_iter().map(|b| {
+                    let bs = b * it_spb;
+                    let be = ((b + 1) * it_spb).min(it_n_steps);
                     if use_bwd {
-                        let buf_end = (be + n_overlap_steps).min(w_n_steps);
+                        let buf_end = (be + it_overlap).min(it_n_steps);
                         pbwt::pbwt_coded_ibs_bwd_batch(
                             &w_precoded, &w_pre_na, n_ref,
-                            &window_coded_starts[wi], &window_coded_ends[wi],
+                            it_starts, it_ends,
                             m_all, nc, w_seed,
                             bs, be, buf_end,
                             &ibs2_off, &ibs2_start, &ibs2_end, &ibs2_other,
                             true, 0)
                     } else {
-                        let buf = bs.saturating_sub(n_overlap_steps);
+                        let buf = bs.saturating_sub(it_overlap);
                         pbwt::pbwt_coded_ibs_fwd_batch(
                             &w_precoded, &w_pre_na, n_ref,
-                            &window_coded_starts[wi], &window_coded_ends[wi],
+                            it_starts, it_ends,
                             m_all, nc, w_seed,
                             bs, be, buf,
                             &ibs2_off, &ibs2_start, &ibs2_end, &ibs2_other,
@@ -369,10 +422,10 @@ fn phase_genotypes_inner(
                     }
                 }).collect();
                 // Merge batches
-                let mut out = vec![-1i32; w_n_steps * n_targ_haps];
+                let mut out = vec![-1i32; it_n_steps * n_targ_haps];
                 for (b, batch) in batches.iter().enumerate() {
-                    let bs = b * steps_per_batch;
-                    let be = ((b + 1) * steps_per_batch).min(w_n_steps);
+                    let bs = b * it_spb;
+                    let be = ((b + 1) * it_spb).min(it_n_steps);
                     for step in bs..be {
                         for t in 0..n_targ_haps {
                             out[step * n_targ_haps + t] = batch[step * n_targ_haps + t];
@@ -385,7 +438,7 @@ fn phase_genotypes_inner(
             // Debug: dump IBS
             if debug::is_debug() && it == debug::debug_iter() {
                 let ds = debug::debug_sample();
-                debug::dump_ibs(it, wi, &w_ibs, w_n_steps, n_targ_haps, ds*2, ds*2+1);
+                debug::dump_ibs(it, wi, &w_ibs, it_n_steps, n_targ_haps, ds*2, ds*2+1);
             }
             let pbwt_ms = t_pbwt.elapsed().as_millis();
 
@@ -422,8 +475,8 @@ fn phase_genotypes_inner(
                             let mut ws = ws.borrow_mut();
                             em::em_for_sample(&w_hap_bits, hap_byte_stride,
                                 &w_ibs, w_cm,
-                                &window_coded_starts[wi], si, w_size, w_n_steps, n_targ_haps,
-                                m_all, w_step_size, window_min_steps[wi], N_MOSAIC,
+                                it_starts, si, w_size, it_n_steps, n_targ_haps,
+                                m_all, it_step_size, it_min_steps, N_MOSAIC,
                                 ri_f32, pm_f32, n_haps_total, &mut ws)
                         })
                     }).collect();
@@ -481,8 +534,8 @@ fn phase_genotypes_inner(
             let active_results: Vec<(usize, hmm::PhaseResult)> = active_samples.par_iter().map(|&si| {
                 (si, hmm::phase_one(&w_hap_bits, hap_byte_stride,
                     &w_ibs, &w_het_mask, w_cm,
-                    &window_coded_starts[wi], w_step_size, window_min_steps[wi], &w_locked, &w_resolved,
-                    si, w_size, n_targ_haps, n_samples, w_n_steps,
+                    it_starts, it_step_size, it_min_steps, &w_locked, &w_resolved,
+                    si, w_size, n_targ_haps, n_samples, it_n_steps,
                     0, own_start_local, own_end_local, m_all, w_size, N_MOSAIC,
                     lr_f32, is_last, ri_f32, pm_f32, n_haps_total, w_bp,
                     it, wi))
