@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Diploid phase_common: iterative MCMC phasing of common variants.
 //!
 //! Orchestrates: PBWT selection → HMM forward-backward → MCMC → update.
@@ -60,160 +59,6 @@ fn split_rec(
         out.push((s0, s1));
     }
     true
-}
-
-/// Per-sample HMM output: transition probabilities between segment diplotypes.
-struct HmmOutput {
-    trans_probs: Vec<f64>,
-    missing_probs: Vec<f32>,
-}
-
-/// Compute transition probabilities from HMM forward pass.
-///
-/// Uses saved full alpha states (prob[k × HAP_NUMBER + h]) to compute:
-/// P(dip d) = sum_k [ prob[k, h0(d)] × prob[k, h1(d)] ]
-///
-/// This is the CORRECT inner-product formula (not product of marginals).
-/// The sum-of-products accounts for correlation between haplotype pairs
-/// through the shared conditioning haplotype k.
-fn compute_transition_probs(
-    graph: &GenotypeGraph,
-    hmm: &SegmentHmm,
-    _cond_set: &[usize],
-    _haplotypes: &[u8],
-    _n_haps_total: usize,
-    _trans: &[f32],
-    seg_first: usize,
-    seg_last: usize,
-) -> HmmOutput {
-    let n_cond = hmm.n_cond;
-    let n_window_segs = seg_last - seg_first + 1;
-
-    // Count transitions within this window
-    let mut n_window_trans = 0usize;
-    for s in seg_first..seg_last {
-        n_window_trans += graph.count_diplotypes(s) * graph.count_diplotypes(s + 1);
-    }
-
-    if n_window_segs < 2 || hmm.alpha_store.is_empty() || n_cond == 0 {
-        return HmmOutput {
-            trans_probs: vec![1.0; n_window_trans.max(1)],
-            missing_probs: vec![],
-        };
-    }
-
-    let mut trans_probs = vec![0.0f64; n_window_trans];
-    let mut toffset = 0usize;
-
-    for s in seg_first..seg_last {
-        // HMM alpha_store is indexed relative to seg_first
-        let s_rel = s - seg_first;
-        let d0_count = graph.count_diplotypes(s);
-        let d1_count = graph.count_diplotypes(s + 1);
-        let n_t = d0_count * d1_count;
-
-        let codes0 = enumerate_active_diplotypes(graph.diplotypes[s]);
-        let codes1 = enumerate_active_diplotypes(graph.diplotypes[s + 1]);
-
-        // Get full alpha at segment s boundary (prob[k * HAP + h])
-        // alpha_store is indexed relative to seg_first
-        let alpha_full = if s_rel < hmm.alpha_store.len() && !hmm.alpha_store[s_rel].is_empty() {
-            &hmm.alpha_store[s_rel]
-        } else {
-            // Fallback to uniform
-            let mut d0_probs = vec![0.0f64; d0_count];
-            let d0_prob = 1.0 / d0_count.max(1) as f64;
-            d0_probs.fill(d0_prob);
-            let d1_prob = 1.0 / d1_count.max(1) as f64;
-            for t in 0..n_t {
-                let d0_idx = t / d1_count;
-                if toffset + t < trans_probs.len() {
-                    trans_probs[toffset + t] = d0_probs[d0_idx] * d1_prob;
-                }
-            }
-            toffset += n_t;
-            continue;
-        };
-
-        // Compute diplotype probabilities using inner product:
-        // P(dip d) = sum_k [ alpha[k, h0(d)] × alpha[k, h1(d)] ]
-        let mut d0_probs = vec![0.0f64; d0_count];
-        let mut d0_sum = 0.0f64;
-        for (i, &d) in codes0.iter().enumerate() {
-            let h0 = dip_hap0(d as usize);
-            let h1 = dip_hap1(d as usize);
-            let mut p = 0.0f64;
-            for k in 0..n_cond {
-                let base = k * HAP_NUMBER;
-                if base + h0 < alpha_full.len() && base + h1 < alpha_full.len() {
-                    p += (alpha_full[base + h0] * alpha_full[base + h1]) as f64;
-                }
-            }
-            d0_probs[i] = p;
-            d0_sum += p;
-        }
-        if d0_sum > 0.0 { for p in &mut d0_probs { *p /= d0_sum; } }
-
-        // For d1: use alpha at s+1 if available, else uniform
-        let mut d1_probs = vec![0.0f64; d1_count];
-        let mut d1_sum = 0.0f64;
-        let s_rel_next = s_rel + 1;
-        let alpha_next = if s_rel_next < hmm.alpha_store.len() && !hmm.alpha_store[s_rel_next].is_empty() {
-            Some(&hmm.alpha_store[s_rel_next])
-        } else {
-            None
-        };
-
-        if let Some(alpha_n) = alpha_next {
-            for (i, &d) in codes1.iter().enumerate() {
-                let h0 = dip_hap0(d as usize);
-                let h1 = dip_hap1(d as usize);
-                let mut p = 0.0f64;
-                for k in 0..n_cond {
-                    let base = k * HAP_NUMBER;
-                    if base + h0 < alpha_n.len() && base + h1 < alpha_n.len() {
-                        p += (alpha_n[base + h0] * alpha_n[base + h1]) as f64;
-                    }
-                }
-                d1_probs[i] = p;
-                d1_sum += p;
-            }
-            if d1_sum > 0.0 { for p in &mut d1_probs { *p /= d1_sum; } }
-        } else {
-            let u = 1.0 / d1_count.max(1) as f64;
-            d1_probs.fill(u);
-        }
-
-        // Joint: P(d0, d1) ∝ P(d0) × P(d1)
-        for t in 0..n_t {
-            let d0_idx = t / d1_count;
-            let d1_idx = t % d1_count;
-            let p = d0_probs[d0_idx.min(d0_probs.len() - 1)]
-                  * d1_probs[d1_idx.min(d1_probs.len() - 1)];
-            if toffset + t < trans_probs.len() {
-                trans_probs[toffset + t] = p.max(1e-10);
-            }
-        }
-
-        toffset += n_t;
-    }
-
-    // Global normalization: scale so average is 1.0
-    let total: f64 = trans_probs.iter().sum();
-    if total > 0.0 {
-        let inv = trans_probs.len() as f64 / total;
-        for p in &mut trans_probs { *p *= inv; }
-    }
-
-    HmmOutput {
-        trans_probs,
-        missing_probs: vec![0.0; graph.n_missing * HAP_NUMBER],
-    }
-}
-
-/// Enumerate active diplotype codes from bitmask.
-fn enumerate_active_diplotypes(mask: u64) -> Vec<u8> {
-    (0..64u8).filter(|&d| dip_get(mask, d as usize)).collect()
 }
 
 /// C++ exact: compute het overlap between two target individuals.
@@ -306,7 +151,6 @@ pub fn run_phase_common_bm(
     crate::selphi_debug!("  [diploid] phase_common: {} iters ({}), depth={}, modulo={:.3}cM, {} haps (pbwt={}) #eval={} #groups={}",
         n_iterations, scheme, depth, modulo, n_haps_total, pbwt_n_haps, n_eval, pbwt_idx.n_groups);
 
-    const N_RANDOM_HAPS: usize = 100;
     let ordering: Vec<usize> = (0..n_haps_total).collect();
     let mut o_iterator: usize = 0;
     let mut rng = CppRng::new(seed as u32);

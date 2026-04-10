@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! IBD2 track detection and storage for PBWT exclusion.
 //!
 //! C++ exact: per-locus IBD2 tracks with ±4cM expansion.
@@ -16,11 +15,6 @@ pub struct Track {
 impl Track {
     fn overlaps(&self, other: &Track) -> bool {
         self.ind == other.ind && other.to >= self.from && other.from <= self.to
-    }
-
-    fn merge(&mut self, other: &Track) {
-        self.from = self.from.min(other.from);
-        self.to = self.to.max(other.to);
     }
 }
 

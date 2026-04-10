@@ -1,4 +1,3 @@
-#![allow(unused_assignments, unused_variables)]
 //! Genotype graph: segments with diplotype bitmasks.
 //!
 //! Each sample's genotypes are represented as a sequence of segments.
@@ -336,7 +335,6 @@ impl GenotypeGraph {
         // Pass 4: build Diplotypes
         self.diplotypes = vec![0u64; self.n_segments];
         vabs = 0;
-        let mut a = 0usize;
         for s in 0..self.n_segments {
             let n_unf = ordered_segments[s] as usize;
             self.diplotypes[s] = if n_unf > 0 { MASK_SCAF } else { MASK_INIT };
@@ -346,7 +344,6 @@ impl GenotypeGraph {
                 let byte = self.variants[vi / 2];
                 let e = vi % 2;
                 let f_het = var_is_het(e, byte);
-                let f_sca = var_is_sca(e, byte);
 
                 if f_het {
                     let cur_unf = {
@@ -368,7 +365,6 @@ impl GenotypeGraph {
                         _ => {} // 3+ shouldn't happen (segment boundary)
                     }
                 }
-                a += (f_sca || f_het) as usize;
             }
             vabs += self.lengths[s] as usize;
         }

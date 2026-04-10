@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Diploid phase_rare: PBWT-based rare variant phasing.
 //!
 //! Matches the C++ algorithm exactly (conditioning_set_solve.cpp):
@@ -12,10 +11,6 @@
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
-use rayon;
-use rayon::prelude::*;
-
-use super::hmm_scaffold;
 
 /// Phase result for a single rare het from one PBWT direction.
 #[derive(Clone, Copy)]
@@ -37,55 +32,11 @@ impl CFlip {
     }
 }
 
-/// Classify all variants as scaffold (common) or rare.
-/// Returns (variant_type, scaffold_indices, rare_het_info).
-///
-/// variant_type[v]: 0=monomorphic, 1=scaffold(common), 2=rare
-fn classify_variants(
-    phased: &[u8],
-    ref_alleles: &[u8],
-    n_var: usize,
-    n_haps: usize,
-    n_ref: usize,
-    rare_mac_threshold: usize,
-) -> (Vec<u8>, Vec<usize>, Vec<usize>) {
-    let n_haps_total = n_ref + n_haps;
-
-    let mut allele_counts = vec![0u32; n_var];
-    for v in 0..n_var {
-        let mut ac = 0u32;
-        for h in 0..n_ref {
-            ac += ref_alleles[v * n_ref + h] as u32;
-        }
-        for h in 0..n_haps {
-            ac += phased[v * n_haps + h] as u32;
-        }
-        allele_counts[v] = ac;
-    }
-
-    let mut var_type = vec![0u8; n_var]; // 0=mono, 1=scaffold, 2=rare
-    let mut scaffold_sites = Vec::new();
-    let mut rare_sites = Vec::new();
-
-    for v in 0..n_var {
-        let mac = allele_counts[v].min(n_haps_total as u32 - allele_counts[v]) as usize;
-        if mac >= rare_mac_threshold {
-            var_type[v] = 1;
-            scaffold_sites.push(v);
-        } else if mac > 0 {
-            var_type[v] = 2;
-            rare_sites.push(v);
-        }
-    }
-
-    (var_type, scaffold_sites, rare_sites)
-}
-
 /// Build merged variant order: all variants sorted by position (already sorted),
 /// with type tags for dispatch.
 #[derive(Clone, Copy)]
 struct VariantTag {
-    var_idx: usize,     // index in full variant array
+    _var_idx: usize,     // index in full variant array
     scaffold_idx: i32,  // index in scaffold array, or -1
     rare_idx: i32,      // index in rare array, or -1
 }
@@ -110,7 +61,7 @@ fn build_variant_order(
     for v in 0..n_var {
         if var_type[v] > 0 {
             order.push(VariantTag {
-                var_idx: v,
+                _var_idx: v,
                 scaffold_idx: scaffold_lookup[v],
                 rare_idx: rare_lookup[v],
             });
@@ -159,294 +110,6 @@ fn build_scaffold_evaluation(
     }
 
     (evaluation, grouping, selection)
-}
-
-/// Build per-haplotype conditioning sets via PBWT on scaffold sites (target-only haps).
-///
-/// C++ exact: conditioning_set_selection.cpp — PBWT forward+backward, min 50 states per hap.
-fn build_scaffold_conditioning_sets(
-    phased: &[u8],
-    scaffold_sites: &[usize],
-    n_haps: usize,        // target haps only = n_samples * 2
-    depth: usize,          // neighbors per side
-    min_states: usize,     // 50
-) -> Vec<Vec<usize>> {
-    let n_scaffold = scaffold_sites.len();
-    if n_scaffold == 0 || n_haps < 2 {
-        return vec![Vec::new(); n_haps];
-    }
-
-    let mut cond_sets: Vec<Vec<usize>> = vec![Vec::new(); n_haps];
-    let store_interval = (n_scaffold / 20).max(1); // store at ~20 evenly spaced sites
-
-    // --- Forward sweep ---
-    let mut a: Vec<usize> = (0..n_haps).collect();
-    let mut c: Vec<usize> = vec![0; n_haps];
-    let mut b: Vec<usize> = vec![0; n_haps];
-    let mut d: Vec<usize> = vec![0; n_haps];
-
-    for (si, &v) in scaffold_sites.iter().enumerate() {
-        let mut u = 0usize;
-        let mut vv = 0usize;
-        let mut p = si;
-        let mut q = si;
-        let base = v * n_haps;
-
-        for h in 0..n_haps {
-            let a_h = a[h];
-            let c_h = c[h];
-            if c_h > p { p = c_h; }
-            if c_h > q { q = c_h; }
-            if phased[base + a_h] == 0 {
-                a[u] = a_h; c[u] = p; p = 0; u += 1;
-            } else {
-                b[vv] = a_h; d[vv] = q; q = 0; vv += 1;
-            }
-        }
-        a[u..u + vv].copy_from_slice(&b[..vv]);
-        c[u..u + vv].copy_from_slice(&d[..vv]);
-
-        // Store neighbors at selected sites
-        if si % store_interval == 0 || si == n_scaffold - 1 {
-            let mut r = vec![0usize; n_haps];
-            for h in 0..n_haps { r[a[h]] = h; }
-
-            for hap in 0..n_haps {
-                let pos = r[hap];
-                for off in 1..=depth {
-                    if pos >= off { cond_sets[hap].push(a[pos - off]); }
-                    if pos + off < n_haps { cond_sets[hap].push(a[pos + off]); }
-                }
-            }
-        }
-    }
-
-    // --- Backward sweep ---
-    let mut a: Vec<usize> = (0..n_haps).collect();
-    let mut c: Vec<usize> = vec![n_scaffold.saturating_sub(1); n_haps];
-    let mut b: Vec<usize> = vec![0; n_haps];
-    let mut d: Vec<usize> = vec![0; n_haps];
-
-    for (si_rev, &v) in scaffold_sites.iter().enumerate().rev() {
-        let mut u = 0usize;
-        let mut vv = 0usize;
-        let mut p = si_rev;
-        let mut q = si_rev;
-        let base = v * n_haps;
-
-        for h in 0..n_haps {
-            let a_h = a[h];
-            let c_h = c[h];
-            if c_h < p { p = c_h; }
-            if c_h < q { q = c_h; }
-            if phased[base + a_h] == 0 {
-                a[u] = a_h; c[u] = p; p = n_scaffold.saturating_sub(1); u += 1;
-            } else {
-                b[vv] = a_h; d[vv] = q; q = n_scaffold.saturating_sub(1); vv += 1;
-            }
-        }
-        a[u..u + vv].copy_from_slice(&b[..vv]);
-        c[u..u + vv].copy_from_slice(&d[..vv]);
-
-        if si_rev % store_interval == 0 || si_rev == 0 {
-            let mut r = vec![0usize; n_haps];
-            for h in 0..n_haps { r[a[h]] = h; }
-
-            for hap in 0..n_haps {
-                let pos = r[hap];
-                for off in 1..=depth {
-                    if pos >= off { cond_sets[hap].push(a[pos - off]); }
-                    if pos + off < n_haps { cond_sets[hap].push(a[pos + off]); }
-                }
-            }
-        }
-    }
-
-    // Dedup, remove self, pad to min_states
-    let mut rng = SmallRng::seed_from_u64(42);
-    for hap in 0..n_haps {
-        cond_sets[hap].sort_unstable();
-        cond_sets[hap].dedup();
-        cond_sets[hap].retain(|&c| c != hap && c / 2 != hap / 2);
-
-        while cond_sets[hap].len() < min_states && n_haps > 2 {
-            let r = rng.gen_range(0..n_haps);
-            if r != hap && r / 2 != hap / 2 && !cond_sets[hap].contains(&r) {
-                cond_sets[hap].push(r);
-            }
-        }
-        cond_sets[hap].sort_unstable();
-    }
-
-    cond_sets
-}
-
-/// Map each rare site to its right-flanking scaffold index (binary search).
-fn map_rare_to_scaffold(
-    rare_sites: &[usize],
-    scaffold_sites: &[usize],
-) -> Vec<usize> {
-    rare_sites.iter().map(|&rv| {
-        scaffold_sites.partition_point(|&sv| sv < rv)
-    }).collect()
-}
-
-/// Run HMM scaffold pass: phase rare hets via Li-Stephens posterior interpolation.
-///
-/// C++ exact: phaser_algorithm.cpp — per-sample HMM forward-backward on scaffold,
-/// then phaseLiAndStephens() for rare hets between scaffold sites.
-fn run_hmm_scaffold_pass(
-    phased: &mut [u8],
-    _target_geno: &[u8],
-    scaffold_sites: &[usize],
-    rare_sites: &[usize],
-    rare_het_samples: &[Vec<usize>],
-    major_alleles: &[bool],
-    cond_sets: &[Vec<usize>],
-    map_r2s: &[usize],
-    cm: &[f64],
-    n_haps: usize,
-    n_samples: usize,
-    ne: f64,
-) -> Vec<bool> {
-    let n_scaffold = scaffold_sites.len();
-    let n_rare = rare_sites.len();
-
-    if n_scaffold < 2 || n_rare == 0 {
-        return vec![false; n_rare * n_samples];
-    }
-
-    // Build per-sample list of rare het indices
-    let sample_rare_hets: Vec<Vec<usize>> = (0..n_samples).map(|si| {
-        (0..n_rare).filter(|&ri| rare_het_samples[ri].contains(&si)).collect()
-    }).collect();
-
-    // Parallel per-sample HMM
-    let results: Vec<Vec<(usize, u8, u8)>> = (0..n_samples).into_par_iter().map(|si| {
-        let rare_hets = &sample_rare_hets[si];
-        if rare_hets.is_empty() { return vec![]; }
-
-        let h0_idx = si * 2;
-        let h1_idx = si * 2 + 1;
-
-        // --- HMM for haplotype h0 ---
-        let hap0_alleles: Vec<bool> = scaffold_sites.iter()
-            .map(|&v| phased[v * n_haps + h0_idx] != 0).collect();
-
-        let result_h0 = if !cond_sets[h0_idx].is_empty() {
-            hmm_scaffold::run_scaffold_hmm(
-                scaffold_sites, &cond_sets[h0_idx], &hap0_alleles,
-                |si_scaffold, ci| {
-                    let v = scaffold_sites[si_scaffold];
-                    phased[v * n_haps + cond_sets[h0_idx][ci]] != 0
-                },
-                cm, ne,
-            )
-        } else {
-            hmm_scaffold::ScaffoldResult {
-                viterbi_path: vec![], posteriors: vec![],
-                n_scaffold: 0, n_cond: 0,
-            }
-        };
-
-        // --- HMM for haplotype h1 ---
-        let hap1_alleles: Vec<bool> = scaffold_sites.iter()
-            .map(|&v| phased[v * n_haps + h1_idx] != 0).collect();
-
-        let result_h1 = if !cond_sets[h1_idx].is_empty() {
-            hmm_scaffold::run_scaffold_hmm(
-                scaffold_sites, &cond_sets[h1_idx], &hap1_alleles,
-                |si_scaffold, ci| {
-                    let v = scaffold_sites[si_scaffold];
-                    phased[v * n_haps + cond_sets[h1_idx][ci]] != 0
-                },
-                cm, ne,
-            )
-        } else {
-            hmm_scaffold::ScaffoldResult {
-                viterbi_path: vec![], posteriors: vec![],
-                n_scaffold: 0, n_cond: 0,
-            }
-        };
-
-        // --- Phase rare hets using posteriors ---
-        let mut resolved: Vec<(usize, u8, u8)> = Vec::new();
-
-        for &ri in rare_hets {
-            let rv = rare_sites[ri];
-            let right_scaffold = map_r2s[ri].min(n_scaffold.saturating_sub(1));
-            let left_scaffold = if right_scaffold > 0 { right_scaffold - 1 } else { 0 };
-
-            // Build carrier indices for h0's conditioning set
-            let carriers_h0: Vec<usize> = if result_h0.n_cond > 0 {
-                cond_sets[h0_idx].iter().enumerate()
-                    .filter(|&(_, &ch)| phased[rv * n_haps + ch] != 0)
-                    .map(|(i, _)| i)
-                    .collect()
-            } else { vec![] };
-
-            let prob_h0 = if result_h0.n_scaffold >= 2 {
-                hmm_scaffold::phase_rare_li_stephens(
-                    &result_h0, left_scaffold, right_scaffold,
-                    &carriers_h0, major_alleles[ri],
-                )
-            } else { 0.5 };
-
-            // Build carrier indices for h1's conditioning set
-            let carriers_h1: Vec<usize> = if result_h1.n_cond > 0 {
-                cond_sets[h1_idx].iter().enumerate()
-                    .filter(|&(_, &ch)| phased[rv * n_haps + ch] != 0)
-                    .map(|(i, _)| i)
-                    .collect()
-            } else { vec![] };
-
-            let prob_h1 = if result_h1.n_scaffold >= 2 {
-                hmm_scaffold::phase_rare_li_stephens(
-                    &result_h1, left_scaffold, right_scaffold,
-                    &carriers_h1, major_alleles[ri],
-                )
-            } else { 0.5 };
-
-            // C++ exact: joint diplotype phasing using both haplotype posteriors
-            // sparse_genotype::phase(prb0, prb1) with threshold 0.5001
-            if let Some((a0, a1, _conf)) = hmm_scaffold::phase_diplotype_joint(
-                prob_h0, prob_h1, 0.5001,
-            ) {
-                resolved.push((ri, a0, a1));
-            } else if result_h0.n_scaffold >= 2 && result_h1.n_scaffold >= 2 {
-                // Try singleton Viterbi fallback
-                let scaffold_idx = right_scaffold.min(result_h0.viterbi_path.len().saturating_sub(1));
-                let (a0, a1) = hmm_scaffold::phase_singleton_viterbi(
-                    &result_h0, &result_h1, scaffold_idx, cm, scaffold_sites,
-                );
-                resolved.push((ri, a0, a1));
-            }
-        }
-
-        resolved
-    }).collect();
-
-    // Apply HMM-resolved phases and build resolution bitmap
-    let mut hmm_resolved = vec![false; n_rare * n_samples];
-
-    for (si, resolved) in results.iter().enumerate() {
-        let h0_idx = si * 2;
-        let h1_idx = si * 2 + 1;
-        for &(ri, a0, a1) in resolved {
-            let rv = rare_sites[ri];
-            phased[rv * n_haps + h0_idx] = a0;
-            phased[rv * n_haps + h1_idx] = a1;
-            hmm_resolved[ri * n_samples + si] = true;
-        }
-    }
-
-    let n_hmm_resolved: usize = hmm_resolved.iter().filter(|&&r| r).count();
-    let n_total_hets: usize = rare_het_samples.iter().map(|s| s.len()).sum();
-    crate::selphi_debug!("  [diploid] HMM scaffold: {}/{} rare hets resolved ({:.1}%)",
-        n_hmm_resolved, n_total_hets,
-        if n_total_hets > 0 { n_hmm_resolved as f64 / n_total_hets as f64 * 100.0 } else { 0.0 });
-
-    hmm_resolved
 }
 
 /// PBWT-based rare variant phasing: forward + backward sweep with voting.

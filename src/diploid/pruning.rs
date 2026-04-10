@@ -1,4 +1,3 @@
-#![allow(unused_assignments, unused_variables)]
 //! Segment merging (pruning) for genotype graphs.
 //!
 //! During pruning iterations, adjacent segments with low-entropy transitions
@@ -32,7 +31,6 @@ pub fn map_merges(
         .collect();
 
     let mut toffset = graph.dc0();
-    let mut voffset = 0usize;
 
     for s in 1..graph.n_segments {
         let curr_dipcount = graph.count_diplotypes(s);
@@ -121,7 +119,6 @@ pub fn map_merges(
             }
         }
 
-        voffset += graph.lengths[s - 1] as usize;
         toffset += n_trans;
     }
 

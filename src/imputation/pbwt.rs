@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! PBWT matching for imputation — forward/backward passes producing CSC match matrices.
 //!
 //! Port of `modules/pbwt_numba.py`: `_pbwt_match_targets`, `_backward_filter_all`,

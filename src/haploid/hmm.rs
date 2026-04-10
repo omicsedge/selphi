@@ -1,4 +1,3 @@
-#![allow(unused_assignments, unused_variables)]
 /// HMM phase worker: composites + clusters + 3-channel forward-backward with swap.
 /// Haploid HMM phase worker: composites + clusters + 3-channel forward-backward with swap.
 use crate::selphi_debug;
@@ -17,7 +16,6 @@ fn copy_hap_to_comp(hbm:&[u8],hbs:usize,h:usize,sl:usize,from:usize,to:usize,com
     {
         // Fast path: read sequentially from haplotype-major bitmatrix
         let hap_base = h * hbs;
-        let mut m = from;
         // Process 8 markers at a time using byte reads
         let byte_start = from >> 3;
         let byte_end = to >> 3;
@@ -26,6 +24,7 @@ fn copy_hap_to_comp(hbm:&[u8],hbs:usize,h:usize,sl:usize,from:usize,to:usize,com
             let first_byte = hbm[hap_base + byte_start];
             if first_byte != 0 {
                 let skip = from & 7;
+                let mut m = from;
                 for k in skip..8 {
                     if m >= to { break; }
                     if (first_byte >> k) & 1 != 0 {
@@ -33,8 +32,6 @@ fn copy_hap_to_comp(hbm:&[u8],hbs:usize,h:usize,sl:usize,from:usize,to:usize,com
                     }
                     m += 1;
                 }
-            } else {
-                m = (byte_start + 1) * 8;
             }
         }
         // Process full bytes

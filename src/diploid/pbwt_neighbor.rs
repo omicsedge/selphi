@@ -1,4 +1,3 @@
-#![allow(unused_assignments, unused_variables)]
 //! Standard PBWT with depth-adaptive neighbor extraction.
 //!
 //! Parallelized via genomic chunks .
