@@ -8,7 +8,7 @@
 
 <img align="right" width="200" src="icons/selphi-logo.svg" alt="Selphi">
 
-**Selphi** — a genotype phasing and imputation tool implemented in Rust. It provides two phasing engines — haploid and diploid — coupled with a Li-Stephens PBWT imputation engine in a unified, memory-efficient pipeline. All internal data structures use a bitmatrix representation (1 bit per allele), the diploid HMM is AVX-512 accelerated, and results are fully deterministic across runs.
+**Selphi** — a genotype phasing and imputation tool implemented in Rust. It provides two phasing engines — haploid and diploid — coupled with a Li-Stephens PBWT imputation engine in a unified, memory-efficient pipeline. All internal data structures use a bitmatrix representation (1 bit per allele), HMM kernels are SIMD-accelerated (AVX-512/AVX2 on x86, NEON on Apple Silicon), and results are fully deterministic across runs.
 
 <p align="center">
   <picture>
@@ -34,7 +34,7 @@ Optionally install to PATH:
 cargo install --path .
 ```
 
-AVX-512 is used when available on the host CPU; falls back to AVX2 automatically.
+Runs natively on Linux x86_64, macOS x86_64, and macOS Apple Silicon (aarch64). SIMD acceleration is automatic: AVX-512 on x86, NEON on ARM.
 
 ### Genetic maps
 
@@ -246,7 +246,7 @@ Two engines are available, selected automatically based on variant density:
 Models each haplotype independently through three parallel HMM channels operating on 280 mosaic composite haplotypes constructed via coded-step PBWT IBS matching. Phase is resolved through a greedy swap criterion comparing forward-backward posteriors across channels. Convergence is deterministic over 15 iterations (3 burn-in + 12 phasing with decreasing likelihood-ratio thresholds). Recommended for chip arrays (up to 50,000 variants).
 
 **Diploid engine** (`--phasing-engine diploid`).
-Models the pair of haplotypes jointly via a genotype graph whose segments encode all possible local diplotype configurations. A segment-based Li-Stephens HMM computes diplotype transition probabilities across conditioning haplotypes selected by positional PBWT. Phase is resolved via MCMC sampling on the genotype graph with iterative pruning (5 burn-in, 3 prune, 5 main iterations, final Viterbi solve). The HMM forward pass is AVX-512 accelerated. Recommended for whole-genome sequencing data (more than 50,000 variants).
+Models the pair of haplotypes jointly via a genotype graph whose segments encode all possible local diplotype configurations. A segment-based Li-Stephens HMM computes diplotype transition probabilities across conditioning haplotypes selected by positional PBWT. Phase is resolved via MCMC sampling on the genotype graph with iterative pruning (5 burn-in, 3 prune, 5 main iterations, final Viterbi solve). The HMM forward pass is SIMD-accelerated (AVX2 on x86, NEON on Apple Silicon). Recommended for whole-genome sequencing data (more than 50,000 variants).
 
 ### Imputation
 
@@ -272,11 +272,11 @@ Single binary file (magic `SRP\0`, version 2) with sequential length-prefixed se
 | Original IDs | Original VCF IDs / rsIDs (zstd) |
 | Contig field | VCF contig header line |
 | Tile index | Offset + compressed size for each 2D tile |
-| Tile data | LZ4-compressed sparse tiles (1024 rows × N haplotype bands) |
+| Tile data | zstd-3 compressed sparse tiles (1024 rows × 4096 haplotype bands) |
 
-Tiles are 2D blocks (1024 variants × haplotype bands) stored as LZ4-compressed sparse format, designed for L2-cache-friendly sequential access during interpolation. The tiled layout enables batch-parallel decompression with double-buffered I/O (decompress batch N+1 while computing batch N).
+Tiles are 2D blocks (1024 variants × 4096 haplotypes) stored as zstd-compressed CSC sparse format, designed for L2-cache-friendly sequential access during interpolation. The tiled layout enables batch-parallel decompression with double-buffered I/O (decompress batch N+1 while computing batch N).
 
-SRP files are created from VCF, BCF, or BREF3 using `--prepare-reference-from`. The entire creation pipeline is pure Rust with zero external dependencies. The BCF reader uses parallel regional reads with CSI index seeking (tested up to 171,054 haplotypes).
+SRP creation is fully streaming — reference panels of any size can be built with minimal memory (340 MB for chr1 1KG, down from 37 GB). The BCF reader uses parallel regional reads with CSI index seeking (tested up to 171,054 haplotypes). Memory usage is estimated at startup with a warning if system RAM is insufficient.
 
 ## Reference
 
