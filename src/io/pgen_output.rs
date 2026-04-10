@@ -41,13 +41,7 @@ pub struct PgenWriter {
     bytes_per_variant: usize, // ceil(n_samples / 4) for 2-bit packing
 }
 
-/// Encode dosage as 16-bit unsigned: 0x0000=0.0, 0x8000=2.0.
-/// Reserved for future PGEN mode 0x10 (dosage support).
-#[inline]
-#[allow(dead_code)]
-fn dosage_to_u16(ds: f32) -> u16 {
-    (ds.clamp(0.0, 2.0) * 16384.0).round() as u16
-}
+
 
 impl PgenWriter {
     /// Create a new PGEN writer. Writes the header immediately.

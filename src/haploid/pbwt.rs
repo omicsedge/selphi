@@ -503,34 +503,6 @@ pub fn pbwt_coded_ibs_bwd_batch(
 // Initial PBWT phasing 
 // ============================================================
 
-/// PBWT prefix-sort update (pbwtCursorForwardsAD).
-#[allow(dead_code)]
-fn pbwt_forwards_ad(a: &mut [i32], d: &mut [i32], y: &[u8], b: &mut [i32], e: &mut [i32], m_total: usize, k: usize) {
-    let mut u = 0usize;
-    let mut v = 0usize;
-    let mut p = k as i32 + 1;
-    let mut q = k as i32 + 1;
-    for i in 0..m_total {
-        if d[i] > p { p = d[i]; }
-        if d[i] > q { q = d[i]; }
-        if y[i] == 0 {
-            a[u] = a[i];
-            d[u] = p;
-            u += 1;
-            p = 0;
-        } else {
-            b[v] = a[i];
-            e[v] = q;
-            v += 1;
-            q = 0;
-        }
-    }
-    a[u..(v + u)].copy_from_slice(&b[..v]);
-    d[u..(v + u)].copy_from_slice(&e[..v]);
-    d[0] = k as i32 + 2;
-    d[m_total] = k as i32 + 2;
-}
-
 /// Phase one marker using PBWT neighbor voting .
 fn pbwt_rec_phase_marker(a: &[i32], n_haps: usize, n_targ_samples: usize,
                           alleles: &mut [i32], unph_het: &mut [bool]) {

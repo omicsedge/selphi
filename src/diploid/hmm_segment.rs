@@ -1228,20 +1228,6 @@ impl SegmentHmm {
         }
     }
 
-    #[allow(dead_code)]
-    fn compute_d_probs_mult(&mut self) -> bool {
-        let mut sum = 0.0f64;
-        for d in 0..64 {
-            let h0 = dip_hap0(d);
-            let h1 = dip_hap1(d);
-            let p = self.h_probs[h0 * HAP_NUMBER + h1] as f64;
-            self.d_probs[d] = p;
-            sum += p;
-        }
-        // Check for underflow
-        sum > 1e-300
-    }
-
     // -----------------------------------------------------------------------
     // FORWARD PASS
     // -----------------------------------------------------------------------
