@@ -474,94 +474,35 @@ pub fn build_srp_from_bref3(
 ) -> Result<(), SrpWriterError> {
     use super::bref3;
 
-    selphi_step!("Reading BREF3 file...");
-    let bref_data = bref3::read_bref3(source_path)
+    // --- Pass 1: stream BREF3 to count variants and collect metadata ---
+    selphi_step!("Scanning BREF3 file...");
+    let mut stream = bref3::open_bref3_stream(source_path)
         .map_err(|e| SrpWriterError::InvalidInput(e))?;
-
-    let sample_ids = bref_data.sample_ids;
+    let sample_ids = stream.sample_ids.clone();
     let n_samples = sample_ids.len();
     let n_haps = n_samples * 2;
 
-    let chunk_size = if chunk_size_override > 0 { chunk_size_override }
-        else { auto_chunk_size(bref_data.variants.len(), n_haps) };
-
-    let mut variants: Vec<VariantRecord> = Vec::new();
-    let mut chunk_col_lists: Vec<Vec<Vec<i32>>> = Vec::new();
-    let mut current_cols: Vec<Vec<i32>> = vec![Vec::new(); n_haps];
-    let mut row = 0usize;
-    let mut n_multi = 0usize;
-
-    for v in &bref_data.variants {
-        if v.alt_alleles.len() > 1 { n_multi += 1; }
-
-        for (h, &a) in v.alleles.iter().enumerate() {
-            if a > 0 { current_cols[h].push(row as i32); }
-        }
-        variants.push(VariantRecord {
-            chrom: v.chrom.clone(), pos: v.pos as i64,
-            ref_allele: v.ref_allele.clone(),
-            alt_allele: v.alt_alleles.first().cloned().unwrap_or_default(),
-            original_id: v.id.clone(),
-        });
-        row += 1;
-        if row >= chunk_size {
-            chunk_col_lists.push(std::mem::replace(&mut current_cols, vec![Vec::new(); n_haps]));
-            row = 0;
-        }
-    }
-    if row > 0 { chunk_col_lists.push(current_cols); }
-
-    let n_variants = variants.len();
-    if n_variants == 0 { return Err(SrpWriterError::NoVariants); }
-
-    let chromosome = variants[0].chrom.clone();
-    selphi_info!("  samples:  {} ({} haplotypes)", n_samples, n_haps);
-    selphi_info!("  variants: {} (chr{}, {}–{}{})", n_variants, chromosome,
-        variants[0].pos, variants[n_variants - 1].pos,
-        if n_multi > 0 { format!(", {} multi-allelic", n_multi) } else { String::new() });
-
-    let contig_field = format!("##contig=<ID={}>", chromosome);
-
-    // Compress CSC chunks
-    let n_chunks = chunk_col_lists.len();
-    selphi_info!("  chunks:   {} (chunk_size={})", n_chunks, chunk_size);
-    selphi_step!("Compressing {} chunks ({} threads)...", n_chunks, rayon::current_num_threads());
-
-    let mut row_counts: Vec<usize> = Vec::with_capacity(n_chunks);
-    for ci in 0..n_chunks {
-        row_counts.push(if ci < n_chunks - 1 { chunk_size } else { n_variants - (n_chunks - 1) * chunk_size });
-    }
-
-    let compressed_chunks: Vec<Vec<u8>> = chunk_col_lists
-        .into_par_iter()
-        .enumerate()
-        .map(|(ci, col_lists)| {
-            let n_vars = row_counts[ci];
-            let mut indptr = Vec::with_capacity(n_haps + 1);
-            let mut indices = Vec::new();
-            indptr.push(0i32);
-            for col in &col_lists { indices.extend_from_slice(col); indptr.push(indices.len() as i32); }
-            let nnz = indices.len();
-            let mut raw = Vec::with_capacity(12 + (n_haps + 1) * 4 + nnz * 4);
-            raw.extend_from_slice(&(n_vars as i32).to_le_bytes());
-            raw.extend_from_slice(&(n_haps as i32).to_le_bytes());
-            raw.extend_from_slice(&(nnz as i32).to_le_bytes());
-            for &v in &indptr { raw.extend_from_slice(&v.to_le_bytes()); }
-            for &v in &indices { raw.extend_from_slice(&v.to_le_bytes()); }
-            zstd::encode_all(Cursor::new(&raw), 3).expect("zstd failed")
-        })
-        .collect();
-
-    // Build variant metadata
-    let mut vbin = Vec::with_capacity(n_variants * 20);
-    let mut ids = Vec::with_capacity(n_variants * 30);
-    let mut orig_ids = Vec::with_capacity(n_variants * 20);
+    let mut n_variants = 0usize;
+    let mut chromosome = String::new();
+    let mut min_pos: i64 = i64::MAX;
+    let mut max_pos: i64 = i64::MIN;
+    let mut vbin = Vec::new();
+    let mut ids = Vec::new();
+    let mut orig_ids = Vec::new();
     let mut first_id = true;
-    for v in &variants {
-        let chr_b = v.chrom.as_bytes();
-        let ref_b = v.ref_allele.as_bytes();
-        let alt_b = v.alt_allele.as_bytes();
-        vbin.extend_from_slice(&v.pos.to_le_bytes());
+
+    while let Some((chrom, pos_i32, ref_allele, alt_allele, id)) =
+        stream.next_variant_meta_only().map_err(|e| SrpWriterError::InvalidInput(e))?
+    {
+        if chromosome.is_empty() { chromosome = chrom.clone(); }
+        let pos = pos_i32 as i64;
+        if pos < min_pos { min_pos = pos; }
+        if pos > max_pos { max_pos = pos; }
+
+        let chr_b = chrom.as_bytes();
+        let ref_b = ref_allele.as_bytes();
+        let alt_b = alt_allele.as_bytes();
+        vbin.extend_from_slice(&pos.to_le_bytes());
         vbin.push(chr_b.len().min(255) as u8);
         vbin.push(ref_b.len().min(255) as u8);
         vbin.push(alt_b.len().min(255) as u8);
@@ -570,22 +511,99 @@ pub fn build_srp_from_bref3(
         vbin.extend_from_slice(&alt_b[..alt_b.len().min(255)]);
 
         if !first_id { ids.push(b'\n'); orig_ids.push(b'\n'); }
-        ids.extend_from_slice(format!("{}-{}-{}-{}", v.chrom, v.pos, v.ref_allele, v.alt_allele).as_bytes());
-        orig_ids.extend_from_slice(v.original_id.as_bytes());
+        ids.extend_from_slice(format!("{}-{}-{}-{}", chrom, pos, ref_allele, alt_allele).as_bytes());
+        orig_ids.extend_from_slice(id.as_bytes());
         first_id = false;
+        n_variants += 1;
+    }
+    drop(stream);
+    if n_variants == 0 { return Err(SrpWriterError::NoVariants); }
+
+    let chunk_size = if chunk_size_override > 0 { chunk_size_override }
+        else { auto_chunk_size(n_variants, n_haps) };
+    let n_chunks = (n_variants + chunk_size - 1) / chunk_size;
+    let mut row_counts: Vec<usize> = Vec::with_capacity(n_chunks);
+    for ci in 0..n_chunks {
+        row_counts.push(if ci < n_chunks - 1 { chunk_size } else { n_variants - (n_chunks - 1) * chunk_size });
     }
 
+    selphi_info!("  samples:  {} ({} haplotypes)", n_samples, n_haps);
+    selphi_info!("  variants: {} (chr{}, {}–{})", n_variants, chromosome, min_pos, max_pos);
+    selphi_info!("  chunks:   {} (chunk_size={})", n_chunks, chunk_size);
+
+    let contig_field = format!("##contig=<ID={}>", chromosome);
     let srp_path = if output_path.extension().map_or(true, |e| e != "srp") {
         output_path.with_extension("srp")
     } else { output_path.to_path_buf() };
 
-    write_tiles_and_assemble(UnifiedSrpData {
-        compressed_chunks, row_counts, n_variants, n_haps,
-        n_samples: n_haps / 2, chunk_size,
-        chromosome, min_pos: variants[0].pos, max_pos: variants[n_variants - 1].pos,
-        contig_field, sample_names: sample_ids,
-        vbin, ids, orig_ids,
-    }, &srp_path)
+    // --- Pass 2: direct scatter + batched parallel compression ---
+    // Read BREF3 sequentially, scatter to per-column stripe buffers.
+    // Batch complete stripes, compress ALL tiles in one rayon dispatch.
+    selphi_step!("Streaming BREF3 → tiles ({} threads)...", rayon::current_num_threads());
+
+    let n_stripes = (n_variants + super::TILE_ROWS - 1) / super::TILE_ROWS;
+    let batch_size = (rayon::current_num_threads() * 4).max(16);
+
+    let mut tile_writer = StreamingTileWriter::new(&srp_path, &SrpMetadataForWrite {
+        n_variants, n_haps, n_samples, n_chunks, chunk_size,
+        row_counts: row_counts.clone(),
+        chromosome, min_pos, max_pos, contig_field,
+        sample_names: sample_ids, vbin, ids, orig_ids,
+    })?;
+
+    let t0 = std::time::Instant::now();
+    let mut stripe_cols: Vec<Vec<u16>> = (0..n_haps).map(|_| Vec::new()).collect();
+    let mut current_stripe = 0usize;
+    let mut stripes_flushed = 0usize;
+    // Batch buffer: completed stripes waiting for parallel compression.
+    // Each entry: (stripe_id, Vec<Vec<u16>> columns)
+    let mut pending_stripes: Vec<(usize, Vec<Vec<u16>>)> = Vec::with_capacity(batch_size);
+
+    let mut stream2 = bref3::open_bref3_stream(source_path)
+        .map_err(|e| SrpWriterError::InvalidInput(e))?;
+    let mut vi = 0usize;
+
+    while let Some(v) = stream2.next_variant().map_err(|e| SrpWriterError::InvalidInput(e))? {
+        let stripe = vi / super::TILE_ROWS;
+        let local_row = (vi % super::TILE_ROWS) as u16;
+
+        // If we moved to a new stripe, save the completed one to batch
+        if stripe > current_stripe {
+            let completed = std::mem::replace(
+                &mut stripe_cols,
+                (0..n_haps).map(|_| Vec::new()).collect(),
+            );
+            pending_stripes.push((current_stripe, completed));
+
+            // Flush batch when full: compress ALL tiles in parallel
+            if pending_stripes.len() >= batch_size {
+                flush_stripe_batch(&mut tile_writer, &mut pending_stripes, n_haps)?;
+                stripes_flushed += batch_size;
+                if stripes_flushed % 1000 < batch_size {
+                    eprintln!("  Stripe {}/{} ({:.1}s)", stripes_flushed, n_stripes, t0.elapsed().as_secs_f64());
+                }
+            }
+            current_stripe = stripe;
+        }
+
+        // Scatter: push row index to each alt haplotype's column
+        for (h, &a) in v.alleles.iter().enumerate() {
+            if a > 0 && h < n_haps {
+                stripe_cols[h].push(local_row);
+            }
+        }
+        vi += 1;
+    }
+    drop(stream2);
+
+    // Save last stripe
+    pending_stripes.push((current_stripe, stripe_cols));
+    // Flush remaining
+    flush_stripe_batch(&mut tile_writer, &mut pending_stripes, n_haps)?;
+
+    let file_size = tile_writer.finish()?;
+    selphi_step!("SRP written: {} ({:.1} MB)", srp_path.display(), file_size as f64 / 1e6);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -826,205 +844,281 @@ pub fn build_srp_unified(
     let all_row_counts: Vec<usize> = region_results.iter()
         .flat_map(|r| r.chunk_row_counts.iter().copied()).collect();
 
-    // Read compressed chunks from disk
-    let mut compressed_chunks: Vec<Vec<u8>> = Vec::with_capacity(total_chunks);
-    for rr in &region_results {
-        for cf in &rr.chunk_files {
-            compressed_chunks.push(std::fs::read(cf)?);
-        }
-    }
+    // Collect chunk file paths (in order) — data stays on disk
+    let chunk_files: Vec<std::path::PathBuf> = region_results.iter()
+        .flat_map(|rr| rr.chunk_files.iter().cloned()).collect();
 
-    write_tiles_and_assemble(UnifiedSrpData {
-        compressed_chunks, row_counts: all_row_counts, n_variants, n_haps,
-        n_samples: hdr.n_samples, chunk_size,
+    let srp_path = if output_path.extension().map_or(true, |e| e != "srp") {
+        output_path.with_extension("srp")
+    } else { output_path.to_path_buf() };
+
+    // Streaming tile writer: process chunks one at a time from disk
+    selphi_step!("Building tiles ({} threads)...", rayon::current_num_threads());
+    let n_stripes = (n_variants + super::TILE_ROWS - 1) / super::TILE_ROWS;
+    let batch_size = (rayon::current_num_threads() * 4).max(16);
+
+    let mut tile_writer = StreamingTileWriter::new(&srp_path, &SrpMetadataForWrite {
+        n_variants, n_haps, n_samples: hdr.n_samples, n_chunks: total_chunks, chunk_size,
+        row_counts: all_row_counts.clone(),
         chromosome, min_pos, max_pos,
         contig_field: hdr.contig_field, sample_names: hdr.sample_names,
         vbin, ids, orig_ids,
-    }, output_path)
+    })?;
+
+    let t0 = std::time::Instant::now();
+    let mut active: std::collections::BTreeMap<usize, Vec<Vec<u16>>> = std::collections::BTreeMap::new();
+    let mut var_offset = 0usize;
+    let mut pending_stripes: Vec<(usize, Vec<Vec<u16>>)> = Vec::with_capacity(batch_size);
+    let mut stripes_flushed = 0usize;
+
+    for (ci, cf) in chunk_files.iter().enumerate() {
+        let compressed = std::fs::read(cf)?;
+        let chunk = super::parse_raw_chunk(&compressed);
+        drop(compressed);
+        let chunk_end = var_offset + chunk.n_rows;
+        let last_stripe = if chunk_end > 0 { (chunk_end - 1) / super::TILE_ROWS } else { 0 };
+
+        // Scatter: for each column, filter rows by stripe
+        for gc in 0..chunk.n_cols.min(n_haps) {
+            let lo = chunk.indptr[gc] as usize;
+            let hi = chunk.indptr[gc + 1] as usize;
+            for k in lo..hi {
+                let row_in_chunk = chunk.indices[k] as usize;
+                let global_row = var_offset + row_in_chunk;
+                let stripe = global_row / super::TILE_ROWS;
+                let local_row = (global_row % super::TILE_ROWS) as u16;
+                let entry = active.entry(stripe)
+                    .or_insert_with(|| (0..n_haps).map(|_| Vec::new()).collect());
+                entry[gc].push(local_row);
+            }
+        }
+        var_offset = chunk_end;
+
+        // Flush stripes that are complete (no future chunk will touch them)
+        let next_first_stripe = if ci + 1 < total_chunks {
+            var_offset / super::TILE_ROWS
+        } else {
+            last_stripe + 1 // flush everything
+        };
+
+        let to_flush: Vec<usize> = active.keys().copied()
+            .take_while(|&s| s < next_first_stripe).collect();
+        for s in to_flush {
+            if let Some(cols) = active.remove(&s) {
+                pending_stripes.push((s, cols));
+            }
+        }
+        if pending_stripes.len() >= batch_size {
+            let flushed_now = pending_stripes.len();
+            flush_stripe_batch(&mut tile_writer, &mut pending_stripes, n_haps)?;
+            stripes_flushed += flushed_now;
+            if stripes_flushed % 1000 < batch_size {
+                eprintln!("  Stripe {}/{} ({:.1}s)", stripes_flushed, n_stripes, t0.elapsed().as_secs_f64());
+            }
+        }
+
+        if (ci + 1) % 200 == 0 || ci + 1 == total_chunks {
+            eprintln!("  Chunk {}/{} ({:.1}s)", ci + 1, total_chunks, t0.elapsed().as_secs_f64());
+        }
+    }
+
+    // Flush remaining active stripes
+    for (s, cols) in active {
+        pending_stripes.push((s, cols));
+    }
+    flush_stripe_batch(&mut tile_writer, &mut pending_stripes, n_haps)?;
+
+    let file_size = tile_writer.finish()?;
+    selphi_step!("SRP: {} ({:.1} MB)", srp_path.display(), file_size as f64 / 1e6);
+    Ok(())
 }
 
-/// Intermediate representation for building a unified SRP file.
-/// Both BCF and BREF3 paths produce this, then `write_tiles_and_assemble` writes the file.
-struct UnifiedSrpData {
-    compressed_chunks: Vec<Vec<u8>>,
-    row_counts: Vec<usize>,
+// ============================================================================
+// Streaming tile writer — writes tiles as stripes complete
+// ============================================================================
+
+/// Writes SRP tiles incrementally. Feed chunks one at a time; completed stripes
+/// are flushed to disk immediately, keeping only a small buffer of active stripes.
+struct StreamingTileWriter {
+    writer: std::io::BufWriter<std::fs::File>,
+    n_variants: usize,
+    n_tile_cols: usize,
+    /// Tile index: (offset, compressed_size) for each tile
+    tile_entries: Vec<(u64, u32)>,
+    /// File position where tile index starts (for seek-back)
+    tile_index_file_pos: u64,
+    /// Current write position
+    write_pos: u64,
+    /// Total tiles written to disk
+    tiles_written: u64,
+}
+
+impl StreamingTileWriter {
+    /// Create writer and write SRP header + metadata. Leaves file positioned for tiles.
+    fn new(
+        output_path: &std::path::Path,
+        metadata: &SrpMetadataForWrite,
+    ) -> Result<Self, SrpWriterError> {
+        use std::io::{Write, Seek, Cursor};
+
+        let n_tile_rows = (metadata.n_variants + super::TILE_ROWS - 1) / super::TILE_ROWS;
+        let n_tile_cols = (metadata.n_haps + super::TILE_COLS - 1) / super::TILE_COLS;
+        let n_tiles = n_tile_rows * n_tile_cols;
+
+        let meta_json = serde_json::json!({
+            "version": 2, "chromosome": metadata.chromosome, "n_variants": metadata.n_variants,
+            "n_haps": metadata.n_haps, "n_samples": metadata.n_samples,
+            "n_chunks": metadata.n_chunks, "chunk_size": metadata.chunk_size,
+            "chunk_row_counts": metadata.row_counts,
+            "min_position": metadata.min_pos, "max_position": metadata.max_pos,
+            "contig_field": metadata.contig_field,
+            "tile_rows": super::TILE_ROWS, "tile_cols": super::TILE_COLS,
+            "n_tile_rows": n_tile_rows, "n_tile_cols": n_tile_cols,
+        });
+        let meta_compressed = zstd::encode_all(Cursor::new(meta_json.to_string().as_bytes()), 3)?;
+        let vbin_compressed = zstd::encode_all(Cursor::new(&metadata.vbin), 3)?;
+        let sample_compressed = zstd::encode_all(
+            Cursor::new(metadata.sample_names.join("\n").as_bytes()), 3)?;
+        let ids_compressed = zstd::encode_all(Cursor::new(&metadata.ids), 3)?;
+        let orig_compressed = zstd::encode_all(Cursor::new(&metadata.orig_ids), 3)?;
+        let contig_bytes = metadata.contig_field.as_bytes();
+
+        let out = std::fs::File::create(output_path)?;
+        let mut w = std::io::BufWriter::with_capacity(4 << 20, out);
+
+        w.write_all(SRP_V2_MAGIC)?;
+        w.write_all(&(meta_compressed.len() as u32).to_le_bytes())?;
+        w.write_all(&meta_compressed)?;
+        w.write_all(&(vbin_compressed.len() as u32).to_le_bytes())?;
+        w.write_all(&vbin_compressed)?;
+        w.write_all(&(sample_compressed.len() as u32).to_le_bytes())?;
+        w.write_all(&sample_compressed)?;
+        w.write_all(&(ids_compressed.len() as u32).to_le_bytes())?;
+        w.write_all(&ids_compressed)?;
+        w.write_all(&(orig_compressed.len() as u32).to_le_bytes())?;
+        w.write_all(&orig_compressed)?;
+        w.write_all(&(contig_bytes.len() as u32).to_le_bytes())?;
+        w.write_all(contig_bytes)?;
+        w.write_all(&0u32.to_le_bytes())?; // n_chunks = 0 (tiled only)
+
+        let pos = w.stream_position().unwrap_or(0);
+        w.write_all(&(n_tiles as u32).to_le_bytes())?;
+        let tile_index_file_pos = pos + 4;
+        let tile_idx_size = (n_tiles * 12) as u64;
+        w.write_all(&vec![0u8; tile_idx_size as usize])?;
+        let write_pos = tile_index_file_pos + tile_idx_size;
+
+        Ok(Self {
+            writer: w,
+            n_variants: metadata.n_variants,
+            n_tile_cols,
+            tile_entries: vec![(0u64, 0u32); n_tiles],
+            tile_index_file_pos,
+            write_pos,
+            tiles_written: 0,
+        })
+    }
+
+    /// Finalize: flush writer and write the tile index. Returns file size.
+    fn finish(mut self) -> Result<u64, SrpWriterError> {
+        use std::io::{Write, Seek, SeekFrom};
+
+        self.writer.flush()?;
+
+        // Seek back and write tile index
+        let mut file = self.writer.into_inner().map_err(|e| SrpWriterError::Io(e.into_error()))?;
+        file.seek(SeekFrom::Start(self.tile_index_file_pos))?;
+        for &(offset, comp_size) in &self.tile_entries {
+            file.write_all(&offset.to_le_bytes())?;
+            file.write_all(&comp_size.to_le_bytes())?;
+        }
+        file.flush()?;
+
+        let file_size = file.metadata()?.len();
+        let tile_total: u64 = self.tile_entries.iter().map(|&(_, sz)| sz as u64).sum();
+        selphi_step!("SRP: tiles={:.1} MB, file={:.1} MB",
+            tile_total as f64 / 1e6, file_size as f64 / 1e6);
+        Ok(file_size)
+    }
+}
+
+/// Metadata needed to write the SRP header (shared by all source paths).
+struct SrpMetadataForWrite {
     n_variants: usize,
     n_haps: usize,
     n_samples: usize,
+    n_chunks: usize,
     chunk_size: usize,
+    row_counts: Vec<usize>,
     chromosome: String,
     min_pos: i64,
     max_pos: i64,
     contig_field: String,
     sample_names: Vec<String>,
-    vbin: Vec<u8>,        // binary variant records
-    ids: Vec<u8>,         // newline-separated chr-pos-ref-alt
-    orig_ids: Vec<u8>,    // newline-separated original IDs
+    vbin: Vec<u8>,
+    ids: Vec<u8>,
+    orig_ids: Vec<u8>,
 }
 
-/// Build tiles from compressed CSC chunks and write the unified SRP file.
-fn write_tiles_and_assemble(
-    data: UnifiedSrpData,
-    output_path: &Path,
+/// Compress ALL tiles from multiple stripes in one rayon dispatch, then write to disk.
+fn flush_stripe_batch(
+    tile_writer: &mut StreamingTileWriter,
+    pending: &mut Vec<(usize, Vec<Vec<u16>>)>,
+    n_haps: usize,
 ) -> Result<(), SrpWriterError> {
-    use super::{SparseTile, TILE_ROWS, TILE_COLS, parse_raw_chunk};
-    use std::io::{Seek, SeekFrom, BufWriter, Cursor};
+    use super::{SparseTile, TILE_ROWS, TILE_COLS};
+    use std::io::Cursor;
 
-    let n_tile_rows = (data.n_variants + TILE_ROWS - 1) / TILE_ROWS;
-    let n_tile_cols = (data.n_haps + TILE_COLS - 1) / TILE_COLS;
-    let n_tiles = n_tile_rows * n_tile_cols;
-    let total_chunks = data.compressed_chunks.len();
+    if pending.is_empty() { return Ok(()); }
 
-    selphi_step!("Building tiles ({} tiles)...", n_tiles);
-    let mut tile_data: Vec<Vec<u8>> = vec![Vec::new(); n_tiles];
-    let t0 = std::time::Instant::now();
+    let n_tile_cols = tile_writer.n_tile_cols;
+    let n_variants = tile_writer.n_variants;
 
-    let chunk_var_starts: Vec<usize> = {
-        let mut starts = Vec::with_capacity(total_chunks);
-        let mut cum = 0;
-        for rc in &data.row_counts { starts.push(cum); cum += rc; }
-        starts
-    };
+    // Build list of all (stripe_idx_in_batch, stripe_id, band) tasks
+    let mut tasks: Vec<(usize, usize, usize)> = Vec::new();
+    for (i, (stripe_id, _)) in pending.iter().enumerate() {
+        for band in 0..n_tile_cols {
+            tasks.push((i, *stripe_id, band));
+        }
+    }
 
-    for cid in 0..total_chunks {
-        let chunk = parse_raw_chunk(&data.compressed_chunks[cid]);
-        let chunk_var_start = chunk_var_starts[cid];
-        let chunk_var_end = chunk_var_start + chunk.n_rows;
-        let first_stripe = chunk_var_start / TILE_ROWS;
-        let last_stripe = (chunk_var_end - 1) / TILE_ROWS;
+    // Compress ALL tiles in parallel
+    let results: Vec<(usize, usize, Vec<u8>)> = tasks.into_par_iter().map(|(batch_idx, stripe_id, band)| {
+        let stripe_cols = &pending[batch_idx].1;
+        let svs = stripe_id * TILE_ROWS;
+        let n_rows = (TILE_ROWS.min(n_variants - svs)) as u16;
+        let col_start = band * TILE_COLS;
+        let col_end = (col_start + TILE_COLS).min(n_haps);
+        let n_cols = col_end - col_start;
 
-        for stripe in first_stripe..=last_stripe {
-            let stripe_var_start = stripe * TILE_ROWS;
-            let stripe_var_end = (stripe_var_start + TILE_ROWS).min(data.n_variants);
-            let ov_start = chunk_var_start.max(stripe_var_start);
-            let ov_end = chunk_var_end.min(stripe_var_end);
-            if ov_start >= ov_end { continue; }
-            let n_rows = stripe_var_end - stripe_var_start;
-
-            let band_tiles: Vec<(usize, Vec<u8>)> = (0..n_tile_cols).into_par_iter().map(|band| {
-                let col_start = band * TILE_COLS;
-                let col_end = (col_start + TILE_COLS).min(data.n_haps);
-                let n_cols = col_end - col_start;
-                let mut indptr = Vec::with_capacity(n_cols + 1);
-                let mut indices = Vec::new();
-                indptr.push(0u32);
-                for lc in 0..n_cols {
-                    let gc = col_start + lc;
-                    if gc < chunk.n_cols {
-                        let lo = chunk.indptr[gc] as usize;
-                        let hi = chunk.indptr[gc + 1] as usize;
-                        let rs = &chunk.indices[lo..hi];
-                        let lov = (ov_start - chunk_var_start) as i32;
-                        let hiv = (ov_end - chunk_var_start) as i32;
-                        let si = rs.partition_point(|&r| r < lov);
-                        for k in si..rs.len() {
-                            let r = rs[k];
-                            if r >= hiv { break; }
-                            indices.push((chunk_var_start + r as usize - stripe_var_start) as u16);
-                        }
-                    }
-                    indptr.push(indices.len() as u32);
-                }
-                let tile = SparseTile { indptr, indices, n_rows: n_rows as u16, n_cols: n_cols as u16 };
-                (band, zstd::encode_all(Cursor::new(&tile.to_bytes()), 3).unwrap())
-            }).collect();
-
-            for (band, tdata) in band_tiles {
-                let idx = stripe * n_tile_cols + band;
-                if tile_data[idx].is_empty() {
-                    tile_data[idx] = tdata;
-                } else {
-                    let existing = SparseTile::from_bytes(&zstd::decode_all(Cursor::new(&tile_data[idx])).unwrap());
-                    let new_part = SparseTile::from_bytes(&zstd::decode_all(Cursor::new(&tdata)).unwrap());
-                    let nc = existing.n_cols as usize;
-                    let mut mi = Vec::with_capacity(nc + 1);
-                    let mut mx = Vec::new();
-                    mi.push(0u32);
-                    for c in 0..nc {
-                        let (elo, ehi) = existing.col_range(c);
-                        for k in elo..ehi { mx.push(existing.indices[k]); }
-                        let (nlo, nhi) = new_part.col_range(c);
-                        for k in nlo..nhi { mx.push(new_part.indices[k]); }
-                        let s = mi.last().copied().unwrap() as usize;
-                        mx[s..].sort_unstable();
-                        mi.push(mx.len() as u32);
-                    }
-                    let merged = SparseTile { indptr: mi, indices: mx, n_rows: existing.n_rows, n_cols: existing.n_cols };
-                    tile_data[idx] = zstd::encode_all(Cursor::new(&merged.to_bytes()), 3).unwrap();
-                }
+        let mut indptr = Vec::with_capacity(n_cols + 1);
+        let mut indices = Vec::new();
+        indptr.push(0u32);
+        for lc in 0..n_cols {
+            let gc = col_start + lc;
+            if gc < stripe_cols.len() {
+                indices.extend_from_slice(&stripe_cols[gc]);
             }
+            indptr.push(indices.len() as u32);
         }
-        if (cid + 1) % 200 == 0 || cid + 1 == total_chunks {
-            eprintln!("  Tiles: chunk {}/{} ({:.1}s)", cid + 1, total_chunks, t0.elapsed().as_secs_f64());
-        }
+        let tile = SparseTile { indptr, indices, n_rows, n_cols: n_cols as u16 };
+        let compressed = zstd::encode_all(Cursor::new(&tile.to_bytes()), 3).unwrap();
+        (stripe_id, band, compressed)
+    }).collect();
+
+    // Write all compressed tiles to disk in order
+    // Sort by (stripe_id, band) to maintain file order
+    let mut sorted = results;
+    sorted.sort_by_key(|&(s, b, _)| (s, b));
+    for (stripe_id, band, tdata) in sorted {
+        let idx = stripe_id * n_tile_cols + band;
+        tile_writer.tile_entries[idx] = (tile_writer.write_pos, tdata.len() as u32);
+        tile_writer.writer.write_all(&tdata)?;
+        tile_writer.write_pos += tdata.len() as u64;
+        tile_writer.tiles_written += 1;
     }
 
-    // Write unified SRP file
-    selphi_step!("Writing unified SRP...");
-    let meta_json = serde_json::json!({
-        "version": 2, "chromosome": data.chromosome, "n_variants": data.n_variants,
-        "n_haps": data.n_haps, "n_samples": data.n_samples,
-        "n_chunks": total_chunks, "chunk_size": data.chunk_size,
-        "chunk_row_counts": data.row_counts,
-        "min_position": data.min_pos, "max_position": data.max_pos,
-        "contig_field": data.contig_field,
-        "tile_rows": TILE_ROWS, "tile_cols": TILE_COLS,
-        "n_tile_rows": n_tile_rows, "n_tile_cols": n_tile_cols,
-    });
-    let meta_compressed = zstd::encode_all(Cursor::new(meta_json.to_string().as_bytes()), 3)?;
-    let vbin_compressed = zstd::encode_all(Cursor::new(&data.vbin), 3)?;
-    let sample_compressed = zstd::encode_all(Cursor::new(data.sample_names.join("\n").as_bytes()), 3)?;
-    let ids_compressed = zstd::encode_all(Cursor::new(&data.ids), 3)?;
-    let orig_compressed = zstd::encode_all(Cursor::new(&data.orig_ids), 3)?;
-    let contig_bytes = data.contig_field.as_bytes();
-
-    let out = std::fs::File::create(output_path)?;
-    let mut w = BufWriter::with_capacity(4 << 20, out);
-
-    w.write_all(SRP_V2_MAGIC)?;
-    w.write_all(&(meta_compressed.len() as u32).to_le_bytes())?;
-    w.write_all(&meta_compressed)?;
-    w.write_all(&(vbin_compressed.len() as u32).to_le_bytes())?;
-    w.write_all(&vbin_compressed)?;
-    w.write_all(&(sample_compressed.len() as u32).to_le_bytes())?;
-    w.write_all(&sample_compressed)?;
-    w.write_all(&(ids_compressed.len() as u32).to_le_bytes())?;
-    w.write_all(&ids_compressed)?;
-    w.write_all(&(orig_compressed.len() as u32).to_le_bytes())?;
-    w.write_all(&orig_compressed)?;
-    w.write_all(&(contig_bytes.len() as u32).to_le_bytes())?;
-    w.write_all(contig_bytes)?;
-    w.write_all(&0u32.to_le_bytes())?; // n_chunks = 0 (tiled only)
-
-    let mut pos = w.stream_position().unwrap_or(0);
-    w.write_all(&(n_tiles as u32).to_le_bytes())?;
-    let tile_index_file_pos = (pos + 4) as usize;
-    let tile_idx_size = n_tiles * 12;
-    w.write_all(&vec![0u8; tile_idx_size])?;
-
-    struct TileEntry2 { offset: u64, comp_size: u32 }
-    let mut tile_entries = Vec::with_capacity(n_tiles);
-    pos = (tile_index_file_pos + tile_idx_size) as u64;
-    for td in &tile_data {
-        tile_entries.push(TileEntry2 { offset: pos, comp_size: td.len() as u32 });
-        w.write_all(td)?;
-        pos += td.len() as u64;
-    }
-    w.flush()?;
-    drop(w);
-
-    let mut file = std::fs::OpenOptions::new().write(true).open(output_path)?;
-    file.seek(SeekFrom::Start(tile_index_file_pos as u64))?;
-    for e in &tile_entries {
-        file.write_all(&e.offset.to_le_bytes())?;
-        file.write_all(&e.comp_size.to_le_bytes())?;
-    }
-    file.flush()?;
-
-    let file_size = std::fs::metadata(output_path)?.len();
-    let tile_total: u64 = tile_data.iter().map(|t| t.len() as u64).sum();
-    selphi_step!("SRP: {} ({:.1} MB, tiles={:.1} MB)",
-        output_path.display(), file_size as f64 / 1e6, tile_total as f64 / 1e6);
+    pending.clear();
     Ok(())
 }
 
@@ -1035,175 +1129,7 @@ fn auto_chunk_size(n_variants: usize, n_haps: usize) -> usize {
     cs.max((n_variants + 1999) / 2000).clamp(1000, 50000)
 }
 
-/// Convert any SrpReader (v1 ZIP, etc) to unified SRP format.
-/// Reads chunks from source, builds tiles, writes single .srp file.
-pub fn convert_to_unified(
-    source: &super::reader::SrpReader,
-    output_path: &Path,
-)  -> Result<(), SrpWriterError> {
-    use super::{SparseTile, TILE_ROWS, TILE_COLS};
-    use std::io::{Seek, SeekFrom, BufWriter};
-
-    let n_variants = source.metadata.n_variants;
-    let n_haps = source.metadata.n_haps;
-    let chunk_size = source.metadata.chunk_size;
-    let n_chunks = source.metadata.n_chunks;
-    let n_tile_rows = (n_variants + TILE_ROWS - 1) / TILE_ROWS;
-    let n_tile_cols = (n_haps + TILE_COLS - 1) / TILE_COLS;
-    let n_tiles = n_tile_rows * n_tile_cols;
-
-    selphi_step!("Building tiles ({} tiles)...", n_tiles);
-
-    // Build tiles from chunks
-    let mut tile_data: Vec<Vec<u8>> = vec![Vec::new(); n_tiles];
-    let t0 = std::time::Instant::now();
-    let mut chunk_var_start = 0usize;
-
-    for cid in 0..n_chunks {
-        let chunk = source.load_chunk_from_source(cid);
-        let chunk_var_end = chunk_var_start + chunk.n_rows;
-        let first_stripe = chunk_var_start / TILE_ROWS;
-        let last_stripe = (chunk_var_end - 1) / TILE_ROWS;
-
-        for stripe in first_stripe..=last_stripe {
-            let svs = stripe * TILE_ROWS;
-            let sve = (svs + TILE_ROWS).min(n_variants);
-            let ov_s = chunk_var_start.max(svs);
-            let ov_e = chunk_var_end.min(sve);
-            if ov_s >= ov_e { continue; }
-            let n_rows = sve - svs;
-
-            let band_tiles: Vec<(usize, Vec<u8>)> = (0..n_tile_cols).into_par_iter().map(|band| {
-                let cs = band * TILE_COLS;
-                let ce = (cs + TILE_COLS).min(n_haps);
-                let nc = ce - cs;
-                let mut indptr = Vec::with_capacity(nc + 1);
-                let mut indices = Vec::new();
-                indptr.push(0u32);
-                for lc in 0..nc {
-                    let gc = cs + lc;
-                    if gc < chunk.n_cols {
-                        let lo = chunk.indptr[gc] as usize;
-                        let hi = chunk.indptr[gc + 1] as usize;
-                        let rs = &chunk.indices[lo..hi];
-                        let lov = (ov_s - chunk_var_start) as i32;
-                        let hiv = (ov_e - chunk_var_start) as i32;
-                        let si = rs.partition_point(|&r| r < lov);
-                        for k in si..rs.len() {
-                            let r = rs[k];
-                            if r >= hiv { break; }
-                            indices.push((chunk_var_start + r as usize - svs) as u16);
-                        }
-                    }
-                    indptr.push(indices.len() as u32);
-                }
-                let tile = SparseTile { indptr, indices, n_rows: n_rows as u16, n_cols: nc as u16 };
-                (band, zstd::encode_all(Cursor::new(&tile.to_bytes()), 3).unwrap())
-            }).collect();
-
-            for (band, data) in band_tiles {
-                let idx = stripe * n_tile_cols + band;
-                if tile_data[idx].is_empty() {
-                    tile_data[idx] = data;
-                } else {
-                    let existing = SparseTile::from_bytes(&zstd::decode_all(Cursor::new(&tile_data[idx])).unwrap());
-                    let new_part = SparseTile::from_bytes(&zstd::decode_all(Cursor::new(&data)).unwrap());
-                    let nc = existing.n_cols as usize;
-                    let mut mi = Vec::with_capacity(nc + 1);
-                    let mut mx = Vec::new();
-                    mi.push(0u32);
-                    for c in 0..nc {
-                        let (elo, ehi) = existing.col_range(c);
-                        for k in elo..ehi { mx.push(existing.indices[k]); }
-                        let (nlo, nhi) = new_part.col_range(c);
-                        for k in nlo..nhi { mx.push(new_part.indices[k]); }
-                        let s = mi.last().copied().unwrap() as usize;
-                        mx[s..].sort_unstable();
-                        mi.push(mx.len() as u32);
-                    }
-                    let merged = SparseTile { indptr: mi, indices: mx, n_rows: existing.n_rows, n_cols: existing.n_cols };
-                    tile_data[idx] = zstd::encode_all(Cursor::new(&merged.to_bytes()), 3).unwrap();
-                }
-            }
-        }
-        chunk_var_start = chunk_var_end;
-        if (cid + 1) % 200 == 0 || cid + 1 == n_chunks {
-            eprintln!("  Tiles: chunk {}/{} ({:.1}s)", cid + 1, n_chunks, t0.elapsed().as_secs_f64());
-        }
-    }
-
-    // Write unified SRP
-    selphi_step!("Writing unified SRP...");
-    let meta_json = serde_json::json!({
-        "version": 2, "chromosome": source.metadata.chromosome,
-        "n_variants": n_variants, "n_haps": n_haps,
-        "n_chunks": 0, "chunk_size": chunk_size,
-        "min_position": source.metadata.min_position,
-        "max_position": source.metadata.max_position,
-        "contig_field": source.metadata.contig_field,
-        "tile_rows": TILE_ROWS, "tile_cols": TILE_COLS,
-        "n_tile_rows": n_tile_rows, "n_tile_cols": n_tile_cols,
-    });
-    let meta_comp = zstd::encode_all(Cursor::new(meta_json.to_string().as_bytes()), 3)?;
-
-    // Variants binary
-    let mut vbin = Vec::with_capacity(n_variants * 20);
-    for v in &source.variants {
-        vbin.extend_from_slice(&v.pos.to_le_bytes());
-        let cb = v.chr.as_bytes(); let rb = v.ref_allele.as_bytes(); let ab = v.alt_allele.as_bytes();
-        vbin.push(cb.len().min(255) as u8); vbin.push(rb.len().min(255) as u8); vbin.push(ab.len().min(255) as u8);
-        vbin.extend_from_slice(&cb[..cb.len().min(255)]);
-        vbin.extend_from_slice(&rb[..rb.len().min(255)]);
-        vbin.extend_from_slice(&ab[..ab.len().min(255)]);
-    }
-    let vbin_comp = zstd::encode_all(Cursor::new(&vbin), 3)?;
-    let sample_comp = zstd::encode_all(Cursor::new(source.sample_ids.join("\n").as_bytes()), 3)?;
-    let ids_comp = zstd::encode_all(Cursor::new(source.ids.join("\n").as_bytes()), 3)?;
-    let orig_comp = zstd::encode_all(Cursor::new(source.original_ids.join("\n").as_bytes()), 3)?;
-    let contig_bytes = source.metadata.contig_field.as_bytes();
-
-    let out = std::fs::File::create(output_path)?;
-    let mut w = BufWriter::with_capacity(4 << 20, out);
-    w.write_all(b"SRP\x00\x02\x00\x00\x00")?;
-    w.write_all(&(meta_comp.len() as u32).to_le_bytes())?; w.write_all(&meta_comp)?;
-    w.write_all(&(vbin_comp.len() as u32).to_le_bytes())?; w.write_all(&vbin_comp)?;
-    w.write_all(&(sample_comp.len() as u32).to_le_bytes())?; w.write_all(&sample_comp)?;
-    w.write_all(&(ids_comp.len() as u32).to_le_bytes())?; w.write_all(&ids_comp)?;
-    w.write_all(&(orig_comp.len() as u32).to_le_bytes())?; w.write_all(&orig_comp)?;
-    w.write_all(&(contig_bytes.len() as u32).to_le_bytes())?; w.write_all(contig_bytes)?;
-    w.write_all(&0u32.to_le_bytes())?; // n_chunks = 0
-
-    let mut pos = w.stream_position().unwrap_or(0);
-    w.write_all(&(n_tiles as u32).to_le_bytes())?;
-    let tile_idx_pos = (pos + 4) as usize;
-    let tile_idx_size = n_tiles * 12;
-    w.write_all(&vec![0u8; tile_idx_size])?;
-
-    struct TE { offset: u64, comp_size: u32 }
-    let mut entries = Vec::with_capacity(n_tiles);
-    pos = (tile_idx_pos + tile_idx_size) as u64;
-    for td in &tile_data {
-        entries.push(TE { offset: pos, comp_size: td.len() as u32 });
-        w.write_all(td)?;
-        pos += td.len() as u64;
-    }
-    w.flush()?;
-    drop(w);
-
-    let mut file = std::fs::OpenOptions::new().write(true).open(output_path)?;
-    file.seek(SeekFrom::Start(tile_idx_pos as u64))?;
-    for e in &entries {
-        file.write_all(&e.offset.to_le_bytes())?;
-        file.write_all(&e.comp_size.to_le_bytes())?;
-    }
-    file.flush()?;
-
-    let fsize = std::fs::metadata(output_path)?.len();
-    let ttotal: u64 = tile_data.iter().map(|t| t.len() as u64).sum();
-    selphi_step!("SRP: {} ({:.1} MB, tiles={:.1} MB)", output_path.display(), fsize as f64 / 1e6, ttotal as f64 / 1e6);
-    Ok(())
-}
-
 fn chrono_now() -> String {
     format!("{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
 }
+
