@@ -315,6 +315,41 @@ fn phase_genotypes_inner(
         }
         drop(init_phased);
 
+        // Rare-allele-aware: precompute carrier lists for low-MAF variants.
+        // For each low-MAF variant (target MAF < 1%), store ref haplotype indices
+        // that carry the alt allele. Used for IBS post-processing each iteration.
+        let low_maf_carriers: Vec<(usize, Vec<u32>)> = {
+            let target_an = (n_samples * 2) as f32;
+            let mut result = Vec::new();
+            for m in 0..w_size {
+                let mut ac = 0u32;
+                for si in 0..n_samples {
+                    ac += target_geno[(ws + m) * n_samples * 2 + si * 2] as u32;
+                    ac += target_geno[(ws + m) * n_samples * 2 + si * 2 + 1] as u32;
+                }
+                let mac = ac.min((n_samples * 2) as u32 - ac);
+                let maf = mac as f32 / target_an;
+                if maf > 0.0 && maf < 0.01 {
+                    let m_byte = m >> 3;
+                    let m_bit = m & 7;
+                    let mut carriers = Vec::new();
+                    for r in 0..n_ref {
+                        let h = n_targ_haps + r;
+                        if (w_hap_bits[h * hap_byte_stride + m_byte] >> m_bit) & 1 == 1 {
+                            carriers.push(h as u32);
+                        }
+                    }
+                    if !carriers.is_empty() {
+                        result.push((m, carriers));
+                    }
+                }
+            }
+            if !result.is_empty() {
+                selphi_debug!("  [rare-aware] W{}: {} low-MAF sites with carriers", wi+1, result.len());
+            }
+            result
+        };
+
         let w_bp = &chip_bp[ws..we];
         let w_cm = &window_gen_pos[wi];
         let own_start_local = ows - ws;
@@ -378,7 +413,7 @@ fn phase_genotypes_inner(
                 selphi_debug!("  [PBWT] n_batches={} steps_per_batch={} n_overlap={} n_steps={} fine={}",
                     it_nb, it_spb, it_overlap, it_n_steps, use_fine);
             }
-            let w_ibs = if it_nb <= 1 {
+            let mut w_ibs = if it_nb <= 1 {
                 if use_bwd {
                     pbwt::pbwt_coded_ibs_bwd_batch(
                         &w_precoded, &w_pre_na, n_ref,
@@ -441,6 +476,62 @@ fn phase_genotypes_inner(
                 debug::dump_ibs(it, wi, &w_ibs, it_n_steps, n_targ_haps, ds*2, ds*2+1);
             }
             let pbwt_ms = t_pbwt.elapsed().as_millis();
+
+            // Rare-allele injection: for each low-MAF het, if the PBWT-selected
+            // IBS match doesn't carry the rare allele, replace with a random carrier.
+            // This ensures the composite HMM has signal for phase determination.
+            if !low_maf_carriers.is_empty() {
+                let hbs = hap_byte_stride;
+                for &(m, ref carriers) in &low_maf_carriers {
+                    let step = it_starts.partition_point(|&s| (s as usize) <= m).saturating_sub(1);
+                    if step >= it_n_steps { continue; }
+
+                    let m_byte = m >> 3;
+                    let m_bit = m & 7;
+
+                    for si in 0..n_samples {
+                        if w_het_mask[m * n_samples + si] == 0 { continue; }
+
+                        for hi in 0..2usize {
+                            let t = si * 2 + hi;
+
+                            // Check if current match at center step already carries rare allele
+                            let center_idx = step * n_targ_haps + t;
+                            let cur_match = w_ibs[center_idx];
+                            if cur_match >= 0 {
+                                let match_allele = (w_hap_bits[cur_match as usize * hbs + m_byte] >> m_bit) & 1;
+                                if match_allele == 1 { continue; } // already a carrier
+                            }
+
+                            // Find best carrier by IBS at ±30 flanking variants
+                            let t_hap = &w_hap_bits[t * hbs..];
+                            let mut best_carrier = carriers[0];
+                            let mut best_ibs = 0u32;
+                            let flank_lo = m.saturating_sub(30);
+                            let flank_hi = (m + 31).min(w_size);
+                            for &c in carriers.iter() {
+                                let c_hap = &w_hap_bits[c as usize * hbs..];
+                                let mut ibs = 0u32;
+                                for fm in flank_lo..flank_hi {
+                                    if fm == m { continue; }
+                                    let fb = fm >> 3;
+                                    let fbit = fm & 7;
+                                    let t_a = (t_hap[fb] >> fbit) & 1;
+                                    let c_a = (c_hap[fb] >> fbit) & 1;
+                                    if t_a == c_a { ibs += 1; }
+                                }
+                                if ibs > best_ibs {
+                                    best_ibs = ibs;
+                                    best_carrier = c;
+                                }
+                            }
+
+                            // Inject carrier at the step containing the low-MAF variant
+                            w_ibs[center_idx] = best_carrier as i32;
+                        }
+                    }
+                }
+            }
 
             // --- EM (burnin only) ---
             // stores recombIntensity (f32) directly, uses up to 500 samples
