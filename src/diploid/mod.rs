@@ -236,7 +236,7 @@ fn _diploid_run(
     // For WGS, all target-polymorphic variants are in common_indices (MAC≥1).
     crate::selphi_debug!("  [diploid] phase_rare: skipped (bitmatrix path)");
 
-    // Confidence: 1.0 everywhere (proper confidence from Viterbi TODO)
+    // Confidence: 1.0 everywhere (diploid Viterbi confidence not yet implemented)
     let confidence = vec![1.0f32; n_var * n_samples];
 
     // No EM Ne estimation in diploid mode — let imputation use MAF-adaptive Ne
