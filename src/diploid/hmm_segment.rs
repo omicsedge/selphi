@@ -15,6 +15,8 @@
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 
 use super::params::{HAP_NUMBER, ED, EE};
 use super::genotype_graph::*;
@@ -116,6 +118,13 @@ unsafe fn divss(a: f32, b: f32) -> f32 { unsafe {
 #[inline(always)]
 fn divss(a: f32, b: f32) -> f32 {
     a / b
+}
+
+// NEON helper: horizontal sum of two float32x4_t (8 floats total)
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn neon_hsum8(lo: float32x4_t, hi: float32x4_t) -> f32 {
+    vaddvq_f32(vaddq_f32(lo, hi))
 }
 
 /// Segment HMM state for one sample in one window.
@@ -277,7 +286,43 @@ impl SegmentHmm {
             self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
                             + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let nt_div = divss(nt, self.prob_sum_t);
+            let yt_div = divss(yt, self.n_cond as f32 * self.prob_sum_t);
+            let _nt = vdupq_n_f32(nt_div);
+            let _factor = vdupq_n_f32(yt_div);
+            let mut _tfreq_lo = vld1q_f32(self.prob_sum_h.as_ptr());
+            let mut _tfreq_hi = vld1q_f32(self.prob_sum_h.as_ptr().add(4));
+            _tfreq_lo = vmulq_f32(_tfreq_lo, _factor);
+            _tfreq_hi = vmulq_f32(_tfreq_hi, _factor);
+            let _mismatch = vdupq_n_f32(MISMATCH);
+            let mut _sum_lo = vdupq_n_f32(0.0);
+            let mut _sum_hi = vdupq_n_f32(0.0);
+
+            let prob = &mut self.prob;
+            for k in 0..self.n_cond {
+                let base = k * HAP_NUMBER;
+                let ptr = prob[base..].as_mut_ptr();
+                let mut _prob_lo = vld1q_f32(ptr);
+                let mut _prob_hi = vld1q_f32(ptr.add(4));
+                _prob_lo = vfmaq_f32(_tfreq_lo, _prob_lo, _nt);
+                _prob_hi = vfmaq_f32(_tfreq_hi, _prob_hi, _nt);
+                if cond_alleles[k] != target_allele {
+                    _prob_lo = vmulq_f32(_prob_lo, _mismatch);
+                    _prob_hi = vmulq_f32(_prob_hi, _mismatch);
+                }
+                _sum_lo = vaddq_f32(_sum_lo, _prob_lo);
+                _sum_hi = vaddq_f32(_sum_hi, _prob_hi);
+                vst1q_f32(ptr, _prob_lo);
+                vst1q_f32(ptr.add(4), _prob_hi);
+            }
+
+            vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
+            vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
+            self.prob_sum_t = neon_hsum8(_sum_lo, _sum_hi);
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let nt_div = divss(nt, self.prob_sum_t);
             let yt_div = divss(yt, self.n_cond as f32 * self.prob_sum_t);
@@ -338,7 +383,43 @@ impl SegmentHmm {
             self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
                             + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let _nt = vdupq_n_f32(divss(nt, self.prob_sum_t));
+            let _factor = vdupq_n_f32(divss(yt, self.n_cond as f32 * self.prob_sum_t));
+            let mut _tfreq_lo = vld1q_f32(self.prob_sum_h.as_ptr());
+            let mut _tfreq_hi = vld1q_f32(self.prob_sum_h.as_ptr().add(4));
+            _tfreq_lo = vmulq_f32(_tfreq_lo, _factor);
+            _tfreq_hi = vmulq_f32(_tfreq_hi, _factor);
+            let _g0_lo = vld1q_f32(g0.as_ptr());
+            let _g0_hi = vld1q_f32(g0.as_ptr().add(4));
+            let _g1_lo = vld1q_f32(g1.as_ptr());
+            let _g1_hi = vld1q_f32(g1.as_ptr().add(4));
+            let mut _sum_lo = vdupq_n_f32(0.0);
+            let mut _sum_hi = vdupq_n_f32(0.0);
+
+            let prob = &mut self.prob;
+            for k in 0..self.n_cond {
+                let (_g_lo, _g_hi) = if cond_alleles[k] { (_g1_lo, _g1_hi) } else { (_g0_lo, _g0_hi) };
+                let base = k * HAP_NUMBER;
+                let ptr = prob[base..].as_mut_ptr();
+                let mut _prob_lo = vld1q_f32(ptr);
+                let mut _prob_hi = vld1q_f32(ptr.add(4));
+                _prob_lo = vfmaq_f32(_tfreq_lo, _prob_lo, _nt);
+                _prob_hi = vfmaq_f32(_tfreq_hi, _prob_hi, _nt);
+                _prob_lo = vmulq_f32(_prob_lo, _g_lo);
+                _prob_hi = vmulq_f32(_prob_hi, _g_hi);
+                _sum_lo = vaddq_f32(_sum_lo, _prob_lo);
+                _sum_hi = vaddq_f32(_sum_hi, _prob_hi);
+                vst1q_f32(ptr, _prob_lo);
+                vst1q_f32(ptr.add(4), _prob_hi);
+            }
+
+            vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
+            vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
+            self.prob_sum_t = neon_hsum8(_sum_lo, _sum_hi);
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let nt_div = divss(nt, self.prob_sum_t);
             let factor = divss(yt, self.n_cond as f32 * self.prob_sum_t);
@@ -384,7 +465,36 @@ impl SegmentHmm {
             self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
                             + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let _nt = vdupq_n_f32(divss(nt, self.prob_sum_t));
+            let _factor = vdupq_n_f32(divss(yt, self.n_cond as f32 * self.prob_sum_t));
+            let mut _tfreq_lo = vld1q_f32(self.prob_sum_h.as_ptr());
+            let mut _tfreq_hi = vld1q_f32(self.prob_sum_h.as_ptr().add(4));
+            _tfreq_lo = vmulq_f32(_tfreq_lo, _factor);
+            _tfreq_hi = vmulq_f32(_tfreq_hi, _factor);
+            let mut _sum_lo = vdupq_n_f32(0.0);
+            let mut _sum_hi = vdupq_n_f32(0.0);
+
+            let prob = &mut self.prob;
+            for k in 0..self.n_cond {
+                let base = k * HAP_NUMBER;
+                let ptr = prob[base..].as_mut_ptr();
+                let mut _prob_lo = vld1q_f32(ptr);
+                let mut _prob_hi = vld1q_f32(ptr.add(4));
+                _prob_lo = vfmaq_f32(_tfreq_lo, _prob_lo, _nt);
+                _prob_hi = vfmaq_f32(_tfreq_hi, _prob_hi, _nt);
+                _sum_lo = vaddq_f32(_sum_lo, _prob_lo);
+                _sum_hi = vaddq_f32(_sum_hi, _prob_hi);
+                vst1q_f32(ptr, _prob_lo);
+                vst1q_f32(ptr.add(4), _prob_hi);
+            }
+
+            vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
+            vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
+            self.prob_sum_t = neon_hsum8(_sum_lo, _sum_hi);
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let nt_div = divss(nt, self.prob_sum_t);
             let factor = divss(yt, self.n_cond as f32 * self.prob_sum_t);
@@ -448,7 +558,35 @@ impl SegmentHmm {
             self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
                             + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let _tfreq = vdupq_n_f32(divss(yt, self.n_cond as f32));
+            let _nt = vdupq_n_f32(divss(nt, self.prob_sum_t));
+            let _mismatch = vdupq_n_f32(MISMATCH);
+            let mut _sum_lo = vdupq_n_f32(0.0);
+            let mut _sum_hi = vdupq_n_f32(0.0);
+
+            for k in 0..self.n_cond {
+                let base = k * HAP_NUMBER;
+                let _pk = vdupq_n_f32(self.prob_sum_k[k]);
+                let mut _prob_lo = vfmaq_f32(_tfreq, _pk, _nt);
+                let mut _prob_hi = _prob_lo;
+                if cond_alleles[k] != target_allele {
+                    _prob_lo = vmulq_f32(_prob_lo, _mismatch);
+                    _prob_hi = vmulq_f32(_prob_hi, _mismatch);
+                }
+                _sum_lo = vaddq_f32(_sum_lo, _prob_lo);
+                _sum_hi = vaddq_f32(_sum_hi, _prob_hi);
+                let ptr = self.prob[base..].as_mut_ptr();
+                vst1q_f32(ptr, _prob_lo);
+                vst1q_f32(ptr.add(4), _prob_hi);
+            }
+
+            vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
+            vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
+            self.prob_sum_t = neon_hsum8(_sum_lo, _sum_hi);
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let tfreq_val = divss(yt, self.n_cond as f32);
             let nt_div = divss(nt, self.prob_sum_t);
@@ -502,7 +640,36 @@ impl SegmentHmm {
             self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
                             + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let _tfreq = vdupq_n_f32(divss(yt, self.n_cond as f32));
+            let _nt = vdupq_n_f32(divss(nt, self.prob_sum_t));
+            let _g0_lo = vld1q_f32(g0.as_ptr());
+            let _g0_hi = vld1q_f32(g0.as_ptr().add(4));
+            let _g1_lo = vld1q_f32(g1.as_ptr());
+            let _g1_hi = vld1q_f32(g1.as_ptr().add(4));
+            let mut _sum_lo = vdupq_n_f32(0.0);
+            let mut _sum_hi = vdupq_n_f32(0.0);
+
+            for k in 0..self.n_cond {
+                let (_g_lo, _g_hi) = if cond_alleles[k] { (_g1_lo, _g1_hi) } else { (_g0_lo, _g0_hi) };
+                let base = k * HAP_NUMBER;
+                let _pk = vdupq_n_f32(self.prob_sum_k[k]);
+                let _base_p = vfmaq_f32(_tfreq, _pk, _nt);
+                let _prob_lo = vmulq_f32(_base_p, _g_lo);
+                let _prob_hi = vmulq_f32(_base_p, _g_hi);
+                _sum_lo = vaddq_f32(_sum_lo, _prob_lo);
+                _sum_hi = vaddq_f32(_sum_hi, _prob_hi);
+                let ptr = self.prob[base..].as_mut_ptr();
+                vst1q_f32(ptr, _prob_lo);
+                vst1q_f32(ptr.add(4), _prob_hi);
+            }
+
+            vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
+            vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
+            self.prob_sum_t = neon_hsum8(_sum_lo, _sum_hi);
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let tfreq_val = divss(yt, self.n_cond as f32);
             let nt_div = divss(nt, self.prob_sum_t);
@@ -543,7 +710,29 @@ impl SegmentHmm {
             self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
                             + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let _tfreq = vdupq_n_f32(divss(yt, self.n_cond as f32));
+            let _nt = vdupq_n_f32(divss(nt, self.prob_sum_t));
+            let mut _sum_lo = vdupq_n_f32(0.0);
+            let mut _sum_hi = vdupq_n_f32(0.0);
+
+            for k in 0..self.n_cond {
+                let base = k * HAP_NUMBER;
+                let _pk = vdupq_n_f32(self.prob_sum_k[k]);
+                let _prob = vfmaq_f32(_tfreq, _pk, _nt);
+                _sum_lo = vaddq_f32(_sum_lo, _prob);
+                _sum_hi = vaddq_f32(_sum_hi, _prob);
+                let ptr = self.prob[base..].as_mut_ptr();
+                vst1q_f32(ptr, _prob);
+                vst1q_f32(ptr.add(4), _prob);
+            }
+
+            vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
+            vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
+            self.prob_sum_t = neon_hsum8(_sum_lo, _sum_hi);
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let tfreq_val = divss(yt, self.n_cond as f32);
             let nt_div = divss(nt, self.prob_sum_t);
@@ -672,7 +861,43 @@ impl SegmentHmm {
             self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
                             + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let nt_div = divss(nt, self.prob_sum_t);
+            let yt_div = divss(yt, self.n_cond as f32 * self.prob_sum_t);
+            let emit_match: [f32; 2] = if target_allele { [MISMATCH, 1.0] } else { [1.0, MISMATCH] };
+            let _nt = vdupq_n_f32(nt_div);
+            let _factor = vdupq_n_f32(yt_div);
+            let mut _tfreq_lo = vld1q_f32(self.prob_sum_h.as_ptr());
+            let mut _tfreq_hi = vld1q_f32(self.prob_sum_h.as_ptr().add(4));
+            _tfreq_lo = vmulq_f32(_tfreq_lo, _factor);
+            _tfreq_hi = vmulq_f32(_tfreq_hi, _factor);
+            let mut _sum_lo = vdupq_n_f32(0.0);
+            let mut _sum_hi = vdupq_n_f32(0.0);
+
+            let prob = &mut self.prob;
+            for k in 0..self.n_cond {
+                let ah = Self::bm_bit(bm_row, k) as usize;
+                let _emit = vdupq_n_f32(emit_match[ah]);
+                let base = k * HAP_NUMBER;
+                let ptr = prob[base..].as_mut_ptr();
+                let mut _prob_lo = vld1q_f32(ptr);
+                let mut _prob_hi = vld1q_f32(ptr.add(4));
+                _prob_lo = vfmaq_f32(_tfreq_lo, _prob_lo, _nt);
+                _prob_hi = vfmaq_f32(_tfreq_hi, _prob_hi, _nt);
+                _prob_lo = vmulq_f32(_prob_lo, _emit);
+                _prob_hi = vmulq_f32(_prob_hi, _emit);
+                _sum_lo = vaddq_f32(_sum_lo, _prob_lo);
+                _sum_hi = vaddq_f32(_sum_hi, _prob_hi);
+                vst1q_f32(ptr, _prob_lo);
+                vst1q_f32(ptr.add(4), _prob_hi);
+            }
+
+            vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
+            vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
+            self.prob_sum_t = neon_hsum8(_sum_lo, _sum_hi);
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let nt_div = divss(nt, self.prob_sum_t);
             let yt_div = divss(yt, self.n_cond as f32 * self.prob_sum_t);
@@ -732,7 +957,44 @@ impl SegmentHmm {
             self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
                             + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let _nt = vdupq_n_f32(divss(nt, self.prob_sum_t));
+            let _factor = vdupq_n_f32(divss(yt, self.n_cond as f32 * self.prob_sum_t));
+            let mut _tfreq_lo = vld1q_f32(self.prob_sum_h.as_ptr());
+            let mut _tfreq_hi = vld1q_f32(self.prob_sum_h.as_ptr().add(4));
+            _tfreq_lo = vmulq_f32(_tfreq_lo, _factor);
+            _tfreq_hi = vmulq_f32(_tfreq_hi, _factor);
+            let _emit = [
+                (vld1q_f32(g0.as_ptr()), vld1q_f32(g0.as_ptr().add(4))),
+                (vld1q_f32(g1.as_ptr()), vld1q_f32(g1.as_ptr().add(4))),
+            ];
+            let mut _sum_lo = vdupq_n_f32(0.0);
+            let mut _sum_hi = vdupq_n_f32(0.0);
+
+            let prob = &mut self.prob;
+            for k in 0..self.n_cond {
+                let ah = Self::bm_bit(bm_row, k) as usize;
+                let (_g_lo, _g_hi) = _emit[ah];
+                let base = k * HAP_NUMBER;
+                let ptr = prob[base..].as_mut_ptr();
+                let mut _prob_lo = vld1q_f32(ptr);
+                let mut _prob_hi = vld1q_f32(ptr.add(4));
+                _prob_lo = vfmaq_f32(_tfreq_lo, _prob_lo, _nt);
+                _prob_hi = vfmaq_f32(_tfreq_hi, _prob_hi, _nt);
+                _prob_lo = vmulq_f32(_prob_lo, _g_lo);
+                _prob_hi = vmulq_f32(_prob_hi, _g_hi);
+                _sum_lo = vaddq_f32(_sum_lo, _prob_lo);
+                _sum_hi = vaddq_f32(_sum_hi, _prob_hi);
+                vst1q_f32(ptr, _prob_lo);
+                vst1q_f32(ptr.add(4), _prob_hi);
+            }
+
+            vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
+            vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
+            self.prob_sum_t = neon_hsum8(_sum_lo, _sum_hi);
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let nt_div = divss(nt, self.prob_sum_t);
             let factor = divss(yt, self.n_cond as f32 * self.prob_sum_t);
@@ -784,7 +1046,33 @@ impl SegmentHmm {
             self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
                             + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let _tfreq = vdupq_n_f32(divss(yt, self.n_cond as f32));
+            let _nt = vdupq_n_f32(divss(nt, self.prob_sum_t));
+            let emit_match: [f32; 2] = if target_allele { [MISMATCH, 1.0] } else { [1.0, MISMATCH] };
+            let mut _sum_lo = vdupq_n_f32(0.0);
+            let mut _sum_hi = vdupq_n_f32(0.0);
+
+            for k in 0..self.n_cond {
+                let ah = Self::bm_bit(bm_row, k) as usize;
+                let _emit = vdupq_n_f32(emit_match[ah]);
+                let base = k * HAP_NUMBER;
+                let _pk = vdupq_n_f32(self.prob_sum_k[k]);
+                let _base_p = vfmaq_f32(_tfreq, _pk, _nt);
+                let _prob = vmulq_f32(_base_p, _emit);
+                _sum_lo = vaddq_f32(_sum_lo, _prob);
+                _sum_hi = vaddq_f32(_sum_hi, _prob);
+                let ptr = self.prob[base..].as_mut_ptr();
+                vst1q_f32(ptr, _prob);
+                vst1q_f32(ptr.add(4), _prob);
+            }
+
+            vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
+            vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
+            self.prob_sum_t = neon_hsum8(_sum_lo, _sum_hi);
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let tfreq_val = divss(yt, self.n_cond as f32);
             let nt_div = divss(nt, self.prob_sum_t);
@@ -836,7 +1124,37 @@ impl SegmentHmm {
             self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
                             + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let _tfreq = vdupq_n_f32(divss(yt, self.n_cond as f32));
+            let _nt = vdupq_n_f32(divss(nt, self.prob_sum_t));
+            let _emit = [
+                (vld1q_f32(g0.as_ptr()), vld1q_f32(g0.as_ptr().add(4))),
+                (vld1q_f32(g1.as_ptr()), vld1q_f32(g1.as_ptr().add(4))),
+            ];
+            let mut _sum_lo = vdupq_n_f32(0.0);
+            let mut _sum_hi = vdupq_n_f32(0.0);
+
+            for k in 0..self.n_cond {
+                let ah = Self::bm_bit(bm_row, k) as usize;
+                let (_g_lo, _g_hi) = _emit[ah];
+                let base = k * HAP_NUMBER;
+                let _pk = vdupq_n_f32(self.prob_sum_k[k]);
+                let _base_p = vfmaq_f32(_tfreq, _pk, _nt);
+                let _prob_lo = vmulq_f32(_base_p, _g_lo);
+                let _prob_hi = vmulq_f32(_base_p, _g_hi);
+                _sum_lo = vaddq_f32(_sum_lo, _prob_lo);
+                _sum_hi = vaddq_f32(_sum_hi, _prob_hi);
+                let ptr = self.prob[base..].as_mut_ptr();
+                vst1q_f32(ptr, _prob_lo);
+                vst1q_f32(ptr.add(4), _prob_hi);
+            }
+
+            vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
+            vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
+            self.prob_sum_t = neon_hsum8(_sum_lo, _sum_hi);
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let tfreq_val = divss(yt, self.n_cond as f32);
             let nt_div = divss(nt, self.prob_sum_t);
@@ -1690,7 +2008,29 @@ impl SegmentHmm {
                 sum_h += self.h_probs[h1*HAP_NUMBER+0]+self.h_probs[h1*HAP_NUMBER+1]+self.h_probs[h1*HAP_NUMBER+2]+self.h_probs[h1*HAP_NUMBER+3]+self.h_probs[h1*HAP_NUMBER+4]+self.h_probs[h1*HAP_NUMBER+5]+self.h_probs[h1*HAP_NUMBER+6]+self.h_probs[h1*HAP_NUMBER+7];
             }
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            for h1 in 0..HAP_NUMBER {
+                let fact2 = (alpha_sum[h1] / alpha_sum_sum.max(1e-30)) * yt / n_cond as f32;
+                let mut _sum_lo = vdupq_n_f32(0.0);
+                let mut _sum_hi = vdupq_n_f32(0.0);
+                for k in 0..n_cond {
+                    let base = k * HAP_NUMBER;
+                    let alpha_val = alpha_full[base + h1] * fact1 + fact2;
+                    let _alpha = vdupq_n_f32(alpha_val);
+                    let _beta_lo = vld1q_f32(self.prob[base..].as_ptr());
+                    let _beta_hi = vld1q_f32(self.prob[base..].as_ptr().add(4));
+                    // C++ exact: separate mul+add, NOT FMA (different rounding)
+                    _sum_lo = vaddq_f32(_sum_lo, vmulq_f32(_alpha, _beta_lo));
+                    _sum_hi = vaddq_f32(_sum_hi, vmulq_f32(_alpha, _beta_hi));
+                }
+                vst1q_f32(self.h_probs[h1 * HAP_NUMBER..].as_mut_ptr(), _sum_lo);
+                vst1q_f32(self.h_probs[h1 * HAP_NUMBER..].as_mut_ptr().add(4), _sum_hi);
+                // C++ exact: compute row sum first, then add to running total
+                sum_h += self.h_probs[h1*HAP_NUMBER+0]+self.h_probs[h1*HAP_NUMBER+1]+self.h_probs[h1*HAP_NUMBER+2]+self.h_probs[h1*HAP_NUMBER+3]+self.h_probs[h1*HAP_NUMBER+4]+self.h_probs[h1*HAP_NUMBER+5]+self.h_probs[h1*HAP_NUMBER+6]+self.h_probs[h1*HAP_NUMBER+7];
+            }
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             for h1 in 0..HAP_NUMBER {
                 let fact2 = (alpha_sum[h1] / alpha_sum_sum.max(1e-30)) * yt / n_cond as f32;
