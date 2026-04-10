@@ -663,327 +663,6 @@ fn fill_chip_sd(
 // Multi-format output: interpolate once, encode to all active formats
 // ---------------------------------------------------------------------------
 
-/// Result of interpolating one tile (format-agnostic).
-pub(crate) struct TileResult {
-    pub alt_probs: Vec<f32>,
-    pub tile_n: usize,
-    pub global_start: usize,
-}
-
-/// Interpolate all tiles for one window (format-agnostic).
-/// Returns per-interval Vec of TileResults.
-///
-/// Supports both the tiled path (PreloadedStripes + interpolate_tile_batch)
-/// and the CSC path (chunk cache + interpolate_tile_preloaded / interpolate_tile).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn interpolate_window_tiles(
-    srp: &Arc<SrpReader>,
-    setup: &WindowSetup,
-    preloaded_stripes: Option<crate::srp::tiled::PreloadedStripes>,
-    preloaded_chunks: Option<Vec<Option<crate::srp::CscChunk>>>,
-) -> std::io::Result<Vec<Vec<TileResult>>> {
-    let tile_size = 4000usize;
-    let use_tiled = srp.is_tiled();
-
-    let n_cores = rayon::current_num_threads();
-    let pct = |cpu: f64, wall: f64| -> f64 { if wall > 0.01 { cpu / wall / n_cores as f64 * 100.0 } else { 0.0 } };
-
-    if use_tiled {
-        // ====================================================================
-        // TILED PATH: batch-parallel intervals with stripe decompression
-        // ====================================================================
-        let tiled = srp.tiled.as_ref().unwrap();
-        let n_tile_cols = tiled.n_tile_cols;
-        let n_tiled_variants = tiled.n_variants();
-        use crate::srp::TILE_ROWS;
-
-        let window_first_stripe = setup.own_wgs_start / TILE_ROWS;
-        let window_last_stripe = if setup.own_wgs_end > 0 { (setup.own_wgs_end - 1) / TILE_ROWS } else { 0 };
-
-        let stripe_comp = tiled.stripe_compressed_bytes(window_first_stripe);
-        let comp_mem_cap: usize = 500 * 1024 * 1024;
-        let stripe_preload_batch = (comp_mem_cap / stripe_comp.max(1)).max(10)
-            .min(window_last_stripe - window_first_stripe + 1);
-        let mut stripe_loaded: Option<crate::srp::tiled::PreloadedStripes> = preloaded_stripes;
-
-        let mut _t_chunk_load = 0.0f64;
-        let mut _t_lz4 = 0.0f64;
-        let mut _t_interp = 0.0f64;
-        let mut _cpu_tiles = 0.0f64;
-        let mut _n_intervals = 0usize;
-
-        // Partition intervals into memory-bounded batches
-        let decomp_tile_bytes: usize = 500 * 1024;
-        let bytes_per_stripe = n_tile_cols * decomp_tile_bytes;
-        let decomp_mem_cap: usize = 2 * 1024 * 1024 * 1024;
-        let max_stripes_per_batch = (decomp_mem_cap / bytes_per_stripe.max(1)).max(4);
-
-        let mut batches: Vec<(usize, usize)> = Vec::new();
-        {
-            let mut bstart = 0;
-            let mut b_first_stripe = if !setup.intervals.is_empty() { setup.intervals[0].wgs_start / TILE_ROWS } else { 0 };
-            for i in 0..setup.intervals.len() {
-                let iv_last = if setup.intervals[i].wgs_end > 0 { (setup.intervals[i].wgs_end - 1) / TILE_ROWS } else { b_first_stripe };
-                let n_stripes = iv_last - b_first_stripe + 1;
-                if n_stripes > max_stripes_per_batch && i > bstart {
-                    batches.push((bstart, i));
-                    bstart = i;
-                    b_first_stripe = setup.intervals[i].wgs_start / TILE_ROWS;
-                }
-            }
-            if bstart < setup.intervals.len() { batches.push((bstart, setup.intervals.len())); }
-        }
-
-        let batch_stripe_ranges: Vec<(usize, usize, usize)> = batches.iter().map(|&(bs, be)| {
-            let ivs = &setup.intervals[bs..be];
-            let fs = ivs[0].wgs_start / TILE_ROWS;
-            let ls = { let e = ivs.last().unwrap().wgs_end; if e > 0 { (e - 1) / TILE_ROWS } else { fs } };
-            (fs, ls, ls - fs + 1)
-        }).collect();
-
-        crate::selphi_debug!("  [tiled] {} intervals → {} batches, max_stripes/batch={}, stripe_comp={:.1}KB",
-            setup.intervals.len(), batches.len(), max_stripes_per_batch, stripe_comp as f64 / 1e3);
-
-        // Double-buffer I/O
-        let mut next_io_handle: Option<std::thread::JoinHandle<std::io::Result<crate::srp::tiled::PreloadedStripes>>> = None;
-
-        // Collect all interval results
-        let mut all_interval_results: Vec<Vec<TileResult>> = setup.intervals.iter().map(|_| Vec::new()).collect();
-
-        // Batch tile descriptor
-        struct BTD { ts: usize, tile_n: usize, gs: usize, ws: usize, we: usize, full_range: f32 }
-
-        for (bi, &(bstart, bend)) in batches.iter().enumerate() {
-            let batch_ivs = &setup.intervals[bstart..bend];
-            if batch_ivs.is_empty() { continue; }
-
-            let (b_first_stripe, b_last_stripe, b_n_stripes) = batch_stripe_ranges[bi];
-
-            // Get compressed data
-            let t0_io = std::time::Instant::now();
-            let loaded_ok = stripe_loaded.as_ref().map_or(false, |l|
-                l.contains_stripe(b_first_stripe) && l.contains_stripe(b_last_stripe));
-            if !loaded_ok {
-                if let Some(handle) = next_io_handle.take() {
-                    match handle.join().expect("stripe I/O thread panicked") {
-                        Ok(loaded) if loaded.contains_stripe(b_first_stripe) && loaded.contains_stripe(b_last_stripe) => {
-                            stripe_loaded = Some(loaded);
-                        }
-                        _ => {
-                            let needed = b_n_stripes;
-                            let n = needed.max(stripe_preload_batch).min(window_last_stripe - b_first_stripe + 1);
-                            stripe_loaded = Some(tiled.preload_stripes(b_first_stripe, n)?);
-                        }
-                    }
-                } else {
-                    let needed = b_n_stripes;
-                    let n = needed.max(stripe_preload_batch).min(window_last_stripe - b_first_stripe + 1);
-                    stripe_loaded = Some(tiled.preload_stripes(b_first_stripe, n)?);
-                }
-            }
-            _t_chunk_load += t0_io.elapsed().as_secs_f64();
-            let loaded = stripe_loaded.as_ref().unwrap();
-
-            // Start background I/O for next batch
-            if bi + 1 < batches.len() {
-                let (next_fs, _next_ls, next_ns) = batch_stripe_ranges[bi + 1];
-                let next_covered = loaded.contains_stripe(next_fs) && loaded.contains_stripe(batch_stripe_ranges[bi + 1].1);
-                if !next_covered {
-                    let tiled_path = tiled.file_path().to_path_buf();
-                    let n_v = n_tiled_variants;
-                    let n_h = tiled.n_haps();
-                    let n_load = next_ns.max(stripe_preload_batch).min(window_last_stripe - next_fs + 1);
-                    let fs = next_fs;
-                    next_io_handle = Some(std::thread::spawn(move || {
-                        let t = crate::srp::tiled::TiledSrpReader::open(&tiled_path, n_v, n_h)?;
-                        t.preload_stripes(fs, n_load)
-                    }));
-                }
-            }
-
-            // Decompress stripes in parallel
-            let t0_lz4 = std::time::Instant::now();
-            let stripe_tiles: Vec<Vec<crate::srp::SparseTile>> = (0..b_n_stripes)
-                .into_par_iter()
-                .map(|si| {
-                    let s = b_first_stripe + si;
-                    (0..n_tile_cols).map(|band| loaded.decompress_tile(s, band)).collect()
-                })
-                .collect();
-            _t_lz4 += t0_lz4.elapsed().as_secs_f64();
-
-            // Build tile descriptors for all intervals in this batch
-            let mut all_descs: Vec<BTD> = Vec::new();
-            let mut desc_counts: Vec<usize> = Vec::with_capacity(batch_ivs.len());
-            _n_intervals += batch_ivs.iter().filter(|iv| iv.wgs_end > iv.wgs_start).count();
-            for (_li, iv) in batch_ivs.iter().enumerate() {
-                let n = iv.wgs_end - iv.wgs_start;
-                if n == 0 { desc_counts.push(0); continue; }
-                let mut cnt = 0;
-                let mut ts = 0;
-                while ts < n {
-                    let tn = (n - ts).min(tile_size);
-                    all_descs.push(BTD {
-                        ts, tile_n: tn, gs: iv.wgs_start + ts,
-                        ws: iv.weight_s, we: iv.weight_e, full_range: n as f32,
-                    });
-                    ts += tn;
-                    cnt += 1;
-                }
-                desc_counts.push(cnt);
-            }
-
-            // Single par_iter: interpolation only (no formatting)
-            let t0_tiles = std::time::Instant::now();
-            let cpu0_tiles = crate::log::cpu_time_secs();
-            let all_tiles: Vec<Vec<f32>> = all_descs.par_iter().map(|desc| {
-                let t: Vec<f32> = (0..desc.tile_n)
-                    .map(|v| (desc.ts + v) as f32 / desc.full_range)
-                    .collect();
-                interpolate_tile_batch(
-                    &stripe_tiles, b_first_stripe, n_tiled_variants, n_tile_cols,
-                    &setup.weight_refs, desc.ws, desc.we,
-                    desc.gs, desc.tile_n, &t, setup.n_haps,
-                )
-            }).collect();
-            _t_interp += t0_tiles.elapsed().as_secs_f64();
-            _cpu_tiles += crate::log::cpu_time_secs() - cpu0_tiles;
-
-            // Distribute results back to per-interval Vecs
-            let mut buf_idx = 0;
-            for (li, _) in batch_ivs.iter().enumerate() {
-                for di in 0..desc_counts[li] {
-                    let desc = &all_descs[buf_idx + di];
-                    all_interval_results[bstart + li].push(TileResult {
-                        alt_probs: all_tiles[buf_idx + di].clone(),
-                        tile_n: desc.tile_n,
-                        global_start: desc.gs,
-                    });
-                }
-                buf_idx += desc_counts[li];
-            }
-        }
-
-        crate::selphi_debug!("  [interp] {} intervals: io={:.1}s lz4={:.1}s tiles={:.1}s({:.0}%cpu)",
-            _n_intervals, _t_chunk_load, _t_lz4, _t_interp, pct(_cpu_tiles, _t_interp));
-
-        Ok(all_interval_results)
-
-    } else {
-        // ====================================================================
-        // CSC PATH: per-interval sliding window
-        // ====================================================================
-        let window_first_chunk = setup.own_wgs_start / setup.chunk_size;
-        let window_last_chunk = if setup.own_wgs_end > 0 { (setup.own_wgs_end - 1) / setup.chunk_size } else { 0 };
-        let total_chunks = window_last_chunk - window_first_chunk + 1;
-        let mut cache_low = window_first_chunk;
-        let mut cache_high: usize;
-
-        let mem_cap_bytes: usize = 2 * 1024 * 1024 * 1024;
-        let chunk_mem_bytes = {
-            let probe = srp.load_chunk_from_source(window_first_chunk);
-            let mem = (probe.n_cols + 1) * 4 + probe.indices.len() * 4 + 12;
-            mem.max(1)
-        };
-        let adaptive_batch = (mem_cap_bytes / chunk_mem_bytes).max(100).min(total_chunks);
-        let mut chunk_cache: Vec<Option<crate::srp::CscChunk>>;
-
-        if let Some(pre) = preloaded_chunks {
-            let n_preloaded = pre.iter().take_while(|c| c.is_some()).count();
-            chunk_cache = pre;
-            cache_high = window_first_chunk + n_preloaded;
-            let next_end = (cache_high + adaptive_batch).min(window_last_chunk + 1);
-            if next_end > cache_high {
-                let batch_ids: Vec<usize> = (cache_high..next_end)
-                    .filter(|id| chunk_cache[id - window_first_chunk].is_none())
-                    .collect();
-                if !batch_ids.is_empty() {
-                    let batch: Vec<(usize, crate::srp::CscChunk)> = batch_ids.par_iter()
-                        .map(|&cid| (cid, srp.load_chunk_from_source(cid)))
-                        .collect();
-                    for (cid, chunk) in batch { chunk_cache[cid - window_first_chunk] = Some(chunk); }
-                }
-                cache_high = next_end;
-            }
-        } else {
-            chunk_cache = (0..total_chunks).map(|_| None).collect();
-            let first_batch_end = (window_first_chunk + adaptive_batch).min(window_last_chunk + 1);
-            let first_ids: Vec<usize> = (window_first_chunk..first_batch_end).collect();
-            let first_chunks: Vec<(usize, crate::srp::CscChunk)> = first_ids.par_iter()
-                .map(|&cid| (cid, srp.load_chunk_from_source(cid)))
-                .collect();
-            for (cid, chunk) in first_chunks { chunk_cache[cid - window_first_chunk] = Some(chunk); }
-            cache_high = first_batch_end;
-        }
-
-        crate::selphi_debug!("  [chunks] size={:.1}MB batch={} of {} total, preloaded to {}",
-            chunk_mem_bytes as f64 / 1e6, adaptive_batch, total_chunks, cache_high - window_first_chunk);
-
-        let mut _t_chunk_load = 0.0f64;
-        let mut _t_interp = 0.0f64;
-        let mut _cpu_tiles = 0.0f64;
-        let mut _cpu_chunk_load = 0.0f64;
-        let mut _n_intervals = 0usize;
-
-        let mut all_interval_results: Vec<Vec<TileResult>> = Vec::with_capacity(setup.intervals.len());
-
-        for interval in &setup.intervals {
-            let n_total_vars = interval.wgs_end - interval.wgs_start;
-            if n_total_vars == 0 { all_interval_results.push(Vec::new()); continue; }
-            let full_range = n_total_vars as f32;
-            _n_intervals += 1;
-
-            let mut tile_descs: Vec<(usize, usize, usize)> = Vec::new();
-            { let mut ts = 0; while ts < n_total_vars { let tn = (n_total_vars - ts).min(tile_size); tile_descs.push((ts, tn, interval.wgs_start + ts)); ts += tn; } }
-
-            // Ensure chunks are loaded
-            let iv_first = interval.wgs_start / setup.chunk_size;
-            let iv_last = if interval.wgs_end > 0 { (interval.wgs_end - 1) / setup.chunk_size } else { iv_first };
-            let evict_below = iv_first.saturating_sub(1);
-            if evict_below > cache_low {
-                for cid in cache_low..evict_below { chunk_cache[cid - window_first_chunk] = None; }
-                cache_low = evict_below;
-            }
-            if iv_last >= cache_high {
-                let new_high = (cache_high + adaptive_batch).min(window_last_chunk + 1);
-                let load_ids: Vec<usize> = (cache_high..new_high)
-                    .filter(|id| chunk_cache[id - window_first_chunk].is_none()).collect();
-                if !load_ids.is_empty() {
-                    let t0 = std::time::Instant::now();
-                    let cpu0 = crate::log::cpu_time_secs();
-                    let new_chunks: Vec<(usize, crate::srp::CscChunk)> = load_ids.par_iter()
-                        .map(|&cid| (cid, srp.load_chunk_from_source(cid))).collect();
-                    for (cid, chunk) in new_chunks { chunk_cache[cid - window_first_chunk] = Some(chunk); }
-                    _t_chunk_load += t0.elapsed().as_secs_f64();
-                    _cpu_chunk_load += crate::log::cpu_time_secs() - cpu0;
-                }
-                cache_high = new_high;
-            }
-
-            let t0_tiles = std::time::Instant::now();
-            let cpu0_tiles = crate::log::cpu_time_secs();
-            let tiles: Vec<TileResult> = tile_descs.par_iter().map(|&(ts, tile_n, global_start)| {
-                let t: Vec<f32> = (0..tile_n).map(|v| (ts + v) as f32 / full_range).collect();
-                let alt_probs = interpolate_tile_preloaded(
-                    &chunk_cache, window_first_chunk, &setup.weight_refs,
-                    interval.weight_s, interval.weight_e,
-                    global_start, tile_n, &t, setup.n_haps, setup.chunk_size,
-                );
-                TileResult { alt_probs, tile_n, global_start }
-            }).collect();
-            _t_interp += t0_tiles.elapsed().as_secs_f64();
-            _cpu_tiles += crate::log::cpu_time_secs() - cpu0_tiles;
-
-            all_interval_results.push(tiles);
-        }
-
-        crate::selphi_debug!("  [interp] {} intervals: chunk_load={:.1}s({:.0}%cpu) tiles={:.1}s({:.0}%cpu)",
-            _n_intervals, _t_chunk_load, pct(_cpu_chunk_load, _t_chunk_load),
-            _t_interp, pct(_cpu_tiles, _t_interp));
-
-        Ok(all_interval_results)
-    }
-}
 
 /// Write one window to all active output formats, interpolating only once.
 /// Returns VCF/BCF byte buffers (empty vec if neither VCF nor BCF is active).
@@ -1031,13 +710,10 @@ pub fn write_window_multiformat(
         for cid in fc..=lc { let _ = srp.load_chunk(cid); }
     }
 
-    // ---- INTERPOLATE ONCE ----
-    let t0_interp = std::time::Instant::now();
-    let interval_tiles = interpolate_window_tiles(srp, &setup, preloaded_stripes, preloaded_chunks)?;
-    let interp_secs = t0_interp.elapsed().as_secs_f64();
-
-    // ---- ENCODE TO ALL ACTIVE FORMATS ----
-    let t0_encode = std::time::Instant::now();
+    // ---- FUSED INTERPOLATE + ENCODE: per-batch for tiled, per-interval for CSC ----
+    // Tiles are interpolated, encoded to all formats, then dropped immediately.
+    // Never holds more than one batch of tiles in memory.
+    let t0_pipeline = std::time::Instant::now();
     let mut vcf_bytes: Vec<Vec<u8>> = Vec::new();
     let mut next_wgs = setup.own_wgs_start;
 
@@ -1045,200 +721,354 @@ pub fn write_window_multiformat(
     let mut pgw = pgen_writer;
     let mut sdw = sd_writer;
 
-    // PGEN per-variant buffers
     let mut hardcalls = if formats.pgen { vec![0u8; n_samples] } else { Vec::new() };
     let mut dosages = if formats.pgen { vec![0.0f32; n_samples] } else { Vec::new() };
-
-    // SelfDecode per-variant buffers
     let mut sd_gt1 = if formats.selfdecode { vec![0i32; n_samples] } else { Vec::new() };
     let mut sd_gt2 = if formats.selfdecode { vec![0i32; n_samples] } else { Vec::new() };
     let mut sd_ap1 = if formats.selfdecode { vec![0.0f32; n_samples] } else { Vec::new() };
     let mut sd_ap2 = if formats.selfdecode { vec![0.0f32; n_samples] } else { Vec::new() };
 
-    for (iv_idx, interval) in setup.intervals.iter().enumerate() {
-        // Emit chip sites between intervals
-        while next_wgs < interval.wgs_start {
-            if setup.is_chip[next_wgs] {
-                let vp_idx = next_wgs - setup.own_wgs_start;
-
-                if formats.vcf {
-                    let mut chip_buf = Vec::with_capacity(n_samples * 20);
-                    format_chip_line_bytes(
-                        &mut chip_buf, next_wgs, vp_idx, &setup.vid_prefixes,
-                        chip_genotypes, &setup.chip_local_idx, setup.n_haps, n_samples, &setup.an_str,
-                    );
-                    vcf_bytes.push(chip_buf);
-                }
-                if formats.bcf {
-                    let vi = var_infos.as_ref().unwrap();
-                    let mut chip_buf = Vec::with_capacity(n_samples * 16);
-                    format_chip_bcf(
-                        &mut chip_buf, vp_idx, next_wgs, vi, chip_genotypes,
-                        &setup.chip_local_idx, setup.n_haps, n_samples,
-                    );
-                    vcf_bytes.push(chip_buf);
-                }
-                // Parquet: chip sites handled inside write_tile_to_parquet (is_chip check)
-                if formats.pgen || formats.selfdecode {
-                    let ci = setup.chip_local_idx[next_wgs];
-                    if formats.pgen {
-                        fill_chip_pgen(&mut hardcalls, &mut dosages, chip_genotypes, ci, setup.n_haps, n_samples);
+    // Macro: encode chip sites in [next_wgs..end) gap
+    macro_rules! emit_chip_gap {
+        ($end:expr) => {
+            while next_wgs < $end {
+                if setup.is_chip[next_wgs] {
+                    let vp_idx = next_wgs - setup.own_wgs_start;
+                    if formats.vcf {
+                        let mut buf = Vec::with_capacity(n_samples * 20);
+                        format_chip_line_bytes(&mut buf, next_wgs, vp_idx, &setup.vid_prefixes,
+                            chip_genotypes, &setup.chip_local_idx, setup.n_haps, n_samples, &setup.an_str);
+                        vcf_bytes.push(buf);
                     }
-                    if formats.selfdecode {
-                        fill_chip_sd(&mut sd_gt1, &mut sd_gt2, chip_genotypes, ci, setup.n_haps, n_samples);
+                    if formats.bcf {
+                        let vi = var_infos.as_ref().unwrap();
+                        let mut buf = Vec::with_capacity(n_samples * 16);
+                        format_chip_bcf(&mut buf, vp_idx, next_wgs, vi, chip_genotypes,
+                            &setup.chip_local_idx, setup.n_haps, n_samples);
+                        vcf_bytes.push(buf);
                     }
-                    if let Some((chrom, pos_str, oid, ref_a, alt_a)) = parse_variant_parts(srp, next_wgs) {
-                        if let Some((ref mut pg, ref mut pv)) = pgw {
-                            super::pgen_output::write_pvar_variant(pv, chrom, pos_str, oid, ref_a, alt_a)?;
-                            pg.write_variant(&hardcalls, &dosages)?;
-                        }
-                        if let Some(ref mut sd) = sdw {
-                            let pos: i32 = pos_str.parse().unwrap_or(0);
-                            sd.write_variant(chrom, pos, oid, ref_a, alt_a,
-                                &sd_gt1, &sd_gt2, &sd_ap1, &sd_ap2, true)?;
+                    if formats.pgen || formats.selfdecode {
+                        let ci = setup.chip_local_idx[next_wgs];
+                        if formats.pgen { fill_chip_pgen(&mut hardcalls, &mut dosages, chip_genotypes, ci, setup.n_haps, n_samples); }
+                        if formats.selfdecode { fill_chip_sd(&mut sd_gt1, &mut sd_gt2, chip_genotypes, ci, setup.n_haps, n_samples); }
+                        if let Some((chrom, pos_str, oid, ref_a, alt_a)) = parse_variant_parts(srp, next_wgs) {
+                            if let Some((ref mut pg, ref mut pv)) = pgw {
+                                super::pgen_output::write_pvar_variant(pv, chrom, pos_str, oid, ref_a, alt_a)?;
+                                pg.write_variant(&hardcalls, &dosages)?;
+                            }
+                            if let Some(ref mut sd) = sdw {
+                                let pos: i32 = pos_str.parse().unwrap_or(0);
+                                sd.write_variant(chrom, pos, oid, ref_a, alt_a, &sd_gt1, &sd_gt2, &sd_ap1, &sd_ap2, true)?;
+                            }
                         }
                     }
                 }
+                next_wgs += 1;
             }
-            next_wgs += 1;
-        }
+        };
+    }
 
-        // Emit tile results for this interval
-        let tiles = &interval_tiles[iv_idx];
-        for tile in tiles {
-            // VCF format
+    // Macro: encode one interpolated tile to all formats
+    macro_rules! encode_tile {
+        ($alt_probs:expr, $tile_n:expr, $global_start:expr) => {{
             if formats.vcf {
-                let vp_start = tile.global_start - setup.own_wgs_start;
-                let buf = format_tile_batch(
-                    &tile.alt_probs, tile.tile_n, setup.n_haps, n_samples,
-                    tile.global_start, setup.n_ref_variants,
+                let vp_start = $global_start - setup.own_wgs_start;
+                vcf_bytes.push(format_tile_batch(
+                    $alt_probs, $tile_n, setup.n_haps, n_samples,
+                    $global_start, setup.n_ref_variants,
                     vp_start, &setup.vid_prefixes, &setup.is_chip, &setup.chip_local_idx,
-                    chip_genotypes, &setup.an_str, no_ap,
-                );
-                vcf_bytes.push(buf);
+                    chip_genotypes, &setup.an_str, no_ap));
             }
-
-            // BCF format
             if formats.bcf {
                 let vi = var_infos.as_ref().unwrap();
-                let vi_start = tile.global_start - setup.own_wgs_start;
-                let buf = format_tile_batch_bcf(
-                    &tile.alt_probs, tile.tile_n, setup.n_haps, n_samples,
-                    tile.global_start, setup.n_ref_variants,
+                let vi_start = $global_start - setup.own_wgs_start;
+                vcf_bytes.push(format_tile_batch_bcf(
+                    $alt_probs, $tile_n, setup.n_haps, n_samples,
+                    $global_start, setup.n_ref_variants,
                     vi_start, vi, &setup.is_chip, &setup.chip_local_idx,
-                    chip_genotypes, no_ap,
-                );
-                vcf_bytes.push(buf);
+                    chip_genotypes, no_ap));
             }
-
-            // Parquet format
             if let Some((ref mut writer, _)) = pw {
                 if let Some(ref sa) = schema_arc {
-                    let vp_start = tile.global_start - setup.own_wgs_start;
+                    let vp_start = $global_start - setup.own_wgs_start;
                     super::parquet_output::write_tile_to_parquet(
-                        writer, sa, &tile.alt_probs, tile.tile_n, n_samples, setup.n_haps,
-                        tile.global_start, &setup.vid_prefixes, vp_start, &setup.is_chip,
-                        &setup.chip_local_idx, chip_genotypes, setup.n_ref_variants,
-                    )?;
+                        writer, sa, $alt_probs, $tile_n, n_samples, setup.n_haps,
+                        $global_start, &setup.vid_prefixes, vp_start, &setup.is_chip,
+                        &setup.chip_local_idx, chip_genotypes, setup.n_ref_variants)?;
                 }
             }
-
-            // PGEN + SelfDecode: per-variant loop (fused to avoid double iteration)
             if formats.pgen || formats.selfdecode {
-                for v in 0..tile.tile_n {
-                    let wgs_i = tile.global_start + v;
+                for v in 0..$tile_n {
+                    let wgs_i = $global_start + v;
                     if wgs_i >= setup.n_ref_variants { break; }
-
                     let Some((chrom, pos_str, oid, ref_a, alt_a)) = parse_variant_parts(srp, wgs_i) else { continue };
                     let is_chip_var = setup.is_chip[wgs_i];
-
                     if is_chip_var {
                         let ci = setup.chip_local_idx[wgs_i];
                         if formats.pgen { fill_chip_pgen(&mut hardcalls, &mut dosages, chip_genotypes, ci, setup.n_haps, n_samples); }
                         if formats.selfdecode { fill_chip_sd(&mut sd_gt1, &mut sd_gt2, chip_genotypes, ci, setup.n_haps, n_samples); }
                     } else {
                         for s in 0..n_samples {
-                            let ap1 = tile.alt_probs[(s * 2) * tile.tile_n + v];
-                            let ap2 = tile.alt_probs[(s * 2 + 1) * tile.tile_n + v];
-                            if formats.pgen {
-                                let ds = ap1 + ap2;
-                                hardcalls[s] = if ds > 1.5 { 2 } else if ds > 0.5 { 1 } else { 0 };
-                                dosages[s] = ds;
-                            }
-                            if formats.selfdecode {
-                                sd_gt1[s] = if ap1 > 0.5 { 1 } else { 0 };
-                                sd_gt2[s] = if ap2 > 0.5 { 1 } else { 0 };
-                                sd_ap1[s] = ap1;
-                                sd_ap2[s] = ap2;
-                            }
+                            let ap1 = $alt_probs[(s * 2) * $tile_n + v];
+                            let ap2 = $alt_probs[(s * 2 + 1) * $tile_n + v];
+                            if formats.pgen { dosages[s] = ap1 + ap2; hardcalls[s] = if dosages[s] > 1.5 { 2 } else if dosages[s] > 0.5 { 1 } else { 0 }; }
+                            if formats.selfdecode { sd_gt1[s] = if ap1 > 0.5 { 1 } else { 0 }; sd_gt2[s] = if ap2 > 0.5 { 1 } else { 0 }; sd_ap1[s] = ap1; sd_ap2[s] = ap2; }
                         }
                     }
-
                     if let Some((ref mut pg, ref mut pv)) = pgw {
                         super::pgen_output::write_pvar_variant(pv, chrom, pos_str, oid, ref_a, alt_a)?;
                         pg.write_variant(&hardcalls, &dosages)?;
                     }
                     if let Some(ref mut sd) = sdw {
                         let pos: i32 = pos_str.parse().unwrap_or(0);
-                        sd.write_variant(chrom, pos, oid, ref_a, alt_a,
-                            &sd_gt1, &sd_gt2, &sd_ap1, &sd_ap2, is_chip_var)?;
+                        sd.write_variant(chrom, pos, oid, ref_a, alt_a, &sd_gt1, &sd_gt2, &sd_ap1, &sd_ap2, is_chip_var)?;
                     }
                 }
             }
-        }
-
-        next_wgs = interval.wgs_end;
+        }};
     }
 
-    // Trailing chip sites after all intervals
-    while next_wgs < setup.own_wgs_end {
-        if setup.is_chip[next_wgs] {
-            let vp_idx = next_wgs - setup.own_wgs_start;
+    let tile_size = 4000usize;
 
-            if formats.vcf {
-                let mut chip_buf = Vec::with_capacity(n_samples * 20);
-                format_chip_line_bytes(
-                    &mut chip_buf, next_wgs, vp_idx, &setup.vid_prefixes,
-                    chip_genotypes, &setup.chip_local_idx, setup.n_haps, n_samples, &setup.an_str,
-                );
-                vcf_bytes.push(chip_buf);
-            }
-            if formats.bcf {
-                let vi = var_infos.as_ref().unwrap();
-                let mut chip_buf = Vec::with_capacity(n_samples * 16);
-                format_chip_bcf(
-                    &mut chip_buf, vp_idx, next_wgs, vi, chip_genotypes,
-                    &setup.chip_local_idx, setup.n_haps, n_samples,
-                );
-                vcf_bytes.push(chip_buf);
-            }
-            if formats.pgen || formats.selfdecode {
-                let ci = setup.chip_local_idx[next_wgs];
-                if formats.pgen {
-                    fill_chip_pgen(&mut hardcalls, &mut dosages, chip_genotypes, ci, setup.n_haps, n_samples);
+    if srp.is_tiled() {
+        // ================================================================
+        // TILED PATH: batch-parallel interpolation + immediate encoding
+        // ================================================================
+        let tiled = srp.tiled.as_ref().unwrap();
+        let n_tile_cols = tiled.n_tile_cols;
+        let n_tiled_variants = tiled.n_variants();
+        use crate::srp::TILE_ROWS;
+
+        let window_last_stripe = if setup.own_wgs_end > 0 { (setup.own_wgs_end - 1) / TILE_ROWS } else { 0 };
+        let window_first_stripe = if !setup.intervals.is_empty() { setup.intervals[0].wgs_start / TILE_ROWS } else { 0 };
+
+        let stripe_comp = tiled.stripe_compressed_bytes(window_first_stripe);
+        let comp_mem_cap: usize = 500 * 1024 * 1024;
+        let stripe_preload_batch = (comp_mem_cap / stripe_comp.max(1)).max(10)
+            .min(window_last_stripe - window_first_stripe + 1);
+
+        // Partition intervals into memory-bounded batches
+        let decomp_tile_bytes: usize = 500 * 1024;
+        let bytes_per_stripe = n_tile_cols * decomp_tile_bytes;
+        let result_bytes_per_stripe = setup.n_haps * TILE_ROWS * 4;
+        let mem_cap: usize = 2 * 1024 * 1024 * 1024;
+        let max_stripes_per_batch = (mem_cap / (bytes_per_stripe + result_bytes_per_stripe).max(1)).max(4);
+
+        let mut batches: Vec<(usize, usize)> = Vec::new();
+        {
+            let mut bstart = 0;
+            let mut b_first_stripe = if !setup.intervals.is_empty() { setup.intervals[0].wgs_start / TILE_ROWS } else { 0 };
+            for i in 0..setup.intervals.len() {
+                let iv_last = if setup.intervals[i].wgs_end > 0 { (setup.intervals[i].wgs_end - 1) / TILE_ROWS } else { b_first_stripe };
+                let n_stripes = iv_last - b_first_stripe + 1;
+                if n_stripes > max_stripes_per_batch && i > bstart {
+                    batches.push((bstart, i));
+                    bstart = i;
+                    b_first_stripe = setup.intervals[i].wgs_start / TILE_ROWS;
                 }
-                if formats.selfdecode {
-                    fill_chip_sd(&mut sd_gt1, &mut sd_gt2, chip_genotypes, ci, setup.n_haps, n_samples);
-                }
-                if let Some((chrom, pos_str, oid, ref_a, alt_a)) = parse_variant_parts(srp, next_wgs) {
-                    if let Some((ref mut pg, ref mut pv)) = pgw {
-                        super::pgen_output::write_pvar_variant(pv, chrom, pos_str, oid, ref_a, alt_a)?;
-                        pg.write_variant(&hardcalls, &dosages)?;
-                    }
-                    if let Some(ref mut sd) = sdw {
-                        let pos: i32 = pos_str.parse().unwrap_or(0);
-                        sd.write_variant(chrom, pos, oid, ref_a, alt_a,
-                            &sd_gt1, &sd_gt2, &sd_ap1, &sd_ap2, true)?;
-                    }
-                }
             }
+            if bstart < setup.intervals.len() { batches.push((bstart, setup.intervals.len())); }
         }
-        next_wgs += 1;
+
+        let batch_stripe_ranges: Vec<(usize, usize, usize)> = batches.iter().map(|&(bs, be)| {
+            let ivs = &setup.intervals[bs..be];
+            let fs = ivs[0].wgs_start / TILE_ROWS;
+            let ls = { let e = ivs.last().unwrap().wgs_end; if e > 0 { (e - 1) / TILE_ROWS } else { fs } };
+            (fs, ls, ls - fs + 1)
+        }).collect();
+
+        let mut stripe_loaded: Option<crate::srp::tiled::PreloadedStripes> = preloaded_stripes;
+        let mut next_io_handle: Option<std::thread::JoinHandle<std::io::Result<crate::srp::tiled::PreloadedStripes>>> = None;
+
+        struct BTD { ts: usize, tile_n: usize, gs: usize, ws: usize, we: usize, full_range: f32 }
+
+        for (bi, &(bstart, bend)) in batches.iter().enumerate() {
+            let batch_ivs = &setup.intervals[bstart..bend];
+            if batch_ivs.is_empty() { continue; }
+            let (b_first_stripe, b_last_stripe, b_n_stripes) = batch_stripe_ranges[bi];
+
+            // Load compressed stripe data
+            let loaded_ok = stripe_loaded.as_ref().map_or(false, |l|
+                l.contains_stripe(b_first_stripe) && l.contains_stripe(b_last_stripe));
+            if !loaded_ok {
+                if let Some(handle) = next_io_handle.take() {
+                    match handle.join().expect("stripe I/O panicked") {
+                        Ok(loaded) if loaded.contains_stripe(b_first_stripe) && loaded.contains_stripe(b_last_stripe) => {
+                            stripe_loaded = Some(loaded);
+                        }
+                        _ => {
+                            let n = b_n_stripes.max(stripe_preload_batch).min(window_last_stripe - b_first_stripe + 1);
+                            stripe_loaded = Some(tiled.preload_stripes(b_first_stripe, n)?);
+                        }
+                    }
+                } else {
+                    let n = b_n_stripes.max(stripe_preload_batch).min(window_last_stripe - b_first_stripe + 1);
+                    stripe_loaded = Some(tiled.preload_stripes(b_first_stripe, n)?);
+                }
+            }
+            let loaded = stripe_loaded.as_ref().unwrap();
+
+            // Background I/O for next batch
+            if bi + 1 < batches.len() {
+                let (next_fs, next_ls, next_ns) = batch_stripe_ranges[bi + 1];
+                if !loaded.contains_stripe(next_fs) || !loaded.contains_stripe(next_ls) {
+                    let tiled_path = tiled.file_path().to_path_buf();
+                    let n_v = n_tiled_variants;
+                    let n_h = tiled.n_haps();
+                    let n_load = next_ns.max(stripe_preload_batch).min(window_last_stripe - next_fs + 1);
+                    let fs = next_fs;
+                    next_io_handle = Some(std::thread::spawn(move || {
+                        let t = crate::srp::tiled::TiledSrpReader::open(&tiled_path, n_v, n_h)?;
+                        t.preload_stripes(fs, n_load)
+                    }));
+                }
+            }
+
+            // Decompress stripes
+            let stripe_tiles: Vec<Vec<crate::srp::SparseTile>> = (0..b_n_stripes)
+                .into_par_iter()
+                .map(|si| {
+                    let s = b_first_stripe + si;
+                    (0..n_tile_cols).map(|band| loaded.decompress_tile(s, band)).collect()
+                })
+                .collect();
+
+            // Build tile descriptors + parallel interpolation
+            let mut all_descs: Vec<BTD> = Vec::new();
+            let mut desc_counts: Vec<usize> = Vec::with_capacity(batch_ivs.len());
+            for iv in batch_ivs {
+                let n = iv.wgs_end - iv.wgs_start;
+                if n == 0 { desc_counts.push(0); continue; }
+                let mut cnt = 0;
+                let mut ts = 0;
+                while ts < n {
+                    let tn = (n - ts).min(tile_size);
+                    all_descs.push(BTD { ts, tile_n: tn, gs: iv.wgs_start + ts,
+                        ws: iv.weight_s, we: iv.weight_e, full_range: n as f32 });
+                    ts += tn;
+                    cnt += 1;
+                }
+                desc_counts.push(cnt);
+            }
+
+            let all_tiles: Vec<Vec<f32>> = all_descs.par_iter().map(|desc| {
+                let t: Vec<f32> = (0..desc.tile_n).map(|v| (desc.ts + v) as f32 / desc.full_range).collect();
+                interpolate_tile_batch(
+                    &stripe_tiles, b_first_stripe, n_tiled_variants, n_tile_cols,
+                    &setup.weight_refs, desc.ws, desc.we,
+                    desc.gs, desc.tile_n, &t, setup.n_haps)
+            }).collect();
+            drop(stripe_tiles); // free decompressed stripes
+
+            // Encode this batch's intervals immediately, then drop all_tiles
+            let mut buf_idx = 0;
+            for (li, _iv) in batch_ivs.iter().enumerate() {
+                let iv_idx = bstart + li;
+                let interval = &setup.intervals[iv_idx];
+
+                emit_chip_gap!(interval.wgs_start);
+
+                for di in 0..desc_counts[li] {
+                    let desc = &all_descs[buf_idx + di];
+                    encode_tile!(&all_tiles[buf_idx + di], desc.tile_n, desc.gs);
+                }
+                buf_idx += desc_counts[li];
+                next_wgs = interval.wgs_end;
+            }
+            // all_tiles dropped here — batch memory freed
+        }
+
+    } else {
+        // ================================================================
+        // CSC PATH: per-interval interpolation + immediate encoding
+        // ================================================================
+        let window_first_chunk = setup.own_wgs_start / setup.chunk_size;
+        let window_last_chunk = if setup.own_wgs_end > 0 { (setup.own_wgs_end - 1) / setup.chunk_size } else { 0 };
+        let total_chunks = window_last_chunk - window_first_chunk + 1;
+        let mut cache_low = window_first_chunk;
+        let mut cache_high: usize;
+
+        let mem_cap_bytes: usize = 2 * 1024 * 1024 * 1024;
+        let chunk_mem_bytes = {
+            let probe = srp.load_chunk_from_source(window_first_chunk);
+            ((probe.n_cols + 1) * 4 + probe.indices.len() * 4 + 12).max(1)
+        };
+        let adaptive_batch = (mem_cap_bytes / chunk_mem_bytes).max(100).min(total_chunks);
+        let mut chunk_cache: Vec<Option<crate::srp::CscChunk>>;
+
+        if let Some(pre) = preloaded_chunks {
+            let n_preloaded = pre.iter().take_while(|c| c.is_some()).count();
+            chunk_cache = pre;
+            cache_high = window_first_chunk + n_preloaded;
+            let next_end = (cache_high + adaptive_batch).min(window_last_chunk + 1);
+            if next_end > cache_high {
+                let batch: Vec<(usize, crate::srp::CscChunk)> = (cache_high..next_end)
+                    .filter(|id| chunk_cache[id - window_first_chunk].is_none())
+                    .collect::<Vec<_>>().par_iter()
+                    .map(|&cid| (cid, srp.load_chunk_from_source(cid))).collect();
+                for (cid, chunk) in batch { chunk_cache[cid - window_first_chunk] = Some(chunk); }
+                cache_high = next_end;
+            }
+        } else {
+            chunk_cache = (0..total_chunks).map(|_| None).collect();
+            let first_batch_end = (window_first_chunk + adaptive_batch).min(window_last_chunk + 1);
+            let chunks: Vec<(usize, crate::srp::CscChunk)> = (window_first_chunk..first_batch_end)
+                .collect::<Vec<_>>().par_iter()
+                .map(|&cid| (cid, srp.load_chunk_from_source(cid))).collect();
+            for (cid, chunk) in chunks { chunk_cache[cid - window_first_chunk] = Some(chunk); }
+            cache_high = first_batch_end;
+        }
+
+        for (iv_idx, interval) in setup.intervals.iter().enumerate() {
+            let n_total_vars = interval.wgs_end - interval.wgs_start;
+
+            emit_chip_gap!(interval.wgs_start);
+
+            if n_total_vars == 0 { next_wgs = interval.wgs_end; continue; }
+            let full_range = n_total_vars as f32;
+
+            // Ensure chunks loaded
+            let iv_last = if interval.wgs_end > 0 { (interval.wgs_end - 1) / setup.chunk_size } else { 0 };
+            let evict_below = (interval.wgs_start / setup.chunk_size).saturating_sub(1);
+            if evict_below > cache_low {
+                for cid in cache_low..evict_below { chunk_cache[cid - window_first_chunk] = None; }
+                cache_low = evict_below;
+            }
+            if iv_last >= cache_high {
+                let new_high = (cache_high + adaptive_batch).min(window_last_chunk + 1);
+                let load_ids: Vec<usize> = (cache_high..new_high)
+                    .filter(|id| chunk_cache[id - window_first_chunk].is_none()).collect();
+                if !load_ids.is_empty() {
+                    let new_chunks: Vec<(usize, crate::srp::CscChunk)> = load_ids.par_iter()
+                        .map(|&cid| (cid, srp.load_chunk_from_source(cid))).collect();
+                    for (cid, chunk) in new_chunks { chunk_cache[cid - window_first_chunk] = Some(chunk); }
+                }
+                cache_high = new_high;
+            }
+
+            // Interpolate this interval's tiles and encode immediately
+            let mut ts = 0usize;
+            while ts < n_total_vars {
+                let tn = (n_total_vars - ts).min(tile_size);
+                let gs = interval.wgs_start + ts;
+                let t_vals: Vec<f32> = (0..tn).map(|v| (ts + v) as f32 / full_range).collect();
+                let alt_probs = interpolate_tile_preloaded(
+                    &chunk_cache, window_first_chunk, &setup.weight_refs,
+                    interval.weight_s, interval.weight_e,
+                    gs, tn, &t_vals, setup.n_haps, setup.chunk_size);
+                encode_tile!(&alt_probs, tn, gs);
+                // alt_probs dropped here
+                ts += tn;
+            }
+            next_wgs = interval.wgs_end;
+        }
     }
 
-    let encode_secs = t0_encode.elapsed().as_secs_f64();
-    crate::selphi_debug!("  [multiformat] interp={:.2}s encode={:.2}s total={:.2}s",
-        interp_secs, encode_secs, interp_secs + encode_secs);
+    // Trailing chip sites
+    emit_chip_gap!(setup.own_wgs_end);
+
+    let total_secs = t0_pipeline.elapsed().as_secs_f64();
+    crate::selphi_debug!("  [multiformat] interp+encode={:.2}s", total_secs);
 
     Ok(vcf_bytes)
 }

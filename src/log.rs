@@ -149,21 +149,32 @@ pub fn estimate_and_warn(
     // targ_alleles
     let targ_mb = (n_chip * n_haps) as f64 / 1e6;
 
-    // SRP preload (capped at ~500 MB)
+    // SRP preload (capped at ~500 MB compressed)
     let preload_mb = 500.0;
 
     // Per-window HMM: each thread uses ~n_candidates * n_var_window * 4 bytes
-    // Typical: 200 candidates × 10K variants × 4 bytes = 8 MB per thread
     let hmm_per_thread_mb = 8.0;
     let hmm_mb = n_threads as f64 * hmm_per_thread_mb;
 
     // all_weights per window: n_haps × ~200 CsrWeights entries × 12 bytes
     let weights_mb = (n_haps as f64 * 200.0 * 12.0) / 1e6;
 
-    // Output buffers, misc overhead
+    // Interpolation: batch of decompressed stripes + alt_probs results.
+    // Stripe tiles: ~500 KB per stripe × n_tile_cols. Capped at 2 GB.
+    // alt_probs per batch: n_haps × TILE_ROWS × 4 bytes × stripes_per_batch.
+    // With mem cap, batch holds ~300 stripes max.
+    let tile_cols = (n_ref + 4095) / 4096;
+    let stripes_per_batch = 300usize.min((n_chip * 100 + 1023) / 1024); // rough estimate
+    let stripe_decomp_mb = (stripes_per_batch * tile_cols * 500 * 1024) as f64 / 1e6;
+    let interp_mb = (n_haps * 1024 * 4 * stripes_per_batch) as f64 / 1e6;
+
+    // VCF output buffers (~8 bytes per genotype per variant per batch)
+    let vcf_mb = (n_samples as f64 * 8.0 * stripes_per_batch as f64 * 1024.0) / 1e6;
+
     let overhead_mb = 200.0;
 
-    let mut total_mb = ref_bm_mb + targ_mb + preload_mb + hmm_mb + weights_mb + overhead_mb;
+    let mut total_mb = ref_bm_mb + targ_mb + preload_mb + hmm_mb + weights_mb
+        + stripe_decomp_mb + interp_mb + vcf_mb + overhead_mb;
 
     // Phasing adds significant memory
     if needs_phasing {
@@ -181,8 +192,8 @@ pub fn estimate_and_warn(
 
     crate::selphi_info!("  Resources: {:.1} GB estimated, {:.1} GB system RAM, {} threads",
         total_gb, sys_gb, n_threads);
-    crate::selphi_info!("    ref_bm={:.0} MB  target={:.0} MB  preload={:.0} MB  hmm={:.0} MB  weights={:.0} MB",
-        ref_bm_mb, targ_mb, preload_mb, hmm_mb, weights_mb);
+    crate::selphi_info!("    ref_bm={:.0} MB  target={:.0} MB  preload={:.0} MB  hmm={:.0} MB  interp={:.0} MB  vcf={:.0} MB",
+        ref_bm_mb, targ_mb, preload_mb, hmm_mb, interp_mb + stripe_decomp_mb, vcf_mb);
 
     if sys_ram > 0.0 && total_mb > sys_ram * 0.9 {
         crate::selphi_info!("  ⚠ WARNING: estimated memory ({:.1} GB) exceeds 90% of system RAM ({:.1} GB)",
