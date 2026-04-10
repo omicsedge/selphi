@@ -1,6 +1,6 @@
 //! Selphi — genotype imputation with integrated phasing.
 //!
-//! Standalone Rust binary. Mirrors the Python `selphi.py` CLI.
+//! Standalone Rust binary.
 
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::needless_range_loop)]
@@ -179,7 +179,6 @@ struct ImputationWindow {
 }
 
 /// Compute overlapping imputation windows from LD-corrected cM coordinates.
-/// Port of Python `_compute_windows_cM` (sliding window logic).
 fn compute_imputation_windows(
     chip_cm: &[f64], window_cm: f64, overlap_cm: f64,
 ) -> Vec<ImputationWindow> {
@@ -639,7 +638,7 @@ fn main() {
     });
     let est_ne = if args.est_ne <= 0 {
         // Ne=175,000 optimal for 1KG panel (plateau 150K-200K, chr22 801s sweep).
-        // Auto formula in Python: 1.836e11 × n_ref^-1.82 × exp(8.75 × chunk_cv)
+        // Ne=175,000 optimal for 1KG panel (plateau 150K-200K, chr22 801s sweep).
         175_000i64
     } else {
         args.est_ne

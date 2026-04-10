@@ -97,8 +97,7 @@ fn phase_genotypes_inner(
     let n_haps_total = n_ref + n_targ_haps;
     let m_all = n_haps_total;
 
-    // chip_cm from Python is raw (no LD correction), matching PlinkGenMap.genPos
-    // (identical to np.interp which matches Java's linear interpolation)
+    // chip_cm is raw (no LD correction), using standard linear interpolation
 
     // 1. Windows
     let windows = window::compute_windows(chip_bp, ref_bp, map_bp, map_cm, 40.0, 2.0);
@@ -152,7 +151,7 @@ fn phase_genotypes_inner(
         window_min_steps.push(ms);
     }
 
-    // 3. Seed chain (Java Random — same as Main.phaseAndImpute)
+    // 3. Seed chain (deterministic LCG per window)
     let mut rng_obj = rng::JavaRandom::new(seed);
     let mut window_seeds = vec![0i64; n_windows];
     for wi in 0..n_windows {
@@ -256,7 +255,7 @@ fn phase_genotypes_inner(
         let mut ri_f32 = 0.04f32 * 100000.0f32 / n_haps_total as f32;
         let mut pm_f32 = pmismatch(n_haps_total) as f32;
 
-        // Haplotype-major bitmatrix: sole data structure (like Java BitArray[])
+        // Haplotype-major bitmatrix: sole data structure
         let hap_byte_stride = (w_size + 7) >> 3;
         let mut w_hap_bits = vec![0u8; m_all * hap_byte_stride];
 
@@ -313,7 +312,7 @@ fn phase_genotypes_inner(
             let lr = lr_threshold(it, n_burnin, n_phasing);
             let nc = n_candidates(it, n_burnin, n_phasing);
 
-            // Pre-compute coded step values in parallel from hap_bits (like Java CodedSteps)
+            // Pre-compute coded step values in parallel from hap_bits
             let (w_precoded, w_pre_na) = pbwt::precompute_coded_steps_parallel(
                 &w_hap_bits, hap_byte_stride,
                 &window_coded_starts[wi], &window_coded_ends[wi], m_all);
@@ -392,7 +391,7 @@ fn phase_genotypes_inner(
 
             // --- EM (burnin only) ---
             // stores recombIntensity (f32) directly, uses up to 500 samples
-            // with Java Random shuffle, and early stopping (sumSwitchProbs >= 20000/nThreads).
+            // with LCG shuffle, and early stopping (sumSwitchProbs >= 20000/nThreads).
             let t_em = Instant::now();
             if it < n_burnin {
                 // Sample selection 

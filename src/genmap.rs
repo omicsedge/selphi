@@ -81,7 +81,7 @@ fn interpolate_cm(map_bp: &[i64], map_cm: &[f64], bp: i64) -> f64 {
     interpolate_cm_impl(map_bp, map_cm, bp, false)
 }
 
-/// Extrapolating variant: matches C++ behavior beyond map range.
+/// Extrapolating variant: extends linearly beyond map range.
 pub fn interpolate_cm_extrapolate(map_bp: &[i64], map_cm: &[f64], bp: i64) -> f64 {
     interpolate_cm_impl(map_bp, map_cm, bp, true)
 }
@@ -116,8 +116,7 @@ fn interpolate_cm_impl(map_bp: &[i64], map_cm: &[f64], bp: i64, extrapolate: boo
     if map_bp[idx] == bp { return map_cm[idx]; }
 
     // Interpolate between idx-1 and idx
-    // C++ order: rate = (cm_hi - cm_lo) / (bp_hi - bp_lo); cm = base + rate * dist
-    // Must match C++ computation order to get identical float truncation.
+    // Computation order preserves specific float truncation for determinism.
     let i = idx - 1;
     let base = map_cm[i];
     let rate = (map_cm[idx] - map_cm[i]) / (map_bp[idx] - map_bp[i]) as f64;
@@ -176,7 +175,7 @@ fn apply_ld_correction(chip_cm: &[f64], switch_rates: &[f64], window_size: usize
     let (p5, p95) = if nz_ratios.is_empty() {
         (0.5, 2.0)
     } else {
-        (numpy_percentile(&nz_ratios, 5.0), numpy_percentile(&nz_ratios, 95.0))
+        (linear_percentile(&nz_ratios, 5.0), linear_percentile(&nz_ratios, 95.0))
     };
     selphi_debug!("  [LD-DBG] nz_ratios={} p5={:.15} p95={:.15}", nz_ratios.len(), p5, p95);
 
@@ -222,8 +221,8 @@ fn apply_ld_correction(chip_cm: &[f64], switch_rates: &[f64], window_size: usize
     corrected
 }
 
-/// Numpy-compatible linear interpolation percentile.
-fn numpy_percentile(sorted: &[f64], pct: f64) -> f64 {
+/// Linear interpolation percentile (standard method).
+fn linear_percentile(sorted: &[f64], pct: f64) -> f64 {
     if sorted.is_empty() { return 0.0; }
     if sorted.len() == 1 { return sorted[0]; }
     let n = sorted.len();

@@ -1,6 +1,5 @@
 //! BREF3 (Binary Reference Format v3) reader.
 //!
-//! Ported from Beagle Java source (bref/Bref3Reader.java, Bref3Header.java).
 //! Reads phased reference panel haplotypes from .bref3 files.
 
 use std::io::{Read, BufReader};
@@ -173,7 +172,7 @@ pub fn read_bref3(path: &Path) -> Result<Bref3Data, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Big-endian I/O helpers (Java DataInput format)
+// Big-endian I/O helpers (BREF3 uses big-endian encoding)
 // ---------------------------------------------------------------------------
 
 fn read_i32<R: Read>(r: &mut R) -> Result<i32, String> {
@@ -194,8 +193,7 @@ fn read_u8<R: Read>(r: &mut R) -> Result<u8, String> {
     Ok(buf[0])
 }
 
-/// Read a Java modified UTF-8 string (DataInput.readUTF format):
-/// 2-byte big-endian length prefix, then modified UTF-8 bytes.
+/// Read a modified UTF-8 string: 2-byte big-endian length prefix, then UTF-8 bytes.
 fn read_utf<R: Read>(r: &mut R) -> Result<String, String> {
     let len = read_u16(r)? as usize;
     let mut buf = vec![0u8; len];
@@ -204,7 +202,7 @@ fn read_utf<R: Read>(r: &mut R) -> Result<String, String> {
     String::from_utf8(buf).map_err(|e| format!("invalid UTF-8: {}", e))
 }
 
-/// Read a Java string array: int32 length, then length × writeUTF strings.
+/// Read a string array: int32 length, then length × UTF-8 strings.
 fn read_string_array<R: Read>(r: &mut R) -> Result<Vec<String>, String> {
     let len = read_i32(r)?;
     if len < 0 { return Ok(Vec::new()); }

@@ -1,8 +1,7 @@
 //! PBWT matching for imputation — forward/backward passes producing CSC match matrices.
 //!
-//! Port of `modules/pbwt_numba.py`: `_pbwt_match_targets`, `_backward_filter_all`,
-//! `_build_csc_arrays`. Different from the phasing PBWT (no coded steps, no IBS2
-//! restrictions, produces CSC sparse match matrices with match lengths).
+//! Different from the phasing PBWT (no coded steps, no IBS2 restrictions,
+//! produces CSC sparse match matrices with match lengths).
 //!
 //! Parallelized via rayon: each target haplotype runs an independent PBWT sort.
 
@@ -46,7 +45,7 @@ impl CscMatchMatrix {
 // PBWT sort update
 // ---------------------------------------------------------------------------
 
-/// PBWT prefix-sort update (port of pbwtCursorForwardsAD / _pbwt_forwards_ad).
+/// PBWT prefix-sort update.
 ///
 /// Splits haplotypes by allele at position k: 0-alleles first, 1-alleles second.
 /// Updates a[], d[], a_inv[] in place.
@@ -558,7 +557,7 @@ pub fn backward_filter_single(
     for var in (0..n_var).rev() {
         let n = fwd.counts[var] as usize;
         let fwd_base = var * fl_fwd;
-        // Process in reverse order (j from n-1 to 0) to match Python
+        // Process in reverse order (j from n-1 to 0) for correct match merging
         for j in (0..n).rev() {
             let ref_hap = fwd.haps[fwd_base + j];
             let length = fwd.lens[fwd_base + j];

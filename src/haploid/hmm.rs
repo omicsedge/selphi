@@ -2,7 +2,7 @@
 /// Haploid HMM phase worker: composites + clusters + 3-channel forward-backward with swap.
 use crate::selphi_debug;
 
-// Min-heap helpers (Java PriorityQueue)
+// Min-heap helpers
 #[inline] pub fn hu(k:&mut[i32],x:&mut[i32],mut p:usize){while p>0{let q=(p-1)>>1;if k[p]<k[q]{k.swap(p,q);x.swap(p,q);p=q}else{break}}}
 #[inline] pub fn hd(k:&mut[i32],x:&mut[i32],mut p:usize,sz:usize){let h=sz>>1;while p<h{let mut c=(p<<1)+1;let r=c+1;
     if r<sz&&k[r]<k[c]{c=r}
@@ -372,7 +372,7 @@ pub fn phase_one(hbm:&[u8],hbs:usize,ibs:&[i32],hmask:&[u8],cm:&[f64],cst:&[i32]
             while seq_end<nhet&&!pw.hl2[seq_end]{seq_end+=1}
             let seq_len=seq_end-seq_start;
             if seq_len==2{
-                // Java: always masks first het in a pair (no bp check)
+                // Always mask first het in a pair (no bp check)
                 pw.hm2[seq_start]=true;
             } else if seq_len==3{
                 let first_bp=chip_bp[pw.hs2[seq_start]];
@@ -398,7 +398,7 @@ pub fn phase_one(hbm:&[u8],hbs:usize,ibs:&[i32],hmask:&[u8],cm:&[f64],cst:&[i32]
             unsafe{crate::haploid::simd::scale_shift(b,sc,sh2,ns)}}
         if pw.hma[cp]>=0{let h2=pw.hma[cp]as usize;
             if pw.hm2[h2]{
-                // Masked het: save backward values but NO channel reset (Java: bwdMiss path)
+                // Masked het: save backward values but NO channel reset
                 pw.bh1[h2*ns..(h2+1)*ns].copy_from_slice(&pw.bwd[ns..2*ns]);
                 pw.bh2[h2*ns..(h2+1)*ns].copy_from_slice(&pw.bwd[2*ns..3*ns]);
             } else if !pw.hl2[h2]{
@@ -408,7 +408,7 @@ pub fn phase_one(hbm:&[u8],hbs:usize,ibs:&[i32],hmask:&[u8],cm:&[f64],cst:&[i32]
                 pw.bwd.copy_within(0..ns, ns);pw.bwd.copy_within(0..ns, 2*ns);
             }}}
     // bwdHet for cluster 0 is never saved by the backward loop.
-    // bh1/bh2 stay at 0.0 init (matching Java's new float[] default).
+    // bh1/bh2 stay at 0.0 init (default zero-initialized).
 
     // Forward + swap (f32 — uses float throughout)
     pw.fwd.clear(); pw.fwd.resize(3*ns, iv); let mut fs=[1.0f32;3];
@@ -422,7 +422,7 @@ pub fn phase_one(hbm:&[u8],hbs:usize,ibs:&[i32],hmask:&[u8],cm:&[f64],cst:&[i32]
         if hv>=0{let h2=hv as usize;
         if pw.hm2[h2]{
             // Masked het: compute posterior but DON'T affect swap chain or reset channels
-            // (Java: masked hets go through imputeAlleles, not phaseHet)
+            // Masked hets compute posterior but don't affect swap chain
             let b1=&pw.bh1[h2*ns..(h2+1)*ns];let b2=&pw.bh2[h2*ns..(h2+1)*ns];
             let(p11,p12,p21,p22)=unsafe{crate::haploid::simd::dot4(&pw.fwd[ns..2*ns],&pw.fwd[2*ns..3*ns],b1,b2,ns)};
             let(mut pns_m,mut pss_m)=(p11*p22,p12*p21);
@@ -434,7 +434,7 @@ pub fn phase_one(hbm:&[u8],hbs:usize,ibs:&[i32],hmask:&[u8],cm:&[f64],cst:&[i32]
             if pw.conf_a[h2]>=lrt{pw.lck_a[h2]=1}
             // Mark masked hets that want local swap (pss > pns) for post-processing
             if pss_m>pns_m{pw.swap_a[h2]=2}  // sentinel: 2 = "masked wants swap"
-            // NO sh3 modification, NO channel reset (Java: masked hets don't affect swap chain)
+            // NO sh3 modification, NO channel reset (masked hets don't affect swap chain)
         } else if!pw.hl2[h2]{
             // Standard phaseHet: full 4-way posterior (f32)
             let b1=&pw.bh1[h2*ns..(h2+1)*ns];let b2=&pw.bh2[h2*ns..(h2+1)*ns];
@@ -468,7 +468,7 @@ pub fn phase_one(hbm:&[u8],hbs:usize,ibs:&[i32],hmask:&[u8],cm:&[f64],cst:&[i32]
             // Masked het: determine absolute swap from cumulative state + local decision
             // swap_a[h2]==2 means "masked wants local swap" (sentinel from forward pass)
             let wants_local_swap = pw.swap_a[h2]==2;
-            // In Java, masked het can independently swap alleles via imputeMaskedHet.
+            // Masked het can independently swap alleles.
             // The cumulative swap state determines the base, local decision can flip it.
             pw.swap_a[h2] = if wants_local_swap { 1-run } else { run };
         } else {

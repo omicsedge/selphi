@@ -1,4 +1,4 @@
-/// Java Random LCG — bit-identical to java.util.Random
+/// LCG random number generator (compatible with standard 48-bit LCG).
 pub struct JavaRandom {
     state: i64,
 }
@@ -50,7 +50,7 @@ mod tests {
     #[test]
     fn test_java_random_sequence() {
         let mut rng = JavaRandom::new(12345);
-        // Verified against Java: Random(12345).nextLong() × 3
+        // Verified reference sequence for seed=12345
         assert_eq!(rng.next_long(), 6674089274190705457);
         assert_eq!(rng.next_long(), -1236052134575208584);
         assert_eq!(rng.next_long(), -3078921119283744887);
@@ -59,7 +59,7 @@ mod tests {
     #[test]
     fn test_next_int() {
         let mut rng = JavaRandom::new(6674089274190705457);
-        // Verified against Java: Random(ws1).nextInt(4812) × 5
+        // Verified reference sequence for next_int(4812)
         assert_eq!(rng.next_int(4812), 1947);
         assert_eq!(rng.next_int(4812), 2721);
         assert_eq!(rng.next_int(4812), 4059);

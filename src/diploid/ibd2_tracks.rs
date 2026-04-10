@@ -1,6 +1,6 @@
 //! IBD2 track detection and storage for PBWT exclusion.
 //!
-//! C++ exact: per-locus IBD2 tracks with ±4cM expansion.
+//! Per-locus IBD2 tracks with ±4cM expansion.
 //! Tracks are stored as (target_ind, from_locus, to_locus) per source individual.
 //! `no_ibd2(hap1, hap2, locus)` checks if the pair is banned at the given locus.
 
@@ -42,9 +42,8 @@ impl Ibd2Tracks {
         self.cm = cm.to_vec();
     }
 
-    /// C++ exact: check if two haplotypes can be used as conditioning pair at given locus.
+    /// Check if two haplotypes can be used as conditioning pair at given locus.
     /// Returns true if they are NOT in IBD2 (i.e., allowed).
-    /// Matches C++ ibd2_tracks::noIBD2(hap0, hap1, locus).
     #[inline]
     pub fn no_ibd2(&self, hap1: usize, hap2: usize, locus: usize) -> bool {
         let s1 = hap1 / 2;
@@ -65,14 +64,13 @@ impl Ibd2Tracks {
         true
     }
 
-    /// C++ exact: add a track with ±4cM expansion.
-    /// Matches C++ Kbanned.pushIBD2 + expand.
+    /// Add a track with ±4cM expansion.
     pub fn add_track(&mut self, query_ind: usize, banned_ind: usize, from_locus: usize, to_locus: usize) {
         let lo = query_ind.min(banned_ind);
         let hi = query_ind.max(banned_ind);
         if lo >= self.n_samples { return; }
 
-        // Expand by 4cM on each side (C++ exact: ibd2_tracks::expand)
+        // Expand by 4cM on each side
         let mut expanded_from = from_locus;
         let mut expanded_to = to_locus;
         if !self.cm.is_empty() {
@@ -89,8 +87,7 @@ impl Ibd2Tracks {
         self.tracks[lo].push(Track { ind: hi, from: expanded_from, to: expanded_to });
     }
 
-    /// C++ exact: sort and merge overlapping tracks.
-    /// Matches C++ ibd2_tracks::collapse.
+    /// Sort and merge overlapping tracks.
     pub fn collapse(&mut self) {
         for tracks in &mut self.tracks {
             if tracks.len() <= 1 { continue; }
@@ -186,7 +183,7 @@ impl Ibd2Tracks {
                         if ng0 < 0 || ng0 != ng1 {
                             let lo = ind0.min(ind1);
                             let hi = ind0.max(ind1);
-                            // Store IBD2 region with ±4cM expansion (C++ exact: expand)
+                            // Store IBD2 region with ±4cM expansion
                             let mut efrom = div;
                             let mut eto = l;
                             let left_cm = scaffold_cm[div];

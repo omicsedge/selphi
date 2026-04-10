@@ -1,6 +1,5 @@
 //! f64 fallback HMM for when f32 underflows.
 //! Scalar (no AVX2) — only used as rare fallback, performance not critical.
-//! Matches C++ haplotype_segment_double.
 
 use super::params::{HAP_NUMBER, ED, EE};
 use super::genotype_graph::*;
@@ -88,7 +87,7 @@ impl SegmentHmmF64 {
         for k in 0..self.n_cond {
             let base = k * HAP_NUMBER;
             for h in 0..HAP_NUMBER {
-                // C++ uses FMA in double version
+                // FMA in f64 version (fused multiply-add)
                 self.prob[base + h] = self.prob[base + h] * nt_div + tfreq[h];
                 if cond_alleles[k] != target_allele {
                     self.prob[base + h] *= MISMATCH;

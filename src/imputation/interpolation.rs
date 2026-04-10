@@ -1,7 +1,6 @@
 //! Interpolation: sparse HMM weights × CSC reference → dosages.
 //!
-//! Port of `modules/interpolation.py`. Uses `Arc<SrpReader>` for thread-safe
-//! reference panel access — no fork-based COW memory duplication.
+//! Uses `Arc<SrpReader>` for thread-safe reference panel access.
 //!
 //! For each interval between chip sites, linearly interpolates HMM weights
 //! to compute alt-allele probabilities at every WGS variant position.

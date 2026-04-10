@@ -1,4 +1,4 @@
-//! Match processing pipeline — exact port of Python's CompositePanelMaskFilter.
+//! Match processing pipeline.
 //!
 //! Converts PBWT CSC match matrices into per-site haplotype lists suitable
 //! for HMM weight computation. The pipeline:
@@ -16,7 +16,7 @@ use crate::imputation::pbwt::CscMatchMatrix;
 
 /// Process a PBWT match matrix into per-site haplotype lists.
 ///
-/// Exact port of `CompositePanelMaskFilter.sparse_matrix()`.
+/// Processes PBWT match matrix into per-site haplotype lists.
 ///
 /// # Arguments
 /// * `csc` — CSC match matrix from PBWT: (n_ref, n_var), columns=variants
@@ -240,7 +240,7 @@ pub fn process_matches_simple(csc: &CscMatchMatrix) -> Vec<Vec<i64>> {
 }
 
 // ---------------------------------------------------------------------------
-// Helper functions (exact ports from Python)
+// Helper functions
 // ---------------------------------------------------------------------------
 
 /// Convert CSC to CSR representation.
@@ -407,10 +407,8 @@ fn get_std(avg_len: &[f64], min_length: f64, max_length: f64) -> Vec<f64> {
     if denom.abs() < 1e-10 {
         return vec![0.2 + 2.8; avg_len.len()];
     }
-    // Match Python exactly: no clamping before powf.
-    // Numpy silently handles negative bases with integer-like exponents
-    // by producing NaN/negative values which then propagate to threshold.
-    // We replicate this by using the raw normalized value.
+    // No clamping before powf — negative bases with integer-like exponents
+    // produce NaN/negative values which propagate to threshold.
     avg_len.iter().map(|&al| {
         let normalized = (al - max_length) / denom;
         normalized.powf(a - 1.0) * 2.8 + 0.2

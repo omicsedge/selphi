@@ -1,7 +1,6 @@
 //! VCF/BCF I/O — reading target genotypes and writing imputed output.
 //!
-//! For now, VCF writing uses plain text piped through bgzip.
-//! VCF reading delegates to the existing Python cyvcf2 pipeline.
+//! VCF writing uses plain text piped through bgzip.
 
 use std::io::{Write, BufWriter};
 use std::path::Path;

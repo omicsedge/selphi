@@ -7,7 +7,7 @@
 //! Three variant paths: HOM (homozygous), AMB (ambiguous/het), MIS (missing).
 //! HOM is the fast path — skips rare variant sites entirely.
 //!
-//! Inner loops use explicit AVX2 intrinsics to match C++ bit-for-bit.
+//! Inner loops use explicit AVX2 intrinsics for bit-identical results.
 //!
 //! Reference: diploid/phase_common/src/models/haplotype_segment_single.h
 
@@ -22,7 +22,6 @@ use super::genotype_graph::*;
 const MISMATCH: f32 = ED / EE;
 
 /// 32-byte aligned f32 vector for AVX2 _mm256_load_ps / _mm256_store_ps.
-/// Matches C++ aligned_vector32<float> from boost::alignment.
 pub(crate) struct AlignedF32 {
     ptr: *mut f32,
     len: usize,
@@ -98,7 +97,7 @@ impl std::ops::DerefMut for AlignedF32 {
 unsafe impl Send for AlignedF32 {}
 unsafe impl Sync for AlignedF32 {}
 
-/// Scalar f32 division via inline asm — matches C++ divss exactly.
+/// Scalar f32 division via inline asm — prevents FMA fusion for determinism.
 /// Prevents LLVM from fusing into FMA (which changes rounding) without
 /// the memory round-trip overhead of std::hint::black_box.
 #[cfg(target_arch = "x86_64")]
@@ -130,7 +129,7 @@ unsafe fn neon_hsum8(lo: float32x4_t, hi: float32x4_t) -> f32 {
 /// Segment HMM state for one sample in one window.
 pub struct SegmentHmm {
     /// prob[k * HAP_NUMBER + h]: P(cond hap k, internal hap h)
-    /// 32-byte aligned for AVX2 _mm256_load_ps (matches C++ aligned_vector32).
+    /// 32-byte aligned for AVX2 _mm256_load_ps.
     pub(crate) prob: AlignedF32,
     /// Sum over K for each of 8 hap configs
     pub prob_sum_h: [f32; HAP_NUMBER],
@@ -149,7 +148,7 @@ pub struct SegmentHmm {
 
     // Transition buffers
     h_probs: [f32; HAP_NUMBER * HAP_NUMBER],
-    sum_h_probs: f32, // C++ sumHProbs: NOT used to normalize h_probs in-place
+    sum_h_probs: f32, // NOT used to normalize h_probs in-place
     d_probs: [f64; 64], // HAP_NUMBER^2 × HAP_NUMBER^2 = 64 diplotype transitions
 }
 
@@ -255,11 +254,11 @@ impl SegmentHmm {
     // -----------------------------------------------------------------------
 
     /// Run at a homozygous site.
-    /// C++ exact: uses AVX2 _mm256_fmadd_ps for bit-identical results.
+    /// Uses AVX2 _mm256_fmadd_ps for bit-identical results.
     fn run_hom(&mut self, target_allele: bool, cond_alleles: &[bool], nt: f32, yt: f32) -> bool {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            // C++ exact: pre-compute factors as scalar, then broadcast.
+            // Pre-compute factors as scalar, then broadcast.
             // divss() prevents compiler from fusing these into FMA with surrounding ops.
             let nt_div = divss(nt, self.prob_sum_t);
             let yt_div = divss(yt, self.n_cond as f32 * self.prob_sum_t);
@@ -346,7 +345,7 @@ impl SegmentHmm {
     }
 
     /// Run at a heterozygous/ambiguous site.
-    /// C++ exact: AVX2 intrinsics for bit-identical results.
+    /// AVX2 intrinsics for bit-identical results.
     fn run_amb(&mut self, amb_code: u8, cond_alleles: &[bool], nt: f32, yt: f32) {
         let mut g0 = [0.0f32; HAP_NUMBER];
         let mut g1 = [0.0f32; HAP_NUMBER];
@@ -442,7 +441,7 @@ impl SegmentHmm {
     }
 
     /// Run at a missing site: transition only, uniform emission.
-    /// C++ exact: AVX2 intrinsics.
+    /// AVX2 intrinsics.
     fn run_mis(&mut self, nt: f32, yt: f32) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -534,7 +533,7 @@ impl SegmentHmm {
     }
 
     /// Collapse at homozygous segment boundary.
-    /// C++ exact: AVX2 COLLAPSE_HOM
+    /// AVX2 COLLAPSE at homozygous boundary.
     fn collapse_hom(&mut self, target_allele: bool, cond_alleles: &[bool], nt: f32, yt: f32) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -606,7 +605,7 @@ impl SegmentHmm {
         }
     }
 
-    /// C++ exact: AVX2 COLLAPSE_AMB
+    /// AVX2 COLLAPSE at ambiguous/het boundary.
     fn collapse_amb(&mut self, amb_code: u8, cond_alleles: &[bool], nt: f32, yt: f32) {
         let mut g0 = [0.0f32; HAP_NUMBER];
         let mut g1 = [0.0f32; HAP_NUMBER];
@@ -690,7 +689,7 @@ impl SegmentHmm {
         }
     }
 
-    /// C++ exact: AVX2 COLLAPSE_MIS
+    /// AVX2 COLLAPSE at missing site boundary.
     fn collapse_mis(&mut self, nt: f32, yt: f32) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -753,7 +752,7 @@ impl SegmentHmm {
 
     // -----------------------------------------------------------------------
     // _BM variants: read conditioning alleles inline from compact bitmatrix.
-    // Eliminates separate extraction loop (single-pass, like C++ Hvar).
+    // Eliminates separate extraction loop (single-pass inline read).
     // -----------------------------------------------------------------------
 
     fn init_hom_bm(&mut self, target_allele: bool, bm_row: *const u64) {
@@ -938,7 +937,7 @@ impl SegmentHmm {
             let _factor = _mm256_set1_ps(divss(yt, self.n_cond as f32 * self.prob_sum_t));
             let mut _tfreq = _mm256_loadu_ps(self.prob_sum_h.as_ptr());
             _tfreq = _mm256_mul_ps(_tfreq, _factor);
-            // Branchless emission: C++ _emit[ah] pattern
+            // Branchless emission: _emit[ah] pattern
             let _emit = [_mm256_loadu_ps(g0.as_ptr()), _mm256_loadu_ps(g1.as_ptr())];
             let mut _sum = _mm256_setzero_ps();
 
@@ -1461,7 +1460,7 @@ impl SegmentHmm {
 
                 if var_is_hom(e, byte) {
                     let target_allele = var_get_hap0(e, byte);
-                    // C++ rare allele skip: if site is rare and target has the
+                    // Rare allele skip: if site is rare and target has the
                     // minor allele, skip the HMM forward step entirely.
                     let rare = if vi < rare_allele.len() { rare_allele[vi] } else { -1 };
                     let skip_rare = rare >= 0 && (target_allele as i8) != rare;
@@ -1784,7 +1783,7 @@ impl SegmentHmm {
                 cond_alleles[k] = haplotypes(vi, h);
             }
 
-            // Backward transition — C++ exact: getBackwardTransProb(prev, curr)
+            // Backward transition
             let (nt, yt) = if first_locus {
                 (1.0f32, 0.0f32)
             } else {
@@ -1818,7 +1817,7 @@ impl SegmentHmm {
 
                 trans_write_offset -= n_t;
 
-                // C++ exact: if TRANS_HAP underflows → skip (leave default 1.0).
+                // If TRANS_HAP underflows → skip (leave default 1.0).
                 // If TRANS_DIP_MULT underflows → try TRANS_DIP_ADD.
                 // If both underflow → skip.
                 if !hap_underflow {
@@ -1835,14 +1834,14 @@ impl SegmentHmm {
                     } else {
                         out.iter().sum::<f64>()
                     };
-                    // C++ exact: scaleDip = 1.0 / sumDProbs; normalize
+                    // scaleDip = 1.0 / sumDProbs; normalize
                     if sum_d > 0.0 {
                         let inv = 1.0 / sum_d;
                         for p in out.iter_mut() { *p *= inv; }
                     }
                 }
 
-                // Continue backward — COLLAPSE never skips for rare (C++ exact)
+                // Continue backward — COLLAPSE never skips for rare
                 if is_hom {
                     self.collapse_hom(var_get_hap0(e, byte), &cond_alleles, nt, yt);
                 } else if is_amb {
@@ -1864,7 +1863,7 @@ impl SegmentHmm {
                 }
             }
 
-            // C++ exact: prev_abs_locus is NOT updated only when RUN_HOM skips (rare within-segment).
+            // prev_abs_locus is NOT updated only when RUN_HOM skips (rare within-segment).
             // COLLAPSE always updates prev_abs_locus. INIT always updates.
             let is_within_seg = !is_first_in_seg;
             let rare_skipped = is_within_seg && is_hom && {
@@ -1886,9 +1885,9 @@ impl SegmentHmm {
         }
 
         // SET_FIRST_TRANS: compute first segment's diplotype probabilities
-        // from backward probSumH. C++ exact: scale = 1.0f / probSumT (f32 division).
+        // from backward probSumH. scale = 1.0f / probSumT (f32 division).
         if trans_write_offset > 0 && self.prob_sum_t > 0.0 {
-            // C++ exact: `double scale = 1.0f / probSumT` — f32 division, then stored as f64.
+            // `double scale = 1.0f / probSumT` — f32 division, then stored as f64.
             let scale = (1.0f32 / self.prob_sum_t) as f64;
             let first_codes = Self::enum_dips(graph.diplotypes[seg_first]);
             let n_first = first_codes.len();
@@ -1896,7 +1895,7 @@ impl SegmentHmm {
             for (t, &d) in first_codes.iter().enumerate() {
                 let h0 = dip_hap0(d as usize);
                 let h1 = dip_hap1(d as usize);
-                // C++ exact: (double)(probSumH[h]*scale) — float*double → promoted to f64
+                // (double)(probSumH[h]*scale) — float*double → promoted to f64
                 let p = (self.prob_sum_h[h0] as f64 * scale)
                       * (self.prob_sum_h[h1] as f64 * scale);
                 if t < trans_write_offset {
@@ -1954,7 +1953,7 @@ impl SegmentHmm {
         };
         let alpha_locus = self.alpha_locus.get(seg_rel - 1).copied().unwrap_or(0);
 
-        // C++ exact: yt = M.getForwardTransProb(AlphaLocus[seg-1], prev_abs_locus)
+        // yt = getForwardTransProb(AlphaLocus[seg-1], prev_abs_locus)
         // Handles non-consecutive when rare sites are at segment boundaries.
         let (nt, yt) = self.transition_params_full(
             backward_prev_locus, alpha_locus,
@@ -1962,7 +1961,7 @@ impl SegmentHmm {
 
         let fact1 = nt / alpha_sum_sum.max(1e-30);
 
-        // C++ exact: AVX2 TRANS_HAP inner loop
+        // AVX2 TRANS_HAP inner loop
         self.h_probs = [0.0; HAP_NUMBER * HAP_NUMBER];
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -1974,11 +1973,11 @@ impl SegmentHmm {
                     let alpha_val = alpha_full[base + h1] * fact1 + fact2;
                     let _alpha = _mm256_set1_ps(alpha_val);
                     let _beta = _mm256_loadu_ps(self.prob[base..].as_ptr());
-                    // C++ exact: separate mul+add, NOT FMA (different rounding)
+                    // Separate mul+add, NOT FMA (different rounding)
                     _sum = _mm256_add_ps(_sum, _mm256_mul_ps(_alpha, _beta));
                 }
                 _mm256_storeu_ps(self.h_probs[h1 * HAP_NUMBER..].as_mut_ptr(), _sum);
-                // C++ exact: compute row sum first, then add to running total
+                // Compute row sum first, then add to running total
                 // (different from adding each element to running total one-by-one)
                 sum_h += self.h_probs[h1*HAP_NUMBER]+self.h_probs[h1*HAP_NUMBER+1]+self.h_probs[h1*HAP_NUMBER+2]+self.h_probs[h1*HAP_NUMBER+3]+self.h_probs[h1*HAP_NUMBER+4]+self.h_probs[h1*HAP_NUMBER+5]+self.h_probs[h1*HAP_NUMBER+6]+self.h_probs[h1*HAP_NUMBER+7];
             }
@@ -1995,13 +1994,13 @@ impl SegmentHmm {
                     let _alpha = vdupq_n_f32(alpha_val);
                     let _beta_lo = vld1q_f32(self.prob[base..].as_ptr());
                     let _beta_hi = vld1q_f32(self.prob[base..].as_ptr().add(4));
-                    // C++ exact: separate mul+add, NOT FMA (different rounding)
+                    // Separate mul+add, NOT FMA (different rounding)
                     _sum_lo = vaddq_f32(_sum_lo, vmulq_f32(_alpha, _beta_lo));
                     _sum_hi = vaddq_f32(_sum_hi, vmulq_f32(_alpha, _beta_hi));
                 }
                 vst1q_f32(self.h_probs[h1 * HAP_NUMBER..].as_mut_ptr(), _sum_lo);
                 vst1q_f32(self.h_probs[h1 * HAP_NUMBER..].as_mut_ptr().add(4), _sum_hi);
-                // C++ exact: compute row sum first, then add to running total
+                // Compute row sum first, then add to running total
                 sum_h += self.h_probs[h1*HAP_NUMBER]+self.h_probs[h1*HAP_NUMBER+1]+self.h_probs[h1*HAP_NUMBER+2]+self.h_probs[h1*HAP_NUMBER+3]+self.h_probs[h1*HAP_NUMBER+4]+self.h_probs[h1*HAP_NUMBER+5]+self.h_probs[h1*HAP_NUMBER+6]+self.h_probs[h1*HAP_NUMBER+7];
             }
         }
@@ -2025,15 +2024,15 @@ impl SegmentHmm {
             }
         }
 
-        // C++ exact: do NOT normalize h_probs in-place.
+        // Do NOT normalize h_probs in-place.
         // Store sumHProbs for TRANS_DIP_MULT to apply as f64 scaling.
         self.sum_h_probs = sum_h;
-        // C++ exact: return true if underflow
+        // Return true if underflow
         sum_h.is_nan() || sum_h.is_infinite() || sum_h < f32::MIN_POSITIVE
     }
 
     /// TRANS_DIP_MULT: DProbs[pd*nc+nd] = (HProbs[h0p,h0c]*scaling) * (HProbs[h1p,h1c]*scaling)
-    /// C++ exact: scaling = 1.0 / sumHProbs applied in f64, NOT pre-normalized in f32.
+    /// scaling = 1.0 / sumHProbs applied in f64, NOT pre-normalized in f32.
     /// Returns true if underflow.
     fn compute_trans_dip_mult(
         &mut self,
@@ -2050,7 +2049,7 @@ impl SegmentHmm {
             for &nd in next_codes {
                 let h0c = dip_hap0(nd as usize);
                 let h1c = dip_hap1(nd as usize);
-                // C++ exact: cast to f64 then multiply by scaling (no pre-normalization)
+                // Cast to f64 then multiply by scaling (no pre-normalization)
                 let p = (self.h_probs[h0p * HAP_NUMBER + h0c] as f64 * scaling)
                       * (self.h_probs[h1p * HAP_NUMBER + h1c] as f64 * scaling);
                 if t < out.len() {
@@ -2060,12 +2059,12 @@ impl SegmentHmm {
                 t += 1;
             }
         }
-        // C++ exact: check underflow
+        // Check underflow
         sum.is_nan() || sum.is_infinite() || sum < f64::MIN_POSITIVE
     }
 
     /// TRANS_DIP_ADD: additive fallback when TRANS_DIP_MULT underflows.
-    /// C++ exact: uses (+) instead of (×) for combining haplotype probs.
+    /// Additive fallback: uses (+) instead of (*) for combining haplotype probs.
     fn compute_trans_dip_add(
         &mut self,
         prev_codes: &[u8],
@@ -2081,7 +2080,7 @@ impl SegmentHmm {
             for &nd in next_codes {
                 let h0c = dip_hap0(nd as usize);
                 let h1c = dip_hap1(nd as usize);
-                // C++ exact: addition instead of multiplication
+                // Addition instead of multiplication (additive fallback)
                 let p = (self.h_probs[h0p * HAP_NUMBER + h0c] as f64 * scaling)
                       + (self.h_probs[h1p * HAP_NUMBER + h1c] as f64 * scaling);
                 if t < out.len() {
@@ -2100,7 +2099,7 @@ impl SegmentHmm {
 
     /// Get transition parameters (nt, yt) for a locus.
     #[inline(always)]
-    /// C++ exact: getForwardTransProb handles non-consecutive loci.
+    /// getForwardTransProb handles non-consecutive loci.
     /// Consecutive: use precomputed trans[prev].
     /// Non-consecutive (rare skip): recompute from cm_f32 distance.
     fn transition_params_full(&self, locus: usize, prev_locus: usize,
@@ -2116,11 +2115,11 @@ impl SegmentHmm {
             let t = trans[prev_locus];
             (1.0 - t, t)
         } else if prev_locus == locus + 1 {
-            // Backward consecutive: trans[locus] (= trans[curr_idx] in C++)
+            // Backward consecutive: trans[locus]
             let t = trans[locus];
             (1.0 - t, t)
         } else {
-            // C++ exact: get{Forward,Backward}TransProb recomputes from cM distance
+            // Non-consecutive: recompute transition from cM distance
             // Use absolute distance (backward has locus < prev_locus)
             let dist_cm = (cm_f32[locus] - cm_f32[prev_locus]).abs();
             let dist = if (dist_cm as f64) <= 1e-7 { 1e-7 } else { dist_cm as f64 };

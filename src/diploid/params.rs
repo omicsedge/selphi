@@ -26,21 +26,19 @@ pub struct HmmParams {
     /// Precomputed transition probabilities between consecutive sites.
     /// trans[i] = probability of recombination between site i and site i+1.
     pub trans: Vec<f32>,
-    /// C++ cm stored as float for getForwardTransProb non-consecutive lookups
+    /// cM stored as float for non-consecutive transition lookups
     pub cm_f32: Vec<f32>,
     /// Rare allele indicator: -1 = not rare, 0 = major is REF, 1 = major is ALT.
-    /// C++ exact: if target has the minor allele at a rare site, HMM forward step is SKIPPED.
+    /// If target has the minor allele at a rare site, HMM forward step is SKIPPED.
     pub rare_allele: Vec<i8>,
 }
 
 impl HmmParams {
     /// Initialize parameters from genetic distances.
     ///
-    /// C++ exact: hmm_parameters stores cm as vector<float>, computes:
-    ///   float dist_cm = cm_f[l] - cm_f[l-1];  // float subtraction
-    ///   t[l-1] = -1.0f * expm1f(-0.04 * Neff * dist_cm / Nhap);
-    /// The exponent is computed in double (0.04 literal promotes), then truncated
-    /// to float for expm1f. We match by truncating cm to f32 first.
+    /// Precompute transition probabilities from cM distances.
+    /// cM truncated to f32 first; exponent computed in f64 then truncated to f32
+    /// for expm1f, preserving deterministic float truncation.
     pub fn new(cm: &[f64], n_haps: usize, ne: f64) -> Self {
         Self::with_allele_freqs(cm, n_haps, ne, None)
     }
@@ -51,28 +49,28 @@ impl HmmParams {
                               allele_counts: Option<&[u32]>) -> Self {
         let n = cm.len();
         let mut trans = Vec::with_capacity(if n > 0 { n - 1 } else { 0 });
-        // C++ stores cm as vector<float> — truncate to match
+        // Store cm as f32 — truncate for deterministic float behavior
         let cm_f32: Vec<f32> = cm.iter().map(|&c| c as f32).collect();
         let coeff = -0.04 * ne / n_haps as f64;
         for i in 0..n.saturating_sub(1) {
-            // C++ float subtraction: float dist_cm = cm[l] - cm[l-1]
+            // f32 subtraction for deterministic rounding
             let dist_f32 = cm_f32[i + 1] - cm_f32[i];
             let dist = if (dist_f32 as f64) <= 1e-7 { 1e-7 } else { dist_f32 as f64 };
-            // C++ computes exponent in double (0.04 promotes), truncates to float for expm1f
+            // Exponent computed in f64 (0.04 promotes), truncated to f32 for expm1f
             let exponent_f32 = (dist * coeff) as f32;
-            // C++ exact: -1.0f * expm1f(exponent_f32)
+            // -1.0f * expm1f(exponent_f32)
             let t = -exponent_f32.exp_m1();
             trans.push(t.clamp(0.0, 1.0));
         }
 
         // Rare allele classification: MAF < 0.001 → store rare allele VALUE.
-        // C++ exact: getAF() = cref/(cref+calt) = REF frequency.
+        // Rare allele classification: getAF() = cref/(cref+calt) = REF frequency.
         // rare_allele[l] = (getAF() > 0.5) → 1 when REF is major (rare=ALT=1), 0 when ALT is major (rare=REF=0).
         // RUN_HOM skips when target has the MAJOR allele (ag != rare_allele).
         let rare_allele = if let Some(ac) = allele_counts {
             ac.iter().map(|&alt_count| {
                 let ref_count = n_haps as f64 - alt_count as f64;
-                let ref_freq = ref_count / n_haps as f64; // C++ getAF() = cref/(cref+calt)
+                let ref_freq = ref_count / n_haps as f64; // REF frequency
                 let maf = ref_freq.min(1.0 - ref_freq);
                 if maf < RARE_VARIANT_FREQ {
                     if ref_freq > 0.5 { 1i8 } else { 0i8 } // rare allele value: 1=ALT, 0=REF

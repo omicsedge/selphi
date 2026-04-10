@@ -99,17 +99,15 @@ impl PbwtNeighborIndex {
     ) -> Self {
         let n_sites = cm.len();
 
-        // Group sites by genetic distance — C++ exact:
-        //   sites_pbwt_grouping[l] = (int)round(V.vec_pos[l]->cm / _modulo_selection);
-        // where cm is double and _modulo_selection is float (promoted to double in division).
-        // Then groups are renumbered to be contiguous (0,1,2,...).
+        // Group sites by genetic distance.
+        // grouping[l] = round(cm[l] / modulo), then renumbered to contiguous (0,1,2,...).
         // Raw indices can be negative (extrapolated cM before first map marker).
-        let modulo_f64 = modulo_cm as f32 as f64;  // C++ passes modulo as float param
+        let modulo_f64 = modulo_cm as f32 as f64;  // modulo truncated to f32 first for determinism
         let mut site_grouping = vec![0usize; n_sites];
         let mut n_groups = 0usize;
         if n_sites > 0 {
-            // Phase 1: raw group indices via (int)round(double_cm / double_from_float_modulo)
-            // Use i64 to match C++ signed int behavior (negative groups are valid).
+            // Phase 1: raw group indices via round(cm / modulo)
+            // Use i64 for signed behavior (negative groups are valid).
             let raw_groups: Vec<i64> = (0..n_sites).map(|i| {
                 (cm[i] / modulo_f64).round() as i64
             }).collect();
@@ -139,12 +137,9 @@ impl PbwtNeighborIndex {
                 crate::selphi_debug!("");
             }
 
-            // Phase 2: renumber to contiguous (C++ exact)
-            // C++: for (l=0, src=-1, tar=-1; l<V.size(); l++)
-            //        if (src == grouping[l]) grouping[l] = tar;
-            //        else { src = grouping[l]; grouping[l] = ++tar; }
+            // Phase 2: renumber to contiguous indices
             {
-                let mut src = i64::MIN;  // sentinel (C++ uses -1, but raw can be -1)
+                let mut src = i64::MIN;  // sentinel (raw groups can be -1)
                 let mut tar: i64 = -1;
                 for i in 0..n_sites {
                     if raw_groups[i] == src {
@@ -159,7 +154,7 @@ impl PbwtNeighborIndex {
             n_groups = site_grouping[n_sites - 1] + 1;
         }
 
-        // Site evaluation — C++ exact: MAC >= filter AND MDR <= threshold
+        // Site evaluation: MAC >= filter AND MDR <= threshold
         // MAC = min(cref, calt) where cref/calt exclude missing alleles
         // MDR = cmis_individuals / (cref + calt + cmis_individuals)
         let site_eval: Vec<bool> = (0..n_sites).map(|i| {
@@ -168,12 +163,12 @@ impl PbwtNeighborIndex {
             let non_missing_alleles = n_haps as u32 - 2 * cmis;
             let cref = non_missing_alleles - calt;
             let mac = cref.min(calt) as usize;
-            let denom = cref + calt + cmis; // C++ quirk: alleles + individuals
+            let denom = cref + calt + cmis; // quirk: mixes allele counts + individual counts
             let mdr = if denom > 0 { cmis as f64 / denom as f64 } else { 1.0 };
             mac >= mac_filter && mdr <= mdr_threshold
         }).collect();
 
-        // C++ exact: binary recursive split for chunk boundaries
+        // Binary recursive split for chunk boundaries
         let min_chunk_cm = 4.0f32;
         let _buffer_cm = 0.5;
         let mut chunk_assignments = vec![-1i32; n_sites];
@@ -206,7 +201,7 @@ impl PbwtNeighborIndex {
                 chunk_boundaries.iter().map(|(s,e)| format!("[{},{}]", s, e)).collect::<Vec<_>>().join(","));
         }
 
-        // C++ exact: decrement first, then check distance (float 0.5f)
+        // Decrement first, then check distance (float 0.5f for determinism)
         // while (starts > 0 && distance < 0.5f) { starts--; distance = pos - cm[starts]; }
         let n_chunks = chunk_boundaries.len();
         let mut chunk_starts = vec![0usize; n_chunks];
@@ -549,7 +544,7 @@ impl PbwtNeighborIndex {
                     let mut off0 = 1usize; let mut off1 = 1usize;
                     let mut dg0 = -1i32; let mut dg1 = -1i32;
                     let tar_idx = group * n_hap + chap;
-                    // C++ exact: n_added only increments when valid neighbor found.
+                    // n_added only increments when valid neighbor found.
                     // Loop continues past rejected candidates (same-ind/IBD2)
                     // until depth neighbors collected or both sides exhausted.
                     let mut n_added = 0usize;
@@ -658,9 +653,8 @@ impl PbwtNeighborIndex {
         result
     }
 
-    /// C++ exact: iterate over SELECTED loci in [l_start, l_end] and collect
+    /// Iterate over SELECTED loci in [l_start, l_end] and collect
     /// unique PBWT neighbors for the given haplotype.
-    /// Matches C++ compute_job.cpp conditioning set extraction.
     pub fn get_conditioning_set_by_loci(&self, hap_idx: usize, l_start: usize, l_end: usize) -> Vec<usize> {
         let addr_offset = self.n_groups * self.n_haps;
         let mut seen = vec![false; self.n_haps];

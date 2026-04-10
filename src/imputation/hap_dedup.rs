@@ -1,7 +1,5 @@
 //! Haplotype deduplication — groups identical reference haplotypes at chip-site
 //! resolution to reduce HMM state count.
-//!
-//! Port of `modules/hap_dedup.py`.
 
 use std::collections::HashMap;
 

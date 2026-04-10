@@ -173,7 +173,7 @@ impl SparseTile {
 }
 
 // ---------------------------------------------------------------------------
-// Variant struct — mirrors Python's structured numpy dtype
+// Variant struct
 // ---------------------------------------------------------------------------
 
 /// A variant in the reference panel.

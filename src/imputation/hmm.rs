@@ -1,6 +1,5 @@
 //! Li-Stephens HMM for imputation weight computation.
 //!
-//! Port of `modules/hmm_utils.py` (class HMM) and parts of `modules/imputation_lib.py`.
 //! Runs forward-backward on each target haplotype to produce sparse CSR weight matrices
 //! that are used by the interpolation step to compute dosages.
 
@@ -90,7 +89,6 @@ impl CsrWeights {
 // ---------------------------------------------------------------------------
 
 /// Filter matches by keeping only haplotypes above 10th percentile frequency.
-/// Port of `_filter_matches_fast` from imputation_lib.py.
 fn filter_matches_fast(
     ordered_matches: &[Vec<i64>],
     n_ref_haps: usize,
@@ -129,7 +127,6 @@ fn filter_matches_fast(
 }
 
 /// Fill gaps for near-complete haplotypes (>95% coverage).
-/// Port of `_extend_high_coverage_haps` from imputation_lib.py.
 fn extend_high_coverage_haps(
     filtered_matches: &mut [Vec<i64>],
     n_ref_haps: usize,
@@ -787,7 +784,7 @@ pub fn calculate_weights(
     }
 
     // 7. Compute recombination probabilities
-    // n_hid = total reference haplotypes (NOT reduced n_states) — matches Python's num_hid=self.n_hid
+    // n_hid = total reference haplotypes (NOT reduced n_states)
     let (f_precomb, r_precomb) = compute_precomb(distances_cm, &n_haps_per_site, est_ne, n_ref_haps, ne_per_site);
 
     // 8. Pruning threshold
@@ -964,7 +961,7 @@ pub fn calculate_weights(
         results.push((start, csr));
     }
 
-    // Reverse to match Python output order (ascending by start)
+    // Reverse to ascending order by start
     results.reverse();
 
     // Build hap_posterior: expand last forward alpha from HMM states → per-haplotype
@@ -1014,7 +1011,7 @@ pub fn calculate_weights(
 /// Compute HMM weights for a batch of target haplotypes in parallel.
 ///
 /// Each target haplotype gets its own PBWT match matrix and is processed
-/// independently via rayon. This replaces Python's `joblib.Parallel`.
+/// independently via rayon.
 pub fn calculate_weights_batch(
     match_matrices: &[CscMatchMatrix],
     distances_cm: &[f64],

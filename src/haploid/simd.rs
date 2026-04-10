@@ -2,8 +2,7 @@
 /// AVX-512 on x86_64, NEON on aarch64, scalar fallback otherwise.
 ///
 /// Vectorizes emission lookup + multiply + accumulation.
-/// SIMD reduction reorders f32 additions vs scalar left-to-right —
-/// equivalent to Java HotSpot C2's auto-vectorized reductions.
+/// SIMD reduction reorders f32 additions vs scalar left-to-right.
 // ============================================================================
 // x86_64 AVX-512 implementation (16 × f32)
 // ============================================================================

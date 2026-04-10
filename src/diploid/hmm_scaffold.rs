@@ -175,7 +175,7 @@ pub fn phase_rare_li_stephens(
 
 /// Joint diplotype phasing using both haplotype posteriors.
 ///
-/// C++ exact: sparse_genotype::phase(prb0, prb1) — computes P(0|1) and P(1|0)
+/// Joint diplotype phasing — computes P(0|1) and P(1|0)
 /// using emission model (ee=0.9999, ed=0.0001) and picks argmax.
 /// Returns (al0, al1, confidence) where confidence = max_prob / sum_prob.
 pub fn phase_diplotype_joint(prob_h0: f32, prob_h1: f32, threshold: f32) -> Option<(u8, u8, f32)> {

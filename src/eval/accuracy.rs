@@ -945,7 +945,7 @@ pub fn evaluate_stream(
     Ok((site_acc, sample_acc, EvalCounts { n_matched, n_imp_variants, n_truth_variants }))
 }
 
-/// Print summary table (matches Python output format).
+/// Print MAF-binned summary table.
 pub fn print_summary(site_acc: &SiteAccumulator, sample_acc: &SampleAccumulator, counts: &EvalCounts) {
     let n_matched = counts.n_matched;
     eprintln!("\n{:<20} {:>12} {:>10} {:>12}", "MAF bin", "N variants", "Mean R²", "Concordance");

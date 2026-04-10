@@ -16,7 +16,7 @@ use super::hmm_segment_f64::SegmentHmmF64;
 use super::sampling;
 use super::pruning;
 
-/// Build windows by recursive binary split (matches C++ window_set::split).
+/// Build windows by recursive binary split.
 fn build_windows(graph: &GenotypeGraph, cm: &[f64], min_cm: f64, rng: &mut CppRng) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     if graph.n_segments == 0 { return out; }
@@ -25,8 +25,8 @@ fn build_windows(graph: &GenotypeGraph, cm: &[f64], min_cm: f64, rng: &mut CppRn
     out
 }
 
-/// C++ window_set::split: returns true if region above thresholds.
-/// Windows OVERLAP by one segment at boundaries (C++ behavior).
+/// Returns true if region above thresholds.
+/// Windows overlap by one segment at boundaries.
 fn split_rec(
     graph: &GenotypeGraph, cm: &[f64],
     s0: usize, s1: usize, min_cm: f64, out: &mut Vec<(usize, usize)>,
@@ -36,7 +36,7 @@ fn split_rec(
     let l0 = graph.segment_start(s0);
     let l1 = graph.segment_start(s1) + graph.lengths[s1] as usize - 1;
     let n_var = l1 - l0 + 1;
-    // C++ uses double: ccm_sto[right_index] - ccm_sta[left_index]
+    // cM span uses f64 for precision
     let len_cm = cm.get(l1.min(cm.len() - 1)).copied().unwrap_or(0.0)
                - cm.get(l0).copied().unwrap_or(0.0);
 
@@ -61,7 +61,7 @@ fn split_rec(
     true
 }
 
-/// C++ exact: compute het overlap between two target individuals.
+/// Compute het overlap between two target individuals.
 /// Returns fraction of union-het sites that are het in both.
 /// Reads from bitmatrix (cache-friendly vs 4.8GB byte array).
 fn compute_het_overlap_bm(
@@ -467,8 +467,7 @@ fn _run_iterations(
         }
 
         // 2. Parallel per-sample: window→HMM→sample
-        // C++ uses pthreads with work-stealing and a global RNG (non-deterministic
-        // multi-threaded). We pre-seed per-sample RNGs for deterministic parallelism.
+        // Pre-seed per-sample RNGs for deterministic parallelism.
         let n_seg_total = AtomicUsize::new(0);
 
         // Pre-seed per-sample RNGs from master (deterministic order)
@@ -500,7 +499,7 @@ fn _run_iterations(
             let all_missing = vec![0.0f32; graph.n_missing * HAP_NUMBER];
             let mut k_per_window: Vec<usize> = Vec::new();
             let mut banned = Vec::new();
-            let mut o_iter = 0usize; // per-sample (C++ per-worker)
+            let mut o_iter = 0usize; // per-sample iteration counter
             let mut cond_bm: Vec<u64> = Vec::new(); // compact bitmatrix, reused across windows
             let mut hmm_reuse = SegmentHmm::new(1); // reused across windows
 
@@ -585,7 +584,7 @@ fn _run_iterations(
                 k_per_window.push(cond_set.len());
 
                 // Build compact bitmatrix for conditioning haps — window range only.
-                // C++ equivalent: Hhap.subset(H, idxH, locus_first, locus_last) + transpose.
+                // Extract conditioning haplotype subset for this window, transposed.
                 // Only covers [w_l0, w_l1] (not 0..n_var_local). Fits in L2 cache.
                 let k = cond_set.len();
                 let k_words = k.div_ceil(64);
@@ -709,7 +708,7 @@ fn _run_iterations(
         let new_banned_pairs: Vec<(usize, usize, usize, usize)> =
             per_sample_banned.into_iter().flatten().collect();
 
-        // 2d. C++ exact: propagate IBD2 banned pairs to global tracks
+        // 2d. Propagate IBD2 banned pairs to global tracks
         // (phaser_algorithm.cpp line 86: H.Kbanned.pushIBD2)
         if !new_banned_pairs.is_empty() {
             for &(query_ind, banned_ind, from_l, to_l) in &new_banned_pairs {

@@ -1,4 +1,4 @@
-//! C++ std::mt19937 + std::uniform_int_distribution compatible RNG.
+//! MT19937 RNG with deterministic uniform_int_distribution.
 
 use rand_mt::Mt19937GenRand32;
 use rand::RngCore;
@@ -12,8 +12,8 @@ impl CppRng {
         Self { mt: Mt19937GenRand32::new(seed) }
     }
 
-    /// C++ rng.getInt(n) = uniform_int_distribution(0, n-1).
-    /// Must match libstdc++ std::uniform_int_distribution exactly:
+    /// uniform_int_distribution(0, n-1).
+    /// Uses rejection sampling for deterministic uniform distribution:
     ///   scaling = UINT_MAX / n;  limit = n * scaling;
     ///   do { raw = rng(); } while (raw >= limit);
     ///   return raw / scaling;
@@ -26,14 +26,14 @@ impl CppRng {
         raw / scaling
     }
 
-    /// C++ rng.getDouble() = uniform_real_distribution(0, 1).
+    /// uniform_real_distribution(0, 1).
     pub fn get_double(&mut self) -> f64 {
         let a = self.mt.next_u32() as f64;
         let b = self.mt.next_u32() as f64;
         (a + b * 4294967296.0) / (4294967296.0 * 4294967296.0)
     }
 
-    /// C++ rng.sample(vec<double>, sum) — u < csum (strict less).
+    /// Sample from CDF — u < csum (strict less).
     pub fn sample_f64(&mut self, probs: &[f64], sum: f64) -> usize {
         let u = self.get_double() * sum;
         let mut csum = probs[0];

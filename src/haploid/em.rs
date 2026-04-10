@@ -13,7 +13,7 @@ pub struct EmWorkspace {
     p_recomb: Vec<f32>, gen_dist: Vec<f64>,
     // compute_em_stats buffers
     bwd: Vec<f32>, saved_bwd: Vec<f32>, fwd: Vec<f32>,
-    // Pre-computed mismatch bytes (like Java alMatch) — avoids per-marker bit extraction
+    // Pre-computed mismatch bytes — avoids per-marker bit extraction
     al_match: Vec<u8>,
 }
 
@@ -47,7 +47,7 @@ fn compute_em_stats_f32(
     bwd: &mut Vec<f32>, saved_bwd: &mut Vec<f32>, fwd: &mut Vec<f32>,
     al_match: &mut Vec<u8>,
 ) -> (i32, f64, f64, f64) {
-    // Pre-compute alMatch for ALL markers (like Java HmmParamData.copyData).
+    // Pre-compute mismatch flags for ALL markers.
     // Extracts discord bytes ONCE; both backward and forward read from this.
     // Key: don't zero — just resize (reuses previous allocation).
     let am_len = n_markers * n_states;

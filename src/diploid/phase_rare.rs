@@ -1,12 +1,9 @@
 //! Diploid phase_rare: PBWT-based rare variant phasing.
 //!
-//! Matches the C++ algorithm exactly (conditioning_set_solve.cpp):
 //! 1. Forward PBWT sweep through ALL variants (scaffold + rare) in physical order
 //! 2. At scaffold sites: update PBWT arrays (A, C, R)
-//! 3. At rare het sites: phase via solveRareForward (threshold + distance-weighted voting)
+//! 3. At rare het sites: phase via threshold + distance-weighted voting
 //! 4. Backward PBWT sweep: same logic, resolves conflicts via CF (cflip) records
-//!
-//! Reference: diploid/phase_rare/src/containers/conditioning_set/conditioning_set_solve.cpp
 
 use rand::Rng;
 use rand::SeedableRng;
@@ -130,7 +127,7 @@ pub fn run_phase_rare(
     let n_haps = n_samples * 2;
     let _n_haps_total = n_ref + n_haps;
 
-    // C++ exact: scaffold = phase_common output sites.
+    // Scaffold = phase_common output sites.
     // Rare = everything NOT in scaffold that has at least one het in target samples.
     let scaffold_set: std::collections::HashSet<usize> = scaffold_from_common.iter().copied().collect();
     let scaffold_sites: Vec<usize> = scaffold_from_common.to_vec();
@@ -180,7 +177,7 @@ pub fn run_phase_rare(
     let mut major_alleles: Vec<bool> = vec![false; rare_sites.len()];
 
     for (ri, &rv) in rare_sites.iter().enumerate() {
-        // C++ exact: major_allele from target haps only (n_haplotypes = 2*n_samples)
+        // major_allele from target haps only (n_haplotypes = 2*n_samples)
         let mut ac = 0u32;
         for h in 0..n_haps { ac += phased[rv * n_haps + h] as u32; }
         major_alleles[ri] = ac as usize > n_haps / 2;
@@ -194,8 +191,8 @@ pub fn run_phase_rare(
         }
     }
 
-    // ======================== IBD2 SCAN (D2: C++ exact) ========================
-    // C++ phase_rare: scanIBD2 on target-only haps → global pair list (no from/to range).
+    // ======================== IBD2 SCAN ========================
+    // scanIBD2 on target-only haps → global pair list (no from/to range).
     // Used in checkIBD2() to exclude IBD2 neighbors during PBWT selection.
     let t_ibd2 = std::time::Instant::now();
     let n_ind = n_samples;
@@ -274,7 +271,7 @@ pub fn run_phase_rare(
         vec![CFlip::new(0, 0.0); rare_het_samples[ri].len()]
     }).collect();
 
-    // Build scaffold bitmatrix: TARGET HAPS ONLY (C++ exact: n_haplotypes = 2*n_samples).
+    // Build scaffold bitmatrix: TARGET HAPS ONLY (n_haplotypes = 2*n_samples).
     let scaffold_eval = vec![true; n_scaffold];
     let scaffold_bm = super::pbwt_neighbor::HaplotypeBitmatrix::from_panel(
         n_scaffold, n_haps,
@@ -285,7 +282,7 @@ pub fn run_phase_rare(
         &scaffold_eval,
     );
 
-    // C++ exact: forward THEN backward (sequential, not parallel).
+    // Forward THEN backward (sequential, not parallel).
     // Forward writes to phased[] immediately, backward sees updated state.
     run_pbwt_phase(
         &variant_order, &scaffold_sites, &rare_sites,
@@ -294,7 +291,7 @@ pub fn run_phase_rare(
         cm, &scaffold_cm, &mut phase_fwd, true, &ibd2_global,
     );
 
-    // Apply forward results to phased[] (C++ exact: phase() modifies in-place during sweep)
+    // Apply forward results to phased[] (modifies in-place during sweep)
     for (ri, &rv) in rare_sites.iter().enumerate() {
         for (hi, &si) in rare_het_samples[ri].iter().enumerate() {
             let fwd = &phase_fwd[ri][hi];
@@ -319,7 +316,7 @@ pub fn run_phase_rare(
     );
 
     // ======================== MERGE FORWARD + BACKWARD ========================
-    // C++ exact: pick the direction with higher confidence
+    // Pick the direction with higher confidence
     let mut n_phased = 0usize;
 
     for (ri, &rv) in rare_sites.iter().enumerate() {
@@ -355,7 +352,7 @@ pub fn run_phase_rare(
 }
 
 /// Run one direction of PBWT sweep (forward or backward) and phase rare hets.
-/// C++ exact: uses TARGET-ONLY haplotypes (n_hap = 2*n_samples).
+/// Uses TARGET-ONLY haplotypes (n_hap = 2*n_samples).
 fn run_pbwt_phase(
     variant_order: &[VariantTag],
     scaffold_sites: &[usize],
@@ -375,7 +372,7 @@ fn run_pbwt_phase(
     let n_scaffold = scaffold_sites.len();
     if n_scaffold == 0 { return; }
 
-    // PBWT arrays — TARGET HAPS ONLY (C++ exact: n_haplotypes = 2*n_samples)
+    // PBWT arrays — TARGET HAPS ONLY (n_haplotypes = 2*n_samples)
     let mut a_arr: Vec<usize> = (0..n_hap).collect();
     let mut b_arr: Vec<usize> = vec![0; n_hap];
     let mut c_arr: Vec<usize> = vec![0; n_hap];
@@ -460,7 +457,7 @@ fn run_pbwt_phase(
             let rv = rare_sites[ri];
             let vr_cm = cm[rv] as f32;
 
-            // C++ exact: C vector uses TARGET HAPS ONLY
+            // C vector uses TARGET HAPS ONLY
             let tar_base = rv * n_hap;
             for h in 0..n_hap {
                 c_vec[h] = if phased[tar_base + h] != 0 { 1 } else { -1 };

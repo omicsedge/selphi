@@ -1,4 +1,4 @@
-//! BREF3 (Binary Reference Format v3) writer — byte-identical with Beagle's bref3.jar.
+//! BREF3 (Binary Reference Format v3) writer — byte-identical output.
 //!
 //! Parallel: multi-threaded BGZF decompression + rayon parallel GT extraction +
 //! rayon parallel SeqCoder inner loops (hap scans for 171K+ haps panels).
@@ -217,7 +217,7 @@ pub fn write_bref3_from_bcf(source_path: &Path, output_path: &Path) -> io::Resul
     Ok(())
 }
 
-/// SeqCoder update: Beagle-style split with parallel inner loops.
+/// SeqCoder update: sequence-coded split with parallel inner loops.
 /// Returns true if n_seq overflowed (caller must flush and retry).
 fn seq_coder_update(
     hap_to_seq: &mut [u16], n_seq: &mut u16, seq_cnt: &mut Vec<u32>,

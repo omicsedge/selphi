@@ -6,14 +6,14 @@ use super::genotype_graph::*;
 use super::params::HAP_NUMBER;
 use super::cpp_rng::CppRng;
 
-/// Sample a diplotype path — uses CppRng matching C++ genotype::sample exactly.
+/// Sample a diplotype path — uses CppRng for deterministic sampling.
 pub fn sample_diplotypes(
     graph: &mut GenotypeGraph,
     trans_probs: &[f64],
     missing_probs: &[f32],
     rng: &mut CppRng,
 ) {
-    // C++: if (rng.getDouble() < 0.5f)
+    // Randomly pick forward or backward
     if rng.get_double() < 0.5 {
         sample_forward(graph, trans_probs, missing_probs, rng);
     } else {
@@ -22,7 +22,7 @@ pub fn sample_diplotypes(
 }
 
 /// Forward sampling: traverse segments left→right, sampling each diplotype.
-/// C++ sampleForward: prev_dipcount=1, toffset accumulated, rng.sample for all segments.
+/// Forward sampling: prev_dipcount=1, toffset accumulated, rng.sample for all segments.
 fn sample_forward(
     graph: &mut GenotypeGraph,
     trans_probs: &[f64],
@@ -150,7 +150,7 @@ pub fn store_probs(
     for t in 0..graph.n_transitions.min(trans_probs.len()) {
         if graph.prob_mask[t] {
             if trel < graph.prob_stored.len() {
-                // C++: float += double (promotes to f64 before add, then truncates)
+                // f32 += f64 (promotes to f64 before add, then truncates back)
                 graph.prob_stored[trel] = (graph.prob_stored[trel] as f64 + trans_probs[t]) as f32;
             }
             trel += 1;

@@ -3,7 +3,7 @@ use crate::selphi_debug;
 use super::rng::JavaRandom;
 use rayon::prelude::*;
 
-/// Pre-compute coded step values from haplotype-major bitmatrix (parallel, like Java CodedSteps).
+/// Pre-compute coded step values from haplotype-major bitmatrix (parallel).
 /// Word-level extraction: 2-3 byte reads per haplotype per step.
 /// Returns (coded_idx, n_alleles): coded_idx is step-major [step * m_total + h].
 pub fn precompute_coded_steps_parallel(
@@ -347,8 +347,6 @@ pub fn pbwt_coded_ibs_bwd_batch(
     let n_steps = pre_na.len();
     let n_targ = m_total - n_ref;
     let check_ibs2 = !ibs2_offsets.is_empty();
-    let _beagle_compat = std::env::var("SELPHI_BEAGLE_COMPAT").unwrap_or_default() == "1";
-
     let mut ibs_out = vec![-1i32; n_steps * n_targ];
 
     let mut a: Vec<i32> = (0..m_total as i32).collect();
