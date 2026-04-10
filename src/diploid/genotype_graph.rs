@@ -1,5 +1,4 @@
 #![allow(unused_assignments, unused_variables)]
-#![allow(dead_code)]
 //! Genotype graph: segments with diplotype bitmasks.
 //!
 //! Each sample's genotypes are represented as a sequence of segments.

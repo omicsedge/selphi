@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_assignments, unused_variables)]
+#![allow(unused_assignments, unused_variables)]
 //! Segment merging (pruning) for genotype graphs.
 //!
 //! During pruning iterations, adjacent segments with low-entropy transitions

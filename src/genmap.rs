@@ -10,9 +10,8 @@ use crate::selphi_debug;
 ///
 /// Map format: space-separated, columns [2]=BP position, [3]=cM.
 /// Lines starting with '#' are comments.
-pub fn load_and_interpolate_genetic_map(map_path: &Path, chip_bps: &[i64]) -> Vec<f64> {
-    let content = std::fs::read_to_string(map_path)
-        .unwrap_or_else(|e| panic!("Cannot read genetic map {}: {}", map_path.display(), e));
+pub fn load_and_interpolate_genetic_map(map_path: &Path, chip_bps: &[i64]) -> std::io::Result<Vec<f64>> {
+    let content = std::fs::read_to_string(map_path)?;
 
     // Parse map: (position, cM) pairs
     let mut map_entries: Vec<(i64, f64)> = Vec::new();
@@ -27,22 +26,21 @@ pub fn load_and_interpolate_genetic_map(map_path: &Path, chip_bps: &[i64]) -> Ve
     map_entries.sort_by_key(|&(bp, _)| bp);
 
     if map_entries.is_empty() {
-        return vec![0.0; chip_bps.len()];
+        return Ok(vec![0.0; chip_bps.len()]);
     }
 
     // Linear interpolation for each chip position
     let map_bp: Vec<i64> = map_entries.iter().map(|&(bp, _)| bp).collect();
     let map_cm: Vec<f64> = map_entries.iter().map(|&(_, cm)| cm).collect();
 
-    chip_bps.iter().map(|&bp| {
+    Ok(chip_bps.iter().map(|&bp| {
         interpolate_cm(&map_bp, &map_cm, bp)
-    }).collect()
+    }).collect())
 }
 
 /// Load raw genetic map as (bp, cM) arrays.
-pub fn load_genetic_map_raw(map_path: &Path) -> (Vec<i64>, Vec<f64>) {
-    let content = std::fs::read_to_string(map_path)
-        .unwrap_or_else(|e| panic!("Cannot read genetic map {}: {}", map_path.display(), e));
+pub fn load_genetic_map_raw(map_path: &Path) -> std::io::Result<(Vec<i64>, Vec<f64>)> {
+    let content = std::fs::read_to_string(map_path)?;
 
     let mut map_bp = Vec::new();
     let mut map_cm = Vec::new();
@@ -72,7 +70,7 @@ pub fn load_genetic_map_raw(map_path: &Path) -> (Vec<i64>, Vec<f64>) {
     let sorted_bp: Vec<i64> = indices.iter().map(|&i| map_bp[i]).collect();
     let sorted_cm: Vec<f64> = indices.iter().map(|&i| map_cm[i]).collect();
 
-    (sorted_bp, sorted_cm)
+    Ok((sorted_bp, sorted_cm))
 }
 
 /// Linear interpolation of a single BP position.
@@ -140,19 +138,18 @@ pub fn compute_ld_correction(
     if n_chip < 3 * window_size {
         return chip_cm.to_vec();
     }
-
-    // Compute switch rates
     let switch_rates = compute_switch_rates(ref_alleles, n_chip, n_haps);
+    apply_ld_correction(chip_cm, &switch_rates, window_size)
+}
 
-    // Map-predicted rates
+fn apply_ld_correction(chip_cm: &[f64], switch_rates: &[f64], window_size: usize) -> Vec<f64> {
+    let n_chip = chip_cm.len();
+
     let mut map_diffs = vec![0.0f64; n_chip - 1];
     for i in 0..n_chip - 1 {
         map_diffs[i] = (chip_cm[i + 1] - chip_cm[i]).max(1e-8);
     }
 
-    // Ratio of observed to predicted
-    // Python: ratios[nz] = sr[nz] / (md[nz] / md[nz].mean() * sr[nz].mean())
-    // Both means are computed over nonzero switch_rate indices only.
     let nonzero: Vec<usize> = (0..n_chip - 1).filter(|&i| switch_rates[i] > 0.0).collect();
     let sr_mean = if nonzero.is_empty() { 1.0 } else {
         nonzero.iter().map(|&i| switch_rates[i]).sum::<f64>() / nonzero.len() as f64
@@ -171,7 +168,6 @@ pub fn compute_ld_correction(
         }
     }
 
-    // Clip extremes (5th-95th percentile)
     let mut nz_ratios: Vec<f64> = ratios.iter().copied()
         .zip(switch_rates.iter()).filter(|(_, s)| **s > 0.0)
         .map(|(r, _)| r).collect();
@@ -180,9 +176,7 @@ pub fn compute_ld_correction(
     let (p5, p95) = if nz_ratios.is_empty() {
         (0.5, 2.0)
     } else {
-        let p5 = numpy_percentile(&nz_ratios, 5.0);
-        let p95 = numpy_percentile(&nz_ratios, 95.0);
-        (p5, p95)
+        (numpy_percentile(&nz_ratios, 5.0), numpy_percentile(&nz_ratios, 95.0))
     };
     selphi_debug!("  [LD-DBG] nz_ratios={} p5={:.15} p95={:.15}", nz_ratios.len(), p5, p95);
 
@@ -190,7 +184,6 @@ pub fn compute_ld_correction(
         *r = r.clamp(p5, p95);
     }
 
-    // Rolling median smoothing (numpy-compatible: average middle two for even windows)
     let half_w = window_size / 2;
     let mut smoothed = vec![1.0f64; n_chip - 1];
     for i in 0..ratios.len() {
@@ -206,13 +199,11 @@ pub fn compute_ld_correction(
         };
     }
 
-    // Apply correction
     let mut corrected_diffs = vec![0.0f64; n_chip - 1];
     for i in 0..n_chip - 1 {
         corrected_diffs[i] = map_diffs[i] * smoothed[i];
     }
 
-    // Renormalize to preserve total span
     let total_orig: f64 = map_diffs.iter().sum();
     let total_corr: f64 = corrected_diffs.iter().sum();
     if total_corr > 0.0 {
@@ -222,7 +213,6 @@ pub fn compute_ld_correction(
         }
     }
 
-    // Rebuild cumulative
     let mut corrected = vec![0.0f64; n_chip];
     corrected[0] = chip_cm[0];
     for i in 0..n_chip - 1 {
@@ -273,7 +263,6 @@ fn compute_switch_rates(ref_alleles: &[u8], n_chip: usize, n_haps: usize) -> Vec
     rates
 }
 
-/// LD correction using bitmatrix reference (no byte array allocation).
 pub fn compute_ld_correction_bm(
     ref_bm: &crate::common::HaplotypeBitmatrix,
     chip_cm: &[f64],
@@ -285,57 +274,7 @@ pub fn compute_ld_correction_bm(
         return chip_cm.to_vec();
     }
     let switch_rates = compute_switch_rates_bm(ref_bm, n_chip, n_haps);
-    // Rest is identical to compute_ld_correction
-    let mut map_diffs = vec![0.0f64; n_chip - 1];
-    for i in 0..n_chip - 1 {
-        map_diffs[i] = (chip_cm[i + 1] - chip_cm[i]).max(1e-8);
-    }
-    let nonzero: Vec<usize> = (0..n_chip - 1).filter(|&i| switch_rates[i] > 0.0).collect();
-    let sr_mean = if nonzero.is_empty() { 1.0 } else {
-        nonzero.iter().map(|&i| switch_rates[i]).sum::<f64>() / nonzero.len() as f64
-    };
-    let md_mean = if nonzero.is_empty() { 1.0 } else {
-        nonzero.iter().map(|&i| map_diffs[i]).sum::<f64>() / nonzero.len() as f64
-    };
-    selphi_debug!("  [LD-DBG] nonzero={} sr_mean={:.15} md_mean={:.15}", nonzero.len(), sr_mean, md_mean);
-    let mut ratios = vec![1.0f64; n_chip - 1];
-    for &i in &nonzero {
-        let predicted = map_diffs[i] / md_mean * sr_mean;
-        if predicted > 0.0 { ratios[i] = switch_rates[i] / predicted; }
-    }
-    let mut nz_ratios: Vec<f64> = ratios.iter().copied()
-        .zip(switch_rates.iter()).filter(|(_, s)| **s > 0.0)
-        .map(|(r, _)| r).collect();
-    nz_ratios.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-    let (p5, p95) = if nz_ratios.is_empty() { (0.5, 2.0) } else {
-        (numpy_percentile(&nz_ratios, 5.0), numpy_percentile(&nz_ratios, 95.0))
-    };
-    selphi_debug!("  [LD-DBG] nz_ratios={} p5={:.15} p95={:.15}", nz_ratios.len(), p5, p95);
-    for r in &mut ratios { *r = r.clamp(p5, p95); }
-    let half_w = window_size / 2;
-    let mut smoothed = vec![1.0f64; n_chip - 1];
-    for i in 0..ratios.len() {
-        let lo = i.saturating_sub(half_w);
-        let hi = (i + half_w + 1).min(ratios.len());
-        let mut window: Vec<f64> = ratios[lo..hi].to_vec();
-        window.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        let mid = window.len() / 2;
-        smoothed[i] = if window.len() % 2 == 0 {
-            (window[mid - 1] + window[mid]) / 2.0
-        } else { window[mid] };
-    }
-    let mut corrected_diffs = vec![0.0f64; n_chip - 1];
-    for i in 0..n_chip - 1 { corrected_diffs[i] = map_diffs[i] * smoothed[i]; }
-    let total_orig: f64 = map_diffs.iter().sum();
-    let total_corr: f64 = corrected_diffs.iter().sum();
-    if total_corr > 0.0 {
-        let scale = total_orig / total_corr;
-        for d in &mut corrected_diffs { *d *= scale; }
-    }
-    let mut corrected = vec![0.0f64; n_chip];
-    corrected[0] = chip_cm[0];
-    for i in 0..n_chip - 1 { corrected[i + 1] = corrected[i] + corrected_diffs[i]; }
-    corrected
+    apply_ld_correction(chip_cm, &switch_rates, window_size)
 }
 
 /// Switch rates from bitmatrix: XOR + popcount per consecutive pair.

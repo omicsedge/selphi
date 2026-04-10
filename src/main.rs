@@ -422,7 +422,8 @@ fn main() {
     let start_time = Instant::now();
 
     // 1. Load reference panel
-    let srp = Arc::new(SrpReader::open(&args.refpanel, args.threads * 2));
+    let srp = Arc::new(SrpReader::open(&args.refpanel, args.threads * 2)
+        .expect("Failed to load SRP reference panel"));
     let n_ref_variants = srp.n_variants();
     let n_ref = srp.n_haps();
     let ref_positions: Vec<i64> = srp.variants.iter().map(|v| v.pos).collect();
@@ -465,13 +466,15 @@ fn main() {
 
     // 6. Genetic map
     let chip_bps: Vec<i64> = wgs_idx.iter().map(|&wi| ref_positions[wi]).collect();
-    let raw_chip_cm = genmap::load_and_interpolate_genetic_map(Path::new(map_path), &chip_bps);
+    let raw_chip_cm = genmap::load_and_interpolate_genetic_map(Path::new(map_path), &chip_bps)
+        .unwrap_or_else(|e| { selphi_error!("Cannot read genetic map {}: {}", map_path, e); std::process::exit(1); });
 
     // 6b. Phase if input is unphased (in-memory fusion — no VCF round-trip)
     let needs_phasing = !is_phased || args.force_phasing;
     let (targ_alleles, em_ne_per_site, ref_bm_from_phasing) = if needs_phasing {
         selphi_step!("Input is unphased — running phasing pipeline...");
-        let (map_bp_raw, map_cm_raw) = genmap::load_genetic_map_raw(Path::new(map_path));
+        let (map_bp_raw, map_cm_raw) = genmap::load_genetic_map_raw(Path::new(map_path))
+            .unwrap_or_else(|e| { selphi_error!("Cannot read genetic map {}: {}", map_path, e); std::process::exit(1); });
         let ref_bp: Vec<i64> = ref_positions.clone();
 
         // Resolve phasing engine

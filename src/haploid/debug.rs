@@ -30,12 +30,12 @@ pub fn dump_ibs(it: usize, wi: usize, global_ibs: &[i32], n_steps: usize, n_targ
                 h0: usize, h1: usize) {
     let dd = debug_dir();
     let path = format!("{}/ibs_it{}_w{}.txt", dd.display(), it, wi);
-    let mut f = fs::File::create(&path).unwrap();
-    writeln!(f, "step\tibs_h0\tibs_h1").unwrap();
+    let Ok(mut f) = fs::File::create(&path) else { return };
+    let _ = writeln!(f, "step\tibs_h0\tibs_h1");
     for s in 0..n_steps {
         let v0 = global_ibs[s * n_targ_haps + h0];
         let v1 = global_ibs[s * n_targ_haps + h1];
-        writeln!(f, "{}\t{}\t{}", s, v0, v1).unwrap();
+        let _ = writeln!(f, "{}\t{}\t{}", s, v0, v1);
     }
     selphi_debug!("  [DEBUG] Dumped IBS candidates ({} steps) to {}", n_steps, path);
 }
@@ -45,19 +45,18 @@ pub fn dump_composites(it: usize, wi: usize, si: usize,
                        comp: &[u8], ns: usize, wsz: usize) {
     let dd = debug_dir();
     let path = format!("{}/comp_it{}_w{}_s{}.txt", dd.display(), it, wi, si);
-    let mut f = fs::File::create(&path).unwrap();
-    // comp is bit-packed marker-major: bit j of marker m = (comp[m*cbs+(j>>3)] >> (j&7)) & 1
+    let Ok(mut f) = fs::File::create(&path) else { return };
     let cbs = if wsz > 0 { comp.len() / wsz } else { (ns + 7) >> 3 };
-    writeln!(f, "# Composites: iter={}, window={}, sample={}, ns={}, wsz={}",
-             it, wi, si, ns, wsz).unwrap();
+    let _ = writeln!(f, "# Composites: iter={}, window={}, sample={}, ns={}, wsz={}",
+             it, wi, si, ns, wsz);
     let n_show = wsz;
-    writeln!(f, "# state\tmarker_alleles[0..{}]", n_show).unwrap();
+    let _ = writeln!(f, "# state\tmarker_alleles[0..{}]", n_show);
     for j in 0..ns {
-        write!(f, "{}", j).unwrap();
+        let _ = write!(f, "{}", j);
         for m in 0..n_show {
-            write!(f, "\t{}", (comp[m * cbs + (j >> 3)] >> (j & 7)) & 1).unwrap();
+            let _ = write!(f, "\t{}", (comp[m * cbs + (j >> 3)] >> (j & 7)) & 1);
         }
-        writeln!(f).unwrap();
+        let _ = writeln!(f);
     }
     selphi_debug!("  [DEBUG] Dumped composites ({} states x {} markers) to {}", ns, wsz, path);
 }
@@ -68,12 +67,12 @@ pub fn dump_clusters(it: usize, wi: usize, si: usize,
                      cha: &[i32], hma: &[i32]) {
     let dd = debug_dir();
     let path = format!("{}/clusters_it{}_w{}_s{}.txt", dd.display(), it, wi, si);
-    let mut f = fs::File::create(&path).unwrap();
-    writeln!(f, "# Clusters: iter={}, window={}, sample={}, nc={}",
-             it, wi, si, nc).unwrap();
-    writeln!(f, "# c\tstart\tend\tsize\tis_het\thet_idx").unwrap();
+    let Ok(mut f) = fs::File::create(&path) else { return };
+    let _ = writeln!(f, "# Clusters: iter={}, window={}, sample={}, nc={}",
+             it, wi, si, nc);
+    let _ = writeln!(f, "# c\tstart\tend\tsize\tis_het\thet_idx");
     for c in 0..nc {
-        writeln!(f, "{}\t{}\t{}\t{}\t{}\t{}", c, csa[c], cea[c], cza[c], cha[c], hma[c]).unwrap();
+        let _ = writeln!(f, "{}\t{}\t{}\t{}\t{}\t{}", c, csa[c], cea[c], cza[c], cha[c], hma[c]);
     }
     selphi_debug!("  [DEBUG] Dumped {} clusters to {}", nc, path);
 }
@@ -83,18 +82,17 @@ pub fn dump_mismatch(it: usize, wi: usize, si: usize,
                      mm: &[u8], nc: usize, ns: usize) {
     let dd = debug_dir();
     let path = format!("{}/mismatch_it{}_w{}_s{}.txt", dd.display(), it, wi, si);
-    let mut f = fs::File::create(&path).unwrap();
-    writeln!(f, "# Mismatch: iter={}, window={}, sample={}, nc={}, ns={}",
-             it, wi, si, nc, ns).unwrap();
-    // Only dump het clusters (cha!=0)
-    writeln!(f, "# ch\tc\t[state0..stateN]").unwrap();
+    let Ok(mut f) = fs::File::create(&path) else { return };
+    let _ = writeln!(f, "# Mismatch: iter={}, window={}, sample={}, nc={}, ns={}",
+             it, wi, si, nc, ns);
+    let _ = writeln!(f, "# ch\tc\t[state0..stateN]");
     for ch in 0..3 {
         for c in 0..nc {
-            write!(f, "{}\t{}", ch, c).unwrap();
+            let _ = write!(f, "{}\t{}", ch, c);
             for j in 0..ns.min(20) {
-                write!(f, "\t{}", mm[ch * nc * ns + c * ns + j]).unwrap();
+                let _ = write!(f, "\t{}", mm[ch * nc * ns + c * ns + j]);
             }
-            writeln!(f).unwrap();
+            let _ = writeln!(f);
         }
     }
     selphi_debug!("  [DEBUG] Dumped mismatch matrix to {}", path);
@@ -106,13 +104,13 @@ pub fn dump_swap_posteriors(it: usize, wi: usize, si: usize,
     // Each entry: (marker_offset, p11, p12, p21, p22, swapped, locked)
     let dd = debug_dir();
     let path = format!("{}/swaps_it{}_w{}_s{}.txt", dd.display(), it, wi, si);
-    let mut f = fs::File::create(&path).unwrap();
-    writeln!(f, "# Swaps: iter={}, window={}, sample={}, n_hets={}",
-             it, wi, si, hets.len()).unwrap();
-    writeln!(f, "# het_idx\tmarker\tp11\tp12\tp21\tp22\tswap\tlock").unwrap();
+    let Ok(mut f) = fs::File::create(&path) else { return };
+    let _ = writeln!(f, "# Swaps: iter={}, window={}, sample={}, n_hets={}",
+             it, wi, si, hets.len());
+    let _ = writeln!(f, "# het_idx\tmarker\tp11\tp12\tp21\tp22\tswap\tlock");
     for (i, &(m, p11, p12, p21, p22, sw, lk)) in hets.iter().enumerate() {
-        writeln!(f, "{}\t{}\t{:.6e}\t{:.6e}\t{:.6e}\t{:.6e}\t{}\t{}",
-                 i, m, p11, p12, p21, p22, sw as u8, lk as u8).unwrap();
+        let _ = writeln!(f, "{}\t{}\t{:.6e}\t{:.6e}\t{:.6e}\t{:.6e}\t{}\t{}",
+                 i, m, p11, p12, p21, p22, sw as u8, lk as u8);
     }
     selphi_debug!("  [DEBUG] Dumped {} swap posteriors to {}", hets.len(), path);
 }
@@ -122,13 +120,13 @@ pub fn dump_sample_geno(it: usize, wi: usize, si: usize,
                         g: &[u8], wsz: usize) {
     let dd = debug_dir();
     let path = format!("{}/geno_it{}_w{}_s{}.txt", dd.display(), it, wi, si);
-    let mut f = fs::File::create(&path).unwrap();
-    writeln!(f, "# Genotype: iter={}, window={}, sample={}, wsz={}",
-             it, wi, si, wsz).unwrap();
-    writeln!(f, "# m\ta0\ta1\thet").unwrap();
+    let Ok(mut f) = fs::File::create(&path) else { return };
+    let _ = writeln!(f, "# Genotype: iter={}, window={}, sample={}, wsz={}",
+             it, wi, si, wsz);
+    let _ = writeln!(f, "# m\ta0\ta1\thet");
     for m in 0..wsz {
         let (a0, a1) = (g[m * 2], g[m * 2 + 1]);
-        writeln!(f, "{}\t{}\t{}\t{}", m, a0, a1, if a0 != a1 { 1 } else { 0 }).unwrap();
+        let _ = writeln!(f, "{}\t{}\t{}\t{}", m, a0, a1, if a0 != a1 { 1 } else { 0 });
     }
 }
 
@@ -137,12 +135,12 @@ pub fn dump_recomb(it: usize, wi: usize, si: usize,
                    pr: &[f32], nc: usize, ne: f32, pm: f32) {
     let dd = debug_dir();
     let path = format!("{}/recomb_it{}_w{}_s{}.txt", dd.display(), it, wi, si);
-    let mut f = fs::File::create(&path).unwrap();
-    writeln!(f, "# Recomb: iter={}, window={}, sample={}, nc={}, ne={}, pm={}",
-             it, wi, si, nc, ne, pm).unwrap();
-    writeln!(f, "# c\tp_recomb").unwrap();
+    let Ok(mut f) = fs::File::create(&path) else { return };
+    let _ = writeln!(f, "# Recomb: iter={}, window={}, sample={}, nc={}, ne={}, pm={}",
+             it, wi, si, nc, ne, pm);
+    let _ = writeln!(f, "# c\tp_recomb");
     for c in 0..nc {
-        writeln!(f, "{}\t{:.8e}", c, pr[c]).unwrap();
+        let _ = writeln!(f, "{}\t{:.8e}", c, pr[c]);
     }
 }
 
@@ -151,14 +149,14 @@ pub fn dump_iter_phase(it: usize, wi: usize, si: usize,
                        phased: &[u8], nth: usize, ws: usize, wsz: usize) {
     let dd = debug_dir();
     let path = format!("{}/iter{}_phase_w{}_s{}.txt", dd.display(), it, wi, si);
-    let mut f = fs::File::create(&path).unwrap();
+    let Ok(mut f) = fs::File::create(&path) else { return };
     let (h0, h1) = (si * 2, si * 2 + 1);
-    writeln!(f, "# iter={} window={} sample={} nMarkers={}", it, wi, si, wsz).unwrap();
-    writeln!(f, "# m\th0\th1").unwrap();
+    let _ = writeln!(f, "# iter={} window={} sample={} nMarkers={}", it, wi, si, wsz);
+    let _ = writeln!(f, "# m\th0\th1");
     for m in 0..wsz {
         let a0 = phased[(ws + m) * nth + h0];
         let a1 = phased[(ws + m) * nth + h1];
-        writeln!(f, "{}\t{}\t{}", m, a0, a1).unwrap();
+        let _ = writeln!(f, "{}\t{}\t{}", m, a0, a1);
     }
 }
 
@@ -167,13 +165,13 @@ pub fn dump_iter_phase_local(it: usize, wi: usize, si: usize,
                              hap_bits: &[u8], hbs: usize, wsz: usize) {
     let dd = debug_dir();
     let path = format!("{}/iter{}_phase_w{}_s{}.txt", dd.display(), it, wi, si);
-    let mut f = fs::File::create(&path).unwrap();
+    let Ok(mut f) = fs::File::create(&path) else { return };
     let (h0, h1) = (si * 2, si * 2 + 1);
-    writeln!(f, "# iter={} window={} sample={} nMarkers={}", it, wi, si, wsz).unwrap();
-    writeln!(f, "# m\th0\th1").unwrap();
+    let _ = writeln!(f, "# iter={} window={} sample={} nMarkers={}", it, wi, si, wsz);
+    let _ = writeln!(f, "# m\th0\th1");
     for m in 0..wsz {
         let a0 = (hap_bits[h0 * hbs + (m >> 3)] >> (m & 7)) & 1;
         let a1 = (hap_bits[h1 * hbs + (m >> 3)] >> (m & 7)) & 1;
-        writeln!(f, "{}\t{}\t{}", m, a0, a1).unwrap();
+        let _ = writeln!(f, "{}\t{}\t{}", m, a0, a1);
     }
 }

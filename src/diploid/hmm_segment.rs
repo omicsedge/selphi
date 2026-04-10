@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-#![allow(dead_code)]
 //! Segment-based Li-Stephens HMM.
 //!
 //! State space: K conditioning haplotypes × HAP_NUMBER (8) internal haplotype
@@ -64,8 +62,10 @@ impl AlignedF32 {
         }
     }
 
+    #[allow(dead_code)]
     #[inline(always)]
     fn as_ptr(&self) -> *const f32 { self.ptr }
+    #[allow(dead_code)]
     #[inline(always)]
     fn as_mut_ptr(&mut self) -> *mut f32 { self.ptr }
 }
@@ -1228,9 +1228,7 @@ impl SegmentHmm {
         }
     }
 
-    /// Compute diplotype transition probabilities.
-    /// DProbs[d_prev * 64_per_segment?] — simplified: d_prev indexes into
-    /// the diplotype bitmask of the current segment.
+    #[allow(dead_code)]
     fn compute_d_probs_mult(&mut self) -> bool {
         let mut sum = 0.0f64;
         for d in 0..64 {

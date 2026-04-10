@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_assignments, unused_variables)]
 #![allow(unused_assignments, unused_variables)]
 //! Standard PBWT with depth-adaptive neighbor extraction.
 //!
@@ -21,14 +20,13 @@ pub use crate::common::HaplotypeBitmatrix;
 /// bits[h * n_words .. (h+1) * n_words] = set of conditioning haplotype indices for h.
 pub struct ConditioningBitset {
     bits: Vec<u64>,
-    n_haps: usize,
     n_words: usize,
 }
 
 impl ConditioningBitset {
     pub fn new(n_haps: usize) -> Self {
         let n_words = (n_haps + 63) / 64;
-        Self { bits: vec![0u64; n_haps * n_words], n_haps, n_words }
+        Self { bits: vec![0u64; n_haps * n_words], n_words }
     }
 
     /// Add a neighbor for haplotype h.
@@ -275,13 +273,6 @@ impl PbwtNeighborIndex {
             }
         }
         self.data.fill(-1);
-    }
-
-    /// Run PBWT sweep — parallel chunks with direct haplotype slice access.
-    pub fn pbwt_sweep<F, G>(&mut self, _n_sites: usize, _haplotypes: F, _ibd2_check: G)
-    where F: Fn(usize, usize) -> bool + Sync, G: Fn(usize, usize, usize) -> bool + Sync {
-        // Use pbwt_sweep_direct instead (called from phase_common)
-        unreachable!("Use pbwt_sweep_direct for optimized path");
     }
 
     /// Parallel PBWT sweep with bitmatrix (1 bit/allele, 8× less memory bandwidth).
@@ -599,84 +590,6 @@ impl PbwtNeighborIndex {
         }
     }
 
-    /// Single-chunk PBWT sweep.
-    /// C++ exact: iterate positions (not haplotypes), no inverse permutation needed.
-    fn pbwt_sweep_chunk<F, G>(
-        &mut self, _chunk: usize, n_sites: usize, _buffer_start: usize,
-        haplotypes: &F, ibd2_check: &G,
-    ) where F: Fn(usize, usize) -> bool, G: Fn(usize, usize, usize) -> bool {
-        let n_hap = self.n_haps;
-        let addr_offset = self.n_groups * self.n_haps;
-
-        let mut a: Vec<i32> = (0..n_hap as i32).collect();
-        let mut c: Vec<i32> = vec![0; n_hap];
-        let mut b_arr: Vec<i32> = vec![0; n_hap];
-        let mut d_arr: Vec<i32> = vec![0; n_hap];
-        let mut allele_row = vec![false; n_hap];
-
-        for l in 0..n_sites {
-            if !self.site_eval[l] { continue; }
-
-            for h in 0..n_hap { allele_row[h] = haplotypes(l, h); }
-
-            let mut u = 0usize; let mut v = 0usize;
-            let mut p = l as i32; let mut q = l as i32;
-            for h in 0..n_hap {
-                let a_h = a[h]; let c_h = c[h];
-                if c_h > p { p = c_h; } if c_h > q { q = c_h; }
-                if !allele_row[a_h as usize] {
-                    a[u] = a_h; c[u] = p; p = 0; u += 1;
-                } else {
-                    b_arr[v] = a_h; d_arr[v] = q; q = 0; v += 1;
-                }
-            }
-            a[u..u+v].copy_from_slice(&b_arr[..v]);
-            c[u..u+v].copy_from_slice(&d_arr[..v]);
-
-            if self.site_selection[l] {
-                let group = self.site_grouping[l];
-
-                // C++ exact: iterate POSITIONS in PBWT order (no a_inv needed)
-                // for (int h = 0; h < n_hap; h++) { chap = A[h]; ... }
-                for h in 0..n_hap {
-                    let chap = a[h] as usize;
-                    let mut off0 = 1usize; let mut off1 = 1usize;
-                    let mut dg0 = -1i32; let mut dg1 = -1i32;
-                    let tar_idx = group * n_hap + chap;
-                    for nd in 0..self.depth {
-                        let (add0, hap0) = if h >= off0 {
-                            let pos = h - off0;
-                            dg0 = dg0.max(c[pos + 1]);
-                            let nb = a[pos] as usize;
-                            (ibd2_check(chap, nb, l), nb)
-                        } else { (false, 0) };
-                        let (add1, hap1) = if h + off1 < n_hap {
-                            let pos = h + off1;
-                            dg1 = dg1.max(c[pos]);
-                            let nb = a[pos] as usize;
-                            (ibd2_check(chap, nb, l), nb)
-                        } else { (false, 0) };
-                        if add0 && add1 {
-                            if dg0 < dg1 {
-                                self.data[nd * addr_offset + tar_idx] = hap0 as i32;
-                                off0 += 1;
-                            } else {
-                                self.data[nd * addr_offset + tar_idx] = hap1 as i32;
-                                off1 += 1;
-                            }
-                        } else if add0 {
-                            self.data[nd * addr_offset + tar_idx] = hap0 as i32;
-                            off0 += 1;
-                        } else if add1 {
-                            self.data[nd * addr_offset + tar_idx] = hap1 as i32;
-                            off1 += 1;
-                        } else { off0 += 1; off1 += 1; }
-                    }
-                }
-            }
-        }
-    }
-
     /// Transpose from (depth, group, hap) to (depth, hap, group).
     /// Also rebuilds cond_bits from the transposed data for consistency.
     pub fn transpose(&mut self) {
@@ -783,10 +696,14 @@ mod tests {
         let mut counter = 0usize;
         idx.select_storage_sites(&mut |n| { counter += 1; 0 });
 
-        idx.pbwt_sweep(n_sites,
-            |site, hap| (hap * 7 + site * 3) % 2 == 1,
-            |h1, h2, _| h1 / 2 != h2 / 2,
+        let site_eval = vec![true; n_sites];
+        let bm = HaplotypeBitmatrix::from_panel(
+            n_sites, n_haps,
+            &|site, hap| (hap * 7 + site * 3) % 2 == 1,
+            &site_eval,
         );
+        let ibd2 = crate::diploid::ibd2_tracks::Ibd2Tracks::new(n_haps / 2);
+        idx.pbwt_sweep_direct(n_sites, &ibd2, &bm);
         idx.transpose();
 
         let cond = idx.get_conditioning_set(0);
@@ -840,10 +757,14 @@ mod tests {
         let mut idx = PbwtNeighborIndex::new(&cm, n_haps, 4, 0.1, 2, &ac, &vec![0u32; n_sites], 0.1);
 
         idx.select_storage_sites(&mut |n| 0);
-        idx.pbwt_sweep(n_sites,
-            |site, hap| (hap * 7 + site * 3) % 2 == 1,
-            |h1, h2, _| h1 / 2 != h2 / 2,
+        let site_eval = vec![true; n_sites];
+        let bm = HaplotypeBitmatrix::from_panel(
+            n_sites, n_haps,
+            &|site, hap| (hap * 7 + site * 3) % 2 == 1,
+            &site_eval,
         );
+        let ibd2 = crate::diploid::ibd2_tracks::Ibd2Tracks::new(n_haps / 2);
+        idx.pbwt_sweep_direct(n_sites, &ibd2, &bm);
         idx.transpose();
 
         // get_conditioning_union(h0, h1) should match manual union

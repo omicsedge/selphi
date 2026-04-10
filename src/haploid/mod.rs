@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Haploid phasing engine: composite HMM with 3-channel greedy swap.
 
 pub mod hmm;
@@ -19,7 +18,6 @@ use crate::common::HaplotypeBitmatrix;
 
 const N_BURNIN: usize = 3;
 const N_PHASING: usize = 12;
-const N_TOTAL: usize = N_BURNIN + N_PHASING;
 const N_MOSAIC: usize = 280;
 
 fn lr_threshold(it: usize, n_burnin: usize, n_phasing: usize) -> f64 {

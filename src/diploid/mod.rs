@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Diploid phasing: genotype graph + segment HMM + phase_rare.
 //!
 //! Activated by `--wgs-phasing`. Optimized for WGS data with rare variants.
@@ -78,7 +77,7 @@ pub fn diploid_phase_bm_prefiltered(
 
     _diploid_run(
         target_geno, common_ref_bm, common_chip_indices,
-        CommonPrep { target_geno_common, cm_common, bp_common, chip_cm_full },
+        CommonPrep { target_geno_common, cm_common, bp_common },
         chip_bp, n_var, n_samples, n_ref, seed, n_threads,
     )
 }
@@ -87,7 +86,6 @@ struct CommonPrep {
     target_geno_common: Vec<u8>,
     cm_common: Vec<f64>,
     bp_common: Vec<i64>,
-    chip_cm_full: Vec<f64>,
 }
 
 fn _prepare_common(
@@ -147,7 +145,7 @@ fn _prepare_common(
     let bp_common: Vec<i64> = common_indices.iter().map(|&v| chip_bp[v]).collect();
 
     (common_indices, common_ref_bm, CommonPrep {
-        target_geno_common, cm_common, bp_common, chip_cm_full,
+        target_geno_common, cm_common, bp_common,
     })
 }
 
@@ -163,7 +161,7 @@ fn _diploid_run(
     let seed = if seed == 33 { 15052011 } else { seed };
     let n_haps = n_samples * 2;
     let n_common = common_indices.len();
-    let CommonPrep { target_geno_common, cm_common, bp_common, chip_cm_full: _ } = prep;
+    let CommonPrep { target_geno_common, cm_common, bp_common } = prep;
 
     crate::selphi_debug!("  [diploid] Building genotype graphs for {} samples ({} common variants)...",
         n_samples, n_common);

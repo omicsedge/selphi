@@ -23,56 +23,57 @@ pub struct SrpReader {
 }
 
 impl SrpReader {
-    pub fn open<P: AsRef<std::path::Path>>(path: P, _cache_size: usize) -> Self {
+    pub fn open<P: AsRef<std::path::Path>>(path: P, _cache_size: usize) -> std::io::Result<Self> {
         use std::io::Seek;
         let filepath = path.as_ref().to_string_lossy().to_string();
-        let mut f = File::open(&filepath).unwrap_or_else(|e| {
-            panic!("Cannot open SRP file {}: {}", filepath, e);
-        });
+        let mut f = File::open(&filepath)?;
 
         let mut magic = [0u8; 8];
-        f.read_exact(&mut magic).unwrap();
+        f.read_exact(&mut magic)?;
         if &magic != MAGIC {
-            panic!("Invalid SRP file: {}. Expected SRP format. Regenerate with: selphi --prepare-reference-from panel.bcf --out panel", filepath);
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                format!("Invalid SRP file: {}. Expected SRP format. Regenerate with: selphi --prepare-reference-from panel.bcf --out panel", filepath)));
         }
 
         let mut buf4 = [0u8; 4];
-        let read_section = |f: &mut File| -> Vec<u8> {
+        let read_section = |f: &mut File| -> std::io::Result<Vec<u8>> {
             let mut b = [0u8; 4];
-            f.read_exact(&mut b).unwrap();
+            f.read_exact(&mut b)?;
             let len = u32::from_le_bytes(b) as usize;
             let mut data = vec![0u8; len];
-            f.read_exact(&mut data).unwrap();
-            data
+            f.read_exact(&mut data)?;
+            Ok(data)
         };
 
         // Header
-        let hdr_comp = read_section(&mut f);
-        let hdr: JsonValue = serde_json::from_slice(
-            &zstd::decode_all(Cursor::new(&hdr_comp)).unwrap()
-        ).unwrap();
+        let hdr_comp = read_section(&mut f)?;
+        let hdr_raw = zstd::decode_all(Cursor::new(&hdr_comp))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let hdr: JsonValue = serde_json::from_slice(&hdr_raw)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let metadata = SrpMetadata::from_json(&hdr);
 
         // Variants
-        let vcomp = read_section(&mut f);
-        let variants = Self::parse_variants_bin(
-            &zstd::decode_all(Cursor::new(&vcomp)).unwrap(), metadata.n_variants);
+        let vcomp = read_section(&mut f)?;
+        let vraw = zstd::decode_all(Cursor::new(&vcomp))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let variants = Self::parse_variants_bin(&vraw, metadata.n_variants);
 
         // Sample IDs, IDs, Original IDs
-        let sample_ids = Self::decode_strings(&read_section(&mut f), false);
-        let ids = Self::decode_strings(&read_section(&mut f), true);
-        let orig = Self::decode_strings(&read_section(&mut f), true);
+        let sample_ids = Self::decode_strings(&read_section(&mut f)?, false);
+        let ids = Self::decode_strings(&read_section(&mut f)?, true);
+        let orig = Self::decode_strings(&read_section(&mut f)?, true);
         let original_ids = if orig.len() == metadata.n_variants { orig } else { ids.clone() };
 
         // Contig field (skip)
-        let _ = read_section(&mut f);
+        let _ = read_section(&mut f)?;
 
         // Chunk index
-        f.read_exact(&mut buf4).unwrap();
+        f.read_exact(&mut buf4)?;
         let n_chunks = u32::from_le_bytes(buf4) as usize;
         let chunk_index = if n_chunks > 0 {
             let mut cidx = vec![0u8; n_chunks * 16];
-            f.read_exact(&mut cidx).unwrap();
+            f.read_exact(&mut cidx)?;
             let idx: Vec<(u64, u32, u32)> = (0..n_chunks).map(|i| {
                 let b = i * 16;
                 (u64::from_le_bytes(cidx[b..b+8].try_into().unwrap()),
@@ -80,15 +81,15 @@ impl SrpReader {
                  u32::from_le_bytes(cidx[b+12..b+16].try_into().unwrap()))
             }).collect();
             let last = &idx[n_chunks - 1];
-            f.seek(std::io::SeekFrom::Start(last.0 + last.1 as u64)).unwrap();
+            f.seek(std::io::SeekFrom::Start(last.0 + last.1 as u64))?;
             idx
         } else { vec![] };
 
         // Tile index
-        f.read_exact(&mut buf4).unwrap();
+        f.read_exact(&mut buf4)?;
         let n_tiles = u32::from_le_bytes(buf4) as usize;
         let mut tidx = vec![0u8; n_tiles * 12];
-        f.read_exact(&mut tidx).unwrap();
+        f.read_exact(&mut tidx)?;
 
         let n_tile_rows = hdr.get("n_tile_rows").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let n_tile_cols = hdr.get("n_tile_cols").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -106,7 +107,7 @@ impl SrpReader {
 
         let mmap = File::open(&filepath).ok().and_then(|f| unsafe { memmap2::Mmap::map(&f).ok() });
 
-        SrpReader { metadata, variants, sample_ids, ids, original_ids, tiled, mmap, chunk_index }
+        Ok(SrpReader { metadata, variants, sample_ids, ids, original_ids, tiled, mmap, chunk_index })
     }
 
     // ======================================================================

@@ -92,24 +92,6 @@ pub fn precompute_coded_steps_parallel(
     (coded_idx, n_alleles_vec)
 }
 
-/// Unpack one bit-packed row (bit_stride bytes) into u8 buffer (bit_stride*8 elements).
-/// Each byte expands to 8 u8 values (0 or 1), LSB first.
-#[inline]
-fn unpack_bits(src: &[u8], dst: &mut [u8], bit_stride: usize) {
-    for bi in 0..bit_stride {
-        let b = src[bi];
-        let o = bi << 3;
-        dst[o]     = b & 1;
-        dst[o + 1] = (b >> 1) & 1;
-        dst[o + 2] = (b >> 2) & 1;
-        dst[o + 3] = (b >> 3) & 1;
-        dst[o + 4] = (b >> 4) & 1;
-        dst[o + 5] = (b >> 5) & 1;
-        dst[o + 6] = (b >> 6) & 1;
-        dst[o + 7] = (b >> 7) & 1;
-    }
-}
-
 /// Compute coded step boundaries from genetic map 
 pub fn compute_step_boundaries(cm: &[f64], step_scale: f64) -> (Vec<i32>, Vec<i32>) {
     let n = cm.len();
