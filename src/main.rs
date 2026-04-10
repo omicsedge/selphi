@@ -450,6 +450,10 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Memory estimation + warning
+    let needs_phasing_estimate = !is_phased || args.force_phasing;
+    selphi::log::estimate_and_warn(n_chip, n_ref, n_samples, args.threads, needs_phasing_estimate);
+
     // Set rayon thread pool (before phasing or imputation)
     rayon::ThreadPoolBuilder::new()
         .num_threads(args.threads)

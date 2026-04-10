@@ -107,6 +107,96 @@ pub fn peak_mem_mb() -> f64 {
     0.0
 }
 
+/// Total system RAM in MB. Works on Linux (/proc/meminfo) and macOS (sysctl).
+pub fn system_ram_mb() -> f64 {
+    // Linux
+    if let Ok(info) = std::fs::read_to_string("/proc/meminfo") {
+        for line in info.lines() {
+            if line.starts_with("MemTotal:") {
+                let kb: f64 = line.split_whitespace()
+                    .nth(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                return kb / 1024.0;
+            }
+        }
+    }
+    // macOS
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("sysctl").arg("-n").arg("hw.memsize").output();
+        if let Ok(o) = out {
+            if let Ok(s) = String::from_utf8(o.stdout) {
+                if let Ok(bytes) = s.trim().parse::<u64>() {
+                    return bytes as f64 / (1024.0 * 1024.0);
+                }
+            }
+        }
+    }
+    0.0
+}
+
+/// Estimate peak memory for imputation/phasing and warn if insufficient.
+/// Call after loading SRP metadata + target intersection.
+pub fn estimate_and_warn(
+    n_chip: usize, n_ref: usize, n_samples: usize, n_threads: usize,
+    needs_phasing: bool,
+) {
+    let n_haps = n_samples * 2;
+    let n_ref_words = (n_ref + 63) / 64;
+
+    // ref_bm: bitmatrix (1 bit per allele)
+    let ref_bm_mb = (n_chip * n_ref_words * 8) as f64 / 1e6;
+
+    // targ_alleles
+    let targ_mb = (n_chip * n_haps) as f64 / 1e6;
+
+    // SRP preload (capped at ~500 MB)
+    let preload_mb = 500.0;
+
+    // Per-window HMM: each thread uses ~n_candidates * n_var_window * 4 bytes
+    // Typical: 200 candidates × 10K variants × 4 bytes = 8 MB per thread
+    let hmm_per_thread_mb = 8.0;
+    let hmm_mb = n_threads as f64 * hmm_per_thread_mb;
+
+    // all_weights per window: n_haps × ~200 CsrWeights entries × 12 bytes
+    let weights_mb = (n_haps as f64 * 200.0 * 12.0) / 1e6;
+
+    // Output buffers, misc overhead
+    let overhead_mb = 200.0;
+
+    let mut total_mb = ref_bm_mb + targ_mb + preload_mb + hmm_mb + weights_mb + overhead_mb;
+
+    // Phasing adds significant memory
+    if needs_phasing {
+        // hap_bits: (n_ref + n_haps) × (window_size / 8) bytes per window
+        // Typical window: 5K variants → 625 bytes per haplotype
+        let hap_bits_mb = ((n_ref + n_haps) as f64 * 625.0) / 1e6;
+        // IBS2 + coded steps + working arrays
+        let phasing_overhead_mb = 300.0;
+        total_mb += hap_bits_mb + phasing_overhead_mb;
+    }
+
+    let sys_ram = system_ram_mb();
+    let total_gb = total_mb / 1024.0;
+    let sys_gb = sys_ram / 1024.0;
+
+    crate::selphi_info!("  Resources: {:.1} GB estimated, {:.1} GB system RAM, {} threads",
+        total_gb, sys_gb, n_threads);
+    crate::selphi_info!("    ref_bm={:.0} MB  target={:.0} MB  preload={:.0} MB  hmm={:.0} MB  weights={:.0} MB",
+        ref_bm_mb, targ_mb, preload_mb, hmm_mb, weights_mb);
+
+    if sys_ram > 0.0 && total_mb > sys_ram * 0.9 {
+        crate::selphi_info!("  ⚠ WARNING: estimated memory ({:.1} GB) exceeds 90% of system RAM ({:.1} GB)",
+            total_gb, sys_gb);
+        crate::selphi_info!("    The system may run out of memory. Consider:");
+        crate::selphi_info!("    - Using fewer threads (--threads {})", (n_threads / 2).max(1));
+        crate::selphi_info!("    - Running on a machine with more RAM");
+        if n_ref > 100_000 {
+            crate::selphi_info!("    - Large panel ({} haplotypes): ref bitmatrix alone = {:.1} GB",
+                n_ref, ref_bm_mb / 1024.0);
+        }
+    }
+}
+
 /// Print the startup banner.
 pub fn print_banner(version: &str) {
     write_log(&format!(r#"
