@@ -112,6 +112,12 @@ unsafe fn divss(a: f32, b: f32) -> f32 { unsafe {
     r
 }}
 
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn divss(a: f32, b: f32) -> f32 {
+    a / b
+}
+
 /// Segment HMM state for one sample in one window.
 pub struct SegmentHmm {
     /// prob[k * HAP_NUMBER + h]: P(cond hap k, internal hap h)
@@ -271,6 +277,26 @@ impl SegmentHmm {
             self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
                             + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let nt_div = divss(nt, self.prob_sum_t);
+            let yt_div = divss(yt, self.n_cond as f32 * self.prob_sum_t);
+            let mut tfreq = [0.0f32; HAP_NUMBER];
+            for h in 0..HAP_NUMBER { tfreq[h] = self.prob_sum_h[h] * yt_div; }
+            let mut sum = [0.0f32; HAP_NUMBER];
+            for k in 0..self.n_cond {
+                let base = k * HAP_NUMBER;
+                for h in 0..HAP_NUMBER {
+                    let mut p = self.prob[base + h] * nt_div + tfreq[h];
+                    if cond_alleles[k] != target_allele { p *= MISMATCH; }
+                    self.prob[base + h] = p;
+                    sum[h] += p;
+                }
+            }
+            self.prob_sum_h = sum;
+            self.prob_sum_t = sum[0] + sum[1] + sum[2] + sum[3]
+                            + sum[4] + sum[5] + sum[6] + sum[7];
+        }
         true
     }
 
@@ -312,6 +338,26 @@ impl SegmentHmm {
             self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
                             + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let nt_div = divss(nt, self.prob_sum_t);
+            let factor = divss(yt, self.n_cond as f32 * self.prob_sum_t);
+            let mut tfreq = [0.0f32; HAP_NUMBER];
+            for h in 0..HAP_NUMBER { tfreq[h] = self.prob_sum_h[h] * factor; }
+            let mut sum = [0.0f32; HAP_NUMBER];
+            for k in 0..self.n_cond {
+                let g = if cond_alleles[k] { &g1 } else { &g0 };
+                let base = k * HAP_NUMBER;
+                for h in 0..HAP_NUMBER {
+                    let p = (self.prob[base + h] * nt_div + tfreq[h]) * g[h];
+                    self.prob[base + h] = p;
+                    sum[h] += p;
+                }
+            }
+            self.prob_sum_h = sum;
+            self.prob_sum_t = sum[0] + sum[1] + sum[2] + sum[3]
+                            + sum[4] + sum[5] + sum[6] + sum[7];
+        }
     }
 
     /// Run at a missing site: transition only, uniform emission.
@@ -337,6 +383,25 @@ impl SegmentHmm {
             _mm256_storeu_ps(self.prob_sum_h.as_mut_ptr(), _sum);
             self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
                             + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let nt_div = divss(nt, self.prob_sum_t);
+            let factor = divss(yt, self.n_cond as f32 * self.prob_sum_t);
+            let mut tfreq = [0.0f32; HAP_NUMBER];
+            for h in 0..HAP_NUMBER { tfreq[h] = self.prob_sum_h[h] * factor; }
+            let mut sum = [0.0f32; HAP_NUMBER];
+            for k in 0..self.n_cond {
+                let base = k * HAP_NUMBER;
+                for h in 0..HAP_NUMBER {
+                    let p = self.prob[base + h] * nt_div + tfreq[h];
+                    self.prob[base + h] = p;
+                    sum[h] += p;
+                }
+            }
+            self.prob_sum_h = sum;
+            self.prob_sum_t = sum[0] + sum[1] + sum[2] + sum[3]
+                            + sum[4] + sum[5] + sum[6] + sum[7];
         }
     }
 
@@ -383,6 +448,24 @@ impl SegmentHmm {
             self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
                             + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let tfreq_val = divss(yt, self.n_cond as f32);
+            let nt_div = divss(nt, self.prob_sum_t);
+            let mut sum = [0.0f32; HAP_NUMBER];
+            for k in 0..self.n_cond {
+                let base = k * HAP_NUMBER;
+                let mut p = self.prob_sum_k[k] * nt_div + tfreq_val;
+                if cond_alleles[k] != target_allele { p *= MISMATCH; }
+                for h in 0..HAP_NUMBER {
+                    self.prob[base + h] = p;
+                    sum[h] += p;
+                }
+            }
+            self.prob_sum_h = sum;
+            self.prob_sum_t = sum[0] + sum[1] + sum[2] + sum[3]
+                            + sum[4] + sum[5] + sum[6] + sum[7];
+        }
     }
 
     /// C++ exact: AVX2 COLLAPSE_AMB
@@ -419,6 +502,25 @@ impl SegmentHmm {
             self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
                             + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let tfreq_val = divss(yt, self.n_cond as f32);
+            let nt_div = divss(nt, self.prob_sum_t);
+            let mut sum = [0.0f32; HAP_NUMBER];
+            for k in 0..self.n_cond {
+                let g = if cond_alleles[k] { &g1 } else { &g0 };
+                let base = k * HAP_NUMBER;
+                let base_p = self.prob_sum_k[k] * nt_div + tfreq_val;
+                for h in 0..HAP_NUMBER {
+                    let p = base_p * g[h];
+                    self.prob[base + h] = p;
+                    sum[h] += p;
+                }
+            }
+            self.prob_sum_h = sum;
+            self.prob_sum_t = sum[0] + sum[1] + sum[2] + sum[3]
+                            + sum[4] + sum[5] + sum[6] + sum[7];
+        }
     }
 
     /// C++ exact: AVX2 COLLAPSE_MIS
@@ -440,6 +542,23 @@ impl SegmentHmm {
             _mm256_storeu_ps(self.prob_sum_h.as_mut_ptr(), _sum);
             self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
                             + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let tfreq_val = divss(yt, self.n_cond as f32);
+            let nt_div = divss(nt, self.prob_sum_t);
+            let mut sum = [0.0f32; HAP_NUMBER];
+            for k in 0..self.n_cond {
+                let base = k * HAP_NUMBER;
+                let p = self.prob_sum_k[k] * nt_div + tfreq_val;
+                for h in 0..HAP_NUMBER {
+                    self.prob[base + h] = p;
+                    sum[h] += p;
+                }
+            }
+            self.prob_sum_h = sum;
+            self.prob_sum_t = sum[0] + sum[1] + sum[2] + sum[3]
+                            + sum[4] + sum[5] + sum[6] + sum[7];
         }
     }
 
@@ -553,6 +672,28 @@ impl SegmentHmm {
             self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
                             + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let nt_div = divss(nt, self.prob_sum_t);
+            let yt_div = divss(yt, self.n_cond as f32 * self.prob_sum_t);
+            let emit_match: [f32; 2] = if target_allele { [MISMATCH, 1.0] } else { [1.0, MISMATCH] };
+            let mut tfreq = [0.0f32; HAP_NUMBER];
+            for h in 0..HAP_NUMBER { tfreq[h] = self.prob_sum_h[h] * yt_div; }
+            let mut sum = [0.0f32; HAP_NUMBER];
+            for k in 0..self.n_cond {
+                let ah = unsafe { Self::bm_bit(bm_row, k) } as usize;
+                let emit = emit_match[ah];
+                let base = k * HAP_NUMBER;
+                for h in 0..HAP_NUMBER {
+                    let p = (self.prob[base + h] * nt_div + tfreq[h]) * emit;
+                    self.prob[base + h] = p;
+                    sum[h] += p;
+                }
+            }
+            self.prob_sum_h = sum;
+            self.prob_sum_t = sum[0] + sum[1] + sum[2] + sum[3]
+                            + sum[4] + sum[5] + sum[6] + sum[7];
+        }
         true
     }
 
@@ -591,6 +732,28 @@ impl SegmentHmm {
             self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
                             + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let nt_div = divss(nt, self.prob_sum_t);
+            let factor = divss(yt, self.n_cond as f32 * self.prob_sum_t);
+            let mut tfreq = [0.0f32; HAP_NUMBER];
+            for h in 0..HAP_NUMBER { tfreq[h] = self.prob_sum_h[h] * factor; }
+            let emit = [&g0, &g1];
+            let mut sum = [0.0f32; HAP_NUMBER];
+            for k in 0..self.n_cond {
+                let ah = unsafe { Self::bm_bit(bm_row, k) } as usize;
+                let g = emit[ah];
+                let base = k * HAP_NUMBER;
+                for h in 0..HAP_NUMBER {
+                    let p = (self.prob[base + h] * nt_div + tfreq[h]) * g[h];
+                    self.prob[base + h] = p;
+                    sum[h] += p;
+                }
+            }
+            self.prob_sum_h = sum;
+            self.prob_sum_t = sum[0] + sum[1] + sum[2] + sum[3]
+                            + sum[4] + sum[5] + sum[6] + sum[7];
+        }
     }
 
     fn collapse_hom_bm(&mut self, target_allele: bool, bm_row: *const u64, nt: f32, yt: f32) {
@@ -620,6 +783,25 @@ impl SegmentHmm {
             _mm256_storeu_ps(self.prob_sum_h.as_mut_ptr(), _sum);
             self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
                             + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let tfreq_val = divss(yt, self.n_cond as f32);
+            let nt_div = divss(nt, self.prob_sum_t);
+            let emit_match: [f32; 2] = if target_allele { [MISMATCH, 1.0] } else { [1.0, MISMATCH] };
+            let mut sum = [0.0f32; HAP_NUMBER];
+            for k in 0..self.n_cond {
+                let ah = unsafe { Self::bm_bit(bm_row, k) } as usize;
+                let base = k * HAP_NUMBER;
+                let p = (self.prob_sum_k[k] * nt_div + tfreq_val) * emit_match[ah];
+                for h in 0..HAP_NUMBER {
+                    self.prob[base + h] = p;
+                    sum[h] += p;
+                }
+            }
+            self.prob_sum_h = sum;
+            self.prob_sum_t = sum[0] + sum[1] + sum[2] + sum[3]
+                            + sum[4] + sum[5] + sum[6] + sum[7];
         }
     }
 
@@ -653,6 +835,27 @@ impl SegmentHmm {
             _mm256_storeu_ps(self.prob_sum_h.as_mut_ptr(), _sum);
             self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
                             + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let tfreq_val = divss(yt, self.n_cond as f32);
+            let nt_div = divss(nt, self.prob_sum_t);
+            let emit = [&g0, &g1];
+            let mut sum = [0.0f32; HAP_NUMBER];
+            for k in 0..self.n_cond {
+                let ah = unsafe { Self::bm_bit(bm_row, k) } as usize;
+                let g = emit[ah];
+                let base = k * HAP_NUMBER;
+                let base_p = self.prob_sum_k[k] * nt_div + tfreq_val;
+                for h in 0..HAP_NUMBER {
+                    let p = base_p * g[h];
+                    self.prob[base + h] = p;
+                    sum[h] += p;
+                }
+            }
+            self.prob_sum_h = sum;
+            self.prob_sum_t = sum[0] + sum[1] + sum[2] + sum[3]
+                            + sum[4] + sum[5] + sum[6] + sum[7];
         }
     }
 
@@ -1485,6 +1688,25 @@ impl SegmentHmm {
                 // C++ exact: compute row sum first, then add to running total
                 // (different from adding each element to running total one-by-one)
                 sum_h += self.h_probs[h1*HAP_NUMBER+0]+self.h_probs[h1*HAP_NUMBER+1]+self.h_probs[h1*HAP_NUMBER+2]+self.h_probs[h1*HAP_NUMBER+3]+self.h_probs[h1*HAP_NUMBER+4]+self.h_probs[h1*HAP_NUMBER+5]+self.h_probs[h1*HAP_NUMBER+6]+self.h_probs[h1*HAP_NUMBER+7];
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            for h1 in 0..HAP_NUMBER {
+                let fact2 = (alpha_sum[h1] / alpha_sum_sum.max(1e-30)) * yt / n_cond as f32;
+                let mut row_sum = [0.0f32; HAP_NUMBER];
+                for k in 0..n_cond {
+                    let base = k * HAP_NUMBER;
+                    let alpha_val = alpha_full[base + h1] * fact1 + fact2;
+                    for h2 in 0..HAP_NUMBER {
+                        row_sum[h2] += alpha_val * self.prob[base + h2];
+                    }
+                }
+                for h2 in 0..HAP_NUMBER {
+                    self.h_probs[h1 * HAP_NUMBER + h2] = row_sum[h2];
+                }
+                sum_h += row_sum[0] + row_sum[1] + row_sum[2] + row_sum[3]
+                       + row_sum[4] + row_sum[5] + row_sum[6] + row_sum[7];
             }
         }
 
