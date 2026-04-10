@@ -77,7 +77,7 @@ pub fn diploid_phase_bm_prefiltered(
 
     _diploid_run(
         target_geno, common_ref_bm, common_chip_indices,
-        CommonPrep { target_geno_common, cm_common, bp_common },
+        CommonPrep { target_geno_common, cm_common, cm_full: chip_cm_full, bp_common },
         chip_bp, n_var, n_samples, n_ref, seed, n_threads,
     )
 }
@@ -85,6 +85,7 @@ pub fn diploid_phase_bm_prefiltered(
 struct CommonPrep {
     target_geno_common: Vec<u8>,
     cm_common: Vec<f64>,
+    cm_full: Vec<f64>,
     bp_common: Vec<i64>,
 }
 
@@ -145,7 +146,7 @@ fn _prepare_common(
     let bp_common: Vec<i64> = common_indices.iter().map(|&v| chip_bp[v]).collect();
 
     (common_indices, common_ref_bm, CommonPrep {
-        target_geno_common, cm_common, bp_common,
+        target_geno_common, cm_common, cm_full: chip_cm_full, bp_common,
     })
 }
 
@@ -161,7 +162,7 @@ fn _diploid_run(
     let seed = if seed == 33 { 15052011 } else { seed };
     let n_haps = n_samples * 2;
     let n_common = common_indices.len();
-    let CommonPrep { target_geno_common, cm_common, bp_common } = prep;
+    let CommonPrep { target_geno_common, cm_common, cm_full, bp_common } = prep;
 
     crate::selphi_debug!("  [diploid] Building genotype graphs for {} samples ({} common variants)...",
         n_samples, n_common);
@@ -231,10 +232,12 @@ fn _diploid_run(
         }
     }
 
-    // phase_rare skipped in bitmatrix path (full ref_bm already freed).
-    // Rare hets remain unphased (random from initial genotype).
-    // For WGS, all target-polymorphic variants are in common_indices (MAC≥1).
-    crate::selphi_debug!("  [diploid] phase_rare: skipped (bitmatrix path)");
+    // Phase rare het variants using common-variant scaffold
+    let empty_ref = vec![0u8; 0];
+    phase_rare::run_phase_rare(
+        &mut phased, &empty_ref, target_geno, &cm_full,
+        n_var, n_samples, n_ref, 1, 15000.0, common_indices,
+    );
 
     // Confidence: 1.0 everywhere (diploid Viterbi confidence not yet implemented)
     let confidence = vec![1.0f32; n_var * n_samples];
