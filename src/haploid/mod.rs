@@ -10,7 +10,6 @@ pub mod rng;
 pub mod debug;
 pub mod composite;
 
-#[allow(unused_imports)]
 use crate::selphi_debug;
 use rayon::prelude::*;
 use std::time::Instant;

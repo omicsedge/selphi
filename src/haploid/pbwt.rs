@@ -1,5 +1,4 @@
 /// PBWT coded-step IBS extraction 
-#[allow(unused_imports)]
 use crate::selphi_debug;
 use super::rng::JavaRandom;
 use rayon::prelude::*;

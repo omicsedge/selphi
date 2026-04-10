@@ -1,5 +1,4 @@
 /// EM parameter estimation.
-#[allow(unused_imports)]
 use crate::selphi_debug;
 use super::hmm;
 

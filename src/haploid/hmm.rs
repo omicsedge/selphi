@@ -1,7 +1,6 @@
 #![allow(unused_assignments, unused_variables)]
 /// HMM phase worker: composites + clusters + 3-channel forward-backward with swap.
 /// Haploid HMM phase worker: composites + clusters + 3-channel forward-backward with swap.
-#[allow(unused_imports)]
 use crate::selphi_debug;
 
 // Min-heap helpers (Java PriorityQueue)
