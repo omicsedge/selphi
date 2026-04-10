@@ -1,5 +1,4 @@
 ///  windowing: genPos/basePos interpolation + RefTargSlidingWindow.
-
 /// PlinkGenMap.genPos() with minEndCmDist=5.0 edge extrapolation.
 pub fn interpolate_gen_pos(bp: i64, map_bp: &[i64], map_cm: &[f64]) -> f64 {
     let n = map_bp.len();
@@ -131,7 +130,7 @@ pub fn compute_windows(
             let key = interpolate_base_pos(start_gen, map_bp, map_cm);
             let wsz = we - ws;
             let olm = wsz >> 2; // windowMarkers >> 2
-            let low = if wsz > olm { wsz - olm } else { 0 };
+            let low = wsz.saturating_sub(olm);
             let mut ov = wsz.saturating_sub(1);
 
             // Binary search within window

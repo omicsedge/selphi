@@ -213,7 +213,7 @@ fn process_region(
         // Flush chunk to disk when full
         if row >= chunk_size {
             let cp = tmp_dir.join(format!("chunk_{}_{}.bin", tid, chunk_idx));
-            std::fs::write(&cp, &compress_chunk(&cols, row, nh))?;
+            std::fs::write(&cp, compress_chunk(&cols, row, nh))?;
             chunk_files.push(cp);
             chunk_row_counts.push(row);
             cols = vec![Vec::new(); nh];
@@ -223,7 +223,7 @@ fn process_region(
     }
     if row > 0 {
         let cp = tmp_dir.join(format!("chunk_{}_{}.bin", tid, chunk_idx));
-        std::fs::write(&cp, &compress_chunk(&cols, row, nh))?;
+        std::fs::write(&cp, compress_chunk(&cols, row, nh))?;
         chunk_files.push(cp);
         chunk_row_counts.push(row);
     }
@@ -262,10 +262,10 @@ fn parse_header(buf: &[u8]) -> io::Result<BcfHeader> {
     let mut sn = Vec::new(); let mut cn = Vec::new(); let mut cf = String::new(); let mut gk: u16 = 0;
     for l in t.lines() {
         if l.starts_with("##contig=<ID=") {
-            let s = "##contig=<ID=".len(); let e = l[s..].find(|c:char| c==',' || c=='>').map(|p| s+p).unwrap_or(l.len());
+            let s = "##contig=<ID=".len(); let e = l[s..].find([',', '>']).map(|p| s+p).unwrap_or(l.len());
             cn.push(l[s..e].to_string()); if cf.is_empty() { cf = l.to_string(); }
         } else if l.starts_with("##FORMAT=<ID=GT,") {
-            if let Some(p) = l.find("IDX=") { let s = p+4; let e = l[s..].find(|c:char| c==',' || c=='>').map(|p| s+p).unwrap_or(l.len()); gk = l[s..e].parse().unwrap_or(0); }
+            if let Some(p) = l.find("IDX=") { let s = p+4; let e = l[s..].find([',', '>']).map(|p| s+p).unwrap_or(l.len()); gk = l[s..e].parse().unwrap_or(0); }
         } else if l.starts_with("#CHROM") {
             let f: Vec<&str> = l.split('\t').collect(); if f.len() > 9 { sn = f[9..].iter().map(|s| s.to_string()).collect(); }
         }

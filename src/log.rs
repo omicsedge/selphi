@@ -141,7 +141,7 @@ pub fn estimate_and_warn(
     needs_phasing: bool,
 ) {
     let n_haps = n_samples * 2;
-    let n_ref_words = (n_ref + 63) / 64;
+    let n_ref_words = n_ref.div_ceil(64);
 
     // ref_bm: bitmatrix (1 bit per allele)
     let ref_bm_mb = (n_chip * n_ref_words * 8) as f64 / 1e6;
@@ -163,8 +163,8 @@ pub fn estimate_and_warn(
     // Stripe tiles: ~500 KB per stripe × n_tile_cols. Capped at 2 GB.
     // alt_probs per batch: n_haps × TILE_ROWS × 4 bytes × stripes_per_batch.
     // With mem cap, batch holds ~300 stripes max.
-    let tile_cols = (n_ref + 4095) / 4096;
-    let stripes_per_batch = 300usize.min((n_chip * 100 + 1023) / 1024); // rough estimate
+    let tile_cols = n_ref.div_ceil(4096);
+    let stripes_per_batch = 300usize.min((n_chip * 100).div_ceil(1024)); // rough estimate
     let stripe_decomp_mb = (stripes_per_batch * tile_cols * 500 * 1024) as f64 / 1e6;
     let interp_mb = (n_haps * 1024 * 4 * stripes_per_batch) as f64 / 1e6;
 
@@ -222,11 +222,9 @@ pub fn print_banner(version: &str) {
 /// Write a message to both stderr and the log file.
 pub fn write_log(msg: &str) {
     eprintln!("{}", msg);
-    if let Ok(mut inner) = LOGGER.lock() {
-        if let Some(ref mut f) = inner.file {
-            let _ = writeln!(f, "{}", msg);
-            let _ = f.flush();
-        }
+    if let Ok(mut inner) = LOGGER.lock() && let Some(ref mut f) = inner.file {
+        let _ = writeln!(f, "{}", msg);
+        let _ = f.flush();
     }
 }
 

@@ -192,7 +192,7 @@ fn apply_ld_correction(chip_cm: &[f64], switch_rates: &[f64], window_size: usize
         let mut window: Vec<f64> = ratios[lo..hi].to_vec();
         window.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         let mid = window.len() / 2;
-        smoothed[i] = if window.len() % 2 == 0 {
+        smoothed[i] = if window.len().is_multiple_of(2) {
             (window[mid - 1] + window[mid]) / 2.0
         } else {
             window[mid]

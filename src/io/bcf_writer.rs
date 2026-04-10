@@ -34,22 +34,22 @@ pub fn setup(
     let mut writer = BufWriter::with_capacity(4 << 20, bgzf);
 
     // Write VCF header
-    write!(writer, "##fileformat=VCFv4.2\n")?;
-    write!(writer, "##source=Selphi_v{version} SelfDecode™\n")?;
-    write!(writer, "##FILTER=<ID=PASS,Description=\"All filters passed\">\n")?;
-    write!(writer, "##INFO=<ID=IMP,Number=0,Type=Flag,Description=\"Imputed marker\">\n")?;
-    write!(writer, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">\n")?;
-    write!(writer, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele Number\">\n")?;
-    write!(writer, "##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Estimated Allele Count\">\n")?;
-    write!(writer, "##INFO=<ID=DR2,Number=1,Type=Float,Description=\"Dosage R-squared: estimated imputation accuracy\">\n")?;
-    write!(writer, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n")?;
-    write!(writer, "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"estimated ALT dose\">\n")?;
-    write!(writer, "##FORMAT=<ID=AP1,Number=A,Type=Float,Description=\"estimated ALT dose on first haplotype\">\n")?;
-    write!(writer, "##FORMAT=<ID=AP2,Number=A,Type=Float,Description=\"estimated ALT dose on second haplotype\">\n")?;
-    write!(writer, "{}\n", contig_field)?;
+    writeln!(writer, "##fileformat=VCFv4.2")?;
+    writeln!(writer, "##source=Selphi_v{version} SelfDecode™")?;
+    writeln!(writer, "##FILTER=<ID=PASS,Description=\"All filters passed\">")?;
+    writeln!(writer, "##INFO=<ID=IMP,Number=0,Type=Flag,Description=\"Imputed marker\">")?;
+    writeln!(writer, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">")?;
+    writeln!(writer, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele Number\">")?;
+    writeln!(writer, "##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Estimated Allele Count\">")?;
+    writeln!(writer, "##INFO=<ID=DR2,Number=1,Type=Float,Description=\"Dosage R-squared: estimated imputation accuracy\">")?;
+    writeln!(writer, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">")?;
+    writeln!(writer, "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"estimated ALT dose\">")?;
+    writeln!(writer, "##FORMAT=<ID=AP1,Number=A,Type=Float,Description=\"estimated ALT dose on first haplotype\">")?;
+    writeln!(writer, "##FORMAT=<ID=AP2,Number=A,Type=Float,Description=\"estimated ALT dose on second haplotype\">")?;
+    writeln!(writer, "{}", contig_field)?;
     write!(writer, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
     for name in sample_names { write!(writer, "\t{}", name)?; }
-    write!(writer, "\n")?;
+    writeln!(writer)?;
 
     selphi_info!("  BCF output: {} ({} samples)", vcf_gz_path.display(), n_samples);
     Ok(BcfWriter { writer, path: vcf_gz_path, convert_to_bcf: true })

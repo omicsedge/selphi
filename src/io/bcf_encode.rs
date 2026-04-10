@@ -51,24 +51,24 @@ pub fn write_bcf_header(
     let mut header_text = Vec::with_capacity(4096);
 
     use std::io::Write;
-    write!(header_text, "##fileformat=VCFv4.2\n").unwrap();
-    write!(header_text, "##source=Selphi_v{version} SelfDecode™\n").unwrap();
-    write!(header_text, "##FILTER=<ID=PASS,Description=\"All filters passed\",IDX={}>\n", FILTER_PASS_IDX).unwrap();
-    write!(header_text, "##INFO=<ID=IMP,Number=0,Type=Flag,Description=\"Imputed marker\",IDX={}>\n", INFO_IMP_IDX).unwrap();
-    write!(header_text, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\",IDX={}>\n", INFO_AF_IDX).unwrap();
-    write!(header_text, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele Number\",IDX={}>\n", INFO_AN_IDX).unwrap();
-    write!(header_text, "##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Estimated Allele Count\",IDX={}>\n", INFO_AC_IDX).unwrap();
-    write!(header_text, "##INFO=<ID=DR2,Number=1,Type=Float,Description=\"Dosage R-squared: estimated imputation accuracy\",IDX={}>\n", INFO_DR2_IDX).unwrap();
-    write!(header_text, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\",IDX={}>\n", FMT_GT_IDX).unwrap();
-    write!(header_text, "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"estimated ALT dose\",IDX={}>\n", FMT_DS_IDX).unwrap();
+    writeln!(header_text, "##fileformat=VCFv4.2").unwrap();
+    writeln!(header_text, "##source=Selphi_v{version} SelfDecode™").unwrap();
+    writeln!(header_text, "##FILTER=<ID=PASS,Description=\"All filters passed\",IDX={}>", FILTER_PASS_IDX).unwrap();
+    writeln!(header_text, "##INFO=<ID=IMP,Number=0,Type=Flag,Description=\"Imputed marker\",IDX={}>", INFO_IMP_IDX).unwrap();
+    writeln!(header_text, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\",IDX={}>", INFO_AF_IDX).unwrap();
+    writeln!(header_text, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele Number\",IDX={}>", INFO_AN_IDX).unwrap();
+    writeln!(header_text, "##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Estimated Allele Count\",IDX={}>", INFO_AC_IDX).unwrap();
+    writeln!(header_text, "##INFO=<ID=DR2,Number=1,Type=Float,Description=\"Dosage R-squared: estimated imputation accuracy\",IDX={}>", INFO_DR2_IDX).unwrap();
+    writeln!(header_text, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\",IDX={}>", FMT_GT_IDX).unwrap();
+    writeln!(header_text, "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"estimated ALT dose\",IDX={}>", FMT_DS_IDX).unwrap();
     if !no_ap {
-        write!(header_text, "##FORMAT=<ID=AP1,Number=A,Type=Float,Description=\"estimated ALT dose on first haplotype\",IDX={}>\n", FMT_AP1_IDX).unwrap();
-        write!(header_text, "##FORMAT=<ID=AP2,Number=A,Type=Float,Description=\"estimated ALT dose on second haplotype\",IDX={}>\n", FMT_AP2_IDX).unwrap();
+        writeln!(header_text, "##FORMAT=<ID=AP1,Number=A,Type=Float,Description=\"estimated ALT dose on first haplotype\",IDX={}>", FMT_AP1_IDX).unwrap();
+        writeln!(header_text, "##FORMAT=<ID=AP2,Number=A,Type=Float,Description=\"estimated ALT dose on second haplotype\",IDX={}>", FMT_AP2_IDX).unwrap();
     }
-    write!(header_text, "{}\n", contig_field).unwrap();
+    writeln!(header_text, "{}", contig_field).unwrap();
     write!(header_text, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT").unwrap();
     for name in sample_names { write!(header_text, "\t{}", name).unwrap(); }
-    write!(header_text, "\n").unwrap();
+    writeln!(header_text).unwrap();
     header_text.push(0); // null terminator
 
     buf.extend_from_slice(BCF_MAGIC);
@@ -99,10 +99,10 @@ fn encode_typed_int8(buf: &mut Vec<u8>, v: i32) {
 /// Encode a typed integer (picks smallest size).
 #[inline]
 fn encode_typed_int(buf: &mut Vec<u8>, v: i32) {
-    if v >= -128 && v <= 127 {
+    if (-128..=127).contains(&v) {
         buf.push(0x10 | TY_INT8);
         buf.push(v as i8 as u8);
-    } else if v >= -32768 && v <= 32767 {
+    } else if (-32768..=32767).contains(&v) {
         buf.push(0x10 | TY_INT16);
         buf.extend_from_slice(&(v as i16).to_le_bytes());
     } else {
@@ -308,7 +308,7 @@ pub fn encode_chip_record(
     for s in 0..n_samples {
         let a0 = chip_genotypes[chip_idx * n_haps + s * 2];
         let a1 = chip_genotypes[chip_idx * n_haps + s * 2 + 1];
-        buf.push(((a0 + 1) << 1) | 0); // first allele, unphased
+        buf.push((a0 + 1) << 1); // first allele, unphased
         buf.push(((a1 + 1) << 1) | 1); // second allele, phased
     }
 

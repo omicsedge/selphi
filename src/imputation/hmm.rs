@@ -14,8 +14,8 @@ use crate::imputation::match_processing;
 
 // Thread-local buffers: reused across haps to avoid ~156 MB allocation per call.
 thread_local! {
-    static TL_FWD_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
-    static TL_WGT_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    static TL_FWD_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static TL_WGT_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
 // ---------------------------------------------------------------------------
@@ -183,7 +183,7 @@ fn filter_matches_fast(
 /// Fill gaps for near-complete haplotypes (>95% coverage).
 /// Port of `_extend_high_coverage_haps` from imputation_lib.py.
 fn extend_high_coverage_haps(
-    filtered_matches: &mut Vec<Vec<i64>>,
+    filtered_matches: &mut [Vec<i64>],
     n_ref_haps: usize,
     coverage_threshold: f64,
 ) {
@@ -782,7 +782,7 @@ fn finalize_weights(
         }
     }
     if is_last_block {
-        let src = if n_rows >= 3 { n_rows - 3 } else { 0 };
+        let src = n_rows.saturating_sub(3);
         let src_base = src * n_states;
         let last_base = (n_rows - 1) * n_states;
         for j in 0..n_states {
@@ -870,7 +870,7 @@ fn combine_fwd_bwd(
         }
     }
     if is_last_block {
-        let src = if n_rows >= 3 { n_rows - 3 } else { 0 };
+        let src = n_rows.saturating_sub(3);
         let src_base = src * n_states;
         let last_base = (n_rows - 1) * n_states;
         for j in 0..n_states {
@@ -955,7 +955,7 @@ fn build_csr_from_weights(
                     }
                 } else {
                     indices.push(hap_id as i32);
-                    data.push(w as f32);
+                    data.push(w);
                 }
             }
         }
@@ -1020,8 +1020,7 @@ pub fn calculate_weights(
 
     // 4. Optional deduplication
     let dedup_result: Option<DedupResult> = ref_alleles.map(|ra| {
-        let dr = hap_dedup::deduplicate_haplotypes(&filtered, ra, n_chip, n_ref_haps);
-        dr
+        hap_dedup::deduplicate_haplotypes(&filtered, ra, n_chip, n_ref_haps)
     });
 
     let matches_for_hmm: &[Vec<i64>] = if let Some(ref dr) = dedup_result {
@@ -1082,8 +1081,7 @@ pub fn calculate_weights(
         let max_ratio = p_no_err / p_err;
         dense_matches.iter().enumerate().map(|(site, dm)| {
             dm.iter().map(|_| {
-                let r = ser[site].min(max_ratio);
-                r
+                ser[site].min(max_ratio)
             }).collect()
         }).collect()
     });
@@ -1249,8 +1247,8 @@ pub fn calculate_weights(
 
     // Build hap_posterior: expand last forward alpha from HMM states → per-haplotype
     // This serves as the prior for the next window's HMM.
-    let hap_posterior = if hap_prior.is_some() || true {
-        // Always compute posterior for cross-window passthrough
+    // Always compute posterior for cross-window passthrough
+    let hap_posterior = {
         let last_alpha = &fwd_blocks.last().unwrap().0;
         let n_rows_last = fwd_blocks.last().unwrap().1;
         let alpha_end = &last_alpha[(n_rows_last - 1) * n_states..n_rows_last * n_states];
@@ -1262,28 +1260,24 @@ pub fn calculate_weights(
         let s: f64 = hp.iter().sum();
         if s > 0.0 { for v in &mut hp { *v /= s; } }
         Some(hp)
-    } else {
-        None
     };
 
     // Dump weights for hap0 to file for comparison
-    if log_n == 0 && crate::log::is_debug() {
-        if let Some((_, csr)) = results.first() {
-            let dd = crate::log::debug_dir();
-            let path = dd.join("rust_weights_hap0.txt");
-            if let Ok(mut f) = std::fs::File::create(&path) {
-                use std::io::Write;
-                writeln!(f, "# CSR weights hap0: {} rows, {} cols, {} nnz", csr.n_rows, csr.n_cols, csr.nnz()).ok();
-                writeln!(f, "# row col weight").ok();
-                for row in 0..csr.n_rows {
-                    let s = csr.indptr[row] as usize;
-                    let e = csr.indptr[row + 1] as usize;
-                    for k in s..e {
-                        writeln!(f, "{} {} {:.10}", row, csr.indices[k], csr.data[k]).ok();
-                    }
+    if log_n == 0 && crate::log::is_debug() && let Some((_, csr)) = results.first() {
+        let dd = crate::log::debug_dir();
+        let path = dd.join("rust_weights_hap0.txt");
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            use std::io::Write;
+            writeln!(f, "# CSR weights hap0: {} rows, {} cols, {} nnz", csr.n_rows, csr.n_cols, csr.nnz()).ok();
+            writeln!(f, "# row col weight").ok();
+            for row in 0..csr.n_rows {
+                let s = csr.indptr[row] as usize;
+                let e = csr.indptr[row + 1] as usize;
+                for k in s..e {
+                    writeln!(f, "{} {} {:.10}", row, csr.indices[k], csr.data[k]).ok();
                 }
-                selphi_debug!("  [HMM-DEBUG] Dumped hap0 weights: {} rows, {} nnz → {}", csr.n_rows, csr.nnz(), path.display());
             }
+            selphi_debug!("  [HMM-DEBUG] Dumped hap0 weights: {} rows, {} nnz → {}", csr.n_rows, csr.nnz(), path.display());
         }
     }
 

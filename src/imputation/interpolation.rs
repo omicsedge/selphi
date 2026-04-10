@@ -131,11 +131,11 @@ fn sparse_interpolate_kernel(
         // Sum of start/end weights (for denominator)
         let mut ss: f32 = 0.0;
         for j in s1..e1 {
-            ss += w.data[j] as f32;
+            ss += w.data[j];
         }
         let mut es: f32 = 0.0;
         for j in s2..e2 {
-            es += w.data[j] as f32;
+            es += w.data[j];
         }
         let ds = es - ss;
 
@@ -146,7 +146,7 @@ fn sparse_interpolate_kernel(
         // Start weights × ref columns
         for j in s1..e1 {
             let col = w.indices[j] as usize;
-            let wt = w.data[j] as f32;
+            let wt = w.data[j];
             // Binary search in CSC chunk for row_offset..row_end
             let lo = chunk.indptr[col] as usize;
             let hi = chunk.indptr[col + 1] as usize;
@@ -170,7 +170,7 @@ fn sparse_interpolate_kernel(
         // End weights × ref columns
         for j in s2..e2 {
             let col = w.indices[j] as usize;
-            let wt = w.data[j] as f32;
+            let wt = w.data[j];
             let lo = chunk.indptr[col] as usize;
             let hi = chunk.indptr[col + 1] as usize;
             let mut left = lo;

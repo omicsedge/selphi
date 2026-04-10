@@ -40,7 +40,7 @@ pub fn setup_parquet_writer(
     output_path: &Path,
     sample_names: &[String],
 ) -> std::io::Result<(ArrowWriter<std::fs::File>, Arc<Schema>)> {
-    let parquet_path = if output_path.extension().map_or(true, |e| e != "parquet") {
+    let parquet_path = if output_path.extension().is_none_or(|e| e != "parquet") {
         output_path.with_extension("parquet")
     } else {
         output_path.to_path_buf()

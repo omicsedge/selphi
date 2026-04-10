@@ -217,7 +217,7 @@ fn build_srp_from_bcf_native(
     use super::bcf_reader;
 
     let header = bcf_reader::read_header_only(source_path)
-        .map_err(|e| SrpWriterError::Io(e))?;
+        .map_err(SrpWriterError::Io)?;
     let nh = header.n_samples * 2;
 
     let csi_path = { let mut p = source_path.as_os_str().to_owned(); p.push(".csi"); std::path::PathBuf::from(p) };
@@ -232,7 +232,7 @@ fn build_srp_from_bcf_native(
     let chunk_size = if chunk_size_override > 0 { chunk_size_override } else {
         let bpv = 0.06 * nh as f64 * 4.0;
         ((10.0 * 1024.0 * 1024.0 / bpv.max(1.0)) as usize)
-            .max((nv_hint + 1999) / 2000).clamp(1000, 50000)
+            .max(nv_hint.div_ceil(2000)).clamp(1000, 50000)
     };
 
     let tmp_dir = tempfile::tempdir()?;
@@ -240,7 +240,7 @@ fn build_srp_from_bcf_native(
     selphi_step!("Parallel BCF read ({} threads)...", rayon::current_num_threads());
 
     let (hdr, region_results) = bcf_reader::read_bcf_parallel(source_path, chunk_size, tmp_dir.path())
-        .map_err(|e| SrpWriterError::Io(e))?;
+        .map_err(SrpWriterError::Io)?;
 
     // Count totals from region results (no data in RAM — just counts + file paths)
     let n_variants: usize = region_results.iter().map(|r| r.n_variants).sum();
@@ -337,7 +337,7 @@ fn build_srp_from_bcf_native(
         "source_file": source, "created_at": chrono_now(),
     });
 
-    let srp_path = if output_path.extension().map_or(true, |e| e != "srp") {
+    let srp_path = if output_path.extension().is_none_or(|e| e != "srp") {
         output_path.with_extension("srp") } else { output_path.to_path_buf() };
 
     let file = std::fs::File::create(&srp_path)?;
@@ -349,9 +349,9 @@ fn build_srp_from_bcf_native(
     zip.write_all(&zstd::encode_all(Cursor::new(meta.to_string().as_bytes()), 3)?)?;
 
     // --- Single pass over meta TSVs: build variants, IDs, original_IDs via streaming zstd ---
-    let mut var_enc = zstd::stream::Encoder::new(Vec::new(), 3).map_err(|e| SrpWriterError::Io(e))?;
-    let mut id_enc = zstd::stream::Encoder::new(Vec::new(), 3).map_err(|e| SrpWriterError::Io(e))?;
-    let mut orig_enc = zstd::stream::Encoder::new(Vec::new(), 3).map_err(|e| SrpWriterError::Io(e))?;
+    let mut var_enc = zstd::stream::Encoder::new(Vec::new(), 3).map_err(SrpWriterError::Io)?;
+    let mut id_enc = zstd::stream::Encoder::new(Vec::new(), 3).map_err(SrpWriterError::Io)?;
+    let mut orig_enc = zstd::stream::Encoder::new(Vec::new(), 3).map_err(SrpWriterError::Io)?;
     let mut first_record = true;
 
     for rr in &region_results {
@@ -382,9 +382,9 @@ fn build_srp_from_bcf_native(
         }
     }
 
-    let var_compressed = var_enc.finish().map_err(|e| SrpWriterError::Io(e))?;
-    let id_compressed = id_enc.finish().map_err(|e| SrpWriterError::Io(e))?;
-    let orig_compressed = orig_enc.finish().map_err(|e| SrpWriterError::Io(e))?;
+    let var_compressed = var_enc.finish().map_err(SrpWriterError::Io)?;
+    let id_compressed = id_enc.finish().map_err(SrpWriterError::Io)?;
+    let orig_compressed = orig_enc.finish().map_err(SrpWriterError::Io)?;
 
     zip.start_file("variants", opts)?;
     zip.write_all(&var_compressed)?;
@@ -477,7 +477,7 @@ pub fn build_srp_from_bref3(
     // --- Pass 1: stream BREF3 to count variants and collect metadata ---
     selphi_step!("Scanning BREF3 file...");
     let mut stream = bref3::open_bref3_stream(source_path)
-        .map_err(|e| SrpWriterError::InvalidInput(e))?;
+        .map_err(SrpWriterError::InvalidInput)?;
     let sample_ids = stream.sample_ids.clone();
     let n_samples = sample_ids.len();
     let n_haps = n_samples * 2;
@@ -492,7 +492,7 @@ pub fn build_srp_from_bref3(
     let mut first_id = true;
 
     while let Some((chrom, pos_i32, ref_allele, alt_allele, id)) =
-        stream.next_variant_meta_only().map_err(|e| SrpWriterError::InvalidInput(e))?
+        stream.next_variant_meta_only().map_err(SrpWriterError::InvalidInput)?
     {
         if chromosome.is_empty() { chromosome = chrom.clone(); }
         let pos = pos_i32 as i64;
@@ -521,7 +521,7 @@ pub fn build_srp_from_bref3(
 
     let chunk_size = if chunk_size_override > 0 { chunk_size_override }
         else { auto_chunk_size(n_variants, n_haps) };
-    let n_chunks = (n_variants + chunk_size - 1) / chunk_size;
+    let n_chunks = n_variants.div_ceil(chunk_size);
     let mut row_counts: Vec<usize> = Vec::with_capacity(n_chunks);
     for ci in 0..n_chunks {
         row_counts.push(if ci < n_chunks - 1 { chunk_size } else { n_variants - (n_chunks - 1) * chunk_size });
@@ -532,7 +532,7 @@ pub fn build_srp_from_bref3(
     selphi_info!("  chunks:   {} (chunk_size={})", n_chunks, chunk_size);
 
     let contig_field = format!("##contig=<ID={}>", chromosome);
-    let srp_path = if output_path.extension().map_or(true, |e| e != "srp") {
+    let srp_path = if output_path.extension().is_none_or(|e| e != "srp") {
         output_path.with_extension("srp")
     } else { output_path.to_path_buf() };
 
@@ -541,7 +541,7 @@ pub fn build_srp_from_bref3(
     // Batch complete stripes, compress ALL tiles in one rayon dispatch.
     selphi_step!("Streaming BREF3 → tiles ({} threads)...", rayon::current_num_threads());
 
-    let n_stripes = (n_variants + super::TILE_ROWS - 1) / super::TILE_ROWS;
+    let n_stripes = n_variants.div_ceil(super::TILE_ROWS);
     let batch_size = (rayon::current_num_threads() * 4).max(16);
 
     let mut tile_writer = StreamingTileWriter::new(&srp_path, &SrpMetadataForWrite {
@@ -560,10 +560,10 @@ pub fn build_srp_from_bref3(
     let mut pending_stripes: Vec<(usize, Vec<Vec<u16>>)> = Vec::with_capacity(batch_size);
 
     let mut stream2 = bref3::open_bref3_stream(source_path)
-        .map_err(|e| SrpWriterError::InvalidInput(e))?;
+        .map_err(SrpWriterError::InvalidInput)?;
     let mut vi = 0usize;
 
-    while let Some(v) = stream2.next_variant().map_err(|e| SrpWriterError::InvalidInput(e))? {
+    while let Some(v) = stream2.next_variant().map_err(SrpWriterError::InvalidInput)? {
         let stripe = vi / super::TILE_ROWS;
         let local_row = (vi % super::TILE_ROWS) as u16;
 
@@ -649,7 +649,7 @@ fn compress_and_assemble(
     let min_pos = variants[0].pos;
     let max_pos = variants[n_variants - 1].pos;
 
-    let srp_path = if output_path.extension().map_or(true, |e| e != "srp") {
+    let srp_path = if output_path.extension().is_none_or(|e| e != "srp") {
         output_path.with_extension("srp")
     } else { output_path.to_path_buf() };
 
@@ -761,7 +761,7 @@ pub fn build_srp_unified(
     use super::bcf_reader;
 
     let header = bcf_reader::read_header_only(source_path)
-        .map_err(|e| SrpWriterError::Io(e))?;
+        .map_err(SrpWriterError::Io)?;
     let n_haps = header.n_samples * 2;
 
     let csi_path = { let mut p = source_path.as_os_str().to_owned(); p.push(".csi"); std::path::PathBuf::from(p) };
@@ -775,14 +775,14 @@ pub fn build_srp_unified(
     let chunk_size = if chunk_size_override > 0 { chunk_size_override } else {
         let bpv = 0.06 * n_haps as f64 * 4.0;
         ((10.0 * 1024.0 * 1024.0 / bpv.max(1.0)) as usize)
-            .max((csi.n_mapped as usize + 1999) / 2000).clamp(1000, 50000)
+            .max((csi.n_mapped as usize).div_ceil(2000)).clamp(1000, 50000)
     };
 
     let tmp_dir = tempfile::tempdir()?;
 
     selphi_step!("Parallel BCF read ({} threads)...", rayon::current_num_threads());
     let (hdr, region_results) = bcf_reader::read_bcf_parallel(source_path, chunk_size, tmp_dir.path())
-        .map_err(|e| SrpWriterError::Io(e))?;
+        .map_err(SrpWriterError::Io)?;
 
     let n_variants: usize = region_results.iter().map(|r| r.n_variants).sum();
     let total_chunks: usize = region_results.iter().map(|r| r.chunk_files.len()).sum();
@@ -848,13 +848,13 @@ pub fn build_srp_unified(
     let chunk_files: Vec<std::path::PathBuf> = region_results.iter()
         .flat_map(|rr| rr.chunk_files.iter().cloned()).collect();
 
-    let srp_path = if output_path.extension().map_or(true, |e| e != "srp") {
+    let srp_path = if output_path.extension().is_none_or(|e| e != "srp") {
         output_path.with_extension("srp")
     } else { output_path.to_path_buf() };
 
     // Streaming tile writer: process chunks one at a time from disk
     selphi_step!("Building tiles ({} threads)...", rayon::current_num_threads());
-    let n_stripes = (n_variants + super::TILE_ROWS - 1) / super::TILE_ROWS;
+    let n_stripes = n_variants.div_ceil(super::TILE_ROWS);
     let batch_size = (rayon::current_num_threads() * 4).max(16);
 
     let mut tile_writer = StreamingTileWriter::new(&srp_path, &SrpMetadataForWrite {
@@ -961,8 +961,8 @@ impl StreamingTileWriter {
     ) -> Result<Self, SrpWriterError> {
         use std::io::{Write, Seek, Cursor};
 
-        let n_tile_rows = (metadata.n_variants + super::TILE_ROWS - 1) / super::TILE_ROWS;
-        let n_tile_cols = (metadata.n_haps + super::TILE_COLS - 1) / super::TILE_COLS;
+        let n_tile_rows = metadata.n_variants.div_ceil(super::TILE_ROWS);
+        let n_tile_cols = metadata.n_haps.div_ceil(super::TILE_COLS);
         let n_tiles = n_tile_rows * n_tile_cols;
 
         let meta_json = serde_json::json!({
@@ -1126,7 +1126,7 @@ fn auto_chunk_size(n_variants: usize, n_haps: usize) -> usize {
     let target_bytes: f64 = 10.0 * 1024.0 * 1024.0;
     let bytes_per_var = 0.06 * n_haps as f64 * 4.0;
     let cs = (target_bytes / bytes_per_var.max(1.0)) as usize;
-    cs.max((n_variants + 1999) / 2000).clamp(1000, 50000)
+    cs.max(n_variants.div_ceil(2000)).clamp(1000, 50000)
 }
 
 fn chrono_now() -> String {

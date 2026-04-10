@@ -61,7 +61,7 @@ impl HmmParams {
             // C++ computes exponent in double (0.04 promotes), truncates to float for expm1f
             let exponent_f32 = (dist * coeff) as f32;
             // C++ exact: -1.0f * expm1f(exponent_f32)
-            let t = -1.0f32 * exponent_f32.exp_m1();
+            let t = -exponent_f32.exp_m1();
             trans.push(t.clamp(0.0, 1.0));
         }
 

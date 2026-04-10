@@ -1,5 +1,4 @@
-/// EM parameter estimation .
-
+/// EM parameter estimation.
 #[allow(unused_imports)]
 use crate::selphi_debug;
 use super::hmm;
@@ -17,6 +16,12 @@ pub struct EmWorkspace {
     bwd: Vec<f32>, saved_bwd: Vec<f32>, fwd: Vec<f32>,
     // Pre-computed mismatch bytes (like Java alMatch) — avoids per-marker bit extraction
     al_match: Vec<u8>,
+}
+
+impl Default for EmWorkspace {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EmWorkspace {
@@ -187,18 +192,18 @@ pub fn em_for_sample(
 
     // Run per-haplotype EM — pass bwd/saved_bwd/fwd/al_match separately to avoid borrow conflict
     let (m1, sm1, sg1, ss1) = {
-        let (mut hmm_bufs, rest) = split_em_workspace_for_stats(ews);
+        let (hmm_bufs, rest) = split_em_workspace_for_stats(ews);
         compute_em_stats_f32(
-            &rest.comp[..wsz * cbs], &rest.hap0, &rest.p_recomb, &rest.gen_dist,
-            em_probs, ns, cbs, wsz, &mut hmm_bufs.0, &mut hmm_bufs.1, &mut hmm_bufs.2,
-            &mut hmm_bufs.3)
+            &rest.comp[..wsz * cbs], rest.hap0, rest.p_recomb, rest.gen_dist,
+            em_probs, ns, cbs, wsz, hmm_bufs.0, hmm_bufs.1, hmm_bufs.2,
+            hmm_bufs.3)
     };
     let (m2, sm2, sg2, ss2) = {
-        let (mut hmm_bufs, rest) = split_em_workspace_for_stats(ews);
+        let (hmm_bufs, rest) = split_em_workspace_for_stats(ews);
         compute_em_stats_f32(
-            &rest.comp[..wsz * cbs], &rest.hap1, &rest.p_recomb, &rest.gen_dist,
-            em_probs, ns, cbs, wsz, &mut hmm_bufs.0, &mut hmm_bufs.1, &mut hmm_bufs.2,
-            &mut hmm_bufs.3)
+            &rest.comp[..wsz * cbs], rest.hap1, rest.p_recomb, rest.gen_dist,
+            em_probs, ns, cbs, wsz, hmm_bufs.0, hmm_bufs.1, hmm_bufs.2,
+            hmm_bufs.3)
     };
 
     if crate::haploid::debug::is_debug() {

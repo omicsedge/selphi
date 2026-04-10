@@ -154,6 +154,12 @@ pub struct SiteAccumulator {
     pub total_n: u64,
 }
 
+impl Default for SiteAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SiteAccumulator {
     pub fn new() -> Self {
         let n_bins = MAF_BINS.len();
@@ -415,12 +421,10 @@ impl VariantReader {
             let hdr_text = String::from_utf8_lossy(&hdr_bytes);
             let mut ds_key: Option<u16> = None;
             for line in hdr_text.lines() {
-                if line.starts_with("##FORMAT=<ID=DS,") {
-                    if let Some(p) = line.find("IDX=") {
-                        let s = p + 4;
-                        let e = line[s..].find(|c: char| c == ',' || c == '>').map(|p| s + p).unwrap_or(line.len());
-                        ds_key = line[s..e].parse().ok();
-                    }
+                if line.starts_with("##FORMAT=<ID=DS,") && let Some(p) = line.find("IDX=") {
+                    let s = p + 4;
+                    let e = line[s..].find([',', '>']).map(|p| s + p).unwrap_or(line.len());
+                    ds_key = line[s..e].parse().ok();
                 }
             }
 
@@ -469,8 +473,7 @@ impl VariantReader {
             VariantReader::Bcf { reader, path, header_end_vpos, .. } => {
                 if pos <= 1 {
                     // Seek to start of data
-                    let vp = noodles_bgzf::VirtualPosition::try_from(*header_end_vpos)
-                        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad vpos"))?;
+                    let vp = noodles_bgzf::VirtualPosition::from(*header_end_vpos);
                     reader.seek(vp)?;
                     return Ok(());
                 }
@@ -552,12 +555,12 @@ impl VariantReader {
                     let pos = i32::from_le_bytes(sb[4..8].try_into().unwrap()) as i64 + 1;
                     let na = u16::from_le_bytes(sb[18..20].try_into().unwrap()) as usize;
 
-                    if na < 2 || na > 2 || skip_gt {
+                    if na != 2 || skip_gt {
                         // Skip individual data without reading
                         let mut rem = li;
                         let mut skip_buf = [0u8; 65536];
                         while rem > 0 { let c = rem.min(skip_buf.len()); reader.read_exact(&mut skip_buf[..c]).ok()?; rem -= c; }
-                        if na < 2 || na > 2 { continue; }
+                        if na != 2 { continue; }
                         // skip_gt: return position info without dosages
                         let chrom = if ci < contig_names.len() { contig_names[ci].as_bytes().to_vec() } else { format!("{}", ci).into_bytes() };
                         let _nf = (u32::from_le_bytes(sb[20..24].try_into().unwrap()) >> 24) as usize;
@@ -566,7 +569,7 @@ impl VariantReader {
                         let mut alleles = Vec::with_capacity(na);
                         for _ in 0..na { alleles.push(rtstr_bytes(sb, &mut o)); }
                         ds_buf.clear();
-                        return Some((chrom, pos, alleles.get(0).cloned().unwrap_or_default(), alleles.get(1).cloned().unwrap_or_default()));
+                        return Some((chrom, pos, alleles.first().cloned().unwrap_or_default(), alleles.get(1).cloned().unwrap_or_default()));
                     }
 
                     ib.resize(li, 0); reader.read_exact(ib).ok()?;
@@ -579,7 +582,7 @@ impl VariantReader {
                     let _id = rtstr(sb, &mut o);
                     let mut alleles = Vec::with_capacity(na);
                     for _ in 0..na { alleles.push(rtstr_bytes(sb, &mut o)); }
-                    let ref_a = alleles.get(0).cloned().unwrap_or_default();
+                    let ref_a = alleles.first().cloned().unwrap_or_default();
                     let alt_a = alleles.get(1).cloned().unwrap_or_default();
 
                     // Parse FORMAT fields — look for DS first, fallback to GT
@@ -649,7 +652,7 @@ impl VariantReader {
                         }
                     }
 
-                    let expected_n = if si_filter.is_some() { si_filter.unwrap().len() } else { ns };
+                    let expected_n = if let Some(f) = si_filter { f.len() } else { ns };
                     if !found_ds && !found_gt {
                         ds_buf.clear();
                         ds_buf.resize(expected_n, -1.0);

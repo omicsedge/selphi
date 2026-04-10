@@ -101,7 +101,7 @@ pub fn compute_step_boundaries(cm: &[f64], step_scale: f64) -> (Vec<i32>, Vec<i3
     let mut diffs: Vec<f64> = (1..n).map(|i| cm[i] - cm[i - 1]).collect();
     diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mid = diffs.len() / 2;
-    let median = if diffs.len() % 2 == 0 {
+    let median = if diffs.len().is_multiple_of(2) {
         (diffs[mid - 1] + diffs[mid]) / 2.0
     } else {
         diffs[mid]
@@ -449,7 +449,7 @@ pub fn pbwt_coded_ibs_bwd_batch(
                     if v < m_total { v += 1; } // v can reach m_total (d[m_total] is sentinel)
                     v_next = d[v].min(v_next);
                 } else {
-                    if u > 0 { u -= 1; }  // u can reach 0 (d[0] is sentinel)
+                    u = u.saturating_sub(1);  // u can reach 0 (d[0] is sentinel)
                     u_next = d[u].min(u_next);
                 }
             }
@@ -525,10 +525,8 @@ fn pbwt_forwards_ad(a: &mut [i32], d: &mut [i32], y: &[u8], b: &mut [i32], e: &m
             q = 0;
         }
     }
-    for i in 0..v {
-        a[u + i] = b[i];
-        d[u + i] = e[i];
-    }
+    a[u..(v + u)].copy_from_slice(&b[..v]);
+    d[u..(v + u)].copy_from_slice(&e[..v]);
     d[0] = k as i32 + 2;
     d[m_total] = k as i32 + 2;
 }
@@ -753,9 +751,7 @@ fn phase_subwindow(
                     let h2 = h1 + 1;
                     if bwd_unph_het[s] {
                         if bwd_rng.next_boolean() {
-                            let tmp = bwd_alleles[h1];
-                            bwd_alleles[h1] = bwd_alleles[h2];
-                            bwd_alleles[h2] = tmp;
+                            bwd_alleles.swap(h1, h2);
                         }
                         bwd_unph_het[s] = false;
                     } else {
@@ -838,9 +834,7 @@ fn phase_subwindow(
                         let fwd_same_phase = (fc1 < fc2) == (alleles[h1] < alleles[h2]);
 
                         if rev_same_phase != fwd_same_phase {
-                            let tmp = alleles[h1];
-                            alleles[h1] = alleles[h2];
-                            alleles[h2] = tmp;
+                            alleles.swap(h1, h2);
                         }
                     }
                     unph_het[s] = false;

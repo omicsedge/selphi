@@ -65,7 +65,8 @@ impl SegmentHmmF64 {
         for k in 0..self.n_cond {
             let g = if cond_alleles[k] { &g1 } else { &g0 };
             let base = k * HAP_NUMBER;
-            for h in 0..HAP_NUMBER { self.prob[base + h] = g[h]; self.prob_sum_h[h] += g[h]; }
+            self.prob[base..(HAP_NUMBER + base)].copy_from_slice(&g[..HAP_NUMBER]);
+            for h in 0..HAP_NUMBER { self.prob_sum_h[h] += g[h]; }
         }
         self.prob_sum_t = self.prob_sum_h.iter().sum();
     }
@@ -280,7 +281,7 @@ impl SegmentHmmF64 {
                 }
                 self.h_probs[h1*HAP_NUMBER+h2] = s;
             }
-            sum_h += self.h_probs[h1*HAP_NUMBER+0]+self.h_probs[h1*HAP_NUMBER+1]+self.h_probs[h1*HAP_NUMBER+2]+self.h_probs[h1*HAP_NUMBER+3]+self.h_probs[h1*HAP_NUMBER+4]+self.h_probs[h1*HAP_NUMBER+5]+self.h_probs[h1*HAP_NUMBER+6]+self.h_probs[h1*HAP_NUMBER+7];
+            sum_h += self.h_probs[h1*HAP_NUMBER]+self.h_probs[h1*HAP_NUMBER+1]+self.h_probs[h1*HAP_NUMBER+2]+self.h_probs[h1*HAP_NUMBER+3]+self.h_probs[h1*HAP_NUMBER+4]+self.h_probs[h1*HAP_NUMBER+5]+self.h_probs[h1*HAP_NUMBER+6]+self.h_probs[h1*HAP_NUMBER+7];
         }
         self.sum_h_probs = sum_h;
         sum_h.is_nan() || sum_h.is_infinite() || sum_h < f64::MIN_POSITIVE
@@ -499,13 +500,13 @@ impl SegmentHmmF64 {
                 r >= 0 && (var_get_hap0(e, byte) as i8) != r
             };
             if !rare_skipped { prev_abs_locus = vi; }
-            if is_amb { if abs_ambiguous > 0 { abs_ambiguous -= 1; } }
+            if is_amb && abs_ambiguous > 0 { abs_ambiguous -= 1; }
 
             if vi == locus_first { break; }
             vi -= 1;
             if curr_seg_locus == 0 && curr_seg > seg_first {
                 curr_seg -= 1; curr_seg_locus = graph.lengths[curr_seg] as usize - 1;
-            } else if curr_seg_locus > 0 { curr_seg_locus -= 1; }
+            } else { curr_seg_locus = curr_seg_locus.saturating_sub(1); }
         }
 
         // SET_FIRST_TRANS

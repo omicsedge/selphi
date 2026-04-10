@@ -460,7 +460,8 @@ pub fn run_phase_common_bm(
                 let mut p = l as i32; let mut q = l as i32;
                 for h in 0..n_hap {
                     let a_h = a[h]; let c_h = c_arr[h];
-                    if c_h > p { p = c_h; } if c_h > q { q = c_h; }
+                    if c_h > p { p = c_h; }
+                    if c_h > q { q = c_h; }
                     if row_buf[a_h as usize] == 0 {
                         a[u] = a_h; c_arr[u] = p; p = 0; u += 1;
                     } else {
@@ -587,7 +588,7 @@ fn _run_iterations(
                 rng_call_count, rng.peek_next());
         }
 
-        pbwt_idx.pbwt_sweep_direct(n_var, &ibd2, &hap_bm);
+        pbwt_idx.pbwt_sweep_direct(n_var, ibd2, hap_bm);
 
         pbwt_idx.transpose();
         let pbwt_ms = t0.elapsed().as_millis();
@@ -633,7 +634,7 @@ fn _run_iterations(
         }).collect();
 
         // Shared immutable borrows for the parallel closure
-        let hap_bm_hmm_ref: &HaplotypeBitmatrix = &hap_bm;
+        let hap_bm_hmm_ref: &HaplotypeBitmatrix = hap_bm;
 
         let per_sample_banned: Vec<Vec<(usize, usize, usize, usize)>> =
             graphs.par_iter_mut().enumerate().map(|(si, graph)| {
@@ -743,7 +744,7 @@ fn _run_iterations(
                 // C++ equivalent: Hhap.subset(H, idxH, locus_first, locus_last) + transpose.
                 // Only covers [w_l0, w_l1] (not 0..n_var_local). Fits in L2 cache.
                 let k = cond_set.len();
-                let k_words = (k + 63) / 64;
+                let k_words = k.div_ceil(64);
                 let n_var_window = w_l1 - w_l0 + 1;
                 let needed = n_var_window * k_words;
                 cond_bm.clear();
@@ -781,7 +782,7 @@ fn _run_iterations(
                 let t_fwd = std::time::Instant::now();
                 hmm_reuse.resize_for(k);
                 hmm_reuse.forward_rare_direct(graph, &cond_bm, k_words, locus_offset, &hmm_params.trans,
-                    w_first, w_last, &hmm_params.rare_allele, &hmm_params);
+                    w_first, w_last, &hmm_params.rare_allele, hmm_params);
                 fwd_ns += t_fwd.elapsed().as_nanos();
 
                 let t_bwd = std::time::Instant::now();
@@ -789,23 +790,23 @@ fn _run_iterations(
                     n_underflow += 1;
                     let mut hmm64 = SegmentHmmF64::new(k);
                     hmm64.forward_rare(graph, &cond_set, &hap_fn, &hmm_params.trans,
-                        w_first, w_last, &hmm_params.rare_allele, &hmm_params);
+                        w_first, w_last, &hmm_params.rare_allele, hmm_params);
                     if hmm64.has_underflow() { continue; }
                     let (t, _) = hmm64.backward_rare(graph, &cond_set, &hap_fn, &hmm_params.trans,
-                        w_first, w_last, &hmm_params.rare_allele, &hmm_params);
+                        w_first, w_last, &hmm_params.rare_allele, hmm_params);
                     t
                 } else {
                     let (t, _) = hmm_reuse.backward_rare_direct(graph, &cond_bm, k_words, locus_offset, &hmm_params.trans,
-                        w_first, w_last, &hmm_params.rare_allele, &hmm_params);
+                        w_first, w_last, &hmm_params.rare_allele, hmm_params);
                     let has_bad = t.iter().any(|&v| v.is_nan() || v.is_infinite());
                     if has_bad {
                         n_bad += 1;
                         let mut hmm64 = SegmentHmmF64::new(k);
                         hmm64.forward_rare(graph, &cond_set, &hap_fn, &hmm_params.trans,
-                            w_first, w_last, &hmm_params.rare_allele, &hmm_params);
+                            w_first, w_last, &hmm_params.rare_allele, hmm_params);
                         if hmm64.has_underflow() { continue; }
                         let (t64, _) = hmm64.backward_rare(graph, &cond_set, &hap_fn, &hmm_params.trans,
-                            w_first, w_last, &hmm_params.rare_allele, &hmm_params);
+                            w_first, w_last, &hmm_params.rare_allele, hmm_params);
                         t64
                     } else {
                         t

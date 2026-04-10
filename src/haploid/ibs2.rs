@@ -1,5 +1,4 @@
 /// IBS2 segment detection —  (Ibs2.java + Ibs2Markers.java + Ibs2Sets.java)
-
 const MIN_INTERMARKER_CM: f64 = 0.02;
 const MIN_MARKER_CNT: usize = 50;
 const MIN_IBS2_CM: f64 = 2.0;

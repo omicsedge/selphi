@@ -92,14 +92,12 @@ pub fn parse_csi(path: &Path) -> io::Result<CsiIndex> {
             // Regular bins
             if bin_id < 100_000 && loffset > 0 {
                 let pos = bin_to_pos(bin_id, min_shift, depth);
-                let vp = VirtualPosition::try_from(loffset)
-                    .unwrap_or(VirtualPosition::default());
+                let vp = VirtualPosition::from(loffset);
                 ref_checkpoints.push((pos, vp));
             }
 
             if min_beg < u64::MAX && ref_first_offset == VirtualPosition::default() {
-                ref_first_offset = VirtualPosition::try_from(min_beg)
-                    .unwrap_or(VirtualPosition::default());
+                ref_first_offset = VirtualPosition::from(min_beg);
             }
         }
 
@@ -271,7 +269,7 @@ pub fn build_csi_index(bcf_path: &Path) -> io::Result<()> {
 
         // Assign to bin (handles indels spanning multiple 16Kb windows)
         let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, DEFAULT_DEPTH);
-        let bins = ref_bins.entry(chrom_id).or_insert_with(BTreeMap::new);
+        let bins = ref_bins.entry(chrom_id).or_default();
         let bin = bins.entry(bin_id).or_insert_with(|| BinData {
             loffset: vpos,
             chunks: vec![(vpos, vpos_end)],
@@ -465,7 +463,7 @@ pub fn build_tbi_index(vcf_gz_path: &Path) -> io::Result<()> {
 
         // Bin assignment (handles indels spanning multiple bins)
         let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, DEFAULT_DEPTH);
-        let bins = ref_bins.entry(ref_id).or_insert_with(BTreeMap::new);
+        let bins = ref_bins.entry(ref_id).or_default();
         let bin = bins.entry(bin_id).or_insert_with(|| BinData {
             _loffset: vpos,
             chunks: vec![(vpos, vpos_end)],
@@ -482,7 +480,7 @@ pub fn build_tbi_index(vcf_gz_path: &Path) -> io::Result<()> {
 
         // Linear index: track minimum vpos for each 16Kb window
         let lin_idx = (pos >> DEFAULT_MIN_SHIFT) as usize;
-        let lin = ref_linear.entry(ref_id).or_insert_with(Vec::new);
+        let lin = ref_linear.entry(ref_id).or_default();
         if lin_idx >= lin.len() {
             lin.resize(lin_idx + 1, 0);
         }
@@ -641,7 +639,7 @@ pub fn build_tbi_index_with_meta(
         let ref_id = *contig_map.get(chrom.as_str()).unwrap_or(&0);
 
         let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, DEFAULT_DEPTH);
-        let bins = ref_bins.entry(ref_id).or_insert_with(BTreeMap::new);
+        let bins = ref_bins.entry(ref_id).or_default();
         let bin = bins.entry(bin_id).or_insert_with(|| BinDataM { _loffset: vpos, chunks: vec![(vpos, vpos_end)] });
         if let Some(last) = bin.chunks.last_mut() {
             if vpos <= last.1 + (1 << 16) { last.1 = vpos_end; }
@@ -649,7 +647,7 @@ pub fn build_tbi_index_with_meta(
         }
         *ref_n_mapped.entry(ref_id).or_insert(0) += 1;
         let lin_idx = (pos >> DEFAULT_MIN_SHIFT) as usize;
-        let lin = ref_linear.entry(ref_id).or_insert_with(Vec::new);
+        let lin = ref_linear.entry(ref_id).or_default();
         if lin_idx >= lin.len() { lin.resize(lin_idx + 1, 0); }
         if lin[lin_idx] == 0 || vpos < lin[lin_idx] { lin[lin_idx] = vpos; }
     }
@@ -836,7 +834,7 @@ impl InlineIndexBuilder {
 
     fn add_record(&mut self, ref_id: usize, pos: i64, rlen: i64, vpos: u64, vpos_end: u64) {
         let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, DEFAULT_DEPTH);
-        let bins = self.ref_bins.entry(ref_id).or_insert_with(BTreeMap::new);
+        let bins = self.ref_bins.entry(ref_id).or_default();
         let bin = bins.entry(bin_id).or_insert_with(|| InlineBinData {
             loffset: vpos, chunks: vec![(vpos, vpos_end)],
         });
@@ -846,7 +844,7 @@ impl InlineIndexBuilder {
         }
         *self.ref_n_mapped.entry(ref_id).or_insert(0) += 1;
         let lin_idx = (pos >> DEFAULT_MIN_SHIFT) as usize;
-        let lin = self.ref_linear.entry(ref_id).or_insert_with(Vec::new);
+        let lin = self.ref_linear.entry(ref_id).or_default();
         if lin_idx >= lin.len() { lin.resize(lin_idx + 1, 0); }
         if lin[lin_idx] == 0 || vpos < lin[lin_idx] { lin[lin_idx] = vpos; }
     }
@@ -877,8 +875,8 @@ impl InlineIndexBuilder {
         let n_ref = self.bcf_n_contigs.max(self.ref_bins.keys().map(|&k| k + 1).max().unwrap_or(0));
         let mut out = Vec::with_capacity(64 * 1024);
         out.extend_from_slice(b"CSI\x01");
-        out.extend_from_slice(&(DEFAULT_MIN_SHIFT as i32).to_le_bytes());
-        out.extend_from_slice(&(DEFAULT_DEPTH as i32).to_le_bytes());
+        out.extend_from_slice(&DEFAULT_MIN_SHIFT.to_le_bytes());
+        out.extend_from_slice(&DEFAULT_DEPTH.to_le_bytes());
         out.extend_from_slice(&0i32.to_le_bytes());
         out.extend_from_slice(&(n_ref as i32).to_le_bytes());
         self.write_ref_sections_csi(&mut out, n_ref);

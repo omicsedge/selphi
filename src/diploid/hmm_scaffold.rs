@@ -187,8 +187,8 @@ pub fn phase_diplotype_joint(prob_h0: f32, prob_h1: f32, threshold: f32) -> Opti
     // gprobs[1] = P(genotype 0|1) = P(h0=ref) * P(h1=alt)
     // gprobs[2] = P(genotype 1|0) = P(h0=alt) * P(h1=ref)
     // With emission error model (ee=match, ed=mismatch)
-    let g01 = ((p00 * EE as f32 + p01 * ED as f32) * (p10 * ED as f32 + p11 * EE as f32)) as f64;
-    let g10 = ((p00 * ED as f32 + p01 * EE as f32) * (p10 * EE as f32 + p11 * ED as f32)) as f64;
+    let g01 = ((p00 * EE + p01 * ED) * (p10 * ED + p11 * EE)) as f64;
+    let g10 = ((p00 * ED + p01 * EE) * (p10 * EE + p11 * ED)) as f64;
 
     let total = g01 + g10;
     if total <= 0.0 { return None; }

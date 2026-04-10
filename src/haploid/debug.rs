@@ -1,7 +1,6 @@
 /// Debug dump utilities for comparing Selphi vs intermediate state.
 /// Activated by --debug or SELPHI_DEBUG=1.
 /// Dumps data for sample 0, iteration 0, window 0.
-
 #[allow(unused_imports)]
 use crate::selphi_debug;
 use std::fs;

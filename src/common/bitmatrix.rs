@@ -19,7 +19,7 @@ impl HaplotypeBitmatrix {
         n_sites: usize, n_haps: usize, haplotypes: &F, site_eval: &[bool],
     ) -> Self
     where F: Fn(usize, usize) -> bool + Sync {
-        let n_words = (n_haps + 63) / 64;
+        let n_words = n_haps.div_ceil(64);
         let mut bits = vec![0u64; n_sites * n_words];
 
         // Fill in parallel by site
@@ -46,7 +46,7 @@ impl HaplotypeBitmatrix {
     pub fn from_byte_slice(
         n_sites: usize, n_haps: usize, hap_data: &[u8], stride: usize, site_eval: &[bool],
     ) -> Self {
-        let n_words = (n_haps + 63) / 64;
+        let n_words = n_haps.div_ceil(64);
         let mut bits = vec![0u64; n_sites * n_words];
 
         bits.par_chunks_mut(n_words).enumerate().for_each(|(site, row)| {
@@ -114,7 +114,7 @@ impl HaplotypeBitmatrix {
 
     /// Build from raw Vec<u64> parts (for SRP extraction).
     pub fn from_raw(bits: Vec<u64>, n_sites: usize, n_haps: usize) -> Self {
-        let n_words = (n_haps + 63) / 64;
+        let n_words = n_haps.div_ceil(64);
         assert_eq!(bits.len(), n_sites * n_words);
         Self { bits, n_sites, n_haps, n_words }
     }
@@ -122,7 +122,7 @@ impl HaplotypeBitmatrix {
     /// Extract a subset of sites by index.
     /// Build from a flat ref_alleles[v * n_ref + h] byte array (variant-major).
     pub fn from_byte_array(ref_alleles: &[u8], n_sites: usize, n_haps: usize) -> Self {
-        let n_words = (n_haps + 63) / 64;
+        let n_words = n_haps.div_ceil(64);
         let mut bits = vec![0u64; n_sites * n_words];
         bits.par_chunks_mut(n_words).enumerate().for_each(|(v, row)| {
             let base = v * n_haps;
@@ -147,15 +147,13 @@ impl HaplotypeBitmatrix {
         site_eval: Option<&[bool]>,
     ) -> Self {
         let n_haps = n_target_haps + n_ref;
-        let n_words = (n_haps + 63) / 64;
+        let n_words = n_haps.div_ceil(64);
         let mut bits = vec![0u64; n_sites * n_words];
         let ref_nw = ref_bm.n_words();
-        let target_word_end = (n_target_haps + 63) / 64;
+        let target_word_end = n_target_haps.div_ceil(64);
 
         bits.par_chunks_mut(n_words).enumerate().for_each(|(site, row)| {
-            if let Some(eval) = site_eval {
-                if !eval[site] { return; }
-            }
+            if let Some(eval) = site_eval && !eval[site] { return; }
             // Target haps: pack bytes into words
             let t_base = site * n_target_haps;
             for w in 0..target_word_end {
@@ -213,7 +211,7 @@ impl HaplotypeBitmatrix {
     pub fn from_byte_slice_all(
         n_sites: usize, n_haps: usize, hap_data: &[u8], stride: usize,
     ) -> Self {
-        let n_words = (n_haps + 63) / 64;
+        let n_words = n_haps.div_ceil(64);
         let mut bits = vec![0u64; n_sites * n_words];
 
         bits.par_chunks_mut(n_words).enumerate().for_each(|(site, row)| {

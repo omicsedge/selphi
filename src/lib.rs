@@ -1,5 +1,11 @@
 //! Selphi: SELfDecode PHasing & Imputation
 
+// Suppress architectural/stylistic clippy warnings that are intentional
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::missing_safety_doc)]
+
 // Logging (must be first for macro exports)
 pub mod log;
 

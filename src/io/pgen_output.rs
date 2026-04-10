@@ -55,7 +55,7 @@ impl PgenWriter {
         let pgen_path = path.with_extension("pgen");
         let mut file = BufWriter::new(std::fs::File::create(&pgen_path)?);
 
-        let bytes_per_variant = (n_samples + 3) / 4; // 2 bits per sample
+        let bytes_per_variant = n_samples.div_ceil(4); // 2 bits per sample
 
         // PGEN header: magic (2 bytes) + mode (1 byte) + variant_ct (4 bytes) + sample_ct (4 bytes)
         // Simplified mode 0x02 = constant-width records (2-bit genotypes, no compression)

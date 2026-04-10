@@ -55,8 +55,8 @@ pub fn write_tiled(
     let n_haps = source.metadata.n_haps;
     let chunk_size = source.metadata.chunk_size;
 
-    let n_tile_rows = (n_variants + TILE_ROWS - 1) / TILE_ROWS;
-    let n_tile_cols = (n_haps + TILE_COLS - 1) / TILE_COLS;
+    let n_tile_rows = n_variants.div_ceil(TILE_ROWS);
+    let n_tile_cols = n_haps.div_ceil(TILE_COLS);
     let n_tiles = n_tile_rows * n_tile_cols;
 
     eprintln!("  Tiled SRP: {} variants × {} haps → {}×{} tiles ({} total)",
@@ -88,11 +88,11 @@ pub fn write_tiled(
     });
     let header_json = serde_json::to_vec(&header)?;
     let header_compressed = zstd::encode_all(Cursor::new(&header_json), 3)
-        .map_err(|e| io::Error::other(e))?;
+        .map_err(io::Error::other)?;
 
     // Process chunk-by-chunk: decompress each source chunk ONCE, tile all stripes it covers.
     // Each source chunk (~9000 rows) covers ~9 stripes (1024 rows each).
-    let n_src_chunks = (n_variants + chunk_size - 1) / chunk_size;
+    let n_src_chunks = n_variants.div_ceil(chunk_size);
     let mut tile_data: Vec<Vec<u8>> = vec![Vec::new(); n_tiles];
 
     let t0 = std::time::Instant::now();
@@ -312,8 +312,8 @@ impl TiledSrpReader {
         let header_size = u32::from_le_bytes(hdr_size_buf) as usize;
         file.seek(SeekFrom::Current(header_size as i64))?;
 
-        let n_tile_rows = (n_variants + TILE_ROWS - 1) / TILE_ROWS;
-        let n_tile_cols = (n_haps + TILE_COLS - 1) / TILE_COLS;
+        let n_tile_rows = n_variants.div_ceil(TILE_ROWS);
+        let n_tile_cols = n_haps.div_ceil(TILE_COLS);
 
         // Read tile index
         let mut n_tiles_buf = [0u8; 4];

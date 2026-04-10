@@ -158,16 +158,14 @@ impl SrpReader {
 
     /// NNZ per chunk for EM density weighting. Uniform if no chunks.
     pub fn get_chunk_nnz(&self) -> Vec<f64> {
-        if let Some(ref mmap) = self.mmap {
-            if !self.chunk_index.is_empty() {
-                return self.chunk_index.iter().map(|&(off, cs, _)| {
-                    let end = (off as usize + cs as usize).min(mmap.len());
-                    zstd::decode_all(Cursor::new(&mmap[off as usize..end]))
-                        .ok().filter(|d| d.len() >= 12)
-                        .map(|d| i32::from_le_bytes(d[8..12].try_into().unwrap()) as f64)
-                        .unwrap_or(1.0)
-                }).collect();
-            }
+        if let Some(ref mmap) = self.mmap && !self.chunk_index.is_empty() {
+            return self.chunk_index.iter().map(|&(off, cs, _)| {
+                let end = (off as usize + cs as usize).min(mmap.len());
+                zstd::decode_all(Cursor::new(&mmap[off as usize..end]))
+                    .ok().filter(|d| d.len() >= 12)
+                    .map(|d| i32::from_le_bytes(d[8..12].try_into().unwrap()) as f64)
+                    .unwrap_or(1.0)
+            }).collect();
         }
         vec![1.0; self.metadata.n_chunks.max(1)]
     }
@@ -178,11 +176,9 @@ impl SrpReader {
     }
 
     pub fn load_chunk_from_source(&self, chunk_id: usize) -> CscChunk {
-        if let Some(ref mmap) = self.mmap {
-            if chunk_id < self.chunk_index.len() {
-                let (off, cs, _) = self.chunk_index[chunk_id];
-                return parse_raw_chunk(&mmap[off as usize..(off as usize + cs as usize)]);
-            }
+        if let Some(ref mmap) = self.mmap && chunk_id < self.chunk_index.len() {
+            let (off, cs, _) = self.chunk_index[chunk_id];
+            return parse_raw_chunk(&mmap[off as usize..(off as usize + cs as usize)]);
         }
         panic!("No chunk data available. Regenerate panel: selphi --prepare-reference-from panel.bcf --out panel");
     }
@@ -201,7 +197,7 @@ impl SrpReader {
 
         let n_chip = wgs_idx.len();
         let n_haps = self.metadata.n_haps;
-        let n_words = (n_haps + 63) / 64;
+        let n_words = n_haps.div_ceil(64);
         let mut bits = vec![0u64; n_chip * n_words];
 
         let mut stripe_groups: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();

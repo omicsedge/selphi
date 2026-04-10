@@ -219,7 +219,7 @@ pub fn setup_vcf_writer(
     output_path: &Path,
     no_ap: bool,
 ) -> std::io::Result<(VcfSender, VcfWriterHandle, VcfBgzipProc)> {
-    let vcf_path = if output_path.extension().map_or(true, |e| e != "gz") {
+    let vcf_path = if output_path.extension().is_none_or(|e| e != "gz") {
         output_path.with_extension("vcf.gz")
     } else {
         output_path.to_path_buf()
@@ -281,24 +281,24 @@ pub fn setup_vcf_writer(
 
     // Write VCF header
     let mut header = Vec::with_capacity(4096);
-    write!(header, "##fileformat=VCFv4.2\n")?;
-    write!(header, "##source=Selphi_v{version} SelfDecode™\n")?;
-    write!(header, "##FILTER=<ID=PASS,Description=\"All filters passed\">\n")?;
-    write!(header, "##INFO=<ID=IMP,Number=0,Type=Flag,Description=\"Imputed marker\">\n")?;
-    write!(header, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">\n")?;
-    write!(header, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele Number\">\n")?;
-    write!(header, "##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Estimated Allele Count\">\n")?;
-    write!(header, "##INFO=<ID=DR2,Number=1,Type=Float,Description=\"Dosage R-squared: estimated imputation accuracy\">\n")?;
-    write!(header, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n")?;
-    write!(header, "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"estimated ALT dose\">\n")?;
+    writeln!(header, "##fileformat=VCFv4.2")?;
+    writeln!(header, "##source=Selphi_v{version} SelfDecode™")?;
+    writeln!(header, "##FILTER=<ID=PASS,Description=\"All filters passed\">")?;
+    writeln!(header, "##INFO=<ID=IMP,Number=0,Type=Flag,Description=\"Imputed marker\">")?;
+    writeln!(header, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">")?;
+    writeln!(header, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele Number\">")?;
+    writeln!(header, "##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Estimated Allele Count\">")?;
+    writeln!(header, "##INFO=<ID=DR2,Number=1,Type=Float,Description=\"Dosage R-squared: estimated imputation accuracy\">")?;
+    writeln!(header, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">")?;
+    writeln!(header, "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"estimated ALT dose\">")?;
     if !no_ap {
-        write!(header, "##FORMAT=<ID=AP1,Number=A,Type=Float,Description=\"estimated ALT dose on first haplotype\">\n")?;
-        write!(header, "##FORMAT=<ID=AP2,Number=A,Type=Float,Description=\"estimated ALT dose on second haplotype\">\n")?;
+        writeln!(header, "##FORMAT=<ID=AP1,Number=A,Type=Float,Description=\"estimated ALT dose on first haplotype\">")?;
+        writeln!(header, "##FORMAT=<ID=AP2,Number=A,Type=Float,Description=\"estimated ALT dose on second haplotype\">")?;
     }
-    write!(header, "{}\n", contig_field)?;
+    writeln!(header, "{}", contig_field)?;
     write!(header, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
     for name in sample_names { write!(header, "\t{}", name)?; }
-    write!(header, "\n")?;
+    writeln!(header)?;
     tx.send(header).map_err(|e| std::io::Error::other(e.to_string()))?;
 
     Ok((tx, writer_handle, ()))
@@ -336,7 +336,7 @@ fn format_tile_batch(
     // Split into coarse chunks for parallel formatting.
     if tile_n == 0 { return Vec::new(); }
     let n_chunks = 16.min(tile_n);
-    let chunk_size = (tile_n + n_chunks - 1) / n_chunks;
+    let chunk_size = tile_n.div_ceil(n_chunks);
 
     let chunks: Vec<Vec<u8>> = (0..n_chunks).into_par_iter().map(|ci| {
         let v_start = ci * chunk_size;
@@ -509,7 +509,7 @@ pub fn setup_bcf_writer(
     output_path: &Path,
     no_ap: bool,
 ) -> std::io::Result<(VcfSender, VcfWriterHandle, VcfBgzipProc)> {
-    let bcf_path = if output_path.extension().map_or(true, |e| e != "bcf") {
+    let bcf_path = if output_path.extension().is_none_or(|e| e != "bcf") {
         output_path.with_extension("bcf")
     } else {
         output_path.to_path_buf()
@@ -567,7 +567,7 @@ fn format_tile_batch_bcf(
 
     if tile_n == 0 { return Vec::new(); }
     let n_chunks = 16.min(tile_n);
-    let chunk_size = (tile_n + n_chunks - 1) / n_chunks;
+    let chunk_size = tile_n.div_ceil(n_chunks);
 
     let chunks: Vec<Vec<u8>> = (0..n_chunks).into_par_iter().map(|ci| {
         let v_start = ci * chunk_size;
@@ -625,7 +625,7 @@ fn format_chip_bcf(
 
 /// Parse variant ID parts from SRP. Returns (chrom, pos_str, rsid/oid, ref, alt) or None.
 #[inline]
-fn parse_variant_parts<'a>(srp: &'a SrpReader, wgs_i: usize) -> Option<(&'a str, &'a str, &'a str, &'a str, &'a str)> {
+fn parse_variant_parts(srp: &SrpReader, wgs_i: usize) -> Option<(&str, &str, &str, &str, &str)> {
     let id = &srp.ids[wgs_i];
     let parts: Vec<&str> = id.splitn(4, '-').collect();
     if parts.len() < 4 { return None; }
@@ -880,6 +880,7 @@ pub fn write_window_multiformat(
         let mut stripe_loaded: Option<crate::srp::tiled::PreloadedStripes> = preloaded_stripes;
         let mut next_io_handle: Option<std::thread::JoinHandle<std::io::Result<crate::srp::tiled::PreloadedStripes>>> = None;
 
+        #[allow(clippy::upper_case_acronyms)]
         struct BTD { ts: usize, tile_n: usize, gs: usize, ws: usize, we: usize, full_range: f32 }
 
         for (bi, &(bstart, bend)) in batches.iter().enumerate() {
@@ -888,7 +889,7 @@ pub fn write_window_multiformat(
             let (b_first_stripe, b_last_stripe, b_n_stripes) = batch_stripe_ranges[bi];
 
             // Load compressed stripe data
-            let loaded_ok = stripe_loaded.as_ref().map_or(false, |l|
+            let loaded_ok = stripe_loaded.as_ref().is_some_and(|l|
                 l.contains_stripe(b_first_stripe) && l.contains_stripe(b_last_stripe));
             if !loaded_ok {
                 if let Some(handle) = next_io_handle.take() {
@@ -1019,7 +1020,7 @@ pub fn write_window_multiformat(
             cache_high = first_batch_end;
         }
 
-        for (_iv_idx, interval) in setup.intervals.iter().enumerate() {
+        for interval in setup.intervals.iter() {
             let n_total_vars = interval.wgs_end - interval.wgs_start;
 
             emit_chip_gap!(interval.wgs_start);
@@ -1134,7 +1135,7 @@ fn interp_kernel(
     let row_end = row_offset + n_vars;
 
     thread_local! {
-        static TL_NUM: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+        static TL_NUM: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
     out.par_chunks_mut(n_vars)
@@ -1271,6 +1272,7 @@ pub fn interpolate_tile_batch(
     let last_stripe = (global_end - 1) / TILE_ROWS;
 
     // Pre-collect stripe overlap info + tile refs outside rayon (O(1) Vec access, no HashMap)
+    #[allow(clippy::upper_case_acronyms)]
     struct SOV<'a> { tiles: &'a [crate::srp::SparseTile], lr_start: usize, lr_end: usize, out_off: usize, ov_n: usize }
     let sovs: Vec<SOV> = (first_stripe..=last_stripe)
         .filter_map(|stripe| {

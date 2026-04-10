@@ -128,7 +128,7 @@ fn phase_genotypes_inner(
         diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median = if diffs.is_empty() { 1e-7 } else {
             let mid = diffs.len() / 2;
-            if diffs.len() % 2 == 0 { (diffs[mid-1] + diffs[mid]) / 2.0 } else { diffs[mid] }
+            if diffs.len().is_multiple_of(2) { (diffs[mid-1] + diffs[mid]) / 2.0 } else { diffs[mid] }
         };
         let ibs_step = (3.0 * median).max(1e-7);
         let ms = (1.0f64 / ibs_step).round() as i32;  // debug JAR: Math.rint, no max(200) floor
@@ -145,7 +145,7 @@ fn phase_genotypes_inner(
                 selphi_debug!("  [DEBUG] Dumped {} coded steps to {}", w_n, path);
             }
         }
-        window_step_size.push(((w_size + w_n.max(1) - 1) / w_n.max(1)).max(2));
+        window_step_size.push(w_size.div_ceil(w_n.max(1)).max(2));
         window_gen_pos.push(w_gen_pos);
         window_coded_starts.push(w_starts);
         window_coded_ends.push(w_ends);
@@ -294,13 +294,13 @@ fn phase_genotypes_inner(
         let own_end_local = owe - ws;
 
         // Pre-compute overlap steps ONCE (invariant across iterations: genetic map doesn't change)
-        let steps_per_batch = (w_n_steps + n_threads - 1) / n_threads;
-        let n_batches = (w_n_steps + steps_per_batch - 1) / steps_per_batch;
+        let steps_per_batch = w_n_steps.div_ceil(n_threads);
+        let n_batches = w_n_steps.div_ceil(steps_per_batch);
         let n_overlap_steps = (0.35 / (3.0 * {
             let mut dd: Vec<f64> = (1..w_cm.len()).map(|i| w_cm[i] - w_cm[i-1]).collect();
             dd.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let mid = dd.len() / 2;
-            if dd.len() % 2 == 0 { (dd[mid-1]+dd[mid])/2.0 } else { dd[mid] }
+            if dd.len().is_multiple_of(2) { (dd[mid-1]+dd[mid])/2.0 } else { dd[mid] }
         }.max(1e-7))).round() as usize;
 
         // --- Iteration loop for this window ---
@@ -509,7 +509,7 @@ fn phase_genotypes_inner(
 
             // Apply swaps, locks, confidence (window-local indices)
             let mut _sw = 0i32; let mut _ht = 0i32; let mut _lk = 0i32;
-            for &(_, ref r) in &active_results {
+            for (_, r) in &active_results {
                 _sw += r.n_swap; _ht += r.n_own; _lk += r.n_lock;
                 for &(rs, re, h0) in &r.swap_ranges {
                     let h1 = h0 + 1;
@@ -534,9 +534,7 @@ fn phase_genotypes_inner(
                         let mid_start = if rs & 7 != 0 { first_byte + 1 } else { first_byte };
                         let mid_end = if re & 7 != 0 { last_byte } else { last_byte + 1 };
                         for bi in mid_start..mid_end {
-                            let tmp = w_hap_bits[h0_off + bi];
-                            w_hap_bits[h0_off + bi] = w_hap_bits[h1_off + bi];
-                            w_hap_bits[h1_off + bi] = tmp;
+                            w_hap_bits.swap(h0_off + bi, h1_off + bi);
                         }
                         if re & 7 != 0 {
                             let mask = (1u8 << (re & 7)) - 1;

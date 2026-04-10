@@ -133,7 +133,7 @@ pub fn map_merges(
         if stat.merged {
             let s = stat.idx;
             // No adjacent merges
-            if s > 0 && !flags[s - 1] && s + 1 <= graph.n_segments && !flags[s + 1] {
+            if s > 0 && !flags[s - 1] && s < graph.n_segments && !flags[s + 1] {
                 flags[s] = true;
             }
         }
@@ -274,7 +274,7 @@ pub fn perform_merges(
                 new_ambiguous.push(new_amb);
             }
 
-            let merged_len = graph.lengths[s] as u16 + graph.lengths[s + 1] as u16;
+            let merged_len = graph.lengths[s] + graph.lengths[s + 1];
             new_lengths.push(merged_len);
             new_diplotypes.push(new_dip);
 

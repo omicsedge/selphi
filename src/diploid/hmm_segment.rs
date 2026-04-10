@@ -1521,10 +1521,6 @@ impl SegmentHmm {
                     prev_abs_locus = vi;
                 }
 
-                // Micro-test: per-site dump for W[0] (K=597, seg_first=0)
-                if seg_first == 0 && self.n_cond == 597 && abs_locus < 15 {
-                }
-
                 abs_locus += 1;
             }
 
@@ -1652,7 +1648,6 @@ impl SegmentHmm {
                 else { self.init_mis(); }
             } else if is_first_in_seg && curr_seg < seg_last {
                 self.sum_k();
-                if self.n_cond == 597 && (curr_seg <= seg_first + 2 || curr_seg >= seg_last - 2) {}
                 let seg_rel = curr_seg + 1 - seg_first;
                 let hap_underflow = self.compute_trans_hap(seg_rel, trans, prev_abs_locus, hmm_params);
                 let prev_dipcount = graph.count_diplotypes(curr_seg);
@@ -1693,8 +1688,8 @@ impl SegmentHmm {
             if curr_seg_locus == 0 && curr_seg > seg_first {
                 curr_seg -= 1;
                 curr_seg_locus = graph.lengths[curr_seg] as usize - 1;
-            } else if curr_seg_locus > 0 {
-                curr_seg_locus -= 1;
+            } else {
+                curr_seg_locus = curr_seg_locus.saturating_sub(1);
             }
         }
 
@@ -1825,10 +1820,6 @@ impl SegmentHmm {
                 // Segment boundary
                 self.sum_k();
 
-                // Dump backward segment state for micro-test
-                if self.n_cond == 597 && (curr_seg <= seg_first + 2 || curr_seg >= seg_last - 2) {
-                }
-
                 // TRANS_HAP: HProbs[h1*8+h2] = sum_k(alpha_trans(k,h1) * beta(k,h2))
                 let seg_rel = curr_seg + 1 - seg_first;
                 let hap_underflow = self.compute_trans_hap(seg_rel, trans, prev_abs_locus, hmm_params);
@@ -1903,8 +1894,8 @@ impl SegmentHmm {
             if curr_seg_locus == 0 && curr_seg > seg_first {
                 curr_seg -= 1;
                 curr_seg_locus = graph.lengths[curr_seg] as usize - 1;
-            } else if curr_seg_locus > 0 {
-                curr_seg_locus -= 1;
+            } else {
+                curr_seg_locus = curr_seg_locus.saturating_sub(1);
             }
         }
 
@@ -2003,7 +1994,7 @@ impl SegmentHmm {
                 _mm256_storeu_ps(self.h_probs[h1 * HAP_NUMBER..].as_mut_ptr(), _sum);
                 // C++ exact: compute row sum first, then add to running total
                 // (different from adding each element to running total one-by-one)
-                sum_h += self.h_probs[h1*HAP_NUMBER+0]+self.h_probs[h1*HAP_NUMBER+1]+self.h_probs[h1*HAP_NUMBER+2]+self.h_probs[h1*HAP_NUMBER+3]+self.h_probs[h1*HAP_NUMBER+4]+self.h_probs[h1*HAP_NUMBER+5]+self.h_probs[h1*HAP_NUMBER+6]+self.h_probs[h1*HAP_NUMBER+7];
+                sum_h += self.h_probs[h1*HAP_NUMBER]+self.h_probs[h1*HAP_NUMBER+1]+self.h_probs[h1*HAP_NUMBER+2]+self.h_probs[h1*HAP_NUMBER+3]+self.h_probs[h1*HAP_NUMBER+4]+self.h_probs[h1*HAP_NUMBER+5]+self.h_probs[h1*HAP_NUMBER+6]+self.h_probs[h1*HAP_NUMBER+7];
             }
         }
         #[cfg(target_arch = "aarch64")]
@@ -2025,7 +2016,7 @@ impl SegmentHmm {
                 vst1q_f32(self.h_probs[h1 * HAP_NUMBER..].as_mut_ptr(), _sum_lo);
                 vst1q_f32(self.h_probs[h1 * HAP_NUMBER..].as_mut_ptr().add(4), _sum_hi);
                 // C++ exact: compute row sum first, then add to running total
-                sum_h += self.h_probs[h1*HAP_NUMBER+0]+self.h_probs[h1*HAP_NUMBER+1]+self.h_probs[h1*HAP_NUMBER+2]+self.h_probs[h1*HAP_NUMBER+3]+self.h_probs[h1*HAP_NUMBER+4]+self.h_probs[h1*HAP_NUMBER+5]+self.h_probs[h1*HAP_NUMBER+6]+self.h_probs[h1*HAP_NUMBER+7];
+                sum_h += self.h_probs[h1*HAP_NUMBER]+self.h_probs[h1*HAP_NUMBER+1]+self.h_probs[h1*HAP_NUMBER+2]+self.h_probs[h1*HAP_NUMBER+3]+self.h_probs[h1*HAP_NUMBER+4]+self.h_probs[h1*HAP_NUMBER+5]+self.h_probs[h1*HAP_NUMBER+6]+self.h_probs[h1*HAP_NUMBER+7];
             }
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -2148,7 +2139,7 @@ impl SegmentHmm {
             let dist_cm = (cm_f32[locus] - cm_f32[prev_locus]).abs();
             let dist = if (dist_cm as f64) <= 1e-7 { 1e-7 } else { dist_cm as f64 };
             let exponent_f32 = (dist * (-0.04 * ne / n_haps as f64)) as f32;
-            let t = -1.0f32 * exponent_f32.exp_m1();
+            let t = -exponent_f32.exp_m1();
             let t = t.clamp(0.0, 1.0);
             (1.0 - t, t)
         }

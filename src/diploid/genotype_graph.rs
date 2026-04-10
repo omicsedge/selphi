@@ -158,7 +158,7 @@ impl GenotypeGraph {
             n_missing: 0,
             n_transitions: 0,
             double_precision: false,
-            variants: vec![0u8; (n_variants + 1) / 2],
+            variants: vec![0u8; n_variants.div_ceil(2)],
             ambiguous: Vec::new(),
             diplotypes: Vec::new(),
             lengths: Vec::new(),
@@ -321,7 +321,7 @@ impl GenotypeGraph {
 
                 if f_het {
                     for h in 0..HAP_NUMBER {
-                        let allele = ((h >> n_unf) % 2) != 0;
+                        let allele = !(h >> n_unf).is_multiple_of(2);
                         if allele {
                             hap_set(&mut self.ambiguous[a1], h);
                         }
@@ -458,7 +458,7 @@ pub fn build_graph(
         if a0 > 1 || a1 > 1 {
             graph.set_missing(v);
         } else {
-            let phased = phased_flags.map_or(false, |f| f[v]);
+            let phased = phased_flags.is_some_and(|f| f[v]);
             graph.set_variant(v, a0, a1, phased);
         }
     }

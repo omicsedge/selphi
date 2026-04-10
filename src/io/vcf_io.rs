@@ -91,7 +91,7 @@ pub fn write_imputed_vcf(
     }
 
     // Open bgzf writer (native Rust, no external bgzip dependency)
-    let vcf_path = if output_path.extension().map_or(true, |e| e != "gz") {
+    let vcf_path = if output_path.extension().is_none_or(|e| e != "gz") {
         output_path.with_extension("vcf.gz")
     } else {
         output_path.to_path_buf()
@@ -105,24 +105,24 @@ pub fn write_imputed_vcf(
     let mut writer = BufWriter::with_capacity(1 << 20, bgzf);
 
     // Write header
-    write!(writer, "##fileformat=VCFv4.2\n")?;
-    write!(writer, "##source=Selphi_v{version} SelfDecode™\n")?;
-    write!(writer, "##FILTER=<ID=PASS,Description=\"All filters passed\">\n")?;
-    write!(writer, "##INFO=<ID=IMP,Number=0,Type=Flag,Description=\"Imputed marker\">\n")?;
-    write!(writer, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">\n")?;
-    write!(writer, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele Number\">\n")?;
-    write!(writer, "##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Estimated Allele Count\">\n")?;
-    write!(writer, "##INFO=<ID=DR2,Number=1,Type=Float,Description=\"Dosage R-squared: estimated imputation accuracy\">\n")?;
-    write!(writer, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n")?;
-    write!(writer, "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"estimated ALT dose\">\n")?;
-    write!(writer, "##FORMAT=<ID=AP1,Number=A,Type=Float,Description=\"estimated ALT dose on first haplotype\">\n")?;
-    write!(writer, "##FORMAT=<ID=AP2,Number=A,Type=Float,Description=\"estimated ALT dose on second haplotype\">\n")?;
-    write!(writer, "{}\n", contig_field)?;
+    writeln!(writer, "##fileformat=VCFv4.2")?;
+    writeln!(writer, "##source=Selphi_v{version} SelfDecode™")?;
+    writeln!(writer, "##FILTER=<ID=PASS,Description=\"All filters passed\">")?;
+    writeln!(writer, "##INFO=<ID=IMP,Number=0,Type=Flag,Description=\"Imputed marker\">")?;
+    writeln!(writer, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">")?;
+    writeln!(writer, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele Number\">")?;
+    writeln!(writer, "##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Estimated Allele Count\">")?;
+    writeln!(writer, "##INFO=<ID=DR2,Number=1,Type=Float,Description=\"Dosage R-squared: estimated imputation accuracy\">")?;
+    writeln!(writer, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">")?;
+    writeln!(writer, "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"estimated ALT dose\">")?;
+    writeln!(writer, "##FORMAT=<ID=AP1,Number=A,Type=Float,Description=\"estimated ALT dose on first haplotype\">")?;
+    writeln!(writer, "##FORMAT=<ID=AP2,Number=A,Type=Float,Description=\"estimated ALT dose on second haplotype\">")?;
+    writeln!(writer, "{}", contig_field)?;
     write!(writer, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
     for name in sample_names {
         write!(writer, "\t{}", name)?;
     }
-    write!(writer, "\n")?;
+    writeln!(writer)?;
 
     // Write variants
     for wgs_i in 0..variants.len() {
@@ -158,7 +158,7 @@ pub fn write_imputed_vcf(
                     write!(writer, "\t{}|{}", a0, a1)?;
                 }
             }
-            write!(writer, "\n")?;
+            writeln!(writer)?;
         } else if let Some((bi, vi)) = block_lookup[wgs_i] {
             // Imputed site
             let block = &blocks[bi];
@@ -190,7 +190,7 @@ pub fn write_imputed_vcf(
                 let gt2 = if ap2 > 0.5 { 1 } else { 0 };
                 write!(writer, "\t{}|{}:{}:{}:{}", gt1, gt2, fmt_val(ds), fmt_val(ap1), fmt_val(ap2))?;
             }
-            write!(writer, "\n")?;
+            writeln!(writer)?;
         }
         // else: variant not covered by any block (skip)
     }

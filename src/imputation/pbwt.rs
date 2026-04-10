@@ -208,15 +208,13 @@ pub fn pbwt_forward_with_workspace(
                     if dv > dmin { dmin = dv; }
                     if dmin > threshold { break; }
                     let hap_at_pos = ws.a[pos as usize];
-                    if hap_at_pos < n_ref as i32 {
-                        if ws.y[ib] != ws.y[pos as usize] || is_last {
-                            let mut length = var as i32 - dmin;
-                            if is_last && ws.y[ib] == ws.y[pos as usize] { length += 1; }
-                            insert_match(
-                                &mut haps, &mut lens, &mut counts, &mut ws.ht,
-                                n_var, fl_fwd, dmin as usize, hap_at_pos, length,
-                            );
-                        }
+                    if hap_at_pos < n_ref as i32 && (ws.y[ib] != ws.y[pos as usize] || is_last) {
+                        let mut length = var as i32 - dmin;
+                        if is_last && ws.y[ib] == ws.y[pos as usize] { length += 1; }
+                        insert_match(
+                            &mut haps, &mut lens, &mut counts, &mut ws.ht,
+                            n_var, fl_fwd, dmin as usize, hap_at_pos, length,
+                        );
                     }
                     pos -= 1;
                 }
@@ -230,15 +228,13 @@ pub fn pbwt_forward_with_workspace(
                     if dv > dmin { dmin = dv; }
                     if dmin > threshold { break; }
                     let hap_at_pos = ws.a[pos];
-                    if hap_at_pos < n_ref as i32 {
-                        if ws.y[pos] != ws.y[ib] || is_last {
-                            let mut length = var as i32 - dmin;
-                            if is_last && ws.y[ib] == ws.y[pos] { length += 1; }
-                            insert_match(
-                                &mut haps, &mut lens, &mut counts, &mut ws.ht,
-                                n_var, fl_fwd, dmin as usize, hap_at_pos, length,
-                            );
-                        }
+                    if hap_at_pos < n_ref as i32 && (ws.y[pos] != ws.y[ib] || is_last) {
+                        let mut length = var as i32 - dmin;
+                        if is_last && ws.y[ib] == ws.y[pos] { length += 1; }
+                        insert_match(
+                            &mut haps, &mut lens, &mut counts, &mut ws.ht,
+                            n_var, fl_fwd, dmin as usize, hap_at_pos, length,
+                        );
                     }
                 }
             }
@@ -285,9 +281,7 @@ pub fn pbwt_forward_single(
     let mut counts = vec![0i32; n_var];
 
     // Initial y from first variant
-    for i in 0..m {
-        y[i] = alleles[i]; // alleles[0, i]
-    }
+    y[..m].copy_from_slice(&alleles[..m]);
 
     for var in 0..n_var {
         let is_last = var >= n_var - 1;
@@ -305,20 +299,18 @@ pub fn pbwt_forward_single(
                     if dv > dmin { dmin = dv; }
                     if dmin > threshold { break; }
                     let hap_at_pos = a[pos as usize];
-                    if hap_at_pos < n_ref as i32 {
-                        if y[ib] != y[pos as usize] || is_last {
-                            let mut length = var as i32 - dmin;
-                            if is_last && y[ib] == y[pos as usize] {
-                                length += 1;
-                            }
-                            let ref_hap = hap_at_pos;
-                            let dmin_idx = dmin as usize;
-                            insert_match(
-                                &mut haps, &mut lens, &mut counts,
-                                &mut ht, n_var, fl_fwd,
-                                dmin_idx, ref_hap, length,
-                            );
+                    if hap_at_pos < n_ref as i32 && (y[ib] != y[pos as usize] || is_last) {
+                        let mut length = var as i32 - dmin;
+                        if is_last && y[ib] == y[pos as usize] {
+                            length += 1;
                         }
+                        let ref_hap = hap_at_pos;
+                        let dmin_idx = dmin as usize;
+                        insert_match(
+                            &mut haps, &mut lens, &mut counts,
+                            &mut ht, n_var, fl_fwd,
+                            dmin_idx, ref_hap, length,
+                        );
                     }
                     pos -= 1;
                 }
@@ -332,20 +324,18 @@ pub fn pbwt_forward_single(
                     if dv > dmin { dmin = dv; }
                     if dmin > threshold { break; }
                     let hap_at_pos = a[pos];
-                    if hap_at_pos < n_ref as i32 {
-                        if y[pos] != y[ib] || is_last {
-                            let mut length = var as i32 - dmin;
-                            if is_last && y[ib] == y[pos] {
-                                length += 1;
-                            }
-                            let ref_hap = hap_at_pos;
-                            let dmin_idx = dmin as usize;
-                            insert_match(
-                                &mut haps, &mut lens, &mut counts,
-                                &mut ht, n_var, fl_fwd,
-                                dmin_idx, ref_hap, length,
-                            );
+                    if hap_at_pos < n_ref as i32 && (y[pos] != y[ib] || is_last) {
+                        let mut length = var as i32 - dmin;
+                        if is_last && y[ib] == y[pos] {
+                            length += 1;
                         }
+                        let ref_hap = hap_at_pos;
+                        let dmin_idx = dmin as usize;
+                        insert_match(
+                            &mut haps, &mut lens, &mut counts,
+                            &mut ht, n_var, fl_fwd,
+                            dmin_idx, ref_hap, length,
+                        );
                     }
                 }
             }
@@ -458,7 +448,7 @@ pub fn pbwt_forward_shared(
     let mut ht: Vec<Vec<i64>> = (0..n_targets).map(|_| vec![0i64; n_ref]).collect();
 
     // Initial y from first variant
-    for i in 0..m { y[i] = alleles[i]; }
+    y[..m].copy_from_slice(&alleles[..m]);
 
     for var in 0..n_var {
         let is_last = var >= n_var - 1;
@@ -488,15 +478,13 @@ pub fn pbwt_forward_shared(
                         if dv > dmin { dmin = dv; }
                         if dmin > threshold { break; }
                         let hap_at_pos = a_ref[pos as usize];
-                        if hap_at_pos < n_ref as i32 {
-                            if target_y != y_ref[pos as usize] || is_last {
-                                let mut length = var as i32 - dmin;
-                                if is_last && target_y == y_ref[pos as usize] { length += 1; }
-                                insert_match(
-                                    &mut r.haps, &mut r.lens, &mut r.counts, ht_t,
-                                    n_var, fl_fwd, dmin as usize, hap_at_pos, length,
-                                );
-                            }
+                        if hap_at_pos < n_ref as i32 && (target_y != y_ref[pos as usize] || is_last) {
+                            let mut length = var as i32 - dmin;
+                            if is_last && target_y == y_ref[pos as usize] { length += 1; }
+                            insert_match(
+                                &mut r.haps, &mut r.lens, &mut r.counts, ht_t,
+                                n_var, fl_fwd, dmin as usize, hap_at_pos, length,
+                            );
                         }
                         pos -= 1;
                     }
@@ -510,15 +498,13 @@ pub fn pbwt_forward_shared(
                         if dv > dmin { dmin = dv; }
                         if dmin > threshold { break; }
                         let hap_at_pos = a_ref[pos];
-                        if hap_at_pos < n_ref as i32 {
-                            if y_ref[pos] != target_y || is_last {
-                                let mut length = var as i32 - dmin;
-                                if is_last && target_y == y_ref[pos] { length += 1; }
-                                insert_match(
-                                    &mut r.haps, &mut r.lens, &mut r.counts, ht_t,
-                                    n_var, fl_fwd, dmin as usize, hap_at_pos, length,
-                                );
-                            }
+                        if hap_at_pos < n_ref as i32 && (y_ref[pos] != target_y || is_last) {
+                            let mut length = var as i32 - dmin;
+                            if is_last && target_y == y_ref[pos] { length += 1; }
+                            insert_match(
+                                &mut r.haps, &mut r.lens, &mut r.counts, ht_t,
+                                n_var, fl_fwd, dmin as usize, hap_at_pos, length,
+                            );
                         }
                     }
                 }
@@ -1073,7 +1059,7 @@ pub fn select_candidates_ibs_quality(
         let tgt_group = coded.hap_group[s][target_hap];
         // Reset or extend runs
         for h in 0..n_ref {
-            if coded.hap_group[s][h as usize] == tgt_group {
+            if coded.hap_group[s][h] == tgt_group {
                 cur_run[h] += 1;
                 if cur_run[h] > max_run[h] {
                     max_run[h] = cur_run[h];
@@ -1189,7 +1175,7 @@ pub fn build_coded_alleles_for_target(
     let mut alleles = vec![0u8; n_steps * m_red];
 
     for s in 0..n_steps {
-        let tgt_group = coded.hap_group[s][target_hap] as u32;
+        let tgt_group = coded.hap_group[s][target_hap];
         let base = s * m_red;
         // Candidates
         for (i, &c) in candidates.iter().enumerate() {

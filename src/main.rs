@@ -2,6 +2,10 @@
 //!
 //! Standalone Rust binary. Mirrors the Python `selphi.py` CLI.
 
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::type_complexity)]
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -375,14 +379,14 @@ fn main() {
             selphi::srp::bref3_writer::write_bref3_from_bcf(Path::new(source), Path::new(output))
                 .unwrap_or_else(|e| { selphi_error!("BREF3 write failed: {}", e); std::process::exit(1); });
         } else if is_bref3 {
-            let srp_path = if Path::new(output).extension().map_or(true, |e| e != "srp") {
+            let srp_path = if Path::new(output).extension().is_none_or(|e| e != "srp") {
                 PathBuf::from(output).with_extension("srp")
             } else { PathBuf::from(output) };
             selphi::srp::writer::build_srp_from_bref3(
                 Path::new(source), &srp_path, args.threads, args.chunk_size)
                 .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
         } else {
-            let srp_path = if Path::new(output).extension().map_or(true, |e| e != "srp") {
+            let srp_path = if Path::new(output).extension().is_none_or(|e| e != "srp") {
                 PathBuf::from(output).with_extension("srp")
             } else { PathBuf::from(output) };
             selphi::srp::writer::build_srp_unified(
@@ -577,7 +581,7 @@ fn main() {
 
         if args.phase_only {
             let out_path = PathBuf::from(output_path);
-            let out_path = if out_path.extension().map_or(true, |e| e != "gz") {
+            let out_path = if out_path.extension().is_none_or(|e| e != "gz") {
                 out_path.with_extension("vcf.gz")
             } else { out_path };
             write_phased_vcf(
@@ -628,7 +632,7 @@ fn main() {
     let log2_haps = (n_ref as f64).log2();
     let fl_fwd = args.fl_fwd.unwrap_or_else(|| {
         let v = (2600.0 / log2_haps) as usize;
-        v.max(100).min(450)
+        v.clamp(100, 450)
     });
     let fl_bwd = args.fl_bwd.unwrap_or_else(|| {
         ((fl_fwd as f64 * 2.4 / log2_haps) as usize).max(13)
@@ -738,7 +742,7 @@ fn main() {
     // Crossover at ~MAF 0.5% based on sweep data.
     let ne_low = est_ne as f64 * 0.85;   // for rare (MAF < 0.5%)
     let ne_high = est_ne as f64 * 1.2;   // for common (MAF > 2%)
-    let maf_ne_per_site: Option<Vec<f64>> = if !em_ne_per_site.is_some() || args.no_em_ne {
+    let maf_ne_per_site: Option<Vec<f64>> = if em_ne_per_site.is_none() || args.no_em_ne {
         // Compute MAF from bitmatrix (popcount)
         let mut ne_maf = vec![ne_low; n_chip];
         for ci in 0..n_chip {
@@ -957,7 +961,7 @@ fn main() {
                     let is_full = n_cand < 100;
 
                     thread_local! {
-                        static TL_RED: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
+                        static TL_RED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
                     }
                     let mut reduced = TL_RED.with(|buf| {
                         let mut b = buf.borrow_mut();
@@ -1014,7 +1018,7 @@ fn main() {
 
                     thread_local! {
                         static WS: std::cell::RefCell<Option<selphi::imputation::pbwt::PbwtWorkspace>> =
-                            std::cell::RefCell::new(None);
+                            const { std::cell::RefCell::new(None) };
                     }
                     let fwd = WS.with(|ws_cell| {
                         let mut ws_opt = ws_cell.borrow_mut();
@@ -1310,8 +1314,8 @@ fn read_target_vcf(
             // Fast GT parsing: "0|1" or "0/1" — allele is single digit at positions 0 and 2
             let (a0, a1) = if gt.len() >= 3 {
                 let b0 = gt[0]; let b1 = gt[2];
-                (if b0 >= b'0' && b0 <= b'9' { b0 - b'0' } else { 0 },
-                 if b1 >= b'0' && b1 <= b'9' { b1 - b'0' } else { 0 })
+                (if b0.is_ascii_digit() { b0 - b'0' } else { 0 },
+                 if b1.is_ascii_digit() { b1 - b'0' } else { 0 })
             } else {
                 (0, 0)
             };
@@ -1335,7 +1339,7 @@ fn read_target_vcf(
 fn fast_parse_i64(bytes: &[u8]) -> i64 {
     let mut n: i64 = 0;
     for &b in bytes {
-        if b >= b'0' && b <= b'9' { n = n * 10 + (b - b'0') as i64; }
+        if b.is_ascii_digit() { n = n * 10 + (b - b'0') as i64; }
     }
     n
 }
@@ -1348,7 +1352,7 @@ fn blake2b_hex(s: &str) -> String {
 /// Intersect target markers with reference panel variants.
 fn intersect_variants(srp: &SrpReader, targets: &[TargetMarker]) -> (Vec<usize>, Vec<usize>) {
     fn strip_chr(c: &str) -> &str {
-        if c.starts_with("chr") { &c[3..] } else { c }
+        if let Some(stripped) = c.strip_prefix("chr") { stripped } else { c }
     }
     let ref_chrom = strip_chr(&srp.metadata.chromosome);
 
@@ -1407,17 +1411,17 @@ fn write_phased_vcf(
         .build_from_writer(file);
     let mut w = BufWriter::with_capacity(4 << 20, bgzf);
 
-    write!(w, "##fileformat=VCFv4.2\n")?;
-    write!(w, "##source=Selphi_v{} SelfDecode™\n", env!("CARGO_PKG_VERSION"))?;
-    write!(w, "##FILTER=<ID=PASS,Description=\"All filters passed\">\n")?;
-    write!(w, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">\n")?;
-    write!(w, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele Number\">\n")?;
-    write!(w, "##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Estimated Allele Count\">\n")?;
-    write!(w, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n")?;
-    write!(w, "{}\n", srp.metadata.contig_field)?;
+    writeln!(w, "##fileformat=VCFv4.2")?;
+    writeln!(w, "##source=Selphi_v{} SelfDecode™", env!("CARGO_PKG_VERSION"))?;
+    writeln!(w, "##FILTER=<ID=PASS,Description=\"All filters passed\">")?;
+    writeln!(w, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">")?;
+    writeln!(w, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele Number\">")?;
+    writeln!(w, "##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Estimated Allele Count\">")?;
+    writeln!(w, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">")?;
+    writeln!(w, "{}", srp.metadata.contig_field)?;
     write!(w, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
     for name in sample_names { write!(w, "\t{}", name)?; }
-    write!(w, "\n")?;
+    writeln!(w)?;
 
     let mut line_buf = String::with_capacity(n_samples * 6);
     for ci in 0..n_chip {
@@ -1436,7 +1440,7 @@ fn write_phased_vcf(
             line_buf.push((b'0' + a1) as char);
         }
         let af = ac as f64 / n_haps as f64;
-        write!(w, "{}\t{}\t.\t{}\t{}\t.\tPASS\tAF={:.4};AC={};AN={}\tGT\t{}\n",
+        writeln!(w, "{}\t{}\t.\t{}\t{}\t.\tPASS\tAF={:.4};AC={};AN={}\tGT\t{}",
             tm.chrom, tm.pos, tm.ref_allele, tm.alt_allele, af, ac, n_haps, line_buf)?;
     }
 

@@ -25,7 +25,7 @@ pub struct ConditioningBitset {
 
 impl ConditioningBitset {
     pub fn new(n_haps: usize) -> Self {
-        let n_words = (n_haps + 63) / 64;
+        let n_words = n_haps.div_ceil(64);
         Self { bits: vec![0u64; n_haps * n_words], n_words }
     }
 
@@ -289,7 +289,7 @@ impl PbwtNeighborIndex {
 
         if n_chunks <= 1 {
             // Single chunk: sequential with bitmatrix
-            self._sweep_bitmatrix_seq(n_sites, &bm, ibd2);
+            self._sweep_bitmatrix_seq(n_sites, bm, ibd2);
             return;
         }
 
@@ -528,7 +528,8 @@ impl PbwtNeighborIndex {
             let mut p = l as i32; let mut q = l as i32;
             for h in 0..n_hap {
                 let a_h = a[h]; let c_h = c[h];
-                if c_h > p { p = c_h; } if c_h > q { q = c_h; }
+                if c_h > p { p = c_h; }
+                if c_h > q { q = c_h; }
                 if hap_data[row_base + a_h as usize] == 0 {
                     a[u] = a_h; c[u] = p; p = 0; u += 1;
                 } else {

@@ -4,11 +4,9 @@
 /// Vectorizes emission lookup + multiply + accumulation.
 /// SIMD reduction reorders f32 additions vs scalar left-to-right —
 /// equivalent to Java HotSpot C2's auto-vectorized reductions.
-
 // ============================================================================
 // x86_64 AVX-512 implementation (16 × f32)
 // ============================================================================
-
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 

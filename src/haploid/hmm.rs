@@ -1,13 +1,14 @@
 #![allow(unused_assignments, unused_variables)]
 /// HMM phase worker: composites + clusters + 3-channel forward-backward with swap.
 /// Haploid HMM phase worker: composites + clusters + 3-channel forward-backward with swap.
-
 #[allow(unused_imports)]
 use crate::selphi_debug;
 
 // Min-heap helpers (Java PriorityQueue)
 #[inline] pub fn hu(k:&mut[i32],x:&mut[i32],mut p:usize){while p>0{let q=(p-1)>>1;if k[p]<k[q]{k.swap(p,q);x.swap(p,q);p=q}else{break}}}
-#[inline] pub fn hd(k:&mut[i32],x:&mut[i32],mut p:usize,sz:usize){let h=sz>>1;while p<h{let mut c=(p<<1)+1;let r=c+1;if r<sz&&k[r]<k[c]{c=r}if k[c]<k[p]{k.swap(p,c);x.swap(p,c);p=c}else{break}}}
+#[inline] pub fn hd(k:&mut[i32],x:&mut[i32],mut p:usize,sz:usize){let h=sz>>1;while p<h{let mut c=(p<<1)+1;let r=c+1;
+    if r<sz&&k[r]<k[c]{c=r}
+    if k[c]<k[p]{k.swap(p,c);x.swap(p,c);p=c}else{break}}}
 
 /// Copy haplotype h from haplotype-major bitmatrix to marker-major comp slot sl, markers [from, to).
 #[inline(always)]
@@ -73,13 +74,13 @@ fn copy_hap_to_comp(hbm:&[u8],hbs:usize,h:usize,sl:usize,from:usize,to:usize,com
 pub fn build_comp(hbm:&[u8],hbs:usize,i0:&[i32],i1:&[i32],nm:usize,mt:usize,ns:usize,cs:&[i32],ss:usize,nmo:usize,mst:i32,
     comp:&mut[u8],cbs:usize,sh:&mut[i32],sst:&mut[i32],hs:&mut[i32],hl:&mut[i32],hk:&mut[i32],hi:&mut[i32],trace:bool)->usize{
     let mut hz=0usize;
-    sh.iter_mut().for_each(|v|*v=-1);sst.iter_mut().for_each(|v|*v=0);
-    hs[..mt].iter_mut().for_each(|v|*v=-1);hl[..mt].iter_mut().for_each(|v|*v=-1_000_000);
+    sh.iter_mut().for_each(|v| *v = -1);sst.iter_mut().for_each(|v| *v = 0);
+    hs[..mt].iter_mut().for_each(|v| *v = -1);hl[..mt].iter_mut().for_each(|v| *v = -1_000_000);
     let bc_dbg = trace;
     let mut bc_trace: Vec<(i32,i32,i32,i32,i32,i32)> = if bc_dbg { Vec::with_capacity(ns*2) } else { Vec::new() };
     for s in 0..ns{for ci in 0..2{
         let ih=if ci==0{i0[s]}else{i1[s]};if ih<0||ih as usize>=mt{continue}let iu=ih as usize;
-        if hs[iu]>=0{hl[iu]=s as i32;if bc_dbg{bc_trace.push((s as i32,ci as i32,ih,0,-1,-1))}continue}
+        if hs[iu]>=0{hl[iu]=s as i32;if bc_dbg{bc_trace.push((s as i32,ci,ih,0,-1,-1))}continue}
         while hz>0{let s0=hi[0]as usize;let hh=sh[s0];
             if hh>=0&&hl[hh as usize]>hk[0]{let oi=hi[0];hz-=1;
                 if hz>0{hk[0]=hk[hz];hi[0]=hi[hz];hd(hk,hi,0,hz)}
@@ -87,13 +88,14 @@ pub fn build_comp(hbm:&[u8],hbs:usize,i0:&[i32],i1:&[i32],nm:usize,mt:usize,ns:u
         let ev=hz==nmo||(hz>0&&(s as i32)-hk[0]>=mst);
         if ev{let sl=hi[0]as usize;let oh=sh[sl];let os=sst[sl]as usize;let ol=hk[0];
             let ms=((ol+s as i32)>>1)as usize;let mut mm=if ms<cs.len(){cs[ms]as usize}else{ms*ss};
-            if mm>nm{mm=nm}if mm>os&&oh>=0{copy_hap_to_comp(hbm,hbs,oh as usize,sl,os,mm,comp,cbs)}
-            if bc_dbg{bc_trace.push((s as i32,ci as i32,ih,2,sl as i32,oh))}
-            if oh>=0{hs[oh as usize]=-1;hl[oh as usize]=-1_000_000}
+            if mm>nm{mm=nm}
+            if mm>os&&oh>=0{copy_hap_to_comp(hbm,hbs,oh as usize,sl,os,mm,comp,cbs)}
+            if bc_dbg{bc_trace.push((s as i32,ci,ih,2,sl as i32,oh))}
+            if oh>=0{hs[oh as usize] = -1;hl[oh as usize] = -1_000_000}
             sh[sl]=ih;sst[sl]=mm as i32;hs[iu]=sl as i32;hl[iu]=s as i32;
             hz-=1;if hz>0{hk[0]=hk[hz];hi[0]=hi[hz];hd(hk,hi,0,hz)}
             hk[hz]=s as i32;hi[hz]=sl as i32;hz+=1;hu(hk,hi,hz-1);
-        }else{if bc_dbg{bc_trace.push((s as i32,ci as i32,ih,1,hz as i32,-1))}
+        }else{if bc_dbg{bc_trace.push((s as i32,ci,ih,1,hz as i32,-1))}
             let sl=hz;sh[sl]=ih;sst[sl]=0;hs[iu]=sl as i32;hl[iu]=s as i32;
             hk[hz]=s as i32;hi[hz]=sl as i32;hz+=1;hu(hk,hi,hz-1)}
     }}
@@ -127,14 +129,14 @@ pub fn build_cl(g:&[u8],cm:&[f64],ws:usize,resolved:&[u8],cs:&mut[i32],ce:&mut[i
             let is_het=t0!=t1&&m-last==1;
             let is_resolved=is_het&&!resolved.is_empty()&&resolved[last]!=0;
             // PHASED_HET: is_het=1 (for mismatch 3-channel) but hm=-1 (no swap)
-            if is_het{ch[nc]=1;if is_resolved{hm[nc]=-1}else{hm[nc]=hi as i32;hi+=1}}
-            else{ch[nc]=0;hm[nc]=-1}nc+=1;last=m}else if m>0{last=m}}ps=sp}
+            if is_het{ch[nc]=1;if is_resolved{hm[nc] = -1}else{hm[nc]=hi as i32;hi+=1}}
+            else{ch[nc]=0;hm[nc] = -1}nc+=1;last=m}else if m>0{last=m}}ps=sp}
     if last<ws{cs[nc]=last as i32;ce[nc]=ws as i32;cz[nc]=(ws-last)as i32;
         let(t0,t1)=(g[last*2],g[last*2+1]);
         let is_het=t0!=t1&&ws-last==1;
         let is_resolved=is_het&&!resolved.is_empty()&&resolved[last]!=0;
-        if is_het{ch[nc]=1;if is_resolved{hm[nc]=-1}else{hm[nc]=hi as i32;hi+=1}}
-        else{ch[nc]=0;hm[nc]=-1}nc+=1}
+        if is_het{ch[nc]=1;if is_resolved{hm[nc] = -1}else{hm[nc]=hi as i32;hi+=1}}
+        else{ch[nc]=0;hm[nc] = -1}nc+=1}
     (nc,hi)
 }
 
@@ -181,6 +183,12 @@ pub struct PhaseWorkspace {
     pub hs2: Vec<usize>,
     pub hl2: Vec<bool>,
     pub hm2: Vec<bool>,
+}
+
+impl Default for PhaseWorkspace {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PhaseWorkspace {
@@ -295,7 +303,9 @@ pub fn phase_one(hbm:&[u8],hbs:usize,ibs:&[i32],hmask:&[u8],cm:&[f64],cst:&[i32]
                 }
             }
             for j in (ns&!7)..ns{let ca=(comp_row[j>>3]>>(j&7))&1;
-                if ca!=a0&&ca!=a1{pw.mm[off0+j]=1}if ca!=a0{pw.mm[off1+j]=1}if ca!=a1{pw.mm[off2+j]=1}}
+                if ca!=a0&&ca!=a1{pw.mm[off0+j]=1}
+                if ca!=a0{pw.mm[off1+j]=1}
+                if ca!=a1{pw.mm[off2+j]=1}}
         }
         else{
             // Hom cluster: check if ANY marker in [cs2,ce2) has comp allele != g[m*2]
