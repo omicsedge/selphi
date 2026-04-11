@@ -31,8 +31,13 @@ impl SrpReader {
         let mut magic = [0u8; 8];
         f.read_exact(&mut magic)?;
         if &magic != MAGIC {
+            let hint = if &magic[..2] == b"PK" {
+                "Detected old ZIP-based SRP format."
+            } else {
+                "Not a valid SRP file."
+            };
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
-                format!("Invalid SRP file: {}. Expected SRP format. Regenerate with: selphi --prepare-reference-from panel.bcf --out panel", filepath)));
+                format!("{} {} Regenerate with: selphi --prepare-reference-from panel.bcf --out panel", hint, filepath)));
         }
 
         let mut buf4 = [0u8; 4];
