@@ -102,10 +102,10 @@ pub fn run_phase_common_bm(
     scheme: &str,
     chip_bp: Option<&[i64]>,
     target_geno: &[u8],
+    max_cond_haps: usize,
 ) {
     let n_haps = n_samples * 2;
     let n_haps_total = n_ref + n_haps;
-
     let stages = expand_scheme(&parse_mcmc_scheme(scheme));
     let n_iterations = stages.len();
     let n_individuals = n_haps_total / 2;
@@ -347,6 +347,7 @@ pub fn run_phase_common_bm(
         &mut pbwt_idx, &mut ibd2, &cm_f64, &hmm_params, &allele_counts,
         &stages, &ordering, &mut o_iterator, &mut rng,
         n_var, n_samples, n_ref, n_haps_total, target_geno, chip_bp,
+        max_cond_haps,
     );
 
     crate::selphi_debug!("  [diploid] phase_common complete");
@@ -378,7 +379,7 @@ pub fn run_phase_common(
     run_phase_common_bm(
         graphs, hap_bm, cm,
         n_var, n_samples, n_ref, seed, n_threads,
-        scheme, chip_bp, target_geno,
+        scheme, chip_bp, target_geno, 0,
     );
 }
 
@@ -401,6 +402,7 @@ fn _run_iterations(
     n_haps_total: usize,
     _target_geno: &[u8],
     _chip_bp: Option<&[i64]>,
+    max_cond_haps: usize,
 ) {
     let _n_haps = n_samples * 2;
     let n_iterations = stages.len();
@@ -478,7 +480,7 @@ fn _run_iterations(
 
         // Shared immutable borrows for the parallel closure
         let hap_bm_hmm_ref: &HaplotypeBitmatrix = hap_bm;
-
+        let ibs_cap = max_cond_haps;
         let per_sample_banned: Vec<Vec<(usize, usize, usize, usize)>> =
             graphs.par_iter_mut().enumerate().map(|(si, graph)| {
             if graph.n_segments == 0 { return vec![]; }
@@ -576,6 +578,24 @@ fn _run_iterations(
                     }
                     cond_set.sort_unstable();
                     cond_set.dedup();
+                }
+
+                // IBS-based cap: if ibs_cap > 0, keep only the top-K by IBS
+                if ibs_cap > 0 && cond_set.len() > ibs_cap {
+                    let step = ((w_l1 - w_l0 + 1) / 200).max(1);
+                    let mut scores: Vec<(u32, usize)> = cond_set.iter().map(|&ch| {
+                        let mut ibs = 0u32;
+                        let mut v = w_l0;
+                        while v <= w_l1 {
+                            if hap_bm_hmm_ref.get(v, ch) == hap_bm_hmm_ref.get(v, h0) { ibs += 1; }
+                            if hap_bm_hmm_ref.get(v, ch) == hap_bm_hmm_ref.get(v, h1) { ibs += 1; }
+                            v += step;
+                        }
+                        (ibs, ch)
+                    }).collect();
+                    scores.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    cond_set = scores[..ibs_cap].iter().map(|&(_, ch)| ch).collect();
+                    cond_set.sort_unstable();
                 }
 
                 cond_ns += t_cond.elapsed().as_nanos();

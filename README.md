@@ -233,6 +233,7 @@ Standard VCF or BCF. Unphased (`0/1`) or phased (`0|1`) genotypes. Multi-allelic
 | `--p-err F` | Emission error probability | 0.025 |
 | `--match-length N` | Minimum PBWT match length | auto |
 | `--max-candidates N` | Max reference candidates per haplotype | 2500 |
+| `--max-cond-haps N` | Max conditioning haplotypes per diploid phasing window (0 = unlimited). IBS-selected. Try 120–200 for faster phasing. | 0 |
 | `--window-cm F` | Imputation window size in cM | 80 |
 | `--overlap-cm F` | Window overlap in cM | 2 |
 

@@ -202,7 +202,7 @@ fn phase_genotypes_inner(
         let (ws, we, ows, owe) = windows[wi];
         let w_size = we - ws;
         let w_n_steps = window_n_steps[wi];
-        let w_step_size = window_step_size[wi];
+        let _w_step_size = window_step_size[wi];
         let overlap = if wi == 0 { 0 } else { windows[wi-1].3 - ws };
 
         // --- Init phase for this window ---

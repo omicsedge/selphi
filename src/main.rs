@@ -116,6 +116,11 @@ struct Args {
     #[arg(long, value_enum, default_value = "auto")]
     phasing_engine: PhasingEngine,
 
+    /// Max conditioning haplotypes per window in diploid phasing (0 = unlimited).
+    /// Lower values = faster but less accurate. Try 120-200 for speed, 0 for best accuracy.
+    #[arg(long, default_value = "0")]
+    max_cond_haps: usize,
+
     /// Alias for --phasing-engine=diploid (deprecated)
     #[arg(long, hide = true)]
     wgs_phasing: bool,
@@ -547,6 +552,7 @@ fn main() {
                     &ref_bp, &map_bp_raw, &map_cm_raw,
                     n_chip, n_samples, n_ref,
                     args.seed, args.threads,
+                    args.max_cond_haps,
                 )
             }
             ResolvedEngine::Haploid => {
