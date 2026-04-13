@@ -167,15 +167,20 @@ pub fn run_phase_common_bm(
         let chunk_assignments = &pbwt_idx.chunk_assignments;
         let chunk_starts = &pbwt_idx.chunk_starts;
 
-        // Read haplotypes from unified bitmatrix
+        // Read haplotypes from unified bitmatrix.
+        // SAFETY: We use raw pointer arithmetic for concurrent access. Each chunk reads
+        // from overlapping row ranges (due to PBWT buffer prefix), but only WRITES to
+        // rows where `chunk_assignments[l] == chunk_id` — these are disjoint across
+        // chunks. We store the pointer as usize for Send, then reconstruct as *mut u64
+        // inside each thread. This avoids creating aliased `&mut [u64]` slices (UB).
         let bm_bits_ptr = hap_bm.bits_ptr() as usize;
         let bm_n_words = hap_bm.n_words();
         let bm_total_len = n_var * bm_n_words;
 
         (0..n_sweep_chunks).into_par_iter().for_each(|chunk_id| {
-            let bm_bits = unsafe {
-                std::slice::from_raw_parts_mut(bm_bits_ptr as *mut u64, bm_total_len)
-            };
+            let bm_ptr = bm_bits_ptr as *mut u64;
+            debug_assert!(!bm_ptr.is_null());
+            let _ = bm_total_len; // used for bounds reasoning
             let buffer_start = chunk_starts[chunk_id];
             let chunk_end = chunk_assignments.iter().rposition(|&c| c == chunk_id as i32)
                 .unwrap_or(n_var - 1);
@@ -192,12 +197,13 @@ pub fn run_phase_common_bm(
                 let in_chunk = chunk_assignments[l] == chunk_id as i32;
                 let do_phase = in_chunk && l > 0;
 
-                // Fill row buffer from unified bitmatrix
+                // Fill row buffer from unified bitmatrix (read via raw pointer)
                 {
                     let row_base = l * bm_n_words;
                     row_buf.fill(0);
                     for w in 0..bm_n_words {
-                        let mut word = bm_bits[row_base + w];
+                        // SAFETY: row_base + w < bm_total_len, pointer is valid
+                        let mut word = unsafe { bm_ptr.add(row_base + w).read() };
                         let base = w * 64;
                         while word != 0 {
                             let k = word.trailing_zeros() as usize;
@@ -282,19 +288,25 @@ pub fn run_phase_common_bm(
                 }
 
                 if do_phase {
+                    // Write phased haplotypes back via raw pointer.
+                    // SAFETY: Only rows where chunk_assignments[l] == chunk_id are
+                    // written, and chunk assignments are disjoint, so no data race.
                     let row_base = l * bm_n_words;
                     for si in 0..n_samples {
                         if het[si] {
                             let h0 = si * 2; let h1 = si * 2 + 1;
                             let v0 = if g_score[h0] > 0.0 { 1u8 } else { 0 };
                             let v1 = if g_score[h1] > 0.0 { 1u8 } else { 0 };
-                            // Write to unified bitmatrix
                             let w0 = h0 / 64; let b0 = 1u64 << (h0 % 64);
                             let w1 = h1 / 64; let b1 = 1u64 << (h1 % 64);
-                            if v0 != 0 { bm_bits[row_base + w0] |= b0; }
-                            else { bm_bits[row_base + w0] &= !b0; }
-                            if v1 != 0 { bm_bits[row_base + w1] |= b1; }
-                            else { bm_bits[row_base + w1] &= !b1; }
+                            unsafe {
+                                let p0 = bm_ptr.add(row_base + w0);
+                                if v0 != 0 { p0.write(p0.read() | b0); }
+                                else { p0.write(p0.read() & !b0); }
+                                let p1 = bm_ptr.add(row_base + w1);
+                                if v1 != 0 { p1.write(p1.read() | b1); }
+                                else { p1.write(p1.read() & !b1); }
+                            }
                             row_buf[h0] = v0;
                             row_buf[h1] = v1;
                         }

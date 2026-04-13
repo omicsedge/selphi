@@ -13,6 +13,16 @@ use crate::selphi_debug;
 fn copy_hap_to_comp(hbm:&[u8],hbs:usize,h:usize,sl:usize,from:usize,to:usize,comp:&mut[u8],cbs:usize) {
     let sl_byte = sl >> 3;
     let sl_bit = 1u8 << (sl & 7);
+    // Short range: bit-by-bit copy when span < 8 markers (avoids partial-byte edge cases)
+    if to - from < 8 {
+        let hap_base = h * hbs;
+        for m in from..to {
+            if (hbm[hap_base + (m >> 3)] >> (m & 7)) & 1 != 0 {
+                comp[m * cbs + sl_byte] |= sl_bit;
+            }
+        }
+        return;
+    }
     {
         // Fast path: read sequentially from haplotype-major bitmatrix
         let hap_base = h * hbs;

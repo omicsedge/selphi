@@ -2,6 +2,7 @@
 
 pub mod hmm;
 pub mod pbwt;
-pub mod interpolation;
 pub mod hap_dedup;
 pub mod match_processing;
+pub mod switch_detect;
+pub mod windows;

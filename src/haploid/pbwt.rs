@@ -99,12 +99,7 @@ pub fn compute_step_boundaries(cm: &[f64], step_scale: f64) -> (Vec<i32>, Vec<i3
     }
     let mut diffs: Vec<f64> = (1..n).map(|i| cm[i] - cm[i - 1]).collect();
     diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mid = diffs.len() / 2;
-    let median = if diffs.len().is_multiple_of(2) {
-        (diffs[mid - 1] + diffs[mid]) / 2.0
-    } else {
-        diffs[mid]
-    };
+    let median = crate::common::utils::median(&diffs);
     let ibs_step = step_scale * median.max(1e-7);
 
     let mut starts = vec![0i32];
@@ -439,15 +434,14 @@ pub fn pbwt_coded_ibs_bwd_batch(
             let mut v_next = d[v];
 
             // Backward window expansion (: sentinels d[0]=d[M]=step-2)
-            // When u=0 or v=m_total, sentinel values force direction switch, not break.
             while (v - u) < nc {
                 if step_i as i32 > u_next && step_i as i32 > v_next { break; }
                 if u_next <= v_next {
-                    if v < m_total { v += 1; } // v can reach m_total (d[m_total] is sentinel)
-                    v_next = d[v].min(v_next);
+                    if v < m_total { v += 1; v_next = d[v].min(v_next); }
+                    else { break; }
                 } else {
-                    u = u.saturating_sub(1);  // u can reach 0 (d[0] is sentinel)
-                    u_next = d[u].min(u_next);
+                    if u > 0 { u -= 1; u_next = d[u].min(u_next); }
+                    else { break; }
                 }
             }
 

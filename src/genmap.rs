@@ -190,12 +190,7 @@ fn apply_ld_correction(chip_cm: &[f64], switch_rates: &[f64], window_size: usize
         let hi = (i + half_w + 1).min(ratios.len());
         let mut window: Vec<f64> = ratios[lo..hi].to_vec();
         window.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        let mid = window.len() / 2;
-        smoothed[i] = if window.len().is_multiple_of(2) {
-            (window[mid - 1] + window[mid]) / 2.0
-        } else {
-            window[mid]
-        };
+        smoothed[i] = crate::common::utils::median(&window);
     }
 
     let mut corrected_diffs = vec![0.0f64; n_chip - 1];

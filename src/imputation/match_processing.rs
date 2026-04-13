@@ -204,41 +204,6 @@ pub fn process_matches(csc: &CscMatchMatrix, kept_matches: usize) -> Vec<Vec<i64
     result
 }
 
-/// Simple match expansion without score thresholding.
-/// Expands ALL CSC match ranges to per-site lists. Relies on downstream
-/// frequency filtering to prune low-quality matches.
-pub fn process_matches_simple(csc: &CscMatchMatrix) -> Vec<Vec<i64>> {
-    let n_ref = csc.n_rows;
-    let n_var = csc.n_cols;
-
-    // Convert CSC to CSR for per-haplotype iteration
-    let (csr_indptr, csr_indices, csr_data) = csc_to_csr(csc);
-
-    // For each haplotype, expand all match ranges
-    let mut site_haps: Vec<Vec<i64>> = vec![Vec::new(); n_var];
-
-    for hap in 0..n_ref {
-        let s = csr_indptr[hap] as usize;
-        let e = csr_indptr[hap + 1] as usize;
-        for k in s..e {
-            let start_var = csr_indices[k] as usize;
-            let length = csr_data[k] as usize;
-            let end_var = (start_var + length - 1).min(n_var - 1);
-            for v in start_var..=end_var {
-                site_haps[v].push(hap as i64);
-            }
-        }
-    }
-
-    // Deduplicate per site
-    for site in &mut site_haps {
-        site.sort_unstable();
-        site.dedup();
-    }
-
-    site_haps
-}
-
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
@@ -407,10 +372,8 @@ fn get_std(avg_len: &[f64], min_length: f64, max_length: f64) -> Vec<f64> {
     if denom.abs() < 1e-10 {
         return vec![0.2 + 2.8; avg_len.len()];
     }
-    // No clamping before powf — negative bases with integer-like exponents
-    // produce NaN/negative values which propagate to threshold.
     avg_len.iter().map(|&al| {
-        let normalized = (al - max_length) / denom;
+        let normalized = ((al - max_length) / denom).clamp(0.0, 1.0);
         normalized.powf(a - 1.0) * 2.8 + 0.2
     }).collect()
 }

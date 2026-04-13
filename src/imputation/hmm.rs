@@ -3,7 +3,6 @@
 //! Runs forward-backward on each target haplotype to produce sparse CSR weight matrices
 //! that are used by the interpolation step to compute dosages.
 
-use rayon::prelude::*;
 use std::cell::RefCell;
 use crate::selphi_debug;
 use crate::imputation::pbwt::CscMatchMatrix;
@@ -14,55 +13,6 @@ use crate::imputation::match_processing;
 thread_local! {
     static TL_FWD_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     static TL_WGT_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
-}
-
-// ---------------------------------------------------------------------------
-// Target site clustering 
-// ---------------------------------------------------------------------------
-
-/// Cluster chip sites by genetic map distance.
-/// Returns Vec of (start, end) ranges where each cluster spans ≤ cluster_cm cM.
-/// Default: cluster_cm = 0.005 cM.
-pub fn cluster_sites(distances_cm: &[f64], cluster_cm: f64) -> Vec<(usize, usize)> {
-    let n = distances_cm.len();
-    if n == 0 { return vec![]; }
-    let mut clusters = Vec::new();
-    let mut start = 0;
-    for i in 1..n {
-        if (distances_cm[i] - distances_cm[start]) > cluster_cm {
-            clusters.push((start, i));
-            start = i;
-        }
-    }
-    clusters.push((start, n));
-    clusters
-}
-
-/// Aggregate per-site dense matches into per-cluster matches.
-/// A haplotype is "matched" at a cluster if it matches at ANY site within it.
-/// Returns: cluster_matches[c] = sorted list of matched haplotype indices.
-pub fn aggregate_matches_to_clusters(
-    dense_matches: &[Vec<usize>],
-    clusters: &[(usize, usize)],
-) -> Vec<Vec<usize>> {
-    clusters.iter().map(|&(s, e)| {
-        let mut haps: Vec<usize> = Vec::new();
-        for site in s..e {
-            if site < dense_matches.len() {
-                haps.extend_from_slice(&dense_matches[site]);
-            }
-        }
-        haps.sort_unstable();
-        haps.dedup();
-        haps
-    }).collect()
-}
-
-/// Compute cluster midpoints in cM.
-pub fn cluster_midpoints(distances_cm: &[f64], clusters: &[(usize, usize)]) -> Vec<f64> {
-    clusters.iter().map(|&(s, e)| {
-        (distances_cm[s] + distances_cm[e - 1]) / 2.0
-    }).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -854,31 +804,6 @@ pub fn calculate_weights(
         fwd_blocks.push((fwd, n_rows));
     }
 
-    // Debug: dump forward checkpoints for hap0
-    if log_n == 0 && crate::log::is_debug() {
-        let dd = crate::log::debug_dir();
-        if let Ok(mut f) = std::fs::File::create(dd.join("rust_fwd_checkpoints.txt")) {
-            use std::io::Write;
-            // Use first (and only) forward block for single-block case
-            let (ref fwd_data, fwd_rows) = fwd_blocks[0];
-            for &check_row in &[0usize, 1, 2, 5, 10, 50, 100, 500, 1000, 5000, 9000] {
-                if check_row >= fwd_rows { break; }
-                let base = check_row * n_states;
-                let row_sum: f64 = fwd_data[base..base + n_states].iter().map(|&v| v as f64).sum();
-                let mut indexed: Vec<(usize, f64)> = (0..n_states)
-                    .map(|j| (j, fwd_data[base + j] as f64))
-                    .filter(|(_, v)| *v > 0.0)
-                    .collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                let top5: Vec<String> = indexed.iter().take(5)
-                    .map(|(j, v)| format!("s{}={:.10}", j, v)).collect();
-                writeln!(f, "row={} sum={:.12} nnz={} top5=[{}]",
-                    check_row, row_sum, indexed.len(), top5.join(", ")).ok();
-            }
-            selphi_debug!("  [FWD-DUMP] Wrote {}", dd.join("rust_fwd_checkpoints.txt").display());
-        }
-    }
-
     // Debug: dump forward checkpoints for hap0 (global row = block_start + local_row)
     if log_n == 0 && crate::log::is_debug() {
         let dd = crate::log::debug_dir();
@@ -1006,31 +931,6 @@ pub fn calculate_weights(
     }
 
     HmmResult { weights: results, hap_posterior }
-}
-
-/// Compute HMM weights for a batch of target haplotypes in parallel.
-///
-/// Each target haplotype gets its own PBWT match matrix and is processed
-/// independently via rayon.
-pub fn calculate_weights_batch(
-    match_matrices: &[CscMatchMatrix],
-    distances_cm: &[f64],
-    output_breaks: &[(usize, usize)],
-    n_ref_haps: usize,
-    est_ne: f64,
-    min_perr: f64,
-    ref_alleles: Option<&[u8]>,
-    n_chip: usize,
-) -> Vec<Vec<(usize, CsrWeights)>> {
-    match_matrices
-        .par_iter()
-        .map(|csc| {
-            calculate_weights(
-                csc, distances_cm, output_breaks, n_ref_haps,
-                est_ne, min_perr, ref_alleles, n_chip, None, None, None, 0.0,
-            ).weights
-        })
-        .collect()
 }
 
 #[cfg(test)]

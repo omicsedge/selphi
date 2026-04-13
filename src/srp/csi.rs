@@ -924,7 +924,7 @@ impl InlineIndexBuilder {
                     out.extend_from_slice(&(bd.chunks.len() as i32).to_le_bytes());
                     for &(b, e) in &bd.chunks { out.extend_from_slice(&b.to_le_bytes()); out.extend_from_slice(&e.to_le_bytes()); }
                 }
-                let pseudo = ((1u64 << (DEFAULT_DEPTH as u64 * 3)) - 1) / 7 + ref_id as u64;
+                let pseudo = ((1u64 << ((DEFAULT_DEPTH as u64 + 1) * 3)) - 1) / 7;
                 out.extend_from_slice(&(pseudo as u32).to_le_bytes());
                 out.extend_from_slice(&0u64.to_le_bytes());
                 out.extend_from_slice(&2i32.to_le_bytes());

@@ -135,8 +135,7 @@ fn phase_genotypes_inner(
         let mut diffs: Vec<f64> = (1..w_gen_pos.len()).map(|i| w_gen_pos[i] - w_gen_pos[i-1]).collect();
         diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median = if diffs.is_empty() { 1e-7 } else {
-            let mid = diffs.len() / 2;
-            if diffs.len().is_multiple_of(2) { (diffs[mid-1] + diffs[mid]) / 2.0 } else { diffs[mid] }
+            crate::common::utils::median(&diffs)
         };
 
         // Coarse steps (standard, scale=3.0)
@@ -359,8 +358,7 @@ fn phase_genotypes_inner(
         let median_dist = {
             let mut dd: Vec<f64> = (1..w_cm.len()).map(|i| w_cm[i] - w_cm[i-1]).collect();
             dd.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let mid = dd.len() / 2;
-            if dd.len().is_multiple_of(2) { (dd[mid-1]+dd[mid])/2.0 } else { dd[mid] }
+            crate::common::utils::median(&dd)
         }.max(1e-7);
         // Coarse batch params
         let steps_per_batch = w_n_steps.div_ceil(n_threads);
@@ -650,9 +648,9 @@ fn phase_genotypes_inner(
             }
 
             // Apply swaps, locks, confidence (window-local indices)
-            let mut _sw = 0i32; let mut _ht = 0i32; let mut _lk = 0i32;
+            let mut sw = 0i32; let mut ht = 0i32; let mut lk = 0i32;
             for (_, r) in &active_results {
-                _sw += r.n_swap; _ht += r.n_own; _lk += r.n_lock;
+                sw += r.n_swap; ht += r.n_own; lk += r.n_lock;
                 for &(rs, re, h0) in &r.swap_ranges {
                     let h1 = h0 + 1;
                     let h0_off = h0 * hap_byte_stride;
@@ -714,7 +712,7 @@ fn phase_genotypes_inner(
             }
 
             let hmm_ms = t_hmm.elapsed().as_millis();
-            let sr = if _ht > 0 { _sw as f64 / _ht as f64 } else { 0.0 };
+            let sr = if ht > 0 { sw as f64 / ht as f64 } else { 0.0 };
             let pt = if it < n_burnin { "burnin" } else { "phasing" };
             if it < n_burnin {
                 // ne() = ceil(25 * recombIntensity * nHaps)
@@ -723,7 +721,7 @@ fn phase_genotypes_inner(
             }
             let skip_str = if n_skipped > 0 { format!(" skip={}", n_skipped) } else { String::new() };
             selphi_debug!("    W{} Iter {}/{} ({},lr={:.1},nc={}): sw={} rate={:.4} lk={} [pbwt={}ms em={}ms hmm={}ms]{}{}",
-                wi+1, it+1, n_total, pt, lr.min(1e6), nc, _sw, sr, _lk,
+                wi+1, it+1, n_total, pt, lr.min(1e6), nc, sw, sr, lk,
                 pbwt_ms, em_ms, hmm_ms, skip_str,
                 if is_last { " (final)" } else { "" });
         }

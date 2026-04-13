@@ -98,8 +98,9 @@ pub fn write_tile_to_parquet(
     for v in 0..tile_n {
         let wgs_i = global_start + v;
         if wgs_i >= n_ref_variants { break; }
+        let local_i = vp_offset + v;
 
-        let prefix = &vid_prefixes[vp_offset + v];
+        let prefix = &vid_prefixes[local_i];
         let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
         let parts: Vec<&str> = prefix_str.splitn(5, '\t').collect();
         if parts.len() < 5 { continue; }
@@ -112,8 +113,8 @@ pub fn write_tile_to_parquet(
 
         let ds_row = &mut ds_flat[n_rows * n_samples..(n_rows + 1) * n_samples];
 
-        if is_chip[wgs_i] {
-            let ci = chip_local_idx[wgs_i];
+        if is_chip[local_i] {
+            let ci = chip_local_idx[local_i];
             let mut ac = 0u32;
             for s in 0..n_samples {
                 let a0 = chip_genotypes[ci * n_haps + s * 2] as f32;

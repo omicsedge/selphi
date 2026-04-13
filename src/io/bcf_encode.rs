@@ -162,7 +162,8 @@ pub fn encode_imputed_record(
     // Fixed header (24 bytes)
     buf.extend_from_slice(&0i32.to_le_bytes());        // chrom = 0 (single contig)
     buf.extend_from_slice(&pos_0based.to_le_bytes());   // pos (0-based)
-    buf.extend_from_slice(&1i32.to_le_bytes());          // rlen = 1 (SNP)
+    let rlen = ref_allele.len() as i32;
+    buf.extend_from_slice(&rlen.to_le_bytes());          // rlen = REF length
     buf.extend_from_slice(&QUAL_MISSING.to_le_bytes());  // qual = missing
     buf.extend_from_slice(&n_info.to_le_bytes());        // n_info
     buf.extend_from_slice(&2u16.to_le_bytes());          // n_allele = 2

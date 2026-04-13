@@ -111,13 +111,14 @@ impl<'a> WindowSetup<'a> {
         let own_wgs_start = if own_chip_start == 0 { 0 } else { wgs_idx[own_chip_start] };
         let own_wgs_end = if own_chip_end >= n_chip_total { n_ref_variants } else { wgs_idx[own_chip_end] };
 
-        let mut is_chip = vec![false; n_ref_variants];
-        let mut chip_local_idx = vec![0usize; n_ref_variants];
+        let window_len = own_wgs_end - own_wgs_start;
+        let mut is_chip = vec![false; window_len];
+        let mut chip_local_idx = vec![0usize; window_len];
         for ci in 0..n_chip_total {
             let wi = wgs_idx[ci];
             if wi >= own_wgs_start && wi < own_wgs_end && wi < n_ref_variants {
-                is_chip[wi] = true;
-                chip_local_idx[wi] = ci;
+                is_chip[wi - own_wgs_start] = true;
+                chip_local_idx[wi - own_wgs_start] = ci;
             }
         }
 
@@ -325,7 +326,7 @@ fn format_tile_batch(
     n_samples: usize,
     global_start: usize,
     n_ref_variants: usize,
-    vid_prefix_offset: usize,  // offset into vid_prefixes for this tile's first variant
+    vid_prefix_offset: usize,  // offset into vid_prefixes / is_chip / chip_local_idx
     vid_prefixes: &[Vec<u8>],
     is_chip: &[bool],
     chip_local_idx: &[usize],
@@ -349,9 +350,10 @@ fn format_tile_batch(
         for v in v_start..v_end {
             let wgs_i = global_start + v;
             if wgs_i >= n_ref_variants { break; }
+            let local_i = vid_prefix_offset + v;
 
-            if is_chip[wgs_i] {
-                let ci = chip_local_idx[wgs_i];
+            if is_chip[local_i] {
+                let ci = chip_local_idx[local_i];
                 let mut ac = 0u32;
                 for s in 0..n_samples {
                     ac += chip_genotypes[ci * n_haps + s * 2] as u32;
@@ -580,12 +582,13 @@ fn format_tile_batch_bcf(
         for v in v_start..v_end {
             let wgs_i = global_start + v;
             if wgs_i >= n_ref_variants { break; }
-            let vi = &var_infos[var_info_offset + v];
+            let local_i = var_info_offset + v;
+            let vi = &var_infos[local_i];
 
-            if is_chip[wgs_i] {
+            if is_chip[local_i] {
                 bcf_encode::encode_chip_record(
                     &mut buf, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
-                    chip_genotypes, chip_local_idx[wgs_i], n_samples, n_haps,
+                    chip_genotypes, chip_local_idx[local_i], n_samples, n_haps,
                 );
             } else {
                 bcf_encode::encode_imputed_record(
@@ -732,25 +735,28 @@ pub fn write_window_multiformat(
     macro_rules! emit_chip_gap {
         ($end:expr) => {
             while next_wgs < $end {
-                if setup.is_chip[next_wgs] {
-                    let vp_idx = next_wgs - setup.own_wgs_start;
+                let local_idx = next_wgs - setup.own_wgs_start;
+                if setup.is_chip[local_idx] {
                     if formats.vcf {
                         let mut buf = Vec::with_capacity(n_samples * 20);
-                        format_chip_line_bytes(&mut buf, next_wgs, vp_idx, &setup.vid_prefixes,
+                        format_chip_line_bytes(&mut buf, local_idx, local_idx, &setup.vid_prefixes,
                             chip_genotypes, &setup.chip_local_idx, setup.n_haps, n_samples, &setup.an_str);
                         vcf_tx.send(buf).expect("VCF send failed");
                     }
                     if formats.bcf {
                         let vi = var_infos.as_ref().unwrap();
                         let mut buf = Vec::with_capacity(n_samples * 16);
-                        format_chip_bcf(&mut buf, vp_idx, next_wgs, vi, chip_genotypes,
+                        format_chip_bcf(&mut buf, local_idx, local_idx, vi, chip_genotypes,
                             &setup.chip_local_idx, setup.n_haps, n_samples);
                         vcf_tx.send(buf).expect("VCF send failed");
                     }
                     if formats.pgen || formats.selfdecode {
-                        let ci = setup.chip_local_idx[next_wgs];
+                        let ci = setup.chip_local_idx[local_idx];
                         if formats.pgen { fill_chip_pgen(&mut hardcalls, &mut dosages, chip_genotypes, ci, setup.n_haps, n_samples); }
-                        if formats.selfdecode { fill_chip_sd(&mut sd_gt1, &mut sd_gt2, chip_genotypes, ci, setup.n_haps, n_samples); }
+                        if formats.selfdecode {
+                            fill_chip_sd(&mut sd_gt1, &mut sd_gt2, chip_genotypes, ci, setup.n_haps, n_samples);
+                            for s in 0..n_samples { sd_ap1[s] = sd_gt1[s] as f32; sd_ap2[s] = sd_gt2[s] as f32; }
+                        }
                         if let Some((chrom, pos_str, oid, ref_a, alt_a)) = parse_variant_parts(srp, next_wgs) {
                             if let Some((ref mut pg, ref mut pv)) = pgw {
                                 super::pgen_output::write_pvar_variant(pv, chrom, pos_str, oid, ref_a, alt_a)?;
@@ -801,12 +807,16 @@ pub fn write_window_multiformat(
                 for v in 0..$tile_n {
                     let wgs_i = $global_start + v;
                     if wgs_i >= setup.n_ref_variants { break; }
+                    let local_i = wgs_i - setup.own_wgs_start;
                     let Some((chrom, pos_str, oid, ref_a, alt_a)) = parse_variant_parts(srp, wgs_i) else { continue };
-                    let is_chip_var = setup.is_chip[wgs_i];
+                    let is_chip_var = setup.is_chip[local_i];
                     if is_chip_var {
-                        let ci = setup.chip_local_idx[wgs_i];
+                        let ci = setup.chip_local_idx[local_i];
                         if formats.pgen { fill_chip_pgen(&mut hardcalls, &mut dosages, chip_genotypes, ci, setup.n_haps, n_samples); }
-                        if formats.selfdecode { fill_chip_sd(&mut sd_gt1, &mut sd_gt2, chip_genotypes, ci, setup.n_haps, n_samples); }
+                        if formats.selfdecode {
+                            fill_chip_sd(&mut sd_gt1, &mut sd_gt2, chip_genotypes, ci, setup.n_haps, n_samples);
+                            for s in 0..n_samples { sd_ap1[s] = sd_gt1[s] as f32; sd_ap2[s] = sd_gt2[s] as f32; }
+                        }
                     } else {
                         for s in 0..n_samples {
                             let ap1 = $alt_probs[(s * 2) * $tile_n + v];

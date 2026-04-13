@@ -229,11 +229,8 @@ fn build_srp_from_bcf_native(
         SrpWriterError::InvalidInput(format!("Failed to read CSI index for {}", source_path.display())))?;
     let nv_hint = csi.n_mapped as usize;
 
-    let chunk_size = if chunk_size_override > 0 { chunk_size_override } else {
-        let bpv = 0.06 * nh as f64 * 4.0;
-        ((10.0 * 1024.0 * 1024.0 / bpv.max(1.0)) as usize)
-            .max(nv_hint.div_ceil(2000)).clamp(1000, 50000)
-    };
+    let chunk_size = if chunk_size_override > 0 { chunk_size_override }
+        else { auto_chunk_size(nv_hint, nh) };
 
     let tmp_dir = tempfile::tempdir()?;
 

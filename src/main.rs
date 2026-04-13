@@ -6,6 +6,8 @@
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::type_complexity)]
 
+mod self_test;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -17,6 +19,10 @@ use selphi::{selphi_info, selphi_debug, selphi_step, selphi_error};
 use selphi::srp::SrpReader;
 use selphi::genmap;
 use selphi::haploid;
+use selphi::io::target_io::{read_target_vcf, write_phased_vcf, extract_target_alleles, intersect_variants};
+use selphi::io::ref_profile::{save_ref_profile, load_ref_profile};
+use selphi::common::utils::extract_subarray;
+use selphi::imputation::windows::compute_imputation_windows;
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
 enum PhasingEngine {
@@ -173,108 +179,12 @@ struct Args {
     #[arg(long, default_value = "0")]
     chunk_size: usize,
 
-}
+    /// Run self-test: exercises all output formats and code paths using the
+    /// provided --refpanel, --input, and --map. Prints pass/fail for each test.
+    /// Optionally add --truth for evaluation test.
+    #[arg(long)]
+    self_test: bool,
 
-// ---------------------------------------------------------------------------
-// Imputation window computation
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-struct ImputationWindow {
-    /// First chip index in window (inclusive)
-    chip_start: usize,
-    /// Last chip index in window (exclusive)
-    chip_end: usize,
-    /// First owned chip index (splice from previous window)
-    own_chip_start: usize,
-    /// Last owned chip index (exclusive, splice to next window)
-    own_chip_end: usize,
-}
-
-/// Compute overlapping imputation windows from LD-corrected cM coordinates.
-fn compute_imputation_windows(
-    chip_cm: &[f64], window_cm: f64, overlap_cm: f64,
-) -> Vec<ImputationWindow> {
-    let n_var = chip_cm.len();
-    if n_var == 0 { return vec![]; }
-
-    let total_cm = chip_cm[n_var - 1] - chip_cm[0];
-    if window_cm <= 0.0 || total_cm <= window_cm {
-        return vec![ImputationWindow {
-            chip_start: 0, chip_end: n_var,
-            own_chip_start: 0, own_chip_end: n_var,
-        }];
-    }
-
-    let stride_cm = window_cm - overlap_cm;
-
-    // Build raw windows: (ws, we, overlap_start_idx)
-    let mut raw: Vec<(usize, usize, usize)> = Vec::new();
-    let mut pos = 0usize;
-    while pos < n_var {
-        let ws = pos;
-        let end_cm = if raw.is_empty() {
-            chip_cm[ws] + window_cm
-        } else {
-            chip_cm[ws] + stride_cm
-        };
-
-        // Find end: first marker >= end_cm
-        let mut we = n_var;
-        for i in ws..n_var {
-            if chip_cm[i] >= end_cm {
-                we = i;
-                break;
-            }
-        }
-
-        // Overlap start: work backward overlap_cm from end of window
-        let ov_start = if we < n_var {
-            let ov_cm = chip_cm[we - 1] - overlap_cm;
-            let mut os = we;
-            for i in ws..we {
-                if chip_cm[i] >= ov_cm {
-                    os = i;
-                    break;
-                }
-            }
-            os
-        } else {
-            we
-        };
-
-        raw.push((ws, we, ov_start));
-        if we >= n_var { break; }
-        pos = if ov_start > ws { ov_start } else { ws + 1 };
-    }
-
-    // Compute owned (splice) regions
-    let mut result = Vec::with_capacity(raw.len());
-    for i in 0..raw.len() {
-        let (ws, we, ov_start) = raw[i];
-
-        let own_start = if i == 0 {
-            ws
-        } else {
-            let (_, prev_we, prev_ov) = raw[i - 1];
-            let overlap_size = prev_we - prev_ov;
-            ws + (overlap_size >> 1)
-        };
-
-        let own_end = if i == raw.len() - 1 {
-            we
-        } else {
-            let ov_rel = ov_start - ws;
-            let n_markers = we - ws;
-            ws + ((n_markers + ov_rel) >> 1)
-        };
-
-        result.push(ImputationWindow {
-            chip_start: ws, chip_end: we,
-            own_chip_start: own_start, own_chip_end: own_end,
-        });
-    }
-    result
 }
 
 fn main() {
@@ -288,13 +198,7 @@ fn main() {
         let log_path = PathBuf::from(output).with_extension("log");
         selphi::log::init(&log_path, args.debug);
 
-        let version = env!("CARGO_PKG_VERSION");
-        selphi_info!("  ___ ___ _    ___ _  _ ___");
-        selphi_info!(" / __| __| |  | _ \\ || |_ _|");
-        selphi_info!(" \\__ \\ _|| |__|  _/ __ || |");
-        selphi_info!(" |___/___|____|_| |_||_|___|");
-        selphi_info!("      v{} \u{1f980} SelfDecode\u{2122}\n", version);
-
+        selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
         selphi_info!("  mode:     evaluate");
         selphi_info!("  imputed:  {}", imputed);
         selphi_info!("  truth:    {}", truth);
@@ -312,7 +216,6 @@ fn main() {
             .expect("Failed to read truth header");
 
         let imp_set: std::collections::HashSet<&str> = imp_samples.iter().map(|s| s.as_str()).collect();
-        let _truth_set: std::collections::HashSet<&str> = truth_samples.iter().map(|s| s.as_str()).collect();
         let shared: Vec<String> = truth_samples.iter()
             .filter(|s| imp_set.contains(s.as_str()))
             .cloned().collect();
@@ -347,6 +250,20 @@ fn main() {
         let mem = selphi::log::peak_mem_mb();
         selphi_info!("\nTotal: {:.1}s | Peak memory: {:.0} MB", elapsed, mem);
         return;
+    }
+
+    // --- Self-test mode ---
+    if args.self_test {
+        let config = self_test::SelfTestConfig {
+            refpanel: &args.refpanel,
+            input: args.input.as_ref().expect("--input required for --self-test"),
+            map: args.map_path.as_ref().expect("--map required for --self-test"),
+            out_base: args.out.as_deref().unwrap_or("self_test_output"),
+            truth: args.truth.as_deref(),
+            threads: args.threads,
+        };
+        let failures = self_test::run(&config);
+        std::process::exit(if failures == 0 { 0 } else { 1 });
     }
 
     if let Some(ref source) = args.prepare_reference_from {
@@ -491,6 +408,7 @@ fn main() {
         selphi_step!("Input is unphased — running phasing pipeline...");
         let (map_bp_raw, map_cm_raw) = genmap::load_genetic_map_raw(Path::new(map_path))
             .unwrap_or_else(|e| { selphi_error!("Cannot read genetic map {}: {}", map_path, e); std::process::exit(1); });
+        // Clone needed: ref_positions is borrowed by chip_bps above and may be needed later.
         let ref_bp: Vec<i64> = ref_positions.clone();
 
         // Resolve phasing engine
@@ -651,9 +569,9 @@ fn main() {
         genmap::compute_ld_correction_bm(&ref_bm_imp, &raw_chip_cm, n_chip, n_ref, 100)
     };
     // ref_alleles byte array eliminated — all pre-imputation uses now read from ref_bm_imp.
-    selphi_debug!("  RS cm_ld[0:5]={:?}", &chip_cm[..5]);
-    selphi_debug!("  RS cm_ld[100]={:.15}", chip_cm[100]);
-    selphi_debug!("  RS cm_ld[1000]={:.15}", chip_cm[1000]);
+    selphi_debug!("  RS cm_ld[0:5]={:?}", &chip_cm[..5.min(chip_cm.len())]);
+    if chip_cm.len() > 100 { selphi_debug!("  RS cm_ld[100]={:.15}", chip_cm[100]); }
+    if chip_cm.len() > 1000 { selphi_debug!("  RS cm_ld[1000]={:.15}", chip_cm[1000]); }
     selphi_step!("Genetic map loaded + LD correction");
 
 
@@ -671,7 +589,6 @@ fn main() {
         ((fl_fwd as f64 * 2.4 / log2_haps) as usize).max(13)
     });
     let est_ne = if args.est_ne <= 0 {
-        // Ne=175,000 optimal for 1KG panel (plateau 150K-200K, chr22 801s sweep).
         // Ne=175,000 optimal for 1KG panel (plateau 150K-200K, chr22 801s sweep).
         175_000i64
     } else {
@@ -846,7 +763,6 @@ fn main() {
     // 11. Process each window: PBWT → HMM, then overlap VCF write with next window's PBWT.
     // Cross-window HMM state passthrough: forward state from window N → prior for window N+1
     let mut hap_priors: Vec<Option<Vec<f64>>> = vec![None; n_haps];
-    let _t0_pipeline = Instant::now();
     let n_cores = rayon::current_num_threads();
     for (wi, window) in windows.iter().enumerate() {
         let t0_win = Instant::now();
@@ -1219,342 +1135,3 @@ fn main() {
     selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB", total, mem);
 }
 
-/// Extract rows [row_start..row_end) from a flat row-major (n_rows, cols) array.
-fn extract_subarray(src: &[u8], cols: usize, row_start: usize, row_end: usize) -> Vec<u8> {
-    let start = row_start * cols;
-    let end = row_end * cols;
-    src[start..end].to_vec()
-}
-
-// ---------------------------------------------------------------------------
-// Target VCF reading (via bcftools)
-// ---------------------------------------------------------------------------
-
-/// Target marker: (chrom, pos, ref_hash, alt_hash)
-#[derive(Debug, Clone)]
-struct TargetMarker {
-    chrom: String,
-    pos: i64,
-    ref_allele: String,
-    alt_allele: String,
-    ref_hash: String,
-    alt_hash: String,
-}
-
-/// Read target VCF/BCF using noodles bgzf + manual text parsing.
-/// Pure Rust — no bcftools dependency.
-fn read_target_vcf(
-    path: &str, srp: &SrpReader,
-) -> (Vec<String>, Vec<TargetMarker>, Vec<Vec<[u8; 2]>>, bool) {
-    use std::io::Read;
-
-    let hash_alleles = !srp.ids.is_empty() && {
-        let first_ref = &srp.variants[0].ref_allele;
-        !srp.ids[0].contains(first_ref)
-    };
-
-    // Read entire decompressed VCF into memory (avoid per-line String alloc)
-    let is_gz = path.ends_with(".gz") || path.ends_with(".bcf");
-    let file = std::fs::File::open(path)
-        .unwrap_or_else(|e| panic!("Cannot open {}: {}", path, e));
-
-    let mut raw = Vec::new();
-    if is_gz {
-        let mut bgzf = noodles_bgzf::io::Reader::new(std::io::BufReader::new(file));
-        bgzf.read_to_end(&mut raw).expect("Failed to decompress bgzf");
-    } else {
-        let mut reader = std::io::BufReader::new(file);
-        reader.read_to_end(&mut raw).expect("Failed to read VCF");
-    }
-
-    let mut markers = Vec::new();
-    let mut genotypes: Vec<Vec<[u8; 2]>> = Vec::new();
-    let mut is_phased = true;
-    let mut phase_checks = 10i32;
-    let mut sample_names: Vec<String> = Vec::new();
-
-    // Parse from byte buffer — zero per-line allocations
-    for line in raw.split(|&b| b == b'\n') {
-        if line.is_empty() || line.starts_with(b"##") { continue; }
-        if line.starts_with(b"#CHROM") {
-            let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
-            if fields.len() > 9 {
-                sample_names = fields[9..].iter()
-                    .map(|f| std::str::from_utf8(f).unwrap_or("").to_string())
-                    .collect();
-            }
-            continue;
-        }
-
-        // Fast field splitting: find first 5 tab-separated fields + genotype region
-        let mut tabs = [0usize; 9]; // positions of first 9 tabs
-        let mut n_tabs = 0;
-        for (i, &b) in line.iter().enumerate() {
-            if b == b'\t' {
-                if n_tabs < 9 { tabs[n_tabs] = i; }
-                n_tabs += 1;
-                if n_tabs >= 9 { break; }
-            }
-        }
-        if n_tabs < 9 { continue; }
-
-        // Parse POS (field 1: between tab[0] and tab[1])
-        let pos_bytes = &line[tabs[0]+1..tabs[1]];
-        let pos: i64 = fast_parse_i64(pos_bytes);
-
-        // REF (field 3: between tab[2] and tab[3])
-        let ref_bytes = &line[tabs[2]+1..tabs[3]];
-        // ALT (field 4: between tab[3] and tab[4]), take first allele before comma
-        let alt_field = &line[tabs[3]+1..tabs[4]];
-        let alt_end = alt_field.iter().position(|&b| b == b',').unwrap_or(alt_field.len());
-        let alt_bytes = &alt_field[..alt_end];
-        if alt_bytes == b"." || alt_bytes.is_empty() { continue; }
-
-        let ref_allele = std::str::from_utf8(ref_bytes).unwrap_or("").to_string();
-        let alt_allele = std::str::from_utf8(alt_bytes).unwrap_or("").to_string();
-        let chrom = std::str::from_utf8(&line[..tabs[0]]).unwrap_or("").to_string();
-
-        let (ref_hash, alt_hash) = if hash_alleles {
-            (blake2b_hex(&ref_allele), blake2b_hex(&alt_allele))
-        } else {
-            (ref_allele.clone(), alt_allele.clone())
-        };
-
-        markers.push(TargetMarker { chrom, pos, ref_allele, alt_allele, ref_hash, alt_hash });
-
-        // Parse genotypes from byte slice (fields 9+)
-        let n_samples = sample_names.len();
-        let mut var_gts = Vec::with_capacity(n_samples);
-        let gt_region = &line[tabs[8]+1..];
-        let mut field_start = 0;
-        for _s in 0..n_samples {
-            // Find end of this sample's field (next tab or end of line)
-            let field_end = gt_region[field_start..].iter()
-                .position(|&b| b == b'\t')
-                .map(|p| field_start + p)
-                .unwrap_or(gt_region.len());
-            let field = &gt_region[field_start..field_end];
-
-            // GT is before first ':'
-            let gt_end = field.iter().position(|&b| b == b':').unwrap_or(field.len());
-            let gt = &field[..gt_end];
-
-            if phase_checks > 0 {
-                if gt.contains(&b'/') { is_phased = false; }
-                phase_checks -= 1;
-            }
-
-            // Fast GT parsing: "0|1" or "0/1" — allele is single digit at positions 0 and 2
-            let (a0, a1) = if gt.len() >= 3 {
-                let b0 = gt[0]; let b1 = gt[2];
-                (if b0.is_ascii_digit() { b0 - b'0' } else { 0 },
-                 if b1.is_ascii_digit() { b1 - b'0' } else { 0 })
-            } else {
-                (0, 0)
-            };
-            var_gts.push([a0, a1]);
-
-            field_start = if field_end < gt_region.len() { field_end + 1 } else { gt_region.len() };
-        }
-        genotypes.push(var_gts);
-    }
-
-    if sample_names.is_empty() {
-        selphi_error!("No samples found in {}", path);
-        std::process::exit(1);
-    }
-
-    (sample_names, markers, genotypes, is_phased)
-}
-
-/// Fast i64 parsing from ASCII bytes (no String allocation).
-#[inline]
-fn fast_parse_i64(bytes: &[u8]) -> i64 {
-    let mut n: i64 = 0;
-    for &b in bytes {
-        if b.is_ascii_digit() { n = n * 10 + (b - b'0') as i64; }
-    }
-    n
-}
-
-/// Blake2b hash — delegates to shared implementation in srp module.
-fn blake2b_hex(s: &str) -> String {
-    selphi::srp::blake2b_hex(s)
-}
-
-/// Intersect target markers with reference panel variants.
-fn intersect_variants(srp: &SrpReader, targets: &[TargetMarker]) -> (Vec<usize>, Vec<usize>) {
-    fn strip_chr(c: &str) -> &str {
-        if let Some(stripped) = c.strip_prefix("chr") { stripped } else { c }
-    }
-    let ref_chrom = strip_chr(&srp.metadata.chromosome);
-
-    // Sort target indices by position for merge-join
-    let mut tgt_order: Vec<usize> = (0..targets.len())
-        .filter(|&i| strip_chr(&targets[i].chrom) == ref_chrom)
-        .collect();
-    tgt_order.sort_by_key(|&i| targets[i].pos);
-
-    // Merge-join: both ref variants and sorted targets are in position order
-    let mut wgs_idx = Vec::with_capacity(targets.len());
-    let mut target_idx = Vec::with_capacity(targets.len());
-    let mut ri = 0usize;
-
-    for &ti in &tgt_order {
-        let tpos = targets[ti].pos;
-        // Advance ref pointer to first variant at or beyond target pos
-        while ri < srp.variants.len() && srp.variants[ri].pos < tpos { ri += 1; }
-        // Check all ref variants at this position
-        let mut rj = ri;
-        while rj < srp.variants.len() && srp.variants[rj].pos == tpos {
-            if srp.variants[rj].ref_allele == targets[ti].ref_hash
-                && srp.variants[rj].alt_allele == targets[ti].alt_hash {
-                wgs_idx.push(rj);
-                target_idx.push(ti);
-                break;
-            }
-            rj += 1;
-        }
-    }
-
-    // Already sorted by wgs_idx (ref is in genomic order, merge preserves it)
-    (wgs_idx, target_idx)
-}
-
-/// Read target VCF using position+allele lists instead of SrpReader.
-/// Write phased-only VCF (chip sites only, GT format).
-fn write_phased_vcf(
-    phased: &[u8],               // (n_chip, n_haps) row-major
-    target_markers: &[TargetMarker],
-    target_idx: &[usize],        // chip → target marker index
-    _wgs_idx: &[usize],          // chip → WGS variant index (for pos ordering)
-    sample_names: &[String],
-    srp: &SrpReader,
-    n_chip: usize,
-    n_haps: usize,
-    output_path: &Path,
-) -> std::io::Result<()> {
-    use std::io::{Write, BufWriter};
-
-    let n_samples = n_haps / 2;
-
-    let file = std::fs::File::create(output_path)?;
-    let bgzf = noodles_bgzf::io::multithreaded_writer::Builder::default()
-        .set_worker_count(std::num::NonZeroUsize::new(4).unwrap())
-        .build_from_writer(file);
-    let mut w = BufWriter::with_capacity(4 << 20, bgzf);
-
-    writeln!(w, "##fileformat=VCFv4.2")?;
-    writeln!(w, "##source=Selphi_v{} SelfDecode™", env!("CARGO_PKG_VERSION"))?;
-    writeln!(w, "##FILTER=<ID=PASS,Description=\"All filters passed\">")?;
-    writeln!(w, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">")?;
-    writeln!(w, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele Number\">")?;
-    writeln!(w, "##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Estimated Allele Count\">")?;
-    writeln!(w, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">")?;
-    writeln!(w, "{}", srp.metadata.contig_field)?;
-    write!(w, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
-    for name in sample_names { write!(w, "\t{}", name)?; }
-    writeln!(w)?;
-
-    let mut line_buf = String::with_capacity(n_samples * 6);
-    for ci in 0..n_chip {
-        let ti = target_idx[ci];
-        let tm = &target_markers[ti];
-
-        let mut ac = 0u32;
-        line_buf.clear();
-        for s in 0..n_samples {
-            let a0 = phased[ci * n_haps + s * 2];
-            let a1 = phased[ci * n_haps + s * 2 + 1];
-            ac += a0 as u32 + a1 as u32;
-            if s > 0 { line_buf.push('\t'); }
-            line_buf.push((b'0' + a0) as char);
-            line_buf.push('|');
-            line_buf.push((b'0' + a1) as char);
-        }
-        let af = ac as f64 / n_haps as f64;
-        writeln!(w, "{}\t{}\t.\t{}\t{}\t.\tPASS\tAF={:.4};AC={};AN={}\tGT\t{}",
-            tm.chrom, tm.pos, tm.ref_allele, tm.alt_allele, af, ac, n_haps, line_buf)?;
-    }
-
-    w.flush()?;
-    let mut bgzf = w.into_inner().map_err(|e| std::io::Error::other(e.to_string()))?;
-    bgzf.finish()?;
-
-    let _ = std::process::Command::new("bcftools")
-        .args(["index", "-f", &output_path.to_string_lossy(), "--threads", "4"])
-        .status();
-
-    Ok(())
-}
-
-/// Extract target alleles at chip sites into flat (n_chip, n_haps) row-major array.
-fn extract_target_alleles(
-    genotypes: &[Vec<[u8; 2]>],
-    target_idx: &[usize],
-    n_chip: usize,
-    n_haps: usize,
-) -> Vec<u8> {
-    let n_samples = n_haps / 2;
-    let mut out = vec![0u8; n_chip * n_haps];
-    for (ci, &ti) in target_idx.iter().enumerate() {
-        if ti >= genotypes.len() { continue; }
-        let gt = &genotypes[ti];
-        for s in 0..n_samples.min(gt.len()) {
-            out[ci * n_haps + s * 2] = gt[s][0];
-            out[ci * n_haps + s * 2 + 1] = gt[s][1];
-        }
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// Cross-chromosome reference profile save/load
-// Format: binary, per-sample top-50 ref individuals (as haplotype indices)
-// ---------------------------------------------------------------------------
-
-fn save_ref_profile(path: &str, profiles: &[Vec<(u32, usize)>], n_samples: usize) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
-    let top_k: u32 = 50;
-    f.write_all(&(n_samples as u32).to_le_bytes())?;
-    f.write_all(&top_k.to_le_bytes())?;
-    for si in 0..n_samples {
-        let prof = &profiles[si];
-        for i in 0..top_k as usize {
-            let (count, ref_ind) = if i < prof.len() { prof[i] } else { (0, 0) };
-            f.write_all(&(ref_ind as u32).to_le_bytes())?;
-            f.write_all(&count.to_le_bytes())?;
-        }
-    }
-    f.flush()
-}
-
-fn load_ref_profile(path: &str, n_samples: usize) -> std::io::Result<Vec<Vec<usize>>> {
-    use std::io::Read;
-    let mut f = std::io::BufReader::new(std::fs::File::open(path)?);
-    let mut buf4 = [0u8; 4];
-    f.read_exact(&mut buf4)?; let saved_n = u32::from_le_bytes(buf4) as usize;
-    f.read_exact(&mut buf4)?; let top_k = u32::from_le_bytes(buf4) as usize;
-    if saved_n != n_samples {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
-            format!("Profile has {} samples but input has {}", saved_n, n_samples)));
-    }
-    let mut result = Vec::with_capacity(n_samples);
-    for _si in 0..n_samples {
-        let mut preferred = Vec::new();
-        for _i in 0..top_k {
-            f.read_exact(&mut buf4)?; let ref_ind = u32::from_le_bytes(buf4) as usize;
-            f.read_exact(&mut buf4)?; let count = u32::from_le_bytes(buf4);
-            if count > 0 {
-                // Convert ref individual index to haplotype indices (both haps)
-                let h0 = n_samples * 2 + ref_ind * 2;
-                let h1 = h0 + 1;
-                preferred.push(h0);
-                preferred.push(h1);
-            }
-        }
-        result.push(preferred);
-    }
-    Ok(result)
-}

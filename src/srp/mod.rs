@@ -354,6 +354,11 @@ mod tests {
     fn test_ucs4_roundtrip() {
         let s = "chr22";
         let encoded = write_ucs4_string(s, 5);
-        assert_eq!(read_ucs4_string(&encoded, 5), s);
+        // Decode: read UCS-4 LE codepoints back to string
+        let decoded: String = encoded.chunks_exact(4)
+            .filter_map(|b| char::from_u32(u32::from_le_bytes(b.try_into().unwrap())))
+            .filter(|&c| c != '\0')
+            .collect();
+        assert_eq!(decoded, s);
     }
 }

@@ -6,4 +6,5 @@ pub mod bcf_encode;
 pub mod parquet_output;
 pub mod pgen_output;
 pub mod selfdecode_output;
-pub mod vcf_io;
+pub mod target_io;
+pub mod ref_profile;

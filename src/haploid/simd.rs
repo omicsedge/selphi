@@ -3,6 +3,7 @@
 ///
 /// Vectorizes emission lookup + multiply + accumulation.
 /// SIMD reduction reorders f32 additions vs scalar left-to-right.
+use super::N_MOSAIC;
 // ============================================================================
 // x86_64 AVX-512 implementation (16 × f32)
 // ============================================================================
@@ -122,8 +123,8 @@ pub unsafe fn em_fwd_update(
     let nss_v = _mm512_set1_ps(no_switch_scale);
     let zero = _mm512_setzero_si512();
     let chunks = ns / 16;
-    let mut ev = [0.0f32; 280];
-    let mut old_fwd = [0.0f32; 280];
+    let mut ev = [0.0f32; N_MOSAIC];
+    let mut old_fwd = [0.0f32; N_MOSAIC];
     for i in 0..chunks {
         let off = i * 16;
         let d16 = _mm_loadu_si128(discord.as_ptr().add(off) as *const __m128i);
@@ -307,8 +308,8 @@ pub unsafe fn em_fwd_update(
     let chunks = ns / 4;
 
     // Pass 0: pre-expand emission + save old_fwd
-    let mut ev = [0.0f32; 280];
-    let mut old_fwd = [0.0f32; 280];
+    let mut ev = [0.0f32; N_MOSAIC];
+    let mut old_fwd = [0.0f32; N_MOSAIC];
     for i in 0..chunks {
         let off = i * 4;
         let em = neon_emission_4(discord.as_ptr().add(off), el0, el1);
@@ -403,8 +404,8 @@ pub unsafe fn em_fwd_update(
     fwd: &mut [f32], saved_bwd: &[f32], discord: &[u8],
     em_probs: [f32; 2], scale: f32, shift: f32, no_switch_scale: f32, ns: usize,
 ) -> (f32, f32, f32, f32) {
-    let mut ev = [0.0f32; 280];
-    let mut old_fwd = [0.0f32; 280];
+    let mut ev = [0.0f32; N_MOSAIC];
+    let mut old_fwd = [0.0f32; N_MOSAIC];
     for j in 0..ns { ev[j] = em_probs[discord[j] as usize]; old_fwd[j] = fwd[j]; }
     let mut fs = 0.0f32;
     for j in 0..ns { fwd[j] = ev[j] * (scale * old_fwd[j] + shift); fs += fwd[j]; }
