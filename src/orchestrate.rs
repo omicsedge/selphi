@@ -86,12 +86,12 @@ pub fn run_multi_chr(
     let version = env!("CARGO_PKG_VERSION");
 
     // 1. Open multi-chr SRP
-    selphi_step!("Opening multi-chr SRP v3...");
+    selphi_step!("Opening multi-chr SRP...");
     let multi_srp = MultiChrSrpReader::open(srp_path)?;
     let chromosomes: Vec<String> = multi_srp.chromosomes().iter().map(|s| s.to_string()).collect();
     let n_chr = chromosomes.len();
 
-    selphi_info!("  refpanel: {} (v3, {} chromosomes)", srp_path.display(), n_chr);
+    selphi_info!("  refpanel: {} (multi-chr, {} chromosomes)", srp_path.display(), n_chr);
     selphi_info!("  chromosomes: {}", chromosomes.join(", "));
     selphi_info!("  haplotypes:  {}", multi_srp.global_meta.n_haps);
     selphi_info!("  samples:     {}", multi_srp.global_meta.n_samples);

@@ -1,4 +1,4 @@
-//! Multi-chromosome SRP v3 writer.
+//! Multi-chromosome SRP writer.
 //!
 //! Creates a single .srp file containing all chromosomes from a multi-contig
 //! BCF/VCF source. Each chromosome gets its own tile section with independent
@@ -346,7 +346,7 @@ pub fn build_multi_chr_srp(
     w.flush()?;
 
     let file_size = std::fs::metadata(&srp_path)?.len();
-    selphi_step!("Multi-chr SRP v3: {} chromosomes, {:.1} MB → {}",
+    selphi_step!("Multi-chr SRP: {} chromosomes, {:.1} MB → {}",
         n_chromosomes, file_size as f64 / 1e6, srp_path.display());
 
     Ok(())
@@ -465,7 +465,7 @@ pub fn build_multi_chr_srp_from_dir(
     }
 
     // Merge all per-chr SRPs into single v3
-    selphi_step!("Merging {} SRPs into multi-chr v3...", srp_paths.len());
+    selphi_step!("Merging {} SRPs into multi-chr SRP...", srp_paths.len());
     merge_srps_to_v3(&srp_paths, output_path)
 }
 
@@ -728,7 +728,7 @@ pub fn merge_srps_to_v3(
     w.flush()?;
 
     let file_size = std::fs::metadata(&srp_path)?.len();
-    selphi_step!("Multi-chr SRP v3: {} chromosomes, {:.1} MB → {}",
+    selphi_step!("Multi-chr SRP: {} chromosomes, {:.1} MB → {}",
         n_chr, file_size as f64 / 1e6, srp_path.display());
 
     Ok(())

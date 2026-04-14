@@ -1,4 +1,4 @@
-//! Multi-chromosome SRP v3 reader.
+//! Multi-chromosome SRP reader.
 //!
 //! Opens a multi-chromosome .srp file, reads the global header and chromosome
 //! directory, and provides per-chromosome views (`ChrSrpView`) that expose
@@ -107,11 +107,11 @@ impl ChrSrpView {
 
     /// Load a CSC chunk by ID (not supported for tiled-only v3 format).
     pub fn load_chunk(&self, _chunk_id: usize) -> Arc<CscChunk> {
-        panic!("CSC chunk loading not supported for multi-chr SRP v3 (tiled-only format)")
+        panic!("CSC chunk loading not supported for multi-chr SRP (tiled-only format)")
     }
 
     pub fn load_chunk_from_source(&self, _chunk_id: usize) -> CscChunk {
-        panic!("CSC chunk loading not supported for multi-chr SRP v3 (tiled-only format)")
+        panic!("CSC chunk loading not supported for multi-chr SRP (tiled-only format)")
     }
 }
 
@@ -142,7 +142,7 @@ impl MultiChrSrpReader {
         f.read_exact(&mut magic)?;
         if &magic != SRP_V3_MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
-                format!("Not a multi-chr SRP v3 file: {}", filepath.display())));
+                format!("Not a multi-chr SRP file: {}", filepath.display())));
         }
 
         // Global metadata (zstd-compressed JSON)

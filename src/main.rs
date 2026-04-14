@@ -334,7 +334,7 @@ fn main() {
         let log_path = PathBuf::from(output).with_extension("log");
         selphi::log::init(&log_path, args.debug);
         selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
-        selphi_info!("  mode:     merge-srps (v2 → v3)");
+        selphi_info!("  mode:     merge-srps (per-chr → multi-chr)");
         selphi_info!("  output:   {}", output);
         selphi_info!("  log:      {}\n", log_path.display());
 
@@ -358,7 +358,7 @@ fn main() {
             let log_path = PathBuf::from(output).with_extension("log");
             selphi::log::init(&log_path, args.debug);
             selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
-            selphi_info!("  mode:     prepare-reference (directory → multi-chr SRP v3)");
+            selphi_info!("  mode:     prepare-reference (directory → multi-chr SRP)");
             selphi_info!("  source:   {} (directory)", source);
             selphi_info!("  output:   {}", output);
             selphi_info!("  threads:  {}", args.threads);
@@ -436,7 +436,7 @@ fn main() {
             } else { PathBuf::from(output) };
 
             if is_multi_contig {
-                selphi_info!("  Detected multi-contig source → building multi-chr SRP v3\n");
+                selphi_info!("  Detected multi-contig source → building multi-chr SRP\n");
                 selphi::srp::multi_chr_writer::build_multi_chr_srp(
                     Path::new(source), &srp_path, args.threads, args.chunk_size)
                     .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
@@ -466,7 +466,7 @@ fn main() {
         let log_path = PathBuf::from(output_path).with_extension("log");
         selphi::log::init(&log_path, args.debug);
         selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
-        selphi_info!("  mode:     multi-chr imputation (unified SRP v3)");
+        selphi_info!("  mode:     multi-chr imputation (unified SRP)");
         selphi_info!("  input:    {}", target_path);
         selphi_info!("  refpanel: {}", args.refpanel);
         selphi_info!("  map:      {}", map_path);

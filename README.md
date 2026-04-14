@@ -69,6 +69,60 @@ selphi \
 
 Input phase is detected automatically. If the input is already phased (pipe-separated genotypes), the phasing step is skipped.
 
+### Whole-genome imputation (all chromosomes at once)
+
+Selphi is the first imputation tool to support **whole-genome imputation from a single reference panel file**. Existing tools (Beagle, Minimac4, IMPUTE5) require users to split their data by chromosome, run each chromosome independently, and concatenate the results — a process that involves managing dozens of intermediate files and complex shell scripting. Selphi eliminates this entirely.
+
+A single `.srp` file can contain the reference panel for all chromosomes. Combined with a concatenated genetic map and a whole-genome input VCF, the entire imputation pipeline runs with one command:
+
+```bash
+selphi \
+  --refpanel all_chromosomes.srp \
+  --input whole_genome.vcf.gz \
+  --map all_chromosomes.map \
+  --out imputed \
+  --threads 16
+```
+
+Multi-chromosome SRP files are automatically detected. Chromosomes are processed sequentially with **overlapped prefetch**: while the current chromosome is being imputed, the next chromosome's reference data, variant intersection, and genetic map are loaded in a background thread. This eliminates the idle gap between chromosomes and keeps all CPU cores utilized throughout the run.
+
+Three equivalent workflows are supported — the user chooses whichever matches their data:
+
+```bash
+# 1. Single chromosome (standard)
+selphi --refpanel chr22.srp --input chr22.vcf.gz --map chr22.map --out result
+
+# 2. Multi-chromosome directory (per-chr SRP files)
+selphi --refpanel-dir panels/ --input whole_genome.vcf.gz --map-dir maps/ --out result
+
+# 3. Unified whole-genome (single multi-chromosome SRP file)
+selphi --refpanel all_chrs.srp --input whole_genome.vcf.gz --map all_chrs.map --out result
+```
+
+#### Creating a unified reference panel
+
+From a directory of per-chromosome BCF or VCF files:
+```bash
+selphi --prepare-reference-from /path/to/bcf_directory/ --out all_chromosomes --threads 16
+```
+
+From existing per-chromosome SRP files:
+```bash
+selphi --merge-srps chr1.srp,chr2.srp,...,chr22.srp --out all_chromosomes
+```
+
+From a multi-contig BCF file (auto-detected):
+```bash
+selphi --prepare-reference-from all_chromosomes.bcf --out all_chromosomes --threads 16
+```
+
+The unified genetic map is simply a concatenation of per-chromosome PLINK maps. The chromosome column (column 1) is used to partition entries:
+```bash
+cat chr1.map chr2.map ... chr22.map > all_chromosomes.map
+```
+
+Memory usage is bounded: only one chromosome's working set is held at a time, with a lightweight prefetch buffer (~200 MB) for the next chromosome. Peak memory equals that of the largest single chromosome.
+
 ### Reference panel preparation
 
 Create an SRP reference panel from VCF, BCF, or BREF3. The source format is auto-detected.
@@ -254,8 +308,12 @@ Standard VCF or BCF. Unphased (`0/1`) or phased (`0|1`) genotypes. Multi-allelic
 | **Indexing** | | |
 | `--index PATH` | Build TBI/CSI index for a VCF.gz or BCF file | |
 | `--index-stats PATH` | Show file statistics and per-contig genomic ranges | |
+| **Multi-chromosome** | | |
+| `--refpanel-dir DIR` | Directory with per-chr SRP files (auto-discovers chromosomes) | |
+| `--map-dir DIR` | Directory with per-chr genetic maps | |
+| `--merge-srps PATHS` | Merge per-chr SRP files into a single multi-chromosome SRP (comma-separated) | |
 | **Reference panel** | | |
-| `--prepare-reference-from PATH` | Create SRP from VCF.gz, BCF, or BREF3 | |
+| `--prepare-reference-from PATH` | Create SRP from VCF.gz, BCF, BREF3, or directory of per-chr files | |
 | `--chunk-size N` | Chunk size for SRP creation (0 = auto) | 0 |
 | **Testing** | | |
 | `--self-test` | Run all output format and code path tests | off |
@@ -294,7 +352,9 @@ Key design principles:
 
 ### Sparse Reference Panel (SRP format)
 
-Single binary file (magic `SRP\0`, version 2) with sequential length-prefixed sections:
+The SRP format supports both single-chromosome and multi-chromosome panels in a single binary file. Multi-chromosome SRP files contain a global header with chromosome directory and shared sample IDs, followed by independent per-chromosome tile sections. The format is auto-detected by `--refpanel`.
+
+Per-chromosome layout:
 
 | Section | Content |
 |---------|---------|
