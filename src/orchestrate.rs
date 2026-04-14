@@ -1,0 +1,528 @@
+//! Native multi-chromosome orchestrator with overlapped processing.
+//!
+//! Processes chromosomes from a unified SRP v3 file sequentially, with
+//! prefetch overlap between consecutive chromosomes for maximum CPU utilization.
+//! No subprocess calls — everything runs in-process.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
+
+use rayon::prelude::*;
+
+use selphi::{selphi_info, selphi_step};
+use selphi::srp::MultiChrSrpReader;
+use selphi::io::target_io::{
+    read_target_vcf_multi_chr, intersect_variants_for_chr, extract_target_alleles,
+};
+use selphi::genmap;
+use selphi::common::utils::extract_subarray;
+use selphi::imputation::windows::compute_imputation_windows;
+
+/// Configuration for multi-chr imputation (mirrors relevant CLI args).
+#[allow(dead_code)]
+pub struct MultiChrImputeConfig {
+    pub threads: usize,
+    pub seed: i64,
+    pub window_cm: f64,
+    pub overlap_cm: f64,
+    pub match_length: Option<usize>,
+    pub est_ne: i64,
+    pub max_candidates: usize,
+    pub p_err: f64,
+    pub no_ap: bool,
+    pub no_em_ne: bool,
+    pub phasing_engine: String,  // "auto", "haploid", "diploid"
+    pub max_cond_haps: usize,
+    pub force_phasing: bool,
+    pub max_windows: usize,
+    pub bcf: bool,
+    pub parquet: bool,
+    pub pgen: bool,
+    pub selfdecode: bool,
+    pub all_formats: bool,
+    pub wgs_phasing: bool,
+}
+
+/// Load chromosome data synchronously (used for first chr or if prefetch was skipped).
+fn load_chr_data(
+    multi_srp: &MultiChrSrpReader,
+    chr_name: &str,
+    target_by_chr: &std::collections::BTreeMap<String, (Vec<selphi::io::target_io::TargetMarker>, Vec<Vec<[u8; 2]>>)>,
+    multi_map: &std::collections::BTreeMap<String, (Vec<i64>, Vec<f64>)>,
+    n_haps: usize,
+) -> Option<(Arc<selphi::srp::SrpReader>, Vec<usize>, Vec<usize>, Vec<u8>, Vec<f64>, Vec<i64>, usize, usize, usize)> {
+    let chr_view = multi_srp.load_chr_view(chr_name).ok()?;
+    let n_ref = chr_view.n_haps();
+    let n_ref_variants = chr_view.n_variants();
+    if n_ref_variants == 0 { return None; }
+    let srp = Arc::new(chr_view.into_srp_reader());
+
+    let key = chr_name.strip_prefix("chr").unwrap_or(chr_name);
+    let (target_markers, target_genotypes) = target_by_chr.get(key)
+        .or_else(|| target_by_chr.get(chr_name))?;
+
+    let (wgs_idx, target_idx) = intersect_variants_for_chr(
+        &srp.metadata.chromosome, &srp.variants, &srp.ids, target_markers,
+    );
+    let n_chip = wgs_idx.len();
+    if n_chip == 0 { return None; }
+
+    let targ_alleles = extract_target_alleles(target_genotypes, &target_idx, n_chip, n_haps);
+    let chip_bps: Vec<i64> = wgs_idx.iter().map(|&wi| srp.variants[wi].pos).collect();
+    let raw_chip_cm = genmap::interpolate_for_chr(multi_map, chr_name, &chip_bps);
+
+    Some((srp, wgs_idx, target_idx, targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip))
+}
+
+/// Run multi-chromosome imputation from a unified SRP v3 file.
+pub fn run_multi_chr(
+    srp_path: &Path,
+    input_path: &str,
+    map_path: &Path,
+    output_path: &str,
+    config: &MultiChrImputeConfig,
+) -> std::io::Result<()> {
+    let start_time = Instant::now();
+    let version = env!("CARGO_PKG_VERSION");
+
+    // 1. Open multi-chr SRP
+    selphi_step!("Opening multi-chr SRP v3...");
+    let multi_srp = MultiChrSrpReader::open(srp_path)?;
+    let chromosomes: Vec<String> = multi_srp.chromosomes().iter().map(|s| s.to_string()).collect();
+    let n_chr = chromosomes.len();
+
+    selphi_info!("  refpanel: {} (v3, {} chromosomes)", srp_path.display(), n_chr);
+    selphi_info!("  chromosomes: {}", chromosomes.join(", "));
+    selphi_info!("  haplotypes:  {}", multi_srp.global_meta.n_haps);
+    selphi_info!("  samples:     {}", multi_srp.global_meta.n_samples);
+
+    // Memory estimate from largest chr
+    if let Some(largest) = multi_srp.largest_chr() {
+        selphi_info!("  largest chr: {} ({} variants)", largest.chr_name, largest.n_variants);
+    }
+    selphi_info!("");
+
+    // 2. Read target VCF once, partition by chromosome
+    selphi_step!("Reading target VCF (all chromosomes)...");
+    let (sample_names, target_by_chr, is_phased) = read_target_vcf_multi_chr(input_path);
+    let n_samples = sample_names.len();
+    let n_haps = n_samples * 2;
+    selphi_info!("  target: {} samples, {} chromosomes, phased={}",
+        n_samples, target_by_chr.len(), is_phased);
+
+    // 3. Load unified genetic map
+    selphi_step!("Loading unified genetic map...");
+    let multi_map = genmap::load_genetic_map_multi_chr(map_path)?;
+    selphi_info!("  map: {} chromosomes loaded", multi_map.len());
+    selphi_info!("");
+
+    // 4. Determine output formats
+    let formats = selphi::io::pipeline::OutputFormats {
+        vcf: !config.bcf,
+        bcf: config.bcf,
+        parquet: config.parquet || config.all_formats,
+        pgen: config.pgen || config.all_formats,
+        selfdecode: config.selfdecode || config.all_formats,
+    };
+
+    // 5. Setup single output writer for ALL chromosomes
+    let out_base = PathBuf::from(output_path);
+    let out_file = if formats.bcf {
+        out_base.with_extension("bcf")
+    } else {
+        out_base.with_extension("vcf.gz")
+    };
+
+    let all_contig_fields = &multi_srp.global_meta.contig_fields;
+    let (vcf_tx, vcf_writer, vcf_bgzip) = if formats.vcf || formats.bcf {
+        if formats.bcf {
+            selphi::io::pipeline::setup_bcf_writer(
+                n_samples, &sample_names, all_contig_fields, version, &out_file, config.no_ap,
+            ).expect("Failed to setup BCF writer")
+        } else {
+            selphi::io::pipeline::setup_vcf_writer(
+                n_samples, &sample_names, all_contig_fields, version, &out_file, config.no_ap,
+            ).expect("Failed to setup VCF writer")
+        }
+    } else {
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        let handle = std::thread::spawn(|| Ok(()));
+        (tx, handle, ())
+    };
+
+    // Prefetch result for next chromosome (loaded in background).
+    struct ChrPrefetchResult {
+        srp: Arc<selphi::srp::SrpReader>,
+        wgs_idx: Vec<usize>,
+        target_idx: Vec<usize>,
+        targ_alleles: Vec<u8>,
+        raw_chip_cm: Vec<f64>,
+        chip_bps: Vec<i64>,
+        n_ref: usize,
+        n_ref_variants: usize,
+        n_chip: usize,
+    }
+
+    // 6. Process each chromosome with prefetch overlap
+    let mut prefetch_result: Option<ChrPrefetchResult> = None;
+
+    for (chr_idx, chr_name) in chromosomes.iter().enumerate() {
+        let chr_start = Instant::now();
+        selphi_info!("  [{}/{}] chr{}", chr_idx + 1, n_chr, chr_name);
+
+        // Use prefetched data if available, otherwise load synchronously
+        let (srp, wgs_idx, _target_idx, targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip) =
+            if let Some(pre) = prefetch_result.take() {
+                selphi_info!("    (prefetched)");
+                (pre.srp, pre.wgs_idx, pre.target_idx, pre.targ_alleles,
+                 pre.raw_chip_cm, pre.chip_bps, pre.n_ref, pre.n_ref_variants, pre.n_chip)
+            } else {
+                // Synchronous load for first chromosome (or if prefetch was skipped)
+                match load_chr_data(&multi_srp, chr_name, &target_by_chr, &multi_map, n_haps) {
+                    Some(d) => d,
+                    None => { selphi_info!("    Skipped"); continue; }
+                }
+            };
+
+        if n_chip == 0 || n_ref_variants == 0 {
+            selphi_info!("    Skipped (0 shared markers)");
+            continue;
+        }
+        selphi_info!("    {} ref variants, {} shared markers", n_ref_variants, n_chip);
+
+        // Phasing (if needed)
+        let needs_phasing = !is_phased || config.force_phasing;
+        let (targ_alleles, em_ne_per_site, ref_bm_from_phasing) = if needs_phasing {
+            let (map_bp_raw, map_cm_raw) = multi_map.get(
+                chr_name.strip_prefix("chr").unwrap_or(chr_name)
+            ).cloned().unwrap_or_else(|| {
+                multi_map.get(chr_name).cloned().unwrap_or_default()
+            });
+            let ref_bp: Vec<i64> = srp.variants.iter().map(|v| v.pos).collect();
+
+            // Extract bitmatrix for phasing
+            let ref_bm = srp.extract_ref_alleles_bitmatrix(&wgs_idx);
+
+            // Multi-chr mode uses haploid phasing engine (chip arrays).
+            selphi_info!("    Phasing: haploid engine");
+            let chip_cm_raw_slice = &raw_chip_cm;
+            let (phased, _ne_arr, _switch_info) = selphi::haploid::phase_genotypes(
+                &targ_alleles, &ref_bm, chip_cm_raw_slice, &chip_bps,
+                &ref_bp, &map_bp_raw, &map_cm_raw,
+                n_chip, n_samples, n_ref,
+                config.seed, config.threads, 0,
+            );
+            (phased, None::<Vec<f64>>, Some(ref_bm))
+        } else {
+            (targ_alleles, None::<Vec<f64>>, None::<selphi::common::HaplotypeBitmatrix>)
+        };
+
+        // Ref bitmatrix for imputation
+        let ref_bm_imp: selphi::common::HaplotypeBitmatrix = ref_bm_from_phasing.unwrap_or_else(|| {
+            srp.extract_ref_alleles_bitmatrix(&wgs_idx)
+        });
+
+        // LD correction
+        let chip_cm = if std::env::var("SELPHI_NO_LD").is_ok() {
+            raw_chip_cm.clone()
+        } else {
+            genmap::compute_ld_correction_bm(&ref_bm_imp, &raw_chip_cm, n_chip, n_ref, 100)
+        };
+
+        // Auto-calibrate parameters
+        let match_length = config.match_length.unwrap_or_else(|| {
+            let ml = (n_ref as f64).log2() as usize - 7;
+            ml.min(n_chip / 2000).max(5)
+        });
+        let log2_haps = (n_ref as f64).log2();
+        let fl_fwd = (2600.0 / log2_haps) as usize;
+        let fl_fwd = fl_fwd.clamp(100, 450);
+        let fl_bwd = ((fl_fwd as f64 * 2.4 / log2_haps) as usize).max(13);
+        let est_ne = if config.est_ne <= 0 { 175_000i64 } else { config.est_ne };
+
+        // Compute imputation windows
+        let windows = compute_imputation_windows(&chip_cm, config.window_cm, config.overlap_cm);
+
+        // MAF-adaptive Ne
+        let ne_low = est_ne as f64 * 0.85;
+        let ne_high = est_ne as f64 * 1.2;
+        let final_ne_per_site: Option<Vec<f64>> = if em_ne_per_site.is_none() || config.no_em_ne {
+            let mut ne_maf = vec![ne_low; n_chip];
+            for ci in 0..n_chip {
+                let ac: u32 = ref_bm_imp.popcount_row(ci, n_ref);
+                let af = ac as f64 / n_ref as f64;
+                let maf = af.min(1.0 - af);
+                let t = ((maf - 0.005) / (0.02 - 0.005)).clamp(0.0, 1.0);
+                ne_maf[ci] = ne_low + t * (ne_high - ne_low);
+            }
+            Some(ne_maf)
+        } else {
+            em_ne_per_site
+        };
+
+        // Pre-compute candidates if phasing ran
+        let precomputed_candidates: Option<Vec<Vec<u32>>> = if needs_phasing {
+            let m_full = n_ref + n_haps;
+            let mut alleles_full = vec![0u8; n_chip * m_full];
+            for ci in 0..n_chip {
+                let row = ref_bm_imp.row(ci);
+                let ref_dst = &mut alleles_full[ci * m_full..ci * m_full + n_ref];
+                for w in 0..ref_bm_imp.n_words() {
+                    let mut word = row[w];
+                    let base = w * 64;
+                    while word != 0 {
+                        let k = word.trailing_zeros() as usize;
+                        let r = base + k;
+                        if r < n_ref { ref_dst[r] = 1; }
+                        word &= word - 1;
+                    }
+                }
+                alleles_full[ci * m_full + n_ref..ci * m_full + m_full]
+                    .copy_from_slice(&targ_alleles[ci * n_haps..(ci + 1) * n_haps]);
+            }
+            let coded_full = selphi::imputation::pbwt::build_coded_steps(
+                &alleles_full, n_chip, m_full, &chip_cm, 0.05,
+            );
+            let max_cand = config.max_candidates;
+            let candidates: Vec<Vec<u32>> = (0..n_haps)
+                .into_par_iter()
+                .map(|tgt| {
+                    selphi::imputation::pbwt::select_candidates(&coded_full, n_ref + tgt, n_ref, 7, max_cand)
+                })
+                .collect();
+            drop(alleles_full);
+            Some(candidates)
+        } else {
+            None
+        };
+
+        // Spawn prefetch for NEXT chromosome (background I/O thread)
+        let prefetch_handle: Option<std::thread::JoinHandle<Option<ChrPrefetchResult>>> =
+            if chr_idx + 1 < n_chr {
+                let next_chr = chromosomes[chr_idx + 1].clone();
+                let srp_path_clone = srp_path.to_path_buf();
+                // Clone only the data we need for the next chr
+                let next_target = {
+                    let key = next_chr.strip_prefix("chr").unwrap_or(&next_chr).to_string();
+                    target_by_chr.get(&key).or_else(|| target_by_chr.get(&next_chr)).cloned()
+                };
+                let next_map = {
+                    let key = next_chr.strip_prefix("chr").unwrap_or(&next_chr).to_string();
+                    multi_map.get(&key).or_else(|| multi_map.get(&next_chr)).cloned()
+                };
+                let n_h = n_haps;
+                Some(std::thread::spawn(move || {
+                    // Open a fresh MultiChrSrpReader (separate file handle)
+                    let reader = MultiChrSrpReader::open(&srp_path_clone).ok()?;
+                    let chr_view = reader.load_chr_view(&next_chr).ok()?;
+                    let n_ref = chr_view.n_haps();
+                    let n_ref_variants = chr_view.n_variants();
+                    if n_ref_variants == 0 { return None; }
+                    let srp = Arc::new(chr_view.into_srp_reader());
+
+                    let (target_markers, target_genotypes) = next_target.as_ref()?;
+                    let (wgs_idx, target_idx) = intersect_variants_for_chr(
+                        &srp.metadata.chromosome, &srp.variants, &srp.ids, target_markers,
+                    );
+                    let n_chip = wgs_idx.len();
+                    if n_chip == 0 { return None; }
+
+                    let targ_alleles = extract_target_alleles(target_genotypes, &target_idx, n_chip, n_h);
+                    let chip_bps: Vec<i64> = wgs_idx.iter().map(|&wi| srp.variants[wi].pos).collect();
+                    let (map_bp, map_cm) = next_map?;
+                    let raw_chip_cm: Vec<f64> = chip_bps.iter().map(|&bp| {
+                        genmap::interpolate_cm(&map_bp, &map_cm, bp)
+                    }).collect();
+
+                    Some(ChrPrefetchResult {
+                        srp, wgs_idx, target_idx, targ_alleles, raw_chip_cm, chip_bps,
+                        n_ref, n_ref_variants, n_chip,
+                    })
+                }))
+            } else {
+                None
+            };
+
+        // Per-window imputation loop
+        let mut hap_priors: Vec<Option<Vec<f64>>> = vec![None; n_haps];
+        let max_candidates = config.max_candidates;
+        let p_err = config.p_err;
+
+        for (wi, window) in windows.iter().enumerate() {
+            let n_var_w = window.chip_end - window.chip_start;
+            let targ_w = extract_subarray(&targ_alleles, n_haps, window.chip_start, window.chip_end);
+            let cm_w = &chip_cm[window.chip_start..window.chip_end];
+            let m = n_ref + n_haps;
+
+            // Build ref_w from bitmatrix
+            let mut ref_w = vec![0u8; n_var_w * n_ref];
+            ref_w.par_chunks_mut(n_ref).enumerate().for_each(|(var, dst)| {
+                let ci = window.chip_start + var;
+                let row = ref_bm_imp.row(ci);
+                for w in 0..ref_bm_imp.n_words() {
+                    let mut word = row[w];
+                    let base = w * 64;
+                    while word != 0 {
+                        let k = word.trailing_zeros() as usize;
+                        let r = base + k;
+                        if r < n_ref { unsafe { *dst.get_unchecked_mut(r) = 1; } }
+                        word &= word - 1;
+                    }
+                }
+            });
+
+            // CodedSteps
+            let coded = selphi::imputation::pbwt::build_coded_steps_bm(
+                &ref_bm_imp, window.chip_start, n_var_w, n_ref, &targ_w, n_haps, cm_w, 0.05,
+            );
+
+            let breaks_w = vec![(0usize, n_var_w)];
+            let ne_w: Option<Vec<f64>> = final_ne_per_site.as_ref().map(|ne| {
+                ne[window.chip_start..window.chip_end].to_vec()
+            });
+            let ne_w_ref = ne_w.as_deref();
+
+            // Preload stripes for interpolation
+            let own_start = if window.own_chip_start == 0 { 0 } else { wgs_idx[window.own_chip_start] };
+            let own_end = if window.own_chip_end >= wgs_idx.len() { srp.n_variants() } else { wgs_idx[window.own_chip_end] };
+
+            let stripe_preload_handle = if srp.is_tiled() {
+                let tiled_ref = srp.tiled.as_ref().unwrap();
+                let first_stripe = own_start / 1024;
+                let last_stripe = if own_end > 0 { (own_end - 1) / 1024 } else { 0 };
+                let n_stripes = last_stripe - first_stripe + 1;
+                let stripe_comp = tiled_ref.stripe_compressed_bytes(first_stripe);
+                let n_load = (500 * 1024 * 1024 / stripe_comp.max(1)).max(10).min(n_stripes);
+                // Preload on current thread (simpler than spawning — tiled preload is fast)
+                Some(tiled_ref.preload_stripes(first_stripe, n_load).ok())
+            } else {
+                None
+            };
+
+            // HMM for all haplotypes
+            let all_results: Vec<(usize, selphi::imputation::hmm::HmmResult)> = (0..n_haps)
+                .into_par_iter()
+                .map(|tgt| {
+                    let prior = hap_priors[tgt].as_deref();
+                    let candidates = if let Some(ref pc) = precomputed_candidates {
+                        pc[tgt].clone()
+                    } else {
+                        selphi::imputation::pbwt::select_candidates(
+                            &coded, n_ref + tgt, n_ref, 7, max_candidates,
+                        )
+                    };
+                    let n_cand = candidates.len();
+                    let m_red = if n_cand < 100 { m } else { n_cand + 1 };
+                    let is_full = n_cand < 100;
+
+                    let mut reduced = vec![0u8; n_var_w * m_red];
+
+                    if is_full {
+                        for var in 0..n_var_w {
+                            let ci = window.chip_start + var;
+                            let row = ref_bm_imp.row(ci);
+                            let dst_base = var * m;
+                            let ref_dst = &mut reduced[dst_base..dst_base + n_ref];
+                            for w in 0..ref_bm_imp.n_words() {
+                                let mut word = row[w];
+                                let base = w * 64;
+                                while word != 0 {
+                                    let k = word.trailing_zeros() as usize;
+                                    let r = base + k;
+                                    if r < n_ref { ref_dst[r] = 1; }
+                                    word &= word - 1;
+                                }
+                            }
+                            reduced[dst_base + n_ref..dst_base + m]
+                                .copy_from_slice(&targ_w[var * n_haps..(var + 1) * n_haps]);
+                        }
+                        let fwd = selphi::imputation::pbwt::pbwt_forward_single(
+                            &reduced, n_var_w, m, n_ref, match_length, fl_fwd,
+                            (n_ref + tgt) as i32,
+                        );
+                        let bwd = selphi::imputation::pbwt::backward_filter_single(&fwd, n_var_w, n_ref, fl_fwd, fl_bwd);
+                        let csc = selphi::imputation::pbwt::build_csc_matrix(&bwd, n_ref, n_var_w, fl_bwd);
+                        return (tgt, selphi::imputation::hmm::calculate_weights(
+                            &csc, cm_w, &breaks_w, n_ref,
+                            est_ne as f64, p_err, Some(&ref_w), n_var_w, None,
+                            ne_w_ref, prior, 0.0,
+                        ));
+                    }
+
+                    for var in 0..n_var_w {
+                        let ci = window.chip_start + var;
+                        let row = ref_bm_imp.row(ci);
+                        let dst = var * m_red;
+                        for (i, &c) in candidates.iter().enumerate() {
+                            reduced[dst + i] = ((row[c as usize / 64] >> (c as usize % 64)) & 1) as u8;
+                        }
+                        reduced[dst + n_cand] = targ_w[var * n_haps + tgt];
+                    }
+
+                    let fwd = selphi::imputation::pbwt::pbwt_forward_single(
+                        &reduced, n_var_w, m_red, n_cand, match_length, fl_fwd,
+                        n_cand as i32,
+                    );
+                    let bwd = selphi::imputation::pbwt::backward_filter_single(&fwd, n_var_w, n_cand, fl_fwd, fl_bwd);
+                    let mut csc = selphi::imputation::pbwt::build_csc_matrix(&bwd, n_cand, n_var_w, fl_bwd);
+                    for idx in &mut csc.indices { *idx = candidates[*idx as usize] as i32; }
+                    csc.n_rows = n_ref;
+
+                    (tgt, selphi::imputation::hmm::calculate_weights(
+                        &csc, cm_w, &breaks_w, n_ref,
+                        est_ne as f64, p_err, Some(&ref_w), n_var_w, None,
+                        ne_w_ref, prior, 0.0,
+                    ))
+                })
+                .collect();
+
+            let mut all_weights: Vec<Vec<(usize, selphi::imputation::hmm::CsrWeights)>> = Vec::with_capacity(n_haps);
+            for (tgt, r) in all_results {
+                if let Some(post) = r.hap_posterior {
+                    hap_priors[tgt] = Some(post);
+                }
+                all_weights.push(r.weights);
+            }
+
+            drop(ref_w);
+
+            // Interpolation + output
+            let preloaded_stripes = stripe_preload_handle.and_then(|h| h);
+            let (cs, os, oe) = (window.chip_start, window.own_chip_start, window.own_chip_end);
+
+            selphi::io::pipeline::write_window_multiformat(
+                &formats, &srp, &all_weights, cs, os, oe,
+                &wgs_idx, n_samples, &targ_alleles,
+                config.no_ap, None, preloaded_stripes,
+                None, // parquet per-chr not supported yet in multi-chr mode
+                None, // pgen per-chr not supported yet
+                None, // selfdecode per-chr not supported yet
+                &vcf_tx,
+            ).expect("Output write failed");
+
+            selphi_info!("    Window {}/{}: {} vars", wi + 1, windows.len(), n_var_w);
+        }
+
+        // Join prefetch for next chromosome (was running during our windows)
+        if let Some(handle) = prefetch_handle {
+            prefetch_result = handle.join().unwrap_or(None);
+        }
+
+        let chr_elapsed = chr_start.elapsed().as_secs_f64();
+        selphi_info!("    \x1b[32m\u{2713}\x1b[0m {:.1}s ({} windows)\n", chr_elapsed, windows.len());
+    }
+
+    // 7. Finalize output writer
+    if formats.vcf || formats.bcf {
+        selphi::io::pipeline::finish_vcf_writer(vcf_tx, vcf_writer, vcf_bgzip)
+            .expect("Failed to finalize VCF/BCF output");
+    }
+
+    let total = start_time.elapsed().as_secs_f64();
+    let mem = selphi::log::peak_mem_mb();
+    selphi_info!("\n  Total: {:.0}s | {} chromosomes | Peak: {:.0} MB | {}",
+        total, n_chr, mem, out_file.display());
+
+    Ok(())
+}

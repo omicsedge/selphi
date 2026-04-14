@@ -8,6 +8,7 @@
 
 mod self_test;
 mod multi_chr;
+mod orchestrate;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -205,6 +206,11 @@ struct Args {
     #[arg(long)]
     self_test: bool,
 
+    /// Merge per-chromosome SRP v2 files into a single multi-chr SRP v3 file.
+    /// Provide comma-separated paths: --merge-srps chr1.srp,chr2.srp,chr3.srp
+    #[arg(long)]
+    merge_srps: Option<String>,
+
 }
 
 fn main() {
@@ -322,7 +328,55 @@ fn main() {
         std::process::exit(if failures == 0 { 0 } else { 1 });
     }
 
+    // --- Merge SRP v2 files into v3 ---
+    if let Some(ref merge_list) = args.merge_srps {
+        let output = args.out.as_deref().unwrap_or("merged");
+        let log_path = PathBuf::from(output).with_extension("log");
+        selphi::log::init(&log_path, args.debug);
+        selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
+        selphi_info!("  mode:     merge-srps (v2 → v3)");
+        selphi_info!("  output:   {}", output);
+        selphi_info!("  log:      {}\n", log_path.display());
+
+        rayon::ThreadPoolBuilder::new().num_threads(args.threads).build_global().ok();
+
+        let paths: Vec<PathBuf> = merge_list.split(',')
+            .map(|s| PathBuf::from(s.trim()))
+            .collect();
+        selphi::srp::multi_chr_writer::merge_srps_to_v3(&paths, Path::new(output))
+            .unwrap_or_else(|e| { selphi_error!("Merge failed: {}", e); std::process::exit(1); });
+
+        let mem = selphi::log::peak_mem_mb();
+        selphi_info!("\nPeak memory: {:.0} MB", mem);
+        return;
+    }
+
     if let Some(ref source) = args.prepare_reference_from {
+        // Directory mode: scan for per-chr BCF/VCF → build multi-chr SRP v3
+        if Path::new(source).is_dir() {
+            let output = args.out.as_deref().unwrap_or("panel");
+            let log_path = PathBuf::from(output).with_extension("log");
+            selphi::log::init(&log_path, args.debug);
+            selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
+            selphi_info!("  mode:     prepare-reference (directory → multi-chr SRP v3)");
+            selphi_info!("  source:   {} (directory)", source);
+            selphi_info!("  output:   {}", output);
+            selphi_info!("  threads:  {}", args.threads);
+            selphi_info!("  log:      {}\n", log_path.display());
+
+            rayon::ThreadPoolBuilder::new().num_threads(args.threads).build_global().ok();
+            let start_time = Instant::now();
+
+            selphi::srp::multi_chr_writer::build_multi_chr_srp_from_dir(
+                Path::new(source), Path::new(output), args.threads, args.chunk_size)
+                .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
+
+            let total = start_time.elapsed().as_secs_f64();
+            let mem = selphi::log::peak_mem_mb();
+            selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB", total, mem);
+            return;
+        }
+
         let is_srp_input = source.ends_with(".srp");
         let auto_output = if is_srp_input {
             Path::new(source).with_extension("bref3").to_string_lossy().to_string()
@@ -371,12 +425,26 @@ fn main() {
                 Path::new(source), &srp_path, args.threads, args.chunk_size)
                 .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
         } else {
+            // Auto-detect multi-contig: check if BCF/VCF has multiple contigs with data
+            let is_multi_contig = {
+                let hdr = selphi::srp::bcf_reader::read_header_only(Path::new(source)).ok();
+                hdr.as_ref().map(|h| h.contig_names.len() > 1).unwrap_or(false)
+            };
+
             let srp_path = if Path::new(output).extension().is_none_or(|e| e != "srp") {
                 PathBuf::from(output).with_extension("srp")
             } else { PathBuf::from(output) };
-            selphi::srp::writer::build_srp_unified(
-                Path::new(source), &srp_path, args.threads, args.chunk_size)
-                .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
+
+            if is_multi_contig {
+                selphi_info!("  Detected multi-contig source → building multi-chr SRP v3\n");
+                selphi::srp::multi_chr_writer::build_multi_chr_srp(
+                    Path::new(source), &srp_path, args.threads, args.chunk_size)
+                    .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
+            } else {
+                selphi::srp::writer::build_srp_unified(
+                    Path::new(source), &srp_path, args.threads, args.chunk_size)
+                    .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
+            }
         }
 
         let total = start_time.elapsed().as_secs_f64();
@@ -392,6 +460,52 @@ fn main() {
     let target_path = args.input.as_deref().expect("--input is required");
     let map_path = args.map_path.as_deref().expect("--map is required");
     let output_path = args.out.as_deref().expect("--out is required");
+
+    // Auto-detect multi-chr SRP v3 and delegate to native orchestrator
+    if let Ok(3) = selphi::srp::multi_chr_reader::detect_srp_version(&args.refpanel) {
+        let log_path = PathBuf::from(output_path).with_extension("log");
+        selphi::log::init(&log_path, args.debug);
+        selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
+        selphi_info!("  mode:     multi-chr imputation (unified SRP v3)");
+        selphi_info!("  input:    {}", target_path);
+        selphi_info!("  refpanel: {}", args.refpanel);
+        selphi_info!("  map:      {}", map_path);
+        selphi_info!("  output:   {}", output_path);
+        selphi_info!("  threads:  {}", args.threads);
+        selphi_info!("  log:      {}\n", log_path.display());
+
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(args.threads)
+            .build_global()
+            .ok();
+
+        let config = orchestrate::MultiChrImputeConfig {
+            threads: args.threads,
+            seed: args.seed,
+            window_cm: args.window_cm,
+            overlap_cm: args.overlap_cm,
+            match_length: args.match_length,
+            est_ne: args.est_ne,
+            max_candidates: args.max_candidates,
+            p_err: args.p_err,
+            no_ap: args.no_ap,
+            no_em_ne: args.no_em_ne,
+            phasing_engine: format!("{:?}", args.phasing_engine).to_lowercase(),
+            max_cond_haps: args.max_cond_haps,
+            force_phasing: args.force_phasing,
+            max_windows: args.max_windows,
+            bcf: args.bcf,
+            parquet: args.parquet,
+            pgen: args.pgen,
+            selfdecode: args.selfdecode,
+            all_formats: args.all_formats,
+            wgs_phasing: args.wgs_phasing,
+        };
+        orchestrate::run_multi_chr(
+            Path::new(&args.refpanel), target_path, Path::new(map_path), output_path, &config,
+        ).unwrap_or_else(|e| { selphi_error!("Multi-chr error: {}", e); std::process::exit(1); });
+        return;
+    }
 
     // Initialize global logger (writes to stderr + .log file)
     let log_path = PathBuf::from(output_path).with_extension("log");

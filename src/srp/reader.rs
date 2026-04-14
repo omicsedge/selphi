@@ -31,7 +31,9 @@ impl SrpReader {
         let mut magic = [0u8; 8];
         f.read_exact(&mut magic)?;
         if &magic != MAGIC {
-            let hint = if &magic[..2] == b"PK" {
+            let hint = if &magic == super::SRP_V3_MAGIC {
+                "Detected multi-chr SRP v3 file. Use MultiChrSrpReader for multi-chromosome panels."
+            } else if &magic[..2] == b"PK" {
                 "Detected old ZIP-based SRP format."
             } else {
                 "Not a valid SRP file."
@@ -113,6 +115,22 @@ impl SrpReader {
         let mmap = File::open(&filepath).ok().and_then(|f| unsafe { memmap2::Mmap::map(&f).ok() });
 
         Ok(SrpReader { metadata, variants, sample_ids, ids, original_ids, tiled, mmap, chunk_index })
+    }
+
+    /// Construct an SrpReader from a ChrSrpView (for multi-chr pipeline compatibility).
+    pub fn from_chr_view(view: super::multi_chr_reader::ChrSrpView) -> Self {
+        let mmap = std::fs::File::open(view.tiled.as_ref().map(|t| t.file_path().to_path_buf())
+            .unwrap_or_default()).ok().and_then(|f| unsafe { memmap2::Mmap::map(&f).ok() });
+        SrpReader {
+            metadata: view.metadata,
+            variants: view.variants,
+            sample_ids: view.sample_ids,
+            ids: view.ids,
+            original_ids: view.original_ids,
+            tiled: view.tiled,
+            mmap,
+            chunk_index: vec![], // v3 tiled-only, no CSC chunks
+        }
     }
 
     // ======================================================================

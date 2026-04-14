@@ -158,6 +158,97 @@ pub fn seek_for_position(index: &CsiIndex, pos: i64) -> VirtualPosition {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-contig CSI parsing
+// ---------------------------------------------------------------------------
+
+/// Per-contig CSI index data.
+pub struct ContigCsiIndex {
+    pub ref_seq_id: usize,
+    pub checkpoints: Vec<(i64, VirtualPosition)>,
+    pub first_offset: VirtualPosition,
+    pub n_mapped: u64,
+}
+
+/// Parse a CSI index file and return per-contig index data for ALL contigs
+/// that have mapped records. Returns entries sorted by ref_seq_id.
+pub fn parse_csi_all_contigs(path: &Path) -> io::Result<Vec<ContigCsiIndex>> {
+    let raw = std::fs::read(path)?;
+
+    let data = {
+        let mut bgzf = noodles_bgzf::io::Reader::new(&raw[..]);
+        let mut dec = Vec::new();
+        bgzf.read_to_end(&mut dec)?;
+        dec
+    };
+
+    if data.len() < 16 || &data[..4] != b"CSI\x01" {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "not a CSI index"));
+    }
+
+    let mut off = 4;
+    let min_shift = i32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4;
+    let depth = i32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4;
+    let l_aux = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
+    off += l_aux;
+    let n_ref = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
+
+    let mut result = Vec::new();
+
+    for ref_idx in 0..n_ref {
+        if off + 4 > data.len() { break; }
+        let n_bin = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
+
+        let mut ref_checkpoints: Vec<(i64, VirtualPosition)> = Vec::new();
+        let mut ref_first_offset = VirtualPosition::default();
+        let mut ref_n_mapped: u64 = 0;
+
+        for _ in 0..n_bin {
+            if off + 4 > data.len() { break; }
+            let bin_id = u32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4;
+            if off + 8 > data.len() { break; }
+            let loffset = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;
+            if off + 4 > data.len() { break; }
+            let n_chunk = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
+
+            let mut min_beg = u64::MAX;
+            let mut chunks = Vec::with_capacity(n_chunk.min(64));
+            for _ in 0..n_chunk {
+                if off + 16 > data.len() { break; }
+                let cnk_beg = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;
+                let cnk_end = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;
+                if chunks.len() < 64 { chunks.push((cnk_beg, cnk_end)); }
+                if cnk_beg < min_beg { min_beg = cnk_beg; }
+            }
+
+            if bin_id >= 100_000 && chunks.len() >= 2 {
+                ref_n_mapped = chunks[1].0;
+            }
+            if bin_id < 100_000 && loffset > 0 {
+                let pos = bin_to_pos(bin_id, min_shift, depth);
+                let vp = VirtualPosition::from(loffset);
+                ref_checkpoints.push((pos, vp));
+            }
+            if min_beg < u64::MAX && ref_first_offset == VirtualPosition::default() {
+                ref_first_offset = VirtualPosition::from(min_beg);
+            }
+        }
+
+        if ref_n_mapped > 0 || !ref_checkpoints.is_empty() {
+            ref_checkpoints.sort_by_key(|&(pos, _)| pos);
+            ref_checkpoints.dedup_by_key(|&mut (pos, _)| pos);
+            result.push(ContigCsiIndex {
+                ref_seq_id: ref_idx,
+                checkpoints: ref_checkpoints,
+                first_offset: ref_first_offset,
+                n_mapped: ref_n_mapped,
+            });
+        }
+    }
+
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
 // CSI index writer: build index by scanning a BCF file
 // ---------------------------------------------------------------------------
 

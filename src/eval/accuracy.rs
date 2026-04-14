@@ -376,6 +376,7 @@ pub struct EvalCounts {
     pub n_matched: u64,
     pub n_imp_variants: u64,
     pub n_truth_variants: u64,
+    pub chromosomes: Vec<String>,
 }
 
 /// Variant record reader — abstracts over VCF.gz and BCF.
@@ -753,6 +754,7 @@ pub fn evaluate_parallel(
                 let mut n_matched = 0u64;
                 let mut n_imp = 0u64;
                 let mut n_truth = 0u64;
+                let mut chr_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
                 let mut imp_ds_raw = Vec::with_capacity(n_samples);
                 let mut truth_ds_raw = Vec::with_capacity(n_samples);
@@ -798,6 +800,7 @@ pub fn evaluate_parallel(
 
                     let (matched, swapped) = match_alleles(&imp.2, &imp.3, &truth.2, &truth.3);
                     if matched {
+                        chr_set.insert(String::from_utf8_lossy(&imp.0).to_string());
                         imp_ds[..n_samples].copy_from_slice(&imp_ds_raw[..n_samples]);
                         if swapped { for si in 0..n_samples { if imp_ds[si] >= 0.0 { imp_ds[si] = 2.0 - imp_ds[si]; } } }
                         truth_ds[..n_samples].copy_from_slice(&truth_ds_raw[..n_samples]);
@@ -818,23 +821,26 @@ pub fn evaluate_parallel(
                     truth_rec = truth_reader.next_record(&mut truth_ds_raw);
                 }
 
-                Ok((site_acc, sample_acc, EvalCounts { n_matched, n_imp_variants: n_imp, n_truth_variants: n_truth }))
+                Ok((site_acc, sample_acc, EvalCounts { n_matched, n_imp_variants: n_imp, n_truth_variants: n_truth, chromosomes: chr_set.into_iter().collect() }))
             })();
-            result.unwrap_or_else(|_| (SiteAccumulator::new(), SampleAccumulator::new(n_samples), EvalCounts { n_matched: 0, n_imp_variants: 0, n_truth_variants: 0 }))
+            result.unwrap_or_else(|_| (SiteAccumulator::new(), SampleAccumulator::new(n_samples), EvalCounts { n_matched: 0, n_imp_variants: 0, n_truth_variants: 0, chromosomes: Vec::new() }))
         })
         .collect();
 
     // Merge all region results
     let mut site_acc = SiteAccumulator::new();
     let mut sample_acc = SampleAccumulator::new(n_samples);
-    let mut total = EvalCounts { n_matched: 0, n_imp_variants: 0, n_truth_variants: 0 };
+    let mut total = EvalCounts { n_matched: 0, n_imp_variants: 0, n_truth_variants: 0, chromosomes: Vec::new() };
+    let mut all_chrs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (sa, sam, c) in results {
         site_acc.merge(&sa);
         sample_acc.merge(&sam);
         total.n_matched += c.n_matched;
         total.n_imp_variants += c.n_imp_variants;
         total.n_truth_variants += c.n_truth_variants;
+        for chr in c.chromosomes { all_chrs.insert(chr); }
     }
+    total.chromosomes = all_chrs.into_iter().collect();
 
     Ok((site_acc, sample_acc, total))
 }
@@ -876,6 +882,7 @@ pub fn evaluate_stream(
     let mut n_matched = 0u64;
     let mut n_imp_variants = 0u64;
     let mut n_truth_variants = 0u64;
+    let mut chr_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     let mut imp_ds_raw = Vec::with_capacity(imp_reader.n_file_samples());
     let mut truth_ds_raw = Vec::with_capacity(truth_reader.n_file_samples());
@@ -905,6 +912,7 @@ pub fn evaluate_stream(
         // Same position — match by alleles (handles indel normalization + REF/ALT swaps)
         let (matched, swapped) = match_alleles(&imp.2, &imp.3, &truth.2, &truth.3);
         if matched {
+            chr_set.insert(String::from_utf8_lossy(&imp.0).to_string());
             // ds_raw already contains only shared samples in order (via sample filter)
             imp_ds[..n_samples].copy_from_slice(&imp_ds_raw[..n_samples]);
             if swapped { for si in 0..n_samples { if imp_ds[si] >= 0.0 { imp_ds[si] = 2.0 - imp_ds[si]; } } }
@@ -942,7 +950,8 @@ pub fn evaluate_stream(
     while { imp_rec = imp_reader.next_record(&mut imp_ds_raw); imp_rec.is_some() } { n_imp_variants += 1; }
     while { truth_rec = truth_reader.next_record(&mut truth_ds_raw); truth_rec.is_some() } { n_truth_variants += 1; }
 
-    Ok((site_acc, sample_acc, EvalCounts { n_matched, n_imp_variants, n_truth_variants }))
+    let chromosomes: Vec<String> = chr_set.into_iter().collect();
+    Ok((site_acc, sample_acc, EvalCounts { n_matched, n_imp_variants, n_truth_variants, chromosomes }))
 }
 
 /// Print MAF-binned summary table.
@@ -986,6 +995,10 @@ pub fn print_summary(site_acc: &SiteAccumulator, sample_acc: &SampleAccumulator,
     crate::selphi_info!("\n  Imputed:  {} variants", counts.n_imp_variants);
     crate::selphi_info!("  Truth:    {} variants", counts.n_truth_variants);
     crate::selphi_info!("  Matched:  {} variants ({:.1}% of truth)", n_matched, match_pct);
+    if !counts.chromosomes.is_empty() {
+        crate::selphi_info!("  Chromosomes: {} ({})", counts.chromosomes.len(),
+            counts.chromosomes.join(", "));
+    }
 }
 
 /// Write JSON summary to file.

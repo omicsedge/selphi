@@ -247,6 +247,89 @@ fn compress_chunk(col_lists: &[Vec<i32>], n_rows: usize, n_haps: usize) -> Vec<u
     zstd::encode_all(Cursor::new(&raw), 3).expect("zstd failed")
 }
 
+/// Parallel BCF reader for a specific contig. Uses pre-parsed per-contig CSI data.
+pub fn read_bcf_parallel_for_contig(
+    path: &Path,
+    chunk_size: usize,
+    tmp_dir: &Path,
+    contig_csi: &super::csi::ContigCsiIndex,
+) -> io::Result<(BcfHeader, Vec<RegionResult>)> {
+    let header = read_header_only(path)?;
+    let nh = header.n_samples * 2;
+
+    let cps = &contig_csi.checkpoints;
+    if cps.is_empty() {
+        // No checkpoints but n_mapped > 0 — use first_offset to EOF
+        if contig_csi.n_mapped == 0 {
+            return Ok((header, vec![]));
+        }
+        // Fallback: scan from first_offset
+        let target_ref_id = contig_csi.ref_seq_id as i32;
+        let result = process_region(path, contig_csi.first_offset, 0, i64::MAX,
+            target_ref_id, header.gt_key_id, header.n_samples, nh, chunk_size, tmp_dir, 0)?;
+        return Ok((header, vec![result]));
+    }
+
+    let target_ref_id = contig_csi.ref_seq_id as i32;
+    let file_size = std::fs::metadata(path)?.len();
+
+    let mut by_offset: Vec<(u64, i64, VirtualPosition)> = cps.iter()
+        .map(|&(pos, vp)| (vp.compressed(), pos, vp))
+        .collect();
+    by_offset.sort_by_key(|&(off, _, _)| off);
+
+    let first_off = by_offset.first().map(|&(o, _, _)| o).unwrap_or(0);
+    let last_off = file_size;
+    let data_range = last_off.saturating_sub(first_off).max(1);
+
+    let n_threads = rayon::current_num_threads().max(1);
+    let segment_size = data_range / n_threads as u64;
+
+    let mut region_indices: Vec<usize> = Vec::with_capacity(n_threads);
+    for t in 0..n_threads {
+        let target = first_off + t as u64 * segment_size;
+        let idx = match by_offset.binary_search_by_key(&target, |&(off, _, _)| off) {
+            Ok(i) => i,
+            Err(0) => 0,
+            Err(i) => i - 1,
+        };
+        if region_indices.last() == Some(&idx) { continue; }
+        region_indices.push(idx);
+    }
+
+    let regions: Vec<(usize, VirtualPosition, i64, i64)> = region_indices.iter()
+        .enumerate()
+        .map(|(ti, &idx)| {
+            let (_, geo_pos, start_vp) = by_offset[idx];
+            let start_pos = if ti == 0 { 0i64 } else { geo_pos };
+            let end_pos = if ti + 1 < region_indices.len() {
+                by_offset[region_indices[ti + 1]].1
+            } else {
+                i64::MAX
+            };
+            (ti, start_vp, start_pos, end_pos)
+        })
+        .collect();
+
+    std::fs::create_dir_all(tmp_dir)?;
+
+    let pb = path.to_path_buf();
+    let gtk = header.gt_key_id;
+    let ns = header.n_samples;
+
+    let results: Vec<RegionResult> = regions
+        .par_iter()
+        .map(|&(ti, vp, sp, ep)| {
+            process_region(&pb, vp, sp, ep, target_ref_id, gtk, ns, nh, chunk_size, tmp_dir, ti)
+                .unwrap_or_else(|_| {
+                    RegionResult { meta_file: PathBuf::new(), chunk_files: Vec::new(), chunk_row_counts: Vec::new(), n_variants: 0 }
+                })
+        })
+        .collect();
+
+    Ok((header, results))
+}
+
 pub fn read_header_only(path: &Path) -> io::Result<BcfHeader> {
     let f = std::fs::File::open(path)?;
     let mut bgzf = noodles_bgzf::io::Reader::new(BufReader::with_capacity(64 << 10, f));
@@ -263,7 +346,9 @@ fn parse_header(buf: &[u8]) -> io::Result<BcfHeader> {
     for l in t.lines() {
         if l.starts_with("##contig=<ID=") {
             let s = "##contig=<ID=".len(); let e = l[s..].find([',', '>']).map(|p| s+p).unwrap_or(l.len());
-            cn.push(l[s..e].to_string()); if cf.is_empty() { cf = l.to_string(); }
+            cn.push(l[s..e].to_string());
+            if !cf.is_empty() { cf.push('\n'); }
+            cf.push_str(l);
         } else if l.starts_with("##FORMAT=<ID=GT,") {
             if let Some(p) = l.find("IDX=") { let s = p+4; let e = l[s..].find([',', '>']).map(|p| s+p).unwrap_or(l.len()); gk = l[s..e].parse().unwrap_or(0); }
         } else if l.starts_with("#CHROM") {

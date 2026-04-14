@@ -300,3 +300,183 @@ pub fn intersect_variants(srp: &SrpReader, targets: &[TargetMarker]) -> (Vec<usi
     // Already sorted by wgs_idx (ref is in genomic order, merge preserves it)
     (wgs_idx, target_idx)
 }
+
+// ---------------------------------------------------------------------------
+// Multi-chromosome VCF reading
+// ---------------------------------------------------------------------------
+
+/// Read a multi-chromosome target VCF once and partition markers+genotypes by chromosome.
+/// Returns (sample_names, per_chr_data, is_phased).
+pub fn read_target_vcf_multi_chr(
+    path: &str,
+) -> (Vec<String>, std::collections::BTreeMap<String, (Vec<TargetMarker>, Vec<Vec<[u8; 2]>>)>, bool) {
+    use std::io::Read;
+
+    let is_gz = path.ends_with(".gz") || path.ends_with(".bcf");
+    let file = std::fs::File::open(path)
+        .unwrap_or_else(|e| panic!("Cannot open {}: {}", path, e));
+
+    let mut raw = Vec::new();
+    if is_gz {
+        let mut bgzf = noodles_bgzf::io::Reader::new(std::io::BufReader::new(file));
+        bgzf.read_to_end(&mut raw).expect("Failed to decompress bgzf");
+    } else {
+        let mut reader = std::io::BufReader::new(file);
+        reader.read_to_end(&mut raw).expect("Failed to read VCF");
+    }
+
+    let mut all_markers: Vec<TargetMarker> = Vec::new();
+    let mut all_genotypes: Vec<Vec<[u8; 2]>> = Vec::new();
+    let mut is_phased = true;
+    let mut phase_checks = 10i32;
+    let mut sample_names: Vec<String> = Vec::new();
+
+    for line in raw.split(|&b| b == b'\n') {
+        if line.is_empty() || line.starts_with(b"##") { continue; }
+        if line.starts_with(b"#CHROM") {
+            let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
+            if fields.len() > 9 {
+                sample_names = fields[9..].iter()
+                    .map(|f| std::str::from_utf8(f).unwrap_or("").to_string())
+                    .collect();
+            }
+            continue;
+        }
+
+        let mut tabs = [0usize; 9];
+        let mut n_tabs = 0;
+        for (i, &b) in line.iter().enumerate() {
+            if b == b'\t' {
+                if n_tabs < 9 { tabs[n_tabs] = i; }
+                n_tabs += 1;
+                if n_tabs >= 9 { break; }
+            }
+        }
+        if n_tabs < 9 { continue; }
+
+        let pos: i64 = fast_parse_i64(&line[tabs[0]+1..tabs[1]]);
+        let ref_bytes = &line[tabs[2]+1..tabs[3]];
+        let alt_field = &line[tabs[3]+1..tabs[4]];
+        let alt_end = alt_field.iter().position(|&b| b == b',').unwrap_or(alt_field.len());
+        let alt_bytes = &alt_field[..alt_end];
+        if alt_bytes == b"." || alt_bytes.is_empty() { continue; }
+
+        let ref_allele = std::str::from_utf8(ref_bytes).unwrap_or("").to_string();
+        let alt_allele = std::str::from_utf8(alt_bytes).unwrap_or("").to_string();
+        let chrom = std::str::from_utf8(&line[..tabs[0]]).unwrap_or("").to_string();
+
+        all_markers.push(TargetMarker {
+            chrom, pos,
+            ref_allele: ref_allele.clone(), alt_allele: alt_allele.clone(),
+            ref_hash: ref_allele, alt_hash: alt_allele,
+        });
+
+        let n_samples = sample_names.len();
+        let mut var_gts = Vec::with_capacity(n_samples);
+        let gt_region = &line[tabs[8]+1..];
+        let mut field_start = 0;
+        for _s in 0..n_samples {
+            let field_end = gt_region[field_start..].iter()
+                .position(|&b| b == b'\t')
+                .map(|p| field_start + p)
+                .unwrap_or(gt_region.len());
+            let field = &gt_region[field_start..field_end];
+            let gt_end = field.iter().position(|&b| b == b':').unwrap_or(field.len());
+            let gt = &field[..gt_end];
+
+            if phase_checks > 0 {
+                if gt.contains(&b'/') { is_phased = false; }
+                phase_checks -= 1;
+            }
+
+            let (a0, a1) = if gt.len() >= 3 {
+                let b0 = gt[0]; let b1 = gt[2];
+                (if b0.is_ascii_digit() { b0 - b'0' } else { 0 },
+                 if b1.is_ascii_digit() { b1 - b'0' } else { 0 })
+            } else {
+                (0, 0)
+            };
+            var_gts.push([a0, a1]);
+            field_start = if field_end < gt_region.len() { field_end + 1 } else { gt_region.len() };
+        }
+        all_genotypes.push(var_gts);
+    }
+
+    // Partition by chromosome
+    let mut by_chr: std::collections::BTreeMap<String, (Vec<TargetMarker>, Vec<Vec<[u8; 2]>>)> =
+        std::collections::BTreeMap::new();
+    for (marker, gts) in all_markers.into_iter().zip(all_genotypes.into_iter()) {
+        let chr = strip_chr_prefix(&marker.chrom).to_string();
+        let entry = by_chr.entry(chr).or_insert_with(|| (Vec::new(), Vec::new()));
+        entry.0.push(marker);
+        entry.1.push(gts);
+    }
+
+    (sample_names, by_chr, is_phased)
+}
+
+fn strip_chr_prefix(s: &str) -> &str {
+    s.strip_prefix("chr").unwrap_or(s)
+}
+
+// ---------------------------------------------------------------------------
+// Generic variant intersection (works with any variant list + chromosome)
+// ---------------------------------------------------------------------------
+
+/// Intersect target markers with a reference variant list for a given chromosome.
+/// Same logic as `intersect_variants` but works with raw variant/ID slices.
+pub fn intersect_variants_for_chr(
+    ref_chromosome: &str,
+    ref_variants: &[crate::srp::Variant],
+    ref_ids: &[String],
+    targets: &[TargetMarker],
+) -> (Vec<usize>, Vec<usize>) {
+    fn strip_chr(c: &str) -> &str {
+        if let Some(stripped) = c.strip_prefix("chr") { stripped } else { c }
+    }
+    let ref_chrom = strip_chr(ref_chromosome);
+
+    let hash_alleles = !ref_ids.is_empty() && {
+        let first_ref = &ref_variants[0].ref_allele;
+        !ref_ids[0].contains(first_ref)
+    };
+
+    // Prepare target markers with correct hash if needed
+    let targets_with_hash: Vec<TargetMarker> = if hash_alleles {
+        targets.iter().map(|t| TargetMarker {
+            chrom: t.chrom.clone(), pos: t.pos,
+            ref_allele: t.ref_allele.clone(), alt_allele: t.alt_allele.clone(),
+            ref_hash: crate::srp::blake2b_hex(&t.ref_allele),
+            alt_hash: crate::srp::blake2b_hex(&t.alt_allele),
+        }).collect()
+    } else {
+        targets.to_vec()
+    };
+    let targets_ref = &targets_with_hash;
+
+    let mut tgt_order: Vec<usize> = (0..targets_ref.len())
+        .filter(|&i| strip_chr(&targets_ref[i].chrom) == ref_chrom)
+        .collect();
+    tgt_order.sort_by_key(|&i| targets_ref[i].pos);
+
+    let mut wgs_idx = Vec::with_capacity(targets_ref.len());
+    let mut target_idx = Vec::with_capacity(targets_ref.len());
+    let mut ri = 0usize;
+
+    for &ti in &tgt_order {
+        let tpos = targets_ref[ti].pos;
+        while ri < ref_variants.len() && ref_variants[ri].pos < tpos { ri += 1; }
+        let mut rj = ri;
+        while rj < ref_variants.len() && ref_variants[rj].pos == tpos {
+            if ref_variants[rj].ref_allele == targets_ref[ti].ref_hash
+                && ref_variants[rj].alt_allele == targets_ref[ti].alt_hash {
+                wgs_idx.push(rj);
+                target_idx.push(ti);
+                break;
+            }
+            rj += 1;
+        }
+    }
+
+    (wgs_idx, target_idx)
+}

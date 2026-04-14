@@ -19,11 +19,48 @@ pub mod bref3_writer;
 pub mod bcf_reader;
 pub mod csi;
 pub mod tiled;
+pub mod multi_chr_reader;
+pub mod multi_chr_writer;
 pub use reader::SrpReader;
+pub use multi_chr_reader::{MultiChrSrpReader, ChrSrpView};
 
 use std::collections::HashMap;
 use std::io::Cursor;
 use serde_json::Value as JsonValue;
+
+// ---------------------------------------------------------------------------
+// SRP version constants
+// ---------------------------------------------------------------------------
+
+/// Magic bytes for SRP v2 (single-chromosome).
+pub const SRP_V2_MAGIC: &[u8; 8] = b"SRP\x00\x02\x00\x00\x00";
+
+/// Magic bytes for SRP v3 (multi-chromosome).
+pub const SRP_V3_MAGIC: &[u8; 8] = b"SRP\x00\x03\x00\x00\x00";
+
+// ---------------------------------------------------------------------------
+// Multi-chromosome SRP types
+// ---------------------------------------------------------------------------
+
+/// Global metadata for a multi-chromosome SRP v3 file.
+#[derive(Debug, Clone)]
+pub struct GlobalSrpMetadata {
+    pub n_chromosomes: usize,
+    pub n_haps: usize,
+    pub n_samples: usize,
+    pub chromosomes: Vec<String>,
+    pub contig_fields: String,
+}
+
+/// Per-chromosome directory entry in an SRP v3 file.
+/// Fixed-size (32 bytes) for O(1) seeking.
+#[derive(Debug, Clone)]
+pub struct ChrDirectoryEntry {
+    pub chr_name: String,
+    pub data_offset: u64,
+    pub n_variants: u32,
+    pub n_tiles: u32,
+}
 
 // ---------------------------------------------------------------------------
 // CSC chunk — the core sparse representation

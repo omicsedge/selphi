@@ -73,11 +73,79 @@ pub fn load_genetic_map_raw(map_path: &Path) -> std::io::Result<(Vec<i64>, Vec<f
     Ok((sorted_bp, sorted_cm))
 }
 
+// ---------------------------------------------------------------------------
+// Multi-chromosome genetic map
+// ---------------------------------------------------------------------------
+
+/// Load a unified multi-chromosome genetic map.
+/// Parses a PLINK-format map file with chromosome column (col 0) and groups
+/// entries by chromosome. Returns a BTreeMap from chromosome name to (bp, cM) arrays.
+pub fn load_genetic_map_multi_chr(
+    map_path: &Path,
+) -> std::io::Result<std::collections::BTreeMap<String, (Vec<i64>, Vec<f64>)>> {
+    let content = std::fs::read_to_string(map_path)?;
+    let mut by_chr: std::collections::BTreeMap<String, Vec<(i64, f64)>> = std::collections::BTreeMap::new();
+
+    for line in content.lines() {
+        if line.starts_with('#') || line.trim().is_empty() { continue; }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() >= 4 {
+            // PLINK format: chr id cM bp
+            let chr = strip_chr(fields[0]).to_string();
+            let cm: f64 = fields[2].parse().unwrap_or(0.0);
+            let bp: i64 = fields[3].parse().unwrap_or(0);
+            by_chr.entry(chr).or_default().push((bp, cm));
+        }
+    }
+
+    let mut result = std::collections::BTreeMap::new();
+    for (chr, mut entries) in by_chr {
+        entries.sort_by_key(|&(bp, _)| bp);
+        let bps: Vec<i64> = entries.iter().map(|&(bp, _)| bp).collect();
+        let cms: Vec<f64> = entries.iter().map(|&(_, cm)| cm).collect();
+        result.insert(chr, (bps, cms));
+    }
+
+    Ok(result)
+}
+
+/// Interpolate cM coordinates for a specific chromosome from a pre-loaded multi-chr map.
+pub fn interpolate_for_chr(
+    multi_map: &std::collections::BTreeMap<String, (Vec<i64>, Vec<f64>)>,
+    chr: &str,
+    chip_bps: &[i64],
+) -> Vec<f64> {
+    let key = strip_chr(chr);
+    if let Some((map_bp, map_cm)) = multi_map.get(key) {
+        chip_bps.iter().map(|&bp| interpolate_cm(map_bp, map_cm, bp)).collect()
+    } else {
+        // Try with and without "chr" prefix
+        let alt = if chr.starts_with("chr") { &chr[3..] } else { &format!("chr{}", chr) };
+        if let Some((map_bp, map_cm)) = multi_map.get(alt) {
+            chip_bps.iter().map(|&bp| interpolate_cm(map_bp, map_cm, bp)).collect()
+        } else {
+            vec![0.0; chip_bps.len()]
+        }
+    }
+}
+
+/// Load raw genetic map grouped by chromosome.
+pub fn load_genetic_map_raw_multi_chr(
+    map_path: &Path,
+) -> std::io::Result<std::collections::BTreeMap<String, (Vec<i64>, Vec<f64>)>> {
+    load_genetic_map_multi_chr(map_path)
+}
+
+/// Strip "chr" prefix for normalization.
+fn strip_chr(s: &str) -> &str {
+    s.strip_prefix("chr").unwrap_or(s)
+}
+
 /// Linear interpolation of a single BP position.
 ///
-/// Default: clamp to map range (safe for imputation, used by chip phasing).
+/// Clamps to map range (safe for imputation, used by chip phasing).
 /// For WGS phasing, use `interpolate_cm_extrapolate` which extrapolates.
-fn interpolate_cm(map_bp: &[i64], map_cm: &[f64], bp: i64) -> f64 {
+pub fn interpolate_cm(map_bp: &[i64], map_cm: &[f64], bp: i64) -> f64 {
     interpolate_cm_impl(map_bp, map_cm, bp, false)
 }
 
