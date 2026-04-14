@@ -20,6 +20,9 @@ pub struct WindowHmmParams {
     pub est_ne: f64,
     pub p_err: f64,
     pub max_candidates: usize,
+    /// For augmented panels: number of WGS haplotypes (candidates with index >= this are chip-only
+    /// and must be filtered before HMM). None = no filtering (standard panel).
+    pub n_wgs_filter: Option<usize>,
 }
 
 /// Result of processing one imputation window.
@@ -83,11 +86,15 @@ pub fn process_window_hmm(
         .into_par_iter()
         .map(|tgt| {
             let prior = hap_priors[tgt].as_deref();
-            let candidates = if let Some(pc) = precomputed_candidates {
+            let mut candidates = if let Some(pc) = precomputed_candidates {
                 pc[tgt].clone()
             } else {
                 pbwt::select_candidates(coded, n_ref + tgt, n_ref, 7, max_candidates)
             };
+            // Filter out chip-only haplotypes if augmented panel
+            if let Some(n_wgs) = params.n_wgs_filter {
+                candidates.retain(|&c| (c as usize) < n_wgs);
+            }
             let n_cand = candidates.len();
             let m_red = if n_cand < 100 { m } else { n_cand + 1 };
             let is_full = n_cand < 100;

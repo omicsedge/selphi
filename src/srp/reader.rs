@@ -304,4 +304,41 @@ impl SrpReader {
         }
         crate::common::HaplotypeBitmatrix::from_raw(bits, n_chip, n_haps)
     }
+
+    /// Extract augmented bitmatrix: WGS haplotypes from tiles + chip haplotypes from allele array.
+    /// Returns a bitmatrix with n_wgs + n_chip_haps columns at chip positions only.
+    /// Used for phasing and PBWT candidate selection with mixed-density panels.
+    pub fn extract_augmented_bitmatrix(
+        &self,
+        wgs_idx: &[usize],
+        chip_alleles: &[u8],  // (n_chip × n_chip_haps) row-major phased alleles
+        n_chip_haps: usize,
+    ) -> crate::common::HaplotypeBitmatrix {
+        let n_chip = wgs_idx.len();
+        let n_wgs = self.metadata.n_haps;
+        let n_total = n_wgs + n_chip_haps;
+        let n_words = n_total.div_ceil(64);
+        let mut bits = vec![0u64; n_chip * n_words];
+
+        // Fill WGS part from tiles (same as extract_ref_alleles_bitmatrix)
+        let wgs_bm = self.extract_ref_alleles_bitmatrix(wgs_idx);
+        let wgs_words = n_wgs.div_ceil(64);
+        for ci in 0..n_chip {
+            let src = wgs_bm.row(ci);
+            bits[ci * n_words..ci * n_words + wgs_words].copy_from_slice(src);
+        }
+
+        // Fill chip part from chip_alleles array
+        for ci in 0..n_chip {
+            for h in 0..n_chip_haps {
+                if chip_alleles[ci * n_chip_haps + h] != 0 {
+                    let gh = n_wgs + h; // global haplotype index (after WGS)
+                    let wi = gh / 64;
+                    bits[ci * n_words + wi] |= 1u64 << (gh % 64);
+                }
+            }
+        }
+
+        crate::common::HaplotypeBitmatrix::from_raw(bits, n_chip, n_total)
+    }
 }

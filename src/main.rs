@@ -216,6 +216,19 @@ struct Args {
     #[arg(long)]
     merge_srps_dir: Option<String>,
 
+    /// Create a mixed-density panel by merging WGS + chip data into a single SRP.
+    /// Chip haplotypes are used to improve phasing and candidate selection.
+    #[arg(long)]
+    prepare_merged_panel: bool,
+
+    /// WGS reference panel (.srp) for --prepare-merged-panel.
+    #[arg(long)]
+    wgs: Option<String>,
+
+    /// Chip genotype data (VCF/BCF, phased or unphased) for --prepare-merged-panel.
+    #[arg(long)]
+    chip: Option<String>,
+
 }
 
 fn main() {
@@ -374,6 +387,37 @@ fn main() {
 
         let mem = selphi::log::peak_mem_mb();
         selphi_info!("\nPeak memory: {:.0} MB", mem);
+        return;
+    }
+
+    // --- Build merged (mixed-density) panel ---
+    if args.prepare_merged_panel {
+        let wgs = args.wgs.as_ref().expect("--wgs required with --prepare-merged-panel");
+        let chip = args.chip.as_ref().expect("--chip required with --prepare-merged-panel");
+        let map = args.map_path.as_ref().expect("--map required with --prepare-merged-panel");
+        let output = args.out.as_deref().unwrap_or("merged_panel");
+
+        let log_path = PathBuf::from(output).with_extension("log");
+        selphi::log::init(&log_path, args.debug);
+        selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
+        selphi_info!("  mode:     prepare-merged-panel");
+        selphi_info!("  wgs:      {}", wgs);
+        selphi_info!("  chip:     {}", chip);
+        selphi_info!("  map:      {}", map);
+        selphi_info!("  output:   {}", output);
+        selphi_info!("  threads:  {}", args.threads);
+        selphi_info!("  log:      {}\n", log_path.display());
+
+        rayon::ThreadPoolBuilder::new().num_threads(args.threads).build_global().ok();
+        let start_time = Instant::now();
+
+        selphi::srp::merged_panel_writer::build_merged_panel(
+            Path::new(wgs), Path::new(chip), Path::new(map), Path::new(output), args.threads,
+        ).unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
+
+        let total = start_time.elapsed().as_secs_f64();
+        let mem = selphi::log::peak_mem_mb();
+        selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB", total, mem);
         return;
     }
 
@@ -570,7 +614,12 @@ fn main() {
     let n_ref_variants = srp.n_variants();
     let n_ref = srp.n_haps();
     let ref_positions: Vec<i64> = srp.variants.iter().map(|v| v.pos).collect();
-    selphi_step!("Loaded SRP: {} variants, {} haplotypes", n_ref_variants, n_ref);
+    if srp.has_augment() {
+        selphi_step!("Loaded SRP: {} variants, {} WGS + {} chip haplotypes (mixed-density panel)",
+            n_ref_variants, srp.wgs_haplotypes(), srp.chip_haplotypes());
+    } else {
+        selphi_step!("Loaded SRP: {} variants, {} haplotypes", n_ref_variants, n_ref);
+    }
 
     // 2. Read target VCF: sample names, variants, genotypes
     let (sample_names, target_markers, target_genotypes, is_phased) =
@@ -1087,6 +1136,7 @@ fn main() {
         let hmm_params = selphi::imputation::window_process::WindowHmmParams {
             n_ref, n_haps, match_length, fl_fwd, fl_bwd,
             est_ne: est_ne as f64, p_err, max_candidates,
+            n_wgs_filter: if srp.has_augment() { Some(srp.wgs_haplotypes()) } else { None },
         };
         let hmm_output = selphi::imputation::window_process::process_window_hmm(
             &hmm_params, &ref_bm_imp, &ref_w, &targ_w, cm_w,
