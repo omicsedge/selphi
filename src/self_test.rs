@@ -124,7 +124,7 @@ fn validate_index(path: &Path) -> Result<(String, usize), String> {
 }
 
 /// Check that a file exists and has non-zero size.
-fn check_file(name: &str, path: &Path, pass: &mut u32, fail: &mut u32) -> bool {
+fn check_file(name: &str, path: &Path, _pass: &mut u32, fail: &mut u32) -> bool {
     if path.exists() {
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         if size > 0 {

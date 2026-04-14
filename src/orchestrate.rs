@@ -460,9 +460,12 @@ pub fn run_multi_chr(
             if srp.n_chip_only_variants() > 0 && !srp.chip_only_alleles.is_empty() {
                 let chip_only_positions: Vec<i64> = srp.chip_only_variants.iter().map(|v| v.pos).collect();
                 let shared_positions: Vec<i64> = wgs_idx.iter().map(|&wi| srp.variants[wi].pos).collect();
+                // NOTE: chip_alleles should come from the augment section of the SRP,
+                // NOT from targ_alleles. Currently placeholder until reader loads augment tiles.
+                let chip_shared_alleles = Vec::new(); // TODO: load from srp augment tiles
                 let co_result = selphi::imputation::chip_only_interp::interpolate_chip_only_variants(
                     &all_weights, &ref_bm_imp,
-                    &targ_alleles, // chip_alleles at shared positions (from augment)
+                    &chip_shared_alleles,
                     srp.chip_haplotypes(),
                     &srp.chip_only_alleles,
                     &chip_only_positions,
@@ -481,6 +484,11 @@ pub fn run_multi_chr(
 
             selphi_info!("    Window {}/{}: {} vars", wi + 1, windows.len(), n_var_w);
         }
+
+        // Free per-chr data before loading next
+        drop(ref_bm_imp);
+        drop(targ_alleles);
+        drop(srp);
 
         // Join prefetch for next chromosome (was running during our windows)
         if let Some(handle) = prefetch_handle {

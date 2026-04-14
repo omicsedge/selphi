@@ -110,6 +110,7 @@ impl CoverageBitvector {
 
     /// Set the coverage for variant i.
     pub fn set(&mut self, i: usize, coverage: VariantCoverage) {
+        assert!(i < self.n_variants, "CoverageBitvector::set: index {} out of bounds ({})", i, self.n_variants);
         let val: u8 = match coverage {
             VariantCoverage::WgsOnly => 0,
             VariantCoverage::Shared => 1,
@@ -122,6 +123,7 @@ impl CoverageBitvector {
 
     /// Get the coverage for variant i.
     pub fn get(&self, i: usize) -> VariantCoverage {
+        if i >= self.n_variants { return VariantCoverage::WgsOnly; }
         let byte_idx = (i * 2) / 8;
         let bit_offset = (i * 2) % 8;
         match (self.data[byte_idx] >> bit_offset) & 3 {

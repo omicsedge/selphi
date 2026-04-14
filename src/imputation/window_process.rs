@@ -96,6 +96,9 @@ pub fn process_window_hmm(
                 candidates.retain(|&c| (c as usize) < n_wgs);
             }
             let n_cand = candidates.len();
+            if n_cand == 0 {
+                return (tgt, HmmResult { weights: Vec::new(), hap_posterior: None });
+            }
             let m_red = if n_cand < 100 { m } else { n_cand + 1 };
             let is_full = n_cand < 100;
 

@@ -537,7 +537,7 @@ fn main() {
             eprintln!("ERROR: --map or --map-dir is required with multi-chr SRP");
             std::process::exit(1);
         }
-        let map_path = args.map_path.as_deref().unwrap_or("");
+        let map_path = args.map_path.as_deref().unwrap_or("unused"); // only used if --map-dir not set
 
         let log_path = PathBuf::from(output_path).with_extension("log");
         selphi::log::init(&log_path, args.debug);
@@ -698,7 +698,6 @@ fn main() {
         // For full pipeline, kept alive for imputation LD correction + candidates.
         let ref_bm_full = if !args.phase_only || engine != ResolvedEngine::Diploid {
             let bm = srp.extract_ref_alleles_bitmatrix(&wgs_idx);
-             // Free decompressed chunk cache (re-loaded on demand for output)
             selphi_step!("Ref bitmatrix extracted ({} chip × {} haps, {:.1} MB)",
                 n_chip, n_ref, (bm.n_words() * n_chip * 8) as f64 / 1e6);
             Some(bm)
@@ -1017,7 +1016,7 @@ fn main() {
     };
 
     // ref_bm_imp stays alive for per-window imputation extraction.
-    // Per-window byte arrays are still extracted from SRP (riga 595).
+    // ref_bm_imp stays alive for per-window imputation (bitmatrix extraction + candidate selection).
 
     // 11. Process each window: PBWT → HMM, then overlap VCF write with next window's PBWT.
     // Cross-window HMM state passthrough: forward state from window N → prior for window N+1
@@ -1178,9 +1177,10 @@ fn main() {
         if srp.n_chip_only_variants() > 0 && !srp.chip_only_alleles.is_empty() {
             let chip_only_positions: Vec<i64> = srp.chip_only_variants.iter().map(|v| v.pos).collect();
             let shared_positions: Vec<i64> = wgs_idx.iter().map(|&wi| ref_positions[wi]).collect();
+            let chip_shared_alleles = Vec::new(); // TODO: load from srp augment tiles
             let co_result = selphi::imputation::chip_only_interp::interpolate_chip_only_variants(
                 &all_weights, &ref_bm_imp,
-                &targ_alleles,
+                &chip_shared_alleles,
                 srp.chip_haplotypes(),
                 &srp.chip_only_alleles,
                 &chip_only_positions,

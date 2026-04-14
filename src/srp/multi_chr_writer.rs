@@ -542,12 +542,10 @@ pub fn merge_single_chr_srps(
                 format!("Sample count mismatch: chr{} has {} samples, expected {}",
                     chr, r.sample_ids.len(), n_samples)));
         }
-        // Check first and last sample names match
-        if !r.sample_ids.is_empty() && !ref_samples.is_empty() {
-            if r.sample_ids[0] != ref_samples[0] || r.sample_ids[n_samples - 1] != ref_samples[n_samples - 1] {
-                return Err(io::Error::new(io::ErrorKind::InvalidData,
-                    format!("Sample names mismatch between chr{} and chr{}", chr, readers[0].0)));
-            }
+        // Check all sample names match
+        if r.sample_ids != *ref_samples {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("Sample names mismatch between chr{} and chr{}", chr, readers[0].0)));
         }
     }
 
