@@ -13,6 +13,7 @@
 //! Boolean data is implicit (all True) — not stored.
 
 mod reader;
+pub mod helpers;
 pub mod writer;
 pub mod bref3;
 pub mod bref3_writer;

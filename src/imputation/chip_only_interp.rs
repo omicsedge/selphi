@@ -121,30 +121,22 @@ pub fn interpolate_chip_only_variants(
 
     let n_co_in_window = variant_indices.len();
 
-    // Compute dosages: output shape is (n_co_in_window × n_target_haps), row-major.
-    // Variant is the outer dimension so write_chip_only_vcf can iterate variants then samples.
-    let mut dosages = vec![0.0f32; n_co_in_window * n_target_haps];
-
-    // Process each target haplotype
-    let dosages_ptr = dosages.as_mut_ptr() as usize;
-    let dosages_len = dosages.len();
+    // Compute dosages: each thread produces (tgt, Vec<f32 per variant>), then merge.
+    // Output shape: (n_co_in_window × n_target_haps), row-major.
     let vi_ref = &variant_indices;
 
-    (0..n_target_haps).into_par_iter().for_each(|tgt| {
+    let per_hap: Vec<(usize, Vec<f32>)> = (0..n_target_haps).into_par_iter().filter_map(|tgt| {
         let weights = &all_weights[tgt];
-        if weights.is_empty() { return; }
+        if weights.is_empty() { return None; }
         let w = &weights[0].1;
+        if w.indptr.len() < 2 { return None; }
 
-        // Use first and last chip positions in window (relative to window, 0-based)
-        // CsrWeights.indptr is indexed by window-relative chip variant index
-        if w.indptr.len() < 2 { return; }
-        let last_chip = w.indptr.len() - 2; // last valid indptr index
+        let last_chip = w.indptr.len() - 2;
         let s1 = w.indptr[0] as usize;
         let e1 = w.indptr[1] as usize;
         let s2 = w.indptr[last_chip] as usize;
         let e2 = w.indptr[last_chip + 1] as usize;
 
-        // Collect unique WGS candidates with their average weights
         let mut cand_weights: Vec<(u32, f64)> = Vec::new();
         for i in s1..e1.min(w.indices.len()) {
             cand_weights.push((w.indices[i] as u32, w.data[i] as f64));
@@ -158,31 +150,37 @@ pub fn interpolate_chip_only_variants(
                 cand_weights.push((h, wt));
             }
         }
-        if cand_weights.is_empty() { return; }
+        if cand_weights.is_empty() { return None; }
 
-        // Build WGS→chip proxy mapping
         let wgs_cands: Vec<u32> = cand_weights.iter().map(|(h, _)| *h).collect();
         let proxies = build_wgs_to_chip_proxy(
             wgs_bm, chip_alleles, n_chip_haps, &wgs_cands,
             window_chip_start, window_chip_end,
         );
 
-        // Normalize weights
         let total_w: f64 = cand_weights.iter().map(|(_, w)| *w).sum();
         let norm = if total_w > 0.0 { 1.0 / total_w } else { 0.0 };
 
-        // Write dosages: (variant_idx, haplotype) layout
-        let ds = unsafe { std::slice::from_raw_parts_mut(dosages_ptr as *mut f32, dosages_len) };
-        for (vi, &co_idx) in vi_ref.iter().enumerate() {
+        let hap_dosages: Vec<f32> = vi_ref.iter().map(|&co_idx| {
             let mut dosage = 0.0f64;
             for (k, (_, wt)) in cand_weights.iter().enumerate() {
                 let chip_proxy = proxies[k];
                 let allele = chip_only_alleles[co_idx * n_chip_haps + chip_proxy] as f64;
                 dosage += wt * norm * allele;
             }
-            ds[vi * n_target_haps + tgt] = dosage as f32;
+            dosage as f32
+        }).collect();
+
+        Some((tgt, hap_dosages))
+    }).collect();
+
+    // Merge per-haplotype results into (n_co × n_haps) row-major array
+    let mut dosages = vec![0.0f32; n_co_in_window * n_target_haps];
+    for (tgt, hap_dosages) in per_hap {
+        for (vi, &d) in hap_dosages.iter().enumerate() {
+            dosages[vi * n_target_haps + tgt] = d;
         }
-    });
+    }
 
     ChipOnlyResult { dosages, variant_indices }
 }

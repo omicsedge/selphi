@@ -51,17 +51,8 @@ impl SrpReader {
         }
 
         let mut buf4 = [0u8; 4];
-        let read_section = |f: &mut File| -> std::io::Result<Vec<u8>> {
-            let mut b = [0u8; 4];
-            f.read_exact(&mut b)?;
-            let len = u32::from_le_bytes(b) as usize;
-            let mut data = vec![0u8; len];
-            f.read_exact(&mut data)?;
-            Ok(data)
-        };
-
         // Header
-        let hdr_comp = read_section(&mut f)?;
+        let hdr_comp = super::helpers::read_section(&mut f)?;
         let hdr_raw = zstd::decode_all(Cursor::new(&hdr_comp))
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let hdr: JsonValue = serde_json::from_slice(&hdr_raw)
@@ -69,19 +60,19 @@ impl SrpReader {
         let metadata = SrpMetadata::from_json(&hdr);
 
         // Variants
-        let vcomp = read_section(&mut f)?;
+        let vcomp = super::helpers::read_section(&mut f)?;
         let vraw = zstd::decode_all(Cursor::new(&vcomp))
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let variants = Self::parse_variants_bin(&vraw, metadata.n_variants);
+        let variants = super::helpers::parse_variants_bin(&vraw, metadata.n_variants);
 
         // Sample IDs, IDs, Original IDs
-        let sample_ids = Self::decode_strings(&read_section(&mut f)?, false);
-        let ids = Self::decode_strings(&read_section(&mut f)?, true);
-        let orig = Self::decode_strings(&read_section(&mut f)?, true);
+        let sample_ids = super::helpers::decode_strings(&super::helpers::read_section(&mut f)?, false);
+        let ids = super::helpers::decode_strings(&super::helpers::read_section(&mut f)?, true);
+        let orig = super::helpers::decode_strings(&super::helpers::read_section(&mut f)?, true);
         let original_ids = if orig.len() == metadata.n_variants { orig } else { ids.clone() };
 
         // Contig field (skip)
-        let _ = read_section(&mut f)?;
+        let _ = super::helpers::read_section(&mut f)?;
 
         // Chunk index
         f.read_exact(&mut buf4)?;
@@ -150,7 +141,10 @@ impl SrpReader {
             }
             match Self::load_augment_section(&mut f, aug, &hdr, &filepath) {
                 Ok(result) => result,
-                Err(_) => (None, None, Vec::new(), Vec::new()),
+                Err(e) => {
+                    crate::selphi_info!("  WARNING: Failed to load augment section from {}: {}. Continuing without augment.", filepath, e);
+                    (None, None, Vec::new(), Vec::new())
+                }
             }
         } else {
             (None, None, Vec::new(), Vec::new())
@@ -196,24 +190,15 @@ impl SrpReader {
         Vec<super::Variant>,
         Vec<u8>,
     )> {
-        let read_sec = |file: &mut File| -> std::io::Result<Vec<u8>> {
-            let mut b = [0u8; 4];
-            file.read_exact(&mut b)?;
-            let len = u32::from_le_bytes(b) as usize;
-            let mut data = vec![0u8; len];
-            file.read_exact(&mut data)?;
-            Ok(data)
-        };
-
         // Coverage bitvector
-        let cov_comp = read_sec(f)?;
+        let cov_comp = super::helpers::read_section(f)?;
         let cov_raw = zstd::decode_all(Cursor::new(&cov_comp))
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let n_variants = aug.total_variants;
         let coverage = super::CoverageBitvector::from_bytes(cov_raw, n_variants);
 
         // Shared variant indices (skip)
-        let _ = read_sec(f)?;
+        let _ = super::helpers::read_section(f)?;
 
         // Augment tile index
         let mut buf4 = [0u8; 4];
@@ -243,12 +228,12 @@ impl SrpReader {
         f.read_exact(&mut buf4)?;
         let n_co = u32::from_le_bytes(buf4) as usize;
         let (co_vars, co_alleles) = if n_co > 0 {
-            let co_vbin_comp = read_sec(f)?;
+            let co_vbin_comp = super::helpers::read_section(f)?;
             let co_vbin_raw = zstd::decode_all(Cursor::new(&co_vbin_comp))
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            let co_variants = Self::parse_variants_bin(&co_vbin_raw, n_co);
-            let _ = read_sec(f)?; // IDs
-            let co_alleles_comp = read_sec(f)?;
+            let co_variants = super::helpers::parse_variants_bin(&co_vbin_raw, n_co);
+            let _ = super::helpers::read_section(f)?; // IDs
+            let co_alleles_comp = super::helpers::read_section(f)?;
             let co_alleles = zstd::decode_all(Cursor::new(&co_alleles_comp))
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             (co_variants, co_alleles)
@@ -257,38 +242,6 @@ impl SrpReader {
         };
 
         Ok((Some(coverage), augment_tiled, co_vars, co_alleles))
-    }
-
-    // ======================================================================
-    // Helpers
-    // ======================================================================
-
-    fn parse_variants_bin(data: &[u8], n: usize) -> Vec<Variant> {
-        let mut out = Vec::with_capacity(n);
-        let mut off = 0;
-        for _ in 0..n {
-            if off + 11 > data.len() { break; }
-            let pos = i64::from_le_bytes(data[off..off+8].try_into().unwrap());
-            let cl = data[off+8] as usize;
-            let rl = data[off+9] as usize;
-            let al = data[off+10] as usize;
-            off += 11;
-            let chr = std::str::from_utf8(&data[off..off+cl]).unwrap_or("").to_string(); off += cl;
-            let ref_allele = std::str::from_utf8(&data[off..off+rl]).unwrap_or("").to_string(); off += rl;
-            let alt_allele = std::str::from_utf8(&data[off..off+al]).unwrap_or("").to_string(); off += al;
-            out.push(Variant { chr, pos, ref_allele, alt_allele });
-        }
-        out
-    }
-
-    fn decode_strings(compressed: &[u8], filter_empty: bool) -> Vec<String> {
-        let raw = zstd::decode_all(Cursor::new(compressed)).unwrap_or_default();
-        let s = String::from_utf8_lossy(&raw);
-        if filter_empty {
-            s.split('\n').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
-        } else {
-            s.split('\n').map(|s| s.to_string()).collect()
-        }
     }
 
     // ======================================================================
