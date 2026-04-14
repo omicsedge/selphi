@@ -1173,6 +1173,30 @@ fn main() {
             selfdecode_writer.as_mut(),
             &vcf_tx,
         ).expect("Output write failed");
+
+        // Chip-only variant interpolation (if augmented panel)
+        if srp.n_chip_only_variants() > 0 && !srp.chip_only_alleles.is_empty() {
+            let chip_only_positions: Vec<i64> = srp.chip_only_variants.iter().map(|v| v.pos).collect();
+            let shared_positions: Vec<i64> = wgs_idx.iter().map(|&wi| ref_positions[wi]).collect();
+            let co_result = selphi::imputation::chip_only_interp::interpolate_chip_only_variants(
+                &all_weights, &ref_bm_imp,
+                &targ_alleles,
+                srp.chip_haplotypes(),
+                &srp.chip_only_alleles,
+                &chip_only_positions,
+                &shared_positions,
+                window.own_chip_start,
+                window.own_chip_end,
+                n_haps,
+            );
+            if !co_result.variant_indices.is_empty() {
+                selphi::io::pipeline::write_chip_only_vcf(
+                    &co_result, &srp.chip_only_variants,
+                    n_samples, no_ap, &vcf_tx,
+                ).expect("Chip-only output failed");
+            }
+        }
+
         let interp_secs = t0_interp.elapsed().as_secs_f64();
 
         let n_win = windows.len();

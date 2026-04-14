@@ -456,6 +456,29 @@ pub fn run_multi_chr(
                 &vcf_tx,
             ).expect("Output write failed");
 
+            // Chip-only variant interpolation (if augmented panel has chip-only variants)
+            if srp.n_chip_only_variants() > 0 && !srp.chip_only_alleles.is_empty() {
+                let chip_only_positions: Vec<i64> = srp.chip_only_variants.iter().map(|v| v.pos).collect();
+                let shared_positions: Vec<i64> = wgs_idx.iter().map(|&wi| srp.variants[wi].pos).collect();
+                let co_result = selphi::imputation::chip_only_interp::interpolate_chip_only_variants(
+                    &all_weights, &ref_bm_imp,
+                    &targ_alleles, // chip_alleles at shared positions (from augment)
+                    srp.chip_haplotypes(),
+                    &srp.chip_only_alleles,
+                    &chip_only_positions,
+                    &shared_positions,
+                    window.own_chip_start,
+                    window.own_chip_end,
+                    n_haps,
+                );
+                if !co_result.variant_indices.is_empty() {
+                    selphi::io::pipeline::write_chip_only_vcf(
+                        &co_result, &srp.chip_only_variants,
+                        n_samples, config.no_ap, &vcf_tx,
+                    ).expect("Chip-only output failed");
+                }
+            }
+
             selphi_info!("    Window {}/{}: {} vars", wi + 1, windows.len(), n_var_w);
         }
 
