@@ -110,7 +110,8 @@ selphi --prepare-reference-from /path/to/bcfs/ --out all_chromosomes --threads 1
 cat chr1.map chr2.map ... chr22.map > all_chromosomes.map
 selphi --refpanel all.srp --input input.vcf.gz --map all_chromosomes.map --out result
 
-# Option B: directory of per-chromosome maps (auto-discovers chr{N}.map files)
+# Option B: directory of per-chromosome maps
+# Auto-discovers common patterns: chr{N}.map, plink.chr{N}.GRCh38.map, etc.
 selphi --refpanel all.srp --input input.vcf.gz --map-dir /path/to/maps/ --out result
 ```
 
@@ -315,7 +316,7 @@ Standard VCF or BCF. Unphased (`0/1`) or phased (`0|1`) genotypes. Multi-allelic
 | `--index-stats PATH` | Show file statistics and per-contig genomic ranges | |
 | **Multi-chromosome** | | |
 | `--refpanel-dir DIR` | Directory with per-chr SRP files (auto-discovers chromosomes) | |
-| `--map-dir DIR` | Directory with per-chr genetic maps (`chr{N}.map`). Alternative to `--map` | |
+| `--map-dir DIR` | Directory with per-chr genetic maps. Auto-discovers common naming patterns. Alternative to `--map` | |
 | `--merge-srps PATHS` | Merge per-chr SRP files into multi-chromosome SRP (comma-separated) | |
 | `--merge-srps-dir DIR` | Merge all SRP files from a directory into multi-chromosome SRP | |
 | **Reference panel** | | |
