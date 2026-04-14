@@ -196,6 +196,33 @@ Allele matching handles indel normalization (suffix/prefix trimming) and REF/ALT
 
 For phasing evaluation (switch error rate), use `bcftools +trio-switch-rate` with a trio pedigree file.
 
+## Indexing
+
+Build a TBI or CSI index natively (no bcftools needed):
+
+```bash
+selphi --index output.vcf.gz      # creates .tbi
+selphi --index output.bcf          # creates .csi
+```
+
+Inspect a file with index statistics:
+
+```bash
+selphi --index-stats output.bcf
+```
+
+Shows format, file size, source, number of samples and variants, phased/unphased, FORMAT/INFO fields, and per-contig genomic ranges.
+
+## Self-test
+
+Verify all code paths after building:
+
+```bash
+selphi --self-test --refpanel panel.srp --input target.vcf.gz --map chr.map --out test_prefix
+```
+
+Optionally add `--truth truth.vcf.gz` to include evaluation in the test suite. Exercises: phase-only, VCF/BCF/Parquet/PGEN/SelfDecode output, pre-phased input, evaluation, and CSI index readability.
+
 ## Input
 
 Standard VCF or BCF. Unphased (`0/1`) or phased (`0|1`) genotypes. Multi-allelic sites are split to biallelic during processing. Target variants must be a subset of the reference panel.
@@ -224,12 +251,17 @@ Standard VCF or BCF. Unphased (`0/1`) or phased (`0|1`) genotypes. Multi-allelic
 | **Accuracy evaluation** | | |
 | `--evaluate PATH` | Evaluate imputed VCF/BCF against truth (standalone mode) | |
 | `--truth PATH` | Truth VCF/BCF with WGS genotypes | |
+| **Indexing** | | |
+| `--index PATH` | Build TBI/CSI index for a VCF.gz or BCF file | |
+| `--index-stats PATH` | Show file statistics and per-contig genomic ranges | |
 | **Reference panel** | | |
 | `--prepare-reference-from PATH` | Create SRP from VCF.gz, BCF, or BREF3 | |
 | `--chunk-size N` | Chunk size for SRP creation (0 = auto) | 0 |
+| **Testing** | | |
+| `--self-test` | Run all output format and code path tests | off |
 | **Advanced** | | |
 | `--seed N` | Random seed for phasing | 33 |
-| `--est-ne N` | Effective population size | 175000 |
+| `--est-ne N` | Effective population size (0 = auto) | 0 |
 | `--p-err F` | Emission error probability | 0.025 |
 | `--match-length N` | Minimum PBWT match length | auto |
 | `--max-candidates N` | Max reference candidates per haplotype | 2500 |
