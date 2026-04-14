@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde_json::Value as JsonValue;
 
 use super::{
-    SRP_V3_MAGIC, GlobalSrpMetadata, ChrDirectoryEntry,
+    SRP_MULTI_CHR_MAGIC, GlobalSrpMetadata, ChrDirectoryEntry,
     SrpMetadata, Variant, CscChunk,
     tiled::{TiledSrpReader, TileEntryPub},
 };
@@ -140,7 +140,7 @@ impl MultiChrSrpReader {
         // Validate magic
         let mut magic = [0u8; 8];
         f.read_exact(&mut magic)?;
-        if &magic != SRP_V3_MAGIC {
+        if &magic != SRP_MULTI_CHR_MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
                 format!("Not a multi-chr SRP file: {}", filepath.display())));
         }
@@ -305,9 +305,9 @@ pub fn detect_srp_version<P: AsRef<Path>>(path: P) -> io::Result<u32> {
     let mut f = File::open(path.as_ref())?;
     let mut magic = [0u8; 8];
     f.read_exact(&mut magic)?;
-    if &magic == super::SRP_V2_MAGIC {
+    if &magic == super::SRP_SINGLE_CHR_MAGIC {
         Ok(2)
-    } else if &magic == super::SRP_V3_MAGIC {
+    } else if &magic == super::SRP_MULTI_CHR_MAGIC {
         Ok(3)
     } else {
         Err(io::Error::new(io::ErrorKind::InvalidData,

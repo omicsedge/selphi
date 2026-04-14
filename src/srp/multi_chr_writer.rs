@@ -10,7 +10,7 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::{selphi_info, selphi_step};
-use super::{SRP_V3_MAGIC, SparseTile, TILE_ROWS, TILE_COLS, ChrDirectoryEntry};
+use super::{SRP_MULTI_CHR_MAGIC, SparseTile, TILE_ROWS, TILE_COLS, ChrDirectoryEntry};
 
 /// Build a multi-chromosome SRP file from a multi-contig BCF/VCF source.
 pub fn build_multi_chr_srp(
@@ -82,7 +82,7 @@ pub fn build_multi_chr_srp(
         .map_err(io::Error::other)?;
 
     // Write multi-chr magic
-    w.write_all(SRP_V3_MAGIC)?;
+    w.write_all(SRP_MULTI_CHR_MAGIC)?;
 
     // Write global metadata (exact size)
     w.write_all(&(global_meta_compressed.len() as u32).to_le_bytes())?;
@@ -598,7 +598,7 @@ pub fn merge_single_chr_srps(
         .map_err(io::Error::other)?;
 
     // Write multi-chr magic
-    w.write_all(SRP_V3_MAGIC)?;
+    w.write_all(SRP_MULTI_CHR_MAGIC)?;
 
     // Global metadata (exact size)
     w.write_all(&(global_meta_compressed.len() as u32).to_le_bytes())?;

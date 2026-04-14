@@ -33,10 +33,10 @@ use serde_json::Value as JsonValue;
 // ---------------------------------------------------------------------------
 
 /// Magic bytes for single-chromosome SRP format.
-pub const SRP_V2_MAGIC: &[u8; 8] = b"SRP\x00\x02\x00\x00\x00";
+pub const SRP_SINGLE_CHR_MAGIC: &[u8; 8] = b"SRP\x00\x02\x00\x00\x00";
 
 /// Magic bytes for multi-chromosome SRP format.
-pub const SRP_V3_MAGIC: &[u8; 8] = b"SRP\x00\x03\x00\x00\x00";
+pub const SRP_MULTI_CHR_MAGIC: &[u8; 8] = b"SRP\x00\x03\x00\x00\x00";
 
 // ---------------------------------------------------------------------------
 // Multi-chromosome SRP types

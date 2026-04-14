@@ -745,7 +745,7 @@ fn compress_and_assemble(
 // ============================================================================
 
 /// Magic for single-chromosome SRP format.
-const SRP_V2_MAGIC: &[u8; 8] = b"SRP\x00\x02\x00\x00\x00";
+const SRP_SINGLE_CHR_MAGIC: &[u8; 8] = b"SRP\x00\x02\x00\x00\x00";
 
 /// Build unified SRP file from BCF source.
 /// Produces a SINGLE .srp file containing metadata, variants, chunks, and tiles.
@@ -983,7 +983,7 @@ impl StreamingTileWriter {
         let out = std::fs::File::create(output_path)?;
         let mut w = std::io::BufWriter::with_capacity(4 << 20, out);
 
-        w.write_all(SRP_V2_MAGIC)?;
+        w.write_all(SRP_SINGLE_CHR_MAGIC)?;
         w.write_all(&(meta_compressed.len() as u32).to_le_bytes())?;
         w.write_all(&meta_compressed)?;
         w.write_all(&(vbin_compressed.len() as u32).to_le_bytes())?;

@@ -31,7 +31,7 @@ impl SrpReader {
         let mut magic = [0u8; 8];
         f.read_exact(&mut magic)?;
         if &magic != MAGIC {
-            let hint = if &magic == super::SRP_V3_MAGIC {
+            let hint = if &magic == super::SRP_MULTI_CHR_MAGIC {
                 "Detected multi-chromosome SRP file. Use MultiChrSrpReader for multi-chromosome panels."
             } else if &magic[..2] == b"PK" {
                 "Detected old ZIP-based SRP format."
