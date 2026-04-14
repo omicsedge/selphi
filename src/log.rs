@@ -160,9 +160,19 @@ pub fn estimate_and_warn(
     // SRP preload (capped at ~500 MB compressed)
     let preload_mb = 500.0;
 
-    // Per-window HMM: each thread uses ~n_candidates * n_var_window * 4 bytes
-    let hmm_per_thread_mb = 8.0;
-    let hmm_mb = n_threads as f64 * hmm_per_thread_mb;
+    // Per-thread PBWT + HMM buffers:
+    // - reduced array: max_candidates × n_chip_per_window × 1 byte
+    // - forward result: n_chip × fl_fwd × 8 bytes (haps + lens)
+    // - HMM forward matrix: n_states × n_chip × 4 bytes
+    // - thread-local reuse buffers
+    let max_candidates = 2500usize;
+    let fl_fwd = 200usize;
+    let n_var_window = n_chip.min(15000); // typical max window size
+    let pbwt_per_thread_mb = (max_candidates * n_var_window   // reduced array
+        + n_var_window * fl_fwd * 8                            // FwdResult (haps + lens)
+        + max_candidates * n_var_window * 4                    // HMM forward matrix
+        ) as f64 / 1e6;
+    let hmm_mb = n_threads as f64 * pbwt_per_thread_mb;
 
     // all_weights per window: n_haps × ~200 CsrWeights entries × 12 bytes
     let weights_mb = (n_haps as f64 * 200.0 * 12.0) / 1e6;
@@ -176,22 +186,37 @@ pub fn estimate_and_warn(
     let stripe_decomp_mb = (stripes_per_batch * tile_cols * 500 * 1024) as f64 / 1e6;
     let interp_mb = (n_haps * 1024 * 4 * stripes_per_batch) as f64 / 1e6;
 
-    // VCF output buffers (~8 bytes per genotype per variant per batch)
-    let vcf_mb = (n_samples as f64 * 8.0 * stripes_per_batch as f64 * 1024.0) / 1e6;
+    // VCF/BCF output: BGZF compressor queues + format strings.
+    // With many samples, VCF lines are ~(12 bytes × n_samples) per variant.
+    // Multiple tiles in flight simultaneously: ~2× stripes_per_batch.
+    let vcf_mb = (n_samples as f64 * 12.0 * stripes_per_batch as f64 * 1024.0 * 2.0) / 1e6;
 
-    let overhead_mb = 200.0;
+    // BGZF writer internal buffers: ~64 KB per compressor thread × n_threads
+    let bgzf_mb = (n_threads as f64 * 64.0 * 1024.0) / 1e6;
+
+    // Thread-local buffers (PBWT workspace, HMM reuse, tile decode) persist across calls
+    let thread_local_mb = n_threads as f64 * 20.0;
+
+    let overhead_mb = 300.0; // OS, allocator fragmentation, misc
 
     let mut total_mb = ref_bm_mb + targ_mb + preload_mb + hmm_mb + weights_mb
-        + stripe_decomp_mb + interp_mb + vcf_mb + overhead_mb;
+        + stripe_decomp_mb + interp_mb + vcf_mb + bgzf_mb + thread_local_mb + overhead_mb;
 
     // Phasing adds significant memory
     if needs_phasing {
-        // hap_bits: (n_ref + n_haps) × (window_size / 8) bytes per window
-        // Typical window: 5K variants → 625 bytes per haplotype
-        let hap_bits_mb = ((n_ref + n_haps) as f64 * 625.0) / 1e6;
-        // IBS2 + coded steps + working arrays
-        let phasing_overhead_mb = 300.0;
-        total_mb += hap_bits_mb + phasing_overhead_mb;
+        let n_total_haps = n_ref + n_haps;
+        // hap_bits: all haplotypes packed in bits, per window
+        let hap_bits_mb = (n_total_haps as f64 * n_var_window as f64 / 8.0) / 1e6;
+        // IBS result arrays: n_coded_steps × n_samples × n_candidates × 4 bytes
+        let n_steps = n_var_window / 10; // ~1 step per 10 variants
+        let ibs_mb = (n_steps * n_samples * 100 * 4) as f64 / 1e6;
+        // Per-sample arrays: confidence, resolved, locked, ref_alleles
+        let sample_arrays_mb = (n_var_window * n_samples * 12) as f64 / 1e6;
+        // Coded steps precomputation: n_steps × n_total_haps × 4 bytes
+        let coded_mb = (n_steps * n_total_haps * 4) as f64 / 1e6;
+        // global_phased + global_confidence
+        let global_mb = (n_chip * n_haps + n_chip * n_samples * 4) as f64 / 1e6;
+        total_mb += hap_bits_mb + ibs_mb + sample_arrays_mb + coded_mb + global_mb;
     }
 
     let sys_ram = system_ram_mb();
