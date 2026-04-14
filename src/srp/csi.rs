@@ -253,7 +253,8 @@ pub fn parse_csi_all_contigs(path: &Path) -> io::Result<Vec<ContigCsiIndex>> {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_MIN_SHIFT: i32 = 14;
-const DEFAULT_DEPTH: i32 = 6; // matches bcftools/htslib default
+const CSI_DEPTH: i32 = 6;  // CSI index depth (bcftools default for CSI)
+const TBI_DEPTH: i32 = 5;  // TBI index depth (standard tabix)
 
 /// Compute the bin_id for a genomic interval [beg, end).
 /// Finds the smallest bin that fully contains the interval.
@@ -359,7 +360,7 @@ pub fn build_csi_index(bcf_path: &Path) -> io::Result<()> {
         let vpos_end: u64 = u64::from(bgzf.virtual_position());
 
         // Assign to bin (handles indels spanning multiple 16Kb windows)
-        let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, DEFAULT_DEPTH);
+        let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, CSI_DEPTH);
         let bins = ref_bins.entry(chrom_id).or_default();
         let bin = bins.entry(bin_id).or_insert_with(|| BinData {
             loffset: vpos,
@@ -380,7 +381,7 @@ pub fn build_csi_index(bcf_path: &Path) -> io::Result<()> {
 
     // Write CSI file
     let min_shift = DEFAULT_MIN_SHIFT;
-    let depth = DEFAULT_DEPTH;
+    let depth = CSI_DEPTH;
     let n_ref = n_contigs.max(ref_bins.keys().map(|&k| k as usize + 1).max().unwrap_or(0));
 
     let mut out = Vec::with_capacity(64 * 1024);
@@ -552,8 +553,8 @@ pub fn build_tbi_index(vcf_gz_path: &Path) -> io::Result<()> {
 
         let vpos_end: u64 = u64::from(bgzf.virtual_position());
 
-        // Bin assignment (handles indels spanning multiple bins)
-        let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, DEFAULT_DEPTH);
+        // Bin assignment (TBI uses depth=5)
+        let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, TBI_DEPTH);
         let bins = ref_bins.entry(ref_id).or_default();
         let bin = bins.entry(bin_id).or_insert_with(|| BinData {
             _loffset: vpos,
@@ -729,7 +730,7 @@ pub fn build_tbi_index_with_meta(
 
         let ref_id = *contig_map.get(chrom.as_str()).unwrap_or(&0);
 
-        let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, DEFAULT_DEPTH);
+        let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, TBI_DEPTH);
         let bins = ref_bins.entry(ref_id).or_default();
         let bin = bins.entry(bin_id).or_insert_with(|| BinDataM { _loffset: vpos, chunks: vec![(vpos, vpos_end)] });
         if let Some(last) = bin.chunks.last_mut() {
@@ -804,7 +805,8 @@ struct InlineBinData {
 enum IndexFormat { Tbi, Csi }
 
 pub struct InlineIndexBuilder {
-    _format: IndexFormat,
+    format: IndexFormat,
+    depth: i32,
     contig_names: Vec<String>,
     contig_map: std::collections::HashMap<String, usize>,
     ref_bins: BTreeMap<usize, BTreeMap<u32, InlineBinData>>,
@@ -817,7 +819,7 @@ pub struct InlineIndexBuilder {
 impl InlineIndexBuilder {
     pub fn new_tbi() -> Self {
         Self {
-            _format: IndexFormat::Tbi,
+            format: IndexFormat::Tbi, depth: TBI_DEPTH,
             contig_names: Vec::new(), contig_map: std::collections::HashMap::new(),
             ref_bins: BTreeMap::new(), ref_n_mapped: BTreeMap::new(),
             ref_linear: BTreeMap::new(), bcf_n_contigs: 0, bcf_header_done: false,
@@ -826,7 +828,7 @@ impl InlineIndexBuilder {
 
     pub fn new_csi() -> Self {
         Self {
-            _format: IndexFormat::Csi,
+            format: IndexFormat::Csi, depth: CSI_DEPTH,
             contig_names: Vec::new(), contig_map: std::collections::HashMap::new(),
             ref_bins: BTreeMap::new(), ref_n_mapped: BTreeMap::new(),
             ref_linear: BTreeMap::new(), bcf_n_contigs: 0, bcf_header_done: false,
@@ -924,7 +926,7 @@ impl InlineIndexBuilder {
     }
 
     fn add_record(&mut self, ref_id: usize, pos: i64, rlen: i64, vpos: u64, vpos_end: u64) {
-        let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, DEFAULT_DEPTH);
+        let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, self.depth);
         let bins = self.ref_bins.entry(ref_id).or_default();
         let bin = bins.entry(bin_id).or_insert_with(|| InlineBinData {
             loffset: vpos, chunks: vec![(vpos, vpos_end)],
@@ -967,7 +969,7 @@ impl InlineIndexBuilder {
         let mut out = Vec::with_capacity(64 * 1024);
         out.extend_from_slice(b"CSI\x01");
         out.extend_from_slice(&DEFAULT_MIN_SHIFT.to_le_bytes());
-        out.extend_from_slice(&DEFAULT_DEPTH.to_le_bytes());
+        out.extend_from_slice(&CSI_DEPTH.to_le_bytes());
         out.extend_from_slice(&0i32.to_le_bytes());
         out.extend_from_slice(&(n_ref as i32).to_le_bytes());
         self.write_ref_sections_csi(&mut out, n_ref);
@@ -1015,7 +1017,7 @@ impl InlineIndexBuilder {
                     out.extend_from_slice(&(bd.chunks.len() as i32).to_le_bytes());
                     for &(b, e) in &bd.chunks { out.extend_from_slice(&b.to_le_bytes()); out.extend_from_slice(&e.to_le_bytes()); }
                 }
-                let pseudo = ((1u64 << ((DEFAULT_DEPTH as u64 + 1) * 3)) - 1) / 7 + 1;
+                let pseudo = ((1u64 << ((self.depth as u64 + 1) * 3)) - 1) / 7 + 1;
                 out.extend_from_slice(&(pseudo as u32).to_le_bytes());
                 out.extend_from_slice(&0u64.to_le_bytes());
                 out.extend_from_slice(&2i32.to_le_bytes());
