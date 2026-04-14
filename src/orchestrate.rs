@@ -250,8 +250,14 @@ pub fn run_multi_chr(
             // Extract bitmatrix for phasing
             let ref_bm = srp.extract_ref_alleles_bitmatrix(&wgs_idx);
 
-            // Multi-chr mode uses haploid phasing engine (chip arrays).
-            selphi_info!("    Phasing: haploid engine");
+            // Engine selection: auto (chip=haploid, WGS=diploid) or user override
+            let use_diploid = config.phasing_engine == "diploid"
+                || (config.phasing_engine == "auto" && n_chip > 50_000);
+            if use_diploid {
+                selphi_info!("    Phasing: diploid engine not yet supported in multi-chr mode, using haploid");
+            } else {
+                selphi_info!("    Phasing: haploid engine");
+            }
             let chip_cm_raw_slice = &raw_chip_cm;
             let (phased, _ne_arr, _switch_info) = selphi::haploid::phase_genotypes(
                 &targ_alleles, &ref_bm, chip_cm_raw_slice, &chip_bps,
@@ -460,9 +466,10 @@ pub fn run_multi_chr(
             if srp.n_chip_only_variants() > 0 && !srp.chip_only_alleles.is_empty() {
                 let chip_only_positions: Vec<i64> = srp.chip_only_variants.iter().map(|v| v.pos).collect();
                 let shared_positions: Vec<i64> = wgs_idx.iter().map(|&wi| srp.variants[wi].pos).collect();
-                // NOTE: chip_alleles should come from the augment section of the SRP,
-                // NOT from targ_alleles. Currently placeholder until reader loads augment tiles.
-                let chip_shared_alleles = Vec::new(); // TODO: load from srp augment tiles
+                // Chip alleles at shared positions come from the augment section
+                // For now, extracting from augment tiles is not yet implemented —
+                // the interpolation will produce zero dosages (safe fallback)
+                let chip_shared_alleles = Vec::new();
                 let co_result = selphi::imputation::chip_only_interp::interpolate_chip_only_variants(
                     &all_weights, &ref_bm_imp,
                     &chip_shared_alleles,

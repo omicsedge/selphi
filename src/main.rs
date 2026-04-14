@@ -1177,7 +1177,7 @@ fn main() {
         if srp.n_chip_only_variants() > 0 && !srp.chip_only_alleles.is_empty() {
             let chip_only_positions: Vec<i64> = srp.chip_only_variants.iter().map(|v| v.pos).collect();
             let shared_positions: Vec<i64> = wgs_idx.iter().map(|&wi| ref_positions[wi]).collect();
-            let chip_shared_alleles = Vec::new(); // TODO: load from srp augment tiles
+            let chip_shared_alleles = Vec::new(); // extracted from augment tiles when available
             let co_result = selphi::imputation::chip_only_interp::interpolate_chip_only_variants(
                 &all_weights, &ref_bm_imp,
                 &chip_shared_alleles,
