@@ -668,6 +668,35 @@ fn main() {
 
     // 6b. Phase if input is unphased (in-memory fusion — no VCF round-trip)
     let needs_phasing = !is_phased || args.force_phasing;
+    // Pedigree pre-phasing: if --ped provided, apply Mendelian constraints before HMM
+    let mut targ_alleles = targ_alleles;
+    if let Some(ref ped_path) = args.ped {
+        if needs_phasing {
+            let ped_entries = selphi::diploid::pedigree::parse_ped(
+                Path::new(ped_path), &sample_names)
+                .unwrap_or_else(|e| { selphi_error!("Cannot read PED file: {}", e); std::process::exit(1); });
+            if !ped_entries.is_empty() {
+                // Build flat genotype array: (n_chip × n_samples × 2), row-major
+                let mut flat_geno = vec![0u8; n_chip * n_samples * 2];
+                for (ci, &ti) in target_idx.iter().enumerate() {
+                    if ti < target_genotypes.len() {
+                        let gt = &target_genotypes[ti];
+                        for s in 0..n_samples.min(gt.len()) {
+                            flat_geno[ci * n_samples * 2 + s * 2] = gt[s][0];
+                            flat_geno[ci * n_samples * 2 + s * 2 + 1] = gt[s][1];
+                        }
+                    }
+                }
+                let (n_ped_phased, n_ped_errors) = selphi::diploid::pedigree::apply_pedigree_scaffold(
+                    &mut targ_alleles, &flat_geno,
+                    &ped_entries, n_chip, n_samples, n_haps,
+                );
+                selphi_step!("Pedigree scaffold: {} trios/duos, {} sites pre-phased, {} Mendelian errors",
+                    ped_entries.len(), n_ped_phased, n_ped_errors);
+            }
+        }
+    }
+
     let (targ_alleles, em_ne_per_site, ref_bm_from_phasing) = if needs_phasing {
         selphi_step!("Input is unphased — running phasing pipeline...");
         let (map_bp_raw, map_cm_raw) = genmap::load_genetic_map_raw(Path::new(map_path))
