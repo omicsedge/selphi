@@ -128,7 +128,7 @@ pub fn run_phase_common_bm(
         cmis
     }).collect();
 
-    let hmm_params = HmmParams::with_allele_freqs(cm, n_haps_total, DEFAULT_NE, Some(&allele_counts));
+    let mut hmm_params = HmmParams::with_allele_freqs(cm, n_haps_total, DEFAULT_NE, Some(&allele_counts));
 
     // IBD2 detection: read from target_haps + ref_bm
     let mut ibd2 = {
@@ -357,7 +357,7 @@ pub fn run_phase_common_bm(
 
     let profiles = _run_iterations(
         graphs, &mut hap_bm, &mut dummy_bm,
-        &mut pbwt_idx, &mut ibd2, &cm_f64, &hmm_params, &allele_counts,
+        &mut pbwt_idx, &mut ibd2, &cm_f64, &mut hmm_params, &allele_counts,
         &stages, &ordering, &mut o_iterator, &mut rng,
         n_var, n_samples, n_ref, n_haps_total, target_geno, chip_bp,
         max_cond_haps, preferred_refs,
@@ -404,7 +404,7 @@ fn _run_iterations(
     pbwt_idx: &mut PbwtNeighborIndex,
     ibd2: &mut Ibd2Tracks,
     cm: &[f64],
-    hmm_params: &HmmParams,
+    hmm_params: &mut HmmParams,
     _allele_counts: &[u32],
     stages: &[Stage],
     ordering: &[usize],
@@ -788,6 +788,35 @@ fn _run_iterations(
             // Single unified bitmatrix: update all sites (used for both PBWT and HMM)
             hap_bm.update_hap_all_from_vec(si * 2, &h0);
             hap_bm.update_hap_all_from_vec(si * 2 + 1, &h1);
+        }
+
+        // EM Ne estimation: after burnin iterations, estimate Ne from observed transitions
+        if stage == Stage::Burnin {
+            // Estimate Ne from empirical switch rate: compare # transitions in graphs
+            // vs expected from current Ne. More transitions → lower Ne (shorter IBD).
+            let mut total_switches = 0u64;
+            let mut total_sites = 0u64;
+            for graph in graphs.iter() {
+                total_switches += graph.n_transitions as u64;
+                total_sites += graph.n_variants as u64;
+            }
+            if total_sites > 0 {
+                let obs_switch_rate = total_switches as f64 / total_sites as f64;
+                // From Li-Stephens: E[switch_rate] ≈ 1 - exp(-0.04 * Ne * avg_dist / n_haps)
+                // For small rates: switch_rate ≈ 0.04 * Ne * avg_dist / n_haps
+                let avg_dist_cm = if cm.len() > 1 {
+                    (cm[cm.len() - 1] - cm[0]) / (cm.len() - 1) as f64
+                } else { 0.01 };
+                if obs_switch_rate > 0.0 && avg_dist_cm > 1e-7 {
+                    let estimated_ne = obs_switch_rate * n_haps_total as f64 / (0.04 * avg_dist_cm);
+                    let new_ne = estimated_ne.clamp(1000.0, 1_000_000.0);
+                    if (new_ne - hmm_params.ne).abs() / hmm_params.ne > 0.05 {
+                        crate::selphi_debug!("    [EM-Ne] iter {}: Ne {:.0} → {:.0} (switch_rate={:.6}, avg_dist={:.6}cM)",
+                            it + 1, hmm_params.ne, new_ne, obs_switch_rate, avg_dist_cm);
+                        hmm_params.update_ne(new_ne);
+                    }
+                }
+            }
         }
 
         let total_ms = t0.elapsed().as_millis();

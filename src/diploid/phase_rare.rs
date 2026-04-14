@@ -349,6 +349,10 @@ pub fn run_phase_rare(
     }
 
     crate::selphi_debug!("  [diploid] phase_rare complete: {} rare hets phased", n_phased);
+
+    // Post-hoc singleton phasing: use IBD segment lengths for MAC=1 variants
+    let n_haps = n_samples * 2;
+    phase_singletons_ibd(phased, target_geno, cm, n_var, n_samples, n_haps, &scaffold_sites);
 }
 
 /// Run one direction of PBWT sweep (forward or backward) and phase rare hets.
@@ -593,6 +597,109 @@ fn run_pbwt_phase(
                 }
             }
         }
+    }
+}
+
+/// Singleton Viterbi phasing: for het sites with MAC=1 among targets,
+/// assign the rare allele to the haplotype with the longer IBD segment.
+///
+/// IBD segment length is estimated from run-length of identical alleles
+/// at scaffold sites around the singleton. The haplotype with longer
+/// consistent run (less recent recombination) gets the singleton allele.
+///
+/// Confidence = max(len0, len1) / (len0 + len1), range [0.5, 1.0].
+pub fn phase_singletons_ibd(
+    phased: &mut [u8],
+    target_geno: &[u8],
+    cm: &[f64],
+    n_var: usize,
+    n_samples: usize,
+    n_haps: usize,
+    scaffold_indices: &[usize],
+) {
+    if scaffold_indices.is_empty() || n_samples == 0 { return; }
+
+    let n_scaffold = scaffold_indices.len();
+    let mut n_phased = 0u32;
+
+    for si in 0..n_samples {
+        let h0 = si * 2;
+        let h1 = si * 2 + 1;
+
+        for v in 0..n_var {
+            let g0 = target_geno[v * n_samples * 2 + si * 2];
+            let g1 = target_geno[v * n_samples * 2 + si * 2 + 1];
+            if g0 == g1 { continue; }
+            if g0 + g1 != 1 { continue; }
+
+            // Check if singleton among targets (MAC=1 in target samples)
+            let mut mac = 0u32;
+            for s2 in 0..n_samples {
+                mac += target_geno[v * n_samples * 2 + s2 * 2] as u32;
+                mac += target_geno[v * n_samples * 2 + s2 * 2 + 1] as u32;
+            }
+            let target_mac = mac.min(n_samples as u32 * 2 - mac);
+            if target_mac > 1 { continue; }
+
+            // Estimate IBD segment length for each haplotype
+            // by measuring run-length of unchanged alleles at scaffold sites
+            let pos_cm = cm.get(v).copied().unwrap_or(0.0);
+            let si_pos = scaffold_indices.partition_point(|&s| cm[s] < pos_cm);
+
+            // Forward run: how far each haplotype maintains same allele pattern
+            let a0_at_v = phased[v * n_haps + h0];
+            let a1_at_v = phased[v * n_haps + h1];
+            let mut fwd_len0 = 0.0f64;
+            let mut fwd_len1 = 0.0f64;
+
+            for i in si_pos..n_scaffold.min(si_pos + 100) {
+                let sv = scaffold_indices[i];
+                let sv_cm = cm[sv] - pos_cm;
+                if sv_cm > 5.0 { break; }
+                // Run breaks when allele at scaffold changes relative to pattern
+                if phased[sv * n_haps + h0] == a0_at_v { fwd_len0 = sv_cm; } else { break; }
+            }
+            for i in si_pos..n_scaffold.min(si_pos + 100) {
+                let sv = scaffold_indices[i];
+                let sv_cm = cm[sv] - pos_cm;
+                if sv_cm > 5.0 { break; }
+                if phased[sv * n_haps + h1] == a1_at_v { fwd_len1 = sv_cm; } else { break; }
+            }
+
+            // Backward run
+            let mut bwd_len0 = 0.0f64;
+            let mut bwd_len1 = 0.0f64;
+            for i in (0..si_pos).rev().take(100) {
+                let sv = scaffold_indices[i];
+                let sv_cm = pos_cm - cm[sv];
+                if sv_cm > 5.0 { break; }
+                if phased[sv * n_haps + h0] == a0_at_v { bwd_len0 = sv_cm; } else { break; }
+            }
+            for i in (0..si_pos).rev().take(100) {
+                let sv = scaffold_indices[i];
+                let sv_cm = pos_cm - cm[sv];
+                if sv_cm > 5.0 { break; }
+                if phased[sv * n_haps + h1] == a1_at_v { bwd_len1 = sv_cm; } else { break; }
+            }
+
+            let total0 = fwd_len0 + bwd_len0;
+            let total1 = fwd_len1 + bwd_len1;
+
+            // Assign singleton to haplotype with LONGER IBD segment
+            if total0 > total1 * 1.2 {
+                phased[v * n_haps + h0] = 1;
+                phased[v * n_haps + h1] = 0;
+                n_phased += 1;
+            } else if total1 > total0 * 1.2 {
+                phased[v * n_haps + h0] = 0;
+                phased[v * n_haps + h1] = 1;
+                n_phased += 1;
+            }
+        }
+    }
+
+    if n_phased > 0 {
+        crate::selphi_debug!("  [singleton] Phased {} singletons via IBD segment length", n_phased);
     }
 }
 

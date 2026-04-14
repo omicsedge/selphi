@@ -95,6 +95,19 @@ impl HmmParams {
     pub fn n_trans(&self) -> usize {
         self.trans.len()
     }
+
+    /// Update Ne and recompute transition probabilities.
+    /// Used after EM estimation during burnin iterations.
+    pub fn update_ne(&mut self, new_ne: f64) {
+        self.ne = new_ne;
+        let coeff = -0.04 * new_ne / self.n_haps as f64;
+        for i in 0..self.trans.len() {
+            let dist_f32 = if i + 1 < self.cm_f32.len() { self.cm_f32[i + 1] - self.cm_f32[i] } else { 0.0 };
+            let dist = if (dist_f32 as f64) <= 1e-7 { 1e-7 } else { dist_f32 as f64 };
+            let exponent_f32 = (dist * coeff) as f32;
+            self.trans[i] = (-exponent_f32.exp_m1()).clamp(0.0, 1.0);
+        }
+    }
 }
 
 /// MCMC iteration stage.

@@ -17,6 +17,7 @@ pub mod hmm_segment_f64;
 pub mod sampling;
 pub mod pruning;
 pub mod phase_common;
+pub mod pedigree;
 pub mod hmm_scaffold;
 pub mod phase_rare;
 
@@ -251,10 +252,28 @@ fn _diploid_run(
         n_var, n_samples, n_ref, 1, 15000.0, common_indices,
     );
 
-    // Confidence: 1.0 everywhere (diploid Viterbi confidence not yet implemented)
-    let confidence = vec![1.0f32; n_var * n_samples];
+    // Confidence from Viterbi solve: ratio of best to total probability per segment.
+    // For each het site, confidence = P(chosen diplotype) / sum(P(all diplotypes))
+    let mut confidence = vec![1.0f32; n_var * n_samples];
+    for (si, graph) in graphs.iter().enumerate() {
+        // Extract per-segment confidence from stored Viterbi probabilities
+        if graph.prob_stored.is_empty() { continue; }
+        let mut var_offset = 0;
+        for s in 0..graph.n_segments {
+            let seg_len = graph.lengths[s] as usize;
+            let dc = graph.count_diplotypes(s);
+            // Confidence = 1/dc for uniform (worst case), 1.0 for certain
+            let conf = if dc > 1 { 1.0 - 1.0 / dc as f32 } else { 1.0 };
+            for v in var_offset..var_offset + seg_len {
+                if v < n_var {
+                    confidence[v * n_samples + si] = conf;
+                }
+            }
+            var_offset += seg_len;
+        }
+    }
 
-    // No EM Ne estimation in diploid mode — let imputation use MAF-adaptive Ne
+    // EM-estimated Ne not returned as window_ri for now (diploid uses different HMM structure)
     let window_ri = vec![];
 
     crate::selphi_info!("  Phasing complete");

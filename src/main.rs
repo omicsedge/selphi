@@ -229,6 +229,11 @@ struct Args {
     #[arg(long)]
     chip: Option<String>,
 
+    /// PED file for pedigree-based phase scaffolding (trio/duo constraints).
+    /// Format: FamilyID SampleID FatherID MotherID Sex Phenotype
+    #[arg(long)]
+    ped: Option<String>,
+
 }
 
 fn main() {
