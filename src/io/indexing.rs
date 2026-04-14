@@ -89,6 +89,7 @@ pub fn index_stats(path: &Path) -> io::Result<()> {
         }
     }
 
+    selphi_info!("");
     Ok(())
 }
 
