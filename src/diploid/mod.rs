@@ -120,6 +120,12 @@ fn _prepare_common(
     let chip_cm_raw: Vec<f64> = chip_bp.iter().map(|&bp| {
         crate::genmap::interpolate_cm_extrapolate(map_bp, map_cm, bp)
     }).collect();
+    if common_indices.is_empty() {
+        crate::selphi_info!("  WARNING: No common variants after MAF filtering — returning empty");
+        let empty_bm = pbwt_neighbor::HaplotypeBitmatrix::from_raw(vec![], 0, 0);
+        let empty_prep = CommonPrep { target_geno_common: vec![], cm_common: vec![], cm_full: vec![], bp_common: vec![] };
+        return (Vec::new(), empty_bm, empty_prep);
+    }
     let baseline_cm = chip_cm_raw[common_indices[0]];
     let chip_cm_full: Vec<f64> = chip_cm_raw.iter().map(|&c| c - baseline_cm).collect();
     let cm_common: Vec<f64> = common_indices.iter().map(|&v| chip_cm_full[v]).collect();

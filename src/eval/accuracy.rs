@@ -718,8 +718,8 @@ pub fn evaluate_parallel(
     let (_, truth_samples) = VariantReader::open(truth_path)?;
     let imp_map: std::collections::HashMap<&str, usize> = imp_samples.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
     let truth_map: std::collections::HashMap<&str, usize> = truth_samples.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
-    let imp_reindex: Vec<usize> = shared_samples.iter().map(|s| imp_map[s.as_str()]).collect();
-    let truth_reindex: Vec<usize> = shared_samples.iter().map(|s| truth_map[s.as_str()]).collect();
+    let imp_reindex: Vec<usize> = shared_samples.iter().map(|s| *imp_map.get(s.as_str()).expect("shared sample missing from imputed file")).collect();
+    let truth_reindex: Vec<usize> = shared_samples.iter().map(|s| *truth_map.get(s.as_str()).expect("shared sample missing from truth file")).collect();
 
     // Divide into regions (more regions than threads for load balancing)
     let n_regions = n_threads * 4;
@@ -870,8 +870,8 @@ pub fn evaluate_stream(
 
     let imp_map: std::collections::HashMap<&str, usize> = imp_samples.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
     let truth_map: std::collections::HashMap<&str, usize> = truth_samples.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
-    let imp_reindex: Vec<usize> = shared_samples.iter().map(|s| imp_map[s.as_str()]).collect();
-    let truth_reindex: Vec<usize> = shared_samples.iter().map(|s| truth_map[s.as_str()]).collect();
+    let imp_reindex: Vec<usize> = shared_samples.iter().map(|s| *imp_map.get(s.as_str()).expect("shared sample missing from imputed file")).collect();
+    let truth_reindex: Vec<usize> = shared_samples.iter().map(|s| *truth_map.get(s.as_str()).expect("shared sample missing from truth file")).collect();
 
     // Set BCF sample filters for selective extraction (skip non-shared samples)
     imp_reader.set_sample_filter(imp_reindex.clone());

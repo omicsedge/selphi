@@ -98,7 +98,7 @@ pub fn compute_step_boundaries(cm: &[f64], step_scale: f64) -> (Vec<i32>, Vec<i3
         return (vec![0], vec![n as i32]);
     }
     let mut diffs: Vec<f64> = (1..n).map(|i| cm[i] - cm[i - 1]).collect();
-    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let median = crate::common::utils::median(&diffs);
     let ibs_step = step_scale * median.max(1e-7);
 
@@ -637,7 +637,7 @@ fn hi_freq_windows(gen_pos: &[f64], n_threads: usize) -> Vec<(usize, usize)> {
 /// PbwtPhaser.from(): binary search for insertion point.
 /// Returns first index with genPos >= pos.
 fn from_marker(gen_pos: &[f64], pos: f64) -> usize {
-    match gen_pos.binary_search_by(|v| v.partial_cmp(&pos).unwrap()) {
+    match gen_pos.binary_search_by(|v| v.partial_cmp(&pos).unwrap_or(std::cmp::Ordering::Equal)) {
         Ok(i) => i,          // exact match: return index
         Err(i) => i,         // not found: return insertion point
     }
@@ -646,7 +646,7 @@ fn from_marker(gen_pos: &[f64], pos: f64) -> usize {
 /// PbwtPhaser.to(): binary search, but if exact match return index+1.
 /// Returns first index with genPos > pos (if exact match, skip past it).
 fn to_marker(gen_pos: &[f64], pos: f64) -> usize {
-    match gen_pos.binary_search_by(|v| v.partial_cmp(&pos).unwrap()) {
+    match gen_pos.binary_search_by(|v| v.partial_cmp(&pos).unwrap_or(std::cmp::Ordering::Equal)) {
         Ok(i) => (i + 1).min(gen_pos.len()),  // exact match: insPt+1
         Err(i) => i,                           // not found: insertion point
     }

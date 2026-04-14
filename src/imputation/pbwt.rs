@@ -110,7 +110,7 @@ fn pbwt_forwards_ad(
         i += 1;
     }
     // Merge b into a (after u)
-    // Use copy_nonoverlapping for bulk transfer
+    debug_assert_eq!(u + v, m, "PBWT partition invariant violated: u={} v={} m={}", u, v, m);
     unsafe {
         std::ptr::copy_nonoverlapping(b.as_ptr(), a.as_mut_ptr().add(u), v);
         std::ptr::copy_nonoverlapping(e.as_ptr(), d.as_mut_ptr().add(u), v);

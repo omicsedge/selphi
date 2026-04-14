@@ -312,7 +312,8 @@ pub fn finish_vcf_writer(
     _bgzip: VcfBgzipProc,
 ) -> std::io::Result<()> {
     drop(tx);
-    writer_handle.join().unwrap()?;
+    writer_handle.join()
+        .map_err(|_| std::io::Error::other("VCF/BCF writer thread panicked"))??;
     Ok(())
 }
 

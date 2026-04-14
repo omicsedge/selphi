@@ -238,7 +238,7 @@ fn apply_ld_correction(chip_cm: &[f64], switch_rates: &[f64], window_size: usize
     let mut nz_ratios: Vec<f64> = ratios.iter().copied()
         .zip(switch_rates.iter()).filter(|(_, s)| **s > 0.0)
         .map(|(r, _)| r).collect();
-    nz_ratios.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    nz_ratios.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     let (p5, p95) = if nz_ratios.is_empty() {
         (0.5, 2.0)
@@ -257,7 +257,7 @@ fn apply_ld_correction(chip_cm: &[f64], switch_rates: &[f64], window_size: usize
         let lo = i.saturating_sub(half_w);
         let hi = (i + half_w + 1).min(ratios.len());
         let mut window: Vec<f64> = ratios[lo..hi].to_vec();
-        window.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        window.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         smoothed[i] = crate::common::utils::median(&window);
     }
 

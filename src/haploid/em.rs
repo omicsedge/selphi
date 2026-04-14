@@ -88,7 +88,7 @@ fn compute_em_stats_f32(
         let em_sum = unsafe { crate::haploid::simd::em_bwd_update(bwd, am, em_probs, n_states) };
         let p_sw = p_recomb[mp1];
         let shift = p_sw / n_states as f32;
-        let scale = (1.0f32 - p_sw) / em_sum;
+        let scale = if em_sum > 0.0f32 { (1.0f32 - p_sw) / em_sum } else { 0.0f32 };
         for j in 0..n_states {
             bwd[j] = scale * bwd[j] + shift;
             saved_bwd[m * n_states + j] = bwd[j];
@@ -98,7 +98,7 @@ fn compute_em_stats_f32(
     // Forward pass: SIMD from pre-computed al_match
     fwd.clear(); fwd.resize(n_states, 1.0f32 / n_states as f32);
     let mut last_sum = 1.0f32;
-    let h_factor = n_states as f32 / (n_states as f32 - 1.0);
+    let h_factor = if n_states > 1 { n_states as f32 / (n_states as f32 - 1.0) } else { 1.0f32 };
     let mut mismatch_cnt = 0i32;
     let mut sum_mismatch_prob = 0.0f64;
     let mut sum_gen_dist = 0.0f64;
@@ -107,8 +107,8 @@ fn compute_em_stats_f32(
     for m in 0..n_markers {
         let p_sw = p_recomb[m];
         let shift = p_sw / n_states as f32;
-        let scale = (1.0f32 - p_sw) / last_sum;
-        let no_switch_scale = ((1.0f32 - p_sw) + shift) / last_sum;
+        let scale = if last_sum > 0.0f32 { (1.0f32 - p_sw) / last_sum } else { 0.0f32 };
+        let no_switch_scale = if last_sum > 0.0f32 { ((1.0f32 - p_sw) + shift) / last_sum } else { shift };
 
         let am = &al_match[m * n_states..(m + 1) * n_states];
         let (joint_state_sum, fwd_sum, state_sum, mismatch_sum) = unsafe {
@@ -120,8 +120,12 @@ fn compute_em_stats_f32(
 
         last_sum = fwd_sum;
         mismatch_cnt += 1;
-        sum_mismatch_prob += (mismatch_sum / state_sum) as f64;
-        let switch_prob = (h_factor * (1.0f32 - joint_state_sum / state_sum)) as f64;
+        if state_sum > 0.0f32 {
+            sum_mismatch_prob += (mismatch_sum / state_sum) as f64;
+        }
+        let switch_prob = if state_sum > 0.0f32 {
+            (h_factor * (1.0f32 - joint_state_sum / state_sum)) as f64
+        } else { 0.0 };
         if switch_prob > 0.0 {
             sum_gen_dist += gen_dist[m];
             sum_switch_prob += switch_prob;

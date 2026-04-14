@@ -60,7 +60,7 @@ pub fn map_merges(
                         (p, t)
                     })
                     .collect();
-                sorted.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                sorted.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
                 // Compute entropy
                 let entropy: f64 = sorted.iter().map(|&(p, _)| {
@@ -123,7 +123,7 @@ pub fn map_merges(
     }
 
     // Sort by entropy (ascending) and select non-adjacent merges
-    stats.sort_by(|a, b| a.entropy.partial_cmp(&b.entropy).unwrap());
+    stats.sort_by(|a, b| a.entropy.partial_cmp(&b.entropy).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut flags = vec![false; graph.n_segments + 1];
     for stat in &stats {
@@ -191,7 +191,7 @@ pub fn perform_merges(
                     (p, t)
                 })
                 .collect();
-            sorted.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            sorted.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
             // Build Mhaps mapping
             let mut mhaps = vec![-1i32; HAP_NUMBER * HAP_NUMBER];

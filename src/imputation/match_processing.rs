@@ -408,7 +408,7 @@ fn batch_get_top_matches(
         if above.is_empty() { continue; }
 
         // Sort by score descending
-        above.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        above.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let n_take = above.len().min(kept_matches);
         for i in 0..n_take {

@@ -260,7 +260,8 @@ fn compute_forward(
         let p_err_f = p_err as f32;
         let p_no_err_f = p_no_err as f32;
 
-        let scale = (1.0f32 - p_rec * nh) / last_sum as f32;
+        let last_sum_f = last_sum as f32;
+        let scale = if last_sum_f > 0.0f32 { (1.0f32 - p_rec * nh) / last_sum_f } else { 0.0f32 };
         let prev_base = (row - 1) * n_states;
         let cur_base = row * n_states;
 
@@ -428,7 +429,8 @@ fn streaming_backward_combine(
             let p_rec = r_precomb[chip_idx] as f32;
             let p_err_f = p_err as f32;
             let p_no_err_f = p_no_err as f32;
-            let scale = (1.0f32 - p_rec * nh) / last_sum as f32;
+            let last_sum_f = last_sum as f32;
+            let scale = if last_sum_f > 0.0f32 { (1.0f32 - p_rec * nh) / last_sum_f } else { 0.0f32 };
 
             // Dense pass: auto-vectorizes to AVX2 (8 × f32)
             if let Some(gs) = group_sizes {
@@ -820,7 +822,7 @@ pub fn calculate_weights(
                         let base = local * n_states;
                         let rsum: f64 = fwd_data[base..base + n_states].iter().map(|&v| v as f64).sum();
                         let mut ix: Vec<(usize, f64)> = (0..n_states).map(|j| (j, fwd_data[base + j] as f64)).filter(|&(_, v)| v > 0.0).collect();
-                        ix.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                        ix.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                         let t5: Vec<String> = ix.iter().take(5).map(|(j, v)| format!("s{}={:.10}", j, v)).collect();
                         writeln!(f, "row={} (blk{}[{}]) sum={:.12} nnz={} top5=[{}]",
                             cr, bi, local, rsum, ix.len(), t5.join(", ")).ok();
@@ -875,7 +877,7 @@ pub fn calculate_weights(
                         let wsum: f32 = csr.data[s..e].iter().sum();
                         let nnz = e - s;
                         let mut entries: Vec<(i32, f32)> = (s..e).map(|k| (csr.indices[k], csr.data[k])).collect();
-                        entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                        entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                         let t5: Vec<String> = entries.iter().take(5).map(|(j, v)| format!("h{}={:.10}", j, v)).collect();
                         writeln!(f, "CSR row={} sum={:.12} nnz={} top5=[{}]", cr, wsum, nnz, t5.join(", ")).ok();
                     }

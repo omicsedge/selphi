@@ -133,7 +133,7 @@ fn phase_genotypes_inner(
         let w_gen_pos = window::enforce_gen_pos(w_cm, w_bp);
         let w_size = we - ws;
         let mut diffs: Vec<f64> = (1..w_gen_pos.len()).map(|i| w_gen_pos[i] - w_gen_pos[i-1]).collect();
-        diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        diffs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median = if diffs.is_empty() { 1e-7 } else {
             crate::common::utils::median(&diffs)
         };
@@ -357,7 +357,7 @@ fn phase_genotypes_inner(
         // Pre-compute batch parameters for BOTH step resolutions
         let median_dist = {
             let mut dd: Vec<f64> = (1..w_cm.len()).map(|i| w_cm[i] - w_cm[i-1]).collect();
-            dd.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            dd.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             crate::common::utils::median(&dd)
         }.max(1e-7);
         // Coarse batch params
@@ -574,13 +574,13 @@ fn phase_genotypes_inner(
                     let mut sorted_switch: Vec<(f64, f64)> = em_results.iter()
                         .filter(|(_, _, g, s)| *g > 0.0 && *s > 0.0 && g.is_finite() && s.is_finite())
                         .map(|(_, _, g, s)| (*g, *s)).collect();
-                    sorted_switch.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap()
-                        .then(a.1.partial_cmp(&b.1).unwrap()));
+                    sorted_switch.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)));
                     for &(g, s) in &sorted_switch { wg += g; wsp += s; }
                     let mut sorted_mismatch: Vec<(i32, f64)> = em_results.iter()
                         .filter(|(c, m, _, _)| *c > 0 && *m > 0.0 && m.is_finite())
                         .map(|(c, m, _, _)| (*c, *m)).collect();
-                    sorted_mismatch.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap()
+                    sorted_mismatch.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
                         .then(a.0.cmp(&b.0)));
                     for &(c, m) in &sorted_mismatch { wc += c; wm += m; }
                     // pMismatch update (only increase)
@@ -605,7 +605,7 @@ fn phase_genotypes_inner(
                     }
                     // Convergence check (only at it==0, after first sub-iteration)
                     if it == 0 {
-                        let w_ri_f64 = wsp / wg;
+                        let w_ri_f64 = if wg > 0.0 { wsp / wg } else { 0.0 };
                         if em_it > 0 && prev_ri_f64 > 0.0 && (w_ri_f64 - prev_ri_f64).abs() <= 0.1 * prev_ri_f64 { break; }
                         prev_ri_f64 = w_ri_f64;
                     }
