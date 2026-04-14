@@ -101,6 +101,7 @@ pub fn fmt_cpu(wall_secs: f64, cpu_start: f64, n_cores: usize) -> String {
 
 /// Peak resident set size in MB (Linux /proc/self/status).
 pub fn peak_mem_mb() -> f64 {
+    // Linux: /proc/self/status VmHWM
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
         for line in status.lines() {
             if line.starts_with("VmHWM:") {
@@ -109,6 +110,20 @@ pub fn peak_mem_mb() -> f64 {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0.0);
                 return kb / 1024.0;
+            }
+        }
+    }
+    // macOS fallback: parse `ps` output for RSS
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+        {
+            if let Ok(s) = String::from_utf8(out.stdout) {
+                if let Ok(kb) = s.trim().parse::<f64>() {
+                    return kb / 1024.0;
+                }
             }
         }
     }

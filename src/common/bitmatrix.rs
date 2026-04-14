@@ -74,6 +74,7 @@ impl HaplotypeBitmatrix {
     #[inline(always)]
     pub fn get(&self, site: usize, hap: usize) -> bool {
         let idx = site * self.n_words + hap / 64;
+        debug_assert!(idx < self.bits.len(), "bitmatrix get: idx={} >= len={} (site={}, hap={})", idx, self.bits.len(), site, hap);
         (self.bits[idx] >> (hap % 64)) & 1 != 0
     }
 
@@ -81,6 +82,7 @@ impl HaplotypeBitmatrix {
     #[inline(always)]
     pub fn set(&mut self, site: usize, hap: usize, val: bool) {
         let idx = site * self.n_words + hap / 64;
+        debug_assert!(idx < self.bits.len(), "bitmatrix set: idx={} >= len={} (site={}, hap={})", idx, self.bits.len(), site, hap);
         let bit = 1u64 << (hap % 64);
         if val { self.bits[idx] |= bit; } else { self.bits[idx] &= !bit; }
     }

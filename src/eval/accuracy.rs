@@ -107,8 +107,8 @@ impl SampleAccumulator {
             let num = n * self.sum_ds_gt[s] - self.sum_ds[s] * self.sum_gt[s];
             let den_x = n * self.sum_ds2[s] - self.sum_ds[s] * self.sum_ds[s];
             let den_y = n * self.sum_gt2[s] - self.sum_gt[s] * self.sum_gt[s];
-            let den = (den_x * den_y).max(0.0).sqrt();
-            if den > 0.0 { (num / den).powi(2) } else { 0.0 }
+            let den = (den_x.max(0.0) * den_y.max(0.0)).sqrt();
+            if den > 0.0 { (num / den).powi(2).clamp(0.0, 1.0) } else { 0.0 }
         }).collect()
     }
 

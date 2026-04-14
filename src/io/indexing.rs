@@ -158,6 +158,11 @@ fn scan_bcf(bgzf: &mut impl io::Read) -> io::Result<FileInfo> {
     while io::Read::read_exact(bgzf, &mut rec_hdr).is_ok() {
         let l_shared = u32::from_le_bytes(rec_hdr[0..4].try_into().unwrap()) as usize;
         let l_indiv = u32::from_le_bytes(rec_hdr[4..8].try_into().unwrap()) as usize;
+        // Sanity check: BCF records should not exceed 256 MB
+        if l_shared > 256 * 1024 * 1024 || l_indiv > 256 * 1024 * 1024 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("BCF record too large: l_shared={}, l_indiv={} (file may be corrupted)", l_shared, l_indiv)));
+        }
 
         let mut shared = vec![0u8; l_shared];
         io::Read::read_exact(bgzf, &mut shared)?;

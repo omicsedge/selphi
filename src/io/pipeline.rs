@@ -435,7 +435,9 @@ fn format_tile_batch(
     an_str: &[u8],
     no_ap: bool,
 ) -> Vec<u8> {
-    // Split into coarse chunks for parallel formatting.
+    // Validate dimensions
+    debug_assert!(alt_probs.len() >= n_haps * tile_n,
+        "alt_probs too small: {} < {} * {}", alt_probs.len(), n_haps, tile_n);
     if tile_n == 0 { return Vec::new(); }
     let n_chunks = 16.min(tile_n);
     let chunk_size = tile_n.div_ceil(n_chunks);

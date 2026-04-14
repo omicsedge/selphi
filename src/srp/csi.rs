@@ -23,33 +23,34 @@ pub struct CsiIndex {
     pub n_ref: usize,
 }
 
-/// Parse a .csi index file. Scans all reference sequences and selects the one
-/// with the most mapped records (highest n_mapped from pseudo-bin).
-pub fn parse_csi(path: &Path) -> io::Result<CsiIndex> {
+/// Decompress CSI file and parse header. Returns (data, min_shift, depth, n_ref, offset_after_header).
+fn decompress_csi_header(path: &Path) -> io::Result<(Vec<u8>, i32, i32, usize, usize)> {
     let raw = std::fs::read(path)?;
-
-    // CSI is BGZF-compressed
     let data = {
         let mut bgzf = noodles_bgzf::io::Reader::new(&raw[..]);
         let mut dec = Vec::new();
         bgzf.read_to_end(&mut dec)?;
         dec
     };
-
     if data.len() < 16 || &data[..4] != b"CSI\x01" {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "not a CSI index"));
     }
-
     let mut off = 4;
     let min_shift = i32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4;
     let depth = i32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4;
     let l_aux = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
-    off += l_aux; // skip aux data
+    off += l_aux;
     let n_ref = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
-
     if n_ref == 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "no reference sequences in CSI"));
     }
+    Ok((data, min_shift, depth, n_ref, off))
+}
+
+/// Parse a .csi index file. Scans all reference sequences and selects the one
+/// with the most mapped records (highest n_mapped from pseudo-bin).
+pub fn parse_csi(path: &Path) -> io::Result<CsiIndex> {
+    let (data, min_shift, depth, n_ref, mut off) = decompress_csi_header(path)?;
 
     // Scan all reference sequences, pick the one with the most data
     let mut best_ref: usize = 0;
@@ -172,25 +173,7 @@ pub struct ContigCsiIndex {
 /// Parse a CSI index file and return per-contig index data for ALL contigs
 /// that have mapped records. Returns entries sorted by ref_seq_id.
 pub fn parse_csi_all_contigs(path: &Path) -> io::Result<Vec<ContigCsiIndex>> {
-    let raw = std::fs::read(path)?;
-
-    let data = {
-        let mut bgzf = noodles_bgzf::io::Reader::new(&raw[..]);
-        let mut dec = Vec::new();
-        bgzf.read_to_end(&mut dec)?;
-        dec
-    };
-
-    if data.len() < 16 || &data[..4] != b"CSI\x01" {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "not a CSI index"));
-    }
-
-    let mut off = 4;
-    let min_shift = i32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4;
-    let depth = i32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4;
-    let l_aux = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
-    off += l_aux;
-    let n_ref = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
+    let (data, min_shift, depth, n_ref, mut off) = decompress_csi_header(path)?;
 
     let mut result = Vec::new();
 
