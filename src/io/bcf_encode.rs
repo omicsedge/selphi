@@ -137,23 +137,30 @@ pub fn encode_imputed_record(
     let n_fmt: u8 = if no_ap { 2 } else { 4 }; // GT+DS or GT+DS+AP1+AP2
     let n_info: u16 = 5; // AF, AC, AN, DR2, IMP
 
-    // --- Compute stats in a single pass ---
+    // --- Two-pass DR2: var(dosage) / var_expected, numerically stable ---
+    // Pass 1: dosage sum + hardcall AC
     let mut ac = 0u32;
     let mut p_sum = 0.0f64;
-    let mut p_sq_sum = 0.0f64;
     for s in 0..n_samples {
         let ap1 = alt_probs[(s * 2) * tile_n + v];
         let ap2 = alt_probs[(s * 2 + 1) * tile_n + v];
         if ap1 > 0.5 { ac += 1; }
         if ap2 > 0.5 { ac += 1; }
-        p_sum += ap1 as f64 + ap2 as f64;
-        p_sq_sum += (ap1 as f64).powi(2) + (ap2 as f64).powi(2);
+        p_sum += (ap1 + ap2) as f64;
     }
     let af = ac as f32 / n_haps as f32;
     let p_hat = p_sum / n_haps as f64;
-    let ev = p_hat * (1.0 - p_hat);
-    let vh = p_sq_sum / n_haps as f64 - p_hat * p_hat;
-    let dr2 = if ev > 0.0 { (vh / ev).clamp(0.0, 1.0) as f32 } else { 0.0f32 };
+    // Pass 2: variance of dosage
+    let mut var_sum = 0.0f64;
+    for s in 0..n_samples {
+        let ap1 = alt_probs[(s * 2) * tile_n + v];
+        let ap2 = alt_probs[(s * 2 + 1) * tile_n + v];
+        let d = (ap1 + ap2) as f64 - 2.0 * p_hat;
+        var_sum += d * d;
+    }
+    let var_dosage = var_sum / n_haps as f64;
+    let var_expected = 2.0 * p_hat * (1.0 - p_hat);
+    let dr2 = if var_expected > 1e-10 { (var_dosage / var_expected).clamp(0.0, 1.0) as f32 } else { 0.0f32 };
 
     // --- Build shared data ---
     let shared_start = buf.len();

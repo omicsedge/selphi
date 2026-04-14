@@ -483,23 +483,29 @@ fn format_tile_batch(
             } else {
                 // Single pass: compute stats AND format simultaneously.
                 // Write prefix + INFO first (need stats), then samples.
+                // Two-pass DR2: var(dosage) / var_expected, numerically stable
+                // Pass 1: dosage sum + hardcall AC
                 let mut ac = 0u32;
                 let mut p_sum = 0.0f64;
-                let mut p_sq_sum = 0.0f64;
                 for s in 0..n_samples {
                     let ap1 = alt_probs[(s * 2) * tile_n + v];
                     let ap2 = alt_probs[(s * 2 + 1) * tile_n + v];
-                    let gt1 = if ap1 > 0.5 { 1u32 } else { 0 };
-                    let gt2 = if ap2 > 0.5 { 1u32 } else { 0 };
-                    ac += gt1 + gt2;
-                    p_sum += ap1 as f64 + ap2 as f64;
-                    p_sq_sum += (ap1 as f64) * (ap1 as f64) + (ap2 as f64) * (ap2 as f64);
+                    ac += if ap1 > 0.5 { 1u32 } else { 0 } + if ap2 > 0.5 { 1u32 } else { 0 };
+                    p_sum += (ap1 + ap2) as f64;
                 }
                 let af = ac as f64 / n_haps as f64;
                 let p_hat = p_sum / n_haps as f64;
-                let ev = p_hat * (1.0 - p_hat);
-                let vh = p_sq_sum / n_haps as f64 - p_hat * p_hat;
-                let dr2 = if ev > 0.0 { (vh / ev).clamp(0.0, 1.0) } else { 0.0 };
+                // Pass 2: variance of dosage (sum of squared deviations from mean)
+                let mut var_sum = 0.0f64;
+                for s in 0..n_samples {
+                    let ap1 = alt_probs[(s * 2) * tile_n + v];
+                    let ap2 = alt_probs[(s * 2 + 1) * tile_n + v];
+                    let d = (ap1 + ap2) as f64 - 2.0 * p_hat;
+                    var_sum += d * d;
+                }
+                let var_dosage = var_sum / n_haps as f64;
+                let var_expected = 2.0 * p_hat * (1.0 - p_hat);
+                let dr2 = if var_expected > 1e-10 { (var_dosage / var_expected).clamp(0.0, 1.0) } else { 0.0 };
 
                 buf.extend_from_slice(&vid_prefixes[vid_prefix_offset + v]);
                 buf.extend_from_slice(b"\t.\tPASS\tAF=");
