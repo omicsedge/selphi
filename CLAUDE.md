@@ -36,6 +36,9 @@ selphi --prepare-reference-from panel.bref3 --out panel --threads 16  # BREF3 �
 selphi --prepare-reference-from panel.srp --out panel.bref3           # SRP → BREF3
 selphi --prepare-reference-from /dir/of/bcfs/ --out all_chrs --threads 16  # Directory → multi-chr SRP
 selphi --merge-srps chr1.srp,chr2.srp,...,chr22.srp --out all_chrs         # Merge per-chr → multi-chr SRP
+
+# Mixed-density panel (WGS + chip augmentation)
+selphi --prepare-merged-panel --wgs panel.srp --chip chip.vcf.gz --map map.map --out merged
 ```
 
 ## Output Formats
@@ -126,10 +129,12 @@ Input VCF/BCF
 | `io/pgen_output.rs` | PLINK2 PGEN writer |
 | `io/bcf_writer.rs` | BGZF multi-threaded writer |
 | `imputation/window_process.rs` | Shared per-window PBWT+HMM processing |
+| `imputation/chip_only_interp.rs` | Chip-only variant interpolation via WGS→chip proxy mapping |
 | `srp/mod.rs` | SRP types (CscChunk, SparseTile, Variant) |
 | `srp/reader.rs` | SRP reader (single-chr) |
 | `srp/multi_chr_reader.rs` | Multi-chr SRP reader + ChrSrpView |
 | `srp/multi_chr_writer.rs` | Multi-chr SRP writer + merge + build from directory |
+| `srp/merged_panel_writer.rs` | Mixed-density panel builder (WGS + chip → SRP with augment) |
 | `srp/writer.rs` | SRP writer (BCF/VCF/BREF3 → .srp) |
 | `srp/tiled.rs` | Tile writer + PreloadedStripes |
 | `srp/bcf_reader.rs` | Native BCF2 parser (parallel) |
