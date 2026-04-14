@@ -1,11 +1,11 @@
 //! Built-in self-test: exercises all output formats and code paths.
 //!
+//! Zero external dependencies — all validation is native (no bcftools required).
 //! Usage: `selphi --self-test --refpanel X --input Y --map Z [--truth T] --out prefix`
 
 use std::path::{Path, PathBuf};
 use selphi::selphi_info;
 
-/// Configuration for the self-test, extracted from CLI args.
 pub struct SelfTestConfig<'a> {
     pub refpanel: &'a str,
     pub input: &'a str,
@@ -15,7 +15,7 @@ pub struct SelfTestConfig<'a> {
     pub threads: usize,
 }
 
-/// Run a single test by spawning selphi as a subprocess.
+/// Run a single selphi subprocess test.
 fn run_one(name: &str, cli_args: &[&str], pass: &mut u32, fail: &mut u32) {
     let exe = std::env::current_exe().expect("cannot find own executable");
     let output = std::process::Command::new(exe).args(cli_args).output();
@@ -37,12 +37,109 @@ fn run_one(name: &str, cli_args: &[&str], pass: &mut u32, fail: &mut u32) {
     }
 }
 
-/// Run all self-tests. Returns the number of failures (0 = all pass).
+/// Native VCF validation: decompress and count header + data lines.
+/// Returns (n_samples, n_variants) or error.
+fn validate_vcf(path: &Path) -> Result<(usize, usize), String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| format!("open: {}", e))?;
+    let mut bgzf = noodles_bgzf::io::Reader::new(std::io::BufReader::new(file));
+    let mut raw = Vec::new();
+    bgzf.read_to_end(&mut raw).map_err(|e| format!("decompress: {}", e))?;
+
+    let mut n_samples = 0;
+    let mut n_variants = 0;
+    for line in raw.split(|&b| b == b'\n') {
+        if line.is_empty() { continue; }
+        if line.starts_with(b"#CHROM") {
+            n_samples = line.split(|&b| b == b'\t').count().saturating_sub(9);
+        } else if !line.starts_with(b"#") {
+            n_variants += 1;
+        }
+    }
+    if n_samples == 0 { return Err("no #CHROM header found".into()); }
+    if n_variants == 0 { return Err("no data lines found".into()); }
+    Ok((n_samples, n_variants))
+}
+
+/// Native BCF validation: read header and count records.
+fn validate_bcf(path: &Path) -> Result<(usize, usize), String> {
+    let header = selphi::srp::bcf_reader::read_header_only(path)
+        .map_err(|e| format!("BCF header: {}", e))?;
+    if header.n_samples == 0 { return Err("no samples".into()); }
+
+    // Count records by reading raw BCF
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| format!("open: {}", e))?;
+    let mut bgzf = noodles_bgzf::io::Reader::new(std::io::BufReader::new(file));
+    let mut magic = [0u8; 5]; bgzf.read_exact(&mut magic).map_err(|e| format!("{}", e))?;
+    let mut buf4 = [0u8; 4];
+    bgzf.read_exact(&mut buf4).map_err(|e| format!("{}", e))?;
+    let hl = u32::from_le_bytes(buf4) as usize;
+    let mut hdr = vec![0u8; hl]; bgzf.read_exact(&mut hdr).map_err(|e| format!("{}", e))?;
+
+    let mut n_variants = 0usize;
+    loop {
+        if bgzf.read_exact(&mut buf4).is_err() { break; }
+        let ls = u32::from_le_bytes(buf4) as usize;
+        if ls == 0 { break; }
+        if bgzf.read_exact(&mut buf4).is_err() { break; }
+        let li = u32::from_le_bytes(buf4) as usize;
+        let mut skip = vec![0u8; ls + li];
+        if bgzf.read_exact(&mut skip).is_err() { break; }
+        n_variants += 1;
+    }
+    if n_variants == 0 { return Err("no records".into()); }
+    Ok((header.n_samples, n_variants))
+}
+
+/// Native TBI/CSI index validation: decompress and check structure.
+fn validate_index(path: &Path) -> Result<(String, usize), String> {
+    let raw = std::fs::read(path).map_err(|e| format!("read: {}", e))?;
+    // Decompress BGZF
+    use std::io::Read;
+    let mut bgzf = noodles_bgzf::io::Reader::new(&raw[..]);
+    let mut data = Vec::new();
+    bgzf.read_to_end(&mut data).map_err(|e| format!("decompress: {}", e))?;
+
+    if data.len() < 8 { return Err("too small".into()); }
+    let magic = &data[0..4];
+    let (format, n_ref_offset) = match magic {
+        b"TBI\x01" => ("TBI", 4),
+        b"CSI\x01" => ("CSI", 4 + 4 + 4 + 4), // skip min_shift, depth, l_aux
+        _ => return Err(format!("unknown magic {:?}", &magic[..4])),
+    };
+
+    // For CSI, skip l_aux bytes
+    let mut off = n_ref_offset;
+    if format == "CSI" {
+        if data.len() < 16 { return Err("CSI too small".into()); }
+        let l_aux = i32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
+        off = 16 + l_aux;
+    }
+    if off + 4 > data.len() { return Err("truncated".into()); }
+    let n_ref = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize;
+    if n_ref == 0 { return Err("n_ref=0".into()); }
+
+    Ok((format.to_string(), n_ref))
+}
+
+/// Check that a file exists and has non-zero size.
+fn check_file(name: &str, path: &Path, pass: &mut u32, fail: &mut u32) -> bool {
+    if path.exists() {
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if size > 0 {
+            return true;
+        }
+    }
+    *fail += 1;
+    selphi_info!("  \x1b[31mFAIL\x1b[0m  {} (file missing or empty)", name);
+    false
+}
+
 pub fn run(config: &SelfTestConfig) -> u32 {
     let SelfTestConfig { refpanel, input, map, out_base, truth, threads } = config;
     let t = format!("--threads={}", threads);
 
-    // Initialize logger + banner (same pattern as other modes)
     let log_path = PathBuf::from(out_base).with_extension("log");
     selphi::log::init(&log_path, false);
     selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
@@ -61,6 +158,8 @@ pub fn run(config: &SelfTestConfig) -> u32 {
             run_one($name, &[$($arg),+], &mut pass, &mut fail)
         };
     }
+
+    // ── Pipeline tests ──────────────────────────────────────────────
 
     // 1. Phase-only
     let out = format!("{}_phase", out_base);
@@ -92,7 +191,7 @@ pub fn run(config: &SelfTestConfig) -> u32 {
     test!("impute → SelfDecode",
         "--refpanel", refpanel, "--input", input, "--map", map, "--out", &out, &t, "--selfdecode");
 
-    // 7. Pre-phased input (uses phase-only output from test 1)
+    // 7. Pre-phased input
     let phased_vcf = format!("{}_phase.vcf.gz", out_base);
     let out = format!("{}_prephased", out_base);
     test!("pre-phased input",
@@ -106,31 +205,152 @@ pub fn run(config: &SelfTestConfig) -> u32 {
             "--evaluate", &vcf_out, "--truth", truth_path, "--out", &out, &t);
     }
 
-    // 9. BCF readability via bcftools (external, optional)
-    let bcf_path = format!("{}_bcf.bcf", out_base);
-    if Path::new(&bcf_path).exists() {
-        let query = std::process::Command::new("bcftools")
-            .args(["view", "-H", &bcf_path])
-            .output();
-        match query {
-            Ok(o) if o.status.success() => {
-                let n = o.stdout.iter().filter(|&&b| b == b'\n').count();
-                if n > 0 {
-                    pass += 1;
-                    selphi_info!("  \x1b[32mPASS\x1b[0m  BCF readable ({} variants)", n);
-                } else {
-                    fail += 1;
-                    selphi_info!("  \x1b[31mFAIL\x1b[0m  BCF empty");
-                }
+    // ── Output validation (native, no bcftools) ─────────────────────
+
+    // 9. VCF output: decompress and count samples + variants
+    let vcf_path = PathBuf::from(format!("{}_vcf.vcf.gz", out_base));
+    if check_file("VCF output exists", &vcf_path, &mut pass, &mut fail) {
+        match validate_vcf(&vcf_path) {
+            Ok((ns, nv)) => {
+                pass += 1;
+                selphi_info!("  \x1b[32mPASS\x1b[0m  VCF valid ({} samples, {} variants)", ns, nv);
             }
-            _ => {
+            Err(e) => {
                 fail += 1;
-                selphi_info!("  \x1b[31mFAIL\x1b[0m  BCF read (bcftools not found?)");
+                selphi_info!("  \x1b[31mFAIL\x1b[0m  VCF invalid ({})", e);
             }
         }
     }
 
-    // Summary
+    // 10. BCF output: read header + count records
+    let bcf_path = PathBuf::from(format!("{}_bcf.bcf", out_base));
+    if check_file("BCF output exists", &bcf_path, &mut pass, &mut fail) {
+        match validate_bcf(&bcf_path) {
+            Ok((ns, nv)) => {
+                pass += 1;
+                selphi_info!("  \x1b[32mPASS\x1b[0m  BCF valid ({} samples, {} variants)", ns, nv);
+            }
+            Err(e) => {
+                fail += 1;
+                selphi_info!("  \x1b[31mFAIL\x1b[0m  BCF invalid ({})", e);
+            }
+        }
+    }
+
+    // ── Index validation (native) ───────────────────────────────────
+
+    // 11. TBI index: rebuild and verify structure
+    if vcf_path.exists() {
+        let tbi_path = PathBuf::from(format!("{}.tbi", vcf_path.display()));
+        let _ = std::fs::remove_file(&tbi_path);
+        match selphi::io::indexing::index_file(&vcf_path) {
+            Ok(()) if tbi_path.exists() => {
+                match validate_index(&tbi_path) {
+                    Ok((fmt, n_ref)) => {
+                        pass += 1;
+                        selphi_info!("  \x1b[32mPASS\x1b[0m  TBI index valid ({}, {} contig{})", fmt, n_ref,
+                            if n_ref != 1 { "s" } else { "" });
+                    }
+                    Err(e) => {
+                        fail += 1;
+                        selphi_info!("  \x1b[31mFAIL\x1b[0m  TBI index corrupt ({})", e);
+                    }
+                }
+            }
+            _ => {
+                fail += 1;
+                selphi_info!("  \x1b[31mFAIL\x1b[0m  TBI index build failed");
+            }
+        }
+    }
+
+    // 12. CSI index: rebuild and verify structure
+    if bcf_path.exists() {
+        let csi_path = PathBuf::from(format!("{}.csi", bcf_path.display()));
+        let _ = std::fs::remove_file(&csi_path);
+        match selphi::io::indexing::index_file(&bcf_path) {
+            Ok(()) if csi_path.exists() => {
+                match validate_index(&csi_path) {
+                    Ok((fmt, n_ref)) => {
+                        pass += 1;
+                        selphi_info!("  \x1b[32mPASS\x1b[0m  CSI index valid ({}, {} contig{})", fmt, n_ref,
+                            if n_ref != 1 { "s" } else { "" });
+                    }
+                    Err(e) => {
+                        fail += 1;
+                        selphi_info!("  \x1b[31mFAIL\x1b[0m  CSI index corrupt ({})", e);
+                    }
+                }
+            }
+            _ => {
+                fail += 1;
+                selphi_info!("  \x1b[31mFAIL\x1b[0m  CSI index build failed");
+            }
+        }
+    }
+
+    // ── Parquet / PGEN / SelfDecode file existence ──────────────────
+
+    let pq_path = PathBuf::from(format!("{}_parquet.parquet", out_base));
+    if check_file("Parquet output exists", &pq_path, &mut pass, &mut fail) {
+        pass += 1;
+        let sz = std::fs::metadata(&pq_path).map(|m| m.len()).unwrap_or(0);
+        selphi_info!("  \x1b[32mPASS\x1b[0m  Parquet file ({:.1} MB)", sz as f64 / 1e6);
+    }
+
+    let pgen_path = PathBuf::from(format!("{}_pgen.pgen", out_base));
+    let pvar_path = PathBuf::from(format!("{}_pgen.pvar", out_base));
+    let psam_path = PathBuf::from(format!("{}_pgen.psam", out_base));
+    if check_file("PGEN output exists", &pgen_path, &mut pass, &mut fail) {
+        if pvar_path.exists() && psam_path.exists() {
+            pass += 1;
+            selphi_info!("  \x1b[32mPASS\x1b[0m  PGEN triplet (.pgen + .pvar + .psam)");
+        } else {
+            fail += 1;
+            selphi_info!("  \x1b[31mFAIL\x1b[0m  PGEN missing .pvar or .psam");
+        }
+    }
+
+    let sd_path = PathBuf::from(format!("{}_sd.selfdecode.zip", out_base));
+    if check_file("SelfDecode output exists", &sd_path, &mut pass, &mut fail) {
+        pass += 1;
+        let sz = std::fs::metadata(&sd_path).map(|m| m.len()).unwrap_or(0);
+        selphi_info!("  \x1b[32mPASS\x1b[0m  SelfDecode ZIP ({:.1} MB)", sz as f64 / 1e6);
+    }
+
+    // ── Mixed-density panel ─────────────────────────────────────────
+
+    // 13. Build merged panel (self-augment: use input as chip data)
+    let merged_out = format!("{}_merged_panel", out_base);
+    let merged_srp = format!("{}.srp", merged_out);
+    test!("merged panel build",
+        "--prepare-merged-panel", "--wgs", refpanel, "--chip", input, "--map", map,
+        "--out", &merged_out, &t);
+
+    // 14. Impute with merged panel
+    if Path::new(&merged_srp).exists() {
+        let imp_out = format!("{}_merged_imputed", out_base);
+        test!("merged panel impute",
+            "--refpanel", &merged_srp, "--input", input, "--map", map,
+            "--out", &imp_out, &t);
+
+        // Validate merged output natively
+        let imp_vcf = PathBuf::from(format!("{}.vcf.gz", imp_out));
+        if imp_vcf.exists() {
+            match validate_vcf(&imp_vcf) {
+                Ok((ns, nv)) => {
+                    pass += 1;
+                    selphi_info!("  \x1b[32mPASS\x1b[0m  merged panel VCF valid ({} samples, {} variants)", ns, nv);
+                }
+                Err(e) => {
+                    fail += 1;
+                    selphi_info!("  \x1b[31mFAIL\x1b[0m  merged panel VCF invalid ({})", e);
+                }
+            }
+        }
+    }
+
+    // ── Summary ─────────────────────────────────────────────────────
     selphi_info!("");
     if fail == 0 {
         selphi_info!("All {} tests passed.", pass);
