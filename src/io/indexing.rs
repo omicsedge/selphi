@@ -216,12 +216,10 @@ fn scan_vcf(bgzf: &mut impl io::Read) -> io::Result<FileInfo> {
 
     // Split into header and data
     let mut header_end = 0;
-    let mut sample_line_start = 0;
-    for (i, line) in buf.split(|&b| b == b'\n').enumerate() {
+    for (_i, line) in buf.split(|&b| b == b'\n').enumerate() {
         if line.starts_with(b"#CHROM") {
-            sample_line_start = buf.windows(6).position(|w| w == b"#CHROM").unwrap_or(0);
-            // Find end of this line
-            header_end = sample_line_start + line.len();
+            let chrom_pos = buf.windows(6).position(|w| w == b"#CHROM").unwrap_or(0);
+            header_end = chrom_pos + line.len();
             break;
         }
         if !line.starts_with(b"#") { break; }

@@ -785,10 +785,7 @@ struct InlineBinData {
     chunks: Vec<(u64, u64)>,
 }
 
-enum IndexFormat { Tbi, Csi }
-
 pub struct InlineIndexBuilder {
-    format: IndexFormat,
     depth: i32,
     contig_names: Vec<String>,
     contig_map: std::collections::HashMap<String, usize>,
@@ -802,7 +799,7 @@ pub struct InlineIndexBuilder {
 impl InlineIndexBuilder {
     pub fn new_tbi() -> Self {
         Self {
-            format: IndexFormat::Tbi, depth: TBI_DEPTH,
+            depth: TBI_DEPTH,
             contig_names: Vec::new(), contig_map: std::collections::HashMap::new(),
             ref_bins: BTreeMap::new(), ref_n_mapped: BTreeMap::new(),
             ref_linear: BTreeMap::new(), bcf_n_contigs: 0, bcf_header_done: false,
@@ -811,7 +808,7 @@ impl InlineIndexBuilder {
 
     pub fn new_csi() -> Self {
         Self {
-            format: IndexFormat::Csi, depth: CSI_DEPTH,
+            depth: CSI_DEPTH,
             contig_names: Vec::new(), contig_map: std::collections::HashMap::new(),
             ref_bins: BTreeMap::new(), ref_n_mapped: BTreeMap::new(),
             ref_linear: BTreeMap::new(), bcf_n_contigs: 0, bcf_header_done: false,

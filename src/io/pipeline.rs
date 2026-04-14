@@ -522,9 +522,27 @@ fn format_tile_batch(
                     buf.extend_from_slice(b";IMP\tGT:DS:AP1:AP2");
                 }
 
+                // Pre-computed constant strings for trivial dosages (>95% of samples for rare variants)
+                const HOMREF_GTDS: &[u8] = b"\t0|0:0";
+                const HOMREF_GTDS_AP: &[u8] = b"\t0|0:0:0:0";
+                const HOMALT_GTDS: &[u8] = b"\t1|1:2";
+                const HOMALT_GTDS_AP: &[u8] = b"\t1|1:2:1:1";
+
                 for s in 0..n_samples {
                     let ap1 = alt_probs[(s * 2) * tile_n + v];
                     let ap2 = alt_probs[(s * 2 + 1) * tile_n + v];
+
+                    // Fast path: trivial dosage (hom-ref or hom-alt) — skip all float formatting
+                    if ap1 < 0.005 && ap2 < 0.005 {
+                        buf.extend_from_slice(if no_ap { HOMREF_GTDS } else { HOMREF_GTDS_AP });
+                        continue;
+                    }
+                    if ap1 > 0.995 && ap2 > 0.995 {
+                        buf.extend_from_slice(if no_ap { HOMALT_GTDS } else { HOMALT_GTDS_AP });
+                        continue;
+                    }
+
+                    // Standard path: format via lookup tables
                     let ds = ap1 + ap2;
                     let gt1 = if ap1 > 0.5 { 1usize } else { 0 };
                     let gt2 = if ap2 > 0.5 { 1usize } else { 0 };
