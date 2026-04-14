@@ -7,6 +7,7 @@
 #![allow(clippy::type_complexity)]
 
 mod self_test;
+mod multi_chr;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -80,6 +81,16 @@ struct Args {
     /// Create SRP reference panel from VCF.gz, BCF, or BREF3 (auto-detected)
     #[arg(long, alias = "prepare_reference_from", alias = "prepare-reference-from")]
     prepare_reference_from: Option<String>,
+
+    /// Directory with per-chr reference panels (chr{N}.srp or chr{N}_v2.srp).
+    /// Enables multi-chromosome mode: auto-discovers panels, splits input by
+    /// contig, imputes each, and concatenates into a single output.
+    #[arg(long)]
+    refpanel_dir: Option<String>,
+
+    /// Directory with per-chr genetic maps (chr{N}.map).
+    #[arg(long)]
+    map_dir: Option<String>,
 
     /// Random seed for phasing
     #[arg(long, default_value = "33")]
@@ -258,6 +269,28 @@ fn main() {
         let elapsed = start.elapsed().as_secs_f64();
         let mem = selphi::log::peak_mem_mb();
         selphi_info!("\nTotal: {:.1}s | Peak memory: {:.0} MB", elapsed, mem);
+        return;
+    }
+
+    // --- Multi-chromosome mode ---
+    if let Some(ref panel_dir) = args.refpanel_dir {
+        let input = args.input.as_ref().expect("--input required with --refpanel-dir");
+        let map_dir = args.map_dir.as_ref().expect("--map-dir required with --refpanel-dir");
+        let out = args.out.as_deref().unwrap_or("imputed");
+        let config = multi_chr::MultiChrConfig {
+            input, refpanel_dir: panel_dir, map_dir, out,
+            threads: args.threads,
+            extra_args: {
+                let mut ea = Vec::new();
+                if args.bcf { ea.push("--bcf".to_string()); }
+                if args.parquet { ea.push("--parquet".to_string()); }
+                if args.pgen { ea.push("--pgen".to_string()); }
+                if args.no_ap { ea.push("--no-ap".to_string()); }
+                ea
+            },
+        };
+        multi_chr::run(&config)
+            .unwrap_or_else(|e| { eprintln!("Error: {}", e); std::process::exit(1); });
         return;
     }
 
