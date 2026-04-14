@@ -92,11 +92,20 @@ Three equivalent workflows are supported — the user chooses whichever matches 
 # 1. Single chromosome (standard)
 selphi --refpanel chr22.srp --input chr22.vcf.gz --map chr22.map --out result
 
-# 2. Multi-chromosome directory (per-chr SRP files)
+# 2. Multi-chromosome with per-chr SRP files
 selphi --refpanel-dir panels/ --input whole_genome.vcf.gz --map-dir maps/ --out result
 
 # 3. Unified whole-genome (single multi-chromosome SRP file)
 selphi --refpanel all_chrs.srp --input whole_genome.vcf.gz --map all_chrs.map --out result
+```
+
+The genetic map can be provided in either form:
+- `--map all_chrs.map` — a single concatenated file (the chromosome column is used to partition entries)
+- `--map-dir maps/` — a directory of per-chromosome maps (auto-discovers `chr{N}.map` files)
+
+Both work with any SRP mode. To create a concatenated map from per-chromosome files:
+```bash
+cat chr1.map chr2.map ... chr22.map > all_chromosomes.map
 ```
 
 #### Creating a unified reference panel
@@ -106,19 +115,15 @@ From a directory of per-chromosome BCF or VCF files:
 selphi --prepare-reference-from /path/to/bcf_directory/ --out all_chromosomes --threads 16
 ```
 
-From existing per-chromosome SRP files:
+From existing per-chromosome SRP files (comma-separated list or directory):
 ```bash
 selphi --merge-srps chr1.srp,chr2.srp,...,chr22.srp --out all_chromosomes
+selphi --merge-srps-dir /path/to/srp_directory/ --out all_chromosomes
 ```
 
 From a multi-contig BCF file (auto-detected):
 ```bash
 selphi --prepare-reference-from all_chromosomes.bcf --out all_chromosomes --threads 16
-```
-
-The unified genetic map is simply a concatenation of per-chromosome PLINK maps. The chromosome column (column 1) is used to partition entries:
-```bash
-cat chr1.map chr2.map ... chr22.map > all_chromosomes.map
 ```
 
 Memory usage is bounded: only one chromosome's working set is held at a time, with a lightweight prefetch buffer (~200 MB) for the next chromosome. Peak memory equals that of the largest single chromosome.
@@ -288,7 +293,7 @@ Standard VCF or BCF. Unphased (`0/1`) or phased (`0|1`) genotypes. Multi-allelic
 | **Imputation** | | |
 | `--refpanel PATH` | Reference panel in SRP format | required |
 | `--input PATH` | Input VCF/BCF with target samples | required |
-| `--map PATH` | Genetic map in PLINK format | required |
+| `--map PATH` | Genetic map in PLINK format (single file or concatenated multi-chr) | required* |
 | `--out PATH` | Output path prefix | required |
 | `--threads N` | Number of threads | all CPUs |
 | `--truth PATH` | Truth VCF/BCF for inline accuracy evaluation | |
@@ -310,8 +315,9 @@ Standard VCF or BCF. Unphased (`0/1`) or phased (`0|1`) genotypes. Multi-allelic
 | `--index-stats PATH` | Show file statistics and per-contig genomic ranges | |
 | **Multi-chromosome** | | |
 | `--refpanel-dir DIR` | Directory with per-chr SRP files (auto-discovers chromosomes) | |
-| `--map-dir DIR` | Directory with per-chr genetic maps | |
-| `--merge-srps PATHS` | Merge per-chr SRP files into a single multi-chromosome SRP (comma-separated) | |
+| `--map-dir DIR` | Directory with per-chr genetic maps (`chr{N}.map`). Alternative to `--map` | |
+| `--merge-srps PATHS` | Merge per-chr SRP files into multi-chromosome SRP (comma-separated) | |
+| `--merge-srps-dir DIR` | Merge all SRP files from a directory into multi-chromosome SRP | |
 | **Reference panel** | | |
 | `--prepare-reference-from PATH` | Create SRP from VCF.gz, BCF, BREF3, or directory of per-chr files | |
 | `--chunk-size N` | Chunk size for SRP creation (0 = auto) | 0 |
