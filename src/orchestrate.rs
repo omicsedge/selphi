@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use rayon::prelude::*;
-
 use selphi::{selphi_info, selphi_step};
 use selphi::srp::MultiChrSrpReader;
 use selphi::io::target_io::{
@@ -346,42 +345,29 @@ pub fn run_multi_chr(
 
         // Per-window imputation loop
         let mut hap_priors: Vec<Option<Vec<f64>>> = vec![None; n_haps];
-        let max_candidates = config.max_candidates;
-        let p_err = config.p_err;
+        let hmm_params = selphi::imputation::window_process::WindowHmmParams {
+            n_ref, n_haps, match_length, fl_fwd, fl_bwd,
+            est_ne: est_ne as f64, p_err: config.p_err,
+            max_candidates: config.max_candidates,
+        };
 
         for (wi, window) in windows.iter().enumerate() {
             let n_var_w = window.chip_end - window.chip_start;
             let targ_w = extract_subarray(&targ_alleles, n_haps, window.chip_start, window.chip_end);
             let cm_w = &chip_cm[window.chip_start..window.chip_end];
-            let m = n_ref + n_haps;
 
-            // Build ref_w from bitmatrix
-            let mut ref_w = vec![0u8; n_var_w * n_ref];
-            ref_w.par_chunks_mut(n_ref).enumerate().for_each(|(var, dst)| {
-                let ci = window.chip_start + var;
-                let row = ref_bm_imp.row(ci);
-                for w in 0..ref_bm_imp.n_words() {
-                    let mut word = row[w];
-                    let base = w * 64;
-                    while word != 0 {
-                        let k = word.trailing_zeros() as usize;
-                        let r = base + k;
-                        if r < n_ref { unsafe { *dst.get_unchecked_mut(r) = 1; } }
-                        word &= word - 1;
-                    }
-                }
-            });
+            // Extract ref_w from bitmatrix (parallel)
+            let ref_w = selphi::imputation::window_process::extract_ref_window(
+                &ref_bm_imp, window.chip_start, n_var_w, n_ref);
 
             // CodedSteps
             let coded = selphi::imputation::pbwt::build_coded_steps_bm(
                 &ref_bm_imp, window.chip_start, n_var_w, n_ref, &targ_w, n_haps, cm_w, 0.05,
             );
 
-            let breaks_w = vec![(0usize, n_var_w)];
             let ne_w: Option<Vec<f64>> = final_ne_per_site.as_ref().map(|ne| {
                 ne[window.chip_start..window.chip_end].to_vec()
             });
-            let ne_w_ref = ne_w.as_deref();
 
             // Preload stripes for interpolation
             let own_start = if window.own_chip_start == 0 { 0 } else { wgs_idx[window.own_chip_start] };
@@ -394,98 +380,19 @@ pub fn run_multi_chr(
                 let n_stripes = last_stripe - first_stripe + 1;
                 let stripe_comp = tiled_ref.stripe_compressed_bytes(first_stripe);
                 let n_load = (500 * 1024 * 1024 / stripe_comp.max(1)).max(10).min(n_stripes);
-                // Preload on current thread (simpler than spawning — tiled preload is fast)
                 Some(tiled_ref.preload_stripes(first_stripe, n_load).ok())
             } else {
                 None
             };
 
-            // HMM for all haplotypes
-            let all_results: Vec<(usize, selphi::imputation::hmm::HmmResult)> = (0..n_haps)
-                .into_par_iter()
-                .map(|tgt| {
-                    let prior = hap_priors[tgt].as_deref();
-                    let candidates = if let Some(ref pc) = precomputed_candidates {
-                        pc[tgt].clone()
-                    } else {
-                        selphi::imputation::pbwt::select_candidates(
-                            &coded, n_ref + tgt, n_ref, 7, max_candidates,
-                        )
-                    };
-                    let n_cand = candidates.len();
-                    let m_red = if n_cand < 100 { m } else { n_cand + 1 };
-                    let is_full = n_cand < 100;
-
-                    let mut reduced = vec![0u8; n_var_w * m_red];
-
-                    if is_full {
-                        for var in 0..n_var_w {
-                            let ci = window.chip_start + var;
-                            let row = ref_bm_imp.row(ci);
-                            let dst_base = var * m;
-                            let ref_dst = &mut reduced[dst_base..dst_base + n_ref];
-                            for w in 0..ref_bm_imp.n_words() {
-                                let mut word = row[w];
-                                let base = w * 64;
-                                while word != 0 {
-                                    let k = word.trailing_zeros() as usize;
-                                    let r = base + k;
-                                    if r < n_ref { ref_dst[r] = 1; }
-                                    word &= word - 1;
-                                }
-                            }
-                            reduced[dst_base + n_ref..dst_base + m]
-                                .copy_from_slice(&targ_w[var * n_haps..(var + 1) * n_haps]);
-                        }
-                        let fwd = selphi::imputation::pbwt::pbwt_forward_single(
-                            &reduced, n_var_w, m, n_ref, match_length, fl_fwd,
-                            (n_ref + tgt) as i32,
-                        );
-                        let bwd = selphi::imputation::pbwt::backward_filter_single(&fwd, n_var_w, n_ref, fl_fwd, fl_bwd);
-                        let csc = selphi::imputation::pbwt::build_csc_matrix(&bwd, n_ref, n_var_w, fl_bwd);
-                        return (tgt, selphi::imputation::hmm::calculate_weights(
-                            &csc, cm_w, &breaks_w, n_ref,
-                            est_ne as f64, p_err, Some(&ref_w), n_var_w, None,
-                            ne_w_ref, prior, 0.0,
-                        ));
-                    }
-
-                    for var in 0..n_var_w {
-                        let ci = window.chip_start + var;
-                        let row = ref_bm_imp.row(ci);
-                        let dst = var * m_red;
-                        for (i, &c) in candidates.iter().enumerate() {
-                            reduced[dst + i] = ((row[c as usize / 64] >> (c as usize % 64)) & 1) as u8;
-                        }
-                        reduced[dst + n_cand] = targ_w[var * n_haps + tgt];
-                    }
-
-                    let fwd = selphi::imputation::pbwt::pbwt_forward_single(
-                        &reduced, n_var_w, m_red, n_cand, match_length, fl_fwd,
-                        n_cand as i32,
-                    );
-                    let bwd = selphi::imputation::pbwt::backward_filter_single(&fwd, n_var_w, n_cand, fl_fwd, fl_bwd);
-                    let mut csc = selphi::imputation::pbwt::build_csc_matrix(&bwd, n_cand, n_var_w, fl_bwd);
-                    for idx in &mut csc.indices { *idx = candidates[*idx as usize] as i32; }
-                    csc.n_rows = n_ref;
-
-                    (tgt, selphi::imputation::hmm::calculate_weights(
-                        &csc, cm_w, &breaks_w, n_ref,
-                        est_ne as f64, p_err, Some(&ref_w), n_var_w, None,
-                        ne_w_ref, prior, 0.0,
-                    ))
-                })
-                .collect();
-
-            let mut all_weights: Vec<Vec<(usize, selphi::imputation::hmm::CsrWeights)>> = Vec::with_capacity(n_haps);
-            for (tgt, r) in all_results {
-                if let Some(post) = r.hap_posterior {
-                    hap_priors[tgt] = Some(post);
-                }
-                all_weights.push(r.weights);
-            }
-
-            drop(ref_w);
+            // HMM for all haplotypes (shared function)
+            let hmm_output = selphi::imputation::window_process::process_window_hmm(
+                &hmm_params, &ref_bm_imp, &ref_w, &targ_w, cm_w,
+                ne_w.as_deref(), &coded,
+                precomputed_candidates.as_ref(),
+                &mut hap_priors, window.chip_start, n_var_w,
+            );
+            let all_weights = hmm_output.all_weights;
 
             // Interpolation + output
             let preloaded_stripes = stripe_preload_handle.and_then(|h| h);

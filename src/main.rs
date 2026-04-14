@@ -940,29 +940,14 @@ fn main() {
         let n_var_w = window.chip_end - window.chip_start;
 
 
-        // Extract window sub-arrays — NO alleles_w materialization.
-        // Ref read from bitmatrix (1 bit/allele), target from dense array.
+        // Extract window sub-arrays
         let t0_extract = Instant::now();
         let targ_w = extract_subarray(&targ_alleles, n_haps, window.chip_start, window.chip_end);
         let cm_w = &chip_cm[window.chip_start..window.chip_end];
-        let m = n_ref + n_haps;
 
-        // Build ref_w from bitmatrix (for HMM) — parallel over variants
-        let mut ref_w = vec![0u8; n_var_w * n_ref];
-        ref_w.par_chunks_mut(n_ref).enumerate().for_each(|(var, dst)| {
-            let ci = window.chip_start + var;
-            let row = ref_bm_imp.row(ci);
-            for w in 0..ref_bm_imp.n_words() {
-                let mut word = row[w];
-                let base = w * 64;
-                while word != 0 {
-                    let k = word.trailing_zeros() as usize;
-                    let r = base + k;
-                    if r < n_ref { unsafe { *dst.get_unchecked_mut(r) = 1; } }
-                    word &= word - 1;
-                }
-            }
-        });
+        // Build ref_w from bitmatrix (parallel over variants)
+        let ref_w = selphi::imputation::window_process::extract_ref_window(
+            &ref_bm_imp, window.chip_start, n_var_w, n_ref);
 
         let extract_secs = t0_extract.elapsed().as_secs_f64();
         let cpu_extract = selphi::log::cpu_time_secs();
@@ -981,7 +966,6 @@ fn main() {
             selphi_debug!("    [HYBRID] steps={} candidates_hap0={}/{}", coded.step_groups.len(), c0.len(), n_ref);
         }
 
-        let breaks_w = vec![(0usize, n_var_w)];
         let ne_w: Option<Vec<f64>> = final_ne_per_site.as_ref().map(|ne| {
             ne[window.chip_start..window.chip_end].to_vec()
         });
@@ -1059,115 +1043,18 @@ fn main() {
         // Process all haplotypes in a single rayon par_iter (no batch sync overhead).
         // Each hap runs PBWT+HMM independently. Thread-local buffers reused via RefCell.
         let t0_hmm = Instant::now();
-        let mut all_weights: Vec<Vec<(usize, selphi::imputation::hmm::CsrWeights)>> = Vec::with_capacity(n_haps);
-
-        {
-            let all_results: Vec<(usize, selphi::imputation::hmm::HmmResult)> = (0..n_haps)
-                .into_par_iter()
-                .map(|tgt| {
-                    let prior = hap_priors[tgt].as_deref();
-                    let candidates = if let Some(ref pc) = precomputed_candidates {
-                        pc[tgt].clone()
-                    } else {
-                        selphi::imputation::pbwt::select_candidates(
-                            &coded, n_ref + tgt, n_ref, 7, max_candidates,
-                        )
-                    };
-                    let n_cand = candidates.len();
-                    // Reduced array: read ref candidates from bitmatrix, target from targ_w.
-                    // Avoids materializing full alleles_w (2GB+ at scale).
-                    let m_red = if n_cand < 100 { m } else { n_cand + 1 };
-                    let is_full = n_cand < 100;
-
-                    thread_local! {
-                        static TL_RED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-                    }
-                    let mut reduced = TL_RED.with(|buf| {
-                        let mut b = buf.borrow_mut();
-                        let needed = n_var_w * m_red;
-                        if b.capacity() >= needed { b.clear(); b.resize(needed, 0u8); std::mem::take(&mut *b) }
-                        else { vec![0u8; needed] }
-                    });
-
-                    if is_full {
-                        // Rare: n_cand < 100, need full ref+target array.
-                        // Build from bitmatrix (cheaper than alleles_w for the full panel).
-                        for var in 0..n_var_w {
-                            let ci = window.chip_start + var;
-                            let row = ref_bm_imp.row(ci);
-                            let dst_base = var * m;
-                            let ref_dst = &mut reduced[dst_base..dst_base + n_ref];
-                            for w in 0..ref_bm_imp.n_words() {
-                                let mut word = row[w];
-                                let base = w * 64;
-                                while word != 0 {
-                                    let k = word.trailing_zeros() as usize;
-                                    let r = base + k;
-                                    if r < n_ref { ref_dst[r] = 1; }
-                                    word &= word - 1;
-                                }
-                            }
-                            reduced[dst_base + n_ref..dst_base + m]
-                                .copy_from_slice(&targ_w[var * n_haps..(var + 1) * n_haps]);
-                        }
-                        let fwd = selphi::imputation::pbwt::pbwt_forward_single(
-                            &reduced, n_var_w, m, n_ref, match_length, fl_fwd,
-                            (n_ref + tgt) as i32,
-                        );
-                        let bwd = selphi::imputation::pbwt::backward_filter_single(&fwd, n_var_w, n_ref, fl_fwd, fl_bwd);
-                        let csc = selphi::imputation::pbwt::build_csc_matrix(&bwd, n_ref, n_var_w, fl_bwd);
-                        TL_RED.with(|buf| { *buf.borrow_mut() = reduced; });
-                        return (tgt, selphi::imputation::hmm::calculate_weights(
-                            &csc, cm_w, &breaks_w, n_ref,
-                            est_ne as f64, p_err, Some(&ref_w), n_var_w, None,
-                            ne_w_ref, prior, 0.0,
-                        ));
-                    }
-
-                    // Common path: build reduced array from bitmatrix + targ_w
-                    for var in 0..n_var_w {
-                        let ci = window.chip_start + var;
-                        let row = ref_bm_imp.row(ci);
-                        let dst = var * m_red;
-                        for (i, &c) in candidates.iter().enumerate() {
-                            reduced[dst + i] = ((row[c as usize / 64] >> (c as usize % 64)) & 1) as u8;
-                        }
-                        reduced[dst + n_cand] = targ_w[var * n_haps + tgt];
-                    }
-
-                    thread_local! {
-                        static WS: std::cell::RefCell<Option<selphi::imputation::pbwt::PbwtWorkspace>> =
-                            const { std::cell::RefCell::new(None) };
-                    }
-                    let fwd = WS.with(|ws_cell| {
-                        let mut ws_opt = ws_cell.borrow_mut();
-                        let ws = ws_opt.get_or_insert_with(|| selphi::imputation::pbwt::PbwtWorkspace::new(m_red, n_cand));
-                        if ws.capacity() < m_red { *ws = selphi::imputation::pbwt::PbwtWorkspace::new(m_red, n_cand); }
-                        selphi::imputation::pbwt::pbwt_forward_with_workspace(ws, &reduced, n_var_w, m_red, n_cand, match_length, fl_fwd, n_cand as i32)
-                    });
-                    let bwd = selphi::imputation::pbwt::backward_filter_single(&fwd, n_var_w, n_cand, fl_fwd, fl_bwd);
-                    let mut csc = selphi::imputation::pbwt::build_csc_matrix(&bwd, n_cand, n_var_w, fl_bwd);
-
-                    TL_RED.with(|buf| { *buf.borrow_mut() = reduced; });
-                    for idx in &mut csc.indices { *idx = candidates[*idx as usize] as i32; }
-                    csc.n_rows = n_ref;
-
-                    (tgt, selphi::imputation::hmm::calculate_weights(
-                        &csc, cm_w, &breaks_w, n_ref,
-                        est_ne as f64, p_err, Some(&ref_w), n_var_w, None,
-                        ne_w_ref, prior, 0.0,
-                    ))
-                })
-                .collect();
-
-            // Extract weights and priors
-            for (tgt, r) in all_results {
-                if let Some(post) = r.hap_posterior {
-                    hap_priors[tgt] = Some(post);
-                }
-                all_weights.push(r.weights);
-            }
-        }
+        // HMM for all haplotypes (shared function with thread-local buffer reuse)
+        let hmm_params = selphi::imputation::window_process::WindowHmmParams {
+            n_ref, n_haps, match_length, fl_fwd, fl_bwd,
+            est_ne: est_ne as f64, p_err, max_candidates,
+        };
+        let hmm_output = selphi::imputation::window_process::process_window_hmm(
+            &hmm_params, &ref_bm_imp, &ref_w, &targ_w, cm_w,
+            ne_w_ref, &coded,
+            precomputed_candidates.as_ref(),
+            &mut hap_priors, window.chip_start, n_var_w,
+        );
+        let all_weights = hmm_output.all_weights;
 
         drop(ref_w);
         let hmm_secs = t0_hmm.elapsed().as_secs_f64();
