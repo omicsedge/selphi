@@ -121,7 +121,7 @@ pub fn build_merged_panel(
     }
 
     // Build coverage bitvector
-    let mut coverage = CoverageBitvector::new(n_wgs_variants);
+    let mut coverage = CoverageBitvector::new(n_wgs_variants + n_chip_only);
     for &wi in &wgs_idx {
         coverage.set(wi, VariantCoverage::Shared);
     }

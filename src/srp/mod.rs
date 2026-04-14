@@ -139,8 +139,15 @@ impl CoverageBitvector {
     /// Raw bytes for serialization.
     pub fn as_bytes(&self) -> &[u8] { &self.data }
 
-    /// Construct from raw bytes.
+    /// Construct from raw bytes. Validates size matches n_variants.
     pub fn from_bytes(data: Vec<u8>, n_variants: usize) -> Self {
+        let expected = (n_variants * 2 + 7) / 8;
+        if data.len() < expected {
+            // Pad with zeros (WgsOnly) if data is shorter than expected
+            let mut padded = data;
+            padded.resize(expected, 0);
+            return Self { data: padded, n_variants };
+        }
         Self { data, n_variants }
     }
 

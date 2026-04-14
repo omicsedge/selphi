@@ -171,7 +171,12 @@ pub fn process_window_hmm(
             let mut csc = pbwt::build_csc_matrix(&bwd, n_cand, n_var_w, fl_bwd);
 
             TL_RED.with(|buf| { *buf.borrow_mut() = reduced; });
-            for idx in &mut csc.indices { *idx = candidates[*idx as usize] as i32; }
+            // CSC indices are positions in reduced[0..n_cand] — remap to absolute haplotype IDs
+            for idx in &mut csc.indices {
+                debug_assert!((*idx as usize) < candidates.len(),
+                    "CSC index {} out of bounds for {} candidates", idx, candidates.len());
+                *idx = candidates[*idx as usize] as i32;
+            }
             csc.n_rows = n_ref;
 
             (tgt, super::hmm::calculate_weights(
