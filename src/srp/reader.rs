@@ -24,6 +24,10 @@ pub struct SrpReader {
     pub augment_meta: Option<super::AugmentMetadata>,
     pub coverage: Option<super::CoverageBitvector>,
     pub augment_tiled: Option<super::tiled::TiledSrpReader>,
+    /// Chip-only variants (not in WGS panel, present only in chip data).
+    pub chip_only_variants: Vec<super::Variant>,
+    /// Chip-only alleles: (n_chip_only × n_chip_haps) row-major.
+    pub chip_only_alleles: Vec<u8>,
 }
 
 impl SrpReader {
@@ -134,6 +138,7 @@ impl SrpReader {
         Ok(SrpReader {
             metadata, variants, sample_ids, ids, original_ids, tiled, mmap, chunk_index,
             augment_meta, coverage: None, augment_tiled: None,
+            chip_only_variants: Vec::new(), chip_only_alleles: Vec::new(),
         })
     }
 
@@ -151,6 +156,7 @@ impl SrpReader {
             mmap,
             chunk_index: vec![],
             augment_meta: None, coverage: None, augment_tiled: None,
+            chip_only_variants: Vec::new(), chip_only_alleles: Vec::new(),
         }
     }
 
@@ -220,6 +226,9 @@ impl SrpReader {
     pub fn variant_coverage(&self, i: usize) -> super::VariantCoverage {
         self.coverage.as_ref().map(|c| c.get(i)).unwrap_or(super::VariantCoverage::WgsOnly)
     }
+
+    /// Number of chip-only variants (imputeable from chip panel only).
+    pub fn n_chip_only_variants(&self) -> usize { self.chip_only_variants.len() }
 
     pub fn load_tiled(&mut self) -> bool { self.tiled.is_some() }
 

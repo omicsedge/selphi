@@ -82,8 +82,43 @@ pub fn build_merged_panel(
             &chip_genotypes, &chip_idx, n_shared, n_chip_haps)
     };
 
-    // Chip-only variants (in chip but not in WGS) — future extension
-    let n_chip_only = 0usize;
+    // Find chip-only variants (in chip but not in WGS)
+    let shared_chip_set: std::collections::BTreeSet<usize> = chip_idx.iter().copied().collect();
+    let chip_only_indices: Vec<usize> = (0..chip_markers.len())
+        .filter(|i| !shared_chip_set.contains(i))
+        .collect();
+    let n_chip_only = chip_only_indices.len();
+
+    // Extract chip-only alleles (unphased genotypes — phase from shared positions)
+    let chip_only_alleles: Vec<u8> = if n_chip_only > 0 {
+        let mut alleles = vec![0u8; n_chip_only * n_chip_haps];
+        for (out_i, &chip_i) in chip_only_indices.iter().enumerate() {
+            if chip_i < chip_genotypes.len() {
+                let gt = &chip_genotypes[chip_i];
+                for s in 0..n_chip_samples.min(gt.len()) {
+                    alleles[out_i * n_chip_haps + s * 2] = gt[s][0];
+                    alleles[out_i * n_chip_haps + s * 2 + 1] = gt[s][1];
+                }
+            }
+        }
+        alleles
+    } else {
+        Vec::new()
+    };
+
+    // Chip-only variant metadata
+    let chip_only_variants: Vec<super::Variant> = chip_only_indices.iter()
+        .map(|&i| super::Variant {
+            chr: chip_markers[i].chrom.clone(),
+            pos: chip_markers[i].pos,
+            ref_allele: chip_markers[i].ref_allele.clone(),
+            alt_allele: chip_markers[i].alt_allele.clone(),
+        })
+        .collect();
+
+    if n_chip_only > 0 {
+        selphi_info!("  Chip-only variants: {} (present in chip panel only — saved for future interpolation)", n_chip_only);
+    }
 
     // Build coverage bitvector
     let mut coverage = CoverageBitvector::new(n_wgs_variants);
@@ -102,16 +137,18 @@ pub fn build_merged_panel(
     selphi_info!("  Panel composition:");
     selphi_info!("    WGS haplotypes:  {}", n_wgs_haps);
     selphi_info!("    Chip haplotypes: {}", n_chip_haps);
-    selphi_info!("    Total variants:  {}", n_wgs_variants);
+    selphi_info!("    WGS variants:    {}", n_wgs_variants);
     selphi_info!("    Shared:          {}", n_shared);
     selphi_info!("    WGS-only:        {}", n_wgs_variants - n_shared);
     selphi_info!("    Chip-only:       {}", n_chip_only);
+    selphi_info!("    Total output:    {}", n_wgs_variants + n_chip_only);
 
     // Write output SRP
     selphi_step!("Writing merged SRP...");
     write_merged_srp(
         &wgs, &augment_meta, &coverage,
         &wgs_idx, &chip_alleles, n_chip_haps,
+        &chip_only_variants, &chip_only_alleles,
         output_path,
     )?;
 
@@ -123,9 +160,11 @@ fn write_merged_srp(
     wgs: &super::SrpReader,
     augment_meta: &AugmentMetadata,
     coverage: &CoverageBitvector,
-    wgs_idx: &[usize],       // WGS variant indices that are shared with chip
-    chip_alleles: &[u8],     // (n_shared × n_chip_haps) row-major phased alleles
+    wgs_idx: &[usize],             // WGS variant indices that are shared with chip
+    chip_alleles: &[u8],           // (n_shared × n_chip_haps) row-major phased alleles
     n_chip_haps: usize,
+    chip_only_variants: &[super::Variant],  // chip-only variant metadata
+    chip_only_alleles: &[u8],               // (n_chip_only × n_chip_haps) row-major
     output_path: &Path,
 ) -> io::Result<()> {
     use rayon::prelude::*;
@@ -357,12 +396,56 @@ fn write_merged_srp(
     w.flush()?;
 
     let aug_total: u64 = aug_tile_entries.iter().map(|&(_, sz)| sz as u64).sum();
-    let file_size = std::fs::metadata(&srp_path)?.len();
     selphi_info!("    augment tiles: {:.1} MB ({} tiles)", aug_total as f64 / 1e6, n_tiles_aug);
+
+    // Write chip-only variant section
+    let n_chip_only = chip_only_variants.len();
+    if n_chip_only > 0 {
+        // Chip-only variant metadata (binary: pos, chr, ref, alt per variant)
+        let mut co_vbin = Vec::with_capacity(n_chip_only * 20);
+        let mut co_ids = Vec::with_capacity(n_chip_only * 30);
+        for (i, v) in chip_only_variants.iter().enumerate() {
+            let chr_b = v.chr.as_bytes();
+            let ref_b = v.ref_allele.as_bytes();
+            let alt_b = v.alt_allele.as_bytes();
+            co_vbin.extend_from_slice(&v.pos.to_le_bytes());
+            co_vbin.push(chr_b.len().min(255) as u8);
+            co_vbin.push(ref_b.len().min(255) as u8);
+            co_vbin.push(alt_b.len().min(255) as u8);
+            co_vbin.extend_from_slice(&chr_b[..chr_b.len().min(255)]);
+            co_vbin.extend_from_slice(&ref_b[..ref_b.len().min(255)]);
+            co_vbin.extend_from_slice(&alt_b[..alt_b.len().min(255)]);
+            if i > 0 { co_ids.push(b'\n'); }
+            co_ids.extend_from_slice(format!("{}-{}-{}-{}", v.chr, v.pos, v.ref_allele, v.alt_allele).as_bytes());
+        }
+        let co_vbin_c = zstd::encode_all(Cursor::new(&co_vbin), 3).map_err(io::Error::other)?;
+        let co_ids_c = zstd::encode_all(Cursor::new(&co_ids), 3).map_err(io::Error::other)?;
+
+        // Chip-only alleles (n_chip_only × n_chip_haps, zstd compressed)
+        let co_alleles_c = zstd::encode_all(Cursor::new(chip_only_alleles), 3).map_err(io::Error::other)?;
+
+        w.write_all(&(n_chip_only as u32).to_le_bytes())?;
+        w.write_all(&(co_vbin_c.len() as u32).to_le_bytes())?;
+        w.write_all(&co_vbin_c)?;
+        w.write_all(&(co_ids_c.len() as u32).to_le_bytes())?;
+        w.write_all(&co_ids_c)?;
+        w.write_all(&(co_alleles_c.len() as u32).to_le_bytes())?;
+        w.write_all(&co_alleles_c)?;
+
+        selphi_info!("    chip-only variants: {} ({:.1} KB)", n_chip_only, co_alleles_c.len() as f64 / 1024.0);
+    } else {
+        w.write_all(&0u32.to_le_bytes())?; // n_chip_only = 0
+    }
+
+    w.flush()?;
+    let file_size = std::fs::metadata(&srp_path)?.len();
     selphi_step!("Merged SRP: {:.1} MB → {}", file_size as f64 / 1e6, srp_path.display());
     selphi_info!("    {} WGS haps + {} chip haps = {} total",
         augment_meta.wgs_haplotypes, augment_meta.chip_haplotypes,
         augment_meta.wgs_haplotypes + augment_meta.chip_haplotypes);
+    if n_chip_only > 0 {
+        selphi_info!("    {} chip-only variants (imputeable from chip haplotypes)", n_chip_only);
+    }
 
     Ok(())
 }
