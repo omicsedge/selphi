@@ -162,7 +162,7 @@ pub fn seek_for_position(index: &CsiIndex, pos: i64) -> VirtualPosition {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_MIN_SHIFT: i32 = 14;
-const DEFAULT_DEPTH: i32 = 5;
+const DEFAULT_DEPTH: i32 = 6; // matches bcftools/htslib default
 
 /// Compute the bin_id for a genomic interval [beg, end).
 /// Finds the smallest bin that fully contains the interval.
@@ -323,7 +323,7 @@ pub fn build_csi_index(bcf_path: &Path) -> io::Result<()> {
             }
 
             // Pseudo-bin
-            let pseudo_bin_id = ((1u64 << ((depth as u64 + 1) * 3)) - 1) / 7;
+            let pseudo_bin_id = ((1u64 << ((depth as u64 + 1) * 3)) - 1) / 7 + 1;
             out.extend_from_slice(&(pseudo_bin_id as u32).to_le_bytes());
             out.extend_from_slice(&0u64.to_le_bytes()); // loffset
             out.extend_from_slice(&2i32.to_le_bytes()); // n_chunk = 2
@@ -924,7 +924,7 @@ impl InlineIndexBuilder {
                     out.extend_from_slice(&(bd.chunks.len() as i32).to_le_bytes());
                     for &(b, e) in &bd.chunks { out.extend_from_slice(&b.to_le_bytes()); out.extend_from_slice(&e.to_le_bytes()); }
                 }
-                let pseudo = ((1u64 << ((DEFAULT_DEPTH as u64 + 1) * 3)) - 1) / 7;
+                let pseudo = ((1u64 << ((DEFAULT_DEPTH as u64 + 1) * 3)) - 1) / 7 + 1;
                 out.extend_from_slice(&(pseudo as u32).to_le_bytes());
                 out.extend_from_slice(&0u64.to_le_bytes());
                 out.extend_from_slice(&2i32.to_le_bytes());
