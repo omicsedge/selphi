@@ -32,17 +32,17 @@ use serde_json::Value as JsonValue;
 // SRP version constants
 // ---------------------------------------------------------------------------
 
-/// Magic bytes for SRP v2 (single-chromosome).
+/// Magic bytes for single-chromosome SRP format.
 pub const SRP_V2_MAGIC: &[u8; 8] = b"SRP\x00\x02\x00\x00\x00";
 
-/// Magic bytes for SRP v3 (multi-chromosome).
+/// Magic bytes for multi-chromosome SRP format.
 pub const SRP_V3_MAGIC: &[u8; 8] = b"SRP\x00\x03\x00\x00\x00";
 
 // ---------------------------------------------------------------------------
 // Multi-chromosome SRP types
 // ---------------------------------------------------------------------------
 
-/// Global metadata for a multi-chromosome SRP v3 file.
+/// Global metadata for a multi-chromosome SRP file.
 #[derive(Debug, Clone)]
 pub struct GlobalSrpMetadata {
     pub n_chromosomes: usize,
@@ -52,7 +52,7 @@ pub struct GlobalSrpMetadata {
     pub contig_fields: String,
 }
 
-/// Per-chromosome directory entry in an SRP v3 file.
+/// Per-chromosome directory entry in a multi-chromosome SRP file.
 /// Fixed-size (32 bytes) for O(1) seeking.
 #[derive(Debug, Clone)]
 pub struct ChrDirectoryEntry {

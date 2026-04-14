@@ -1,6 +1,6 @@
 //! Native multi-chromosome orchestrator with overlapped processing.
 //!
-//! Processes chromosomes from a unified SRP v3 file sequentially, with
+//! Processes chromosomes from a unified multi-chr SRP file sequentially, with
 //! prefetch overlap between consecutive chromosomes for maximum CPU utilization.
 //! No subprocess calls — everything runs in-process.
 
@@ -41,6 +41,7 @@ pub struct MultiChrImputeConfig {
     pub selfdecode: bool,
     pub all_formats: bool,
     pub wgs_phasing: bool,
+    pub map_dir: Option<String>,
 }
 
 /// Load chromosome data synchronously (used for first chr or if prefetch was skipped).
@@ -74,7 +75,7 @@ fn load_chr_data(
     Some((srp, wgs_idx, target_idx, targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip))
 }
 
-/// Run multi-chromosome imputation from a unified SRP v3 file.
+/// Run multi-chromosome imputation from a unified multi-chr SRP file.
 pub fn run_multi_chr(
     srp_path: &Path,
     input_path: &str,
@@ -110,10 +111,56 @@ pub fn run_multi_chr(
     selphi_info!("  target: {} samples, {} chromosomes, phased={}",
         n_samples, target_by_chr.len(), is_phased);
 
-    // 3. Load unified genetic map
-    selphi_step!("Loading unified genetic map...");
-    let multi_map = genmap::load_genetic_map_multi_chr(map_path)?;
-    selphi_info!("  map: {} chromosomes loaded", multi_map.len());
+    // 3. Load genetic map (unified file or per-chr directory)
+    let multi_map = if let Some(ref dir) = config.map_dir {
+        selphi_step!("Loading genetic maps from directory...");
+        let map_dir = std::path::Path::new(dir);
+        let mut combined = std::collections::BTreeMap::new();
+        for chr_name in &chromosomes {
+            let key = chr_name.strip_prefix("chr").unwrap_or(chr_name);
+            // Try common patterns: chr{N}.map, {N}.map, plink.chr{N}.*.map
+            let candidates = [
+                format!("chr{}.map", key),
+                format!("{}.map", key),
+                format!("plink.chr{}.GRCh38.map", key),
+                format!("plink.chr{}.GRCh37.map", key),
+            ];
+            let mut found = false;
+            for pattern in &candidates {
+                let path = map_dir.join(pattern);
+                if path.exists() {
+                    let (bp, cm) = genmap::load_genetic_map_raw(&path)?;
+                    combined.insert(key.to_string(), (bp, cm));
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                // Glob fallback: any file containing the chr name
+                if let Ok(entries) = std::fs::read_dir(map_dir) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.contains(&format!("chr{}", key)) && name.ends_with(".map") {
+                            let (bp, cm) = genmap::load_genetic_map_raw(&entry.path())?;
+                            combined.insert(key.to_string(), (bp, cm));
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !found {
+                selphi_info!("  WARNING: no map found for chr{} in {}", key, dir);
+            }
+        }
+        selphi_info!("  maps: {} chromosomes loaded from {}", combined.len(), dir);
+        combined
+    } else {
+        selphi_step!("Loading unified genetic map...");
+        let multi_map = genmap::load_genetic_map_multi_chr(map_path)?;
+        selphi_info!("  map: {} chromosomes loaded", multi_map.len());
+        multi_map
+    };
     selphi_info!("");
 
     // 4. Determine output formats

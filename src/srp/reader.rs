@@ -129,7 +129,7 @@ impl SrpReader {
             original_ids: view.original_ids,
             tiled: view.tiled,
             mmap,
-            chunk_index: vec![], // v3 tiled-only, no CSC chunks
+            chunk_index: vec![], // multi-chr: tiled-only, no CSC chunks
         }
     }
 

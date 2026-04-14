@@ -337,7 +337,7 @@ impl TiledSrpReader {
         })
     }
 
-    /// Construct from pre-parsed tile index (used by unified SRP v2 reader).
+    /// Construct from pre-parsed tile index (used by SRP reader).
     pub fn from_entries(
         file_path: PathBuf, n_variants: usize, n_haps: usize,
         entries: Vec<TileEntryPub>, n_tile_rows: usize, n_tile_cols: usize,

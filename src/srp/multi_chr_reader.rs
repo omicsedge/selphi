@@ -22,7 +22,7 @@ use super::{
 // ChrSrpView — per-chromosome view of a multi-chr SRP
 // ---------------------------------------------------------------------------
 
-/// A per-chromosome view extracted from a multi-chromosome SRP v3 file.
+/// A per-chromosome view extracted from a multi-chromosome SRP file.
 /// Exposes the same interface as `SrpReader` so the imputation pipeline
 /// can operate on it without modification.
 pub struct ChrSrpView {
@@ -105,7 +105,7 @@ impl ChrSrpView {
         super::SrpReader::from_chr_view(self)
     }
 
-    /// Load a CSC chunk by ID (not supported for tiled-only v3 format).
+    /// Load a CSC chunk by ID (not supported for multi-chr tiled-only format).
     pub fn load_chunk(&self, _chunk_id: usize) -> Arc<CscChunk> {
         panic!("CSC chunk loading not supported for multi-chr SRP (tiled-only format)")
     }
@@ -119,7 +119,7 @@ impl ChrSrpView {
 // MultiChrSrpReader
 // ---------------------------------------------------------------------------
 
-/// Reader for multi-chromosome SRP v3 files.
+/// Reader for multi-chromosome SRP files.
 /// Opens the file, reads global header + chromosome directory + sample IDs.
 /// Per-chromosome data is loaded on demand via `load_chr_view()`.
 pub struct MultiChrSrpReader {
@@ -131,7 +131,7 @@ pub struct MultiChrSrpReader {
 }
 
 impl MultiChrSrpReader {
-    /// Open a multi-chromosome SRP v3 file.
+    /// Open a multi-chromosome SRP file.
     /// Reads global header, chromosome directory, and shared sample IDs.
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let filepath = path.as_ref().to_path_buf();
@@ -300,7 +300,7 @@ impl MultiChrSrpReader {
 // ---------------------------------------------------------------------------
 
 /// Detect SRP file version by reading the first 8 bytes.
-/// Returns 2 for v2 (single-chr), 3 for v3 (multi-chr), or an error.
+/// Returns 2 for single-chr, 3 for multi-chr, or an error.
 pub fn detect_srp_version<P: AsRef<Path>>(path: P) -> io::Result<u32> {
     let mut f = File::open(path.as_ref())?;
     let mut magic = [0u8; 8];

@@ -12,7 +12,7 @@ use rayon::prelude::*;
 use crate::{selphi_info, selphi_step};
 use super::{SRP_V3_MAGIC, SparseTile, TILE_ROWS, TILE_COLS, ChrDirectoryEntry};
 
-/// Build a multi-chromosome SRP v3 file from a multi-contig BCF/VCF source.
+/// Build a multi-chromosome SRP file from a multi-contig BCF/VCF source.
 pub fn build_multi_chr_srp(
     source_path: &Path,
     output_path: &Path,
@@ -81,7 +81,7 @@ pub fn build_multi_chr_srp(
         Cursor::new(global_meta_json.to_string().as_bytes()), 3)
         .map_err(io::Error::other)?;
 
-    // Write v3 magic
+    // Write multi-chr magic
     w.write_all(SRP_V3_MAGIC)?;
 
     // Write global metadata (exact size)
@@ -414,9 +414,9 @@ fn auto_chunk_size(n_variants: usize, n_haps: usize) -> usize {
     cs.max(n_variants.div_ceil(2000)).clamp(1000, 50000)
 }
 
-/// Build a multi-chr SRP v3 from a directory of per-chr BCF/VCF files.
+/// Build a multi-chr SRP from a directory of per-chr BCF/VCF files.
 /// Scans the directory for .bcf and .vcf.gz files, builds a per-chr SRP for each,
-/// then merges them into a single v3 file.
+/// then merges them into a single multi-chr file.
 pub fn build_multi_chr_srp_from_dir(
     source_dir: &Path,
     output_path: &Path,
@@ -452,7 +452,7 @@ pub fn build_multi_chr_srp_from_dir(
         bcf_files.iter().map(|(c, _)| format!("chr{}", c)).collect::<Vec<_>>().join(", "));
     selphi_info!("");
 
-    // Build individual SRP v2 for each chr in a temp dir, then merge to v3
+    // Build individual per-chr SRP, then merge into multi-chr
     let tmp_dir = tempfile::tempdir()?;
     let mut srp_paths: Vec<std::path::PathBuf> = Vec::new();
 
@@ -466,7 +466,7 @@ pub fn build_multi_chr_srp_from_dir(
 
     // Merge all per-chr SRPs into single v3
     selphi_step!("Merging {} SRPs into multi-chr SRP...", srp_paths.len());
-    merge_srps_to_v3(&srp_paths, output_path)
+    merge_single_chr_srps(&srp_paths, output_path)
 }
 
 /// Strip IDX=N from a ##contig= line to avoid duplicate IDX conflicts in multi-chr headers.
@@ -498,12 +498,12 @@ fn chr_sort_key(chr: &str) -> (u8, u32) {
 }
 
 // ============================================================================
-// Merge per-chr SRP v2 files into a single SRP v3
+// Merge per-chr SRP files into a single multi-chr SRP
 // ============================================================================
 
-/// Merge multiple per-chromosome SRP v2 files into a single SRP v3 file.
-/// Tile data is copied verbatim (no decompression) — just offsets are adjusted.
-pub fn merge_srps_to_v3(
+/// Merge multiple single-chromosome SRP files into a single multi-chromosome SRP.
+/// Validates haplotype/sample consistency across all panels.
+pub fn merge_single_chr_srps(
     srp_paths: &[std::path::PathBuf],
     output_path: &Path,
 ) -> io::Result<()> {
@@ -526,8 +526,41 @@ pub fn merge_srps_to_v3(
     // Sort by chromosome
     readers.sort_by(|a, b| chr_sort_key(&a.0).cmp(&chr_sort_key(&b.0)));
 
+    // Validate consistency across all panels
     let n_haps = readers[0].1.n_haps();
     let n_samples = readers[0].1.sample_ids.len();
+    let ref_samples = &readers[0].1.sample_ids;
+
+    for (chr, r) in &readers[1..] {
+        if r.n_haps() != n_haps {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("Haplotype count mismatch: chr{} has {} haps, expected {} (from chr{})",
+                    chr, r.n_haps(), n_haps, readers[0].0)));
+        }
+        if r.sample_ids.len() != n_samples {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("Sample count mismatch: chr{} has {} samples, expected {}",
+                    chr, r.sample_ids.len(), n_samples)));
+        }
+        // Check first and last sample names match
+        if !r.sample_ids.is_empty() && !ref_samples.is_empty() {
+            if r.sample_ids[0] != ref_samples[0] || r.sample_ids[n_samples - 1] != ref_samples[n_samples - 1] {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    format!("Sample names mismatch between chr{} and chr{}", chr, readers[0].0)));
+            }
+        }
+    }
+
+    // Check for duplicate chromosomes
+    for i in 1..readers.len() {
+        if readers[i].0 == readers[i - 1].0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("Duplicate chromosome: chr{}", readers[i].0)));
+        }
+    }
+
+    selphi_info!("  Validated: {} panels, {} haps, {} samples, {} chromosomes",
+        readers.len(), n_haps, n_samples, readers.len());
     let chromosomes: Vec<String> = readers.iter().map(|(c, _)| c.clone()).collect();
 
     // Build global contig field (strip IDX= to avoid conflicts)
@@ -564,7 +597,7 @@ pub fn merge_srps_to_v3(
         Cursor::new(global_meta_json.to_string().as_bytes()), 3)
         .map_err(io::Error::other)?;
 
-    // Write v3 magic
+    // Write multi-chr magic
     w.write_all(SRP_V3_MAGIC)?;
 
     // Global metadata (exact size)
@@ -586,7 +619,7 @@ pub fn merge_srps_to_v3(
     w.write_all(&(sample_compressed.len() as u32).to_le_bytes())?;
     w.write_all(&sample_compressed)?;
 
-    // Process each chromosome: copy per-chr data from v2 SRP
+    // Process each chromosome: copy per-chr data from source SRP
     let mut chr_entries: Vec<ChrDirectoryEntry> = Vec::new();
 
     for (chr_idx, (chr_name, reader)) in readers.iter().enumerate() {
@@ -653,7 +686,7 @@ pub fn merge_srps_to_v3(
         w.write_all(&(orig_c.len() as u32).to_le_bytes())?;
         w.write_all(&orig_c)?;
 
-        // Tile index + tile data: copy compressed tiles from v2 SRP with offset adjustment
+        // Tile index + tile data: copy compressed tiles with offset adjustment
         let tiled = reader.tiled.as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData,
                 format!("SRP for chr{} has no tiled backend", chr_name)))?;
@@ -732,4 +765,51 @@ pub fn merge_srps_to_v3(
         n_chr, file_size as f64 / 1e6, srp_path.display());
 
     Ok(())
+}
+
+/// Merge all SRP files from a directory into a single multi-chr SRP.
+/// Auto-discovers .srp files, validates each can be opened, checks for duplicate
+/// chromosomes, and merges into a single output.
+pub fn merge_srps_from_dir(
+    source_dir: &Path,
+    output_path: &Path,
+) -> io::Result<()> {
+    // Scan directory for .srp files
+    let mut srp_files: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(source_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".srp") {
+                srp_files.push(entry.path());
+            }
+        }
+    }
+
+    if srp_files.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::NotFound,
+            format!("No .srp files found in {}", source_dir.display())));
+    }
+
+    srp_files.sort();
+
+    // Validate each file can be opened
+    let mut valid: Vec<std::path::PathBuf> = Vec::new();
+    for path in &srp_files {
+        match super::multi_chr_reader::detect_srp_version(path) {
+            Ok(2) | Ok(3) => valid.push(path.clone()),
+            _ => {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    format!("{} is not a valid SRP file. Regenerate with: selphi --prepare-reference-from panel.bcf --out panel", name)));
+            }
+        }
+    }
+
+    selphi_info!("  Found {} SRP files in {}:", valid.len(), source_dir.display());
+    for f in &valid {
+        selphi_info!("    {}", f.file_name().unwrap_or_default().to_string_lossy());
+    }
+    selphi_info!("");
+
+    merge_single_chr_srps(&valid, output_path)
 }

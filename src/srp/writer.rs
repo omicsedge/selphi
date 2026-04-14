@@ -744,7 +744,7 @@ fn compress_and_assemble(
 // SRP Unified Format (v2): single file with chunks + tiles
 // ============================================================================
 
-/// Magic for SRP v2 unified format.
+/// Magic for single-chromosome SRP format.
 const SRP_V2_MAGIC: &[u8; 8] = b"SRP\x00\x02\x00\x00\x00";
 
 /// Build unified SRP file from BCF source.
