@@ -71,9 +71,7 @@ Input phase is detected automatically. If the input is already phased (pipe-sepa
 
 ### Whole-genome imputation (all chromosomes at once)
 
-Selphi is the first imputation tool to support **whole-genome imputation from a single reference panel file**. Existing tools (Beagle, Minimac4, IMPUTE5) require users to split their data by chromosome, run each chromosome independently, and concatenate the results — a process that involves managing dozens of intermediate files and complex shell scripting. Selphi eliminates this entirely.
-
-A single `.srp` file can contain the reference panel for all chromosomes. Combined with a concatenated genetic map and a whole-genome input VCF, the entire imputation pipeline runs with one command:
+Selphi supports whole-genome imputation from a **single reference panel file** containing all chromosomes. No per-chromosome splitting, no shell loops, no manual concatenation — one command imputes the entire genome:
 
 ```bash
 selphi \
@@ -84,49 +82,51 @@ selphi \
   --threads 16
 ```
 
-Multi-chromosome SRP files are automatically detected. Chromosomes are processed sequentially with **overlapped prefetch**: while the current chromosome is being imputed, the next chromosome's reference data, variant intersection, and genetic map are loaded in a background thread. This eliminates the idle gap between chromosomes and keeps all CPU cores utilized throughout the run.
+Selphi auto-detects whether the SRP file contains one or multiple chromosomes. Each chromosome is processed sequentially, with the next chromosome's data pre-loaded in the background to minimize idle time between transitions.
 
-Three equivalent workflows are supported — the user chooses whichever matches their data:
+#### Preparing the input files
+
+**Reference panel.** Merge per-chromosome SRP files into a single multi-chromosome SRP:
 
 ```bash
-# 1. Single chromosome (standard)
-selphi --refpanel chr22.srp --input chr22.vcf.gz --map chr22.map --out result
+# From a directory of SRP files
+selphi --merge-srps-dir /path/to/srps/ --out all_chromosomes
 
-# 2. Multi-chromosome with per-chr SRP files
-selphi --refpanel-dir panels/ --input whole_genome.vcf.gz --map-dir maps/ --out result
-
-# 3. Unified whole-genome (single multi-chromosome SRP file)
-selphi --refpanel all_chrs.srp --input whole_genome.vcf.gz --map all_chrs.map --out result
-```
-
-The genetic map can be provided in either form:
-- `--map all_chrs.map` — a single concatenated file (the chromosome column is used to partition entries)
-- `--map-dir maps/` — a directory of per-chromosome maps (auto-discovers `chr{N}.map` files)
-
-Both work with any SRP mode. To create a concatenated map from per-chromosome files:
-```bash
-cat chr1.map chr2.map ... chr22.map > all_chromosomes.map
-```
-
-#### Creating a unified reference panel
-
-From a directory of per-chromosome BCF or VCF files:
-```bash
-selphi --prepare-reference-from /path/to/bcf_directory/ --out all_chromosomes --threads 16
-```
-
-From existing per-chromosome SRP files (comma-separated list or directory):
-```bash
+# Or list them explicitly
 selphi --merge-srps chr1.srp,chr2.srp,...,chr22.srp --out all_chromosomes
-selphi --merge-srps-dir /path/to/srp_directory/ --out all_chromosomes
 ```
 
-From a multi-contig BCF file (auto-detected):
+If you have per-chromosome BCF/VCF instead of SRP, you can build the multi-chromosome panel directly:
+
 ```bash
-selphi --prepare-reference-from all_chromosomes.bcf --out all_chromosomes --threads 16
+# From a directory of per-chromosome BCF files
+selphi --prepare-reference-from /path/to/bcfs/ --out all_chromosomes --threads 16
 ```
 
-Memory usage is bounded: only one chromosome's working set is held at a time, with a lightweight prefetch buffer (~200 MB) for the next chromosome. Peak memory equals that of the largest single chromosome.
+**Genetic map.** Either concatenate per-chromosome maps into one file, or point to the directory:
+
+```bash
+# Option A: concatenated file
+cat chr1.map chr2.map ... chr22.map > all_chromosomes.map
+selphi --refpanel all.srp --input input.vcf.gz --map all_chromosomes.map --out result
+
+# Option B: directory of per-chromosome maps (auto-discovers chr{N}.map files)
+selphi --refpanel all.srp --input input.vcf.gz --map-dir /path/to/maps/ --out result
+```
+
+**Target VCF.** A standard multi-chromosome VCF or BCF. Chromosomes not present in the reference panel are automatically skipped.
+
+#### Alternative: per-chromosome directory mode
+
+If you prefer to keep separate SRP files per chromosome, you can use directory mode without merging:
+
+```bash
+selphi --refpanel-dir panels/ --input whole_genome.vcf.gz --map-dir maps/ --out result
+```
+
+#### Memory
+
+Only one chromosome is held in memory at a time. Peak memory equals that of the largest single chromosome plus a small prefetch buffer (~200 MB) for the next chromosome.
 
 ### Reference panel preparation
 
