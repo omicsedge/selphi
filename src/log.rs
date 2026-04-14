@@ -45,6 +45,14 @@ pub fn init(log_path: &Path, debug: bool) {
     DEBUG_FLAG.store(debug || env_debug, Ordering::Relaxed);
 }
 
+/// Initialize logger for stderr-only output (no log file).
+/// Used by modes that don't produce output files (e.g. --index-stats).
+pub fn init_stderr_only() {
+    let mut inner = LOGGER.lock().unwrap();
+    inner.file = None;
+    inner.start = Instant::now();
+}
+
 /// Check if debug mode is enabled (lock-free).
 #[inline]
 pub fn is_debug() -> bool {

@@ -8,3 +8,4 @@ pub mod pgen_output;
 pub mod selfdecode_output;
 pub mod target_io;
 pub mod ref_profile;
+pub mod indexing;

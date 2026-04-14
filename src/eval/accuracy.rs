@@ -948,25 +948,25 @@ pub fn evaluate_stream(
 /// Print MAF-binned summary table.
 pub fn print_summary(site_acc: &SiteAccumulator, sample_acc: &SampleAccumulator, counts: &EvalCounts) {
     let n_matched = counts.n_matched;
-    eprintln!("\n{:<20} {:>12} {:>10} {:>12}", "MAF bin", "N variants", "Mean R²", "Concordance");
-    eprintln!("{}", "-".repeat(60));
+    crate::selphi_info!("\n{:<20} {:>12} {:>10} {:>12}", "MAF bin", "N variants", "Mean R²", "Concordance");
+    crate::selphi_info!("{}", "-".repeat(60));
 
     for (bi, &(_, _, label)) in MAF_BINS.iter().enumerate() {
         let n = site_acc.bin_n[bi];
         if n == 0 {
-            eprintln!("{:<20} {:>12} {:>10} {:>12}", label, "0", "N/A", "N/A");
+            crate::selphi_info!("{:<20} {:>12} {:>10} {:>12}", label, "0", "N/A", "N/A");
         } else {
             let mean_r2 = site_acc.bin_r2_sum[bi] / n as f64;
             let mean_conc = site_acc.bin_conc_sum[bi] / n as f64;
-            eprintln!("{:<20} {:>12} {:>10.4} {:>12.4}", label, n, mean_r2, mean_conc);
+            crate::selphi_info!("{:<20} {:>12} {:>10.4} {:>12.4}", label, n, mean_r2, mean_conc);
         }
     }
 
-    eprintln!("{}", "-".repeat(60));
+    crate::selphi_info!("{}", "-".repeat(60));
     if site_acc.total_n > 0 {
         let overall_r2 = if site_acc.total_r2_n > 0 { site_acc.total_r2_sum / site_acc.total_r2_n as f64 } else { 0.0 };
         let overall_conc = site_acc.total_conc_sum / site_acc.total_n as f64;
-        eprintln!("{:<20} {:>12} {:>10.4} {:>12.4}", "OVERALL", n_matched, overall_r2, overall_conc);
+        crate::selphi_info!("{:<20} {:>12} {:>10.4} {:>12.4}", "OVERALL", n_matched, overall_r2, overall_conc);
     }
 
     // Per-sample summary
@@ -977,15 +977,15 @@ pub fn print_summary(site_acc: &SiteAccumulator, sample_acc: &SampleAccumulator,
         let min_r2 = sample_r2.iter().cloned().fold(f64::INFINITY, f64::min);
         let max_r2 = sample_r2.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let mean_conc: f64 = sample_conc.iter().sum::<f64>() / sample_conc.len() as f64;
-        eprintln!("\nPer-sample (n={}):", sample_acc.n_samples);
-        eprintln!("  R²:          mean={:.6}, min={:.6}, max={:.6}", mean_r2, min_r2, max_r2);
-        eprintln!("  Concordance: mean={:.6}", mean_conc);
+        crate::selphi_info!("\nPer-sample (n={}):", sample_acc.n_samples);
+        crate::selphi_info!("  R²:          mean={:.6}, min={:.6}, max={:.6}", mean_r2, min_r2, max_r2);
+        crate::selphi_info!("  Concordance: mean={:.6}", mean_conc);
     }
 
     let match_pct = if counts.n_truth_variants > 0 { 100.0 * n_matched as f64 / counts.n_truth_variants as f64 } else { 0.0 };
-    eprintln!("\n  Imputed:  {} variants", counts.n_imp_variants);
-    eprintln!("  Truth:    {} variants", counts.n_truth_variants);
-    eprintln!("  Matched:  {} variants ({:.1}% of truth)", n_matched, match_pct);
+    crate::selphi_info!("\n  Imputed:  {} variants", counts.n_imp_variants);
+    crate::selphi_info!("  Truth:    {} variants", counts.n_truth_variants);
+    crate::selphi_info!("  Matched:  {} variants ({:.1}% of truth)", n_matched, match_pct);
 }
 
 /// Write JSON summary to file.

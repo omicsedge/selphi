@@ -577,7 +577,7 @@ pub fn build_srp_from_bref3(
                 flush_stripe_batch(&mut tile_writer, &mut pending_stripes, n_haps)?;
                 stripes_flushed += batch_size;
                 if stripes_flushed % 1000 < batch_size {
-                    eprintln!("  Stripe {}/{} ({:.1}s)", stripes_flushed, n_stripes, t0.elapsed().as_secs_f64());
+                    crate::selphi_info!("  Stripe {}/{} ({:.1}s)", stripes_flushed, n_stripes, t0.elapsed().as_secs_f64());
                 }
             }
             current_stripe = stripe;
@@ -910,12 +910,12 @@ pub fn build_srp_unified(
             flush_stripe_batch(&mut tile_writer, &mut pending_stripes, n_haps)?;
             stripes_flushed += flushed_now;
             if stripes_flushed % 1000 < batch_size {
-                eprintln!("  Stripe {}/{} ({:.1}s)", stripes_flushed, n_stripes, t0.elapsed().as_secs_f64());
+                crate::selphi_info!("  Stripe {}/{} ({:.1}s)", stripes_flushed, n_stripes, t0.elapsed().as_secs_f64());
             }
         }
 
         if (ci + 1) % 200 == 0 || ci + 1 == total_chunks {
-            eprintln!("  Chunk {}/{} ({:.1}s)", ci + 1, total_chunks, t0.elapsed().as_secs_f64());
+            crate::selphi_info!("  Chunk {}/{} ({:.1}s)", ci + 1, total_chunks, t0.elapsed().as_secs_f64());
         }
     }
 

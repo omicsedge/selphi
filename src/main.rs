@@ -179,6 +179,15 @@ struct Args {
     #[arg(long, default_value = "0")]
     chunk_size: usize,
 
+    /// Index a VCF.gz or BCF file (creates .tbi or .csi index).
+    /// Use --index-stats to show index statistics instead of building.
+    #[arg(long)]
+    index: Option<String>,
+
+    /// Show index statistics for a VCF.gz/BCF file (variant counts per contig).
+    #[arg(long)]
+    index_stats: Option<String>,
+
     /// Run self-test: exercises all output formats and code paths using the
     /// provided --refpanel, --input, and --map. Prints pass/fail for each test.
     /// Optionally add --truth for evaluation test.
@@ -249,6 +258,20 @@ fn main() {
         let elapsed = start.elapsed().as_secs_f64();
         let mem = selphi::log::peak_mem_mb();
         selphi_info!("\nTotal: {:.1}s | Peak memory: {:.0} MB", elapsed, mem);
+        return;
+    }
+
+    // --- Index mode ---
+    if let Some(ref file_path) = args.index {
+        selphi::io::indexing::index_file(Path::new(file_path))
+            .unwrap_or_else(|e| { eprintln!("Error: {}", e); std::process::exit(1); });
+        return;
+    }
+
+    // --- Index stats mode ---
+    if let Some(ref file_path) = args.index_stats {
+        selphi::io::indexing::index_stats(Path::new(file_path))
+            .unwrap_or_else(|e| { eprintln!("Error: {}", e); std::process::exit(1); });
         return;
     }
 

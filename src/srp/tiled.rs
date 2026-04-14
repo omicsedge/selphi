@@ -59,7 +59,7 @@ pub fn write_tiled(
     let n_tile_cols = n_haps.div_ceil(TILE_COLS);
     let n_tiles = n_tile_rows * n_tile_cols;
 
-    eprintln!("  Tiled SRP: {} variants × {} haps → {}×{} tiles ({} total)",
+    crate::selphi_info!("  Tiled SRP: {} variants × {} haps → {}×{} tiles ({} total)",
         n_variants, n_haps, n_tile_rows, n_tile_cols, n_tiles);
 
     // Build header JSON
@@ -190,7 +190,7 @@ pub fn write_tiled(
             let elapsed = t0.elapsed().as_secs_f64();
             let rate = (cid + 1) as f64 / elapsed;
             let eta = (n_src_chunks - cid - 1) as f64 / rate;
-            eprintln!("  Chunk {}/{} ({:.0} chunks/s, ETA {:.0}s)", cid + 1, n_src_chunks, rate, eta);
+            crate::selphi_info!("  Chunk {}/{} ({:.0} chunks/s, ETA {:.0}s)", cid + 1, n_src_chunks, rate, eta);
         }
     }
 
@@ -233,7 +233,7 @@ pub fn write_tiled(
     file.flush()?;
 
     let file_size = std::fs::metadata(output_path)?.len();
-    eprintln!("  Tiled SRP: {} ({:.1} MB)", output_path.display(), file_size as f64 / 1e6);
+    crate::selphi_info!("  Tiled SRP: {} ({:.1} MB)", output_path.display(), file_size as f64 / 1e6);
 
     Ok(())
 }

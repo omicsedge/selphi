@@ -53,7 +53,7 @@ pub fn write_bref3_from_bcf(source_path: &Path, output_path: &Path) -> io::Resul
         output_path.to_path_buf()
     };
 
-    eprintln!("  BREF3: {} samples, {} haps, maxNSeq={}, nonMajThreshold={}",
+    crate::selphi_info!("  BREF3: {} samples, {} haps, maxNSeq={}, nonMajThreshold={}",
         n_samples, n_haps, max_n_seq, non_maj_threshold);
 
     let snv_perms = snv_perms();
@@ -212,7 +212,7 @@ pub fn write_bref3_from_bcf(source_path: &Path, output_path: &Path) -> io::Resul
     reader_handle.join().unwrap()?;
 
     let size = std::fs::metadata(&bref3_path)?.len();
-    eprintln!("  BREF3: {} variants in {} blocks, {} ({:.1} MB)",
+    crate::selphi_info!("  BREF3: {} variants in {} blocks, {} ({:.1} MB)",
         total_variants, total_blocks, bref3_path.display(), size as f64 / 1e6);
     Ok(())
 }
