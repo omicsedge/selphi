@@ -20,6 +20,10 @@ pub struct SrpReader {
     pub tiled: Option<super::tiled::TiledSrpReader>,
     mmap: Option<memmap2::Mmap>,
     chunk_index: Vec<(u64, u32, u32)>,
+    // Mixed-density panel augment (optional — None for standard panels)
+    pub augment_meta: Option<super::AugmentMetadata>,
+    pub coverage: Option<super::CoverageBitvector>,
+    pub augment_tiled: Option<super::tiled::TiledSrpReader>,
 }
 
 impl SrpReader {
@@ -114,7 +118,23 @@ impl SrpReader {
 
         let mmap = File::open(&filepath).ok().and_then(|f| unsafe { memmap2::Mmap::map(&f).ok() });
 
-        Ok(SrpReader { metadata, variants, sample_ids, ids, original_ids, tiled, mmap, chunk_index })
+        // Augment section: check metadata for augment presence
+        let augment_meta = metadata.raw.get("augment").and_then(|v| {
+            let obj = v.as_object()?;
+            Some(super::AugmentMetadata {
+                wgs_haplotypes: obj.get("wgs_haplotypes")?.as_u64()? as usize,
+                chip_haplotypes: obj.get("chip_haplotypes")?.as_u64()? as usize,
+                total_variants: obj.get("total_variants")?.as_u64()? as usize,
+                shared_variants: obj.get("shared_variants")?.as_u64()? as usize,
+                chip_only_variants: obj.get("chip_only_variants")?.as_u64()? as usize,
+            })
+        });
+        // TODO: load coverage bitvector and augment tiles when format is finalized
+
+        Ok(SrpReader {
+            metadata, variants, sample_ids, ids, original_ids, tiled, mmap, chunk_index,
+            augment_meta, coverage: None, augment_tiled: None,
+        })
     }
 
     /// Construct an SrpReader from a ChrSrpView (for multi-chr pipeline compatibility).
@@ -129,7 +149,8 @@ impl SrpReader {
             original_ids: view.original_ids,
             tiled: view.tiled,
             mmap,
-            chunk_index: vec![], // multi-chr: tiled-only, no CSC chunks
+            chunk_index: vec![],
+            augment_meta: None, coverage: None, augment_tiled: None,
         }
     }
 
@@ -176,6 +197,29 @@ impl SrpReader {
     pub fn chromosome(&self) -> &str { &self.metadata.chromosome }
     pub fn is_tiled(&self) -> bool { self.tiled.is_some() }
     pub fn is_v2(&self) -> bool { true }
+
+    /// Whether this panel has a chip augment section (mixed-density panel).
+    pub fn has_augment(&self) -> bool { self.augment_meta.is_some() }
+
+    /// Number of WGS haplotypes (full coverage). Same as n_haps() for standard panels.
+    pub fn wgs_haplotypes(&self) -> usize {
+        self.augment_meta.as_ref().map(|a| a.wgs_haplotypes).unwrap_or(self.metadata.n_haps)
+    }
+
+    /// Number of chip haplotypes (partial coverage). 0 for standard panels.
+    pub fn chip_haplotypes(&self) -> usize {
+        self.augment_meta.as_ref().map(|a| a.chip_haplotypes).unwrap_or(0)
+    }
+
+    /// Total haplotypes (WGS + chip).
+    pub fn total_haplotypes(&self) -> usize {
+        self.wgs_haplotypes() + self.chip_haplotypes()
+    }
+
+    /// Get variant coverage category. WgsOnly for all variants in standard panels.
+    pub fn variant_coverage(&self, i: usize) -> super::VariantCoverage {
+        self.coverage.as_ref().map(|c| c.get(i)).unwrap_or(super::VariantCoverage::WgsOnly)
+    }
 
     pub fn load_tiled(&mut self) -> bool { self.tiled.is_some() }
 
