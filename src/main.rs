@@ -703,6 +703,57 @@ fn main() {
         }
     }
 
+    // ChrX haploid auto-detection: if chromosome is X, detect males (< 1% het)
+    // and reset their het calls to missing. Also supports explicit --haploids file.
+    if needs_phasing {
+        let chr = srp.chromosome();
+        let is_chrx = chr == "X" || chr == "chrX" || chr == "x" || chr == "23";
+
+        let haploid_samples = if let Some(ref hap_path) = args.haploids {
+            // Explicit haploid list
+            selphi::diploid::pedigree::parse_haploids(Path::new(hap_path), &sample_names)
+                .unwrap_or_else(|e| { selphi_error!("Cannot read haploids file: {}", e); std::process::exit(1); })
+        } else if is_chrx {
+            // Auto-detect: samples with < 1% het on chrX are likely males
+            let mut haploids = std::collections::HashSet::new();
+            for si in 0..n_samples {
+                let mut n_het = 0u32;
+                let mut n_total = 0u32;
+                for ci in 0..n_chip {
+                    let a0 = targ_alleles[ci * n_haps + si * 2];
+                    let a1 = targ_alleles[ci * n_haps + si * 2 + 1];
+                    if a0 <= 1 && a1 <= 1 { n_total += 1; }
+                    if a0 != a1 { n_het += 1; }
+                }
+                if n_total > 100 && (n_het as f64 / n_total as f64) < 0.01 {
+                    haploids.insert(si);
+                }
+            }
+            haploids
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        if !haploid_samples.is_empty() {
+            let mut flat_geno = vec![0u8; n_chip * n_samples * 2];
+            for (ci, &ti) in target_idx.iter().enumerate() {
+                if ti < target_genotypes.len() {
+                    let gt = &target_genotypes[ti];
+                    for s in 0..n_samples.min(gt.len()) {
+                        flat_geno[ci * n_samples * 2 + s * 2] = gt[s][0];
+                        flat_geno[ci * n_samples * 2 + s * 2 + 1] = gt[s][1];
+                    }
+                }
+            }
+            let n_reset = selphi::diploid::pedigree::reset_haploid_hets(
+                &mut targ_alleles, &flat_geno, &haploid_samples, n_chip, n_samples, n_haps,
+            );
+            let detect_method = if args.haploids.is_some() { "from file" } else { "auto-detected" };
+            selphi_step!("Haploid samples ({}): {} samples, {} het calls reset to missing",
+                detect_method, haploid_samples.len(), n_reset);
+        }
+    }
+
     let (targ_alleles, em_ne_per_site, ref_bm_from_phasing) = if needs_phasing {
         selphi_step!("Input is unphased — running phasing pipeline...");
         let (map_bp_raw, map_cm_raw) = genmap::load_genetic_map_raw(Path::new(map_path))
