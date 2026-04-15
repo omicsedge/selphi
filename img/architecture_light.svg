@@ -69,9 +69,9 @@
   <rect x="200" y="402" width="520" height="30" rx="6" fill="url(#sg)" stroke="#8250df" stroke-width="1" filter="url(#sh)"/>
   <text x="460" y="422" text-anchor="middle" fill="#8250df" font-size="12">Phase refinement: bidirectional IBD crossover + 2-state Viterbi HMM</text>
 
-  <!-- Pedigree arrow -->
-  <path d="M787 114 L787 200 L855 200 L855 310 L850 310" fill="none" stroke="#8c959f" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arr)"/>
-  <text x="863" y="260" fill="#8c959f" font-size="9" transform="rotate(90,863,260)" text-anchor="middle">Mendelian scaffold</text>
+  <!-- Pedigree arrow (stays outside diploid box right edge at x=870) -->
+  <path d="M787 114 L787 190 L885 190 L885 310 L870 310" fill="none" stroke="#8c959f" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arr)"/>
+  <text x="895" y="255" fill="#8c959f" font-size="9" transform="rotate(90,895,255)" text-anchor="middle">Mendelian scaffold</text>
 
   <!-- Bypass arrow -->
   <path d="M 28 114 L 12 114 L 12 510 L 48 510" fill="none" stroke="#0969da" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arr)"/>
