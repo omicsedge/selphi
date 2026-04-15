@@ -20,63 +20,7 @@ Here we present Selphi 2, a complete redesign of the Selphi genotype imputation 
 
 In this paper, we describe the algorithmic components of Selphi 2, benchmark its accuracy against Selphi 1 [23] and state-of-the-art tools on the 1000 Genomes Project and TOPMed reference panels, and demonstrate the utility of mixed-density panel augmentation for populations underrepresented in WGS reference panels.
 
-## Figure 1: Selphi 2 pipeline architecture
-
-```
-                                    ┌──────────────┐
-                                    │   Pedigree   │
-                                    │  (optional)  │
-                                    └──────┬───────┘
-                                           │ Mendelian constraints
-    ┌────────────┐   ┌────────────┐   ┌────▼───────────────────────────────────────┐
-    │   Target   │   │ Reference  │   │            PHASING  (if unphased)          │
-    │  VCF/BCF   │──▶│   Panel    │──▶│                                            │
-    │            │   │   (.srp)   │   │  Auto-detect: ≤50K → Haploid               │
-    └────────────┘   └────────────┘   │              >50K → Diploid                │
-    ┌────────────┐        │           │                                            │
-    │  Genetic   │────────┘           │  ┌─────────────┐    ┌───────────────────┐  │
-    │    Map     │                    │  │   Haploid    │    │     Diploid       │  │
-    └────────────┘                    │  │  Composite   │    │  Genotype graph   │  │
-                                      │  │  HMM + swap  │    │  MCMC + Viterbi   │  │
-                                      │  │  15 iter     │    │  15 iter          │  │
-                                      │  │  EM per-win  │    │  EM Ne + common   │  │
-                                      │  └─────────────┘    │  → rare phasing   │  │
-                                      │                     └───────────────────┘  │
-                                      │  ┌──────────────────────────────────────┐  │
-                                      │  │  Phase refinement (IBD crossover     │  │
-                                      │  │  detection + 2-state Viterbi HMM)   │  │
-                                      │  └──────────────────────────────────────┘  │
-                                      └──────────────────┬─────────────────────────┘
-                                                         │
-                                          Phased haplotypes (in memory, no I/O)
-                                                         │
-                                                         ▼
-                        ┌────────────────────────────────────────────────────────┐
-                        │                    IMPUTATION                          │
-                        │                                                        │
-                        │  PBWT ──▶ Candidate ──▶ Li-Stephens HMM               │
-                        │  coded-step   selection     f32 fwd / f64 bwd          │
-                        │  bitmatrix    ≤2500 refs    adaptive Ne = 36 × n_ref   │
-                        │  (1 bit/al)   + dedup       MAF-adaptive per-site      │
-                        │                                    │                   │
-                        │                              HMM weights               │
-                        │                                    ▼                   │
-                        │  ┌──────────────────────────────────────────────────┐  │
-                        │  │   Tiled interpolation (1024 × 4096 per tile)    │  │
-                        │  │   Fused: interpolate → encode → drop per tile   │  │
-                        │  │   L2 cache optimized, streaming I/O             │  │
-                        │  └──────────────────────┬───────────────────────────┘  │
-                        └─────────────────────────┼─────────────────────────────┘
-                                                  │
-                                                  ▼
-                        ┌────────────────────────────────────────────────────────┐
-                        │              MULTI-FORMAT OUTPUT                       │
-                        │   Single interpolation pass → all formats              │
-                        │                                                        │
-                        │   VCF.gz   BCF 2.2   Parquet   PGEN    SelfDecode     │
-                        │   (BGZF)   (native)  (zstd)   (dosage)  (ZIP)        │
-                        └────────────────────────────────────────────────────────┘
-```
+![Figure 1](figure1_pipeline.svg)
 
 **Figure 1. Overview of the Selphi 2 pipeline.** The pipeline accepts unphased or phased target genotypes in VCF/BCF format, a reference panel in SRP format (single- or multi-chromosome), and a genetic map. If the input is unphased, phasing is performed first using one of two engines selected automatically by variant density: the haploid engine (composite HMM with three-channel greedy swap, optimized for chip arrays with up to 50,000 variants) or the diploid engine (genotype graph with MCMC sampling, optimized for whole-genome sequencing data). The diploid engine operates in two stages: common variants (MAF ≥ 0.1%) are phased via iterative MCMC with EM-estimated effective population size, then rare variants are phased onto the common-variant scaffold using bidirectional PBWT sweeps with IBD2-aware neighbor exclusion and singleton IBD phasing. When pedigree information is available, Mendelian constraints are applied before the HMM to pre-phase deterministic parent-child configurations. An optional phase refinement pass corrects residual switch errors via bidirectional IBD crossover detection and a two-state Viterbi HMM. Phased haplotypes are passed directly in memory to the imputation stage with no intermediate file I/O. Imputation uses a coded-step PBWT operating on a bitmatrix-native representation (1 bit per allele) to select up to 2,500 candidate reference haplotypes per target. After haplotype deduplication, a Li-Stephens HMM (32-bit forward pass for throughput, 64-bit backward pass for numerical stability) computes per-site posterior weights with an effective population size that scales automatically with panel size (Ne ≈ 36 × n_ref, validated across panels from 5,000 to 171,000 haplotypes) and is further adjusted per site by minor allele frequency. The resulting HMM weights are interpolated to full reference-panel density using L2-cache-optimized 2D tiles (1,024 variants × 4,096 haplotypes). Interpolation is fused with output encoding: each tile is interpolated, encoded to all active output formats, and immediately freed, preventing accumulation of interpolated dosages in memory. Five output formats are supported from a single interpolation pass: VCF.gz with multi-threaded BGZF compression, native BCF 2.2, Apache Parquet with zstd compression, PLINK2 PGEN with 16-bit dosage, and SelfDecode per-sample Parquet archives.
 
