@@ -122,21 +122,21 @@
   <rect x="30" y="720" width="720" height="60" rx="8" fill="#fff" stroke="#2d7d46" stroke-width="1.5"/>
   <text x="390" y="741" text-anchor="middle" fill="#1b5e20" font-size="12" font-weight="700">Multi-Format Output (single interpolation pass)</text>
 
-  <!-- Format pills -->
-  <rect x="55" y="750" width="100" height="22" rx="11" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
-  <text x="105" y="765" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="600">VCF.gz</text>
+  <!-- Format pills (centered: 5 pills + 4 gaps = 610px total, box=720, margin=55 each side) -->
+  <rect x="85" y="750" width="100" height="22" rx="11" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
+  <text x="135" y="765" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="600">VCF.gz</text>
 
-  <rect x="170" y="750" width="100" height="22" rx="11" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
-  <text x="220" y="765" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="600">BCF 2.2</text>
+  <rect x="200" y="750" width="100" height="22" rx="11" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
+  <text x="250" y="765" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="600">BCF 2.2</text>
 
-  <rect x="285" y="750" width="100" height="22" rx="11" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
-  <text x="335" y="765" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="600">Parquet</text>
+  <rect x="315" y="750" width="100" height="22" rx="11" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
+  <text x="365" y="765" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="600">Parquet</text>
 
-  <rect x="400" y="750" width="140" height="22" rx="11" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
-  <text x="470" y="765" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="600">PGEN + dosage</text>
+  <rect x="430" y="750" width="140" height="22" rx="11" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
+  <text x="500" y="765" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="600">PGEN + dosage</text>
 
-  <rect x="555" y="750" width="110" height="22" rx="11" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
-  <text x="610" y="765" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="600">SelfDecode</text>
+  <rect x="585" y="750" width="110" height="22" rx="11" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
+  <text x="640" y="765" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="600">SelfDecode</text>
 
   <!-- ========== E: FEATURES BAR ========== -->
   <text x="20" y="808" fill="#333" font-size="14" font-weight="700">e</text>

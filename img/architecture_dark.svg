@@ -71,6 +71,10 @@
   <rect x="200" y="402" width="520" height="30" rx="6" fill="url(#sg)" stroke="#a855f7" stroke-width="1"/>
   <text x="460" y="422" text-anchor="middle" fill="#c084fc" font-size="12">Phase refinement: bidirectional IBD crossover + 2-state Viterbi HMM</text>
 
+  <!-- Pedigree arrow -->
+  <path d="M787 114 L787 200 L855 200 L855 310 L850 310" fill="none" stroke="#6e7681" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arr)"/>
+  <text x="863" y="260" fill="#6e7681" font-size="9" transform="rotate(90,863,260)" text-anchor="middle">Mendelian scaffold</text>
+
   <!-- Bypass arrow for pre-phased -->
   <path d="M 28 114 L 12 114 L 12 510 L 48 510" fill="none" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arr)"/>
   <text x="5" y="330" fill="#58a6ff" font-size="10" font-weight="600" transform="rotate(-90,5,330)" text-anchor="middle">pre-phased -> skip</text>
@@ -112,17 +116,17 @@
   <rect x="50" y="658" width="820" height="50" rx="10" fill="url(#sg)" stroke="#238636" stroke-width="1.5"/>
   <text x="460" y="678" text-anchor="middle" fill="#7ee787" font-size="13" font-weight="700">Multi-Format Output (single interpolation pass)</text>
 
-  <!-- Format boxes -->
-  <rect x="75" y="688" width="120" height="18" rx="4" fill="#238636" opacity="0.2"/>
-  <text x="135" y="701" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">VCF.gz</text>
-  <rect x="210" y="688" width="120" height="18" rx="4" fill="#238636" opacity="0.2"/>
-  <text x="270" y="701" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">BCF 2.2</text>
-  <rect x="345" y="688" width="120" height="18" rx="4" fill="#238636" opacity="0.2"/>
-  <text x="405" y="701" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">Parquet</text>
-  <rect x="480" y="688" width="155" height="18" rx="4" fill="#238636" opacity="0.2"/>
-  <text x="558" y="701" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">PGEN + dosage</text>
-  <rect x="650" y="688" width="120" height="18" rx="4" fill="#238636" opacity="0.2"/>
-  <text x="710" y="701" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">SelfDecode</text>
+  <!-- Format boxes (centered: total 695px in 820px box, 63px margin each side) -->
+  <rect x="113" y="688" width="120" height="18" rx="4" fill="#238636" opacity="0.2"/>
+  <text x="173" y="701" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">VCF.gz</text>
+  <rect x="248" y="688" width="120" height="18" rx="4" fill="#238636" opacity="0.2"/>
+  <text x="308" y="701" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">BCF 2.2</text>
+  <rect x="383" y="688" width="120" height="18" rx="4" fill="#238636" opacity="0.2"/>
+  <text x="443" y="701" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">Parquet</text>
+  <rect x="518" y="688" width="155" height="18" rx="4" fill="#238636" opacity="0.2"/>
+  <text x="596" y="701" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">PGEN + dosage</text>
+  <rect x="688" y="688" width="120" height="18" rx="4" fill="#238636" opacity="0.2"/>
+  <text x="748" y="701" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">SelfDecode</text>
 
   <!-- Multi-chr note -->
   <rect x="50" y="726" width="820" height="32" rx="6" fill="#0d1117" stroke="#d29922" stroke-width="1" stroke-dasharray="4,3"/>
