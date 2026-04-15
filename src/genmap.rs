@@ -163,17 +163,23 @@ fn interpolate_cm_impl(map_bp: &[i64], map_cm: &[f64], bp: i64, extrapolate: boo
 
     if bp < map_bp[0] {
         if extrapolate && n >= 2 {
-            let mean_rate = (map_cm[n - 1] - map_cm[0]) / (map_bp[n - 1] - map_bp[0]) as f64;
-            let dist = (map_bp[0] - bp) as f64;
-            return map_cm[0] - mean_rate * dist;
+            let bp_span = (map_bp[n - 1] - map_bp[0]) as f64;
+            if bp_span > 0.0 {
+                let mean_rate = (map_cm[n - 1] - map_cm[0]) / bp_span;
+                let dist = (map_bp[0] - bp) as f64;
+                return map_cm[0] - mean_rate * dist;
+            }
         }
         return map_cm[0];
     }
     if bp > map_bp[n - 1] {
         if extrapolate && n >= 2 {
-            let mean_rate = (map_cm[n - 1] - map_cm[0]) / (map_bp[n - 1] - map_bp[0]) as f64;
-            let dist = (bp - map_bp[n - 1]) as f64;
-            return map_cm[n - 1] + mean_rate * dist;
+            let bp_span = (map_bp[n - 1] - map_bp[0]) as f64;
+            if bp_span > 0.0 {
+                let mean_rate = (map_cm[n - 1] - map_cm[0]) / bp_span;
+                let dist = (bp - map_bp[n - 1]) as f64;
+                return map_cm[n - 1] + mean_rate * dist;
+            }
         }
         return map_cm[n - 1];
     }
@@ -187,7 +193,9 @@ fn interpolate_cm_impl(map_bp: &[i64], map_cm: &[f64], bp: i64, extrapolate: boo
     // Computation order preserves specific float truncation for determinism.
     let i = idx - 1;
     let base = map_cm[i];
-    let rate = (map_cm[idx] - map_cm[i]) / (map_bp[idx] - map_bp[i]) as f64;
+    let bp_span = (map_bp[idx] - map_bp[i]) as f64;
+    if bp_span <= 0.0 { return base; } // duplicate BP positions in genetic map
+    let rate = (map_cm[idx] - map_cm[i]) / bp_span;
     let dist = (bp - map_bp[i]) as f64;
     base + rate * dist
 }

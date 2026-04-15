@@ -263,16 +263,9 @@ fn main() {
         let imp_path = Path::new(imputed);
         let truth_path = Path::new(truth);
 
-        // Find shared samples
-        let imp_samples = selphi::eval::accuracy::parse_header_samples(imp_path)
-            .expect("Failed to read imputed header");
-        let truth_samples = selphi::eval::accuracy::parse_header_samples(truth_path)
-            .expect("Failed to read truth header");
-
-        let imp_set: std::collections::HashSet<&str> = imp_samples.iter().map(|s| s.as_str()).collect();
-        let shared: Vec<String> = truth_samples.iter()
-            .filter(|s| imp_set.contains(s.as_str()))
-            .cloned().collect();
+        let (imp_samples, truth_samples, shared) =
+            selphi::eval::accuracy::find_shared_samples(imp_path, truth_path)
+                .expect("Failed to read sample headers");
 
         selphi_info!("  Imputed:  {} samples", imp_samples.len());
         selphi_info!("  Truth:    {} samples", truth_samples.len());
@@ -681,17 +674,8 @@ fn main() {
                 Path::new(ped_path), &sample_names)
                 .unwrap_or_else(|e| { selphi_error!("Cannot read PED file: {}", e); std::process::exit(1); });
             if !ped_entries.is_empty() {
-                // Build flat genotype array: (n_chip × n_samples × 2), row-major
-                let mut flat_geno = vec![0u8; n_chip * n_samples * 2];
-                for (ci, &ti) in target_idx.iter().enumerate() {
-                    if ti < target_genotypes.len() {
-                        let gt = &target_genotypes[ti];
-                        for s in 0..n_samples.min(gt.len()) {
-                            flat_geno[ci * n_samples * 2 + s * 2] = gt[s][0];
-                            flat_geno[ci * n_samples * 2 + s * 2 + 1] = gt[s][1];
-                        }
-                    }
-                }
+                let flat_geno = selphi::diploid::pedigree::build_flat_genotypes(
+                    &target_idx, &target_genotypes, n_chip, n_samples);
                 let (n_ped_phased, n_ped_imputed, n_ped_unsolved, n_ped_errors) =
                     selphi::diploid::pedigree::apply_pedigree_scaffold(
                         &mut targ_alleles, &flat_geno,
@@ -710,41 +694,17 @@ fn main() {
         let is_chrx = chr == "X" || chr == "chrX" || chr == "x" || chr == "23";
 
         let haploid_samples = if let Some(ref hap_path) = args.haploids {
-            // Explicit haploid list
             selphi::diploid::pedigree::parse_haploids(Path::new(hap_path), &sample_names)
                 .unwrap_or_else(|e| { selphi_error!("Cannot read haploids file: {}", e); std::process::exit(1); })
         } else if is_chrx {
-            // Auto-detect: samples with < 1% het on chrX are likely males
-            let mut haploids = std::collections::HashSet::new();
-            for si in 0..n_samples {
-                let mut n_het = 0u32;
-                let mut n_total = 0u32;
-                for ci in 0..n_chip {
-                    let a0 = targ_alleles[ci * n_haps + si * 2];
-                    let a1 = targ_alleles[ci * n_haps + si * 2 + 1];
-                    if a0 <= 1 && a1 <= 1 { n_total += 1; }
-                    if a0 != a1 { n_het += 1; }
-                }
-                if n_total > 100 && (n_het as f64 / n_total as f64) < 0.01 {
-                    haploids.insert(si);
-                }
-            }
-            haploids
+            selphi::diploid::pedigree::detect_haploid_chrx(&targ_alleles, n_chip, n_samples, n_haps)
         } else {
             std::collections::HashSet::new()
         };
 
         if !haploid_samples.is_empty() {
-            let mut flat_geno = vec![0u8; n_chip * n_samples * 2];
-            for (ci, &ti) in target_idx.iter().enumerate() {
-                if ti < target_genotypes.len() {
-                    let gt = &target_genotypes[ti];
-                    for s in 0..n_samples.min(gt.len()) {
-                        flat_geno[ci * n_samples * 2 + s * 2] = gt[s][0];
-                        flat_geno[ci * n_samples * 2 + s * 2 + 1] = gt[s][1];
-                    }
-                }
-            }
+            let flat_geno = selphi::diploid::pedigree::build_flat_genotypes(
+                &target_idx, &target_genotypes, n_chip, n_samples);
             let n_reset = selphi::diploid::pedigree::reset_haploid_hets(
                 &mut targ_alleles, &flat_geno, &haploid_samples, n_chip, n_samples, n_haps,
             );
@@ -1251,8 +1211,8 @@ fn main() {
 
         // Interpolation + output (runs BEFORE waiting for previous VCF write — no dependency)
         let t0_interp = Instant::now();
-        let (cs, _ce, os, oe) = (window.chip_start, window.chip_end,
-                                  window.own_chip_start, window.own_chip_end);
+        let (cs, os, oe) = (window.chip_start,
+                            window.own_chip_start, window.own_chip_end);
 
         selphi::io::pipeline::write_window_multiformat(
             &formats, &srp, &all_weights, cs, os, oe,
@@ -1357,15 +1317,9 @@ fn main() {
         {
             selphi_step!("Evaluating accuracy vs truth...");
 
-            let imp_samples = selphi::eval::accuracy::parse_header_samples(&final_path)
-                .expect("Failed to read imputed header");
-            let truth_samples = selphi::eval::accuracy::parse_header_samples(truth_path)
-                .expect("Failed to read truth header");
-
-            let imp_set: std::collections::HashSet<&str> = imp_samples.iter().map(|s| s.as_str()).collect();
-            let shared: Vec<String> = truth_samples.iter()
-                .filter(|s| imp_set.contains(s.as_str()))
-                .cloned().collect();
+            let (_imp, _truth, shared) =
+                selphi::eval::accuracy::find_shared_samples(&final_path, truth_path)
+                    .expect("Failed to read sample headers");
 
             selphi_info!("  truth:    {}", truth);
             selphi_info!("  shared:   {} samples", shared.len());

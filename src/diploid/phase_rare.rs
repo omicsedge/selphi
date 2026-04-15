@@ -67,48 +67,6 @@ fn build_variant_order(
     order
 }
 
-/// Determine which scaffold sites are "evaluation" sites (pass MAC filter)
-/// and group them by genetic distance for PBWT storage site selection.
-fn build_scaffold_evaluation(
-    scaffold_sites: &[usize],
-    cm: &[f64],
-    modulo_cm: f64,
-) -> (Vec<bool>, Vec<usize>, Vec<bool>) {
-    let n_scaffold = scaffold_sites.len();
-    if n_scaffold == 0 {
-        return (vec![], vec![], vec![]);
-    }
-
-    // All scaffold sites pass evaluation (they're already MAC-filtered)
-    let evaluation = vec![true; n_scaffold];
-
-    // Group by genetic distance
-    let base_cm = cm[scaffold_sites[0]];
-    let grouping: Vec<usize> = scaffold_sites.iter()
-        .map(|&v| ((cm[v] - base_cm) / modulo_cm) as usize)
-        .collect();
-
-    // Select one random site per group
-    let n_groups = grouping.last().map_or(0, |&g| g + 1);
-    let mut selection = vec![false; n_scaffold];
-    let mut rng = SmallRng::seed_from_u64(42);
-
-    let mut group_candidates: Vec<Vec<usize>> = vec![Vec::new(); n_groups];
-    for (i, &g) in grouping.iter().enumerate() {
-        if evaluation[i] {
-            group_candidates[g].push(i);
-        }
-    }
-    for candidates in &group_candidates {
-        if !candidates.is_empty() {
-            let idx = rng.gen_range(0..candidates.len());
-            selection[candidates[idx]] = true;
-        }
-    }
-
-    (evaluation, grouping, selection)
-}
-
 /// PBWT-based rare variant phasing: forward + backward sweep with voting.
 ///
 /// Main rare-variant phasing algorithm.
@@ -158,11 +116,6 @@ pub fn run_phase_rare(
     let n_scaffold = scaffold_sites.len();
     crate::selphi_debug!("  [diploid] phase_rare: {} rare het variants, {} scaffold sites",
         rare_sites.len(), n_scaffold);
-
-    // Build scaffold evaluation/selection
-    let (_evaluation, _grouping, _selection) = build_scaffold_evaluation(
-        &scaffold_sites, cm, 0.1,
-    );
 
     // Build variant order
     let variant_order = build_variant_order(&var_type, &scaffold_sites, &rare_sites, n_var);

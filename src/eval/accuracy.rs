@@ -372,6 +372,18 @@ pub fn parse_header_samples(path: &Path) -> io::Result<Vec<String>> {
 }
 
 /// Evaluation result counts.
+/// Find samples shared between imputed and truth files.
+/// Returns (imputed_samples, truth_samples, shared_samples).
+pub fn find_shared_samples(imp_path: &Path, truth_path: &Path) -> io::Result<(Vec<String>, Vec<String>, Vec<String>)> {
+    let imp_samples = parse_header_samples(imp_path)?;
+    let truth_samples = parse_header_samples(truth_path)?;
+    let imp_set: std::collections::HashSet<&str> = imp_samples.iter().map(|s| s.as_str()).collect();
+    let shared: Vec<String> = truth_samples.iter()
+        .filter(|s| imp_set.contains(s.as_str()))
+        .cloned().collect();
+    Ok((imp_samples, truth_samples, shared))
+}
+
 pub struct EvalCounts {
     pub n_matched: u64,
     pub n_imp_variants: u64,

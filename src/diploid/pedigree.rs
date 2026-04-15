@@ -144,7 +144,7 @@ pub fn apply_pedigree_scaffold(
                         phased[v * n_haps + ch1] = 0;
                         n_phased += 1;
                     }
-                    (1, 2) | (0, _) => {
+                    (1, 2) => {
                         // Mother hom-alt → child got ALT from mother
                         phased[v * n_haps + ch0] = 0;
                         phased[v * n_haps + ch1] = 1;
@@ -204,6 +204,31 @@ pub fn apply_pedigree_scaffold(
     (n_phased, n_imputed, n_unsolved, n_errors)
 }
 
+/// Auto-detect haploid samples on chrX by het rate.
+/// Males on chrX should have <1% het rate. Returns sample indices.
+pub fn detect_haploid_chrx(
+    alleles: &[u8],     // (n_var × n_haps) target alleles
+    n_var: usize,
+    n_samples: usize,
+    n_haps: usize,
+) -> HashSet<usize> {
+    let mut haploids = HashSet::new();
+    for si in 0..n_samples {
+        let mut n_het = 0u32;
+        let mut n_total = 0u32;
+        for v in 0..n_var {
+            let a0 = alleles[v * n_haps + si * 2];
+            let a1 = alleles[v * n_haps + si * 2 + 1];
+            if a0 <= 1 && a1 <= 1 { n_total += 1; }
+            if a0 != a1 { n_het += 1; }
+        }
+        if n_total > 100 && (n_het as f64 / n_total as f64) < 0.01 {
+            haploids.insert(si);
+        }
+    }
+    haploids
+}
+
 /// Parse haploid sample list (one sample ID per line).
 /// Returns set of sample indices that are haploid (e.g., chrX males).
 pub fn parse_haploids(
@@ -225,6 +250,27 @@ pub fn parse_haploids(
         }
     }
     Ok(haploid_set)
+}
+
+/// Build flat genotype array (n_var × n_samples × 2) from per-variant genotype vectors.
+/// Used by pedigree scaffold and haploid reset to access genotypes in row-major layout.
+pub fn build_flat_genotypes(
+    target_idx: &[usize],
+    target_genotypes: &[Vec<[u8; 2]>],
+    n_chip: usize,
+    n_samples: usize,
+) -> Vec<u8> {
+    let mut flat = vec![0u8; n_chip * n_samples * 2];
+    for (ci, &ti) in target_idx.iter().enumerate() {
+        if ti < target_genotypes.len() {
+            let gt = &target_genotypes[ti];
+            for s in 0..n_samples.min(gt.len()) {
+                flat[ci * n_samples * 2 + s * 2] = gt[s][0];
+                flat[ci * n_samples * 2 + s * 2 + 1] = gt[s][1];
+            }
+        }
+    }
+    flat
 }
 
 /// Reset heterozygous calls to missing in haploid samples.
