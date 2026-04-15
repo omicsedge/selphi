@@ -687,12 +687,13 @@ fn main() {
                         }
                     }
                 }
-                let (n_ped_phased, n_ped_errors) = selphi::diploid::pedigree::apply_pedigree_scaffold(
-                    &mut targ_alleles, &flat_geno,
-                    &ped_entries, n_chip, n_samples, n_haps,
-                );
-                selphi_step!("Pedigree scaffold: {} trios/duos, {} sites pre-phased, {} Mendelian errors",
-                    ped_entries.len(), n_ped_phased, n_ped_errors);
+                let (n_ped_phased, n_ped_imputed, n_ped_unsolved, n_ped_errors) =
+                    selphi::diploid::pedigree::apply_pedigree_scaffold(
+                        &mut targ_alleles, &flat_geno,
+                        &ped_entries, n_chip, n_samples, n_haps,
+                    );
+                selphi_step!("Pedigree scaffold: {} trios/duos, {} phased, {} imputed, {} unsolved, {} Mendelian errors",
+                    ped_entries.len(), n_ped_phased, n_ped_imputed, n_ped_unsolved, n_ped_errors);
             }
         }
     }
