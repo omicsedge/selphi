@@ -771,7 +771,6 @@ pub fn select_candidates(
         return Vec::new();
     }
 
-    // Collect ALL ref haps that share a partition with target at ANY step
     let mut seen = vec![false; n_ref];
     let mut candidates = Vec::new();
 
@@ -785,7 +784,6 @@ pub fn select_candidates(
         }
     }
 
-    // If too many: rank by step count (IBS coverage frequency)
     if candidates.len() > max_candidates {
         let mut counts = vec![0u16; n_ref];
         for s in 0..n_steps {
@@ -803,6 +801,7 @@ pub fn select_candidates(
     candidates.sort_unstable();
     candidates
 }
+
 
 
 

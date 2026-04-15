@@ -32,7 +32,7 @@ The pipeline accepts unphased or phased VCF/BCF input, phases the target if nece
 
 ### 2.2 Phasing engines
 
-Selphi 2 includes two phasing engines that are selected automatically based on input variant density. For chip arrays (up to 50,000 variants), the haploid engine is used. For whole-genome sequencing data (more than 50,000 variants), the diploid engine is used. Users may override the automatic selection with `--phasing-engine haploid|diploid`.
+Selphi 2 includes two phasing engines that are selected automatically based on input variant density. For chip arrays (up to 50,000 variants), the haploid engine is used. For whole-genome sequencing data (more than 50,000 variants), the diploid engine is used. Users may override the automatic selection via command-line options.
 
 #### 2.2.1 Haploid engine
 
@@ -48,9 +48,9 @@ EM parameter estimation [15] is performed within each iteration to calibrate the
 
 #### 2.2.2 Diploid engine
 
-The diploid engine models the pair of haplotypes jointly through a genotype graph, following the approach of SHAPEIT4 [16] and SHAPEIT5 [9]. At each heterozygous site, the graph encodes all possible local diplotype configurations using 64-bit bitmasks. A segment-based Li-Stephens HMM computes diplotype transition probabilities across conditioning haplotypes selected by positional PBWT. The number of conditioning haplotypes can be limited via `--max-cond-haps` (default: unlimited) for computational efficiency.
+The diploid engine models the pair of haplotypes jointly through a genotype graph, following the approach of SHAPEIT4 [16] and SHAPEIT5 [9]. At each heterozygous site, the graph encodes all possible local diplotype configurations using 64-bit bitmasks. A segment-based Li-Stephens HMM computes diplotype transition probabilities across conditioning haplotypes selected by positional PBWT. The number of conditioning haplotypes can be capped for computational efficiency (default: unlimited).
 
-Phase is resolved via MCMC sampling on the genotype graph with iterative pruning (5 burn-in, 3 pruning, 5 main iterations), followed by a final Viterbi solve. The HMM forward pass is SIMD-accelerated (AVX2 on x86, NEON on Apple Silicon). The diploid engine operates only on common variants (MAF >= 0.1%); rare variants are phased in a separate pass (Section 2.2.3).
+Phase is resolved via MCMC sampling on the genotype graph with 15 iterations following the scheme 5b,1p,1b,1p,1b,1p,5m (5 initial burn-in, 3 interleaved prune/burn-in cycles, 5 main iterations), followed by a final Viterbi solve. The HMM forward pass is SIMD-accelerated (AVX2 on x86, NEON on Apple Silicon). The diploid engine operates only on common variants (MAF >= 0.1%); rare variants are phased in a separate pass (Section 2.2.3).
 
 During burn-in iterations, the effective population size (Ne) is re-estimated from the empirical transition rate observed in the genotype graphs. The observed switch rate (fraction of sites where a genotype graph changes diplotype assignment) is related to Ne through the Li-Stephens approximation [2]: switch_rate ≈ 0.04 × Ne × d / n_haps, where d is the mean inter-marker distance in cM. The estimated Ne is clamped to [1,000, 1,000,000] and applied only when the change exceeds 5% of the current value, preventing oscillation while allowing adaptation to population-specific recombination patterns.
 
@@ -58,7 +58,7 @@ During burn-in iterations, the effective population size (Ne) is re-estimated fr
 
 Rare variants (those not in the common-variant scaffold) are phased in a dedicated PBWT-based pass that operates on target haplotypes only. This two-stage common-then-rare strategy parallels the approach introduced in SHAPEIT5 [9].
 
-The algorithm proceeds in four steps. First, an IBD2 scan identifies sample pairs sharing both haplotypes identical-by-descent across scaffold sites [17]. Pairs are detected using a diploid PBWT on genotype sums (0/1/2), with IBD2 segments required to span at least 2.5 cM, 1 Mb, and 100 scaffold sites. IBD2 pairs are excluded from PBWT neighbor selection to prevent a sample's own diplotype from being used as evidence for phasing.
+The algorithm proceeds in four steps. First, an IBD2 scan identifies sample pairs sharing both haplotypes identical-by-descent across scaffold sites [17]. Pairs are detected using a diploid PBWT on genotype sums (0/1/2), with IBD2 segments required to span at least 2.5 cM, 1 Mb, and 100 scaffold sites. IBD2 pairs are excluded from PBWT neighbor selection during rare variant phasing, as their haplotypes are uninformative for resolving phase at heterozygous sites shared between both individuals.
 
 Second, a scaffold bitmatrix is constructed from target haplotypes at scaffold sites, filtering out sites with a missing data rate (MDR) above 10%. A forward PBWT sweep processes all variants in physical order: at scaffold sites, the PBWT arrays (permutation A, divergence C, reverse-lookup R) are updated; at rare heterozygous sites, phasing is performed using a two-pass threshold-then-distance voting scheme. In the threshold pass, the two PBWT neighbors of each of the target's haplotypes vote on the phase assignment. If the net vote exceeds a threshold (starting at 2.5 and decreasing to 1.0), the phase is assigned and the carrier contributes to subsequent decisions. In the distance pass, remaining unphased sites use distance-weighted votes, where the weight is the genetic distance from the PBWT divergence point to the current position.
 
@@ -90,7 +90,15 @@ A reduced array is constructed containing only the candidate haplotypes plus the
 
 P(switch) = 1 - exp(-d_k × 0.04 × Ne / n_ref)
 
-where d_k is the genetic distance between consecutive markers in Morgans, Ne is the effective population size, and n_ref is the number of reference haplotypes. The effective population size is calibrated per site using a MAF-adaptive scheme: Ne is set to 0.85 × Ne_base for rare variants (MAF < 0.5%) and 1.2 × Ne_base for common variants (MAF > 2%), with a smooth logistic transition between. When the diploid phasing engine is used, the Ne estimated by EM during burn-in (Section 2.2.2) is propagated to the imputation HMM, providing a data-driven calibration rather than a fixed default. When phasing is not performed (pre-phased input), the default Ne_base of 175,000, calibrated empirically on the 1000 Genomes panel [19], is used.
+where d_k is the genetic distance between consecutive markers in centiMorgans, Ne is the effective population size, and n_ref is the number of candidate haplotypes. In existing imputation tools, Ne is a fixed constant typically calibrated on a single reference panel (e.g., Ne = 15,000 in Beagle [5], or Ne = 20,000 in IMPUTE5 [4]). However, the optimal Ne depends on the reference panel size: as panels grow, PBWT-selected candidates represent increasingly close matches to the target, sharing shorter identity-by-descent segments. To capture the mosaic structure at finer resolution, the HMM must switch between candidates more frequently, requiring a proportionally larger Ne.
+
+Selphi 2 sets Ne automatically as a linear function of the total number of reference haplotypes:
+
+Ne = 36.4 × n_ref_total
+
+where n_ref_total is the total number of haplotypes in the reference panel (not the number of candidates selected for the HMM). This scaling was derived empirically by optimizing imputation R² across three reference panels spanning two orders of magnitude in size: the 1000 Genomes Phase 3 panel (4,802 haplotypes; optimal Ne ≈ 175,000), a UK Biobank subset (75,542 haplotypes; optimal Ne ≈ 2,750,000), and the TOPMed panel (171,054 haplotypes; optimal Ne ≈ 6,200,000). The constant ratio Ne/n_ref ≈ 36 was consistent across panels despite substantial differences in population composition (multi-ethnic global panel, European-only cohort, and multi-ethnic clinical cohort, respectively).
+
+The effective population size is further calibrated per site using a MAF-adaptive scheme: Ne is set to 0.85 × Ne_base for rare variants (MAF < 0.5%) and 1.2 × Ne_base for common variants (MAF > 2%), with a smooth logistic transition between. When the diploid phasing engine is used, the Ne estimated by EM during burn-in (Section 2.2.2) may additionally inform the imputation HMM. Users may override the automatic Ne with a fixed value for reproducibility with prior results.
 
 The resulting HMM posterior weights are stored as sparse CSR matrices (row-per-chip-variant, column-per-reference-haplotype), with entries below 1/(H+1) set to zero.
 
