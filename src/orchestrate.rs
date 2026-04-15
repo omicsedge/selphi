@@ -291,7 +291,10 @@ pub fn run_multi_chr(
         let fl_fwd = (2600.0 / log2_haps) as usize;
         let fl_fwd = fl_fwd.clamp(100, 450);
         let fl_bwd = ((fl_fwd as f64 * 2.4 / log2_haps) as usize).max(13);
-        let est_ne = if config.est_ne <= 0 { 175_000i64 } else { config.est_ne };
+        let est_ne = if config.est_ne <= 0 {
+            let auto_ne = (36.4 * n_ref as f64).round() as i64;
+            auto_ne.max(20_000)
+        } else { config.est_ne };
 
         // Compute imputation windows
         let windows = compute_imputation_windows(&chip_cm, config.window_cm, config.overlap_cm);

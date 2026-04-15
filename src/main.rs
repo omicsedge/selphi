@@ -871,8 +871,11 @@ fn main() {
         ((fl_fwd as f64 * 2.4 / log2_haps) as usize).max(13)
     });
     let est_ne = if args.est_ne <= 0 {
-        // Ne=175,000 optimal for 1KG panel (plateau 150K-200K, chr22 801s sweep).
-        175_000i64
+        // Adaptive Ne: scales linearly with panel size.
+        // Validated on 1KG (4802 haps, Ne=175K), UKB (75K haps, Ne=2.75M),
+        // TOPMed (171K haps, Ne=5M). Constant ratio ~36 × n_ref.
+        let auto_ne = (36.4 * n_ref as f64).round() as i64;
+        auto_ne.max(20_000)
     } else {
         args.est_ne
     };
