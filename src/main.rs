@@ -235,8 +235,8 @@ struct Args {
     ped: Option<String>,
 
     /// File listing haploid samples (one ID per line, e.g. chrX males).
-    /// Heterozygous calls in these samples are reset to missing before phasing.
-    #[arg(long)]
+    /// Usually not needed: chrX males are auto-detected (< 1% het rate).
+    #[arg(long, hide = true)]
     haploids: Option<String>,
 
 }
