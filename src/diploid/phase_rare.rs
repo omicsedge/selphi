@@ -272,7 +272,17 @@ pub fn run_phase_rare(
     }).collect();
 
     // Build scaffold bitmatrix: TARGET HAPS ONLY (n_haplotypes = 2*n_samples).
-    let scaffold_eval = vec![true; n_scaffold];
+    // Filter scaffold evaluation sites by missing data rate (MDR <= 10%)
+    let scaffold_eval: Vec<bool> = scaffold_sites.iter().map(|&v| {
+        let mut n_missing = 0u32;
+        for si in 0..n_samples {
+            let g0 = target_geno[v * n_samples * 2 + si * 2];
+            let g1 = target_geno[v * n_samples * 2 + si * 2 + 1];
+            if g0 > 1 || g1 > 1 { n_missing += 1; } // missing if allele > 1
+        }
+        let mdr = n_missing as f64 / n_samples as f64;
+        mdr <= 0.10 // same as SHAPEIT5 --pbwt-mdr 0.10
+    }).collect();
     let scaffold_bm = super::pbwt_neighbor::HaplotypeBitmatrix::from_panel(
         n_scaffold, n_haps,
         &|scaffold_idx: usize, hap_idx: usize| {
@@ -600,14 +610,14 @@ fn run_pbwt_phase(
     }
 }
 
-/// Singleton Viterbi phasing: for het sites with MAC=1 among targets,
-/// assign the rare allele to the haplotype with the longer IBD segment.
+/// Singleton phasing via IBD segment length at scaffold sites.
 ///
-/// IBD segment length is estimated from run-length of identical alleles
-/// at scaffold sites around the singleton. The haplotype with longer
-/// consistent run (less recent recombination) gets the singleton allele.
+/// For each singleton het (MAC=1 among targets), identifies the haplotype with
+/// the longer consistent run at scaffold sites (proxy for IBD segment length).
+/// The singleton allele is assigned to the haplotype with the LONGER segment
+/// (matching SHAPEIT5's phaseCoalescentViterbi logic).
 ///
-/// Confidence = max(len0, len1) / (len0 + len1), range [0.5, 1.0].
+/// Confidence = max(w0, w1) / (w0 + w1), range [0.5, 1.0].
 pub fn phase_singletons_ibd(
     phased: &mut [u8],
     target_geno: &[u8],
@@ -626,75 +636,81 @@ pub fn phase_singletons_ibd(
         let h0 = si * 2;
         let h1 = si * 2 + 1;
 
+        // Build per-haplotype "run-length map" at scaffold sites:
+        // For each scaffold site, measure length of consistent allele run
+        // containing that site (forward + backward until allele changes).
+        // This is a proxy for the Viterbi IBD segment length.
+        let mut seg_len_h0 = vec![0.0f64; n_scaffold];
+        let mut seg_len_h1 = vec![0.0f64; n_scaffold];
+
+        // Forward sweep: measure run starts
+        let mut run_start_h0 = 0usize;
+        let mut run_start_h1 = 0usize;
+        for i in 1..n_scaffold {
+            let sv = scaffold_indices[i];
+            let sv_prev = scaffold_indices[i - 1];
+            if phased[sv * n_haps + h0] != phased[sv_prev * n_haps + h0] {
+                // State change on h0: record run for previous segment
+                let run_cm = cm[scaffold_indices[i - 1]] - cm[scaffold_indices[run_start_h0]];
+                for j in run_start_h0..i {
+                    seg_len_h0[j] = run_cm;
+                }
+                run_start_h0 = i;
+            }
+            if phased[sv * n_haps + h1] != phased[sv_prev * n_haps + h1] {
+                let run_cm = cm[scaffold_indices[i - 1]] - cm[scaffold_indices[run_start_h1]];
+                for j in run_start_h1..i {
+                    seg_len_h1[j] = run_cm;
+                }
+                run_start_h1 = i;
+            }
+        }
+        // Final runs
+        if n_scaffold > 0 {
+            let run_cm = cm[scaffold_indices[n_scaffold - 1]] - cm[scaffold_indices[run_start_h0]];
+            for j in run_start_h0..n_scaffold { seg_len_h0[j] = run_cm; }
+            let run_cm = cm[scaffold_indices[n_scaffold - 1]] - cm[scaffold_indices[run_start_h1]];
+            for j in run_start_h1..n_scaffold { seg_len_h1[j] = run_cm; }
+        }
+
+        // Phase singletons
         for v in 0..n_var {
             let g0 = target_geno[v * n_samples * 2 + si * 2];
             let g1 = target_geno[v * n_samples * 2 + si * 2 + 1];
-            if g0 == g1 { continue; }
-            if g0 + g1 != 1 { continue; }
+            if g0 == g1 || g0 + g1 != 1 { continue; }
 
-            // Check if singleton among targets (MAC=1 in target samples)
+            // Check if singleton (MAC=1)
             let mut mac = 0u32;
             for s2 in 0..n_samples {
                 mac += target_geno[v * n_samples * 2 + s2 * 2] as u32;
                 mac += target_geno[v * n_samples * 2 + s2 * 2 + 1] as u32;
             }
-            let target_mac = mac.min(n_samples as u32 * 2 - mac);
-            if target_mac > 1 { continue; }
+            if mac.min(n_samples as u32 * 2 - mac) > 1 { continue; }
 
-            // Estimate IBD segment length for each haplotype
-            // by measuring run-length of unchanged alleles at scaffold sites
+            // Find flanking scaffold position
             let pos_cm = cm.get(v).copied().unwrap_or(0.0);
-            let si_pos = scaffold_indices.partition_point(|&s| cm[s] < pos_cm);
+            let idx = scaffold_indices.partition_point(|&s| cm[s] < pos_cm);
 
-            // Forward run: how far each haplotype maintains same allele pattern
-            let a0_at_v = phased[v * n_haps + h0];
-            let a1_at_v = phased[v * n_haps + h1];
-            let mut fwd_len0 = 0.0f64;
-            let mut fwd_len1 = 0.0f64;
+            // Get IBD segment lengths for both haplotypes (max of flanking)
+            let w0 = if idx == 0 { seg_len_h0[0] }
+                else if idx >= n_scaffold { seg_len_h0[n_scaffold - 1] }
+                else { seg_len_h0[idx - 1].max(seg_len_h0[idx]) };
 
-            for i in si_pos..n_scaffold.min(si_pos + 100) {
-                let sv = scaffold_indices[i];
-                let sv_cm = cm[sv] - pos_cm;
-                if sv_cm > 5.0 { break; }
-                // Run breaks when allele at scaffold changes relative to pattern
-                if phased[sv * n_haps + h0] == a0_at_v { fwd_len0 = sv_cm; } else { break; }
-            }
-            for i in si_pos..n_scaffold.min(si_pos + 100) {
-                let sv = scaffold_indices[i];
-                let sv_cm = cm[sv] - pos_cm;
-                if sv_cm > 5.0 { break; }
-                if phased[sv * n_haps + h1] == a1_at_v { fwd_len1 = sv_cm; } else { break; }
-            }
-
-            // Backward run
-            let mut bwd_len0 = 0.0f64;
-            let mut bwd_len1 = 0.0f64;
-            for i in (0..si_pos).rev().take(100) {
-                let sv = scaffold_indices[i];
-                let sv_cm = pos_cm - cm[sv];
-                if sv_cm > 5.0 { break; }
-                if phased[sv * n_haps + h0] == a0_at_v { bwd_len0 = sv_cm; } else { break; }
-            }
-            for i in (0..si_pos).rev().take(100) {
-                let sv = scaffold_indices[i];
-                let sv_cm = pos_cm - cm[sv];
-                if sv_cm > 5.0 { break; }
-                if phased[sv * n_haps + h1] == a1_at_v { bwd_len1 = sv_cm; } else { break; }
-            }
-
-            let total0 = fwd_len0 + bwd_len0;
-            let total1 = fwd_len1 + bwd_len1;
+            let w1 = if idx == 0 { seg_len_h1[0] }
+                else if idx >= n_scaffold { seg_len_h1[n_scaffold - 1] }
+                else { seg_len_h1[idx - 1].max(seg_len_h1[idx]) };
 
             // Assign singleton to haplotype with LONGER IBD segment
-            if total0 > total1 * 1.2 {
+            if w0 > w1 {
                 phased[v * n_haps + h0] = 1;
                 phased[v * n_haps + h1] = 0;
                 n_phased += 1;
-            } else if total1 > total0 * 1.2 {
+            } else if w1 > w0 {
                 phased[v * n_haps + h0] = 0;
                 phased[v * n_haps + h1] = 1;
                 n_phased += 1;
             }
+            // w0 == w1: keep existing phase (50/50 confidence)
         }
     }
 

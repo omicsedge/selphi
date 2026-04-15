@@ -6,7 +6,7 @@
 //!
 //! Convention: hap0 = paternal (allele from father), hap1 = maternal (from mother).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 
@@ -202,4 +202,60 @@ pub fn apply_pedigree_scaffold(
     }
 
     (n_phased, n_imputed, n_unsolved, n_errors)
+}
+
+/// Parse haploid sample list (one sample ID per line).
+/// Returns set of sample indices that are haploid (e.g., chrX males).
+pub fn parse_haploids(
+    haploid_path: &Path,
+    sample_names: &[String],
+) -> io::Result<HashSet<usize>> {
+    let content = std::fs::read_to_string(haploid_path)?;
+    let name_to_idx: HashMap<&str, usize> = sample_names.iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
+
+    let mut haploid_set = HashSet::new();
+    for line in content.lines() {
+        let name = line.trim();
+        if name.is_empty() || name.starts_with('#') { continue; }
+        if let Some(&idx) = name_to_idx.get(name) {
+            haploid_set.insert(idx);
+        }
+    }
+    Ok(haploid_set)
+}
+
+/// Reset heterozygous calls to missing in haploid samples.
+/// Identical to SHAPEIT5's mapHaploidsAndResetHets().
+/// For haploid individuals (e.g., chrX males), het calls are biologically impossible
+/// and indicate genotyping error. Setting them to missing allows the HMM to impute
+/// the correct homozygous call.
+///
+/// Returns the number of het calls reset.
+pub fn reset_haploid_hets(
+    alleles: &mut [u8],         // (n_var × n_haps) target alleles
+    genotypes: &[u8],           // (n_var × n_samples × 2) original genotypes
+    haploid_samples: &HashSet<usize>,
+    n_var: usize,
+    n_samples: usize,
+    n_haps: usize,
+) -> usize {
+    let mut n_reset = 0;
+    for &si in haploid_samples {
+        let h0 = si * 2;
+        let h1 = si * 2 + 1;
+        for v in 0..n_var {
+            let g0 = genotypes[v * n_samples * 2 + si * 2];
+            let g1 = genotypes[v * n_samples * 2 + si * 2 + 1];
+            if g0 != g1 {
+                // Het in haploid → set both alleles to 0 (missing/ref)
+                alleles[v * n_haps + h0] = 0;
+                alleles[v * n_haps + h1] = 0;
+                n_reset += 1;
+            }
+        }
+    }
+    n_reset
 }
