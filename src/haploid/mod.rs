@@ -757,5 +757,11 @@ fn phase_genotypes_inner(
         selphi_debug!("  [Rust] W{} complete: {:.1}s", wi+1, t0.elapsed().as_secs_f64());
     }
 
+    // Note: singleton IBD phasing is NOT applied in haploid engine.
+    // The haploid engine already handles rare variants via carrier injection
+    // and adaptive step scaling. The singleton IBD approach requires a sparse
+    // scaffold (common variants only) to compute meaningful segment lengths,
+    // which is available in the diploid engine's phase_rare but not here.
+
     (global_phased, global_confidence, window_ri)
 }
