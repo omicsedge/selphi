@@ -22,7 +22,7 @@ use selphi::srp::SrpReader;
 use selphi::genmap;
 use selphi::haploid;
 use selphi::io::target_io::{read_target_vcf, write_phased_vcf, extract_target_alleles, intersect_variants};
-use selphi::io::ref_profile::{save_ref_profile, load_ref_profile};
+
 use selphi::common::utils::extract_subarray;
 use selphi::imputation::windows::compute_imputation_windows;
 
@@ -139,13 +139,6 @@ struct Args {
     #[arg(long, default_value = "0")]
     max_cond_haps: usize,
 
-    /// Save per-sample reference haplotype usage profile after phasing (for cross-chromosome).
-    #[arg(long)]
-    save_ref_profile: Option<String>,
-
-    /// Load reference haplotype profile to seed conditioning set (cross-chromosome prior).
-    #[arg(long)]
-    load_ref_profile: Option<String>,
 
     /// Alias for --phasing-engine=diploid (deprecated)
     #[arg(long, hide = true)]
@@ -781,34 +774,14 @@ fn main() {
                     common_chip_indices.len(), n_chip,
                     (common_ref_bm.n_words() * common_chip_indices.len() * 8) as f64 / 1e6);
 
-                // Load cross-chr preferred refs if provided
-                let preferred = if let Some(ref path) = args.load_ref_profile {
-                    match load_ref_profile(path, n_samples) {
-                        Ok(p) => { selphi_info!("  Loaded cross-chr profile: {} samples", p.len()); Some(p) }
-                        Err(e) => { selphi_info!("  WARNING: failed to load ref profile: {}", e); None }
-                    }
-                } else { None };
-
-                let (p, c, w, ref_profiles) = selphi::diploid::diploid_phase_bm_prefiltered(
+                selphi::diploid::diploid_phase_bm_prefiltered(
                     &targ_alleles, common_ref_bm, &common_chip_indices,
                     &raw_chip_cm, &chip_bps,
                     &ref_bp, &map_bp_raw, &map_cm_raw,
                     n_chip, n_samples, n_ref,
                     args.seed, args.threads,
                     args.max_cond_haps,
-                    preferred.as_deref(),
-                );
-
-                // Save cross-chr profile if requested
-                if let Some(ref path) = args.save_ref_profile {
-                    if let Err(e) = save_ref_profile(path, &ref_profiles, n_samples) {
-                        selphi_info!("  WARNING: failed to save ref profile: {}", e);
-                    } else {
-                        selphi_info!("  Saved cross-chr ref profile: {}", path);
-                    }
-                }
-
-                (p, c, w)
+                )
             }
             ResolvedEngine::Haploid => {
                 selphi_step!("Using haploid phasing engine");

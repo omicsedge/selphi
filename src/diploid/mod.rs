@@ -37,9 +37,8 @@ pub fn diploid_phase_bm_ref(
     let (common_indices, common_ref_bm, prep) =
         _prepare_common(target_geno, ref_bm, chip_cm, chip_bp, ref_bp, map_bp, map_cm,
             n_var, n_samples, n_ref);
-    let (p, c, w, _profiles) = _diploid_run(target_geno, common_ref_bm, &common_indices, prep,
-        chip_bp, n_var, n_samples, n_ref, seed, n_threads, 0, None);
-    (p, c, w)
+    _diploid_run(target_geno, common_ref_bm, &common_indices, prep,
+        chip_bp, n_var, n_samples, n_ref, seed, n_threads, 0)
 }
 
 /// Diploid phasing with pre-filtered common_ref_bm (no full ref_bm ever allocated).
@@ -52,8 +51,7 @@ pub fn diploid_phase_bm_prefiltered(
     _chip_cm: &[f64], chip_bp: &[i64], _ref_bp: &[i64], map_bp: &[i64], map_cm: &[f64],
     n_var: usize, n_samples: usize, n_ref: usize, seed: i64, n_threads: usize,
     max_cond_haps: usize,
-    preferred_refs: Option<&[Vec<usize>]>,
-) -> (Vec<u8>, Vec<f32>, Vec<(f32, usize, usize)>, Vec<Vec<(u32, usize)>>) {
+) -> (Vec<u8>, Vec<f32>, Vec<(f32, usize, usize)>) {
     let seed = if seed == 33 { 15052011 } else { seed };
     let n_haps = n_samples * 2;
     let _n_haps_total = n_ref + n_haps;
@@ -82,7 +80,7 @@ pub fn diploid_phase_bm_prefiltered(
     _diploid_run(
         target_geno, common_ref_bm, common_chip_indices,
         CommonPrep { target_geno_common, cm_common, cm_full: chip_cm_full, bp_common },
-        chip_bp, n_var, n_samples, n_ref, seed, n_threads, max_cond_haps, preferred_refs,
+        chip_bp, n_var, n_samples, n_ref, seed, n_threads, max_cond_haps,
     )
 }
 
@@ -168,8 +166,7 @@ fn _diploid_run(
     _chip_bp: &[i64],
     n_var: usize, n_samples: usize, n_ref: usize, seed: i64, n_threads: usize,
     max_cond_haps: usize,
-    preferred_refs: Option<&[Vec<usize>]>,
-) -> (Vec<u8>, Vec<f32>, Vec<(f32, usize, usize)>, Vec<Vec<(u32, usize)>>) {
+) -> (Vec<u8>, Vec<f32>, Vec<(f32, usize, usize)>) {
     use rayon::prelude::*;
     let seed = if seed == 33 { 15052011 } else { seed };
     let n_haps = n_samples * 2;
@@ -216,13 +213,13 @@ fn _diploid_run(
     drop(common_ref_bm);
 
     // Run phase_common on COMMON variants only (bitmatrix-native)
-    let ref_profiles = phase_common::run_phase_common_bm(
+    phase_common::run_phase_common_bm(
         &mut graphs, unified_bm, &cm_common,
         n_common, n_samples, n_ref, seed, n_threads,
         "5b,1p,1b,1p,1b,1p,5m",
         Some(&bp_common),
         &target_geno_common,
-        max_cond_haps, preferred_refs,
+        max_cond_haps,
     );
 
     // Extract phased haplotypes from solved graphs (COMMON variants only)
@@ -278,5 +275,5 @@ fn _diploid_run(
 
     crate::selphi_info!("  Phasing complete");
 
-    (phased, confidence, window_ri, ref_profiles)
+    (phased, confidence, window_ri)
 }

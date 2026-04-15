@@ -103,8 +103,7 @@ pub fn run_phase_common_bm(
     chip_bp: Option<&[i64]>,
     target_geno: &[u8],
     max_cond_haps: usize,
-    preferred_refs: Option<&[Vec<usize>]>,
-) -> Vec<Vec<(u32, usize)>> {
+) {
     let n_haps = n_samples * 2;
     let n_haps_total = n_ref + n_haps;
     let stages = expand_scheme(&parse_mcmc_scheme(scheme));
@@ -355,16 +354,15 @@ pub fn run_phase_common_bm(
 
     let mut dummy_bm = HaplotypeBitmatrix::empty();
 
-    let profiles = _run_iterations(
+    _run_iterations(
         graphs, &mut hap_bm, &mut dummy_bm,
         &mut pbwt_idx, &mut ibd2, &cm_f64, &mut hmm_params, &allele_counts,
         &stages, &ordering, &mut o_iterator, &mut rng,
         n_var, n_samples, n_ref, n_haps_total, target_geno, chip_bp,
-        max_cond_haps, preferred_refs,
+        max_cond_haps,
     );
 
     crate::selphi_debug!("  [diploid] phase_common complete");
-    profiles
 }
 
 /// Legacy entry: converts byte-per-allele haplotypes to bitmatrix, then delegates
@@ -393,7 +391,7 @@ pub fn run_phase_common(
     run_phase_common_bm(
         graphs, hap_bm, cm,
         n_var, n_samples, n_ref, seed, n_threads,
-        scheme, chip_bp, target_geno, 0, None,
+        scheme, chip_bp, target_geno, 0,
     );
 }
 
@@ -417,18 +415,10 @@ fn _run_iterations(
     _target_geno: &[u8],
     _chip_bp: Option<&[i64]>,
     max_cond_haps: usize,
-    preferred_refs: Option<&[Vec<usize>]>,  // per-sample preferred ref hap indices
-) -> Vec<Vec<(u32, usize)>> {  // returns per-sample ref usage: [(count, ref_ind)]
+) {
     let _n_haps = n_samples * 2;
-    let n_ref = n_haps_total - n_samples * 2;
     let n_iterations = stages.len();
     const N_RANDOM_HAPS: usize = 100;
-
-    // Track per-sample ref individual usage across all iterations
-    let n_ref_ind = n_ref / 2;
-    let ref_usage: Vec<std::sync::atomic::AtomicU32> = (0..n_samples * n_ref_ind)
-        .map(|_| std::sync::atomic::AtomicU32::new(0))
-        .collect();
 
     for (it, &stage) in stages.iter().enumerate() {
         let t0 = std::time::Instant::now();
@@ -625,28 +615,6 @@ fn _run_iterations(
                 if cond_set.is_empty() { continue; }
                 k_per_window.push(cond_set.len());
 
-                // Inject cross-chromosome preferred ref haps into conditioning set
-                if let Some(prefs) = preferred_refs {
-                    if si < prefs.len() {
-                        for &ph in &prefs[si] {
-                            if !cond_set.contains(&ph) {
-                                cond_set.push(ph);
-                            }
-                        }
-                        cond_set.sort_unstable();
-                        cond_set.dedup();
-                    }
-                }
-
-                // Track ref hap usage per sample (for cross-chr debug)
-                for &ch in &cond_set {
-                    let ind = ch / 2;
-                    if ind >= n_samples && (ind - n_samples) < n_ref_ind {
-                        ref_usage[si * n_ref_ind + (ind - n_samples)]
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-
                 // Build compact bitmatrix for conditioning haps — window range only.
                 // Extract conditioning haplotype subset for this window, transposed.
                 // Only covers [w_l0, w_l1] (not 0..n_var_local). Fits in L2 cache.
@@ -830,27 +798,4 @@ fn _run_iterations(
         sampling::solve(graph);
     }
 
-    // Build per-sample ref usage profile (sorted by count descending)
-    let mut profiles: Vec<Vec<(u32, usize)>> = Vec::with_capacity(n_samples);
-    for si in 0..n_samples {
-        let mut counts: Vec<(u32, usize)> = (0..n_ref_ind)
-            .map(|ri| (ref_usage[si * n_ref_ind + ri].load(std::sync::atomic::Ordering::Relaxed), ri))
-            .filter(|&(c, _)| c > 0)
-            .collect();
-        counts.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        profiles.push(counts);
-    }
-
-    // Debug: log top ref individuals for first few samples
-    {
-        let show = n_samples.min(5);
-        for si in 0..show {
-            let top20: Vec<String> = profiles[si].iter().take(20)
-                .map(|&(c, ri)| format!("ref{}={}", ri, c))
-                .collect();
-            crate::selphi_debug!("  [cross-chr] sample={} top_ref=[{}]", si, top20.join(", "));
-        }
-    }
-
-    profiles
 }
