@@ -196,7 +196,7 @@ Selphi supports five output formats. Formats are **additive** — combine any fl
 | *(default)* | VCF.gz | GT, DS, AP1, AP2 per sample | Standard bioinformatics, bcftools |
 | `--bcf` | BCF 2.2 | GT, DS, AP1, AP2 per sample | Fast downstream parsing, no external deps |
 | `--parquet` | Apache Parquet (zstd) | DS per sample, variant-major | Data science, cloud analytics, Polars/DuckDB |
-| `--pgen` | PLINK2 PGEN | Hardcall genotypes (2-bit) | GWAS with plink2 |
+| `--pgen` | PLINK2 PGEN | Hardcall (2-bit) + dosage (16-bit) | GWAS with plink2 |
 | `--selfdecode` | ZIP of per-sample Parquet | GT, AP1, AP2 per sample | SelfDecode ETL pipeline |
 
 ```bash
@@ -377,7 +377,7 @@ Two engines are available, selected automatically based on variant density:
 Models each haplotype independently through three parallel HMM channels operating on 280 mosaic composite haplotypes constructed via coded-step PBWT IBS matching. Phase is resolved through a greedy swap criterion comparing forward-backward posteriors across channels. Convergence is deterministic over 15 iterations (3 burn-in + 12 phasing with decreasing likelihood-ratio thresholds). Recommended for chip arrays (up to 50,000 variants).
 
 **Diploid engine** (`--phasing-engine diploid`).
-Models the pair of haplotypes jointly via a genotype graph whose segments encode all possible local diplotype configurations. A segment-based Li-Stephens HMM computes diplotype transition probabilities across conditioning haplotypes selected by positional PBWT. Phase is resolved via MCMC sampling on the genotype graph with iterative pruning (5 burn-in, 3 prune, 5 main iterations, final Viterbi solve). The HMM forward pass is SIMD-accelerated (AVX2 on x86, NEON on Apple Silicon). Recommended for whole-genome sequencing data (more than 50,000 variants).
+Models the pair of haplotypes jointly via a genotype graph whose segments encode all possible local diplotype configurations. A segment-based Li-Stephens HMM computes diplotype transition probabilities across conditioning haplotypes selected by positional PBWT. Phase is resolved via MCMC sampling on the genotype graph with iterative pruning (5 burn-in, 3 interleaved prune/burn-in cycles, 5 main iterations, final Viterbi solve). The HMM forward pass is SIMD-accelerated (AVX2 on x86, NEON on Apple Silicon). Common variants (MAF ≥ 0.1%) are phased first; rare variants are phased onto the scaffold via bidirectional PBWT sweeps with IBD2-aware exclusion and singleton IBD phasing. Recommended for whole-genome sequencing data (more than 50,000 variants).
 
 ### Imputation
 
@@ -387,7 +387,7 @@ Key design principles:
 - **Bitmatrix-native**: reference panel stored as 1 bit per allele throughout (8x less memory)
 - **Unified pipeline**: phasing and imputation share the same bitmatrix in-memory (no VCF round-trip)
 - **Deterministic**: fixed-seed rayon parallelism produces bit-identical results across runs
-- **Auto-calibrated**: match length, forward/backward filter sizes, and Ne are calibrated from panel size
+- **Auto-calibrated**: match length, forward/backward filter sizes, and Ne are calibrated from panel size (Ne ≈ 36 × n_ref, validated on panels from 5K to 171K haplotypes)
 - **Streaming output**: tiles are formatted and compressed in parallel, output is streamed to BGZF
 
 ### Sparse Reference Panel (SRP format)
