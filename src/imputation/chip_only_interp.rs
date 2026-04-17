@@ -42,7 +42,9 @@ fn build_wgs_to_chip_proxy(
     let n_cand = wgs_candidates.len();
     let n_shared_in_window = window_chip_end - window_chip_start;
 
-    if n_cand == 0 || n_shared_in_window == 0 || n_chip_haps == 0 {
+    // chip_alleles empty → caller didn't supply shared-position chip alleles; return
+    // zeroed proxies so downstream dosage falls back to 0 instead of panicking on OOB.
+    if n_cand == 0 || n_shared_in_window == 0 || n_chip_haps == 0 || chip_alleles.is_empty() {
         return vec![0; n_cand];
     }
 

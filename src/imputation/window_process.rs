@@ -99,8 +99,12 @@ pub fn process_window_hmm(
             if n_cand == 0 {
                 return (tgt, HmmResult { weights: Vec::new(), hap_posterior: None });
             }
-            let m_red = if n_cand < 100 { m } else { n_cand + 1 };
-            let is_full = n_cand < 100;
+            // For augmented panels, the is_full path would build a `reduced` array of size
+            // n_ref_bm (including chip-only haps) and yield CSC indices >= n_ref_hmm, which
+            // would OOB inside filter_matches_fast(n_ref_hmm). Force the common (filtered)
+            // path whenever we have chip-only haps to exclude.
+            let is_full = n_cand < 100 && params.n_wgs_filter.is_none();
+            let m_red = if is_full { m } else { n_cand + 1 };
 
             thread_local! {
                 static TL_RED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -139,8 +143,9 @@ pub fn process_window_hmm(
                 let bwd = pbwt::backward_filter_single(&fwd, n_var_w, n_ref, fl_fwd, fl_bwd);
                 let csc = pbwt::build_csc_matrix(&bwd, n_ref, n_var_w, fl_bwd);
                 TL_RED.with(|buf| { *buf.borrow_mut() = reduced; });
+                let n_ref_hmm = params.n_wgs_filter.unwrap_or(n_ref);
                 return (tgt, super::hmm::calculate_weights(
-                    &csc, cm_w, &breaks_w, n_ref,
+                    &csc, cm_w, &breaks_w, n_ref_hmm,
                     est_ne, p_err, Some(ref_w), n_var_w, None,
                     ne_w, prior, 0.0,
                 ));
@@ -171,16 +176,21 @@ pub fn process_window_hmm(
             let mut csc = pbwt::build_csc_matrix(&bwd, n_cand, n_var_w, fl_bwd);
 
             TL_RED.with(|buf| { *buf.borrow_mut() = reduced; });
-            // CSC indices are positions in reduced[0..n_cand] — remap to absolute haplotype IDs
+            // CSC indices are positions in reduced[0..n_cand] — remap to absolute haplotype IDs.
+            // With n_wgs_filter, candidates were already filtered to indices < n_wgs, so remapped
+            // indices are < n_ref_hmm.
             for idx in &mut csc.indices {
                 debug_assert!((*idx as usize) < candidates.len(),
                     "CSC index {} out of bounds for {} candidates", idx, candidates.len());
                 *idx = candidates[*idx as usize] as i32;
             }
-            csc.n_rows = n_ref;
 
+            // For HMM: use WGS-only ref count for transition probabilities AND CSC row dim.
+            // Both must be consistent: CSC indices live in [0, n_ref_hmm), so n_rows == n_ref_hmm.
+            let n_ref_hmm = params.n_wgs_filter.unwrap_or(n_ref);
+            csc.n_rows = n_ref_hmm;
             (tgt, super::hmm::calculate_weights(
-                &csc, cm_w, &breaks_w, n_ref,
+                &csc, cm_w, &breaks_w, n_ref_hmm,
                 est_ne, p_err, Some(ref_w), n_var_w, None,
                 ne_w, prior, 0.0,
             ))
