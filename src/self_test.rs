@@ -161,10 +161,12 @@ pub fn run(config: &SelfTestConfig) -> u32 {
 
     // ── Pipeline tests ──────────────────────────────────────────────
 
-    // 1. Phase-only
+    // 1. Phase-only. Force phasing so the test produces a VCF even when the
+    // smoke-test input happens to already be phased.
     let out = format!("{}_phase", out_base);
     test!("phase-only (haploid)",
-        "--refpanel", refpanel, "--input", input, "--map", map, "--out", &out, &t, "--phase-only");
+        "--refpanel", refpanel, "--input", input, "--map", map, "--out", &out, &t,
+        "--phase-only", "--force-phasing");
 
     // 2. VCF imputation
     let out = format!("{}_vcf", out_base);
@@ -191,7 +193,8 @@ pub fn run(config: &SelfTestConfig) -> u32 {
     test!("impute → SelfDecode",
         "--refpanel", refpanel, "--input", input, "--map", map, "--out", &out, &t, "--selfdecode");
 
-    // 7. Pre-phased input
+    // 7. Pre-phased input — reuse the phase-only output (produced above with
+    // --force-phasing, so it exists regardless of input phase state).
     let phased_vcf = format!("{}_phase.vcf.gz", out_base);
     let out = format!("{}_prephased", out_base);
     test!("pre-phased input",
