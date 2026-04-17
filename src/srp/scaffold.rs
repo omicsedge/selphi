@@ -5,7 +5,9 @@
 //!   magic: b"SCFF\x00\x01\x00\x00"          — 8 bytes
 //!   header_len: u32                           — 4 bytes (length of zstd blob)
 //!   header_zstd: [u8; header_len]             — zstd-compressed JSON with
-//!                                                chromosome, n_chip_vars, n_words
+//!                                                chromosome, n_chip_vars, n_words,
+//!                                                chip_digest (hex, 16 chars —
+//!                                                64-bit FNV-1a over pos/ref/alt)
 //!   data_offset = 8 + 4 + header_len
 //!   body: [hap 0 bits][hap 1 bits]...         — each hap = n_words × u64,
 //!                                                bit j of variant v packed at
@@ -14,6 +16,17 @@
 //! The number of appended haps is inferred from file size, not stored in the
 //! header — this makes append atomic (single write + fsync) without header
 //! rewrites.
+//!
+//! ## Integrity checks
+//! * `chromosome` and `chip_digest` are verified against the current run at
+//!   open time — catches accidental reuse of a scaffold from a different
+//!   chromosome or a different chip panel version.
+//!
+//! ## Sidecar bridge cache
+//! A scaffold at `path/foo.scf` may have a sidecar `path/foo.scf.bridge`
+//! holding the scaffold→WGS nearest-neighbour bridge as `u32 × n_haps`
+//! (little-endian). The cache is refreshed incrementally: only the newly
+//! appended haps are bridged on each open. See `src/imputation/tadp.rs`.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
@@ -30,6 +43,10 @@ struct Header {
     chromosome: String,
     n_chip_vars: usize,
     n_words: usize,
+    /// 64-bit digest over (chr, pos, ref, alt) of the full chip variant list,
+    /// written as 16-char lowercase hex. Used to catch cohort/chip version
+    /// mismatch on reopen.
+    chip_digest: String,
     data_offset: u64,
 }
 
@@ -55,16 +72,23 @@ impl Header {
         let chromosome = j["chromosome"].as_str().unwrap_or("").to_string();
         let n_chip_vars = j["n_chip_vars"].as_u64().unwrap_or(0) as usize;
         let n_words = j["n_words"].as_u64().unwrap_or(0) as usize;
+        let chip_digest = j["chip_digest"].as_str().unwrap_or("").to_string();
         let data_offset = r.stream_position()?;
-        Ok(Self { chromosome, n_chip_vars, n_words, data_offset })
+        Ok(Self { chromosome, n_chip_vars, n_words, chip_digest, data_offset })
     }
 
-    fn write<W: Write>(w: &mut W, chromosome: &str, n_chip_vars: usize) -> io::Result<u64> {
+    fn write<W: Write>(
+        w: &mut W,
+        chromosome: &str,
+        n_chip_vars: usize,
+        chip_digest: &str,
+    ) -> io::Result<u64> {
         let n_words = n_chip_vars.div_ceil(64);
         let body = json!({
             "chromosome": chromosome,
             "n_chip_vars": n_chip_vars,
             "n_words": n_words,
+            "chip_digest": chip_digest,
             "version": 1,
         })
         .to_string();
@@ -75,6 +99,35 @@ impl Header {
         w.write_all(&comp)?;
         Ok((8 + 4 + comp.len()) as u64)
     }
+}
+
+/// Compute the 64-bit chip digest (FNV-1a) over `(chr, pos, ref_allele,
+/// alt_allele)` tuples in order. Used both at scaffold creation and at open
+/// time to detect cohort / chip-version mismatch.
+pub fn compute_chip_digest<'a, I>(variants: I) -> String
+where
+    I: IntoIterator<Item = (&'a str, i64, &'a str, &'a str)>,
+{
+    let mut h: u64 = 0xcbf29ce484222325;
+    for (chr, pos, r, a) in variants {
+        for b in chr.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        for b in pos.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        for b in r.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        for b in a.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    format!("{:016x}", h)
 }
 
 // ---------------------------------------------------------------------------
@@ -92,11 +145,16 @@ pub struct ScaffoldWriter {
 
 impl ScaffoldWriter {
     /// Create a new scaffold file. Errors if the file already exists.
-    pub fn create(path: &Path, chromosome: &str, n_chip_vars: usize) -> io::Result<Self> {
+    pub fn create(
+        path: &Path,
+        chromosome: &str,
+        n_chip_vars: usize,
+        chip_digest: &str,
+    ) -> io::Result<Self> {
         let mut f = OpenOptions::new()
             .read(true).write(true).create_new(true)
             .open(path)?;
-        let data_offset = Header::write(&mut f, chromosome, n_chip_vars)?;
+        let data_offset = Header::write(&mut f, chromosome, n_chip_vars, chip_digest)?;
         let _ = data_offset;
         Ok(Self {
             path: path.to_path_buf(),
@@ -167,6 +225,7 @@ impl ScaffoldWriter {
 pub struct ScaffoldReader {
     _mmap: Mmap,
     chromosome: String,
+    chip_digest: String,
     n_chip_vars: usize,
     n_words: usize,
     n_haps: usize,
@@ -204,6 +263,7 @@ impl ScaffoldReader {
         Ok(Self {
             _mmap: mmap,
             chromosome: hdr.chromosome,
+            chip_digest: hdr.chip_digest,
             n_chip_vars: hdr.n_chip_vars,
             n_words: hdr.n_words,
             n_haps,
@@ -213,6 +273,7 @@ impl ScaffoldReader {
     }
 
     pub fn chromosome(&self) -> &str { &self.chromosome }
+    pub fn chip_digest(&self) -> &str { &self.chip_digest }
     pub fn n_chip_vars(&self) -> usize { self.n_chip_vars }
     pub fn n_words(&self) -> usize { self.n_words }
     pub fn n_haps(&self) -> usize { self.n_haps }
@@ -255,8 +316,11 @@ mod tests {
         drop(tmp); // remove the file so create() doesn't see it
 
         let n_vars = 150; // across 3 words (last partially filled)
+        let digest = compute_chip_digest(
+            (0..n_vars).map(|i| ("20", i as i64 * 100, "A", "C"))
+        );
         {
-            let mut w = ScaffoldWriter::create(&path, "20", n_vars).unwrap();
+            let mut w = ScaffoldWriter::create(&path, "20", n_vars, &digest).unwrap();
             let n_words = n_vars.div_ceil(64);
 
             // hap 0: alternating bits at positions 0, 2, 4, ...
@@ -290,6 +354,7 @@ mod tests {
         assert_eq!(r.n_haps(), 3);
         assert_eq!(r.n_chip_vars(), n_vars);
         assert_eq!(r.chromosome(), "20");
+        assert_eq!(r.chip_digest(), &digest);
         // hap 0: even positions → 1
         for v in 0..n_vars {
             assert_eq!(r.get(0, v), if v % 2 == 0 { 1 } else { 0 });

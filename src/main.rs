@@ -814,8 +814,18 @@ fn main() {
     let (ref_bm_imp, scaffold_ctx) = if let Some(ref sp) = args.augment_scaffold {
         let path = PathBuf::from(sp);
         let chr = srp.chromosome().to_string();
+        // Compute chip digest over the subset of panel variants shared with
+        // the target (in wgs_idx order). Same computation on every batch with
+        // the same target chip → same digest; mismatch implies cohort or
+        // chip-version drift.
+        let chip_digest = selphi::srp::scaffold::compute_chip_digest(
+            wgs_idx.iter().map(|&wi| {
+                let v = &srp.variants[wi];
+                (v.chr.as_str(), v.pos, v.ref_allele.as_str(), v.alt_allele.as_str())
+            })
+        );
         if !path.exists() {
-            selphi::srp::scaffold::ScaffoldWriter::create(&path, &chr, n_chip)
+            selphi::srp::scaffold::ScaffoldWriter::create(&path, &chr, n_chip, &chip_digest)
                 .expect("Failed to create scaffold file")
                 .flush()
                 .expect("Failed to flush new scaffold header");
@@ -823,30 +833,42 @@ fn main() {
         }
         let scaffold = selphi::srp::scaffold::ScaffoldReader::open(&path)
             .expect("Failed to open scaffold");
+        if scaffold.chromosome() != chr {
+            selphi_error!("Scaffold chromosome ({}) != panel chromosome ({}).",
+                          scaffold.chromosome(), chr);
+            std::process::exit(1);
+        }
         if scaffold.n_chip_vars() != n_chip {
-            selphi_error!("Scaffold chip var count ({}) != target chip count ({}). \
-                           Scaffold was built from a different panel/target pair.",
+            selphi_error!("Scaffold chip var count ({}) != target chip count ({}).",
                           scaffold.n_chip_vars(), n_chip);
+            std::process::exit(1);
+        }
+        if scaffold.chip_digest() != chip_digest {
+            selphi_error!("Scaffold chip digest ({}) != current ({}). \
+                           Scaffold built from a different panel/chip version — refusing \
+                           to reuse it (would corrupt PBWT candidate selection).",
+                          scaffold.chip_digest(), chip_digest);
             std::process::exit(1);
         }
         let n_scaffold = scaffold.n_haps();
         if n_scaffold == 0 {
             selphi_step!("Scaffold: empty (first batch, will be populated after this run)");
-            let _ = chr;
             (ref_bm_imp, Some(ScaffoldCtx {
                 n_haps: 0, bridge: Vec::new(), path,
             }))
         } else {
             let t0 = Instant::now();
-            let bridge = selphi::imputation::tadp::build_scaffold_to_wgs_bridge(
-                &scaffold, &ref_bm_imp, n_ref);
+            // Incremental bridge via sidecar cache: only recompute for haps
+            // appended since the last run.
+            let bridge = selphi::imputation::tadp::load_or_extend_bridge(
+                &path, &scaffold, &ref_bm_imp, n_ref,
+            ).expect("Failed to build/extend scaffold bridge");
             let extended = selphi::imputation::tadp::extend_bitmatrix_with_scaffold(
                 &ref_bm_imp, &scaffold);
             selphi_step!("Scaffold: {} haps bridged to {} WGS; extended bitmatrix {:.1} MB [{:.1}s]",
                 n_scaffold, n_ref,
                 (extended.n_words() * n_chip * 8) as f64 / 1e6,
                 t0.elapsed().as_secs_f64());
-            let _ = chr;
             (extended, Some(ScaffoldCtx {
                 n_haps: n_scaffold, bridge, path,
             }))
