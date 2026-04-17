@@ -407,6 +407,320 @@ fn flush_tiles<W: Write + Seek>(
     Ok(())
 }
 
+/// Merge multiple single-chr SRP files with DIFFERENT samples into one SRP.
+/// All inputs must contain the same chromosome. Variants are unioned by position,
+/// haplotypes are concatenated horizontally. Missing data = REF (0).
+pub fn merge_samples_single_chr(
+    srp_paths: &[std::path::PathBuf],
+    output_path: &Path,
+) -> io::Result<()> {
+    use super::{SrpReader, Variant, SRP_SINGLE_CHR_MAGIC};
+    use std::collections::{BTreeMap, HashSet};
+
+    if srp_paths.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "No SRP files to merge"));
+    }
+
+    // 1. Open all SRP files
+    selphi_step!("Merging {} SRP files (different samples, same chromosome)...", srp_paths.len());
+    let mut readers: Vec<SrpReader> = Vec::new();
+    for path in srp_paths {
+        let r = SrpReader::open(path, 2)?;
+        readers.push(r);
+    }
+
+    // Validate: all same chromosome
+    let chr = readers[0].chromosome().to_string();
+    for (i, r) in readers.iter().enumerate().skip(1) {
+        let rc = r.chromosome();
+        if rc != chr {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("Chromosome mismatch: file 0 has chr{}, file {} has chr{}", chr, i, rc)));
+        }
+    }
+
+    // 2. Collect per-reader info
+    let mut total_haps = 0usize;
+    let mut total_samples = 0usize;
+    let mut all_sample_ids: Vec<String> = Vec::new();
+    let mut hap_offsets: Vec<usize> = Vec::new(); // cumulative hap offset per reader
+
+    for r in &readers {
+        hap_offsets.push(total_haps);
+        let ns = r.sample_ids.len();
+        let nh = r.n_haps();
+        selphi_info!("  {} samples ({} haps), {} variants",
+            ns, nh, r.n_variants());
+        total_samples += ns;
+        total_haps += nh;
+        all_sample_ids.extend(r.sample_ids.iter().cloned());
+    }
+    selphi_info!("  Total: {} samples ({} haps)", total_samples, total_haps);
+
+    // Reject duplicate sample IDs across input SRPs. Silent duplication would make
+    // CSC tiles contain the same ALT bit twice per sample, corrupting decompression.
+    {
+        let mut seen: HashSet<&str> = HashSet::with_capacity(all_sample_ids.len());
+        let mut duplicates: Vec<&str> = Vec::new();
+        for sid in &all_sample_ids {
+            if !seen.insert(sid.as_str()) {
+                duplicates.push(sid.as_str());
+            }
+        }
+        if !duplicates.is_empty() {
+            let preview: Vec<&str> = duplicates.iter().take(5).copied().collect();
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                "merge_samples_single_chr: {} duplicate sample ID(s) across input SRPs (first: {:?}). \
+                 Deduplicate inputs before merging.",
+                duplicates.len(), preview)));
+        }
+    }
+
+    // 3. Build union of variants by (pos, ref, alt) → index
+    let mut var_map: BTreeMap<(i64, String, String), usize> = BTreeMap::new();
+    let mut merged_variants: Vec<Variant> = Vec::new();
+
+    for r in &readers {
+        for v in &r.variants {
+            let key = (v.pos, v.ref_allele.clone(), v.alt_allele.clone());
+            if !var_map.contains_key(&key) {
+                let idx = merged_variants.len();
+                var_map.insert(key, idx);
+                merged_variants.push(v.clone());
+            }
+        }
+    }
+    let n_variants = merged_variants.len();
+    selphi_info!("  Union variants: {}", n_variants);
+
+    // 4. For each reader, build mapping: reader_var_idx → merged_var_idx
+    let reader_var_maps: Vec<Vec<usize>> = readers.iter().map(|r| {
+        r.variants.iter().map(|v| {
+            let key = (v.pos, v.ref_allele.clone(), v.alt_allele.clone());
+            var_map[&key]
+        }).collect()
+    }).collect();
+
+    // 5. Build tiles: iterate stripes, read from each reader, scatter into merged tile columns
+    let n_tile_rows = n_variants.div_ceil(TILE_ROWS);
+    let n_tile_cols = total_haps.div_ceil(TILE_COLS);
+    let n_tiles = n_tile_rows * n_tile_cols;
+
+    selphi_info!("  Tiles: {} rows x {} cols = {} tiles",
+        n_tile_rows, n_tile_cols, n_tiles);
+
+    // Write single-chr SRP
+    let srp_path = if output_path.extension().is_none_or(|e| e != "srp") {
+        output_path.with_extension("srp")
+    } else {
+        output_path.to_path_buf()
+    };
+    let out = std::fs::File::create(&srp_path)?;
+    let mut w = std::io::BufWriter::with_capacity(4 << 20, out);
+
+    // Magic
+    w.write_all(SRP_SINGLE_CHR_MAGIC)?;
+
+    // Metadata JSON
+    let contig_field = format!("##contig=<ID={}>", chr);
+    let meta_json = serde_json::json!({
+        "version": 2,
+        "chromosome": chr,
+        "n_variants": n_variants,
+        "n_haps": total_haps,
+        "n_samples": total_samples,
+        "n_chunks": 1,
+        "chunk_size": n_variants,
+        "chunk_row_counts": [n_variants],
+        "min_position": merged_variants.first().map(|v| v.pos).unwrap_or(0),
+        "max_position": merged_variants.last().map(|v| v.pos).unwrap_or(0),
+        "contig_field": contig_field,
+        "tile_rows": TILE_ROWS,
+        "tile_cols": TILE_COLS,
+        "n_tile_rows": n_tile_rows,
+        "n_tile_cols": n_tile_cols,
+    });
+    let meta_compressed = zstd::encode_all(
+        Cursor::new(meta_json.to_string().as_bytes()), 3).map_err(io::Error::other)?;
+    w.write_all(&(meta_compressed.len() as u32).to_le_bytes())?;
+    w.write_all(&meta_compressed)?;
+
+    // Variants binary
+    let mut vbin = Vec::with_capacity(n_variants * 20);
+    let mut ids_buf = Vec::new();
+    let mut orig_buf = Vec::new();
+    for (i, v) in merged_variants.iter().enumerate() {
+        let chr_b = v.chr.as_bytes();
+        let ref_b = v.ref_allele.as_bytes();
+        let alt_b = v.alt_allele.as_bytes();
+        vbin.extend_from_slice(&v.pos.to_le_bytes());
+        vbin.push(chr_b.len().min(255) as u8);
+        vbin.push(ref_b.len().min(255) as u8);
+        vbin.push(alt_b.len().min(255) as u8);
+        vbin.extend_from_slice(&chr_b[..chr_b.len().min(255)]);
+        vbin.extend_from_slice(&ref_b[..ref_b.len().min(255)]);
+        vbin.extend_from_slice(&alt_b[..alt_b.len().min(255)]);
+        if i > 0 { ids_buf.push(b'\n'); orig_buf.push(b'\n'); }
+        let id = format!("{}-{}-{}-{}", v.chr, v.pos, v.ref_allele, v.alt_allele);
+        ids_buf.extend_from_slice(id.as_bytes());
+        orig_buf.extend_from_slice(id.as_bytes());
+    }
+    let vbin_c = zstd::encode_all(Cursor::new(&vbin), 3).map_err(io::Error::other)?;
+    w.write_all(&(vbin_c.len() as u32).to_le_bytes())?;
+    w.write_all(&vbin_c)?;
+
+    // Sample IDs
+    let sample_c = zstd::encode_all(Cursor::new(all_sample_ids.join("\n").as_bytes()), 3)
+        .map_err(io::Error::other)?;
+    w.write_all(&(sample_c.len() as u32).to_le_bytes())?;
+    w.write_all(&sample_c)?;
+
+    // IDs
+    let ids_c = zstd::encode_all(Cursor::new(&ids_buf), 3).map_err(io::Error::other)?;
+    w.write_all(&(ids_c.len() as u32).to_le_bytes())?;
+    w.write_all(&ids_c)?;
+
+    // Original IDs
+    let orig_c = zstd::encode_all(Cursor::new(&orig_buf), 3).map_err(io::Error::other)?;
+    w.write_all(&(orig_c.len() as u32).to_le_bytes())?;
+    w.write_all(&orig_c)?;
+
+    // Contig field
+    let contig_c = zstd::encode_all(Cursor::new(contig_field.as_bytes()), 3)
+        .map_err(io::Error::other)?;
+    w.write_all(&(contig_c.len() as u32).to_le_bytes())?;
+    w.write_all(&contig_c)?;
+
+    // Tile index placeholder
+    w.write_all(&(n_tiles as u32).to_le_bytes())?;
+    let tile_index_pos = w.stream_position()?;
+    w.write_all(&vec![0u8; n_tiles * 12])?;
+    let mut write_pos = tile_index_pos + (n_tiles * 12) as u64;
+    let mut tile_entries = vec![(0u64, 0u32); n_tiles];
+
+    // 6. Build tiles stripe by stripe (fully parallel)
+    //
+    // For each merged stripe of TILE_ROWS variants:
+    //   a) In parallel across readers: preload tiles, extract ALT entries as (global_col, merged_row)
+    //   b) Scatter entries into stripe columns
+    //   c) Compress and write tiles (parallel via flush_tiles)
+
+    // Pre-compute per-reader: which reader variants fall in each merged stripe
+    // reader_stripe_map[ri][merged_stripe] = Vec<(reader_var_idx, merged_local_row)>
+    let reader_stripe_map: Vec<Vec<Vec<(usize, u16)>>> = readers.iter().enumerate().map(|(ri, _)| {
+        let mut stripes: Vec<Vec<(usize, u16)>> = vec![Vec::new(); n_tile_rows];
+        for (rvi, &mvi) in reader_var_maps[ri].iter().enumerate() {
+            let ms = mvi / TILE_ROWS;
+            stripes[ms].push((rvi, (mvi % TILE_ROWS) as u16));
+        }
+        stripes
+    }).collect();
+
+    for stripe in 0..n_tile_rows {
+        // Parallel: each reader extracts its ALT entries for this stripe
+        // Returns Vec<(global_col, merged_local_row)> per reader
+        let reader_entries: Vec<Vec<(usize, u16)>> = readers.iter().enumerate()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|(ri, reader)| {
+                let rsv = &reader_stripe_map[ri][stripe];
+                if rsv.is_empty() { return Vec::new(); }
+
+                let hap_off = hap_offsets[ri];
+                let r_n_haps = reader.n_haps();
+                let tiled = match reader.tiled.as_ref() {
+                    Some(t) => t,
+                    None => return Vec::new(),
+                };
+
+                // Preload reader stripes needed for this merged stripe
+                let r_stripe_min = rsv.iter().map(|&(rvi, _)| rvi / TILE_ROWS).min().unwrap();
+                let r_stripe_max = rsv.iter().map(|&(rvi, _)| rvi / TILE_ROWS).max().unwrap();
+                let loaded = match tiled.preload_stripes(r_stripe_min, r_stripe_max - r_stripe_min + 1) {
+                    Ok(l) => l,
+                    Err(_) => return Vec::new(),
+                };
+
+                // Build row lookup: for each reader stripe, which merged rows to extract
+                // Keyed by (reader_stripe, reader_local_row) → merged_local_row
+                let mut row_lookup: std::collections::HashMap<(usize, u16), u16> = std::collections::HashMap::new();
+                for &(rvi, merged_row) in rsv {
+                    row_lookup.insert((rvi / TILE_ROWS, (rvi % TILE_ROWS) as u16), merged_row);
+                }
+
+                let r_n_tile_cols = r_n_haps.div_ceil(TILE_COLS);
+                let mut entries: Vec<(usize, u16)> = Vec::new();
+
+                for band in 0..r_n_tile_cols {
+                    let col_start = band * TILE_COLS;
+                    // Collect unique reader stripes for this band
+                    let r_stripes: Vec<usize> = rsv.iter()
+                        .map(|&(rvi, _)| rvi / TILE_ROWS)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter().collect();
+
+                    for r_stripe in r_stripes {
+                        let tile = loaded.decompress_tile(r_stripe, band);
+                        // For each column in this tile
+                        for lc in 0..tile.n_cols as usize {
+                            let gc = col_start + lc;
+                            if gc >= r_n_haps { break; }
+                            let (lo, hi) = tile.col_range(lc);
+                            // For each ALT entry in this column
+                            for k in lo..hi {
+                                let r_local_row = tile.indices[k];
+                                if let Some(&merged_row) = row_lookup.get(&(r_stripe, r_local_row)) {
+                                    entries.push((hap_off + gc, merged_row));
+                                }
+                            }
+                        }
+                    }
+                }
+                entries
+            }).collect();
+
+        // Scatter all entries into stripe columns
+        let mut stripe_cols: Vec<Vec<u16>> = vec![Vec::new(); total_haps];
+        for entries in &reader_entries {
+            for &(global_col, merged_row) in entries {
+                stripe_cols[global_col].push(merged_row);
+            }
+        }
+
+        // Sort row indices within each column (required for CSC) — parallel for large panels
+        stripe_cols.par_iter_mut().for_each(|col| col.sort_unstable());
+
+        // Compress and write tiles
+        let mut pending = vec![(stripe, stripe_cols)];
+        flush_tiles(&mut w, &mut pending, total_haps, n_variants,
+            n_tile_cols, &mut tile_entries, &mut write_pos)?;
+
+        if (stripe + 1) % 10 == 0 || stripe + 1 == n_tile_rows {
+            let pct = (stripe + 1) * 100 / n_tile_rows;
+            selphi_info!("    stripe {}/{} ({}%)", stripe + 1, n_tile_rows, pct);
+        }
+    }
+
+    // Fill tile index
+    w.flush()?;
+    let end_pos = w.stream_position()?;
+    w.seek(SeekFrom::Start(tile_index_pos))?;
+    for &(offset, comp_size) in &tile_entries {
+        w.write_all(&offset.to_le_bytes())?;
+        w.write_all(&comp_size.to_le_bytes())?;
+    }
+    w.seek(SeekFrom::Start(end_pos))?;
+    w.flush()?;
+
+    let file_size = std::fs::metadata(&srp_path)?.len();
+    let tile_total: u64 = tile_entries.iter().map(|&(_, sz)| sz as u64).sum();
+    selphi_step!("Merged SRP: {} samples ({} haps), {} variants, tiles={:.1} MB, file={:.1} MB → {}",
+        total_samples, total_haps, n_variants,
+        tile_total as f64 / 1e6, file_size as f64 / 1e6, srp_path.display());
+
+    Ok(())
+}
+
 fn auto_chunk_size(n_variants: usize, n_haps: usize) -> usize {
     let target_bytes: f64 = 10.0 * 1024.0 * 1024.0;
     let bytes_per_var = 0.06 * n_haps as f64 * 4.0;
@@ -531,6 +845,18 @@ pub fn merge_single_chr_srps(
     let n_samples = readers[0].1.sample_ids.len();
     let ref_samples = &readers[0].1.sample_ids;
 
+    // Detect mode: same-chr (different samples) or different-chr (same samples)
+    let all_same_chr = readers.iter().all(|(_c, _)| _c == &readers[0].0);
+    let all_same_samples = readers[1..].iter().all(|(_, r)| r.sample_ids == *ref_samples);
+
+    if all_same_chr && !all_same_samples {
+        // Same chromosome, different samples → horizontal merge
+        selphi_info!("  Detected same-chr merge: {} files with different samples on chr{}",
+            readers.len(), readers[0].0);
+        drop(readers); // release SrpReaders, merge_samples_single_chr opens them itself
+        return merge_samples_single_chr(srp_paths, output_path);
+    }
+
     for (chr, r) in &readers[1..] {
         if r.n_haps() != n_haps {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
@@ -542,7 +868,6 @@ pub fn merge_single_chr_srps(
                 format!("Sample count mismatch: chr{} has {} samples, expected {}",
                     chr, r.sample_ids.len(), n_samples)));
         }
-        // Check all sample names match
         if r.sample_ids != *ref_samples {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
                 format!("Sample names mismatch between chr{} and chr{}", chr, readers[0].0)));

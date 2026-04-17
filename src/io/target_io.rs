@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use crate::srp::SrpReader;
-use crate::{selphi_error};
+use crate::{selphi_error, selphi_info};
 
 // ---------------------------------------------------------------------------
 // TargetMarker
@@ -279,22 +279,36 @@ pub fn intersect_variants(srp: &SrpReader, targets: &[TargetMarker]) -> (Vec<usi
     let mut wgs_idx = Vec::with_capacity(targets.len());
     let mut target_idx = Vec::with_capacity(targets.len());
     let mut ri = 0usize;
+    let mut n_hash_matches = 0usize;
+    let mut n_plain_matches = 0usize;
 
     for &ti in &tgt_order {
         let tpos = targets[ti].pos;
         // Advance ref pointer to first variant at or beyond target pos
         while ri < srp.variants.len() && srp.variants[ri].pos < tpos { ri += 1; }
-        // Check all ref variants at this position
+        // Check all ref variants at this position.
+        // Match ref+alt as a coherent pair: either both via hash (new SRP format)
+        // or both via plain alleles (old/compat format). Mixing (e.g. ref via hash,
+        // alt via plain) is rejected to avoid ambiguous cross-format matches.
         let mut rj = ri;
         while rj < srp.variants.len() && srp.variants[rj].pos == tpos {
-            if srp.variants[rj].ref_allele == targets[ti].ref_hash
-                && srp.variants[rj].alt_allele == targets[ti].alt_hash {
+            let hash_match = srp.variants[rj].ref_allele == targets[ti].ref_hash
+                && srp.variants[rj].alt_allele == targets[ti].alt_hash;
+            let plain_match = !hash_match
+                && srp.variants[rj].ref_allele == targets[ti].ref_allele
+                && srp.variants[rj].alt_allele == targets[ti].alt_allele;
+            if hash_match || plain_match {
                 wgs_idx.push(rj);
                 target_idx.push(ti);
+                if hash_match { n_hash_matches += 1; } else { n_plain_matches += 1; }
                 break;
             }
             rj += 1;
         }
+    }
+    if n_hash_matches > 0 || n_plain_matches > 0 {
+        selphi_info!("  Variant intersection: {} hash matches, {} plain matches",
+            n_hash_matches, n_plain_matches);
     }
 
     // Already sorted by wgs_idx (ref is in genomic order, merge preserves it)
