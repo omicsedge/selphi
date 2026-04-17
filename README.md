@@ -347,13 +347,13 @@ Standard VCF or BCF. Unphased (`0/1`) or phased (`0|1`) genotypes. Multi-allelic
 | **Multi-chromosome** | | |
 | `--refpanel-dir DIR` | Directory with per-chr SRP files (auto-discovers chromosomes) | |
 | `--map-dir DIR` | Directory with per-chr genetic maps. Auto-discovers common naming patterns. Alternative to `--map` | |
-| `--merge-srps PATHS` | Merge per-chr SRP files into multi-chromosome SRP (comma-separated) | |
+| `--merge-srps PATHS` | Merge SRP files (comma-separated). Auto-detects mode: per-chr files with same samples → multi-chromosome SRP; same-chr files with different samples → horizontal merge | |
 | `--merge-srps-dir DIR` | Merge all SRP files from a directory into multi-chromosome SRP | |
 | **Reference panel** | | |
 | `--prepare-reference-from PATH` | Create SRP from VCF.gz, BCF, BREF3, or directory of per-chr files | |
 | `--prepare-merged-panel` | Create mixed-density panel from WGS + chip data | off |
 | `--wgs PATH` | WGS reference panel (.srp) for `--prepare-merged-panel` | |
-| `--chip PATH` | Chip genotype data (VCF/BCF) for `--prepare-merged-panel` | |
+| `--chip PATH` | Chip genotype data (VCF.gz, BCF, SRP, or BREF3) for `--prepare-merged-panel` | |
 | `--chunk-size N` | Chunk size for SRP creation (0 = auto) | 0 |
 | **Testing** | | |
 | `--self-test` | Run all output format and code path tests | off |
