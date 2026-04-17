@@ -98,11 +98,6 @@ impl SrpReader {
                 comp_size: u32::from_le_bytes(tidx[b+8..b+12].try_into().unwrap()),
             }
         }).collect();
-        // Find the end of tile data (max offset + size across all tiles)
-        let last_tile_end = tile_entries.iter()
-            .map(|e| e.offset + e.comp_size as u64)
-            .max()
-            .unwrap_or(0);
 
         let tiled = Some(super::tiled::TiledSrpReader::from_entries(
             filepath.clone().into(), metadata.n_variants, metadata.n_haps,
@@ -110,7 +105,6 @@ impl SrpReader {
         ));
 
         let mmap = File::open(&filepath).ok().and_then(|f| unsafe { memmap2::Mmap::map(&f).ok() });
-        let _ = last_tile_end; // kept for format offset accounting
 
         Ok(SrpReader {
             metadata, variants, sample_ids, ids, original_ids, tiled, mmap, chunk_index,
