@@ -22,7 +22,6 @@ pub mod csi;
 pub mod tiled;
 pub mod multi_chr_reader;
 pub mod multi_chr_writer;
-pub mod merged_panel_writer;
 pub use reader::SrpReader;
 pub use multi_chr_reader::{MultiChrSrpReader, ChrSrpView};
 
@@ -62,110 +61,6 @@ pub struct ChrDirectoryEntry {
     pub data_offset: u64,
     pub n_variants: u32,
     pub n_tiles: u32,
-}
-
-// ---------------------------------------------------------------------------
-// Mixed-density panel augment types
-// ---------------------------------------------------------------------------
-
-/// Coverage category for a variant in a mixed-density panel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VariantCoverage {
-    /// Present in WGS panel only (default — all standard variants).
-    WgsOnly,
-    /// Present in both WGS and chip panels.
-    Shared,
-    /// Present in chip panel only (not in WGS).
-    ChipOnly,
-}
-
-/// Metadata for the chip augment section of a mixed-density SRP.
-#[derive(Debug, Clone)]
-pub struct AugmentMetadata {
-    /// Number of WGS haplotypes (full coverage, all variants).
-    pub wgs_haplotypes: usize,
-    /// Number of chip haplotypes (partial coverage, shared + chip-only variants).
-    pub chip_haplotypes: usize,
-    /// Total variants in the panel (WGS ∪ chip).
-    pub total_variants: usize,
-    /// Number of variants shared between WGS and chip.
-    pub shared_variants: usize,
-    /// Number of chip-only variants (not in WGS).
-    pub chip_only_variants: usize,
-}
-
-/// Compressed bitvector storing per-variant coverage category.
-/// 2 bits per variant: 00 = WgsOnly, 01 = Shared, 10 = ChipOnly.
-#[derive(Debug, Clone)]
-pub struct CoverageBitvector {
-    data: Vec<u8>,
-    n_variants: usize,
-}
-
-impl CoverageBitvector {
-    /// Create a new bitvector with all variants set to WgsOnly.
-    pub fn new(n_variants: usize) -> Self {
-        let n_bytes = (n_variants * 2 + 7) / 8;
-        Self { data: vec![0u8; n_bytes], n_variants }
-    }
-
-    /// Set the coverage for variant i.
-    pub fn set(&mut self, i: usize, coverage: VariantCoverage) {
-        assert!(i < self.n_variants, "CoverageBitvector::set: index {} out of bounds ({})", i, self.n_variants);
-        let val: u8 = match coverage {
-            VariantCoverage::WgsOnly => 0,
-            VariantCoverage::Shared => 1,
-            VariantCoverage::ChipOnly => 2,
-        };
-        let byte_idx = (i * 2) / 8;
-        let bit_offset = (i * 2) % 8;
-        self.data[byte_idx] = (self.data[byte_idx] & !(3 << bit_offset)) | (val << bit_offset);
-    }
-
-    /// Get the coverage for variant i.
-    pub fn get(&self, i: usize) -> VariantCoverage {
-        if i >= self.n_variants { return VariantCoverage::WgsOnly; }
-        let byte_idx = (i * 2) / 8;
-        let bit_offset = (i * 2) % 8;
-        match (self.data[byte_idx] >> bit_offset) & 3 {
-            1 => VariantCoverage::Shared,
-            2 => VariantCoverage::ChipOnly,
-            _ => VariantCoverage::WgsOnly,
-        }
-    }
-
-    /// Number of variants.
-    pub fn len(&self) -> usize { self.n_variants }
-
-    /// Raw bytes for serialization.
-    pub fn as_bytes(&self) -> &[u8] { &self.data }
-
-    /// Construct from raw bytes. Validates size matches n_variants.
-    pub fn from_bytes(data: Vec<u8>, n_variants: usize) -> Self {
-        let expected = (n_variants * 2 + 7) / 8;
-        if data.len() < expected {
-            // Pad with zeros (WgsOnly) if data is shorter than expected
-            let mut padded = data;
-            padded.resize(expected, 0);
-            return Self { data: padded, n_variants };
-        }
-        Self { data, n_variants }
-    }
-
-    /// Count variants by coverage type.
-    pub fn counts(&self) -> (usize, usize, usize) {
-        let mut wgs = 0usize;
-        let mut shared = 0usize;
-        let mut chip = 0usize;
-        for i in 0..self.n_variants {
-            match self.get(i) {
-                VariantCoverage::WgsOnly => wgs += 1,
-                VariantCoverage::Shared => shared += 1,
-                VariantCoverage::ChipOnly => chip += 1,
-            }
-        }
-        (wgs, shared, chip)
-    }
 }
 
 // ---------------------------------------------------------------------------

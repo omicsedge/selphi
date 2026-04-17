@@ -405,7 +405,6 @@ pub fn run_multi_chr(
             n_ref, n_haps, match_length, fl_fwd, fl_bwd,
             est_ne: est_ne as f64, p_err: config.p_err,
             max_candidates: config.max_candidates,
-            n_wgs_filter: if srp.has_augment() { Some(srp.wgs_haplotypes()) } else { None },
         };
 
         for (wi, window) in windows.iter().enumerate() {
@@ -464,33 +463,6 @@ pub fn run_multi_chr(
                 None, // selfdecode per-chr not supported yet
                 &vcf_tx,
             ).expect("Output write failed");
-
-            // Chip-only variant interpolation (if augmented panel has chip-only variants)
-            if srp.n_chip_only_variants() > 0 && !srp.chip_only_alleles.is_empty() {
-                let chip_only_positions: Vec<i64> = srp.chip_only_variants.iter().map(|v| v.pos).collect();
-                let shared_positions: Vec<i64> = wgs_idx.iter().map(|&wi| srp.variants[wi].pos).collect();
-                // Chip alleles at shared positions come from the augment section
-                // For now, extracting from augment tiles is not yet implemented —
-                // the interpolation will produce zero dosages (safe fallback)
-                let chip_shared_alleles = Vec::new();
-                let co_result = selphi::imputation::chip_only_interp::interpolate_chip_only_variants(
-                    &all_weights, &ref_bm_imp,
-                    &chip_shared_alleles,
-                    srp.chip_haplotypes(),
-                    &srp.chip_only_alleles,
-                    &chip_only_positions,
-                    &shared_positions,
-                    window.own_chip_start,
-                    window.own_chip_end,
-                    n_haps,
-                );
-                if !co_result.variant_indices.is_empty() {
-                    selphi::io::pipeline::write_chip_only_vcf(
-                        &co_result, &srp.chip_only_variants,
-                        n_samples, config.no_ap, &vcf_tx,
-                    ).expect("Chip-only output failed");
-                }
-            }
 
             selphi_info!("    Window {}/{}: {} vars", wi + 1, windows.len(), n_var_w);
         }

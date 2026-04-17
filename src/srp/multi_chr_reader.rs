@@ -32,12 +32,6 @@ pub struct ChrSrpView {
     pub ids: Vec<String>,
     pub original_ids: Vec<String>,
     pub tiled: Option<TiledSrpReader>,
-    // Augment fields (None for standard panels)
-    pub augment_meta: Option<super::AugmentMetadata>,
-    pub coverage: Option<super::CoverageBitvector>,
-    pub augment_tiled: Option<TiledSrpReader>,
-    pub chip_only_variants: Vec<Variant>,
-    pub chip_only_alleles: Vec<u8>,
 }
 
 impl ChrSrpView {
@@ -297,8 +291,6 @@ impl MultiChrSrpReader {
             ids,
             original_ids,
             tiled,
-            augment_meta: None, coverage: None, augment_tiled: None,
-            chip_only_variants: Vec::new(), chip_only_alleles: Vec::new(),
         })
     }
 }

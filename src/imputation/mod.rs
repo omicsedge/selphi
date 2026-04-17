@@ -7,4 +7,3 @@ pub mod match_processing;
 pub mod switch_detect;
 pub mod windows;
 pub mod window_process;
-pub mod chip_only_interp;
