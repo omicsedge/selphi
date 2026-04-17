@@ -839,11 +839,50 @@ fn main() {
     // ref_bm_full was extracted for phasing, reuse for imputation.
     // For pre-phased input (no phasing ran), extract now.
     let ref_bm_imp = ref_bm_from_phasing.unwrap_or_else(|| {
-        let bm = srp.extract_ref_alleles_bitmatrix(&wgs_idx);
-        selphi_step!("Ref bitmatrix extracted ({} chip × {} haps, {:.1} MB)",
-            n_chip, n_ref, (bm.n_words() * n_chip * 8) as f64 / 1e6);
-        bm
+        if srp.has_augment() && srp.augment_tiled.is_some() && srp.chip_haplotypes() <= 100_000 {
+            let bm = srp.extract_augmented_bitmatrix_from_tiles(&wgs_idx);
+            let n_total = srp.wgs_haplotypes() + srp.chip_haplotypes();
+            selphi_step!("Augmented bitmatrix extracted ({} chip × {} haps [{}+{}], {:.1} MB)",
+                n_chip, n_total, srp.wgs_haplotypes(), srp.chip_haplotypes(),
+                (bm.n_words() * n_chip * 8) as f64 / 1e6);
+            bm
+        } else {
+            let bm = srp.extract_ref_alleles_bitmatrix(&wgs_idx);
+            selphi_step!("Ref bitmatrix extracted ({} chip × {} haps, {:.1} MB)",
+                n_chip, n_ref, (bm.n_words() * n_chip * 8) as f64 / 1e6);
+            bm
+        }
     });
+    // n_ref stays as WGS haplotypes only — chip haps are filtered by n_wgs_filter before HMM
+
+    // Extract chip alleles at shared positions once per pipeline (augmented panel only).
+    // Used by chip_only_interp to find nearest chip proxy for each WGS candidate.
+    // Shape: (n_chip × n_chip_haps), row-major. Only allocated when augment is active.
+    let chip_shared_alleles: Vec<u8> = if srp.has_augment()
+        && srp.augment_tiled.is_some()
+        && srp.chip_haplotypes() <= 100_000
+        && !srp.chip_only_alleles.is_empty()
+    {
+        let n_wgs = srp.wgs_haplotypes();
+        let n_chip_haps = srp.chip_haplotypes();
+        let mut alleles = vec![0u8; n_chip * n_chip_haps];
+        for vi in 0..n_chip {
+            let row = ref_bm_imp.row(vi);
+            for ch in 0..n_chip_haps {
+                let h = n_wgs + ch;
+                let w = h / 64;
+                if w < ref_bm_imp.n_words() && (row[w] >> (h % 64)) & 1 != 0 {
+                    alleles[vi * n_chip_haps + ch] = 1;
+                }
+            }
+        }
+        selphi_step!("Chip shared alleles extracted ({} × {} haps, {:.1} MB)",
+            n_chip, n_chip_haps, (n_chip * n_chip_haps) as f64 / 1e6);
+        alleles
+    } else {
+        Vec::new()
+    };
+
     let chip_cm = if std::env::var("SELPHI_NO_LD").is_ok() {
         selphi_info!("  [WARN] LD correction DISABLED");
         raw_chip_cm.clone()
@@ -1060,17 +1099,21 @@ fn main() {
         let targ_w = extract_subarray(&targ_alleles, n_haps, window.chip_start, window.chip_end);
         let cm_w = &chip_cm[window.chip_start..window.chip_end];
 
-        // Build ref_w from bitmatrix (parallel over variants)
+        // Build ref_w from bitmatrix (parallel over variants).
+        // Use n_ref_bm (augmented hap count) so the HMM can read ALL candidate
+        // haplotypes — chip haps included — without OOB when n_wgs_filter=None.
+        let n_ref_bm_early = ref_bm_imp.n_haps;
         let ref_w = selphi::imputation::window_process::extract_ref_window(
-            &ref_bm_imp, window.chip_start, n_var_w, n_ref);
+            &ref_bm_imp, window.chip_start, n_var_w, n_ref_bm_early);
 
         let extract_secs = t0_extract.elapsed().as_secs_f64();
         let cpu_extract = selphi::log::cpu_time_secs();
 
         // CodedSteps: bitmatrix-native (no alleles_w needed)
         let t0_coded = Instant::now();
+        let n_ref_bm = ref_bm_imp.n_haps; // may be > n_ref when augmented
         let coded = selphi::imputation::pbwt::build_coded_steps_bm(
-            &ref_bm_imp, window.chip_start, n_var_w, n_ref, &targ_w, n_haps, cm_w, 0.05,
+            &ref_bm_imp, window.chip_start, n_var_w, n_ref_bm, &targ_w, n_haps, cm_w, 0.05,
         );
         let max_candidates = args.max_candidates;
         let p_err = args.p_err;
@@ -1160,9 +1203,11 @@ fn main() {
         let t0_hmm = Instant::now();
         // HMM for all haplotypes (shared function with thread-local buffer reuse)
         let hmm_params = selphi::imputation::window_process::WindowHmmParams {
-            n_ref, n_haps, match_length, fl_fwd, fl_bwd,
+            n_ref: n_ref_bm, n_haps, match_length, fl_fwd, fl_bwd,
             est_ne: est_ne as f64, p_err, max_candidates,
-            n_wgs_filter: if srp.has_augment() { Some(srp.wgs_haplotypes()) } else { None },
+            // EXPERIMENT: disabled to let HMM see chip haps as first-class candidates.
+            // n_wgs_filter: if srp.has_augment() { Some(srp.wgs_haplotypes()) } else { None },
+            n_wgs_filter: None,
         };
         let hmm_output = selphi::imputation::window_process::process_window_hmm(
             &hmm_params, &ref_bm_imp, &ref_w, &targ_w, cm_w,
@@ -1204,7 +1249,6 @@ fn main() {
         if srp.n_chip_only_variants() > 0 && !srp.chip_only_alleles.is_empty() {
             let chip_only_positions: Vec<i64> = srp.chip_only_variants.iter().map(|v| v.pos).collect();
             let shared_positions: Vec<i64> = wgs_idx.iter().map(|&wi| ref_positions[wi]).collect();
-            let chip_shared_alleles = Vec::new(); // extracted from augment tiles when available
             let co_result = selphi::imputation::chip_only_interp::interpolate_chip_only_variants(
                 &all_weights, &ref_bm_imp,
                 &chip_shared_alleles,

@@ -303,4 +303,12 @@ impl HaplotypeBitmatrix {
     /// Raw pointer to bits array (for unsafe hot loops).
     #[inline(always)]
     pub fn bits_ptr(&self) -> *const u64 { self.bits.as_ptr() }
+
+    /// Raw bits slice (read-only).
+    #[inline(always)]
+    pub fn raw_bits(&self) -> &[u64] { &self.bits }
+
+    /// Mutable raw bits slice.
+    #[inline(always)]
+    pub fn raw_bits_mut(&mut self) -> &mut [u64] { &mut self.bits }
 }

@@ -137,7 +137,8 @@ impl SrpReader {
             let aug = augment_meta.as_ref().unwrap();
             // Seek past main tile data to where augment section starts
             if last_tile_end > 0 {
-                let _ = f.seek(std::io::SeekFrom::Start(last_tile_end));
+                crate::selphi_debug!("  [augment] seeking to last_tile_end={}", last_tile_end);
+                f.seek(std::io::SeekFrom::Start(last_tile_end))?;
             }
             match Self::load_augment_section(&mut f, aug, &hdr, &filepath) {
                 Ok(result) => result,
@@ -191,21 +192,31 @@ impl SrpReader {
         Vec<u8>,
     )> {
         // Coverage bitvector
+        use std::io::Seek;
+        let pos_before = f.seek(std::io::SeekFrom::Current(0))?;
+        crate::selphi_debug!("  [augment] reading coverage at pos={}", pos_before);
         let cov_comp = super::helpers::read_section(f)?;
+        crate::selphi_debug!("  [augment] coverage: {} compressed bytes", cov_comp.len());
         let cov_raw = zstd::decode_all(Cursor::new(&cov_comp))
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let n_variants = aug.total_variants;
         let coverage = super::CoverageBitvector::from_bytes(cov_raw, n_variants);
 
         // Shared variant indices (skip)
-        let _ = super::helpers::read_section(f)?;
+        crate::selphi_debug!("  [augment] reading shared_idx at pos={}", f.seek(std::io::SeekFrom::Current(0))?);
+        let shared_section = super::helpers::read_section(f)?;
+        crate::selphi_debug!("  [augment] shared_idx: {} compressed bytes", shared_section.len());
 
         // Augment tile index
         let mut buf4 = [0u8; 4];
+        let pos_tile = f.seek(std::io::SeekFrom::Current(0))?;
         f.read_exact(&mut buf4)?;
         let n_tiles_aug = u32::from_le_bytes(buf4) as usize;
+        crate::selphi_debug!("  [augment] tile index at pos={}, n_tiles_aug={}, need {} bytes",
+            pos_tile, n_tiles_aug, n_tiles_aug * 12);
         let mut aug_tidx = vec![0u8; n_tiles_aug * 12];
         f.read_exact(&mut aug_tidx)?;
+        crate::selphi_debug!("  [augment] tile index read OK");
 
         let n_tile_rows_aug = hdr.get("augment").and_then(|a| a.get("n_tile_rows_aug")).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let n_tile_cols_aug = hdr.get("augment").and_then(|a| a.get("n_tile_cols_aug")).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -217,12 +228,23 @@ impl SrpReader {
                 comp_size: u32::from_le_bytes(aug_tidx[b+8..b+12].try_into().unwrap()),
             }
         }).collect();
+        // Skip past augment tile data to reach chip-only section
+        let aug_tile_end = aug_entries.iter()
+            .map(|e| e.offset + e.comp_size as u64)
+            .max()
+            .unwrap_or(0);
+
         let augment_tiled = if n_tiles_aug > 0 && n_tile_rows_aug > 0 {
             Some(super::tiled::TiledSrpReader::from_entries(
                 filepath.to_string().into(), aug.shared_variants, aug.chip_haplotypes,
                 aug_entries, n_tile_rows_aug, n_tile_cols_aug,
             ))
         } else { None };
+
+        // Seek past augment tile data
+        if aug_tile_end > 0 {
+            f.seek(std::io::SeekFrom::Start(aug_tile_end))?;
+        }
 
         // Chip-only variants
         f.read_exact(&mut buf4)?;
@@ -281,6 +303,93 @@ impl SrpReader {
 
     /// Number of chip-only variants (imputeable from chip panel only).
     pub fn n_chip_only_variants(&self) -> usize { self.chip_only_variants.len() }
+
+    /// Extract augmented bitmatrix (WGS + chip haps) at shared chip positions.
+    /// WGS part from main tiles, chip part from augment tiles.
+    /// `wgs_idx`: indices into WGS variants that are shared with chip target.
+    pub fn extract_augmented_bitmatrix_from_tiles(
+        &self,
+        wgs_idx: &[usize],
+    ) -> crate::common::HaplotypeBitmatrix {
+        use super::TILE_ROWS;
+        use super::TILE_COLS;
+
+        let n_chip = wgs_idx.len();
+        let n_wgs = self.wgs_haplotypes();
+        let n_chip_haps = self.chip_haplotypes();
+        let n_total = n_wgs + n_chip_haps;
+
+        // Start with WGS-only bitmatrix
+        let mut bm = self.extract_ref_alleles_bitmatrix(wgs_idx);
+
+        // Expand to fit chip haplotypes
+        let n_words_old = n_wgs.div_ceil(64);
+        let n_words_new = n_total.div_ceil(64);
+        if n_words_new > n_words_old {
+            let mut new_bits = vec![0u64; n_chip * n_words_new];
+            for ci in 0..n_chip {
+                new_bits[ci * n_words_new..ci * n_words_new + n_words_old]
+                    .copy_from_slice(&bm.raw_bits()[ci * n_words_old..(ci + 1) * n_words_old]);
+            }
+            bm = crate::common::HaplotypeBitmatrix::from_raw(new_bits, n_chip, n_total);
+        }
+
+        // Fill chip haplotypes from augment tiles
+        if let Some(ref aug_tiled) = self.augment_tiled {
+            // Build mapping: wgs_idx[ci] → augment variant index
+            // The augment stores shared variants in the same order as the coverage bitvector's shared entries
+            // We need to map wgs_idx → augment tile row
+            let aug = self.augment_meta.as_ref().unwrap();
+            let n_shared = aug.shared_variants;
+
+            // The coverage bitvector tells us which WGS variants are shared
+            // augment row i = i-th shared variant in WGS order
+            // We need: for each wgs_idx[ci], find its augment row
+            let mut wgs_to_aug: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+            if let Some(ref cov) = self.coverage {
+                let mut aug_row = 0usize;
+                for vi in 0..self.n_variants() {
+                    if cov.get(vi) == super::VariantCoverage::Shared {
+                        wgs_to_aug.insert(vi, aug_row);
+                        aug_row += 1;
+                    }
+                }
+            }
+
+            let n_aug_tile_cols = n_chip_haps.div_ceil(TILE_COLS);
+
+            // Process in stripe batches
+            for ci in 0..n_chip {
+                let aug_row = match wgs_to_aug.get(&wgs_idx[ci]) {
+                    Some(&r) => r,
+                    None => continue,
+                };
+                let aug_stripe = aug_row / TILE_ROWS;
+                let aug_local_row = (aug_row % TILE_ROWS) as u16;
+
+                if let Ok(loaded) = aug_tiled.preload_stripes(aug_stripe, 1) {
+                    for band in 0..n_aug_tile_cols {
+                        let tile = loaded.decompress_tile(aug_stripe, band);
+                        let col_start = band * TILE_COLS;
+                        for lc in 0..tile.n_cols as usize {
+                            let (lo, hi) = tile.col_range(lc);
+                            for k in lo..hi {
+                                if tile.indices[k] == aug_local_row {
+                                    let gh = n_wgs + col_start + lc;
+                                    if gh < n_total {
+                                        let wi = gh / 64;
+                                        bm.raw_bits_mut()[ci * n_words_new + wi] |= 1u64 << (gh % 64);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        bm
+    }
 
     pub fn load_tiled(&mut self) -> bool { self.tiled.is_some() }
 
