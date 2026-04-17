@@ -10,6 +10,14 @@ use crate::common::HaplotypeBitmatrix;
 use super::hmm::{CsrWeights, HmmResult};
 use super::pbwt;
 
+/// Threshold on the PBWT-selected candidate count below which the per-target
+/// HMM falls back to running on the full reference panel instead of a reduced
+/// candidate pool. Below ~100 candidates the reduced-pool PBWT+HMM becomes
+/// unreliable (too few states for the Li-Stephens transition matrix), so the
+/// "is_full" branch rebuilds the per-window dense allele array over all haps.
+/// Rare in practice — most windows have hundreds to thousands of candidates.
+const FULL_PANEL_HMM_THRESHOLD: usize = 100;
+
 /// Parameters for per-window HMM processing.
 pub struct WindowHmmParams {
     pub n_ref: usize,
@@ -25,6 +33,57 @@ pub struct WindowHmmParams {
 /// Result of processing one imputation window.
 pub struct WindowHmmOutput {
     pub all_weights: Vec<Vec<(usize, CsrWeights)>>,
+}
+
+/// Inputs for `impute_window`: whole-chromosome buffers plus window bounds.
+/// Keeping this as a struct avoids a 9-argument function signature that was
+/// duplicated between the single-chr and multi-chr pipelines.
+pub struct ImputeWindowInputs<'a> {
+    pub ref_bm: &'a HaplotypeBitmatrix,
+    pub targ_alleles: &'a [u8],           // (n_chip × n_haps) full target, row-major
+    pub chip_cm: &'a [f64],               // per-chip genetic distances (cM), full length
+    pub ne_per_site: Option<&'a [f64]>,   // per-site Ne (from phasing EM), full length
+    pub chip_start: usize,
+    pub chip_end: usize,
+}
+
+/// Runs the per-window imputation pipeline: window sub-array extraction,
+/// coded-steps build, candidate selection, and Li-Stephens HMM over all
+/// target haplotypes. Shared between `main.rs` single-chr and `orchestrate.rs`
+/// multi-chr pipelines so they cannot drift.
+///
+/// The output is a sparse CSR per target hap; interpolation / encoding is
+/// left to the caller because the I/O and format dispatch differ between
+/// single-chr and multi-chr modes.
+pub fn impute_window(
+    inputs: &ImputeWindowInputs,
+    params: &WindowHmmParams,
+    precomputed_candidates: Option<&Vec<Vec<u32>>>,
+    hap_priors: &mut [Option<Vec<f64>>],
+) -> WindowHmmOutput {
+    let n_var_w = inputs.chip_end - inputs.chip_start;
+    let targ_w = crate::common::utils::extract_subarray(
+        inputs.targ_alleles, params.n_haps, inputs.chip_start, inputs.chip_end,
+    );
+    let cm_w = &inputs.chip_cm[inputs.chip_start..inputs.chip_end];
+
+    let ref_w = extract_ref_window(inputs.ref_bm, inputs.chip_start, n_var_w, params.n_ref);
+
+    let coded = super::pbwt::build_coded_steps_bm(
+        inputs.ref_bm, inputs.chip_start, n_var_w, params.n_ref,
+        &targ_w, params.n_haps, cm_w, 0.05,
+    );
+
+    let ne_w: Option<Vec<f64>> = inputs.ne_per_site.map(|ne| {
+        ne[inputs.chip_start..inputs.chip_end].to_vec()
+    });
+
+    process_window_hmm(
+        params, inputs.ref_bm, &ref_w, &targ_w, cm_w,
+        ne_w.as_deref(), &coded,
+        precomputed_candidates,
+        hap_priors, inputs.chip_start, n_var_w,
+    )
 }
 
 /// Extract ref_w (dense u8 array) from bitmatrix for a window range.
@@ -92,7 +151,7 @@ pub fn process_window_hmm(
             if n_cand == 0 {
                 return (tgt, HmmResult { weights: Vec::new(), hap_posterior: None });
             }
-            let is_full = n_cand < 100;
+            let is_full = n_cand < FULL_PANEL_HMM_THRESHOLD;
             let m_red = if is_full { m } else { n_cand + 1 };
 
             thread_local! {
@@ -106,7 +165,7 @@ pub fn process_window_hmm(
             });
 
             if is_full {
-                // Rare: n_cand < 100, need full ref+target array from bitmatrix.
+                // Rare: n_cand < FULL_PANEL_HMM_THRESHOLD, need full ref+target array from bitmatrix.
                 for var in 0..n_var_w {
                     let ci = chip_start + var;
                     let row = ref_bm.row(ci);

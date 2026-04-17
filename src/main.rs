@@ -23,7 +23,6 @@ use selphi::genmap;
 use selphi::haploid;
 use selphi::io::target_io::{read_target_vcf, write_phased_vcf, extract_target_alleles, intersect_variants};
 
-use selphi::common::utils::extract_subarray;
 use selphi::imputation::windows::compute_imputation_windows;
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
@@ -224,6 +223,15 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
+    // Initialize the Rayon global thread pool exactly once. All dispatch branches
+    // below (eval, merge-srps, prepare-reference, phasing, imputation) share this
+    // pool; they used to re-init locally, which silently no-op'd after the first
+    // caller and made `--threads` ineffective for later branches.
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(args.threads)
+        .build_global()
+        .ok();
+
     // --- Evaluate accuracy mode ---
     if let Some(ref imputed) = args.evaluate {
         let truth = args.truth.as_ref().expect("--truth required with --evaluate");
@@ -339,8 +347,6 @@ fn main() {
         selphi_info!("  output:   {}", output);
         selphi_info!("  log:      {}\n", log_path.display());
 
-        rayon::ThreadPoolBuilder::new().num_threads(args.threads).build_global().ok();
-
         let paths: Vec<PathBuf> = merge_list.split(',')
             .map(|s| PathBuf::from(s.trim()))
             .collect();
@@ -363,8 +369,6 @@ fn main() {
         selphi_info!("  output:   {}", output);
         selphi_info!("  log:      {}\n", log_path.display());
 
-        rayon::ThreadPoolBuilder::new().num_threads(args.threads).build_global().ok();
-
         selphi::srp::multi_chr_writer::merge_srps_from_dir(Path::new(dir), Path::new(output))
             .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
 
@@ -386,7 +390,6 @@ fn main() {
             selphi_info!("  threads:  {}", args.threads);
             selphi_info!("  log:      {}\n", log_path.display());
 
-            rayon::ThreadPoolBuilder::new().num_threads(args.threads).build_global().ok();
             let start_time = Instant::now();
 
             selphi::srp::multi_chr_writer::build_multi_chr_srp_from_dir(
@@ -430,11 +433,6 @@ fn main() {
         selphi_info!("");
 
         let start_time = Instant::now();
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(args.threads)
-            .build_global()
-            .ok();
-
         if output_bref3 {
             selphi_step!("Writing BREF3...");
             selphi::srp::bref3_writer::write_bref3_from_bcf(Path::new(source), Path::new(output))
@@ -505,11 +503,6 @@ fn main() {
         selphi_info!("  output:   {}", output_path);
         selphi_info!("  threads:  {}", args.threads);
         selphi_info!("  log:      {}\n", log_path.display());
-
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(args.threads)
-            .build_global()
-            .ok();
 
         let config = orchestrate::MultiChrImputeConfig {
             threads: args.threads,
@@ -593,12 +586,6 @@ fn main() {
     // Memory estimation + warning
     let needs_phasing_estimate = !is_phased || args.force_phasing;
     selphi::log::estimate_and_warn(n_chip, n_ref, n_samples, args.threads, needs_phasing_estimate);
-
-    // Set rayon thread pool (before phasing or imputation)
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(args.threads)
-        .build_global()
-        .ok();
 
     // 5. Extract target alleles at chip sites (before ref — needed for MAF filter)
     let targ_alleles = extract_target_alleles(&target_genotypes, &target_idx, n_chip, n_haps);
@@ -1007,39 +994,13 @@ fn main() {
         let n_var_w = window.chip_end - window.chip_start;
 
 
-        // Extract window sub-arrays
         let t0_extract = Instant::now();
-        let targ_w = extract_subarray(&targ_alleles, n_haps, window.chip_start, window.chip_end);
-        let cm_w = &chip_cm[window.chip_start..window.chip_end];
-
-        // Build ref_w from bitmatrix (parallel over variants).
-        let ref_w = selphi::imputation::window_process::extract_ref_window(
-            &ref_bm_imp, window.chip_start, n_var_w, n_ref);
-
-        let extract_secs = t0_extract.elapsed().as_secs_f64();
-        let cpu_extract = selphi::log::cpu_time_secs();
-
-        // CodedSteps: bitmatrix-native (no alleles_w needed)
-        let t0_coded = Instant::now();
-        let coded = selphi::imputation::pbwt::build_coded_steps_bm(
-            &ref_bm_imp, window.chip_start, n_var_w, n_ref, &targ_w, n_haps, cm_w, 0.05,
-        );
         let max_candidates = args.max_candidates;
         let p_err = args.p_err;
-
-        // Debug: log candidate count for first target
-        {
-            let c0 = selphi::imputation::pbwt::select_candidates(&coded, n_ref, n_ref, 7, max_candidates);
-            selphi_debug!("    [HYBRID] steps={} candidates_hap0={}/{}", coded.step_groups.len(), c0.len(), n_ref);
-        }
-
-        let ne_w: Option<Vec<f64>> = final_ne_per_site.as_ref().map(|ne| {
-            ne[window.chip_start..window.chip_end].to_vec()
-        });
-        let ne_w_ref = ne_w.as_deref();
-
-        let coded_secs = t0_coded.elapsed().as_secs_f64();
-        let cpu_coded = selphi::log::cpu_time_secs();
+        let cpu_extract = selphi::log::cpu_time_secs();
+        let extract_secs = t0_extract.elapsed().as_secs_f64();
+        let cpu_coded = cpu_extract;
+        let coded_secs = 0.0;
 
         // Pre-load data for interpolation during HMM (overlaps I/O with compute).
         // Tiled: sequential read of compressed stripes (~500 MB).
@@ -1107,23 +1068,26 @@ fn main() {
             }));
         }
 
-        // Process all haplotypes in a single rayon par_iter (no batch sync overhead).
-        // Each hap runs PBWT+HMM independently. Thread-local buffers reused via RefCell.
+        // Shared per-window pipeline: extract ref_w/targ_w/cm_w, build coded steps,
+        // run candidate selection + Li-Stephens HMM for all target haplotypes.
         let t0_hmm = Instant::now();
-        // HMM for all haplotypes (shared function with thread-local buffer reuse)
         let hmm_params = selphi::imputation::window_process::WindowHmmParams {
             n_ref, n_haps, match_length, fl_fwd, fl_bwd,
             est_ne: est_ne as f64, p_err, max_candidates,
         };
-        let hmm_output = selphi::imputation::window_process::process_window_hmm(
-            &hmm_params, &ref_bm_imp, &ref_w, &targ_w, cm_w,
-            ne_w_ref, &coded,
-            precomputed_candidates.as_ref(),
-            &mut hap_priors, window.chip_start, n_var_w,
+        let inputs = selphi::imputation::window_process::ImputeWindowInputs {
+            ref_bm: &ref_bm_imp,
+            targ_alleles: &targ_alleles,
+            chip_cm: &chip_cm,
+            ne_per_site: final_ne_per_site.as_deref(),
+            chip_start: window.chip_start,
+            chip_end: window.chip_end,
+        };
+        let hmm_output = selphi::imputation::window_process::impute_window(
+            &inputs, &hmm_params, precomputed_candidates.as_ref(), &mut hap_priors,
         );
         let all_weights = hmm_output.all_weights;
 
-        drop(ref_w);
         let hmm_secs = t0_hmm.elapsed().as_secs_f64();
         let cpu_hmm = selphi::log::cpu_time_secs();
         let pbwt_secs = t0_win.elapsed().as_secs_f64();

@@ -15,7 +15,6 @@ use selphi::io::target_io::{
     read_target_vcf_multi_chr, intersect_variants_for_chr, extract_target_alleles,
 };
 use selphi::genmap;
-use selphi::common::utils::extract_subarray;
 use selphi::imputation::windows::compute_imputation_windows;
 
 /// Configuration for multi-chr imputation (mirrors relevant CLI args).
@@ -409,23 +408,8 @@ pub fn run_multi_chr(
 
         for (wi, window) in windows.iter().enumerate() {
             let n_var_w = window.chip_end - window.chip_start;
-            let targ_w = extract_subarray(&targ_alleles, n_haps, window.chip_start, window.chip_end);
-            let cm_w = &chip_cm[window.chip_start..window.chip_end];
 
-            // Extract ref_w from bitmatrix (parallel)
-            let ref_w = selphi::imputation::window_process::extract_ref_window(
-                &ref_bm_imp, window.chip_start, n_var_w, n_ref);
-
-            // CodedSteps
-            let coded = selphi::imputation::pbwt::build_coded_steps_bm(
-                &ref_bm_imp, window.chip_start, n_var_w, n_ref, &targ_w, n_haps, cm_w, 0.05,
-            );
-
-            let ne_w: Option<Vec<f64>> = final_ne_per_site.as_ref().map(|ne| {
-                ne[window.chip_start..window.chip_end].to_vec()
-            });
-
-            // Preload stripes for interpolation
+            // Preload stripes for interpolation (runs concurrently with HMM below).
             let own_start = if window.own_chip_start == 0 { 0 } else { wgs_idx[window.own_chip_start] };
             let own_end = if window.own_chip_end >= wgs_idx.len() { srp.n_variants() } else { wgs_idx[window.own_chip_end] };
 
@@ -441,12 +425,18 @@ pub fn run_multi_chr(
                 None
             };
 
-            // HMM for all haplotypes (shared function)
-            let hmm_output = selphi::imputation::window_process::process_window_hmm(
-                &hmm_params, &ref_bm_imp, &ref_w, &targ_w, cm_w,
-                ne_w.as_deref(), &coded,
-                precomputed_candidates.as_ref(),
-                &mut hap_priors, window.chip_start, n_var_w,
+            // Shared per-window pipeline (extracted: window sub-arrays, coded steps,
+            // candidate selection, Li-Stephens HMM for all target haplotypes).
+            let inputs = selphi::imputation::window_process::ImputeWindowInputs {
+                ref_bm: &ref_bm_imp,
+                targ_alleles: &targ_alleles,
+                chip_cm: &chip_cm,
+                ne_per_site: final_ne_per_site.as_deref(),
+                chip_start: window.chip_start,
+                chip_end: window.chip_end,
+            };
+            let hmm_output = selphi::imputation::window_process::impute_window(
+                &inputs, &hmm_params, precomputed_candidates.as_ref(), &mut hap_priors,
             );
             let all_weights = hmm_output.all_weights;
 
