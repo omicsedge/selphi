@@ -129,36 +129,6 @@ selphi --refpanel-dir panels/ --input whole_genome.vcf.gz --map-dir maps/ --out 
 
 Only one chromosome is held in memory at a time. Peak memory equals that of the largest single chromosome plus a small prefetch buffer (~200 MB) for the next chromosome.
 
-### Mixed-density reference panels (WGS + chip augmentation)
-
-Selphi can combine a WGS reference panel with additional chip-genotyped samples into a single panel file. The chip haplotypes improve phasing and haplotype matching at shared positions, without introducing imputed data at positions where the chip has no coverage.
-
-This is useful when you have:
-- A WGS panel (e.g., 2,504 samples from 1000 Genomes) providing dense variant coverage
-- A larger cohort of chip-genotyped samples (e.g., 500K from a biobank) providing haplotype diversity at array positions
-
-```bash
-# Create a merged panel from WGS + chip data
-selphi --prepare-merged-panel \
-  --wgs panel_wgs.srp \
-  --chip chip_genotypes.vcf.gz \
-  --map genetic_map.map \
-  --out merged_panel \
-  --threads 16
-
-# Use it exactly like a standard panel
-selphi --refpanel merged_panel.srp --input target.vcf.gz --map map.map --out result
-```
-
-Selphi automatically detects the augmented panel and adjusts the pipeline:
-- **Phasing** uses all haplotypes (WGS + chip) at shared positions for better phase resolution
-- **Candidate selection** matches against the full pool but selects only WGS haplotypes for the HMM
-- **HMM and interpolation** use only WGS haplotypes — no chip data enters the dosage calculation at positions where chip has no coverage
-
-If the chip data is unphased, Selphi phases it automatically using the WGS panel as reference during panel creation.
-
-No existing imputation tool supports this natively. Other tools require either a fully dense panel or pre-imputation of the chip data, which introduces error propagation at rare variants. Selphi uses each data source only where it has real measurements.
-
 ### Reference panel preparation
 
 Create an SRP reference panel from VCF, BCF, or BREF3. The source format is auto-detected.
@@ -351,9 +321,6 @@ Standard VCF or BCF. Unphased (`0/1`) or phased (`0|1`) genotypes. Multi-allelic
 | `--merge-srps-dir DIR` | Merge all SRP files from a directory into multi-chromosome SRP | |
 | **Reference panel** | | |
 | `--prepare-reference-from PATH` | Create SRP from VCF.gz, BCF, BREF3, or directory of per-chr files | |
-| `--prepare-merged-panel` | Create mixed-density panel from WGS + chip data | off |
-| `--wgs PATH` | WGS reference panel (.srp) for `--prepare-merged-panel` | |
-| `--chip PATH` | Chip genotype data (VCF.gz, BCF, SRP, or BREF3) for `--prepare-merged-panel` | |
 | `--chunk-size N` | Chunk size for SRP creation (0 = auto) | 0 |
 | **Testing** | | |
 | `--self-test` | Run all output format and code path tests | off |

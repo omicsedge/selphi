@@ -356,67 +356,6 @@ pub fn concat_bgzf(inputs: &[std::path::PathBuf], output: &Path) -> std::io::Res
     Ok(())
 }
 
-/// Write chip-only variant dosages to VCF output.
-/// Called after standard window output if chip-only variants exist in the window.
-pub fn write_chip_only_vcf(
-    result: &crate::imputation::chip_only_interp::ChipOnlyResult,
-    chip_only_variants: &[crate::srp::Variant],
-    n_samples: usize,
-    no_ap: bool,
-    vcf_tx: &std::sync::mpsc::SyncSender<Vec<u8>>,
-) -> std::io::Result<()> {
-    if result.variant_indices.is_empty() { return Ok(()); }
-
-    let n_haps = n_samples * 2;
-    let mut buf = Vec::with_capacity(result.variant_indices.len() * n_samples * 8);
-
-    for (out_i, &co_idx) in result.variant_indices.iter().enumerate() {
-        let v = &chip_only_variants[co_idx];
-
-        // Compute per-sample DS, AF, AC
-        let mut ac = 0.0f64;
-        for s in 0..n_samples {
-            let d0 = result.dosages[out_i * n_haps + s * 2] as f64;
-            let d1 = result.dosages[out_i * n_haps + s * 2 + 1] as f64;
-            ac += d0 + d1;
-        }
-        let af = ac / n_haps as f64;
-        let dr2 = 0.0; // R² not computable for chip-only (no direct truth)
-
-        // VCF line
-        buf.extend_from_slice(format!(
-            "{}\t{}\t{}-{}-{}-{}\t{}\t{}\t.\tPASS\tAF={:.4};AC={};AN={};DR2={:.4};IMP",
-            v.chr, v.pos, v.chr, v.pos, v.ref_allele, v.alt_allele,
-            v.ref_allele, v.alt_allele, af, ac as u64, n_haps, dr2,
-        ).as_bytes());
-
-        if no_ap {
-            buf.extend_from_slice(b"\tGT:DS");
-        } else {
-            buf.extend_from_slice(b"\tGT:DS:AP1:AP2");
-        }
-
-        for s in 0..n_samples {
-            let ap1 = result.dosages[out_i * n_haps + s * 2];
-            let ap2 = result.dosages[out_i * n_haps + s * 2 + 1];
-            let ds = ap1 + ap2;
-            let gt0 = if ap1 > 0.5 { 1 } else { 0 };
-            let gt1 = if ap2 > 0.5 { 1 } else { 0 };
-            if no_ap {
-                buf.extend_from_slice(format!("\t{}|{}:{:.2}", gt0, gt1, ds).as_bytes());
-            } else {
-                buf.extend_from_slice(format!("\t{}|{}:{:.2}:{:.2}:{:.2}", gt0, gt1, ds, ap1, ap2).as_bytes());
-            }
-        }
-        buf.push(b'\n');
-    }
-
-    if !buf.is_empty() {
-        let _ = vcf_tx.send(buf);
-    }
-    Ok(())
-}
-
 /// Batch-format a tile of imputed variants using parallel chunked formatting.
 /// Splits the tile into coarse chunks (one per core) to avoid fine-grained
 /// rayon overhead while still parallelizing the memory-bound LUT+copy work.

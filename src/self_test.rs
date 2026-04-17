@@ -318,38 +318,6 @@ pub fn run(config: &SelfTestConfig) -> u32 {
         selphi_info!("  \x1b[32mPASS\x1b[0m  SelfDecode ZIP ({:.1} MB)", sz as f64 / 1e6);
     }
 
-    // ── Mixed-density panel ─────────────────────────────────────────
-
-    // 13. Build merged panel (self-augment: use input as chip data)
-    let merged_out = format!("{}_merged_panel", out_base);
-    let merged_srp = format!("{}.srp", merged_out);
-    test!("merged panel build",
-        "--prepare-merged-panel", "--wgs", refpanel, "--chip", input, "--map", map,
-        "--out", &merged_out, &t);
-
-    // 14. Impute with merged panel
-    if Path::new(&merged_srp).exists() {
-        let imp_out = format!("{}_merged_imputed", out_base);
-        test!("merged panel impute",
-            "--refpanel", &merged_srp, "--input", input, "--map", map,
-            "--out", &imp_out, &t);
-
-        // Validate merged output natively
-        let imp_vcf = PathBuf::from(format!("{}.vcf.gz", imp_out));
-        if imp_vcf.exists() {
-            match validate_vcf(&imp_vcf) {
-                Ok((ns, nv)) => {
-                    pass += 1;
-                    selphi_info!("  \x1b[32mPASS\x1b[0m  merged panel VCF valid ({} samples, {} variants)", ns, nv);
-                }
-                Err(e) => {
-                    fail += 1;
-                    selphi_info!("  \x1b[31mFAIL\x1b[0m  merged panel VCF invalid ({})", e);
-                }
-            }
-        }
-    }
-
     // ── Summary ─────────────────────────────────────────────────────
     selphi_info!("");
     if fail == 0 {
