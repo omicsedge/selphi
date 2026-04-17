@@ -277,7 +277,17 @@ fn build_srp_from_bcf_native(
                 let n_alt: usize = f[5].parse().unwrap_or(0);
 
                 if chromosome.is_empty() {
-                    chromosome = if cid < contig_names.len() { contig_names[cid].clone() } else { f[0].to_string() };
+                    chromosome = if cid < contig_names.len() {
+                        contig_names[cid].clone()
+                    } else if contig_names.len() == 1 {
+                        // After reheader: index may not match, use the only contig available
+                        contig_names[0].clone()
+                    } else {
+                        return Err(SrpWriterError::InvalidInput(format!(
+                            "BCF contig id {} out of range (header has {} contigs); \
+                             refusing silent fallback to raw field '{}'",
+                            cid, contig_names.len(), f[0])));
+                    };
                     chr_w = chromosome.chars().count().max(1);
                 }
                 if pos < min_pos { min_pos = pos; }
@@ -358,7 +368,16 @@ fn build_srp_from_bcf_native(
             let f: Vec<&str> = line.split('\t').collect();
             if f.len() < 6 { continue; }
             let cid: usize = f[0].parse().unwrap_or(0);
-            let chrom = if cid < contig_names.len() { &contig_names[cid] } else { f[0] };
+            let chrom = if cid < contig_names.len() {
+                &contig_names[cid]
+            } else if contig_names.len() == 1 {
+                &contig_names[0]
+            } else {
+                return Err(SrpWriterError::InvalidInput(format!(
+                    "BCF contig id {} out of range (header has {} contigs); \
+                     refusing silent fallback to raw field '{}'",
+                    cid, contig_names.len(), f[0])));
+            };
             let pos: i64 = f[1].parse().unwrap_or(0);
             let ref_allele = f[2];
             let alt_allele = f[3];
@@ -398,7 +417,16 @@ fn build_srp_from_bcf_native(
                 let f: Vec<&str> = line.split('\t').collect();
                 if f.len() < 6 { continue; }
                 let cid: usize = f[0].parse().unwrap_or(0);
-                let chrom = if cid < contig_names.len() { &contig_names[cid] } else { f[0] };
+                let chrom = if cid < contig_names.len() {
+                    &contig_names[cid]
+                } else if contig_names.len() == 1 {
+                    &contig_names[0]
+                } else {
+                    return Err(SrpWriterError::InvalidInput(format!(
+                        "BCF contig id {} out of range (header has {} contigs); \
+                         refusing silent fallback to raw field '{}'",
+                        cid, contig_names.len(), f[0])));
+                };
                 let pos: i64 = f[1].parse().unwrap_or(0);
                 let ref_allele = f[2];
                 let alt_allele = f[3];
@@ -804,7 +832,16 @@ pub fn build_srp_unified(
             let f: Vec<&str> = line.split('\t').collect();
             if f.len() < 6 { continue; }
             let cid: usize = f[0].parse().unwrap_or(0);
-            let chrom = if cid < contig_names.len() { &contig_names[cid] } else { f[0] };
+            let chrom = if cid < contig_names.len() {
+                &contig_names[cid]
+            } else if contig_names.len() == 1 {
+                &contig_names[0]
+            } else {
+                return Err(SrpWriterError::InvalidInput(format!(
+                    "BCF contig id {} out of range (header has {} contigs); \
+                     refusing silent fallback to raw field '{}'",
+                    cid, contig_names.len(), f[0])));
+            };
             let pos: i64 = f[1].parse().unwrap_or(0);
             let ref_allele = f[2];
             let alt_allele = f[3];

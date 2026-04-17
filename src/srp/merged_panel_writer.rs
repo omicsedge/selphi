@@ -33,78 +33,158 @@ pub fn build_merged_panel(
     let n_wgs_variants = wgs.n_variants();
     selphi_info!("  WGS: {} variants, {} haplotypes", n_wgs_variants, n_wgs_haps);
 
-    // Read chip target data
+    // Read chip data — supports VCF/BCF and SRP/BREF3 natively
     selphi_step!("Reading chip data...");
-    let (chip_samples, chip_markers, chip_genotypes, chip_is_phased) =
-        crate::io::target_io::read_target_vcf(chip_path.to_str().unwrap_or(""), &wgs);
-    let n_chip_samples = chip_samples.len();
-    let n_chip_haps = n_chip_samples * 2;
-    selphi_info!("  Chip: {} samples ({} haplotypes), {} variants, phased={}",
-        n_chip_samples, n_chip_haps, chip_markers.len(), chip_is_phased);
+    let chip_ext = chip_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let is_srp_chip = chip_ext == "srp" || chip_ext == "bref3";
 
-    // Find shared variants (intersection of WGS and chip positions)
-    let (wgs_idx, chip_idx) = crate::io::target_io::intersect_variants(&wgs, &chip_markers);
-    let n_shared = wgs_idx.len();
-    selphi_info!("  Shared variants: {} ({:.1}% of chip)",
-        n_shared, n_shared as f64 / chip_markers.len() as f64 * 100.0);
+    let (n_chip_samples, n_chip_haps, chip_markers, chip_alleles, wgs_idx, n_shared, chip_only_indices, chip_only_alleles, n_chip_only);
 
-    if n_shared == 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData,
-            "No shared variants between WGS panel and chip data"));
-    }
+    if is_srp_chip {
+        // SRP or BREF3 chip input — read via SRP reader (already phased, tiled)
+        let chip_srp = if chip_ext == "bref3" {
+            // Convert BREF3 → SRP in temp, then open
+            let tmp_srp = output_path.with_extension("chip_tmp.srp");
+            selphi_info!("  Converting BREF3 → SRP...");
+            super::writer::build_srp_unified(chip_path, &tmp_srp, 0, threads)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{}", e)))?;
+            super::SrpReader::open(&tmp_srp, threads * 2)?
+        } else {
+            super::SrpReader::open(chip_path, threads * 2)?
+        };
 
-    // Phase chip data if unphased (using WGS as reference)
-    let chip_alleles = if !chip_is_phased {
-        selphi_step!("Phasing chip data using WGS reference...");
-        let ref_bm = wgs.extract_ref_alleles_bitmatrix(&wgs_idx);
-        let n_chip_vars = wgs_idx.len();
-        let targ_alleles = crate::io::target_io::extract_target_alleles(
-            &chip_genotypes, &chip_idx, n_chip_vars, n_chip_haps);
+        n_chip_samples = chip_srp.sample_ids.len();
+        n_chip_haps = chip_srp.n_haps();
+        let n_chip_variants = chip_srp.n_variants();
+        selphi_info!("  Chip (SRP): {} samples ({} haps), {} variants, phased",
+            n_chip_samples, n_chip_haps, n_chip_variants);
 
-        let chip_bps: Vec<i64> = wgs_idx.iter().map(|&wi| wgs.variants[wi].pos).collect();
-        let ref_bp: Vec<i64> = wgs.variants.iter().map(|v| v.pos).collect();
-        let (map_bp, map_cm) = crate::genmap::load_genetic_map_raw(map_path)?;
-        let chip_cm: Vec<f64> = chip_bps.iter().map(|&bp| {
-            crate::genmap::interpolate_cm(&map_bp, &map_cm, bp)
-        }).collect();
+        // Build variant markers for intersection
+        chip_markers = chip_srp.variants.iter().map(|v| {
+            crate::io::target_io::TargetMarker {
+                chrom: v.chr.clone(), pos: v.pos,
+                ref_allele: v.ref_allele.clone(), alt_allele: v.alt_allele.clone(),
+                ref_hash: crate::srp::blake2b_hex(&v.ref_allele),
+                alt_hash: crate::srp::blake2b_hex(&v.alt_allele),
+            }
+        }).collect::<Vec<_>>();
 
-        let (phased, _ne, _sw) = crate::haploid::phase_genotypes(
-            &targ_alleles, &ref_bm, &chip_cm, &chip_bps,
-            &ref_bp, &map_bp, &map_cm,
-            n_chip_vars, n_chip_samples, n_wgs_haps,
-            33, threads, 0,
-        );
-        selphi_step!("Chip phasing complete");
-        phased
-    } else {
-        // Already phased — extract alleles at shared positions
-        crate::io::target_io::extract_target_alleles(
-            &chip_genotypes, &chip_idx, n_shared, n_chip_haps)
-    };
+        // Intersect WGS and chip variants
+        let (wi, ci) = crate::io::target_io::intersect_variants(&wgs, &chip_markers);
+        n_shared = wi.len();
+        selphi_info!("  Shared variants: {} ({:.1}% of chip)",
+            n_shared, n_shared as f64 / n_chip_variants as f64 * 100.0);
 
-    // Find chip-only variants (in chip but not in WGS)
-    let shared_chip_set: std::collections::BTreeSet<usize> = chip_idx.iter().copied().collect();
-    let chip_only_indices: Vec<usize> = (0..chip_markers.len())
-        .filter(|i| !shared_chip_set.contains(i))
-        .collect();
-    let n_chip_only = chip_only_indices.len();
+        if n_shared == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                "No shared variants between WGS panel and chip data"));
+        }
 
-    // Extract chip-only alleles (unphased genotypes — phase from shared positions)
-    let chip_only_alleles: Vec<u8> = if n_chip_only > 0 {
-        let mut alleles = vec![0u8; n_chip_only * n_chip_haps];
-        for (out_i, &chip_i) in chip_only_indices.iter().enumerate() {
-            if chip_i < chip_genotypes.len() {
-                let gt = &chip_genotypes[chip_i];
-                for s in 0..n_chip_samples.min(gt.len()) {
-                    alleles[out_i * n_chip_haps + s * 2] = gt[s][0];
-                    alleles[out_i * n_chip_haps + s * 2 + 1] = gt[s][1];
+        // Extract chip alleles at shared positions from SRP tiles
+        let ref_bm = chip_srp.extract_ref_alleles_bitmatrix(&ci);
+        let mut alleles = vec![0u8; n_shared * n_chip_haps];
+        for vi in 0..n_shared {
+            let row = ref_bm.row(vi);
+            for h in 0..n_chip_haps {
+                let word = h / 64;
+                let bit = h % 64;
+                if word < ref_bm.n_words() && (row[word] >> bit) & 1 != 0 {
+                    alleles[vi * n_chip_haps + h] = 1;
                 }
             }
         }
-        alleles
+        chip_alleles = alleles;
+        wgs_idx = wi;
+
+        // Chip-only variants
+        let shared_chip_set: std::collections::BTreeSet<usize> = ci.iter().copied().collect();
+        chip_only_indices = (0..n_chip_variants).filter(|i| !shared_chip_set.contains(i)).collect::<Vec<_>>();
+        n_chip_only = chip_only_indices.len();
+
+        // Extract chip-only alleles from SRP
+        chip_only_alleles = if n_chip_only > 0 {
+            let co_bm = chip_srp.extract_ref_alleles_bitmatrix(&chip_only_indices);
+            let mut co_alleles = vec![0u8; n_chip_only * n_chip_haps];
+            for vi in 0..n_chip_only {
+                let row = co_bm.row(vi);
+                for h in 0..n_chip_haps {
+                    let word = h / 64;
+                    let bit = h % 64;
+                    if word < co_bm.n_words() && (row[word] >> bit) & 1 != 0 {
+                        co_alleles[vi * n_chip_haps + h] = 1;
+                    }
+                }
+            }
+            co_alleles
+        } else { Vec::new() };
     } else {
-        Vec::new()
-    };
+        // VCF/BCF chip input — original path
+        let (cs, cm, cg, cip) =
+            crate::io::target_io::read_target_vcf(chip_path.to_str().unwrap_or(""), &wgs);
+        n_chip_samples = cs.len();
+        n_chip_haps = n_chip_samples * 2;
+        chip_markers = cm;
+        selphi_info!("  Chip (VCF): {} samples ({} haps), {} variants, phased={}",
+            n_chip_samples, n_chip_haps, chip_markers.len(), cip);
+
+        let (wi, ci) = crate::io::target_io::intersect_variants(&wgs, &chip_markers);
+        n_shared = wi.len();
+        selphi_info!("  Shared variants: {} ({:.1}% of chip)",
+            n_shared, n_shared as f64 / chip_markers.len() as f64 * 100.0);
+
+        if n_shared == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                "No shared variants between WGS panel and chip data"));
+        }
+
+        chip_alleles = if !cip {
+            selphi_step!("Phasing chip data using WGS reference...");
+            let ref_bm = wgs.extract_ref_alleles_bitmatrix(&wi);
+            let n_chip_vars = wi.len();
+            let targ_alleles = crate::io::target_io::extract_target_alleles(
+                &cg, &ci, n_chip_vars, n_chip_haps);
+
+            let chip_bps: Vec<i64> = wi.iter().map(|&wii| wgs.variants[wii].pos).collect();
+            let ref_bp: Vec<i64> = wgs.variants.iter().map(|v| v.pos).collect();
+            let (map_bp, map_cm) = crate::genmap::load_genetic_map_raw(map_path)?;
+            let chip_cm: Vec<f64> = chip_bps.iter().map(|&bp| {
+                crate::genmap::interpolate_cm(&map_bp, &map_cm, bp)
+            }).collect();
+
+            let (phased, _ne, _sw) = crate::haploid::phase_genotypes(
+                &targ_alleles, &ref_bm, &chip_cm, &chip_bps,
+                &ref_bp, &map_bp, &map_cm,
+                n_chip_vars, n_chip_samples, n_wgs_haps,
+                33, threads, 0,
+            );
+            selphi_step!("Chip phasing complete");
+            phased
+        } else {
+            crate::io::target_io::extract_target_alleles(
+                &cg, &ci, n_shared, n_chip_haps)
+        };
+        wgs_idx = wi;
+
+        let shared_chip_set: std::collections::BTreeSet<usize> = ci.iter().copied().collect();
+        chip_only_indices = (0..chip_markers.len()).filter(|i| !shared_chip_set.contains(i)).collect::<Vec<_>>();
+        n_chip_only = chip_only_indices.len();
+
+        chip_only_alleles = if n_chip_only > 0 {
+            let mut alleles = vec![0u8; n_chip_only * n_chip_haps];
+            for (out_i, &chip_i) in chip_only_indices.iter().enumerate() {
+                if chip_i < cg.len() {
+                    let gt = &cg[chip_i];
+                    for s in 0..n_chip_samples.min(gt.len()) {
+                        alleles[out_i * n_chip_haps + s * 2] = gt[s][0];
+                        alleles[out_i * n_chip_haps + s * 2 + 1] = gt[s][1];
+                    }
+                }
+            }
+            alleles
+        } else {
+            Vec::new()
+        };
+    }
 
     // Chip-only variant metadata
     let chip_only_variants: Vec<super::Variant> = chip_only_indices.iter()
@@ -268,6 +348,9 @@ fn write_merged_srp(
     w.write_all(&ids_c)?;
     w.write_all(&(orig_c.len() as u32).to_le_bytes())?;
     w.write_all(&orig_c)?;
+    // NOTE: contig is NOT compressed, to stay compatible with SRP readers that
+    // expect an uncompressed 4-byte-length-prefixed contig name at this offset.
+    // Compressing it without bumping the SRP magic would cause silent corruption.
     w.write_all(&(contig_bytes.len() as u32).to_le_bytes())?;
     w.write_all(contig_bytes)?;
 
@@ -349,7 +432,7 @@ fn write_merged_srp(
         let n_rows = row_end - row_start;
 
         // Build tiles for this stripe in parallel across bands
-        let tiles: Vec<(usize, Vec<u8>)> = (0..n_tile_cols_aug).into_par_iter().map(|band| {
+        let tiles: io::Result<Vec<(usize, Vec<u8>)>> = (0..n_tile_cols_aug).into_par_iter().map(|band| {
             let col_start = band * TILE_COLS;
             let col_end = (col_start + TILE_COLS).min(n_chip_haps);
             let n_cols = col_end - col_start;
@@ -372,9 +455,11 @@ fn write_merged_srp(
             let tile = SparseTile {
                 indptr, indices, n_rows: n_rows as u16, n_cols: n_cols as u16,
             };
-            let compressed = zstd::encode_all(Cursor::new(&tile.to_bytes()), 3).unwrap();
-            (band, compressed)
+            let compressed = zstd::encode_all(Cursor::new(&tile.to_bytes()), 3)
+                .map_err(io::Error::other)?;
+            Ok((band, compressed))
         }).collect();
+        let tiles = tiles?;
 
         for (band, compressed) in tiles {
             let idx = aug_stripe * n_tile_cols_aug + band;
