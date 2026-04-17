@@ -591,6 +591,12 @@ pub fn merge_samples_single_chr(
     w.write_all(&(contig_c.len() as u32).to_le_bytes())?;
     w.write_all(&contig_c)?;
 
+    // Chunk index (required by SrpReader::open between contig and tile index).
+    // merge_samples_single_chr produces tile-only panels — no CSC chunks —
+    // so write n_chunks=0 here. Missing this section made the reader read
+    // n_tiles in place of n_chunks and seek to an invalid offset (EINVAL).
+    w.write_all(&0u32.to_le_bytes())?;
+
     // Tile index placeholder
     w.write_all(&(n_tiles as u32).to_le_bytes())?;
     let tile_index_pos = w.stream_position()?;

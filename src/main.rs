@@ -74,6 +74,13 @@ struct Args {
     #[arg(long, alias = "force-unphased")]
     force_phasing: bool,
 
+    /// Target-Augmented Dynamic Panel (TADP) scaffold file. If the path exists,
+    /// its haplotypes join the PBWT candidate pool via nearest-WGS bridging (no
+    /// change to HMM emission). After imputation, the phased target haps of
+    /// this run are appended to the scaffold for subsequent runs.
+    #[arg(long)]
+    augment_scaffold: Option<String>,
+
     /// Enable verbose debug output (all internal diagnostics)
     #[arg(long)]
     debug: bool,
@@ -795,6 +802,59 @@ fn main() {
     if chip_cm.len() > 1000 { selphi_debug!("  RS cm_ld[1000]={:.15}", chip_cm[1000]); }
     selphi_step!("Genetic map loaded + LD correction");
 
+    // 6d. Target-Augmented Dynamic Panel (TADP). When --augment-scaffold is
+    // given, the scaffold haplotypes join the PBWT candidate pool via a
+    // nearest-WGS bridge; HMM emission stays WGS-only. New scaffold files are
+    // created on first use so the same path can be reused across batch runs.
+    struct ScaffoldCtx {
+        n_haps: usize,
+        bridge: Vec<u32>,
+        path: PathBuf,
+    }
+    let (ref_bm_imp, scaffold_ctx) = if let Some(ref sp) = args.augment_scaffold {
+        let path = PathBuf::from(sp);
+        let chr = srp.chromosome().to_string();
+        if !path.exists() {
+            selphi::srp::scaffold::ScaffoldWriter::create(&path, &chr, n_chip)
+                .expect("Failed to create scaffold file")
+                .flush()
+                .expect("Failed to flush new scaffold header");
+            selphi_step!("Scaffold created (empty): {}", path.display());
+        }
+        let scaffold = selphi::srp::scaffold::ScaffoldReader::open(&path)
+            .expect("Failed to open scaffold");
+        if scaffold.n_chip_vars() != n_chip {
+            selphi_error!("Scaffold chip var count ({}) != target chip count ({}). \
+                           Scaffold was built from a different panel/target pair.",
+                          scaffold.n_chip_vars(), n_chip);
+            std::process::exit(1);
+        }
+        let n_scaffold = scaffold.n_haps();
+        if n_scaffold == 0 {
+            selphi_step!("Scaffold: empty (first batch, will be populated after this run)");
+            let _ = chr;
+            (ref_bm_imp, Some(ScaffoldCtx {
+                n_haps: 0, bridge: Vec::new(), path,
+            }))
+        } else {
+            let t0 = Instant::now();
+            let bridge = selphi::imputation::tadp::build_scaffold_to_wgs_bridge(
+                &scaffold, &ref_bm_imp, n_ref);
+            let extended = selphi::imputation::tadp::extend_bitmatrix_with_scaffold(
+                &ref_bm_imp, &scaffold);
+            selphi_step!("Scaffold: {} haps bridged to {} WGS; extended bitmatrix {:.1} MB [{:.1}s]",
+                n_scaffold, n_ref,
+                (extended.n_words() * n_chip * 8) as f64 / 1e6,
+                t0.elapsed().as_secs_f64());
+            let _ = chr;
+            (extended, Some(ScaffoldCtx {
+                n_haps: n_scaffold, bridge, path,
+            }))
+        }
+    } else {
+        (ref_bm_imp, None)
+    };
+
 
     // 7. Auto-calibrate parameters
     let match_length = args.match_length.unwrap_or_else(|| {
@@ -1074,6 +1134,8 @@ fn main() {
         let hmm_params = selphi::imputation::window_process::WindowHmmParams {
             n_ref, n_haps, match_length, fl_fwd, fl_bwd,
             est_ne: est_ne as f64, p_err, max_candidates,
+            n_scaffold: scaffold_ctx.as_ref().map(|s| s.n_haps).unwrap_or(0),
+            scaffold_bridge: scaffold_ctx.as_ref().map(|s| s.bridge.as_slice()),
         };
         let inputs = selphi::imputation::window_process::ImputeWindowInputs {
             ref_bm: &ref_bm_imp,
@@ -1142,9 +1204,10 @@ fn main() {
 
     }
 
-    // Free imputation data structures before indexing/evaluation
+    // Free imputation data structures before indexing/evaluation.
+    // targ_alleles is only freed up-front when no scaffold is active — with
+    // TADP the append hook below still needs the phased chip bits.
     drop(srp);
-    drop(targ_alleles);
     drop(wgs_idx);
     drop(chip_cm);
     drop(sample_names);
@@ -1211,6 +1274,20 @@ fn main() {
                 selphi_info!("  No shared samples — skipping evaluation");
             }
         }
+    }
+
+    // TADP: append this run's phased target haps to the scaffold so the next
+    // batch sees them. Append happens after imputation + evaluation so that
+    // any eval regression aborts before polluting the scaffold.
+    if let Some(ref ctx) = scaffold_ctx {
+        let t0 = Instant::now();
+        let mut w = selphi::srp::scaffold::ScaffoldWriter::open_append(&ctx.path)
+            .expect("Failed to open scaffold for append");
+        selphi::imputation::tadp::append_batch_to_scaffold(&mut w, &targ_alleles, n_chip, n_haps)
+            .expect("Failed to append target haps to scaffold");
+        w.flush().expect("Failed to flush scaffold after append");
+        selphi_step!("Scaffold: appended {} haps ({} → {} total) [{:.1}s]",
+            n_haps, ctx.n_haps, w.n_haps(), t0.elapsed().as_secs_f64());
     }
 
     let total = start_time.elapsed().as_secs_f64();
