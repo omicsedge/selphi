@@ -404,6 +404,8 @@ pub fn run_multi_chr(
             n_ref, n_haps, match_length, fl_fwd, fl_bwd,
             est_ne: est_ne as f64, p_err: config.p_err,
             max_candidates: config.max_candidates,
+            n_scaffold: 0,
+            scaffold_bridge: None,
         };
 
         for (wi, window) in windows.iter().enumerate() {
