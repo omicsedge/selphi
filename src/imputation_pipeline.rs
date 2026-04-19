@@ -290,82 +290,6 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     if chip_cm.len() > 1000 { selphi_debug!("  RS cm_ld[1000]={:.15}", chip_cm[1000]); }
     selphi_step!("Genetic map loaded + LD correction");
 
-    // 6d. Target-Augmented Dynamic Panel (TADP). When --augment-scaffold is
-    // given, the scaffold haplotypes join the PBWT candidate pool via a
-    // nearest-WGS bridge; HMM emission stays WGS-only. New scaffold files are
-    // created on first use so the same path can be reused across batch runs.
-    struct ScaffoldCtx {
-        n_haps: usize,
-        bridge: Vec<u32>,
-        path: PathBuf,
-    }
-    let (ref_bm_imp, scaffold_ctx) = if let Some(ref sp) = args.augment_scaffold {
-        let path = PathBuf::from(sp);
-        let chr = srp.chromosome().to_string();
-        // Compute chip digest over the subset of panel variants shared with
-        // the target (in wgs_idx order). Same computation on every batch with
-        // the same target chip → same digest; mismatch implies cohort or
-        // chip-version drift.
-        let chip_digest = selphi::srp::scaffold::compute_chip_digest(
-            wgs_idx.iter().map(|&wi| {
-                let v = &srp.variants[wi];
-                (v.chr.as_str(), v.pos, v.ref_allele.as_str(), v.alt_allele.as_str())
-            })
-        );
-        if !path.exists() {
-            selphi::srp::scaffold::ScaffoldWriter::create(&path, &chr, n_chip, &chip_digest)
-                .expect("Failed to create scaffold file")
-                .flush()
-                .expect("Failed to flush new scaffold header");
-            selphi_step!("Scaffold created (empty): {}", path.display());
-        }
-        let scaffold = selphi::srp::scaffold::ScaffoldReader::open(&path)
-            .expect("Failed to open scaffold");
-        if scaffold.chromosome() != chr {
-            selphi_error!("Scaffold chromosome ({}) != panel chromosome ({}).",
-                          scaffold.chromosome(), chr);
-            std::process::exit(1);
-        }
-        if scaffold.n_chip_vars() != n_chip {
-            selphi_error!("Scaffold chip var count ({}) != target chip count ({}).",
-                          scaffold.n_chip_vars(), n_chip);
-            std::process::exit(1);
-        }
-        if scaffold.chip_digest() != chip_digest {
-            selphi_error!("Scaffold chip digest ({}) != current ({}). \
-                           Scaffold built from a different panel/chip version — refusing \
-                           to reuse it (would corrupt PBWT candidate selection).",
-                          scaffold.chip_digest(), chip_digest);
-            std::process::exit(1);
-        }
-        let n_scaffold = scaffold.n_haps();
-        if n_scaffold == 0 {
-            selphi_step!("Scaffold: empty (first batch, will be populated after this run)");
-            (ref_bm_imp, Some(ScaffoldCtx {
-                n_haps: 0, bridge: Vec::new(), path,
-            }))
-        } else {
-            let t0 = Instant::now();
-            // Incremental bridge via sidecar cache: only recompute for haps
-            // appended since the last run.
-            let bridge = selphi::imputation::tadp::load_or_extend_bridge(
-                &path, &scaffold, &ref_bm_imp, n_ref,
-            ).expect("Failed to build/extend scaffold bridge");
-            let extended = selphi::imputation::tadp::extend_bitmatrix_with_scaffold(
-                &ref_bm_imp, &scaffold);
-            selphi_step!("Scaffold: {} haps bridged to {} WGS; extended bitmatrix {:.1} MB [{:.1}s]",
-                n_scaffold, n_ref,
-                (extended.n_words() * n_chip * 8) as f64 / 1e6,
-                t0.elapsed().as_secs_f64());
-            (extended, Some(ScaffoldCtx {
-                n_haps: n_scaffold, bridge, path,
-            }))
-        }
-    } else {
-        (ref_bm_imp, None)
-    };
-
-
     // 7. Auto-calibrate parameters
     let match_length = args.match_length.unwrap_or_else(|| {
         let ml = (n_ref as f64).log2() as usize - 7;
@@ -517,20 +441,107 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // per-window recompute against the shared CodedSteps is cheap.
     let precomp_bytes: u64 = (n_haps as u64) * (args.max_candidates as u64) * 4;
     let precomp_cap_bytes: u64 = 2 * 1024 * 1024 * 1024;
+    // Load optional ancestry context for PBWT candidate reweighting.
+    let panel_anc: Option<Vec<u8>> = if let Some(p) = args.panel_ancestry.as_deref() {
+        Some(selphi::imputation::ancestry::load_panel_ancestry(Path::new(p), &srp.sample_ids)
+            .expect("Failed to parse --panel-ancestry TSV"))
+    } else { None };
+    let target_anc: Option<Vec<f32>> = if let Some(p) = args.target_ancestry.as_deref() {
+        Some(selphi::imputation::ancestry::load_target_ancestry(Path::new(p), &sample_names)
+            .expect("Failed to parse --target-ancestry TSV"))
+    } else { None };
+    let ancestry_active = panel_anc.is_some() && target_anc.is_some();
+    if ancestry_active {
+        selphi_step!(
+            "Ancestry-aware PBWT active (strength={:.2})", args.ancestry_strength
+        );
+    } else if panel_anc.is_some() || target_anc.is_some() {
+        selphi_info!("  Note: both --panel-ancestry and --target-ancestry are required to activate ancestry reweighting; running baseline.");
+    }
+
     let precomputed_candidates: Option<Vec<Vec<u32>>> = if needs_phasing && precomp_bytes <= precomp_cap_bytes {
         let t0_cand = Instant::now();
         let coded_full = selphi::imputation::pbwt::build_coded_steps_bm(
             &ref_bm_imp, 0, n_chip, n_ref, &targ_alleles, n_haps, &chip_cm, 0.05,
         );
         let max_cand = args.max_candidates;
+
+        // If --local-ancestry is set and we have panel labels, infer local
+        // ancestry directly from coded_full (no neural net, no external tool).
+        // This is the PBWT-native alternative to Orchestra's base+smoother
+        // architecture: the same coded-steps structure we need for PBWT
+        // candidate selection also gives us per-step ancestry probabilities.
+        let local_anc = if args.local_ancestry && panel_anc.is_some() {
+            let t0 = Instant::now();
+            let mut la = selphi::imputation::ancestry::infer_local_ancestry(
+                &coded_full,
+                n_ref,
+                n_haps,
+                panel_anc.as_deref().unwrap(),
+            );
+            if args.local_ancestry_smooth > 0 {
+                selphi::imputation::ancestry::smooth_local_ancestry(
+                    &mut la, args.local_ancestry_smooth,
+                );
+            }
+            selphi_step!(
+                "Local ancestry inferred (PBWT-native): {} haps × {} steps (smooth r={}) [{:.1}s]",
+                la.n_haps, la.n_steps, args.local_ancestry_smooth,
+                t0.elapsed().as_secs_f64(),
+            );
+            if args.export_local_ancestry {
+                let tsv_path = PathBuf::from(output_path).with_extension("local_ancestry.tsv");
+                if let Err(e) = la.write_tsv(&tsv_path) {
+                    selphi_error!("Failed to write local ancestry TSV: {}", e);
+                } else {
+                    selphi_info!("  Local ancestry TSV: {}", tsv_path.display());
+                }
+            }
+            Some(la)
+        } else { None };
+
+        // Build ancestry context: prefer local if computed, else fall back
+        // to global per-sample probs when --target-ancestry was passed.
+        // Uniform dummy target_hap_probs (length n_haps * N_POPS of zeros)
+        // is only read when `local` is None; keep a zero vector around so
+        // the slice is always valid.
+        let n_pops = selphi::imputation::ancestry::N_POPS;
+        let zeros_vec = vec![0.0f32; n_haps * n_pops];
+        let anc_ctx = if args.local_ancestry && panel_anc.is_some() && local_anc.is_some() {
+            Some(selphi::imputation::ancestry::AncestryContext {
+                panel_hap_pop: panel_anc.as_deref().unwrap(),
+                target_hap_probs: target_anc.as_deref().unwrap_or(&zeros_vec),
+                local: local_anc.as_ref(),
+                strength: args.ancestry_strength,
+            })
+        } else if ancestry_active {
+            Some(selphi::imputation::ancestry::AncestryContext {
+                panel_hap_pop: panel_anc.as_deref().unwrap(),
+                target_hap_probs: target_anc.as_deref().unwrap(),
+                local: None,
+                strength: args.ancestry_strength,
+            })
+        } else { None };
+
         let candidates: Vec<Vec<u32>> = (0..n_haps)
             .into_par_iter()
             .map(|tgt| {
-                selphi::imputation::pbwt::select_candidates(&coded_full, n_ref + tgt, n_ref, 7, max_cand)
+                selphi::imputation::pbwt::select_candidates_weighted(
+                    &coded_full,
+                    n_ref + tgt,
+                    n_ref,
+                    7,
+                    max_cand,
+                    anc_ctx.as_ref(),
+                    tgt,
+                )
             })
             .collect();
-        selphi_debug!("  Pre-computed candidates: {} haps, {:.1}s (phasing-refined)",
-            n_haps, t0_cand.elapsed().as_secs_f64());
+        let mode = if local_anc.is_some() { "local" }
+            else if ancestry_active { "global" }
+            else { "none" };
+        selphi_debug!("  Pre-computed candidates: {} haps, {:.1}s (phasing-refined, ancestry={})",
+            n_haps, t0_cand.elapsed().as_secs_f64(), mode);
         Some(candidates)
     } else {
         None
@@ -629,8 +640,6 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         let hmm_params = selphi::imputation::window_process::WindowHmmParams {
             n_ref, n_haps, match_length, fl_fwd, fl_bwd,
             est_ne: est_ne as f64, p_err, max_candidates,
-            n_scaffold: scaffold_ctx.as_ref().map(|s| s.n_haps).unwrap_or(0),
-            scaffold_bridge: scaffold_ctx.as_ref().map(|s| s.bridge.as_slice()),
             compute_posterior: wi + 1 < windows.len(),
         };
         let inputs = selphi::imputation::window_process::ImputeWindowInputs {
@@ -714,8 +723,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     }
 
     // Free imputation data structures before indexing/evaluation.
-    // targ_alleles is only freed up-front when no scaffold is active — with
-    // TADP the append hook below still needs the phased chip bits.
+    drop(targ_alleles);
     drop(srp);
     drop(wgs_idx);
     drop(chip_cm);
@@ -790,20 +798,6 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                 selphi_info!("  (evaluation requires VCF/BCF output; got {})", imp_s);
             }
         }
-    }
-
-    // TADP: append this run's phased target haps to the scaffold so the next
-    // batch sees them. Append happens after imputation + evaluation so that
-    // any eval regression aborts before polluting the scaffold.
-    if let Some(ref ctx) = scaffold_ctx {
-        let t0 = Instant::now();
-        let mut w = selphi::srp::scaffold::ScaffoldWriter::open_append(&ctx.path)
-            .expect("Failed to open scaffold for append");
-        selphi::imputation::tadp::append_batch_to_scaffold(&mut w, &targ_alleles, n_chip, n_haps)
-            .expect("Failed to append target haps to scaffold");
-        w.flush().expect("Failed to flush scaffold after append");
-        selphi_step!("Scaffold: appended {} haps ({} → {} total) [{:.1}s]",
-            n_haps, ctx.n_haps, w.n_haps(), t0.elapsed().as_secs_f64());
     }
 
     let total = start_time.elapsed().as_secs_f64();

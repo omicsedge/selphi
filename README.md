@@ -129,32 +129,6 @@ selphi --refpanel-dir panels/ --input whole_genome.vcf.gz --map-dir maps/ --out 
 
 Only one chromosome is held in memory at a time. Peak memory equals that of the largest single chromosome plus a small prefetch buffer (~200 MB) for the next chromosome.
 
-### Target-Augmented Dynamic Panel (TADP)
-
-When imputing a large cohort in batches, each already-phased batch can
-rejoin the reference panel for the next batch — at chip positions only,
-append-only, no panel rewrite. The scaffold is a single growable file
-that holds chip-position bits per target hap; during imputation its haps
-join the PBWT candidate pool and are bridged to their nearest WGS hap
-before HMM emission (so there is no "missing data at WGS-only sites").
-
-```bash
-# First batch creates the scaffold if it doesn't exist
-selphi --refpanel panel.srp --input batch1.vcf.gz --map chr.map \
-       --out batch1_imp --augment-scaffold scaffold.scf
-
-# Next batch reuses it automatically
-selphi --refpanel panel.srp --input batch2.vcf.gz --map chr.map \
-       --out batch2_imp --augment-scaffold scaffold.scf
-
-# ... and so on; scaffold grows linearly
-```
-
-Append cost is O(chip_vars × new_haps / 8) — microseconds and tens of KB
-per batch of 100 samples. Per-batch runtime overhead over a plain
-imputation is seconds, not minutes. Omitting `--augment-scaffold`
-restores the standard WGS-only pipeline bit-for-bit.
-
 ### Reference panel preparation
 
 Create an SRP reference panel from VCF, BCF, or BREF3. The source format is auto-detected.
@@ -343,7 +317,6 @@ Standard VCF or BCF. Unphased (`0/1`) or phased (`0|1`) genotypes. Multi-allelic
 | **Multi-chromosome** | | |
 | `--refpanel-dir DIR` | Directory with per-chr SRP files (auto-merges into a temp multi-chr SRP under `/data/tmp/`, then runs the native in-process multi-chr orchestrator) | |
 | `--map-dir DIR` | Directory with per-chr genetic maps. Auto-discovers common naming patterns. Alternative to `--map` | |
-| `--augment-scaffold PATH` | Target-Augmented Dynamic Panel scaffold file. Created on first use, then grown append-only between batches. | |
 | `--merge-srps PATHS` | Merge SRP files (comma-separated). Auto-detects mode: per-chr files with same samples → multi-chromosome SRP; same-chr files with different samples → horizontal merge | |
 | `--merge-srps-dir DIR` | Merge all SRP files from a directory into multi-chromosome SRP | |
 | **Reference panel** | | |

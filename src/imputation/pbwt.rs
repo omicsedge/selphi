@@ -766,6 +766,30 @@ pub fn select_candidates(
     _n_consecutive: usize, // unused (kept for API compat)
     max_candidates: usize, // cap (default 2000)
 ) -> Vec<u32> {
+    select_candidates_weighted(coded, target_hap, n_ref, _n_consecutive, max_candidates, None, 0)
+}
+
+/// Variant with ancestry-aware rescoring.
+///
+/// When `ancestry` is `Some`, every raw PBWT match hit is counted as
+/// `ancestry.score(tgt_local, h)` instead of 1. Candidates are then sorted
+/// by the re-weighted count. When the number of candidates fits inside
+/// `max_candidates`, ancestry still affects the returned sort order so the
+/// top-K slice used downstream is ancestry-biased.
+///
+/// `tgt_local` is the target's haplotype index in the ancestry table
+/// (0..n_target_haps), distinct from `target_hap` which is absolute in the
+/// PBWT coded steps.
+#[allow(clippy::too_many_arguments)]
+pub fn select_candidates_weighted(
+    coded: &CodedSteps,
+    target_hap: usize,
+    n_ref: usize,
+    _n_consecutive: usize,
+    max_candidates: usize,
+    ancestry: Option<&crate::imputation::ancestry::AncestryContext<'_>>,
+    tgt_local: usize,
+) -> Vec<u32> {
     let n_steps = coded.step_groups.len();
     if n_steps == 0 {
         return Vec::new();
@@ -784,18 +808,36 @@ pub fn select_candidates(
         }
     }
 
-    if candidates.len() > max_candidates {
-        let mut counts = vec![0u16; n_ref];
+    // Ancestry rescoring: rank by (raw match count) × (ancestry multiplier).
+    // Three regimes:
+    //   - None: raw integer counts, no rescoring, no sort unless truncating
+    //   - Some, no local: global target-ancestry vector (same for every step)
+    //   - Some, with local: per-step target-ancestry vector (local ancestry)
+    let need_sort = ancestry.is_some() || candidates.len() > max_candidates;
+    if need_sort {
+        let mut scores = vec![0.0f32; n_ref];
+        let use_local = ancestry.map(|a| a.local.is_some()).unwrap_or(false);
         for s in 0..n_steps {
             let gid = coded.hap_group[s][target_hap] as usize;
             for &h in &coded.step_groups[s][gid] {
                 if (h as usize) < n_ref {
-                    counts[h as usize] += 1;
+                    let w = match ancestry {
+                        None => 1.0,
+                        Some(a) if use_local => a.score_local(tgt_local, h, s),
+                        Some(a) => a.score(tgt_local, h),
+                    };
+                    scores[h as usize] += w;
                 }
             }
         }
-        candidates.sort_unstable_by(|&a, &b| counts[b as usize].cmp(&counts[a as usize]));
-        candidates.truncate(max_candidates);
+        candidates.sort_unstable_by(|&a, &b| {
+            scores[b as usize]
+                .partial_cmp(&scores[a as usize])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if candidates.len() > max_candidates {
+            candidates.truncate(max_candidates);
+        }
     }
 
     candidates.sort_unstable();

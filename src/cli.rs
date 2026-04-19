@@ -54,12 +54,49 @@ pub struct Args {
     #[arg(long, alias = "force-unphased")]
     pub force_phasing: bool,
 
-    /// Target-Augmented Dynamic Panel (TADP) scaffold file. If the path exists,
-    /// its haplotypes join the PBWT candidate pool via nearest-WGS bridging (no
-    /// change to HMM emission). After imputation, the phased target haps of
-    /// this run are appended to the scaffold for subsequent runs.
+    /// Panel ancestry labels (TSV: `sample_id<TAB>super_pop`, 1 header line).
+    /// When both --panel-ancestry and --target-ancestry are provided, PBWT
+    /// candidate selection re-weights raw match scores by ancestry match,
+    /// preferring panel haps of the same super-population as the target hap.
+    /// Supported labels: AFR, EUR, EAS, SAS, AMR. Any other label is treated
+    /// as "unknown" (no weight boost).
     #[arg(long)]
-    pub augment_scaffold: Option<String>,
+    pub panel_ancestry: Option<String>,
+
+    /// Target ancestry probabilities (TSV: `sample_id<TAB>AFR<TAB>EUR<TAB>EAS<TAB>SAS<TAB>AMR`,
+    /// 1 header line). Probabilities per row should sum to ~1. For the MVP
+    /// "global ancestry" mock this is a one-hot vector; the same interface
+    /// will later accept per-window local-ancestry output from Orchestra.
+    #[arg(long)]
+    pub target_ancestry: Option<String>,
+
+    /// How strongly ancestry match biases the PBWT candidate ranking.
+    /// Final per-candidate score = raw_match_count * (1 - strength + strength * ancestry_prob).
+    /// 0.0 disables ancestry weighting (baseline); 1.0 fully replaces by ancestry.
+    /// Default 0.5 = equal blend.
+    #[arg(long, default_value = "0.5")]
+    pub ancestry_strength: f32,
+
+    /// Enable native PBWT-based local ancestry inference. When set,
+    /// --target-ancestry (per-sample global probs) is ignored and instead
+    /// selphi computes per-target-hap × per-PBWT-step ancestry probabilities
+    /// directly from the coded-steps match structure already being built for
+    /// PBWT candidate selection. Requires --panel-ancestry (panel hap labels).
+    /// Orthogonal to --target-ancestry: set one or the other.
+    #[arg(long)]
+    pub local_ancestry: bool,
+
+    /// Export inferred local ancestry to a TSV next to --out. Only active
+    /// when --local-ancestry is set. Format: `hap_idx\tstep\tstart_chip_var\tAFR\tEUR\tEAS\tSAS\tAMR`.
+    #[arg(long)]
+    pub export_local_ancestry: bool,
+
+    /// Moving-average smoothing half-width (in PBWT steps) applied to the
+    /// per-step per-hap ancestry probability matrix. 0 disables smoothing.
+    /// Each step is replaced by the mean of `2*radius + 1` neighbours.
+    /// Default 5 steps ~= ~25 cM chunks on a 1 cM/step build.
+    #[arg(long, default_value = "5")]
+    pub local_ancestry_smooth: usize,
 
     /// Enable verbose debug output (all internal diagnostics)
     #[arg(long)]

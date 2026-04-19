@@ -22,7 +22,6 @@ pub mod csi;
 pub mod tiled;
 pub mod multi_chr_reader;
 pub mod multi_chr_writer;
-pub mod scaffold;
 pub use reader::SrpReader;
 pub use multi_chr_reader::{MultiChrSrpReader, ChrSrpView};
 
