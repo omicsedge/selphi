@@ -323,7 +323,7 @@ Standard VCF or BCF. Unphased (`0/1`) or phased (`0|1`) genotypes. Multi-allelic
 | `--map PATH` | Genetic map in PLINK format (single file or concatenated multi-chr) | required* |
 | `--out PATH` | Output path prefix | required |
 | `--threads N` | Number of threads | all CPUs |
-| `--truth PATH` | Truth VCF/BCF for inline accuracy evaluation | |
+| `--truth PATH` | Truth VCF/BCF — auto-runs post-hoc evaluation after imputation | |
 | `--phasing-engine ENGINE` | `auto`, `haploid`, or `diploid` | `auto` |
 | `--phase-only` | Output phased haplotypes only (skip imputation) | off |
 | `--force-phasing` | Re-phase even if input is already phased | off |
@@ -341,7 +341,7 @@ Standard VCF or BCF. Unphased (`0/1`) or phased (`0|1`) genotypes. Multi-allelic
 | `--index PATH` | Build TBI/CSI index for a VCF.gz or BCF file | |
 | `--index-stats PATH` | Show file statistics and per-contig genomic ranges | |
 | **Multi-chromosome** | | |
-| `--refpanel-dir DIR` | Directory with per-chr SRP files (auto-discovers chromosomes) | |
+| `--refpanel-dir DIR` | Directory with per-chr SRP files (auto-merges into a temp multi-chr SRP under `/data/tmp/`, then runs the native in-process multi-chr orchestrator) | |
 | `--map-dir DIR` | Directory with per-chr genetic maps. Auto-discovers common naming patterns. Alternative to `--map` | |
 | `--augment-scaffold PATH` | Target-Augmented Dynamic Panel scaffold file. Created on first use, then grown append-only between batches. | |
 | `--merge-srps PATHS` | Merge SRP files (comma-separated). Auto-detects mode: per-chr files with same samples → multi-chromosome SRP; same-chr files with different samples → horizontal merge | |

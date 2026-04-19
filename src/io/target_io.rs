@@ -227,9 +227,8 @@ pub fn write_phased_vcf(
     let mut bgzf = w.into_inner().map_err(|e| std::io::Error::other(e.to_string()))?;
     bgzf.finish()?;
 
-    let _ = std::process::Command::new("bcftools")
-        .args(["index", "-f", &output_path.to_string_lossy(), "--threads", "4"])
-        .status();
+    // Build a TBI index natively (no bcftools subprocess).
+    let _ = crate::srp::csi::build_tbi_index(output_path);
 
     Ok(())
 }

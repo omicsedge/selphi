@@ -18,7 +18,6 @@ use selphi::genmap;
 use selphi::imputation::windows::compute_imputation_windows;
 
 /// Configuration for multi-chr imputation (mirrors relevant CLI args).
-#[allow(dead_code)]
 pub struct MultiChrImputeConfig {
     pub threads: usize,
     pub seed: i64,
@@ -31,15 +30,12 @@ pub struct MultiChrImputeConfig {
     pub no_ap: bool,
     pub no_em_ne: bool,
     pub phasing_engine: String,  // "auto", "haploid", "diploid"
-    pub max_cond_haps: usize,
     pub force_phasing: bool,
-    pub max_windows: usize,
     pub bcf: bool,
     pub parquet: bool,
     pub pgen: bool,
     pub selfdecode: bool,
     pub all_formats: bool,
-    pub wgs_phasing: bool,
     pub map_dir: Option<String>,
 }
 
@@ -315,28 +311,12 @@ pub fn run_multi_chr(
             em_ne_per_site
         };
 
-        // Pre-compute candidates if phasing ran
-        let precomputed_candidates: Option<Vec<Vec<u32>>> = if needs_phasing {
-            let m_full = n_ref + n_haps;
-            let mut alleles_full = vec![0u8; n_chip * m_full];
-            for ci in 0..n_chip {
-                let row = ref_bm_imp.row(ci);
-                let ref_dst = &mut alleles_full[ci * m_full..ci * m_full + n_ref];
-                for w in 0..ref_bm_imp.n_words() {
-                    let mut word = row[w];
-                    let base = w * 64;
-                    while word != 0 {
-                        let k = word.trailing_zeros() as usize;
-                        let r = base + k;
-                        if r < n_ref { ref_dst[r] = 1; }
-                        word &= word - 1;
-                    }
-                }
-                alleles_full[ci * m_full + n_ref..ci * m_full + m_full]
-                    .copy_from_slice(&targ_alleles[ci * n_haps..(ci + 1) * n_haps]);
-            }
-            let coded_full = selphi::imputation::pbwt::build_coded_steps(
-                &alleles_full, n_chip, m_full, &chip_cm, 0.05,
+        // Pre-compute candidates if phasing ran. Gate by retention cost.
+        let precomp_bytes: u64 = (n_haps as u64) * (config.max_candidates as u64) * 4;
+        let precomp_cap_bytes: u64 = 2 * 1024 * 1024 * 1024;
+        let precomputed_candidates: Option<Vec<Vec<u32>>> = if needs_phasing && precomp_bytes <= precomp_cap_bytes {
+            let coded_full = selphi::imputation::pbwt::build_coded_steps_bm(
+                &ref_bm_imp, 0, n_chip, n_ref, &targ_alleles, n_haps, &chip_cm, 0.05,
             );
             let max_cand = config.max_candidates;
             let candidates: Vec<Vec<u32>> = (0..n_haps)
@@ -345,7 +325,6 @@ pub fn run_multi_chr(
                     selphi::imputation::pbwt::select_candidates(&coded_full, n_ref + tgt, n_ref, 7, max_cand)
                 })
                 .collect();
-            drop(alleles_full);
             Some(candidates)
         } else {
             None
@@ -400,15 +379,16 @@ pub fn run_multi_chr(
 
         // Per-window imputation loop
         let mut hap_priors: Vec<Option<Vec<f64>>> = vec![None; n_haps];
-        let hmm_params = selphi::imputation::window_process::WindowHmmParams {
-            n_ref, n_haps, match_length, fl_fwd, fl_bwd,
-            est_ne: est_ne as f64, p_err: config.p_err,
-            max_candidates: config.max_candidates,
-            n_scaffold: 0,
-            scaffold_bridge: None,
-        };
 
         for (wi, window) in windows.iter().enumerate() {
+            let hmm_params = selphi::imputation::window_process::WindowHmmParams {
+                n_ref, n_haps, match_length, fl_fwd, fl_bwd,
+                est_ne: est_ne as f64, p_err: config.p_err,
+                max_candidates: config.max_candidates,
+                n_scaffold: 0,
+                scaffold_bridge: None,
+                compute_posterior: wi + 1 < windows.len(),
+            };
             let n_var_w = window.chip_end - window.chip_start;
 
             // Preload stripes for interpolation (runs concurrently with HMM below).
@@ -447,13 +427,27 @@ pub fn run_multi_chr(
             let (cs, os, oe) = (window.chip_start, window.own_chip_start, window.own_chip_end);
 
             selphi::io::pipeline::write_window_multiformat(
-                &formats, &srp, &all_weights, cs, os, oe,
-                &wgs_idx, n_samples, &targ_alleles,
-                config.no_ap, None, preloaded_stripes,
-                None, // parquet per-chr not supported yet in multi-chr mode
-                None, // pgen per-chr not supported yet
-                None, // selfdecode per-chr not supported yet
-                &vcf_tx,
+                &formats,
+                selphi::io::pipeline::WindowInput {
+                    srp: &srp,
+                    all_weights: &all_weights,
+                    win_chip_start: cs,
+                    own_chip_start: os,
+                    own_chip_end: oe,
+                    wgs_idx: &wgs_idx,
+                    n_samples,
+                    chip_genotypes: &targ_alleles,
+                    no_ap: config.no_ap,
+                    preloaded_chunks: None,
+                    preloaded_stripes,
+                },
+                selphi::io::pipeline::WindowWriters {
+                    // Per-chr parquet/pgen/selfdecode not wired yet in multi-chr mode.
+                    parquet: None,
+                    pgen: None,
+                    selfdecode: None,
+                    vcf_tx: &vcf_tx,
+                },
             ).expect("Output write failed");
 
             selphi_info!("    Window {}/{}: {} vars", wi + 1, windows.len(), n_var_w);

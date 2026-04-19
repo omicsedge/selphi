@@ -153,11 +153,34 @@ impl<'a> WindowSetup<'a> {
 }
 
 // Pre-built dosage → byte-slice lookup tables for zero-alloc VCF formatting.
+// DS uses 3-decimal precision to match Beagle/IMPUTE5 output and preserve
+// the imputed f32 dosage. An earlier 2-decimal LUT plus a hardcoded
+// `ap<0.005→DS=0` fast path collapsed ultra-rare dosages to exactly zero,
+// inflating OVERALL R² by ~0.0017 vs the BCF f32 output. AP stays at
+// 2-decimal to keep the paired-index LUT at 101×101 = 10k entries; AP is
+// informational and not used for R² evaluation.
 lazy_static::lazy_static! {
-    /// DS/AP formatting: index 0..200 → b"0", b"0.01", ..., b"2"
+    /// DS formatting: index 0..2000 → b"0", b"0.001", ..., b"2"
     static ref FMT_LUT: Vec<&'static [u8]> = {
-        let mut v: Vec<Vec<u8>> = Vec::with_capacity(201);
-        for i in 0..=200 {
+        let mut v: Vec<Vec<u8>> = Vec::with_capacity(2001);
+        for i in 0..=2000 {
+            let val = i as f64 / 1000.0;
+            if val == val.floor() {
+                v.push(format!("{}", val as i32).into_bytes());
+            } else {
+                let s = format!("{:.3}", val);
+                // Strip trailing zeros but keep at least one decimal digit.
+                let s = s.trim_end_matches('0').trim_end_matches('.').to_string();
+                v.push(s.into_bytes());
+            }
+        }
+        v.into_iter().map(|b| &*Box::leak(b.into_boxed_slice())).collect()
+    };
+
+    /// AP formatting (2-decimal): index 0..100 → b"0", b"0.01", ..., b"1"
+    static ref FMT_LUT_AP: Vec<&'static [u8]> = {
+        let mut v: Vec<Vec<u8>> = Vec::with_capacity(101);
+        for i in 0..=100 {
             let val = i as f64 / 100.0;
             if val == val.floor() {
                 v.push(format!("{}", val as i32).into_bytes());
@@ -176,8 +199,8 @@ lazy_static::lazy_static! {
         for g1 in 0..2u8 {
             let mut mid = Vec::with_capacity(2);
             for g2 in 0..2u8 {
-                let mut inner = Vec::with_capacity(201);
-                for ds in 0..=200 {
+                let mut inner = Vec::with_capacity(2001);
+                for ds in 0..=2000 {
                     let s = format!("{}|{}:{}", g1, g2, std::str::from_utf8(FMT_LUT[ds]).unwrap());
                     inner.push(&*Box::leak(s.into_bytes().into_boxed_slice()));
                 }
@@ -194,8 +217,8 @@ lazy_static::lazy_static! {
         for a1 in 0..=100 {
             let mut inner = Vec::with_capacity(101);
             for a2 in 0..=100 {
-                let s = format!(":{}:{}", std::str::from_utf8(FMT_LUT[a1]).unwrap(),
-                                          std::str::from_utf8(FMT_LUT[a2]).unwrap());
+                let s = format!(":{}:{}", std::str::from_utf8(FMT_LUT_AP[a1]).unwrap(),
+                                          std::str::from_utf8(FMT_LUT_AP[a2]).unwrap());
                 inner.push(&*Box::leak(s.into_bytes().into_boxed_slice()));
             }
             outer.push(inner);
@@ -227,7 +250,7 @@ pub fn setup_vcf_writer(
     };
 
     let out_file = std::fs::File::create(&vcf_path)?;
-    let bgzip_threads = 16.min(n_samples.max(1));
+    let bgzip_threads = 4.min(n_samples.max(1));
     let bgzf_writer = noodles_bgzf::io::multithreaded_writer::Builder::default()
         .set_worker_count(std::num::NonZeroUsize::new(bgzip_threads).unwrap())
         .build_from_writer(out_file);
@@ -235,7 +258,11 @@ pub fn setup_vcf_writer(
     let tbi_path = { let mut p = vcf_path.as_os_str().to_owned(); p.push(".tbi"); std::path::PathBuf::from(p) };
     let vcf_path_clone = vcf_path.clone();
 
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+    // Channel buffer sized adaptively: at biobank scale each VCF tile is ~300 MB
+    // of text (5000 samples × 4096 variants). 64 tiles in flight = 19 GB waste.
+    // 4 is enough to keep the writer fed without starving compute.
+    let channel_depth = if n_samples >= 1000 { 4 } else { 16 };
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(channel_depth);
     let writer_handle = std::thread::spawn(move || -> std::io::Result<()> {
         let mut writer = BufWriter::with_capacity(4 << 20, bgzf_writer);
         // Collect record metadata for post-write index building
@@ -461,7 +488,11 @@ fn format_tile_batch(
                     buf.extend_from_slice(b";IMP\tGT:DS:AP1:AP2");
                 }
 
-                // Pre-computed constant strings for trivial dosages (>95% of samples for rare variants)
+                // Pre-computed constant strings for trivial dosages.
+                // Narrowed to match 3-decimal DS precision: the fast path now
+                // only fires for dosages that would round to exactly 0 (or 2)
+                // at 3 decimals, so it preserves ultra-rare probabilities
+                // instead of collapsing them to the hom-ref integer.
                 const HOMREF_GTDS: &[u8] = b"\t0|0:0";
                 const HOMREF_GTDS_AP: &[u8] = b"\t0|0:0:0:0";
                 const HOMALT_GTDS: &[u8] = b"\t1|1:2";
@@ -471,21 +502,21 @@ fn format_tile_batch(
                     let ap1 = alt_probs[(s * 2) * tile_n + v];
                     let ap2 = alt_probs[(s * 2 + 1) * tile_n + v];
 
-                    // Fast path: trivial dosage (hom-ref or hom-alt) — skip all float formatting
-                    if ap1 < 0.005 && ap2 < 0.005 {
+                    // Fast path: dosage rounds exactly to 0 or 2 at 3-decimal precision.
+                    if ap1 < 0.0005 && ap2 < 0.0005 {
                         buf.extend_from_slice(if no_ap { HOMREF_GTDS } else { HOMREF_GTDS_AP });
                         continue;
                     }
-                    if ap1 > 0.995 && ap2 > 0.995 {
+                    if ap1 > 0.9995 && ap2 > 0.9995 {
                         buf.extend_from_slice(if no_ap { HOMALT_GTDS } else { HOMALT_GTDS_AP });
                         continue;
                     }
 
-                    // Standard path: format via lookup tables
+                    // Standard path: format via lookup tables (DS 3-dec, AP 2-dec)
                     let ds = ap1 + ap2;
                     let gt1 = if ap1 > 0.5 { 1usize } else { 0 };
                     let gt2 = if ap2 > 0.5 { 1usize } else { 0 };
-                    let ds_idx = ((ds * 100.0).round() as usize).min(200);
+                    let ds_idx = ((ds * 1000.0).round() as usize).min(2000);
                     buf.push(b'\t');
                     buf.extend_from_slice(GTDS_LUT_B[gt1][gt2][ds_idx]);
                     if !no_ap {
@@ -584,7 +615,7 @@ pub fn setup_bcf_writer(
     };
 
     let out_file = std::fs::File::create(&bcf_path)?;
-    let bgzip_threads = 16.min(n_samples.max(1));
+    let bgzip_threads = 4.min(n_samples.max(1));
     let bgzf_writer = noodles_bgzf::io::multithreaded_writer::Builder::default()
         .set_worker_count(std::num::NonZeroUsize::new(bgzip_threads).unwrap())
         .build_from_writer(out_file);
@@ -593,7 +624,11 @@ pub fn setup_bcf_writer(
     let _csi_path = bcf_path.with_extension("bcf.csi");
     let bcf_path_clone = bcf_path.clone();
 
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+    // Channel buffer sized adaptively: at biobank scale each VCF tile is ~300 MB
+    // of text (5000 samples × 4096 variants). 64 tiles in flight = 19 GB waste.
+    // 4 is enough to keep the writer fed without starving compute.
+    let channel_depth = if n_samples >= 1000 { 4 } else { 16 };
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(channel_depth);
     let writer_handle = std::thread::spawn(move || -> std::io::Result<()> {
         let mut writer = BufWriter::with_capacity(4 << 20, bgzf_writer);
         for buf in rx {
@@ -716,6 +751,7 @@ fn fill_chip_pgen(
     }
 }
 
+
 /// Fill chip genotypes for SelfDecode output (gt1/gt2 as i32).
 #[inline]
 fn fill_chip_sd(
@@ -733,27 +769,45 @@ fn fill_chip_sd(
 // ---------------------------------------------------------------------------
 
 
+/// Per-window data inputs (refpanel slice, weights, chip GT, preloaded SRP
+/// pieces). Grouped to keep `write_window_multiformat` readable.
+pub struct WindowInput<'a> {
+    pub srp: &'a Arc<SrpReader>,
+    pub all_weights: &'a [Vec<(usize, CsrWeights)>],
+    pub win_chip_start: usize,
+    pub own_chip_start: usize,
+    pub own_chip_end: usize,
+    pub wgs_idx: &'a [usize],
+    pub n_samples: usize,
+    pub chip_genotypes: &'a [u8],
+    pub no_ap: bool,
+    pub preloaded_chunks: Option<Vec<Option<crate::srp::CscChunk>>>,
+    pub preloaded_stripes: Option<crate::srp::tiled::PreloadedStripes>,
+}
+
+/// Active output sinks. Only the ones requested by `OutputFormats` are
+/// populated; the others stay `None`.
+pub struct WindowWriters<'a> {
+    pub parquet: Option<(&'a mut parquet::arrow::ArrowWriter<std::fs::File>, &'a Arc<arrow::datatypes::Schema>)>,
+    pub pgen: Option<(&'a mut super::pgen_output::PgenWriter, &'a mut BufWriter<std::fs::File>)>,
+    pub selfdecode: Option<&'a mut super::selfdecode_output::SelfdecodeWriter>,
+    pub vcf_tx: &'a std::sync::mpsc::SyncSender<Vec<u8>>,
+}
+
 /// Write one window to all active output formats.
-/// VCF/BCF bytes are sent directly to `vcf_tx` as produced — no accumulation.
-#[allow(clippy::too_many_arguments)]
+/// VCF/BCF bytes are sent directly to `writers.vcf_tx` as produced — no accumulation.
 pub fn write_window_multiformat(
     formats: &OutputFormats,
-    srp: &Arc<SrpReader>,
-    all_weights: &[Vec<(usize, CsrWeights)>],
-    win_chip_start: usize,
-    own_chip_start: usize,
-    own_chip_end: usize,
-    wgs_idx: &[usize],
-    n_samples: usize,
-    chip_genotypes: &[u8],
-    no_ap: bool,
-    preloaded_chunks: Option<Vec<Option<crate::srp::CscChunk>>>,
-    preloaded_stripes: Option<crate::srp::tiled::PreloadedStripes>,
-    parquet_writer: Option<(&mut parquet::arrow::ArrowWriter<std::fs::File>, &Arc<arrow::datatypes::Schema>)>,
-    pgen_writer: Option<(&mut super::pgen_output::PgenWriter, &mut BufWriter<std::fs::File>)>,
-    sd_writer: Option<&mut super::selfdecode_output::SelfdecodeWriter>,
-    vcf_tx: &std::sync::mpsc::SyncSender<Vec<u8>>,
+    input: WindowInput<'_>,
+    writers: WindowWriters<'_>,
 ) -> std::io::Result<()> {
+    let WindowInput {
+        srp, all_weights, win_chip_start, own_chip_start, own_chip_end,
+        wgs_idx, n_samples, chip_genotypes, no_ap,
+        preloaded_chunks, preloaded_stripes,
+    } = input;
+    let WindowWriters { parquet: parquet_writer, pgen: pgen_writer, selfdecode: sd_writer, vcf_tx } = writers;
+
     let setup = WindowSetup::new(
         srp, all_weights, win_chip_start,
         own_chip_start, own_chip_end, wgs_idx, n_samples,
@@ -789,9 +843,10 @@ pub fn write_window_multiformat(
     let mut pw = parquet_writer;
     let mut pgw = pgen_writer;
     let mut sdw = sd_writer;
+    let need_dosages = formats.pgen;
 
     let mut hardcalls = if formats.pgen { vec![0u8; n_samples] } else { Vec::new() };
-    let mut dosages = if formats.pgen { vec![0.0f32; n_samples] } else { Vec::new() };
+    let mut dosages = if need_dosages { vec![0.0f32; n_samples] } else { Vec::new() };
     let mut sd_gt1 = if formats.selfdecode { vec![0i32; n_samples] } else { Vec::new() };
     let mut sd_gt2 = if formats.selfdecode { vec![0i32; n_samples] } else { Vec::new() };
     let mut sd_ap1 = if formats.selfdecode { vec![0.0f32; n_samples] } else { Vec::new() };
@@ -818,7 +873,9 @@ pub fn write_window_multiformat(
                     }
                     if formats.pgen || formats.selfdecode {
                         let ci = setup.chip_local_idx[local_idx];
-                        if formats.pgen { fill_chip_pgen(&mut hardcalls, &mut dosages, chip_genotypes, ci, setup.n_haps, n_samples); }
+                        if formats.pgen {
+                            fill_chip_pgen(&mut hardcalls, &mut dosages, chip_genotypes, ci, setup.n_haps, n_samples);
+                        }
                         if formats.selfdecode {
                             fill_chip_sd(&mut sd_gt1, &mut sd_gt2, chip_genotypes, ci, setup.n_haps, n_samples);
                             for s in 0..n_samples { sd_ap1[s] = sd_gt1[s] as f32; sd_ap2[s] = sd_gt2[s] as f32; }
@@ -878,7 +935,9 @@ pub fn write_window_multiformat(
                     let is_chip_var = setup.is_chip[local_i];
                     if is_chip_var {
                         let ci = setup.chip_local_idx[local_i];
-                        if formats.pgen { fill_chip_pgen(&mut hardcalls, &mut dosages, chip_genotypes, ci, setup.n_haps, n_samples); }
+                        if formats.pgen {
+                            fill_chip_pgen(&mut hardcalls, &mut dosages, chip_genotypes, ci, setup.n_haps, n_samples);
+                        }
                         if formats.selfdecode {
                             fill_chip_sd(&mut sd_gt1, &mut sd_gt2, chip_genotypes, ci, setup.n_haps, n_samples);
                             for s in 0..n_samples { sd_ap1[s] = sd_gt1[s] as f32; sd_ap2[s] = sd_gt2[s] as f32; }
@@ -887,7 +946,10 @@ pub fn write_window_multiformat(
                         for s in 0..n_samples {
                             let ap1 = $alt_probs[(s * 2) * $tile_n + v];
                             let ap2 = $alt_probs[(s * 2 + 1) * $tile_n + v];
-                            if formats.pgen { dosages[s] = ap1 + ap2; hardcalls[s] = if dosages[s] > 1.5 { 2 } else if dosages[s] > 0.5 { 1 } else { 0 }; }
+                            if formats.pgen {
+                                dosages[s] = ap1 + ap2;
+                                hardcalls[s] = if dosages[s] > 1.5 { 2 } else if dosages[s] > 0.5 { 1 } else { 0 };
+                            }
                             if formats.selfdecode { sd_gt1[s] = if ap1 > 0.5 { 1 } else { 0 }; sd_gt2[s] = if ap2 > 0.5 { 1 } else { 0 }; sd_ap1[s] = ap1; sd_ap2[s] = ap2; }
                         }
                     }
