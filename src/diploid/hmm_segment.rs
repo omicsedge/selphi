@@ -61,12 +61,6 @@ impl AlignedF32 {
         }
     }
 
-    #[allow(dead_code)]
-    #[inline(always)]
-    fn as_ptr(&self) -> *const f32 { self.ptr }
-    #[allow(dead_code)]
-    #[inline(always)]
-    fn as_mut_ptr(&mut self) -> *mut f32 { self.ptr }
 }
 
 impl Drop for AlignedF32 {

@@ -175,21 +175,23 @@ impl SiteAccumulator {
     }
 
     /// Add one variant's per-site metrics.
-    /// Concordance always counted. R² only counted when not NaN (non-zero variance).
+    /// Concordance always counted. R² only counted when not NaN AND when the
+    /// variant falls into one of the declared MAF bins (MAF ≥ 0.0005). This
+    /// matches Beagle/IMPUTE5/Minimac4 convention and avoids ultra-rare
+    /// singleton noise (MAF < 0.05%) dragging the mean to meaningless values.
     pub fn add(&mut self, maf: f64, r2: f64, concordance: f64) {
         // Concordance counts for ALL variants (including monomorphic)
         self.total_conc_sum += concordance;
         self.total_n += 1;
 
-        // R² and MAF-binned metrics only for variants with valid R²
         if !r2.is_nan() {
-            self.total_r2_sum += r2;
-            self.total_r2_n += 1;
             for (bi, &(lo, hi, _)) in MAF_BINS.iter().enumerate() {
                 if maf >= lo && maf < hi {
                     self.bin_r2_sum[bi] += r2;
                     self.bin_conc_sum[bi] += concordance;
                     self.bin_n[bi] += 1;
+                    self.total_r2_sum += r2;
+                    self.total_r2_n += 1;
                     break;
                 }
             }
@@ -272,11 +274,24 @@ fn match_alleles(imp_ref: &[u8], imp_alt: &[u8], truth_ref: &[u8], truth_alt: &[
     (false, false)
 }
 
+/// Strip a trailing `\n` or `\r\n` from a line read via `read_until(b'\n', ...)`.
+#[inline]
+fn strip_line_endings(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    if end > 0 && line[end - 1] == b'\n' { end -= 1; }
+    if end > 0 && line[end - 1] == b'\r' { end -= 1; }
+    &line[..end]
+}
+
 /// Parse a VCF/BCF text line to extract dosage for all samples.
 /// Returns (chrom, pos, ref, alt, dosages) where dosages[i] is DS for sample i.
 /// If DS not available, uses GT (0/0→0, 0/1→1, 1/1→2).
 /// Returns None for header lines or multi-allelic.
 pub fn parse_vcf_line(line: &[u8], n_samples: usize, ds_buf: &mut Vec<f32>) -> Option<(Vec<u8>, i64, Vec<u8>, Vec<u8>)> {
+    // Strip trailing newline (\n, \r\n). Without this, `is_empty()` below is
+    // false for blank records whose line_buf contains just "\n", and the
+    // pos/allele slicing would include the trailing byte.
+    let line = strip_line_endings(line);
     if line.is_empty() || line[0] == b'#' { return None; }
 
     // Find first 9 tabs (fixed VCF columns)
@@ -320,26 +335,26 @@ pub fn parse_vcf_line(line: &[u8], n_samples: usize, ds_buf: &mut Vec<f32>) -> O
                 ds_buf.push(-1.0);
             }
         } else if let Some(gi) = gt_idx {
-            // Fall back to GT
+            // Fall back to GT. Missing alleles fold to 0 (hom-ref) to match
+            // SRP/BCF readers and keep MAF denominators aligned.
             if let Some(gt) = sample_field.split(|&b| b == b':').nth(gi) {
                 if gt.len() >= 3 {
-                    let a0 = if gt[0] == b'.' { -1i32 } else { (gt[0] - b'0') as i32 };
-                    let a1 = if gt[2] == b'.' { -1i32 } else { (gt[2] - b'0') as i32 };
-                    if a0 < 0 || a1 < 0 { ds_buf.push(-1.0); }
-                    else { ds_buf.push((a0 + a1) as f32); }
+                    let a0 = if gt[0] == b'.' { 0i32 } else { (gt[0] - b'0') as i32 };
+                    let a1 = if gt[2] == b'.' { 0i32 } else { (gt[2] - b'0') as i32 };
+                    ds_buf.push((a0 + a1) as f32);
                 } else {
-                    ds_buf.push(-1.0);
+                    ds_buf.push(0.0);
                 }
             } else {
-                ds_buf.push(-1.0);
+                ds_buf.push(0.0);
             }
         } else {
-            ds_buf.push(-1.0);
+            ds_buf.push(0.0);
         }
     }
 
     // Pad if needed
-    while ds_buf.len() < n_samples { ds_buf.push(-1.0); }
+    while ds_buf.len() < n_samples { ds_buf.push(0.0); }
 
     Some((chrom, pos, ref_a, alt_a))
 }
@@ -398,6 +413,10 @@ enum VariantReader {
         reader: BufReader<noodles_bgzf::io::Reader<BufReader<std::fs::File>>>,
         line_buf: Vec<u8>,
         n_file_samples: usize,
+        /// Path for TBI-based seek
+        path: std::path::PathBuf,
+        /// Virtual position of the first data line (post-header)
+        header_end_vpos: u64,
     },
     Bcf {
         reader: noodles_bgzf::io::Reader<BufReader<std::fs::File>>,
@@ -417,8 +436,8 @@ enum VariantReader {
 
 impl VariantReader {
     fn open(path: &Path) -> io::Result<(Self, Vec<String>)> {
-        let is_bcf = path.to_string_lossy().ends_with(".bcf")
-            || path.to_string_lossy().ends_with(".bcf.gz");
+        let s = path.to_string_lossy();
+        let is_bcf = s.ends_with(".bcf") || s.ends_with(".bcf.gz");
 
         if is_bcf {
             let hdr = crate::srp::bcf_reader::read_header_only(path)?;
@@ -451,31 +470,55 @@ impl VariantReader {
                 sb: Vec::with_capacity(512), ib: Vec::with_capacity(ns * 4),
             }, samples))
         } else {
+            // Read header directly through bgzf's own block buffer so
+            // `virtual_position()` stays exactly at the first byte after
+            // `#CHROM\n`. Wrapping bgzf in an outer BufReader would prefetch
+            // data-section bytes before we capture `header_end_vpos`, and
+            // `reader.get_ref().virtual_position()` then points past the first
+            // data record — causing parallel-region seeks to start mid-first-line.
             let f = std::fs::File::open(path)?;
-            let bgzf = noodles_bgzf::io::Reader::new(BufReader::with_capacity(4 << 20, f));
-            let mut reader = BufReader::new(bgzf);
-            let mut samples = Vec::new();
-            let mut line = String::new();
-            loop {
-                line.clear();
-                if reader.read_line(&mut line)? == 0 { break; }
-                if line.starts_with("#CHROM") {
-                    let fields: Vec<&str> = line.trim().split('\t').collect();
-                    if fields.len() > 9 { samples = fields[9..].iter().map(|s| s.to_string()).collect(); }
+            let mut bgzf_inner = noodles_bgzf::io::Reader::new(BufReader::with_capacity(4 << 20, f));
+            let mut samples: Vec<String> = Vec::new();
+            let mut line_bytes: Vec<u8> = Vec::with_capacity(4096);
+            'hdr: loop {
+                line_bytes.clear();
+                loop {
+                    let buf = bgzf_inner.fill_buf()?;
+                    if buf.is_empty() { break 'hdr; }
+                    if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                        line_bytes.extend_from_slice(&buf[..nl]);
+                        bgzf_inner.consume(nl + 1);
+                        break;
+                    } else {
+                        let len = buf.len();
+                        line_bytes.extend_from_slice(buf);
+                        bgzf_inner.consume(len);
+                    }
+                }
+                if line_bytes.starts_with(b"#CHROM") {
+                    let line = String::from_utf8_lossy(&line_bytes);
+                    let fields: Vec<&str> = line.trim_end().split('\t').collect();
+                    if fields.len() > 9 {
+                        samples = fields[9..].iter().map(|s| s.to_string()).collect();
+                    }
                     break;
                 }
             }
             let ns = samples.len();
+            let header_end_vpos = u64::from(bgzf_inner.virtual_position());
+            let reader = BufReader::new(bgzf_inner);
             Ok((VariantReader::Vcf {
                 reader, line_buf: Vec::with_capacity(ns * 8), n_file_samples: ns,
+                path: path.to_path_buf(), header_end_vpos,
             }, samples))
         }
     }
 
-    /// Set sample indices to extract (for selective BCF reading).
+    /// Set sample indices to extract (selective extraction for BCF only).
     fn set_sample_filter(&mut self, indices: Vec<usize>) {
-        if let VariantReader::Bcf { sample_indices, .. } = self {
-            *sample_indices = Some(indices);
+        match self {
+            VariantReader::Bcf { sample_indices, .. } => { *sample_indices = Some(indices); }
+            VariantReader::Vcf { .. } => { let _ = indices; }
         }
     }
 
@@ -484,29 +527,56 @@ impl VariantReader {
     fn seek_to_position(&mut self, pos: i64) -> io::Result<()> {
         match self {
             VariantReader::Bcf { reader, path, header_end_vpos, .. } => {
+                // Always re-open on seek (matches the VCF path). Seeking an
+                // already-driven noodles_bgzf::Reader that's wrapped in a
+                // BufReader leaves stale block/line state in ways that dropped
+                // ~5% of records at region boundaries on parallel eval.
+                let open_fresh = |vp: noodles_bgzf::VirtualPosition, p: &std::path::Path|
+                    -> io::Result<noodles_bgzf::io::Reader<BufReader<std::fs::File>>> {
+                    let f = std::fs::File::open(p)?;
+                    let mut bgzf = noodles_bgzf::io::Reader::new(BufReader::with_capacity(4 << 20, f));
+                    bgzf.seek(vp)?;
+                    Ok(bgzf)
+                };
                 if pos <= 1 {
-                    // Seek to start of data
                     let vp = noodles_bgzf::VirtualPosition::from(*header_end_vpos);
-                    reader.seek(vp)?;
+                    *reader = open_fresh(vp, path)?;
                     return Ok(());
                 }
-                // Load CSI index
                 let csi_path = { let mut p = path.as_os_str().to_owned(); p.push(".csi"); std::path::PathBuf::from(p) };
                 if csi_path.exists() {
                     let csi = crate::srp::csi::parse_csi(&csi_path)?;
                     let vp = crate::srp::csi::seek_for_position(&csi, pos - 1); // CSI uses 0-based
-                    reader.seek(vp)?;
+                    *reader = open_fresh(vp, path)?;
                     Ok(())
                 } else {
-                    // No index — can't seek, just read from current position
+                    // No index — fall back to header start and let the caller
+                    // scan sequentially. Don't leave the reader half-consumed.
+                    let vp = noodles_bgzf::VirtualPosition::from(*header_end_vpos);
+                    *reader = open_fresh(vp, path)?;
                     Ok(())
                 }
             }
-            VariantReader::Vcf { reader: _, .. } => {
-                // VCF.gz: try TBI index for seeking
-                // TBI and CSI use similar checkpoint structure. Use parse_csi on .tbi if available.
-                // For now, no VCF seek — each thread reads from start and skips to region.
-                // The truth file (usually BCF) gets CSI seek, which is the big file.
+            VariantReader::Vcf { reader, path, header_end_vpos, .. } => {
+                if pos <= 1 {
+                    // Re-open and reset to first data line
+                    let f = std::fs::File::open(path)?;
+                    let mut bgzf = noodles_bgzf::io::Reader::new(BufReader::with_capacity(4 << 20, f));
+                    let vp = noodles_bgzf::VirtualPosition::from(*header_end_vpos);
+                    bgzf.seek(vp)?;
+                    *reader = BufReader::new(bgzf);
+                    return Ok(());
+                }
+                let tbi_path = { let mut p = path.as_os_str().to_owned(); p.push(".tbi"); std::path::PathBuf::from(p) };
+                if !tbi_path.exists() { return Ok(()); }
+                let tbi = match crate::srp::csi::parse_tbi(&tbi_path) { Ok(t) => t, Err(_) => return Ok(()) };
+                // Pick the first contig with non-empty linear index (typical single-chr eval).
+                let contig_idx = tbi.linear.iter().position(|lin| !lin.is_empty()).unwrap_or(0);
+                let vp = crate::srp::csi::tbi_seek(&tbi, contig_idx, pos - 1);
+                let f = std::fs::File::open(path)?;
+                let mut bgzf = noodles_bgzf::io::Reader::new(BufReader::with_capacity(4 << 20, f));
+                bgzf.seek(vp)?;
+                *reader = BufReader::new(bgzf);
                 Ok(())
             }
         }
@@ -532,7 +602,7 @@ impl VariantReader {
 
     fn next_record_inner(&mut self, ds_buf: &mut Vec<f32>, skip_gt: bool) -> Option<(Vec<u8>, i64, Vec<u8>, Vec<u8>)> {
         match self {
-            VariantReader::Vcf { reader, line_buf, n_file_samples } => {
+            VariantReader::Vcf { reader, line_buf, n_file_samples, .. } => {
                 loop {
                     line_buf.clear();
                     if reader.read_until(b'\n', line_buf).ok()? == 0 { return None; }
@@ -615,7 +685,10 @@ impl VariantReader {
                         let fs = vl * es * ns;
 
                         if dsk == Some(k) && tid == 5 && vl == 1 {
-                            // DS field: float32 per sample (selective if filter set)
+                            // DS field: float32 per sample (selective if filter set).
+                            // Clear any hardcalls previously pushed by the GT branch —
+                            // DS is authoritative when present.
+                            ds_buf.clear();
                             if let Some(indices) = si_filter {
                                 for &si in indices {
                                     let off = io2 + si * 4;
@@ -637,15 +710,19 @@ impl VariantReader {
                         } else if k == gtk && !found_ds {
                             // GT field: int8 per sample × ploidy (selective if filter set)
                             let ge = (io2 + fs).min(ib.len());
+                            // Missing alleles are folded to 0 (hom-ref) to keep
+                            // MAF denominators aligned with the SRP truth reader
+                            // (1-bit-per-allele has no missing encoding).
                             if let Some(indices) = si_filter {
                                 for &si in indices {
                                     let b = io2 + si * vl * es;
                                     if b + 1 < ge {
                                         let a0 = (ib[b] >> 1).wrapping_sub(1);
                                         let a1 = (ib[b+1] >> 1).wrapping_sub(1);
-                                        if a0 > 127 || a1 > 127 { ds_buf.push(-1.0); }
-                                        else { ds_buf.push(a0.min(1) as f32 + a1.min(1) as f32); }
-                                    } else { ds_buf.push(-1.0); }
+                                        let a0c = if a0 > 127 { 0 } else { a0.min(1) };
+                                        let a1c = if a1 > 127 { 0 } else { a1.min(1) };
+                                        ds_buf.push(a0c as f32 + a1c as f32);
+                                    } else { ds_buf.push(0.0); }
                                 }
                             } else {
                                 for si in 0..ns {
@@ -653,9 +730,10 @@ impl VariantReader {
                                     if b + 1 < ge {
                                         let a0 = (ib[b] >> 1).wrapping_sub(1);
                                         let a1 = (ib[b+1] >> 1).wrapping_sub(1);
-                                        if a0 > 127 || a1 > 127 { ds_buf.push(-1.0); }
-                                        else { ds_buf.push(a0.min(1) as f32 + a1.min(1) as f32); }
-                                    } else { ds_buf.push(-1.0); }
+                                        let a0c = if a0 > 127 { 0 } else { a0.min(1) };
+                                        let a1c = if a1 > 127 { 0 } else { a1.min(1) };
+                                        ds_buf.push(a0c as f32 + a1c as f32);
+                                    } else { ds_buf.push(0.0); }
                                 }
                             }
                             found_gt = true;
@@ -713,8 +791,114 @@ fn rtint(buf: &[u8], o: &mut usize) -> i32 {
     }
 }
 
+/// Load 16 kb checkpoint positions (0-based) from the file's seek index.
+/// Returns None if no index is present next to the file.
+fn load_checkpoint_positions(path: &Path) -> Option<Vec<i64>> {
+    let s = path.to_string_lossy();
+    if s.ends_with(".bcf") || s.ends_with(".bcf.gz") {
+        let csi_path = {
+            let mut p = path.as_os_str().to_owned();
+            p.push(".csi");
+            std::path::PathBuf::from(p)
+        };
+        if !csi_path.exists() { return None; }
+        let csi = crate::srp::csi::parse_csi(&csi_path).ok()?;
+        let mut positions: Vec<i64> = csi.checkpoints.iter().map(|&(pos, _)| pos).collect();
+        positions.sort();
+        positions.dedup();
+        if positions.is_empty() { return None; }
+        Some(positions)
+    } else if s.ends_with(".vcf.gz") {
+        let tbi_path = {
+            let mut p = path.as_os_str().to_owned();
+            p.push(".tbi");
+            std::path::PathBuf::from(p)
+        };
+        if !tbi_path.exists() { return None; }
+        let tbi = crate::srp::csi::parse_tbi(&tbi_path).ok()?;
+        // TBI linear index: one vpos per 16 kbp interval. Non-zero entries
+        // mark intervals with records. Use the contig that actually has data.
+        let linear = tbi.linear.iter().find(|l| !l.is_empty())?;
+        let positions: Vec<i64> = linear.iter().enumerate()
+            .filter(|&(_, &v)| v != 0)
+            .map(|(i, _)| (i as i64) * 16384)
+            .collect();
+        if positions.is_empty() { return None; }
+        Some(positions)
+    } else {
+        None
+    }
+}
+
+/// Build parallel evaluation regions. Prefers variant-balanced split
+/// (equal number of 16 kb checkpoints per region) using the imputed file's
+/// seek index; falls back to equal-bp split when no index is available.
+fn build_eval_regions(imputed_path: &Path, n_regions: usize) -> Vec<(i64, i64)> {
+    let n_regions = n_regions.max(1);
+
+    if let Some(cp) = load_checkpoint_positions(imputed_path) {
+        // Spread checkpoints across regions. Each region covers `stride`
+        // consecutive checkpoints, giving approximately equal record count
+        // since each 16 kb checkpoint represents a similar number of records
+        // in BCF-sorted imputation output.
+        let n_cp = cp.len();
+        let regions_count = n_regions.min(n_cp);
+        let mut regions = Vec::with_capacity(regions_count);
+        for i in 0..regions_count {
+            let start_idx = (i * n_cp) / regions_count;
+            let start = if i == 0 { 1 } else { cp[start_idx] + 1 };
+            let end = if i + 1 == regions_count {
+                i64::MAX
+            } else {
+                let end_idx = ((i + 1) * n_cp) / regions_count;
+                cp[end_idx] + 1
+            };
+            regions.push((start, end));
+        }
+        return regions;
+    }
+
+    // Fallback: equal-bp split across a human-genome-sized interval.
+    let chunk_bp = 300_000_000i64 / n_regions as i64;
+    (0..n_regions)
+        .map(|i| {
+            let start = i as i64 * chunk_bp + 1;
+            let end = if i + 1 == n_regions {
+                i64::MAX
+            } else {
+                (i as i64 + 1) * chunk_bp + 1
+            };
+            (start, end)
+        })
+        .collect()
+}
+
 /// Parallel evaluation: split by genomic region, one thread per region.
 /// Each thread opens its own file handles and evaluates its portion independently.
+/// Make sure a seek-enabling index exists for a VCF.gz or BCF file, so the
+/// parallel evaluator can skip to its assigned region via pread instead of
+/// decompressing the whole file in every thread. No-op when an index already
+/// exists next to the file.
+fn ensure_seek_index(path: &Path) -> io::Result<()> {
+    let s = path.to_string_lossy();
+    let is_bcf = s.ends_with(".bcf") || s.ends_with(".bcf.gz");
+    if is_bcf {
+        let csi = { let mut p = path.as_os_str().to_owned(); p.push(".csi"); std::path::PathBuf::from(p) };
+        if !csi.exists() {
+            crate::selphi_info!("  Building CSI index for parallel eval: {}", path.display());
+            crate::srp::csi::build_csi_index(path).map_err(|e|
+                io::Error::other(format!("CSI build failed: {}", e)))?;
+        }
+    } else if s.ends_with(".vcf.gz") {
+        let tbi = { let mut p = path.as_os_str().to_owned(); p.push(".tbi"); std::path::PathBuf::from(p) };
+        if !tbi.exists() {
+            crate::selphi_info!("  Building TBI index for parallel eval: {}", path.display());
+            crate::srp::csi::build_tbi_index(path)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn evaluate_parallel(
     imputed_path: &Path,
     truth_path: &Path,
@@ -725,6 +909,12 @@ pub fn evaluate_parallel(
 
     let n_samples = shared_samples.len();
 
+    // Ensure parallel-seek indexes exist so each thread can pread-seek its
+    // region instead of re-scanning from BOF. Without this, 16 threads each
+    // decompress the whole 10+ GB file → pathologically slow.
+    ensure_seek_index(imputed_path)?;
+    ensure_seek_index(truth_path)?;
+
     // Get sample info
     let (_, imp_samples) = VariantReader::open(imputed_path)?;
     let (_, truth_samples) = VariantReader::open(truth_path)?;
@@ -733,23 +923,28 @@ pub fn evaluate_parallel(
     let imp_reindex: Vec<usize> = shared_samples.iter().map(|s| *imp_map.get(s.as_str()).expect("shared sample missing from imputed file")).collect();
     let truth_reindex: Vec<usize> = shared_samples.iter().map(|s| *truth_map.get(s.as_str()).expect("shared sample missing from truth file")).collect();
 
-    // Divide into regions (more regions than threads for load balancing)
+    // Build variant-balanced regions from the imputed file's index.
+    //
+    // Previous code sliced the genome into equal-bp chunks (300 Mb / n_regions).
+    // On chr20 (61 Mb of records) that left 50/64 regions empty and concentrated
+    // all work in ~14 regions with very uneven record counts — the slowest
+    // region was 1.48× heavier than the fastest, bounding wall at ~269 s on
+    // MESA 5k despite 3072 s of aggregate CPU work.
+    //
+    // Now we use the index's 16 kb checkpoints (CSI for BCF, TBI linear for
+    // VCF.gz) as approximate record-density markers. Each region covers an
+    // equal number of checkpoints → roughly equal record count. Falls back to
+    // equal-bp splitting if no index is available.
     let n_regions = n_threads * 4;
-    let chunk_bp = 300_000_000i64 / n_regions.max(1) as i64;
-    let regions: Vec<(i64, i64)> = (0..n_regions)
-        .map(|i| {
-            let start = i as i64 * chunk_bp + 1;
-            let end = if i == n_regions - 1 { i64::MAX } else { (i as i64 + 1) * chunk_bp + 1 };
-            (start, end)
-        })
-        .collect();
+    let regions = build_eval_regions(imputed_path, n_regions);
 
     let imp_path = imputed_path.to_path_buf();
     let truth_path_buf = truth_path.to_path_buf();
 
-    let results: Vec<(SiteAccumulator, SampleAccumulator, EvalCounts)> = regions
+    let results: Vec<(SiteAccumulator, SampleAccumulator, EvalCounts, f64)> = regions
         .par_iter()
         .map(|&(region_start, region_end)| {
+            let t0 = std::time::Instant::now();
             // Each thread: open files, scan to region, evaluate with full genotypes
             let result = (|| -> io::Result<_> {
                 let (mut imp_reader, _) = VariantReader::open(&imp_path)?;
@@ -789,62 +984,101 @@ pub fn evaluate_parallel(
                     }
                 };
 
-                // Merge within region
-                #[allow(unused_assignments)]
+                // Merge within region. A record is "owned" by this region iff
+                // its pos is in [region_start, region_end). The skip loop above
+                // already discarded pos < region_start. The merge advances the
+                // smaller side; counters increment only while pos < region_end.
                 while let (Some(imp), Some(truth)) = (&imp_rec, &truth_rec) {
                     if imp.1 >= region_end && truth.1 >= region_end { break; }
 
                     if imp.1 < truth.1 {
                         if imp.1 < region_end { n_imp += 1; }
                         imp_rec = imp_reader.next_record(&mut imp_ds_raw);
-                        continue;
-                    }
-                    if imp.1 > truth.1 {
+                    } else if imp.1 > truth.1 {
                         if truth.1 < region_end { n_truth += 1; }
                         truth_rec = truth_reader.next_record(&mut truth_ds_raw);
-                        continue;
-                    }
+                    } else if imp.1 < region_end {
+                        // Same position, in-region.
+                        n_imp += 1;
+                        n_truth += 1;
 
-                    // Same position
-                    if imp.1 >= region_end { break; }
-                    n_imp += 1;
-                    n_truth += 1;
+                        let (matched, swapped) = match_alleles(&imp.2, &imp.3, &truth.2, &truth.3);
+                        if matched {
+                            chr_set.insert(String::from_utf8_lossy(&imp.0).to_string());
+                            imp_ds[..n_samples].copy_from_slice(&imp_ds_raw[..n_samples]);
+                            if swapped { for si in 0..n_samples { if imp_ds[si] >= 0.0 { imp_ds[si] = 2.0 - imp_ds[si]; } } }
+                            truth_ds[..n_samples].copy_from_slice(&truth_ds_raw[..n_samples]);
 
-                    let (matched, swapped) = match_alleles(&imp.2, &imp.3, &truth.2, &truth.3);
-                    if matched {
-                        chr_set.insert(String::from_utf8_lossy(&imp.0).to_string());
-                        imp_ds[..n_samples].copy_from_slice(&imp_ds_raw[..n_samples]);
-                        if swapped { for si in 0..n_samples { if imp_ds[si] >= 0.0 { imp_ds[si] = 2.0 - imp_ds[si]; } } }
-                        truth_ds[..n_samples].copy_from_slice(&truth_ds_raw[..n_samples]);
-
-                        let mut gt_sum = 0.0f64;
-                        let mut gt_n = 0u32;
-                        for s in 0..n_samples {
-                            if truth_ds[s] >= 0.0 { gt_sum += truth_ds[s] as f64; gt_n += 1; }
+                            let mut gt_sum = 0.0f64;
+                            let mut gt_n = 0u32;
+                            for s in 0..n_samples {
+                                if truth_ds[s] >= 0.0 { gt_sum += truth_ds[s] as f64; gt_n += 1; }
+                            }
+                            let maf = if gt_n > 0 { let af = gt_sum / (gt_n as f64 * 2.0); af.min(1.0 - af) } else { 0.0 };
+                            let (r2, conc) = site_r2(&imp_ds, &truth_ds, n_samples);
+                            site_acc.add(maf, r2, conc);
+                            sample_acc.add_variant(&imp_ds, &truth_ds, maf);
+                            n_matched += 1;
                         }
-                        let maf = if gt_n > 0 { let af = gt_sum / (gt_n as f64 * 2.0); af.min(1.0 - af) } else { 0.0 };
-                        let (r2, conc) = site_r2(&imp_ds, &truth_ds, n_samples);
-                        site_acc.add(maf, r2, conc);
-                        sample_acc.add_variant(&imp_ds, &truth_ds, maf);
-                        n_matched += 1;
-                    }
 
+                        imp_rec = imp_reader.next_record(&mut imp_ds_raw);
+                        truth_rec = truth_reader.next_record(&mut truth_ds_raw);
+                    } else {
+                        // Same position, both past region_end.
+                        break;
+                    }
+                }
+
+                // Drain remaining in-region records when the other side hit
+                // EOF. Without this, imp/truth records left over after a
+                // premature None on one side were silently dropped from the
+                // displayed counts (R² unaffected, but totals under-reported).
+                while let Some(ref rec) = imp_rec {
+                    if rec.1 >= region_end { break; }
+                    n_imp += 1;
                     imp_rec = imp_reader.next_record(&mut imp_ds_raw);
+                }
+                while let Some(ref rec) = truth_rec {
+                    if rec.1 >= region_end { break; }
+                    n_truth += 1;
                     truth_rec = truth_reader.next_record(&mut truth_ds_raw);
                 }
 
                 Ok((site_acc, sample_acc, EvalCounts { n_matched, n_imp_variants: n_imp, n_truth_variants: n_truth, chromosomes: chr_set.into_iter().collect() }))
             })();
-            result.unwrap_or_else(|_| (SiteAccumulator::new(), SampleAccumulator::new(n_samples), EvalCounts { n_matched: 0, n_imp_variants: 0, n_truth_variants: 0, chromosomes: Vec::new() }))
+            let wall = t0.elapsed().as_secs_f64();
+            match result {
+                Ok((sa, sm, ec)) => (sa, sm, ec, wall),
+                Err(_) => (SiteAccumulator::new(), SampleAccumulator::new(n_samples), EvalCounts { n_matched: 0, n_imp_variants: 0, n_truth_variants: 0, chromosomes: Vec::new() }, wall),
+            }
         })
         .collect();
+
+    // Log the slowest / fastest / median region wall time under --debug so
+    // the imbalance between regions is visible without spamming on every run.
+    {
+        let mut walls: Vec<(f64, u64)> = results.iter()
+            .map(|(_, _, ec, w)| (*w, ec.n_matched))
+            .collect();
+        walls.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        let total_wall: f64 = walls.iter().map(|(w, _)| w).sum();
+        let slowest = walls.first().copied().unwrap_or((0.0, 0));
+        let fastest = walls.iter().rev().find(|(_, n)| *n > 0).copied().unwrap_or((0.0, 0));
+        let median = walls.get(walls.len() / 2).copied().unwrap_or((0.0, 0));
+        let n_nonempty = walls.iter().filter(|(_, n)| *n > 0).count();
+        crate::selphi_debug!(
+            "  eval regions: {} nonempty of {}, slowest={:.2}s ({} vars), median={:.2}s ({} vars), fastest={:.2}s ({} vars), sum={:.1}s",
+            n_nonempty, walls.len(),
+            slowest.0, slowest.1, median.0, median.1, fastest.0, fastest.1, total_wall,
+        );
+    }
 
     // Merge all region results
     let mut site_acc = SiteAccumulator::new();
     let mut sample_acc = SampleAccumulator::new(n_samples);
     let mut total = EvalCounts { n_matched: 0, n_imp_variants: 0, n_truth_variants: 0, chromosomes: Vec::new() };
     let mut all_chrs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for (sa, sam, c) in results {
+    for (sa, sam, c, _wall) in results {
         site_acc.merge(&sa);
         sample_acc.merge(&sam);
         total.n_matched += c.n_matched;

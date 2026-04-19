@@ -97,7 +97,23 @@ pub fn parse_csi(path: &Path) -> io::Result<CsiIndex> {
                 ref_checkpoints.push((pos, vp));
             }
 
-            if min_beg < u64::MAX && ref_first_offset == VirtualPosition::default() {
+            // Track the smallest virtual position across ALL regular bins —
+            // that's the earliest record in the file, i.e. the true "start
+            // of data". Using the FIRST iterated bin's min_beg is wrong:
+            // BTreeMap iteration is by bin_id, and indels that straddle a
+            // 16kb (or 128kb / 1MB) window land in higher-level (lower
+            // bin_id) bins. A level-4 bin (ids 585..4681) sorts BEFORE leaf
+            // bins (ids 37449..), so the first iterated bin is typically
+            // NOT the earliest record. Prior code seeded first_offset from
+            // a mid-chromosome indel's vp, causing seek_for_position() to
+            // jump past ~60 k records whenever it fell through to
+            // first_offset. Exclude pseudo-bin — its chunk[0] = (0, 0) is a
+            // sentinel, not a real virtual position.
+            if bin_id < 100_000
+                && min_beg < u64::MAX
+                && (ref_first_offset == VirtualPosition::default()
+                    || min_beg < u64::from(ref_first_offset))
+            {
                 ref_first_offset = VirtualPosition::from(min_beg);
             }
         }
@@ -122,6 +138,10 @@ pub fn parse_csi(path: &Path) -> io::Result<CsiIndex> {
             format!("CSI: no data found across {} reference sequences", n_ref)));
     }
 
+    crate::selphi_debug!(
+        "  CSI parsed: ref={} n_mapped={} n_checkpoints={} first_offset={}",
+        best_ref, best_n_mapped, best_checkpoints.len(), u64::from(best_first_offset)
+    );
 
     Ok(CsiIndex {
         checkpoints: best_checkpoints,
@@ -211,7 +231,14 @@ pub fn parse_csi_all_contigs(path: &Path) -> io::Result<Vec<ContigCsiIndex>> {
                 let vp = VirtualPosition::from(loffset);
                 ref_checkpoints.push((pos, vp));
             }
-            if min_beg < u64::MAX && ref_first_offset == VirtualPosition::default() {
+            // Track the smallest chunk_beg across ALL regular bins (see
+            // parse_csi for the full rationale). Exclude pseudo-bin — its
+            // chunk[0] = (0, 0) is a sentinel, not a real virtual position.
+            if bin_id < 100_000
+                && min_beg < u64::MAX
+                && (ref_first_offset == VirtualPosition::default()
+                    || min_beg < u64::from(ref_first_offset))
+            {
                 ref_first_offset = VirtualPosition::from(min_beg);
             }
         }
@@ -229,6 +256,102 @@ pub fn parse_csi_all_contigs(path: &Path) -> io::Result<Vec<ContigCsiIndex>> {
     }
 
     Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// TBI parser
+// ---------------------------------------------------------------------------
+
+/// Parsed TBI index. Uses the linear index (one virtual position per 16 kbp
+/// interval) for seeking. Simpler than CSI because TBI has a fixed min_shift
+/// of 14 (16 kbp intervals).
+pub struct TbiIndex {
+    pub contig_names: Vec<String>,
+    /// Per-contig linear index: linear[contig_idx][interval] = virtual offset.
+    /// interval = pos_0based / 16384.
+    pub linear: Vec<Vec<u64>>,
+}
+
+impl TbiIndex {
+    /// Find the contig index matching `name`, or None.
+    pub fn find_contig(&self, name: &str) -> Option<usize> {
+        self.contig_names.iter().position(|n| n == name)
+    }
+}
+
+/// Parse a .tbi index file.
+pub fn parse_tbi(path: &Path) -> io::Result<TbiIndex> {
+    let raw = std::fs::read(path)?;
+    let data = {
+        let mut bgzf = noodles_bgzf::io::Reader::new(&raw[..]);
+        let mut dec = Vec::new();
+        bgzf.read_to_end(&mut dec)?;
+        dec
+    };
+    if data.len() < 36 || &data[..4] != b"TBI\x01" {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "not a TBI index"));
+    }
+    let mut off = 4;
+    let n_ref = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
+    off += 4 * 6; // format, col_seq, col_beg, col_end, meta, skip — skip
+    let l_nm = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
+    if off + l_nm > data.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "TBI: contig-names past EOF"));
+    }
+    // Parse null-terminated contig names
+    let mut contig_names = Vec::with_capacity(n_ref);
+    let nm_end = off + l_nm;
+    let mut name_start = off;
+    while name_start < nm_end {
+        let term = data[name_start..nm_end].iter().position(|&b| b == 0).unwrap_or(nm_end - name_start);
+        let end = name_start + term;
+        contig_names.push(String::from_utf8_lossy(&data[name_start..end]).to_string());
+        name_start = end + 1;
+    }
+    off = nm_end;
+    while contig_names.len() < n_ref { contig_names.push(String::new()); }
+
+    let mut linear: Vec<Vec<u64>> = Vec::with_capacity(n_ref);
+    for _ in 0..n_ref {
+        if off + 4 > data.len() { linear.push(Vec::new()); continue; }
+        let n_bin = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
+        // Skip bins (bin_id u32 + n_chunk i32 + n_chunk × (u64 beg, u64 end))
+        for _ in 0..n_bin {
+            if off + 8 > data.len() { break; }
+            off += 4; // bin_id
+            let n_chunk = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
+            off += n_chunk * 16;
+            if off > data.len() { break; }
+        }
+        // Linear index
+        if off + 4 > data.len() { linear.push(Vec::new()); continue; }
+        let n_intv = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
+        let mut intvs = Vec::with_capacity(n_intv);
+        for _ in 0..n_intv {
+            if off + 8 > data.len() { break; }
+            let v = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;
+            intvs.push(v);
+        }
+        linear.push(intvs);
+    }
+
+    Ok(TbiIndex { contig_names, linear })
+}
+
+/// Seek for a genomic position in a TBI-indexed contig. Returns the virtual
+/// position of the BGZF block at or before `pos_0based`. Falls back to 0
+/// (start of file) if contig or interval not found.
+pub fn tbi_seek(index: &TbiIndex, contig_idx: usize, pos_0based: i64) -> VirtualPosition {
+    let Some(linear) = index.linear.get(contig_idx) else { return VirtualPosition::from(0); };
+    if linear.is_empty() { return VirtualPosition::from(0); }
+    let interval = (pos_0based.max(0) / 16384) as usize;
+    // Walk backwards for the last non-zero offset ≤ interval (TBI fill gaps
+    // forward but be defensive).
+    let idx = interval.min(linear.len() - 1);
+    for i in (0..=idx).rev() {
+        if linear[i] != 0 { return VirtualPosition::from(linear[i]); }
+    }
+    VirtualPosition::from(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +467,7 @@ pub fn build_csi_index(bcf_path: &Path) -> io::Result<()> {
 
         // Assign to bin (handles indels spanning multiple 16Kb windows)
         let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, CSI_DEPTH);
+
         let bins = ref_bins.entry(chrom_id).or_default();
         let bin = bins.entry(bin_id).or_insert_with(|| BinData {
             loffset: vpos,
@@ -431,15 +555,21 @@ pub fn build_csi_index(bcf_path: &Path) -> io::Result<()> {
 /// Writes the .tbi file next to the VCF.gz.
 pub fn build_tbi_index(vcf_gz_path: &Path) -> io::Result<()> {
     use std::collections::BTreeMap;
-    use std::io::BufReader;
+    use std::io::{BufRead, BufReader};
 
     let tbi_path = { let mut p = vcf_gz_path.as_os_str().to_owned(); p.push(".tbi"); std::path::PathBuf::from(p) };
 
     let f = std::fs::File::open(vcf_gz_path)?;
-    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let wc = std::num::NonZero::new(n_threads).unwrap();
-    let mut bgzf = noodles_bgzf::io::MultithreadedReader::with_worker_count(
-        wc, BufReader::with_capacity(4 << 20, f));
+    // NB: we read through `noodles_bgzf::io::Reader` directly (single-threaded
+    // block reader). The previous multi-threaded reader plus a 256 KB user
+    // buffer broke `virtual_position()` tracking — bgzf's position reflected
+    // where the *multi-threaded prefetch* had reached, not where our parse
+    // cursor was, so the TBI linear-index entries pointed mid-line. Seek on
+    // that index landed mid-record, and `parse_vcf_line` rejected the
+    // fragmented first reads — losing ~10–250 records per chr22 801 s eval.
+    // Reading via `BufRead::fill_buf` / `consume` on the single-threaded
+    // reader keeps `virtual_position()` in sync with our cursor byte-by-byte.
+    let mut bgzf = noodles_bgzf::io::Reader::new(BufReader::with_capacity(4 << 20, f));
 
     struct BinData {
         _loffset: u64,
@@ -452,44 +582,36 @@ pub fn build_tbi_index(vcf_gz_path: &Path) -> io::Result<()> {
     let mut ref_n_mapped: BTreeMap<usize, u64> = BTreeMap::new();
     let mut ref_linear: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
 
-    // Buffered line reading (much faster than byte-by-byte)
-    let mut read_buf = vec![0u8; 256 << 10]; // 256KB read buffer
-    let mut line_buf = Vec::with_capacity(4096);
-    let mut buf_pos = 0usize;
-    let mut buf_len = 0usize;
-    let _vpos_at_buf_start: u64 = 0;
-    let _bytes_consumed_in_block = 0usize;
+    let mut line_buf: Vec<u8> = Vec::with_capacity(65536);
 
     loop {
-        // Track virtual position at start of line
+        // Virtual position of the first byte of the next line.
         let vpos: u64 = u64::from(bgzf.virtual_position());
 
-        // Read one line using buffered approach
+        // Read one line from bgzf using its own internal block buffer. No
+        // user-level pre-read, so `virtual_position()` stays precise.
         line_buf.clear();
         loop {
-            if buf_pos >= buf_len {
-                buf_len = match bgzf.read(&mut read_buf) {
-                    Ok(0) => 0,
-                    Ok(n) => n,
-                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e),
-                };
-                buf_pos = 0;
-                if buf_len == 0 { break; }
+            let buf = match bgzf.fill_buf() {
+                Ok(b) => b,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if buf.is_empty() {
+                break; // EOF
             }
-            // Scan for newline in buffer
-            let remaining = &read_buf[buf_pos..buf_len];
-            if let Some(nl) = remaining.iter().position(|&b| b == b'\n') {
-                line_buf.extend_from_slice(&remaining[..nl]);
-                buf_pos += nl + 1;
+            if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                line_buf.extend_from_slice(&buf[..nl]);
+                bgzf.consume(nl + 1);
                 break;
             } else {
-                line_buf.extend_from_slice(remaining);
-                buf_pos = buf_len;
+                let len = buf.len();
+                line_buf.extend_from_slice(buf);
+                bgzf.consume(len);
             }
         }
 
-        if line_buf.is_empty() && buf_len == 0 { break; } // EOF
+        if line_buf.is_empty() { break; } // EOF
 
         // Skip header lines
         if line_buf.starts_with(b"#") {
@@ -655,13 +777,13 @@ pub fn build_tbi_index_with_meta(
     tbi_path: &Path,
 ) -> io::Result<()> {
     use std::collections::BTreeMap;
-    use std::io::BufReader;
+    use std::io::{BufRead, BufReader};
 
+    // See `build_tbi_index` above: multi-threaded bgzf + user buffer breaks
+    // `virtual_position()` tracking; reading via the single-threaded bgzf's
+    // own block buffer (`fill_buf` / `consume`) keeps vpos precise.
     let f = std::fs::File::open(vcf_gz_path)?;
-    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let wc = std::num::NonZero::new(n_threads).unwrap();
-    let mut bgzf = noodles_bgzf::io::MultithreadedReader::with_worker_count(
-        wc, BufReader::with_capacity(4 << 20, f));
+    let mut bgzf = noodles_bgzf::io::Reader::new(BufReader::with_capacity(4 << 20, f));
 
     let mut contig_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (i, name) in contig_names.iter().enumerate() { contig_map.insert(name.clone(), i); }
@@ -671,11 +793,7 @@ pub fn build_tbi_index_with_meta(
     let mut ref_n_mapped: BTreeMap<usize, u64> = BTreeMap::new();
     let mut ref_linear: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
 
-    // Fast scan: read lines, only track virtual positions, use pre-collected metadata
-    let mut read_buf = vec![0u8; 256 << 10];
-    let mut line_buf = Vec::with_capacity(4096);
-    let mut buf_pos = 0usize;
-    let mut buf_len = 0usize;
+    let mut line_buf: Vec<u8> = Vec::with_capacity(65536);
     let mut rec_idx = 0usize;
 
     loop {
@@ -683,26 +801,23 @@ pub fn build_tbi_index_with_meta(
 
         line_buf.clear();
         loop {
-            if buf_pos >= buf_len {
-                buf_len = match bgzf.read(&mut read_buf) {
-                    Ok(0) => 0, Ok(n) => n,
-                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e),
-                };
-                buf_pos = 0;
-                if buf_len == 0 { break; }
-            }
-            let remaining = &read_buf[buf_pos..buf_len];
-            if let Some(nl) = remaining.iter().position(|&b| b == b'\n') {
-                line_buf.extend_from_slice(&remaining[..nl]);
-                buf_pos += nl + 1;
+            let buf = match bgzf.fill_buf() {
+                Ok(b) => b,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if buf.is_empty() { break; }
+            if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                line_buf.extend_from_slice(&buf[..nl]);
+                bgzf.consume(nl + 1);
                 break;
             } else {
-                line_buf.extend_from_slice(remaining);
-                buf_pos = buf_len;
+                let len = buf.len();
+                line_buf.extend_from_slice(buf);
+                bgzf.consume(len);
             }
         }
-        if line_buf.is_empty() && buf_len == 0 { break; }
+        if line_buf.is_empty() { break; }
         if line_buf.starts_with(b"#") { continue; }
 
         let vpos_end: u64 = u64::from(bgzf.virtual_position());
