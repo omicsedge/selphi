@@ -36,6 +36,10 @@ pub struct WindowHmmParams<'a> {
     /// bridge before entering the HMM so the emission never touches scaffold
     /// bits (scaffold only covers chip positions, not WGS-only sites).
     pub scaffold_bridge: Option<&'a [u32]>,
+    /// Whether the HMM should compute `hap_posterior` for cross-window passthrough.
+    /// Set to false on the final window — the posterior is an `n_ref`-sized f64
+    /// vector per target that would never be read, saving ~13 GB at biobank scale.
+    pub compute_posterior: bool,
 }
 
 /// Result of processing one imputation window.
@@ -70,18 +74,15 @@ pub fn impute_window(
     hap_priors: &mut [Option<Vec<f64>>],
 ) -> WindowHmmOutput {
     let n_var_w = inputs.chip_end - inputs.chip_start;
-    let targ_w = crate::common::utils::extract_subarray(
-        inputs.targ_alleles, params.n_haps, inputs.chip_start, inputs.chip_end,
-    );
+    // targ_alleles is (n_chip × n_haps) row-major, so the window slice is contiguous — no copy needed.
+    let targ_w: &[u8] = &inputs.targ_alleles[inputs.chip_start * params.n_haps .. inputs.chip_end * params.n_haps];
     let cm_w = &inputs.chip_cm[inputs.chip_start..inputs.chip_end];
-
-    let ref_w = extract_ref_window(inputs.ref_bm, inputs.chip_start, n_var_w, params.n_ref);
 
     // PBWT sees the full augmented hap pool (WGS + scaffold); the HMM stays on WGS.
     let n_ref_total = params.n_ref + params.n_scaffold;
     let coded = super::pbwt::build_coded_steps_bm(
         inputs.ref_bm, inputs.chip_start, n_var_w, n_ref_total,
-        &targ_w, params.n_haps, cm_w, 0.05,
+        targ_w, params.n_haps, cm_w, 0.05,
     );
 
     let ne_w: Option<Vec<f64>> = inputs.ne_per_site.map(|ne| {
@@ -89,37 +90,11 @@ pub fn impute_window(
     });
 
     process_window_hmm(
-        params, inputs.ref_bm, &ref_w, &targ_w, cm_w,
+        params, inputs.ref_bm, targ_w, cm_w,
         ne_w.as_deref(), &coded,
         precomputed_candidates,
         hap_priors, inputs.chip_start, n_var_w,
     )
-}
-
-/// Extract ref_w (dense u8 array) from bitmatrix for a window range.
-/// Parallel over variants using par_chunks_mut.
-pub fn extract_ref_window(
-    ref_bm: &HaplotypeBitmatrix,
-    chip_start: usize,
-    n_var_w: usize,
-    n_ref: usize,
-) -> Vec<u8> {
-    let mut ref_w = vec![0u8; n_var_w * n_ref];
-    ref_w.par_chunks_mut(n_ref).enumerate().for_each(|(var, dst)| {
-        let ci = chip_start + var;
-        let row = ref_bm.row(ci);
-        for w in 0..ref_bm.n_words() {
-            let mut word = row[w];
-            let base = w * 64;
-            while word != 0 {
-                let k = word.trailing_zeros() as usize;
-                let r = base + k;
-                if r < n_ref { unsafe { *dst.get_unchecked_mut(r) = 1; } }
-                word &= word - 1;
-            }
-        }
-    });
-    ref_w
 }
 
 /// Run PBWT + HMM for all target haplotypes in a single window.
@@ -127,7 +102,6 @@ pub fn extract_ref_window(
 pub fn process_window_hmm(
     params: &WindowHmmParams,
     ref_bm: &HaplotypeBitmatrix,
-    ref_w: &[u8],
     targ_w: &[u8],
     cm_w: &[f64],
     ne_w: Option<&[f64]>,
@@ -234,8 +208,10 @@ pub fn process_window_hmm(
                 TL_RED.with(|buf| { *buf.borrow_mut() = reduced; });
                 return (tgt, super::hmm::calculate_weights(
                     &csc, cm_w, &breaks_w, n_ref,
-                    est_ne, p_err, Some(ref_w), n_var_w, None,
-                    ne_w, prior, 0.0,
+                    est_ne, p_err,
+                    Some(super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start }),
+                    n_var_w, None,
+                    ne_w, prior, 0.0, params.compute_posterior,
                 ));
             }
 
@@ -273,8 +249,10 @@ pub fn process_window_hmm(
             csc.n_rows = n_ref;
             (tgt, super::hmm::calculate_weights(
                 &csc, cm_w, &breaks_w, n_ref,
-                est_ne, p_err, Some(ref_w), n_var_w, None,
-                ne_w, prior, 0.0,
+                est_ne, p_err,
+                Some(super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start }),
+                n_var_w, None,
+                ne_w, prior, 0.0, params.compute_posterior,
             ))
         })
         .collect();
