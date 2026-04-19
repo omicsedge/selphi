@@ -30,6 +30,11 @@ arrow = { version = "54", features = ["prettyprint"] }
 parquet = { version = "54", features = ["zstd", "snap"] }
 memmap2 = "0.9"
 lz4_flex = "0.11"
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
+[features]
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]
 
 [profile.release]
 opt-level = 3

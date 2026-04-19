@@ -189,8 +189,19 @@ pub fn estimate_and_warn(
         ) as f64 / 1e6;
     let hmm_mb = n_threads as f64 * pbwt_per_thread_mb;
 
-    // all_weights per window: n_haps × ~200 CsrWeights entries × 12 bytes
-    let weights_mb = (n_haps as f64 * 200.0 * 12.0) / 1e6;
+    // all_weights per window: each target holds a sparse CSR over the chip
+    // window with ~100-200 non-zero entries per chip row. At biobank scale
+    // this dominates peak memory.
+    //   indptr: (n_chip_window + 1) × 4 bytes
+    //   indices + data: nnz × 8 bytes, nnz ≈ n_chip_window × ~100
+    let n_chip_window = n_chip.min(15000);
+    let per_weights_mb = (n_chip_window as f64 * 4.0 + n_chip_window as f64 * 100.0 * 8.0) / 1e6;
+    let weights_mb = (n_haps as f64) * per_weights_mb;
+
+    // hap_posterior: n_haps × n_ref × 8 bytes, held after each non-final window.
+    // Skipped on the final window by the HMM (compute_posterior=false), but
+    // consumes peak for all but the last.
+    let hap_posterior_mb = (n_haps as f64 * n_ref as f64 * 8.0) / 1e6;
 
     // Interpolation: batch of decompressed stripes + alt_probs results.
     // Stripe tiles: ~500 KB per stripe × n_tile_cols. Capped at 2 GB.
@@ -215,6 +226,7 @@ pub fn estimate_and_warn(
     let overhead_mb = 300.0; // OS, allocator fragmentation, misc
 
     let mut total_mb = ref_bm_mb + targ_mb + preload_mb + hmm_mb + weights_mb
+        + hap_posterior_mb
         + stripe_decomp_mb + interp_mb + vcf_mb + bgzf_mb + thread_local_mb + overhead_mb;
 
     // Phasing adds significant memory
@@ -240,8 +252,8 @@ pub fn estimate_and_warn(
 
     crate::selphi_info!("  Resources: {:.1} GB estimated, {:.1} GB system RAM, {} threads",
         total_gb, sys_gb, n_threads);
-    crate::selphi_info!("    ref_bm={:.0} MB  target={:.0} MB  preload={:.0} MB  hmm={:.0} MB  interp={:.0} MB  vcf={:.0} MB",
-        ref_bm_mb, targ_mb, preload_mb, hmm_mb, interp_mb + stripe_decomp_mb, vcf_mb);
+    crate::selphi_info!("    ref_bm={:.0} MB  target={:.0} MB  preload={:.0} MB  hmm={:.0} MB  weights={:.0} MB  posterior={:.0} MB  interp={:.0} MB  vcf={:.0} MB",
+        ref_bm_mb, targ_mb, preload_mb, hmm_mb, weights_mb, hap_posterior_mb, interp_mb + stripe_decomp_mb, vcf_mb);
 
     if sys_ram > 0.0 && total_mb > sys_ram * 0.9 {
         crate::selphi_info!("  ⚠ WARNING: estimated memory ({:.1} GB) exceeds 90% of system RAM ({:.1} GB)",

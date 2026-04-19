@@ -663,6 +663,14 @@ pub struct HmmResult {
     pub hap_posterior: Option<Vec<f64>>,
 }
 
+/// Source for reference alleles at chip sites during dedup.
+/// `Bitmatrix` reads bits on demand (no dense byte alloc) — preferred at
+/// biobank scale where the dense `n_chip × n_ref` buffer is hundreds of MB.
+pub enum RefAlleleSource<'a> {
+    Bytes(&'a [u8]),
+    Bitmatrix { bm: &'a crate::common::HaplotypeBitmatrix, chip_start: usize },
+}
+
 pub fn calculate_weights(
     match_matrix: &CscMatchMatrix,
     distances_cm: &[f64],
@@ -670,12 +678,13 @@ pub fn calculate_weights(
     n_ref_haps: usize,
     est_ne: f64,
     min_perr: f64,
-    ref_alleles: Option<&[u8]>,
+    ref_alleles: Option<RefAlleleSource<'_>>,
     n_chip: usize,
     site_emission_ratios: Option<&[f64]>,
     ne_per_site: Option<&[f64]>,
     hap_prior: Option<&[f64]>,
     _cluster_cm: f64,
+    compute_posterior: bool,
 ) -> HmmResult {
     // 1. Process matches: CSC → scored top-K → freq filter → range expansion
     let expanded = match_processing::process_matches(match_matrix, 50);
@@ -690,8 +699,11 @@ pub fn calculate_weights(
     let _ext_total: usize = filtered.iter().map(|v| v.len()).sum();
 
     // 4. Optional deduplication
-    let dedup_result: Option<DedupResult> = ref_alleles.map(|ra| {
-        hap_dedup::deduplicate_haplotypes(&filtered, ra, n_chip, n_ref_haps)
+    let dedup_result: Option<DedupResult> = ref_alleles.map(|src| match src {
+        RefAlleleSource::Bytes(ra) =>
+            hap_dedup::deduplicate_haplotypes(&filtered, ra, n_chip, n_ref_haps),
+        RefAlleleSource::Bitmatrix { bm, chip_start } =>
+            hap_dedup::deduplicate_haplotypes_bm(&filtered, bm, chip_start, n_chip, n_ref_haps),
     });
 
     let matches_for_hmm: &[Vec<i64>] = if let Some(ref dr) = dedup_result {
@@ -891,10 +903,10 @@ pub fn calculate_weights(
     // Reverse to ascending order by start
     results.reverse();
 
-    // Build hap_posterior: expand last forward alpha from HMM states → per-haplotype
-    // This serves as the prior for the next window's HMM.
-    // Always compute posterior for cross-window passthrough
-    let hap_posterior = {
+    // Build hap_posterior only when requested (cross-window passthrough).
+    // On the last window this is never consumed — skip the n_ref_haps f64 alloc.
+    // At biobank scale (171K haps × 10K targets) this saves ~13 GB.
+    let hap_posterior = if compute_posterior {
         let last_alpha = &fwd_blocks.last().unwrap().0;
         let n_rows_last = fwd_blocks.last().unwrap().1;
         let alpha_end = &last_alpha[(n_rows_last - 1) * n_states..n_rows_last * n_states];
@@ -902,10 +914,11 @@ pub fn calculate_weights(
         for (si, &hap_id) in state_to_hap.iter().enumerate() {
             hp[hap_id as usize] += alpha_end[si] as f64;
         }
-        // Normalize
         let s: f64 = hp.iter().sum();
         if s > 0.0 { for v in &mut hp { *v /= s; } }
         Some(hp)
+    } else {
+        None
     };
 
     // Dump weights for hap0 to file for comparison
@@ -1013,7 +1026,7 @@ mod tests {
         let breaks = vec![(0usize, n_var)];
 
         let result = calculate_weights(
-            &csc, &cm, &breaks, n_haps, 50000.0, 0.0001, None, n_var, None, None, None, 0.0,
+            &csc, &cm, &breaks, n_haps, 50000.0, 0.0001, None::<RefAlleleSource>, n_var, None, None, None, 0.0, false,
         ).weights;
 
         assert_eq!(result.len(), 1);
