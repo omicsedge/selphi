@@ -385,8 +385,6 @@ pub fn run_multi_chr(
                 n_ref, n_haps, match_length, fl_fwd, fl_bwd,
                 est_ne: est_ne as f64, p_err: config.p_err,
                 max_candidates: config.max_candidates,
-                n_scaffold: 0,
-                scaffold_bridge: None,
                 compute_posterior: wi + 1 < windows.len(),
             };
             let n_var_w = window.chip_end - window.chip_start;

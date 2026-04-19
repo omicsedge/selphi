@@ -19,7 +19,7 @@ use super::pbwt;
 const FULL_PANEL_HMM_THRESHOLD: usize = 100;
 
 /// Parameters for per-window HMM processing.
-pub struct WindowHmmParams<'a> {
+pub struct WindowHmmParams {
     pub n_ref: usize,
     pub n_haps: usize,
     pub match_length: usize,
@@ -28,14 +28,6 @@ pub struct WindowHmmParams<'a> {
     pub est_ne: f64,
     pub p_err: f64,
     pub max_candidates: usize,
-    /// Extra PBWT-participating haps living past `n_ref`, i.e. in
-    /// `[n_ref, n_ref + n_scaffold)`. Used for Target-Augmented Dynamic Panel.
-    pub n_scaffold: usize,
-    /// Bridge that maps scaffold hap index `i ∈ [0, n_scaffold)` to its nearest
-    /// WGS hap in `[0, n_ref)`. Scaffold candidates are remapped through this
-    /// bridge before entering the HMM so the emission never touches scaffold
-    /// bits (scaffold only covers chip positions, not WGS-only sites).
-    pub scaffold_bridge: Option<&'a [u32]>,
     /// Whether the HMM should compute `hap_posterior` for cross-window passthrough.
     /// Set to false on the final window — the posterior is an `n_ref`-sized f64
     /// vector per target that would never be read, saving ~13 GB at biobank scale.
@@ -78,10 +70,8 @@ pub fn impute_window(
     let targ_w: &[u8] = &inputs.targ_alleles[inputs.chip_start * params.n_haps .. inputs.chip_end * params.n_haps];
     let cm_w = &inputs.chip_cm[inputs.chip_start..inputs.chip_end];
 
-    // PBWT sees the full augmented hap pool (WGS + scaffold); the HMM stays on WGS.
-    let n_ref_total = params.n_ref + params.n_scaffold;
     let coded = super::pbwt::build_coded_steps_bm(
-        inputs.ref_bm, inputs.chip_start, n_var_w, n_ref_total,
+        inputs.ref_bm, inputs.chip_start, n_var_w, params.n_ref,
         targ_w, params.n_haps, cm_w, 0.05,
     );
 
@@ -112,10 +102,8 @@ pub fn process_window_hmm(
     n_var_w: usize,
 ) -> WindowHmmOutput {
     let n_ref = params.n_ref;
-    let n_scaffold = params.n_scaffold;
-    let n_ref_total = n_ref + n_scaffold;
     let n_haps = params.n_haps;
-    let m = n_ref_total + n_haps;
+    let m = n_ref + n_haps;
     let match_length = params.match_length;
     let fl_fwd = params.fl_fwd;
     let fl_bwd = params.fl_bwd;
@@ -128,45 +116,16 @@ pub fn process_window_hmm(
         .into_par_iter()
         .map(|tgt| {
             let prior = hap_priors[tgt].as_deref();
-            let raw_candidates = if let Some(pc) = precomputed_candidates {
+            let candidates = if let Some(pc) = precomputed_candidates {
                 pc[tgt].clone()
             } else {
-                pbwt::select_candidates(coded, n_ref_total + tgt, n_ref_total, 7, max_candidates)
-            };
-            // Remap scaffold candidates (idx >= n_ref) to their WGS nearest
-            // neighbour so the HMM only ever sees WGS haps (scaffold haps
-            // carry no data at WGS-only sites). Dedup because a WGS hap may
-            // appear both directly and as a bridge target.
-            let candidates: Vec<u32> = if n_scaffold > 0 {
-                let bridge = params.scaffold_bridge
-                    .expect("scaffold_bridge required when n_scaffold > 0");
-                let mut seen = vec![false; n_ref];
-                let mut out = Vec::with_capacity(raw_candidates.len());
-                for c in raw_candidates {
-                    let w = if (c as usize) < n_ref {
-                        c
-                    } else {
-                        bridge[c as usize - n_ref]
-                    };
-                    if !seen[w as usize] {
-                        seen[w as usize] = true;
-                        out.push(w);
-                    }
-                }
-                out.sort_unstable();
-                out
-            } else {
-                raw_candidates
+                pbwt::select_candidates(coded, n_ref + tgt, n_ref, 7, max_candidates)
             };
             let n_cand = candidates.len();
             if n_cand == 0 {
                 return (tgt, HmmResult { weights: Vec::new(), hap_posterior: None });
             }
-            // The is_full path rebuilds a dense panel of size `m = n_ref_total + n_haps`,
-            // which would include empty scaffold slots. After remap we only have
-            // WGS candidates, so force the common path whenever a scaffold is
-            // active — keeps the reduced array a clean (n_cand+1) vector.
-            let is_full = n_cand < FULL_PANEL_HMM_THRESHOLD && n_scaffold == 0;
+            let is_full = n_cand < FULL_PANEL_HMM_THRESHOLD;
             let m_red = if is_full { m } else { n_cand + 1 };
 
             thread_local! {
