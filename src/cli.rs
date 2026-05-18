@@ -148,6 +148,18 @@ pub struct Args {
     #[arg(long)]
     pub no_em_ne: bool,
 
+    /// Use chromosome-level precomputed PBWT candidates instead of the
+    /// per-window default. Off by default — per-window selection avoids
+    /// a truncation bias against segment-specific haps on admixed targets
+    /// (haps that match in only one chromosomal region get filtered out
+    /// of the global top-K aggregation but survive the local per-window
+    /// top-K). Also scales naturally to biobank panels (no n_haps ×
+    /// max_candidates × 4 chr-wide allocation that would explode at
+    /// 100K+ samples). Empirically: per-window default +0.005–0.007
+    /// OVERALL R² on admixed cohorts, no regression on pure cohorts.
+    #[arg(long)]
+    pub precompute_candidates: bool,
+
     /// Output VCF.gz instead of BCF (default: BCF for speed)
     #[arg(long)]
     pub vcf: bool,
