@@ -217,6 +217,174 @@ pub fn write_bref3_from_bcf(source_path: &Path, output_path: &Path) -> io::Resul
     Ok(())
 }
 
+/// Convert an existing SRP panel directly to BREF3 without round-tripping
+/// through BCF/VCF.
+///
+/// Reads variants in chunks (default 65_536 variants ≈ 800 MB at n_haps ≈ 10k)
+/// via `SrpReader::extract_ref_alleles_bitmatrix`, builds `VariantRec`s
+/// from the unpacked bits, and feeds them through the same SeqCoder + block
+/// writer pipeline used by `write_bref3_from_bcf`. Byte-identical output for
+/// the same input panel.
+pub fn write_bref3_from_srp(source_path: &Path, output_path: &Path) -> io::Result<()> {
+    use crate::srp::SrpReader;
+
+    let mut reader = SrpReader::open(source_path, 0)?;
+    reader.load_tiled();
+    let n_haps = reader.n_haps();
+    let n_samples = n_haps / 2;
+    let n_variants = reader.n_variants();
+    let max_n_seq = default_max_n_seq(n_samples);
+    let max_seq_coding_major_cnt = ((n_haps as f64 * 0.995) - 1.0).floor() as usize;
+    let non_maj_threshold = n_haps - max_seq_coding_major_cnt;
+
+    let bref3_path = if output_path.extension().is_none_or(|e| e != "bref3") {
+        output_path.with_extension("bref3")
+    } else {
+        output_path.to_path_buf()
+    };
+
+    crate::selphi_info!("  BREF3: {} samples, {} haps, {} variants, maxNSeq={}, nonMajThreshold={}",
+        n_samples, n_haps, n_variants, max_n_seq, non_maj_threshold);
+
+    let snv_perms = snv_perms();
+    let chrom_name = reader.chromosome().to_string();
+
+    // Derive Beagle-style sample IDs from the 2*n_haps sample list.
+    // SRP stores per-hap identifiers; BREF3 headers want per-sample.
+    // We take even-indexed haps and strip `_0`/`_1`/`#0`/`#1` suffixes if present.
+    let sample_names: Vec<String> = (0..n_samples).map(|s| {
+        let raw = reader.sample_ids.get(s * 2).cloned().unwrap_or_else(|| format!("S{}", s));
+        // Strip common per-hap suffixes
+        for suf in ["_0", "_1", "#0", "#1", ":0", ":1"] {
+            if let Some(stripped) = raw.strip_suffix(suf) {
+                return stripped.to_string();
+            }
+        }
+        raw
+    }).collect();
+
+    let mut w = BufWriter::with_capacity(4 << 20, std::fs::File::create(&bref3_path)?);
+    let mut bytes_written: u64 = 0;
+
+    bytes_written += write_i32_c(&mut w, MAGIC_NUMBER_V3)?;
+    bytes_written += write_utf_c(&mut w, "selphi_2.0.0_converter_bref3")?;
+    bytes_written += write_string_array_c(&mut w, &sample_names)?;
+
+    let mut block_recs: Vec<VariantRec> = Vec::with_capacity(512);
+    let mut block_encodings: Vec<RecEncoding> = Vec::with_capacity(512);
+    let mut hap_to_seq = vec![0u16; n_haps];
+    let mut n_seq: u16 = 1;
+    let mut seq_cnt = vec![n_haps as u32; 1];
+    let mut total_variants = 0u64;
+    let mut total_blocks = 0u64;
+    let mut block_index: Vec<(u64, i32)> = Vec::new();
+
+    const CHUNK: usize = 65_536;
+    let mut idx = 0;
+    while idx < n_variants {
+        let hi = (idx + CHUNK).min(n_variants);
+        let wgs_idx: Vec<usize> = (idx..hi).collect();
+        let bm = reader.extract_ref_alleles_bitmatrix(&wgs_idx);
+
+        // Unpack each variant row from the chunk.
+        for (local_i, gi) in wgs_idx.iter().enumerate() {
+            let v = &reader.variants[*gi];
+            let mut alleles = vec![0u8; n_haps];
+            let row = bm.row(local_i);
+            for h in 0..n_haps {
+                let w_idx = h / 64;
+                let bit = 1u64 << (h % 64);
+                if row[w_idx] & bit != 0 {
+                    alleles[h] = 1;
+                }
+            }
+            let alt_count: usize = alleles.iter().filter(|&&a| a > 0).count();
+            let ref_count = n_haps - alt_count;
+            let (major_allele, minor_count) = if ref_count >= alt_count {
+                (0u8, alt_count)
+            } else {
+                (1u8, ref_count)
+            };
+
+            let rec = VariantRec {
+                pos: v.pos as i32,
+                id: String::new(),
+                ref_allele: v.ref_allele.clone(),
+                alt_allele: v.alt_allele.clone(),
+                alleles,
+                major_allele,
+                minor_count,
+            };
+
+            let use_seq = rec.minor_count >= non_maj_threshold;
+            if use_seq {
+                let overflow = seq_coder_update(
+                    &mut hap_to_seq, &mut n_seq, &mut seq_cnt,
+                    &rec.alleles, rec.major_allele, n_haps, max_n_seq,
+                );
+                if overflow {
+                    if !block_recs.is_empty() {
+                        bytes_written += write_bref3_block(
+                            &mut w, &chrom_name, &block_recs, &block_encodings,
+                            &hap_to_seq, n_seq, n_haps, &snv_perms, bytes_written, &mut block_index,
+                        )?;
+                        total_variants += block_recs.len() as u64;
+                        total_blocks += 1;
+                        block_recs.clear();
+                        block_encodings.clear();
+                    }
+                    hap_to_seq.fill(0);
+                    n_seq = 1;
+                    seq_cnt.clear();
+                    seq_cnt.push(n_haps as u32);
+                    seq_coder_update(
+                        &mut hap_to_seq, &mut n_seq, &mut seq_cnt,
+                        &rec.alleles, rec.major_allele, n_haps, max_n_seq,
+                    );
+                }
+                block_encodings.push(RecEncoding::Seq);
+            } else {
+                block_encodings.push(RecEncoding::Allele);
+            }
+            block_recs.push(rec);
+        }
+
+        idx = hi;
+    }
+
+    if !block_recs.is_empty() {
+        bytes_written += write_bref3_block(
+            &mut w, &chrom_name, &block_recs, &block_encodings,
+            &hap_to_seq, n_seq, n_haps, &snv_perms, bytes_written, &mut block_index,
+        )?;
+        total_variants += block_recs.len() as u64;
+        total_blocks += 1;
+    }
+
+    // End sentinel + index (mirror write_bref3_from_bcf)
+    bytes_written += write_i32_c(&mut w, 0)?;
+    let index_start = bytes_written;
+    let chroms: Vec<String> = vec![chrom_name.clone()];
+    let chrom_starts: Vec<i32> = vec![0];
+    bytes_written += write_string_array_c(&mut w, &chroms)?;
+    for &s in &chrom_starts { bytes_written += write_i32_c(&mut w, s)?; }
+    let mut last_ci: i32 = -1;
+    for &(offset, pos) in &block_index {
+        let mut off = offset as i64;
+        if last_ci < 0 { off = -off; last_ci = 0; }
+        bytes_written += write_i64_c(&mut w, off)?;
+        bytes_written += write_i32_c(&mut w, pos)?;
+    }
+    bytes_written += write_i64_c(&mut w, -999_999_999_999_999)?;
+    write_i64_c(&mut w, index_start as i64)?;
+    w.flush()?;
+
+    let size = std::fs::metadata(&bref3_path)?.len();
+    crate::selphi_info!("  BREF3: {} variants in {} blocks, {} ({:.1} MB)",
+        total_variants, total_blocks, bref3_path.display(), size as f64 / 1e6);
+    Ok(())
+}
+
 /// SeqCoder update: sequence-coded split with parallel inner loops.
 /// Returns true if n_seq overflowed (caller must flush and retry).
 fn seq_coder_update(

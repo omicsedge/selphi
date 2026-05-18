@@ -459,7 +459,20 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         selphi_info!("  Note: both --panel-ancestry and --target-ancestry are required to activate ancestry reweighting; running baseline.");
     }
 
-    let precomputed_candidates: Option<Vec<Vec<u32>>> = if needs_phasing && precomp_bytes <= precomp_cap_bytes {
+    // Per-window candidate selection is the default. Each imputation window
+    // picks its own top-K candidates from window-local PBWT coded steps so
+    // segment-specific haplotypes survive on admixed targets (where the
+    // chromosome-level top-K aggregation would truncate them out). On
+    // pure-pop cohorts the two strategies give bit-identical R². Empirical:
+    // +0.005-0.007 OVERALL R² on MESA admixed (chr20, 4900-sample panel)
+    // and no regression on 1KG 801s chr22. Also scales naturally to
+    // biobank panels — no chr-wide n_haps × max_candidates × 4 allocation
+    // that would explode at 100K+ samples.
+    //
+    // Pass `--precompute-candidates` to fall back to the chr-level path
+    // (faster on small panels but susceptible to the truncation bias on
+    // admixed cohorts).
+    let precomputed_candidates: Option<Vec<Vec<u32>>> = if args.precompute_candidates && needs_phasing && precomp_bytes <= precomp_cap_bytes {
         let t0_cand = Instant::now();
         let coded_full = selphi::imputation::pbwt::build_coded_steps_bm(
             &ref_bm_imp, 0, n_chip, n_ref, &targ_alleles, n_haps, &chip_cm, 0.05,

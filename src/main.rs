@@ -270,8 +270,13 @@ fn main() {
         let start_time = Instant::now();
         if output_bref3 {
             selphi_step!("Writing BREF3...");
-            selphi::srp::bref3_writer::write_bref3_from_bcf(Path::new(source), Path::new(output))
-                .unwrap_or_else(|e| { selphi_error!("BREF3 write failed: {}", e); std::process::exit(1); });
+            if is_srp_input {
+                selphi::srp::bref3_writer::write_bref3_from_srp(Path::new(source), Path::new(output))
+                    .unwrap_or_else(|e| { selphi_error!("BREF3 write failed: {}", e); std::process::exit(1); });
+            } else {
+                selphi::srp::bref3_writer::write_bref3_from_bcf(Path::new(source), Path::new(output))
+                    .unwrap_or_else(|e| { selphi_error!("BREF3 write failed: {}", e); std::process::exit(1); });
+            }
         } else if is_bref3 {
             let srp_path = if Path::new(output).extension().is_none_or(|e| e != "srp") {
                 PathBuf::from(output).with_extension("srp")
