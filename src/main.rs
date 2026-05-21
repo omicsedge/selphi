@@ -37,6 +37,7 @@ fn main() {
         .build_global()
         .ok();
 
+
     // --- Evaluate accuracy mode ---
     if let Some(ref imputed) = args.evaluate {
         let truth = args.truth.as_ref().expect("--truth required with --evaluate");
@@ -120,6 +121,9 @@ fn main() {
             match_length: args.match_length,
             est_ne: args.est_ne,
             max_candidates: args.max_candidates,
+            // sample_batch_size (user-facing): N SAMPLES per batch.
+            // Internally stored as N × 2 hap units (diploid).
+            target_batch_size: args.sample_batch_size.saturating_mul(2),
             p_err: args.p_err,
             no_ap: args.no_ap,
             no_em_ne: args.no_em_ne,
@@ -352,6 +356,9 @@ fn main() {
             match_length: args.match_length,
             est_ne: args.est_ne,
             max_candidates: args.max_candidates,
+            // sample_batch_size (user-facing): N SAMPLES per batch.
+            // Internally stored as N × 2 hap units (diploid).
+            target_batch_size: args.sample_batch_size.saturating_mul(2),
             p_err: args.p_err,
             no_ap: args.no_ap,
             no_em_ne: args.no_em_ne,

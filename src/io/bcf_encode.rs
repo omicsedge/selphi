@@ -258,6 +258,152 @@ pub fn encode_imputed_record(
     buf[shared_start + 4..shared_start + 8].copy_from_slice(&l_indiv.to_le_bytes());
 }
 
+/// Partial encoder for batched mode: writes BCF record WITHOUT INFO stats
+/// (no DR2/AF/AC/AN/IMP). Sample data only (GT/DS/AP1/AP2). The merger
+/// reads N batch records, concatenates sample data, and recomputes INFO
+/// from full concatenated dosages before writing the final BCF record.
+///
+/// `alt_probs` layout: `alt_probs[(sample_local*2 + hap) * tile_n + v]`
+/// where sample_local is 0..n_samples_in_batch (NOT the global sample index).
+pub fn encode_imputed_record_partial(
+    buf: &mut Vec<u8>,
+    pos_0based: i32,
+    id: &[u8],
+    ref_allele: &[u8],
+    alt_allele: &[u8],
+    alt_probs: &[f32],
+    tile_n: usize,
+    v: usize,
+    n_samples_in_batch: usize,
+    no_ap: bool,
+) {
+    let n_fmt: u8 = if no_ap { 2 } else { 4 };
+    let n_info: u16 = 0;
+
+    let shared_start = buf.len();
+    buf.extend_from_slice(&[0u8; 8]); // placeholder for l_shared, l_indiv
+
+    buf.extend_from_slice(&0i32.to_le_bytes());        // chrom
+    buf.extend_from_slice(&pos_0based.to_le_bytes());   // pos
+    let rlen = ref_allele.len() as i32;
+    buf.extend_from_slice(&rlen.to_le_bytes());          // rlen
+    buf.extend_from_slice(&QUAL_MISSING.to_le_bytes());  // qual
+    buf.extend_from_slice(&n_info.to_le_bytes());        // n_info = 0
+    buf.extend_from_slice(&2u16.to_le_bytes());          // n_allele
+    let fmt_sample = (n_fmt as u32) << 24 | (n_samples_in_batch as u32);
+    buf.extend_from_slice(&fmt_sample.to_le_bytes());
+
+    encode_typed_string(buf, id);
+    encode_typed_string(buf, ref_allele);
+    encode_typed_string(buf, alt_allele);
+
+    // FILTER = PASS
+    buf.push(0x10 | TY_INT8);
+    buf.push(FILTER_PASS_IDX);
+    // No INFO fields
+
+    let l_shared = (buf.len() - shared_start - 8) as u32;
+
+    let indiv_start = buf.len();
+
+    // GT: key + descriptor + 2 bytes/sample
+    encode_typed_int8(buf, FMT_GT_IDX as i32);
+    buf.push(0x20 | TY_INT8); // n=2, type=int8
+    for s in 0..n_samples_in_batch {
+        let ap1 = alt_probs[(s * 2) * tile_n + v];
+        let ap2 = alt_probs[(s * 2 + 1) * tile_n + v];
+        let g1 = if ap1 > 0.5 { 0x04u8 } else { 0x02u8 };
+        let g2 = if ap2 > 0.5 { 0x05u8 } else { 0x03u8 };
+        buf.push(g1);
+        buf.push(g2);
+    }
+
+    // DS: key + descriptor + 4 bytes/sample
+    encode_typed_int8(buf, FMT_DS_IDX as i32);
+    buf.push(0x10 | TY_FLOAT);
+    for s in 0..n_samples_in_batch {
+        let ap1 = alt_probs[(s * 2) * tile_n + v];
+        let ap2 = alt_probs[(s * 2 + 1) * tile_n + v];
+        buf.extend_from_slice(&(ap1 + ap2).to_le_bytes());
+    }
+
+    if !no_ap {
+        encode_typed_int8(buf, FMT_AP1_IDX as i32);
+        buf.push(0x10 | TY_FLOAT);
+        for s in 0..n_samples_in_batch {
+            let ap1 = alt_probs[(s * 2) * tile_n + v];
+            buf.extend_from_slice(&ap1.to_le_bytes());
+        }
+
+        encode_typed_int8(buf, FMT_AP2_IDX as i32);
+        buf.push(0x10 | TY_FLOAT);
+        for s in 0..n_samples_in_batch {
+            let ap2 = alt_probs[(s * 2 + 1) * tile_n + v];
+            buf.extend_from_slice(&ap2.to_le_bytes());
+        }
+    }
+
+    let l_indiv = (buf.len() - indiv_start) as u32;
+
+    buf[shared_start..shared_start + 4].copy_from_slice(&l_shared.to_le_bytes());
+    buf[shared_start + 4..shared_start + 8].copy_from_slice(&l_indiv.to_le_bytes());
+}
+
+/// Partial encoder for batched mode (chip variant): BCF record with NO INFO stats.
+/// Merger recomputes AF/AC/AN at end. GT-only sample data.
+pub fn encode_chip_record_partial(
+    buf: &mut Vec<u8>,
+    pos_0based: i32,
+    id: &[u8],
+    ref_allele: &[u8],
+    alt_allele: &[u8],
+    chip_genotypes: &[u8],
+    chip_idx: usize,
+    n_samples_in_batch: usize,
+    sample_offset: usize,    // global sample index of batch's first sample
+    n_haps: usize,            // global n_haps for chip_genotypes indexing
+) {
+    let n_info: u16 = 0;
+    let n_fmt: u8 = 1;
+
+    let shared_start = buf.len();
+    buf.extend_from_slice(&[0u8; 8]);
+
+    buf.extend_from_slice(&0i32.to_le_bytes());
+    buf.extend_from_slice(&pos_0based.to_le_bytes());
+    buf.extend_from_slice(&1i32.to_le_bytes());
+    buf.extend_from_slice(&QUAL_MISSING.to_le_bytes());
+    buf.extend_from_slice(&n_info.to_le_bytes());
+    buf.extend_from_slice(&2u16.to_le_bytes());
+    let fmt_sample = (n_fmt as u32) << 24 | (n_samples_in_batch as u32);
+    buf.extend_from_slice(&fmt_sample.to_le_bytes());
+
+    encode_typed_string(buf, id);
+    encode_typed_string(buf, ref_allele);
+    encode_typed_string(buf, alt_allele);
+
+    buf.push(0x10 | TY_INT8);
+    buf.push(FILTER_PASS_IDX);
+
+    let l_shared = (buf.len() - shared_start - 8) as u32;
+    let indiv_start = buf.len();
+
+    encode_typed_int8(buf, FMT_GT_IDX as i32);
+    buf.push(0x20 | TY_INT8);
+    for s in 0..n_samples_in_batch {
+        let gs = sample_offset + s;
+        let a0 = chip_genotypes[chip_idx * n_haps + gs * 2];
+        let a1 = chip_genotypes[chip_idx * n_haps + gs * 2 + 1];
+        buf.push((a0 + 1) << 1);
+        buf.push(((a1 + 1) << 1) | 1);
+    }
+
+    let l_indiv = (buf.len() - indiv_start) as u32;
+
+    buf[shared_start..shared_start + 4].copy_from_slice(&l_shared.to_le_bytes());
+    buf[shared_start + 4..shared_start + 8].copy_from_slice(&l_indiv.to_le_bytes());
+}
+
 /// Encode a BCF2 record for a chip (genotyped) variant.
 pub fn encode_chip_record(
     buf: &mut Vec<u8>,
