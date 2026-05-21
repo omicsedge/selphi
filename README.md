@@ -84,6 +84,23 @@ selphi \
 
 Selphi auto-detects whether the SRP file contains one or multiple chromosomes. Each chromosome is processed sequentially, with the next chromosome's data pre-loaded in the background to minimize idle time between transitions.
 
+### Memory-bounded mode (biobank-scale)
+
+For panels where memory is the binding constraint, pass `--sample-batch-size N` to process target samples in batches of N. BCF format only; output is bit-identical to the non-batched run.
+
+```bash
+selphi \
+  --refpanel topmed.srp \
+  --input cohort.vcf.gz \
+  --map genetic_map.map \
+  --out imputed \
+  --bcf \
+  --sample-batch-size 100 \
+  --threads 16
+```
+
+Memory peak scales linearly with `sample-batch-size`. Tradeoff: ~30-40% wall overhead from the per-window batch BCFs being merged at the end.
+
 #### Preparing the input files
 
 **Reference panel.** Merge per-chromosome SRP files into a single multi-chromosome SRP:
@@ -333,6 +350,7 @@ Standard VCF or BCF. Unphased (`0/1`) or phased (`0|1`) genotypes. Multi-allelic
 | `--max-cond-haps N` | Max conditioning haplotypes per diploid phasing window (0 = unlimited). IBS-selected. Try 120–200 for faster phasing. | 0 |
 | `--window-cm F` | Imputation window size in cM | 80 |
 | `--overlap-cm F` | Window overlap in cM | 2 |
+| `--sample-batch-size N` | Memory-bounded mode: process target samples in batches of N. 0 = off (max wall, max RAM). > 0 = streams per-batch BCFs to disk then merges → ~5× memory reduction at ~30-40% wall overhead. Bit-identical output. BCF format only. | 0 |
 
 ## Method
 

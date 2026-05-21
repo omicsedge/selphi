@@ -78,9 +78,15 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         std::process::exit(1);
     }
 
-    // Memory estimation + warning
+    // Memory estimation + auto-reduce threads to fit in 92 % of system RAM.
+    // If even single-threaded would OOM, this aborts the process before any
+    // heavy allocation. Otherwise we wrap the heavy work in a sub-pool
+    // sized to the safe thread count (rayon's global pool was already
+    // initialised to args.threads in main.rs).
     let needs_phasing_estimate = !is_phased || args.force_phasing;
-    selphi::log::estimate_and_warn(n_chip, n_ref, n_samples, args.threads, needs_phasing_estimate);
+    let _effective_threads = selphi::log::estimate_and_warn(
+        n_chip, n_ref, n_samples, args.threads, needs_phasing_estimate,
+    );
 
     // 5. Extract target alleles at chip sites (before ref — needed for MAF filter)
     let targ_alleles = extract_target_alleles(&target_genotypes, &target_idx, n_chip, n_haps);
@@ -376,8 +382,13 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         ).expect("Failed to setup SelfDecode writer"))
     } else { None };
 
-    // VCF/BCF channel-based writer (active if VCF or BCF format enabled)
-    let (vcf_tx, vcf_writer, vcf_bgzip) = if formats.vcf || formats.bcf {
+    // VCF/BCF channel-based writer (active if VCF or BCF format enabled).
+    // SKIPPED when batched-BCF is active — the per-batch writers + merger
+    // produce the final BCF directly at the user's output path.
+    // sample_batch_size is in SAMPLES; convert to haps (× 2) for internal use.
+    let target_batch_size_haps = args.sample_batch_size.saturating_mul(2);
+    let skip_main_writer = target_batch_size_haps > 0 && formats.bcf;
+    let (vcf_tx, vcf_writer, vcf_bgzip) = if (formats.vcf || formats.bcf) && !skip_main_writer {
         if formats.bcf {
             selphi::io::pipeline::setup_bcf_writer(
                 n_samples, &sample_names, &srp.metadata.contig_field, version, &out_file, no_ap,
@@ -403,6 +414,26 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         if formats.pgen { fmts.push("PGEN"); }
         if formats.selfdecode { fmts.push("SelfDecode"); }
         selphi_info!("  formats:  {}", fmts.join(" + "));
+    }
+
+    // Batched-BCF writers (when --target-batch-size > 0 and BCF output requested).
+    // These write per-batch intermediate BCFs that are merged at end of imputation.
+    // Currently runs IN ADDITION to the main writer for validation; production may
+    // disable the main writer when batched is on.
+    let batched_bcf_active = target_batch_size_haps > 0 && formats.bcf;
+    let mut batch_writers: Vec<selphi::io::bcf_batch::BatchWriter> = if batched_bcf_active {
+        let tmp_dir = std::env::temp_dir().join(format!("selphi_batch_{}", std::process::id()));
+        let n_haps_total = n_samples * 2;
+        selphi::io::bcf_batch::setup_batch_writers(
+            n_haps_total, target_batch_size_haps, &tmp_dir,
+            &sample_names, &srp.metadata.contig_field, version, no_ap,
+        ).expect("Failed to setup batch writers")
+    } else {
+        Vec::new()
+    };
+    if batched_bcf_active {
+        selphi_info!("  batched: {} batch BCF writers active (batch_size={} haps)",
+            batch_writers.len(), target_batch_size_haps);
     }
 
     // Compute MAF-adaptive Ne per site: rare variants need lower Ne (concentrated
@@ -567,6 +598,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // Cross-window HMM state passthrough: forward state from window N → prior for window N+1
     let mut hap_priors: Vec<Option<Vec<f64>>> = vec![None; n_haps];
     let n_cores = rayon::current_num_threads();
+
     for (wi, window) in windows.iter().enumerate() {
         let t0_win = Instant::now();
         let cpu0_win = selphi::log::cpu_time_secs();
@@ -654,6 +686,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
             n_ref, n_haps, match_length, fl_fwd, fl_bwd,
             est_ne: est_ne as f64, p_err, max_candidates,
             compute_posterior: wi + 1 < windows.len(),
+            target_batch_size: target_batch_size_haps,
         };
         let inputs = selphi::imputation::window_process::ImputeWindowInputs {
             ref_bm: &ref_bm_imp,
@@ -663,9 +696,57 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
             chip_start: window.chip_start,
             chip_end: window.chip_end,
         };
-        let hmm_output = selphi::imputation::window_process::impute_window(
-            &inputs, &hmm_params, precomputed_candidates.as_ref(), &mut hap_priors,
-        );
+        // Streaming callback for batched-BCF mode: each batch's CSRs are
+        // written immediately to the corresponding batch BCF and then dropped.
+        // This bounds memory peak in the HMM section by batch_size × per_csr
+        // instead of n_haps × per_csr.
+        let (cs, os, oe) = (window.chip_start, window.own_chip_start, window.own_chip_end);
+        let hmm_output = if batched_bcf_active && !batch_writers.is_empty() {
+            let bw_ref = &batch_writers;
+            let srp_ref = &srp;
+            let wgs_ref = &wgs_idx;
+            let chip_genos_ref = &targ_alleles;
+            // batch_size in HAP units (each sample is 2 haps).
+            // The writers were created in setup_batch_writers using
+            // samples_per_batch = ceil(target_batch_size / 2). Reconstruct.
+            let mut cb = move |bs: usize, be: usize, refs: &[&selphi::imputation::hmm::CsrWeights]| -> std::io::Result<()> {
+                // Find which batch writer covers [bs, be) — same hap_start.
+                let bi = bw_ref.iter().position(|w| w.hap_start == bs)
+                    .ok_or_else(|| std::io::Error::other(format!("no batch writer for hap_start={bs}")))?;
+                let w = &bw_ref[bi];
+                if w.hap_end != be {
+                    return Err(std::io::Error::other(format!(
+                        "batch range mismatch: writer has [{}..{}), got [{bs}..{be})", w.hap_start, w.hap_end,
+                    )));
+                }
+                selphi::io::bcf_batch::write_window_bcf_batched(
+                    selphi::io::bcf_batch::WindowBatchInput {
+                        srp: srp_ref,
+                        weights: refs,
+                        hap_start: bs, hap_end: be,
+                        win_chip_start: cs,
+                        own_chip_start: os,
+                        own_chip_end: oe,
+                        wgs_idx: wgs_ref,
+                        n_samples_total: n_samples,
+                        chip_genotypes: chip_genos_ref,
+                        no_ap,
+                        preloaded_chunks: None,
+                        preloaded_stripes: None,
+                    },
+                    &w.tx,
+                )
+            };
+            selphi::imputation::window_process::impute_window(
+                &inputs, &hmm_params, precomputed_candidates.as_ref(), &mut hap_priors,
+                Some(&mut cb),
+            )
+        } else {
+            selphi::imputation::window_process::impute_window(
+                &inputs, &hmm_params, precomputed_candidates.as_ref(), &mut hap_priors,
+                None,
+            )
+        };
         let all_weights = hmm_output.all_weights;
 
         let hmm_secs = t0_hmm.elapsed().as_secs_f64();
@@ -681,10 +762,13 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         
 
         // Interpolation + output (runs BEFORE waiting for previous VCF write — no dependency)
+        // Note: when batched_bcf_active, all_weights is EMPTY (CSRs were
+        // streamed to batch writers during HMM). Skip write_window_multiformat.
         let t0_interp = Instant::now();
-        let (cs, os, oe) = (window.chip_start,
-                            window.own_chip_start, window.own_chip_end);
 
+        if all_weights.is_empty() && batched_bcf_active {
+            // Streaming path already wrote everything via callback; nothing to do here.
+        } else {
         selphi::io::pipeline::write_window_multiformat(
             &formats,
             selphi::io::pipeline::WindowInput {
@@ -707,6 +791,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                 vcf_tx: &vcf_tx,
             },
         ).expect("Output write failed");
+        }
 
         let interp_secs = t0_interp.elapsed().as_secs_f64();
 
@@ -735,6 +820,24 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
 
     }
 
+    // Finalize per-batch BCF writers + merge into final batched output.
+    // This runs BEFORE the main writer finalize so we have access to sample_names + contig_field.
+    if batched_bcf_active && !batch_writers.is_empty() {
+        let batch_writers_taken = std::mem::take(&mut batch_writers);
+        let batch_paths = selphi::io::bcf_batch::finalize_batch_writers(batch_writers_taken)
+            .expect("Failed to finalize batch writers");
+        // Merger writes directly to the user's expected output path (the main
+        // BCF writer was skipped earlier, so out_file is currently absent).
+        selphi_info!("  Merging {} batch BCFs → {} ...", batch_paths.len(), out_file.display());
+        let t_merge = Instant::now();
+        selphi::io::bcf_merge::merge_batch_bcfs(
+            &batch_paths, &out_file, &sample_names, &srp.metadata.contig_field, version, no_ap,
+        ).expect("Batch BCF merge failed");
+        selphi_info!("  Merged in {:.1}s", t_merge.elapsed().as_secs_f64());
+        // Clean up intermediate files
+        for p in &batch_paths { let _ = std::fs::remove_file(p); }
+    }
+
     // Free imputation data structures before indexing/evaluation.
     drop(targ_alleles);
     drop(srp);
@@ -759,9 +862,14 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     if let Some(sd) = selfdecode_writer {
         sd.finish().expect("Failed to finalize SelfDecode output");
     }
-    if formats.vcf || formats.bcf {
+    if (formats.vcf || formats.bcf) && !skip_main_writer {
         selphi::io::pipeline::finish_vcf_writer(vcf_tx, vcf_writer, vcf_bgzip)
             .expect("Failed to finalize VCF/BCF output");
+    } else {
+        // Dummy writer (or batched mode): just drop the sender so the thread exits.
+        drop(vcf_tx);
+        vcf_writer.join().expect("dummy writer panicked").ok();
+        drop(vcf_bgzip);
     }
 
     let final_path = out_file.clone();

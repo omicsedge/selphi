@@ -26,6 +26,8 @@ pub struct MultiChrImputeConfig {
     pub match_length: Option<usize>,
     pub est_ne: i64,
     pub max_candidates: usize,
+    /// Target-hap batch size (HAPLOTYPE units = 2 × samples). 0 = off.
+    pub target_batch_size: usize,
     pub p_err: f64,
     pub no_ap: bool,
     pub no_em_ne: bool,
@@ -386,6 +388,7 @@ pub fn run_multi_chr(
                 est_ne: est_ne as f64, p_err: config.p_err,
                 max_candidates: config.max_candidates,
                 compute_posterior: wi + 1 < windows.len(),
+                target_batch_size: config.target_batch_size,
             };
             let n_var_w = window.chip_end - window.chip_start;
 
@@ -415,9 +418,12 @@ pub fn run_multi_chr(
                 chip_start: window.chip_start,
                 chip_end: window.chip_end,
             };
-            let hmm_output = selphi::imputation::window_process::impute_window(
-                &inputs, &hmm_params, precomputed_candidates.as_ref(), &mut hap_priors,
-            );
+            let hmm_output = {
+                selphi::imputation::window_process::impute_window(
+                    &inputs, &hmm_params, precomputed_candidates.as_ref(), &mut hap_priors,
+                    None, // multi-chr orchestrate.rs doesn't support batched streaming yet
+                )
+            };
             let all_weights = hmm_output.all_weights;
 
             // Interpolation + output

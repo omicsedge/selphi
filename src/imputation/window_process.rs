@@ -32,6 +32,13 @@ pub struct WindowHmmParams {
     /// Set to false on the final window — the posterior is an `n_ref`-sized f64
     /// vector per target that would never be read, saving ~13 GB at biobank scale.
     pub compute_posterior: bool,
+    /// Target-hap batch size (in HAPLOTYPE units = 2 × samples) for
+    /// memory-bounded HMM processing. 0 = off (single par_iter over all
+    /// targets, current behavior). > 0 = process targets in chunks. The
+    /// caller is responsible for multiplying user-provided sample count
+    /// by 2 (diploid) before storing here. Bit-identical output regardless
+    /// of batch size.
+    pub target_batch_size: usize,
 }
 
 /// Result of processing one imputation window.
@@ -64,6 +71,7 @@ pub fn impute_window(
     params: &WindowHmmParams,
     precomputed_candidates: Option<&Vec<Vec<u32>>>,
     hap_priors: &mut [Option<Vec<f64>>],
+    on_batch_done: Option<BatchDoneCb<'_>>,
 ) -> WindowHmmOutput {
     let n_var_w = inputs.chip_end - inputs.chip_start;
     // targ_alleles is (n_chip × n_haps) row-major, so the window slice is contiguous — no copy needed.
@@ -84,11 +92,28 @@ pub fn impute_window(
         ne_w.as_deref(), &coded,
         precomputed_candidates,
         hap_priors, inputs.chip_start, n_var_w,
+        on_batch_done,
     )
 }
 
+/// Callback invoked after each batch's HMM completes, when streaming mode is
+/// active. Receives the batch's hap range and per-target weight references.
+/// Implementor is responsible for writing the batch's CSRs to disk and
+/// returning Ok. After callback returns, the CSRs are dropped (no accumulation
+/// into `all_weights`), giving the memory benefit of batched processing.
+pub type BatchDoneCb<'a> = &'a mut dyn FnMut(
+    usize,                               // batch_start (hap index)
+    usize,                               // batch_end (hap index, exclusive)
+    &[&super::hmm::CsrWeights],          // weight refs for this batch
+) -> std::io::Result<()>;
+
 /// Run PBWT + HMM for all target haplotypes in a single window.
 /// Returns per-haplotype sparse weights and updated priors.
+///
+/// If `on_batch_done` is provided, each batch's CSRs are passed to the
+/// callback IMMEDIATELY after the batch finishes (then dropped), and the
+/// returned `WindowHmmOutput.all_weights` is empty. This is the streaming
+/// path that bounds memory peak by batch size.
 pub fn process_window_hmm(
     params: &WindowHmmParams,
     ref_bm: &HaplotypeBitmatrix,
@@ -100,6 +125,7 @@ pub fn process_window_hmm(
     hap_priors: &mut [Option<Vec<f64>>],
     chip_start: usize,
     n_var_w: usize,
+    mut on_batch_done: Option<BatchDoneCb<'_>>,
 ) -> WindowHmmOutput {
     let n_ref = params.n_ref;
     let n_haps = params.n_haps;
@@ -112,10 +138,24 @@ pub fn process_window_hmm(
     let max_candidates = params.max_candidates;
     let breaks_w = vec![(0usize, n_var_w)];
 
-    let all_results: Vec<(usize, HmmResult)> = (0..n_haps)
-        .into_par_iter()
-        .map(|tgt| {
-            let prior = hap_priors[tgt].as_deref();
+    // Target-hap batching: when target_batch_size > 0, process target haps
+    // in chunks of N rather than all at once. Bit-identical output (same HMM
+    // per target, same hap_priors update order). Memory peak inside HMM
+    // section becomes ~batch_size × per_target_csr instead of n_haps × per_csr.
+    let batch_size = if params.target_batch_size == 0 {
+        n_haps
+    } else {
+        params.target_batch_size.min(n_haps).max(1)
+    };
+    let mut all_weights: Vec<Vec<(usize, super::hmm::CsrWeights)>> = Vec::with_capacity(n_haps);
+
+    for batch_start in (0..n_haps).step_by(batch_size) {
+        let batch_end = (batch_start + batch_size).min(n_haps);
+        let hap_priors_view: &[Option<Vec<f64>>] = hap_priors;
+        let batch_results: Vec<(usize, HmmResult)> = (batch_start..batch_end)
+            .into_par_iter()
+            .map(|tgt| {
+                let prior = hap_priors_view[tgt].as_deref();
             let candidates = if let Some(pc) = precomputed_candidates {
                 pc[tgt].clone()
             } else {
@@ -206,6 +246,7 @@ pub fn process_window_hmm(
                 *idx = candidates[*idx as usize] as i32;
             }
             csc.n_rows = n_ref;
+
             (tgt, super::hmm::calculate_weights(
                 &csc, cm_w, &breaks_w, n_ref,
                 est_ne, p_err,
@@ -216,13 +257,31 @@ pub fn process_window_hmm(
         })
         .collect();
 
-    // Extract weights and update priors
-    let mut all_weights = Vec::with_capacity(n_haps);
-    for (tgt, r) in all_results {
-        if let Some(post) = r.hap_posterior {
-            hap_priors[tgt] = Some(post);
+        // Sequential update of hap_priors. If streaming callback present:
+        //   - Stash batch's CSRs into a local Vec, call callback, drop.
+        //   - all_weights stays empty (streaming mode).
+        // Otherwise (default): push to all_weights.
+        if let Some(ref mut cb) = on_batch_done {
+            let mut batch_weights: Vec<Vec<(usize, super::hmm::CsrWeights)>> = Vec::with_capacity(batch_end - batch_start);
+            for (tgt, r) in batch_results {
+                if let Some(post) = r.hap_posterior {
+                    hap_priors[tgt] = Some(post);
+                }
+                batch_weights.push(r.weights);
+            }
+            let batch_refs: Vec<&super::hmm::CsrWeights> = batch_weights.iter()
+                .map(|w| &w[0].1).collect();
+            cb(batch_start, batch_end, &batch_refs)
+                .expect("on_batch_done callback failed");
+            // batch_weights goes out of scope → CSRs dropped here
+        } else {
+            for (tgt, r) in batch_results {
+                if let Some(post) = r.hap_posterior {
+                    hap_priors[tgt] = Some(post);
+                }
+                all_weights.push(r.weights);
+            }
         }
-        all_weights.push(r.weights);
     }
 
     WindowHmmOutput { all_weights }

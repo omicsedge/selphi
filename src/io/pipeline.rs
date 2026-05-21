@@ -52,7 +52,7 @@ pub(crate) struct WindowSetup<'a> {
 }
 
 /// Build interpolation intervals for the owned portion of a window.
-pub(crate) fn build_intervals(
+pub fn build_intervals(
     win_chip_start: usize,
     own_chip_start: usize,
     own_chip_end: usize,
@@ -1212,7 +1212,7 @@ pub fn write_window_multiformat(
     Ok(())
 }
 
-fn interpolate_tile_preloaded(
+pub fn interpolate_tile_preloaded(
     chunk_cache: &[Option<crate::srp::CscChunk>],
     chunk_base: usize,
     weights: &[&CsrWeights],

@@ -2,6 +2,8 @@
 
 pub mod pipeline;
 pub mod bcf_encode;
+pub mod bcf_batch;
+pub mod bcf_merge;
 pub mod parquet_output;
 pub mod pgen_output;
 pub mod selfdecode_output;
