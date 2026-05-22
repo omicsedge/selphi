@@ -729,7 +729,14 @@ fn format_chip_bcf(
 
 /// Parse variant ID parts from SRP. Returns (chrom, pos_str, rsid/oid, ref, alt) or None.
 #[inline]
-fn parse_variant_parts(srp: &SrpReader, wgs_i: usize) -> Option<(&str, &str, &str, &str, &str)> {
+/// Parse `srp.ids[wgs_i]` (formatted `chrom-pos-ref-alt`) into its parts.
+/// Returns `(chrom, pos, original_id, ref_allele, alt_allele)`.
+///
+/// **Important**: `srp.ids[wgs_i]` carries the *full-length* REF/ALT,
+/// whereas `srp.variants[wgs_i].ref_allele/alt_allele` are stored with u8
+/// length and silently truncate beyond 255 chars. Use this helper (not
+/// the `Variant` struct fields) anywhere we emit REF/ALT to output.
+pub fn parse_variant_parts(srp: &SrpReader, wgs_i: usize) -> Option<(&str, &str, &str, &str, &str)> {
     let id = &srp.ids[wgs_i];
     let parts: Vec<&str> = id.splitn(4, '-').collect();
     if parts.len() < 4 { return None; }

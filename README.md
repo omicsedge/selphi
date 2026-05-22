@@ -86,7 +86,7 @@ Selphi auto-detects whether the SRP file contains one or multiple chromosomes. E
 
 ### Memory-bounded mode (biobank-scale)
 
-For panels where memory is the binding constraint, pass `--sample-batch-size N` to process target samples in batches of N. BCF format only; output is bit-identical to the non-batched run.
+For panels where memory is the binding constraint, pass `--sample-batch-size N` to process target samples in batches of N. **Supported for all output formats** (VCF, BCF, Parquet, PGEN, SelfDecode); output is bit-identical to the non-batched run.
 
 ```bash
 selphi \
@@ -99,7 +99,7 @@ selphi \
   --threads 16
 ```
 
-Memory peak scales linearly with `sample-batch-size`. Tradeoff: ~30-40% wall overhead from the per-window batch BCFs being merged at the end.
+Memory peak scales linearly with `sample-batch-size`. Tradeoff: ~30-40% wall overhead from the per-window batch outputs being merged at the end. Multiple output formats can be combined (e.g. `--bcf --parquet --pgen --sample-batch-size 100`) — each format has its own per-batch writer and native sample-merger.
 
 #### Preparing the input files
 
@@ -350,7 +350,7 @@ Standard VCF or BCF. Unphased (`0/1`) or phased (`0|1`) genotypes. Multi-allelic
 | `--max-cond-haps N` | Max conditioning haplotypes per diploid phasing window (0 = unlimited). IBS-selected. Try 120–200 for faster phasing. | 0 |
 | `--window-cm F` | Imputation window size in cM | 80 |
 | `--overlap-cm F` | Window overlap in cM | 2 |
-| `--sample-batch-size N` | Memory-bounded mode: process target samples in batches of N. 0 = off (max wall, max RAM). > 0 = streams per-batch BCFs to disk then merges → ~5× memory reduction at ~30-40% wall overhead. Bit-identical output. BCF format only. | 0 |
+| `--sample-batch-size N` | Memory-bounded mode: process target samples in batches of N. 0 = off (max wall, max RAM). > 0 = streams per-batch outputs to disk then natively merges them → ~5× memory reduction at ~30-40% wall overhead. Bit-identical output for all formats (VCF/BCF/Parquet/PGEN/SelfDecode). | 0 |
 
 ## Method
 

@@ -168,10 +168,30 @@ impl SelfdecodeWriter {
         sample_names: &[String],
         filter_hom_ref: bool,
     ) -> std::io::Result<Self> {
+        Self::new_inner(output_path, sample_names, filter_hom_ref, sample_names.len() > 1)
+    }
+
+    /// Create a SelfDecode writer for one shard of a batched output.
+    /// Forces `multi_sample=true` so per-batch ZIP entries always carry the
+    /// sample-name prefix — preventing collisions when the merger
+    /// (`sd_merge::merge_batch_sds`) concatenates entries from N batches.
+    pub fn new_batched(
+        output_path: &Path,
+        sample_names: &[String],
+        filter_hom_ref: bool,
+    ) -> std::io::Result<Self> {
+        Self::new_inner(output_path, sample_names, filter_hom_ref, true)
+    }
+
+    fn new_inner(
+        output_path: &Path,
+        sample_names: &[String],
+        filter_hom_ref: bool,
+        multi_sample: bool,
+    ) -> std::io::Result<Self> {
         let zip_path = output_path.with_extension("selfdecode.zip");
         let file = std::fs::File::create(&zip_path)?;
         let zip = zip::ZipWriter::new(file);
-        let multi_sample = sample_names.len() > 1;
         let buffers: Vec<SampleBuffer> = (0..sample_names.len())
             .map(|_| SampleBuffer::new())
             .collect();
