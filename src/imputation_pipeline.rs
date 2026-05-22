@@ -358,16 +358,18 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     let out_file = if formats.bcf { out_path.with_extension("bcf") }
         else { out_path.with_extension("vcf.gz") };
 
-    // Parquet writer (independent of VCF/BCF)
-    let mut parquet_writer = if formats.parquet {
+    // Parquet writer (independent of VCF/BCF).
+    // Skipped when --sample-batch-size > 0 — batched path takes over.
+    let mut parquet_writer = if formats.parquet && args.sample_batch_size == 0 {
         let pq_file = out_path.with_extension("parquet");
         let (w, s) = selphi::io::parquet_output::setup_parquet_writer(&pq_file, &sample_names)
             .expect("Failed to setup Parquet writer");
         Some((w, s))
     } else { None };
 
-    // PGEN writer (.pgen + .pvar + .psam)
-    let mut pgen_writer = if formats.pgen {
+    // PGEN writer (.pgen + .pvar + .psam).
+    // Skipped when --sample-batch-size > 0 — batched path takes over.
+    let mut pgen_writer = if formats.pgen && args.sample_batch_size == 0 {
         let pgen_file = out_path.with_extension("pgen");
         selphi::io::pgen_output::write_psam(&pgen_file, &sample_names).expect("Failed to write .psam");
         let pvar = selphi::io::pgen_output::write_pvar(&pgen_file).expect("Failed to write .pvar");
@@ -375,19 +377,20 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         Some((pgen, pvar))
     } else { None };
 
-    // SelfDecode writer (per-sample chunked Parquet in ZIP)
-    let mut selfdecode_writer = if formats.selfdecode {
+    // SelfDecode writer (per-sample chunked Parquet in ZIP).
+    // Skipped when --sample-batch-size > 0 — batched path takes over.
+    let mut selfdecode_writer = if formats.selfdecode && args.sample_batch_size == 0 {
         Some(selphi::io::selfdecode_output::SelfdecodeWriter::new(
             &out_path, &sample_names, false, // filter_hom_ref disabled by default
         ).expect("Failed to setup SelfDecode writer"))
     } else { None };
 
     // VCF/BCF channel-based writer (active if VCF or BCF format enabled).
-    // SKIPPED when batched-BCF is active — the per-batch writers + merger
-    // produce the final BCF directly at the user's output path.
+    // SKIPPED when any batched format is active — the per-batch writers +
+    // mergers produce the final output directly at the user's output path.
     // sample_batch_size is in SAMPLES; convert to haps (× 2) for internal use.
     let target_batch_size_haps = args.sample_batch_size.saturating_mul(2);
-    let skip_main_writer = target_batch_size_haps > 0 && formats.bcf;
+    let skip_main_writer = target_batch_size_haps > 0 && (formats.bcf || formats.vcf);
     let (vcf_tx, vcf_writer, vcf_bgzip) = if (formats.vcf || formats.bcf) && !skip_main_writer {
         if formats.bcf {
             selphi::io::pipeline::setup_bcf_writer(
@@ -416,16 +419,13 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         selphi_info!("  formats:  {}", fmts.join(" + "));
     }
 
-    // Batched-BCF writers (when --target-batch-size > 0 and BCF output requested).
-    // These write per-batch intermediate BCFs that are merged at end of imputation.
-    // Currently runs IN ADDITION to the main writer for validation; production may
-    // disable the main writer when batched is on.
+    // Batched-BCF writers (when --sample-batch-size > 0 and BCF output requested).
     let batched_bcf_active = target_batch_size_haps > 0 && formats.bcf;
+    let batch_tmp_dir = std::env::temp_dir().join(format!("selphi_batch_{}", std::process::id()));
     let mut batch_writers: Vec<selphi::io::bcf_batch::BatchWriter> = if batched_bcf_active {
-        let tmp_dir = std::env::temp_dir().join(format!("selphi_batch_{}", std::process::id()));
         let n_haps_total = n_samples * 2;
         selphi::io::bcf_batch::setup_batch_writers(
-            n_haps_total, target_batch_size_haps, &tmp_dir,
+            n_haps_total, target_batch_size_haps, &batch_tmp_dir,
             &sample_names, &srp.metadata.contig_field, version, no_ap,
         ).expect("Failed to setup batch writers")
     } else {
@@ -436,19 +436,91 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
             batch_writers.len(), target_batch_size_haps);
     }
 
-    // Compute MAF-adaptive Ne per site: rare variants need lower Ne (concentrated
-    // HMM weights), common variants benefit from higher Ne (smoother transitions).
-    // Crossover at ~MAF 0.5% based on sweep data.
+    // Batched-VCF writers (when --sample-batch-size > 0 and VCF output requested).
+    let batched_vcf_active = target_batch_size_haps > 0 && formats.vcf;
+    let mut vcf_batch_writers: Vec<selphi::io::vcf_batch::VcfBatchWriter> = if batched_vcf_active {
+        let n_haps_total = n_samples * 2;
+        selphi::io::vcf_batch::setup_vcf_batch_writers(
+            n_haps_total, target_batch_size_haps, &batch_tmp_dir,
+            &sample_names, &srp.metadata.contig_field, version, no_ap,
+        ).expect("Failed to setup VCF batch writers")
+    } else {
+        Vec::new()
+    };
+    if batched_vcf_active {
+        selphi_info!("  batched: {} batch VCF.gz writers active (batch_size={} haps)",
+            vcf_batch_writers.len(), target_batch_size_haps);
+    }
+
+    // Batched-SelfDecode writers (when --sample-batch-size > 0 and SD output requested).
+    let batched_sd_active = target_batch_size_haps > 0 && formats.selfdecode;
+    let mut sd_batch_writers: Vec<selphi::io::sd_batch::SdBatchWriter> = if batched_sd_active {
+        let n_haps_total = n_samples * 2;
+        selphi::io::sd_batch::setup_sd_batch_writers(
+            n_haps_total, target_batch_size_haps, &batch_tmp_dir,
+            &sample_names, false,
+        ).expect("Failed to setup SD batch writers")
+    } else {
+        Vec::new()
+    };
+    if batched_sd_active {
+        selphi_info!("  batched: {} batch SelfDecode writers active",
+            sd_batch_writers.len());
+    }
+
+    // Batched-PGEN writers (when --sample-batch-size > 0 and PGEN output requested).
+    let batched_pgen_active = target_batch_size_haps > 0 && formats.pgen;
+    let mut pgen_batch_writers: Vec<selphi::io::pgen_batch::PgenBatchWriter> = if batched_pgen_active {
+        let n_haps_total = n_samples * 2;
+        selphi::io::pgen_batch::setup_pgen_batch_writers(
+            n_haps_total, target_batch_size_haps, &batch_tmp_dir, &sample_names,
+        ).expect("Failed to setup PGEN batch writers")
+    } else {
+        Vec::new()
+    };
+    if batched_pgen_active {
+        selphi_info!("  batched: {} batch PGEN writers active", pgen_batch_writers.len());
+    }
+
+    // Batched-Parquet writers (when --sample-batch-size > 0 and Parquet output requested).
+    let batched_parquet_active = target_batch_size_haps > 0 && formats.parquet;
+    let mut parquet_batch_writers: Vec<selphi::io::parquet_batch::ParquetBatchWriter> = if batched_parquet_active {
+        let n_haps_total = n_samples * 2;
+        selphi::io::parquet_batch::setup_parquet_batch_writers(
+            n_haps_total, target_batch_size_haps, &batch_tmp_dir, &sample_names,
+        ).expect("Failed to setup Parquet batch writers")
+    } else {
+        Vec::new()
+    };
+    if batched_parquet_active {
+        selphi_info!("  batched: {} batch Parquet writers active", parquet_batch_writers.len());
+    }
+
+    // True if HMM streaming callback should consume CSRs into per-batch writers
+    // (any batched format active).
+    let batched_any_active = batched_bcf_active || batched_vcf_active
+        || batched_sd_active || batched_pgen_active || batched_parquet_active;
+
+    // MAF-adaptive Ne per site: rare variants benefit from lower Ne
+    // (concentrated HMM, locks onto IBD haps), common variants benefit
+    // from slightly higher Ne (smoother transitions). Narrow ramp only —
+    // a wider CV-aware ramp was tested 2026-05-22 on MESA chr20 × TOPMed
+    // mc=150K and REGRESSED OVERALL by -0.005, because Ne is a chain
+    // (transition) parameter, not a per-site parameter — high Ne at any
+    // common site causes HMM hap-switching that pollutes the trajectory
+    // through nearby rare sites. Per-site Ne cannot deliver per-bin
+    // optimal Ne; the per-bin sweep result was a single-run aggregate,
+    // not a separable per-site policy. See project_ne_sweep_2026_05_22.md
+    // for full numbers.
     let ne_low = est_ne as f64 * 0.85;   // for rare (MAF < 0.5%)
     let ne_high = est_ne as f64 * 1.2;   // for common (MAF > 2%)
     let maf_ne_per_site: Option<Vec<f64>> = if em_ne_per_site.is_none() || args.no_em_ne {
-        // Compute MAF from bitmatrix (popcount)
         let mut ne_maf = vec![ne_low; n_chip];
         for ci in 0..n_chip {
             let ac: u32 = ref_bm_imp.popcount_row(ci, n_ref);
             let af = ac as f64 / n_ref as f64;
             let maf = af.min(1.0 - af);
-            // Smooth ramp: Ne_low at MAF<0.005, Ne_high at MAF>0.02, linear between
+            // Smooth ramp: ne_low at MAF<0.005, ne_high at MAF>0.02, linear between
             let t = ((maf - 0.005) / (0.02 - 0.005)).clamp(0.0, 1.0);
             ne_maf[ci] = ne_low + t * (ne_high - ne_low);
         }
@@ -696,46 +768,157 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
             chip_start: window.chip_start,
             chip_end: window.chip_end,
         };
-        // Streaming callback for batched-BCF mode: each batch's CSRs are
-        // written immediately to the corresponding batch BCF and then dropped.
-        // This bounds memory peak in the HMM section by batch_size × per_csr
-        // instead of n_haps × per_csr.
+        // Streaming callback for batched mode: each batch's CSRs are written
+        // immediately to the corresponding batch writer(s) (BCF, VCF, SD,
+        // PGEN, Parquet — whichever are active) and then dropped. Bounds
+        // HMM-section memory by batch_size × per_csr instead of n_haps × per_csr.
+        //
+        // BCF and VCF writers are channel-based (shared-ref OK). Stateful
+        // writers (SelfDecode/PGEN/Parquet) live in &mut RefMut slots so the
+        // closure can take &mut access via index without moving them out.
         let (cs, os, oe) = (window.chip_start, window.own_chip_start, window.own_chip_end);
-        let hmm_output = if batched_bcf_active && !batch_writers.is_empty() {
-            let bw_ref = &batch_writers;
+        let hmm_output = if batched_any_active {
+            let bcf_bw_ref = &batch_writers;
+            let vcf_bw_ref = &vcf_batch_writers;
+            let sd_bw_ref = &mut sd_batch_writers;
+            let pgen_bw_ref = &mut pgen_batch_writers;
+            let parquet_bw_ref = &mut parquet_batch_writers;
             let srp_ref = &srp;
             let wgs_ref = &wgs_idx;
             let chip_genos_ref = &targ_alleles;
-            // batch_size in HAP units (each sample is 2 haps).
-            // The writers were created in setup_batch_writers using
-            // samples_per_batch = ceil(target_batch_size / 2). Reconstruct.
-            let mut cb = move |bs: usize, be: usize, refs: &[&selphi::imputation::hmm::CsrWeights]| -> std::io::Result<()> {
-                // Find which batch writer covers [bs, be) — same hap_start.
-                let bi = bw_ref.iter().position(|w| w.hap_start == bs)
-                    .ok_or_else(|| std::io::Error::other(format!("no batch writer for hap_start={bs}")))?;
-                let w = &bw_ref[bi];
-                if w.hap_end != be {
-                    return Err(std::io::Error::other(format!(
-                        "batch range mismatch: writer has [{}..{}), got [{bs}..{be})", w.hap_start, w.hap_end,
-                    )));
+            let bcf_on = batched_bcf_active;
+            let vcf_on = batched_vcf_active;
+            let sd_on  = batched_sd_active;
+            let pgen_on = batched_pgen_active;
+            let parquet_on = batched_parquet_active;
+            let mut cb = |bs: usize, be: usize, refs: &[&selphi::imputation::hmm::CsrWeights]| -> std::io::Result<()> {
+                if bcf_on {
+                    let bi = bcf_bw_ref.iter().position(|w| w.hap_start == bs)
+                        .ok_or_else(|| std::io::Error::other(format!("no BCF batch writer for hap_start={bs}")))?;
+                    let w = &bcf_bw_ref[bi];
+                    if w.hap_end != be {
+                        return Err(std::io::Error::other(format!(
+                            "BCF batch range mismatch: writer has [{}..{}), got [{bs}..{be})", w.hap_start, w.hap_end,
+                        )));
+                    }
+                    selphi::io::bcf_batch::write_window_bcf_batched(
+                        selphi::io::bcf_batch::WindowBatchInput {
+                            srp: srp_ref,
+                            weights: refs,
+                            hap_start: bs, hap_end: be,
+                            win_chip_start: cs,
+                            own_chip_start: os,
+                            own_chip_end: oe,
+                            wgs_idx: wgs_ref,
+                            n_samples_total: n_samples,
+                            chip_genotypes: chip_genos_ref,
+                            no_ap,
+                            preloaded_chunks: None,
+                            preloaded_stripes: None,
+                        },
+                        &w.tx,
+                    )?;
                 }
-                selphi::io::bcf_batch::write_window_bcf_batched(
-                    selphi::io::bcf_batch::WindowBatchInput {
-                        srp: srp_ref,
-                        weights: refs,
-                        hap_start: bs, hap_end: be,
-                        win_chip_start: cs,
-                        own_chip_start: os,
-                        own_chip_end: oe,
-                        wgs_idx: wgs_ref,
-                        n_samples_total: n_samples,
-                        chip_genotypes: chip_genos_ref,
-                        no_ap,
-                        preloaded_chunks: None,
-                        preloaded_stripes: None,
-                    },
-                    &w.tx,
-                )
+                if vcf_on {
+                    let bi = vcf_bw_ref.iter().position(|w| w.hap_start == bs)
+                        .ok_or_else(|| std::io::Error::other(format!("no VCF batch writer for hap_start={bs}")))?;
+                    let w = &vcf_bw_ref[bi];
+                    if w.hap_end != be {
+                        return Err(std::io::Error::other(format!(
+                            "VCF batch range mismatch: writer has [{}..{}), got [{bs}..{be})", w.hap_start, w.hap_end,
+                        )));
+                    }
+                    selphi::io::vcf_batch::write_window_vcf_batched(
+                        selphi::io::vcf_batch::WindowBatchInput {
+                            srp: srp_ref,
+                            weights: refs,
+                            hap_start: bs, hap_end: be,
+                            win_chip_start: cs,
+                            own_chip_start: os,
+                            own_chip_end: oe,
+                            wgs_idx: wgs_ref,
+                            n_samples_total: n_samples,
+                            chip_genotypes: chip_genos_ref,
+                            no_ap,
+                            preloaded_chunks: None,
+                            preloaded_stripes: None,
+                        },
+                        &w.tx,
+                    )?;
+                }
+                if sd_on {
+                    let bi = sd_bw_ref.iter().position(|w| w.hap_start == bs)
+                        .ok_or_else(|| std::io::Error::other(format!("no SD batch writer for hap_start={bs}")))?;
+                    if sd_bw_ref[bi].hap_end != be {
+                        return Err(std::io::Error::other(format!(
+                            "SD batch range mismatch: writer has [{}..{}), got [{bs}..{be})",
+                            sd_bw_ref[bi].hap_start, sd_bw_ref[bi].hap_end,
+                        )));
+                    }
+                    selphi::io::sd_batch::write_window_sd_batched(
+                        selphi::io::sd_batch::WindowBatchInput {
+                            srp: srp_ref,
+                            weights: refs,
+                            hap_start: bs, hap_end: be,
+                            win_chip_start: cs,
+                            own_chip_start: os,
+                            own_chip_end: oe,
+                            wgs_idx: wgs_ref,
+                            n_samples_total: n_samples,
+                            chip_genotypes: chip_genos_ref,
+                        },
+                        &mut sd_bw_ref[bi],
+                    )?;
+                }
+                if pgen_on {
+                    let bi = pgen_bw_ref.iter().position(|w| w.hap_start == bs)
+                        .ok_or_else(|| std::io::Error::other(format!("no PGEN batch writer for hap_start={bs}")))?;
+                    if pgen_bw_ref[bi].hap_end != be {
+                        return Err(std::io::Error::other(format!(
+                            "PGEN batch range mismatch: writer has [{}..{}), got [{bs}..{be})",
+                            pgen_bw_ref[bi].hap_start, pgen_bw_ref[bi].hap_end,
+                        )));
+                    }
+                    selphi::io::pgen_batch::write_window_pgen_batched(
+                        selphi::io::pgen_batch::WindowBatchInput {
+                            srp: srp_ref,
+                            weights: refs,
+                            hap_start: bs, hap_end: be,
+                            win_chip_start: cs,
+                            own_chip_start: os,
+                            own_chip_end: oe,
+                            wgs_idx: wgs_ref,
+                            n_samples_total: n_samples,
+                            chip_genotypes: chip_genos_ref,
+                        },
+                        &mut pgen_bw_ref[bi],
+                    )?;
+                }
+                if parquet_on {
+                    let bi = parquet_bw_ref.iter().position(|w| w.hap_start == bs)
+                        .ok_or_else(|| std::io::Error::other(format!("no Parquet batch writer for hap_start={bs}")))?;
+                    if parquet_bw_ref[bi].hap_end != be {
+                        return Err(std::io::Error::other(format!(
+                            "Parquet batch range mismatch: writer has [{}..{}), got [{bs}..{be})",
+                            parquet_bw_ref[bi].hap_start, parquet_bw_ref[bi].hap_end,
+                        )));
+                    }
+                    selphi::io::parquet_batch::write_window_parquet_batched(
+                        selphi::io::parquet_batch::WindowBatchInput {
+                            srp: srp_ref,
+                            weights: refs,
+                            hap_start: bs, hap_end: be,
+                            win_chip_start: cs,
+                            own_chip_start: os,
+                            own_chip_end: oe,
+                            wgs_idx: wgs_ref,
+                            n_samples_total: n_samples,
+                            chip_genotypes: chip_genos_ref,
+                        },
+                        &mut parquet_bw_ref[bi],
+                    )?;
+                }
+                Ok(())
             };
             selphi::imputation::window_process::impute_window(
                 &inputs, &hmm_params, precomputed_candidates.as_ref(), &mut hap_priors,
@@ -762,11 +945,11 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         
 
         // Interpolation + output (runs BEFORE waiting for previous VCF write — no dependency)
-        // Note: when batched_bcf_active, all_weights is EMPTY (CSRs were
+        // Note: when any batched format is active, all_weights is EMPTY (CSRs were
         // streamed to batch writers during HMM). Skip write_window_multiformat.
         let t0_interp = Instant::now();
 
-        if all_weights.is_empty() && batched_bcf_active {
+        if all_weights.is_empty() && batched_any_active {
             // Streaming path already wrote everything via callback; nothing to do here.
         } else {
         selphi::io::pipeline::write_window_multiformat(
@@ -821,20 +1004,75 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     }
 
     // Finalize per-batch BCF writers + merge into final batched output.
-    // This runs BEFORE the main writer finalize so we have access to sample_names + contig_field.
     if batched_bcf_active && !batch_writers.is_empty() {
         let batch_writers_taken = std::mem::take(&mut batch_writers);
         let batch_paths = selphi::io::bcf_batch::finalize_batch_writers(batch_writers_taken)
             .expect("Failed to finalize batch writers");
-        // Merger writes directly to the user's expected output path (the main
-        // BCF writer was skipped earlier, so out_file is currently absent).
         selphi_info!("  Merging {} batch BCFs → {} ...", batch_paths.len(), out_file.display());
         let t_merge = Instant::now();
         selphi::io::bcf_merge::merge_batch_bcfs(
             &batch_paths, &out_file, &sample_names, &srp.metadata.contig_field, version, no_ap,
         ).expect("Batch BCF merge failed");
         selphi_info!("  Merged in {:.1}s", t_merge.elapsed().as_secs_f64());
-        // Clean up intermediate files
+        for p in &batch_paths { let _ = std::fs::remove_file(p); }
+    }
+
+    // Finalize per-batch VCF writers + merge into final batched VCF.gz.
+    if batched_vcf_active && !vcf_batch_writers.is_empty() {
+        let writers_taken = std::mem::take(&mut vcf_batch_writers);
+        let batch_paths = selphi::io::vcf_batch::finalize_vcf_batch_writers(writers_taken)
+            .expect("Failed to finalize VCF batch writers");
+        selphi_info!("  Merging {} batch VCFs → {} ...", batch_paths.len(), out_file.display());
+        let t_merge = Instant::now();
+        selphi::io::vcf_merge::merge_batch_vcfs(
+            &batch_paths, &out_file, &sample_names, &srp.metadata.contig_field, version, no_ap,
+        ).expect("Batch VCF merge failed");
+        selphi_info!("  Merged in {:.1}s", t_merge.elapsed().as_secs_f64());
+        for p in &batch_paths { let _ = std::fs::remove_file(p); }
+    }
+
+    // Finalize per-batch SelfDecode writers + merge into final batched ZIP.
+    if batched_sd_active && !sd_batch_writers.is_empty() {
+        let writers_taken = std::mem::take(&mut sd_batch_writers);
+        let batch_paths = selphi::io::sd_batch::finalize_sd_batch_writers(writers_taken)
+            .expect("Failed to finalize SD batch writers");
+        let sd_out = out_path.clone();
+        selphi_info!("  Merging {} batch SelfDecode ZIPs → {} ...", batch_paths.len(), sd_out.display());
+        let t_merge = Instant::now();
+        selphi::io::sd_merge::merge_batch_sds(&batch_paths, &sd_out)
+            .expect("Batch SD merge failed");
+        selphi_info!("  Merged in {:.1}s", t_merge.elapsed().as_secs_f64());
+        for p in &batch_paths { let _ = std::fs::remove_file(p); }
+    }
+
+    // Finalize per-batch PGEN writers + merge into final batched PGEN.
+    if batched_pgen_active && !pgen_batch_writers.is_empty() {
+        let writers_taken = std::mem::take(&mut pgen_batch_writers);
+        let batch_paths = selphi::io::pgen_batch::finalize_pgen_batch_writers(writers_taken)
+            .expect("Failed to finalize PGEN batch writers");
+        let pgen_out = out_path.with_extension("pgen");
+        selphi_info!("  Merging {} batch PGENs → {} ...", batch_paths.len(), pgen_out.display());
+        let t_merge = Instant::now();
+        selphi::io::pgen_merge::merge_batch_pgens(&batch_paths, &out_path, &sample_names)
+            .expect("Batch PGEN merge failed");
+        selphi_info!("  Merged in {:.1}s", t_merge.elapsed().as_secs_f64());
+        for (p, v) in &batch_paths { let _ = std::fs::remove_file(p); let _ = std::fs::remove_file(v); }
+        for (p, _) in &batch_paths {
+            let _ = std::fs::remove_file(p.with_extension("psam"));
+        }
+    }
+
+    // Finalize per-batch Parquet writers + merge into final batched Parquet.
+    if batched_parquet_active && !parquet_batch_writers.is_empty() {
+        let writers_taken = std::mem::take(&mut parquet_batch_writers);
+        let batch_paths = selphi::io::parquet_batch::finalize_parquet_batch_writers(writers_taken)
+            .expect("Failed to finalize Parquet batch writers");
+        let parquet_out = out_path.with_extension("parquet");
+        selphi_info!("  Merging {} batch Parquets → {} ...", batch_paths.len(), parquet_out.display());
+        let t_merge = Instant::now();
+        selphi::io::parquet_merge::merge_batch_parquets(&batch_paths, &parquet_out, &sample_names)
+            .expect("Batch Parquet merge failed");
+        selphi_info!("  Merged in {:.1}s", t_merge.elapsed().as_secs_f64());
         for p in &batch_paths { let _ = std::fs::remove_file(p); }
     }
 
