@@ -136,9 +136,32 @@ pub struct Args {
     #[arg(long)]
     pub fl_bwd: Option<usize>,
 
-    /// Max candidates from coded-step PBWT
-    #[arg(long, default_value = "2500")]
+    /// Maximum candidates retained from per-window PBWT top-K selection.
+    /// 0 = AUTO: scaled by panel size and panel diversity. Set explicitly to
+    /// override the auto value.
+    #[arg(long, default_value = "0")]
     pub max_candidates: usize,
+
+    /// Base fraction of panel haplotypes when --max-candidates=0 (auto).
+    /// Effective mc = `clamp(n_ref × (frac + cv_alpha × chunk_cv), 2500, adaptive_mc_max)`.
+    /// Default 0.10 = 10% of panel as baseline (before CV adjustment).
+    #[arg(long, default_value = "0.10")]
+    pub adaptive_mc_frac: f64,
+
+    /// CV-coupled fraction in the auto formula. Final scale = `frac + cv_alpha × chunk_cv`.
+    /// `chunk_cv` measures haplotype-pattern diversity (computed at SRP load
+    /// from compressed tile size variability). Higher CV => more candidates
+    /// retained, which helps capture rare-variant carriers in minority
+    /// sub-populations. Set to 0 to make mc depend only on n_ref.
+    #[arg(long, default_value = "0.80")]
+    pub adaptive_mc_cv_alpha: f64,
+
+    /// Hard cap for AUTO max_candidates (--max-candidates=0). Default 1000000
+    /// is effectively unlimited — the formula `n_ref × (frac + cv_alpha × cv)`
+    /// alone determines mc. Lower this if memory-constrained: HMM scratch
+    /// scales as n_chip × mc × 4 bytes per target haplotype.
+    #[arg(long, default_value = "1000000")]
+    pub adaptive_mc_max: usize,
 
     /// Process target samples in batches of N for memory-bounded imputation.
     /// 0 = off (default; all samples held simultaneously in RAM, max wall).

@@ -121,6 +121,9 @@ fn main() {
             match_length: args.match_length,
             est_ne: args.est_ne,
             max_candidates: args.max_candidates,
+            adaptive_mc_frac: args.adaptive_mc_frac,
+            adaptive_mc_cv_alpha: args.adaptive_mc_cv_alpha,
+            adaptive_mc_max: args.adaptive_mc_max,
             // sample_batch_size (user-facing): N SAMPLES per batch.
             // Internally stored as N × 2 hap units (diploid).
             target_batch_size: args.sample_batch_size.saturating_mul(2),
@@ -356,6 +359,9 @@ fn main() {
             match_length: args.match_length,
             est_ne: args.est_ne,
             max_candidates: args.max_candidates,
+            adaptive_mc_frac: args.adaptive_mc_frac,
+            adaptive_mc_cv_alpha: args.adaptive_mc_cv_alpha,
+            adaptive_mc_max: args.adaptive_mc_max,
             // sample_batch_size (user-facing): N SAMPLES per batch.
             // Internally stored as N × 2 hap units (diploid).
             target_batch_size: args.sample_batch_size.saturating_mul(2),

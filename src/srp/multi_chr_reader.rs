@@ -245,7 +245,7 @@ impl MultiChrSrpReader {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let meta_json: JsonValue = serde_json::from_slice(&meta_raw)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let metadata = SrpMetadata::from_json(&meta_json);
+        let mut metadata = SrpMetadata::from_json(&meta_json);
 
         // Variants
         let vcomp = super::helpers::read_section(&mut f)?;
@@ -278,6 +278,19 @@ impl MultiChrSrpReader {
                 comp_size: u32::from_le_bytes(tidx[b+8..b+12].try_into().unwrap()),
             }
         }).collect();
+
+        // On-the-fly chunk_cv from tile comp_sizes (multi-chr SRPs don't
+        // store CV at write time). Matches the single-chr reader logic.
+        if metadata.chunk_cv == 0.0 && tile_entries.len() > 1 {
+            let sizes: Vec<f64> = tile_entries.iter()
+                .map(|t| t.comp_size as f64).collect();
+            let mean = sizes.iter().sum::<f64>() / sizes.len() as f64;
+            if mean > 0.0 {
+                let var = sizes.iter()
+                    .map(|s| (s - mean).powi(2)).sum::<f64>() / sizes.len() as f64;
+                metadata.chunk_cv = var.sqrt() / mean;
+            }
+        }
 
         let tiled = Some(TiledSrpReader::from_entries(
             self.path.clone(), metadata.n_variants, metadata.n_haps,

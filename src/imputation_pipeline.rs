@@ -537,12 +537,36 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
 
     // Pre-compute per-haplotype candidates from full-chromosome phased data.
     // When phasing ran, these candidates are based on correctly phased alleles
+    // Resolve adaptive max_candidates: when --max-candidates=0 (auto), scale
+    // with panel size and panel diversity (chunk_cv). On large panels the
+    // default mc=2500 keeps a tiny fraction of candidates, truncating
+    // rare-variant carriers from minority sub-populations.
+    //
+    // Formula: mc = n_ref × (frac + cv_alpha × chunk_cv), clamped to
+    // [2500, adaptive_mc_max]. `chunk_cv` is computed from compressed tile
+    // size variability at SRP load — higher cv => more haplotype-pattern
+    // diversity => more candidates retained.
+    let effective_mc: usize = if args.max_candidates == 0 {
+        let cv = srp.metadata.chunk_cv;
+        let scale = args.adaptive_mc_frac + args.adaptive_mc_cv_alpha * cv;
+        let auto = ((n_ref as f64) * scale.max(0.0)) as usize;
+        let mc = auto.clamp(2500, args.adaptive_mc_max);
+        selphi_step!(
+            "Auto max_candidates: n_ref={}, chunk_cv={:.3}, frac={:.3}+cv_α×cv={:.3} → mc={} (clamp [{}..{}])",
+            n_ref, cv, args.adaptive_mc_frac, scale, mc, 2500, args.adaptive_mc_max
+        );
+        mc
+    } else {
+        selphi_debug!("Explicit max_candidates={}", args.max_candidates);
+        args.max_candidates
+    };
+
     // (refined over 15 iterations) → higher quality than per-window selection.
     // Saves coded-step computation + selection inside the per-window loop.
     // Gate: at biobank scale the Vec<Vec<u32>> retention alone can exceed 10 GB
     // (n_haps × max_candidates × 4 bytes). Skip when that projection > 2 GB —
     // per-window recompute against the shared CodedSteps is cheap.
-    let precomp_bytes: u64 = (n_haps as u64) * (args.max_candidates as u64) * 4;
+    let precomp_bytes: u64 = (n_haps as u64) * (effective_mc as u64) * 4;
     let precomp_cap_bytes: u64 = 2 * 1024 * 1024 * 1024;
     // Load optional ancestry context for PBWT candidate reweighting.
     let panel_anc: Option<Vec<u8>> = if let Some(p) = args.panel_ancestry.as_deref() {
@@ -580,7 +604,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         let coded_full = selphi::imputation::pbwt::build_coded_steps_bm(
             &ref_bm_imp, 0, n_chip, n_ref, &targ_alleles, n_haps, &chip_cm, 0.05,
         );
-        let max_cand = args.max_candidates;
+        let max_cand = effective_mc;
 
         // If --local-ancestry is set and we have panel labels, infer local
         // ancestry directly from coded_full (no neural net, no external tool).
@@ -678,7 +702,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
 
 
         let t0_extract = Instant::now();
-        let max_candidates = args.max_candidates;
+        let max_candidates = effective_mc;
         let p_err = args.p_err;
         let cpu_extract = selphi::log::cpu_time_secs();
         let extract_secs = t0_extract.elapsed().as_secs_f64();
@@ -921,12 +945,14 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                 Ok(())
             };
             selphi::imputation::window_process::impute_window(
-                &inputs, &hmm_params, precomputed_candidates.as_ref(), &mut hap_priors,
+                &inputs, &hmm_params, precomputed_candidates.as_ref(),
+                &mut hap_priors,
                 Some(&mut cb),
             )
         } else {
             selphi::imputation::window_process::impute_window(
-                &inputs, &hmm_params, precomputed_candidates.as_ref(), &mut hap_priors,
+                &inputs, &hmm_params, precomputed_candidates.as_ref(),
+                &mut hap_priors,
                 None,
             )
         };
