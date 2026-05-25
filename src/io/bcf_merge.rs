@@ -33,11 +33,10 @@ use std::path::{Path, PathBuf};
 use noodles_bgzf::io::{Reader as BgzfReader, multithreaded_writer};
 
 use crate::io::bcf_encode::{
-    BCF_MAGIC, FILTER_PASS_IDX,
+    BCF_MAGIC,
     INFO_IMP_IDX, INFO_AF_IDX, INFO_AN_IDX, INFO_AC_IDX, INFO_DR2_IDX,
 };
 
-const QUAL_MISSING: u32 = 0x7F800001;
 const TY_INT8: u8 = 1;
 const TY_INT32: u8 = 3;
 const TY_FLOAT: u8 = 5;
@@ -423,7 +422,6 @@ fn compute_imp_stats_from_ds(
                 all_ap1.push(f * 0.5);
                 all_ap2.push(f * 0.5);
             }
-            off += k * 4;
         } else {
             // Skip DS
             off += k * 4;

@@ -52,7 +52,7 @@ pub(crate) struct WindowSetup<'a> {
 }
 
 /// Build interpolation intervals for the owned portion of a window.
-pub fn build_intervals(
+pub(crate) fn build_intervals(
     win_chip_start: usize,
     own_chip_start: usize,
     own_chip_end: usize,

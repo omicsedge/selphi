@@ -366,16 +366,19 @@ pub fn write_bref3_from_srp(source_path: &Path, output_path: &Path) -> io::Resul
     let index_start = bytes_written;
     let chroms: Vec<String> = vec![chrom_name.clone()];
     let chrom_starts: Vec<i32> = vec![0];
-    bytes_written += write_string_array_c(&mut w, &chroms)?;
-    for &s in &chrom_starts { bytes_written += write_i32_c(&mut w, s)?; }
+    // After capturing `index_start`, `bytes_written` is no longer consulted,
+    // so the per-write increments are dropped on purpose; the writes still
+    // happen via `?` propagation.
+    write_string_array_c(&mut w, &chroms)?;
+    for &s in &chrom_starts { write_i32_c(&mut w, s)?; }
     let mut last_ci: i32 = -1;
     for &(offset, pos) in &block_index {
         let mut off = offset as i64;
         if last_ci < 0 { off = -off; last_ci = 0; }
-        bytes_written += write_i64_c(&mut w, off)?;
-        bytes_written += write_i32_c(&mut w, pos)?;
+        write_i64_c(&mut w, off)?;
+        write_i32_c(&mut w, pos)?;
     }
-    bytes_written += write_i64_c(&mut w, -999_999_999_999_999)?;
+    write_i64_c(&mut w, -999_999_999_999_999)?;
     write_i64_c(&mut w, index_start as i64)?;
     w.flush()?;
 
