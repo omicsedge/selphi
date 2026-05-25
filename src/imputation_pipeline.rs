@@ -535,32 +535,29 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // Merge: prefer EM Ne if available, otherwise MAF-adaptive
     let final_ne_per_site: Option<Vec<f64>> = em_ne_per_site.or(maf_ne_per_site);
 
-    // Pre-compute per-haplotype candidates from full-chromosome phased data.
-    // When phasing ran, these candidates are based on correctly phased alleles
-    // Resolve adaptive max_candidates: when --max-candidates=0 (auto), scale
-    // with panel size and panel diversity (chunk_cv). On large panels the
-    // default mc=2500 keeps a tiny fraction of candidates, truncating
-    // rare-variant carriers from minority sub-populations.
-    //
-    // Formula: mc = n_ref × (frac + cv_alpha × chunk_cv), clamped to
-    // [2500, adaptive_mc_max]. `chunk_cv` is computed from compressed tile
-    // size variability at SRP load — higher cv => more haplotype-pattern
-    // diversity => more candidates retained.
-    let effective_mc: usize = if args.max_candidates == 0 {
-        let cv = srp.metadata.chunk_cv;
-        let scale = args.adaptive_mc_frac + args.adaptive_mc_cv_alpha * cv;
-        let auto = ((n_ref as f64) * scale.max(0.0)) as usize;
-        let mc = auto.clamp(2500, args.adaptive_mc_max);
+    // Resolve adaptive max_candidates. With --max-candidates=0 (auto), mc
+    // scales with panel size and panel diversity (chunk_cv from the SRP);
+    // see `selphi::imputation::resolve_max_candidates`. On large panels the
+    // legacy default mc=2500 keeps a tiny fraction of candidates and
+    // truncates rare-variant carriers from minority sub-populations.
+    let (effective_mc, mc_was_auto) = selphi::imputation::resolve_max_candidates(
+        args.max_candidates, n_ref, srp.metadata.chunk_cv,
+        args.adaptive_mc_frac, args.adaptive_mc_cv_alpha, args.adaptive_mc_max,
+    );
+    if mc_was_auto {
+        let scale = args.adaptive_mc_frac
+            + args.adaptive_mc_cv_alpha * srp.metadata.chunk_cv.clamp(0.0, 1.0);
         selphi_step!(
-            "Auto max_candidates: n_ref={}, chunk_cv={:.3}, frac={:.3}+cv_α×cv={:.3} → mc={} (clamp [{}..{}])",
-            n_ref, cv, args.adaptive_mc_frac, scale, mc, 2500, args.adaptive_mc_max
+            "Auto max_candidates: n_ref={}, chunk_cv={:.3}, scale={:.3} → mc={} (clamp [{}..{}])",
+            n_ref, srp.metadata.chunk_cv, scale, effective_mc,
+            selphi::imputation::MIN_MAX_CANDIDATES, args.adaptive_mc_max,
         );
-        mc
     } else {
         selphi_debug!("Explicit max_candidates={}", args.max_candidates);
-        args.max_candidates
-    };
+    }
 
+    // Pre-compute per-haplotype candidates from full-chromosome phased data.
+    // When phasing ran, these candidates are based on correctly phased alleles
     // (refined over 15 iterations) → higher quality than per-window selection.
     // Saves coded-step computation + selection inside the per-window loop.
     // Gate: at biobank scale the Vec<Vec<u32>> retention alone can exceed 10 GB

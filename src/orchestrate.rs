@@ -319,20 +319,19 @@ pub fn run_multi_chr(
         };
 
         // Resolve adaptive max_candidates per-chr (matches imputation_pipeline.rs).
-        // Uses n_ref (panel size) + chunk_cv (diversity proxy).
-        let effective_mc: usize = if config.max_candidates == 0 {
-            let cv = srp.metadata.chunk_cv;
-            let scale = config.adaptive_mc_frac + config.adaptive_mc_cv_alpha * cv;
-            let auto = ((n_ref as f64) * scale.max(0.0)) as usize;
-            let mc = auto.clamp(2500, config.adaptive_mc_max);
+        let (effective_mc, mc_was_auto) = selphi::imputation::resolve_max_candidates(
+            config.max_candidates, n_ref, srp.metadata.chunk_cv,
+            config.adaptive_mc_frac, config.adaptive_mc_cv_alpha, config.adaptive_mc_max,
+        );
+        if mc_was_auto {
+            let scale = config.adaptive_mc_frac
+                + config.adaptive_mc_cv_alpha * srp.metadata.chunk_cv.clamp(0.0, 1.0);
             selphi_step!(
-                "Auto max_candidates (chr): n_ref={}, cv={:.3}, frac+α·cv={:.3} → mc={} (clamp [{}..{}])",
-                n_ref, cv, scale, mc, 2500, config.adaptive_mc_max
+                "Auto max_candidates: n_ref={}, chunk_cv={:.3}, scale={:.3} → mc={} (clamp [{}..{}])",
+                n_ref, srp.metadata.chunk_cv, scale, effective_mc,
+                selphi::imputation::MIN_MAX_CANDIDATES, config.adaptive_mc_max,
             );
-            mc
-        } else {
-            config.max_candidates
-        };
+        }
 
         // Pre-compute candidates if phasing ran. Gate by retention cost.
         let precomp_bytes: u64 = (n_haps as u64) * (effective_mc as u64) * 4;

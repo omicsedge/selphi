@@ -99,19 +99,11 @@ impl SrpReader {
             }
         }).collect();
 
-        // Compute chunk_cv from tile comp_sizes if metadata didn't have it.
-        // CV = stdev / mean of compressed tile sizes — a higher CV indicates
-        // more heterogeneous compression across the panel, which correlates
-        // with haplotype-pattern diversity.
-        if metadata.chunk_cv == 0.0 && tile_entries.len() > 1 {
-            let sizes: Vec<f64> = tile_entries.iter()
-                .map(|t| t.comp_size as f64).collect();
-            let mean = sizes.iter().sum::<f64>() / sizes.len() as f64;
-            if mean > 0.0 {
-                let var = sizes.iter()
-                    .map(|s| (s - mean).powi(2)).sum::<f64>() / sizes.len() as f64;
-                metadata.chunk_cv = var.sqrt() / mean;
-            }
+        // Populate chunk_cv on-the-fly when not stored in metadata (new
+        // tiled SRPs don't write it). See `srp::chunk_cv_from_tiles` for
+        // the formula and rationale.
+        if metadata.chunk_cv == 0.0 {
+            metadata.chunk_cv = super::chunk_cv_from_tiles(&tile_entries);
         }
 
         let tiled = Some(super::tiled::TiledSrpReader::from_entries(
