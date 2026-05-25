@@ -274,7 +274,6 @@ pub fn write_window_bcf_batched(
         let n_tiled_variants = tiled.n_variants();
 
         let window_last_stripe = if own_wgs_end > 0 { (own_wgs_end - 1) / TILE_ROWS } else { 0 };
-        let window_first_stripe = if !intervals.is_empty() { intervals[0].wgs_start / TILE_ROWS } else { 0 };
 
         // Compute mem-bounded batch sizes (same heuristic as pipeline.rs).
         let decomp_tile_bytes: usize = 500 * 1024;

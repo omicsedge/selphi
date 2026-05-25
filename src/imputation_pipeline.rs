@@ -1127,10 +1127,10 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         selphi::io::pipeline::finish_vcf_writer(vcf_tx, vcf_writer, vcf_bgzip)
             .expect("Failed to finalize VCF/BCF output");
     } else {
-        // Dummy writer (or batched mode): just drop the sender so the thread exits.
+        // Dummy writer (or batched mode): drop the sender so the thread exits,
+        // then join. `vcf_bgzip` is `()` here and needs no explicit cleanup.
         drop(vcf_tx);
         vcf_writer.join().expect("dummy writer panicked").ok();
-        drop(vcf_bgzip);
     }
 
     let final_path = out_file.clone();
