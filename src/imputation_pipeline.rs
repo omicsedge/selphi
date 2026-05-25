@@ -22,6 +22,135 @@ use selphi::imputation::windows::compute_imputation_windows;
 
 use crate::cli::{Args, PhasingEngine};
 
+/// Resolved phasing engine for an imputation run. `Auto` from the CLI is
+/// resolved once into `Haploid` or `Diploid` based on input variant density.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ResolvedEngine { Haploid, Diploid }
+
+/// Resolve the phasing engine from CLI args and target variant count.
+/// `--wgs-phasing` forces `Diploid`; otherwise `--phasing-engine` is honoured,
+/// with `Auto` choosing `Diploid` when the chip target exceeds ~50K variants
+/// and `Haploid` otherwise (chip-array regime).
+fn resolve_phasing_engine(args: &Args, n_chip: usize) -> ResolvedEngine {
+    if args.wgs_phasing {
+        return ResolvedEngine::Diploid;
+    }
+    match args.phasing_engine {
+        PhasingEngine::Diploid => ResolvedEngine::Diploid,
+        PhasingEngine::Haploid => ResolvedEngine::Haploid,
+        PhasingEngine::Auto => {
+            let is_wgs = n_chip > 50_000;
+            if is_wgs {
+                selphi_info!("  Auto-detected WGS input ({} variants > 50K) → Diploid engine", n_chip);
+                ResolvedEngine::Diploid
+            } else {
+                selphi_info!("  Auto-detected chip input ({} variants ≤ 50K) → Haploid engine", n_chip);
+                ResolvedEngine::Haploid
+            }
+        }
+    }
+}
+
+/// Apply pedigree pre-phasing when a PED file is supplied. Mendelian
+/// constraints from parent-child relationships pre-phase deterministic sites
+/// before the HMM-based phasing runs. No-op when `--ped` is absent or when
+/// the target is already phased.
+fn apply_pedigree_prephase(
+    args: &Args, needs_phasing: bool,
+    targ_alleles: &mut [u8],
+    sample_names: &[String],
+    target_idx: &[usize], target_genotypes: &[Vec<[u8; 2]>],
+    n_chip: usize, n_samples: usize, n_haps: usize,
+) {
+    let Some(ped_path) = args.ped.as_deref() else { return; };
+    if !needs_phasing { return; }
+    let ped_entries = selphi::diploid::pedigree::parse_ped(Path::new(ped_path), sample_names)
+        .unwrap_or_else(|e| { selphi_error!("Cannot read PED file: {}", e); std::process::exit(1); });
+    if ped_entries.is_empty() { return; }
+    let flat_geno = selphi::diploid::pedigree::build_flat_genotypes(
+        target_idx, target_genotypes, n_chip, n_samples);
+    let (n_phased, n_imp, n_uns, n_err) = selphi::diploid::pedigree::apply_pedigree_scaffold(
+        targ_alleles, &flat_geno, &ped_entries, n_chip, n_samples, n_haps,
+    );
+    selphi_step!("Pedigree scaffold: {} trios/duos, {} phased, {} imputed, {} unsolved, {} Mendelian errors",
+        ped_entries.len(), n_phased, n_imp, n_uns, n_err);
+}
+
+/// Detect haploid samples (chromosome X males by heterozygosity, or a
+/// user-supplied `--haploids` list) and reset their heterozygous calls to
+/// missing so the HMM can re-impute the correct homozygous genotype.
+/// No-op when the target is already phased.
+fn apply_haploid_detection(
+    args: &Args, needs_phasing: bool, chr: &str,
+    targ_alleles: &mut [u8],
+    sample_names: &[String],
+    target_idx: &[usize], target_genotypes: &[Vec<[u8; 2]>],
+    n_chip: usize, n_samples: usize, n_haps: usize,
+) {
+    if !needs_phasing { return; }
+    let is_chrx = chr == "X" || chr == "chrX" || chr == "x" || chr == "23";
+    let haploid_samples = if let Some(ref hap_path) = args.haploids {
+        selphi::diploid::pedigree::parse_haploids(Path::new(hap_path), sample_names)
+            .unwrap_or_else(|e| { selphi_error!("Cannot read haploids file: {}", e); std::process::exit(1); })
+    } else if is_chrx {
+        selphi::diploid::pedigree::detect_haploid_chrx(targ_alleles, n_chip, n_samples, n_haps)
+    } else {
+        return;
+    };
+    if haploid_samples.is_empty() { return; }
+    let flat_geno = selphi::diploid::pedigree::build_flat_genotypes(
+        target_idx, target_genotypes, n_chip, n_samples);
+    let n_reset = selphi::diploid::pedigree::reset_haploid_hets(
+        targ_alleles, &flat_geno, &haploid_samples, n_chip, n_samples, n_haps,
+    );
+    let detect_method = if args.haploids.is_some() { "from file" } else { "auto-detected" };
+    selphi_step!("Haploid samples ({}): {} samples, {} het calls reset to missing",
+        detect_method, haploid_samples.len(), n_reset);
+}
+
+/// PBWT / HMM auto-calibrated parameters derived from the reference panel
+/// dimensions plus any explicit CLI overrides.
+#[derive(Debug, Clone, Copy)]
+struct PbwtParams {
+    /// Minimum PBWT match length (in SNPs).
+    match_length: usize,
+    /// Forward-direction match candidate cap.
+    fl_fwd: usize,
+    /// Backward-direction match candidate cap.
+    fl_bwd: usize,
+    /// HMM effective population size.
+    est_ne: i64,
+}
+
+/// Resolve the PBWT match length, forward / backward candidate caps, and the
+/// HMM effective population size, honouring any explicit CLI overrides and
+/// falling back to panel-size-driven defaults otherwise. Validated on three
+/// reference panels two orders of magnitude apart in size; the ratio
+/// Ne / n_ref stays near 36 across all of them.
+fn auto_calibrate_pbwt_params(args: &Args, n_ref: usize, n_chip: usize) -> PbwtParams {
+    let match_length = args.match_length.unwrap_or_else(|| {
+        let ml = (n_ref as f64).log2() as usize - 7;
+        ml.min(n_chip / 2000).max(5)
+    });
+    let log2_haps = (n_ref as f64).log2();
+    let fl_fwd = args.fl_fwd.unwrap_or_else(|| {
+        let v = (2600.0 / log2_haps) as usize;
+        v.clamp(100, 450)
+    });
+    let fl_bwd = args.fl_bwd.unwrap_or_else(|| {
+        ((fl_fwd as f64 * 2.4 / log2_haps) as usize).max(13)
+    });
+    let est_ne = if args.est_ne <= 0 {
+        // Adaptive Ne: scales linearly with panel size — constant ratio
+        // Ne / n_ref ≈ 36 across panels validated above.
+        let auto_ne = (36.4 * n_ref as f64).round() as i64;
+        auto_ne.max(20_000)
+    } else {
+        args.est_ne
+    };
+    PbwtParams { match_length, fl_fwd, fl_bwd, est_ne }
+}
+
 /// Run single-chromosome imputation (or phase-only) end-to-end.
 ///
 /// The body is an inline port of the original `main()` single-chr branch;
@@ -98,53 +227,17 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
 
     // 6b. Phase if input is unphased (in-memory fusion — no VCF round-trip)
     let needs_phasing = !is_phased || args.force_phasing;
-    // Pedigree pre-phasing: if --ped provided, apply Mendelian constraints before HMM
     let mut targ_alleles = targ_alleles;
-    if let Some(ref ped_path) = args.ped {
-        if needs_phasing {
-            let ped_entries = selphi::diploid::pedigree::parse_ped(
-                Path::new(ped_path), &sample_names)
-                .unwrap_or_else(|e| { selphi_error!("Cannot read PED file: {}", e); std::process::exit(1); });
-            if !ped_entries.is_empty() {
-                let flat_geno = selphi::diploid::pedigree::build_flat_genotypes(
-                    &target_idx, &target_genotypes, n_chip, n_samples);
-                let (n_ped_phased, n_ped_imputed, n_ped_unsolved, n_ped_errors) =
-                    selphi::diploid::pedigree::apply_pedigree_scaffold(
-                        &mut targ_alleles, &flat_geno,
-                        &ped_entries, n_chip, n_samples, n_haps,
-                    );
-                selphi_step!("Pedigree scaffold: {} trios/duos, {} phased, {} imputed, {} unsolved, {} Mendelian errors",
-                    ped_entries.len(), n_ped_phased, n_ped_imputed, n_ped_unsolved, n_ped_errors);
-            }
-        }
-    }
-
-    // ChrX haploid auto-detection: if chromosome is X, detect males (< 1% het)
-    // and reset their het calls to missing. Also supports explicit --haploids file.
-    if needs_phasing {
-        let chr = srp.chromosome();
-        let is_chrx = chr == "X" || chr == "chrX" || chr == "x" || chr == "23";
-
-        let haploid_samples = if let Some(ref hap_path) = args.haploids {
-            selphi::diploid::pedigree::parse_haploids(Path::new(hap_path), &sample_names)
-                .unwrap_or_else(|e| { selphi_error!("Cannot read haploids file: {}", e); std::process::exit(1); })
-        } else if is_chrx {
-            selphi::diploid::pedigree::detect_haploid_chrx(&targ_alleles, n_chip, n_samples, n_haps)
-        } else {
-            std::collections::HashSet::new()
-        };
-
-        if !haploid_samples.is_empty() {
-            let flat_geno = selphi::diploid::pedigree::build_flat_genotypes(
-                &target_idx, &target_genotypes, n_chip, n_samples);
-            let n_reset = selphi::diploid::pedigree::reset_haploid_hets(
-                &mut targ_alleles, &flat_geno, &haploid_samples, n_chip, n_samples, n_haps,
-            );
-            let detect_method = if args.haploids.is_some() { "from file" } else { "auto-detected" };
-            selphi_step!("Haploid samples ({}): {} samples, {} het calls reset to missing",
-                detect_method, haploid_samples.len(), n_reset);
-        }
-    }
+    apply_pedigree_prephase(
+        args, needs_phasing, &mut targ_alleles,
+        &sample_names, &target_idx, &target_genotypes,
+        n_chip, n_samples, n_haps,
+    );
+    apply_haploid_detection(
+        args, needs_phasing, srp.chromosome(), &mut targ_alleles,
+        &sample_names, &target_idx, &target_genotypes,
+        n_chip, n_samples, n_haps,
+    );
 
     let (targ_alleles, em_ne_per_site, ref_bm_from_phasing) = if needs_phasing {
         selphi_step!("Input is unphased — running phasing pipeline...");
@@ -153,28 +246,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         // Clone needed: ref_positions is borrowed by chip_bps above and may be needed later.
         let ref_bp: Vec<i64> = ref_positions.clone();
 
-        // Resolve phasing engine
-        #[derive(Debug, Clone, Copy, PartialEq)]
-        enum ResolvedEngine { Haploid, Diploid }
-
-        let engine = if args.wgs_phasing {
-            ResolvedEngine::Diploid
-        } else {
-            match args.phasing_engine {
-                PhasingEngine::Diploid => ResolvedEngine::Diploid,
-                PhasingEngine::Haploid => ResolvedEngine::Haploid,
-                PhasingEngine::Auto => {
-                    let is_wgs = n_chip > 50_000;
-                    if is_wgs {
-                        selphi_info!("  Auto-detected WGS input ({} variants > 50K) → Diploid engine", n_chip);
-                        ResolvedEngine::Diploid
-                    } else {
-                        selphi_info!("  Auto-detected chip input ({} variants ≤ 50K) → Haploid engine", n_chip);
-                        ResolvedEngine::Haploid
-                    }
-                }
-            }
-        };
+        let engine = resolve_phasing_engine(args, n_chip);
 
         // Extract full ref bitmatrix (shared for phasing + imputation).
         // For phase-only diploid, we'll subset to common and drop full.
@@ -297,29 +369,10 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     selphi_step!("Genetic map loaded + LD correction");
 
     // 7. Auto-calibrate parameters
-    let match_length = args.match_length.unwrap_or_else(|| {
-        let ml = (n_ref as f64).log2() as usize - 7;
-        ml.min(n_chip / 2000).max(5)
-    });
-    let log2_haps = (n_ref as f64).log2();
-    let fl_fwd = args.fl_fwd.unwrap_or_else(|| {
-        let v = (2600.0 / log2_haps) as usize;
-        v.clamp(100, 450)
-    });
-    let fl_bwd = args.fl_bwd.unwrap_or_else(|| {
-        ((fl_fwd as f64 * 2.4 / log2_haps) as usize).max(13)
-    });
-    let est_ne = if args.est_ne <= 0 {
-        // Adaptive Ne: scales linearly with panel size.
-        // Validated on 1KG (4802 haps, Ne=175K), UKB (75K haps, Ne=2.75M),
-        // TOPMed (171K haps, Ne=5M). Constant ratio ~36 × n_ref.
-        let auto_ne = (36.4 * n_ref as f64).round() as i64;
-        auto_ne.max(20_000)
-    } else {
-        args.est_ne
-    };
-
-    selphi_debug!("  Match length: {}, fl_fwd: {}, fl_bwd: {}, Ne: {}", match_length, fl_fwd, fl_bwd, est_ne);
+    let PbwtParams { match_length, fl_fwd, fl_bwd, est_ne } =
+        auto_calibrate_pbwt_params(args, n_ref, n_chip);
+    selphi_debug!("  Match length: {}, fl_fwd: {}, fl_bwd: {}, Ne: {}",
+        match_length, fl_fwd, fl_bwd, est_ne);
 
     // 8. Compute imputation windows
     let windows = compute_imputation_windows(&chip_cm, args.window_cm, args.overlap_cm);
