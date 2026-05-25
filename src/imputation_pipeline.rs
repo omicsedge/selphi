@@ -151,6 +151,548 @@ fn auto_calibrate_pbwt_params(args: &Args, n_ref: usize, n_chip: usize) -> PbwtP
     PbwtParams { match_length, fl_fwd, fl_bwd, est_ne }
 }
 
+/// Per-format batched-writer activity flags. Mirrors the `formats` struct
+/// but gated by `--sample-batch-size > 0`. `any` is the disjunction —
+/// when true, the HMM streaming callback consumes CSRs into the per-batch
+/// writers (and the main VCF/BCF channel writer is skipped).
+#[derive(Debug, Clone, Copy)]
+struct BatchActive {
+    bcf: bool, vcf: bool, sd: bool, pgen: bool, parquet: bool, any: bool,
+}
+
+/// Per-format vectors of per-batch writers, populated when the corresponding
+/// `BatchActive` flag is true and left empty otherwise. Drained by
+/// `finalize_batched_outputs` after the imputation loop completes.
+#[derive(Default)]
+struct BatchWriters {
+    bcf: Vec<selphi::io::bcf_batch::BatchWriter>,
+    vcf: Vec<selphi::io::vcf_batch::VcfBatchWriter>,
+    sd: Vec<selphi::io::sd_batch::SdBatchWriter>,
+    pgen: Vec<selphi::io::pgen_batch::PgenBatchWriter>,
+    parquet: Vec<selphi::io::parquet_batch::ParquetBatchWriter>,
+}
+
+/// Output writers owned by the imputation loop. The non-batched writers
+/// (single-stream Parquet/PGEN/SelfDecode + the VCF/BCF channel) live here
+/// when `--sample-batch-size == 0`; otherwise per-batch writers in `batch`
+/// take over and the channel-based writer is a no-op dummy.
+struct OutputWriters {
+    parquet: Option<(parquet::arrow::ArrowWriter<std::fs::File>, std::sync::Arc<arrow::datatypes::Schema>)>,
+    pgen: Option<(selphi::io::pgen_output::PgenWriter, std::io::BufWriter<std::fs::File>)>,
+    selfdecode: Option<selphi::io::selfdecode_output::SelfdecodeWriter>,
+    vcf_tx: selphi::io::pipeline::VcfSender,
+    vcf_writer: selphi::io::pipeline::VcfWriterHandle,
+    vcf_bgzip: selphi::io::pipeline::VcfBgzipProc,
+    batch: BatchWriters,
+}
+
+/// Output destination and shape flags used across the imputation loop.
+/// Static, derived once from CLI args.
+struct OutputCtx {
+    formats: selphi::io::pipeline::OutputFormats,
+    out_file: PathBuf,
+    target_batch_size_haps: usize,
+    skip_main_writer: bool,
+    batch_active: BatchActive,
+}
+
+/// Resolve output formats from CLI args + set up every active writer. Honours
+/// `--vcf`/`--bcf` (mutually exclusive — BCF replaces VCF), `--parquet`,
+/// `--pgen`, `--selfdecode`, and `--all-formats`. When `--sample-batch-size > 0`,
+/// each active format gets a per-batch writer set; the main VCF/BCF channel
+/// is replaced by a dummy sender (the merged output is produced by the batch
+/// finalizers instead).
+#[allow(clippy::too_many_arguments)]
+fn setup_output_writers(
+    args: &Args, n_samples: usize, sample_names: &[String],
+    contig_field: &str, version: &str, out_path: &Path,
+) -> (OutputCtx, OutputWriters) {
+    let no_ap = args.no_ap;
+
+    if args.vcf && args.bcf {
+        eprintln!("Error: --vcf and --bcf are mutually exclusive (both use the same output channel)");
+        std::process::exit(1);
+    }
+
+    // (default) → VCF.gz, --bcf replaces VCF, other format flags are additive.
+    let formats = selphi::io::pipeline::OutputFormats {
+        vcf: !args.bcf,
+        bcf: args.bcf,
+        parquet: args.parquet || args.all_formats,
+        pgen: args.pgen || args.all_formats,
+        selfdecode: args.selfdecode || args.all_formats,
+    };
+    let out_file = if formats.bcf { out_path.with_extension("bcf") }
+        else { out_path.with_extension("vcf.gz") };
+
+    // sample_batch_size is in SAMPLES; HMM internals work in haps (× 2).
+    let target_batch_size_haps = args.sample_batch_size.saturating_mul(2);
+    let batched = target_batch_size_haps > 0;
+    let batch_active = BatchActive {
+        bcf: batched && formats.bcf,
+        vcf: batched && formats.vcf,
+        sd: batched && formats.selfdecode,
+        pgen: batched && formats.pgen,
+        parquet: batched && formats.parquet,
+        any: batched && (formats.bcf || formats.vcf || formats.selfdecode || formats.pgen || formats.parquet),
+    };
+    // VCF/BCF channel writer is skipped iff a batched VCF/BCF is taking over.
+    let skip_main_writer = batched && (formats.bcf || formats.vcf);
+
+    // Non-batched single-stream writers (active when --sample-batch-size == 0).
+    let parquet = if formats.parquet && !batched {
+        let pq_file = out_path.with_extension("parquet");
+        Some(selphi::io::parquet_output::setup_parquet_writer(&pq_file, sample_names)
+            .expect("Failed to setup Parquet writer"))
+    } else { None };
+    let pgen = if formats.pgen && !batched {
+        let pgen_file = out_path.with_extension("pgen");
+        selphi::io::pgen_output::write_psam(&pgen_file, sample_names).expect("Failed to write .psam");
+        let pvar = selphi::io::pgen_output::write_pvar(&pgen_file).expect("Failed to write .pvar");
+        let pg = selphi::io::pgen_output::PgenWriter::new(&pgen_file, n_samples).expect("Failed to create .pgen");
+        Some((pg, pvar))
+    } else { None };
+    let selfdecode = if formats.selfdecode && !batched {
+        Some(selphi::io::selfdecode_output::SelfdecodeWriter::new(out_path, sample_names, false)
+            .expect("Failed to setup SelfDecode writer"))
+    } else { None };
+
+    // VCF/BCF channel writer (or dummy when not active / superseded by batched).
+    let (vcf_tx, vcf_writer, vcf_bgzip) = if (formats.vcf || formats.bcf) && !skip_main_writer {
+        if formats.bcf {
+            selphi::io::pipeline::setup_bcf_writer(
+                n_samples, sample_names, contig_field, version, &out_file, no_ap,
+            ).expect("Failed to setup BCF writer")
+        } else {
+            selphi::io::pipeline::setup_vcf_writer(
+                n_samples, sample_names, contig_field, version, &out_file, no_ap,
+            ).expect("Failed to setup VCF writer")
+        }
+    } else {
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        let handle = std::thread::spawn(|| Ok(()));
+        (tx, handle, ())
+    };
+
+    // Active-format banner.
+    let mut fmts = Vec::new();
+    if formats.vcf { fmts.push("VCF.gz"); }
+    if formats.bcf { fmts.push("BCF"); }
+    if formats.parquet { fmts.push("Parquet"); }
+    if formats.pgen { fmts.push("PGEN"); }
+    if formats.selfdecode { fmts.push("SelfDecode"); }
+    selphi_info!("  formats:  {}", fmts.join(" + "));
+
+    // Batched writers. Each block: `if active { setup(...).expect }; selphi_info!`.
+    let batch_tmp_dir = std::env::temp_dir().join(format!("selphi_batch_{}", std::process::id()));
+    let n_haps_total = n_samples * 2;
+    let mut batch = BatchWriters::default();
+
+    if batch_active.bcf {
+        batch.bcf = selphi::io::bcf_batch::setup_batch_writers(
+            n_haps_total, target_batch_size_haps, &batch_tmp_dir,
+            sample_names, contig_field, version, no_ap,
+        ).expect("Failed to setup batch writers");
+        selphi_info!("  batched: {} batch BCF writers active (batch_size={} haps)", batch.bcf.len(), target_batch_size_haps);
+    }
+    if batch_active.vcf {
+        batch.vcf = selphi::io::vcf_batch::setup_vcf_batch_writers(
+            n_haps_total, target_batch_size_haps, &batch_tmp_dir,
+            sample_names, contig_field, version, no_ap,
+        ).expect("Failed to setup VCF batch writers");
+        selphi_info!("  batched: {} batch VCF.gz writers active (batch_size={} haps)", batch.vcf.len(), target_batch_size_haps);
+    }
+    if batch_active.sd {
+        batch.sd = selphi::io::sd_batch::setup_sd_batch_writers(
+            n_haps_total, target_batch_size_haps, &batch_tmp_dir, sample_names, false,
+        ).expect("Failed to setup SD batch writers");
+        selphi_info!("  batched: {} batch SelfDecode writers active", batch.sd.len());
+    }
+    if batch_active.pgen {
+        batch.pgen = selphi::io::pgen_batch::setup_pgen_batch_writers(
+            n_haps_total, target_batch_size_haps, &batch_tmp_dir, sample_names,
+        ).expect("Failed to setup PGEN batch writers");
+        selphi_info!("  batched: {} batch PGEN writers active", batch.pgen.len());
+    }
+    if batch_active.parquet {
+        batch.parquet = selphi::io::parquet_batch::setup_parquet_batch_writers(
+            n_haps_total, target_batch_size_haps, &batch_tmp_dir, sample_names,
+        ).expect("Failed to setup Parquet batch writers");
+        selphi_info!("  batched: {} batch Parquet writers active", batch.parquet.len());
+    }
+
+    (
+        OutputCtx { formats, out_file, target_batch_size_haps, skip_main_writer, batch_active },
+        OutputWriters { parquet, pgen, selfdecode, vcf_tx, vcf_writer, vcf_bgzip, batch },
+    )
+}
+
+/// Inputs to `run_phasing_engines`. Mostly slices borrowed from the
+/// surrounding pipeline; bundled in a struct so the helper signature
+/// stays under the `too_many_arguments` clippy threshold.
+struct PhasingInputs<'a> {
+    args: &'a Args,
+    srp: &'a SrpReader,
+    map_path: &'a str,
+    targ_alleles: &'a [u8],
+    raw_chip_cm: &'a [f64],
+    chip_bps: &'a [i64],
+    ref_positions: &'a [i64],
+    wgs_idx: &'a [usize],
+    n_chip: usize, n_samples: usize, n_ref: usize,
+}
+
+/// Phasing pipeline result. `ref_bm_full` is `None` only for phase-only
+/// diploid (where the full bitmatrix is never built — only the common-MAF
+/// subset is). For all other paths it is `Some` and is reused by the
+/// imputation HMM downstream.
+struct PhasingResult {
+    phased_alleles: Vec<u8>,
+    window_ri: Vec<(f32, usize, usize)>,
+    ref_bm_full: Option<selphi::common::HaplotypeBitmatrix>,
+    engine: ResolvedEngine,
+}
+
+/// Run the resolved phasing engine (haploid or diploid). Extracts the full
+/// reference bitmatrix (shared with downstream imputation) and dispatches to
+/// the appropriate engine, subsetting to common-MAF variants for diploid.
+fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
+    let PhasingInputs {
+        args, srp, map_path, targ_alleles, raw_chip_cm, chip_bps,
+        ref_positions, wgs_idx, n_chip, n_samples, n_ref,
+    } = *inp;
+
+    selphi_step!("Input is unphased — running phasing pipeline...");
+    let (map_bp_raw, map_cm_raw) = genmap::load_genetic_map_raw(Path::new(map_path))
+        .unwrap_or_else(|e| { selphi_error!("Cannot read genetic map {}: {}", map_path, e); std::process::exit(1); });
+    let ref_bp: Vec<i64> = ref_positions.to_vec();
+
+    let engine = resolve_phasing_engine(args, n_chip);
+
+    // Full ref bitmatrix is shared between phasing and imputation. Phase-only
+    // diploid is the one path that skips it (only the common subset is needed).
+    let ref_bm_full = if !args.phase_only || engine != ResolvedEngine::Diploid {
+        let bm = srp.extract_ref_alleles_bitmatrix(wgs_idx);
+        selphi_step!("Ref bitmatrix extracted ({} chip × {} haps, {:.1} MB)",
+            n_chip, n_ref, (bm.n_words() * n_chip * 8) as f64 / 1e6);
+        Some(bm)
+    } else { None };
+
+    let (phased, _confidence, window_ri) = match engine {
+        ResolvedEngine::Diploid => {
+            selphi_step!("Using Diploid phasing");
+            // Common-MAF chip subset (MAF >= 0.001 on target). Diploid runs
+            // on common variants only; rare ones are re-imputed by the HMM.
+            let target_an = (n_samples * 2) as u32;
+            let common_chip_indices: Vec<usize> = (0..n_chip).into_par_iter().filter(|&v| {
+                let mut ac = 0u32;
+                for si in 0..n_samples {
+                    ac += targ_alleles[v * n_samples * 2 + si * 2] as u32;
+                    ac += targ_alleles[v * n_samples * 2 + si * 2 + 1] as u32;
+                }
+                let mac = ac.min(target_an - ac);
+                (mac as f32 / target_an as f32) >= 0.001f32
+            }).collect();
+            let common_ref_bm = if let Some(ref full_bm) = ref_bm_full {
+                selphi::diploid::pbwt_neighbor::HaplotypeBitmatrix::from_subset(
+                    full_bm, &common_chip_indices)
+            } else {
+                // Phase-only path: extract just the common subset from SRP.
+                let common_wgs: Vec<usize> = common_chip_indices.iter().map(|&ci| wgs_idx[ci]).collect();
+                srp.extract_ref_alleles_bitmatrix(&common_wgs)
+            };
+            selphi_step!("Common ref subset ({} / {} variants, {:.1} MB)",
+                common_chip_indices.len(), n_chip,
+                (common_ref_bm.n_words() * common_chip_indices.len() * 8) as f64 / 1e6);
+            selphi::diploid::diploid_phase_bm_prefiltered(
+                targ_alleles, common_ref_bm, &common_chip_indices,
+                raw_chip_cm, chip_bps,
+                &ref_bp, &map_bp_raw, &map_cm_raw,
+                n_chip, n_samples, n_ref,
+                args.seed, args.threads, args.max_cond_haps,
+            )
+        }
+        ResolvedEngine::Haploid => {
+            selphi_step!("Using haploid phasing engine");
+            let ref_bm = ref_bm_full.as_ref().unwrap();
+            haploid::phase_genotypes(
+                targ_alleles, ref_bm,
+                raw_chip_cm, chip_bps,
+                &ref_bp, &map_bp_raw, &map_cm_raw,
+                n_chip, n_samples, n_ref,
+                args.seed, args.threads, args.max_windows,
+            )
+        }
+    };
+    selphi_step!("Phasing complete: {} samples phased, {} EM windows",
+        n_samples, window_ri.len());
+    PhasingResult { phased_alleles: phased, window_ri, ref_bm_full, engine }
+}
+
+/// Convert per-window recombIntensity (`ri`) from phasing into a per-site
+/// effective population size for the imputation HMM.
+///
+/// Phasing EM: `ri = 0.04 * Ne / nHaps_total` (ref + target)
+/// Imputation HMM: `coeff = -0.04 * Ne / n_ref` (ref only)
+/// To preserve the same recomb intensity in the imputation HMM:
+/// `Ne_imp = ri * n_ref / 0.04`.
+fn em_ne_from_window_ri(
+    window_ri: &[(f32, usize, usize)], default_ne_hint: i64,
+    n_chip: usize, n_ref: usize,
+) -> Vec<f64> {
+    let default_ne = if default_ne_hint > 0 { default_ne_hint as f64 } else { 175_000.0 };
+    let mut em_ne = vec![default_ne; n_chip];
+    for (ri, ows, owe) in window_ri {
+        let ne_w = *ri as f64 * n_ref as f64 / 0.04;
+        for i in *ows..*owe {
+            em_ne[i] = ne_w;
+        }
+        selphi_debug!("  EM window [{}-{}): Ne={:.0} (ri={:.6})", ows, owe, ne_w, ri);
+    }
+    em_ne
+}
+
+/// Build the full-chromosome PBWT candidate list once per target haplotype
+/// when (a) `--precompute-candidates` is set, (b) the input had to be phased
+/// (so the alleles are now refined over 15 iterations), and (c) the
+/// projected `n_haps × max_candidates × 4 bytes` footprint fits under the
+/// 2 GB cap. Otherwise returns `None` and per-window selection takes over.
+///
+/// When `--local-ancestry` is set with a panel ancestry sidecar, also
+/// infers per-step local ancestry (PBWT-native, no neural net) and threads
+/// the resulting context through the selection.
+#[allow(clippy::too_many_arguments)]
+fn maybe_precompute_candidates(
+    args: &Args, output_path: &str,
+    ref_bm_imp: &selphi::common::HaplotypeBitmatrix,
+    targ_alleles: &[u8], chip_cm: &[f64],
+    panel_anc: Option<&[u8]>, target_anc: Option<&[f32]>,
+    ancestry_active: bool,
+    needs_phasing: bool, effective_mc: usize,
+    n_chip: usize, n_ref: usize, n_haps: usize,
+) -> Option<Vec<Vec<u32>>> {
+    if !args.precompute_candidates || !needs_phasing { return None; }
+    let precomp_bytes: u64 = (n_haps as u64) * (effective_mc as u64) * 4;
+    if precomp_bytes > 2 * 1024 * 1024 * 1024 { return None; }
+
+    let t0_cand = Instant::now();
+    let coded_full = selphi::imputation::pbwt::build_coded_steps_bm(
+        ref_bm_imp, 0, n_chip, n_ref, targ_alleles, n_haps, chip_cm, 0.05,
+    );
+
+    // Optional PBWT-native local-ancestry inference (alternative to Orchestra).
+    let local_anc = if let (true, Some(pa)) = (args.local_ancestry, panel_anc) {
+        let t0 = Instant::now();
+        let mut la = selphi::imputation::ancestry::infer_local_ancestry(
+            &coded_full, n_ref, n_haps, pa,
+        );
+        if args.local_ancestry_smooth > 0 {
+            selphi::imputation::ancestry::smooth_local_ancestry(&mut la, args.local_ancestry_smooth);
+        }
+        selphi_step!(
+            "Local ancestry inferred (PBWT-native): {} haps × {} steps (smooth r={}) [{:.1}s]",
+            la.n_haps, la.n_steps, args.local_ancestry_smooth,
+            t0.elapsed().as_secs_f64(),
+        );
+        if args.export_local_ancestry {
+            let tsv_path = PathBuf::from(output_path).with_extension("local_ancestry.tsv");
+            match la.write_tsv(&tsv_path) {
+                Ok(()) => selphi_info!("  Local ancestry TSV: {}", tsv_path.display()),
+                Err(e) => selphi_error!("Failed to write local ancestry TSV: {}", e),
+            }
+        }
+        Some(la)
+    } else { None };
+
+    // Build ancestry context: local-anc preferred over global per-sample probs.
+    // Uniform dummy target_hap_probs is only read when `local` is None; keep
+    // a zero vector around so the slice is always valid.
+    let n_pops = selphi::imputation::ancestry::N_POPS;
+    let zeros_vec = vec![0.0f32; n_haps * n_pops];
+    let anc_ctx = match (args.local_ancestry, panel_anc, &local_anc, ancestry_active, target_anc) {
+        (true, Some(pa), Some(_), _, _) => Some(selphi::imputation::ancestry::AncestryContext {
+            panel_hap_pop: pa,
+            target_hap_probs: target_anc.unwrap_or(&zeros_vec),
+            local: local_anc.as_ref(),
+            strength: args.ancestry_strength,
+        }),
+        (_, Some(pa), _, true, Some(ta)) => Some(selphi::imputation::ancestry::AncestryContext {
+            panel_hap_pop: pa,
+            target_hap_probs: ta,
+            local: None,
+            strength: args.ancestry_strength,
+        }),
+        _ => None,
+    };
+
+    let candidates: Vec<Vec<u32>> = (0..n_haps).into_par_iter().map(|tgt| {
+        selphi::imputation::pbwt::select_candidates_weighted(
+            &coded_full, n_ref + tgt, n_ref, 7, effective_mc, anc_ctx.as_ref(), tgt,
+        )
+    }).collect();
+
+    let mode = if local_anc.is_some() { "local" }
+        else if ancestry_active { "global" }
+        else { "none" };
+    selphi_debug!("  Pre-computed candidates: {} haps, {:.1}s (phasing-refined, ancestry={})",
+        n_haps, t0_cand.elapsed().as_secs_f64(), mode);
+    Some(candidates)
+}
+
+/// Finalize all active per-batch writers (--sample-batch-size > 0) and merge
+/// each format's batch intermediates into the final bit-identical output.
+/// Mutates the writer vectors in-place — they are taken with `mem::take` and
+/// left empty after merge. Temp files are removed once the merge succeeds.
+#[allow(clippy::too_many_arguments)]
+fn finalize_batched_outputs(
+    batch_writers: &mut Vec<selphi::io::bcf_batch::BatchWriter>,
+    vcf_batch_writers: &mut Vec<selphi::io::vcf_batch::VcfBatchWriter>,
+    sd_batch_writers: &mut Vec<selphi::io::sd_batch::SdBatchWriter>,
+    pgen_batch_writers: &mut Vec<selphi::io::pgen_batch::PgenBatchWriter>,
+    parquet_batch_writers: &mut Vec<selphi::io::parquet_batch::ParquetBatchWriter>,
+    out_file: &Path, out_path: &Path,
+    sample_names: &[String], contig_field: &str,
+    version: &str, no_ap: bool,
+) {
+    // BCF — channel-based per-batch writers, native sample-merger.
+    if !batch_writers.is_empty() {
+        let taken = std::mem::take(batch_writers);
+        let batch_paths = selphi::io::bcf_batch::finalize_batch_writers(taken)
+            .expect("Failed to finalize batch writers");
+        selphi_info!("  Merging {} batch BCFs → {} ...", batch_paths.len(), out_file.display());
+        let t = Instant::now();
+        selphi::io::bcf_merge::merge_batch_bcfs(
+            &batch_paths, out_file, sample_names, contig_field, version, no_ap,
+        ).expect("Batch BCF merge failed");
+        selphi_info!("  Merged in {:.1}s", t.elapsed().as_secs_f64());
+        for p in &batch_paths { let _ = std::fs::remove_file(p); }
+    }
+    // VCF.gz
+    if !vcf_batch_writers.is_empty() {
+        let taken = std::mem::take(vcf_batch_writers);
+        let batch_paths = selphi::io::vcf_batch::finalize_vcf_batch_writers(taken)
+            .expect("Failed to finalize VCF batch writers");
+        selphi_info!("  Merging {} batch VCFs → {} ...", batch_paths.len(), out_file.display());
+        let t = Instant::now();
+        selphi::io::vcf_merge::merge_batch_vcfs(
+            &batch_paths, out_file, sample_names, contig_field, version, no_ap,
+        ).expect("Batch VCF merge failed");
+        selphi_info!("  Merged in {:.1}s", t.elapsed().as_secs_f64());
+        for p in &batch_paths { let _ = std::fs::remove_file(p); }
+    }
+    // SelfDecode (per-sample chunked Parquet in ZIP)
+    if !sd_batch_writers.is_empty() {
+        let taken = std::mem::take(sd_batch_writers);
+        let batch_paths = selphi::io::sd_batch::finalize_sd_batch_writers(taken)
+            .expect("Failed to finalize SD batch writers");
+        let sd_out = out_path.to_path_buf();
+        selphi_info!("  Merging {} batch SelfDecode ZIPs → {} ...", batch_paths.len(), sd_out.display());
+        let t = Instant::now();
+        selphi::io::sd_merge::merge_batch_sds(&batch_paths, &sd_out).expect("Batch SD merge failed");
+        selphi_info!("  Merged in {:.1}s", t.elapsed().as_secs_f64());
+        for p in &batch_paths { let _ = std::fs::remove_file(p); }
+    }
+    // PGEN (.pgen + .pvar + .psam)
+    if !pgen_batch_writers.is_empty() {
+        let taken = std::mem::take(pgen_batch_writers);
+        let batch_paths = selphi::io::pgen_batch::finalize_pgen_batch_writers(taken)
+            .expect("Failed to finalize PGEN batch writers");
+        let pgen_out = out_path.with_extension("pgen");
+        selphi_info!("  Merging {} batch PGENs → {} ...", batch_paths.len(), pgen_out.display());
+        let t = Instant::now();
+        selphi::io::pgen_merge::merge_batch_pgens(&batch_paths, out_path, sample_names)
+            .expect("Batch PGEN merge failed");
+        selphi_info!("  Merged in {:.1}s", t.elapsed().as_secs_f64());
+        for (p, v) in &batch_paths { let _ = std::fs::remove_file(p); let _ = std::fs::remove_file(v); }
+        for (p, _) in &batch_paths { let _ = std::fs::remove_file(p.with_extension("psam")); }
+    }
+    // Parquet (variant-major)
+    if !parquet_batch_writers.is_empty() {
+        let taken = std::mem::take(parquet_batch_writers);
+        let batch_paths = selphi::io::parquet_batch::finalize_parquet_batch_writers(taken)
+            .expect("Failed to finalize Parquet batch writers");
+        let parquet_out = out_path.with_extension("parquet");
+        selphi_info!("  Merging {} batch Parquets → {} ...", batch_paths.len(), parquet_out.display());
+        let t = Instant::now();
+        selphi::io::parquet_merge::merge_batch_parquets(&batch_paths, &parquet_out, sample_names)
+            .expect("Batch Parquet merge failed");
+        selphi_info!("  Merged in {:.1}s", t.elapsed().as_secs_f64());
+        for p in &batch_paths { let _ = std::fs::remove_file(p); }
+    }
+}
+
+/// Post-imputation accuracy evaluation against a truth VCF/BCF. Reads only
+/// the shared samples between the imputed output and the truth file and
+/// writes a per-MAF-bin R² + concordance summary to `<output>.eval.json`.
+/// No-op when `--truth` is absent or the output is not VCF/BCF.
+fn evaluate_against_truth(args: &Args, output_path: &str, final_path: &Path) {
+    let Some(ref truth) = args.truth else { return; };
+    let truth_path = Path::new(truth);
+    if !truth_path.exists() { return; }
+
+    let imp_s = final_path.to_string_lossy();
+    let eval_supported = imp_s.ends_with(".vcf.gz") || imp_s.ends_with(".bcf");
+    if !eval_supported {
+        selphi_info!("  (evaluation requires VCF/BCF output; got {})", imp_s);
+        return;
+    }
+
+    selphi_step!("Evaluating accuracy vs truth...");
+    let (_imp, _truth, shared) = selphi::eval::accuracy::find_shared_samples(final_path, truth_path)
+        .expect("Failed to read sample headers");
+    selphi_info!("  imputed:  {}", final_path.display());
+    selphi_info!("  truth:    {}", truth);
+    selphi_info!("  shared:   {} samples", shared.len());
+    if shared.is_empty() {
+        selphi_info!("  No shared samples — skipping evaluation");
+        return;
+    }
+    let (site_acc, sample_acc, counts) = selphi::eval::accuracy::evaluate(
+        final_path, truth_path, &shared,
+    ).expect("Evaluation failed");
+    selphi::eval::accuracy::print_summary(&site_acc, &sample_acc, &counts);
+    let json_path = PathBuf::from(output_path).with_extension("eval.json");
+    selphi::eval::accuracy::write_json_summary(&json_path, &site_acc, &sample_acc, &counts, Some(&shared))
+        .expect("Failed to write JSON summary");
+    selphi_step!("Accuracy: {}", json_path.display());
+}
+
+/// MAF-adaptive Ne per site: rare variants benefit from lower Ne
+/// (concentrated HMM, locks onto IBD haps), common from slightly higher Ne
+/// (smoother transitions). Narrow ramp only — a wider CV-aware ramp was
+/// tested 2026-05-22 on MESA chr20 × TOPMed mc=150K and REGRESSED OVERALL
+/// by -0.005, because Ne is a chain (transition) parameter, not a per-site
+/// parameter — high Ne at any common site causes HMM hap-switching that
+/// pollutes the trajectory through nearby rare sites. See
+/// project_ne_sweep_2026_05_22.md for full numbers.
+///
+/// Returns `None` if `--no-em-ne` is off and EM Ne from phasing is present
+/// (caller will use that instead).
+fn compute_maf_adaptive_ne(
+    args: &Args, em_ne_per_site: &Option<Vec<f64>>,
+    ref_bm_imp: &selphi::common::HaplotypeBitmatrix,
+    est_ne: i64, n_chip: usize, n_ref: usize,
+) -> Option<Vec<f64>> {
+    if em_ne_per_site.is_some() && !args.no_em_ne {
+        return None;
+    }
+    let ne_low = est_ne as f64 * 0.85;   // for rare (MAF < 0.5%)
+    let ne_high = est_ne as f64 * 1.2;   // for common (MAF > 2%)
+    let mut ne_maf = vec![ne_low; n_chip];
+    for ci in 0..n_chip {
+        let ac: u32 = ref_bm_imp.popcount_row(ci, n_ref);
+        let af = ac as f64 / n_ref as f64;
+        let maf = af.min(1.0 - af);
+        let t = ((maf - 0.005) / (0.02 - 0.005)).clamp(0.0, 1.0);
+        ne_maf[ci] = ne_low + t * (ne_high - ne_low);
+    }
+    let n_rare = ne_maf.iter().filter(|&&n| n < ne_low + 1.0).count();
+    let n_common = ne_maf.iter().filter(|&&n| n > ne_high - 1.0).count();
+    selphi_debug!("  MAF-adaptive Ne: {:.0}(rare)→{:.0}(common), {} rare / {} common / {} transition",
+        ne_low, ne_high, n_rare, n_common, n_chip - n_rare - n_common);
+    Some(ne_maf)
+}
+
 /// Run single-chromosome imputation (or phase-only) end-to-end.
 ///
 /// The body is an inline port of the original `main()` single-chr branch;
@@ -240,88 +782,13 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     );
 
     let (targ_alleles, em_ne_per_site, ref_bm_from_phasing) = if needs_phasing {
-        selphi_step!("Input is unphased — running phasing pipeline...");
-        let (map_bp_raw, map_cm_raw) = genmap::load_genetic_map_raw(Path::new(map_path))
-            .unwrap_or_else(|e| { selphi_error!("Cannot read genetic map {}: {}", map_path, e); std::process::exit(1); });
-        // Clone needed: ref_positions is borrowed by chip_bps above and may be needed later.
-        let ref_bp: Vec<i64> = ref_positions.clone();
-
-        let engine = resolve_phasing_engine(args, n_chip);
-
-        // Extract full ref bitmatrix (shared for phasing + imputation).
-        // For phase-only diploid, we'll subset to common and drop full.
-        // For full pipeline, kept alive for imputation LD correction + candidates.
-        let ref_bm_full = if !args.phase_only || engine != ResolvedEngine::Diploid {
-            let bm = srp.extract_ref_alleles_bitmatrix(&wgs_idx);
-            selphi_step!("Ref bitmatrix extracted ({} chip × {} haps, {:.1} MB)",
-                n_chip, n_ref, (bm.n_words() * n_chip * 8) as f64 / 1e6);
-            Some(bm)
-        } else { None };
-
-        let (phased, _confidence, window_ri) = match engine {
-            ResolvedEngine::Diploid => {
-                selphi_step!("Using Diploid phasing");
-                // Subset full bitmatrix to common variants (MAF >= 0.001 on target)
-                let target_an = (n_samples * 2) as u32;
-                let common_chip_indices: Vec<usize> = (0..n_chip).into_par_iter().filter(|&v| {
-                    let mut ac = 0u32;
-                    for si in 0..n_samples {
-                        ac += targ_alleles[v * n_samples * 2 + si * 2] as u32;
-                        ac += targ_alleles[v * n_samples * 2 + si * 2 + 1] as u32;
-                    }
-                    let mac = ac.min(target_an - ac);
-                    (mac as f32 / target_an as f32) >= 0.001f32
-                }).collect();
-                let common_ref_bm = if let Some(ref full_bm) = ref_bm_full {
-                    // Full bitmatrix available (full pipeline) — subset in-memory
-                    selphi::diploid::pbwt_neighbor::HaplotypeBitmatrix::from_subset(
-                        full_bm, &common_chip_indices)
-                } else {
-                    // Phase-only: extract only common variants from SRP (saves RAM)
-                    let common_wgs: Vec<usize> = common_chip_indices.iter().map(|&ci| wgs_idx[ci]).collect();
-                    srp.extract_ref_alleles_bitmatrix(&common_wgs)
-                };
-                selphi_step!("Common ref subset ({} / {} variants, {:.1} MB)",
-                    common_chip_indices.len(), n_chip,
-                    (common_ref_bm.n_words() * common_chip_indices.len() * 8) as f64 / 1e6);
-
-                selphi::diploid::diploid_phase_bm_prefiltered(
-                    &targ_alleles, common_ref_bm, &common_chip_indices,
-                    &raw_chip_cm, &chip_bps,
-                    &ref_bp, &map_bp_raw, &map_cm_raw,
-                    n_chip, n_samples, n_ref,
-                    args.seed, args.threads,
-                    args.max_cond_haps,
-                )
-            }
-            ResolvedEngine::Haploid => {
-                selphi_step!("Using haploid phasing engine");
-                let ref_bm = ref_bm_full.as_ref().unwrap();
-                haploid::phase_genotypes(
-                    &targ_alleles, ref_bm,
-                    &raw_chip_cm, &chip_bps,
-                    &ref_bp, &map_bp_raw, &map_cm_raw,
-                    n_chip, n_samples, n_ref,
-                    args.seed, args.threads, args.max_windows,
-                )
-            }
-        };
-
-        // Convert per-window recombIntensity to per-site Ne for imputation HMM.
-        // Phasing EM: ri = 0.04 * Ne / nHaps_total (ref+target)
-        // Imputation HMM: coeff = -0.04 * Ne / n_ref (ref only)
-        // To preserve the same recomb intensity: Ne_imp = ri * n_ref / 0.04
-        let default_ne = if args.est_ne > 0 { args.est_ne as f64 } else { 175_000.0 };
-        let mut em_ne = vec![default_ne; n_chip];
-        for (ri, ows, owe) in &window_ri {
-            let ne_w = *ri as f64 * n_ref as f64 / 0.04;
-            for i in *ows..*owe {
-                em_ne[i] = ne_w;
-            }
-            selphi_debug!("  EM window [{}-{}): Ne={:.0} (ri={:.6})", ows, owe, ne_w, ri);
-        }
-        selphi_step!("Phasing complete: {} samples phased, {} EM windows",
-            n_samples, window_ri.len());
+        let pr = run_phasing_engines(&PhasingInputs {
+            args, srp: &srp, map_path,
+            targ_alleles: &targ_alleles, raw_chip_cm: &raw_chip_cm, chip_bps: &chip_bps,
+            ref_positions: &ref_positions, wgs_idx: &wgs_idx,
+            n_chip, n_samples, n_ref,
+        });
+        let em_ne = em_ne_from_window_ri(&pr.window_ri, args.est_ne, n_chip, n_ref);
 
         if args.phase_only {
             let out_path = PathBuf::from(output_path);
@@ -329,15 +796,18 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                 out_path.with_extension("vcf.gz")
             } else { out_path };
             write_phased_vcf(
-                &phased, &target_markers, &target_idx, &wgs_idx,
+                &pr.phased_alleles, &target_markers, &target_idx, &wgs_idx,
                 &sample_names, &srp, n_chip, n_haps, &out_path,
             ).expect("Failed to write phased VCF");
             selphi_step!("Phase-only VCF: {}", out_path.display());
-            selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB", start_time.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
+            selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB",
+                start_time.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
             return;
         }
-
-        (phased, if args.no_em_ne || engine == ResolvedEngine::Diploid { None } else { Some(em_ne) }, ref_bm_full)
+        // Diploid phasing already feeds its own Ne back through the HMM; for
+        // haploid we forward the per-site EM Ne unless --no-em-ne disables it.
+        let em_ne_to_use = if args.no_em_ne || pr.engine == ResolvedEngine::Diploid { None } else { Some(em_ne) };
+        (pr.phased_alleles, em_ne_to_use, pr.ref_bm_full)
     } else {
         if args.phase_only {
             selphi_info!("WARNING: --phase_only requested but input is already phased. Nothing to do.");
@@ -384,208 +854,34 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
             cm_span, w.chip_end - w.chip_start);
     }
 
-    // 9. Output path setup + multi-format writer
+    // 9. Output path setup + multi-format writer (see `setup_output_writers`).
     let out_path = PathBuf::from(output_path);
     let no_ap = args.no_ap;
+    let (octx, writers) = setup_output_writers(
+        args, n_samples, &sample_names, &srp.metadata.contig_field, version, &out_path,
+    );
+    let OutputCtx { formats, out_file, target_batch_size_haps, skip_main_writer, batch_active } = octx;
+    let BatchActive {
+        bcf: batched_bcf_active, vcf: batched_vcf_active, sd: batched_sd_active,
+        pgen: batched_pgen_active, parquet: batched_parquet_active, any: batched_any_active,
+    } = batch_active;
+    let OutputWriters {
+        parquet: mut parquet_writer,
+        pgen: mut pgen_writer,
+        selfdecode: mut selfdecode_writer,
+        vcf_tx, vcf_writer, vcf_bgzip,
+        batch: BatchWriters {
+            bcf: mut batch_writers,
+            vcf: mut vcf_batch_writers,
+            sd: mut sd_batch_writers,
+            pgen: mut pgen_batch_writers,
+            parquet: mut parquet_batch_writers,
+        },
+    } = writers;
 
-    // Validate conflicting flags
-    if args.vcf && args.bcf {
-        eprintln!("Error: --vcf and --bcf are mutually exclusive (both use the same output channel)");
-        std::process::exit(1);
-    }
-
-    // Determine active output formats:
-    //   (default) → VCF.gz (always produced unless --bcf replaces it)
-    //   --bcf → BCF replaces VCF (mutually exclusive)
-    //   --parquet, --pgen, --selfdecode → additive
-    //   --all-formats → VCF + Parquet + PGEN + SelfDecode
-    let formats = selphi::io::pipeline::OutputFormats {
-        vcf: !args.bcf,
-        bcf: args.bcf,
-        parquet: args.parquet || args.all_formats,
-        pgen: args.pgen || args.all_formats,
-        selfdecode: args.selfdecode || args.all_formats,
-    };
-
-    // Primary output file (the VCF/BCF path)
-    let out_file = if formats.bcf { out_path.with_extension("bcf") }
-        else { out_path.with_extension("vcf.gz") };
-
-    // Parquet writer (independent of VCF/BCF).
-    // Skipped when --sample-batch-size > 0 — batched path takes over.
-    let mut parquet_writer = if formats.parquet && args.sample_batch_size == 0 {
-        let pq_file = out_path.with_extension("parquet");
-        let (w, s) = selphi::io::parquet_output::setup_parquet_writer(&pq_file, &sample_names)
-            .expect("Failed to setup Parquet writer");
-        Some((w, s))
-    } else { None };
-
-    // PGEN writer (.pgen + .pvar + .psam).
-    // Skipped when --sample-batch-size > 0 — batched path takes over.
-    let mut pgen_writer = if formats.pgen && args.sample_batch_size == 0 {
-        let pgen_file = out_path.with_extension("pgen");
-        selphi::io::pgen_output::write_psam(&pgen_file, &sample_names).expect("Failed to write .psam");
-        let pvar = selphi::io::pgen_output::write_pvar(&pgen_file).expect("Failed to write .pvar");
-        let pgen = selphi::io::pgen_output::PgenWriter::new(&pgen_file, n_samples).expect("Failed to create .pgen");
-        Some((pgen, pvar))
-    } else { None };
-
-    // SelfDecode writer (per-sample chunked Parquet in ZIP).
-    // Skipped when --sample-batch-size > 0 — batched path takes over.
-    let mut selfdecode_writer = if formats.selfdecode && args.sample_batch_size == 0 {
-        Some(selphi::io::selfdecode_output::SelfdecodeWriter::new(
-            &out_path, &sample_names, false, // filter_hom_ref disabled by default
-        ).expect("Failed to setup SelfDecode writer"))
-    } else { None };
-
-    // VCF/BCF channel-based writer (active if VCF or BCF format enabled).
-    // SKIPPED when any batched format is active — the per-batch writers +
-    // mergers produce the final output directly at the user's output path.
-    // sample_batch_size is in SAMPLES; convert to haps (× 2) for internal use.
-    let target_batch_size_haps = args.sample_batch_size.saturating_mul(2);
-    let skip_main_writer = target_batch_size_haps > 0 && (formats.bcf || formats.vcf);
-    let (vcf_tx, vcf_writer, vcf_bgzip) = if (formats.vcf || formats.bcf) && !skip_main_writer {
-        if formats.bcf {
-            selphi::io::pipeline::setup_bcf_writer(
-                n_samples, &sample_names, &srp.metadata.contig_field, version, &out_file, no_ap,
-            ).expect("Failed to setup BCF writer")
-        } else {
-            selphi::io::pipeline::setup_vcf_writer(
-                n_samples, &sample_names, &srp.metadata.contig_field, version, &out_file, no_ap,
-            ).expect("Failed to setup VCF writer")
-        }
-    } else {
-        // Dummy sender (no VCF/BCF output)
-        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
-        let handle = std::thread::spawn(|| Ok(()));
-        (tx, handle, ())
-    };
-
-    // Log active output formats
-    {
-        let mut fmts = Vec::new();
-        if formats.vcf { fmts.push("VCF.gz"); }
-        if formats.bcf { fmts.push("BCF"); }
-        if formats.parquet { fmts.push("Parquet"); }
-        if formats.pgen { fmts.push("PGEN"); }
-        if formats.selfdecode { fmts.push("SelfDecode"); }
-        selphi_info!("  formats:  {}", fmts.join(" + "));
-    }
-
-    // Batched-BCF writers (when --sample-batch-size > 0 and BCF output requested).
-    let batched_bcf_active = target_batch_size_haps > 0 && formats.bcf;
-    let batch_tmp_dir = std::env::temp_dir().join(format!("selphi_batch_{}", std::process::id()));
-    let mut batch_writers: Vec<selphi::io::bcf_batch::BatchWriter> = if batched_bcf_active {
-        let n_haps_total = n_samples * 2;
-        selphi::io::bcf_batch::setup_batch_writers(
-            n_haps_total, target_batch_size_haps, &batch_tmp_dir,
-            &sample_names, &srp.metadata.contig_field, version, no_ap,
-        ).expect("Failed to setup batch writers")
-    } else {
-        Vec::new()
-    };
-    if batched_bcf_active {
-        selphi_info!("  batched: {} batch BCF writers active (batch_size={} haps)",
-            batch_writers.len(), target_batch_size_haps);
-    }
-
-    // Batched-VCF writers (when --sample-batch-size > 0 and VCF output requested).
-    let batched_vcf_active = target_batch_size_haps > 0 && formats.vcf;
-    let mut vcf_batch_writers: Vec<selphi::io::vcf_batch::VcfBatchWriter> = if batched_vcf_active {
-        let n_haps_total = n_samples * 2;
-        selphi::io::vcf_batch::setup_vcf_batch_writers(
-            n_haps_total, target_batch_size_haps, &batch_tmp_dir,
-            &sample_names, &srp.metadata.contig_field, version, no_ap,
-        ).expect("Failed to setup VCF batch writers")
-    } else {
-        Vec::new()
-    };
-    if batched_vcf_active {
-        selphi_info!("  batched: {} batch VCF.gz writers active (batch_size={} haps)",
-            vcf_batch_writers.len(), target_batch_size_haps);
-    }
-
-    // Batched-SelfDecode writers (when --sample-batch-size > 0 and SD output requested).
-    let batched_sd_active = target_batch_size_haps > 0 && formats.selfdecode;
-    let mut sd_batch_writers: Vec<selphi::io::sd_batch::SdBatchWriter> = if batched_sd_active {
-        let n_haps_total = n_samples * 2;
-        selphi::io::sd_batch::setup_sd_batch_writers(
-            n_haps_total, target_batch_size_haps, &batch_tmp_dir,
-            &sample_names, false,
-        ).expect("Failed to setup SD batch writers")
-    } else {
-        Vec::new()
-    };
-    if batched_sd_active {
-        selphi_info!("  batched: {} batch SelfDecode writers active",
-            sd_batch_writers.len());
-    }
-
-    // Batched-PGEN writers (when --sample-batch-size > 0 and PGEN output requested).
-    let batched_pgen_active = target_batch_size_haps > 0 && formats.pgen;
-    let mut pgen_batch_writers: Vec<selphi::io::pgen_batch::PgenBatchWriter> = if batched_pgen_active {
-        let n_haps_total = n_samples * 2;
-        selphi::io::pgen_batch::setup_pgen_batch_writers(
-            n_haps_total, target_batch_size_haps, &batch_tmp_dir, &sample_names,
-        ).expect("Failed to setup PGEN batch writers")
-    } else {
-        Vec::new()
-    };
-    if batched_pgen_active {
-        selphi_info!("  batched: {} batch PGEN writers active", pgen_batch_writers.len());
-    }
-
-    // Batched-Parquet writers (when --sample-batch-size > 0 and Parquet output requested).
-    let batched_parquet_active = target_batch_size_haps > 0 && formats.parquet;
-    let mut parquet_batch_writers: Vec<selphi::io::parquet_batch::ParquetBatchWriter> = if batched_parquet_active {
-        let n_haps_total = n_samples * 2;
-        selphi::io::parquet_batch::setup_parquet_batch_writers(
-            n_haps_total, target_batch_size_haps, &batch_tmp_dir, &sample_names,
-        ).expect("Failed to setup Parquet batch writers")
-    } else {
-        Vec::new()
-    };
-    if batched_parquet_active {
-        selphi_info!("  batched: {} batch Parquet writers active", parquet_batch_writers.len());
-    }
-
-    // True if HMM streaming callback should consume CSRs into per-batch writers
-    // (any batched format active).
-    let batched_any_active = batched_bcf_active || batched_vcf_active
-        || batched_sd_active || batched_pgen_active || batched_parquet_active;
-
-    // MAF-adaptive Ne per site: rare variants benefit from lower Ne
-    // (concentrated HMM, locks onto IBD haps), common variants benefit
-    // from slightly higher Ne (smoother transitions). Narrow ramp only —
-    // a wider CV-aware ramp was tested 2026-05-22 on MESA chr20 × TOPMed
-    // mc=150K and REGRESSED OVERALL by -0.005, because Ne is a chain
-    // (transition) parameter, not a per-site parameter — high Ne at any
-    // common site causes HMM hap-switching that pollutes the trajectory
-    // through nearby rare sites. Per-site Ne cannot deliver per-bin
-    // optimal Ne; the per-bin sweep result was a single-run aggregate,
-    // not a separable per-site policy. See project_ne_sweep_2026_05_22.md
-    // for full numbers.
-    let ne_low = est_ne as f64 * 0.85;   // for rare (MAF < 0.5%)
-    let ne_high = est_ne as f64 * 1.2;   // for common (MAF > 2%)
-    let maf_ne_per_site: Option<Vec<f64>> = if em_ne_per_site.is_none() || args.no_em_ne {
-        let mut ne_maf = vec![ne_low; n_chip];
-        for ci in 0..n_chip {
-            let ac: u32 = ref_bm_imp.popcount_row(ci, n_ref);
-            let af = ac as f64 / n_ref as f64;
-            let maf = af.min(1.0 - af);
-            // Smooth ramp: ne_low at MAF<0.005, ne_high at MAF>0.02, linear between
-            let t = ((maf - 0.005) / (0.02 - 0.005)).clamp(0.0, 1.0);
-            ne_maf[ci] = ne_low + t * (ne_high - ne_low);
-        }
-        let n_rare = ne_maf.iter().filter(|&&n| n < ne_low + 1.0).count();
-        let n_common = ne_maf.iter().filter(|&&n| n > ne_high - 1.0).count();
-        selphi_debug!("  MAF-adaptive Ne: {:.0}(rare)→{:.0}(common), {} rare / {} common / {} transition",
-            ne_low, ne_high, n_rare, n_common, n_chip - n_rare - n_common);
-        Some(ne_maf)
-    } else {
-        None  // use EM Ne from phasing instead
-    };
-    // Merge: prefer EM Ne if available, otherwise MAF-adaptive
+    // Prefer EM Ne from phasing if available; otherwise fall back to a narrow
+    // MAF-adaptive ramp. See `compute_maf_adaptive_ne` for the rationale.
+    let maf_ne_per_site = compute_maf_adaptive_ne(args, &em_ne_per_site, &ref_bm_imp, est_ne, n_chip, n_ref);
     let final_ne_per_site: Option<Vec<f64>> = em_ne_per_site.or(maf_ne_per_site);
 
     // Resolve adaptive max_candidates. With --max-candidates=0 (auto), mc
@@ -609,133 +905,34 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         selphi_debug!("Explicit max_candidates={}", args.max_candidates);
     }
 
-    // Pre-compute per-haplotype candidates from full-chromosome phased data.
-    // When phasing ran, these candidates are based on correctly phased alleles
-    // (refined over 15 iterations) → higher quality than per-window selection.
-    // Saves coded-step computation + selection inside the per-window loop.
-    // Gate: at biobank scale the Vec<Vec<u32>> retention alone can exceed 10 GB
-    // (n_haps × max_candidates × 4 bytes). Skip when that projection > 2 GB —
-    // per-window recompute against the shared CodedSteps is cheap.
-    let precomp_bytes: u64 = (n_haps as u64) * (effective_mc as u64) * 4;
-    let precomp_cap_bytes: u64 = 2 * 1024 * 1024 * 1024;
     // Load optional ancestry context for PBWT candidate reweighting.
-    let panel_anc: Option<Vec<u8>> = if let Some(p) = args.panel_ancestry.as_deref() {
-        Some(selphi::imputation::ancestry::load_panel_ancestry(Path::new(p), &srp.sample_ids)
-            .expect("Failed to parse --panel-ancestry TSV"))
-    } else { None };
-    let target_anc: Option<Vec<f32>> = if let Some(p) = args.target_ancestry.as_deref() {
-        Some(selphi::imputation::ancestry::load_target_ancestry(Path::new(p), &sample_names)
-            .expect("Failed to parse --target-ancestry TSV"))
-    } else { None };
+    let panel_anc: Option<Vec<u8>> = args.panel_ancestry.as_deref().map(|p| {
+        selphi::imputation::ancestry::load_panel_ancestry(Path::new(p), &srp.sample_ids)
+            .expect("Failed to parse --panel-ancestry TSV")
+    });
+    let target_anc: Option<Vec<f32>> = args.target_ancestry.as_deref().map(|p| {
+        selphi::imputation::ancestry::load_target_ancestry(Path::new(p), &sample_names)
+            .expect("Failed to parse --target-ancestry TSV")
+    });
     let ancestry_active = panel_anc.is_some() && target_anc.is_some();
     if ancestry_active {
-        selphi_step!(
-            "Ancestry-aware PBWT active (strength={:.2})", args.ancestry_strength
-        );
+        selphi_step!("Ancestry-aware PBWT active (strength={:.2})", args.ancestry_strength);
     } else if panel_anc.is_some() || target_anc.is_some() {
         selphi_info!("  Note: both --panel-ancestry and --target-ancestry are required to activate ancestry reweighting; running baseline.");
     }
 
-    // Per-window candidate selection is the default. Each imputation window
-    // picks its own top-K candidates from window-local PBWT coded steps so
-    // segment-specific haplotypes survive on admixed targets (where the
-    // chromosome-level top-K aggregation would truncate them out). On
-    // pure-pop cohorts the two strategies give bit-identical R². Empirical:
-    // +0.005-0.007 OVERALL R² on MESA admixed (chr20, 4900-sample panel)
-    // and no regression on 1KG 801s chr22. Also scales naturally to
-    // biobank panels — no chr-wide n_haps × max_candidates × 4 allocation
-    // that would explode at 100K+ samples.
-    //
-    // Pass `--precompute-candidates` to fall back to the chr-level path
-    // (faster on small panels but susceptible to the truncation bias on
-    // admixed cohorts).
-    let precomputed_candidates: Option<Vec<Vec<u32>>> = if args.precompute_candidates && needs_phasing && precomp_bytes <= precomp_cap_bytes {
-        let t0_cand = Instant::now();
-        let coded_full = selphi::imputation::pbwt::build_coded_steps_bm(
-            &ref_bm_imp, 0, n_chip, n_ref, &targ_alleles, n_haps, &chip_cm, 0.05,
-        );
-        let max_cand = effective_mc;
-
-        // If --local-ancestry is set and we have panel labels, infer local
-        // ancestry directly from coded_full (no neural net, no external tool).
-        // This is the PBWT-native alternative to Orchestra's base+smoother
-        // architecture: the same coded-steps structure we need for PBWT
-        // candidate selection also gives us per-step ancestry probabilities.
-        let local_anc = if args.local_ancestry && panel_anc.is_some() {
-            let t0 = Instant::now();
-            let mut la = selphi::imputation::ancestry::infer_local_ancestry(
-                &coded_full,
-                n_ref,
-                n_haps,
-                panel_anc.as_deref().unwrap(),
-            );
-            if args.local_ancestry_smooth > 0 {
-                selphi::imputation::ancestry::smooth_local_ancestry(
-                    &mut la, args.local_ancestry_smooth,
-                );
-            }
-            selphi_step!(
-                "Local ancestry inferred (PBWT-native): {} haps × {} steps (smooth r={}) [{:.1}s]",
-                la.n_haps, la.n_steps, args.local_ancestry_smooth,
-                t0.elapsed().as_secs_f64(),
-            );
-            if args.export_local_ancestry {
-                let tsv_path = PathBuf::from(output_path).with_extension("local_ancestry.tsv");
-                if let Err(e) = la.write_tsv(&tsv_path) {
-                    selphi_error!("Failed to write local ancestry TSV: {}", e);
-                } else {
-                    selphi_info!("  Local ancestry TSV: {}", tsv_path.display());
-                }
-            }
-            Some(la)
-        } else { None };
-
-        // Build ancestry context: prefer local if computed, else fall back
-        // to global per-sample probs when --target-ancestry was passed.
-        // Uniform dummy target_hap_probs (length n_haps * N_POPS of zeros)
-        // is only read when `local` is None; keep a zero vector around so
-        // the slice is always valid.
-        let n_pops = selphi::imputation::ancestry::N_POPS;
-        let zeros_vec = vec![0.0f32; n_haps * n_pops];
-        let anc_ctx = if args.local_ancestry && panel_anc.is_some() && local_anc.is_some() {
-            Some(selphi::imputation::ancestry::AncestryContext {
-                panel_hap_pop: panel_anc.as_deref().unwrap(),
-                target_hap_probs: target_anc.as_deref().unwrap_or(&zeros_vec),
-                local: local_anc.as_ref(),
-                strength: args.ancestry_strength,
-            })
-        } else if ancestry_active {
-            Some(selphi::imputation::ancestry::AncestryContext {
-                panel_hap_pop: panel_anc.as_deref().unwrap(),
-                target_hap_probs: target_anc.as_deref().unwrap(),
-                local: None,
-                strength: args.ancestry_strength,
-            })
-        } else { None };
-
-        let candidates: Vec<Vec<u32>> = (0..n_haps)
-            .into_par_iter()
-            .map(|tgt| {
-                selphi::imputation::pbwt::select_candidates_weighted(
-                    &coded_full,
-                    n_ref + tgt,
-                    n_ref,
-                    7,
-                    max_cand,
-                    anc_ctx.as_ref(),
-                    tgt,
-                )
-            })
-            .collect();
-        let mode = if local_anc.is_some() { "local" }
-            else if ancestry_active { "global" }
-            else { "none" };
-        selphi_debug!("  Pre-computed candidates: {} haps, {:.1}s (phasing-refined, ancestry={})",
-            n_haps, t0_cand.elapsed().as_secs_f64(), mode);
-        Some(candidates)
-    } else {
-        None
-    };
+    // Per-window candidate selection is the default. Each window picks its
+    // own top-K from window-local PBWT coded steps so segment-specific haps
+    // survive on admixed targets (chromosome-level top-K aggregation would
+    // truncate them out). On pure-pop cohorts the two strategies give
+    // bit-identical R². Empirical: +0.005-0.007 OVERALL R² on MESA admixed,
+    // no regression on 1KG 801s chr22. Pass `--precompute-candidates` to
+    // restore the chr-level path (faster on small panels).
+    let precomputed_candidates = maybe_precompute_candidates(
+        args, output_path, &ref_bm_imp, &targ_alleles, &chip_cm,
+        panel_anc.as_deref(), target_anc.as_deref(), ancestry_active,
+        needs_phasing, effective_mc, n_chip, n_ref, n_haps,
+    );
 
     // ref_bm_imp stays alive for per-window imputation extraction.
     // ref_bm_imp stays alive for per-window imputation (bitmatrix extraction + candidate selection).
@@ -1079,78 +1276,13 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
 
     }
 
-    // Finalize per-batch BCF writers + merge into final batched output.
-    if batched_bcf_active && !batch_writers.is_empty() {
-        let batch_writers_taken = std::mem::take(&mut batch_writers);
-        let batch_paths = selphi::io::bcf_batch::finalize_batch_writers(batch_writers_taken)
-            .expect("Failed to finalize batch writers");
-        selphi_info!("  Merging {} batch BCFs → {} ...", batch_paths.len(), out_file.display());
-        let t_merge = Instant::now();
-        selphi::io::bcf_merge::merge_batch_bcfs(
-            &batch_paths, &out_file, &sample_names, &srp.metadata.contig_field, version, no_ap,
-        ).expect("Batch BCF merge failed");
-        selphi_info!("  Merged in {:.1}s", t_merge.elapsed().as_secs_f64());
-        for p in &batch_paths { let _ = std::fs::remove_file(p); }
-    }
-
-    // Finalize per-batch VCF writers + merge into final batched VCF.gz.
-    if batched_vcf_active && !vcf_batch_writers.is_empty() {
-        let writers_taken = std::mem::take(&mut vcf_batch_writers);
-        let batch_paths = selphi::io::vcf_batch::finalize_vcf_batch_writers(writers_taken)
-            .expect("Failed to finalize VCF batch writers");
-        selphi_info!("  Merging {} batch VCFs → {} ...", batch_paths.len(), out_file.display());
-        let t_merge = Instant::now();
-        selphi::io::vcf_merge::merge_batch_vcfs(
-            &batch_paths, &out_file, &sample_names, &srp.metadata.contig_field, version, no_ap,
-        ).expect("Batch VCF merge failed");
-        selphi_info!("  Merged in {:.1}s", t_merge.elapsed().as_secs_f64());
-        for p in &batch_paths { let _ = std::fs::remove_file(p); }
-    }
-
-    // Finalize per-batch SelfDecode writers + merge into final batched ZIP.
-    if batched_sd_active && !sd_batch_writers.is_empty() {
-        let writers_taken = std::mem::take(&mut sd_batch_writers);
-        let batch_paths = selphi::io::sd_batch::finalize_sd_batch_writers(writers_taken)
-            .expect("Failed to finalize SD batch writers");
-        let sd_out = out_path.clone();
-        selphi_info!("  Merging {} batch SelfDecode ZIPs → {} ...", batch_paths.len(), sd_out.display());
-        let t_merge = Instant::now();
-        selphi::io::sd_merge::merge_batch_sds(&batch_paths, &sd_out)
-            .expect("Batch SD merge failed");
-        selphi_info!("  Merged in {:.1}s", t_merge.elapsed().as_secs_f64());
-        for p in &batch_paths { let _ = std::fs::remove_file(p); }
-    }
-
-    // Finalize per-batch PGEN writers + merge into final batched PGEN.
-    if batched_pgen_active && !pgen_batch_writers.is_empty() {
-        let writers_taken = std::mem::take(&mut pgen_batch_writers);
-        let batch_paths = selphi::io::pgen_batch::finalize_pgen_batch_writers(writers_taken)
-            .expect("Failed to finalize PGEN batch writers");
-        let pgen_out = out_path.with_extension("pgen");
-        selphi_info!("  Merging {} batch PGENs → {} ...", batch_paths.len(), pgen_out.display());
-        let t_merge = Instant::now();
-        selphi::io::pgen_merge::merge_batch_pgens(&batch_paths, &out_path, &sample_names)
-            .expect("Batch PGEN merge failed");
-        selphi_info!("  Merged in {:.1}s", t_merge.elapsed().as_secs_f64());
-        for (p, v) in &batch_paths { let _ = std::fs::remove_file(p); let _ = std::fs::remove_file(v); }
-        for (p, _) in &batch_paths {
-            let _ = std::fs::remove_file(p.with_extension("psam"));
-        }
-    }
-
-    // Finalize per-batch Parquet writers + merge into final batched Parquet.
-    if batched_parquet_active && !parquet_batch_writers.is_empty() {
-        let writers_taken = std::mem::take(&mut parquet_batch_writers);
-        let batch_paths = selphi::io::parquet_batch::finalize_parquet_batch_writers(writers_taken)
-            .expect("Failed to finalize Parquet batch writers");
-        let parquet_out = out_path.with_extension("parquet");
-        selphi_info!("  Merging {} batch Parquets → {} ...", batch_paths.len(), parquet_out.display());
-        let t_merge = Instant::now();
-        selphi::io::parquet_merge::merge_batch_parquets(&batch_paths, &parquet_out, &sample_names)
-            .expect("Batch Parquet merge failed");
-        selphi_info!("  Merged in {:.1}s", t_merge.elapsed().as_secs_f64());
-        for p in &batch_paths { let _ = std::fs::remove_file(p); }
-    }
+    // Finalize per-format per-batch writers + merge into bit-identical output.
+    finalize_batched_outputs(
+        &mut batch_writers, &mut vcf_batch_writers,
+        &mut sd_batch_writers, &mut pgen_batch_writers, &mut parquet_batch_writers,
+        &out_file, &out_path,
+        &sample_names, &srp.metadata.contig_field, version, no_ap,
+    );
 
     // Free imputation data structures before indexing/evaluation.
     drop(targ_alleles);
@@ -1198,42 +1330,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // Post-imputation accuracy evaluation. Runs the same parallel eval that
     // `--evaluate` uses — the primary VCF/BCF output already contains the
     // full f32 dosages (BCF) or 3-decimal DS (VCF) that the evaluator needs.
-    if let Some(ref truth) = args.truth {
-        let truth_path = Path::new(truth);
-        if truth_path.exists() {
-            let imp_s = final_path.to_string_lossy();
-            let eval_supported = imp_s.ends_with(".vcf.gz") || imp_s.ends_with(".bcf");
-
-            if eval_supported {
-                selphi_step!("Evaluating accuracy vs truth...");
-
-                let (_imp, _truth, shared) =
-                    selphi::eval::accuracy::find_shared_samples(&final_path, truth_path)
-                        .expect("Failed to read sample headers");
-
-                selphi_info!("  imputed:  {}", final_path.display());
-                selphi_info!("  truth:    {}", truth);
-                selphi_info!("  shared:   {} samples", shared.len());
-
-                if !shared.is_empty() {
-                    let (site_acc, sample_acc, counts) = selphi::eval::accuracy::evaluate(
-                        &final_path, truth_path, &shared,
-                    ).expect("Evaluation failed");
-
-                    selphi::eval::accuracy::print_summary(&site_acc, &sample_acc, &counts);
-
-                    let json_path = PathBuf::from(output_path).with_extension("eval.json");
-                    selphi::eval::accuracy::write_json_summary(&json_path, &site_acc, &sample_acc, &counts, Some(&shared))
-                        .expect("Failed to write JSON summary");
-                    selphi_step!("Accuracy: {}", json_path.display());
-                } else {
-                    selphi_info!("  No shared samples — skipping evaluation");
-                }
-            } else {
-                selphi_info!("  (evaluation requires VCF/BCF output; got {})", imp_s);
-            }
-        }
-    }
+    evaluate_against_truth(args, output_path, &final_path);
 
     let total = start_time.elapsed().as_secs_f64();
     let mem = selphi::log::peak_mem_mb();
