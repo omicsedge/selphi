@@ -104,7 +104,7 @@ pub fn merge_batch_pgens(
         }
 
         // 4b. Concatenate hardcalls into 1-byte-per-sample, then repack.
-        for b in &mut packed_out { *b = 0; }
+        packed_out.fill(0);
         let mut sample_idx = 0usize;
         for b in 0..readers.len() {
             let unp = &batch_unpacked[b];
