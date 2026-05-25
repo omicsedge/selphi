@@ -1,12 +1,12 @@
-# Selphi 2: integrated phasing and imputation with mixed-density reference panels
+# **Selphi 2: integrated phasing and imputation with mixed-density reference panels**
 
 Authors: Adriano De Marino, [co-authors TBD]
 
-## Abstract
+# **Abstract**
 
 [To be written after Results section]
 
-## Introduction
+# **Introduction**
 
 Genotype imputation, the statistical inference of ungenotyped variants from reference panels of sequenced haplotypes, has become foundational to modern human genetics. By expanding the variant coverage of array-genotyped and low-coverage sequenced cohorts, imputation enables genome-wide association studies (GWAS), polygenic risk score (PRS) estimation, and fine-mapping of causal variants at a fraction of the cost of deep whole-genome sequencing (WGS) [1]. As reference panels have grown from thousands to hundreds of thousands of sequenced individuals, and as the clinical relevance of rare and low-frequency variants has become increasingly apparent, the demands on imputation algorithms have evolved accordingly.
 
@@ -24,9 +24,11 @@ In this paper, we describe the algorithmic components of Selphi 2, benchmark its
 
 **Figure 1. Overview of the Selphi 2 pipeline.** The pipeline accepts unphased or phased target genotypes in VCF/BCF format, a reference panel in SRP format (single- or multi-chromosome), and a genetic map. If the input is unphased, phasing is performed first using one of two engines selected automatically by variant density: the haploid engine (composite HMM with three-channel greedy swap, optimized for chip arrays with up to 50,000 variants) or the diploid engine (genotype graph with MCMC sampling, optimized for whole-genome sequencing data). The diploid engine operates in two stages: common variants (MAF ≥ 0.1%) are phased via iterative MCMC with EM-estimated effective population size, then rare variants are phased onto the common-variant scaffold using bidirectional PBWT sweeps with IBD2-aware neighbor exclusion and singleton IBD phasing. When pedigree information is available, Mendelian constraints are applied before the HMM to pre-phase deterministic parent-child configurations. An optional phase refinement pass corrects residual switch errors via bidirectional IBD crossover detection and a two-state Viterbi HMM. Phased haplotypes are passed directly in memory to the imputation stage with no intermediate file I/O. Imputation uses a coded-step PBWT operating on a bitmatrix-native representation (1 bit per allele) to select up to 2,500 candidate reference haplotypes per target. After haplotype deduplication, a Li-Stephens HMM (32-bit forward pass for throughput, 64-bit backward pass for numerical stability) computes per-site posterior weights with an effective population size that scales automatically with panel size (Ne ≈ 36 × n_ref, validated across panels from 5,000 to 171,000 haplotypes) and is further adjusted per site by minor allele frequency. The resulting HMM weights are interpolated to full reference-panel density using L2-cache-optimized 2D tiles (1,024 variants × 4,096 haplotypes). Interpolation is fused with output encoding: each tile is interpolated, encoded to all active output formats, and immediately freed, preventing accumulation of interpolated dosages in memory. Five output formats are supported from a single interpolation pass: VCF.gz with multi-threaded BGZF compression, native BCF 2.2, Apache Parquet with zstd compression, PLINK2 PGEN with 16-bit dosage, and SelfDecode per-sample Parquet archives.
 
-## Methods
+# **Methods**
 
-### 2.1 Architecture overview
+## **Selphi 2**
+
+### **Architecture overview**
 
 Selphi 2 is implemented in Rust (edition 2024) with no external runtime dependencies. All compression libraries (zstd, lz4), file format encoders (VCF, BCF, Parquet, PGEN), and index builders (TBI, CSI) are compiled from source as part of the binary. The implementation uses the rayon library [13] for deterministic data-parallel processing: all parallel operations use fixed-seed iteration orders, ensuring bit-identical results across runs on the same hardware.
 
@@ -34,11 +36,11 @@ SIMD acceleration is provided through platform-specific intrinsics: AVX-512 (16-
 
 The pipeline accepts unphased or phased VCF/BCF input, phases the target if necessary, imputes against the reference panel, and writes output in one or more formats simultaneously. No intermediate files are written between stages; phased haplotypes are passed directly in memory to the imputation engine. Memory usage is estimated at startup from panel dimensions and thread count, with a warning if the estimate exceeds available system RAM.
 
-### 2.2 Phasing engines
+### **Phasing engines**
 
 Selphi 2 includes two phasing engines that are selected automatically based on input variant density. For chip arrays (up to 50,000 variants), the haploid engine is used. For whole-genome sequencing data (more than 50,000 variants), the diploid engine is used. Users may override the automatic selection via command-line options.
 
-#### 2.2.1 Haploid engine
+**Haploid engine.**
 
 The haploid phasing engine models each haplotype independently through a composite HMM with a greedy swap criterion, following the approach of Browning and Browning [14]. The algorithm operates in 15 iterations (3 burn-in with fixed phase, 12 phasing iterations with decreasing likelihood-ratio thresholds from 100,000 to 1.0).
 
@@ -50,15 +52,15 @@ For rare variants, a carrier injection mechanism ensures that haplotypes carryin
 
 EM parameter estimation [15] is performed within each iteration to calibrate the mismatch probability and effective recombination rate per window, enabling the HMM transition probabilities to adapt to local recombination patterns.
 
-#### 2.2.2 Diploid engine
+**Diploid engine.**
 
 The diploid engine models the pair of haplotypes jointly through a genotype graph, following the approach of SHAPEIT4 [16] and SHAPEIT5 [9]. At each heterozygous site, the graph encodes all possible local diplotype configurations using 64-bit bitmasks. A segment-based Li-Stephens HMM computes diplotype transition probabilities across conditioning haplotypes selected by positional PBWT. The number of conditioning haplotypes can be capped for computational efficiency (default: unlimited).
 
-Phase is resolved via MCMC sampling on the genotype graph with 15 iterations following the scheme 5b,1p,1b,1p,1b,1p,5m (5 initial burn-in, 3 interleaved prune/burn-in cycles, 5 main iterations), followed by a final Viterbi solve. The HMM forward pass is SIMD-accelerated (AVX2 on x86, NEON on Apple Silicon). The diploid engine operates only on common variants (MAF >= 0.1%); rare variants are phased in a separate pass (Section 2.2.3).
+Phase is resolved via MCMC sampling on the genotype graph with 15 iterations following the scheme 5b,1p,1b,1p,1b,1p,5m (5 initial burn-in, 3 interleaved prune/burn-in cycles, 5 main iterations), followed by a final Viterbi solve. The HMM forward pass is SIMD-accelerated (AVX2 on x86, NEON on Apple Silicon). The diploid engine operates only on common variants (MAF >= 0.1%); rare variants are phased in a separate pass (Rare variant phasing, below).
 
 During burn-in iterations, the effective population size (Ne) is re-estimated from the empirical transition rate observed in the genotype graphs. The observed switch rate (fraction of sites where a genotype graph changes diplotype assignment) is related to Ne through the Li-Stephens approximation [2]: switch_rate ≈ 0.04 × Ne × d / n_haps, where d is the mean inter-marker distance in cM. The estimated Ne is clamped to [1,000, 1,000,000] and applied only when the change exceeds 5% of the current value, preventing oscillation while allowing adaptation to population-specific recombination patterns.
 
-#### 2.2.3 Rare variant phasing (diploid)
+**Rare variant phasing (diploid).**
 
 Rare variants (those not in the common-variant scaffold) are phased in a dedicated PBWT-based pass that operates on target haplotypes only. This two-stage common-then-rare strategy parallels the approach introduced in SHAPEIT5 [9].
 
@@ -70,23 +72,23 @@ Third, a backward PBWT sweep repeats the same procedure in reverse genomic order
 
 Fourth, singleton variants (MAC = 1 among targets) are phased using IBD segment lengths at the scaffold. For each sample, the run-length of consistent alleles on each haplotype is measured at scaffold sites as a proxy for the coalescent Viterbi IBD segment length. The singleton allele is assigned to the haplotype with the longer flanking IBD segment. This is analogous to the coalescent-based singleton phasing in SHAPEIT5 [9] but uses empirical run-lengths rather than a full coalescent HMM.
 
-#### 2.2.4 Phase refinement
+**Phase refinement.**
 
 After the main phasing step, an optional post-hoc phase refinement pass corrects residual switch errors using bidirectional IBD crossover detection. At each heterozygous site, the algorithm tracks the top-K reference haplotypes (by consecutive match run length >= 3 SNPs) on each strand. A crossover is detected when the top-K haplotypes matching strand 1 at position i predominantly match strand 2 at position i+1, or vice versa. The crossover fractions are converted to log-ratios and smoothed, then a two-state HMM (correct phase vs. switched) with a transition rate of 0.5 per cM is solved via Viterbi to identify switch error positions.
 
-#### 2.2.5 Pedigree scaffolding
+**Pedigree scaffolding.**
 
 When pedigree information is available (PLINK PED format), Mendelian constraints from parent-child relationships are applied before the HMM-based phasing, following established practice [16,18,9]. For each trio or duo, the algorithm considers all nine combinations of parental genotype sums (homozygous reference, heterozygous, homozygous alternate) at each variant. When the child is heterozygous and at least one parent is homozygous, the phase is deterministic: the child received the homozygous allele from that parent. When both parents are heterozygous, the phase cannot be resolved by Mendelian logic alone and is deferred to the HMM. When the child has missing genotype data and both parents are homozygous, the child's genotype is imputed. Mendelian inconsistencies (e.g., child heterozygous with both parents homozygous for the same allele) are counted but not corrected.
 
 On chromosome X, haploid samples (males) are detected automatically by their heterozygosity rate: samples with fewer than 1% heterozygous calls across at least 100 non-missing sites are classified as haploid. Heterozygous calls in haploid samples are biologically impossible and indicate genotyping error; these are reset to missing to allow the HMM to impute the correct homozygous genotype.
 
-### 2.3 PBWT matching for imputation
+### **PBWT matching for imputation**
 
 The imputation component uses a coded-step PBWT [4] operating directly on the reference panel bitmatrix (1 bit per allele, packed as 64-bit words). At each step boundary (defined by genetic map positions at approximately 0.05 cM intervals), haplotypes are grouped by their allele sequence within the step using word-level extraction: 64 haplotypes are processed per 64-bit operation, and FNV-1a hashing is used for steps spanning more than 20 SNPs. The result is a set of coded-step partitions from which candidate reference haplotypes can be selected.
 
-For each target haplotype, up to 2,500 candidate reference haplotypes are selected based on their co-occurrence with the target in coded-step partitions. Thread-local workspace buffers (permutation arrays, divergence arrays) are pre-allocated and reused across all targets within a rayon thread, eliminating per-target allocation overhead.
+For each target haplotype, candidate reference haplotypes are selected based on their co-occurrence with the target in coded-step partitions. The number retained per target (`max_candidates`, henceforth mc) is set automatically as a function of the reference panel size and diversity, as described in the next section. Thread-local workspace buffers (permutation arrays, divergence arrays) are pre-allocated and reused across all targets within a rayon thread, eliminating per-target allocation overhead.
 
-### 2.4 Candidate selection and HMM
+### **Candidate selection and HMM**
 
 The selected candidates undergo two filtering steps before entering the HMM. First, candidates appearing below the 10th percentile of occurrence frequency across all step partitions are removed. Second, candidates with greater than 95% position coverage have their gaps filled to prevent artificial truncation of otherwise consistent matches. Identical reference haplotypes at the shared variant positions are then grouped (haplotype deduplication), reducing the number of HMM hidden states by 10–50% depending on the reference panel and target region.
 
@@ -102,17 +104,27 @@ Ne = 36.4 × n_ref_total
 
 where n_ref_total is the total number of haplotypes in the reference panel (not the number of candidates selected for the HMM). This scaling was derived empirically by optimizing imputation R² across three reference panels spanning two orders of magnitude in size: the 1000 Genomes Phase 3 panel (4,802 haplotypes; optimal Ne ≈ 175,000), a UK Biobank subset (75,542 haplotypes; optimal Ne ≈ 2,750,000), and the TOPMed panel (171,054 haplotypes; optimal Ne ≈ 6,200,000). The constant ratio Ne/n_ref ≈ 36 was consistent across panels despite substantial differences in population composition (multi-ethnic global panel, European-only cohort, and multi-ethnic clinical cohort, respectively).
 
-The effective population size is further calibrated per site using a MAF-adaptive scheme: Ne is set to 0.85 × Ne_base for rare variants (MAF < 0.5%) and 1.2 × Ne_base for common variants (MAF > 2%), with a smooth logistic transition between. When the diploid phasing engine is used, the Ne estimated by EM during burn-in (Section 2.2.2) may additionally inform the imputation HMM. Users may override the automatic Ne with a fixed value for reproducibility with prior results.
+The effective population size is further calibrated per site using a MAF-adaptive scheme: Ne is set to 0.85 × Ne_base for rare variants (MAF < 0.5%) and 1.2 × Ne_base for common variants (MAF > 2%), with a smooth logistic transition between. When the diploid phasing engine is used, the Ne estimated by EM during burn-in (see Diploid engine, above) may additionally inform the imputation HMM. Users may override the automatic Ne with a fixed value for reproducibility with prior results.
+
+**Adaptive candidate-set sizing.** The maximum number of reference haplotypes retained per target — denoted mc, henceforth — is set automatically as a function of reference panel size and panel diversity. A fixed mc — as used in earlier Selphi releases (mc \= 2,500)[23] — generates a panel-relative truncation rate that varies by two orders of magnitude across panels: mc \= 2,500 retains 50% of a 5,000-haplotype panel but only 1.5% of a 171,054-haplotype panel. The latter regime systematically excludes rare-variant carriers from minority sub-populations when the per-target top-K is dominated by haplotypes of the panel's majority ancestry, producing R² losses concentrated on low-frequency variants in admixed cohorts.
+
+Selphi 2 resolves mc automatically as
+
+mc \= clamp(Nref (γ + α CVpanel), mcfloor, mcceil)
+
+where Nref is the total number of reference haplotypes, γ is a base fraction, α is a diversity-coupled fraction, and CVpanel ∈ \[0, 1\] is the coefficient of variation of compressed tile sizes in the SRP, computed once at panel load. CVpanel is a proxy for haplotype-pattern diversity: panels containing multiple distinct mosaic structures (multiple ancestries, divergent sub-populations) compress less uniformly than ancestrally homogeneous panels, yielding higher CV.
+
+**Choice of γ, α, mcfloor and mcceil.** The defaults γ \= 0.10, α \= 0.80, mcfloor \= 2,500, and mcceil \= 10⁶ were chosen so that mc remains near 2,500 on small homogeneous panels (preserving baseline accuracy on cohorts such as the 1000 Genomes Phase 3 panel) and rises with both n_ref and panel diversity on larger panels. The floor at 2,500 reproduces the historical default and ensures that even very small panels supply enough conditioning states to the HMM; the ceiling at 10⁶ is effectively unlimited and acts only as a safety bound against pathological inputs. On the panels evaluated in this work, the formula yields mc \= 3,133 for the 1000 Genomes Phase 3 panel (CVpanel \= 0.691, Nref \= 4,802) — essentially the floor — and mc \= 132,676 for the TOPMed panel (CVpanel \= 0.845, Nref \= 171,054) — approximately 78% of the panel. Users may override the automatic mc with a fixed value for reproducibility with prior results.
 
 The resulting HMM posterior weights are stored as sparse CSR matrices (row-per-chip-variant, column-per-reference-haplotype), with entries below 1/(H+1) set to zero.
 
-### 2.5 Interpolation and output
+### **Interpolation and output**
 
 Between consecutive shared-variant positions (chip sites), imputed dosages at reference-panel-only positions are computed by linear interpolation of the HMM-derived haplotype weights, following the standard approach [4,7]:
 
 P(alt | j) = sum_r [ w_r(j) × x_r(j) ] / sum_r [ w_r(j) ]
 
-where w_r(j) is the interpolated weight of reference haplotype r at position j, and x_r(j) is the allele carried by haplotype r at that position. Reference alleles at imputed positions are read from the tiled SRP format (Section 2.6), with pre-loaded stripe batches overlapping I/O with HMM computation.
+where w_r(j) is the interpolated weight of reference haplotype r at position j, and x_r(j) is the allele carried by haplotype r at that position. Reference alleles at imputed positions are read from the tiled SRP format (see Sparse Reference Panel format, below), with pre-loaded stripe batches overlapping I/O with HMM computation.
 
 Interpolation operates on tiles of 1,024 variants × 4,096 haplotypes, sized to fit in L2 cache per core. Within each tile, the interpolation is fused with output encoding: after a tile's dosages are computed, they are immediately formatted to all active output formats and the tile memory is freed. This prevents accumulation of interpolated dosages across the entire chromosome.
 
@@ -126,7 +138,7 @@ To accelerate VCF output formatting, a fast path is employed for samples with tr
 
 Selphi 2 supports five output formats from a single interpolation pass: VCF.gz (multi-threaded BGZF compression), native BCF 2.2 [21], Apache Parquet (zstd-compressed, variant-major columnar layout), PLINK2 PGEN [10] (mode 0x03 with fixed-width records containing 2-bit hardcalls and 16-bit unphased dosage), and SelfDecode format (per-sample chunked Parquet in a ZIP archive). The VCF/BCF output channel uses a dedicated writer thread with a bounded synchronous channel (capacity 64 blocks), decoupling interpolation throughput from I/O throughput. All output formats use the same two-pass DR2 computation, ensuring consistent quality metrics regardless of format choice.
 
-### 2.6 Sparse Reference Panel format (SRP)
+### **Sparse Reference Panel format (SRP)**
 
 The SRP format stores reference panel haplotypes as a 2D tiled sparse matrix. Each tile covers 1,024 variants × 4,096 haplotypes and is stored as a compressed sparse column (CSC) sub-matrix with u16 row indices and u32 column pointers, compressed with zstd at level 3. Tiles are arranged in row-major order (all bands for stripe 0, then stripe 1, etc.), enabling sequential bulk reads per stripe batch via a single pread() system call.
 
@@ -134,7 +146,7 @@ SRP creation is fully streaming: source data (BCF, VCF, or BREF3 [6]) is process
 
 The SRP format supports both single-chromosome and multi-chromosome panels. A multi-chromosome SRP stores all chromosomes in a single file with a global header containing a chromosome directory and shared sample IDs, followed by independent per-chromosome tile sections. Multi-chromosome panels are automatically detected, enabling whole-genome imputation from a single command with overlapped prefetch of the next chromosome's data during the current chromosome's HMM computation.
 
-### 2.7 Mixed-density reference panels
+### **Mixed-density reference panels**
 
 Selphi 2 introduces a novel reference panel structure that combines whole-genome sequenced (WGS) haplotypes with array-genotyped (chip) haplotypes in a single panel file. The WGS haplotypes provide full variant coverage and are used for HMM computation and dosage interpolation. The chip haplotypes provide partial coverage (only at array positions) and are used exclusively to improve phasing resolution and PBWT candidate selection at shared positions.
 
@@ -144,7 +156,7 @@ During imputation, the phasing engine constructs an enlarged bitmatrix containin
 
 For variants present only in the chip panel (not in WGS), Selphi 2 computes dosages by mapping HMM weights from the nearest shared positions to chip haplotype proxies: for each WGS candidate with high weight, the most similar chip haplotype at shared positions (by Hamming distance) is identified, and its allele at the chip-only position is weighted accordingly.
 
-### 2.8 Multi-chromosome processing
+### **Multi-chromosome processing**
 
 Selphi 2 supports whole-genome imputation from a single command using a multi-chromosome SRP file. A multi-chromosome SRP contains a global header with a chromosome directory and shared sample IDs, followed by independent per-chromosome tile sections. Multi-chromosome panels are created from multi-contig BCF files, from directories of per-chromosome BCF files, or by merging existing single-chromosome SRP files.
 
@@ -152,23 +164,23 @@ Target VCF input is read once and partitioned by chromosome in memory. Genetic m
 
 Output is written to a single VCF/BCF file across all chromosomes, with per-chromosome BGZF blocks concatenated natively (preserving block alignment for tabix/CSI indexing).
 
-### 2.9 LD correction
+### **LD correction**
 
 Genetic map distances used in the HMM transition probabilities are corrected for local linkage disequilibrium (LD) patterns [22]. Empirical switch rates between consecutive variant pairs in the reference panel are computed via XOR-and-popcount operations on the bitmatrix. These switch rates are normalized by expected heterozygosity, median-filtered to remove noise, and used to adjust the genetic map distances while preserving the total genetic length. This prevents inflation of the effective population size estimate in regions of strong LD.
 
-### 2.10 Computational resources
+### **Computational resources**
 
 [To be filled with benchmark data]
 
-## Results
+# **Results**
 
 [To be written after benchmarks]
 
-## Discussion
+# **Discussion**
 
 [To be written]
 
-## References
+# **References**
 
 1. McCarthy S, Das S, Kretzschmar W, et al. A reference panel of 64,976 haplotypes for genotype imputation. *Nat Genet*. 2016;48(10):1279-1283.
 2. Li N, Stephens M. Modeling linkage disequilibrium and identifying recombination hotspots using single-nucleotide polymorphism data. *Genetics*. 2003;165(4):2213-2233.
