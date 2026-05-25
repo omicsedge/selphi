@@ -169,16 +169,20 @@ pub fn estimate_and_warn(
     n_chip: usize, n_ref: usize, n_samples: usize, n_threads: usize,
     needs_phasing: bool,
 ) -> usize {
-    estimate_and_warn_with_mc(n_chip, n_ref, n_samples, n_threads, 2500, needs_phasing)
+    estimate_and_warn_with_mc(n_chip, n_ref, n_samples, n_threads, 2500, 0, needs_phasing)
 }
 
-/// Same as [`estimate_and_warn`] but caller passes the actual
-/// `max_candidates` value (default 2500). The per-thread PBWT reduced array
-/// scales linearly with max_candidates and dominates memory at large
-/// candidate values on biobank panels.
+/// Same as [`estimate_and_warn`] but caller passes the actual resolved
+/// `max_candidates` and `--sample-batch-size` (in haps; 0 disables batching).
+/// Both shape the estimate materially:
+/// - `max_candidates` scales the per-thread PBWT reduced array linearly.
+/// - `target_batch_size_haps`, when > 0, caps the in-flight weights /
+///   posterior buffers from `n_haps × per_buffer` to
+///   `target_batch_size_haps × per_buffer` — the entire point of batched
+///   output.
 pub fn estimate_and_warn_with_mc(
     n_chip: usize, n_ref: usize, n_samples: usize, n_threads_init: usize,
-    max_candidates_in: usize,
+    max_candidates_in: usize, target_batch_size_haps: usize,
     needs_phasing: bool,
 ) -> usize {
     // Mem cap: never let estimate exceed this fraction of system RAM at startup.
@@ -186,7 +190,8 @@ pub fn estimate_and_warn_with_mc(
 
     // Compute estimate for a given thread count.
     let est_for_threads = |n_threads: usize| -> f64 {
-        compute_estimate_mb(n_chip, n_ref, n_samples, n_threads, max_candidates_in, needs_phasing)
+        compute_estimate_mb(n_chip, n_ref, n_samples, n_threads,
+            max_candidates_in, target_batch_size_haps, needs_phasing)
     };
 
     // NOTE: the static estimator overcounts I/O buffer transients (vcf_mb,
@@ -215,36 +220,55 @@ pub fn estimate_and_warn_with_mc(
     let total_gb = total_mb / 1024.0;
     let sys_gb = sys_ram_mb / 1024.0;
     let _ = (n_chip, n_ref, n_samples, needs_phasing); // silence unused on log-only path
-    crate::selphi_info!("  Resources: {:.1} GB estimated, {:.1} GB system RAM, {} threads (mc={})",
-        total_gb, sys_gb, n_threads, max_candidates_in);
+    let batch_note = if target_batch_size_haps > 0 {
+        format!(", sample-batch-size={}", target_batch_size_haps / 2)
+    } else { String::new() };
+    crate::selphi_info!("  Resources: {:.1} GB estimated, {:.1} GB system RAM, {} threads (mc={}{})",
+        total_gb, sys_gb, n_threads, max_candidates_in, batch_note);
 
     n_threads
 }
 
 fn compute_estimate_mb(
     n_chip: usize, n_ref: usize, n_samples: usize, n_threads: usize,
-    max_candidates: usize, needs_phasing: bool,
+    max_candidates: usize, target_batch_size_haps: usize, needs_phasing: bool,
 ) -> f64 {
     let n_haps = n_samples * 2;
     let n_ref_words = n_ref.div_ceil(64);
     let ref_bm_mb = (n_chip * n_ref_words * 8) as f64 / 1e6;
     let targ_mb = (n_chip * n_haps) as f64 / 1e6;
     let preload_mb = 500.0;
-    let fl_fwd = 200usize;
-    let n_var_window = n_chip.min(15000);
-    let pbwt_per_thread_mb = (max_candidates * n_var_window
-        + n_var_window * fl_fwd * 8
-        + max_candidates * n_var_window * 4) as f64 / 1e6;
-    let hmm_mb = n_threads as f64 * pbwt_per_thread_mb;
+
+    // HMM forward(f32) + backward(f64) scratch per thread, sized for one
+    // window. Window length ≈ window_cm / chip_cm × n_chip. Default
+    // window_cm=5 cM on a chr-scale chip (~70 cM) → roughly n_chip / 14 vars
+    // per window. State count is bounded by max_candidates.
+    // Empirical: at mc=132676 on MESA 5K chr20 the per-thread HMM scratch is
+    // ~1.5 GB and total HMM is ~24 GB at 16 threads — this formula matches.
+    let window_chip_vars = (n_chip / 14).clamp(100, 5000);
+    let hmm_per_thread_mb = (window_chip_vars * max_candidates.max(2500) * 12) as f64 / 1e6;
+    let hmm_mb = n_threads as f64 * hmm_per_thread_mb;
+
     let n_chip_window = n_chip.min(15000);
     let per_weights_mb = (n_chip_window as f64 * 4.0 + n_chip_window as f64 * 100.0 * 8.0) / 1e6;
-    let weights_mb = (n_haps as f64) * per_weights_mb;
-    let hap_posterior_mb = (n_haps as f64 * n_ref as f64 * 8.0) / 1e6;
+    // With --sample-batch-size, weights and per-hap posterior are bounded to
+    // one batch at a time (next batch starts only after the current one's
+    // CSRs are streamed to its per-batch writer and dropped).
+    let in_flight_haps = if target_batch_size_haps > 0 {
+        target_batch_size_haps.min(n_haps)
+    } else {
+        n_haps
+    };
+    let weights_mb = (in_flight_haps as f64) * per_weights_mb;
+    let hap_posterior_mb = (in_flight_haps as f64 * n_ref as f64 * 8.0) / 1e6;
     let tile_cols = n_ref.div_ceil(4096);
     let stripes_per_batch = 300usize.min((n_chip * 100).div_ceil(1024));
     let stripe_decomp_mb = (stripes_per_batch * tile_cols * 500 * 1024) as f64 / 1e6;
-    let interp_mb = (n_haps * 1024 * 4 * stripes_per_batch) as f64 / 1e6;
-    let vcf_mb = ((n_samples as f64 * 12.0 * stripes_per_batch as f64 * 1024.0 * 2.0) / 1e6).min(2_000.0);
+    // Interpolation and VCF/BCF encode buffers scale with the in-flight hap
+    // count (or sample count) and are also bounded by --sample-batch-size.
+    let in_flight_samples = in_flight_haps / 2;
+    let interp_mb = (in_flight_haps * 1024 * 4 * stripes_per_batch) as f64 / 1e6;
+    let vcf_mb = ((in_flight_samples as f64 * 12.0 * stripes_per_batch as f64 * 1024.0 * 2.0) / 1e6).min(2_000.0);
     let bgzf_mb = (n_threads as f64 * 64.0 * 1024.0) / 1e6;
     let thread_local_mb = n_threads as f64 * 20.0;
     let overhead_mb = 300.0;
@@ -252,11 +276,14 @@ fn compute_estimate_mb(
         + hap_posterior_mb + stripe_decomp_mb + interp_mb + vcf_mb + bgzf_mb
         + thread_local_mb + overhead_mb;
     if needs_phasing {
+        // Phasing-only extras. Sized for one phasing window (the haploid /
+        // diploid engines operate on similar window scales as the imputation
+        // HMM — reuse the same `window_chip_vars` derivation).
         let n_total_haps = n_ref + n_haps;
-        let hap_bits_mb = (n_total_haps as f64 * n_var_window as f64 / 8.0) / 1e6;
-        let n_steps = n_var_window / 10;
+        let hap_bits_mb = (n_total_haps as f64 * window_chip_vars as f64 / 8.0) / 1e6;
+        let n_steps = (window_chip_vars / 10).max(1);
         let ibs_mb = (n_steps * n_samples * 100 * 4) as f64 / 1e6;
-        let sample_arrays_mb = (n_var_window * n_samples * 12) as f64 / 1e6;
+        let sample_arrays_mb = (window_chip_vars * n_samples * 12) as f64 / 1e6;
         let coded_mb = (n_steps * n_total_haps * 4) as f64 / 1e6;
         let global_mb = (n_chip * n_haps + n_chip * n_samples * 4) as f64 / 1e6;
         total_mb += hap_bits_mb + ibs_mb + sample_arrays_mb + coded_mb + global_mb;

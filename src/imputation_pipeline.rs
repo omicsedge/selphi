@@ -749,14 +749,36 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         std::process::exit(1);
     }
 
+    // Resolve auto max_candidates and the batched-output cap BEFORE memory
+    // estimation so the estimator reflects the actual runtime configuration
+    // (the floor mc=2500 + non-batched assumption would massively overcount
+    // weights / posterior / interp / vcf buffers).
+    let (effective_mc, mc_was_auto) = selphi::imputation::resolve_max_candidates(
+        args.max_candidates, n_ref, srp.metadata.chunk_cv,
+        args.adaptive_mc_frac, args.adaptive_mc_cv_alpha, args.adaptive_mc_max,
+    );
+    if mc_was_auto {
+        let scale = args.adaptive_mc_frac
+            + args.adaptive_mc_cv_alpha * srp.metadata.chunk_cv.clamp(0.0, 1.0);
+        selphi_step!(
+            "Auto max_candidates: n_ref={}, chunk_cv={:.3}, scale={:.3} → mc={} (clamp [{}..{}])",
+            n_ref, srp.metadata.chunk_cv, scale, effective_mc,
+            selphi::imputation::MIN_MAX_CANDIDATES, args.adaptive_mc_max,
+        );
+    } else {
+        selphi_debug!("Explicit max_candidates={}", args.max_candidates);
+    }
+    let target_batch_size_haps_estimate = args.sample_batch_size.saturating_mul(2);
+
     // Memory estimation + auto-reduce threads to fit in 92 % of system RAM.
     // If even single-threaded would OOM, this aborts the process before any
     // heavy allocation. Otherwise we wrap the heavy work in a sub-pool
     // sized to the safe thread count (rayon's global pool was already
     // initialised to args.threads in main.rs).
     let needs_phasing_estimate = !is_phased || args.force_phasing;
-    let _effective_threads = selphi::log::estimate_and_warn(
-        n_chip, n_ref, n_samples, args.threads, needs_phasing_estimate,
+    let _effective_threads = selphi::log::estimate_and_warn_with_mc(
+        n_chip, n_ref, n_samples, args.threads, effective_mc,
+        target_batch_size_haps_estimate, needs_phasing_estimate,
     );
 
     // 5. Extract target alleles at chip sites (before ref — needed for MAF filter)
@@ -884,26 +906,8 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     let maf_ne_per_site = compute_maf_adaptive_ne(args, &em_ne_per_site, &ref_bm_imp, est_ne, n_chip, n_ref);
     let final_ne_per_site: Option<Vec<f64>> = em_ne_per_site.or(maf_ne_per_site);
 
-    // Resolve adaptive max_candidates. With --max-candidates=0 (auto), mc
-    // scales with panel size and panel diversity (chunk_cv from the SRP);
-    // see `selphi::imputation::resolve_max_candidates`. On large panels the
-    // legacy default mc=2500 keeps a tiny fraction of candidates and
-    // truncates rare-variant carriers from minority sub-populations.
-    let (effective_mc, mc_was_auto) = selphi::imputation::resolve_max_candidates(
-        args.max_candidates, n_ref, srp.metadata.chunk_cv,
-        args.adaptive_mc_frac, args.adaptive_mc_cv_alpha, args.adaptive_mc_max,
-    );
-    if mc_was_auto {
-        let scale = args.adaptive_mc_frac
-            + args.adaptive_mc_cv_alpha * srp.metadata.chunk_cv.clamp(0.0, 1.0);
-        selphi_step!(
-            "Auto max_candidates: n_ref={}, chunk_cv={:.3}, scale={:.3} → mc={} (clamp [{}..{}])",
-            n_ref, srp.metadata.chunk_cv, scale, effective_mc,
-            selphi::imputation::MIN_MAX_CANDIDATES, args.adaptive_mc_max,
-        );
-    } else {
-        selphi_debug!("Explicit max_candidates={}", args.max_candidates);
-    }
+    // (effective_mc was resolved early, before the memory estimator, so the
+    // estimate reflects the actual mc rather than the floor.)
 
     // Load optional ancestry context for PBWT candidate reweighting.
     let panel_anc: Option<Vec<u8>> = args.panel_ancestry.as_deref().map(|p| {
