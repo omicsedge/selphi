@@ -25,7 +25,12 @@ pub struct MultiChrImputeConfig {
     pub overlap_cm: f64,
     pub match_length: Option<usize>,
     pub est_ne: i64,
+    /// User-set max_candidates. 0 = AUTO (resolved per-chr from
+    /// `adaptive_mc_frac`, `adaptive_mc_cv_alpha`, `adaptive_mc_max`).
     pub max_candidates: usize,
+    pub adaptive_mc_frac: f64,
+    pub adaptive_mc_cv_alpha: f64,
+    pub adaptive_mc_max: usize,
     /// Target-hap batch size (HAPLOTYPE units = 2 × samples). 0 = off.
     pub target_batch_size: usize,
     pub p_err: f64,
@@ -313,14 +318,30 @@ pub fn run_multi_chr(
             em_ne_per_site
         };
 
+        // Resolve adaptive max_candidates per-chr (matches imputation_pipeline.rs).
+        // Uses n_ref (panel size) + chunk_cv (diversity proxy).
+        let effective_mc: usize = if config.max_candidates == 0 {
+            let cv = srp.metadata.chunk_cv;
+            let scale = config.adaptive_mc_frac + config.adaptive_mc_cv_alpha * cv;
+            let auto = ((n_ref as f64) * scale.max(0.0)) as usize;
+            let mc = auto.clamp(2500, config.adaptive_mc_max);
+            selphi_step!(
+                "Auto max_candidates (chr): n_ref={}, cv={:.3}, frac+α·cv={:.3} → mc={} (clamp [{}..{}])",
+                n_ref, cv, scale, mc, 2500, config.adaptive_mc_max
+            );
+            mc
+        } else {
+            config.max_candidates
+        };
+
         // Pre-compute candidates if phasing ran. Gate by retention cost.
-        let precomp_bytes: u64 = (n_haps as u64) * (config.max_candidates as u64) * 4;
+        let precomp_bytes: u64 = (n_haps as u64) * (effective_mc as u64) * 4;
         let precomp_cap_bytes: u64 = 2 * 1024 * 1024 * 1024;
         let precomputed_candidates: Option<Vec<Vec<u32>>> = if needs_phasing && precomp_bytes <= precomp_cap_bytes {
             let coded_full = selphi::imputation::pbwt::build_coded_steps_bm(
                 &ref_bm_imp, 0, n_chip, n_ref, &targ_alleles, n_haps, &chip_cm, 0.05,
             );
-            let max_cand = config.max_candidates;
+            let max_cand = effective_mc;
             let candidates: Vec<Vec<u32>> = (0..n_haps)
                 .into_par_iter()
                 .map(|tgt| {
@@ -386,7 +407,7 @@ pub fn run_multi_chr(
             let hmm_params = selphi::imputation::window_process::WindowHmmParams {
                 n_ref, n_haps, match_length, fl_fwd, fl_bwd,
                 est_ne: est_ne as f64, p_err: config.p_err,
-                max_candidates: config.max_candidates,
+                max_candidates: effective_mc,
                 compute_posterior: wi + 1 < windows.len(),
                 target_batch_size: config.target_batch_size,
             };
@@ -420,7 +441,8 @@ pub fn run_multi_chr(
             };
             let hmm_output = {
                 selphi::imputation::window_process::impute_window(
-                    &inputs, &hmm_params, precomputed_candidates.as_ref(), &mut hap_priors,
+                    &inputs, &hmm_params, precomputed_candidates.as_ref(),
+                    &mut hap_priors,
                     None, // multi-chr orchestrate.rs doesn't support batched streaming yet
                 )
             };
