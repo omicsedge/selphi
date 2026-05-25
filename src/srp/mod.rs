@@ -303,8 +303,25 @@ impl SrpMetadata {
 }
 
 // ---------------------------------------------------------------------------
-// Variant dtype parsing + UCS-4 helpers
+// Helpers
 // ---------------------------------------------------------------------------
+
+/// Coefficient of variation (stdev / mean) of tile compressed sizes. Used as
+/// a proxy for haplotype-pattern diversity in the adaptive `max_candidates`
+/// formula: panels containing multiple distinct mosaic structures compress
+/// less uniformly than ancestrally homogeneous panels. Returns 0.0 if fewer
+/// than 2 tiles or mean is zero.
+pub fn chunk_cv_from_tiles(tile_entries: &[tiled::TileEntryPub]) -> f64 {
+    if tile_entries.len() < 2 { return 0.0; }
+    let n = tile_entries.len() as f64;
+    let sum: f64 = tile_entries.iter().map(|t| t.comp_size as f64).sum();
+    let mean = sum / n;
+    if mean == 0.0 { return 0.0; }
+    let var: f64 = tile_entries.iter()
+        .map(|t| { let d = t.comp_size as f64 - mean; d * d })
+        .sum::<f64>() / n;
+    var.sqrt() / mean
+}
 
 /// Write a string as UCS-4 LE, null-padded to `width_chars` code points.
 pub(crate) fn write_ucs4_string(s: &str, width_chars: usize) -> Vec<u8> {
