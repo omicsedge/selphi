@@ -80,8 +80,10 @@ fn parse_tsv_labels(path: &Path) -> io::Result<HashMap<String, u8>> {
         }
         let mut cols = line.split('\t');
         let Some(sample) = cols.next() else { continue; };
-        // Accept `sample_id<TAB>pop` or `sample_id<TAB>sub_pop<TAB>super_pop`
-        let last = cols.last().unwrap_or("");
+        // Accept `sample_id<TAB>pop` or `sample_id<TAB>sub_pop<TAB>super_pop`.
+        // Use `next_back` (O(1) on the DoubleEndedIterator) instead of `last`
+        // which would consume the whole iterator.
+        let last = cols.next_back().unwrap_or("");
         if sample.is_empty() { continue; }
         map.insert(sample.to_string(), parse_pop(last));
     }

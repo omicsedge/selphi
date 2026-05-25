@@ -483,9 +483,9 @@ pub fn merge_samples_single_chr(
     for r in &readers {
         for v in &r.variants {
             let key = (v.pos, v.ref_allele.clone(), v.alt_allele.clone());
-            if !var_map.contains_key(&key) {
+            if let std::collections::btree_map::Entry::Vacant(e) = var_map.entry(key) {
                 let idx = merged_variants.len();
-                var_map.insert(key, idx);
+                e.insert(idx);
                 merged_variants.push(v.clone());
             }
         }
@@ -780,7 +780,7 @@ pub fn build_multi_chr_srp_from_dir(
         selphi_step!("[{}/{}] Building SRP for chr{}...", i + 1, bcf_files.len(), chr);
         let tmp_srp = tmp_dir.path().join(format!("chr{}.srp", chr));
         super::writer::build_srp_unified(bcf_path, &tmp_srp, threads, chunk_size_override)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("chr{}: {}", chr, e)))?;
+            .map_err(|e| io::Error::other(format!("chr{}: {}", chr, e)))?;
         srp_paths.push(tmp_srp);
     }
 

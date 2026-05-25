@@ -165,7 +165,7 @@ pub struct Args {
 
     /// Process target samples in batches of N for memory-bounded imputation.
     /// 0 = off (default; all samples held simultaneously in RAM, max wall).
-    /// > 0 = process N samples at a time, stream batch BCFs to disk, merge
+    /// N > 0 = process N samples at a time, stream batch BCFs to disk, merge
     /// at end. Bit-identical output. Memory drops linearly with batch size;
     /// wall increases ~30-40% due to merge step. Recommended: 100-500 samples
     /// for biobank panels; not needed for small panels.

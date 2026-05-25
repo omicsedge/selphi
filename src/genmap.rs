@@ -120,7 +120,13 @@ pub fn interpolate_for_chr(
         chip_bps.iter().map(|&bp| interpolate_cm(map_bp, map_cm, bp)).collect()
     } else {
         // Try with and without "chr" prefix
-        let alt = if chr.starts_with("chr") { &chr[3..] } else { &format!("chr{}", chr) };
+        let alt_buf;
+        let alt = if let Some(stripped) = chr.strip_prefix("chr") {
+            stripped
+        } else {
+            alt_buf = format!("chr{}", chr);
+            alt_buf.as_str()
+        };
         if let Some((map_bp, map_cm)) = multi_map.get(alt) {
             chip_bps.iter().map(|&bp| interpolate_cm(map_bp, map_cm, bp)).collect()
         } else {

@@ -216,7 +216,7 @@ fn scan_vcf(bgzf: &mut impl io::Read) -> io::Result<FileInfo> {
 
     // Split into header and data
     let mut header_end = 0;
-    for (_i, line) in buf.split(|&b| b == b'\n').enumerate() {
+    for line in buf.split(|&b| b == b'\n') {
         if line.starts_with(b"#CHROM") {
             let chrom_pos = buf.windows(6).position(|w| w == b"#CHROM").unwrap_or(0);
             header_end = chrom_pos + line.len();
@@ -297,10 +297,10 @@ fn parse_header(header: &str) -> HeaderMeta {
     let mut n_samples = 0;
 
     for line in header.lines() {
-        if line.starts_with("##fileformat=") {
-            file_format = line["##fileformat=".len()..].to_string();
-        } else if line.starts_with("##source=") {
-            source = Some(line["##source=".len()..].to_string());
+        if let Some(rest) = line.strip_prefix("##fileformat=") {
+            file_format = rest.to_string();
+        } else if let Some(rest) = line.strip_prefix("##source=") {
+            source = Some(rest.to_string());
         } else if line.starts_with("##contig=") {
             if let Some(i) = line.find("ID=") {
                 let rest = &line[i + 3..];

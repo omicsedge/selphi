@@ -60,7 +60,7 @@ pub fn setup_batch_writers(
     let n_batches = n_samples.div_ceil(samples_per_batch);
     // Cap total BGZF workers across batches at ~32. Each writer is mostly idle
     // (small per-record compression), so heavy parallelism per batch is wasteful.
-    let bgzip_per_batch = (32 / n_batches.max(1)).max(1).min(4);
+    let bgzip_per_batch = (32 / n_batches.max(1)).clamp(1, 4);
 
     let mut writers = Vec::new();
     let mut sample_start = 0usize;

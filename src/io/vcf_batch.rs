@@ -49,7 +49,7 @@ pub fn setup_vcf_batch_writers(
     let n_samples = n_haps / 2;
     let samples_per_batch = batch_size.div_ceil(2).max(1);
     let n_batches = n_samples.div_ceil(samples_per_batch);
-    let bgzip_per_batch = (32 / n_batches.max(1)).max(1).min(4);
+    let bgzip_per_batch = (32 / n_batches.max(1)).clamp(1, 4);
 
     let mut writers = Vec::new();
     let mut sample_start = 0usize;
