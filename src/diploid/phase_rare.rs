@@ -69,10 +69,13 @@ fn build_variant_order(
 
 /// PBWT-based rare variant phasing: forward + backward sweep with voting.
 ///
-/// Main rare-variant phasing algorithm.
+/// Main rare-variant phasing algorithm. When `full_chip_ref_bm` is `Some`,
+/// the reference panel is woven into the PBWT context — scaffold updates,
+/// neighbor lookups, and rare-site voting all consider both target and
+/// reference haps. Without it (legacy path) only target haps are used.
 pub fn run_phase_rare(
-    phased: &mut [u8],        // (n_var × n_haps) — will be updated with rare phases
-    _ref_alleles: &[u8],       // (n_var × n_ref)
+    phased: &mut [u8],        // (n_var × n_haps_target) — will be updated with rare phases
+    full_chip_ref_bm: Option<&super::pbwt_neighbor::HaplotypeBitmatrix>, // (n_var × n_ref) or None
     target_geno: &[u8],       // (n_var × n_samples × 2) original genotypes
     cm: &[f64],
     n_var: usize,
@@ -83,7 +86,8 @@ pub fn run_phase_rare(
     scaffold_from_common: &[usize], // variant indices phased by phase_common
 ) {
     let n_haps = n_samples * 2;
-    let _n_haps_total = n_ref + n_haps;
+    let use_ref = full_chip_ref_bm.is_some();
+    let n_haps_total = if use_ref { n_haps + n_ref } else { n_haps };
 
     // Scaffold = phase_common output sites.
     // Rare = everything NOT in scaffold that has at least one het in target samples.
@@ -224,8 +228,10 @@ pub fn run_phase_rare(
         vec![CFlip::new(0, 0.0); rare_het_samples[ri].len()]
     }).collect();
 
-    // Build scaffold bitmatrix: TARGET HAPS ONLY (n_haplotypes = 2*n_samples).
-    // Filter scaffold evaluation sites by missing data rate (MDR <= 10%)
+    // Build scaffold bitmatrix. If a full-chip reference panel is supplied
+    // (`use_ref`), pack TARGET + REF haps so the PBWT can use ref haps as
+    // candidate neighbors for rare-variant voting. Otherwise (legacy path)
+    // pack only target haps.
     let scaffold_eval: Vec<bool> = scaffold_sites.iter().map(|&v| {
         let mut n_missing = 0u32;
         for si in 0..n_samples {
@@ -237,10 +243,16 @@ pub fn run_phase_rare(
         mdr <= 0.10 // same as SHAPEIT5 --pbwt-mdr 0.10
     }).collect();
     let scaffold_bm = super::pbwt_neighbor::HaplotypeBitmatrix::from_panel(
-        n_scaffold, n_haps,
+        n_scaffold, n_haps_total,
         &|scaffold_idx: usize, hap_idx: usize| {
             let v = scaffold_sites[scaffold_idx];
-            phased[v * n_haps + hap_idx] != 0
+            if hap_idx < n_haps {
+                phased[v * n_haps + hap_idx] != 0
+            } else if let Some(ref_bm) = full_chip_ref_bm {
+                ref_bm.get(v, hap_idx - n_haps)
+            } else {
+                false
+            }
         },
         &scaffold_eval,
     );
@@ -250,7 +262,8 @@ pub fn run_phase_rare(
     run_pbwt_phase(
         &variant_order, &scaffold_sites, &rare_sites,
         &rare_het_samples, &major_alleles,
-        &scaffold_bm, phased, n_var, n_haps,
+        &scaffold_bm, phased, full_chip_ref_bm,
+        n_var, n_haps, n_haps_total,
         cm, &scaffold_cm, &mut phase_fwd, true, &ibd2_global,
     );
 
@@ -274,7 +287,8 @@ pub fn run_phase_rare(
     run_pbwt_phase(
         &variant_order, &scaffold_sites, &rare_sites,
         &rare_het_samples, &major_alleles,
-        &scaffold_bm, phased, n_var, n_haps,
+        &scaffold_bm, phased, full_chip_ref_bm,
+        n_var, n_haps, n_haps_total,
         cm, &scaffold_cm, &mut phase_bwd, false, &ibd2_global,
     );
 
@@ -319,7 +333,11 @@ pub fn run_phase_rare(
 }
 
 /// Run one direction of PBWT sweep (forward or backward) and phase rare hets.
-/// Uses TARGET-ONLY haplotypes (n_hap = 2*n_samples).
+///
+/// PBWT sweeps the full panel when `full_chip_ref_bm` is `Some` (target +
+/// ref) and target-only otherwise. Rare-site `c_vec` is filled from
+/// `phased` for target haps and from the reference panel for ref haps.
+#[allow(clippy::too_many_arguments)]
 fn run_pbwt_phase(
     variant_order: &[VariantTag],
     scaffold_sites: &[usize],
@@ -328,13 +346,15 @@ fn run_pbwt_phase(
     _major_alleles: &[bool],
     scaffold_bm: &super::pbwt_neighbor::HaplotypeBitmatrix,
     phased: &[u8],
+    full_chip_ref_bm: Option<&super::pbwt_neighbor::HaplotypeBitmatrix>,
     _n_var: usize,
-    n_hap: usize,          // target haps only = n_samples * 2
+    n_target_haps: usize,
+    n_hap: usize,
     cm: &[f64],
     scaffold_cm: &[f64],
     phase_results: &mut [Vec<CFlip>],
     forward: bool,
-    ibd2_global: &[Vec<usize>], // D2: IBD2 pairs per individual (global, no range)
+    ibd2_global: &[Vec<usize>], // IBD2 pairs per target individual (target only)
 ) {
     let n_scaffold = scaffold_sites.len();
     if n_scaffold == 0 { return; }
@@ -424,10 +444,17 @@ fn run_pbwt_phase(
             let rv = rare_sites[ri];
             let vr_cm = cm[rv] as f32;
 
-            // C vector uses TARGET HAPS ONLY
-            let tar_base = rv * n_hap;
-            for h in 0..n_hap {
+            // Fill c_vec for target haps from `phased`, for ref haps from
+            // the supplied full-chip reference bitmatrix. Target row stride
+            // is `n_target_haps` (phased is n_var × n_target_haps).
+            let tar_base = rv * n_target_haps;
+            for h in 0..n_target_haps {
                 c_vec[h] = if phased[tar_base + h] != 0 { 1 } else { -1 };
+            }
+            if let Some(ref_bm) = full_chip_ref_bm {
+                for h in n_target_haps..n_hap {
+                    c_vec[h] = if ref_bm.get(rv, h - n_target_haps) { 1 } else { -1 };
+                }
             }
 
             // All het carriers start as unphased (c_vec[h]=0)
@@ -454,6 +481,11 @@ fn run_pbwt_phase(
 
                     // D2: IBD2 check helper — returns true if pair NOT in IBD2
                     let check_ibd2 = |hap_a: usize, hap_b: usize| -> bool {
+                        // Ref haps are never in IBD2 with anyone (no
+                        // target relatedness data for them).
+                        if hap_a >= n_target_haps || hap_b >= n_target_haps {
+                            return true;
+                        }
                         let i1 = (hap_a / 2).min(hap_b / 2);
                         let i2 = (hap_a / 2).max(hap_b / 2);
                         if i1 == i2 { return false; } // same individual
@@ -508,6 +540,9 @@ fn run_pbwt_phase(
                 let mut v1: f32 = 0.0;
 
                 let check_ibd2 = |hap_a: usize, hap_b: usize| -> bool {
+                    if hap_a >= n_target_haps || hap_b >= n_target_haps {
+                        return true;
+                    }
                     let i1 = (hap_a / 2).min(hap_b / 2);
                     let i2 = (hap_a / 2).max(hap_b / 2);
                     if i1 == i2 { return false; }

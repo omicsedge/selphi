@@ -37,7 +37,7 @@ pub fn diploid_phase_bm_ref(
     let (common_indices, common_ref_bm, prep) =
         _prepare_common(target_geno, ref_bm, chip_cm, chip_bp, ref_bp, map_bp, map_cm,
             n_var, n_samples, n_ref);
-    _diploid_run(target_geno, common_ref_bm, &common_indices, prep,
+    _diploid_run(target_geno, common_ref_bm, &common_indices, Some(ref_bm), prep,
         chip_bp, n_var, n_samples, n_ref, seed, n_threads, 0)
 }
 
@@ -48,6 +48,7 @@ pub fn diploid_phase_bm_prefiltered(
     target_geno: &[u8],
     common_ref_bm: pbwt_neighbor::HaplotypeBitmatrix,
     common_chip_indices: &[usize],
+    full_chip_ref_bm: Option<&pbwt_neighbor::HaplotypeBitmatrix>,
     _chip_cm: &[f64], chip_bp: &[i64], _ref_bp: &[i64], map_bp: &[i64], map_cm: &[f64],
     n_var: usize, n_samples: usize, n_ref: usize, seed: i64, n_threads: usize,
     max_cond_haps: usize,
@@ -78,7 +79,7 @@ pub fn diploid_phase_bm_prefiltered(
     }
 
     _diploid_run(
-        target_geno, common_ref_bm, common_chip_indices,
+        target_geno, common_ref_bm, common_chip_indices, full_chip_ref_bm,
         CommonPrep { target_geno_common, cm_common, cm_full: chip_cm_full, bp_common },
         chip_bp, n_var, n_samples, n_ref, seed, n_threads, max_cond_haps,
     )
@@ -158,10 +159,12 @@ fn _prepare_common(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn _diploid_run(
     target_geno: &[u8],
     common_ref_bm: pbwt_neighbor::HaplotypeBitmatrix,
     common_indices: &[usize],
+    full_chip_ref_bm: Option<&pbwt_neighbor::HaplotypeBitmatrix>,
     prep: CommonPrep,
     _chip_bp: &[i64],
     n_var: usize, n_samples: usize, n_ref: usize, seed: i64, n_threads: usize,
@@ -242,10 +245,12 @@ fn _diploid_run(
         }
     }
 
-    // Phase rare het variants using common-variant scaffold
-    let empty_ref = vec![0u8; 0];
+    // Phase rare het variants using common-variant scaffold. When the
+    // full-chip reference panel is available, weave it into the PBWT
+    // context so rare-variant phasing benefits from biobank-scale ref
+    // matches instead of running target-only.
     phase_rare::run_phase_rare(
-        &mut phased, &empty_ref, target_geno, &cm_full,
+        &mut phased, full_chip_ref_bm, target_geno, &cm_full,
         n_var, n_samples, n_ref, 1, 15000.0, common_indices,
     );
 
