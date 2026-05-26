@@ -41,6 +41,10 @@ fn n_candidates(it: usize, n_burnin: usize, n_phasing: usize) -> i32 {
     if it < n_burnin { return 100; }
     let remaining = (n_burnin + n_phasing - it) as f64;
     let v = remaining / n_phasing as f64 * 90.0;
+    // Banker's rounding at the x.5 iterations (it=4, it=8). Beagle uses Java
+    // Math.round (half-up) here; we tried matching it and it REGRESSED chr22
+    // 1KG by -0.0002 (the extra candidate at it=4/8 was a slight net
+    // negative), so we keep the half-to-even variant.
     let nc = if (v - v.floor() - 0.5).abs() < 1e-9 {
         let f = v.floor() as i32;
         if f % 2 == 0 { f } else { f + 1 }
@@ -139,16 +143,21 @@ fn phase_genotypes_inner(
         };
 
         // Coarse steps (standard, scale=3.0)
+        // minSteps floors the composite-segment eviction window. Beagle uses
+        // `max(200, ceil(1/phaseStep))` ("200 steps and 1 cM",
+        // BasicPhaseStates.java:84); without the 200 floor we evict composite
+        // segments ~3× sooner on dense chip maps (shorter IBS-anchored
+        // segments). Match Beagle.
         let (w_starts, w_ends) = compute_step_boundaries(&w_gen_pos, 3.0);
         let w_n = w_starts.len();
         let ibs_step = (3.0 * median).max(1e-7);
-        let ms = (1.0f64 / ibs_step).round() as i32;
+        let ms = ((1.0f64 / ibs_step).ceil() as i32).max(200);
 
         // Fine steps (scale=1.0)
         let (w_starts_f, w_ends_f) = compute_step_boundaries(&w_gen_pos, 1.0);
         let w_n_f = w_starts_f.len();
         let ibs_step_f = (1.0 * median).max(1e-7);
-        let ms_f = (1.0f64 / ibs_step_f).round() as i32;
+        let ms_f = ((1.0f64 / ibs_step_f).ceil() as i32).max(200);
 
         // Debug: dump coded step boundaries for W0
         if debug::is_debug() && window_gen_pos.is_empty() {
@@ -360,15 +369,20 @@ fn phase_genotypes_inner(
             dd.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             crate::common::utils::median(&dd)
         }.max(1e-7);
+        // PBWT batch overlap buffer. Beagle uses D_BUFFER = 1.0 cM
+        // (PbwtIbsData.java:75, Par.java). We previously used 0.35 cM, a ~3×
+        // narrower warm-up that can truncate PBWT context for boundary
+        // haplotypes between parallel batches. Match Beagle.
+        const PBWT_BUFFER_CM: f64 = 1.0;
         // Coarse batch params
         let steps_per_batch = w_n_steps.div_ceil(n_threads);
         let n_batches = w_n_steps.div_ceil(steps_per_batch);
-        let n_overlap_steps = (0.35 / (3.0 * median_dist)).round() as usize;
+        let n_overlap_steps = (PBWT_BUFFER_CM / (3.0 * median_dist)).round() as usize;
         // Fine batch params
         let w_n_steps_f = window_n_steps_fine[wi];
         let steps_per_batch_f = w_n_steps_f.div_ceil(n_threads);
         let n_batches_f = w_n_steps_f.div_ceil(steps_per_batch_f);
-        let n_overlap_steps_f = (0.35 / (1.0 * median_dist)).round() as usize;
+        let n_overlap_steps_f = (PBWT_BUFFER_CM / (1.0 * median_dist)).round() as usize;
 
         // Adaptive step scale: fine steps for first 5 iterations (phase is uncertain,
         // need error tolerance), coarse for remaining (phase is good, need discrimination).
