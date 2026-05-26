@@ -144,12 +144,22 @@ pub fn run_phase_common_bm(
     };
     let cm_f64: Vec<f64> = cm.to_vec();
 
-    let pbwt_n_haps = n_haps_total.min(10000);
-    let mut pbwt_idx = PbwtNeighborIndex::new(cm, pbwt_n_haps, depth, modulo, 5, &allele_counts, &miss_counts, 0.1);
+    // PBWT now sweeps the FULL panel (target + ref) but stores conditioning
+    // sets only for target haps. The previous 10K cap on `n_haps` excluded
+    // the entire reference panel on biobank-scale runs (n_haps_total =
+    // 181054 on MESA × TOPMed) — target haps got conditioning sets full of
+    // other target haps, with zero ref-panel context. Matches SHAPEIT5
+    // (sweep is full panel, storage is per-individual).
+    let n_target = n_haps;
+    let n_pbwt_sweep = n_haps_total;
+    let mut pbwt_idx = PbwtNeighborIndex::new(
+        cm, n_target, n_pbwt_sweep, depth, modulo,
+        5, &allele_counts, &miss_counts, 0.1,
+    );
 
     let n_eval: usize = pbwt_idx.site_eval.iter().filter(|&&e| e).count();
-    crate::selphi_debug!("  [diploid] phase_common: {} iters ({}), depth={}, modulo={:.3}cM, {} haps (pbwt={}) #eval={} #groups={}",
-        n_iterations, scheme, depth, modulo, n_haps_total, pbwt_n_haps, n_eval, pbwt_idx.n_groups);
+    crate::selphi_debug!("  [diploid] phase_common: {} iters ({}), depth={}, modulo={:.3}cM, {} haps (pbwt sweep={}, store={}) #eval={} #groups={}",
+        n_iterations, scheme, depth, modulo, n_haps_total, n_pbwt_sweep, n_target, n_eval, pbwt_idx.n_groups);
 
     let ordering: Vec<usize> = (0..n_haps_total).collect();
     let mut o_iterator: usize = 0;
