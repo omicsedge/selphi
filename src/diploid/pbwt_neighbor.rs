@@ -74,11 +74,23 @@ impl ConditioningBitset {
 }
 
 /// PBWT neighbor index.
+///
+/// Storage is sized for the **target** haps (`n_haps` field) — only target
+/// haps get conditioning sets recorded — but the PBWT sweep iterates over
+/// the **full panel** (`n_sweep`) so target haps see reference haps as
+/// candidate neighbors. This matches SHAPEIT5 (`conditioning_set_managment.cpp:156`
+/// allocates per-individual, `conditioning_set_solve.cpp:72` sweeps over
+/// all haps). Target haps must be laid out at indices `[0, n_haps)` in the
+/// input bitmatrix (which is the contract enforced by
+/// `HaplotypeBitmatrix::from_target_and_ref`).
 pub struct PbwtNeighborIndex {
     /// Flat storage: data[d * n_haps * n_groups + h * n_groups + g] after transpose.
     pub data: Vec<i32>,
     pub n_groups: usize,
+    /// Number of TARGET haps — storage dimension.
     pub n_haps: usize,
+    /// Full panel size (target + ref) — PBWT sort dimension.
+    pub n_sweep: usize,
     pub depth: usize,
     pub group_sites: Vec<usize>,
     pub site_grouping: Vec<usize>,
@@ -92,11 +104,18 @@ pub struct PbwtNeighborIndex {
 }
 
 impl PbwtNeighborIndex {
+    /// `n_target`: target hap count (= storage dimension).
+    /// `n_sweep`: full panel size (target + ref). Must be `>= n_target`.
+    /// Target haps must occupy indices `[0, n_target)` in the bitmatrix
+    /// passed to `pbwt_sweep_direct`; ref haps occupy `[n_target, n_sweep)`.
     pub fn new(
-        cm: &[f64], n_haps: usize, depth: usize, modulo_cm: f64,
+        cm: &[f64], n_target: usize, n_sweep: usize,
+        depth: usize, modulo_cm: f64,
         mac_filter: usize, allele_counts: &[u32],
         miss_counts: &[u32], mdr_threshold: f64,
     ) -> Self {
+        debug_assert!(n_sweep >= n_target, "n_sweep must include n_target");
+        let n_haps = n_target;
         let n_sites = cm.len();
 
         // Group sites by genetic distance.
@@ -154,13 +173,15 @@ impl PbwtNeighborIndex {
             n_groups = site_grouping[n_sites - 1] + 1;
         }
 
-        // Site evaluation: MAC >= filter AND MDR <= threshold
+        // Site evaluation: MAC >= filter AND MDR <= threshold over the FULL
+        // panel (target + ref) so a site rare in the targets but well-
+        // represented in the panel still gets evaluated.
         // MAC = min(cref, calt) where cref/calt exclude missing alleles
         // MDR = cmis_individuals / (cref + calt + cmis_individuals)
         let site_eval: Vec<bool> = (0..n_sites).map(|i| {
             let calt = allele_counts[i];
             let cmis = miss_counts[i]; // missing individuals (not alleles)
-            let non_missing_alleles = n_haps as u32 - 2 * cmis;
+            let non_missing_alleles = n_sweep as u32 - 2 * cmis;
             let cref = non_missing_alleles - calt;
             let mac = cref.min(calt) as usize;
             let denom = cref + calt + cmis; // quirk: mixes allele counts + individual counts
@@ -219,7 +240,7 @@ impl PbwtNeighborIndex {
         let data = vec![-1i32; depth * n_haps * n_groups];
 
         Self {
-            data, n_groups, n_haps, depth,
+            data, n_groups, n_haps, n_sweep, depth,
             group_sites: vec![0; n_groups],
             site_grouping, site_eval,
             site_selection: vec![false; n_sites],
@@ -274,7 +295,8 @@ impl PbwtNeighborIndex {
     pub fn pbwt_sweep_direct(&mut self, n_sites: usize,
                               ibd2: &super::ibd2_tracks::Ibd2Tracks,
                               bm: &HaplotypeBitmatrix) {
-        let n_hap = self.n_haps;
+        let n_hap = self.n_sweep;       // PBWT iterates the full panel
+        let n_target = self.n_haps;     // storage is target-only
         let depth = self.depth;
         let addr_offset = self.n_groups * self.n_haps;
 
@@ -353,9 +375,13 @@ impl PbwtNeighborIndex {
                     let group = site_grouping[l];
                     for h in 0..n_hap {
                         let chap = a[h] as usize;
+                        // Only target haps get stored conditioning sets;
+                        // ref haps in the sort still influence neighbor
+                        // proximity for adjacent target haps.
+                        if chap >= n_target { continue; }
                         let mut off0 = 1usize; let mut off1 = 1usize;
                         let mut dg0 = -1i32; let mut dg1 = -1i32;
-                        let tar_idx = group * n_hap + chap;
+                        let tar_idx = group * n_target + chap;
                         let mut n_added = 0usize;
                         while n_added < depth {
                             let left_avail = h >= off0;
@@ -422,7 +448,8 @@ impl PbwtNeighborIndex {
     /// Sequential fallback for single-chunk case (bitmatrix path).
     fn _sweep_bitmatrix_seq(&mut self, n_sites: usize, bm: &HaplotypeBitmatrix,
                              ibd2: &super::ibd2_tracks::Ibd2Tracks) {
-        let n_hap = self.n_haps;
+        let n_hap = self.n_sweep;
+        let n_target = self.n_haps;
         let addr_offset = self.n_groups * self.n_haps;
 
         let mut a: Vec<i32> = (0..n_hap as i32).collect();
@@ -463,9 +490,11 @@ impl PbwtNeighborIndex {
                 let group = self.site_grouping[l];
                 for h in 0..n_hap {
                     let chap = a[h] as usize;
+                    // Only target haps get stored conditioning sets.
+                    if chap >= n_target { continue; }
                     let mut off0 = 1usize; let mut off1 = 1usize;
                     let mut dg0 = -1i32; let mut dg1 = -1i32;
-                    let tar_idx = group * n_hap + chap;
+                    let tar_idx = group * n_target + chap;
                     for nd in 0..self.depth {
                         let (add0, hap0) = if h >= off0 {
                             let pos = h - off0;
@@ -503,7 +532,8 @@ impl PbwtNeighborIndex {
     /// Fast PBWT sweep — sequential fallback (kept for compatibility).
     fn _pbwt_sweep_direct_old(&mut self, n_sites: usize, hap_data: &[u8], n_haps_stride: usize,
                               ibd2: &super::ibd2_tracks::Ibd2Tracks) {
-        let n_hap = self.n_haps;
+        let n_hap = self.n_sweep;
+        let n_target = self.n_haps;
         let addr_offset = self.n_groups * self.n_haps;
         let depth = self.depth;
 
@@ -541,9 +571,10 @@ impl PbwtNeighborIndex {
 
                 for h in 0..n_hap {
                     let chap = a[h] as usize;
+                    if chap >= n_target { continue; }
                     let mut off0 = 1usize; let mut off1 = 1usize;
                     let mut dg0 = -1i32; let mut dg1 = -1i32;
-                    let tar_idx = group * n_hap + chap;
+                    let tar_idx = group * n_target + chap;
                     // n_added only increments when valid neighbor found.
                     // Loop continues past rejected candidates (same-ind/IBD2)
                     // until depth neighbors collected or both sides exhausted.
@@ -608,10 +639,13 @@ impl PbwtNeighborIndex {
 
     /// Get conditioning set for one haplotype. Uses bitset when available (O(n_words)),
     /// falls back to data array scan.
+    ///
+    /// Neighbors are full-panel indices ∈ `[0, n_sweep)` (both target and ref
+    /// haps), since the storage is per-target but the sweep covers the entire
+    /// panel.
     pub fn get_conditioning_set(&self, hap_idx: usize) -> Vec<usize> {
-        // Fallback: scan data array (post-transpose layout)
         let addr_offset = self.n_groups * self.n_haps;
-        let mut seen = vec![false; self.n_haps];
+        let mut seen = vec![false; self.n_sweep];
         let mut result = Vec::new();
         for d in 0..self.depth {
             for g in 0..self.n_groups {
@@ -619,7 +653,7 @@ impl PbwtNeighborIndex {
                 let neighbor = self.data[idx];
                 if neighbor >= 0 {
                     let n = neighbor as usize;
-                    if n < self.n_haps && !seen[n] { seen[n] = true; result.push(n); }
+                    if n < self.n_sweep && !seen[n] { seen[n] = true; result.push(n); }
                 }
             }
         }
@@ -638,7 +672,7 @@ impl PbwtNeighborIndex {
 
     pub fn get_conditioning_set_window(&self, hap_idx: usize, g_start: usize, g_end: usize) -> Vec<usize> {
         let addr_offset = self.n_groups * self.n_haps;
-        let mut seen = vec![false; self.n_haps];
+        let mut seen = vec![false; self.n_sweep];
         let mut result = Vec::new();
         for d in 0..self.depth {
             for g in g_start..g_end.min(self.n_groups) {
@@ -646,7 +680,7 @@ impl PbwtNeighborIndex {
                 let neighbor = self.data[idx];
                 if neighbor >= 0 {
                     let n = neighbor as usize;
-                    if n < self.n_haps && !seen[n] { seen[n] = true; result.push(n); }
+                    if n < self.n_sweep && !seen[n] { seen[n] = true; result.push(n); }
                 }
             }
         }
@@ -654,10 +688,11 @@ impl PbwtNeighborIndex {
     }
 
     /// Iterate over SELECTED loci in [l_start, l_end] and collect
-    /// unique PBWT neighbors for the given haplotype.
+    /// unique PBWT neighbors for the given haplotype. Neighbor indices are
+    /// full-panel (target + ref) ∈ `[0, n_sweep)`.
     pub fn get_conditioning_set_by_loci(&self, hap_idx: usize, l_start: usize, l_end: usize) -> Vec<usize> {
         let addr_offset = self.n_groups * self.n_haps;
-        let mut seen = vec![false; self.n_haps];
+        let mut seen = vec![false; self.n_sweep];
         let mut result = Vec::new();
         for l in l_start..=l_end.min(self.site_selection.len().saturating_sub(1)) {
             if !self.site_selection[l] { continue; }
@@ -667,7 +702,7 @@ impl PbwtNeighborIndex {
                 let neighbor = self.data[idx];
                 if neighbor >= 0 {
                     let n = neighbor as usize;
-                    if n < self.n_haps && !seen[n] { seen[n] = true; result.push(n); }
+                    if n < self.n_sweep && !seen[n] { seen[n] = true; result.push(n); }
                 }
             }
         }
@@ -685,7 +720,7 @@ mod tests {
         let n_sites = 200;
         let cm: Vec<f64> = (0..n_sites).map(|i| i as f64 * 0.05).collect();
         let ac: Vec<u32> = vec![50; n_sites];
-        let mut idx = PbwtNeighborIndex::new(&cm, n_haps, 4, 0.1, 2, &ac, &vec![0u32; n_sites], 0.1);
+        let mut idx = PbwtNeighborIndex::new(&cm, n_haps, n_haps, 4, 0.1, 2, &ac, &vec![0u32; n_sites], 0.1);
 
         let mut counter = 0usize;
         idx.select_storage_sites(&mut |n| { counter += 1; 0 });
@@ -748,7 +783,7 @@ mod tests {
         let n_sites = 200;
         let cm: Vec<f64> = (0..n_sites).map(|i| i as f64 * 0.05).collect();
         let ac: Vec<u32> = vec![50; n_sites];
-        let mut idx = PbwtNeighborIndex::new(&cm, n_haps, 4, 0.1, 2, &ac, &vec![0u32; n_sites], 0.1);
+        let mut idx = PbwtNeighborIndex::new(&cm, n_haps, n_haps, 4, 0.1, 2, &ac, &vec![0u32; n_sites], 0.1);
 
         idx.select_storage_sites(&mut |n| 0);
         let site_eval = vec![true; n_sites];

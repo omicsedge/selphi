@@ -74,7 +74,6 @@ pub fn map_merges(
                 let mut mhaps = vec![-1i32; HAP_NUMBER * HAP_NUMBER];
                 let mut n_unique_haps = 0usize;
                 let mut cum_sum = 0.0f64;
-                let mut feasible = false;
 
                 for &(prob, t) in &sorted {
                     let prev_idx = t / curr_dipcount;
@@ -90,31 +89,24 @@ pub fn map_merges(
                     let curr_h0 = dip_hap0(curr_dip);
                     let curr_h1 = dip_hap1(curr_dip);
 
-                    // Merged haplotype indices
                     let merged_h0 = prev_h0 * HAP_NUMBER + curr_h0;
                     let merged_h1 = prev_h1 * HAP_NUMBER + curr_h1;
 
-                    // Assign new sequential indices
-                    if mhaps[merged_h0] < 0 {
-                        if n_unique_haps >= HAP_NUMBER { continue; }
-                        mhaps[merged_h0] = n_unique_haps as i32;
-                        n_unique_haps += 1;
-                    }
-                    if mhaps[merged_h1] < 0 {
-                        if n_unique_haps >= HAP_NUMBER { continue; }
-                        mhaps[merged_h1] = n_unique_haps as i32;
-                        n_unique_haps += 1;
-                    }
+                    // Mirror SHAPEIT5 genotype_prune.cpp:101-112: assign new
+                    // merged hap IDs unconditionally (the original n_haps≤8
+                    // gate around the assignment is commented out in SHAPEIT5
+                    // and was an over-aggressive copy in our port), then
+                    // accept the merge when n_haps reaches exactly HAP_NUMBER
+                    // and the cumulative prob mass strictly exceeds threshold.
+                    let new_h0 = mhaps[merged_h0] < 0;
+                    let new_h1 = mhaps[merged_h1] < 0 && merged_h0 != merged_h1;
+                    if new_h0 { mhaps[merged_h0] = n_unique_haps as i32; n_unique_haps += 1; }
+                    if new_h1 { mhaps[merged_h1] = n_unique_haps as i32; n_unique_haps += 1; }
 
                     cum_sum += prob;
-                    if cum_sum >= threshold && n_unique_haps <= HAP_NUMBER {
-                        feasible = true;
-                        break;
+                    if n_unique_haps == HAP_NUMBER && cum_sum > threshold {
+                        stats[s - 1].merged = true;
                     }
-                }
-
-                if feasible {
-                    stats[s - 1].merged = true;
                 }
             }
         }
