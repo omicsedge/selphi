@@ -768,15 +768,40 @@ fn _run_iterations(
             hap_bm.update_hap_all_from_vec(si * 2 + 1, &h1);
         }
 
-        // NOTE: a per-burnin "EM-Ne" online update used to live here. It was
-        // removed 2026-05-26: it used `graph.n_transitions` (the diplotype-
-        // graph edge count, which can far exceed n_variants) as if it were a
-        // per-site switch rate, so the estimate always saturated at the 1e6
-        // clamp. That inflated the transition coefficient
-        // (-0.04 · Ne / n_haps) ~66× over SHAPEIT5's fixed Ne=15000, making
-        // the HMM far too switch-happy and fragmenting common-variant phase
-        // on biobank panels. SHAPEIT5 (`hmm_parameters.cpp`) uses a fixed Ne
-        // throughout; we now match that. See project_phasing_engine_mesa5k.
+        // EM-Ne online update during burnin. Diverges from SHAPEIT5 (which
+        // uses a fixed Ne) and the formula is admittedly crude — it uses
+        // `graph.n_transitions` (diplotype-graph edge count, > n_variants) as
+        // a switch-rate proxy, so it saturates at the 1e6 clamp on real data,
+        // i.e. it effectively just sets Ne≈1e6 during burnin. BUT empirically
+        // that high Ne is CORRECT for imputation-style phasing against a huge
+        // external reference panel: on MESA 5K × TOPMed-85K, removing it
+        // REGRESSED OVERALL R² 0.6148 → 0.6120 (worse on every MAF bin), and
+        // on 1KG it cost only +0.0003. A large diverse panel needs more
+        // haplotype switching (finer mosaic) than SHAPEIT5's population-scale
+        // Ne=15000 assumes. Keep it. See project_phasing_engine_mesa5k.
+        if stage == Stage::Burnin {
+            let mut total_switches = 0u64;
+            let mut total_sites = 0u64;
+            for graph in graphs.iter() {
+                total_switches += graph.n_transitions as u64;
+                total_sites += graph.n_variants as u64;
+            }
+            if total_sites > 0 {
+                let obs_switch_rate = total_switches as f64 / total_sites as f64;
+                let avg_dist_cm = if cm.len() > 1 {
+                    (cm[cm.len() - 1] - cm[0]) / (cm.len() - 1) as f64
+                } else { 0.01 };
+                if obs_switch_rate > 0.0 && avg_dist_cm > 1e-7 {
+                    let estimated_ne = obs_switch_rate * n_haps_total as f64 / (0.04 * avg_dist_cm);
+                    let new_ne = estimated_ne.clamp(1000.0, 1_000_000.0);
+                    if (new_ne - hmm_params.ne).abs() / hmm_params.ne > 0.05 {
+                        crate::selphi_debug!("    [EM-Ne] iter {}: Ne {:.0} → {:.0} (switch_rate={:.6}, avg_dist={:.6}cM)",
+                            it + 1, hmm_params.ne, new_ne, obs_switch_rate, avg_dist_cm);
+                        hmm_params.update_ne(new_ne);
+                    }
+                }
+            }
+        }
 
         let total_ms = t0.elapsed().as_millis();
         crate::selphi_debug!("    Iter {}/{} ({}): {} segs [pbwt={}ms total={}ms]",
