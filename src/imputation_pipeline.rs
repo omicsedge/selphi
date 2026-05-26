@@ -404,8 +404,14 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
             selphi_step!("Common ref subset ({} / {} variants, {:.1} MB)",
                 common_chip_indices.len(), n_chip,
                 (common_ref_bm.n_words() * common_chip_indices.len() * 8) as f64 / 1e6);
+            // Pass the full-chip ref bitmatrix (if available) so phase_rare
+            // can weave the reference panel into its PBWT context. In the
+            // phase-only diploid path `ref_bm_full` is `None` (we only
+            // extract the common subset to save RAM); phase_rare falls
+            // back to target-only.
             selphi::diploid::diploid_phase_bm_prefiltered(
                 targ_alleles, common_ref_bm, &common_chip_indices,
+                ref_bm_full.as_ref(),
                 raw_chip_cm, chip_bps,
                 &ref_bp, &map_bp_raw, &map_cm_raw,
                 n_chip, n_samples, n_ref,
