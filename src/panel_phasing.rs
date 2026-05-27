@@ -12,6 +12,8 @@ use selphi::{selphi_info, selphi_step, selphi_error};
 use selphi::genmap;
 use selphi::io::target_io::{read_cohort_vcf, write_panel_vcf, TargetMarker};
 use selphi::srp::SrpReader;
+use selphi::srp::writer::{build_srp_from_panel, PanelVariant};
+use selphi::srp::bref3_writer::write_bref3_from_srp;
 
 use crate::cli::{Args, PhasingEngine};
 
@@ -432,18 +434,53 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
         .unwrap_or_else(|e| { selphi_error!("Failed to write phased panel VCF: {}", e); std::process::exit(1); });
     selphi_step!("Phased panel VCF: {}", out_vcf.display());
 
-    // 8. Optional reference-format outputs. The current native VCF→SRP path
-    //    (`build_srp`) emits the DEPRECATED ZIP SRP that today's reader
-    //    rejects; the only producer of the live tiled SRP format is the BCF
-    //    path (`build_srp_from_bcf_native`). A native panel BCF writer is
-    //    needed to wire --srp/--bref3 cleanly — TODO. For now, point the
-    //    user at the working chain rather than emit an unusable file.
+    // 8. Optional native reference-format outputs. The phased panel is written
+    //    straight into the live tiled SRP (the format the imputation reader
+    //    consumes) with no BCF/VCF round-trip; BREF3 reuses the byte-identical
+    //    SRP→BREF3 converter. Both are derived from the in-memory `phased`
+    //    array, so this is cheap relative to phasing itself.
     if args.srp || args.bref3 {
-        selphi_info!("  NOTE: native --srp/--bref3 output is not wired yet (needs a panel BCF writer).");
-        selphi_info!("  Build a reference from the phased VCF with:");
-        selphi_info!("    bcftools view {} -Ob -o panel.bcf && bcftools index panel.bcf", out_vcf.display());
-        selphi_info!("    selphi --prepare-reference-from panel.bcf --out panel{}",
-            if args.bref3 { "  (then --prepare-reference-from panel.srp --out panel.bref3)" } else { "" });
+        // Clean base name: strip a trailing .vcf.gz / .gz / .vcf so the
+        // reference files are `<base>.srp` / `<base>.bref3`, not `<base>.vcf.srp`.
+        let mut base = out_path.clone();
+        if base.extension().is_some_and(|e| e == "gz") { base.set_extension(""); }
+        if base.extension().is_some_and(|e| e == "vcf") { base.set_extension(""); }
+
+        let pvs: Vec<PanelVariant> = markers.iter().map(|m| PanelVariant {
+            chrom: &m.chrom, pos: m.pos,
+            ref_allele: &m.ref_allele, alt_allele: &m.alt_allele, id: ".",
+        }).collect();
+
+        // SRP is needed for either output; write it to its final location when
+        // --srp was requested, otherwise to a tempdir on the same filesystem
+        // (kept off /tmp) that is removed once BREF3 is built.
+        let srp_out = base.with_extension("srp");
+        let mut _tmp_keep: Option<tempfile::TempDir> = None;
+        let srp_path: PathBuf = if args.srp {
+            srp_out.clone()
+        } else {
+            let parent = base.parent().filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+            let td = tempfile::Builder::new().prefix(".selphi_panel_srp_").tempdir_in(&parent)
+                .unwrap_or_else(|e| { selphi_error!("Cannot create temp dir for SRP: {}", e); std::process::exit(1); });
+            let p = td.path().join("panel.srp");
+            _tmp_keep = Some(td);
+            p
+        };
+
+        build_srp_from_panel(&phased, &pvs, &sample_names, n_haps, &srp_path)
+            .unwrap_or_else(|e| { selphi_error!("Failed to write phased panel SRP: {}", e); std::process::exit(1); });
+        if args.srp {
+            selphi_step!("Phased panel SRP: {}", srp_out.display());
+        }
+
+        if args.bref3 {
+            let bref3_out = base.with_extension("bref3");
+            write_bref3_from_srp(&srp_path, &bref3_out)
+                .unwrap_or_else(|e| { selphi_error!("Failed to write phased panel BREF3: {}", e); std::process::exit(1); });
+            selphi_step!("Phased panel BREF3: {}", bref3_out.display());
+        }
+        // _tmp_keep (if any) drops here → intermediate SRP removed.
     }
 
     selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB",

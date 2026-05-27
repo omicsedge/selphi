@@ -249,12 +249,14 @@ pub fn write_bref3_from_srp(source_path: &Path, output_path: &Path) -> io::Resul
     let snv_perms = snv_perms();
     let chrom_name = reader.chromosome().to_string();
 
-    // Derive Beagle-style sample IDs from the 2*n_haps sample list.
-    // SRP stores per-hap identifiers; BREF3 headers want per-sample.
-    // We take even-indexed haps and strip `_0`/`_1`/`#0`/`#1` suffixes if present.
+    // BREF3 headers want one ID per sample. SRP `sample_ids` may be stored
+    // either per-sample (n_samples entries — what selphi's writers emit) or
+    // per-hap (2*n_samples entries with `_0`/`_1`-style suffixes). Detect
+    // which and index accordingly; strip per-hap suffixes when present.
+    let per_hap = reader.sample_ids.len() >= n_samples * 2 && n_samples > 0;
     let sample_names: Vec<String> = (0..n_samples).map(|s| {
-        let raw = reader.sample_ids.get(s * 2).cloned().unwrap_or_else(|| format!("S{}", s));
-        // Strip common per-hap suffixes
+        let idx = if per_hap { s * 2 } else { s };
+        let raw = reader.sample_ids.get(idx).cloned().unwrap_or_else(|| format!("S{}", s));
         for suf in ["_0", "_1", "#0", "#1", ":0", ":1"] {
             if let Some(stripped) = raw.strip_suffix(suf) {
                 return stripped.to_string();
