@@ -287,11 +287,19 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
     //    (n_var × n_haps) is held once for writing regardless.
     let sys_gb = selphi::log::system_ram_mb() / 1024.0;
     let n_threads = args.threads.max(1);
-    // budget for ONE chunk's working memory; leave room for output + overhead.
-    let budget_gb = (0.55 * sys_gb - (n_var as f64 * n_haps as f64 / 1e9)).max(4.0);
+    // Budget for ONE chunk's working memory; leave room for the output array
+    // (held once) + overhead. Haploid gets a tighter fraction — it has the
+    // larger, less-predictable footprint and OOM forces an instance reset.
+    let budget_frac = if matches!(engine, PhasingEngine::Haploid) { 0.50 } else { 0.55 };
+    let budget_gb = (budget_frac * sys_gb - (n_var as f64 * n_haps as f64 / 1e9)).max(4.0);
+    // per_var_bytes calibrated to MEASURED peaks on 1KG chr22 (4802 haps, 16
+    // threads): a 150K-variant haploid chunk peaked at ~63 GB working
+    // (≈420 KB/var); diploid full chr (1.07M) at ~27 GB (≈25 KB/var).
+    // Haploid scales with per-thread HMM scratch (N_MOSAIC states × several
+    // f32/f64 buffers); diploid is bounded by common-only windows.
     let per_var_bytes = match engine {
-        PhasingEngine::Haploid => 280.0 * 24.0 * n_threads as f64 + n_haps as f64 * 4.0,
-        _ => n_haps as f64 * 4.0 * 2.5,
+        PhasingEngine::Haploid => 280.0 * 110.0 * n_threads as f64 + n_haps as f64 * 8.0,
+        _ => n_haps as f64 * 4.0 * 1.5,
     };
     let max_chunk_vars = if args.chunk_vars > 0 {
         args.chunk_vars // explicit override (testing / manual control)
