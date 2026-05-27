@@ -57,6 +57,17 @@ struct VariantRecord {
     original_id: String,
 }
 
+/// Lightweight per-variant view for building an SRP from an in-memory panel
+/// (e.g. a freshly phased cohort). Borrows the caller's strings — no copies.
+pub struct PanelVariant<'a> {
+    pub chrom: &'a str,
+    pub pos: i64,
+    pub ref_allele: &'a str,
+    pub alt_allele: &'a str,
+    /// Original VCF ID, or "." if none.
+    pub id: &'a str,
+}
+
 // ---------------------------------------------------------------------------
 // VCF/BCF → SRP (pure Rust, no bcftools)
 // ---------------------------------------------------------------------------
@@ -632,6 +643,117 @@ pub fn build_srp_from_bref3(
 }
 
 // ---------------------------------------------------------------------------
+// In-memory phased panel → SRP (native tiled, no BCF/VCF round-trip)
+// ---------------------------------------------------------------------------
+
+/// Build a native tiled SRP directly from an in-memory phased panel.
+///
+/// `phased` is `n_var × n_haps` row-major allele bytes (0 = ref, ≥1 = alt) —
+/// the layout produced by the phasing engines. `variants` carries one entry
+/// per row in the same order. This is the BREF3→SRP scatter path
+/// ([`build_srp_from_bref3`]) reading from memory instead of a stream, so a
+/// freshly phased cohort can be written as a live `.srp` (the same format the
+/// imputation reader consumes) without converting through BCF.
+pub fn build_srp_from_panel(
+    phased: &[u8],
+    variants: &[PanelVariant],
+    sample_names: &[String],
+    n_haps: usize,
+    output_path: &Path,
+) -> Result<(), SrpWriterError> {
+    let n_variants = variants.len();
+    if n_variants == 0 { return Err(SrpWriterError::NoVariants); }
+    if phased.len() != n_variants * n_haps {
+        return Err(SrpWriterError::InvalidInput(format!(
+            "phased panel size {} != n_var {} × n_haps {}", phased.len(), n_variants, n_haps)));
+    }
+    let n_samples = n_haps / 2;
+
+    // Variant index (vbin / IDs / original_IDs) — identical encoding to the
+    // BREF3 path so a panel-built SRP is indistinguishable from a converted one.
+    let chromosome = variants[0].chrom.to_string();
+    let mut min_pos = i64::MAX;
+    let mut max_pos = i64::MIN;
+    let mut vbin = Vec::with_capacity(n_variants * 20);
+    let mut ids = Vec::with_capacity(n_variants * 24);
+    let mut orig_ids = Vec::with_capacity(n_variants * 2);
+    let mut first_id = true;
+    for v in variants {
+        if v.pos < min_pos { min_pos = v.pos; }
+        if v.pos > max_pos { max_pos = v.pos; }
+        let chr_b = v.chrom.as_bytes();
+        let ref_b = v.ref_allele.as_bytes();
+        let alt_b = v.alt_allele.as_bytes();
+        vbin.extend_from_slice(&v.pos.to_le_bytes());
+        vbin.push(chr_b.len().min(255) as u8);
+        vbin.push(ref_b.len().min(255) as u8);
+        vbin.push(alt_b.len().min(255) as u8);
+        vbin.extend_from_slice(&chr_b[..chr_b.len().min(255)]);
+        vbin.extend_from_slice(&ref_b[..ref_b.len().min(255)]);
+        vbin.extend_from_slice(&alt_b[..alt_b.len().min(255)]);
+        if !first_id { ids.push(b'\n'); orig_ids.push(b'\n'); }
+        ids.extend_from_slice(format!("{}-{}-{}-{}", v.chrom, v.pos, v.ref_allele, v.alt_allele).as_bytes());
+        orig_ids.extend_from_slice(v.id.as_bytes());
+        first_id = false;
+    }
+
+    let chunk_size = auto_chunk_size(n_variants, n_haps);
+    let n_chunks = n_variants.div_ceil(chunk_size);
+    let mut row_counts = Vec::with_capacity(n_chunks);
+    for ci in 0..n_chunks {
+        row_counts.push(if ci < n_chunks - 1 { chunk_size } else { n_variants - (n_chunks - 1) * chunk_size });
+    }
+    let contig_field = format!("##contig=<ID={}>", chromosome);
+
+    let srp_path = if output_path.extension().is_none_or(|e| e != "srp") {
+        output_path.with_extension("srp")
+    } else { output_path.to_path_buf() };
+
+    selphi_info!("  samples:  {} ({} haplotypes)", n_samples, n_haps);
+    selphi_info!("  variants: {} (chr{}, {}–{})", n_variants, chromosome, min_pos, max_pos);
+    selphi_step!("Streaming phased panel → tiles ({} threads)...", rayon::current_num_threads());
+
+    let mut tile_writer = StreamingTileWriter::new(&srp_path, &SrpMetadataForWrite {
+        n_variants, n_haps, n_samples, n_chunks, chunk_size,
+        row_counts, chromosome, min_pos, max_pos, contig_field,
+        sample_names: sample_names.to_vec(), vbin, ids, orig_ids,
+    })?;
+
+    // Scatter variants into per-haplotype stripe columns; flush complete
+    // stripes in parallel batches. Mirrors the BREF3 streaming scatter, but
+    // the allele row comes from `phased` rather than a decoded stream.
+    let batch_size = (rayon::current_num_threads() * 4).max(16);
+    let mut stripe_cols: Vec<Vec<u16>> = (0..n_haps).map(|_| Vec::new()).collect();
+    let mut current_stripe = 0usize;
+    let mut pending_stripes: Vec<(usize, Vec<Vec<u16>>)> = Vec::with_capacity(batch_size);
+
+    for vi in 0..n_variants {
+        let stripe = vi / super::TILE_ROWS;
+        let local_row = (vi % super::TILE_ROWS) as u16;
+        if stripe > current_stripe {
+            let completed = std::mem::replace(
+                &mut stripe_cols, (0..n_haps).map(|_| Vec::new()).collect());
+            pending_stripes.push((current_stripe, completed));
+            if pending_stripes.len() >= batch_size {
+                flush_stripe_batch(&mut tile_writer, &mut pending_stripes, n_haps)?;
+            }
+            current_stripe = stripe;
+        }
+        let base = vi * n_haps;
+        let row = &phased[base..base + n_haps];
+        for (h, &a) in row.iter().enumerate() {
+            if a != 0 { stripe_cols[h].push(local_row); }
+        }
+    }
+    pending_stripes.push((current_stripe, stripe_cols));
+    flush_stripe_batch(&mut tile_writer, &mut pending_stripes, n_haps)?;
+
+    let file_size = tile_writer.finish()?;
+    selphi_step!("SRP written: {} ({:.1} MB)", srp_path.display(), file_size as f64 / 1e6);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Shared: compress chunks + assemble ZIP
 // ---------------------------------------------------------------------------
 
@@ -1165,5 +1287,56 @@ fn auto_chunk_size(n_variants: usize, n_haps: usize) -> usize {
 
 fn chrono_now() -> String {
     format!("{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::srp::SrpReader;
+
+    /// `build_srp_from_panel` must encode an in-memory phased panel into a
+    /// live tiled SRP whose decoded allele bitmatrix is bit-identical to the
+    /// input — across multiple tile stripes incl. a partial last one.
+    #[test]
+    fn test_build_srp_from_panel_roundtrip() {
+        let n_var = 2500usize; // > 2×TILE_ROWS (1024) + a partial last stripe
+        let n_haps = 10usize;  // 5 samples
+        let mut phased = vec![0u8; n_var * n_haps];
+        for v in 0..n_var {
+            for h in 0..n_haps {
+                if (v * 31 + h * 7) % 5 == 0 { phased[v * n_haps + h] = 1; }
+            }
+        }
+
+        let chroms = vec!["22".to_string(); n_var];
+        let refs = vec!["A".to_string(); n_var];
+        let alts = vec!["C".to_string(); n_var];
+        let poss: Vec<i64> = (0..n_var as i64).map(|v| 1000 + v * 10).collect();
+        let pvs: Vec<PanelVariant> = (0..n_var).map(|v| PanelVariant {
+            chrom: &chroms[v], pos: poss[v],
+            ref_allele: &refs[v], alt_allele: &alts[v], id: ".",
+        }).collect();
+        let samples: Vec<String> = (0..n_haps / 2).map(|s| format!("S{s}")).collect();
+
+        let dir = tempfile::tempdir().unwrap();
+        let srp_path = dir.path().join("panel.srp");
+        build_srp_from_panel(&phased, &pvs, &samples, n_haps, &srp_path).unwrap();
+
+        let mut reader = SrpReader::open(&srp_path, 0).unwrap();
+        reader.load_tiled();
+        assert_eq!(reader.n_variants(), n_var);
+        assert_eq!(reader.n_haps(), n_haps);
+
+        let all: Vec<usize> = (0..n_var).collect();
+        let bm = reader.extract_ref_alleles_bitmatrix(&all);
+        for v in 0..n_var {
+            for h in 0..n_haps {
+                assert_eq!(bm.get(v, h), phased[v * n_haps + h] != 0,
+                    "allele mismatch at variant {v}, hap {h}");
+            }
+        }
+        assert_eq!(reader.variants[0].pos, 1000);
+        assert_eq!(reader.variants[n_var - 1].pos, 1000 + (n_var as i64 - 1) * 10);
+    }
 }
 
