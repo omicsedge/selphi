@@ -64,6 +64,7 @@ pub fn read_cohort_vcf(
     let mut is_phased = true;
     let mut phase_checks = 10i32;
     let mut sample_names: Vec<String> = Vec::new();
+    let mut n_multiallelic = 0usize;
 
     for line in raw.split(|&b| b == b'\n') {
         if line.is_empty() || line.starts_with(b"##") { continue; }
@@ -93,6 +94,7 @@ pub fn read_cohort_vcf(
         let alt_end = alt_field.iter().position(|&b| b == b',').unwrap_or(alt_field.len());
         let alt_bytes = &alt_field[..alt_end];
         if alt_bytes == b"." || alt_bytes.is_empty() { continue; }
+        if alt_end < alt_field.len() { n_multiallelic += 1; } // ALT had a comma
         let ref_allele = std::str::from_utf8(ref_bytes).unwrap_or("").to_string();
         let alt_allele = std::str::from_utf8(alt_bytes).unwrap_or("").to_string();
         let chrom = std::str::from_utf8(&line[..tabs[0]]).unwrap_or("").to_string();
@@ -117,10 +119,14 @@ pub fn read_cohort_vcf(
                 if gt.contains(&b'/') { is_phased = false; }
                 phase_checks -= 1;
             }
+            // Binarise to {0,1}: REF/missing → 0, ANY alt allele (1..9) → 1.
+            // Panel phasing treats the cohort as biallelic (the ALT kept is
+            // the first); collapsing higher alt indices here keeps phasing
+            // and the written output consistent (no silent ref/missing/alt
+            // mismatch downstream). Multiallelic sites are counted + warned.
+            let bin = |b: u8| -> u8 { if b.is_ascii_digit() && b != b'0' { 1 } else { 0 } };
             let (a0, a1) = if gt.len() >= 3 {
-                let b0 = gt[0]; let b1 = gt[2];
-                (if b0.is_ascii_digit() { b0 - b'0' } else { 0 },
-                 if b1.is_ascii_digit() { b1 - b'0' } else { 0 })
+                (bin(gt[0]), bin(gt[2]))
             } else { (0, 0) };
             var_gts.push([a0, a1]);
             field_start = if field_end < gt_region.len() { field_end + 1 } else { gt_region.len() };
@@ -131,6 +137,9 @@ pub fn read_cohort_vcf(
     if sample_names.is_empty() {
         selphi_error!("No samples found in {}", path);
         std::process::exit(1);
+    }
+    if n_multiallelic > 0 {
+        selphi_info!("  WARNING: {} multi-allelic sites — kept first ALT, genotypes binarised (ref vs any-alt). Split multiallelics beforehand for exact handling.", n_multiallelic);
     }
     (sample_names, markers, genotypes, is_phased)
 }
