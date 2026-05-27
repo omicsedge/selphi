@@ -292,13 +292,18 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
     // larger, less-predictable footprint and OOM forces an instance reset.
     let budget_frac = if matches!(engine, PhasingEngine::Haploid) { 0.50 } else { 0.55 };
     let budget_gb = (budget_frac * sys_gb - (n_var as f64 * n_haps as f64 / 1e9)).max(4.0);
-    // per_var_bytes calibrated to MEASURED peaks on 1KG chr22 (4802 haps, 16
-    // threads): a 150K-variant haploid chunk peaked at ~63 GB working
-    // (≈420 KB/var); diploid full chr (1.07M) at ~27 GB (≈25 KB/var).
-    // Haploid scales with per-thread HMM scratch (N_MOSAIC states × several
-    // f32/f64 buffers); diploid is bounded by common-only windows.
+    // per_var_bytes calibrated to MEASURED working-set peaks on 1KG chr22 at
+    // 16 threads, across TWO cohort sizes so it scales with n_haps (a fixed
+    // constant over-chunks small cohorts — e.g. 54 children needlessly split
+    // into 10 chunks):
+    //   - 54 samples (108 haps):  ~37 KB/var
+    //   - 2401 samples (4802 haps): ~420 KB/var
+    // Linear fit ≈ 85 B/var per hap (× threads/16 for the per-thread HMM
+    // scratch) + 30 KB/var fixed (composites, w_hap_bits, output stride).
+    // Diploid is bounded by common-only 4cM windows: ~25 KB/var (n_haps×4×1.5).
     let per_var_bytes = match engine {
-        PhasingEngine::Haploid => 280.0 * 110.0 * n_threads as f64 + n_haps as f64 * 8.0,
+        PhasingEngine::Haploid =>
+            85.0 * n_haps as f64 * (n_threads as f64 / 16.0).max(0.25) + 30_000.0,
         _ => n_haps as f64 * 4.0 * 1.5,
     };
     let max_chunk_vars = if args.chunk_vars > 0 {
