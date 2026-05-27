@@ -14,6 +14,7 @@ mod self_test;
 mod orchestrate;
 mod cli;
 mod imputation_pipeline;
+mod panel_phasing;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -37,6 +38,15 @@ fn main() {
         .build_global()
         .ok();
 
+
+    // --- De-novo panel phasing mode ---
+    if args.phase_panel {
+        let input = args.input.as_deref()
+            .unwrap_or_else(|| { eprintln!("Error: --input is required for --phase-panel"); std::process::exit(1); });
+        let output = args.out.as_deref().unwrap_or("phased_panel");
+        panel_phasing::run(&args, input, output);
+        return;
+    }
 
     // --- Evaluate accuracy mode ---
     if let Some(ref imputed) = args.evaluate {

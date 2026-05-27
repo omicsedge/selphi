@@ -35,6 +35,107 @@ fn fast_parse_i64(bytes: &[u8]) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// read_cohort_vcf  (panel self-phasing — no SRP intersection)
+// ---------------------------------------------------------------------------
+
+/// Read a full cohort VCF.gz for de-novo panel phasing: ALL biallelic
+/// variants × ALL samples, no reference-panel intersection. Returns
+/// (sample_names, markers, genotypes, is_phased). `genotypes[v][s] =
+/// [allele0, allele1]` with missing alleles coerced to 0. Allele hashes in
+/// the returned markers are left empty (not needed for panel output).
+pub fn read_cohort_vcf(
+    path: &str,
+) -> (Vec<String>, Vec<TargetMarker>, Vec<Vec<[u8; 2]>>, bool) {
+    use std::io::Read;
+    let is_gz = path.ends_with(".gz") || path.ends_with(".bcf");
+    let file = std::fs::File::open(path)
+        .unwrap_or_else(|e| panic!("Cannot open {}: {}", path, e));
+    let mut raw = Vec::new();
+    if is_gz {
+        let mut bgzf = noodles_bgzf::io::Reader::new(std::io::BufReader::new(file));
+        bgzf.read_to_end(&mut raw).expect("Failed to decompress bgzf");
+    } else {
+        let mut reader = std::io::BufReader::new(file);
+        reader.read_to_end(&mut raw).expect("Failed to read VCF");
+    }
+
+    let mut markers = Vec::new();
+    let mut genotypes: Vec<Vec<[u8; 2]>> = Vec::new();
+    let mut is_phased = true;
+    let mut phase_checks = 10i32;
+    let mut sample_names: Vec<String> = Vec::new();
+
+    for line in raw.split(|&b| b == b'\n') {
+        if line.is_empty() || line.starts_with(b"##") { continue; }
+        if line.starts_with(b"#CHROM") {
+            let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
+            if fields.len() > 9 {
+                sample_names = fields[9..].iter()
+                    .map(|f| std::str::from_utf8(f).unwrap_or("").to_string())
+                    .collect();
+            }
+            continue;
+        }
+        let mut tabs = [0usize; 9];
+        let mut n_tabs = 0;
+        for (i, &b) in line.iter().enumerate() {
+            if b == b'\t' {
+                if n_tabs < 9 { tabs[n_tabs] = i; }
+                n_tabs += 1;
+                if n_tabs >= 9 { break; }
+            }
+        }
+        if n_tabs < 9 { continue; }
+
+        let pos: i64 = fast_parse_i64(&line[tabs[0]+1..tabs[1]]);
+        let ref_bytes = &line[tabs[2]+1..tabs[3]];
+        let alt_field = &line[tabs[3]+1..tabs[4]];
+        let alt_end = alt_field.iter().position(|&b| b == b',').unwrap_or(alt_field.len());
+        let alt_bytes = &alt_field[..alt_end];
+        if alt_bytes == b"." || alt_bytes.is_empty() { continue; }
+        let ref_allele = std::str::from_utf8(ref_bytes).unwrap_or("").to_string();
+        let alt_allele = std::str::from_utf8(alt_bytes).unwrap_or("").to_string();
+        let chrom = std::str::from_utf8(&line[..tabs[0]]).unwrap_or("").to_string();
+        markers.push(TargetMarker {
+            chrom, pos, ref_allele, alt_allele,
+            ref_hash: String::new(), alt_hash: String::new(),
+        });
+
+        let n_samples = sample_names.len();
+        let mut var_gts = Vec::with_capacity(n_samples);
+        let gt_region = &line[tabs[8]+1..];
+        let mut field_start = 0;
+        for _s in 0..n_samples {
+            let field_end = gt_region[field_start..].iter()
+                .position(|&b| b == b'\t')
+                .map(|p| field_start + p)
+                .unwrap_or(gt_region.len());
+            let field = &gt_region[field_start..field_end];
+            let gt_end = field.iter().position(|&b| b == b':').unwrap_or(field.len());
+            let gt = &field[..gt_end];
+            if phase_checks > 0 {
+                if gt.contains(&b'/') { is_phased = false; }
+                phase_checks -= 1;
+            }
+            let (a0, a1) = if gt.len() >= 3 {
+                let b0 = gt[0]; let b1 = gt[2];
+                (if b0.is_ascii_digit() { b0 - b'0' } else { 0 },
+                 if b1.is_ascii_digit() { b1 - b'0' } else { 0 })
+            } else { (0, 0) };
+            var_gts.push([a0, a1]);
+            field_start = if field_end < gt_region.len() { field_end + 1 } else { gt_region.len() };
+        }
+        genotypes.push(var_gts);
+    }
+
+    if sample_names.is_empty() {
+        selphi_error!("No samples found in {}", path);
+        std::process::exit(1);
+    }
+    (sample_names, markers, genotypes, is_phased)
+}
+
+// ---------------------------------------------------------------------------
 // read_target_vcf
 // ---------------------------------------------------------------------------
 
@@ -230,6 +331,65 @@ pub fn write_phased_vcf(
     // Build a TBI index natively (no bcftools subprocess).
     let _ = crate::srp::csi::build_tbi_index(output_path);
 
+    Ok(())
+}
+
+/// Write a phased PANEL VCF.gz: every cohort marker with phased GT.
+/// Independent of any reference/SRP — used by the de-novo panel-phasing path.
+pub fn write_panel_vcf(
+    phased: &[u8],               // (n_var × n_haps) row-major
+    markers: &[TargetMarker],
+    sample_names: &[String],
+    n_var: usize,
+    n_haps: usize,
+    output_path: &Path,
+) -> std::io::Result<()> {
+    use std::io::{Write, BufWriter};
+    let n_samples = n_haps / 2;
+
+    let file = std::fs::File::create(output_path)?;
+    let bgzf = noodles_bgzf::io::multithreaded_writer::Builder::default()
+        .set_worker_count(std::num::NonZeroUsize::new(4).unwrap())
+        .build_from_writer(file);
+    let mut w = BufWriter::with_capacity(4 << 20, bgzf);
+
+    writeln!(w, "##fileformat=VCFv4.2")?;
+    writeln!(w, "##source=Selphi_v{} SelfDecode\u{2122} (panel-phasing)", env!("CARGO_PKG_VERSION"))?;
+    writeln!(w, "##FILTER=<ID=PASS,Description=\"All filters passed\">")?;
+    writeln!(w, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">")?;
+    writeln!(w, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele Number\">")?;
+    writeln!(w, "##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Estimated Allele Count\">")?;
+    writeln!(w, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">")?;
+    if let Some(m0) = markers.first() {
+        writeln!(w, "##contig=<ID={}>", m0.chrom)?;
+    }
+    write!(w, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
+    for name in sample_names { write!(w, "\t{}", name)?; }
+    writeln!(w)?;
+
+    let mut line_buf = String::with_capacity(n_samples * 4);
+    for v in 0..n_var {
+        let m = &markers[v];
+        let mut ac = 0u32;
+        line_buf.clear();
+        for s in 0..n_samples {
+            let a0 = phased[v * n_haps + s * 2];
+            let a1 = phased[v * n_haps + s * 2 + 1];
+            ac += a0 as u32 + a1 as u32;
+            if s > 0 { line_buf.push('\t'); }
+            line_buf.push((b'0' + a0.min(1)) as char);
+            line_buf.push('|');
+            line_buf.push((b'0' + a1.min(1)) as char);
+        }
+        let af = ac as f64 / n_haps as f64;
+        writeln!(w, "{}\t{}\t.\t{}\t{}\t.\tPASS\tAF={:.4};AC={};AN={}\tGT\t{}",
+            m.chrom, m.pos, m.ref_allele, m.alt_allele, af, ac, n_haps, line_buf)?;
+    }
+
+    w.flush()?;
+    let mut bgzf = w.into_inner().map_err(|e| std::io::Error::other(e.to_string()))?;
+    bgzf.finish()?;
+    let _ = crate::srp::csi::build_tbi_index(output_path);
     Ok(())
 }
 
