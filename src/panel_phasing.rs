@@ -10,9 +10,70 @@ use std::time::Instant;
 
 use selphi::{selphi_info, selphi_step, selphi_error};
 use selphi::genmap;
-use selphi::io::target_io::{read_cohort_vcf, write_panel_vcf};
+use selphi::io::target_io::{read_cohort_vcf, write_panel_vcf, TargetMarker};
+use selphi::srp::SrpReader;
 
 use crate::cli::{Args, PhasingEngine};
+
+/// Cohort read from any supported input: sample names, per-variant markers,
+/// flat genotypes (n_var × n_haps), and the boolean "input was phased".
+struct Cohort {
+    sample_names: Vec<String>,
+    markers: Vec<TargetMarker>,
+    geno: Vec<u8>, // n_var × n_haps row-major (allele bytes)
+    n_var: usize,
+    n_samples: usize,
+    was_phased: bool,
+}
+
+/// Read a cohort for panel phasing from VCF.gz or SRP. The existing phase
+/// (if any) is irrelevant — graph construction uses genotypes only, so an
+/// already-phased panel (SRP, or phased VCF) is simply re-phased.
+fn read_cohort(input_path: &str) -> Cohort {
+    if input_path.ends_with(".srp") {
+        // Re-phase an existing SRP panel: extract every variant's alleles
+        // across all panel haps into a cohort genotype array.
+        let srp = SrpReader::open(input_path, 16)
+            .unwrap_or_else(|e| { selphi_error!("Cannot open SRP {}: {}", input_path, e); std::process::exit(1); });
+        let n_var = srp.n_variants();
+        let n_haps = srp.n_haps();
+        let n_samples = n_haps / 2;
+        let all_idx: Vec<usize> = (0..n_var).collect();
+        let bm = srp.extract_ref_alleles_bitmatrix(&all_idx);
+        let mut geno = vec![0u8; n_var * n_haps];
+        for v in 0..n_var {
+            let base = v * n_haps;
+            for h in 0..n_haps {
+                if bm.get(v, h) { geno[base + h] = 1; }
+            }
+        }
+        let markers: Vec<TargetMarker> = srp.variants.iter().map(|vv| TargetMarker {
+            chrom: vv.chr.clone(), pos: vv.pos,
+            ref_allele: vv.ref_allele.clone(), alt_allele: vv.alt_allele.clone(),
+            ref_hash: String::new(), alt_hash: String::new(),
+        }).collect();
+        let sample_names = if srp.sample_ids.len() == n_samples {
+            srp.sample_ids.clone()
+        } else {
+            (0..n_samples).map(|i| format!("sample_{i}")).collect()
+        };
+        Cohort { sample_names, markers, geno, n_var, n_samples, was_phased: true }
+    } else {
+        let (sample_names, markers, genotypes, was_phased) = read_cohort_vcf(input_path);
+        let n_var = markers.len();
+        let n_samples = sample_names.len();
+        let n_haps = n_samples * 2;
+        let mut geno = vec![0u8; n_var * n_haps];
+        for (v, gv) in genotypes.iter().enumerate() {
+            let base = v * n_haps;
+            for (s, g) in gv.iter().enumerate() {
+                geno[base + s * 2] = g[0];
+                geno[base + s * 2 + 1] = g[1];
+            }
+        }
+        Cohort { sample_names, markers, geno, n_var, n_samples, was_phased }
+    }
+}
 
 /// Run de-novo panel phasing end-to-end.
 pub fn run(args: &Args, input_path: &str, output_path: &str) {
@@ -32,27 +93,18 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
 
     let start = Instant::now();
 
-    // 1. Read cohort (all variants × all samples, no SRP).
-    let (sample_names, markers, genotypes, is_phased) = read_cohort_vcf(input_path);
-    let n_var = markers.len();
-    let n_samples = sample_names.len();
+    // 1. Read cohort (VCF.gz or SRP). Input phase is ignored — we re-phase.
+    let cohort = read_cohort(input_path);
+    let Cohort { sample_names, markers, geno: cohort_geno, n_var, n_samples, was_phased } = cohort;
     let n_haps = n_samples * 2;
-    selphi_step!("Cohort: {} samples, {} variants, phased={} (input phase ignored — re-phasing)",
-        n_samples, n_var, is_phased);
+    selphi_step!("Cohort: {} samples, {} variants, input_phased={} (re-phasing from genotypes)",
+        n_samples, n_var, was_phased);
     if n_var == 0 || n_samples == 0 {
         selphi_error!("Empty cohort.");
         std::process::exit(1);
     }
 
-    // 2. Flatten genotypes to (n_var × n_haps) + bp positions.
-    let mut cohort_geno = vec![0u8; n_var * n_haps];
-    for (v, gv) in genotypes.iter().enumerate() {
-        let base = v * n_haps;
-        for (s, g) in gv.iter().enumerate() {
-            cohort_geno[base + s * 2] = g[0];
-            cohort_geno[base + s * 2 + 1] = g[1];
-        }
-    }
+    // 2. bp positions.
     let bp: Vec<i64> = markers.iter().map(|m| m.pos).collect();
 
     // 3. Genetic map.
