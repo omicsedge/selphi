@@ -141,23 +141,27 @@ fn phase_panel_chunked(
     //
     // `forced_chunk_vars > 0` (from --chunk-vars) fixes the chunk size; we
     // then fit as many concurrent chunks as the budget allows.
+    // The parallel path additionally stores ALL phased chunks
+    // (~n_var × n_haps bytes) until ligation, so any concurrency must fit
+    // n_parallel working sets WITHIN the budget left after that reservation.
+    let results_gb = n_var as f64 * n_haps as f64 / 1e9;
     let (chunk_vars, n_parallel) = if forced_chunk_vars > 0 {
         let cv = forced_chunk_vars.min(n_var);
         let per_chunk_gb = cv as f64 * per_var_bytes / 1e9;
-        let np = ((work_budget_gb / per_chunk_gb).floor() as usize)
-            .clamp(1, n_threads.min(4));
+        // If >1 chunk total we may run in parallel and hold the results store;
+        // budget for that. (A single chunk needs no results store.)
+        let will_chunk = cv < n_var;
+        let par_budget = if will_chunk { (work_budget_gb - results_gb).max(work_budget_gb * 0.3) }
+                         else { work_budget_gb };
+        let np = ((par_budget / per_chunk_gb).floor() as usize).clamp(1, n_threads.min(4));
         (cv, np)
     } else {
         let single_chunk_vars = ((work_budget_gb * 1e9 / per_var_bytes) as usize).max(20_000);
         if n_var <= single_chunk_vars {
             (n_var, 1)
         } else {
-            // The parallel path additionally stores ALL phased chunks
-            // (~n_var × n_haps) until ligation, so reserve one array for it
-            // before budgeting the concurrent working sets.
-            let results_gb = n_var as f64 * n_haps as f64 / 1e9;
             let par_budget = (work_budget_gb - results_gb).max(work_budget_gb * 0.3);
-            let np = (n_threads / 4).max(1).min(4).min(args.threads).max(1);
+            let np = (n_threads / 4).clamp(1, 4);
             let cv = (((par_budget * 1e9) / (np as f64 * per_var_bytes)) as usize)
                 .clamp(20_000, n_var);
             (cv, np)
