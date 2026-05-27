@@ -57,6 +57,12 @@ pub struct Args {
     #[arg(long)]
     pub phase_panel: bool,
 
+    /// (--phase-panel) Override the auto-computed chunk size (variants per
+    /// chunk) for chunked panel phasing. 0 = auto (memory-budgeted). Mainly
+    /// for testing the chunk+ligate path on small inputs.
+    #[arg(long, default_value = "0")]
+    pub chunk_vars: usize,
+
     /// (--phase-panel) Restrict phasing to a genomic region "chr:start-end"
     /// (or "chr"). Bounds memory for large WGS panels — phase region by
     /// region (SHAPEIT5-style), then ligate externally. Start/end are 1-based
