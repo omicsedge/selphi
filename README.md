@@ -75,7 +75,7 @@ Phase an unphased cohort using the cohort itself as the conditioning set — the
 
 ```bash
 selphi --phase-panel \
-  --input cohort.vcf.gz \           # VCF.gz or .srp (re-phase an existing panel)
+  --input cohort.vcf.gz \           # VCF.gz, .srp, or .bref3 (re-phase an existing panel)
   --map genetic_map.map \
   --out panel \
   --srp --bref3 \                   # also emit native .srp / .bref3 reference panels
@@ -357,7 +357,7 @@ Standard VCF or BCF. Unphased (`0/1`) or phased (`0|1`) genotypes. Multi-allelic
 | `--merge-srps PATHS` | Merge SRP files (comma-separated). Auto-detects mode: per-chr files with same samples → multi-chromosome SRP; same-chr files with different samples → horizontal merge | |
 | `--merge-srps-dir DIR` | Merge all SRP files from a directory into multi-chromosome SRP | |
 | **Panel phasing** | | |
-| `--phase-panel` | De-novo phase a cohort against itself (no reference); input VCF.gz or .srp | off |
+| `--phase-panel` | De-novo phase a cohort against itself (no reference); input VCF.gz, .srp, or .bref3 | off |
 | `--srp` | (with `--phase-panel`) also emit a native `.srp` reference panel | off |
 | `--bref3` | (with `--phase-panel`) also emit a native `.bref3` reference panel | off |
 | `--region REG` | (with `--phase-panel`) restrict phasing to `chr:start-end` to bound memory | |
