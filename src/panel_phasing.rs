@@ -97,21 +97,22 @@ fn parse_region(reg: &str) -> (String, i64, i64) {
 }
 
 /// Phase one cohort block (single chunk or whole panel) with the chosen
-/// engine, n_ref=0 self-phasing. Returns (phased n_var×n_haps, n_var).
+/// engine, n_ref=0 self-phasing, on `n_threads` threads. Returns phased
+/// (n_var × n_haps).
 fn phase_cohort(
-    engine: PhasingEngine, args: &Args,
+    engine: PhasingEngine, args: &Args, n_threads: usize,
     geno: &[u8], bp: &[i64], map_bp: &[i64], map_cm: &[f64],
     n_var: usize, n_samples: usize,
-) -> (Vec<u8>, usize) {
+) -> Vec<u8> {
     let (phased, _c, _r) = match engine {
         PhasingEngine::Haploid => selphi::haploid::phase_panel(
             geno, bp, map_bp, map_cm, n_var, n_samples,
-            args.seed, args.threads, args.max_windows),
+            args.seed, n_threads, args.max_windows),
         _ => selphi::diploid::diploid_phase_panel(
             geno, bp, map_bp, map_cm, n_var, n_samples,
-            args.seed, args.threads, args.max_cond_haps),
+            args.seed, n_threads, args.max_cond_haps),
     };
-    (phased, n_var)
+    phased
 }
 
 /// Auto-chunked panel phasing with ligation. Splits [0,n_var) into chunks of
@@ -124,53 +125,120 @@ fn phase_cohort(
 fn phase_panel_chunked(
     engine: PhasingEngine, args: &Args,
     cohort_geno: &[u8], bp: &[i64], map_bp: &[i64], map_cm: &[f64],
-    n_var: usize, n_samples: usize, max_chunk_vars: usize,
+    n_var: usize, n_samples: usize,
+    per_var_bytes: f64, work_budget_gb: f64, n_threads: usize,
+    forced_chunk_vars: usize,
 ) -> Vec<u8> {
     let n_haps = n_samples * 2;
-    // Overlap: 10% of chunk, clamped — enough het sites for a reliable flip
-    // vote, small enough not to inflate work.
-    let overlap = (max_chunk_vars / 10).clamp(2_000, 50_000).min(max_chunk_vars / 2);
-    let step = max_chunk_vars - overlap;
 
-    // Chunk boundaries [start, end): consecutive chunks share `overlap` vars.
+    // Joint chunk-size + parallelism choice, MEMORY-BOUNDED. We want to keep
+    // all cores busy without exceeding `work_budget_gb` for the concurrent
+    // chunk working sets. A single chunk sized to the whole budget uses all
+    // threads but runs one at a time; smaller chunks let several phase
+    // concurrently (helps when the engine doesn't scale to all threads on one
+    // chunk). We cap parallelism so each chunk still gets a useful thread
+    // slice, and so total concurrent memory stays ≤ budget.
+    //
+    // `forced_chunk_vars > 0` (from --chunk-vars) fixes the chunk size; we
+    // then fit as many concurrent chunks as the budget allows.
+    let (chunk_vars, n_parallel) = if forced_chunk_vars > 0 {
+        let cv = forced_chunk_vars.min(n_var);
+        let per_chunk_gb = cv as f64 * per_var_bytes / 1e9;
+        let np = ((work_budget_gb / per_chunk_gb).floor() as usize)
+            .clamp(1, n_threads.min(4));
+        (cv, np)
+    } else {
+        let single_chunk_vars = ((work_budget_gb * 1e9 / per_var_bytes) as usize).max(20_000);
+        if n_var <= single_chunk_vars {
+            (n_var, 1)
+        } else {
+            let np = (n_threads / 4).max(1).min(4).min(args.threads).max(1);
+            let cv = (((work_budget_gb * 1e9) / (np as f64 * per_var_bytes)) as usize)
+                .clamp(20_000, n_var);
+            (cv, np)
+        }
+    };
+    let threads_per = (n_threads / n_parallel).max(1);
+    let overlap = (chunk_vars / 20).clamp(2_000, 30_000).min(chunk_vars / 2);
+    let step = chunk_vars - overlap;
+
     let mut chunks: Vec<(usize, usize)> = Vec::new();
     let mut s = 0usize;
     while s < n_var {
-        let e = (s + max_chunk_vars).min(n_var);
+        let e = (s + chunk_vars).min(n_var);
         chunks.push((s, e));
         if e == n_var { break; }
         s += step;
     }
-    selphi_step!("Auto-chunking: {} chunks of ≤{} variants (overlap {}), {} engine",
-        chunks.len(), max_chunk_vars, overlap,
-        if engine == PhasingEngine::Haploid { "haploid" } else { "diploid" });
+    selphi_step!("Auto-chunking: {} chunks of ≤{} variants (overlap {}), {} engine, {}-way parallel × {} threads",
+        chunks.len(), chunk_vars, overlap,
+        if engine == PhasingEngine::Haploid { "haploid" } else { "diploid" },
+        n_parallel, threads_per);
 
+    // Phase chunks (memory-bounded parallelism), then ligate sequentially.
+    // Each chunk is phased inside its own rayon pool of `threads_per` threads
+    // so n_parallel chunks share the cores without oversubscription. Results
+    // are stored and stitched left-to-right afterwards (ligation is cheap and
+    // has a sequential dependency).
+    let t_all = std::time::Instant::now();
+    let phased_chunks: Vec<Vec<u8>> = if n_parallel <= 1 {
+        chunks.iter().enumerate().map(|(ci, &(cs, ce))| {
+            let cn = ce - cs;
+            let t0 = std::time::Instant::now();
+            let r = phase_cohort(engine, args, threads_per,
+                &cohort_geno[cs * n_haps..ce * n_haps], &bp[cs..ce],
+                map_bp, map_cm, cn, n_samples);
+            selphi_step!("  chunk {}/{} [{}..{}) phased in {:.0}s [{:.0} MB]",
+                ci + 1, chunks.len(), cs, ce, t0.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
+            r
+        }).collect()
+    } else {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let next = AtomicUsize::new(0);
+        let mut results: Vec<Vec<u8>> = (0..chunks.len()).map(|_| Vec::new()).collect();
+        let res_ptr = results.as_mut_ptr() as usize;
+        std::thread::scope(|scope| {
+            for _ in 0..n_parallel {
+                scope.spawn(|| {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads_per).build().expect("chunk pool");
+                    loop {
+                        let ci = next.fetch_add(1, Ordering::Relaxed);
+                        if ci >= chunks.len() { break; }
+                        let (cs, ce) = chunks[ci];
+                        let cn = ce - cs;
+                        let t0 = std::time::Instant::now();
+                        let r = pool.install(|| phase_cohort(
+                            engine, args, threads_per,
+                            &cohort_geno[cs * n_haps..ce * n_haps], &bp[cs..ce],
+                            map_bp, map_cm, cn, n_samples));
+                        selphi_step!("  chunk {}/{} [{}..{}) phased in {:.0}s [{:.0} MB]",
+                            ci + 1, chunks.len(), cs, ce, t0.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
+                        // SAFETY: each ci written by exactly one worker; slots disjoint.
+                        unsafe {
+                            let slot = (res_ptr as *mut Vec<u8>).add(ci);
+                            std::ptr::write(slot, r);
+                        }
+                    }
+                });
+            }
+        });
+        results
+    };
+    selphi_step!("All chunks phased in {:.0}s; ligating", t_all.elapsed().as_secs_f64());
+
+    // Sequential ligation: stitch left-to-right with per-sample flip on overlap.
     let mut global = vec![0u8; n_var * n_haps];
-    let mut prev_end = 0usize; // global is filled up to here
-
+    let mut prev_end = 0usize;
     for (ci, &(cs, ce)) in chunks.iter().enumerate() {
-        let cn = ce - cs;
-        // Extract this chunk's genotypes / bp.
-        let mut cg = vec![0u8; cn * n_haps];
-        cg.copy_from_slice(&cohort_geno[cs * n_haps..ce * n_haps]);
-        let cbp = &bp[cs..ce];
-
-        let t0 = std::time::Instant::now();
-        let (cphased, _) = phase_cohort(engine, args, &cg, cbp, map_bp, map_cm, cn, n_samples);
-        selphi_step!("  chunk {}/{} [{}..{}) phased in {:.0}s [{:.0} MB]",
-            ci + 1, chunks.len(), cs, ce, t0.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
-
+        let cphased = &phased_chunks[ci];
         if ci == 0 {
-            // First chunk: accept as-is, fill global [cs, ce).
-            global[cs * n_haps..ce * n_haps].copy_from_slice(&cphased);
+            global[cs * n_haps..ce * n_haps].copy_from_slice(cphased);
             prev_end = ce;
             continue;
         }
-
-        // Overlap region with the already-stitched global = [cs, prev_end).
         let ov_start = cs;
         let ov_end = prev_end.min(ce);
-        // Per-sample flip decision over overlap het sites.
         for sa in 0..n_samples {
             let h0 = sa * 2;
             let h1 = sa * 2 + 1;
@@ -179,7 +247,7 @@ fn phase_panel_chunked(
             for v in ov_start..ov_end {
                 let g0 = global[v * n_haps + h0];
                 let g1 = global[v * n_haps + h1];
-                if g0 == g1 { continue; } // only het sites are informative
+                if g0 == g1 { continue; }
                 let rel = (v - cs) * n_haps;
                 let c0 = cphased[rel + h0];
                 let c1 = cphased[rel + h1];
@@ -187,8 +255,6 @@ fn phase_panel_chunked(
                 if c0 == g0 && c1 == g1 { agree += 1; } else { disagree += 1; }
             }
             let flip = disagree > agree;
-            // Copy the chunk's NON-overlap part [prev_end, ce) into global,
-            // flipping this sample's two haps if needed.
             for v in prev_end..ce {
                 let rel = (v - cs) * n_haps;
                 let (a0, a1) = (cphased[rel + h0], cphased[rel + h1]);
@@ -311,16 +377,16 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
     } else {
         ((budget_gb * 1e9 / per_var_bytes) as usize).max(20_000)
     };
-    let phased: Vec<u8> = if n_var <= max_chunk_vars {
+    let phased: Vec<u8> = if args.chunk_vars == 0 && n_var <= max_chunk_vars {
         // Single-shot: fits the budget.
         selphi_step!("Phasing {} engine, single-shot ({} variants, budget {:.0} GB/chunk)",
             if engine == PhasingEngine::Haploid { "haploid" } else { "diploid" }, n_var, budget_gb);
-        phase_cohort(engine, args, &cohort_geno, &bp, &map_bp, &map_cm, n_var, n_samples).0
+        phase_cohort(engine, args, n_threads, &cohort_geno, &bp, &map_bp, &map_cm, n_var, n_samples)
     } else {
-        // Auto-chunked + ligated.
+        // Auto-chunked + ligated, with memory-bounded parallelism across chunks.
         phase_panel_chunked(
             engine, args, &cohort_geno, &bp, &map_bp, &map_cm,
-            n_var, n_samples, max_chunk_vars,
+            n_var, n_samples, per_var_bytes, budget_gb, n_threads, args.chunk_vars,
         )
     };
     selphi_step!("Phasing complete [{:.0}s | {:.0} MB]", start.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
