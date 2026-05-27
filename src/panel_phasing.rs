@@ -75,6 +75,27 @@ fn read_cohort(input_path: &str) -> Cohort {
     }
 }
 
+/// Parse "chr:start-end", "chr:start", or "chr" → (chrom, start_bp, end_bp).
+/// Missing bounds default to the full range. 1-based inclusive.
+fn parse_region(reg: &str) -> (String, i64, i64) {
+    match reg.split_once(':') {
+        None => (reg.to_string(), 0, i64::MAX),
+        Some((chrom, range)) => {
+            let (s, e) = match range.split_once('-') {
+                None => {
+                    let s: i64 = range.replace(',', "").parse().unwrap_or(0);
+                    (s, i64::MAX)
+                }
+                Some((a, b)) => (
+                    a.replace(',', "").parse().unwrap_or(0),
+                    b.replace(',', "").parse().unwrap_or(i64::MAX),
+                ),
+            };
+            (chrom.to_string(), s, e)
+        }
+    }
+}
+
 /// Run de-novo panel phasing end-to-end.
 pub fn run(args: &Args, input_path: &str, output_path: &str) {
     let map_path = args.map_path.as_deref()
@@ -95,6 +116,33 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
 
     // 1. Read cohort (VCF.gz or SRP). Input phase is ignored — we re-phase.
     let cohort = read_cohort(input_path);
+    let mut cohort = cohort;
+    // Optional region restriction (bounds memory; phase region-by-region).
+    if let Some(ref reg) = args.region {
+        let (rchrom, rstart, rend) = parse_region(reg);
+        let keep: Vec<usize> = (0..cohort.markers.len()).filter(|&v| {
+            let m = &cohort.markers[v];
+            let chrom_ok = rchrom.is_empty()
+                || m.chrom == rchrom
+                || m.chrom.trim_start_matches("chr") == rchrom.trim_start_matches("chr");
+            chrom_ok && m.pos >= rstart && m.pos <= rend
+        }).collect();
+        if keep.is_empty() {
+            selphi_error!("No variants in region {} — nothing to phase.", reg);
+            std::process::exit(1);
+        }
+        let n_haps_in = cohort.n_samples * 2;
+        let mut new_geno = vec![0u8; keep.len() * n_haps_in];
+        for (ni, &v) in keep.iter().enumerate() {
+            new_geno[ni * n_haps_in..(ni + 1) * n_haps_in]
+                .copy_from_slice(&cohort.geno[v * n_haps_in..(v + 1) * n_haps_in]);
+        }
+        let new_markers: Vec<_> = keep.iter().map(|&v| cohort.markers[v].clone()).collect();
+        selphi_step!("Region {}: {} / {} variants retained", reg, keep.len(), cohort.n_var);
+        cohort.geno = new_geno;
+        cohort.markers = new_markers;
+        cohort.n_var = keep.len();
+    }
     let Cohort { sample_names, markers, geno: cohort_geno, n_var, n_samples, was_phased } = cohort;
     let n_haps = n_samples * 2;
     selphi_step!("Cohort: {} samples, {} variants, input_phased={} (re-phasing from genotypes)",

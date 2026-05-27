@@ -57,6 +57,13 @@ pub struct Args {
     #[arg(long)]
     pub phase_panel: bool,
 
+    /// (--phase-panel) Restrict phasing to a genomic region "chr:start-end"
+    /// (or "chr"). Bounds memory for large WGS panels — phase region by
+    /// region (SHAPEIT5-style), then ligate externally. Start/end are 1-based
+    /// bp inclusive.
+    #[arg(long)]
+    pub region: Option<String>,
+
     /// Force phasing even if input is already phased (re-phase for better accuracy)
     #[arg(long, alias = "force-unphased")]
     pub force_phasing: bool,
