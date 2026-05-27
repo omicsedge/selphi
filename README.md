@@ -69,6 +69,26 @@ selphi \
 
 Input phase is detected automatically. If the input is already phased (pipe-separated genotypes), the phasing step is skipped.
 
+### Panel phasing (de-novo, no reference)
+
+Phase an unphased cohort using the cohort itself as the conditioning set — the SHAPEIT5/Beagle-style reference-panel construction, in one command (phase_common → phase_rare internally). No external reference panel.
+
+```bash
+selphi --phase-panel \
+  --input cohort.vcf.gz \           # VCF.gz or .srp (re-phase an existing panel)
+  --map genetic_map.map \
+  --out panel \
+  --srp --bref3 \                   # also emit native .srp / .bref3 reference panels
+  --threads 16
+
+# Bound memory on biobank-scale WGS: phase a region, or let it auto-chunk + ligate
+selphi --phase-panel --input cohort.vcf.gz --map map.map --out panel --region 22:16000000-20000000
+```
+
+- Engine: `--phasing-engine diploid` (default, SHAPEIT5-style, best for WGS) or `haploid`.
+- Output: phased `panel.vcf.gz` always; add `--srp` and/or `--bref3` for native reference panels (written straight from memory, no BCF round-trip). The `.srp` is directly usable as `--refpanel` for imputation.
+- Large cohorts auto-chunk by genetic distance with memory-bounded parallelism and ligation; `--chunk-vars N` overrides the chunk size.
+
 ### Whole-genome imputation (all chromosomes at once)
 
 Selphi supports whole-genome imputation from a **single reference panel file** containing all chromosomes. No per-chromosome splitting, no shell loops, no manual concatenation — one command imputes the entire genome:
@@ -336,6 +356,12 @@ Standard VCF or BCF. Unphased (`0/1`) or phased (`0|1`) genotypes. Multi-allelic
 | `--map-dir DIR` | Directory with per-chr genetic maps. Auto-discovers common naming patterns. Alternative to `--map` | |
 | `--merge-srps PATHS` | Merge SRP files (comma-separated). Auto-detects mode: per-chr files with same samples → multi-chromosome SRP; same-chr files with different samples → horizontal merge | |
 | `--merge-srps-dir DIR` | Merge all SRP files from a directory into multi-chromosome SRP | |
+| **Panel phasing** | | |
+| `--phase-panel` | De-novo phase a cohort against itself (no reference); input VCF.gz or .srp | off |
+| `--srp` | (with `--phase-panel`) also emit a native `.srp` reference panel | off |
+| `--bref3` | (with `--phase-panel`) also emit a native `.bref3` reference panel | off |
+| `--region REG` | (with `--phase-panel`) restrict phasing to `chr:start-end` to bound memory | |
+| `--chunk-vars N` | (with `--phase-panel`) override the auto chunk size (variants/chunk) | 0 |
 | **Reference panel** | | |
 | `--prepare-reference-from PATH` | Create SRP from VCF.gz, BCF, BREF3, or directory of per-chr files | |
 | `--chunk-size N` | Chunk size for SRP creation (0 = auto) | 0 |
