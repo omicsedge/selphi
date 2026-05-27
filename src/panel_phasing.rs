@@ -119,16 +119,42 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
         _ => PhasingEngine::Diploid,
     };
 
-    // 5. Memory guard. Dominant cost is the diploid unified bitmatrix +
-    //    per-sample byte arrays: ~ n_common × n_haps bytes. Refuse to start a
-    //    run that would clearly exceed system RAM (avoids OOM on large WGS
-    //    panels — those need region chunking, not yet implemented).
-    let est_gb = (n_var as f64 * n_haps as f64 * 2.0) / 1e9; // byte arrays + bitmatrix
+    // 5. Memory guard — ENGINE-AWARE. The two engines have very different
+    //    footprints on dense WGS panels (measured on 1KG chr22: 2401 samples
+    //    × 1.07M variants):
+    //      - diploid:  ~27 GB (bounded 4cM windows, common-only, capped state)
+    //      - haploid: ~118 GB (40cM windows → ~all variants per window; the
+    //        per-window fwd/bwd HMM scratch × N_MOSAIC states × threads
+    //        dominates and explodes on dense input).
+    //    Refuse a run that would exceed the safe fraction of system RAM —
+    //    OOM here forces an instance reset, so this guard is hard.
     let sys_gb = selphi::log::system_ram_mb() / 1024.0;
-    selphi_step!("Estimated working memory ~{:.1} GB (system {:.1} GB)", est_gb, sys_gb);
-    if est_gb > 0.9 * sys_gb {
-        selphi_error!("Panel too large for single-shot phasing (~{:.0} GB > 90% of {:.0} GB RAM).", est_gb, sys_gb);
-        selphi_error!("Region chunking for biobank-scale panels is not yet implemented; phase by --region externally for now.");
+    let n_threads = args.threads.max(1) as f64;
+    let byte_arrays_gb = (n_var as f64 * n_haps as f64 * 4.0) / 1e9;
+    let est_gb = match engine {
+        PhasingEngine::Haploid => {
+            // Worst case: one 40cM window holds ~all variants. Per-thread
+            // HMM scratch ≈ n_var × N_MOSAIC(280) × ~24 B (f32 fwd + f64 bwd
+            // + match indices); × threads. Calibrated to the measured 118 GB.
+            let hmm_scratch_gb = (n_var as f64 * 280.0 * 24.0 * n_threads) / 1e9;
+            byte_arrays_gb + hmm_scratch_gb
+        }
+        _ => byte_arrays_gb * 2.5, // diploid: bounded windows; ~27 GB on 1KG
+    };
+    let cap = if matches!(engine, PhasingEngine::Haploid) { 0.80 } else { 0.90 };
+    selphi_step!("Estimated working memory ~{:.1} GB ({} engine, system {:.1} GB, cap {:.0}%)",
+        est_gb, if matches!(engine, PhasingEngine::Haploid) { "haploid" } else { "diploid" },
+        sys_gb, cap * 100.0);
+    if est_gb > cap * sys_gb {
+        selphi_error!("Panel too large for single-shot {} panel phasing (~{:.0} GB > {:.0}% of {:.0} GB RAM).",
+            if matches!(engine, PhasingEngine::Haploid) { "haploid" } else { "diploid" },
+            est_gb, cap * 100.0, sys_gb);
+        if matches!(engine, PhasingEngine::Haploid) {
+            selphi_error!("The haploid engine windows at 40 cM and is not memory-suited to dense WGS panel phasing.");
+            selphi_error!("Use --phasing-engine diploid for panel phasing, or wait for region chunking (biobank scale).");
+        } else {
+            selphi_error!("Region chunking for biobank-scale panels is not yet implemented.");
+        }
         std::process::exit(1);
     }
 
