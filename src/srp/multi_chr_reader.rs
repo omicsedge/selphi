@@ -251,7 +251,7 @@ impl MultiChrSrpReader {
         let vcomp = super::helpers::read_section(&mut f)?;
         let vraw = zstd::decode_all(Cursor::new(&vcomp))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let variants = super::helpers::parse_variants_bin(&vraw, entry.n_variants as usize);
+        let variants = super::helpers::parse_variants_bin(&vraw, entry.n_variants as usize)?;
 
         // IDs
         let ids = super::helpers::decode_strings(&super::helpers::read_section(&mut f)?, true);

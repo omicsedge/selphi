@@ -55,7 +55,7 @@ impl SrpReader {
         let vcomp = super::helpers::read_section(&mut f)?;
         let vraw = zstd::decode_all(Cursor::new(&vcomp))
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let variants = super::helpers::parse_variants_bin(&vraw, metadata.n_variants);
+        let variants = super::helpers::parse_variants_bin(&vraw, metadata.n_variants)?;
 
         // Sample IDs, IDs, Original IDs
         let sample_ids = super::helpers::decode_strings(&super::helpers::read_section(&mut f)?, false);

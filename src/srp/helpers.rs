@@ -15,22 +15,27 @@ pub fn read_section(f: &mut File) -> io::Result<Vec<u8>> {
 }
 
 /// Parse binary variant records: [8B pos][1B chr_len][1B ref_len][1B alt_len][chr][ref][alt] per variant.
-pub fn parse_variants_bin(data: &[u8], n: usize) -> Vec<Variant> {
+pub fn parse_variants_bin(data: &[u8], n: usize) -> std::io::Result<Vec<Variant>> {
+    let trunc = || std::io::Error::new(std::io::ErrorKind::InvalidData,
+        "truncated/corrupt variants_bin section (fewer bytes than n_variants requires)");
     let mut out = Vec::with_capacity(n);
     let mut off = 0;
     for _ in 0..n {
-        if off + 11 > data.len() { break; }
+        if off + 11 > data.len() { return Err(trunc()); }
         let pos = i64::from_le_bytes(data[off..off+8].try_into().unwrap());
         let cl = data[off+8] as usize;
         let rl = data[off+9] as usize;
         let al = data[off+10] as usize;
         off += 11;
+        // Bounds-check the variable-length fields (a mid-record truncation would
+        // otherwise panic on the slice) and never silently return fewer than n.
+        if off + cl + rl + al > data.len() { return Err(trunc()); }
         let chr = std::str::from_utf8(&data[off..off+cl]).unwrap_or("").to_string(); off += cl;
         let ref_allele = std::str::from_utf8(&data[off..off+rl]).unwrap_or("").to_string(); off += rl;
         let alt_allele = std::str::from_utf8(&data[off..off+al]).unwrap_or("").to_string(); off += al;
         out.push(Variant { chr, pos, ref_allele, alt_allele });
     }
-    out
+    Ok(out)
 }
 
 /// Decompress and split newline-delimited strings.
