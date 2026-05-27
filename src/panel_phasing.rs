@@ -152,8 +152,13 @@ fn phase_panel_chunked(
         if n_var <= single_chunk_vars {
             (n_var, 1)
         } else {
+            // The parallel path additionally stores ALL phased chunks
+            // (~n_var × n_haps) until ligation, so reserve one array for it
+            // before budgeting the concurrent working sets.
+            let results_gb = n_var as f64 * n_haps as f64 / 1e9;
+            let par_budget = (work_budget_gb - results_gb).max(work_budget_gb * 0.3);
             let np = (n_threads / 4).max(1).min(4).min(args.threads).max(1);
-            let cv = (((work_budget_gb * 1e9) / (np as f64 * per_var_bytes)) as usize)
+            let cv = (((par_budget * 1e9) / (np as f64 * per_var_bytes)) as usize)
                 .clamp(20_000, n_var);
             (cv, np)
         }
@@ -181,18 +186,27 @@ fn phase_panel_chunked(
     // are stored and stitched left-to-right afterwards (ligation is cheap and
     // has a sequential dependency).
     let t_all = std::time::Instant::now();
-    let phased_chunks: Vec<Vec<u8>> = if n_parallel <= 1 {
-        chunks.iter().enumerate().map(|(ci, &(cs, ce))| {
+    let mut global = vec![0u8; n_var * n_haps];
+    let mut prev_end = 0usize;
+
+    if n_parallel <= 1 {
+        // Sequential: phase one chunk, ligate it, drop it. Keeps peak memory
+        // at cohort_geno + global + ONE chunk working set — the lean path for
+        // the memory-heavy haploid-on-biobank case.
+        for (ci, &(cs, ce)) in chunks.iter().enumerate() {
             let cn = ce - cs;
             let t0 = std::time::Instant::now();
-            let r = phase_cohort(engine, args, threads_per,
+            let cphased = phase_cohort(engine, args, threads_per,
                 &cohort_geno[cs * n_haps..ce * n_haps], &bp[cs..ce],
                 map_bp, map_cm, cn, n_samples);
             selphi_step!("  chunk {}/{} [{}..{}) phased in {:.0}s [{:.0} MB]",
                 ci + 1, chunks.len(), cs, ce, t0.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
-            r
-        }).collect()
+            prev_end = ligate_chunk(&mut global, &cphased, ci, cs, ce, prev_end, n_samples, n_haps);
+        }
     } else {
+        // Parallel: phase chunks concurrently (stored), then ligate in order.
+        // Only taken for smaller cohorts where n_parallel chunks + the stored
+        // results comfortably fit RAM (the budget accounts for it).
         use std::sync::atomic::{AtomicUsize, Ordering};
         let next = AtomicUsize::new(0);
         let mut results: Vec<Vec<u8>> = (0..chunks.len()).map(|_| Vec::new()).collect();
@@ -214,7 +228,10 @@ fn phase_panel_chunked(
                             map_bp, map_cm, cn, n_samples));
                         selphi_step!("  chunk {}/{} [{}..{}) phased in {:.0}s [{:.0} MB]",
                             ci + 1, chunks.len(), cs, ce, t0.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
-                        // SAFETY: each ci written by exactly one worker; slots disjoint.
+                        // SAFETY: `ci` is unique per iteration (atomic counter),
+                        // so each slot is written by exactly one worker; the Vec
+                        // is never resized; the prior empty Vec::new() owns no
+                        // heap so overwriting it without dropping leaks nothing.
                         unsafe {
                             let slot = (res_ptr as *mut Vec<u8>).add(ci);
                             std::ptr::write(slot, r);
@@ -223,53 +240,60 @@ fn phase_panel_chunked(
                 });
             }
         });
-        results
-    };
-    selphi_step!("All chunks phased in {:.0}s; ligating", t_all.elapsed().as_secs_f64());
-
-    // Sequential ligation: stitch left-to-right with per-sample flip on overlap.
-    let mut global = vec![0u8; n_var * n_haps];
-    let mut prev_end = 0usize;
-    for (ci, &(cs, ce)) in chunks.iter().enumerate() {
-        let cphased = &phased_chunks[ci];
-        if ci == 0 {
-            global[cs * n_haps..ce * n_haps].copy_from_slice(cphased);
-            prev_end = ce;
-            continue;
+        for (ci, &(cs, ce)) in chunks.iter().enumerate() {
+            prev_end = ligate_chunk(&mut global, &results[ci], ci, cs, ce, prev_end, n_samples, n_haps);
         }
-        let ov_start = cs;
-        let ov_end = prev_end.min(ce);
-        for sa in 0..n_samples {
-            let h0 = sa * 2;
-            let h1 = sa * 2 + 1;
-            let mut agree = 0i64;
-            let mut disagree = 0i64;
-            for v in ov_start..ov_end {
-                let g0 = global[v * n_haps + h0];
-                let g1 = global[v * n_haps + h1];
-                if g0 == g1 { continue; }
-                let rel = (v - cs) * n_haps;
-                let c0 = cphased[rel + h0];
-                let c1 = cphased[rel + h1];
-                if c0 == c1 { continue; }
-                if c0 == g0 && c1 == g1 { agree += 1; } else { disagree += 1; }
-            }
-            let flip = disagree > agree;
-            for v in prev_end..ce {
-                let rel = (v - cs) * n_haps;
-                let (a0, a1) = (cphased[rel + h0], cphased[rel + h1]);
-                if flip {
-                    global[v * n_haps + h0] = a1;
-                    global[v * n_haps + h1] = a0;
-                } else {
-                    global[v * n_haps + h0] = a0;
-                    global[v * n_haps + h1] = a1;
-                }
-            }
-        }
-        prev_end = ce;
     }
+    selphi_step!("All chunks phased + ligated in {:.0}s", t_all.elapsed().as_secs_f64());
     global
+}
+
+/// Stitch one phased chunk into `global`. The first chunk is copied verbatim;
+/// each later chunk's non-overlap region [prev_end, ce) is appended, with each
+/// sample's two haplotypes flipped iff they disagree with the already-stitched
+/// phase across the overlap [cs, prev_end) het sites (majority vote). Returns
+/// the new `prev_end`.
+#[allow(clippy::too_many_arguments)]
+fn ligate_chunk(
+    global: &mut [u8], cphased: &[u8],
+    ci: usize, cs: usize, ce: usize, prev_end: usize,
+    n_samples: usize, n_haps: usize,
+) -> usize {
+    if ci == 0 {
+        global[cs * n_haps..ce * n_haps].copy_from_slice(cphased);
+        return ce;
+    }
+    let ov_start = cs;
+    let ov_end = prev_end.min(ce);
+    for sa in 0..n_samples {
+        let h0 = sa * 2;
+        let h1 = sa * 2 + 1;
+        let mut agree = 0i64;
+        let mut disagree = 0i64;
+        for v in ov_start..ov_end {
+            let g0 = global[v * n_haps + h0];
+            let g1 = global[v * n_haps + h1];
+            if g0 == g1 { continue; }
+            let rel = (v - cs) * n_haps;
+            let c0 = cphased[rel + h0];
+            let c1 = cphased[rel + h1];
+            if c0 == c1 { continue; }
+            if c0 == g0 && c1 == g1 { agree += 1; } else { disagree += 1; }
+        }
+        let flip = disagree > agree;
+        for v in prev_end..ce {
+            let rel = (v - cs) * n_haps;
+            let (a0, a1) = (cphased[rel + h0], cphased[rel + h1]);
+            if flip {
+                global[v * n_haps + h0] = a1;
+                global[v * n_haps + h1] = a0;
+            } else {
+                global[v * n_haps + h0] = a0;
+                global[v * n_haps + h1] = a1;
+            }
+        }
+    }
+    ce
 }
 
 /// Run de-novo panel phasing end-to-end.
@@ -357,7 +381,11 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
     // (held once) + overhead. Haploid gets a tighter fraction — it has the
     // larger, less-predictable footprint and OOM forces an instance reset.
     let budget_frac = if matches!(engine, PhasingEngine::Haploid) { 0.50 } else { 0.55 };
-    let budget_gb = (budget_frac * sys_gb - (n_var as f64 * n_haps as f64 / 1e9)).max(4.0);
+    // Reserve TWO full output arrays: the input cohort_geno (held throughout)
+    // and the phased output, both n_var × n_haps bytes. What's left is the
+    // budget for the per-chunk working set(s).
+    let array_gb = n_var as f64 * n_haps as f64 / 1e9;
+    let budget_gb = (budget_frac * sys_gb - 2.0 * array_gb).max(4.0);
     // per_var_bytes calibrated to MEASURED working-set peaks on 1KG chr22 at
     // 16 threads, across TWO cohort sizes so it scales with n_haps (a fixed
     // constant over-chunks small cohorts — e.g. 54 children needlessly split
