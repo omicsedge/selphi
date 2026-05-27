@@ -109,15 +109,15 @@ pub fn read_bcf_parallel(
     let gtk = header.gt_key_id;
     let ns = header.n_samples;
 
+    // Propagate any region's I/O error instead of swallowing it into an empty
+    // result — a swallowed error would silently drop ~1/N of the panel's
+    // variants with no diagnostic (corrupting the reference panel).
     let results: Vec<RegionResult> = regions
         .par_iter()
         .map(|&(ti, vp, sp, ep)| {
             process_region(&pb, vp, sp, ep, target_ref_id, gtk, ns, nh, chunk_size, tmp_dir, ti)
-                .unwrap_or_else(|_| {
-                    RegionResult { meta_file: PathBuf::new(), chunk_files: Vec::new(), chunk_row_counts: Vec::new(), n_variants: 0 }
-                })
         })
-        .collect();
+        .collect::<io::Result<Vec<RegionResult>>>()?;
 
 
     Ok((header, results))
@@ -317,15 +317,15 @@ pub fn read_bcf_parallel_for_contig(
     let gtk = header.gt_key_id;
     let ns = header.n_samples;
 
+    // Propagate any region's I/O error instead of swallowing it into an empty
+    // result — a swallowed error would silently drop ~1/N of the panel's
+    // variants with no diagnostic (corrupting the reference panel).
     let results: Vec<RegionResult> = regions
         .par_iter()
         .map(|&(ti, vp, sp, ep)| {
             process_region(&pb, vp, sp, ep, target_ref_id, gtk, ns, nh, chunk_size, tmp_dir, ti)
-                .unwrap_or_else(|_| {
-                    RegionResult { meta_file: PathBuf::new(), chunk_files: Vec::new(), chunk_row_counts: Vec::new(), n_variants: 0 }
-                })
         })
-        .collect();
+        .collect::<io::Result<Vec<RegionResult>>>()?;
 
     Ok((header, results))
 }
