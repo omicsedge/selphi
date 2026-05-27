@@ -151,7 +151,7 @@ impl HaplotypeBitmatrix {
         let n_haps = n_target_haps + n_ref;
         let n_words = n_haps.div_ceil(64);
         let mut bits = vec![0u64; n_sites * n_words];
-        let ref_nw = ref_bm.n_words();
+        let ref_nw = if n_ref > 0 { ref_bm.n_words() } else { 0 };
         let target_word_end = n_target_haps.div_ceil(64);
 
         bits.par_chunks_mut(n_words).enumerate().for_each(|(site, row)| {
@@ -169,6 +169,8 @@ impl HaplotypeBitmatrix {
                 }
                 row[w] = word;
             }
+            // Panel self-phasing: no reference haps to append.
+            if n_ref == 0 { return; }
             // Ref haps: copy from ref bitmatrix with offset shift
             let ref_row = ref_bm.row(site);
             let bit_offset = n_target_haps & 63; // bits used in last target word

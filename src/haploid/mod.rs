@@ -58,6 +58,33 @@ fn compute_step_boundaries(cm: &[f64], step_scale: f64) -> (Vec<i32>, Vec<i32>) 
     pbwt::compute_step_boundaries(cm, step_scale)
 }
 
+/// De-novo PANEL phasing (haploid engine): phase an unphased cohort using
+/// the cohort itself as the conditioning set (n_ref = 0). Composites are
+/// built from the cohort haplotypes; the IBS candidate selection already
+/// excludes the query individual's own sample (pbwt.rs same-sample gate), so
+/// each sample phases conditioning on the OTHERS. No external reference.
+///
+/// `cohort_geno`: (n_var × n_samples × 2) genotype bytes. `bp`: per-variant
+/// base-pair positions. Returns phased haplotypes (n_var × n_haps).
+#[allow(clippy::too_many_arguments)]
+pub fn phase_panel(
+    cohort_geno: &[u8],
+    bp: &[i64], map_bp: &[i64], map_cm: &[f64],
+    n_var: usize, n_samples: usize,
+    seed: i64, n_threads: usize, max_windows: usize,
+) -> (Vec<u8>, Vec<f32>, Vec<(f32, usize, usize)>) {
+    let chip_cm: Vec<f64> = bp.iter().map(|&b| {
+        crate::genmap::interpolate_cm_extrapolate(map_bp, map_cm, b)
+    }).collect();
+    let empty_ref = HaplotypeBitmatrix::from_raw(vec![], 0, 0);
+    // ref_bp = cohort bp (only used for ref-side map alignment; n_ref=0 so inert)
+    phase_genotypes_inner(
+        cohort_geno, &empty_ref, &chip_cm, bp,
+        bp, map_bp, map_cm, n_var, n_samples, /* n_ref = */ 0,
+        seed, n_threads, max_windows, N_BURNIN, N_PHASING,
+    )
+}
+
 /// Main phasing entry point (window-major, ).
 pub fn phase_genotypes(
     target_geno: &[u8], ref_bm: &HaplotypeBitmatrix,
@@ -296,18 +323,23 @@ fn phase_genotypes_inner(
         let hap_byte_stride = (w_size + 7) >> 3;
         let mut w_hap_bits = vec![0u8; m_all * hap_byte_stride];
 
-        // Fill ref haps from bitmatrix (word-level for speed)
-        for m in 0..w_size {
-            let m_byte = m >> 3;
-            let m_bit = 1u8 << (m & 7);
-            let row = ref_bm.row(ws + m);
-            for w in 0..ref_bm.n_words() {
-                let mut word = row[w];
-                let h_base = n_targ_haps + w * 64;
-                while word != 0 {
-                    let k = word.trailing_zeros() as usize;
-                    w_hap_bits[(h_base + k) * hap_byte_stride + m_byte] |= m_bit;
-                    word &= word - 1;
+        // Fill ref haps from bitmatrix (word-level for speed).
+        // Skipped for panel self-phasing (n_ref=0): the cohort conditions on
+        // itself, composites are built from target haps, IBS selection
+        // excludes the query's own sample.
+        if n_ref > 0 {
+            for m in 0..w_size {
+                let m_byte = m >> 3;
+                let m_bit = 1u8 << (m & 7);
+                let row = ref_bm.row(ws + m);
+                for w in 0..ref_bm.n_words() {
+                    let mut word = row[w];
+                    let h_base = n_targ_haps + w * 64;
+                    while word != 0 {
+                        let k = word.trailing_zeros() as usize;
+                        w_hap_bits[(h_base + k) * hap_byte_stride + m_byte] |= m_bit;
+                        word &= word - 1;
+                    }
                 }
             }
         }
