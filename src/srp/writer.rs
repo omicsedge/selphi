@@ -1338,5 +1338,35 @@ mod tests {
         assert_eq!(reader.variants[0].pos, 1000);
         assert_eq!(reader.variants[n_var - 1].pos, 1000 + (n_var as i64 - 1) * 10);
     }
+
+    /// Original variant IDs (rsIDs) must survive a panel→SRP→read round-trip
+    /// per-variant, INCLUDING variants with no ID (""). Regression guard for
+    /// the reader bug where filtering empty IDs broke the length match and
+    /// dropped every rsID to the synthetic-ID fallback.
+    #[test]
+    fn test_srp_preserves_original_ids_with_gaps() {
+        let n_haps = 4usize;
+        let ids = ["rs1", "rs2", "", "rs4", ""]; // two variants intentionally have no rsID
+        let n_var = ids.len();
+        let phased = vec![0u8; n_var * n_haps];
+        let chroms = vec!["7".to_string(); n_var];
+        let refs = vec!["A".to_string(); n_var];
+        let alts = vec!["G".to_string(); n_var];
+        let pvs: Vec<PanelVariant> = (0..n_var).map(|v| PanelVariant {
+            chrom: &chroms[v], pos: 100 + v as i64,
+            ref_allele: &refs[v], alt_allele: &alts[v], id: ids[v],
+        }).collect();
+        let samples: Vec<String> = (0..n_haps / 2).map(|s| format!("S{s}")).collect();
+
+        let dir = tempfile::tempdir().unwrap();
+        let srp_path = dir.path().join("ids.srp");
+        build_srp_from_panel(&phased, &pvs, &samples, n_haps, &srp_path).unwrap();
+
+        let reader = SrpReader::open(&srp_path, 0).unwrap();
+        assert_eq!(reader.original_ids.len(), n_var, "original_ids length must equal n_variants");
+        for v in 0..n_var {
+            assert_eq!(reader.original_ids[v], ids[v], "original_id mismatch at variant {v}");
+        }
+    }
 }
 
