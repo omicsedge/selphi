@@ -59,10 +59,11 @@ fn cohort_from_srp(input_path: &str) -> Cohort {
             if bm.get(v, h) { geno[base + h] = 1; }
         }
     }
-    let markers: Vec<TargetMarker> = srp.variants.iter().map(|vv| TargetMarker {
+    let markers: Vec<TargetMarker> = srp.variants.iter().enumerate().map(|(i, vv)| TargetMarker {
         chrom: vv.chr.clone(), pos: vv.pos,
         ref_allele: vv.ref_allele.clone(), alt_allele: vv.alt_allele.clone(),
         ref_hash: String::new(), alt_hash: String::new(),
+        id: srp.original_ids.get(i).cloned().unwrap_or_default(),
     }).collect();
     let sample_names = if srp.sample_ids.len() == n_samples {
         srp.sample_ids.clone()
@@ -85,11 +86,11 @@ fn cohort_from_bref3(input_path: &str) -> Cohort {
     let n_samples = sample_names.len();
     let n_haps = s1.n_haps;
     let mut markers: Vec<TargetMarker> = Vec::new();
-    while let Some((chrom, pos, ref_a, alt_a, _id)) = s1.next_variant_meta_only()
+    while let Some((chrom, pos, ref_a, alt_a, id)) = s1.next_variant_meta_only()
         .unwrap_or_else(|e| { selphi_error!("BREF3 read error: {}", e); std::process::exit(1); }) {
         markers.push(TargetMarker {
             chrom, pos: pos as i64, ref_allele: ref_a, alt_allele: alt_a,
-            ref_hash: String::new(), alt_hash: String::new(),
+            ref_hash: String::new(), alt_hash: String::new(), id,
         });
     }
     drop(s1);
@@ -383,6 +384,21 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
     selphi_info!("  threads:  {}", args.threads);
     selphi_info!("");
 
+    // Flag imputation/output options that --phase-panel does not use (output is
+    // a phased VCF + optional native --srp/--bref3), so they aren't silently dropped.
+    let mut ignored: Vec<&str> = Vec::new();
+    if !args.refpanel.is_empty() { ignored.push("--refpanel"); }
+    if args.truth.is_some() { ignored.push("--truth"); }
+    if args.bcf { ignored.push("--bcf"); }
+    if args.parquet { ignored.push("--parquet"); }
+    if args.pgen { ignored.push("--pgen"); }
+    if args.selfdecode { ignored.push("--selfdecode"); }
+    if args.all_formats { ignored.push("--all-formats"); }
+    if !ignored.is_empty() {
+        selphi_info!("  NOTE: --phase-panel ignores {} (output = phased VCF + optional --srp/--bref3).",
+            ignored.join(", "));
+    }
+
     let start = Instant::now();
 
     // 1. Read cohort (VCF.gz or SRP). Input phase is ignored — we re-phase.
@@ -421,6 +437,23 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
     if n_var == 0 || n_samples == 0 {
         selphi_error!("Empty cohort.");
         std::process::exit(1);
+    }
+
+    // Single-chromosome guard. The genetic-map cM axis is monotonic per
+    // chromosome and the native SRP/BREF3 writers label every variant with the
+    // first variant's chromosome — a multi-chromosome cohort would break phasing
+    // across boundaries and mislabel contigs. Require one chromosome.
+    {
+        let mut chroms: Vec<&str> = markers.iter().map(|m| m.chrom.as_str()).collect();
+        chroms.sort_unstable();
+        chroms.dedup();
+        if chroms.len() > 1 {
+            let shown: Vec<&str> = chroms.iter().take(6).copied().collect();
+            selphi_error!("--phase-panel needs a single chromosome, but the input spans {} ({}{}). \
+                Restrict with --region chr:start-end, or split the input per chromosome.",
+                chroms.len(), shown.join(","), if chroms.len() > 6 { ",…" } else { "" });
+            std::process::exit(1);
+        }
     }
 
     // 2. bp positions.
@@ -525,7 +558,7 @@ fn write_reference_panels(
 
     let pvs: Vec<PanelVariant> = markers.iter().map(|m| PanelVariant {
         chrom: &m.chrom, pos: m.pos,
-        ref_allele: &m.ref_allele, alt_allele: &m.alt_allele, id: ".",
+        ref_allele: &m.ref_allele, alt_allele: &m.alt_allele, id: &m.id,
     }).collect();
 
     // SRP is needed for either output; write it to its final location when

@@ -256,8 +256,10 @@ impl MultiChrSrpReader {
         // IDs
         let ids = super::helpers::decode_strings(&super::helpers::read_section(&mut f)?, true);
 
-        // Original IDs
-        let orig = super::helpers::decode_strings(&super::helpers::read_section(&mut f)?, true);
+        // Original IDs — must NOT filter empties (per-variant, "" for no-rsID),
+        // else the length stops matching n_variants and every rsID is lost to
+        // the synthetic-ID fallback below (matches the single-chr reader fix).
+        let orig = super::helpers::decode_strings(&super::helpers::read_section(&mut f)?, false);
         let original_ids = if orig.len() == entry.n_variants as usize { orig } else { ids.clone() };
 
         // Tile index

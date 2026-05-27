@@ -18,6 +18,10 @@ pub struct TargetMarker {
     pub alt_allele: String,
     pub ref_hash: String,
     pub alt_hash: String,
+    /// Original variant ID (rsID) from the VCF/SRP/BREF3, "." or "" if none.
+    /// Only populated by the panel-phasing cohort readers; the imputation
+    /// target readers leave it empty (imputation output IDs come from the panel).
+    pub id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -98,9 +102,10 @@ pub fn read_cohort_vcf(
         let ref_allele = std::str::from_utf8(ref_bytes).unwrap_or("").to_string();
         let alt_allele = std::str::from_utf8(alt_bytes).unwrap_or("").to_string();
         let chrom = std::str::from_utf8(&line[..tabs[0]]).unwrap_or("").to_string();
+        let id = std::str::from_utf8(&line[tabs[1]+1..tabs[2]]).unwrap_or(".").to_string();
         markers.push(TargetMarker {
             chrom, pos, ref_allele, alt_allele,
-            ref_hash: String::new(), alt_hash: String::new(),
+            ref_hash: String::new(), alt_hash: String::new(), id,
         });
 
         let n_samples = sample_names.len();
@@ -227,7 +232,7 @@ pub fn read_target_vcf(
             (ref_allele.clone(), alt_allele.clone())
         };
 
-        markers.push(TargetMarker { chrom, pos, ref_allele, alt_allele, ref_hash, alt_hash });
+        markers.push(TargetMarker { chrom, pos, ref_allele, alt_allele, ref_hash, alt_hash, id: String::new() });
 
         // Parse genotypes from byte slice (fields 9+)
         let n_samples = sample_names.len();
@@ -391,8 +396,9 @@ pub fn write_panel_vcf(
             line_buf.push((b'0' + a1.min(1)) as char);
         }
         let af = ac as f64 / n_haps as f64;
-        writeln!(w, "{}\t{}\t.\t{}\t{}\t.\tPASS\tAF={:.4};AC={};AN={}\tGT\t{}",
-            m.chrom, m.pos, m.ref_allele, m.alt_allele, af, ac, n_haps, line_buf)?;
+        let id = if m.id.is_empty() { "." } else { m.id.as_str() };
+        writeln!(w, "{}\t{}\t{}\t{}\t{}\t.\tPASS\tAF={:.4};AC={};AN={}\tGT\t{}",
+            m.chrom, m.pos, id, m.ref_allele, m.alt_allele, af, ac, n_haps, line_buf)?;
     }
 
     w.flush()?;
@@ -550,7 +556,7 @@ pub fn read_target_vcf_multi_chr(
         all_markers.push(TargetMarker {
             chrom, pos,
             ref_allele: ref_allele.clone(), alt_allele: alt_allele.clone(),
-            ref_hash: ref_allele, alt_hash: alt_allele,
+            ref_hash: ref_allele, alt_hash: alt_allele, id: String::new(),
         });
 
         let n_samples = sample_names.len();
@@ -629,7 +635,7 @@ pub fn intersect_variants_for_chr(
             chrom: t.chrom.clone(), pos: t.pos,
             ref_allele: t.ref_allele.clone(), alt_allele: t.alt_allele.clone(),
             ref_hash: crate::srp::blake2b_hex(&t.ref_allele),
-            alt_hash: crate::srp::blake2b_hex(&t.alt_allele),
+            alt_hash: crate::srp::blake2b_hex(&t.alt_allele), id: t.id.clone(),
         }).collect()
     } else {
         targets.to_vec()
