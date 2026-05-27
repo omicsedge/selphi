@@ -248,6 +248,15 @@ pub struct Args {
     #[arg(long)]
     pub selfdecode: bool,
 
+    /// (--phase-panel) Also emit the phased panel as an .srp reference panel,
+    /// ready to use directly with --refpanel (no VCF→SRP round-trip).
+    #[arg(long)]
+    pub srp: bool,
+
+    /// (--phase-panel) Also emit the phased panel as a .bref3 reference panel.
+    #[arg(long)]
+    pub bref3: bool,
+
     /// Evaluate imputation accuracy: --evaluate imputed.vcf.gz --truth truth.vcf.gz --out results
     #[arg(long)]
     pub evaluate: Option<String>,
