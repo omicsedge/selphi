@@ -310,7 +310,9 @@ pub fn write_bref3_from_srp(source_path: &Path, output_path: &Path) -> io::Resul
 
             let rec = VariantRec {
                 pos: v.pos as i32,
-                id: String::new(),
+                // Preserve the original variant ID (rsID) carried in the SRP's
+                // original_IDs section; "." / empty becomes a no-ID record.
+                id: reader.original_ids.get(*gi).cloned().unwrap_or_default(),
                 ref_allele: v.ref_allele.clone(),
                 alt_allele: v.alt_allele.clone(),
                 alleles,
