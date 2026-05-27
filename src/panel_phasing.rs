@@ -96,6 +96,116 @@ fn parse_region(reg: &str) -> (String, i64, i64) {
     }
 }
 
+/// Phase one cohort block (single chunk or whole panel) with the chosen
+/// engine, n_ref=0 self-phasing. Returns (phased n_var×n_haps, n_var).
+fn phase_cohort(
+    engine: PhasingEngine, args: &Args,
+    geno: &[u8], bp: &[i64], map_bp: &[i64], map_cm: &[f64],
+    n_var: usize, n_samples: usize,
+) -> (Vec<u8>, usize) {
+    let (phased, _c, _r) = match engine {
+        PhasingEngine::Haploid => selphi::haploid::phase_panel(
+            geno, bp, map_bp, map_cm, n_var, n_samples,
+            args.seed, args.threads, args.max_windows),
+        _ => selphi::diploid::diploid_phase_panel(
+            geno, bp, map_bp, map_cm, n_var, n_samples,
+            args.seed, args.threads, args.max_cond_haps),
+    };
+    (phased, n_var)
+}
+
+/// Auto-chunked panel phasing with ligation. Splits [0,n_var) into chunks of
+/// ≤ `max_chunk_vars` with an overlap region between consecutive chunks,
+/// phases each independently (bounded memory), and ligates: for each sample
+/// the new chunk's two haplotypes are flipped if they disagree with the
+/// already-stitched phase across the overlap's heterozygous sites (majority
+/// vote). This is the SHAPEIT5 chunk+ligate strategy in a single command.
+#[allow(clippy::too_many_arguments)]
+fn phase_panel_chunked(
+    engine: PhasingEngine, args: &Args,
+    cohort_geno: &[u8], bp: &[i64], map_bp: &[i64], map_cm: &[f64],
+    n_var: usize, n_samples: usize, max_chunk_vars: usize,
+) -> Vec<u8> {
+    let n_haps = n_samples * 2;
+    // Overlap: 10% of chunk, clamped — enough het sites for a reliable flip
+    // vote, small enough not to inflate work.
+    let overlap = (max_chunk_vars / 10).clamp(2_000, 50_000).min(max_chunk_vars / 2);
+    let step = max_chunk_vars - overlap;
+
+    // Chunk boundaries [start, end): consecutive chunks share `overlap` vars.
+    let mut chunks: Vec<(usize, usize)> = Vec::new();
+    let mut s = 0usize;
+    while s < n_var {
+        let e = (s + max_chunk_vars).min(n_var);
+        chunks.push((s, e));
+        if e == n_var { break; }
+        s += step;
+    }
+    selphi_step!("Auto-chunking: {} chunks of ≤{} variants (overlap {}), {} engine",
+        chunks.len(), max_chunk_vars, overlap,
+        if engine == PhasingEngine::Haploid { "haploid" } else { "diploid" });
+
+    let mut global = vec![0u8; n_var * n_haps];
+    let mut prev_end = 0usize; // global is filled up to here
+
+    for (ci, &(cs, ce)) in chunks.iter().enumerate() {
+        let cn = ce - cs;
+        // Extract this chunk's genotypes / bp.
+        let mut cg = vec![0u8; cn * n_haps];
+        cg.copy_from_slice(&cohort_geno[cs * n_haps..ce * n_haps]);
+        let cbp = &bp[cs..ce];
+
+        let t0 = std::time::Instant::now();
+        let (cphased, _) = phase_cohort(engine, args, &cg, cbp, map_bp, map_cm, cn, n_samples);
+        selphi_step!("  chunk {}/{} [{}..{}) phased in {:.0}s [{:.0} MB]",
+            ci + 1, chunks.len(), cs, ce, t0.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
+
+        if ci == 0 {
+            // First chunk: accept as-is, fill global [cs, ce).
+            global[cs * n_haps..ce * n_haps].copy_from_slice(&cphased);
+            prev_end = ce;
+            continue;
+        }
+
+        // Overlap region with the already-stitched global = [cs, prev_end).
+        let ov_start = cs;
+        let ov_end = prev_end.min(ce);
+        // Per-sample flip decision over overlap het sites.
+        for sa in 0..n_samples {
+            let h0 = sa * 2;
+            let h1 = sa * 2 + 1;
+            let mut agree = 0i64;
+            let mut disagree = 0i64;
+            for v in ov_start..ov_end {
+                let g0 = global[v * n_haps + h0];
+                let g1 = global[v * n_haps + h1];
+                if g0 == g1 { continue; } // only het sites are informative
+                let rel = (v - cs) * n_haps;
+                let c0 = cphased[rel + h0];
+                let c1 = cphased[rel + h1];
+                if c0 == c1 { continue; }
+                if c0 == g0 && c1 == g1 { agree += 1; } else { disagree += 1; }
+            }
+            let flip = disagree > agree;
+            // Copy the chunk's NON-overlap part [prev_end, ce) into global,
+            // flipping this sample's two haps if needed.
+            for v in prev_end..ce {
+                let rel = (v - cs) * n_haps;
+                let (a0, a1) = (cphased[rel + h0], cphased[rel + h1]);
+                if flip {
+                    global[v * n_haps + h0] = a1;
+                    global[v * n_haps + h1] = a0;
+                } else {
+                    global[v * n_haps + h0] = a0;
+                    global[v * n_haps + h1] = a1;
+                }
+            }
+        }
+        prev_end = ce;
+    }
+    global
+}
+
 /// Run de-novo panel phasing end-to-end.
 pub fn run(args: &Args, input_path: &str, output_path: &str) {
     let map_path = args.map_path.as_deref()
@@ -167,62 +277,39 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
         _ => PhasingEngine::Diploid,
     };
 
-    // 5. Memory guard — ENGINE-AWARE. The two engines have very different
-    //    footprints on dense WGS panels (measured on 1KG chr22: 2401 samples
-    //    × 1.07M variants):
-    //      - diploid:  ~27 GB (bounded 4cM windows, common-only, capped state)
-    //      - haploid: ~118 GB (40cM windows → ~all variants per window; the
-    //        per-window fwd/bwd HMM scratch × N_MOSAIC states × threads
-    //        dominates and explodes on dense input).
-    //    Refuse a run that would exceed the safe fraction of system RAM —
-    //    OOM here forces an instance reset, so this guard is hard.
+    // 5. Decide single-shot vs auto-chunked, ENGINE-AWARE. The two engines
+    //    have very different per-variant footprints on dense WGS (measured on
+    //    1KG chr22, 2401 samples × 1.07M variants): diploid ~27 GB (bounded
+    //    4cM windows), haploid ~118 GB (40cM windows hold ~all variants, the
+    //    fwd/bwd scratch × N_MOSAIC × threads explodes). Per-chunk working
+    //    memory ≈ chunk_vars × per_var_bytes(engine); choose chunk_vars so a
+    //    chunk fits a safe budget, then ligate. The full output array
+    //    (n_var × n_haps) is held once for writing regardless.
     let sys_gb = selphi::log::system_ram_mb() / 1024.0;
-    let n_threads = args.threads.max(1) as f64;
-    let byte_arrays_gb = (n_var as f64 * n_haps as f64 * 4.0) / 1e9;
-    let est_gb = match engine {
-        PhasingEngine::Haploid => {
-            // Worst case: one 40cM window holds ~all variants. Per-thread
-            // HMM scratch ≈ n_var × N_MOSAIC(280) × ~24 B (f32 fwd + f64 bwd
-            // + match indices); × threads. Calibrated to the measured 118 GB.
-            let hmm_scratch_gb = (n_var as f64 * 280.0 * 24.0 * n_threads) / 1e9;
-            byte_arrays_gb + hmm_scratch_gb
-        }
-        _ => byte_arrays_gb * 2.5, // diploid: bounded windows; ~27 GB on 1KG
+    let n_threads = args.threads.max(1);
+    // budget for ONE chunk's working memory; leave room for output + overhead.
+    let budget_gb = (0.55 * sys_gb - (n_var as f64 * n_haps as f64 / 1e9)).max(4.0);
+    let per_var_bytes = match engine {
+        PhasingEngine::Haploid => 280.0 * 24.0 * n_threads as f64 + n_haps as f64 * 4.0,
+        _ => n_haps as f64 * 4.0 * 2.5,
     };
-    let cap = if matches!(engine, PhasingEngine::Haploid) { 0.80 } else { 0.90 };
-    selphi_step!("Estimated working memory ~{:.1} GB ({} engine, system {:.1} GB, cap {:.0}%)",
-        est_gb, if matches!(engine, PhasingEngine::Haploid) { "haploid" } else { "diploid" },
-        sys_gb, cap * 100.0);
-    if est_gb > cap * sys_gb {
-        selphi_error!("Panel too large for single-shot {} panel phasing (~{:.0} GB > {:.0}% of {:.0} GB RAM).",
-            if matches!(engine, PhasingEngine::Haploid) { "haploid" } else { "diploid" },
-            est_gb, cap * 100.0, sys_gb);
-        if matches!(engine, PhasingEngine::Haploid) {
-            selphi_error!("The haploid engine windows at 40 cM and is not memory-suited to dense WGS panel phasing.");
-            selphi_error!("Use --phasing-engine diploid for panel phasing, or wait for region chunking (biobank scale).");
-        } else {
-            selphi_error!("Region chunking for biobank-scale panels is not yet implemented.");
-        }
-        std::process::exit(1);
-    }
-
-    // 6. Phase.
-    selphi_step!("Phasing engine: {}", if engine == PhasingEngine::Haploid { "haploid" } else { "diploid" });
-    let (phased, _conf, _ri) = match engine {
-        PhasingEngine::Haploid => {
-            selphi::haploid::phase_panel(
-                &cohort_geno, &bp, &map_bp, &map_cm,
-                n_var, n_samples, args.seed, args.threads, args.max_windows,
-            )
-        }
-        _ => {
-            selphi::diploid::diploid_phase_panel(
-                &cohort_geno, &bp, &map_bp, &map_cm,
-                n_var, n_samples, args.seed, args.threads, args.max_cond_haps,
-            )
-        }
+    let max_chunk_vars = if args.chunk_vars > 0 {
+        args.chunk_vars // explicit override (testing / manual control)
+    } else {
+        ((budget_gb * 1e9 / per_var_bytes) as usize).max(20_000)
     };
-    let _ = &phased;
+    let phased: Vec<u8> = if n_var <= max_chunk_vars {
+        // Single-shot: fits the budget.
+        selphi_step!("Phasing {} engine, single-shot ({} variants, budget {:.0} GB/chunk)",
+            if engine == PhasingEngine::Haploid { "haploid" } else { "diploid" }, n_var, budget_gb);
+        phase_cohort(engine, args, &cohort_geno, &bp, &map_bp, &map_cm, n_var, n_samples).0
+    } else {
+        // Auto-chunked + ligated.
+        phase_panel_chunked(
+            engine, args, &cohort_geno, &bp, &map_bp, &map_cm,
+            n_var, n_samples, max_chunk_vars,
+        )
+    };
     selphi_step!("Phasing complete [{:.0}s | {:.0} MB]", start.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
 
     // 7. Output phased VCF.gz (always — the canonical genotype output).
