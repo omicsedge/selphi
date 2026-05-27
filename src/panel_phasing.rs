@@ -29,9 +29,9 @@ struct Cohort {
     was_phased: bool,
 }
 
-/// Read a cohort for panel phasing from VCF.gz or SRP. The existing phase
-/// (if any) is irrelevant — graph construction uses genotypes only, so an
-/// already-phased panel (SRP, or phased VCF) is simply re-phased.
+/// Read a cohort for panel phasing from VCF.gz, SRP, or BREF3. The existing
+/// phase (if any) is irrelevant — graph construction uses genotypes only, so
+/// an already-phased panel (SRP/BREF3, or phased VCF) is simply re-phased.
 fn read_cohort(input_path: &str) -> Cohort {
     if input_path.ends_with(".srp") {
         // Re-phase an existing SRP panel: extract every variant's alleles
