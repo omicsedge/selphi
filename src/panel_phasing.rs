@@ -34,98 +34,112 @@ struct Cohort {
 /// an already-phased panel (SRP/BREF3, or phased VCF) is simply re-phased.
 fn read_cohort(input_path: &str) -> Cohort {
     if input_path.ends_with(".srp") {
-        // Re-phase an existing SRP panel: extract every variant's alleles
-        // across all panel haps into a cohort genotype array.
-        let srp = SrpReader::open(input_path, 16)
-            .unwrap_or_else(|e| { selphi_error!("Cannot open SRP {}: {}", input_path, e); std::process::exit(1); });
-        let n_var = srp.n_variants();
-        let n_haps = srp.n_haps();
-        let n_samples = n_haps / 2;
-        let all_idx: Vec<usize> = (0..n_var).collect();
-        let bm = srp.extract_ref_alleles_bitmatrix(&all_idx);
-        let mut geno = vec![0u8; n_var * n_haps];
-        for v in 0..n_var {
-            let base = v * n_haps;
-            for h in 0..n_haps {
-                if bm.get(v, h) { geno[base + h] = 1; }
-            }
-        }
-        let markers: Vec<TargetMarker> = srp.variants.iter().map(|vv| TargetMarker {
-            chrom: vv.chr.clone(), pos: vv.pos,
-            ref_allele: vv.ref_allele.clone(), alt_allele: vv.alt_allele.clone(),
-            ref_hash: String::new(), alt_hash: String::new(),
-        }).collect();
-        let sample_names = if srp.sample_ids.len() == n_samples {
-            srp.sample_ids.clone()
-        } else {
-            (0..n_samples).map(|i| format!("sample_{i}")).collect()
-        };
-        Cohort { sample_names, markers, geno, n_var, n_samples, was_phased: true }
+        cohort_from_srp(input_path)
     } else if input_path.ends_with(".bref3") {
-        // Re-phase an existing BREF3 panel. Two passes — a cheap meta-only
-        // count + marker collection, then an allele-fill pass into a genotype
-        // array allocated EXACTLY once. This avoids the Vec-doubling transient
-        // (up to 2× the n_var × n_haps array) that could OOM on a biobank
-        // panel; same two-pass pattern as `build_srp_from_bref3`.
-        let p = Path::new(input_path);
-        let mut s1 = open_bref3_stream(p)
-            .unwrap_or_else(|e| { selphi_error!("Cannot open BREF3 {}: {}", input_path, e); std::process::exit(1); });
-        let sample_names = s1.sample_ids.clone();
-        let n_samples = sample_names.len();
-        let n_haps = s1.n_haps;
-        let mut markers: Vec<TargetMarker> = Vec::new();
-        while let Some((chrom, pos, ref_a, alt_a, _id)) = s1.next_variant_meta_only()
-            .unwrap_or_else(|e| { selphi_error!("BREF3 read error: {}", e); std::process::exit(1); }) {
-            markers.push(TargetMarker {
-                chrom, pos: pos as i64, ref_allele: ref_a, alt_allele: alt_a,
-                ref_hash: String::new(), alt_hash: String::new(),
-            });
-        }
-        drop(s1);
-        let n_var = markers.len();
-        if n_var == 0 {
-            selphi_error!("BREF3 cohort has no variants: {}", input_path);
-            std::process::exit(1);
-        }
-        let mut geno = vec![0u8; n_var * n_haps];
-        let mut n_multi = 0usize;
-        let mut s2 = open_bref3_stream(p)
-            .unwrap_or_else(|e| { selphi_error!("Cannot reopen BREF3 {}: {}", input_path, e); std::process::exit(1); });
-        let mut vi = 0usize;
-        while let Some(v) = s2.next_variant()
-            .unwrap_or_else(|e| { selphi_error!("BREF3 read error: {}", e); std::process::exit(1); }) {
-            if vi >= n_var { break; }
-            if v.alt_alleles.len() > 1 { n_multi += 1; }
-            let base = vi * n_haps;
-            for (h, &a) in v.alleles.iter().enumerate() {
-                if h < n_haps && a != 0 { geno[base + h] = 1; }
-            }
-            vi += 1;
-        }
-        drop(s2);
-        if vi != n_var {
-            selphi_error!("BREF3 variant count mismatch between passes ({} vs {}) — corrupt file?", vi, n_var);
-            std::process::exit(1);
-        }
-        if n_multi > 0 {
-            selphi_step!("BREF3: {} multi-allelic sites binarized (any ALT → 1)", n_multi);
-        }
-        Cohort { sample_names, markers, geno, n_var, n_samples, was_phased: true }
+        cohort_from_bref3(input_path)
     } else {
-        let (sample_names, markers, genotypes, was_phased) = read_cohort_vcf(input_path);
-        let n_var = markers.len();
-        let n_samples = sample_names.len();
-        let n_haps = n_samples * 2;
-        let mut geno = vec![0u8; n_var * n_haps];
-        for (v, gv) in genotypes.iter().enumerate() {
-            let base = v * n_haps;
-            for (s, g) in gv.iter().enumerate() {
-                geno[base + s * 2] = g[0];
-                geno[base + s * 2 + 1] = g[1];
-            }
-        }
-        Cohort { sample_names, markers, geno, n_var, n_samples, was_phased }
+        cohort_from_vcf(input_path)
     }
+}
+
+/// Re-phase an existing SRP panel: extract every variant's alleles across all
+/// panel haps into a cohort genotype array.
+fn cohort_from_srp(input_path: &str) -> Cohort {
+    let srp = SrpReader::open(input_path, 16)
+        .unwrap_or_else(|e| { selphi_error!("Cannot open SRP {}: {}", input_path, e); std::process::exit(1); });
+    let n_var = srp.n_variants();
+    let n_haps = srp.n_haps();
+    let n_samples = n_haps / 2;
+    let all_idx: Vec<usize> = (0..n_var).collect();
+    let bm = srp.extract_ref_alleles_bitmatrix(&all_idx);
+    let mut geno = vec![0u8; n_var * n_haps];
+    for v in 0..n_var {
+        let base = v * n_haps;
+        for h in 0..n_haps {
+            if bm.get(v, h) { geno[base + h] = 1; }
+        }
+    }
+    let markers: Vec<TargetMarker> = srp.variants.iter().map(|vv| TargetMarker {
+        chrom: vv.chr.clone(), pos: vv.pos,
+        ref_allele: vv.ref_allele.clone(), alt_allele: vv.alt_allele.clone(),
+        ref_hash: String::new(), alt_hash: String::new(),
+    }).collect();
+    let sample_names = if srp.sample_ids.len() == n_samples {
+        srp.sample_ids.clone()
+    } else {
+        (0..n_samples).map(|i| format!("sample_{i}")).collect()
+    };
+    Cohort { sample_names, markers, geno, n_var, n_samples, was_phased: true }
+}
+
+/// Re-phase an existing BREF3 panel. Two passes — a cheap meta-only count +
+/// marker collection, then an allele-fill pass into a genotype array allocated
+/// EXACTLY once. This avoids the Vec-doubling transient (up to 2× the
+/// n_var × n_haps array) that could OOM on a biobank panel; same two-pass
+/// pattern as `build_srp_from_bref3`.
+fn cohort_from_bref3(input_path: &str) -> Cohort {
+    let p = Path::new(input_path);
+    let mut s1 = open_bref3_stream(p)
+        .unwrap_or_else(|e| { selphi_error!("Cannot open BREF3 {}: {}", input_path, e); std::process::exit(1); });
+    let sample_names = s1.sample_ids.clone();
+    let n_samples = sample_names.len();
+    let n_haps = s1.n_haps;
+    let mut markers: Vec<TargetMarker> = Vec::new();
+    while let Some((chrom, pos, ref_a, alt_a, _id)) = s1.next_variant_meta_only()
+        .unwrap_or_else(|e| { selphi_error!("BREF3 read error: {}", e); std::process::exit(1); }) {
+        markers.push(TargetMarker {
+            chrom, pos: pos as i64, ref_allele: ref_a, alt_allele: alt_a,
+            ref_hash: String::new(), alt_hash: String::new(),
+        });
+    }
+    drop(s1);
+    let n_var = markers.len();
+    if n_var == 0 {
+        selphi_error!("BREF3 cohort has no variants: {}", input_path);
+        std::process::exit(1);
+    }
+    let mut geno = vec![0u8; n_var * n_haps];
+    let mut n_multi = 0usize;
+    let mut s2 = open_bref3_stream(p)
+        .unwrap_or_else(|e| { selphi_error!("Cannot reopen BREF3 {}: {}", input_path, e); std::process::exit(1); });
+    let mut vi = 0usize;
+    while let Some(v) = s2.next_variant()
+        .unwrap_or_else(|e| { selphi_error!("BREF3 read error: {}", e); std::process::exit(1); }) {
+        if vi >= n_var { break; }
+        if v.alt_alleles.len() > 1 { n_multi += 1; }
+        let base = vi * n_haps;
+        for (h, &a) in v.alleles.iter().enumerate() {
+            if h < n_haps && a != 0 { geno[base + h] = 1; }
+        }
+        vi += 1;
+    }
+    drop(s2);
+    if vi != n_var {
+        selphi_error!("BREF3 variant count mismatch between passes ({} vs {}) — corrupt file?", vi, n_var);
+        std::process::exit(1);
+    }
+    if n_multi > 0 {
+        selphi_step!("BREF3: {} multi-allelic sites binarized (any ALT → 1)", n_multi);
+    }
+    Cohort { sample_names, markers, geno, n_var, n_samples, was_phased: true }
+}
+
+/// Read an (un)phased cohort from a VCF.gz via `read_cohort_vcf`, packing the
+/// per-sample diploid genotypes into the flat n_var × n_haps array.
+fn cohort_from_vcf(input_path: &str) -> Cohort {
+    let (sample_names, markers, genotypes, was_phased) = read_cohort_vcf(input_path);
+    let n_var = markers.len();
+    let n_samples = sample_names.len();
+    let n_haps = n_samples * 2;
+    let mut geno = vec![0u8; n_var * n_haps];
+    for (v, gv) in genotypes.iter().enumerate() {
+        let base = v * n_haps;
+        for (s, g) in gv.iter().enumerate() {
+            geno[base + s * 2] = g[0];
+            geno[base + s * 2 + 1] = g[1];
+        }
+    }
+    Cohort { sample_names, markers, geno, n_var, n_samples, was_phased }
 }
 
 /// Parse "chr:start-end", "chr:start", or "chr" → (chrom, start_bp, end_bp).
@@ -485,55 +499,63 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
         .unwrap_or_else(|e| { selphi_error!("Failed to write phased panel VCF: {}", e); std::process::exit(1); });
     selphi_step!("Phased panel VCF: {}", out_vcf.display());
 
-    // 8. Optional native reference-format outputs. The phased panel is written
-    //    straight into the live tiled SRP (the format the imputation reader
-    //    consumes) with no BCF/VCF round-trip; BREF3 reuses the byte-identical
-    //    SRP→BREF3 converter. Both are derived from the in-memory `phased`
-    //    array, so this is cheap relative to phasing itself.
-    if args.srp || args.bref3 {
-        // Clean base name: strip a trailing .vcf.gz / .gz / .vcf so the
-        // reference files are `<base>.srp` / `<base>.bref3`, not `<base>.vcf.srp`.
-        let mut base = out_path.clone();
-        if base.extension().is_some_and(|e| e == "gz") { base.set_extension(""); }
-        if base.extension().is_some_and(|e| e == "vcf") { base.set_extension(""); }
-
-        let pvs: Vec<PanelVariant> = markers.iter().map(|m| PanelVariant {
-            chrom: &m.chrom, pos: m.pos,
-            ref_allele: &m.ref_allele, alt_allele: &m.alt_allele, id: ".",
-        }).collect();
-
-        // SRP is needed for either output; write it to its final location when
-        // --srp was requested, otherwise to a tempdir on the same filesystem
-        // (kept off /tmp) that is removed once BREF3 is built.
-        let srp_out = base.with_extension("srp");
-        let mut _tmp_keep: Option<tempfile::TempDir> = None;
-        let srp_path: PathBuf = if args.srp {
-            srp_out.clone()
-        } else {
-            let parent = base.parent().filter(|p| !p.as_os_str().is_empty())
-                .map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
-            let td = tempfile::Builder::new().prefix(".selphi_panel_srp_").tempdir_in(&parent)
-                .unwrap_or_else(|e| { selphi_error!("Cannot create temp dir for SRP: {}", e); std::process::exit(1); });
-            let p = td.path().join("panel.srp");
-            _tmp_keep = Some(td);
-            p
-        };
-
-        build_srp_from_panel(&phased, &pvs, &sample_names, n_haps, &srp_path)
-            .unwrap_or_else(|e| { selphi_error!("Failed to write phased panel SRP: {}", e); std::process::exit(1); });
-        if args.srp {
-            selphi_step!("Phased panel SRP: {}", srp_out.display());
-        }
-
-        if args.bref3 {
-            let bref3_out = base.with_extension("bref3");
-            write_bref3_from_srp(&srp_path, &bref3_out)
-                .unwrap_or_else(|e| { selphi_error!("Failed to write phased panel BREF3: {}", e); std::process::exit(1); });
-            selphi_step!("Phased panel BREF3: {}", bref3_out.display());
-        }
-        // _tmp_keep (if any) drops here → intermediate SRP removed.
-    }
+    // 8. Optional native reference-format outputs (--srp / --bref3).
+    write_reference_panels(args, &phased, &markers, &sample_names, n_haps, &out_path);
 
     selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB",
         start.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
+}
+
+/// Write the optional native reference-panel outputs requested via `--srp` /
+/// `--bref3`. The phased panel is written straight into the live tiled SRP
+/// (the format the imputation reader consumes) with no BCF/VCF round-trip;
+/// BREF3 reuses the byte-identical SRP→BREF3 converter. Both derive from the
+/// in-memory `phased` array, so this is cheap relative to phasing itself.
+fn write_reference_panels(
+    args: &Args, phased: &[u8], markers: &[TargetMarker],
+    sample_names: &[String], n_haps: usize, out_path: &Path,
+) {
+    if !(args.srp || args.bref3) { return; }
+
+    // Clean base name: strip a trailing .vcf.gz / .gz / .vcf so the reference
+    // files are `<base>.srp` / `<base>.bref3`, not `<base>.vcf.srp`.
+    let mut base = out_path.to_path_buf();
+    if base.extension().is_some_and(|e| e == "gz") { base.set_extension(""); }
+    if base.extension().is_some_and(|e| e == "vcf") { base.set_extension(""); }
+
+    let pvs: Vec<PanelVariant> = markers.iter().map(|m| PanelVariant {
+        chrom: &m.chrom, pos: m.pos,
+        ref_allele: &m.ref_allele, alt_allele: &m.alt_allele, id: ".",
+    }).collect();
+
+    // SRP is needed for either output; write it to its final location when
+    // --srp was requested, otherwise to a tempdir on the same filesystem
+    // (kept off /tmp) that is removed once BREF3 is built.
+    let srp_out = base.with_extension("srp");
+    let mut _tmp_keep: Option<tempfile::TempDir> = None;
+    let srp_path: PathBuf = if args.srp {
+        srp_out.clone()
+    } else {
+        let parent = base.parent().filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+        let td = tempfile::Builder::new().prefix(".selphi_panel_srp_").tempdir_in(&parent)
+            .unwrap_or_else(|e| { selphi_error!("Cannot create temp dir for SRP: {}", e); std::process::exit(1); });
+        let p = td.path().join("panel.srp");
+        _tmp_keep = Some(td);
+        p
+    };
+
+    build_srp_from_panel(phased, &pvs, sample_names, n_haps, &srp_path)
+        .unwrap_or_else(|e| { selphi_error!("Failed to write phased panel SRP: {}", e); std::process::exit(1); });
+    if args.srp {
+        selphi_step!("Phased panel SRP: {}", srp_out.display());
+    }
+
+    if args.bref3 {
+        let bref3_out = base.with_extension("bref3");
+        write_bref3_from_srp(&srp_path, &bref3_out)
+            .unwrap_or_else(|e| { selphi_error!("Failed to write phased panel BREF3: {}", e); std::process::exit(1); });
+        selphi_step!("Phased panel BREF3: {}", bref3_out.display());
+    }
+    // _tmp_keep (if any) drops here → intermediate SRP removed.
 }
