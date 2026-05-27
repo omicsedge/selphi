@@ -160,9 +160,10 @@ pub fn system_ram_mb() -> f64 {
 /// Estimate peak memory for imputation/phasing and warn if insufficient.
 /// Call after loading SRP metadata + target intersection.
 ///
-/// Auto-reduces n_threads to fit in `mem_cap_frac * sys_ram` and ABORTS if
-/// even single-threaded would exceed the cap. Returns the effective
-/// thread count to use for subsequent rayon work. If the active rayon pool
+/// ADVISORY ONLY: warns (does not abort, does not reduce threads) if the
+/// estimate exceeds system RAM — the estimator deliberately over-estimates
+/// (see compute_estimate_mb), so aborting would falsely block valid runs.
+/// Returns n_threads unchanged. If the active rayon pool
 /// has more threads, the caller should wrap heavy work in
 /// `rayon::ThreadPoolBuilder::new().num_threads(N).build().unwrap().install(...)`.
 pub fn estimate_and_warn(

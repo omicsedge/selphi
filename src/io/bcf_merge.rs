@@ -294,7 +294,11 @@ fn merge_one_record(
     let filter_off = shared_filter_start(v0.shared)?;
     // FILTER for our records: 1B descriptor + 1B value = 2 bytes
     let post_filter_off = filter_off + 2;
-    let new_n_info: u16 = if is_chip { 3 } else if no_ap { 4 } else { 5 };
+    // INFO count is independent of --no-ap (that only drops the AP FORMAT
+    // fields): chip = AF,AC,AN (3); imputed = AF,AC,AN,DR2,IMP (5). Must match
+    // the non-batched encoder (bcf_encode declares 5) or htslib mis-parses.
+    let _ = no_ap;
+    let new_n_info: u16 = if is_chip { 3 } else { 5 };
 
     // ----- Build merged SHARED -----
     let mut out = Vec::with_capacity(8 + v0.l_shared * 2 + v0.l_indiv * rec_bufs.len());

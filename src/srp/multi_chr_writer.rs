@@ -156,7 +156,12 @@ pub fn build_multi_chr_srp(
                 let f: Vec<&str> = line.split('\t').collect();
                 if f.len() < 6 { continue; }
                 let cid: usize = f[0].parse().unwrap_or(0);
-                let chrom = if cid < contig_names.len() { &contig_names[cid] } else { f[0] };
+                // Refuse the silent fallback to the raw contig-id field (matches
+                // the hardened single-chr writer) — it would mislabel chromosomes.
+                let chrom = if cid < contig_names.len() { &contig_names[cid] } else {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                        "BCF contig id {} out of range (header has {} contigs)", cid, contig_names.len())));
+                };
                 let pos: i64 = f[1].parse().unwrap_or(0);
                 let ref_allele = f[2];
                 let alt_allele = f[3];
