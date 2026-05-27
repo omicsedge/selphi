@@ -177,14 +177,28 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
     let _ = &phased;
     selphi_step!("Phasing complete [{:.0}s | {:.0} MB]", start.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
 
-    // 7. Output phased VCF.gz.
+    // 7. Output phased VCF.gz (always — the canonical genotype output).
     let out_path = PathBuf::from(output_path);
     let out_vcf = if out_path.extension().is_none_or(|e| e != "gz") {
         out_path.with_extension("vcf.gz")
-    } else { out_path };
+    } else { out_path.clone() };
     write_panel_vcf(&phased, &markers, &sample_names, n_var, n_haps, &out_vcf)
         .unwrap_or_else(|e| { selphi_error!("Failed to write phased panel VCF: {}", e); std::process::exit(1); });
-    selphi_step!("Phased panel: {}", out_vcf.display());
+    selphi_step!("Phased panel VCF: {}", out_vcf.display());
+
+    // 8. Optional reference-format outputs. The current native VCF→SRP path
+    //    (`build_srp`) emits the DEPRECATED ZIP SRP that today's reader
+    //    rejects; the only producer of the live tiled SRP format is the BCF
+    //    path (`build_srp_from_bcf_native`). A native panel BCF writer is
+    //    needed to wire --srp/--bref3 cleanly — TODO. For now, point the
+    //    user at the working chain rather than emit an unusable file.
+    if args.srp || args.bref3 {
+        selphi_info!("  NOTE: native --srp/--bref3 output is not wired yet (needs a panel BCF writer).");
+        selphi_info!("  Build a reference from the phased VCF with:");
+        selphi_info!("    bcftools view {} -Ob -o panel.bcf && bcftools index panel.bcf", out_vcf.display());
+        selphi_info!("    selphi --prepare-reference-from panel.bcf --out panel{}",
+            if args.bref3 { "  (then --prepare-reference-from panel.srp --out panel.bref3)" } else { "" });
+    }
 
     selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB",
         start.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
