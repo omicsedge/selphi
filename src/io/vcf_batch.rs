@@ -365,15 +365,17 @@ fn build_vid_prefixes(srp: &SrpReader, start: usize, end: usize) -> Vec<Vec<u8>>
     let end = end.min(n_var);
     (start..end).map(|i| {
         let id = &srp.ids[i];
-        let parts: Vec<&str> = id.splitn(4, '-').collect();
-        if parts.len() < 4 { return Vec::new(); }
+        // Right-split so chrom may contain '-' (rare assembly contigs).
+        let (chrom, pos, ref_a, alt) = match crate::srp::helpers::parse_synthetic_id(id) {
+            Some(x) => x, None => return Vec::new(),
+        };
         let oid = if !srp.original_ids[i].is_empty() { &srp.original_ids[i] } else { id };
         let mut prefix = Vec::with_capacity(40);
-        prefix.extend_from_slice(parts[0].as_bytes()); prefix.push(b'\t');
-        prefix.extend_from_slice(parts[1].as_bytes()); prefix.push(b'\t');
+        prefix.extend_from_slice(chrom.as_bytes()); prefix.push(b'\t');
+        prefix.extend_from_slice(pos.as_bytes()); prefix.push(b'\t');
         prefix.extend_from_slice(oid.as_bytes()); prefix.push(b'\t');
-        prefix.extend_from_slice(parts[2].as_bytes()); prefix.push(b'\t');
-        prefix.extend_from_slice(parts[3].as_bytes());
+        prefix.extend_from_slice(ref_a.as_bytes()); prefix.push(b'\t');
+        prefix.extend_from_slice(alt.as_bytes());
         prefix
     }).collect()
 }

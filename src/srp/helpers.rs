@@ -53,6 +53,19 @@ pub fn decode_strings(compressed: &[u8], filter_empty: bool) -> std::io::Result<
     })
 }
 
+/// Parse a synthetic SRP variant ID of the form "chrom-pos-ref-alt". Splits
+/// from the RIGHT so chrom may contain '-' (rare but valid for some
+/// assemblies). Returns Some((chrom, pos, ref, alt)) on success, None if the
+/// id has fewer than 4 '-'-separated fields.
+pub fn parse_synthetic_id(id: &str) -> Option<(&str, &str, &str, &str)> {
+    let mut iter = id.rsplitn(4, '-');
+    let alt = iter.next()?;
+    let ref_a = iter.next()?;
+    let pos = iter.next()?;
+    let chrom = iter.next()?;
+    Some((chrom, pos, ref_a, alt))
+}
+
 /// Validate the byte lengths of one SRP variant record (CHROM/REF/ALT).
 /// Returns an error if any exceeds 255 bytes — the on-disk format encodes the
 /// length as a `u8`, so without this check long alleles were silently truncated

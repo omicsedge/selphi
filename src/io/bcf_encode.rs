@@ -484,17 +484,18 @@ pub struct BcfVariantInfo {
 pub fn parse_variant_infos(ids: &[String], original_ids: &[String], start: usize, end: usize) -> Vec<BcfVariantInfo> {
     (start..end).map(|i| {
         let id_str = &ids[i];
-        let parts: Vec<&str> = id_str.splitn(4, '-').collect();
-        if parts.len() < 4 {
-            return BcfVariantInfo { pos_0based: 0, id: b".".to_vec(), ref_allele: b"N".to_vec(), alt_allele: b"N".to_vec() };
-        }
-        let pos: i32 = parts[1].parse().unwrap_or(1) - 1; // 1-based → 0-based
+        // Right-split so chrom may contain '-' (rare assembly contigs).
+        let (_chrom, pos_str, ref_a, alt) = match crate::srp::helpers::parse_synthetic_id(id_str) {
+            Some(x) => x,
+            None => return BcfVariantInfo { pos_0based: 0, id: b".".to_vec(), ref_allele: b"N".to_vec(), alt_allele: b"N".to_vec() },
+        };
+        let pos: i32 = pos_str.parse().unwrap_or(1) - 1; // 1-based → 0-based
         let oid = if !original_ids[i].is_empty() { &original_ids[i] } else { id_str };
         BcfVariantInfo {
             pos_0based: pos,
             id: oid.as_bytes().to_vec(),
-            ref_allele: parts[2].as_bytes().to_vec(),
-            alt_allele: parts[3].as_bytes().to_vec(),
+            ref_allele: ref_a.as_bytes().to_vec(),
+            alt_allele: alt.as_bytes().to_vec(),
         }
     }).collect()
 }
