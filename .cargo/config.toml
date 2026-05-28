@@ -24,3 +24,11 @@ rustflags = ["-C", "target-cpu=neoverse-n1"]
 
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "target-cpu=apple-m1"]
+
+# Static musl build — fully self-contained ELF that runs on any glibc/musl
+# Linux without a runtime libc dependency. Produces a single portable binary
+# for distribution. Requires `musl-tools` (apt) for the linker. Build with:
+#   cargo build --release --target x86_64-unknown-linux-musl
+[target.x86_64-unknown-linux-musl]
+linker = "musl-gcc"
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+crt-static"]
