@@ -1019,10 +1019,20 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                             let srp_ref = &srp_clone;
                             let ptr = chunks_ptr as usize;
                             s.spawn(move || {
-                                let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut Option<selphi::srp::CscChunk>, n_total) };
+                                let base = ptr as *mut Option<selphi::srp::CscChunk>;
                                 let mut i = if worker == 0 { n_workers } else { worker }; // worker 0 skips chunk 0 (already probed)
                                 while i < n_preload {
-                                    slice[i] = Some(srp_ref.load_chunk_from_source(first_c + i));
+                                    // SAFETY: each `i` is owned by exactly one worker (strided
+                                    // by n_workers from distinct offsets), so writes are to
+                                    // disjoint slots. We use raw `*mut` + `ptr::write` instead
+                                    // of `slice::from_raw_parts_mut` so we never construct
+                                    // overlapping `&mut [T]` references (which is UB even when
+                                    // the actual accesses are disjoint). The slot was
+                                    // pre-initialised to `None` (no heap owned), so
+                                    // ptr::write — which skips the destructor — leaks nothing.
+                                    unsafe {
+                                        std::ptr::write(base.add(i), Some(srp_ref.load_chunk_from_source(first_c + i)));
+                                    }
                                     i += n_workers;
                                 }
                             });
