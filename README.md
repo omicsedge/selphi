@@ -34,7 +34,15 @@ Optionally install to PATH:
 cargo install --path .
 ```
 
-Runs natively on Linux x86_64, macOS x86_64, and macOS Apple Silicon (aarch64). SIMD acceleration is automatic: AVX-512 on x86, NEON on ARM.
+Runs natively on Linux x86_64, macOS x86_64, and macOS Apple Silicon (aarch64). One binary, runtime SIMD dispatch:
+
+- **x86_64 baseline**: AVX2 + FMA + BMI2 (`x86-64-v3`, Haswell 2013+) — works on every modern Intel/AMD CPU and every current AWS instance family (incl. AMD-based c5a/c6a/c7a/m5a).
+- **AVX-512 fast path** (diploid HMM only): used automatically when AVX-512F+DQ is detected at startup (c5/c6/c7i etc.). Selecting between paths is one cached check per process; no recompilation.
+- **aarch64**: NEON.
+
+The binary prints its chosen SIMD path on startup: `[selphi] SIMD: AVX-512F+DQ` or `[selphi] SIMD: AVX2 (scalar fallback for diploid HMM)`. Set `SELPHI_FORCE_SCALAR=1` to force the scalar path on AVX-512 hosts (for parity testing). Set `SELPHI_QUIET_SIMD=1` to suppress the line.
+
+Cross-host validation: bit-identical dosage output between forced-scalar on an AVX-512 build host and the natural scalar path on AMD EPYC 7571 (Zen1, no AVX-512). |ΔR²| ≤ 0.0002 OVERALL vs AVX-512 path on chr22 1KG 801 samples.
 
 ### Genetic maps
 
