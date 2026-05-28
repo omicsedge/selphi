@@ -38,13 +38,17 @@ pub fn parse_variants_bin(data: &[u8], n: usize) -> std::io::Result<Vec<Variant>
     Ok(out)
 }
 
-/// Decompress and split newline-delimited strings.
-pub fn decode_strings(compressed: &[u8], filter_empty: bool) -> Vec<String> {
-    let raw = zstd::decode_all(Cursor::new(compressed)).unwrap_or_default();
+/// Decompress and split newline-delimited strings. Propagates zstd errors
+/// (was `unwrap_or_default()` — a corrupt section would silently produce an
+/// empty list and downstream code would emit "" sample IDs / variant IDs).
+pub fn decode_strings(compressed: &[u8], filter_empty: bool) -> std::io::Result<Vec<String>> {
+    let raw = zstd::decode_all(Cursor::new(compressed)).map_err(|e| std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("decode_strings: zstd decompress failed (corrupt SRP section): {}", e)))?;
     let s = String::from_utf8_lossy(&raw);
-    if filter_empty {
+    Ok(if filter_empty {
         s.split('\n').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
     } else {
         s.split('\n').map(|s| s.to_string()).collect()
-    }
+    })
 }
