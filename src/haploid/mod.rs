@@ -500,14 +500,17 @@ fn phase_genotypes_inner(
                             0, true, 0)
                     }
                 }).collect();
-                // Merge batches
+                // Merge batches. Each batch buffer is now LOCAL-indexed
+                // (covering only its [bs, be) rows, not the full window), so
+                // we read `batch[(step - bs) * n_targ + t]` instead of the
+                // previous global `batch[step * n_targ + t]`.
                 let mut out = vec![-1i32; it_n_steps * n_targ_haps];
                 for (b, batch) in batches.iter().enumerate() {
                     let bs = b * it_spb;
                     let be = ((b + 1) * it_spb).min(it_n_steps);
                     for step in bs..be {
                         for t in 0..n_targ_haps {
-                            out[step * n_targ_haps + t] = batch[step * n_targ_haps + t];
+                            out[step * n_targ_haps + t] = batch[(step - bs) * n_targ_haps + t];
                         }
                     }
                 }
