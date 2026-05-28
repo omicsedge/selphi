@@ -52,3 +52,26 @@ pub fn decode_strings(compressed: &[u8], filter_empty: bool) -> std::io::Result<
         s.split('\n').map(|s| s.to_string()).collect()
     })
 }
+
+/// Validate the byte lengths of one SRP variant record (CHROM/REF/ALT).
+/// Returns an error if any exceeds 255 bytes — the on-disk format encodes the
+/// length as a `u8`, so without this check long alleles were silently truncated
+/// to 255, producing a panel with mangled CHROM/REF/ALT strings (real risk
+/// for biobank panels with large indels). Call before pushing the record.
+pub fn check_record_lens(chrom: &[u8], ref_allele: &[u8], alt_allele: &[u8]) -> std::io::Result<()> {
+    fn check(field: &str, b: &[u8]) -> std::io::Result<()> {
+        if b.len() > 255 {
+            let preview: String = b.iter().take(32)
+                .map(|&c| if c.is_ascii_graphic() { c as char } else { '.' }).collect();
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!(
+                "SRP record {} length {} exceeds the 255-byte u8 limit (preview: '{}...'). \
+                 Pre-normalize with `bcftools norm -m-` or filter alleles >255 bp before building the SRP.",
+                field, b.len(), preview)));
+        }
+        Ok(())
+    }
+    check("CHROM", chrom)?;
+    check("REF", ref_allele)?;
+    check("ALT", alt_allele)?;
+    Ok(())
+}

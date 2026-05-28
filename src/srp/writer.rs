@@ -446,7 +446,7 @@ fn build_srp_from_bcf_native(
                 let chr_b = chrom.as_bytes();
                 let ref_b = ref_allele.as_bytes();
                 let alt_b = alt_allele.as_bytes();
-                vbin.push(chr_b.len().min(255) as u8);
+                super::helpers::check_record_lens(chr_b, ref_b, alt_b)?; vbin.push(chr_b.len().min(255) as u8);
                 vbin.push(ref_b.len().min(255) as u8);
                 vbin.push(alt_b.len().min(255) as u8);
                 vbin.extend_from_slice(&chr_b[..chr_b.len().min(255)]);
@@ -539,7 +539,7 @@ pub fn build_srp_from_bref3(
         let ref_b = ref_allele.as_bytes();
         let alt_b = alt_allele.as_bytes();
         vbin.extend_from_slice(&pos.to_le_bytes());
-        vbin.push(chr_b.len().min(255) as u8);
+        super::helpers::check_record_lens(chr_b, ref_b, alt_b)?; vbin.push(chr_b.len().min(255) as u8);
         vbin.push(ref_b.len().min(255) as u8);
         vbin.push(alt_b.len().min(255) as u8);
         vbin.extend_from_slice(&chr_b[..chr_b.len().min(255)]);
@@ -685,7 +685,7 @@ pub fn build_srp_from_panel(
         let ref_b = v.ref_allele.as_bytes();
         let alt_b = v.alt_allele.as_bytes();
         vbin.extend_from_slice(&v.pos.to_le_bytes());
-        vbin.push(chr_b.len().min(255) as u8);
+        super::helpers::check_record_lens(chr_b, ref_b, alt_b)?; vbin.push(chr_b.len().min(255) as u8);
         vbin.push(ref_b.len().min(255) as u8);
         vbin.push(alt_b.len().min(255) as u8);
         vbin.extend_from_slice(&chr_b[..chr_b.len().min(255)]);
@@ -845,7 +845,7 @@ fn compress_and_assemble(
             let chr_b = v.chrom.as_bytes();
             let ref_b = v.ref_allele.as_bytes();
             let alt_b = v.alt_allele.as_bytes();
-            vbin.push(chr_b.len().min(255) as u8);
+            super::helpers::check_record_lens(chr_b, ref_b, alt_b)?; vbin.push(chr_b.len().min(255) as u8);
             vbin.push(ref_b.len().min(255) as u8);
             vbin.push(alt_b.len().min(255) as u8);
             vbin.extend_from_slice(&chr_b[..chr_b.len().min(255)]);
@@ -978,7 +978,7 @@ pub fn build_srp_unified(
             let ref_b = ref_allele.as_bytes();
             let alt_b = alt_allele.as_bytes();
             vbin.extend_from_slice(&pos.to_le_bytes());
-            vbin.push(chr_b.len().min(255) as u8);
+            super::helpers::check_record_lens(chr_b, ref_b, alt_b)?; vbin.push(chr_b.len().min(255) as u8);
             vbin.push(ref_b.len().min(255) as u8);
             vbin.push(alt_b.len().min(255) as u8);
             vbin.extend_from_slice(&chr_b[..chr_b.len().min(255)]);
