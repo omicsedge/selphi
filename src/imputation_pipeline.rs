@@ -129,7 +129,8 @@ struct PbwtParams {
 /// Ne / n_ref stays near 36 across all of them.
 fn auto_calibrate_pbwt_params(args: &Args, n_ref: usize, n_chip: usize) -> PbwtParams {
     let match_length = args.match_length.unwrap_or_else(|| {
-        let ml = (n_ref as f64).log2() as usize - 7;
+        // saturating_sub: log2(n_ref) < 7 when n_ref < 128 would underflow usize.
+        let ml = ((n_ref as f64).log2() as usize).saturating_sub(7);
         ml.min(n_chip / 2000).max(5)
     });
     let log2_haps = (n_ref as f64).log2();
