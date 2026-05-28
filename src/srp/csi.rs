@@ -40,6 +40,13 @@ fn decompress_csi_header(path: &Path) -> io::Result<(Vec<u8>, i32, i32, usize, u
     let depth = i32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4;
     let l_aux = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
     off += l_aux;
+    // Guard against a corrupt l_aux that pushes off past data.len() — the
+    // subsequent 4-byte slice would otherwise panic with a generic OOB.
+    if off + 4 > data.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("CSI: aux block extends past EOF (l_aux={} pushes off to {} > total {})",
+                l_aux, off, data.len())));
+    }
     let n_ref = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
     if n_ref == 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "no reference sequences in CSI"));
