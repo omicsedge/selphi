@@ -28,14 +28,23 @@ pub struct TargetMarker {
 // Fast i64 parsing
 // ---------------------------------------------------------------------------
 
-/// Fast i64 parsing from ASCII bytes (no String allocation).
+/// Fast i64 parsing from ASCII bytes (no String allocation). Returns `-1`
+/// as a sentinel if the input contains no digits or any non-digit/non-sign/
+/// non-whitespace byte (so callers can `if pos < 1 { continue; }` to skip
+/// malformed VCF POS columns instead of silently accepting POS=0).
 #[inline]
 fn fast_parse_i64(bytes: &[u8]) -> i64 {
     let mut n: i64 = 0;
+    let mut seen_digit = false;
     for &b in bytes {
-        if b.is_ascii_digit() { n = n * 10 + (b - b'0') as i64; }
+        if b.is_ascii_digit() {
+            n = n * 10 + (b - b'0') as i64;
+            seen_digit = true;
+        } else if !(b.is_ascii_whitespace() || b == b'+') {
+            return -1; // any unexpected byte → invalid POS
+        }
     }
-    n
+    if seen_digit { n } else { -1 }
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +102,7 @@ pub fn read_cohort_vcf(
         if n_tabs < 9 { continue; }
 
         let pos: i64 = fast_parse_i64(&line[tabs[0]+1..tabs[1]]);
+        if pos < 1 { continue; } // skip malformed VCF POS (sentinel)
         let ref_bytes = &line[tabs[2]+1..tabs[3]];
         let alt_field = &line[tabs[3]+1..tabs[4]];
         let alt_end = alt_field.iter().position(|&b| b == b',').unwrap_or(alt_field.len());
@@ -213,6 +223,7 @@ pub fn read_target_vcf(
         // Parse POS (field 1: between tab[0] and tab[1])
         let pos_bytes = &line[tabs[0]+1..tabs[1]];
         let pos: i64 = fast_parse_i64(pos_bytes);
+        if pos < 1 { continue; } // skip malformed VCF POS (sentinel)
 
         // REF (field 3: between tab[2] and tab[3])
         let ref_bytes = &line[tabs[2]+1..tabs[3]];
@@ -547,6 +558,7 @@ pub fn read_target_vcf_multi_chr(
         if n_tabs < 9 { continue; }
 
         let pos: i64 = fast_parse_i64(&line[tabs[0]+1..tabs[1]]);
+        if pos < 1 { continue; } // skip malformed VCF POS (sentinel)
         let ref_bytes = &line[tabs[2]+1..tabs[3]];
         let alt_field = &line[tabs[3]+1..tabs[4]];
         let alt_end = alt_field.iter().position(|&b| b == b',').unwrap_or(alt_field.len());
