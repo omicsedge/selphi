@@ -355,7 +355,17 @@ fn parse_header(buf: &[u8]) -> io::Result<BcfHeader> {
             if !cf.is_empty() { cf.push('\n'); }
             cf.push_str(l);
         } else if l.starts_with("##FORMAT=<ID=GT,") {
-            if let Some(p) = l.find("IDX=") { let s = p+4; let e = l[s..].find([',', '>']).map(|p| s+p).unwrap_or(l.len()); gk = l[s..e].parse().unwrap_or(0); }
+            // GT FORMAT IDX must parse — silently falling back to 0 would read
+            // FORMAT id 0 (often PL/DP) as if it were GT (silent wrong genotypes).
+            if let Some(p) = l.find("IDX=") {
+                let s = p+4;
+                let e = l[s..].find([',', '>']).map(|p| s+p).unwrap_or(l.len());
+                gk = l[s..e].parse().map_err(|err| io::Error::new(io::ErrorKind::InvalidData,
+                    format!("BCF header: GT FORMAT IDX is not a number ({:?}): {}", &l[s..e], err)))?;
+            } else {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    "BCF header: ##FORMAT=<ID=GT,...> has no IDX= field (cannot identify the GT FORMAT key)"));
+            }
         } else if l.starts_with("#CHROM") {
             let f: Vec<&str> = l.split('\t').collect(); if f.len() > 9 { sn = f[9..].iter().map(|s| s.to_string()).collect(); }
         }

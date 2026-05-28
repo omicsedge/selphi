@@ -58,13 +58,13 @@ impl SrpReader {
         let variants = super::helpers::parse_variants_bin(&vraw, metadata.n_variants)?;
 
         // Sample IDs, IDs, Original IDs
-        let sample_ids = super::helpers::decode_strings(&super::helpers::read_section(&mut f)?, false);
-        let ids = super::helpers::decode_strings(&super::helpers::read_section(&mut f)?, true);
+        let sample_ids = super::helpers::decode_strings(&super::helpers::read_section(&mut f)?, false)?;
+        let ids = super::helpers::decode_strings(&super::helpers::read_section(&mut f)?, true)?;
         // original_IDs are per-variant with "" for variants lacking an rsID;
         // must NOT filter empties or the length stops matching n_variants and
         // every rsID is lost to the synthetic-ID fallback below. Downstream
         // writers already fall back to the synthetic ID per-variant when "".
-        let orig = super::helpers::decode_strings(&super::helpers::read_section(&mut f)?, false);
+        let orig = super::helpers::decode_strings(&super::helpers::read_section(&mut f)?, false)?;
         let original_ids = if orig.len() == metadata.n_variants { orig } else { ids.clone() };
 
         // Contig field (skip)

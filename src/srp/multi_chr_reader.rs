@@ -152,16 +152,29 @@ impl MultiChrSrpReader {
         let meta_json: JsonValue = serde_json::from_slice(&meta_raw)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+        // Required metadata: missing/wrong-type fields must hard-error, not
+        // silently turn the panel into a 0-sized phantom (downstream would
+        // allocate empty arrays and produce wrong-but-quiet output).
+        let req_u64 = |k: &str| -> io::Result<u64> {
+            meta_json.get(k).and_then(|v| v.as_u64()).ok_or_else(|| io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("multi-chr SRP metadata missing/invalid required field '{}'", k)))
+        };
         let global_meta = GlobalSrpMetadata {
-            n_chromosomes: meta_json.get("n_chromosomes").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-            n_haps: meta_json.get("n_haps").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-            n_samples: meta_json.get("n_samples").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            n_chromosomes: req_u64("n_chromosomes")? as usize,
+            n_haps: req_u64("n_haps")? as usize,
+            n_samples: req_u64("n_samples")? as usize,
             chromosomes: meta_json.get("chromosomes")
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                 .unwrap_or_default(),
             contig_fields: meta_json.get("contig_fields").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         };
+        if global_meta.n_chromosomes == 0 || global_meta.n_haps == 0 || global_meta.n_samples == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("multi-chr SRP metadata has zero dimensions: n_chromosomes={} n_haps={} n_samples={}",
+                    global_meta.n_chromosomes, global_meta.n_haps, global_meta.n_samples)));
+        }
 
         // Chromosome directory
         let mut buf4 = [0u8; 4];
@@ -254,12 +267,12 @@ impl MultiChrSrpReader {
         let variants = super::helpers::parse_variants_bin(&vraw, entry.n_variants as usize)?;
 
         // IDs
-        let ids = super::helpers::decode_strings(&super::helpers::read_section(&mut f)?, true);
+        let ids = super::helpers::decode_strings(&super::helpers::read_section(&mut f)?, true)?;
 
         // Original IDs — must NOT filter empties (per-variant, "" for no-rsID),
         // else the length stops matching n_variants and every rsID is lost to
         // the synthetic-ID fallback below (matches the single-chr reader fix).
-        let orig = super::helpers::decode_strings(&super::helpers::read_section(&mut f)?, false);
+        let orig = super::helpers::decode_strings(&super::helpers::read_section(&mut f)?, false)?;
         let original_ids = if orig.len() == entry.n_variants as usize { orig } else { ids.clone() };
 
         // Tile index

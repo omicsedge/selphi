@@ -343,7 +343,9 @@ pub fn write_phased_vcf(
     bgzf.finish()?;
 
     // Build a TBI index natively (no bcftools subprocess).
-    let _ = crate::srp::csi::build_tbi_index(output_path);
+    if let Err(e) = crate::srp::csi::build_tbi_index(output_path) {
+        selphi_info!("  WARN: TBI index build failed for {}: {} — VCF is still valid, just unindexed.", output_path.display(), e);
+    }
 
     Ok(())
 }
@@ -404,7 +406,9 @@ pub fn write_panel_vcf(
     w.flush()?;
     let mut bgzf = w.into_inner().map_err(|e| std::io::Error::other(e.to_string()))?;
     bgzf.finish()?;
-    let _ = crate::srp::csi::build_tbi_index(output_path);
+    if let Err(e) = crate::srp::csi::build_tbi_index(output_path) {
+        selphi_info!("  WARN: TBI index build failed for {}: {} — VCF is still valid, just unindexed.", output_path.display(), e);
+    }
     Ok(())
 }
 
