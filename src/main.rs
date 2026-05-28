@@ -27,20 +27,23 @@ use cli::Args;
 
 
 fn main() {
-    // Selphi is built with `target-cpu=native` and uses AVX-512 intrinsics in
-    // the diploid HMM hot path (run_hom_bm), without a scalar fallback. On a
-    // CPU lacking AVX-512 those would SIGILL mid-imputation. Fail fast & clear
-    // at startup so the user can rebuild with AVX2-only flags if needed.
+    // Probe & report the SIMD path picked for the diploid HMM hot loop. The
+    // baseline is `x86-64-v3` (AVX2/FMA/BMI2 — Haswell+ 2013); AVX-512F+DQ is
+    // a runtime upgrade. Setting `SELPHI_FORCE_SCALAR=1` forces the scalar
+    // path on AVX-512 hosts (used for parity testing).
     #[cfg(target_arch = "x86_64")]
-    {
-        // Diploid HMM uses both AVX-512F (_mm512_*) and AVX-512DQ
-        // (_mm512_insertf32x8 / _mm512_extractf32x8_ps).
-        if !std::arch::is_x86_feature_detected!("avx512f")
-            || !std::arch::is_x86_feature_detected!("avx512dq") {
-            eprintln!("ERROR: this Selphi binary requires AVX-512F+DQ (built with target-cpu=native using AVX-512 intrinsics in the diploid HMM). The running CPU does not support those.");
-            eprintln!("Run on an AVX-512-capable host (e.g. AWS r7a / r7i / c7a / m7i), or rebuild with `RUSTFLAGS=\"-C target-cpu=x86-64-v3\"` for AVX2-only hosts.");
-            std::process::exit(1);
-        }
+    if std::env::var("SELPHI_QUIET_SIMD").ok().as_deref() != Some("1") {
+        let forced_scalar = std::env::var("SELPHI_FORCE_SCALAR").ok().as_deref() == Some("1");
+        let has_avx512 = std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512dq");
+        let path = if forced_scalar {
+            "scalar (SELPHI_FORCE_SCALAR=1)"
+        } else if has_avx512 {
+            "AVX-512F+DQ"
+        } else {
+            "AVX2 (scalar fallback for diploid HMM)"
+        };
+        eprintln!("[selphi] SIMD: {}", path);
     }
 
     let args = Args::parse();

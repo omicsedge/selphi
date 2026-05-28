@@ -113,6 +113,27 @@ fn divss(a: f32, b: f32) -> f32 {
     a / b
 }
 
+/// Runtime AVX-512 capability check, cached after first call.
+///
+/// `SELPHI_FORCE_SCALAR=1` forces the scalar path even on AVX-512 hosts —
+/// used to validate scalar/SIMD parity on a single machine without spinning
+/// up non-AVX-512 hardware. The env var is read exactly once.
+///
+/// Requires both AVX-512F (base) and AVX-512DQ (`_mm512_extractf32x8_ps` /
+/// `_mm512_insertf32x8`). DQ has been on every server-class Intel since
+/// Skylake-X (2017) but not on Knights Landing/Mill.
+#[cfg(target_arch = "x86_64")]
+fn use_avx512() -> bool {
+    use std::sync::OnceLock;
+    static USE: OnceLock<bool> = OnceLock::new();
+    *USE.get_or_init(|| {
+        if std::env::var("SELPHI_FORCE_SCALAR").ok().as_deref() == Some("1") {
+            return false;
+        }
+        is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512dq")
+    })
+}
+
 // NEON helper: horizontal sum of two float32x4_t (8 floats total)
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -784,135 +805,187 @@ impl SegmentHmm {
         self.prob_sum_t = self.prob_sum_h.iter().sum();
     }
 
+    /// HOM transition step. Dispatches to AVX-512 / NEON / scalar based on
+    /// runtime CPU detection (cached). Set `SELPHI_FORCE_SCALAR=1` to bypass
+    /// the SIMD path on x86_64 for parity testing.
     fn run_hom_bm(&mut self, target_allele: bool, bm_row: *const u64, nt: f32, yt: f32) -> bool {
         #[cfg(target_arch = "x86_64")]
-        unsafe {
-            use std::arch::x86_64::*;
-            let nt_div = divss(nt, self.prob_sum_t);
-            let yt_div = divss(yt, self.n_cond as f32 * self.prob_sum_t);
-            let _mismatch_f = MISMATCH;
-            let emit_match = if target_allele { [_mismatch_f, 1.0f32] } else { [1.0f32, _mismatch_f] };
-
-            // AVX-512 path: process 2 conditioning haps per iteration (16 floats)
-            let _nt_512 = _mm512_set1_ps(nt_div);
-            let _tfreq_base = [
-                self.prob_sum_h[0], self.prob_sum_h[1], self.prob_sum_h[2], self.prob_sum_h[3],
-                self.prob_sum_h[4], self.prob_sum_h[5], self.prob_sum_h[6], self.prob_sum_h[7],
-                self.prob_sum_h[0], self.prob_sum_h[1], self.prob_sum_h[2], self.prob_sum_h[3],
-                self.prob_sum_h[4], self.prob_sum_h[5], self.prob_sum_h[6], self.prob_sum_h[7],
-            ];
-            let _factor_512 = _mm512_set1_ps(yt_div);
-            let _tfreq_512 = _mm512_mul_ps(_mm512_loadu_ps(_tfreq_base.as_ptr()), _factor_512);
-            let mut _sum_512 = _mm512_setzero_ps();
-
-            let prob = &mut self.prob;
-            let n_pairs = self.n_cond / 2;
-            let n_cond = self.n_cond;
-
-            for kp in 0..n_pairs {
-                let k0 = kp * 2;
-                let k1 = k0 + 1;
-                let ah0 = Self::bm_bit(bm_row, k0) as usize;
-                let ah1 = Self::bm_bit(bm_row, k1) as usize;
-                let base = k0 * HAP_NUMBER;
-                let mut _prob = _mm512_loadu_ps(prob[base..].as_ptr());
-                _prob = _mm512_fmadd_ps(_prob, _nt_512, _tfreq_512);
-                // Build per-pair emission: lower 8 for k0, upper 8 for k1
-                let e0 = emit_match[ah0];
-                let e1 = emit_match[ah1];
-                let _emit = _mm512_setr_ps(e0,e0,e0,e0,e0,e0,e0,e0, e1,e1,e1,e1,e1,e1,e1,e1);
-                _prob = _mm512_mul_ps(_prob, _emit);
-                _sum_512 = _mm512_add_ps(_sum_512, _prob);
-                _mm512_storeu_ps(prob[base..].as_mut_ptr(), _prob);
+        {
+            if use_avx512() {
+                unsafe { self.run_hom_bm_avx512(target_allele, bm_row, nt, yt); }
+            } else {
+                unsafe { self.run_hom_bm_scalar_x86(target_allele, bm_row, nt, yt); }
             }
-
-            // Handle odd last element with AVX2
-            if n_cond & 1 != 0 {
-                let k = n_cond - 1;
-                let ah = Self::bm_bit(bm_row, k) as usize;
-                let base = k * HAP_NUMBER;
-                let _nt_256 = _mm256_set1_ps(nt_div);
-                let _tfreq_256 = _mm256_mul_ps(
-                    _mm256_loadu_ps(self.prob_sum_h.as_ptr()),
-                    _mm256_set1_ps(yt_div));
-                let mut _prob = _mm256_load_ps(prob[base..].as_ptr());
-                _prob = _mm256_fmadd_ps(_prob, _nt_256, _tfreq_256);
-                _prob = _mm256_mul_ps(_prob, _mm256_set1_ps(emit_match[ah]));
-                // Add to lower half of _sum_512
-                let _sum_lo = _mm512_castps512_ps256(_sum_512);
-                let _sum_lo_new = _mm256_add_ps(_sum_lo, _prob);
-                _sum_512 = _mm512_insertf32x8::<0>(_sum_512, _sum_lo_new);
-                _mm256_store_ps(prob[base..].as_mut_ptr(), _prob);
-            }
-
-            // Reduce 512 → 256: add upper and lower halves
-            let _sum_lo = _mm512_castps512_ps256(_sum_512);
-            let _sum_hi = _mm512_extractf32x8_ps::<1>(_sum_512);
-            let _sum = _mm256_add_ps(_sum_lo, _sum_hi);
-
-            _mm256_storeu_ps(self.prob_sum_h.as_mut_ptr(), _sum);
-            self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
-                            + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
+            return true;
         }
         #[cfg(target_arch = "aarch64")]
-        unsafe {
-            let nt_div = divss(nt, self.prob_sum_t);
-            let yt_div = divss(yt, self.n_cond as f32 * self.prob_sum_t);
-            let emit_match: [f32; 2] = if target_allele { [MISMATCH, 1.0] } else { [1.0, MISMATCH] };
-            let _nt = vdupq_n_f32(nt_div);
-            let _factor = vdupq_n_f32(yt_div);
-            let mut _tfreq_lo = vld1q_f32(self.prob_sum_h.as_ptr());
-            let mut _tfreq_hi = vld1q_f32(self.prob_sum_h.as_ptr().add(4));
-            _tfreq_lo = vmulq_f32(_tfreq_lo, _factor);
-            _tfreq_hi = vmulq_f32(_tfreq_hi, _factor);
-            let mut _sum_lo = vdupq_n_f32(0.0);
-            let mut _sum_hi = vdupq_n_f32(0.0);
-
-            let prob = &mut self.prob;
-            for k in 0..self.n_cond {
-                let ah = Self::bm_bit(bm_row, k) as usize;
-                let _emit = vdupq_n_f32(emit_match[ah]);
-                let base = k * HAP_NUMBER;
-                let ptr = prob[base..].as_mut_ptr();
-                let mut _prob_lo = vld1q_f32(ptr);
-                let mut _prob_hi = vld1q_f32(ptr.add(4));
-                _prob_lo = vfmaq_f32(_tfreq_lo, _prob_lo, _nt);
-                _prob_hi = vfmaq_f32(_tfreq_hi, _prob_hi, _nt);
-                _prob_lo = vmulq_f32(_prob_lo, _emit);
-                _prob_hi = vmulq_f32(_prob_hi, _emit);
-                _sum_lo = vaddq_f32(_sum_lo, _prob_lo);
-                _sum_hi = vaddq_f32(_sum_hi, _prob_hi);
-                vst1q_f32(ptr, _prob_lo);
-                vst1q_f32(ptr.add(4), _prob_hi);
-            }
-
-            vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
-            vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
-            self.prob_sum_t = neon_hsum8(_sum_lo, _sum_hi);
+        {
+            unsafe { self.run_hom_bm_neon(target_allele, bm_row, nt, yt); }
+            return true;
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
-            let nt_div = divss(nt, self.prob_sum_t);
-            let yt_div = divss(yt, self.n_cond as f32 * self.prob_sum_t);
-            let emit_match: [f32; 2] = if target_allele { [MISMATCH, 1.0] } else { [1.0, MISMATCH] };
-            let mut tfreq = [0.0f32; HAP_NUMBER];
-            for h in 0..HAP_NUMBER { tfreq[h] = self.prob_sum_h[h] * yt_div; }
-            let mut sum = [0.0f32; HAP_NUMBER];
-            for k in 0..self.n_cond {
-                let ah = unsafe { Self::bm_bit(bm_row, k) } as usize;
-                let emit = emit_match[ah];
-                let base = k * HAP_NUMBER;
-                for h in 0..HAP_NUMBER {
-                    let p = (self.prob[base + h] * nt_div + tfreq[h]) * emit;
-                    self.prob[base + h] = p;
-                    sum[h] += p;
-                }
-            }
-            self.prob_sum_h = sum;
-            self.prob_sum_t = sum[0] + sum[1] + sum[2] + sum[3]
-                            + sum[4] + sum[5] + sum[6] + sum[7];
+            self.run_hom_bm_scalar(target_allele, bm_row, nt, yt);
+            true
         }
-        true
+    }
+
+    /// AVX-512F+DQ implementation. Caller must verify CPU support via
+    /// `use_avx512()` before calling.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512dq")]
+    unsafe fn run_hom_bm_avx512(&mut self, target_allele: bool, bm_row: *const u64, nt: f32, yt: f32) { unsafe {
+        let nt_div = divss(nt, self.prob_sum_t);
+        let yt_div = divss(yt, self.n_cond as f32 * self.prob_sum_t);
+        let emit_match: [f32; 2] = if target_allele { [MISMATCH, 1.0] } else { [1.0, MISMATCH] };
+
+        // Process 2 conditioning haps per iteration (16 floats)
+        let _nt_512 = _mm512_set1_ps(nt_div);
+        let _tfreq_base = [
+            self.prob_sum_h[0], self.prob_sum_h[1], self.prob_sum_h[2], self.prob_sum_h[3],
+            self.prob_sum_h[4], self.prob_sum_h[5], self.prob_sum_h[6], self.prob_sum_h[7],
+            self.prob_sum_h[0], self.prob_sum_h[1], self.prob_sum_h[2], self.prob_sum_h[3],
+            self.prob_sum_h[4], self.prob_sum_h[5], self.prob_sum_h[6], self.prob_sum_h[7],
+        ];
+        let _factor_512 = _mm512_set1_ps(yt_div);
+        let _tfreq_512 = _mm512_mul_ps(_mm512_loadu_ps(_tfreq_base.as_ptr()), _factor_512);
+        let mut _sum_512 = _mm512_setzero_ps();
+
+        let prob = &mut self.prob;
+        let n_pairs = self.n_cond / 2;
+        let n_cond = self.n_cond;
+
+        for kp in 0..n_pairs {
+            let k0 = kp * 2;
+            let k1 = k0 + 1;
+            let ah0 = Self::bm_bit(bm_row, k0) as usize;
+            let ah1 = Self::bm_bit(bm_row, k1) as usize;
+            let base = k0 * HAP_NUMBER;
+            let mut _prob = _mm512_loadu_ps(prob[base..].as_ptr());
+            _prob = _mm512_fmadd_ps(_prob, _nt_512, _tfreq_512);
+            let e0 = emit_match[ah0];
+            let e1 = emit_match[ah1];
+            let _emit = _mm512_setr_ps(e0,e0,e0,e0,e0,e0,e0,e0, e1,e1,e1,e1,e1,e1,e1,e1);
+            _prob = _mm512_mul_ps(_prob, _emit);
+            _sum_512 = _mm512_add_ps(_sum_512, _prob);
+            _mm512_storeu_ps(prob[base..].as_mut_ptr(), _prob);
+        }
+
+        // Handle odd last element with AVX2 (always available on AVX-512 hosts)
+        if n_cond & 1 != 0 {
+            let k = n_cond - 1;
+            let ah = Self::bm_bit(bm_row, k) as usize;
+            let base = k * HAP_NUMBER;
+            let _nt_256 = _mm256_set1_ps(nt_div);
+            let _tfreq_256 = _mm256_mul_ps(
+                _mm256_loadu_ps(self.prob_sum_h.as_ptr()),
+                _mm256_set1_ps(yt_div));
+            let mut _prob = _mm256_load_ps(prob[base..].as_ptr());
+            _prob = _mm256_fmadd_ps(_prob, _nt_256, _tfreq_256);
+            _prob = _mm256_mul_ps(_prob, _mm256_set1_ps(emit_match[ah]));
+            let _sum_lo = _mm512_castps512_ps256(_sum_512);
+            let _sum_lo_new = _mm256_add_ps(_sum_lo, _prob);
+            _sum_512 = _mm512_insertf32x8::<0>(_sum_512, _sum_lo_new);
+            _mm256_store_ps(prob[base..].as_mut_ptr(), _prob);
+        }
+
+        let _sum_lo = _mm512_castps512_ps256(_sum_512);
+        let _sum_hi = _mm512_extractf32x8_ps::<1>(_sum_512);
+        let _sum = _mm256_add_ps(_sum_lo, _sum_hi);
+
+        _mm256_storeu_ps(self.prob_sum_h.as_mut_ptr(), _sum);
+        self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
+                        + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
+    }}
+
+    /// x86_64 fallback. Used when AVX-512 absent (older Intel, all AMD pre-Zen4,
+    /// or `SELPHI_FORCE_SCALAR=1`). Pure scalar — relies on the compiler's
+    /// AVX2 auto-vectorization from the v3 baseline. Bit-equivalent to the
+    /// scalar fallback on non-x86 archs.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn run_hom_bm_scalar_x86(&mut self, target_allele: bool, bm_row: *const u64, nt: f32, yt: f32) { unsafe {
+        let nt_div = divss(nt, self.prob_sum_t);
+        let yt_div = divss(yt, self.n_cond as f32 * self.prob_sum_t);
+        let emit_match: [f32; 2] = if target_allele { [MISMATCH, 1.0] } else { [1.0, MISMATCH] };
+        let mut tfreq = [0.0f32; HAP_NUMBER];
+        for h in 0..HAP_NUMBER { tfreq[h] = self.prob_sum_h[h] * yt_div; }
+        let mut sum = [0.0f32; HAP_NUMBER];
+        for k in 0..self.n_cond {
+            let ah = Self::bm_bit(bm_row, k) as usize;
+            let emit = emit_match[ah];
+            let base = k * HAP_NUMBER;
+            for h in 0..HAP_NUMBER {
+                let p = (self.prob[base + h] * nt_div + tfreq[h]) * emit;
+                self.prob[base + h] = p;
+                sum[h] += p;
+            }
+        }
+        self.prob_sum_h = sum;
+        self.prob_sum_t = sum[0] + sum[1] + sum[2] + sum[3]
+                        + sum[4] + sum[5] + sum[6] + sum[7];
+    }}
+
+    /// aarch64 NEON implementation.
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    unsafe fn run_hom_bm_neon(&mut self, target_allele: bool, bm_row: *const u64, nt: f32, yt: f32) { unsafe {
+        let nt_div = divss(nt, self.prob_sum_t);
+        let yt_div = divss(yt, self.n_cond as f32 * self.prob_sum_t);
+        let emit_match: [f32; 2] = if target_allele { [MISMATCH, 1.0] } else { [1.0, MISMATCH] };
+        let _nt = vdupq_n_f32(nt_div);
+        let _factor = vdupq_n_f32(yt_div);
+        let mut _tfreq_lo = vld1q_f32(self.prob_sum_h.as_ptr());
+        let mut _tfreq_hi = vld1q_f32(self.prob_sum_h.as_ptr().add(4));
+        _tfreq_lo = vmulq_f32(_tfreq_lo, _factor);
+        _tfreq_hi = vmulq_f32(_tfreq_hi, _factor);
+        let mut _sum_lo = vdupq_n_f32(0.0);
+        let mut _sum_hi = vdupq_n_f32(0.0);
+
+        let prob = &mut self.prob;
+        for k in 0..self.n_cond {
+            let ah = Self::bm_bit(bm_row, k) as usize;
+            let _emit = vdupq_n_f32(emit_match[ah]);
+            let base = k * HAP_NUMBER;
+            let ptr = prob[base..].as_mut_ptr();
+            let mut _prob_lo = vld1q_f32(ptr);
+            let mut _prob_hi = vld1q_f32(ptr.add(4));
+            _prob_lo = vfmaq_f32(_tfreq_lo, _prob_lo, _nt);
+            _prob_hi = vfmaq_f32(_tfreq_hi, _prob_hi, _nt);
+            _prob_lo = vmulq_f32(_prob_lo, _emit);
+            _prob_hi = vmulq_f32(_prob_hi, _emit);
+            _sum_lo = vaddq_f32(_sum_lo, _prob_lo);
+            _sum_hi = vaddq_f32(_sum_hi, _prob_hi);
+            vst1q_f32(ptr, _prob_lo);
+            vst1q_f32(ptr.add(4), _prob_hi);
+        }
+
+        vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
+        vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
+        self.prob_sum_t = neon_hsum8(_sum_lo, _sum_hi);
+    }}
+
+    /// Portable scalar fallback (non-x86, non-aarch64 builds).
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    fn run_hom_bm_scalar(&mut self, target_allele: bool, bm_row: *const u64, nt: f32, yt: f32) {
+        let nt_div = divss(nt, self.prob_sum_t);
+        let yt_div = divss(yt, self.n_cond as f32 * self.prob_sum_t);
+        let emit_match: [f32; 2] = if target_allele { [MISMATCH, 1.0] } else { [1.0, MISMATCH] };
+        let mut tfreq = [0.0f32; HAP_NUMBER];
+        for h in 0..HAP_NUMBER { tfreq[h] = self.prob_sum_h[h] * yt_div; }
+        let mut sum = [0.0f32; HAP_NUMBER];
+        for k in 0..self.n_cond {
+            let ah = unsafe { Self::bm_bit(bm_row, k) } as usize;
+            let emit = emit_match[ah];
+            let base = k * HAP_NUMBER;
+            for h in 0..HAP_NUMBER {
+                let p = (self.prob[base + h] * nt_div + tfreq[h]) * emit;
+                self.prob[base + h] = p;
+                sum[h] += p;
+            }
+        }
+        self.prob_sum_h = sum;
+        self.prob_sum_t = sum[0] + sum[1] + sum[2] + sum[3]
+                        + sum[4] + sum[5] + sum[6] + sum[7];
     }
 
     fn run_amb_bm(&mut self, amb_code: u8, bm_row: *const u64, nt: f32, yt: f32) {
