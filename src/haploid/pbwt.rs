@@ -144,7 +144,13 @@ pub fn pbwt_coded_ibs_fwd_batch(
     let n_targ = m_total - n_ref;
     let check_ibs2 = !ibs2_offsets.is_empty();
 
-    let mut ibs_out = vec![-1i32; n_steps * n_targ];
+    // ibs_out covers only this batch's [batch_start, end) rows — local indexing
+    // (was full-window n_steps*n_targ). On parallel multi-batch paths this cuts
+    // the per-batch allocation from O(window) to O(batch). Single-batch
+    // (batch_start=0) gives the same size+indexing as before.
+    let end_for_alloc = batch_end.min(n_steps);
+    let local_len = end_for_alloc.saturating_sub(batch_start);
+    let mut ibs_out = vec![-1i32; local_len * n_targ];
 
     let mut a: Vec<i32> = (0..m_total as i32).collect();
     let mut d = vec![buffer_start as i32; m_total + 1];
@@ -260,7 +266,7 @@ pub fn pbwt_coded_ibs_fwd_batch(
             }
 
             let n = v - u;
-            ibs_out[step * n_targ + t] = -1;
+            ibs_out[(step - batch_start) * n_targ + t] = -1;
 
             if n > 1 {
                 let rand_val = rng.next_int(n as i32);
@@ -301,7 +307,7 @@ pub fn pbwt_coded_ibs_fwd_batch(
                             if forbidden { continue; }
                         }
                     }
-                    ibs_out[step * n_targ + t] = cand as i32;
+                    ibs_out[(step - batch_start) * n_targ + t] = cand as i32;
                     break;
                 }
             }
@@ -342,7 +348,10 @@ pub fn pbwt_coded_ibs_bwd_batch(
     let n_steps = pre_na.len();
     let n_targ = m_total - n_ref;
     let check_ibs2 = !ibs2_offsets.is_empty();
-    let mut ibs_out = vec![-1i32; n_steps * n_targ];
+    // ibs_out covers only [batch_start, batch_end) — local indexing (was full
+    // n_steps*n_targ). Same memory savings rationale as the fwd path.
+    let local_len = batch_end.min(n_steps).saturating_sub(batch_start);
+    let mut ibs_out = vec![-1i32; local_len * n_targ];
 
     let mut a: Vec<i32> = (0..m_total as i32).collect();
     let buf_end_val = if buffer_end > 0 { buffer_end as i32 - 1 } else { 0 };
@@ -446,7 +455,7 @@ pub fn pbwt_coded_ibs_bwd_batch(
             }
 
             let n = v - u;
-            ibs_out[step_i * n_targ + t] = -1;
+            ibs_out[(step_i - batch_start) * n_targ + t] = -1;
 
             if n > 1 {
                 let rand_val = rng.next_int(n as i32);
@@ -481,7 +490,7 @@ pub fn pbwt_coded_ibs_bwd_batch(
                             if forbidden { continue; }
                         }
                     }
-                    ibs_out[step_i * n_targ + t] = cand as i32;
+                    ibs_out[(step_i - batch_start) * n_targ + t] = cand as i32;
                     break;
                 }
             }
