@@ -35,6 +35,10 @@ impl CppRng {
 
     /// Sample from CDF — u < csum (strict less).
     pub fn sample_f64(&mut self, probs: &[f64], sum: f64) -> usize {
+        // Defensive guard: empty probs would read probs[0] (panic) and
+        // underflow `probs.len()-1` in the loop bound. Callers today always
+        // pass len>=1; this keeps the landmine off for future callers.
+        if probs.is_empty() { return 0; }
         let u = self.get_double() * sum;
         let mut csum = probs[0];
         for i in 0..probs.len() - 1 {

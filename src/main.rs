@@ -42,6 +42,25 @@ fn main() {
 
     let args = Args::parse();
 
+    // Reject conflicting top-level modes (dispatch is first-match-wins, so
+    // passing two would silently run only one). At most one allowed.
+    {
+        let mut modes: Vec<&str> = Vec::new();
+        if args.phase_panel { modes.push("--phase-panel"); }
+        if args.evaluate.is_some() { modes.push("--evaluate"); }
+        if args.index.is_some() { modes.push("--index"); }
+        if args.index_stats.is_some() { modes.push("--index-stats"); }
+        if args.self_test { modes.push("--self-test"); }
+        if args.merge_srps.is_some() { modes.push("--merge-srps"); }
+        if args.merge_srps_dir.is_some() { modes.push("--merge-srps-dir"); }
+        if args.prepare_reference_from.is_some() { modes.push("--prepare-reference-from"); }
+        if modes.len() > 1 {
+            eprintln!("ERROR: the following are mutually exclusive top-level modes; pick one: {}.",
+                modes.join(", "));
+            std::process::exit(1);
+        }
+    }
+
     // Initialize the Rayon global thread pool exactly once. All dispatch branches
     // below (eval, merge-srps, prepare-reference, phasing, imputation) share this
     // pool; they used to re-init locally, which silently no-op'd after the first

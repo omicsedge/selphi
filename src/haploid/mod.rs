@@ -316,7 +316,9 @@ fn phase_genotypes_inner(
         let mut w_confidence = vec![1.0f32; w_size * n_samples];
         // stores recombIntensity (f32) directly, not ne.
         // recombIntensity = 0.04f * ne / nHaps. Initial ne=100000.
-        let mut ri_f32 = 0.04f32 * 100000.0f32 / n_haps_total as f32;
+        // `.max(1.0)` guards an empty cohort (n_haps_total=0) from producing
+        // +inf/NaN that would poison the f32 forward.
+        let mut ri_f32 = 0.04f32 * 100000.0f32 / (n_haps_total as f32).max(1.0);
         let mut pm_f32 = pmismatch(n_haps_total) as f32;
 
         // Haplotype-major bitmatrix: sole data structure

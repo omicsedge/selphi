@@ -79,8 +79,13 @@ pub fn read_bcf_parallel(
             Err(0) => 0,
             Err(i) => i - 1,
         };
-        // Deduplicate: skip if same checkpoint as previous region
-        if region_indices.last() == Some(&idx) { continue; }
+        // Deduplicate: skip if same checkpoint as previous region OR if the
+        // previous region's geo_pos equals this one (two distinct checkpoints
+        // at the same position — e.g. multiallelic split sites — would form an
+        // empty (X, X] range whose records get dropped by BOTH threads).
+        if let Some(&last_idx) = region_indices.last() {
+            if last_idx == idx || by_offset[last_idx].1 == by_offset[idx].1 { continue; }
+        }
         region_indices.push(idx);
     }
 

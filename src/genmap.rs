@@ -19,8 +19,10 @@ pub fn load_and_interpolate_genetic_map(map_path: &Path, chip_bps: &[i64]) -> st
         if line.starts_with('#') || line.trim().is_empty() { continue; }
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 4 { continue; }
-        let bp: i64 = fields[3].parse().unwrap_or(0);
-        let cm: f64 = fields[2].parse().unwrap_or(0.0);
+        // Skip malformed rows (e.g. a non-numeric header) instead of inserting
+        // a silent (0, 0) anchor that would distort cM for early variants.
+        let Ok(bp) = fields[3].parse::<i64>() else { continue };
+        let Ok(cm) = fields[2].parse::<f64>() else { continue };
         map_entries.push((bp, cm));
     }
     map_entries.sort_by_key(|&(bp, _)| bp);
@@ -48,16 +50,15 @@ pub fn load_genetic_map_raw(map_path: &Path) -> std::io::Result<(Vec<i64>, Vec<f
         if line.starts_with('#') || line.trim().is_empty() { continue; }
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() >= 4 {
-            // PLINK format: chr id cM bp
-            let bp: i64 = fields[3].parse().unwrap_or(0);
-            let cm: f64 = fields[2].parse().unwrap_or(0.0);
-            map_bp.push(bp);
-            map_cm.push(cm);
+            // PLINK format: chr id cM bp — skip rows with non-numeric fields
+            // (e.g. header) instead of inserting a (0, 0) anchor.
+            if let (Ok(bp), Ok(cm)) = (fields[3].parse::<i64>(), fields[2].parse::<f64>()) {
+                map_bp.push(bp);
+                map_cm.push(cm);
+            }
         } else if fields.len() == 3 {
             // gmap format: pos chr cM (with header "pos chr cM")
-            // Skip header line where first field is not a number
-            if let Ok(bp) = fields[0].parse::<i64>() {
-                let cm: f64 = fields[2].parse().unwrap_or(0.0);
+            if let (Ok(bp), Ok(cm)) = (fields[0].parse::<i64>(), fields[2].parse::<f64>()) {
                 map_bp.push(bp);
                 map_cm.push(cm);
             }
@@ -90,11 +91,12 @@ pub fn load_genetic_map_multi_chr(
         if line.starts_with('#') || line.trim().is_empty() { continue; }
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() >= 4 {
-            // PLINK format: chr id cM bp
-            let chr = strip_chr(fields[0]).to_string();
-            let cm: f64 = fields[2].parse().unwrap_or(0.0);
-            let bp: i64 = fields[3].parse().unwrap_or(0);
-            by_chr.entry(chr).or_default().push((bp, cm));
+            // PLINK format: chr id cM bp — skip rows with non-numeric fields
+            // (e.g. header) instead of inserting a (0, 0) anchor.
+            if let (Ok(bp), Ok(cm)) = (fields[3].parse::<i64>(), fields[2].parse::<f64>()) {
+                let chr = strip_chr(fields[0]).to_string();
+                by_chr.entry(chr).or_default().push((bp, cm));
+            }
         }
     }
 
