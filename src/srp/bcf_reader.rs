@@ -157,6 +157,13 @@ fn process_region(
         let li = ru32(&mut bgzf)? as usize;
         sb.resize(ls, 0); bgzf.read_exact(&mut sb)?;
 
+        // BCF SHARED block fixed header is 24 bytes (chrom + pos + rlen + qual
+        // + n_info + n_allele + n_sample/n_fmt). A truncated record would
+        // panic on the slice indexing below — hard-error with context instead.
+        if ls < 24 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("BCF record SHARED block too short: l_shared={} < 24", ls)));
+        }
         let ci = i32::from_le_bytes(sb[0..4].try_into().unwrap());
         let na = u16::from_le_bytes(sb[18..20].try_into().unwrap()) as usize;
         let rec_pos = i32::from_le_bytes(sb[4..8].try_into().unwrap()) as i64 + 1;
@@ -390,7 +397,11 @@ fn rtstr(buf: &[u8], o: &mut usize) -> String {
 }
 fn rtint(buf: &[u8], o: &mut usize) -> i32 {
     if *o>=buf.len() { return 0; } let tb=buf[*o]; *o+=1;
-    match tb&0x0F { 1 => { let v=buf[*o] as i8 as i32; *o+=1; v }
-        2 => { let v=i16::from_le_bytes(buf[*o..*o+2].try_into().unwrap()) as i32; *o+=2; v }
-        3 => { let v=i32::from_le_bytes(buf[*o..*o+4].try_into().unwrap()); *o+=4; v } _ => 0 }
+    // Bounds-check the multi-byte reads (was unguarded → OOB panic on truncated INFO/FORMAT).
+    match tb&0x0F {
+        1 => { if *o >= buf.len() { return 0; } let v=buf[*o] as i8 as i32; *o+=1; v }
+        2 => { if *o+2 > buf.len() { return 0; } let v=i16::from_le_bytes(buf[*o..*o+2].try_into().unwrap()) as i32; *o+=2; v }
+        3 => { if *o+4 > buf.len() { return 0; } let v=i32::from_le_bytes(buf[*o..*o+4].try_into().unwrap()); *o+=4; v }
+        _ => 0
+    }
 }
