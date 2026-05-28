@@ -206,10 +206,19 @@ fn process_region(
                 for si in 0..ns {
                     let b = io2 + si * vl * es;
                     if b + 1 >= ge { break; }
-                    let a0 = (ib[b] >> 1).wrapping_sub(1);
-                    let a1 = (ib[b+1] >> 1).wrapping_sub(1);
-                    if a0 > 0 && a0 < 128 { cols[si*2].push(row as i32); }
-                    if a1 > 0 && a1 < 128 { cols[si*2+1].push(row as i32); }
+                    // BCF int8 GT: reserved bytes 0x80 (missing) and 0x81
+                    // (end-of-vector, haploid sample in a diploid encoding)
+                    // were silently mis-mapped to ALT-63 by the >>1 -1 path
+                    // (both yield 63 < 128 → spurious ALT). Skip them.
+                    let b0 = ib[b]; let b1 = ib[b+1];
+                    if b0 < 0x80 {
+                        let a0 = (b0 >> 1).wrapping_sub(1);
+                        if a0 > 0 && a0 < 128 { cols[si*2].push(row as i32); }
+                    }
+                    if b1 < 0x80 {
+                        let a1 = (b1 >> 1).wrapping_sub(1);
+                        if a1 > 0 && a1 < 128 { cols[si*2+1].push(row as i32); }
+                    }
                 }
                 break;
             }
