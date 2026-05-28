@@ -44,6 +44,22 @@ The binary prints its chosen SIMD path on startup: `[selphi] SIMD: AVX-512F+DQ` 
 
 Cross-host validation: bit-identical dosage output between forced-scalar on an AVX-512 build host and the natural scalar path on AMD EPYC 7571 (Zen1, no AVX-512). |ΔR²| ≤ 0.0002 OVERALL vs AVX-512 path on chr22 1KG 801 samples.
 
+### Distribution binaries (release)
+
+`scripts/build-release.sh` produces named binaries in `dist/`:
+
+```bash
+./scripts/build-release.sh            # selphi-linux-x86_64           (glibc dynamic)
+./scripts/build-release.sh --musl     # also: selphi-linux-x86_64-musl (static)
+```
+
+| Binary | When to use | Trade-off |
+|---|---|---|
+| `selphi-linux-x86_64` | Default. Server / cluster / cloud (covers ~99% of users). | Fast. Requires glibc ≥ 2.39 on the host as built here; rebuild inside an older-glibc container (Ubuntu 18.04 / 20.04 / `manylinux2014`) to lower the floor. |
+| `selphi-linux-x86_64-musl` | Alpine Linux, Docker `scratch` images, very old distros, any host where the glibc binary fails to load. | Fully self-contained, no runtime libc dependency. ~60% slower wall-time in the HMM hot path (musl + static-PIE adds overhead per inner-loop iteration). |
+
+The musl build requires `apt install musl-tools` and `rustup target add x86_64-unknown-linux-musl`.
+
 ### Genetic maps
 
 Selphi requires a genetic map in PLINK format (cM positions). Beagle genetic maps work directly:
