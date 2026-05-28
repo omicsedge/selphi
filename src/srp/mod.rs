@@ -184,16 +184,24 @@ impl SparseTile {
 
     /// Deserialize tile from bytes.
     pub fn from_bytes(data: &[u8]) -> Self {
+        // Explicit bounds checks so a corrupt tile produces a clear panic
+        // message (instead of a generic slice-OOB) — the function returns
+        // SparseTile (not Result) by interface, so we abort with context.
+        assert!(data.len() >= 8,
+            "SparseTile::from_bytes: tile header truncated ({} < 8 bytes)", data.len());
         let n_rows = u16::from_le_bytes(data[0..2].try_into().unwrap());
         let n_cols = u16::from_le_bytes(data[2..4].try_into().unwrap());
         let nnz = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
         let indptr_start = 8;
         let indptr_end = indptr_start + (n_cols as usize + 1) * 4;
+        let indices_end = indptr_end + nnz * 2;
+        assert!(indices_end <= data.len(),
+            "SparseTile::from_bytes: tile body truncated (need {} bytes, have {}; n_rows={} n_cols={} nnz={})",
+            indices_end, data.len(), n_rows, n_cols, nnz);
         let indptr: Vec<u32> = data[indptr_start..indptr_end]
             .chunks_exact(4)
             .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
             .collect();
-        let indices_end = indptr_end + nnz * 2;
         let indices: Vec<u16> = data[indptr_end..indices_end]
             .chunks_exact(2)
             .map(|b| u16::from_le_bytes(b.try_into().unwrap()))

@@ -263,10 +263,15 @@ impl PreloadedStripes {
         let (off, len) = self.offsets[local];
         let compressed = &self.buf[off..off + len];
         // Auto-detect: zstd magic = 0xFD2FB528, LZ4 prepend-size starts with u32 size.
+        // Panics on corrupt tile data are unrecoverable here (hot path, fn
+        // returns SparseTile not Result); include stripe/band/len so the
+        // operator can locate the bad tile.
         let raw = if compressed.len() >= 4 && compressed[0] == 0x28 && compressed[1] == 0xB5 && compressed[2] == 0x2F && compressed[3] == 0xFD {
-            zstd::decode_all(std::io::Cursor::new(compressed)).expect("zstd decompress failed")
+            zstd::decode_all(std::io::Cursor::new(compressed)).unwrap_or_else(|e|
+                panic!("zstd decompress failed at stripe={} band={} (comp_len={}): {}", stripe, band, len, e))
         } else {
-            lz4_flex::decompress_size_prepended(compressed).expect("LZ4 decompress failed")
+            lz4_flex::decompress_size_prepended(compressed).unwrap_or_else(|e|
+                panic!("LZ4 decompress failed at stripe={} band={} (comp_len={}): {}", stripe, band, len, e))
         };
         SparseTile::from_bytes(&raw)
     }
