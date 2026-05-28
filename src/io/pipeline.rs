@@ -1310,10 +1310,13 @@ fn interp_kernel(
                 // Merge start and end weight ranges by column index.
                 scatter_fused(w, s1, e1, s2, e2, chunk, row_offset, row_end, t, &mut num);
 
-                // Final division: out[v] = num[v] / (ss + t[v] * ds)
+                // Final division: out[v] = num[v] / (ss + t[v] * ds).
+                // Guard den==0 (matches the tiled path) — defends against NaN/Inf
+                // if weight normalization ever produces a zero denominator outside
+                // the ss==0 && ds==0 early-return.
                 for v in 0..n_vars {
                     let den = ss + t[v] * ds;
-                    hap_out[v] = num[v] / den;
+                    if den != 0.0 { hap_out[v] = num[v] / den; }
                 }
             });
         });
