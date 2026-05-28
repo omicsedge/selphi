@@ -27,6 +27,19 @@ use cli::Args;
 
 
 fn main() {
+    // Selphi is built with `target-cpu=native` and uses AVX-512 intrinsics in
+    // the diploid HMM hot path (run_hom_bm), without a scalar fallback. On a
+    // CPU lacking AVX-512 those would SIGILL mid-imputation. Fail fast & clear
+    // at startup so the user can rebuild with AVX2-only flags if needed.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !std::arch::is_x86_feature_detected!("avx512f") {
+            eprintln!("ERROR: this Selphi binary requires AVX-512 (built with target-cpu=native using AVX-512 intrinsics in the diploid HMM). The running CPU does not support AVX-512.");
+            eprintln!("Run on an AVX-512-capable host (e.g. AWS r7a / r7i / c7a / m7i), or rebuild with `RUSTFLAGS=\"-C target-cpu=x86-64-v3\"` for AVX2-only hosts.");
+            std::process::exit(1);
+        }
+    }
+
     let args = Args::parse();
 
     // Initialize the Rayon global thread pool exactly once. All dispatch branches
