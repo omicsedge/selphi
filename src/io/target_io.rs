@@ -53,14 +53,14 @@ pub fn read_cohort_vcf(
     use std::io::Read;
     let is_gz = path.ends_with(".gz") || path.ends_with(".bcf");
     let file = std::fs::File::open(path)
-        .unwrap_or_else(|e| panic!("Cannot open {}: {}", path, e));
+        .unwrap_or_else(|e| { selphi_error!("Cannot open {}: {}", path, e); std::process::exit(1) });
     let mut raw = Vec::new();
     if is_gz {
         let mut bgzf = noodles_bgzf::io::Reader::new(std::io::BufReader::new(file));
-        bgzf.read_to_end(&mut raw).expect("Failed to decompress bgzf");
+        bgzf.read_to_end(&mut raw).unwrap_or_else(|e| { selphi_error!("BGZF decompress failed for {}: {}", path, e); std::process::exit(1) });
     } else {
         let mut reader = std::io::BufReader::new(file);
-        reader.read_to_end(&mut raw).expect("Failed to read VCF");
+        reader.read_to_end(&mut raw).unwrap_or_else(|e| { selphi_error!("Failed to read VCF {}: {}", path, e); std::process::exit(1) });
     }
 
     let mut markers = Vec::new();
@@ -168,15 +168,15 @@ pub fn read_target_vcf(
     // Read entire decompressed VCF into memory (avoid per-line String alloc)
     let is_gz = path.ends_with(".gz") || path.ends_with(".bcf");
     let file = std::fs::File::open(path)
-        .unwrap_or_else(|e| panic!("Cannot open {}: {}", path, e));
+        .unwrap_or_else(|e| { selphi_error!("Cannot open {}: {}", path, e); std::process::exit(1) });
 
     let mut raw = Vec::new();
     if is_gz {
         let mut bgzf = noodles_bgzf::io::Reader::new(std::io::BufReader::new(file));
-        bgzf.read_to_end(&mut raw).expect("Failed to decompress bgzf");
+        bgzf.read_to_end(&mut raw).unwrap_or_else(|e| { selphi_error!("BGZF decompress failed for {}: {}", path, e); std::process::exit(1) });
     } else {
         let mut reader = std::io::BufReader::new(file);
-        reader.read_to_end(&mut raw).expect("Failed to read VCF");
+        reader.read_to_end(&mut raw).unwrap_or_else(|e| { selphi_error!("Failed to read VCF {}: {}", path, e); std::process::exit(1) });
     }
 
     let mut markers = Vec::new();
@@ -502,15 +502,15 @@ pub fn read_target_vcf_multi_chr(
 
     let is_gz = path.ends_with(".gz") || path.ends_with(".bcf");
     let file = std::fs::File::open(path)
-        .unwrap_or_else(|e| panic!("Cannot open {}: {}", path, e));
+        .unwrap_or_else(|e| { selphi_error!("Cannot open {}: {}", path, e); std::process::exit(1) });
 
     let mut raw = Vec::new();
     if is_gz {
         let mut bgzf = noodles_bgzf::io::Reader::new(std::io::BufReader::new(file));
-        bgzf.read_to_end(&mut raw).expect("Failed to decompress bgzf");
+        bgzf.read_to_end(&mut raw).unwrap_or_else(|e| { selphi_error!("BGZF decompress failed for {}: {}", path, e); std::process::exit(1) });
     } else {
         let mut reader = std::io::BufReader::new(file);
-        reader.read_to_end(&mut raw).expect("Failed to read VCF");
+        reader.read_to_end(&mut raw).unwrap_or_else(|e| { selphi_error!("Failed to read VCF {}: {}", path, e); std::process::exit(1) });
     }
 
     let mut all_markers: Vec<TargetMarker> = Vec::new();

@@ -167,6 +167,9 @@ impl<R: Read> Bref3StreamReader<R> {
         } else {
             let n_alleles = 1 + (allele_code & 0b11) as usize;
             let perm_index = (allele_code as u8 >> 2) as usize;
+            if perm_index >= self.snv_perms.len() {
+                return Err(format!("BREF3 SNV allele_code out of range: perm_index={} >= snv_perms.len()={}", perm_index, self.snv_perms.len()));
+            }
             self.snv_perms[perm_index][..n_alleles].to_vec()
         };
 
@@ -183,7 +186,12 @@ impl<R: Read> Bref3StreamReader<R> {
             let mut out = vec![0u8; n_haps];
             for h in 0..n_haps {
                 let seq = self.block_hap_to_seq[h] as usize;
-                out[h] = if seq < self.block_n_seq { seq_to_allele[seq] } else { 0 };
+                if seq >= self.block_n_seq {
+                    // Hard-error instead of silently mapping out-of-range
+                    // hap_to_seq entries to REF (would corrupt genotypes).
+                    return Err(format!("BREF3 block: hap {} maps to seq {} >= n_seq {} (corrupt block)", h, seq, self.block_n_seq));
+                }
+                out[h] = seq_to_allele[seq];
             }
             out
         } else if flag == ALLELE_CODED {
@@ -263,6 +271,9 @@ impl<R: Read> Bref3StreamReader<R> {
         } else {
             let n_alleles = 1 + (allele_code & 0b11) as usize;
             let perm_index = (allele_code as u8 >> 2) as usize;
+            if perm_index >= self.snv_perms.len() {
+                return Err(format!("BREF3 SNV allele_code out of range: perm_index={} >= snv_perms.len()={}", perm_index, self.snv_perms.len()));
+            }
             let p = &self.snv_perms[perm_index];
             let r = p[0].clone();
             let a = if n_alleles > 1 { p[1].clone() } else { String::new() };
