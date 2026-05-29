@@ -64,8 +64,11 @@ pub fn run_stage2_after_stage1(
     // Stats for debugging
     let n_low_freq = n_var - n_high_freq;
     let n_carrier_groups_gt1 = rare_carriers.iter().filter(|c| c.len() > 1).count();
-    eprintln!("  [stage2] markers: total={} high_freq={} low_freq={} (carriers>1: {})",
-        n_var, n_high_freq, n_low_freq, n_carrier_groups_gt1);
+    let stage1_cm_dbg: Vec<f64> = (0..n_var).filter(|&m| rare_carriers[m].is_empty()).map(|m| chip_cm[m]).collect();
+    let ibs_step_cm_dbg = compute_ibs_step_cm(&stage1_cm_dbg);
+    let n_steps_dbg = build_steps(&stage1_cm_dbg, ibs_step_cm_dbg).len();
+    eprintln!("  [stage2] markers: total={} high_freq={} low_freq={} (carriers>1: {}) ibs_step={:.5}cM n_steps={}",
+        n_var, n_high_freq, n_low_freq, n_carrier_groups_gt1, ibs_step_cm_dbg, n_steps_dbg);
 
     // 2) Combined site-major bit-packed panel: target haps first, then ref.
     let combined_panel = build_combined_panel(global_phased, ref_bm, n_var, n_targ_haps, n_ref_haps);
@@ -75,10 +78,14 @@ pub fn run_stage2_after_stage1(
         .filter(|&m| rare_carriers[m].is_empty())
         .collect();
 
-    // 4) PBWT step boundaries on the stage-1 scaffold (grouped by ~0.05 cM
-    //    intervals, mirroring Selphi haploid's coded-step granularity).
+    // 4) PBWT step boundaries on the stage-1 scaffold. Beagle uses
+    //    `ibs_step = step_scale × medianDiff(stage1_cm)` with `step_scale = 3.0`.
+    //    The earlier 0.05 cM hardcode was 100× too coarse and reduced
+    //    PBWT carrier-graph hit rate to <2%, causing 76% of het swap
+    //    decisions to be coin-flip ties (degenerate al_probs all zero).
     let stage1_cm: Vec<f64> = stage1_to_global.iter().map(|&m| chip_cm[m]).collect();
-    let stage1_steps = build_steps(&stage1_cm, /*step_cm =*/ 0.05);
+    let ibs_step_cm = compute_ibs_step_cm(&stage1_cm);
+    let stage1_steps = build_steps(&stage1_cm, ibs_step_cm);
     if stage1_steps.is_empty() {
         return false; // no stage-1 scaffold → nothing to anchor stage-2 to
     }
@@ -91,9 +98,8 @@ pub fn run_stage2_after_stage1(
     let (prev_stage1_marker, prev_stage1_wt) =
         build_prev_stage1_arrays(chip_cm, &stage1_to_global);
 
-    // 6) min_steps mirrors Beagle: max(200, ceil(1 / ibs_step)) where
-    //    ibs_step is the median between-step cM (≈ 0.05 cM here).
-    let min_steps = std::cmp::max(200, (1.0 / 0.05f64).ceil() as usize);
+    // 6) min_steps mirrors Beagle: max(200, ceil(1 cM / ibs_step_cm))
+    let min_steps = std::cmp::max(200, (1.0 / ibs_step_cm.max(1e-9)).ceil() as usize);
 
     // 7) Stage2Input wiring.
     //
@@ -106,7 +112,8 @@ pub fn run_stage2_after_stage1(
     let theta = 1.0_f64 / ((n_haps as f64).ln() + 0.5);
     let p_mismatch = (theta / (2.0 * (theta + n_haps as f64))) as f32;
     let max_states: usize = 140;  // Beagle phase_states / 2 = 280 / 2 = 140
-    let max_backoff_steps: usize = 20;
+    // Beagle MAX_BACKOFF_CM = 0.3 cM; scale by step size.
+    let max_backoff_steps: usize = ((0.3_f64 / ibs_step_cm.max(1e-9)).round() as usize).max(2);
     let no_ibs2: Vec<i32> = Vec::new();
 
     let input = stage2::Stage2Input {
@@ -252,6 +259,26 @@ fn build_combined_panel(
     }
     let _ = ref_n_words; // silence unused
     panel
+}
+
+/// Compute Beagle's `ibsStep = step_scale × medianDiff(stage1_cm)`.
+/// `step_scale = 3.0` is Beagle's `D_STEP_SCALE`. Falls back to a
+/// 0.001 cM floor for degenerate (all-same-cM) maps so we never
+/// produce zero-length steps.
+fn compute_ibs_step_cm(stage1_cm: &[f64]) -> f64 {
+    const STEP_SCALE: f64 = 3.0;
+    if stage1_cm.len() < 2 { return 0.001; }
+    let mut diffs: Vec<f64> = stage1_cm.windows(2)
+        .map(|w| (w[1] - w[0]).max(0.0))
+        .collect();
+    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = diffs.len() / 2;
+    let median = if diffs.len() % 2 == 1 {
+        diffs[mid]
+    } else {
+        (diffs[mid - 1] + diffs[mid]) * 0.5
+    };
+    (STEP_SCALE * median).max(1e-5) // 0.00001 cM floor
 }
 
 /// Group consecutive stage-1 markers into PBWT steps of `step_cm`

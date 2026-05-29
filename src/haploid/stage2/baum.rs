@@ -27,6 +27,9 @@ pub struct Stage2Baum<'a> {
     probs: [Vec<Vec<f32>>; 2],
     n_states_per_bit: [usize; 2],
     rng: crate::haploid::rng::JavaRandom,
+    n_het_seen: u64,
+    n_swap_done: u64,
+    n_tie_coinflip: u64,
 }
 
 impl<'a> Stage2Baum<'a> {
@@ -42,6 +45,9 @@ impl<'a> Stage2Baum<'a> {
             probs: [mk_scratch_f(), mk_scratch_f()],
             n_states_per_bit: [0, 0],
             rng: crate::haploid::rng::JavaRandom::new(input.seed as i64),
+            n_het_seen: 0,
+            n_swap_done: 0,
+            n_tie_coinflip: 0,
         }
     }
 
@@ -68,6 +74,11 @@ impl<'a> Stage2Baum<'a> {
         self.n_states_per_bit[0] = self.state_probs.run(h1, &mut self.states[0], &mut self.probs[0]);
         self.n_states_per_bit[1] = self.state_probs.run(h2, &mut self.states[1], &mut self.probs[1]);
 
+        // Reset per-sample counters
+        self.n_het_seen = 0;
+        self.n_swap_done = 0;
+        self.n_tie_coinflip = 0;
+
         let mut start = 0usize;
         for j in 0..self.input.stage1_to_global.len() {
             let end = self.input.stage1_to_global[j];
@@ -75,6 +86,15 @@ impl<'a> Stage2Baum<'a> {
             start = end + 1;
         }
         self.impute_interval(sample, start, self.input.n_markers, &mut write);
+
+        if std::env::var("SELPHI_HAPLOID_STAGE2_DEBUG").ok().as_deref() == Some("swaps") && sample < 16 {
+            eprintln!(
+                "    [stage2 swap] sample={} hets={} swaps={} ({:.2}%) ties={}",
+                sample, self.n_het_seen, self.n_swap_done,
+                100.0 * self.n_swap_done as f64 / self.n_het_seen.max(1) as f64,
+                self.n_tie_coinflip,
+            );
+        }
     }
 
     fn impute_interval<F>(&mut self, sample: usize, start: usize, end: usize, write: &mut F)
@@ -122,8 +142,16 @@ impl<'a> Stage2Baum<'a> {
                 );
                 let p1 = al_probs1[a1 as usize] * al_probs2[a2 as usize];
                 let p2 = al_probs1[a2 as usize] * al_probs2[a1 as usize];
-                let swap = p1 < p2 || (p1 == p2 && self.rng.next_boolean());
-                if swap { (a2, a1) } else { (a1, a2) }
+                self.n_het_seen += 1;
+                let is_tie = p1 == p2;
+                if is_tie { self.n_tie_coinflip += 1; }
+                let swap = p1 < p2 || (is_tie && self.rng.next_boolean());
+                if swap {
+                    self.n_swap_done += 1;
+                    (a2, a1)
+                } else {
+                    (a1, a2)
+                }
             };
             write(m, sample, out_a1, out_a2);
         }
