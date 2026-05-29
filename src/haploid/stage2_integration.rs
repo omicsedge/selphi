@@ -96,11 +96,17 @@ pub fn run_stage2_after_stage1(
     let min_steps = std::cmp::max(200, (1.0 / 0.05f64).ceil() as usize);
 
     // 7) Stage2Input wiring.
-    let p_mismatch: f32 = 1.0e-4; // Beagle default for the HmmStateProbs emission
-    let max_states: usize = 70;   // Beagle: phase_states/2 (280/2 = 140); we use
-                                  // 70 as a reasonable middle-ground; will tune
-                                  // during validation
-    let max_backoff_steps: usize = 5;
+    //
+    // Beagle's Par.liStephensPMismatch(nHaps):
+    //   theta = 1 / (ln(nHaps) + 0.5)
+    //   pMismatch = theta / (2 * (theta + nHaps))
+    // For our trio chr22 with n_haps=4586 this gives ≈ 1.22e-5; my earlier
+    // hardcoded 1e-4 was ~10× too large, biasing the HMM toward false
+    // "mismatch" emissions and washing out the state-probability signal.
+    let theta = 1.0_f64 / ((n_haps as f64).ln() + 0.5);
+    let p_mismatch = (theta / (2.0 * (theta + n_haps as f64))) as f32;
+    let max_states: usize = 140;  // Beagle phase_states / 2 = 280 / 2 = 140
+    let max_backoff_steps: usize = 20;
     let no_ibs2: Vec<i32> = Vec::new();
 
     let input = stage2::Stage2Input {
