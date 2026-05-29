@@ -575,7 +575,8 @@ fn run_sweep_fwd(
     let mut inv_a = vec![0i32; n_haps];
     let mut i_to_prev = vec![0i32; n_haps];
     let mut i_to_next = vec![0i32; n_haps];
-    let max_states = input.max_states;
+    let _max_states = input.max_states;
+    let n_candidates = input.n_candidates;
     let max_backoff = input.max_backoff_steps as i32;
 
     let mut fwd_out: Vec<Vec<i32>> = Vec::with_capacity(n_steps);
@@ -618,7 +619,7 @@ fn run_sweep_fwd(
                     carrier_hit += 1;
                 } else {
                     fallback += 1;
-                    let (u, v) = expand_window_fwd(i, &div, step as i32, n_haps, max_states);
+                    let (u, v) = expand_window_fwd(i, &div, step as i32, n_haps, n_candidates);
                     let m = get_match(
                         m_start as i32, m_incl_end, i, u, v, &prefix, &mut rng,
                         input.ibs2_offsets, input.ibs2_start, input.ibs2_end, input.ibs2_other,
@@ -658,7 +659,8 @@ fn run_sweep_bwd(
     let mut inv_a = vec![0i32; n_haps];
     let mut i_to_prev = vec![0i32; n_haps];
     let mut i_to_next = vec![0i32; n_haps];
-    let max_states = input.max_states;
+    let _max_states = input.max_states;
+    let n_candidates = input.n_candidates;
     let max_backoff = input.max_backoff_steps as i32;
 
     let mut bwd_out: Vec<Option<Vec<i32>>> = (0..n_steps).map(|_| None).collect();
@@ -698,7 +700,7 @@ fn run_sweep_bwd(
                 if best_i >= 0 {
                     selected[prefix[i] as usize] = prefix[best_i as usize];
                 } else {
-                    let (u, v) = expand_window_bwd(i, &div, step as i32, n_haps, max_states);
+                    let (u, v) = expand_window_bwd(i, &div, step as i32, n_haps, n_candidates);
                     selected[prefix[i] as usize] = get_match(
                         m_start as i32, m_incl_end, i, u, v, &prefix, &mut rng,
                         input.ibs2_offsets, input.ibs2_start, input.ibs2_end, input.ibs2_other,

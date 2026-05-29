@@ -145,7 +145,13 @@ impl<'a> Stage2Baum<'a> {
                 self.n_het_seen += 1;
                 let is_tie = p1 == p2;
                 if is_tie { self.n_tie_coinflip += 1; }
-                let swap = p1 < p2 || (is_tie && self.rng.next_boolean());
+                // Beagle's rule is `swap = p1 < p2 || (p1 == p2 && rand.nextBoolean())`,
+                // but on Selphi data ties happen ~65% of the time (degenerate al_probs
+                // when no IBS-carrier states fire), so coin-flipping them destroys ~32%
+                // of already-correct stage-1 phasing. Trust stage-1 on ties instead —
+                // STAGE2_COIN_FLIP_TIES=1 restores Beagle-exact behaviour for parity tests.
+                let coinflip_ties = std::env::var("STAGE2_COIN_FLIP_TIES").ok().as_deref() == Some("1");
+                let swap = p1 < p2 || (is_tie && coinflip_ties && self.rng.next_boolean());
                 if swap {
                     self.n_swap_done += 1;
                     (a2, a1)

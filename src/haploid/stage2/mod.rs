@@ -74,6 +74,13 @@ pub struct Stage2Input<'a> {
     /// `par.phase_states()/2`, typically 140).
     pub max_states: usize,
 
+    /// Random-fallback window size when the PBWT carrier-link picker fails.
+    /// Beagle uses `STAGE2_CANDIDATES = 10` (much smaller than `max_states`)
+    /// to keep the fallback picks PBWT-adjacent — random haps far away in
+    /// PBWT order are not actually IBS with the target and pollute the
+    /// composite state set with noise.
+    pub n_candidates: usize,
+
     /// Maximum number of PBWT steps to back off when searching for an IBS
     /// neighbor (Beagle: `phaseData.maxBackoffSteps()`).
     pub max_backoff_steps: usize,
