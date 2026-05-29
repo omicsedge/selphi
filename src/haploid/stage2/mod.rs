@@ -100,15 +100,23 @@ pub struct Stage2Output {
 /// The caller must have already phased the target at common (high-frequency)
 /// markers (stage-1). The phased haplotypes plus the reference panel must
 /// be passed via `Stage2Input::all_haps_packed`.
-pub fn run(_input: &Stage2Input) -> Stage2Output {
-    // TODO(stage2): implement
-    // High-level flow per `stage2_design.md`:
-    //   let ibs = pbwt_ibs::LowFreqPbwtPhaseIbs::new(input);
-    //   for each target hap (parallel):
-    //       let mut hmm = hmm_state_probs::HmmStateProbs::new(&ibs, input);
-    //       let n_states = hmm.run(targ_hap, &mut ref_haps, &mut state_probs);
-    //       baum::Stage2Baum::new(...).phase(sample, &mut output);
-    unimplemented!("stage2::run not yet implemented; see stage2_design.md")
+///
+/// `write` is invoked for every (sample, marker) the algorithm considers,
+/// with the chosen phased alleles `(a1, a2)`. The caller writes them back
+/// into its own target genotype matrix.
+///
+/// This is single-threaded for now; per-sample parallelization with rayon
+/// is a follow-up after the algorithm is validated against Beagle SER.
+pub fn run<F>(input: &Stage2Input, mut write: F)
+where
+    F: FnMut(usize, usize, u8, u8),
+{
+    let ibs = pbwt_ibs::LowFreqPbwtPhaseIbs::new(input);
+    let mut baum = baum::Stage2Baum::new(&ibs, input);
+    let n_samples = input.n_target_haps / 2;
+    for sample in 0..n_samples {
+        baum.phase(sample, &mut write);
+    }
 }
 
 /// Whether the Beagle gating condition is met to run stage-2: > 25% of markers
