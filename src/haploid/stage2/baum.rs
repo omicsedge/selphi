@@ -86,12 +86,17 @@ impl<'a> Stage2Baum<'a> {
         let packed = self.input.all_haps_packed;
         let n_haps = self.input.n_haps;
         let n_markers = self.input.n_markers;
+        // Diagnostic env knob: if SELPHI_HAPLOID_STAGE2_DEBUG=noswap, write the
+        // input alleles back unchanged — used to verify the integration path
+        // doesn't itself corrupt phase (separates swap-logic bugs from
+        // integration bugs). Default behaviour runs the full swap test.
+        let no_swap = std::env::var("SELPHI_HAPLOID_STAGE2_DEBUG").ok().as_deref()
+            == Some("noswap");
 
         for m in start..end {
             let a1 = super::baum::allele(packed, n_haps, n_markers, m, hap1);
             let a2 = super::baum::allele(packed, n_haps, n_markers, m, hap2);
-            let (out_a1, out_a2) = if a1 == a2 {
-                // Homozygous: nothing to do, write unchanged.
+            let (out_a1, out_a2) = if a1 == a2 || no_swap {
                 (a1, a2)
             } else {
                 // Heterozygous: swap test using state probs.
@@ -149,18 +154,13 @@ impl<'a> Stage2Baum<'a> {
         (idx, wt)
     }
 
-    /// Whether `allele` at global marker `m` is "low-frequency" by Beagle's
-    /// definition. We approximate via the carrier list at this marker: if
-    /// there's a non-empty carriers list (which we precompute only for rare
-    /// alleles) and the allele matches one of the carrier patterns, it's rare.
+    /// Whether `allele` at global marker `m` is the low-frequency allele
+    /// (Beagle's `fpd.isLowFreq(m, al)`). Returns true iff the marker has
+    /// a designated rare allele AND `allele` equals that designation.
     fn is_low_freq(&self, m: usize, allele: u8) -> bool {
-        if m >= self.input.rare_carriers.len() {
-            return false;
-        }
-        let carriers = &self.input.rare_carriers[m];
-        // If carriers is non-empty, allele 1 is the rare allele (biallelic
-        // SNVs only — TODO multi-allelic).
-        !carriers.is_empty() && allele == 1
+        if m >= self.input.rare_allele.len() { return false; }
+        let r = self.input.rare_allele[m];
+        r >= 0 && r as u8 == allele
     }
 }
 
@@ -170,20 +170,22 @@ impl<'a> Stage2Baum<'a> {
 // unit-tested in isolation against hand-computed reference values.
 // ---------------------------------------------------------------------------
 
-/// Allele lookup at a (marker, hap) pair. `target_hap_count` separates the
-/// target haps (indices < `target_hap_count`) from the reference haps
-/// (indices ≥ `target_hap_count`). Returns the allele (0 or 1).
+/// Allele lookup at a (marker, hap) pair. Layout is **site-major** to match
+/// Selphi's existing `HaplotypeBitmatrix` (one row per marker, haps packed
+/// into `u64` chunks within each row). `n_words = ceil(n_haps / 64)` is the
+/// stride per marker row.
 ///
-/// `all_haps_packed` is row-major: row = hap, col = marker, packed as
-/// 1 bit per allele into `u64` chunks. So
-/// `allele(m, h) = (all_haps_packed[h * stride + (m >> 6)] >> (m & 63)) & 1`.
+/// `allele(m, h) = (packed[m * n_words + (h >> 6)] >> (h & 63)) & 1`.
+///
+/// This is the same layout produced by `common::bitmatrix::HaplotypeBitmatrix`
+/// so the integration in `phase_genotypes_inner` can reuse the existing
+/// reference-panel packed bits directly (no transpose).
 #[inline]
-pub fn allele(all_haps_packed: &[u64], n_haps: usize, n_markers: usize, marker: usize, hap: usize) -> u8 {
-    debug_assert!(marker < n_markers);
+pub fn allele(all_haps_packed: &[u64], n_haps: usize, _n_markers: usize, marker: usize, hap: usize) -> u8 {
     debug_assert!(hap < n_haps);
-    let stride = n_markers.div_ceil(64);
-    let word = all_haps_packed[hap * stride + (marker >> 6)];
-    ((word >> (marker & 63)) & 1) as u8
+    let n_words = n_haps.div_ceil(64);
+    let word = all_haps_packed[marker * n_words + (hap >> 6)];
+    ((word >> (hap & 63)) & 1) as u8
 }
 
 /// Compute unscaled allele probabilities at rare marker `m` for one of the
@@ -345,21 +347,22 @@ fn max_index(a: &[f32]) -> usize {
 mod tests {
     use super::*;
 
-    /// Build a packed haplotype matrix from a Vec<Vec<u8>> of 0/1 alleles
-    /// for testing. Returns (packed, stride).
+    /// Build a SITE-MAJOR packed haplotype matrix for testing. Returns
+    /// (packed, n_haps, n_markers, n_words). Site-major layout matches
+    /// `allele()` and Selphi's HaplotypeBitmatrix.
     fn pack(haps: &[Vec<u8>]) -> (Vec<u64>, usize, usize, usize) {
         let n_haps = haps.len();
         let n_markers = haps[0].len();
-        let stride = n_markers.div_ceil(64);
-        let mut packed = vec![0u64; n_haps * stride];
+        let n_words = n_haps.div_ceil(64);
+        let mut packed = vec![0u64; n_markers * n_words];
         for (h, row) in haps.iter().enumerate() {
             for (m, &a) in row.iter().enumerate() {
                 if a != 0 {
-                    packed[h * stride + (m >> 6)] |= 1u64 << (m & 63);
+                    packed[m * n_words + (h >> 6)] |= 1u64 << (h & 63);
                 }
             }
         }
-        (packed, n_haps, n_markers, stride)
+        (packed, n_haps, n_markers, n_words)
     }
 
     #[test]

@@ -39,6 +39,12 @@ pub struct Stage2Input<'a> {
     /// the rare allele at marker m, empty if marker is not rare).
     pub rare_carriers: &'a [Vec<u32>],
 
+    /// Per-marker rare-allele code: 0 or 1 if that allele is the rare one
+    /// at marker `m`, `-1` if the marker is common (no rare allele). Used
+    /// by `Stage2Baum::is_low_freq` to determine whether a target's allele
+    /// at a rare marker IS the rare allele (Beagle's `fpd.isLowFreq(m, al)`).
+    pub rare_allele: &'a [i8],
+
     /// Stage-1 step boundaries in stage-1-marker coords: `(start, end_excl)`.
     pub stage1_steps: &'a [(usize, usize)],
 
