@@ -9,6 +9,7 @@ pub mod simd;
 pub mod rng;
 pub mod debug;
 pub mod composite;
+pub mod stage2;
 
 use crate::selphi_debug;
 use rayon::prelude::*;
