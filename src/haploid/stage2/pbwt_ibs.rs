@@ -780,57 +780,61 @@ fn collect_step_carriers(input: &Stage2Input, stage1_start: usize, stage1_end_ex
 /// kill that side's `next_end` so the loop can keep expanding the other
 /// side. Otherwise an early v- or u-edge prematurely truncates the window
 /// and produces 1-hap windows that `get_match` reports as -1.
+/// Forward expand: fwd PBWT divergence stores "match start marker" — small = long match.
+/// We track the MAX (worst / latest match-start) on each side; loop while at least one
+/// side still has match-start ≤ step. Literal port of Beagle `LowFreqPbwtPhaseIbs.getfwdIbsHaps`.
 fn expand_window_fwd(i: usize, d: &[i32], step: i32, n_haps: usize, n_candidates: usize) -> (usize, usize) {
     let mut u = i;
     let mut v = i + 1;
-    let n_words = d.len(); // = n_haps + 1 (incl. sentinel)
-    let mut u_next_end = d[u];
-    let mut v_next_end = if v < n_words { d[v] } else { i32::MIN };
-    while (v - u) < n_candidates && (step <= u_next_end || step <= v_next_end) {
-        if u_next_end <= v_next_end {
-            // try expanding v
+    let n_words = d.len(); // = n_haps + 1 (incl. sentinel at d[n_haps])
+    let mut u_next_match_start = d[u];
+    let mut v_next_match_start = if v < n_words { d[v] } else { i32::MAX };
+    while (v - u) < n_candidates && (u_next_match_start <= step || v_next_match_start <= step) {
+        if v_next_match_start <= u_next_match_start {
+            // v-side is doing better (more recent matches) — extend v.
             if v + 1 < n_words {
                 v += 1;
-                v_next_end = d[v].min(v_next_end);
+                v_next_match_start = d[v].max(v_next_match_start);
             } else {
-                v_next_end = i32::MIN; // v side exhausted
+                v_next_match_start = i32::MAX; // exhausted
             }
         } else {
-            // try expanding u
             if u > 0 {
                 u -= 1;
-                u_next_end = d[u].min(u_next_end);
+                u_next_match_start = d[u].max(u_next_match_start);
             } else {
-                u_next_end = i32::MIN; // u side exhausted
+                u_next_match_start = i32::MAX; // exhausted
             }
         }
-        // Cap window to [0, n_haps] strictly.
         if v > n_haps { v = n_haps; break; }
     }
     (u, v)
 }
 
-/// Backward direction window expansion.
+/// Backward expand: bwd PBWT divergence stores "match end marker" — large = long match.
+/// We track the MIN (worst / earliest match-end) on each side; loop while at least one
+/// side still has match-end ≥ step. Literal port of Beagle `LowFreqPbwtPhaseIbs.getbwdIbsHaps`.
 fn expand_window_bwd(i: usize, d: &[i32], step: i32, n_haps: usize, n_candidates: usize) -> (usize, usize) {
     let mut u = i;
     let mut v = i + 1;
     let n_words = d.len();
-    let mut u_next_start = d[u];
-    let mut v_next_start = if v < n_words { d[v] } else { i32::MAX };
-    while (v - u) < n_candidates && (u_next_start <= step || v_next_start <= step) {
-        if v_next_start <= u_next_start {
+    let mut u_next_match_end = d[u];
+    let mut v_next_match_end = if v < n_words { d[v] } else { i32::MIN };
+    while (v - u) < n_candidates && (step <= u_next_match_end || step <= v_next_match_end) {
+        if u_next_match_end <= v_next_match_end {
+            // v-side is doing better (later end / longer match) — extend v.
             if v + 1 < n_words {
                 v += 1;
-                v_next_start = d[v].max(v_next_start);
+                v_next_match_end = d[v].min(v_next_match_end);
             } else {
-                v_next_start = i32::MAX;
+                v_next_match_end = i32::MIN;
             }
         } else {
             if u > 0 {
                 u -= 1;
-                u_next_start = d[u].max(u_next_start);
+                u_next_match_end = d[u].min(u_next_match_end);
             } else {
-                u_next_start = i32::MAX;
+                u_next_match_end = i32::MIN;
             }
         }
         if v > n_haps { v = n_haps; break; }
