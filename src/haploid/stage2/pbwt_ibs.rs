@@ -176,18 +176,22 @@ impl LowFreqPbwtPhaseIbs {
     /// default is the same `phase_states/2` used for the composite state
     /// count; we expose it via `Stage2Input::max_states` (already passed).
     pub fn new(input: &Stage2Input) -> Self {
-        // Build per-step coded sequences once. coded[step][hap] = allele
-        // index 0..n_alleles_at_step-1. For the haploid stage-2 the allele
-        // coding is just the hap's bit at the step's middle marker (Beagle
-        // uses CodedSteps which pre-computes step-coded alleles; for SNV-
-        // dominated panels nAlleles=2 and the coding is just the raw bit).
+        // Multi-marker coded-step encoding (Beagle CodedSteps equivalent).
+        // For each stage-1 step, encode each hap's allele pattern across
+        // the markers in the step. step_len <= 20 → bit-pack into u32;
+        // longer steps → FNV-1a hash. Then normalize to sequential indices.
+        // This produces n_alleles_per_step in the thousands (vs the
+        // earlier 2-allele single-marker encoding which made the PBWT
+        // divergences too "stale" and broke window expansion).
         let n_haps = input.n_haps;
         let n_steps = input.stage1_steps.len();
         let n_target_haps = input.n_target_haps;
-        let n_alleles_per_step = build_coded_steps(input);
+        let (coded_steps, n_alleles_per_step) = build_coded_steps(input);
 
-        let fwd = run_sweep_fwd(input, &n_alleles_per_step, n_haps, n_steps, n_target_haps);
-        let bwd = run_sweep_bwd(input, &n_alleles_per_step, n_haps, n_steps, n_target_haps);
+        let fwd = run_sweep_fwd(input, &coded_steps, &n_alleles_per_step,
+            n_haps, n_steps, n_target_haps);
+        let bwd = run_sweep_bwd(input, &coded_steps, &n_alleles_per_step,
+            n_haps, n_steps, n_target_haps);
 
         Self { fwd, bwd }
     }
@@ -210,11 +214,88 @@ impl LowFreqPbwtPhaseIbs {
 // panels would need richer coding — left as TODO since SNV panels dominate.
 // ---------------------------------------------------------------------------
 
-pub(super) fn build_coded_steps(input: &Stage2Input) -> Vec<usize> {
-    // For the current biallelic SNV use-case, every step has exactly 2 alleles.
-    // Returned vec is `n_alleles[step]`; if we later support multi-allelic we
-    // populate this from the actual count of distinct alleles in the step.
-    vec![2usize; input.stage1_steps.len()]
+/// Encode each step as a per-hap integer code by packing the bits of the
+/// step's spanning global markers (≤20) into a u32, or hashing them
+/// (FNV-1a) for longer steps. Then normalize to sequential indices.
+///
+/// Returns `(coded, n_alleles_per_step)` where:
+/// - `coded[step * n_haps + hap]` = the allele code for `hap` at `step`
+///   (an integer in 0..n_alleles_per_step[step]).
+/// - `n_alleles_per_step[step]` = number of distinct allele codes at step.
+///
+/// This is the Beagle `CodedSteps` equivalent: multiple distinct allele
+/// codes per step let the PBWT sort haps into TIGHT groups with shared
+/// multi-marker patterns, keeping divergences "recent" enough that the
+/// IBS-neighbor window expansion finds real neighbors. The previous
+/// single-marker version gave only n_alleles=2 per step, which created
+/// ~2293/2293 splits that left divergences stale (step - log2(n_haps))
+/// and produced empty IBS windows 99.5% of the time.
+pub(super) fn build_coded_steps(input: &Stage2Input) -> (Vec<i32>, Vec<usize>) {
+    use super::baum::allele;
+    let n_haps = input.n_haps;
+    let n_markers = input.n_markers;
+    let n_steps = input.stage1_steps.len();
+    let mut coded = vec![0i32; n_steps * n_haps];
+    let mut n_alleles_vec = vec![0usize; n_steps];
+
+    let mut seen: Vec<i32> = Vec::with_capacity(n_haps);
+
+    for (step, &(s1_start, s1_end_excl)) in input.stage1_steps.iter().enumerate() {
+        // Translate stage-1 step bounds to global marker bounds.
+        let global_start = if s1_start == 0 {
+            0
+        } else {
+            input.stage1_to_global[s1_start]
+        };
+        let global_end = if s1_end_excl < input.stage1_to_global.len() {
+            input.stage1_to_global[s1_end_excl]
+        } else {
+            n_markers
+        };
+
+        let step_len = global_end.saturating_sub(global_start);
+        let out_off = step * n_haps;
+
+        if step_len <= 20 && step_len > 0 {
+            // Bit-pack: one bit per marker, up to 20 bits → u32.
+            for h in 0..n_haps {
+                let mut v: i32 = 0;
+                for m in global_start..global_end {
+                    let bit = allele(input.all_haps_packed, n_haps, n_markers, m, h) as i32;
+                    v = (v << 1) | bit;
+                }
+                coded[out_off + h] = v;
+            }
+        } else if step_len > 20 {
+            // FNV-1a hash on the bit pattern.
+            for h in 0..n_haps {
+                let mut v: i32 = 2166136261u32 as i32 & 0x7FFFFFFF;
+                for m in global_start..global_end {
+                    let bit = allele(input.all_haps_packed, n_haps, n_markers, m, h) as i32;
+                    v = (v ^ bit).wrapping_mul(16777619) & 0x7FFFFFFF;
+                }
+                coded[out_off + h] = v;
+            }
+        }
+        // step_len == 0 → all 0 (degenerate but safe)
+
+        // Normalize to sequential 0..n_alleles indices.
+        seen.clear();
+        for h in 0..n_haps {
+            let v = coded[out_off + h];
+            let mut idx = -1i32;
+            for (k, &sv) in seen.iter().enumerate() {
+                if sv == v { idx = k as i32; break; }
+            }
+            if idx < 0 {
+                idx = seen.len() as i32;
+                seen.push(v);
+            }
+            coded[out_off + h] = idx;
+        }
+        n_alleles_vec[step] = seen.len().max(1);
+    }
+    (coded, n_alleles_vec)
 }
 
 // ---------------------------------------------------------------------------
@@ -445,18 +526,23 @@ pub fn get_match(
     if i_length == 1 {
         return -1;
     }
+    let target_sample = (a[i] >> 1) as u32;
     let mut index = i_start + (rng.next_int(i_length as i32) as usize);
     for _ in 0..i_length {
-        if !are_ibs2(
-            (a[i] >> 1) as u32,
-            (a[index] >> 1) as u32,
-            m_start,
-            m_incl_end,
-            ibs2_offsets,
-            ibs2_start,
-            ibs2_end,
-            ibs2_other,
-        ) {
+        let cand_sample = (a[index] >> 1) as u32;
+        // Skip both haps of the target's own sample. Beagle's getMatch relies
+        // on the Ibs2 lookup to filter these out implicitly, but we always
+        // run with empty IBS2 data, so we add an explicit self-sample check
+        // to avoid returning the target's own hap as its "IBS neighbor"
+        // (which would produce a fake-perfect-match state and corrupt the
+        // HMM posterior).
+        if cand_sample != target_sample
+            && !are_ibs2(
+                target_sample, cand_sample,
+                m_start, m_incl_end,
+                ibs2_offsets, ibs2_start, ibs2_end, ibs2_other,
+            )
+        {
             return a[index];
         }
         index += 1;
@@ -473,29 +559,32 @@ pub fn get_match(
 
 fn run_sweep_fwd(
     input: &Stage2Input,
+    coded_steps: &[i32],
     n_alleles_per_step: &[usize],
     n_haps: usize,
     n_steps: usize,
     n_target_haps: usize,
 ) -> Vec<Vec<i32>> {
+    let debug = std::env::var("SELPHI_HAPLOID_STAGE2_DEBUG").ok().as_deref() == Some("trace");
+    let mut carrier_hit = 0u64;
+    let mut fallback = 0u64;
+    let mut fallback_null = 0u64;
     let mut pbwt = PbwtDivUpdater::new(n_haps);
     let mut prefix: Vec<i32> = (0..n_haps as i32).collect();
     let mut div = vec![0i32; n_haps + 1];
     let mut inv_a = vec![0i32; n_haps];
     let mut i_to_prev = vec![0i32; n_haps];
     let mut i_to_next = vec![0i32; n_haps];
-    let mut allele_coding = vec![0i32; n_haps];
     let max_states = input.max_states;
     let max_backoff = input.max_backoff_steps as i32;
 
     let mut fwd_out: Vec<Vec<i32>> = Vec::with_capacity(n_steps);
     for step in 0..n_steps {
         let (m_start, m_end_excl) = input.stage1_steps[step];
-        let mid_marker = (m_start + m_end_excl) / 2;
-        encode_step_alleles(input, mid_marker, &mut allele_coding);
+        let allele_coding = &coded_steps[step * n_haps..(step + 1) * n_haps];
 
         pbwt.fwd_update(
-            &allele_coding,
+            allele_coding,
             n_alleles_per_step[step],
             step as i32,
             &mut prefix,
@@ -526,17 +615,27 @@ fn run_sweep_fwd(
                 );
                 if best_i >= 0 {
                     selected[prefix[i] as usize] = prefix[best_i as usize];
+                    carrier_hit += 1;
                 } else {
-                    // Random fallback: expand window [u, v] until enough cands or out of bounds.
+                    fallback += 1;
                     let (u, v) = expand_window_fwd(i, &div, step as i32, n_haps, max_states);
-                    selected[prefix[i] as usize] = get_match(
+                    let m = get_match(
                         m_start as i32, m_incl_end, i, u, v, &prefix, &mut rng,
                         input.ibs2_offsets, input.ibs2_start, input.ibs2_end, input.ibs2_other,
                     );
+                    if m < 0 { fallback_null += 1; }
+                    selected[prefix[i] as usize] = m;
                 }
             }
         }
         fwd_out.push(selected);
+    }
+    if debug {
+        eprintln!(
+            "  [stage2 fwd] carrier_hit={} fallback={} fallback_null={} (ratio carrier={:.1}%)",
+            carrier_hit, fallback, fallback_null,
+            100.0 * carrier_hit as f64 / (carrier_hit + fallback) as f64,
+        );
     }
     fwd_out
 }
@@ -547,6 +646,7 @@ fn run_sweep_fwd(
 
 fn run_sweep_bwd(
     input: &Stage2Input,
+    coded_steps: &[i32],
     n_alleles_per_step: &[usize],
     n_haps: usize,
     n_steps: usize,
@@ -558,7 +658,6 @@ fn run_sweep_bwd(
     let mut inv_a = vec![0i32; n_haps];
     let mut i_to_prev = vec![0i32; n_haps];
     let mut i_to_next = vec![0i32; n_haps];
-    let mut allele_coding = vec![0i32; n_haps];
     let max_states = input.max_states;
     let max_backoff = input.max_backoff_steps as i32;
 
@@ -566,11 +665,10 @@ fn run_sweep_bwd(
     for step_ri in 0..n_steps {
         let step = n_steps - 1 - step_ri;
         let (m_start, m_end_excl) = input.stage1_steps[step];
-        let mid_marker = (m_start + m_end_excl) / 2;
-        encode_step_alleles(input, mid_marker, &mut allele_coding);
+        let allele_coding = &coded_steps[step * n_haps..(step + 1) * n_haps];
 
         pbwt.bwd_update(
-            &allele_coding,
+            allele_coding,
             n_alleles_per_step[step],
             step as i32,
             &mut prefix,
@@ -676,23 +774,38 @@ fn collect_step_carriers(input: &Stage2Input, stage1_start: usize, stage1_end_ex
 }
 
 /// Walk PBWT positions outward from `i` until window has ≥ n_candidates haps
-/// or runs out of haps with d ≤ step (fwd direction).
+/// or both sides have exhausted matches reaching `step`.
+///
+/// Closer to Beagle's logic: instead of `break`ing when an edge is hit, we
+/// kill that side's `next_end` so the loop can keep expanding the other
+/// side. Otherwise an early v- or u-edge prematurely truncates the window
+/// and produces 1-hap windows that `get_match` reports as -1.
 fn expand_window_fwd(i: usize, d: &[i32], step: i32, n_haps: usize, n_candidates: usize) -> (usize, usize) {
     let mut u = i;
     let mut v = i + 1;
+    let n_words = d.len(); // = n_haps + 1 (incl. sentinel)
     let mut u_next_end = d[u];
-    let mut v_next_end = if v < d.len() { d[v] } else { step + 1 };
+    let mut v_next_end = if v < n_words { d[v] } else { i32::MIN };
     while (v - u) < n_candidates && (step <= u_next_end || step <= v_next_end) {
         if u_next_end <= v_next_end {
-            if v + 1 >= d.len() { break; }
-            v += 1;
-            v_next_end = d[v].min(v_next_end);
-            if v >= n_haps { v = n_haps; break; }
+            // try expanding v
+            if v + 1 < n_words {
+                v += 1;
+                v_next_end = d[v].min(v_next_end);
+            } else {
+                v_next_end = i32::MIN; // v side exhausted
+            }
         } else {
-            if u == 0 { break; }
-            u -= 1;
-            u_next_end = d[u].min(u_next_end);
+            // try expanding u
+            if u > 0 {
+                u -= 1;
+                u_next_end = d[u].min(u_next_end);
+            } else {
+                u_next_end = i32::MIN; // u side exhausted
+            }
         }
+        // Cap window to [0, n_haps] strictly.
+        if v > n_haps { v = n_haps; break; }
     }
     (u, v)
 }
@@ -701,19 +814,26 @@ fn expand_window_fwd(i: usize, d: &[i32], step: i32, n_haps: usize, n_candidates
 fn expand_window_bwd(i: usize, d: &[i32], step: i32, n_haps: usize, n_candidates: usize) -> (usize, usize) {
     let mut u = i;
     let mut v = i + 1;
+    let n_words = d.len();
     let mut u_next_start = d[u];
-    let mut v_next_start = if v < d.len() { d[v] } else { step - 1 };
+    let mut v_next_start = if v < n_words { d[v] } else { i32::MAX };
     while (v - u) < n_candidates && (u_next_start <= step || v_next_start <= step) {
         if v_next_start <= u_next_start {
-            if v + 1 >= d.len() { break; }
-            v += 1;
-            v_next_start = d[v].max(v_next_start);
-            if v >= n_haps { v = n_haps; break; }
+            if v + 1 < n_words {
+                v += 1;
+                v_next_start = d[v].max(v_next_start);
+            } else {
+                v_next_start = i32::MAX;
+            }
         } else {
-            if u == 0 { break; }
-            u -= 1;
-            u_next_start = d[u].max(u_next_start);
+            if u > 0 {
+                u -= 1;
+                u_next_start = d[u].max(u_next_start);
+            } else {
+                u_next_start = i32::MAX;
+            }
         }
+        if v > n_haps { v = n_haps; break; }
     }
     (u, v)
 }
