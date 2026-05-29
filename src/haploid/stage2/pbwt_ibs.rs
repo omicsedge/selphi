@@ -635,10 +635,36 @@ fn encode_step_alleles(input: &Stage2Input, marker: usize, out: &mut [i32]) {
     }
 }
 
-/// Collect the rare-allele carrier groups for all markers in `[m_start, m_end)`.
-fn collect_step_carriers(input: &Stage2Input, m_start: usize, m_end_excl: usize) -> Vec<Vec<u32>> {
+/// Collect the rare-allele carrier groups for the global markers spanned by
+/// stage-1 step `[stage1_start, stage1_end_excl)`.
+///
+/// CRITICAL: `stage1_steps[step]` returns boundaries in **stage-1 marker**
+/// index space (positions into `stage1_to_global`), while `rare_carriers`
+/// is indexed by **global VCF marker** index. We must translate via
+/// `stage1_to_global` before looking up carriers. Beagle does the same in
+/// `LowFreqPbwtPhaseIbs.lowFreqHapLists` (translates stage-1 step bounds
+/// into global marker bounds via `stage1To2`).
+fn collect_step_carriers(input: &Stage2Input, stage1_start: usize, stage1_end_excl: usize) -> Vec<Vec<u32>> {
+    let n_stage1 = input.stage1_to_global.len();
+    if n_stage1 == 0 { return Vec::new(); }
+    // Stage-1 start → global marker idx of that stage-1 marker. Special case
+    // the very first step's left edge to global 0 so we don't miss rare
+    // markers BEFORE the first stage-1 marker.
+    let global_start = if stage1_start == 0 {
+        0
+    } else {
+        input.stage1_to_global[stage1_start]
+    };
+    // Stage-1 end (exclusive) → global marker idx of the first stage-1 marker
+    // NOT in this step. If we're at the last step, run all the way to n_markers
+    // to include rare markers past the last stage-1 marker.
+    let global_end = if stage1_end_excl < n_stage1 {
+        input.stage1_to_global[stage1_end_excl]
+    } else {
+        input.n_markers
+    };
     let mut out: Vec<Vec<u32>> = Vec::new();
-    for m in m_start..m_end_excl {
+    for m in global_start..global_end {
         if m < input.rare_carriers.len() {
             let carriers = &input.rare_carriers[m];
             if carriers.len() > 1 {

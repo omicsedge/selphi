@@ -45,6 +45,19 @@ pub struct Stage2Input<'a> {
     /// at a rare marker IS the rare allele (Beagle's `fpd.isLowFreq(m, al)`).
     pub rare_allele: &'a [i8],
 
+    /// Per-(global)-marker index of the previous stage-1 marker (in the
+    /// stage-1 list, not in global VCF coords). Used by Stage2Baum to
+    /// interpolate state probabilities between flanking stage-1 markers.
+    /// Beagle: `FixedPhaseData.prevStage1Marker[m]`.
+    pub prev_stage1_marker: &'a [usize],
+
+    /// Per-(global)-marker interpolation weight on the previous stage-1
+    /// marker. `prev_wt[m] = (posB - posM) / (posB - posA)` where posA is
+    /// the cM of the previous stage-1 marker and posB the cM of the next.
+    /// At a stage-1 marker itself the weight is 1.0. Beagle:
+    /// `FixedPhaseData.prevStage1Wt[m]`.
+    pub prev_stage1_wt: &'a [f32],
+
     /// Stage-1 step boundaries in stage-1-marker coords: `(start, end_excl)`.
     pub stage1_steps: &'a [(usize, usize)],
 

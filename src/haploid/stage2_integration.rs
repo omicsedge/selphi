@@ -61,6 +61,11 @@ pub fn run_stage2_after_stage1(
     if !stage2::should_run_stage2(n_high_freq, n_var) {
         return false;
     }
+    // Stats for debugging
+    let n_low_freq = n_var - n_high_freq;
+    let n_carrier_groups_gt1 = rare_carriers.iter().filter(|c| c.len() > 1).count();
+    eprintln!("  [stage2] markers: total={} high_freq={} low_freq={} (carriers>1: {})",
+        n_var, n_high_freq, n_low_freq, n_carrier_groups_gt1);
 
     // 2) Combined site-major bit-packed panel: target haps first, then ref.
     let combined_panel = build_combined_panel(global_phased, ref_bm, n_var, n_targ_haps, n_ref_haps);
@@ -80,6 +85,11 @@ pub fn run_stage2_after_stage1(
 
     // 5) Per-stage-1-marker recombination probabilities (used by HmmStateProbs).
     let p_recomb_per_stage1 = compute_p_recomb(&stage1_cm, n_haps, STAGE2_NE);
+
+    // 5b) Per-global-marker prev-stage1-marker index + cM-weighted
+    //     interpolation weight. Beagle FixedPhaseData prevWt + prevStage1Marker.
+    let (prev_stage1_marker, prev_stage1_wt) =
+        build_prev_stage1_arrays(chip_cm, &stage1_to_global);
 
     // 6) min_steps mirrors Beagle: max(200, ceil(1 / ibs_step)) where
     //    ibs_step is the median between-step cM (≈ 0.05 cM here).
@@ -101,6 +111,8 @@ pub fn run_stage2_after_stage1(
         stage1_to_global: &stage1_to_global,
         rare_carriers: &rare_carriers,
         rare_allele: &rare_allele,
+        prev_stage1_marker: &prev_stage1_marker,
+        prev_stage1_wt: &prev_stage1_wt,
         stage1_steps: &stage1_steps,
         stage1_cm: &stage1_cm,
         p_recomb_per_marker: &p_recomb_per_stage1,
@@ -253,6 +265,79 @@ fn build_steps(stage1_cm: &[f64], step_cm: f64) -> Vec<(usize, usize)> {
     }
     steps.push((step_start, stage1_cm.len()));
     steps
+}
+
+/// Beagle FixedPhaseData.prevStage1Marker + prevStage1Wt precomputation.
+/// For each global marker `m`, store:
+/// - `prev_marker[m]` = index in stage-1 marker list of the closest stage-1
+///   marker preceding (or AT) m. If m is before the first stage-1 marker
+///   we use index 0 (Beagle default int[] init behaviour).
+/// - `prev_wt[m]` = `(posB - posM) / (posB - posA)` where posA and posB
+///   are the cM positions of the flanking stage-1 markers. At stage-1
+///   markers themselves the weight is 1.0. At markers outside the stage-1
+///   range we use 1.0 (Beagle Arrays.fill default).
+fn build_prev_stage1_arrays(chip_cm: &[f64], stage1_to_global: &[usize]) -> (Vec<usize>, Vec<f32>) {
+    let n_markers = chip_cm.len();
+    let n_hi = stage1_to_global.len();
+    let mut prev_marker = vec![0usize; n_markers];
+    let mut prev_wt = vec![1.0f32; n_markers];
+    if n_hi == 0 {
+        return (prev_marker, prev_wt);
+    }
+
+    // For each consecutive pair of stage-1 markers, fill the in-between
+    // global markers with cM-weighted prev weight + record prev index.
+    // Mirrors Beagle FixedPhaseData.prevStage1Marker:
+    //   for j in 2..nHiFreq: mkrA[stage1[j-1]..stage1[j]] = j-1
+    // and prevWt:
+    //   for j in 1..nHiFreq: prev_wt[m] = (posB - posM)/(posB - posA)
+    //                        for m in (stage1[j-1], stage1[j])
+    //                        and prev_wt[stage1[j-1]] = 1.0
+    // Edges:
+    //   prev_wt[0..stage1[0]] = 1.0
+    //   prev_wt[stage1[last]..n_markers] = 1.0
+    //   prev_marker[stage1[last]..n_markers] = n_hi - 1
+    //   prev_marker[0..stage1[1]] = 0  (the default zero init from Beagle int[])
+
+    if n_hi >= 2 {
+        let mut start = stage1_to_global[1];
+        for j in 2..n_hi {
+            let end = stage1_to_global[j];
+            for m in start..end {
+                prev_marker[m] = j - 1;
+            }
+            start = end;
+        }
+        for m in start..n_markers {
+            prev_marker[m] = n_hi - 1;
+        }
+    }
+
+    let mut start = stage1_to_global[0];
+    for j in 1..n_hi {
+        let end = stage1_to_global[j];
+        let pos_a = chip_cm[start];
+        let pos_b = chip_cm[end];
+        let d = pos_b - pos_a;
+        prev_wt[start] = 1.0;
+        if d > 0.0 {
+            for m in (start + 1)..end {
+                let pos_m = chip_cm[m];
+                prev_wt[m] = ((pos_b - pos_m) / d) as f32;
+            }
+        } else {
+            // Degenerate (same cM): split evenly
+            for m in (start + 1)..end {
+                prev_wt[m] = 0.5;
+            }
+        }
+        start = end;
+    }
+    for m in start..n_markers {
+        prev_wt[m] = 1.0;
+    }
+
+    (prev_marker, prev_wt)
 }
 
 /// Per-stage-1-marker recombination probability
