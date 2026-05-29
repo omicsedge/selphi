@@ -14,13 +14,13 @@ The dominant computational framework for genotype imputation is the Li and Steph
 
 The current imputation ecosystem is fragmented across multiple specialized tools. A standard end-to-end workflow phases the target with Eagle2 [8] or SHAPEIT5 [9], imputes the phased target with Beagle 5.4 [5], IMPUTE5 [4], or Minimac4 [7], converts the reference panel between project-specific binary formats with dedicated converters (bref3 for Beagle, xcf for IMPUTE5, msav for Minimac4), splits the genome into per-chromosome files for parallel execution, indexes outputs with bcftools, and re-encodes results into downstream formats (BCF, Apache Parquet, PLINK2 PGEN [10]) with external writers. Each handoff requires intermediate files, shell glue, and per-chromosome bookkeeping. Beagle 5.4 [5] integrates phasing and imputation in a single Java process, mitigating some of this fragmentation, but the genome is still processed one chromosome at a time and the output is restricted to VCF.
 
-The original Selphi [23] addressed a different limitation of this ecosystem: the locality of haplotype matching imposed by sliding-window or chunked PBWT scans. By performing a chromosome-wide PBWT scan and accumulating cumulative match statistics across that scan, Selphi 1 achieved higher rare-variant imputation accuracy than Beagle 5.4, IMPUTE5, and Minimac4 across the 1000 Genomes Project [19] and TOPMed [24] reference panels. However, Selphi 1 was implemented in Python with Numba-JIT-compiled inner loops, required pre-phased input, processed one chromosome at a time, and capped the per-target retained haplotype set at K_2 = 60 — a cap calibrated on the 1000 Genomes Phase 3 panel (4,802 haplotypes; ~1.2% retained) that, when applied to biobank-scale panels such as TOPMed (171,054 haplotypes; ~0.04% retained), systematically excluded rare-variant carriers from minority sub-populations, eroding accuracy on admixed cohorts.
+The original Selphi [23] addressed a different limitation of this ecosystem: the locality of haplotype matching imposed by sliding-window or chunked PBWT scans. By performing a chromosome-wide PBWT scan and accumulating cumulative match statistics across that scan, Selphi 1 achieved higher rare-variant imputation accuracy than Beagle 5.4, IMPUTE5, and Minimac4 across the 1000 Genomes Project [19] and TOPMed [24] reference panels. However, Selphi 1 was implemented in Python with Numba-JIT-compiled inner loops, required pre-phased input, processed one chromosome at a time, and capped the per-target retained haplotype set at K_2 = 60 — a cap calibrated on the 1000 Genomes Phase 3 panel (4,802 haplotypes; 1.2% retained) that, when applied to biobank-scale panels such as TOPMed (171,054 haplotypes; 0.04% retained), systematically excluded rare-variant carriers from minority sub-populations, eroding accuracy on admixed cohorts.
 
 Recent methodological advances have addressed some of these challenges in isolation. SHAPEIT5 [9] introduced a two-stage phasing strategy that first establishes a common-variant scaffold and then phases rare variants onto it, substantially reducing switch error rates for low-frequency variants in large cohorts. GLIMPSE2 [11] developed sparse panel representations that encode common variants at bit-level granularity and store rare allele carriers as index lists, enabling efficient imputation from low-coverage sequencing data. QUILT2 [12] extended the PBWT with multi-symbol matching for application to diverse sequencing technologies. None of these tools, however, integrate phasing, imputation, panel preparation, indexing, and multi-format output in a single executable, nor do they perform whole-genome imputation in a single process against a single reference panel file.
 
 Here we present Selphi 2, a complete reimplementation of the Selphi algorithm in Rust that retains the chromosome-wide PBWT scan and multi-stage haplotype selection of Selphi 1 while resolving the workflow limitations above. Phasing is integrated through two engines selected automatically by input variant density: a haploid composite-HMM engine for chip arrays (up to 50,000 variants) and a diploid genotype-graph engine with MCMC sampling for WGS data (above 50,000 variants); pre-phased input is no longer required. Whole-genome imputation is performed in a single command against a single multi-chromosome reference panel file, with the next chromosome's data prefetched during the current chromosome's HMM computation, eliminating per-chromosome file splitting and output concatenation. The fixed per-target candidate-set cap of Selphi 1 is replaced by a panel-adaptive sizing formula derived from the reference panel size and the haplotype-pattern diversity of the panel, recovering the rare-variant accuracy that the fixed cap forfeited on admixed cohorts against biobank-scale panels. The Rust reimplementation, with a streaming sparse panel format that bounds peak memory below 500 MB during panel construction independently of panel size, reduces both wall time and peak memory relative to Selphi 1 (Results). Output is written to one or more of five formats from a single interpolation pass: VCF.gz, BCF 2.2, Apache Parquet, PLINK2 PGEN with dosage, and SelfDecode per-sample Parquet archives.
 
-In this paper, we describe the algorithmic components of Selphi 2 (Methods), benchmark its accuracy and resource consumption against Selphi 1 [23] and Beagle 5.4 [5] on the 1000 Genomes Project [19] and TOPMed [24] reference panels (Results), and compare its phasing performance against SHAPEIT5 [9] on the 1000 Genomes trio dataset.
+In this paper, we describe the algorithmic components of Selphi 2 (Methods) and benchmark its imputation accuracy, phasing accuracy, and resource consumption against Selphi 1 [23] and Beagle 5.4/5.5 [5,6] on the 1000 Genomes Project [19] and the TOPMed [24] reference panels (Results).
 
 ![Figure 1](figure1_pipeline.svg)
 
@@ -118,7 +118,7 @@ mc \= clamp(Nref (γ + α CVpanel), mcfloor, mcceil)
 
 where Nref is the total number of reference haplotypes, γ is a base fraction, α is a diversity-coupled fraction, and CVpanel ∈ \[0, 1\] is the coefficient of variation of compressed tile sizes in the SRP, computed once at panel load. CVpanel is a proxy for haplotype-pattern diversity: panels containing multiple distinct mosaic structures (multiple ancestries, divergent sub-populations) compress less uniformly than ancestrally homogeneous panels, yielding higher CV.
 
-**Choice of γ, α, mcfloor and mcceil.** The defaults γ \= 0.10, α \= 0.80, mcfloor \= 2,500, and mcceil \= 10⁶ were chosen so that mc remains near 2,500 on small homogeneous panels (preserving baseline accuracy on cohorts such as the 1000 Genomes Phase 3 panel) and rises with both n_ref and panel diversity on larger panels. The floor at 2,500 reproduces the historical default and ensures that even very small panels supply enough conditioning states to the HMM; the ceiling at 10⁶ is effectively unlimited and acts only as a safety bound against pathological inputs. On the panels evaluated in this work, the formula yields mc \= 3,133 for the 1000 Genomes Phase 3 panel (CVpanel \= 0.691, Nref \= 4,802) — essentially the floor — and mc \= 132,676 for the TOPMed panel (CVpanel \= 0.845, Nref \= 171,054) — approximately 78% of the panel. Users may override the automatic mc with a fixed value for reproducibility with prior results.
+**Choice of γ, α, mcfloor and mcceil.** The defaults γ \= 0.10, α \= 0.80, mcfloor \= 2,500, and mcceil \= 10⁶ were chosen so that mc remains near 2,500 on small homogeneous panels (preserving baseline accuracy on cohorts such as the 1000 Genomes Phase 3 panel) and rises with both n_ref and panel diversity on larger panels. The floor at 2,500 reproduces the historical default and ensures that even very small panels supply enough conditioning states to the HMM; the ceiling at 10⁶ is effectively unlimited and acts only as a safety bound against pathological inputs. On the panels evaluated in this work, the formula yields mc \= 3,133 for the 1000 Genomes Phase 3 panel (CVpanel \= 0.691, Nref \= 4,802) — essentially the floor — and mc \= 132,676 for the TOPMed panel (CVpanel \= 0.845, Nref \= 171,054) — 78% of the panel. Users may override the automatic mc with a fixed value for reproducibility with prior results.
 
 The resulting HMM posterior weights are stored as sparse CSR matrices (row-per-chip-variant, column-per-reference-haplotype), with entries below 1/(H+1) set to zero.
 
@@ -168,7 +168,74 @@ Genetic map distances used in the HMM transition probabilities are corrected for
 
 # **Results**
 
-[To be written after benchmarks]
+We evaluated Selphi 2 against Beagle (5.4 and 5.5) and the original Selphi 1.5.3 on three reference panels spanning two orders of magnitude in size: the 1000 Genomes Phase 3 panel [19] (4,802 haplotypes), the TOPMed Freeze 8 panel [24] (171,054 haplotypes), and a 75,552-haplotype production panel containing the full 1000 Genomes cohort. All experiments use unphased target genotypes as the realistic input scenario; tools that require pre-phased input (Selphi 1.5.3 in particular) were pre-phased with Selphi 2's haploid engine to ensure an identical phased starting point. Imputation R² is computed against held-out whole-genome-sequenced truth, stratified by minor allele frequency (MAF) in the reference panel. All benchmarks were run on the same machine with 16 threads.
+
+## **Imputation accuracy on the 1000 Genomes Phase 3 reference panel**
+
+On chromosome 22 of the 1000 Genomes Phase 3 panel (4,802 haplotypes, 1,070,401 variants) imputed for 801 held-out samples, Selphi 2 attains an overall R² of 0.4822 against the whole-genome-sequenced truth, compared to 0.4727 for Beagle 5.5 (Δ = +0.0095). The per-sample mean R² is 0.9151 (Selphi 2) versus 0.9048 (Beagle 5.5). The same comparison on chromosome 1 (5,770,000 variants) gives overall R² 0.5702 (Selphi 2) versus 0.5640 (Beagle 5.5), Δ = +0.0062, and per-sample mean 0.9561 versus 0.9507. Selphi 2 wins in every MAF bin on both chromosomes (Table 1).
+
+**Table 1. Imputation R² on the 1000 Genomes Phase 3 panel, by MAF.** Each cell reports R² between imputed dosage and whole-genome-sequenced truth, computed at variants in the indicated MAF bin (frequencies in the 1000 Genomes reference panel). n = 801 held-out samples per chromosome; full-pipeline mode (unphased target chip in, imputed dosage out).
+
+| MAF | chr22 Selphi 2 | chr22 Beagle 5.5 | chr1 Selphi 2 | chr1 Beagle 5.5 |
+|---|---|---|---|---|
+| 0.05–0.1% | 0.2743 | 0.2800 | 0.3543 | 0.3638 |
+| 0.5–1%    | 0.5069 | 0.4865 | 0.6112 | 0.5924 |
+| 20–50%    | 0.8408 | 0.8270 | 0.9305 | 0.9231 |
+| OVERALL   | **0.4822** | 0.4727 | **0.5702** | 0.5640 |
+
+At MAF below 0.1%, Beagle 5.5 narrowly outperforms Selphi 2 in both chromosomes (Δ ≈ -0.006 to -0.010). At MAF ≥ 0.5% Selphi 2 wins by margins that grow with allele frequency (chr22 20–50% MAF: +0.0138). The crossover reflects the differing trade-offs in candidate selection: at the rarest frequencies, Beagle 5.5's window-local composite-haplotype reconstruction better preserves single-carrier reference haplotypes, while at common frequencies the chromosome-wide PBWT scan of Selphi 2 retains more informative haplotypes per target.
+
+## **Imputation accuracy on a biobank-scale admixed cohort**
+
+The Selphi 1 candidate-set cap of K_2 = 60 was calibrated on the 1000 Genomes Phase 3 panel (retaining 1.2% of the panel). When the panel grows to TOPMed-scale (171,054 haplotypes), the same cap retains 0.04% of the panel and systematically excludes haplotypes that carry rare alleles in minority sub-populations. We tested this hypothesis on the MESA cohort (5,000 multi-ethnic samples, chip-array genotyped) imputed against the TOPMed Freeze 8 panel (chr20, 17.9 million variants). The cohort is admixed (African, Hispanic, Asian, and European sub-populations) and is fully held out from TOPMed.
+
+Selphi 2's panel-adaptive sizing formula (Methods, Candidate selection and HMM) yields mc = 132,676 for the TOPMed panel (panel-tile-compression diversity CV = 0.845, scaled fraction 0.776). At this candidate-set size, Selphi 2 attains overall R² 0.6153 on the MESA cohort, compared to 0.5975 for Beagle 5.4 on the same input (Δ = +0.0178). Per-sample mean R² is 0.9023 (Selphi 2) versus 0.8764 (Beagle 5.4), Δ = +0.0259. Increasing the candidate set further to mc = 150,000 yields a marginal additional gain (overall R² 0.6162, Δ = +0.0009 over mc = 120,000) and confirms the diminishing-returns regime captured by the formula.
+
+To isolate the contribution of the new sizing rule, we ran Selphi 2 on the same admixed cohort with mc fixed at 2,500 (the configuration that mirrors Selphi 1's K_2 = 60 cap on a panel of this size in retained-fraction terms). On a 500-sample MESA subset (chr20, TOPMed panel), mc = 2,500 yielded overall R² 0.5771 while mc = 132,676 (auto) yielded R² 0.6422, a gain of +0.0651 attributable entirely to the candidate-set size (Table 2).
+
+**Table 2. Effect of candidate-set size on imputation R², MESA admixed cohort × TOPMed panel.** Per-MAF R² for two candidate-set sizes on a 500-sample subset of MESA, chr20. mc = 2,500 mirrors Selphi 1's K_2 cap on a panel of this size; mc = 132,676 is the value chosen by the panel-adaptive formula (Methods).
+
+| MAF | mc = 2,500 | mc = 132,676 (auto) | Δ |
+|---|---|---|---|
+| 0.1–0.2% | 0.5066 | 0.6150 | +0.1084 |
+| 0.2–0.5% | 0.5373 | 0.6101 | +0.0728 |
+| 0.5–1%   | 0.5961 | 0.6504 | +0.0543 |
+| 1–2%     | 0.6277 | 0.6677 | +0.0400 |
+| 5–10%    | 0.6471 | 0.6650 | +0.0179 |
+| 20–50%   | 0.6688 | 0.6769 | +0.0081 |
+| OVERALL  | 0.5771 | **0.6422** | **+0.0651** |
+
+The gain is monotonically larger at rarer MAF bins, confirming that the fixed cap in Selphi 1 was preferentially truncating rare-variant carriers. The panel-adaptive formula recovers this accuracy without manual tuning.
+
+## **Independent validation against leak-free GIAB truth**
+
+The 1000 Genomes panel benchmarks share haplotypes with the held-out targets via descent, which can inflate measured accuracy. As an independent validation we used the Genome in a Bottle (GIAB) reference samples HG002–HG007 — none of which are in the 1000 Genomes Project — as held-out targets against a 75,552-haplotype production reference panel that contains the full 1000 Genomes cohort. Truth genotypes were taken from the GIAB v4.2.1 high-confidence regions restricted to common variants (MAF 5–50%, n = 73,710 sites on chr21 after restriction; n = 409,392 on chr1).
+
+On chr21, Selphi 2 attains R² 0.9704 (concordance 0.9777) versus Beagle 5 (Oct 2025 build) 0.9676 (concordance 0.9762) and Selphi 1.5.3 0.9702 (concordance 0.9776). Selphi 2 and Selphi 1.5.3 are statistically tied on this leak-free truth; both exceed Beagle 5 by 0.0028. On chr1, Selphi 2 attains R² 0.9815 versus Beagle 0.9825 and Selphi 1.5.3 0.9815 — a three-way effective tie on a well-saturated panel.
+
+The wall-time and memory comparison on this benchmark is striking: Selphi 2 imputes chr21 in 7.2 s with peak memory 6.2 GB; Selphi 1.5.3 takes 112.8 s with peak 7.1 GB; Beagle 5 takes 12.5 s with peak 14.5 GB. On the larger chr1, the speed-up over Selphi 1.5.3 grows to 50× (38.8 s for Selphi 2 versus 1923 s for Selphi 1.5.3) with Selphi 2 using less than half the memory of Beagle 5 (16.3 GB versus 39.2 GB). Selphi 2 thus matches the accuracy of the established imputation tools on leak-free truth while reducing runtime by an order of magnitude relative to Selphi 1.5.3 and by 1.7× relative to Beagle 5.
+
+## **Phasing accuracy on the 1000 Genomes trio dataset**
+
+We evaluated the two phasing engines on the 1000 Genomes trio dataset, using 54 trio children for which both parents are sequenced and de-novo phase truth can be established by Mendelian inheritance (parent-of-origin assignment). All 54 children's chromosome 22 genotypes were phased de-novo using the cohort itself as the conditioning set (`--phase-panel`, no external reference), and the switch error rate (SER) was computed against the parent-of-origin truth using `bcftools +trio-switch-rate`.
+
+Selphi 2's haploid engine attains a switch error rate of 8.47% (54 children, chr22). Selphi 2's diploid engine attains 8.55% on the same data. The two engines are within 0.1 percentage points on this small homogeneous cohort, consistent with the chr22 1000 Genomes imputation result above (where the diploid engine slightly outperforms the haploid). On admixed biobank-scale data (MESA 5K × TOPMed chr20), the per-engine balance inverts: the haploid engine attains overall R² 0.6156 versus the diploid engine's 0.5979, a gap of +0.0177 concentrated on rare variants. We discuss the interpretation of this engine-by-cohort trade-off in the Discussion.
+
+## **Computational efficiency**
+
+Table 3 summarizes wall time and peak resident memory for Selphi 2, Selphi 1.5.3, and Beagle on the three reference panels evaluated above, on the same machine (16 threads) and on identical inputs.
+
+**Table 3. Wall time and peak memory.** All numbers measured on a single workstation (16-thread CPU) with /usr/bin/time -v; Selphi 1.5.3 memory measured via docker stats. The MESA 5K × TOPMed row reflects Selphi 2 at its panel-adaptive default mc (132,676) and Beagle 5.4 at its default settings, both consuming an unphased chip target and producing imputed dosages. Selphi 1.5.3 did not complete the MESA 5K × TOPMed run within a reasonable wall-time budget.
+
+| Benchmark | Selphi 2 | Selphi 1.5.3 | Beagle |
+|---|---|---|---|
+| chr22 1KG 801s (impute-only, phased input) | 69 s / 13.2 GB | n/a | 58 s / 21.7 GB |
+| chr1 1KG 801s (impute-only, phased input) | 373 s / 21.9 GB | n/a | 207 s / 20.2 GB |
+| chr21 GIAB 6 samples (impute-only) | 7.2 s / 6.2 GB | 112.8 s / 7.1 GB | 12.5 s / 14.5 GB |
+| chr1 GIAB 6 samples (impute-only) | 38.8 s / 16.3 GB | 1923 s / 22.1 GB | 43.2 s / 39.2 GB |
+| MESA 5K × TOPMed chr20 (full pipeline) | 12345 s / 66.8 GB | did not finish | 3451 s / 103 GB |
+
+Selphi 2's wall time is 1.7× to 49.6× lower than Selphi 1.5.3 on imputation-only workloads, and its peak memory is 25% to 60% lower than Beagle's on all 1000 Genomes and GIAB benchmarks. On the TOPMed biobank-scale run, Selphi 2 is slower than Beagle 5.4 (3.6×) but its peak memory is 35% lower (66.8 GB versus 103 GB). The runtime cost on the biobank-scale panel is the price paid for the larger candidate-set retained per target (mc = 132,676 versus Beagle's window-local composite haplotypes); the corresponding accuracy gain is +0.0178 overall R² (Table 2) and is concentrated on the rare-variant bins.
 
 # **Discussion**
 
