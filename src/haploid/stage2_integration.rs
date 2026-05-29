@@ -112,6 +112,9 @@ pub fn run_stage2_after_stage1(
     let theta = 1.0_f64 / ((n_haps as f64).ln() + 0.5);
     let p_mismatch = (theta / (2.0 * (theta + n_haps as f64))) as f32;
     let max_states: usize = 140;  // Beagle phase_states / 2 = 280 / 2 = 140
+    // Beagle STAGE2_CANDIDATES = 10. Random-fallback window must be SMALL so
+    // the chosen hap is actually PBWT-adjacent (and therefore likely IBS).
+    let n_candidates: usize = 10;
     // Beagle MAX_BACKOFF_CM = 0.3 cM; scale by step size.
     let max_backoff_steps: usize = ((0.3_f64 / ibs_step_cm.max(1e-9)).round() as usize).max(2);
     let no_ibs2: Vec<i32> = Vec::new();
@@ -131,6 +134,7 @@ pub fn run_stage2_after_stage1(
         p_recomb_per_marker: &p_recomb_per_stage1,
         p_mismatch,
         max_states,
+        n_candidates,
         max_backoff_steps,
         min_steps,
         ibs2_offsets: &no_ibs2,
