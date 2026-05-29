@@ -129,29 +129,11 @@ impl<'a> Stage2Baum<'a> {
         }
     }
 
-    /// Identify the stage-1 marker index immediately before global marker
-    /// `m`, plus the interpolation weight applied to its state probs (the
-    /// next stage-1 marker gets weight `1 - wt_a`).
-    ///
-    /// Beagle's `fpd.prevStage1Marker(m)` and `fpd.prevStage1Wt(m)` come from
-    /// `FixedPhaseData` precomputation. We compute on-the-fly here from
-    /// `stage1_to_global` (binary search) and the cM positions.
+    /// Lookup the precomputed `(prev_stage1_marker[m], prev_stage1_wt[m])`.
+    /// Mirrors Beagle's `(fpd.prevStage1Marker[m], fpd.prevStage1Wt[m])`
+    /// indexed in global marker coords.
     fn prev_stage1_marker_and_wt(&self, m: usize) -> (usize, f32) {
-        let stage1 = self.input.stage1_to_global;
-        // Linear/binary search for the largest stage1 marker index whose
-        // global marker is <= m.
-        let idx = match stage1.binary_search(&m) {
-            Ok(i) => i,
-            Err(0) => 0,
-            Err(i) => i - 1,
-        };
-        let idx = idx.min(stage1.len().saturating_sub(1));
-        // Interpolation weight: 1.0 if m IS the stage-1 marker, 0.5 otherwise
-        // (Beagle uses a more careful cM-based interpolation but for tonight's
-        // port we keep it simple — the per-marker recomb scaling captures
-        // most of the genetic-distance information already).
-        let wt = if stage1[idx] == m { 1.0 } else { 0.5 };
-        (idx, wt)
+        (self.input.prev_stage1_marker[m], self.input.prev_stage1_wt[m])
     }
 
     /// Whether `allele` at global marker `m` is the low-frequency allele
