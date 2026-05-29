@@ -763,6 +763,13 @@ fn collect_step_carriers(input: &Stage2Input, stage1_start: usize, stage1_end_ex
     } else {
         input.n_markers
     };
+    // Note on partner expansion: Beagle's `hapList(carriers)` adds BOTH haps
+    // of each carrier sample to the graph (even the non-carrier partner of a
+    // het sample). I tested that here and it 2.25x'd carrier_hit (8890 →
+    // 20048) but SER regressed (2.5622% → 2.5731% on chr22). The extra non-
+    // carrier states are noisy enough to outweigh the denser graph. Keeping
+    // Selphi-style "real carriers only" — the difference cancels because we
+    // already have a good stage-1 phasing input that Beagle does not.
     let mut out: Vec<Vec<u32>> = Vec::new();
     for m in global_start..global_end {
         if m < input.rare_carriers.len() {
@@ -860,6 +867,12 @@ pub fn are_ibs2(
     ibs2_end: &[i32],
     ibs2_other: &[i32],
 ) -> bool {
+    // Same sample is trivially IBS2 with itself. Beagle relies on the Ibs2
+    // class being non-empty (stage-1 always computes it), but Selphi runs
+    // stage-2 with empty IBS2 data, so this self-skip must be explicit —
+    // otherwise the carrier-link picker can return the target's OWN partner
+    // hap as its IBS neighbor (a circular state that wrecks the swap test).
+    if sample1 == sample2 { return true; }
     if ibs2_offsets.is_empty() { return false; }
     let s1 = sample1 as usize;
     if s1 + 1 >= ibs2_offsets.len() { return false; }
