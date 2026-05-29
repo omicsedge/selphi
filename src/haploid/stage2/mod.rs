@@ -59,6 +59,12 @@ pub struct Stage2Input<'a> {
     /// neighbor (Beagle: `phaseData.maxBackoffSteps()`).
     pub max_backoff_steps: usize,
 
+    /// Minimum segment length (in PBWT steps) before a composite-haplotype
+    /// segment can be replaced. Beagle: `max(200, ceil(1.0 / ibsStep))` where
+    /// `ibsStep = par.step_scale() * medianDiff(stage1Map.genPos())`. Caller
+    /// (Selphi haploid pipeline) computes from its own genetic map config.
+    pub min_steps: usize,
+
     /// RNG seed for deterministic tie-breaking.
     pub seed: u64,
 }
