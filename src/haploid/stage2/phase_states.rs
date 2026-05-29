@@ -183,17 +183,21 @@ impl<'a> LowFreqPhaseStates<'a> {
     }
 
     /// Mirrors `setFinalRefSegs` (Java): close off each composite hap's
-    /// last segment by appending an end-marker at `n_markers`, then
-    /// initialize the `comp_hap_to_*` cache to the first segment.
+    /// last segment by appending the sentinel end-marker, then initialize
+    /// the `comp_hap_to_*` cache to the first segment.
+    ///
+    /// Beagle's segment ends are indexed in **stage-1 marker space**
+    /// (the `nMarkers` Beagle uses inside LowFreqPhaseStates is
+    /// `allHaps.nMarkers()` = stage-1 marker count, NOT the global VCF
+    /// marker count). So the sentinel here is `n_stage1_markers`.
     fn finalize_segments(&mut self) -> usize {
         let n_comp_haps = self.q.len();
-        // Drain the queue to walk each composite once.
         let comp_hap_indices: Vec<usize> = self.q.iter().map(|s| s.comp_hap_index).collect();
         self.q.clear();
 
-        let n_markers = self.input.n_markers;
+        let n_stage1_markers = self.input.stage1_to_global.len();
         for &comp_hap in &comp_hap_indices {
-            self.comp_hap_end[comp_hap].push(n_markers);
+            self.comp_hap_end[comp_hap].push(n_stage1_markers);
             self.segment_index[comp_hap] = 0;
             self.comp_hap_to_hap[comp_hap] = self.comp_hap_hap[comp_hap][0];
             self.comp_hap_to_end[comp_hap] = self.comp_hap_end[comp_hap][0];
@@ -201,9 +205,11 @@ impl<'a> LowFreqPhaseStates<'a> {
         n_comp_haps
     }
 
-    /// Mirrors `copyData` (Java). For each marker, advance each composite
-    /// hap's segment pointer if we just crossed its end marker, then write
-    /// the current segment's ref hap and the match/mismatch flag.
+    /// Mirrors `copyData` (Java). Iterates over **stage-1 marker indices**
+    /// (Beagle's `nMarkers` here = `allHaps.nMarkers()` = stage-1 scaffold
+    /// count, not global VCF markers). Each stage-1 index is translated to
+    /// the global marker via `stage1_to_global` to look up alleles in the
+    /// post-stage-1 phased panel.
     fn copy_data(
         &mut self,
         targ_hap: usize,
@@ -211,21 +217,24 @@ impl<'a> LowFreqPhaseStates<'a> {
         haps: &mut [Vec<i32>],
         mismatches: &mut [Vec<u8>],
     ) {
-        let n_markers = self.input.n_markers;
         let packed = self.input.all_haps_packed;
         let n_haps = self.input.n_haps;
-        for m in 0..n_markers {
-            let obs_allele = allele(packed, n_haps, n_markers, m, targ_hap);
+        let n_markers_global = self.input.n_markers;
+        let stage1_to_global = self.input.stage1_to_global;
+        let n_stage1_markers = stage1_to_global.len();
+        for sm in 0..n_stage1_markers {
+            let gm = stage1_to_global[sm];
+            let obs_allele = allele(packed, n_haps, n_markers_global, gm, targ_hap);
             for j in 0..n_comp_haps {
-                if m == self.comp_hap_to_end[j] {
+                if sm == self.comp_hap_to_end[j] {
                     self.segment_index[j] += 1;
                     self.comp_hap_to_hap[j] = self.comp_hap_hap[j][self.segment_index[j]];
                     self.comp_hap_to_end[j] = self.comp_hap_end[j][self.segment_index[j]];
                 }
                 let ref_hap = self.comp_hap_to_hap[j];
-                haps[m][j] = ref_hap;
-                let ref_allele = allele(packed, n_haps, n_markers, m, ref_hap as usize);
-                mismatches[m][j] = if ref_allele == obs_allele { 0 } else { 1 };
+                haps[sm][j] = ref_hap;
+                let ref_allele = allele(packed, n_haps, n_markers_global, gm, ref_hap as usize);
+                mismatches[sm][j] = if ref_allele == obs_allele { 0 } else { 1 };
             }
         }
     }

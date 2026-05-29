@@ -10,6 +10,7 @@ pub mod rng;
 pub mod debug;
 pub mod composite;
 pub mod stage2;
+pub mod stage2_integration;
 
 use crate::selphi_debug;
 use rayon::prelude::*;
@@ -814,6 +815,25 @@ fn phase_genotypes_inner(
     // and adaptive step scaling. The singleton IBD approach requires a sparse
     // scaffold (common variants only) to compute meaningful segment lengths,
     // which is available in the diploid engine's phase_rare but not here.
+
+    // Stage-2 rare-variant phasing (opt-in via SELPHI_HAPLOID_STAGE2=1).
+    // Beagle-equivalent stage-2 PBWT+HMM that refines phase at rare markers
+    // using the stage-1 common-variant scaffold; targets the SER gap
+    // measured on the 1KG 54-trio benchmark (Selphi haploid 2.569% chr22
+    // / 1.876% chr1 vs Beagle 5.5 2.548% / 1.865%). Default off until
+    // validated; gated by env var to keep the regression-safe baseline.
+    if stage2_integration::stage2_enabled() {
+        let stage2_t0 = Instant::now();
+        eprintln!("  [stage2] running rare-variant phasing pass...");
+        let ran = stage2_integration::run_stage2_after_stage1(
+            &mut global_phased, ref_bm, chip_cm, n_var, n_samples, n_ref, seed,
+        );
+        if ran {
+            eprintln!("  [stage2] complete: {:.1}s", stage2_t0.elapsed().as_secs_f64());
+        } else {
+            eprintln!("  [stage2] skipped: too few rare markers (gate)");
+        }
+    }
 
     (global_phased, global_confidence, window_ri)
 }
