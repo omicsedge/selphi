@@ -65,6 +65,24 @@ pub struct Stage2Input<'a> {
     /// (Selphi haploid pipeline) computes from its own genetic map config.
     pub min_steps: usize,
 
+    /// IBS2 lookup arrays (flat layout from `haploid::ibs2::build_ibs2_lookup`).
+    /// Used to skip identical-by-descent siblings when picking the IBS
+    /// neighbor. Empty slices = no IBS2 restrictions (matches Beagle behavior
+    /// when no IBS2 has been computed).
+    pub ibs2_offsets: &'a [i32],
+    pub ibs2_start: &'a [i32],
+    pub ibs2_end: &'a [i32],
+    pub ibs2_other: &'a [i32],
+
+    /// Per-marker `Vec<u32>` of haplotypes carrying the rare-allele for
+    /// each *low-frequency* allele at that marker. Length = `n_markers`.
+    /// Marker indexed by *global* marker index. Empty vec = marker is
+    /// high-frequency, no carriers tracked. Beagle equivalent:
+    /// `fpd.carriers(m, al)` for each rare al at marker m.
+    /// This is identical to the existing `rare_carriers` field above —
+    /// kept as alias for clarity in the PBWT IBS sweep, which consumes
+    /// the carrier lists per stage-1 STEP.
+
     /// RNG seed for deterministic tie-breaking.
     pub seed: u64,
 }
