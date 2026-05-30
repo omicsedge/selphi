@@ -137,23 +137,31 @@ impl Default for LcwgsParams {
         fn envf(k: &str, d: f32) -> f32 { std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d) }
         fn envu(k: &str, d: usize) -> usize { std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d) }
         Self {
-            // Finer PBWT than GLIMPSE2's defaults (depth 12 / 0.1 cM): our
-            // match-length selection needs denser storage for comparable
-            // conditioning quality. chr22 1x per-variant R² / wall:
-            //   depth 30 / 0.02 cM → 0.77  / 226s
-            //   depth 40 / 0.01 cM → 0.825 / 421s   ← default (3x faster than GLIMPSE2)
-            //   depth 120/ 0.005   → 0.858 / 1313s  (= GLIMPSE2 speed, still below 0.916)
-            // GLIMPSE2 reaches 0.916 at depth 12 — its selection is more
-            // efficient per candidate; closing that is a selection-quality
-            // task, not a brute-force-depth one. Tunable via env.
+            // Defaults retuned 2026-05-30 (selection-quality session). The key
+            // change vs the old d40/0.01cM/iter15 (full chr22 R² 0.893): run the
+            // PBWT at fine 0.002 cM storage (low depth 16 is enough) AND run more
+            // Gibbs iterations (25). On chr22 1x, FAIR per-variant R² vs GLIMPSE2
+            // (0.9155) on the identical 326K-variant intersection:
+            //   d40/0.01 cM, iter15           → 0.893   (old default)
+            //   d16/0.002cM, iter15, noscaf   → 0.900
+            //   d16/0.002cM, iter25, noscaf+RC→ 0.905   ← new default
+            // Iterations are the biggest lever (Gibbs hadn't converged at 15);
+            // at iter25 the common+mid bins (≥5%) MATCH GLIMPSE2 and dense (0cM)
+            // PBWT no longer beats 0.002cM, so we keep the faster 0.002cM. The
+            // residual gap is the 0.5-1% rare bin (GLIMPSE2 rare-carrier PBWT).
             kpbwt: envu("LCWGS_KPBWT", 2000),
-            pbwt_modulo_cm: envf("LCWGS_PBWT_MODULO_CM", 0.01),
-            pbwt_depth: envu("LCWGS_PBWT_DEPTH", 40),
-            n_iterations: envu("LCWGS_N_ITER", 15),
-            n_main_iterations: envu("LCWGS_N_MAIN", 5),
+            pbwt_modulo_cm: envf("LCWGS_PBWT_MODULO_CM", 0.002),
+            pbwt_depth: envu("LCWGS_PBWT_DEPTH", 16),
+            n_iterations: envu("LCWGS_N_ITER", 25),
+            n_main_iterations: envu("LCWGS_N_MAIN", 8),
             ne: envf("LCWGS_NE", 100_000.0),
             rare_maf: 0.001,
-            epsilon: envf("LCWGS_EPSILON", 1e-4),
+            // Imputation HMM error rate. GLIMPSE2's err-imp default is 1e-12 (it
+            // trusts the panel haplotypes almost perfectly in the final HMM); the
+            // old 1e-4 over-softened the emission and blurred rare-carrier calls.
+            // chr22 1x: 1e-12 lifts OVERALL 0.9431→0.9443 and the 0.5-1% bin
+            // 0.9196→0.9239 (plateaus by 1e-8). Tunable via LCWGS_EPSILON.
+            epsilon: envf("LCWGS_EPSILON", 1e-12),
         }
     }
 }

@@ -79,12 +79,15 @@ pub fn run_gibbs(
     // from the marginal genotype MAP, then refined by Gibbs sampling.
     let mut hap_alleles = init_hap_alleles(gl3, ref_bm, n_samples, n_var, params.seed_or_default());
 
-    // Common (scaffold) site partition from the PANEL minor-allele frequency.
-    // The HMM forward-backward runs only on these; rare sites are imputed by
-    // interpolating the scaffold posterior (GLIMPSE2-style). This keeps the
-    // conditioning/HMM clean (no dilution by flat-GL rare sites) and lifts
-    // rare-variant accuracy. Disable with LCWGS_NO_SCAFFOLD=1 (all sites).
-    let use_scaffold = std::env::var("LCWGS_NO_SCAFFOLD").is_err();
+    // Scaffold mode (OPT-IN, LCWGS_SCAFFOLD=1): run the HMM forward-backward only
+    // on common sites and interpolate the posterior to rare sites. Default is now
+    // OFF — the full FB over ALL sites (rare included) lifts rare-variant accuracy
+    // because a rare-allele-carrying conditioning hap then contributes its allele
+    // directly through the rare site's posterior (measured +0.002 OVERALL, and it
+    // is the path that lets rare carriers be imputed from LD). Scaffold remains
+    // available for memory-bound huge-panel runs. NOTE: the legacy LCWGS_NO_SCAFFOLD
+    // var is retired; absence of LCWGS_SCAFFOLD = no scaffold.
+    let use_scaffold = std::env::var("LCWGS_SCAFFOLD").is_ok();
     let common_idx: Vec<usize> = if use_scaffold {
         let n_ref = ref_bm.n_haps;
         let thr = params.rare_maf as f64;
@@ -107,20 +110,123 @@ pub fn run_gibbs(
     let mut n_acc = 0usize;
 
     let force_all_cond = std::env::var("LCWGS_FORCE_ALL_COND").is_ok();
+    // When set, the selection PBWT stores at ALL sites (incl. rare) rather than
+    // only common/scaffold sites. The sampled haplotype carries rare alleles, so
+    // including rare sites lets a (sampled) carrier match other carriers in the
+    // PBWT — a cheap proxy for GLIMPSE2's separate rare-carrier PBWT. The HMM
+    // scaffold still runs on common_idx.
+    let select_all_sites = std::env::var("LCWGS_SELECT_ALL_SITES").is_ok();
+    let empty_idx: Vec<usize> = Vec::new();
+    let sel_idx: &[usize] = if select_all_sites { &empty_idx } else { &common_idx };
     let all_ref: Vec<u32> = (0..ref_bm.n_haps as u32).collect();
     let seed = params.seed_or_default();
 
+    // Selection-refresh interval: the PBWT conditioning set converges after the
+    // first iterations, so re-running the (expensive, dense) selection every
+    // iteration is wasteful. Refresh every `refresh` iterations (and always on
+    // iter 0 + the first main iteration); reuse the cached set in between.
+    let refresh = std::env::var("LCWGS_SELECT_REFRESH").ok()
+        .and_then(|s| s.parse::<usize>().ok()).filter(|&r| r >= 1).unwrap_or(5);
+    // Per-region selection (opt-in LCWGS_REGION_KEEP=N): force-include the closest
+    // N ref neighbors at every storage site (union across the window). Intended to
+    // let a single big-window K cover the whole mosaic the way GLIMPSE2's per-region
+    // PBWT does. MEASURED NO-OP: rk=2 == rk=0 on both the 2.9cM mid and 14cM regions,
+    // and per-region + a big chunk still loses to default 2cM chunking. Reason:
+    // Selphi's CHUNKING already IS per-region selection (each ~2cM chunk re-selects
+    // K fresh), so within-chunk per-region is redundant with the global ranking.
+    // Default 0 (skip the overhead); kept gated for the record.
+    let region_keep = std::env::var("LCWGS_REGION_KEEP").ok()
+        .and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+    let mut cond_cache: Vec<Vec<u32>> = Vec::new();
+
+    // Rare-allele carrier augmentation (GLIMPSE2 select_rare_pd_fg analogue).
+    // DEFAULT = the "reinforcement" form: each iteration, a target hap currently
+    // SAMPLED as a carrier at a rare site gets that site's carriers added to its
+    // conditioning set, so the HMM can lock onto the true carrier copy. Small but
+    // positive (+~0.0007 OVERALL). Disable with LCWGS_NO_RARE_CARRIER=1.
+    //
+    // NOTE — a more aggressive FLANKING-haplotype variant (add carriers whose
+    // common-site IBS match to the target is long, independent of sampled state;
+    // pbwt_select::augment_rare_carriers, opt-in LCWGS_RC_FLANK=1) was tested and
+    // REGRESSES (−0.01 OVERALL at every match-length threshold, and even drops the
+    // 0.5-1% bin). Reason: the HMM conditioning set is GLOBAL over the chunk, so
+    // any added carrier distorts the well-converged copying at ALL sites, not just
+    // the rare one — the dense selection already includes genuinely-IBD carriers.
+    // The rare-bin gap to GLIMPSE2 is therefore NOT a missing-carrier problem.
+    let rare_carrier = std::env::var("LCWGS_NO_RARE_CARRIER").is_err() && !force_all_cond;
+    let rc_flank = std::env::var("LCWGS_RC_FLANK").is_ok();
+    let rc_window = std::env::var("LCWGS_RARE_CARRIER_WINDOW").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(50usize);
+    let rc_max_add = std::env::var("LCWGS_RARE_CARRIER_MAXADD").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(256usize);
+    // Common sites for the flanking PBWT (opt-in path only).
+    let common_for_flank: Vec<usize> = if rare_carrier && rc_flank {
+        let n_ref = ref_bm.n_haps;
+        let thr = params.rare_maf as f64;
+        (0..n_var).filter(|&v| {
+            let ac = ref_bm.popcount_row(v, n_ref) as f64;
+            (ac.min(n_ref as f64 - ac) / n_ref as f64) >= thr
+        }).collect()
+    } else { Vec::new() };
+    // Rare sites (low panel minor-allele count) + their panel carriers.
+    let rare_sites: Vec<(usize, Vec<u32>)> = if rare_carrier {
+        let n_ref = ref_bm.n_haps;
+        let max_carr = std::env::var("LCWGS_RARE_CARRIER_MAX").ok()
+            .and_then(|s| s.parse().ok()).unwrap_or(64usize);
+        (0..n_var).filter_map(|v| {
+            let ac = ref_bm.popcount_row(v, n_ref) as usize;
+            if (1..=max_carr).contains(&ac) {
+                let carriers: Vec<u32> = (0..n_ref as u32)
+                    .filter(|&h| ref_bm.get(v, h as usize)).collect();
+                Some((v, carriers))
+            } else { None }
+        }).collect()
+    } else { Vec::new() };
+    let mut rare_aug_cache: Vec<Vec<u32>> = Vec::new();
+
     for it in 0..params.n_iterations {
         // 1. Sparse PBWT selection from the current sampled hap alleles.
-        let cond_per_hap = if force_all_cond {
-            vec![all_ref.clone(); n_target_haps]
+        let recompute = it == 0 || it == n_burnin || it % refresh == 0;
+        let base_cond: &Vec<Vec<u32>> = if force_all_cond {
+            if cond_cache.is_empty() { cond_cache = vec![all_ref.clone(); n_target_haps]; }
+            &cond_cache
         } else {
-            select_conditioning_haps(
-                &hap_alleles, ref_bm, cm,
-                n_target_haps, params.kpbwt, params.pbwt_modulo_cm, params.pbwt_depth,
-                &common_idx,
-            )
+            if recompute {
+                cond_cache = select_conditioning_haps(
+                    &hap_alleles, ref_bm, cm,
+                    n_target_haps, params.kpbwt, params.pbwt_modulo_cm, params.pbwt_depth,
+                    sel_idx, region_keep,
+                );
+            }
+            &cond_cache
         };
+
+        // 1b. Rare-carrier augmentation.
+        let cond_storage: Option<Vec<Vec<u32>>> = if rare_carrier {
+            let mut aug = base_cond.clone();
+            if rc_flank {
+                // Flanking variant (opt-in, see note above — regresses).
+                if recompute {
+                    rare_aug_cache = super::pbwt_select::augment_rare_carriers(
+                        &hap_alleles, ref_bm, &common_for_flank, &rare_sites,
+                        n_target_haps, rc_window, rc_max_add,
+                    );
+                }
+                for h in 0..n_target_haps { aug[h].extend_from_slice(&rare_aug_cache[h]); }
+            } else {
+                // Default reinforcement variant: add carriers at sites where the
+                // target hap is currently sampled as a carrier.
+                for (v, carriers) in &rare_sites {
+                    let base = v * n_target_haps;
+                    for h in 0..n_target_haps {
+                        if hap_alleles[base + h] == 1 { aug[h].extend_from_slice(carriers); }
+                    }
+                }
+            }
+            for c in aug.iter_mut() { c.sort_unstable(); c.dedup(); }
+            Some(aug)
+        } else { None };
+        let cond_per_hap: &Vec<Vec<u32>> = cond_storage.as_ref().unwrap_or(base_cond);
 
         // 2. Per-target-hap HMM. Each hap conditions its emission on the
         //    PARTNER hap's current allele (diploid → haploid decoupling).
