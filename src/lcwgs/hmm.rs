@@ -102,6 +102,13 @@ pub fn run_forward_backward(
     let inv_k = 1.0f32 / (k as f32);
     let ee = 1.0f32 - params.epsilon;
     let ed = params.epsilon;
+    // GLIMPSE2 divides the forward emission back out of the hidden-state
+    // posterior before re-applying the read+error model (imputation_hmm.cpp:
+    // `prob_hid /= emit`). Without this, the per-site read is double-counted
+    // (once baked into alpha, once via the explicit ee/ed × HL fold-in),
+    // over-trusting noisy lcWGS reads and under-calling true carriers. Gated
+    // for A/B; default ON once validated.
+    let loo = std::env::var("LCWGS_NO_EMIT_LOO").is_err();
 
     // --- Precompute emission per (variant, allele) ---
     TL_EMIT.with(|cell| {
@@ -211,6 +218,10 @@ pub fn run_forward_backward(
             // Combine with HL via the emission matrix to obtain prob_obs:
             // prob_obs[a] = (prob_hid[0]*ee + prob_hid[1]*ed)  if a=0
             //             = (prob_hid[0]*ed + prob_hid[1]*ee)  if a=1
+            if loo {
+                prob_hid_0 /= e0_last.max(f32::MIN_POSITIVE);
+                prob_hid_1 /= e1_last.max(f32::MIN_POSITIVE);
+            }
             let h0 = hl[2 * last];
             let h1 = hl[2 * last + 1];
             let po0 = (prob_hid_0 * ee + prob_hid_1 * ed) * h0;
@@ -245,6 +256,10 @@ pub fn run_forward_backward(
             }
             beta_sum = new_beta_sum;
 
+            if loo {
+                prob_hid_0 /= e0_v.max(f32::MIN_POSITIVE);
+                prob_hid_1 /= e1_v.max(f32::MIN_POSITIVE);
+            }
             let h0v = hl[2 * v];
             let h1v = hl[2 * v + 1];
             let po0 = (prob_hid_0 * ee + prob_hid_1 * ed) * h0v;
@@ -292,6 +307,11 @@ pub fn run_forward_backward_scaffold(
     let ee = 1.0f32 - params.epsilon;
     let ed = params.epsilon;
     let scale = 0.04f64 * (params.ne as f64) / (k as f64);
+    // Leave-one-out emission at the imputed site (GLIMPSE2 `prob_hid /= emit`).
+    // In the scaffold path only EXACT scaffold sites double-count the read (the
+    // interpolated gamma at a rare site already excludes that rare site's
+    // emission), so we divide out emission only when v is a scaffold site.
+    let loo = std::env::var("LCWGS_NO_EMIT_LOO").is_err();
 
     // Scaffold emission per (scaffold site j, allele): GL-weighted, normalized.
     // emit_s[2*j + a]
@@ -403,12 +423,14 @@ pub fn run_forward_backward_scaffold(
         // Advance next_s so common_idx[next_s] is the first scaffold site >= v.
         while next_s < n_s && common_idx[next_s] < v { next_s += 1; }
         // Flanking scaffold indices ja (<=v) and jb (>=v) in scaffold space.
-        let (ja, jb, wt_a) = if next_s == 0 {
-            (0usize, 0usize, 1.0f32) // before first scaffold site
+        // `exact` = v is itself a scaffold site (its own emission is baked
+        // into gamma[ja] and must be divided back out to avoid double-count).
+        let (ja, jb, wt_a, exact) = if next_s == 0 {
+            (0usize, 0usize, 1.0f32, common_idx[0] == v) // before first scaffold site
         } else if next_s >= n_s {
-            (n_s - 1, n_s - 1, 1.0f32) // after last
+            (n_s - 1, n_s - 1, 1.0f32, common_idx[n_s - 1] == v) // after last
         } else if common_idx[next_s] == v {
-            (next_s, next_s, 1.0f32) // exactly a scaffold site
+            (next_s, next_s, 1.0f32, true) // exactly a scaffold site
         } else {
             let a = next_s - 1;
             let b = next_s;
@@ -416,17 +438,25 @@ pub fn run_forward_backward_scaffold(
             let cbv = cm[common_idx[b]];
             let d = (cbv - ca).max(1e-9);
             let w = ((cbv - cm[v]) / d) as f32; // weight on a (closer to a → larger)
-            (a, b, w.clamp(0.0, 1.0))
+            (a, b, w.clamp(0.0, 1.0), false)
         };
         // Interpolated per-state posterior, fold into allele probs.
         let oa = ja * k;
         let ob = jb * k;
         let omw = 1.0 - wt_a;
+        let do_loo = loo && exact;
+        let (e0j, e1j) = (emit_s[2 * ja], emit_s[2 * ja + 1]);
         let mut prob_hid_0 = 0.0f32;
         let mut prob_hid_1 = 0.0f32;
         for (st, &h) in cond_haps.iter().enumerate() {
-            let g = wt_a * gamma[oa + st] + omw * gamma[ob + st];
-            if ref_bm.get(v, h as usize) { prob_hid_1 += g; } else { prob_hid_0 += g; }
+            let mut g = wt_a * gamma[oa + st] + omw * gamma[ob + st];
+            if ref_bm.get(v, h as usize) {
+                if do_loo { g /= e1j.max(f32::MIN_POSITIVE); }
+                prob_hid_1 += g;
+            } else {
+                if do_loo { g /= e0j.max(f32::MIN_POSITIVE); }
+                prob_hid_0 += g;
+            }
         }
         let h0 = hl[2 * v];
         let h1 = hl[2 * v + 1];
