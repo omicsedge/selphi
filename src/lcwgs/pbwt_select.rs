@@ -107,22 +107,24 @@ pub fn select_conditioning_haps(
     let mut div: Vec<i32> = vec![0i32; n_haps_total];
     let mut inv: Vec<i32> = vec![0i32; n_haps_total];
     let mut rec: Vec<i32> = vec![0i32; n_haps_total];
-    // Per-target-hap neighbor frequency counter, reused across iterations.
-    // Length = n_ref_haps; index = ref-hap index; value = count of storage
-    // sites this ref hap appeared as a neighbor for some target hap.
-    // Allocated PER target hap because counts are independent.
-    let mut counts: Vec<u32> = vec![0u32; n_ref_haps];
     let mut out: Vec<Vec<u32>> = Vec::with_capacity(n_target_haps);
 
-    // Run PBWT forward across all storage sites. Save inv-array snapshots
-    // at each storage site for later neighbor extraction per target hap.
-    // We accumulate counts during the sweep for ALL target haps in a single
-    // pass — keep counts as a 2D array (n_target_haps × n_ref_haps).
-    // Memory: n_target_haps × n_ref_haps × 4 B. For 100 samples × 4500
-    // ref haps = 1.8 MB — trivial. For 50K samples × 1M ref haps = 200 GB
-    // → too much; in that regime we'd switch to per-sample loops with
-    // PBWT snapshot replay. MVP keeps the single-pass version.
-    let mut all_counts = vec![0u32; n_target_haps * n_ref_haps];
+    // PHASE 1.5 ALGORITHM (sum of IBS match lengths, not counts).
+    // For each (target hap, ref hap) observed as PBWT-adjacent at some
+    // storage site, accumulate the MATCH LENGTH = storage_idx - div[pos].
+    // Higher = longer IBS match = better conditioning candidate.
+    //
+    // The previous v1 (counts) gave near-uniform output because depth=12
+    // × ~16 storage sites × 108 target haps means every panel hap gets
+    // observed ~once: count distribution is flat. Match-length sum is
+    // heavy-tailed (long IBS dominate), so top-Kpbwt picks the real
+    // matches.
+    //
+    // Memory: n_target_haps × n_ref_haps × 4 B (u32). For 100 samples
+    // × 4500 ref haps = 1.8 MB. At biobank scale (50K × 1M) this would
+    // be 200 GB — at that point the algorithm switches to per-sample
+    // PBWT replay (TODO: Phase 2 scaling).
+    let mut match_len: Vec<u32> = vec![0u32; n_target_haps * n_ref_haps];
 
     for (storage_idx, &v) in storage_sites.iter().enumerate() {
         // Build per-hap rec[] for this storage site:
@@ -144,15 +146,15 @@ pub fn select_conditioning_haps(
         }
 
         // For each target hap, find its current PBWT position and record
-        // the `depth` nearest neighbors on each side (skipping other
-        // target haps).
+        // the `depth` nearest non-self neighbors on each side, weighting
+        // each by its match length.
+        let storage_idx_i = storage_idx as i32;
         for h in 0..n_target_haps {
             let pos = inv[h] as i32;
             let row_off = h * n_ref_haps;
 
-            // Walk left and right, collecting up to `depth/2 + depth/2`
-            // = `depth` reference haps total. GLIMPSE2 walks until it has
-            // `depth` non-self neighbors.
+            // Walk left + right alternately, accumulating up to `depth`
+            // ref-hap neighbors total.
             let mut taken = 0usize;
             let mut left = pos - 1;
             let mut right = pos + 1;
@@ -162,7 +164,17 @@ pub fn select_conditioning_haps(
                     let hap_left = prefix[left as usize] as usize;
                     if hap_left >= n_target_haps {
                         let ref_idx = hap_left - n_target_haps;
-                        all_counts[row_off + ref_idx] = all_counts[row_off + ref_idx].saturating_add(1);
+                        // Match length = storage_idx - div[left + 1]
+                        // (divergence is the marker where this hap and
+                        // its preceding hap diverge; same applies in
+                        // PBWT step coords).
+                        // For position `left`, div[left+1] is the start
+                        // of the match with the hap at `left+1`.
+                        // Bounded by [1, storage_idx + 1].
+                        let div_idx = (left + 1) as usize;
+                        let ml = (storage_idx_i - div[div_idx]).max(1) as u32;
+                        match_len[row_off + ref_idx] =
+                            match_len[row_off + ref_idx].saturating_add(ml);
                         taken += 1;
                         if taken >= depth { break; }
                     }
@@ -172,7 +184,12 @@ pub fn select_conditioning_haps(
                     let hap_right = prefix[right as usize] as usize;
                     if hap_right >= n_target_haps {
                         let ref_idx = hap_right - n_target_haps;
-                        all_counts[row_off + ref_idx] = all_counts[row_off + ref_idx].saturating_add(1);
+                        // For position `right`, div[right] is the start
+                        // of the match with the hap at `right-1`.
+                        let div_idx = right as usize;
+                        let ml = (storage_idx_i - div[div_idx]).max(1) as u32;
+                        match_len[row_off + ref_idx] =
+                            match_len[row_off + ref_idx].saturating_add(ml);
                         taken += 1;
                         if taken >= depth { break; }
                     }
@@ -182,24 +199,18 @@ pub fn select_conditioning_haps(
         }
     }
 
-    // Reduce per-target-hap counts → top-kpbwt by frequency.
+    // Reduce per-target-hap match-length sums → top-kpbwt by total length.
+    // Sort descending; tiebreak by index ascending for determinism.
     for h in 0..n_target_haps {
         let row_off = h * n_ref_haps;
-        let row = &all_counts[row_off..row_off + n_ref_haps];
-        // Collect (count, ref_idx) pairs for non-zero counts only.
-        // For biobank scale we may want a quickselect; for MVP a sort is OK.
+        let row = &match_len[row_off..row_off + n_ref_haps];
         let mut hits: Vec<(u32, u32)> = row.iter().enumerate()
             .filter(|&(_, &c)| c > 0)
             .map(|(i, &c)| (c, i as u32))
             .collect();
-        // Sort descending by count, tiebreak by index ascending (deterministic)
         hits.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         if hits.len() > kpbwt { hits.truncate(kpbwt); }
         out.push(hits.into_iter().map(|(_, idx)| idx).collect());
-
-        // Zero out the row for next iteration (not strictly needed since
-        // we built it from scratch above, but defensive).
-        for c in &mut counts { *c = 0; }
     }
 
     out

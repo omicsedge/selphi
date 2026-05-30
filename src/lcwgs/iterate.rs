@@ -135,12 +135,23 @@ pub fn run_gibbs(
     // hard calls for the NEXT iteration and as the output to accumulate.
     let mut last_hap_dosage = vec![0.0f32; n_var * n_target_haps];
 
+    // Diagnostic: force the conditioning set to the FULL reference panel
+    // (every ref hap conditions every target hap). Bypasses PBWT selection
+    // entirely. If R² is good with this on, the HMM is correct and the bug
+    // is in selection; if R² stays low, the bug is in the HMM/dosage path.
+    let force_all_cond = std::env::var("LCWGS_FORCE_ALL_COND").is_ok();
+    let all_ref: Vec<u32> = (0..ref_bm.n_haps as u32).collect();
+
     for it in 0..params.n_iterations {
         // 1. Sparse PBWT selection (uses hard_calls)
-        let cond_per_hap = select_conditioning_haps(
-            &hard_calls, ref_bm, cm,
-            n_target_haps, params.kpbwt, params.pbwt_modulo_cm, params.pbwt_depth,
-        );
+        let cond_per_hap = if force_all_cond {
+            vec![all_ref.clone(); n_target_haps]
+        } else {
+            select_conditioning_haps(
+                &hard_calls, ref_bm, cm,
+                n_target_haps, params.kpbwt, params.pbwt_modulo_cm, params.pbwt_depth,
+            )
+        };
 
         // 2. Per-hap HMM in parallel across samples
         let n_haps_local = n_target_haps;
