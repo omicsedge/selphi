@@ -74,6 +74,18 @@ pub struct Args {
     #[arg(long, alias = "force-unphased")]
     pub force_phasing: bool,
 
+    /// Low-coverage WGS mode. Input VCF/BCF must have a PL FORMAT field
+    /// (Phred-scaled genotype likelihoods, typically produced by
+    /// `bcftools mpileup | bcftools call`). Selphi parses PL → per-hap
+    /// likelihoods and runs a GLIMPSE2-style GL-aware Li-Stephens HMM
+    /// against the reference panel to impute dosages. Skips the diploid
+    /// genotype-graph engine (incompatible with GL input). Output VCF
+    /// emits GT, DS (dosage), and GP (genotype posteriors).
+    ///
+    /// Recommended coverage: 0.5x-4x sequencing.
+    #[arg(long)]
+    pub lcwgs: bool,
+
     /// Panel ancestry labels (TSV: `sample_id<TAB>super_pop`, 1 header line).
     /// When both --panel-ancestry and --target-ancestry are provided, PBWT
     /// candidate selection re-weights raw match scores by ancestry match,
