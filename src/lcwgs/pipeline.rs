@@ -76,7 +76,10 @@ pub fn run_lcwgs(
     );
 
     // --- 2. Intersect target markers against panel variants ---
-    let (target_idx, wgs_idx) = intersect_variants(srp, &markers);
+    // intersect_variants returns (wgs_idx, target_idx) in THAT order:
+    //   wgs_idx[k]    = panel variant index of the k-th shared variant
+    //   target_idx[k] = target-marker index of the k-th shared variant
+    let (wgs_idx, target_idx) = intersect_variants(srp, &markers);
     let n_shared = wgs_idx.len();
     selphi_info!("  shared variants: {} / {} ({:.1}% of target)",
         n_shared, n_target_variants, 100.0 * n_shared as f64 / n_target_variants.max(1) as f64);
@@ -107,14 +110,85 @@ pub fn run_lcwgs(
     }
     drop(gl3_input);
 
-    // --- 6. Run Gibbs alternation ---
-    let gibbs_out = run_gibbs(&gl3_shared, &ref_bm, &cm, n_samples, params);
+    // --- 6. Chunked Gibbs imputation ---
+    // A single conditioning set of K haps cannot capture the target's mosaic
+    // across a whole chromosome (the target copies hundreds of distinct ref
+    // haps along 50 cM). GLIMPSE2 solves this by chunking: each ~few-cM chunk
+    // gets its OWN PBWT-selected conditioning set. We chunk by cM with a
+    // buffer region on each side (only the core region's dosage is kept), then
+    // ligate. This fixes accuracy AND bounds memory (alpha = K × chunk_size).
+    let dosage = run_chunked_gibbs(&gl3_shared, &ref_bm, &cm, n_samples, n_shared, params);
 
     Ok(LcwgsOutput {
-        dosage: gibbs_out.dosage,
+        dosage,
         n_variants: n_shared,
         sample_ids,
     })
+}
+
+/// Chunk the chromosome by cM and run the Gibbs per chunk with its own
+/// conditioning set. Each chunk has a core region (whose dosage is kept) and
+/// a buffer region on each side (computed but discarded — absorbs edge
+/// effects, like GLIMPSE2's ligation buffers).
+///
+/// Returns the per-(variant, sample) diploid dosage in shared-panel order.
+fn run_chunked_gibbs(
+    gl3_shared: &[f32],
+    ref_bm: &crate::common::HaplotypeBitmatrix,
+    cm: &[f64],
+    n_samples: usize,
+    n_shared: usize,
+    params: &LcwgsParams,
+) -> Vec<f32> {
+    // GLIMPSE2-style: ~core_cm core + buffer_cm each side. Defaults chosen to
+    // match GLIMPSE2_chunk's typical ~few-cM cores. cM span of chr22 ≈ 50.
+    let core_cm = params.chunk_core_cm();
+    let buffer_cm = params.chunk_buffer_cm();
+    let mut dosage = vec![0.0f32; n_shared * n_samples];
+    if n_shared == 0 { return dosage; }
+
+    // Build chunk core boundaries by cM
+    let total_cm = cm[n_shared - 1] - cm[0];
+    let n_chunks = ((total_cm / core_cm).ceil() as usize).max(1);
+    crate::selphi_info!(
+        "  chunked Gibbs: {:.1} cM span → {} chunks (core {:.1} cM + {:.1} cM buffer each side)",
+        total_cm, n_chunks, core_cm, buffer_cm);
+
+    for c in 0..n_chunks {
+        let core_lo_cm = cm[0] + c as f64 * core_cm;
+        let core_hi_cm = core_lo_cm + core_cm;
+        let buf_lo_cm = core_lo_cm - buffer_cm;
+        let buf_hi_cm = core_hi_cm + buffer_cm;
+
+        // Variant index ranges (buffer = HMM window, core = kept output).
+        let buf_start = cm.partition_point(|&x| x < buf_lo_cm);
+        let buf_end = cm.partition_point(|&x| x < buf_hi_cm); // exclusive
+        if buf_end <= buf_start { continue; }
+        let core_start = cm.partition_point(|&x| x < core_lo_cm);
+        let core_end = cm.partition_point(|&x| x < core_hi_cm); // exclusive
+        if core_end <= core_start { continue; }
+
+        let chunk_n = buf_end - buf_start;
+        // Slice gl3 + cm for the buffer window
+        let chunk_gl3: Vec<f32> = gl3_shared[buf_start * n_samples * 3 .. buf_end * n_samples * 3].to_vec();
+        let chunk_cm: Vec<f64> = cm[buf_start..buf_end].to_vec();
+        // Sub-bitmatrix of the buffer window's sites
+        let site_indices: Vec<usize> = (buf_start..buf_end).collect();
+        let chunk_bm = crate::common::HaplotypeBitmatrix::from_subset(ref_bm, &site_indices);
+
+        let out = run_gibbs(&chunk_gl3, &chunk_bm, &chunk_cm, n_samples, params);
+
+        // Copy only the CORE region's dosage into the global output.
+        for v in core_start..core_end {
+            let local_v = v - buf_start;
+            for s in 0..n_samples {
+                dosage[v * n_samples + s] = out.dosage[local_v * n_samples + s];
+            }
+        }
+        let _ = chunk_n;
+    }
+
+    dosage
 }
 
 /// Tiny static-input smoke test: 1 sample, 4 ref haps, 4 variants, flat

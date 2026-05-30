@@ -106,6 +106,21 @@ impl LcwgsParams {
     pub fn seed_or_default(&self) -> u64 {
         15_052_011
     }
+
+    /// cM span of each chunk's core region (whose dosage is kept). A single
+    /// conditioning set must capture the target's mosaic within this span;
+    /// too large → conditioning dilutes (the whole-chromosome failure mode),
+    /// too small → more chunks + more overhead. GLIMPSE2 cores are ~few cM.
+    pub fn chunk_core_cm(&self) -> f64 {
+        8.0
+    }
+
+    /// cM buffer added each side of the core. The HMM runs over core+2×buffer
+    /// but only the core dosage is kept — the buffer absorbs edge effects
+    /// (forward-backward needs context beyond the region of interest).
+    pub fn chunk_buffer_cm(&self) -> f64 {
+        2.0
+    }
 }
 
 impl Default for LcwgsParams {
