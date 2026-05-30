@@ -1,52 +1,302 @@
 //! Sparse PBWT haplotype selection for lcWGS.
 //!
-//! Reproduces GLIMPSE2's `matchHapsFromCompressedPBWTSmall` (see
-//! `_archive/reference_code/GLIMPSE2/phase/src/containers/haplotype_set.cpp`).
+//! Reproduces GLIMPSE2's `matchHapsFromCompressedPBWTSmall` algorithm: at
+//! each "storage site" (variants spaced `pbwt_modulo_cm` cM apart along
+//! the chromosome) we run a PBWT update on the combined target + reference
+//! panel and record, for each target haplotype, the `pbwt_depth` nearest
+//! neighbors in the PBWT sort order. After sweeping all storage sites we
+//! aggregate per-target-hap neighbor frequencies and keep the top `kpbwt`
+//! most-frequent references as the conditioning set.
 //!
-//! # Algorithm
+//! # Why sparse?
 //!
-//! At each "storage site" (variants spaced `pbwt_modulo_cm` cM apart along
-//! the chromosome), the PBWT sort permutation is materialized and the
-//! `pbwt_depth` nearest neighbors of each target haplotype are recorded.
+//! Running the PBWT update at every variant of a biobank-scale panel is
+//! expensive (O(n_haps × n_var)). For a chip-density scaffold the panel
+//! supplies enough common variants that storage at 0.1 cM resolution
+//! samples the LD structure densely enough — GLIMPSE2 finds K=2000 panel
+//! neighbors with `pbwt_depth=12` is plenty even at 0.1× sequencing.
 //!
-//! For each target hap, the union of all stored neighbors across all
-//! storage sites is the candidate set. The candidate set is then truncated
-//! to the `Kpbwt` most frequently-occurring neighbors (= the reference haps
-//! that match the target's hard-call sequence in the longest stretches).
+//! # Inputs
 //!
-//! For lcWGS, the target's "allele" at each storage site is the
-//! **MAP genotype** (argmax of the GL-derived genotype probabilities). This
-//! is necessarily noisy at low depth, but the PBWT match is robust to a
-//! few errors per long stretch (the LD structure of the panel filters
-//! transient mistakes). GLIMPSE2 finds 12 neighbors / 0.1 cM with Kpbwt=2000
-//! is sufficient even at 0.1x coverage.
+//! `target_hard_calls[v * n_target_haps + h] ∈ {0, 1}` — the per-hap MAP
+//! allele at the COMMON storage scaffold. Iteration 0 of the Gibbs loop
+//! derives this from the marginalized HL (`argmax_g HL_g` per sample, then
+//! both haps share the marginal); subsequent iterations use the per-hap
+//! dosage from the previous HMM round.
 //!
-//! # Iteration
+//! # Performance (per feedback_ultra_optimized)
 //!
-//! After the first imputation round, each target sample has a per-site
-//! dosage from which we can derive a *better* MAP genotype. Subsequent
-//! PBWT selection rounds use these refined hard calls, yielding a
-//! progressively cleaner conditioning set (this is GLIMPSE2's Gibbs scheme).
-//!
-//! TODO: implement. Stub for module-skeleton commit.
+//! - Reuses `crate::haploid::stage2::pbwt_ibs::PbwtDivUpdater` (no
+//!   duplication of PBWT primitive).
+//! - Per-storage-site `rec[]` and per-hap `neighbor_counts[]` reused as
+//!   `&mut Vec` scratch — no allocation in the inner loop.
+//! - `prefix[]` and `div[]` allocated once at outer level.
+//! - Only PBWT updates run on storage sites (1 per 0.1 cM, ≈ 700-1500 on
+//!   chr22 vs 246K stage-1 marker steps for the Beagle stage-2 port).
+//! - Single-threaded for now; per-storage-site parallelism is a follow-up
+//!   if needed at biobank scale.
 
-/// Select up to `Kpbwt` conditioning haplotypes for each target hap by
+use crate::common::HaplotypeBitmatrix;
+use crate::haploid::stage2::pbwt_ibs::PbwtDivUpdater;
+
+/// Pick storage sites along the chromosome at the target cM spacing.
+/// Returns variant indices (into the 0..n_var panel) at roughly
+/// `modulo_cm` cM apart. Always includes the first and last variant.
+#[inline]
+fn pick_storage_sites(cm: &[f64], modulo_cm: f32) -> Vec<usize> {
+    let n_var = cm.len();
+    if n_var == 0 { return Vec::new(); }
+    let mut out = Vec::with_capacity(n_var / 100);
+    out.push(0);
+    let modulo = modulo_cm as f64;
+    let mut last_cm = cm[0];
+    for v in 1..n_var {
+        if cm[v] - last_cm >= modulo {
+            out.push(v);
+            last_cm = cm[v];
+        }
+    }
+    if *out.last().unwrap() != n_var - 1 {
+        out.push(n_var - 1);
+    }
+    out
+}
+
+/// Select up to `kpbwt` conditioning haplotypes for each target hap by
 /// sparse PBWT against the reference panel.
 ///
-/// `target_hard_calls[v * n_target_haps + h]` ∈ {0, 1} is the MAP allele
-/// for hap h at common variant v (computed externally from PL/dosages).
-/// `ref_bm` provides the reference panel at the same variants.
-/// `cm[v]` = cM positions of common variants.
+/// # Args
+/// * `target_hard_calls[v * n_target_haps + h]` ∈ {0, 1} — per-hap MAP
+///   allele at variant v.
+/// * `ref_bm` — reference panel (n_var rows × n_ref_haps cols).
+/// * `cm[v]` — genetic position in cM (length = n_var).
+/// * `n_target_haps` — number of target haps to query (= 2 × n_samples).
+/// * `kpbwt` — max output haplotype count per target hap.
+/// * `modulo_cm` — storage-site spacing in cM (GLIMPSE2 default 0.1).
+/// * `depth` — neighbors stored per storage site per target hap
+///   (GLIMPSE2 default 12).
 ///
-/// Returns, for each target hap, a Vec of reference haplotype indices.
+/// Returns a `Vec<Vec<u32>>` of length `n_target_haps`, each inner Vec
+/// containing reference hap indices (into `ref_bm`) sorted by frequency
+/// of appearance in the PBWT sweep (most frequent first), capped at
+/// `kpbwt`.
 pub fn select_conditioning_haps(
-    _target_hard_calls: &[u8],
-    _ref_bm: &crate::common::HaplotypeBitmatrix,
-    _cm: &[f64],
-    _n_target_haps: usize,
-    _kpbwt: usize,
-    _modulo_cm: f32,
-    _depth: usize,
+    target_hard_calls: &[u8],
+    ref_bm: &HaplotypeBitmatrix,
+    cm: &[f64],
+    n_target_haps: usize,
+    kpbwt: usize,
+    modulo_cm: f32,
+    depth: usize,
 ) -> Vec<Vec<u32>> {
-    unimplemented!("lcwgs::pbwt_select::select_conditioning_haps — Phase 1 stub. Implement next commit.");
+    let n_ref_haps = ref_bm.n_haps;
+    let n_var = cm.len();
+    let n_haps_total = n_target_haps + n_ref_haps;
+    assert_eq!(target_hard_calls.len(), n_var * n_target_haps);
+    assert_eq!(ref_bm.n_sites, n_var);
+    assert!(n_target_haps >= 1);
+
+    let storage_sites = pick_storage_sites(cm, modulo_cm);
+    if storage_sites.is_empty() {
+        return vec![Vec::new(); n_target_haps];
+    }
+
+    // PBWT state arrays — allocated once
+    let mut pbwt = PbwtDivUpdater::new(n_haps_total);
+    let mut prefix: Vec<i32> = (0..n_haps_total as i32).collect();
+    let mut div: Vec<i32> = vec![0i32; n_haps_total];
+    let mut inv: Vec<i32> = vec![0i32; n_haps_total];
+    let mut rec: Vec<i32> = vec![0i32; n_haps_total];
+    // Per-target-hap neighbor frequency counter, reused across iterations.
+    // Length = n_ref_haps; index = ref-hap index; value = count of storage
+    // sites this ref hap appeared as a neighbor for some target hap.
+    // Allocated PER target hap because counts are independent.
+    let mut counts: Vec<u32> = vec![0u32; n_ref_haps];
+    let mut out: Vec<Vec<u32>> = Vec::with_capacity(n_target_haps);
+
+    // Run PBWT forward across all storage sites. Save inv-array snapshots
+    // at each storage site for later neighbor extraction per target hap.
+    // We accumulate counts during the sweep for ALL target haps in a single
+    // pass — keep counts as a 2D array (n_target_haps × n_ref_haps).
+    // Memory: n_target_haps × n_ref_haps × 4 B. For 100 samples × 4500
+    // ref haps = 1.8 MB — trivial. For 50K samples × 1M ref haps = 200 GB
+    // → too much; in that regime we'd switch to per-sample loops with
+    // PBWT snapshot replay. MVP keeps the single-pass version.
+    let mut all_counts = vec![0u32; n_target_haps * n_ref_haps];
+
+    for (storage_idx, &v) in storage_sites.iter().enumerate() {
+        // Build per-hap rec[] for this storage site:
+        // - Target haps: their MAP allele
+        // - Ref haps: their actual panel allele
+        for h in 0..n_target_haps {
+            rec[h] = target_hard_calls[v * n_target_haps + h] as i32;
+        }
+        for rh in 0..n_ref_haps {
+            rec[n_target_haps + rh] = if ref_bm.get(v, rh) { 1 } else { 0 };
+        }
+
+        // PBWT forward update (biallelic ⇒ n_alleles=2)
+        pbwt.fwd_update(&rec, 2, storage_idx as i32, &mut prefix, &mut div);
+
+        // Build inv-permutation: inv[hap] = its current PBWT position
+        for (i, &p) in prefix.iter().enumerate() {
+            inv[p as usize] = i as i32;
+        }
+
+        // For each target hap, find its current PBWT position and record
+        // the `depth` nearest neighbors on each side (skipping other
+        // target haps).
+        for h in 0..n_target_haps {
+            let pos = inv[h] as i32;
+            let row_off = h * n_ref_haps;
+
+            // Walk left and right, collecting up to `depth/2 + depth/2`
+            // = `depth` reference haps total. GLIMPSE2 walks until it has
+            // `depth` non-self neighbors.
+            let mut taken = 0usize;
+            let mut left = pos - 1;
+            let mut right = pos + 1;
+            while taken < depth {
+                if left < 0 && right >= n_haps_total as i32 { break; }
+                if left >= 0 {
+                    let hap_left = prefix[left as usize] as usize;
+                    if hap_left >= n_target_haps {
+                        let ref_idx = hap_left - n_target_haps;
+                        all_counts[row_off + ref_idx] = all_counts[row_off + ref_idx].saturating_add(1);
+                        taken += 1;
+                        if taken >= depth { break; }
+                    }
+                    left -= 1;
+                }
+                if right < n_haps_total as i32 {
+                    let hap_right = prefix[right as usize] as usize;
+                    if hap_right >= n_target_haps {
+                        let ref_idx = hap_right - n_target_haps;
+                        all_counts[row_off + ref_idx] = all_counts[row_off + ref_idx].saturating_add(1);
+                        taken += 1;
+                        if taken >= depth { break; }
+                    }
+                    right += 1;
+                }
+            }
+        }
+    }
+
+    // Reduce per-target-hap counts → top-kpbwt by frequency.
+    for h in 0..n_target_haps {
+        let row_off = h * n_ref_haps;
+        let row = &all_counts[row_off..row_off + n_ref_haps];
+        // Collect (count, ref_idx) pairs for non-zero counts only.
+        // For biobank scale we may want a quickselect; for MVP a sort is OK.
+        let mut hits: Vec<(u32, u32)> = row.iter().enumerate()
+            .filter(|&(_, &c)| c > 0)
+            .map(|(i, &c)| (c, i as u32))
+            .collect();
+        // Sort descending by count, tiebreak by index ascending (deterministic)
+        hits.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        if hits.len() > kpbwt { hits.truncate(kpbwt); }
+        out.push(hits.into_iter().map(|(_, idx)| idx).collect());
+
+        // Zero out the row for next iteration (not strictly needed since
+        // we built it from scratch above, but defensive).
+        for c in &mut counts { *c = 0; }
+    }
+
+    out
+}
+
+/// Helper: build per-hap MAP allele array from per-hap likelihoods.
+/// `hap_alleles[v * n_target_haps + h]` = 1 if `hl[v*n*2 + 2*s + a]` of
+/// the per-hap likelihood is larger at allele 1, else 0.
+/// This is used by the FIRST Gibbs iteration; subsequent iterations
+/// derive hard calls from the previous round's dosage.
+pub fn map_alleles_from_hl(hl: &[f32], n_samples: usize, n_var: usize) -> Vec<u8> {
+    let n_target_haps = n_samples * 2;
+    debug_assert_eq!(hl.len(), n_var * n_target_haps);
+    let mut out = vec![0u8; n_var * n_target_haps];
+    // Two haps of one sample share the same per-hap HL (the marginalization
+    // is identical), so they get the same MAP call in iteration 0. Later
+    // iterations supply per-hap dosages that differentiate them.
+    for v in 0..n_var {
+        let off = v * n_target_haps;
+        for h in 0..n_target_haps {
+            let h0 = hl[off + h * 2];
+            let h1 = hl[off + h * 2 + 1];
+            // Wait — hl is packed per-hap, not per-genotype, so layout is
+            // hl[v*n_target_haps*2 + 2*s + a]. Two haps of same sample
+            // currently have identical HL. Carefully re-index:
+            // For a target hap index h, its (hl[0], hl[1]) live at
+            //   hl[v * n_target_haps * 2 + 2*h] and ... + 2*h+1
+            // BUT actually the existing pl_reader output layout is
+            //   hl[v*n_samples*2 + 2*s + a]  with n_target_haps = n_samples*2
+            // So per-hap layout per-(sample×hap) collapses to per-sample.
+            let _ = (h0, h1); // silence: handled below
+            let s = h / 2;
+            let l0 = hl[v * n_samples * 2 + 2 * s + 0];
+            let l1 = hl[v * n_samples * 2 + 2 * s + 1];
+            out[off + h] = if l1 > l0 { 1 } else { 0 };
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::HaplotypeBitmatrix;
+
+    #[test]
+    fn storage_sites_at_modulo() {
+        // 5 variants at 0.0, 0.05, 0.1, 0.15, 0.2 cM, modulo 0.1
+        // Should pick variants near 0.0, 0.1, 0.2
+        let cm = vec![0.0f64, 0.05, 0.10, 0.15, 0.20];
+        let s = pick_storage_sites(&cm, 0.1);
+        assert!(s.contains(&0));
+        assert!(s.contains(&4));
+        assert!(s.len() >= 3, "expected ≥3 storage sites, got {:?}", s);
+    }
+
+    #[test]
+    fn storage_sites_dense_modulo_picks_each() {
+        let cm = vec![0.0, 0.01, 0.02, 0.03];
+        let s = pick_storage_sites(&cm, 0.001);
+        // Every variant becomes a storage site (modulo smaller than spacing)
+        assert_eq!(s.len(), 4);
+    }
+
+    #[test]
+    fn target_with_distinct_ref_hap_gets_top_neighbor() {
+        // 5 variants, 4 ref haps where hap 0 matches target perfectly,
+        // hap 1 matches partially, haps 2/3 don't match.
+        // Target should pick hap 0 as top conditioning hap.
+        let n_var = 5;
+        let n_ref = 4;
+        // Target: 0,1,0,1,0 at all sites
+        let target: Vec<u8> = vec![0, 1, 0, 1, 0];
+        // Ref haps: hap 0 = [0,1,0,1,0] (perfect match)
+        //           hap 1 = [0,1,0,1,1] (mostly match)
+        //           hap 2 = [1,0,1,0,1] (opposite)
+        //           hap 3 = [1,1,1,1,1] (all alt)
+        let ref_alleles: Vec<u8> = vec![
+            // site 0: hap0=0, hap1=0, hap2=1, hap3=1
+            0,0,1,1,
+            // site 1: hap0=1, hap1=1, hap2=0, hap3=1
+            1,1,0,1,
+            // site 2: hap0=0, hap1=0, hap2=1, hap3=1
+            0,0,1,1,
+            // site 3: hap0=1, hap1=1, hap2=0, hap3=1
+            1,1,0,1,
+            // site 4: hap0=0, hap1=1, hap2=1, hap3=1
+            0,1,1,1,
+        ];
+        let bm = HaplotypeBitmatrix::from_byte_slice_all(n_var, n_ref, &ref_alleles, n_ref);
+        // 1 target hap; target_hard_calls in (v * n_target_haps + h) layout
+        // For n_target_haps=1, layout = target[v]
+        let cm = vec![0.0f64, 0.05, 0.10, 0.15, 0.20];
+        let out = select_conditioning_haps(&target, &bm, &cm, 1, 2, 0.05, 4);
+        assert_eq!(out.len(), 1);
+        // Top hap should be hap 0 (perfect match)
+        assert!(!out[0].is_empty(), "should select at least one hap");
+        assert!(out[0].contains(&0), "should include hap 0 (perfect match); got {:?}", out[0]);
+    }
 }
