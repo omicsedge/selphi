@@ -142,9 +142,12 @@ fn main() {
             write!(bgzf, "variant")?;
             for s in &result.sample_ids { write!(bgzf, "\t{}", s)?; }
             writeln!(bgzf)?;
-            // rows
+            // rows — "variant" column is chrom:pos:ref:alt so downstream eval
+            // can match by identity (dose rows are in shared-panel order, NOT
+            // target-VCF order, when some target variants miss the panel).
             for v in 0..n_var {
-                write!(bgzf, "{}", v)?;
+                let (chrom, pos, r, a) = &result.variants[v];
+                write!(bgzf, "{}:{}:{}:{}", chrom, pos, r, a)?;
                 for s in 0..n_samp {
                     write!(bgzf, "\t{:.4}", result.dosage[v * n_samp + s])?;
                 }

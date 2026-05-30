@@ -108,18 +108,25 @@ impl LcwgsParams {
     }
 
     /// cM span of each chunk's core region (whose dosage is kept). A single
-    /// conditioning set must capture the target's mosaic within this span;
-    /// too large → conditioning dilutes (the whole-chromosome failure mode),
-    /// too small → more chunks + more overhead. GLIMPSE2 cores are ~few cM.
+    /// conditioning set of K haps must capture the target's mosaic within the
+    /// full window (core + 2×buffer); too large → K dilutes across the window
+    /// (the whole-chromosome failure mode), too small → more chunks + overhead.
+    /// Empirically a ~2 cM core (≈3 cM window) keeps K-selection concentrated.
+    /// Override with `LCWGS_CHUNK_CORE_CM` for tuning.
     pub fn chunk_core_cm(&self) -> f64 {
-        8.0
+        std::env::var("LCWGS_CHUNK_CORE_CM").ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2.0)
     }
 
     /// cM buffer added each side of the core. The HMM runs over core+2×buffer
     /// but only the core dosage is kept — the buffer absorbs edge effects
     /// (forward-backward needs context beyond the region of interest).
+    /// Override with `LCWGS_CHUNK_BUFFER_CM`.
     pub fn chunk_buffer_cm(&self) -> f64 {
-        2.0
+        std::env::var("LCWGS_CHUNK_BUFFER_CM").ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.5)
     }
 }
 

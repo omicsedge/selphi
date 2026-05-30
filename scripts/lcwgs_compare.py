@@ -20,21 +20,33 @@ except ImportError:
 
 
 def load_dose_tsv(path: str):
-    """Load (n_variants, n_samples) dosage matrix from bgzf TSV produced by Selphi.
+    """Load dosage matrix from bgzf TSV produced by Selphi.
 
     Header: 'variant\\t<sid1>\\t<sid2>...'
-    Rows: '<variant_idx>\\t<dose1>\\t<dose2>...'
+    Rows:   '<chrom:pos:ref:alt>\\t<dose1>\\t<dose2>...'
+
+    Returns (mat, samples, variant_keys) where variant_keys[i] = (chrom, pos,
+    ref, alt) parsed from the row label, so dose rows can be matched to truth
+    by identity (rows are in shared-panel order, not target-VCF order).
     """
     opener = gzip.open if path.endswith(".gz") else open
+    keys = []
     with opener(path, "rt") as f:
         header = f.readline().rstrip("\n").split("\t")
         samples = header[1:]
         rows = []
         for line in f:
             parts = line.rstrip("\n").split("\t")
+            label = parts[0]
+            # chrom:pos:ref:alt  (chrom may itself be numeric like "22")
+            fields = label.split(":")
+            if len(fields) == 4:
+                keys.append((fields[0], int(fields[1]), fields[2], fields[3]))
+            else:
+                keys.append(None)  # legacy row-index format
             rows.append([float(x) for x in parts[1:]])
     mat = np.asarray(rows, dtype=np.float32)
-    return mat, samples
+    return mat, samples, keys
 
 
 def main():
@@ -47,25 +59,33 @@ def main():
                     help="Comma-separated MAF bin edges")
     args = ap.parse_args()
 
-    # Load dose matrix
-    dose, dose_samples = load_dose_tsv(args.dose)
+    # Load dose matrix + per-row variant keys (chrom,pos,ref,alt)
+    dose, dose_samples, dose_keys = load_dose_tsv(args.dose)
     n_var_dose, n_samp_dose = dose.shape
     print(f"Loaded dose: {n_var_dose} variants × {n_samp_dose} samples",
           file=sys.stderr)
 
-    # Load target VCF site order (matches dose row order)
-    target = VCF(args.target)
-    target_samples = target.samples
-    target_sites = []  # (chrom, pos, ref, alt)
-    for rec in target:
-        if rec.ALT is None or len(rec.ALT) != 1:
-            continue
-        target_sites.append((rec.CHROM, rec.POS, rec.REF, rec.ALT[0]))
-    print(f"Target sites: {len(target_sites)}", file=sys.stderr)
-
-    if len(target_sites) != n_var_dose:
-        print(f"WARNING: target ({len(target_sites)}) != dose rows ({n_var_dose})",
-              file=sys.stderr)
+    # Build lookup directly from the dose row labels (identity match).
+    # Normalize chrom by stripping any "chr" prefix so "22" and "chr22" match.
+    def norm(c):
+        return c[3:] if c.startswith("chr") else c
+    if dose_keys[0] is not None:
+        site_to_row = {}
+        for i, k in enumerate(dose_keys):
+            if k is None:
+                continue
+            site_to_row[(norm(k[0]), k[1], k[2], k[3])] = i
+    else:
+        # Legacy row-index format: fall back to target-VCF order (may mismap
+        # if target≠shared). Kept only for old dose files.
+        target = VCF(args.target)
+        site_to_row = {}
+        idx = 0
+        for rec in target:
+            if rec.ALT is None or len(rec.ALT) != 1:
+                continue
+            site_to_row[(norm(rec.CHROM), rec.POS, rec.REF, rec.ALT[0])] = idx
+            idx += 1
 
     # Load truth indexed by (chrom, pos, ref, alt)
     truth = VCF(args.truth)
@@ -81,10 +101,7 @@ def main():
         truth_idx = list(range(len(truth_samples)))
         dose_idx = list(range(len(dose_samples)))
 
-    # Build lookup for target_sites → dose row
-    site_to_row = {site: i for i, site in enumerate(target_sites)}
-
-    # Walk truth, match to target, accumulate per-MAF-bin
+    # Walk truth, match to dose by variant identity, accumulate per-MAF-bin
     bins = [float(x) for x in args.maf_bins.split(",")]
     bin_data = [[] for _ in range(len(bins) - 1)]  # list of (truth, dose) per bin
     all_truth = []
@@ -96,7 +113,7 @@ def main():
     for rec in truth:
         if rec.ALT is None or len(rec.ALT) != 1:
             continue
-        site = (rec.CHROM, rec.POS, rec.REF, rec.ALT[0])
+        site = (norm(rec.CHROM), rec.POS, rec.REF, rec.ALT[0])
         row = site_to_row.get(site)
         if row is None:
             n_not_in_dose += 1

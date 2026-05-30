@@ -39,6 +39,11 @@ pub struct LcwgsOutput {
     pub n_variants: usize,
     /// Sample IDs from target VCF.
     pub sample_ids: Vec<String>,
+    /// Per-shared-variant identity `(chrom, pos, ref, alt)` in dosage-row
+    /// order (shared-panel genomic order). Lets the output/eval match dose
+    /// rows to truth by position — the dose rows are NOT in target-VCF order
+    /// when some target variants don't intersect the panel.
+    pub variants: Vec<(String, i64, String, String)>,
 }
 
 /// Top-level lcWGS pipeline. Inputs are file paths to keep the surface
@@ -88,14 +93,18 @@ pub fn run_lcwgs(
             "No shared variants between target VCF and reference panel"));
     }
 
-    // --- 3. Extract ref bitmatrix subsetted to shared variants ---
-    let ref_bm = srp.extract_ref_alleles_bitmatrix(&wgs_idx);
-    selphi_info!("  ref bitmatrix: {} sites × {} haps", ref_bm.n_sites, ref_bm.n_haps);
+    // --- 3. (ref bitmatrix is now extracted per-chunk from SRP — see step 6) ---
 
     // --- 4. Build cM positions for shared variants from the genetic map ---
     let (map_bp, map_cm) = genmap::load_genetic_map_raw(std::path::Path::new(map_path))?;
     let cm: Vec<f64> = wgs_idx.iter().map(|&wi| {
         genmap::interpolate_cm_extrapolate(&map_bp, &map_cm, srp.variants[wi].pos)
+    }).collect();
+
+    // Per-shared-variant identity in dosage-row order (panel genomic order).
+    let variants: Vec<(String, i64, String, String)> = wgs_idx.iter().map(|&wi| {
+        let v = &srp.variants[wi];
+        (v.chr.clone(), v.pos, v.ref_allele.clone(), v.alt_allele.clone())
     }).collect();
 
     // --- 5. Re-layout gl3[] from target-VCF variant order to shared-panel order ---
@@ -116,13 +125,30 @@ pub fn run_lcwgs(
     // haps along 50 cM). GLIMPSE2 solves this by chunking: each ~few-cM chunk
     // gets its OWN PBWT-selected conditioning set. We chunk by cM with a
     // buffer region on each side (only the core region's dosage is kept), then
-    // ligate. This fixes accuracy AND bounds memory (alpha = K × chunk_size).
-    let dosage = run_chunked_gibbs(&gl3_shared, &ref_bm, &cm, n_samples, n_shared, params);
+    // ligate. This fixes accuracy AND bounds memory: the reference bitmatrix is
+    // extracted from the SRP PER CHUNK (never the whole chromosome in RAM),
+    // which beats GLIMPSE2's memory profile.
+    // Diagnostic: emit the raw GL-implied dosage (E[ALT] = g1 + 2*g2) with NO
+    // imputation. Correlation of this with truth tells us whether gl3_shared
+    // is correctly mapped to variants (independent of the HMM).
+    if std::env::var("LCWGS_RAW_GL").is_ok() {
+        let mut raw = vec![0.0f32; n_shared * n_samples];
+        for v in 0..n_shared {
+            for s in 0..n_samples {
+                let b = v * n_samples * 3 + 3 * s;
+                raw[v * n_samples + s] = gl3_shared[b + 1] + 2.0 * gl3_shared[b + 2];
+            }
+        }
+        return Ok(LcwgsOutput { dosage: raw, n_variants: n_shared, sample_ids, variants });
+    }
+
+    let dosage = run_chunked_gibbs(&gl3_shared, srp, &wgs_idx, &cm, n_samples, n_shared, params);
 
     Ok(LcwgsOutput {
         dosage,
         n_variants: n_shared,
         sample_ids,
+        variants,
     })
 }
 
@@ -134,7 +160,8 @@ pub fn run_lcwgs(
 /// Returns the per-(variant, sample) diploid dosage in shared-panel order.
 fn run_chunked_gibbs(
     gl3_shared: &[f32],
-    ref_bm: &crate::common::HaplotypeBitmatrix,
+    srp: &SrpReader,
+    wgs_idx: &[usize],
     cm: &[f64],
     n_samples: usize,
     n_shared: usize,
@@ -172,11 +199,24 @@ fn run_chunked_gibbs(
         // Slice gl3 + cm for the buffer window
         let chunk_gl3: Vec<f32> = gl3_shared[buf_start * n_samples * 3 .. buf_end * n_samples * 3].to_vec();
         let chunk_cm: Vec<f64> = cm[buf_start..buf_end].to_vec();
-        // Sub-bitmatrix of the buffer window's sites
-        let site_indices: Vec<usize> = (buf_start..buf_end).collect();
-        let chunk_bm = crate::common::HaplotypeBitmatrix::from_subset(ref_bm, &site_indices);
+        // Extract the chunk's reference bitmatrix DIRECTLY from the SRP for the
+        // buffer window's panel variants. This is the same path the standalone
+        // pipeline uses, and keeps peak memory at K × chunk_size (the full-
+        // chromosome ref bitmatrix is never materialized).
+        let chunk_wgs: Vec<usize> = wgs_idx[buf_start..buf_end].to_vec();
+        let chunk_bm = srp.extract_ref_alleles_bitmatrix(&chunk_wgs);
 
         let out = run_gibbs(&chunk_gl3, &chunk_bm, &chunk_cm, n_samples, params);
+
+        if std::env::var("LCWGS_CHUNK_DIAG").is_ok() {
+            let gl3_sum: f64 = chunk_gl3.iter().map(|&x| x as f64).sum();
+            let dose_mean: f64 = out.dosage.iter().map(|&d| d as f64).sum::<f64>() / out.dosage.len().max(1) as f64;
+            let bm_ones: u64 = (0..chunk_bm.n_sites).map(|si| chunk_bm.popcount_row(si, chunk_bm.n_haps) as u64).sum();
+            crate::selphi_info!(
+                "  [chunk {}] cm=[{:.3},{:.3}] n_var={} gl3_sum={:.1} bm_ones_total={} dose_mean={:.4}",
+                c, chunk_cm[0], chunk_cm[chunk_cm.len()-1], chunk_n,
+                gl3_sum, bm_ones, dose_mean);
+        }
 
         // Copy only the CORE region's dosage into the global output.
         for v in core_start..core_end {
