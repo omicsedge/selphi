@@ -429,7 +429,16 @@ fn phase_genotypes_inner(
         let mut converged = vec![false; n_samples];
         let convergence_start_iter = 8usize; // start checking after 8 iterations
         let convergence_threshold = 0.01f64; // swap rate < 1%
-        for it in 0..n_total {
+        // Beagle adaptive burnin (Main.java:256-257): if the burnin swap rate
+        // drops below 1% the remaining burnin iterations are skipped and we
+        // advance straight to the first phasing iteration. Opt-in via
+        // SELPHI_HAPLOID_BURNIN_EARLYSTOP=1 (gated: changes the iteration
+        // schedule, so kept off by default until validated on trio SER — see
+        // feedback_r2_never_regress). The audit flags this as the likely
+        // remaining cause of the ~0.01 pp trio-SER gap vs Beagle.
+        let burnin_earlystop = std::env::var("SELPHI_HAPLOID_BURNIN_EARLYSTOP").ok().as_deref() == Some("1");
+        let mut it = 0usize;
+        while it < n_total {
             let is_last = it == n_total - 1;
             let use_bwd = (it & 1) == 0;
             let lr = lr_threshold(it, n_burnin, n_phasing);
@@ -777,6 +786,16 @@ fn phase_genotypes_inner(
                 wi+1, it+1, n_total, pt, lr.min(1e6), nc, sw, sr, lk,
                 pbwt_ms, em_ms, hmm_ms, skip_str,
                 if is_last { " (final)" } else { "" });
+
+            // Advance iteration. Beagle adaptive burnin: a burnin iteration
+            // whose swap rate already ≤ 1% jumps to the first phasing iteration
+            // (skips the rest of burnin), so EM/candidate ramping doesn't keep
+            // churning an already-stable phase. Only when opted in.
+            if burnin_earlystop && it + 1 < n_burnin && sr <= convergence_threshold {
+                it = n_burnin; // advance to first phasing iteration
+            } else {
+                it += 1;
+            }
         }
 
         // Save per-window EM recombIntensity (owned region boundaries in global coords)
