@@ -192,8 +192,16 @@ fn extract_subfield(field: &[u8], n: usize) -> Option<&[u8]> {
 pub struct PlVcfResult {
     /// Per-hap likelihoods packed as
     /// `hl[v * n_samples * 2 + 2*s + a]` = `P(reads_{s,v} | hap a)`.
-    /// Each (sample, variant) pair has hl[0] + hl[1] = 1.
+    /// Each (sample, variant) pair has hl[0] + hl[1] = 1. This is the
+    /// pre-marginalized form (identical for both haps of a sample) — kept
+    /// for the simple non-iterative path and tests.
     pub hl: Vec<f32>,
+    /// Raw 3-way genotype likelihoods, normalized per (sample, variant) to
+    /// sum 1: `gl3[v * n_samples * 3 + 3*s + g]` = `P(reads | genotype g)`
+    /// for g ∈ {0=hom-REF, 1=het, 2=hom-ALT}. Required by the Gibbs loop to
+    /// build per-hap likelihoods CONDITIONAL on the other hap's allele
+    /// (GLIMPSE2 makeHaplotypeLikelihoods).
+    pub gl3: Vec<f32>,
     /// Variant markers in file order.
     pub markers: Vec<TargetMarker>,
     /// Sample IDs from the VCF #CHROM line.
@@ -228,6 +236,7 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
     let mut n_samples = 0usize;
     let mut markers: Vec<TargetMarker> = Vec::with_capacity(est_variants);
     let mut hl: Vec<f32> = Vec::new(); // sized once after #CHROM parsed
+    let mut gl3: Vec<f32> = Vec::new(); // 3 genotype probs per (sample, variant)
 
     let mut n_variants_seen = 0usize;
     let mut n_missing_pl = 0usize;
@@ -308,9 +317,12 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
         });
         n_variants_seen += 1;
 
-        // Allocate hl row in-place (no temp Vec)
+        // Allocate hl + gl3 rows in-place (no temp Vec)
         let var_off = hl.len();
         hl.resize(var_off + n_samples * 2, 0.5);
+        let gl_off = gl3.len();
+        // Flat default for the 3-way GL is uniform (1/3 each).
+        gl3.resize(gl_off + n_samples * 3, 1.0 / 3.0);
 
         // Per-sample PL extraction (byte slice walk)
         let gt_region = &line[tabs[8]+1..];
@@ -322,33 +334,45 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
             while field_end < n && gt_region[field_end] != b'\t' { field_end += 1; }
             let field = &gt_region[field_start..field_end];
 
-            let (h0, h1) = match pl_pos {
+            // (h0, h1) = pre-marginalized per-hap likelihood;
+            // (g0, g1, g2) = normalized 3-way genotype likelihood.
+            let (h0, h1, g0, g1, g2) = match pl_pos {
                 Some(p) => match extract_subfield(field, p) {
                     Some(pl_bytes) => match parse_pl_field(pl_bytes) {
                         Some(pl) => {
                             let l00 = phred_to_lik(pl[0]);
                             let l01 = phred_to_lik(pl[1]);
                             let l11 = phred_to_lik(pl[2]);
+                            let gsum = l00 + l01 + l11;
+                            let (g0, g1, g2) = if gsum > f32::MIN_POSITIVE {
+                                let gi = 1.0 / gsum;
+                                (l00 * gi, l01 * gi, l11 * gi)
+                            } else {
+                                (1.0/3.0, 1.0/3.0, 1.0/3.0)
+                            };
                             let a = l00 + 0.5 * l01;
                             let b = l11 + 0.5 * l01;
                             let sum = a + b;
                             if sum > f32::MIN_POSITIVE {
                                 let inv = 1.0 / sum;
-                                (a * inv, b * inv)
+                                (a * inv, b * inv, g0, g1, g2)
                             } else {
-                                n_missing_pl += 1; (0.5, 0.5)
+                                n_missing_pl += 1; (0.5, 0.5, 1.0/3.0, 1.0/3.0, 1.0/3.0)
                             }
                         }
-                        None => { n_missing_pl += 1; (0.5, 0.5) }
+                        None => { n_missing_pl += 1; (0.5, 0.5, 1.0/3.0, 1.0/3.0, 1.0/3.0) }
                     },
-                    None => { n_missing_pl += 1; (0.5, 0.5) }
+                    None => { n_missing_pl += 1; (0.5, 0.5, 1.0/3.0, 1.0/3.0, 1.0/3.0) }
                 },
-                None => { n_missing_pl += 1; (0.5, 0.5) }
+                None => { n_missing_pl += 1; (0.5, 0.5, 1.0/3.0, 1.0/3.0, 1.0/3.0) }
             };
             // SAFETY: var_off + 2*s + 1 < var_off + n_samples*2, in bounds.
             unsafe {
                 *hl.get_unchecked_mut(var_off + 2 * s)     = h0;
                 *hl.get_unchecked_mut(var_off + 2 * s + 1) = h1;
+                *gl3.get_unchecked_mut(gl_off + 3 * s)     = g0;
+                *gl3.get_unchecked_mut(gl_off + 3 * s + 1) = g1;
+                *gl3.get_unchecked_mut(gl_off + 3 * s + 2) = g2;
             }
 
             field_start = if field_end < n { field_end + 1 } else { n };
@@ -366,6 +390,7 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
 
     Ok(PlVcfResult {
         hl,
+        gl3,
         markers,
         sample_ids: sample_names,
     })

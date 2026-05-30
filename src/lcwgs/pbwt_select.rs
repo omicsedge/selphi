@@ -221,6 +221,7 @@ pub fn select_conditioning_haps(
 /// the per-hap likelihood is larger at allele 1, else 0.
 /// This is used by the FIRST Gibbs iteration; subsequent iterations
 /// derive hard calls from the previous round's dosage.
+#[allow(dead_code)]
 pub fn map_alleles_from_hl(hl: &[f32], n_samples: usize, n_var: usize) -> Vec<u8> {
     let n_target_haps = n_samples * 2;
     debug_assert_eq!(hl.len(), n_var * n_target_haps);
