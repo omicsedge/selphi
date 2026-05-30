@@ -101,6 +101,13 @@ pub struct LcwgsParams {
     pub epsilon: f32,
 }
 
+impl LcwgsParams {
+    /// RNG seed for Gibbs initialization. GLIMPSE2 default: 15052011.
+    pub fn seed_or_default(&self) -> u64 {
+        15_052_011
+    }
+}
+
 impl Default for LcwgsParams {
     fn default() -> Self {
         Self {

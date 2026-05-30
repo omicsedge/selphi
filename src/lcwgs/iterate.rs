@@ -31,10 +31,64 @@
 
 use rayon::prelude::*;
 
-use super::pbwt_select::{select_conditioning_haps, map_alleles_from_hl};
+use super::pbwt_select::select_conditioning_haps;
 use super::hmm::run_forward_backward;
 use super::LcwgsParams;
 use crate::common::HaplotypeBitmatrix;
+
+/// Hard-call bootstrap for the FIRST Gibbs iteration. For each (sample, var):
+/// - If HL strongly favors REF or ALT (max ratio > 4×), use MAP.
+/// - Otherwise (flat / near-flat HL) sample a panel hap uniformly at random
+///   and copy its allele at this site. This gives the PBWT something to
+///   bite into — without it, the all-zero hard-call collapse forces the
+///   conditioning set toward all-REF panel haps.
+///
+/// Deterministic: uses xorshift seeded by `(seed, sample, var)` so the
+/// bootstrap is reproducible across runs (matches the GLIMPSE2 convention
+/// of a fixed seed for the Gibbs initialization).
+fn bootstrap_hard_calls(
+    hl: &[f32],
+    ref_bm: &HaplotypeBitmatrix,
+    n_samples: usize,
+    n_var: usize,
+    seed: u64,
+) -> Vec<u8> {
+    let n_target_haps = n_samples * 2;
+    let n_ref = ref_bm.n_haps;
+    let mut out = vec![0u8; n_var * n_target_haps];
+    // Threshold: "confident HL" = max(l)/min(l) > 4 (i.e. ≥6 dB phred gap).
+    // Below this, treat as ambiguous and sample from panel.
+    let confidence_ratio: f32 = 4.0;
+    for v in 0..n_var {
+        let off = v * n_target_haps;
+        let hl_off = v * n_samples * 2;
+        for h in 0..n_target_haps {
+            let s = h / 2;
+            let l0 = hl[hl_off + 2 * s];
+            let l1 = hl[hl_off + 2 * s + 1];
+            let mx = l0.max(l1);
+            let mn = l0.min(l1);
+            if mn <= 0.0 || mx / mn >= confidence_ratio {
+                // Confident: take MAP
+                out[off + h] = if l1 > l0 { 1 } else { 0 };
+            } else {
+                // Ambiguous: sample a random panel hap at this site
+                // Deterministic xorshift on (seed, v, h)
+                let mut x = seed
+                    .wrapping_add((v as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                    .wrapping_add((h as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+                x ^= x >> 30;
+                x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                x ^= x >> 27;
+                x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+                x ^= x >> 31;
+                let r = (x as usize) % n_ref;
+                out[off + h] = if ref_bm.get(v, r) { 1 } else { 0 };
+            }
+        }
+    }
+    out
+}
 
 /// Per-variant per-sample dosage output of the Gibbs imputation.
 /// Layout: `dosage[v * n_samples + s]` ∈ [0, 2] is `E[ALT count]` for
@@ -59,8 +113,18 @@ pub fn run_gibbs(
     assert_eq!(hl.len(), n_var * n_samples * 2);
     assert_eq!(ref_bm.n_sites, n_var);
 
-    // --- Iteration 0: derive MAP hard calls from PL marginalization ---
-    let mut hard_calls = map_alleles_from_hl(hl, n_samples, n_var);
+    // --- Iteration 0: hard-call initialization ---
+    // For lcWGS at low coverage, ~half the sites have flat HL (no/few reads),
+    // and map_alleles_from_hl defaults to 0 when l0 == l1 → "all-REF" hard
+    // calls → the PBWT then groups every target hap together as REF, and the
+    // sparse-PBWT conditioning set ends up being all-REF panel haps → the
+    // HMM converges to dose ≈ 0 and the Gibbs feedback loop never breaks
+    // out. Fix: at flat-HL sites, draw the hard call from the panel allele
+    // frequency (sampling a random panel hap at that site). This gives a
+    // realistic per-site genotype distribution to bootstrap the PBWT
+    // selection from, mirroring GLIMPSE2's behaviour where ambiguous sites
+    // do not collapse to a degenerate REF hard call.
+    let mut hard_calls = bootstrap_hard_calls(hl, ref_bm, n_samples, n_var, params.seed_or_default());
 
     // Accumulator for "main iteration" averaged dosages
     let n_burnin = params.n_iterations.saturating_sub(params.n_main_iterations);
