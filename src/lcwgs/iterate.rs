@@ -32,7 +32,7 @@
 use rayon::prelude::*;
 
 use super::pbwt_select::select_conditioning_haps;
-use super::hmm::run_forward_backward;
+use super::hmm::{run_forward_backward, run_forward_backward_scaffold};
 use super::LcwgsParams;
 use crate::common::HaplotypeBitmatrix;
 
@@ -72,6 +72,27 @@ pub fn run_gibbs(
     // Per-hap sampled alleles, layout [v * n_target_haps + h]. Initialized
     // from the marginal genotype MAP, then refined by Gibbs sampling.
     let mut hap_alleles = init_hap_alleles(gl3, ref_bm, n_samples, n_var, params.seed_or_default());
+
+    // Common (scaffold) site partition from the PANEL minor-allele frequency.
+    // The HMM forward-backward runs only on these; rare sites are imputed by
+    // interpolating the scaffold posterior (GLIMPSE2-style). This keeps the
+    // conditioning/HMM clean (no dilution by flat-GL rare sites) and lifts
+    // rare-variant accuracy. Disable with LCWGS_NO_SCAFFOLD=1 (all sites).
+    let use_scaffold = std::env::var("LCWGS_NO_SCAFFOLD").is_err();
+    let common_idx: Vec<usize> = if use_scaffold {
+        let n_ref = ref_bm.n_haps;
+        let thr = params.rare_maf as f64;
+        (0..n_var).filter(|&v| {
+            let ac = ref_bm.popcount_row(v, n_ref) as f64;
+            let maf = ac.min(n_ref as f64 - ac) / n_ref as f64;
+            maf >= thr
+        }).collect()
+    } else {
+        Vec::new()
+    };
+    if use_scaffold {
+        crate::selphi_debug!("  [lcwgs] scaffold: {} common / {} total sites", common_idx.len(), n_var);
+    }
 
     let n_burnin = params.n_iterations.saturating_sub(params.n_main_iterations);
     let mut acc_dosage = vec![0.0f64; n_var * n_samples];
@@ -128,6 +149,8 @@ pub fn run_gibbs(
             let cond = &cond_per_hap[h];
             let dose: Vec<f32> = if cond.is_empty() {
                 (0..n_var).map(|v| hap_hl[2 * v + 1]).collect()
+            } else if use_scaffold {
+                run_forward_backward_scaffold(&hap_hl, &common_idx, cond, ref_bm, cm, params).dosage
             } else {
                 run_forward_backward(&hap_hl, cond, ref_bm, cm, params).dosage
             };

@@ -257,6 +257,188 @@ pub fn run_forward_backward(
     HmmOutput { dosage }
 }
 
+/// GLIMPSE2-style scaffold HMM: run forward-backward ONLY on the common
+/// (scaffold) sites, then impute ALL sites (common + rare) by interpolating
+/// the per-state posterior between flanking scaffold sites. This is the same
+/// design as `diploid::hmm_scaffold` and the Beagle stage-2 port
+/// (`haploid::stage2`), adapted to GL-weighted emissions.
+///
+/// Why this helps rare variants: the PBWT/HMM scaffold stays on well-typed
+/// common sites (clean conditioning, no dilution from flat-GL rare sites),
+/// and rare-variant dose is read off the panel via the scaffold posterior —
+/// a rare-allele-carrying conditioning hap contributes its allele wherever
+/// the target is copying it, even with zero reads at the rare site.
+///
+/// `common_idx` lists the LOCAL variant indices (into `cm`/`ref_bm`/`hl`) that
+/// are common/scaffold sites, in ascending order. All other sites are imputed
+/// by interpolation. If `common_idx` is empty, falls back to the all-sites
+/// `run_forward_backward`.
+pub fn run_forward_backward_scaffold(
+    hl: &[f32],
+    common_idx: &[usize],
+    cond_haps: &[u32],
+    ref_bm: &HaplotypeBitmatrix,
+    cm: &[f64],
+    params: &LcwgsParams,
+) -> HmmOutput {
+    let n_var = cm.len();
+    let n_s = common_idx.len();
+    let k = cond_haps.len();
+    if n_s == 0 || k == 0 {
+        return run_forward_backward(hl, cond_haps, ref_bm, cm, params);
+    }
+
+    let inv_k = 1.0f32 / (k as f32);
+    let ee = 1.0f32 - params.epsilon;
+    let ed = params.epsilon;
+    let scale = 0.04f64 * (params.ne as f64) / (k as f64);
+
+    // Scaffold emission per (scaffold site j, allele): GL-weighted, normalized.
+    // emit_s[2*j + a]
+    let mut emit_s = vec![0.0f32; n_s * 2];
+    for (j, &v) in common_idx.iter().enumerate() {
+        let h0 = hl[2 * v];
+        let h1 = hl[2 * v + 1];
+        let p0 = h0 * ee + h1 * ed;
+        let p1 = h0 * ed + h1 * ee;
+        let s = p0 + p1;
+        if s > f32::MIN_POSITIVE {
+            emit_s[2 * j] = p0 / s;
+            emit_s[2 * j + 1] = p1 / s;
+        } else {
+            emit_s[2 * j] = 0.5;
+            emit_s[2 * j + 1] = 0.5;
+        }
+    }
+
+    // p_rec between consecutive scaffold sites (by their cM gap).
+    let mut p_rec = vec![0.0f32; n_s];
+    for j in 1..n_s {
+        let d = (cm[common_idx[j]] - cm[common_idx[j - 1]]).max(0.0);
+        p_rec[j] = (1.0 - (-d * scale).exp()) as f32;
+    }
+
+    // Forward over scaffold; alpha[j*k + state].
+    let mut alpha = vec![0.0f32; n_s * k];
+    let mut alpha_sum = vec![0.0f32; n_s];
+    {
+        let e0 = emit_s[0];
+        let e1 = emit_s[1];
+        let mut s0 = 0.0f32;
+        for (j2, &h) in cond_haps.iter().enumerate() {
+            let a = ref_bm.get(common_idx[0], h as usize);
+            let p = inv_k * if a { e1 } else { e0 };
+            alpha[j2] = p;
+            s0 += p;
+        }
+        alpha_sum[0] = s0;
+    }
+    for j in 1..n_s {
+        let pr = p_rec[j];
+        let fact1 = pr * inv_k;
+        let fact2 = (1.0 - pr) / alpha_sum[j - 1].max(f32::MIN_POSITIVE);
+        let e0 = emit_s[2 * j];
+        let e1 = emit_s[2 * j + 1];
+        let prev = (j - 1) * k;
+        let curr = j * k;
+        let site = common_idx[j];
+        let mut s = 0.0f32;
+        for (st, &h) in cond_haps.iter().enumerate() {
+            let a = ref_bm.get(site, h as usize);
+            let e = if a { e1 } else { e0 };
+            let p = (alpha[prev + st] * fact2 + fact1) * e;
+            alpha[curr + st] = p;
+            s += p;
+        }
+        alpha_sum[j] = s;
+    }
+
+    // Backward over scaffold; convert alpha → gamma (posterior) in place.
+    // gamma[j*k+state] = alpha[j]*beta[j], row-normalized.
+    let mut beta = vec![inv_k; k];
+    let mut gamma = vec![0.0f32; n_s * k];
+    {
+        let last = n_s - 1;
+        let off = last * k;
+        let mut gsum = 0.0f32;
+        for st in 0..k {
+            let g = alpha[off + st] * beta[st];
+            gamma[off + st] = g;
+            gsum += g;
+        }
+        if gsum > 0.0 { let inv = 1.0 / gsum; for st in 0..k { gamma[off + st] *= inv; } }
+    }
+    let mut beta_sum = 1.0f32; // beta initialized uniform sums to 1
+    for j in (0..n_s - 1).rev() {
+        let pr = p_rec[j + 1];
+        let fact1 = pr * inv_k;
+        let fact2 = (1.0 - pr) / beta_sum.max(f32::MIN_POSITIVE);
+        let e0 = emit_s[2 * (j + 1)];
+        let e1 = emit_s[2 * (j + 1) + 1];
+        let next_site = common_idx[j + 1];
+        let mut new_sum = 0.0f32;
+        for (st, &h) in cond_haps.iter().enumerate() {
+            let a = ref_bm.get(next_site, h as usize);
+            let e = if a { e1 } else { e0 };
+            let b = (beta[st] * fact2 + fact1) * e;
+            beta[st] = b;
+            new_sum += b;
+        }
+        beta_sum = new_sum;
+        let off = j * k;
+        let mut gsum = 0.0f32;
+        for st in 0..k {
+            let g = alpha[off + st] * beta[st];
+            gamma[off + st] = g;
+            gsum += g;
+        }
+        if gsum > 0.0 { let inv = 1.0 / gsum; for st in 0..k { gamma[off + st] *= inv; } }
+    }
+    drop(alpha);
+
+    // Impute ALL sites by interpolating gamma between flanking scaffold sites.
+    let mut dosage = vec![0.0f32; n_var];
+    let mut next_s = 0usize; // index into common_idx of the first scaffold site >= v
+    for v in 0..n_var {
+        // Advance next_s so common_idx[next_s] is the first scaffold site >= v.
+        while next_s < n_s && common_idx[next_s] < v { next_s += 1; }
+        // Flanking scaffold indices ja (<=v) and jb (>=v) in scaffold space.
+        let (ja, jb, wt_a) = if next_s == 0 {
+            (0usize, 0usize, 1.0f32) // before first scaffold site
+        } else if next_s >= n_s {
+            (n_s - 1, n_s - 1, 1.0f32) // after last
+        } else if common_idx[next_s] == v {
+            (next_s, next_s, 1.0f32) // exactly a scaffold site
+        } else {
+            let a = next_s - 1;
+            let b = next_s;
+            let ca = cm[common_idx[a]];
+            let cbv = cm[common_idx[b]];
+            let d = (cbv - ca).max(1e-9);
+            let w = ((cbv - cm[v]) / d) as f32; // weight on a (closer to a → larger)
+            (a, b, w.clamp(0.0, 1.0))
+        };
+        // Interpolated per-state posterior, fold into allele probs.
+        let oa = ja * k;
+        let ob = jb * k;
+        let omw = 1.0 - wt_a;
+        let mut prob_hid_0 = 0.0f32;
+        let mut prob_hid_1 = 0.0f32;
+        for (st, &h) in cond_haps.iter().enumerate() {
+            let g = wt_a * gamma[oa + st] + omw * gamma[ob + st];
+            if ref_bm.get(v, h as usize) { prob_hid_1 += g; } else { prob_hid_0 += g; }
+        }
+        let h0 = hl[2 * v];
+        let h1 = hl[2 * v + 1];
+        let po0 = (prob_hid_0 * ee + prob_hid_1 * ed) * h0;
+        let po1 = (prob_hid_0 * ed + prob_hid_1 * ee) * h1;
+        let s = po0 + po1;
+        dosage[v] = if s > f32::MIN_POSITIVE { po1 / s } else { 0.5 };
+    }
+
+    HmmOutput { dosage }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
