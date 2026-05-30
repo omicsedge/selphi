@@ -128,23 +128,27 @@ fn main() {
             start.elapsed().as_secs_f32(),
         );
 
-        // TODO output writer: write VCF with GT/DS/GP fields.
-        // For MVP we dump dosages as a TSV next to --out so end-to-end
-        // works; proper VCF.gz writer is the next iteration.
-        let tsv_path = PathBuf::from(output).with_extension("dose.tsv.gz");
+        // Write imputed VCF.gz with GT:DS:GP.
+        let vcf_path = PathBuf::from(format!("{}.vcf.gz", output));
+        if let Err(e) = selphi::lcwgs::output::write_lcwgs_vcf(&result, &vcf_path) {
+            eprintln!("Failed to write {}: {}", vcf_path.display(), e);
+            std::process::exit(1);
+        }
+        selphi_info!("  wrote imputed VCF: {}", vcf_path.display());
+
+        // Also emit a bgzf dosage TSV (chrom:pos:ref:alt per row) for fast
+        // identity-matched evaluation, gated by --parquet-like flag reuse:
+        // always write it next to the VCF for benchmarking convenience.
+        let tsv_path = PathBuf::from(format!("{}.dose.tsv.gz", output));
         let n_var = result.n_variants;
         let n_samp = result.sample_ids.len();
         if let Err(e) = (|| -> std::io::Result<()> {
             use std::io::Write;
             let file = std::fs::File::create(&tsv_path)?;
             let mut bgzf = noodles_bgzf::io::Writer::new(file);
-            // header
             write!(bgzf, "variant")?;
             for s in &result.sample_ids { write!(bgzf, "\t{}", s)?; }
             writeln!(bgzf)?;
-            // rows — "variant" column is chrom:pos:ref:alt so downstream eval
-            // can match by identity (dose rows are in shared-panel order, NOT
-            // target-VCF order, when some target variants miss the panel).
             for v in 0..n_var {
                 let (chrom, pos, r, a) = &result.variants[v];
                 write!(bgzf, "{}:{}:{}:{}", chrom, pos, r, a)?;
@@ -159,7 +163,7 @@ fn main() {
             eprintln!("Failed to write {}: {}", tsv_path.display(), e);
             std::process::exit(1);
         }
-        selphi_info!("  wrote dosages: {}", tsv_path.display());
+        selphi_info!("  wrote dosage TSV: {}", tsv_path.display());
         return;
     }
 
