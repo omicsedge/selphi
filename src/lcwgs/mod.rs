@@ -138,12 +138,17 @@ impl Default for LcwgsParams {
         fn envu(k: &str, d: usize) -> usize { std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d) }
         Self {
             // Finer PBWT than GLIMPSE2's defaults (depth 12 / 0.1 cM): our
-            // selection needs denser storage to reach the same conditioning
-            // quality. depth 30 / 0.02 cM → chr22 1x per-variant R² 0.77;
-            // depth 40 / 0.01 cM → 0.825 (slower). Tunable via env.
+            // match-length selection needs denser storage for comparable
+            // conditioning quality. chr22 1x per-variant R² / wall:
+            //   depth 30 / 0.02 cM → 0.77  / 226s
+            //   depth 40 / 0.01 cM → 0.825 / 421s   ← default (3x faster than GLIMPSE2)
+            //   depth 120/ 0.005   → 0.858 / 1313s  (= GLIMPSE2 speed, still below 0.916)
+            // GLIMPSE2 reaches 0.916 at depth 12 — its selection is more
+            // efficient per candidate; closing that is a selection-quality
+            // task, not a brute-force-depth one. Tunable via env.
             kpbwt: envu("LCWGS_KPBWT", 2000),
-            pbwt_modulo_cm: envf("LCWGS_PBWT_MODULO_CM", 0.02),
-            pbwt_depth: envu("LCWGS_PBWT_DEPTH", 30),
+            pbwt_modulo_cm: envf("LCWGS_PBWT_MODULO_CM", 0.01),
+            pbwt_depth: envu("LCWGS_PBWT_DEPTH", 40),
             n_iterations: envu("LCWGS_N_ITER", 15),
             n_main_iterations: envu("LCWGS_N_MAIN", 5),
             ne: envf("LCWGS_NE", 100_000.0),

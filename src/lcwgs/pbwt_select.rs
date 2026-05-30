@@ -42,13 +42,31 @@ use crate::haploid::stage2::pbwt_ibs::PbwtDivUpdater;
 /// Pick storage sites along the chromosome at the target cM spacing.
 /// Returns variant indices (into the 0..n_var panel) at roughly
 /// `modulo_cm` cM apart. Always includes the first and last variant.
+/// If `allowed` is non-empty, storage sites are picked ONLY from those
+/// variant indices (used to restrict the PBWT to well-typed common sites —
+/// flat-GL rare sites carry no discriminating signal and dilute the
+/// divergence-based match lengths, weakening selection at fixed depth).
 #[inline]
-fn pick_storage_sites(cm: &[f64], modulo_cm: f32) -> Vec<usize> {
+fn pick_storage_sites(cm: &[f64], modulo_cm: f32, allowed: &[usize]) -> Vec<usize> {
+    let modulo = modulo_cm as f64;
+    if !allowed.is_empty() {
+        let mut out = Vec::with_capacity(allowed.len());
+        out.push(allowed[0]);
+        let mut last_cm = cm[allowed[0]];
+        for &v in &allowed[1..] {
+            if cm[v] - last_cm >= modulo {
+                out.push(v);
+                last_cm = cm[v];
+            }
+        }
+        let last = *allowed.last().unwrap();
+        if *out.last().unwrap() != last { out.push(last); }
+        return out;
+    }
     let n_var = cm.len();
     if n_var == 0 { return Vec::new(); }
     let mut out = Vec::with_capacity(n_var / 100);
     out.push(0);
-    let modulo = modulo_cm as f64;
     let mut last_cm = cm[0];
     for v in 1..n_var {
         if cm[v] - last_cm >= modulo {
@@ -88,6 +106,7 @@ pub fn select_conditioning_haps(
     kpbwt: usize,
     modulo_cm: f32,
     depth: usize,
+    common_idx: &[usize],
 ) -> Vec<Vec<u32>> {
     let n_ref_haps = ref_bm.n_haps;
     let n_var = cm.len();
@@ -96,7 +115,7 @@ pub fn select_conditioning_haps(
     assert_eq!(ref_bm.n_sites, n_var);
     assert!(n_target_haps >= 1);
 
-    let storage_sites = pick_storage_sites(cm, modulo_cm);
+    let storage_sites = pick_storage_sites(cm, modulo_cm, common_idx);
     if storage_sites.is_empty() {
         return vec![Vec::new(); n_target_haps];
     }
@@ -300,7 +319,7 @@ mod tests {
         // 1 target hap; target_hard_calls in (v * n_target_haps + h) layout
         // For n_target_haps=1, layout = target[v]
         let cm = vec![0.0f64, 0.05, 0.10, 0.15, 0.20];
-        let out = select_conditioning_haps(&target, &bm, &cm, 1, 2, 0.05, 4);
+        let out = select_conditioning_haps(&target, &bm, &cm, 1, 2, 0.05, 4, &[]);
         assert_eq!(out.len(), 1);
         // Top hap should be hap 0 (perfect match)
         assert!(!out[0].is_empty(), "should select at least one hap");
