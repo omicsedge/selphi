@@ -276,7 +276,7 @@ mod tests {
         // 5 variants at 0.0, 0.05, 0.1, 0.15, 0.2 cM, modulo 0.1
         // Should pick variants near 0.0, 0.1, 0.2
         let cm = vec![0.0f64, 0.05, 0.10, 0.15, 0.20];
-        let s = pick_storage_sites(&cm, 0.1);
+        let s = pick_storage_sites(&cm, 0.1, &[]);
         assert!(s.contains(&0));
         assert!(s.contains(&4));
         assert!(s.len() >= 3, "expected ≥3 storage sites, got {:?}", s);
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn storage_sites_dense_modulo_picks_each() {
         let cm = vec![0.0, 0.01, 0.02, 0.03];
-        let s = pick_storage_sites(&cm, 0.001);
+        let s = pick_storage_sites(&cm, 0.001, &[]);
         // Every variant becomes a storage site (modulo smaller than spacing)
         assert_eq!(s.len(), 4);
     }
