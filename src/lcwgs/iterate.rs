@@ -41,6 +41,12 @@ use crate::common::HaplotypeBitmatrix;
 /// sample s at variant v.
 pub struct GibbsOutput {
     pub dosage: Vec<f32>,
+    /// Genotype posteriors `gp[(v*n_samples + s)*3 + g]` for g ∈ {0,1,2},
+    /// averaged over main iterations, each (v,s) triple sums to 1.
+    /// Derived per-iteration from the two haploid ALT probabilities
+    /// (independent-hap model): P(00)=(1-d0)(1-d1), P(01)=d0(1-d1)+(1-d0)d1,
+    /// P(11)=d0·d1. DS = gp01 + 2·gp11 is consistent with `dosage`.
+    pub gp: Vec<f32>,
 }
 
 /// Run the GLIMPSE2-style Gibbs alternation for all samples.
@@ -96,6 +102,8 @@ pub fn run_gibbs(
 
     let n_burnin = params.n_iterations.saturating_sub(params.n_main_iterations);
     let mut acc_dosage = vec![0.0f64; n_var * n_samples];
+    // Genotype-posterior accumulator (3 per variant×sample).
+    let mut acc_gp = vec![0.0f64; n_var * n_samples * 3];
     let mut n_acc = 0usize;
 
     let force_all_cond = std::env::var("LCWGS_FORCE_ALL_COND").is_ok();
@@ -172,27 +180,40 @@ pub fn run_gibbs(
             (h, dose, sampled)
         }).collect();
 
-        // 3. Write back sampled alleles + accumulate posterior dose (main iters).
+        // 3. Write back sampled alleles; collect per-hap dose for GP.
         let is_main = it >= n_burnin;
+        // Index per-hap dose by hap for pairing the two haps of each sample.
+        let mut hap_dose: Vec<Option<Vec<f32>>> = (0..n_target_haps).map(|_| None).collect();
         for (h, dose, sampled) in results {
-            let s = h / 2;
             for v in 0..n_var {
                 hap_alleles[v * n_target_haps + h] = sampled[v];
-                if is_main {
-                    acc_dosage[v * n_samples + s] += dose[v] as f64;
+            }
+            hap_dose[h] = Some(dose);
+        }
+        if is_main {
+            for s in 0..n_samples {
+                let d0 = hap_dose[2 * s].as_ref().unwrap();
+                let d1 = hap_dose[2 * s + 1].as_ref().unwrap();
+                for v in 0..n_var {
+                    let a0 = d0[v] as f64; // P(hap0 = ALT)
+                    let a1 = d1[v] as f64; // P(hap1 = ALT)
+                    let gp_off = (v * n_samples + s) * 3;
+                    acc_gp[gp_off]     += (1.0 - a0) * (1.0 - a1);     // P(00)
+                    acc_gp[gp_off + 1] += a0 * (1.0 - a1) + (1.0 - a0) * a1; // P(01)
+                    acc_gp[gp_off + 2] += a0 * a1;                     // P(11)
+                    acc_dosage[v * n_samples + s] += a0 + a1;          // E[ALT]
                 }
             }
+            n_acc += 1;
         }
-        if is_main { n_acc += 1; }
     }
 
-    // Average across main iterations. acc_dosage already summed both haps of
-    // each sample (each hap added its posterior ALT prob), so dividing by
-    // n_acc gives E[ALT count] ∈ [0, 2].
+    // Average across main iterations.
     let inv_n = if n_acc > 0 { 1.0 / n_acc as f64 } else { 1.0 };
     let dosage: Vec<f32> = acc_dosage.iter().map(|&d| (d * inv_n) as f32).collect();
+    let gp: Vec<f32> = acc_gp.iter().map(|&g| (g * inv_n) as f32).collect();
 
-    GibbsOutput { dosage }
+    GibbsOutput { dosage, gp }
 }
 
 /// Initialize per-hap sampled alleles from the marginal genotype MAP.

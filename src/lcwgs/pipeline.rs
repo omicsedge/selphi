@@ -35,6 +35,8 @@ use super::LcwgsParams;
 pub struct LcwgsOutput {
     /// `dosage[v_in_panel * n_samples + s]` ∈ [0, 2] = E[ALT count].
     pub dosage: Vec<f32>,
+    /// Genotype posteriors `gp[(v*n_samples+s)*3 + g]`, g ∈ {0,1,2}.
+    pub gp: Vec<f32>,
     /// Reference panel variant count (== `n_shared` between target & panel).
     pub n_variants: usize,
     /// Sample IDs from target VCF.
@@ -139,13 +141,15 @@ pub fn run_lcwgs(
                 raw[v * n_samples + s] = gl3_shared[b + 1] + 2.0 * gl3_shared[b + 2];
             }
         }
-        return Ok(LcwgsOutput { dosage: raw, n_variants: n_shared, sample_ids, variants });
+        let gp = vec![1.0f32 / 3.0; n_shared * n_samples * 3];
+        return Ok(LcwgsOutput { dosage: raw, gp, n_variants: n_shared, sample_ids, variants });
     }
 
-    let dosage = run_chunked_gibbs(&gl3_shared, srp, &wgs_idx, &cm, n_samples, n_shared, params);
+    let (dosage, gp) = run_chunked_gibbs(&gl3_shared, srp, &wgs_idx, &cm, n_samples, n_shared, params);
 
     Ok(LcwgsOutput {
         dosage,
+        gp,
         n_variants: n_shared,
         sample_ids,
         variants,
@@ -157,7 +161,8 @@ pub fn run_lcwgs(
 /// a buffer region on each side (computed but discarded — absorbs edge
 /// effects, like GLIMPSE2's ligation buffers).
 ///
-/// Returns the per-(variant, sample) diploid dosage in shared-panel order.
+/// Returns (dosage, gp) per (variant, sample) in shared-panel order.
+/// `gp` is 3 genotype posteriors per variant×sample.
 fn run_chunked_gibbs(
     gl3_shared: &[f32],
     srp: &SrpReader,
@@ -166,13 +171,14 @@ fn run_chunked_gibbs(
     n_samples: usize,
     n_shared: usize,
     params: &LcwgsParams,
-) -> Vec<f32> {
+) -> (Vec<f32>, Vec<f32>) {
     // GLIMPSE2-style: ~core_cm core + buffer_cm each side. Defaults chosen to
     // match GLIMPSE2_chunk's typical ~few-cM cores. cM span of chr22 ≈ 50.
     let core_cm = params.chunk_core_cm();
     let buffer_cm = params.chunk_buffer_cm();
     let mut dosage = vec![0.0f32; n_shared * n_samples];
-    if n_shared == 0 { return dosage; }
+    let mut gp = vec![0.0f32; n_shared * n_samples * 3];
+    if n_shared == 0 { return (dosage, gp); }
 
     // Build chunk core boundaries by cM
     let total_cm = cm[n_shared - 1] - cm[0];
@@ -218,17 +224,22 @@ fn run_chunked_gibbs(
                 gl3_sum, bm_ones, dose_mean);
         }
 
-        // Copy only the CORE region's dosage into the global output.
+        // Copy only the CORE region's dosage + GP into the global output.
         for v in core_start..core_end {
             let local_v = v - buf_start;
             for s in 0..n_samples {
                 dosage[v * n_samples + s] = out.dosage[local_v * n_samples + s];
+                let g_dst = (v * n_samples + s) * 3;
+                let g_src = (local_v * n_samples + s) * 3;
+                gp[g_dst]     = out.gp[g_src];
+                gp[g_dst + 1] = out.gp[g_src + 1];
+                gp[g_dst + 2] = out.gp[g_src + 2];
             }
         }
         let _ = chunk_n;
     }
 
-    dosage
+    (dosage, gp)
 }
 
 /// Tiny static-input smoke test: 1 sample, 4 ref haps, 4 variants, flat

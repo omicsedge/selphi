@@ -57,6 +57,7 @@ pub mod hmm;
 pub mod pbwt_select;
 pub mod iterate;
 pub mod pipeline;
+pub mod output;
 
 /// Top-level lcWGS input passed to the pipeline.
 pub struct LcwgsInput<'a> {
