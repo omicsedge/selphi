@@ -118,6 +118,7 @@ pub fn run_gibbs(
             select_conditioning_haps(
                 &hap_alleles, ref_bm, cm,
                 n_target_haps, params.kpbwt, params.pbwt_modulo_cm, params.pbwt_depth,
+                &common_idx,
             )
         };
 
