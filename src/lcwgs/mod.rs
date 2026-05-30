@@ -132,15 +132,22 @@ impl LcwgsParams {
 
 impl Default for LcwgsParams {
     fn default() -> Self {
+        // Env overrides for tuning sweeps (LCWGS_<PARAM>).
+        fn envf(k: &str, d: f32) -> f32 { std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d) }
+        fn envu(k: &str, d: usize) -> usize { std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d) }
         Self {
-            kpbwt: 2000,
-            pbwt_modulo_cm: 0.1,
-            pbwt_depth: 12,
-            n_iterations: 15,
-            n_main_iterations: 5,
-            ne: 100_000.0,
+            // Finer PBWT than GLIMPSE2's defaults (depth 12 / 0.1 cM): our
+            // selection needs denser storage to reach the same conditioning
+            // quality. depth 30 / 0.02 cM → chr22 1x per-variant R² 0.77;
+            // depth 40 / 0.01 cM → 0.825 (slower). Tunable via env.
+            kpbwt: envu("LCWGS_KPBWT", 2000),
+            pbwt_modulo_cm: envf("LCWGS_PBWT_MODULO_CM", 0.02),
+            pbwt_depth: envu("LCWGS_PBWT_DEPTH", 30),
+            n_iterations: envu("LCWGS_N_ITER", 15),
+            n_main_iterations: envu("LCWGS_N_MAIN", 5),
+            ne: envf("LCWGS_NE", 100_000.0),
             rare_maf: 0.001,
-            epsilon: 1e-4,
+            epsilon: envf("LCWGS_EPSILON", 1e-4),
         }
     }
 }
