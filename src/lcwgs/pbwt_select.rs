@@ -217,23 +217,18 @@ pub fn map_alleles_from_hl(hl: &[f32], n_samples: usize, n_var: usize) -> Vec<u8
     // Two haps of one sample share the same per-hap HL (the marginalization
     // is identical), so they get the same MAP call in iteration 0. Later
     // iterations supply per-hap dosages that differentiate them.
+    // hl layout from pl_reader: hl[v * n_samples * 2 + 2*s + a]
+    // (n_target_haps = n_samples * 2). The two haps of a sample share the
+    // same per-hap likelihood after marginalization, so MAP(hap0) == MAP(hap1)
+    // on iteration 0. The Gibbs loop differentiates per-hap on later rounds
+    // by feeding per-hap dosages back as hard calls instead of calling here.
     for v in 0..n_var {
         let off = v * n_target_haps;
+        let hl_off = v * n_samples * 2;
         for h in 0..n_target_haps {
-            let h0 = hl[off + h * 2];
-            let h1 = hl[off + h * 2 + 1];
-            // Wait — hl is packed per-hap, not per-genotype, so layout is
-            // hl[v*n_target_haps*2 + 2*s + a]. Two haps of same sample
-            // currently have identical HL. Carefully re-index:
-            // For a target hap index h, its (hl[0], hl[1]) live at
-            //   hl[v * n_target_haps * 2 + 2*h] and ... + 2*h+1
-            // BUT actually the existing pl_reader output layout is
-            //   hl[v*n_samples*2 + 2*s + a]  with n_target_haps = n_samples*2
-            // So per-hap layout per-(sample×hap) collapses to per-sample.
-            let _ = (h0, h1); // silence: handled below
             let s = h / 2;
-            let l0 = hl[v * n_samples * 2 + 2 * s + 0];
-            let l1 = hl[v * n_samples * 2 + 2 * s + 1];
+            let l0 = hl[hl_off + 2 * s];
+            let l1 = hl[hl_off + 2 * s + 1];
             out[off + h] = if l1 > l0 { 1 } else { 0 };
         }
     }
