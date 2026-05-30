@@ -23,6 +23,9 @@ pub mod diploid;
 // Imputation engine
 pub mod imputation;
 
+// Low-coverage WGS imputation engine (GLIMPSE2-style GL-aware Li-Stephens)
+pub mod lcwgs;
+
 // I/O and output
 pub mod io;
 
