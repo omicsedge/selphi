@@ -29,7 +29,7 @@ use crate::selphi_info;
 
 use super::iterate::run_gibbs;
 use super::pl_reader::{parse_pl_vcf, PlVcfResult};
-use super::{LcwgsInput, LcwgsParams};
+use super::LcwgsParams;
 
 /// Per (variant, sample) imputation output for downstream writers.
 pub struct LcwgsOutput {
@@ -64,7 +64,7 @@ pub fn run_lcwgs(
         let first_ref = &srp.variants[0].ref_allele;
         !srp.ids[0].contains(first_ref)
     };
-    let PlVcfResult { hl: hl_input, markers, sample_ids } =
+    let PlVcfResult { hl: _hl_input, gl3: gl3_input, markers, sample_ids } =
         parse_pl_vcf(target_vcf, hash_alleles)?;
     let n_samples = sample_ids.len();
     let n_target_variants = markers.len();
@@ -95,28 +95,20 @@ pub fn run_lcwgs(
         genmap::interpolate_cm_extrapolate(&map_bp, &map_cm, srp.variants[wi].pos)
     }).collect();
 
-    // --- 5. Re-layout hl[] from target-VCF variant order to shared-panel order ---
-    // hl_input is laid out per target_variant (in target VCF order). We need
-    // hl_shared in panel-shared variant order.
-    let n_haps = n_samples * 2;
-    let mut hl_shared = vec![0.5f32; n_shared * n_samples * 2];
+    // --- 5. Re-layout gl3[] from target-VCF variant order to shared-panel order ---
+    // gl3_input is laid out per target variant (VCF order); we need it in
+    // panel-shared variant order. 3 genotype probs per (sample, variant).
+    let mut gl3_shared = vec![1.0f32 / 3.0; n_shared * n_samples * 3];
     for (shared_i, &t_idx) in target_idx.iter().enumerate() {
-        let src_off = t_idx * n_samples * 2;
-        let dst_off = shared_i * n_samples * 2;
-        hl_shared[dst_off .. dst_off + n_samples * 2]
-            .copy_from_slice(&hl_input[src_off .. src_off + n_samples * 2]);
+        let src_off = t_idx * n_samples * 3;
+        let dst_off = shared_i * n_samples * 3;
+        gl3_shared[dst_off .. dst_off + n_samples * 3]
+            .copy_from_slice(&gl3_input[src_off .. src_off + n_samples * 3]);
     }
-    drop(hl_input);
+    drop(gl3_input);
 
     // --- 6. Run Gibbs alternation ---
-    let _input_descriptor = LcwgsInput {
-        hl: &hl_shared,
-        n_samples,
-        n_variants: n_shared,
-        sample_ids: sample_ids.clone(),
-    };
-    let _ = (n_haps, &_input_descriptor); // descriptor kept for future signature
-    let gibbs_out = run_gibbs(&hl_shared, &ref_bm, &cm, n_samples, params);
+    let gibbs_out = run_gibbs(&gl3_shared, &ref_bm, &cm, n_samples, params);
 
     Ok(LcwgsOutput {
         dosage: gibbs_out.dosage,
@@ -147,7 +139,7 @@ mod tests {
             0,1,1,0,
         ];
         let bm = HaplotypeBitmatrix::from_byte_slice_all(n_var, n_ref, &ref_alleles, n_ref);
-        let hl: Vec<f32> = vec![0.5f32; n_var * n_samples * 2];
+        let gl3: Vec<f32> = vec![1.0 / 3.0; n_var * n_samples * 3];
         let cm = vec![0.0, 0.01, 0.02, 0.03];
         let mut params = LcwgsParams::default();
         params.ne = 10.0;
@@ -155,7 +147,7 @@ mod tests {
         params.n_main_iterations = 1;
         params.kpbwt = 3;
         params.pbwt_modulo_cm = 0.001;
-        let out = run_gibbs(&hl, &bm, &cm, n_samples, &params);
+        let out = run_gibbs(&gl3, &bm, &cm, n_samples, &params);
         assert_eq!(out.dosage.len(), n_var * n_samples);
         for (v, &d) in out.dosage.iter().enumerate() {
             assert!(!d.is_nan(), "dose {} at v={} is NaN", d, v);
