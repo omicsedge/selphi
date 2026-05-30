@@ -86,6 +86,80 @@ fn main() {
         return;
     }
 
+    // --- Low-coverage WGS imputation mode (GLIMPSE2-style) ---
+    if args.lcwgs {
+        let input = args.input.as_deref()
+            .unwrap_or_else(|| { eprintln!("Error: --input is required for --lcwgs"); std::process::exit(1); });
+        if args.refpanel.is_empty() {
+            eprintln!("Error: --refpanel is required for --lcwgs");
+            std::process::exit(1);
+        }
+        let refpanel = args.refpanel.as_str();
+        let map = args.map_path.as_deref()
+            .unwrap_or_else(|| { eprintln!("Error: --map is required for --lcwgs"); std::process::exit(1); });
+        let output = args.out.as_deref().unwrap_or("lcwgs_imputed");
+
+        let log_path = PathBuf::from(output).with_extension("log");
+        selphi::log::init(&log_path, args.debug);
+        selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
+        selphi_info!("  mode:     lcwgs");
+        selphi_info!("  input:    {}", input);
+        selphi_info!("  refpanel: {}", refpanel);
+        selphi_info!("  map:      {}", map);
+        selphi_info!("  output:   {}", output);
+        selphi_info!("  threads:  {}", args.threads);
+        selphi_info!("  log:      {}\n", log_path.display());
+
+        let start = std::time::Instant::now();
+
+        // Load SRP reference panel
+        let srp = selphi::srp::SrpReader::open(refpanel, 0)
+            .unwrap_or_else(|e| { eprintln!("Failed to open SRP: {}", e); std::process::exit(1); });
+        selphi_info!("  SRP loaded: {} variants, {} haps", srp.metadata.n_variants, srp.metadata.n_haps);
+
+        // Run lcWGS pipeline
+        let params = selphi::lcwgs::LcwgsParams::default();
+        let result = selphi::lcwgs::pipeline::run_lcwgs(input, &srp, map, &params, args.threads)
+            .unwrap_or_else(|e| { eprintln!("lcWGS pipeline failed: {}", e); std::process::exit(1); });
+
+        selphi_info!(
+            "  lcwgs done: {} variants × {} samples in {:.1}s",
+            result.n_variants, result.sample_ids.len(),
+            start.elapsed().as_secs_f32(),
+        );
+
+        // TODO output writer: write VCF with GT/DS/GP fields.
+        // For MVP we dump dosages as a TSV next to --out so end-to-end
+        // works; proper VCF.gz writer is the next iteration.
+        let tsv_path = PathBuf::from(output).with_extension("dose.tsv.gz");
+        let n_var = result.n_variants;
+        let n_samp = result.sample_ids.len();
+        if let Err(e) = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let file = std::fs::File::create(&tsv_path)?;
+            let mut bgzf = noodles_bgzf::io::Writer::new(file);
+            // header
+            write!(bgzf, "variant")?;
+            for s in &result.sample_ids { write!(bgzf, "\t{}", s)?; }
+            writeln!(bgzf)?;
+            // rows
+            for v in 0..n_var {
+                write!(bgzf, "{}", v)?;
+                for s in 0..n_samp {
+                    write!(bgzf, "\t{:.4}", result.dosage[v * n_samp + s])?;
+                }
+                writeln!(bgzf)?;
+            }
+            bgzf.finish()?;
+            Ok(())
+        })() {
+            eprintln!("Failed to write {}: {}", tsv_path.display(), e);
+            std::process::exit(1);
+        }
+        selphi_info!("  wrote dosages: {}", tsv_path.display());
+        return;
+    }
+
     // --- Evaluate accuracy mode ---
     if let Some(ref imputed) = args.evaluate {
         let truth = args.truth.as_ref().expect("--truth required with --evaluate");
