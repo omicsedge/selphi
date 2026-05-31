@@ -156,9 +156,25 @@ pub fn run_forward_backward(
         let emit = cell_e.borrow();
         let p_rec = cell_p.borrow();
 
-        alpha.clear(); alpha.resize(n_var * k, 0.0);
-        alpha_sum.clear(); alpha_sum.resize(n_var, 0.0);
-        beta.clear(); beta.resize(k, 0.0);
+        // Size the scratch WITHOUT zero-filling: the forward pass writes every
+        // alpha[v*k+j] / alpha_sum[v] before it is ever read (base case fills
+        // row 0; the inductive step fills all rows; alpha[prev] is from the
+        // previous, already-written row), and the backward init writes every
+        // beta[j] before use. Zero-filling ~n_var*k f32 each of the ~2700 HMM
+        // calls per chunk-iteration was pure wasted bandwidth.
+        let need_a = n_var * k;
+        let (la, ls, lb) = (alpha.len(), alpha_sum.len(), beta.len());
+        if la < need_a { alpha.reserve(need_a - la); }
+        if ls < n_var { alpha_sum.reserve(n_var - ls); }
+        if lb < k { beta.reserve(k - lb); }
+        // SAFETY: reserve above guarantees capacity >= the new len; every element
+        // is written before it is read (see comment); f32 is Copy with no Drop,
+        // so growing the logical length over allocated capacity is sound.
+        unsafe {
+            alpha.set_len(need_a);
+            alpha_sum.set_len(n_var);
+            beta.set_len(k);
+        }
 
         // Forward base case (v = 0)
         let emit0 = emit[0];
