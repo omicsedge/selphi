@@ -134,6 +134,7 @@ pub fn run_forward_backward(
     ref_bm: &HaplotypeBitmatrix,
     cm: &[f64],
     params: &LcwgsParams,
+    recomb_mult: Option<&[f32]>,
 ) -> HmmOutput {
     let n_var = cm.len();
     let k = cond_haps.len();
@@ -145,7 +146,7 @@ pub fn run_forward_backward(
     // back to the scalar path below on non-AVX-512 hosts or SELPHI_FORCE_SCALAR=1.
     #[cfg(target_arch = "x86_64")]
     if use_avx512_lcwgs() {
-        return unsafe { run_fb_avx512(hl, cond_haps, ref_bm, cm, params) };
+        return unsafe { run_fb_avx512(hl, cond_haps, ref_bm, cm, params, recomb_mult) };
     }
 
     let inv_k = 1.0f32 / (k as f32);
@@ -188,9 +189,15 @@ pub fn run_forward_backward(
         buf.resize(n_var, 0.0);
         // GLIMPSE2: scale = 0.04 * Ne / K
         let scale = 0.04f64 * (params.ne as f64) / (k as f64);
+        // MAF-adaptive recombination: a per-site multiplier on the transition
+        // RATE (folded inside the exp, not applied to the probability — exact).
+        // <1 at a site = stickier copy into it; used to keep a rare-allele
+        // carrier copied across rare sites (PHASE-0: carriers present but not
+        // copied) without touching common-common boundaries. None = identity.
         for v in 1..n_var {
             let d = (cm[v] - cm[v - 1]).max(0.0);
-            buf[v] = (1.0 - (-d * scale).exp()) as f32;
+            let m = recomb_mult.map_or(1.0, |rm| rm[v] as f64);
+            buf[v] = (1.0 - (-d * scale * m).exp()) as f32;
         }
         // buf[0] unused
     });
@@ -351,6 +358,7 @@ unsafe fn run_fb_avx512(
     ref_bm: &HaplotypeBitmatrix,
     cm: &[f64],
     params: &LcwgsParams,
+    recomb_mult: Option<&[f32]>,
 ) -> HmmOutput { unsafe {
     use core::arch::x86_64::*;
     let n_var = cm.len();
@@ -387,7 +395,8 @@ unsafe fn run_fb_avx512(
         let scale = 0.04f64 * (params.ne as f64) / (k as f64);
         for v in 1..n_var {
             let d = (cm[v] - cm[v - 1]).max(0.0);
-            p_rec[v] = (1.0 - (-d * scale).exp()) as f32;
+            let m = recomb_mult.map_or(1.0, |rm| rm[v] as f64);
+            p_rec[v] = (1.0 - (-d * scale * m).exp()) as f32;
         }
         // Bit-packed conditioning alleles (1 bit/state). Branchless + word-at-a-
         // time: accumulate 64 consecutive states into a register, store once per
@@ -625,7 +634,7 @@ pub fn run_forward_backward_scaffold(
     let n_s = common_idx.len();
     let k = cond_haps.len();
     if n_s == 0 || k == 0 {
-        return run_forward_backward(hl, cond_haps, ref_bm, cm, params);
+        return run_forward_backward(hl, cond_haps, ref_bm, cm, params, None);
     }
 
     let inv_k = 1.0f32 / (k as f32);
@@ -812,7 +821,7 @@ mod tests {
         let cm = vec![0.0f64];
         let cond = vec![0u32, 1];
         let params = LcwgsParams::default();
-        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params);
+        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None);
         assert_eq!(out.dosage.len(), 1);
         assert!((out.dosage[0] - 0.5).abs() < 1e-3,
             "flat HL on 50/50 panel should give dose ≈ 0.5, got {}", out.dosage[0]);
@@ -828,7 +837,7 @@ mod tests {
         let cm = vec![0.0];
         let cond = vec![0u32, 1];
         let params = LcwgsParams::default();
-        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params);
+        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None);
         assert!(out.dosage[0] < 0.05,
             "strong REF HL should give dose ≈ 0, got {}", out.dosage[0]);
     }
@@ -843,7 +852,7 @@ mod tests {
         let cm = vec![0.0];
         let cond = vec![0u32, 1];
         let params = LcwgsParams::default();
-        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params);
+        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None);
         assert!(out.dosage[0] > 0.95,
             "strong ALT HL should give dose ≈ 1, got {}", out.dosage[0]);
     }
@@ -861,7 +870,7 @@ mod tests {
         let cm = vec![0.0f64, 0.5, 1.0];
         let cond = vec![0u32, 1];
         let params = LcwgsParams::default();
-        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params);
+        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None);
         for v in 0..3 {
             assert!((out.dosage[v] - 0.5).abs() < 1e-2,
                 "site {} dose={} should be ≈ 0.5", v, out.dosage[v]);
@@ -886,7 +895,7 @@ mod tests {
         // (real lcWGS workloads have K≈2000 so default Ne=100000 is fine).
         let mut params = LcwgsParams::default();
         params.ne = 10.0;
-        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params);
+        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None);
         // Site 1 should be close to 1 (strong direct evidence)
         assert!(out.dosage[1] > 0.85, "site 1 dose={}", out.dosage[1]);
         // Sites 0 and 2 should be > 0.5 (spread via HMM transition)
@@ -916,7 +925,7 @@ mod tests {
         let cm = vec![0.0f64, 0.05, 0.10, 0.15, 0.20];
         let cond: Vec<u32> = (0..k as u32).collect();
         let params = LcwgsParams::default();
-        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params);
+        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None);
         // Middle: strong ALT evidence
         assert!(out.dosage[2] > 0.85, "middle dose={}", out.dosage[2]);
         // Adjacent sites should be tugged toward ALT but less than middle

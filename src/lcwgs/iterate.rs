@@ -212,6 +212,45 @@ pub fn run_gibbs(
     } else { Vec::new() };
     let mut rare_aug_cache: Vec<Vec<u32>> = Vec::new();
 
+    // MAF-adaptive recombination (opt-in LCWGS_RARE_RECOMB=<f<1.0>, default OFF).
+    // Hypothesis: a single global recombination rate can't serve both bins — rare
+    // sites want a sticky copy (one long carrier IBD segment) while common sites
+    // want frequent switching (short mosaic). A low GLOBAL Ne lifts the rare bin
+    // but regresses commons (measured: r12 Ne=2000 +0.0014 on 0.5-1% but −0.0011
+    // OVERALL). So instead we damp the transition RATE only on boundaries ADJACENT
+    // to a rare site (both sides), a local low-recombination well so a rare-allele
+    // conditioning hap stays copied across it (PHASE-0: carriers present-but-not-
+    // copied). recomb_mult[v] multiplies the rate at boundary (v-1→v); 1.0=identity.
+    //
+    // MEASURED VERDICT (default OFF — does NOT close the rare gap): the rare-bin
+    // lift is real but tiny and INCONSISTENT across regions (0.5-1% bin: mid +0.0021,
+    // r12 +0.0013, full-chr22 only +0.0003) and on the canonical full-chr22 326K
+    // benchmark it is a NET REGRESSION (OVERALL 0.9051→0.9047, commons −0.001 to
+    // −0.0012) → rejected as default per r2-never-regress. CONFIRMS PHASE-0: the
+    // rare gap is NOT primarily a global copy-stickiness problem; the real fix is
+    // GLIMPSE2's dedicated rare-carrier conditioning (a separate small HMM over the
+    // rare-allele-carrying haplotypes), not a transition-rate knob. Kept gated for
+    // the record. scale=0.25 was the per-region optimum.
+    let rare_recomb = std::env::var("LCWGS_RARE_RECOMB").ok()
+        .and_then(|s| s.parse::<f32>().ok()).filter(|&s| s > 0.0 && s < 1.0);
+    let recomb_mult: Option<Vec<f32>> = rare_recomb.map(|s| {
+        let n_ref = ref_bm.n_haps;
+        let max_carr = std::env::var("LCWGS_RARE_CARRIER_MAX").ok()
+            .and_then(|x| x.parse().ok()).unwrap_or(64usize);
+        let mut mult = vec![1.0f32; n_var];
+        for v in 0..n_var {
+            let ac = ref_bm.popcount_row(v, n_ref) as usize;
+            if (1..=max_carr).contains(&ac) {
+                // Damp the boundary entering this rare site and the one leaving it
+                // (the backward pass needs the leaving boundary to be sticky too).
+                mult[v] *= s;
+                if v + 1 < n_var { mult[v + 1] *= s; }
+            }
+        }
+        mult
+    });
+    let recomb_ref: Option<&[f32]> = recomb_mult.as_deref();
+
     // Gated phase-timing breakdown (LCWGS_TIMING=1). Accumulates wall time per
     // phase across all iterations; printed once at the end. Zero overhead when
     // unset (the Instant calls are guarded by `timing`).
@@ -395,7 +434,7 @@ pub fn run_gibbs(
             } else if use_scaffold {
                 run_forward_backward_scaffold(&hap_hl, &common_idx, cond, ref_bm, cm, params).dosage
             } else {
-                run_forward_backward(&hap_hl, cond, ref_bm, cm, params).dosage
+                run_forward_backward(&hap_hl, cond, ref_bm, cm, params, recomb_ref).dosage
             };
 
             // Sample a fresh allele per site from the posterior ALT prob.
