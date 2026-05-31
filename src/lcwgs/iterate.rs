@@ -184,6 +184,55 @@ pub fn run_gibbs(
     } else { Vec::new() };
     let mut rare_aug_cache: Vec<Vec<u32>> = Vec::new();
 
+    // GL-DRIVEN rare-carrier seeding (GLIMPSE2 initRareTar + performSelection_RARE_INIT_GL).
+    // The decisive difference from the sampled-state / flanking variants: seed a
+    // rare site's panel carriers into a sample's conditioning ONLY when that
+    // sample's OWN reads support carrying the rare allele — non-flat (has reads)
+    // AND the HWE-prior-weighted carrier posterior beats the major-hom posterior.
+    // This is read-driven and per-sample-targeted, so it adds carriers to true
+    // carriers (no false-positive dilution onto non-carriers, which sank the
+    // flanking variant) and breaks the chicken-and-egg for read-supported carriers
+    // (they get the carrier into the conditioning from iteration 0, before the HMM
+    // ever samples them ALT). Computed ONCE (read-evidence is iteration-invariant).
+    // GL-seed is OPT-IN (LCWGS_RC_GLSEED=1): MEASURED WORSE than the default
+    // sampled-state form (mid 0.9411 vs 0.9443). The iterative sampled state
+    // refines over burn-in — it avoids 1-read false carriers and discovers
+    // zero-read carriers via LD — so it beats GLIMPSE2's read-driven init seed.
+    let rc_glseed = std::env::var("LCWGS_RC_GLSEED").is_ok();
+    let rc_sampled = !rc_glseed; // DEFAULT = sampled-state (the winner)
+    let gl_seed: Vec<Vec<u32>> = if rare_carrier && !rc_flank && !rc_sampled {
+        let n_ref = ref_bm.n_haps as f64;
+        let mut seed: Vec<Vec<u32>> = vec![Vec::new(); n_target_haps];
+        for (v, carriers) in &rare_sites {
+            // minor = ALT (rare_sites are low-ALT-count); major-hom = g0.
+            let af = (carriers.len() as f64 / n_ref).min(0.5);
+            let w0 = (1.0 - af) * (1.0 - af);
+            let w1 = 2.0 * af * (1.0 - af);
+            let w2 = af * af;
+            for s in 0..n_samples {
+                let b = v * n_samples * 3 + 3 * s;
+                let g0 = gl3[b] as f64;
+                let g1 = gl3[b + 1] as f64;
+                let g2 = gl3[b + 2] as f64;
+                // Flat (no reads) → skip (uniform GL carries no carrier signal).
+                let mx = g0.max(g1).max(g2);
+                let mn = g0.min(g1).min(g2);
+                if mx - mn < 1e-3 { continue; }
+                // Read-support precondition: a non-major genotype is at least as
+                // likely as major-hom from the reads alone.
+                if !(g1 >= g0 || g2 >= g0) { continue; }
+                // HWE-prior-weighted posterior: carrier (het+homALT) beats homREF?
+                if g1 * w1 + g2 * w2 > g0 * w0 {
+                    let h0 = 2 * s;
+                    seed[h0].extend_from_slice(carriers);
+                    seed[h0 + 1].extend_from_slice(carriers);
+                }
+            }
+        }
+        for sset in seed.iter_mut() { sset.sort_unstable(); sset.dedup(); }
+        seed
+    } else { Vec::new() };
+
     for it in 0..params.n_iterations {
         // 1. Sparse PBWT selection from the current sampled hap alleles.
         let recompute = it == 0 || it == n_burnin || it % refresh == 0;
@@ -213,8 +262,8 @@ pub fn run_gibbs(
                     );
                 }
                 for h in 0..n_target_haps { aug[h].extend_from_slice(&rare_aug_cache[h]); }
-            } else {
-                // Default reinforcement variant: add carriers at sites where the
+            } else if rc_sampled {
+                // Sampled-state reinforcement (opt-in): add carriers where the
                 // target hap is currently sampled as a carrier.
                 for (v, carriers) in &rare_sites {
                     let base = v * n_target_haps;
@@ -222,6 +271,9 @@ pub fn run_gibbs(
                         if hap_alleles[base + h] == 1 { aug[h].extend_from_slice(carriers); }
                     }
                 }
+            } else {
+                // DEFAULT: GL-driven read-supported carrier seed (iteration-invariant).
+                for h in 0..n_target_haps { aug[h].extend_from_slice(&gl_seed[h]); }
             }
             for c in aug.iter_mut() { c.sort_unstable(); c.dedup(); }
             Some(aug)
