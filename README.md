@@ -128,6 +128,21 @@ selphi \
 
 Selphi auto-detects whether the SRP file contains one or multiple chromosomes. Each chromosome is processed sequentially, with the next chromosome's data pre-loaded in the background to minimize idle time between transitions.
 
+### Low-coverage WGS imputation (`--lcwgs`)
+
+For low-coverage sequencing (0.5–2× depth), where most sites have a genotype likelihood rather than a confident call, use the genotype-likelihood-aware engine. Input is a VCF/BCF with the `PL` field (e.g. from `bcftools mpileup | bcftools call`) at the panel's sites:
+
+```bash
+selphi --lcwgs \
+  --refpanel reference.srp \
+  --input target_gl.vcf.gz \
+  --map genetic_map.map \
+  --out imputed \
+  --threads 16
+```
+
+Output is VCF.gz with `GT:DS:GP`. The engine alternates sparse-PBWT haplotype selection with a GL-weighted Li-Stephens forward-backward (conditional-HL diploid Gibbs), AVX-512-vectorized, and processes the chromosome in cM chunks so the full-chromosome reference panel is never held in memory. On a simulated chr22 1× benchmark it matches GLIMPSE2 on common/intermediate-frequency variants at ~1.6× lower wall time, without ever holding the full-chromosome reference panel in memory (overall R² 0.905 vs 0.916; the residual is the 0.5–1% bin). Expert tuning knobs are exposed via `LCWGS_*` environment variables (PBWT depth/spacing, Gibbs iterations, Ne, epsilon); the defaults are calibrated for 1× data.
+
 ### Memory-bounded mode (biobank-scale)
 
 For panels where memory is the binding constraint, pass `--sample-batch-size N` to process target samples in batches of N. **Supported for all output formats** (VCF, BCF, Parquet, PGEN, SelfDecode); output is bit-identical to the non-batched run.
