@@ -161,6 +161,19 @@ pub fn run_gibbs(
     // the rare one — the dense selection already includes genuinely-IBD carriers.
     // The rare-bin gap to GLIMPSE2 is therefore NOT a missing-carrier problem.
     let rare_carrier = std::env::var("LCWGS_NO_RARE_CARRIER").is_err() && !force_all_cond;
+    // Conditioning-set size ceiling AFTER rare-carrier augmentation. The base
+    // PBWT selection is small (dense d16 gives ~1000 unique neighbors), and the
+    // sampled-state RC then unions in every carrier of every rare site the hap
+    // is currently sampled ALT at — which balloons K (≈1000→3400 on dense
+    // regions), and since both the forward matrix (n_var×K) and the O(n_var×K)
+    // HMM scale linearly with K, that inflation is the dominant memory+time cost.
+    // When set, cap keeps the IBD-RANKED base set (the genuine long matches)
+    // first, then fills with carriers up to k_max — so the rare-carrier signal
+    // is retained but the global conditioning can't blow past the ceiling.
+    // 0/unset = no cap (legacy behaviour, bit-identical: the HMM is set-based so
+    // order-preserving dedup and sort-dedup yield the same dosage).
+    let k_max = std::env::var("LCWGS_KMAX").ok()
+        .and_then(|s| s.parse::<usize>().ok()).filter(|&k| k > 0);
     let rc_flank = std::env::var("LCWGS_RC_FLANK").is_ok();
     let rc_window = std::env::var("LCWGS_RARE_CARRIER_WINDOW").ok()
         .and_then(|s| s.parse().ok()).unwrap_or(50usize);
@@ -190,6 +203,14 @@ pub fn run_gibbs(
         }).collect()
     } else { Vec::new() };
     let mut rare_aug_cache: Vec<Vec<u32>> = Vec::new();
+
+    // Gated phase-timing breakdown (LCWGS_TIMING=1). Accumulates wall time per
+    // phase across all iterations; printed once at the end. Zero overhead when
+    // unset (the Instant calls are guarded by `timing`).
+    let timing = std::env::var("LCWGS_TIMING").is_ok();
+    let (mut t_sel, mut t_aug, mut t_clone, mut t_hmm, mut t_wb) =
+        (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let mut max_k = 0usize;
 
     // GL-DRIVEN rare-carrier seeding (GLIMPSE2 initRareTar + performSelection_RARE_INIT_GL).
     // The decisive difference from the sampled-state / flanking variants: seed a
@@ -256,6 +277,7 @@ pub fn run_gibbs(
     for it in 0..params.n_iterations {
         // 1. Sparse PBWT selection from the current sampled hap alleles.
         let recompute = it == 0 || it == n_burnin || it % refresh == 0;
+        let t0 = if timing { Some(std::time::Instant::now()) } else { None };
         let base_cond: &Vec<Vec<u32>> = if force_all_cond {
             if cond_cache.is_empty() { cond_cache = vec![all_ref.clone(); n_target_haps]; }
             &cond_cache
@@ -269,8 +291,10 @@ pub fn run_gibbs(
             }
             &cond_cache
         };
+        if let Some(t) = t0 { t_sel += t.elapsed().as_secs_f64(); }
 
         // 1b. Rare-carrier augmentation.
+        let t0 = if timing { Some(std::time::Instant::now()) } else { None };
         let cond_storage: Option<Vec<Vec<u32>>> = if rare_carrier {
             let mut aug = base_cond.clone();
             if rc_flank {
@@ -299,10 +323,27 @@ pub fn run_gibbs(
                 // DEFAULT: GL-driven read-supported carrier seed (iteration-invariant).
                 for h in 0..n_target_haps { aug[h].extend_from_slice(&gl_seed[h]); }
             }
-            for c in aug.iter_mut() { c.sort_unstable(); c.dedup(); }
+            if let Some(kmax) = k_max {
+                // Priority-preserving dedup + cap: aug[h] = base (IBD-ranked) ++
+                // carriers (append order). retain-first keeps base ahead of
+                // carriers, then truncate to kmax drops only the lowest-priority
+                // overflow carriers — base matches are always retained.
+                let mut seen = std::collections::HashSet::new();
+                for c in aug.iter_mut() {
+                    seen.clear();
+                    c.retain(|&x| seen.insert(x));
+                    c.truncate(kmax);
+                }
+            } else {
+                for c in aug.iter_mut() { c.sort_unstable(); c.dedup(); }
+            }
             Some(aug)
         } else { None };
         let cond_per_hap: &Vec<Vec<u32>> = cond_storage.as_ref().unwrap_or(base_cond);
+        if let Some(t) = t0 { t_aug += t.elapsed().as_secs_f64(); }
+        if timing {
+            max_k = max_k.max(cond_per_hap.iter().map(|c| c.len()).max().unwrap_or(0));
+        }
 
         // 2. Per-target-hap HMM. Each hap conditions its emission on the
         //    PARTNER hap's current allele (diploid → haploid decoupling).
@@ -310,8 +351,11 @@ pub fn run_gibbs(
         //    partner state (GLIMPSE2 phases hap0 then hap1 sequentially per
         //    sample; we approximate with a per-iteration snapshot, which is
         //    a valid Gibbs scan and avoids cross-hap data races).
+        let t0 = if timing { Some(std::time::Instant::now()) } else { None };
         let prev_alleles = hap_alleles.clone();
+        if let Some(t) = t0 { t_clone += t.elapsed().as_secs_f64(); }
 
+        let t0 = if timing { Some(std::time::Instant::now()) } else { None };
         let results: Vec<(usize, Vec<f32>, Vec<u8>)> = (0..n_target_haps).into_par_iter().map(|h| {
             let s = h / 2;
             let partner = if h & 1 == 0 { h + 1 } else { h - 1 };
@@ -362,8 +406,10 @@ pub fn run_gibbs(
             }
             (h, dose, sampled)
         }).collect();
+        if let Some(t) = t0 { t_hmm += t.elapsed().as_secs_f64(); }
 
         // 3. Write back sampled alleles; collect per-hap dose for GP.
+        let t0 = if timing { Some(std::time::Instant::now()) } else { None };
         let is_main = it >= n_burnin;
         // Index per-hap dose by hap for pairing the two haps of each sample.
         let mut hap_dose: Vec<Option<Vec<f32>>> = (0..n_target_haps).map(|_| None).collect();
@@ -391,6 +437,17 @@ pub fn run_gibbs(
             }
             n_acc += 1;
         }
+        if let Some(t) = t0 { t_wb += t.elapsed().as_secs_f64(); }
+    }
+
+    if timing {
+        let (pack_ns, fb_ns) = super::hmm::take_hmm_profile();
+        crate::selphi_info!(
+            "  [lcwgs timing] sel={:.2}s aug={:.2}s clone={:.2}s hmm={:.2}s wb={:.2}s | max_K={} n_var={} n_haps={}",
+            t_sel, t_aug, t_clone, t_hmm, t_wb, max_k, n_var, n_target_haps);
+        crate::selphi_info!(
+            "  [lcwgs timing]   hmm split (cpu-time summed over threads): condbits-pack={:.1}s forward-backward={:.1}s",
+            pack_ns as f64 / 1e9, fb_ns as f64 / 1e9);
     }
 
     // Average across main iterations.

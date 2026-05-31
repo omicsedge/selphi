@@ -55,9 +55,22 @@
 //!   added in a follow-up.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::LcwgsParams;
 use crate::common::HaplotypeBitmatrix;
+
+// Gated micro-profiling (LCWGS_TIMING): nanoseconds spent building the bit-packed
+// conditioning (`condbits`, the random-gather pack) vs the rest of the HMM
+// (forward + backward arithmetic). Summed across all parallel HMM calls; read +
+// reset by `take_hmm_profile`. Relaxed atomics — the add is negligible vs the work.
+static PROF_PACK_NS: AtomicU64 = AtomicU64::new(0);
+static PROF_FB_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Read and reset the (condbits-pack ns, forward-backward ns) profile counters.
+pub fn take_hmm_profile() -> (u64, u64) {
+    (PROF_PACK_NS.swap(0, Ordering::Relaxed), PROF_FB_NS.swap(0, Ordering::Relaxed))
+}
 
 // Thread-local scratch buffers (reused across haps to amortize alloc).
 thread_local! {
@@ -87,6 +100,14 @@ fn use_avx512_lcwgs() -> bool {
         }
         is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512dq")
     })
+}
+
+/// Cached `LCWGS_TIMING` flag (gates the micro-profiling Instant calls so the
+/// production path has zero timing overhead).
+fn hmm_timing() -> bool {
+    use std::sync::OnceLock;
+    static T: OnceLock<bool> = OnceLock::new();
+    *T.get_or_init(|| std::env::var("LCWGS_TIMING").is_ok())
 }
 
 /// Output of one HMM run on a single target haplotype.
@@ -368,16 +389,44 @@ unsafe fn run_fb_avx512(
             let d = (cm[v] - cm[v - 1]).max(0.0);
             p_rec[v] = (1.0 - (-d * scale).exp()) as f32;
         }
-        // Bit-packed conditioning alleles (zeroed then OR'd; 1 bit/state).
+        // Bit-packed conditioning alleles (1 bit/state). Branchless + word-at-a-
+        // time: accumulate 64 consecutive states into a register, store once per
+        // word. The previous form did a branch on each (random) allele bit — a
+        // ~50% mispredict rate — plus a read-modify-write into condbits per set
+        // bit. Casting the bool allele to u64 and shifting it in is branchless,
+        // and building the whole word in a register removes the per-bit RMW.
+        // Every word is fully written (no pre-zero needed); the trailing partial
+        // word has its unused high bits left 0, and they are never read (mask16
+        // only touches states < k). Output is identical to the old pack.
+        let timing = hmm_timing();
+        let t_pack = if timing { Some(std::time::Instant::now()) } else { None };
         condbits.clear(); condbits.resize(n_var * w64, 0u64);
+        let cbm = condbits.as_mut_ptr();
         for v in 0..n_var {
+            // Hoist the site row once (one bounds check), then read each
+            // conditioning hap's allele bit unchecked — h < n_haps by
+            // construction, so h>>6 is always a valid word in this row.
+            let rp = ref_bm.row(v).as_ptr();
             let base = v * w64;
-            for (j, &h) in cond_haps.iter().enumerate() {
-                if ref_bm.get(v, h as usize) {
-                    condbits[base + j / 64] |= 1u64 << (j % 64);
+            let mut widx = 0usize;
+            let mut word = 0u64;
+            let mut bitpos = 0u32;
+            for &h in cond_haps.iter() {
+                let h = h as usize;
+                let bit = (*rp.add(h >> 6) >> (h & 63)) & 1;
+                word |= bit << bitpos;
+                bitpos += 1;
+                if bitpos == 64 {
+                    *cbm.add(base + widx) = word;
+                    widx += 1; word = 0; bitpos = 0;
                 }
             }
+            if bitpos > 0 { *cbm.add(base + widx) = word; }
         }
+        if let Some(t) = t_pack {
+            PROF_PACK_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        let t_fb = if timing { Some(std::time::Instant::now()) } else { None };
 
         // size scratch (no zero-fill; written before read)
         let need_a = n_var * k;
@@ -539,6 +588,9 @@ unsafe fn run_fb_avx512(
             let po1 = (prob_hid_0 * ed + prob_hid_1 * ee) * h1v;
             let s = po0 + po1;
             dosage[v] = if s > f32::MIN_POSITIVE { po1 / s } else { 0.5 };
+        }
+        if let Some(t) = t_fb {
+            PROF_FB_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
     }))))));
 
