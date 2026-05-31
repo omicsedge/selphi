@@ -214,6 +214,41 @@ fn run_chunked_gibbs(
 
         let out = run_gibbs(&chunk_gl3, &chunk_bm, &chunk_cm, n_samples, params);
 
+        // PHASE-0 diagnostic dump (LCWGS_COND_DUMP=<dir>): per chunk, write the
+        // final base conditioning set per target hap + the panel carrier list of
+        // each CORE rare variant. A Python harness cross-checks, for the
+        // confident-wrong zero-read carriers, whether the true carrier is ABSENT
+        // from selection (→ build persistent per-locus PBWT) or PRESENT (→ HMM
+        // bottleneck, rewrite won't help). No effect on normal runs.
+        if let Ok(dir) = std::env::var("LCWGS_COND_DUMP") {
+            use std::io::Write;
+            let _ = std::fs::create_dir_all(&dir);
+            let n_ref = chunk_bm.n_haps;
+            // conditioning sets per target hap
+            if let Ok(mut f) = std::fs::File::create(format!("{dir}/c{c}_cond.tsv")) {
+                for (h, cond) in out.cond_final.iter().enumerate() {
+                    let csv: String = cond.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+                    let _ = writeln!(f, "{h}\t{csv}");
+                }
+            }
+            // carriers of each CORE rare variant (panel ALT count 1..=64)
+            if let Ok(mut f) = std::fs::File::create(format!("{dir}/c{c}_rare.tsv")) {
+                for v in core_start..core_end {
+                    let lv = v - buf_start;
+                    let ac = chunk_bm.popcount_row(lv, n_ref) as usize;
+                    if (1..=64).contains(&ac) {
+                        let wi = chunk_wgs[lv];
+                        let var = &srp.variants[wi];
+                        let carr: String = (0..n_ref as u32)
+                            .filter(|&h| chunk_bm.get(lv, h as usize))
+                            .map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+                        let _ = writeln!(f, "{}:{}:{}:{}\t{}",
+                            var.chr, var.pos, var.ref_allele, var.alt_allele, carr);
+                    }
+                }
+            }
+        }
+
         if std::env::var("LCWGS_CHUNK_DIAG").is_ok() {
             let gl3_sum: f64 = chunk_gl3.iter().map(|&x| x as f64).sum();
             let dose_mean: f64 = out.dosage.iter().map(|&d| d as f64).sum::<f64>() / out.dosage.len().max(1) as f64;

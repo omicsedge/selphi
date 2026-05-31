@@ -47,6 +47,13 @@ pub struct GibbsOutput {
     /// (independent-hap model): P(00)=(1-d0)(1-d1), P(01)=d0(1-d1)+(1-d0)d1,
     /// P(11)=d0·d1. DS = gp01 + 2·gp11 is consistent with `dosage`.
     pub gp: Vec<f32>,
+    /// PHASE-0 DIAGNOSTIC ONLY (populated iff LCWGS_COND_DUMP is set): the
+    /// final-refresh BASE conditioning set per target hap (selection output,
+    /// before rare-carrier augmentation). Used to test whether the true rare
+    /// carrier is ABSENT from selection (→ build persistent per-locus PBWT) or
+    /// PRESENT-but-not-copied (→ HMM-emission bottleneck, rewrite won't help).
+    /// Empty in normal runs.
+    pub cond_final: Vec<Vec<u32>>,
 }
 
 /// Run the GLIMPSE2-style Gibbs alternation for all samples.
@@ -391,7 +398,11 @@ pub fn run_gibbs(
     let dosage: Vec<f32> = acc_dosage.iter().map(|&d| (d * inv_n) as f32).collect();
     let gp: Vec<f32> = acc_gp.iter().map(|&g| (g * inv_n) as f32).collect();
 
-    GibbsOutput { dosage, gp }
+    // PHASE-0: expose the final base conditioning set for the carrier-presence
+    // diagnostic (cond_cache holds the last refresh's selection output).
+    let cond_final = if std::env::var("LCWGS_COND_DUMP").is_ok() { cond_cache } else { Vec::new() };
+
+    GibbsOutput { dosage, gp, cond_final }
 }
 
 /// Initialize per-hap sampled alleles from the marginal genotype MAP.
