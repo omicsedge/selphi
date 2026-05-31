@@ -200,6 +200,19 @@ pub fn run_gibbs(
     // zero-read carriers via LD — so it beats GLIMPSE2's read-driven init seed.
     let rc_glseed = std::env::var("LCWGS_RC_GLSEED").is_ok();
     let rc_sampled = !rc_glseed; // DEFAULT = sampled-state (the winner)
+    // Soft-dose trigger threshold for the sampled-state RC: add a rare site's
+    // carriers to a hap when its PREVIOUS-iteration posterior ALT dose exceeds
+    // this (not only when hard-sampled ALT). A diffuse carrier (dose ~0.13) is
+    // hard-sampled ALT only ~13% of iterations, so the hard trigger reinforces
+    // it too weakly to converge; a low soft threshold strengthens that feedback.
+    // 1.0 disables (pure hard-sampled trigger, the prior behaviour).
+    let rc_dose_thr = std::env::var("LCWGS_RC_DOSE_THR").ok()
+        .and_then(|s| s.parse::<f32>().ok()).unwrap_or(1.0);
+    let mut hap_soft: Vec<f32> = if rc_dose_thr < 1.0 {
+        vec![0.0f32; n_var * n_target_haps]
+    } else {
+        Vec::new()
+    };
     let gl_seed: Vec<Vec<u32>> = if rare_carrier && !rc_flank && !rc_sampled {
         let n_ref = ref_bm.n_haps as f64;
         let mut seed: Vec<Vec<u32>> = vec![Vec::new(); n_target_haps];
@@ -263,12 +276,16 @@ pub fn run_gibbs(
                 }
                 for h in 0..n_target_haps { aug[h].extend_from_slice(&rare_aug_cache[h]); }
             } else if rc_sampled {
-                // Sampled-state reinforcement (opt-in): add carriers where the
-                // target hap is currently sampled as a carrier.
+                // Sampled-state reinforcement (default): add carriers where the
+                // target hap is sampled as a carrier OR (soft trigger) its prior
+                // posterior ALT dose exceeds rc_dose_thr.
+                let soft = rc_dose_thr < 1.0 && it > 0;
                 for (v, carriers) in &rare_sites {
                     let base = v * n_target_haps;
                     for h in 0..n_target_haps {
-                        if hap_alleles[base + h] == 1 { aug[h].extend_from_slice(carriers); }
+                        let hit = hap_alleles[base + h] == 1
+                            || (soft && hap_soft[base + h] > rc_dose_thr);
+                        if hit { aug[h].extend_from_slice(carriers); }
                     }
                 }
             } else {
@@ -343,9 +360,11 @@ pub fn run_gibbs(
         let is_main = it >= n_burnin;
         // Index per-hap dose by hap for pairing the two haps of each sample.
         let mut hap_dose: Vec<Option<Vec<f32>>> = (0..n_target_haps).map(|_| None).collect();
+        let track_soft = rc_dose_thr < 1.0;
         for (h, dose, sampled) in results {
             for v in 0..n_var {
                 hap_alleles[v * n_target_haps + h] = sampled[v];
+                if track_soft { hap_soft[v * n_target_haps + h] = dose[v]; }
             }
             hap_dose[h] = Some(dose);
         }
