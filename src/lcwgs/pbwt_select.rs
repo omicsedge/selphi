@@ -141,11 +141,17 @@ pub fn select_conditioning_haps(
     // heavy-tailed (long IBS dominate), so top-Kpbwt picks the real
     // matches.
     //
-    // Memory: n_target_haps × n_ref_haps × 4 B (u32). For 100 samples
-    // × 4500 ref haps = 1.8 MB. At biobank scale (50K × 1M) this would
-    // be 200 GB — at that point the algorithm switches to per-sample
-    // PBWT replay (TODO: Phase 2 scaling).
-    let mut match_len: Vec<u32> = vec![0u32; n_target_haps * n_ref_haps];
+    // SPARSE per-target accumulation (biobank-scaling fix). Each target hap sees
+    // only ~depth × n_storage_sites distinct ref neighbors, so we store a per-hap
+    // map ref_idx → summed-match-length instead of a DENSE n_target_haps × n_ref_haps
+    // matrix. The old dense matrix was 200 GB at biobank scale (50K × 1M); the
+    // sparse form is O(n_target_haps × neighbors), independent of n_ref_haps. The
+    // selected set and its ranking are BIT-IDENTICAL to the dense version (same
+    // (ref, summed-len) pairs; the explicit len-desc / idx-asc tiebreak below makes
+    // ordering deterministic regardless of map iteration order).
+    use std::collections::HashMap;
+    let mut match_len: Vec<HashMap<u32, u32>> =
+        (0..n_target_haps).map(|_| HashMap::new()).collect();
 
     // PER-REGION coverage (GLIMPSE2 compactSelection-style). When region_keep>0,
     // the closest `region_keep` ref neighbors at EACH storage site are force-kept
@@ -186,7 +192,7 @@ pub fn select_conditioning_haps(
         let storage_idx_i = storage_idx as i32;
         for h in 0..n_target_haps {
             let pos = inv[h] as i32;
-            let row_off = h * n_ref_haps;
+            let mlh = &mut match_len[h];
 
             // Walk left + right alternately, accumulating up to `depth`
             // ref-hap neighbors total.
@@ -208,8 +214,8 @@ pub fn select_conditioning_haps(
                         // Bounded by [1, storage_idx + 1].
                         let div_idx = (left + 1) as usize;
                         let ml = (storage_idx_i - div[div_idx]).max(1) as u32;
-                        match_len[row_off + ref_idx] =
-                            match_len[row_off + ref_idx].saturating_add(ml);
+                        let e = mlh.entry(ref_idx as u32).or_insert(0);
+                        *e = e.saturating_add(ml);
                         if region_keep > 0 && taken < region_keep {
                             region_neigh[h].push(ref_idx as u32);
                         }
@@ -226,8 +232,8 @@ pub fn select_conditioning_haps(
                         // of the match with the hap at `right-1`.
                         let div_idx = right as usize;
                         let ml = (storage_idx_i - div[div_idx]).max(1) as u32;
-                        match_len[row_off + ref_idx] =
-                            match_len[row_off + ref_idx].saturating_add(ml);
+                        let e = mlh.entry(ref_idx as u32).or_insert(0);
+                        *e = e.saturating_add(ml);
                         if region_keep > 0 && taken < region_keep {
                             region_neigh[h].push(ref_idx as u32);
                         }
@@ -246,8 +252,7 @@ pub fn select_conditioning_haps(
     // guarantees whole-window mosaic + short-IBD-carrier coverage), then the
     // remaining slots up to kpbwt are filled by global match-length ranking.
     for h in 0..n_target_haps {
-        let row_off = h * n_ref_haps;
-        let row = &match_len[row_off..row_off + n_ref_haps];
+        let mlh = &match_len[h];
 
         if region_keep > 0 {
             let mut sel: Vec<u32> = std::mem::take(&mut region_neigh[h]);
@@ -257,9 +262,9 @@ pub fn select_conditioning_haps(
                 // Fill remaining slots from the global match-length ranking,
                 // skipping already-included region haps.
                 let in_region: std::collections::HashSet<u32> = sel.iter().copied().collect();
-                let mut hits: Vec<(u32, u32)> = row.iter().enumerate()
-                    .filter(|&(i, &c)| c > 0 && !in_region.contains(&(i as u32)))
-                    .map(|(i, &c)| (c, i as u32))
+                let mut hits: Vec<(u32, u32)> = mlh.iter()
+                    .filter(|&(&i, _)| !in_region.contains(&i))
+                    .map(|(&i, &c)| (c, i))
                     .collect();
                 hits.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
                 let need = kpbwt - sel.len();
@@ -268,16 +273,15 @@ pub fn select_conditioning_haps(
                 // Region union alone exceeds kpbwt: keep the kpbwt with the
                 // longest global match (still a per-region-sourced set).
                 sel.sort_unstable_by(|&a, &b| {
-                    row[b as usize].cmp(&row[a as usize]).then(a.cmp(&b))
+                    let (ca, cb) = (mlh.get(&a).copied().unwrap_or(0), mlh.get(&b).copied().unwrap_or(0));
+                    cb.cmp(&ca).then(a.cmp(&b))
                 });
                 sel.truncate(kpbwt);
             }
             out.push(sel);
         } else {
-            let mut hits: Vec<(u32, u32)> = row.iter().enumerate()
-                .filter(|&(_, &c)| c > 0)
-                .map(|(i, &c)| (c, i as u32))
-                .collect();
+            // All map entries have count >= 1 (ml is .max(1)), so no >0 filter needed.
+            let mut hits: Vec<(u32, u32)> = mlh.iter().map(|(&i, &c)| (c, i)).collect();
             hits.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
             if hits.len() > kpbwt { hits.truncate(kpbwt); }
             out.push(hits.into_iter().map(|(_, idx)| idx).collect());
