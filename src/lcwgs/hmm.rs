@@ -66,6 +66,27 @@ thread_local! {
     static TL_ALPHA_SUM: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     static TL_EMIT: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     static TL_PREC: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    // Bit-packed conditioning alleles (n_var × ceil(k/64) u64) for the AVX-512
+    // path: 16 alleles load directly as a __mmask16 for _mm512_mask_blend_ps.
+    // Keeps the materialized conditioning at 1 bit/state (~k/64 u64 per site) so
+    // the extra traffic stays tiny — a contiguous f32 materialization (32×) was
+    // measured SLOWER than the scattered gather (memory-bandwidth bound).
+    static TL_CONDBITS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Whether to use the AVX-512 lcWGS HMM path. Cached. `SELPHI_FORCE_SCALAR=1`
+/// forces the scalar path (for scalar/SIMD parity validation), matching the
+/// convention used by the diploid `run_hom_bm` dispatch.
+#[cfg(target_arch = "x86_64")]
+fn use_avx512_lcwgs() -> bool {
+    use std::sync::OnceLock;
+    static USE: OnceLock<bool> = OnceLock::new();
+    *USE.get_or_init(|| {
+        if std::env::var("SELPHI_FORCE_SCALAR").ok().as_deref() == Some("1") {
+            return false;
+        }
+        is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512dq")
+    })
 }
 
 /// Output of one HMM run on a single target haplotype.
@@ -98,6 +119,13 @@ pub fn run_forward_backward(
     assert_eq!(hl.len(), n_var * 2, "hl must be n_var * 2 f32");
     assert!(k >= 1, "at least one conditioning haplotype required");
     assert!(n_var >= 1, "at least one variant required");
+
+    // AVX-512 fast path (bit-packed conditioning, vectorized fwd/bwd). Falls
+    // back to the scalar path below on non-AVX-512 hosts or SELPHI_FORCE_SCALAR=1.
+    #[cfg(target_arch = "x86_64")]
+    if use_avx512_lcwgs() {
+        return unsafe { run_fb_avx512(hl, cond_haps, ref_bm, cm, params) };
+    }
 
     let inv_k = 1.0f32 / (k as f32);
     let ee = 1.0f32 - params.epsilon;
@@ -287,6 +315,235 @@ pub fn run_forward_backward(
 
     HmmOutput { dosage }
 }
+
+/// AVX-512 implementation of [`run_forward_backward`]. Numerically equivalent
+/// (to f32 reduction-order) to the scalar path; validated against
+/// `SELPHI_FORCE_SCALAR=1`. Conditioning alleles are materialized bit-packed
+/// once (16 per `__mmask16`); the forward/backward inner loops over the K
+/// states are vectorized 16-wide with `_mm512_mask_blend_ps` for the emission
+/// select and `_mm512_mask_add_ps` for the per-allele posterior accumulation.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512dq")]
+unsafe fn run_fb_avx512(
+    hl: &[f32],
+    cond_haps: &[u32],
+    ref_bm: &HaplotypeBitmatrix,
+    cm: &[f64],
+    params: &LcwgsParams,
+) -> HmmOutput { unsafe {
+    use core::arch::x86_64::*;
+    let n_var = cm.len();
+    let k = cond_haps.len();
+    let inv_k = 1.0f32 / (k as f32);
+    let ee = 1.0f32 - params.epsilon;
+    let ed = params.epsilon;
+    let loo = std::env::var("LCWGS_NO_EMIT_LOO").is_err();
+    let w64 = k.div_ceil(64);
+    let kmain = k & !15usize; // largest multiple of 16 ≤ k
+
+    let mut dosage = vec![0.0f32; n_var];
+
+    TL_ALPHA.with(|ca| TL_ALPHA_SUM.with(|cs| TL_BETA.with(|cb| TL_EMIT.with(|ce| TL_PREC.with(|cp| TL_CONDBITS.with(|cc| {
+        let mut alpha = ca.borrow_mut();
+        let mut alpha_sum = cs.borrow_mut();
+        let mut beta = cb.borrow_mut();
+        let mut emit = ce.borrow_mut();
+        let mut p_rec = cp.borrow_mut();
+        let mut condbits = cc.borrow_mut();
+
+        // emission per (variant, allele)
+        emit.clear(); emit.resize(n_var * 2, 0.0);
+        for v in 0..n_var {
+            let h0 = hl[2 * v]; let h1 = hl[2 * v + 1];
+            let p0 = h0 * ee + h1 * ed;
+            let p1 = h0 * ed + h1 * ee;
+            let s = p0 + p1;
+            if s > f32::MIN_POSITIVE { let inv = 1.0 / s; emit[2*v] = p0*inv; emit[2*v+1] = p1*inv; }
+            else { emit[2*v] = 0.5; emit[2*v+1] = 0.5; }
+        }
+        // p_rec
+        p_rec.clear(); p_rec.resize(n_var, 0.0);
+        let scale = 0.04f64 * (params.ne as f64) / (k as f64);
+        for v in 1..n_var {
+            let d = (cm[v] - cm[v - 1]).max(0.0);
+            p_rec[v] = (1.0 - (-d * scale).exp()) as f32;
+        }
+        // Bit-packed conditioning alleles (zeroed then OR'd; 1 bit/state).
+        condbits.clear(); condbits.resize(n_var * w64, 0u64);
+        for v in 0..n_var {
+            let base = v * w64;
+            for (j, &h) in cond_haps.iter().enumerate() {
+                if ref_bm.get(v, h as usize) {
+                    condbits[base + j / 64] |= 1u64 << (j % 64);
+                }
+            }
+        }
+
+        // size scratch (no zero-fill; written before read)
+        let need_a = n_var * k;
+        let (la, ls, lb) = (alpha.len(), alpha_sum.len(), beta.len());
+        if la < need_a { alpha.reserve(need_a - la); }
+        if ls < n_var { alpha_sum.reserve(n_var - ls); }
+        if lb < k { beta.reserve(k - lb); }
+        alpha.set_len(need_a); alpha_sum.set_len(n_var); beta.set_len(k);
+
+        let ap = alpha.as_mut_ptr();
+        let cbp = condbits.as_ptr();
+        // mask16 of allele bits for the 16-lane group starting at j.
+        #[inline(always)]
+        unsafe fn mask16(cbp: *const u64, base: usize, j: usize) -> u16 { unsafe {
+            ((*cbp.add(base + j / 64) >> (j % 64)) & 0xFFFF) as u16
+        }}
+
+        // --- Forward base case (v=0): alpha = inv_k * e ---
+        {
+            let e0 = _mm512_set1_ps(emit[0]);
+            let e1 = _mm512_set1_ps(emit[1]);
+            let invkv = _mm512_set1_ps(inv_k);
+            let mut sumv = _mm512_setzero_ps();
+            let mut j = 0;
+            while j < kmain {
+                let m = mask16(cbp, 0, j);
+                let ev = _mm512_mask_blend_ps(m, e0, e1);
+                let p = _mm512_mul_ps(ev, invkv);
+                _mm512_storeu_ps(ap.add(j), p);
+                sumv = _mm512_add_ps(sumv, p);
+                j += 16;
+            }
+            let mut s0 = _mm512_reduce_add_ps(sumv);
+            while j < k {
+                let a = (*cbp.add(j / 64) >> (j % 64)) & 1 != 0;
+                let p = inv_k * if a { emit[1] } else { emit[0] };
+                *ap.add(j) = p; s0 += p; j += 1;
+            }
+            alpha_sum[0] = s0;
+        }
+
+        // --- Forward inductive ---
+        for v in 1..n_var {
+            let pr = p_rec[v];
+            let fact1 = pr * inv_k;
+            let fact2 = (1.0 - pr) / alpha_sum[v - 1].max(f32::MIN_POSITIVE);
+            let e0s = emit[2 * v]; let e1s = emit[2 * v + 1];
+            let e0 = _mm512_set1_ps(e0s); let e1 = _mm512_set1_ps(e1s);
+            let f1v = _mm512_set1_ps(fact1); let f2v = _mm512_set1_ps(fact2);
+            let base = v * w64;
+            let prev_off = (v - 1) * k; let curr_off = v * k;
+            let mut sumv = _mm512_setzero_ps();
+            let mut j = 0;
+            while j < kmain {
+                let prev = _mm512_loadu_ps(ap.add(prev_off + j));
+                let tmp = _mm512_fmadd_ps(prev, f2v, f1v);
+                let m = mask16(cbp, base, j);
+                let ev = _mm512_mask_blend_ps(m, e0, e1);
+                let p = _mm512_mul_ps(tmp, ev);
+                _mm512_storeu_ps(ap.add(curr_off + j), p);
+                sumv = _mm512_add_ps(sumv, p);
+                j += 16;
+            }
+            let mut s = _mm512_reduce_add_ps(sumv);
+            while j < k {
+                let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
+                let e = if a { e1s } else { e0s };
+                let p = (*ap.add(prev_off + j) * fact2 + fact1) * e;
+                *ap.add(curr_off + j) = p; s += p; j += 1;
+            }
+            alpha_sum[v] = s;
+        }
+
+        // --- Backward init (last site) ---
+        let last = n_var - 1;
+        let bp = beta.as_mut_ptr();
+        let e0l = emit[2 * last]; let e1l = emit[2 * last + 1];
+        let mut beta_sum;
+        {
+            let e0 = _mm512_set1_ps(e0l); let e1 = _mm512_set1_ps(e1l);
+            let invkv = _mm512_set1_ps(inv_k);
+            let base = last * w64; let aoff = last * k;
+            let mut bsumv = _mm512_setzero_ps();
+            let mut p1v = _mm512_setzero_ps(); let mut p0v = _mm512_setzero_ps();
+            let mut j = 0;
+            while j < kmain {
+                let m = mask16(cbp, base, j);
+                let ev = _mm512_mask_blend_ps(m, e0, e1);
+                let bv = _mm512_mul_ps(ev, invkv);
+                _mm512_storeu_ps(bp.add(j), bv);
+                bsumv = _mm512_add_ps(bsumv, bv);
+                let av = _mm512_loadu_ps(ap.add(aoff + j));
+                let postv = _mm512_mul_ps(av, invkv);
+                p1v = _mm512_mask_add_ps(p1v, m, p1v, postv);
+                p0v = _mm512_mask_add_ps(p0v, !m, p0v, postv);
+                j += 16;
+            }
+            beta_sum = _mm512_reduce_add_ps(bsumv);
+            let mut prob_hid_1 = _mm512_reduce_add_ps(p1v);
+            let mut prob_hid_0 = _mm512_reduce_add_ps(p0v);
+            while j < k {
+                let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
+                let e = if a { e1l } else { e0l };
+                let b = inv_k * e; *bp.add(j) = b; beta_sum += b;
+                let post = *ap.add(aoff + j) * inv_k;
+                if a { prob_hid_1 += post; } else { prob_hid_0 += post; }
+                j += 1;
+            }
+            if loo { prob_hid_0 /= e0l.max(f32::MIN_POSITIVE); prob_hid_1 /= e1l.max(f32::MIN_POSITIVE); }
+            let h0 = hl[2 * last]; let h1 = hl[2 * last + 1];
+            let po0 = (prob_hid_0 * ee + prob_hid_1 * ed) * h0;
+            let po1 = (prob_hid_0 * ed + prob_hid_1 * ee) * h1;
+            let s = po0 + po1;
+            dosage[last] = if s > f32::MIN_POSITIVE { po1 / s } else { 0.5 };
+        }
+
+        // --- Backward inductive ---
+        for v in (0..last).rev() {
+            let pr = p_rec[v + 1];
+            let fact1 = pr * inv_k;
+            let fact2 = (1.0 - pr) / beta_sum.max(f32::MIN_POSITIVE);
+            let e0s = emit[2 * v]; let e1s = emit[2 * v + 1];
+            let e0 = _mm512_set1_ps(e0s); let e1 = _mm512_set1_ps(e1s);
+            let f1v = _mm512_set1_ps(fact1); let f2v = _mm512_set1_ps(fact2);
+            let base = v * w64; let aoff = v * k;
+            let mut bsumv = _mm512_setzero_ps();
+            let mut p1v = _mm512_setzero_ps(); let mut p0v = _mm512_setzero_ps();
+            let mut j = 0;
+            while j < kmain {
+                let bprev = _mm512_loadu_ps(bp.add(j));
+                let bun = _mm512_fmadd_ps(bprev, f2v, f1v); // beta*fact2 + fact1
+                let av = _mm512_loadu_ps(ap.add(aoff + j));
+                let postv = _mm512_mul_ps(av, bun);
+                let m = mask16(cbp, base, j);
+                p1v = _mm512_mask_add_ps(p1v, m, p1v, postv);
+                p0v = _mm512_mask_add_ps(p0v, !m, p0v, postv);
+                let ev = _mm512_mask_blend_ps(m, e0, e1);
+                let nb = _mm512_mul_ps(bun, ev);
+                _mm512_storeu_ps(bp.add(j), nb);
+                bsumv = _mm512_add_ps(bsumv, nb);
+                j += 16;
+            }
+            let mut new_beta_sum = _mm512_reduce_add_ps(bsumv);
+            let mut prob_hid_1 = _mm512_reduce_add_ps(p1v);
+            let mut prob_hid_0 = _mm512_reduce_add_ps(p0v);
+            while j < k {
+                let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
+                let e = if a { e1s } else { e0s };
+                let bun = *bp.add(j) * fact2 + fact1;
+                let post = *ap.add(aoff + j) * bun;
+                if a { prob_hid_1 += post; } else { prob_hid_0 += post; }
+                let nb = bun * e; *bp.add(j) = nb; new_beta_sum += nb;
+                j += 1;
+            }
+            beta_sum = new_beta_sum;
+            if loo { prob_hid_0 /= e0s.max(f32::MIN_POSITIVE); prob_hid_1 /= e1s.max(f32::MIN_POSITIVE); }
+            let h0v = hl[2 * v]; let h1v = hl[2 * v + 1];
+            let po0 = (prob_hid_0 * ee + prob_hid_1 * ed) * h0v;
+            let po1 = (prob_hid_0 * ed + prob_hid_1 * ee) * h1v;
+            let s = po0 + po1;
+            dosage[v] = if s > f32::MIN_POSITIVE { po1 / s } else { 0.5 };
+        }
+    }))))));
+
+    HmmOutput { dosage }
+}}
 
 /// GLIMPSE2-style scaffold HMM: run forward-backward ONLY on the common
 /// (scaffold) sites, then impute ALL sites (common + rare) by interpolating
