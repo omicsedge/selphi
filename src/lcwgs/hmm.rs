@@ -110,6 +110,31 @@ fn hmm_timing() -> bool {
     *T.get_or_init(|| std::env::var("LCWGS_TIMING").is_ok())
 }
 
+/// Li-Stephens transition rate scale (cM⁻¹). Default = Selphi's `0.04·Ne/K`
+/// (K-dependent: more conditioning states → less recombination per state).
+/// `LCWGS_GLIMPSE_RECOMB=1` switches to GLIMPSE2's K-INDEPENDENT form
+/// `0.04·Ne/max(n_ref, Ne)` (conditioning_set.cpp:34) — with the default
+/// Ne=100000 ≥ n_ref this is ≈0.04 cM⁻¹, ~33× less recombination than Selphi's
+/// 1.33 at K≈3000, i.e. a much stickier copy (a carrier, once copied at a
+/// flanking common site, stays copied across the rare site). Cached.
+///
+/// MEASURED VERDICT (gated, default off): the faithful K-independent form lifts
+/// the rare bin on the mid region (+0.0028) but REGRESSES on the representative
+/// r12 region (OVERALL 0.9332→0.9310; rare bin flat, commons −0.002..−0.005),
+/// same pattern as the Ne sweep — a stickier global copy trades common accuracy
+/// for no rare gain on real LD. Not the lever (6th faithful negative on the
+/// rare-bin gap; see rare_ibs.rs). Kept gated for the record.
+fn recomb_scale(ne: f32, k: usize, n_ref: usize) -> f64 {
+    use std::sync::OnceLock;
+    static GLM: OnceLock<bool> = OnceLock::new();
+    let glm = *GLM.get_or_init(|| std::env::var("LCWGS_GLIMPSE_RECOMB").is_ok());
+    if glm {
+        0.04f64 * (ne as f64) / (n_ref.max(ne as usize) as f64)
+    } else {
+        0.04f64 * (ne as f64) / (k as f64)
+    }
+}
+
 /// Output of one HMM run on a single target haplotype.
 pub struct HmmOutput {
     /// Per-variant haploid dosage `E[ALT count]` ∈ [0, 1]. Length = `n_var`.
@@ -187,8 +212,7 @@ pub fn run_forward_backward(
         let mut buf = cell.borrow_mut();
         buf.clear();
         buf.resize(n_var, 0.0);
-        // GLIMPSE2: scale = 0.04 * Ne / K
-        let scale = 0.04f64 * (params.ne as f64) / (k as f64);
+        let scale = recomb_scale(params.ne, k, ref_bm.n_haps);
         // MAF-adaptive recombination: a per-site multiplier on the transition
         // RATE (folded inside the exp, not applied to the probability — exact).
         // <1 at a site = stickier copy into it; used to keep a rare-allele
@@ -392,7 +416,7 @@ unsafe fn run_fb_avx512(
         }
         // p_rec
         p_rec.clear(); p_rec.resize(n_var, 0.0);
-        let scale = 0.04f64 * (params.ne as f64) / (k as f64);
+        let scale = recomb_scale(params.ne, k, ref_bm.n_haps);
         for v in 1..n_var {
             let d = (cm[v] - cm[v - 1]).max(0.0);
             let m = recomb_mult.map_or(1.0, |rm| rm[v] as f64);
