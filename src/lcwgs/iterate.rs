@@ -275,6 +275,13 @@ pub fn run_gibbs(
     // zero-read carriers via LD — so it beats GLIMPSE2's read-driven init seed.
     let rc_glseed = std::env::var("LCWGS_RC_GLSEED").is_ok();
     let rc_sampled = !rc_glseed; // DEFAULT = sampled-state (the winner)
+    // Chicken-egg test (LCWGS_RC_ALL): add a rare site's carriers to EVERY target
+    // hap unconditionally (not only when sampled ALT), mirroring GLIMPSE2's
+    // init_small_rare which makes all cluster carriers available regardless of the
+    // target's current allele. Isolates whether the rare gap is a carrier-
+    // availability problem (chicken-egg: a zero-read true carrier never sampled
+    // ALT never gets its carriers) vs a copy-competition problem.
+    let rc_all = std::env::var("LCWGS_RC_ALL").is_ok();
     // Soft-dose trigger threshold for the sampled-state RC: add a rare site's
     // carriers to a hap when its PREVIOUS-iteration posterior ALT dose exceeds
     // this (not only when hard-sampled ALT). A diffuse carrier (dose ~0.13) is
@@ -321,6 +328,20 @@ pub fn run_gibbs(
         seed
     } else { Vec::new() };
 
+    // GLIMPSE2-style match-extension selection (opt-in LCWGS_MATCHEXT). Replaces
+    // the global summed-match-length ranking with depth-bucketed local-match
+    // harvesting over a dense PBWT of ALL sites, unioned depth-first — covers
+    // every local region (incl. locally-matching rare carriers) before adding
+    // redundant depth (see rare_ibs.rs). modulo/depth/gate match GLIMPSE2's
+    // pbwt_modulo_cm=0.1 / pbwt_depth=12 / "long matches only".
+    let matchext = std::env::var("LCWGS_MATCHEXT").is_ok();
+    let mx_modulo = std::env::var("LCWGS_MATCHEXT_MODULO").ok()
+        .and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.1);
+    let mx_depth = std::env::var("LCWGS_MATCHEXT_DEPTH").ok()
+        .and_then(|s| s.parse::<usize>().ok()).unwrap_or(12);
+    let mx_gate = std::env::var("LCWGS_MATCHEXT_GATE").ok()
+        .and_then(|s| s.parse::<f32>().ok()).unwrap_or(mx_modulo / 2.0);
+
     for it in 0..params.n_iterations {
         // 1. Sparse PBWT selection from the current sampled hap alleles.
         let recompute = it == 0 || it == n_burnin || it % refresh == 0;
@@ -330,11 +351,18 @@ pub fn run_gibbs(
             &cond_cache
         } else {
             if recompute {
-                cond_cache = select_conditioning_haps(
-                    &hap_alleles, ref_bm, cm,
-                    n_target_haps, params.kpbwt, params.pbwt_modulo_cm, params.pbwt_depth,
-                    sel_idx, region_keep,
-                );
+                cond_cache = if matchext {
+                    super::rare_ibs::select_conditioning_haps_matchext(
+                        &hap_alleles, ref_bm, cm,
+                        n_target_haps, params.kpbwt, mx_depth, mx_modulo, mx_gate,
+                    )
+                } else {
+                    select_conditioning_haps(
+                        &hap_alleles, ref_bm, cm,
+                        n_target_haps, params.kpbwt, params.pbwt_modulo_cm, params.pbwt_depth,
+                        sel_idx, region_keep,
+                    )
+                };
             }
             &cond_cache
         };
@@ -361,7 +389,8 @@ pub fn run_gibbs(
                 for (v, carriers) in &rare_sites {
                     let base = v * n_target_haps;
                     for h in 0..n_target_haps {
-                        let hit = hap_alleles[base + h] == 1
+                        let hit = rc_all
+                            || hap_alleles[base + h] == 1
                             || (soft && hap_soft[base + h] > rc_dose_thr);
                         if hit { aug[h].extend_from_slice(carriers); }
                     }
