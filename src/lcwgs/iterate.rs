@@ -164,16 +164,24 @@ pub fn run_gibbs(
     // Conditioning-set size ceiling AFTER rare-carrier augmentation. The base
     // PBWT selection is small (dense d16 gives ~1000 unique neighbors), and the
     // sampled-state RC then unions in every carrier of every rare site the hap
-    // is currently sampled ALT at — which balloons K (≈1000→3400 on dense
+    // is currently sampled ALT at — which balloons K (≈1000→3600 on dense
     // regions), and since both the forward matrix (n_var×K) and the O(n_var×K)
-    // HMM scale linearly with K, that inflation is the dominant memory+time cost.
-    // When set, cap keeps the IBD-RANKED base set (the genuine long matches)
-    // first, then fills with carriers up to k_max — so the rare-carrier signal
-    // is retained but the global conditioning can't blow past the ceiling.
-    // 0/unset = no cap (legacy behaviour, bit-identical: the HMM is set-based so
-    // order-preserving dedup and sort-dedup yield the same dosage).
-    let k_max = std::env::var("LCWGS_KMAX").ok()
-        .and_then(|s| s.parse::<usize>().ok()).filter(|&k| k > 0);
+    // HMM scale linearly with K, that inflation is the dominant memory cost.
+    // The cap keeps the IBD-RANKED base set (the genuine long matches) first,
+    // then fills with carriers up to k_max — so the rare-carrier signal is
+    // retained but the global conditioning can't blow past the ceiling.
+    //
+    // DEFAULT 3000 (retuned 2026-05-31): the uncapped peak K is ~2450–3644
+    // across chr22 chunks; 3000 trims only the densest, most-inflated chunks.
+    // On the full-chr22 326K benchmark this cuts peak RSS −24% (50.6→38.6 GB)
+    // for −0.0001 OVERALL R² (0.905 unchanged to reported precision). A tighter
+    // cap (1500) saves more (−48%) but regresses −0.0010 → too aggressive. Set
+    // LCWGS_KMAX=0 to disable the cap entirely (legacy uncapped behaviour).
+    let k_max = match std::env::var("LCWGS_KMAX").ok().and_then(|s| s.parse::<usize>().ok()) {
+        Some(0) => None,        // explicit opt-out → no cap
+        Some(k) => Some(k),     // explicit ceiling
+        None => Some(3000),     // default ceiling
+    };
     let rc_flank = std::env::var("LCWGS_RC_FLANK").is_ok();
     let rc_window = std::env::var("LCWGS_RARE_CARRIER_WINDOW").ok()
         .and_then(|s| s.parse().ok()).unwrap_or(50usize);

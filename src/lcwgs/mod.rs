@@ -152,7 +152,14 @@ impl Default for LcwgsParams {
             kpbwt: envu("LCWGS_KPBWT", 2000),
             pbwt_modulo_cm: envf("LCWGS_PBWT_MODULO_CM", 0.002),
             pbwt_depth: envu("LCWGS_PBWT_DEPTH", 16),
-            n_iterations: envu("LCWGS_N_ITER", 25),
+            // Retuned 2026-05-31 (speed/memory session). Dropped 25→20: Gibbs has
+            // converged by 20 (the 17→25 bump was the convergence lever, but the
+            // last 5 burn-in iterations no longer move the averaged dose). On the
+            // canonical full-chr22 326K-variant benchmark, iter20 + KMAX=3000 is
+            // OVERALL 0.9051 vs 0.9052 at iter25/uncapped (−0.0001, i.e. 0.905 to
+            // reported precision, uniform across MAF bins) for −16% wall and
+            // −24% peak RSS. Restore the old behaviour with LCWGS_N_ITER=25.
+            n_iterations: envu("LCWGS_N_ITER", 20),
             n_main_iterations: envu("LCWGS_N_MAIN", 8),
             ne: envf("LCWGS_NE", 100_000.0),
             rare_maf: 0.001,
