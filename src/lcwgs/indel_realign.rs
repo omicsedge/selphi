@@ -31,7 +31,10 @@ impl GapParams {
     fn new(open_phred: f64, ext_phred: f64) -> Self {
         let delta = 10f64.powf(-open_phred / 10.0);
         let eps = 10f64.powf(-ext_phred / 10.0);
-        GapParams { mm: 1.0 - 2.0 * delta, open: delta, gm: 1.0 - eps, ext: eps }
+        // Clamp the match→match probability to ≥0: a very low gap-open Phred
+        // (≲6, reachable via env knobs) would make 1−2δ negative and silently
+        // corrupt the forward sums.
+        GapParams { mm: (1.0 - 2.0 * delta).max(0.0), open: delta, gm: 1.0 - eps, ext: eps }
     }
 }
 
