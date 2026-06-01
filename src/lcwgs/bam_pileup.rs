@@ -195,6 +195,7 @@ fn pileup_one(
         // whole-file streaming path and the indexed region-query path.
         let mut cigar_buf: Vec<(Kind, usize)> = Vec::with_capacity(16);
         let mut iscratch = IndelScratch::default();
+        let mut ov = OverlapState::new(n_var); // mate-overlap collapse state
         let mut process = |record: &bam::Record| {
             match record.reference_sequence_id() {
                 Some(Ok(rid)) if rid == target_rid => {}
@@ -214,11 +215,14 @@ fn pileup_one(
             for op in record.cigar().iter() {
                 match op { Ok(o) => cigar_buf.push((o.kind(), o.len())), Err(_) => return }
             }
+            // Fragment hash (paired mates share a QNAME) → count overlap once.
+            let qhash = record.name().map(|n| fnv1a(n.as_ref())).unwrap_or((start as u64) << 1 | 1);
             walk_record(
                 start, last_pos, &cigar_buf,
                 |qi| seq.get(qi).unwrap_or(b'N'),
                 |qi| qbytes[qi],
                 pos, ref_base, alt_base, is_snp, params, lut, &mut ll, &mut depth,
+                qhash, &mut ov,
             );
             if let Some(model) = indel_model {
                 super::indel_realign::score_read(
@@ -226,7 +230,7 @@ fn pileup_one(
                     |qi| seq.get(qi).unwrap_or(b'N'),
                     |qi| qbytes[qi],
                     model, lut, &mut iscratch, &mut ll, &mut depth,
-                    params.max_depth, params.min_bq,
+                    params.max_depth, params.min_bq, qhash, &mut ov.last_frag,
                 );
             }
         };
@@ -334,6 +338,7 @@ fn pileup_one_cram(
     let last_pos = pos[n_var - 1];
     let mut cigar_buf: Vec<(Kind, usize)> = Vec::with_capacity(16);
     let mut iscratch = IndelScratch::default();
+    let mut ov = OverlapState::new(n_var); // mate-overlap collapse state
 
     // Same guards + walk as the BAM path, over decoded RecordBufs.
     let mut process = |record: &RecordBuf| {
@@ -347,11 +352,13 @@ fn pileup_one_cram(
         if qbytes.is_empty() { return; }
         cigar_buf.clear();
         for op in record.cigar().as_ref() { cigar_buf.push((op.kind(), op.len())); }
+        let qhash = record.name().map(|n| fnv1a(n.as_ref())).unwrap_or((start as u64) << 1 | 1);
         walk_record(
             start, last_pos, &cigar_buf,
             |qi| seq.get(qi).unwrap_or(b'N'),
             |qi| qbytes[qi],
             pos, ref_base, alt_base, is_snp, params, lut, &mut ll, &mut depth,
+            qhash, &mut ov,
         );
         if let Some(model) = indel_model {
             super::indel_realign::score_read(
@@ -359,7 +366,7 @@ fn pileup_one_cram(
                 |qi| seq.get(qi).unwrap_or(b'N'),
                 |qi| qbytes[qi],
                 model, lut, &mut iscratch, &mut ll, &mut depth,
-                params.max_depth, params.min_bq,
+                params.max_depth, params.min_bq, qhash, &mut ov.last_frag,
             );
         }
     };
@@ -400,12 +407,41 @@ fn pileup_one_cram(
     Ok((sample_id, finalize_gl(&ll, &depth)))
 }
 
+/// FNV-1a 64-bit hash of a read name, used to detect overlapping paired-end
+/// mates (the two mates share a QNAME). `u64::MAX` is reserved as "unset".
+#[inline]
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for &b in bytes { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+    if h == u64::MAX { 0 } else { h }
+}
+
+/// Per-site state for collapsing overlapping paired-end mates. A fragment's two
+/// mates cover the same DNA molecule, so an overlapped site is ONE observation:
+/// `last_frag[v]` is the last fragment to score site `v`; `first_base`/
+/// `first_qual` hold that observation so the partner mate can be merged in
+/// (agreeing bases → best quality kept; disagreeing → higher-quality base,
+/// quality reduced by the conflict) rather than double-counted.
+struct OverlapState { last_frag: Vec<u64>, first_base: Vec<u8>, first_qual: Vec<u8> }
+impl OverlapState {
+    fn new(n: usize) -> Self {
+        OverlapState { last_frag: vec![u64::MAX; n], first_base: vec![0; n], first_qual: vec![0; n] }
+    }
+}
+
 /// Shared CIGAR-walk + GL accumulation for one read, used by BOTH the BAM
 /// (concrete) and CRAM (trait) paths. `cigar` is the read's ops as (kind, len);
 /// `base_at(qi)`/`qual_at(qi)` fetch the read base (ASCII) / phred quality at a
 /// query index. Maps each covered panel site to its read base+qual and folds it
 /// into the per-genotype log-likelihoods. Format-agnostic (the only BAM/CRAM
 /// difference — how a record exposes cigar/seq/qual — is supplied by the caller).
+///
+/// Overlapping paired-end mates (same fragment) are counted ONCE per site:
+/// `qhash` is the read's fragment hash and `last_frag[v]` records the last
+/// fragment that contributed to site `v`; a second mate of the same fragment is
+/// skipped. Without this, both mates double-count the fragment's evidence,
+/// inflating GL confidence at ~30-50% of sites (overlap region) and degrading
+/// imputation — matching `samtools`/`bcftools`/GLIMPSE2 overlap handling.
 #[allow(clippy::too_many_arguments)]
 fn walk_record<B: Fn(usize) -> u8, Q: Fn(usize) -> u8>(
     start: i64,
@@ -421,6 +457,8 @@ fn walk_record<B: Fn(usize) -> u8, Q: Fn(usize) -> u8>(
     lut: &PhredLut,
     ll: &mut [[f64; 3]],
     depth: &mut [u32],
+    qhash: u64,
+    ov: &mut OverlapState,
 ) {
     let n_var = pos.len();
     // Reference span (for the early-out): sum of ref-consuming ops.
@@ -440,14 +478,35 @@ fn walk_record<B: Fn(usize) -> u8, Q: Fn(usize) -> u8>(
                 while si < n_var && pos[si] < refcur { si += 1; }
                 while si < n_var && pos[si] < ref_end {
                     let v = si;
-                    if is_snp[v] && depth[v] < params.max_depth {
+                    if is_snp[v] {
                         let qi = qcur + (pos[v] - refcur) as usize;
                         let b = base_at(qi);
-                        let q = qual_at(qi);
-                        if b != b'N' && q >= params.min_bq {
-                            let q = (q as usize).min(93);
-                            accumulate(&mut ll[v], b, ref_base[v], alt_base[v], q, lut);
-                            depth[v] += 1;
+                        let qraw = qual_at(qi);
+                        if b != b'N' && qraw >= params.min_bq {
+                            let q = (qraw as usize).min(93);
+                            if ov.last_frag[v] == qhash {
+                                // Overlapping mate of the same fragment: merge into the
+                                // existing observation (one molecule) instead of adding.
+                                let fb = ov.first_base[v];
+                                let fq = ov.first_qual[v] as usize;
+                                let (mb, mq) = if b == fb {
+                                    (fb, q.max(fq))                       // agree → best quality
+                                } else if q >= fq {
+                                    (b, (q - fq).max(1))                  // disagree → higher-q base, reduced
+                                } else {
+                                    (fb, (fq - q).max(1))
+                                };
+                                accumulate(&mut ll[v], fb, ref_base[v], alt_base[v], fq, lut, -1.0);
+                                accumulate(&mut ll[v], mb, ref_base[v], alt_base[v], mq, lut, 1.0);
+                                ov.first_base[v] = mb;
+                                ov.first_qual[v] = mq as u8;
+                            } else if depth[v] < params.max_depth {
+                                accumulate(&mut ll[v], b, ref_base[v], alt_base[v], q, lut, 1.0);
+                                depth[v] += 1;
+                                ov.last_frag[v] = qhash;
+                                ov.first_base[v] = b;
+                                ov.first_qual[v] = q as u8;
+                            }
                         }
                     }
                     si += 1;
@@ -463,15 +522,17 @@ fn walk_record<B: Fn(usize) -> u8, Q: Fn(usize) -> u8>(
     }
 }
 
-/// Accumulate one read base into the 3 genotype log10-likelihoods.
+/// Accumulate one read base into the 3 genotype log10-likelihoods, scaled by
+/// `sign` (+1 to add an observation, −1 to remove a previously-added one — used
+/// when an overlapping mate replaces the first mate's base).
 #[inline(always)]
-fn accumulate(ll: &mut [f64; 3], b: u8, rb: u8, ab: u8, q: usize, lut: &PhredLut) {
+fn accumulate(ll: &mut [f64; 3], b: u8, rb: u8, ab: u8, q: usize, lut: &PhredLut, sign: f64) {
     // hom-REF: P(b|ref); hom-ALT: P(b|alt); het: ½P(b|ref)+½P(b|alt).
     let (lref, pref) = if b == rb { (lut.lmatch[q], lut.pmatch[q]) } else { (lut.lmis[q], lut.pmis[q]) };
     let (lalt, palt) = if b == ab { (lut.lmatch[q], lut.pmatch[q]) } else { (lut.lmis[q], lut.pmis[q]) };
-    ll[0] += lref;
-    ll[2] += lalt;
-    ll[1] += (0.5 * pref + 0.5 * palt).log10();
+    ll[0] += sign * lref;
+    ll[2] += sign * lalt;
+    ll[1] += sign * (0.5 * pref + 0.5 * palt).log10();
 }
 
 #[cfg(test)]
@@ -492,16 +553,16 @@ mod tests {
         let lut = PhredLut::new();
         // ref=A, alt=G. One high-quality A read → favors hom-ref (g0) over het/hom-alt.
         let mut ll = [0.0f64; 3];
-        accumulate(&mut ll, b'A', b'A', b'G', 30, &lut);
+        accumulate(&mut ll, b'A', b'A', b'G', 30, &lut, 1.0);
         assert!(ll[0] > ll[1] && ll[1] > ll[2], "A read: g0>g1>g2, got {:?}", ll);
         // One G read (alt) → favors hom-alt.
         let mut ll2 = [0.0f64; 3];
-        accumulate(&mut ll2, b'G', b'A', b'G', 30, &lut);
+        accumulate(&mut ll2, b'G', b'A', b'G', 30, &lut, 1.0);
         assert!(ll2[2] > ll2[1] && ll2[1] > ll2[0], "G read: g2>g1>g0, got {:?}", ll2);
         // One A + one G (het evidence) → het most likely.
         let mut llh = [0.0f64; 3];
-        accumulate(&mut llh, b'A', b'A', b'G', 30, &lut);
-        accumulate(&mut llh, b'G', b'A', b'G', 30, &lut);
+        accumulate(&mut llh, b'A', b'A', b'G', 30, &lut, 1.0);
+        accumulate(&mut llh, b'G', b'A', b'G', 30, &lut, 1.0);
         assert!(llh[1] > llh[0] && llh[1] > llh[2], "A+G: het wins, got {:?}", llh);
     }
 }

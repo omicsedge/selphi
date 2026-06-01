@@ -200,12 +200,15 @@ pub fn run_lcwgs_bam(
     selphi_info!("  lcWGS-BAM: {} BAM(s), chrom {}, {} panel sites ({} SNPs, {} indels) to impute",
         bam_paths.len(), chrom, n_shared, n_snp, n_indel);
 
-    // Indel sites are scored by local read-vs-haplotype realignment (pair-HMM),
-    // which needs the reference FASTA to build the local haplotypes. Built once,
-    // shared across samples. Without --reference (or if disabled) indels stay flat
-    // and are imputed from the panel/LD. Gated by LCWGS_NO_INDEL_REALIGN.
-    let disable_indel = std::env::var("LCWGS_NO_INDEL_REALIGN").is_ok();
-    let indel_model = if n_indel > 0 && !disable_indel {
+    // Indel sites: by DEFAULT left flat (imputed from the haplotype scaffold/LD),
+    // matching GLIMPSE2's default. At low coverage the per-read indel genotype
+    // likelihoods are miscalibrated, and injecting them into the joint HMM
+    // measurably HURTS neighbouring-SNP accuracy (chr1 30-45Mb 1x downsampling
+    // benchmark: SNP r² 0.960 with indels flat vs 0.950 with read-based indel
+    // GLs). Opt in with LCWGS_INDEL_REALIGN=1 (needs --reference); the read-vs-
+    // haplotype pair-HMM is then used to score indels (see `super::indel_realign`).
+    let enable_indel = std::env::var("LCWGS_INDEL_REALIGN").is_ok();
+    let indel_model = if n_indel > 0 && enable_indel {
         match reference {
             Some(refp) => {
                 let inputs: Vec<super::indel_realign::IndelInput> = (0..n_shared)
@@ -221,15 +224,18 @@ pub fn run_lcwgs_bam(
                     })
                     .collect();
                 let m = super::indel_realign::IndelModel::build(refp, &chrom, &inputs)?;
-                selphi_info!("  lcWGS-BAM: indel realignment ON for {} indel sites", m.n_sites());
+                selphi_info!("  lcWGS-BAM: indel realignment ON (opt-in) for {} indel sites", m.n_sites());
                 Some(m)
             }
             None => {
-                selphi_info!("  lcWGS-BAM: {} indel sites left flat (no --reference for realignment)", n_indel);
+                selphi_info!("  lcWGS-BAM: LCWGS_INDEL_REALIGN set but no --reference; {} indels left flat", n_indel);
                 None
             }
         }
     } else {
+        if n_indel > 0 {
+            selphi_info!("  lcWGS-BAM: {} indel sites imputed flat from scaffold (default; LCWGS_INDEL_REALIGN=1 to score from reads)", n_indel);
+        }
         None
     };
 
