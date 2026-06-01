@@ -582,22 +582,10 @@ impl VariantReader {
         }
     }
 
-    fn n_file_samples(&self) -> usize {
-        match self {
-            VariantReader::Vcf { n_file_samples, .. } => *n_file_samples,
-            VariantReader::Bcf { n_file_samples, .. } => *n_file_samples,
-        }
-    }
-
     /// Read next biallelic variant. Returns (chrom, pos, ref, alt) and fills ds_buf with dosages.
     /// For BCF: if skip_genotypes=true, skips the individual data (fast position scan).
     fn next_record(&mut self, ds_buf: &mut Vec<f32>) -> Option<(Vec<u8>, i64, Vec<u8>, Vec<u8>)> {
         self.next_record_inner(ds_buf, false)
-    }
-
-    /// Read next record, optionally skipping genotype data (BCF only — for fast scanning).
-    fn next_record_skip_gt(&mut self, ds_buf: &mut Vec<f32>) -> Option<(Vec<u8>, i64, Vec<u8>, Vec<u8>)> {
-        self.next_record_inner(ds_buf, true)
     }
 
     fn next_record_inner(&mut self, ds_buf: &mut Vec<f32>, skip_gt: bool) -> Option<(Vec<u8>, i64, Vec<u8>, Vec<u8>)> {
@@ -1100,104 +1088,6 @@ pub fn evaluate(
 ) -> io::Result<(SiteAccumulator, SampleAccumulator, EvalCounts)> {
     let n_threads = rayon::current_num_threads().max(1);
     evaluate_parallel(imputed_path, truth_path, shared_samples, n_threads)
-}
-
-/// Single-threaded stream-merge (fallback). Supports VCF.gz and BCF.
-#[allow(unused_assignments)]
-pub fn evaluate_stream(
-    imputed_path: &Path,
-    truth_path: &Path,
-    shared_samples: &[String],
-) -> io::Result<(SiteAccumulator, SampleAccumulator, EvalCounts)> {
-    let n_samples = shared_samples.len();
-
-    let (mut imp_reader, imp_samples) = VariantReader::open(imputed_path)?;
-    let (mut truth_reader, truth_samples) = VariantReader::open(truth_path)?;
-
-    let imp_map: std::collections::HashMap<&str, usize> = imp_samples.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
-    let truth_map: std::collections::HashMap<&str, usize> = truth_samples.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
-    let imp_reindex: Vec<usize> = shared_samples.iter().map(|s| *imp_map.get(s.as_str()).expect("shared sample missing from imputed file")).collect();
-    let truth_reindex: Vec<usize> = shared_samples.iter().map(|s| *truth_map.get(s.as_str()).expect("shared sample missing from truth file")).collect();
-
-    // Set BCF sample filters for selective extraction (skip non-shared samples)
-    imp_reader.set_sample_filter(imp_reindex.clone());
-    truth_reader.set_sample_filter(truth_reindex.clone());
-
-    let mut site_acc = SiteAccumulator::new();
-    let mut sample_acc = SampleAccumulator::new(n_samples);
-    let mut n_matched = 0u64;
-    let mut n_imp_variants = 0u64;
-    let mut n_truth_variants = 0u64;
-    let mut chr_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-
-    let mut imp_ds_raw = Vec::with_capacity(imp_reader.n_file_samples());
-    let mut truth_ds_raw = Vec::with_capacity(truth_reader.n_file_samples());
-    let mut imp_ds = vec![0.0f32; n_samples];
-    let mut truth_ds = vec![0.0f32; n_samples];
-
-    let mut imp_rec = imp_reader.next_record(&mut imp_ds_raw);
-    if imp_rec.is_some() { n_imp_variants += 1; }
-    let mut truth_rec = truth_reader.next_record(&mut truth_ds_raw);
-    if truth_rec.is_some() { n_truth_variants += 1; }
-
-    while let (Some(imp), Some(truth)) = (&imp_rec, &truth_rec) {
-        let imp_pos = imp.1;
-        let truth_pos = truth.1;
-
-        if imp_pos < truth_pos {
-            imp_rec = imp_reader.next_record_skip_gt(&mut imp_ds_raw);
-            if imp_rec.is_some() { n_imp_variants += 1; }
-            continue;
-        }
-        if imp_pos > truth_pos {
-            truth_rec = truth_reader.next_record_skip_gt(&mut truth_ds_raw);
-            if truth_rec.is_some() { n_truth_variants += 1; }
-            continue;
-        }
-
-        // Same position — match by alleles (handles indel normalization + REF/ALT swaps)
-        let (matched, swapped) = match_alleles(&imp.2, &imp.3, &truth.2, &truth.3);
-        if matched {
-            chr_set.insert(String::from_utf8_lossy(&imp.0).to_string());
-            // ds_raw already contains only shared samples in order (via sample filter)
-            imp_ds[..n_samples].copy_from_slice(&imp_ds_raw[..n_samples]);
-            if swapped { for si in 0..n_samples { if imp_ds[si] >= 0.0 { imp_ds[si] = 2.0 - imp_ds[si]; } } }
-            truth_ds[..n_samples].copy_from_slice(&truth_ds_raw[..n_samples]);
-
-            // Compute MAF from truth
-            let mut gt_sum = 0.0f64;
-            let mut gt_n = 0u32;
-            for s in 0..n_samples {
-                if truth_ds[s] >= 0.0 { gt_sum += truth_ds[s] as f64; gt_n += 1; }
-            }
-            let maf = if gt_n > 0 {
-                let af = gt_sum / (gt_n as f64 * 2.0);
-                af.min(1.0 - af)
-            } else { 0.0 };
-
-            // Per-site R² and concordance
-            let (r2, conc) = site_r2(&imp_ds, &truth_ds, n_samples);
-            site_acc.add(maf, r2, conc);
-
-            // Per-sample accumulation
-            sample_acc.add_variant(&imp_ds, &truth_ds, maf);
-
-            n_matched += 1;
-        }
-
-        // Advance both
-        imp_rec = imp_reader.next_record(&mut imp_ds_raw);
-        if imp_rec.is_some() { n_imp_variants += 1; }
-        truth_rec = truth_reader.next_record(&mut truth_ds_raw);
-        if truth_rec.is_some() { n_truth_variants += 1; }
-    }
-
-    // Count remaining variants after merge loop ends
-    while { imp_rec = imp_reader.next_record(&mut imp_ds_raw); imp_rec.is_some() } { n_imp_variants += 1; }
-    while { truth_rec = truth_reader.next_record(&mut truth_ds_raw); truth_rec.is_some() } { n_truth_variants += 1; }
-
-    let chromosomes: Vec<String> = chr_set.into_iter().collect();
-    Ok((site_acc, sample_acc, EvalCounts { n_matched, n_imp_variants, n_truth_variants, chromosomes }))
 }
 
 /// Print MAF-binned summary table.
