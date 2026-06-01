@@ -26,6 +26,15 @@ pub struct Args {
     #[arg(long, alias = "target")]
     pub input: Option<String>,
 
+    /// lcWGS: input BAM file (one sample). Computes genotype likelihoods natively
+    /// at the reference-panel sites instead of reading a pre-computed PL VCF.
+    #[arg(long)]
+    pub bam: Option<String>,
+
+    /// lcWGS: text file listing one BAM path per line (multi-sample).
+    #[arg(long)]
+    pub bam_list: Option<String>,
+
     /// Path to genetic map (PLINK format)
     #[arg(long = "map")]
     pub map_path: Option<String>,

@@ -88,8 +88,23 @@ fn main() {
 
     // --- Low-coverage WGS imputation mode (GLIMPSE2-style) ---
     if args.lcwgs {
-        let input = args.input.as_deref()
-            .unwrap_or_else(|| { eprintln!("Error: --input is required for --lcwgs"); std::process::exit(1); });
+        // GL source: BAM(s) (native pileup) take precedence over a PL VCF.
+        let bam_paths: Vec<String> = if let Some(b) = args.bam.as_deref() {
+            vec![b.to_string()]
+        } else if let Some(list) = args.bam_list.as_deref() {
+            std::fs::read_to_string(list)
+                .unwrap_or_else(|e| { eprintln!("Error reading --bam-list {}: {}", list, e); std::process::exit(1); })
+                .lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
+        } else {
+            Vec::new()
+        };
+        let bam_mode = !bam_paths.is_empty();
+        let input = if bam_mode {
+            args.bam.as_deref().or(args.bam_list.as_deref()).unwrap_or("")
+        } else {
+            args.input.as_deref()
+                .unwrap_or_else(|| { eprintln!("Error: --input (PL VCF) or --bam/--bam-list is required for --lcwgs"); std::process::exit(1); })
+        };
         if args.refpanel.is_empty() {
             eprintln!("Error: --refpanel is required for --lcwgs");
             std::process::exit(1);
@@ -117,10 +132,13 @@ fn main() {
             .unwrap_or_else(|e| { eprintln!("Failed to open SRP: {}", e); std::process::exit(1); });
         selphi_info!("  SRP loaded: {} variants, {} haps", srp.metadata.n_variants, srp.metadata.n_haps);
 
-        // Run lcWGS pipeline
+        // Run lcWGS pipeline (BAM-native GL pileup, or pre-computed PL VCF)
         let params = selphi::lcwgs::LcwgsParams::default();
-        let result = selphi::lcwgs::pipeline::run_lcwgs(input, &srp, map, &params, args.threads)
-            .unwrap_or_else(|e| { eprintln!("lcWGS pipeline failed: {}", e); std::process::exit(1); });
+        let result = if bam_mode {
+            selphi::lcwgs::pipeline::run_lcwgs_bam(&bam_paths, &srp, map, &params, None, args.threads)
+        } else {
+            selphi::lcwgs::pipeline::run_lcwgs(input, &srp, map, &params, args.threads)
+        }.unwrap_or_else(|e| { eprintln!("lcWGS pipeline failed: {}", e); std::process::exit(1); });
 
         selphi_info!(
             "  lcwgs done: {} variants × {} samples in {:.1}s",
