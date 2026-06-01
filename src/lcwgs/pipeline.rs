@@ -199,7 +199,8 @@ pub fn run_lcwgs_bam(
         bam_paths.len(), chrom, n_shared, n_snp);
 
     let pp = super::bam_pileup::PileupParams::default();
-    let bamgl = super::bam_pileup::pileup_bams(bam_paths, &chrom, &pos, &ref_base, &alt_base, &is_snp, pp)?;
+    let region_bounds = region.map(|(_, s, e)| (s, e));
+    let bamgl = super::bam_pileup::pileup_bams(bam_paths, &chrom, &pos, &ref_base, &alt_base, &is_snp, region_bounds, pp)?;
     let n_samples = bamgl.sample_ids.len();
 
     // cM positions + variant identities (panel order).

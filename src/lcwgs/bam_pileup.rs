@@ -22,6 +22,7 @@
 use std::io;
 use rayon::prelude::*;
 use noodles_bam as bam;
+use noodles_core::{Position, Region};
 use noodles_sam::alignment::record::cigar::op::Kind;
 
 /// Per-sample GL pileup result, ready for the Gibbs engine.
@@ -77,6 +78,7 @@ impl PhredLut {
 /// `(pos_1based, ref_base, alt_base)` ascending by pos, with `is_snp` marking
 /// biallelic SNPs (non-SNP sites are left flat). Returns `gl3` over ALL sites
 /// (flat where no reads / not a SNP) in the given order, plus sample IDs.
+#[allow(clippy::too_many_arguments)]
 pub fn pileup_bams(
     bam_paths: &[String],
     chrom: &str,
@@ -84,6 +86,7 @@ pub fn pileup_bams(
     ref_base: &[u8],
     alt_base: &[u8],
     is_snp: &[bool],
+    region: Option<(i64, i64)>,
     params: PileupParams,
 ) -> io::Result<BamGl> {
     let n_var = pos.len();
@@ -95,7 +98,7 @@ pub fn pileup_bams(
     // [n_var*3] normalised GL block; assembled into the interleaved gl3 after.
     let per_sample: Vec<io::Result<(String, Vec<f32>)>> = bam_paths
         .par_iter()
-        .map(|path| pileup_one(path, chrom, pos, ref_base, alt_base, is_snp, &params, &lut))
+        .map(|path| pileup_one(path, chrom, pos, ref_base, alt_base, is_snp, region, &params, &lut))
         .collect();
 
     let mut sample_ids = Vec::with_capacity(n_samples);
@@ -128,6 +131,7 @@ fn pileup_one(
     ref_base: &[u8],
     alt_base: &[u8],
     is_snp: &[bool],
+    region: Option<(i64, i64)>,
     params: &PileupParams,
     lut: &PhredLut,
 ) -> io::Result<(String, Vec<f32>)> {
@@ -151,31 +155,31 @@ fn pileup_one(
     // Per-genotype log10-likelihood accumulators + read-depth (for cap).
     let mut ll = vec![[0.0f64; 3]; n_var];
     let mut depth = vec![0u32; n_var];
+    let last_pos = pos[n_var - 1];
 
     if let Some(target_rid) = target_rid {
-        let mut record = bam::Record::default();
-        while reader.read_record(&mut record)? != 0 {
-            // chromosome filter
+        // Shared per-record pileup: CIGAR-walk + GL accumulation. Used by both the
+        // whole-file streaming path and the indexed region-query path.
+        let mut process = |record: &bam::Record| {
             match record.reference_sequence_id() {
                 Some(Ok(rid)) if rid == target_rid => {}
-                _ => continue,
+                _ => return,
             }
-            // flag + mapq filters
-            if record.flags().bits() & FLAG_EXCLUDE != 0 { continue; }
+            if record.flags().bits() & FLAG_EXCLUDE != 0 { return; }
             let mapq = record.mapping_quality().map(|m| m.get()).unwrap_or(0);
-            if mapq < params.min_mapq { continue; }
+            if mapq < params.min_mapq { return; }
             let start = match record.alignment_start() {
                 Some(Ok(p)) => usize::from(p) as i64, // 1-based
-                _ => continue,
+                _ => return,
             };
             let seq = record.sequence();
             let qual = record.quality_scores();
             let qbytes = qual.as_bytes();
-            if qbytes.is_empty() { continue; } // no base qualities → can't score
+            if qbytes.is_empty() { return; } // no base qualities → can't score
 
             // First panel site at or after the read start (sites sorted asc).
             let mut si = pos.partition_point(|&p| p < start);
-            if si >= n_var || pos[si] > read_ref_end(&record, start) { continue; }
+            if si >= n_var || pos[si] > read_ref_end(record, start) { return; }
 
             // Walk CIGAR: refcur (1-based), qcur (0-based query index).
             let mut refcur = start;
@@ -186,7 +190,6 @@ fn pileup_one(
                 match op.kind() {
                     Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
                         let ref_end = refcur + len as i64; // exclusive
-                        // advance si to first site >= refcur (it already is >= start)
                         while si < n_var && pos[si] < refcur { si += 1; }
                         while si < n_var && pos[si] < ref_end {
                             let v = si;
@@ -209,7 +212,30 @@ fn pileup_one(
                     Kind::Insertion | Kind::SoftClip => { qcur += len; }
                     Kind::HardClip | Kind::Pad => {}
                 }
-                if refcur > pos[n_var - 1] { break; }
+                if refcur > last_pos { break; }
+            }
+        };
+
+        // Region mode with a .bai index → fetch only the region's reads (avoids
+        // reading the whole file). Otherwise stream all records (zero-alloc reuse).
+        let bai_path = format!("{path}.bai");
+        let region_query = region.filter(|_| std::path::Path::new(&bai_path).exists());
+        if let Some((rs, re)) = region_query {
+            let index = bam::bai::fs::read(&bai_path)?;
+            let start = Position::try_from(rs.max(1) as usize)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            let end = Position::try_from(re.max(1) as usize)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            let reg = Region::new(chrom.as_bytes().to_vec(), start..=end);
+            let mut q = reader.query(&header, &index, &reg)?;
+            let mut record = bam::Record::default();
+            while q.read_record(&mut record)? != 0 {
+                process(&record);
+            }
+        } else {
+            let mut record = bam::Record::default();
+            while reader.read_record(&mut record)? != 0 {
+                process(&record);
             }
         }
     }

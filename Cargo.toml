@@ -23,6 +23,7 @@ noodles-bcf = "0.78"
 noodles-vcf = "0.82"
 noodles-bam = "0.90"
 noodles-sam = "0.85"
+noodles-core = "0.20"
 lazy_static = "1.5"
 rand = { version = "0.8", features = ["small_rng"] }
 rand_mt = "4"
