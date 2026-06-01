@@ -69,6 +69,7 @@ fn run_one_hap<F: Fn(usize) -> usize>(
     gl3: &[f32], ref_bm: &HaplotypeBitmatrix, cm: &[f64], params: &LcwgsParams,
     recomb_ref: Option<&[f32]>, use_scaffold: bool, common_idx: &[usize],
     n_var: usize, n_samples: usize,
+    commit_thr: Option<f32>,
 ) -> (Vec<f32>, Vec<u8>) {
     let mut hap_hl = vec![0.0f32; n_var * 2];
     for v in 0..n_var {
@@ -94,16 +95,28 @@ fn run_one_hap<F: Fn(usize) -> usize>(
         run_forward_backward(&hap_hl, cond, ref_bm, cm, params, recomb_ref).dosage
     };
     let mut sampled = vec![0u8; n_var];
-    for v in 0..n_var {
-        let mut x = seed
-            .wrapping_add((it as u64).wrapping_mul(0x100_0000_01b3))
-            .wrapping_add((h as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
-            .wrapping_add((v as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
-        x ^= x >> 30; x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        x ^= x >> 27; x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
-        x ^= x >> 31;
-        let u = (x >> 40) as f32 / (1u64 << 24) as f32; // uniform [0,1)
-        sampled[v] = if u < dose[v] { 1 } else { 0 };
+    if let Some(thr) = commit_thr {
+        // Annealed dose-commitment (deterministic): the conditioning state is
+        // the committed allele dose>thr, not a stochastic draw. With thr annealed
+        // high→low across iterations, a confident carrier commits early, the PBWT
+        // + rare-carrier feedback then lock its carriers in, and the posterior
+        // runs up to 1.0 — driving the commitment the stochastic scan reaches only
+        // ~30% of the time. Less sampling noise than GLIMPSE2's hard Gibbs.
+        for v in 0..n_var {
+            sampled[v] = if dose[v] > thr { 1 } else { 0 };
+        }
+    } else {
+        for v in 0..n_var {
+            let mut x = seed
+                .wrapping_add((it as u64).wrapping_mul(0x100_0000_01b3))
+                .wrapping_add((h as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                .wrapping_add((v as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+            x ^= x >> 30; x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x ^= x >> 27; x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+            x ^= x >> 31;
+            let u = (x >> 40) as f32 / (1u64 << 24) as f32; // uniform [0,1)
+            sampled[v] = if u < dose[v] { 1 } else { 0 };
+        }
     }
     (dose, sampled)
 }
@@ -390,6 +403,24 @@ pub fn run_gibbs(
     // conditioned on hap0's freshly-sampled allele within the same iteration,
     // coupling the two haps via the per-genotype GL. Default off = snapshot scan.
     let seq_diploid = std::env::var("LCWGS_SEQ_DIPLOID").is_ok();
+    // Annealed dose-commitment (LCWGS_COMMIT=1): replace stochastic hap sampling
+    // with a deterministic commit dose>thr, thr annealed from COMMIT_HI (early,
+    // only confident sites commit) to COMMIT_LO (late). Drives true carriers to
+    // commit + reinforce, recovering the diffuse ~0.3 doses the stochastic scan
+    // leaves uncommitted. Burn-in commits; main iterations sample softly so the
+    // averaged output dose stays calibrated.
+    let commit = std::env::var("LCWGS_COMMIT").is_ok();
+    let commit_hi = std::env::var("LCWGS_COMMIT_HI").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.6);
+    let commit_lo = std::env::var("LCWGS_COMMIT_LO").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.3);
+    // Rare-carrier RESCUE (LCWGS_RARE_RESCUE=1): after convergence, lift the
+    // diffuse ALT prob of haps that share a long, uniquely-long LOCAL IBD segment
+    // with a rare-allele carrier (rare_ibs::rare_carrier_rescue), via
+    // a_final = max(a_hmm, boost). Targets exactly the missed-carrier cases
+    // without touching well-called sites / non-carriers.
+    let rescue = std::env::var("LCWGS_RARE_RESCUE").is_ok();
+    let rescue_theta = std::env::var("LCWGS_RESCUE_THETA").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.3);
+    let rescue_margin = std::env::var("LCWGS_RESCUE_MARGIN").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.2);
+    let mut acc_hap_dose: Vec<f64> = if rescue { vec![0.0; n_var * n_target_haps] } else { Vec::new() };
     let matchext = std::env::var("LCWGS_MATCHEXT").is_ok();
     let mx_modulo = std::env::var("LCWGS_MATCHEXT_MODULO").ok()
         .and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.1);
@@ -487,6 +518,14 @@ pub fn run_gibbs(
         let prev_alleles = hap_alleles.clone();
         if let Some(t) = t0 { t_clone += t.elapsed().as_secs_f64(); }
 
+        // Annealed commit threshold for this iteration: commit only during
+        // burn-in (so main-iteration output stays the soft averaged posterior),
+        // annealing thr from commit_hi (it=0) to commit_lo (end of burn-in).
+        let commit_thr: Option<f32> = if commit && it < n_burnin {
+            let frac = if n_burnin > 1 { it as f32 / (n_burnin - 1) as f32 } else { 0.0 };
+            Some(commit_hi + (commit_lo - commit_hi) * frac)
+        } else { None };
+
         let t0 = if timing { Some(std::time::Instant::now()) } else { None };
         let results: Vec<(usize, Vec<f32>, Vec<u8>)> = if seq_diploid {
             // SEQUENTIAL diploid scan (GLIMPSE2 phase_individual): per sample,
@@ -504,13 +543,13 @@ pub fn run_gibbs(
                     h0, s, it, seed,
                     |v| prev_alleles[v * n_target_haps + h1] as usize,
                     &cond_per_hap[h0], gl3, ref_bm, cm, params, recomb_ref,
-                    use_scaffold, &common_idx, n_var, n_samples);
+                    use_scaffold, &common_idx, n_var, n_samples, commit_thr);
                 // hap1 ← partner = hap0's FRESH allele (this iteration).
                 let (dose1, samp1) = run_one_hap(
                     h1, s, it, seed,
                     |v| samp0[v] as usize,
                     &cond_per_hap[h1], gl3, ref_bm, cm, params, recomb_ref,
-                    use_scaffold, &common_idx, n_var, n_samples);
+                    use_scaffold, &common_idx, n_var, n_samples, commit_thr);
                 [(h0, dose0, samp0), (h1, dose1, samp1)]
             }).collect()
         } else {
@@ -523,7 +562,7 @@ pub fn run_gibbs(
                     h, s, it, seed,
                     |v| prev_alleles[v * n_target_haps + partner] as usize,
                     &cond_per_hap[h], gl3, ref_bm, cm, params, recomb_ref,
-                    use_scaffold, &common_idx, n_var, n_samples);
+                    use_scaffold, &common_idx, n_var, n_samples, commit_thr);
                 (h, dose, sampled)
             }).collect()
         };
@@ -556,6 +595,12 @@ pub fn run_gibbs(
                     acc_dosage[v * n_samples + s] += a0 + a1;          // E[ALT]
                 }
             }
+            if rescue {
+                for h in 0..n_target_haps {
+                    let d = hap_dose[h].as_ref().unwrap();
+                    for v in 0..n_var { acc_hap_dose[v * n_target_haps + h] += d[v] as f64; }
+                }
+            }
             n_acc += 1;
         }
         if let Some(t) = t0 { t_wb += t.elapsed().as_secs_f64(); }
@@ -573,8 +618,33 @@ pub fn run_gibbs(
 
     // Average across main iterations.
     let inv_n = if n_acc > 0 { 1.0 / n_acc as f64 } else { 1.0 };
-    let dosage: Vec<f32> = acc_dosage.iter().map(|&d| (d * inv_n) as f32).collect();
-    let gp: Vec<f32> = acc_gp.iter().map(|&g| (g * inv_n) as f32).collect();
+    let mut dosage: Vec<f32> = acc_dosage.iter().map(|&d| (d * inv_n) as f32).collect();
+    let mut gp: Vec<f32> = acc_gp.iter().map(|&g| (g * inv_n) as f32).collect();
+
+    // Rare-carrier RESCUE: lift the per-hap ALT prob of diffuse missed carriers
+    // using the local IBD match to carriers on the converged sampled haplotypes,
+    // a_final = max(a_hmm_avg, boost). Recombine the two haps into diploid dose+GP
+    // at rare sites only. Targets the residual 0.5-1% gap without touching the
+    // common/intermediate bins or the false-positive rate.
+    if rescue && !rare_sites.is_empty() {
+        let depth = std::env::var("LCWGS_RESCUE_DEPTH").ok()
+            .and_then(|s| s.parse::<usize>().ok()).unwrap_or(params.pbwt_depth);
+        let boost = super::rare_ibs::rare_carrier_rescue(
+            &hap_alleles, ref_bm, cm, &rare_sites, n_target_haps, depth, rescue_theta, rescue_margin);
+        for (ri, (v, _)) in rare_sites.iter().enumerate() {
+            for s in 0..n_samples {
+                let a0 = (acc_hap_dose[*v * n_target_haps + 2*s] * inv_n) as f32;
+                let a1 = (acc_hap_dose[*v * n_target_haps + 2*s + 1] * inv_n) as f32;
+                let a0 = a0.max(boost[ri * n_target_haps + 2*s]) as f64;
+                let a1 = a1.max(boost[ri * n_target_haps + 2*s + 1]) as f64;
+                dosage[*v * n_samples + s] = (a0 + a1) as f32;
+                let go = (*v * n_samples + s) * 3;
+                gp[go]     = ((1.0 - a0) * (1.0 - a1)) as f32;
+                gp[go + 1] = (a0 * (1.0 - a1) + (1.0 - a0) * a1) as f32;
+                gp[go + 2] = (a0 * a1) as f32;
+            }
+        }
+    }
 
     // PHASE-0: expose the final base conditioning set for the carrier-presence
     // diagnostic (cond_cache holds the last refresh's selection output).

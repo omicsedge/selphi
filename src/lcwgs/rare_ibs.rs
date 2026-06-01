@@ -252,6 +252,144 @@ pub fn select_conditioning_haps_matchext(
     out
 }
 
+/// Per-(rare-site, target-hap) ALT-probability BOOST from local IBD match to
+/// carriers, for RESCUING the diffuse-dose missed carriers (NOT replacing the
+/// HMM dose — replacement was measured catastrophic). For each rare site, via a
+/// dense bidirectional PBWT over the converged sampled haplotypes, measure each
+/// target hap's longest LOCAL IBD (cM, up+down) to the nearest CARRIER vs the
+/// nearest NON-carrier. When the carrier match is both long AND uniquely longer
+/// than the ref match (margin), the hap shares a rare-lineage segment with a
+/// carrier → boost its ALT prob. The caller applies `a_final = max(a_hmm, boost)`
+/// so only diffuse true carriers are lifted; well-called sites and non-carriers
+/// (carrier match ≤ ref match → boost 0) are untouched, preserving the low
+/// false-positive rate.
+///
+/// Returns `boost[rare_idx * n_target_haps + h]` ∈ [0,1] (0 = no rescue).
+#[allow(clippy::too_many_arguments)]
+pub fn rare_carrier_rescue(
+    hap_alleles: &[u8],
+    ref_bm: &HaplotypeBitmatrix,
+    cm: &[f64],
+    rare_sites: &[(usize, Vec<u32>)],
+    n_target_haps: usize,
+    depth: usize,
+    theta_cm: f32,
+    margin_cm: f32,
+) -> Vec<f32> {
+    let n_var = ref_bm.n_sites;
+    let n_ref = ref_bm.n_haps;
+    let n_haps_total = n_target_haps + n_ref;
+    let n_rare = rare_sites.len();
+    // longest local IBD (cM) to nearest carrier / non-carrier, accumulated
+    // bidirectionally (forward = upstream, backward = downstream).
+    let mut lc = vec![0.0f32; n_rare * n_target_haps]; // carrier
+    let mut lr = vec![0.0f32; n_rare * n_target_haps]; // ref
+    if n_rare == 0 { return Vec::new(); }
+
+    let words = n_ref.div_ceil(64);
+    let mut var_to_rare = vec![-1i32; n_var];
+    let mut carrier_bits: Vec<Vec<u64>> = Vec::with_capacity(n_rare);
+    for (ri, (v, carriers)) in rare_sites.iter().enumerate() {
+        var_to_rare[*v] = ri as i32;
+        let mut bs = vec![0u64; words];
+        for &c in carriers { bs[(c as usize) >> 6] |= 1u64 << ((c as usize) & 63); }
+        carrier_bits.push(bs);
+    }
+    let is_carrier = |ri: usize, rh: usize| (carrier_bits[ri][rh >> 6] >> (rh & 63)) & 1 != 0;
+
+    let mut rec = vec![0i32; n_haps_total];
+    let fill = |rec: &mut [i32], v: usize| {
+        let base = v * n_target_haps;
+        for h in 0..n_target_haps { rec[h] = hap_alleles[base + h] as i32; }
+        for rh in 0..n_ref { rec[n_target_haps + rh] = ref_bm.get(v, rh) as i32; }
+    };
+    // record: at rare site v, for each target hap, find nearest carrier &
+    // non-carrier among PBWT neighbours, accumulate the local match length.
+    // `fwd`: divergence is an upstream match-start (≤v) → len = cm[v]-cm[start].
+    // `!fwd`: divergence is a downstream match-end (≥v) → len = cm[end]-cm[v].
+    let record = |ri: usize, v: usize, prefix: &[i32], div: &[i32], inv: &[i32],
+                  fwd: bool, lc: &mut [f32], lr: &mut [f32]| {
+        let cmv = cm[v];
+        for h in 0..n_target_haps {
+            let pos = inv[h] as i32;
+            let (mut got_c, mut got_r) = (false, false);
+            // walk down
+            let mut run = if fwd { i32::MIN } else { i32::MAX };
+            let mut p = pos + 1;
+            let mut steps = 0;
+            while p < n_haps_total as i32 && !(got_c && got_r) && steps < (depth as i32 + 4) {
+                if fwd { if div[p as usize] > run { run = div[p as usize]; } }
+                else if div[p as usize] < run { run = div[p as usize]; }
+                let hap = prefix[p as usize] as usize;
+                if hap >= n_target_haps {
+                    let rh = hap - n_target_haps;
+                    let ml = if fwd { (cmv - cm[run.max(0).min(v as i32) as usize]).max(0.0) as f32 }
+                             else { (cm[run.min((n_var-1) as i32).max(v as i32) as usize] - cmv).max(0.0) as f32 };
+                    if is_carrier(ri, rh) { if !got_c { lc[ri*n_target_haps+h] += ml; got_c = true; } }
+                    else if !got_r { lr[ri*n_target_haps+h] += ml; got_r = true; }
+                }
+                p += 1; steps += 1;
+            }
+            // walk up
+            let mut run = if fwd { i32::MIN } else { i32::MAX };
+            let mut q = pos;
+            let (mut gc2, mut gr2) = (false, false);
+            steps = 0;
+            while q > 0 && !(gc2 && gr2) && steps < (depth as i32 + 4) {
+                if fwd { if div[q as usize] > run { run = div[q as usize]; } }
+                else if div[q as usize] < run { run = div[q as usize]; }
+                let hap = prefix[(q-1) as usize] as usize;
+                if hap >= n_target_haps {
+                    let rh = hap - n_target_haps;
+                    let ml = if fwd { (cmv - cm[run.max(0).min(v as i32) as usize]).max(0.0) as f32 }
+                             else { (cm[run.min((n_var-1) as i32).max(v as i32) as usize] - cmv).max(0.0) as f32 };
+                    // take the max over the two directions of the walk for each class
+                    if is_carrier(ri, rh) { if !gc2 { let e=&mut lc[ri*n_target_haps+h]; *e=e.max(ml); gc2=true; } }
+                    else if !gr2 { let e=&mut lr[ri*n_target_haps+h]; *e=e.max(ml); gr2=true; }
+                }
+                q -= 1; steps += 1;
+            }
+        }
+    };
+
+    // forward sweep
+    {
+        let mut pbwt = PbwtDivUpdater::new(n_haps_total);
+        let mut prefix: Vec<i32> = (0..n_haps_total as i32).collect();
+        let mut div = vec![0i32; n_haps_total];
+        let mut inv = vec![0i32; n_haps_total];
+        for v in 0..n_var {
+            fill(&mut rec, v);
+            pbwt.fwd_update(&rec, 2, v as i32, &mut prefix, &mut div);
+            let ri = var_to_rare[v];
+            if ri >= 0 { for (i,&pp) in prefix.iter().enumerate(){inv[pp as usize]=i as i32;} record(ri as usize, v, &prefix, &div, &inv, true, &mut lc, &mut lr); }
+        }
+    }
+    // backward sweep
+    {
+        let mut pbwt = PbwtDivUpdater::new(n_haps_total);
+        let mut prefix: Vec<i32> = (0..n_haps_total as i32).collect();
+        let mut div = vec![(n_var as i32)-1; n_haps_total];
+        let mut inv = vec![0i32; n_haps_total];
+        for v in (0..n_var).rev() {
+            fill(&mut rec, v);
+            pbwt.bwd_update(&rec, 2, v as i32, &mut prefix, &mut div);
+            let ri = var_to_rare[v];
+            if ri >= 0 { for (i,&pp) in prefix.iter().enumerate(){inv[pp as usize]=i as i32;} record(ri as usize, v, &prefix, &div, &inv, false, &mut lc, &mut lr); }
+        }
+    }
+
+    // boost = sigmoid((L_carrier - L_ref - margin)/theta), only when carrier
+    // match strictly exceeds ref match by the margin (else 0 = no rescue).
+    let inv_theta = 1.0f32 / theta_cm.max(1e-6);
+    let mut boost = vec![0.0f32; n_rare * n_target_haps];
+    for i in 0..n_rare * n_target_haps {
+        let d = lc[i] - lr[i] - margin_cm;
+        boost[i] = if d > 0.0 { 1.0 / (1.0 + (-d * inv_theta).exp()) } else { 0.0 };
+    }
+    boost
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
