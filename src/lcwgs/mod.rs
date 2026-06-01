@@ -62,21 +62,6 @@ pub mod iterate;
 pub mod pipeline;
 pub mod output;
 
-/// Top-level lcWGS input passed to the pipeline.
-pub struct LcwgsInput<'a> {
-    /// Per-hap likelihoods packed as `hl[v * n_target_haps * 2 + 2*s + a]`
-    /// where v is variant index, s is sample index, a ∈ {0,1} is hap allele.
-    /// `hl[..., a]` = `P(reads at site v in sample s | hap allele = a)`,
-    /// normalized so the two values for each hap sum to 1.
-    pub hl: &'a [f32],
-    /// Number of target samples (the panel of individuals being imputed).
-    pub n_samples: usize,
-    /// Number of shared variants between target and reference panel.
-    pub n_variants: usize,
-    /// Sample IDs for output writing (length n_samples).
-    pub sample_ids: Vec<String>,
-}
-
 /// Default GLIMPSE2 algorithm parameters (Rubinacci & Delaneau 2023).
 pub struct LcwgsParams {
     /// Maximum number of reference haplotypes selected per target hap via

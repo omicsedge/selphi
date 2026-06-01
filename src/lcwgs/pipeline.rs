@@ -97,19 +97,7 @@ pub fn run_lcwgs(
 
     // --- 3. (ref bitmatrix is now extracted per-chunk from SRP — see step 6) ---
 
-    // --- 4. Build cM positions for shared variants from the genetic map ---
-    let (map_bp, map_cm) = genmap::load_genetic_map_raw(std::path::Path::new(map_path))?;
-    let cm: Vec<f64> = wgs_idx.iter().map(|&wi| {
-        genmap::interpolate_cm_extrapolate(&map_bp, &map_cm, srp.variants[wi].pos)
-    }).collect();
-
-    // Per-shared-variant identity in dosage-row order (panel genomic order).
-    let variants: Vec<(String, i64, String, String)> = wgs_idx.iter().map(|&wi| {
-        let v = &srp.variants[wi];
-        (v.chr.clone(), v.pos, v.ref_allele.clone(), v.alt_allele.clone())
-    }).collect();
-
-    // --- 5. Re-layout gl3[] from target-VCF variant order to shared-panel order ---
+    // --- 4. Re-layout gl3[] from target-VCF variant order to shared-panel order ---
     // gl3_input is laid out per target variant (VCF order); we need it in
     // panel-shared variant order. 3 genotype probs per (sample, variant).
     let mut gl3_shared = vec![1.0f32 / 3.0; n_shared * n_samples * 3];
@@ -121,18 +109,37 @@ pub fn run_lcwgs(
     }
     drop(gl3_input);
 
-    // --- 6. Chunked Gibbs imputation ---
-    // A single conditioning set of K haps cannot capture the target's mosaic
-    // across a whole chromosome (the target copies hundreds of distinct ref
-    // haps along 50 cM). GLIMPSE2 solves this by chunking: each ~few-cM chunk
-    // gets its OWN PBWT-selected conditioning set. We chunk by cM with a
-    // buffer region on each side (only the core region's dosage is kept), then
-    // ligate. This fixes accuracy AND bounds memory: the reference bitmatrix is
-    // extracted from the SRP PER CHUNK (never the whole chromosome in RAM),
-    // which beats GLIMPSE2's memory profile.
-    // Diagnostic: emit the raw GL-implied dosage (E[ALT] = g1 + 2*g2) with NO
-    // imputation. Correlation of this with truth tells us whether gl3_shared
-    // is correctly mapped to variants (independent of the HMM).
+    // --- 5. cM map + chunked Gibbs imputation (shared with the BAM path) ---
+    impute_from_gl3(srp, &wgs_idx, gl3_shared, n_samples, sample_ids, map_path, params)
+}
+
+/// Shared imputation tail for both lcWGS paths (VCF-PL and BAM): given `gl3` in
+/// panel-shared variant order (`gl3[v*n_samples*3 + 3*s + g]`), build the cM map
+/// + variant identities, run the chunked Gibbs imputation, and assemble the
+/// output. Chunking gives each ~few-cM window its own PBWT-selected conditioning
+/// set (a single set cannot capture the target's chromosome-wide mosaic) and
+/// bounds memory: the reference bitmatrix is extracted from the SRP per chunk,
+/// never the whole chromosome at once. `LCWGS_RAW_GL` returns the un-imputed
+/// GL-implied dosage (`E[ALT]=g1+2·g2`) for diagnostics.
+fn impute_from_gl3(
+    srp: &SrpReader,
+    wgs_idx: &[usize],
+    gl3_shared: Vec<f32>,
+    n_samples: usize,
+    sample_ids: Vec<String>,
+    map_path: &str,
+    params: &LcwgsParams,
+) -> std::io::Result<LcwgsOutput> {
+    let n_shared = wgs_idx.len();
+    let (map_bp, map_cm) = genmap::load_genetic_map_raw(std::path::Path::new(map_path))?;
+    let cm: Vec<f64> = wgs_idx.iter().map(|&wi| {
+        genmap::interpolate_cm_extrapolate(&map_bp, &map_cm, srp.variants[wi].pos)
+    }).collect();
+    let variants: Vec<(String, i64, String, String)> = wgs_idx.iter().map(|&wi| {
+        let v = &srp.variants[wi];
+        (v.chr.clone(), v.pos, v.ref_allele.clone(), v.alt_allele.clone())
+    }).collect();
+
     if std::env::var("LCWGS_RAW_GL").is_ok() {
         let mut raw = vec![0.0f32; n_shared * n_samples];
         for v in 0..n_shared {
@@ -145,15 +152,8 @@ pub fn run_lcwgs(
         return Ok(LcwgsOutput { dosage: raw, gp, n_variants: n_shared, sample_ids, variants });
     }
 
-    let (dosage, gp) = run_chunked_gibbs(&gl3_shared, srp, &wgs_idx, &cm, n_samples, n_shared, params);
-
-    Ok(LcwgsOutput {
-        dosage,
-        gp,
-        n_variants: n_shared,
-        sample_ids,
-        variants,
-    })
+    let (dosage, gp) = run_chunked_gibbs(&gl3_shared, srp, wgs_idx, &cm, n_samples, n_shared, params);
+    Ok(LcwgsOutput { dosage, gp, n_variants: n_shared, sample_ids, variants })
 }
 
 /// lcWGS pipeline starting from BAM(s): compute genotype likelihoods natively
@@ -172,12 +172,19 @@ pub fn run_lcwgs_bam(
     reference: Option<&str>,
     _n_threads: usize,
 ) -> std::io::Result<LcwgsOutput> {
-    // Panel variant indices to impute (region subset, else all).
+    // Panel variant indices to impute (region subset, else all). Chromosome
+    // match is `chr`-prefix tolerant (panel `1`/`22` ↔ region `chr1`/`chr22`),
+    // matching the rest of the pipeline (resolve_contig, intersect_variants);
+    // an exact `==` here silently yielded 0 variants on bare-named panels.
+    let strip_chr = |c: &str| c.strip_prefix("chr").unwrap_or(c).to_string();
     let wgs_idx: Vec<usize> = match region {
-        Some((c, s, e)) => (0..srp.variants.len()).filter(|&i| {
-            let v = &srp.variants[i];
-            v.chr == c && v.pos >= s && v.pos <= e
-        }).collect(),
+        Some((c, s, e)) => {
+            let want = strip_chr(c);
+            (0..srp.variants.len()).filter(|&i| {
+                let v = &srp.variants[i];
+                strip_chr(&v.chr) == want && v.pos >= s && v.pos <= e
+            }).collect()
+        }
         None => (0..srp.variants.len()).collect(),
     };
     let n_shared = wgs_idx.len();
@@ -244,19 +251,8 @@ pub fn run_lcwgs_bam(
     let bamgl = super::bam_pileup::pileup_bams(bam_paths, &chrom, &pos, &ref_base, &alt_base, &is_snp, region_bounds, reference, indel_model.as_ref(), pp)?;
     let n_samples = bamgl.sample_ids.len();
 
-    // cM positions + variant identities (panel order).
-    let (map_bp, map_cm) = genmap::load_genetic_map_raw(std::path::Path::new(map_path))?;
-    let cm: Vec<f64> = wgs_idx.iter().map(|&wi| {
-        genmap::interpolate_cm_extrapolate(&map_bp, &map_cm, srp.variants[wi].pos)
-    }).collect();
-    let variants: Vec<(String, i64, String, String)> = wgs_idx.iter().map(|&wi| {
-        let v = &srp.variants[wi];
-        (v.chr.clone(), v.pos, v.ref_allele.clone(), v.alt_allele.clone())
-    }).collect();
-
-    let (dosage, gp) = run_chunked_gibbs(&bamgl.gl3, srp, &wgs_idx, &cm, n_samples, n_shared, params);
-
-    Ok(LcwgsOutput { dosage, gp, n_variants: n_shared, sample_ids: bamgl.sample_ids, variants })
+    // bamgl.gl3 is already in panel-shared order → shared imputation tail.
+    impute_from_gl3(srp, &wgs_idx, bamgl.gl3, n_samples, bamgl.sample_ids, map_path, params)
 }
 
 /// Chunk the chromosome by cM and run the Gibbs per chunk with its own

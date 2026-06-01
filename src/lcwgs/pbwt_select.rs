@@ -412,37 +412,6 @@ pub fn augment_rare_carriers(
     out
 }
 
-/// Helper: build per-hap MAP allele array from per-hap likelihoods.
-/// `hap_alleles[v * n_target_haps + h]` = 1 if `hl[v*n*2 + 2*s + a]` of
-/// the per-hap likelihood is larger at allele 1, else 0.
-/// This is used by the FIRST Gibbs iteration; subsequent iterations
-/// derive hard calls from the previous round's dosage.
-#[allow(dead_code)]
-pub fn map_alleles_from_hl(hl: &[f32], n_samples: usize, n_var: usize) -> Vec<u8> {
-    let n_target_haps = n_samples * 2;
-    debug_assert_eq!(hl.len(), n_var * n_target_haps);
-    let mut out = vec![0u8; n_var * n_target_haps];
-    // Two haps of one sample share the same per-hap HL (the marginalization
-    // is identical), so they get the same MAP call in iteration 0. Later
-    // iterations supply per-hap dosages that differentiate them.
-    // hl layout from pl_reader: hl[v * n_samples * 2 + 2*s + a]
-    // (n_target_haps = n_samples * 2). The two haps of a sample share the
-    // same per-hap likelihood after marginalization, so MAP(hap0) == MAP(hap1)
-    // on iteration 0. The Gibbs loop differentiates per-hap on later rounds
-    // by feeding per-hap dosages back as hard calls instead of calling here.
-    for v in 0..n_var {
-        let off = v * n_target_haps;
-        let hl_off = v * n_samples * 2;
-        for h in 0..n_target_haps {
-            let s = h / 2;
-            let l0 = hl[hl_off + 2 * s];
-            let l1 = hl[hl_off + 2 * s + 1];
-            out[off + h] = if l1 > l0 { 1 } else { 0 };
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
