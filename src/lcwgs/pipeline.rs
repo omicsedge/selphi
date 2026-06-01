@@ -169,6 +169,7 @@ pub fn run_lcwgs_bam(
     map_path: &str,
     params: &LcwgsParams,
     region: Option<(&str, i64, i64)>,
+    reference: Option<&str>,
     _n_threads: usize,
 ) -> std::io::Result<LcwgsOutput> {
     // Panel variant indices to impute (region subset, else all).
@@ -200,7 +201,7 @@ pub fn run_lcwgs_bam(
 
     let pp = super::bam_pileup::PileupParams::default();
     let region_bounds = region.map(|(_, s, e)| (s, e));
-    let bamgl = super::bam_pileup::pileup_bams(bam_paths, &chrom, &pos, &ref_base, &alt_base, &is_snp, region_bounds, pp)?;
+    let bamgl = super::bam_pileup::pileup_bams(bam_paths, &chrom, &pos, &ref_base, &alt_base, &is_snp, region_bounds, reference, pp)?;
     let n_samples = bamgl.sample_ids.len();
 
     // cM positions + variant identities (panel order).

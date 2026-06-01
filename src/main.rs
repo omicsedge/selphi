@@ -148,7 +148,7 @@ fn main() {
         });
         let result = if bam_mode {
             let reg = bam_region.as_ref().map(|(c, s, e)| (c.as_str(), *s, *e));
-            selphi::lcwgs::pipeline::run_lcwgs_bam(&bam_paths, &srp, map, &params, reg, args.threads)
+            selphi::lcwgs::pipeline::run_lcwgs_bam(&bam_paths, &srp, map, &params, reg, args.reference.as_deref(), args.threads)
         } else {
             selphi::lcwgs::pipeline::run_lcwgs(input, &srp, map, &params, args.threads)
         }.unwrap_or_else(|e| { eprintln!("lcWGS pipeline failed: {}", e); std::process::exit(1); });

@@ -31,9 +31,14 @@ pub struct Args {
     #[arg(long)]
     pub bam: Option<String>,
 
-    /// lcWGS: text file listing one BAM path per line (multi-sample).
+    /// lcWGS: text file listing one BAM/CRAM path per line (multi-sample).
     #[arg(long)]
     pub bam_list: Option<String>,
+
+    /// lcWGS: reference FASTA (with .fai) for decoding CRAM read bases.
+    /// Required when --bam/--bam-list points at .cram input; ignored for BAM.
+    #[arg(long, alias = "fasta")]
+    pub reference: Option<String>,
 
     /// Path to genetic map (PLINK format)
     #[arg(long = "map")]
