@@ -297,8 +297,11 @@ fn merge_one_record(
     // INFO count is independent of --no-ap (that only drops the AP FORMAT
     // fields): chip = AF,AC,AN (3); imputed = AF,AC,AN,DR2,IMP (5). Must match
     // the non-batched encoder (bcf_encode declares 5) or htslib mis-parses.
-    let _ = no_ap;
     let new_n_info: u16 = if is_chip { 3 } else { 5 };
+    // Intermediate imputed records always carry AP1/AP2 (n_fmt==4); the FINAL
+    // output drops them when the user asked --no-ap → write GT+DS only. AC/AF/DR2
+    // are computed from the intermediate's per-hap AP (correct) regardless.
+    let out_n_fmt: u8 = if !is_chip && no_ap { 2 } else { n_fmt };
 
     // ----- Build merged SHARED -----
     let mut out = Vec::with_capacity(8 + v0.l_shared * 2 + v0.l_indiv * rec_bufs.len());
@@ -314,7 +317,7 @@ fn merge_one_record(
     out.extend_from_slice(&v0.shared[0..16]);                       // chrom, pos, rlen, qual
     out.extend_from_slice(&new_n_info.to_le_bytes());                // updated n_info (offset 16..18)
     out.extend_from_slice(&v0.shared[18..20]);                       // n_allele (unchanged)
-    let fmt_sample_new = (n_fmt as u32) << 24 | (total_samples as u32);
+    let fmt_sample_new = (out_n_fmt as u32) << 24 | (total_samples as u32);
     out.extend_from_slice(&fmt_sample_new.to_le_bytes());            // updated fmt_sample (offset 20..24)
 
     // ID, REF, ALT, FILTER (verbatim from batch_0)
@@ -351,7 +354,9 @@ fn merge_one_record(
     let indiv_start = out.len();
     let mut batch_indiv_offs: Vec<usize> = vec![0usize; rec_bufs.len()];
 
-    for _ in 0..n_fmt {
+    // Copy only out_n_fmt fields (GT[,DS] for --no-ap; GT,DS,AP1,AP2 otherwise).
+    // The intermediate's trailing AP fields are simply not consumed when dropped.
+    for _ in 0..out_n_fmt {
         // Read field header from batch_0: 2-byte typed_int8(key) + 1-byte descriptor.
         let h_off = batch_indiv_offs[0];
         let b0_indiv = view(&rec_bufs[0]).indiv;

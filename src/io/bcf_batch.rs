@@ -46,6 +46,12 @@ pub fn setup_batch_writers(
     version: &str,
     no_ap: bool,
 ) -> std::io::Result<Vec<BatchWriter>> {
+    // The per-batch INTERMEDIATE always stores AP1/AP2 regardless of --no-ap: the
+    // merger needs the per-hap ALT probs to count AC correctly (AC = #{hap: AP>0.5};
+    // it cannot be recovered from DS alone). The final merged BCF drops AP per the
+    // user's --no-ap (handled in merge_one_record).
+    let _ = no_ap;
+    let no_ap = false;
     if batch_size == 0 || n_haps == 0 {
         return Ok(Vec::new());
     }
@@ -181,6 +187,10 @@ pub fn write_window_bcf_batched(
         wgs_idx, n_samples_total, chip_genotypes, no_ap,
         preloaded_chunks, preloaded_stripes,
     } = input;
+    // Intermediate always carries AP1/AP2 (see setup_batch_writers); the merger
+    // needs them to count AC, and the final BCF drops AP per --no-ap.
+    let _ = no_ap;
+    let no_ap = false;
     let n_haps_total = n_samples_total * 2;
     let sample_start = hap_start / 2;
     let n_samples_in_batch = (hap_end - hap_start) / 2;
