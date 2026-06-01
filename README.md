@@ -141,7 +141,7 @@ selphi --lcwgs \
   --threads 16
 ```
 
-Output is VCF.gz with `GT:DS:GP`. The engine alternates sparse-PBWT haplotype selection with a GL-weighted Li-Stephens forward-backward (conditional-HL diploid Gibbs), AVX-512-vectorized, and processes the chromosome in cM chunks so the full-chromosome reference panel is never held in memory. On a simulated chr22 1× benchmark it matches GLIMPSE2 on common/intermediate-frequency variants at ~2.0× lower wall time (10.8 min vs 21.4 min on 16 cores), without ever holding the full-chromosome reference panel in memory (overall R² 0.905 vs 0.916; the residual is the 0.5–1% bin). Expert tuning knobs are exposed via `LCWGS_*` environment variables (PBWT depth/spacing, Gibbs iterations, Ne, epsilon); the defaults are calibrated for 1× data.
+Output is VCF.gz with `GT:DS:GP`. The engine alternates sparse-PBWT haplotype selection with a GL-weighted Li-Stephens forward-backward (conditional-HL diploid Gibbs), AVX-512-vectorized, and processes the chromosome in cM chunks so the full-chromosome reference panel is never held in memory. On a simulated chr22 1× benchmark the default (accuracy-tuned) engine reaches overall per-variant R² 0.907 vs GLIMPSE2's 0.916, matching GLIMPSE2 on common variants and **beating it on the 5–10% bin** (0.933 vs 0.932); the residual gap is the rarest bins (0.5–1%, 1–5%). The Gibbs iteration count trades accuracy for speed: the default `LCWGS_N_ITER=50` runs chr22 in ~24 min / 36 GB, while a fast mode (`LCWGS_N_ITER=20 LCWGS_N_MAIN=8`) runs in ~11 min — 2× faster than GLIMPSE2 — at R² 0.905. Other expert knobs are exposed via `LCWGS_*` environment variables (PBWT depth/spacing, Ne, epsilon, K-ceiling); all defaults are calibrated for 1× data.
 
 ### Memory-bounded mode (biobank-scale)
 
