@@ -57,6 +57,7 @@ pub mod hmm;
 pub mod pbwt_select;
 pub mod rare_ibs;
 pub mod bam_pileup;
+pub mod indel_realign;
 pub mod iterate;
 pub mod pipeline;
 pub mod output;

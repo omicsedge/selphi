@@ -4,6 +4,7 @@
 //! Prints `pos<TAB>PL0,PL1,PL2<TAB>` per site (Phred, min=0), to compare vs
 //! `bcftools mpileup` PL on the same BAM/sites.
 use selphi::lcwgs::bam_pileup::{pileup_bams, PileupParams};
+use selphi::lcwgs::indel_realign::{IndelInput, IndelModel};
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
@@ -11,6 +12,8 @@ fn main() {
     let mut pos = Vec::new();
     let mut rb = Vec::new();
     let mut ab = Vec::new();
+    let mut rb_full: Vec<Vec<u8>> = Vec::new();
+    let mut ab_full: Vec<Vec<u8>> = Vec::new();
     let mut snp = Vec::new();
     for line in std::fs::read_to_string(sites).unwrap().lines() {
         let f: Vec<&str> = line.split('\t').collect();
@@ -19,15 +22,27 @@ fn main() {
         pos.push(p);
         rb.push(f[1].as_bytes()[0]);
         ab.push(f[2].as_bytes()[0]);
+        rb_full.push(f[1].as_bytes().to_vec());
+        ab_full.push(f[2].as_bytes().to_vec());
         snp.push(f[1].len() == 1 && f[2].len() == 1);
     }
     // Optional 4th arg: region "start-end" → use the indexed query.
     let region: Option<(i64, i64)> = a.get(4).and_then(|s| {
         s.split_once('-').map(|(x, y)| (x.replace(',', "").parse().unwrap(), y.replace(',', "").parse().unwrap()))
     });
-    // CRAM needs a reference FASTA (with .fai); pass via CRAM_REF env.
+    // CRAM needs a reference FASTA (with .fai); pass via CRAM_REF env. When a
+    // reference is given, build the indel pair-HMM model so indel sites are scored
+    // by local realignment (else they stay flat) — lets us validate indel GLs too.
     let reference = std::env::var("CRAM_REF").ok();
-    let r = pileup_bams(&[bam.clone()], chrom, &pos, &rb, &ab, &snp, region, reference.as_deref(), PileupParams::default()).unwrap();
+    let indel_model = reference.as_deref().and_then(|refp| {
+        let inputs: Vec<IndelInput> = (0..pos.len()).filter(|&i| !snp[i]).map(|i| IndelInput {
+            var_idx: i, pos: pos[i],
+            ref_allele: rb_full[i].clone(), alt_allele: ab_full[i].clone(),
+        }).collect();
+        if inputs.is_empty() { return None; }
+        IndelModel::build(refp, chrom, &inputs).ok()
+    });
+    let r = pileup_bams(&[bam.clone()], chrom, &pos, &rb, &ab, &snp, region, reference.as_deref(), indel_model.as_ref(), PileupParams::default()).unwrap();
     for i in 0..pos.len() {
         let (g0, g1, g2) = (r.gl3[i * 3], r.gl3[i * 3 + 1], r.gl3[i * 3 + 2]);
         let mx = g0.max(g1).max(g2);

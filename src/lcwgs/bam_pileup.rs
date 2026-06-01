@@ -12,8 +12,9 @@
 //! the per-genotype log-likelihood, and emits the normalised 3-way GL in the
 //! exact layout the Gibbs loop consumes (`gl3[v*n_samples*3 + 3*s + g]`). Sites
 //! with no covering reads collapse to the flat `[1/3,1/3,1/3]` (the dominant
-//! case at 1×), so the panel/LD carries them. Indel panel sites are left flat in
-//! phase 1 (SNP-only pileup; indel realignment is phase 2).
+//! case at 1×), so the panel/LD carries them. Indel panel sites are scored by
+//! local read-vs-haplotype realignment (a pair-HMM; see [`super::indel_realign`])
+//! when a reference FASTA is supplied; otherwise they too stay flat.
 //!
 //! Model (per read base `b`, phred base-quality `q`, error `ε = 10^(-q/10)`):
 //! `P(b|REF)=1-ε if b==ref else ε/3`, `P(b|ALT)` likewise, `P(b|het)=½P(b|REF)+½P(b|ALT)`.
@@ -28,6 +29,7 @@ use noodles_core::{Position, Region};
 use noodles_sam::alignment::record::cigar::op::Kind;
 use noodles_sam::alignment::RecordBuf;
 use noodles_sam::Header;
+use super::indel_realign::{IndelModel, IndelScratch};
 
 /// Per-sample GL pileup result, ready for the Gibbs engine.
 pub struct BamGl {
@@ -74,10 +76,15 @@ fn resolve_contig(header: &Header, chrom: &str) -> Option<(usize, Vec<u8>)> {
 
 /// Phred→error lookup tables (q ∈ 0..=93). Precomputed once: log10(1-ε),
 /// log10(ε/3), and the linear (1-ε), (ε/3) for the het term — avoids powf/log10
-/// in the per-base hot loop.
-struct PhredLut { lmatch: [f64; 94], lmis: [f64; 94], pmatch: [f64; 94], pmis: [f64; 94] }
+/// in the per-base hot loop. Shared with the indel pair-HMM emission model.
+pub(crate) struct PhredLut {
+    pub(crate) lmatch: [f64; 94],
+    pub(crate) lmis: [f64; 94],
+    pub(crate) pmatch: [f64; 94],
+    pub(crate) pmis: [f64; 94],
+}
 impl PhredLut {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut t = PhredLut { lmatch: [0.0; 94], lmis: [0.0; 94], pmatch: [0.0; 94], pmis: [0.0; 94] };
         for q in 0..94 {
             let eps = 10f64.powf(-(q as f64) / 10.0);
@@ -106,6 +113,7 @@ pub fn pileup_bams(
     is_snp: &[bool],
     region: Option<(i64, i64)>,
     reference: Option<&str>,
+    indel_model: Option<&IndelModel>,
     params: PileupParams,
 ) -> io::Result<BamGl> {
     let n_var = pos.len();
@@ -117,7 +125,7 @@ pub fn pileup_bams(
     // own [n_var*3] normalised GL block; assembled into the interleaved gl3 after.
     let per_sample: Vec<io::Result<(String, Vec<f32>)>> = bam_paths
         .par_iter()
-        .map(|path| pileup_one(path, chrom, pos, ref_base, alt_base, is_snp, region, reference, &params, &lut))
+        .map(|path| pileup_one(path, chrom, pos, ref_base, alt_base, is_snp, region, reference, indel_model, &params, &lut))
         .collect();
 
     let mut sample_ids = Vec::with_capacity(n_samples);
@@ -153,11 +161,12 @@ fn pileup_one(
     is_snp: &[bool],
     region: Option<(i64, i64)>,
     reference: Option<&str>,
+    indel_model: Option<&IndelModel>,
     params: &PileupParams,
     lut: &PhredLut,
 ) -> io::Result<(String, Vec<f32>)> {
     if path.to_ascii_lowercase().ends_with(".cram") {
-        return pileup_one_cram(path, chrom, pos, ref_base, alt_base, is_snp, region, reference, params, lut);
+        return pileup_one_cram(path, chrom, pos, ref_base, alt_base, is_snp, region, reference, indel_model, params, lut);
     }
     let n_var = pos.len();
     let mut reader = bam::io::reader::Builder::default().build_from_path(path)?;
@@ -185,6 +194,7 @@ fn pileup_one(
         // Shared per-record pileup: CIGAR-walk + GL accumulation. Used by both the
         // whole-file streaming path and the indexed region-query path.
         let mut cigar_buf: Vec<(Kind, usize)> = Vec::with_capacity(16);
+        let mut iscratch = IndelScratch::default();
         let mut process = |record: &bam::Record| {
             match record.reference_sequence_id() {
                 Some(Ok(rid)) if rid == target_rid => {}
@@ -210,6 +220,15 @@ fn pileup_one(
                 |qi| qbytes[qi],
                 pos, ref_base, alt_base, is_snp, params, lut, &mut ll, &mut depth,
             );
+            if let Some(model) = indel_model {
+                super::indel_realign::score_read(
+                    start, &cigar_buf,
+                    |qi| seq.get(qi).unwrap_or(b'N'),
+                    |qi| qbytes[qi],
+                    model, lut, &mut iscratch, &mut ll, &mut depth,
+                    params.max_depth, params.min_bq,
+                );
+            }
         };
 
         // Region mode with a .bai index → fetch only the region's reads (avoids
@@ -278,6 +297,7 @@ fn pileup_one_cram(
     is_snp: &[bool],
     region: Option<(i64, i64)>,
     reference: Option<&str>,
+    indel_model: Option<&IndelModel>,
     params: &PileupParams,
     lut: &PhredLut,
 ) -> io::Result<(String, Vec<f32>)> {
@@ -313,6 +333,7 @@ fn pileup_one_cram(
     };
     let last_pos = pos[n_var - 1];
     let mut cigar_buf: Vec<(Kind, usize)> = Vec::with_capacity(16);
+    let mut iscratch = IndelScratch::default();
 
     // Same guards + walk as the BAM path, over decoded RecordBufs.
     let mut process = |record: &RecordBuf| {
@@ -332,6 +353,15 @@ fn pileup_one_cram(
             |qi| qbytes[qi],
             pos, ref_base, alt_base, is_snp, params, lut, &mut ll, &mut depth,
         );
+        if let Some(model) = indel_model {
+            super::indel_realign::score_read(
+                start, &cigar_buf,
+                |qi| seq.get(qi).unwrap_or(b'N'),
+                |qi| qbytes[qi],
+                model, lut, &mut iscratch, &mut ll, &mut depth,
+                params.max_depth, params.min_bq,
+            );
+        }
     };
 
     // Region mode with a .crai index → decode only the region. Else stream all.
