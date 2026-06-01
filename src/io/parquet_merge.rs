@@ -159,7 +159,6 @@ pub fn merge_batch_parquets(
             if is_imp {
                 // Second pass: variance of DS
                 let mut var_sum = 0.0f64;
-                let mut sample_idx_global2 = 0usize;
                 for bi in 0..batches.len() {
                     let arrs = &batch_ap_arrays[bi];
                     let k_in_batch = arrs.len() / 2;
@@ -168,9 +167,7 @@ pub fn merge_batch_parquets(
                         let ap2 = arrs[s * 2 + 1].value(row);
                         let d = (ap1 + ap2) as f64 - 2.0 * p_hat;
                         var_sum += d * d;
-                        let _ = sample_idx_global2;
                     }
-                    sample_idx_global2 += arrs.len() / 2;
                 }
                 let var_dosage = var_sum / n_haps_total as f64;
                 let var_expected = 2.0 * p_hat * (1.0 - p_hat);
