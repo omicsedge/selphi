@@ -143,6 +143,24 @@ selphi --lcwgs \
 
 Output is VCF.gz with `GT:DS:GP`. The engine alternates sparse-PBWT haplotype selection with a GL-weighted Li-Stephens forward-backward (conditional-HL diploid Gibbs), AVX-512-vectorized, and processes the chromosome in cM chunks so the full-chromosome reference panel is never held in memory. On a simulated chr22 1× benchmark the default (accuracy-tuned) engine reaches overall per-variant R² 0.907 vs GLIMPSE2's 0.916, matching GLIMPSE2 on common variants and **beating it on the 5–10% bin** (0.933 vs 0.932); the residual gap is the rarest bins (0.5–1%, 1–5%). The Gibbs iteration count trades accuracy for speed: the default `LCWGS_N_ITER=50` runs chr22 in ~24 min / 36 GB, while a fast mode (`LCWGS_N_ITER=20 LCWGS_N_MAIN=8`) runs in ~11 min — 2× faster than GLIMPSE2 — at R² 0.905. Other expert knobs are exposed via `LCWGS_*` environment variables (PBWT depth/spacing, Ne, epsilon, K-ceiling); all defaults are calibrated for 1× data.
 
+#### Native BAM/CRAM input
+
+Instead of a pre-computed `PL` VCF, point `--lcwgs` directly at aligned reads — Selphi computes the genotype likelihoods natively at the panel's sites (no `bcftools mpileup` step). One alignment file per sample; `--bam-list` takes a file with one path per line (samples piled up in parallel). CRAM additionally needs the reference FASTA (with a `.fai`) it was compressed against:
+
+```bash
+# Single BAM
+selphi --lcwgs --bam sample.bam --refpanel reference.srp --map genetic_map.map --out imputed --threads 16
+
+# CRAM (needs the reference FASTA used at compression)
+selphi --lcwgs --bam sample.cram --reference GRCh38.fa --refpanel reference.srp --map genetic_map.map --out imputed --threads 16
+
+# Many samples, bounded to a region (uses the .bai/.crai index — only that region is decoded)
+selphi --lcwgs --bam-list bams.txt --reference GRCh38.fa --refpanel reference.srp --map genetic_map.map \
+  --region chr20:1000000-2000000 --out imputed --threads 16
+```
+
+The pileup is CIGAR-aware (`M/=/X/I/D/N/S`) and uses the standard base-quality model (`P(b|REF)=1−ε`, `ε=10^(−Q/10)`), filtering by mapping quality (`--` `LCWGS_MIN_MAPQ`, default 20), base quality (`LCWGS_MIN_BQ`, 20) and depth cap (`LCWGS_MAX_DEPTH`, 250); the genotype-likelihood output is identical to `bcftools mpileup`/GLIMPSE2 at the same filters. Contig names are matched tolerant to the `chr` prefix (panel `1` ↔ alignment `chr1`). With `--region` and a `.bai`/`.crai` index present, only the requested region's reads are decoded.
+
 ### Memory-bounded mode (biobank-scale)
 
 For panels where memory is the binding constraint, pass `--sample-batch-size N` to process target samples in batches of N. **Supported for all output formats** (VCF, BCF, Parquet, PGEN, SelfDecode); output is bit-identical to the non-batched run.
