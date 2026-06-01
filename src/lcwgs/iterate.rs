@@ -147,6 +147,39 @@ pub fn run_gibbs(
     assert_eq!(gl3.len(), n_var * n_samples * 3);
     assert_eq!(ref_bm.n_sites, n_var);
 
+    // Rare-site GL softening (LCWGS_RARE_GL_SOFT=w∈(0,1], default off). At 1×, a
+    // single read makes the per-genotype GL over-confident (one REF read at a true
+    // het looks like hom-REF, suppressing the carrier the panel/LD would call). At
+    // RARE sites we blend the GL toward uniform by `w`, so the panel copying
+    // dominates where it has LD signal — recovering weak-read missed carriers —
+    // without inventing false positives (where the panel says REF the dose stays
+    // REF). Applied to a gl3 copy used everywhere downstream (init + HMM + seed).
+    let gl_soft = std::env::var("LCWGS_RARE_GL_SOFT").ok()
+        .and_then(|s| s.parse::<f32>().ok()).filter(|&w| w > 0.0 && w <= 1.0);
+    let gl3_owned: Vec<f32>;
+    let gl3: &[f32] = if let Some(w) = gl_soft {
+        let n_ref = ref_bm.n_haps;
+        let thr = params.rare_maf as f64;
+        let mut g = gl3.to_vec();
+        let third = 1.0f32 / 3.0;
+        for v in 0..n_var {
+            let ac = ref_bm.popcount_row(v, n_ref) as f64;
+            let maf = ac.min(n_ref as f64 - ac) / n_ref as f64;
+            if maf < thr {
+                for s in 0..n_samples {
+                    let b = v * n_samples * 3 + 3 * s;
+                    for g3 in g[b..b + 3].iter_mut() {
+                        *g3 = (1.0 - w) * *g3 + w * third;
+                    }
+                }
+            }
+        }
+        gl3_owned = g;
+        &gl3_owned
+    } else {
+        gl3
+    };
+
     // Per-hap sampled alleles, layout [v * n_target_haps + h]. Initialized
     // from the marginal genotype MAP, then refined by Gibbs sampling.
     let mut hap_alleles = init_hap_alleles(gl3, ref_bm, n_samples, n_var, params.seed_or_default());
