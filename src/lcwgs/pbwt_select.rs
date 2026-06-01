@@ -108,7 +108,6 @@ pub fn select_conditioning_haps(
     modulo_cm: f32,
     depth: usize,
     common_idx: &[usize],
-    region_keep: usize,
 ) -> Vec<Vec<u32>> {
     let n_ref_haps = ref_bm.n_haps;
     let n_var = cm.len();
@@ -152,20 +151,6 @@ pub fn select_conditioning_haps(
     use std::collections::HashMap;
     let mut match_len: Vec<HashMap<u32, u32>> =
         (0..n_target_haps).map(|_| HashMap::new()).collect();
-
-    // PER-REGION coverage (GLIMPSE2 compactSelection-style). When region_keep>0,
-    // the closest `region_keep` ref neighbors at EACH storage site are force-kept
-    // for the target, UNIONed across sites. The global match_len ranking biases
-    // toward haps that match long *somewhere*, so over a large window it misses
-    // the target's true *local* copy in regions where another hap matches longer
-    // elsewhere — the per-region union guarantees each region's best match is in
-    // the conditioning set, which is what lets a single K cover a whole-chromosome
-    // mosaic (and capture short-IBD rare carriers). region_keep=0 = legacy global.
-    let mut region_neigh: Vec<Vec<u32>> = if region_keep > 0 {
-        vec![Vec::new(); n_target_haps]
-    } else {
-        Vec::new()
-    };
 
     for (storage_idx, &v) in storage_sites.iter().enumerate() {
         // Build per-hap rec[] for this storage site:
@@ -216,9 +201,6 @@ pub fn select_conditioning_haps(
                         let ml = (storage_idx_i - div[div_idx]).max(1) as u32;
                         let e = mlh.entry(ref_idx as u32).or_insert(0);
                         *e = e.saturating_add(ml);
-                        if region_keep > 0 && taken < region_keep {
-                            region_neigh[h].push(ref_idx as u32);
-                        }
                         taken += 1;
                         if taken >= depth { break; }
                     }
@@ -234,9 +216,6 @@ pub fn select_conditioning_haps(
                         let ml = (storage_idx_i - div[div_idx]).max(1) as u32;
                         let e = mlh.entry(ref_idx as u32).or_insert(0);
                         *e = e.saturating_add(ml);
-                        if region_keep > 0 && taken < region_keep {
-                            region_neigh[h].push(ref_idx as u32);
-                        }
                         taken += 1;
                         if taken >= depth { break; }
                     }
@@ -248,167 +227,15 @@ pub fn select_conditioning_haps(
 
     // Reduce per-target-hap match-length sums → top-kpbwt by total length.
     // Sort descending; tiebreak by index ascending for determinism.
-    // With region_keep>0, the per-region union is force-included FIRST (it
-    // guarantees whole-window mosaic + short-IBD-carrier coverage), then the
-    // remaining slots up to kpbwt are filled by global match-length ranking.
     for h in 0..n_target_haps {
         let mlh = &match_len[h];
-
-        if region_keep > 0 {
-            let mut sel: Vec<u32> = std::mem::take(&mut region_neigh[h]);
-            sel.sort_unstable();
-            sel.dedup();
-            if sel.len() < kpbwt {
-                // Fill remaining slots from the global match-length ranking,
-                // skipping already-included region haps.
-                let in_region: std::collections::HashSet<u32> = sel.iter().copied().collect();
-                let mut hits: Vec<(u32, u32)> = mlh.iter()
-                    .filter(|&(&i, _)| !in_region.contains(&i))
-                    .map(|(&i, &c)| (c, i))
-                    .collect();
-                hits.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-                let need = kpbwt - sel.len();
-                sel.extend(hits.into_iter().take(need).map(|(_, idx)| idx));
-            } else if sel.len() > kpbwt {
-                // Region union alone exceeds kpbwt: keep the kpbwt with the
-                // longest global match (still a per-region-sourced set).
-                sel.sort_unstable_by(|&a, &b| {
-                    let (ca, cb) = (mlh.get(&a).copied().unwrap_or(0), mlh.get(&b).copied().unwrap_or(0));
-                    cb.cmp(&ca).then(a.cmp(&b))
-                });
-                sel.truncate(kpbwt);
-            }
-            out.push(sel);
-        } else {
-            // All map entries have count >= 1 (ml is .max(1)), so no >0 filter needed.
-            let mut hits: Vec<(u32, u32)> = mlh.iter().map(|(&i, &c)| (c, i)).collect();
-            hits.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-            if hits.len() > kpbwt { hits.truncate(kpbwt); }
-            out.push(hits.into_iter().map(|(_, idx)| idx).collect());
-        }
+        // All map entries have count >= 1 (ml is .max(1)), so no >0 filter needed.
+        let mut hits: Vec<(u32, u32)> = mlh.iter().map(|(&i, &c)| (c, i)).collect();
+        hits.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        if hits.len() > kpbwt { hits.truncate(kpbwt); }
+        out.push(hits.into_iter().map(|(_, idx)| idx).collect());
     }
 
-    out
-}
-
-/// Rare-allele carrier augmentation (GLIMPSE2 `select_rare_pd_fg` analogue).
-///
-/// A rare-allele carrier with only a SHORT flanking IBS match to the target is
-/// missed by the global top-K selection (its total match length loses to haps
-/// that match longer elsewhere), and at the rare site itself the PBWT splits
-/// haps by allele — so a REF-sampled target (e.g. a zero-read carrier) is never
-/// PBWT-adjacent to the ALT carriers. GLIMPSE2 finds such carriers in the
-/// FLANKING haplotype space instead. We reproduce that cheaply: run one PBWT
-/// sweep over COMMON sites only (so `prefix[]` reflects the flanking-haplotype
-/// order, independent of any rare allele) and, for each rare site, add the panel
-/// carriers that lie within `window` positions of the target in that order.
-///
-/// This is independent of the target's *sampled* allele at the rare site (no
-/// chicken-and-egg), and selective (only carriers whose flanking haplotype is
-/// near the target), so it doesn't degenerate to all-conditioning.
-///
-/// Returns per-target-hap extra reference indices to UNION into the conditioning
-/// set. `rare_sites[i] = (variant_idx, carriers)` with `carriers` the panel hap
-/// indices carrying the minor allele at that site (precomputed by the caller).
-#[allow(clippy::too_many_arguments)]
-pub fn augment_rare_carriers(
-    target_hard_calls: &[u8],
-    ref_bm: &HaplotypeBitmatrix,
-    common_idx: &[usize],
-    rare_sites: &[(usize, Vec<u32>)],
-    n_target_haps: usize,
-    window: usize,
-    max_add_per_hap: usize,
-) -> Vec<Vec<u32>> {
-    let n_ref_haps = ref_bm.n_haps;
-    let n_haps_total = n_target_haps + n_ref_haps;
-    let mut out: Vec<Vec<u32>> = vec![Vec::new(); n_target_haps];
-    if common_idx.is_empty() || rare_sites.is_empty() {
-        return out;
-    }
-
-    let mut pbwt = PbwtDivUpdater::new(n_haps_total);
-    let mut prefix: Vec<i32> = (0..n_haps_total as i32).collect();
-    let mut div: Vec<i32> = vec![0i32; n_haps_total];
-    let mut inv: Vec<i32> = vec![0i32; n_haps_total];
-    let mut rec: Vec<i32> = vec![0i32; n_haps_total];
-
-    // Walk common sites; between consecutive common sites, the PBWT order is
-    // (approximately) constant, so we attribute each rare site to the order
-    // produced by the most recent common-site update <= its variant index.
-    // `ri` is a cursor into the (variant-sorted) rare_sites list.
-    debug_assert!(common_idx.windows(2).all(|w| w[0] < w[1]));
-    let mut ri = 0usize;
-    // Rare sites before the first common site use the identity order — skip
-    // them (no flanking signal yet).
-    while ri < rare_sites.len() && rare_sites[ri].0 < common_idx[0] {
-        ri += 1;
-    }
-
-    for (step, &cv) in common_idx.iter().enumerate() {
-        for h in 0..n_target_haps {
-            rec[h] = target_hard_calls[cv * n_target_haps + h] as i32;
-        }
-        for rh in 0..n_ref_haps {
-            rec[n_target_haps + rh] = if ref_bm.get(cv, rh) { 1 } else { 0 };
-        }
-        pbwt.fwd_update(&rec, 2, step as i32, &mut prefix, &mut div);
-        for (i, &p) in prefix.iter().enumerate() {
-            inv[p as usize] = i as i32;
-        }
-
-        // Upper bound on variant index whose flanking order is this update's:
-        // everything strictly before the NEXT common site.
-        let next_cv = common_idx.get(step + 1).copied().unwrap_or(usize::MAX);
-        // `window` is reinterpreted as the MINIMUM match length (in common-site
-        // steps) a target must share with a carrier to receive it. Position
-        // adjacency in the PBWT is NOT enough — only haps with a long shared
-        // prefix are genuinely IBD; adding positionally-near but short-match
-        // carriers dilutes the conditioning set and hurts. We expand outward
-        // from the carrier's PBWT slot while the running match length (step −
-        // max divergence in the spanned range) stays ≥ `min_match`.
-        let min_match = window as i32;
-        let step_i = step as i32;
-        while ri < rare_sites.len() && rare_sites[ri].0 < next_cv {
-            let (_v, carriers) = &rare_sites[ri];
-            for &c in carriers {
-                let pos_c = inv[n_target_haps + c as usize] as i32;
-                // Walk DOWN (increasing index): match length to a hap at p is
-                // step − max(div[pos_c+1 ..= p]). div[i] is the divergence of
-                // prefix[i] vs prefix[i-1].
-                let mut run = 0i32; // running max divergence
-                let mut p = pos_c + 1;
-                while p < n_haps_total as i32 {
-                    if div[p as usize] > run { run = div[p as usize]; }
-                    if step_i - run < min_match { break; }
-                    let hap = prefix[p as usize] as usize;
-                    if hap < n_target_haps && out[hap].len() < max_add_per_hap {
-                        out[hap].push(c);
-                    }
-                    p += 1;
-                }
-                // Walk UP (decreasing index): match length to hap at p is
-                // step − max(div[p+1 ..= pos_c]).
-                run = 0;
-                p = pos_c;
-                while p > 0 {
-                    if div[p as usize] > run { run = div[p as usize]; }
-                    if step_i - run < min_match { break; }
-                    let hap = prefix[(p - 1) as usize] as usize;
-                    if hap < n_target_haps && out[hap].len() < max_add_per_hap {
-                        out[hap].push(c);
-                    }
-                    p -= 1;
-                }
-            }
-            ri += 1;
-        }
-    }
-
-    for v in out.iter_mut() {
-        v.sort_unstable();
-        v.dedup();
-    }
     out
 }
 
@@ -465,7 +292,7 @@ mod tests {
         // 1 target hap; target_hard_calls in (v * n_target_haps + h) layout
         // For n_target_haps=1, layout = target[v]
         let cm = vec![0.0f64, 0.05, 0.10, 0.15, 0.20];
-        let out = select_conditioning_haps(&target, &bm, &cm, 1, 2, 0.05, 4, &[], 0);
+        let out = select_conditioning_haps(&target, &bm, &cm, 1, 2, 0.05, 4, &[]);
         assert_eq!(out.len(), 1);
         // Top hap should be hap 0 (perfect match)
         assert!(!out[0].is_empty(), "should select at least one hap");

@@ -55,7 +55,6 @@
 pub mod pl_reader;
 pub mod hmm;
 pub mod pbwt_select;
-pub mod rare_ibs;
 pub mod bam_pileup;
 pub mod indel_realign;
 pub mod iterate;
