@@ -153,15 +153,17 @@ impl Default for LcwgsParams {
             kpbwt: envu("LCWGS_KPBWT", 2000),
             pbwt_modulo_cm: envf("LCWGS_PBWT_MODULO_CM", 0.002),
             pbwt_depth: envu("LCWGS_PBWT_DEPTH", 16),
-            // Retuned 2026-05-31 (speed/memory session). Dropped 25→20: Gibbs has
-            // converged by 20 (the 17→25 bump was the convergence lever, but the
-            // last 5 burn-in iterations no longer move the averaged dose). On the
-            // canonical full-chr22 326K-variant benchmark, iter20 + KMAX=3000 is
-            // OVERALL 0.9051 vs 0.9052 at iter25/uncapped (−0.0001, i.e. 0.905 to
-            // reported precision, uniform across MAF bins) for −16% wall and
-            // −24% peak RSS. Restore the old behaviour with LCWGS_N_ITER=25.
-            n_iterations: envu("LCWGS_N_ITER", 20),
-            n_main_iterations: envu("LCWGS_N_MAIN", 8),
+            // Retuned 2026-06-01 (accuracy session). Raised to 50/25 from 20/8:
+            // the diffuse-dose rare carriers need more Gibbs iterations to
+            // converge/commit. The OVERALL gain from iter20→iter50 is broad-
+            // spectrum, ALL MAF bins up, no regression — validated on the
+            // canonical full-chr22 326K benchmark (iter50 + core4): OVERALL
+            // 0.9051→0.9068 (+0.0017), 0.5-1% +0.0026, and now BEATS GLIMPSE2 on
+            // the 5-10% bin (0.9326 vs 0.9319). Convergence plateaus at ~50
+            // (iter80 == iter50). Cost ~2.5× wall. Restore the fast 20/8 with
+            // LCWGS_N_ITER=20 LCWGS_N_MAIN=8 (the earlier speed-tuned default).
+            n_iterations: envu("LCWGS_N_ITER", 50),
+            n_main_iterations: envu("LCWGS_N_MAIN", 25),
             ne: envf("LCWGS_NE", 100_000.0),
             rare_maf: 0.001,
             // Imputation HMM error rate. GLIMPSE2's err-imp default is 1e-12 (it
