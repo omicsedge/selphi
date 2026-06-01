@@ -207,6 +207,8 @@ pub(crate) fn score_read<B: Fn(usize) -> u8, Q: Fn(usize) -> u8>(
     depth: &mut [u32],
     max_depth: u32,
     min_bq: u8,
+    qhash: u64,
+    last_frag: &mut [u64],
 ) {
     if model.sites.is_empty() { return; }
     let ref_span: i64 = cigar.iter().map(|&(k, l)| match k {
@@ -222,6 +224,7 @@ pub(crate) fn score_read<B: Fn(usize) -> u8, Q: Fn(usize) -> u8>(
         // Require the read to span the indel core with a minimum flanking anchor.
         if start > s.pos - MIN_ANCHOR || read_end < core_end + MIN_ANCHOR { continue; }
         if depth[s.var_idx] >= max_depth { continue; }
+        if last_frag[s.var_idx] == qhash { continue; } // overlapping mate → count fragment once
 
         extract_window(start, cigar, &base_at, &qual_at, s.hstart, s.hend, min_bq, &mut sc.wb, &mut sc.wq);
         if sc.wb.len() < MIN_WINDOW { continue; }
@@ -239,6 +242,7 @@ pub(crate) fn score_read<B: Fn(usize) -> u8, Q: Fn(usize) -> u8>(
         let m = lp_ref.max(lp_alt);
         ll[v][1] += (0.5f64).log10() + m + (10f64.powf(lp_ref - m) + 10f64.powf(lp_alt - m)).log10();
         depth[v] += 1;
+        last_frag[v] = qhash;
     }
 }
 
