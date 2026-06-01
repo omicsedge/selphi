@@ -156,6 +156,67 @@ pub fn run_lcwgs(
     })
 }
 
+/// lcWGS pipeline starting from BAM(s): compute genotype likelihoods natively
+/// at the reference-panel sites (see [`super::bam_pileup`]) instead of reading a
+/// pre-computed PL VCF, then run the same chunked Gibbs imputation. One BAM per
+/// sample. `region` optionally restricts to `(chrom, start, end)` (1-based);
+/// otherwise every panel variant is imputed (use a per-chromosome/region SRP to
+/// bound the work). Reuses [`run_chunked_gibbs`] — the imputation core is shared
+/// with the VCF path.
+pub fn run_lcwgs_bam(
+    bam_paths: &[String],
+    srp: &SrpReader,
+    map_path: &str,
+    params: &LcwgsParams,
+    region: Option<(&str, i64, i64)>,
+    _n_threads: usize,
+) -> std::io::Result<LcwgsOutput> {
+    // Panel variant indices to impute (region subset, else all).
+    let wgs_idx: Vec<usize> = match region {
+        Some((c, s, e)) => (0..srp.variants.len()).filter(|&i| {
+            let v = &srp.variants[i];
+            v.chr == c && v.pos >= s && v.pos <= e
+        }).collect(),
+        None => (0..srp.variants.len()).collect(),
+    };
+    let n_shared = wgs_idx.len();
+    if n_shared == 0 {
+        return Err(std::io::Error::other("No panel variants in the requested region"));
+    }
+    let chrom = srp.variants[wgs_idx[0]].chr.clone();
+
+    // Site arrays for the pileup (ascending by pos; SNP = single-base ref+alt).
+    let pos: Vec<i64> = wgs_idx.iter().map(|&wi| srp.variants[wi].pos).collect();
+    let ref_base: Vec<u8> = wgs_idx.iter().map(|&wi| srp.variants[wi].ref_allele.as_bytes().first().copied().unwrap_or(b'N')).collect();
+    let alt_base: Vec<u8> = wgs_idx.iter().map(|&wi| srp.variants[wi].alt_allele.as_bytes().first().copied().unwrap_or(b'N')).collect();
+    let is_snp: Vec<bool> = wgs_idx.iter().map(|&wi| {
+        let v = &srp.variants[wi];
+        v.ref_allele.len() == 1 && v.alt_allele.len() == 1
+    }).collect();
+    let n_snp = is_snp.iter().filter(|&&b| b).count();
+
+    selphi_info!("  lcWGS-BAM: {} BAM(s), chrom {}, {} panel sites ({} SNPs) to impute",
+        bam_paths.len(), chrom, n_shared, n_snp);
+
+    let pp = super::bam_pileup::PileupParams::default();
+    let bamgl = super::bam_pileup::pileup_bams(bam_paths, &chrom, &pos, &ref_base, &alt_base, &is_snp, pp)?;
+    let n_samples = bamgl.sample_ids.len();
+
+    // cM positions + variant identities (panel order).
+    let (map_bp, map_cm) = genmap::load_genetic_map_raw(std::path::Path::new(map_path))?;
+    let cm: Vec<f64> = wgs_idx.iter().map(|&wi| {
+        genmap::interpolate_cm_extrapolate(&map_bp, &map_cm, srp.variants[wi].pos)
+    }).collect();
+    let variants: Vec<(String, i64, String, String)> = wgs_idx.iter().map(|&wi| {
+        let v = &srp.variants[wi];
+        (v.chr.clone(), v.pos, v.ref_allele.clone(), v.alt_allele.clone())
+    }).collect();
+
+    let (dosage, gp) = run_chunked_gibbs(&bamgl.gl3, srp, &wgs_idx, &cm, n_samples, n_shared, params);
+
+    Ok(LcwgsOutput { dosage, gp, n_variants: n_shared, sample_ids: bamgl.sample_ids, variants })
+}
+
 /// Chunk the chromosome by cM and run the Gibbs per chunk with its own
 /// conditioning set. Each chunk has a core region (whose dosage is kept) and
 /// a buffer region on each side (computed but discarded — absorbs edge
