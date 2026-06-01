@@ -163,7 +163,21 @@ pub fn process_window_hmm(
             };
             let n_cand = candidates.len();
             if n_cand == 0 {
-                return (tgt, HmmResult { weights: Vec::new(), hap_posterior: None });
+                // No PBWT conditioning candidates for this target hap. Emit a
+                // VALID all-zero CsrWeights (per-chip-site indptr of length
+                // n_var_w+1, no entries) rather than an empty `weights` vec:
+                // downstream interpolation indexes weights[0].indptr[chip_site]
+                // (io/pipeline.rs / streaming), so an empty vec panicked. A
+                // zero-weight matrix contributes nothing for this hap (the only
+                // sound result with no reference support) instead of crashing.
+                let empty = super::hmm::CsrWeights {
+                    indptr: vec![0i32; n_var_w + 1],
+                    indices: Vec::new(),
+                    data: Vec::new(),
+                    n_rows: n_var_w,
+                    n_cols: n_ref,
+                };
+                return (tgt, HmmResult { weights: vec![(tgt, empty)], hap_posterior: None });
             }
             let is_full = n_cand < FULL_PANEL_HMM_THRESHOLD;
             let m_red = if is_full { m } else { n_cand + 1 };
