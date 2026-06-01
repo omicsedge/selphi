@@ -74,6 +74,29 @@ fn resolve_contig(header: &Header, chrom: &str) -> Option<(usize, Vec<u8>)> {
     }
 }
 
+/// Sample id for a pileup output column: first `@RG SM` in the header, else the
+/// alignment file's stem. Shared by the BAM and CRAM paths.
+fn read_group_sample_id(header: &Header, path: &str) -> String {
+    header
+        .read_groups()
+        .values()
+        .find_map(|rg| rg.other_fields().get(b"SM").map(|v| String::from_utf8_lossy(v).into_owned()))
+        .unwrap_or_else(|| {
+            std::path::Path::new(path).file_stem().map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string())
+        })
+}
+
+/// 1-based inclusive `[rs, re]` → a noodles `Region` on `name`, for an indexed
+/// BAM/CRAM query. Shared by the BAM and CRAM region paths.
+fn build_region(name: Vec<u8>, rs: i64, re: i64) -> io::Result<Region> {
+    let start = Position::try_from(rs.max(1) as usize)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let end = Position::try_from(re.max(1) as usize)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    Ok(Region::new(name, start..=end))
+}
+
 /// Phred→error lookup tables (q ∈ 0..=93). Precomputed once: log10(1-ε),
 /// log10(ε/3), and the linear (1-ε), (ε/3) for the het term — avoids powf/log10
 /// in the per-base hot loop. Shared with the indel pair-HMM emission model.
@@ -172,15 +195,7 @@ fn pileup_one(
     let mut reader = bam::io::reader::Builder::default().build_from_path(path)?;
     let header = reader.read_header()?;
 
-    // Sample id: first @RG SM, else file stem.
-    let sample_id = header
-        .read_groups()
-        .values()
-        .find_map(|rg| rg.other_fields().get(b"SM").map(|v| String::from_utf8_lossy(v).into_owned()))
-        .unwrap_or_else(|| {
-            std::path::Path::new(path).file_stem().map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.to_string())
-        });
+    let sample_id = read_group_sample_id(&header, path);
 
     // Map chrom name → reference id in this BAM (chr-prefix tolerant).
     let resolved = resolve_contig(&header, chrom);
@@ -241,11 +256,7 @@ fn pileup_one(
         let region_query = region.filter(|_| std::path::Path::new(&bai_path).exists());
         if let Some((rs, re)) = region_query {
             let index = bam::bai::fs::read(&bai_path)?;
-            let start = Position::try_from(rs.max(1) as usize)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            let end = Position::try_from(re.max(1) as usize)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            let reg = Region::new(contig_name.clone(), start..=end);
+            let reg = build_region(contig_name.clone(), rs, re)?;
             let mut q = reader.query(&header, &index, &reg)?;
             let mut record = bam::Record::default();
             while q.read_record(&mut record)? != 0 {
@@ -319,15 +330,7 @@ fn pileup_one_cram(
         .build_from_path(path)?;
     let header = reader.read_header()?;
 
-    // Sample id: first @RG SM, else file stem.
-    let sample_id = header
-        .read_groups()
-        .values()
-        .find_map(|rg| rg.other_fields().get(b"SM").map(|v| String::from_utf8_lossy(v).into_owned()))
-        .unwrap_or_else(|| {
-            std::path::Path::new(path).file_stem().map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.to_string())
-        });
+    let sample_id = read_group_sample_id(&header, path);
 
     let mut ll = vec![[0.0f64; 3]; n_var];
     let mut depth = vec![0u32; n_var];
@@ -390,11 +393,7 @@ fn pileup_one_cram(
                 }
             })
             .collect();
-        let start = Position::try_from(rs.max(1) as usize)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let end = Position::try_from(re.max(1) as usize)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let reg = Region::new(contig_name.clone(), start..=end);
+        let reg = build_region(contig_name.clone(), rs, re)?;
         for result in reader.query(&header, &index, &reg)? {
             process(&result?);
         }
