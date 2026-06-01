@@ -1673,6 +1673,7 @@ dependencies = [
  "noodles-bam",
  "noodles-bcf",
  "noodles-bgzf 0.46.0",
+ "noodles-core 0.20.0",
  "noodles-sam",
  "noodles-vcf 0.82.0",
  "num_cpus",

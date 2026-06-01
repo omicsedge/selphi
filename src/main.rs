@@ -134,8 +134,21 @@ fn main() {
 
         // Run lcWGS pipeline (BAM-native GL pileup, or pre-computed PL VCF)
         let params = selphi::lcwgs::LcwgsParams::default();
+        // Optional --region "chr:start-end" (or "chr") to bound BAM-mode imputation.
+        let bam_region: Option<(String, i64, i64)> = args.region.as_deref().map(|r| {
+            match r.split_once(':') {
+                Some((c, range)) => {
+                    let (s, e) = range.split_once('-').unwrap_or((range, range));
+                    let s = s.replace(',', "").parse::<i64>().unwrap_or(1);
+                    let e = e.replace(',', "").parse::<i64>().unwrap_or(i64::MAX);
+                    (c.to_string(), s, e)
+                }
+                None => (r.to_string(), 1, i64::MAX),
+            }
+        });
         let result = if bam_mode {
-            selphi::lcwgs::pipeline::run_lcwgs_bam(&bam_paths, &srp, map, &params, None, args.threads)
+            let reg = bam_region.as_ref().map(|(c, s, e)| (c.as_str(), *s, *e));
+            selphi::lcwgs::pipeline::run_lcwgs_bam(&bam_paths, &srp, map, &params, reg, args.threads)
         } else {
             selphi::lcwgs::pipeline::run_lcwgs(input, &srp, map, &params, args.threads)
         }.unwrap_or_else(|e| { eprintln!("lcWGS pipeline failed: {}", e); std::process::exit(1); });

@@ -21,7 +21,11 @@ fn main() {
         ab.push(f[2].as_bytes()[0]);
         snp.push(f[1].len() == 1 && f[2].len() == 1);
     }
-    let r = pileup_bams(&[bam.clone()], chrom, &pos, &rb, &ab, &snp, PileupParams::default()).unwrap();
+    // Optional 4th arg: region "start-end" → use the indexed query.
+    let region: Option<(i64, i64)> = a.get(4).and_then(|s| {
+        s.split_once('-').map(|(x, y)| (x.replace(',', "").parse().unwrap(), y.replace(',', "").parse().unwrap()))
+    });
+    let r = pileup_bams(&[bam.clone()], chrom, &pos, &rb, &ab, &snp, region, PileupParams::default()).unwrap();
     for i in 0..pos.len() {
         let (g0, g1, g2) = (r.gl3[i * 3], r.gl3[i * 3 + 1], r.gl3[i * 3 + 2]);
         let mx = g0.max(g1).max(g2);
