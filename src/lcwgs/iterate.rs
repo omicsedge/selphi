@@ -56,6 +56,58 @@ pub struct GibbsOutput {
     pub cond_final: Vec<Vec<u32>>,
 }
 
+/// One target haplotype's HMM pass: build the conditional per-site emission
+/// likelihood (each site's HL conditioned on the partner hap's allele at that
+/// site, via `partner_at`), run the GL-weighted forward-backward over `cond`,
+/// and sample a fresh allele per site from the posterior. Shared by the
+/// per-hap-parallel (snapshot) and per-sample-sequential diploid scans.
+#[allow(clippy::too_many_arguments)]
+fn run_one_hap<F: Fn(usize) -> usize>(
+    h: usize, s: usize, it: usize, seed: u64,
+    partner_at: F,
+    cond: &[u32],
+    gl3: &[f32], ref_bm: &HaplotypeBitmatrix, cm: &[f64], params: &LcwgsParams,
+    recomb_ref: Option<&[f32]>, use_scaffold: bool, common_idx: &[usize],
+    n_var: usize, n_samples: usize,
+) -> (Vec<f32>, Vec<u8>) {
+    let mut hap_hl = vec![0.0f32; n_var * 2];
+    for v in 0..n_var {
+        let ca = partner_at(v); // 0 or 1
+        let g_base = v * n_samples * 3 + 3 * s;
+        let a = gl3[g_base + ca];        // P(this hap REF | partner ca)
+        let b = gl3[g_base + 1 + ca];    // P(this hap ALT | partner ca)
+        let sum = a + b;
+        if sum > f32::MIN_POSITIVE {
+            let inv = 1.0 / sum;
+            hap_hl[2 * v] = a * inv;
+            hap_hl[2 * v + 1] = b * inv;
+        } else {
+            hap_hl[2 * v] = 0.5;
+            hap_hl[2 * v + 1] = 0.5;
+        }
+    }
+    let dose: Vec<f32> = if cond.is_empty() {
+        (0..n_var).map(|v| hap_hl[2 * v + 1]).collect()
+    } else if use_scaffold {
+        run_forward_backward_scaffold(&hap_hl, common_idx, cond, ref_bm, cm, params).dosage
+    } else {
+        run_forward_backward(&hap_hl, cond, ref_bm, cm, params, recomb_ref).dosage
+    };
+    let mut sampled = vec![0u8; n_var];
+    for v in 0..n_var {
+        let mut x = seed
+            .wrapping_add((it as u64).wrapping_mul(0x100_0000_01b3))
+            .wrapping_add((h as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .wrapping_add((v as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+        x ^= x >> 30; x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 27; x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^= x >> 31;
+        let u = (x >> 40) as f32 / (1u64 << 24) as f32; // uniform [0,1)
+        sampled[v] = if u < dose[v] { 1 } else { 0 };
+    }
+    (dose, sampled)
+}
+
 /// Run the GLIMPSE2-style Gibbs alternation for all samples.
 ///
 /// `gl3[v * n_samples * 3 + 3*s + g]` is the normalized 3-way genotype
@@ -334,6 +386,10 @@ pub fn run_gibbs(
     // every local region (incl. locally-matching rare carriers) before adding
     // redundant depth (see rare_ibs.rs). modulo/depth/gate match GLIMPSE2's
     // pbwt_modulo_cm=0.1 / pbwt_depth=12 / "long matches only".
+    // Sequential diploid scan (GLIMPSE2 phase_individual): phase hap0, then hap1
+    // conditioned on hap0's freshly-sampled allele within the same iteration,
+    // coupling the two haps via the per-genotype GL. Default off = snapshot scan.
+    let seq_diploid = std::env::var("LCWGS_SEQ_DIPLOID").is_ok();
     let matchext = std::env::var("LCWGS_MATCHEXT").is_ok();
     let mx_modulo = std::env::var("LCWGS_MATCHEXT_MODULO").ok()
         .and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.1);
@@ -432,56 +488,45 @@ pub fn run_gibbs(
         if let Some(t) = t0 { t_clone += t.elapsed().as_secs_f64(); }
 
         let t0 = if timing { Some(std::time::Instant::now()) } else { None };
-        let results: Vec<(usize, Vec<f32>, Vec<u8>)> = (0..n_target_haps).into_par_iter().map(|h| {
-            let s = h / 2;
-            let partner = if h & 1 == 0 { h + 1 } else { h - 1 };
-
-            // Build conditional per-hap HL: for each variant, condAllele is
-            // the partner's current sampled allele. GLIMPSE2:
-            //   HL[0] = gl[0+ca] / (gl[0+ca] + gl[1+ca])
-            //   HL[1] = gl[1+ca] / (gl[0+ca] + gl[1+ca])
-            let mut hap_hl = vec![0.0f32; n_var * 2];
-            for v in 0..n_var {
-                let ca = prev_alleles[v * n_target_haps + partner] as usize; // 0 or 1
-                let g_base = v * n_samples * 3 + 3 * s;
-                let a = gl3[g_base + ca];       // P(this hap REF | partner ca)
-                let b = gl3[g_base + 1 + ca];    // P(this hap ALT | partner ca)
-                let sum = a + b;
-                if sum > f32::MIN_POSITIVE {
-                    let inv = 1.0 / sum;
-                    hap_hl[2 * v] = a * inv;
-                    hap_hl[2 * v + 1] = b * inv;
-                } else {
-                    hap_hl[2 * v] = 0.5;
-                    hap_hl[2 * v + 1] = 0.5;
-                }
-            }
-
-            let cond = &cond_per_hap[h];
-            let dose: Vec<f32> = if cond.is_empty() {
-                (0..n_var).map(|v| hap_hl[2 * v + 1]).collect()
-            } else if use_scaffold {
-                run_forward_backward_scaffold(&hap_hl, &common_idx, cond, ref_bm, cm, params).dosage
-            } else {
-                run_forward_backward(&hap_hl, cond, ref_bm, cm, params, recomb_ref).dosage
-            };
-
-            // Sample a fresh allele per site from the posterior ALT prob.
-            // Deterministic xorshift on (seed, it, h, v).
-            let mut sampled = vec![0u8; n_var];
-            for v in 0..n_var {
-                let mut x = seed
-                    .wrapping_add((it as u64).wrapping_mul(0x100_0000_01b3))
-                    .wrapping_add((h as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
-                    .wrapping_add((v as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
-                x ^= x >> 30; x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-                x ^= x >> 27; x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
-                x ^= x >> 31;
-                let u = (x >> 40) as f32 / (1u64 << 24) as f32; // uniform [0,1)
-                sampled[v] = if u < dose[v] { 1 } else { 0 };
-            }
-            (h, dose, sampled)
-        }).collect();
+        let results: Vec<(usize, Vec<f32>, Vec<u8>)> = if seq_diploid {
+            // SEQUENTIAL diploid scan (GLIMPSE2 phase_individual): per sample,
+            // phase hap0 first, then phase hap1 conditioned on hap0's FRESHLY
+            // sampled allele (same iteration). This couples the two haps through
+            // the per-genotype GL within the iteration — for a low-read het
+            // carrier it lets one hap go ALT (via the panel) while the other
+            // explains the REF read, recovering the het that the snapshot scan
+            // (both haps reading stale partner state) pulls toward REF.
+            (0..n_samples).into_par_iter().flat_map(|s| {
+                let h0 = 2 * s;
+                let h1 = 2 * s + 1;
+                // hap0 ← partner = hap1's PREVIOUS-iteration allele.
+                let (dose0, samp0) = run_one_hap(
+                    h0, s, it, seed,
+                    |v| prev_alleles[v * n_target_haps + h1] as usize,
+                    &cond_per_hap[h0], gl3, ref_bm, cm, params, recomb_ref,
+                    use_scaffold, &common_idx, n_var, n_samples);
+                // hap1 ← partner = hap0's FRESH allele (this iteration).
+                let (dose1, samp1) = run_one_hap(
+                    h1, s, it, seed,
+                    |v| samp0[v] as usize,
+                    &cond_per_hap[h1], gl3, ref_bm, cm, params, recomb_ref,
+                    use_scaffold, &common_idx, n_var, n_samples);
+                [(h0, dose0, samp0), (h1, dose1, samp1)]
+            }).collect()
+        } else {
+            // Snapshot per-hap scan (default): both haps read the partner's
+            // previous-iteration allele; embarrassingly parallel over all haps.
+            (0..n_target_haps).into_par_iter().map(|h| {
+                let s = h / 2;
+                let partner = if h & 1 == 0 { h + 1 } else { h - 1 };
+                let (dose, sampled) = run_one_hap(
+                    h, s, it, seed,
+                    |v| prev_alleles[v * n_target_haps + partner] as usize,
+                    &cond_per_hap[h], gl3, ref_bm, cm, params, recomb_ref,
+                    use_scaffold, &common_idx, n_var, n_samples);
+                (h, dose, sampled)
+            }).collect()
+        };
         if let Some(t) = t0 { t_hmm += t.elapsed().as_secs_f64(); }
 
         // 3. Write back sampled alleles; collect per-hap dose for GP.
