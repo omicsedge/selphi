@@ -60,7 +60,11 @@ pub fn read_cohort_vcf(
     path: &str,
 ) -> (Vec<String>, Vec<TargetMarker>, Vec<Vec<[u8; 2]>>, bool) {
     use std::io::Read;
-    let is_gz = path.ends_with(".gz") || path.ends_with(".bcf");
+    // Real binary BCF → noodles decoder (captures the variant ID for panel output).
+    if path.ends_with(".bcf") {
+        return read_target_bcf(path, false, true);
+    }
+    let is_gz = path.ends_with(".gz");
     let file = std::fs::File::open(path)
         .unwrap_or_else(|e| { selphi_error!("Cannot open {}: {}", path, e); std::process::exit(1) });
     let mut raw = Vec::new();
@@ -70,6 +74,9 @@ pub fn read_cohort_vcf(
     } else {
         let mut reader = std::io::BufReader::new(file);
         reader.read_to_end(&mut raw).unwrap_or_else(|e| { selphi_error!("Failed to read VCF {}: {}", path, e); std::process::exit(1) });
+    }
+    if raw.starts_with(b"BCF\x02\x02") {
+        return read_target_bcf(path, false, true);
     }
 
     let mut markers = Vec::new();
@@ -163,7 +170,84 @@ pub fn read_cohort_vcf(
 // read_target_vcf
 // ---------------------------------------------------------------------------
 
-/// Read target VCF/BCF using noodles bgzf + manual text parsing.
+/// First-ALT + per-sample diploid `[a0,a1]` GT extraction from a decoded BCF
+/// record set. Shared binary-BCF target reader: a real BCF is BGZF-wrapped
+/// BINARY (magic `BCF\2\2`), which the VCF byte-scanner below cannot read —
+/// it would find zero markers. Uses the same noodles-bcf decoder + dispatch
+/// pattern as the lcWGS PL reader. `hash_alleles` mirrors [`read_target_vcf`].
+fn read_target_bcf(
+    path: &str, hash_alleles: bool, capture_id: bool,
+) -> (Vec<String>, Vec<TargetMarker>, Vec<Vec<[u8; 2]>>, bool) {
+    use noodles_bcf as bcf;
+    use noodles_vcf::variant::record_buf::samples::sample::Value;
+    use noodles_vcf::variant::record::samples::series::value::genotype::Phasing;
+
+    let mut reader = bcf::io::reader::Builder::default().build_from_path(path)
+        .unwrap_or_else(|e| { selphi_error!("Cannot open BCF {}: {}", path, e); std::process::exit(1) });
+    let header = reader.read_header()
+        .unwrap_or_else(|e| { selphi_error!("Cannot read BCF header {}: {}", path, e); std::process::exit(1) });
+    let sample_names: Vec<String> = header.sample_names().iter().cloned().collect();
+    if sample_names.is_empty() {
+        selphi_error!("No samples found in {}", path);
+        std::process::exit(1);
+    }
+
+    let mut markers = Vec::new();
+    let mut genotypes: Vec<Vec<[u8; 2]>> = Vec::new();
+    let mut is_phased = true;
+    let mut phase_checks = 10i32;
+
+    for result in reader.record_bufs(&header) {
+        let rec = match result { Ok(r) => r, Err(_) => continue };
+        let pos = match rec.variant_start() { Some(p) => usize::from(p) as i64, None => continue };
+        if pos < 1 { continue; }
+        let alt_allele = match rec.alternate_bases().as_ref().first() {
+            Some(a) if a != "." && !a.is_empty() => a.clone(),
+            _ => continue,
+        };
+        let chrom = rec.reference_sequence_name().to_string();
+        let ref_allele = rec.reference_bases().to_string();
+        // Hash mode matches each text reader: cohort (capture_id) leaves hashes
+        // empty; the imputation readers hash (when the panel uses hashed allele
+        // ids) or store the plain allele otherwise.
+        let (ref_hash, alt_hash) = if capture_id {
+            (String::new(), String::new())
+        } else if hash_alleles {
+            (crate::srp::blake2b_hex(&ref_allele), crate::srp::blake2b_hex(&alt_allele))
+        } else {
+            (ref_allele.clone(), alt_allele.clone())
+        };
+        let id = if capture_id {
+            rec.ids().as_ref().iter().next().cloned().unwrap_or_else(|| ".".to_string())
+        } else {
+            String::new()
+        };
+        markers.push(TargetMarker { chrom, pos, ref_allele, alt_allele, ref_hash, alt_hash, id });
+
+        let mut var_gts = Vec::with_capacity(sample_names.len());
+        for sample in rec.samples().values() {
+            let (a0, a1, phased) = match sample.get("GT").flatten() {
+                Some(Value::Genotype(gt)) => {
+                    let al = gt.as_ref();
+                    let a0 = al.first().and_then(|a| a.position()).unwrap_or(0).min(255) as u8;
+                    let a1 = al.get(1).and_then(|a| a.position()).unwrap_or(0).min(255) as u8;
+                    // VCF phasing is carried on the allele separators after the
+                    // first; a diploid is phased iff its 2nd allele is Phased.
+                    let phased = al.get(1).map(|a| a.phasing() == Phasing::Phased).unwrap_or(true);
+                    (a0, a1, phased)
+                }
+                _ => (0, 0, true),
+            };
+            if phase_checks > 0 { if !phased { is_phased = false; } phase_checks -= 1; }
+            var_gts.push([a0, a1]);
+        }
+        genotypes.push(var_gts);
+    }
+    (sample_names, markers, genotypes, is_phased)
+}
+
+/// Read target VCF/BCF using noodles bgzf + manual text parsing (real binary
+/// BCF is dispatched to [`read_target_bcf`]).
 /// Pure Rust — no bcftools dependency.
 pub fn read_target_vcf(
     path: &str, srp: &SrpReader,
@@ -175,8 +259,14 @@ pub fn read_target_vcf(
         !srp.ids[0].contains(first_ref)
     };
 
+    // Real (binary) BCF → noodles decoder; the byte-scan below only handles VCF
+    // text. Dispatch on extension first (avoids a double decompress), then sniff.
+    if path.ends_with(".bcf") {
+        return read_target_bcf(path, hash_alleles, false);
+    }
+
     // Read entire decompressed VCF into memory (avoid per-line String alloc)
-    let is_gz = path.ends_with(".gz") || path.ends_with(".bcf");
+    let is_gz = path.ends_with(".gz");
     let file = std::fs::File::open(path)
         .unwrap_or_else(|e| { selphi_error!("Cannot open {}: {}", path, e); std::process::exit(1) });
 
@@ -187,6 +277,10 @@ pub fn read_target_vcf(
     } else {
         let mut reader = std::io::BufReader::new(file);
         reader.read_to_end(&mut raw).unwrap_or_else(|e| { selphi_error!("Failed to read VCF {}: {}", path, e); std::process::exit(1) });
+    }
+    // Content-sniff: a BGZF-wrapped binary BCF (magic "BCF\2\2") misnamed .vcf.gz.
+    if raw.starts_with(b"BCF\x02\x02") {
+        return read_target_bcf(path, hash_alleles, false);
     }
 
     let mut markers = Vec::new();
@@ -514,8 +608,22 @@ pub fn read_target_vcf_multi_chr(
     path: &str,
 ) -> (Vec<String>, std::collections::BTreeMap<String, (Vec<TargetMarker>, Vec<Vec<[u8; 2]>>)>, bool) {
     use std::io::Read;
-
-    let is_gz = path.ends_with(".gz") || path.ends_with(".bcf");
+    type ByChr = std::collections::BTreeMap<String, (Vec<TargetMarker>, Vec<Vec<[u8; 2]>>)>;
+    // Real binary BCF → noodles decoder, then partition by chromosome.
+    let partition = |samples: Vec<String>, markers: Vec<TargetMarker>, gts: Vec<Vec<[u8; 2]>>, phased: bool| {
+        let mut by_chr: ByChr = std::collections::BTreeMap::new();
+        for (m, g) in markers.into_iter().zip(gts) {
+            let e = by_chr.entry(m.chrom.clone()).or_default();
+            e.0.push(m);
+            e.1.push(g);
+        }
+        (samples, by_chr, phased)
+    };
+    if path.ends_with(".bcf") {
+        let (s, m, g, p) = read_target_bcf(path, false, false);
+        return partition(s, m, g, p);
+    }
+    let is_gz = path.ends_with(".gz");
     let file = std::fs::File::open(path)
         .unwrap_or_else(|e| { selphi_error!("Cannot open {}: {}", path, e); std::process::exit(1) });
 
@@ -526,6 +634,10 @@ pub fn read_target_vcf_multi_chr(
     } else {
         let mut reader = std::io::BufReader::new(file);
         reader.read_to_end(&mut raw).unwrap_or_else(|e| { selphi_error!("Failed to read VCF {}: {}", path, e); std::process::exit(1) });
+    }
+    if raw.starts_with(b"BCF\x02\x02") {
+        let (s, m, g, p) = read_target_bcf(path, false, false);
+        return partition(s, m, g, p);
     }
 
     let mut all_markers: Vec<TargetMarker> = Vec::new();
