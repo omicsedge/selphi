@@ -195,13 +195,47 @@ pub fn run_lcwgs_bam(
         v.ref_allele.len() == 1 && v.alt_allele.len() == 1
     }).collect();
     let n_snp = is_snp.iter().filter(|&&b| b).count();
+    let n_indel = n_shared - n_snp;
 
-    selphi_info!("  lcWGS-BAM: {} BAM(s), chrom {}, {} panel sites ({} SNPs) to impute",
-        bam_paths.len(), chrom, n_shared, n_snp);
+    selphi_info!("  lcWGS-BAM: {} BAM(s), chrom {}, {} panel sites ({} SNPs, {} indels) to impute",
+        bam_paths.len(), chrom, n_shared, n_snp, n_indel);
+
+    // Indel sites are scored by local read-vs-haplotype realignment (pair-HMM),
+    // which needs the reference FASTA to build the local haplotypes. Built once,
+    // shared across samples. Without --reference (or if disabled) indels stay flat
+    // and are imputed from the panel/LD. Gated by LCWGS_NO_INDEL_REALIGN.
+    let disable_indel = std::env::var("LCWGS_NO_INDEL_REALIGN").is_ok();
+    let indel_model = if n_indel > 0 && !disable_indel {
+        match reference {
+            Some(refp) => {
+                let inputs: Vec<super::indel_realign::IndelInput> = (0..n_shared)
+                    .filter(|&i| !is_snp[i])
+                    .map(|i| {
+                        let v = &srp.variants[wgs_idx[i]];
+                        super::indel_realign::IndelInput {
+                            var_idx: i,
+                            pos: pos[i],
+                            ref_allele: v.ref_allele.as_bytes().to_vec(),
+                            alt_allele: v.alt_allele.as_bytes().to_vec(),
+                        }
+                    })
+                    .collect();
+                let m = super::indel_realign::IndelModel::build(refp, &chrom, &inputs)?;
+                selphi_info!("  lcWGS-BAM: indel realignment ON for {} indel sites", m.n_sites());
+                Some(m)
+            }
+            None => {
+                selphi_info!("  lcWGS-BAM: {} indel sites left flat (no --reference for realignment)", n_indel);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let pp = super::bam_pileup::PileupParams::default();
     let region_bounds = region.map(|(_, s, e)| (s, e));
-    let bamgl = super::bam_pileup::pileup_bams(bam_paths, &chrom, &pos, &ref_base, &alt_base, &is_snp, region_bounds, reference, pp)?;
+    let bamgl = super::bam_pileup::pileup_bams(bam_paths, &chrom, &pos, &ref_base, &alt_base, &is_snp, region_bounds, reference, indel_model.as_ref(), pp)?;
     let n_samples = bamgl.sample_ids.len();
 
     // cM positions + variant identities (panel order).
