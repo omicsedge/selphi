@@ -33,7 +33,7 @@
 use std::io::Read;
 
 use crate::io::target_io::TargetMarker;
-use crate::{selphi_error, selphi_info};
+use crate::selphi_info;
 
 // ---------------------------------------------------------------------------
 // LUT: phred → likelihood
@@ -208,13 +208,125 @@ pub struct PlVcfResult {
     pub sample_ids: Vec<String>,
 }
 
+const FLAT_HL: [f32; 2] = [0.5, 0.5];
+const FLAT_GL3: [f32; 3] = [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0];
+
+/// One PL triple → `(per-hap HL, 3-way GL, valid)`. `valid=false` (→ flat
+/// `[0.5,0.5]` / `[⅓,⅓,⅓]`) when PL is absent/malformed or the likelihoods sum
+/// to ~0. Shared by the VCF-text and BCF parsers so both produce identical GLs.
+#[inline]
+fn pl_to_hl_gl3(pl: Option<[i32; 3]>) -> ([f32; 2], [f32; 3], bool) {
+    let pl = match pl { Some(p) => p, None => return (FLAT_HL, FLAT_GL3, false) };
+    let l00 = phred_to_lik(pl[0]);
+    let l01 = phred_to_lik(pl[1]);
+    let l11 = phred_to_lik(pl[2]);
+    let gsum = l00 + l01 + l11;
+    let gl3 = if gsum > f32::MIN_POSITIVE {
+        let gi = 1.0 / gsum;
+        [l00 * gi, l01 * gi, l11 * gi]
+    } else {
+        FLAT_GL3
+    };
+    let a = l00 + 0.5 * l01;
+    let b = l11 + 0.5 * l01;
+    let sum = a + b;
+    if sum > f32::MIN_POSITIVE {
+        let inv = 1.0 / sum;
+        ([a * inv, b * inv], gl3, true)
+    } else {
+        (FLAT_HL, FLAT_GL3, false)
+    }
+}
+
+/// Extract a `[pl00, pl01, pl11]` triple from a decoded BCF `PL` sample value
+/// (an integer array). Returns `None` if absent, non-integer, short, or any
+/// element is missing.
+fn bcf_value_to_pl3(
+    v: &noodles_vcf::variant::record_buf::samples::sample::value::Value,
+) -> Option<[i32; 3]> {
+    use noodles_vcf::variant::record_buf::samples::sample::value::{Array, Value};
+    match v {
+        Value::Array(Array::Integer(vals)) if vals.len() >= 3 => Some([vals[0]?, vals[1]?, vals[2]?]),
+        _ => None,
+    }
+}
+
+/// Read a real (binary) BCF target with a `PL` FORMAT field → per-hap
+/// likelihoods, producing the same [`PlVcfResult`] as the VCF-text path. Uses
+/// the battle-tested `noodles-bcf` decoder (the VCF-text parser cannot read
+/// binary BCF — see [`parse_pl_vcf`]).
+fn parse_pl_bcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Result<PlVcfResult> {
+    use noodles_bcf as bcf;
+    let mut reader = bcf::io::reader::Builder::default().build_from_path(path)?;
+    let header = reader.read_header()?;
+    let sample_ids: Vec<String> = header.sample_names().iter().cloned().collect();
+    let n_samples = sample_ids.len();
+    if n_samples == 0 {
+        return Err(std::io::Error::other(format!("No samples in BCF {path}")));
+    }
+
+    let mut markers: Vec<TargetMarker> = Vec::new();
+    let mut hl: Vec<f32> = Vec::new();
+    let mut gl3: Vec<f32> = Vec::new();
+    let mut n_variants_seen = 0usize;
+    let mut n_missing_pl = 0usize;
+
+    for result in reader.record_bufs(&header) {
+        let rec = result?;
+        let pos = match rec.variant_start() { Some(p) => usize::from(p) as i64, None => continue };
+        if pos < 1 { continue; }
+        let alt_allele = match rec.alternate_bases().as_ref().first() {
+            Some(a) if a != "." && !a.is_empty() => a.clone(),
+            _ => continue, // no ALT → not a biallelic-style target site
+        };
+        let chrom = rec.reference_sequence_name().to_string();
+        let ref_allele = rec.reference_bases().to_string();
+        let (ref_hash, alt_hash) = if hash_alleles_against_srp {
+            (crate::srp::blake2b_hex(&ref_allele), crate::srp::blake2b_hex(&alt_allele))
+        } else {
+            (ref_allele.clone(), alt_allele.clone())
+        };
+        markers.push(TargetMarker { chrom, pos, ref_allele, alt_allele, ref_hash, alt_hash, id: String::new() });
+        n_variants_seen += 1;
+
+        let var_off = hl.len();
+        hl.resize(var_off + n_samples * 2, 0.5);
+        let gl_off = gl3.len();
+        gl3.resize(gl_off + n_samples * 3, 1.0 / 3.0);
+
+        let samples = rec.samples();
+        for (s, sample) in samples.values().enumerate() {
+            if s >= n_samples { break; }
+            let pl_opt = sample.get("PL").flatten().and_then(|v| bcf_value_to_pl3(v));
+            let (hlp, glp, valid) = pl_to_hl_gl3(pl_opt);
+            if !valid { n_missing_pl += 1; }
+            hl[var_off + 2 * s] = hlp[0];
+            hl[var_off + 2 * s + 1] = hlp[1];
+            gl3[gl_off + 3 * s] = glp[0];
+            gl3[gl_off + 3 * s + 1] = glp[1];
+            gl3[gl_off + 3 * s + 2] = glp[2];
+        }
+    }
+
+    selphi_info!(
+        "  PL BCF: {} samples, {} variants ({} sample-sites with missing/malformed PL → flat 0.5/0.5)",
+        n_samples, n_variants_seen, n_missing_pl,
+    );
+    Ok(PlVcfResult { hl, gl3, markers, sample_ids })
+}
+
 /// Read a VCF/BCF target with `PL` field → per-hap likelihoods.
 ///
 /// Pure-Rust: bgzf-decompress, scan, byte-slice parsing.
 pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Result<PlVcfResult> {
-    let is_gz = path.ends_with(".gz") || path.ends_with(".bcf");
-    let file = std::fs::File::open(path)
-        .unwrap_or_else(|e| { selphi_error!("Cannot open {}: {}", path, e); std::process::exit(1) });
+    // Real (binary) BCF is parsed by noodles-bcf; the byte-scan below only
+    // handles VCF text. Dispatch on extension first (common case, avoids a
+    // double decompress), then content-sniff for a misnamed BCF.
+    if path.ends_with(".bcf") {
+        return parse_pl_bcf(path, hash_alleles_against_srp);
+    }
+    let is_gz = path.ends_with(".gz");
+    let file = std::fs::File::open(path)?;
 
     // Decompress entire VCF (Selphi convention; bgzf streaming uses
     // multi-threaded reads internally on noodles).
@@ -225,6 +337,10 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
     } else {
         let mut reader = std::io::BufReader::new(file);
         reader.read_to_end(&mut raw)?;
+    }
+    // Content-sniff: a BGZF-wrapped binary BCF (magic "BCF\2\2") misnamed .vcf.gz.
+    if raw.starts_with(b"BCF\x02\x02") {
+        return parse_pl_bcf(path, hash_alleles_against_srp);
     }
 
     // Pre-scan: count non-header newlines for capacity reservation
@@ -335,44 +451,20 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
             let field = &gt_region[field_start..field_end];
 
             // (h0, h1) = pre-marginalized per-hap likelihood;
-            // (g0, g1, g2) = normalized 3-way genotype likelihood.
-            let (h0, h1, g0, g1, g2) = match pl_pos {
-                Some(p) => match extract_subfield(field, p) {
-                    Some(pl_bytes) => match parse_pl_field(pl_bytes) {
-                        Some(pl) => {
-                            let l00 = phred_to_lik(pl[0]);
-                            let l01 = phred_to_lik(pl[1]);
-                            let l11 = phred_to_lik(pl[2]);
-                            let gsum = l00 + l01 + l11;
-                            let (g0, g1, g2) = if gsum > f32::MIN_POSITIVE {
-                                let gi = 1.0 / gsum;
-                                (l00 * gi, l01 * gi, l11 * gi)
-                            } else {
-                                (1.0/3.0, 1.0/3.0, 1.0/3.0)
-                            };
-                            let a = l00 + 0.5 * l01;
-                            let b = l11 + 0.5 * l01;
-                            let sum = a + b;
-                            if sum > f32::MIN_POSITIVE {
-                                let inv = 1.0 / sum;
-                                (a * inv, b * inv, g0, g1, g2)
-                            } else {
-                                n_missing_pl += 1; (0.5, 0.5, 1.0/3.0, 1.0/3.0, 1.0/3.0)
-                            }
-                        }
-                        None => { n_missing_pl += 1; (0.5, 0.5, 1.0/3.0, 1.0/3.0, 1.0/3.0) }
-                    },
-                    None => { n_missing_pl += 1; (0.5, 0.5, 1.0/3.0, 1.0/3.0, 1.0/3.0) }
-                },
-                None => { n_missing_pl += 1; (0.5, 0.5, 1.0/3.0, 1.0/3.0, 1.0/3.0) }
-            };
+            // (g0, g1, g2) = normalized 3-way genotype likelihood. Shared with
+            // the BCF path via pl_to_hl_gl3 so both produce identical GLs.
+            let pl_opt = pl_pos
+                .and_then(|p| extract_subfield(field, p))
+                .and_then(parse_pl_field);
+            let (hlp, glp, valid) = pl_to_hl_gl3(pl_opt);
+            if !valid { n_missing_pl += 1; }
             // SAFETY: var_off + 2*s + 1 < var_off + n_samples*2, in bounds.
             unsafe {
-                *hl.get_unchecked_mut(var_off + 2 * s)     = h0;
-                *hl.get_unchecked_mut(var_off + 2 * s + 1) = h1;
-                *gl3.get_unchecked_mut(gl_off + 3 * s)     = g0;
-                *gl3.get_unchecked_mut(gl_off + 3 * s + 1) = g1;
-                *gl3.get_unchecked_mut(gl_off + 3 * s + 2) = g2;
+                *hl.get_unchecked_mut(var_off + 2 * s)     = hlp[0];
+                *hl.get_unchecked_mut(var_off + 2 * s + 1) = hlp[1];
+                *gl3.get_unchecked_mut(gl_off + 3 * s)     = glp[0];
+                *gl3.get_unchecked_mut(gl_off + 3 * s + 1) = glp[1];
+                *gl3.get_unchecked_mut(gl_off + 3 * s + 2) = glp[2];
             }
 
             field_start = if field_end < n { field_end + 1 } else { n };
@@ -380,8 +472,7 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
     }
 
     if sample_names.is_empty() {
-        selphi_error!("No samples in PL VCF {}", path);
-        std::process::exit(1);
+        return Err(std::io::Error::other(format!("No samples in PL VCF {path}")));
     }
     selphi_info!(
         "  PL VCF: {} samples, {} variants ({} sample-sites with missing/malformed PL → flat 0.5/0.5)",
