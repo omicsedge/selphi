@@ -109,13 +109,14 @@ pub fn merge_batch_vcfs(
             }
         }
 
-        // Parallel merge across the chunk's records.
+        // Parallel merge across the chunk's records. A malformed/mismatched
+        // record yields Err; collecting into io::Result short-circuits and
+        // propagates it out of the rayon pool instead of panicking a worker.
         let merged: Vec<(Vec<u8>, String, i64, i64)> = (0..chunk_lines).into_par_iter().map(|i| {
             let mut batch_lines: Vec<&str> = Vec::with_capacity(n_batches);
             for bi in 0..n_batches { batch_lines.push(&chunk_per_batch[bi][i]); }
             merge_one_record(&batch_lines, n_samples_total, no_ap)
-                .expect("merge_one_record failed")
-        }).collect();
+        }).collect::<std::io::Result<Vec<_>>>()?;
 
         for (buf, chrom, pos, rlen) in merged {
             writer.write_all(&buf)?;
@@ -513,4 +514,66 @@ fn write_u32(buf: &mut Vec<u8>, v: u32) {
         n /= 10;
     }
     buf.extend_from_slice(&tmp[i..]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Write a minimal single-sample bgzf VCF (header + one variant line).
+    fn write_bgzf_vcf(path: &Path, sample: &str, variant_line: &str) {
+        let f = std::fs::File::create(path).unwrap();
+        let mut w = noodles_bgzf::io::Writer::new(f);
+        writeln!(w, "##fileformat=VCFv4.2").unwrap();
+        writeln!(w, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{sample}").unwrap();
+        writeln!(w, "{variant_line}").unwrap();
+        w.finish().unwrap();
+    }
+
+    /// A per-record failure inside the rayon merge must propagate as `Err`
+    /// rather than panicking a worker thread (regression test for the former
+    /// `.expect("merge_one_record failed")`).
+    #[test]
+    fn merge_propagates_record_error_without_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let b0 = dir.path().join("batch0.vcf.gz");
+        let b1 = dir.path().join("batch1.vcf.gz");
+        // Same record count + matching FORMAT, but a mismatched shared prefix
+        // (POS 100 vs 200) → merge_one_record returns Err for this record.
+        write_bgzf_vcf(&b0, "S0", "22\t100\t.\tA\tG\t.\tPASS\t.\tGT:DS:AP1:AP2\t0|0:0:0:0");
+        write_bgzf_vcf(&b1, "S1", "22\t200\t.\tA\tG\t.\tPASS\t.\tGT:DS:AP1:AP2\t0|0:0:0:0");
+
+        let out = dir.path().join("merged.vcf.gz");
+        let names = vec!["S0".to_string(), "S1".to_string()];
+        let res = merge_batch_vcfs(
+            &[b0, b1],
+            &out,
+            &names,
+            "##contig=<ID=22>",
+            "test",
+            false,
+        );
+        assert!(res.is_err(), "expected Err from mismatched batch records, got Ok");
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            msg.contains("shared prefix mismatch"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    /// A well-formed pair of batches merges cleanly to a single record.
+    #[test]
+    fn merge_two_batches_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let b0 = dir.path().join("ok0.vcf.gz");
+        let b1 = dir.path().join("ok1.vcf.gz");
+        write_bgzf_vcf(&b0, "S0", "22\t100\t.\tA\tG\t.\tPASS\t.\tGT:DS:AP1:AP2\t0|0:0:0:0");
+        write_bgzf_vcf(&b1, "S1", "22\t100\t.\tA\tG\t.\tPASS\t.\tGT:DS:AP1:AP2\t1|1:2:1:1");
+        let out = dir.path().join("ok.vcf.gz");
+        let names = vec!["S0".to_string(), "S1".to_string()];
+        let res = merge_batch_vcfs(&[b0, b1], &out, &names, "##contig=<ID=22>", "test", false);
+        assert!(res.is_ok(), "expected Ok, got {res:?}");
+        assert!(out.exists());
+    }
 }
