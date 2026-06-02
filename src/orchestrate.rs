@@ -38,6 +38,12 @@ pub struct MultiChrImputeConfig {
     pub no_em_ne: bool,
     pub phasing_engine: String,  // "auto", "haploid", "diploid"
     pub force_phasing: bool,
+    /// `--precompute-candidates`: chromosome-wide PBWT candidate precompute (opt-in).
+    /// Default false = per-window selection, which avoids the admixed-target
+    /// truncation bias (+0.005–0.007 OVERALL R²; see cli.rs). The single-chr path
+    /// already gates on this flag; multi-chr must too, or admixed multi-chr runs
+    /// silently get the worse chr-wide selection.
+    pub precompute_candidates: bool,
     pub bcf: bool,
     pub parquet: bool,
     pub pgen: bool,
@@ -334,10 +340,13 @@ pub fn run_multi_chr(
             );
         }
 
-        // Pre-compute candidates if phasing ran. Gate by retention cost.
+        // Pre-compute chr-wide candidates only when the user opted in
+        // (--precompute-candidates) AND phasing ran AND the retention cost fits.
+        // Default (flag off) = per-window selection (matches the single-chr path;
+        // avoids the admixed truncation bias).
         let precomp_bytes: u64 = (n_haps as u64) * (effective_mc as u64) * 4;
         let precomp_cap_bytes: u64 = 2 * 1024 * 1024 * 1024;
-        let precomputed_candidates: Option<Vec<Vec<u32>>> = if needs_phasing && precomp_bytes <= precomp_cap_bytes {
+        let precomputed_candidates: Option<Vec<Vec<u32>>> = if config.precompute_candidates && needs_phasing && precomp_bytes <= precomp_cap_bytes {
             let coded_full = selphi::imputation::pbwt::build_coded_steps_bm(
                 &ref_bm_imp, 0, n_chip, n_ref, &targ_alleles, n_haps, &chip_cm, 0.05,
             );
