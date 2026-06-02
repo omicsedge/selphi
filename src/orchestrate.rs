@@ -61,6 +61,46 @@ pub struct MultiChrImputeConfig {
     pub map_dir: Option<String>,
 }
 
+impl MultiChrImputeConfig {
+    /// Build from parsed CLI args. `map_dir` is the only field that differs
+    /// between the two dispatch arms (the `--refpanel-dir` path vs `args.map_dir`);
+    /// every other field is a verbatim copy of `args`, so both main.rs
+    /// construction sites collapse to one call each (no field-drift risk).
+    pub fn from_args(args: &crate::cli::Args, map_dir: Option<String>) -> Self {
+        Self {
+            threads: args.threads,
+            seed: args.seed,
+            window_cm: args.window_cm,
+            overlap_cm: args.overlap_cm,
+            match_length: args.match_length,
+            est_ne: args.est_ne,
+            max_candidates: args.max_candidates,
+            adaptive_mc_frac: args.adaptive_mc_frac,
+            adaptive_mc_cv_alpha: args.adaptive_mc_cv_alpha,
+            adaptive_mc_max: args.adaptive_mc_max,
+            // sample_batch_size (user-facing): N SAMPLES per batch.
+            // Internally stored as N × 2 hap units (diploid).
+            target_batch_size: args.sample_batch_size.saturating_mul(2),
+            p_err: args.p_err,
+            no_ap: args.no_ap,
+            no_em_ne: args.no_em_ne,
+            phasing_engine: format!("{:?}", args.phasing_engine).to_lowercase(),
+            wgs_phasing: args.wgs_phasing,
+            force_phasing: args.force_phasing,
+            max_cond_haps: args.max_cond_haps,
+            fl_fwd: args.fl_fwd,
+            fl_bwd: args.fl_bwd,
+            precompute_candidates: args.precompute_candidates,
+            bcf: args.bcf,
+            parquet: args.parquet,
+            pgen: args.pgen,
+            selfdecode: args.selfdecode,
+            all_formats: args.all_formats,
+            map_dir,
+        }
+    }
+}
+
 /// Load chromosome data synchronously (used for first chr or if prefetch was skipped).
 fn load_chr_data(
     multi_srp: &MultiChrSrpReader,
