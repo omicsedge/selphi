@@ -177,17 +177,28 @@ pub fn run_phase_common_bm(
         let chunk_starts = &pbwt_idx.chunk_starts;
 
         // Read haplotypes from unified bitmatrix.
-        // SAFETY: We use raw pointer arithmetic for concurrent access. Each chunk reads
-        // from overlapping row ranges (due to PBWT buffer prefix), but only WRITES to
-        // rows where `chunk_assignments[l] == chunk_id` — these are disjoint across
-        // chunks. We store the pointer as usize for Send, then reconstruct as *mut u64
-        // inside each thread. This avoids creating aliased `&mut [u64]` slices (UB).
+        // SAFETY + DETERMINISM: chunks run in parallel and each WRITES only the rows
+        // it owns (chunk_assignments[l] == chunk_id) — disjoint across chunks. But
+        // each chunk also READS a back-stepped buffer prefix that lies inside the
+        // PREVIOUS chunk's owned (and concurrently-written) rows. Reading the live
+        // bitmatrix there is a data race: the warm-up would see a timing-dependent
+        // mix of this-iteration partial writes → UB + nondeterministic phasing.
+        // Fix: every chunk READS allele rows from an immutable SNAPSHOT of the
+        // bitmatrix taken before the sweep (the previous iteration's consistent
+        // phasing — exactly what the PBWT warm-up should condition on), and only
+        // WRITES go to the live bitmatrix. Within a chunk the phasing propagates
+        // through `row_buf` + the PBWT a/c/r arrays, not via re-reads, so reading
+        // own rows from the snapshot (their pre-sweep input state) is equivalent.
         let bm_bits_ptr = hap_bm.bits_ptr() as usize;
         let bm_n_words = hap_bm.n_words();
         let bm_total_len = n_var * bm_n_words;
+        let bm_snapshot: Vec<u64> =
+            unsafe { std::slice::from_raw_parts(bm_bits_ptr as *const u64, bm_total_len) }.to_vec();
+        let snap_ptr = bm_snapshot.as_ptr() as usize;
 
         (0..n_sweep_chunks).into_par_iter().for_each(|chunk_id| {
             let bm_ptr = bm_bits_ptr as *mut u64;
+            let snap = snap_ptr as *const u64;
             debug_assert!(!bm_ptr.is_null());
             let _ = bm_total_len; // used for bounds reasoning
             let buffer_start = chunk_starts[chunk_id];
@@ -211,8 +222,9 @@ pub fn run_phase_common_bm(
                     let row_base = l * bm_n_words;
                     row_buf.fill(0);
                     for w in 0..bm_n_words {
-                        // SAFETY: row_base + w < bm_total_len, pointer is valid
-                        let mut word = unsafe { bm_ptr.add(row_base + w).read() };
+                        // Read from the immutable snapshot (race-free, deterministic):
+                        // row_base + w < bm_total_len, pointer valid.
+                        let mut word = unsafe { snap.add(row_base + w).read() };
                         let base = w * 64;
                         while word != 0 {
                             let k = word.trailing_zeros() as usize;
