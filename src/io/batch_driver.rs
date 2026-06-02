@@ -52,6 +52,21 @@ pub fn for_each_batch<E>(
     Ok(())
 }
 
+/// Finalize a vector of per-batch writers by running each (in order) through
+/// `finish`, collecting the resulting output path(s). Shared shell of the five
+/// `finalize_*_batch_writers`: each passes its own `finish` closure (drop tx +
+/// join thread / flush pvar + `pgen.finish` / `writer.finish` / `ArrowWriter::close`).
+pub fn finalize_writers<W, P, E>(
+    writers: Vec<W>,
+    mut finish: impl FnMut(W) -> Result<P, E>,
+) -> Result<Vec<P>, E> {
+    let mut paths = Vec::with_capacity(writers.len());
+    for w in writers {
+        paths.push(finish(w)?);
+    }
+    Ok(paths)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

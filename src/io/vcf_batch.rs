@@ -113,15 +113,13 @@ fn setup_one_vcf_writer(
 }
 
 pub fn finalize_vcf_batch_writers(writers: Vec<VcfBatchWriter>) -> std::io::Result<Vec<PathBuf>> {
-    let mut paths = Vec::with_capacity(writers.len());
-    for w in writers {
+    crate::io::batch_driver::finalize_writers(writers, |w| -> std::io::Result<PathBuf> {
         let VcfBatchWriter { tx, handle, path, .. } = w;
         drop(tx);
         handle.join()
             .map_err(|_| std::io::Error::other("VCF batch writer thread panicked"))??;
-        paths.push(path);
-    }
-    Ok(paths)
+        Ok(path)
+    })
 }
 
 /// Per-window batch input — same shape as `bcf_batch::WindowBatchInput`.

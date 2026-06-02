@@ -54,14 +54,12 @@ pub fn setup_pgen_batch_writers(
 
 pub fn finalize_pgen_batch_writers(writers: Vec<PgenBatchWriter>) -> std::io::Result<Vec<(PathBuf, PathBuf)>> {
     use std::io::Write as _;
-    let mut paths = Vec::with_capacity(writers.len());
-    for w in writers {
+    crate::io::batch_driver::finalize_writers(writers, |w| -> std::io::Result<(PathBuf, PathBuf)> {
         let PgenBatchWriter { pgen, mut pvar, pgen_path, pvar_path, .. } = w;
         pvar.flush()?;
         pgen.finish()?;
-        paths.push((pgen_path, pvar_path));
-    }
-    Ok(paths)
+        Ok((pgen_path, pvar_path))
+    })
 }
 
 pub struct WindowBatchInput<'a> {

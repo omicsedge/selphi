@@ -78,13 +78,11 @@ pub fn setup_parquet_batch_writers(
 }
 
 pub fn finalize_parquet_batch_writers(writers: Vec<ParquetBatchWriter>) -> std::io::Result<Vec<PathBuf>> {
-    let mut paths = Vec::with_capacity(writers.len());
-    for w in writers {
+    crate::io::batch_driver::finalize_writers(writers, |w| -> std::io::Result<PathBuf> {
         let ParquetBatchWriter { writer, path, .. } = w;
         writer.close().map_err(|e| std::io::Error::other(e.to_string()))?;
-        paths.push(path);
-    }
-    Ok(paths)
+        Ok(path)
+    })
 }
 
 pub struct WindowBatchInput<'a> {
