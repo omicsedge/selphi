@@ -51,6 +51,29 @@ pub(crate) struct WindowSetup<'a> {
     pub an_str: Vec<u8>,
 }
 
+/// Partition `intervals` into contiguous batches each spanning at most
+/// `max_stripes_per_batch` tile stripes; returns `(start, end_excl)` index
+/// ranges. Shared by the non-batched multiformat path and the batched driver —
+/// only the per-caller stripe cap differs.
+pub(crate) fn partition_intervals(intervals: &[Interval], max_stripes_per_batch: usize) -> Vec<(usize, usize)> {
+    use crate::srp::TILE_ROWS;
+    let mut batches: Vec<(usize, usize)> = Vec::new();
+    if intervals.is_empty() { return batches; }
+    let mut bstart = 0;
+    let mut b_first_stripe = intervals[0].wgs_start / TILE_ROWS;
+    for i in 0..intervals.len() {
+        let iv_last = if intervals[i].wgs_end > 0 { (intervals[i].wgs_end - 1) / TILE_ROWS } else { b_first_stripe };
+        let n_stripes = iv_last - b_first_stripe + 1;
+        if n_stripes > max_stripes_per_batch && i > bstart {
+            batches.push((bstart, i));
+            bstart = i;
+            b_first_stripe = intervals[i].wgs_start / TILE_ROWS;
+        }
+    }
+    if bstart < intervals.len() { batches.push((bstart, intervals.len())); }
+    batches
+}
+
 /// Build interpolation intervals for the owned portion of a window.
 pub(crate) fn build_intervals(
     win_chip_start: usize,
@@ -952,21 +975,7 @@ pub fn write_window_multiformat(
         let mem_cap: usize = 2 * 1024 * 1024 * 1024;
         let max_stripes_per_batch = (mem_cap / (bytes_per_stripe + result_bytes_per_stripe).max(1)).max(4);
 
-        let mut batches: Vec<(usize, usize)> = Vec::new();
-        {
-            let mut bstart = 0;
-            let mut b_first_stripe = if !setup.intervals.is_empty() { setup.intervals[0].wgs_start / TILE_ROWS } else { 0 };
-            for i in 0..setup.intervals.len() {
-                let iv_last = if setup.intervals[i].wgs_end > 0 { (setup.intervals[i].wgs_end - 1) / TILE_ROWS } else { b_first_stripe };
-                let n_stripes = iv_last - b_first_stripe + 1;
-                if n_stripes > max_stripes_per_batch && i > bstart {
-                    batches.push((bstart, i));
-                    bstart = i;
-                    b_first_stripe = setup.intervals[i].wgs_start / TILE_ROWS;
-                }
-            }
-            if bstart < setup.intervals.len() { batches.push((bstart, setup.intervals.len())); }
-        }
+        let batches = partition_intervals(&setup.intervals, max_stripes_per_batch);
 
         let batch_stripe_ranges: Vec<(usize, usize, usize)> = batches.iter().map(|&(bs, be)| {
             let ivs = &setup.intervals[bs..be];
