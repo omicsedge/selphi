@@ -655,6 +655,9 @@ fn format_tile_batch_bcf(
 
         // Estimate: ~(14*n_samples + 80) bytes per variant for BCF
         let mut buf = Vec::with_capacity((v_end - v_start) * (n_samples * 14 + 80));
+        // Per-chunk reusable dosage scratch for the imputed two-pass DR2 helper
+        // (allocated once per parallel chunk, not per variant).
+        let mut ds_scratch = vec![0f32; n_samples];
 
         for v in v_start..v_end {
             let wgs_i = global_start + v;
@@ -670,7 +673,7 @@ fn format_tile_batch_bcf(
             } else {
                 bcf_encode::encode_imputed_record(
                     &mut buf, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
-                    alt_probs, tile_n, v, n_samples, n_haps, no_ap,
+                    alt_probs, tile_n, v, n_samples, n_haps, no_ap, &mut ds_scratch,
                 );
             }
         }
