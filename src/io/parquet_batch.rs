@@ -124,8 +124,9 @@ impl ParquetSink<'_> {
 
 impl BatchSink for ParquetSink<'_> {
     fn begin_window(&mut self, ctx: &WindowCtx) -> std::io::Result<()> {
-        // Tile-level row buffers (flush as row groups). cap == tile_size.max(64).
-        let cap = 4000usize.max(64);
+        // Tile-level row buffers (flush as row groups). cap == the kernel
+        // tile_size (4000); the historical `.max(64)` floor is a no-op here.
+        let cap = 4000usize;
         self.cap = cap;
         self.chroms = StringBuilder::with_capacity(cap, cap * 4);
         self.positions = Int64Builder::with_capacity(cap);

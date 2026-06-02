@@ -1,10 +1,19 @@
-//! Shared per-batch sample slicing for `--sample-batch-size` output writers.
+//! Shared driver for the `--sample-batch-size` output writers.
 //!
-//! All five format batch-writers (VCF / BCF / PGEN / SelfDecode / Parquet)
-//! partitioned samples into batches with byte-identical arithmetic, each with
-//! its own hand-copied `while sample_start < n_samples { … }` loop. This is the
-//! single source for that slicing; each writer keeps only its format-specific
-//! per-batch writer construction (path extension, encoder type, header).
+//! All five format batch-writers (VCF / BCF / PGEN / SelfDecode / Parquet) used
+//! to hand-copy the same logic three times over: the per-batch sample slicing,
+//! the finalize loop, and the ~120-line per-window imputation→emit kernel. This
+//! module is the single source for all three:
+//!
+//! - [`for_each_batch`] / [`samples_per_batch`] — partition samples into batches
+//!   with byte-identical arithmetic (each writer keeps only its format-specific
+//!   per-batch construction: path extension, encoder type, header).
+//! - [`finalize_writers`] — the take/finish/collect-paths loop (each writer
+//!   supplies its own `finish` closure).
+//! - [`WindowBatchInput`] / [`WindowCtx`] / [`BatchSink`] / [`run_window`] — the
+//!   per-window control flow (interval building, tiled/CSC dispatch, stripe-batch
+//!   partition, interpolation, chip-gap/imputed-tile emit order). Each format
+//!   implements [`BatchSink`] for the encoding of individual variants only.
 
 use std::sync::Arc;
 
