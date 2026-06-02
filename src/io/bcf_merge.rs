@@ -450,27 +450,14 @@ fn compute_imp_stats_from_ds(
         }
     }
 
-    let n_haps = (all_ap1.len() * 2) as u32;
-    let mut ac = 0u32;
-    let mut p_sum = 0.0f64;
-    for i in 0..all_ap1.len() {
-        let ap1 = all_ap1[i];
-        let ap2 = all_ap2[i];
-        if ap1 > 0.5 { ac += 1; }
-        if ap2 > 0.5 { ac += 1; }
-        p_sum += (ap1 + ap2) as f64;
-    }
+    let n_samples = all_ap1.len();
+    let n_haps = (n_samples * 2) as u32;
+    let mut ds = vec![0f32; n_samples];
+    let (ac, dr2_f64) = crate::io::dosage_stats::imputed_ac_dr2(
+        n_samples, n_haps as usize, |s| (all_ap1[s], all_ap2[s]), &mut ds,
+    );
     let af = ac as f32 / n_haps as f32;
-    let p_hat = p_sum / n_haps as f64;
-
-    let mut var_sum = 0.0f64;
-    for i in 0..all_ap1.len() {
-        let d = (all_ap1[i] + all_ap2[i]) as f64 - 2.0 * p_hat;
-        var_sum += d * d;
-    }
-    let var_dosage = var_sum / n_haps as f64;
-    let var_expected = 2.0 * p_hat * (1.0 - p_hat);
-    let dr2 = if var_expected > 1e-10 { (var_dosage / var_expected).clamp(0.0, 1.0) as f32 } else { 0.0f32 };
+    let dr2 = dr2_f64 as f32;
 
     Ok((ac, af, dr2, n_haps))
 }
