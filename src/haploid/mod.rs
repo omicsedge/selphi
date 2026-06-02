@@ -8,7 +8,6 @@ pub mod em;
 pub mod simd;
 pub mod rng;
 pub mod debug;
-pub mod composite;
 pub mod stage2;
 pub mod stage2_integration;
 
@@ -98,20 +97,6 @@ pub fn phase_genotypes(
     phase_genotypes_inner(target_geno, ref_bm, chip_cm, chip_bp,
         ref_bp, map_bp, map_cm, n_var, n_samples, n_ref,
         seed, n_threads, max_windows, N_BURNIN, N_PHASING)
-}
-
-/// Phasing with configurable iteration counts.
-pub fn phase_genotypes_iters(
-    target_geno: &[u8], ref_bm: &HaplotypeBitmatrix,
-    chip_cm: &[f64], chip_bp: &[i64],
-    ref_bp: &[i64], map_bp: &[i64], map_cm: &[f64],
-    n_var: usize, n_samples: usize, n_ref: usize,
-    seed: i64, n_threads: usize, max_windows: usize,
-    n_burnin: usize, n_phasing: usize,
-) -> (Vec<u8>, Vec<f32>, Vec<(f32, usize, usize)>) {
-    phase_genotypes_inner(target_geno, ref_bm, chip_cm, chip_bp,
-        ref_bp, map_bp, map_cm, n_var, n_samples, n_ref,
-        seed, n_threads, max_windows, n_burnin, n_phasing)
 }
 
 /// Core phasing with optional diplotype HMM.

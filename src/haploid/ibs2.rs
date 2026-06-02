@@ -255,22 +255,6 @@ pub fn compute_ibs2_restrictions_with_maf(
     all_restrictions
 }
 
-/// Backward-compatible wrapper (target-only MAF, no thinning).
-pub fn compute_ibs2_restrictions(gt_sums: &[i8], cm: &[f64], target_geno: &[u8],
-                                  n_var: usize, n_samples: usize) -> Vec<[i32; 4]> {
-    let mut maf_arr = vec![0.0f32; n_var];
-    for v in 0..n_var {
-        let mut n_alt = 0i32; let mut n_tot = 0i32;
-        for s in 0..n_samples {
-            let gs = gt_sums[v * n_samples + s];
-            if gs >= 0 { n_tot += 2; n_alt += gs as i32; }
-        }
-        let f = if n_tot > 0 { n_alt as f32 / n_tot as f32 } else { 0.0 };
-        maf_arr[v] = if f > 0.5 { 1.0 - f } else { f };
-    }
-    compute_ibs2_restrictions_with_maf(gt_sums, cm, &maf_arr, target_geno, n_var, n_samples)
-}
-
 /// Build CSR lookup for fast IBS2 checking in PBWT.
 pub fn build_ibs2_lookup(restrictions: &[[i32; 4]], n_samples: usize)
     -> (Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>)
