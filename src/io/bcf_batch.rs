@@ -13,13 +13,10 @@
 
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::io::pipeline::{VcfSender, VcfWriterHandle};
-use crate::io::batch_driver::{BatchSink, WindowCtx};
-use crate::imputation::hmm::CsrWeights;
-use crate::srp::SrpReader;
+use crate::io::batch_driver::{BatchSink, WindowBatchInput, WindowCtx};
 
 /// One per-batch BCF writer.
 pub struct BatchWriter {
@@ -143,28 +140,6 @@ pub fn batch_of_hap(hap: usize, hap_per_batch: usize) -> usize {
     hap / hap_per_batch
 }
 
-/// Per-window batch input: a slice of the window's all_weights (K target haps).
-pub struct WindowBatchInput<'a> {
-    pub srp: &'a Arc<SrpReader>,
-    /// Subset of target-hap weights for THIS batch (size K = hap_end - hap_start).
-    pub weights: &'a [&'a CsrWeights],
-    /// Batch's global hap range: [hap_start, hap_end). hap_start must be even.
-    pub hap_start: usize,
-    pub hap_end: usize,
-    pub win_chip_start: usize,
-    pub own_chip_start: usize,
-    pub own_chip_end: usize,
-    pub wgs_idx: &'a [usize],
-    pub n_samples_total: usize,
-    pub chip_genotypes: &'a [u8],
-    pub no_ap: bool,
-}
-
-/// Streaming write of one window to a SINGLE per-batch BCF writer.
-///
-/// Mirrors `crate::io::pipeline::write_window_multiformat` but BCF-only,
-/// for a sample subrange, using partial encoders that omit INFO stats.
-/// All inputs are slices/references — no copying.
 /// [`BatchSink`] for the per-batch BCF writer. Streams native BCF2.2 records
 /// (INFO omitted) into an 8 MB byte buffer, sending it to the BGZF compressor
 /// thread whenever it exceeds 4 MB after a tile and once at window end. The

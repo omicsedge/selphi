@@ -7,11 +7,8 @@
 
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use crate::imputation::hmm::CsrWeights;
-use crate::srp::SrpReader;
-use crate::io::batch_driver::{BatchSink, WindowCtx};
+use crate::io::batch_driver::{BatchSink, WindowBatchInput, WindowCtx};
 use crate::io::pgen_output::{PgenWriter, write_psam, write_pvar, write_pvar_variant};
 
 pub struct PgenBatchWriter {
@@ -61,19 +58,6 @@ pub fn finalize_pgen_batch_writers(writers: Vec<PgenBatchWriter>) -> std::io::Re
         pgen.finish()?;
         Ok((pgen_path, pvar_path))
     })
-}
-
-pub struct WindowBatchInput<'a> {
-    pub srp: &'a Arc<SrpReader>,
-    pub weights: &'a [&'a CsrWeights],
-    pub hap_start: usize,
-    pub hap_end: usize,
-    pub win_chip_start: usize,
-    pub own_chip_start: usize,
-    pub own_chip_end: usize,
-    pub wgs_idx: &'a [usize],
-    pub n_samples_total: usize,
-    pub chip_genotypes: &'a [u8],
 }
 
 /// [`BatchSink`] for the PGEN writer: fills per-sample hardcall + dosage scratch
@@ -133,7 +117,7 @@ pub fn write_window_pgen_batched(
 ) -> std::io::Result<()> {
     let WindowBatchInput {
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
-        wgs_idx, n_samples_total, chip_genotypes,
+        wgs_idx, n_samples_total, chip_genotypes, no_ap: _,
     } = input;
     let mut sink = PgenSink { bw, hardcalls: Vec::new(), dosages: Vec::new() };
     crate::io::batch_driver::run_window(

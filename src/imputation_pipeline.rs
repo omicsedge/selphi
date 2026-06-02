@@ -1084,127 +1084,52 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
             let pgen_on = batched_pgen_active;
             let parquet_on = batched_parquet_active;
             let mut cb = |bs: usize, be: usize, refs: &[&selphi::imputation::hmm::CsrWeights]| -> std::io::Result<()> {
+                // One input bundle per (batch, window); each active writer gets a Copy.
+                let input = selphi::io::batch_driver::WindowBatchInput {
+                    srp: srp_ref,
+                    weights: refs,
+                    hap_start: bs, hap_end: be,
+                    win_chip_start: cs,
+                    own_chip_start: os,
+                    own_chip_end: oe,
+                    wgs_idx: wgs_ref,
+                    n_samples_total: n_samples,
+                    chip_genotypes: chip_genos_ref,
+                    no_ap,
+                };
+                // Find this batch's writer by hap_start, asserting its hap_end matches.
+                macro_rules! find_bi {
+                    ($writers:expr, $label:expr) => {{
+                        let bi = $writers.iter().position(|w| w.hap_start == bs)
+                            .ok_or_else(|| std::io::Error::other(format!("no {} batch writer for hap_start={bs}", $label)))?;
+                        if $writers[bi].hap_end != be {
+                            return Err(std::io::Error::other(format!(
+                                "{} batch range mismatch: writer has [{}..{}), got [{bs}..{be})",
+                                $label, $writers[bi].hap_start, $writers[bi].hap_end,
+                            )));
+                        }
+                        bi
+                    }};
+                }
                 if bcf_on {
-                    let bi = bcf_bw_ref.iter().position(|w| w.hap_start == bs)
-                        .ok_or_else(|| std::io::Error::other(format!("no BCF batch writer for hap_start={bs}")))?;
-                    let w = &bcf_bw_ref[bi];
-                    if w.hap_end != be {
-                        return Err(std::io::Error::other(format!(
-                            "BCF batch range mismatch: writer has [{}..{}), got [{bs}..{be})", w.hap_start, w.hap_end,
-                        )));
-                    }
-                    selphi::io::bcf_batch::write_window_bcf_batched(
-                        selphi::io::bcf_batch::WindowBatchInput {
-                            srp: srp_ref,
-                            weights: refs,
-                            hap_start: bs, hap_end: be,
-                            win_chip_start: cs,
-                            own_chip_start: os,
-                            own_chip_end: oe,
-                            wgs_idx: wgs_ref,
-                            n_samples_total: n_samples,
-                            chip_genotypes: chip_genos_ref,
-                            no_ap,
-                        },
-                        &w.tx,
-                    )?;
+                    let bi = find_bi!(bcf_bw_ref, "BCF");
+                    selphi::io::bcf_batch::write_window_bcf_batched(input, &bcf_bw_ref[bi].tx)?;
                 }
                 if vcf_on {
-                    let bi = vcf_bw_ref.iter().position(|w| w.hap_start == bs)
-                        .ok_or_else(|| std::io::Error::other(format!("no VCF batch writer for hap_start={bs}")))?;
-                    let w = &vcf_bw_ref[bi];
-                    if w.hap_end != be {
-                        return Err(std::io::Error::other(format!(
-                            "VCF batch range mismatch: writer has [{}..{}), got [{bs}..{be})", w.hap_start, w.hap_end,
-                        )));
-                    }
-                    selphi::io::vcf_batch::write_window_vcf_batched(
-                        selphi::io::vcf_batch::WindowBatchInput {
-                            srp: srp_ref,
-                            weights: refs,
-                            hap_start: bs, hap_end: be,
-                            win_chip_start: cs,
-                            own_chip_start: os,
-                            own_chip_end: oe,
-                            wgs_idx: wgs_ref,
-                            n_samples_total: n_samples,
-                            chip_genotypes: chip_genos_ref,
-                            no_ap,
-                        },
-                        &w.tx,
-                    )?;
+                    let bi = find_bi!(vcf_bw_ref, "VCF");
+                    selphi::io::vcf_batch::write_window_vcf_batched(input, &vcf_bw_ref[bi].tx)?;
                 }
                 if sd_on {
-                    let bi = sd_bw_ref.iter().position(|w| w.hap_start == bs)
-                        .ok_or_else(|| std::io::Error::other(format!("no SD batch writer for hap_start={bs}")))?;
-                    if sd_bw_ref[bi].hap_end != be {
-                        return Err(std::io::Error::other(format!(
-                            "SD batch range mismatch: writer has [{}..{}), got [{bs}..{be})",
-                            sd_bw_ref[bi].hap_start, sd_bw_ref[bi].hap_end,
-                        )));
-                    }
-                    selphi::io::sd_batch::write_window_sd_batched(
-                        selphi::io::sd_batch::WindowBatchInput {
-                            srp: srp_ref,
-                            weights: refs,
-                            hap_start: bs, hap_end: be,
-                            win_chip_start: cs,
-                            own_chip_start: os,
-                            own_chip_end: oe,
-                            wgs_idx: wgs_ref,
-                            n_samples_total: n_samples,
-                            chip_genotypes: chip_genos_ref,
-                        },
-                        &mut sd_bw_ref[bi],
-                    )?;
+                    let bi = find_bi!(sd_bw_ref, "SD");
+                    selphi::io::sd_batch::write_window_sd_batched(input, &mut sd_bw_ref[bi])?;
                 }
                 if pgen_on {
-                    let bi = pgen_bw_ref.iter().position(|w| w.hap_start == bs)
-                        .ok_or_else(|| std::io::Error::other(format!("no PGEN batch writer for hap_start={bs}")))?;
-                    if pgen_bw_ref[bi].hap_end != be {
-                        return Err(std::io::Error::other(format!(
-                            "PGEN batch range mismatch: writer has [{}..{}), got [{bs}..{be})",
-                            pgen_bw_ref[bi].hap_start, pgen_bw_ref[bi].hap_end,
-                        )));
-                    }
-                    selphi::io::pgen_batch::write_window_pgen_batched(
-                        selphi::io::pgen_batch::WindowBatchInput {
-                            srp: srp_ref,
-                            weights: refs,
-                            hap_start: bs, hap_end: be,
-                            win_chip_start: cs,
-                            own_chip_start: os,
-                            own_chip_end: oe,
-                            wgs_idx: wgs_ref,
-                            n_samples_total: n_samples,
-                            chip_genotypes: chip_genos_ref,
-                        },
-                        &mut pgen_bw_ref[bi],
-                    )?;
+                    let bi = find_bi!(pgen_bw_ref, "PGEN");
+                    selphi::io::pgen_batch::write_window_pgen_batched(input, &mut pgen_bw_ref[bi])?;
                 }
                 if parquet_on {
-                    let bi = parquet_bw_ref.iter().position(|w| w.hap_start == bs)
-                        .ok_or_else(|| std::io::Error::other(format!("no Parquet batch writer for hap_start={bs}")))?;
-                    if parquet_bw_ref[bi].hap_end != be {
-                        return Err(std::io::Error::other(format!(
-                            "Parquet batch range mismatch: writer has [{}..{}), got [{bs}..{be})",
-                            parquet_bw_ref[bi].hap_start, parquet_bw_ref[bi].hap_end,
-                        )));
-                    }
-                    selphi::io::parquet_batch::write_window_parquet_batched(
-                        selphi::io::parquet_batch::WindowBatchInput {
-                            srp: srp_ref,
-                            weights: refs,
-                            hap_start: bs, hap_end: be,
-                            win_chip_start: cs,
-                            own_chip_start: os,
-                            own_chip_end: oe,
-                            wgs_idx: wgs_ref,
-                            n_samples_total: n_samples,
-                            chip_genotypes: chip_genos_ref,
-                        },
-                        &mut parquet_bw_ref[bi],
-                    )?;
+                    let bi = find_bi!(parquet_bw_ref, "Parquet");
+                    selphi::io::parquet_batch::write_window_parquet_batched(input, &mut parquet_bw_ref[bi])?;
                 }
                 Ok(())
             };
