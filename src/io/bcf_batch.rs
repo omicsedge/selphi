@@ -127,19 +127,6 @@ pub fn finalize_batch_writers(writers: Vec<BatchWriter>) -> std::io::Result<Vec<
     })
 }
 
-/// Helper: send a buffer of BCF record bytes to a specific batch writer.
-#[inline]
-pub fn send_to_batch(writers: &[BatchWriter], batch_idx: usize, buf: Vec<u8>) -> std::io::Result<()> {
-    writers[batch_idx].tx.send(buf)
-        .map_err(|e| std::io::Error::other(format!("batch {batch_idx} send failed: {e}")))
-}
-
-/// Map a global hap index to its batch index (for routing records).
-#[inline]
-pub fn batch_of_hap(hap: usize, hap_per_batch: usize) -> usize {
-    hap / hap_per_batch
-}
-
 /// [`BatchSink`] for the per-batch BCF writer. Streams native BCF2.2 records
 /// (INFO omitted) into an 8 MB byte buffer, sending it to the BGZF compressor
 /// thread whenever it exceeds 4 MB after a tile and once at window end. The
