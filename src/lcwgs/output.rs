@@ -1,8 +1,9 @@
 //! VCF.gz writer for lcWGS imputation output.
 //!
 //! Emits one record per shared variant with `GT:DS:GP`:
-//! - `GT` — hard genotype call from the max-posterior genotype (phased "|"
-//!   when the het orientation is determined, else "/").
+//! - `GT` — hard genotype call from the max-posterior genotype, always emitted
+//!   unphased ("0/0", "0/1", "1/1"); lcWGS imputation does not resolve the het
+//!   orientation, so no phased "|" is produced.
 //! - `DS` — ALT dosage E[ALT count] ∈ [0, 2].
 //! - `GP` — three genotype posteriors P(0/0), P(0/1), P(1/1).
 //!
