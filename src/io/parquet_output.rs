@@ -126,32 +126,16 @@ pub fn write_tile_to_parquet(
             dr2s.append_null();
             imps.append_value(false);
         } else {
-            // Two-pass DR2: var(dosage) / var_expected, numerically stable
-            // Pass 1: dosage sum + hardcall AC
-            let mut ac = 0u32;
-            let mut p_sum = 0.0f64;
-            for s in 0..n_samples {
-                let ap1 = alt_probs[(s * 2) * tile_n + v];
-                let ap2 = alt_probs[(s * 2 + 1) * tile_n + v];
-                let ds = ap1 + ap2;
-                ds_row[s] = ds;
-                if ap1 > 0.5 { ac += 1; }
-                if ap2 > 0.5 { ac += 1; }
-                p_sum += (ap1 + ap2) as f64;
-            }
-            let af = ac as f32 / n_haps as f32;
-            let p_hat = p_sum / n_haps as f64;
-            // Pass 2: variance of dosage
-            let mut var_sum = 0.0f64;
-            for s in 0..n_samples {
-                let d = ds_row[s] as f64 - 2.0 * p_hat;
-                var_sum += d * d;
-            }
-            let var_dosage = var_sum / n_haps as f64;
-            let var_expected = 2.0 * p_hat * (1.0 - p_hat);
-            let dr2 = if var_expected > 1e-10 { (var_dosage / var_expected).clamp(0.0, 1.0) as f32 } else { 0.0 };
-            afs.append_value(af);
-            dr2s.append_value(dr2);
+            // Two-pass DR2 via the shared helper; `ds_row` doubles as the
+            // pass-1 dosage cache (it also feeds the per-sample DS column).
+            // Byte-identical f64 accumulation to the former inlined two passes.
+            let (ac, dr2_f64) = crate::io::dosage_stats::imputed_ac_dr2(
+                n_samples, n_haps,
+                |s| (alt_probs[(s * 2) * tile_n + v], alt_probs[(s * 2 + 1) * tile_n + v]),
+                ds_row,
+            );
+            afs.append_value(ac as f32 / n_haps as f32);
+            dr2s.append_value(dr2_f64 as f32);
             imps.append_value(true);
         }
         n_rows += 1;
