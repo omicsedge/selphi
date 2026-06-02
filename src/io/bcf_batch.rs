@@ -159,8 +159,6 @@ pub struct WindowBatchInput<'a> {
     pub n_samples_total: usize,
     pub chip_genotypes: &'a [u8],
     pub no_ap: bool,
-    pub preloaded_chunks: Option<Vec<Option<crate::srp::CscChunk>>>,
-    pub preloaded_stripes: Option<crate::srp::tiled::PreloadedStripes>,
 }
 
 /// Streaming write of one window to a SINGLE per-batch BCF writer.
@@ -178,7 +176,6 @@ pub fn write_window_bcf_batched(
     let WindowBatchInput {
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples_total, chip_genotypes, no_ap,
-        preloaded_chunks, preloaded_stripes,
     } = input;
     // Intermediate always carries AP1/AP2 (see setup_batch_writers); the merger
     // needs them to count AC, and the final BCF drops AP per --no-ap.
@@ -302,8 +299,6 @@ pub fn write_window_bcf_batched(
             if bstart < intervals.len() { batches.push((bstart, intervals.len())); }
         }
 
-        let _ = preloaded_stripes; // Caller pre-load currently unused; we load per-batch ourselves.
-
         let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024 * 1024);
         for &(bstart, bend) in &batches {
             let batch_ivs = &intervals[bstart..bend];
@@ -358,12 +353,9 @@ pub fn write_window_bcf_batched(
         let window_last_chunk = if own_wgs_end > 0 { (own_wgs_end - 1) / chunk_size } else { 0 };
         let total_chunks = window_last_chunk - window_first_chunk + 1;
 
-        let chunk_cache: Vec<Option<crate::srp::CscChunk>> = match preloaded_chunks {
-            Some(pre) => pre,
-            None => (0..total_chunks)
-                .map(|i| Some(srp.load_chunk_from_source(window_first_chunk + i)))
-                .collect(),
-        };
+        let chunk_cache: Vec<Option<crate::srp::CscChunk>> = (0..total_chunks)
+            .map(|i| Some(srp.load_chunk_from_source(window_first_chunk + i)))
+            .collect();
 
         let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024 * 1024);
         for iv in &intervals {

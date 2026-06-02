@@ -1105,8 +1105,6 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                             n_samples_total: n_samples,
                             chip_genotypes: chip_genos_ref,
                             no_ap,
-                            preloaded_chunks: None,
-                            preloaded_stripes: None,
                         },
                         &w.tx,
                     )?;
@@ -1132,8 +1130,6 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                             n_samples_total: n_samples,
                             chip_genotypes: chip_genos_ref,
                             no_ap,
-                            preloaded_chunks: None,
-                            preloaded_stripes: None,
                         },
                         &w.tx,
                     )?;
