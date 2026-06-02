@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use crate::imputation::hmm::CsrWeights;
 use crate::srp::SrpReader;
+use crate::io::batch_driver::{BatchSink, WindowCtx};
 use crate::io::pgen_output::{PgenWriter, write_psam, write_pvar, write_pvar_variant};
 
 pub struct PgenBatchWriter {
@@ -75,196 +76,68 @@ pub struct WindowBatchInput<'a> {
     pub chip_genotypes: &'a [u8],
 }
 
+/// [`BatchSink`] for the PGEN writer: fills per-sample hardcall + dosage scratch
+/// and forwards each variant to PVAR + `PgenWriter::write_variant`.
+struct PgenSink<'w> {
+    bw: &'w mut PgenBatchWriter,
+    hardcalls: Vec<u8>,
+    dosages: Vec<f32>,
+}
+
+impl BatchSink for PgenSink<'_> {
+    fn begin_window(&mut self, ctx: &WindowCtx) -> std::io::Result<()> {
+        self.hardcalls = vec![0u8; ctx.n_samples_in_batch];
+        self.dosages = vec![0.0f32; ctx.n_samples_in_batch];
+        Ok(())
+    }
+
+    fn emit_chip(&mut self, wgs_i: usize, local_i: usize, ctx: &WindowCtx) -> std::io::Result<()> {
+        let (chrom, pos_s, rsid, ref_a, alt_a) =
+            crate::io::pipeline::parse_variant_parts(ctx.srp, wgs_i)
+                .ok_or_else(|| std::io::Error::other(format!("bad variant id at {wgs_i}")))?;
+        let ci = ctx.chip_local_idx[local_i];
+        for s in 0..ctx.n_samples_in_batch {
+            let gs = ctx.sample_start + s;
+            let a0 = ctx.chip_genotypes[ci * ctx.n_haps_total + gs * 2];
+            let a1 = ctx.chip_genotypes[ci * ctx.n_haps_total + gs * 2 + 1];
+            let g = a0 + a1; // 0/1/2
+            self.hardcalls[s] = g;
+            self.dosages[s] = g as f32;
+        }
+        write_pvar_variant(&mut self.bw.pvar, chrom, pos_s, rsid, ref_a, alt_a)?;
+        self.bw.pgen.write_variant(&self.hardcalls, &self.dosages)
+    }
+
+    fn emit_imputed(
+        &mut self, wgs_i: usize, _local_i: usize,
+        alt: &[f32], tile_n: usize, v: usize, ctx: &WindowCtx,
+    ) -> std::io::Result<()> {
+        let (chrom, pos_s, rsid, ref_a, alt_a) =
+            crate::io::pipeline::parse_variant_parts(ctx.srp, wgs_i)
+                .ok_or_else(|| std::io::Error::other(format!("bad variant id at {wgs_i}")))?;
+        for s in 0..ctx.n_samples_in_batch {
+            let p1 = alt[(s * 2) * tile_n + v];
+            let p2 = alt[(s * 2 + 1) * tile_n + v];
+            let ds = p1 + p2;
+            self.dosages[s] = ds;
+            self.hardcalls[s] = if ds > 1.5 { 2 } else if ds > 0.5 { 1 } else { 0 };
+        }
+        write_pvar_variant(&mut self.bw.pvar, chrom, pos_s, rsid, ref_a, alt_a)?;
+        self.bw.pgen.write_variant(&self.hardcalls, &self.dosages)
+    }
+}
+
 pub fn write_window_pgen_batched(
     input: WindowBatchInput<'_>,
     bw: &mut PgenBatchWriter,
 ) -> std::io::Result<()> {
-    use crate::srp::TILE_ROWS;
-
     let WindowBatchInput {
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples_total, chip_genotypes,
     } = input;
-    let n_haps_total = n_samples_total * 2;
-    let sample_start = hap_start / 2;
-    let n_samples_in_batch = (hap_end - hap_start) / 2;
-    let n_haps_in_batch = hap_end - hap_start;
-    if n_samples_in_batch == 0 { return Ok(()); }
-
-    let n_ref_variants = srp.n_variants();
-    let n_chip_total = wgs_idx.len();
-    let chunk_size = srp.chunk_size();
-    let own_wgs_start = if own_chip_start == 0 { 0 } else { wgs_idx[own_chip_start] };
-    let own_wgs_end = if own_chip_end >= n_chip_total { n_ref_variants } else { wgs_idx[own_chip_end] };
-    let window_len = own_wgs_end - own_wgs_start;
-
-    let mut is_chip = vec![false; window_len];
-    let mut chip_local_idx = vec![0usize; window_len];
-    for ci in 0..n_chip_total {
-        let wi = wgs_idx[ci];
-        if wi >= own_wgs_start && wi < own_wgs_end && wi < n_ref_variants {
-            is_chip[wi - own_wgs_start] = true;
-            chip_local_idx[wi - own_wgs_start] = ci;
-        }
-    }
-
-    let intervals = crate::io::pipeline::build_intervals(
-        win_chip_start, own_chip_start, own_chip_end, wgs_idx, own_wgs_start, own_wgs_end,
-    );
-    if intervals.is_empty() { return Ok(()); }
-    let tile_size = 4000usize;
-    let mut next_wgs = own_wgs_start;
-
-    let mut hardcalls = vec![0u8; n_samples_in_batch];
-    let mut dosages = vec![0.0f32; n_samples_in_batch];
-
-    macro_rules! emit_variant_inline {
-        ($wgs_i:expr, $alt:expr) => {{
-            let wgs_i_ = $wgs_i;
-            let (chrom, pos_s, rsid, ref_a, alt_a) =
-                crate::io::pipeline::parse_variant_parts(srp.as_ref(), wgs_i_)
-                    .ok_or_else(|| std::io::Error::other(format!("bad variant id at {wgs_i_}")))?;
-            let local_i = wgs_i_ - own_wgs_start;
-            let is_chip_var = is_chip[local_i];
-            if is_chip_var {
-                let ci = chip_local_idx[local_i];
-                for s in 0..n_samples_in_batch {
-                    let gs = sample_start + s;
-                    let a0 = chip_genotypes[ci * n_haps_total + gs * 2] as u8;
-                    let a1 = chip_genotypes[ci * n_haps_total + gs * 2 + 1] as u8;
-                    let g = a0 + a1; // 0/1/2
-                    hardcalls[s] = g;
-                    dosages[s] = g as f32;
-                }
-            } else {
-                let (alt, tile_n, v_in_tile): (&[f32], usize, usize) = $alt;
-                for s in 0..n_samples_in_batch {
-                    let p1 = alt[(s * 2) * tile_n + v_in_tile];
-                    let p2 = alt[(s * 2 + 1) * tile_n + v_in_tile];
-                    let ds = p1 + p2;
-                    dosages[s] = ds;
-                    hardcalls[s] = if ds > 1.5 { 2 } else if ds > 0.5 { 1 } else { 0 };
-                }
-            }
-            write_pvar_variant(&mut bw.pvar, chrom, pos_s, rsid, ref_a, alt_a)?;
-            bw.pgen.write_variant(&hardcalls, &dosages)?;
-        }};
-    }
-
-    macro_rules! emit_chip_gap_inline {
-        ($end:expr) => {{
-            while next_wgs < $end {
-                let local_idx = next_wgs - own_wgs_start;
-                if is_chip[local_idx] {
-                    let empty: &[f32] = &[];
-                    emit_variant_inline!(next_wgs, (empty, 1, 0));
-                }
-                next_wgs += 1;
-            }
-        }};
-    }
-
-    if srp.is_tiled() {
-        let tiled = srp.tiled.as_ref().unwrap();
-        let n_tile_cols = tiled.n_tile_cols;
-        let n_tiled_variants = tiled.n_variants();
-        let window_last_stripe = if own_wgs_end > 0 { (own_wgs_end - 1) / TILE_ROWS } else { 0 };
-        let decomp_tile_bytes: usize = 500 * 1024;
-        let bytes_per_stripe = n_tile_cols * decomp_tile_bytes;
-        let result_bytes_per_stripe = n_haps_in_batch * TILE_ROWS * 4;
-        let mem_cap: usize = 1024 * 1024 * 1024;
-        let max_stripes_per_batch = (mem_cap / (bytes_per_stripe + result_bytes_per_stripe).max(1)).max(4);
-
-        let mut batches: Vec<(usize, usize)> = Vec::new();
-        {
-            let mut bstart = 0;
-            let mut b_first_stripe = intervals[0].wgs_start / TILE_ROWS;
-            for i in 0..intervals.len() {
-                let iv_last = if intervals[i].wgs_end > 0 { (intervals[i].wgs_end - 1) / TILE_ROWS } else { b_first_stripe };
-                let n_stripes = iv_last - b_first_stripe + 1;
-                if n_stripes > max_stripes_per_batch && i > bstart {
-                    batches.push((bstart, i));
-                    bstart = i;
-                    b_first_stripe = intervals[i].wgs_start / TILE_ROWS;
-                }
-            }
-            if bstart < intervals.len() { batches.push((bstart, intervals.len())); }
-        }
-
-        for &(bstart, bend) in &batches {
-            let batch_ivs = &intervals[bstart..bend];
-            if batch_ivs.is_empty() { continue; }
-            let b_first_stripe = batch_ivs[0].wgs_start / TILE_ROWS;
-            let b_last_stripe = {
-                let e = batch_ivs.last().unwrap().wgs_end;
-                if e > 0 { (e - 1) / TILE_ROWS } else { b_first_stripe }
-            };
-            let b_n_stripes = b_last_stripe - b_first_stripe + 1;
-            let n_load = b_n_stripes.min(window_last_stripe - b_first_stripe + 1);
-            let stripes = tiled.preload_stripes(b_first_stripe, n_load)?;
-            let stripe_tiles: Vec<Vec<crate::srp::SparseTile>> = (0..b_n_stripes)
-                .map(|si| {
-                    let s = b_first_stripe + si;
-                    (0..n_tile_cols).map(|band| stripes.decompress_tile(s, band)).collect()
-                })
-                .collect();
-
-            for iv in batch_ivs {
-                emit_chip_gap_inline!(iv.wgs_start);
-                let n = iv.wgs_end - iv.wgs_start;
-                if n == 0 { next_wgs = iv.wgs_end; continue; }
-                let full_range = n as f32;
-                let mut ts = 0usize;
-                while ts < n {
-                    let tn = (n - ts).min(tile_size);
-                    let gs = iv.wgs_start + ts;
-                    let t_vals: Vec<f32> = (0..tn).map(|v| (ts + v) as f32 / full_range).collect();
-                    let alt_probs = crate::io::pipeline::interpolate_tile_batch(
-                        &stripe_tiles, b_first_stripe, n_tiled_variants, n_tile_cols,
-                        weights, iv.weight_s, iv.weight_e, gs, tn, &t_vals, n_haps_in_batch,
-                    );
-                    for v in 0..tn {
-                        let wgs_i = gs + v;
-                        if wgs_i >= n_ref_variants { break; }
-                        emit_variant_inline!(wgs_i, (alt_probs.as_slice(), tn, v));
-                    }
-                    ts += tn;
-                }
-                next_wgs = iv.wgs_end;
-            }
-        }
-        emit_chip_gap_inline!(own_wgs_end);
-    } else {
-        let window_first_chunk = own_wgs_start / chunk_size;
-        let window_last_chunk = if own_wgs_end > 0 { (own_wgs_end - 1) / chunk_size } else { 0 };
-        let total_chunks = window_last_chunk - window_first_chunk + 1;
-        let chunk_cache: Vec<Option<crate::srp::CscChunk>> = (0..total_chunks)
-            .map(|i| Some(srp.load_chunk_from_source(window_first_chunk + i)))
-            .collect();
-        for iv in &intervals {
-            emit_chip_gap_inline!(iv.wgs_start);
-            let n = iv.wgs_end - iv.wgs_start;
-            if n == 0 { next_wgs = iv.wgs_end; continue; }
-            let full_range = n as f32;
-            let mut ts = 0usize;
-            while ts < n {
-                let tn = (n - ts).min(tile_size);
-                let gs = iv.wgs_start + ts;
-                let t_vals: Vec<f32> = (0..tn).map(|v| (ts + v) as f32 / full_range).collect();
-                let alt_probs = crate::io::pipeline::interpolate_tile_preloaded(
-                    &chunk_cache, window_first_chunk, weights,
-                    iv.weight_s, iv.weight_e, gs, tn, &t_vals, n_haps_in_batch, chunk_size,
-                );
-                for v in 0..tn {
-                    let wgs_i = gs + v;
-                    if wgs_i >= n_ref_variants { break; }
-                    emit_variant_inline!(wgs_i, (alt_probs.as_slice(), tn, v));
-                }
-                ts += tn;
-            }
-            next_wgs = iv.wgs_end;
-        }
-        emit_chip_gap_inline!(own_wgs_end);
-    }
-    Ok(())
+    let mut sink = PgenSink { bw, hardcalls: Vec::new(), dosages: Vec::new() };
+    crate::io::batch_driver::run_window(
+        &mut sink, srp.as_ref(), weights, hap_start, hap_end,
+        win_chip_start, own_chip_start, own_chip_end, wgs_idx, n_samples_total, chip_genotypes,
+    )
 }
