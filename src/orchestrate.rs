@@ -37,7 +37,16 @@ pub struct MultiChrImputeConfig {
     pub no_ap: bool,
     pub no_em_ne: bool,
     pub phasing_engine: String,  // "auto", "haploid", "diploid"
+    /// `--wgs-phasing` (deprecated alias): forces the diploid engine regardless
+    /// of `phasing_engine`. Mirrors single-chr resolve_phasing_engine.
+    pub wgs_phasing: bool,
     pub force_phasing: bool,
+    /// `--max-cond-haps`: cap on conditioning haps for diploid phasing (0 = unlimited).
+    pub max_cond_haps: usize,
+    /// User-set PBWT flank sizes (`--fl-fwd`/`--fl-bwd`). `None` = auto-derive from
+    /// log2(n_ref), byte-identical to the single-chr default (auto_calibrate_pbwt_params).
+    pub fl_fwd: Option<usize>,
+    pub fl_bwd: Option<usize>,
     /// `--precompute-candidates`: chromosome-wide PBWT candidate precompute (opt-in).
     /// Default false = per-window selection, which avoids the admixed-target
     /// truncation bias (+0.005–0.007 OVERALL R²; see cli.rs). The single-chr path
@@ -258,21 +267,59 @@ pub fn run_multi_chr(
             // Extract bitmatrix for phasing
             let ref_bm = srp.extract_ref_alleles_bitmatrix(&wgs_idx);
 
-            // Engine selection: auto (chip=haploid, WGS=diploid) or user override
-            let use_diploid = config.phasing_engine == "diploid"
+            // Engine selection: auto (chip=haploid, WGS=diploid) or user override.
+            // Diploid phasing is per-chr self-contained (no cross-chr state), so it
+            // is equivalent to running the single-chr diploid engine on each chr;
+            // we mirror run_phasing_engines (imputation_pipeline.rs) exactly.
+            let use_diploid = config.wgs_phasing
+                || config.phasing_engine == "diploid"
                 || (config.phasing_engine == "auto" && n_chip > 50_000);
-            if use_diploid {
-                selphi_info!("    Phasing: diploid engine not yet supported in multi-chr mode, using haploid");
+            let phased = if use_diploid {
+                // Common-MAF chip subset (MAF >= 0.001 on target). Diploid phases
+                // common variants; rare ones are re-imputed/woven by phase_rare.
+                let target_an = (n_samples * 2) as u32;
+                let common_chip_indices: Vec<usize> = (0..n_chip).into_par_iter().filter(|&v| {
+                    let mut ac = 0u32;
+                    for si in 0..n_samples {
+                        ac += targ_alleles[v * n_samples * 2 + si * 2] as u32;
+                        ac += targ_alleles[v * n_samples * 2 + si * 2 + 1] as u32;
+                    }
+                    let mac = ac.min(target_an - ac);
+                    (mac as f32 / target_an as f32) >= 0.001f32
+                }).collect();
+                if common_chip_indices.is_empty() {
+                    // No common scaffold for diploid — fall back to haploid.
+                    selphi_info!("    Phasing: diploid requested but no common-MAF variants; using haploid");
+                    let (phased, _ne, _ri) = selphi::haploid::phase_genotypes(
+                        &targ_alleles, &ref_bm, &raw_chip_cm, &chip_bps,
+                        &ref_bp, &map_bp_raw, &map_cm_raw,
+                        n_chip, n_samples, n_ref, config.seed, config.threads, 0,
+                    );
+                    phased
+                } else {
+                    selphi_info!("    Phasing: diploid engine ({} / {} common-MAF variants)",
+                        common_chip_indices.len(), n_chip);
+                    let common_ref_bm =
+                        selphi::diploid::pbwt_neighbor::HaplotypeBitmatrix::from_subset(
+                            &ref_bm, &common_chip_indices);
+                    let (phased, _conf, _ri) = selphi::diploid::diploid_phase_bm_prefiltered(
+                        &targ_alleles, common_ref_bm, &common_chip_indices, Some(&ref_bm),
+                        &raw_chip_cm, &chip_bps, &ref_bp, &map_bp_raw, &map_cm_raw,
+                        n_chip, n_samples, n_ref,
+                        config.seed, config.threads, config.max_cond_haps,
+                    );
+                    phased
+                }
             } else {
                 selphi_info!("    Phasing: haploid engine");
-            }
-            let chip_cm_raw_slice = &raw_chip_cm;
-            let (phased, _ne_arr, _switch_info) = selphi::haploid::phase_genotypes(
-                &targ_alleles, &ref_bm, chip_cm_raw_slice, &chip_bps,
-                &ref_bp, &map_bp_raw, &map_cm_raw,
-                n_chip, n_samples, n_ref,
-                config.seed, config.threads, 0,
-            );
+                let (phased, _ne_arr, _switch_info) = selphi::haploid::phase_genotypes(
+                    &targ_alleles, &ref_bm, &raw_chip_cm, &chip_bps,
+                    &ref_bp, &map_bp_raw, &map_cm_raw,
+                    n_chip, n_samples, n_ref,
+                    config.seed, config.threads, 0,
+                );
+                phased
+            };
             (phased, None::<Vec<f64>>, Some(ref_bm))
         } else {
             (targ_alleles, None::<Vec<f64>>, None::<selphi::common::HaplotypeBitmatrix>)
@@ -297,9 +344,14 @@ pub fn run_multi_chr(
             ml.min(n_chip / 2000).max(5)
         });
         let log2_haps = (n_ref as f64).log2();
-        let fl_fwd = (2600.0 / log2_haps) as usize;
-        let fl_fwd = fl_fwd.clamp(100, 450);
-        let fl_bwd = ((fl_fwd as f64 * 2.4 / log2_haps) as usize).max(13);
+        // Honor user `--fl-fwd`/`--fl-bwd` overrides; else auto-derive (byte-identical
+        // to the single-chr auto_calibrate_pbwt_params default).
+        let fl_fwd = config.fl_fwd.unwrap_or_else(|| {
+            ((2600.0 / log2_haps) as usize).clamp(100, 450)
+        });
+        let fl_bwd = config.fl_bwd.unwrap_or_else(|| {
+            ((fl_fwd as f64 * 2.4 / log2_haps) as usize).max(13)
+        });
         let est_ne = if config.est_ne <= 0 {
             let auto_ne = (36.4 * n_ref as f64).round() as i64;
             auto_ne.max(20_000)
