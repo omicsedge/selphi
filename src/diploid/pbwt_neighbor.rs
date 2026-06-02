@@ -15,64 +15,6 @@ pub use crate::common::HaplotypeBitmatrix;
 // Conditioning Bitset — fast per-haplotype neighbor set
 // ---------------------------------------------------------------------------
 
-/// Bitpacked conditioning set: one bitset per haplotype.
-/// bits[h * n_words .. (h+1) * n_words] = set of conditioning haplotype indices for h.
-pub struct ConditioningBitset {
-    bits: Vec<u64>,
-    n_words: usize,
-}
-
-impl ConditioningBitset {
-    pub fn new(n_haps: usize) -> Self {
-        let n_words = n_haps.div_ceil(64);
-        Self { bits: vec![0u64; n_haps * n_words], n_words }
-    }
-
-    /// Add a neighbor for haplotype h.
-    #[inline(always)]
-    pub fn add_neighbor(&mut self, h: usize, neighbor: usize) {
-        let base = h * self.n_words;
-        self.bits[base + neighbor / 64] |= 1u64 << (neighbor % 64);
-    }
-
-    /// Get conditioning set for one haplotype as a sorted Vec.
-    pub fn get_set(&self, h: usize) -> Vec<usize> {
-        let base = h * self.n_words;
-        let row = &self.bits[base..base + self.n_words];
-        let mut result = Vec::new();
-        for (w, &word) in row.iter().enumerate() {
-            let mut bits = word;
-            while bits != 0 {
-                let bit = bits.trailing_zeros() as usize;
-                result.push(w * 64 + bit);
-                bits &= bits - 1; // clear lowest set bit
-            }
-        }
-        result
-    }
-
-    /// Get union of conditioning sets for h0 and h1 (bitwise OR).
-    pub fn get_union(&self, h0: usize, h1: usize) -> Vec<usize> {
-        let b0 = h0 * self.n_words;
-        let b1 = h1 * self.n_words;
-        let mut result = Vec::new();
-        for w in 0..self.n_words {
-            let mut bits = self.bits[b0 + w] | self.bits[b1 + w];
-            while bits != 0 {
-                let bit = bits.trailing_zeros() as usize;
-                result.push(w * 64 + bit);
-                bits &= bits - 1;
-            }
-        }
-        result
-    }
-
-    /// Clear all bits.
-    pub fn clear(&mut self) {
-        self.bits.fill(0);
-    }
-}
-
 /// PBWT neighbor index.
 ///
 /// Storage is sized for the **target** haps (`n_haps` field) — only target
@@ -99,8 +41,6 @@ pub struct PbwtNeighborIndex {
     // Chunking for multi-threaded PBWT
     pub chunk_assignments: Vec<i32>,  // per-site: which chunk
     pub chunk_starts: Vec<usize>,     // per-chunk: buffer start site
-    /// Reserved for future use (ordering-aware conditioning bitset).
-    _cond_bits: Option<ConditioningBitset>,
 }
 
 impl PbwtNeighborIndex {
@@ -246,7 +186,6 @@ impl PbwtNeighborIndex {
             site_selection: vec![false; n_sites],
             chunk_assignments,
             chunk_starts,
-            _cond_bits: None,
         }
     }
 
@@ -423,28 +362,6 @@ impl PbwtNeighborIndex {
         });
     }
 
-    /// Dump PBWT state at a specific site for debugging.
-    fn _dump_pbwt_state(a: &[i32], _c: &[i32], site: usize, group: usize, n_hap: usize) {
-        use std::io::Write;
-        static DUMP_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        if DUMP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 { return; }
-        if let Ok(mut f) = std::fs::File::create(format!("{}/pbwt_state_dump.txt", crate::log::debug_dir().display())) {
-            writeln!(f, "site={} group={} n_hap={}", site, group, n_hap).ok();
-            writeln!(f, "A[0..20]={:?}", &a[..20.min(n_hap)]).ok();
-            writeln!(f, "A_last20={:?}", &a[n_hap.saturating_sub(20)..n_hap]).ok();
-            // Hash of full A
-            let mut hash = 0u64;
-            for i in 0..n_hap { hash = hash.wrapping_mul(31).wrapping_add(a[i] as u64); }
-            writeln!(f, "A_hash={:#018x}", hash).ok();
-            // First 5 target haps (4802..4811) positions in A
-            for th in 4802..4812.min(n_hap) {
-                let pos = a.iter().position(|&x| x == th as i32);
-                writeln!(f, "target_hap_{} pos_in_A={:?}", th, pos).ok();
-            }
-            crate::selphi_debug!("  [PBWT] Dumped state at site {} to {}/pbwt_state_dump.txt", site, crate::log::debug_dir().display());
-        }
-    }
-
     /// Sequential fallback for single-chunk case (bitmatrix path).
     fn _sweep_bitmatrix_seq(&mut self, n_sites: usize, bm: &HaplotypeBitmatrix,
                              ibd2: &super::ibd2_tracks::Ibd2Tracks) {
@@ -584,23 +501,6 @@ impl PbwtNeighborIndex {
         cs
     }
 
-    pub fn get_conditioning_set_window(&self, hap_idx: usize, g_start: usize, g_end: usize) -> Vec<usize> {
-        let addr_offset = self.n_groups * self.n_haps;
-        let mut seen = vec![false; self.n_sweep];
-        let mut result = Vec::new();
-        for d in 0..self.depth {
-            for g in g_start..g_end.min(self.n_groups) {
-                let idx = d * addr_offset + hap_idx * self.n_groups + g;
-                let neighbor = self.data[idx];
-                if neighbor >= 0 {
-                    let n = neighbor as usize;
-                    if n < self.n_sweep && !seen[n] { seen[n] = true; result.push(n); }
-                }
-            }
-        }
-        result
-    }
-
     /// Iterate over SELECTED loci in [l_start, l_end] and collect
     /// unique PBWT neighbors for the given haplotype. Neighbor indices are
     /// full-panel (target + ref) ∈ `[0, n_sweep)`.
@@ -669,26 +569,6 @@ mod tests {
         assert!(!bm.get(0, 0));
         // hap=2, site=1 → (2*7 + 1*3) % 2 = 17%2 = 1 → true
         assert!(bm.get(1, 2));
-    }
-
-    #[test]
-    fn test_conditioning_bitset() {
-        let mut cbs = ConditioningBitset::new(200);
-        cbs.add_neighbor(0, 5);
-        cbs.add_neighbor(0, 10);
-        cbs.add_neighbor(0, 100);
-        cbs.add_neighbor(1, 5);
-        cbs.add_neighbor(1, 20);
-
-        let s0 = cbs.get_set(0);
-        assert_eq!(s0, vec![5, 10, 100]);
-
-        let s1 = cbs.get_set(1);
-        assert_eq!(s1, vec![5, 20]);
-
-        // Union: {5, 10, 100} ∪ {5, 20} = {5, 10, 20, 100}
-        let u = cbs.get_union(0, 1);
-        assert_eq!(u, vec![5, 10, 20, 100]);
     }
 
     #[test]
