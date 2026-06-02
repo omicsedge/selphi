@@ -46,13 +46,11 @@ pub fn setup_sd_batch_writers(
 }
 
 pub fn finalize_sd_batch_writers(writers: Vec<SdBatchWriter>) -> std::io::Result<Vec<PathBuf>> {
-    let mut paths = Vec::with_capacity(writers.len());
-    for w in writers {
+    crate::io::batch_driver::finalize_writers(writers, |w| -> std::io::Result<PathBuf> {
         let SdBatchWriter { writer, path, .. } = w;
         writer.finish()?;
-        paths.push(path);
-    }
-    Ok(paths)
+        Ok(path)
+    })
 }
 
 pub struct WindowBatchInput<'a> {

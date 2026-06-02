@@ -120,15 +120,13 @@ fn setup_one_batch_writer(
 /// Finalize all batch writers: close channels and join threads. Files are
 /// flushed and ready for merging by [`super::bcf_merge`].
 pub fn finalize_batch_writers(writers: Vec<BatchWriter>) -> std::io::Result<Vec<PathBuf>> {
-    let mut paths = Vec::with_capacity(writers.len());
-    for w in writers {
+    crate::io::batch_driver::finalize_writers(writers, |w| -> std::io::Result<PathBuf> {
         let BatchWriter { tx, handle, path, .. } = w;
         drop(tx);
         handle.join()
             .map_err(|_| std::io::Error::other("batch writer thread panicked"))??;
-        paths.push(path);
-    }
-    Ok(paths)
+        Ok(path)
+    })
 }
 
 /// Helper: send a buffer of BCF record bytes to a specific batch writer.
