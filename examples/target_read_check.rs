@@ -17,11 +17,18 @@ fn main() {
             marker_diff += 1;
         }
     }
+    // Biallelic-projection invariant: every extracted allele must be 0 or 1
+    // (multiallelic index 2+ must be clamped at the GT parse, else chip
+    // passthrough emits a GT allele beyond the single output ALT).
+    let max_v = gv.iter().flatten().flat_map(|g| g.iter()).copied().max().unwrap_or(0);
+    let max_b = gb.iter().flatten().flat_map(|g| g.iter()).copied().max().unwrap_or(0);
     println!("samples: {} vs {}", sv.len(), sb.len());
     println!("markers: {} vs {} (field mismatch {})", mv.len(), mb.len(), marker_diff);
     println!("genotypes_eq: {}", gv == gb);
     println!("is_phased: {} vs {}", pv, pb);
-    let pass = sv == sb && mv.len() == mb.len() && marker_diff == 0 && gv == gb && pv == pb;
+    println!("max_allele: vcf={} bcf={} (must be <=1)", max_v, max_b);
+    let pass = sv == sb && mv.len() == mb.len() && marker_diff == 0 && gv == gb && pv == pb
+        && max_v <= 1 && max_b <= 1;
     println!("{}", if pass { "PASS: BCF reader == VCF reader" } else { "FAIL" });
     std::process::exit(if pass { 0 } else { 1 });
 }
