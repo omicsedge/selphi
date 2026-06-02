@@ -1,5 +1,6 @@
 //! I/O: VCF/BCF reading, streaming output pipeline, native BCF encoder.
 
+pub mod dosage_stats;
 pub mod pipeline;
 pub mod bcf_encode;
 pub mod bcf_batch;
