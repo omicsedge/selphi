@@ -8,13 +8,12 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read as _, Cursor};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
 use super::{
     SRP_MULTI_CHR_MAGIC, GlobalSrpMetadata, ChrDirectoryEntry,
-    SrpMetadata, Variant, CscChunk,
+    SrpMetadata, Variant,
     tiled::{TiledSrpReader, TileEntryPub},
 };
 
@@ -51,24 +50,10 @@ impl ChrSrpView {
         tiled.extract_bitmatrix(self.metadata.n_haps, wgs_idx)
     }
 
-    /// NNZ per chunk — returns uniform 1.0 for tiled-only format.
-    pub fn get_chunk_nnz(&self) -> Vec<f64> {
-        vec![1.0; self.metadata.n_chunks.max(1)]
-    }
-
     /// Convert this ChrSrpView into an SrpReader for use with existing pipeline functions.
     /// This creates an SrpReader that wraps this view's data.
     pub fn into_srp_reader(self) -> super::SrpReader {
         super::SrpReader::from_chr_view(self)
-    }
-
-    /// Load a CSC chunk by ID (not supported for multi-chr tiled-only format).
-    pub fn load_chunk(&self, _chunk_id: usize) -> Arc<CscChunk> {
-        panic!("CSC chunk loading not supported for multi-chr SRP (tiled-only format)")
-    }
-
-    pub fn load_chunk_from_source(&self, _chunk_id: usize) -> CscChunk {
-        panic!("CSC chunk loading not supported for multi-chr SRP (tiled-only format)")
     }
 }
 
@@ -186,11 +171,6 @@ impl MultiChrSrpReader {
 
     /// Number of chromosomes in the file.
     pub fn n_chromosomes(&self) -> usize { self.chr_directory.len() }
-
-    /// Get directory entry for a chromosome by name.
-    pub fn chr_entry(&self, chr_name: &str) -> Option<&ChrDirectoryEntry> {
-        self.chr_map.get(chr_name).map(|&i| &self.chr_directory[i])
-    }
 
     /// Find the chromosome with the most variants (for memory estimation).
     pub fn largest_chr(&self) -> Option<&ChrDirectoryEntry> {

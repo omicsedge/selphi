@@ -147,23 +147,7 @@ impl SrpReader {
     pub fn chunk_size(&self) -> usize { self.metadata.chunk_size }
     pub fn chromosome(&self) -> &str { &self.metadata.chromosome }
     pub fn is_tiled(&self) -> bool { self.tiled.is_some() }
-    pub fn is_v2(&self) -> bool { true }
-
     pub fn load_tiled(&mut self) -> bool { self.tiled.is_some() }
-
-    /// NNZ per chunk for EM density weighting. Uniform if no chunks.
-    pub fn get_chunk_nnz(&self) -> Vec<f64> {
-        if let Some(ref mmap) = self.mmap && !self.chunk_index.is_empty() {
-            return self.chunk_index.iter().map(|&(off, cs, _)| {
-                let end = (off as usize + cs as usize).min(mmap.len());
-                zstd::decode_all(Cursor::new(&mmap[off as usize..end]))
-                    .ok().filter(|d| d.len() >= 12)
-                    .map(|d| i32::from_le_bytes(d[8..12].try_into().unwrap()) as f64)
-                    .unwrap_or(1.0)
-            }).collect();
-        }
-        vec![1.0; self.metadata.n_chunks.max(1)]
-    }
 
     /// Load CSC chunk (for BCF/Parquet/PGEN output paths).
     pub fn load_chunk(&self, chunk_id: usize) -> Arc<CscChunk> {
