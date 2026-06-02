@@ -135,6 +135,76 @@ fn recomb_scale(ne: f32, k: usize, n_ref: usize) -> f64 {
     }
 }
 
+/// Precompute the normalized per-(variant, allele) emission into `out`
+/// (`out[2v]` = P(ref), `out[2v+1]` = P(alt)). Shared verbatim by the scalar
+/// and AVX-512 forward-backward paths so the f32 op order (`p0 * inv`, with the
+/// degenerate `0.5/0.5` fallback) is bit-identical between them. NOTE the
+/// scaffold path uses a direct `p0 / s` (different rounding) and does NOT use
+/// this helper.
+#[inline]
+fn precompute_emit(hl: &[f32], n_var: usize, ee: f32, ed: f32, out: &mut Vec<f32>) {
+    out.clear();
+    out.resize(n_var * 2, 0.0);
+    for v in 0..n_var {
+        let h0 = hl[2 * v];
+        let h1 = hl[2 * v + 1];
+        let p0 = h0 * ee + h1 * ed;
+        let p1 = h0 * ed + h1 * ee;
+        let s = p0 + p1;
+        if s > f32::MIN_POSITIVE {
+            let inv = 1.0 / s;
+            out[2 * v] = p0 * inv;
+            out[2 * v + 1] = p1 * inv;
+        } else {
+            out[2 * v] = 0.5;
+            out[2 * v + 1] = 0.5;
+        }
+    }
+}
+
+/// Precompute the per-boundary recombination probability `p_rec[v]` (transition
+/// from site `v-1` to `v`) into `out`; `out[0]` is left 0 (unused). `scale` is
+/// [`recomb_scale`]; `recomb_mult` an optional per-site rate multiplier folded
+/// inside the exp. Shared verbatim by the scalar and AVX-512 paths.
+#[inline]
+fn precompute_prec(cm: &[f64], n_var: usize, scale: f64, recomb_mult: Option<&[f32]>, out: &mut Vec<f32>) {
+    out.clear();
+    out.resize(n_var, 0.0);
+    for v in 1..n_var {
+        let d = (cm[v] - cm[v - 1]).max(0.0);
+        let m = recomb_mult.map_or(1.0, |rm| rm[v] as f64);
+        out[v] = (1.0 - (-d * scale * m).exp()) as f32;
+    }
+}
+
+/// Fold the haploid per-allele posterior (`prob_hid_0/1`) back through the
+/// leave-one-out emission division (`loo`) and the read+error emission model
+/// (`ee`/`ed` against the target likelihood `h0`/`h1`) to the final per-site
+/// ALT dosage. Shared verbatim across both the last-site and inductive backward
+/// steps of the scalar and AVX-512 paths (4 call sites). Takes the posteriors
+/// by value — they are not read again after finalization at any call site.
+#[inline(always)]
+fn finalize_site(
+    loo: bool,
+    mut prob_hid_0: f32,
+    mut prob_hid_1: f32,
+    e0: f32,
+    e1: f32,
+    h0: f32,
+    h1: f32,
+    ee: f32,
+    ed: f32,
+) -> f32 {
+    if loo {
+        prob_hid_0 /= e0.max(f32::MIN_POSITIVE);
+        prob_hid_1 /= e1.max(f32::MIN_POSITIVE);
+    }
+    let po0 = (prob_hid_0 * ee + prob_hid_1 * ed) * h0;
+    let po1 = (prob_hid_0 * ed + prob_hid_1 * ee) * h1;
+    let s = po0 + po1;
+    if s > f32::MIN_POSITIVE { po1 / s } else { 0.5 }
+}
+
 /// Output of one HMM run on a single target haplotype.
 pub struct HmmOutput {
     /// Per-variant haploid dosage `E[ALT count]` ∈ [0, 1]. Length = `n_var`.
@@ -188,42 +258,19 @@ pub fn run_forward_backward(
     // --- Precompute emission per (variant, allele) ---
     TL_EMIT.with(|cell| {
         let mut buf = cell.borrow_mut();
-        buf.clear();
-        buf.resize(n_var * 2, 0.0);
-        for v in 0..n_var {
-            let h0 = hl[2 * v];
-            let h1 = hl[2 * v + 1];
-            let p0 = h0 * ee + h1 * ed;
-            let p1 = h0 * ed + h1 * ee;
-            let s = p0 + p1;
-            if s > f32::MIN_POSITIVE {
-                let inv = 1.0 / s;
-                buf[2 * v] = p0 * inv;
-                buf[2 * v + 1] = p1 * inv;
-            } else {
-                buf[2 * v] = 0.5;
-                buf[2 * v + 1] = 0.5;
-            }
-        }
+        precompute_emit(hl, n_var, ee, ed, &mut buf);
     });
 
     // --- Precompute p_rec at each boundary (v-1 → v) ---
+    // MAF-adaptive recombination: a per-site multiplier on the transition RATE
+    // (folded inside the exp, not applied to the probability — exact). <1 at a
+    // site = stickier copy into it; used to keep a rare-allele carrier copied
+    // across rare sites (PHASE-0: carriers present but not copied) without
+    // touching common-common boundaries. None = identity.
     TL_PREC.with(|cell| {
         let mut buf = cell.borrow_mut();
-        buf.clear();
-        buf.resize(n_var, 0.0);
         let scale = recomb_scale(params.ne, k, ref_bm.n_haps);
-        // MAF-adaptive recombination: a per-site multiplier on the transition
-        // RATE (folded inside the exp, not applied to the probability — exact).
-        // <1 at a site = stickier copy into it; used to keep a rare-allele
-        // carrier copied across rare sites (PHASE-0: carriers present but not
-        // copied) without touching common-common boundaries. None = identity.
-        for v in 1..n_var {
-            let d = (cm[v] - cm[v - 1]).max(0.0);
-            let m = recomb_mult.map_or(1.0, |rm| rm[v] as f64);
-            buf[v] = (1.0 - (-d * scale * m).exp()) as f32;
-        }
-        // buf[0] unused
+        precompute_prec(cm, n_var, scale, recomb_mult, &mut buf);
     });
 
     // --- Forward pass ---
@@ -314,16 +361,10 @@ pub fn run_forward_backward(
             // Combine with HL via the emission matrix to obtain prob_obs:
             // prob_obs[a] = (prob_hid[0]*ee + prob_hid[1]*ed)  if a=0
             //             = (prob_hid[0]*ed + prob_hid[1]*ee)  if a=1
-            if loo {
-                prob_hid_0 /= e0_last.max(f32::MIN_POSITIVE);
-                prob_hid_1 /= e1_last.max(f32::MIN_POSITIVE);
-            }
-            let h0 = hl[2 * last];
-            let h1 = hl[2 * last + 1];
-            let po0 = (prob_hid_0 * ee + prob_hid_1 * ed) * h0;
-            let po1 = (prob_hid_0 * ed + prob_hid_1 * ee) * h1;
-            let s = po0 + po1;
-            dosage[last] = if s > f32::MIN_POSITIVE { po1 / s } else { 0.5 };
+            dosage[last] = finalize_site(
+                loo, prob_hid_0, prob_hid_1, e0_last, e1_last,
+                hl[2 * last], hl[2 * last + 1], ee, ed,
+            );
         }
 
         // Backward inductive: v = last-1 .. 0
@@ -352,16 +393,10 @@ pub fn run_forward_backward(
             }
             beta_sum = new_beta_sum;
 
-            if loo {
-                prob_hid_0 /= e0_v.max(f32::MIN_POSITIVE);
-                prob_hid_1 /= e1_v.max(f32::MIN_POSITIVE);
-            }
-            let h0v = hl[2 * v];
-            let h1v = hl[2 * v + 1];
-            let po0 = (prob_hid_0 * ee + prob_hid_1 * ed) * h0v;
-            let po1 = (prob_hid_0 * ed + prob_hid_1 * ee) * h1v;
-            let s = po0 + po1;
-            dosage[v] = if s > f32::MIN_POSITIVE { po1 / s } else { 0.5 };
+            dosage[v] = finalize_site(
+                loo, prob_hid_0, prob_hid_1, e0_v, e1_v,
+                hl[2 * v], hl[2 * v + 1], ee, ed,
+            );
         }
     })))));
 
@@ -405,23 +440,10 @@ unsafe fn run_fb_avx512(
         let mut condbits = cc.borrow_mut();
 
         // emission per (variant, allele)
-        emit.clear(); emit.resize(n_var * 2, 0.0);
-        for v in 0..n_var {
-            let h0 = hl[2 * v]; let h1 = hl[2 * v + 1];
-            let p0 = h0 * ee + h1 * ed;
-            let p1 = h0 * ed + h1 * ee;
-            let s = p0 + p1;
-            if s > f32::MIN_POSITIVE { let inv = 1.0 / s; emit[2*v] = p0*inv; emit[2*v+1] = p1*inv; }
-            else { emit[2*v] = 0.5; emit[2*v+1] = 0.5; }
-        }
+        precompute_emit(hl, n_var, ee, ed, &mut emit);
         // p_rec
-        p_rec.clear(); p_rec.resize(n_var, 0.0);
         let scale = recomb_scale(params.ne, k, ref_bm.n_haps);
-        for v in 1..n_var {
-            let d = (cm[v] - cm[v - 1]).max(0.0);
-            let m = recomb_mult.map_or(1.0, |rm| rm[v] as f64);
-            p_rec[v] = (1.0 - (-d * scale * m).exp()) as f32;
-        }
+        precompute_prec(cm, n_var, scale, recomb_mult, &mut p_rec);
         // Bit-packed conditioning alleles (1 bit/state). Branchless + word-at-a-
         // time: accumulate 64 consecutive states into a register, store once per
         // word. The previous form did a branch on each (random) allele bit — a
@@ -568,12 +590,10 @@ unsafe fn run_fb_avx512(
                 if a { prob_hid_1 += post; } else { prob_hid_0 += post; }
                 j += 1;
             }
-            if loo { prob_hid_0 /= e0l.max(f32::MIN_POSITIVE); prob_hid_1 /= e1l.max(f32::MIN_POSITIVE); }
-            let h0 = hl[2 * last]; let h1 = hl[2 * last + 1];
-            let po0 = (prob_hid_0 * ee + prob_hid_1 * ed) * h0;
-            let po1 = (prob_hid_0 * ed + prob_hid_1 * ee) * h1;
-            let s = po0 + po1;
-            dosage[last] = if s > f32::MIN_POSITIVE { po1 / s } else { 0.5 };
+            dosage[last] = finalize_site(
+                loo, prob_hid_0, prob_hid_1, e0l, e1l,
+                hl[2 * last], hl[2 * last + 1], ee, ed,
+            );
         }
 
         // --- Backward inductive ---
@@ -615,12 +635,10 @@ unsafe fn run_fb_avx512(
                 j += 1;
             }
             beta_sum = new_beta_sum;
-            if loo { prob_hid_0 /= e0s.max(f32::MIN_POSITIVE); prob_hid_1 /= e1s.max(f32::MIN_POSITIVE); }
-            let h0v = hl[2 * v]; let h1v = hl[2 * v + 1];
-            let po0 = (prob_hid_0 * ee + prob_hid_1 * ed) * h0v;
-            let po1 = (prob_hid_0 * ed + prob_hid_1 * ee) * h1v;
-            let s = po0 + po1;
-            dosage[v] = if s > f32::MIN_POSITIVE { po1 / s } else { 0.5 };
+            dosage[v] = finalize_site(
+                loo, prob_hid_0, prob_hid_1, e0s, e1s,
+                hl[2 * v], hl[2 * v + 1], ee, ed,
+            );
         }
         if let Some(t) = t_fb {
             PROF_FB_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
