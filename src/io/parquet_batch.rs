@@ -59,18 +59,10 @@ pub fn setup_parquet_batch_writers(
     }
     std::fs::create_dir_all(tmp_dir)?;
 
-    let n_samples = n_haps / 2;
-    let samples_per_batch = batch_size.div_ceil(2).max(1);
     let mut writers = Vec::new();
-    let mut sample_start = 0usize;
-    let mut batch_idx = 0usize;
-
-    while sample_start < n_samples {
-        let sample_end = (sample_start + samples_per_batch).min(n_samples);
-        let hap_start = sample_start * 2;
-        let hap_end = sample_end * 2;
-        let path = tmp_dir.join(format!("selphi_batch_{:04}.parquet", batch_idx));
-        let batch_names = &all_sample_names[sample_start..sample_end];
+    crate::io::batch_driver::for_each_batch(n_haps, batch_size, |r| {
+        let path = tmp_dir.join(format!("selphi_batch_{:04}.parquet", r.batch_idx));
+        let batch_names = &all_sample_names[r.sample_start..r.sample_end];
         let schema = Arc::new(build_batch_schema(batch_names));
         let file = std::fs::File::create(&path)?;
         let props = WriterProperties::builder()
@@ -79,10 +71,9 @@ pub fn setup_parquet_batch_writers(
             .build();
         let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        writers.push(ParquetBatchWriter { writer, schema, path, hap_start, hap_end });
-        sample_start = sample_end;
-        batch_idx += 1;
-    }
+        writers.push(ParquetBatchWriter { writer, schema, path, hap_start: r.hap_start, hap_end: r.hap_end });
+        Ok::<(), std::io::Error>(())
+    })?;
     Ok(writers)
 }
 
