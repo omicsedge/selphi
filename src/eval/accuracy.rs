@@ -24,14 +24,6 @@ pub const MAF_BINS: &[(f64, f64, &str)] = &[
     (0.20,   0.50,   "20-50%"),
 ];
 
-/// Per-site result for one variant.
-pub struct SiteResult {
-    pub maf: f64,
-    pub r2: f64,
-    pub concordance: f64,
-    pub n_samples: usize,
-}
-
 /// Accumulator for per-sample statistics (online, across all variants).
 pub struct SampleAccumulator {
     pub n_samples: usize,

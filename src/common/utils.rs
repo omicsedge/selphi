@@ -1,12 +1,5 @@
 //! Common utility functions.
 
-/// Extract rows [row_start..row_end) from a flat row-major (n_rows, cols) array.
-pub fn extract_subarray(src: &[u8], cols: usize, row_start: usize, row_end: usize) -> Vec<u8> {
-    let start = row_start * cols;
-    let end = row_end * cols;
-    src[start..end].to_vec()
-}
-
 /// Compute median of a PRE-SORTED slice.
 pub fn median(sorted: &[f64]) -> f64 {
     let n = sorted.len();

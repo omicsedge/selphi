@@ -224,16 +224,6 @@ impl LocalAncestry {
         &self.target_probs[offset..offset + N_POPS]
     }
 
-    /// Look up the step index that contains a given chip variant.
-    #[inline]
-    pub fn step_of_variant(&self, chip_var: usize) -> usize {
-        // step_starts is strictly increasing; find largest i such that
-        // step_starts[i] <= chip_var. `partition_point` gives the first index
-        // where the predicate fails, i.e. first i with step_starts[i] > chip_var.
-        let first_after = self.step_starts.partition_point(|&s| s <= chip_var);
-        first_after.saturating_sub(1).min(self.n_steps.saturating_sub(1))
-    }
-
     /// Write a per-hap per-step TSV. Format:
     /// `hap_idx\tstep\tstart_chip_var\tAFR\tEUR\tEAS\tSAS\tAMR`.
     pub fn write_tsv(&self, path: &Path) -> io::Result<()> {

@@ -1,7 +1,6 @@
 //! Genetic map loading and LD correction.
 //!
-//! Port of `modules/load_data.py`: `load_and_interpolate_genetic_map`,
-//! `compute_ld_correction`, `_compute_switch_rates`.
+//! Port of `modules/load_data.py`: `load_and_interpolate_genetic_map`.
 
 use std::path::Path;
 use crate::selphi_debug;
@@ -137,13 +136,6 @@ pub fn interpolate_for_chr(
     }
 }
 
-/// Load raw genetic map grouped by chromosome.
-pub fn load_genetic_map_raw_multi_chr(
-    map_path: &Path,
-) -> std::io::Result<std::collections::BTreeMap<String, (Vec<i64>, Vec<f64>)>> {
-    load_genetic_map_multi_chr(map_path)
-}
-
 /// Strip "chr" prefix for normalization.
 fn strip_chr(s: &str) -> &str {
     s.strip_prefix("chr").unwrap_or(s)
@@ -206,23 +198,6 @@ fn interpolate_cm_impl(map_bp: &[i64], map_cm: &[f64], bp: i64, extrapolate: boo
     let rate = (map_cm[idx] - map_cm[i]) / bp_span;
     let dist = (bp - map_bp[i]) as f64;
     base + rate * dist
-}
-
-/// LD-corrected recombination rates from reference panel.
-///
-/// Adjusts cM distances using empirical switch rates from the reference panel.
-pub fn compute_ld_correction(
-    ref_alleles: &[u8],  // (n_chip, n_haps) row-major
-    chip_cm: &[f64],
-    n_chip: usize,
-    n_haps: usize,
-    window_size: usize,
-) -> Vec<f64> {
-    if n_chip < 3 * window_size {
-        return chip_cm.to_vec();
-    }
-    let switch_rates = compute_switch_rates(ref_alleles, n_chip, n_haps);
-    apply_ld_correction(chip_cm, &switch_rates, window_size)
 }
 
 fn apply_ld_correction(chip_cm: &[f64], switch_rates: &[f64], window_size: usize) -> Vec<f64> {
@@ -311,34 +286,6 @@ fn linear_percentile(sorted: &[f64], pct: f64) -> f64 {
     if hi >= n { return sorted[n - 1]; }
     let frac = idx - lo as f64;
     sorted[lo] + frac * (sorted[hi] - sorted[lo])
-}
-
-/// Compute per-interval switch rates from reference panel.
-fn compute_switch_rates(ref_alleles: &[u8], n_chip: usize, n_haps: usize) -> Vec<f64> {
-    let mut rates = vec![0.0f64; n_chip - 1];
-    for i in 0..n_chip - 1 {
-        let mut sum_i = 0u32;
-        let mut sum_i1 = 0u32;
-        let mut switches = 0u32;
-        let base_i = i * n_haps;
-        let base_i1 = (i + 1) * n_haps;
-        for h in 0..n_haps {
-            sum_i += ref_alleles[base_i + h] as u32;
-            sum_i1 += ref_alleles[base_i1 + h] as u32;
-            if ref_alleles[base_i + h] != ref_alleles[base_i1 + h] {
-                switches += 1;
-            }
-        }
-        let freq_i = sum_i as f64 / n_haps as f64;
-        let freq_i1 = sum_i1 as f64 / n_haps as f64;
-        let het_i = 2.0 * freq_i * (1.0 - freq_i);
-        let het_i1 = 2.0 * freq_i1 * (1.0 - freq_i1);
-        let het_product = het_i * het_i1;
-        if het_product >= 0.01 {
-            rates[i] = (switches as f64 / n_haps as f64) / het_product;
-        }
-    }
-    rates
 }
 
 pub fn compute_ld_correction_bm(
