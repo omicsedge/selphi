@@ -190,12 +190,6 @@ fn extract_subfield(field: &[u8], n: usize) -> Option<&[u8]> {
 
 /// Output of `parse_pl_vcf`.
 pub struct PlVcfResult {
-    /// Per-hap likelihoods packed as
-    /// `hl[v * n_samples * 2 + 2*s + a]` = `P(reads_{s,v} | hap a)`.
-    /// Each (sample, variant) pair has hl[0] + hl[1] = 1. This is the
-    /// pre-marginalized form (identical for both haps of a sample) — kept
-    /// for the simple non-iterative path and tests.
-    pub hl: Vec<f32>,
     /// Raw 3-way genotype likelihoods, normalized per (sample, variant) to
     /// sum 1: `gl3[v * n_samples * 3 + 3*s + g]` = `P(reads | genotype g)`
     /// for g ∈ {0=hom-REF, 1=het, 2=hom-ALT}. Required by the Gibbs loop to
@@ -266,7 +260,6 @@ fn parse_pl_bcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Result<P
     }
 
     let mut markers: Vec<TargetMarker> = Vec::new();
-    let mut hl: Vec<f32> = Vec::new();
     let mut gl3: Vec<f32> = Vec::new();
     let mut n_variants_seen = 0usize;
     let mut n_missing_pl = 0usize;
@@ -289,8 +282,6 @@ fn parse_pl_bcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Result<P
         markers.push(TargetMarker { chrom, pos, ref_allele, alt_allele, ref_hash, alt_hash, id: String::new() });
         n_variants_seen += 1;
 
-        let var_off = hl.len();
-        hl.resize(var_off + n_samples * 2, 0.5);
         let gl_off = gl3.len();
         gl3.resize(gl_off + n_samples * 3, 1.0 / 3.0);
 
@@ -298,10 +289,8 @@ fn parse_pl_bcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Result<P
         for (s, sample) in samples.values().enumerate() {
             if s >= n_samples { break; }
             let pl_opt = sample.get("PL").flatten().and_then(|v| bcf_value_to_pl3(v));
-            let (hlp, glp, valid) = pl_to_hl_gl3(pl_opt);
+            let (_, glp, valid) = pl_to_hl_gl3(pl_opt);
             if !valid { n_missing_pl += 1; }
-            hl[var_off + 2 * s] = hlp[0];
-            hl[var_off + 2 * s + 1] = hlp[1];
             gl3[gl_off + 3 * s] = glp[0];
             gl3[gl_off + 3 * s + 1] = glp[1];
             gl3[gl_off + 3 * s + 2] = glp[2];
@@ -312,7 +301,7 @@ fn parse_pl_bcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Result<P
         "  PL BCF: {} samples, {} variants ({} sample-sites with missing/malformed PL → flat 0.5/0.5)",
         n_samples, n_variants_seen, n_missing_pl,
     );
-    Ok(PlVcfResult { hl, gl3, markers, sample_ids })
+    Ok(PlVcfResult { gl3, markers, sample_ids })
 }
 
 /// Read a VCF/BCF target with `PL` field → per-hap likelihoods.
@@ -351,7 +340,6 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
     let mut sample_names: Vec<String> = Vec::new();
     let mut n_samples = 0usize;
     let mut markers: Vec<TargetMarker> = Vec::with_capacity(est_variants);
-    let mut hl: Vec<f32> = Vec::new(); // sized once after #CHROM parsed
     let mut gl3: Vec<f32> = Vec::new(); // 3 genotype probs per (sample, variant)
 
     let mut n_variants_seen = 0usize;
@@ -385,9 +373,9 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
             }
             sample_names = tmp_samples;
             n_samples = sample_names.len();
-            // Pre-reserve hl buffer for n_variants × n_samples × 2 f32.
+            // Pre-reserve gl3 buffer for n_variants × n_samples × 3 f32.
             // Slight over-reserve is OK; under-reserve would force regrowth.
-            hl.reserve(est_variants.saturating_mul(n_samples * 2));
+            gl3.reserve(est_variants.saturating_mul(n_samples * 3));
             continue;
         }
         if n_samples == 0 { continue; } // shouldn't happen but be defensive
@@ -433,9 +421,7 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
         });
         n_variants_seen += 1;
 
-        // Allocate hl + gl3 rows in-place (no temp Vec)
-        let var_off = hl.len();
-        hl.resize(var_off + n_samples * 2, 0.5);
+        // Allocate gl3 row in-place (no temp Vec)
         let gl_off = gl3.len();
         // Flat default for the 3-way GL is uniform (1/3 each).
         gl3.resize(gl_off + n_samples * 3, 1.0 / 3.0);
@@ -456,12 +442,10 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
             let pl_opt = pl_pos
                 .and_then(|p| extract_subfield(field, p))
                 .and_then(parse_pl_field);
-            let (hlp, glp, valid) = pl_to_hl_gl3(pl_opt);
+            let (_, glp, valid) = pl_to_hl_gl3(pl_opt);
             if !valid { n_missing_pl += 1; }
-            // SAFETY: var_off + 2*s + 1 < var_off + n_samples*2, in bounds.
+            // SAFETY: gl_off + 3*s + 2 < gl_off + n_samples*3, in bounds.
             unsafe {
-                *hl.get_unchecked_mut(var_off + 2 * s)     = hlp[0];
-                *hl.get_unchecked_mut(var_off + 2 * s + 1) = hlp[1];
                 *gl3.get_unchecked_mut(gl_off + 3 * s)     = glp[0];
                 *gl3.get_unchecked_mut(gl_off + 3 * s + 1) = glp[1];
                 *gl3.get_unchecked_mut(gl_off + 3 * s + 2) = glp[2];
@@ -480,7 +464,6 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
     );
 
     Ok(PlVcfResult {
-        hl,
         gl3,
         markers,
         sample_ids: sample_names,

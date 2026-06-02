@@ -71,7 +71,7 @@ pub fn run_lcwgs(
         let first_ref = &srp.variants[0].ref_allele;
         !srp.ids[0].contains(first_ref)
     };
-    let PlVcfResult { hl: _hl_input, gl3: gl3_input, markers, sample_ids } =
+    let PlVcfResult { gl3: gl3_input, markers, sample_ids } =
         parse_pl_vcf(target_vcf, hash_alleles)?;
     let n_samples = sample_ids.len();
     let n_target_variants = markers.len();
