@@ -126,11 +126,14 @@ fn split_vcf_fields(line: &[u8]) -> Option<VcfFields<'_>> {
 
 /// Parse the per-sample diploid GT region (VCF fields 9+) into `[a0, a1]`
 /// pairs, biallelic-projected to {0,1}: any ALT allele index (≥1, incl.
-/// multiallelic 2+) folds to 1; REF / missing / haploid (`len < 3`) → 0.
-/// Decrements `*phase_checks` over the leading samples and clears `*is_phased`
-/// when a checked sample uses the unphased `/` separator. (Replaces three
-/// byte-identical copies; the former cohort `bin` and `.min(1)` clamps yield
-/// the same {0,1} result.)
+/// multiallelic 2+) folds to 1; REF / missing → 0. A HAPLOID GT (`len < 3`,
+/// e.g. chrX males `"1"`) is read as `[allele, 0]` — matching the binary-BCF
+/// reader (`read_target_bcf`), which reads the real allele — so the call
+/// reaches the downstream chrX-haploid handling (detect_haploid_chrx /
+/// reset_haploid_hets) instead of being silently dropped to `0|0`. Decrements
+/// `*phase_checks` over the leading samples and clears `*is_phased` when a
+/// checked sample uses the unphased `/` separator. (Replaces three byte-
+/// identical copies; the former cohort `bin` and `.min(1)` clamps are equal.)
 fn parse_gt_region(
     gt_region: &[u8],
     n_samples: usize,
@@ -155,10 +158,12 @@ fn parse_gt_region(
         }
 
         let (a0, a1) = if gt.len() >= 3 {
-            let b0 = gt[0];
-            let b1 = gt[2];
-            (if b0.is_ascii_digit() { (b0 - b'0').min(1) } else { 0 },
-             if b1.is_ascii_digit() { (b1 - b'0').min(1) } else { 0 })
+            // Diploid "a/b" or "a|b" (separator at index 1).
+            (if gt[0].is_ascii_digit() { (gt[0] - b'0').min(1) } else { 0 },
+             if gt[2].is_ascii_digit() { (gt[2] - b'0').min(1) } else { 0 })
+        } else if !gt.is_empty() {
+            // Haploid "a" — keep the allele in slot 0 (matches read_target_bcf).
+            (if gt[0].is_ascii_digit() { (gt[0] - b'0').min(1) } else { 0 }, 0)
         } else {
             (0, 0)
         };
