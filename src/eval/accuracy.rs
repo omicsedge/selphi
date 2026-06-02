@@ -766,38 +766,12 @@ fn gt_allele_to_dose(raw: u8) -> u8 {
     if a > 127 { 0 } else { a.min(1) }
 }
 
-/// Parse BCF typed string into bytes.
-fn rtstr_bytes(buf: &[u8], o: &mut usize) -> Vec<u8> {
-    if *o >= buf.len() { return Vec::new(); }
-    let tb = buf[*o]; *o += 1;
-    let tid = tb & 0x0F;
-    let vl = { let r = (tb >> 4) as usize; if r == 15 { rtint(buf, o) as usize } else { r } };
-    if tid == 7 {
-        let e = (*o + vl).min(buf.len());
-        let s = &buf[*o..e];
-        let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
-        *o = e;
-        s[..end].to_vec()
-    } else {
-        *o += vl * match tid { 1=>1, 2=>2, 3=>4, 5=>4, _=>1 };
-        Vec::new()
-    }
-}
+// BCF typed-atom parsers shared with srp::bcf_reader + srp::bref3_writer.
+use crate::srp::bcf_types::{read_typed_i32 as rtint, read_typed_str_bytes as rtstr_bytes};
 
-/// Parse BCF typed string (reuse from bcf_reader pattern).
+/// Parse a BCF typed string, with a lossy UTF-8 conversion (eval-side behavior).
 fn rtstr(buf: &[u8], o: &mut usize) -> String {
     String::from_utf8_lossy(&rtstr_bytes(buf, o)).to_string()
-}
-
-fn rtint(buf: &[u8], o: &mut usize) -> i32 {
-    if *o >= buf.len() { return 0; }
-    let tb = buf[*o]; *o += 1;
-    match tb & 0x0F {
-        1 => { let v = buf[*o] as i8 as i32; *o += 1; v }
-        2 => { let v = i16::from_le_bytes(buf[*o..*o+2].try_into().unwrap()) as i32; *o += 2; v }
-        3 => { let v = i32::from_le_bytes(buf[*o..*o+4].try_into().unwrap()); *o += 4; v }
-        _ => 0
-    }
 }
 
 /// Load 16 kb checkpoint positions (0-based) from the file's seek index.

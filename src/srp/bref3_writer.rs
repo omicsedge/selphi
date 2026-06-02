@@ -507,11 +507,11 @@ fn parse_bcf_gt(raw: &RawBcfRec, n_haps: usize, n_samples: usize, gtk: u16) -> V
     let mut io2 = 0usize;
     for _ in 0..nf {
         if io2 >= ib.len() { break; }
-        let k = rtint_le(ib, &mut io2) as u16;
+        let k = rtint(ib, &mut io2) as u16;
         if io2 >= ib.len() { break; }
         let tb = ib[io2]; io2 += 1;
         let tid = tb & 0x0F;
-        let vl = { let r = (tb >> 4) as usize; if r == 15 { rtint_le(ib, &mut io2) as usize } else { r } };
+        let vl = { let r = (tb >> 4) as usize; if r == 15 { rtint(ib, &mut io2) as usize } else { r } };
         let es = match tid { 1=>1, 2=>2, 3=>4, 5=>4, 7=>1, _=>1 };
         let fs = vl * es * n_samples;
         if k == gtk {
@@ -603,33 +603,8 @@ fn write_bref3_block<W: Write>(
     Ok(written)
 }
 
-// --- BCF parsing helpers ---
-
-fn rtint_le(buf: &[u8], o: &mut usize) -> i32 {
-    if *o >= buf.len() { return 0; }
-    let tb = buf[*o]; *o += 1;
-    match tb & 0x0F {
-        1 => { let v = buf[*o] as i8 as i32; *o += 1; v }
-        2 => { let v = i16::from_le_bytes(buf[*o..*o+2].try_into().unwrap()) as i32; *o += 2; v }
-        3 => { let v = i32::from_le_bytes(buf[*o..*o+4].try_into().unwrap()); *o += 4; v }
-        _ => 0
-    }
-}
-
-fn rtstr(buf: &[u8], o: &mut usize) -> String {
-    if *o >= buf.len() { return String::new(); }
-    let tb = buf[*o]; *o += 1;
-    let tid = tb & 0x0F;
-    let vl = { let r = (tb >> 4) as usize; if r == 15 { rtint_le(buf, o) as usize } else { r } };
-    if tid == 7 {
-        let e = (*o + vl).min(buf.len());
-        let s = std::str::from_utf8(&buf[*o..e]).unwrap_or("").trim_end_matches('\0').to_string();
-        *o = e; s
-    } else {
-        *o += vl * match tid { 1=>1, 2=>2, 3=>4, 5=>4, _=>1 };
-        String::new()
-    }
-}
+// --- BCF parsing helpers (shared with bcf_reader + eval::accuracy) ---
+use super::bcf_types::{read_typed_i32 as rtint, read_typed_str as rtstr};
 
 fn snv_perms() -> Vec<Vec<String>> {
     let bases: Vec<String> = vec!["A".into(), "C".into(), "G".into(), "T".into()];

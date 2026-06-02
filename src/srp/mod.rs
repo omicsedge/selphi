@@ -18,6 +18,7 @@ pub mod writer;
 pub mod bref3;
 pub mod bref3_writer;
 pub mod bcf_reader;
+pub(crate) mod bcf_types;
 pub mod csi;
 pub mod tiled;
 pub mod multi_chr_reader;

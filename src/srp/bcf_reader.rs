@@ -398,19 +398,5 @@ fn ru32eof<R: Read>(r: &mut R) -> io::Result<Option<u32>> {
         Err(ref e) if e.kind()==io::ErrorKind::Interrupted => {} Err(e) => return Err(e),
     }}
 }
-fn rtstr(buf: &[u8], o: &mut usize) -> String {
-    if *o>=buf.len() { return String::new(); } let tb=buf[*o]; *o+=1; let tid=tb&0x0F;
-    let vl={ let r=(tb>>4) as usize; if r==15 { rtint(buf,o) as usize } else { r } };
-    if tid==7 { let e=(*o+vl).min(buf.len()); let s=std::str::from_utf8(&buf[*o..e]).unwrap_or("").trim_end_matches('\0').to_string(); *o=e; s }
-    else { *o+=vl*match tid { 1=>1,2=>2,3=>4,5=>4,_=>1 }; String::new() }
-}
-fn rtint(buf: &[u8], o: &mut usize) -> i32 {
-    if *o>=buf.len() { return 0; } let tb=buf[*o]; *o+=1;
-    // Bounds-check the multi-byte reads (was unguarded → OOB panic on truncated INFO/FORMAT).
-    match tb&0x0F {
-        1 => { if *o >= buf.len() { return 0; } let v=buf[*o] as i8 as i32; *o+=1; v }
-        2 => { if *o+2 > buf.len() { return 0; } let v=i16::from_le_bytes(buf[*o..*o+2].try_into().unwrap()) as i32; *o+=2; v }
-        3 => { if *o+4 > buf.len() { return 0; } let v=i32::from_le_bytes(buf[*o..*o+4].try_into().unwrap()); *o+=4; v }
-        _ => 0
-    }
-}
+// BCF typed-atom parsers shared with bref3_writer + eval::accuracy.
+use super::bcf_types::{read_typed_i32 as rtint, read_typed_str as rtstr};
