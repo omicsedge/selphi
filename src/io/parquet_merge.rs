@@ -130,52 +130,36 @@ pub fn merge_batch_parquets(
             batch_ap_arrays.push(arrs);
         }
 
+        // Reusable per-row scratch: flattened (ap1, ap2) in global sample order,
+        // plus the helper's per-sample dosage output (also feeds the DS columns).
+        let mut flat: Vec<(f32, f32)> = Vec::with_capacity(n_samples_total);
+        let mut ds_scratch = vec![0f32; n_samples_total];
+
         for row in 0..n_rows {
             let is_imp = imp_col.value(row);
             imp_b.append_value(is_imp);
 
-            // Gather AP1/AP2 across all batches for this row.
-            // Compute AC (hardcall count), p_sum (Σ DS), p_hat, var_sum.
-            let mut ac: u32 = 0;
-            let mut p_sum = 0.0f64;
-            // First pass: fill ds_builders + accumulate ac, p_sum.
-            let mut sample_idx_global = 0usize;
+            // Gather AP1/AP2 across all batches for this row in global sample order.
+            flat.clear();
             for bi in 0..batches.len() {
                 let arrs = &batch_ap_arrays[bi];
                 let k_in_batch = arrs.len() / 2;
                 for s in 0..k_in_batch {
-                    let ap1 = arrs[s * 2].value(row);
-                    let ap2 = arrs[s * 2 + 1].value(row);
-                    let ds = ap1 + ap2;
-                    ds_builders[sample_idx_global].append_value(ds);
-                    if ap1 > 0.5 { ac += 1; }
-                    if ap2 > 0.5 { ac += 1; }
-                    p_sum += ds as f64;
-                    sample_idx_global += 1;
+                    flat.push((arrs[s * 2].value(row), arrs[s * 2 + 1].value(row)));
                 }
             }
+            // AC + dosage-R² via the shared helper; ds_scratch[s] = ap1+ap2 (the DS column).
+            let (ac, dr2_f64) = crate::io::dosage_stats::imputed_ac_dr2(
+                n_samples_total, n_haps_total as usize, |s| flat[s], &mut ds_scratch,
+            );
+            for s in 0..n_samples_total {
+                ds_builders[s].append_value(ds_scratch[s]);
+            }
             let af = ac as f32 / n_haps_total as f32;
-            let p_hat = p_sum / n_haps_total as f64;
+            af_b.append_value(af);
             if is_imp {
-                // Second pass: variance of DS
-                let mut var_sum = 0.0f64;
-                for bi in 0..batches.len() {
-                    let arrs = &batch_ap_arrays[bi];
-                    let k_in_batch = arrs.len() / 2;
-                    for s in 0..k_in_batch {
-                        let ap1 = arrs[s * 2].value(row);
-                        let ap2 = arrs[s * 2 + 1].value(row);
-                        let d = (ap1 + ap2) as f64 - 2.0 * p_hat;
-                        var_sum += d * d;
-                    }
-                }
-                let var_dosage = var_sum / n_haps_total as f64;
-                let var_expected = 2.0 * p_hat * (1.0 - p_hat);
-                let dr2 = if var_expected > 1e-10 { (var_dosage / var_expected).clamp(0.0, 1.0) as f32 } else { 0.0 };
-                af_b.append_value(af);
-                dr2_b.append_value(dr2);
+                dr2_b.append_value(dr2_f64 as f32);
             } else {
-                af_b.append_value(af);
                 dr2_b.append_null();
             }
         }

@@ -264,36 +264,36 @@ fn merge_one_record(
         }
     }
 
-    // Recompute INFO from concatenated dosages/genotypes — using the exact
-    // same f64 math as `pipeline.rs::format_tile_batch`:
-    //   ac is from hardcalls (ap1>0.5, ap2>0.5)
-    //   p_sum += (ap1 + ap2) as f64
-    //   var_sum += ((ap1+ap2) as f64 - 2*p_hat)^2
-    // f32 → f64 conversion happens AFTER summing in f32 (matches non-batched).
+    // Recompute INFO from the concatenated per-batch genotypes/dosages. Imputed
+    // AC + dosage-R² go through the shared dosage_stats::imputed_ac_dr2 helper
+    // (same f64 accumulation order + f32-add-then-cast dosages as the
+    // non-batched path); chip AC/AN is a plain hardcall count.
     let mut ac: u32 = 0;
     let mut an: u32 = 0;
-    let (mut p_sum, mut var_sum) = (0.0f64, 0.0f64);
     let mut n_hap_tot: u32 = 0;
+    let mut dr2 = 0.0f64; // written to INFO only when is_imputed
     if is_imputed {
+        // Flatten per-hap ALT probs across batches in batch-major order (the
+        // order the hand-rolled two-pass used) so the helper's flat ap(s)
+        // closure sums in exactly the same sequence.
+        let mut flat: Vec<(f32, f32)> =
+            Vec::with_capacity(all_sample_ap1.iter().map(|v| v.len()).sum());
         for bi in 0..all_sample_ap1.len() {
             let a1 = &all_sample_ap1[bi];
             let a2 = &all_sample_ap2[bi];
             for s in 0..a1.len() {
-                ac += if a1[s] > 0.5 { 1u32 } else { 0 } + if a2[s] > 0.5 { 1u32 } else { 0 };
-                an += 2;
-                n_hap_tot += 2;
-                p_sum += (a1[s] + a2[s]) as f64;
+                flat.push((a1[s], a2[s]));
             }
         }
-        let p_hat = if n_hap_tot > 0 { p_sum / n_hap_tot as f64 } else { 0.0 };
-        for bi in 0..all_sample_ap1.len() {
-            let a1 = &all_sample_ap1[bi];
-            let a2 = &all_sample_ap2[bi];
-            for s in 0..a1.len() {
-                let d = (a1[s] + a2[s]) as f64 - 2.0 * p_hat;
-                var_sum += d * d;
-            }
-        }
+        let n_samp = flat.len();
+        n_hap_tot = (n_samp * 2) as u32;
+        an = n_hap_tot;
+        let mut ds = vec![0f32; n_samp];
+        let (ac_v, dr2_v) = crate::io::dosage_stats::imputed_ac_dr2(
+            n_samp, n_hap_tot as usize, |s| flat[s], &mut ds,
+        );
+        ac = ac_v;
+        dr2 = dr2_v;
     } else {
         for (bgta, bgtb) in all_sample_gt_a.iter().zip(all_sample_gt_b.iter()) {
             for s in 0..bgta.len() {
@@ -319,10 +319,6 @@ fn merge_one_record(
     buf.extend_from_slice(b";AN=");
     write_u32(&mut buf, an);
     if is_imputed {
-        let var_dosage = var_sum / n_hap_tot as f64;
-        let p_hat = p_sum / n_hap_tot as f64;
-        let var_expected = 2.0 * p_hat * (1.0 - p_hat);
-        let dr2 = if var_expected > 1e-10 { (var_dosage / var_expected).clamp(0.0, 1.0) } else { 0.0 };
         buf.extend_from_slice(b";DR2=");
         write_f4(&mut buf, dr2);
         buf.extend_from_slice(b";IMP");
