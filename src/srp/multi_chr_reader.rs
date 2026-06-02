@@ -43,55 +43,12 @@ impl ChrSrpView {
     pub fn is_tiled(&self) -> bool { self.tiled.is_some() }
 
     /// Extract reference alleles as a bitmatrix for the given chip variant indices.
-    /// Same logic as `SrpReader::extract_ref_alleles_bitmatrix`.
+    /// Same logic as `SrpReader::extract_ref_alleles_bitmatrix` — both delegate to
+    /// the shared `TiledSrpReader::extract_bitmatrix`.
     pub fn extract_ref_alleles_bitmatrix(&self, wgs_idx: &[usize]) -> crate::common::HaplotypeBitmatrix {
-        use super::{TILE_ROWS, TILE_COLS};
-        use rayon::prelude::*;
-
         let tiled = self.tiled.as_ref()
             .expect("Tiled backend required for multi-chr SRP");
-
-        let n_chip = wgs_idx.len();
-        let n_haps = self.metadata.n_haps;
-        let n_words = n_haps.div_ceil(64);
-        let mut bits = vec![0u64; n_chip * n_words];
-
-        let mut stripe_groups: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
-        for (ci, &wi) in wgs_idx.iter().enumerate() {
-            stripe_groups.entry(wi / TILE_ROWS).or_default().push((ci, wi % TILE_ROWS));
-        }
-        let mut sorted: Vec<_> = stripe_groups.into_iter().collect();
-        sorted.sort_by_key(|(s, _)| *s);
-
-        let bits_ptr = bits.as_mut_ptr() as usize;
-        let bits_len = bits.len();
-        let n_tc = tiled.n_tile_cols;
-
-        for batch in sorted.chunks(400) {
-            let fs = batch[0].0;
-            let ls = batch.last().unwrap().0;
-            let loaded = tiled.preload_stripes(fs, ls - fs + 1).expect("preload failed");
-
-            batch.par_iter().for_each(|(stripe, sites)| {
-                let bs = unsafe { std::slice::from_raw_parts_mut(bits_ptr as *mut u64, bits_len) };
-                for band in 0..n_tc {
-                    let tile = loaded.decompress_tile(*stripe, band);
-                    let cb = band * TILE_COLS;
-                    for col in 0..tile.n_cols as usize {
-                        let gh = cb + col;
-                        if gh >= n_haps { break; }
-                        let wi = gh / 64;
-                        let bit = 1u64 << (gh % 64);
-                        let (lo, hi) = tile.col_range(col);
-                        for k in lo..hi {
-                            let lr = tile.indices[k] as usize;
-                            for &(ci, cr) in sites { if cr == lr { bs[ci * n_words + wi] |= bit; } }
-                        }
-                    }
-                }
-            });
-        }
-        crate::common::HaplotypeBitmatrix::from_raw(bits, n_chip, n_haps)
+        tiled.extract_bitmatrix(self.metadata.n_haps, wgs_idx)
     }
 
     /// NNZ per chunk — returns uniform 1.0 for tiled-only format.
