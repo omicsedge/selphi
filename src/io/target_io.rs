@@ -48,6 +48,128 @@ fn fast_parse_i64(bytes: &[u8]) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// Shared VCF-text parsing primitives (used by all three text readers below:
+// read_cohort_vcf / read_target_vcf / read_target_vcf_multi_chr). Binary BCF
+// is dispatched to read_target_bcf by each reader before these are called.
+// ---------------------------------------------------------------------------
+
+/// Read a VCF path fully into a decompressed byte buffer (BGZF `.gz` or plain
+/// text). Exits the process on I/O / decompression error. Does NOT handle
+/// binary BCF — the caller dispatches that first (and re-checks the `BCF\2\2`
+/// magic on the returned buffer for a mis-named `.vcf.gz`).
+fn read_vcf_raw(path: &str) -> Vec<u8> {
+    use std::io::Read;
+    let is_gz = path.ends_with(".gz");
+    let file = std::fs::File::open(path)
+        .unwrap_or_else(|e| { selphi_error!("Cannot open {}: {}", path, e); std::process::exit(1) });
+    let mut raw = Vec::new();
+    if is_gz {
+        let mut bgzf = noodles_bgzf::io::Reader::new(std::io::BufReader::new(file));
+        bgzf.read_to_end(&mut raw)
+            .unwrap_or_else(|e| { selphi_error!("BGZF decompress failed for {}: {}", path, e); std::process::exit(1) });
+    } else {
+        let mut reader = std::io::BufReader::new(file);
+        reader.read_to_end(&mut raw)
+            .unwrap_or_else(|e| { selphi_error!("Failed to read VCF {}: {}", path, e); std::process::exit(1) });
+    }
+    raw
+}
+
+/// Core fields of one VCF data line, borrowed from the line buffer. `gt_region`
+/// is the raw bytes of fields 9+ (per-sample columns), to be handed to
+/// [`parse_gt_region`].
+struct VcfFields<'a> {
+    chrom: &'a str,
+    pos: i64,
+    id: &'a str,
+    ref_allele: &'a str,
+    alt_allele: &'a str,
+    /// True if the ALT field carried a comma (more than one ALT allele).
+    multiallelic: bool,
+    gt_region: &'a [u8],
+}
+
+/// Split a VCF data line into [`VcfFields`]. Returns `None` for lines that all
+/// three readers skip identically: fewer than 9 tabs, `POS < 1` (malformed),
+/// or a missing/`.` ALT. The first ALT allele (before any comma) is kept.
+fn split_vcf_fields(line: &[u8]) -> Option<VcfFields<'_>> {
+    let mut tabs = [0usize; 9];
+    let mut n_tabs = 0;
+    for (i, &b) in line.iter().enumerate() {
+        if b == b'\t' {
+            if n_tabs < 9 { tabs[n_tabs] = i; }
+            n_tabs += 1;
+            if n_tabs >= 9 { break; }
+        }
+    }
+    if n_tabs < 9 { return None; }
+
+    let pos = fast_parse_i64(&line[tabs[0] + 1..tabs[1]]);
+    if pos < 1 { return None; }
+
+    let ref_bytes = &line[tabs[2] + 1..tabs[3]];
+    let alt_field = &line[tabs[3] + 1..tabs[4]];
+    let alt_end = alt_field.iter().position(|&b| b == b',').unwrap_or(alt_field.len());
+    let alt_bytes = &alt_field[..alt_end];
+    if alt_bytes == b"." || alt_bytes.is_empty() { return None; }
+
+    Some(VcfFields {
+        chrom: std::str::from_utf8(&line[..tabs[0]]).unwrap_or(""),
+        pos,
+        id: std::str::from_utf8(&line[tabs[1] + 1..tabs[2]]).unwrap_or("."),
+        ref_allele: std::str::from_utf8(ref_bytes).unwrap_or(""),
+        alt_allele: std::str::from_utf8(alt_bytes).unwrap_or(""),
+        multiallelic: alt_end < alt_field.len(),
+        gt_region: &line[tabs[8] + 1..],
+    })
+}
+
+/// Parse the per-sample diploid GT region (VCF fields 9+) into `[a0, a1]`
+/// pairs, biallelic-projected to {0,1}: any ALT allele index (≥1, incl.
+/// multiallelic 2+) folds to 1; REF / missing / haploid (`len < 3`) → 0.
+/// Decrements `*phase_checks` over the leading samples and clears `*is_phased`
+/// when a checked sample uses the unphased `/` separator. (Replaces three
+/// byte-identical copies; the former cohort `bin` and `.min(1)` clamps yield
+/// the same {0,1} result.)
+fn parse_gt_region(
+    gt_region: &[u8],
+    n_samples: usize,
+    is_phased: &mut bool,
+    phase_checks: &mut i32,
+) -> Vec<[u8; 2]> {
+    let mut var_gts = Vec::with_capacity(n_samples);
+    let mut field_start = 0;
+    for _ in 0..n_samples {
+        let field_end = gt_region[field_start..]
+            .iter()
+            .position(|&b| b == b'\t')
+            .map(|p| field_start + p)
+            .unwrap_or(gt_region.len());
+        let field = &gt_region[field_start..field_end];
+        let gt_end = field.iter().position(|&b| b == b':').unwrap_or(field.len());
+        let gt = &field[..gt_end];
+
+        if *phase_checks > 0 {
+            if gt.contains(&b'/') { *is_phased = false; }
+            *phase_checks -= 1;
+        }
+
+        let (a0, a1) = if gt.len() >= 3 {
+            let b0 = gt[0];
+            let b1 = gt[2];
+            (if b0.is_ascii_digit() { (b0 - b'0').min(1) } else { 0 },
+             if b1.is_ascii_digit() { (b1 - b'0').min(1) } else { 0 })
+        } else {
+            (0, 0)
+        };
+        var_gts.push([a0, a1]);
+
+        field_start = if field_end < gt_region.len() { field_end + 1 } else { gt_region.len() };
+    }
+    var_gts
+}
+
+// ---------------------------------------------------------------------------
 // read_cohort_vcf  (panel self-phasing — no SRP intersection)
 // ---------------------------------------------------------------------------
 
@@ -59,22 +181,11 @@ fn fast_parse_i64(bytes: &[u8]) -> i64 {
 pub fn read_cohort_vcf(
     path: &str,
 ) -> (Vec<String>, Vec<TargetMarker>, Vec<Vec<[u8; 2]>>, bool) {
-    use std::io::Read;
     // Real binary BCF → noodles decoder (captures the variant ID for panel output).
     if path.ends_with(".bcf") {
         return read_target_bcf(path, false, true);
     }
-    let is_gz = path.ends_with(".gz");
-    let file = std::fs::File::open(path)
-        .unwrap_or_else(|e| { selphi_error!("Cannot open {}: {}", path, e); std::process::exit(1) });
-    let mut raw = Vec::new();
-    if is_gz {
-        let mut bgzf = noodles_bgzf::io::Reader::new(std::io::BufReader::new(file));
-        bgzf.read_to_end(&mut raw).unwrap_or_else(|e| { selphi_error!("BGZF decompress failed for {}: {}", path, e); std::process::exit(1) });
-    } else {
-        let mut reader = std::io::BufReader::new(file);
-        reader.read_to_end(&mut raw).unwrap_or_else(|e| { selphi_error!("Failed to read VCF {}: {}", path, e); std::process::exit(1) });
-    }
+    let raw = read_vcf_raw(path);
     if raw.starts_with(b"BCF\x02\x02") {
         return read_target_bcf(path, false, true);
     }
@@ -97,63 +208,16 @@ pub fn read_cohort_vcf(
             }
             continue;
         }
-        let mut tabs = [0usize; 9];
-        let mut n_tabs = 0;
-        for (i, &b) in line.iter().enumerate() {
-            if b == b'\t' {
-                if n_tabs < 9 { tabs[n_tabs] = i; }
-                n_tabs += 1;
-                if n_tabs >= 9 { break; }
-            }
-        }
-        if n_tabs < 9 { continue; }
-
-        let pos: i64 = fast_parse_i64(&line[tabs[0]+1..tabs[1]]);
-        if pos < 1 { continue; } // skip malformed VCF POS (sentinel)
-        let ref_bytes = &line[tabs[2]+1..tabs[3]];
-        let alt_field = &line[tabs[3]+1..tabs[4]];
-        let alt_end = alt_field.iter().position(|&b| b == b',').unwrap_or(alt_field.len());
-        let alt_bytes = &alt_field[..alt_end];
-        if alt_bytes == b"." || alt_bytes.is_empty() { continue; }
-        if alt_end < alt_field.len() { n_multiallelic += 1; } // ALT had a comma
-        let ref_allele = std::str::from_utf8(ref_bytes).unwrap_or("").to_string();
-        let alt_allele = std::str::from_utf8(alt_bytes).unwrap_or("").to_string();
-        let chrom = std::str::from_utf8(&line[..tabs[0]]).unwrap_or("").to_string();
-        let id = std::str::from_utf8(&line[tabs[1]+1..tabs[2]]).unwrap_or(".").to_string();
+        let Some(f) = split_vcf_fields(line) else { continue };
+        if f.multiallelic { n_multiallelic += 1; }
+        // Panel phasing treats the cohort as biallelic (first ALT kept); the GT
+        // binarisation in parse_gt_region collapses higher ALT indices to 1.
         markers.push(TargetMarker {
-            chrom, pos, ref_allele, alt_allele,
-            ref_hash: String::new(), alt_hash: String::new(), id,
+            chrom: f.chrom.to_string(), pos: f.pos,
+            ref_allele: f.ref_allele.to_string(), alt_allele: f.alt_allele.to_string(),
+            ref_hash: String::new(), alt_hash: String::new(), id: f.id.to_string(),
         });
-
-        let n_samples = sample_names.len();
-        let mut var_gts = Vec::with_capacity(n_samples);
-        let gt_region = &line[tabs[8]+1..];
-        let mut field_start = 0;
-        for _s in 0..n_samples {
-            let field_end = gt_region[field_start..].iter()
-                .position(|&b| b == b'\t')
-                .map(|p| field_start + p)
-                .unwrap_or(gt_region.len());
-            let field = &gt_region[field_start..field_end];
-            let gt_end = field.iter().position(|&b| b == b':').unwrap_or(field.len());
-            let gt = &field[..gt_end];
-            if phase_checks > 0 {
-                if gt.contains(&b'/') { is_phased = false; }
-                phase_checks -= 1;
-            }
-            // Binarise to {0,1}: REF/missing → 0, ANY alt allele (1..9) → 1.
-            // Panel phasing treats the cohort as biallelic (the ALT kept is
-            // the first); collapsing higher alt indices here keeps phasing
-            // and the written output consistent (no silent ref/missing/alt
-            // mismatch downstream). Multiallelic sites are counted + warned.
-            let bin = |b: u8| -> u8 { if b.is_ascii_digit() && b != b'0' { 1 } else { 0 } };
-            let (a0, a1) = if gt.len() >= 3 {
-                (bin(gt[0]), bin(gt[2]))
-            } else { (0, 0) };
-            var_gts.push([a0, a1]);
-            field_start = if field_end < gt_region.len() { field_end + 1 } else { gt_region.len() };
-        }
-        genotypes.push(var_gts);
+        genotypes.push(parse_gt_region(f.gt_region, sample_names.len(), &mut is_phased, &mut phase_checks));
     }
 
     if sample_names.is_empty() {
@@ -256,8 +320,6 @@ fn read_target_bcf(
 pub fn read_target_vcf(
     path: &str, srp: &SrpReader,
 ) -> (Vec<String>, Vec<TargetMarker>, Vec<Vec<[u8; 2]>>, bool) {
-    use std::io::Read;
-
     let hash_alleles = !srp.ids.is_empty() && {
         let first_ref = &srp.variants[0].ref_allele;
         !srp.ids[0].contains(first_ref)
@@ -269,19 +331,7 @@ pub fn read_target_vcf(
         return read_target_bcf(path, hash_alleles, false);
     }
 
-    // Read entire decompressed VCF into memory (avoid per-line String alloc)
-    let is_gz = path.ends_with(".gz");
-    let file = std::fs::File::open(path)
-        .unwrap_or_else(|e| { selphi_error!("Cannot open {}: {}", path, e); std::process::exit(1) });
-
-    let mut raw = Vec::new();
-    if is_gz {
-        let mut bgzf = noodles_bgzf::io::Reader::new(std::io::BufReader::new(file));
-        bgzf.read_to_end(&mut raw).unwrap_or_else(|e| { selphi_error!("BGZF decompress failed for {}: {}", path, e); std::process::exit(1) });
-    } else {
-        let mut reader = std::io::BufReader::new(file);
-        reader.read_to_end(&mut raw).unwrap_or_else(|e| { selphi_error!("Failed to read VCF {}: {}", path, e); std::process::exit(1) });
-    }
+    let raw = read_vcf_raw(path);
     // Content-sniff: a BGZF-wrapped binary BCF (magic "BCF\2\2") misnamed .vcf.gz.
     if raw.starts_with(b"BCF\x02\x02") {
         return read_target_bcf(path, hash_alleles, false);
@@ -306,81 +356,18 @@ pub fn read_target_vcf(
             continue;
         }
 
-        // Fast field splitting: find first 5 tab-separated fields + genotype region
-        let mut tabs = [0usize; 9]; // positions of first 9 tabs
-        let mut n_tabs = 0;
-        for (i, &b) in line.iter().enumerate() {
-            if b == b'\t' {
-                if n_tabs < 9 { tabs[n_tabs] = i; }
-                n_tabs += 1;
-                if n_tabs >= 9 { break; }
-            }
-        }
-        if n_tabs < 9 { continue; }
-
-        // Parse POS (field 1: between tab[0] and tab[1])
-        let pos_bytes = &line[tabs[0]+1..tabs[1]];
-        let pos: i64 = fast_parse_i64(pos_bytes);
-        if pos < 1 { continue; } // skip malformed VCF POS (sentinel)
-
-        // REF (field 3: between tab[2] and tab[3])
-        let ref_bytes = &line[tabs[2]+1..tabs[3]];
-        // ALT (field 4: between tab[3] and tab[4]), take first allele before comma
-        let alt_field = &line[tabs[3]+1..tabs[4]];
-        let alt_end = alt_field.iter().position(|&b| b == b',').unwrap_or(alt_field.len());
-        let alt_bytes = &alt_field[..alt_end];
-        if alt_bytes == b"." || alt_bytes.is_empty() { continue; }
-
-        let ref_allele = std::str::from_utf8(ref_bytes).unwrap_or("").to_string();
-        let alt_allele = std::str::from_utf8(alt_bytes).unwrap_or("").to_string();
-        let chrom = std::str::from_utf8(&line[..tabs[0]]).unwrap_or("").to_string();
-
+        let Some(f) = split_vcf_fields(line) else { continue };
         let (ref_hash, alt_hash) = if hash_alleles {
-            (crate::srp::blake2b_hex(&ref_allele), crate::srp::blake2b_hex(&alt_allele))
+            (crate::srp::blake2b_hex(f.ref_allele), crate::srp::blake2b_hex(f.alt_allele))
         } else {
-            (ref_allele.clone(), alt_allele.clone())
+            (f.ref_allele.to_string(), f.alt_allele.to_string())
         };
-
-        markers.push(TargetMarker { chrom, pos, ref_allele, alt_allele, ref_hash, alt_hash, id: String::new() });
-
-        // Parse genotypes from byte slice (fields 9+)
-        let n_samples = sample_names.len();
-        let mut var_gts = Vec::with_capacity(n_samples);
-        let gt_region = &line[tabs[8]+1..];
-        let mut field_start = 0;
-        for _s in 0..n_samples {
-            // Find end of this sample's field (next tab or end of line)
-            let field_end = gt_region[field_start..].iter()
-                .position(|&b| b == b'\t')
-                .map(|p| field_start + p)
-                .unwrap_or(gt_region.len());
-            let field = &gt_region[field_start..field_end];
-
-            // GT is before first ':'
-            let gt_end = field.iter().position(|&b| b == b':').unwrap_or(field.len());
-            let gt = &field[..gt_end];
-
-            if phase_checks > 0 {
-                if gt.contains(&b'/') { is_phased = false; }
-                phase_checks -= 1;
-            }
-
-            // Fast GT parsing: "0|1" or "0/1" — allele is single digit at positions 0 and 2
-            let (a0, a1) = if gt.len() >= 3 {
-                let b0 = gt[0]; let b1 = gt[2];
-                // Biallelic projection (.min(1)): multiallelic allele index 2+ folds
-                // to 1 so chip passthrough never emits a GT beyond the single ALT.
-                // No-op on biallelic input. Matches the BCF reader + write_panel_vcf.
-                (if b0.is_ascii_digit() { (b0 - b'0').min(1) } else { 0 },
-                 if b1.is_ascii_digit() { (b1 - b'0').min(1) } else { 0 })
-            } else {
-                (0, 0)
-            };
-            var_gts.push([a0, a1]);
-
-            field_start = if field_end < gt_region.len() { field_end + 1 } else { gt_region.len() };
-        }
-        genotypes.push(var_gts);
+        markers.push(TargetMarker {
+            chrom: f.chrom.to_string(), pos: f.pos,
+            ref_allele: f.ref_allele.to_string(), alt_allele: f.alt_allele.to_string(),
+            ref_hash, alt_hash, id: String::new(),
+        });
+        genotypes.push(parse_gt_region(f.gt_region, sample_names.len(), &mut is_phased, &mut phase_checks));
     }
 
     if sample_names.is_empty() {
@@ -614,7 +601,6 @@ pub fn intersect_variants(srp: &SrpReader, targets: &[TargetMarker]) -> (Vec<usi
 pub fn read_target_vcf_multi_chr(
     path: &str,
 ) -> (Vec<String>, std::collections::BTreeMap<String, (Vec<TargetMarker>, Vec<Vec<[u8; 2]>>)>, bool) {
-    use std::io::Read;
     type ByChr = std::collections::BTreeMap<String, (Vec<TargetMarker>, Vec<Vec<[u8; 2]>>)>;
     // Real binary BCF → noodles decoder, then partition by chromosome.
     let partition = |samples: Vec<String>, markers: Vec<TargetMarker>, gts: Vec<Vec<[u8; 2]>>, phased: bool| {
@@ -630,18 +616,7 @@ pub fn read_target_vcf_multi_chr(
         let (s, m, g, p) = read_target_bcf(path, false, false);
         return partition(s, m, g, p);
     }
-    let is_gz = path.ends_with(".gz");
-    let file = std::fs::File::open(path)
-        .unwrap_or_else(|e| { selphi_error!("Cannot open {}: {}", path, e); std::process::exit(1) });
-
-    let mut raw = Vec::new();
-    if is_gz {
-        let mut bgzf = noodles_bgzf::io::Reader::new(std::io::BufReader::new(file));
-        bgzf.read_to_end(&mut raw).unwrap_or_else(|e| { selphi_error!("BGZF decompress failed for {}: {}", path, e); std::process::exit(1) });
-    } else {
-        let mut reader = std::io::BufReader::new(file);
-        reader.read_to_end(&mut raw).unwrap_or_else(|e| { selphi_error!("Failed to read VCF {}: {}", path, e); std::process::exit(1) });
-    }
+    let raw = read_vcf_raw(path);
     if raw.starts_with(b"BCF\x02\x02") {
         let (s, m, g, p) = read_target_bcf(path, false, false);
         return partition(s, m, g, p);
@@ -665,67 +640,14 @@ pub fn read_target_vcf_multi_chr(
             continue;
         }
 
-        let mut tabs = [0usize; 9];
-        let mut n_tabs = 0;
-        for (i, &b) in line.iter().enumerate() {
-            if b == b'\t' {
-                if n_tabs < 9 { tabs[n_tabs] = i; }
-                n_tabs += 1;
-                if n_tabs >= 9 { break; }
-            }
-        }
-        if n_tabs < 9 { continue; }
-
-        let pos: i64 = fast_parse_i64(&line[tabs[0]+1..tabs[1]]);
-        if pos < 1 { continue; } // skip malformed VCF POS (sentinel)
-        let ref_bytes = &line[tabs[2]+1..tabs[3]];
-        let alt_field = &line[tabs[3]+1..tabs[4]];
-        let alt_end = alt_field.iter().position(|&b| b == b',').unwrap_or(alt_field.len());
-        let alt_bytes = &alt_field[..alt_end];
-        if alt_bytes == b"." || alt_bytes.is_empty() { continue; }
-
-        let ref_allele = std::str::from_utf8(ref_bytes).unwrap_or("").to_string();
-        let alt_allele = std::str::from_utf8(alt_bytes).unwrap_or("").to_string();
-        let chrom = std::str::from_utf8(&line[..tabs[0]]).unwrap_or("").to_string();
-
+        let Some(f) = split_vcf_fields(line) else { continue };
         all_markers.push(TargetMarker {
-            chrom, pos,
-            ref_allele: ref_allele.clone(), alt_allele: alt_allele.clone(),
-            ref_hash: ref_allele, alt_hash: alt_allele, id: String::new(),
+            chrom: f.chrom.to_string(), pos: f.pos,
+            ref_allele: f.ref_allele.to_string(), alt_allele: f.alt_allele.to_string(),
+            ref_hash: f.ref_allele.to_string(), alt_hash: f.alt_allele.to_string(),
+            id: String::new(),
         });
-
-        let n_samples = sample_names.len();
-        let mut var_gts = Vec::with_capacity(n_samples);
-        let gt_region = &line[tabs[8]+1..];
-        let mut field_start = 0;
-        for _s in 0..n_samples {
-            let field_end = gt_region[field_start..].iter()
-                .position(|&b| b == b'\t')
-                .map(|p| field_start + p)
-                .unwrap_or(gt_region.len());
-            let field = &gt_region[field_start..field_end];
-            let gt_end = field.iter().position(|&b| b == b':').unwrap_or(field.len());
-            let gt = &field[..gt_end];
-
-            if phase_checks > 0 {
-                if gt.contains(&b'/') { is_phased = false; }
-                phase_checks -= 1;
-            }
-
-            let (a0, a1) = if gt.len() >= 3 {
-                let b0 = gt[0]; let b1 = gt[2];
-                // Biallelic projection (.min(1)): multiallelic allele index 2+ folds
-                // to 1 so chip passthrough never emits a GT beyond the single ALT.
-                // No-op on biallelic input. Matches the BCF reader + write_panel_vcf.
-                (if b0.is_ascii_digit() { (b0 - b'0').min(1) } else { 0 },
-                 if b1.is_ascii_digit() { (b1 - b'0').min(1) } else { 0 })
-            } else {
-                (0, 0)
-            };
-            var_gts.push([a0, a1]);
-            field_start = if field_end < gt_region.len() { field_end + 1 } else { gt_region.len() };
-        }
-        all_genotypes.push(var_gts);
+        all_genotypes.push(parse_gt_region(f.gt_region, sample_names.len(), &mut is_phased, &mut phase_checks));
     }
 
     // Partition by chromosome
