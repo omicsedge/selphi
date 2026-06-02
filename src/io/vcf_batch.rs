@@ -52,22 +52,15 @@ pub fn setup_vcf_batch_writers(
     let bgzip_per_batch = (32 / n_batches.max(1)).clamp(1, 4);
 
     let mut writers = Vec::new();
-    let mut sample_start = 0usize;
-    let mut batch_idx = 0usize;
-
-    while sample_start < n_samples {
-        let sample_end = (sample_start + samples_per_batch).min(n_samples);
-        let hap_start = sample_start * 2;
-        let hap_end = sample_end * 2;
-        let path = tmp_dir.join(format!("selphi_batch_{:04}.vcf.gz", batch_idx));
-        let samples_slice = &all_sample_names[sample_start..sample_end];
+    crate::io::batch_driver::for_each_batch(n_haps, batch_size, |r| {
+        let path = tmp_dir.join(format!("selphi_batch_{:04}.vcf.gz", r.batch_idx));
+        let samples_slice = &all_sample_names[r.sample_start..r.sample_end];
         let (tx, handle) = setup_one_vcf_writer(
             &path, samples_slice, contig_field, version, no_ap, bgzip_per_batch,
         )?;
-        writers.push(VcfBatchWriter { tx, handle, path, hap_start, hap_end });
-        sample_start = sample_end;
-        batch_idx += 1;
-    }
+        writers.push(VcfBatchWriter { tx, handle, path, hap_start: r.hap_start, hap_end: r.hap_end });
+        Ok::<(), std::io::Error>(())
+    })?;
     Ok(writers)
 }
 

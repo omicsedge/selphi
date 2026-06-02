@@ -30,27 +30,18 @@ pub fn setup_sd_batch_writers(
     }
     std::fs::create_dir_all(tmp_dir)?;
 
-    let n_samples = n_haps / 2;
-    let samples_per_batch = batch_size.div_ceil(2).max(1);
     let mut writers = Vec::new();
-    let mut sample_start = 0usize;
-    let mut batch_idx = 0usize;
-
-    while sample_start < n_samples {
-        let sample_end = (sample_start + samples_per_batch).min(n_samples);
-        let hap_start = sample_start * 2;
-        let hap_end = sample_end * 2;
-        let path = tmp_dir.join(format!("selphi_batch_{:04}", batch_idx));
-        let batch_names = &all_sample_names[sample_start..sample_end];
+    crate::io::batch_driver::for_each_batch(n_haps, batch_size, |r| {
+        let path = tmp_dir.join(format!("selphi_batch_{:04}", r.batch_idx));
+        let batch_names = &all_sample_names[r.sample_start..r.sample_end];
         let writer = SelfdecodeWriter::new_batched(&path, batch_names, filter_hom_ref)?;
         writers.push(SdBatchWriter {
             writer,
             path: path.with_extension("selfdecode.zip"),
-            hap_start, hap_end,
+            hap_start: r.hap_start, hap_end: r.hap_end,
         });
-        sample_start = sample_end;
-        batch_idx += 1;
-    }
+        Ok::<(), std::io::Error>(())
+    })?;
     Ok(writers)
 }
 
