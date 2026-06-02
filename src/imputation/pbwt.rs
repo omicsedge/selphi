@@ -264,95 +264,15 @@ pub fn pbwt_forward_single(
     fl_fwd: usize,
     target_abs: i32,
 ) -> FwdResult {
-    let mut a: Vec<i32> = (0..m as i32).collect();
-    let mut a_inv: Vec<i32> = (0..m as i32).collect();
-    let mut d = vec![0i32; m + 1];
-    d[0] = 1;
-    d[m] = 1;
-    let mut y = vec![0u8; m];
-    let mut b_arr = vec![0i32; m];
-    let mut e_arr = vec![0i32; m];
-    let mut ht = vec![0i64; n_ref]; // haplotype totals
-
-    let mut haps = vec![0i32; n_var * fl_fwd];
-    let mut lens = vec![0i32; n_var * fl_fwd];
-    let mut counts = vec![0i32; n_var];
-
-    // Initial y from first variant
-    y[..m].copy_from_slice(&alleles[..m]);
-
-    for var in 0..n_var {
-        let is_last = var >= n_var - 1;
-
-        if var >= min_l {
-            let threshold = (var - min_l) as i32;
-            let ib = a_inv[target_abs as usize] as usize;
-
-            // LEFT SCAN: scan positions below target
-            {
-                let mut dmin: i32 = 0;
-                let mut pos = ib as isize - 1;
-                while pos >= 0 {
-                    let dv = d[pos as usize + 1];
-                    if dv > dmin { dmin = dv; }
-                    if dmin > threshold { break; }
-                    let hap_at_pos = a[pos as usize];
-                    if hap_at_pos < n_ref as i32 && (y[ib] != y[pos as usize] || is_last) {
-                        let mut length = var as i32 - dmin;
-                        if is_last && y[ib] == y[pos as usize] {
-                            length += 1;
-                        }
-                        let ref_hap = hap_at_pos;
-                        let dmin_idx = dmin as usize;
-                        insert_match(
-                            &mut haps, &mut lens, &mut counts,
-                            &mut ht, n_var, fl_fwd,
-                            dmin_idx, ref_hap, length,
-                        );
-                    }
-                    pos -= 1;
-                }
-            }
-
-            // RIGHT SCAN: scan positions above target
-            {
-                let mut dmin: i32 = 0;
-                for pos in (ib + 1)..m {
-                    let dv = d[pos];
-                    if dv > dmin { dmin = dv; }
-                    if dmin > threshold { break; }
-                    let hap_at_pos = a[pos];
-                    if hap_at_pos < n_ref as i32 && (y[pos] != y[ib] || is_last) {
-                        let mut length = var as i32 - dmin;
-                        if is_last && y[ib] == y[pos] {
-                            length += 1;
-                        }
-                        let ref_hap = hap_at_pos;
-                        let dmin_idx = dmin as usize;
-                        insert_match(
-                            &mut haps, &mut lens, &mut counts,
-                            &mut ht, n_var, fl_fwd,
-                            dmin_idx, ref_hap, length,
-                        );
-                    }
-                }
-            }
-        }
-
-        // Sort update AFTER match finding
-        pbwt_forwards_ad(&mut a, &mut a_inv, &mut d, &y, &mut b_arr, &mut e_arr, m, var);
-
-        // Read next variant's alleles in new sort order (gather with prefetch)
-        if var < n_var - 1 {
-            let row_base = (var + 1) * m;
-            let row = &alleles[row_base..row_base + m];
-            for i in 0..m {
-                y[i] = row[a[i] as usize];
-            }
-        }
-    }
-
-    FwdResult { haps, lens, counts }
+    // Identical algorithm to `pbwt_forward_with_workspace`; this entry point
+    // just allocates a fresh workspace instead of reusing a thread-local one.
+    // `pbwt_forward_with_workspace` calls `ws.reset(m)` first, which initializes
+    // a/a_inv/d/ht exactly as the former standalone body did, and overwrites `y`
+    // from `alleles` before use — so the delegated result is identical (verified
+    // by `pbwt_forward_single_matches_workspace`). Used by the rare full-panel
+    // fallback in window_process, which has no per-thread workspace to reuse.
+    let mut ws = PbwtWorkspace::new(m, n_ref);
+    pbwt_forward_with_workspace(&mut ws, alleles, n_var, m, n_ref, min_l, fl_fwd, target_abs)
 }
 
 /// Insert a match into the sorted buffer at a specific variant position.
@@ -542,6 +462,44 @@ mod tests {
         assert_eq!(haps[0], 3);
         assert_eq!(haps[1], 1);
         assert_eq!(haps[2], 5);
+    }
+
+    /// The workspace-reusing forward pass and the single-shot forward pass must
+    /// produce identical match results for the same input. (Before the dedup
+    /// this guarded that the two hand-written copies agreed; after the dedup
+    /// `pbwt_forward_single` delegates to `pbwt_forward_with_workspace`, so it
+    /// also guards that a fresh workspace reproduces the standalone behavior.)
+    #[test]
+    fn pbwt_forward_single_matches_workspace() {
+        let n_var = 12usize;
+        let n_ref = 8usize;
+        let m = n_ref + 1; // 8 reference haplotypes + 1 target at index n_ref
+        let target_abs = n_ref as i32;
+        let min_l = 2usize;
+        let fl_fwd = 4usize;
+
+        // Deterministic synthetic panel with enough structure to form matches
+        // (some reference haps share runs with the target around it).
+        let mut alleles = vec![0u8; n_var * m];
+        for var in 0..n_var {
+            for h in 0..m {
+                alleles[var * m + h] = (((h * 7 + var * 3 + (h % 2) * var) % 5) < 2) as u8;
+            }
+        }
+
+        let mut ws = PbwtWorkspace::new(m, n_ref);
+        let r_ws = pbwt_forward_with_workspace(
+            &mut ws, &alleles, n_var, m, n_ref, min_l, fl_fwd, target_abs,
+        );
+        let r_single = pbwt_forward_single(
+            &alleles, n_var, m, n_ref, min_l, fl_fwd, target_abs,
+        );
+
+        // Non-vacuous: the synthetic panel actually produces matches.
+        assert!(r_single.counts.iter().sum::<i32>() > 0, "test input produced no matches");
+        assert_eq!(r_single.counts, r_ws.counts);
+        assert_eq!(r_single.haps, r_ws.haps);
+        assert_eq!(r_single.lens, r_ws.lens);
     }
 
 }
