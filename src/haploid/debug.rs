@@ -142,22 +142,6 @@ pub fn dump_recomb(it: usize, wi: usize, si: usize,
     }
 }
 
-/// Dump per-iteration phased haplotypes for one sample (global phased array).
-pub fn dump_iter_phase(it: usize, wi: usize, si: usize,
-                       phased: &[u8], nth: usize, ws: usize, wsz: usize) {
-    let dd = debug_dir();
-    let path = format!("{}/iter{}_phase_w{}_s{}.txt", dd.display(), it, wi, si);
-    let Ok(mut f) = fs::File::create(&path) else { return };
-    let (h0, h1) = (si * 2, si * 2 + 1);
-    let _ = writeln!(f, "# iter={} window={} sample={} nMarkers={}", it, wi, si, wsz);
-    let _ = writeln!(f, "# m\th0\th1");
-    for m in 0..wsz {
-        let a0 = phased[(ws + m) * nth + h0];
-        let a1 = phased[(ws + m) * nth + h1];
-        let _ = writeln!(f, "{}\t{}\t{}", m, a0, a1);
-    }
-}
-
 /// Dump per-iteration phased haplotypes from window-local phased array.
 pub fn dump_iter_phase_local(it: usize, wi: usize, si: usize,
                              hap_bits: &[u8], hbs: usize, wsz: usize) {

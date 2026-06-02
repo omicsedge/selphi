@@ -724,17 +724,6 @@ fn set_inv(prefix: &[i32], inv_a: &mut [i32]) {
     }
 }
 
-#[inline]
-fn encode_step_alleles(input: &Stage2Input, marker: usize, out: &mut [i32]) {
-    use super::baum::allele;
-    let packed = input.all_haps_packed;
-    let n_haps = input.n_haps;
-    let n_markers = input.n_markers;
-    for h in 0..n_haps {
-        out[h] = allele(packed, n_haps, n_markers, marker, h) as i32;
-    }
-}
-
 /// Collect the rare-allele carrier groups for the global markers spanned by
 /// stage-1 step `[stage1_start, stage1_end_excl)`.
 ///

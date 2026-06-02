@@ -61,9 +61,6 @@ pub struct Stage2Input<'a> {
     /// Stage-1 step boundaries in stage-1-marker coords: `(start, end_excl)`.
     pub stage1_steps: &'a [(usize, usize)],
 
-    /// Genetic position per stage-1 marker (cM).
-    pub stage1_cm: &'a [f64],
-
     /// Per-marker recombination probability for the Li-Stephens HMM.
     pub p_recomb_per_marker: &'a [f32],
 
@@ -111,14 +108,6 @@ pub struct Stage2Input<'a> {
 
     /// RNG seed for deterministic tie-breaking.
     pub seed: u64,
-}
-
-/// Outputs: phased rare markers, one bit per (target_hap × rare_marker).
-pub struct Stage2Output {
-    /// Flat n_target_haps × n_rare_markers bit-packed array.
-    pub rare_phased: Vec<u8>,
-    /// Number of rare markers (columns in `rare_phased`).
-    pub n_rare_markers: usize,
 }
 
 /// Entry point: run Beagle-equivalent stage-2 rare-variant phasing.

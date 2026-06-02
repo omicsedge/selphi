@@ -130,7 +130,6 @@ pub fn run_stage2_after_stage1(
         prev_stage1_marker: &prev_stage1_marker,
         prev_stage1_wt: &prev_stage1_wt,
         stage1_steps: &stage1_steps,
-        stage1_cm: &stage1_cm,
         p_recomb_per_marker: &p_recomb_per_stage1,
         p_mismatch,
         max_states,
