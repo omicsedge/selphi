@@ -342,6 +342,14 @@ pub fn parse_vcf_line(line: &[u8], n_samples: usize, ds_buf: &mut Vec<f32>) -> O
                     let a0 = if gt[0] == b'.' { 0i32 } else { (gt[0] - b'0') as i32 };
                     let a1 = if gt[2] == b'.' { 0i32 } else { (gt[2] - b'0') as i32 };
                     ds_buf.push((a0 + a1) as f32);
+                } else if gt.len() == 1 {
+                    // Haploid GT (e.g. chrX males): one allele → its biallelic ALT
+                    // count (0/1). Matches the BCF reader's vector_end handling
+                    // (gt_allele_to_dose), so VCF-truth vs BCF-imputed agree on
+                    // haploid sites. Missing "." → 0. No-op on autosomal diploid
+                    // (always len>=3).
+                    let a = if gt[0] == b'.' { 0i32 } else { (gt[0] - b'0') as i32 };
+                    ds_buf.push(a.min(1) as f32);
                 } else {
                     ds_buf.push(0.0);
                 }
@@ -705,10 +713,8 @@ impl VariantReader {
                                 for &si in indices {
                                     let b = io2 + si * vl * es;
                                     if b + 1 < ge {
-                                        let a0 = (ib[b] >> 1).wrapping_sub(1);
-                                        let a1 = (ib[b+1] >> 1).wrapping_sub(1);
-                                        let a0c = if a0 > 127 { 0 } else { a0.min(1) };
-                                        let a1c = if a1 > 127 { 0 } else { a1.min(1) };
+                                        let a0c = gt_allele_to_dose(ib[b]);
+                                        let a1c = gt_allele_to_dose(ib[b+1]);
                                         ds_buf.push(a0c as f32 + a1c as f32);
                                     } else { ds_buf.push(0.0); }
                                 }
@@ -716,10 +722,8 @@ impl VariantReader {
                                 for si in 0..ns {
                                     let b = io2 + si * vl * es;
                                     if b + 1 < ge {
-                                        let a0 = (ib[b] >> 1).wrapping_sub(1);
-                                        let a1 = (ib[b+1] >> 1).wrapping_sub(1);
-                                        let a0c = if a0 > 127 { 0 } else { a0.min(1) };
-                                        let a1c = if a1 > 127 { 0 } else { a1.min(1) };
+                                        let a0c = gt_allele_to_dose(ib[b]);
+                                        let a1c = gt_allele_to_dose(ib[b+1]);
                                         ds_buf.push(a0c as f32 + a1c as f32);
                                     } else { ds_buf.push(0.0); }
                                 }
@@ -743,6 +747,23 @@ impl VariantReader {
             }
         }
     }
+}
+
+/// Decode one BCF int8 GT allele byte into a biallelic ALT indicator (0 or 1).
+///
+/// BCF GT encoding (int8): each allele byte = `(allele + 1) << 1 | phased`, so
+/// `allele = (raw >> 1) - 1` and the low bit is the phase. A missing allele
+/// (`allele = -1`) is byte `0x00`/`0x01` → `(raw>>1)-1` wraps to 255.
+/// The int8 **missing value** `0x80` (-128) and **end-of-vector** pad `0x81`
+/// (-127, used to pad haploid samples in a diploid-ploidy record, e.g. chrX)
+/// are SENTINELS, not alleles: `(0x80>>1)-1 = 63` would otherwise mis-decode to
+/// ALT. All of {missing allele, 0x80, 0x81} fold to 0 (no ALT contribution);
+/// any present ALT (`allele >= 1`, incl. multiallelic) folds to 1.
+#[inline]
+fn gt_allele_to_dose(raw: u8) -> u8 {
+    if raw == 0x80 || raw == 0x81 { return 0; }
+    let a = (raw >> 1).wrapping_sub(1);
+    if a > 127 { 0 } else { a.min(1) }
 }
 
 /// Parse BCF typed string into bytes.
@@ -1195,4 +1216,29 @@ pub fn write_json_summary(
     let mut f = std::fs::File::create(path)?;
     f.write_all(serde_json::to_string_pretty(&json)?.as_bytes())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gt_allele_to_dose;
+
+    #[test]
+    fn bcf_gt_allele_decode_covers_sentinels() {
+        // Encoding: allele byte = (allele+1)<<1 | phased. Low bit = phase.
+        // REF (allele 0): 0x02 unphased, 0x03 phased -> dose 0.
+        assert_eq!(gt_allele_to_dose(0x02), 0);
+        assert_eq!(gt_allele_to_dose(0x03), 0);
+        // ALT (allele 1): 0x04 unphased, 0x05 phased -> dose 1.
+        assert_eq!(gt_allele_to_dose(0x04), 1);
+        assert_eq!(gt_allele_to_dose(0x05), 1);
+        // Multiallelic ALT (allele 2): 0x06 -> folds to 1 (biallelic indicator).
+        assert_eq!(gt_allele_to_dose(0x06), 1);
+        // Missing allele (allele -1): byte 0x00/0x01 -> dose 0.
+        assert_eq!(gt_allele_to_dose(0x00), 0);
+        assert_eq!(gt_allele_to_dose(0x01), 0);
+        // THE BUG: int8 missing sentinel 0x80 and end-of-vector pad 0x81 must
+        // fold to 0, NOT decode to allele (0x80>>1)-1 = 63 -> 1.
+        assert_eq!(gt_allele_to_dose(0x80), 0);
+        assert_eq!(gt_allele_to_dose(0x81), 0);
+    }
 }
