@@ -663,11 +663,10 @@ pub struct HmmResult {
     pub hap_posterior: Option<Vec<f64>>,
 }
 
-/// Source for reference alleles at chip sites during dedup.
-/// `Bitmatrix` reads bits on demand (no dense byte alloc) — preferred at
-/// biobank scale where the dense `n_chip × n_ref` buffer is hundreds of MB.
+/// Source for reference alleles at chip sites during dedup: reads bits on
+/// demand from the haplotype bitmatrix (no dense `n_chip × n_ref` byte buffer,
+/// which at biobank scale would be hundreds of MB).
 pub enum RefAlleleSource<'a> {
-    Bytes(&'a [u8]),
     Bitmatrix { bm: &'a crate::common::HaplotypeBitmatrix, chip_start: usize },
 }
 
@@ -699,11 +698,9 @@ pub fn calculate_weights(
     let _ext_total: usize = filtered.iter().map(|v| v.len()).sum();
 
     // 4. Optional deduplication
-    let dedup_result: Option<DedupResult> = ref_alleles.map(|src| match src {
-        RefAlleleSource::Bytes(ra) =>
-            hap_dedup::deduplicate_haplotypes(&filtered, ra, n_chip, n_ref_haps),
-        RefAlleleSource::Bitmatrix { bm, chip_start } =>
-            hap_dedup::deduplicate_haplotypes_bm(&filtered, bm, chip_start, n_chip, n_ref_haps),
+    let dedup_result: Option<DedupResult> = ref_alleles.map(|src| {
+        let RefAlleleSource::Bitmatrix { bm, chip_start } = src;
+        hap_dedup::deduplicate_haplotypes_bm(&filtered, bm, chip_start, n_chip, n_ref_haps)
     });
 
     let matches_for_hmm: &[Vec<i64>] = if let Some(ref dr) = dedup_result {
