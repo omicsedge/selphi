@@ -238,7 +238,7 @@ fn _diploid_run(
     common_indices: &[usize],
     full_chip_ref_bm: Option<&pbwt_neighbor::HaplotypeBitmatrix>,
     prep: CommonPrep,
-    _chip_bp: &[i64],
+    chip_bp: &[i64],
     n_var: usize, n_samples: usize, n_ref: usize, seed: i64, n_threads: usize,
     max_cond_haps: usize,
 ) -> (Vec<u8>, Vec<f32>, Vec<(f32, usize, usize)>) {
@@ -322,7 +322,7 @@ fn _diploid_run(
     // context so rare-variant phasing benefits from biobank-scale ref
     // matches instead of running target-only.
     phase_rare::run_phase_rare(
-        &mut phased, full_chip_ref_bm, target_geno, &cm_full,
+        &mut phased, full_chip_ref_bm, target_geno, &cm_full, chip_bp,
         n_var, n_samples, n_ref, 1, 15000.0, common_indices,
     );
 

@@ -78,6 +78,7 @@ pub fn run_phase_rare(
     full_chip_ref_bm: Option<&super::pbwt_neighbor::HaplotypeBitmatrix>, // (n_var × n_ref) or None
     target_geno: &[u8],       // (n_var × n_samples × 2) original genotypes
     cm: &[f64],
+    bp: &[i64],               // (n_var) physical positions — for the IBD2 segment bp gate
     n_var: usize,
     n_samples: usize,
     n_ref: usize,
@@ -197,7 +198,10 @@ pub fn run_phase_rare(
                     if g_arr[ip] != g_arr[i] { break; }
                     div = div.max(d_scan[0][ip + 1] as i64);
                     let length_cm = scaffold_cm[l] - scaffold_cm[div as usize];
-                    let length_bp = (scaffold_sites[l] as i64 - scaffold_sites[div as usize] as i64) as f64;
+                    // scaffold_sites holds VARIANT INDICES, so index bp[] to get the
+                    // physical span in base pairs (was comparing index deltas to 1e6 bp,
+                    // which never fired → the >=1e6 gate was dead).
+                    let length_bp = (bp[scaffold_sites[l]] - bp[scaffold_sites[div as usize]]) as f64;
                     let length_ct = l as i64 - div + 1;
                     if (length_ct == n_scaffold as i64) ||
                        (length_cm >= 2.5 && length_bp >= 1e6 && length_ct >= 100) {
