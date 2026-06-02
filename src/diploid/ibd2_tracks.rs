@@ -37,11 +37,6 @@ impl Ibd2Tracks {
         }
     }
 
-    /// Set cM positions for ±4cM expansion in add_track.
-    pub fn set_cm(&mut self, cm: &[f64]) {
-        self.cm = cm.to_vec();
-    }
-
     /// Check if two haplotypes can be used as conditioning pair at given locus.
     /// Returns true if they are NOT in IBD2 (i.e., allowed).
     #[inline]

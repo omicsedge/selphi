@@ -387,36 +387,6 @@ pub fn run_phase_common_bm(
     crate::selphi_debug!("  [diploid] phase_common complete");
 }
 
-/// Legacy entry: converts byte-per-allele haplotypes to bitmatrix, then delegates
-/// to `run_phase_common_bm`. The byte array is freed immediately after conversion.
-pub fn run_phase_common(
-    graphs: &mut [GenotypeGraph],
-    haplotypes: &mut Vec<u8>,
-    cm: &[f64],
-    n_var: usize,
-    n_samples: usize,
-    n_ref: usize,
-    seed: i64,
-    n_threads: usize,
-    scheme: &str,
-    chip_bp: Option<&[i64]>,
-    target_geno: &[u8],
-) {
-    let n_haps_total = n_ref + n_samples * 2;
-
-    // Convert byte array to bitmatrix and free the large array immediately
-    let hap_bm = HaplotypeBitmatrix::from_byte_slice_all(
-        n_var, n_haps_total, haplotypes, n_haps_total);
-    haplotypes.clear();
-    haplotypes.shrink_to_fit();
-
-    run_phase_common_bm(
-        graphs, hap_bm, cm,
-        n_var, n_samples, n_ref, seed, n_threads,
-        scheme, chip_bp, target_geno, 0,
-    );
-}
-
 fn _run_iterations(
     graphs: &mut [GenotypeGraph],
     hap_bm: &mut HaplotypeBitmatrix,     // unified: used for both PBWT and HMM

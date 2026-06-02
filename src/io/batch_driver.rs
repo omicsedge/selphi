@@ -114,7 +114,6 @@ pub struct WindowCtx<'a> {
     pub own_wgs_start: usize,
     pub own_wgs_end: usize,
     /// Window-local flags/indices, length `own_wgs_end - own_wgs_start`.
-    pub is_chip: &'a [bool],
     pub chip_local_idx: &'a [usize],
     pub chip_genotypes: &'a [u8],
 }
@@ -206,7 +205,6 @@ pub fn run_window<S: BatchSink>(
         n_haps_total,
         own_wgs_start,
         own_wgs_end,
-        is_chip: &is_chip,
         chip_local_idx: &chip_local_idx,
         chip_genotypes,
     };
