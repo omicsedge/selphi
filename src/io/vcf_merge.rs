@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use noodles_bgzf::io::{Reader as BgzfReader, multithreaded_writer};
+use crate::io::vcf_fmt::{write_f4, write_u32};
 
 /// Merge N per-batch VCF.gz files into a single merged VCF.gz at `output_path`.
 /// Also builds the .tbi index alongside.
@@ -57,8 +58,9 @@ pub fn merge_batch_vcfs(
         )));
     }
 
-    // Write the merged VCF header (mirrors `setup_vcf_writer` exactly).
-    write_merged_header(&mut writer, all_sample_names, contig_field, version, no_ap)?;
+    // Write the merged VCF header (shared with the non-batched + per-batch writers).
+    crate::io::vcf_fmt::write_imputation_vcf_header(
+        &mut writer, all_sample_names, contig_field, version, no_ap, "")?;
 
     // Index metadata accumulated during merge for TBI building.
     let mut record_meta: Vec<(String, i64, i64)> = Vec::new();
@@ -162,35 +164,6 @@ fn parse_contig_id(contig_field: &str) -> Option<String> {
     let rest = &contig_field[s..];
     let e = rest.find(|c: char| c == ',' || c == '>').unwrap_or(rest.len());
     Some(rest[..e].to_string())
-}
-
-/// Write the merged VCF header — exactly matches `setup_vcf_writer`.
-fn write_merged_header(
-    w: &mut BufWriter<noodles_bgzf::io::MultithreadedWriter<std::fs::File>>,
-    sample_names: &[String],
-    contig_field: &str,
-    version: &str,
-    no_ap: bool,
-) -> std::io::Result<()> {
-    writeln!(w, "##fileformat=VCFv4.2")?;
-    writeln!(w, "##source=Selphi_v{version} SelfDecode™")?;
-    writeln!(w, "##FILTER=<ID=PASS,Description=\"All filters passed\">")?;
-    writeln!(w, "##INFO=<ID=IMP,Number=0,Type=Flag,Description=\"Imputed marker\">")?;
-    writeln!(w, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">")?;
-    writeln!(w, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele Number\">")?;
-    writeln!(w, "##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Estimated Allele Count\">")?;
-    writeln!(w, "##INFO=<ID=DR2,Number=1,Type=Float,Description=\"Dosage R-squared: estimated imputation accuracy\">")?;
-    writeln!(w, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">")?;
-    writeln!(w, "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"estimated ALT dose\">")?;
-    if !no_ap {
-        writeln!(w, "##FORMAT=<ID=AP1,Number=A,Type=Float,Description=\"estimated ALT dose on first haplotype\">")?;
-        writeln!(w, "##FORMAT=<ID=AP2,Number=A,Type=Float,Description=\"estimated ALT dose on second haplotype\">")?;
-    }
-    writeln!(w, "{}", contig_field)?;
-    write!(w, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
-    for name in sample_names { write!(w, "\t{}", name)?; }
-    writeln!(w)?;
-    Ok(())
 }
 
 /// Merge N batch records (one variant) into a single merged VCF line.
@@ -496,24 +469,6 @@ fn write_ap_2dec(buf: &mut Vec<u8>, v: f32) {
         if s.ends_with('.') { s.pop(); }
         buf.extend_from_slice(s.as_bytes());
     }
-}
-
-fn write_f4(buf: &mut Vec<u8>, v: f64) {
-    use std::io::Write;
-    write!(buf, "{:.4}", v).unwrap();
-}
-
-fn write_u32(buf: &mut Vec<u8>, v: u32) {
-    let mut tmp = [0u8; 10];
-    let mut n = v;
-    let mut i = tmp.len();
-    if n == 0 { buf.push(b'0'); return; }
-    while n > 0 {
-        i -= 1;
-        tmp[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
-    buf.extend_from_slice(&tmp[i..]);
 }
 
 #[cfg(test)]

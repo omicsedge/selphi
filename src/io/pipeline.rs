@@ -311,24 +311,8 @@ pub fn setup_vcf_writer(
 
     // Write VCF header
     let mut header = Vec::with_capacity(4096);
-    writeln!(header, "##fileformat=VCFv4.2")?;
-    writeln!(header, "##source=Selphi_v{version} SelfDecode™")?;
-    writeln!(header, "##FILTER=<ID=PASS,Description=\"All filters passed\">")?;
-    writeln!(header, "##INFO=<ID=IMP,Number=0,Type=Flag,Description=\"Imputed marker\">")?;
-    writeln!(header, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">")?;
-    writeln!(header, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele Number\">")?;
-    writeln!(header, "##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Estimated Allele Count\">")?;
-    writeln!(header, "##INFO=<ID=DR2,Number=1,Type=Float,Description=\"Dosage R-squared: estimated imputation accuracy\">")?;
-    writeln!(header, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">")?;
-    writeln!(header, "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"estimated ALT dose\">")?;
-    if !no_ap {
-        writeln!(header, "##FORMAT=<ID=AP1,Number=A,Type=Float,Description=\"estimated ALT dose on first haplotype\">")?;
-        writeln!(header, "##FORMAT=<ID=AP2,Number=A,Type=Float,Description=\"estimated ALT dose on second haplotype\">")?;
-    }
-    writeln!(header, "{}", contig_field)?;
-    write!(header, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
-    for name in sample_names { write!(header, "\t{}", name)?; }
-    writeln!(header)?;
+    crate::io::vcf_fmt::write_imputation_vcf_header(
+        &mut header, sample_names, contig_field, version, no_ap, "")?;
     tx.send(header).map_err(|e| std::io::Error::other(e.to_string()))?;
 
     Ok((tx, writer_handle, ()))
@@ -526,27 +510,7 @@ fn format_tile_batch(
     buf
 }
 
-/// Write f64 as "%.4f" into a byte buffer (no allocation).
-#[inline]
-fn write_f4(buf: &mut Vec<u8>, v: f64) {
-    use std::io::Write;
-    write!(buf, "{:.4}", v).unwrap();
-}
-
-/// Write u32 as decimal into a byte buffer (no allocation).
-#[inline]
-fn write_u32(buf: &mut Vec<u8>, v: u32) {
-    let mut tmp = [0u8; 10];
-    let mut n = v;
-    let mut i = tmp.len();
-    if n == 0 { buf.push(b'0'); return; }
-    while n > 0 {
-        i -= 1;
-        tmp[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
-    buf.extend_from_slice(&tmp[i..]);
-}
+use crate::io::vcf_fmt::{write_f4, write_u32};
 
 /// Format a chip line into a reusable byte buffer.
 fn format_chip_line_bytes(

@@ -2,6 +2,7 @@
 
 pub mod batch_driver;
 pub mod dosage_stats;
+pub mod vcf_fmt;
 pub mod pipeline;
 pub mod bcf_encode;
 pub mod bcf_batch;
