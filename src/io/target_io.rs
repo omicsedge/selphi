@@ -229,8 +229,12 @@ fn read_target_bcf(
             let (a0, a1, phased) = match sample.get("GT").flatten() {
                 Some(Value::Genotype(gt)) => {
                     let al = gt.as_ref();
-                    let a0 = al.first().and_then(|a| a.position()).unwrap_or(0).min(255) as u8;
-                    let a1 = al.get(1).and_then(|a| a.position()).unwrap_or(0).min(255) as u8;
+                    // Biallelic projection: any ALT allele index (>=1, incl. multiallelic
+                    // 2+) folds to 1; missing/REF -> 0. Keeps the whole pipeline on the
+                    // 0/1 bitmatrix domain so chip passthrough never emits a GT allele
+                    // index beyond the single output ALT. No-op on biallelic input.
+                    let a0 = al.first().and_then(|a| a.position()).unwrap_or(0).min(1) as u8;
+                    let a1 = al.get(1).and_then(|a| a.position()).unwrap_or(0).min(1) as u8;
                     // VCF phasing is carried on the allele separators after the
                     // first; a diploid is phased iff its 2nd allele is Phased.
                     let phased = al.get(1).map(|a| a.phasing() == Phasing::Phased).unwrap_or(true);
@@ -364,8 +368,11 @@ pub fn read_target_vcf(
             // Fast GT parsing: "0|1" or "0/1" — allele is single digit at positions 0 and 2
             let (a0, a1) = if gt.len() >= 3 {
                 let b0 = gt[0]; let b1 = gt[2];
-                (if b0.is_ascii_digit() { b0 - b'0' } else { 0 },
-                 if b1.is_ascii_digit() { b1 - b'0' } else { 0 })
+                // Biallelic projection (.min(1)): multiallelic allele index 2+ folds
+                // to 1 so chip passthrough never emits a GT beyond the single ALT.
+                // No-op on biallelic input. Matches the BCF reader + write_panel_vcf.
+                (if b0.is_ascii_digit() { (b0 - b'0').min(1) } else { 0 },
+                 if b1.is_ascii_digit() { (b1 - b'0').min(1) } else { 0 })
             } else {
                 (0, 0)
             };
@@ -707,8 +714,11 @@ pub fn read_target_vcf_multi_chr(
 
             let (a0, a1) = if gt.len() >= 3 {
                 let b0 = gt[0]; let b1 = gt[2];
-                (if b0.is_ascii_digit() { b0 - b'0' } else { 0 },
-                 if b1.is_ascii_digit() { b1 - b'0' } else { 0 })
+                // Biallelic projection (.min(1)): multiallelic allele index 2+ folds
+                // to 1 so chip passthrough never emits a GT beyond the single ALT.
+                // No-op on biallelic input. Matches the BCF reader + write_panel_vcf.
+                (if b0.is_ascii_digit() { (b0 - b'0').min(1) } else { 0 },
+                 if b1.is_ascii_digit() { (b1 - b'0').min(1) } else { 0 })
             } else {
                 (0, 0)
             };
