@@ -331,16 +331,6 @@ pub fn chunk_cv_from_tiles(tile_entries: &[tiled::TileEntryPub]) -> f64 {
     var.sqrt() / mean
 }
 
-/// Write a string as UCS-4 LE, null-padded to `width_chars` code points.
-pub(crate) fn write_ucs4_string(s: &str, width_chars: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; width_chars * 4];
-    for (i, c) in s.chars().take(width_chars).enumerate() {
-        let cp = c as u32;
-        buf[i*4..i*4+4].copy_from_slice(&cp.to_le_bytes());
-    }
-    buf
-}
-
 /// Parse a raw binary chunk after zstd decompression.
 pub(crate) fn parse_raw_chunk(compressed: &[u8]) -> CscChunk {
     let decompressed = zstd::decode_all(Cursor::new(compressed))
@@ -411,17 +401,5 @@ mod tests {
         assert!(!chunk.get(0, 1));
         assert!(chunk.get(1, 1));
         assert!(!chunk.get(2, 1));
-    }
-
-    #[test]
-    fn test_ucs4_roundtrip() {
-        let s = "chr22";
-        let encoded = write_ucs4_string(s, 5);
-        // Decode: read UCS-4 LE codepoints back to string
-        let decoded: String = encoded.chunks_exact(4)
-            .filter_map(|b| char::from_u32(u32::from_le_bytes(b.try_into().unwrap())))
-            .filter(|&c| c != '\0')
-            .collect();
-        assert_eq!(decoded, s);
     }
 }
