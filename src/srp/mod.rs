@@ -99,51 +99,6 @@ impl CscChunk {
         indices.binary_search(&(row as i32)).is_ok()
     }
 
-    /// Transpose a row range [row_start, row_end) from CSC to row-major sparse.
-    pub fn transpose_rows(&self, row_start: usize, row_end: usize) -> (Vec<i32>, Vec<i32>) {
-        let n_rows = row_end - row_start;
-        let mut row_counts = vec![0i32; n_rows];
-        for col in 0..self.n_cols {
-            let lo = self.indptr[col] as usize;
-            let hi = self.indptr[col + 1] as usize;
-            let start = self.indices[lo..hi].partition_point(|&r| (r as usize) < row_start);
-            for k in (lo + start)..hi {
-                let r = self.indices[k] as usize;
-                if r >= row_end { break; }
-                row_counts[r - row_start] += 1;
-            }
-        }
-        let mut row_indptr = vec![0i32; n_rows + 1];
-        for r in 0..n_rows {
-            row_indptr[r + 1] = row_indptr[r] + row_counts[r];
-        }
-        let total_nnz = row_indptr[n_rows] as usize;
-        let mut col_indices = vec![0i32; total_nnz];
-        let mut pos = vec![0i32; n_rows];
-        for col in 0..self.n_cols {
-            let lo = self.indptr[col] as usize;
-            let hi = self.indptr[col + 1] as usize;
-            let start = self.indices[lo..hi].partition_point(|&r| (r as usize) < row_start);
-            for k in (lo + start)..hi {
-                let r = self.indices[k] as usize;
-                if r >= row_end { break; }
-                let lr = r - row_start;
-                let p = (row_indptr[lr] + pos[lr]) as usize;
-                col_indices[p] = col as i32;
-                pos[lr] += 1;
-            }
-        }
-        (row_indptr, col_indices)
-    }
-
-    /// Extract a dense u8 column vector for column `col`.
-    pub fn col_dense(&self, col: usize) -> Vec<u8> {
-        let mut out = vec![0u8; self.n_rows];
-        for &idx in self.col_indices(col) {
-            out[idx as usize] = 1;
-        }
-        out
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -287,28 +242,6 @@ impl SrpMetadata {
         }
     }
 
-    /// Get the first variant index for a given chunk ID.
-    pub fn chunk_var_start(&self, chunk_id: usize) -> usize {
-        if !self.chunk_var_starts.is_empty() {
-            self.chunk_var_starts[chunk_id]
-        } else {
-            chunk_id * self.chunk_size
-        }
-    }
-
-    /// Find chunk ID for a given variant index.
-    pub fn variant_to_chunk(&self, wgs_i: usize) -> (usize, usize) {
-        if !self.chunk_var_starts.is_empty() {
-            // Binary search in chunk_var_starts
-            let cid = match self.chunk_var_starts.binary_search(&wgs_i) {
-                Ok(i) => i,
-                Err(i) => i.saturating_sub(1),
-            };
-            (cid, wgs_i - self.chunk_var_starts[cid])
-        } else {
-            (wgs_i / self.chunk_size, wgs_i % self.chunk_size)
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
