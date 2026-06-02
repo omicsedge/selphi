@@ -5,11 +5,8 @@
 //! all ZIP entries from the N intermediates into a single final ZIP.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use crate::imputation::hmm::CsrWeights;
-use crate::srp::SrpReader;
-use crate::io::batch_driver::{BatchSink, WindowCtx};
+use crate::io::batch_driver::{BatchSink, WindowBatchInput, WindowCtx};
 use crate::io::selfdecode_output::SelfdecodeWriter;
 
 pub struct SdBatchWriter {
@@ -52,19 +49,6 @@ pub fn finalize_sd_batch_writers(writers: Vec<SdBatchWriter>) -> std::io::Result
         writer.finish()?;
         Ok(path)
     })
-}
-
-pub struct WindowBatchInput<'a> {
-    pub srp: &'a Arc<SrpReader>,
-    pub weights: &'a [&'a CsrWeights],
-    pub hap_start: usize,
-    pub hap_end: usize,
-    pub win_chip_start: usize,
-    pub own_chip_start: usize,
-    pub own_chip_end: usize,
-    pub wgs_idx: &'a [usize],
-    pub n_samples_total: usize,
-    pub chip_genotypes: &'a [u8],
 }
 
 /// [`BatchSink`] for the SelfDecode writer: fills per-sample GT/AP scratch and
@@ -131,7 +115,7 @@ pub fn write_window_sd_batched(
 ) -> std::io::Result<()> {
     let WindowBatchInput {
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
-        wgs_idx, n_samples_total, chip_genotypes,
+        wgs_idx, n_samples_total, chip_genotypes, no_ap: _,
     } = input;
     let mut sink = SdSink { bw, gt1: Vec::new(), gt2: Vec::new(), ap1: Vec::new(), ap2: Vec::new() };
     crate::io::batch_driver::run_window(

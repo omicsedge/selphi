@@ -6,8 +6,31 @@
 //! single source for that slicing; each writer keeps only its format-specific
 //! per-batch writer construction (path extension, encoder type, header).
 
+use std::sync::Arc;
+
 use crate::imputation::hmm::CsrWeights;
 use crate::srp::SrpReader;
+
+/// Inputs for the per-window batched write of ONE batch's hap range, shared by
+/// all five format writers. Every field is a `Copy` reference / scalar, so the
+/// orchestrator builds it once per `(batch, window)` and hands a copy to each
+/// active writer. `no_ap` is honoured only by the VCF writer; BCF forces it
+/// false (its intermediate always carries AP so the merger can recompute AC),
+/// and PGEN/SD/Parquet ignore it.
+#[derive(Clone, Copy)]
+pub struct WindowBatchInput<'a> {
+    pub srp: &'a Arc<SrpReader>,
+    pub weights: &'a [&'a CsrWeights],
+    pub hap_start: usize,
+    pub hap_end: usize,
+    pub win_chip_start: usize,
+    pub own_chip_start: usize,
+    pub own_chip_end: usize,
+    pub wgs_idx: &'a [usize],
+    pub n_samples_total: usize,
+    pub chip_genotypes: &'a [u8],
+    pub no_ap: bool,
+}
 
 /// One batch's sample / haplotype range (haps = 2 × samples).
 pub struct BatchRange {

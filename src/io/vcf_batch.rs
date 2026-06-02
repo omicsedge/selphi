@@ -13,12 +13,10 @@
 
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::io::pipeline::{VcfSender, VcfWriterHandle};
-use crate::io::batch_driver::{BatchSink, WindowCtx};
-use crate::imputation::hmm::CsrWeights;
+use crate::io::batch_driver::{BatchSink, WindowBatchInput, WindowCtx};
 use crate::srp::SrpReader;
 
 /// One per-batch VCF writer.
@@ -121,21 +119,6 @@ pub fn finalize_vcf_batch_writers(writers: Vec<VcfBatchWriter>) -> std::io::Resu
             .map_err(|_| std::io::Error::other("VCF batch writer thread panicked"))??;
         Ok(path)
     })
-}
-
-/// Per-window batch input — same shape as `bcf_batch::WindowBatchInput`.
-pub struct WindowBatchInput<'a> {
-    pub srp: &'a Arc<SrpReader>,
-    pub weights: &'a [&'a CsrWeights],
-    pub hap_start: usize,
-    pub hap_end: usize,
-    pub win_chip_start: usize,
-    pub own_chip_start: usize,
-    pub own_chip_end: usize,
-    pub wgs_idx: &'a [usize],
-    pub n_samples_total: usize,
-    pub chip_genotypes: &'a [u8],
-    pub no_ap: bool,
 }
 
 /// [`BatchSink`] for the per-batch VCF.gz writer. Streams VCF text records
