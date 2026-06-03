@@ -116,9 +116,7 @@ pub fn write_bref3_from_bcf(source_path: &Path, output_path: &Path) -> io::Resul
     let mut w = BufWriter::with_capacity(4 << 20, std::fs::File::create(&bref3_path)?);
     let mut bytes_written: u64 = 0;
 
-    bytes_written += write_i32_c(&mut w, MAGIC_NUMBER_V3)?;
-    bytes_written += write_utf_c(&mut w, "selphi_2.0.0_converter_bref3")?;
-    bytes_written += write_string_array_c(&mut w, &hdr.sample_names)?;
+    bytes_written += write_bref3_header(&mut w, &hdr.sample_names)?;
 
     let mut block_recs: Vec<VariantRec> = Vec::with_capacity(512);
     let mut block_encodings: Vec<RecEncoding> = Vec::with_capacity(512);
@@ -192,21 +190,9 @@ pub fn write_bref3_from_bcf(source_path: &Path, output_path: &Path) -> io::Resul
     }
 
     // End sentinel + index
-    bytes_written += write_i32_c(&mut w, 0)?;
-    let index_start = bytes_written;
     let chroms: Vec<String> = if chrom.is_empty() { vec![] } else { vec![chrom] };
     let chrom_starts: Vec<i32> = if chroms.is_empty() { vec![] } else { vec![0] };
-    bytes_written += write_string_array_c(&mut w, &chroms)?;
-    for &s in &chrom_starts { bytes_written += write_i32_c(&mut w, s)?; }
-    let mut last_ci: i32 = -1;
-    for &(offset, pos) in &block_index {
-        let mut off = offset as i64;
-        if last_ci < 0 { off = -off; last_ci = 0; }
-        bytes_written += write_i64_c(&mut w, off)?;
-        bytes_written += write_i32_c(&mut w, pos)?;
-    }
-    bytes_written += write_i64_c(&mut w, -999_999_999_999_999)?;
-    write_i64_c(&mut w, index_start as i64)?;
+    write_bref3_trailer(&mut w, bytes_written, &chroms, &chrom_starts, &block_index)?;
     w.flush()?;
 
     reader_handle.join().unwrap()?;
@@ -268,9 +254,7 @@ pub fn write_bref3_from_srp(source_path: &Path, output_path: &Path) -> io::Resul
     let mut w = BufWriter::with_capacity(4 << 20, std::fs::File::create(&bref3_path)?);
     let mut bytes_written: u64 = 0;
 
-    bytes_written += write_i32_c(&mut w, MAGIC_NUMBER_V3)?;
-    bytes_written += write_utf_c(&mut w, "selphi_2.0.0_converter_bref3")?;
-    bytes_written += write_string_array_c(&mut w, &sample_names)?;
+    bytes_written += write_bref3_header(&mut w, &sample_names)?;
 
     let mut block_recs: Vec<VariantRec> = Vec::with_capacity(512);
     let mut block_encodings: Vec<RecEncoding> = Vec::with_capacity(512);
@@ -366,24 +350,9 @@ pub fn write_bref3_from_srp(source_path: &Path, output_path: &Path) -> io::Resul
     }
 
     // End sentinel + index (mirror write_bref3_from_bcf)
-    bytes_written += write_i32_c(&mut w, 0)?;
-    let index_start = bytes_written;
     let chroms: Vec<String> = vec![chrom_name.clone()];
     let chrom_starts: Vec<i32> = vec![0];
-    // After capturing `index_start`, `bytes_written` is no longer consulted,
-    // so the per-write increments are dropped on purpose; the writes still
-    // happen via `?` propagation.
-    write_string_array_c(&mut w, &chroms)?;
-    for &s in &chrom_starts { write_i32_c(&mut w, s)?; }
-    let mut last_ci: i32 = -1;
-    for &(offset, pos) in &block_index {
-        let mut off = offset as i64;
-        if last_ci < 0 { off = -off; last_ci = 0; }
-        write_i64_c(&mut w, off)?;
-        write_i32_c(&mut w, pos)?;
-    }
-    write_i64_c(&mut w, -999_999_999_999_999)?;
-    write_i64_c(&mut w, index_start as i64)?;
+    write_bref3_trailer(&mut w, bytes_written, &chroms, &chrom_starts, &block_index)?;
     w.flush()?;
 
     let size = std::fs::metadata(&bref3_path)?.len();
@@ -654,5 +623,46 @@ fn write_utf_c<W: Write>(w: &mut W, s: &str) -> io::Result<u64> {
 fn write_string_array_c<W: Write>(w: &mut W, arr: &[String]) -> io::Result<u64> {
     let mut n = write_i32_c(w, arr.len() as i32)?;
     for s in arr { n += write_utf_c(w, s)?; }
+    Ok(n)
+}
+
+/// Write the BREF3 file header ("driver"): the v3 magic number, the program
+/// string, and the sample-name array. Returns the bytes written. Shared by the
+/// BCF and SRP writers so the header layout has a single definition.
+fn write_bref3_header<W: Write>(w: &mut W, sample_names: &[String]) -> io::Result<u64> {
+    let mut n = write_i32_c(w, MAGIC_NUMBER_V3)?;
+    n += write_utf_c(w, "selphi_2.0.0_converter_bref3")?;
+    n += write_string_array_c(w, sample_names)?;
+    Ok(n)
+}
+
+/// Write the BREF3 trailer: the end-of-records sentinel (i32 0), then the index
+/// section — chrom names + per-chrom block-start indices + per-block
+/// `(offset, pos)` entries (the first offset is negated, the Beagle chrom-
+/// boundary marker) + the `-999_999_999_999_999` terminator + the absolute
+/// offset where the index begins. `bytes_written` is the file length before the
+/// end sentinel (so `index_start` lands just after it). Returns bytes written.
+/// Shared by the BCF and SRP writers; `chroms`/`chrom_starts` are built by each
+/// caller (the BCF path emits empty arrays when no variants were seen).
+fn write_bref3_trailer<W: Write>(
+    w: &mut W,
+    bytes_written: u64,
+    chroms: &[String],
+    chrom_starts: &[i32],
+    block_index: &[(u64, i32)],
+) -> io::Result<u64> {
+    let mut n = write_i32_c(w, 0)?; // end-of-records sentinel
+    let index_start = bytes_written + n;
+    n += write_string_array_c(w, chroms)?;
+    for &s in chrom_starts { n += write_i32_c(w, s)?; }
+    let mut last_ci: i32 = -1;
+    for &(offset, pos) in block_index {
+        let mut off = offset as i64;
+        if last_ci < 0 { off = -off; last_ci = 0; }
+        n += write_i64_c(w, off)?;
+        n += write_i32_c(w, pos)?;
+    }
+    n += write_i64_c(w, -999_999_999_999_999)?;
+    n += write_i64_c(w, index_start as i64)?;
     Ok(n)
 }
