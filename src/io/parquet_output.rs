@@ -25,7 +25,9 @@ pub fn build_schema(sample_names: &[String]) -> Schema {
         Field::new("ID", DataType::Utf8, true),
         Field::new("REF", DataType::Utf8, false),
         Field::new("ALT", DataType::Utf8, false),
-        Field::new("AF", DataType::Float32, true),
+        // AF is always computed and appended (never null), unlike DR2 which is null
+        // for chip/genotyped sites. Declare it non-nullable to match how it is written.
+        Field::new("AF", DataType::Float32, false),
         Field::new("DR2", DataType::Float32, true),
         Field::new("IMP", DataType::Boolean, false),
     ];
