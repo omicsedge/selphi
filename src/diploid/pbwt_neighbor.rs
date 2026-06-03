@@ -43,6 +43,52 @@ pub struct PbwtNeighborIndex {
     pub chunk_starts: Vec<usize>,     // per-chunk: buffer start site
 }
 
+/// One PBWT radix-split + divergence step at site `l`: stably partition the
+/// prefix `a` / divergence `c` by the allele bit at `l`, buffering the
+/// 1-allele bucket in scratch `b_arr`/`d_arr` and appending it after the
+/// 0-allele bucket. Verbatim hot loop shared by the parallel chunked sweep
+/// (`pbwt_sweep_direct`) and the sequential sweep (`_sweep_bitmatrix_seq`).
+#[inline]
+fn pbwt_radix_split(
+    l: usize,
+    n_hap: usize,
+    bm: &HaplotypeBitmatrix,
+    a: &mut [i32],
+    c: &mut [i32],
+    b_arr: &mut [i32],
+    d_arr: &mut [i32],
+) {
+    let mut u = 0usize; let mut v = 0usize;
+    let mut p = l as i32; let mut q = l as i32;
+    // Hot loop: e.g. 4812 haps × 113K sites. Unchecked indexing eliminates
+    // bounds checks (3 per iteration = 1.6B checks saved).
+    // SAFETY: h < n_hap = a.len() = c.len(); u+v = n_hap = a.len();
+    // a_h < n_hap (permutation); bm bounds guaranteed by construction.
+    unsafe {
+        let a_ptr = a.as_mut_ptr();
+        let c_ptr = c.as_mut_ptr();
+        let b_ptr = b_arr.as_mut_ptr();
+        let d_ptr = d_arr.as_mut_ptr();
+        let bm_bits = bm.bits_ptr();
+        let bm_nw = bm.n_words();
+        for h in 0..n_hap {
+            let a_h = *a_ptr.add(h);
+            let c_h = *c_ptr.add(h);
+            if c_h > p { p = c_h; }
+            if c_h > q { q = c_h; }
+            let hap = a_h as usize;
+            let bit = (*bm_bits.add(l * bm_nw + hap / 64) >> (hap % 64)) & 1;
+            if bit == 0 {
+                *a_ptr.add(u) = a_h; *c_ptr.add(u) = p; p = 0; u += 1;
+            } else {
+                *b_ptr.add(v) = a_h; *d_ptr.add(v) = q; q = 0; v += 1;
+            }
+        }
+    }
+    a[u..u + v].copy_from_slice(&b_arr[..v]);
+    c[u..u + v].copy_from_slice(&d_arr[..v]);
+}
+
 impl PbwtNeighborIndex {
     /// `n_target`: target hap count (= storage dimension).
     /// `n_sweep`: full panel size (target + ref). Must be `>= n_target`.
@@ -280,35 +326,7 @@ impl PbwtNeighborIndex {
                 if !site_eval[l] { continue; }
                 let in_chunk = chunk_assignments[l] == chunk_id as i32;
 
-                let mut u = 0usize; let mut v = 0usize;
-                let mut p = l as i32; let mut q = l as i32;
-                // Hot loop: 4812 haps × 113K sites. Unchecked indexing
-                // eliminates bounds checks (3 per iteration = 1.6B checks saved).
-                // SAFETY: h < n_hap = a.len() = c.len(); u+v = n_hap = a.len();
-                // a_h < n_hap (permutation); bm bounds guaranteed by construction.
-                unsafe {
-                    let a_ptr = a.as_mut_ptr();
-                    let c_ptr = c.as_mut_ptr();
-                    let b_ptr = b_arr.as_mut_ptr();
-                    let d_ptr = d_arr.as_mut_ptr();
-                    let bm_bits = bm.bits_ptr();
-                    let bm_nw = bm.n_words();
-                    for h in 0..n_hap {
-                        let a_h = *a_ptr.add(h);
-                        let c_h = *c_ptr.add(h);
-                        if c_h > p { p = c_h; }
-                        if c_h > q { q = c_h; }
-                        let hap = a_h as usize;
-                        let bit = (*bm_bits.add(l * bm_nw + hap / 64) >> (hap % 64)) & 1;
-                        if bit == 0 {
-                            *a_ptr.add(u) = a_h; *c_ptr.add(u) = p; p = 0; u += 1;
-                        } else {
-                            *b_ptr.add(v) = a_h; *d_ptr.add(v) = q; q = 0; v += 1;
-                        }
-                    }
-                }
-                a[u..u + v].copy_from_slice(&b_arr[..v]);
-                c[u..u + v].copy_from_slice(&d_arr[..v]);
+                pbwt_radix_split(l, n_hap, bm, &mut a, &mut c, &mut b_arr, &mut d_arr);
 
                 if in_chunk && site_selection[l] {
                     let group = site_grouping[l];
@@ -377,31 +395,7 @@ impl PbwtNeighborIndex {
         for l in 0..n_sites {
             if !self.site_eval[l] { continue; }
 
-            let mut u = 0usize; let mut v = 0usize;
-            let mut p = l as i32; let mut q = l as i32;
-            unsafe {
-                let a_ptr = a.as_mut_ptr();
-                let c_ptr = c.as_mut_ptr();
-                let b_ptr = b_arr.as_mut_ptr();
-                let d_ptr = d_arr.as_mut_ptr();
-                let bm_bits = bm.bits_ptr();
-                let bm_nw = bm.n_words();
-                for h in 0..n_hap {
-                    let a_h = *a_ptr.add(h);
-                    let c_h = *c_ptr.add(h);
-                    if c_h > p { p = c_h; }
-                    if c_h > q { q = c_h; }
-                    let hap = a_h as usize;
-                    let bit = (*bm_bits.add(l * bm_nw + hap / 64) >> (hap % 64)) & 1;
-                    if bit == 0 {
-                        *a_ptr.add(u) = a_h; *c_ptr.add(u) = p; p = 0; u += 1;
-                    } else {
-                        *b_ptr.add(v) = a_h; *d_ptr.add(v) = q; q = 0; v += 1;
-                    }
-                }
-            }
-            a[u..u+v].copy_from_slice(&b_arr[..v]);
-            c[u..u+v].copy_from_slice(&d_arr[..v]);
+            pbwt_radix_split(l, n_hap, bm, &mut a, &mut c, &mut b_arr, &mut d_arr);
 
             if self.site_selection[l] {
                 let group = self.site_grouping[l];
