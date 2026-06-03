@@ -377,25 +377,14 @@ pub fn run_multi_chr(
             genmap::compute_ld_correction_bm(&ref_bm_imp, &raw_chip_cm, n_chip, n_ref, 100)
         };
 
-        // Auto-calibrate parameters
-        let match_length = config.match_length.unwrap_or_else(|| {
-            // saturating_sub: log2(n_ref) < 7 when n_ref < 128 would underflow usize.
-            let ml = ((n_ref as f64).log2() as usize).saturating_sub(7);
-            ml.min(n_chip / 2000).max(5)
-        });
-        let log2_haps = (n_ref as f64).log2();
-        // Honor user `--fl-fwd`/`--fl-bwd` overrides; else auto-derive (byte-identical
-        // to the single-chr auto_calibrate_pbwt_params default).
-        let fl_fwd = config.fl_fwd.unwrap_or_else(|| {
-            ((2600.0 / log2_haps) as usize).clamp(100, 450)
-        });
-        let fl_bwd = config.fl_bwd.unwrap_or_else(|| {
-            ((fl_fwd as f64 * 2.4 / log2_haps) as usize).max(13)
-        });
-        let est_ne = if config.est_ne <= 0 {
-            let auto_ne = (36.4 * n_ref as f64).round() as i64;
-            auto_ne.max(20_000)
-        } else { config.est_ne };
+        // Auto-calibrate parameters — shared verbatim with the single-chr
+        // pipeline so the two impute paths cannot drift in match_length / fl_fwd
+        // / fl_bwd / est_ne. Honors the same `--match-length`/`--fl-fwd`/
+        // `--fl-bwd`/`--est-ne` overrides.
+        let crate::imputation_pipeline::PbwtParams { match_length, fl_fwd, fl_bwd, est_ne } =
+            crate::imputation_pipeline::auto_calibrate_pbwt_params(
+                config.match_length, config.fl_fwd, config.fl_bwd, config.est_ne, n_ref, n_chip,
+            );
 
         // Compute imputation windows
         let windows = compute_imputation_windows(&chip_cm, config.window_cm, config.overlap_cm);
