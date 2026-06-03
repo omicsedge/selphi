@@ -32,8 +32,13 @@ pub struct TargetMarker {
 /// as a sentinel if the input contains no digits or any non-digit/non-sign/
 /// non-whitespace byte (so callers can `if pos < 1 { continue; }` to skip
 /// malformed VCF POS columns instead of silently accepting POS=0).
+///
+/// `pub(crate)` so the lcWGS PL reader shares this one canonical definition
+/// rather than carrying a byte-equivalent copy. Both callers pass the VCF POS
+/// column (the bytes strictly between the 1st and 2nd tab of a `\n`-delimited
+/// line), which in practice is pure ASCII digits.
 #[inline]
-fn fast_parse_i64(bytes: &[u8]) -> i64 {
+pub(crate) fn fast_parse_i64(bytes: &[u8]) -> i64 {
     let mut n: i64 = 0;
     let mut seen_digit = false;
     for &b in bytes {

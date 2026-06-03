@@ -677,21 +677,12 @@ impl VariantReader {
                             // Clear any hardcalls previously pushed by the GT branch —
                             // DS is authoritative when present.
                             ds_buf.clear();
-                            if let Some(indices) = si_filter {
-                                for &si in indices {
-                                    let off = io2 + si * 4;
-                                    if off + 4 <= ib.len() {
-                                        ds_buf.push(f32::from_le_bytes(ib[off..off+4].try_into().unwrap()));
-                                    } else { ds_buf.push(-1.0); }
-                                }
-                            } else {
-                                for si in 0..ns {
-                                    let off = io2 + si * 4;
-                                    if off + 4 <= ib.len() {
-                                        ds_buf.push(f32::from_le_bytes(ib[off..off+4].try_into().unwrap()));
-                                    } else { ds_buf.push(-1.0); }
-                                }
-                            }
+                            for_each_sample(si_filter, ns, |si| {
+                                let off = io2 + si * 4;
+                                if off + 4 <= ib.len() {
+                                    ds_buf.push(f32::from_le_bytes(ib[off..off+4].try_into().unwrap()));
+                                } else { ds_buf.push(-1.0); }
+                            });
                             found_ds = true;
                             // io2 not advanced past DS field — break exits the field loop
                             break;
@@ -701,25 +692,14 @@ impl VariantReader {
                             // Missing alleles are folded to 0 (hom-ref) to keep
                             // MAF denominators aligned with the SRP truth reader
                             // (1-bit-per-allele has no missing encoding).
-                            if let Some(indices) = si_filter {
-                                for &si in indices {
-                                    let b = io2 + si * vl * es;
-                                    if b + 1 < ge {
-                                        let a0c = gt_allele_to_dose(ib[b]);
-                                        let a1c = gt_allele_to_dose(ib[b+1]);
-                                        ds_buf.push(a0c as f32 + a1c as f32);
-                                    } else { ds_buf.push(0.0); }
-                                }
-                            } else {
-                                for si in 0..ns {
-                                    let b = io2 + si * vl * es;
-                                    if b + 1 < ge {
-                                        let a0c = gt_allele_to_dose(ib[b]);
-                                        let a1c = gt_allele_to_dose(ib[b+1]);
-                                        ds_buf.push(a0c as f32 + a1c as f32);
-                                    } else { ds_buf.push(0.0); }
-                                }
-                            }
+                            for_each_sample(si_filter, ns, |si| {
+                                let b = io2 + si * vl * es;
+                                if b + 1 < ge {
+                                    let a0c = gt_allele_to_dose(ib[b]);
+                                    let a1c = gt_allele_to_dose(ib[b+1]);
+                                    ds_buf.push(a0c as f32 + a1c as f32);
+                                } else { ds_buf.push(0.0); }
+                            });
                             found_gt = true;
                             io2 += fs;
                         } else {
@@ -756,6 +736,19 @@ fn gt_allele_to_dose(raw: u8) -> u8 {
     if raw == 0x80 || raw == 0x81 { return 0; }
     let a = (raw >> 1).wrapping_sub(1);
     if a > 127 { 0 } else { a.min(1) }
+}
+
+/// Invoke `f(sample_index)` for each kept sample, in order: the filtered
+/// positions in `si_filter` when present (selective BCF sample extraction),
+/// otherwise every sample `0..ns`. Folds the byte-identical filter/no-filter
+/// branch pairs in the BCF DS and GT extraction loops into one body.
+#[inline]
+fn for_each_sample(si_filter: Option<&[usize]>, ns: usize, mut f: impl FnMut(usize)) {
+    if let Some(indices) = si_filter {
+        for &si in indices { f(si); }
+    } else {
+        for si in 0..ns { f(si); }
+    }
 }
 
 // BCF typed-atom parsers shared with srp::bcf_reader + srp::bref3_writer.
