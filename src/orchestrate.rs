@@ -119,17 +119,32 @@ fn load_chr_data(
     let (target_markers, target_genotypes) = target_by_chr.get(key)
         .or_else(|| target_by_chr.get(chr_name))?;
 
+    let (wgs_idx, target_idx, targ_alleles, chip_bps, n_chip) =
+        prepare_chr_target(&srp, target_markers, target_genotypes, n_haps)?;
+    let raw_chip_cm = genmap::interpolate_for_chr(multi_map, chr_name, &chip_bps);
+
+    Some((srp, wgs_idx, target_idx, targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip))
+}
+
+/// Intersect target markers against a chromosome's reference panel, extract the
+/// target alleles, and collect the chip base-pair positions. Shared verbatim by
+/// the synchronous `load_chr_data` and the background prefetch closure so the
+/// per-chr data preparation cannot drift between them. Returns None when no
+/// markers are shared (n_chip == 0).
+fn prepare_chr_target(
+    srp: &selphi::srp::SrpReader,
+    target_markers: &[selphi::io::target_io::TargetMarker],
+    target_genotypes: &[Vec<[u8; 2]>],
+    n_haps: usize,
+) -> Option<(Vec<usize>, Vec<usize>, Vec<u8>, Vec<i64>, usize)> {
     let (wgs_idx, target_idx) = intersect_variants_for_chr(
         &srp.metadata.chromosome, &srp.variants, &srp.ids, target_markers,
     );
     let n_chip = wgs_idx.len();
     if n_chip == 0 { return None; }
-
     let targ_alleles = extract_target_alleles(target_genotypes, &target_idx, n_chip, n_haps);
     let chip_bps: Vec<i64> = wgs_idx.iter().map(|&wi| srp.variants[wi].pos).collect();
-    let raw_chip_cm = genmap::interpolate_for_chr(multi_map, chr_name, &chip_bps);
-
-    Some((srp, wgs_idx, target_idx, targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip))
+    Some((wgs_idx, target_idx, targ_alleles, chip_bps, n_chip))
 }
 
 /// Run multi-chromosome imputation from a unified multi-chr SRP file.
@@ -468,14 +483,8 @@ pub fn run_multi_chr(
                     let srp = Arc::new(chr_view.into_srp_reader());
 
                     let (target_markers, target_genotypes) = next_target.as_ref()?;
-                    let (wgs_idx, target_idx) = intersect_variants_for_chr(
-                        &srp.metadata.chromosome, &srp.variants, &srp.ids, target_markers,
-                    );
-                    let n_chip = wgs_idx.len();
-                    if n_chip == 0 { return None; }
-
-                    let targ_alleles = extract_target_alleles(target_genotypes, &target_idx, n_chip, n_h);
-                    let chip_bps: Vec<i64> = wgs_idx.iter().map(|&wi| srp.variants[wi].pos).collect();
+                    let (wgs_idx, target_idx, targ_alleles, chip_bps, n_chip) =
+                        prepare_chr_target(&srp, target_markers, target_genotypes, n_h)?;
                     let (map_bp, map_cm) = next_map?;
                     let raw_chip_cm: Vec<f64> = chip_bps.iter().map(|&bp| {
                         genmap::interpolate_cm(&map_bp, &map_cm, bp)
