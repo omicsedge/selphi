@@ -432,6 +432,40 @@ fn batch_get_top_matches(
     (result, n_matches)
 }
 
+/// Overlap test shared by both passes of `batch_expand_matches`.
+///
+/// Computes the clamped `[start, stop]` variant range for match `mi` and, via
+/// binary search over the haplotype's selected sites `hap_sites[hs..he]`,
+/// returns `Some((start, stop))` iff that range overlaps a selected site
+/// (and `None` for the `start > stop` / no-overlap skips). The arithmetic and
+/// control flow are identical to the original inlined block, so the count pass
+/// (`stop - start + 1`) and the fill pass (`start..=stop`) behave verbatim.
+#[inline]
+fn expand_match_range(
+    starts: &[i32], stops: &[i32], hap_sites: &[i32],
+    mi: usize, hs: usize, he: usize, n_var: usize,
+) -> Option<(usize, usize)> {
+    let start = starts[mi] as usize;
+    let stop = (stops[mi] as usize).min(n_var - 1);
+    if start > stop { return None; }
+    // Binary search for overlap with selected sites
+    let mut lo = hs;
+    let mut hi = he;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if (hap_sites[mid] as usize) < start {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo < he && (hap_sites[lo] as usize) <= stop {
+        Some((start, stop))
+    } else {
+        None
+    }
+}
+
 /// Expand matches: for each haplotype, expand its PBWT match ranges
 /// to cover all variants in those ranges.
 fn batch_expand_matches(
@@ -448,21 +482,9 @@ fn batch_expand_matches(
         let ms = csr_indptr[hap] as usize;
         let me = csr_indptr[hap + 1] as usize;
         for mi in ms..me {
-            let start = starts[mi] as usize;
-            let stop = (stops[mi] as usize).min(n_var - 1);
-            if start > stop { continue; }
-            // Binary search for overlap with selected sites
-            let mut lo = hs;
-            let mut hi = he;
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                if (hap_sites[mid] as usize) < start {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            if lo < he && (hap_sites[lo] as usize) <= stop {
+            if let Some((start, stop)) =
+                expand_match_range(starts, stops, hap_sites, mi, hs, he, n_var)
+            {
                 total += stop - start + 1;
             }
         }
@@ -480,20 +502,9 @@ fn batch_expand_matches(
         let ms = csr_indptr[hap] as usize;
         let me = csr_indptr[hap + 1] as usize;
         for mi in ms..me {
-            let start = starts[mi] as usize;
-            let stop = (stops[mi] as usize).min(n_var - 1);
-            if start > stop { continue; }
-            let mut lo = hs;
-            let mut hi = he;
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                if (hap_sites[mid] as usize) < start {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            if lo < he && (hap_sites[lo] as usize) <= stop {
+            if let Some((start, stop)) =
+                expand_match_range(starts, stops, hap_sites, mi, hs, he, n_var)
+            {
                 for vv in start..=stop {
                     expand_vars[pos] = vv as i32;
                     expand_haps[pos] = hap as i64;
