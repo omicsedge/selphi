@@ -275,7 +275,10 @@ fn extract_window<B: Fn(usize) -> u8, Q: Fn(usize) -> u8>(
                 qcur += len;
             }
             Kind::Insertion => {
-                if refcur > hstart && refcur < hend {
+                // Half-open window [hstart, hend): an insertion anchored exactly at
+                // hstart belongs to the window, same as the match branch above (rp >=
+                // hstart). Was `>`, which silently dropped a window-start insertion.
+                if refcur >= hstart && refcur < hend {
                     for k in 0..len {
                         let b = base_at(qcur + k);
                         if b != b'N' { wb.push(b); wq.push(qual_at(qcur + k)); }
