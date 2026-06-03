@@ -330,7 +330,7 @@ pub fn run_multi_chr(
                 if common_chip_indices.is_empty() {
                     // No common scaffold for diploid — fall back to haploid.
                     selphi_info!("    Phasing: diploid requested but no common-MAF variants; using haploid");
-                    let (phased, _ne, _ri) = selphi::haploid::phase_genotypes(
+                    let (phased, _ri) = selphi::haploid::phase_genotypes(
                         &targ_alleles, &ref_bm, &raw_chip_cm, &chip_bps,
                         &ref_bp, &map_bp_raw, &map_cm_raw,
                         n_chip, n_samples, n_ref, config.seed, config.threads, 0,
@@ -342,7 +342,7 @@ pub fn run_multi_chr(
                     let common_ref_bm =
                         selphi::diploid::pbwt_neighbor::HaplotypeBitmatrix::from_subset(
                             &ref_bm, &common_chip_indices);
-                    let (phased, _conf, _ri) = selphi::diploid::diploid_phase_bm_prefiltered(
+                    let (phased, _ri) = selphi::diploid::diploid_phase_bm_prefiltered(
                         &targ_alleles, common_ref_bm, &common_chip_indices, Some(&ref_bm),
                         &raw_chip_cm, &chip_bps, &ref_bp, &map_bp_raw, &map_cm_raw,
                         n_chip, n_samples, n_ref,
@@ -352,7 +352,7 @@ pub fn run_multi_chr(
                 }
             } else {
                 selphi_info!("    Phasing: haploid engine");
-                let (phased, _ne_arr, _switch_info) = selphi::haploid::phase_genotypes(
+                let (phased, _switch_info) = selphi::haploid::phase_genotypes(
                     &targ_alleles, &ref_bm, &raw_chip_cm, &chip_bps,
                     &ref_bp, &map_bp_raw, &map_cm_raw,
                     n_chip, n_samples, n_ref,

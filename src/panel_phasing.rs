@@ -172,7 +172,7 @@ fn phase_cohort(
     geno: &[u8], bp: &[i64], map_bp: &[i64], map_cm: &[f64],
     n_var: usize, n_samples: usize,
 ) -> Vec<u8> {
-    let (phased, _c, _r) = match engine {
+    let (phased, _r) = match engine {
         PhasingEngine::Haploid => selphi::haploid::phase_panel(
             geno, bp, map_bp, map_cm, n_var, n_samples,
             args.seed, n_threads, args.max_windows),

@@ -152,7 +152,6 @@ pub struct PhaseResult {
     pub n_lock: i32,
     pub swap_ranges: Vec<(usize, usize, usize)>,  // (range_start, range_end, h0) — window-local markers
     pub locks: Vec<(usize, usize)>,
-    pub confs: Vec<(usize, usize, f32)>,
 }
 
 
@@ -223,12 +222,12 @@ thread_local! {
 pub fn phase_one(hbm:&[u8],hbs:usize,ibs:&[i32],hmask:&[u8],cm:&[f64],cst:&[i32],
     ss:usize,mst:i32,locked:&[u8],resolved:&[u8],si:usize,_nv:usize,nt:usize,nsa:usize,
     nst:usize,ws:usize,os:usize,oe:usize,mt:usize,wsz:usize,nmo:usize,
-    lrt:f32,last:bool,recomb_intensity:f32,pm:f32,nh:usize,
+    lrt:f32,recomb_intensity:f32,pm:f32,nh:usize,
     chip_bp:&[i64],
     dbg_it:usize,dbg_wi:usize,
 ) -> PhaseResult {
     let(h0,h1)=(si*2,si*2+1);
-    let empty = PhaseResult { n_swap:0, n_own:0, n_lock:0, swap_ranges:vec![], locks:vec![], confs:vec![] };
+    let empty = PhaseResult { n_swap:0, n_own:0, n_lock:0, swap_ranges:vec![], locks:vec![] };
     let mut nho=0i32;
     for m in 0..wsz{let vg=ws+m;if vg>=os&&vg<oe&&hmask[vg*nsa+si]!=0{nho+=1}}
     if nho<2{return empty}
@@ -490,8 +489,8 @@ pub fn phase_one(hbm:&[u8],hbs:usize,ibs:&[i32],hmask:&[u8],cm:&[f64],cst:&[i32]
     // swap semantics: swapHaps is a CUMULATIVE state. When true at het X,
     // ALL markers from het X to the next unphased het are physically swapped.
     // Apply swaps to ALL window markers (not just owned).
-    // But only report locks/conf for owned region.
-    let mut swap_ranges=Vec::new();let mut locks=Vec::new();let mut confs=Vec::new();
+    // But only report locks for owned region.
+    let mut swap_ranges=Vec::new();let mut locks=Vec::new();
     let(mut nsw,mut nown,mut nlk)=(0i32,0i32,0i32);
     for h2 in 0..nhet{
         let vg=ws+pw.hs2[h2];
@@ -502,9 +501,8 @@ pub fn phase_one(hbm:&[u8],hbs:usize,ibs:&[i32],hmask:&[u8],cm:&[f64],cst:&[i32]
             swap_ranges.push((range_start, range_end, h0));
             nsw+=1;
         }
-        if pw.lck_a[h2]!=0&&locked[vg*nsa+si]==0{locks.push((vg,si));nlk+=1}
-        if last&&vg>=os&&vg<oe{let cv=if pw.conf_a[h2]>=lrt{1.0f32}else{pw.conf_a[h2]/lrt.max(1.0)};confs.push((vg,si,cv))}}
+        if pw.lck_a[h2]!=0&&locked[vg*nsa+si]==0{locks.push((vg,si));nlk+=1}}
     // Return workspace to thread-local for reuse
     TL_PW.with(|w| { let mut ws = w.borrow_mut(); std::mem::swap(&mut *ws, &mut pw); });
-    PhaseResult { n_swap: nsw, n_own: nown, n_lock: nlk, swap_ranges, locks, confs }
+    PhaseResult { n_swap: nsw, n_own: nown, n_lock: nlk, swap_ranges, locks }
 }
