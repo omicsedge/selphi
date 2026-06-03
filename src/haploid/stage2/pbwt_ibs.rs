@@ -57,60 +57,41 @@ impl PbwtDivUpdater {
     /// `hap` at the marker indexed by `marker`. `prefix` and `div` are the
     /// current PBWT arrays and are updated in place. Precondition: every
     /// entry of `div` is ≤ `marker`.
-    ///
-    /// Verbatim from PbwtDivUpdater.fwdUpdate.
     pub fn fwd_update(
-        &mut self,
-        rec: &[i32],
-        n_alleles: usize,
-        marker: i32,
-        prefix: &mut [i32],
-        div: &mut [i32],
+        &mut self, rec: &[i32], n_alleles: usize, marker: i32,
+        prefix: &mut [i32], div: &mut [i32],
     ) {
-        assert_eq!(rec.len(), self.n_haps);
-        assert_eq!(prefix.len(), self.n_haps);
-        assert!(n_alleles >= 1);
-
-        self.ensure_alleles(n_alleles);
-        for j in 0..n_alleles {
-            self.p[j] = marker + 1;
-            self.a[j].clear();
-            self.d[j].clear();
-        }
-
-        for i in 0..self.n_haps {
-            let allele = rec[prefix[i] as usize] as usize;
-            assert!(allele < n_alleles);
-            for j in 0..n_alleles {
-                if div[i] > self.p[j] { self.p[j] = div[i]; }
-            }
-            self.a[allele].push(prefix[i]);
-            self.d[allele].push(self.p[allele]);
-            self.p[allele] = i32::MIN;
-        }
-        self.commit_prefix_and_div(n_alleles, prefix, div);
+        self.update::<true>(rec, n_alleles, marker, prefix, div);
     }
 
     /// Backward PBWT update. Mirror of `fwd_update`; `p` is initialized to
     /// `marker - 1` and uses MIN (rather than MAX) when accumulating.
     /// Precondition: every entry of `div` is ≥ `marker`.
-    ///
-    /// Verbatim from PbwtDivUpdater.bwdUpdate.
     pub fn bwd_update(
-        &mut self,
-        rec: &[i32],
-        n_alleles: usize,
-        marker: i32,
-        prefix: &mut [i32],
-        div: &mut [i32],
+        &mut self, rec: &[i32], n_alleles: usize, marker: i32,
+        prefix: &mut [i32], div: &mut [i32],
+    ) {
+        self.update::<false>(rec, n_alleles, marker, prefix, div);
+    }
+
+    /// Shared fwd/bwd PBWT prefix+divergence update. `FWD` const-folds the
+    /// p-array seed (`marker±1`), the divergence accumulation (max vs min),
+    /// and the per-bucket reset sentinel (`i32::MIN`/`MAX`) — the two
+    /// monomorphizations match the previous hand-written fwd/bwd bodies.
+    /// Verbatim from PbwtDivUpdater.fwdUpdate / bwdUpdate.
+    #[inline]
+    fn update<const FWD: bool>(
+        &mut self, rec: &[i32], n_alleles: usize, marker: i32,
+        prefix: &mut [i32], div: &mut [i32],
     ) {
         assert_eq!(rec.len(), self.n_haps);
         assert_eq!(prefix.len(), self.n_haps);
         assert!(n_alleles >= 1);
 
         self.ensure_alleles(n_alleles);
+        let p_init = if FWD { marker + 1 } else { marker - 1 };
         for j in 0..n_alleles {
-            self.p[j] = marker - 1;
+            self.p[j] = p_init;
             self.a[j].clear();
             self.d[j].clear();
         }
@@ -119,11 +100,12 @@ impl PbwtDivUpdater {
             let allele = rec[prefix[i] as usize] as usize;
             assert!(allele < n_alleles);
             for j in 0..n_alleles {
-                if div[i] < self.p[j] { self.p[j] = div[i]; }
+                let extend = if FWD { div[i] > self.p[j] } else { div[i] < self.p[j] };
+                if extend { self.p[j] = div[i]; }
             }
             self.a[allele].push(prefix[i]);
             self.d[allele].push(self.p[allele]);
-            self.p[allele] = i32::MAX;
+            self.p[allele] = if FWD { i32::MIN } else { i32::MAX };
         }
         self.commit_prefix_and_div(n_alleles, prefix, div);
     }
@@ -299,16 +281,28 @@ pub(super) fn build_coded_steps(input: &Stage2Input) -> (Vec<i32>, Vec<usize>) {
 }
 
 // ---------------------------------------------------------------------------
-// best_fwd_stage2_index / best_bwd_stage2_index: pick the IBS neighbor at
-// PBWT position `i` using the carrier-link graph + divergence walk + IBS2
-// skip. Port of LowFreqPbwtPhaseIbs.bestFwdStage2Index / bestBwdStage2Index.
+// best_stage2_index<FWD>: pick the IBS neighbor at PBWT position `i` using the
+// carrier-link graph + divergence walk + IBS2 skip. Port of
+// LowFreqPbwtPhaseIbs.bestFwdStage2Index / bestBwdStage2Index.
 // ---------------------------------------------------------------------------
 
-/// Forward direction: prefers prev or next carrier-linked position whose
-/// chain of divergences fits inside `[step, dMax]`. Returns the PBWT-array
-/// INDEX (not hap) of the chosen neighbor, or -1 if no neighbor found.
+/// Pick the IBS neighbour at PBWT position `i`, walking the carrier-link graph
+/// (skipping IBS2 siblings) and bounding the match by the divergence backoff.
+/// Returns the PBWT-array INDEX (not hap) of the chosen neighbor, or -1.
+///
+/// `FWD` const-folds the divergence direction so the two monomorphizations
+/// match the previous bestFwd/bestBwdStage2Index bodies:
+/// - forward tracks "match start" — extreme = min(d[i], d[i+1]), bound `+backoff`
+///   capped at `step`, walk while `d <= bound` accumulating with `max`, and
+///   prefers the prev side when its bound is STRICTLY smaller;
+/// - backward tracks "match end" — extreme = max(d[i], d[i+1]), bound `-backoff`
+///   floored at `step`, walk while `d >= bound` accumulating with `min`, and
+///   prefers the prev side when its bound is STRICTLY larger.
+///
+/// `n_steps_m1` seeds the backward match-end bound (unused when `FWD`).
+#[inline]
 #[allow(clippy::too_many_arguments)]
-pub fn best_fwd_stage2_index(
+fn best_stage2_index<const FWD: bool>(
     step: i32,
     m_start: i32,
     m_incl_end: i32,
@@ -318,6 +312,7 @@ pub fn best_fwd_stage2_index(
     i_to_prev: &[i32],
     i_to_next: &[i32],
     max_backoff_steps: i32,
+    n_steps_m1: i32,
     ibs2_offsets: &[i32],
     ibs2_start: &[i32],
     ibs2_end: &[i32],
@@ -326,15 +321,19 @@ pub fn best_fwd_stage2_index(
     let n = a.len();
     let mut best_prev_match: i32 = -1;
     let mut best_next_match: i32 = -1;
-    let mut prev_match_start: i32 = 0;
-    let mut next_match_start: i32 = 0;
+    // fwd: match-start bound starts at 0 and grows via max;
+    // bwd: match-end bound starts at n_steps_m1 and shrinks via min.
+    let mut prev_bound: i32 = if FWD { 0 } else { n_steps_m1 };
+    let mut next_bound: i32 = if FWD { 0 } else { n_steps_m1 };
 
-    let min_match_start = if (i + 1) < n {
-        d[i].min(d[i + 1])
+    let extreme = if (i + 1) < n {
+        if FWD { d[i].min(d[i + 1]) } else { d[i].max(d[i + 1]) }
     } else {
         d[i]
     };
-    let d_max = (min_match_start + max_backoff_steps).min(step);
+    let d_lim = if FWD { (extreme + max_backoff_steps).min(step) }
+                else    { (extreme - max_backoff_steps).max(step) };
+    let within = |x: i32| if FWD { x <= d_lim } else { x >= d_lim };
 
     // Walk prev (left) through carrier-linked positions, skipping IBS2 sibs.
     let mut prev_i = i_to_prev[i];
@@ -356,12 +355,12 @@ pub fn best_fwd_stage2_index(
         let prev_iu = prev_i as usize;
         debug_assert!(prev_iu < i);
         let mut u = i;
-        while u.saturating_sub(1) != prev_iu && d[u] <= d_max {
-            prev_match_start = prev_match_start.max(d[u]);
+        while u.saturating_sub(1) != prev_iu && within(d[u]) {
+            prev_bound = if FWD { prev_bound.max(d[u]) } else { prev_bound.min(d[u]) };
             u -= 1;
         }
-        if u.saturating_sub(1) == prev_iu && d[u] <= d_max {
-            prev_match_start = prev_match_start.max(d[u]);
+        if u.saturating_sub(1) == prev_iu && within(d[u]) {
+            prev_bound = if FWD { prev_bound.max(d[u]) } else { prev_bound.min(d[u]) };
             best_prev_match = prev_i;
         }
     }
@@ -386,118 +385,21 @@ pub fn best_fwd_stage2_index(
         let next_iu = next_i as usize;
         debug_assert!(i < next_iu);
         let mut v = i;
-        while (v + 1) != next_iu && d[v + 1] <= d_max {
+        while (v + 1) != next_iu && within(d[v + 1]) {
             v += 1;
-            next_match_start = next_match_start.max(d[v]);
+            next_bound = if FWD { next_bound.max(d[v]) } else { next_bound.min(d[v]) };
         }
-        if (v + 1) == next_iu && d[v + 1] <= d_max {
+        if (v + 1) == next_iu && within(d[v + 1]) {
             v += 1;
-            next_match_start = next_match_start.max(d[v]);
+            next_bound = if FWD { next_bound.max(d[v]) } else { next_bound.min(d[v]) };
             best_next_match = next_i;
         }
     }
 
-    // Beagle's tie-breaker: prefer the prev side iff its max divergence
-    // (prev_match_start) is STRICTLY smaller AND a match was found.
-    if prev_match_start < next_match_start && best_prev_match != -1 {
-        best_prev_match
-    } else {
-        best_next_match
-    }
-}
-
-/// Backward direction. Symmetric to fwd: divergence "match end" is the
-/// MIN this time (since bwd PBWT walks downward through marker space).
-#[allow(clippy::too_many_arguments)]
-pub fn best_bwd_stage2_index(
-    step: i32,
-    m_start: i32,
-    m_incl_end: i32,
-    i: usize,
-    a: &[i32],
-    d: &[i32],
-    i_to_prev: &[i32],
-    i_to_next: &[i32],
-    max_backoff_steps: i32,
-    n_steps_m1: i32,
-    ibs2_offsets: &[i32],
-    ibs2_start: &[i32],
-    ibs2_end: &[i32],
-    ibs2_other: &[i32],
-) -> i32 {
-    let n = a.len();
-    let mut best_prev_match: i32 = -1;
-    let mut best_next_match: i32 = -1;
-    let mut prev_match_incl_end: i32 = n_steps_m1;
-    let mut next_match_incl_end: i32 = n_steps_m1;
-
-    let max_match_start = if (i + 1) < n {
-        d[i].max(d[i + 1])
-    } else {
-        d[i]
-    };
-    let d_min = (max_match_start - max_backoff_steps).max(step);
-
-    let mut prev_i = i_to_prev[i];
-    while prev_i > i32::MIN
-        && are_ibs2(
-            (a[i] >> 1) as u32,
-            (a[prev_i as usize] >> 1) as u32,
-            m_start,
-            m_incl_end,
-            ibs2_offsets,
-            ibs2_start,
-            ibs2_end,
-            ibs2_other,
-        )
-    {
-        prev_i = i_to_prev[prev_i as usize];
-    }
-    if prev_i > i32::MIN {
-        let prev_iu = prev_i as usize;
-        debug_assert!(prev_iu < i);
-        let mut u = i;
-        while u.saturating_sub(1) != prev_iu && d[u] >= d_min {
-            prev_match_incl_end = prev_match_incl_end.min(d[u]);
-            u -= 1;
-        }
-        if u.saturating_sub(1) == prev_iu && d[u] >= d_min {
-            prev_match_incl_end = prev_match_incl_end.min(d[u]);
-            best_prev_match = prev_i;
-        }
-    }
-
-    let mut next_i = i_to_next[i];
-    while next_i < i32::MAX
-        && are_ibs2(
-            (a[i] >> 1) as u32,
-            (a[next_i as usize] >> 1) as u32,
-            m_start,
-            m_incl_end,
-            ibs2_offsets,
-            ibs2_start,
-            ibs2_end,
-            ibs2_other,
-        )
-    {
-        next_i = i_to_next[next_i as usize];
-    }
-    if next_i < i32::MAX {
-        let next_iu = next_i as usize;
-        debug_assert!(i < next_iu);
-        let mut v = i;
-        while (v + 1) != next_iu && d[v + 1] >= d_min {
-            v += 1;
-            next_match_incl_end = next_match_incl_end.min(d[v]);
-        }
-        if (v + 1) == next_iu && d[v + 1] >= d_min {
-            v += 1;
-            next_match_incl_end = next_match_incl_end.min(d[v]);
-            best_next_match = next_i;
-        }
-    }
-
-    if prev_match_incl_end > next_match_incl_end && best_prev_match != -1 {
+    // Beagle's tie-breaker: prefer the prev side iff its bound is STRICTLY
+    // smaller (fwd) / larger (bwd) AND a match was found.
+    let prefer_prev = if FWD { prev_bound < next_bound } else { prev_bound > next_bound };
+    if prefer_prev && best_prev_match != -1 {
         best_prev_match
     } else {
         best_next_match
@@ -608,10 +510,10 @@ fn run_sweep_fwd(
         let mut selected = vec![-1i32; n_target_haps];
         for i in 0..n_haps {
             if prefix[i] < n_target_haps as i32 {
-                let best_i = best_fwd_stage2_index(
+                let best_i = best_stage2_index::<true>(
                     step as i32, m_start as i32, m_incl_end,
                     i, &prefix, &div, &i_to_prev, &i_to_next,
-                    max_backoff,
+                    max_backoff, (n_steps as i32) - 1,
                     input.ibs2_offsets, input.ibs2_start, input.ibs2_end, input.ibs2_other,
                 );
                 if best_i >= 0 {
@@ -691,7 +593,7 @@ fn run_sweep_bwd(
         let mut selected = vec![-1i32; n_target_haps];
         for i in 0..n_haps {
             if prefix[i] < n_target_haps as i32 {
-                let best_i = best_bwd_stage2_index(
+                let best_i = best_stage2_index::<false>(
                     step as i32, m_start as i32, m_incl_end,
                     i, &prefix, &div, &i_to_prev, &i_to_next,
                     max_backoff, (n_steps as i32) - 1,
