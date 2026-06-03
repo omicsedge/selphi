@@ -105,22 +105,6 @@ fn fast_parse_i32(bytes: &[u8]) -> i32 {
     if seen { n } else { -1 }
 }
 
-#[inline]
-fn fast_parse_i64(bytes: &[u8]) -> i64 {
-    let mut n: i64 = 0;
-    let mut seen = false;
-    for &b in bytes {
-        let d = b.wrapping_sub(b'0');
-        if d < 10 {
-            n = n * 10 + d as i64;
-            seen = true;
-        } else if !(b == b' ' || b == b'\t' || b == b'+') {
-            return -1;
-        }
-    }
-    if seen { n } else { -1 }
-}
-
 /// Parse a single PL byte-slice like `"0,15,180"` into a [pl00, pl01, pl11].
 /// Returns `None` for missing/malformed input.
 #[inline]
@@ -394,7 +378,7 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
 
         // CHROM/POS/REF/ALT
         let chrom_bytes = &line[..tabs[0]];
-        let pos = fast_parse_i64(&line[tabs[0]+1..tabs[1]]);
+        let pos = crate::io::target_io::fast_parse_i64(&line[tabs[0]+1..tabs[1]]);
         if pos < 1 { continue; }
         let ref_bytes = &line[tabs[2]+1..tabs[3]];
         let alt_field = &line[tabs[3]+1..tabs[4]];
