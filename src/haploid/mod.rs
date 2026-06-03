@@ -73,7 +73,7 @@ pub fn phase_panel(
     bp: &[i64], map_bp: &[i64], map_cm: &[f64],
     n_var: usize, n_samples: usize,
     seed: i64, n_threads: usize, max_windows: usize,
-) -> (Vec<u8>, Vec<f32>, Vec<(f32, usize, usize)>) {
+) -> (Vec<u8>, Vec<(f32, usize, usize)>) {
     let chip_cm: Vec<f64> = bp.iter().map(|&b| {
         crate::genmap::interpolate_cm_extrapolate(map_bp, map_cm, b)
     }).collect();
@@ -93,7 +93,7 @@ pub fn phase_genotypes(
     ref_bp: &[i64], map_bp: &[i64], map_cm: &[f64],
     n_var: usize, n_samples: usize, n_ref: usize,
     seed: i64, n_threads: usize, max_windows: usize,
-) -> (Vec<u8>, Vec<f32>, Vec<(f32, usize, usize)>) {
+) -> (Vec<u8>, Vec<(f32, usize, usize)>) {
     phase_genotypes_inner(target_geno, ref_bm, chip_cm, chip_bp,
         ref_bp, map_bp, map_cm, n_var, n_samples, n_ref,
         seed, n_threads, max_windows, N_BURNIN, N_PHASING)
@@ -107,7 +107,7 @@ fn phase_genotypes_inner(
     n_var: usize, n_samples: usize, n_ref: usize,
     seed: i64, n_threads: usize, max_windows: usize,
     n_burnin: usize, n_phasing: usize,
-) -> (Vec<u8>, Vec<f32>, Vec<(f32, usize, usize)>) {
+) -> (Vec<u8>, Vec<(f32, usize, usize)>) {
     rayon::ThreadPoolBuilder::new().num_threads(n_threads).build_global().ok();
     let t0 = Instant::now();
 
@@ -212,7 +212,6 @@ fn phase_genotypes_inner(
     // IBS2 restrictions are computed PER WINDOW (stage1Ibs2 per FixedPhaseData)
     // Global output arrays
     let mut global_phased = vec![0u8; n_var * n_targ_haps];
-    let mut global_confidence = vec![1.0f32; n_var * n_samples];
     // Per-window EM-estimated recombIntensity (0.04 * Ne / nHaps) + owned range
     let mut window_ri: Vec<(f32, usize, usize)> = Vec::with_capacity(n_windows);
 
@@ -300,7 +299,6 @@ fn phase_genotypes_inner(
 
         // Per-window working arrays
         let mut w_locked = vec![0u8; w_size * n_samples];
-        let mut w_confidence = vec![1.0f32; w_size * n_samples];
         // stores recombIntensity (f32) directly, not ne.
         // recombIntensity = 0.04f * ne / nHaps. Initial ne=100000.
         // `.max(1.0)` guards an empty cohort (n_haps_total=0) from producing
@@ -673,7 +671,7 @@ fn phase_genotypes_inner(
                     it_starts, it_step_size, it_min_steps, &w_locked, &w_resolved,
                     si, w_size, n_targ_haps, n_samples, it_n_steps,
                     0, own_start_local, own_end_local, m_all, w_size, N_MOSAIC,
-                    lr_f32, is_last, ri_f32, pm_f32, n_haps_total, w_bp,
+                    lr_f32, ri_f32, pm_f32, n_haps_total, w_bp,
                     it, wi))
             }).collect();
 
@@ -735,9 +733,6 @@ fn phase_genotypes_inner(
                 for &(vm, si) in &r.locks {
                     w_locked[vm * n_samples + si] = 1;
                 }
-                for &(vm, si, cv) in &r.confs {
-                    w_confidence[vm * n_samples + si] = cv;
-                }
             }
 
             // Debug: dump per-iteration phase (using window-local data)
@@ -787,7 +782,7 @@ fn phase_genotypes_inner(
         window_ri.push((ri_f32, ows, owe));
 
         // Copy ALL window results to global arrays (SamplePhase swaps apply to entire window).
-        // Owned region: authoritative phase + confidence.
+        // Owned region: authoritative phase.
         // Non-owned (overlap): needed by next window's SplicedGT for initial phase.
         for h in 0..n_targ_haps {
             let h_off = h * hap_byte_stride;
@@ -804,11 +799,6 @@ fn phase_genotypes_inner(
                 for k in 0..(w_size - rem_start) {
                     global_phased[(ws + rem_start + k) * n_targ_haps + h] = (byte >> k) & 1;
                 }
-            }
-        }
-        for m in own_start_local..own_end_local {
-            for s in 0..n_samples {
-                global_confidence[(ws + m) * n_samples + s] = w_confidence[m * n_samples + s];
             }
         }
         selphi_debug!("  [Rust] W{} complete: {:.1}s", wi+1, t0.elapsed().as_secs_f64());
@@ -839,5 +829,5 @@ fn phase_genotypes_inner(
         }
     }
 
-    (global_phased, global_confidence, window_ri)
+    (global_phased, window_ri)
 }

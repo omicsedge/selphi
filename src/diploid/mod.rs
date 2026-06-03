@@ -38,7 +38,7 @@ pub fn diploid_phase_panel(
     bp: &[i64], map_bp: &[i64], map_cm: &[f64],
     n_var: usize, n_samples: usize, seed: i64, n_threads: usize,
     max_cond_haps: usize,
-) -> (Vec<u8>, Vec<f32>, Vec<(f32, usize, usize)>) {
+) -> (Vec<u8>, Vec<(f32, usize, usize)>) {
     let seed = if seed == 33 { 15052011 } else { seed };
     let n_haps = n_samples * 2;
 
@@ -61,7 +61,7 @@ pub fn diploid_phase_panel(
         n_common, n_var, an);
     if common_indices.is_empty() {
         crate::selphi_info!("  WARNING: no common variants — returning input unphased");
-        return (cohort_geno.to_vec(), vec![1.0; n_var * n_samples], vec![]);
+        return (cohort_geno.to_vec(), vec![]);
     }
 
     // cM positions (full + common subset), baseline at first common variant.
@@ -104,7 +104,7 @@ pub fn diploid_phase_bm_prefiltered(
     _chip_cm: &[f64], chip_bp: &[i64], _ref_bp: &[i64], map_bp: &[i64], map_cm: &[f64],
     n_var: usize, n_samples: usize, n_ref: usize, seed: i64, n_threads: usize,
     max_cond_haps: usize,
-) -> (Vec<u8>, Vec<f32>, Vec<(f32, usize, usize)>) {
+) -> (Vec<u8>, Vec<(f32, usize, usize)>) {
     let seed = if seed == 33 { 15052011 } else { seed };
     let n_haps = n_samples * 2;
     let _n_haps_total = n_ref + n_haps;
@@ -154,7 +154,7 @@ fn _diploid_run(
     chip_bp: &[i64],
     n_var: usize, n_samples: usize, n_ref: usize, seed: i64, n_threads: usize,
     max_cond_haps: usize,
-) -> (Vec<u8>, Vec<f32>, Vec<(f32, usize, usize)>) {
+) -> (Vec<u8>, Vec<(f32, usize, usize)>) {
     use rayon::prelude::*;
     let seed = if seed == 33 { 15052011 } else { seed };
     let n_haps = n_samples * 2;
@@ -239,31 +239,10 @@ fn _diploid_run(
         n_var, n_samples, n_ref, 1, 15000.0, common_indices,
     );
 
-    // Confidence from Viterbi solve: ratio of best to total probability per segment.
-    // For each het site, confidence = P(chosen diplotype) / sum(P(all diplotypes))
-    let mut confidence = vec![1.0f32; n_var * n_samples];
-    for (si, graph) in graphs.iter().enumerate() {
-        // Extract per-segment confidence from stored Viterbi probabilities
-        if graph.prob_stored.is_empty() { continue; }
-        let mut var_offset = 0;
-        for s in 0..graph.n_segments {
-            let seg_len = graph.lengths[s] as usize;
-            let dc = graph.count_diplotypes(s);
-            // Confidence = 1/dc for uniform (worst case), 1.0 for certain
-            let conf = if dc > 1 { 1.0 - 1.0 / dc as f32 } else { 1.0 };
-            for v in var_offset..var_offset + seg_len {
-                if v < n_var {
-                    confidence[v * n_samples + si] = conf;
-                }
-            }
-            var_offset += seg_len;
-        }
-    }
-
     // EM-estimated Ne not returned as window_ri for now (diploid uses different HMM structure)
     let window_ri = vec![];
 
     crate::selphi_info!("  Phasing complete");
 
-    (phased, confidence, window_ri)
+    (phased, window_ri)
 }

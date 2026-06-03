@@ -379,7 +379,7 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
         Some(bm)
     } else { None };
 
-    let (phased, _confidence, window_ri) = match engine {
+    let (phased, window_ri) = match engine {
         ResolvedEngine::Diploid => {
             selphi_step!("Using Diploid phasing");
             // Common-MAF chip subset (MAF >= 0.001 on target). Diploid runs
