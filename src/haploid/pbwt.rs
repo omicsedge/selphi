@@ -113,6 +113,155 @@ pub fn compute_step_boundaries(cm: &[f64], step_scale: f64) -> (Vec<i32>, Vec<i3
     (starts, ends)
 }
 
+/// One PBWT divergence-array update step (counting-sort by allele code, with
+/// match-start/end divergence propagation). Shared by the forward and backward
+/// coded-IBS sweeps; `FWD` is a compile-time const so the direction-dependent
+/// comparison, reset sentinel, and p-array seeding are const-folded — the two
+/// monomorphizations are identical to the previous hand-written fwd/bwd copies.
+///
+/// Forward: divergence is a "match start" (propagated with `max`, reset to
+/// `i32::MIN`, p seeded `step+1`, sentinels `step+2`). Backward: "match end"
+/// (`min`, `i32::MAX`, `step-1`, `step-2`).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn pbwt_div_update_step<const FWD: bool>(
+    coded_vals: &[i32], n_alleles: usize, step: i32, m_total: usize,
+    a: &mut [i32], d: &mut [i32],
+    grp_a: &mut [i32], grp_d: &mut [i32],
+    grp_counts: &mut [i32], grp_offsets: &mut [i32], p_arr: &mut [i32],
+) {
+    for j in 0..n_alleles { grp_counts[j] = 0; }
+    for i in 0..m_total {
+        grp_counts[coded_vals[a[i] as usize] as usize] += 1;
+    }
+    let mut total = 0i32;
+    for j in 0..n_alleles {
+        grp_offsets[j] = total;
+        total += grp_counts[j];
+        grp_counts[j] = 0;
+    }
+    let p_init = if FWD { step + 1 } else { step - 1 };
+    for j in 0..n_alleles { p_arr[j] = p_init; }
+
+    // Divergence update: broadcast d[i] to all p_arr entries (unsafe for speed)
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let d_ptr = d.as_ptr();
+        let cv_ptr = coded_vals.as_ptr();
+        let ga_ptr = grp_a.as_mut_ptr();
+        let gd_ptr = grp_d.as_mut_ptr();
+        let gc_ptr = grp_counts.as_mut_ptr();
+        let go_ptr = grp_offsets.as_ptr();
+        let p_ptr = p_arr.as_mut_ptr();
+        for i in 0..m_total {
+            let ai = *a_ptr.add(i);
+            let al = *cv_ptr.add(ai as usize) as usize;
+            let di = *d_ptr.add(i);
+            for j in 0..n_alleles {
+                let pj = &mut *p_ptr.add(j);
+                let extend = if FWD { di > *pj } else { di < *pj };
+                if extend { *pj = di; }
+            }
+            let pos = (*go_ptr.add(al) + *gc_ptr.add(al)) as usize;
+            *ga_ptr.add(pos) = ai;
+            *gd_ptr.add(pos) = *p_ptr.add(al);
+            *gc_ptr.add(al) += 1;
+            *p_ptr.add(al) = if FWD { i32::MIN } else { i32::MAX };
+        }
+    }
+
+    a[..m_total].copy_from_slice(&grp_a[..m_total]);
+    d[..m_total].copy_from_slice(&grp_d[..m_total]);
+    let sentinel = if FWD { step + 2 } else { step - 2 };
+    d[0] = sentinel;
+    d[m_total] = sentinel;
+}
+
+/// Expand the PBWT match window `[u, v)` around prefix position `i` until it
+/// holds `nc` candidates or the divergence walk stops. `FWD` const-folds the
+/// stop condition and the max/min divergence accumulation (identical to the
+/// previous fwd/bwd hand-written loops).
+#[inline]
+fn expand_ibs_window<const FWD: bool>(
+    i: usize, d: &[i32], step: i32, m_total: usize, nc: usize,
+) -> (usize, usize) {
+    let mut u = i;
+    let mut v = i + 1;
+    let mut u_next = d[u];
+    let mut v_next = d[v];
+    while (v - u) < nc {
+        let stop = if FWD { u_next > step && v_next > step }
+                   else    { u_next < step && v_next < step };
+        if stop { break; }
+        let expand_v = if FWD { v_next <= u_next } else { u_next <= v_next };
+        if expand_v {
+            if v < m_total {
+                v += 1;
+                v_next = if FWD { d[v].max(v_next) } else { d[v].min(v_next) };
+            } else { break; }
+        } else if u > 0 {
+            u -= 1;
+            u_next = if FWD { d[u].max(u_next) } else { d[u].min(u_next) };
+        } else { break; }
+    }
+    (u, v)
+}
+
+/// Pick one IBS neighbour for target hap `t` from the PBWT window `[u, v)`,
+/// skipping self and IBS2-restricted siblings. Returns the candidate hap index
+/// (panel-relative) or -1 if none. Direction-agnostic — verbatim shared by the
+/// fwd and bwd sweeps.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn select_ibs_candidate(
+    u: usize, v: usize, i: usize, t: usize,
+    a: &[i32], rng: &mut JavaRandom,
+    n_targ: usize, n_ref: usize, targ_first: bool,
+    check_ibs2: bool, ms: usize, me: usize, marker_offset: usize,
+    ibs2_offsets: &[i32], ibs2_start: &[i32], ibs2_end: &[i32], ibs2_other: &[i32],
+) -> i32 {
+    let n = v - u;
+    if n <= 1 { return -1; }
+    let rand_val = rng.next_int(n as i32);
+    let start_off = rand_val as usize;
+    let t_sample = t / 2;
+    for j in 0..n {
+        let idx = u + (start_off + j) % n;
+        if idx == i { continue; }
+        let cand = a[idx] as usize;
+        // areIbs2: returns true for same-sample (always excluded) AND for
+        // IBS2 segment overlap. Check both.
+        let cand_is_targ = if targ_first { cand < n_targ } else { cand >= n_ref };
+        if cand_is_targ {
+            let cand_t = if targ_first { cand } else { cand - n_ref };
+            let cand_sample = cand_t / 2;
+            // Same-sample exclusion (areIbs2 returns true for s1==s2)
+            if cand_sample == t_sample { continue; }
+            // IBS2 segment restriction
+            if check_ibs2 {
+                let ms_g = ms + marker_offset;
+                let me_g = me + marker_offset;
+                let off_s = ibs2_offsets[t_sample] as usize;
+                let off_e = ibs2_offsets[t_sample + 1] as usize;
+                let mut forbidden = false;
+                for k in off_s..off_e {
+                    if ibs2_other[k] as usize == cand_sample {
+                        let rs = ibs2_start[k] as usize;
+                        let re = ibs2_end[k] as usize;
+                        if ms_g.max(rs) < me_g.min(re) {
+                            forbidden = true;
+                            break;
+                        }
+                    }
+                }
+                if forbidden { continue; }
+            }
+        }
+        return cand as i32;
+    }
+    -1
+}
+
 /// Forward PBWT batch with coded-step IBS extraction + IBS2 restrictions.
 ///
 /// Runs PBWT from `buffer_start` to `batch_end`, writing IBS results only
@@ -171,55 +320,10 @@ pub fn pbwt_coded_ibs_fwd_batch(
         let coded_vals = &precoded[step * m_total..(step + 1) * m_total];
         let n_alleles = pre_na[step];
 
-        // PbwtDivUpdater.fwdUpdate
-        for j in 0..n_alleles {
-            grp_counts[j] = 0;
-        }
-        for i in 0..m_total {
-            grp_counts[coded_vals[a[i] as usize] as usize] += 1;
-        }
-
-        let mut total = 0i32;
-        for j in 0..n_alleles {
-            grp_offsets[j] = total;
-            total += grp_counts[j];
-            grp_counts[j] = 0;
-        }
-
-        for j in 0..n_alleles {
-            p_arr[j] = step as i32 + 1;
-        }
-
-        // Divergence update: broadcast d[i] to all p_arr entries (unsafe for speed)
-        unsafe {
-            let a_ptr = a.as_ptr();
-            let d_ptr = d.as_ptr();
-            let cv_ptr = coded_vals.as_ptr();
-            let ga_ptr = grp_a.as_mut_ptr();
-            let gd_ptr = grp_d.as_mut_ptr();
-            let gc_ptr = grp_counts.as_mut_ptr();
-            let go_ptr = grp_offsets.as_ptr();
-            let p_ptr = p_arr.as_mut_ptr();
-            for i in 0..m_total {
-                let ai = *a_ptr.add(i);
-                let al = *cv_ptr.add(ai as usize) as usize;
-                let di = *d_ptr.add(i);
-                for j in 0..n_alleles {
-                    let pj = &mut *p_ptr.add(j);
-                    if di > *pj { *pj = di; }
-                }
-                let pos = (*go_ptr.add(al) + *gc_ptr.add(al)) as usize;
-                *ga_ptr.add(pos) = ai;
-                *gd_ptr.add(pos) = *p_ptr.add(al);
-                *gc_ptr.add(al) += 1;
-                *p_ptr.add(al) = i32::MIN;
-            }
-        }
-
-        a[..m_total].copy_from_slice(&grp_a[..m_total]);
-        d[..m_total].copy_from_slice(&grp_d[..m_total]);
-        d[0] = step as i32 + 2;
-        d[m_total] = step as i32 + 2;
+        pbwt_div_update_step::<true>(
+            coded_vals, n_alleles, step as i32, m_total,
+            &mut a, &mut d, &mut grp_a, &mut grp_d,
+            &mut grp_counts, &mut grp_offsets, &mut p_arr);
 
         // Only extract IBS for steps in [batch_start, batch_end)
         if step < batch_start {
@@ -244,73 +348,13 @@ pub fn pbwt_coded_ibs_fwd_batch(
             }
             let t = if targ_first { t_idx } else { t_idx - n_ref };
 
-            let mut u = i;
-            let mut v = i + 1;
-            let mut u_next = d[u];
-            let mut v_next = d[v];
-
-            while (v - u) < nc {
-                // fwd getfwdIbsHaps: continue while uStart<=step || vStart<=step
-                if u_next > step as i32 && v_next > step as i32 {
-                    break;
-                }
-                // if vNextMatchStart <= uNextMatchStart → expand v (right)
-                //         else → expand u (left)
-                if v_next <= u_next {
-                    if v < m_total { v_next = d[v + 1].max(v_next); v += 1; }
-                    else { break; }
-                } else {
-                    if u > 0 { u -= 1; u_next = d[u].max(u_next); }
-                    else { break; }
-                }
-            }
-
-            let n = v - u;
-            ibs_out[(step - batch_start) * n_targ + t] = -1;
-
-            if n > 1 {
-                let rand_val = rng.next_int(n as i32);
-                let start_off = rand_val as usize;
-                let t_sample = t / 2;
-
-                for j in 0..n {
-                    let idx = u + (start_off + j) % n;
-                    if idx == i {
-                        continue;
-                    }
-                    let cand = a[idx] as usize;
-                    // areIbs2: returns true for same-sample (always excluded)
-                    // AND for IBS2 segment overlap. Check both.
-                    let cand_is_targ = if targ_first { cand < n_targ } else { cand >= n_ref };
-                    if cand_is_targ {
-                        let cand_t = if targ_first { cand } else { cand - n_ref };
-                        let cand_sample = cand_t / 2;
-                        // Same-sample exclusion (areIbs2 returns true for s1==s2)
-                        if cand_sample == t_sample { continue; }
-                        // IBS2 segment restriction
-                        if check_ibs2 {
-                            let ms_g = ms + marker_offset;
-                            let me_g = me + marker_offset;
-                            let off_s = ibs2_offsets[t_sample] as usize;
-                            let off_e = ibs2_offsets[t_sample + 1] as usize;
-                            let mut forbidden = false;
-                            for k in off_s..off_e {
-                                if ibs2_other[k] as usize == cand_sample {
-                                    let rs = ibs2_start[k] as usize;
-                                    let re = ibs2_end[k] as usize;
-                                    if ms_g.max(rs) < me_g.min(re) {
-                                        forbidden = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if forbidden { continue; }
-                        }
-                    }
-                    ibs_out[(step - batch_start) * n_targ + t] = cand as i32;
-                    break;
-                }
-            }
+            let (u, v) = expand_ibs_window::<true>(i, &d, step as i32, m_total, nc);
+            ibs_out[(step - batch_start) * n_targ + t] = select_ibs_candidate(
+                u, v, i, t, &a, &mut rng,
+                n_targ, n_ref, targ_first,
+                check_ibs2, ms, me, marker_offset,
+                ibs2_offsets, ibs2_start, ibs2_end, ibs2_other,
+            );
         }
     }
     ibs_out
@@ -378,51 +422,10 @@ pub fn pbwt_coded_ibs_bwd_batch(
         let coded_vals = &precoded[step_i * m_total..(step_i + 1) * m_total];
         let n_alleles = pre_na[step_i];
 
-        // PbwtDivUpdater.bwdUpdate — MIN instead of MAX
-        for j in 0..n_alleles { grp_counts[j] = 0; }
-        for i in 0..m_total {
-            grp_counts[coded_vals[a[i] as usize] as usize] += 1;
-        }
-        let mut total = 0i32;
-        for j in 0..n_alleles {
-            grp_offsets[j] = total;
-            total += grp_counts[j];
-            grp_counts[j] = 0;
-        }
-
-        // Backward: p_arr initialized to step - 1
-        for j in 0..n_alleles { p_arr[j] = step_i as i32 - 1; }
-
-        unsafe {
-            let a_ptr = a.as_ptr();
-            let d_ptr = d.as_ptr();
-            let cv_ptr = coded_vals.as_ptr();
-            let ga_ptr = grp_a.as_mut_ptr();
-            let gd_ptr = grp_d.as_mut_ptr();
-            let gc_ptr = grp_counts.as_mut_ptr();
-            let go_ptr = grp_offsets.as_ptr();
-            let p_ptr = p_arr.as_mut_ptr();
-            for i in 0..m_total {
-                let ai = *a_ptr.add(i);
-                let al = *cv_ptr.add(ai as usize) as usize;
-                let di = *d_ptr.add(i);
-                for j in 0..n_alleles {
-                    let pj = &mut *p_ptr.add(j);
-                    if di < *pj { *pj = di; }
-                }
-                let pos = (*go_ptr.add(al) + *gc_ptr.add(al)) as usize;
-                *ga_ptr.add(pos) = ai;
-                *gd_ptr.add(pos) = *p_ptr.add(al);
-                *gc_ptr.add(al) += 1;
-                *p_ptr.add(al) = i32::MAX;
-            }
-        }
-
-        a[..m_total].copy_from_slice(&grp_a[..m_total]);
-        d[..m_total].copy_from_slice(&grp_d[..m_total]);
-        // Backward sentinels: step - 2
-        d[0] = step_i as i32 - 2;
-        d[m_total] = step_i as i32 - 2;
+        pbwt_div_update_step::<false>(
+            coded_vals, n_alleles, step_i as i32, m_total,
+            &mut a, &mut d, &mut grp_a, &mut grp_d,
+            &mut grp_counts, &mut grp_offsets, &mut p_arr);
 
         // Only extract IBS for steps in [batch_start, batch_end)
         if step_i >= batch_end || step_i < batch_start { continue; }
@@ -437,63 +440,13 @@ pub fn pbwt_coded_ibs_bwd_batch(
             if !is_target { continue; }
             let t = if targ_first { t_idx } else { t_idx - n_ref };
 
-            let mut u = i;
-            let mut v = i + 1;
-            let mut u_next = d[u];
-            let mut v_next = d[v];
-
-            // Backward window expansion (: sentinels d[0]=d[M]=step-2)
-            while (v - u) < nc {
-                if step_i as i32 > u_next && step_i as i32 > v_next { break; }
-                if u_next <= v_next {
-                    if v < m_total { v += 1; v_next = d[v].min(v_next); }
-                    else { break; }
-                } else {
-                    if u > 0 { u -= 1; u_next = d[u].min(u_next); }
-                    else { break; }
-                }
-            }
-
-            let n = v - u;
-            ibs_out[(step_i - batch_start) * n_targ + t] = -1;
-
-            if n > 1 {
-                let rand_val = rng.next_int(n as i32);
-                let start_off = rand_val as usize;
-                let t_sample = t / 2;
-
-                for j in 0..n {
-                    let idx = u + (start_off + j) % n;
-                    if idx == i { continue; }
-                    let cand = a[idx] as usize;
-                    // areIbs2: returns true for same-sample + IBS2 overlap
-                    let cand_is_targ = if targ_first { cand < n_targ } else { cand >= n_ref };
-                    if cand_is_targ {
-                        let cand_t = if targ_first { cand } else { cand - n_ref };
-                        let cand_sample = cand_t / 2;
-                        if cand_sample == t_sample { continue; }
-                        if check_ibs2 {
-                            let ms_g = ms + marker_offset;
-                            let me_g = me + marker_offset;
-                            let off_s = ibs2_offsets[t_sample] as usize;
-                            let off_e = ibs2_offsets[t_sample + 1] as usize;
-                            let mut forbidden = false;
-                            for k in off_s..off_e {
-                                if ibs2_other[k] as usize == cand_sample {
-                                    let rs = ibs2_start[k] as usize;
-                                    let re = ibs2_end[k] as usize;
-                                    if ms_g.max(rs) < me_g.min(re) {
-                                        forbidden = true; break;
-                                    }
-                                }
-                            }
-                            if forbidden { continue; }
-                        }
-                    }
-                    ibs_out[(step_i - batch_start) * n_targ + t] = cand as i32;
-                    break;
-                }
-            }
+            let (u, v) = expand_ibs_window::<false>(i, &d, step_i as i32, m_total, nc);
+            ibs_out[(step_i - batch_start) * n_targ + t] = select_ibs_candidate(
+                u, v, i, t, &a, &mut rng,
+                n_targ, n_ref, targ_first,
+                check_ibs2, ms, me, marker_offset,
+                ibs2_offsets, ibs2_start, ibs2_end, ibs2_other,
+            );
         }
     }
     ibs_out
