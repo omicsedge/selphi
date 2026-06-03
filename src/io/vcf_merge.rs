@@ -441,34 +441,32 @@ fn write_sample_gt_ds_ap(buf: &mut Vec<u8>, a: u8, b: u8, ap1: f32, ap2: f32) {
     write_ap_2dec(buf, ap2);
 }
 
-fn write_dosage_3dec(buf: &mut Vec<u8>, v: f32) {
+/// Format a fixed-point float into `buf`: scale by `scale`, round, clamp to
+/// [0, max_scaled], emit with up to `frac_width` fractional digits, trimming
+/// trailing zeros (and a bare trailing dot). Shared by the dosage (3-decimal,
+/// DS) and AP (2-decimal, AP1/AP2) VCF-merge writers, which differ only in the
+/// scale / clamp / width triple.
+fn write_scaled_float(buf: &mut Vec<u8>, v: f32, scale: i32, max_scaled: i32, frac_width: usize) {
     use std::io::Write;
-    let scaled = ((v * 1000.0).round() as i32).clamp(0, 2000);
-    let int_part = scaled / 1000;
-    let frac_part = scaled % 1000;
+    let scaled = ((v * scale as f32).round() as i32).clamp(0, max_scaled);
+    let int_part = scaled / scale;
+    let frac_part = scaled % scale;
     if frac_part == 0 {
         write!(buf, "{int_part}").unwrap();
     } else {
-        let mut s = format!("{int_part}.{:03}", frac_part);
+        let mut s = format!("{}.{:0width$}", int_part, frac_part, width = frac_width);
         while s.ends_with('0') { s.pop(); }
         if s.ends_with('.') { s.pop(); }
         buf.extend_from_slice(s.as_bytes());
     }
 }
 
+fn write_dosage_3dec(buf: &mut Vec<u8>, v: f32) {
+    write_scaled_float(buf, v, 1000, 2000, 3);
+}
+
 fn write_ap_2dec(buf: &mut Vec<u8>, v: f32) {
-    use std::io::Write;
-    let scaled = ((v * 100.0).round() as i32).clamp(0, 100);
-    let int_part = scaled / 100;
-    let frac_part = scaled % 100;
-    if frac_part == 0 {
-        write!(buf, "{int_part}").unwrap();
-    } else {
-        let mut s = format!("{int_part}.{:02}", frac_part);
-        while s.ends_with('0') { s.pop(); }
-        if s.ends_with('.') { s.pop(); }
-        buf.extend_from_slice(s.as_bytes());
-    }
+    write_scaled_float(buf, v, 100, 100, 2);
 }
 
 #[cfg(test)]
