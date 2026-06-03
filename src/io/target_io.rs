@@ -384,6 +384,56 @@ pub fn read_target_vcf(
 }
 
 // ---------------------------------------------------------------------------
+// Shared GT-only VCF.gz writer building blocks (header + per-record GT row),
+// used by both write_phased_vcf (chip sites vs a reference SRP) and
+// write_panel_vcf (de-novo panel phasing). The record loops differ in indexing
+// and the ID field, so only the header and the phased-GT row are shared.
+// ---------------------------------------------------------------------------
+
+/// Write the GT-only VCF header: fileformat, source (with `source_suffix`
+/// appended after the SelfDecode tag), FILTER=PASS, AF/AN/AC INFO, GT FORMAT,
+/// an optional contig line, and the `#CHROM ... FORMAT <samples...>` column row.
+fn write_gt_vcf_header<W: std::io::Write>(
+    w: &mut W,
+    source_suffix: &str,
+    contig: Option<&str>,
+    sample_names: &[String],
+) -> std::io::Result<()> {
+    writeln!(w, "##fileformat=VCFv4.2")?;
+    writeln!(w, "##source=Selphi_v{} SelfDecode\u{2122}{}", env!("CARGO_PKG_VERSION"), source_suffix)?;
+    writeln!(w, "##FILTER=<ID=PASS,Description=\"All filters passed\">")?;
+    writeln!(w, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">")?;
+    writeln!(w, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele Number\">")?;
+    writeln!(w, "##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Estimated Allele Count\">")?;
+    writeln!(w, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">")?;
+    if let Some(c) = contig { writeln!(w, "{}", c)?; }
+    write!(w, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
+    for name in sample_names { write!(w, "\t{}", name)?; }
+    writeln!(w)?;
+    Ok(())
+}
+
+/// Build the phased diploid GT string for one variant row (`row` = the variant's
+/// `n_haps` alleles) into `line_buf` (`a|b` per sample, tab-separated), returning
+/// the raw ALT allele count. When `clamp`, alleles are projected to biallelic
+/// 0/1 for the emitted GT (the AC still sums the raw alleles).
+fn build_phased_gt_row(line_buf: &mut String, row: &[u8], n_samples: usize, clamp: bool) -> u32 {
+    line_buf.clear();
+    let mut ac = 0u32;
+    for s in 0..n_samples {
+        let a0 = row[s * 2];
+        let a1 = row[s * 2 + 1];
+        ac += a0 as u32 + a1 as u32;
+        if s > 0 { line_buf.push('\t'); }
+        let (g0, g1) = if clamp { (a0.min(1), a1.min(1)) } else { (a0, a1) };
+        line_buf.push((b'0' + g0) as char);
+        line_buf.push('|');
+        line_buf.push((b'0' + g1) as char);
+    }
+    ac
+}
+
+// ---------------------------------------------------------------------------
 // write_phased_vcf
 // ---------------------------------------------------------------------------
 
@@ -409,34 +459,14 @@ pub fn write_phased_vcf(
         .build_from_writer(file);
     let mut w = BufWriter::with_capacity(4 << 20, bgzf);
 
-    writeln!(w, "##fileformat=VCFv4.2")?;
-    writeln!(w, "##source=Selphi_v{} SelfDecode\u{2122}", env!("CARGO_PKG_VERSION"))?;
-    writeln!(w, "##FILTER=<ID=PASS,Description=\"All filters passed\">")?;
-    writeln!(w, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">")?;
-    writeln!(w, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele Number\">")?;
-    writeln!(w, "##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Estimated Allele Count\">")?;
-    writeln!(w, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">")?;
-    writeln!(w, "{}", srp.metadata.contig_field)?;
-    write!(w, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
-    for name in sample_names { write!(w, "\t{}", name)?; }
-    writeln!(w)?;
+    write_gt_vcf_header(&mut w, "", Some(srp.metadata.contig_field.as_str()), sample_names)?;
 
     let mut line_buf = String::with_capacity(n_samples * 6);
     for ci in 0..n_chip {
         let ti = target_idx[ci];
         let tm = &target_markers[ti];
-
-        let mut ac = 0u32;
-        line_buf.clear();
-        for s in 0..n_samples {
-            let a0 = phased[ci * n_haps + s * 2];
-            let a1 = phased[ci * n_haps + s * 2 + 1];
-            ac += a0 as u32 + a1 as u32;
-            if s > 0 { line_buf.push('\t'); }
-            line_buf.push((b'0' + a0) as char);
-            line_buf.push('|');
-            line_buf.push((b'0' + a1) as char);
-        }
+        let row = &phased[ci * n_haps..ci * n_haps + n_haps];
+        let ac = build_phased_gt_row(&mut line_buf, row, n_samples, false);
         let af = ac as f64 / n_haps as f64;
         writeln!(w, "{}\t{}\t.\t{}\t{}\t.\tPASS\tAF={:.4};AC={};AN={}\tGT\t{}",
             tm.chrom, tm.pos, tm.ref_allele, tm.alt_allele, af, ac, n_haps, line_buf)?;
@@ -473,34 +503,14 @@ pub fn write_panel_vcf(
         .build_from_writer(file);
     let mut w = BufWriter::with_capacity(4 << 20, bgzf);
 
-    writeln!(w, "##fileformat=VCFv4.2")?;
-    writeln!(w, "##source=Selphi_v{} SelfDecode\u{2122} (panel-phasing)", env!("CARGO_PKG_VERSION"))?;
-    writeln!(w, "##FILTER=<ID=PASS,Description=\"All filters passed\">")?;
-    writeln!(w, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">")?;
-    writeln!(w, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele Number\">")?;
-    writeln!(w, "##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Estimated Allele Count\">")?;
-    writeln!(w, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">")?;
-    if let Some(m0) = markers.first() {
-        writeln!(w, "##contig=<ID={}>", m0.chrom)?;
-    }
-    write!(w, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
-    for name in sample_names { write!(w, "\t{}", name)?; }
-    writeln!(w)?;
+    let contig = markers.first().map(|m0| format!("##contig=<ID={}>", m0.chrom));
+    write_gt_vcf_header(&mut w, " (panel-phasing)", contig.as_deref(), sample_names)?;
 
     let mut line_buf = String::with_capacity(n_samples * 4);
     for v in 0..n_var {
         let m = &markers[v];
-        let mut ac = 0u32;
-        line_buf.clear();
-        for s in 0..n_samples {
-            let a0 = phased[v * n_haps + s * 2];
-            let a1 = phased[v * n_haps + s * 2 + 1];
-            ac += a0 as u32 + a1 as u32;
-            if s > 0 { line_buf.push('\t'); }
-            line_buf.push((b'0' + a0.min(1)) as char);
-            line_buf.push('|');
-            line_buf.push((b'0' + a1.min(1)) as char);
-        }
+        let row = &phased[v * n_haps..v * n_haps + n_haps];
+        let ac = build_phased_gt_row(&mut line_buf, row, n_samples, true);
         let af = ac as f64 / n_haps as f64;
         let id = if m.id.is_empty() { "." } else { m.id.as_str() };
         writeln!(w, "{}\t{}\t{}\t{}\t{}\t.\tPASS\tAF={:.4};AC={};AN={}\tGT\t{}",
