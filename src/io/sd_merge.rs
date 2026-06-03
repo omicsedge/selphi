@@ -23,7 +23,11 @@ pub fn merge_batch_sds(batch_paths: &[PathBuf], output_path: &Path) -> std::io::
     let out_file = std::fs::File::create(&final_path)?;
     let mut zw = ZipWriter::new(out_file);
     let options = SimpleFileOptions::default()
-        .compression_method(CompressionMethod::Stored); // parquet entries are already compressed
+        .compression_method(CompressionMethod::Stored) // parquet entries are already compressed
+        // Fixed entry timestamp (ZIP epoch) → bit-identical merged archive across
+        // runs (entries are re-stamped here, so the per-batch intermediates' times
+        // do not leak into the final output).
+        .last_modified_time(zip::DateTime::default());
 
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024 * 1024);
     for path in batch_paths {

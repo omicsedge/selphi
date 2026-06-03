@@ -297,7 +297,11 @@ impl SelfdecodeWriter {
         if parquet_bytes.is_empty() { return Ok(()); }
 
         let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored); // parquet already compressed
+            .compression_method(zip::CompressionMethod::Stored) // parquet already compressed
+            // Fixed entry timestamp (ZIP epoch) so the archive is bit-identical
+            // across runs — otherwise the per-entry mod-time defaults to now(),
+            // breaking Selphi's deterministic-output guarantee for this format.
+            .last_modified_time(zip::DateTime::default());
         self.zip.start_file(&path, options)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         self.zip.write_all(&parquet_bytes)?;
