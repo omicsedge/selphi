@@ -521,7 +521,7 @@ fn run_sweep_fwd(
                     carrier_hit += 1;
                 } else {
                     fallback += 1;
-                    let (u, v) = expand_window_fwd(i, &div, step as i32, n_haps, n_candidates);
+                    let (u, v) = expand_window::<true>(i, &div, step as i32, n_haps, n_candidates);
                     let m = get_match(
                         m_start as i32, m_incl_end, i, u, v, &prefix, &mut rng,
                         input.ibs2_offsets, input.ibs2_start, input.ibs2_end, input.ibs2_other,
@@ -602,7 +602,7 @@ fn run_sweep_bwd(
                 if best_i >= 0 {
                     selected[prefix[i] as usize] = prefix[best_i as usize];
                 } else {
-                    let (u, v) = expand_window_bwd(i, &div, step as i32, n_haps, n_candidates);
+                    let (u, v) = expand_window::<false>(i, &div, step as i32, n_haps, n_candidates);
                     selected[prefix[i] as usize] = get_match(
                         m_start as i32, m_incl_end, i, u, v, &prefix, &mut rng,
                         input.ibs2_offsets, input.ibs2_start, input.ibs2_end, input.ibs2_other,
@@ -673,69 +673,49 @@ fn collect_step_carriers(input: &Stage2Input, stage1_start: usize, stage1_end_ex
     out
 }
 
-/// Walk PBWT positions outward from `i` until window has ≥ n_candidates haps
-/// or both sides have exhausted matches reaching `step`.
+/// Walk PBWT positions outward from `i` until the window holds ≥ n_candidates
+/// haps or both sides have exhausted matches reaching `step` — the random
+/// fallback window for `get_match`.
 ///
 /// Closer to Beagle's logic: instead of `break`ing when an edge is hit, we
-/// kill that side's `next_end` so the loop can keep expanding the other
-/// side. Otherwise an early v- or u-edge prematurely truncates the window
-/// and produces 1-hap windows that `get_match` reports as -1.
-/// Forward expand: fwd PBWT divergence stores "match start marker" — small = long match.
-/// We track the MAX (worst / latest match-start) on each side; loop while at least one
-/// side still has match-start ≤ step. Literal port of Beagle `LowFreqPbwtPhaseIbs.getfwdIbsHaps`.
-fn expand_window_fwd(i: usize, d: &[i32], step: i32, n_haps: usize, n_candidates: usize) -> (usize, usize) {
+/// kill that side's match value so the loop can keep expanding the other side.
+/// Otherwise an early v- or u-edge prematurely truncates the window and
+/// produces 1-hap windows that `get_match` reports as -1.
+///
+/// `FWD` const-folds the divergence direction so the two monomorphizations
+/// match the previous get{fwd,bwd}IbsHaps bodies:
+/// - forward: divergence is a "match start" (small = long match); a side stays
+///   open while its value ≤ step, accumulates with `max`, exhausts to i32::MAX;
+/// - backward: divergence is a "match end" (large = long match); open while
+///   value ≥ step, accumulates with `min`, exhausts to i32::MIN.
+///
+/// Literal port of Beagle `LowFreqPbwtPhaseIbs.get{fwd,bwd}IbsHaps`.
+#[inline]
+fn expand_window<const FWD: bool>(
+    i: usize, d: &[i32], step: i32, n_haps: usize, n_candidates: usize,
+) -> (usize, usize) {
+    let exh = if FWD { i32::MAX } else { i32::MIN }; // exhausted-side sentinel
+    let open = |x: i32| if FWD { x <= step } else { x >= step };
     let mut u = i;
     let mut v = i + 1;
     let n_words = d.len(); // = n_haps + 1 (incl. sentinel at d[n_haps])
-    let mut u_next_match_start = d[u];
-    let mut v_next_match_start = if v < n_words { d[v] } else { i32::MAX };
-    while (v - u) < n_candidates && (u_next_match_start <= step || v_next_match_start <= step) {
-        if v_next_match_start <= u_next_match_start {
-            // v-side is doing better (more recent matches) — extend v.
+    let mut u_next = d[u];
+    let mut v_next = if v < n_words { d[v] } else { exh };
+    while (v - u) < n_candidates && (open(u_next) || open(v_next)) {
+        let extend_v = if FWD { v_next <= u_next } else { u_next <= v_next };
+        if extend_v {
+            // v-side is doing better (longer match) — extend v.
             if v + 1 < n_words {
                 v += 1;
-                v_next_match_start = d[v].max(v_next_match_start);
+                v_next = if FWD { d[v].max(v_next) } else { d[v].min(v_next) };
             } else {
-                v_next_match_start = i32::MAX; // exhausted
+                v_next = exh; // exhausted
             }
+        } else if u > 0 {
+            u -= 1;
+            u_next = if FWD { d[u].max(u_next) } else { d[u].min(u_next) };
         } else {
-            if u > 0 {
-                u -= 1;
-                u_next_match_start = d[u].max(u_next_match_start);
-            } else {
-                u_next_match_start = i32::MAX; // exhausted
-            }
-        }
-        if v > n_haps { v = n_haps; break; }
-    }
-    (u, v)
-}
-
-/// Backward expand: bwd PBWT divergence stores "match end marker" — large = long match.
-/// We track the MIN (worst / earliest match-end) on each side; loop while at least one
-/// side still has match-end ≥ step. Literal port of Beagle `LowFreqPbwtPhaseIbs.getbwdIbsHaps`.
-fn expand_window_bwd(i: usize, d: &[i32], step: i32, n_haps: usize, n_candidates: usize) -> (usize, usize) {
-    let mut u = i;
-    let mut v = i + 1;
-    let n_words = d.len();
-    let mut u_next_match_end = d[u];
-    let mut v_next_match_end = if v < n_words { d[v] } else { i32::MIN };
-    while (v - u) < n_candidates && (step <= u_next_match_end || step <= v_next_match_end) {
-        if u_next_match_end <= v_next_match_end {
-            // v-side is doing better (later end / longer match) — extend v.
-            if v + 1 < n_words {
-                v += 1;
-                v_next_match_end = d[v].min(v_next_match_end);
-            } else {
-                v_next_match_end = i32::MIN;
-            }
-        } else {
-            if u > 0 {
-                u -= 1;
-                u_next_match_end = d[u].min(u_next_match_end);
-            } else {
-                u_next_match_end = i32::MIN;
-            }
+            u_next = exh; // exhausted
         }
         if v > n_haps { v = n_haps; break; }
     }
