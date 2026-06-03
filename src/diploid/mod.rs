@@ -18,7 +18,6 @@ pub mod sampling;
 pub mod pruning;
 pub mod phase_common;
 pub mod pedigree;
-pub mod hmm_scaffold;
 pub mod phase_rare;
 
 /// De-novo PANEL phasing: phase an unphased cohort using the cohort itself

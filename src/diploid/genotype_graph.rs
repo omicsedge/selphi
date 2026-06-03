@@ -121,8 +121,6 @@ pub struct GenotypeGraph {
     pub n_missing: usize,
     /// Number of transitions between segments.
     pub n_transitions: usize,
-    /// Whether f64 precision is needed (underflow recovery).
-    pub double_precision: bool,
 
     /// Packed variant data: 4 bits per variant (2 variants per byte).
     pub variants: Vec<u8>,
@@ -156,7 +154,6 @@ impl GenotypeGraph {
             n_ambiguous: 0,
             n_missing: 0,
             n_transitions: 0,
-            double_precision: false,
             variants: vec![0u8; n_variants.div_ceil(2)],
             ambiguous: Vec::new(),
             diplotypes: Vec::new(),

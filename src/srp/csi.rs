@@ -19,8 +19,6 @@ pub struct CsiIndex {
     pub n_mapped: u64,
     /// Which reference sequence index was selected (for multi-contig filtering).
     pub ref_seq_id: usize,
-    /// Total number of reference sequences in the index.
-    pub n_ref: usize,
 }
 
 /// Decompress CSI file and parse header. Returns (data, min_shift, depth, n_ref, offset_after_header).
@@ -155,7 +153,6 @@ pub fn parse_csi(path: &Path) -> io::Result<CsiIndex> {
         first_offset: best_first_offset,
         n_mapped: best_n_mapped,
         ref_seq_id: best_ref,
-        n_ref,
     })
 }
 

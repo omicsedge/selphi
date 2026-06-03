@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::*;
-use arrow::datatypes::Schema;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
@@ -185,6 +184,5 @@ pub fn merge_batch_parquets(
     }
 
     writer.close().map_err(|e| std::io::Error::other(format!("close: {e}")))?;
-    let _ = &schema as &Schema;
     Ok(())
 }

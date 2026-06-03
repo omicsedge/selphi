@@ -651,8 +651,8 @@ unsafe fn run_fb_avx512(
 /// GLIMPSE2-style scaffold HMM: run forward-backward ONLY on the common
 /// (scaffold) sites, then impute ALL sites (common + rare) by interpolating
 /// the per-state posterior between flanking scaffold sites. This is the same
-/// design as `diploid::hmm_scaffold` and the Beagle stage-2 port
-/// (`haploid::stage2`), adapted to GL-weighted emissions.
+/// design as the Beagle stage-2 port (`haploid::stage2`), adapted to
+/// GL-weighted emissions.
 ///
 /// Why this helps rare variants: the PBWT/HMM scaffold stays on well-typed
 /// common sites (clean conditioning, no dilution from flat-GL rare sites),

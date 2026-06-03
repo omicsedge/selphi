@@ -353,45 +353,6 @@ pub fn finish_vcf_writer(
     Ok(())
 }
 
-/// Native BGZF block concatenation: joins multiple BGZF files into one.
-/// Strips trailing EOF blocks from each input, appends a single final EOF.
-/// No decompression/recompression — pure byte-level copy.
-pub fn concat_bgzf(inputs: &[std::path::PathBuf], output: &Path) -> std::io::Result<()> {
-    use std::io::BufWriter;
-
-    // Standard BGZF EOF block (28 bytes)
-    const EOF_BLOCK: [u8; 28] = [
-        0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00,
-        0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00,
-    ];
-
-    if inputs.len() == 1 {
-        // Single file: just rename/copy
-        std::fs::copy(&inputs[0], output)?;
-        return Ok(());
-    }
-
-    let out = std::fs::File::create(output)?;
-    let mut w = BufWriter::with_capacity(4 << 20, out);
-
-    for input in inputs {
-        let data = std::fs::read(input)?;
-        // Strip trailing EOF block if present
-        if data.len() >= 28 && data[data.len()-28..] == EOF_BLOCK {
-            w.write_all(&data[..data.len()-28])?;
-        } else {
-            w.write_all(&data)?;
-        }
-    }
-
-    // Write final EOF block
-    w.write_all(&EOF_BLOCK)?;
-    w.flush()?;
-    Ok(())
-}
-
 /// Batch-format a tile of imputed variants using parallel chunked formatting.
 /// Splits the tile into coarse chunks (one per core) to avoid fine-grained
 /// rayon overhead while still parallelizing the memory-bound LUT+copy work.
@@ -596,8 +557,6 @@ pub fn setup_bcf_writer(
         .set_worker_count(std::num::NonZeroUsize::new(bgzip_threads).unwrap())
         .build_from_writer(out_file);
 
-    // CSI index path (built inline during write)
-    let _csi_path = bcf_path.with_extension("bcf.csi");
     let bcf_path_clone = bcf_path.clone();
 
     // Channel buffer sized adaptively: at biobank scale each VCF tile is ~300 MB

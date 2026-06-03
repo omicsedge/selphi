@@ -26,10 +26,6 @@ pub struct CscMatchMatrix {
 }
 
 impl CscMatchMatrix {
-    pub fn nnz(&self) -> usize {
-        self.indices.len()
-    }
-
     pub fn empty(n_rows: usize, n_cols: usize) -> Self {
         CscMatchMatrix {
             indptr: vec![0i32; n_cols + 1],
