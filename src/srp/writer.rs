@@ -300,6 +300,32 @@ const SRP_SINGLE_CHR_MAGIC: &[u8; 8] = b"SRP\x00\x02\x00\x00\x00";
 
 /// Build unified SRP file from BCF source.
 /// Produces a SINGLE .srp file containing metadata, variants, chunks, and tiles.
+/// Scatter one parsed chunk's set bits into the per-stripe tile-column map
+/// `active` (creating empty stripe entries on demand); `var_offset` is the
+/// chunk's global first-variant row. Verbatim inner loop shared by
+/// build_srp_unified and build_multi_chr_srp — their differing flush/progress
+/// orchestration stays in the callers.
+#[inline]
+pub(crate) fn scatter_chunk_into_active(
+    chunk: &super::CscChunk,
+    var_offset: usize,
+    n_haps: usize,
+    active: &mut std::collections::BTreeMap<usize, Vec<Vec<u16>>>,
+) {
+    for gc in 0..chunk.n_cols.min(n_haps) {
+        let lo = chunk.indptr[gc] as usize;
+        let hi = chunk.indptr[gc + 1] as usize;
+        for k in lo..hi {
+            let global_row = var_offset + chunk.indices[k] as usize;
+            let stripe = global_row / super::TILE_ROWS;
+            let local_row = (global_row % super::TILE_ROWS) as u16;
+            active.entry(stripe)
+                .or_insert_with(|| (0..n_haps).map(|_| Vec::new()).collect())[gc]
+                .push(local_row);
+        }
+    }
+}
+
 pub fn build_srp_unified(
     source_path: &Path,
     output_path: &Path,
@@ -420,19 +446,7 @@ pub fn build_srp_unified(
         let last_stripe = if chunk_end > 0 { (chunk_end - 1) / super::TILE_ROWS } else { 0 };
 
         // Scatter: for each column, filter rows by stripe
-        for gc in 0..chunk.n_cols.min(n_haps) {
-            let lo = chunk.indptr[gc] as usize;
-            let hi = chunk.indptr[gc + 1] as usize;
-            for k in lo..hi {
-                let row_in_chunk = chunk.indices[k] as usize;
-                let global_row = var_offset + row_in_chunk;
-                let stripe = global_row / super::TILE_ROWS;
-                let local_row = (global_row % super::TILE_ROWS) as u16;
-                let entry = active.entry(stripe)
-                    .or_insert_with(|| (0..n_haps).map(|_| Vec::new()).collect());
-                entry[gc].push(local_row);
-            }
-        }
+        scatter_chunk_into_active(&chunk, var_offset, n_haps, &mut active);
         var_offset = chunk_end;
 
         // Flush stripes that are complete (no future chunk will touch them)

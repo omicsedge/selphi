@@ -236,19 +236,7 @@ pub fn build_multi_chr_srp(
             drop(compressed);
             let chunk_end = var_offset + chunk.n_rows;
 
-            for gc in 0..chunk.n_cols.min(n_haps) {
-                let lo = chunk.indptr[gc] as usize;
-                let hi = chunk.indptr[gc + 1] as usize;
-                for k in lo..hi {
-                    let row_in_chunk = chunk.indices[k] as usize;
-                    let global_row = var_offset + row_in_chunk;
-                    let stripe = global_row / TILE_ROWS;
-                    let local_row = (global_row % TILE_ROWS) as u16;
-                    let entry = active.entry(stripe)
-                        .or_insert_with(|| (0..n_haps).map(|_| Vec::new()).collect());
-                    entry[gc].push(local_row);
-                }
-            }
+            super::writer::scatter_chunk_into_active(&chunk, var_offset, n_haps, &mut active);
             var_offset = chunk_end;
 
             let next_first_stripe = if ci + 1 < total_chunks {
