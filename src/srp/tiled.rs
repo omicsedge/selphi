@@ -270,3 +270,54 @@ impl TiledSrpReader {
         crate::common::HaplotypeBitmatrix::from_raw(bits, n_chip, n_haps)
     }
 }
+
+/// Compress one batch of pending stripes into `(stripe_id, band, zstd_bytes)`,
+/// sorted by `(stripe_id, band)` for deterministic on-disk tile order.
+///
+/// `pending` is a list of `(stripe_id, stripe_columns)` where `stripe_columns[gc]`
+/// is the (already row-local) sorted indices for global column `gc`. Each stripe
+/// is split into `n_tile_cols` bands of `TILE_COLS` columns; the band's
+/// `SparseTile` is built and zstd-3 compressed in parallel. Shared by the
+/// single-chr `StreamingTileWriter` flush and the multi-chr `flush_tiles` so the
+/// tile-compression path has exactly one definition.
+pub fn compress_pending_tiles(
+    pending: &[(usize, Vec<Vec<u16>>)],
+    n_haps: usize,
+    n_variants: usize,
+    n_tile_cols: usize,
+) -> Vec<(usize, usize, Vec<u8>)> {
+    use std::io::Cursor;
+    // Build the (batch_idx, stripe_id, band) task list.
+    let mut tasks: Vec<(usize, usize, usize)> = Vec::new();
+    for (i, (stripe_id, _)) in pending.iter().enumerate() {
+        for band in 0..n_tile_cols {
+            tasks.push((i, *stripe_id, band));
+        }
+    }
+    // Compress all tiles in parallel; collect preserves task order.
+    let mut results: Vec<(usize, usize, Vec<u8>)> = tasks.into_par_iter().map(|(batch_idx, stripe_id, band)| {
+        let stripe_cols = &pending[batch_idx].1;
+        let svs = stripe_id * TILE_ROWS;
+        let n_rows = (TILE_ROWS.min(n_variants - svs)) as u16;
+        let col_start = band * TILE_COLS;
+        let col_end = (col_start + TILE_COLS).min(n_haps);
+        let n_cols = col_end - col_start;
+
+        let mut indptr = Vec::with_capacity(n_cols + 1);
+        let mut indices = Vec::new();
+        indptr.push(0u32);
+        for lc in 0..n_cols {
+            let gc = col_start + lc;
+            if gc < stripe_cols.len() {
+                indices.extend_from_slice(&stripe_cols[gc]);
+            }
+            indptr.push(indices.len() as u32);
+        }
+        let tile = SparseTile { indptr, indices, n_rows, n_cols: n_cols as u16 };
+        let compressed = zstd::encode_all(Cursor::new(&tile.to_bytes()), 3).unwrap();
+        (stripe_id, band, compressed)
+    }).collect();
+    // File order = (stripe_id, band).
+    results.sort_by_key(|&(s, b, _)| (s, b));
+    results
+}
