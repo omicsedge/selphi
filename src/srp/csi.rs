@@ -390,6 +390,114 @@ fn reg2bin(beg: i64, end: i64, min_shift: i32, depth: i32) -> u32 {
     0 // root bin
 }
 
+// ---------------------------------------------------------------------------
+// Shared CSI/TBI serialization primitives.
+//
+// CSI and TBI diverge (CSI carries a per-bin loffset + a depth-derived
+// pseudo-bin and no linear index; TBI has the fixed pseudo-bin 37450 + a linear
+// index and no per-bin loffset), so these stay as separate leaf emitters rather
+// than one merged writer — but the byte layout of every atom now lives in one
+// place, shared by the post-hoc builders (build_csi_index / build_tbi_index /
+// build_tbi_index_with_meta) and the streaming InlineIndexBuilder. The
+// pseudo-bin is just a regular bin whose chunks encode the metadata pair
+// [(0, 0), (n_mapped, 0)].
+// ---------------------------------------------------------------------------
+
+/// CSI pseudo-bin id for a given index depth (htslib `bin_limit` + 1).
+#[inline]
+fn csi_pseudo_bin_id(depth: i32) -> u32 {
+    (((1u64 << ((depth as u64 + 1) * 3)) - 1) / 7 + 1) as u32
+}
+
+/// Emit `n_chunk` (i32) followed by each chunk's (beg, end) virtual-offset pair.
+#[inline]
+fn write_chunks(out: &mut Vec<u8>, chunks: &[(u64, u64)]) {
+    out.extend_from_slice(&(chunks.len() as i32).to_le_bytes());
+    for &(beg, end) in chunks {
+        out.extend_from_slice(&beg.to_le_bytes());
+        out.extend_from_slice(&end.to_le_bytes());
+    }
+}
+
+/// Emit one CSI bin: bin_id (u32) + loffset (u64) + chunks. Also used for the
+/// CSI pseudo-bin via `write_csi_pseudo_bin`.
+#[inline]
+fn write_csi_bin(out: &mut Vec<u8>, bin_id: u32, loffset: u64, chunks: &[(u64, u64)]) {
+    out.extend_from_slice(&bin_id.to_le_bytes());
+    out.extend_from_slice(&loffset.to_le_bytes());
+    write_chunks(out, chunks);
+}
+
+/// Emit one TBI bin: bin_id (u32) + chunks. Also used for the TBI pseudo-bin
+/// via `write_tbi_pseudo_bin`.
+#[inline]
+fn write_tbi_bin(out: &mut Vec<u8>, bin_id: u32, chunks: &[(u64, u64)]) {
+    out.extend_from_slice(&bin_id.to_le_bytes());
+    write_chunks(out, chunks);
+}
+
+/// CSI metadata pseudo-bin: id from `csi_pseudo_bin_id`, loffset 0, chunks
+/// [(0,0), (n_mapped, 0)].
+#[inline]
+fn write_csi_pseudo_bin(out: &mut Vec<u8>, depth: i32, n_mapped: u64) {
+    write_csi_bin(out, csi_pseudo_bin_id(depth), 0, &[(0, 0), (n_mapped, 0)]);
+}
+
+/// TBI metadata pseudo-bin: id 37450, chunks [(0,0), (n_mapped, 0)].
+#[inline]
+fn write_tbi_pseudo_bin(out: &mut Vec<u8>, n_mapped: u64) {
+    write_tbi_bin(out, 37450, &[(0, 0), (n_mapped, 0)]);
+}
+
+/// CSI file header: magic + min_shift + depth + l_aux(0) + n_ref.
+#[inline]
+fn write_csi_header(out: &mut Vec<u8>, n_ref: i32) {
+    out.extend_from_slice(b"CSI\x01");
+    out.extend_from_slice(&DEFAULT_MIN_SHIFT.to_le_bytes());
+    out.extend_from_slice(&CSI_DEPTH.to_le_bytes());
+    out.extend_from_slice(&0i32.to_le_bytes()); // l_aux = 0
+    out.extend_from_slice(&n_ref.to_le_bytes());
+}
+
+/// TBI file header: magic + n_ref + the VCF column spec + null-joined names.
+#[inline]
+fn write_tbi_header(out: &mut Vec<u8>, n_ref: i32, contig_names: &[String]) {
+    out.extend_from_slice(b"TBI\x01");
+    out.extend_from_slice(&n_ref.to_le_bytes());
+    out.extend_from_slice(&2i32.to_le_bytes());  // format = VCF
+    out.extend_from_slice(&1i32.to_le_bytes());  // col_seq = 1 (CHROM)
+    out.extend_from_slice(&2i32.to_le_bytes());  // col_beg = 2 (POS)
+    out.extend_from_slice(&0i32.to_le_bytes());  // col_end = 0 (none for VCF)
+    out.extend_from_slice(&35i32.to_le_bytes()); // meta = '#'
+    out.extend_from_slice(&0i32.to_le_bytes());  // skip = 0
+    let mut names_buf = Vec::new();
+    for name in contig_names {
+        names_buf.extend_from_slice(name.as_bytes());
+        names_buf.push(0);
+    }
+    out.extend_from_slice(&(names_buf.len() as i32).to_le_bytes());
+    out.extend_from_slice(&names_buf);
+}
+
+/// TBI linear index for one reference: fill zero gaps forward, then emit
+/// n_intv (i32) + each 16 kb-window's minimum virtual offset (u64).
+/// `None` → just n_intv = 0.
+#[inline]
+fn write_tbi_linear(out: &mut Vec<u8>, lin: Option<&Vec<u64>>) {
+    if let Some(lin) = lin {
+        let mut filled = lin.clone();
+        for i in 1..filled.len() {
+            if filled[i] == 0 { filled[i] = filled[i - 1]; }
+        }
+        out.extend_from_slice(&(filled.len() as i32).to_le_bytes());
+        for &offset in &filled {
+            out.extend_from_slice(&offset.to_le_bytes());
+        }
+    } else {
+        out.extend_from_slice(&0i32.to_le_bytes());
+    }
+}
+
 /// Build a CSI index for a BCF file by scanning all records.
 /// Writes the .csi file next to the BCF.
 pub fn build_csi_index(bcf_path: &Path) -> io::Result<()> {
@@ -494,54 +602,25 @@ pub fn build_csi_index(bcf_path: &Path) -> io::Result<()> {
     }
 
     // Write CSI file
-    let min_shift = DEFAULT_MIN_SHIFT;
     let depth = CSI_DEPTH;
     let n_ref = n_contigs.max(ref_bins.keys().map(|&k| k as usize + 1).max().unwrap_or(0));
 
     let mut out = Vec::with_capacity(64 * 1024);
-
-    // Header
-    out.extend_from_slice(b"CSI\x01");
-    out.extend_from_slice(&min_shift.to_le_bytes());
-    out.extend_from_slice(&depth.to_le_bytes());
-    out.extend_from_slice(&0i32.to_le_bytes()); // l_aux = 0
-    out.extend_from_slice(&(n_ref as i32).to_le_bytes());
+    write_csi_header(&mut out, n_ref as i32);
 
     // Per reference sequence
     for ref_id in 0..n_ref as i32 {
-        let bins = ref_bins.get(&ref_id);
-        let n_mapped = ref_n_mapped.get(&ref_id).copied().unwrap_or(0);
-
-        if let Some(bins) = bins {
+        if let Some(bins) = ref_bins.get(&ref_id) {
+            let n_mapped = ref_n_mapped.get(&ref_id).copied().unwrap_or(0);
             // n_bin = real bins + 1 pseudo-bin
-            let n_bin = bins.len() as i32 + 1;
-            out.extend_from_slice(&n_bin.to_le_bytes());
-
-            // Regular bins
+            out.extend_from_slice(&(bins.len() as i32 + 1).to_le_bytes());
             for (&bin_id, bin_data) in bins {
-                out.extend_from_slice(&bin_id.to_le_bytes());
-                out.extend_from_slice(&bin_data.loffset.to_le_bytes());
-                out.extend_from_slice(&(bin_data.chunks.len() as i32).to_le_bytes());
-                for &(beg, end) in &bin_data.chunks {
-                    out.extend_from_slice(&beg.to_le_bytes());
-                    out.extend_from_slice(&end.to_le_bytes());
-                }
+                write_csi_bin(&mut out, bin_id, bin_data.loffset, &bin_data.chunks);
             }
-
-            // Pseudo-bin
-            let pseudo_bin_id = ((1u64 << ((depth as u64 + 1) * 3)) - 1) / 7 + 1;
-            out.extend_from_slice(&(pseudo_bin_id as u32).to_le_bytes());
-            out.extend_from_slice(&0u64.to_le_bytes()); // loffset
-            out.extend_from_slice(&2i32.to_le_bytes()); // n_chunk = 2
-            // chunk[0] = (ref_beg_vpos, ref_end_vpos) — unused, set to 0
-            out.extend_from_slice(&0u64.to_le_bytes());
-            out.extend_from_slice(&0u64.to_le_bytes());
-            // chunk[1] = (n_mapped, n_unmapped)
-            out.extend_from_slice(&n_mapped.to_le_bytes());
-            out.extend_from_slice(&0u64.to_le_bytes()); // n_unmapped = 0
+            write_csi_pseudo_bin(&mut out, depth, n_mapped);
         } else {
-            // Empty reference
-            out.extend_from_slice(&0i32.to_le_bytes()); // n_bin = 0
+            // Empty reference: n_bin = 0
+            out.extend_from_slice(&0i32.to_le_bytes());
         }
     }
 
@@ -698,68 +777,19 @@ pub fn build_tbi_index(vcf_gz_path: &Path) -> io::Result<()> {
 
     let mut out = Vec::with_capacity(64 * 1024);
 
-    // TBI header
-    out.extend_from_slice(b"TBI\x01");
-    out.extend_from_slice(&(n_ref as i32).to_le_bytes());
-    out.extend_from_slice(&2i32.to_le_bytes());     // format = VCF
-    out.extend_from_slice(&1i32.to_le_bytes());     // col_seq = 1 (CHROM)
-    out.extend_from_slice(&2i32.to_le_bytes());     // col_beg = 2 (POS)
-    out.extend_from_slice(&0i32.to_le_bytes());     // col_end = 0 (none for VCF)
-    out.extend_from_slice(&35i32.to_le_bytes());    // meta = '#'
-    out.extend_from_slice(&0i32.to_le_bytes());     // skip = 0
-
-    // Concatenated contig names (null-terminated)
-    let mut names_buf = Vec::new();
-    for name in &contig_names {
-        names_buf.extend_from_slice(name.as_bytes());
-        names_buf.push(0);
-    }
-    out.extend_from_slice(&(names_buf.len() as i32).to_le_bytes());
-    out.extend_from_slice(&names_buf);
+    write_tbi_header(&mut out, n_ref as i32, &contig_names);
 
     // Per reference sequence
     for ref_id in 0..n_ref {
-        let bins = ref_bins.get(&ref_id);
-        let lin = ref_linear.get(&ref_id);
-        let n_mapped = ref_n_mapped.get(&ref_id).copied().unwrap_or(0);
-
-        if let Some(bins) = bins {
+        if let Some(bins) = ref_bins.get(&ref_id) {
+            let n_mapped = ref_n_mapped.get(&ref_id).copied().unwrap_or(0);
             // n_bin = regular bins + 1 pseudo-bin
-            let n_bin = bins.len() as i32 + 1;
-            out.extend_from_slice(&n_bin.to_le_bytes());
-
+            out.extend_from_slice(&(bins.len() as i32 + 1).to_le_bytes());
             for (&bin_id, bin_data) in bins {
-                out.extend_from_slice(&bin_id.to_le_bytes());
-                out.extend_from_slice(&(bin_data.chunks.len() as i32).to_le_bytes());
-                for &(beg, end) in &bin_data.chunks {
-                    out.extend_from_slice(&beg.to_le_bytes());
-                    out.extend_from_slice(&end.to_le_bytes());
-                }
+                write_tbi_bin(&mut out, bin_id, &bin_data.chunks);
             }
-
-            // Pseudo-bin (bin 37450 for BAI/TBI)
-            let pseudo_bin_id = 37450u32;
-            out.extend_from_slice(&pseudo_bin_id.to_le_bytes());
-            out.extend_from_slice(&2i32.to_le_bytes());
-            out.extend_from_slice(&0u64.to_le_bytes());
-            out.extend_from_slice(&0u64.to_le_bytes());
-            out.extend_from_slice(&n_mapped.to_le_bytes());
-            out.extend_from_slice(&0u64.to_le_bytes());
-
-            // Linear index
-            if let Some(lin) = lin {
-                // Fill gaps: propagate non-zero offsets forward
-                let mut filled = lin.clone();
-                for i in 1..filled.len() {
-                    if filled[i] == 0 { filled[i] = filled[i-1]; }
-                }
-                out.extend_from_slice(&(filled.len() as i32).to_le_bytes());
-                for &offset in &filled {
-                    out.extend_from_slice(&offset.to_le_bytes());
-                }
-            } else {
-                out.extend_from_slice(&0i32.to_le_bytes());
-            }
+            write_tbi_pseudo_bin(&mut out, n_mapped);
+            write_tbi_linear(&mut out, ref_linear.get(&ref_id));
         } else {
             out.extend_from_slice(&0i32.to_le_bytes()); // n_bin = 0
             out.extend_from_slice(&0i32.to_le_bytes()); // n_intv = 0
@@ -852,38 +882,17 @@ pub fn build_tbi_index_with_meta(
     // Write TBI
     let n_ref = contig_names.len();
     let mut out = Vec::with_capacity(64 * 1024);
-    out.extend_from_slice(b"TBI\x01");
-    out.extend_from_slice(&(n_ref as i32).to_le_bytes());
-    out.extend_from_slice(&2i32.to_le_bytes());
-    out.extend_from_slice(&1i32.to_le_bytes());
-    out.extend_from_slice(&2i32.to_le_bytes());
-    out.extend_from_slice(&0i32.to_le_bytes());
-    out.extend_from_slice(&35i32.to_le_bytes());
-    out.extend_from_slice(&0i32.to_le_bytes());
-    let mut names_buf = Vec::new();
-    for n in contig_names { names_buf.extend_from_slice(n.as_bytes()); names_buf.push(0); }
-    out.extend_from_slice(&(names_buf.len() as i32).to_le_bytes());
-    out.extend_from_slice(&names_buf);
+    write_tbi_header(&mut out, n_ref as i32, contig_names);
 
     for ref_id in 0..n_ref {
         if let Some(bins) = ref_bins.get(&ref_id) {
             let n_mapped = ref_n_mapped.get(&ref_id).copied().unwrap_or(0);
             out.extend_from_slice(&((bins.len() as i32 + 1).to_le_bytes()));
             for (&bid, bd) in bins {
-                out.extend_from_slice(&bid.to_le_bytes());
-                out.extend_from_slice(&(bd.chunks.len() as i32).to_le_bytes());
-                for &(b, e) in &bd.chunks { out.extend_from_slice(&b.to_le_bytes()); out.extend_from_slice(&e.to_le_bytes()); }
+                write_tbi_bin(&mut out, bid, &bd.chunks);
             }
-            out.extend_from_slice(&37450u32.to_le_bytes());
-            out.extend_from_slice(&2i32.to_le_bytes());
-            out.extend_from_slice(&0u64.to_le_bytes()); out.extend_from_slice(&0u64.to_le_bytes());
-            out.extend_from_slice(&n_mapped.to_le_bytes()); out.extend_from_slice(&0u64.to_le_bytes());
-            if let Some(lin) = ref_linear.get(&ref_id) {
-                let mut filled = lin.clone();
-                for i in 1..filled.len() { if filled[i] == 0 { filled[i] = filled[i-1]; } }
-                out.extend_from_slice(&(filled.len() as i32).to_le_bytes());
-                for &o in &filled { out.extend_from_slice(&o.to_le_bytes()); }
-            } else { out.extend_from_slice(&0i32.to_le_bytes()); }
+            write_tbi_pseudo_bin(&mut out, n_mapped);
+            write_tbi_linear(&mut out, ref_linear.get(&ref_id));
         } else {
             out.extend_from_slice(&0i32.to_le_bytes());
             out.extend_from_slice(&0i32.to_le_bytes());
@@ -1047,18 +1056,7 @@ impl InlineIndexBuilder {
     pub fn write_tbi(&self, path: &Path) -> io::Result<()> {
         let n_ref = self.contig_names.len();
         let mut out = Vec::with_capacity(64 * 1024);
-        out.extend_from_slice(b"TBI\x01");
-        out.extend_from_slice(&(n_ref as i32).to_le_bytes());
-        out.extend_from_slice(&2i32.to_le_bytes());
-        out.extend_from_slice(&1i32.to_le_bytes());
-        out.extend_from_slice(&2i32.to_le_bytes());
-        out.extend_from_slice(&0i32.to_le_bytes());
-        out.extend_from_slice(&35i32.to_le_bytes());
-        out.extend_from_slice(&0i32.to_le_bytes());
-        let mut names_buf = Vec::new();
-        for n in &self.contig_names { names_buf.extend_from_slice(n.as_bytes()); names_buf.push(0); }
-        out.extend_from_slice(&(names_buf.len() as i32).to_le_bytes());
-        out.extend_from_slice(&names_buf);
+        write_tbi_header(&mut out, n_ref as i32, &self.contig_names);
         self.write_ref_sections(&mut out, n_ref);
         let f = std::fs::File::create(path)?;
         let mut w = noodles_bgzf::io::Writer::new(f);
@@ -1069,11 +1067,7 @@ impl InlineIndexBuilder {
     pub fn write_csi(&self, path: &Path) -> io::Result<()> {
         let n_ref = self.bcf_n_contigs.max(self.ref_bins.keys().map(|&k| k + 1).max().unwrap_or(0));
         let mut out = Vec::with_capacity(64 * 1024);
-        out.extend_from_slice(b"CSI\x01");
-        out.extend_from_slice(&DEFAULT_MIN_SHIFT.to_le_bytes());
-        out.extend_from_slice(&CSI_DEPTH.to_le_bytes());
-        out.extend_from_slice(&0i32.to_le_bytes());
-        out.extend_from_slice(&(n_ref as i32).to_le_bytes());
+        write_csi_header(&mut out, n_ref as i32);
         self.write_ref_sections_csi(&mut out, n_ref);
         let f = std::fs::File::create(path)?;
         let mut w = noodles_bgzf::io::Writer::new(f);
@@ -1087,20 +1081,10 @@ impl InlineIndexBuilder {
                 let n_mapped = self.ref_n_mapped.get(&ref_id).copied().unwrap_or(0);
                 out.extend_from_slice(&((bins.len() as i32 + 1).to_le_bytes()));
                 for (&bid, bd) in bins {
-                    out.extend_from_slice(&bid.to_le_bytes());
-                    out.extend_from_slice(&(bd.chunks.len() as i32).to_le_bytes());
-                    for &(b, e) in &bd.chunks { out.extend_from_slice(&b.to_le_bytes()); out.extend_from_slice(&e.to_le_bytes()); }
+                    write_tbi_bin(out, bid, &bd.chunks);
                 }
-                out.extend_from_slice(&37450u32.to_le_bytes());
-                out.extend_from_slice(&2i32.to_le_bytes());
-                out.extend_from_slice(&0u64.to_le_bytes()); out.extend_from_slice(&0u64.to_le_bytes());
-                out.extend_from_slice(&n_mapped.to_le_bytes()); out.extend_from_slice(&0u64.to_le_bytes());
-                if let Some(lin) = self.ref_linear.get(&ref_id) {
-                    let mut filled = lin.clone();
-                    for i in 1..filled.len() { if filled[i] == 0 { filled[i] = filled[i-1]; } }
-                    out.extend_from_slice(&(filled.len() as i32).to_le_bytes());
-                    for &o in &filled { out.extend_from_slice(&o.to_le_bytes()); }
-                } else { out.extend_from_slice(&0i32.to_le_bytes()); }
+                write_tbi_pseudo_bin(out, n_mapped);
+                write_tbi_linear(out, self.ref_linear.get(&ref_id));
             } else {
                 out.extend_from_slice(&0i32.to_le_bytes());
                 out.extend_from_slice(&0i32.to_le_bytes());
@@ -1114,19 +1098,120 @@ impl InlineIndexBuilder {
                 let n_mapped = self.ref_n_mapped.get(&ref_id).copied().unwrap_or(0);
                 out.extend_from_slice(&((bins.len() as i32 + 1).to_le_bytes()));
                 for (&bid, bd) in bins {
-                    out.extend_from_slice(&bid.to_le_bytes());
-                    out.extend_from_slice(&bd.loffset.to_le_bytes());
-                    out.extend_from_slice(&(bd.chunks.len() as i32).to_le_bytes());
-                    for &(b, e) in &bd.chunks { out.extend_from_slice(&b.to_le_bytes()); out.extend_from_slice(&e.to_le_bytes()); }
+                    write_csi_bin(out, bid, bd.loffset, &bd.chunks);
                 }
-                let pseudo = ((1u64 << ((self.depth as u64 + 1) * 3)) - 1) / 7 + 1;
-                out.extend_from_slice(&(pseudo as u32).to_le_bytes());
-                out.extend_from_slice(&0u64.to_le_bytes());
-                out.extend_from_slice(&2i32.to_le_bytes());
-                out.extend_from_slice(&0u64.to_le_bytes()); out.extend_from_slice(&0u64.to_le_bytes());
-                out.extend_from_slice(&n_mapped.to_le_bytes()); out.extend_from_slice(&0u64.to_le_bytes());
+                write_csi_pseudo_bin(out, self.depth, n_mapped);
             } else { out.extend_from_slice(&0i32.to_le_bytes()); }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Byte-pin every shared serialization atom against a hand-written layout.
+    // Combined with the empirical .csi/.tbi md5 gate on the live builders (which
+    // call these same helpers), this also transitively covers the streaming
+    // InlineIndexBuilder, whose write_* methods are now thin wrappers here.
+
+    #[test]
+    fn write_chunks_layout() {
+        let mut got = Vec::new();
+        write_chunks(&mut got, &[(1u64, 2u64), (3u64, 4u64)]);
+        let mut exp = Vec::new();
+        exp.extend_from_slice(&2i32.to_le_bytes()); // n_chunk
+        for v in [1u64, 2, 3, 4] { exp.extend_from_slice(&v.to_le_bytes()); }
+        assert_eq!(got, exp);
+    }
+
+    #[test]
+    fn bin_layouts() {
+        // TBI bin: bin_id(u32) + n_chunk + (beg,end) pairs.
+        let mut got = Vec::new();
+        write_tbi_bin(&mut got, 4681, &[(5u64, 6u64)]);
+        let mut exp = Vec::new();
+        exp.extend_from_slice(&4681u32.to_le_bytes());
+        exp.extend_from_slice(&1i32.to_le_bytes());
+        exp.extend_from_slice(&5u64.to_le_bytes());
+        exp.extend_from_slice(&6u64.to_le_bytes());
+        assert_eq!(got, exp);
+
+        // CSI bin adds a loffset(u64) before the chunks.
+        let mut got = Vec::new();
+        write_csi_bin(&mut got, 4681, 99, &[(5u64, 6u64)]);
+        let mut exp = Vec::new();
+        exp.extend_from_slice(&4681u32.to_le_bytes());
+        exp.extend_from_slice(&99u64.to_le_bytes());
+        exp.extend_from_slice(&1i32.to_le_bytes());
+        exp.extend_from_slice(&5u64.to_le_bytes());
+        exp.extend_from_slice(&6u64.to_le_bytes());
+        assert_eq!(got, exp);
+    }
+
+    #[test]
+    fn pseudo_bins() {
+        // CSI pseudo-bin id for the bcftools-default depth 6 (((1<<21)-1)/7 + 1).
+        assert_eq!(csi_pseudo_bin_id(6), 299594);
+
+        let mut got = Vec::new();
+        write_tbi_pseudo_bin(&mut got, 7);
+        let mut exp = Vec::new();
+        exp.extend_from_slice(&37450u32.to_le_bytes());
+        exp.extend_from_slice(&2i32.to_le_bytes());
+        for v in [0u64, 0, 7, 0] { exp.extend_from_slice(&v.to_le_bytes()); }
+        assert_eq!(got, exp);
+
+        let mut got = Vec::new();
+        write_csi_pseudo_bin(&mut got, CSI_DEPTH, 7);
+        let mut exp = Vec::new();
+        exp.extend_from_slice(&csi_pseudo_bin_id(CSI_DEPTH).to_le_bytes());
+        exp.extend_from_slice(&0u64.to_le_bytes()); // loffset
+        exp.extend_from_slice(&2i32.to_le_bytes());
+        for v in [0u64, 0, 7, 0] { exp.extend_from_slice(&v.to_le_bytes()); }
+        assert_eq!(got, exp);
+    }
+
+    #[test]
+    fn headers() {
+        let mut got = Vec::new();
+        write_csi_header(&mut got, 3);
+        let mut exp = Vec::new();
+        exp.extend_from_slice(b"CSI\x01");
+        exp.extend_from_slice(&DEFAULT_MIN_SHIFT.to_le_bytes());
+        exp.extend_from_slice(&CSI_DEPTH.to_le_bytes());
+        exp.extend_from_slice(&0i32.to_le_bytes());
+        exp.extend_from_slice(&3i32.to_le_bytes());
+        assert_eq!(got, exp);
+
+        let names = vec!["chr1".to_string(), "chrX".to_string()];
+        let mut got = Vec::new();
+        write_tbi_header(&mut got, 2, &names);
+        let mut exp = Vec::new();
+        exp.extend_from_slice(b"TBI\x01");
+        exp.extend_from_slice(&2i32.to_le_bytes());
+        for v in [2i32, 1, 2, 0, 35, 0] { exp.extend_from_slice(&v.to_le_bytes()); }
+        let nb = b"chr1\0chrX\0";
+        exp.extend_from_slice(&(nb.len() as i32).to_le_bytes());
+        exp.extend_from_slice(nb);
+        assert_eq!(got, exp);
+    }
+
+    #[test]
+    fn tbi_linear_fill_forward() {
+        // None -> just n_intv = 0.
+        let mut got = Vec::new();
+        write_tbi_linear(&mut got, None);
+        assert_eq!(got, 0i32.to_le_bytes().to_vec());
+
+        // Some -> zero gaps propagate the previous offset forward.
+        let lin = vec![10u64, 0, 0, 5, 0];
+        let mut got = Vec::new();
+        write_tbi_linear(&mut got, Some(&lin));
+        let mut exp = Vec::new();
+        exp.extend_from_slice(&5i32.to_le_bytes());
+        for v in [10u64, 10, 10, 5, 5] { exp.extend_from_slice(&v.to_le_bytes()); }
+        assert_eq!(got, exp);
     }
 }
 
