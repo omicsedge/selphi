@@ -33,13 +33,93 @@ pub struct RegionResult {
 }
 
 /// Parallel BCF reader. Each thread writes to disk.
+/// Divide the file into ~`n_threads` byte-balanced regions from the CSI
+/// checkpoints `cps`, returning (thread_id, start_vp, start_pos, end_pos) tuples.
+/// Checkpoints are sorted by compressed offset; region 0 starts at pos 0 to
+/// capture records before the first checkpoint; the last region runs to EOF.
+///
+/// `dedup_same_pos`: also skip a region whose checkpoint shares its genomic
+/// position with the previous region — two distinct checkpoints at the same
+/// position (e.g. multiallelic split sites) would form an empty (X, X] range
+/// dropped by both threads. The single-chr reader enables this; the per-contig
+/// reader historically does not (preserved here, not unified, to stay
+/// byte-identical).
+fn split_regions(
+    cps: &[(i64, VirtualPosition)],
+    file_size: u64,
+    dedup_same_pos: bool,
+) -> Vec<(usize, VirtualPosition, i64, i64)> {
+    let mut by_offset: Vec<(u64, i64, VirtualPosition)> = cps.iter()
+        .map(|&(pos, vp)| (vp.compressed(), pos, vp))
+        .collect();
+    by_offset.sort_by_key(|&(off, _, _)| off);
+
+    let first_off = by_offset.first().map(|&(o, _, _)| o).unwrap_or(0);
+    let data_range = file_size.saturating_sub(first_off).max(1); // data extends to EOF
+
+    let n_threads = rayon::current_num_threads().max(1);
+    let segment_size = data_range / n_threads as u64;
+
+    let mut region_indices: Vec<usize> = Vec::with_capacity(n_threads);
+    for t in 0..n_threads {
+        let target = first_off + t as u64 * segment_size;
+        let idx = match by_offset.binary_search_by_key(&target, |&(off, _, _)| off) {
+            Ok(i) => i,
+            Err(0) => 0,
+            Err(i) => i - 1,
+        };
+        if let Some(&last_idx) = region_indices.last() {
+            if last_idx == idx { continue; }
+            if dedup_same_pos && by_offset[last_idx].1 == by_offset[idx].1 { continue; }
+        }
+        region_indices.push(idx);
+    }
+
+    region_indices.iter()
+        .enumerate()
+        .map(|(ti, &idx)| {
+            let (_, geo_pos, start_vp) = by_offset[idx];
+            let start_pos = if ti == 0 { 0i64 } else { geo_pos };
+            let end_pos = if ti + 1 < region_indices.len() {
+                by_offset[region_indices[ti + 1]].1
+            } else {
+                i64::MAX
+            };
+            (ti, start_vp, start_pos, end_pos)
+        })
+        .collect()
+}
+
+/// Read every region in parallel via `process_region`, propagating any region's
+/// I/O error rather than swallowing it into an empty result (a swallowed error
+/// would silently drop ~1/N of the panel's variants, corrupting the panel).
+fn dispatch_regions(
+    path: &Path,
+    regions: &[(usize, VirtualPosition, i64, i64)],
+    target_ref_id: i32,
+    header: &BcfHeader,
+    chunk_size: usize,
+    tmp_dir: &Path,
+) -> io::Result<Vec<RegionResult>> {
+    std::fs::create_dir_all(tmp_dir)?;
+    let pb = path.to_path_buf();
+    let gtk = header.gt_key_id;
+    let ns = header.n_samples;
+    let nh = ns * 2;
+    regions
+        .par_iter()
+        .map(|&(ti, vp, sp, ep)| {
+            process_region(&pb, vp, sp, ep, target_ref_id, gtk, ns, nh, chunk_size, tmp_dir, ti)
+        })
+        .collect::<io::Result<Vec<RegionResult>>>()
+}
+
 pub fn read_bcf_parallel(
     path: &Path,
     chunk_size: usize,
     tmp_dir: &Path,
 ) -> io::Result<(BcfHeader, Vec<RegionResult>)> {
     let header = read_header_only(path)?;
-    let nh = header.n_samples * 2;
 
     // CSI required
     let csi_path = { let mut p = path.as_os_str().to_owned(); p.push(".csi"); PathBuf::from(p) };
@@ -56,75 +136,12 @@ pub fn read_bcf_parallel(
     let target_ref_id = csi.ref_seq_id as i32;
     let file_size = std::fs::metadata(path)?.len();
 
-    // --- File-size-based region division ---
-    // Sort checkpoints by compressed byte offset for balanced I/O splitting
-    let mut by_offset: Vec<(u64, i64, VirtualPosition)> = cps.iter()
-        .map(|&(pos, vp)| (vp.compressed(), pos, vp))
-        .collect();
-    by_offset.sort_by_key(|&(off, _, _)| off);
-
-    let first_off = by_offset.first().map(|&(o, _, _)| o).unwrap_or(0);
-    let last_off = file_size; // data extends to EOF
-    let data_range = last_off.saturating_sub(first_off).max(1);
-
-    let n_threads = rayon::current_num_threads().max(1);
-    let segment_size = data_range / n_threads as u64;
-
-    let mut region_indices: Vec<usize> = Vec::with_capacity(n_threads);
-    for t in 0..n_threads {
-        let target = first_off + t as u64 * segment_size;
-        // Find last checkpoint at or before target offset
-        let idx = match by_offset.binary_search_by_key(&target, |&(off, _, _)| off) {
-            Ok(i) => i,
-            Err(0) => 0,
-            Err(i) => i - 1,
-        };
-        // Deduplicate: skip if same checkpoint as previous region OR if the
-        // previous region's geo_pos equals this one (two distinct checkpoints
-        // at the same position — e.g. multiallelic split sites — would form an
-        // empty (X, X] range whose records get dropped by BOTH threads).
-        if let Some(&last_idx) = region_indices.last() {
-            if last_idx == idx || by_offset[last_idx].1 == by_offset[idx].1 { continue; }
-        }
-        region_indices.push(idx);
-    }
-
-    // Build region tuples: (thread_id, start_vp, start_pos, end_pos)
-    // Thread 0 uses start_pos=0 to capture all records before the first checkpoint position
-    let regions: Vec<(usize, VirtualPosition, i64, i64)> = region_indices.iter()
-        .enumerate()
-        .map(|(ti, &idx)| {
-            let (_, geo_pos, start_vp) = by_offset[idx];
-            let start_pos = if ti == 0 { 0i64 } else { geo_pos };
-            let end_pos = if ti + 1 < region_indices.len() {
-                by_offset[region_indices[ti + 1]].1
-            } else {
-                i64::MAX
-            };
-            (ti, start_vp, start_pos, end_pos)
-        })
-        .collect();
+    let regions = split_regions(cps, file_size, /* dedup_same_pos = */ true);
 
     selphi_info!("  regions:  {} (from {} CSI checkpoints, file {:.1} GB)",
               regions.len(), cps.len(), file_size as f64 / 1e9);
 
-    std::fs::create_dir_all(tmp_dir)?;
-
-    let pb = path.to_path_buf();
-    let gtk = header.gt_key_id;
-    let ns = header.n_samples;
-
-    // Propagate any region's I/O error instead of swallowing it into an empty
-    // result — a swallowed error would silently drop ~1/N of the panel's
-    // variants with no diagnostic (corrupting the reference panel).
-    let results: Vec<RegionResult> = regions
-        .par_iter()
-        .map(|&(ti, vp, sp, ep)| {
-            process_region(&pb, vp, sp, ep, target_ref_id, gtk, ns, nh, chunk_size, tmp_dir, ti)
-        })
-        .collect::<io::Result<Vec<RegionResult>>>()?;
-
-
+    let results = dispatch_regions(path, &regions, target_ref_id, &header, chunk_size, tmp_dir)?;
     Ok((header, results))
 }
 
@@ -294,60 +311,8 @@ pub fn read_bcf_parallel_for_contig(
     let target_ref_id = contig_csi.ref_seq_id as i32;
     let file_size = std::fs::metadata(path)?.len();
 
-    let mut by_offset: Vec<(u64, i64, VirtualPosition)> = cps.iter()
-        .map(|&(pos, vp)| (vp.compressed(), pos, vp))
-        .collect();
-    by_offset.sort_by_key(|&(off, _, _)| off);
-
-    let first_off = by_offset.first().map(|&(o, _, _)| o).unwrap_or(0);
-    let last_off = file_size;
-    let data_range = last_off.saturating_sub(first_off).max(1);
-
-    let n_threads = rayon::current_num_threads().max(1);
-    let segment_size = data_range / n_threads as u64;
-
-    let mut region_indices: Vec<usize> = Vec::with_capacity(n_threads);
-    for t in 0..n_threads {
-        let target = first_off + t as u64 * segment_size;
-        let idx = match by_offset.binary_search_by_key(&target, |&(off, _, _)| off) {
-            Ok(i) => i,
-            Err(0) => 0,
-            Err(i) => i - 1,
-        };
-        if region_indices.last() == Some(&idx) { continue; }
-        region_indices.push(idx);
-    }
-
-    let regions: Vec<(usize, VirtualPosition, i64, i64)> = region_indices.iter()
-        .enumerate()
-        .map(|(ti, &idx)| {
-            let (_, geo_pos, start_vp) = by_offset[idx];
-            let start_pos = if ti == 0 { 0i64 } else { geo_pos };
-            let end_pos = if ti + 1 < region_indices.len() {
-                by_offset[region_indices[ti + 1]].1
-            } else {
-                i64::MAX
-            };
-            (ti, start_vp, start_pos, end_pos)
-        })
-        .collect();
-
-    std::fs::create_dir_all(tmp_dir)?;
-
-    let pb = path.to_path_buf();
-    let gtk = header.gt_key_id;
-    let ns = header.n_samples;
-
-    // Propagate any region's I/O error instead of swallowing it into an empty
-    // result — a swallowed error would silently drop ~1/N of the panel's
-    // variants with no diagnostic (corrupting the reference panel).
-    let results: Vec<RegionResult> = regions
-        .par_iter()
-        .map(|&(ti, vp, sp, ep)| {
-            process_region(&pb, vp, sp, ep, target_ref_id, gtk, ns, nh, chunk_size, tmp_dir, ti)
-        })
-        .collect::<io::Result<Vec<RegionResult>>>()?;
-
+    let regions = split_regions(cps, file_size, /* dedup_same_pos = */ false);
+    let results = dispatch_regions(path, &regions, target_ref_id, &header, chunk_size, tmp_dir)?;
     Ok((header, results))
 }
 
