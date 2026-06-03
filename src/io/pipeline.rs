@@ -258,6 +258,32 @@ pub type VcfSender = std::sync::mpsc::SyncSender<Vec<u8>>;
 pub type VcfWriterHandle = std::thread::JoinHandle<std::io::Result<()>>;
 pub type VcfBgzipProc = (); // No external process — native bgzf
 
+/// The native multithreaded BGZF writer over a freshly-created output file.
+type BgzfFileWriter = noodles_bgzf::io::multithreaded_writer::MultithreadedWriter<std::fs::File>;
+
+/// Create the output file, the native multithreaded BGZF writer (4 workers,
+/// capped at the sample count), and the adaptive-depth sync channel shared by
+/// the VCF and BCF writers. The caller spawns the writer thread (which differs:
+/// TBI metadata scan vs. CSI drain) and sends the format-specific header.
+#[inline]
+fn build_bgzf_channel(
+    path: &Path,
+    n_samples: usize,
+) -> std::io::Result<(BgzfFileWriter, VcfSender, std::sync::mpsc::Receiver<Vec<u8>>)> {
+    let out_file = std::fs::File::create(path)?;
+    let bgzip_threads = 4.min(n_samples.max(1));
+    let bgzf_writer = noodles_bgzf::io::multithreaded_writer::Builder::default()
+        .set_worker_count(std::num::NonZeroUsize::new(bgzip_threads).unwrap())
+        .build_from_writer(out_file);
+
+    // Channel buffer sized adaptively: at biobank scale each VCF tile is ~300 MB
+    // of text (5000 samples × 4096 variants). 64 tiles in flight = 19 GB waste.
+    // 4 is enough to keep the writer fed without starving compute.
+    let channel_depth = if n_samples >= 1000 { 4 } else { 16 };
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(channel_depth);
+    Ok((bgzf_writer, tx, rx))
+}
+
 /// Setup the VCF writer: native noodles-bgzf (no external bgzip dependency).
 /// Returns (sender, writer_handle, ()) to be shared across windows.
 pub fn setup_vcf_writer(
@@ -274,20 +300,11 @@ pub fn setup_vcf_writer(
         output_path.to_path_buf()
     };
 
-    let out_file = std::fs::File::create(&vcf_path)?;
-    let bgzip_threads = 4.min(n_samples.max(1));
-    let bgzf_writer = noodles_bgzf::io::multithreaded_writer::Builder::default()
-        .set_worker_count(std::num::NonZeroUsize::new(bgzip_threads).unwrap())
-        .build_from_writer(out_file);
+    let (bgzf_writer, tx, rx) = build_bgzf_channel(&vcf_path, n_samples)?;
 
     let tbi_path = { let mut p = vcf_path.as_os_str().to_owned(); p.push(".tbi"); std::path::PathBuf::from(p) };
     let vcf_path_clone = vcf_path.clone();
 
-    // Channel buffer sized adaptively: at biobank scale each VCF tile is ~300 MB
-    // of text (5000 samples × 4096 variants). 64 tiles in flight = 19 GB waste.
-    // 4 is enough to keep the writer fed without starving compute.
-    let channel_depth = if n_samples >= 1000 { 4 } else { 16 };
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(channel_depth);
     let writer_handle = std::thread::spawn(move || -> std::io::Result<()> {
         let mut writer = BufWriter::with_capacity(4 << 20, bgzf_writer);
         // Collect record metadata for post-write index building
@@ -395,29 +412,8 @@ fn format_tile_batch(
 
             if is_chip[local_i] {
                 let ci = chip_local_idx[local_i];
-                let mut ac = 0u32;
-                for s in 0..n_samples {
-                    ac += chip_genotypes[ci * n_haps + s * 2] as u32;
-                    ac += chip_genotypes[ci * n_haps + s * 2 + 1] as u32;
-                }
-                let af = ac as f64 / n_haps as f64;
-                buf.extend_from_slice(&vid_prefixes[vid_prefix_offset + v]);
-                buf.extend_from_slice(b"\t.\tPASS\tAF=");
-                write_f4(&mut buf, af);
-                buf.extend_from_slice(b";AC=");
-                write_u32(&mut buf, ac);
-                buf.extend_from_slice(b";AN=");
-                buf.extend_from_slice(an_str);
-                buf.extend_from_slice(b"\tGT");
-                for s in 0..n_samples {
-                    let a0 = chip_genotypes[ci * n_haps + s * 2];
-                    let a1 = chip_genotypes[ci * n_haps + s * 2 + 1];
-                    buf.push(b'\t');
-                    buf.push(b'0' + a0);
-                    buf.push(b'|');
-                    buf.push(b'0' + a1);
-                }
-                buf.push(b'\n');
+                append_chip_line_bytes(&mut buf, vid_prefix_offset + v, ci,
+                    vid_prefixes, chip_genotypes, n_haps, n_samples, an_str);
             } else {
                 // Single pass: compute stats AND format simultaneously.
                 // Write prefix + INFO first (need stats), then samples.
@@ -496,24 +492,24 @@ fn format_tile_batch(
 
 use crate::io::vcf_fmt::{write_f4, write_u32};
 
-/// Format a chip line into a reusable byte buffer.
-fn format_chip_line_bytes(
-    buf: &mut Vec<u8>, wgs_i: usize, vp_idx: usize,
+/// Append a chip VCF line (no GT:DS/AP — original phased genotypes) to `buf`
+/// without clearing it. `ci` is the chip-local variant index, `vp_idx` the
+/// variant-prefix index. Shared by `format_chip_line_bytes` and the chip branch
+/// of `format_tile_batch` so both emit byte-identical lines.
+#[inline]
+fn append_chip_line_bytes(
+    buf: &mut Vec<u8>, vp_idx: usize, ci: usize,
     vid_prefixes: &[Vec<u8>],
-    chip_gt: &[u8], chip_idx: &[usize],
-    n_haps: usize, n_samples: usize, an_str: &[u8],
+    chip_gt: &[u8], n_haps: usize, n_samples: usize, an_str: &[u8],
 ) {
-    buf.clear();
-    let ci = chip_idx[wgs_i];
     let mut ac = 0u32;
-    buf.extend_from_slice(&vid_prefixes[vp_idx]);
-    buf.extend_from_slice(b"\t.\tPASS\tAF=");
-    // First pass: count AC
     for s in 0..n_samples {
         ac += chip_gt[ci * n_haps + s * 2] as u32;
         ac += chip_gt[ci * n_haps + s * 2 + 1] as u32;
     }
     let af = ac as f64 / n_haps as f64;
+    buf.extend_from_slice(&vid_prefixes[vp_idx]);
+    buf.extend_from_slice(b"\t.\tPASS\tAF=");
     write_f4(buf, af);
     buf.extend_from_slice(b";AC=");
     write_u32(buf, ac);
@@ -529,6 +525,18 @@ fn format_chip_line_bytes(
         buf.push(b'0' + a1);
     }
     buf.push(b'\n');
+}
+
+/// Format a chip line into a reusable byte buffer.
+fn format_chip_line_bytes(
+    buf: &mut Vec<u8>, wgs_i: usize, vp_idx: usize,
+    vid_prefixes: &[Vec<u8>],
+    chip_gt: &[u8], chip_idx: &[usize],
+    n_haps: usize, n_samples: usize, an_str: &[u8],
+) {
+    buf.clear();
+    let ci = chip_idx[wgs_i];
+    append_chip_line_bytes(buf, vp_idx, ci, vid_prefixes, chip_gt, n_haps, n_samples, an_str);
 }
 
 // ---------------------------------------------------------------------------
@@ -551,19 +559,10 @@ pub fn setup_bcf_writer(
         output_path.to_path_buf()
     };
 
-    let out_file = std::fs::File::create(&bcf_path)?;
-    let bgzip_threads = 4.min(n_samples.max(1));
-    let bgzf_writer = noodles_bgzf::io::multithreaded_writer::Builder::default()
-        .set_worker_count(std::num::NonZeroUsize::new(bgzip_threads).unwrap())
-        .build_from_writer(out_file);
+    let (bgzf_writer, tx, rx) = build_bgzf_channel(&bcf_path, n_samples)?;
 
     let bcf_path_clone = bcf_path.clone();
 
-    // Channel buffer sized adaptively: at biobank scale each VCF tile is ~300 MB
-    // of text (5000 samples × 4096 variants). 64 tiles in flight = 19 GB waste.
-    // 4 is enough to keep the writer fed without starving compute.
-    let channel_depth = if n_samples >= 1000 { 4 } else { 16 };
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(channel_depth);
     let writer_handle = std::thread::spawn(move || -> std::io::Result<()> {
         let mut writer = BufWriter::with_capacity(4 << 20, bgzf_writer);
         for buf in rx {
@@ -697,15 +696,21 @@ fn fill_chip_pgen(
 }
 
 
-/// Fill chip genotypes for SelfDecode output (gt1/gt2 as i32).
+/// Fill chip genotypes for SelfDecode output (gt1/gt2 as i32) and mirror them
+/// into the allele-probability fields (ap1/ap2 = gt1/gt2 as f32), since chip
+/// sites are hard calls. The `gt -> ap` mirror lives here so it stays in one
+/// place across the gap and tile encode paths.
 #[inline]
 fn fill_chip_sd(
     sd_gt1: &mut [i32], sd_gt2: &mut [i32],
+    sd_ap1: &mut [f32], sd_ap2: &mut [f32],
     chip_genotypes: &[u8], ci: usize, n_haps: usize, n_samples: usize,
 ) {
     for s in 0..n_samples {
         sd_gt1[s] = chip_genotypes[ci * n_haps + s * 2] as i32;
         sd_gt2[s] = chip_genotypes[ci * n_haps + s * 2 + 1] as i32;
+        sd_ap1[s] = sd_gt1[s] as f32;
+        sd_ap2[s] = sd_gt2[s] as f32;
     }
 }
 
@@ -822,8 +827,7 @@ pub fn write_window_multiformat(
                             fill_chip_pgen(&mut hardcalls, &mut dosages, chip_genotypes, ci, setup.n_haps, n_samples);
                         }
                         if formats.selfdecode {
-                            fill_chip_sd(&mut sd_gt1, &mut sd_gt2, chip_genotypes, ci, setup.n_haps, n_samples);
-                            for s in 0..n_samples { sd_ap1[s] = sd_gt1[s] as f32; sd_ap2[s] = sd_gt2[s] as f32; }
+                            fill_chip_sd(&mut sd_gt1, &mut sd_gt2, &mut sd_ap1, &mut sd_ap2, chip_genotypes, ci, setup.n_haps, n_samples);
                         }
                         if let Some((chrom, pos_str, oid, ref_a, alt_a)) = parse_variant_parts(srp, next_wgs) {
                             if let Some((ref mut pg, ref mut pv)) = pgw {
@@ -884,8 +888,7 @@ pub fn write_window_multiformat(
                             fill_chip_pgen(&mut hardcalls, &mut dosages, chip_genotypes, ci, setup.n_haps, n_samples);
                         }
                         if formats.selfdecode {
-                            fill_chip_sd(&mut sd_gt1, &mut sd_gt2, chip_genotypes, ci, setup.n_haps, n_samples);
-                            for s in 0..n_samples { sd_ap1[s] = sd_gt1[s] as f32; sd_ap2[s] = sd_gt2[s] as f32; }
+                            fill_chip_sd(&mut sd_gt1, &mut sd_gt2, &mut sd_ap1, &mut sd_ap2, chip_genotypes, ci, setup.n_haps, n_samples);
                         }
                     } else {
                         for s in 0..n_samples {
