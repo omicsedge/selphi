@@ -10,7 +10,7 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::{selphi_info, selphi_step};
-use super::{SRP_MULTI_CHR_MAGIC, SparseTile, TILE_ROWS, TILE_COLS, ChrDirectoryEntry};
+use super::{SRP_MULTI_CHR_MAGIC, TILE_ROWS, TILE_COLS, ChrDirectoryEntry};
 
 /// Build a multi-chromosome SRP file from a multi-contig BCF/VCF source.
 pub fn build_multi_chr_srp(
@@ -170,16 +170,7 @@ pub fn build_multi_chr_srp(
                 if pos < min_pos { min_pos = pos; }
                 if pos > max_pos { max_pos = pos; }
 
-                let chr_b = chrom.as_bytes();
-                let ref_b = ref_allele.as_bytes();
-                let alt_b = alt_allele.as_bytes();
-                vbin.extend_from_slice(&pos.to_le_bytes());
-                super::helpers::check_record_lens(chr_b, ref_b, alt_b)?; vbin.push(chr_b.len().min(255) as u8);
-                vbin.push(ref_b.len().min(255) as u8);
-                vbin.push(alt_b.len().min(255) as u8);
-                vbin.extend_from_slice(&chr_b[..chr_b.len().min(255)]);
-                vbin.extend_from_slice(&ref_b[..ref_b.len().min(255)]);
-                vbin.extend_from_slice(&alt_b[..alt_b.len().min(255)]);
+                super::helpers::push_variant_vbin(&mut vbin, pos, chrom, ref_allele, alt_allele)?;
 
                 if !first_id { ids.push(b'\n'); orig_ids.push(b'\n'); }
                 ids.extend_from_slice(format!("{}-{}-{}-{}", chrom, pos, ref_allele, alt_allele).as_bytes());
@@ -332,23 +323,7 @@ pub fn build_multi_chr_srp(
     }
 
     // Seek back to fill chromosome directory
-    w.flush()?;
-    let end_pos = w.stream_position()?;
-    w.seek(SeekFrom::Start(chr_dir_pos))?;
-    for entry in &chr_entries {
-        let name_bytes = entry.chr_name.as_bytes();
-        let name_len = name_bytes.len().min(12) as u32;
-        w.write_all(&name_len.to_le_bytes())?;
-        let mut name_buf = [0u8; 12];
-        name_buf[..name_len as usize].copy_from_slice(&name_bytes[..name_len as usize]);
-        w.write_all(&name_buf)?;
-        w.write_all(&entry.data_offset.to_le_bytes())?;
-        w.write_all(&entry.n_variants.to_le_bytes())?;
-        w.write_all(&entry.n_tiles.to_le_bytes())?;
-    }
-
-    w.seek(SeekFrom::Start(end_pos))?;
-    w.flush()?;
+    write_chr_directory(&mut w, chr_dir_pos, &chr_entries)?;
 
     let file_size = std::fs::metadata(&srp_path)?.len();
     selphi_step!("Multi-chr SRP: {} chromosomes, {:.1} MB → {}",
@@ -369,38 +344,7 @@ fn flush_tiles<W: Write + Seek>(
 ) -> io::Result<()> {
     if pending.is_empty() { return Ok(()); }
 
-    let mut tasks: Vec<(usize, usize, usize)> = Vec::new();
-    for (i, (stripe_id, _)) in pending.iter().enumerate() {
-        for band in 0..n_tile_cols {
-            tasks.push((i, *stripe_id, band));
-        }
-    }
-
-    let results: Vec<(usize, usize, Vec<u8>)> = tasks.into_par_iter().map(|(batch_idx, stripe_id, band)| {
-        let stripe_cols = &pending[batch_idx].1;
-        let svs = stripe_id * TILE_ROWS;
-        let n_rows = (TILE_ROWS.min(n_variants - svs)) as u16;
-        let col_start = band * TILE_COLS;
-        let col_end = (col_start + TILE_COLS).min(n_haps);
-        let n_cols = col_end - col_start;
-
-        let mut indptr = Vec::with_capacity(n_cols + 1);
-        let mut indices = Vec::new();
-        indptr.push(0u32);
-        for lc in 0..n_cols {
-            let gc = col_start + lc;
-            if gc < stripe_cols.len() {
-                indices.extend_from_slice(&stripe_cols[gc]);
-            }
-            indptr.push(indices.len() as u32);
-        }
-        let tile = SparseTile { indptr, indices, n_rows, n_cols: n_cols as u16 };
-        let compressed = zstd::encode_all(Cursor::new(&tile.to_bytes()), 3).unwrap();
-        (stripe_id, band, compressed)
-    }).collect();
-
-    let mut sorted = results;
-    sorted.sort_by_key(|&(s, b, _)| (s, b));
+    let sorted = super::tiled::compress_pending_tiles(pending, n_haps, n_variants, n_tile_cols);
     for (stripe_id, band, tdata) in sorted {
         let idx = stripe_id * n_tile_cols + band;
         tile_entries[idx] = (*write_pos, tdata.len() as u32);
@@ -409,6 +353,34 @@ fn flush_tiles<W: Write + Seek>(
     }
 
     pending.clear();
+    Ok(())
+}
+
+/// Fill the multi-chr SRP chromosome directory: seek back to `chr_dir_pos`,
+/// write one 32-byte entry per chr (name_len u32 + 12-byte zero-padded name +
+/// data_offset u64 + n_variants u32 + n_tiles u32), then restore the write
+/// cursor to the end. Shared by `build_multi_chr_srp` and `merge_srps_from_dir`.
+fn write_chr_directory<W: Write + Seek>(
+    w: &mut W,
+    chr_dir_pos: u64,
+    chr_entries: &[ChrDirectoryEntry],
+) -> io::Result<()> {
+    w.flush()?;
+    let end_pos = w.stream_position()?;
+    w.seek(SeekFrom::Start(chr_dir_pos))?;
+    for entry in chr_entries {
+        let name_bytes = entry.chr_name.as_bytes();
+        let name_len = name_bytes.len().min(12) as u32;
+        w.write_all(&name_len.to_le_bytes())?;
+        let mut name_buf = [0u8; 12];
+        name_buf[..name_len as usize].copy_from_slice(&name_bytes[..name_len as usize]);
+        w.write_all(&name_buf)?;
+        w.write_all(&entry.data_offset.to_le_bytes())?;
+        w.write_all(&entry.n_variants.to_le_bytes())?;
+        w.write_all(&entry.n_tiles.to_le_bytes())?;
+    }
+    w.seek(SeekFrom::Start(end_pos))?;
+    w.flush()?;
     Ok(())
 }
 
@@ -555,16 +527,7 @@ pub fn merge_samples_single_chr(
     let mut ids_buf = Vec::new();
     let mut orig_buf = Vec::new();
     for (i, v) in merged_variants.iter().enumerate() {
-        let chr_b = v.chr.as_bytes();
-        let ref_b = v.ref_allele.as_bytes();
-        let alt_b = v.alt_allele.as_bytes();
-        vbin.extend_from_slice(&v.pos.to_le_bytes());
-        super::helpers::check_record_lens(chr_b, ref_b, alt_b)?; vbin.push(chr_b.len().min(255) as u8);
-        vbin.push(ref_b.len().min(255) as u8);
-        vbin.push(alt_b.len().min(255) as u8);
-        vbin.extend_from_slice(&chr_b[..chr_b.len().min(255)]);
-        vbin.extend_from_slice(&ref_b[..ref_b.len().min(255)]);
-        vbin.extend_from_slice(&alt_b[..alt_b.len().min(255)]);
+        super::helpers::push_variant_vbin(&mut vbin, v.pos, &v.chr, &v.ref_allele, &v.alt_allele)?;
         if i > 0 { ids_buf.push(b'\n'); orig_buf.push(b'\n'); }
         let id = format!("{}-{}-{}-{}", v.chr, v.pos, v.ref_allele, v.alt_allele);
         ids_buf.extend_from_slice(id.as_bytes());
@@ -992,16 +955,7 @@ pub fn merge_single_chr_srps(
         let mut ids_buf = Vec::with_capacity(n_variants * 30);
         let mut orig_buf = Vec::with_capacity(n_variants * 20);
         for (i, v) in reader.variants.iter().enumerate() {
-            let chr_b = v.chr.as_bytes();
-            let ref_b = v.ref_allele.as_bytes();
-            let alt_b = v.alt_allele.as_bytes();
-            vbin.extend_from_slice(&v.pos.to_le_bytes());
-            super::helpers::check_record_lens(chr_b, ref_b, alt_b)?; vbin.push(chr_b.len().min(255) as u8);
-            vbin.push(ref_b.len().min(255) as u8);
-            vbin.push(alt_b.len().min(255) as u8);
-            vbin.extend_from_slice(&chr_b[..chr_b.len().min(255)]);
-            vbin.extend_from_slice(&ref_b[..ref_b.len().min(255)]);
-            vbin.extend_from_slice(&alt_b[..alt_b.len().min(255)]);
+            super::helpers::push_variant_vbin(&mut vbin, v.pos, &v.chr, &v.ref_allele, &v.alt_allele)?;
             if i > 0 { ids_buf.push(b'\n'); orig_buf.push(b'\n'); }
             ids_buf.extend_from_slice(reader.ids[i].as_bytes());
             if i < reader.original_ids.len() {
@@ -1076,23 +1030,7 @@ pub fn merge_single_chr_srps(
     }
 
     // Fill chromosome directory (seek back)
-    w.flush()?;
-    let end_pos = w.stream_position()?;
-    w.seek(SeekFrom::Start(chr_dir_pos))?;
-    for entry in &chr_entries {
-        let name_bytes = entry.chr_name.as_bytes();
-        let name_len = name_bytes.len().min(12) as u32;
-        w.write_all(&name_len.to_le_bytes())?;
-        let mut name_buf = [0u8; 12];
-        name_buf[..name_len as usize].copy_from_slice(&name_bytes[..name_len as usize]);
-        w.write_all(&name_buf)?;
-        w.write_all(&entry.data_offset.to_le_bytes())?;
-        w.write_all(&entry.n_variants.to_le_bytes())?;
-        w.write_all(&entry.n_tiles.to_le_bytes())?;
-    }
-
-    w.seek(SeekFrom::Start(end_pos))?;
-    w.flush()?;
+    write_chr_directory(&mut w, chr_dir_pos, &chr_entries)?;
 
     let file_size = std::fs::metadata(&srp_path)?.len();
     selphi_step!("Multi-chr SRP: {} chromosomes, {:.1} MB → {}",

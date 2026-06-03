@@ -11,7 +11,6 @@
 use std::io::Write;
 use std::path::Path;
 
-use rayon::prelude::*;
 
 use crate::{selphi_info, selphi_step};
 
@@ -97,16 +96,7 @@ pub fn build_srp_from_bref3(
         if pos < min_pos { min_pos = pos; }
         if pos > max_pos { max_pos = pos; }
 
-        let chr_b = chrom.as_bytes();
-        let ref_b = ref_allele.as_bytes();
-        let alt_b = alt_allele.as_bytes();
-        vbin.extend_from_slice(&pos.to_le_bytes());
-        super::helpers::check_record_lens(chr_b, ref_b, alt_b)?; vbin.push(chr_b.len().min(255) as u8);
-        vbin.push(ref_b.len().min(255) as u8);
-        vbin.push(alt_b.len().min(255) as u8);
-        vbin.extend_from_slice(&chr_b[..chr_b.len().min(255)]);
-        vbin.extend_from_slice(&ref_b[..ref_b.len().min(255)]);
-        vbin.extend_from_slice(&alt_b[..alt_b.len().min(255)]);
+        super::helpers::push_variant_vbin(&mut vbin, pos, &chrom, &ref_allele, &alt_allele)?;
 
         if !first_id { ids.push(b'\n'); orig_ids.push(b'\n'); }
         ids.extend_from_slice(format!("{}-{}-{}-{}", chrom, pos, ref_allele, alt_allele).as_bytes());
@@ -243,16 +233,7 @@ pub fn build_srp_from_panel(
     for v in variants {
         if v.pos < min_pos { min_pos = v.pos; }
         if v.pos > max_pos { max_pos = v.pos; }
-        let chr_b = v.chrom.as_bytes();
-        let ref_b = v.ref_allele.as_bytes();
-        let alt_b = v.alt_allele.as_bytes();
-        vbin.extend_from_slice(&v.pos.to_le_bytes());
-        super::helpers::check_record_lens(chr_b, ref_b, alt_b)?; vbin.push(chr_b.len().min(255) as u8);
-        vbin.push(ref_b.len().min(255) as u8);
-        vbin.push(alt_b.len().min(255) as u8);
-        vbin.extend_from_slice(&chr_b[..chr_b.len().min(255)]);
-        vbin.extend_from_slice(&ref_b[..ref_b.len().min(255)]);
-        vbin.extend_from_slice(&alt_b[..alt_b.len().min(255)]);
+        super::helpers::push_variant_vbin(&mut vbin, v.pos, v.chrom, v.ref_allele, v.alt_allele)?;
         if !first_id { ids.push(b'\n'); orig_ids.push(b'\n'); }
         ids.extend_from_slice(format!("{}-{}-{}-{}", v.chrom, v.pos, v.ref_allele, v.alt_allele).as_bytes());
         orig_ids.extend_from_slice(v.id.as_bytes());
@@ -399,16 +380,7 @@ pub fn build_srp_unified(
             if pos > max_pos { max_pos = pos; }
 
             // Binary variant record
-            let chr_b = chrom.as_bytes();
-            let ref_b = ref_allele.as_bytes();
-            let alt_b = alt_allele.as_bytes();
-            vbin.extend_from_slice(&pos.to_le_bytes());
-            super::helpers::check_record_lens(chr_b, ref_b, alt_b)?; vbin.push(chr_b.len().min(255) as u8);
-            vbin.push(ref_b.len().min(255) as u8);
-            vbin.push(alt_b.len().min(255) as u8);
-            vbin.extend_from_slice(&chr_b[..chr_b.len().min(255)]);
-            vbin.extend_from_slice(&ref_b[..ref_b.len().min(255)]);
-            vbin.extend_from_slice(&alt_b[..alt_b.len().min(255)]);
+            super::helpers::push_variant_vbin(&mut vbin, pos, chrom, ref_allele, alt_allele)?;
 
             // IDs
             if !first_id { ids.push(b'\n'); orig_ids.push(b'\n'); }
@@ -647,50 +619,15 @@ fn flush_stripe_batch(
     pending: &mut Vec<(usize, Vec<Vec<u16>>)>,
     n_haps: usize,
 ) -> Result<(), SrpWriterError> {
-    use super::{SparseTile, TILE_ROWS, TILE_COLS};
-    use std::io::Cursor;
-
     if pending.is_empty() { return Ok(()); }
 
     let n_tile_cols = tile_writer.n_tile_cols;
     let n_variants = tile_writer.n_variants;
 
-    // Build list of all (stripe_idx_in_batch, stripe_id, band) tasks
-    let mut tasks: Vec<(usize, usize, usize)> = Vec::new();
-    for (i, (stripe_id, _)) in pending.iter().enumerate() {
-        for band in 0..n_tile_cols {
-            tasks.push((i, *stripe_id, band));
-        }
-    }
+    // Compress all pending tiles (shared with the multi-chr flush_tiles path).
+    let sorted = super::tiled::compress_pending_tiles(pending, n_haps, n_variants, n_tile_cols);
 
-    // Compress ALL tiles in parallel
-    let results: Vec<(usize, usize, Vec<u8>)> = tasks.into_par_iter().map(|(batch_idx, stripe_id, band)| {
-        let stripe_cols = &pending[batch_idx].1;
-        let svs = stripe_id * TILE_ROWS;
-        let n_rows = (TILE_ROWS.min(n_variants - svs)) as u16;
-        let col_start = band * TILE_COLS;
-        let col_end = (col_start + TILE_COLS).min(n_haps);
-        let n_cols = col_end - col_start;
-
-        let mut indptr = Vec::with_capacity(n_cols + 1);
-        let mut indices = Vec::new();
-        indptr.push(0u32);
-        for lc in 0..n_cols {
-            let gc = col_start + lc;
-            if gc < stripe_cols.len() {
-                indices.extend_from_slice(&stripe_cols[gc]);
-            }
-            indptr.push(indices.len() as u32);
-        }
-        let tile = SparseTile { indptr, indices, n_rows, n_cols: n_cols as u16 };
-        let compressed = zstd::encode_all(Cursor::new(&tile.to_bytes()), 3).unwrap();
-        (stripe_id, band, compressed)
-    }).collect();
-
-    // Write all compressed tiles to disk in order
-    // Sort by (stripe_id, band) to maintain file order
-    let mut sorted = results;
-    sorted.sort_by_key(|&(s, b, _)| (s, b));
+    // Write all compressed tiles to disk in (stripe_id, band) order.
     for (stripe_id, band, tdata) in sorted {
         let idx = stripe_id * n_tile_cols + band;
         tile_writer.tile_entries[idx] = (tile_writer.write_pos, tdata.len() as u32);

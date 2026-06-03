@@ -88,3 +88,63 @@ pub fn check_record_lens(chrom: &[u8], ref_allele: &[u8], alt_allele: &[u8]) -> 
     check("ALT", alt_allele)?;
     Ok(())
 }
+
+/// Append one variant's binary index entry to `vbin` (the SRP variant index),
+/// the single definition of the on-disk variant-record layout shared by every
+/// SRP writer (build_srp_unified / from_bref3 / from_panel, build_multi_chr_srp,
+/// merge_samples_single_chr).
+///
+/// Layout: `pos` (i64 LE), then the chrom/ref/alt length bytes (u8 each, capped
+/// at 255), then the chrom, ref and alt bytes themselves (each truncated to 255).
+/// Rejects any field longer than 255 B via [`check_record_lens`] before writing
+/// the length bytes (mirrors the inlined order: pos is appended first, then the
+/// check gates the rest).
+#[inline]
+pub fn push_variant_vbin(
+    vbin: &mut Vec<u8>,
+    pos: i64,
+    chrom: &str,
+    ref_allele: &str,
+    alt_allele: &str,
+) -> std::io::Result<()> {
+    let chr_b = chrom.as_bytes();
+    let ref_b = ref_allele.as_bytes();
+    let alt_b = alt_allele.as_bytes();
+    vbin.extend_from_slice(&pos.to_le_bytes());
+    check_record_lens(chr_b, ref_b, alt_b)?;
+    vbin.push(chr_b.len().min(255) as u8);
+    vbin.push(ref_b.len().min(255) as u8);
+    vbin.push(alt_b.len().min(255) as u8);
+    vbin.extend_from_slice(&chr_b[..chr_b.len().min(255)]);
+    vbin.extend_from_slice(&ref_b[..ref_b.len().min(255)]);
+    vbin.extend_from_slice(&alt_b[..alt_b.len().min(255)]);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::push_variant_vbin;
+
+    #[test]
+    fn push_variant_vbin_layout() {
+        // pos (i64 LE, 8B) + chr/ref/alt length bytes (u8) + chr + ref + alt.
+        let mut vbin = Vec::new();
+        push_variant_vbin(&mut vbin, 16050075i64, "22", "A", "GT").unwrap();
+        let mut exp = Vec::new();
+        exp.extend_from_slice(&16050075i64.to_le_bytes());
+        exp.push(2); // "22"
+        exp.push(1); // "A"
+        exp.push(2); // "GT"
+        exp.extend_from_slice(b"22");
+        exp.extend_from_slice(b"A");
+        exp.extend_from_slice(b"GT");
+        assert_eq!(vbin, exp);
+    }
+
+    #[test]
+    fn push_variant_vbin_rejects_oversize_allele() {
+        let long = "A".repeat(256);
+        let mut vbin = Vec::new();
+        assert!(push_variant_vbin(&mut vbin, 1, "22", &long, "T").is_err());
+    }
+}
