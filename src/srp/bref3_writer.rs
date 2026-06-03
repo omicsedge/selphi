@@ -141,53 +141,21 @@ pub fn write_bref3_from_bcf(source_path: &Path, output_path: &Path) -> io::Resul
                 chrom = if ci < contig_names.len() { contig_names[ci].clone() } else { format!("{}", ci) };
             }
 
-            let use_seq = rec.minor_count >= non_maj_threshold;
-
-            if use_seq {
-                let overflow = seq_coder_update(
-                    &mut hap_to_seq, &mut n_seq, &mut seq_cnt,
-                    &rec.alleles, rec.major_allele, n_haps, max_n_seq,
-                );
-
-                if overflow {
-                    // Flush block
-                    if !block_recs.is_empty() {
-                        bytes_written += write_bref3_block(
-                            &mut w, &chrom, &block_recs, &block_encodings,
-                            &hap_to_seq, n_seq, n_haps, &snv_perms, bytes_written, &mut block_index,
-                        )?;
-                        total_variants += block_recs.len() as u64;
-                        total_blocks += 1;
-                        block_recs.clear();
-                        block_encodings.clear();
-                    }
-                    // Reset and re-apply
-                    hap_to_seq.fill(0);
-                    n_seq = 1;
-                    seq_cnt.clear();
-                    seq_cnt.push(n_haps as u32);
-                    seq_coder_update(
-                        &mut hap_to_seq, &mut n_seq, &mut seq_cnt,
-                        &rec.alleles, rec.major_allele, n_haps, max_n_seq,
-                    );
-                }
-                block_encodings.push(RecEncoding::Seq);
-            } else {
-                block_encodings.push(RecEncoding::Allele);
-            }
-            block_recs.push(rec);
+            process_bref3_record(
+                &mut w, rec, &chrom, non_maj_threshold, n_haps, max_n_seq, &snv_perms,
+                &mut block_recs, &mut block_encodings, &mut hap_to_seq, &mut n_seq,
+                &mut seq_cnt, &mut bytes_written, &mut block_index,
+                &mut total_variants, &mut total_blocks,
+            )?;
         }
     }
 
     // Flush remaining
-    if !block_recs.is_empty() {
-        bytes_written += write_bref3_block(
-            &mut w, &chrom, &block_recs, &block_encodings,
-            &hap_to_seq, n_seq, n_haps, &snv_perms, bytes_written, &mut block_index,
-        )?;
-        total_variants += block_recs.len() as u64;
-        total_blocks += 1;
-    }
+    flush_final_bref3_block(
+        &mut w, &chrom, &block_recs, &block_encodings,
+        &hap_to_seq, n_seq, n_haps, &snv_perms, &mut bytes_written, &mut block_index,
+        &mut total_variants, &mut total_blocks,
+    )?;
 
     // End sentinel + index
     let chroms: Vec<String> = if chrom.is_empty() { vec![] } else { vec![chrom] };
@@ -304,50 +272,22 @@ pub fn write_bref3_from_srp(source_path: &Path, output_path: &Path) -> io::Resul
                 minor_count,
             };
 
-            let use_seq = rec.minor_count >= non_maj_threshold;
-            if use_seq {
-                let overflow = seq_coder_update(
-                    &mut hap_to_seq, &mut n_seq, &mut seq_cnt,
-                    &rec.alleles, rec.major_allele, n_haps, max_n_seq,
-                );
-                if overflow {
-                    if !block_recs.is_empty() {
-                        bytes_written += write_bref3_block(
-                            &mut w, &chrom_name, &block_recs, &block_encodings,
-                            &hap_to_seq, n_seq, n_haps, &snv_perms, bytes_written, &mut block_index,
-                        )?;
-                        total_variants += block_recs.len() as u64;
-                        total_blocks += 1;
-                        block_recs.clear();
-                        block_encodings.clear();
-                    }
-                    hap_to_seq.fill(0);
-                    n_seq = 1;
-                    seq_cnt.clear();
-                    seq_cnt.push(n_haps as u32);
-                    seq_coder_update(
-                        &mut hap_to_seq, &mut n_seq, &mut seq_cnt,
-                        &rec.alleles, rec.major_allele, n_haps, max_n_seq,
-                    );
-                }
-                block_encodings.push(RecEncoding::Seq);
-            } else {
-                block_encodings.push(RecEncoding::Allele);
-            }
-            block_recs.push(rec);
+            process_bref3_record(
+                &mut w, rec, &chrom_name, non_maj_threshold, n_haps, max_n_seq, &snv_perms,
+                &mut block_recs, &mut block_encodings, &mut hap_to_seq, &mut n_seq,
+                &mut seq_cnt, &mut bytes_written, &mut block_index,
+                &mut total_variants, &mut total_blocks,
+            )?;
         }
 
         idx = hi;
     }
 
-    if !block_recs.is_empty() {
-        bytes_written += write_bref3_block(
-            &mut w, &chrom_name, &block_recs, &block_encodings,
-            &hap_to_seq, n_seq, n_haps, &snv_perms, bytes_written, &mut block_index,
-        )?;
-        total_variants += block_recs.len() as u64;
-        total_blocks += 1;
-    }
+    flush_final_bref3_block(
+        &mut w, &chrom_name, &block_recs, &block_encodings,
+        &hap_to_seq, n_seq, n_haps, &snv_perms, &mut bytes_written, &mut block_index,
+        &mut total_variants, &mut total_blocks,
+    )?;
 
     // End sentinel + index (mirror write_bref3_from_bcf)
     let chroms: Vec<String> = vec![chrom_name.clone()];
@@ -507,6 +447,94 @@ fn parse_bcf_gt(raw: &RawBcfRec, n_haps: usize, n_samples: usize, gtk: u16) -> V
 }
 
 /// Write one BREF3 block.
+/// Append one variant record to the in-progress BREF3 block, flushing the block
+/// and resetting the SeqCoder state on overflow. Shared verbatim by the BCF- and
+/// SRP-sourced writers (`write_bref3_from_bcf` / `write_bref3_from_srp`) so the
+/// two record-encoding paths cannot drift. Mirrors `write_bref3_block`'s
+/// `offset`/return-delta convention via `bytes_written`.
+#[allow(clippy::too_many_arguments)]
+fn process_bref3_record<W: Write>(
+    w: &mut W,
+    rec: VariantRec,
+    chrom: &str,
+    non_maj_threshold: usize,
+    n_haps: usize,
+    max_n_seq: u16,
+    snv_perms: &[Vec<String>],
+    block_recs: &mut Vec<VariantRec>,
+    block_encodings: &mut Vec<RecEncoding>,
+    hap_to_seq: &mut [u16],
+    n_seq: &mut u16,
+    seq_cnt: &mut Vec<u32>,
+    bytes_written: &mut u64,
+    block_index: &mut Vec<(u64, i32)>,
+    total_variants: &mut u64,
+    total_blocks: &mut u64,
+) -> io::Result<()> {
+    let use_seq = rec.minor_count >= non_maj_threshold;
+    if use_seq {
+        let overflow = seq_coder_update(
+            hap_to_seq, n_seq, seq_cnt,
+            &rec.alleles, rec.major_allele, n_haps, max_n_seq,
+        );
+        if overflow {
+            // Flush block
+            if !block_recs.is_empty() {
+                *bytes_written += write_bref3_block(
+                    w, chrom, block_recs, block_encodings,
+                    hap_to_seq, *n_seq, n_haps, snv_perms, *bytes_written, block_index,
+                )?;
+                *total_variants += block_recs.len() as u64;
+                *total_blocks += 1;
+                block_recs.clear();
+                block_encodings.clear();
+            }
+            // Reset and re-apply
+            hap_to_seq.fill(0);
+            *n_seq = 1;
+            seq_cnt.clear();
+            seq_cnt.push(n_haps as u32);
+            seq_coder_update(
+                hap_to_seq, n_seq, seq_cnt,
+                &rec.alleles, rec.major_allele, n_haps, max_n_seq,
+            );
+        }
+        block_encodings.push(RecEncoding::Seq);
+    } else {
+        block_encodings.push(RecEncoding::Allele);
+    }
+    block_recs.push(rec);
+    Ok(())
+}
+
+/// Flush the final accumulated block after the main record loop and bump the
+/// running variant/block counters. Shared by both BREF3 writers.
+#[allow(clippy::too_many_arguments)]
+fn flush_final_bref3_block<W: Write>(
+    w: &mut W,
+    chrom: &str,
+    block_recs: &[VariantRec],
+    block_encodings: &[RecEncoding],
+    hap_to_seq: &[u16],
+    n_seq: u16,
+    n_haps: usize,
+    snv_perms: &[Vec<String>],
+    bytes_written: &mut u64,
+    block_index: &mut Vec<(u64, i32)>,
+    total_variants: &mut u64,
+    total_blocks: &mut u64,
+) -> io::Result<()> {
+    if !block_recs.is_empty() {
+        *bytes_written += write_bref3_block(
+            w, chrom, block_recs, block_encodings,
+            hap_to_seq, n_seq, n_haps, snv_perms, *bytes_written, block_index,
+        )?;
+        *total_variants += block_recs.len() as u64;
+        *total_blocks += 1;
+    }
+    Ok(())
+}
+
 fn write_bref3_block<W: Write>(
     w: &mut W, chrom: &str, recs: &[VariantRec], encodings: &[RecEncoding],
     hap_to_seq: &[u16], n_seq: u16, n_haps: usize, snv_perms: &[Vec<String>],
