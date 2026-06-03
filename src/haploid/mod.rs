@@ -589,7 +589,10 @@ fn phase_genotypes_inner(
                     // Uses Random(pd.seed()) = Random(seed + it)
                     let mut em_rng = rng::JavaRandom::new(window_seeds[wi] + it as i64);
                     for j in 0..max_samples_to_analyze {
-                        let k = j + (em_rng.next_int((n_samples - j) as i32) as usize);
+                        // Clamp the cast: next_int takes i32, and (n_samples - j) as i32
+                        // would wrap negative above 2^31 samples (next_int(<0) returns 0,
+                        // silently breaking the Fisher-Yates swap). Inert below 2^31.
+                        let k = j + (em_rng.next_int((n_samples - j).min(i32::MAX as usize) as i32) as usize);
                         ia.swap(j, k);
                     }
                     ia.truncate(max_samples_to_analyze);

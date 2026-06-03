@@ -298,7 +298,13 @@ pub fn compress_pending_tiles(
     let mut results: Vec<(usize, usize, Vec<u8>)> = tasks.into_par_iter().map(|(batch_idx, stripe_id, band)| {
         let stripe_cols = &pending[batch_idx].1;
         let svs = stripe_id * TILE_ROWS;
-        let n_rows = (TILE_ROWS.min(n_variants - svs)) as u16;
+        // saturating_sub: a corrupt panel chunk with an out-of-range CSC row index
+        // (scatter_chunk_into_active, writer.rs) can derive a stripe past the declared
+        // variant count, making svs >= n_variants. Clamp instead of underflowing
+        // (debug builds assert loudly; release builds fail soft rather than wrapping
+        // to a huge u16 and corrupting tile row counts). No effect on valid panels.
+        debug_assert!(svs < n_variants, "tile stripe start {svs} >= n_variants {n_variants} (corrupt chunk indices)");
+        let n_rows = (TILE_ROWS.min(n_variants.saturating_sub(svs))) as u16;
         let col_start = band * TILE_COLS;
         let col_end = (col_start + TILE_COLS).min(n_haps);
         let n_cols = col_end - col_start;

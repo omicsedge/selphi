@@ -617,6 +617,11 @@ impl VariantReader {
                     }
                     let ls = u32::from_le_bytes(lbuf) as usize;
                     if ls == 0 { return None; }
+                    // BCF SHARED block has a 24-byte fixed header (chrom + pos + rlen +
+                    // qual + n_info + n_allele + n_fmt); a truncated record (ls < 24)
+                    // would panic on the sb[..] slicing below. Mirror the guard in
+                    // srp/bcf_reader.rs and bail cleanly on malformed input.
+                    if ls < 24 { return None; }
                     let mut libuf = [0u8; 4];
                     reader.read_exact(&mut libuf).ok()?;
                     let li = u32::from_le_bytes(libuf) as usize;
