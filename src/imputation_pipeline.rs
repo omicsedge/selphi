@@ -111,15 +111,15 @@ fn apply_haploid_detection(
 /// PBWT / HMM auto-calibrated parameters derived from the reference panel
 /// dimensions plus any explicit CLI overrides.
 #[derive(Debug, Clone, Copy)]
-struct PbwtParams {
+pub(crate) struct PbwtParams {
     /// Minimum PBWT match length (in SNPs).
-    match_length: usize,
+    pub(crate) match_length: usize,
     /// Forward-direction match candidate cap.
-    fl_fwd: usize,
+    pub(crate) fl_fwd: usize,
     /// Backward-direction match candidate cap.
-    fl_bwd: usize,
+    pub(crate) fl_bwd: usize,
     /// HMM effective population size.
-    est_ne: i64,
+    pub(crate) est_ne: i64,
 }
 
 /// Resolve the PBWT match length, forward / backward candidate caps, and the
@@ -127,27 +127,38 @@ struct PbwtParams {
 /// falling back to panel-size-driven defaults otherwise. Validated on three
 /// reference panels two orders of magnitude apart in size; the ratio
 /// Ne / n_ref stays near 36 across all of them.
-fn auto_calibrate_pbwt_params(args: &Args, n_ref: usize, n_chip: usize) -> PbwtParams {
-    let match_length = args.match_length.unwrap_or_else(|| {
+/// Override params are the user's explicit `--match-length` / `--fl-fwd` /
+/// `--fl-bwd` (each `None` = auto) and `--est-ne` (`<= 0` = auto). Taken as
+/// primitives rather than `&Args` so the multi-chr orchestrator (which carries
+/// a `MultiChrImputeConfig`, not `Args`) shares the exact same calibration.
+pub(crate) fn auto_calibrate_pbwt_params(
+    match_length_override: Option<usize>,
+    fl_fwd_override: Option<usize>,
+    fl_bwd_override: Option<usize>,
+    est_ne_override: i64,
+    n_ref: usize,
+    n_chip: usize,
+) -> PbwtParams {
+    let match_length = match_length_override.unwrap_or_else(|| {
         // saturating_sub: log2(n_ref) < 7 when n_ref < 128 would underflow usize.
         let ml = ((n_ref as f64).log2() as usize).saturating_sub(7);
         ml.min(n_chip / 2000).max(5)
     });
     let log2_haps = (n_ref as f64).log2();
-    let fl_fwd = args.fl_fwd.unwrap_or_else(|| {
+    let fl_fwd = fl_fwd_override.unwrap_or_else(|| {
         let v = (2600.0 / log2_haps) as usize;
         v.clamp(100, 450)
     });
-    let fl_bwd = args.fl_bwd.unwrap_or_else(|| {
+    let fl_bwd = fl_bwd_override.unwrap_or_else(|| {
         ((fl_fwd as f64 * 2.4 / log2_haps) as usize).max(13)
     });
-    let est_ne = if args.est_ne <= 0 {
+    let est_ne = if est_ne_override <= 0 {
         // Adaptive Ne: scales linearly with panel size — constant ratio
         // Ne / n_ref ≈ 36 across panels validated above.
         let auto_ne = (36.4 * n_ref as f64).round() as i64;
         auto_ne.max(20_000)
     } else {
-        args.est_ne
+        est_ne_override
     };
     PbwtParams { match_length, fl_fwd, fl_bwd, est_ne }
 }
@@ -869,7 +880,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
 
     // 7. Auto-calibrate parameters
     let PbwtParams { match_length, fl_fwd, fl_bwd, est_ne } =
-        auto_calibrate_pbwt_params(args, n_ref, n_chip);
+        auto_calibrate_pbwt_params(args.match_length, args.fl_fwd, args.fl_bwd, args.est_ne, n_ref, n_chip);
     selphi_debug!("  Match length: {}, fl_fwd: {}, fl_bwd: {}, Ne: {}",
         match_length, fl_fwd, fl_bwd, est_ne);
 
