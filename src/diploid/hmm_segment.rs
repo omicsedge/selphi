@@ -1137,8 +1137,8 @@ impl SegmentHmm {
                 let prev_dipcount = graph.count_diplotypes(curr_seg);
                 let next_dipcount = graph.count_diplotypes(curr_seg + 1);
                 let n_t = prev_dipcount * next_dipcount;
-                let prev_codes = Self::enum_dips(graph.diplotypes[curr_seg]);
-                let next_codes = Self::enum_dips(graph.diplotypes[curr_seg + 1]);
+                let prev_codes = enumerate_diplotypes(graph.diplotypes[curr_seg]);
+                let next_codes = enumerate_diplotypes(graph.diplotypes[curr_seg + 1]);
                 trans_write_offset -= n_t;
                 if !hap_underflow {
                     let out = &mut transition_probs[trans_write_offset..trans_write_offset + n_t];
@@ -1180,7 +1180,7 @@ impl SegmentHmm {
         // SET_FIRST_TRANS
         if trans_write_offset > 0 && self.prob_sum_t > 0.0 {
             let scale = (1.0f32 / self.prob_sum_t) as f64;
-            let first_codes = Self::enum_dips(graph.diplotypes[seg_first]);
+            let first_codes = enumerate_diplotypes(graph.diplotypes[seg_first]);
             let n_first = first_codes.len();
             let mut sum_dip = 0.0f64;
             for (t, &d) in first_codes.iter().enumerate() {
@@ -1375,10 +1375,6 @@ impl SegmentHmm {
             }
         }
         sum.is_nan() || sum.is_infinite() || sum < f64::MIN_POSITIVE
-    }
-
-    fn enum_dips(mask: u64) -> Vec<u8> {
-        (0..64u8).filter(|&d| dip_get(mask, d as usize)).collect()
     }
 
     /// Get transition parameters (nt, yt) for a locus.

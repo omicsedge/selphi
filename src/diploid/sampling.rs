@@ -255,17 +255,6 @@ pub fn solve(graph: &mut GenotypeGraph) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Enumerate active diplotype codes from a 64-bit bitmask.
-fn enumerate_diplotypes(dip_mask: u64) -> Vec<u8> {
-    let mut codes = Vec::new();
-    for d in 0..64u8 {
-        if dip_get(dip_mask, d as usize) {
-            codes.push(d);
-        }
-    }
-    codes
-}
-
 /// Apply sampled diplotype codes to the genotype graph.
 /// Updates the haplotype alleles based on the sampled diplotype path.
 fn apply_sampled_diplotypes(
