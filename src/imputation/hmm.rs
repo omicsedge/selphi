@@ -200,6 +200,30 @@ fn build_dense_matches(
     (dense_matches, n_matches, state_to_hap, n_states)
 }
 
+/// State pruning for large panels: zero out states below `prune_threshold`
+/// of `row_sum`, then renormalize the survivors so the row sum is preserved.
+///
+/// `row` is exactly the `n_states` working slice of the current HMM row; the
+/// loops iterate over its full length, matching the original inlined `0..n_states`
+/// loops verbatim (both the forward `cur` slice and the backward `cur_bwd` buffer
+/// are length `n_states`). FP arithmetic and operation order are identical.
+#[inline]
+fn prune_row(row: &mut [f32], row_sum: f64, prune_threshold: f64) {
+    if prune_threshold > 0.0 && row_sum > 0.0 {
+        let thresh = (prune_threshold * row_sum) as f32;
+        let mut pruned_sum = 0.0f64;
+        for v in row.iter() {
+            if *v >= thresh { pruned_sum += *v as f64; }
+        }
+        if pruned_sum > 0.0 {
+            let rescale = (row_sum / pruned_sum) as f32;
+            for v in row.iter_mut() {
+                if *v < thresh { *v = 0.0; } else { *v *= rescale; }
+            }
+        }
+    }
+}
+
 /// Forward pass of the Li-Stephens HMM.
 ///
 /// Returns (fwd, last_alpha, last_sum) where fwd is (n_rows, n_states) row-major.
@@ -308,19 +332,7 @@ fn compute_forward(
         last_sum = row_sum;
 
         // State pruning for large panels
-        if prune_threshold > 0.0 && last_sum > 0.0 {
-            let thresh = (prune_threshold * last_sum) as f32;
-            let mut pruned_sum = 0.0f64;
-            for j in 0..n_states {
-                if cur[j] >= thresh { pruned_sum += cur[j] as f64; }
-            }
-            if pruned_sum > 0.0 {
-                let rescale = (last_sum / pruned_sum) as f32;
-                for j in 0..n_states {
-                    if cur[j] < thresh { cur[j] = 0.0; } else { cur[j] *= rescale; }
-                }
-            }
-        }
+        prune_row(cur, last_sum, prune_threshold);
     }
 
     // Boundary condition for last block
@@ -462,19 +474,7 @@ fn streaming_backward_combine(
             for j in 0..n_states { row_sum += cur_bwd[j] as f64; }
             last_sum = row_sum;
 
-            if prune_threshold > 0.0 && last_sum > 0.0 {
-                let thresh = (prune_threshold * last_sum) as f32;
-                let mut pruned_sum = 0.0f64;
-                for j in 0..n_states {
-                    if cur_bwd[j] >= thresh { pruned_sum += cur_bwd[j] as f64; }
-                }
-                if pruned_sum > 0.0 {
-                    let rescale = (last_sum / pruned_sum) as f32;
-                    for j in 0..n_states {
-                        if cur_bwd[j] < thresh { cur_bwd[j] = 0.0; } else { cur_bwd[j] *= rescale; }
-                    }
-                }
-            }
+            prune_row(&mut cur_bwd, last_sum, prune_threshold);
         }
 
         // Combine: weights[row] = fwd[row] * cur_bwd — branch-free, auto-vectorizes
