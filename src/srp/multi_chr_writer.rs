@@ -77,16 +77,11 @@ pub fn build_multi_chr_srp(
         "chromosomes": contig_order.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
         "contig_fields": header.contig_field,
     });
-    let global_meta_compressed = zstd::encode_all(
-        Cursor::new(global_meta_json.to_string().as_bytes()), 3)
-        .map_err(io::Error::other)?;
-
     // Write multi-chr magic
     w.write_all(SRP_MULTI_CHR_MAGIC)?;
 
     // Write global metadata (exact size)
-    w.write_all(&(global_meta_compressed.len() as u32).to_le_bytes())?;
-    w.write_all(&global_meta_compressed)?;
+    super::writer::write_section(&mut w, global_meta_json.to_string().as_bytes())?;
 
     // Write n_chromosomes
     w.write_all(&(n_chromosomes as u32).to_le_bytes())?;
@@ -97,11 +92,7 @@ pub fn build_multi_chr_srp(
     w.write_all(&vec![0u8; chr_dir_size])?;
 
     // Write shared sample IDs
-    let sample_compressed = zstd::encode_all(
-        Cursor::new(header.sample_names.join("\n").as_bytes()), 3)
-        .map_err(io::Error::other)?;
-    w.write_all(&(sample_compressed.len() as u32).to_le_bytes())?;
-    w.write_all(&sample_compressed)?;
+    super::writer::write_section(&mut w, header.sample_names.join("\n").as_bytes())?;
 
     // Process each chromosome
     let tmp_dir = tempfile::tempdir()?;
@@ -119,7 +110,7 @@ pub fn build_multi_chr_srp(
         let chunk_size = if chunk_size_override > 0 {
             chunk_size_override
         } else {
-            auto_chunk_size(contig_csi.n_mapped as usize, n_haps)
+            super::writer::auto_chunk_size(contig_csi.n_mapped as usize, n_haps)
         };
 
         let (_hdr, region_results) = bcf_reader::read_bcf_parallel_for_contig(
@@ -170,11 +161,8 @@ pub fn build_multi_chr_srp(
                 if pos < min_pos { min_pos = pos; }
                 if pos > max_pos { max_pos = pos; }
 
-                super::helpers::push_variant_vbin(&mut vbin, pos, chrom, ref_allele, alt_allele)?;
-
-                if !first_id { ids.push(b'\n'); orig_ids.push(b'\n'); }
-                ids.extend_from_slice(format!("{}-{}-{}-{}", chrom, pos, ref_allele, alt_allele).as_bytes());
-                orig_ids.extend_from_slice(original_id.as_bytes());
+                super::writer::push_variant_index(&mut vbin, &mut ids, &mut orig_ids, first_id,
+                    chrom, pos, ref_allele, alt_allele, original_id)?;
                 first_id = false;
             }
         }
@@ -217,25 +205,16 @@ pub fn build_multi_chr_srp(
             "n_tile_rows": n_tile_rows,
             "n_tile_cols": n_tile_cols,
         });
-        let meta_compressed = zstd::encode_all(Cursor::new(meta_json.to_string().as_bytes()), 3)
-            .map_err(io::Error::other)?;
-        w.write_all(&(meta_compressed.len() as u32).to_le_bytes())?;
-        w.write_all(&meta_compressed)?;
+        super::writer::write_section(&mut w, meta_json.to_string().as_bytes())?;
 
         // Variants binary
-        let vbin_compressed = zstd::encode_all(Cursor::new(&vbin), 3).map_err(io::Error::other)?;
-        w.write_all(&(vbin_compressed.len() as u32).to_le_bytes())?;
-        w.write_all(&vbin_compressed)?;
+        super::writer::write_section(&mut w, &vbin)?;
 
         // IDs
-        let ids_compressed = zstd::encode_all(Cursor::new(&ids), 3).map_err(io::Error::other)?;
-        w.write_all(&(ids_compressed.len() as u32).to_le_bytes())?;
-        w.write_all(&ids_compressed)?;
+        super::writer::write_section(&mut w, &ids)?;
 
         // Original IDs
-        let orig_compressed = zstd::encode_all(Cursor::new(&orig_ids), 3).map_err(io::Error::other)?;
-        w.write_all(&(orig_compressed.len() as u32).to_le_bytes())?;
-        w.write_all(&orig_compressed)?;
+        super::writer::write_section(&mut w, &orig_ids)?;
 
         // Tile index placeholder
         w.write_all(&(n_tiles as u32).to_le_bytes())?;
@@ -299,14 +278,7 @@ pub fn build_multi_chr_srp(
             n_tile_cols, &mut tile_entries, &mut write_pos)?;
 
         // Seek back to fill tile index
-        w.flush()?;
-        let current_pos = w.stream_position()?;
-        w.seek(SeekFrom::Start(tile_index_pos))?;
-        for &(offset, comp_size) in &tile_entries {
-            w.write_all(&offset.to_le_bytes())?;
-            w.write_all(&comp_size.to_le_bytes())?;
-        }
-        w.seek(SeekFrom::Start(current_pos))?;
+        fill_tile_index(&mut w, tile_index_pos, &tile_entries)?;
 
         let tile_total: u64 = tile_entries.iter().map(|&(_, sz)| sz as u64).sum();
         selphi_info!("    tiles: {:.1} MB ({} tiles)", tile_total as f64 / 1e6, n_tiles);
@@ -353,6 +325,30 @@ fn flush_tiles<W: Write + Seek>(
     }
 
     pending.clear();
+    Ok(())
+}
+
+/// Fill an SRP tile index in place: flush the writer, remember the current
+/// (end) position, seek back to `tile_index_pos`, write each tile's
+/// `(offset: u64 LE, comp_size: u32 LE)` entry, then restore the cursor to the
+/// saved end position. Shared by the seek-back tile-index fill in
+/// `build_multi_chr_srp`, `merge_samples_single_chr` and `merge_single_chr_srps`.
+/// Byte-for-byte identical to the inlined flush / stream_position / seek / write
+/// loop / seek-back it replaces (callers that previously flushed again after the
+/// seek-back keep that trailing `w.flush()`).
+fn fill_tile_index<W: Write + Seek>(
+    w: &mut W,
+    tile_index_pos: u64,
+    tile_entries: &[(u64, u32)],
+) -> io::Result<()> {
+    w.flush()?;
+    let resume_pos = w.stream_position()?;
+    w.seek(SeekFrom::Start(tile_index_pos))?;
+    for &(offset, comp_size) in tile_entries {
+        w.write_all(&offset.to_le_bytes())?;
+        w.write_all(&comp_size.to_le_bytes())?;
+    }
+    w.seek(SeekFrom::Start(resume_pos))?;
     Ok(())
 }
 
@@ -517,47 +513,32 @@ pub fn merge_samples_single_chr(
         "n_tile_rows": n_tile_rows,
         "n_tile_cols": n_tile_cols,
     });
-    let meta_compressed = zstd::encode_all(
-        Cursor::new(meta_json.to_string().as_bytes()), 3).map_err(io::Error::other)?;
-    w.write_all(&(meta_compressed.len() as u32).to_le_bytes())?;
-    w.write_all(&meta_compressed)?;
+    super::writer::write_section(&mut w, meta_json.to_string().as_bytes())?;
 
     // Variants binary
     let mut vbin = Vec::with_capacity(n_variants * 20);
     let mut ids_buf = Vec::new();
     let mut orig_buf = Vec::new();
     for (i, v) in merged_variants.iter().enumerate() {
-        super::helpers::push_variant_vbin(&mut vbin, v.pos, &v.chr, &v.ref_allele, &v.alt_allele)?;
-        if i > 0 { ids_buf.push(b'\n'); orig_buf.push(b'\n'); }
+        // Tile-only merge has no original IDs, so the synthetic chrom-pos-ref-alt
+        // ID is written to BOTH the synthetic and original ID streams.
         let id = format!("{}-{}-{}-{}", v.chr, v.pos, v.ref_allele, v.alt_allele);
-        ids_buf.extend_from_slice(id.as_bytes());
-        orig_buf.extend_from_slice(id.as_bytes());
+        super::writer::push_variant_index(&mut vbin, &mut ids_buf, &mut orig_buf, i == 0,
+            &v.chr, v.pos, &v.ref_allele, &v.alt_allele, &id)?;
     }
-    let vbin_c = zstd::encode_all(Cursor::new(&vbin), 3).map_err(io::Error::other)?;
-    w.write_all(&(vbin_c.len() as u32).to_le_bytes())?;
-    w.write_all(&vbin_c)?;
+    super::writer::write_section(&mut w, &vbin)?;
 
     // Sample IDs
-    let sample_c = zstd::encode_all(Cursor::new(all_sample_ids.join("\n").as_bytes()), 3)
-        .map_err(io::Error::other)?;
-    w.write_all(&(sample_c.len() as u32).to_le_bytes())?;
-    w.write_all(&sample_c)?;
+    super::writer::write_section(&mut w, all_sample_ids.join("\n").as_bytes())?;
 
     // IDs
-    let ids_c = zstd::encode_all(Cursor::new(&ids_buf), 3).map_err(io::Error::other)?;
-    w.write_all(&(ids_c.len() as u32).to_le_bytes())?;
-    w.write_all(&ids_c)?;
+    super::writer::write_section(&mut w, &ids_buf)?;
 
     // Original IDs
-    let orig_c = zstd::encode_all(Cursor::new(&orig_buf), 3).map_err(io::Error::other)?;
-    w.write_all(&(orig_c.len() as u32).to_le_bytes())?;
-    w.write_all(&orig_c)?;
+    super::writer::write_section(&mut w, &orig_buf)?;
 
     // Contig field
-    let contig_c = zstd::encode_all(Cursor::new(contig_field.as_bytes()), 3)
-        .map_err(io::Error::other)?;
-    w.write_all(&(contig_c.len() as u32).to_le_bytes())?;
-    w.write_all(&contig_c)?;
+    super::writer::write_section(&mut w, contig_field.as_bytes())?;
 
     // Chunk index (required by SrpReader::open between contig and tile index).
     // merge_samples_single_chr produces tile-only panels — no CSC chunks —
@@ -676,14 +657,7 @@ pub fn merge_samples_single_chr(
     }
 
     // Fill tile index
-    w.flush()?;
-    let end_pos = w.stream_position()?;
-    w.seek(SeekFrom::Start(tile_index_pos))?;
-    for &(offset, comp_size) in &tile_entries {
-        w.write_all(&offset.to_le_bytes())?;
-        w.write_all(&comp_size.to_le_bytes())?;
-    }
-    w.seek(SeekFrom::Start(end_pos))?;
+    fill_tile_index(&mut w, tile_index_pos, &tile_entries)?;
     w.flush()?;
 
     let file_size = std::fs::metadata(&srp_path)?.len();
@@ -693,13 +667,6 @@ pub fn merge_samples_single_chr(
         tile_total as f64 / 1e6, file_size as f64 / 1e6, srp_path.display());
 
     Ok(())
-}
-
-fn auto_chunk_size(n_variants: usize, n_haps: usize) -> usize {
-    let target_bytes: f64 = 10.0 * 1024.0 * 1024.0;
-    let bytes_per_var = 0.06 * n_haps as f64 * 4.0;
-    let cs = (target_bytes / bytes_per_var.max(1.0)) as usize;
-    cs.max(n_variants.div_ceil(2000)).clamp(1000, 50000)
 }
 
 /// Build a multi-chr SRP from a directory of per-chr BCF/VCF files.
@@ -890,16 +857,11 @@ pub fn merge_single_chr_srps(
         "chromosomes": chromosomes,
         "contig_fields": all_contig_fields,
     });
-    let global_meta_compressed = zstd::encode_all(
-        Cursor::new(global_meta_json.to_string().as_bytes()), 3)
-        .map_err(io::Error::other)?;
-
     // Write multi-chr magic
     w.write_all(SRP_MULTI_CHR_MAGIC)?;
 
     // Global metadata (exact size)
-    w.write_all(&(global_meta_compressed.len() as u32).to_le_bytes())?;
-    w.write_all(&global_meta_compressed)?;
+    super::writer::write_section(&mut w, global_meta_json.to_string().as_bytes())?;
 
     // n_chromosomes
     let n_chr = readers.len();
@@ -910,11 +872,7 @@ pub fn merge_single_chr_srps(
     w.write_all(&vec![0u8; n_chr * 32])?;
 
     // Shared sample IDs
-    let sample_compressed = zstd::encode_all(
-        Cursor::new(readers[0].1.sample_ids.join("\n").as_bytes()), 3)
-        .map_err(io::Error::other)?;
-    w.write_all(&(sample_compressed.len() as u32).to_le_bytes())?;
-    w.write_all(&sample_compressed)?;
+    super::writer::write_section(&mut w, readers[0].1.sample_ids.join("\n").as_bytes())?;
 
     // Process each chromosome: copy per-chr data from source SRP
     let mut chr_entries: Vec<ChrDirectoryEntry> = Vec::new();
@@ -945,10 +903,7 @@ pub fn merge_single_chr_srps(
             "n_tile_rows": n_tile_rows,
             "n_tile_cols": n_tile_cols,
         });
-        let meta_compressed = zstd::encode_all(Cursor::new(meta_json.to_string().as_bytes()), 3)
-            .map_err(io::Error::other)?;
-        w.write_all(&(meta_compressed.len() as u32).to_le_bytes())?;
-        w.write_all(&meta_compressed)?;
+        super::writer::write_section(&mut w, meta_json.to_string().as_bytes())?;
 
         // Variants binary — re-encode from reader's variant structs
         let mut vbin = Vec::with_capacity(n_variants * 20);
@@ -962,17 +917,11 @@ pub fn merge_single_chr_srps(
                 orig_buf.extend_from_slice(reader.original_ids[i].as_bytes());
             }
         }
-        let vbin_c = zstd::encode_all(Cursor::new(&vbin), 3).map_err(io::Error::other)?;
-        w.write_all(&(vbin_c.len() as u32).to_le_bytes())?;
-        w.write_all(&vbin_c)?;
+        super::writer::write_section(&mut w, &vbin)?;
 
-        let ids_c = zstd::encode_all(Cursor::new(&ids_buf), 3).map_err(io::Error::other)?;
-        w.write_all(&(ids_c.len() as u32).to_le_bytes())?;
-        w.write_all(&ids_c)?;
+        super::writer::write_section(&mut w, &ids_buf)?;
 
-        let orig_c = zstd::encode_all(Cursor::new(&orig_buf), 3).map_err(io::Error::other)?;
-        w.write_all(&(orig_c.len() as u32).to_le_bytes())?;
-        w.write_all(&orig_c)?;
+        super::writer::write_section(&mut w, &orig_buf)?;
 
         // Tile index + tile data: copy compressed tiles with offset adjustment
         let tiled = reader.tiled.as_ref()
@@ -1009,14 +958,7 @@ pub fn merge_single_chr_srps(
         }
 
         // Seek back to fill tile index
-        w.flush()?;
-        let current_pos = w.stream_position()?;
-        w.seek(SeekFrom::Start(tile_index_pos))?;
-        for &(offset, comp_size) in &tile_entries {
-            w.write_all(&offset.to_le_bytes())?;
-            w.write_all(&comp_size.to_le_bytes())?;
-        }
-        w.seek(SeekFrom::Start(current_pos))?;
+        fill_tile_index(&mut w, tile_index_pos, &tile_entries)?;
 
         let tile_total: u64 = tile_entries.iter().map(|&(_, sz)| sz as u64).sum();
         selphi_info!("    {} variants, tiles: {:.1} MB", n_variants, tile_total as f64 / 1e6);

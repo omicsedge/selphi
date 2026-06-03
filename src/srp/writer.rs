@@ -96,11 +96,8 @@ pub fn build_srp_from_bref3(
         if pos < min_pos { min_pos = pos; }
         if pos > max_pos { max_pos = pos; }
 
-        super::helpers::push_variant_vbin(&mut vbin, pos, &chrom, &ref_allele, &alt_allele)?;
-
-        if !first_id { ids.push(b'\n'); orig_ids.push(b'\n'); }
-        ids.extend_from_slice(format!("{}-{}-{}-{}", chrom, pos, ref_allele, alt_allele).as_bytes());
-        orig_ids.extend_from_slice(id.as_bytes());
+        push_variant_index(&mut vbin, &mut ids, &mut orig_ids, first_id,
+            &chrom, pos, &ref_allele, &alt_allele, &id)?;
         first_id = false;
         n_variants += 1;
     }
@@ -233,10 +230,8 @@ pub fn build_srp_from_panel(
     for v in variants {
         if v.pos < min_pos { min_pos = v.pos; }
         if v.pos > max_pos { max_pos = v.pos; }
-        super::helpers::push_variant_vbin(&mut vbin, v.pos, v.chrom, v.ref_allele, v.alt_allele)?;
-        if !first_id { ids.push(b'\n'); orig_ids.push(b'\n'); }
-        ids.extend_from_slice(format!("{}-{}-{}-{}", v.chrom, v.pos, v.ref_allele, v.alt_allele).as_bytes());
-        orig_ids.extend_from_slice(v.id.as_bytes());
+        push_variant_index(&mut vbin, &mut ids, &mut orig_ids, first_id,
+            v.chrom, v.pos, v.ref_allele, v.alt_allele, v.id)?;
         first_id = false;
     }
 
@@ -325,11 +320,8 @@ pub fn build_srp_unified(
     let csi = super::csi::parse_csi(&csi_path).map_err(|_|
         SrpWriterError::InvalidInput("Failed to read CSI index".into()))?;
 
-    let chunk_size = if chunk_size_override > 0 { chunk_size_override } else {
-        let bpv = 0.06 * n_haps as f64 * 4.0;
-        ((10.0 * 1024.0 * 1024.0 / bpv.max(1.0)) as usize)
-            .max((csi.n_mapped as usize).div_ceil(2000)).clamp(1000, 50000)
-    };
+    let chunk_size = if chunk_size_override > 0 { chunk_size_override }
+        else { auto_chunk_size(csi.n_mapped as usize, n_haps) };
 
     let tmp_dir = tempfile::tempdir()?;
 
@@ -379,13 +371,9 @@ pub fn build_srp_unified(
             if pos < min_pos { min_pos = pos; }
             if pos > max_pos { max_pos = pos; }
 
-            // Binary variant record
-            super::helpers::push_variant_vbin(&mut vbin, pos, chrom, ref_allele, alt_allele)?;
-
-            // IDs
-            if !first_id { ids.push(b'\n'); orig_ids.push(b'\n'); }
-            ids.extend_from_slice(format!("{}-{}-{}-{}", chrom, pos, ref_allele, alt_allele).as_bytes());
-            orig_ids.extend_from_slice(original_id.as_bytes());
+            // Binary variant record + synthetic/original IDs
+            push_variant_index(&mut vbin, &mut ids, &mut orig_ids, first_id,
+                chrom, pos, ref_allele, alt_allele, original_id)?;
             first_id = false;
         }
     }
@@ -510,7 +498,7 @@ impl StreamingTileWriter {
         output_path: &std::path::Path,
         metadata: &SrpMetadataForWrite,
     ) -> Result<Self, SrpWriterError> {
-        use std::io::{Write, Seek, Cursor};
+        use std::io::{Write, Seek};
 
         let n_tile_rows = metadata.n_variants.div_ceil(super::TILE_ROWS);
         let n_tile_cols = metadata.n_haps.div_ceil(super::TILE_COLS);
@@ -526,28 +514,19 @@ impl StreamingTileWriter {
             "tile_rows": super::TILE_ROWS, "tile_cols": super::TILE_COLS,
             "n_tile_rows": n_tile_rows, "n_tile_cols": n_tile_cols,
         });
-        let meta_compressed = zstd::encode_all(Cursor::new(meta_json.to_string().as_bytes()), 3)?;
-        let vbin_compressed = zstd::encode_all(Cursor::new(&metadata.vbin), 3)?;
-        let sample_compressed = zstd::encode_all(
-            Cursor::new(metadata.sample_names.join("\n").as_bytes()), 3)?;
-        let ids_compressed = zstd::encode_all(Cursor::new(&metadata.ids), 3)?;
-        let orig_compressed = zstd::encode_all(Cursor::new(&metadata.orig_ids), 3)?;
         let contig_bytes = metadata.contig_field.as_bytes();
 
         let out = std::fs::File::create(output_path)?;
         let mut w = std::io::BufWriter::with_capacity(4 << 20, out);
 
         w.write_all(SRP_SINGLE_CHR_MAGIC)?;
-        w.write_all(&(meta_compressed.len() as u32).to_le_bytes())?;
-        w.write_all(&meta_compressed)?;
-        w.write_all(&(vbin_compressed.len() as u32).to_le_bytes())?;
-        w.write_all(&vbin_compressed)?;
-        w.write_all(&(sample_compressed.len() as u32).to_le_bytes())?;
-        w.write_all(&sample_compressed)?;
-        w.write_all(&(ids_compressed.len() as u32).to_le_bytes())?;
-        w.write_all(&ids_compressed)?;
-        w.write_all(&(orig_compressed.len() as u32).to_le_bytes())?;
-        w.write_all(&orig_compressed)?;
+        write_section(&mut w, meta_json.to_string().as_bytes())?;
+        write_section(&mut w, &metadata.vbin)?;
+        write_section(&mut w, metadata.sample_names.join("\n").as_bytes())?;
+        write_section(&mut w, &metadata.ids)?;
+        write_section(&mut w, &metadata.orig_ids)?;
+        // Contig field is stored RAW (not zstd-framed), so it is written directly
+        // rather than via write_section.
         w.write_all(&(contig_bytes.len() as u32).to_le_bytes())?;
         w.write_all(contig_bytes)?;
         w.write_all(&0u32.to_le_bytes())?; // n_chunks = 0 (tiled only)
@@ -636,11 +615,64 @@ fn flush_stripe_batch(
     Ok(())
 }
 
-fn auto_chunk_size(n_variants: usize, n_haps: usize) -> usize {
+/// SRP chunk-size heuristic: target ~10 MiB per chunk given ~0.06-density
+/// 4-byte-per-cell rows, floored so the panel never exceeds ~2000 chunks and
+/// clamped to [1000, 50000]. Shared by every SRP writer (single-chr / from_bref3
+/// / from_panel and the multi-chr writer) so the chunking is byte-for-byte the
+/// same regardless of source path. `n_variants` is the row-count driver (the
+/// BCF path passes the CSI mapped-record count, which is the same value).
+#[inline]
+pub(crate) fn auto_chunk_size(n_variants: usize, n_haps: usize) -> usize {
     let target_bytes: f64 = 10.0 * 1024.0 * 1024.0;
     let bytes_per_var = 0.06 * n_haps as f64 * 4.0;
     let cs = (target_bytes / bytes_per_var.max(1.0)) as usize;
     cs.max(n_variants.div_ceil(2000)).clamp(1000, 50000)
+}
+
+/// Write one length-prefixed zstd section: zstd-compress `data` at level 3, then
+/// write its `u32` little-endian byte length followed by the compressed bytes.
+/// This is the write-side mirror of [`super::helpers::read_section`] and the
+/// single definition of the on-disk section framing shared by every SRP writer.
+/// Byte-for-byte identical to the inlined
+/// `let c = zstd::encode_all(Cursor::new(data), 3)?;
+///  w.write_all(&(c.len() as u32).to_le_bytes())?; w.write_all(&c)?;`
+/// it replaces.
+#[inline]
+pub(crate) fn write_section<W: Write>(w: &mut W, data: &[u8]) -> std::io::Result<()> {
+    let compressed = zstd::encode_all(std::io::Cursor::new(data), 3)?;
+    w.write_all(&(compressed.len() as u32).to_le_bytes())?;
+    w.write_all(&compressed)?;
+    Ok(())
+}
+
+/// Append one variant's three index entries — binary record (`vbin`), synthetic
+/// `chrom-pos-ref-alt` ID (`ids`) and original ID (`orig_ids`) — in the exact
+/// order and framing every SRP writer uses. The synthetic-ID / original-ID
+/// streams are newline-delimited, so a `'\n'` separator is pushed before every
+/// entry except the first (caller passes `first` for the first variant).
+///
+/// Byte-for-byte identical to the inlined loop body it replaces:
+/// `push_variant_vbin(vbin, pos, chrom, ref, alt)?;
+///  if !first { ids.push(b'\n'); orig_ids.push(b'\n'); }
+///  ids.extend_from_slice(format!("{chrom}-{pos}-{ref}-{alt}").as_bytes());
+///  orig_ids.extend_from_slice(orig_id.as_bytes());`
+#[inline]
+pub(crate) fn push_variant_index(
+    vbin: &mut Vec<u8>,
+    ids: &mut Vec<u8>,
+    orig_ids: &mut Vec<u8>,
+    first: bool,
+    chrom: &str,
+    pos: i64,
+    ref_allele: &str,
+    alt_allele: &str,
+    orig_id: &str,
+) -> std::io::Result<()> {
+    super::helpers::push_variant_vbin(vbin, pos, chrom, ref_allele, alt_allele)?;
+    if !first { ids.push(b'\n'); orig_ids.push(b'\n'); }
+    ids.extend_from_slice(format!("{}-{}-{}-{}", chrom, pos, ref_allele, alt_allele).as_bytes());
+    orig_ids.extend_from_slice(orig_id.as_bytes());
+    Ok(())
 }
 
 #[cfg(test)]
