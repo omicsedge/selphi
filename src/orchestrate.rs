@@ -235,6 +235,32 @@ pub fn run_multi_chr(
     };
     selphi_info!("");
 
+    // 3b. Refuse to silently impute a chromosome at cM=0. Every chromosome present
+    // in BOTH the reference panel and the target (i.e. one that will actually be
+    // imputed) must have a genetic map; without one, interpolate_for_chr falls back
+    // to all-zero cM (no recombination structure) and quietly emits a low-quality
+    // result. Error early with an actionable message instead.
+    let missing_maps: Vec<String> = chromosomes.iter()
+        .filter_map(|chr| {
+            let key = chr.strip_prefix("chr").unwrap_or(chr.as_str());
+            let in_target = target_by_chr.contains_key(key) || target_by_chr.contains_key(chr);
+            let has_map = multi_map.contains_key(key) || multi_map.contains_key(chr);
+            if in_target && !has_map { Some(key.to_string()) } else { None }
+        })
+        .collect();
+    if !missing_maps.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "no genetic map for chromosome(s) {} present in both the target and the \
+                 reference panel; provide a map for each (--map-dir containing chr<N>.map, \
+                 or a unified --map file). Refusing to impute without a genetic map (would \
+                 use cM=0 everywhere and silently degrade accuracy).",
+                missing_maps.join(", ")
+            ),
+        ));
+    }
+
     // 4. Determine output formats
     let formats = selphi::io::pipeline::OutputFormats {
         vcf: !config.bcf,
