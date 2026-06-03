@@ -652,29 +652,31 @@ fn _run_iterations(
                     w_first, w_last, &hmm_params.rare_allele, hmm_params);
                 fwd_ns += t_fwd.elapsed().as_nanos();
 
-                let t_bwd = std::time::Instant::now();
-                let w_trans = if hmm_reuse.has_underflow() {
-                    n_underflow += 1;
+                // f64 fallback (taken on f32 forward underflow OR a non-finite f32
+                // backward result); returns None when the f64 HMM also underflows,
+                // which each caller turns into `continue`. Shared verbatim by both
+                // fallback sites below so they cannot drift.
+                let run_hmm64_fallback = || -> Option<Vec<f64>> {
                     let mut hmm64 = SegmentHmmF64::new(k);
                     hmm64.forward_rare(graph, &cond_set, &hap_fn, &hmm_params.trans,
                         w_first, w_last, &hmm_params.rare_allele, hmm_params);
-                    if hmm64.has_underflow() { continue; }
+                    if hmm64.has_underflow() { return None; }
                     let (t, _) = hmm64.backward_rare(graph, &cond_set, &hap_fn, &hmm_params.trans,
                         w_first, w_last, &hmm_params.rare_allele, hmm_params);
-                    t
+                    Some(t)
+                };
+
+                let t_bwd = std::time::Instant::now();
+                let w_trans = if hmm_reuse.has_underflow() {
+                    n_underflow += 1;
+                    match run_hmm64_fallback() { Some(t) => t, None => continue }
                 } else {
                     let (t, _) = hmm_reuse.backward_rare_direct(graph, &cond_bm, k_words, locus_offset, &hmm_params.trans,
                         w_first, w_last, &hmm_params.rare_allele, hmm_params);
                     let has_bad = t.iter().any(|&v| v.is_nan() || v.is_infinite());
                     if has_bad {
                         n_bad += 1;
-                        let mut hmm64 = SegmentHmmF64::new(k);
-                        hmm64.forward_rare(graph, &cond_set, &hap_fn, &hmm_params.trans,
-                            w_first, w_last, &hmm_params.rare_allele, hmm_params);
-                        if hmm64.has_underflow() { continue; }
-                        let (t64, _) = hmm64.backward_rare(graph, &cond_set, &hap_fn, &hmm_params.trans,
-                            w_first, w_last, &hmm_params.rare_allele, hmm_params);
-                        t64
+                        match run_hmm64_fallback() { Some(t) => t, None => continue }
                     } else {
                         t
                     }
