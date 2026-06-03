@@ -213,6 +213,8 @@ selphi --refpanel all.srp --input input.vcf.gz --map all_chromosomes.map --out r
 selphi --refpanel all.srp --input input.vcf.gz --map-dir /path/to/maps/ --out result
 ```
 
+Every chromosome that is present in **both** the reference panel and the target (i.e. one that will actually be imputed) must have a genetic map. If a map is missing for such a chromosome, Selphi errors out early with an actionable message rather than silently imputing it with zero genetic distances (which would degrade accuracy). Chromosomes absent from the target are not required to have a map.
+
 **Target VCF.** A standard multi-chromosome VCF or BCF. Chromosomes not present in the reference panel are automatically skipped.
 
 #### Alternative: per-chromosome directory mode
