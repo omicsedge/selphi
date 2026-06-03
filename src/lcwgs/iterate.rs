@@ -134,6 +134,13 @@ struct GibbsConfig {
     timing: bool,
     /// Diagnostic: expose the final base conditioning set (`LCWGS_COND_DUMP`).
     cond_dump: bool,
+    /// EXPERIMENT (`LCWGS_GS_MAIN`): use a sequential within-sample Gauss-Seidel
+    /// diploid sweep during MAIN iterations only (sample h0 from the snapshot,
+    /// then h1 conditioned on h0's FRESH sample). Seeds the het commitment the
+    /// parallel-Jacobi snapshot sweep cannot, but confined to main iters so it
+    /// does not amplify burn-in noise — the documented failure mode of the
+    /// earlier always-on sequential-diploid scan (commit e54436b). Default off.
+    gs_main: bool,
 }
 impl GibbsConfig {
     fn from_env() -> Self {
@@ -150,6 +157,7 @@ impl GibbsConfig {
             rare_carrier_max: envu("LCWGS_RARE_CARRIER_MAX").unwrap_or(64),
             timing: std::env::var("LCWGS_TIMING").is_ok(),
             cond_dump: std::env::var("LCWGS_COND_DUMP").is_ok(),
+            gs_main: std::env::var("LCWGS_GS_MAIN").is_ok(),
         }
     }
 }
@@ -298,8 +306,33 @@ pub fn run_gibbs(
         let prev_alleles = hap_alleles.clone();
         if let Some(t) = t0 { t_clone += t.elapsed().as_secs_f64(); }
 
+        let is_main = it >= n_burnin;
         let t0 = if timing { Some(std::time::Instant::now()) } else { None };
-        let results: Vec<(usize, Vec<f32>, Vec<u8>)> =
+        let results: Vec<(usize, Vec<f32>, Vec<u8>)> = if cfg.gs_main && is_main {
+            // Gauss-Seidel diploid sweep (MAIN iters only): per sample, sample h0
+            // conditioned on the snapshot partner, then h1 conditioned on h0's
+            // FRESH sample. Samples stay independent → parallel over samples (no
+            // races). Seeds the (ALT,REF)=het commitment a Jacobi snapshot sweep
+            // cannot establish; restricted to main iters so it does not amplify
+            // burn-in noise (cf. the always-on sequential-diploid scan, e54436b).
+            let per_sample: Vec<Vec<(usize, Vec<f32>, Vec<u8>)>> =
+                (0..n_samples).into_par_iter().map(|s| {
+                    let h0 = 2 * s;
+                    let h1 = 2 * s + 1;
+                    let (d0, samp0) = run_one_hap(
+                        h0, s, it, seed,
+                        |v| prev_alleles[v * n_target_haps + h1] as usize,
+                        &cond_per_hap[h0], gl3, ref_bm, cm, params,
+                        use_scaffold, &common_idx, n_var, n_samples);
+                    let (d1, samp1) = run_one_hap(
+                        h1, s, it, seed,
+                        |v| samp0[v] as usize,
+                        &cond_per_hap[h1], gl3, ref_bm, cm, params,
+                        use_scaffold, &common_idx, n_var, n_samples);
+                    vec![(h0, d0, samp0), (h1, d1, samp1)]
+                }).collect();
+            per_sample.into_iter().flatten().collect()
+        } else {
             (0..n_target_haps).into_par_iter().map(|h| {
                 let s = h / 2;
                 let partner = if h & 1 == 0 { h + 1 } else { h - 1 };
@@ -309,12 +342,12 @@ pub fn run_gibbs(
                     &cond_per_hap[h], gl3, ref_bm, cm, params,
                     use_scaffold, &common_idx, n_var, n_samples);
                 (h, dose, sampled)
-            }).collect();
+            }).collect()
+        };
         if let Some(t) = t0 { t_hmm += t.elapsed().as_secs_f64(); }
 
         // 3. Write back sampled alleles; accumulate per-hap dose into GP + dosage.
         let t0 = if timing { Some(std::time::Instant::now()) } else { None };
-        let is_main = it >= n_burnin;
         let mut hap_dose: Vec<Option<Vec<f32>>> = (0..n_target_haps).map(|_| None).collect();
         for (h, dose, sampled) in results {
             for v in 0..n_var { hap_alleles[v * n_target_haps + h] = sampled[v]; }
