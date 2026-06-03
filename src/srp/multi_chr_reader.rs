@@ -36,19 +36,6 @@ pub struct ChrSrpView {
 impl ChrSrpView {
     pub fn n_variants(&self) -> usize { self.metadata.n_variants }
     pub fn n_haps(&self) -> usize { self.metadata.n_haps }
-    pub fn n_chunks(&self) -> usize { self.metadata.n_chunks }
-    pub fn chunk_size(&self) -> usize { self.metadata.chunk_size }
-    pub fn chromosome(&self) -> &str { &self.metadata.chromosome }
-    pub fn is_tiled(&self) -> bool { self.tiled.is_some() }
-
-    /// Extract reference alleles as a bitmatrix for the given chip variant indices.
-    /// Same logic as `SrpReader::extract_ref_alleles_bitmatrix` — both delegate to
-    /// the shared `TiledSrpReader::extract_bitmatrix`.
-    pub fn extract_ref_alleles_bitmatrix(&self, wgs_idx: &[usize]) -> crate::common::HaplotypeBitmatrix {
-        let tiled = self.tiled.as_ref()
-            .expect("Tiled backend required for multi-chr SRP");
-        tiled.extract_bitmatrix(self.metadata.n_haps, wgs_idx)
-    }
 
     /// Convert this ChrSrpView into an SrpReader for use with existing pipeline functions.
     /// This creates an SrpReader that wraps this view's data.

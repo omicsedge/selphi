@@ -143,7 +143,6 @@ impl SrpReader {
 
     pub fn n_variants(&self) -> usize { self.metadata.n_variants }
     pub fn n_haps(&self) -> usize { self.metadata.n_haps }
-    pub fn n_chunks(&self) -> usize { self.metadata.n_chunks }
     pub fn chunk_size(&self) -> usize { self.metadata.chunk_size }
     pub fn chromosome(&self) -> &str { &self.metadata.chromosome }
     pub fn is_tiled(&self) -> bool { self.tiled.is_some() }

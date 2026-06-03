@@ -502,8 +502,6 @@ struct StreamingTileWriter {
     tile_index_file_pos: u64,
     /// Current write position
     write_pos: u64,
-    /// Total tiles written to disk
-    tiles_written: u64,
 }
 
 impl StreamingTileWriter {
@@ -568,7 +566,6 @@ impl StreamingTileWriter {
             tile_entries: vec![(0u64, 0u32); n_tiles],
             tile_index_file_pos,
             write_pos,
-            tiles_written: 0,
         })
     }
 
@@ -633,7 +630,6 @@ fn flush_stripe_batch(
         tile_writer.tile_entries[idx] = (tile_writer.write_pos, tdata.len() as u32);
         tile_writer.writer.write_all(&tdata)?;
         tile_writer.write_pos += tdata.len() as u64;
-        tile_writer.tiles_written += 1;
     }
 
     pending.clear();
