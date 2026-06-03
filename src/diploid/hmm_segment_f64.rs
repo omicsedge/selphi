@@ -320,10 +320,6 @@ impl SegmentHmmF64 {
         sum.is_nan() || sum.is_infinite() || sum < f64::MIN_POSITIVE
     }
 
-    fn enum_dips(mask: u64) -> Vec<u8> {
-        (0..64u8).filter(|&d| dip_get(mask, d as usize)).collect()
-    }
-
     // -- FORWARD --
     pub fn forward_rare<F>(
         &mut self, graph: &GenotypeGraph, cond_haps: &[usize], haplotypes: &F,
@@ -468,8 +464,8 @@ impl SegmentHmmF64 {
                 let prev_dc = graph.count_diplotypes(curr_seg);
                 let next_dc = graph.count_diplotypes(curr_seg + 1);
                 let n_t = prev_dc * next_dc;
-                let prev_codes = Self::enum_dips(graph.diplotypes[curr_seg]);
-                let next_codes = Self::enum_dips(graph.diplotypes[curr_seg + 1]);
+                let prev_codes = enumerate_diplotypes(graph.diplotypes[curr_seg]);
+                let next_codes = enumerate_diplotypes(graph.diplotypes[curr_seg + 1]);
                 trans_write_offset -= n_t;
                 if !hap_uf {
                     let out = &mut transition_probs[trans_write_offset..trans_write_offset+n_t];
@@ -511,7 +507,7 @@ impl SegmentHmmF64 {
         // SET_FIRST_TRANS
         if trans_write_offset > 0 && self.prob_sum_t > 0.0 {
             let scale = 1.0f64 / self.prob_sum_t;
-            let first_codes = Self::enum_dips(graph.diplotypes[seg_first]);
+            let first_codes = enumerate_diplotypes(graph.diplotypes[seg_first]);
             let n_first = first_codes.len();
             let mut sum_dip = 0.0f64;
             for (t, &d) in first_codes.iter().enumerate() {

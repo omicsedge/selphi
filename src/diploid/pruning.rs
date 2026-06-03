@@ -69,8 +69,8 @@ pub fn map_merges(
                 stats[s - 1].entropy = entropy;
 
                 // Check if HAP_NUMBER haplotypes capture enough mass via Mhaps mapping
-                let prev_codes = enumerate_diplotypes_raw(graph.diplotypes[s - 1]);
-                let curr_codes = enumerate_diplotypes_raw(graph.diplotypes[s]);
+                let prev_codes = enumerate_diplotypes(graph.diplotypes[s - 1]);
+                let curr_codes = enumerate_diplotypes(graph.diplotypes[s]);
                 let mut mhaps = vec![-1i32; HAP_NUMBER * HAP_NUMBER];
                 let mut n_unique_haps = 0usize;
                 let mut cum_sum = 0.0f64;
@@ -173,8 +173,8 @@ pub fn perform_merges(
             let curr_dipcount = graph.count_diplotypes(s + 1);
             let n_trans = prev_dipcount * curr_dipcount;
 
-            let prev_codes = enumerate_diplotypes_raw(graph.diplotypes[s]);
-            let curr_codes = enumerate_diplotypes_raw(graph.diplotypes[s + 1]);
+            let prev_codes = enumerate_diplotypes(graph.diplotypes[s]);
+            let curr_codes = enumerate_diplotypes(graph.diplotypes[s + 1]);
 
             // Sort transitions by probability (descending)
             let mut sorted: Vec<(f64, usize)> = (0..n_trans)
@@ -307,13 +307,3 @@ pub fn perform_merges(
     graph.n_stored_probs = 0;
 }
 
-/// Helper: enumerate active diplotype codes from bitmask.
-fn enumerate_diplotypes_raw(dip_mask: u64) -> Vec<u8> {
-    let mut codes = Vec::new();
-    for d in 0..64u8 {
-        if dip_get(dip_mask, d as usize) {
-            codes.push(d);
-        }
-    }
-    codes
-}

@@ -78,6 +78,20 @@ pub fn var_set_sca(e: usize, v: &mut u8) { *v |= 3 << (e << 2); }
 #[inline(always)]
 pub fn dip_get(dip: u64, idx: usize) -> bool { ((dip >> idx) & 1) != 0 }
 
+/// Enumerate active diplotype codes (set-bit indices, 0..64) from a diplotype
+/// bitmask. Shared by sampling, pruning, and both segment HMMs so the four
+/// former copies cannot drift.
+#[inline]
+pub fn enumerate_diplotypes(mask: u64) -> Vec<u8> {
+    let mut codes = Vec::new();
+    for d in 0..64u8 {
+        if dip_get(mask, d as usize) {
+            codes.push(d);
+        }
+    }
+    codes
+}
+
 /// Set bit `idx` in diplotype bitmask.
 #[inline(always)]
 pub fn dip_set(dip: &mut u64, idx: usize) { *dip |= 1u64 << idx; }
