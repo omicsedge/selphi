@@ -52,6 +52,81 @@ fn decompress_csi_header(path: &Path) -> io::Result<(Vec<u8>, i32, i32, usize, u
     Ok((data, min_shift, depth, n_ref, off))
 }
 
+/// Scan one reference sequence's `n_bin` bins from `data` starting at `*off`,
+/// advancing `*off` past them. Returns this reference's
+/// `(checkpoints, first_offset, n_mapped)`.
+///
+/// Shared verbatim by `parse_csi` (which selects the dominant reference) and
+/// `parse_csi_all_contigs` (which keeps every non-empty reference). Both
+/// callers sort/dedup `checkpoints` afterwards as needed — this helper leaves
+/// them in bin-iteration order. `min_beg` excludes the pseudo-bin sentinel
+/// `(0, 0)`; see the inline rationale for the smallest-offset first_offset.
+#[inline]
+fn scan_ref_bins(
+    data: &[u8],
+    off: &mut usize,
+    n_bin: usize,
+    min_shift: i32,
+    depth: i32,
+) -> (Vec<(i64, VirtualPosition)>, VirtualPosition, u64) {
+    let mut ref_checkpoints: Vec<(i64, VirtualPosition)> = Vec::new();
+    let mut ref_first_offset = VirtualPosition::default();
+    let mut ref_n_mapped: u64 = 0;
+
+    for _ in 0..n_bin {
+        if *off + 4 > data.len() { break; }
+        let bin_id = u32::from_le_bytes(data[*off..*off+4].try_into().unwrap()); *off += 4;
+        if *off + 8 > data.len() { break; }
+        let loffset = u64::from_le_bytes(data[*off..*off+8].try_into().unwrap()); *off += 8;
+        if *off + 4 > data.len() { break; }
+        let n_chunk = i32::from_le_bytes(data[*off..*off+4].try_into().unwrap()) as usize; *off += 4;
+
+        let mut min_beg = u64::MAX;
+        let mut chunks = Vec::with_capacity(n_chunk.min(64));
+        for _ in 0..n_chunk {
+            if *off + 16 > data.len() { break; }
+            let cnk_beg = u64::from_le_bytes(data[*off..*off+8].try_into().unwrap()); *off += 8;
+            let cnk_end = u64::from_le_bytes(data[*off..*off+8].try_into().unwrap()); *off += 8;
+            if chunks.len() < 64 { chunks.push((cnk_beg, cnk_end)); }
+            if cnk_beg < min_beg { min_beg = cnk_beg; }
+        }
+
+        // Pseudo-bin: chunk[1] = (n_mapped, n_unmapped)
+        if bin_id >= 100_000 && chunks.len() >= 2 {
+            ref_n_mapped = chunks[1].0;
+        }
+
+        // Regular bins
+        if bin_id < 100_000 && loffset > 0 {
+            let pos = bin_to_pos(bin_id, min_shift, depth);
+            let vp = VirtualPosition::from(loffset);
+            ref_checkpoints.push((pos, vp));
+        }
+
+        // Track the smallest virtual position across ALL regular bins —
+        // that's the earliest record in the file, i.e. the true "start
+        // of data". Using the FIRST iterated bin's min_beg is wrong:
+        // BTreeMap iteration is by bin_id, and indels that straddle a
+        // 16kb (or 128kb / 1MB) window land in higher-level (lower
+        // bin_id) bins. A level-4 bin (ids 585..4681) sorts BEFORE leaf
+        // bins (ids 37449..), so the first iterated bin is typically
+        // NOT the earliest record. Prior code seeded first_offset from
+        // a mid-chromosome indel's vp, causing seek_for_position() to
+        // jump past ~60 k records whenever it fell through to
+        // first_offset. Exclude pseudo-bin — its chunk[0] = (0, 0) is a
+        // sentinel, not a real virtual position.
+        if bin_id < 100_000
+            && min_beg < u64::MAX
+            && (ref_first_offset == VirtualPosition::default()
+                || min_beg < u64::from(ref_first_offset))
+        {
+            ref_first_offset = VirtualPosition::from(min_beg);
+        }
+    }
+
+    (ref_checkpoints, ref_first_offset, ref_n_mapped)
+}
+
 /// Parse a .csi index file. Scans all reference sequences and selects the one
 /// with the most mapped records (highest n_mapped from pseudo-bin).
 pub fn parse_csi(path: &Path) -> io::Result<CsiIndex> {
@@ -68,60 +143,8 @@ pub fn parse_csi(path: &Path) -> io::Result<CsiIndex> {
         if off + 4 > data.len() { break; }
         let n_bin = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
 
-        let mut ref_checkpoints: Vec<(i64, VirtualPosition)> = Vec::new();
-        let mut ref_first_offset = VirtualPosition::default();
-        let mut ref_n_mapped: u64 = 0;
-
-        for _ in 0..n_bin {
-            if off + 4 > data.len() { break; }
-            let bin_id = u32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4;
-            if off + 8 > data.len() { break; }
-            let loffset = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;
-            if off + 4 > data.len() { break; }
-            let n_chunk = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
-
-            let mut min_beg = u64::MAX;
-            let mut chunks = Vec::with_capacity(n_chunk.min(64));
-            for _ in 0..n_chunk {
-                if off + 16 > data.len() { break; }
-                let cnk_beg = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;
-                let cnk_end = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;
-                if chunks.len() < 64 { chunks.push((cnk_beg, cnk_end)); }
-                if cnk_beg < min_beg { min_beg = cnk_beg; }
-            }
-
-            // Pseudo-bin: chunk[1] = (n_mapped, n_unmapped)
-            if bin_id >= 100_000 && chunks.len() >= 2 {
-                ref_n_mapped = chunks[1].0;
-            }
-
-            // Regular bins
-            if bin_id < 100_000 && loffset > 0 {
-                let pos = bin_to_pos(bin_id, min_shift, depth);
-                let vp = VirtualPosition::from(loffset);
-                ref_checkpoints.push((pos, vp));
-            }
-
-            // Track the smallest virtual position across ALL regular bins —
-            // that's the earliest record in the file, i.e. the true "start
-            // of data". Using the FIRST iterated bin's min_beg is wrong:
-            // BTreeMap iteration is by bin_id, and indels that straddle a
-            // 16kb (or 128kb / 1MB) window land in higher-level (lower
-            // bin_id) bins. A level-4 bin (ids 585..4681) sorts BEFORE leaf
-            // bins (ids 37449..), so the first iterated bin is typically
-            // NOT the earliest record. Prior code seeded first_offset from
-            // a mid-chromosome indel's vp, causing seek_for_position() to
-            // jump past ~60 k records whenever it fell through to
-            // first_offset. Exclude pseudo-bin — its chunk[0] = (0, 0) is a
-            // sentinel, not a real virtual position.
-            if bin_id < 100_000
-                && min_beg < u64::MAX
-                && (ref_first_offset == VirtualPosition::default()
-                    || min_beg < u64::from(ref_first_offset))
-            {
-                ref_first_offset = VirtualPosition::from(min_beg);
-            }
-        }
+        let (mut ref_checkpoints, ref_first_offset, ref_n_mapped) =
+            scan_ref_bins(&data, &mut off, n_bin, min_shift, depth);
 
         // Select this ref seq if it has more mapped records (or more bins as fallback)
         let dominated = ref_n_mapped > best_n_mapped
@@ -205,47 +228,8 @@ pub fn parse_csi_all_contigs(path: &Path) -> io::Result<Vec<ContigCsiIndex>> {
         if off + 4 > data.len() { break; }
         let n_bin = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
 
-        let mut ref_checkpoints: Vec<(i64, VirtualPosition)> = Vec::new();
-        let mut ref_first_offset = VirtualPosition::default();
-        let mut ref_n_mapped: u64 = 0;
-
-        for _ in 0..n_bin {
-            if off + 4 > data.len() { break; }
-            let bin_id = u32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4;
-            if off + 8 > data.len() { break; }
-            let loffset = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;
-            if off + 4 > data.len() { break; }
-            let n_chunk = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
-
-            let mut min_beg = u64::MAX;
-            let mut chunks = Vec::with_capacity(n_chunk.min(64));
-            for _ in 0..n_chunk {
-                if off + 16 > data.len() { break; }
-                let cnk_beg = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;
-                let cnk_end = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;
-                if chunks.len() < 64 { chunks.push((cnk_beg, cnk_end)); }
-                if cnk_beg < min_beg { min_beg = cnk_beg; }
-            }
-
-            if bin_id >= 100_000 && chunks.len() >= 2 {
-                ref_n_mapped = chunks[1].0;
-            }
-            if bin_id < 100_000 && loffset > 0 {
-                let pos = bin_to_pos(bin_id, min_shift, depth);
-                let vp = VirtualPosition::from(loffset);
-                ref_checkpoints.push((pos, vp));
-            }
-            // Track the smallest chunk_beg across ALL regular bins (see
-            // parse_csi for the full rationale). Exclude pseudo-bin — its
-            // chunk[0] = (0, 0) is a sentinel, not a real virtual position.
-            if bin_id < 100_000
-                && min_beg < u64::MAX
-                && (ref_first_offset == VirtualPosition::default()
-                    || min_beg < u64::from(ref_first_offset))
-            {
-                ref_first_offset = VirtualPosition::from(min_beg);
-            }
-        }
+        let (mut ref_checkpoints, ref_first_offset, ref_n_mapped) =
+            scan_ref_bins(&data, &mut off, n_bin, min_shift, depth);
 
         if ref_n_mapped > 0 || !ref_checkpoints.is_empty() {
             ref_checkpoints.sort_by_key(|&(pos, _)| pos);
