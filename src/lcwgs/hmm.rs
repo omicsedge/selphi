@@ -149,6 +149,16 @@ fn hmm_timing() -> bool {
     *T.get_or_init(|| std::env::var("LCWGS_TIMING").is_ok())
 }
 
+/// Cached leave-one-out emission flag (`true` unless `LCWGS_NO_EMIT_LOO` is set).
+/// GLIMPSE2 divides the forward emission back out of the hidden-state posterior
+/// before re-applying the read+error model; default ON. Cached so the four FB
+/// kernels don't re-read the env on every (per-hap, per-Gibbs-iteration) call.
+fn lcwgs_loo() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("LCWGS_NO_EMIT_LOO").is_err())
+}
+
 /// Li-Stephens transition rate scale (cM⁻¹). Default = Selphi's `0.04·Ne/K`
 /// (K-dependent: more conditioning states → less recombination per state).
 /// `LCWGS_GLIMPSE_RECOMB=1` switches to GLIMPSE2's K-INDEPENDENT form
@@ -302,7 +312,7 @@ pub fn run_forward_backward(
     // (once baked into alpha, once via the explicit ee/ed × HL fold-in),
     // over-trusting noisy lcWGS reads and under-calling true carriers. Gated
     // for A/B; default ON once validated.
-    let loo = std::env::var("LCWGS_NO_EMIT_LOO").is_err();
+    let loo = lcwgs_loo();
 
     // --- Precompute emission per (variant, allele) ---
     TL_EMIT.with(|cell| {
@@ -639,7 +649,7 @@ unsafe fn run_fb_avx512(
     let inv_k = 1.0f32 / (k as f32);
     let ee = 1.0f32 - params.epsilon;
     let ed = params.epsilon;
-    let loo = std::env::var("LCWGS_NO_EMIT_LOO").is_err();
+    let loo = lcwgs_loo();
     let w64 = k.div_ceil(64);
     let kmain = k & !15usize; // largest multiple of 16 ≤ k
 
@@ -889,7 +899,7 @@ unsafe fn run_fb_avx2(
     let inv_k = 1.0f32 / (k as f32);
     let ee = 1.0f32 - params.epsilon;
     let ed = params.epsilon;
-    let loo = std::env::var("LCWGS_NO_EMIT_LOO").is_err();
+    let loo = lcwgs_loo();
     let w64 = k.div_ceil(64);
     let kmain8 = k & !7usize; // largest multiple of 8 ≤ k
 
@@ -1165,7 +1175,7 @@ unsafe fn run_fb_neon(
     let inv_k = 1.0f32 / (k as f32);
     let ee = 1.0f32 - params.epsilon;
     let ed = params.epsilon;
-    let loo = std::env::var("LCWGS_NO_EMIT_LOO").is_err();
+    let loo = lcwgs_loo();
     let w64 = k.div_ceil(64);
     let kmain4 = k & !3usize; // largest multiple of 4 ≤ k
     let zero = vdupq_n_f32(0.0);
@@ -1399,7 +1409,7 @@ pub fn run_forward_backward_scaffold(
     // In the scaffold path only EXACT scaffold sites double-count the read (the
     // interpolated gamma at a rare site already excludes that rare site's
     // emission), so we divide out emission only when v is a scaffold site.
-    let loo = std::env::var("LCWGS_NO_EMIT_LOO").is_err();
+    let loo = lcwgs_loo();
 
     // Scaffold emission per (scaffold site j, allele): GL-weighted, normalized.
     // emit_s[2*j + a]
@@ -1691,5 +1701,57 @@ mod tests {
         for (v, &d) in out.dosage.iter().enumerate() {
             assert!((0.0..=1.0).contains(&d), "site {} dose={} out of range", v, d);
         }
+    }
+
+    /// SIMD-vs-SIMD equivalence regression lock for the lcWGS forward-backward.
+    /// AVX-512 and AVX2 are not bit-identical (16- vs 8-wide f32 reduction order)
+    /// but must agree to f32 noise. This pins the AVX2 path (commit 8d693e1) and
+    /// the AVX-512 path against drift. Designed to exercise the failure modes the
+    /// width-split could introduce:
+    ///   - k=203 = 12·16+11 = 25·8+3  → both the 16-wide AND 8-wide scalar tails,
+    ///   - mixed within-word condbits (non-trivial lane masks),
+    ///   - n_var=40 > chk_stride(=⌈√40⌉=7) → multiple checkpoint blocks recomputed.
+    /// The NEON path (run_fb_neon) is the same 4-wide structure but aarch64-only;
+    /// it needs the equivalent gate run on real ARM (see the run_fb_neon doc).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx512_avx2_fb_equivalence() {
+        use crate::common::HaplotypeBitmatrix;
+        if !is_x86_feature_detected!("avx512f") || !is_x86_feature_detected!("avx512dq")
+            || !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma")
+        {
+            eprintln!("skipping avx512_avx2_fb_equivalence: host lacks AVX-512 and/or AVX2+FMA");
+            return;
+        }
+        let k = 203usize;
+        let n_var = 40usize;
+        // Mixed, non-degenerate panel so condbits words carry varied bits.
+        let mut hap_data = vec![0u8; n_var * k];
+        for v in 0..n_var {
+            for h in 0..k {
+                hap_data[v * k + h] = (((h * 7 + v * 13 + (h % 5)) % 3) == 0) as u8;
+            }
+        }
+        let bm = HaplotypeBitmatrix::from_byte_slice_all(n_var, k, &hap_data, k);
+        // Varied per-site HL (not flat) to drive non-trivial posteriors.
+        let mut hl = vec![0.5f32; n_var * 2];
+        for v in 0..n_var {
+            let alt = 0.1 + 0.8 * ((v % 7) as f32 / 7.0);
+            hl[2 * v] = 1.0 - alt;
+            hl[2 * v + 1] = alt;
+        }
+        let cm: Vec<f64> = (0..n_var).map(|v| v as f64 * 0.05).collect();
+        let cond: Vec<u32> = (0..k as u32).collect();
+        let params = LcwgsParams::default();
+
+        let a = unsafe { run_fb_avx512(&hl, &cond, &bm, &cm, &params, None) };
+        let b = unsafe { run_fb_avx2(&hl, &cond, &bm, &cm, &params, None) };
+        assert_eq!(a.dosage.len(), n_var);
+        assert_eq!(b.dosage.len(), n_var);
+        let max_abs = a.dosage.iter().zip(&b.dosage)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs < 1e-3,
+            "AVX-512 vs AVX2 lcWGS FB dosage diverged: max|Δ|={} (expected < 1e-3)", max_abs);
     }
 }
