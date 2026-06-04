@@ -79,6 +79,10 @@ thread_local! {
     static TL_ALPHA_SUM: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     static TL_EMIT: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     static TL_PREC: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    // Forward-checkpointing scratch (memory + cache win): one recomputed block
+    // (chk_stride × k) and two rolling forward columns (2 × k).
+    static TL_BLK: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static TL_FCOL: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     // Bit-packed conditioning alleles (n_var × ceil(k/64) u64) for the AVX-512
     // path: 16 alleles load directly as a __mmask16 for _mm512_mask_blend_ps.
     // Keeps the materialized conditioning at 1 bit/state (~k/64 u64 per site) so
@@ -273,130 +277,155 @@ pub fn run_forward_backward(
         precompute_prec(cm, n_var, scale, recomb_mult, &mut buf);
     });
 
-    // --- Forward pass ---
+    // --- Forward pass (CHECKPOINTED) ---
+    // The dense forward matrix (n_var × K) is the memory peak and, since the HMM
+    // is memory-bandwidth-bound, the speed bottleneck too. Store full alpha
+    // columns only every `chk_stride ≈ √n_var`; recompute the in-between columns
+    // from the nearest checkpoint during the backward pass. `alpha_sum` (n_var
+    // scalars) is kept in full so the recompute is BIT-EXACT (identical
+    // fact1/fact2/emit and identical accumulation order). Peak alpha memory:
+    // (n_chk + chk_stride)×K ≈ 2√n_var×K instead of n_var×K.
     let mut dosage = vec![0.0f32; n_var];
+    let chk_stride = ((n_var as f64).sqrt().ceil() as usize).max(1);
+    let n_chk = n_var.div_ceil(chk_stride);
+    let mut blk = vec![0.0f32; chk_stride * k]; // one recomputed forward block
+    let mut fcol = vec![0.0f32; 2 * k];          // rolling forward prev/curr
 
     TL_ALPHA.with(|cell_a| TL_ALPHA_SUM.with(|cell_s| TL_BETA.with(|cell_b| TL_EMIT.with(|cell_e| TL_PREC.with(|cell_p| {
-        let mut alpha = cell_a.borrow_mut();
-        let mut alpha_sum = cell_s.borrow_mut();
-        let mut beta = cell_b.borrow_mut();
+        let mut chk = cell_a.borrow_mut();        // n_chk × k  (alpha at checkpoint columns)
+        let mut alpha_sum = cell_s.borrow_mut();  // n_var      (every column's sum; cheap)
+        let mut beta = cell_b.borrow_mut();       // k
         let emit = cell_e.borrow();
         let p_rec = cell_p.borrow();
 
-        // Size the scratch WITHOUT zero-filling: the forward pass writes every
-        // alpha[v*k+j] / alpha_sum[v] before it is ever read (base case fills
-        // row 0; the inductive step fills all rows; alpha[prev] is from the
-        // previous, already-written row), and the backward init writes every
-        // beta[j] before use. Zero-filling ~n_var*k f32 each of the ~2700 HMM
-        // calls per chunk-iteration was pure wasted bandwidth.
-        let need_a = n_var * k;
-        let (la, ls, lb) = (alpha.len(), alpha_sum.len(), beta.len());
-        if la < need_a { alpha.reserve(need_a - la); }
+        // Size scratch WITHOUT zero-fill (every used element written before read).
+        let need_chk = n_chk * k;
+        let (lchk, ls, lb) = (chk.len(), alpha_sum.len(), beta.len());
+        if lchk < need_chk { chk.reserve(need_chk - lchk); }
         if ls < n_var { alpha_sum.reserve(n_var - ls); }
         if lb < k { beta.reserve(k - lb); }
-        // SAFETY: reserve above guarantees capacity >= the new len; every element
-        // is written before it is read (see comment); f32 is Copy with no Drop,
-        // so growing the logical length over allocated capacity is sound.
+        // SAFETY: capacities reserved above; f32 is Copy/no-Drop; every element is
+        // written before read (forward fills all sums + checkpoints; beta init
+        // fills all k; recompute fills each block before the backward reads it).
         unsafe {
-            alpha.set_len(need_a);
+            chk.set_len(need_chk);
             alpha_sum.set_len(n_var);
             beta.set_len(k);
         }
 
-        // Forward base case (v = 0)
-        let emit0 = emit[0];
-        let emit1 = emit[1];
-        let mut s0 = 0.0f32;
-        for j in 0..k {
-            let h = cond_haps[j] as usize;
-            let a = ref_bm.get(0, h);
-            let e = if a { emit1 } else { emit0 };
-            let p = inv_k * e;
-            alpha[j] = p;
-            s0 += p;
-        }
-        alpha_sum[0] = s0;
-
-        // Forward inductive step
-        for v in 1..n_var {
+        // One bit-exact forward column step: dst ← forward(src) at variant v using
+        // alpha_sum[v-1]. Identical math/order to the original inductive loop, so
+        // a recomputed column equals the originally-stored alpha column bit-for-bit.
+        let fwd_step = |src: &[f32], dst: &mut [f32], v: usize, asum_prev: f32| -> f32 {
             let pr = p_rec[v];
             let fact1 = pr * inv_k;
-            let fact2 = (1.0 - pr) / alpha_sum[v - 1].max(f32::MIN_POSITIVE);
+            let fact2 = (1.0 - pr) / asum_prev.max(f32::MIN_POSITIVE);
             let e0 = emit[2 * v];
             let e1 = emit[2 * v + 1];
-            let prev_off = (v - 1) * k;
-            let curr_off = v * k;
             let mut s = 0.0f32;
             for j in 0..k {
-                let h = cond_haps[j] as usize;
-                let a = ref_bm.get(v, h);
+                let a = ref_bm.get(v, cond_haps[j] as usize);
                 let e = if a { e1 } else { e0 };
-                let p = (alpha[prev_off + j] * fact2 + fact1) * e;
-                alpha[curr_off + j] = p;
+                let p = (src[j] * fact2 + fact1) * e;
+                dst[j] = p;
                 s += p;
             }
-            alpha_sum[v] = s;
-        }
+            s
+        };
 
-        // --- Backward pass + per-site posterior + dosage ---
-        // Initialize Beta at last site: Beta[k] = (1/K) * emit_last[ref_allele[k]]
-        let last = n_var - 1;
-        let e0_last = emit[2 * last];
-        let e1_last = emit[2 * last + 1];
-        let mut beta_sum = 0.0f32;
+        // Initial forward: fill alpha_sum[..] + store checkpoint columns (base
+        // case v=0 into fcol[0..k], then roll prev/curr through the chromosome).
         {
-            let mut prob_hid_0 = 0.0f32;
-            let mut prob_hid_1 = 0.0f32;
+            let (prev, _) = fcol.split_at_mut(k);
+            let emit0 = emit[0];
+            let emit1 = emit[1];
+            let mut s0 = 0.0f32;
             for j in 0..k {
-                let h = cond_haps[j] as usize;
-                let a = ref_bm.get(last, h);
-                let e = if a { e1_last } else { e0_last };
-                let b = inv_k * e;
-                beta[j] = b;
-                beta_sum += b;
-                // Posterior at last: alpha * beta_un_emitted (which is 1/K here)
-                let post = alpha[last * k + j] * inv_k;
-                if a { prob_hid_1 += post; } else { prob_hid_0 += post; }
+                let a = ref_bm.get(0, cond_haps[j] as usize);
+                let p = inv_k * if a { emit1 } else { emit0 };
+                prev[j] = p;
+                s0 += p;
             }
-            // Combine with HL via the emission matrix to obtain prob_obs:
-            // prob_obs[a] = (prob_hid[0]*ee + prob_hid[1]*ed)  if a=0
-            //             = (prob_hid[0]*ed + prob_hid[1]*ee)  if a=1
-            dosage[last] = finalize_site(
-                loo, prob_hid_0, prob_hid_1, e0_last, e1_last,
-                hl[2 * last], hl[2 * last + 1], ee, ed,
-            );
+            alpha_sum[0] = s0;
+            chk[0..k].copy_from_slice(prev);
+        }
+        for v in 1..n_var {
+            let (prev, curr) = fcol.split_at_mut(k);
+            alpha_sum[v] = fwd_step(prev, curr, v, alpha_sum[v - 1]);
+            if v % chk_stride == 0 {
+                let c = v / chk_stride;
+                chk[c * k..c * k + k].copy_from_slice(curr);
+            }
+            prev.copy_from_slice(curr); // roll curr → prev for the next column
         }
 
-        // Backward inductive: v = last-1 .. 0
-        for v in (0..last).rev() {
-            // Use p_rec at boundary (v+1 — i.e. between v and v+1)
-            let pr = p_rec[v + 1];
-            let fact1 = pr * inv_k;
-            let fact2 = (1.0 - pr) / beta_sum.max(f32::MIN_POSITIVE);
-            let e0_v = emit[2 * v];
-            let e1_v = emit[2 * v + 1];
-            let mut new_beta_sum = 0.0f32;
-            let mut prob_hid_0 = 0.0f32;
-            let mut prob_hid_1 = 0.0f32;
-            let alpha_off = v * k;
-            for j in 0..k {
-                let h = cond_haps[j] as usize;
-                let a = ref_bm.get(v, h);
-                let e = if a { e1_v } else { e0_v };
-                let beta_un_emit = beta[j] * fact2 + fact1;
-                // posterior at v: alpha[v,k] * beta_un_emit[k]
-                let post = alpha[alpha_off + j] * beta_un_emit;
-                if a { prob_hid_1 += post; } else { prob_hid_0 += post; }
-                let new_b = beta_un_emit * e;
-                beta[j] = new_b;
-                new_beta_sum += new_b;
+        // --- Backward pass: blocks in reverse; recompute each block's forward
+        //     columns from its checkpoint into `blk`; beta (k) rolls globally
+        //     (beta depends only on the previous beta + emit + p_rec, not alpha,
+        //     so the recompute does not perturb it). ---
+        let last = n_var - 1;
+        let mut beta_sum = 0.0f32;
+        let mut init_done = false;
+        for b in (0..n_chk).rev() {
+            let lo = b * chk_stride;
+            let hi = ((b + 1) * chk_stride).min(n_var);
+            // Recompute block forward columns: blk col 0 = alpha[lo] (checkpoint b),
+            // blk col i = forward(blk col i-1) for variant lo+i.
+            blk[0..k].copy_from_slice(&chk[b * k..b * k + k]);
+            for i in 1..(hi - lo) {
+                let v = lo + i;
+                let (left, right) = blk.split_at_mut(i * k);
+                fwd_step(&left[(i - 1) * k..i * k], &mut right[0..k], v, alpha_sum[v - 1]);
             }
-            beta_sum = new_beta_sum;
-
-            dosage[v] = finalize_site(
-                loo, prob_hid_0, prob_hid_1, e0_v, e1_v,
-                hl[2 * v], hl[2 * v + 1], ee, ed,
-            );
+            // Backward over the block, v from hi-1 down to lo.
+            for v in (lo..hi).rev() {
+                let acol = &blk[(v - lo) * k..(v - lo) * k + k];
+                if !init_done {
+                    // v == last: Beta init = (1/K)·emit_last + posterior at last.
+                    let e0 = emit[2 * last];
+                    let e1 = emit[2 * last + 1];
+                    let mut prob_hid_0 = 0.0f32;
+                    let mut prob_hid_1 = 0.0f32;
+                    for j in 0..k {
+                        let a = ref_bm.get(last, cond_haps[j] as usize);
+                        let e = if a { e1 } else { e0 };
+                        let bb = inv_k * e;
+                        beta[j] = bb;
+                        beta_sum += bb;
+                        let post = acol[j] * inv_k;
+                        if a { prob_hid_1 += post; } else { prob_hid_0 += post; }
+                    }
+                    dosage[last] = finalize_site(
+                        loo, prob_hid_0, prob_hid_1, e0, e1,
+                        hl[2 * last], hl[2 * last + 1], ee, ed,
+                    );
+                    init_done = true;
+                } else {
+                    let pr = p_rec[v + 1];
+                    let fact1 = pr * inv_k;
+                    let fact2 = (1.0 - pr) / beta_sum.max(f32::MIN_POSITIVE);
+                    let e0_v = emit[2 * v];
+                    let e1_v = emit[2 * v + 1];
+                    let mut new_beta_sum = 0.0f32;
+                    let mut prob_hid_0 = 0.0f32;
+                    let mut prob_hid_1 = 0.0f32;
+                    for j in 0..k {
+                        let a = ref_bm.get(v, cond_haps[j] as usize);
+                        let e = if a { e1_v } else { e0_v };
+                        let beta_un_emit = beta[j] * fact2 + fact1;
+                        let post = acol[j] * beta_un_emit;
+                        if a { prob_hid_1 += post; } else { prob_hid_0 += post; }
+                        let new_b = beta_un_emit * e;
+                        beta[j] = new_b;
+                        new_beta_sum += new_b;
+                    }
+                    beta_sum = new_beta_sum;
+                    dosage[v] = finalize_site(
+                        loo, prob_hid_0, prob_hid_1, e0_v, e1_v,
+                        hl[2 * v], hl[2 * v + 1], ee, ed,
+                    );
+                }
+            }
         }
     })))));
 
