@@ -34,9 +34,11 @@ impl DmmConfig {
         let envf = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<f64>().ok());
         let envu = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<usize>().ok());
         DmmConfig {
-            m: envu("LCWGS_DMM_M").filter(|&m| m >= 2).unwrap_or(8),
-            seg_cm: envf("LCWGS_DMM_SEG_CM").filter(|&c| c > 0.0).unwrap_or(0.5),
-            switch_pen: envf("LCWGS_DMM_SWITCH").map(|x| x as f32).unwrap_or(4.0),
+            // Defaults = the r12-validated "combo" (M12/seg_cm=1.0/switch_pen=2):
+            // r12 0.5-1% 0.9089→0.9111, OVERALL 0.9386→0.9395 vs the M8/0.5/4 first cut.
+            m: envu("LCWGS_DMM_M").filter(|&m| m >= 2).unwrap_or(12),
+            seg_cm: envf("LCWGS_DMM_SEG_CM").filter(|&c| c > 0.0).unwrap_or(1.0),
+            switch_pen: envf("LCWGS_DMM_SWITCH").map(|x| x as f32).unwrap_or(2.0),
         }
     }
 }
