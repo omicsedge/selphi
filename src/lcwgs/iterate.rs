@@ -139,12 +139,15 @@ struct GibbsConfig {
     /// then h1 conditioned on h0's FRESH sample). Seeds the het commitment the
     /// parallel-Jacobi snapshot sweep cannot, but confined to main iters so it
     /// does not amplify burn-in noise — the documented failure mode of the
-    /// earlier always-on sequential-diploid scan (commit e54436b). Default off.
+    /// earlier always-on sequential-diploid scan (commit e54436b). On whenever
+    /// DMM is on (the default — DMM regularizes it); standalone via LCWGS_GS_MAIN
+    /// (measured-negative alone, kept for A/B only).
     gs_main: bool,
-    /// EXPERIMENT (`LCWGS_DMM`): after the GS-main sweep, re-phase each sample's
+    /// (`LCWGS_DMM`): after the GS-main sweep, re-phase each sample's
     /// H0/H1 with a segment-level diplotype-commitment (DMM, GLIMPSE2
     /// rephaseHaplotypes analogue) before write-back, so a segment-coherent
-    /// low-noise phase feeds the next iteration. Implies `gs_main`. Default off.
+    /// low-noise phase feeds the next iteration. Implies `gs_main`. DEFAULT ON
+    /// (2026-06-04, validated chr22 + chr1); opt out with `LCWGS_NO_DMM=1`.
     dmm: bool,
     /// EXPERIMENT (`LCWGS_DMM_GL`): GL-aware DMM emission — weight the segment
     /// copy-match by per-site read confidence (peakedness of the genotype GL),
@@ -155,6 +158,19 @@ struct GibbsConfig {
 impl GibbsConfig {
     fn from_env() -> Self {
         let envu = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<usize>().ok());
+        // DMM segment phase-commitment is DEFAULT-ON (2026-06-04). Validated on
+        // chr22 AND an independent chr1:30-45Mb A/B: every MAF bin improved, zero
+        // regression, biggest gains in the rare bins, GLIMPSE2 OVERALL gap halved
+        // (chr1 0.9330→0.9361, 0.5-1% 0.9004→0.9062), at ~+8% wall / neutral memory.
+        // Opt out with LCWGS_NO_DMM=1 (reverts to the parallel-Jacobi sweep, no
+        // Gauss-Seidel). LCWGS_DMM_GL (GL-aware emission, R²-neutral — kept opt-in)
+        // and LCWGS_DMM (explicit) also force it on. DMM implies the Gauss-Seidel
+        // main sweep (it regularizes it); LCWGS_DMM_GL implies the DMM.
+        let dmm_gl = std::env::var("LCWGS_DMM_GL").is_ok();
+        let dmm = dmm_gl
+            || std::env::var("LCWGS_DMM").is_ok()
+            || std::env::var("LCWGS_NO_DMM").is_err();
+        let gs_main = dmm || std::env::var("LCWGS_GS_MAIN").is_ok();
         GibbsConfig {
             use_scaffold: std::env::var("LCWGS_SCAFFOLD").is_ok(),
             refresh: envu("LCWGS_SELECT_REFRESH").filter(|&r| r >= 1).unwrap_or(5),
@@ -167,11 +183,9 @@ impl GibbsConfig {
             rare_carrier_max: envu("LCWGS_RARE_CARRIER_MAX").unwrap_or(64),
             timing: std::env::var("LCWGS_TIMING").is_ok(),
             cond_dump: std::env::var("LCWGS_COND_DUMP").is_ok(),
-            // LCWGS_DMM[_GL] implies the Gauss-Seidel main sweep (DMM regularizes it);
-            // LCWGS_DMM_GL implies the DMM.
-            gs_main: ["LCWGS_GS_MAIN", "LCWGS_DMM", "LCWGS_DMM_GL"].iter().any(|k| std::env::var(k).is_ok()),
-            dmm: std::env::var("LCWGS_DMM").is_ok() || std::env::var("LCWGS_DMM_GL").is_ok(),
-            dmm_gl: std::env::var("LCWGS_DMM_GL").is_ok(),
+            gs_main,
+            dmm,
+            dmm_gl,
         }
     }
 }
