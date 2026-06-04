@@ -66,7 +66,14 @@ pub fn rephase_diplotype(
     weight: Option<&[f32]>,
 ) {
     let n_var = h0.len();
-    let m = phase_haps.len().min(cfg.m);
+    // The number of phasing copies = however many the caller supplied, bounded by
+    // a hard safety cap (the Viterbi state space is m²). The default path fills
+    // `phase_haps` to exactly `cfg.m` (≤ DMM_MAX_M), so `min` is a no-op there and
+    // the default is byte-identical; the rare-carrier-aware caller (LCWGS_DMM_RC)
+    // appends a few local carriers on top of the cfg.m IBD set and relies on this
+    // to use them rather than truncate back to cfg.m.
+    const DMM_MAX_M: usize = 32;
+    let m = phase_haps.len().min(DMM_MAX_M.max(cfg.m));
     if n_var == 0 || m < 2 { return; }
     let haps = &phase_haps[..m];
 
