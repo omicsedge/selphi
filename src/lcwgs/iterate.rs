@@ -146,6 +146,11 @@ struct GibbsConfig {
     /// rephaseHaplotypes analogue) before write-back, so a segment-coherent
     /// low-noise phase feeds the next iteration. Implies `gs_main`. Default off.
     dmm: bool,
+    /// EXPERIMENT (`LCWGS_DMM_GL`): GL-aware DMM emission — weight the segment
+    /// copy-match by per-site read confidence (peakedness of the genotype GL),
+    /// so the diplotype commitment is driven by read-supported sites and ignores
+    /// flat-GL (zero-read) noise. Implies `dmm`. Default off.
+    dmm_gl: bool,
 }
 impl GibbsConfig {
     fn from_env() -> Self {
@@ -162,9 +167,11 @@ impl GibbsConfig {
             rare_carrier_max: envu("LCWGS_RARE_CARRIER_MAX").unwrap_or(64),
             timing: std::env::var("LCWGS_TIMING").is_ok(),
             cond_dump: std::env::var("LCWGS_COND_DUMP").is_ok(),
-            // LCWGS_DMM implies the Gauss-Seidel main sweep (the DMM regularizes it).
-            gs_main: std::env::var("LCWGS_GS_MAIN").is_ok() || std::env::var("LCWGS_DMM").is_ok(),
-            dmm: std::env::var("LCWGS_DMM").is_ok(),
+            // LCWGS_DMM[_GL] implies the Gauss-Seidel main sweep (DMM regularizes it);
+            // LCWGS_DMM_GL implies the DMM.
+            gs_main: ["LCWGS_GS_MAIN", "LCWGS_DMM", "LCWGS_DMM_GL"].iter().any(|k| std::env::var(k).is_ok()),
+            dmm: std::env::var("LCWGS_DMM").is_ok() || std::env::var("LCWGS_DMM_GL").is_ok(),
+            dmm_gl: std::env::var("LCWGS_DMM_GL").is_ok(),
         }
     }
 }
@@ -229,7 +236,9 @@ pub fn run_gibbs(
     let n_burnin = params.n_iterations.saturating_sub(params.n_main_iterations);
     let mut acc_dosage = vec![0.0f64; n_var * n_samples];
     // Genotype-posterior accumulator (3 per variant×sample).
-    let mut acc_gp = vec![0.0f64; n_var * n_samples * 3];
+    // f32 accumulator (≤ n_main probs in [0,1] → f32 is ample; halves the GP
+    // accumulator vs f64). DS/R² are unaffected — they come from acc_dosage (f64).
+    let mut acc_gp = vec![0.0f32; n_var * n_samples * 3];
     let mut n_acc = 0usize;
 
     let sel_idx: &[usize] = &common_idx;
@@ -385,7 +394,24 @@ pub fn run_gibbs(
                     if ph.len() < dcfg.m && i < c1.len() && seen.insert(c1[i]) { ph.push(c1[i]); }
                     i += 1;
                 }
-                super::dmm::rephase_diplotype(&mut h0, &mut h1, &ph, ref_bm, cm, dcfg);
+                // GL-aware emission weight (LCWGS_DMM_GL): per-site read confidence
+                // = peakedness of the genotype GL [P(00),P(01),P(11)] for this sample,
+                // mapped to [0,1] (1/3=flat/no-read→0, peaked→1). Down-weights the
+                // flat-GL (zero-read) sites that the segment commitment must not trust.
+                let weight: Option<Vec<f32>> = if cfg.dmm_gl {
+                    let mut w = vec![0.0f32; n_var];
+                    for v in 0..n_var {
+                        let b = v * n_samples * 3 + 3 * s;
+                        let (g0, g1, g2) = (gl3[b], gl3[b + 1], gl3[b + 2]);
+                        let sum = g0 + g1 + g2;
+                        w[v] = if sum > f32::MIN_POSITIVE {
+                            let mx = g0.max(g1).max(g2) / sum;
+                            ((mx - 1.0 / 3.0) / (2.0 / 3.0)).clamp(0.0, 1.0)
+                        } else { 0.0 };
+                    }
+                    Some(w)
+                } else { None };
+                super::dmm::rephase_diplotype(&mut h0, &mut h1, &ph, ref_bm, cm, dcfg, weight.as_deref());
                 (s, h0, h1)
             }).collect();
             for (s, h0, h1) in rephased {
@@ -404,9 +430,9 @@ pub fn run_gibbs(
                     let a0 = d0[v] as f64; // P(hap0 = ALT)
                     let a1 = d1[v] as f64; // P(hap1 = ALT)
                     let gp_off = (v * n_samples + s) * 3;
-                    acc_gp[gp_off]     += (1.0 - a0) * (1.0 - a1);     // P(00)
-                    acc_gp[gp_off + 1] += a0 * (1.0 - a1) + (1.0 - a0) * a1; // P(01)
-                    acc_gp[gp_off + 2] += a0 * a1;                     // P(11)
+                    acc_gp[gp_off]     += ((1.0 - a0) * (1.0 - a1)) as f32;     // P(00)
+                    acc_gp[gp_off + 1] += (a0 * (1.0 - a1) + (1.0 - a0) * a1) as f32; // P(01)
+                    acc_gp[gp_off + 2] += (a0 * a1) as f32;                     // P(11)
                     acc_dosage[v * n_samples + s] += a0 + a1;          // E[ALT]
                 }
             }
@@ -428,7 +454,7 @@ pub fn run_gibbs(
     // Average across main iterations.
     let inv_n = if n_acc > 0 { 1.0 / n_acc as f64 } else { 1.0 };
     let dosage: Vec<f32> = acc_dosage.iter().map(|&d| (d * inv_n) as f32).collect();
-    let gp: Vec<f32> = acc_gp.iter().map(|&g| (g * inv_n) as f32).collect();
+    let gp: Vec<f32> = acc_gp.iter().map(|&g| (g as f64 * inv_n) as f32).collect();
 
     // Diagnostic: expose the final base conditioning set (cond_cache = last refresh).
     let cond_final = if cfg.cond_dump { cond_cache } else { Vec::new() };
