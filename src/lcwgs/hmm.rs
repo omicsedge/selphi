@@ -125,6 +125,22 @@ fn use_avx2_lcwgs() -> bool {
     })
 }
 
+/// Whether to use the NEON lcWGS HMM path on aarch64 (the SIMD path for Apple
+/// Silicon / ARM servers, e.g. AWS Graviton). NEON is baseline on aarch64 but we
+/// still feature-detect for correctness; `SELPHI_FORCE_SCALAR=1` forces the scalar
+/// fallback for scalar/SIMD parity validation. Mirrors [`use_avx2_lcwgs`].
+#[cfg(target_arch = "aarch64")]
+fn use_neon_lcwgs() -> bool {
+    use std::sync::OnceLock;
+    static USE: OnceLock<bool> = OnceLock::new();
+    *USE.get_or_init(|| {
+        if std::env::var("SELPHI_FORCE_SCALAR").ok().as_deref() == Some("1") {
+            return false;
+        }
+        std::arch::is_aarch64_feature_detected!("neon")
+    })
+}
+
 /// Cached `LCWGS_TIMING` flag (gates the micro-profiling Instant calls so the
 /// production path has zero timing overhead).
 fn hmm_timing() -> bool {
@@ -269,6 +285,12 @@ pub fn run_forward_backward(
     #[cfg(target_arch = "x86_64")]
     if use_avx2_lcwgs() {
         return unsafe { run_fb_avx2(hl, cond_haps, ref_bm, cm, params, recomb_mult) };
+    }
+    // NEON fast path (aarch64: Apple Silicon / ARM servers). 4-wide analogue of
+    // the AVX2 path; falls back to scalar below under SELPHI_FORCE_SCALAR=1.
+    #[cfg(target_arch = "aarch64")]
+    if use_neon_lcwgs() {
+        return unsafe { run_fb_neon(hl, cond_haps, ref_bm, cm, params, recomb_mult) };
     }
 
     let inv_k = 1.0f32 / (k as f32);
@@ -465,7 +487,7 @@ pub fn run_forward_backward(
 /// buffer outlives the call. Every used slot is written before it is read (the
 /// forward base/recompute fill each column before the backward reads it), so the
 /// no-zero `set_len` is sound (same idiom as the alpha/beta scratch).
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn tl_scratch_ptr(cell: &'static std::thread::LocalKey<RefCell<Vec<f32>>>, need: usize) -> *mut f32 {
     cell.with(|c| {
         let mut b = c.borrow_mut();
@@ -530,7 +552,7 @@ unsafe fn fwd_col_avx512(
 /// Horizontal sum of an `__m256` (8 × f32).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn hsum256(v: core::arch::x86_64::__m256) -> f32 { unsafe {
+unsafe fn hsum256(v: core::arch::x86_64::__m256) -> f32 {
     use core::arch::x86_64::*;
     let lo = _mm256_castps256_ps128(v);
     let hi = _mm256_extractf128_ps(v, 1);
@@ -538,7 +560,7 @@ unsafe fn hsum256(v: core::arch::x86_64::__m256) -> f32 { unsafe {
     let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
     let s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
     _mm_cvtss_f32(s)
-}}
+}
 
 /// Expand 8 condbits allele bits (state offset `j`, within one 64-bit word —
 /// guaranteed since `j` is a multiple of 8 and 8|64) into an `__m256` lane mask
@@ -1038,6 +1060,283 @@ unsafe fn run_fb_avx2(
                     let mut new_beta_sum = hsum256(bsumv);
                     let mut prob_hid_1 = hsum256(p1v);
                     let mut prob_hid_0 = hsum256(p0v);
+                    while j < k {
+                        let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
+                        let e = if a { e1s } else { e0s };
+                        let bun = *bp.add(j) * fact2 + fact1;
+                        let post = *acol.add(j) * bun;
+                        if a { prob_hid_1 += post; } else { prob_hid_0 += post; }
+                        let nb = bun * e; *bp.add(j) = nb; new_beta_sum += nb;
+                        j += 1;
+                    }
+                    beta_sum = new_beta_sum;
+                    dosage[v] = finalize_site(
+                        loo, prob_hid_0, prob_hid_1, e0s, e1s,
+                        hl[2 * v], hl[2 * v + 1], ee, ed,
+                    );
+                }
+            }
+        }
+        if let Some(t) = t_fb { PROF_FB_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
+    }))))));
+
+    HmmOutput { dosage }
+}}
+
+// ===========================================================================
+// NEON (aarch64) FB path — 4-wide analogue of `run_fb_avx2`.
+//
+// VALIDATION STATUS: compile-validated on aarch64 (intrinsics type-check via
+// `cargo check --target aarch64-unknown-linux-gnu`), but NOT runtime-validated
+// on ARM hardware (this is an x86 host). Like the AVX2/AVX-512 paths it is NOT
+// bit-identical to scalar (different f32 reduction width/order); it is expected
+// to be R²-EQUIVALENT. Before trusting it in production on Apple Silicon / AWS
+// Graviton, run the lcWGS R²-equivalence gate on real ARM (SELPHI_FORCE_SCALAR
+// vs NEON, mid+r12) exactly as AVX2 was gated on x86. The scalar fallback
+// (SELPHI_FORCE_SCALAR=1) is the safety net until that run happens.
+// ===========================================================================
+
+/// `uint32x4_t` lane mask of 4 condbits (state offset `j`, within one 64-bit
+/// word — `j` is a multiple of 4 and 4|64) — all-ones lane where the allele is
+/// ALT. The NEON analogue of the AVX2 `lane_mask8`, for `vbslq_f32`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn lane_mask4(cbp: *const u64, base: usize, j: usize) -> core::arch::aarch64::uint32x4_t { unsafe {
+    use core::arch::aarch64::*;
+    let bits = ((*cbp.add(base + j / 64) >> (j % 64)) & 0xF) as u32;
+    let v = vdupq_n_u32(bits);
+    let sel_arr: [u32; 4] = [1, 2, 4, 8];
+    let sel = vld1q_u32(sel_arr.as_ptr());
+    vceqq_u32(vandq_u32(v, sel), sel) // all-ones lane where bit set
+}}
+
+/// NEON forward column (4-wide analogue of [`fwd_col_avx2`]): `curr ← forward(prev)`
+/// at variant `v`. `kmain4 = k & !3`. Numerically equivalent to scalar (to f32
+/// reduction order). Shared by the NEON FB body's forward + block-recompute.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn fwd_col_neon(
+    prev: *const f32, curr: *mut f32, v: usize,
+    e0s: f32, e1s: f32, pr: f32, asum_prev: f32,
+    cbp: *const u64, inv_k: f32, k: usize, kmain4: usize, w64: usize,
+) -> f32 { unsafe {
+    use core::arch::aarch64::*;
+    let fact1 = pr * inv_k;
+    let fact2 = (1.0 - pr) / asum_prev.max(f32::MIN_POSITIVE);
+    let e0 = vdupq_n_f32(e0s); let e1 = vdupq_n_f32(e1s);
+    let f1v = vdupq_n_f32(fact1); let f2v = vdupq_n_f32(fact2);
+    let base = v * w64;
+    let mut sumv = vdupq_n_f32(0.0);
+    let mut j = 0;
+    while j < kmain4 {
+        let pv = vld1q_f32(prev.add(j));
+        let tmp = vfmaq_f32(f1v, pv, f2v); // f1v + pv*f2v
+        let m = lane_mask4(cbp, base, j);
+        let ev = vbslq_f32(m, e1, e0);
+        let p = vmulq_f32(tmp, ev);
+        vst1q_f32(curr.add(j), p);
+        sumv = vaddq_f32(sumv, p);
+        j += 4;
+    }
+    let mut s = vaddvq_f32(sumv);
+    while j < k {
+        let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
+        let e = if a { e1s } else { e0s };
+        let p = (*prev.add(j) * fact2 + fact1) * e;
+        *curr.add(j) = p; s += p; j += 1;
+    }
+    s
+}}
+
+/// NEON checkpointed forward-backward (4-wide mirror of [`run_fb_avx2`]).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn run_fb_neon(
+    hl: &[f32],
+    cond_haps: &[u32],
+    ref_bm: &HaplotypeBitmatrix,
+    cm: &[f64],
+    params: &LcwgsParams,
+    recomb_mult: Option<&[f32]>,
+) -> HmmOutput { unsafe {
+    use core::arch::aarch64::*;
+    let n_var = cm.len();
+    let k = cond_haps.len();
+    let inv_k = 1.0f32 / (k as f32);
+    let ee = 1.0f32 - params.epsilon;
+    let ed = params.epsilon;
+    let loo = std::env::var("LCWGS_NO_EMIT_LOO").is_err();
+    let w64 = k.div_ceil(64);
+    let kmain4 = k & !3usize; // largest multiple of 4 ≤ k
+    let zero = vdupq_n_f32(0.0);
+
+    let mut dosage = vec![0.0f32; n_var];
+
+    TL_ALPHA.with(|ca| TL_ALPHA_SUM.with(|cs| TL_BETA.with(|cb| TL_EMIT.with(|ce| TL_PREC.with(|cp| TL_CONDBITS.with(|cc| {
+        let mut alpha = ca.borrow_mut();
+        let mut alpha_sum = cs.borrow_mut();
+        let mut beta = cb.borrow_mut();
+        let mut emit = ce.borrow_mut();
+        let mut p_rec = cp.borrow_mut();
+        let mut condbits = cc.borrow_mut();
+
+        precompute_emit(hl, n_var, ee, ed, &mut emit);
+        let scale = recomb_scale(params.ne, k, ref_bm.n_haps);
+        precompute_prec(cm, n_var, scale, recomb_mult, &mut p_rec);
+        // Bit-packed conditioning alleles (1 bit/state) — identical pack to AVX2.
+        let timing = hmm_timing();
+        let t_pack = if timing { Some(std::time::Instant::now()) } else { None };
+        condbits.clear(); condbits.resize(n_var * w64, 0u64);
+        let cbm = condbits.as_mut_ptr();
+        for v in 0..n_var {
+            let rp = ref_bm.row(v).as_ptr();
+            let base = v * w64;
+            let mut widx = 0usize;
+            let mut word = 0u64;
+            let mut bitpos = 0u32;
+            for &h in cond_haps.iter() {
+                let h = h as usize;
+                let bit = (*rp.add(h >> 6) >> (h & 63)) & 1;
+                word |= bit << bitpos;
+                bitpos += 1;
+                if bitpos == 64 { *cbm.add(base + widx) = word; widx += 1; word = 0; bitpos = 0; }
+            }
+            if bitpos > 0 { *cbm.add(base + widx) = word; }
+        }
+        if let Some(t) = t_pack { PROF_PACK_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
+        let t_fb = if timing { Some(std::time::Instant::now()) } else { None };
+
+        // Checkpointed forward + block-recompute backward (see run_fb_avx512).
+        let chk_stride = ((n_var as f64).sqrt().ceil() as usize).max(1);
+        let n_chk = n_var.div_ceil(chk_stride);
+        let need_chk = n_chk * k;
+        let (la, ls, lb) = (alpha.len(), alpha_sum.len(), beta.len());
+        if la < need_chk { alpha.reserve(need_chk - la); }
+        if ls < n_var { alpha_sum.reserve(n_var - ls); }
+        if lb < k { beta.reserve(k - lb); }
+        alpha.set_len(need_chk); alpha_sum.set_len(n_var); beta.set_len(k);
+        let chkp = alpha.as_mut_ptr();
+        let bp = beta.as_mut_ptr();
+        let cbp = condbits.as_ptr();
+        let blkp = tl_scratch_ptr(&TL_BLK, chk_stride * k);
+        let fcolp = tl_scratch_ptr(&TL_FCOL, 2 * k);
+        let last = n_var - 1;
+        let e0l = emit[2 * last]; let e1l = emit[2 * last + 1];
+
+        // Initial forward (base case v=0 → fcol[0..k]).
+        {
+            let e0 = vdupq_n_f32(emit[0]);
+            let e1 = vdupq_n_f32(emit[1]);
+            let invkv = vdupq_n_f32(inv_k);
+            let mut sumv = vdupq_n_f32(0.0);
+            let mut j = 0;
+            while j < kmain4 {
+                let m = lane_mask4(cbp, 0, j);
+                let ev = vbslq_f32(m, e1, e0);
+                let p = vmulq_f32(ev, invkv);
+                vst1q_f32(fcolp.add(j), p);
+                sumv = vaddq_f32(sumv, p);
+                j += 4;
+            }
+            let mut s0 = vaddvq_f32(sumv);
+            while j < k {
+                let a = (*cbp.add(j / 64) >> (j % 64)) & 1 != 0;
+                let p = inv_k * if a { emit[1] } else { emit[0] };
+                *fcolp.add(j) = p; s0 += p; j += 1;
+            }
+            alpha_sum[0] = s0;
+            std::ptr::copy_nonoverlapping(fcolp, chkp, k);
+        }
+        for v in 1..n_var {
+            let s = fwd_col_neon(
+                fcolp, fcolp.add(k), v, emit[2 * v], emit[2 * v + 1],
+                p_rec[v], alpha_sum[v - 1], cbp, inv_k, k, kmain4, w64);
+            alpha_sum[v] = s;
+            if v % chk_stride == 0 {
+                let c = v / chk_stride;
+                std::ptr::copy_nonoverlapping(fcolp.add(k), chkp.add(c * k), k);
+            }
+            std::ptr::copy_nonoverlapping(fcolp.add(k), fcolp, k);
+        }
+
+        // Backward: blocks in reverse, recompute then backward kernel.
+        let mut beta_sum = 0.0f32;
+        let mut init_done = false;
+        for b in (0..n_chk).rev() {
+            let lo = b * chk_stride;
+            let hi = ((b + 1) * chk_stride).min(n_var);
+            std::ptr::copy_nonoverlapping(chkp.add(b * k), blkp, k);
+            for i in 1..(hi - lo) {
+                let v = lo + i;
+                fwd_col_neon(
+                    blkp.add((i - 1) * k), blkp.add(i * k), v, emit[2 * v], emit[2 * v + 1],
+                    p_rec[v], alpha_sum[v - 1], cbp, inv_k, k, kmain4, w64);
+            }
+            for v in (lo..hi).rev() {
+                let acol = blkp.add((v - lo) * k);
+                if !init_done {
+                    let e0 = vdupq_n_f32(e0l); let e1 = vdupq_n_f32(e1l);
+                    let invkv = vdupq_n_f32(inv_k);
+                    let base = last * w64;
+                    let mut bsumv = vdupq_n_f32(0.0);
+                    let mut p1v = vdupq_n_f32(0.0); let mut p0v = vdupq_n_f32(0.0);
+                    let mut j = 0;
+                    while j < kmain4 {
+                        let m = lane_mask4(cbp, base, j);
+                        let ev = vbslq_f32(m, e1, e0);
+                        let bv = vmulq_f32(ev, invkv);
+                        vst1q_f32(bp.add(j), bv);
+                        bsumv = vaddq_f32(bsumv, bv);
+                        let av = vld1q_f32(acol.add(j));
+                        let postv = vmulq_f32(av, invkv);
+                        p1v = vaddq_f32(p1v, vbslq_f32(m, postv, zero));
+                        p0v = vaddq_f32(p0v, vbslq_f32(m, zero, postv));
+                        j += 4;
+                    }
+                    beta_sum = vaddvq_f32(bsumv);
+                    let mut prob_hid_1 = vaddvq_f32(p1v);
+                    let mut prob_hid_0 = vaddvq_f32(p0v);
+                    while j < k {
+                        let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
+                        let e = if a { e1l } else { e0l };
+                        let bb = inv_k * e; *bp.add(j) = bb; beta_sum += bb;
+                        let post = *acol.add(j) * inv_k;
+                        if a { prob_hid_1 += post; } else { prob_hid_0 += post; }
+                        j += 1;
+                    }
+                    dosage[last] = finalize_site(
+                        loo, prob_hid_0, prob_hid_1, e0l, e1l,
+                        hl[2 * last], hl[2 * last + 1], ee, ed,
+                    );
+                    init_done = true;
+                } else {
+                    let pr = p_rec[v + 1];
+                    let fact1 = pr * inv_k;
+                    let fact2 = (1.0 - pr) / beta_sum.max(f32::MIN_POSITIVE);
+                    let e0s = emit[2 * v]; let e1s = emit[2 * v + 1];
+                    let e0 = vdupq_n_f32(e0s); let e1 = vdupq_n_f32(e1s);
+                    let f1v = vdupq_n_f32(fact1); let f2v = vdupq_n_f32(fact2);
+                    let base = v * w64;
+                    let mut bsumv = vdupq_n_f32(0.0);
+                    let mut p1v = vdupq_n_f32(0.0); let mut p0v = vdupq_n_f32(0.0);
+                    let mut j = 0;
+                    while j < kmain4 {
+                        let bprev = vld1q_f32(bp.add(j));
+                        let bun = vfmaq_f32(f1v, bprev, f2v); // f1v + bprev*f2v
+                        let av = vld1q_f32(acol.add(j));
+                        let postv = vmulq_f32(av, bun);
+                        let m = lane_mask4(cbp, base, j);
+                        p1v = vaddq_f32(p1v, vbslq_f32(m, postv, zero));
+                        p0v = vaddq_f32(p0v, vbslq_f32(m, zero, postv));
+                        let ev = vbslq_f32(m, e1, e0);
+                        let nb = vmulq_f32(bun, ev);
+                        vst1q_f32(bp.add(j), nb);
+                        bsumv = vaddq_f32(bsumv, nb);
+                        j += 4;
+                    }
+                    let mut new_beta_sum = vaddvq_f32(bsumv);
+                    let mut prob_hid_1 = vaddvq_f32(p1v);
+                    let mut prob_hid_0 = vaddvq_f32(p0v);
                     while j < k {
                         let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
                         let e = if a { e1s } else { e0s };
