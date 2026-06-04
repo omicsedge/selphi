@@ -102,7 +102,26 @@ fn use_avx512_lcwgs() -> bool {
         if std::env::var("SELPHI_FORCE_SCALAR").ok().as_deref() == Some("1") {
             return false;
         }
+        // SELPHI_FORCE_AVX2=1 drops to the AVX2 path even on an AVX-512 host (for
+        // AVX2/scalar parity validation on this hardware).
+        if std::env::var("SELPHI_FORCE_AVX2").ok().as_deref() == Some("1") {
+            return false;
+        }
         is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512dq")
+    })
+}
+
+/// Whether to use the AVX2 lcWGS HMM path (hosts with AVX2+FMA but no AVX-512,
+/// or `SELPHI_FORCE_AVX2=1`). Checked after [`use_avx512_lcwgs`]. Cached.
+#[cfg(target_arch = "x86_64")]
+fn use_avx2_lcwgs() -> bool {
+    use std::sync::OnceLock;
+    static USE: OnceLock<bool> = OnceLock::new();
+    *USE.get_or_init(|| {
+        if std::env::var("SELPHI_FORCE_SCALAR").ok().as_deref() == Some("1") {
+            return false;
+        }
+        is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
     })
 }
 
@@ -246,6 +265,10 @@ pub fn run_forward_backward(
     #[cfg(target_arch = "x86_64")]
     if use_avx512_lcwgs() {
         return unsafe { run_fb_avx512(hl, cond_haps, ref_bm, cm, params, recomb_mult) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if use_avx2_lcwgs() {
+        return unsafe { run_fb_avx2(hl, cond_haps, ref_bm, cm, params, recomb_mult) };
     }
 
     let inv_k = 1.0f32 / (k as f32);
@@ -504,6 +527,72 @@ unsafe fn fwd_col_avx512(
     s
 }}
 
+/// Horizontal sum of an `__m256` (8 × f32).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum256(v: core::arch::x86_64::__m256) -> f32 { unsafe {
+    use core::arch::x86_64::*;
+    let lo = _mm256_castps256_ps128(v);
+    let hi = _mm256_extractf128_ps(v, 1);
+    let s = _mm_add_ps(lo, hi);
+    let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    let s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+    _mm_cvtss_f32(s)
+}}
+
+/// Expand 8 condbits allele bits (state offset `j`, within one 64-bit word —
+/// guaranteed since `j` is a multiple of 8 and 8|64) into an `__m256` lane mask
+/// (all-ones lane where the allele is ALT). The AVX2 analogue of the AVX-512
+/// `__mmask16`, for `_mm256_blendv_ps`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn lane_mask8(cbp: *const u64, base: usize, j: usize) -> core::arch::x86_64::__m256 { unsafe {
+    use core::arch::x86_64::*;
+    let bits = ((*cbp.add(base + j / 64) >> (j % 64)) & 0xFF) as i32;
+    let v = _mm256_set1_epi32(bits);
+    let sel = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+    let eq = _mm256_cmpeq_epi32(_mm256_and_si256(v, sel), sel); // -1 where bit set
+    _mm256_castsi256_ps(eq)
+}}
+
+/// AVX2 forward column (8-wide analogue of [`fwd_col_avx512`]): `curr ← forward(prev)`
+/// at variant `v`. `kmain8 = k & !7`. Numerically equivalent to scalar/AVX-512 (to
+/// f32 reduction order). Shared by the AVX2 FB body's forward + block-recompute.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fwd_col_avx2(
+    prev: *const f32, curr: *mut f32, v: usize,
+    e0s: f32, e1s: f32, pr: f32, asum_prev: f32,
+    cbp: *const u64, inv_k: f32, k: usize, kmain8: usize, w64: usize,
+) -> f32 { unsafe {
+    use core::arch::x86_64::*;
+    let fact1 = pr * inv_k;
+    let fact2 = (1.0 - pr) / asum_prev.max(f32::MIN_POSITIVE);
+    let e0 = _mm256_set1_ps(e0s); let e1 = _mm256_set1_ps(e1s);
+    let f1v = _mm256_set1_ps(fact1); let f2v = _mm256_set1_ps(fact2);
+    let base = v * w64;
+    let mut sumv = _mm256_setzero_ps();
+    let mut j = 0;
+    while j < kmain8 {
+        let pv = _mm256_loadu_ps(prev.add(j));
+        let tmp = _mm256_fmadd_ps(pv, f2v, f1v);
+        let m = lane_mask8(cbp, base, j);
+        let ev = _mm256_blendv_ps(e0, e1, m);
+        let p = _mm256_mul_ps(tmp, ev);
+        _mm256_storeu_ps(curr.add(j), p);
+        sumv = _mm256_add_ps(sumv, p);
+        j += 8;
+    }
+    let mut s = hsum256(sumv);
+    while j < k {
+        let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
+        let e = if a { e1s } else { e0s };
+        let p = (*prev.add(j) * fact2 + fact1) * e;
+        *curr.add(j) = p; s += p; j += 1;
+    }
+    s
+}}
+
 /// AVX-512 implementation of [`run_forward_backward`]. Numerically equivalent
 /// (to f32 reduction-order) to the scalar path; validated against
 /// `SELPHI_FORCE_SCALAR=1`. Conditioning alleles are materialized bit-packed
@@ -750,6 +839,223 @@ unsafe fn run_fb_avx512(
         if let Some(t) = t_fb {
             PROF_FB_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
+    }))))));
+
+    HmmOutput { dosage }
+}}
+
+/// AVX2 implementation of [`run_forward_backward`] — 8-wide mirror of
+/// [`run_fb_avx512`] for hosts with AVX2+FMA but no AVX-512 (most non-datacenter
+/// x86). Same checkpointed forward / block-recompute backward; the AVX-512
+/// `__mmask16` ops are emulated with `lane_mask8` + `_mm256_blendv_ps` (emission
+/// select) and `_mm256_and_ps`/`_mm256_andnot_ps` (per-allele posterior split).
+/// Numerically equivalent to the scalar/AVX-512 paths to f32 reduction order
+/// (validated by R²-equivalence, like the AVX-512 path vs scalar).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn run_fb_avx2(
+    hl: &[f32],
+    cond_haps: &[u32],
+    ref_bm: &HaplotypeBitmatrix,
+    cm: &[f64],
+    params: &LcwgsParams,
+    recomb_mult: Option<&[f32]>,
+) -> HmmOutput { unsafe {
+    use core::arch::x86_64::*;
+    let n_var = cm.len();
+    let k = cond_haps.len();
+    let inv_k = 1.0f32 / (k as f32);
+    let ee = 1.0f32 - params.epsilon;
+    let ed = params.epsilon;
+    let loo = std::env::var("LCWGS_NO_EMIT_LOO").is_err();
+    let w64 = k.div_ceil(64);
+    let kmain8 = k & !7usize; // largest multiple of 8 ≤ k
+
+    let mut dosage = vec![0.0f32; n_var];
+
+    TL_ALPHA.with(|ca| TL_ALPHA_SUM.with(|cs| TL_BETA.with(|cb| TL_EMIT.with(|ce| TL_PREC.with(|cp| TL_CONDBITS.with(|cc| {
+        let mut alpha = ca.borrow_mut();
+        let mut alpha_sum = cs.borrow_mut();
+        let mut beta = cb.borrow_mut();
+        let mut emit = ce.borrow_mut();
+        let mut p_rec = cp.borrow_mut();
+        let mut condbits = cc.borrow_mut();
+
+        precompute_emit(hl, n_var, ee, ed, &mut emit);
+        let scale = recomb_scale(params.ne, k, ref_bm.n_haps);
+        precompute_prec(cm, n_var, scale, recomb_mult, &mut p_rec);
+        // Bit-packed conditioning alleles (1 bit/state) — identical to the AVX-512 pack.
+        let timing = hmm_timing();
+        let t_pack = if timing { Some(std::time::Instant::now()) } else { None };
+        condbits.clear(); condbits.resize(n_var * w64, 0u64);
+        let cbm = condbits.as_mut_ptr();
+        for v in 0..n_var {
+            let rp = ref_bm.row(v).as_ptr();
+            let base = v * w64;
+            let mut widx = 0usize;
+            let mut word = 0u64;
+            let mut bitpos = 0u32;
+            for &h in cond_haps.iter() {
+                let h = h as usize;
+                let bit = (*rp.add(h >> 6) >> (h & 63)) & 1;
+                word |= bit << bitpos;
+                bitpos += 1;
+                if bitpos == 64 { *cbm.add(base + widx) = word; widx += 1; word = 0; bitpos = 0; }
+            }
+            if bitpos > 0 { *cbm.add(base + widx) = word; }
+        }
+        if let Some(t) = t_pack { PROF_PACK_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
+        let t_fb = if timing { Some(std::time::Instant::now()) } else { None };
+
+        // Checkpointed forward + block-recompute backward (see run_fb_avx512).
+        let chk_stride = ((n_var as f64).sqrt().ceil() as usize).max(1);
+        let n_chk = n_var.div_ceil(chk_stride);
+        let need_chk = n_chk * k;
+        let (la, ls, lb) = (alpha.len(), alpha_sum.len(), beta.len());
+        if la < need_chk { alpha.reserve(need_chk - la); }
+        if ls < n_var { alpha_sum.reserve(n_var - ls); }
+        if lb < k { beta.reserve(k - lb); }
+        alpha.set_len(need_chk); alpha_sum.set_len(n_var); beta.set_len(k);
+        let chkp = alpha.as_mut_ptr();
+        let bp = beta.as_mut_ptr();
+        let cbp = condbits.as_ptr();
+        let blkp = tl_scratch_ptr(&TL_BLK, chk_stride * k);
+        let fcolp = tl_scratch_ptr(&TL_FCOL, 2 * k);
+        let last = n_var - 1;
+        let e0l = emit[2 * last]; let e1l = emit[2 * last + 1];
+
+        // Initial forward (base case v=0 → fcol[0..k]).
+        {
+            let e0 = _mm256_set1_ps(emit[0]);
+            let e1 = _mm256_set1_ps(emit[1]);
+            let invkv = _mm256_set1_ps(inv_k);
+            let mut sumv = _mm256_setzero_ps();
+            let mut j = 0;
+            while j < kmain8 {
+                let m = lane_mask8(cbp, 0, j);
+                let ev = _mm256_blendv_ps(e0, e1, m);
+                let p = _mm256_mul_ps(ev, invkv);
+                _mm256_storeu_ps(fcolp.add(j), p);
+                sumv = _mm256_add_ps(sumv, p);
+                j += 8;
+            }
+            let mut s0 = hsum256(sumv);
+            while j < k {
+                let a = (*cbp.add(j / 64) >> (j % 64)) & 1 != 0;
+                let p = inv_k * if a { emit[1] } else { emit[0] };
+                *fcolp.add(j) = p; s0 += p; j += 1;
+            }
+            alpha_sum[0] = s0;
+            std::ptr::copy_nonoverlapping(fcolp, chkp, k);
+        }
+        for v in 1..n_var {
+            let s = fwd_col_avx2(
+                fcolp, fcolp.add(k), v, emit[2 * v], emit[2 * v + 1],
+                p_rec[v], alpha_sum[v - 1], cbp, inv_k, k, kmain8, w64);
+            alpha_sum[v] = s;
+            if v % chk_stride == 0 {
+                let c = v / chk_stride;
+                std::ptr::copy_nonoverlapping(fcolp.add(k), chkp.add(c * k), k);
+            }
+            std::ptr::copy_nonoverlapping(fcolp.add(k), fcolp, k);
+        }
+
+        // Backward: blocks in reverse, recompute then backward kernel.
+        let mut beta_sum = 0.0f32;
+        let mut init_done = false;
+        for b in (0..n_chk).rev() {
+            let lo = b * chk_stride;
+            let hi = ((b + 1) * chk_stride).min(n_var);
+            std::ptr::copy_nonoverlapping(chkp.add(b * k), blkp, k);
+            for i in 1..(hi - lo) {
+                let v = lo + i;
+                fwd_col_avx2(
+                    blkp.add((i - 1) * k), blkp.add(i * k), v, emit[2 * v], emit[2 * v + 1],
+                    p_rec[v], alpha_sum[v - 1], cbp, inv_k, k, kmain8, w64);
+            }
+            for v in (lo..hi).rev() {
+                let acol = blkp.add((v - lo) * k);
+                if !init_done {
+                    let e0 = _mm256_set1_ps(e0l); let e1 = _mm256_set1_ps(e1l);
+                    let invkv = _mm256_set1_ps(inv_k);
+                    let base = last * w64;
+                    let mut bsumv = _mm256_setzero_ps();
+                    let mut p1v = _mm256_setzero_ps(); let mut p0v = _mm256_setzero_ps();
+                    let mut j = 0;
+                    while j < kmain8 {
+                        let m = lane_mask8(cbp, base, j);
+                        let ev = _mm256_blendv_ps(e0, e1, m);
+                        let bv = _mm256_mul_ps(ev, invkv);
+                        _mm256_storeu_ps(bp.add(j), bv);
+                        bsumv = _mm256_add_ps(bsumv, bv);
+                        let av = _mm256_loadu_ps(acol.add(j));
+                        let postv = _mm256_mul_ps(av, invkv);
+                        p1v = _mm256_add_ps(p1v, _mm256_and_ps(postv, m));
+                        p0v = _mm256_add_ps(p0v, _mm256_andnot_ps(m, postv));
+                        j += 8;
+                    }
+                    beta_sum = hsum256(bsumv);
+                    let mut prob_hid_1 = hsum256(p1v);
+                    let mut prob_hid_0 = hsum256(p0v);
+                    while j < k {
+                        let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
+                        let e = if a { e1l } else { e0l };
+                        let bb = inv_k * e; *bp.add(j) = bb; beta_sum += bb;
+                        let post = *acol.add(j) * inv_k;
+                        if a { prob_hid_1 += post; } else { prob_hid_0 += post; }
+                        j += 1;
+                    }
+                    dosage[last] = finalize_site(
+                        loo, prob_hid_0, prob_hid_1, e0l, e1l,
+                        hl[2 * last], hl[2 * last + 1], ee, ed,
+                    );
+                    init_done = true;
+                } else {
+                    let pr = p_rec[v + 1];
+                    let fact1 = pr * inv_k;
+                    let fact2 = (1.0 - pr) / beta_sum.max(f32::MIN_POSITIVE);
+                    let e0s = emit[2 * v]; let e1s = emit[2 * v + 1];
+                    let e0 = _mm256_set1_ps(e0s); let e1 = _mm256_set1_ps(e1s);
+                    let f1v = _mm256_set1_ps(fact1); let f2v = _mm256_set1_ps(fact2);
+                    let base = v * w64;
+                    let mut bsumv = _mm256_setzero_ps();
+                    let mut p1v = _mm256_setzero_ps(); let mut p0v = _mm256_setzero_ps();
+                    let mut j = 0;
+                    while j < kmain8 {
+                        let bprev = _mm256_loadu_ps(bp.add(j));
+                        let bun = _mm256_fmadd_ps(bprev, f2v, f1v);
+                        let av = _mm256_loadu_ps(acol.add(j));
+                        let postv = _mm256_mul_ps(av, bun);
+                        let m = lane_mask8(cbp, base, j);
+                        p1v = _mm256_add_ps(p1v, _mm256_and_ps(postv, m));
+                        p0v = _mm256_add_ps(p0v, _mm256_andnot_ps(m, postv));
+                        let ev = _mm256_blendv_ps(e0, e1, m);
+                        let nb = _mm256_mul_ps(bun, ev);
+                        _mm256_storeu_ps(bp.add(j), nb);
+                        bsumv = _mm256_add_ps(bsumv, nb);
+                        j += 8;
+                    }
+                    let mut new_beta_sum = hsum256(bsumv);
+                    let mut prob_hid_1 = hsum256(p1v);
+                    let mut prob_hid_0 = hsum256(p0v);
+                    while j < k {
+                        let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
+                        let e = if a { e1s } else { e0s };
+                        let bun = *bp.add(j) * fact2 + fact1;
+                        let post = *acol.add(j) * bun;
+                        if a { prob_hid_1 += post; } else { prob_hid_0 += post; }
+                        let nb = bun * e; *bp.add(j) = nb; new_beta_sum += nb;
+                        j += 1;
+                    }
+                    beta_sum = new_beta_sum;
+                    dosage[v] = finalize_site(
+                        loo, prob_hid_0, prob_hid_1, e0s, e1s,
+                        hl[2 * v], hl[2 * v + 1], ee, ed,
+                    );
+                }
+            }
+        }
+        if let Some(t) = t_fb { PROF_FB_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
     }))))));
 
     HmmOutput { dosage }
