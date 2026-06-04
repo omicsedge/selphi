@@ -432,12 +432,64 @@ pub fn run_forward_backward(
     HmmOutput { dosage }
 }
 
+/// `__mmask16` of allele bits for the 16-lane state group starting at `j`, from
+/// the bit-packed condbits row at `base`. Shared by the AVX-512 FB body and the
+/// forward-column recompute helper. (No intrinsics → plain fn.)
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn lcwgs_mask16(cbp: *const u64, base: usize, j: usize) -> u16 {
+    // SAFETY: caller guarantees base + j/64 indexes a valid condbits word.
+    unsafe { ((*cbp.add(base + j / 64) >> (j % 64)) & 0xFFFF) as u16 }
+}
+
+/// One AVX-512 forward column: `curr ← forward(prev)` at variant `v`, using
+/// `alpha_sum[v-1]` (= `asum_prev`). Returns the new column sum (`alpha_sum[v]`).
+/// Identical math/order to the inductive forward loop in [`run_fb_avx512`], so a
+/// recomputed column equals the originally-stored one bit-for-bit — the basis of
+/// the forward-checkpointing memory/cache win.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512dq")]
+unsafe fn fwd_col_avx512(
+    prev: *const f32, curr: *mut f32, v: usize,
+    e0s: f32, e1s: f32, pr: f32, asum_prev: f32,
+    cbp: *const u64, inv_k: f32, k: usize, kmain: usize, w64: usize,
+) -> f32 { unsafe {
+    use core::arch::x86_64::*;
+    let fact1 = pr * inv_k;
+    let fact2 = (1.0 - pr) / asum_prev.max(f32::MIN_POSITIVE);
+    let e0 = _mm512_set1_ps(e0s); let e1 = _mm512_set1_ps(e1s);
+    let f1v = _mm512_set1_ps(fact1); let f2v = _mm512_set1_ps(fact2);
+    let base = v * w64;
+    let mut sumv = _mm512_setzero_ps();
+    let mut j = 0;
+    while j < kmain {
+        let pv = _mm512_loadu_ps(prev.add(j));
+        let tmp = _mm512_fmadd_ps(pv, f2v, f1v);
+        let m = lcwgs_mask16(cbp, base, j);
+        let ev = _mm512_mask_blend_ps(m, e0, e1);
+        let p = _mm512_mul_ps(tmp, ev);
+        _mm512_storeu_ps(curr.add(j), p);
+        sumv = _mm512_add_ps(sumv, p);
+        j += 16;
+    }
+    let mut s = _mm512_reduce_add_ps(sumv);
+    while j < k {
+        let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
+        let e = if a { e1s } else { e0s };
+        let p = (*prev.add(j) * fact2 + fact1) * e;
+        *curr.add(j) = p; s += p; j += 1;
+    }
+    s
+}}
+
 /// AVX-512 implementation of [`run_forward_backward`]. Numerically equivalent
 /// (to f32 reduction-order) to the scalar path; validated against
 /// `SELPHI_FORCE_SCALAR=1`. Conditioning alleles are materialized bit-packed
 /// once (16 per `__mmask16`); the forward/backward inner loops over the K
 /// states are vectorized 16-wide with `_mm512_mask_blend_ps` for the emission
 /// select and `_mm512_mask_add_ps` for the per-allele posterior accumulation.
+/// Forward-checkpointed: alpha stored every √n_var, recomputed in-block during
+/// the backward pass (see [`fwd_col_avx512`]).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512dq")]
 unsafe fn run_fb_avx512(
@@ -512,23 +564,34 @@ unsafe fn run_fb_avx512(
         }
         let t_fb = if timing { Some(std::time::Instant::now()) } else { None };
 
-        // size scratch (no zero-fill; written before read)
-        let need_a = n_var * k;
+        // --- Checkpointed forward + block-recompute backward (memory/cache win) ---
+        // alpha stored only at √n_var checkpoints (chk, reusing TL_ALPHA); the
+        // in-between columns are recomputed per block during the backward pass via
+        // `fwd_col_avx512` — bit-identical (same FMA/blend/reduce order), so the
+        // dose is unchanged. alpha_sum (n_var) kept in full. condbits stays full
+        // (1/32 of the old alpha). Peak alpha: (n_chk+chk_stride)×K ≈ 2√n_var×K.
+        let chk_stride = ((n_var as f64).sqrt().ceil() as usize).max(1);
+        let n_chk = n_var.div_ceil(chk_stride);
+        let need_chk = n_chk * k;
         let (la, ls, lb) = (alpha.len(), alpha_sum.len(), beta.len());
-        if la < need_a { alpha.reserve(need_a - la); }
+        if la < need_chk { alpha.reserve(need_chk - la); }
         if ls < n_var { alpha_sum.reserve(n_var - ls); }
         if lb < k { beta.reserve(k - lb); }
-        alpha.set_len(need_a); alpha_sum.set_len(n_var); beta.set_len(k);
-
-        let ap = alpha.as_mut_ptr();
+        alpha.set_len(need_chk); alpha_sum.set_len(n_var); beta.set_len(k);
+        let chkp = alpha.as_mut_ptr();  // checkpoint columns: n_chk × k
+        let bp = beta.as_mut_ptr();
         let cbp = condbits.as_ptr();
-        // mask16 of allele bits for the 16-lane group starting at j.
-        #[inline(always)]
-        unsafe fn mask16(cbp: *const u64, base: usize, j: usize) -> u16 { unsafe {
-            ((*cbp.add(base + j / 64) >> (j % 64)) & 0xFFFF) as u16
-        }}
+        // Block recompute buffer (chk_stride × k) + rolling forward columns (2 × k).
+        // POC: local buffers; production should move these to thread-locals.
+        let mut blk = vec![0.0f32; chk_stride * k];
+        let mut fcol = vec![0.0f32; 2 * k];
+        let blkp = blk.as_mut_ptr();
+        let fcolp = fcol.as_mut_ptr();
+        let last = n_var - 1;
+        let e0l = emit[2 * last]; let e1l = emit[2 * last + 1];
 
-        // --- Forward base case (v=0): alpha = inv_k * e ---
+        // --- Initial forward: fill alpha_sum + store checkpoint columns ---
+        // Base case v=0 into fcol[0..k] (= prev).
         {
             let e0 = _mm512_set1_ps(emit[0]);
             let e1 = _mm512_set1_ps(emit[1]);
@@ -536,10 +599,10 @@ unsafe fn run_fb_avx512(
             let mut sumv = _mm512_setzero_ps();
             let mut j = 0;
             while j < kmain {
-                let m = mask16(cbp, 0, j);
+                let m = lcwgs_mask16(cbp, 0, j);
                 let ev = _mm512_mask_blend_ps(m, e0, e1);
                 let p = _mm512_mul_ps(ev, invkv);
-                _mm512_storeu_ps(ap.add(j), p);
+                _mm512_storeu_ps(fcolp.add(j), p);
                 sumv = _mm512_add_ps(sumv, p);
                 j += 16;
             }
@@ -547,127 +610,122 @@ unsafe fn run_fb_avx512(
             while j < k {
                 let a = (*cbp.add(j / 64) >> (j % 64)) & 1 != 0;
                 let p = inv_k * if a { emit[1] } else { emit[0] };
-                *ap.add(j) = p; s0 += p; j += 1;
+                *fcolp.add(j) = p; s0 += p; j += 1;
             }
             alpha_sum[0] = s0;
+            std::ptr::copy_nonoverlapping(fcolp, chkp, k); // checkpoint 0 = alpha[0]
         }
-
-        // --- Forward inductive ---
         for v in 1..n_var {
-            let pr = p_rec[v];
-            let fact1 = pr * inv_k;
-            let fact2 = (1.0 - pr) / alpha_sum[v - 1].max(f32::MIN_POSITIVE);
-            let e0s = emit[2 * v]; let e1s = emit[2 * v + 1];
-            let e0 = _mm512_set1_ps(e0s); let e1 = _mm512_set1_ps(e1s);
-            let f1v = _mm512_set1_ps(fact1); let f2v = _mm512_set1_ps(fact2);
-            let base = v * w64;
-            let prev_off = (v - 1) * k; let curr_off = v * k;
-            let mut sumv = _mm512_setzero_ps();
-            let mut j = 0;
-            while j < kmain {
-                let prev = _mm512_loadu_ps(ap.add(prev_off + j));
-                let tmp = _mm512_fmadd_ps(prev, f2v, f1v);
-                let m = mask16(cbp, base, j);
-                let ev = _mm512_mask_blend_ps(m, e0, e1);
-                let p = _mm512_mul_ps(tmp, ev);
-                _mm512_storeu_ps(ap.add(curr_off + j), p);
-                sumv = _mm512_add_ps(sumv, p);
-                j += 16;
-            }
-            let mut s = _mm512_reduce_add_ps(sumv);
-            while j < k {
-                let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
-                let e = if a { e1s } else { e0s };
-                let p = (*ap.add(prev_off + j) * fact2 + fact1) * e;
-                *ap.add(curr_off + j) = p; s += p; j += 1;
-            }
+            // prev = fcol[0..k], curr = fcol[k..2k] (disjoint).
+            let s = fwd_col_avx512(
+                fcolp, fcolp.add(k), v, emit[2 * v], emit[2 * v + 1],
+                p_rec[v], alpha_sum[v - 1], cbp, inv_k, k, kmain, w64);
             alpha_sum[v] = s;
+            if v % chk_stride == 0 {
+                let c = v / chk_stride;
+                std::ptr::copy_nonoverlapping(fcolp.add(k), chkp.add(c * k), k);
+            }
+            std::ptr::copy_nonoverlapping(fcolp.add(k), fcolp, k); // roll curr → prev
         }
 
-        // --- Backward init (last site) ---
-        let last = n_var - 1;
-        let bp = beta.as_mut_ptr();
-        let e0l = emit[2 * last]; let e1l = emit[2 * last + 1];
-        let mut beta_sum;
-        {
-            let e0 = _mm512_set1_ps(e0l); let e1 = _mm512_set1_ps(e1l);
-            let invkv = _mm512_set1_ps(inv_k);
-            let base = last * w64; let aoff = last * k;
-            let mut bsumv = _mm512_setzero_ps();
-            let mut p1v = _mm512_setzero_ps(); let mut p0v = _mm512_setzero_ps();
-            let mut j = 0;
-            while j < kmain {
-                let m = mask16(cbp, base, j);
-                let ev = _mm512_mask_blend_ps(m, e0, e1);
-                let bv = _mm512_mul_ps(ev, invkv);
-                _mm512_storeu_ps(bp.add(j), bv);
-                bsumv = _mm512_add_ps(bsumv, bv);
-                let av = _mm512_loadu_ps(ap.add(aoff + j));
-                let postv = _mm512_mul_ps(av, invkv);
-                p1v = _mm512_mask_add_ps(p1v, m, p1v, postv);
-                p0v = _mm512_mask_add_ps(p0v, !m, p0v, postv);
-                j += 16;
+        // --- Backward: blocks in reverse; recompute each block's forward columns
+        //     into `blk` from its checkpoint; beta (k) rolls globally. ---
+        let mut beta_sum = 0.0f32;
+        let mut init_done = false;
+        for b in (0..n_chk).rev() {
+            let lo = b * chk_stride;
+            let hi = ((b + 1) * chk_stride).min(n_var);
+            // Recompute block forward: blk col 0 = chk[b] (= alpha[lo]); col i = fwd(col i-1).
+            std::ptr::copy_nonoverlapping(chkp.add(b * k), blkp, k);
+            for i in 1..(hi - lo) {
+                let v = lo + i;
+                fwd_col_avx512(
+                    blkp.add((i - 1) * k), blkp.add(i * k), v, emit[2 * v], emit[2 * v + 1],
+                    p_rec[v], alpha_sum[v - 1], cbp, inv_k, k, kmain, w64);
             }
-            beta_sum = _mm512_reduce_add_ps(bsumv);
-            let mut prob_hid_1 = _mm512_reduce_add_ps(p1v);
-            let mut prob_hid_0 = _mm512_reduce_add_ps(p0v);
-            while j < k {
-                let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
-                let e = if a { e1l } else { e0l };
-                let b = inv_k * e; *bp.add(j) = b; beta_sum += b;
-                let post = *ap.add(aoff + j) * inv_k;
-                if a { prob_hid_1 += post; } else { prob_hid_0 += post; }
-                j += 1;
+            // Backward over the block, v from hi-1 down to lo. alpha[v] = blk col (v-lo).
+            for v in (lo..hi).rev() {
+                let acol = blkp.add((v - lo) * k);
+                if !init_done {
+                    // v == last: Beta init = (1/K)·emit_last + posterior at last.
+                    let e0 = _mm512_set1_ps(e0l); let e1 = _mm512_set1_ps(e1l);
+                    let invkv = _mm512_set1_ps(inv_k);
+                    let base = last * w64;
+                    let mut bsumv = _mm512_setzero_ps();
+                    let mut p1v = _mm512_setzero_ps(); let mut p0v = _mm512_setzero_ps();
+                    let mut j = 0;
+                    while j < kmain {
+                        let m = lcwgs_mask16(cbp, base, j);
+                        let ev = _mm512_mask_blend_ps(m, e0, e1);
+                        let bv = _mm512_mul_ps(ev, invkv);
+                        _mm512_storeu_ps(bp.add(j), bv);
+                        bsumv = _mm512_add_ps(bsumv, bv);
+                        let av = _mm512_loadu_ps(acol.add(j));
+                        let postv = _mm512_mul_ps(av, invkv);
+                        p1v = _mm512_mask_add_ps(p1v, m, p1v, postv);
+                        p0v = _mm512_mask_add_ps(p0v, !m, p0v, postv);
+                        j += 16;
+                    }
+                    beta_sum = _mm512_reduce_add_ps(bsumv);
+                    let mut prob_hid_1 = _mm512_reduce_add_ps(p1v);
+                    let mut prob_hid_0 = _mm512_reduce_add_ps(p0v);
+                    while j < k {
+                        let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
+                        let e = if a { e1l } else { e0l };
+                        let bb = inv_k * e; *bp.add(j) = bb; beta_sum += bb;
+                        let post = *acol.add(j) * inv_k;
+                        if a { prob_hid_1 += post; } else { prob_hid_0 += post; }
+                        j += 1;
+                    }
+                    dosage[last] = finalize_site(
+                        loo, prob_hid_0, prob_hid_1, e0l, e1l,
+                        hl[2 * last], hl[2 * last + 1], ee, ed,
+                    );
+                    init_done = true;
+                } else {
+                    let pr = p_rec[v + 1];
+                    let fact1 = pr * inv_k;
+                    let fact2 = (1.0 - pr) / beta_sum.max(f32::MIN_POSITIVE);
+                    let e0s = emit[2 * v]; let e1s = emit[2 * v + 1];
+                    let e0 = _mm512_set1_ps(e0s); let e1 = _mm512_set1_ps(e1s);
+                    let f1v = _mm512_set1_ps(fact1); let f2v = _mm512_set1_ps(fact2);
+                    let base = v * w64;
+                    let mut bsumv = _mm512_setzero_ps();
+                    let mut p1v = _mm512_setzero_ps(); let mut p0v = _mm512_setzero_ps();
+                    let mut j = 0;
+                    while j < kmain {
+                        let bprev = _mm512_loadu_ps(bp.add(j));
+                        let bun = _mm512_fmadd_ps(bprev, f2v, f1v); // beta*fact2 + fact1
+                        let av = _mm512_loadu_ps(acol.add(j));
+                        let postv = _mm512_mul_ps(av, bun);
+                        let m = lcwgs_mask16(cbp, base, j);
+                        p1v = _mm512_mask_add_ps(p1v, m, p1v, postv);
+                        p0v = _mm512_mask_add_ps(p0v, !m, p0v, postv);
+                        let ev = _mm512_mask_blend_ps(m, e0, e1);
+                        let nb = _mm512_mul_ps(bun, ev);
+                        _mm512_storeu_ps(bp.add(j), nb);
+                        bsumv = _mm512_add_ps(bsumv, nb);
+                        j += 16;
+                    }
+                    let mut new_beta_sum = _mm512_reduce_add_ps(bsumv);
+                    let mut prob_hid_1 = _mm512_reduce_add_ps(p1v);
+                    let mut prob_hid_0 = _mm512_reduce_add_ps(p0v);
+                    while j < k {
+                        let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
+                        let e = if a { e1s } else { e0s };
+                        let bun = *bp.add(j) * fact2 + fact1;
+                        let post = *acol.add(j) * bun;
+                        if a { prob_hid_1 += post; } else { prob_hid_0 += post; }
+                        let nb = bun * e; *bp.add(j) = nb; new_beta_sum += nb;
+                        j += 1;
+                    }
+                    beta_sum = new_beta_sum;
+                    dosage[v] = finalize_site(
+                        loo, prob_hid_0, prob_hid_1, e0s, e1s,
+                        hl[2 * v], hl[2 * v + 1], ee, ed,
+                    );
+                }
             }
-            dosage[last] = finalize_site(
-                loo, prob_hid_0, prob_hid_1, e0l, e1l,
-                hl[2 * last], hl[2 * last + 1], ee, ed,
-            );
-        }
-
-        // --- Backward inductive ---
-        for v in (0..last).rev() {
-            let pr = p_rec[v + 1];
-            let fact1 = pr * inv_k;
-            let fact2 = (1.0 - pr) / beta_sum.max(f32::MIN_POSITIVE);
-            let e0s = emit[2 * v]; let e1s = emit[2 * v + 1];
-            let e0 = _mm512_set1_ps(e0s); let e1 = _mm512_set1_ps(e1s);
-            let f1v = _mm512_set1_ps(fact1); let f2v = _mm512_set1_ps(fact2);
-            let base = v * w64; let aoff = v * k;
-            let mut bsumv = _mm512_setzero_ps();
-            let mut p1v = _mm512_setzero_ps(); let mut p0v = _mm512_setzero_ps();
-            let mut j = 0;
-            while j < kmain {
-                let bprev = _mm512_loadu_ps(bp.add(j));
-                let bun = _mm512_fmadd_ps(bprev, f2v, f1v); // beta*fact2 + fact1
-                let av = _mm512_loadu_ps(ap.add(aoff + j));
-                let postv = _mm512_mul_ps(av, bun);
-                let m = mask16(cbp, base, j);
-                p1v = _mm512_mask_add_ps(p1v, m, p1v, postv);
-                p0v = _mm512_mask_add_ps(p0v, !m, p0v, postv);
-                let ev = _mm512_mask_blend_ps(m, e0, e1);
-                let nb = _mm512_mul_ps(bun, ev);
-                _mm512_storeu_ps(bp.add(j), nb);
-                bsumv = _mm512_add_ps(bsumv, nb);
-                j += 16;
-            }
-            let mut new_beta_sum = _mm512_reduce_add_ps(bsumv);
-            let mut prob_hid_1 = _mm512_reduce_add_ps(p1v);
-            let mut prob_hid_0 = _mm512_reduce_add_ps(p0v);
-            while j < k {
-                let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
-                let e = if a { e1s } else { e0s };
-                let bun = *bp.add(j) * fact2 + fact1;
-                let post = *ap.add(aoff + j) * bun;
-                if a { prob_hid_1 += post; } else { prob_hid_0 += post; }
-                let nb = bun * e; *bp.add(j) = nb; new_beta_sum += nb;
-                j += 1;
-            }
-            beta_sum = new_beta_sum;
-            dosage[v] = finalize_site(
-                loo, prob_hid_0, prob_hid_1, e0s, e1s,
-                hl[2 * v], hl[2 * v + 1], ee, ed,
-            );
         }
         if let Some(t) = t_fb {
             PROF_FB_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
