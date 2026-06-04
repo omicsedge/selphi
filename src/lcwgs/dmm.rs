@@ -47,6 +47,13 @@ impl DmmConfig {
 /// (≤ `cfg.m`) set of conditioning haps used for the diplotype phasing — the
 /// caller passes the IBD-ranked top of the sample's conditioning set (GLIMPSE2
 /// uses a fixed HAP_NUMBER=8 phasing set). Genotype-preserving.
+///
+/// `weight` (LCWGS_DMM_GL): optional per-site read-confidence in [0,1]. When
+/// present, each site's copy-match contributes `weight[v]` instead of 1, so the
+/// segment commitment is driven by READ-SUPPORTED sites and ignores flat-GL
+/// (zero-read) noise — the addressable (~53% weak-read) half of the rare gap.
+/// `None` reproduces the plain integer-count emission byte-for-byte.
+#[allow(clippy::too_many_arguments)]
 pub fn rephase_diplotype(
     h0: &mut [u8],
     h1: &mut [u8],
@@ -54,6 +61,7 @@ pub fn rephase_diplotype(
     ref_bm: &HaplotypeBitmatrix,
     cm: &[f64],
     cfg: &DmmConfig,
+    weight: Option<&[f32]>,
 ) {
     let n_var = h0.len();
     let m = phase_haps.len().min(cfg.m);
@@ -98,12 +106,22 @@ pub fn rephase_diplotype(
             let ab = a * n_var;
             for b in 0..m {
                 let bb = b * n_var;
-                let mut sc = 0i32;
-                for v in lo..hi {
-                    sc += (hap_al[ab + v] == h0[v]) as i32;
-                    sc += (hap_al[bb + v] == h1[v]) as i32;
-                }
-                emit[ebase + a * m + b] = sc as f32;
+                let sc = if let Some(w) = weight {
+                    let mut s = 0.0f32;
+                    for v in lo..hi {
+                        s += w[v] * (hap_al[ab + v] == h0[v]) as u32 as f32;
+                        s += w[v] * (hap_al[bb + v] == h1[v]) as u32 as f32;
+                    }
+                    s
+                } else {
+                    let mut ic = 0i32;
+                    for v in lo..hi {
+                        ic += (hap_al[ab + v] == h0[v]) as i32;
+                        ic += (hap_al[bb + v] == h1[v]) as i32;
+                    }
+                    ic as f32
+                };
+                emit[ebase + a * m + b] = sc;
             }
         }
     }
