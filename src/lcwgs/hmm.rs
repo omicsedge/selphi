@@ -288,6 +288,9 @@ pub fn run_forward_backward(
     let mut dosage = vec![0.0f32; n_var];
     let chk_stride = ((n_var as f64).sqrt().ceil() as usize).max(1);
     let n_chk = n_var.div_ceil(chk_stride);
+    // Scalar (non-AVX-512 fallback) path: local scratch is fine — this path runs
+    // only on non-AVX-512 hosts / SELPHI_FORCE_SCALAR, where per-call alloc is not
+    // perf-critical. The production AVX-512 path uses thread-local scratch.
     let mut blk = vec![0.0f32; chk_stride * k]; // one recomputed forward block
     let mut fcol = vec![0.0f32; 2 * k];          // rolling forward prev/curr
 
@@ -430,6 +433,25 @@ pub fn run_forward_backward(
     })))));
 
     HmmOutput { dosage }
+}
+
+/// Ensure a thread-local f32 scratch has ≥ `need` length and return a raw pointer
+/// into its (thread-persistent) buffer — avoids a per-call heap alloc in the hot
+/// HMM path without adding another `.with` nesting level. SOUND within one
+/// `run_fb_avx512` call: nothing else borrows that thread-local there, and the
+/// buffer outlives the call. Every used slot is written before it is read (the
+/// forward base/recompute fill each column before the backward reads it), so the
+/// no-zero `set_len` is sound (same idiom as the alpha/beta scratch).
+#[cfg(target_arch = "x86_64")]
+fn tl_scratch_ptr(cell: &'static std::thread::LocalKey<RefCell<Vec<f32>>>, need: usize) -> *mut f32 {
+    cell.with(|c| {
+        let mut b = c.borrow_mut();
+        let len = b.len();
+        if len < need { b.reserve(need - len); }
+        // SAFETY: capacity reserved; f32 is Copy/no-Drop; written before read.
+        unsafe { b.set_len(need); }
+        b.as_mut_ptr()
+    })
 }
 
 /// `__mmask16` of allele bits for the 16-lane state group starting at `j`, from
@@ -581,12 +603,10 @@ unsafe fn run_fb_avx512(
         let chkp = alpha.as_mut_ptr();  // checkpoint columns: n_chk × k
         let bp = beta.as_mut_ptr();
         let cbp = condbits.as_ptr();
-        // Block recompute buffer (chk_stride × k) + rolling forward columns (2 × k).
-        // POC: local buffers; production should move these to thread-locals.
-        let mut blk = vec![0.0f32; chk_stride * k];
-        let mut fcol = vec![0.0f32; 2 * k];
-        let blkp = blk.as_mut_ptr();
-        let fcolp = fcol.as_mut_ptr();
+        // Block recompute buffer (chk_stride × k) + rolling forward columns (2 × k),
+        // from thread-local scratch (no per-call alloc in the hot path).
+        let blkp = tl_scratch_ptr(&TL_BLK, chk_stride * k);
+        let fcolp = tl_scratch_ptr(&TL_FCOL, 2 * k);
         let last = n_var - 1;
         let e0l = emit[2 * last]; let e1l = emit[2 * last + 1];
 
