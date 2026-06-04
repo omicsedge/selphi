@@ -154,6 +154,23 @@ struct GibbsConfig {
     /// so the diplotype commitment is driven by read-supported sites and ignores
     /// flat-GL (zero-read) noise. Implies `dmm`. Default off.
     dmm_gl: bool,
+    /// Rare-carrier-aware DMM phasing set (DEFAULT ON; opt out `LCWGS_NO_DMM_RC`).
+    /// The DMM's per-segment commitment normally chooses its M phasing copies from
+    /// the GLOBALLY IBD-ranked conditioning list, so a locally-IBD rare-allele
+    /// carrier (which the diagnosis shows is the dominant "present-but-not-copied"
+    /// miss class — 78% of 0.5-1% misses under the prior default) is never a
+    /// commitment candidate. When on, the panel carriers of each sample's het rare
+    /// sites are ranked by local IBD-run length to the het-ALT hap and the top
+    /// `dmm_rc_budget` are appended to that sample's DMM phasing set, so the segment
+    /// Viterbi can commit a het rare-carrier segment onto the true carrier (which
+    /// then reinforces over main iters). This does NOT touch the global HMM
+    /// conditioning set (adding carriers there is measured-negative: RC_ALL /
+    /// match-ext / flank all regress). Validated 2026-06-04 (r12 + full-chr22 +
+    /// chr1: every MAF bin up, zero regression, neutral wall/mem). Requires `dmm`.
+    dmm_rc: bool,
+    /// Max local rare carriers injected per sample into the DMM phasing set
+    /// (`LCWGS_DMM_RC_BUDGET`, default 6). On top of the `LCWGS_DMM_M` IBD copies.
+    dmm_rc_budget: usize,
 }
 impl GibbsConfig {
     fn from_env() -> Self {
@@ -167,10 +184,18 @@ impl GibbsConfig {
         // and LCWGS_DMM (explicit) also force it on. DMM implies the Gauss-Seidel
         // main sweep (it regularizes it); LCWGS_DMM_GL implies the DMM.
         let dmm_gl = std::env::var("LCWGS_DMM_GL").is_ok();
+        let force_dmm_rc = std::env::var("LCWGS_DMM_RC").is_ok();
         let dmm = dmm_gl
+            || force_dmm_rc
             || std::env::var("LCWGS_DMM").is_ok()
             || std::env::var("LCWGS_NO_DMM").is_err();
         let gs_main = dmm || std::env::var("LCWGS_GS_MAIN").is_ok();
+        // Rare-carrier-aware DMM is DEFAULT-ON when the DMM is on (validated
+        // 2026-06-04 on r12 + full-chr22 + chr1: every MAF bin up, zero regression,
+        // neutral wall/mem). It extends the DMM segment-commitment set, so it is a
+        // no-op when the DMM is off (LCWGS_NO_DMM). Opt out with LCWGS_NO_DMM_RC=1;
+        // LCWGS_DMM_RC forces it (and the DMM) on.
+        let dmm_rc = dmm && (force_dmm_rc || std::env::var("LCWGS_NO_DMM_RC").is_err());
         GibbsConfig {
             use_scaffold: std::env::var("LCWGS_SCAFFOLD").is_ok(),
             refresh: envu("LCWGS_SELECT_REFRESH").filter(|&r| r >= 1).unwrap_or(5),
@@ -186,6 +211,8 @@ impl GibbsConfig {
             gs_main,
             dmm,
             dmm_gl,
+            dmm_rc,
+            dmm_rc_budget: envu("LCWGS_DMM_RC_BUDGET").unwrap_or(6),
         }
     }
 }
@@ -397,15 +424,72 @@ pub fn run_gibbs(
                 let (h0i, h1i) = (2 * s, 2 * s + 1);
                 let mut h0: Vec<u8> = (0..n_var).map(|v| hap_alleles[v * n_target_haps + h0i]).collect();
                 let mut h1: Vec<u8> = (0..n_var).map(|v| hap_alleles[v * n_target_haps + h1i]).collect();
-                // Diplotype phasing set: interleave the two haps' IBD-ranked cond
-                // lists, dedup, take top-M.
+                // Rare-carrier-aware injection (LCWGS_DMM_RC): for this sample's
+                // het rare sites, rank the panel carriers by LOCAL flanking
+                // agreement with the het-ALT hap and keep the top `dmm_rc_budget`.
+                // These are offered to the segment Viterbi as extra phasing copies
+                // so a het rare-carrier segment can be committed onto the true
+                // carrier (the dominant present-but-not-copied miss class). Empty
+                // and byte-identical when dmm_rc is off.
+                let rc_inject: Vec<u32> = if cfg.dmm_rc {
+                    // Local IBD-run length of a carrier vs the het-ALT hap: extend
+                    // left/right from the rare site counting consecutive matching
+                    // alleles until the first mismatch, capped at RC_RUN_CAP each
+                    // side. This is the local IBD segment length (a PBWT-divergence
+                    // analogue) — cheap (early-stop on mismatch; rare carriers share
+                    // only short runs) and the right metric for which carrier the
+                    // segment Viterbi should be able to commit to.
+                    const RC_RUN_CAP: usize = 64;
+                    let mut scored: Vec<(u32, u32)> = Vec::new();
+                    for (rv, carriers) in &rare_sites {
+                        let rv = *rv;
+                        if h0[rv] == h1[rv] { continue; }            // het sites only
+                        let alt: &[u8] = if h0[rv] == 1 { &h0 } else { &h1 };
+                        for &c in carriers {
+                            let cu = c as usize;
+                            let mut run = 1u32;                       // the rare site itself matches (carrier ALT, alt hap ALT)
+                            let mut w = rv;
+                            let mut steps = 0;
+                            while w > 0 && steps < RC_RUN_CAP {
+                                w -= 1; steps += 1;
+                                if ref_bm.get(w, cu) as u8 == alt[w] { run += 1; } else { break; }
+                            }
+                            let mut w = rv; let mut steps = 0;
+                            while w + 1 < n_var && steps < RC_RUN_CAP {
+                                w += 1; steps += 1;
+                                if ref_bm.get(w, cu) as u8 == alt[w] { run += 1; } else { break; }
+                            }
+                            scored.push((run, c));
+                        }
+                    }
+                    if scored.is_empty() {
+                        Vec::new()
+                    } else {
+                        // Longest local IBD first; index tiebreak for determinism.
+                        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+                        let mut seenc = std::collections::HashSet::new();
+                        scored.into_iter()
+                            .filter(|&(_, c)| seenc.insert(c))
+                            .take(cfg.dmm_rc_budget)
+                            .map(|(_, c)| c)
+                            .collect()
+                    }
+                } else {
+                    Vec::new()
+                };
+
+                // Diplotype phasing set: the injected rare carriers (if any) first,
+                // then the two haps' IBD-ranked cond lists interleaved, deduped, with
+                // `dcfg.m` IBD copies kept ON TOP of the injected carriers.
                 let (c0, c1) = (&cond_per_hap[h0i], &cond_per_hap[h1i]);
-                let mut ph: Vec<u32> = Vec::with_capacity(dcfg.m);
+                let mut ph: Vec<u32> = Vec::with_capacity(dcfg.m + rc_inject.len());
                 let mut seen = std::collections::HashSet::new();
+                for &c in &rc_inject { if seen.insert(c) { ph.push(c); } }
+                let target = dcfg.m + ph.len();
                 let mut i = 0;
-                while ph.len() < dcfg.m && (i < c0.len() || i < c1.len()) {
+                while ph.len() < target && (i < c0.len() || i < c1.len()) {
                     if i < c0.len() && seen.insert(c0[i]) { ph.push(c0[i]); }
-                    if ph.len() < dcfg.m && i < c1.len() && seen.insert(c1[i]) { ph.push(c1[i]); }
+                    if ph.len() < target && i < c1.len() && seen.insert(c1[i]) { ph.push(c1[i]); }
                     i += 1;
                 }
                 // GL-aware emission weight (LCWGS_DMM_GL): per-site read confidence
