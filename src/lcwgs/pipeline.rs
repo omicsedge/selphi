@@ -28,6 +28,20 @@ use crate::srp::SrpReader;
 use crate::selphi_info;
 
 use super::iterate::run_gibbs;
+
+/// Current process RSS in GB (Linux /proc/self/statm field 2 = resident pages).
+fn rss_gb() -> f64 {
+    std::fs::read_to_string("/proc/self/statm").ok()
+        .and_then(|s| s.split_whitespace().nth(1).and_then(|p| p.parse::<u64>().ok()))
+        .map(|pages| pages as f64 * 4096.0 / 1.073_741_824e9)
+        .unwrap_or(0.0)
+}
+/// Gated RSS checkpoint (`LCWGS_MEMTRACE`) for locating the memory peak.
+fn memtrace(label: &str) {
+    if std::env::var("LCWGS_MEMTRACE").is_ok() {
+        crate::selphi_info!("  [memtrace] {:<40} {:.1} GB RSS", label, rss_gb());
+    }
+}
 use super::pl_reader::{parse_pl_vcf, PlVcfResult};
 use super::LcwgsParams;
 
@@ -66,6 +80,7 @@ pub fn run_lcwgs(
     params: &LcwgsParams,
     _n_threads: usize,
 ) -> std::io::Result<LcwgsOutput> {
+    memtrace("entry (after SRP load)");
     // --- 1. Parse target VCF with PL ---
     let hash_alleles = !srp.ids.is_empty() && {
         let first_ref = &srp.variants[0].ref_allele;
@@ -73,6 +88,7 @@ pub fn run_lcwgs(
     };
     let PlVcfResult { gl3: gl3_input, markers, sample_ids } =
         parse_pl_vcf(target_vcf, hash_alleles)?;
+    memtrace("after parse_pl_vcf (+gl3_input)");
     let n_samples = sample_ids.len();
     let n_target_variants = markers.len();
     let n_ref_haps = srp.metadata.n_haps;
@@ -108,6 +124,7 @@ pub fn run_lcwgs(
             .copy_from_slice(&gl3_input[src_off .. src_off + n_samples * 3]);
     }
     drop(gl3_input);
+    memtrace("after gl3_shared relayout (gl3_input dropped)");
 
     // --- 5. cM map + chunked Gibbs imputation (shared with the BAM path) ---
     impute_from_gl3(srp, &wgs_idx, gl3_shared, n_samples, sample_ids, map_path, params)
@@ -312,6 +329,7 @@ fn run_chunked_gibbs(
         let chunk_bm = srp.extract_ref_alleles_bitmatrix(&chunk_wgs);
 
         let out = run_gibbs(&chunk_gl3, &chunk_bm, &chunk_cm, n_samples, params);
+        memtrace(&format!("chunk {c}/{n_chunks} done (chunk_n={chunk_n})"));
 
         // PHASE-0 diagnostic dump (LCWGS_COND_DUMP=<dir>): per chunk, write the
         // final base conditioning set per target hap + the panel carrier list of
