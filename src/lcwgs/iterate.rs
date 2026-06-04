@@ -141,6 +141,11 @@ struct GibbsConfig {
     /// does not amplify burn-in noise — the documented failure mode of the
     /// earlier always-on sequential-diploid scan (commit e54436b). Default off.
     gs_main: bool,
+    /// EXPERIMENT (`LCWGS_DMM`): after the GS-main sweep, re-phase each sample's
+    /// H0/H1 with a segment-level diplotype-commitment (DMM, GLIMPSE2
+    /// rephaseHaplotypes analogue) before write-back, so a segment-coherent
+    /// low-noise phase feeds the next iteration. Implies `gs_main`. Default off.
+    dmm: bool,
 }
 impl GibbsConfig {
     fn from_env() -> Self {
@@ -157,7 +162,9 @@ impl GibbsConfig {
             rare_carrier_max: envu("LCWGS_RARE_CARRIER_MAX").unwrap_or(64),
             timing: std::env::var("LCWGS_TIMING").is_ok(),
             cond_dump: std::env::var("LCWGS_COND_DUMP").is_ok(),
-            gs_main: std::env::var("LCWGS_GS_MAIN").is_ok(),
+            // LCWGS_DMM implies the Gauss-Seidel main sweep (the DMM regularizes it).
+            gs_main: std::env::var("LCWGS_GS_MAIN").is_ok() || std::env::var("LCWGS_DMM").is_ok(),
+            dmm: std::env::var("LCWGS_DMM").is_ok(),
         }
     }
 }
@@ -189,6 +196,7 @@ pub fn run_gibbs(
     assert_eq!(ref_bm.n_sites, n_var);
 
     let cfg = GibbsConfig::from_env();
+    let dmm_cfg = if cfg.dmm { Some(super::dmm::DmmConfig::from_env()) } else { None };
 
     // Per-hap sampled alleles, layout [v * n_target_haps + h]. Initialized
     // from the marginal genotype MAP, then refined by Gibbs sampling.
@@ -352,6 +360,41 @@ pub fn run_gibbs(
         for (h, dose, sampled) in results {
             for v in 0..n_var { hap_alleles[v * n_target_haps + h] = sampled[v]; }
             hap_dose[h] = Some(dose);
+        }
+
+        // DMM segment phase-commitment (LCWGS_DMM, main iters only): re-phase each
+        // sample's H0/H1 onto a per-segment committed diplotype copy so a
+        // segment-coherent low-noise phase feeds the next iteration's selection +
+        // partner conditioning (regularizes the GS-main coupling). Genotype-
+        // preserving → this iteration's accumulated dose (from hap_dose) is
+        // unchanged; only subsequent iterations' inputs differ.
+        if cfg.dmm && is_main {
+            let dcfg = dmm_cfg.as_ref().unwrap();
+            let rephased: Vec<(usize, Vec<u8>, Vec<u8>)> = (0..n_samples).into_par_iter().map(|s| {
+                let (h0i, h1i) = (2 * s, 2 * s + 1);
+                let mut h0: Vec<u8> = (0..n_var).map(|v| hap_alleles[v * n_target_haps + h0i]).collect();
+                let mut h1: Vec<u8> = (0..n_var).map(|v| hap_alleles[v * n_target_haps + h1i]).collect();
+                // Diplotype phasing set: interleave the two haps' IBD-ranked cond
+                // lists, dedup, take top-M.
+                let (c0, c1) = (&cond_per_hap[h0i], &cond_per_hap[h1i]);
+                let mut ph: Vec<u32> = Vec::with_capacity(dcfg.m);
+                let mut seen = std::collections::HashSet::new();
+                let mut i = 0;
+                while ph.len() < dcfg.m && (i < c0.len() || i < c1.len()) {
+                    if i < c0.len() && seen.insert(c0[i]) { ph.push(c0[i]); }
+                    if ph.len() < dcfg.m && i < c1.len() && seen.insert(c1[i]) { ph.push(c1[i]); }
+                    i += 1;
+                }
+                super::dmm::rephase_diplotype(&mut h0, &mut h1, &ph, ref_bm, cm, dcfg);
+                (s, h0, h1)
+            }).collect();
+            for (s, h0, h1) in rephased {
+                let (h0i, h1i) = (2 * s, 2 * s + 1);
+                for v in 0..n_var {
+                    hap_alleles[v * n_target_haps + h0i] = h0[v];
+                    hap_alleles[v * n_target_haps + h1i] = h1[v];
+                }
+            }
         }
         if is_main {
             for s in 0..n_samples {

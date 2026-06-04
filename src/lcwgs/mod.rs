@@ -58,6 +58,7 @@ pub mod pbwt_select;
 pub mod bam_pileup;
 pub mod indel_realign;
 pub mod iterate;
+pub mod dmm;
 pub mod pipeline;
 pub mod output;
 
