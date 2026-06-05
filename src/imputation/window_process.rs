@@ -51,7 +51,7 @@ pub struct WindowHmmOutput {
 /// duplicated between the single-chr and multi-chr pipelines.
 pub struct ImputeWindowInputs<'a> {
     pub ref_bm: &'a HaplotypeBitmatrix,
-    pub targ_alleles: &'a [u8],           // (n_chip × n_haps) full target, row-major
+    pub targ_alleles: &'a HaplotypeBitmatrix, // (n_chip sites × n_haps) full target, bit-packed
     pub chip_cm: &'a [f64],               // per-chip genetic distances (cM), full length
     pub ne_per_site: Option<&'a [f64]>,   // per-site Ne (from phasing EM), full length
     pub chip_start: usize,
@@ -74,8 +74,23 @@ pub fn impute_window(
     on_batch_done: Option<BatchDoneCb<'_>>,
 ) -> WindowHmmOutput {
     let n_var_w = inputs.chip_end - inputs.chip_start;
-    // targ_alleles is (n_chip × n_haps) row-major, so the window slice is contiguous — no copy needed.
-    let targ_w: &[u8] = &inputs.targ_alleles[inputs.chip_start * params.n_haps .. inputs.chip_end * params.n_haps];
+    // targ_alleles is now bit-packed (the full target is held 8× smaller); unpack
+    // ONLY this window's rows into a small dense Vec<u8> (n_var_w × n_haps) so the
+    // hot loops below (build_coded_steps_bm + reduced-array) stay byte-for-byte
+    // unchanged. get(site,h) round-trips the 0/1 alleles exactly.
+    let targ_w_owned: Vec<u8> = {
+        let nh = params.n_haps;
+        let mut w = vec![0u8; n_var_w * nh];
+        for var in 0..n_var_w {
+            let site = inputs.chip_start + var;
+            let base = var * nh;
+            for h in 0..nh {
+                w[base + h] = inputs.targ_alleles.get(site, h) as u8;
+            }
+        }
+        w
+    };
+    let targ_w: &[u8] = &targ_w_owned;
     let cm_w = &inputs.chip_cm[inputs.chip_start..inputs.chip_end];
 
     let coded = super::pbwt::build_coded_steps_bm(

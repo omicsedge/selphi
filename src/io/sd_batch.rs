@@ -79,8 +79,8 @@ impl BatchSink for SdSink<'_> {
         let ci = ctx.chip_local_idx[local_i];
         for s in 0..ctx.n_samples_in_batch {
             let gs = ctx.sample_start + s;
-            let a0 = ctx.chip_genotypes[ci * ctx.n_haps_total + gs * 2] as i32;
-            let a1 = ctx.chip_genotypes[ci * ctx.n_haps_total + gs * 2 + 1] as i32;
+            let a0 = ctx.chip_genotypes.get(ci, gs * 2) as i32;
+            let a1 = ctx.chip_genotypes.get(ci, gs * 2 + 1) as i32;
             self.gt1[s] = a0; self.gt2[s] = a1;
             self.ap1[s] = a0 as f32; self.ap2[s] = a1 as f32;
         }
