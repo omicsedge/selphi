@@ -64,8 +64,8 @@ pub struct Args {
     #[arg(long)]
     pub phase_only: bool,
 
-    /// De-novo PANEL phasing: phase an unphased cohort (--input VCF/BCF) using
-    /// the cohort itself as the conditioning set (no --refpanel needed).
+    /// De-novo PANEL phasing: phase an unphased cohort (--input VCF/BCF, SRP, or
+    /// BREF3) using the cohort itself as the conditioning set (no --refpanel needed).
     /// Two-stage diploid (phase_common → phase_rare) by default, or haploid
     /// via --phasing-engine haploid. Output is a phased panel VCF.gz.
     #[arg(long)]
