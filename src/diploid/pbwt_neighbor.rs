@@ -117,8 +117,9 @@ impl PbwtNeighborIndex {
                 (cm[i] / modulo_f64).round() as i64
             }).collect();
 
-            // Debug: dump raw group stats
-            {
+            // Debug: dump raw group stats (gated — the stats + eprint! were running
+            // unconditionally on every call, spamming stderr and wasting work).
+            if crate::log::is_debug() {
                 let distinct: std::collections::HashSet<i64> = raw_groups.iter().copied().collect();
                 let min_g = raw_groups.iter().min().copied().unwrap_or(0);
                 let max_g = raw_groups.iter().max().copied().unwrap_or(0);

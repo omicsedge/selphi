@@ -443,8 +443,9 @@ fn _run_iterations(
         pbwt_idx.transpose();
         let pbwt_ms = t0.elapsed().as_millis();
 
-        // Debug: dump PBWT neighbors for target hap 0 at first 5 groups
-        if it == 0 {
+        // Debug: dump PBWT neighbors for target hap 0 at first 5 groups (gated:
+        // the eprint! lines below were unconditional stderr spam on every run).
+        if it == 0 && crate::log::is_debug() {
             let h0 = 0usize; // first target haplotype (target-first layout)
             let addr_offset = pbwt_idx.n_groups * pbwt_idx.n_haps;
             eprint!("  [PBWT] h0={} neighbors at groups 0..5:", h0);
@@ -701,8 +702,8 @@ fn _run_iterations(
                 }
             }
 
-            // Debug sample 0
-            if si == 0 {
+            // Debug sample 0 (gated: the eprint! below was unconditional per-iter spam)
+            if si == 0 && crate::log::is_debug() {
                 eprint!("DBG iter={} sample=0 n_segs={} n_trans={} n_windows={} UF={} BAD={} fwd={}ms bwd={}ms cond={}ms",
                     it, graph.n_segments, graph.n_transitions, windows.len(),
                     n_underflow, n_bad,
