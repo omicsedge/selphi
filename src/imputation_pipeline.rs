@@ -959,6 +959,14 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // ref_bm_imp stays alive for per-window imputation extraction.
     // ref_bm_imp stays alive for per-window imputation (bitmatrix extraction + candidate selection).
 
+    // Bit-pack the (now-final, phased) target for the imputation+output loop (the
+    // run's memory peak): held 8× smaller, impute_window unpacks each small window
+    // for the hot loops, output reads via .get(). Alleles are strictly 0/1
+    // (target_io coerces missing/REF→0, ALT→1) so the round-trip is bit-exact.
+    let targ_bm = selphi::common::HaplotypeBitmatrix::from_byte_slice_all(
+        n_chip, n_haps, &targ_alleles, n_haps);
+    drop(targ_alleles);
+
     // 11. Process each window: PBWT → HMM, then overlap VCF write with next window's PBWT.
     // Cross-window HMM state passthrough: forward state from window N → prior for window N+1
     let mut hap_priors: Vec<Option<Vec<f64>>> = vec![None; n_haps];
@@ -1065,7 +1073,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         };
         let inputs = selphi::imputation::window_process::ImputeWindowInputs {
             ref_bm: &ref_bm_imp,
-            targ_alleles: &targ_alleles,
+            targ_alleles: &targ_bm,
             chip_cm: &chip_cm,
             ne_per_site: final_ne_per_site.as_deref(),
             chip_start: window.chip_start,
@@ -1088,7 +1096,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
             let parquet_bw_ref = &mut parquet_batch_writers;
             let srp_ref = &srp;
             let wgs_ref = &wgs_idx;
-            let chip_genos_ref = &targ_alleles;
+            let chip_genos_ref = &targ_bm;
             let bcf_on = batched_bcf_active;
             let vcf_on = batched_vcf_active;
             let sd_on  = batched_sd_active;
@@ -1188,7 +1196,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                 own_chip_end: oe,
                 wgs_idx: &wgs_idx,
                 n_samples,
-                chip_genotypes: &targ_alleles,
+                chip_genotypes: &targ_bm,
                 no_ap,
                 preloaded_chunks: preloaded,
                 preloaded_stripes,
@@ -1238,7 +1246,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     );
 
     // Free imputation data structures before indexing/evaluation.
-    drop(targ_alleles);
+    drop(targ_bm);
     drop(srp);
     drop(wgs_idx);
     drop(chip_cm);

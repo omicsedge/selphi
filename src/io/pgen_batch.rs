@@ -82,8 +82,8 @@ impl BatchSink for PgenSink<'_> {
         let ci = ctx.chip_local_idx[local_i];
         for s in 0..ctx.n_samples_in_batch {
             let gs = ctx.sample_start + s;
-            let a0 = ctx.chip_genotypes[ci * ctx.n_haps_total + gs * 2];
-            let a1 = ctx.chip_genotypes[ci * ctx.n_haps_total + gs * 2 + 1];
+            let a0 = ctx.chip_genotypes.get(ci, gs * 2) as u8;
+            let a1 = ctx.chip_genotypes.get(ci, gs * 2 + 1) as u8;
             let g = a0 + a1; // 0/1/2
             self.hardcalls[s] = g;
             self.dosages[s] = g as f32;

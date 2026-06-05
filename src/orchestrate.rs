@@ -525,6 +525,15 @@ pub fn run_multi_chr(
                 None
             };
 
+        // Bit-pack the (now-final, phased) target so it is held 8× smaller through
+        // the imputation+output window loop (the run's memory peak). impute_window
+        // unpacks each small window back to dense for the hot loops; output reads
+        // via .get(). Alleles are strictly 0/1 (target_io coerces missing/REF→0,
+        // ALT→1) so from_byte_slice_all↔get round-trips bit-exactly.
+        let targ_bm = selphi::common::HaplotypeBitmatrix::from_byte_slice_all(
+            n_chip, n_haps, &targ_alleles, n_haps);
+        drop(targ_alleles);
+
         // Per-window imputation loop
         let mut hap_priors: Vec<Option<Vec<f64>>> = vec![None; n_haps];
 
@@ -558,7 +567,7 @@ pub fn run_multi_chr(
             // candidate selection, Li-Stephens HMM for all target haplotypes).
             let inputs = selphi::imputation::window_process::ImputeWindowInputs {
                 ref_bm: &ref_bm_imp,
-                targ_alleles: &targ_alleles,
+                targ_alleles: &targ_bm,
                 chip_cm: &chip_cm,
                 ne_per_site: final_ne_per_site.as_deref(),
                 chip_start: window.chip_start,
@@ -587,7 +596,7 @@ pub fn run_multi_chr(
                     own_chip_end: oe,
                     wgs_idx: &wgs_idx,
                     n_samples,
-                    chip_genotypes: &targ_alleles,
+                    chip_genotypes: &targ_bm,
                     no_ap: config.no_ap,
                     preloaded_chunks: None,
                     preloaded_stripes,
@@ -606,7 +615,7 @@ pub fn run_multi_chr(
 
         // Free per-chr data before loading next
         drop(ref_bm_imp);
-        drop(targ_alleles);
+        drop(targ_bm);
         drop(srp);
 
         // Join prefetch for next chromosome (was running during our windows)

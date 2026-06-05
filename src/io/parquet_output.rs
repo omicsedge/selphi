@@ -78,7 +78,7 @@ pub fn write_tile_to_parquet(
     vp_offset: usize,
     is_chip: &[bool],
     chip_local_idx: &[usize],
-    chip_genotypes: &[u8],
+    chip_genotypes: &crate::common::HaplotypeBitmatrix,
     n_ref_variants: usize,
 ) -> std::io::Result<()> {
     if tile_n == 0 { return Ok(()); }
@@ -119,8 +119,8 @@ pub fn write_tile_to_parquet(
             let ci = chip_local_idx[local_i];
             let mut ac = 0u32;
             for s in 0..n_samples {
-                let a0 = chip_genotypes[ci * n_haps + s * 2] as f32;
-                let a1 = chip_genotypes[ci * n_haps + s * 2 + 1] as f32;
+                let a0 = chip_genotypes.get(ci, s * 2) as u8 as f32;
+                let a1 = chip_genotypes.get(ci, s * 2 + 1) as u8 as f32;
                 ds_row[s] = a0 + a1;
                 ac += (a0 + a1) as u32;
             }

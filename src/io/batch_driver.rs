@@ -37,7 +37,7 @@ pub struct WindowBatchInput<'a> {
     pub own_chip_end: usize,
     pub wgs_idx: &'a [usize],
     pub n_samples_total: usize,
-    pub chip_genotypes: &'a [u8],
+    pub chip_genotypes: &'a crate::common::HaplotypeBitmatrix,
     pub no_ap: bool,
 }
 
@@ -115,7 +115,7 @@ pub struct WindowCtx<'a> {
     pub own_wgs_end: usize,
     /// Window-local flags/indices, length `own_wgs_end - own_wgs_start`.
     pub chip_local_idx: &'a [usize],
-    pub chip_genotypes: &'a [u8],
+    pub chip_genotypes: &'a crate::common::HaplotypeBitmatrix,
 }
 
 /// Format-specific encoding hooks driven by [`run_window`]. The driver owns the
@@ -169,7 +169,7 @@ pub fn run_window<S: BatchSink>(
     own_chip_end: usize,
     wgs_idx: &[usize],
     n_samples_total: usize,
-    chip_genotypes: &[u8],
+    chip_genotypes: &crate::common::HaplotypeBitmatrix,
 ) -> std::io::Result<()> {
     use crate::srp::TILE_ROWS;
 

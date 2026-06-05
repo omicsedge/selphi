@@ -384,7 +384,7 @@ fn format_tile_batch(
     vid_prefixes: &[Vec<u8>],
     is_chip: &[bool],
     chip_local_idx: &[usize],
-    chip_genotypes: &[u8],
+    chip_genotypes: &crate::common::HaplotypeBitmatrix,
     an_str: &[u8],
     no_ap: bool,
 ) -> Vec<u8> {
@@ -500,12 +500,13 @@ use crate::io::vcf_fmt::{write_f4, write_u32};
 fn append_chip_line_bytes(
     buf: &mut Vec<u8>, vp_idx: usize, ci: usize,
     vid_prefixes: &[Vec<u8>],
-    chip_gt: &[u8], n_haps: usize, n_samples: usize, an_str: &[u8],
+    chip_gt: &crate::common::HaplotypeBitmatrix, n_haps: usize, n_samples: usize, an_str: &[u8],
 ) {
+    let _ = n_haps;
     let mut ac = 0u32;
     for s in 0..n_samples {
-        ac += chip_gt[ci * n_haps + s * 2] as u32;
-        ac += chip_gt[ci * n_haps + s * 2 + 1] as u32;
+        ac += chip_gt.get(ci, s * 2) as u32;
+        ac += chip_gt.get(ci, s * 2 + 1) as u32;
     }
     let af = ac as f64 / n_haps as f64;
     buf.extend_from_slice(&vid_prefixes[vp_idx]);
@@ -517,8 +518,8 @@ fn append_chip_line_bytes(
     buf.extend_from_slice(an_str);
     buf.extend_from_slice(b"\tGT");
     for s in 0..n_samples {
-        let a0 = chip_gt[ci * n_haps + s * 2];
-        let a1 = chip_gt[ci * n_haps + s * 2 + 1];
+        let a0 = chip_gt.get(ci, s * 2) as u8;
+        let a1 = chip_gt.get(ci, s * 2 + 1) as u8;
         buf.push(b'\t');
         buf.push(b'0' + a0);
         buf.push(b'|');
@@ -531,7 +532,7 @@ fn append_chip_line_bytes(
 fn format_chip_line_bytes(
     buf: &mut Vec<u8>, wgs_i: usize, vp_idx: usize,
     vid_prefixes: &[Vec<u8>],
-    chip_gt: &[u8], chip_idx: &[usize],
+    chip_gt: &crate::common::HaplotypeBitmatrix, chip_idx: &[usize],
     n_haps: usize, n_samples: usize, an_str: &[u8],
 ) {
     buf.clear();
@@ -597,7 +598,7 @@ fn format_tile_batch_bcf(
     var_infos: &[super::bcf_encode::BcfVariantInfo],
     is_chip: &[bool],
     chip_local_idx: &[usize],
-    chip_genotypes: &[u8],
+    chip_genotypes: &crate::common::HaplotypeBitmatrix,
     no_ap: bool,
 ) -> Vec<u8> {
     use super::bcf_encode;
@@ -652,7 +653,7 @@ fn format_chip_bcf(
     vi_idx: usize,
     wgs_i: usize,
     var_infos: &[super::bcf_encode::BcfVariantInfo],
-    chip_gt: &[u8],
+    chip_gt: &crate::common::HaplotypeBitmatrix,
     chip_idx: &[usize],
     n_haps: usize,
     n_samples: usize,
@@ -685,11 +686,12 @@ pub fn parse_variant_parts(srp: &SrpReader, wgs_i: usize) -> Option<(&str, &str,
 #[inline]
 fn fill_chip_pgen(
     hardcalls: &mut [u8], dosages: &mut [f32],
-    chip_genotypes: &[u8], ci: usize, n_haps: usize, n_samples: usize,
+    chip_genotypes: &crate::common::HaplotypeBitmatrix, ci: usize, n_haps: usize, n_samples: usize,
 ) {
+    let _ = n_haps;
     for s in 0..n_samples {
-        let a0 = chip_genotypes[ci * n_haps + s * 2];
-        let a1 = chip_genotypes[ci * n_haps + s * 2 + 1];
+        let a0 = chip_genotypes.get(ci, s * 2) as u8;
+        let a1 = chip_genotypes.get(ci, s * 2 + 1) as u8;
         hardcalls[s] = a0 + a1;
         dosages[s] = hardcalls[s] as f32;
     }
@@ -704,11 +706,12 @@ fn fill_chip_pgen(
 fn fill_chip_sd(
     sd_gt1: &mut [i32], sd_gt2: &mut [i32],
     sd_ap1: &mut [f32], sd_ap2: &mut [f32],
-    chip_genotypes: &[u8], ci: usize, n_haps: usize, n_samples: usize,
+    chip_genotypes: &crate::common::HaplotypeBitmatrix, ci: usize, n_haps: usize, n_samples: usize,
 ) {
+    let _ = n_haps;
     for s in 0..n_samples {
-        sd_gt1[s] = chip_genotypes[ci * n_haps + s * 2] as i32;
-        sd_gt2[s] = chip_genotypes[ci * n_haps + s * 2 + 1] as i32;
+        sd_gt1[s] = chip_genotypes.get(ci, s * 2) as i32;
+        sd_gt2[s] = chip_genotypes.get(ci, s * 2 + 1) as i32;
         sd_ap1[s] = sd_gt1[s] as f32;
         sd_ap2[s] = sd_gt2[s] as f32;
     }
@@ -729,7 +732,7 @@ pub struct WindowInput<'a> {
     pub own_chip_end: usize,
     pub wgs_idx: &'a [usize],
     pub n_samples: usize,
-    pub chip_genotypes: &'a [u8],
+    pub chip_genotypes: &'a crate::common::HaplotypeBitmatrix,
     pub no_ap: bool,
     pub preloaded_chunks: Option<Vec<Option<crate::srp::CscChunk>>>,
     pub preloaded_stripes: Option<crate::srp::tiled::PreloadedStripes>,

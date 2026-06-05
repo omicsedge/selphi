@@ -207,18 +207,19 @@ fn build_vid_prefixes(srp: &SrpReader, start: usize, end: usize) -> Vec<Vec<u8>>
 fn emit_chip_line(
     buf: &mut Vec<u8>,
     vid_prefix: &[u8],
-    chip_genotypes: &[u8],
+    chip_genotypes: &crate::common::HaplotypeBitmatrix,
     chip_idx: usize,
     n_samples_in_batch: usize,
     sample_offset: usize,
     n_haps_total: usize,
 ) {
+    let _ = n_haps_total;
     buf.extend_from_slice(vid_prefix);
     buf.extend_from_slice(b"\t.\tPASS\t.\tGT");
     for s in 0..n_samples_in_batch {
         let gs = sample_offset + s;
-        let a0 = chip_genotypes[chip_idx * n_haps_total + gs * 2];
-        let a1 = chip_genotypes[chip_idx * n_haps_total + gs * 2 + 1];
+        let a0 = chip_genotypes.get(chip_idx, gs * 2) as u8;
+        let a1 = chip_genotypes.get(chip_idx, gs * 2 + 1) as u8;
         buf.push(b'\t');
         buf.push(b'0' + a0);
         buf.push(b'|');

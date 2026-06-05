@@ -228,18 +228,19 @@ fn emit_ap_imputed(buf: &mut Vec<u8>, alt_probs: &[f32], tile_n: usize, v: usize
 #[inline]
 fn emit_gt_chip(
     buf: &mut Vec<u8>,
-    chip_genotypes: &[u8],
+    chip_genotypes: &crate::common::HaplotypeBitmatrix,
     chip_idx: usize,
     n_haps: usize,
     sample_offset: usize,
     n_samples: usize,
 ) {
+    let _ = n_haps;
     encode_typed_int8(buf, FMT_GT_IDX as i32);
     buf.push(0x20 | TY_INT8); // n=2, type=int8
     for s in 0..n_samples {
         let gs = sample_offset + s;
-        let a0 = chip_genotypes[chip_idx * n_haps + gs * 2];
-        let a1 = chip_genotypes[chip_idx * n_haps + gs * 2 + 1];
+        let a0 = chip_genotypes.get(chip_idx, gs * 2) as u8;
+        let a1 = chip_genotypes.get(chip_idx, gs * 2 + 1) as u8;
         buf.push((a0 + 1) << 1);       // first allele, unphased
         buf.push(((a1 + 1) << 1) | 1); // second allele, phased
     }
@@ -348,7 +349,7 @@ pub fn encode_chip_record_partial(
     id: &[u8],
     ref_allele: &[u8],
     alt_allele: &[u8],
-    chip_genotypes: &[u8],
+    chip_genotypes: &crate::common::HaplotypeBitmatrix,
     chip_idx: usize,
     n_samples_in_batch: usize,
     sample_offset: usize,    // global sample index of batch's first sample
@@ -374,7 +375,7 @@ pub fn encode_chip_record(
     id: &[u8],
     ref_allele: &[u8],
     alt_allele: &[u8],
-    chip_genotypes: &[u8],
+    chip_genotypes: &crate::common::HaplotypeBitmatrix,
     chip_idx: usize,
     n_samples: usize,
     n_haps: usize,
@@ -384,8 +385,8 @@ pub fn encode_chip_record(
 
     let mut ac = 0u32;
     for s in 0..n_samples {
-        ac += chip_genotypes[chip_idx * n_haps + s * 2] as u32;
-        ac += chip_genotypes[chip_idx * n_haps + s * 2 + 1] as u32;
+        ac += chip_genotypes.get(chip_idx, s * 2) as u32;
+        ac += chip_genotypes.get(chip_idx, s * 2 + 1) as u32;
     }
     let af = ac as f32 / n_haps as f32;
 
