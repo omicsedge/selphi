@@ -61,6 +61,11 @@ impl SampleAccumulator {
     /// Add one variant's dosage/truth for all samples.
     pub fn add_variant(&mut self, ds: &[f32], truth_gt: &[f32], maf: f64) {
         self.n_variants += 1;
+        // The MAF bin depends only on `maf` (per-variant), so resolve it ONCE
+        // instead of rescanning MAF_BINS for every sample. `position` returns the
+        // first matching bin — identical to the original first-match-then-break
+        // scan, so the accumulated bin_errors/bin_n are bit-identical.
+        let bin = MAF_BINS.iter().position(|&(lo, hi, _)| maf >= lo && maf < hi);
         for s in 0..self.n_samples {
             let d = ds[s] as f64;
             let g = truth_gt[s] as f64;
@@ -76,19 +81,14 @@ impl SampleAccumulator {
             if d_call == g_call { self.n_correct[s] += 1; }
             self.n_total[s] += 1;
 
-            // MAF bin errors
-            for (bi, &(lo, hi, _)) in MAF_BINS.iter().enumerate() {
-                if maf >= lo && maf < hi {
-                    if d_call != g_call { self.bin_errors[bi][s] += 1; }
-                    break;
-                }
+            // MAF bin errors (bin resolved once above)
+            if d_call != g_call {
+                if let Some(bi) = bin { self.bin_errors[bi][s] += 1; }
             }
         }
 
         // Track bin variant counts
-        for (bi, &(lo, hi, _)) in MAF_BINS.iter().enumerate() {
-            if maf >= lo && maf < hi { self.bin_n[bi] += 1; break; }
-        }
+        if let Some(bi) = bin { self.bin_n[bi] += 1; }
     }
 
     /// Compute per-sample R² from accumulated statistics.
