@@ -38,7 +38,7 @@ Runs natively on Linux x86_64, macOS x86_64, and macOS Apple Silicon (aarch64). 
 
 - **x86_64 baseline**: AVX2 + FMA + BMI2 (`x86-64-v3`, Haswell 2013+) — works on every modern Intel/AMD CPU and every current AWS instance family (incl. AMD-based c5a/c6a/c7a/m5a).
 - **AVX-512 fast path** (diploid + lcWGS HMMs): used automatically when AVX-512F+DQ is detected at startup (c5/c6/c7i etc.). Selecting between paths is one cached check per process; no recompilation. The lcWGS forward-backward additionally has an AVX2+FMA path (~4× faster than scalar on non-AVX-512 x86) and a NEON path for aarch64.
-- **aarch64**: NEON.
+- **aarch64**: NEON — runtime-validated on AWS Graviton (native full-crate build; lcWGS NEON forward-backward R²-equivalent to scalar, differing only in f32 reduction order).
 
 The binary prints its chosen SIMD path on startup: `[selphi] SIMD: AVX-512F+DQ` or `[selphi] SIMD: AVX2 (scalar fallback for diploid HMM)`. Set `SELPHI_FORCE_SCALAR=1` to force the scalar path on AVX-512 hosts (for parity testing). Set `SELPHI_QUIET_SIMD=1` to suppress the line.
 
