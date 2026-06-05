@@ -493,7 +493,9 @@ fn run_pbwt_phase(
                         let i1 = (hap_a / 2).min(hap_b / 2);
                         let i2 = (hap_a / 2).max(hap_b / 2);
                         if i1 == i2 { return false; } // same individual
-                        !ibd2_global[i1].contains(&i2)
+                        // ibd2_global[*] is sorted+deduped (line ~220) and read-only here →
+                    // binary_search is byte-identical to .contains() but O(log n).
+                    ibd2_global[i1].binary_search(&i2).is_err()
                     };
 
                     if r_arr[h0] > 0 {
@@ -550,7 +552,9 @@ fn run_pbwt_phase(
                     let i1 = (hap_a / 2).min(hap_b / 2);
                     let i2 = (hap_a / 2).max(hap_b / 2);
                     if i1 == i2 { return false; }
-                    !ibd2_global[i1].contains(&i2)
+                    // ibd2_global[*] is sorted+deduped (line ~220) and read-only here →
+                    // binary_search is byte-identical to .contains() but O(log n).
+                    ibd2_global[i1].binary_search(&i2).is_err()
                 };
 
                 if r_arr[h0] > 0 {

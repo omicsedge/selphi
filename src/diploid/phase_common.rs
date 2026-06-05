@@ -530,8 +530,12 @@ fn _run_iterations(
                     pbwt_idx.get_conditioning_union(h0, h1)
                 } else {
                     let mut cs = pbwt_idx.get_conditioning_set_by_loci(h0, w_l0, w_l1);
+                    // Membership via a HashSet (O(1)) instead of linear cs.contains (O(n)) —
+                    // O(n²)→O(n) on the merge. `cs` push order is preserved (load-bearing for
+                    // the downstream bitmatrix layout), so the result is byte-identical.
+                    let mut cs_seen: std::collections::HashSet<_> = cs.iter().copied().collect();
                     for c in pbwt_idx.get_conditioning_set_by_loci(h1, w_l0, w_l1) {
-                        if !cs.contains(&c) { cs.push(c); }
+                        if cs_seen.insert(c) { cs.push(c); }
                     }
                     cs
                 };

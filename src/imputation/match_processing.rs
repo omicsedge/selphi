@@ -182,11 +182,11 @@ pub fn process_matches(csc: &CscMatchMatrix, kept_matches: usize) -> Vec<Vec<i64
     let mut result = vec![Vec::new(); n_var];
     let mut boundaries = vec![0usize; n_var + 1];
     {
-        let sorted_vars: Vec<i32> = order2.iter().map(|&i| expand_vars[i]).collect();
-        // searchsorted equivalent
+        // searchsorted equivalent — read the bi-th smallest as expand_vars[order2[bi]]
+        // directly (order2 is sorted by expand_vars), avoiding a materialized sorted_vars Vec.
         let mut bi = 0;
         for v in 0..=n_var {
-            while bi < sorted_vars.len() && (sorted_vars[bi] as usize) < v {
+            while bi < order2.len() && (expand_vars[order2[bi]] as usize) < v {
                 bi += 1;
             }
             boundaries[v] = bi;
