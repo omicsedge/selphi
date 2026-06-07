@@ -17,13 +17,15 @@
 pub mod bitmatrix;
 pub mod unphred;
 pub mod rng;
-pub mod params;
 pub mod variant;
 pub mod genotype;
 pub mod ref_haplotype_set;
 pub mod conditioning_set;
-pub mod phasing_hmm;
 pub mod haplotype_set;
 pub mod imputation_hmm;
 pub mod caller;
 pub mod pipeline;
+// NB: `params` (Glimpse2Params) and `phasing_hmm` were MOVED into `crate::lcwgs`
+// (`lcwgs::g2_params` / `lcwgs::phasing_hmm`) so the production `--lcwgs` engine is
+// self-contained. This `glimpse2` (`--glimpse2-exact`) engine now imports them back
+// from `crate::lcwgs`; it is slated for removal once `--glimpse2-exact` is retired.

@@ -1410,7 +1410,7 @@ mod tests {
     use crate::glimpse2::conditioning_set::{
         ConditioningSet, InMemoryRefPanel, TargetSelectionView, STAGE_MAIN,
     };
-    use crate::glimpse2::params::Glimpse2Params;
+    use crate::lcwgs::g2_params::Glimpse2Params;
     use crate::glimpse2::variant::{Variant, VariantMap};
     use crate::common::HaplotypeBitmatrix;
 

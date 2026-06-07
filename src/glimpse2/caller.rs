@@ -75,8 +75,8 @@ use crate::glimpse2::conditioning_set::{
 use crate::glimpse2::genotype::{map_output_call, Genotype};
 use crate::glimpse2::haplotype_set::{GenotypeView, TargetHaplotypeSet};
 use crate::glimpse2::imputation_hmm::ImputationHmm;
-use crate::glimpse2::params::Glimpse2Params;
-use crate::glimpse2::phasing_hmm::PhasingHmm;
+use crate::lcwgs::g2_params::Glimpse2Params;
+use crate::lcwgs::phasing_hmm::PhasingHmm;
 use crate::glimpse2::ref_haplotype_set::RefHaplotypeSet;
 use crate::glimpse2::rng::{Mt19937Rng, DEFAULT_SEED};
 use crate::glimpse2::unphred;

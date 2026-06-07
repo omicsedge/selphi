@@ -41,7 +41,7 @@
 
 use crate::common::HaplotypeBitmatrix;
 use crate::glimpse2::bitmatrix::BitMatrix;
-use crate::glimpse2::params::Glimpse2Params;
+use crate::lcwgs::g2_params::Glimpse2Params;
 use crate::glimpse2::variant::VariantMap;
 
 /// GLIMPSE2 `otools.h:83-86`.

@@ -141,7 +141,7 @@ fn main() {
                 std::process::exit(1);
             }
             selphi_info!("  engine:   glimpse2-exact (faithful GLIMPSE2 port)");
-            let mut g2params = selphi::glimpse2::params::Glimpse2Params::default();
+            let mut g2params = selphi::lcwgs::g2_params::Glimpse2Params::default();
             // RESEARCH knob: override the conditioning size (LCWGS_G2X_KPBWT) to probe
             // selection headroom — e.g. = n_ref for an all-cond upper bound.
             if let Ok(k) = std::env::var("LCWGS_G2X_KPBWT") {
