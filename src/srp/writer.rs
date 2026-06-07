@@ -87,10 +87,22 @@ pub fn build_srp_from_bref3(
     let mut ids = Vec::new();
     let mut orig_ids = Vec::new();
     let mut first_id = true;
+    // Variants whose CHROM/REF/ALT exceed the 255-byte SRP u8 length cap (large
+    // indels/SVs in biobank panels) are SKIPPED rather than erroring out. Record
+    // their raw stream position so pass 2 drops the SAME variants, keeping the
+    // variant index and genotype tiles aligned. Panels with no such alleles skip
+    // nothing → byte-identical to the prior behavior.
+    let mut skip_long: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut raw_idx = 0usize;
 
     while let Some((chrom, pos_i32, ref_allele, alt_allele, id)) =
         stream.next_variant_meta_only().map_err(SrpWriterError::InvalidInput)?
     {
+        if chrom.len() > 255 || ref_allele.len() > 255 || alt_allele.len() > 255 {
+            skip_long.insert(raw_idx);
+            raw_idx += 1;
+            continue;
+        }
         if chromosome.is_empty() { chromosome = chrom.clone(); }
         let pos = pos_i32 as i64;
         if pos < min_pos { min_pos = pos; }
@@ -100,8 +112,12 @@ pub fn build_srp_from_bref3(
             &chrom, pos, &ref_allele, &alt_allele, &id)?;
         first_id = false;
         n_variants += 1;
+        raw_idx += 1;
     }
     drop(stream);
+    if !skip_long.is_empty() {
+        crate::selphi_info!("  skipped {} variant(s) with CHROM/REF/ALT >255 B (SRP u8 cap)", skip_long.len());
+    }
     if n_variants == 0 { return Err(SrpWriterError::NoVariants); }
 
     let chunk_size = if chunk_size_override > 0 { chunk_size_override }
@@ -147,8 +163,12 @@ pub fn build_srp_from_bref3(
     let mut stream2 = bref3::open_bref3_stream(source_path)
         .map_err(SrpWriterError::InvalidInput)?;
     let mut vi = 0usize;
+    let mut raw_idx2 = 0usize;
 
     while let Some(v) = stream2.next_variant().map_err(SrpWriterError::InvalidInput)? {
+        // Drop the SAME long-allele variants pass 1 skipped (keeps vi aligned).
+        if skip_long.contains(&raw_idx2) { raw_idx2 += 1; continue; }
+        raw_idx2 += 1;
         let stripe = vi / super::TILE_ROWS;
         let local_row = (vi % super::TILE_ROWS) as u16;
 
