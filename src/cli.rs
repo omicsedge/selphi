@@ -100,6 +100,14 @@ pub struct Args {
     #[arg(long)]
     pub lcwgs: bool,
 
+    /// (--lcwgs) Use the GLIMPSE2-FAITHFUL lcWGS engine (a 1:1 port of GLIMPSE2's
+    /// phase/ Gibbs caller: ref_haplotype_set + sparse PBWT selection + GL-aware
+    /// Li-Stephens FB + diplotype-mosaic rephasing + MT19937). Separate from the
+    /// default heuristic --lcwgs engine; produces GT:DS:GP via the same writer.
+    /// Requires --input (PL VCF/BCF), --refpanel (.srp), and --map. Seed via --seed.
+    #[arg(long)]
+    pub glimpse2_exact: bool,
+
     /// Panel ancestry labels (TSV: `sample_id<TAB>super_pop`, 1 header line).
     /// When both --panel-ancestry and --target-ancestry are provided, PBWT
     /// candidate selection re-weights raw match scores by ancestry match,

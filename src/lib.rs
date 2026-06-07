@@ -26,6 +26,10 @@ pub mod imputation;
 // Low-coverage WGS imputation engine (GLIMPSE2-style GL-aware Li-Stephens)
 pub mod lcwgs;
 
+// GLIMPSE2-faithful lcWGS engine (1:1 port, --glimpse2-exact). Built in stages; see
+// src/glimpse2/PORT_SPEC.md.
+pub mod glimpse2;
+
 // I/O and output
 pub mod io;
 

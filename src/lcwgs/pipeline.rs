@@ -303,7 +303,12 @@ fn run_chunked_gibbs(
         "  chunked Gibbs: {:.1} cM span → {} chunks (core {:.1} cM + {:.1} cM buffer each side)",
         total_cm, n_chunks, core_cm, buffer_cm);
 
-    for c in 0..n_chunks {
+    // Per-chunk work as a closure so chunks can run in PARALLEL when the sample
+    // count is too small to fill the cores (single/few-sample: the sample/hap
+    // par_iter inside run_gibbs is degenerate → most cores idle). Chunks are fully
+    // independent (disjoint core output; run_gibbs is deterministic, keyed only by
+    // chunk-local indices) so parallel chunks are BIT-IDENTICAL to sequential.
+    let process_chunk = |c: usize| -> Option<(usize, usize, usize, super::iterate::GibbsOutput)> {
         let core_lo_cm = cm[0] + c as f64 * core_cm;
         let core_hi_cm = core_lo_cm + core_cm;
         let buf_lo_cm = core_lo_cm - buffer_cm;
@@ -312,10 +317,10 @@ fn run_chunked_gibbs(
         // Variant index ranges (buffer = HMM window, core = kept output).
         let buf_start = cm.partition_point(|&x| x < buf_lo_cm);
         let buf_end = cm.partition_point(|&x| x < buf_hi_cm); // exclusive
-        if buf_end <= buf_start { continue; }
+        if buf_end <= buf_start { return None; }
         let core_start = cm.partition_point(|&x| x < core_lo_cm);
         let core_end = cm.partition_point(|&x| x < core_hi_cm); // exclusive
-        if core_end <= core_start { continue; }
+        if core_end <= core_start { return None; }
 
         let chunk_n = buf_end - buf_start;
         // Slice gl3 + cm for the buffer window
@@ -366,6 +371,39 @@ fn run_chunked_gibbs(
             }
         }
 
+        // WHITE-BOX TRACE (LCWGS_TRACE_POS=pos1,pos2,... + LCWGS_COND_DUMP set so
+        // cond_final is populated; optional LCWGS_TRACE_SAMPLE=idx, default 0): at the
+        // listed genomic positions, for the traced sample's two haps, report the panel
+        // AF, the imputed dose, and the FRACTION of that hap's (chunk-wide) conditioning
+        // set that carries ALT at the site. If carrier-frac ≈ panel AF but dose≈0 →
+        // present-but-not-copied (FB/copying issue); if carrier-frac << AF → the global
+        // selection under-picks local carriers (per-locus selection is the lever).
+        if let Ok(poss) = std::env::var("LCWGS_TRACE_POS") {
+            let targets: Vec<i64> = poss.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            let strace: usize = std::env::var("LCWGS_TRACE_SAMPLE").ok()
+                .and_then(|x| x.parse().ok()).unwrap_or(0);
+            let n_ref = chunk_bm.n_haps;
+            if !out.cond_final.is_empty() {
+                for v in core_start..core_end {
+                    let lv = v - buf_start;
+                    let wi = chunk_wgs[lv];
+                    let var = &srp.variants[wi];
+                    if !targets.contains(&(var.pos as i64)) { continue; }
+                    let ac = chunk_bm.popcount_row(lv, n_ref) as f32;
+                    let af = ac / n_ref as f32;
+                    let dose = out.dosage[lv * n_samples + strace];
+                    for h in [2 * strace, 2 * strace + 1] {
+                        let cond = &out.cond_final[h];
+                        let ncar = cond.iter().filter(|&&r| chunk_bm.get(lv, r as usize)).count();
+                        let frac = if cond.is_empty() { 0.0 } else { ncar as f32 / cond.len() as f32 };
+                        eprintln!(
+                            "TRACE pos={} af={:.3} dose={:.3} hap{} K={} alt_carriers={} ({:.1}% vs panel {:.1}%)",
+                            var.pos, af, dose, h, cond.len(), ncar, 100.0 * frac, 100.0 * af);
+                    }
+                }
+            }
+        }
+
         if std::env::var("LCWGS_CHUNK_DIAG").is_ok() {
             let gl3_sum: f64 = chunk_gl3.iter().map(|&x| x as f64).sum();
             let dose_mean: f64 = out.dosage.iter().map(|&d| d as f64).sum::<f64>() / out.dosage.len().max(1) as f64;
@@ -376,7 +414,24 @@ fn run_chunked_gibbs(
                 gl3_sum, bm_ones, dose_mean);
         }
 
-        // Copy only the CORE region's dosage + GP into the global output.
+        let _ = chunk_n;
+        Some((core_start, core_end, buf_start, out))
+    };
+
+    // Run chunks in parallel only when the sample count underutilizes the cores
+    // (few-sample regime). Multi-sample keeps sequential chunks: run_gibbs already
+    // parallelizes over samples, and this bounds peak memory (one chunk slice live).
+    let chunk_parallel = 2 * n_samples < rayon::current_num_threads().max(1);
+    let chunk_results: Vec<Option<(usize, usize, usize, super::iterate::GibbsOutput)>> =
+        if chunk_parallel {
+            use rayon::prelude::*;
+            (0..n_chunks).into_par_iter().map(|c| process_chunk(c)).collect()
+        } else {
+            (0..n_chunks).map(|c| process_chunk(c)).collect()
+        };
+
+    // Merge each chunk's CORE dosage + GP into the global output (in index order).
+    for (core_start, core_end, buf_start, out) in chunk_results.into_iter().flatten() {
         for v in core_start..core_end {
             let local_v = v - buf_start;
             for s in 0..n_samples {
@@ -388,7 +443,6 @@ fn run_chunked_gibbs(
                 gp[g_dst + 2] = out.gp[g_src + 2];
             }
         }
-        let _ = chunk_n;
     }
 
     (dosage, gp)
