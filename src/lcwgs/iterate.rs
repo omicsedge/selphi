@@ -171,6 +171,34 @@ struct GibbsConfig {
     /// Max local rare carriers injected per sample into the DMM phasing set
     /// (`LCWGS_DMM_RC_BUDGET`, default 6). On top of the `LCWGS_DMM_M` IBD copies.
     dmm_rc_budget: usize,
+    /// EXPERIMENT (`LCWGS_BURNIN_DIPLOID`, default off): run the Gauss-Seidel sweep +
+    /// genotype-preserving DMM re-phase during BURN-IN too, not only MAIN, mirroring
+    /// GLIMPSE2's unconditional per-iteration joint re-projection (caller_algorithm.cpp:
+    /// 61-71). Selphi gates both to `is_main`, leaving the ~25-iter burn-in as pure
+    /// parallel-Jacobi where the two haps can drain into the same allele (the verified
+    /// 2026-06-06 het→hom soft-GL collapse). Running the joint step every iter mitigates
+    /// it: real adriano 1× +0.0045 (gain in common bins), at a small −0.0004 on the
+    /// canonical r12 multi-sample benchmark (a real-vs-simulated tradeoff). Dose/GP are
+    /// still accumulated MAIN-only. Byte-identical when off.
+    burnin_diploid: bool,
+    /// DEFAULT-ON (2026-06-06): replace the heuristic DMM re-phase with the FAITHFUL
+    /// GLIMPSE2 phasing HMM port (crate::glimpse2::phasing_hmm) run EVERY iteration
+    /// (GLIMPSE2 schedule). Validated clean win in every regime, NO tradeoff: canonical
+    /// r12 (54s) OVERALL 0.9403→0.9511 beating GLIMPSE2 0.9429 on EVERY bin; full-chr22
+    /// 0.9119→0.9255 (vs GLIMPSE2 0.9155, every bin incl rare 0.5-1%); adriano real
+    /// 0.843→0.8675; sim-solo 0.9756→0.9775. Cost: phasing-every-iter is ~2× wall on
+    /// multi-sample (single-sample is still 4× faster than GLIMPSE2). Opt out with
+    /// `LCWGS_NO_GLIMPSE2_PHASE=1` → reverts to the (faster) heuristic DMM sweep.
+    glimpse2_phase: bool,
+    /// EXPERIMENT (`LCWGS_FAITHFUL_SELECT`, DEFAULT OFF): replace the heuristic
+    /// per-hap PBWT selection (`select_conditioning_haps`) producer with the
+    /// FAITHFUL GLIMPSE2 compressed-sparse-PBWT per-INDIVIDUAL selection
+    /// (`super::faithful_select`, reusing `crate::glimpse2`). Everything
+    /// downstream (rare-carrier augmentation, HMM, GLIMPSE2/DMM rephase) is
+    /// UNCHANGED. faithful = common conditioning (its strength); the existing
+    /// rare-carrier aug supplies rare → best-of-both in one pass. When unset the
+    /// engine is byte-identical to the prior default.
+    faithful_select: bool,
 }
 impl GibbsConfig {
     fn from_env() -> Self {
@@ -213,6 +241,9 @@ impl GibbsConfig {
             dmm_gl,
             dmm_rc,
             dmm_rc_budget: envu("LCWGS_DMM_RC_BUDGET").unwrap_or(6),
+            burnin_diploid: std::env::var("LCWGS_BURNIN_DIPLOID").is_ok(),
+            glimpse2_phase: std::env::var("LCWGS_NO_GLIMPSE2_PHASE").is_err(),
+            faithful_select: std::env::var("LCWGS_FAITHFUL_SELECT").is_ok(),
         }
     }
 }
@@ -287,6 +318,17 @@ pub fn run_gibbs(
     let refresh = cfg.refresh;
     let mut cond_cache: Vec<Vec<u32>> = Vec::new();
 
+    // Faithful GLIMPSE2 compressed-sparse-PBWT selection (LCWGS_FAITHFUL_SELECT,
+    // default OFF). Built ONCE per chunk from the same ref_bm + cm + gl3 the
+    // hybrid uses; drives the GLIMPSE2 per-individual selection each refresh.
+    let mut faithful: Option<super::faithful_select::FaithfulSelector> = if cfg.faithful_select {
+        Some(super::faithful_select::FaithfulSelector::build(
+            ref_bm, cm, gl3, n_samples, params, seed,
+        ))
+    } else {
+        None
+    };
+
     // Rare-allele carrier augmentation (GLIMPSE2 select_rare_pd_fg analogue):
     // each iteration, a target hap currently SAMPLED as a carrier at a rare site
     // gets that site's panel carriers added to its conditioning set so the HMM
@@ -318,7 +360,13 @@ pub fn run_gibbs(
         let recompute = it == 0 || it == n_burnin || it % refresh == 0;
         let t0 = if timing { Some(std::time::Instant::now()) } else { None };
         let base_cond: &Vec<Vec<u32>> = {
-            if recompute {
+            if let Some(fsel) = faithful.as_mut() {
+                // FAITHFUL GLIMPSE2 selection: re-run EVERY iteration (GLIMPSE2
+                // re-selects per iteration), feeding it the hybrid's current
+                // sampled haps. Produces the SAME Vec<Vec<u32>> shape (per target
+                // hap) the downstream rare-carrier aug + HMM consume.
+                cond_cache = fsel.select(&hap_alleles);
+            } else if recompute {
                 cond_cache = select_conditioning_haps(
                     &hap_alleles, ref_bm, cm,
                     n_target_haps, params.kpbwt, params.pbwt_modulo_cm, params.pbwt_depth,
@@ -366,7 +414,7 @@ pub fn run_gibbs(
 
         let is_main = it >= n_burnin;
         let t0 = if timing { Some(std::time::Instant::now()) } else { None };
-        let results: Vec<(usize, Vec<f32>, Vec<u8>)> = if cfg.gs_main && is_main {
+        let results: Vec<(usize, Vec<f32>, Vec<u8>)> = if cfg.gs_main && (is_main || cfg.burnin_diploid) {
             // Gauss-Seidel diploid sweep (MAIN iters only): per sample, sample h0
             // conditioned on the snapshot partner, then h1 conditioned on h0's
             // FRESH sample. Samples stay independent → parallel over samples (no
@@ -418,7 +466,84 @@ pub fn run_gibbs(
         // partner conditioning (regularizes the GS-main coupling). Genotype-
         // preserving → this iteration's accumulated dose (from hap_dose) is
         // unchanged; only subsequent iterations' inputs differ.
-        if cfg.dmm && is_main {
+        // FAITHFUL GLIMPSE2 phasing HMM (LCWGS_GLIMPSE2_PHASE): every iteration,
+        // re-phase each sample's H0/H1 via the ported phasing_hmm (8-founder diplotype
+        // SAMPLE_DIP). Replaces the heuristic DMM. Genotype-preserving (re-phases hets);
+        // feeds the next iteration's selection + partner conditioning, like the DMM.
+        if cfg.glimpse2_phase {
+            let g2p = crate::glimpse2::params::Glimpse2Params {
+                ne: params.ne as f64,
+                ..Default::default()
+            };
+            let poly_sites: Vec<i32> = (0..n_var as i32).collect();
+            let mono_sites: Vec<i32> = Vec::new();
+            let lq = vec![false; n_var];
+            // Richer phasing conditioning (LCWGS_G2_RICH_COND): use the UNION of both
+            // haps' cond sets (GLIMPSE2 phases against the individual's shared set, not
+            // one hap's) so the diplotype Viterbi sees both haps' candidate copies.
+            let rich_cond = std::env::var("LCWGS_G2_RICH_COND").is_ok();
+            // FAITHFUL flat rule (LCWGS_G2_FLAT_EXACT). GLIMPSE2 genotype_reader.cpp:580
+            // sets flat ⟺ the GL triple is all-equal (PL[0]==PL[1]==PL[2], i.e. no
+            // informative read), NOT a peakedness threshold. Our default `<1/3+1e-3`
+            // over-marks weakly-informative sites as flat; this restores the exact rule.
+            let flat_exact = std::env::var("LCWGS_G2_FLAT_EXACT").is_ok();
+            let rephased: Vec<(usize, Vec<u8>, Vec<u8>)> = (0..n_samples).into_par_iter().map(|s| {
+                let (h0i, h1i) = (2 * s, 2 * s + 1);
+                let mut h0: Vec<bool> = (0..n_var).map(|v| hap_alleles[v * n_target_haps + h0i] == 1).collect();
+                let mut h1: Vec<bool> = (0..n_var).map(|v| hap_alleles[v * n_target_haps + h1i] == 1).collect();
+                // flat[v]: read uninformative (≈ no/weak read) → emission-skipped het.
+                let mut flat = vec![false; n_var];
+                for v in 0..n_var {
+                    let b = v * n_samples * 3 + 3 * s;
+                    let (g0, g1, g2) = (gl3[b], gl3[b + 1], gl3[b + 2]);
+                    let sum = g0 + g1 + g2;
+                    flat[v] = if flat_exact {
+                        // GLIMPSE2-exact: all-equal GL triple ⇒ no read info.
+                        sum <= f32::MIN_POSITIVE || (g0 == g1 && g1 == g2)
+                    } else {
+                        sum <= f32::MIN_POSITIVE
+                            || (g0.max(g1).max(g2) / sum) < (1.0 / 3.0 + 1e-3)
+                    };
+                }
+                let cond_union: Vec<u32>;
+                let cond_haps: &[u32] = if rich_cond {
+                    let mut seen = std::collections::HashSet::new();
+                    let mut u: Vec<u32> =
+                        Vec::with_capacity(cond_per_hap[h0i].len() + cond_per_hap[h1i].len());
+                    for &c in cond_per_hap[h0i].iter().chain(cond_per_hap[h1i].iter()) {
+                        if seen.insert(c) { u.push(c); }
+                    }
+                    cond_union = u;
+                    &cond_union
+                } else {
+                    &cond_per_hap[h0i]
+                };
+                // deterministic uniform [0,1) (xorshift64*), keyed by seed/iter/sample.
+                let mut st = seed
+                    ^ (s as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    ^ (it as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)
+                    | 1;
+                let mut rng_u01 = || {
+                    st ^= st >> 12; st ^= st << 25; st ^= st >> 27;
+                    let x = st.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                    (x >> 40) as f32 / (1u64 << 24) as f32
+                };
+                let mut hmm = crate::glimpse2::phasing_hmm::PhasingHmm::new(&g2p);
+                hmm.rephase(&mut h0, &mut h1, &flat, cond_haps, ref_bm, cm, &g2p,
+                            &poly_sites, &mono_sites, &lq, &mut rng_u01);
+                (s,
+                 h0.iter().map(|&b| b as u8).collect(),
+                 h1.iter().map(|&b| b as u8).collect())
+            }).collect();
+            for (s, h0, h1) in rephased {
+                let (h0i, h1i) = (2 * s, 2 * s + 1);
+                for v in 0..n_var {
+                    hap_alleles[v * n_target_haps + h0i] = h0[v];
+                    hap_alleles[v * n_target_haps + h1i] = h1[v];
+                }
+            }
+        }
+        if cfg.dmm && (is_main || cfg.burnin_diploid) && !cfg.glimpse2_phase {
             let dcfg = dmm_cfg.as_ref().unwrap();
             let rephased: Vec<(usize, Vec<u8>, Vec<u8>)> = (0..n_samples).into_par_iter().map(|s| {
                 let (h0i, h1i) = (2 * s, 2 * s + 1);
