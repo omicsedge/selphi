@@ -62,6 +62,11 @@ pub mod iterate;
 pub mod dmm;
 pub mod pipeline;
 pub mod output;
+// Faithful GLIMPSE2 8-founder phasing HMM + its params — the per-iteration phaser
+// run by the production engine (default-on). Moved here from `crate::glimpse2` so
+// `--lcwgs` is self-contained; the `--glimpse2-exact` engine imports them back.
+pub mod g2_params;
+pub mod phasing_hmm;
 
 /// Default GLIMPSE2 algorithm parameters (Rubinacci & Delaneau 2023).
 pub struct LcwgsParams {

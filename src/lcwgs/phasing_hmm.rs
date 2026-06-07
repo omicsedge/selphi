@@ -42,7 +42,7 @@
 //!     cumulative-walk `sample` semantics but NOT libstdc++ bit-for-bit RNG.
 
 use crate::common::HaplotypeBitmatrix;
-use crate::glimpse2::params::{
+use crate::lcwgs::g2_params::{
     Glimpse2Params, HAP_NUMBER, VAR_FLAT_HET, VAR_PEAK_HET, VAR_PEAK_HOM,
 };
 

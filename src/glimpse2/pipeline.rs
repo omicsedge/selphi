@@ -16,7 +16,7 @@
 use crate::common::HaplotypeBitmatrix;
 use crate::glimpse2::caller::{collect_calls, Glimpse2Caller};
 use crate::glimpse2::genotype::Genotype;
-use crate::glimpse2::params::Glimpse2Params;
+use crate::lcwgs::g2_params::Glimpse2Params;
 use crate::glimpse2::variant::{Variant, VariantMap};
 use crate::lcwgs::pipeline::LcwgsOutput;
 use crate::srp::SrpReader;

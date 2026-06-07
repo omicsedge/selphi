@@ -182,7 +182,7 @@ struct GibbsConfig {
     /// still accumulated MAIN-only. Byte-identical when off.
     burnin_diploid: bool,
     /// DEFAULT-ON (2026-06-06): replace the heuristic DMM re-phase with the FAITHFUL
-    /// GLIMPSE2 phasing HMM port (crate::glimpse2::phasing_hmm) run EVERY iteration
+    /// GLIMPSE2 phasing HMM port (crate::lcwgs::phasing_hmm) run EVERY iteration
     /// (GLIMPSE2 schedule). Validated clean win in every regime, NO tradeoff: canonical
     /// r12 (54s) OVERALL 0.9403→0.9511 beating GLIMPSE2 0.9429 on EVERY bin; full-chr22
     /// 0.9119→0.9255 (vs GLIMPSE2 0.9155, every bin incl rare 0.5-1%); adriano real
@@ -471,7 +471,7 @@ pub fn run_gibbs(
         // SAMPLE_DIP). Replaces the heuristic DMM. Genotype-preserving (re-phases hets);
         // feeds the next iteration's selection + partner conditioning, like the DMM.
         if cfg.glimpse2_phase {
-            let g2p = crate::glimpse2::params::Glimpse2Params {
+            let g2p = crate::lcwgs::g2_params::Glimpse2Params {
                 ne: params.ne as f64,
                 ..Default::default()
             };
@@ -528,7 +528,7 @@ pub fn run_gibbs(
                     let x = st.wrapping_mul(0x2545_F491_4F6C_DD1D);
                     (x >> 40) as f32 / (1u64 << 24) as f32
                 };
-                let mut hmm = crate::glimpse2::phasing_hmm::PhasingHmm::new(&g2p);
+                let mut hmm = crate::lcwgs::phasing_hmm::PhasingHmm::new(&g2p);
                 hmm.rephase(&mut h0, &mut h1, &flat, cond_haps, ref_bm, cm, &g2p,
                             &poly_sites, &mono_sites, &lq, &mut rng_u01);
                 (s,

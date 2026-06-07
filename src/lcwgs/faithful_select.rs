@@ -29,7 +29,7 @@
 
 use crate::common::HaplotypeBitmatrix;
 use crate::glimpse2::haplotype_set::{GenotypeView, TargetHaplotypeSet};
-use crate::glimpse2::params::Glimpse2Params;
+use crate::lcwgs::g2_params::Glimpse2Params;
 use crate::glimpse2::ref_haplotype_set::RefHaplotypeSet;
 use crate::glimpse2::rng::Mt19937Rng;
 use crate::glimpse2::unphred;
