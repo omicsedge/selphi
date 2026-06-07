@@ -355,6 +355,12 @@ pub fn run_gibbs(
         (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let mut max_k = 0usize;
 
+    // Per-iteration partner-allele snapshot, reused across iterations (the
+    // previous `hap_alleles.clone()` allocated a fresh Vec<u8> [n_var*n_target_haps]
+    // every iteration — the largest per-iteration alloc; pooling it cuts peak RSS
+    // and allocator churn on multi-sample runs, byte-identically).
+    let mut prev_alleles = vec![0u8; hap_alleles.len()];
+
     for it in 0..params.n_iterations {
         // 1. Sparse PBWT selection from the current sampled hap alleles.
         let recompute = it == 0 || it == n_burnin || it % refresh == 0;
@@ -409,7 +415,7 @@ pub fn run_gibbs(
         //    per-iteration snapshot keeps the parallel scan a valid Gibbs scan and
         //    avoids cross-hap data races.
         let t0 = if timing { Some(std::time::Instant::now()) } else { None };
-        let prev_alleles = hap_alleles.clone();
+        prev_alleles.copy_from_slice(&hap_alleles);
         if let Some(t) = t0 { t_clone += t.elapsed().as_secs_f64(); }
 
         let is_main = it >= n_burnin;
