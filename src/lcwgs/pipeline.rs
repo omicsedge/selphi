@@ -169,6 +169,25 @@ fn impute_from_gl3(
         return Ok(LcwgsOutput { dosage: raw, gp, n_variants: n_shared, sample_ids, variants });
     }
 
+    // Adaptive conditioning depth (chip/WGS auto-max-candidates concept): on a big
+    // diverse panel a fixed kpbwt=2000 under-selects, so the true RARE carrier is
+    // often not in the conditioning set (the one bin GLIMPSE2 still kept). Scale
+    // kpbwt with panel size, clamped: big panels deepen (rare-bin gap closes, e.g.
+    // 75552-hap panel → ~5000: rare 0.9971→0.9989, ties GLIMPSE2, +10s/+0.24GB),
+    // small/matched panels stay 2000 (r12 unchanged). Past ~5000 the common bins
+    // regress (rare↔common tradeoff), hence the cap. Skip when kpbwt is set explicitly.
+    let mut params_owned;
+    let params: &LcwgsParams = if std::env::var("LCWGS_KPBWT").is_err() {
+        let n_ref = srp.metadata.n_haps;
+        let adaptive = ((n_ref as f64 * 0.066).round() as usize).clamp(2000, 5000);
+        if adaptive != params.kpbwt {
+            crate::selphi_info!("  adaptive K: kpbwt {} → {} (n_ref={})", params.kpbwt, adaptive, n_ref);
+            params_owned = params.clone();
+            params_owned.kpbwt = adaptive;
+            &params_owned
+        } else { params }
+    } else { params };
+
     let (dosage, gp) = run_chunked_gibbs(&gl3_shared, srp, wgs_idx, &cm, n_samples, n_shared, params);
     Ok(LcwgsOutput { dosage, gp, n_variants: n_shared, sample_ids, variants })
 }

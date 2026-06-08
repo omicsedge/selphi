@@ -69,6 +69,7 @@ pub mod g2_params;
 pub mod phasing_hmm;
 
 /// Default GLIMPSE2 algorithm parameters (Rubinacci & Delaneau 2023).
+#[derive(Clone)]
 pub struct LcwgsParams {
     /// Maximum number of reference haplotypes selected per target hap via
     /// sparse PBWT. Beyond this the conditioning set is truncated.
