@@ -167,17 +167,37 @@ fn lcwgs_loo() -> bool {
 /// 1.33 at K≈3000, i.e. a much stickier copy (a carrier, once copied at a
 /// flanking common site, stays copied across the rare site). Cached.
 ///
-/// MEASURED VERDICT (gated, default off): the faithful K-independent form lifts
-/// the rare bin on the mid region (+0.0028) but REGRESSES on the representative
-/// r12 region (OVERALL 0.9332→0.9310; rare bin flat, commons −0.002..−0.005),
-/// same pattern as the Ne sweep — a stickier global copy trades common accuracy
-/// for no rare gain on real LD. Not the lever (6th faithful negative on the
-/// rare-bin gap; see rare_ibs.rs). Kept gated for the record.
-fn recomb_scale(ne: f32, k: usize, n_ref: usize) -> f64 {
+/// ADAPTIVE (default): pick the form by PANEL-vs-CAP regime. The K-dependent form
+/// is tuned for small/panel-matched panels (cond set ≈ panel); on a LARGE panel the
+/// conditioning set is capped at `kpbwt` ≪ `n_ref`, so `0.04·Ne/K` blows up (K≈3000,
+/// n_ref≈75552 → ~1.33, a 33× too-recombinant / unsticky copy that misses the real
+/// long IBD matches a big diverse panel offers). When `n_ref > 4·kpbwt` (big-panel
+/// regime) switch to GLIMPSE2's K-INDEPENDENT `0.04·Ne/max(n_ref,Ne)` (≈0.04, sticky).
+/// MEASURED (chr22, HG002 1×): big 75552-hap panel OVERALL 0.9688→0.9773 (+0.0085,
+/// closes ~77% of the residual to --glimpse2-exact 0.9800); panel-matched r12 is
+/// NEUTRAL because n_ref=4478 ≤ 4·kpbwt → keeps the K-dependent 0.9524 (forcing
+/// K-independent there would cost −0.0025, the prior small-panel negative). Force
+/// either form with `LCWGS_GLIMPSE_RECOMB=1` (always K-indep) / `LCWGS_KDEP_RECOMB=1`
+/// (always K-dep). Cached; speed/memory-neutral (recomb precompute only).
+fn recomb_scale(ne: f32, k: usize, n_ref: usize, kpbwt: usize) -> f64 {
     use std::sync::OnceLock;
-    static GLM: OnceLock<bool> = OnceLock::new();
-    let glm = *GLM.get_or_init(|| std::env::var("LCWGS_GLIMPSE_RECOMB").is_ok());
-    if glm {
+    // 0 = adaptive (default), 1 = force K-independent, 2 = force K-dependent.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        if std::env::var("LCWGS_GLIMPSE_RECOMB").is_ok() {
+            1
+        } else if std::env::var("LCWGS_KDEP_RECOMB").is_ok() {
+            2
+        } else {
+            0
+        }
+    });
+    let kindep = match mode {
+        1 => true,
+        2 => false,
+        _ => kpbwt > 0 && n_ref > 4 * kpbwt,
+    };
+    if kindep {
         0.04f64 * (ne as f64) / (n_ref.max(ne as usize) as f64)
     } else {
         0.04f64 * (ne as f64) / (k as f64)
@@ -328,7 +348,7 @@ pub fn run_forward_backward(
     // touching common-common boundaries. None = identity.
     TL_PREC.with(|cell| {
         let mut buf = cell.borrow_mut();
-        let scale = recomb_scale(params.ne, k, ref_bm.n_haps);
+        let scale = recomb_scale(params.ne, k, ref_bm.n_haps, params.kpbwt);
         precompute_prec(cm, n_var, scale, recomb_mult, &mut buf);
     });
 
@@ -666,7 +686,7 @@ unsafe fn run_fb_avx512(
         // emission per (variant, allele)
         precompute_emit(hl, n_var, ee, ed, &mut emit);
         // p_rec
-        let scale = recomb_scale(params.ne, k, ref_bm.n_haps);
+        let scale = recomb_scale(params.ne, k, ref_bm.n_haps, params.kpbwt);
         precompute_prec(cm, n_var, scale, recomb_mult, &mut p_rec);
         // Bit-packed conditioning alleles (1 bit/state). Branchless + word-at-a-
         // time: accumulate 64 consecutive states into a register, store once per
@@ -914,7 +934,7 @@ unsafe fn run_fb_avx2(
         let mut condbits = cc.borrow_mut();
 
         precompute_emit(hl, n_var, ee, ed, &mut emit);
-        let scale = recomb_scale(params.ne, k, ref_bm.n_haps);
+        let scale = recomb_scale(params.ne, k, ref_bm.n_haps, params.kpbwt);
         precompute_prec(cm, n_var, scale, recomb_mult, &mut p_rec);
         // Bit-packed conditioning alleles (1 bit/state) — identical to the AVX-512 pack.
         let timing = hmm_timing();
@@ -1191,7 +1211,7 @@ unsafe fn run_fb_neon(
         let mut condbits = cc.borrow_mut();
 
         precompute_emit(hl, n_var, ee, ed, &mut emit);
-        let scale = recomb_scale(params.ne, k, ref_bm.n_haps);
+        let scale = recomb_scale(params.ne, k, ref_bm.n_haps, params.kpbwt);
         precompute_prec(cm, n_var, scale, recomb_mult, &mut p_rec);
         // Bit-packed conditioning alleles (1 bit/state) — identical pack to AVX2.
         let timing = hmm_timing();
