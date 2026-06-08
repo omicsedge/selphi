@@ -190,14 +190,19 @@ struct GibbsConfig {
     /// multi-sample (single-sample is still 4× faster than GLIMPSE2). Opt out with
     /// `LCWGS_NO_GLIMPSE2_PHASE=1` → reverts to the (faster) heuristic DMM sweep.
     glimpse2_phase: bool,
-    /// EXPERIMENT (`LCWGS_FAITHFUL_SELECT`, DEFAULT OFF): replace the heuristic
-    /// per-hap PBWT selection (`select_conditioning_haps`) producer with the
     /// FAITHFUL GLIMPSE2 compressed-sparse-PBWT per-INDIVIDUAL selection
-    /// (`super::faithful_select`, reusing `crate::glimpse2`). Everything
+    /// (`super::faithful_select`, reusing `crate::glimpse2`), replacing the
+    /// heuristic per-hap PBWT selection (`select_conditioning_haps`). Everything
     /// downstream (rare-carrier augmentation, HMM, GLIMPSE2/DMM rephase) is
-    /// UNCHANGED. faithful = common conditioning (its strength); the existing
-    /// rare-carrier aug supplies rare → best-of-both in one pass. When unset the
-    /// engine is byte-identical to the prior default.
+    /// UNCHANGED. **DEFAULT ON** (opt out `LCWGS_NO_FAITHFUL_SELECT=1` → the
+    /// heuristic selection). The heuristic storage-site selection picks poor
+    /// neighbours when choosing K of a LARGE panel: on the 75552-hap production
+    /// panel (HG002 1×, chr22) it scores OVERALL 0.9196 vs the faithful selection's
+    /// 0.9688 (+0.049, ~80% of the gap to GLIMPSE2 0.9806; the residual ~0.011 is
+    /// the imputation HMM — for full parity use `--glimpse2-exact` 0.9800). On the
+    /// panel-matched r12 benchmark it is NEUTRAL (0.9524 vs heuristic 0.9531, still
+    /// beats GLIMPSE2 0.9429) → strict win, no regime tradeoff. Costs ~2× wall on
+    /// small panels (one-time compressed-PBWT build per chunk; amortized multi-sample).
     faithful_select: bool,
 }
 impl GibbsConfig {
@@ -243,7 +248,7 @@ impl GibbsConfig {
             dmm_rc_budget: envu("LCWGS_DMM_RC_BUDGET").unwrap_or(6),
             burnin_diploid: std::env::var("LCWGS_BURNIN_DIPLOID").is_ok(),
             glimpse2_phase: std::env::var("LCWGS_NO_GLIMPSE2_PHASE").is_err(),
-            faithful_select: std::env::var("LCWGS_FAITHFUL_SELECT").is_ok(),
+            faithful_select: std::env::var("LCWGS_NO_FAITHFUL_SELECT").is_err(),
         }
     }
 }
