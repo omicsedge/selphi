@@ -421,11 +421,39 @@ fn run_chunked_gibbs(
     // Run chunks in parallel only when the sample count underutilizes the cores
     // (few-sample regime). Multi-sample keeps sequential chunks: run_gibbs already
     // parallelizes over samples, and this bounds peak memory (one chunk slice live).
-    let chunk_parallel = 2 * n_samples < rayon::current_num_threads().max(1);
+    let threads = rayon::current_num_threads().max(1);
+    let chunk_parallel = 2 * n_samples < threads;
     let chunk_results: Vec<Option<(usize, usize, usize, super::iterate::GibbsOutput)>> =
         if chunk_parallel {
             use rayon::prelude::*;
-            (0..n_chunks).into_par_iter().map(|c| process_chunk(c)).collect()
+            // All-chunks-parallel holds EVERY chunk's ref_bm + selection structures
+            // live at once (peak ≈ n_chunks × per-chunk) — fast but memory-spiky on a
+            // big panel. Process in WAVES of `max_live` so peak ≈ a memory budget,
+            // keeping most of the parallel speedup. Byte-identical: chunks are
+            // independent + deterministic, and the merge is by core index.
+            let n_ref = srp.metadata.n_haps;
+            let avg_chunk_n = (n_shared / n_chunks).max(1);
+            // per-chunk ≈ ref_bm (chunk_n × ceil(n_ref/64) × 8) × ~1.9 (RefHapSet +
+            // PBWT scratch + HMM + allocator overhead; calibrated to measured RSS).
+            let per_chunk_gb =
+                (avg_chunk_n * n_ref.div_ceil(64) * 8) as f64 / 1e9 * 1.9;
+            let budget_gb = std::env::var("LCWGS_MEM_BUDGET_GB")
+                .ok().and_then(|x| x.parse::<f64>().ok()).unwrap_or(2.5);
+            let max_live = ((budget_gb / per_chunk_gb.max(1e-9)).floor() as usize)
+                .clamp(1, n_chunks.min(threads));
+            crate::selphi_info!(
+                "  chunk parallelism: {} live (budget {:.1} GB, ~{:.2} GB/chunk)",
+                max_live, budget_gb, per_chunk_gb);
+            let mut results = Vec::with_capacity(n_chunks);
+            let mut start = 0;
+            while start < n_chunks {
+                let end = (start + max_live).min(n_chunks);
+                let wave: Vec<_> =
+                    (start..end).into_par_iter().map(|c| process_chunk(c)).collect();
+                results.extend(wave);
+                start = end;
+            }
+            results
         } else {
             (0..n_chunks).map(|c| process_chunk(c)).collect()
         };
