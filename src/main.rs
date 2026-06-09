@@ -13,6 +13,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod self_test;
 mod orchestrate;
 mod cli;
+mod autoroute;
 mod imputation_pipeline;
 mod panel_phasing;
 
@@ -46,7 +47,7 @@ fn main() {
         eprintln!("[selphi] SIMD: {}", path);
     }
 
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     // Reject conflicting top-level modes (dispatch is first-match-wins, so
     // passing two would silently run only one). At most one allowed.
@@ -75,6 +76,38 @@ fn main() {
         .num_threads(args.threads)
         .build_global()
         .ok();
+
+    // --- Auto-route: sniff the target and AUTO-FILL the engine/mode flags ---
+    //
+    // Only meaningful for an actual imputation run (BAM/CRAM or a VCF/BCF target
+    // against a reference panel). Skip it for the non-imputation top-level modes
+    // (prepare-reference, merge-srps, evaluate, index, self-test, phase-panel) —
+    // those have no engine to pick. Auto-route only ever flips `lcwgs` / `refine`
+    // when the user left them unset; explicit flags always win. Default OFF.
+    if args.auto_route {
+        let is_other_mode = args.phase_panel
+            || args.evaluate.is_some()
+            || args.index.is_some()
+            || args.index_stats.is_some()
+            || args.self_test
+            || args.merge_srps.is_some()
+            || args.merge_srps_dir.is_some()
+            || args.prepare_reference_from.is_some();
+        if is_other_mode {
+            selphi_step!("auto-route: ignored (not an imputation run)");
+        } else {
+            let (eff_lcwgs, eff_refine) = autoroute::resolve(
+                args.lcwgs,
+                args.refine,
+                args.input.as_deref(),
+                args.bam.as_deref(),
+                args.bam_list.as_deref(),
+                args.reference.as_deref(),
+            );
+            args.lcwgs = eff_lcwgs;
+            args.refine = eff_refine;
+        }
+    }
 
 
     // --- De-novo panel phasing mode ---
