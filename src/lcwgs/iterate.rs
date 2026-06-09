@@ -56,27 +56,6 @@ pub struct GibbsOutput {
     pub cond_final: Vec<Vec<u32>>,
 }
 
-/// Per-haplotype genotype-likelihood floor (GLIMPSE2 `min_gl`, faithful port of
-/// `genotype.cpp` `makeHaplotypeLikelihoods`:112-113). After normalizing the
-/// partner-conditioned per-hap likelihood, each entry is clamped into
-/// `[min_gl, 1 - min_gl]`. WHY: at higher depth `bcftools` manufactures a few
-/// confident-but-erroneous false-HET GLs (`PL=[*,0,*]`) at true-hom-ref RARE
-/// sites; without a floor the conditioned HL underflows toward `[~0, ~1]` and
-/// (with `epsilon=1e-12`) the emission kill-ratio blows past ~1e12, so the
-/// all-REF rare panel can no longer pull the stray ALT back and Selphi locks a
-/// false dose — which is why our rare-bin R² *dropped* from 2× to 4× while
-/// GLIMPSE2 (which has this floor + the SAME err_imp=1e-12) stayed flat. At ≤2×
-/// the conditioned HL rarely underflows past 1e-10, so the floor is ~a no-op
-/// there; it engages on the confident false-HETs that depth creates. Default
-/// 1e-10 (GLIMPSE2's default); `LCWGS_MIN_GL=0` disables it (byte-identical to
-/// the pre-floor behaviour, for ablation).
-fn min_gl() -> f32 {
-    static M: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *M.get_or_init(|| {
-        std::env::var("LCWGS_MIN_GL").ok().and_then(|s| s.parse().ok()).unwrap_or(1e-10)
-    })
-}
-
 /// One target haplotype's HMM pass: build the conditional per-site emission
 /// likelihood (each site's HL conditioned on the partner hap's allele at that
 /// site, via `partner_at`), run the GL-weighted forward-backward over `cond`,
@@ -92,7 +71,7 @@ fn run_one_hap<F: Fn(usize) -> usize>(
     n_var: usize, n_samples: usize,
 ) -> (Vec<f32>, Vec<u8>) {
     let mut hap_hl = vec![0.0f32; n_var * 2];
-    let mg = min_gl(); // GLIMPSE2 per-hap GL floor (0 = disabled)
+    let mg = params.min_gl; // GLIMPSE2 per-hap GL floor (0 = disabled)
     for v in 0..n_var {
         let ca = partner_at(v); // 0 or 1
         let g_base = v * n_samples * 3 + 3 * s;
