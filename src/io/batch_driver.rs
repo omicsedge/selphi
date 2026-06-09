@@ -39,6 +39,12 @@ pub struct WindowBatchInput<'a> {
     pub n_samples_total: usize,
     pub chip_genotypes: &'a crate::common::HaplotypeBitmatrix,
     pub no_ap: bool,
+    /// R3 --refine: per-chip-site input confidence (chip-site order). `None`
+    /// when refine is off or every retained site is fully confident.
+    pub site_conf: Option<&'a [f64]>,
+    /// R3 --refine: chip sites with confidence `< refine_thr` re-route to the
+    /// imputed output branch. Ignored when `site_conf` is `None`.
+    pub refine_thr: f64,
 }
 
 /// One batch's sample / haplotype range (haps = 2 × samples).
@@ -170,6 +176,8 @@ pub fn run_window<S: BatchSink>(
     wgs_idx: &[usize],
     n_samples_total: usize,
     chip_genotypes: &crate::common::HaplotypeBitmatrix,
+    site_conf: Option<&[f64]>,
+    refine_thr: f64,
 ) -> std::io::Result<()> {
     use crate::srp::TILE_ROWS;
 
@@ -190,12 +198,26 @@ pub fn run_window<S: BatchSink>(
 
     let mut is_chip = vec![false; window_len];
     let mut chip_local_idx = vec![0usize; window_len];
+    // R3: see WindowSetup::new in pipeline.rs. A low-confidence chip site keeps
+    // is_chip=false so it falls into the imputed branch (its OWN call becomes the
+    // HMM/panel dosage). chip_local_idx is kept set for every chip row.
+    let mut n_rerouted = 0usize;
     for ci in 0..n_chip_total {
         let wi = wgs_idx[ci];
         if wi >= own_wgs_start && wi < own_wgs_end && wi < n_ref_variants {
-            is_chip[wi - own_wgs_start] = true;
             chip_local_idx[wi - own_wgs_start] = ci;
+            let soft = site_conf.is_some_and(|c| c.get(ci).is_some_and(|&x| x < refine_thr));
+            if soft {
+                n_rerouted += 1;
+            } else {
+                is_chip[wi - own_wgs_start] = true;
+            }
         }
+    }
+    if n_rerouted > 0 && hap_start == 0 {
+        // Logged once per window (first batch only) to avoid per-batch/per-format
+        // spam; step-level so it surfaces alongside the multiformat path's log.
+        crate::selphi_step!("--refine: re-routed {} low-confidence chip site(s) to imputed output (thr={})", n_rerouted, refine_thr);
     }
 
     let ctx = WindowCtx {

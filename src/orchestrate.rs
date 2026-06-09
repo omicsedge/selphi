@@ -604,6 +604,10 @@ pub fn run_multi_chr(
                     no_ap: config.no_ap,
                     preloaded_chunks: None,
                     preloaded_stripes,
+                    // R3 --refine is not wired into the multi-chr orchestrate path
+                    // (same as R2): no per-site confidence here → no re-route.
+                    site_conf: None,
+                    refine_thr: 0.5,
                 },
                 selphi::io::pipeline::WindowWriters {
                     // Per-chr parquet/pgen/selfdecode not wired yet in multi-chr mode.
