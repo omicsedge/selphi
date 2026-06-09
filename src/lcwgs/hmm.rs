@@ -159,6 +159,28 @@ fn lcwgs_loo() -> bool {
     *V.get_or_init(|| std::env::var("LCWGS_NO_EMIT_LOO").is_err())
 }
 
+/// GL-adaptive emission (re-test on real soft-PL multi-coverage harness, 2026-06-08).
+/// When `LCWGS_ADAPT_EMIT` is set, soften each per-hap likelihood toward flat
+/// (0.5/0.5) by a confidence weight `w = |h0-h1|^pow` BEFORE the HMM, so
+/// low-confidence (soft real-data, low-DP) reads lean on LD/copying while sharp
+/// reads pass through trusted. `pow` from `LCWGS_ADAPT_EMIT_POW` (default 1.0;
+/// >1 = more aggressive softening of the moderate band, <1 = gentler). Returns
+/// None (no-op → byte-identical) when unset. Applied once in
+/// [`run_forward_backward`] so it flows through every SIMD path and the backward
+/// fold-in consistently. Prior arc: a per-site-epsilon variant was a tradeoff on
+/// an older HEAD (real +0.004-0.006 / sim −0.0028, UPDATE 33) before the joint
+/// phaser became default; re-tested here on real soft GL where it helped.
+fn adapt_emit_pow() -> Option<f32> {
+    use std::sync::OnceLock;
+    static V: OnceLock<Option<f32>> = OnceLock::new();
+    *V.get_or_init(|| {
+        if std::env::var("LCWGS_ADAPT_EMIT").is_err() { return None; }
+        let pow = std::env::var("LCWGS_ADAPT_EMIT_POW").ok()
+            .and_then(|s| s.parse().ok()).unwrap_or(1.0f32);
+        Some(pow)
+    })
+}
+
 /// Li-Stephens transition rate scale (cM⁻¹). Default = Selphi's `0.04·Ne/K`
 /// (K-dependent: more conditioning states → less recombination per state).
 /// `LCWGS_GLIMPSE_RECOMB=1` switches to GLIMPSE2's K-INDEPENDENT form
@@ -305,6 +327,25 @@ pub fn run_forward_backward(
     assert_eq!(hl.len(), n_var * 2, "hl must be n_var * 2 f32");
     assert!(k >= 1, "at least one conditioning haplotype required");
     assert!(n_var >= 1, "at least one variant required");
+
+    // GL-adaptive emission: optionally soften hl toward flat (0.5/0.5) on
+    // low-confidence sites BEFORE dispatch, so every SIMD path + the backward
+    // HL fold-in see the same softened reads. No-op (byte-identical) when unset.
+    let hl_soft_buf;
+    let hl: &[f32] = if let Some(pow) = adapt_emit_pow() {
+        let mut b = vec![0.0f32; hl.len()];
+        for v in 0..n_var {
+            let h0 = hl[2 * v];
+            let h1 = hl[2 * v + 1];
+            let w = (h0 - h1).abs().powf(pow); // 0 (flat) .. 1 (sharp)
+            b[2 * v] = 0.5 + (h0 - 0.5) * w;
+            b[2 * v + 1] = 0.5 + (h1 - 0.5) * w;
+        }
+        hl_soft_buf = b;
+        &hl_soft_buf
+    } else {
+        hl
+    };
 
     // AVX-512 fast path (bit-packed conditioning, vectorized fwd/bwd). Falls
     // back to the scalar path below on non-AVX-512 hosts or SELPHI_FORCE_SCALAR=1.
