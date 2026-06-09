@@ -117,8 +117,10 @@ pub fn in_chrx_par(pos: i64, build: Build) -> bool {
 }
 
 /// Infer the build from the largest chrX position seen (GRCh38 chrX is
-/// 156,040,895 bp; GRCh37 is 155,270,560). A max position beyond the GRCh37
-/// length implies GRCh38. Conservative: defaults to GRCh38 when ambiguous.
+/// 156,040,895 bp; GRCh37 is 155,270,560). A position beyond the GRCh37 chrX
+/// length can ONLY be GRCh38 → GRCh38; otherwise (ambiguous range) → GRCh37.
+/// Pass the PANEL chrX extent (which spans the chromosome) rather than a sparse
+/// target's max, and prefer an explicit `--build` near the PAR2 boundary.
 pub fn infer_build_from_chrx_maxpos(max_pos: i64) -> Build {
     if max_pos > 155_270_560 { Build::Grch38 } else { Build::Grch37 }
 }

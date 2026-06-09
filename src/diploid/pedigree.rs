@@ -261,19 +261,32 @@ pub fn parse_haploids(
 
 /// Build flat genotype array (n_var × n_samples × 2) from per-variant genotype vectors.
 /// Used by pedigree scaffold and haploid reset to access genotypes in row-major layout.
+/// `transforms` (optional, aligned to `target_idx`; empty = none): `1` = this chip
+/// site was matched to the panel with REF/ALT swapped, so its biallelic calls are
+/// recoded 0↔1 into PANEL orientation — matching `extract_target_alleles`, so the
+/// pedigree scaffold and haploid reset read genotypes in the SAME frame as the
+/// `targ_alleles`/`ref_bm` they write into. Empty/all-zero → byte-identical.
 pub fn build_flat_genotypes(
     target_idx: &[usize],
     target_genotypes: &[Vec<[u8; 2]>],
     n_chip: usize,
     n_samples: usize,
+    transforms: &[u8],
 ) -> Vec<u8> {
     let mut flat = vec![0u8; n_chip * n_samples * 2];
     for (ci, &ti) in target_idx.iter().enumerate() {
         if ti < target_genotypes.len() {
             let gt = &target_genotypes[ti];
+            let swap = transforms.get(ci).copied().unwrap_or(0) == 1;
             for s in 0..n_samples.min(gt.len()) {
-                flat[ci * n_samples * 2 + s * 2] = gt[s][0];
-                flat[ci * n_samples * 2 + s * 2 + 1] = gt[s][1];
+                if swap {
+                    // Recode true 0/1 alleles; leave missing/>1 sentinels intact.
+                    flat[ci * n_samples * 2 + s * 2] = if gt[s][0] <= 1 { 1 - gt[s][0] } else { gt[s][0] };
+                    flat[ci * n_samples * 2 + s * 2 + 1] = if gt[s][1] <= 1 { 1 - gt[s][1] } else { gt[s][1] };
+                } else {
+                    flat[ci * n_samples * 2 + s * 2] = gt[s][0];
+                    flat[ci * n_samples * 2 + s * 2 + 1] = gt[s][1];
+                }
             }
         }
     }
