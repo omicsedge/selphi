@@ -88,14 +88,30 @@ fn apply_haploid_detection(
     sample_names: &[String],
     target_idx: &[usize], target_genotypes: &[Vec<[u8; 2]>],
     n_chip: usize, n_samples: usize, n_haps: usize,
+    chip_bps: &[i64],
 ) {
     if !needs_phasing { return; }
     let is_chrx = chr == "X" || chr == "chrX" || chr == "x" || chr == "23";
+    // PAR mask (opt-in `--chrx-par` on a chrX run): males are DIPLOID in PAR1/PAR2.
+    // `None` otherwise → byte-identical to the historical whole-chromosome handling.
+    let par_site: Option<Vec<bool>> = if args.chrx_par && is_chrx {
+        use selphi::contig::Build;
+        let build = match args.build {
+            crate::cli::BuildArg::Grch37 => Build::Grch37,
+            crate::cli::BuildArg::Grch38 => Build::Grch38,
+            crate::cli::BuildArg::Auto => selphi::contig::infer_build_from_chrx_maxpos(
+                chip_bps.iter().copied().max().unwrap_or(0)),
+        };
+        Some(chip_bps.iter().map(|&p| selphi::contig::in_chrx_par(p, build)).collect())
+    } else {
+        None
+    };
+    let par_ref = par_site.as_deref();
     let haploid_samples = if let Some(ref hap_path) = args.haploids {
         selphi::diploid::pedigree::parse_haploids(Path::new(hap_path), sample_names)
             .unwrap_or_else(|e| { selphi_error!("Cannot read haploids file: {}", e); std::process::exit(1); })
     } else if is_chrx {
-        selphi::diploid::pedigree::detect_haploid_chrx(targ_alleles, n_chip, n_samples, n_haps)
+        selphi::diploid::pedigree::detect_haploid_chrx(targ_alleles, n_chip, n_samples, n_haps, par_ref)
     } else {
         return;
     };
@@ -103,11 +119,17 @@ fn apply_haploid_detection(
     let flat_geno = selphi::diploid::pedigree::build_flat_genotypes(
         target_idx, target_genotypes, n_chip, n_samples);
     let n_reset = selphi::diploid::pedigree::reset_haploid_hets(
-        targ_alleles, &flat_geno, &haploid_samples, n_chip, n_samples, n_haps,
+        targ_alleles, &flat_geno, &haploid_samples, n_chip, n_samples, n_haps, par_ref,
     );
     let detect_method = if args.haploids.is_some() { "from file" } else { "auto-detected" };
-    selphi_step!("Haploid samples ({}): {} samples, {} het calls reset to missing",
-        detect_method, haploid_samples.len(), n_reset);
+    let n_par = par_ref.map_or(0, |p| p.iter().filter(|&&x| x).count());
+    if n_par > 0 {
+        selphi_step!("Haploid samples ({}, PAR-aware): {} samples, {} non-PAR het calls reset, {} PAR sites kept diploid",
+            detect_method, haploid_samples.len(), n_reset, n_par);
+    } else {
+        selphi_step!("Haploid samples ({}): {} samples, {} het calls reset to missing",
+            detect_method, haploid_samples.len(), n_reset);
+    }
 }
 
 /// PBWT / HMM auto-calibrated parameters derived from the reference panel
@@ -890,7 +912,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     apply_haploid_detection(
         args, needs_phasing, srp.chromosome(), &mut targ_alleles,
         &sample_names, &target_idx, &target_genotypes,
-        n_chip, n_samples, n_haps,
+        n_chip, n_samples, n_haps, &chip_bps,
     );
 
     let (targ_alleles, em_ne_per_site, ref_bm_from_phasing) = if needs_phasing {

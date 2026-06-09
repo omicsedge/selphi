@@ -206,17 +206,24 @@ pub fn apply_pedigree_scaffold(
 
 /// Auto-detect haploid samples on chrX by het rate.
 /// Males on chrX should have <1% het rate. Returns sample indices.
+/// `par_site` (optional, len `n_var`, `true` = pseudo-autosomal): when provided,
+/// PAR sites are EXCLUDED from the het-rate estimate, because males ARE diploid
+/// (heterozygous) in PAR — counting PAR hets would inflate a male's het rate and
+/// could hide his haploid status. `None` counts every site (byte-identical to
+/// the historical whole-chromosome heuristic).
 pub fn detect_haploid_chrx(
     alleles: &[u8],     // (n_var × n_haps) target alleles
     n_var: usize,
     n_samples: usize,
     n_haps: usize,
+    par_site: Option<&[bool]>,
 ) -> HashSet<usize> {
     let mut haploids = HashSet::new();
     for si in 0..n_samples {
         let mut n_het = 0u32;
         let mut n_total = 0u32;
         for v in 0..n_var {
+            if par_site.is_some_and(|p| p.get(v).copied().unwrap_or(false)) { continue; }
             let a0 = alleles[v * n_haps + si * 2];
             let a1 = alleles[v * n_haps + si * 2 + 1];
             if a0 <= 1 && a1 <= 1 { n_total += 1; }
@@ -280,6 +287,10 @@ pub fn build_flat_genotypes(
 /// the correct homozygous call.
 ///
 /// Returns the number of het calls reset.
+/// `par_site` (optional, len `n_var`, `true` = pseudo-autosomal): when provided,
+/// het calls at PAR sites are PRESERVED (not reset), because a male IS diploid in
+/// PAR and his PAR heterozygotes are real. `None` resets every het (byte-identical
+/// to the historical behavior, which wrongly destroyed male PAR hets).
 pub fn reset_haploid_hets(
     alleles: &mut [u8],         // (n_var × n_haps) target alleles
     genotypes: &[u8],           // (n_var × n_samples × 2) original genotypes
@@ -287,12 +298,15 @@ pub fn reset_haploid_hets(
     n_var: usize,
     n_samples: usize,
     n_haps: usize,
+    par_site: Option<&[bool]>,
 ) -> usize {
     let mut n_reset = 0;
     for &si in haploid_samples {
         let h0 = si * 2;
         let h1 = si * 2 + 1;
         for v in 0..n_var {
+            // PAR → male is diploid here; keep his (real) het call.
+            if par_site.is_some_and(|p| p.get(v).copied().unwrap_or(false)) { continue; }
             let g0 = genotypes[v * n_samples * 2 + si * 2];
             let g1 = genotypes[v * n_samples * 2 + si * 2 + 1];
             if g0 != g1 {
@@ -304,4 +318,45 @@ pub fn reset_haploid_hets(
         }
     }
     n_reset
+}
+
+#[cfg(test)]
+mod par_tests {
+    use super::*;
+
+    #[test]
+    fn reset_preserves_par_hets() {
+        // 1 haploid sample, 4 sites; het at site1 (PAR) and site3 (non-PAR).
+        let geno = vec![0,0, 0,1, 0,0, 1,0]; // (n_var=4 × n_samples=1 × 2)
+        let par = [false, true, false, false];
+        let hap: HashSet<usize> = [0usize].into_iter().collect();
+
+        // PAR-aware: only the non-PAR het (site3) is reset; PAR het (site1) kept.
+        let mut a = vec![0,0, 0,1, 0,0, 1,0];
+        let n = reset_haploid_hets(&mut a, &geno, &hap, 4, 1, 2, Some(&par));
+        assert_eq!(n, 1);
+        assert_eq!(a, vec![0,0, 0,1, 0,0, 0,0]);
+
+        // None → historical behavior: both hets reset.
+        let mut a2 = vec![0,0, 0,1, 0,0, 1,0];
+        let n2 = reset_haploid_hets(&mut a2, &geno, &hap, 4, 1, 2, None);
+        assert_eq!(n2, 2);
+        assert_eq!(a2, vec![0,0, 0,0, 0,0, 0,0]);
+    }
+
+    #[test]
+    fn detect_excludes_par_hets() {
+        // Male with hets ONLY in PAR (sites 0..10), hom elsewhere (sites 10..200).
+        let n_var = 200usize;
+        let mut alleles = vec![0u8; n_var * 2];
+        for v in 0..10 { alleles[v * 2 + 1] = 1; } // het at PAR sites
+        let par: Vec<bool> = (0..n_var).map(|v| v < 10).collect();
+
+        // PAR-aware: PAR hets excluded → 0% het over non-PAR → detected haploid.
+        let h = detect_haploid_chrx(&alleles, n_var, 1, 2, Some(&par));
+        assert!(h.contains(&0));
+        // None: 10/200 = 5% het (> 1%) → NOT detected (PAR hets inflate the rate).
+        let h0 = detect_haploid_chrx(&alleles, n_var, 1, 2, None);
+        assert!(!h0.contains(&0));
+    }
 }
