@@ -301,6 +301,63 @@ pub fn run_lcwgs_bam(
     impute_from_gl3(srp, &wgs_idx, bamgl.gl3, n_samples, bamgl.sample_ids, map_path, params)
 }
 
+/// Resolve the two-depth common/rare split for this run (see `process_chunk`).
+/// Priority: `LCWGS_NO_SPLIT` → off; explicit `LCWGS_SPLIT_MAF="lo,hi"` → manual;
+/// otherwise AUTO (default). AUTO engages iff BOTH hold:
+///   (1) BIG PANEL — the adaptive `kpbwt` exceeds the default conditioning cap
+///       (3000), so the deep pass actually lets through IBD haps the default
+///       truncates (the lever that feeds the 5-10% band). On small / panel-matched
+///       panels `kpbwt ≤ 3000` → returns None → single pass, byte-identical.
+///   (2) SOFT GL (low coverage) — mean per-(site,sample) max normalized genotype
+///       likelihood < `LCWGS_SPLIT_GL_THR` (default 0.84). Calibrated 0.5×≈0.69 /
+///       1×≈0.73 / 2×≈0.79 / 4×≈0.89: the split WINS every bin ≤2× but is neutral
+///       at ≥4× (informative reads carry the signal), so high-coverage runs skip
+///       the 2nd pass. De-noised 3-sample validation: 1× dominates all bins, 2×
+///       wins 6/7+overall, 4× tie (not engaged).
+/// Band defaults to [0.05,0.10) (`LCWGS_SPLIT_BAND`); deep cap 5000 (`LCWGS_SPLIT_KMAX`).
+fn resolve_split(gl3: &[f32], n_samples: usize, n_var: usize, params: &LcwgsParams) -> Option<(f64, f64, usize)> {
+    if std::env::var("LCWGS_NO_SPLIT").is_ok() { return None; }
+    let deep_k = std::env::var("LCWGS_SPLIT_KMAX").ok().and_then(|x| x.parse().ok()).unwrap_or(5000usize);
+    let parse_band = |s: &str| -> Option<(f64, f64)> {
+        let p: Vec<f64> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        if p.len() == 2 && p[0] < p[1] { Some((p[0], p[1])) } else { None }
+    };
+    // Manual override.
+    if let Ok(s) = std::env::var("LCWGS_SPLIT_MAF") {
+        return parse_band(&s).map(|(lo, hi)| {
+            crate::selphi_info!("  lcWGS SPLIT (manual): MAF∈[{},{}) → deep pass (k_max={})", lo, hi, deep_k);
+            (lo, hi, deep_k)
+        });
+    }
+    // AUTO. (1) big-panel gate: the deep cap must exceed the default cap to differ.
+    let default_kmax = 3000usize;
+    if params.kpbwt <= default_kmax { return None; }
+    // (2) soft-GL (coverage) gate.
+    let thr: f32 = std::env::var("LCWGS_SPLIT_GL_THR").ok().and_then(|x| x.parse().ok()).unwrap_or(0.84);
+    let (mut sum, mut cnt) = (0.0f64, 0usize);
+    for v in 0..n_var {
+        let b = v * n_samples * 3;
+        for s in 0..n_samples {
+            let (g0, g1, g2) = (gl3[b + 3 * s], gl3[b + 3 * s + 1], gl3[b + 3 * s + 2]);
+            let tot = g0 + g1 + g2;
+            if tot > 0.0 { sum += (g0.max(g1).max(g2) / tot) as f64; cnt += 1; }
+        }
+    }
+    let mean_conf = if cnt > 0 { (sum / cnt as f64) as f32 } else { 1.0 };
+    let (lo, hi) = std::env::var("LCWGS_SPLIT_BAND").ok().and_then(|s| parse_band(&s)).unwrap_or((0.05, 0.10));
+    if mean_conf < thr {
+        crate::selphi_info!(
+            "  lcWGS SPLIT (auto-ON): big panel (kpbwt={}) + soft GL (mean_conf={:.3} < {:.2}) → deep pass MAF∈[{},{}) k_max={}",
+            params.kpbwt, mean_conf, thr, lo, hi, deep_k);
+        Some((lo, hi, deep_k))
+    } else {
+        crate::selphi_info!(
+            "  lcWGS SPLIT (auto-OFF): high coverage (mean_conf={:.3} ≥ {:.2}) — split is neutral, single pass",
+            mean_conf, thr);
+        None
+    }
+}
+
 /// Chunk the chromosome by cM and run the Gibbs per chunk with its own
 /// conditioning set. Each chunk has a core region (whose dosage is kept) and
 /// a buffer region on each side (computed but discarded — absorbs edge
@@ -332,6 +389,17 @@ fn run_chunked_gibbs(
         "  chunked Gibbs: {:.1} cM span → {} chunks (core {:.1} cM + {:.1} cM buffer each side)",
         total_cm, n_chunks, core_cm, buffer_cm);
 
+    // Two-depth common/rare SPLIT — auto-gated by panel size + coverage (see
+    // `resolve_split`). The default conditioning cap (k_max=3000) keeps the rare
+    // bins undiluted but truncates the IBD base on a big panel (kpbwt≈5000),
+    // starving the mid-frequency (5-10%) sites of the mid-ranked IBD haps they
+    // need. When engaged, each chunk is ALSO imputed at a deep cap and sites whose
+    // PANEL MAF ∈ [lo,hi) take the deep dose; all others keep the default. AUTO
+    // engages only on a BIG panel at LOW coverage (≤~2×) — where it makes Selphi
+    // beat GLIMPSE2 on every MAF bin; small/panel-matched panels + high coverage
+    // skip it (single pass, byte-identical). Cost when on: ~2× the per-chunk Gibbs.
+    let split_band: Option<(f64, f64, usize)> = resolve_split(gl3_shared, n_samples, n_shared, params);
+
     // Per-chunk work as a closure so chunks can run in PARALLEL when the sample
     // count is too small to fill the cores (single/few-sample: the sample/hap
     // par_iter inside run_gibbs is degenerate → most cores idle). Chunks are fully
@@ -362,7 +430,27 @@ fn run_chunked_gibbs(
         let chunk_wgs: Vec<usize> = wgs_idx[buf_start..buf_end].to_vec();
         let chunk_bm = srp.extract_ref_alleles_bitmatrix(&chunk_wgs);
 
-        let out = run_gibbs(&chunk_gl3, &chunk_bm, &chunk_cm, n_samples, params);
+        let mut out = run_gibbs(&chunk_gl3, &chunk_bm, &chunk_cm, n_samples, params, None);
+        // Two-depth split: run the deep pass and overlay its dose/GP onto the band
+        // sites (panel MAF ∈ [lo,hi)), routing by PANEL allele frequency only (known
+        // a-priori; no truth). Byte-identical when `split_band` is None.
+        if let Some((lo, hi, deep_k)) = split_band {
+            let out_deep = run_gibbs(&chunk_gl3, &chunk_bm, &chunk_cm, n_samples, params, Some(deep_k));
+            let n_ref = chunk_bm.n_haps;
+            for lv in 0..chunk_bm.n_sites {
+                let ac = chunk_bm.popcount_row(lv, n_ref) as f64;
+                let maf = ac.min(n_ref as f64 - ac) / n_ref as f64;
+                if lo <= maf && maf < hi {
+                    for s in 0..n_samples {
+                        out.dosage[lv * n_samples + s] = out_deep.dosage[lv * n_samples + s];
+                        let g = (lv * n_samples + s) * 3;
+                        out.gp[g] = out_deep.gp[g];
+                        out.gp[g + 1] = out_deep.gp[g + 1];
+                        out.gp[g + 2] = out_deep.gp[g + 2];
+                    }
+                }
+            }
+        }
         memtrace(&format!("chunk {c}/{n_chunks} done (chunk_n={chunk_n})"));
 
         // PHASE-0 diagnostic dump (LCWGS_COND_DUMP=<dir>): per chunk, write the
@@ -535,7 +623,7 @@ mod tests {
         params.n_main_iterations = 1;
         params.kpbwt = 3;
         params.pbwt_modulo_cm = 0.001;
-        let out = run_gibbs(&gl3, &bm, &cm, n_samples, &params);
+        let out = run_gibbs(&gl3, &bm, &cm, n_samples, &params, None);
         assert_eq!(out.dosage.len(), n_var * n_samples);
         for (v, &d) in out.dosage.iter().enumerate() {
             assert!(!d.is_nan(), "dose {} at v={} is NaN", d, v);

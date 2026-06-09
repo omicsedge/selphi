@@ -22,11 +22,11 @@ use crate::common::HaplotypeBitmatrix;
 /// Tunable DMM knobs (env, parsed once).
 pub struct DmmConfig {
     /// Number of conditioning haps used for the per-segment diplotype phasing
-    /// (GLIMPSE2 uses HAP_NUMBER=8). `LCWGS_DMM_M`, default 8.
+    /// (GLIMPSE2 uses HAP_NUMBER=8). `LCWGS_DMM_M`, default 12 (the r12-validated combo).
     pub m: usize,
-    /// Segment length in cM (`LCWGS_DMM_SEG_CM`, default 0.5).
+    /// Segment length in cM (`LCWGS_DMM_SEG_CM`, default 1.0).
     pub seg_cm: f64,
-    /// Per-segment pair-switch penalty (log-units) (`LCWGS_DMM_SWITCH`, default 4.0).
+    /// Per-segment pair-switch penalty (log-units) (`LCWGS_DMM_SWITCH`, default 2.0).
     pub switch_pen: f32,
 }
 impl DmmConfig {

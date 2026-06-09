@@ -56,6 +56,27 @@ pub struct GibbsOutput {
     pub cond_final: Vec<Vec<u32>>,
 }
 
+/// Per-haplotype genotype-likelihood floor (GLIMPSE2 `min_gl`, faithful port of
+/// `genotype.cpp` `makeHaplotypeLikelihoods`:112-113). After normalizing the
+/// partner-conditioned per-hap likelihood, each entry is clamped into
+/// `[min_gl, 1 - min_gl]`. WHY: at higher depth `bcftools` manufactures a few
+/// confident-but-erroneous false-HET GLs (`PL=[*,0,*]`) at true-hom-ref RARE
+/// sites; without a floor the conditioned HL underflows toward `[~0, ~1]` and
+/// (with `epsilon=1e-12`) the emission kill-ratio blows past ~1e12, so the
+/// all-REF rare panel can no longer pull the stray ALT back and Selphi locks a
+/// false dose — which is why our rare-bin R² *dropped* from 2× to 4× while
+/// GLIMPSE2 (which has this floor + the SAME err_imp=1e-12) stayed flat. At ≤2×
+/// the conditioned HL rarely underflows past 1e-10, so the floor is ~a no-op
+/// there; it engages on the confident false-HETs that depth creates. Default
+/// 1e-10 (GLIMPSE2's default); `LCWGS_MIN_GL=0` disables it (byte-identical to
+/// the pre-floor behaviour, for ablation).
+fn min_gl() -> f32 {
+    static M: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("LCWGS_MIN_GL").ok().and_then(|s| s.parse().ok()).unwrap_or(1e-10)
+    })
+}
+
 /// One target haplotype's HMM pass: build the conditional per-site emission
 /// likelihood (each site's HL conditioned on the partner hap's allele at that
 /// site, via `partner_at`), run the GL-weighted forward-backward over `cond`,
@@ -71,6 +92,7 @@ fn run_one_hap<F: Fn(usize) -> usize>(
     n_var: usize, n_samples: usize,
 ) -> (Vec<f32>, Vec<u8>) {
     let mut hap_hl = vec![0.0f32; n_var * 2];
+    let mg = min_gl(); // GLIMPSE2 per-hap GL floor (0 = disabled)
     for v in 0..n_var {
         let ca = partner_at(v); // 0 or 1
         let g_base = v * n_samples * 3 + 3 * s;
@@ -79,8 +101,18 @@ fn run_one_hap<F: Fn(usize) -> usize>(
         let sum = a + b;
         if sum > f32::MIN_POSITIVE {
             let inv = 1.0 / sum;
-            hap_hl[2 * v] = a * inv;
-            hap_hl[2 * v + 1] = b * inv;
+            let mut h0 = a * inv;
+            let mut h1 = b * inv;
+            // Clamp into [min_gl, 1-min_gl] (GLIMPSE2 makeHaplotypeLikelihoods):
+            // a confident false read cannot drive the emission past ~1/min_gl, so
+            // the panel still wins back a depth-manufactured false-HET at a rare
+            // site. They sum to 1, so at most one entry can be below the floor.
+            if mg > 0.0 {
+                if h0 < mg { h0 = mg; h1 = 1.0 - mg; }
+                else if h1 < mg { h1 = mg; h0 = 1.0 - mg; }
+            }
+            hap_hl[2 * v] = h0;
+            hap_hl[2 * v + 1] = h1;
         } else {
             hap_hl[2 * v] = 0.5;
             hap_hl[2 * v + 1] = 0.5;
@@ -204,6 +236,22 @@ struct GibbsConfig {
     /// beats GLIMPSE2 0.9429) → strict win, no regime tradeoff. Costs ~2× wall on
     /// small panels (one-time compressed-PBWT build per chunk; amortized multi-sample).
     faithful_select: bool,
+    /// Phasing cadence in the MAIN phase (`LCWGS_PHASE_MAIN_EVERY`, default 1 =
+    /// re-phase every iteration = byte-identical to the shipped schedule). With
+    /// N>1 the per-iteration re-phase runs only every Nth MAIN iteration (burn-in
+    /// always re-phases); the FINAL iteration's re-phase is ALWAYS skipped — it is
+    /// dead work (its only consumer is a non-existent next iteration, and this
+    /// iteration's dose was already accumulated from `hap_dose` before the re-phase).
+    /// The re-phase is the dominant multi-sample cost, so N>1 trades a documented
+    /// accuracy probe for ~linear phasing-wall savings. Watch the 0.5-1% rare bin
+    /// (the one bin --lcwgs wins). See the `phase=` split under `LCWGS_TIMING`.
+    phase_main_every: usize,
+    /// Phasing-HMM conditioning uses the UNION of both haps' cond sets
+    /// (`LCWGS_G2_RICH_COND`). Read once here (was a per-iteration env read).
+    rich_cond: bool,
+    /// GLIMPSE2-exact flat rule (`LCWGS_G2_FLAT_EXACT`): a site is flat ⟺ its GL
+    /// triple is all-equal. Read once here (was a per-iteration env read).
+    flat_exact: bool,
 }
 impl GibbsConfig {
     fn from_env() -> Self {
@@ -249,6 +297,9 @@ impl GibbsConfig {
             burnin_diploid: std::env::var("LCWGS_BURNIN_DIPLOID").is_ok(),
             glimpse2_phase: std::env::var("LCWGS_NO_GLIMPSE2_PHASE").is_err(),
             faithful_select: std::env::var("LCWGS_NO_FAITHFUL_SELECT").is_err(),
+            phase_main_every: envu("LCWGS_PHASE_MAIN_EVERY").filter(|&n| n >= 1).unwrap_or(1),
+            rich_cond: std::env::var("LCWGS_G2_RICH_COND").is_ok(),
+            flat_exact: std::env::var("LCWGS_G2_FLAT_EXACT").is_ok(),
         }
     }
 }
@@ -273,13 +324,19 @@ pub fn run_gibbs(
     cm: &[f64],
     n_samples: usize,
     params: &LcwgsParams,
+    k_max_override: Option<usize>,
 ) -> GibbsOutput {
     let n_var = cm.len();
     let n_target_haps = n_samples * 2;
     assert_eq!(gl3.len(), n_var * n_samples * 3);
     assert_eq!(ref_bm.n_sites, n_var);
 
-    let cfg = GibbsConfig::from_env();
+    let mut cfg = GibbsConfig::from_env();
+    // Conditioning-cap override for the two-depth common/rare split (the deep pass
+    // in `super::pipeline::run_chunked_gibbs` passes `Some(deep_k)` so the full IBD
+    // base survives — feeds the 5-10% band; `Some(0)` = uncapped). `None` = use the
+    // env/default cap → byte-identical to the single-pass behaviour.
+    if let Some(k) = k_max_override { cfg.k_max = if k == 0 { None } else { Some(k) }; }
     let dmm_cfg = if cfg.dmm { Some(super::dmm::DmmConfig::from_env()) } else { None };
 
     // Per-hap sampled alleles, layout [v * n_target_haps + h]. Initialized
@@ -356,8 +413,8 @@ pub fn run_gibbs(
 
     // Gated phase-timing breakdown (LCWGS_TIMING). Zero overhead when unset.
     let timing = cfg.timing;
-    let (mut t_sel, mut t_aug, mut t_clone, mut t_hmm, mut t_wb) =
-        (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let (mut t_sel, mut t_aug, mut t_clone, mut t_hmm, mut t_wb, mut t_phase) =
+        (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let mut max_k = 0usize;
 
     // Per-iteration partner-allele snapshot, reused across iterations (the
@@ -365,6 +422,15 @@ pub fn run_gibbs(
     // every iteration — the largest per-iteration alloc; pooling it cuts peak RSS
     // and allocator churn on multi-sample runs, byte-identically).
     let mut prev_alleles = vec![0u8; hap_alleles.len()];
+
+    // Loop-invariant phasing-HMM inputs (constant across all iterations): poly =
+    // every site, no monomorphic, no low-qual. Built once (only when the faithful
+    // phaser is active) instead of reallocating n_var-length Vecs every iteration.
+    let (poly_sites, mono_sites, lq): (Vec<i32>, Vec<i32>, Vec<bool>) = if cfg.glimpse2_phase {
+        ((0..n_var as i32).collect(), Vec::new(), vec![false; n_var])
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
 
     for it in 0..params.n_iterations {
         // 1. Sparse PBWT selection from the current sampled hap alleles.
@@ -471,6 +537,17 @@ pub fn run_gibbs(
             hap_dose[h] = Some(dose);
         }
 
+        // Re-phase cadence (LCWGS_PHASE_MAIN_EVERY, default 1 = every iteration).
+        // Burn-in always re-phases; MAIN re-phases every Nth iter; the FINAL
+        // iteration's re-phase is ALWAYS skipped — it is dead work (its only
+        // consumer is the next iteration, which does not exist, and this
+        // iteration's dose was already accumulated from `hap_dose` above). With
+        // N=1 this is byte-identical to the shipped schedule modulo that free skip.
+        let is_last_iter = it + 1 == params.n_iterations;
+        let phase_this_iter = !is_last_iter
+            && (it < n_burnin || (it - n_burnin) % cfg.phase_main_every == 0);
+        let tp0 = if timing { Some(std::time::Instant::now()) } else { None };
+
         // DMM segment phase-commitment (LCWGS_DMM, main iters only): re-phase each
         // sample's H0/H1 onto a per-segment committed diplotype copy so a
         // segment-coherent low-noise phase feeds the next iteration's selection +
@@ -481,23 +558,21 @@ pub fn run_gibbs(
         // re-phase each sample's H0/H1 via the ported phasing_hmm (8-founder diplotype
         // SAMPLE_DIP). Replaces the heuristic DMM. Genotype-preserving (re-phases hets);
         // feeds the next iteration's selection + partner conditioning, like the DMM.
-        if cfg.glimpse2_phase {
+        if cfg.glimpse2_phase && phase_this_iter {
             let g2p = crate::lcwgs::g2_params::Glimpse2Params {
                 ne: params.ne as f64,
                 ..Default::default()
             };
-            let poly_sites: Vec<i32> = (0..n_var as i32).collect();
-            let mono_sites: Vec<i32> = Vec::new();
-            let lq = vec![false; n_var];
+            // poly_sites / mono_sites / lq are hoisted above the iteration loop.
             // Richer phasing conditioning (LCWGS_G2_RICH_COND): use the UNION of both
             // haps' cond sets (GLIMPSE2 phases against the individual's shared set, not
             // one hap's) so the diplotype Viterbi sees both haps' candidate copies.
-            let rich_cond = std::env::var("LCWGS_G2_RICH_COND").is_ok();
+            let rich_cond = cfg.rich_cond;
             // FAITHFUL flat rule (LCWGS_G2_FLAT_EXACT). GLIMPSE2 genotype_reader.cpp:580
             // sets flat ⟺ the GL triple is all-equal (PL[0]==PL[1]==PL[2], i.e. no
             // informative read), NOT a peakedness threshold. Our default `<1/3+1e-3`
             // over-marks weakly-informative sites as flat; this restores the exact rule.
-            let flat_exact = std::env::var("LCWGS_G2_FLAT_EXACT").is_ok();
+            let flat_exact = cfg.flat_exact;
             let rephased: Vec<(usize, Vec<u8>, Vec<u8>)> = (0..n_samples).into_par_iter().map(|s| {
                 let (h0i, h1i) = (2 * s, 2 * s + 1);
                 let mut h0: Vec<bool> = (0..n_var).map(|v| hap_alleles[v * n_target_haps + h0i] == 1).collect();
@@ -554,7 +629,7 @@ pub fn run_gibbs(
                 }
             }
         }
-        if cfg.dmm && (is_main || cfg.burnin_diploid) && !cfg.glimpse2_phase {
+        if cfg.dmm && (is_main || cfg.burnin_diploid) && !cfg.glimpse2_phase && phase_this_iter {
             let dcfg = dmm_cfg.as_ref().unwrap();
             let rephased: Vec<(usize, Vec<u8>, Vec<u8>)> = (0..n_samples).into_par_iter().map(|s| {
                 let (h0i, h1i) = (2 * s, 2 * s + 1);
@@ -656,6 +731,7 @@ pub fn run_gibbs(
                 }
             }
         }
+        if let Some(t) = tp0 { t_phase += t.elapsed().as_secs_f64(); }
         if is_main {
             for s in 0..n_samples {
                 let d0 = hap_dose[2 * s].as_ref().unwrap();
@@ -678,8 +754,8 @@ pub fn run_gibbs(
     if timing {
         let (pack_ns, fb_ns) = super::hmm::take_hmm_profile();
         crate::selphi_info!(
-            "  [lcwgs timing] sel={:.2}s aug={:.2}s clone={:.2}s hmm={:.2}s wb={:.2}s | max_K={} n_var={} n_haps={}",
-            t_sel, t_aug, t_clone, t_hmm, t_wb, max_k, n_var, n_target_haps);
+            "  [lcwgs timing] sel={:.2}s aug={:.2}s clone={:.2}s hmm={:.2}s wb={:.2}s (phase={:.2}s of wb) | max_K={} n_var={} n_haps={}",
+            t_sel, t_aug, t_clone, t_hmm, t_wb, t_phase, max_k, n_var, n_target_haps);
         crate::selphi_info!(
             "  [lcwgs timing]   hmm split (cpu-time summed over threads): condbits-pack={:.1}s forward-backward={:.1}s",
             pack_ns as f64 / 1e9, fb_ns as f64 / 1e9);
@@ -774,7 +850,7 @@ mod tests {
         params.n_main_iterations = 1;
         params.kpbwt = 3;
         params.pbwt_modulo_cm = 0.001;
-        let out = run_gibbs(&gl3, &bm, &cm, n_samples, &params);
+        let out = run_gibbs(&gl3, &bm, &cm, n_samples, &params, None);
         assert_eq!(out.dosage.len(), n_var * n_samples);
         for &d in &out.dosage {
             assert!((0.0..=2.0).contains(&d), "dose {} out of range", d);
