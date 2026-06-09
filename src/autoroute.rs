@@ -458,7 +458,7 @@ pub fn resolve(
             }
         }
         AutoRoute::PlainGenotype => {
-            selphi_step!("auto-route: GT-only confident calls → genotype engine (no refine)");
+            selphi_step!("auto-route: confident hard calls (GT-only, or GQ/DP below WGS density) → genotype engine (no refine)");
         }
     }
     (eff_lcwgs, eff_refine)
