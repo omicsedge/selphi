@@ -81,6 +81,10 @@ pub fn run_lcwgs(
     _n_threads: usize,
 ) -> std::io::Result<LcwgsOutput> {
     memtrace("entry (after SRP load)");
+    if let Some(msg) = crate::contig::nonrecomb_refusal(srp.chromosome()) {
+        crate::selphi_error!("{}", msg);
+        std::process::exit(2);
+    }
     // --- 1. Parse target VCF with PL ---
     let hash_alleles = !srp.ids.is_empty() && {
         let first_ref = &srp.variants[0].ref_allele;
@@ -208,6 +212,10 @@ pub fn run_lcwgs_bam(
     reference: Option<&str>,
     _n_threads: usize,
 ) -> std::io::Result<LcwgsOutput> {
+    if let Some(msg) = crate::contig::nonrecomb_refusal(srp.chromosome()) {
+        crate::selphi_error!("{}", msg);
+        std::process::exit(2);
+    }
     // Panel variant indices to impute (region subset, else all). Chromosome
     // match is `chr`-prefix tolerant (panel `1`/`22` ↔ region `chr1`/`chr22`),
     // matching the rest of the pipeline (resolve_contig, intersect_variants);

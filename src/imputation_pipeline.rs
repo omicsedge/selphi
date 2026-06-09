@@ -747,6 +747,14 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     let ref_positions: Vec<i64> = srp.variants.iter().map(|v| v.pos).collect();
     selphi_step!("Loaded SRP: {} variants, {} haplotypes", n_ref_variants, n_ref);
 
+    // Refuse chrY/chrMT: the Li-Stephens recombination model does not apply to a
+    // non-recombining / haploid / homoplasmic contig (panels omit them too).
+    // Override with SELPHI_ALLOW_NONRECOMB=1. Autosomes/chrX are unaffected.
+    if let Some(msg) = selphi::contig::nonrecomb_refusal(srp.chromosome()) {
+        selphi_error!("{}", msg);
+        std::process::exit(2);
+    }
+
     // 2. Read target VCF: sample names, variants, genotypes
     let (sample_names, target_markers, target_genotypes, is_phased) =
         read_target_vcf(target_path, &srp);
