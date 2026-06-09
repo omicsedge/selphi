@@ -680,6 +680,37 @@ fn line_min_confidence(
     if min_c.is_finite() { min_c } else { 1.0 }
 }
 
+/// R4 per-hap confidence: like [`line_min_confidence`] but emits one confidence
+/// per sample (NOT the min across samples), appended into `out` in sample order.
+/// Exactly `n_samples` values are pushed per call. When the FORMAT carries none
+/// of GQ/PL/DP every sample yields 1.0 (fully trusted). Missing/short per-sample
+/// fields also fall back to 1.0 via `sample_confidence`'s (None,None) arm.
+fn line_per_sample_confidence(
+    format_bytes: &[u8], gt_region: &[u8], n_samples: usize, gq_lo: f64, gq_hi: f64,
+    out: &mut Vec<f64>,
+) {
+    let gq_i = format_field_index(format_bytes, b"GQ");
+    let pl_i = format_field_index(format_bytes, b"PL");
+    let dp_i = format_field_index(format_bytes, b"DP");
+    if gq_i.is_none() && pl_i.is_none() && dp_i.is_none() {
+        out.extend(std::iter::repeat(1.0f64).take(n_samples));
+        return;
+    }
+    let mut field_start = 0usize;
+    for _ in 0..n_samples {
+        let field_end = gt_region[field_start..]
+            .iter().position(|&b| b == b'\t')
+            .map(|p| field_start + p)
+            .unwrap_or(gt_region.len());
+        let field = &gt_region[field_start..field_end];
+        let gq = gq_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
+        let pl = pl_i.and_then(|i| nth_subfield(field, i)).and_then(parse_pl_triple);
+        let dp = dp_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
+        out.push(sample_confidence(gq, pl, dp, gq_lo, gq_hi));
+        field_start = if field_end < gt_region.len() { field_end + 1 } else { gt_region.len() };
+    }
+}
+
 /// FORMAT spec bytes from a VCF data line (field 9, between the 9th tab and the
 /// next tab/EOL). Mirrors `split_vcf_fields` (which only captures up to field 9).
 #[inline]
@@ -806,6 +837,87 @@ fn extract_site_confidence_bcf(path: &str, gq_lo: f64, gq_hi: f64) -> Vec<f64> {
     conf
 }
 
+/// R4 per-(marker, sample) confidence. Returns a flat row-major matrix
+/// `[marker * n_samples + sample]` (one row per RETAINED marker, in the SAME
+/// file order as [`extract_target_site_confidence`] / `read_target_vcf`) plus
+/// `n_samples`. Uses the SAME GQ→PL→DP `sample_confidence` map as the min path,
+/// but keeps every sample's value instead of collapsing to the min. The caller
+/// re-indexes into chip-site order via [`align_confidence_to_chip_per_sample`].
+/// The hard-call path is untouched (additive, opt-in under `--refine`).
+pub fn extract_target_site_confidence_per_sample(path: &str) -> (Vec<f64>, usize) {
+    let (gq_lo, gq_hi) = refine_gq_endpoints();
+
+    if path.ends_with(".bcf") {
+        return extract_site_confidence_per_sample_bcf(path, gq_lo, gq_hi);
+    }
+    let raw = read_vcf_raw(path);
+    if raw.starts_with(b"BCF\x02\x02") {
+        return extract_site_confidence_per_sample_bcf(path, gq_lo, gq_hi);
+    }
+
+    let mut conf: Vec<f64> = Vec::new();
+    let mut n_samples = 0usize;
+    for line in raw.split(|&b| b == b'\n') {
+        if line.is_empty() || line.starts_with(b"##") { continue; }
+        if line.starts_with(b"#CHROM") {
+            let n_tabs = line.iter().filter(|&&b| b == b'\t').count();
+            n_samples = n_tabs.saturating_sub(8);
+            continue;
+        }
+        let Some(f) = split_vcf_fields(line) else { continue };
+        match vcf_format_bytes(line) {
+            Some(fmt) => line_per_sample_confidence(fmt, f.gt_region, n_samples, gq_lo, gq_hi, &mut conf),
+            None => conf.extend(std::iter::repeat(1.0f64).take(n_samples)),
+        }
+    }
+    (conf, n_samples)
+}
+
+/// BCF path for [`extract_target_site_confidence_per_sample`]. Same record
+/// order + retention rule as `extract_site_confidence_bcf`, one value per sample.
+fn extract_site_confidence_per_sample_bcf(path: &str, gq_lo: f64, gq_hi: f64) -> (Vec<f64>, usize) {
+    use noodles_bcf as bcf;
+    use noodles_vcf::variant::record_buf::samples::sample::Value;
+
+    let mut reader = match bcf::io::reader::Builder::default().build_from_path(path) {
+        Ok(r) => r,
+        Err(_) => return (Vec::new(), 0),
+    };
+    let header = match reader.read_header() { Ok(h) => h, Err(_) => return (Vec::new(), 0) };
+
+    let int_val = |v: &Value| -> Option<i64> {
+        match v {
+            Value::Integer(i) => Some(*i as i64),
+            _ => None,
+        }
+    };
+
+    let mut conf = Vec::new();
+    let mut n_samples = 0usize;
+    for result in reader.record_bufs(&header) {
+        let rec = match result { Ok(r) => r, Err(_) => continue };
+        let pos = match rec.variant_start() { Some(p) => usize::from(p) as i64, None => continue };
+        if pos < 1 { continue; }
+        let keep = matches!(rec.alternate_bases().as_ref().first(), Some(a) if a != "." && !a.is_empty());
+        if !keep { continue; }
+
+        let samples = rec.samples();
+        let mut row_n = 0usize;
+        for sample in samples.values() {
+            let gq = sample.get("GQ").flatten().and_then(int_val);
+            let dp = sample.get("DP").flatten().and_then(int_val);
+            let pl: Option<[i32; 3]> = match sample.get("PL").flatten() {
+                Some(v) => bcf_value_to_pl3(v),
+                _ => None,
+            };
+            conf.push(sample_confidence(gq, pl, dp, gq_lo, gq_hi));
+            row_n += 1;
+        }
+        if row_n > n_samples { n_samples = row_n; }
+    }
+    (conf, n_samples)
+}
+
 /// Re-index a per-marker (file-order) confidence vector into post-intersection
 /// chip-site order via `target_idx` (chip site i → target marker index). The
 /// result is `n_chip` long, aligned to `chip_cm` / the HMM. Out-of-range or
@@ -822,6 +934,34 @@ pub fn align_confidence_to_chip(
             let c = marker_conf[ti].clamp(0.0, 1.0);
             out[ci] = c;
             if c < 1.0 { any_soft = true; }
+        }
+    }
+    if any_soft { Some(out) } else { None }
+}
+
+/// R4: re-index a per-(marker, sample) confidence matrix into post-intersection
+/// chip-site order. `marker_conf` is row-major `[marker * n_samples + sample]`
+/// (file order, from [`extract_target_site_confidence_per_sample`]); the result
+/// is row-major `[chip_site * n_samples + sample]`, `n_chip` rows long, aligned
+/// to `chip_cm` / the HMM. Out-of-range markers default to a fully-confident row
+/// (all 1.0). Returns `None` (→ no per-hap softening anywhere → byte-identical
+/// scalar emission) when EVERY entry is 1.0.
+pub fn align_confidence_to_chip_per_sample(
+    marker_conf: &[f64], n_samples: usize, target_idx: &[usize], n_chip: usize,
+) -> Option<Vec<f64>> {
+    if n_samples == 0 { return None; }
+    let n_markers = marker_conf.len() / n_samples;
+    let mut out = vec![1.0f64; n_chip * n_samples];
+    let mut any_soft = false;
+    for (ci, &ti) in target_idx.iter().enumerate().take(n_chip) {
+        if ti < n_markers {
+            let src = &marker_conf[ti * n_samples..(ti + 1) * n_samples];
+            let dst = &mut out[ci * n_samples..(ci + 1) * n_samples];
+            for (d, &s) in dst.iter_mut().zip(src.iter()) {
+                let c = s.clamp(0.0, 1.0);
+                *d = c;
+                if c < 1.0 { any_soft = true; }
+            }
         }
     }
     if any_soft { Some(out) } else { None }
