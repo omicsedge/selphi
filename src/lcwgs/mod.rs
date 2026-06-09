@@ -34,7 +34,7 @@
 //! - [`pbwt_select`] — sparse PBWT haplotype selection from MAP genotypes
 //!   (argmax-from-GL) at common sites only, default `Kpbwt = 2000`
 //! - [`iterate`] — Gibbs alternating haploid imputation and phasing
-//!   (default 5 iterations), refining the conditioning set each round
+//!   (default 50 iterations, last 25 "main"), refining the conditioning set each round
 //! - [`pipeline`] — orchestrator: SRP load → PL parse → PBWT → iterate
 //!   HMM → write outputs
 //!
