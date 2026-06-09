@@ -426,4 +426,34 @@ pub struct Args {
     /// Usually not needed: chrX males are auto-detected (< 1% het rate).
     #[arg(long, hide = true)]
     pub haploids: Option<String>,
+
+    /// chrX PAR-aware male ploidy (opt-in). When set on a chrX run, males are
+    /// treated as DIPLOID inside the pseudo-autosomal regions (PAR1/PAR2) and
+    /// HAPLOID elsewhere: their PAR heterozygous calls are preserved (today they
+    /// are wrongly reset), and male-haploid detection counts only non-PAR sites.
+    /// PAR coordinates are selected by `--build`. Default OFF → byte-identical to
+    /// the historical whole-chromosome treatment. (The haploid GT *output*
+    /// emission for non-PAR males is a separate, follow-up step; with this flag
+    /// the imputation is PAR-correct but male chrX dosages are still written
+    /// diploid.)
+    #[arg(long)]
+    pub chrx_par: bool,
+
+    /// Reference build for chrX PAR coordinates (used with `--chrx-par`):
+    /// grch37|grch38|auto. `auto` (default) infers from the largest chrX position
+    /// (GRCh38 chrX is longer than GRCh37). Aliases hg19→grch37, hg38→grch38.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub build: BuildArg,
+}
+
+/// Reference-build selector for chrX PAR coordinates.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BuildArg {
+    /// Infer from the largest observed chrX position.
+    #[default]
+    Auto,
+    #[value(alias = "hg19")]
+    Grch37,
+    #[value(alias = "hg38")]
+    Grch38,
 }
