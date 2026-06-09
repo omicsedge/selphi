@@ -236,6 +236,9 @@ fn compute_forward(
     p_err: f64,
     group_sizes: Option<&[f64]>,
     emission_ratios: Option<&[Vec<f64>]>,
+    // R1 hybrid emission: per-chip-site mismatch prob ε_eff. None → use the scalar
+    // `p_err` (byte-identical to the shipped path). Some(sp) → sp[chip_idx] per site.
+    site_perr: Option<&[f64]>,
     start: usize,
     stop: usize,
     is_last: bool,
@@ -281,8 +284,10 @@ fn compute_forward(
         let nh = n_haps[chip_idx] as f32;
         let nm = n_matches[chip_idx];
         let p_rec = f_precomb[chip_idx] as f32;
-        let p_err_f = p_err as f32;
-        let p_no_err_f = p_no_err as f32;
+        let (p_err_f, p_no_err_f) = match site_perr {
+            Some(sp) => { let e = sp[chip_idx]; (e as f32, (1.0 - e) as f32) }
+            None => (p_err as f32, p_no_err as f32),
+        };
 
         let last_sum_f = last_sum as f32;
         let scale = if last_sum_f > 0.0f32 { (1.0f32 - p_rec * nh) / last_sum_f } else { 0.0f32 };
@@ -377,6 +382,8 @@ fn streaming_backward_combine(
     p_err: f64,
     group_sizes: Option<&[f64]>,
     emission_ratios: Option<&[Vec<f64>]>,
+    // R1 hybrid emission: per-chip-site mismatch prob ε_eff (None → scalar p_err).
+    site_perr: Option<&[f64]>,
     start: usize,
     stop: usize,
     is_first: bool,
@@ -439,8 +446,10 @@ fn streaming_backward_combine(
             let nh = n_haps[chip_idx] as f32;
             let nm = n_matches[chip_idx];
             let p_rec = r_precomb[chip_idx] as f32;
-            let p_err_f = p_err as f32;
-            let p_no_err_f = p_no_err as f32;
+            let (p_err_f, p_no_err_f) = match site_perr {
+                Some(sp) => { let e = sp[chip_idx]; (e as f32, (1.0 - e) as f32) }
+                None => (p_err as f32, p_no_err as f32),
+            };
             let last_sum_f = last_sum as f32;
             let scale = if last_sum_f > 0.0f32 { (1.0f32 - p_rec * nh) / last_sum_f } else { 0.0f32 };
 
@@ -766,6 +775,20 @@ pub fn calculate_weights(
         }).collect()
     });
 
+    // R1 hybrid-emission spine (Slice 1, env-gated test hook). `SELPHI_REFINE_CONST_C=c`
+    // treats EVERY chip site as confidence c → per-site mismatch prob
+    //   ε_eff = (1-c)*0.5 + c*p_err     (p_err is the data-derived window scalar).
+    // At c≥1, ε_eff == p_err exactly AND we collapse to None → the forward/backward take
+    // the scalar arm token-for-token → BIT-IDENTICAL to the shipped path. c<1 softens the
+    // emission toward flat (lean on LD). Real GQ/PL-derived per-site c is Slice 2.
+    let site_perr: Option<Vec<f64>> = std::env::var("SELPHI_REFINE_CONST_C").ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&c| c < 1.0)
+        .map(|c| {
+            let eps = ((1.0 - c) * 0.5 + c * p_err).clamp(p_err, 0.5);
+            vec![eps; distances_cm.len()]
+        });
+
     // Debug: dump HMM internals for hap0
     if log_n == 0 {
         selphi_debug!("  [FWD-DBG] n_states={} p_err={:.8} prune={:.6}", n_states, p_err, prune_threshold);
@@ -806,6 +829,7 @@ pub fn calculate_weights(
             &dense_matches, &n_matches, &n_haps_per_site, &f_precomb,
             n_states, p_err, group_sizes_f64.as_deref(),
             dense_emission_ratios.as_deref(),
+            site_perr.as_deref(),
             start, stop, is_last,
             alpha.as_deref(), last_sum_fwd, prune_threshold,
         );
@@ -864,6 +888,7 @@ pub fn calculate_weights(
             &r_precomb, n_states, p_err,
             group_sizes_f64.as_deref(),
             dense_emission_ratios.as_deref(),
+            site_perr.as_deref(),
             start, stop, is_first,
             init_beta.as_deref(), init_sum, prune_threshold,
             n_hid, &state_to_hap, gm_ref,
