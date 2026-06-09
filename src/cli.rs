@@ -112,6 +112,19 @@ pub struct Args {
     #[arg(long)]
     pub refine: bool,
 
+    /// Auto-detect the target input and pick the engine/mode WITHOUT the user
+    /// choosing. A cheap sniff of the input (BAM/CRAM → reads; VCF/BCF FORMAT +
+    /// a sample of records) decides:
+    ///   - reads, or a PL VCF with absent/low-call-rate GT → lcWGS engine;
+    ///   - confident GT with a confidence field (GQ/PL/DP) → genotype engine + --refine;
+    ///   - GT-only confident (chip array) → plain genotype engine.
+    /// Only fills in `--lcwgs` / `--refine` when they are UNSET; an explicit
+    /// `--lcwgs` / `--refine` always wins. Default OFF. The chosen route is
+    /// logged loudly. Thresholds: SELPHI_AUTOROUTE_CALLRATE (default 0.5),
+    /// SELPHI_AUTOROUTE_SAMPLE (default 2000 records).
+    #[arg(long)]
+    pub auto_route: bool,
+
     /// (--lcwgs) Use the GLIMPSE2-FAITHFUL lcWGS engine (a 1:1 port of GLIMPSE2's
     /// phase/ Gibbs caller: ref_haplotype_set + sparse PBWT selection + GL-aware
     /// Li-Stephens FB + diplotype-mosaic rephasing + MT19937). Separate from the
