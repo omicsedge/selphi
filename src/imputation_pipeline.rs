@@ -774,13 +774,35 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // refine is off OR every retained site is fully confident → byte-identical.
     let target_site_conf: Option<Vec<f64>> = if args.refine {
         let marker_conf = extract_target_site_confidence(target_path);
-        let aligned = align_confidence_to_chip(&marker_conf, &target_idx, n_chip);
+        let mut aligned = align_confidence_to_chip(&marker_conf, &target_idx, n_chip);
+        // R3 TEST-ONLY hook: synthesize confidence = 0.0 for the first ⌊f·n_chip⌋
+        // chip sites so the low-confidence → imputed re-route fires on a chip
+        // benchmark (which carries no genuine soft sites). Off by default; the
+        // real driver is the GQ/PL/DP confidence above.
+        if let Ok(s) = std::env::var("SELPHI_REFINE_TEST_SOFT_FRAC") {
+            if let Ok(f) = s.trim().parse::<f64>() {
+                if f > 0.0 {
+                    let n_force = ((f.min(1.0)) * n_chip as f64).floor() as usize;
+                    if n_force > 0 {
+                        let v = aligned.get_or_insert_with(|| vec![1.0f64; n_chip]);
+                        for c in v.iter_mut().take(n_force) { *c = 0.0; }
+                        selphi_step!("--refine TEST: forced {} chip site(s) to confidence 0.0 (SELPHI_REFINE_TEST_SOFT_FRAC={})", n_force, f);
+                    }
+                }
+            }
+        }
         let n_soft = aligned.as_ref().map(|c| c.iter().filter(|&&x| x < 1.0).count()).unwrap_or(0);
         selphi_step!("--refine: {} chip site(s) with input confidence < 1.0 (of {})", n_soft, n_chip);
         aligned
     } else {
         None
     };
+    // R3 re-route threshold: chip sites with confidence < thr are emitted as the
+    // HMM/panel-derived (imputed) dosage instead of verbatim hard calls. From
+    // env SELPHI_REFINE_THR (default 0.5). Only consulted when site_conf is Some.
+    let refine_thr: f64 = std::env::var("SELPHI_REFINE_THR").ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(0.5);
 
     // Resolve auto max_candidates and the batched-output cap BEFORE memory
     // estimation so the estimator reflects the actual runtime configuration
@@ -1131,6 +1153,8 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                     n_samples_total: n_samples,
                     chip_genotypes: chip_genos_ref,
                     no_ap,
+                    site_conf: target_site_conf.as_deref(),
+                    refine_thr,
                 };
                 // Find this batch's writer by hap_start, asserting its hap_end matches.
                 macro_rules! find_bi {
@@ -1216,6 +1240,8 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                 no_ap,
                 preloaded_chunks: preloaded,
                 preloaded_stripes,
+                site_conf: target_site_conf.as_deref(),
+                refine_thr,
             },
             selphi::io::pipeline::WindowWriters {
                 parquet: parquet_writer.as_mut().map(|(w, s)| (w, &*s)),

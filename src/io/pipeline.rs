@@ -125,6 +125,8 @@ impl<'a> WindowSetup<'a> {
         own_chip_end: usize,
         wgs_idx: &[usize],
         n_samples: usize,
+        site_conf: Option<&[f64]>,
+        refine_thr: f64,
     ) -> Self {
         let n_haps = n_samples * 2;
         let n_ref_variants = srp.n_variants();
@@ -137,12 +139,29 @@ impl<'a> WindowSetup<'a> {
         let window_len = own_wgs_end - own_wgs_start;
         let mut is_chip = vec![false; window_len];
         let mut chip_local_idx = vec![0usize; window_len];
+        // R3: under --refine, a low-confidence chip site is re-routed to the
+        // imputed output branch (its OWN call becomes the HMM/panel dosage). We
+        // realize this by leaving is_chip=false for soft sites: every output
+        // format selects verbatim-vs-imputed on is_chip alone (paired with
+        // chip_local_idx, which we still populate), and the interpolation anchors
+        // come from the chip RANGE (build_intervals) not is_chip — so a soft row's
+        // alt_probs already holds its refined HMM dosage. chip_local_idx is kept
+        // set for all chip rows so any future consumer still resolves the index.
+        let mut n_rerouted = 0usize;
         for ci in 0..n_chip_total {
             let wi = wgs_idx[ci];
             if wi >= own_wgs_start && wi < own_wgs_end && wi < n_ref_variants {
-                is_chip[wi - own_wgs_start] = true;
                 chip_local_idx[wi - own_wgs_start] = ci;
+                let soft = site_conf.is_some_and(|c| c.get(ci).is_some_and(|&x| x < refine_thr));
+                if soft {
+                    n_rerouted += 1; // is_chip stays false → falls into imputed branch
+                } else {
+                    is_chip[wi - own_wgs_start] = true;
+                }
             }
+        }
+        if n_rerouted > 0 {
+            crate::selphi_step!("--refine: re-routed {} low-confidence chip site(s) to imputed output (thr={})", n_rerouted, refine_thr);
         }
 
         let vid_prefixes: Vec<Vec<u8>> = (own_wgs_start..own_wgs_end).map(|i| {
@@ -736,6 +755,12 @@ pub struct WindowInput<'a> {
     pub no_ap: bool,
     pub preloaded_chunks: Option<Vec<Option<crate::srp::CscChunk>>>,
     pub preloaded_stripes: Option<crate::srp::tiled::PreloadedStripes>,
+    /// R3 --refine: per-chip-site input confidence (chip-site order). `None`
+    /// when refine is off or every retained site is fully confident.
+    pub site_conf: Option<&'a [f64]>,
+    /// R3 --refine: chip sites with confidence `< refine_thr` re-route to the
+    /// imputed output branch. Ignored when `site_conf` is `None`.
+    pub refine_thr: f64,
 }
 
 /// Active output sinks. Only the ones requested by `OutputFormats` are
@@ -757,13 +782,14 @@ pub fn write_window_multiformat(
     let WindowInput {
         srp, all_weights, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples, chip_genotypes, no_ap,
-        preloaded_chunks, preloaded_stripes,
+        preloaded_chunks, preloaded_stripes, site_conf, refine_thr,
     } = input;
     let WindowWriters { parquet: parquet_writer, pgen: pgen_writer, selfdecode: sd_writer, vcf_tx } = writers;
 
     let setup = WindowSetup::new(
         srp, all_weights, win_chip_start,
         own_chip_start, own_chip_end, wgs_idx, n_samples,
+        site_conf, refine_thr,
     );
 
     if setup.intervals.is_empty() {
