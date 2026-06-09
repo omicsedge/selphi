@@ -263,24 +263,61 @@ impl FaithfulSelector {
     /// Flatten `pbwt_states[ind]` (per-depth-layer ref-hap ids) into the deduped
     /// union per sample → both haps of the sample get that union (capped kpbwt).
     fn flatten_pbwt(&self) -> Vec<Vec<u32>> {
+        let qual = qual_trunc();
         let mut cond = vec![Vec::new(); 2 * self.n_samples];
         for s in 0..self.n_samples {
-            // Union across all depth layers, dedup, ascending (priority-neutral —
-            // the downstream rare-carrier aug keeps base ahead of carriers).
-            let mut union: Vec<u32> = Vec::new();
-            for layer in &self.tar.pbwt_states[s] {
-                union.extend(layer.iter().map(|&x| x as u32));
-            }
-            union.sort_unstable();
-            union.dedup();
-            if self.kpbwt > 0 && union.len() > self.kpbwt {
-                union.truncate(self.kpbwt);
-            }
+            let union: Vec<u32> = if qual {
+                // QUALITY-ordered cap (LCWGS_QUAL_TRUNC): the depth LAYER index is the
+                // match-rank (layer 0 = closest local match). Iterate layers best-first
+                // and keep each hap on its FIRST (best) appearance until kpbwt — so the
+                // cap (and the downstream kmax cap, which inherits this order) keeps the
+                // best-matching haps, NOT the lowest-index ones (the prior `sort_unstable
+                // + truncate` was match-quality-blind). The base is left in best-first
+                // order (NOT index-sorted) so the DOWNSTREAM kmax cap in iterate.rs —
+                // which keeps the first kmax of base — also keeps best-first. The
+                // layer-major + first-occurrence build is already deterministic.
+                let mut seen = std::collections::HashSet::new();
+                let mut u: Vec<u32> = Vec::new();
+                'outer: for layer in &self.tar.pbwt_states[s] {
+                    for &x in layer {
+                        let h = x as u32;
+                        if seen.insert(h) {
+                            u.push(h);
+                            if self.kpbwt > 0 && u.len() >= self.kpbwt as usize {
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+                u
+            } else {
+                // Union across all depth layers, dedup, ascending (priority-neutral —
+                // the downstream rare-carrier aug keeps base ahead of carriers).
+                let mut u: Vec<u32> = Vec::new();
+                for layer in &self.tar.pbwt_states[s] {
+                    u.extend(layer.iter().map(|&x| x as u32));
+                }
+                u.sort_unstable();
+                u.dedup();
+                if self.kpbwt > 0 && u.len() > self.kpbwt as usize {
+                    u.truncate(self.kpbwt as usize);
+                }
+                u
+            };
             cond[2 * s + 1] = union.clone();
             cond[2 * s] = union;
         }
         cond
     }
+}
+
+/// `LCWGS_QUAL_TRUNC=1` → cap the per-sample conditioning union by MATCH QUALITY
+/// (best depth-layer first) instead of by haplotype index. Default off (the
+/// shipped index-order behavior, byte-identical). Cached once.
+fn qual_trunc() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("LCWGS_QUAL_TRUNC").is_ok())
 }
 
 /// Build per-sample [`GenotypeView`]s from explicit field slices (so the caller
