@@ -766,7 +766,8 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
 
     // 3. Variant intersection (merge-join on sorted positions)
     let t0_isect = std::time::Instant::now();
-    let (wgs_idx, target_idx) = intersect_variants(&srp, &target_markers);
+    let (wgs_idx, target_idx, allele_transforms) =
+        intersect_variants(&srp, &target_markers, args.allele_match);
     selphi_debug!("  Intersect: {:.1}ms", t0_isect.elapsed().as_secs_f64() * 1000.0);
     let n_chip = wgs_idx.len();
     selphi_step!("Shared markers: {} ({:.1}% of target)",
@@ -871,7 +872,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     );
 
     // 5. Extract target alleles at chip sites (before ref — needed for MAF filter)
-    let targ_alleles = extract_target_alleles(&target_genotypes, &target_idx, n_chip, n_haps);
+    let targ_alleles = extract_target_alleles(&target_genotypes, &target_idx, n_chip, n_haps, &allele_transforms);
 
     // 6. Genetic map
     let chip_bps: Vec<i64> = wgs_idx.iter().map(|&wi| ref_positions[wi]).collect();

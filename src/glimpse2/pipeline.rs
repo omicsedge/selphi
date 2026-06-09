@@ -79,7 +79,10 @@ pub fn run_pipeline(
     // --- 2. Intersect target markers against the panel. ---
     // (wgs_idx[k] = panel index, target_idx[k] = target-marker index, of the
     //  k-th shared variant — same contract as run_lcwgs.)
-    let (wgs_idx, target_idx) = intersect_variants(srp, &markers);
+    // GLIMPSE2-exact reproduces GLIMPSE2 1:1; no allele reconciliation (and GL is
+    // reference-oriented anyway).
+    let (wgs_idx, target_idx, _) =
+        intersect_variants(srp, &markers, crate::io::target_io::AlleleMatch::None);
     let n_shared = wgs_idx.len();
     if n_shared == 0 {
         return Err(std::io::Error::other(

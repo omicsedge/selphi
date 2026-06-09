@@ -106,7 +106,9 @@ pub fn run_lcwgs(
     // intersect_variants returns (wgs_idx, target_idx) in THAT order:
     //   wgs_idx[k]    = panel variant index of the k-th shared variant
     //   target_idx[k] = target-marker index of the k-th shared variant
-    let (wgs_idx, target_idx) = intersect_variants(srp, &markers);
+    // lcWGS PL is read-derived (reference orientation); no allele reconciliation.
+    let (wgs_idx, target_idx, _) =
+        intersect_variants(srp, &markers, crate::io::target_io::AlleleMatch::None);
     let n_shared = wgs_idx.len();
     selphi_info!("  shared variants: {} / {} ({:.1}% of target)",
         n_shared, n_target_variants, 100.0 * n_shared as f64 / n_target_variants.max(1) as f64);
