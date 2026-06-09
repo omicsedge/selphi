@@ -15,6 +15,26 @@ pub enum PhasingEngine {
     Diploid,
 }
 
+/// Imputation engine/mode selection (`--engine`). The unified, discoverable
+/// front door for the otherwise-orthogonal `--lcwgs` / `--refine` booleans.
+/// Default is `auto`: Selphi sniffs the target input and picks the engine
+/// itself (the previous `--auto-route` behaviour, now default-ON).
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
+pub enum Engine {
+    /// Sniff the target (BAM/CRAM → reads; VCF/BCF FORMAT + a record sample)
+    /// and pick: reads/PL → lcWGS; confident GT+GQ/DP at WGS density → genotype
+    /// + refine; otherwise (chip array, or GT-only) → plain genotype.
+    Auto,
+    /// Force the lcWGS GL-aware engine (reads / PL VCF). Same as `--lcwgs`.
+    Lcwgs,
+    /// Force the plain chip/WGS genotype engine — no refinement, no lcWGS,
+    /// regardless of what a sniff would have chosen (the explicit "force-OFF").
+    Genotype,
+    /// Force the chip/WGS genotype engine WITH GL-aware refinement. Same as
+    /// `--refine`.
+    Refine,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "selphi", about = "PBWT-based genotype imputation")]
 pub struct Args {
@@ -97,8 +117,21 @@ pub struct Args {
     /// emits GT, DS (dosage), and GP (genotype posteriors).
     ///
     /// Recommended coverage: 0.5x-4x sequencing.
+    ///
+    /// LEGACY alias for `--engine lcwgs`. Still honoured; `--engine` wins if both
+    /// are given.
     #[arg(long)]
     pub lcwgs: bool,
+
+    /// Imputation engine/mode: auto|lcwgs|genotype|refine. DEFAULT auto — Selphi
+    /// sniffs the target and picks the engine without you choosing (BAM/CRAM or a
+    /// PL VCF → lcWGS; confident GT with GQ/DP at WGS density → genotype+refine;
+    /// chip array / GT-only → plain genotype). Pass an explicit value to force a
+    /// route (e.g. `--engine genotype` is the force-OFF that overrides the sniff).
+    /// The legacy `--lcwgs` / `--refine` / `--auto-route` flags still work and map
+    /// onto this; an explicit `--engine` takes precedence over them.
+    #[arg(long, value_enum)]
+    pub engine: Option<Engine>,
 
     /// Hybrid GL-aware refinement of the chip/WGS imputation HMM. When set,
     /// Selphi reads a per-chip-site input confidence c[v] ∈ [0,1] from the
@@ -109,19 +142,22 @@ pub struct Args {
     /// a per-haplotype version is a later step. Default OFF → bit-identical to
     /// the shipped hard-call path. The hard calls still flow to the bitmatrix
     /// unchanged; only the HMM emission weighting is affected.
+    ///
+    /// LEGACY alias for `--engine refine`. Still honoured; `--engine` wins if
+    /// both are given.
     #[arg(long)]
     pub refine: bool,
 
-    /// Auto-detect the target input and pick the engine/mode WITHOUT the user
-    /// choosing. A cheap sniff of the input (BAM/CRAM → reads; VCF/BCF FORMAT +
-    /// a sample of records) decides:
-    ///   - reads, or a PL VCF with absent/low-call-rate GT → lcWGS engine;
-    ///   - confident GT with a confidence field (GQ/PL/DP) → genotype engine + --refine;
-    ///   - GT-only confident (chip array) → plain genotype engine.
-    /// Only fills in `--lcwgs` / `--refine` when they are UNSET; an explicit
-    /// `--lcwgs` / `--refine` always wins. Default OFF. The chosen route is
-    /// logged loudly. Thresholds: SELPHI_AUTOROUTE_CALLRATE (default 0.5),
-    /// SELPHI_AUTOROUTE_SAMPLE (default 2000 records).
+    /// LEGACY no-op alias for `--engine auto`. Auto-routing is now the DEFAULT
+    /// (`--engine auto`), so this flag is redundant but still accepted so old
+    /// command lines keep working. A cheap sniff of the target (BAM/CRAM → reads;
+    /// VCF/BCF FORMAT + a record sample) picks the engine:
+    ///   - reads, or a PL VCF → lcWGS engine;
+    ///   - confident GT with GQ/DP at WGS density → genotype engine + refine;
+    ///   - chip array / GT-only confident → plain genotype engine.
+    /// Tunables: SELPHI_AUTOROUTE_CALLRATE (default 0.5), SELPHI_AUTOROUTE_SAMPLE
+    /// (2000 records), SELPHI_AUTOROUTE_WGS_DENSITY (1000 variants/Mb gate for the
+    /// refine branch), SELPHI_AUTOROUTE_MAXBYTES (256 MiB sniff read cap).
     #[arg(long)]
     pub auto_route: bool,
 

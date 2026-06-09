@@ -77,14 +77,17 @@ fn main() {
         .build_global()
         .ok();
 
-    // --- Auto-route: sniff the target and AUTO-FILL the engine/mode flags ---
+    // --- Engine selection: `--engine auto|lcwgs|genotype|refine` ---
+    //
+    // The unified front door. Default is `auto` (default-ON auto-route): Selphi
+    // sniffs the target and picks the engine itself. Legacy `--lcwgs` / `--refine`
+    // / `--auto-route` map onto an `Engine`; an explicit `--engine` wins over them.
     //
     // Only meaningful for an actual imputation run (BAM/CRAM or a VCF/BCF target
-    // against a reference panel). Skip it for the non-imputation top-level modes
+    // against a reference panel). Skipped for the non-imputation top-level modes
     // (prepare-reference, merge-srps, evaluate, index, self-test, phase-panel) —
-    // those have no engine to pick. Auto-route only ever flips `lcwgs` / `refine`
-    // when the user left them unset; explicit flags always win. Default OFF.
-    if args.auto_route {
+    // those have no engine to pick.
+    {
         let is_other_mode = args.phase_panel
             || args.evaluate.is_some()
             || args.index.is_some()
@@ -93,19 +96,50 @@ fn main() {
             || args.merge_srps.is_some()
             || args.merge_srps_dir.is_some()
             || args.prepare_reference_from.is_some();
+
+        // Resolve the effective engine: explicit `--engine` first, else the legacy
+        // booleans (`--lcwgs` → lcwgs, `--refine` → refine), else `auto` (which is
+        // also what bare `--auto-route` and "no engine flag at all" mean now).
+        let engine = args.engine.unwrap_or_else(|| {
+            if args.lcwgs { cli::Engine::Lcwgs }
+            else if args.refine { cli::Engine::Refine }
+            else { cli::Engine::Auto }
+        });
+
         if is_other_mode {
-            selphi_step!("auto-route: ignored (not an imputation run)");
+            if args.engine.is_some() || args.auto_route {
+                selphi_step!("engine: ignored (not an imputation run)");
+            }
         } else {
-            let (eff_lcwgs, eff_refine) = autoroute::resolve(
-                args.lcwgs,
-                args.refine,
-                args.input.as_deref(),
-                args.bam.as_deref(),
-                args.bam_list.as_deref(),
-                args.reference.as_deref(),
-            );
-            args.lcwgs = eff_lcwgs;
-            args.refine = eff_refine;
+            match engine {
+                cli::Engine::Auto => {
+                    let (eff_lcwgs, eff_refine) = autoroute::resolve(
+                        args.lcwgs,
+                        args.refine,
+                        args.input.as_deref(),
+                        args.bam.as_deref(),
+                        args.bam_list.as_deref(),
+                        args.reference.as_deref(),
+                    );
+                    args.lcwgs = eff_lcwgs;
+                    args.refine = eff_refine;
+                }
+                cli::Engine::Lcwgs => {
+                    selphi_step!("engine: lcwgs (forced)");
+                    args.lcwgs = true;
+                    args.refine = false;
+                }
+                cli::Engine::Genotype => {
+                    selphi_step!("engine: genotype (forced — no lcwgs, no refine)");
+                    args.lcwgs = false;
+                    args.refine = false;
+                }
+                cli::Engine::Refine => {
+                    selphi_step!("engine: genotype + refine (forced)");
+                    args.lcwgs = false;
+                    args.refine = true;
+                }
+            }
         }
     }
 
