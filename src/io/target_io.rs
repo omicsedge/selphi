@@ -689,7 +689,10 @@ fn vcf_format_bytes(line: &[u8]) -> Option<&[u8]> {
     for (i, &b) in line.iter().enumerate() {
         if b == b'\t' {
             tab += 1;
-            if tab == 9 {
+            // FORMAT is VCF column 9 = the field AFTER the 8th tab (column N starts
+            // after tab N-1). `tab == 9` would return column 10 (SAMPLE1), so GQ/PL/DP
+            // were never found and every site defaulted to confidence 1.0.
+            if tab == 8 {
                 let rest = &line[i + 1..];
                 let end = rest.iter().position(|&b| b == b'\t').unwrap_or(rest.len());
                 return Some(&rest[..end]);
