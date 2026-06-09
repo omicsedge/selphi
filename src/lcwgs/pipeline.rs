@@ -182,17 +182,46 @@ fn impute_from_gl3(
     // 75552-hap panel → ~5000: rare 0.9971→0.9989, ties GLIMPSE2, +10s/+0.24GB),
     // small/matched panels stay 2000 (r12 unchanged). Past ~5000 the common bins
     // regress (rare↔common tradeoff), hence the cap. Skip when kpbwt is set explicitly.
-    let mut params_owned;
-    let params: &LcwgsParams = if std::env::var("LCWGS_KPBWT").is_err() {
+    let mut eff = params.clone();
+    let mut modified = false;
+    if std::env::var("LCWGS_KPBWT").is_err() {
         let n_ref = srp.metadata.n_haps;
         let adaptive = ((n_ref as f64 * 0.066).round() as usize).clamp(2000, 5000);
-        if adaptive != params.kpbwt {
-            crate::selphi_info!("  adaptive K: kpbwt {} → {} (n_ref={})", params.kpbwt, adaptive, n_ref);
-            params_owned = params.clone();
-            params_owned.kpbwt = adaptive;
-            &params_owned
-        } else { params }
-    } else { params };
+        if adaptive != eff.kpbwt {
+            crate::selphi_info!("  adaptive K: kpbwt {} → {} (n_ref={})", eff.kpbwt, adaptive, n_ref);
+            eff.kpbwt = adaptive;
+            modified = true;
+        }
+    }
+    // Coverage-adaptive GL floor (LCWGS_ADAPT_MIN_GL, default OFF; honoured only when
+    // LCWGS_MIN_GL is unset). At HIGH coverage the reads manufacture confident
+    // false-HET GLs at rare hom-ref sites that the default 1e-10 floor can't catch
+    // (they sit at HL~1e-4) → raise min_gl so the emission can't lock them (the 4×
+    // rare over-trust). No-op at ≤2× (keeps 1e-10). Trades a little 5-10% for the
+    // rare/OVERALL win at high coverage (out-of-regime for lcWGS) → opt-in. Gated by
+    // the SAME mean-GL-peakedness signal the split uses (calibrated 0.5×≈0.69 … 4×≈0.89).
+    if std::env::var("LCWGS_ADAPT_MIN_GL").is_ok() && std::env::var("LCWGS_MIN_GL").is_err() {
+        let thr: f32 = std::env::var("LCWGS_SPLIT_GL_THR").ok().and_then(|x| x.parse().ok()).unwrap_or(0.84);
+        let hi: f32 = std::env::var("LCWGS_ADAPT_MIN_GL_HI").ok().and_then(|x| x.parse().ok()).unwrap_or(1e-2);
+        let (mut sum, mut cnt) = (0.0f64, 0usize);
+        for v in 0..n_shared {
+            let b = v * n_samples * 3;
+            for s in 0..n_samples {
+                let (g0, g1, g2) = (gl3_shared[b + 3 * s], gl3_shared[b + 3 * s + 1], gl3_shared[b + 3 * s + 2]);
+                let t = g0 + g1 + g2;
+                if t > 0.0 { sum += (g0.max(g1).max(g2) / t) as f64; cnt += 1; }
+            }
+        }
+        let mean_conf = if cnt > 0 { (sum / cnt as f64) as f32 } else { 1.0 };
+        if mean_conf >= thr && (hi - eff.min_gl).abs() > f32::EPSILON {
+            crate::selphi_info!("  adaptive min_gl: {} → {} (mean_conf={:.3} ≥ {:.2}, high coverage — clamp false-HETs)", eff.min_gl, hi, mean_conf, thr);
+            eff.min_gl = hi;
+            modified = true;
+        } else {
+            crate::selphi_info!("  adaptive min_gl: kept {} (mean_conf={:.3} < {:.2}, low coverage)", eff.min_gl, mean_conf, thr);
+        }
+    }
+    let params: &LcwgsParams = if modified { &eff } else { params };
 
     let (dosage, gp) = run_chunked_gibbs(&gl3_shared, srp, wgs_idx, &cm, n_samples, n_shared, params);
     Ok(LcwgsOutput { dosage, gp, n_variants: n_shared, sample_ids, variants })

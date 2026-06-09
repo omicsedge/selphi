@@ -95,6 +95,15 @@ pub struct LcwgsParams {
     /// Emission constants for the GLIMPSE2 weighted emission.
     /// `ee = 1 - epsilon` (match), `ed = epsilon` (mismatch).
     pub epsilon: f32,
+    /// Per-haplotype genotype-likelihood floor (GLIMPSE2 `min_gl`,
+    /// `makeHaplotypeLikelihoods`): the partner-conditioned per-hap likelihood in
+    /// `iterate::run_one_hap` is clamped into `[min_gl, 1 - min_gl]` so a confident-
+    /// but-erroneous read cannot drive the emission ratio past ~`1/min_gl`. Default
+    /// `1e-10` (= GLIMPSE2's default; byte-identical on panel-matched data — it only
+    /// fires on the depth-manufactured confident false-HETs that caused the 4× rare
+    /// over-trust). `0` disables. `LCWGS_MIN_GL` sets it; `LCWGS_ADAPT_MIN_GL`
+    /// coverage-scales it (see `pipeline::impute_from_gl3`).
+    pub min_gl: f32,
 }
 
 impl LcwgsParams {
@@ -166,6 +175,7 @@ impl Default for LcwgsParams {
             // chr22 1x: 1e-12 lifts OVERALL 0.9431→0.9443 and the 0.5-1% bin
             // 0.9196→0.9239 (plateaus by 1e-8). Tunable via LCWGS_EPSILON.
             epsilon: envf("LCWGS_EPSILON", 1e-12),
+            min_gl: envf("LCWGS_MIN_GL", 1e-10),
         }
     }
 }
