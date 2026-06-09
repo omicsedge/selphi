@@ -532,6 +532,299 @@ pub fn write_panel_vcf(
 }
 
 // ---------------------------------------------------------------------------
+// R2 --refine: per-chip-site input confidence c[v] ∈ [0,1]
+// ---------------------------------------------------------------------------
+
+/// Default GQ→confidence ramp endpoints (env overridable SELPHI_REFINE_GQ_LO/_HI).
+const REFINE_GQ_LO: f64 = 10.0;
+const REFINE_GQ_HI: f64 = 30.0;
+/// DP→confidence ramp endpoints (fixed; the MVP only exposes GQ tuning).
+const REFINE_DP_LO: f64 = 4.0;
+const REFINE_DP_HI: f64 = 12.0;
+
+fn refine_gq_endpoints() -> (f64, f64) {
+    let lo = std::env::var("SELPHI_REFINE_GQ_LO").ok()
+        .and_then(|s| s.parse::<f64>().ok()).unwrap_or(REFINE_GQ_LO);
+    let hi = std::env::var("SELPHI_REFINE_GQ_HI").ok()
+        .and_then(|s| s.parse::<f64>().ok()).unwrap_or(REFINE_GQ_HI);
+    (lo, hi)
+}
+
+#[inline]
+fn ramp(x: f64, lo: f64, hi: f64) -> f64 {
+    if hi <= lo { return 1.0; }
+    ((x - lo) / (hi - lo)).clamp(0.0, 1.0)
+}
+
+/// Map one sample's FORMAT subfields to a confidence in [0,1].
+/// Priority: GQ (and/or DP → min), else PL-derived GQ-equiv, else DP, else 1.0.
+/// `gq`/`dp` are the integer values (or None if absent/missing); `pl` is the
+/// parsed diploid PL triple (or None). Returns 1.0 when nothing usable is
+/// present (the site is treated as a fully trusted hard call → untouched HMM).
+#[inline]
+fn sample_confidence(
+    gq: Option<i64>, pl: Option<[i32; 3]>, dp: Option<i64>,
+    gq_lo: f64, gq_hi: f64,
+) -> f64 {
+    // GQ-equivalent: real GQ if present, else (2nd-smallest PL − smallest PL).
+    let gq_eq: Option<f64> = match gq {
+        Some(g) => Some(g as f64),
+        None => pl.map(|p| {
+            let mut s = p;
+            s.sort_unstable();
+            (s[1] - s[0]) as f64
+        }),
+    };
+    let dp_conf: Option<f64> = dp.map(|d| ramp(d as f64, REFINE_DP_LO, REFINE_DP_HI));
+    match (gq_eq, dp_conf) {
+        (Some(g), Some(d)) => ramp(g, gq_lo, gq_hi).min(d),
+        (Some(g), None) => ramp(g, gq_lo, gq_hi),
+        (None, Some(d)) => d,
+        (None, None) => 1.0,
+    }
+}
+
+/// Index of `name` in a colon-separated FORMAT spec (`b"GT:GQ:DP"` → 1 for GQ).
+#[inline]
+fn format_field_index(format_bytes: &[u8], name: &[u8]) -> Option<usize> {
+    let mut idx = 0usize;
+    let mut start = 0usize;
+    for (i, &b) in format_bytes.iter().enumerate() {
+        if b == b':' {
+            if &format_bytes[start..i] == name { return Some(idx); }
+            idx += 1;
+            start = i + 1;
+        }
+    }
+    if &format_bytes[start..] == name { Some(idx) } else { None }
+}
+
+/// Extract the n-th colon-separated subfield from a per-sample byte slice.
+#[inline]
+fn nth_subfield(field: &[u8], n: usize) -> Option<&[u8]> {
+    let mut idx = 0usize;
+    let mut start = 0usize;
+    for (i, &b) in field.iter().enumerate() {
+        if b == b':' {
+            if idx == n { return Some(&field[start..i]); }
+            idx += 1;
+            start = i + 1;
+        }
+    }
+    if idx == n { Some(&field[start..]) } else { None }
+}
+
+/// Parse a `.`-tolerant integer subfield (GQ/DP). Returns None for "." / empty
+/// / malformed (matches the "subfield absent" case → no contribution).
+#[inline]
+fn parse_int_subfield(bytes: &[u8]) -> Option<i64> {
+    if bytes.is_empty() || bytes == b"." { return None; }
+    let v = fast_parse_i64(bytes);
+    if v < 0 { None } else { Some(v) }
+}
+
+/// Parse a `pl00,pl01,pl11` triple from a FORMAT PL subfield. None if missing /
+/// not exactly three comma-separated non-negative ints.
+#[inline]
+fn parse_pl_triple(bytes: &[u8]) -> Option<[i32; 3]> {
+    if bytes.is_empty() || bytes == b"." { return None; }
+    let mut out = [0i32; 3];
+    let mut idx = 0usize;
+    let mut start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b',' {
+            if idx >= 3 { return None; }
+            let s = &bytes[start..i];
+            let v = fast_parse_i64(s);
+            if v < 0 { return None; }
+            out[idx] = v as i32;
+            idx += 1;
+            start = i + 1;
+        }
+    }
+    if idx != 2 { return None; }
+    let v = fast_parse_i64(&bytes[start..]);
+    if v < 0 { return None; }
+    out[2] = v as i32;
+    Some(out)
+}
+
+/// Compute the per-marker confidence for one VCF data line's per-sample region.
+/// MVP = the MINIMUM confidence across samples (a site is "soft" if ANY sample
+/// is soft). When the FORMAT carries none of GQ/PL/DP, every sample yields 1.0
+/// → the marker is fully trusted (untouched HMM).
+fn line_min_confidence(
+    format_bytes: &[u8], gt_region: &[u8], n_samples: usize, gq_lo: f64, gq_hi: f64,
+) -> f64 {
+    let gq_i = format_field_index(format_bytes, b"GQ");
+    let pl_i = format_field_index(format_bytes, b"PL");
+    let dp_i = format_field_index(format_bytes, b"DP");
+    if gq_i.is_none() && pl_i.is_none() && dp_i.is_none() {
+        return 1.0;
+    }
+    let mut min_c = f64::INFINITY;
+    let mut field_start = 0usize;
+    for _ in 0..n_samples {
+        let field_end = gt_region[field_start..]
+            .iter().position(|&b| b == b'\t')
+            .map(|p| field_start + p)
+            .unwrap_or(gt_region.len());
+        let field = &gt_region[field_start..field_end];
+        let gq = gq_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
+        let pl = pl_i.and_then(|i| nth_subfield(field, i)).and_then(parse_pl_triple);
+        let dp = dp_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
+        let c = sample_confidence(gq, pl, dp, gq_lo, gq_hi);
+        if c < min_c { min_c = c; }
+        field_start = if field_end < gt_region.len() { field_end + 1 } else { gt_region.len() };
+    }
+    if min_c.is_finite() { min_c } else { 1.0 }
+}
+
+/// FORMAT spec bytes from a VCF data line (field 9, between the 9th tab and the
+/// next tab/EOL). Mirrors `split_vcf_fields` (which only captures up to field 9).
+#[inline]
+fn vcf_format_bytes(line: &[u8]) -> Option<&[u8]> {
+    let mut tab = 0usize;
+    let mut last = 0usize;
+    for (i, &b) in line.iter().enumerate() {
+        if b == b'\t' {
+            tab += 1;
+            if tab == 9 {
+                let rest = &line[i + 1..];
+                let end = rest.iter().position(|&b| b == b'\t').unwrap_or(rest.len());
+                return Some(&rest[..end]);
+            }
+            last = i;
+        }
+    }
+    let _ = last;
+    None
+}
+
+/// `--refine`: read the target VCF/BCF a second time and compute one confidence
+/// value c ∈ [0,1] per RETAINED marker, in the SAME order `read_target_vcf`
+/// produced its `markers` (it uses the identical `split_vcf_fields` skip logic /
+/// BCF dispatch). The result must be re-indexed into chip-site order by the
+/// caller via `target_idx` (see [`align_confidence_to_chip`]). Markers with no
+/// usable GQ/PL/DP yield 1.0 (untouched).
+///
+/// Returns one f64 per marker (file order, parallel to `read_target_vcf`'s
+/// `markers`). The hard-call path (`read_target_vcf` / `parse_gt_region`) is
+/// NOT touched — this is an additive, opt-in pass.
+pub fn extract_target_site_confidence(path: &str) -> Vec<f64> {
+    let (gq_lo, gq_hi) = refine_gq_endpoints();
+
+    // Real (binary) BCF → noodles decoder; mirror read_target_vcf's dispatch.
+    if path.ends_with(".bcf") {
+        return extract_site_confidence_bcf(path, gq_lo, gq_hi);
+    }
+    let raw = read_vcf_raw(path);
+    if raw.starts_with(b"BCF\x02\x02") {
+        return extract_site_confidence_bcf(path, gq_lo, gq_hi);
+    }
+
+    let mut conf: Vec<f64> = Vec::new();
+    let mut n_samples = 0usize;
+    for line in raw.split(|&b| b == b'\n') {
+        if line.is_empty() || line.starts_with(b"##") { continue; }
+        if line.starts_with(b"#CHROM") {
+            let n_tabs = line.iter().filter(|&&b| b == b'\t').count();
+            n_samples = n_tabs.saturating_sub(8); // 9 fixed cols → tabs 1..8 before samples
+            continue;
+        }
+        // Identical retention rule to read_target_vcf.
+        let Some(f) = split_vcf_fields(line) else { continue };
+        let c = match vcf_format_bytes(line) {
+            Some(fmt) => line_min_confidence(fmt, f.gt_region, n_samples, gq_lo, gq_hi),
+            None => 1.0,
+        };
+        conf.push(c);
+    }
+    conf
+}
+
+/// BCF path for [`extract_target_site_confidence`]. Walks records in the same
+/// order + with the same retention rule as `read_target_bcf`.
+/// Decoded BCF `PL` sample value (integer array) → `[pl00, pl01, pl11]`.
+/// `None` if absent / non-integer / fewer than three present elements.
+fn bcf_value_to_pl3(
+    v: &noodles_vcf::variant::record_buf::samples::sample::value::Value,
+) -> Option<[i32; 3]> {
+    use noodles_vcf::variant::record_buf::samples::sample::value::{Array, Value};
+    match v {
+        Value::Array(Array::Integer(vals)) if vals.len() >= 3 => Some([vals[0]?, vals[1]?, vals[2]?]),
+        _ => None,
+    }
+}
+
+fn extract_site_confidence_bcf(path: &str, gq_lo: f64, gq_hi: f64) -> Vec<f64> {
+    use noodles_bcf as bcf;
+    use noodles_vcf::variant::record_buf::samples::sample::Value;
+
+    let mut reader = match bcf::io::reader::Builder::default().build_from_path(path) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let header = match reader.read_header() { Ok(h) => h, Err(_) => return Vec::new() };
+
+    let int_val = |v: &Value| -> Option<i64> {
+        match v {
+            Value::Integer(i) => Some(*i as i64),
+            _ => None,
+        }
+    };
+
+    let mut conf = Vec::new();
+    for result in reader.record_bufs(&header) {
+        let rec = match result { Ok(r) => r, Err(_) => continue };
+        // Same retention rule as read_target_bcf.
+        let pos = match rec.variant_start() { Some(p) => usize::from(p) as i64, None => continue };
+        if pos < 1 { continue; }
+        let keep = matches!(rec.alternate_bases().as_ref().first(), Some(a) if a != "." && !a.is_empty());
+        if !keep { continue; }
+
+        let samples = rec.samples();
+        let mut min_c = f64::INFINITY;
+        let mut any_field = false;
+        for sample in samples.values() {
+            let gq = sample.get("GQ").flatten().and_then(int_val);
+            let dp = sample.get("DP").flatten().and_then(int_val);
+            // PL triple (first three values) if present.
+            let pl: Option<[i32; 3]> = match sample.get("PL").flatten() {
+                Some(v) => bcf_value_to_pl3(v),
+                _ => None,
+            };
+            if gq.is_some() || pl.is_some() || dp.is_some() { any_field = true; }
+            let c = sample_confidence(gq, pl, dp, gq_lo, gq_hi);
+            if c < min_c { min_c = c; }
+        }
+        conf.push(if any_field && min_c.is_finite() { min_c } else { 1.0 });
+    }
+    conf
+}
+
+/// Re-index a per-marker (file-order) confidence vector into post-intersection
+/// chip-site order via `target_idx` (chip site i → target marker index). The
+/// result is `n_chip` long, aligned to `chip_cm` / the HMM. Out-of-range or
+/// missing entries default to 1.0 (untouched). Returns `None` (→ no softening
+/// anywhere) when every chip site is fully confident, so the whole pipeline is
+/// byte-identical to the shipped path for a confident input.
+pub fn align_confidence_to_chip(
+    marker_conf: &[f64], target_idx: &[usize], n_chip: usize,
+) -> Option<Vec<f64>> {
+    let mut out = vec![1.0f64; n_chip];
+    let mut any_soft = false;
+    for (ci, &ti) in target_idx.iter().enumerate().take(n_chip) {
+        if ti < marker_conf.len() {
+            let c = marker_conf[ti].clamp(0.0, 1.0);
+            out[ci] = c;
+            if c < 1.0 { any_soft = true; }
+        }
+    }
+    if any_soft { Some(out) } else { None }
+}
+
+// ---------------------------------------------------------------------------
 // extract_target_alleles
 // ---------------------------------------------------------------------------
 

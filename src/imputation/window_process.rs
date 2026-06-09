@@ -54,6 +54,10 @@ pub struct ImputeWindowInputs<'a> {
     pub targ_alleles: &'a HaplotypeBitmatrix, // (n_chip sites × n_haps) full target, bit-packed
     pub chip_cm: &'a [f64],               // per-chip genetic distances (cM), full length
     pub ne_per_site: Option<&'a [f64]>,   // per-site Ne (from phasing EM), full length
+    /// R2 `--refine` per-chip-site input confidence c[v] ∈ [0,1] (full length,
+    /// post-intersection chip-site order). `None` when refine is off → the HMM
+    /// emission is the shipped scalar `p_err` path (bit-identical).
+    pub site_conf: Option<&'a [f64]>,
     pub chip_start: usize,
     pub chip_end: usize,
 }
@@ -102,9 +106,14 @@ pub fn impute_window(
         ne[inputs.chip_start..inputs.chip_end].to_vec()
     });
 
+    // Slice the per-chip-site confidence to this window (same indexing as cm_w).
+    let conf_w: Option<Vec<f64>> = inputs.site_conf.map(|c| {
+        c[inputs.chip_start..inputs.chip_end].to_vec()
+    });
+
     process_window_hmm(
         params, inputs.ref_bm, targ_w, cm_w,
-        ne_w.as_deref(), &coded,
+        ne_w.as_deref(), conf_w.as_deref(), &coded,
         precomputed_candidates,
         hap_priors, inputs.chip_start, n_var_w,
         on_batch_done,
@@ -135,6 +144,7 @@ pub fn process_window_hmm(
     targ_w: &[u8],
     cm_w: &[f64],
     ne_w: Option<&[f64]>,
+    conf_w: Option<&[f64]>,
     coded: &pbwt::CodedSteps,
     precomputed_candidates: Option<&Vec<Vec<u32>>>,
     hap_priors: &mut [Option<Vec<f64>>],
@@ -239,7 +249,7 @@ pub fn process_window_hmm(
                     est_ne, p_err,
                     Some(super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start }),
                     n_var_w, None,
-                    ne_w, prior, 0.0, params.compute_posterior,
+                    ne_w, prior, conf_w, 0.0, params.compute_posterior,
                 ));
             }
 
@@ -281,7 +291,7 @@ pub fn process_window_hmm(
                 est_ne, p_err,
                 Some(super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start }),
                 n_var_w, None,
-                ne_w, prior, 0.0, params.compute_posterior,
+                ne_w, prior, conf_w, 0.0, params.compute_posterior,
             ))
         })
         .collect();
