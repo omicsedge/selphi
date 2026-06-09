@@ -799,10 +799,15 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     };
     // R3 re-route threshold: chip sites with confidence < thr are emitted as the
     // HMM/panel-derived (imputed) dosage instead of verbatim hard calls. From
-    // env SELPHI_REFINE_THR (default 0.5). Only consulted when site_conf is Some.
+    // env SELPHI_REFINE_THR (default 0.1). 0.1 tuned on GIAB HG002 4x (chr22:20-30Mb,
+    // leak-free panel): the conf distribution is bimodal — refining the c≈0 mass
+    // (~all soft sites at thr∈[0.02,0.1]) gives the peak OVERALL R² 0.8887→0.9107
+    // (+0.0220); pushing thr higher only adds borderline calls (c∈[0.1,0.95]) where
+    // the input ≈ the panel and slightly hurts. 0.1 is the top-of-plateau optimum AND
+    // the safest (fewest re-routes). Only consulted when site_conf is Some (--refine).
     let refine_thr: f64 = std::env::var("SELPHI_REFINE_THR").ok()
         .and_then(|s| s.trim().parse::<f64>().ok())
-        .unwrap_or(0.5);
+        .unwrap_or(0.1);
 
     // Resolve auto max_candidates and the batched-output cap BEFORE memory
     // estimation so the estimator reflects the actual runtime configuration
