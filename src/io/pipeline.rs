@@ -44,11 +44,47 @@ pub(crate) struct WindowSetup<'a> {
     pub n_ref_variants: usize,
     pub chunk_size: usize,
     pub is_chip: Vec<bool>,
+    /// R4b: true for EVERY input chip site (set when `chip_local_idx` is
+    /// assigned), NOT flipped by softness — unlike `is_chip`, which stays true
+    /// only for fully-confident sites that emit a verbatim record. At a
+    /// re-routed (soft) site, `is_chip=false` but `is_input_chip=true`, which is
+    /// what lets the imputed formatters preserve confident samples' hard calls.
+    pub is_input_chip: Vec<bool>,
     pub chip_local_idx: Vec<usize>,
     pub intervals: Vec<Interval>,
     pub weight_refs: Vec<&'a CsrWeights>,
     pub vid_prefixes: Vec<Vec<u8>>,
     pub an_str: Vec<u8>,
+    /// R4b: per-(chip-site, sample) input confidence, row-major
+    /// `[chip_site * n_samples + sample]` (chip-site = post-intersection index,
+    /// the same value stored in `chip_local_idx`). `None` when refine is off or
+    /// the per-sample matrix is unavailable → `use_hardcall` is always false and
+    /// the imputed branch is byte-identical to pre-R4b.
+    pub site_conf_per_sample: Option<Vec<f64>>,
+    pub refine_thr: f64,
+    pub n_samples: usize,
+}
+
+impl WindowSetup<'_> {
+    /// R4b: should sample `s` at window-local variant `local_i` emit its
+    /// VERBATIM chip hard call (instead of the panel `alt_probs`)?
+    ///
+    /// True only at an INPUT chip site whose per-sample confidence is at/above
+    /// `refine_thr`. Always false when `site_conf_per_sample` is `None` (refine
+    /// off) — so every imputed formatter degrades to its pre-R4b behavior and
+    /// the imputed branch is only ever hit for genuine non-chip sites.
+    #[inline]
+    pub fn use_hardcall(&self, local_i: usize, s: usize) -> bool {
+        if !self.is_input_chip[local_i] { return false; }
+        match self.site_conf_per_sample.as_ref() {
+            None => false,
+            Some(conf) => {
+                let ci = self.chip_local_idx[local_i];
+                conf.get(ci * self.n_samples + s)
+                    .is_some_and(|&c| c >= self.refine_thr)
+            }
+        }
+    }
 }
 
 /// Partition `intervals` into contiguous batches each spanning at most
@@ -126,6 +162,7 @@ impl<'a> WindowSetup<'a> {
         wgs_idx: &[usize],
         n_samples: usize,
         site_conf: Option<&[f64]>,
+        site_conf_per_sample: Option<&[f64]>,
         refine_thr: f64,
     ) -> Self {
         let n_haps = n_samples * 2;
@@ -138,6 +175,8 @@ impl<'a> WindowSetup<'a> {
 
         let window_len = own_wgs_end - own_wgs_start;
         let mut is_chip = vec![false; window_len];
+        // R4b: true for ALL input chip sites (not flipped by softness).
+        let mut is_input_chip = vec![false; window_len];
         let mut chip_local_idx = vec![0usize; window_len];
         // R3: under --refine, a low-confidence chip site is re-routed to the
         // imputed output branch (its OWN call becomes the HMM/panel dosage). We
@@ -152,6 +191,7 @@ impl<'a> WindowSetup<'a> {
             let wi = wgs_idx[ci];
             if wi >= own_wgs_start && wi < own_wgs_end && wi < n_ref_variants {
                 chip_local_idx[wi - own_wgs_start] = ci;
+                is_input_chip[wi - own_wgs_start] = true;
                 let soft = site_conf.is_some_and(|c| c.get(ci).is_some_and(|&x| x < refine_thr));
                 if soft {
                     n_rerouted += 1; // is_chip stays false → falls into imputed branch
@@ -190,8 +230,10 @@ impl<'a> WindowSetup<'a> {
 
         WindowSetup {
             own_wgs_start, own_wgs_end, n_haps, n_ref_variants,
-            chunk_size, is_chip, chip_local_idx, intervals,
+            chunk_size, is_chip, is_input_chip, chip_local_idx, intervals,
             weight_refs, vid_prefixes, an_str,
+            site_conf_per_sample: site_conf_per_sample.map(|c| c.to_vec()),
+            refine_thr, n_samples,
         }
     }
 }
@@ -406,11 +448,27 @@ fn format_tile_batch(
     chip_genotypes: &crate::common::HaplotypeBitmatrix,
     an_str: &[u8],
     no_ap: bool,
+    // R4b: per-(chip-site,sample) hard-call preservation at re-routed sites.
+    is_input_chip: &[bool],
+    site_conf_per_sample: Option<&[f64]>,
+    refine_thr: f64,
 ) -> Vec<u8> {
     // Validate dimensions
     debug_assert!(alt_probs.len() >= n_haps * tile_n,
         "alt_probs too small: {} < {} * {}", alt_probs.len(), n_haps, tile_n);
     if tile_n == 0 { return Vec::new(); }
+    // R4b helper: at an input chip site, sample `s` with confidence >= thr keeps
+    // its verbatim hard call; everything else uses the panel alt_probs. Always
+    // false when site_conf_per_sample is None (refine off) → pre-R4b behavior.
+    let use_hardcall = |local_i: usize, s: usize| -> bool {
+        is_input_chip[local_i] && match site_conf_per_sample {
+            None => false,
+            Some(conf) => {
+                let ci = chip_local_idx[local_i];
+                conf.get(ci * n_samples + s).is_some_and(|&c| c >= refine_thr)
+            }
+        }
+    };
     let n_chunks = 16.min(tile_n);
     let chunk_size = tile_n.div_ceil(n_chunks);
 
@@ -434,13 +492,27 @@ fn format_tile_batch(
                 append_chip_line_bytes(&mut buf, vid_prefix_offset + v, ci,
                     vid_prefixes, chip_genotypes, n_haps, n_samples, an_str);
             } else {
+                let ci = chip_local_idx[local_i];
+                // R4b: per-sample (ap1, ap2). A confident sample at an input chip
+                // site contributes its verbatim hard call (0.0/1.0 per hap); every
+                // other sample contributes the panel alt_probs. Used for both the
+                // AC/AF/DR2 stats AND the per-sample FORMAT fields so stats track
+                // the actually-emitted dosages.
+                let sample_ap = |s: usize| -> (f32, f32) {
+                    if use_hardcall(local_i, s) {
+                        (chip_genotypes.get(ci, s * 2) as u8 as f32,
+                         chip_genotypes.get(ci, s * 2 + 1) as u8 as f32)
+                    } else {
+                        (alt_probs[(s * 2) * tile_n + v], alt_probs[(s * 2 + 1) * tile_n + v])
+                    }
+                };
                 // Single pass: compute stats AND format simultaneously.
                 // Write prefix + INFO first (need stats), then samples.
                 // Two-pass DR2 (var(dosage)/var_expected) via the shared helper —
                 // byte-identical f64 accumulation to the former inlined two passes.
                 let (ac, dr2) = crate::io::dosage_stats::imputed_ac_dr2(
                     n_samples, n_haps,
-                    |s| (alt_probs[(s * 2) * tile_n + v], alt_probs[(s * 2 + 1) * tile_n + v]),
+                    sample_ap,
                     &mut ds_scratch,
                 );
                 let af = ac as f64 / n_haps as f64;
@@ -471,8 +543,7 @@ fn format_tile_batch(
                 const HOMALT_GTDS_AP: &[u8] = b"\t1|1:2:1:1";
 
                 for s in 0..n_samples {
-                    let ap1 = alt_probs[(s * 2) * tile_n + v];
-                    let ap2 = alt_probs[(s * 2 + 1) * tile_n + v];
+                    let (ap1, ap2) = sample_ap(s);
 
                     // Fast path: dosage rounds exactly to 0 or 2 at 3-decimal precision.
                     if ap1 < 0.0005 && ap2 < 0.0005 {
@@ -619,6 +690,10 @@ fn format_tile_batch_bcf(
     chip_local_idx: &[usize],
     chip_genotypes: &crate::common::HaplotypeBitmatrix,
     no_ap: bool,
+    // R4b: per-(chip-site,sample) hard-call preservation at re-routed sites.
+    is_input_chip: &[bool],
+    site_conf_per_sample: Option<&[f64]>,
+    refine_thr: f64,
 ) -> Vec<u8> {
     use super::bcf_encode;
 
@@ -636,6 +711,9 @@ fn format_tile_batch_bcf(
         // Per-chunk reusable dosage scratch for the imputed two-pass DR2 helper
         // (allocated once per parallel chunk, not per variant).
         let mut ds_scratch = vec![0f32; n_samples];
+        // R4b: per-chunk reusable per-sample hard-call mask, filled only at a
+        // re-routed input chip site when a per-sample confidence matrix exists.
+        let mut hc_mask = vec![false; n_samples];
 
         for v in v_start..v_end {
             let wgs_i = global_start + v;
@@ -649,9 +727,28 @@ fn format_tile_batch_bcf(
                     chip_genotypes, chip_local_idx[local_i], n_samples, n_haps,
                 );
             } else {
+                // R4b: build the per-sample preserve-hard-call mask for this
+                // re-routed input chip site (no-op when refine off / not a chip).
+                let hc = match (is_input_chip[local_i], site_conf_per_sample) {
+                    (true, Some(conf)) => {
+                        let ci = chip_local_idx[local_i];
+                        let base = ci * n_samples;
+                        let mut any = false;
+                        for s in 0..n_samples {
+                            let keep = conf.get(base + s).is_some_and(|&c| c >= refine_thr);
+                            hc_mask[s] = keep;
+                            any |= keep;
+                        }
+                        if any {
+                            Some(bcf_encode::R4bHardcall { chip_genotypes, chip_idx: ci, mask: &hc_mask, sample_offset: 0 })
+                        } else { None }
+                    }
+                    _ => None,
+                };
                 bcf_encode::encode_imputed_record(
                     &mut buf, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
                     alt_probs, tile_n, v, n_samples, n_haps, no_ap, &mut ds_scratch,
+                    hc.as_ref(),
                 );
             }
         }
@@ -758,6 +855,12 @@ pub struct WindowInput<'a> {
     /// R3 --refine: per-chip-site input confidence (chip-site order). `None`
     /// when refine is off or every retained site is fully confident.
     pub site_conf: Option<&'a [f64]>,
+    /// R4b --refine: per-(chip-site, sample) input confidence, row-major
+    /// `[chip_site * n_samples + sample]`. Drives PER-SAMPLE output at a
+    /// re-routed (soft) site: a sample with confidence `>= refine_thr` emits its
+    /// verbatim hard call, a soft sample gets the panel `alt_probs`. `None` →
+    /// imputed branch is byte-identical to pre-R4b.
+    pub site_conf_per_sample: Option<&'a [f64]>,
     /// R3 --refine: chip sites with confidence `< refine_thr` re-route to the
     /// imputed output branch. Ignored when `site_conf` is `None`.
     pub refine_thr: f64,
@@ -782,14 +885,14 @@ pub fn write_window_multiformat(
     let WindowInput {
         srp, all_weights, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples, chip_genotypes, no_ap,
-        preloaded_chunks, preloaded_stripes, site_conf, refine_thr,
+        preloaded_chunks, preloaded_stripes, site_conf, site_conf_per_sample, refine_thr,
     } = input;
     let WindowWriters { parquet: parquet_writer, pgen: pgen_writer, selfdecode: sd_writer, vcf_tx } = writers;
 
     let setup = WindowSetup::new(
         srp, all_weights, win_chip_start,
         own_chip_start, own_chip_end, wgs_idx, n_samples,
-        site_conf, refine_thr,
+        site_conf, site_conf_per_sample, refine_thr,
     );
 
     if setup.intervals.is_empty() {
@@ -830,6 +933,8 @@ pub fn write_window_multiformat(
     let mut sd_gt2 = if formats.selfdecode { vec![0i32; n_samples] } else { Vec::new() };
     let mut sd_ap1 = if formats.selfdecode { vec![0.0f32; n_samples] } else { Vec::new() };
     let mut sd_ap2 = if formats.selfdecode { vec![0.0f32; n_samples] } else { Vec::new() };
+    // R4b: reusable per-sample hard-call mask for the PGEN/SD imputed branch.
+    let mut sd_hc_mask = if formats.selfdecode { vec![false; n_samples] } else { Vec::new() };
 
     // Macro: encode chip sites in [next_wgs..end) gap
     macro_rules! emit_chip_gap {
@@ -865,7 +970,7 @@ pub fn write_window_multiformat(
                             }
                             if let Some(ref mut sd) = sdw {
                                 let pos: i32 = pos_str.parse().unwrap_or(0);
-                                sd.write_variant(chrom, pos, oid, ref_a, alt_a, &sd_gt1, &sd_gt2, &sd_ap1, &sd_ap2, true)?;
+                                sd.write_variant(chrom, pos, oid, ref_a, alt_a, &sd_gt1, &sd_gt2, &sd_ap1, &sd_ap2, true, None)?;
                             }
                         }
                     }
@@ -884,7 +989,9 @@ pub fn write_window_multiformat(
                     $alt_probs, $tile_n, setup.n_haps, n_samples,
                     $global_start, setup.n_ref_variants,
                     vp_start, &setup.vid_prefixes, &setup.is_chip, &setup.chip_local_idx,
-                    chip_genotypes, &setup.an_str, no_ap)).expect("VCF send failed");
+                    chip_genotypes, &setup.an_str, no_ap,
+                    &setup.is_input_chip, setup.site_conf_per_sample.as_deref(), setup.refine_thr,
+                )).expect("VCF send failed");
             }
             if formats.bcf {
                 let vi = var_infos.as_ref().unwrap();
@@ -893,7 +1000,9 @@ pub fn write_window_multiformat(
                     $alt_probs, $tile_n, setup.n_haps, n_samples,
                     $global_start, setup.n_ref_variants,
                     vi_start, vi, &setup.is_chip, &setup.chip_local_idx,
-                    chip_genotypes, no_ap)).expect("VCF send failed");
+                    chip_genotypes, no_ap,
+                    &setup.is_input_chip, setup.site_conf_per_sample.as_deref(), setup.refine_thr,
+                )).expect("VCF send failed");
             }
             if let Some((ref mut writer, _)) = pw {
                 if let Some(ref sa) = schema_arc {
@@ -901,7 +1010,8 @@ pub fn write_window_multiformat(
                     super::parquet_output::write_tile_to_parquet(
                         writer, sa, $alt_probs, $tile_n, n_samples, setup.n_haps,
                         $global_start, &setup.vid_prefixes, vp_start, &setup.is_chip,
-                        &setup.chip_local_idx, chip_genotypes, setup.n_ref_variants)?;
+                        &setup.chip_local_idx, chip_genotypes, setup.n_ref_variants,
+                        &setup.is_input_chip, setup.site_conf_per_sample.as_deref(), setup.refine_thr)?;
                 }
             }
             if formats.pgen || formats.selfdecode {
@@ -920,15 +1030,28 @@ pub fn write_window_multiformat(
                             fill_chip_sd(&mut sd_gt1, &mut sd_gt2, &mut sd_ap1, &mut sd_ap2, chip_genotypes, ci, setup.n_haps, n_samples);
                         }
                     } else {
+                        // R4b: at a re-routed input chip site, a confident sample
+                        // (conf >= thr) emits its verbatim hard call; soft samples
+                        // (and pure-imputed sites) use the panel alt_probs.
+                        let mut any_hc = false;
                         for s in 0..n_samples {
-                            let ap1 = $alt_probs[(s * 2) * $tile_n + v];
-                            let ap2 = $alt_probs[(s * 2 + 1) * $tile_n + v];
+                            let hc = setup.use_hardcall(local_i, s);
+                            if formats.selfdecode { sd_hc_mask[s] = hc; }
+                            any_hc |= hc;
+                            let ci = setup.chip_local_idx[local_i];
+                            let (ap1, ap2) = if hc {
+                                (chip_genotypes.get(ci, s * 2) as u8 as f32,
+                                 chip_genotypes.get(ci, s * 2 + 1) as u8 as f32)
+                            } else {
+                                ($alt_probs[(s * 2) * $tile_n + v], $alt_probs[(s * 2 + 1) * $tile_n + v])
+                            };
                             if formats.pgen {
                                 dosages[s] = ap1 + ap2;
                                 hardcalls[s] = if dosages[s] > 1.5 { 2 } else if dosages[s] > 0.5 { 1 } else { 0 };
                             }
                             if formats.selfdecode { sd_gt1[s] = if ap1 > 0.5 { 1 } else { 0 }; sd_gt2[s] = if ap2 > 0.5 { 1 } else { 0 }; sd_ap1[s] = ap1; sd_ap2[s] = ap2; }
                         }
+                        let _ = any_hc;
                     }
                     if let Some((ref mut pg, ref mut pv)) = pgw {
                         super::pgen_output::write_pvar_variant(pv, chrom, pos_str, oid, ref_a, alt_a)?;
@@ -936,7 +1059,13 @@ pub fn write_window_multiformat(
                     }
                     if let Some(ref mut sd) = sdw {
                         let pos: i32 = pos_str.parse().unwrap_or(0);
-                        sd.write_variant(chrom, pos, oid, ref_a, alt_a, &sd_gt1, &sd_gt2, &sd_ap1, &sd_ap2, is_chip_var)?;
+                        // R4b: pass the per-sample mask only at re-routed (imputed)
+                        // input chip sites; chip + pure-imputed sites pass None.
+                        let sd_mask: Option<&[bool]> = if !is_chip_var
+                            && setup.is_input_chip[local_i]
+                            && setup.site_conf_per_sample.is_some()
+                        { Some(&sd_hc_mask) } else { None };
+                        sd.write_variant(chrom, pos, oid, ref_a, alt_a, &sd_gt1, &sd_gt2, &sd_ap1, &sd_ap2, is_chip_var, sd_mask)?;
                     }
                 }
             }

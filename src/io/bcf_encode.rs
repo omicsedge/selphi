@@ -175,15 +175,46 @@ fn finalize_record(buf: &mut [u8], shared_start: usize, indiv_start: usize) {
     buf[shared_start + 4..shared_start + 8].copy_from_slice(&l_indiv.to_le_bytes());
 }
 
+/// R4b: per-sample hard-call override for an imputed record at a re-routed chip
+/// site. `mask[s]` true → sample `s` emits its VERBATIM chip hard call (from
+/// `chip_genotypes` at `chip_idx`) instead of `alt_probs`. `None`/absent →
+/// pre-R4b behavior (every sample from `alt_probs`).
+pub struct R4bHardcall<'a> {
+    pub chip_genotypes: &'a crate::common::HaplotypeBitmatrix,
+    pub chip_idx: usize,
+    /// Per-(batch-local) sample mask. `mask[s_local]` true → preserve hard call.
+    pub mask: &'a [bool],
+    /// Global sample index of the encoder's first sample (0 for the full,
+    /// non-batched encoder; this batch's `sample_start` for the partial path).
+    /// `chip_genotypes` is always indexed by the GLOBAL sample.
+    pub sample_offset: usize,
+}
+
+/// Resolve sample `s`'s emitted `(ap1, ap2)` for an imputed record, applying the
+/// R4b hard-call override when present. The hard call yields per-hap allele
+/// values (0.0/1.0); otherwise the panel `alt_probs`. `s` is the encoder-local
+/// sample index (matches the `alt_probs` / `mask` layout); the chip matrix is
+/// indexed by the global sample (`sample_offset + s`).
+#[inline]
+fn r4b_ap(alt_probs: &[f32], tile_n: usize, v: usize, s: usize, hc: Option<&R4bHardcall>) -> (f32, f32) {
+    if let Some(h) = hc {
+        if h.mask[s] {
+            let gs = h.sample_offset + s;
+            return (h.chip_genotypes.get(h.chip_idx, gs * 2) as u8 as f32,
+                    h.chip_genotypes.get(h.chip_idx, gs * 2 + 1) as u8 as f32);
+        }
+    }
+    (alt_probs[(s * 2) * tile_n + v], alt_probs[(s * 2 + 1) * tile_n + v])
+}
+
 /// Emit the imputed GT FORMAT field: 2 int8 alleles/sample, hardcalled from the
 /// per-hap ALT probabilities at the 0.5 threshold (hap 1 unphased, hap 2 phased).
 #[inline]
-fn emit_gt_imputed(buf: &mut Vec<u8>, alt_probs: &[f32], tile_n: usize, v: usize, n_samples: usize) {
+fn emit_gt_imputed(buf: &mut Vec<u8>, alt_probs: &[f32], tile_n: usize, v: usize, n_samples: usize, hc: Option<&R4bHardcall>) {
     encode_typed_int8(buf, FMT_GT_IDX as i32);
     buf.push(0x20 | TY_INT8); // n=2, type=int8
     for s in 0..n_samples {
-        let ap1 = alt_probs[(s * 2) * tile_n + v];
-        let ap2 = alt_probs[(s * 2 + 1) * tile_n + v];
+        let (ap1, ap2) = r4b_ap(alt_probs, tile_n, v, s, hc);
         // GT encoding: (allele + 1) << 1 | phased_bit
         let g1 = if ap1 > 0.5 { 0x04u8 } else { 0x02u8 }; // (1+1)<<1=4 or (0+1)<<1=2
         let g2 = if ap2 > 0.5 { 0x05u8 } else { 0x03u8 }; // |1 for phased
@@ -194,31 +225,30 @@ fn emit_gt_imputed(buf: &mut Vec<u8>, alt_probs: &[f32], tile_n: usize, v: usize
 
 /// Emit the imputed DS FORMAT field: one float32 dosage (`ap1 + ap2`) per sample.
 #[inline]
-fn emit_ds_imputed(buf: &mut Vec<u8>, alt_probs: &[f32], tile_n: usize, v: usize, n_samples: usize) {
+fn emit_ds_imputed(buf: &mut Vec<u8>, alt_probs: &[f32], tile_n: usize, v: usize, n_samples: usize, hc: Option<&R4bHardcall>) {
     encode_typed_int8(buf, FMT_DS_IDX as i32);
     buf.push(0x10 | TY_FLOAT); // n=1, type=float
     for s in 0..n_samples {
-        let ap1 = alt_probs[(s * 2) * tile_n + v];
-        let ap2 = alt_probs[(s * 2 + 1) * tile_n + v];
+        let (ap1, ap2) = r4b_ap(alt_probs, tile_n, v, s, hc);
         buf.extend_from_slice(&(ap1 + ap2).to_le_bytes());
     }
 }
 
 /// Emit the imputed AP1 + AP2 FORMAT fields: per-hap ALT dose float32s.
 #[inline]
-fn emit_ap_imputed(buf: &mut Vec<u8>, alt_probs: &[f32], tile_n: usize, v: usize, n_samples: usize) {
+fn emit_ap_imputed(buf: &mut Vec<u8>, alt_probs: &[f32], tile_n: usize, v: usize, n_samples: usize, hc: Option<&R4bHardcall>) {
     // AP1: key=AP1_IDX, type=float32, n_per_sample=1
     encode_typed_int8(buf, FMT_AP1_IDX as i32);
     buf.push(0x10 | TY_FLOAT);
     for s in 0..n_samples {
-        let ap1 = alt_probs[(s * 2) * tile_n + v];
+        let (ap1, _) = r4b_ap(alt_probs, tile_n, v, s, hc);
         buf.extend_from_slice(&ap1.to_le_bytes());
     }
     // AP2: key=AP2_IDX, type=float32, n_per_sample=1
     encode_typed_int8(buf, FMT_AP2_IDX as i32);
     buf.push(0x10 | TY_FLOAT);
     for s in 0..n_samples {
-        let ap2 = alt_probs[(s * 2 + 1) * tile_n + v];
+        let (_, ap2) = r4b_ap(alt_probs, tile_n, v, s, hc);
         buf.extend_from_slice(&ap2.to_le_bytes());
     }
 }
@@ -262,17 +292,21 @@ pub fn encode_imputed_record(
     n_haps: usize,
     no_ap: bool,
     ds_scratch: &mut [f32], // reusable per-sample dosage buffer (len >= n_samples)
+    // R4b: per-sample hard-call override at a re-routed chip site. `None` →
+    // pre-R4b behavior (byte-identical when refine is off).
+    hc: Option<&R4bHardcall>,
 ) {
     let n_fmt: u8 = if no_ap { 2 } else { 4 }; // GT+DS or GT+DS+AP1+AP2
     let n_info: u16 = 5; // AF, AC, AN, DR2, IMP
 
     // Hardcall ALT count + dosage-R² via the shared two-pass helper (the same
     // math the batched merger and the VCF/Parquet writers use), so the
-    // variance computation lives in exactly one place.
+    // variance computation lives in exactly one place. R4b: stats track the
+    // actually-emitted per-sample dosage (hard call for confident samples).
     let (ac, dr2_f64) = crate::io::dosage_stats::imputed_ac_dr2(
         n_samples,
         n_haps,
-        |s| (alt_probs[(s * 2) * tile_n + v], alt_probs[(s * 2 + 1) * tile_n + v]),
+        |s| r4b_ap(alt_probs, tile_n, v, s, hc),
         ds_scratch,
     );
     let af = ac as f32 / n_haps as f32;
@@ -296,10 +330,10 @@ pub fn encode_imputed_record(
     buf.push(0x00); // IMP flag: missing-typed (no value)
 
     let indiv_start = buf.len();
-    emit_gt_imputed(buf, alt_probs, tile_n, v, n_samples);
-    emit_ds_imputed(buf, alt_probs, tile_n, v, n_samples);
+    emit_gt_imputed(buf, alt_probs, tile_n, v, n_samples, hc);
+    emit_ds_imputed(buf, alt_probs, tile_n, v, n_samples, hc);
     if !no_ap {
-        emit_ap_imputed(buf, alt_probs, tile_n, v, n_samples);
+        emit_ap_imputed(buf, alt_probs, tile_n, v, n_samples, hc);
     }
     finalize_record(buf, shared_start, indiv_start);
 }
@@ -322,6 +356,10 @@ pub fn encode_imputed_record_partial(
     v: usize,
     n_samples_in_batch: usize,
     no_ap: bool,
+    // R4b: per-sample hard-call override at a re-routed chip site. `mask` is
+    // batch-local; `sample_offset` (= batch sample_start) maps to global
+    // `chip_genotypes` indices. `None` → pre-R4b behavior (byte-identical).
+    hc: Option<&R4bHardcall>,
 ) {
     let n_fmt: u8 = if no_ap { 2 } else { 4 };
     let n_info: u16 = 0;
@@ -333,10 +371,10 @@ pub fn encode_imputed_record_partial(
     // No INFO fields (merger recomputes them from concatenated dosages).
 
     let indiv_start = buf.len();
-    emit_gt_imputed(buf, alt_probs, tile_n, v, n_samples_in_batch);
-    emit_ds_imputed(buf, alt_probs, tile_n, v, n_samples_in_batch);
+    emit_gt_imputed(buf, alt_probs, tile_n, v, n_samples_in_batch, hc);
+    emit_ds_imputed(buf, alt_probs, tile_n, v, n_samples_in_batch, hc);
     if !no_ap {
-        emit_ap_imputed(buf, alt_probs, tile_n, v, n_samples_in_batch);
+        emit_ap_imputed(buf, alt_probs, tile_n, v, n_samples_in_batch, hc);
     }
     finalize_record(buf, shared_start, indiv_start);
 }

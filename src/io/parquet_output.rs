@@ -80,6 +80,10 @@ pub fn write_tile_to_parquet(
     chip_local_idx: &[usize],
     chip_genotypes: &crate::common::HaplotypeBitmatrix,
     n_ref_variants: usize,
+    // R4b: per-(chip-site,sample) hard-call preservation at re-routed sites.
+    is_input_chip: &[bool],
+    site_conf_per_sample: Option<&[f64]>,
+    refine_thr: f64,
 ) -> std::io::Result<()> {
     if tile_n == 0 { return Ok(()); }
 
@@ -128,12 +132,23 @@ pub fn write_tile_to_parquet(
             dr2s.append_null();
             imps.append_value(false);
         } else {
-            // Two-pass DR2 via the shared helper; `ds_row` doubles as the
-            // pass-1 dosage cache (it also feeds the per-sample DS column).
-            // Byte-identical f64 accumulation to the former inlined two passes.
+            // R4b: a confident sample at a re-routed input chip site contributes
+            // its verbatim hard call; every other sample uses the panel alt_probs.
+            // The closure feeds BOTH the AC/AF/DR2 stats and the per-sample DS
+            // column (`ds_row` is the pass-1 dosage cache). No-op when refine off.
+            let ci = chip_local_idx[local_i];
+            let use_hc = is_input_chip[local_i] && site_conf_per_sample.is_some();
+            let conf = site_conf_per_sample;
             let (ac, dr2_f64) = crate::io::dosage_stats::imputed_ac_dr2(
                 n_samples, n_haps,
-                |s| (alt_probs[(s * 2) * tile_n + v], alt_probs[(s * 2 + 1) * tile_n + v]),
+                |s| {
+                    if use_hc && conf.unwrap().get(ci * n_samples + s).is_some_and(|&c| c >= refine_thr) {
+                        (chip_genotypes.get(ci, s * 2) as u8 as f32,
+                         chip_genotypes.get(ci, s * 2 + 1) as u8 as f32)
+                    } else {
+                        (alt_probs[(s * 2) * tile_n + v], alt_probs[(s * 2 + 1) * tile_n + v])
+                    }
+                },
                 ds_row,
             );
             afs.append_value(ac as f32 / n_haps as f32);
