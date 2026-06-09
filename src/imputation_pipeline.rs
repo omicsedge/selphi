@@ -1182,6 +1182,8 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                     chip_genotypes: chip_genos_ref,
                     no_ap,
                     site_conf: target_site_conf.as_deref(),
+                    // R4b: per-(chip-site, sample) confidence for per-sample output.
+                    site_conf_per_sample: target_site_conf_per_sample.as_deref(),
                     refine_thr,
                 };
                 // Find this batch's writer by hap_start, asserting its hap_end matches.
@@ -1269,6 +1271,9 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                 preloaded_chunks: preloaded,
                 preloaded_stripes,
                 site_conf: target_site_conf.as_deref(),
+                // R4b: per-(chip-site, sample) confidence drives per-sample output
+                // at re-routed sites — confident samples keep their verbatim call.
+                site_conf_per_sample: target_site_conf_per_sample.as_deref(),
                 refine_thr,
             },
             selphi::io::pipeline::WindowWriters {

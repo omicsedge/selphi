@@ -138,6 +138,8 @@ struct BcfSink<'a> {
     buf: Vec<u8>,
     /// Pre-parsed POS/ID/REF/ALT per window-local variant.
     var_infos: Vec<crate::io::bcf_encode::BcfVariantInfo>,
+    /// R4b: reusable batch-local per-sample hard-call mask.
+    hc_mask: Vec<bool>,
 }
 
 impl BatchSink for BcfSink<'_> {
@@ -146,6 +148,7 @@ impl BatchSink for BcfSink<'_> {
             &ctx.srp.ids, &ctx.srp.original_ids, ctx.own_wgs_start, ctx.own_wgs_end,
         );
         self.buf = Vec::with_capacity(8 * 1024 * 1024);
+        self.hc_mask = vec![false; ctx.n_samples_in_batch];
         Ok(())
     }
 
@@ -164,9 +167,28 @@ impl BatchSink for BcfSink<'_> {
         alt: &[f32], tile_n: usize, v: usize, ctx: &WindowCtx,
     ) -> std::io::Result<()> {
         let vi = &self.var_infos[local_i];
+        // R4b: build the batch-local preserve-hard-call mask for this re-routed
+        // input chip site (no-op when refine off / not a chip site).
+        let hc = if ctx.is_input_chip[local_i] && ctx.site_conf_per_sample.is_some() {
+            let mut any = false;
+            for s in 0..ctx.n_samples_in_batch {
+                let keep = ctx.use_hardcall(local_i, s);
+                self.hc_mask[s] = keep;
+                any |= keep;
+            }
+            if any {
+                Some(crate::io::bcf_encode::R4bHardcall {
+                    chip_genotypes: ctx.chip_genotypes,
+                    chip_idx: ctx.chip_local_idx[local_i],
+                    mask: &self.hc_mask,
+                    sample_offset: ctx.sample_start,
+                })
+            } else { None }
+        } else { None };
         crate::io::bcf_encode::encode_imputed_record_partial(
             &mut self.buf, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
             alt, tile_n, v, ctx.n_samples_in_batch, self.no_ap,
+            hc.as_ref(),
         );
         Ok(())
     }
@@ -199,15 +221,15 @@ pub fn write_window_bcf_batched(
 ) -> std::io::Result<()> {
     let WindowBatchInput {
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
-        wgs_idx, n_samples_total, chip_genotypes, no_ap, site_conf, refine_thr,
+        wgs_idx, n_samples_total, chip_genotypes, no_ap, site_conf, site_conf_per_sample, refine_thr,
     } = input;
     // Intermediate always carries AP1/AP2 (see setup_batch_writers); the merger
     // needs them to count AC, and the final BCF drops AP per --no-ap.
     let _ = no_ap;
-    let mut sink = BcfSink { tx, no_ap: false, buf: Vec::new(), var_infos: Vec::new() };
+    let mut sink = BcfSink { tx, no_ap: false, buf: Vec::new(), var_infos: Vec::new(), hc_mask: Vec::new() };
     crate::io::batch_driver::run_window(
         &mut sink, srp.as_ref(), weights, hap_start, hap_end,
         win_chip_start, own_chip_start, own_chip_end, wgs_idx, n_samples_total, chip_genotypes,
-        site_conf, refine_thr,
+        site_conf, site_conf_per_sample, refine_thr,
     )
 }

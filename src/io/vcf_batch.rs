@@ -140,6 +140,7 @@ impl BatchSink for VcfSink<'_> {
         emit_imputed_line(
             &mut self.buf, &self.vid_prefixes[local_i],
             alt, tile_n, v, ctx.n_samples_in_batch, self.no_ap,
+            ctx, local_i,
         );
         Ok(())
     }
@@ -172,13 +173,13 @@ pub fn write_window_vcf_batched(
 ) -> std::io::Result<()> {
     let WindowBatchInput {
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
-        wgs_idx, n_samples_total, chip_genotypes, no_ap, site_conf, refine_thr,
+        wgs_idx, n_samples_total, chip_genotypes, no_ap, site_conf, site_conf_per_sample, refine_thr,
     } = input;
     let mut sink = VcfSink { tx, no_ap, buf: Vec::new(), vid_prefixes: Vec::new() };
     crate::io::batch_driver::run_window(
         &mut sink, srp.as_ref(), weights, hap_start, hap_end,
         win_chip_start, own_chip_start, own_chip_end, wgs_idx, n_samples_total, chip_genotypes,
-        site_conf, refine_thr,
+        site_conf, site_conf_per_sample, refine_thr,
     )
 }
 
@@ -236,6 +237,7 @@ fn emit_chip_line(
 /// digits (lossless for f32) so the merger can recompute DR2 with the same
 /// numerical precision as the non-batched path. Merger trims to the final
 /// 3-dec DS / 2-dec AP precision before writing output.
+#[allow(clippy::too_many_arguments)]
 fn emit_imputed_line(
     buf: &mut Vec<u8>,
     vid_prefix: &[u8],
@@ -244,6 +246,9 @@ fn emit_imputed_line(
     v: usize,
     n_samples_in_batch: usize,
     _no_ap: bool,
+    // R4b: per-sample hard-call preservation at re-routed input chip sites.
+    ctx: &WindowCtx,
+    local_i: usize,
 ) {
     // Intermediate format ALWAYS includes AP1:AP2 so the merger has access
     // to individual hap probabilities — required to reproduce the non-batched
@@ -254,8 +259,16 @@ fn emit_imputed_line(
     buf.extend_from_slice(b"\t.\tPASS\t.\tGT:DS:AP1:AP2");
 
     for s in 0..n_samples_in_batch {
-        let ap1 = alt_probs[(s * 2) * tile_n + v];
-        let ap2 = alt_probs[(s * 2 + 1) * tile_n + v];
+        // R4b: a confident sample at a re-routed input chip site emits its
+        // verbatim hard call (0.0/1.0 per hap); soft / pure-imputed → alt_probs.
+        let (ap1, ap2) = if ctx.use_hardcall(local_i, s) {
+            let ci = ctx.chip_local_idx[local_i];
+            let gs = ctx.sample_start + s;
+            (ctx.chip_genotypes.get(ci, gs * 2) as u8 as f32,
+             ctx.chip_genotypes.get(ci, gs * 2 + 1) as u8 as f32)
+        } else {
+            (alt_probs[(s * 2) * tile_n + v], alt_probs[(s * 2 + 1) * tile_n + v])
+        };
         let gt1 = if ap1 > 0.5 { 1u8 } else { 0 };
         let gt2 = if ap2 > 0.5 { 1u8 } else { 0 };
         let ds = ap1 + ap2;

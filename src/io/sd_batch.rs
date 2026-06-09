@@ -59,6 +59,8 @@ struct SdSink<'w> {
     gt2: Vec<i32>,
     ap1: Vec<f32>,
     ap2: Vec<f32>,
+    /// R4b: reusable batch-local per-sample hard-call mask.
+    hc_mask: Vec<bool>,
 }
 
 impl BatchSink for SdSink<'_> {
@@ -68,6 +70,7 @@ impl BatchSink for SdSink<'_> {
         self.gt2 = vec![0i32; n];
         self.ap1 = vec![0.0f32; n];
         self.ap2 = vec![0.0f32; n];
+        self.hc_mask = vec![false; n];
         Ok(())
     }
 
@@ -85,27 +88,40 @@ impl BatchSink for SdSink<'_> {
             self.ap1[s] = a0 as f32; self.ap2[s] = a1 as f32;
         }
         self.bw.writer.write_variant(chrom, pos, rsid, ref_a, alt_a,
-            &self.gt1, &self.gt2, &self.ap1, &self.ap2, true)
+            &self.gt1, &self.gt2, &self.ap1, &self.ap2, true, None)
     }
 
     fn emit_imputed(
-        &mut self, wgs_i: usize, _local_i: usize,
+        &mut self, wgs_i: usize, local_i: usize,
         alt: &[f32], tile_n: usize, v: usize, ctx: &WindowCtx,
     ) -> std::io::Result<()> {
         let (chrom, pos_s, rsid, ref_a, alt_a) =
             crate::io::pipeline::parse_variant_parts(ctx.srp, wgs_i)
                 .ok_or_else(|| std::io::Error::other(format!("bad variant id at {wgs_i}")))?;
         let pos: i32 = pos_s.parse().unwrap_or(0);
+        // R4b: a confident sample at a re-routed input chip site emits its
+        // verbatim hard call (AP null, chip-like); soft / pure-imputed → alt_probs.
+        let ci = ctx.chip_local_idx[local_i];
+        let mut any_hc = false;
         for s in 0..ctx.n_samples_in_batch {
-            let p1 = alt[(s * 2) * tile_n + v];
-            let p2 = alt[(s * 2 + 1) * tile_n + v];
+            let hc = ctx.use_hardcall(local_i, s);
+            self.hc_mask[s] = hc;
+            any_hc |= hc;
+            let (p1, p2) = if hc {
+                let gs = ctx.sample_start + s;
+                (ctx.chip_genotypes.get(ci, gs * 2) as u8 as f32,
+                 ctx.chip_genotypes.get(ci, gs * 2 + 1) as u8 as f32)
+            } else {
+                (alt[(s * 2) * tile_n + v], alt[(s * 2 + 1) * tile_n + v])
+            };
             self.gt1[s] = if p1 > 0.5 { 1 } else { 0 };
             self.gt2[s] = if p2 > 0.5 { 1 } else { 0 };
             self.ap1[s] = p1;
             self.ap2[s] = p2;
         }
+        let mask: Option<&[bool]> = if any_hc { Some(&self.hc_mask) } else { None };
         self.bw.writer.write_variant(chrom, pos, rsid, ref_a, alt_a,
-            &self.gt1, &self.gt2, &self.ap1, &self.ap2, false)
+            &self.gt1, &self.gt2, &self.ap1, &self.ap2, false, mask)
     }
 }
 
@@ -115,12 +131,12 @@ pub fn write_window_sd_batched(
 ) -> std::io::Result<()> {
     let WindowBatchInput {
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
-        wgs_idx, n_samples_total, chip_genotypes, no_ap: _, site_conf, refine_thr,
+        wgs_idx, n_samples_total, chip_genotypes, no_ap: _, site_conf, site_conf_per_sample, refine_thr,
     } = input;
-    let mut sink = SdSink { bw, gt1: Vec::new(), gt2: Vec::new(), ap1: Vec::new(), ap2: Vec::new() };
+    let mut sink = SdSink { bw, gt1: Vec::new(), gt2: Vec::new(), ap1: Vec::new(), ap2: Vec::new(), hc_mask: Vec::new() };
     crate::io::batch_driver::run_window(
         &mut sink, srp.as_ref(), weights, hap_start, hap_end,
         win_chip_start, own_chip_start, own_chip_end, wgs_idx, n_samples_total, chip_genotypes,
-        site_conf, refine_thr,
+        site_conf, site_conf_per_sample, refine_thr,
     )
 }

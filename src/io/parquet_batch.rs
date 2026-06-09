@@ -163,7 +163,7 @@ impl BatchSink for ParquetSink<'_> {
     }
 
     fn emit_imputed(
-        &mut self, wgs_i: usize, _local_i: usize,
+        &mut self, wgs_i: usize, local_i: usize,
         alt: &[f32], tile_n: usize, v: usize, ctx: &WindowCtx,
     ) -> std::io::Result<()> {
         let (chrom, pos_s, rsid, ref_a, alt_a) =
@@ -176,9 +176,17 @@ impl BatchSink for ParquetSink<'_> {
         self.refs_b.append_value(ref_a);
         self.alts_b.append_value(alt_a);
         self.imps.append_value(true);
+        // R4b: a confident sample at a re-routed input chip site emits its
+        // verbatim hard call; soft / pure-imputed → alt_probs.
+        let ci = ctx.chip_local_idx[local_i];
         for s in 0..ctx.n_samples_in_batch {
-            let p1 = alt[(s * 2) * tile_n + v];
-            let p2 = alt[(s * 2 + 1) * tile_n + v];
+            let (p1, p2) = if ctx.use_hardcall(local_i, s) {
+                let gs = ctx.sample_start + s;
+                (ctx.chip_genotypes.get(ci, gs * 2) as u8 as f32,
+                 ctx.chip_genotypes.get(ci, gs * 2 + 1) as u8 as f32)
+            } else {
+                (alt[(s * 2) * tile_n + v], alt[(s * 2 + 1) * tile_n + v])
+            };
             self.ap_builders[s * 2].append_value(p1);
             self.ap_builders[s * 2 + 1].append_value(p2);
         }
@@ -198,7 +206,7 @@ pub fn write_window_parquet_batched(
 ) -> std::io::Result<()> {
     let WindowBatchInput {
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
-        wgs_idx, n_samples_total, chip_genotypes, no_ap: _, site_conf, refine_thr,
+        wgs_idx, n_samples_total, chip_genotypes, no_ap: _, site_conf, site_conf_per_sample, refine_thr,
     } = input;
     let mut sink = ParquetSink {
         bw,
@@ -214,6 +222,6 @@ pub fn write_window_parquet_batched(
     crate::io::batch_driver::run_window(
         &mut sink, srp.as_ref(), weights, hap_start, hap_end,
         win_chip_start, own_chip_start, own_chip_end, wgs_idx, n_samples_total, chip_genotypes,
-        site_conf, refine_thr,
+        site_conf, site_conf_per_sample, refine_thr,
     )
 }

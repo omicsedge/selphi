@@ -42,6 +42,10 @@ pub struct WindowBatchInput<'a> {
     /// R3 --refine: per-chip-site input confidence (chip-site order). `None`
     /// when refine is off or every retained site is fully confident.
     pub site_conf: Option<&'a [f64]>,
+    /// R4b --refine: per-(chip-site, sample) input confidence, row-major
+    /// `[chip_site * n_samples_total + global_sample]`. Drives per-sample output
+    /// at re-routed sites. `None` → byte-identical pre-R4b imputed output.
+    pub site_conf_per_sample: Option<&'a [f64]>,
     /// R3 --refine: chip sites with confidence `< refine_thr` re-route to the
     /// imputed output branch. Ignored when `site_conf` is `None`.
     pub refine_thr: f64,
@@ -122,6 +126,37 @@ pub struct WindowCtx<'a> {
     /// Window-local flags/indices, length `own_wgs_end - own_wgs_start`.
     pub chip_local_idx: &'a [usize],
     pub chip_genotypes: &'a crate::common::HaplotypeBitmatrix,
+    /// R4b: true for EVERY input chip site (not flipped by softness), length
+    /// `own_wgs_end - own_wgs_start`. Lets the imputed emit preserve confident
+    /// samples' hard calls at re-routed sites.
+    pub is_input_chip: &'a [bool],
+    /// R4b: per-(chip-site, GLOBAL-sample) input confidence, row-major
+    /// `[chip_site * n_samples_total + global_sample]`. `None` → no per-sample
+    /// preservation (byte-identical pre-R4b imputed output).
+    pub site_conf_per_sample: Option<&'a [f64]>,
+    pub refine_thr: f64,
+}
+
+impl WindowCtx<'_> {
+    /// R4b: should the batch-local sample `s_local` at window-local variant
+    /// `local_i` emit its VERBATIM chip hard call? `s_local` is relative to this
+    /// batch's first sample (`sample_start`); the per-sample confidence matrix is
+    /// indexed by the GLOBAL sample (`sample_start + s_local`). Always false when
+    /// `site_conf_per_sample` is `None`.
+    #[inline]
+    pub fn use_hardcall(&self, local_i: usize, s_local: usize) -> bool {
+        if !self.is_input_chip[local_i] { return false; }
+        match self.site_conf_per_sample {
+            None => false,
+            Some(conf) => {
+                let n_samples_total = self.n_haps_total / 2;
+                let global_s = self.sample_start + s_local;
+                let ci = self.chip_local_idx[local_i];
+                conf.get(ci * n_samples_total + global_s)
+                    .is_some_and(|&c| c >= self.refine_thr)
+            }
+        }
+    }
 }
 
 /// Format-specific encoding hooks driven by [`run_window`]. The driver owns the
@@ -177,6 +212,7 @@ pub fn run_window<S: BatchSink>(
     n_samples_total: usize,
     chip_genotypes: &crate::common::HaplotypeBitmatrix,
     site_conf: Option<&[f64]>,
+    site_conf_per_sample: Option<&[f64]>,
     refine_thr: f64,
 ) -> std::io::Result<()> {
     use crate::srp::TILE_ROWS;
@@ -197,6 +233,8 @@ pub fn run_window<S: BatchSink>(
     let window_len = own_wgs_end - own_wgs_start;
 
     let mut is_chip = vec![false; window_len];
+    // R4b: true for ALL input chip sites (not flipped by softness).
+    let mut is_input_chip = vec![false; window_len];
     let mut chip_local_idx = vec![0usize; window_len];
     // R3: see WindowSetup::new in pipeline.rs. A low-confidence chip site keeps
     // is_chip=false so it falls into the imputed branch (its OWN call becomes the
@@ -206,6 +244,7 @@ pub fn run_window<S: BatchSink>(
         let wi = wgs_idx[ci];
         if wi >= own_wgs_start && wi < own_wgs_end && wi < n_ref_variants {
             chip_local_idx[wi - own_wgs_start] = ci;
+            is_input_chip[wi - own_wgs_start] = true;
             let soft = site_conf.is_some_and(|c| c.get(ci).is_some_and(|&x| x < refine_thr));
             if soft {
                 n_rerouted += 1;
@@ -229,6 +268,9 @@ pub fn run_window<S: BatchSink>(
         own_wgs_end,
         chip_local_idx: &chip_local_idx,
         chip_genotypes,
+        is_input_chip: &is_input_chip,
+        site_conf_per_sample,
+        refine_thr,
     };
     sink.begin_window(&ctx)?;
 

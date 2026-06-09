@@ -229,6 +229,11 @@ impl SelfdecodeWriter {
         ap1_values: &[f32],    // n_samples: allele prob hap 1
         ap2_values: &[f32],    // n_samples: allele prob hap 2
         is_chip: bool,
+        // R4b: at an imputed (`is_chip=false`) re-routed chip site, samples whose
+        // bit is true emit a verbatim hard call → AP1/AP2 are null (chip-like)
+        // for them, even though the record as a whole is imputed. `None` →
+        // pre-R4b behavior (AP nullness is the single `is_chip` flag for all).
+        hardcall_mask: Option<&[bool]>,
     ) -> std::io::Result<()> {
         let n_samples = self.sample_names.len();
         let is_chrm = chrom.contains('M');
@@ -257,7 +262,10 @@ impl SelfdecodeWriter {
             buf.gt1.push(Some(g1));
             buf.gt2.push(Some(g2));
             buf.phased.push(true); // selphi always produces phased output
-            if is_chip {
+            // R4b: a per-sample hard-call (mask[s]) is null-AP like a chip site.
+            let sample_is_hardcall = is_chip
+                || hardcall_mask.is_some_and(|m| m[s]);
+            if sample_is_hardcall {
                 buf.ap1.push(None);
                 buf.ap2.push(None);
             } else {

@@ -608,6 +608,7 @@ pub fn run_multi_chr(
                     // R3 --refine is not wired into the multi-chr orchestrate path
                     // (same as R2): no per-site confidence here → no re-route.
                     site_conf: None,
+                    site_conf_per_sample: None,
                     refine_thr: 0.5,
                 },
                 selphi::io::pipeline::WindowWriters {
