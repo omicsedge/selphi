@@ -270,11 +270,13 @@ fn read_target_bcf(
     let mut genotypes: Vec<Vec<[u8; 2]>> = Vec::new();
     let mut is_phased = true;
     let mut phase_checks = 10i32;
+    let mut n_multiallelic = 0usize;
 
     for result in reader.record_bufs(&header) {
         let rec = match result { Ok(r) => r, Err(_) => continue };
         let pos = match rec.variant_start() { Some(p) => usize::from(p) as i64, None => continue };
         if pos < 1 { continue; }
+        if rec.alternate_bases().as_ref().len() > 1 { n_multiallelic += 1; }
         let alt_allele = match rec.alternate_bases().as_ref().first() {
             Some(a) if a != "." && !a.is_empty() => a.clone(),
             _ => continue,
@@ -321,6 +323,9 @@ fn read_target_bcf(
         }
         genotypes.push(var_gts);
     }
+    if n_multiallelic > 0 {
+        selphi_info!("  WARNING: {} multi-allelic target site(s) — first ALT kept, genotypes biallelic-projected (REF vs any-ALT). Run `bcftools norm -m -any` on target and panel for per-ALT imputation.", n_multiallelic);
+    }
     (sample_names, markers, genotypes, is_phased)
 }
 
@@ -352,6 +357,7 @@ pub fn read_target_vcf(
     let mut is_phased = true;
     let mut phase_checks = 10i32;
     let mut sample_names: Vec<String> = Vec::new();
+    let mut n_multiallelic = 0usize;
 
     // Parse from byte buffer — zero per-line allocations
     for line in raw.split(|&b| b == b'\n') {
@@ -367,6 +373,7 @@ pub fn read_target_vcf(
         }
 
         let Some(f) = split_vcf_fields(line) else { continue };
+        if f.multiallelic { n_multiallelic += 1; }
         let (ref_hash, alt_hash) = if hash_alleles {
             (crate::srp::blake2b_hex(f.ref_allele), crate::srp::blake2b_hex(f.alt_allele))
         } else {
@@ -383,6 +390,9 @@ pub fn read_target_vcf(
     if sample_names.is_empty() {
         selphi_error!("No samples found in {}", path);
         std::process::exit(1);
+    }
+    if n_multiallelic > 0 {
+        selphi_info!("  WARNING: {} multi-allelic target site(s) — first ALT kept, genotypes biallelic-projected (REF vs any-ALT). Run `bcftools norm -m -any` on target and panel for per-ALT imputation.", n_multiallelic);
     }
 
     (sample_names, markers, genotypes, is_phased)
@@ -1083,6 +1093,7 @@ pub fn read_target_vcf_multi_chr(
     let mut is_phased = true;
     let mut phase_checks = 10i32;
     let mut sample_names: Vec<String> = Vec::new();
+    let mut n_multiallelic = 0usize;
 
     for line in raw.split(|&b| b == b'\n') {
         if line.is_empty() || line.starts_with(b"##") { continue; }
@@ -1097,6 +1108,7 @@ pub fn read_target_vcf_multi_chr(
         }
 
         let Some(f) = split_vcf_fields(line) else { continue };
+        if f.multiallelic { n_multiallelic += 1; }
         all_markers.push(TargetMarker {
             chrom: f.chrom.to_string(), pos: f.pos,
             ref_allele: f.ref_allele.to_string(), alt_allele: f.alt_allele.to_string(),
@@ -1114,6 +1126,10 @@ pub fn read_target_vcf_multi_chr(
         let entry = by_chr.entry(chr).or_insert_with(|| (Vec::new(), Vec::new()));
         entry.0.push(marker);
         entry.1.push(gts);
+    }
+
+    if n_multiallelic > 0 {
+        selphi_info!("  WARNING: {} multi-allelic target site(s) — first ALT kept, genotypes biallelic-projected (REF vs any-ALT). Run `bcftools norm -m -any` on target and panel for per-ALT imputation.", n_multiallelic);
     }
 
     (sample_names, by_chr, is_phased)
