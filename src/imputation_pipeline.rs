@@ -17,7 +17,8 @@ use selphi::{selphi_info, selphi_debug, selphi_step, selphi_error};
 use selphi::srp::SrpReader;
 use selphi::genmap;
 use selphi::haploid;
-use selphi::io::target_io::{read_target_vcf, write_phased_vcf, extract_target_alleles, intersect_variants};
+use selphi::io::target_io::{read_target_vcf, write_phased_vcf, extract_target_alleles, intersect_variants,
+    extract_target_site_confidence, align_confidence_to_chip};
 use selphi::imputation::windows::compute_imputation_windows;
 
 use crate::cli::{Args, PhasingEngine};
@@ -767,6 +768,20 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         std::process::exit(1);
     }
 
+    // R2 --refine: per-chip-site input confidence c[v] ∈ [0,1] from the target
+    // VCF (GQ/PL/DP). Built ONLY under --refine; aligned to post-intersection
+    // chip-site order via target_idx. None (→ shipped scalar emission) when
+    // refine is off OR every retained site is fully confident → byte-identical.
+    let target_site_conf: Option<Vec<f64>> = if args.refine {
+        let marker_conf = extract_target_site_confidence(target_path);
+        let aligned = align_confidence_to_chip(&marker_conf, &target_idx, n_chip);
+        let n_soft = aligned.as_ref().map(|c| c.iter().filter(|&&x| x < 1.0).count()).unwrap_or(0);
+        selphi_step!("--refine: {} chip site(s) with input confidence < 1.0 (of {})", n_soft, n_chip);
+        aligned
+    } else {
+        None
+    };
+
     // Resolve auto max_candidates and the batched-output cap BEFORE memory
     // estimation so the estimator reflects the actual runtime configuration
     // (the floor mc=2500 + non-batched assumption would massively overcount
@@ -1076,6 +1091,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
             targ_alleles: &targ_bm,
             chip_cm: &chip_cm,
             ne_per_site: final_ne_per_site.as_deref(),
+            site_conf: target_site_conf.as_deref(),
             chip_start: window.chip_start,
             chip_end: window.chip_end,
         };

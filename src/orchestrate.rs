@@ -570,6 +570,10 @@ pub fn run_multi_chr(
                 targ_alleles: &targ_bm,
                 chip_cm: &chip_cm,
                 ne_per_site: final_ne_per_site.as_deref(),
+                // R2 --refine is single-chr only for now: the multi-chr reader
+                // (read_target_vcf_multi_chr) does not yet capture per-site
+                // GQ/PL/DP, so confidence is None here (→ shipped scalar emission).
+                site_conf: None,
                 chip_start: window.chip_start,
                 chip_end: window.chip_end,
             };

@@ -100,6 +100,18 @@ pub struct Args {
     #[arg(long)]
     pub lcwgs: bool,
 
+    /// Hybrid GL-aware refinement of the chip/WGS imputation HMM. When set,
+    /// Selphi reads a per-chip-site input confidence c[v] ∈ [0,1] from the
+    /// target VCF (GQ, else PL, else DP) and softens the Li-Stephens emission
+    /// at low-confidence sites toward flat (lean on LD) instead of trusting the
+    /// hard call. MVP: for multi-sample input, c is the MINIMUM confidence
+    /// across samples at each site (a site is "soft" if ANY sample is soft);
+    /// a per-haplotype version is a later step. Default OFF → bit-identical to
+    /// the shipped hard-call path. The hard calls still flow to the bitmatrix
+    /// unchanged; only the HMM emission weighting is affected.
+    #[arg(long)]
+    pub refine: bool,
+
     /// (--lcwgs) Use the GLIMPSE2-FAITHFUL lcWGS engine (a 1:1 port of GLIMPSE2's
     /// phase/ Gibbs caller: ref_haplotype_set + sparse PBWT selection + GL-aware
     /// Li-Stephens FB + diplotype-mosaic rephasing + MT19937). Separate from the

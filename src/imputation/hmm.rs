@@ -691,6 +691,11 @@ pub fn calculate_weights(
     site_emission_ratios: Option<&[f64]>,
     ne_per_site: Option<&[f64]>,
     hap_prior: Option<&[f64]>,
+    // R2 hybrid-emission spine: per-chip-site input confidence c[v] in [0,1]
+    // (1 = fully trusted hard call). Slice is aligned to `distances_cm`
+    // (post-intersection chip-site order). None (or all-1.0) -> the shipped
+    // scalar `p_err` emission, bit-identical. Built only under `--refine`.
+    c: Option<&[f64]>,
     _cluster_cm: f64,
     compute_posterior: bool,
 ) -> HmmResult {
@@ -775,19 +780,37 @@ pub fn calculate_weights(
         }).collect()
     });
 
-    // R1 hybrid-emission spine (Slice 1, env-gated test hook). `SELPHI_REFINE_CONST_C=c`
-    // treats EVERY chip site as confidence c → per-site mismatch prob
-    //   ε_eff = (1-c)*0.5 + c*p_err     (p_err is the data-derived window scalar).
-    // At c≥1, ε_eff == p_err exactly AND we collapse to None → the forward/backward take
-    // the scalar arm token-for-token → BIT-IDENTICAL to the shipped path. c<1 softens the
-    // emission toward flat (lean on LD). Real GQ/PL-derived per-site c is Slice 2.
-    let site_perr: Option<Vec<f64>> = std::env::var("SELPHI_REFINE_CONST_C").ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|&c| c < 1.0)
-        .map(|c| {
-            let eps = ((1.0 - c) * 0.5 + c * p_err).clamp(p_err, 0.5);
-            vec![eps; distances_cm.len()]
-        });
+    // Hybrid-emission spine. Per-chip-site confidence c[v] ∈ [0,1] → per-site
+    // mismatch prob  ε_eff = (1-c)*0.5 + c*p_err  (p_err is the data-derived
+    // window scalar). At c≥1, ε_eff == p_err exactly. If EVERY site has c≥1 we
+    // collapse to None → the forward/backward take the scalar arm token-for-token
+    // → BIT-IDENTICAL to the shipped path. c<1 softens the emission toward flat
+    // (lean on LD where the input genotype is uncertain).
+    //
+    // Two sources, in priority order:
+    //   R2 (real): `c` — per-site GQ/PL/DP-derived confidence threaded from the
+    //              target VCF under `--refine` (None when refine is off).
+    //   R1 (test): env `SELPHI_REFINE_CONST_C=c` — a single constant c applied to
+    //              every site; an override/fallback used by the test gates.
+    let const_c_env: Option<f64> = std::env::var("SELPHI_REFINE_CONST_C").ok()
+        .and_then(|s| s.parse::<f64>().ok());
+    let site_perr: Option<Vec<f64>> = if let Some(cv) = c {
+        debug_assert_eq!(cv.len(), distances_cm.len(),
+            "site confidence length {} != n_sites {}", cv.len(), distances_cm.len());
+        // Collapse to None when every site is fully confident → byte-identical.
+        if cv.iter().any(|&c| c < 1.0) {
+            Some(cv.iter().map(|&c| {
+                ((1.0 - c) * 0.5 + c * p_err).clamp(p_err, 0.5)
+            }).collect())
+        } else {
+            None
+        }
+    } else if let Some(c) = const_c_env.filter(|&c| c < 1.0) {
+        let eps = ((1.0 - c) * 0.5 + c * p_err).clamp(p_err, 0.5);
+        Some(vec![eps; distances_cm.len()])
+    } else {
+        None
+    };
 
     // Debug: dump HMM internals for hap0
     if log_n == 0 {
@@ -1048,7 +1071,7 @@ mod tests {
         let breaks = vec![(0usize, n_var)];
 
         let result = calculate_weights(
-            &csc, &cm, &breaks, n_haps, 50000.0, 0.0001, None::<RefAlleleSource>, n_var, None, None, None, 0.0, false,
+            &csc, &cm, &breaks, n_haps, 50000.0, 0.0001, None::<RefAlleleSource>, n_var, None, None, None, None, 0.0, false,
         ).weights;
 
         assert_eq!(result.len(), 1);
