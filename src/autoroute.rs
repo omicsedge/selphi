@@ -55,8 +55,6 @@ impl Sniff {
     fn call_rate(&self) -> f64 {
         if self.gt_total == 0 { 1.0 } else { self.gt_called as f64 / self.gt_total as f64 }
     }
-    /// Any per-site confidence field the chip/WGS `--refine` path can consume.
-    fn has_confidence(&self) -> bool { self.has_gq || self.has_pl || self.has_dp }
 }
 
 /// Number of data records to sample. Env-overridable for testing.
@@ -80,31 +78,38 @@ fn callrate_threshold() -> f64 {
 /// decision is easy to audit.
 ///
 /// 1. BAM/CRAM input (reads) → `Lcwgs`.
-/// 2. VCF/BCF with absent GT, OR (low GT call-rate AND PL present) → `Lcwgs`
-///    (read-likelihood regime).
-/// 3. Otherwise (confident hard calls):
-///    - a confidence field (GQ/PL/DP) present → `RefineGenotype`;
-///    - GT-only, no confidence field → `PlainGenotype`.
+/// 2. PL present (read-likelihoods) → `Lcwgs` — the GL-aware engine beats the
+///    genotype engine on WGS at every coverage (GIAB crossover); PL is the signal.
+/// 3. No PL, GT absent or mostly uncalled → `Lcwgs` (sparse read regime).
+/// 4. No PL, confident GT: GQ/DP present → `RefineGenotype`; GT-only → `PlainGenotype`.
 fn auto_route_decision(is_reads: bool, s: &Sniff, callrate_thr: f64) -> AutoRoute {
     // 1. Aligned reads are unambiguously the lcWGS regime.
     if is_reads {
         return AutoRoute::Lcwgs;
     }
-    // 2. Read-likelihood VCF: GT absent entirely, or GT present but mostly
-    //    uncalled (low coverage). The PL-present requirement only gates the
-    //    *low-call-rate* branch; a fully GT-absent file is lcWGS regardless.
+    // 2. PL present = read-derived genotype likelihoods are available. A
+    //    per-coverage GIAB HG002 crossover (chr22_v2.srp, 0.5x→16x) showed the
+    //    GL-aware lcWGS engine BEATS the genotype engine (even with --refine) at
+    //    EVERY tested WGS coverage — lcWGS 0.91→0.95 vs genotype+refine 0.71→0.91
+    //    (genotype DECLINES past 4x: a sparse-chip interpolator fed dense WGS
+    //    calls just echoes the raw calls + their errors). So the routing signal
+    //    is PL PRESENCE, not depth/call-rate: with PL, route to lcWGS regardless
+    //    of GT call-rate. (Earlier call-rate gating misrouted WGS callsets —
+    //    bcftools fills 0/0 at panel sites so call-rate≈1 at any coverage.)
+    //    Chip arrays carry GT without PL → fall through to the genotype path.
+    if s.has_pl {
+        return AutoRoute::Lcwgs;
+    }
+    // 3. No PL. GT absent, or GT present but mostly uncalled → still the read
+    //    regime in practice (e.g. a sparse all-`GT .` file).
     let low_call = s.call_rate() < callrate_thr;
-    if !s.has_gt || (low_call && s.has_pl) {
+    if !s.has_gt || low_call {
         return AutoRoute::Lcwgs;
     }
-    // A GT-bearing file that is almost entirely uncalled but carries NO PL is
-    // still the read regime in practice (e.g. a bcftools-called file whose
-    // sampled head is all `GT .`); treat very-low call-rate as lcWGS too.
-    if low_call {
-        return AutoRoute::Lcwgs;
-    }
-    // 3. Confident hard calls.
-    if s.has_confidence() {
+    // 4. Confident hard calls WITHOUT PL (a GT:GQ/DP callset with PL stripped,
+    //    or a chip array). GQ/DP present → genotype + --refine to clean soft
+    //    sites; GT-only (chip array) → plain genotype.
+    if s.has_gq || s.has_dp {
         AutoRoute::RefineGenotype
     } else {
         AutoRoute::PlainGenotype
@@ -337,7 +342,7 @@ pub fn resolve(
         }
         AutoRoute::RefineGenotype => {
             if !cli_refine {
-                selphi_step!("auto-route: detected GT with input confidence (GQ/PL/DP) → genotype engine + --refine");
+                selphi_step!("auto-route: GT with GQ/DP confidence, no PL → genotype engine + --refine");
                 eff_refine = true;
             }
         }
@@ -380,6 +385,16 @@ mod tests {
     fn gt_with_gq_confident_is_refine() {
         let s = sniff(true, false, true, false, 1000, 1000);
         assert_eq!(auto_route_decision(false, &s, 0.5), AutoRoute::RefineGenotype);
+    }
+
+    #[test]
+    fn gt_with_pl_high_callrate_is_lcwgs() {
+        // WGS callset: GT + PL + high call-rate (bcftools fills 0/0 at panel
+        // sites → call-rate≈1 at any coverage). PL present → lcWGS, which wins
+        // WGS at every coverage (the GIAB crossover finding). This is the case
+        // the prior call-rate rule misrouted to genotype+refine.
+        let s = sniff(true, true, false, true, 1000, 998);
+        assert_eq!(auto_route_decision(false, &s, 0.5), AutoRoute::Lcwgs);
     }
 
     #[test]
