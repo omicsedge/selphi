@@ -4,6 +4,7 @@
 //! independently of the full flag surface.
 
 use clap::Parser;
+pub use selphi::io::target_io::AlleleMatch;
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
 pub enum PhasingEngine {
@@ -122,6 +123,20 @@ pub struct Args {
     /// are given.
     #[arg(long)]
     pub lcwgs: bool,
+
+    /// Target↔panel allele reconciliation: none|swap|strand|full. DEFAULT none
+    /// (exact REF/ALT match only — byte-identical to before). A genotyping chip on
+    /// a different strand or with REF/ALT swapped vs the panel silently loses those
+    /// markers under `none`; the other modes recover them:
+    ///   swap   = also accept REF/ALT-swapped sites (recode genotype 0↔1);
+    ///   strand = also accept opposite-strand SNPs (reverse-complement), then exact/swap;
+    ///   full   = swap + strand.
+    /// Palindromic SNPs (A/T, C/G) are strand-ambiguous and are matched only by exact
+    /// equality (conform-gt / Michigan convention). Applies to the chip/WGS genotype
+    /// path (single- and multi-chr); lcWGS/GLIMPSE2-exact are unaffected. Sites that
+    /// already match exactly are never touched, so conforming input is byte-identical.
+    #[arg(long, value_enum, default_value = "none")]
+    pub allele_match: AlleleMatch,
 
     /// Imputation engine/mode: auto|lcwgs|genotype|refine. DEFAULT auto — Selphi
     /// sniffs the target and picks the engine without you choosing (BAM/CRAM or a

@@ -59,6 +59,8 @@ pub struct MultiChrImputeConfig {
     pub selfdecode: bool,
     pub all_formats: bool,
     pub map_dir: Option<String>,
+    /// `--allele-match`: target↔panel strand/swap reconciliation mode.
+    pub allele_match: selphi::io::target_io::AlleleMatch,
 }
 
 impl MultiChrImputeConfig {
@@ -97,6 +99,7 @@ impl MultiChrImputeConfig {
             selfdecode: args.selfdecode,
             all_formats: args.all_formats,
             map_dir,
+            allele_match: args.allele_match,
         }
     }
 }
@@ -108,6 +111,7 @@ fn load_chr_data(
     target_by_chr: &std::collections::BTreeMap<String, (Vec<selphi::io::target_io::TargetMarker>, Vec<Vec<[u8; 2]>>)>,
     multi_map: &std::collections::BTreeMap<String, (Vec<i64>, Vec<f64>)>,
     n_haps: usize,
+    allele_match: selphi::io::target_io::AlleleMatch,
 ) -> Option<(Arc<selphi::srp::SrpReader>, Vec<usize>, Vec<usize>, Vec<u8>, Vec<f64>, Vec<i64>, usize, usize, usize)> {
     let chr_view = multi_srp.load_chr_view(chr_name).ok()?;
     let n_ref = chr_view.n_haps();
@@ -120,7 +124,7 @@ fn load_chr_data(
         .or_else(|| target_by_chr.get(chr_name))?;
 
     let (wgs_idx, target_idx, targ_alleles, chip_bps, n_chip) =
-        prepare_chr_target(&srp, target_markers, target_genotypes, n_haps)?;
+        prepare_chr_target(&srp, target_markers, target_genotypes, n_haps, allele_match)?;
     let raw_chip_cm = genmap::interpolate_for_chr(multi_map, chr_name, &chip_bps);
 
     Some((srp, wgs_idx, target_idx, targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip))
@@ -136,13 +140,14 @@ fn prepare_chr_target(
     target_markers: &[selphi::io::target_io::TargetMarker],
     target_genotypes: &[Vec<[u8; 2]>],
     n_haps: usize,
+    allele_match: selphi::io::target_io::AlleleMatch,
 ) -> Option<(Vec<usize>, Vec<usize>, Vec<u8>, Vec<i64>, usize)> {
-    let (wgs_idx, target_idx) = intersect_variants_for_chr(
-        &srp.metadata.chromosome, &srp.variants, &srp.ids, target_markers,
+    let (wgs_idx, target_idx, transforms) = intersect_variants_for_chr(
+        &srp.metadata.chromosome, &srp.variants, &srp.ids, target_markers, allele_match,
     );
     let n_chip = wgs_idx.len();
     if n_chip == 0 { return None; }
-    let targ_alleles = extract_target_alleles(target_genotypes, &target_idx, n_chip, n_haps);
+    let targ_alleles = extract_target_alleles(target_genotypes, &target_idx, n_chip, n_haps, &transforms);
     let chip_bps: Vec<i64> = wgs_idx.iter().map(|&wi| srp.variants[wi].pos).collect();
     Some((wgs_idx, target_idx, targ_alleles, chip_bps, n_chip))
 }
@@ -341,7 +346,7 @@ pub fn run_multi_chr(
                  pre.raw_chip_cm, pre.chip_bps, pre.n_ref, pre.n_ref_variants, pre.n_chip)
             } else {
                 // Synchronous load for first chromosome (or if prefetch was skipped)
-                match load_chr_data(&multi_srp, chr_name, &target_by_chr, &multi_map, n_haps) {
+                match load_chr_data(&multi_srp, chr_name, &target_by_chr, &multi_map, n_haps, config.allele_match) {
                     Some(d) => d,
                     None => { selphi_info!("    Skipped"); continue; }
                 }
@@ -517,6 +522,7 @@ pub fn run_multi_chr(
                     multi_map.get(&key).or_else(|| multi_map.get(&next_chr)).cloned()
                 };
                 let n_h = n_haps;
+                let allele_match = config.allele_match;
                 Some(std::thread::spawn(move || {
                     // Open a fresh MultiChrSrpReader (separate file handle)
                     let reader = MultiChrSrpReader::open(&srp_path_clone).ok()?;
@@ -528,7 +534,7 @@ pub fn run_multi_chr(
 
                     let (target_markers, target_genotypes) = next_target.as_ref()?;
                     let (wgs_idx, target_idx, targ_alleles, chip_bps, n_chip) =
-                        prepare_chr_target(&srp, target_markers, target_genotypes, n_h)?;
+                        prepare_chr_target(&srp, target_markers, target_genotypes, n_h, allele_match)?;
                     let (map_bp, map_cm) = next_map?;
                     let raw_chip_cm: Vec<f64> = chip_bps.iter().map(|&bp| {
                         genmap::interpolate_cm(&map_bp, &map_cm, bp)

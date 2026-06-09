@@ -25,6 +25,106 @@ pub struct TargetMarker {
 }
 
 // ---------------------------------------------------------------------------
+// Strand / allele reconciliation (--allele-match)
+// ---------------------------------------------------------------------------
+
+/// Target↔panel allele-matching mode (`--allele-match`). `None` is byte-identical
+/// to the historical exact-REF/ALT-pair matcher; the others add a fallback ladder
+/// that runs ONLY when the exact match fails, so any already-conforming input is
+/// unaffected. Mirrors Beagle conform-gt's reconciliation as an opt-in pre-step.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AlleleMatch {
+    /// Exact REF/ALT only (default; byte-identical to pre-feature behavior).
+    #[default]
+    None,
+    /// Also accept REF/ALT-swapped sites (target REF==panel ALT and vice-versa) →
+    /// recode the genotype 0↔1 into panel orientation.
+    Swap,
+    /// Also accept opposite-strand SNPs (reverse-complement the target alleles),
+    /// then re-test exact / swap. (Implies the swap rung.)
+    Strand,
+    /// Both swap and strand.
+    Full,
+}
+
+/// Reverse-complement of a single SNP base (A↔T, C↔G, upper-cased). `None` for
+/// anything that is not exactly one A/C/G/T base — indels / symbolic / multi-base
+/// alleles are NOT strand-flipped (left to upstream `bcftools norm`).
+fn rc_snp_base(allele: &str) -> Option<String> {
+    let b = allele.as_bytes();
+    if b.len() != 1 { return None; }
+    let c = match b[0].to_ascii_uppercase() {
+        b'A' => 'T', b'T' => 'A', b'C' => 'G', b'G' => 'C',
+        _ => return None,
+    };
+    Some(c.to_string())
+}
+
+/// A strand-AMBIGUOUS (palindromic) biallelic SNP: both alleles single bases and
+/// complementary (A/T or C/G). Reverse-complement equals the original allele set,
+/// so strand vs. swap cannot be told apart from labels alone — the conform-gt /
+/// Michigan-server convention is to EXCLUDE these from reconciliation (match by
+/// exact equality only). AF-based resolution is a documented future option.
+fn is_palindromic_snp(r: &str, a: &str) -> bool {
+    matches!((rc_snp_base(r), rc_snp_base(a)), (Some(rc_r), Some(_)) if rc_r == a.to_ascii_uppercase())
+}
+
+/// Which rung of the reconciliation ladder matched (for logging).
+#[derive(Clone, Copy, PartialEq)]
+enum ReconKind { Swap, Strand }
+
+/// One reconciliation hit: panel index, GT transform (0 = none, 1 = swap 0↔1), rung.
+struct LadderHit { rj: usize, transform: u8, kind: ReconKind }
+
+/// Fallback matcher, run ONLY when the exact REF/ALT match failed and `mode` is
+/// not `None`. Scans same-position panel candidates `[ri..)` (pos == `tpos`) for a
+/// REF/ALT swap or a reverse-complement (strand) match per `mode`. Palindromic
+/// SNPs are skipped (ambiguous). `*_key` are the precomputed comparison keys
+/// (equal to panel storage — blake2b hash or plain allele); `*_lit` are the literal
+/// target alleles (needed to reverse-complement; the panel side may be hashed and
+/// thus not RC-able, so the target is RC'd then re-keyed).
+fn reconcile_ladder(
+    variants: &[crate::srp::Variant], ri: usize, tpos: i64,
+    tgt_ref_key: &str, tgt_alt_key: &str,
+    tgt_ref_lit: &str, tgt_alt_lit: &str,
+    hash_alleles: bool, mode: AlleleMatch,
+) -> Option<LadderHit> {
+    if mode == AlleleMatch::None { return None; }
+    if is_palindromic_snp(tgt_ref_lit, tgt_alt_lit) { return None; }
+    let key = |s: &str| if hash_alleles { crate::srp::blake2b_hex(s) } else { s.to_string() };
+
+    // Rung 1 — REF/ALT swap (same strand): panel.ref==key(alt) && panel.alt==key(ref).
+    if matches!(mode, AlleleMatch::Swap | AlleleMatch::Full) {
+        let mut rj = ri;
+        while rj < variants.len() && variants[rj].pos == tpos {
+            if variants[rj].ref_allele == tgt_alt_key && variants[rj].alt_allele == tgt_ref_key {
+                return Some(LadderHit { rj, transform: 1, kind: ReconKind::Swap });
+            }
+            rj += 1;
+        }
+    }
+    // Rung 2 — strand flip (reverse-complement the target SNP), then exact or swap.
+    if matches!(mode, AlleleMatch::Strand | AlleleMatch::Full) {
+        if let (Some(rc_r), Some(rc_a)) = (rc_snp_base(tgt_ref_lit), rc_snp_base(tgt_alt_lit)) {
+            let (rk, ak) = (key(&rc_r), key(&rc_a));
+            let mut rj = ri;
+            while rj < variants.len() && variants[rj].pos == tpos {
+                // RC same order → REF/ALT roles preserved → no GT flip.
+                if variants[rj].ref_allele == rk && variants[rj].alt_allele == ak {
+                    return Some(LadderHit { rj, transform: 0, kind: ReconKind::Strand });
+                }
+                // RC + swap → GT flip.
+                if variants[rj].ref_allele == ak && variants[rj].alt_allele == rk {
+                    return Some(LadderHit { rj, transform: 1, kind: ReconKind::Strand });
+                }
+                rj += 1;
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Fast i64 parsing
 // ---------------------------------------------------------------------------
 
@@ -982,20 +1082,34 @@ pub fn align_confidence_to_chip_per_sample(
 // ---------------------------------------------------------------------------
 
 /// Extract target alleles at chip sites into flat (n_chip, n_haps) row-major array.
+///
+/// `transforms` (aligned to `target_idx`; empty = no transform) carries the
+/// allele-reconciliation result: `1` = this chip site was matched to the panel
+/// with REF/ALT swapped, so the biallelic call is recoded 0↔1 into panel
+/// orientation. An empty or all-zero slice leaves the calls untouched
+/// (byte-identical to the pre-`--allele-match` behavior).
 pub fn extract_target_alleles(
     genotypes: &[Vec<[u8; 2]>],
     target_idx: &[usize],
     n_chip: usize,
     n_haps: usize,
+    transforms: &[u8],
 ) -> Vec<u8> {
     let n_samples = n_haps / 2;
     let mut out = vec![0u8; n_chip * n_haps];
     for (ci, &ti) in target_idx.iter().enumerate() {
         if ti >= genotypes.len() { continue; }
         let gt = &genotypes[ti];
+        let swap = transforms.get(ci).copied().unwrap_or(0) == 1;
         for s in 0..n_samples.min(gt.len()) {
-            out[ci * n_haps + s * 2] = gt[s][0];
-            out[ci * n_haps + s * 2 + 1] = gt[s][1];
+            if swap {
+                // Biallelic 0↔1 recode (alleles are projected to {0,1} upstream).
+                out[ci * n_haps + s * 2] = 1 - gt[s][0].min(1);
+                out[ci * n_haps + s * 2 + 1] = 1 - gt[s][1].min(1);
+            } else {
+                out[ci * n_haps + s * 2] = gt[s][0];
+                out[ci * n_haps + s * 2 + 1] = gt[s][1];
+            }
         }
     }
     out
@@ -1006,11 +1120,24 @@ pub fn extract_target_alleles(
 // ---------------------------------------------------------------------------
 
 /// Intersect target markers with reference panel variants.
-pub fn intersect_variants(srp: &SrpReader, targets: &[TargetMarker]) -> (Vec<usize>, Vec<usize>) {
+///
+/// Returns `(wgs_idx, target_idx, transforms)` where `transforms[k]` is the GT
+/// recode for matched site `k` (0 = none, 1 = REF/ALT-swap → recode 0↔1).
+/// `mode` controls the opt-in reconciliation ladder (`AlleleMatch::None` =
+/// exact-only, byte-identical to before; all transforms 0).
+pub fn intersect_variants(
+    srp: &SrpReader, targets: &[TargetMarker], mode: AlleleMatch,
+) -> (Vec<usize>, Vec<usize>, Vec<u8>) {
     fn strip_chr(c: &str) -> &str {
         if let Some(stripped) = c.strip_prefix("chr") { stripped } else { c }
     }
     let ref_chrom = strip_chr(&srp.metadata.chromosome);
+    // Panel allele storage: hashed (synthetic IDs don't contain the literal ref)
+    // or plain. Mirrors read_target_vcf; only consulted by the reconciliation
+    // ladder (the exact pass below uses the precomputed target hash/plain keys).
+    let hash_alleles = !srp.ids.is_empty()
+        && !srp.variants.is_empty()
+        && !srp.ids[0].contains(&srp.variants[0].ref_allele);
 
     // Sort target indices by position for merge-join
     let mut tgt_order: Vec<usize> = (0..targets.len())
@@ -1021,9 +1148,12 @@ pub fn intersect_variants(srp: &SrpReader, targets: &[TargetMarker]) -> (Vec<usi
     // Merge-join: both ref variants and sorted targets are in position order
     let mut wgs_idx = Vec::with_capacity(targets.len());
     let mut target_idx = Vec::with_capacity(targets.len());
+    let mut transforms: Vec<u8> = Vec::with_capacity(targets.len());
     let mut ri = 0usize;
     let mut n_hash_matches = 0usize;
     let mut n_plain_matches = 0usize;
+    let mut n_swap = 0usize;
+    let mut n_strand = 0usize;
 
     for &ti in &tgt_order {
         let tpos = targets[ti].pos;
@@ -1033,6 +1163,7 @@ pub fn intersect_variants(srp: &SrpReader, targets: &[TargetMarker]) -> (Vec<usi
         // Match ref+alt as a coherent pair: either both via hash (new SRP format)
         // or both via plain alleles (old/compat format). Mixing (e.g. ref via hash,
         // alt via plain) is rejected to avoid ambiguous cross-format matches.
+        let mut matched = false;
         let mut rj = ri;
         while rj < srp.variants.len() && srp.variants[rj].pos == tpos {
             let hash_match = srp.variants[rj].ref_allele == targets[ti].ref_hash
@@ -1043,19 +1174,39 @@ pub fn intersect_variants(srp: &SrpReader, targets: &[TargetMarker]) -> (Vec<usi
             if hash_match || plain_match {
                 wgs_idx.push(rj);
                 target_idx.push(ti);
+                transforms.push(0);
                 if hash_match { n_hash_matches += 1; } else { n_plain_matches += 1; }
+                matched = true;
                 break;
             }
             rj += 1;
+        }
+        // Opt-in fallback: only when the exact match failed.
+        if !matched && mode != AlleleMatch::None {
+            if let Some(hit) = reconcile_ladder(
+                &srp.variants, ri, tpos,
+                &targets[ti].ref_hash, &targets[ti].alt_hash,
+                &targets[ti].ref_allele, &targets[ti].alt_allele,
+                hash_alleles, mode,
+            ) {
+                wgs_idx.push(hit.rj);
+                target_idx.push(ti);
+                transforms.push(hit.transform);
+                match hit.kind { ReconKind::Swap => n_swap += 1, ReconKind::Strand => n_strand += 1 }
+            }
         }
     }
     if n_hash_matches > 0 || n_plain_matches > 0 {
         selphi_info!("  Variant intersection: {} hash matches, {} plain matches",
             n_hash_matches, n_plain_matches);
     }
+    if n_swap > 0 || n_strand > 0 {
+        selphi_info!("  --allele-match: reconciled {} swap, {} strand site(s) (recoded to panel orientation)",
+            n_swap, n_strand);
+    }
 
     // Already sorted by wgs_idx (ref is in genomic order, merge preserves it)
-    (wgs_idx, target_idx)
+    (wgs_idx, target_idx, transforms)
 }
 
 // ---------------------------------------------------------------------------
@@ -1150,7 +1301,8 @@ pub fn intersect_variants_for_chr(
     ref_variants: &[crate::srp::Variant],
     ref_ids: &[String],
     targets: &[TargetMarker],
-) -> (Vec<usize>, Vec<usize>) {
+    mode: AlleleMatch,
+) -> (Vec<usize>, Vec<usize>, Vec<u8>) {
     fn strip_chr(c: &str) -> &str {
         if let Some(stripped) = c.strip_prefix("chr") { stripped } else { c }
     }
@@ -1181,22 +1333,120 @@ pub fn intersect_variants_for_chr(
 
     let mut wgs_idx = Vec::with_capacity(targets_ref.len());
     let mut target_idx = Vec::with_capacity(targets_ref.len());
+    let mut transforms: Vec<u8> = Vec::with_capacity(targets_ref.len());
     let mut ri = 0usize;
+    let mut n_swap = 0usize;
+    let mut n_strand = 0usize;
 
     for &ti in &tgt_order {
         let tpos = targets_ref[ti].pos;
         while ri < ref_variants.len() && ref_variants[ri].pos < tpos { ri += 1; }
+        let mut matched = false;
         let mut rj = ri;
         while rj < ref_variants.len() && ref_variants[rj].pos == tpos {
             if ref_variants[rj].ref_allele == targets_ref[ti].ref_hash
                 && ref_variants[rj].alt_allele == targets_ref[ti].alt_hash {
                 wgs_idx.push(rj);
                 target_idx.push(ti);
+                transforms.push(0);
+                matched = true;
                 break;
             }
             rj += 1;
         }
+        if !matched && mode != AlleleMatch::None {
+            if let Some(hit) = reconcile_ladder(
+                ref_variants, ri, tpos,
+                &targets_ref[ti].ref_hash, &targets_ref[ti].alt_hash,
+                &targets_ref[ti].ref_allele, &targets_ref[ti].alt_allele,
+                hash_alleles, mode,
+            ) {
+                wgs_idx.push(hit.rj);
+                target_idx.push(ti);
+                transforms.push(hit.transform);
+                match hit.kind { ReconKind::Swap => n_swap += 1, ReconKind::Strand => n_strand += 1 }
+            }
+        }
+    }
+    if n_swap > 0 || n_strand > 0 {
+        selphi_info!("  --allele-match [{}]: reconciled {} swap, {} strand site(s)",
+            ref_chrom, n_swap, n_strand);
     }
 
-    (wgs_idx, target_idx)
+    (wgs_idx, target_idx, transforms)
+}
+
+#[cfg(test)]
+mod allele_match_tests {
+    use super::*;
+    use crate::srp::Variant;
+
+    fn v(pos: i64, r: &str, a: &str) -> Variant {
+        Variant { chr: "22".into(), pos, ref_allele: r.into(), alt_allele: a.into() }
+    }
+    // Run the ladder against a single panel variant A/G at pos 100 (plain panel).
+    fn ladder(tref: &str, talt: &str, mode: AlleleMatch) -> Option<(usize, u8, bool)> {
+        let panel = [v(100, "A", "G")];
+        reconcile_ladder(&panel, 0, 100, tref, talt, tref, talt, false, mode)
+            .map(|h| (h.rj, h.transform, h.kind == ReconKind::Strand))
+    }
+
+    #[test]
+    fn rc_and_palindrome_helpers() {
+        assert_eq!(rc_snp_base("A").as_deref(), Some("T"));
+        assert_eq!(rc_snp_base("g").as_deref(), Some("C"));
+        assert_eq!(rc_snp_base("AC"), None);   // not single base
+        assert_eq!(rc_snp_base("N"), None);
+        assert!(is_palindromic_snp("A", "T"));
+        assert!(is_palindromic_snp("C", "G"));
+        assert!(!is_palindromic_snp("A", "G")); // not complementary
+        assert!(!is_palindromic_snp("AT", "A")); // indel
+    }
+
+    #[test]
+    fn swap_match_flips_gt() {
+        // Target REF/ALT swapped vs panel A/G → swap rung, transform=1.
+        assert_eq!(ladder("G", "A", AlleleMatch::Swap), Some((0, 1, false)));
+        assert_eq!(ladder("G", "A", AlleleMatch::Full), Some((0, 1, false)));
+        // Strand mode alone does NOT do a pure swap.
+        assert_eq!(ladder("G", "A", AlleleMatch::Strand), None);
+        // None mode never reconciles.
+        assert_eq!(ladder("G", "A", AlleleMatch::None), None);
+    }
+
+    #[test]
+    fn strand_flip_preserves_or_flips_gt() {
+        // Reverse-complement of A/G is T/C, same order → strand match, no GT flip.
+        assert_eq!(ladder("T", "C", AlleleMatch::Strand), Some((0, 0, true)));
+        assert_eq!(ladder("T", "C", AlleleMatch::Full), Some((0, 0, true)));
+        // RC + swap: panel A/G vs target C/T (RC = G/A) → strand+swap, GT flip.
+        assert_eq!(ladder("C", "T", AlleleMatch::Strand), Some((0, 1, true)));
+        // Swap mode alone won't strand-flip.
+        assert_eq!(ladder("T", "C", AlleleMatch::Swap), None);
+    }
+
+    #[test]
+    fn exact_pair_is_not_reconciled_by_ladder() {
+        // An exact-orientation target (A/G) has no swap/strand hit — the ladder is
+        // only ever reached after the exact pass fails, and must not self-match.
+        assert_eq!(ladder("A", "G", AlleleMatch::Full), None);
+    }
+
+    #[test]
+    fn palindrome_is_skipped() {
+        // Panel A/T (palindrome). A swapped target T/A is strand-ambiguous → skip.
+        let panel = [v(100, "A", "T")];
+        let hit = reconcile_ladder(&panel, 0, 100, "T", "A", "T", "A", false, AlleleMatch::Full);
+        assert!(hit.is_none());
+    }
+
+    #[test]
+    fn extract_applies_swap_transform() {
+        // One chip site, 1 sample diploid [0,1]; swap transform → [1,0].
+        let geno = vec![vec![[0u8, 1u8]]];
+        let plain = extract_target_alleles(&geno, &[0], 1, 2, &[]);
+        assert_eq!(plain, vec![0, 1]);
+        let swapped = extract_target_alleles(&geno, &[0], 1, 2, &[1]);
+        assert_eq!(swapped, vec![1, 0]);
+    }
 }
