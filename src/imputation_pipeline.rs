@@ -18,7 +18,8 @@ use selphi::srp::SrpReader;
 use selphi::genmap;
 use selphi::haploid;
 use selphi::io::target_io::{read_target_vcf, write_phased_vcf, extract_target_alleles, intersect_variants,
-    extract_target_site_confidence, align_confidence_to_chip};
+    extract_target_site_confidence, align_confidence_to_chip,
+    extract_target_site_confidence_per_sample, align_confidence_to_chip_per_sample};
 use selphi::imputation::windows::compute_imputation_windows;
 
 use crate::cli::{Args, PhasingEngine};
@@ -768,17 +769,33 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         std::process::exit(1);
     }
 
-    // R2 --refine: per-chip-site input confidence c[v] ∈ [0,1] from the target
-    // VCF (GQ/PL/DP). Built ONLY under --refine; aligned to post-intersection
-    // chip-site order via target_idx. None (→ shipped scalar emission) when
-    // refine is off OR every retained site is fully confident → byte-identical.
-    let target_site_conf: Option<Vec<f64>> = if args.refine {
+    // --refine input confidence c ∈ [0,1] from the target VCF (GQ/PL/DP). Built
+    // ONLY under --refine; aligned to post-intersection chip-site order via
+    // target_idx. Two views:
+    //   R4 EMISSION: `target_site_conf_per_sample` — per-(chip-site, sample),
+    //       row-major [chip*n_samples + sample]. Each target hap softens its
+    //       emission with its OWN sample's confidence column (a site soft for one
+    //       sample no longer corrupts another sample's confident haps).
+    //   R3 RE-ROUTE: `target_site_conf` — per-chip-site MIN across samples (any
+    //       sample soft → record emitted as imputed). Drives WindowSetup /
+    //       batch_driver is_chip flips (output formatters UNCHANGED — R4b will
+    //       make the re-route per-sample).
+    // Both None (→ shipped scalar emission, byte-identical) when refine is off OR
+    // every retained entry is fully confident.
+    // MEMORY: the per-sample matrix is dense [n_chip × n_samples] f64. Fine for
+    // refine cohorts (chip-density n_chip, modest n_samples); for very large
+    // multi-sample refine runs this is n_chip*n_samples*8 bytes.
+    let (target_site_conf, target_site_conf_per_sample): (Option<Vec<f64>>, Option<Vec<f64>>) = if args.refine {
         let marker_conf = extract_target_site_confidence(target_path);
         let mut aligned = align_confidence_to_chip(&marker_conf, &target_idx, n_chip);
+        let (marker_conf_ps, ps_n) = extract_target_site_confidence_per_sample(target_path);
+        let mut aligned_ps = align_confidence_to_chip_per_sample(&marker_conf_ps, ps_n, &target_idx, n_chip);
         // R3 TEST-ONLY hook: synthesize confidence = 0.0 for the first ⌊f·n_chip⌋
         // chip sites so the low-confidence → imputed re-route fires on a chip
         // benchmark (which carries no genuine soft sites). Off by default; the
-        // real driver is the GQ/PL/DP confidence above.
+        // real driver is the GQ/PL/DP confidence above. Applied to BOTH the
+        // per-site min (re-route) AND every sample's column (per-hap emission)
+        // so the two views stay consistent.
         if let Ok(s) = std::env::var("SELPHI_REFINE_TEST_SOFT_FRAC") {
             if let Ok(f) = s.trim().parse::<f64>() {
                 if f > 0.0 {
@@ -786,6 +803,10 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                     if n_force > 0 {
                         let v = aligned.get_or_insert_with(|| vec![1.0f64; n_chip]);
                         for c in v.iter_mut().take(n_force) { *c = 0.0; }
+                        if ps_n > 0 {
+                            let vps = aligned_ps.get_or_insert_with(|| vec![1.0f64; n_chip * ps_n]);
+                            for c in vps.iter_mut().take(n_force * ps_n) { *c = 0.0; }
+                        }
                         selphi_step!("--refine TEST: forced {} chip site(s) to confidence 0.0 (SELPHI_REFINE_TEST_SOFT_FRAC={})", n_force, f);
                     }
                 }
@@ -793,9 +814,9 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         }
         let n_soft = aligned.as_ref().map(|c| c.iter().filter(|&&x| x < 1.0).count()).unwrap_or(0);
         selphi_step!("--refine: {} chip site(s) with input confidence < 1.0 (of {})", n_soft, n_chip);
-        aligned
+        (aligned, aligned_ps)
     } else {
-        None
+        (None, None)
     };
     // R3 re-route threshold: chip sites with confidence < thr are emitted as the
     // HMM/panel-derived (imputed) dosage instead of verbatim hard calls. From
@@ -1118,7 +1139,9 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
             targ_alleles: &targ_bm,
             chip_cm: &chip_cm,
             ne_per_site: final_ne_per_site.as_deref(),
-            site_conf: target_site_conf.as_deref(),
+            // R4: per-(chip-site, sample) confidence for the per-hap emission.
+            site_conf_per_sample: target_site_conf_per_sample.as_deref(),
+            n_samples,
             chip_start: window.chip_start,
             chip_end: window.chip_end,
         };

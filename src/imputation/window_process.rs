@@ -54,10 +54,16 @@ pub struct ImputeWindowInputs<'a> {
     pub targ_alleles: &'a HaplotypeBitmatrix, // (n_chip sites × n_haps) full target, bit-packed
     pub chip_cm: &'a [f64],               // per-chip genetic distances (cM), full length
     pub ne_per_site: Option<&'a [f64]>,   // per-site Ne (from phasing EM), full length
-    /// R2 `--refine` per-chip-site input confidence c[v] ∈ [0,1] (full length,
-    /// post-intersection chip-site order). `None` when refine is off → the HMM
-    /// emission is the shipped scalar `p_err` path (bit-identical).
-    pub site_conf: Option<&'a [f64]>,
+    /// R4 `--refine` per-(chip-site, sample) input confidence c[v,s] ∈ [0,1],
+    /// row-major `[chip_site * n_samples + sample]` (full chip length,
+    /// post-intersection chip-site order). Each target hap `tgt` draws sample
+    /// `tgt/2`'s OWN confidence column for its emission — so a site soft for one
+    /// sample no longer corrupts another sample's confident haps. `None` when
+    /// refine is off OR every entry is 1.0 → the shipped scalar `p_err`
+    /// emission (bit-identical).
+    pub site_conf_per_sample: Option<&'a [f64]>,
+    /// Number of samples = stride of `site_conf_per_sample` rows (haps / 2).
+    pub n_samples: usize,
     pub chip_start: usize,
     pub chip_end: usize,
 }
@@ -106,14 +112,18 @@ pub fn impute_window(
         ne[inputs.chip_start..inputs.chip_end].to_vec()
     });
 
-    // Slice the per-chip-site confidence to this window (same indexing as cm_w).
-    let conf_w: Option<Vec<f64>> = inputs.site_conf.map(|c| {
-        c[inputs.chip_start..inputs.chip_end].to_vec()
+    // R4: slice the per-(chip-site, sample) confidence matrix to this window's
+    // rows (same indexing as cm_w). The result is row-major
+    // [window_var * n_samples + sample]; each hap extracts its sample's column
+    // inside process_window_hmm. None → byte-identical scalar emission.
+    let ns = inputs.n_samples;
+    let conf_w: Option<Vec<f64>> = inputs.site_conf_per_sample.map(|c| {
+        c[inputs.chip_start * ns..inputs.chip_end * ns].to_vec()
     });
 
     process_window_hmm(
         params, inputs.ref_bm, targ_w, cm_w,
-        ne_w.as_deref(), conf_w.as_deref(), &coded,
+        ne_w.as_deref(), conf_w.as_deref(), ns, &coded,
         precomputed_candidates,
         hap_priors, inputs.chip_start, n_var_w,
         on_batch_done,
@@ -144,7 +154,11 @@ pub fn process_window_hmm(
     targ_w: &[u8],
     cm_w: &[f64],
     ne_w: Option<&[f64]>,
+    // R4: per-(window-site, sample) confidence, row-major [var * n_samples +
+    // sample]. Each target hap `tgt` extracts sample `tgt/2`'s column and feeds
+    // it as the per-site `c` to calculate_weights. None → scalar emission.
     conf_w: Option<&[f64]>,
+    n_samples: usize,
     coded: &pbwt::CodedSteps,
     precomputed_candidates: Option<&Vec<Vec<u32>>>,
     hap_priors: &mut [Option<Vec<f64>>],
@@ -181,6 +195,14 @@ pub fn process_window_hmm(
             .into_par_iter()
             .map(|tgt| {
                 let prior = hap_priors_view[tgt].as_deref();
+            // R4 per-hap emission confidence: hap `tgt` belongs to sample tgt/2.
+            // Extract that sample's column [var * n_samples + tgt/2] for v in
+            // 0..n_var_w as a contiguous per-site vector for calculate_weights.
+            // None (refine off / all-confident) → scalar emission, unchanged.
+            let conf_hap: Option<Vec<f64>> = conf_w.map(|cw| {
+                let s = tgt / 2;
+                (0..n_var_w).map(|v| cw[v * n_samples + s]).collect()
+            });
             let candidates = if let Some(pc) = precomputed_candidates {
                 pc[tgt].clone()
             } else {
@@ -249,7 +271,7 @@ pub fn process_window_hmm(
                     est_ne, p_err,
                     Some(super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start }),
                     n_var_w, None,
-                    ne_w, prior, conf_w, 0.0, params.compute_posterior,
+                    ne_w, prior, conf_hap.as_deref(), 0.0, params.compute_posterior,
                 ));
             }
 
@@ -291,7 +313,7 @@ pub fn process_window_hmm(
                 est_ne, p_err,
                 Some(super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start }),
                 n_var_w, None,
-                ne_w, prior, conf_w, 0.0, params.compute_posterior,
+                ne_w, prior, conf_hap.as_deref(), 0.0, params.compute_posterior,
             ))
         })
         .collect();
