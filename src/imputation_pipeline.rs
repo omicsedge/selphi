@@ -63,14 +63,16 @@ fn apply_pedigree_prephase(
     sample_names: &[String],
     target_idx: &[usize], target_genotypes: &[Vec<[u8; 2]>],
     n_chip: usize, n_samples: usize, n_haps: usize,
+    transforms: &[u8],
 ) {
     let Some(ped_path) = args.ped.as_deref() else { return; };
     if !needs_phasing { return; }
     let ped_entries = selphi::diploid::pedigree::parse_ped(Path::new(ped_path), sample_names)
         .unwrap_or_else(|e| { selphi_error!("Cannot read PED file: {}", e); std::process::exit(1); });
     if ped_entries.is_empty() { return; }
+    // Recode to panel orientation so the scaffold reads the same frame it writes.
     let flat_geno = selphi::diploid::pedigree::build_flat_genotypes(
-        target_idx, target_genotypes, n_chip, n_samples);
+        target_idx, target_genotypes, n_chip, n_samples, transforms);
     let (n_phased, n_imp, n_uns, n_err) = selphi::diploid::pedigree::apply_pedigree_scaffold(
         targ_alleles, &flat_geno, &ped_entries, n_chip, n_samples, n_haps,
     );
@@ -89,9 +91,12 @@ fn apply_haploid_detection(
     target_idx: &[usize], target_genotypes: &[Vec<[u8; 2]>],
     n_chip: usize, n_samples: usize, n_haps: usize,
     chip_bps: &[i64],
+    panel_max_pos: i64,
 ) {
     if !needs_phasing { return; }
-    let is_chrx = chr == "X" || chr == "chrX" || chr == "x" || chr == "23";
+    // Superset of the historical literal test (chr-prefix-tolerant / case-insensitive),
+    // equal on every label that test matched.
+    let is_chrx = selphi::contig::is_chrx(chr);
     // PAR mask (opt-in `--chrx-par` on a chrX run): males are DIPLOID in PAR1/PAR2.
     // `None` otherwise → byte-identical to the historical whole-chromosome handling.
     let par_site: Option<Vec<bool>> = if args.chrx_par && is_chrx {
@@ -99,8 +104,13 @@ fn apply_haploid_detection(
         let build = match args.build {
             crate::cli::BuildArg::Grch37 => Build::Grch37,
             crate::cli::BuildArg::Grch38 => Build::Grch38,
-            crate::cli::BuildArg::Auto => selphi::contig::infer_build_from_chrx_maxpos(
-                chip_bps.iter().copied().max().unwrap_or(0)),
+            // Infer from the PANEL chrX extent (spans the chromosome) — robust to a
+            // sparse target that lacks distal-X markers.
+            crate::cli::BuildArg::Auto => {
+                let b = selphi::contig::infer_build_from_chrx_maxpos(panel_max_pos);
+                selphi_step!("--chrx-par: inferred build {:?} from chrX max pos {} (use --build to override)", b, panel_max_pos);
+                b
+            }
         };
         Some(chip_bps.iter().map(|&p| selphi::contig::in_chrx_par(p, build)).collect())
     } else {
@@ -116,8 +126,10 @@ fn apply_haploid_detection(
         return;
     };
     if haploid_samples.is_empty() { return; }
+    // No transform needed: het detection (g0!=g1) is invariant under a 0↔1 swap,
+    // and the reset zeroes the call regardless of orientation.
     let flat_geno = selphi::diploid::pedigree::build_flat_genotypes(
-        target_idx, target_genotypes, n_chip, n_samples);
+        target_idx, target_genotypes, n_chip, n_samples, &[]);
     let n_reset = selphi::diploid::pedigree::reset_haploid_hets(
         targ_alleles, &flat_geno, &haploid_samples, n_chip, n_samples, n_haps, par_ref,
     );
@@ -907,12 +919,13 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     apply_pedigree_prephase(
         args, needs_phasing, &mut targ_alleles,
         &sample_names, &target_idx, &target_genotypes,
-        n_chip, n_samples, n_haps,
+        n_chip, n_samples, n_haps, &allele_transforms,
     );
     apply_haploid_detection(
         args, needs_phasing, srp.chromosome(), &mut targ_alleles,
         &sample_names, &target_idx, &target_genotypes,
         n_chip, n_samples, n_haps, &chip_bps,
+        ref_positions.iter().copied().max().unwrap_or(0),
     );
 
     let (targ_alleles, em_ne_per_site, ref_bm_from_phasing) = if needs_phasing {
@@ -931,7 +944,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
             } else { out_path };
             write_phased_vcf(
                 &pr.phased_alleles, &target_markers, &target_idx, &wgs_idx,
-                &sample_names, &srp, n_chip, n_haps, &out_path,
+                &sample_names, &srp, n_chip, n_haps, &allele_transforms, &out_path,
             ).expect("Failed to write phased VCF");
             selphi_step!("Phase-only VCF: {}", out_path.display());
             selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB",

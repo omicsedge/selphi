@@ -554,7 +554,7 @@ fn build_phased_gt_row(line_buf: &mut String, row: &[u8], n_samples: usize, clam
 
 /// Write phased-only VCF (chip sites only, GT format).
 pub fn write_phased_vcf(
-    phased: &[u8],               // (n_chip, n_haps) row-major
+    phased: &[u8],               // (n_chip, n_haps) row-major, PANEL orientation
     target_markers: &[TargetMarker],
     target_idx: &[usize],        // chip → target marker index
     _wgs_idx: &[usize],          // chip → WGS variant index (for pos ordering)
@@ -562,6 +562,7 @@ pub fn write_phased_vcf(
     srp: &SrpReader,
     n_chip: usize,
     n_haps: usize,
+    transforms: &[u8],           // chip → allele-match transform (1 = REF/ALT-swapped)
     output_path: &Path,
 ) -> std::io::Result<()> {
     use std::io::{Write, BufWriter};
@@ -580,7 +581,18 @@ pub fn write_phased_vcf(
     for ci in 0..n_chip {
         let ti = target_idx[ci];
         let tm = &target_markers[ti];
-        let row = &phased[ci * n_haps..ci * n_haps + n_haps];
+        let slice = &phased[ci * n_haps..ci * n_haps + n_haps];
+        // The phased alleles are in PANEL orientation. A swap-reconciled site
+        // (transform=1) must be un-recoded back to the TARGET REF/ALT it is
+        // labelled with, else the emitted GT contradicts its own REF/ALT column.
+        // (transform=0 / --allele-match none → no flip → byte-identical.)
+        let flipped: Vec<u8>;
+        let row: &[u8] = if transforms.get(ci).copied().unwrap_or(0) == 1 {
+            flipped = slice.iter().map(|&a| 1 - a.min(1)).collect();
+            &flipped
+        } else {
+            slice
+        };
         let ac = build_phased_gt_row(&mut line_buf, row, n_samples, false);
         let af = ac as f64 / n_haps as f64;
         writeln!(w, "{}\t{}\t.\t{}\t{}\t.\tPASS\tAF={:.4};AC={};AN={}\tGT\t{}",
@@ -1135,7 +1147,8 @@ pub fn intersect_variants(
     // Panel allele storage: hashed (synthetic IDs don't contain the literal ref)
     // or plain. Mirrors read_target_vcf; only consulted by the reconciliation
     // ladder (the exact pass below uses the precomputed target hash/plain keys).
-    let hash_alleles = !srp.ids.is_empty()
+    let hash_alleles = mode != AlleleMatch::None
+        && !srp.ids.is_empty()
         && !srp.variants.is_empty()
         && !srp.ids[0].contains(&srp.variants[0].ref_allele);
 

@@ -93,6 +93,40 @@ selphi \
 
 Input phase is detected automatically. If the input is already phased (pipe-separated genotypes), the phasing step is skipped.
 
+### Target ↔ panel allele reconciliation (`--allele-match`)
+
+By default target sites are matched to the panel by **exact REF/ALT** — a genotyping
+chip on a different strand, or with REF/ALT swapped relative to the panel, silently
+loses those markers (the same reason Beagle ships a separate `conform-gt` tool).
+Opt in to reconciliation:
+
+```bash
+selphi ... --allele-match full        # none (default) | swap | strand | full
+```
+
+- `swap` — also accept REF/ALT-swapped sites (recodes the genotype 0↔1 to panel orientation)
+- `strand` — also accept opposite-strand SNPs (reverse-complement), then exact/swap
+- `full` — swap + strand
+
+Palindromic SNPs (A/T, C/G) are strand-ambiguous and are matched by exact equality
+only (the conform-gt / imputation-server convention). Sites that already match
+exactly are never touched, so conforming input is bit-identical to `none`. Applies
+to the chip/WGS genotype path; tune `bcftools norm -m -any` upstream if your panel
+and target disagree on multi-allelic representation (multi-allelic target sites are
+biallelic-projected with a warning).
+
+### Sex chromosomes
+
+- **chrX**: males are auto-detected (low heterozygosity) and their het calls reset
+  before imputation. Add `--chrx-par --build grch38` (or `grch37`/`auto`) to be
+  **PAR-aware** — males stay diploid in PAR1/PAR2 (their real PAR heterozygotes are
+  preserved) and haploid elsewhere.
+- **chrY / chrMT**: refused with a clear message — the Li-Stephens recombination
+  model does not apply to a non-recombining / haploid / homoplasmic contig, and
+  standard panels omit them (use a Y- or mtDNA-haplogroup caller). In whole-genome
+  runs they are skipped with a warning so the autosomes still complete.
+  `SELPHI_ALLOW_NONRECOMB=1` forces a run.
+
 ### Panel phasing (de-novo, no reference)
 
 Phase an unphased cohort using the cohort itself as the conditioning set — the SHAPEIT5/Beagle-style reference-panel construction, in one command (phase_common → phase_rare internally). No external reference panel.

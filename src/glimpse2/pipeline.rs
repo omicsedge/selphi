@@ -60,6 +60,13 @@ pub fn run_pipeline(
     use crate::io::target_io::intersect_variants;
     use crate::lcwgs::pl_reader::{parse_pl_vcf, PlVcfResult};
 
+    // Refuse chrY/chrMT (non-recombining) like the other imputation engines — this
+    // path is reached before the run_lcwgs guard. Override: SELPHI_ALLOW_NONRECOMB=1.
+    if let Some(msg) = crate::contig::nonrecomb_refusal(srp.chromosome()) {
+        crate::selphi_error!("{}", msg);
+        std::process::exit(2);
+    }
+
     // --- 1. Parse the target VCF/BCF (PL → gl3), matching run_lcwgs's setup. ---
     let hash_alleles = !srp.ids.is_empty() && {
         let first_ref = &srp.variants[0].ref_allele;

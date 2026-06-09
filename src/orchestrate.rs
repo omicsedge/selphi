@@ -61,6 +61,8 @@ pub struct MultiChrImputeConfig {
     pub map_dir: Option<String>,
     /// `--allele-match`: target↔panel strand/swap reconciliation mode.
     pub allele_match: selphi::io::target_io::AlleleMatch,
+    /// `--chrx-par`: set so multi-chr can warn it is single-chr-only (no effect here yet).
+    pub chrx_par: bool,
 }
 
 impl MultiChrImputeConfig {
@@ -100,6 +102,7 @@ impl MultiChrImputeConfig {
             all_formats: args.all_formats,
             map_dir,
             allele_match: args.allele_match,
+            chrx_par: args.chrx_par,
         }
     }
 }
@@ -186,6 +189,10 @@ pub fn run_multi_chr(
         }
     }
     let n_chr = chromosomes.len();
+    if config.chrx_par {
+        selphi_info!("  NOTE: --chrx-par is single-chromosome-only and has no effect on this multi-chr run \
+            (chrX male-haploid / PAR handling is not yet wired into the multi-chr path).");
+    }
 
     selphi_info!("  refpanel: {} (multi-chr, {} chromosomes)", srp_path.display(), n_chr);
     selphi_info!("  chromosomes: {}", chromosomes.join(", "));
@@ -263,8 +270,16 @@ pub fn run_multi_chr(
     // imputed) must have a genetic map; without one, interpolate_for_chr falls back
     // to all-zero cM (no recombination structure) and quietly emits a low-quality
     // result. Error early with an actionable message instead.
+    let allow_nr = selphi::contig::allow_nonrecomb();
     let missing_maps: Vec<String> = chromosomes.iter()
         .filter_map(|chr| {
+            // With SELPHI_ALLOW_NONRECOMB=1 a user has opted into running chrY/chrMT
+            // (which have no meaningful cM map) at cM=0; don't hard-error on their
+            // always-missing map — honor the escape hatch like the single-chr path.
+            if allow_nr && matches!(selphi::contig::classify_contig(chr),
+                selphi::contig::ContigClass::ChrY | selphi::contig::ContigClass::ChrMt) {
+                return None;
+            }
             let key = chr.strip_prefix("chr").unwrap_or(chr.as_str());
             let in_target = target_by_chr.contains_key(key) || target_by_chr.contains_key(chr);
             let has_map = multi_map.contains_key(key) || multi_map.contains_key(chr);
