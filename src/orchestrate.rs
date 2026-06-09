@@ -161,7 +161,25 @@ pub fn run_multi_chr(
     // 1. Open multi-chr SRP
     selphi_step!("Opening multi-chr SRP...");
     let multi_srp = MultiChrSrpReader::open(srp_path)?;
-    let chromosomes: Vec<String> = multi_srp.chromosomes().iter().map(|s| s.to_string()).collect();
+    let mut chromosomes: Vec<String> = multi_srp.chromosomes().iter().map(|s| s.to_string()).collect();
+    // Drop non-recombining contigs (chrY/chrMT): the Li-Stephens model does not
+    // apply (see contig::nonrecomb_refusal). Skip-with-warning rather than
+    // hard-error so an autosomal whole-genome run that happens to carry chrY/chrMT
+    // still succeeds on the autosomes. Override with SELPHI_ALLOW_NONRECOMB=1.
+    // No-op (and silent) for the common autosome-only / autosome+chrX panel.
+    if !selphi::contig::allow_nonrecomb() {
+        let skipped: Vec<String> = chromosomes.iter()
+            .filter(|c| matches!(selphi::contig::classify_contig(c),
+                selphi::contig::ContigClass::ChrY | selphi::contig::ContigClass::ChrMt))
+            .cloned().collect();
+        if !skipped.is_empty() {
+            chromosomes.retain(|c| !matches!(selphi::contig::classify_contig(c),
+                selphi::contig::ContigClass::ChrY | selphi::contig::ContigClass::ChrMt));
+            selphi_info!("  WARNING: skipping non-recombining contig(s) {} — chrY/chrMT are not \
+                supported by the Li-Stephens model (use a haplogroup caller; SELPHI_ALLOW_NONRECOMB=1 to force)",
+                skipped.join(", "));
+        }
+    }
     let n_chr = chromosomes.len();
 
     selphi_info!("  refpanel: {} (multi-chr, {} chromosomes)", srp_path.display(), n_chr);

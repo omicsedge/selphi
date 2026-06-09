@@ -11,6 +11,7 @@ pub mod log;
 
 // Common data structures
 pub mod common;
+pub mod contig;
 pub mod srp;
 pub mod genmap;
 
