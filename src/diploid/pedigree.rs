@@ -98,17 +98,21 @@ pub fn apply_pedigree_scaffold(
             let child_het = cg0 != cg1 && child_sum == 1;
             let child_mis = cg0 > 1 || cg1 > 1; // missing if either allele > 1
 
-            // Get parent genotype sums (0=hom-ref, 1=het, 2=hom-alt, -1=unavailable)
+            // Get parent genotype sums (0=hom-ref, 1=het, 2=hom-alt, -1=unavailable).
+            // A parent whose GT is MISSING (sentinel allele > 1) is UNAVAILABLE, not
+            // hom-ref: otherwise a het child + a missing parent is mis-scored as a
+            // Mendelian error, or deterministically phased off bogus 0/0 data (the
+            // readers fold `./.` to the GT_MISSING sentinel for exactly this).
             let gen_father: i8 = if let Some(fi) = ped.father_idx {
-                let fg = genotypes[v * n_samples * 2 + fi * 2]
-                       + genotypes[v * n_samples * 2 + fi * 2 + 1];
-                fg as i8
+                let fa0 = genotypes[v * n_samples * 2 + fi * 2];
+                let fa1 = genotypes[v * n_samples * 2 + fi * 2 + 1];
+                if fa0 > 1 || fa1 > 1 { -1 } else { (fa0 + fa1) as i8 }
             } else { -1 };
 
             let gen_mother: i8 = if let Some(mi) = ped.mother_idx {
-                let mg = genotypes[v * n_samples * 2 + mi * 2]
-                       + genotypes[v * n_samples * 2 + mi * 2 + 1];
-                mg as i8
+                let ma0 = genotypes[v * n_samples * 2 + mi * 2];
+                let ma1 = genotypes[v * n_samples * 2 + mi * 2 + 1];
+                if ma0 > 1 || ma1 > 1 { -1 } else { (ma0 + ma1) as i8 }
             } else { -1 };
 
             // Case 1: Child missing + both parents available → impute
@@ -322,7 +326,10 @@ pub fn reset_haploid_hets(
             if par_site.is_some_and(|p| p.get(v).copied().unwrap_or(false)) { continue; }
             let g0 = genotypes[v * n_samples * 2 + si * 2];
             let g1 = genotypes[v * n_samples * 2 + si * 2 + 1];
-            if g0 != g1 {
+            // A MISSING GT (sentinel > 1) is NOT a haploid het error — skip it (it was
+            // folded to (0,0) before the sentinel existed, i.e. not reset). Only a real
+            // {0,1} het triggers the reset.
+            if g0 <= 1 && g1 <= 1 && g0 != g1 {
                 // Het in haploid → set both alleles to 0 (missing/ref)
                 alleles[v * n_haps + h0] = 0;
                 alleles[v * n_haps + h1] = 0;
@@ -371,5 +378,33 @@ mod par_tests {
         // None: 10/200 = 5% het (> 1%) → NOT detected (PAR hets inflate the rate).
         let h0 = detect_haploid_chrx(&alleles, n_var, 1, 2, None);
         assert!(!h0.contains(&0));
+    }
+
+    #[test]
+    fn missing_parent_is_unavailable_not_homref() {
+        // child(0) het, father(1) MISSING (GT_MISSING sentinel), mother(2) hom-ref.
+        // Pre-fix the missing father folded to (0,0)=hom-ref → (0,0)+(0,0) + het child
+        // = false Mendelian error. Fixed: a missing parent is UNAVAILABLE (-1) → the
+        // available (hom-ref) mother deterministically phases the child, no error.
+        use crate::io::target_io::GT_MISSING;
+        let (n_var, n_samples, n_haps) = (1usize, 3usize, 6usize);
+        let geno: Vec<u8> = vec![0, 1, GT_MISSING, GT_MISSING, 0, 0];
+        let ped = vec![PedEntry { child_idx: 0, father_idx: Some(1), mother_idx: Some(2) }];
+        let mut phased = vec![0u8; n_var * n_haps];
+        let (n_phased, n_imputed, _, n_errors) =
+            apply_pedigree_scaffold(&mut phased, &geno, &ped, n_var, n_samples, n_haps);
+        assert_eq!(n_errors, 0, "a missing parent must NOT count as a Mendelian error");
+        assert_eq!(n_phased, 1, "the available hom-ref mother should phase the child");
+        assert_eq!(n_imputed, 0);
+        assert_eq!(phased[0], 1, "child got REF from the mother → paternal allele = ALT");
+        assert_eq!(phased[1], 0);
+
+        // Control: a REAL hom-ref father (0,0) + hom-ref mother + het child IS a
+        // Mendelian error — proves the test discriminates missing from hom-ref.
+        let geno2: Vec<u8> = vec![0, 1, 0, 0, 0, 0];
+        let mut phased2 = vec![0u8; n_var * n_haps];
+        let (_, _, _, n_err2) =
+            apply_pedigree_scaffold(&mut phased2, &geno2, &ped, n_var, n_samples, n_haps);
+        assert_eq!(n_err2, 1, "real hom-ref + hom-ref parents with a het child = Mendelian error");
     }
 }
