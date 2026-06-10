@@ -73,6 +73,15 @@ pub struct Args {
     #[arg(long, default_value_t = num_cpus::get())]
     pub threads: usize,
 
+    /// Load tunables from a selphi.toml config file. Sets knobs not already in the
+    /// environment (precedence: default < --config < env var < CLI flag). See --dump-config.
+    #[arg(long)]
+    pub config: Option<String>,
+
+    /// Print the full effective configuration (after --config + env) as TOML, then exit.
+    #[arg(long)]
+    pub dump_config: bool,
+
     /// Minimum PBWT match length (auto if not set)
     #[arg(long)]
     pub match_length: Option<usize>,
