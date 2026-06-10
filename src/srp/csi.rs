@@ -299,7 +299,7 @@ pub fn parse_tbi(path: &Path) -> io::Result<TbiIndex> {
     off = nm_end;
     while contig_names.len() < n_ref { contig_names.push(String::new()); }
 
-    let mut linear: Vec<Vec<u64>> = Vec::with_capacity(n_ref);
+    let mut linear: Vec<Vec<u64>> = Vec::with_capacity(n_ref.min(1 << 16)); // cap eager reservation vs untrusted n_ref
     for _ in 0..n_ref {
         if off + 4 > data.len() { linear.push(Vec::new()); continue; }
         let n_bin = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
@@ -307,14 +307,15 @@ pub fn parse_tbi(path: &Path) -> io::Result<TbiIndex> {
         for _ in 0..n_bin {
             if off + 8 > data.len() { break; }
             off += 4; // bin_id
-            let n_chunk = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
-            off += n_chunk * 16;
+            let n_chunk = i32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4;
+            if n_chunk < 0 { break; } // malformed: `negative as usize * 16` would wrap
+            off += n_chunk as usize * 16;
             if off > data.len() { break; }
         }
         // Linear index
         if off + 4 > data.len() { linear.push(Vec::new()); continue; }
         let n_intv = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
-        let mut intvs = Vec::with_capacity(n_intv);
+        let mut intvs = Vec::with_capacity(n_intv.min(1 << 16)); // cap eager reservation vs untrusted n_intv
         for _ in 0..n_intv {
             if off + 8 > data.len() { break; }
             let v = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;

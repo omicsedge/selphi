@@ -397,7 +397,7 @@ pub fn encode_chip_record_partial(
     let n_fmt: u8 = 1;
 
     let shared_start = begin_record(
-        buf, pos_0based, 1, n_info, n_fmt, n_samples_in_batch,
+        buf, pos_0based, ref_allele.len() as i32, n_info, n_fmt, n_samples_in_batch,
         id, ref_allele, alt_allele,
     );
 
@@ -429,7 +429,7 @@ pub fn encode_chip_record(
     let af = ac as f32 / n_haps as f32;
 
     let shared_start = begin_record(
-        buf, pos_0based, 1, n_info, n_fmt, n_samples,
+        buf, pos_0based, ref_allele.len() as i32, n_info, n_fmt, n_samples,
         id, ref_allele, alt_allele,
     );
 

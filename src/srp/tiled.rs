@@ -250,6 +250,13 @@ impl TiledSrpReader {
 
             batch.par_iter().for_each(|(stripe, sites)| {
                 let bs = unsafe { std::slice::from_raw_parts_mut(bits_ptr as *mut u64, bits_len) };
+                // Per-stripe row(cr) → chip-indices(ci) map, built ONCE per stripe.
+                // Replaces the inner per-nnz `for &(ci,cr) in sites` linear scan
+                // (O(nnz × |sites|), pathological for dense extraction where |sites|
+                // ≈ TILE_ROWS, e.g. --phase-panel / srp→bref3) with an O(1) lookup.
+                // `|=` is order-independent + idempotent → output bit-identical.
+                let mut row_cis: HashMap<usize, Vec<usize>> = HashMap::with_capacity(sites.len());
+                for &(ci, cr) in sites.iter() { row_cis.entry(cr).or_default().push(ci); }
                 for band in 0..n_tc {
                     let tile = loaded.decompress_tile(*stripe, band);
                     let cb = band * TILE_COLS;
@@ -261,7 +268,9 @@ impl TiledSrpReader {
                         let (lo, hi) = tile.col_range(col);
                         for k in lo..hi {
                             let lr = tile.indices[k] as usize;
-                            for &(ci, cr) in sites { if cr == lr { bs[ci * n_words + wi] |= bit; } }
+                            if let Some(cis) = row_cis.get(&lr) {
+                                for &ci in cis { bs[ci * n_words + wi] |= bit; }
+                            }
                         }
                     }
                 }
