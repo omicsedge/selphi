@@ -275,7 +275,7 @@ fn precompute_prec(cm: &[f64], n_var: usize, scale: f64, recomb_mult: Option<&[f
 /// steps of the scalar and AVX-512 paths (4 call sites). Takes the posteriors
 /// by value — they are not read again after finalization at any call site.
 #[inline(always)]
-fn finalize_site(
+pub(crate) fn finalize_site(
     loo: bool,
     mut prob_hid_0: f32,
     mut prob_hid_1: f32,
@@ -321,6 +321,18 @@ pub fn run_forward_backward(
     cm: &[f64],
     params: &LcwgsParams,
     recomb_mult: Option<&[f32]>,
+    // POLY/MONO SKIP (LCWGS_POLY_SKIP). When `Some(ps)`, the caller has already
+    // COMPACTED `hl` (len n_poly*2) and `cm` (len n_poly) to the polymorphic-in-
+    // conditioning-set sites; `ps[c]` maps a compacted index `c ∈ 0..n_poly` to its
+    // absolute `ref_bm` row. The FB then runs over the compacted axis (n_var =
+    // cm.len() = n_poly), and only the `ref_bm` SITE reads are remapped through `ps`
+    // — emission/transition/dosage stay on the compacted axis. The monomorphic
+    // sites (uniform emission across all K states → posterior independent of the
+    // copying weights) are direct-imputed in closed form by the CALLER and scattered
+    // back alongside the returned poly-site dosages. `None` ⇒ byte-identical to the
+    // full-axis path. (`ps.len()` must equal `cm.len()`.) See the U²=U transition
+    // identity: dropping a uniform-emission site and spanning its cM gap is exact.
+    poly_sites: Option<&[usize]>,
 ) -> HmmOutput {
     let n_var = cm.len();
     let k = cond_haps.len();
@@ -351,17 +363,17 @@ pub fn run_forward_backward(
     // back to the scalar path below on non-AVX-512 hosts or SELPHI_FORCE_SCALAR=1.
     #[cfg(target_arch = "x86_64")]
     if use_avx512_lcwgs() {
-        return unsafe { run_fb_avx512(hl, cond_haps, ref_bm, cm, params, recomb_mult) };
+        return unsafe { run_fb_avx512(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites) };
     }
     #[cfg(target_arch = "x86_64")]
     if use_avx2_lcwgs() {
-        return unsafe { run_fb_avx2(hl, cond_haps, ref_bm, cm, params, recomb_mult) };
+        return unsafe { run_fb_avx2(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites) };
     }
     // NEON fast path (aarch64: Apple Silicon / ARM servers). 4-wide analogue of
     // the AVX2 path; falls back to scalar below under SELPHI_FORCE_SCALAR=1.
     #[cfg(target_arch = "aarch64")]
     if use_neon_lcwgs() {
-        return unsafe { run_fb_neon(hl, cond_haps, ref_bm, cm, params, recomb_mult) };
+        return unsafe { run_fb_neon(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites) };
     }
 
     let inv_k = 1.0f32 / (k as f32);
@@ -442,8 +454,9 @@ pub fn run_forward_backward(
             let e0 = emit[2 * v];
             let e1 = emit[2 * v + 1];
             let mut s = 0.0f32;
+            let site_v = poly_sites.map_or(v, |ps| ps[v]); // absolute ref_bm row
             for j in 0..k {
-                let a = ref_bm.get(v, cond_haps[j] as usize);
+                let a = ref_bm.get(site_v, cond_haps[j] as usize);
                 let e = if a { e1 } else { e0 };
                 let p = (src[j] * fact2 + fact1) * e;
                 dst[j] = p;
@@ -459,8 +472,9 @@ pub fn run_forward_backward(
             let emit0 = emit[0];
             let emit1 = emit[1];
             let mut s0 = 0.0f32;
+            let site_0 = poly_sites.map_or(0, |ps| ps[0]); // absolute row of poly site 0
             for j in 0..k {
-                let a = ref_bm.get(0, cond_haps[j] as usize);
+                let a = ref_bm.get(site_0, cond_haps[j] as usize);
                 let p = inv_k * if a { emit1 } else { emit0 };
                 prev[j] = p;
                 s0 += p;
@@ -505,8 +519,9 @@ pub fn run_forward_backward(
                     let e1 = emit[2 * last + 1];
                     let mut prob_hid_0 = 0.0f32;
                     let mut prob_hid_1 = 0.0f32;
+                    let site_last = poly_sites.map_or(last, |ps| ps[last]); // absolute row of last poly site
                     for j in 0..k {
-                        let a = ref_bm.get(last, cond_haps[j] as usize);
+                        let a = ref_bm.get(site_last, cond_haps[j] as usize);
                         let e = if a { e1 } else { e0 };
                         let bb = inv_k * e;
                         beta[j] = bb;
@@ -528,8 +543,9 @@ pub fn run_forward_backward(
                     let mut new_beta_sum = 0.0f32;
                     let mut prob_hid_0 = 0.0f32;
                     let mut prob_hid_1 = 0.0f32;
+                    let site_v = poly_sites.map_or(v, |ps| ps[v]); // absolute ref_bm row
                     for j in 0..k {
-                        let a = ref_bm.get(v, cond_haps[j] as usize);
+                        let a = ref_bm.get(site_v, cond_haps[j] as usize);
                         let e = if a { e1_v } else { e0_v };
                         let beta_un_emit = beta[j] * fact2 + fact1;
                         let post = acol[j] * beta_un_emit;
@@ -703,6 +719,7 @@ unsafe fn run_fb_avx512(
     cm: &[f64],
     params: &LcwgsParams,
     recomb_mult: Option<&[f32]>,
+    poly_sites: Option<&[usize]>, // compacted→absolute ref_bm row map (LCWGS_POLY_SKIP)
 ) -> HmmOutput { unsafe {
     use core::arch::x86_64::*;
     let n_var = cm.len();
@@ -746,7 +763,7 @@ unsafe fn run_fb_avx512(
             // Hoist the site row once (one bounds check), then read each
             // conditioning hap's allele bit unchecked — h < n_haps by
             // construction, so h>>6 is always a valid word in this row.
-            let rp = ref_bm.row(v).as_ptr();
+            let rp = ref_bm.row(poly_sites.map_or(v, |ps| ps[v])).as_ptr();
             let base = v * w64;
             let mut widx = 0usize;
             let mut word = 0u64;
@@ -953,6 +970,7 @@ unsafe fn run_fb_avx2(
     cm: &[f64],
     params: &LcwgsParams,
     recomb_mult: Option<&[f32]>,
+    poly_sites: Option<&[usize]>, // compacted→absolute ref_bm row map (LCWGS_POLY_SKIP)
 ) -> HmmOutput { unsafe {
     use core::arch::x86_64::*;
     let n_var = cm.len();
@@ -983,7 +1001,7 @@ unsafe fn run_fb_avx2(
         condbits.clear(); condbits.resize(n_var * w64, 0u64);
         let cbm = condbits.as_mut_ptr();
         for v in 0..n_var {
-            let rp = ref_bm.row(v).as_ptr();
+            let rp = ref_bm.row(poly_sites.map_or(v, |ps| ps[v])).as_ptr();
             let base = v * w64;
             let mut widx = 0usize;
             let mut word = 0u64;
@@ -1229,6 +1247,7 @@ unsafe fn run_fb_neon(
     cm: &[f64],
     params: &LcwgsParams,
     recomb_mult: Option<&[f32]>,
+    poly_sites: Option<&[usize]>, // compacted→absolute ref_bm row map (LCWGS_POLY_SKIP)
 ) -> HmmOutput { unsafe {
     use core::arch::aarch64::*;
     let n_var = cm.len();
@@ -1260,7 +1279,7 @@ unsafe fn run_fb_neon(
         condbits.clear(); condbits.resize(n_var * w64, 0u64);
         let cbm = condbits.as_mut_ptr();
         for v in 0..n_var {
-            let rp = ref_bm.row(v).as_ptr();
+            let rp = ref_bm.row(poly_sites.map_or(v, |ps| ps[v])).as_ptr();
             let base = v * w64;
             let mut widx = 0usize;
             let mut word = 0u64;
@@ -1459,7 +1478,7 @@ pub fn run_forward_backward_scaffold(
     let n_s = common_idx.len();
     let k = cond_haps.len();
     if n_s == 0 || k == 0 {
-        return run_forward_backward(hl, cond_haps, ref_bm, cm, params, None);
+        return run_forward_backward(hl, cond_haps, ref_bm, cm, params, None, None);
     }
 
     let inv_k = 1.0f32 / (k as f32);
@@ -1646,7 +1665,7 @@ mod tests {
         let cm = vec![0.0f64];
         let cond = vec![0u32, 1];
         let params = LcwgsParams::default();
-        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None);
+        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None);
         assert_eq!(out.dosage.len(), 1);
         assert!((out.dosage[0] - 0.5).abs() < 1e-3,
             "flat HL on 50/50 panel should give dose ≈ 0.5, got {}", out.dosage[0]);
@@ -1662,7 +1681,7 @@ mod tests {
         let cm = vec![0.0];
         let cond = vec![0u32, 1];
         let params = LcwgsParams::default();
-        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None);
+        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None);
         assert!(out.dosage[0] < 0.05,
             "strong REF HL should give dose ≈ 0, got {}", out.dosage[0]);
     }
@@ -1677,7 +1696,7 @@ mod tests {
         let cm = vec![0.0];
         let cond = vec![0u32, 1];
         let params = LcwgsParams::default();
-        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None);
+        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None);
         assert!(out.dosage[0] > 0.95,
             "strong ALT HL should give dose ≈ 1, got {}", out.dosage[0]);
     }
@@ -1695,7 +1714,7 @@ mod tests {
         let cm = vec![0.0f64, 0.5, 1.0];
         let cond = vec![0u32, 1];
         let params = LcwgsParams::default();
-        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None);
+        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None);
         for v in 0..3 {
             assert!((out.dosage[v] - 0.5).abs() < 1e-2,
                 "site {} dose={} should be ≈ 0.5", v, out.dosage[v]);
@@ -1720,7 +1739,7 @@ mod tests {
         // (real lcWGS workloads have K≈2000 so default Ne=100000 is fine).
         let mut params = LcwgsParams::default();
         params.ne = 10.0;
-        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None);
+        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None);
         // Site 1 should be close to 1 (strong direct evidence)
         assert!(out.dosage[1] > 0.85, "site 1 dose={}", out.dosage[1]);
         // Sites 0 and 2 should be > 0.5 (spread via HMM transition)
@@ -1750,7 +1769,7 @@ mod tests {
         let cm = vec![0.0f64, 0.05, 0.10, 0.15, 0.20];
         let cond: Vec<u32> = (0..k as u32).collect();
         let params = LcwgsParams::default();
-        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None);
+        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None);
         // Middle: strong ALT evidence
         assert!(out.dosage[2] > 0.85, "middle dose={}", out.dosage[2]);
         // Adjacent sites should be tugged toward ALT but less than middle
@@ -1805,8 +1824,8 @@ mod tests {
         let cond: Vec<u32> = (0..k as u32).collect();
         let params = LcwgsParams::default();
 
-        let a = unsafe { run_fb_avx512(&hl, &cond, &bm, &cm, &params, None) };
-        let b = unsafe { run_fb_avx2(&hl, &cond, &bm, &cm, &params, None) };
+        let a = unsafe { run_fb_avx512(&hl, &cond, &bm, &cm, &params, None, None) };
+        let b = unsafe { run_fb_avx2(&hl, &cond, &bm, &cm, &params, None, None) };
         assert_eq!(a.dosage.len(), n_var);
         assert_eq!(b.dosage.len(), n_var);
         let max_abs = a.dosage.iter().zip(&b.dosage)
