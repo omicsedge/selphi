@@ -78,18 +78,37 @@ pub fn var_set_sca(e: usize, v: &mut u8) { *v |= 3 << (e << 2); }
 #[inline(always)]
 pub fn dip_get(dip: u64, idx: usize) -> bool { ((dip >> idx) & 1) != 0 }
 
+/// Stack-allocated set-bit list returned by [`enumerate_diplotypes`]. Derefs to
+/// `&[u8]`, so every call site (`.len()`, indexing, `.iter()`, `&[u8]` args) is
+/// unchanged — but no per-call heap allocation happens on the hot MCMC path.
+pub struct DipCodes {
+    buf: [u8; 64],
+    len: usize,
+}
+impl std::ops::Deref for DipCodes {
+    type Target = [u8];
+    #[inline(always)]
+    fn deref(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
 /// Enumerate active diplotype codes (set-bit indices, 0..64) from a diplotype
 /// bitmask. Shared by sampling, pruning, and both segment HMMs so the four
-/// former copies cannot drift.
+/// former copies cannot drift. Returns a stack-backed [`DipCodes`] (no heap
+/// alloc); the bytes and their order are identical to the former `Vec<u8>`.
 #[inline]
-pub fn enumerate_diplotypes(mask: u64) -> Vec<u8> {
-    let mut codes = Vec::new();
+pub fn enumerate_diplotypes(mask: u64) -> DipCodes {
+    let mut buf = [0u8; 64];
+    let mut len = 0usize;
     for d in 0..64u8 {
-        if dip_get(mask, d as usize) {
-            codes.push(d);
-        }
+        // Branch-free: always write d at the cursor, advance only when the bit
+        // is set. Yields the identical ascending set-bit sequence as the prior
+        // push-based version (cursor ≤ 63 since at most 64 bits can be set).
+        buf[len] = d;
+        len += dip_get(mask, d as usize) as usize;
     }
-    codes
+    DipCodes { buf, len }
 }
 
 /// Set bit `idx` in diplotype bitmask.
