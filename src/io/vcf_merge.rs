@@ -128,6 +128,23 @@ pub fn merge_batch_vcfs(
         if any_eof { break; }
     }
 
+    // Completeness: every batch must be fully consumed. The chunk loop's inner
+    // per-batch break exits on batch-0 EOF while a LONGER batch may still have
+    // trailing records (the count-mismatch check inside the loop misses that
+    // specific case) — silently truncating the merged output. Probe each reader;
+    // a non-blank trailing line means a mismatched/truncated intermediate.
+    for (bi, r) in readers.iter_mut().enumerate() {
+        let mut extra = String::new();
+        match r.read_line(&mut extra) {
+            Ok(n) if n > 0 && !extra.trim().is_empty() => {
+                return Err(std::io::Error::other(format!(
+                    "batch {bi} has trailing records beyond the merged set — \
+                     mismatched/truncated intermediate batch file")));
+            }
+            _ => {}
+        }
+    }
+
     writer.flush()?;
     drop(writer);
 

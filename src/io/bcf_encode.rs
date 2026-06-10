@@ -149,6 +149,9 @@ fn begin_record(
     buf.extend_from_slice(&QUAL_MISSING.to_le_bytes());   // qual = missing
     buf.extend_from_slice(&n_info.to_le_bytes());         // n_info
     buf.extend_from_slice(&2u16.to_le_bytes());           // n_allele = 2
+    // BCF2.2 packs n_fmt (top 8 bits) | n_sample (low 24 bits): n_samples must fit
+    // in 24 bits (16,777,215) or it corrupts the n_fmt field. Intrinsic format limit.
+    debug_assert!(n_samples < (1 << 24), "BCF n_samples {} exceeds the 24-bit fmt_sample limit", n_samples);
     let fmt_sample = (n_fmt as u32) << 24 | (n_samples as u32);
     buf.extend_from_slice(&fmt_sample.to_le_bytes());
 

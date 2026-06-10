@@ -130,11 +130,21 @@ fn main() {
                     args.refine = false;
                 }
                 cli::Engine::Genotype => {
+                    // The genotype/refine engines consume GT/PL records, not reads — a
+                    // forced genotype/refine on BAM/CRAM input would silently misroute.
+                    if args.bam.is_some() || args.bam_list.is_some() {
+                        selphi_error!("--engine genotype cannot process BAM/CRAM reads — use --engine lcwgs (or auto)");
+                        std::process::exit(2);
+                    }
                     selphi_step!("engine: genotype (forced — no lcwgs, no refine)");
                     args.lcwgs = false;
                     args.refine = false;
                 }
                 cli::Engine::Refine => {
+                    if args.bam.is_some() || args.bam_list.is_some() {
+                        selphi_error!("--engine refine cannot process BAM/CRAM reads — use --engine lcwgs (or auto)");
+                        std::process::exit(2);
+                    }
                     selphi_step!("engine: genotype + refine (forced)");
                     args.lcwgs = false;
                     args.refine = true;
