@@ -69,6 +69,13 @@ fn run_one_hap<F: Fn(usize) -> usize>(
     gl3: &[f32], ref_bm: &HaplotypeBitmatrix, cm: &[f64], params: &LcwgsParams,
     use_scaffold: bool, common_idx: &[usize],
     n_var: usize, n_samples: usize,
+    // POLY/MONO SKIP (LCWGS_POLY_SKIP). `Some((is_common, shap_ref))` ⇒ run the
+    // imputation FB only over this hap's POLYMORPHIC-in-conditioning-set sites
+    // (every common site + every rare site carried by ≥1 of `cond`) and
+    // direct-impute the monomorphic-in-cond sites in closed form. None ⇒ the
+    // full-axis FB (byte-identical default). `is_common[v]`=panel MAF≥rare_maf;
+    // `shap_ref[h]`=ascending rare sites where panel hap h carries the minor allele.
+    poly_skip: Option<(&[bool], &[Vec<u32>])>,
 ) -> (Vec<f32>, Vec<u8>) {
     let mut hap_hl = vec![0.0f32; n_var * 2];
     let mg = params.min_gl; // GLIMPSE2 per-hap GL floor (0 = disabled)
@@ -101,8 +108,63 @@ fn run_one_hap<F: Fn(usize) -> usize>(
         (0..n_var).map(|v| hap_hl[2 * v + 1]).collect()
     } else if use_scaffold {
         run_forward_backward_scaffold(&hap_hl, common_idx, cond, ref_bm, cm, params).dosage
+    } else if let Some((is_common, shap_ref)) = poly_skip {
+        // POLY/MONO SKIP (GLIMPSE2 conditioning_set::compactSelection analogue).
+        // Polymorphic = every common site + every rare site carried by ≥1 of this
+        // hap's conditioning haps; the rest are monomorphic-in-cond (every cond hap
+        // agrees → uniform emission across all K states → the copying posterior is
+        // independent of the FB weights). Run the FB over the compacted poly axis
+        // (transitions span the skipped sites' cM gaps — exact, since T(d1+d2)=
+        // T(d2)∘T(d1) for r=1-exp(scale·Δcm)), then scatter poly doses back and
+        // direct-impute the mono sites in closed form.
+        let mut carried: Vec<u32> = Vec::new();
+        for &c in cond { carried.extend_from_slice(&shap_ref[c as usize]); }
+        carried.sort_unstable();
+        carried.dedup();
+        let mut poly_sites: Vec<usize> = Vec::with_capacity(n_var);
+        let mut hl_poly: Vec<f32> = Vec::with_capacity(n_var * 2);
+        let mut cm_poly: Vec<f64> = Vec::with_capacity(n_var);
+        let mut mono: Vec<usize> = Vec::new();
+        let mut ci = 0usize;
+        for v in 0..n_var {
+            let v32 = v as u32;
+            while ci < carried.len() && carried[ci] < v32 { ci += 1; }
+            let carried_v = ci < carried.len() && carried[ci] == v32;
+            if is_common[v] || carried_v {
+                poly_sites.push(v);
+                hl_poly.push(hap_hl[2 * v]);
+                hl_poly.push(hap_hl[2 * v + 1]);
+                cm_poly.push(cm[v]);
+            } else {
+                mono.push(v);
+            }
+        }
+        let mut dose = vec![0.0f32; n_var];
+        if !poly_sites.is_empty() {
+            let dp = run_forward_backward(
+                &hl_poly, cond, ref_bm, &cm_poly, params, None, Some(&poly_sites),
+            ).dosage;
+            for (i, &v) in poly_sites.iter().enumerate() { dose[v] = dp[i]; }
+        }
+        // Direct-impute the monomorphic sites: all K cond haps carry the major
+        // allele `m_alt = ref_bm.get(v, cond[0])`, so finalize_site with the
+        // unit-mass posterior (loo=false; the mass + LOO divisor cancel) gives the
+        // exact full-FB dose: ed·h1/(ee·h0+ed·h1) (REF-major) or ee·h1/(ed·h0+ee·h1).
+        let ee = 1.0f32 - params.epsilon;
+        let ed = params.epsilon;
+        for &v in &mono {
+            let m_alt = ref_bm.get(v, cond[0] as usize);
+            dose[v] = crate::lcwgs::hmm::finalize_site(
+                false,
+                if m_alt { 0.0 } else { 1.0 },
+                if m_alt { 1.0 } else { 0.0 },
+                0.0, 0.0,
+                hap_hl[2 * v], hap_hl[2 * v + 1], ee, ed,
+            );
+        }
+        dose
     } else {
-        run_forward_backward(&hap_hl, cond, ref_bm, cm, params, None).dosage
+        run_forward_backward(&hap_hl, cond, ref_bm, cm, params, None, None).dosage
     };
     // Sample a fresh allele per site from the posterior dose (deterministic
     // splitmix64 stream keyed by seed/iteration/hap/variant → reproducible).
@@ -231,6 +293,20 @@ struct GibbsConfig {
     /// GLIMPSE2-exact flat rule (`LCWGS_G2_FLAT_EXACT`): a site is flat ⟺ its GL
     /// triple is all-equal. Read once here (was a per-iteration env read).
     flat_exact: bool,
+    /// EXPERIMENT (`LCWGS_POLY_SKIP`, default OFF → byte-identical default). Faithful
+    /// GLIMPSE2 `conditioning_set::compactSelection` poly/mono split (conditioning_set.cpp:
+    /// 122-138): run the per-iteration phasing HMM only over each individual's
+    /// POLYMORPHIC sites — every COMMON site (panel MAF ≥ `rare_maf`) plus every RARE
+    /// site carried by ≥1 of that individual's conditioning haps — and SKIP the
+    /// monomorphic-in-conditioning-set rare sites. Their emission is uniform across all
+    /// founders so they integrate out exactly for HOMs; het-at-mono falls to the random
+    /// shuffle pass (phasing_hmm.cpp:294-301), which is phase-degenerate anyway (no
+    /// conditioning hap carries the minor allele) and dosage-invariant. On a whole
+    /// chromosome the rare-monomorphic-in-cond sites are the large majority, so this is
+    /// the multi-sample phaser-wall lever: GLIMPSE2 pays O(n_poly·K), we paid O(n_var·K).
+    /// NOT byte-identical to the all-sites phaser (the het-mono segmentation/RNG path
+    /// differs) → gated and R²-validated, not md5-gated.
+    poly_skip: bool,
 }
 impl GibbsConfig {
     fn from_env() -> Self {
@@ -279,6 +355,7 @@ impl GibbsConfig {
             phase_main_every: envu("LCWGS_PHASE_MAIN_EVERY").filter(|&n| n >= 1).unwrap_or(1),
             rich_cond: std::env::var("LCWGS_G2_RICH_COND").is_ok(),
             flat_exact: std::env::var("LCWGS_G2_FLAT_EXACT").is_ok(),
+            poly_skip: std::env::var("LCWGS_POLY_SKIP").is_ok(),
         }
     }
 }
@@ -411,6 +488,31 @@ pub fn run_gibbs(
         (Vec::new(), Vec::new(), Vec::new())
     };
 
+    // Per-individual polymorphic/monomorphic split structures (LCWGS_POLY_SKIP).
+    // `ps_is_common[v]` = panel MAF ≥ rare_maf (always polymorphic, GLIMPSE2 TYPE_COMMON);
+    // `ps_shap_ref[h]` = ascending rare sites where panel hap h carries the minor allele
+    // (GLIMPSE2 H.ShapRef). Built once; empty unless the lever is on so the default path
+    // is untouched. The per-sample union of `ps_shap_ref` over a sample's conditioning
+    // haps yields its polymorphic rare sites; the rest are monomorphic-in-cond.
+    // Built once whenever poly-skip is on (consumed by BOTH the phasing HMM rephase
+    // and, via `poly_skip_arg` below, the imputation FB). Empty when off → both
+    // consumers fall through to the full-axis path (byte-identical default).
+    let (ps_is_common, ps_shap_ref): (Vec<bool>, Vec<Vec<u32>>) =
+        if cfg.poly_skip {
+            build_poly_skip_structures(ref_bm, params.rare_maf, n_var)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+    // Imputation-FB poly-skip argument: the compacted-axis FB applies to the
+    // default (non-scaffold) path only — scaffold already restricts the FB to
+    // common sites. `None` ⇒ the full-axis FB (byte-identical default).
+    let poly_skip_arg: Option<(&[bool], &[Vec<u32>])> =
+        if cfg.poly_skip && !use_scaffold {
+            Some((ps_is_common.as_slice(), ps_shap_ref.as_slice()))
+        } else {
+            None
+        };
+
     for it in 0..params.n_iterations {
         // 1. Sparse PBWT selection from the current sampled hap alleles.
         let recompute = it == 0 || it == n_burnin || it % refresh == 0;
@@ -485,12 +587,12 @@ pub fn run_gibbs(
                         h0, s, it, seed,
                         |v| prev_alleles[v * n_target_haps + h1] as usize,
                         &cond_per_hap[h0], gl3, ref_bm, cm, params,
-                        use_scaffold, &common_idx, n_var, n_samples);
+                        use_scaffold, &common_idx, n_var, n_samples, poly_skip_arg);
                     let (d1, samp1) = run_one_hap(
                         h1, s, it, seed,
                         |v| samp0[v] as usize,
                         &cond_per_hap[h1], gl3, ref_bm, cm, params,
-                        use_scaffold, &common_idx, n_var, n_samples);
+                        use_scaffold, &common_idx, n_var, n_samples, poly_skip_arg);
                     vec![(h0, d0, samp0), (h1, d1, samp1)]
                 }).collect();
             per_sample.into_iter().flatten().collect()
@@ -502,7 +604,7 @@ pub fn run_gibbs(
                     h, s, it, seed,
                     |v| prev_alleles[v * n_target_haps + partner] as usize,
                     &cond_per_hap[h], gl3, ref_bm, cm, params,
-                    use_scaffold, &common_idx, n_var, n_samples);
+                    use_scaffold, &common_idx, n_var, n_samples, poly_skip_arg);
                 (h, dose, sampled)
             }).collect()
         };
@@ -593,9 +695,42 @@ pub fn run_gibbs(
                     let x = st.wrapping_mul(0x2545_F491_4F6C_DD1D);
                     (x >> 40) as f32 / (1u64 << 24) as f32
                 };
+                // Per-individual poly/mono split (LCWGS_POLY_SKIP): polymorphic =
+                // every common site + every rare site carried by one of THIS sample's
+                // conditioning haps; the rest is monomorphic-in-cond and skipped (a
+                // het-at-mono goes to the random shuffle pass, a hom-at-mono is omitted
+                // entirely — its uniform emission integrates out exactly). Mirrors
+                // GLIMPSE2 conditioning_set.cpp:122-138.
+                let (ps_owned, ms_owned): (Vec<i32>, Vec<i32>) = if cfg.poly_skip {
+                    let mut carried: Vec<u32> = Vec::new();
+                    for &h in cond_haps { carried.extend_from_slice(&ps_shap_ref[h as usize]); }
+                    carried.sort_unstable();
+                    carried.dedup();
+                    let mut ps_v: Vec<i32> = Vec::new();
+                    let mut ms_v: Vec<i32> = Vec::new();
+                    let mut ci = 0usize;
+                    for v in 0..n_var {
+                        let v32 = v as u32;
+                        while ci < carried.len() && carried[ci] < v32 { ci += 1; }
+                        let carried_v = ci < carried.len() && carried[ci] == v32;
+                        if ps_is_common[v] || carried_v {
+                            ps_v.push(v as i32);
+                        } else if h0[v] != h1[v] {
+                            ms_v.push(v as i32);
+                        }
+                    }
+                    (ps_v, ms_v)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                let (poly_ref, mono_ref): (&[i32], &[i32]) = if cfg.poly_skip {
+                    (&ps_owned, &ms_owned)
+                } else {
+                    (&poly_sites, &mono_sites)
+                };
                 let mut hmm = crate::lcwgs::phasing_hmm::PhasingHmm::new(&g2p);
                 hmm.rephase(&mut h0, &mut h1, &flat, cond_haps, ref_bm, cm, &g2p,
-                            &poly_sites, &mono_sites, &lq, &mut rng_u01);
+                            poly_ref, mono_ref, &lq, &mut rng_u01);
                 (s,
                  h0.iter().map(|&b| b as u8).collect(),
                  h1.iter().map(|&b| b as u8).collect())
@@ -749,6 +884,45 @@ pub fn run_gibbs(
     let cond_final = if cfg.cond_dump { cond_cache } else { Vec::new() };
 
     GibbsOutput { dosage, gp, cond_final }
+}
+
+/// Build the per-individual polymorphic/monomorphic split inputs for the phasing
+/// HMM (`LCWGS_POLY_SKIP`), mirroring GLIMPSE2 `conditioning_set::compactSelection`
+/// (conditioning_set.cpp:122-138): a site is COMMON (always polymorphic) when its
+/// panel MAF ≥ `rare_maf`; otherwise it is RARE and stays polymorphic for a given
+/// conditioning set iff some conditioning hap carries its MINOR allele.
+///
+/// Returns `(is_common, shap_ref)` where `is_common[v]` flags common sites and
+/// `shap_ref[h]` is the ascending list of RARE site indices at which panel hap `h`
+/// carries the minor allele (the transpose GLIMPSE2 stores as `H.ShapRef`). The
+/// per-sample union of `shap_ref` over a sample's conditioning haps gives the rare
+/// sites that remain polymorphic; the rest are monomorphic-in-conditioning-set.
+fn build_poly_skip_structures(
+    ref_bm: &HaplotypeBitmatrix,
+    rare_maf: f32,
+    n_var: usize,
+) -> (Vec<bool>, Vec<Vec<u32>>) {
+    let n_ref = ref_bm.n_haps;
+    let thr = rare_maf as f64;
+    let mut is_common = vec![false; n_var];
+    let mut shap_ref: Vec<Vec<u32>> = vec![Vec::new(); n_ref];
+    for v in 0..n_var {
+        let ac = ref_bm.popcount_row(v, n_ref) as f64;
+        let maf = ac.min(n_ref as f64 - ac) / n_ref as f64;
+        if maf >= thr {
+            is_common[v] = true;
+            continue;
+        }
+        // Rare: carriers = panel haps with the MINOR allele (ALT when ALT is the
+        // minor allele, else REF). For MAF < rare_maf the minor count is small → sparse.
+        let alt_is_minor = ac <= (n_ref as f64 - ac);
+        for h in 0..n_ref {
+            if ref_bm.get(v, h) == alt_is_minor {
+                shap_ref[h].push(v as u32);
+            }
+        }
+    }
+    (is_common, shap_ref)
 }
 
 /// Initialize per-hap sampled alleles from the marginal genotype MAP.
