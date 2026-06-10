@@ -74,7 +74,6 @@ pub fn merge_batch_vcfs(
     // INFO recomputation across records within a chunk.
     const CHUNK_SIZE: usize = 1024;
     let n_batches = readers.len();
-    let n_samples_total = all_sample_names.len();
 
     loop {
         // Read one chunk of lines from each batch reader.
@@ -117,7 +116,7 @@ pub fn merge_batch_vcfs(
         let merged: Vec<(Vec<u8>, String, i64, i64)> = (0..chunk_lines).into_par_iter().map(|i| {
             let mut batch_lines: Vec<&str> = Vec::with_capacity(n_batches);
             for bi in 0..n_batches { batch_lines.push(&chunk_per_batch[bi][i]); }
-            merge_one_record(&batch_lines, n_samples_total, no_ap)
+            merge_one_record(&batch_lines, no_ap)
         }).collect::<std::io::Result<Vec<_>>>()?;
 
         for (buf, chrom, pos, rlen) in merged {
@@ -187,13 +186,11 @@ fn parse_contig_id(contig_field: &str) -> Option<String> {
 /// Returns (line_bytes, chrom, pos_0based, rlen) for TBI indexing.
 fn merge_one_record(
     batch_lines: &[&str],
-    n_samples_total: usize,
     no_ap: bool,
 ) -> std::io::Result<(Vec<u8>, String, i64, i64)> {
     if batch_lines.is_empty() {
         return Err(std::io::Error::other("merge_one_record: empty batches"));
     }
-    let _ = n_samples_total;
 
     // Split first batch's line into fields (CHROM..FORMAT + samples).
     let first = batch_lines[0];
