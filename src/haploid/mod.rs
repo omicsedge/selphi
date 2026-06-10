@@ -607,6 +607,14 @@ fn phase_genotypes_inner(
                     thread_local! {
                         static EM_WS: RefCell<em::EmWorkspace> = RefCell::new(em::EmWorkspace::new());
                     }
+                    // Per-marker recombination prob is loop-invariant across the per-sample
+                    // E-step (pure function of the window map gaps and this sub-iteration's
+                    // ri) — hoist the -expm1 transcendental out of em_for_sample. Byte-identical.
+                    let mut p_recomb_em = vec![0.0f32; w_size];
+                    for m in 1..w_size {
+                        let prod = ri_f32 * (w_cm[m] - w_cm[m - 1]) as f32;
+                        p_recomb_em[m] = -(-(prod as f64)).exp_m1() as f32;
+                    }
                     let em_results: Vec<(i32, f64, f64, f64)> = em_samp.par_iter().map(|&si| {
                         EM_WS.with(|ws| {
                             let mut ws = ws.borrow_mut();
@@ -614,7 +622,7 @@ fn phase_genotypes_inner(
                                 &w_ibs, w_cm,
                                 it_starts, si, w_size, it_n_steps, n_targ_haps,
                                 m_all, it_step_size, it_min_steps, N_MOSAIC,
-                                ri_f32, pm_f32, n_haps_total, &mut ws)
+                                ri_f32, pm_f32, n_haps_total, &p_recomb_em, &mut ws)
                         })
                     }).collect();
                     let (mut wc, mut wm, mut wg, mut wsp) = (0i32, 0.0f64, 0.0f64, 0.0f64);
@@ -668,6 +676,14 @@ fn phase_genotypes_inner(
 
             let active_samples: Vec<usize> = (0..n_samples).filter(|&si| !converged[si]).collect();
             let n_skipped = n_samples - active_samples.len();
+            // Per-marker recombination prob is loop-invariant across the per-sample phasing
+            // HMM (pure function of the window map gaps and the post-EM ri) — hoist the
+            // -expm1 transcendental out of phase_one. Byte-identical.
+            let mut p_recomb_hmm = vec![0.0f32; w_size];
+            for m in 1..w_size {
+                let prod = ri_f32 * (w_cm[m] - w_cm[m - 1]) as f32;
+                p_recomb_hmm[m] = -(-(prod as f64)).exp_m1() as f32;
+            }
             let active_results: Vec<(usize, hmm::PhaseResult)> = active_samples.par_iter().map(|&si| {
                 (si, hmm::phase_one(&w_hap_bits, hap_byte_stride,
                     &w_ibs, &w_het_mask, w_cm,
@@ -675,6 +691,7 @@ fn phase_genotypes_inner(
                     si, w_size, n_targ_haps, n_samples, it_n_steps,
                     0, own_start_local, own_end_local, m_all, w_size, N_MOSAIC,
                     lr_f32, ri_f32, pm_f32, n_haps_total, w_bp,
+                    &p_recomb_hmm,
                     it, wi))
             }).collect();
 

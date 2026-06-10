@@ -224,6 +224,10 @@ pub fn phase_one(hbm:&[u8],hbs:usize,ibs:&[i32],hmask:&[u8],cm:&[f64],cst:&[i32]
     nst:usize,ws:usize,os:usize,oe:usize,mt:usize,wsz:usize,nmo:usize,
     lrt:f32,recomb_intensity:f32,pm:f32,nh:usize,
     chip_bp:&[i64],
+    // Per-marker recombination prob, precomputed once per phasing iteration by the
+    // caller (loop-invariant across samples: a pure function of the window map gaps and
+    // the post-EM `recomb_intensity`). Indexed by window marker; `p_recomb[0]==0`.
+    p_recomb:&[f32],
     dbg_it:usize,dbg_wi:usize,
 ) -> PhaseResult {
     let(h0,h1)=(si*2,si*2+1);
@@ -351,14 +355,15 @@ pub fn phase_one(hbm:&[u8],hbs:usize,ibs:&[i32],hmask:&[u8],cm:&[f64],cst:&[i32]
 
     if dbg{crate::haploid::debug::dump_mismatch(dbg_it,dbg_wi,si,&pw.mm,nc,ns)}
 
-    // Per-cluster recombination probability (f32 product before expm1)
-    let ri=recomb_intensity;
+    // Per-cluster recombination probability. p_recomb[m] (the -expm1 transcendental) is
+    // precomputed once per phasing iteration by the caller (loop-invariant across samples);
+    // only the per-cluster product is local. Byte-identical to the former per-call recompute
+    // (p_recomb[0]==0 matches the old m==0 → dm=0 → p=0 branch).
+    let ri=recomb_intensity; // still used by the debug dump below
     pw.pr.clear(); pw.pr.resize(nc, 0.0f32);
     for c in 1..nc{let mut pnr=1.0f32;
         for m in pw.csa[c]as usize..pw.cea[c]as usize{
-            let dm=if m>0{(cm[m]-cm[m-1])as f32}else{0.0f32};
-            let prod=ri*dm;  // f32×f32 product (recombIntensity * dist, both float)
-            let p=(-(-(prod as f64)).exp_m1())as f32;pnr*=1.0-p}
+            let p=p_recomb[m];pnr*=1.0-p}
         pw.pr[c]=1.0-pnr}
 
     if dbg{crate::haploid::debug::dump_recomb(dbg_it,dbg_wi,si,&pw.pr,nc,ri*nh as f32/0.04f32,pm)}
