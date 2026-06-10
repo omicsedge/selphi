@@ -108,17 +108,19 @@ fn extend_high_coverage_haps(
     // to the former per-hap recompute. Byte-identical.
     let mut ext_of = vec![usize::MAX; n_ref_haps];
     for (i, &h) in extend_haps.iter().enumerate() { ext_of[h] = i; }
-    let mut present = vec![vec![false; n_sites]; extend_haps.len()];
+    // Single flat (n_extend × n_sites) bitmask, row-major by extend-hap, instead of a
+    // Vec<Vec<bool>> (one heap alloc, not n_extend).
+    let mut present = vec![false; extend_haps.len() * n_sites];
     for (v, site) in filtered_matches.iter().enumerate() {
         for &m in site {
             let i = ext_of[m as usize];
-            if i != usize::MAX { present[i][v] = true; }
+            if i != usize::MAX { present[i * n_sites + v] = true; }
         }
     }
     // Add each extend-hap to the sites where it is missing (same order as before).
     for (i, &h) in extend_haps.iter().enumerate() {
         for v in 0..n_sites {
-            if !present[i][v] {
+            if !present[i * n_sites + v] {
                 filtered_matches[v].push(h as i64);
             }
         }

@@ -31,7 +31,6 @@ pub fn write_lcwgs_vcf(out: &LcwgsOutput, output_path: &std::path::Path) -> std:
     writeln!(w, "##source=Selphi_v{}_lcWGS SelfDecode\u{2122}", env!("CARGO_PKG_VERSION"))?;
     writeln!(w, "##FILTER=<ID=PASS,Description=\"All filters passed\">")?;
     writeln!(w, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT allele frequency\">")?;
-    writeln!(w, "##INFO=<ID=RAF,Number=A,Type=Float,Description=\"Reference-panel ALT allele frequency\">")?;
     writeln!(w, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">")?;
     writeln!(w, "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"Estimated ALT dose [0,2]\">")?;
     writeln!(w, "##FORMAT=<ID=GP,Number=G,Type=Float,Description=\"Estimated genotype posteriors\">")?;

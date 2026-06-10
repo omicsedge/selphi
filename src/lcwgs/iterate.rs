@@ -6,17 +6,19 @@
 //!     selected haps, producing per-hap dosages
 //!  3. Re-derive MAP genotypes from the new dosages
 //!
-//! Default schedule: 15 iterations total, with the last 5 ("main") averaged
-//! into the final output. The first 10 ("burn-in") refine the conditioning
-//! set without contributing to the saved dosages.
+//! Default schedule: 50 iterations total (`LCWGS_N_ITER`), with the last 25
+//! ("main", `LCWGS_N_MAIN`) averaged into the final output. The first 25
+//! ("burn-in") refine the conditioning set without contributing to the saved
+//! dosages. (Raised from GLIMPSE2's 20/15 to 50/25 — a measured broad-spectrum
+//! +0.0017 OVERALL / +0.0026 on the 0.5-1% rare bin; convergence plateaus ~50.)
 //!
 //! # Why iterate
 //!
 //! At low coverage the first MAP call (from raw PL alone) has high error
 //! rate — ~30% wrong calls at 0.5× sequencing. After one HMM pass the
 //! per-site posterior is much sharper (LD-informed), so the next PBWT
-//! selection picks a cleaner conditioning set, etc. Empirically GLIMPSE2
-//! converges in 10-15 rounds; we copy that schedule.
+//! selection picks a cleaner conditioning set, etc. GLIMPSE2 converges in
+//! ~20 rounds; we run more (50) for the rare-bin convergence gain above.
 //!
 //! # Performance (per feedback_ultra_optimized)
 //!
