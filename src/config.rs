@@ -130,6 +130,29 @@ static KNOBS: &[Knob] = &[
 /// adaptive path.
 const PRESENCE_GATED: &[&str] = &["LCWGS_KPBWT", "LCWGS_MIN_GL"];
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Typed accessors — the SINGLE point of env-var access (purist refactor). Every
+// env read in the codebase routes through these, so `std::env::var` lives ONLY in
+// this file. Each replicates one read idiom BYTE-IDENTICALLY (no trim, matching the
+// historical `envu`/`envf` closures and inline `.ok().and_then(parse).unwrap_or`):
+//   present(X)      = std::env::var(X).is_ok()              (opt-in; opt-out = !present)
+//   is_one(X)       = value == "1"  (== Some("1") idiom)
+//   {usize,u32,i64,f64,f32}_or(X,d) = parse, unwrap_or(d)
+//   {usize,f64}_opt(X)              = parse → Option         (for the `match`/special sites)
+//   raw(X)          = the raw value if present               (for `special` sites that
+//                                                              keep their own parse/filter)
+// ─────────────────────────────────────────────────────────────────────────────
+#[allow(dead_code)] #[inline] pub fn present(name: &str) -> bool { std::env::var(name).is_ok() }
+#[allow(dead_code)] #[inline] pub fn is_one(name: &str) -> bool { std::env::var(name).ok().as_deref() == Some("1") }
+#[allow(dead_code)] #[inline] pub fn raw(name: &str) -> Option<String> { std::env::var(name).ok() }
+#[allow(dead_code)] #[inline] pub fn usize_or(name: &str, d: usize) -> usize { std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(d) }
+#[allow(dead_code)] #[inline] pub fn usize_opt(name: &str) -> Option<usize> { std::env::var(name).ok().and_then(|s| s.parse().ok()) }
+#[allow(dead_code)] #[inline] pub fn u32_or(name: &str, d: u32) -> u32 { std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(d) }
+#[allow(dead_code)] #[inline] pub fn i64_or(name: &str, d: i64) -> i64 { std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(d) }
+#[allow(dead_code)] #[inline] pub fn f64_or(name: &str, d: f64) -> f64 { std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(d) }
+#[allow(dead_code)] #[inline] pub fn f64_opt(name: &str) -> Option<f64> { std::env::var(name).ok().and_then(|s| s.parse().ok()) }
+#[allow(dead_code)] #[inline] pub fn f32_or(name: &str, d: f32) -> f32 { std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(d) }
+
 /// Load a Selphi config file (`--config`). For each `KEY = value` line where KEY is a
 /// known knob and the env var is NOT already set, set it so the existing env reads pick
 /// it up. Bool knobs: `true`/`1` → set to "1"; `false`/absent → left unset. Returns the
