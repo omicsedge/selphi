@@ -628,6 +628,20 @@ pub fn phase_singletons_ibd(
     let n_scaffold = scaffold_indices.len();
     let mut n_phased = 0u32;
 
+    // Per-site folded allele count (ALT-allele sum over all 2·n_samples haplotypes).
+    // This is a SITE property — invariant across the per-sample loop below, which only
+    // ever writes `phased`, never `target_geno`. Precompute it ONCE instead of redoing
+    // the O(n_samples) fold inside the per-(sample × het-site) inner loop (which made
+    // the singleton scan O(n_var · n_samples²)). Byte-identical; quadratic→linear in n.
+    let site_ac: Vec<u32> = (0..n_var).map(|v| {
+        let mut ac = 0u32;
+        for s2 in 0..n_samples {
+            ac += target_geno[v * n_samples * 2 + s2 * 2] as u32;
+            ac += target_geno[v * n_samples * 2 + s2 * 2 + 1] as u32;
+        }
+        ac
+    }).collect();
+
     for si in 0..n_samples {
         let h0 = si * 2;
         let h1 = si * 2 + 1;
@@ -675,12 +689,8 @@ pub fn phase_singletons_ibd(
             let g1 = target_geno[v * n_samples * 2 + si * 2 + 1];
             if g0 == g1 || g0 + g1 != 1 { continue; }
 
-            // Check if singleton (MAC=1)
-            let mut mac = 0u32;
-            for s2 in 0..n_samples {
-                mac += target_geno[v * n_samples * 2 + s2 * 2] as u32;
-                mac += target_geno[v * n_samples * 2 + s2 * 2 + 1] as u32;
-            }
+            // Check if singleton (MAC=1) — folded count from the precomputed site_ac.
+            let mac = site_ac[v];
             if mac.min(n_samples as u32 * 2 - mac) > 1 { continue; }
 
             // Find flanking scaffold position
