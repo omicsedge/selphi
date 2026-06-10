@@ -592,12 +592,10 @@ fn append_chip_line_bytes(
     vid_prefixes: &[Vec<u8>],
     chip_gt: &crate::common::HaplotypeBitmatrix, n_haps: usize, n_samples: usize, an_str: &[u8],
 ) {
-    let _ = n_haps;
-    let mut ac = 0u32;
-    for s in 0..n_samples {
-        ac += chip_gt.get(ci, s * 2) as u32;
-        ac += chip_gt.get(ci, s * 2 + 1) as u32;
-    }
+    // Chip hard-call ALT count = popcount of the row over all n_haps (= 2·n_samples)
+    // haplotypes. Word-wise popcount instead of a per-bit `get()` sweep; byte-identical.
+    let _ = n_samples;
+    let ac = chip_gt.popcount_row(ci, n_haps);
     let af = ac as f64 / n_haps as f64;
     buf.extend_from_slice(&vid_prefixes[vp_idx]);
     buf.extend_from_slice(b"\t.\tPASS\tAF=");

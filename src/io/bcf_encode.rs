@@ -424,11 +424,10 @@ pub fn encode_chip_record(
     let n_info: u16 = 3; // AF, AC, AN (no DR2, no IMP)
     let n_fmt: u8 = 1;   // GT only
 
-    let mut ac = 0u32;
-    for s in 0..n_samples {
-        ac += chip_genotypes.get(chip_idx, s * 2) as u32;
-        ac += chip_genotypes.get(chip_idx, s * 2 + 1) as u32;
-    }
+    // Chip hard-call ALT count = popcount of the row over all n_haps (= 2·n_samples)
+    // haplotypes. Word-wise popcount instead of a per-bit `get()` sweep; byte-identical.
+    let _ = n_samples;
+    let ac = chip_genotypes.popcount_row(chip_idx, n_haps);
     let af = ac as f32 / n_haps as f32;
 
     let shared_start = begin_record(
