@@ -36,14 +36,10 @@ pub struct SampleAccumulator {
     pub sum_ds_gt: Vec<f64>,
     pub n_correct: Vec<u64>,
     pub n_total: Vec<u64>,
-    // Per-MAF-bin errors
-    pub bin_errors: Vec<Vec<u64>>,  // [bin][sample]
-    pub bin_n: Vec<u64>,            // [bin] variant count
 }
 
 impl SampleAccumulator {
     pub fn new(n_samples: usize) -> Self {
-        let n_bins = MAF_BINS.len();
         SampleAccumulator {
             n_samples, n_variants: 0,
             sum_ds: vec![0.0; n_samples],
@@ -53,19 +49,12 @@ impl SampleAccumulator {
             sum_ds_gt: vec![0.0; n_samples],
             n_correct: vec![0; n_samples],
             n_total: vec![0; n_samples],
-            bin_errors: (0..n_bins).map(|_| vec![0u64; n_samples]).collect(),
-            bin_n: vec![0; n_bins],
         }
     }
 
     /// Add one variant's dosage/truth for all samples.
-    pub fn add_variant(&mut self, ds: &[f32], truth_gt: &[f32], maf: f64) {
+    pub fn add_variant(&mut self, ds: &[f32], truth_gt: &[f32]) {
         self.n_variants += 1;
-        // The MAF bin depends only on `maf` (per-variant), so resolve it ONCE
-        // instead of rescanning MAF_BINS for every sample. `position` returns the
-        // first matching bin — identical to the original first-match-then-break
-        // scan, so the accumulated bin_errors/bin_n are bit-identical.
-        let bin = MAF_BINS.iter().position(|&(lo, hi, _)| maf >= lo && maf < hi);
         for s in 0..self.n_samples {
             let d = ds[s] as f64;
             let g = truth_gt[s] as f64;
@@ -80,15 +69,7 @@ impl SampleAccumulator {
             let g_call = g.round() as i32;
             if d_call == g_call { self.n_correct[s] += 1; }
             self.n_total[s] += 1;
-
-            // MAF bin errors (bin resolved once above)
-            if d_call != g_call {
-                if let Some(bi) = bin { self.bin_errors[bi][s] += 1; }
-            }
         }
-
-        // Track bin variant counts
-        if let Some(bi) = bin { self.bin_n[bi] += 1; }
     }
 
     /// Compute per-sample R² from accumulated statistics.
@@ -122,12 +103,6 @@ impl SampleAccumulator {
             self.sum_ds_gt[s] += other.sum_ds_gt[s];
             self.n_correct[s] += other.n_correct[s];
             self.n_total[s] += other.n_total[s];
-        }
-        for bi in 0..MAF_BINS.len() {
-            for s in 0..self.n_samples {
-                self.bin_errors[bi][s] += other.bin_errors[bi][s];
-            }
-            self.bin_n[bi] += other.bin_n[bi];
         }
     }
 }
@@ -990,7 +965,7 @@ pub fn evaluate_parallel(
                             let maf = if gt_n > 0 { let af = gt_sum / (gt_n as f64 * 2.0); af.min(1.0 - af) } else { 0.0 };
                             let (r2, conc) = site_r2(&imp_ds, &truth_ds, n_samples);
                             site_acc.add(maf, r2, conc);
-                            sample_acc.add_variant(&imp_ds, &truth_ds, maf);
+                            sample_acc.add_variant(&imp_ds, &truth_ds);
                             n_matched += 1;
                         }
 

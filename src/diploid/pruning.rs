@@ -146,7 +146,6 @@ pub fn perform_merges(
 
     let mut s = 0usize;
     let mut toffset = graph.dc0();
-    let _amb_offset_prev = 0usize;
 
     // Precompute ambiguous offsets per segment
     let mut amb_offsets = vec![0usize; graph.n_segments + 1];

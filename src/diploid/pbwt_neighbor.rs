@@ -34,7 +34,6 @@ pub struct PbwtNeighborIndex {
     /// Full panel size (target + ref) — PBWT sort dimension.
     pub n_sweep: usize,
     pub depth: usize,
-    pub group_sites: Vec<usize>,
     pub site_grouping: Vec<usize>,
     pub site_eval: Vec<bool>,
     pub site_selection: Vec<bool>,
@@ -228,7 +227,6 @@ impl PbwtNeighborIndex {
 
         Self {
             data, n_groups, n_haps, n_sweep, depth,
-            group_sites: vec![0; n_groups],
             site_grouping, site_eval,
             site_selection: vec![false; n_sites],
             chunk_assignments,
@@ -259,18 +257,11 @@ impl PbwtNeighborIndex {
             crate::selphi_debug!("  [PBWT] select: {} groups, {} non-empty, hash={:#x}",
                 self.n_groups, non_empty, hash);
         }
-        let mut rng_call_count = 0usize;
-        let is_first = FIRST.load(std::sync::atomic::Ordering::Relaxed);
         for g in 0..self.n_groups {
             if !candidates[g].is_empty() {
-                rng_call_count += 1;
                 let idx = rng(candidates[g].len());
-                if rng_call_count <= 5 && !is_first {
-                    // is_first was already swapped above, so this is iter 0
-                }
                 let site = candidates[g][idx];
                 self.site_selection[site] = true;
-                self.group_sites[g] = site;
             }
         }
         self.data.fill(-1);
@@ -532,7 +523,7 @@ mod tests {
         let mut idx = PbwtNeighborIndex::new(&cm, n_haps, n_haps, 4, 0.1, 2, &ac, &vec![0u32; n_sites], 0.1);
 
         let mut counter = 0usize;
-        idx.select_storage_sites(&mut |n| { counter += 1; 0 });
+        idx.select_storage_sites(&mut |_n| { counter += 1; 0 });
 
         let site_eval = vec![true; n_sites];
         let bm = HaplotypeBitmatrix::from_panel(
@@ -574,7 +565,7 @@ mod tests {
         let ac: Vec<u32> = vec![50; n_sites];
         let mut idx = PbwtNeighborIndex::new(&cm, n_haps, n_haps, 4, 0.1, 2, &ac, &vec![0u32; n_sites], 0.1);
 
-        idx.select_storage_sites(&mut |n| 0);
+        idx.select_storage_sites(&mut |_n| 0);
         let site_eval = vec![true; n_sites];
         let bm = HaplotypeBitmatrix::from_panel(
             n_sites, n_haps,

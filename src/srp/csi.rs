@@ -267,13 +267,6 @@ pub struct TbiIndex {
     pub linear: Vec<Vec<u64>>,
 }
 
-impl TbiIndex {
-    /// Find the contig index matching `name`, or None.
-    pub fn find_contig(&self, name: &str) -> Option<usize> {
-        self.contig_names.iter().position(|n| n == name)
-    }
-}
-
 /// Parse a .tbi index file.
 pub fn parse_tbi(path: &Path) -> io::Result<TbiIndex> {
     let raw = std::fs::read(path)?;

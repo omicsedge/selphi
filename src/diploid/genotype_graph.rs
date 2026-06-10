@@ -173,8 +173,7 @@ pub struct GenotypeGraph {
     pub prob_missing: Vec<f32>,
     /// Number of stored transition probabilities.
     pub n_stored_probs: usize,
-    /// Number of storage events (main iterations completed).
-    pub n_storage_events: usize,
+    // (n_storage_events counter removed: was write-only.)
 }
 
 impl GenotypeGraph {
@@ -196,7 +195,6 @@ impl GenotypeGraph {
             prob_stored: Vec::new(),
             prob_missing: Vec::new(),
             n_stored_probs: 0,
-            n_storage_events: 0,
         }
     }
 

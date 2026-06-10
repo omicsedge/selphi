@@ -92,13 +92,6 @@ pub fn cpu_time_secs() -> f64 {
     0.0
 }
 
-/// Format CPU utilization: "X.Xs cpu (YY% of N cores)"
-pub fn fmt_cpu(wall_secs: f64, cpu_start: f64, n_cores: usize) -> String {
-    let cpu_delta = cpu_time_secs() - cpu_start;
-    let pct = if wall_secs > 0.01 { cpu_delta / wall_secs / n_cores as f64 * 100.0 } else { 0.0 };
-    format!("{:.1}s cpu ({:.0}% of {} cores)", cpu_delta, pct, n_cores)
-}
-
 /// Peak resident set size in MB (Linux /proc/self/status).
 pub fn peak_mem_mb() -> f64 {
     // Linux: /proc/self/status VmHWM
