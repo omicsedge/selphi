@@ -138,11 +138,17 @@ pub fn apply_config_file(path: &str) -> std::io::Result<usize> {
     let text = std::fs::read_to_string(path)?;
     let mut applied = 0usize;
     for raw in text.lines() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with('[') { continue; }
-        let Some((k, v)) = line.split_once('=') else { continue };
+        let s = raw.trim();
+        if s.is_empty() || s.starts_with('#') || s.starts_with('[') { continue; }
+        let Some((k, rest)) = s.split_once('=') else { continue };
         let k = k.trim();
-        let v = v.trim().trim_matches('"').trim();
+        // Value: a QUOTED value may contain '#' (take up to the closing quote, preserving it);
+        // otherwise strip a trailing '# comment'. Then trim surrounding whitespace.
+        let rest = rest.trim_start();
+        let v: &str = match rest.strip_prefix('"').and_then(|r| r.split_once('"')) {
+            Some((inner, _)) => inner,
+            None => rest.split('#').next().unwrap_or("").trim(),
+        };
         let Some(knob) = KNOBS.iter().find(|kn| kn.name == k) else {
             eprintln!("[selphi] config: unknown knob '{k}' (ignored)");
             continue;
@@ -150,13 +156,21 @@ pub fn apply_config_file(path: &str) -> std::io::Result<usize> {
         if std::env::var(k).is_ok() { continue; } // explicit env overrides the file
         match knob.kind {
             Kind::Bool => {
-                if v.eq_ignore_ascii_case("true") || v == "1" {
-                    // SAFETY: set before the engine runs, single-threaded (main, post-parse).
-                    unsafe { std::env::set_var(k, "1"); }
-                    applied += 1;
+                // Accept the common spellings; warn (don't silently disable) on anything else.
+                match v.trim().to_ascii_lowercase().as_str() {
+                    "true" | "1" | "yes" | "on" | "y" => {
+                        // SAFETY: set before the engine runs, single-threaded (main, post-parse).
+                        unsafe { std::env::set_var(k, "1"); }
+                        applied += 1;
+                    }
+                    "false" | "0" | "no" | "off" | "n" | "" => {} // leave unset
+                    other => eprintln!(
+                        "[selphi] config: knob '{k}' has unrecognized bool value '{other}' \
+                         (treated as off; use true/false)"),
                 }
             }
             Kind::Value => {
+                let v = v.trim();
                 if !v.is_empty() {
                     unsafe { std::env::set_var(k, v); }
                     applied += 1;
@@ -210,4 +224,46 @@ pub fn dump_config() -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KNOBS;
+    use std::collections::HashSet;
+
+    /// Every env var Selphi actually reads (LCWGS_/SELPHI_/STAGE2_ prefix, via
+    /// `std::env::var` / `envu` / `envf` / `envs`) MUST be in the KNOBS registry — so
+    /// `--dump-config` / `--config` stay complete and the registry can't silently drift
+    /// when a new knob is added without registering it. Scans src/ at test time.
+    #[test]
+    fn registry_covers_every_env_knob() {
+        let reg: HashSet<&str> = KNOBS.iter().map(|k| k.name).collect();
+        let mut found: HashSet<String> = HashSet::new();
+        let mut stack = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(dir) = stack.pop() {
+            for ent in std::fs::read_dir(&dir).unwrap().flatten() {
+                let p = ent.path();
+                if p.is_dir() { stack.push(p); continue; }
+                if p.extension().and_then(|e| e.to_str()) != Some("rs") { continue; }
+                let txt = std::fs::read_to_string(&p).unwrap();
+                for pat in ["env::var(\"", "envu(\"", "envf(\"", "envs(\""] {
+                    let mut from = 0usize;
+                    while let Some(i) = txt[from..].find(pat) {
+                        let start = from + i + pat.len();
+                        let name: String = txt[start..].chars()
+                            .take_while(|c| *c == '_' || c.is_ascii_uppercase() || c.is_ascii_digit())
+                            .collect();
+                        if name.starts_with("LCWGS_") || name.starts_with("SELPHI_") || name.starts_with("STAGE2_") {
+                            found.insert(name);
+                        }
+                        from = start;
+                    }
+                }
+            }
+        }
+        let mut missing: Vec<&String> = found.iter().filter(|n| !reg.contains(n.as_str())).collect();
+        missing.sort();
+        assert!(missing.is_empty(),
+            "env knobs read in src/ but missing from config.rs KNOBS (add them): {missing:?}");
+    }
 }
