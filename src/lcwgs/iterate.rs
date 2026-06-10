@@ -517,6 +517,30 @@ pub fn run_gibbs(
             None
         };
 
+    // Per-sample phasing `flat` GL mask (read-uninformative sites). It depends ONLY
+    // on the static input `gl3` and the `flat_exact` rule — the Gibbs loop re-samples
+    // `hap_alleles`, never `gl3` — so it is loop-invariant. Build it ONCE here instead
+    // of rebuilding it inside the per-iteration per-sample rephase closure (was
+    // O(n_samples·n_var) GL reads + a Vec alloc per sample × every iteration). Phaser-
+    // only; empty when the GLIMPSE2 phaser is off. Byte-identical (same values).
+    let flat_all: Vec<Vec<bool>> = if cfg.glimpse2_phase {
+        let flat_exact = cfg.flat_exact;
+        (0..n_samples).map(|s| {
+            (0..n_var).map(|v| {
+                let b = v * n_samples * 3 + 3 * s;
+                let (g0, g1, g2) = (gl3[b], gl3[b + 1], gl3[b + 2]);
+                let sum = g0 + g1 + g2;
+                if flat_exact {
+                    sum <= f32::MIN_POSITIVE || (g0 == g1 && g1 == g2)
+                } else {
+                    sum <= f32::MIN_POSITIVE || (g0.max(g1).max(g2) / sum) < (1.0 / 3.0 + 1e-3)
+                }
+            }).collect()
+        }).collect()
+    } else {
+        Vec::new()
+    };
+
     for it in 0..params.n_iterations {
         // 1. Sparse PBWT selection from the current sampled hap alleles.
         let recompute = it == 0 || it == n_burnin || it % refresh == 0;
@@ -657,25 +681,13 @@ pub fn run_gibbs(
             // sets flat ⟺ the GL triple is all-equal (PL[0]==PL[1]==PL[2], i.e. no
             // informative read), NOT a peakedness threshold. Our default `<1/3+1e-3`
             // over-marks weakly-informative sites as flat; this restores the exact rule.
-            let flat_exact = cfg.flat_exact;
             let rephased: Vec<(usize, Vec<u8>, Vec<u8>)> = (0..n_samples).into_par_iter().map(|s| {
                 let (h0i, h1i) = (2 * s, 2 * s + 1);
                 let mut h0: Vec<bool> = (0..n_var).map(|v| hap_alleles[v * n_target_haps + h0i] == 1).collect();
                 let mut h1: Vec<bool> = (0..n_var).map(|v| hap_alleles[v * n_target_haps + h1i] == 1).collect();
                 // flat[v]: read uninformative (≈ no/weak read) → emission-skipped het.
-                let mut flat = vec![false; n_var];
-                for v in 0..n_var {
-                    let b = v * n_samples * 3 + 3 * s;
-                    let (g0, g1, g2) = (gl3[b], gl3[b + 1], gl3[b + 2]);
-                    let sum = g0 + g1 + g2;
-                    flat[v] = if flat_exact {
-                        // GLIMPSE2-exact: all-equal GL triple ⇒ no read info.
-                        sum <= f32::MIN_POSITIVE || (g0 == g1 && g1 == g2)
-                    } else {
-                        sum <= f32::MIN_POSITIVE
-                            || (g0.max(g1).max(g2) / sum) < (1.0 / 3.0 + 1e-3)
-                    };
-                }
+                // Loop-invariant (depends only on static gl3) → precomputed in flat_all.
+                let flat: &[bool] = &flat_all[s];
                 let cond_union: Vec<u32>;
                 let cond_haps: &[u32] = if rich_cond {
                     let mut seen = std::collections::HashSet::new();
@@ -733,7 +745,7 @@ pub fn run_gibbs(
                     (&poly_sites, &mono_sites)
                 };
                 let mut hmm = crate::lcwgs::phasing_hmm::PhasingHmm::new(&g2p);
-                hmm.rephase(&mut h0, &mut h1, &flat, cond_haps, ref_bm, cm, &g2p,
+                hmm.rephase(&mut h0, &mut h1, flat, cond_haps, ref_bm, cm, &g2p,
                             poly_ref, mono_ref, &lq, &mut rng_u01);
                 (s,
                  h0.iter().map(|&b| b as u8).collect(),
