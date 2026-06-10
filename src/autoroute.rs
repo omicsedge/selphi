@@ -75,7 +75,7 @@ impl Sniff {
 
 /// Number of data records to sample. Env-overridable for testing.
 fn sample_target() -> usize {
-    std::env::var("SELPHI_AUTOROUTE_SAMPLE").ok()
+    selphi::config::raw("SELPHI_AUTOROUTE_SAMPLE")
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(2000)
@@ -84,7 +84,7 @@ fn sample_target() -> usize {
 /// Call-rate threshold below which a GT-bearing-but-mostly-uncalled file is
 /// treated as the read-likelihood regime. Env-overridable.
 fn callrate_threshold() -> f64 {
-    std::env::var("SELPHI_AUTOROUTE_CALLRATE").ok()
+    selphi::config::raw("SELPHI_AUTOROUTE_CALLRATE")
         .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|&f| (0.0..=1.0).contains(&f))
         .unwrap_or(0.5)
@@ -95,7 +95,7 @@ fn callrate_threshold() -> f64 {
 /// Below it, the callset is a chip array → plain genotype (no refine). A WGS
 /// callset is ~1000–2000 sites/Mb; a genotyping chip is ~100–800. Env-overridable.
 fn wgs_density_threshold() -> f64 {
-    std::env::var("SELPHI_AUTOROUTE_WGS_DENSITY").ok()
+    selphi::config::raw("SELPHI_AUTOROUTE_WGS_DENSITY")
         .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|&f| f >= 0.0)
         .unwrap_or(1000.0)
@@ -109,7 +109,7 @@ fn wgs_density_threshold() -> f64 {
 /// presence / density / call-rate are all ratio-robust to the truncation.
 /// Env-overridable (bytes). BCF is unaffected (it streams records).
 fn sniff_max_bytes() -> u64 {
-    std::env::var("SELPHI_AUTOROUTE_MAXBYTES").ok()
+    selphi::config::raw("SELPHI_AUTOROUTE_MAXBYTES")
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(256 << 20) // 256 MiB

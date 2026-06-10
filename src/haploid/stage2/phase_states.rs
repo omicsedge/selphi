@@ -122,10 +122,10 @@ impl<'a> LowFreqPhaseStates<'a> {
         let q_before_random = self.q.len();
         if self.q.is_empty() {
             self.fill_q_with_random_haps(targ_hap);
-            if std::env::var("SELPHI_HAPLOID_STAGE2_DEBUG").ok().as_deref() == Some("trace") {
+            if crate::config::raw("SELPHI_HAPLOID_STAGE2_DEBUG").as_deref() == Some("trace") {
                 eprintln!("    [phase_states] target_hap={} FELL BACK to random haps (q was empty)", targ_hap);
             }
-        } else if std::env::var("SELPHI_HAPLOID_STAGE2_DEBUG").ok().as_deref() == Some("trace") && targ_hap < 4 {
+        } else if crate::config::raw("SELPHI_HAPLOID_STAGE2_DEBUG").as_deref() == Some("trace") && targ_hap < 4 {
             eprintln!("    [phase_states] target_hap={} q.len()={}", targ_hap, q_before_random);
         }
 

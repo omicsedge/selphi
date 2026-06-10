@@ -839,7 +839,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         // real driver is the GQ/PL/DP confidence above. Applied to BOTH the
         // per-site min (re-route) AND every sample's column (per-hap emission)
         // so the two views stay consistent.
-        if let Ok(s) = std::env::var("SELPHI_REFINE_TEST_SOFT_FRAC") {
+        if let Some(s) = selphi::config::raw("SELPHI_REFINE_TEST_SOFT_FRAC") {
             if let Ok(f) = s.trim().parse::<f64>() {
                 if f > 0.0 {
                     let n_force = ((f.min(1.0)) * n_chip as f64).floor() as usize;
@@ -869,7 +869,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // (+0.0220); pushing thr higher only adds borderline calls (c∈[0.1,0.95]) where
     // the input ≈ the panel and slightly hurts. 0.1 is the top-of-plateau optimum AND
     // the safest (fewest re-routes). Only consulted when site_conf is Some (--refine).
-    let refine_thr: f64 = std::env::var("SELPHI_REFINE_THR").ok()
+    let refine_thr: f64 = selphi::config::raw("SELPHI_REFINE_THR")
         .and_then(|s| s.trim().parse::<f64>().ok())
         .unwrap_or(0.1);
 
@@ -973,7 +973,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         bm
     });
 
-    let chip_cm = if std::env::var("SELPHI_NO_LD").is_ok() {
+    let chip_cm = if selphi::config::present("SELPHI_NO_LD") {
         selphi_info!("  [WARN] LD correction DISABLED");
         raw_chip_cm.clone()
     } else {

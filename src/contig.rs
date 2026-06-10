@@ -62,7 +62,7 @@ pub fn is_chrx(chrom: &str) -> bool {
 /// True when the non-recombining-contig override is set (`SELPHI_ALLOW_NONRECOMB`
 /// = `1`/`true`). Expert escape hatch; default off.
 pub fn allow_nonrecomb() -> bool {
-    std::env::var("SELPHI_ALLOW_NONRECOMB")
+    crate::config::raw("SELPHI_ALLOW_NONRECOMB")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }

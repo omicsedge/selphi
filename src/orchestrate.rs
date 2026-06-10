@@ -450,7 +450,7 @@ pub fn run_multi_chr(
         });
 
         // LD correction
-        let chip_cm = if std::env::var("SELPHI_NO_LD").is_ok() {
+        let chip_cm = if selphi::config::present("SELPHI_NO_LD") {
             raw_chip_cm.clone()
         } else {
             genmap::compute_ld_correction_bm(&ref_bm_imp, &raw_chip_cm, n_chip, n_ref, 100)

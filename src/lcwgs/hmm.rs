@@ -99,12 +99,12 @@ fn use_avx512_lcwgs() -> bool {
     use std::sync::OnceLock;
     static USE: OnceLock<bool> = OnceLock::new();
     *USE.get_or_init(|| {
-        if std::env::var("SELPHI_FORCE_SCALAR").ok().as_deref() == Some("1") {
+        if crate::config::is_one("SELPHI_FORCE_SCALAR") {
             return false;
         }
         // SELPHI_FORCE_AVX2=1 drops to the AVX2 path even on an AVX-512 host (for
         // AVX2/scalar parity validation on this hardware).
-        if std::env::var("SELPHI_FORCE_AVX2").ok().as_deref() == Some("1") {
+        if crate::config::is_one("SELPHI_FORCE_AVX2") {
             return false;
         }
         is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512dq")
@@ -118,7 +118,7 @@ fn use_avx2_lcwgs() -> bool {
     use std::sync::OnceLock;
     static USE: OnceLock<bool> = OnceLock::new();
     *USE.get_or_init(|| {
-        if std::env::var("SELPHI_FORCE_SCALAR").ok().as_deref() == Some("1") {
+        if crate::config::is_one("SELPHI_FORCE_SCALAR") {
             return false;
         }
         is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
@@ -134,7 +134,7 @@ fn use_neon_lcwgs() -> bool {
     use std::sync::OnceLock;
     static USE: OnceLock<bool> = OnceLock::new();
     *USE.get_or_init(|| {
-        if std::env::var("SELPHI_FORCE_SCALAR").ok().as_deref() == Some("1") {
+        if crate::config::is_one("SELPHI_FORCE_SCALAR") {
             return false;
         }
         std::arch::is_aarch64_feature_detected!("neon")
@@ -146,7 +146,7 @@ fn use_neon_lcwgs() -> bool {
 fn hmm_timing() -> bool {
     use std::sync::OnceLock;
     static T: OnceLock<bool> = OnceLock::new();
-    *T.get_or_init(|| std::env::var("LCWGS_TIMING").is_ok())
+    *T.get_or_init(|| crate::config::present("LCWGS_TIMING"))
 }
 
 /// Cached leave-one-out emission flag (`true` unless `LCWGS_NO_EMIT_LOO` is set).
@@ -156,7 +156,7 @@ fn hmm_timing() -> bool {
 fn lcwgs_loo() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("LCWGS_NO_EMIT_LOO").is_err())
+    *V.get_or_init(|| !crate::config::present("LCWGS_NO_EMIT_LOO"))
 }
 
 /// GL-adaptive emission (re-test on real soft-PL multi-coverage harness, 2026-06-08).
@@ -174,8 +174,8 @@ fn adapt_emit_pow() -> Option<f32> {
     use std::sync::OnceLock;
     static V: OnceLock<Option<f32>> = OnceLock::new();
     *V.get_or_init(|| {
-        if std::env::var("LCWGS_ADAPT_EMIT").is_err() { return None; }
-        let pow = std::env::var("LCWGS_ADAPT_EMIT_POW").ok()
+        if !crate::config::present("LCWGS_ADAPT_EMIT") { return None; }
+        let pow = crate::config::raw("LCWGS_ADAPT_EMIT_POW")
             .and_then(|s| s.parse().ok()).unwrap_or(1.0f32);
         Some(pow)
     })
@@ -206,9 +206,9 @@ fn recomb_scale(ne: f32, k: usize, n_ref: usize, kpbwt: usize) -> f64 {
     // 0 = adaptive (default), 1 = force K-independent, 2 = force K-dependent.
     static MODE: OnceLock<u8> = OnceLock::new();
     let mode = *MODE.get_or_init(|| {
-        if std::env::var("LCWGS_GLIMPSE_RECOMB").is_ok() {
+        if crate::config::present("LCWGS_GLIMPSE_RECOMB") {
             1
-        } else if std::env::var("LCWGS_KDEP_RECOMB").is_ok() {
+        } else if crate::config::present("LCWGS_KDEP_RECOMB") {
             2
         } else {
             0

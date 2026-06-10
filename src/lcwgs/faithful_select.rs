@@ -322,7 +322,7 @@ impl FaithfulSelector {
 fn qual_trunc() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("LCWGS_QUAL_TRUNC").is_ok())
+    *V.get_or_init(|| crate::config::present("LCWGS_QUAL_TRUNC"))
 }
 
 /// Build per-sample [`GenotypeView`]s from explicit field slices (so the caller

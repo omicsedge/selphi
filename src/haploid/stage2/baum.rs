@@ -87,7 +87,7 @@ impl<'a> Stage2Baum<'a> {
         }
         self.impute_interval(sample, start, self.input.n_markers, &mut write);
 
-        if std::env::var("SELPHI_HAPLOID_STAGE2_DEBUG").ok().as_deref() == Some("swaps") && sample < 16 {
+        if crate::config::raw("SELPHI_HAPLOID_STAGE2_DEBUG").as_deref() == Some("swaps") && sample < 16 {
             eprintln!(
                 "    [stage2 swap] sample={} hets={} swaps={} ({:.2}%) ties={}",
                 sample, self.n_het_seen, self.n_swap_done,
@@ -110,7 +110,7 @@ impl<'a> Stage2Baum<'a> {
         // input alleles back unchanged — used to verify the integration path
         // doesn't itself corrupt phase (separates swap-logic bugs from
         // integration bugs). Default behaviour runs the full swap test.
-        let no_swap = std::env::var("SELPHI_HAPLOID_STAGE2_DEBUG").ok().as_deref()
+        let no_swap = crate::config::raw("SELPHI_HAPLOID_STAGE2_DEBUG").as_deref()
             == Some("noswap");
 
         for m in start..end {
@@ -150,7 +150,7 @@ impl<'a> Stage2Baum<'a> {
                 // when no IBS-carrier states fire), so coin-flipping them destroys ~32%
                 // of already-correct stage-1 phasing. Trust stage-1 on ties instead —
                 // STAGE2_COIN_FLIP_TIES=1 restores Beagle-exact behaviour for parity tests.
-                let coinflip_ties = std::env::var("STAGE2_COIN_FLIP_TIES").ok().as_deref() == Some("1");
+                let coinflip_ties = crate::config::is_one("STAGE2_COIN_FLIP_TIES");
                 let swap = p1 < p2 || (is_tie && coinflip_ties && self.rng.next_boolean());
                 if swap {
                     self.n_swap_done += 1;

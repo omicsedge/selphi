@@ -22,7 +22,7 @@ use noodles_fasta as fasta;
 use noodles_sam::alignment::record::cigar::op::Kind;
 use super::bam_pileup::PhredLut;
 
-fn envu(k: &str, d: i64) -> i64 { std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d) }
+use crate::config::i64_or as envu;
 
 /// Affine-gap transition probabilities for the pair-HMM (linear space).
 #[derive(Clone, Copy)]

@@ -73,10 +73,10 @@ fn use_avx512_g2x() -> bool {
     use std::sync::OnceLock;
     static USE: OnceLock<bool> = OnceLock::new();
     *USE.get_or_init(|| {
-        if std::env::var("SELPHI_FORCE_SCALAR").ok().as_deref() == Some("1") {
+        if crate::config::is_one("SELPHI_FORCE_SCALAR") {
             return false;
         }
-        if std::env::var("SELPHI_FORCE_AVX2").ok().as_deref() == Some("1") {
+        if crate::config::is_one("SELPHI_FORCE_AVX2") {
             return false;
         }
         is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512dq")
@@ -90,7 +90,7 @@ fn use_avx2_g2x() -> bool {
     use std::sync::OnceLock;
     static USE: OnceLock<bool> = OnceLock::new();
     *USE.get_or_init(|| {
-        if std::env::var("SELPHI_FORCE_SCALAR").ok().as_deref() == Some("1") {
+        if crate::config::is_one("SELPHI_FORCE_SCALAR") {
             return false;
         }
         is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")

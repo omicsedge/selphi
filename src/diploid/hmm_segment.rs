@@ -127,7 +127,7 @@ fn use_avx512() -> bool {
     use std::sync::OnceLock;
     static USE: OnceLock<bool> = OnceLock::new();
     *USE.get_or_init(|| {
-        if std::env::var("SELPHI_FORCE_SCALAR").ok().as_deref() == Some("1") {
+        if crate::config::is_one("SELPHI_FORCE_SCALAR") {
             return false;
         }
         is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512dq")

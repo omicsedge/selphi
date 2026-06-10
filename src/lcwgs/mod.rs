@@ -119,9 +119,7 @@ impl LcwgsParams {
     /// Empirically a ~2 cM core (≈3 cM window) keeps K-selection concentrated.
     /// Override with `LCWGS_CHUNK_CORE_CM` for tuning.
     pub fn chunk_core_cm(&self) -> f64 {
-        std::env::var("LCWGS_CHUNK_CORE_CM").ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2.0)
+        crate::config::f64_or("LCWGS_CHUNK_CORE_CM", 2.0)
     }
 
     /// cM buffer added each side of the core. The HMM runs over core+2×buffer
@@ -129,17 +127,14 @@ impl LcwgsParams {
     /// (forward-backward needs context beyond the region of interest).
     /// Override with `LCWGS_CHUNK_BUFFER_CM`.
     pub fn chunk_buffer_cm(&self) -> f64 {
-        std::env::var("LCWGS_CHUNK_BUFFER_CM").ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.5)
+        crate::config::f64_or("LCWGS_CHUNK_BUFFER_CM", 0.5)
     }
 }
 
 impl Default for LcwgsParams {
     fn default() -> Self {
-        // Env overrides for tuning sweeps (LCWGS_<PARAM>).
-        fn envf(k: &str, d: f32) -> f32 { std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d) }
-        fn envu(k: &str, d: usize) -> usize { std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d) }
+        // Env overrides for tuning sweeps (LCWGS_<PARAM>) — via the central config accessors.
+        use crate::config::{usize_or as envu, f32_or as envf};
         Self {
             // Defaults retuned 2026-05-30 (selection-quality session). The key
             // change vs the old d40/0.01cM/iter15 (full chr22 R² 0.893): run the

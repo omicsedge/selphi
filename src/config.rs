@@ -289,4 +289,26 @@ mod tests {
         assert!(missing.is_empty(),
             "env knobs read in src/ but missing from config.rs KNOBS (add them): {missing:?}");
     }
+
+    /// PURIST INVARIANT: `std::env::var(` must appear ONLY in config.rs — every env read
+    /// routes through the typed accessors (present/is_one/raw/*_or). Guards against a
+    /// scattered direct read creeping back into the engine code.
+    #[test]
+    fn no_scattered_env_reads() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut stack = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(dir) = stack.pop() {
+            for ent in std::fs::read_dir(&dir).unwrap().flatten() {
+                let p = ent.path();
+                if p.is_dir() { stack.push(p); continue; }
+                if p.extension().and_then(|e| e.to_str()) != Some("rs") { continue; }
+                if p.file_name().and_then(|n| n.to_str()) == Some("config.rs") { continue; }
+                if std::fs::read_to_string(&p).unwrap().contains("std::env::var(") {
+                    offenders.push(p.display().to_string());
+                }
+            }
+        }
+        assert!(offenders.is_empty(),
+            "std::env::var must live ONLY in config.rs (route via the accessors); found in: {offenders:?}");
+    }
 }

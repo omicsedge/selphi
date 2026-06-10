@@ -419,7 +419,7 @@ fn phase_genotypes_inner(
         // schedule, so kept off by default until validated on trio SER — see
         // feedback_r2_never_regress). The audit flags this as the likely
         // remaining cause of the ~0.01 pp trio-SER gap vs Beagle.
-        let burnin_earlystop = std::env::var("SELPHI_HAPLOID_BURNIN_EARLYSTOP").ok().as_deref() == Some("1");
+        let burnin_earlystop = crate::config::is_one("SELPHI_HAPLOID_BURNIN_EARLYSTOP");
         let mut it = 0usize;
         while it < n_total {
             let is_last = it == n_total - 1;
