@@ -142,6 +142,10 @@ pub fn em_for_sample(
     hbm: &[u8], hbs: usize, ibs: &[i32], cm: &[f64], cst: &[i32],
     si: usize, wsz: usize, nst: usize, nt: usize,
     mt: usize, ss: usize, mst: i32, nmo: usize, recomb_intensity: f32, p_mismatch: f32, _nh: usize,
+    // Per-marker recombination prob, precomputed once per EM sub-iteration by the
+    // caller (loop-invariant across samples: a pure function of the window map gaps
+    // and the sub-iteration's `recomb_intensity`). Length = `wsz`.
+    p_recomb_in: &[f32],
     ews: &mut EmWorkspace,
 ) -> (i32, f64, f64, f64) {
     let (h0, h1) = (si * 2, si * 2 + 1);
@@ -180,15 +184,17 @@ pub fn em_for_sample(
         for k in 0..(wsz - rem) { ews.hap0[rem + k] = (b0 >> k) & 1; ews.hap1[rem + k] = (b1 >> k) & 1; }
     }
 
-    // Per-marker recombination and genetic distance (all f32, )
-    let ri = recomb_intensity;
-    ews.p_recomb.clear(); ews.p_recomb.resize(wsz, 0.0f32);
+    // Per-marker genetic distance (cheap) + recombination prob. `p_recomb` (the
+    // -expm1 transcendental) is loop-invariant across samples within an EM sub-iteration
+    // — a pure function of the window map gaps and `recomb_intensity` — so it is
+    // precomputed once by the caller and passed in (`p_recomb_in`). gen_dist stays local.
+    // Byte-identical to the former per-sample recompute.
+    let _ = recomb_intensity;
+    ews.p_recomb.clear(); ews.p_recomb.extend_from_slice(p_recomb_in);
     ews.gen_dist.clear(); ews.gen_dist.resize(wsz, 0.0f64);
     for m in 1..wsz {
-        let gd_f32 = (cm[m] - cm[m-1]) as f32;
-        let prod = ri * gd_f32;
-        ews.p_recomb[m] = -(-(prod as f64)).exp_m1() as f32;
-        ews.gen_dist[m] = gd_f32 as f64;
+        // Preserve the original f32 round-trip: gen_dist = ((cm[m]-cm[m-1]) as f32) as f64.
+        ews.gen_dist[m] = (cm[m] - cm[m-1]) as f32 as f64;
     }
 
     let em_probs = [1.0f32 - p_mismatch, p_mismatch];
