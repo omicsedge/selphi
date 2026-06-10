@@ -114,6 +114,16 @@ fn cohort_from_bref3(input_path: &str) -> Cohort {
         }
         vi += 1;
     }
+    // Over-count guard: the loop breaks at `vi >= n_var`, which would HIDE a file
+    // that has MORE variants than the first pass counted (a desync/corruption — the
+    // `vi != n_var` check below only catches the under-count). One extra read must
+    // yield None.
+    if vi == n_var {
+        if let Ok(Some(_)) = s2.next_variant() {
+            selphi_error!("BREF3 has more variants than the first pass counted ({}) — corrupt/desynced file?", n_var);
+            std::process::exit(1);
+        }
+    }
     drop(s2);
     if vi != n_var {
         selphi_error!("BREF3 variant count mismatch between passes ({} vs {}) — corrupt file?", vi, n_var);

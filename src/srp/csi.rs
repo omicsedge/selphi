@@ -36,6 +36,13 @@ fn decompress_csi_header(path: &Path) -> io::Result<(Vec<u8>, i32, i32, usize, u
     let mut off = 4;
     let min_shift = i32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4;
     let depth = i32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4;
+    // `bin_to_pos` shifts a u64 by up to `min_shift + depth*3`; reject a malformed
+    // header that would overflow the shift (release masks it → silently wrong seek).
+    // bcftools CSI defaults are min_shift=14, depth=5 (sum 29).
+    if min_shift < 0 || depth < 0 || min_shift as i64 + depth as i64 * 3 >= 64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("CSI: min_shift={} depth={} would overflow the bin-position shift", min_shift, depth)));
+    }
     let l_aux = i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize; off += 4;
     off += l_aux;
     // Guard against a corrupt l_aux that pushes off past data.len() — the

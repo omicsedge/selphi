@@ -183,6 +183,18 @@ pub fn merge_batch_parquets(
         writer.write(&rb).map_err(|e| std::io::Error::other(format!("write: {e}")))?;
     }
 
+    // Completeness: every batch must be fully consumed. The loop breaks on the
+    // first reader to hit EOF while a longer batch may still have trailing
+    // row-groups (the in-loop `!batches.is_empty()` check misses the
+    // batch-0-shortest case) — silently truncating the merged output.
+    for (i, r) in readers.iter_mut().enumerate() {
+        if r.next().is_some() {
+            return Err(std::io::Error::other(format!(
+                "batch {i} has trailing row-groups beyond the merged set — \
+                 mismatched/truncated intermediate parquet")));
+        }
+    }
+
     writer.close().map_err(|e| std::io::Error::other(format!("close: {e}")))?;
     Ok(())
 }
