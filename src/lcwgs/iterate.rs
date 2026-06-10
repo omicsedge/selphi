@@ -293,19 +293,21 @@ struct GibbsConfig {
     /// GLIMPSE2-exact flat rule (`LCWGS_G2_FLAT_EXACT`): a site is flat ⟺ its GL
     /// triple is all-equal. Read once here (was a per-iteration env read).
     flat_exact: bool,
-    /// EXPERIMENT (`LCWGS_POLY_SKIP`, default OFF → byte-identical default). Faithful
-    /// GLIMPSE2 `conditioning_set::compactSelection` poly/mono split (conditioning_set.cpp:
-    /// 122-138): run the per-iteration phasing HMM only over each individual's
-    /// POLYMORPHIC sites — every COMMON site (panel MAF ≥ `rare_maf`) plus every RARE
-    /// site carried by ≥1 of that individual's conditioning haps — and SKIP the
-    /// monomorphic-in-conditioning-set rare sites. Their emission is uniform across all
-    /// founders so they integrate out exactly for HOMs; het-at-mono falls to the random
-    /// shuffle pass (phasing_hmm.cpp:294-301), which is phase-degenerate anyway (no
-    /// conditioning hap carries the minor allele) and dosage-invariant. On a whole
-    /// chromosome the rare-monomorphic-in-cond sites are the large majority, so this is
-    /// the multi-sample phaser-wall lever: GLIMPSE2 pays O(n_poly·K), we paid O(n_var·K).
-    /// NOT byte-identical to the all-sites phaser (the het-mono segmentation/RNG path
-    /// differs) → gated and R²-validated, not md5-gated.
+    /// DEFAULT ON (opt out `LCWGS_NO_POLY_SKIP=1`). Faithful GLIMPSE2
+    /// `conditioning_set::compactSelection` poly/mono split (conditioning_set.cpp:122-138),
+    /// applied to BOTH the per-iteration phasing HMM AND the imputation forward-backward:
+    /// run each kernel only over an individual's POLYMORPHIC sites — every COMMON site
+    /// (panel MAF ≥ `rare_maf`) plus every RARE site carried by ≥1 of that individual's
+    /// conditioning haps — and SKIP the monomorphic-in-conditioning-set rare sites. Their
+    /// emission is uniform across all K founders so they integrate out EXACTLY (the
+    /// transition T(d)=(1-r)I+rU with r=1-exp(scale·Δcm) satisfies T(d1+d2)=T(d2)∘T(d1)
+    /// since U²=U): the phaser sends het-at-mono to the random shuffle pass
+    /// (phasing_hmm.cpp:294-301, phase-degenerate, dosage-invariant) and the FB direct-
+    /// imputes monos in closed form via `hmm::finalize_site`. On a whole chromosome the
+    /// rare-monomorphic-in-cond sites are the large majority, so this is the dominant
+    /// multi-sample wall lever (GLIMPSE2 pays O(n_poly·K) per pass; we paid O(n_var·K)).
+    /// NOT md5-identical to the all-sites kernels (het-mono segmentation/RNG differs) →
+    /// R²-validated (canonical r12: OVERALL R² unchanged at 0.9816, every bin ±0.0010).
     poly_skip: bool,
 }
 impl GibbsConfig {
@@ -355,7 +357,9 @@ impl GibbsConfig {
             phase_main_every: envu("LCWGS_PHASE_MAIN_EVERY").filter(|&n| n >= 1).unwrap_or(1),
             rich_cond: std::env::var("LCWGS_G2_RICH_COND").is_ok(),
             flat_exact: std::env::var("LCWGS_G2_FLAT_EXACT").is_ok(),
-            poly_skip: std::env::var("LCWGS_POLY_SKIP").is_ok(),
+            // DEFAULT ON (2026-06-10): R²-safe poly/mono skip (phaser + imputation FB).
+            // Opt out with LCWGS_NO_POLY_SKIP=1 (reverts to the dense all-sites kernels).
+            poly_skip: std::env::var("LCWGS_NO_POLY_SKIP").is_err(),
         }
     }
 }
