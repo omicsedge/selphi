@@ -39,7 +39,7 @@
   <!-- ========== B: PHASING ========== -->
   <text x="20" y="168" fill="#333" font-size="14" font-weight="700">b</text>
 
-  <rect x="30" y="172" width="720" height="250" rx="8" fill="#fff" stroke="#1565c0" stroke-width="1.5"/>
+  <rect x="30" y="172" width="720" height="190" rx="8" fill="#fff" stroke="#1565c0" stroke-width="1.5"/>
   <text x="390" y="193" text-anchor="middle" fill="#1565c0" font-size="13" font-weight="700">PHASING</text>
   <text x="390" y="208" text-anchor="middle" fill="#666" font-size="10">Auto-select: chip (up to 50K variants) -> Haploid | WGS (>50K) -> Diploid</text>
 
@@ -60,10 +60,6 @@
   <text x="565" y="295" text-anchor="middle" fill="#333" font-size="10.5">Common -> rare two-stage (PBWT voting)</text>
   <text x="565" y="312" text-anchor="middle" fill="#333" font-size="10.5">IBD2 exclusion + singleton IBD phasing</text>
   <text x="565" y="340" text-anchor="middle" fill="#888" font-size="9" font-style="italic">Optimized for whole-genome sequencing</text>
-
-  <!-- Phase refinement -->
-  <rect x="150" y="362" width="480" height="26" rx="4" fill="#f3e5f5" stroke="#7b1fa2" stroke-width="0.8"/>
-  <text x="390" y="380" text-anchor="middle" fill="#6a1b9a" font-size="10.5">Phase refinement: bidirectional IBD crossover detection + Viterbi HMM</text>
 
   <!-- Pedigree arrow -->
   <path d="M668 82 L668 200 L735 200 L735 280 L730 280" fill="none" stroke="#999" stroke-width="0.8" stroke-dasharray="4,2" marker-end="url(#a)"/>
