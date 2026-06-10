@@ -10,12 +10,12 @@ pub fn is_debug() -> bool {
 }
 
 pub fn debug_sample() -> usize {
-    std::env::var("SELPHI_DEBUG_SAMPLE").ok()
+    crate::config::raw("SELPHI_DEBUG_SAMPLE")
         .and_then(|v| v.parse().ok()).unwrap_or(0)
 }
 
 pub fn debug_iter() -> usize {
-    std::env::var("SELPHI_DEBUG_ITER").ok()
+    crate::config::raw("SELPHI_DEBUG_ITER")
         .and_then(|v| v.parse().ok()).unwrap_or(0)
 }
 

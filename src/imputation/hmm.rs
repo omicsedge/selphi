@@ -797,7 +797,7 @@ pub fn calculate_weights(
     //              target VCF under `--refine` (None when refine is off).
     //   R1 (test): env `SELPHI_REFINE_CONST_C=c` — a single constant c applied to
     //              every site; an override/fallback used by the test gates.
-    let const_c_env: Option<f64> = std::env::var("SELPHI_REFINE_CONST_C").ok()
+    let const_c_env: Option<f64> = crate::config::raw("SELPHI_REFINE_CONST_C")
         .and_then(|s| s.parse::<f64>().ok());
     let site_perr: Option<Vec<f64>> = if let Some(cv) = c {
         debug_assert_eq!(cv.len(), distances_cm.len(),

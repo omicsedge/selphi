@@ -467,7 +467,7 @@ fn run_sweep_fwd(
     n_steps: usize,
     n_target_haps: usize,
 ) -> Vec<Vec<i32>> {
-    let debug = std::env::var("SELPHI_HAPLOID_STAGE2_DEBUG").ok().as_deref() == Some("trace");
+    let debug = crate::config::raw("SELPHI_HAPLOID_STAGE2_DEBUG").as_deref() == Some("trace");
     let mut carrier_hit = 0u64;
     let mut fallback = 0u64;
     let mut fallback_null = 0u64;

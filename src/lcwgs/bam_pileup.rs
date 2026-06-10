@@ -48,7 +48,7 @@ pub struct PileupParams {
 }
 impl Default for PileupParams {
     fn default() -> Self {
-        fn envu(k: &str, d: u32) -> u32 { std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d) }
+        use crate::config::u32_or as envu;
         Self {
             min_mapq: envu("LCWGS_MIN_MAPQ", 20) as u8,
             min_bq: envu("LCWGS_MIN_BQ", 20) as u8,

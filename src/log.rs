@@ -41,7 +41,7 @@ pub fn init(log_path: &Path, debug: bool) {
     inner.debug_dir = debug_dir;
 
     // Set debug flag from CLI or env var
-    let env_debug = std::env::var("SELPHI_DEBUG").ok().map(|v| v == "1").unwrap_or(false);
+    let env_debug = crate::config::is_one("SELPHI_DEBUG");
     DEBUG_FLAG.store(debug || env_debug, Ordering::Relaxed);
 }
 

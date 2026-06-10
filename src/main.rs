@@ -51,8 +51,8 @@ fn main() {
     // a runtime upgrade. Setting `SELPHI_FORCE_SCALAR=1` forces the scalar
     // path on AVX-512 hosts (used for parity testing).
     #[cfg(target_arch = "x86_64")]
-    if std::env::var("SELPHI_QUIET_SIMD").ok().as_deref() != Some("1") {
-        let forced_scalar = std::env::var("SELPHI_FORCE_SCALAR").ok().as_deref() == Some("1");
+    if !selphi::config::is_one("SELPHI_QUIET_SIMD") {
+        let forced_scalar = selphi::config::is_one("SELPHI_FORCE_SCALAR");
         let has_avx512 = std::arch::is_x86_feature_detected!("avx512f")
             && std::arch::is_x86_feature_detected!("avx512dq");
         let path = if forced_scalar {
@@ -237,15 +237,15 @@ fn main() {
             let mut g2params = selphi::lcwgs::g2_params::Glimpse2Params::default();
             // RESEARCH knob: override the conditioning size (LCWGS_G2X_KPBWT) to probe
             // selection headroom — e.g. = n_ref for an all-cond upper bound.
-            if let Ok(k) = std::env::var("LCWGS_G2X_KPBWT") {
+            if let Some(k) = selphi::config::raw("LCWGS_G2X_KPBWT") {
                 if let Ok(k) = k.parse::<usize>() { g2params.kpbwt = k; g2params.kinit = k; }
             }
             // RESEARCH knobs: override the Gibbs schedule (LCWGS_G2X_BURNIN /
             // LCWGS_G2X_MAIN) to probe convergence headroom vs GLIMPSE2's 5/15.
-            if let Ok(b) = std::env::var("LCWGS_G2X_BURNIN") {
+            if let Some(b) = selphi::config::raw("LCWGS_G2X_BURNIN") {
                 if let Ok(b) = b.parse::<i32>() { g2params.burnin = b; }
             }
-            if let Ok(m) = std::env::var("LCWGS_G2X_MAIN") {
+            if let Some(m) = selphi::config::raw("LCWGS_G2X_MAIN") {
                 if let Ok(m) = m.parse::<i32>() { g2params.main = m; }
             }
             let result = selphi::glimpse2::pipeline::run_pipeline(

@@ -314,7 +314,7 @@ struct GibbsConfig {
 }
 impl GibbsConfig {
     fn from_env() -> Self {
-        let envu = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<usize>().ok());
+        use crate::config::usize_opt as envu;
         // DMM segment phase-commitment is DEFAULT-ON (2026-06-04). Validated on
         // chr22 AND an independent chr1:30-45Mb A/B: every MAF bin improved, zero
         // regression, biggest gains in the rare bins, GLIMPSE2 OVERALL gap halved
@@ -323,45 +323,45 @@ impl GibbsConfig {
         // Gauss-Seidel). LCWGS_DMM_GL (GL-aware emission, R²-neutral — kept opt-in)
         // and LCWGS_DMM (explicit) also force it on. DMM implies the Gauss-Seidel
         // main sweep (it regularizes it); LCWGS_DMM_GL implies the DMM.
-        let dmm_gl = std::env::var("LCWGS_DMM_GL").is_ok();
-        let force_dmm_rc = std::env::var("LCWGS_DMM_RC").is_ok();
+        let dmm_gl = crate::config::present("LCWGS_DMM_GL");
+        let force_dmm_rc = crate::config::present("LCWGS_DMM_RC");
         let dmm = dmm_gl
             || force_dmm_rc
-            || std::env::var("LCWGS_DMM").is_ok()
-            || std::env::var("LCWGS_NO_DMM").is_err();
-        let gs_main = dmm || std::env::var("LCWGS_GS_MAIN").is_ok();
+            || crate::config::present("LCWGS_DMM")
+            || !crate::config::present("LCWGS_NO_DMM");
+        let gs_main = dmm || crate::config::present("LCWGS_GS_MAIN");
         // Rare-carrier-aware DMM is DEFAULT-ON when the DMM is on (validated
         // 2026-06-04 on r12 + full-chr22 + chr1: every MAF bin up, zero regression,
         // neutral wall/mem). It extends the DMM segment-commitment set, so it is a
         // no-op when the DMM is off (LCWGS_NO_DMM). Opt out with LCWGS_NO_DMM_RC=1;
         // LCWGS_DMM_RC forces it (and the DMM) on.
-        let dmm_rc = dmm && (force_dmm_rc || std::env::var("LCWGS_NO_DMM_RC").is_err());
+        let dmm_rc = dmm && (force_dmm_rc || !crate::config::present("LCWGS_NO_DMM_RC"));
         GibbsConfig {
-            use_scaffold: std::env::var("LCWGS_SCAFFOLD").is_ok(),
+            use_scaffold: crate::config::present("LCWGS_SCAFFOLD"),
             refresh: envu("LCWGS_SELECT_REFRESH").filter(|&r| r >= 1).unwrap_or(5),
-            rare_carrier: std::env::var("LCWGS_NO_RARE_CARRIER").is_err(),
+            rare_carrier: !crate::config::present("LCWGS_NO_RARE_CARRIER"),
             k_max: match envu("LCWGS_KMAX") {
                 Some(0) => None,    // explicit opt-out
                 Some(k) => Some(k),
                 None => Some(3000), // default ceiling (retuned 2026-05-31)
             },
             rare_carrier_max: envu("LCWGS_RARE_CARRIER_MAX").unwrap_or(64),
-            timing: std::env::var("LCWGS_TIMING").is_ok(),
-            cond_dump: std::env::var("LCWGS_COND_DUMP").is_ok(),
+            timing: crate::config::present("LCWGS_TIMING"),
+            cond_dump: crate::config::present("LCWGS_COND_DUMP"),
             gs_main,
             dmm,
             dmm_gl,
             dmm_rc,
             dmm_rc_budget: envu("LCWGS_DMM_RC_BUDGET").unwrap_or(6),
-            burnin_diploid: std::env::var("LCWGS_BURNIN_DIPLOID").is_ok(),
-            glimpse2_phase: std::env::var("LCWGS_NO_GLIMPSE2_PHASE").is_err(),
-            faithful_select: std::env::var("LCWGS_NO_FAITHFUL_SELECT").is_err(),
+            burnin_diploid: crate::config::present("LCWGS_BURNIN_DIPLOID"),
+            glimpse2_phase: !crate::config::present("LCWGS_NO_GLIMPSE2_PHASE"),
+            faithful_select: !crate::config::present("LCWGS_NO_FAITHFUL_SELECT"),
             phase_main_every: envu("LCWGS_PHASE_MAIN_EVERY").filter(|&n| n >= 1).unwrap_or(1),
-            rich_cond: std::env::var("LCWGS_G2_RICH_COND").is_ok(),
-            flat_exact: std::env::var("LCWGS_G2_FLAT_EXACT").is_ok(),
+            rich_cond: crate::config::present("LCWGS_G2_RICH_COND"),
+            flat_exact: crate::config::present("LCWGS_G2_FLAT_EXACT"),
             // DEFAULT ON (2026-06-10): R²-safe poly/mono skip (phaser + imputation FB).
             // Opt out with LCWGS_NO_POLY_SKIP=1 (reverts to the dense all-sites kernels).
-            poly_skip: std::env::var("LCWGS_NO_POLY_SKIP").is_err(),
+            poly_skip: !crate::config::present("LCWGS_NO_POLY_SKIP"),
         }
     }
 }

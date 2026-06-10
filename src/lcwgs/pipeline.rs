@@ -38,7 +38,7 @@ fn rss_gb() -> f64 {
 }
 /// Gated RSS checkpoint (`LCWGS_MEMTRACE`) for locating the memory peak.
 fn memtrace(label: &str) {
-    if std::env::var("LCWGS_MEMTRACE").is_ok() {
+    if crate::config::present("LCWGS_MEMTRACE") {
         crate::selphi_info!("  [memtrace] {:<40} {:.1} GB RSS", label, rss_gb());
     }
 }
@@ -163,7 +163,7 @@ fn impute_from_gl3(
         (v.chr.clone(), v.pos, v.ref_allele.clone(), v.alt_allele.clone())
     }).collect();
 
-    if std::env::var("LCWGS_RAW_GL").is_ok() {
+    if crate::config::present("LCWGS_RAW_GL") {
         let mut raw = vec![0.0f32; n_shared * n_samples];
         for v in 0..n_shared {
             for s in 0..n_samples {
@@ -184,7 +184,7 @@ fn impute_from_gl3(
     // regress (rare↔common tradeoff), hence the cap. Skip when kpbwt is set explicitly.
     let mut eff = params.clone();
     let mut modified = false;
-    if std::env::var("LCWGS_KPBWT").is_err() {
+    if !crate::config::present("LCWGS_KPBWT") {
         let n_ref = srp.metadata.n_haps;
         let adaptive = ((n_ref as f64 * 0.066).round() as usize).clamp(2000, 5000);
         if adaptive != eff.kpbwt {
@@ -200,9 +200,9 @@ fn impute_from_gl3(
     // rare over-trust). No-op at ≤2× (keeps 1e-10). Trades a little 5-10% for the
     // rare/OVERALL win at high coverage (out-of-regime for lcWGS) → opt-in. Gated by
     // the SAME mean-GL-peakedness signal the split uses (calibrated 0.5×≈0.69 … 4×≈0.89).
-    if std::env::var("LCWGS_ADAPT_MIN_GL").is_ok() && std::env::var("LCWGS_MIN_GL").is_err() {
-        let thr: f32 = std::env::var("LCWGS_SPLIT_GL_THR").ok().and_then(|x| x.parse().ok()).unwrap_or(0.84);
-        let hi: f32 = std::env::var("LCWGS_ADAPT_MIN_GL_HI").ok().and_then(|x| x.parse().ok()).unwrap_or(1e-2);
+    if crate::config::present("LCWGS_ADAPT_MIN_GL") && !crate::config::present("LCWGS_MIN_GL") {
+        let thr: f32 = crate::config::raw("LCWGS_SPLIT_GL_THR").and_then(|x| x.parse().ok()).unwrap_or(0.84);
+        let hi: f32 = crate::config::raw("LCWGS_ADAPT_MIN_GL_HI").and_then(|x| x.parse().ok()).unwrap_or(1e-2);
         let (mut sum, mut cnt) = (0.0f64, 0usize);
         for v in 0..n_shared {
             let b = v * n_samples * 3;
@@ -289,7 +289,7 @@ pub fn run_lcwgs_bam(
     // benchmark: SNP r² 0.960 with indels flat vs 0.950 with read-based indel
     // GLs). Opt in with LCWGS_INDEL_REALIGN=1 (needs --reference); the read-vs-
     // haplotype pair-HMM is then used to score indels (see `super::indel_realign`).
-    let enable_indel = std::env::var("LCWGS_INDEL_REALIGN").is_ok();
+    let enable_indel = crate::config::present("LCWGS_INDEL_REALIGN");
     let indel_model = if n_indel > 0 && enable_indel {
         match reference {
             Some(refp) => {
@@ -345,14 +345,14 @@ pub fn run_lcwgs_bam(
 ///       wins 6/7+overall, 4× tie (not engaged).
 /// Band defaults to [0.05,0.10) (`LCWGS_SPLIT_BAND`); deep cap 5000 (`LCWGS_SPLIT_KMAX`).
 fn resolve_split(gl3: &[f32], n_samples: usize, n_var: usize, params: &LcwgsParams) -> Option<(f64, f64, usize)> {
-    if std::env::var("LCWGS_NO_SPLIT").is_ok() { return None; }
-    let deep_k = std::env::var("LCWGS_SPLIT_KMAX").ok().and_then(|x| x.parse().ok()).unwrap_or(5000usize);
+    if crate::config::present("LCWGS_NO_SPLIT") { return None; }
+    let deep_k = crate::config::raw("LCWGS_SPLIT_KMAX").and_then(|x| x.parse().ok()).unwrap_or(5000usize);
     let parse_band = |s: &str| -> Option<(f64, f64)> {
         let p: Vec<f64> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
         if p.len() == 2 && p[0] < p[1] { Some((p[0], p[1])) } else { None }
     };
     // Manual override.
-    if let Ok(s) = std::env::var("LCWGS_SPLIT_MAF") {
+    if let Some(s) = crate::config::raw("LCWGS_SPLIT_MAF") {
         return parse_band(&s).map(|(lo, hi)| {
             crate::selphi_info!("  lcWGS SPLIT (manual): MAF∈[{},{}) → deep pass (k_max={})", lo, hi, deep_k);
             (lo, hi, deep_k)
@@ -362,7 +362,7 @@ fn resolve_split(gl3: &[f32], n_samples: usize, n_var: usize, params: &LcwgsPara
     let default_kmax = 3000usize;
     if params.kpbwt <= default_kmax { return None; }
     // (2) soft-GL (coverage) gate.
-    let thr: f32 = std::env::var("LCWGS_SPLIT_GL_THR").ok().and_then(|x| x.parse().ok()).unwrap_or(0.84);
+    let thr: f32 = crate::config::raw("LCWGS_SPLIT_GL_THR").and_then(|x| x.parse().ok()).unwrap_or(0.84);
     let (mut sum, mut cnt) = (0.0f64, 0usize);
     for v in 0..n_var {
         let b = v * n_samples * 3;
@@ -373,7 +373,7 @@ fn resolve_split(gl3: &[f32], n_samples: usize, n_var: usize, params: &LcwgsPara
         }
     }
     let mean_conf = if cnt > 0 { (sum / cnt as f64) as f32 } else { 1.0 };
-    let (lo, hi) = std::env::var("LCWGS_SPLIT_BAND").ok().and_then(|s| parse_band(&s)).unwrap_or((0.05, 0.10));
+    let (lo, hi) = crate::config::raw("LCWGS_SPLIT_BAND").and_then(|s| parse_band(&s)).unwrap_or((0.05, 0.10));
     if mean_conf < thr {
         crate::selphi_info!(
             "  lcWGS SPLIT (auto-ON): big panel (kpbwt={}) + soft GL (mean_conf={:.3} < {:.2}) → deep pass MAF∈[{},{}) k_max={}",
@@ -488,7 +488,7 @@ fn run_chunked_gibbs(
         // confident-wrong zero-read carriers, whether the true carrier is ABSENT
         // from selection (→ build persistent per-locus PBWT) or PRESENT (→ HMM
         // bottleneck, rewrite won't help). No effect on normal runs.
-        if let Ok(dir) = std::env::var("LCWGS_COND_DUMP") {
+        if let Some(dir) = crate::config::raw("LCWGS_COND_DUMP") {
             use std::io::Write;
             let _ = std::fs::create_dir_all(&dir);
             let n_ref = chunk_bm.n_haps;
@@ -524,9 +524,9 @@ fn run_chunked_gibbs(
         // set that carries ALT at the site. If carrier-frac ≈ panel AF but dose≈0 →
         // present-but-not-copied (FB/copying issue); if carrier-frac << AF → the global
         // selection under-picks local carriers (per-locus selection is the lever).
-        if let Ok(poss) = std::env::var("LCWGS_TRACE_POS") {
+        if let Some(poss) = crate::config::raw("LCWGS_TRACE_POS") {
             let targets: Vec<i64> = poss.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-            let strace: usize = std::env::var("LCWGS_TRACE_SAMPLE").ok()
+            let strace: usize = crate::config::raw("LCWGS_TRACE_SAMPLE")
                 .and_then(|x| x.parse().ok()).unwrap_or(0);
             let n_ref = chunk_bm.n_haps;
             if !out.cond_final.is_empty() {
@@ -550,7 +550,7 @@ fn run_chunked_gibbs(
             }
         }
 
-        if std::env::var("LCWGS_CHUNK_DIAG").is_ok() {
+        if crate::config::present("LCWGS_CHUNK_DIAG") {
             let gl3_sum: f64 = chunk_gl3.iter().map(|&x| x as f64).sum();
             let dose_mean: f64 = out.dosage.iter().map(|&d| d as f64).sum::<f64>() / out.dosage.len().max(1) as f64;
             let bm_ones: u64 = (0..chunk_bm.n_sites).map(|si| chunk_bm.popcount_row(si, chunk_bm.n_haps) as u64).sum();
@@ -583,8 +583,7 @@ fn run_chunked_gibbs(
             // PBWT scratch + HMM + allocator overhead; calibrated to measured RSS).
             let per_chunk_gb =
                 (avg_chunk_n * n_ref.div_ceil(64) * 8) as f64 / 1e9 * 1.9;
-            let budget_gb = std::env::var("LCWGS_MEM_BUDGET_GB")
-                .ok().and_then(|x| x.parse::<f64>().ok()).unwrap_or(2.5);
+            let budget_gb = crate::config::f64_or("LCWGS_MEM_BUDGET_GB", 2.5);
             let max_live = ((budget_gb / per_chunk_gb.max(1e-9)).floor() as usize)
                 .clamp(1, n_chunks.min(threads));
             crate::selphi_info!(

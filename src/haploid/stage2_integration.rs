@@ -392,7 +392,7 @@ fn compute_p_recomb(stage1_cm: &[f64], n_haps: usize, ne: f64) -> Vec<f32> {
 
 /// Read the `SELPHI_HAPLOID_STAGE2` env var: returns `true` if set to "1".
 pub fn stage2_enabled() -> bool {
-    std::env::var("SELPHI_HAPLOID_STAGE2").ok().as_deref() == Some("1")
+    crate::config::is_one("SELPHI_HAPLOID_STAGE2")
 }
 
 #[cfg(test)]

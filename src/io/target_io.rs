@@ -699,9 +699,9 @@ const REFINE_DP_LO: f64 = 4.0;
 const REFINE_DP_HI: f64 = 12.0;
 
 fn refine_gq_endpoints() -> (f64, f64) {
-    let lo = std::env::var("SELPHI_REFINE_GQ_LO").ok()
+    let lo = crate::config::raw("SELPHI_REFINE_GQ_LO")
         .and_then(|s| s.parse::<f64>().ok()).unwrap_or(REFINE_GQ_LO);
-    let hi = std::env::var("SELPHI_REFINE_GQ_HI").ok()
+    let hi = crate::config::raw("SELPHI_REFINE_GQ_HI")
         .and_then(|s| s.parse::<f64>().ok()).unwrap_or(REFINE_GQ_HI);
     (lo, hi)
 }

@@ -209,7 +209,7 @@ struct RareCarrierCfg {
 
 impl RareCarrierCfg {
     fn from_env() -> Self {
-        let envu = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<usize>().ok());
+        use crate::config::usize_opt as envu;
         // DEFAULTS = the GIAB-chr1-validated winner (real HG002 1×, 75552-hap panel,
         // 19157 truth SNPs): max_mac=16, top=3, main-only. This config beats
         // GLIMPSE2 OVERALL (0.9431 vs 0.9429) and on every rare bin (0-0.5%
@@ -221,10 +221,10 @@ impl RareCarrierCfg {
         // common bins (mac32/top3 → 0.9379, full-aggressive → 0.9349). The sweet
         // spot reaches the rarest sites' true carriers without that pollution.
         RareCarrierCfg {
-            enabled: std::env::var("LCWGS_G2X_RARE_CARRIER").is_ok(),
+            enabled: crate::config::present("LCWGS_G2X_RARE_CARRIER"),
             // main-only by default (burn-in stays faithful; the dose-accumulating
             // MAIN iters get the rare edge). LCWGS_G2X_RC_ALL_ITERS forces every iter.
-            main_only: std::env::var("LCWGS_G2X_RC_ALL_ITERS").is_err(),
+            main_only: !crate::config::present("LCWGS_G2X_RC_ALL_ITERS"),
             max_mac: envu("LCWGS_G2X_RC_MAX_MAC").unwrap_or(16),
             top_per_site: envu("LCWGS_G2X_RC_TOP").unwrap_or(3),
             run_cap: envu("LCWGS_G2X_RC_RUN_CAP").unwrap_or(64),
@@ -290,7 +290,7 @@ impl Glimpse2Caller {
         let mut sample_rngs: Vec<Mt19937Rng> = (0..n_samples)
             .map(|i| Mt19937Rng::new(sample_seed(seed32, i)))
             .collect();
-        let serial = std::env::var("LCWGS_G2X_SERIAL").is_ok() || n_samples <= 1;
+        let serial = crate::config::present("LCWGS_G2X_SERIAL") || n_samples <= 1;
 
         let rc_cfg = RareCarrierCfg::from_env();
         if rc_cfg.enabled {

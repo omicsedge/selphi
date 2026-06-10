@@ -31,8 +31,7 @@ pub struct DmmConfig {
 }
 impl DmmConfig {
     pub fn from_env() -> Self {
-        let envf = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<f64>().ok());
-        let envu = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<usize>().ok());
+        use crate::config::{f64_opt as envf, usize_opt as envu};
         DmmConfig {
             // Defaults = the r12-validated "combo" (M12/seg_cm=1.0/switch_pen=2):
             // r12 0.5-1% 0.9089→0.9111, OVERALL 0.9386→0.9395 vs the M8/0.5/4 first cut.
