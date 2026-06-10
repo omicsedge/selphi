@@ -78,7 +78,10 @@ fn read_utf<R: Read>(r: &mut R) -> Result<String, String> {
 fn read_string_array<R: Read>(r: &mut R) -> Result<Vec<String>, String> {
     let len = read_i32(r)?;
     if len < 0 { return Ok(Vec::new()); }
-    let mut arr = Vec::with_capacity(len as usize);
+    // Cap the EAGER reservation against an untrusted on-disk length (a malformed
+    // header could otherwise pre-allocate ~48 GB of String before reading a byte);
+    // the bounded loop below grows it as read_utf actually yields elements / EOFs.
+    let mut arr = Vec::with_capacity((len as usize).min(4096));
     for _ in 0..len {
         arr.push(read_utf(r)?);
     }
@@ -203,7 +206,7 @@ impl<R: Read> Bref3StreamReader<R> {
                 let count = read_i32(&mut self.reader)?;
                 if count == -1 {
                     major_allele = a as u8;
-                } else {
+                } else if (0..=n_haps as i32).contains(&count) {
                     for _ in 0..count {
                         let hap_idx = read_i32(&mut self.reader)? as usize;
                         if hap_idx < n_haps {
@@ -211,6 +214,10 @@ impl<R: Read> Bref3StreamReader<R> {
                             assigned[hap_idx] = true;
                         }
                     }
+                } else {
+                    // Malformed: a negative-but-not-(-1) count makes `0..count` a no-op
+                    // and DESYNCS the stream (silently wrong decode); >n_haps is impossible.
+                    return Err(format!("BREF3 ALLELE_CODED count {} out of range [-1, {}]", count, n_haps));
                 }
             }
             for h in 0..n_haps {
@@ -288,11 +295,20 @@ impl<R: Read> Bref3StreamReader<R> {
         } else if flag == ALLELE_CODED {
             for _ in 0..n_alleles {
                 let count = read_i32(&mut self.reader)?;
-                if count != -1 {
-                    // Skip count × i32
-                    let skip = count as usize * 4;
-                    let mut buf = vec![0u8; skip];
-                    self.reader.read_exact(&mut buf).map_err(|e| format!("skip allele: {}", e))?;
+                if count == -1 { continue; }
+                if count < 0 {
+                    return Err(format!("BREF3 ALLELE_CODED negative count: {}", count));
+                }
+                // Skip count × i32 via a bounded loop — NEVER pre-allocate a
+                // count-sized buffer: a malformed huge count (or the old `count as
+                // usize * 4` sign-wrap) would abort the process before read_exact
+                // could fail. Byte-identical for valid input (same bytes consumed).
+                let mut remaining = count as u64 * 4;
+                let mut tmp = [0u8; 8192];
+                while remaining > 0 {
+                    let n = remaining.min(tmp.len() as u64) as usize;
+                    self.reader.read_exact(&mut tmp[..n]).map_err(|e| format!("skip allele: {}", e))?;
+                    remaining -= n as u64;
                 }
             }
         } else {

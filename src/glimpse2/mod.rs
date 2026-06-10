@@ -26,6 +26,10 @@ pub mod imputation_hmm;
 pub mod caller;
 pub mod pipeline;
 // NB: `params` (Glimpse2Params) and `phasing_hmm` were MOVED into `crate::lcwgs`
-// (`lcwgs::g2_params` / `lcwgs::phasing_hmm`) so the production `--lcwgs` engine is
-// self-contained. This `glimpse2` (`--glimpse2-exact`) engine now imports them back
-// from `crate::lcwgs`; it is slated for removal once `--glimpse2-exact` is retired.
+// (`lcwgs::g2_params` / `lcwgs::phasing_hmm`); the `--glimpse2-exact` engine imports
+// them back. FOOTGUN: this module is NOT fully removable with `--glimpse2-exact` —
+// the DEFAULT `--lcwgs` engine's faithful selection (`lcwgs::faithful_select`, default-ON
+// since UPDATE 52) depends on the KEEP-set `ref_haplotype_set` / `haplotype_set` / `rng`.
+// Only the exact-engine-specific modules (`caller`, `conditioning_set`, `genotype`,
+// `imputation_hmm`, `pipeline`) are removable when `--glimpse2-exact` is retired; the
+// KEEP-set must first be relocated into `crate::lcwgs` or the default path breaks.

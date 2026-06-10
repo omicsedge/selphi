@@ -1,5 +1,10 @@
 //! Faithful GLIMPSE2 compressed-sparse-PBWT conditioning for the hybrid lcWGS
-//! engine, gated behind `LCWGS_FAITHFUL_SELECT` (DEFAULT OFF).
+//! engine. **DEFAULT ON** (opt out with `LCWGS_NO_FAITHFUL_SELECT=1`; the legacy
+//! `LCWGS_FAITHFUL_SELECT` force-on is a no-op now that it is the default). It is
+//! the production selection at big-panel scale (UPDATE 52). FOOTGUN: this module —
+//! and thus the DEFAULT `--lcwgs` engine — depends on `crate::glimpse2`
+//! (ref_haplotype_set / haplotype_set / rng), so `src/glimpse2/` is NOT dead
+//! weight: deleting it breaks the default lcWGS path, not just `--glimpse2-exact`.
 //!
 //! The shipped hybrid engine selects per-target-hap conditioning with the
 //! heuristic [`super::pbwt_select::select_conditioning_haps`] sweep, then adds
