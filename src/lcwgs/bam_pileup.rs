@@ -235,7 +235,7 @@ fn pileup_one(
             walk_record(
                 start, last_pos, &cigar_buf,
                 |qi| seq.get(qi).unwrap_or(b'N'),
-                |qi| qbytes[qi],
+                |qi| qbytes.get(qi).copied().unwrap_or(0),
                 pos, ref_base, alt_base, is_snp, params, lut, &mut ll, &mut depth,
                 qhash, &mut ov,
             );
@@ -243,7 +243,7 @@ fn pileup_one(
                 super::indel_realign::score_read(
                     start, &cigar_buf,
                     |qi| seq.get(qi).unwrap_or(b'N'),
-                    |qi| qbytes[qi],
+                    |qi| qbytes.get(qi).copied().unwrap_or(0),
                     model, lut, &mut iscratch, &mut ll, &mut depth,
                     params.max_depth, params.min_bq, qhash, &mut ov.last_frag,
                 );
@@ -359,7 +359,7 @@ fn pileup_one_cram(
         walk_record(
             start, last_pos, &cigar_buf,
             |qi| seq.get(qi).unwrap_or(b'N'),
-            |qi| qbytes[qi],
+            |qi| qbytes.get(qi).copied().unwrap_or(0),
             pos, ref_base, alt_base, is_snp, params, lut, &mut ll, &mut depth,
             qhash, &mut ov,
         );
@@ -367,7 +367,7 @@ fn pileup_one_cram(
             super::indel_realign::score_read(
                 start, &cigar_buf,
                 |qi| seq.get(qi).unwrap_or(b'N'),
-                |qi| qbytes[qi],
+                |qi| qbytes.get(qi).copied().unwrap_or(0),
                 model, lut, &mut iscratch, &mut ll, &mut depth,
                 params.max_depth, params.min_bq, qhash, &mut ov.last_frag,
             );

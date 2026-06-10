@@ -659,6 +659,14 @@ impl TargetHaplotypeSet {
         if self.kpbwt == 0 || (self.kpbwt as usize) >= n_ref {
             return; // cpp:319-323
         }
+        // Degenerate chunk with ZERO common/HQ sites (every variant rare): there is no
+        // common-site PBWT to walk, and `pbwt_stored`/`pbwt_grp` are empty — the
+        // per-group checkpoint loop below would index `pbwt_stored[0]` out of bounds
+        // (panic). Bail early; the conditioning set is then built from the rare/list
+        // fallback. Byte-identical on any real chunk (pbwt_stored is non-empty there).
+        if self.pbwt_stored.is_empty() {
+            return;
+        }
 
         // pY cursor into Ypacked.
         let y = rhs.ypacked();

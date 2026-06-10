@@ -84,6 +84,13 @@ static KNOBS: &[Knob] = &[
     Knob { name: "LCWGS_G2X_BURNIN", group: "imputation", kind: Kind::Value, default_repr: "", user_facing: false, doc: "⚠ Research override for Glimpse2Params.burnin (--glimpse2-exact path only). parsed ::<i32>() (registry kind u32 logical; negative would parse). No default — unset leaves Glimpse2Params default (5)...." },
     Knob { name: "LCWGS_G2X_KPBWT", group: "imputation", kind: Kind::Value, default_repr: "", user_facing: false, doc: "Research override for conditioning size on the --glimpse2-exact path; sets both kpbwt and kinit. parse::<usize>(). No default — unset (or parse-fail) leaves Glimpse2Params defaults." },
     Knob { name: "LCWGS_G2X_MAIN", group: "imputation", kind: Kind::Value, default_repr: "", user_facing: false, doc: "⚠ Research override for Glimpse2Params.main (Gibbs main-iter count, --glimpse2-exact path only). parsed ::<i32>() (registry kind u32 logical). No default — unset leaves Glimpse2Params default (15)." },
+    Knob { name: "LCWGS_G2X_RARE_CARRIER", group: "imputation", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "Enable rare-carrier injection on the --glimpse2-exact path. is_ok() (caller.rs:224)." },
+    Knob { name: "LCWGS_G2X_RC_ALL_ITERS", group: "imputation", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "OPT-OUT of main-only rare-carrier injection on --glimpse2-exact: PRESENCE makes it run every iteration (main_only = is_err(), caller.rs:227). Unset = main-iters only." },
+    Knob { name: "LCWGS_G2X_RC_MAX_MAC", group: "imputation", kind: Kind::Value, default_repr: "16", user_facing: false, doc: "Max minor-allele-count for a rare site to get carrier injection (--glimpse2-exact). envu, unwrap_or(16) (caller.rs:228)." },
+    Knob { name: "LCWGS_G2X_RC_TOP", group: "imputation", kind: Kind::Value, default_repr: "3", user_facing: false, doc: "Top carriers injected per rare site (--glimpse2-exact). envu, unwrap_or(3) (caller.rs:229)." },
+    Knob { name: "LCWGS_G2X_RC_RUN_CAP", group: "imputation", kind: Kind::Value, default_repr: "64", user_facing: false, doc: "Cap on IBD-run carriers injected (--glimpse2-exact). envu, unwrap_or(64) (caller.rs:230)." },
+    Knob { name: "LCWGS_G2X_SERIAL", group: "imputation", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "Force serial (non-parallel) per-sample processing on the --glimpse2-exact path (also forced when n_samples ≤ 1). is_ok() (caller.rs:293)." },
+    Knob { name: "SELPHI_REFINE_THR", group: "imputation", kind: Kind::Value, default_repr: "0.1", user_facing: true, doc: "Per-sample confidence threshold for the WGS refine engine: at an input chip site a sample with confidence ≥ thr keeps its verbatim hard call; below it uses the panel dosage. parse::<f64>(), unwrap_or(0.1) (imputation_pipeline.rs:872)." },
     Knob { name: "SELPHI_NO_LD", group: "imputation", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "Disable LD correction on chip genetic-map positions in the multi-chr orchestrator (raw cM instead of compute_ld_correction_bm). is_ok() (presence with any value, incl. empty, enables). Default-off ..." },
     Knob { name: "SELPHI_REFINE_CONST_C", group: "imputation", kind: Kind::Value, default_repr: "", user_facing: false, doc: "Test/override constant per-site confidence c applied to EVERY chip site for the hybrid-emission refine spine (eps_eff=(1-c)*0.5 + c*p_err). parse::<f64>(); takes effect ONLY when no real per-site c..." },
     Knob { name: "SELPHI_REFINE_GQ_HI", group: "imputation", kind: Kind::Value, default_repr: "30", user_facing: false, doc: "Upper endpoint of the GQ→input-confidence ramp used by --refine (GQ >= HI → confidence 1). parse::<f64>().unwrap_or(REFINE_GQ_HI const=30.0); no range filter (ramp() guards hi<=lo)." },
@@ -104,12 +111,24 @@ static KNOBS: &[Knob] = &[
     Knob { name: "LCWGS_TRACE_SAMPLE", group: "debug", kind: Kind::Value, default_repr: "0", user_facing: false, doc: "Sample index to trace for LCWGS_TRACE_POS. parse, unwrap_or(0)." },
     Knob { name: "SELPHI_DEBUG_ITER", group: "debug", kind: Kind::Value, default_repr: "0", user_facing: false, doc: "Iteration index to dump in haploid debug dumps. .parse().unwrap_or(0)." },
     Knob { name: "SELPHI_DEBUG_SAMPLE", group: "debug", kind: Kind::Value, default_repr: "0", user_facing: false, doc: "Sample index to dump in haploid debug dumps (IBS/composites/clusters). .parse().unwrap_or(0)." },
+    Knob { name: "SELPHI_DEBUG", group: "debug", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "Master debug-logging toggle (distinct from _ITER/_SAMPLE). Enabled when set to \"1\" (log.rs:44)." },
+    Knob { name: "SELPHI_REFINE_TEST_SOFT_FRAC", group: "debug", kind: Kind::Value, default_repr: "", user_facing: false, doc: "TEST-ONLY: force a fraction of chip sites to be treated as soft (refine-eligible) to exercise the refine path. parse::<f64>() in (0,1]; no-op/unset by default (imputation_pipeline.rs:842)." },
     Knob { name: "SELPHI_FORCE_AVX2", group: "debug", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "Force the AVX2 lcWGS FB path even on an AVX-512 host (AVX2/scalar parity). Exact-match: only '1' enables (.ok().as_deref()==Some('1')). Checked after SELPHI_FORCE_SCALAR." },
     Knob { name: "SELPHI_FORCE_SCALAR", group: "debug", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "Force the scalar code path, disabling all SIMD (AVX-512/AVX2/NEON), for cross-uarch / SIMD parity. Exact-match: only the literal value '1' enables (.ok().as_deref()==Some('1')). PROCESS-WIDE single..." },
     Knob { name: "SELPHI_HAPLOID_STAGE2_DEBUG", group: "debug", kind: Kind::Value, default_repr: "", user_facing: false, doc: "Haploid stage-2 debug-mode selector: 'swaps' (per-sample swap stats, baum.rs:90) or 'noswap' (write input alleles unchanged, baum.rs:113). Compared to string literals at two sites; only these two m..." },
     Knob { name: "SELPHI_QUIET_SIMD", group: "debug", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "Suppress the startup '[selphi] SIMD: <path>' diagnostic line. x86_64-only (cfg-gated). Exact-match: only '1' suppresses (.ok().as_deref()!=Some('1'))." },
-    Knob { name: "SELPHI_FORCE_SCALAR_DIPLOID_SEGMENT", group: "diploid-internal-note", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "⚠ NOT A SEPARATE KNOB — this is the SAME global SELPHI_FORCE_SCALAR var read at diploid/hmm_segment.rs:130 (gates use_avx512()). Do NOT emit a distinct registry entry; folded into the single global..." },
+    // (SELPHI_FORCE_SCALAR also gates the diploid-segment HMM SIMD at diploid/hmm_segment.rs:130 —
+    //  it is the SAME global var, not a separate knob, so it is NOT listed twice.)
+    Knob { name: "SELPHI_ALLOW_NONRECOMB", group: "run", kind: Kind::Bool, default_repr: "false", user_facing: true, doc: "Escape hatch: allow imputing a non-recombining contig (chrY / chrMT), where the Li-Stephens model is inapplicable and is refused by default. is_ok() (contig.rs:65)." },
 ];
+
+/// Value knobs whose UNSET state selects ADAPTIVE behavior (they are read both as a value
+/// AND via `is_err()` as a presence-gate): e.g. `LCWGS_KPBWT` unset → auto-scale by panel
+/// size (pipeline.rs), `LCWGS_MIN_GL` unset → the coverage-adaptive GL floor can engage.
+/// `dump_config` emits these COMMENTED-OUT when the env is unset, so round-tripping a
+/// default dump back through `--config` does not pin the value and silently disable the
+/// adaptive path.
+const PRESENCE_GATED: &[&str] = &["LCWGS_KPBWT", "LCWGS_MIN_GL"];
 
 /// Load a Selphi config file (`--config`). For each `KEY = value` line where KEY is a
 /// known knob and the env var is NOT already set, set it so the existing env reads pick
@@ -169,9 +188,24 @@ pub fn dump_config() -> String {
                 let _ = writeln!(out, "{} = {}", k.name, set);
             }
             Kind::Value => {
-                let v = std::env::var(k.name).unwrap_or_else(|_| k.default_repr.to_string());
-                let shown = if v.is_empty() { "\"\"".to_string() } else { v };
-                let _ = writeln!(out, "{} = {}", k.name, shown);
+                match std::env::var(k.name) {
+                    Ok(v) => {
+                        let shown = if v.is_empty() { "\"\"".to_string() } else { v };
+                        let _ = writeln!(out, "{} = {}", k.name, shown);
+                    }
+                    Err(_) if PRESENCE_GATED.contains(&k.name) => {
+                        // Presence-gated value knob: being UNSET selects an adaptive default
+                        // (e.g. LCWGS_KPBWT unset → auto-scale by panel size). Emit it
+                        // COMMENTED so round-tripping a default dump through --config does not
+                        // pin the value and silently disable the adaptive behavior.
+                        let _ = writeln!(out, "# {} = {}   # unset = adaptive; uncomment to pin",
+                            k.name, k.default_repr);
+                    }
+                    Err(_) => {
+                        let shown = if k.default_repr.is_empty() { "\"\"".to_string() } else { k.default_repr.to_string() };
+                        let _ = writeln!(out, "{} = {}", k.name, shown);
+                    }
+                }
             }
         }
     }

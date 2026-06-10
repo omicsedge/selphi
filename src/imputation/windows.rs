@@ -35,6 +35,19 @@ pub fn compute_imputation_windows(
         }];
     }
 
+    // overlap_cm must be < window_cm: otherwise the stride is ≤ 0, windows stop
+    // advancing, the owned regions never reach the last marker (silent variant loss),
+    // and own_start can invert past own_end. Normalize a bad config to half the window
+    // (with a warning) instead of dropping variants. No-op for sane overlaps (the
+    // default is 2 cM vs 80 cM windows).
+    let overlap_cm = if overlap_cm >= window_cm {
+        eprintln!("WARNING: --overlap-cm ({overlap_cm}) ≥ --window-cm ({window_cm}); \
+                   clamping overlap to {} cM (half the window).", window_cm * 0.5);
+        window_cm * 0.5
+    } else {
+        overlap_cm
+    };
+
     let stride_cm = window_cm - overlap_cm;
 
     // Build raw windows: (ws, we, overlap_start_idx)
@@ -97,6 +110,14 @@ pub fn compute_imputation_windows(
             let n_markers = we - ws;
             ws + ((n_markers + ov_rel) >> 1)
         };
+
+        // Guard against an inverted owned region (own_start > own_end). At the default
+        // window/overlap this never happens, but a pathological config (e.g. overlap_cm
+        // close to or ≥ window_cm — rejected at CLI parse, but defend in depth) can make
+        // `own_start = ws + overlap_size/2` exceed `own_end`. Clamping to an empty region
+        // (own_start == own_end) keeps the downstream `own_wgs_end - own_wgs_start` from
+        // underflowing (usize) into a panic. Byte-identical when own_start ≤ own_end.
+        let own_start = own_start.min(own_end);
 
         result.push(ImputationWindow {
             chip_start: ws, chip_end: we,
