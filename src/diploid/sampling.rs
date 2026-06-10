@@ -161,7 +161,6 @@ pub fn store_probs(
     for m in 0..n_mis.min(graph.prob_missing.len()) {
         graph.prob_missing[m] += missing_probs[m];
     }
-    graph.n_storage_events += 1;
 }
 
 /// Viterbi solve: find maximum-probability diplotype path through accumulated probabilities.

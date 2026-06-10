@@ -164,7 +164,6 @@ pub struct SegmentHmm {
     // Transition buffers
     h_probs: [f32; HAP_NUMBER * HAP_NUMBER],
     sum_h_probs: f32, // NOT used to normalize h_probs in-place
-    d_probs: [f64; 64], // HAP_NUMBER^2 × HAP_NUMBER^2 = 64 diplotype transitions
 }
 
 impl SegmentHmm {
@@ -182,7 +181,6 @@ impl SegmentHmm {
             alpha_locus: Vec::new(),
             h_probs: [0.0; HAP_NUMBER * HAP_NUMBER],
             sum_h_probs: 0.0,
-            d_probs: [0.0; 64],
         }
     }
 
@@ -198,7 +196,6 @@ impl SegmentHmm {
         self.prob_sum_t = 0.0;
         self.h_probs = [0.0; HAP_NUMBER * HAP_NUMBER];
         self.sum_h_probs = 0.0;
-        self.d_probs = [0.0; 64];
     }
 
     // -----------------------------------------------------------------------
@@ -1416,8 +1413,3 @@ impl SegmentHmm {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-}

@@ -11,9 +11,6 @@ pub const VAR_PEAK_HET: i8 = 0;
 pub const VAR_PEAK_HOM: i8 = -1;
 pub const VAR_FLAT_HET: i8 = -2;
 
-/// Common/rare split MAF (genotype_reader.cpp:234, caller_parameters.cpp:56).
-pub const SPARSE_MAF: f64 = 0.001;
-
 #[derive(Clone, Copy)]
 pub struct Glimpse2Params {
     /// Phasing emission error (`err_phase`), ed_phs; ee_phs = 1 - err_phase.
