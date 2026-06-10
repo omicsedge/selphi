@@ -13,7 +13,6 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod self_test;
 mod orchestrate;
 mod cli;
-mod config;
 mod autoroute;
 mod imputation_pipeline;
 mod panel_phasing;
@@ -36,14 +35,14 @@ fn main() {
     // overrides the file (precedence: default < file < env < CLI flag). Single-threaded
     // here (immediately post-parse), so the unsafe set_var inside is sound.
     if let Some(cfg_path) = args.config.clone() {
-        match config::apply_config_file(&cfg_path) {
+        match selphi::config::apply_config_file(&cfg_path) {
             Ok(n) => eprintln!("[selphi] config: applied {n} knob(s) from {cfg_path}"),
             Err(e) => { eprintln!("ERROR: --config {cfg_path}: {e}"); std::process::exit(2); }
         }
     }
     // --dump-config: print the full effective configuration (after --config + env) and exit.
     if args.dump_config {
-        print!("{}", config::dump_config());
+        print!("{}", selphi::config::dump_config());
         return;
     }
 

@@ -9,6 +9,9 @@
 // Logging (must be first for macro exports)
 pub mod log;
 
+// Central config registry + typed env accessors (single point of env-var access)
+pub mod config;
+
 // Common data structures
 pub mod common;
 pub mod contig;
