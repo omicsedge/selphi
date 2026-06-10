@@ -100,17 +100,25 @@ fn extend_high_coverage_haps(
 
     if extend_haps.is_empty() { return; }
 
-    // Build presence mask per hap
-    for &h in &extend_haps {
-        let mut present = vec![false; n_sites];
-        for (v, site) in filtered_matches.iter().enumerate() {
-            if site.iter().any(|&m| m as usize == h) {
-                present[v] = true;
-            }
+    // Build the per-(extend-hap, site) presence mask in ONE pass over the match lists
+    // (O(total_matches) with an O(1) hap→extend-index lookup), instead of an O(|site|)
+    // `any()` scan per (extend-hap × site) = O(n_extend · total_matches). An extend-hap's
+    // presence is independent of other extend-haps' pushes (distinct hap ids), so the
+    // values — and the push order below (extend_haps ascending, then site) — are identical
+    // to the former per-hap recompute. Byte-identical.
+    let mut ext_of = vec![usize::MAX; n_ref_haps];
+    for (i, &h) in extend_haps.iter().enumerate() { ext_of[h] = i; }
+    let mut present = vec![vec![false; n_sites]; extend_haps.len()];
+    for (v, site) in filtered_matches.iter().enumerate() {
+        for &m in site {
+            let i = ext_of[m as usize];
+            if i != usize::MAX { present[i][v] = true; }
         }
-        // Add to missing sites
+    }
+    // Add each extend-hap to the sites where it is missing (same order as before).
+    for (i, &h) in extend_haps.iter().enumerate() {
         for v in 0..n_sites {
-            if !present[v] {
+            if !present[i][v] {
                 filtered_matches[v].push(h as i64);
             }
         }
