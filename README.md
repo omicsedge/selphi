@@ -8,7 +8,7 @@
 
 <img align="right" width="200" src="icons/selphi-logo.svg" alt="Selphi">
 
-**Selphi** — a genotype phasing and imputation tool implemented in Rust. It provides two phasing engines — haploid and diploid — coupled with a Li-Stephens PBWT imputation engine in a unified, memory-efficient pipeline. All internal data structures use a bitmatrix representation (1 bit per allele), HMM kernels are SIMD-accelerated (AVX-512/AVX2 on x86, NEON on Apple Silicon), and results are fully deterministic across runs.
+**Selphi** — a genotype phasing and imputation tool implemented in Rust. It provides two phasing engines — haploid and diploid — coupled with two imputation engines — a Li-Stephens PBWT engine for chip/WGS hard calls and a genotype-likelihood-aware engine for low-coverage WGS (`--lcwgs`) — in a unified, memory-efficient pipeline. All internal data structures use a bitmatrix representation (1 bit per allele), HMM kernels are SIMD-accelerated (AVX-512/AVX2 on x86, NEON on Apple Silicon), and results are fully deterministic across runs.
 
 <p align="center">
   <picture>
