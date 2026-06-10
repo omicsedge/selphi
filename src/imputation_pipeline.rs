@@ -581,7 +581,7 @@ fn maybe_precompute_candidates(
 
     let candidates: Vec<Vec<u32>> = (0..n_haps).into_par_iter().map(|tgt| {
         selphi::imputation::pbwt::select_candidates_weighted(
-            &coded_full, n_ref + tgt, n_ref, 7, effective_mc, anc_ctx.as_ref(), tgt,
+            &coded_full, n_ref + tgt, n_ref, effective_mc, anc_ctx.as_ref(), tgt,
         )
     }).collect();
 
