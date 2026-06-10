@@ -146,7 +146,7 @@
   <text x="390" y="841" text-anchor="middle" fill="#666" font-size="10">Alternative to (b)+(c) for low-coverage data: joint GL-aware phasing + imputation, same panel &amp; output</text>
   <text x="390" y="862" text-anchor="middle" fill="#333" font-size="10.5">Input: PL VCF/BCF or aligned reads (BAM/CRAM, native pileup) at 0.5&#x2013;2&#xd7; depth</text>
   <text x="390" y="879" text-anchor="middle" fill="#333" font-size="10.5">Sparse-PBWT selection &#x21c4; GL-weighted Li-Stephens forward&#x2013;backward (&#x221a;n-checkpointed, SIMD)</text>
-  <text x="390" y="896" text-anchor="middle" fill="#333" font-size="10.5">+ diplotype-mosaic phase commitment (Gibbs, GLIMPSE2-class) &#x2192; GT:DS:GP</text>
+  <text x="390" y="896" text-anchor="middle" fill="#333" font-size="10.5">+ diplotype-mosaic phase commitment (Gibbs sampler) &#x2192; GT:DS:GP</text>
 
   <!-- ========== F: FEATURES BAR ========== -->
   <text x="20" y="922" fill="#333" font-size="14" font-weight="700">f</text>
