@@ -26,6 +26,7 @@
   - [Distribution binaries](#distribution-binaries)
   - [Genetic maps](#genetic-maps)
 - [Usage](#usage)
+  - [Engine selection (--engine)](#engine-selection---engine)
   - [Full pipeline (phase + impute)](#full-pipeline-phase--impute)
   - [Phase-only](#phase-only)
   - [Allele reconciliation (--allele-match)](#allele-reconciliation---allele-match)
@@ -87,6 +88,10 @@ Selphi needs a genetic map in PLINK format (cM positions); Beagle maps work dire
 ## Usage
 
 Input is a standard VCF or BCF, phased (`0|1`) or unphased (`0/1`); phase is auto-detected. Multi-allelic sites are split to biallelic. Target variants must be a subset of the reference panel.
+
+### Engine selection (`--engine`)
+
+`--engine auto` (the default) sniffs the target and picks the imputation engine: aligned reads or a `PL` VCF route to the low-coverage engine; confident WGS-density calls with a GQ/DP field route to the genotype engine with GL-aware refinement; a chip array or GT-only input routes to the plain genotype engine. Force a specific engine with `--engine lcwgs | genotype | refine` (the legacy `--lcwgs` and `--refine` flags still work and map onto these; `--engine genotype` is the explicit force-off). The phasing engine is selected separately by `--phasing-engine auto | haploid | diploid`.
 
 ### Full pipeline (phase + impute)
 
@@ -332,11 +337,12 @@ selphi --self-test --refpanel panel.srp --input target.vcf.gz --map chr.map --ou
 | `--out PATH` | Output path prefix | required |
 | `--threads N` | Number of threads | all CPUs |
 | `--truth PATH` | Truth VCF/BCF; auto-runs post-hoc evaluation after imputation | |
-| `--phasing-engine ENGINE` | `auto`, `haploid`, or `diploid` | `auto` |
+| `--engine ENGINE` | Imputation engine: `auto` (default, sniffs the target), `lcwgs`, `genotype`, or `refine` | `auto` |
+| `--phasing-engine ENGINE` | Phasing engine: `auto`, `haploid`, or `diploid` | `auto` |
 | `--phase-only` | Output phased haplotypes only (skip imputation) | off |
 | `--force-phasing` | Re-phase even if input is already phased | off |
 | `--allele-match MODE` | Target/panel allele reconciliation: `none`, `swap`, `strand`, `full` | `none` |
-| `--lcwgs` | Use the low-coverage genotype-likelihood engine (PL VCF or BAM/CRAM) | off |
+| `--lcwgs` | Legacy alias for `--engine lcwgs`; also enables PL/BAM low-coverage input | off |
 | `--bam PATH` / `--bam-list PATH` | Aligned reads for `--lcwgs` (single file, or a list) | |
 | `--reference PATH` | Reference FASTA (required for CRAM input) | |
 | `--chrx-par` / `--build B` | PAR-aware chrX male ploidy; `B` = `grch38`/`grch37`/`auto` | off |
