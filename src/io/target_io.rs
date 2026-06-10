@@ -239,6 +239,14 @@ fn split_vcf_fields(line: &[u8]) -> Option<VcfFields<'_>> {
 /// `*phase_checks` over the leading samples and clears `*is_phased` when a
 /// checked sample uses the unphased `/` separator. (Replaces three byte-
 /// identical copies; the former cohort `bin` and `.min(1)` clamps are equal.)
+
+/// Per-allele sentinel for a MISSING genotype (`.`), distinct from the real
+/// (biallelic-projected) alleles {0,1}. The imputation path folds it back to 0
+/// in [`extract_target_alleles`] (so imputation is byte-identical — missing has
+/// always been treated as hom-ref there); the pedigree scaffold reads it (any
+/// value > 1) to skip a missing parent instead of mistaking it for hom-ref.
+pub const GT_MISSING: u8 = 3;
+
 fn parse_gt_region(
     gt_region: &[u8],
     n_samples: usize,
@@ -263,14 +271,17 @@ fn parse_gt_region(
         }
 
         let (a0, a1) = if gt.len() >= 3 {
-            // Diploid "a/b" or "a|b" (separator at index 1).
-            (if gt[0].is_ascii_digit() { (gt[0] - b'0').min(1) } else { 0 },
-             if gt[2].is_ascii_digit() { (gt[2] - b'0').min(1) } else { 0 })
+            // Diploid "a/b" or "a|b" (separator at index 1). A missing allele ('.')
+            // is marked GT_MISSING (not folded to 0) so the pedigree scaffold can
+            // distinguish a truly-missing parent from a real hom-ref; the imputation
+            // path folds it back to 0 in extract_target_alleles (byte-identical there).
+            (if gt[0].is_ascii_digit() { (gt[0] - b'0').min(1) } else { GT_MISSING },
+             if gt[2].is_ascii_digit() { (gt[2] - b'0').min(1) } else { GT_MISSING })
         } else if !gt.is_empty() {
             // Haploid "a" — keep the allele in slot 0 (matches read_target_bcf).
-            (if gt[0].is_ascii_digit() { (gt[0] - b'0').min(1) } else { 0 }, 0)
+            (if gt[0].is_ascii_digit() { (gt[0] - b'0').min(1) } else { GT_MISSING }, 0)
         } else {
-            (0, 0)
+            (GT_MISSING, GT_MISSING)
         };
         var_gts.push([a0, a1]);
 
@@ -291,13 +302,22 @@ fn parse_gt_region(
 pub fn read_cohort_vcf(
     path: &str,
 ) -> (Vec<String>, Vec<TargetMarker>, Vec<Vec<[u8; 2]>>, bool) {
+    // Panel self-phasing has no pedigree consumer; fold the GT_MISSING sentinel that
+    // read_target_bcf / parse_gt_region now emit back to 0 (the phasing engine expects
+    // {0,1}), keeping this path byte-identical to the pre-sentinel behaviour.
+    let fold_missing = |mut r: (Vec<String>, Vec<TargetMarker>, Vec<Vec<[u8; 2]>>, bool)| {
+        for v in r.2.iter_mut() {
+            for g in v.iter_mut() { if g[0] > 1 { g[0] = 0; } if g[1] > 1 { g[1] = 0; } }
+        }
+        r
+    };
     // Real binary BCF → noodles decoder (captures the variant ID for panel output).
     if path.ends_with(".bcf") {
-        return read_target_bcf(path, false, true);
+        return fold_missing(read_target_bcf(path, false, true));
     }
     let raw = read_vcf_raw(path);
     if raw.starts_with(b"BCF\x02\x02") {
-        return read_target_bcf(path, false, true);
+        return fold_missing(read_target_bcf(path, false, true));
     }
 
     let mut markers = Vec::new();
@@ -327,7 +347,12 @@ pub fn read_cohort_vcf(
             ref_allele: f.ref_allele.to_string(), alt_allele: f.alt_allele.to_string(),
             ref_hash: String::new(), alt_hash: String::new(), id: f.id.to_string(),
         });
-        genotypes.push(parse_gt_region(f.gt_region, sample_names.len(), &mut is_phased, &mut phase_checks));
+        // Cohort/panel self-phasing has no pedigree consumer, so fold the GT_MISSING
+        // sentinel back to 0 here (the panel phasing engine expects {0,1}); keeps this
+        // path byte-identical to the pre-sentinel behaviour (missing → hom-ref).
+        let mut gts = parse_gt_region(f.gt_region, sample_names.len(), &mut is_phased, &mut phase_checks);
+        for g in gts.iter_mut() { if g[0] > 1 { g[0] = 0; } if g[1] > 1 { g[1] = 0; } }
+        genotypes.push(gts);
     }
 
     if sample_names.is_empty() {
@@ -409,14 +434,23 @@ fn read_target_bcf(
                     // 2+) folds to 1; missing/REF -> 0. Keeps the whole pipeline on the
                     // 0/1 bitmatrix domain so chip passthrough never emits a GT allele
                     // index beyond the single output ALT. No-op on biallelic input.
-                    let a0 = al.first().and_then(|a| a.position()).unwrap_or(0).min(1) as u8;
-                    let a1 = al.get(1).and_then(|a| a.position()).unwrap_or(0).min(1) as u8;
+                    // A present allele projects to {0,1}; a MISSING allele ('.') → GT_MISSING
+                    // (see parse_gt_region) so the pedigree scaffold can skip a missing parent.
+                    // The haploid slot-1 (al.get(1)==None, i.e. no 2nd allele) stays 0, NOT
+                    // missing. extract_target_alleles folds GT_MISSING back to 0 (imputation
+                    // byte-identical).
+                    let a0 = al.first().and_then(|a| a.position())
+                        .map(|p| (p as u8).min(1)).unwrap_or(GT_MISSING);
+                    let a1 = match al.get(1) {
+                        None => 0,
+                        Some(a) => a.position().map(|p| (p as u8).min(1)).unwrap_or(GT_MISSING),
+                    };
                     // VCF phasing is carried on the allele separators after the
                     // first; a diploid is phased iff its 2nd allele is Phased.
                     let phased = al.get(1).map(|a| a.phasing() == Phasing::Phased).unwrap_or(true);
                     (a0, a1, phased)
                 }
-                _ => (0, 0, true),
+                _ => (GT_MISSING, GT_MISSING, true),
             };
             if phase_checks > 0 { if !phased { is_phased = false; } phase_checks -= 1; }
             var_gts.push([a0, a1]);
@@ -1114,13 +1148,18 @@ pub fn extract_target_alleles(
         let gt = &genotypes[ti];
         let swap = transforms.get(ci).copied().unwrap_or(0) == 1;
         for s in 0..n_samples.min(gt.len()) {
+            // Fold a MISSING sentinel (>1) back to 0 = hom-ref — imputation's
+            // long-standing treatment of a missing target GT. Byte-identical for real
+            // {0,1} alleles (the fold is a no-op; the swap arm's old `.min(1)` was too).
+            let g0 = if gt[s][0] > 1 { 0 } else { gt[s][0] };
+            let g1 = if gt[s][1] > 1 { 0 } else { gt[s][1] };
             if swap {
                 // Biallelic 0↔1 recode (alleles are projected to {0,1} upstream).
-                out[ci * n_haps + s * 2] = 1 - gt[s][0].min(1);
-                out[ci * n_haps + s * 2 + 1] = 1 - gt[s][1].min(1);
+                out[ci * n_haps + s * 2] = 1 - g0;
+                out[ci * n_haps + s * 2 + 1] = 1 - g1;
             } else {
-                out[ci * n_haps + s * 2] = gt[s][0];
-                out[ci * n_haps + s * 2 + 1] = gt[s][1];
+                out[ci * n_haps + s * 2] = g0;
+                out[ci * n_haps + s * 2 + 1] = g1;
             }
         }
     }
