@@ -33,7 +33,6 @@ impl CFlip {
 /// with type tags for dispatch.
 #[derive(Clone, Copy)]
 struct VariantTag {
-    _var_idx: usize,     // index in full variant array
     scaffold_idx: i32,  // index in scaffold array, or -1
     rare_idx: i32,      // index in rare array, or -1
 }
@@ -58,7 +57,6 @@ fn build_variant_order(
     for v in 0..n_var {
         if var_type[v] > 0 {
             order.push(VariantTag {
-                _var_idx: v,
                 scaffold_idx: scaffold_lookup[v],
                 rare_idx: rare_lookup[v],
             });
