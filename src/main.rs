@@ -13,6 +13,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod self_test;
 mod orchestrate;
 mod cli;
+mod config;
 mod autoroute;
 mod imputation_pipeline;
 mod panel_phasing;
@@ -28,6 +29,24 @@ use cli::Args;
 
 
 fn main() {
+    let mut args = Args::parse();
+
+    // --config: load a selphi.toml into the process environment BEFORE any engine env
+    // read. Sets only knobs not already in the environment, so an explicit env var still
+    // overrides the file (precedence: default < file < env < CLI flag). Single-threaded
+    // here (immediately post-parse), so the unsafe set_var inside is sound.
+    if let Some(cfg_path) = args.config.clone() {
+        match config::apply_config_file(&cfg_path) {
+            Ok(n) => eprintln!("[selphi] config: applied {n} knob(s) from {cfg_path}"),
+            Err(e) => { eprintln!("ERROR: --config {cfg_path}: {e}"); std::process::exit(2); }
+        }
+    }
+    // --dump-config: print the full effective configuration (after --config + env) and exit.
+    if args.dump_config {
+        print!("{}", config::dump_config());
+        return;
+    }
+
     // Probe & report the SIMD path picked for the diploid HMM hot loop. The
     // baseline is `x86-64-v3` (AVX2/FMA/BMI2 — Haswell+ 2013); AVX-512F+DQ is
     // a runtime upgrade. Setting `SELPHI_FORCE_SCALAR=1` forces the scalar
@@ -46,8 +65,6 @@ fn main() {
         };
         eprintln!("[selphi] SIMD: {}", path);
     }
-
-    let mut args = Args::parse();
 
     // Reject conflicting top-level modes (dispatch is first-match-wins, so
     // passing two would silently run only one). At most one allowed.
