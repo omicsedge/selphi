@@ -1324,7 +1324,7 @@ pub fn interpolate_tile_preloaded(
     if first_chunk == last_chunk {
         let chunk = chunk_cache[first_chunk - chunk_base].as_ref().unwrap();
         let row_offset = global_start - first_chunk * chunk_size;
-        interp_kernel(weights, chip_s, chip_e, chunk, row_offset, tile_n, t, &mut alt_probs, n_haps);
+        interp_kernel(weights, chip_s, chip_e, chunk, row_offset, tile_n, t, &mut alt_probs, 0, tile_n, n_haps);
     } else {
         let mut tile_offset = 0;
         for sid in first_chunk..=last_chunk {
@@ -1338,14 +1338,12 @@ pub fn interpolate_tile_preloaded(
             let row_offset = ov_start - chunk_start;
             let t_start = tile_offset;
 
-            let mut sub = vec![0.0f32; n_haps * ov_n];
-            interp_kernel(weights, chip_s, chip_e, chunk, row_offset, ov_n, &t[t_start..t_start+ov_n], &mut sub, n_haps);
-
-            for h in 0..n_haps {
-                for v in 0..ov_n {
-                    alt_probs[h * tile_n + tile_offset + v] = sub[h * ov_n + v];
-                }
-            }
+            // Write this chunk's slice DIRECTLY into alt_probs at column `tile_offset`
+            // (stride tile_n) — no per-chunk scratch Vec + serial copy-back. Each chunk
+            // writes a disjoint column range, so the sequential calls are race-free and
+            // the result is bit-identical to the scratch+copy version.
+            interp_kernel(weights, chip_s, chip_e, chunk, row_offset, ov_n,
+                          &t[t_start..t_start+ov_n], &mut alt_probs, tile_offset, tile_n, n_haps);
             tile_offset += ov_n;
         }
     }
@@ -1360,7 +1358,7 @@ fn interp_kernel(
     chip_s: usize, chip_e: usize,
     chunk: &crate::srp::CscChunk,
     row_offset: usize, n_vars: usize,
-    t: &[f32], out: &mut [f32], n_haps: usize,
+    t: &[f32], out: &mut [f32], out_offset: usize, out_stride: usize, n_haps: usize,
 ) {
     let row_end = row_offset + n_vars;
 
@@ -1368,10 +1366,15 @@ fn interp_kernel(
         static TL_NUM: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
-    out.par_chunks_mut(n_vars)
+    // Each hap owns one `out_stride`-long row of `out`; this call writes its
+    // `[out_offset, out_offset + n_vars)` slice. Multi-chunk tiles call this once
+    // per chunk with the chunk's `out_offset` so each chunk writes its slice
+    // DIRECTLY into the shared `alt_probs` — no per-chunk scratch + copy-back.
+    out.par_chunks_mut(out_stride)
         .take(n_haps)
         .enumerate()
-        .for_each(|(h, hap_out)| {
+        .for_each(|(h, hap_row)| {
+            let hap_out = &mut hap_row[out_offset..out_offset + n_vars];
             let w = weights[h];
             let s1 = w.indptr[chip_s] as usize;
             let e1 = w.indptr[chip_s + 1] as usize;

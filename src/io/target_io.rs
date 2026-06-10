@@ -1236,7 +1236,11 @@ pub fn read_target_vcf_multi_chr(
     let partition = |samples: Vec<String>, markers: Vec<TargetMarker>, gts: Vec<Vec<[u8; 2]>>, phased: bool| {
         let mut by_chr: ByChr = std::collections::BTreeMap::new();
         for (m, g) in markers.into_iter().zip(gts) {
-            let e = by_chr.entry(m.chrom.clone()).or_default();
+            // Key by the STRIPPED contig (matching the VCF path below) — the
+            // consumers (orchestrate) look up per-chr by stripped name, so a raw
+            // key (e.g. "chr22") on a bare-named ("22") panel would miss and SILENTLY
+            // drop the whole chromosome. TargetMarker.chrom stays raw (intersect re-strips).
+            let e = by_chr.entry(strip_chr_prefix(&m.chrom).to_string()).or_default();
             e.0.push(m);
             e.1.push(g);
         }
