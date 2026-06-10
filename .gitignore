@@ -1,0 +1,23 @@
+# Test-data and index artifacts — never commit these to the source repo.
+# Reference panels, alignments, and truth/benchmark VCFs live OUTSIDE the repo
+# (under data/ symlinks or /data/...). Only stray index files were ever committed
+# by accident; this guard stops them (and the large data files) from coming back.
+
+# Alignments + their indexes
+*.bam
+*.cram
+*.bai
+*.crai
+
+# Variant/index files
+*.csi
+*.tbi
+*.bcf
+
+# GIAB / sample-specific test artifacts
+HG002*
+HG003*
+HG004*
+
+# Build output
+/target/
