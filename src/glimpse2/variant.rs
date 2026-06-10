@@ -29,16 +29,6 @@ impl Variant {
     pub fn mac(&self) -> u32 {
         self.cref.min(self.calt)
     }
-    /// Alternate allele frequency (calt / (cref+calt)).
-    #[inline]
-    pub fn af(&self) -> f64 {
-        let n = (self.cref + self.calt) as f64;
-        if n > 0.0 {
-            self.calt as f64 / n
-        } else {
-            0.0
-        }
-    }
 }
 
 /// Ordered variants + helpers (cM lookup, common/rare classification).
@@ -57,19 +47,13 @@ impl VariantMap {
     pub fn is_empty(&self) -> bool {
         self.vars.is_empty()
     }
-    /// Is variant `i` common under the SPARSE_MAF split (AF in [maf, 1-maf]).
-    #[inline]
-    pub fn is_common(&self, i: usize, sparse_maf: f64) -> bool {
-        let af = self.vars[i].af();
-        af >= sparse_maf && af <= 1.0 - sparse_maf
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn mac_and_af() {
+    fn mac() {
         let v = Variant {
             bp: 100,
             id: "rs1".into(),
@@ -83,6 +67,5 @@ mod tests {
             lq: false,
         };
         assert_eq!(v.mac(), 10);
-        assert!((v.af() - 0.1).abs() < 1e-12);
     }
 }

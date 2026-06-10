@@ -1,16 +1,17 @@
 //! SRP (Sparse Reference Panel) reader and writer.
 //!
-//! The .srp format is a zstd-compressed ZIP archive containing:
-//!   - `metadata`      — JSON with panel dimensions, chunk info, variant dtypes
-//!   - `variants`      — zstd-compressed binary array of variant structs
-//!   - `chunks`        — zstd-compressed binary array of (chunk_id, start_bp, end_bp)
-//!   - `sample_ids`    — zstd-compressed newline-delimited sample names
-//!   - `IDs`           — zstd-compressed newline-delimited "chr-pos-ref-alt"
-//!   - `original_IDs`  — zstd-compressed newline-delimited original VCF IDs
-//!   - `haplotypes/N.bin` or `.npz` — zstd-compressed CSC boolean sparse chunks
+//! The `.srp` format is a binary, tile-based sparse panel (the legacy
+//! zstd-ZIP/`.npz` archive layout is gone). Two variants, distinguished by an
+//! 8-byte magic:
+//!   - Single-chr (`SRP_SINGLE_CHR_MAGIC`, `b"SRP\0\x02.."`, v2): header +
+//!     variant index + sample IDs + 2D sparse tiles.
+//!   - Multi-chr (`SRP_MULTI_CHR_MAGIC`, `b"SRP\0\x03.."`, v3): global header +
+//!     per-chromosome directory + per-chr tile sections (auto-detected on read).
 //!
-//! Chunk format (raw): `[rows:i4][cols:i4][nnz:i4][indptr:i4*(cols+1)][indices:i4*nnz]`
-//! Boolean data is implicit (all True) — not stored.
+//! Each tile is a CSC sub-matrix of `TILE_ROWS` (1024) variants × `TILE_COLS`
+//! (4096) haplotypes with u16 row indices, u32 indptr, and a compressed payload;
+//! boolean allele data is implicit (the stored indices ARE the set bits). See
+//! `tiled.rs` for the on-disk tile layout and `multi_chr_*` for the container.
 
 mod reader;
 pub mod helpers;

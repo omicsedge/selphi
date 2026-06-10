@@ -5,6 +5,17 @@
 //! Dosage: uint16 LE, 0=0.0, 16384=1.0, 32768=2.0, 65535=missing.
 //!
 //! Spec: github.com/chrchang/plink-ng (pgen_spec.pdf, pgenlib_misc.h)
+//!
+//! HARDCALL CONVENTION (intentional — differs from VCF/BCF/SelfDecode):
+//! PGEN derives its 2-bit hardcall by ROUNDING THE SUMMED DOSAGE
+//! (`ds = ap1 + ap2`; `2` if `ds > 1.5`, `1` if `ds > 0.5`, else `0`) — the
+//! standard PLINK dosage→hardcall convention, internally consistent with the
+//! 16-bit dosage it stores alongside. VCF/BCF/SelfDecode instead take a
+//! PER-HAPLOTYPE argmax (`gt1 = ap1 > 0.5`, `gt2 = ap2 > 0.5`). The DOSAGE
+//! fields are identical across all formats; only the hardcall/GT can differ
+//! on borderline per-hap probabilities (e.g. `ap1 = ap2 = 0.4` → PGEN het
+//! `1`, VCF `0|0`). Chip (hard-call) sites never diverge. This is a format
+//! convention, not a bug: PGEN stays self-consistent for PLINK tooling.
 
 use std::io::{self, Write, BufWriter, Seek, SeekFrom};
 use std::path::Path;

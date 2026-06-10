@@ -236,7 +236,11 @@ impl SelfdecodeWriter {
         hardcall_mask: Option<&[bool]>,
     ) -> std::io::Result<()> {
         let n_samples = self.sample_names.len();
-        let is_chrm = chrom.contains('M');
+        // Full-token contig classification (chr-prefix-tolerant, case-insensitive)
+        // rather than a `contains('M')` substring test, so a non-standard scaffold
+        // whose label merely contains 'M' is not mistaken for chrMT. Identical to
+        // the old test on every standard contig (1-22/X/Y/M/MT/chrM/chrMT).
+        let is_chrm = crate::contig::classify_contig(chrom) == crate::contig::ContigClass::ChrMt;
 
         for s in 0..n_samples {
             let g1 = gt1_values[s];
