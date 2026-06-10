@@ -628,10 +628,9 @@ pub fn select_candidates(
     coded: &CodedSteps,
     target_hap: usize,     // absolute index in merged panel
     n_ref: usize,          // number of reference haplotypes (hap < n_ref = ref)
-    _n_consecutive: usize, // unused (kept for API compat)
     max_candidates: usize, // cap (default 2000)
 ) -> Vec<u32> {
-    select_candidates_weighted(coded, target_hap, n_ref, _n_consecutive, max_candidates, None, 0)
+    select_candidates_weighted(coded, target_hap, n_ref, max_candidates, None, 0)
 }
 
 /// Variant with ancestry-aware rescoring.
@@ -650,7 +649,6 @@ pub fn select_candidates_weighted(
     coded: &CodedSteps,
     target_hap: usize,
     n_ref: usize,
-    _n_consecutive: usize,
     max_candidates: usize,
     ancestry: Option<&crate::imputation::ancestry::AncestryContext<'_>>,
     tgt_local: usize,

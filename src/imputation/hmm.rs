@@ -172,27 +172,22 @@ fn compute_precomb(
 fn build_dense_matches(
     matches: &[Vec<i64>],
 ) -> (Vec<Vec<usize>>, Vec<usize>, Vec<i64>, usize) {
-    // Collect all unique hap IDs across all sites
-    let mut all_haps = std::collections::BTreeSet::new();
-    for site in matches {
-        for &h in site {
-            all_haps.insert(h);
-        }
-    }
-    let state_to_hap: Vec<i64> = all_haps.iter().copied().collect();
+    // Unique hap IDs, ASCENDING — a sort+dedup Vec replaces the BTreeSet, and a
+    // binary_search replaces the HashMap reverse-map. `state_to_hap` stays ascending
+    // (== the old BTreeSet iteration order), so each hap's state index is identical →
+    // bit-identical downstream; just one fewer tree + hashmap alloc/lookup per HMM call.
+    let mut state_to_hap: Vec<i64> = matches.iter().flatten().copied().collect();
+    state_to_hap.sort_unstable();
+    state_to_hap.dedup();
     let n_states = state_to_hap.len();
 
-    // Build reverse map: hap_id → state_index
-    let mut hap_to_state = std::collections::HashMap::new();
-    for (i, &h) in state_to_hap.iter().enumerate() {
-        hap_to_state.insert(h, i);
-    }
-
-    // Build dense_matches
+    // Build dense_matches (hap_id → state index via binary_search on the sorted vec).
     let mut dense_matches = Vec::with_capacity(matches.len());
     let mut n_matches = Vec::with_capacity(matches.len());
     for site in matches {
-        let dm: Vec<usize> = site.iter().map(|&h| hap_to_state[&h]).collect();
+        let dm: Vec<usize> = site.iter()
+            .map(|&h| state_to_hap.binary_search(&h).expect("hap in state_to_hap"))
+            .collect();
         n_matches.push(dm.len());
         dense_matches.push(dm);
     }

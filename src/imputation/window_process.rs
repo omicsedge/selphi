@@ -206,7 +206,7 @@ pub fn process_window_hmm(
             let candidates = if let Some(pc) = precomputed_candidates {
                 pc[tgt].clone()
             } else {
-                pbwt::select_candidates(coded, n_ref + tgt, n_ref, 7, max_candidates)
+                pbwt::select_candidates(coded, n_ref + tgt, n_ref, max_candidates)
             };
             let n_cand = candidates.len();
             if n_cand == 0 {

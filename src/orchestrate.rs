@@ -514,7 +514,7 @@ pub fn run_multi_chr(
             let candidates: Vec<Vec<u32>> = (0..n_haps)
                 .into_par_iter()
                 .map(|tgt| {
-                    selphi::imputation::pbwt::select_candidates(&coded_full, n_ref + tgt, n_ref, 7, max_cand)
+                    selphi::imputation::pbwt::select_candidates(&coded_full, n_ref + tgt, n_ref, max_cand)
                 })
                 .collect();
             Some(candidates)
