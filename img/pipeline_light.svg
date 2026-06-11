@@ -17,7 +17,7 @@
     <clipPath id="t1_1"><rect x="58" y="75" width="0" height="22"><animate attributeName="width" values="0;0;446;446" keyTimes="0;0.3400;0.3767;1" dur="30s" repeatCount="indefinite"/></rect></clipPath>
     <clipPath id="t2_1"><rect x="58" y="101" width="0" height="22"><animate attributeName="width" values="0;0;474;474" keyTimes="0;0.3800;0.4200;1" dur="30s" repeatCount="indefinite"/></rect></clipPath>
     <clipPath id="t1_2"><rect x="58" y="75" width="0" height="22"><animate attributeName="width" values="0;0;502;502" keyTimes="0;0.6733;0.7100;1" dur="30s" repeatCount="indefinite"/></rect></clipPath>
-    <clipPath id="t2_2"><rect x="58" y="101" width="0" height="22"><animate attributeName="width" values="0;0;353;353" keyTimes="0;0.7133;0.7533;1" dur="30s" repeatCount="indefinite"/></rect></clipPath>
+    <clipPath id="t2_2"><rect x="58" y="101" width="0" height="22"><animate attributeName="width" values="0;0;427;427" keyTimes="0;0.7133;0.7533;1" dur="30s" repeatCount="indefinite"/></rect></clipPath>
   </defs>
   <rect width="920" height="1222" rx="12" fill="#ffffff"/>
   <g font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace">
@@ -61,10 +61,10 @@
       <text x="844" y="37" text-anchor="end" fill="#5eead4" font-size="13" font-weight="700">low-coverage WGS  →  lcWGS</text>
       <text x="34" y="90" fill="#7ee787" font-size="16" font-weight="700">$</text>
       <g clip-path="url(#t1_2)"><text x="58" y="90" fill="#e6edf3" font-size="15">selphi --refpanel chr22.srp --input sample.gl.vcf.gz \</text></g>
-      <g clip-path="url(#t2_2)"><text x="58" y="116" fill="#e6edf3" font-size="15">    --map chr22.map --out lowcov -t 16</text></g>
-      <rect width="9" height="18" fill="#7ee787" x="58" y="102"><animate attributeName="x" values="58;58;560;58;411;411" keyTimes="0;0.6733;0.7100;0.7133;0.7533;1" dur="30s" repeatCount="indefinite"/><animate attributeName="y" values="76;76;102;102" keyTimes="0;0.7100;0.7133;1" dur="30s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0;0.5;0.5;1" dur="0.9s" repeatCount="indefinite"/></rect>
+      <g clip-path="url(#t2_2)"><text x="58" y="116" fill="#e6edf3" font-size="15">    --map chr22.map --out lowcov --lcwgs -t 16</text></g>
+      <rect width="9" height="18" fill="#7ee787" x="58" y="102"><animate attributeName="x" values="58;58;560;58;485;485" keyTimes="0;0.6733;0.7100;0.7133;0.7533;1" dur="30s" repeatCount="indefinite"/><animate attributeName="y" values="76;76;102;102" keyTimes="0;0.7100;0.7133;1" dur="30s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0;0.5;0.5;1" dur="0.9s" repeatCount="indefinite"/></rect>
       <text x="34" y="150" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.7627;0.7667;1" dur="30s" repeatCount="indefinite"/><tspan fill="#56d4dd">[selphi]</tspan><tspan fill="#8b949e"> SIMD: </tspan><tspan fill="#7ee787">AVX-512F+DQ</tspan></text>
-      <text x="34" y="176" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.7793;0.7833;1" dur="30s" repeatCount="indefinite"/><tspan fill="#8b949e">  auto-route: PL / low GT call-rate  </tspan><tspan fill="#5eead4">→ lcWGS engine (integrated phasing)</tspan></text>
+      <text x="34" y="176" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.7793;0.7833;1" dur="30s" repeatCount="indefinite"/><tspan fill="#8b949e">  mode: lcwgs  </tspan><tspan fill="#5eead4">→ low-coverage WGS engine (integrated phasing)</tspan></text>
       <text x="34" y="202" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.7960;0.8000;1" dur="30s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  SRP loaded: 1070401 variants, 4478 haps</tspan></text>
       <text x="34" y="228" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.8127;0.8167;1" dur="30s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  PL VCF: 1 sample, 929834 variants  </tspan><tspan fill="#8b949e">(296438 flat 0.5/0.5)</tspan></text>
       <text x="34" y="254" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.8293;0.8333;1" dur="30s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  shared variants: 929834 / 929834 (100.0% of target)</tspan></text>
