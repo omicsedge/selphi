@@ -459,16 +459,33 @@ pub fn run_gibbs(
     // can lock onto the true carrier copy (+~0.0007 OVERALL; default ON).
     let rare_carrier = cfg.rare_carrier;
     let k_max = cfg.k_max;
-    // Rare sites (low panel minor-allele count) + their panel carriers.
-    let rare_sites: Vec<(usize, Vec<u32>)> = if rare_carrier {
+    // Rare sites (low panel MINOR-allele count) + their MINOR-allele carriers.
+    // A site is rare when its minor allele = min(ac, n_ref-ac) is carried by
+    // 1..=max_carr panel haps, and the augmented carriers must be the haps that
+    // carry that MINOR allele. When REF is the minor allele (common ALT, ac >
+    // n_ref/2) the rare carriers are the REF haps, not the ALT haps — selecting
+    // ALT carriers there (and never flagging the site as rare) is the bug this
+    // fixes: rare-REF carriers were never injected. We store `minor_allele` per
+    // site so the augmentation below matches the target hap's sampled allele
+    // against the correct allele. Opt out with LCWGS_RARE_CARRIER_ALT_ONLY=1 to
+    // reproduce the prior ALT-only behaviour for A/B validation.
+    let rare_sites: Vec<(usize, u8, Vec<u32>)> = if rare_carrier {
         let n_ref = ref_bm.n_haps;
         let max_carr = cfg.rare_carrier_max;
+        let alt_only = crate::config::present("LCWGS_RARE_CARRIER_ALT_ONLY");
         (0..n_var).filter_map(|v| {
-            let ac = ref_bm.popcount_row(v, n_ref) as usize;
-            if (1..=max_carr).contains(&ac) {
+            let ac = ref_bm.popcount_row(v, n_ref) as usize; // panel ALT-allele count
+            // Minor allele + its carrier count. Legacy path forces ALT.
+            let (minor_allele, minor_count) = if alt_only || ac <= n_ref - ac {
+                (1u8, ac)             // ALT is minor (or tie); legacy always uses ALT
+            } else {
+                (0u8, n_ref - ac)     // REF is minor (common ALT)
+            };
+            if (1..=max_carr).contains(&minor_count) {
+                let want_alt = minor_allele == 1;
                 let carriers: Vec<u32> = (0..n_ref as u32)
-                    .filter(|&h| ref_bm.get(v, h as usize)).collect();
-                Some((v, carriers))
+                    .filter(|&h| ref_bm.get(v, h as usize) == want_alt).collect();
+                Some((v, minor_allele, carriers))
             } else { None }
         }).collect()
     } else { Vec::new() };
@@ -570,10 +587,12 @@ pub fn run_gibbs(
         let t0 = if timing { Some(std::time::Instant::now()) } else { None };
         let cond_storage: Option<Vec<Vec<u32>>> = if rare_carrier {
             let mut aug = base_cond.clone();
-            for (v, carriers) in &rare_sites {
+            for (v, minor_allele, carriers) in &rare_sites {
                 let base = v * n_target_haps;
                 for h in 0..n_target_haps {
-                    if hap_alleles[base + h] == 1 { aug[h].extend_from_slice(carriers); }
+                    // Augment a target hap currently sampled as this site's MINOR
+                    // (rare) allele with that allele's panel carriers.
+                    if hap_alleles[base + h] == *minor_allele { aug[h].extend_from_slice(carriers); }
                 }
             }
             if let Some(kmax) = k_max {
@@ -784,23 +803,24 @@ pub fn run_gibbs(
                     // segment Viterbi should be able to commit to.
                     const RC_RUN_CAP: usize = 64;
                     let mut scored: Vec<(u32, u32)> = Vec::new();
-                    for (rv, carriers) in &rare_sites {
+                    for (rv, minor_allele, carriers) in &rare_sites {
                         let rv = *rv;
                         if h0[rv] == h1[rv] { continue; }            // het sites only
-                        let alt: &[u8] = if h0[rv] == 1 { &h0 } else { &h1 };
+                        // the hap carrying this site's MINOR (rare) allele
+                        let rare_hap: &[u8] = if h0[rv] == *minor_allele { &h0 } else { &h1 };
                         for &c in carriers {
                             let cu = c as usize;
-                            let mut run = 1u32;                       // the rare site itself matches (carrier ALT, alt hap ALT)
+                            let mut run = 1u32;                       // the rare site itself matches (carrier and rare hap share the minor allele)
                             let mut w = rv;
                             let mut steps = 0;
                             while w > 0 && steps < RC_RUN_CAP {
                                 w -= 1; steps += 1;
-                                if ref_bm.get(w, cu) as u8 == alt[w] { run += 1; } else { break; }
+                                if ref_bm.get(w, cu) as u8 == rare_hap[w] { run += 1; } else { break; }
                             }
                             let mut w = rv; let mut steps = 0;
                             while w + 1 < n_var && steps < RC_RUN_CAP {
                                 w += 1; steps += 1;
-                                if ref_bm.get(w, cu) as u8 == alt[w] { run += 1; } else { break; }
+                                if ref_bm.get(w, cu) as u8 == rare_hap[w] { run += 1; } else { break; }
                             }
                             scored.push((run, c));
                         }
