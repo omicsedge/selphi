@@ -1079,6 +1079,9 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     let mut hap_priors: Vec<Option<Vec<f64>>> = vec![None; n_haps];
     let n_cores = rayon::current_num_threads();
 
+    // Run-level imputation-quality accumulator (mean DR2 over imputed sites).
+    let mut dr2_acc = selphi::io::dosage_stats::Dr2Summary::default();
+
     for (wi, window) in windows.iter().enumerate() {
         let t0_win = Instant::now();
         let cpu0_win = selphi::log::cpu_time_secs();
@@ -1326,6 +1329,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                 selfdecode: selfdecode_writer.as_mut(),
                 vcf_tx: &vcf_tx,
             },
+            &mut dr2_acc,
         ).expect("Output write failed");
         }
 
@@ -1363,6 +1367,9 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         &out_file, &out_path,
         &sample_names, &srp.metadata.contig_field, version, no_ap,
     );
+
+    // Capture output dimensions before srp is dropped (for the Output summary).
+    let n_out_variants = srp.variants.len();
 
     // Free imputation data structures before indexing/evaluation.
     drop(targ_bm);
@@ -1404,7 +1411,19 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         if formats.parquet { paths.push(format!("{}", out_path.with_extension("parquet").display())); }
         if formats.pgen { paths.push(format!("{}", out_path.with_extension("pgen").display())); }
         if formats.selfdecode { paths.push(format!("{}", out_path.with_extension("selfdecode.zip").display())); }
-        selphi_step!("Output: {}", paths.join(" + "));
+        let total_bytes: u64 = paths.iter()
+            .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+            .sum();
+        selphi_step!("Output: {}  ({} variants × {} samples · {})",
+            paths.join(" + "), selphi::log::fmt_thousands(n_out_variants as u64), n_samples, selphi::log::fmt_bytes(total_bytes));
+    }
+
+    // Imputation-quality summary — the model's own DR2 (no truth needed). Beagle/
+    // Minimac print this on every run; it's the one quality signal users always get.
+    if dr2_acc.n > 0 {
+        selphi_info!("  Imputation quality: mean DR2 {}  ·  {:.1}% of {} imputed variants DR2 \u{2265} 0.8",
+            selphi::log::cyan(&format!("{:.4}", dr2_acc.mean())),
+            dr2_acc.pct_ge08(), selphi::log::fmt_thousands(dr2_acc.n));
     }
 
     // Post-imputation accuracy evaluation. Runs the same parallel eval that
