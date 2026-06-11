@@ -62,7 +62,7 @@ fn main() {
         } else {
             "AVX2 (scalar fallback for diploid HMM)"
         };
-        eprintln!("[selphi] SIMD: {}", path);
+        eprintln!("{} SIMD: {}", selphi::log::cyan("[selphi]"), selphi::log::green(path));
     }
 
     // Reject conflicting top-level modes (dispatch is first-match-wins, so

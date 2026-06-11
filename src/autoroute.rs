@@ -447,18 +447,18 @@ pub fn resolve(
     match decision {
         AutoRoute::Lcwgs => {
             if !cli_lcwgs {
-                selphi_step!("auto-route: PL / low GT call-rate (reads or read-likelihood) → lcWGS engine");
+                selphi_step!("auto-route: PL / low GT call-rate (reads or read-likelihood) {}", selphi::log::green("→ lcWGS engine"));
                 eff_lcwgs = true;
             }
         }
         AutoRoute::RefineGenotype => {
             if !cli_refine {
-                selphi_step!("auto-route: confident GT with GQ/DP at WGS density, no PL → genotype engine + --refine");
+                selphi_step!("auto-route: confident GT with GQ/DP at WGS density, no PL {}", selphi::log::green("→ genotype engine + --refine"));
                 eff_refine = true;
             }
         }
         AutoRoute::PlainGenotype => {
-            selphi_step!("auto-route: confident hard calls (GT-only, or GQ/DP below WGS density) → genotype engine (no refine)");
+            selphi_step!("auto-route: confident hard calls (GT-only, or GQ/DP below WGS density) {}", selphi::log::green("→ genotype engine (no refine)"));
         }
     }
     (eff_lcwgs, eff_refine)

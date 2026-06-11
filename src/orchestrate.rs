@@ -673,7 +673,7 @@ pub fn run_multi_chr(
         }
 
         let chr_elapsed = chr_start.elapsed().as_secs_f64();
-        selphi_info!("    \x1b[32m\u{2713}\x1b[0m {:.1}s ({} windows)\n", chr_elapsed, windows.len());
+        selphi_info!("    {} {:.1}s ({} windows)\n", selphi::log::green("\u{2713}"), chr_elapsed, windows.len());
     }
 
     // 7. Finalize output writer
