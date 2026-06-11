@@ -1,18 +1,18 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 990" font-family="Arial, Helvetica, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 852" font-family="Arial, Helvetica, sans-serif">
   <defs>
     <marker id="a" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
       <path d="M0,0 L7,2.5 L0,5" fill="#333"/>
     </marker>
   </defs>
 
-  <rect width="780" height="990" fill="#fff"/>
+  <rect width="780" height="852" fill="#fff"/>
 
   <!-- ========== A: INPUT ========== -->
   <text x="20" y="24" fill="#333" font-size="14" font-weight="700">a</text>
 
   <rect x="30" y="34" width="160" height="48" rx="6" fill="#e8f5e9" stroke="#2d7d46" stroke-width="1.2"/>
   <text x="110" y="55" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="700">TARGET</text>
-  <text x="110" y="72" text-anchor="middle" fill="#333" font-size="11">VCF / BCF</text>
+  <text x="110" y="72" text-anchor="middle" fill="#333" font-size="11">VCF / BCF / reads</text>
 
   <rect x="215" y="34" width="160" height="48" rx="6" fill="#fff3e0" stroke="#e65100" stroke-width="1.2"/>
   <text x="295" y="55" text-anchor="middle" fill="#bf360c" font-size="10" font-weight="700">REFERENCE PANEL</text>
@@ -36,19 +36,19 @@
 
   <line x1="295" y1="136" x2="295" y2="160" stroke="#333" stroke-width="1" marker-end="url(#a)"/>
 
-  <!-- ========== B: PHASING ========== -->
+  <!-- ========== B: PHASING (two engines, auto-selected) ========== -->
   <text x="20" y="168" fill="#333" font-size="14" font-weight="700">b</text>
 
   <rect x="30" y="172" width="720" height="190" rx="8" fill="#fff" stroke="#1565c0" stroke-width="1.5"/>
   <text x="390" y="193" text-anchor="middle" fill="#1565c0" font-size="13" font-weight="700">PHASING</text>
-  <text x="390" y="208" text-anchor="middle" fill="#666" font-size="10">Auto-select: chip (up to 50K variants) -> Haploid | WGS (>50K) -> Diploid</text>
+  <text x="390" y="208" text-anchor="middle" fill="#666" font-size="10">Auto-select by variant density: chip (up to 50K) &#x2192; Haploid | WGS (&gt;50K) &#x2192; Diploid</text>
 
   <!-- Haploid box -->
   <rect x="50" y="220" width="330" height="130" rx="6" fill="#fff8e1" stroke="#f57f17" stroke-width="1.2"/>
   <text x="215" y="241" text-anchor="middle" fill="#e65100" font-size="12" font-weight="700">Haploid Engine</text>
-  <text x="215" y="261" text-anchor="middle" fill="#333" font-size="10.5">Coded-step PBWT -> 280 composite haplotypes</text>
+  <text x="215" y="261" text-anchor="middle" fill="#333" font-size="10.5">Coded-step PBWT &#x2192; 280 composite haplotypes</text>
   <text x="215" y="278" text-anchor="middle" fill="#333" font-size="10.5">3-channel HMM + greedy swap (15 iterations)</text>
-  <text x="215" y="295" text-anchor="middle" fill="#333" font-size="10.5">Adaptive step scale (fine -> coarse)</text>
+  <text x="215" y="295" text-anchor="middle" fill="#333" font-size="10.5">Adaptive step scale (fine &#x2192; coarse)</text>
   <text x="215" y="312" text-anchor="middle" fill="#333" font-size="10.5">Rare carrier injection + EM per-window</text>
   <text x="215" y="340" text-anchor="middle" fill="#888" font-size="9" font-style="italic">Optimized for genotyping arrays</text>
 
@@ -57,7 +57,7 @@
   <text x="565" y="241" text-anchor="middle" fill="#0d47a1" font-size="12" font-weight="700">Diploid Engine</text>
   <text x="565" y="261" text-anchor="middle" fill="#333" font-size="10.5">Genotype graph + MCMC (15 iterations)</text>
   <text x="565" y="278" text-anchor="middle" fill="#333" font-size="10.5">EM Ne estimation during burn-in</text>
-  <text x="565" y="295" text-anchor="middle" fill="#333" font-size="10.5">Common -> rare two-stage (PBWT voting)</text>
+  <text x="565" y="295" text-anchor="middle" fill="#333" font-size="10.5">Common &#x2192; rare two-stage (PBWT voting)</text>
   <text x="565" y="312" text-anchor="middle" fill="#333" font-size="10.5">IBD2 exclusion + singleton IBD phasing</text>
   <text x="565" y="340" text-anchor="middle" fill="#888" font-size="9" font-style="italic">Optimized for whole-genome sequencing</text>
 
@@ -65,93 +65,79 @@
   <path d="M668 82 L668 200 L735 200 L735 280 L730 280" fill="none" stroke="#999" stroke-width="0.8" stroke-dasharray="4,2" marker-end="url(#a)"/>
   <text x="743" y="245" fill="#888" font-size="8.5" transform="rotate(90,743,245)" text-anchor="middle">Mendelian scaffold</text>
 
-  <!-- Pre-phased bypass -->
-  <path d="M30 82 L14 82 L14 550 L28 550" fill="none" stroke="#1565c0" stroke-width="1.2" stroke-dasharray="5,3" marker-end="url(#a)"/>
-  <text x="8" y="340" fill="#1565c0" font-size="9" font-weight="600" transform="rotate(-90,8,340)" text-anchor="middle">pre-phased input</text>
+  <!-- Pre-phased bypass: skip phasing, go straight to imputation -->
+  <path d="M30 82 L14 82 L14 545 L48 545" fill="none" stroke="#1565c0" stroke-width="1.2" stroke-dasharray="5,3" marker-end="url(#a)"/>
+  <text x="8" y="320" fill="#1565c0" font-size="9" font-weight="600" transform="rotate(-90,8,320)" text-anchor="middle">pre-phased input</text>
 
   <!-- Handoff -->
-  <rect x="130" y="428" width="520" height="22" rx="4" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8" stroke-dasharray="5,3"/>
-  <text x="390" y="443" text-anchor="middle" fill="#2d7d46" font-size="10">In-memory handoff (no intermediate file I/O)</text>
+  <rect x="130" y="374" width="520" height="22" rx="4" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8" stroke-dasharray="5,3"/>
+  <text x="390" y="389" text-anchor="middle" fill="#2d7d46" font-size="10">In-memory handoff (phased haplotypes + shared bitmatrix, no file I/O)</text>
 
-  <line x1="390" y1="450" x2="390" y2="476" stroke="#333" stroke-width="1" marker-end="url(#a)"/>
+  <line x1="390" y1="396" x2="390" y2="420" stroke="#333" stroke-width="1" marker-end="url(#a)"/>
 
-  <!-- ========== C: IMPUTATION ========== -->
-  <text x="20" y="486" fill="#333" font-size="14" font-weight="700">c</text>
+  <!-- ========== C: IMPUTATION (two engines, auto-selected by input) ========== -->
+  <text x="20" y="428" fill="#333" font-size="14" font-weight="700">c</text>
 
-  <rect x="30" y="490" width="720" height="190" rx="8" fill="#fff" stroke="#c2185b" stroke-width="1.5"/>
-  <text x="390" y="511" text-anchor="middle" fill="#c2185b" font-size="13" font-weight="700">IMPUTATION</text>
+  <rect x="30" y="432" width="720" height="234" rx="8" fill="#fff" stroke="#c2185b" stroke-width="1.5"/>
+  <text x="390" y="453" text-anchor="middle" fill="#c2185b" font-size="13" font-weight="700">IMPUTATION</text>
+  <text x="390" y="468" text-anchor="middle" fill="#666" font-size="10">Auto-select by input: confident genotypes &#x2192; genotype engine | low-coverage GL / aligned reads &#x2192; lcWGS engine</text>
 
-  <!-- Three sub-steps -->
-  <rect x="50" y="524" width="200" height="56" rx="5" fill="#fce4ec" stroke="#c2185b" stroke-width="0.8"/>
-  <text x="150" y="545" text-anchor="middle" fill="#880e4f" font-size="11" font-weight="600">PBWT Matching</text>
-  <text x="150" y="562" text-anchor="middle" fill="#555" font-size="9.5">Coded-step on bitmatrix</text>
-  <text x="150" y="574" text-anchor="middle" fill="#555" font-size="9.5">up to 2,500 candidates</text>
+  <!-- Genotype imputation engine (chip / WGS hard calls) -->
+  <rect x="50" y="480" width="330" height="138" rx="6" fill="#fce4ec" stroke="#c2185b" stroke-width="1.2"/>
+  <text x="215" y="500" text-anchor="middle" fill="#880e4f" font-size="12" font-weight="700">Genotype Imputation</text>
+  <text x="215" y="515" text-anchor="middle" fill="#888" font-size="9" font-style="italic">chip / WGS confident hard calls</text>
+  <text x="215" y="535" text-anchor="middle" fill="#333" font-size="10.5">PBWT candidate selection (up to 2,500)</text>
+  <text x="215" y="552" text-anchor="middle" fill="#333" font-size="10.5">Li-Stephens HMM (f32 fwd / f64 bwd)</text>
+  <text x="215" y="569" text-anchor="middle" fill="#333" font-size="10.5">Haplotype deduplication</text>
+  <text x="215" y="586" text-anchor="middle" fill="#333" font-size="10.5">Adaptive Ne = 36 &#xd7; n_ref, MAF-scaled</text>
+  <text x="215" y="608" text-anchor="middle" fill="#b0457b" font-size="9" font-style="italic">hard calls in &#x2192; dosages out</text>
 
-  <line x1="250" y1="552" x2="275" y2="552" stroke="#333" stroke-width="1" marker-end="url(#a)"/>
+  <!-- Low-coverage WGS imputation engine (GL-aware) -->
+  <rect x="400" y="480" width="330" height="138" rx="6" fill="#e0f2f1" stroke="#00897b" stroke-width="1.2"/>
+  <text x="565" y="500" text-anchor="middle" fill="#00695c" font-size="12" font-weight="700">Low-Coverage WGS Imputation</text>
+  <text x="565" y="515" text-anchor="middle" fill="#888" font-size="9" font-style="italic">0.5&#x2013;2&#xd7; sequencing (genotype likelihoods)</text>
+  <text x="565" y="535" text-anchor="middle" fill="#333" font-size="10.5">Input: PL VCF / BAM / CRAM (native pileup)</text>
+  <text x="565" y="552" text-anchor="middle" fill="#333" font-size="10.5">Sparse-PBWT &#x21c4; GL-weighted Li-Stephens FB</text>
+  <text x="565" y="569" text-anchor="middle" fill="#333" font-size="10.5">&#x221a;n-checkpointed forward-backward, SIMD</text>
+  <text x="565" y="586" text-anchor="middle" fill="#333" font-size="10.5">Diplotype-mosaic Gibbs (phase commitment)</text>
+  <text x="565" y="608" text-anchor="middle" fill="#00897b" font-size="9" font-style="italic">GLs in &#x2192; GT:DS:GP out</text>
 
-  <rect x="278" y="524" width="200" height="56" rx="5" fill="#fce4ec" stroke="#c2185b" stroke-width="0.8"/>
-  <text x="378" y="545" text-anchor="middle" fill="#880e4f" font-size="11" font-weight="600">Li-Stephens HMM</text>
-  <text x="378" y="562" text-anchor="middle" fill="#555" font-size="9.5">f32 forward + f64 backward</text>
-  <text x="378" y="574" text-anchor="middle" fill="#555" font-size="9.5">Haplotype deduplication</text>
+  <!-- Shared interpolation + streaming output -->
+  <rect x="60" y="628" width="660" height="30" rx="5" fill="#f8f9fa" stroke="#aaa" stroke-width="0.8"/>
+  <text x="390" y="641" text-anchor="middle" fill="#333" font-size="10" font-weight="600">Tiled interpolation (1,024 &#xd7; 4,096, L2-cache) &#xb7; fused interpolate&#x2192;encode&#x2192;stream &#xb7; DR2 two-pass &#xb7; LD-corrected</text>
+  <text x="390" y="653" text-anchor="middle" fill="#666" font-size="9">single interpolation pass, streamed per tile (never accumulates the full chromosome)</text>
 
-  <line x1="478" y1="552" x2="503" y2="552" stroke="#333" stroke-width="1" marker-end="url(#a)"/>
-
-  <rect x="506" y="524" width="224" height="56" rx="5" fill="#fce4ec" stroke="#c2185b" stroke-width="0.8"/>
-  <text x="618" y="545" text-anchor="middle" fill="#880e4f" font-size="11" font-weight="600">Adaptive Ne = 36 &#xd7; n_ref</text>
-  <text x="618" y="562" text-anchor="middle" fill="#555" font-size="9.5">Panel-size calibrated</text>
-  <text x="618" y="574" text-anchor="middle" fill="#555" font-size="9.5">MAF-adaptive per-site scaling</text>
-
-  <!-- Tiled interpolation -->
-  <rect x="80" y="596" width="620" height="42" rx="5" fill="#f8f9fa" stroke="#aaa" stroke-width="0.8"/>
-  <text x="390" y="614" text-anchor="middle" fill="#333" font-size="11" font-weight="600">Tiled Interpolation (1,024 x 4,096 tiles, L2-cache optimized)</text>
-  <text x="390" y="630" text-anchor="middle" fill="#666" font-size="10">Fused interpolate -> encode -> drop per tile | DR2 two-pass | LD-corrected distances</text>
-
-  <!-- Arrow to bottom -->
-  <rect x="50" y="646" width="680" height="26" rx="4" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
-  <text x="390" y="664" text-anchor="middle" fill="#2d7d46" font-size="10">Streaming output: tiles encoded and written immediately (never accumulate full chromosome)</text>
-
-  <line x1="390" y1="680" x2="390" y2="706" stroke="#333" stroke-width="1" marker-end="url(#a)"/>
+  <line x1="390" y1="666" x2="390" y2="690" stroke="#333" stroke-width="1" marker-end="url(#a)"/>
 
   <!-- ========== D: OUTPUT ========== -->
-  <text x="20" y="716" fill="#333" font-size="14" font-weight="700">d</text>
+  <text x="20" y="700" fill="#333" font-size="14" font-weight="700">d</text>
 
-  <rect x="30" y="720" width="720" height="60" rx="8" fill="#fff" stroke="#2d7d46" stroke-width="1.5"/>
-  <text x="390" y="741" text-anchor="middle" fill="#1b5e20" font-size="12" font-weight="700">Multi-Format Output (single interpolation pass)</text>
+  <rect x="30" y="704" width="720" height="60" rx="8" fill="#fff" stroke="#2d7d46" stroke-width="1.5"/>
+  <text x="390" y="725" text-anchor="middle" fill="#1b5e20" font-size="12" font-weight="700">Multi-Format Output (single interpolation pass, identical dosages)</text>
 
-  <!-- Format pills (centered: 5 pills + 4 gaps = 610px total, box=720, margin=55 each side) -->
-  <rect x="85" y="750" width="100" height="22" rx="11" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
-  <text x="135" y="765" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="600">VCF.gz</text>
+  <rect x="85" y="734" width="100" height="22" rx="11" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
+  <text x="135" y="749" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="600">VCF.gz</text>
 
-  <rect x="200" y="750" width="100" height="22" rx="11" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
-  <text x="250" y="765" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="600">BCF 2.2</text>
+  <rect x="200" y="734" width="100" height="22" rx="11" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
+  <text x="250" y="749" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="600">BCF 2.2</text>
 
-  <rect x="315" y="750" width="100" height="22" rx="11" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
-  <text x="365" y="765" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="600">Parquet</text>
+  <rect x="315" y="734" width="100" height="22" rx="11" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
+  <text x="365" y="749" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="600">Parquet</text>
 
-  <rect x="430" y="750" width="140" height="22" rx="11" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
-  <text x="500" y="765" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="600">PGEN + dosage</text>
+  <rect x="430" y="734" width="140" height="22" rx="11" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
+  <text x="500" y="749" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="600">PGEN + dosage</text>
 
-  <rect x="585" y="750" width="110" height="22" rx="11" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
-  <text x="640" y="765" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="600">SelfDecode</text>
+  <rect x="585" y="734" width="110" height="22" rx="11" fill="#e8f5e9" stroke="#2d7d46" stroke-width="0.8"/>
+  <text x="640" y="749" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="600">SelfDecode</text>
 
-  <!-- ========== E: ALTERNATIVE ENGINE — LOW-COVERAGE WGS ========== -->
-  <text x="20" y="800" fill="#333" font-size="14" font-weight="700">e</text>
+  <!-- ========== E: FEATURES BAR ========== -->
+  <text x="20" y="788" fill="#333" font-size="14" font-weight="700">e</text>
 
-  <rect x="30" y="804" width="720" height="98" rx="8" fill="#e0f2f1" stroke="#00897b" stroke-width="1.5"/>
-  <text x="390" y="825" text-anchor="middle" fill="#00695c" font-size="13" font-weight="700">LOW-COVERAGE WGS ENGINE&#xa0;&#xa0;(--lcwgs / --engine lcwgs)</text>
-  <text x="390" y="841" text-anchor="middle" fill="#666" font-size="10">Alternative to (b)+(c) for low-coverage data: joint GL-aware phasing + imputation, same panel &amp; output</text>
-  <text x="390" y="862" text-anchor="middle" fill="#333" font-size="10.5">Input: PL VCF/BCF or aligned reads (BAM/CRAM, native pileup) at 0.5&#x2013;2&#xd7; depth</text>
-  <text x="390" y="879" text-anchor="middle" fill="#333" font-size="10.5">Sparse-PBWT selection &#x21c4; GL-weighted Li-Stephens forward&#x2013;backward (&#x221a;n-checkpointed, SIMD)</text>
-  <text x="390" y="896" text-anchor="middle" fill="#333" font-size="10.5">+ diplotype-mosaic phase commitment (Gibbs sampler) &#x2192; GT:DS:GP</text>
+  <rect x="30" y="792" width="345" height="48" rx="6" fill="#fff3e0" stroke="#e65100" stroke-width="0.8"/>
+  <text x="203" y="812" text-anchor="middle" fill="#bf360c" font-size="11" font-weight="600">Multi-chromosome processing</text>
+  <text x="203" y="829" text-anchor="middle" fill="#666" font-size="10">Single SRP file, overlapped prefetch</text>
 
-  <!-- ========== F: FEATURES BAR ========== -->
-  <text x="20" y="922" fill="#333" font-size="14" font-weight="700">f</text>
-
-  <rect x="30" y="926" width="345" height="48" rx="6" fill="#fff3e0" stroke="#e65100" stroke-width="0.8"/>
-  <text x="203" y="946" text-anchor="middle" fill="#bf360c" font-size="11" font-weight="600">Multi-chromosome processing</text>
-  <text x="203" y="963" text-anchor="middle" fill="#666" font-size="10">Single SRP file, overlapped prefetch</text>
-
-  <rect x="395" y="926" width="355" height="48" rx="6" fill="#e3f2fd" stroke="#1565c0" stroke-width="0.8"/>
-  <text x="573" y="946" text-anchor="middle" fill="#0d47a1" font-size="11" font-weight="600">Mixed-density reference panels</text>
-  <text x="573" y="963" text-anchor="middle" fill="#666" font-size="10">WGS + chip merged-panel builder (--prepare-merged-panel)</text>
+  <rect x="395" y="792" width="355" height="48" rx="6" fill="#e3f2fd" stroke="#1565c0" stroke-width="0.8"/>
+  <text x="573" y="812" text-anchor="middle" fill="#0d47a1" font-size="11" font-weight="600">Mixed-density reference panels</text>
+  <text x="573" y="829" text-anchor="middle" fill="#666" font-size="10">WGS + chip merged-panel builder (--prepare-merged-panel)</text>
 </svg>
