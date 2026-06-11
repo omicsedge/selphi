@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 936" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 792" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
   <defs>
     <marker id="arr" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
       <path d="M0,0 L8,3 L0,6" fill="none" stroke="#8b949e" stroke-width="1.2"/>
@@ -13,7 +13,7 @@
     </filter>
   </defs>
 
-  <rect width="920" height="936" rx="12" fill="#0d1117"/>
+  <rect width="920" height="792" rx="12" fill="#0d1117"/>
 
   <text x="460" y="34" text-anchor="middle" fill="#e6edf3" font-size="18" font-weight="600">Selphi 2 — Pipeline Architecture</text>
 
@@ -160,28 +160,5 @@
       <animate attributeName="opacity" values="1;1;1;1;0;0;1" keyTimes="0;0.31;0.35;0.64;0.68;0.97;1" dur="15s" repeatCount="indefinite"/></rect>
     <rect x="470" y="502" width="380" height="104" rx="8" stroke="#0d9488" stroke-width="3" opacity="0">
       <animate attributeName="opacity" values="0;0;0;0;1;1;0" keyTimes="0;0.31;0.35;0.64;0.68;0.97;1" dur="15s" repeatCount="indefinite"/></rect>
-  </g>
-  <!-- ===== synced live terminal: shows the real log of the lit path (same clock) ===== -->
-  <rect x="44" y="800" width="832" height="120" rx="9" fill="#0d1117" stroke="#30363d" stroke-width="1.4"/>
-  <circle cx="64" cy="820" r="4.5" fill="#ff5f56"/><circle cx="80" cy="820" r="4.5" fill="#ffbd2e"/><circle cx="96" cy="820" r="4.5" fill="#27c93f"/>
-  <text x="460" y="824" text-anchor="middle" fill="#6e7681" font-size="10.5" font-family="ui-monospace, Menlo, Consolas, monospace">what the lit path actually runs</text>
-  <line x1="44" y1="834" x2="876" y2="834" stroke="#21262d" stroke-width="1"/>
-  <g opacity="0" font-family="ui-monospace, Menlo, Consolas, monospace"><animate attributeName="opacity" values="1;1;0;0;0;0;1" keyTimes="0;0.31;0.35;0.64;0.68;0.97;1" dur="15s" repeatCount="indefinite"/>
-    <text x="60" y="862" fill="#7ee787" font-size="13" font-weight="700">$</text>
-    <text x="76" y="862" fill="#e6edf3" font-size="13">selphi --refpanel chr22.srp --input chip.vcf.gz --map chr22.map --out imputed -t 16</text>
-    <text x="60" y="886" font-size="12.5"><tspan fill="#8b949e">  auto-route: GT-only, 262 sites/Mb  </tspan><tspan fill="#fb923c">→ haploid phasing + genotype imputation</tspan></text>
-    <text x="60" y="908" font-size="13"><tspan fill="#7ee787">✓ imputed.vcf.gz</tspan><tspan fill="#8b949e">   ·   OVERALL R² </tspan><tspan fill="#5eead4">0.4825</tspan><tspan fill="#8b949e">   ·   89s  ·  12.5 GB peak</tspan></text>
-  </g>
-  <g opacity="0" font-family="ui-monospace, Menlo, Consolas, monospace"><animate attributeName="opacity" values="0;0;1;1;0;0;0" keyTimes="0;0.31;0.35;0.64;0.68;0.97;1" dur="15s" repeatCount="indefinite"/>
-    <text x="60" y="862" fill="#7ee787" font-size="13" font-weight="700">$</text>
-    <text x="76" y="862" fill="#e6edf3" font-size="13">selphi --refpanel chr22.srp --input wgs.vcf.gz --map chr22.map --out phased --phase-only -t 16</text>
-    <text x="60" y="886" font-size="12.5"><tspan fill="#8b949e">  WGS, 1070399 variants &gt; 50K  </tspan><tspan fill="#6cb6ff">→ diploid phasing engine</tspan></text>
-    <text x="60" y="908" font-size="13"><tspan fill="#7ee787">✓ phased.vcf.gz</tspan><tspan fill="#8b949e">   ·   diploid · 54 samples   ·   </tspan><tspan fill="#8b949e">72s  ·  4.3 GB peak</tspan></text>
-  </g>
-  <g opacity="0" font-family="ui-monospace, Menlo, Consolas, monospace"><animate attributeName="opacity" values="0;0;0;0;1;1;0" keyTimes="0;0.31;0.35;0.64;0.68;0.97;1" dur="15s" repeatCount="indefinite"/>
-    <text x="60" y="862" fill="#7ee787" font-size="13" font-weight="700">$</text>
-    <text x="76" y="862" fill="#e6edf3" font-size="13">selphi --refpanel chr22.srp --input sample.gl.vcf.gz --map chr22.map --out lowcov -t 16</text>
-    <text x="60" y="886" font-size="12.5"><tspan fill="#8b949e">  auto-route: PL / low GT call-rate  </tspan><tspan fill="#5eead4">→ low-coverage WGS engine (integrated phasing)</tspan></text>
-    <text x="60" y="908" font-size="13"><tspan fill="#7ee787">✓ lowcov.vcf.gz</tspan><tspan fill="#8b949e">   ·   </tspan><tspan fill="#5eead4">GT:DS:GP</tspan><tspan fill="#8b949e">   ·   929,834 variants  ·  117.6s</tspan></text>
   </g>
 </svg>
