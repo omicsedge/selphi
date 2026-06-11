@@ -22,17 +22,17 @@ fn run_one(name: &str, cli_args: &[&str], pass: &mut u32, fail: &mut u32) {
     match output {
         Ok(o) if o.status.success() => {
             *pass += 1;
-            selphi_info!("  \x1b[32mPASS\x1b[0m  {}", name);
+            selphi_info!("  {}  {}", selphi::log::green("PASS"), name);
         }
         Ok(o) => {
             *fail += 1;
             let stderr = String::from_utf8_lossy(&o.stderr);
             let last = stderr.lines().last().unwrap_or("");
-            selphi_info!("  \x1b[31mFAIL\x1b[0m  {}  ({})", name, last);
+            selphi_info!("  {}  {}  ({})", selphi::log::red("FAIL"), name, last);
         }
         Err(e) => {
             *fail += 1;
-            selphi_info!("  \x1b[31mFAIL\x1b[0m  {}  ({})", name, e);
+            selphi_info!("  {}  {}  ({})", selphi::log::red("FAIL"), name, e);
         }
     }
 }
@@ -132,7 +132,7 @@ fn check_file(name: &str, path: &Path, _pass: &mut u32, fail: &mut u32) -> bool 
         }
     }
     *fail += 1;
-    selphi_info!("  \x1b[31mFAIL\x1b[0m  {} (file missing or empty)", name);
+    selphi_info!("  {}  {} (file missing or empty)", selphi::log::red("FAIL"), name);
     false
 }
 
@@ -216,11 +216,11 @@ pub fn run(config: &SelfTestConfig) -> u32 {
         match validate_vcf(&vcf_path) {
             Ok((ns, nv)) => {
                 pass += 1;
-                selphi_info!("  \x1b[32mPASS\x1b[0m  VCF valid ({} samples, {} variants)", ns, nv);
+                selphi_info!("  {}  VCF valid ({} samples, {} variants)", selphi::log::green("PASS"), ns, nv);
             }
             Err(e) => {
                 fail += 1;
-                selphi_info!("  \x1b[31mFAIL\x1b[0m  VCF invalid ({})", e);
+                selphi_info!("  {}  VCF invalid ({})", selphi::log::red("FAIL"), e);
             }
         }
     }
@@ -231,11 +231,11 @@ pub fn run(config: &SelfTestConfig) -> u32 {
         match validate_bcf(&bcf_path) {
             Ok((ns, nv)) => {
                 pass += 1;
-                selphi_info!("  \x1b[32mPASS\x1b[0m  BCF valid ({} samples, {} variants)", ns, nv);
+                selphi_info!("  {}  BCF valid ({} samples, {} variants)", selphi::log::green("PASS"), ns, nv);
             }
             Err(e) => {
                 fail += 1;
-                selphi_info!("  \x1b[31mFAIL\x1b[0m  BCF invalid ({})", e);
+                selphi_info!("  {}  BCF invalid ({})", selphi::log::red("FAIL"), e);
             }
         }
     }
@@ -251,18 +251,18 @@ pub fn run(config: &SelfTestConfig) -> u32 {
                 match validate_index(&tbi_path) {
                     Ok((fmt, n_ref)) => {
                         pass += 1;
-                        selphi_info!("  \x1b[32mPASS\x1b[0m  TBI index valid ({}, {} contig{})", fmt, n_ref,
+                        selphi_info!("  {}  TBI index valid ({}, {} contig{})", selphi::log::green("PASS"), fmt, n_ref,
                             if n_ref != 1 { "s" } else { "" });
                     }
                     Err(e) => {
                         fail += 1;
-                        selphi_info!("  \x1b[31mFAIL\x1b[0m  TBI index corrupt ({})", e);
+                        selphi_info!("  {}  TBI index corrupt ({})", selphi::log::red("FAIL"), e);
                     }
                 }
             }
             _ => {
                 fail += 1;
-                selphi_info!("  \x1b[31mFAIL\x1b[0m  TBI index build failed");
+                selphi_info!("  {}  TBI index build failed", selphi::log::red("FAIL"));
             }
         }
     }
@@ -276,18 +276,18 @@ pub fn run(config: &SelfTestConfig) -> u32 {
                 match validate_index(&csi_path) {
                     Ok((fmt, n_ref)) => {
                         pass += 1;
-                        selphi_info!("  \x1b[32mPASS\x1b[0m  CSI index valid ({}, {} contig{})", fmt, n_ref,
+                        selphi_info!("  {}  CSI index valid ({}, {} contig{})", selphi::log::green("PASS"), fmt, n_ref,
                             if n_ref != 1 { "s" } else { "" });
                     }
                     Err(e) => {
                         fail += 1;
-                        selphi_info!("  \x1b[31mFAIL\x1b[0m  CSI index corrupt ({})", e);
+                        selphi_info!("  {}  CSI index corrupt ({})", selphi::log::red("FAIL"), e);
                     }
                 }
             }
             _ => {
                 fail += 1;
-                selphi_info!("  \x1b[31mFAIL\x1b[0m  CSI index build failed");
+                selphi_info!("  {}  CSI index build failed", selphi::log::red("FAIL"));
             }
         }
     }
@@ -298,7 +298,7 @@ pub fn run(config: &SelfTestConfig) -> u32 {
     if check_file("Parquet output exists", &pq_path, &mut pass, &mut fail) {
         pass += 1;
         let sz = std::fs::metadata(&pq_path).map(|m| m.len()).unwrap_or(0);
-        selphi_info!("  \x1b[32mPASS\x1b[0m  Parquet file ({:.1} MB)", sz as f64 / 1e6);
+        selphi_info!("  {}  Parquet file ({:.1} MB)", selphi::log::green("PASS"), sz as f64 / 1e6);
     }
 
     let pgen_path = PathBuf::from(format!("{}_pgen.pgen", out_base));
@@ -307,10 +307,10 @@ pub fn run(config: &SelfTestConfig) -> u32 {
     if check_file("PGEN output exists", &pgen_path, &mut pass, &mut fail) {
         if pvar_path.exists() && psam_path.exists() {
             pass += 1;
-            selphi_info!("  \x1b[32mPASS\x1b[0m  PGEN triplet (.pgen + .pvar + .psam)");
+            selphi_info!("  {}  PGEN triplet (.pgen + .pvar + .psam)", selphi::log::green("PASS"));
         } else {
             fail += 1;
-            selphi_info!("  \x1b[31mFAIL\x1b[0m  PGEN missing .pvar or .psam");
+            selphi_info!("  {}  PGEN missing .pvar or .psam", selphi::log::red("FAIL"));
         }
     }
 
@@ -318,7 +318,7 @@ pub fn run(config: &SelfTestConfig) -> u32 {
     if check_file("SelfDecode output exists", &sd_path, &mut pass, &mut fail) {
         pass += 1;
         let sz = std::fs::metadata(&sd_path).map(|m| m.len()).unwrap_or(0);
-        selphi_info!("  \x1b[32mPASS\x1b[0m  SelfDecode ZIP ({:.1} MB)", sz as f64 / 1e6);
+        selphi_info!("  {}  SelfDecode ZIP ({:.1} MB)", selphi::log::green("PASS"), sz as f64 / 1e6);
     }
 
     // ── Summary ─────────────────────────────────────────────────────
