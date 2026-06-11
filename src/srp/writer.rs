@@ -22,7 +22,6 @@ use crate::{selphi_info, selphi_step};
 pub enum SrpWriterError {
     Io(std::io::Error),
     InvalidInput(String),
-    Zip(zip::result::ZipError),
     NoVariants,
 }
 
@@ -31,7 +30,6 @@ impl std::fmt::Display for SrpWriterError {
         match self {
             Self::Io(e) => write!(f, "I/O error: {}", e),
             Self::InvalidInput(msg) => write!(f, "invalid input: {}", msg),
-            Self::Zip(e) => write!(f, "ZIP error: {}", e),
             Self::NoVariants => write!(f, "no variants found in input"),
         }
     }
@@ -39,9 +37,6 @@ impl std::fmt::Display for SrpWriterError {
 
 impl From<std::io::Error> for SrpWriterError {
     fn from(e: std::io::Error) -> Self { Self::Io(e) }
-}
-impl From<zip::result::ZipError> for SrpWriterError {
-    fn from(e: zip::result::ZipError) -> Self { Self::Zip(e) }
 }
 
 // ---------------------------------------------------------------------------
