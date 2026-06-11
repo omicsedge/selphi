@@ -2,7 +2,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="img/title.svg"/>
     <source media="(prefers-color-scheme: light)" srcset="img/title_light.svg"/>
-    <img src="img/title.svg" alt="SELfdecode PHasing & Imputation" width="820"/>
+    <img src="img/title.svg" alt="SELfdecode PHasing & Imputation" width="900"/>
   </picture>
 </p>
 
@@ -14,7 +14,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="img/pipeline_dark.svg"/>
     <source media="(prefers-color-scheme: light)" srcset="img/pipeline_light.svg"/>
-    <img src="img/pipeline_dark.svg" alt="Selphi auto-routes each input to the right engine: the full real log runs on top while the pipeline below lights up each stage in sync (chip, WGS, low-coverage)" width="820"/>
+    <img src="img/pipeline_dark.svg" alt="Selphi auto-routes each input to the right engine: the full real log runs on top while the pipeline below lights up each stage in sync (chip, WGS, low-coverage)" width="900"/>
   </picture>
 </p>
 
