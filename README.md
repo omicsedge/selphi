@@ -119,17 +119,18 @@ Already-phased input skips the phasing step automatically; use `--force-phasing`
 
 ### Allele reconciliation (`--allele-match`)
 
-By default target sites match the panel by exact REF/ALT, so a chip on a different strand, or with REF/ALT swapped relative to the panel, silently loses those markers. Opt in to reconciliation:
+Target sites are matched to the panel, and by default REF/ALT-swapped sites are reconciled (a chip that labels REF/ALT opposite the panel would otherwise silently lose those markers). Choose the level:
 
 ```bash
-selphi ... --allele-match full        # none (default) | swap | strand | full
+selphi ... --allele-match full        # none | swap (default) | strand | full
 ```
 
-- `swap`: also accept REF/ALT-swapped sites (recodes the genotype to panel orientation)
+- `none`: exact REF/ALT only (no reconciliation)
+- `swap` (default): also accept REF/ALT-swapped sites (recodes the genotype to panel orientation) — unambiguous
 - `strand`: also accept opposite-strand SNPs (reverse-complement)
 - `full`: swap + strand
 
-Palindromic SNPs (A/T, C/G) are matched by exact equality only. Sites that already match are never touched, so conforming input is bit-identical to `none`.
+`strand`/`full` carry a small false-match risk on non-palindromic SNPs (a target variant absent from the panel can reverse-complement onto a different one), so they stay opt-in. Palindromic SNPs (A/T, C/G) are matched by exact equality only. Sites that already match exactly are never touched, so conforming input is bit-identical regardless of mode. The number of reconciled sites is reported in the log.
 
 ### Sex chromosomes
 
@@ -341,7 +342,7 @@ selphi --self-test --refpanel panel.srp --input target.vcf.gz --map chr.map --ou
 | `--phasing-engine ENGINE` | Phasing engine: `auto`, `haploid`, or `diploid` | `auto` |
 | `--phase-only` | Output phased haplotypes only (skip imputation) | off |
 | `--force-phasing` | Re-phase even if input is already phased | off |
-| `--allele-match MODE` | Target/panel allele reconciliation: `none`, `swap`, `strand`, `full` | `none` |
+| `--allele-match MODE` | Target/panel allele reconciliation: `none`, `swap`, `strand`, `full` | `swap` |
 | `--lcwgs` | Legacy alias for `--engine lcwgs`; also enables PL/BAM low-coverage input | off |
 | `--bam PATH` / `--bam-list PATH` | Aligned reads for `--lcwgs` (single file, or a list) | |
 | `--reference PATH` | Reference FASTA (required for CRAM input) | |
