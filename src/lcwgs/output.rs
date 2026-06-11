@@ -38,6 +38,13 @@ pub fn write_lcwgs_vcf(out: &LcwgsOutput, output_path: &std::path::Path) -> std:
     for s in &out.sample_ids { write!(w, "\t{}", s)?; }
     writeln!(w)?;
 
+    // Per-call quality: GP confidence = the max genotype posterior. Works for
+    // ANY sample count (unlike DR2, which needs variance across samples and is
+    // degenerate for the common single-sample lcWGS run).
+    let mut conf_sum = 0.0f64;
+    let mut n_conf_ge09 = 0u64;
+    let mut n_calls = 0u64;
+
     let mut line = String::with_capacity(n_samples * 24);
     for v in 0..n_var {
         let (chrom, pos, r, a) = &out.variants[v];
@@ -64,14 +71,17 @@ pub fn write_lcwgs_vcf(out: &LcwgsOutput, output_path: &std::path::Path) -> std:
             let g0 = out.gp[g_off];
             let g1 = out.gp[g_off + 1];
             let g2 = out.gp[g_off + 2];
-            // Hard call = argmax genotype.
-            let (gt, _) = if g0 >= g1 && g0 >= g2 {
+            // Hard call = argmax genotype; conf = its posterior (call confidence).
+            let (gt, conf) = if g0 >= g1 && g0 >= g2 {
                 ("0/0", g0)
             } else if g2 >= g0 && g2 >= g1 {
                 ("1/1", g2)
             } else {
                 ("0/1", g1)
             };
+            conf_sum += conf as f64;
+            n_calls += 1;
+            if conf >= 0.9 { n_conf_ge09 += 1; }
             line.push('\t');
             line.push_str(gt);
             line.push(':');
@@ -83,5 +93,13 @@ pub fn write_lcwgs_vcf(out: &LcwgsOutput, output_path: &std::path::Path) -> std:
     }
 
     w.flush()?;
+
+    // Imputation-quality summary (per-call GP confidence; no truth needed).
+    if n_calls > 0 {
+        let mean_conf = conf_sum / n_calls as f64;
+        let pct = 100.0 * n_conf_ge09 as f64 / n_calls as f64;
+        crate::selphi_info!("  Imputation quality: mean GP confidence {}  ·  {:.1}% of {} calls \u{2265} 0.9",
+            crate::log::cyan(&format!("{:.4}", mean_conf)), pct, crate::log::fmt_thousands(n_calls));
+    }
     Ok(())
 }
