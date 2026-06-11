@@ -349,6 +349,10 @@ pub fn run_multi_chr(
     // 6. Process each chromosome with prefetch overlap
     let mut prefetch_result: Option<ChrPrefetchResult> = None;
 
+    // Run-level imputation-quality accumulator + output variant tally (all chrs).
+    let mut dr2_acc = selphi::io::dosage_stats::Dr2Summary::default();
+    let mut n_out_variants_total: u64 = 0;
+
     for (chr_idx, chr_name) in chromosomes.iter().enumerate() {
         let chr_start = Instant::now();
         selphi_info!("  [{}/{}] chr{}", chr_idx + 1, n_chr, chr_name);
@@ -657,10 +661,13 @@ pub fn run_multi_chr(
                     selfdecode: None,
                     vcf_tx: &vcf_tx,
                 },
+                &mut dr2_acc,
             ).expect("Output write failed");
 
             selphi_info!("    Window {}/{}: {} vars", wi + 1, windows.len(), n_var_w);
         }
+
+        n_out_variants_total += srp.variants.len() as u64;
 
         // Free per-chr data before loading next
         drop(ref_bm_imp);
@@ -680,6 +687,17 @@ pub fn run_multi_chr(
     if formats.vcf || formats.bcf {
         selphi::io::pipeline::finish_vcf_writer(vcf_tx, vcf_writer, vcf_bgzip)
             .expect("Failed to finalize VCF/BCF output");
+    }
+
+    // Output summary + imputation-quality (model DR2, no truth needed).
+    let out_bytes = std::fs::metadata(&out_file).map(|m| m.len()).unwrap_or(0);
+    selphi_step!("Output: {}  ({} variants × {} samples · {})",
+        out_file.display(), selphi::log::fmt_thousands(n_out_variants_total), n_samples,
+        selphi::log::fmt_bytes(out_bytes));
+    if dr2_acc.n > 0 {
+        selphi_info!("  Imputation quality: mean DR2 {}  ·  {:.1}% of {} imputed variants DR2 \u{2265} 0.8",
+            selphi::log::cyan(&format!("{:.4}", dr2_acc.mean())),
+            dr2_acc.pct_ge08(), selphi::log::fmt_thousands(dr2_acc.n));
     }
 
     let total = start_time.elapsed().as_secs_f64();

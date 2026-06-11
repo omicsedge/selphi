@@ -873,12 +873,35 @@ pub struct WindowWriters<'a> {
     pub vcf_tx: &'a std::sync::mpsc::SyncSender<Vec<u8>>,
 }
 
+/// Accumulate the dosage-R² of every IMPUTED site in one interpolated tile into
+/// `acc` (the run-level mean-DR2 quality summary). Chip/typed sites are skipped.
+/// Uses the raw panel `alt_probs`; at the rare `--refine` re-routed hard-call
+/// sites that is the model DR2, a negligible approximation for a summary.
+fn accumulate_tile_dr2(
+    acc: &mut crate::io::dosage_stats::Dr2Summary,
+    alt_probs: &[f32], tile_n: usize, global_start: usize,
+    setup: &WindowSetup, n_samples: usize, scratch: &mut [f32],
+) {
+    for v in 0..tile_n {
+        if global_start + v >= setup.n_ref_variants { break; }
+        let local_i = global_start - setup.own_wgs_start + v;
+        if setup.is_chip[local_i] { continue; }
+        let (_, dr2) = crate::io::dosage_stats::imputed_ac_dr2(
+            n_samples, setup.n_haps,
+            |s| (alt_probs[(s * 2) * tile_n + v], alt_probs[(s * 2 + 1) * tile_n + v]),
+            scratch,
+        );
+        acc.add(dr2);
+    }
+}
+
 /// Write one window to all active output formats.
 /// VCF/BCF bytes are sent directly to `writers.vcf_tx` as produced — no accumulation.
 pub fn write_window_multiformat(
     formats: &OutputFormats,
     input: WindowInput<'_>,
     writers: WindowWriters<'_>,
+    dr2_acc: &mut crate::io::dosage_stats::Dr2Summary,
 ) -> std::io::Result<()> {
     let WindowInput {
         srp, all_weights, win_chip_start, own_chip_start, own_chip_end,
@@ -933,6 +956,8 @@ pub fn write_window_multiformat(
     let mut sd_ap2 = if formats.selfdecode { vec![0.0f32; n_samples] } else { Vec::new() };
     // R4b: reusable per-sample hard-call mask for the PGEN/SD imputed branch.
     let mut sd_hc_mask = if formats.selfdecode { vec![false; n_samples] } else { Vec::new() };
+    // Reusable dosage scratch for the format-independent DR2 quality accumulation.
+    let mut dr2_scratch = vec![0f32; n_samples];
 
     // Macro: encode chip sites in [next_wgs..end) gap
     macro_rules! emit_chip_gap {
@@ -1067,6 +1092,9 @@ pub fn write_window_multiformat(
                     }
                 }
             }
+            // Format-independent imputation-quality accumulation (mean DR2 over
+            // imputed sites). Runs once per tile regardless of active formats.
+            accumulate_tile_dr2(dr2_acc, $alt_probs, $tile_n, $global_start, &setup, n_samples, &mut dr2_scratch);
         }};
     }
 
