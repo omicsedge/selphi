@@ -3,11 +3,49 @@
 //! Two levels: info (always shown) and debug (only with `--debug` or `SELPHI_DEBUG=1`).
 //! Use the macros `selphi_info!`, `selphi_debug!`, `selphi_step!`, `selphi_error!`.
 
-use std::io::Write;
+use std::io::{Write, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+
+// ---------------------------------------------------------------------------
+// Color: ANSI is emitted ONLY when stderr is a real terminal, so AWS/CloudWatch,
+// files, and pipes get clean plain text (and the `.log` file is always plain —
+// write_log strips ANSI before writing it). NO_COLOR (the cross-tool standard)
+// disables it. No progress bars anywhere: every log line is static, append-only.
+// ---------------------------------------------------------------------------
+static USE_COLOR: LazyLock<bool> = LazyLock::new(|| {
+    std::io::stderr().is_terminal() && !crate::config::present("NO_COLOR")
+});
+
+#[inline]
+fn sgr(code: &str, s: &str) -> String {
+    if *USE_COLOR { format!("\x1b[{code}m{s}\x1b[0m") } else { s.to_string() }
+}
+#[inline] pub fn dim(s: &str) -> String { sgr("2", s) }
+#[inline] pub fn bold(s: &str) -> String { sgr("1", s) }
+#[inline] pub fn red(s: &str) -> String { sgr("1;31", s) }
+#[inline] pub fn green(s: &str) -> String { sgr("32", s) }
+#[inline] pub fn yellow(s: &str) -> String { sgr("33", s) }
+#[inline] pub fn cyan(s: &str) -> String { sgr("1;36", s) }
+
+/// Strip ANSI SGR escape sequences (for the plain-text `.log` file).
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&n) = chars.peek() { chars.next(); if n.is_ascii_alphabetic() { break; } }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
 
 struct LoggerInner {
     file: Option<std::fs::File>,
@@ -288,20 +326,23 @@ fn compute_estimate_mb(
 
 /// Print the startup banner.
 pub fn print_banner(version: &str) {
-    write_log(&format!(r#"
+    let art = cyan(r#"
   ___ ___ _    ___ _  _ ___
  / __| __| |  | _ \ || |_ _|
  \__ \ _|| |__|  _/ __ || |
- |___/___|____|_| |_||_|___|
-      v{version} {crab} SelfDecode{tm}
-"#, crab = '\u{1F980}', tm = '\u{2122}'));
+ |___/___|____|_| |_||_|___|"#);
+    let tag = format!("      {} {} {}",
+        dim(&format!("v{version}")), '\u{1F980}', green("SelfDecode\u{2122}"));
+    write_log(&format!("{art}\n{tag}\n"));
 }
 
 /// Write a message to both stderr and the log file.
 pub fn write_log(msg: &str) {
     eprintln!("{}", msg);
     if let Ok(mut inner) = LOGGER.lock() && let Some(ref mut f) = inner.file {
-        let _ = writeln!(f, "{}", msg);
+        // The log file is always plain text — strip any color the terminal got.
+        let plain = if msg.contains('\u{1b}') { strip_ansi(msg) } else { msg.to_string() };
+        let _ = writeln!(f, "{}", plain);
         let _ = f.flush();
     }
 }
@@ -310,7 +351,9 @@ pub fn write_log(msg: &str) {
 pub fn write_step(msg: &str) {
     let elapsed = elapsed_secs();
     let mem = peak_mem_mb();
-    let line = format!("  {:<60} [{:.1}s | {:.0} MB]", msg, elapsed, mem);
+    // Dim the timing/memory suffix so the message reads first.
+    let timing = dim(&format!("[{:.1}s | {:.0} MB]", elapsed, mem));
+    let line = format!("  {:<60} {}", msg, timing);
     write_log(&line);
 }
 
@@ -344,6 +387,6 @@ macro_rules! selphi_step {
 #[macro_export]
 macro_rules! selphi_error {
     ($($arg:tt)*) => {
-        $crate::log::write_log(&format!("ERROR: {}", format!($($arg)*)))
+        $crate::log::write_log(&$crate::log::red(&format!("ERROR: {}", format!($($arg)*))))
     };
 }
