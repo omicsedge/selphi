@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 250" role="img"
+     font-family="ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace">
+  <title>selphi terminal demo: impute a chip against a reference panel</title>
+  <defs>
+    <clipPath id="typeCmd">
+      <rect x="42" y="63" width="0" height="22">
+        <animate attributeName="width" values="0;0;648;648;0"
+                 keyTimes="0;0.03;0.33;0.97;1" dur="9s" repeatCount="indefinite"/>
+      </rect>
+    </clipPath>
+  </defs>
+
+  <!-- window -->
+  <rect x="4" y="4" width="792" height="242" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
+  <!-- title bar -->
+  <circle cx="26" cy="26" r="5.5" fill="#ff5f56"/>
+  <circle cx="46" cy="26" r="5.5" fill="#ffbd2e"/>
+  <circle cx="66" cy="26" r="5.5" fill="#27c93f"/>
+  <text x="400" y="30" text-anchor="middle" fill="#6e7681" font-size="12">selphi</text>
+  <line x1="4" y1="44" x2="796" y2="44" stroke="#21262d" stroke-width="1"/>
+
+  <!-- command line: prompt + typed (clipped) command + cursor -->
+  <text x="24" y="80" fill="#7ee787" font-size="13.5" font-weight="700">$</text>
+  <g clip-path="url(#typeCmd)">
+    <text x="42" y="80" fill="#e6edf3" font-size="13.5">selphi --refpanel chr22.srp --input chip.vcf.gz --map chr22.map --out imputed -t 16</text>
+  </g>
+  <rect y="66" width="8" height="16" fill="#7ee787">
+    <animate attributeName="x" values="42;42;690;690;42" keyTimes="0;0.03;0.33;0.97;1" dur="9s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="1;0" keyTimes="0;0.5" dur="1.06s" calcMode="discrete" repeatCount="indefinite"/>
+  </rect>
+
+  <!-- output, staged -->
+  <text x="24" y="112" fill="#8b949e" font-size="13" opacity="0">[selphi] SIMD: AVX-512F+DQ  &#xb7;  engine: genotype (auto)
+    <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.38;0.40;0.97;1" dur="9s" repeatCount="indefinite"/>
+  </text>
+  <text x="24" y="138" fill="#c9d1d9" font-size="13" opacity="0">phasing   801 samples (haploid) .............. done   12s
+    <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.47;0.49;0.97;1" dur="9s" repeatCount="indefinite"/>
+  </text>
+  <text x="24" y="164" fill="#c9d1d9" font-size="13" opacity="0">imputing  1,070,401 variants ................. done   57s
+    <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.56;0.58;0.97;1" dur="9s" repeatCount="indefinite"/>
+  </text>
+  <text x="24" y="194" font-size="13" opacity="0">
+    <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.67;0.69;0.97;1" dur="9s" repeatCount="indefinite"/>
+    <tspan fill="#7ee787" font-weight="700">&#x2713; imputed.vcf.gz</tspan><tspan fill="#8b949e">   &#xb7;   OVERALL R&#xb2; </tspan><tspan fill="#5eead4" font-weight="700">0.482</tspan><tspan fill="#8b949e">   &#xb7;   69s   &#xb7;   13.1 GB peak</tspan>
+  </text>
+</svg>
