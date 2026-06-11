@@ -1,15 +1,3 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 58" width="820" height="58">
-  <style>
-    .b { fill: #fff; font-family: 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 26px; font-weight: 700; }
-    .t { fill: #e6edf3; font-family: 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 42px; font-weight: 700; }
-  </style>
-  <rect x="0" y="7" width="64" height="43" rx="6" fill="#4568f9"/>
-  <text class="b" x="32" y="36" text-anchor="middle">SEL</text>
-  <text class="t" x="70" y="44">fDecode</text>
-  <rect x="248" y="7" width="52" height="43" rx="6" fill="#e8590c"/>
-  <text class="b" x="274" y="36" text-anchor="middle">PH</text>
-  <text class="t" x="306" y="44">asing &amp;</text>
-  <rect x="468" y="7" width="30" height="43" rx="6" fill="#4568f9"/>
-  <text class="b" x="483" y="36" text-anchor="middle">I</text>
-  <text class="t" x="504" y="44">mputation</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 765 62" width="765" height="62">
+  <text x="12" y="45" font-family="'Segoe UI', Helvetica, Arial, sans-serif" font-size="38" font-weight="700" letter-spacing="0.3"><tspan fill="#4568f9">SEL</tspan><tspan fill="#ffffff">fDecode  </tspan><tspan fill="#4568f9">PH</tspan><tspan fill="#ffffff">asing &amp; </tspan><tspan fill="#4568f9">I</tspan><tspan fill="#ffffff">mputation</tspan></text>
 </svg>
