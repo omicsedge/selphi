@@ -30,6 +30,27 @@ fn sgr(code: &str, s: &str) -> String {
 #[inline] pub fn yellow(s: &str) -> String { sgr("33", s) }
 #[inline] pub fn cyan(s: &str) -> String { sgr("1;36", s) }
 
+/// Human-readable byte size: `1.2 GB` / `142.0 MB` / `9.8 KB` / `512 B`.
+pub fn fmt_bytes(b: u64) -> String {
+    let f = b as f64;
+    if f >= 1e9 { format!("{:.1} GB", f / 1e9) }
+    else if f >= 1e6 { format!("{:.1} MB", f / 1e6) }
+    else if f >= 1e3 { format!("{:.1} KB", f / 1e3) }
+    else { format!("{} B", b) }
+}
+
+/// Integer with thousands separators: `1070401` -> `1,070,401`.
+pub fn fmt_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let len = s.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 { out.push(','); }
+        out.push(c);
+    }
+    out
+}
+
 /// Strip ANSI SGR escape sequences (for the plain-text `.log` file).
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
