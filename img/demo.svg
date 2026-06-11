@@ -1,46 +1,54 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 250" role="img"
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 332" role="img"
      font-family="ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace">
-  <title>selphi terminal demo: impute a chip against a reference panel</title>
+  <title>selphi: one binary auto-routes the input to the right engine (animated, real logs)</title>
   <defs>
-    <clipPath id="typeCmd">
-      <rect x="42" y="63" width="0" height="22">
-        <animate attributeName="width" values="0;0;648;648;0"
-                 keyTimes="0;0.03;0.33;0.97;1" dur="9s" repeatCount="indefinite"/>
-      </rect>
-    </clipPath>
+    <clipPath id="clip0"><rect x="42" y="63" width="0" height="20">
+      <animate attributeName="width" values="0;0;616;616" keyTimes="0;0.0067;0.0500;1" dur="18s" repeatCount="indefinite"/></rect></clipPath>
+    <clipPath id="clip1"><rect x="42" y="63" width="0" height="20">
+      <animate attributeName="width" values="0;0;668;668" keyTimes="0;0.3400;0.3833;1" dur="18s" repeatCount="indefinite"/></rect></clipPath>
+    <clipPath id="clip2"><rect x="42" y="63" width="0" height="20">
+      <animate attributeName="width" values="0;0;650;650" keyTimes="0;0.6733;0.7167;1" dur="18s" repeatCount="indefinite"/></rect></clipPath>
   </defs>
-
-  <!-- window -->
-  <rect x="4" y="4" width="792" height="242" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
-  <!-- title bar -->
+  <rect x="4" y="4" width="892" height="324" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
   <circle cx="26" cy="26" r="5.5" fill="#ff5f56"/>
   <circle cx="46" cy="26" r="5.5" fill="#ffbd2e"/>
   <circle cx="66" cy="26" r="5.5" fill="#27c93f"/>
-  <text x="400" y="30" text-anchor="middle" fill="#6e7681" font-size="12">selphi</text>
-  <line x1="4" y1="44" x2="796" y2="44" stroke="#21262d" stroke-width="1"/>
-
-  <!-- command line: prompt + typed (clipped) command + cursor -->
-  <text x="24" y="80" fill="#7ee787" font-size="13.5" font-weight="700">$</text>
-  <g clip-path="url(#typeCmd)">
-    <text x="42" y="80" fill="#e6edf3" font-size="13.5">selphi --refpanel chr22.srp --input chip.vcf.gz --map chr22.map --out imputed -t 16</text>
+  <text x="450.0" y="30" text-anchor="middle" fill="#6e7681" font-size="12">selphi  ·  one binary, auto-routed</text>
+  <line x1="4" y1="44" x2="896" y2="44" stroke="#21262d" stroke-width="1"/>
+  <g opacity="0"><animate attributeName="opacity" values="1;1;0;0;1" keyTimes="0;0.3273;0.3333;0.9940;1" dur="18s" repeatCount="indefinite"/>
+    <text x="882" y="30" text-anchor="end" fill="#fb923c" font-size="11" font-weight="700">chip array  →  haploid + genotype</text>
+    <text x="24" y="78" fill="#7ee787" font-size="13.0" font-weight="700">$</text>
+    <g clip-path="url(#clip0)"><text x="42" y="78" fill="#e6edf3" font-size="13.0">selphi --refpanel chr22.srp --input chip.vcf.gz --map chr22.map --out imputed -t 16</text></g>
+    <text x="24" y="108" font-size="12.5" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;0.0733;0.0773" dur="18s" repeatCount="indefinite"/><tspan fill="#56d4dd">[selphi]</tspan><tspan fill="#8b949e"> SIMD: </tspan><tspan fill="#7ee787">AVX-512F+DQ</tspan></text>
+    <text x="24" y="133" font-size="12.5" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;0.1017;0.1057" dur="18s" repeatCount="indefinite"/><tspan fill="#8b949e">  auto-route: GT-only · 262 sites/Mb  </tspan><tspan fill="#7ee787">→ genotype engine</tspan></text>
+    <text x="24" y="158" font-size="12.5" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;0.1300;0.1340" dur="18s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Target: </tspan><tspan fill="#e6edf3">801</tspan><tspan fill="#8b949e"> samples · </tspan><tspan fill="#e6edf3">9283</tspan><tspan fill="#8b949e"> variants · phased=false</tspan></text>
+    <text x="24" y="183" font-size="12.5" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;0.1583;0.1623" dur="18s" repeatCount="indefinite"/><tspan fill="#8b949e">  chip input (9283 ≤ 50K)  </tspan><tspan fill="#fb923c">→ Haploid phasing engine</tspan></text>
+    <text x="24" y="208" font-size="12.5" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;0.1867;0.1907" dur="18s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Phasing complete: 801 samples, 3 EM windows   </tspan><tspan fill="#8b949e">14.2s | 856 MB</tspan></text>
+    <text x="24" y="233" font-size="12.5" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;0.2150;0.2190" dur="18s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Output: imputed.vcf.gz   </tspan><tspan fill="#8b949e">86.7s | 12.5 GB</tspan></text>
+    <text x="24" y="272" font-size="13.0" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;0.2433;0.2473" dur="18s" repeatCount="indefinite"/><tspan fill="#7ee787">✓ imputed.vcf.gz</tspan><tspan fill="#8b949e">   ·   OVERALL R² </tspan><tspan fill="#5eead4">0.4825</tspan><tspan fill="#8b949e">   ·   89s  ·  12.5 GB peak</tspan></text>
   </g>
-  <rect y="66" width="8" height="16" fill="#7ee787">
-    <animate attributeName="x" values="42;42;690;690;42" keyTimes="0;0.03;0.33;0.97;1" dur="9s" repeatCount="indefinite"/>
-    <animate attributeName="opacity" values="1;0" keyTimes="0;0.5" dur="1.06s" calcMode="discrete" repeatCount="indefinite"/>
-  </rect>
-
-  <!-- output, staged -->
-  <text x="24" y="112" fill="#8b949e" font-size="13" opacity="0">[selphi] SIMD: AVX-512F+DQ  &#xb7;  engine: genotype (auto)
-    <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.38;0.40;0.97;1" dur="9s" repeatCount="indefinite"/>
-  </text>
-  <text x="24" y="138" fill="#c9d1d9" font-size="13" opacity="0">phasing   801 samples (haploid) .............. done   12s
-    <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.47;0.49;0.97;1" dur="9s" repeatCount="indefinite"/>
-  </text>
-  <text x="24" y="164" fill="#c9d1d9" font-size="13" opacity="0">imputing  1,070,401 variants ................. done   57s
-    <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.56;0.58;0.97;1" dur="9s" repeatCount="indefinite"/>
-  </text>
-  <text x="24" y="194" font-size="13" opacity="0">
-    <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.67;0.69;0.97;1" dur="9s" repeatCount="indefinite"/>
-    <tspan fill="#7ee787" font-weight="700">&#x2713; imputed.vcf.gz</tspan><tspan fill="#8b949e">   &#xb7;   OVERALL R&#xb2; </tspan><tspan fill="#5eead4" font-weight="700">0.480</tspan><tspan fill="#8b949e">   &#xb7;   76s   &#xb7;   12.2 GB peak</tspan>
-  </text>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.3273;0.3333;0.6607;0.6667;1" dur="18s" repeatCount="indefinite"/>
+    <text x="882" y="30" text-anchor="end" fill="#6cb6ff" font-size="11" font-weight="700">WGS  →  diploid (--phase-only)</text>
+    <text x="24" y="78" fill="#7ee787" font-size="13.0" font-weight="700">$</text>
+    <g clip-path="url(#clip1)"><text x="42" y="78" fill="#e6edf3" font-size="13.0">selphi --refpanel chr22.srp --input wgs.vcf.gz --map chr22.map --out phased --phase-only -t 16</text></g>
+    <text x="24" y="108" font-size="12.5" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;0.4067;0.4107" dur="18s" repeatCount="indefinite"/><tspan fill="#56d4dd">[selphi]</tspan><tspan fill="#8b949e"> SIMD: </tspan><tspan fill="#7ee787">AVX-512F+DQ</tspan></text>
+    <text x="24" y="133" font-size="12.5" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;0.4350;0.4390" dur="18s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Target: </tspan><tspan fill="#e6edf3">54</tspan><tspan fill="#8b949e"> samples · </tspan><tspan fill="#e6edf3">1070401</tspan><tspan fill="#8b949e"> variants · phased=false</tspan></text>
+    <text x="24" y="158" font-size="12.5" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;0.4633;0.4673" dur="18s" repeatCount="indefinite"/><tspan fill="#8b949e">  WGS input (1070399 &gt; 50K)  </tspan><tspan fill="#6cb6ff">→ Diploid phasing engine</tspan></text>
+    <text x="24" y="183" font-size="12.5" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;0.4917;0.4957" dur="18s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Common ref subset: 347061 / 1070399 variants</tspan></text>
+    <text x="24" y="208" font-size="12.5" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;0.5200;0.5240" dur="18s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Phasing complete: 54 samples, 0 EM windows   </tspan><tspan fill="#8b949e">71.5s | 4.3 GB</tspan></text>
+    <text x="24" y="272" font-size="13.0" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;0.5483;0.5523" dur="18s" repeatCount="indefinite"/><tspan fill="#7ee787">✓ phased.vcf.gz</tspan><tspan fill="#8b949e">   ·   diploid · 54 samples   ·   </tspan><tspan fill="#8b949e">72s  ·  4.3 GB peak</tspan></text>
+  </g>
+  <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.6607;0.6667;0.9940;1" dur="18s" repeatCount="indefinite"/>
+    <text x="882" y="30" text-anchor="end" fill="#5eead4" font-size="11" font-weight="700">low-coverage WGS  →  lcWGS</text>
+    <text x="24" y="78" fill="#7ee787" font-size="13.0" font-weight="700">$</text>
+    <g clip-path="url(#clip2)"><text x="42" y="78" fill="#e6edf3" font-size="13.0">selphi --refpanel chr22.srp --input sample.gl.vcf.gz --map chr22.map --out lowcov -t 16</text></g>
+    <text x="24" y="108" font-size="12.5" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;0.7400;0.7440" dur="18s" repeatCount="indefinite"/><tspan fill="#56d4dd">[selphi]</tspan><tspan fill="#8b949e"> SIMD: </tspan><tspan fill="#7ee787">AVX-512F+DQ</tspan></text>
+    <text x="24" y="133" font-size="12.5" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;0.7683;0.7723" dur="18s" repeatCount="indefinite"/><tspan fill="#8b949e">  auto-route: PL / low GT call-rate  </tspan><tspan fill="#5eead4">→ lcWGS engine</tspan></text>
+    <text x="24" y="158" font-size="12.5" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;0.7967;0.8007" dur="18s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  PL VCF: </tspan><tspan fill="#e6edf3">1</tspan><tspan fill="#8b949e"> sample · </tspan><tspan fill="#e6edf3">929834</tspan><tspan fill="#8b949e"> variants</tspan></text>
+    <text x="24" y="183" font-size="12.5" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;0.8250;0.8290" dur="18s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  shared variants: 929834 / 929834 (100.0% of target)</tspan></text>
+    <text x="24" y="208" font-size="12.5" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;0.8533;0.8573" dur="18s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  chunked Gibbs: 82.4 cM span </tspan><tspan fill="#8b949e">→ 42 chunks</tspan></text>
+    <text x="24" y="233" font-size="12.5" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;0.8817;0.8857" dur="18s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  lcwgs done: 929834 variants × 1 sample </tspan><tspan fill="#8b949e">in 117.6s</tspan></text>
+    <text x="24" y="272" font-size="13.0" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;0.9100;0.9140" dur="18s" repeatCount="indefinite"/><tspan fill="#7ee787">✓ lowcov.vcf.gz</tspan><tspan fill="#8b949e">   ·   </tspan><tspan fill="#5eead4">GT:DS:GP</tspan><tspan fill="#8b949e">   ·   GL-aware Li-Stephens forward-backward</tspan></text>
+  </g>
+  <text x="450.0" y="314" text-anchor="middle" fill="#484f58" font-size="11">same command shape · selphi sniffs the input and routes it to the right engine</text>
 </svg>
