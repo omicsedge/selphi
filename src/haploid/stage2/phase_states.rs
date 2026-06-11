@@ -87,8 +87,6 @@ impl<'a> LowFreqPhaseStates<'a> {
         }
     }
 
-    pub fn max_states(&self) -> usize { self.max_states }
-
     /// Fill `haps[m][j]` and `mismatches[m][j]` for `targ_hap`. Returns the
     /// number of composite states actually built (≤ `max_states`).
     ///
