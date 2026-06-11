@@ -16,7 +16,6 @@ pub struct HmmStateProbs<'a> {
     pub(crate) p_mismatch_arr: [f32; 2],
     pub(crate) mismatch: Vec<Vec<u8>>,
     pub(crate) bwd_buf: Vec<f32>,
-    pub(crate) max_states: usize,
 }
 
 impl<'a> HmmStateProbs<'a> {
@@ -30,7 +29,6 @@ impl<'a> HmmStateProbs<'a> {
             p_mismatch_arr: [1.0 - p_miss, p_miss],
             mismatch: vec![vec![0u8; max_states]; n_stage1_markers],
             bwd_buf: vec![0.0f32; max_states],
-            max_states,
         }
     }
 
@@ -47,8 +45,6 @@ impl<'a> HmmStateProbs<'a> {
         run_bwd(state_probs, &self.mismatch, &self.p_mismatch_arr, self.p_recomb, &mut self.bwd_buf, n_states);
         n_states
     }
-
-    pub fn max_states(&self) -> usize { self.max_states }
 }
 
 /// Li-Stephens forward pass. `probs[m][j]` is updated in place; on entry the

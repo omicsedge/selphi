@@ -1,5 +1,3 @@
-#![allow(dead_code)]  // stub stage; fields wired up in subsequent commits.
-
 //! Selphi haploid stage-2 rare-variant phasing.
 //!
 //! Port of Beagle 5.x `phase.PhaseLS.runStage2` and the supporting classes

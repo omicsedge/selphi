@@ -27,7 +27,6 @@ pub mod multi_chr_writer;
 pub use reader::SrpReader;
 pub use multi_chr_reader::{MultiChrSrpReader, ChrSrpView};
 
-use std::collections::HashMap;
 use std::io::Cursor;
 use serde_json::Value as JsonValue;
 
@@ -202,31 +201,13 @@ pub struct SrpMetadata {
     pub chunk_size: usize,
     pub min_position: i64,
     pub max_position: i64,
-    pub chunk_format: String,
     pub chunk_cv: f64,
     pub contig_field: String,
-    /// Cumulative variant starts per chunk (for non-uniform chunk sizes).
-    /// chunk_var_starts[cid] = first variant index in chunk cid.
-    /// Empty for uniform chunk sizes (use chunk_id * chunk_size).
-    pub chunk_var_starts: Vec<usize>,
-    /// Raw JSON for any extra fields
-    pub raw: HashMap<String, JsonValue>,
 }
 
 impl SrpMetadata {
     pub(crate) fn from_json(v: &JsonValue) -> Self {
         let obj = v.as_object().expect("metadata must be a JSON object");
-        let chunk_var_starts = if let Some(arr) = obj.get("chunk_row_counts").and_then(|v| v.as_array()) {
-            let mut starts = Vec::with_capacity(arr.len());
-            let mut cum = 0usize;
-            for val in arr {
-                starts.push(cum);
-                cum += val.as_u64().unwrap_or(0) as usize;
-            }
-            starts
-        } else {
-            Vec::new()
-        };
         Self {
             chromosome: obj.get("chromosome").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             n_variants: obj.get("n_variants").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
@@ -235,11 +216,8 @@ impl SrpMetadata {
             chunk_size: obj.get("chunk_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
             min_position: obj.get("min_position").and_then(|v| v.as_i64()).unwrap_or(0),
             max_position: obj.get("max_position").and_then(|v| v.as_i64()).unwrap_or(0),
-            chunk_format: obj.get("chunk_format").and_then(|v| v.as_str()).unwrap_or("npz").to_string(),
             chunk_cv: obj.get("chunk_cv").and_then(|v| v.as_f64()).unwrap_or(0.0),
             contig_field: obj.get("contig_field").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            chunk_var_starts,
-            raw: obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
     }
 

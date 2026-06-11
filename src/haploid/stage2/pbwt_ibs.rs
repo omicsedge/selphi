@@ -43,8 +43,6 @@ impl PbwtDivUpdater {
         }
     }
 
-    pub fn n_haps(&self) -> usize { self.n_haps }
-
     fn ensure_alleles(&mut self, n_alleles: usize) {
         while self.a.len() < n_alleles {
             self.a.push(Vec::new());
