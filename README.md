@@ -11,14 +11,10 @@
 **Selphi** is a genotype phasing and imputation tool implemented in Rust. It provides two phasing engines (haploid and diploid) and two imputation engines: a Li-Stephens PBWT engine for chip/WGS hard calls, and a genotype-likelihood-aware engine for low-coverage WGS (`--lcwgs`). Everything runs in a unified, memory-efficient pipeline. All internal data structures use a bitmatrix representation (1 bit per allele), HMM kernels are SIMD-accelerated (AVX-512/AVX2 on x86, NEON on Apple Silicon), and results are fully deterministic across runs.
 
 <p align="center">
-  <img src="img/demo.svg" alt="selphi imputing a chip array against a reference panel (animated terminal demo)" width="800"/>
-</p>
-
-<p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="img/architecture_dark.svg"/>
-    <source media="(prefers-color-scheme: light)" srcset="img/architecture_light.svg"/>
-    <img src="img/architecture_dark.svg" alt="Selphi pipeline architecture" width="800"/>
+    <source media="(prefers-color-scheme: dark)" srcset="img/pipeline_dark.svg"/>
+    <source media="(prefers-color-scheme: light)" srcset="img/pipeline_light.svg"/>
+    <img src="img/pipeline_dark.svg" alt="Selphi auto-routes each input to the right engine: the full real log runs on top while the pipeline below lights up each stage in sync (chip, WGS, low-coverage)" width="820"/>
   </picture>
 </p>
 
