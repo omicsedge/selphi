@@ -133,18 +133,22 @@ pub struct Args {
     #[arg(long)]
     pub lcwgs: bool,
 
-    /// Target↔panel allele reconciliation: none|swap|strand|full. DEFAULT none
-    /// (exact REF/ALT match only — byte-identical to before). A genotyping chip on
-    /// a different strand or with REF/ALT swapped vs the panel silently loses those
-    /// markers under `none`; the other modes recover them:
-    ///   swap   = also accept REF/ALT-swapped sites (recode genotype 0↔1);
+    /// Target↔panel allele reconciliation: none|swap|strand|full. DEFAULT swap
+    /// (also accept REF/ALT-swapped sites, recoding the genotype 0↔1 — unambiguous
+    /// and recovers the common case where a chip labels REF/ALT opposite the panel).
+    /// A chip on a different strand silently loses those markers under swap; the
+    /// other modes recover more:
+    ///   none   = exact REF/ALT only (byte-identical to pre-feature behavior);
+    ///   swap   = also accept REF/ALT-swapped sites (recode genotype 0↔1) [default];
     ///   strand = also accept opposite-strand SNPs (reverse-complement), then exact/swap;
     ///   full   = swap + strand.
     /// Palindromic SNPs (A/T, C/G) are strand-ambiguous and are matched only by exact
-    /// equality (conform-gt / Michigan convention). Applies to the chip/WGS genotype
-    /// path (single- and multi-chr); lcWGS/GLIMPSE2-exact are unaffected. Sites that
-    /// already match exactly are never touched, so conforming input is byte-identical.
-    #[arg(long, value_enum, default_value = "none")]
+    /// equality (conform-gt / Michigan convention). `strand`/`full` carry a small
+    /// false-match risk on non-palindromic SNPs, so they stay opt-in. Applies to the
+    /// chip/WGS genotype path (single- and multi-chr); lcWGS/GLIMPSE2-exact are
+    /// unaffected. Sites that already match exactly are never touched, so conforming
+    /// input is byte-identical regardless of mode.
+    #[arg(long, value_enum, default_value = "swap")]
     pub allele_match: AlleleMatch,
 
     /// Imputation engine/mode: auto|lcwgs|genotype|refine. DEFAULT auto — Selphi

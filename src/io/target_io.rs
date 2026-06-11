@@ -34,11 +34,14 @@ pub struct TargetMarker {
 /// unaffected. Mirrors Beagle conform-gt's reconciliation as an opt-in pre-step.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum AlleleMatch {
-    /// Exact REF/ALT only (default; byte-identical to pre-feature behavior).
-    #[default]
+    /// Exact REF/ALT only (byte-identical to pre-feature behavior; opt in to disable
+    /// reconciliation entirely with `--allele-match none`).
     None,
     /// Also accept REF/ALT-swapped sites (target REF==panel ALT and vice-versa) →
-    /// recode the genotype 0↔1 into panel orientation.
+    /// recode the genotype 0↔1 into panel orientation. This is the CLI **default**:
+    /// unambiguous and recovers the common opposite-REF/ALT-label case. (Sites that
+    /// already match exactly are untouched, so conforming input is byte-identical.)
+    #[default]
     Swap,
     /// Also accept opposite-strand SNPs (reverse-complement the target alleles),
     /// then re-test exact / swap. (Implies the swap rung.)
