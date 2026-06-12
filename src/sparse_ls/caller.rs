@@ -1,10 +1,9 @@
-//! Faithful Rust reimplementation of GLIMPSE2's `caller` phasing/imputation driver loop.
+//! Rust implementation of the GLIMPSE2 `caller` phasing/imputation driver loop.
 //!
-//! reimplementation of the Gibbs schedule in
-//! `_archive/reference_code/GLIMPSE2/phase/src/caller/caller_algorithm.cpp`
-//! (`phase_loop` / `phase_iteration` / `phase_individual`).
+//! Implements the Gibbs schedule (`phase_loop` / `phase_iteration` /
+//! `phase_individual`) of the GLIMPSE2 model.
 //!
-//! This is the CAPSTONE that wires the already-ported modules together:
+//! This is the CAPSTONE that wires the supporting modules together:
 //!   [`RefHaplotypeSet`]  — immutable reference panel + compressed sparse PBWT.
 //!   [`TargetHaplotypeSet`] — mutable target side + per-iteration PBWT selection.
 //!   [`ConditioningSet`]  — per-(individual,iteration) conditioning (`select`).
@@ -14,7 +13,7 @@
 //!   [`Mt19937Rng`]       — libstdc++-faithful MT19937 stream (RNG injection).
 //!
 //! ─────────────────────────────────────────────────────────────────────────────
-//! THE LOOP (verbatim from caller_algorithm.cpp):
+//! THE LOOP:
 //!
 //! ```text
 //! phase_loop:
@@ -62,11 +61,11 @@
 //!   * `performSelection_RARE_INIT_GL`    (explicitly "not parallel"),
 //!   * the per-individual `sampleHaplotypeH0/H1` + `rephaseHaplotypes` draws.
 //! The last group reads `rng` concurrently in GLIMPSE2, so its draw INTERLEAVING is
-//! thread-schedule-dependent and NOT reproducible across runs even in the C++. Here
+//! thread-schedule-dependent and NOT reproducible across runs even in that model. Here
 //! we run STRICTLY SERIAL (ind ascending), which is one deterministic interleaving
-//! of the C++ behavior. We share ONE `Mt19937Rng` across all consumers, drawn in
+//! of that behavior. We share ONE `Mt19937Rng` across all consumers, drawn in
 //! program order: this is statistical parity (the design goal), not bit-identity
-//! against a specific C++ thread schedule. (PORT_SPEC riskiest #1.)
+//! against a specific thread schedule.
 
 use crate::common::HaplotypeBitmatrix;
 use crate::sparse_ls::conditioning_set::{
@@ -85,21 +84,19 @@ use rayon::prelude::*;
 
 // ════════════════════════════════════════════════════════════════════════════
 //   TargetSelectionView for TargetHaplotypeSet
-//   (the "one missing glue impl" — conditioning_set.rs ~line 173).
+//   (the one missing glue impl — see conditioning_set.rs).
 // ════════════════════════════════════════════════════════════════════════════
 //
-// Four of the five methods map 1:1 to public fields of TargetHaplotypeSet. The
-// fifth, `list_states(hapid)`, has NO backing field: in GLIMPSE2, `list_states`
-// is populated ONLY by `read_list_states` (haplotype_set.cpp:835-851), which is
-// called ONLY when the user passes `--state-list <file>` (caller_initialise.cpp:166,
-// guarded by `use_list`). The per-iteration PBWT selection (`matchHaps…`) feeds
-// `pbwt_states`, NEVER `list_states`. So with no `--state-list` (our path), every
-// `list_states[hapid]` is empty, and `compactSelection`'s list-merge (conditioning
-// _set.cpp:110-116) is a no-op. The empty `&[]` stub is therefore EXACT for the
-// whole-panel and Kpbwt-based selection paths we run.
+// Four of the five methods map directly to public fields of TargetHaplotypeSet. The
+// fifth, `list_states(hapid)`, has NO backing field: `list_states` is populated
+// ONLY when the user passes `--state-list <file>` (guarded by `use_list`). The
+// per-iteration PBWT selection (`matchHaps…`) feeds `pbwt_states`, NEVER
+// `list_states`. So with no `--state-list` (our path), every `list_states[hapid]`
+// is empty, and `compactSelection`'s list-merge is a no-op. The empty `&[]` stub
+// is therefore EXACT for the whole-panel and Kpbwt-based selection paths we run.
 //
-// TODO faithful: port haplotype_set::list_states + read_list_states for the
-// `--state-list` external-conditioning feature (unused by --ls-exact).
+// TODO: support `list_states` + `read_list_states` for the `--state-list`
+// external-conditioning feature (unused by --ls-exact).
 impl TargetSelectionView for TargetHaplotypeSet {
     #[inline]
     fn tar_ind2hapid(&self, ind: usize) -> i32 {
@@ -130,7 +127,7 @@ impl TargetSelectionView for TargetHaplotypeSet {
 
 /// Finalized per-(sample, variant) call. `dose` ∈ [0,2] (E[ALT]); `gp` is the
 /// 3-way genotype posterior (`gp[2]` unused for a haploid sample); `gt` is the
-/// phased hard call. (genotype_writer.cpp:113-171, via `map_output_call`.)
+/// phased hard call. (Produced via `map_output_call`.)
 #[derive(Clone, Debug)]
 pub struct SampleCalls {
     /// `dose[v]` for every absolute site (length `n_tot_sites`).
@@ -146,8 +143,8 @@ pub struct SampleCalls {
 
 /// Per-WORKER scratch (one per rayon thread, reused across the samples that
 /// thread processes): the HLC/HP0/HP1 buffers + the conditioning set + the two
-/// HMMs. This mirrors GLIMPSE2's `COND[id_worker]`/`HMM[id_worker]`/`DMM[id_worker]`
-/// per-worker objects (caller_algorithm.cpp). The RNG is NOT here: each sample
+/// HMMs. This mirrors the GLIMPSE2 model's per-worker
+/// `COND`/`HMM`/`DMM` objects. The RNG is NOT here: each sample
 /// carries its own (see `LsExactCaller::run`).
 struct Worker {
     hlc: Vec<f32>,
@@ -232,7 +229,7 @@ impl RareCarrierCfg {
     }
 }
 
-/// The GLIMPSE2 caller driver (stateless marker; all scratch is per-`Worker`).
+/// The caller driver (stateless marker; all scratch is per-`Worker`).
 pub struct LsExactCaller;
 
 impl LsExactCaller {
@@ -262,16 +259,16 @@ impl LsExactCaller {
         let seed32 = if seed == 0 { DEFAULT_SEED } else { seed as u32 };
         let mut rng = Mt19937Rng::new(seed32);
 
-        // --- min_gl (GLIMPSE2 default 1e-10, caller_parameters.cpp:63). The
-        //     params struct does not carry it; use the GLIMPSE2 default. ---
+        // --- min_gl (matches GLIMPSE2's default 1e-10). The params struct does
+        //     not carry it; use the default. ---
         let min_gl = MIN_GL_DEFAULT;
 
         // --- Target side + per-iteration PBWT scratch. ---
         let n_samples = genotypes.len();
         let tar_ploidy: Vec<i32> = genotypes.iter().map(|g| g.ploidy).collect();
         let mut tar = TargetHaplotypeSet::new(ref_hs, n_samples, tar_ploidy);
-        // allocatePBWT (cpp:229-315) sizes all PBWT scratch + grouping. Defaults:
-        // pbwt-depth=12, pbwt-modulo-cm=0.1 (caller_parameters.cpp:69-70).
+        // allocatePBWT sizes all PBWT scratch + grouping. Defaults:
+        // pbwt-depth=12, pbwt-modulo-cm=0.1.
         tar.allocate_pbwt(
             ref_hs,
             PBWT_DEPTH_DEFAULT,
@@ -284,8 +281,8 @@ impl LsExactCaller {
         // --- Per-sample RNG streams: each sample owns a deterministic MT19937
         //     seeded from (base_seed, sample_idx) and advancing across iterations.
         //     This makes the per-individual sweep PARALLEL over samples AND
-        //     reproducible regardless of thread schedule (GLIMPSE2 shares one rng
-        //     across threads → not reproducible even in C++; ours is). The pre-loop
+        //     reproducible regardless of thread schedule (the GLIMPSE2 model shares
+        //     one rng across threads → not reproducible; ours is). The pre-loop
         //     selection draws still use the shared `rng` (serial, before the sweep). ---
         let mut sample_rngs: Vec<Mt19937Rng> = (0..n_samples)
             .map(|i| Mt19937Rng::new(sample_seed(seed32, i)))
@@ -304,7 +301,7 @@ impl LsExactCaller {
 
         // ───────────────────────── phase_loop ─────────────────────────
         // increment_iteration() collapses empty stages. iterations_per_stage =
-        // [INIT=1, BURN=burnin, MAIN=main] (caller_algorithm.cpp).
+        // [INIT=1, BURN=burnin, MAIN=main].
         let iters = [1i32, params.burnin, params.main]; // [INIT, BURN, MAIN]
         let mut stage = STAGE_INIT;
         let mut iter_in_stage = -1i32;
@@ -319,7 +316,7 @@ impl LsExactCaller {
         }
 
         // ───────────────────────── finalize ─────────────────────────
-        // for each ind: sortAndNormAndInferGenotype() (caller_algorithm.cpp).
+        // for each ind: sortAndNormAndInferGenotype().
         for g in genotypes.iter_mut() {
             g.sort_and_norm_and_infer_genotype();
         }
@@ -327,10 +324,10 @@ impl LsExactCaller {
 
 }
 
-/// `caller::phase_iteration` (caller_algorithm.cpp:84-137). The per-individual
-/// sweep is PARALLEL over samples (each sample carries its own `srng`; the
-/// per-thread `Worker` scratch is reused). The pre-loop selection (serial in
-/// GLIMPSE2 too) uses the shared `rng`.
+/// `caller::phase_iteration`. The per-individual sweep is PARALLEL over samples
+/// (each sample carries its own `srng`; the per-thread `Worker` scratch is
+/// reused). The pre-loop selection (serial in the GLIMPSE2 model too) uses the
+/// shared `rng`.
 #[allow(clippy::too_many_arguments)]
 fn phase_iteration(
     stage: i32,
@@ -349,7 +346,7 @@ fn phase_iteration(
     serial: bool,
     rc_cfg: &RareCarrierCfg,
 ) {
-    // ---- PRE-LOOP iteration setup (NOT parallel in C++; shared `rng`). ----
+    // ---- PRE-LOOP iteration setup (NOT parallel in the GLIMPSE2 model; shared `rng`). ----
     if stage == STAGE_INIT {
         let views = build_views(genotypes);
         tar.init_rare_tar(ref_hs, &views, vmap, unphred_table);
@@ -390,7 +387,7 @@ fn phase_iteration(
             );
     }
 
-    // ---- post-iteration: free INIT selection state (cpp:135-136). ----
+    // ---- post-iteration: free INIT selection state. ----
     if stage == STAGE_INIT {
         for s in &mut tar.init_states {
             s.clear();
@@ -399,8 +396,8 @@ fn phase_iteration(
     }
 }
 
-/// `caller::phase_individual` (caller_algorithm.cpp:52-82). Operates on ONE
-/// sample `g` with its own `srng`, reusing the per-thread `Worker` scratch.
+/// `caller::phase_individual`. Operates on ONE sample `g` with its own `srng`,
+/// reusing the per-thread `Worker` scratch.
 #[allow(clippy::too_many_arguments)]
 fn phase_individual_one(
     w: &mut Worker,
@@ -419,7 +416,7 @@ fn phase_individual_one(
 ) {
     let ploidy = g.ploidy;
 
-    // COND[w]->select(ind, current_stage)  (cpp:57). The RefPanelView is the
+    // COND[w]->select(ind, current_stage). The RefPanelView is the
     // production wrapper bundling ref_hs + ref_bm (HvarRef served from ref_bm).
     let rp = crate::sparse_ls::conditioning_set::RefPanelWithBm { hs: ref_hs, ref_bm };
     w.cond.select(ind, stage, &rp, tar, vmap);
@@ -441,7 +438,7 @@ fn phase_individual_one(
         );
     }
 
-    // HL build (cpp:59-65).
+    // HL build.
     if stage == STAGE_INIT {
         g.init_haplotype_likelihoods(&mut w.hlc, min_gl);
     } else if ploidy > 1 {
@@ -451,11 +448,11 @@ fn phase_individual_one(
         g.init_haplotype_likelihoods(&mut w.hlc, min_gl);
     }
 
-    // computePosteriors(HLC, G.flat, HP0)  (cpp:66)
+    // computePosteriors(HLC, G.flat, HP0)
     w.imp_hmm
         .compute_posteriors(&w.cond, &w.hlc, &g.flat, &mut w.hp0);
 
-    // sampleHaplotypeH0(HP0)  (cpp:67). One getFloat() per site, f64-cmp.
+    // sampleHaplotypeH0(HP0). One getFloat() per site, f64-cmp.
     {
         let mut draw = || srng.get_float() as f64;
         g.sample_haplotype_h0(&w.hp0, &mut draw);
@@ -464,16 +461,16 @@ fn phase_individual_one(
     if ploidy > 1 {
         // makeHaplotypeLikelihoods(HLC, first=false) — H1, conditioned on NEW H0.
         g.make_haplotype_likelihoods(&mut w.hlc, false, min_gl);
-        // computePosteriors(HLC, G.flat, HP1) (cpp:72)
+        // computePosteriors(HLC, G.flat, HP1)
         w.imp_hmm
             .compute_posteriors(&w.cond, &w.hlc, &g.flat, &mut w.hp1);
-        // sampleHaplotypeH1(HP1) (cpp:73)
+        // sampleHaplotypeH1(HP1)
         {
             let mut draw = || srng.get_float() as f64;
             g.sample_haplotype_h1(&w.hp1, &mut draw);
         }
 
-        // DMM->rephaseHaplotypes(H0, H1, flat) (cpp:74). The phasing HMM's
+        // DMM->rephaseHaplotypes(H0, H1, flat). The phasing HMM's
         // conditioning set IS the imputation conditioning set (idx_haps_ref).
         let cond_haps: Vec<u32> = w.cond.idx_haps_ref.iter().map(|&h| h as u32).collect();
         // Disjoint field borrows: g.h0/g.h1 (&mut) + g.flat (&), and w.phs_hmm (&mut)
@@ -494,7 +491,7 @@ fn phase_individual_one(
         );
     }
 
-    // STAGE_MAIN dose accumulation (cpp:76-80).
+    // STAGE_MAIN dose accumulation.
     if stage == STAGE_MAIN {
         if ploidy > 1 {
             g.store_genotype_posteriors(&w.hp0, &w.hp1);
@@ -504,12 +501,12 @@ fn phase_individual_one(
     }
 }
 
-// GLIMPSE2 caller defaults (caller_parameters.cpp). Not carried by LsParams.
+// Caller defaults (match the GLIMPSE2 model). Not carried by LsParams.
 const MIN_GL_DEFAULT: f32 = 1e-10;
 const PBWT_DEPTH_DEFAULT: i32 = 12;
 const PBWT_MODULO_CM_DEFAULT: f32 = 0.1;
 
-/// `caller::increment_iteration` (caller_algorithm.cpp:139-145).
+/// `caller::increment_iteration`.
 #[inline]
 fn increment_iteration(stage: &mut i32, iter_in_stage: &mut i32, iters: &[i32; 3]) {
     *iter_in_stage += 1;
@@ -520,14 +517,14 @@ fn increment_iteration(stage: &mut i32, iter_in_stage: &mut i32, iters: &[i32; 3
 }
 
 /// Build the per-individual [`GenotypeView`]s the selection code consumes. Each
-/// view borrows the genotype's GL/flat/H0/H1 (matching the C++ `*G.vecG[i]`).
+/// view borrows the genotype's GL/flat/H0/H1.
 fn build_views(genotypes: &[Genotype]) -> Vec<GenotypeView<'_>> {
     genotypes.iter().map(|g| g.view()).collect()
 }
 
 /// Collect finalized per-sample dose + GP from the genotypes AFTER
 /// [`LsExactCaller::run`]. Maps each stored posterior through
-/// `map_output_call` (genotype_writer.cpp). Sites with no stored record get the
+/// `map_output_call`. Sites with no stored record get the
 /// Ref/Ref default (dose 0, GP=(1,0,0)).
 pub fn collect_calls(genotypes: &[Genotype], n_tot_sites: usize) -> Vec<SampleCalls> {
     genotypes

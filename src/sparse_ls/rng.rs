@@ -1,24 +1,21 @@
-//! VERBATIM libstdc++ RNG port — the byte-identity GATE for the GLIMPSE2-exact
-//! engine (PORT_SPEC.md §riskiest_parts #1: "the single most important module").
+//! libstdc++-faithful RNG reimplementation — the byte-identity GATE for the
+//! GLIMPSE2-exact engine (the single most important module for reproducibility).
 //!
-//! GLIMPSE2's `random_number_generator` (common/src/utils/random_number.h:35-125)
-//! wraps a `std::mt19937` plus three `std::uniform_*_distribution`s and a hand-
-//! rolled `sample()`. Reproducing its *output stream* bit-for-bit requires
-//! replicating not just MT19937 (which is portable) but the **implementation-
-//! defined** libstdc++ pieces:
+//! The GLIMPSE2 model's random-number generator wraps a `std::mt19937` plus three
+//! `std::uniform_*_distribution`s and a hand-rolled `sample()`. Reproducing its
+//! *output stream* bit-for-bit requires replicating not just MT19937 (which is
+//! portable) but the **implementation-defined** libstdc++ pieces:
 //!   * `std::uniform_int_distribution<unsigned int>::operator()` — Lemire's
-//!     nearly-divisionless downscaling (`_S_nd`, uniform_int_dist.h:251-281,288+).
+//!     nearly-divisionless downscaling (`_S_nd`).
 //!   * `std::uniform_real_distribution<float>::operator()` — `__generate_canonical`
-//!     with `float` precision (random.h:1902-1910, random.tcc:3346-3381).
+//!     with `float` precision.
 //!   * `std::sample` over `std::vector<int>` (random-access pop) into a
 //!     `back_insert_iterator` (output samp) → the **selection-sampling** overload
-//!     `__sample(.., forward_iterator_tag, .., _Cat, ..)` (stl_algo.h:5841-5907)
-//!     with the `__gen_two_uniform_ints` fast path (stl_algo.h:3717-3725).
+//!     with the `__gen_two_uniform_ints` fast path.
 //!
-//! All algorithm choices below were read out of the **system libstdc++ 13.3.0**
-//! headers that build this tree (`/usr/include/c++/13/bits/{random.tcc,
-//! uniform_int_dist.h,random.h,stl_algo.h}`) and cross-checked against a C++
-//! golden dump (seed 15052011); the dumped constants are baked into the tests.
+//! All algorithm choices below match the **system libstdc++ 13.3.0** behaviour
+//! and are cross-checked against a reference output dump (seed 15052011); the
+//! dumped constants are baked into the tests.
 //!
 //! PLATFORM NOTE (load-bearing): on x86-64 Linux `std::mt19937::result_type` is
 //! `uint_fast32_t` == **64-bit**, but `min()=0`, `max()=2^32-1`. So:
@@ -28,9 +25,6 @@
 //!   * `generate_canonical<float,24>` computes `__m = 1` (one engine draw),
 //!     `__r = 2^32`, result `= float(g()) / 2^32` clamped below 1.
 //! These are the gate's risk points — see `report` at bottom and the unknowns.
-//!
-//! cpp refs use `random_number.h:NN` for GLIMPSE2's wrapper and
-//! `random.tcc:NN` / `uniform_int_dist.h:NN` / `stl_algo.h:NN` for libstdc++.
 
 use crate::sparse_ls::haplotype_set::Rng as RngTrait;
 
@@ -56,10 +50,10 @@ const TEMPER_T: u32 = 15;
 const TEMPER_C: u32 = 0xefc6_0000;
 const TEMPER_L: u32 = 18;
 
-/// The default GLIMPSE2 seed (`random_number.h:46`: `_seed = 15052011`).
+/// The default GLIMPSE2 seed (`_seed = 15052011`).
 pub const DEFAULT_SEED: u32 = 15_052_011;
 
-/// Verbatim `std::mt19937`.
+/// Faithful `std::mt19937`.
 #[derive(Clone)]
 pub struct Mt19937 {
     mt: [u32; N],
@@ -68,14 +62,14 @@ pub struct Mt19937 {
 }
 
 impl Mt19937 {
-    /// `mersenne_twister_engine::seed(result_type)` — random.tcc:325-343.
+    /// `mersenne_twister_engine::seed(result_type)`.
     pub fn new(seed: u32) -> Self {
         let mut e = Mt19937 { mt: [0u32; N], p: N };
         e.seed(seed);
         e
     }
 
-    /// `seed(result_type __sd)` — random.tcc:328-343.
+    /// `seed(result_type __sd)`.
     pub fn seed(&mut self, sd: u32) {
         // _M_x[0] = mod_2^32(sd)
         self.mt[0] = sd;
@@ -90,7 +84,7 @@ impl Mt19937 {
         self.p = N; // _M_p = state_size
     }
 
-    /// `_M_gen_rand()` — the twist, random.tcc:396-425.
+    /// `_M_gen_rand()` — the twist.
     #[inline]
     fn gen_rand(&mut self) {
         // for k in 0..(n-m)
@@ -110,8 +104,8 @@ impl Mt19937 {
         self.p = 0;
     }
 
-    /// `operator()()` — reload-then-temper, random.tcc:455-469. Returns the raw
-    /// 32-bit engine output (held in a `u64` upstream, but always `<= 2^32-1`).
+    /// `operator()()` — reload-then-temper. Returns the raw 32-bit engine output
+    /// (held in a `u64` upstream, but always `<= 2^32-1`).
     #[inline]
     pub fn next_u32(&mut self) -> u32 {
         if self.p >= N {
@@ -140,17 +134,16 @@ const URNG_MAX: u64 = u32::MAX as u64; // 0xFFFFFFFF
 const URNG_RANGE: u64 = URNG_MAX - URNG_MIN; // 0xFFFFFFFF == __UINT32_MAX__
 
 // ---------------------------------------------------------------------------
-// std::uniform_int_distribution<unsigned int>  (Lemire's _S_nd downscaling)
-// uniform_int_dist.h:251-281 (_S_nd) and 283-373 (operator()).
+// std::uniform_int_distribution<unsigned int>  (Lemire's _S_nd downscaling).
 //
-// GLIMPSE2 getInt(imin,imax) (random_number.h:65-67) constructs the dist over
-// `unsigned int` and calls operator() with param {imin,imax}. With
-// __urngrange == __UINT32_MAX__ and __urange < __urngrange this is exactly
-// `_S_nd<uint64_t>(g, u32_erange)` (uniform_int_dist.h:332-337). u32 product-low.
+// getInt(imin,imax) constructs the dist over `unsigned int` and calls operator()
+// with param {imin,imax}. With __urngrange == __UINT32_MAX__ and
+// __urange < __urngrange this is exactly `_S_nd<uint64_t>(g, u32_erange)`.
+// u32 product-low.
 // ---------------------------------------------------------------------------
 
-/// `_S_nd<_Wp=u64, _Up=u32>(g, range)` — Lemire nearly-divisionless
-/// (uniform_int_dist.h:251-281). `range` is the *count* of values (uerange).
+/// `_S_nd<_Wp=u64, _Up=u32>(g, range)` — Lemire nearly-divisionless.
+/// `range` is the *count* of values (uerange).
 #[inline]
 fn lemire_u32(g: &mut Mt19937, range: u32) -> u32 {
     // _Wp __product = _Wp(g()) * _Wp(range);
@@ -169,12 +162,12 @@ fn lemire_u32(g: &mut Mt19937, range: u32) -> u32 {
     (product >> 32) as u32
 }
 
-/// `std::uniform_int_distribution<unsigned int>` operator() for the GLIMPSE2 case
-/// (uniform_int_dist.h:288-373). Inclusive `[imin, imax]`. Only the branches that
-/// can occur with mt19937 (urngrange == 2^32-1) and the small ranges GLIMPSE2
-/// uses (always `__urngrange > __urange`, i.e. downscaling) are exercised; the
-/// up-scaling / equal branches and the >2^32 ranges are unreachable here but are
-/// implemented for completeness (see `uniform_int_full`).
+/// `std::uniform_int_distribution<unsigned int>` operator() for the GLIMPSE2 case.
+/// Inclusive `[imin, imax]`. Only the branches that can occur with mt19937
+/// (urngrange == 2^32-1) and the small ranges in use (always
+/// `__urngrange > __urange`, i.e. downscaling) are exercised; the up-scaling /
+/// equal branches and the >2^32 ranges are unreachable here but are implemented
+/// for completeness (see `uniform_int_full`).
 #[inline]
 pub fn uniform_int(g: &mut Mt19937, imin: u32, imax: u32) -> u32 {
     debug_assert!(imax >= imin);
@@ -186,18 +179,18 @@ pub fn uniform_int(g: &mut Mt19937, imin: u32, imax: u32) -> u32 {
         // __urngrange == __UINT32_MAX__ -> _S_nd<uint64_t>(g, u32 erange)
         imin + lemire_u32(g, uerange as u32)
     } else if URNG_RANGE < (urange as u64) {
-        // up-scaling (uniform_int_dist.h:347-368). Unreachable for u32 dist.
+        // up-scaling. Unreachable for u32 dist.
         uniform_int_upscale(g, imin, urange as u64) as u32
     } else {
-        // __urngrange == __urange -> direct (uniform_int_dist.h:369-370).
+        // __urngrange == __urange -> direct.
         imin + ((g.next_u64() - URNG_MIN) as u32)
     }
 }
 
 /// `std::uniform_int_distribution<i64>` operator() over a range that may exceed
 /// `__urngrange`. Used by `std::sample`'s `__gen_two_uniform_ints` and per-element
-/// fallback. Returns a value in `[0, urange]`. (uniform_int_dist.h:288-373 with
-/// _IntType = ptrdiff_t -> __uctype = u64.)
+/// fallback. Returns a value in `[0, urange]` (with _IntType = ptrdiff_t ->
+/// __uctype = u64).
 #[inline]
 fn uniform_int_i64(g: &mut Mt19937, urange: u64) -> u64 {
     if URNG_RANGE > urange {
@@ -212,8 +205,8 @@ fn uniform_int_i64(g: &mut Mt19937, urange: u64) -> u64 {
     }
 }
 
-/// Up-scaling branch of `uniform_int_distribution::operator()`
-/// (uniform_int_dist.h:347-368): compose `(urngrange+1)*high + low` with rejection.
+/// Up-scaling branch of `uniform_int_distribution::operator()`:
+/// compose `(urngrange+1)*high + low` with rejection.
 /// Recursive in C++; here we recurse via `uniform_int_i64` on the reduced range.
 fn uniform_int_upscale(g: &mut Mt19937, a: u32, urange: u64) -> u64 {
     let uerngrange = URNG_RANGE + 1;
@@ -235,9 +228,7 @@ pub fn uniform_int_full(g: &mut Mt19937, imin: u32, imax: u32) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// std::uniform_real_distribution<float>  (generate_canonical<float,24>)
-// random.h:1902-1910 (operator()) + _Adaptor (random.h:166-199) +
-// generate_canonical (random.tcc:3346-3381).
+// std::uniform_real_distribution<float>  (generate_canonical<float,24>).
 //
 // For mt19937 + float: __b=min(24,24)=24; __r=2^32; __log2r=32; __m=1; so
 //   canonical = float( g() - min ) / float(2^32)   (one engine draw)
@@ -249,7 +240,7 @@ pub fn uniform_int_full(g: &mut Mt19937, imin: u32, imax: u32) -> u32 {
 
 const TWO_POW_32_F32: f32 = 4_294_967_296.0; // 2^32, exactly representable in f32
 
-/// `generate_canonical<float, 24, mt19937>` (random.tcc:3346-3381).
+/// `generate_canonical<float, 24, mt19937>`.
 #[inline]
 fn generate_canonical_f32(g: &mut Mt19937) -> f32 {
     // __m == 1: single iteration -> sum = float(g() - min) * 1.0; tmp = 1.0 * r.
@@ -263,8 +254,8 @@ fn generate_canonical_f32(g: &mut Mt19937) -> f32 {
     ret
 }
 
-/// `std::uniform_real_distribution<float>(fmin,fmax)(g)` (random.h:1902-1910).
-/// GLIMPSE2 `getFloat(fmin,fmax)` returns this (note: its declared return type is
+/// `std::uniform_real_distribution<float>(fmin,fmax)(g)`.
+/// `getFloat(fmin,fmax)` returns this (note: its declared return type is
 /// `double`, but the value is computed in `float` then widened — for (0,1) the
 /// float bit pattern IS the gate; we return f32 and let callers widen as needed).
 #[inline]
@@ -273,18 +264,17 @@ pub fn uniform_real_f32(g: &mut Mt19937, fmin: f32, fmax: f32) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// std::sample — selection-sampling overload (stl_algo.h:5841-5907) with
-// __gen_two_uniform_ints fast path (stl_algo.h:3717-3725).
+// std::sample — selection-sampling overload with __gen_two_uniform_ints fast path.
 //
-// GLIMPSE2 (haplotype_set.cpp:807/818/826) calls
+// The model calls
 //   std::sample(vec<int>.begin(), .end(), back_inserter(out), n, engine)
 // pop = random-access (forward), samp = output_iterator -> selection sampling.
 // _Size = ptrdiff_t (signed 64); _USize = u64; emits in INPUT order (ascending
 // positions for an iota population). We return the chosen 0-based POSITIONS so
-// the caller can index whatever container it sampled (PORT_SPEC Rng::sample_indices).
+// the caller can index whatever container it sampled (Rng::sample_indices).
 // ---------------------------------------------------------------------------
 
-/// `__gen_two_uniform_ints(b0, b1, g)` (stl_algo.h:3717-3725):
+/// `__gen_two_uniform_ints(b0, b1, g)`:
 /// `x = uniform_int<i64>{0, b0*b1 - 1}(g); return (x / b1, x % b1)`.
 #[inline]
 fn gen_two_uniform_ints(g: &mut Mt19937, b0: u64, b1: u64) -> (u64, u64) {
@@ -294,8 +284,8 @@ fn gen_two_uniform_ints(g: &mut Mt19937, b0: u64, b1: u64) -> (u64, u64) {
 }
 
 /// Selection-sampling `std::sample` returning the chosen POSITIONS in `0..pool_len`
-/// in ascending order (stl_algo.h:5841-5907). Deterministic; advances `g` exactly
-/// as libstdc++ does (gate-critical: the RNG-state advance must match).
+/// in ascending order. Deterministic; advances `g` exactly as libstdc++ does
+/// (gate-critical: the RNG-state advance must match).
 pub fn sample_positions(g: &mut Mt19937, pool_len: usize, n: usize) -> Vec<usize> {
     // if (__first == __last) return; -> empty pool.
     if pool_len == 0 {
@@ -346,14 +336,13 @@ pub fn sample_positions(g: &mut Mt19937, pool_len: usize, n: usize) -> Vec<usize
 }
 
 // ---------------------------------------------------------------------------
-// The GLIMPSE2 wrapper (random_number_generator) + adapters.
+// The GLIMPSE2 random_number_generator + adapters.
 // ---------------------------------------------------------------------------
 
-/// Verbatim `random_number_generator` (random_number.h:35-125): an `std::mt19937`
-/// + the distribution methods GLIMPSE2 actually calls. The distribution *objects*
-/// it stores (`uniformDistributionInt(0,32768)` etc.) are stateless for the way
-/// GLIMPSE2 uses them (always called with an explicit per-call `param()`), so we
-/// keep only the engine.
+/// Faithful `random_number_generator`: an `std::mt19937` + the distribution methods
+/// the GLIMPSE2 model actually calls. The distribution *objects* it stores
+/// (`uniformDistributionInt(0,32768)` etc.) are stateless for the way they are used
+/// (always called with an explicit per-call `param()`), so we keep only the engine.
 #[derive(Clone)]
 pub struct Mt19937Rng {
     pub engine: Mt19937,
@@ -361,55 +350,55 @@ pub struct Mt19937Rng {
 }
 
 impl Mt19937Rng {
-    /// `random_number_generator(_seed = 15052011)` (random_number.h:46).
+    /// `random_number_generator(_seed = 15052011)`.
     pub fn new(seed: u32) -> Self {
         Mt19937Rng { engine: Mt19937::new(seed), seed }
     }
 
-    /// Default-seeded (15052011), as GLIMPSE2 does before `caller_initialise.cpp:46`
-    /// overrides with `--seed` (default also 15052011).
+    /// Default-seeded (15052011), as the GLIMPSE2 model does before `--seed`
+    /// overrides it (default also 15052011).
     pub fn default_seeded() -> Self {
         Mt19937Rng::new(DEFAULT_SEED)
     }
 
-    /// `setSeed(_seed)` (random_number.h:52-55).
+    /// `setSeed(_seed)`.
     pub fn set_seed(&mut self, seed: u32) {
         self.seed = seed;
         self.engine.seed(seed);
     }
 
-    /// `getSeed()` (random_number.h:57-59).
+    /// `getSeed()`.
     pub fn get_seed(&self) -> u32 {
         self.seed
     }
 
-    /// `getInt(imin, imax)` (random_number.h:65-67) — inclusive both ends.
+    /// `getInt(imin, imax)` — inclusive both ends.
     #[inline]
     pub fn get_int_u(&mut self, imin: u32, imax: u32) -> u32 {
         uniform_int(&mut self.engine, imin, imax)
     }
 
-    /// `getInt(isize)` (random_number.h:69-71) -> getInt(0, isize-1).
+    /// `getInt(isize)` -> getInt(0, isize-1).
     #[inline]
     pub fn get_int_size(&mut self, isize: u32) -> u32 {
         self.get_int_u(0, isize - 1)
     }
 
-    /// `getFloat(fmin=0, fmax=1)` (random_number.h:73-75). Returns the f32 the
-    /// `<float>` distribution produced (GLIMPSE2 widens to double; the gate is the
-    /// f32 value). Use this as the `&mut impl FnMut() -> f32` for the phasing HMM.
+    /// `getFloat(fmin=0, fmax=1)`. Returns the f32 the `<float>` distribution
+    /// produced (the model widens to double; the gate is the f32 value). Use this
+    /// as the `&mut impl FnMut() -> f32` for the phasing HMM.
     #[inline]
     pub fn get_float(&mut self) -> f32 {
         uniform_real_f32(&mut self.engine, 0.0f32, 1.0f32)
     }
 
-    /// `getFloat(fmin, fmax)` (random_number.h:73-75) — explicit bounds form.
+    /// `getFloat(fmin, fmax)` — explicit bounds form.
     #[inline]
     pub fn get_float_range(&mut self, fmin: f32, fmax: f32) -> f32 {
         uniform_real_f32(&mut self.engine, fmin, fmax)
     }
 
-    /// `int sample(std::vector<float>& vec, float sum)` (random_number.h:89-97):
+    /// `int sample(std::vector<float>& vec, float sum)`:
     /// `csum=vec[0]; u=getFloat()*sum; for i in 0..len-1 {if u<=csum return i; csum+=vec[i+1]} return len-1`.
     /// Used by phasing_hmm for `dip_sampled` (DProbs is an 8-float vector).
     #[inline]
@@ -428,8 +417,8 @@ impl Mt19937Rng {
 }
 
 /// Adapter: drive the phasing HMM's `&mut impl FnMut() -> f32` closure from the
-/// MT19937 stream. (PORT_SPEC: "get_float(&mut self)->f32 usable as the
-/// phasing_hmm `&mut impl FnMut()->f32` closure".) Example:
+/// MT19937 stream. `get_float(&mut self) -> f32` is usable directly as the phasing
+/// HMM's `&mut impl FnMut() -> f32` closure. Example:
 /// `let mut rng = Mt19937Rng::default_seeded(); let mut draw = rng.float_closure();`
 impl Mt19937Rng {
     /// Returns a closure that yields `getFloat()` on each call, borrowing `self`.
@@ -440,12 +429,12 @@ impl Mt19937Rng {
 
 /// The `haplotype_set::Rng` trait adapter (get_int + sample_indices).
 ///
-/// `get_int(imin, imax)` is GLIMPSE2 `rng.getInt` (inclusive). The trait signs the
-/// bounds as `i32` (GLIMPSE2's callers pass non-negative values:
-/// `getInt(loffset, pbwt_grp[idx]-1)` and `getInt(0, n_ref_haps-1)`), so we route
-/// through the `u32` distribution. `sample_indices` IS `std::sample`'s
-/// selection-sampling, returning ascending positions (matches the trait contract
-/// AND libstdc++'s input-order guarantee for an iota population).
+/// `get_int(imin, imax)` is `rng.getInt` (inclusive). The trait signs the bounds as
+/// `i32` (callers pass non-negative values: `getInt(loffset, pbwt_grp[idx]-1)` and
+/// `getInt(0, n_ref_haps-1)`), so we route through the `u32` distribution.
+/// `sample_indices` IS `std::sample`'s selection-sampling, returning ascending
+/// positions (matches the trait contract AND libstdc++'s input-order guarantee for
+/// an iota population).
 impl RngTrait for Mt19937Rng {
     #[inline]
     fn get_int(&mut self, imin: i32, imax: i32) -> i32 {
@@ -467,14 +456,14 @@ impl RngTrait for Mt19937Rng {
 
 // ===========================================================================
 // TESTS — gate constants are the FIRST 20 outputs of each primitive for seed
-// 15052011, dumped from a C++ harness linking the system libstdc++ 13.3.0 (the
-// same toolchain that builds GLIMPSE2 here). A tiny C++ harness can diff these.
+// 15052011, taken from a reference dump produced against the system
+// libstdc++ 13.3.0 (the same toolchain that builds the GLIMPSE2 model here).
 // ===========================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// mt19937.next_u32() #0..19, seed 15052011 (C++ golden).
+    /// mt19937.next_u32() #0..19, seed 15052011 (reference golden).
     const GOLDEN_NEXT_U32: [u32; 20] = [
         0x937164e8, 0x074c2c18, 0x7dec7c65, 0x02657fb8, 0x75eef4f0, 0x3363590b, 0xf9d91cb8,
         0x94c24b06, 0x5fe3a4a8, 0xa35c3932, 0x5fdd7db7, 0xf7f03410, 0xc7ee31a1, 0x49c9e59b,
@@ -488,11 +477,11 @@ mod tests {
         0x3d0247e7, 0x3f28ac97, 0x3f2cce2a, 0x3e5654fd, 0x3e900c4b, 0x3dea0d66,
     ];
 
-    /// getInt(0,9) #0..19, seed 15052011 (C++ golden).
+    /// getInt(0,9) #0..19, seed 15052011 (reference golden).
     const GOLDEN_INT_0_9: [u32; 20] =
         [5, 0, 4, 0, 4, 2, 9, 5, 3, 6, 3, 9, 7, 2, 0, 6, 6, 2, 2, 1];
 
-    /// getInt(0,99999) #0..19, seed 15052011 (C++ golden).
+    /// getInt(0,99999) #0..19, seed 15052011 (reference golden).
     const GOLDEN_INT_0_99999: [u32; 20] = [
         57594, 2850, 49188, 936, 46067, 20073, 97596, 58108, 37456, 63812, 37447, 96850, 78097,
         28823, 3180, 65888, 67502, 20930, 28134, 11428,
@@ -532,7 +521,7 @@ mod tests {
         }
     }
 
-    /// std::sample(iota(20), 5) over the SAME engine: C++ golden = [2,6,7,11,19].
+    /// std::sample(iota(20), 5) over the SAME engine: reference golden = [2,6,7,11,19].
     #[test]
     fn sample_positions_iota20_5() {
         let mut e = Mt19937::new(DEFAULT_SEED);
@@ -540,8 +529,8 @@ mod tests {
         assert_eq!(picks, vec![2, 6, 7, 11, 19]);
     }
 
-    /// std::sample over a len-10 population, n=4: C++ golden positions = [2,3,6,7]
-    /// (the C++ harness sampled VALUES [17,24,45,52] from values[i]=i*7+3, i.e.
+    /// std::sample over a len-10 population, n=4: reference golden positions = [2,3,6,7]
+    /// (the reference sampled VALUES [17,24,45,52] from values[i]=i*7+3, i.e.
     /// positions 2,3,6,7). We return positions.
     #[test]
     fn sample_positions_len10_4() {
@@ -551,7 +540,7 @@ mod tests {
         assert_eq!(picks, vec![2, 3, 6, 7]);
     }
 
-    /// rng.sample(vec<float>, sum) — the DProbs path. C++ golden first 10 picks
+    /// rng.sample(vec<float>, sum) — the DProbs path. Reference golden first 10 picks
     /// over vec=[.1,.2,.05,.15,.3,.05,.1,.05] (sum=1.0): [4,0,3,0,3,1,7,4,3,4].
     #[test]
     fn sample_weighted_dprobs() {

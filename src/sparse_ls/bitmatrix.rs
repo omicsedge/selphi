@@ -1,8 +1,8 @@
-//! Faithful reimplementation of GLIMPSE2 `bitmatrix.h` (containers/bitmatrix.h:88-110).
+//! Bit matrix backing the GLIMPSE2 model's haplotype storage.
 //!
 //! Row-major bit matrix, `n_cols/8` bytes per row, **MSB-first** within a byte.
 //! `allocate`/`reallocate` round BOTH `n_rows` and `n_cols` up to a multiple of 8.
-//! `reallocate` does NOT zero new bytes (matches the C++; callers overwrite).
+//! `reallocate` does NOT zero new bytes; callers always overwrite rows before reading.
 
 #[derive(Clone, Default)]
 pub struct BitMatrix {
@@ -25,7 +25,7 @@ impl BitMatrix {
         BitMatrix::default()
     }
 
-    /// Allocate (rounds dims up to ×8) and ZERO. GLIMPSE2 `allocate`.
+    /// Allocate (rounds dims up to ×8) and ZERO the backing store.
     pub fn allocate(&mut self, n_rows: usize, n_cols: usize) {
         self.n_rows = round8(n_rows);
         self.n_cols = round8(n_cols);
@@ -35,17 +35,17 @@ impl BitMatrix {
         self.bytes.resize(n, 0);
     }
 
-    /// Resize the backing store WITHOUT zeroing new bytes. GLIMPSE2 `reallocate`.
+    /// Resize the backing store WITHOUT zeroing new bytes.
     pub fn reallocate(&mut self, n_rows: usize, n_cols: usize) {
         self.n_rows = round8(n_rows);
         self.n_cols = round8(n_cols);
         self.n_bytes_per_row = self.n_cols >> 3;
         let n = self.n_rows * self.n_bytes_per_row;
         if self.bytes.len() < n {
-            // grow without zeroing the prefix; new tail is unspecified (as in C++).
+            // grow without zeroing the prefix; new tail is logically unspecified.
             self.bytes.reserve(n - self.bytes.len());
-            // SAFETY mirror of C++ realloc semantics: expose uninitialized tail as 0
-            // is NOT done by GLIMPSE2; we resize but callers always set rows before read.
+            // The tail is not semantically initialized; callers always set rows
+            // before reading them, so we simply resize the backing store.
             self.bytes.resize(n, 0);
         } else {
             self.bytes.truncate(n);
@@ -69,7 +69,7 @@ impl BitMatrix {
         }
     }
 
-    /// Set an entire row to `b` (GLIMPSE2 `setRow`: memset to b*255).
+    /// Set an entire row to `b` (fills every byte of the row with `b*255`).
     #[inline]
     pub fn set_row(&mut self, r: usize, b: bool) {
         let base = r * self.n_bytes_per_row;
@@ -79,7 +79,7 @@ impl BitMatrix {
         }
     }
 
-    /// Raw byte holding column `c` of row `r` (GLIMPSE2 `getByte`).
+    /// Raw byte holding column `c` of row `r`.
     #[inline]
     pub fn get_byte(&self, r: usize, c: usize) -> u8 {
         self.bytes[r * self.n_bytes_per_row + (c >> 3)]
