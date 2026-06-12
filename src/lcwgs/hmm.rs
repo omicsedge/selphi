@@ -181,29 +181,28 @@ fn adapt_emit_pow() -> Option<f32> {
     })
 }
 
-/// Li-Stephens transition rate scale (cM⁻¹). Default = Selphi's `0.04·Ne/K`
-/// (K-dependent: more conditioning states → less recombination per state).
-/// `LCWGS_GLIMPSE_RECOMB=1` switches to GLIMPSE2's K-INDEPENDENT form
-/// `0.04·Ne/max(n_ref, Ne)` (conditioning_set.cpp:34) — with the default
-/// Ne=100000 ≥ n_ref this is ≈0.04 cM⁻¹, ~33× less recombination than Selphi's
-/// 1.33 at K≈3000, i.e. a much stickier copy (a carrier, once copied at a
-/// flanking common site, stays copied across the rare site). Cached.
+/// Li-Stephens transition rate scale (cM⁻¹). DEFAULT = GLIMPSE2's K-INDEPENDENT
+/// form `0.04·Ne/max(n_ref, Ne)` (conditioning_set.cpp:34) — with the default
+/// Ne=100000 ≥ n_ref this is ≈0.04 cM⁻¹, a sticky copy (a carrier, once copied at
+/// a flanking common site, stays copied across the rare site). The alternative
+/// K-DEPENDENT form `0.04·Ne/K` (more conditioning states → less recombination per
+/// state) is available via `LCWGS_KDEP_RECOMB=1`. Cached; speed/memory-neutral.
 ///
-/// ADAPTIVE (default): pick the form by PANEL-vs-CAP regime. The K-dependent form
-/// is tuned for small/panel-matched panels (cond set ≈ panel); on a LARGE panel the
-/// conditioning set is capped at `kpbwt` ≪ `n_ref`, so `0.04·Ne/K` blows up (K≈3000,
-/// n_ref≈75552 → ~1.33, a 33× too-recombinant / unsticky copy that misses the real
-/// long IBD matches a big diverse panel offers). When `n_ref > 4·kpbwt` (big-panel
-/// regime) switch to GLIMPSE2's K-INDEPENDENT `0.04·Ne/max(n_ref,Ne)` (≈0.04, sticky).
-/// MEASURED (chr22, HG002 1×): big 75552-hap panel OVERALL 0.9688→0.9773 (+0.0085,
-/// closes ~77% of the residual to --glimpse2-exact 0.9800); panel-matched r12 is
-/// NEUTRAL because n_ref=4478 ≤ 4·kpbwt → keeps the K-dependent 0.9524 (forcing
-/// K-independent there would cost −0.0025, the prior small-panel negative). Force
-/// either form with `LCWGS_GLIMPSE_RECOMB=1` (always K-indep) / `LCWGS_KDEP_RECOMB=1`
-/// (always K-dep). Cached; speed/memory-neutral (recomb precompute only).
-fn recomb_scale(ne: f32, k: usize, n_ref: usize, kpbwt: usize) -> f64 {
+/// HISTORY: the engine previously defaulted to an ADAPTIVE rule — K-independent only
+/// for big panels (`n_ref > 4·kpbwt`), K-dependent for small/panel-matched panels —
+/// because on SIMULATED panel-matched r12 the K-independent form measured −0.0025.
+/// That simulated signal did NOT transfer to real reads. On REAL GIAB low-coverage
+/// (HG002/HG003/HG004, ~1.8× chr22, 4478-hap panel) the K-dependent form was the
+/// whole real-data accuracy gap: K-independent lifts per-sample R² 0.9141→0.9185
+/// (HG002), 0.9148→0.9185 (HG003), 0.9078→0.9183 (HG004), beating GLIMPSE2
+/// (0.9171/0.9177/0.9116) on all three AND the --glimpse2-exact port, at the fast
+/// default speed. So K-independent is now the unconditional default. (Big panels
+/// were already K-independent under the old adaptive rule, so this only changes the
+/// panel-matched regime — for the better, on real data.) `LCWGS_GLIMPSE_RECOMB=1`
+/// also forces K-indep (now redundant); `LCWGS_KDEP_RECOMB=1` restores the old K-dep.
+fn recomb_scale(ne: f32, k: usize, n_ref: usize, _kpbwt: usize) -> f64 {
     use std::sync::OnceLock;
-    // 0 = adaptive (default), 1 = force K-independent, 2 = force K-dependent.
+    // 0 = K-independent (default), 1 = force K-independent, 2 = force K-dependent.
     static MODE: OnceLock<u8> = OnceLock::new();
     let mode = *MODE.get_or_init(|| {
         if crate::config::present("LCWGS_GLIMPSE_RECOMB") {
@@ -215,9 +214,8 @@ fn recomb_scale(ne: f32, k: usize, n_ref: usize, kpbwt: usize) -> f64 {
         }
     });
     let kindep = match mode {
-        1 => true,
-        2 => false,
-        _ => kpbwt > 0 && n_ref > 4 * kpbwt,
+        2 => false,           // K-dependent (uses `k` below); old small-panel form
+        _ => true,            // default + explicit LCWGS_GLIMPSE_RECOMB: K-independent
     };
     if kindep {
         0.04f64 * (ne as f64) / (n_ref.max(ne as usize) as f64)
