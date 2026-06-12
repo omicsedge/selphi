@@ -387,6 +387,7 @@ pub fn run_gibbs(
     n_samples: usize,
     params: &LcwgsParams,
     k_max_override: Option<usize>,
+    precomputed_cond: Option<&Vec<Vec<u32>>>,
 ) -> GibbsOutput {
     let n_var = cm.len();
     let n_target_haps = n_samples * 2;
@@ -445,7 +446,7 @@ pub fn run_gibbs(
     // Faithful GLIMPSE2 compressed-sparse-PBWT selection (LCWGS_FAITHFUL_SELECT,
     // default OFF). Built ONCE per chunk from the same ref_bm + cm + gl3 the
     // hybrid uses; drives the GLIMPSE2 per-individual selection each refresh.
-    let mut faithful: Option<super::faithful_select::FaithfulSelector> = if cfg.faithful_select {
+    let mut faithful: Option<super::faithful_select::FaithfulSelector> = if cfg.faithful_select && precomputed_cond.is_none() {
         Some(super::faithful_select::FaithfulSelector::build(
             ref_bm, cm, gl3, n_samples, params, seed,
         ))
@@ -565,7 +566,14 @@ pub fn run_gibbs(
         let recompute = it == 0 || it == n_burnin || it % refresh == 0;
         let t0 = if timing { Some(std::time::Instant::now()) } else { None };
         let base_cond: &Vec<Vec<u32>> = {
-            if let Some(fsel) = faithful.as_mut() {
+            if let Some(pc) = precomputed_cond {
+                // CHROMOSOME-WIDE selection (LCWGS_CHRWIDE_PBWT): the conditioning
+                // set was selected ONCE over the whole chromosome's common-site
+                // scaffold (long-range IBD), so it is fixed across chunks AND
+                // iterations. Global panel-hap indices == chunk-local (chunk_bm
+                // keeps all haps). Copy once; rare-carrier aug below still applies.
+                if it == 0 { cond_cache = pc.clone(); }
+            } else if let Some(fsel) = faithful.as_mut() {
                 // FAITHFUL GLIMPSE2 selection: re-run EVERY iteration (GLIMPSE2
                 // re-selects per iteration), feeding it the hybrid's current
                 // sampled haps. Produces the SAME Vec<Vec<u32>> shape (per target
@@ -963,6 +971,46 @@ fn build_poly_skip_structures(
     (is_common, shap_ref)
 }
 
+/// Chromosome-wide conditioning-set selection (`LCWGS_CHRWIDE_PBWT`).
+///
+/// Cross-pollination from the genotype engine's signature chromosome-wide PBWT:
+/// instead of re-selecting the conditioning set per cM chunk (chunk-local, like
+/// GLIMPSE2), select it ONCE over the WHOLE chromosome's common-site scaffold so
+/// each target hap conditions on the panel haps that share the longest-range IBD
+/// — the carriers most likely to also carry the target's rare alleles. The
+/// resulting per-target-hap list of GLOBAL panel-hap indices is then fixed across
+/// all chunks (chunk_bm keeps every hap, so global == chunk-local). Pairs with the
+/// K-independent ("sticky") recombination default: sticky copy keeps a long-range
+/// carrier copied through read-less rare sites, and this gives it better carriers
+/// to copy. Measured (real GIAB 1×, one-chunk probe): rare 0-0.5% +0.01 on 3/3.
+///
+/// `gl3`/`ref_bm`/`cm` are the WHOLE-chromosome common-site scaffold (built by the
+/// caller). Seeds a hard-call scaffold from the marginal MAP, then runs the same
+/// faithful GLIMPSE2 selector (or the divergence PBWT under LCWGS_NO_FAITHFUL_SELECT)
+/// chromosome-wide. Returns `Vec<Vec<u32>>` indexed by target hap.
+pub fn select_chrwide_cond(
+    gl3: &[f32],
+    ref_bm: &HaplotypeBitmatrix,
+    cm: &[f64],
+    n_samples: usize,
+    params: &LcwgsParams,
+) -> Vec<Vec<u32>> {
+    let n_var = cm.len();
+    let seed = params.seed_or_default();
+    let scaffold = init_hap_alleles(gl3, ref_bm, n_samples, n_var, seed);
+    if !crate::config::present("LCWGS_NO_FAITHFUL_SELECT") {
+        let mut fsel =
+            super::faithful_select::FaithfulSelector::build(ref_bm, cm, gl3, n_samples, params, seed);
+        fsel.select(&scaffold)
+    } else {
+        let sel_idx: Vec<usize> = (0..n_var).collect();
+        select_conditioning_haps(
+            &scaffold, ref_bm, cm, n_samples * 2,
+            params.kpbwt, params.pbwt_modulo_cm, params.pbwt_depth, &sel_idx,
+        )
+    }
+}
+
 /// Initialize per-hap sampled alleles from the marginal genotype MAP.
 /// For genotype MAP g: 0→(0,0), 2→(1,1), 1→(0,1). Ambiguous (flat GL)
 /// sites are seeded from a random panel hap so the first PBWT has signal.
@@ -1041,7 +1089,7 @@ mod tests {
         params.n_main_iterations = 1;
         params.kpbwt = 3;
         params.pbwt_modulo_cm = 0.001;
-        let out = run_gibbs(&gl3, &bm, &cm, n_samples, &params, None);
+        let out = run_gibbs(&gl3, &bm, &cm, n_samples, &params, None, None);
         assert_eq!(out.dosage.len(), n_var * n_samples);
         for &d in &out.dosage {
             assert!((0.0..=2.0).contains(&d), "dose {} out of range", d);
