@@ -58,7 +58,7 @@ static KNOBS: &[Knob] = &[
     Knob { name: "LCWGS_EPSILON", group: "lcwgs", kind: Kind::Value, default_repr: "0.000000000001", user_facing: false, doc: "Imputation HMM emission error rate (ee=1-eps match, ed=eps mismatch); GLIMPSE2 err-imp default 1e-12. envf.unwrap_or(1e-12). Internal calibration knob." },
     Knob { name: "LCWGS_G2_FLAT_EXACT", group: "lcwgs", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "GLIMPSE2-exact flat rule: a site is flat iff its GL triple is all-equal. is_ok(); default off." },
     Knob { name: "LCWGS_G2_RICH_COND", group: "lcwgs", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "Phasing-HMM conditioning uses the union of both haps' conditioning sets. is_ok(); default off." },
-    Knob { name: "LCWGS_GLIMPSE_RECOMB", group: "lcwgs", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "Force K-INDEPENDENT Li-Stephens recomb 0.04*Ne/max(n_ref,Ne) (GLIMPSE2 form). is_ok() → MODE=1; unset = adaptive selector. Cached. Higher precedence than LCWGS_KDEP_RECOMB." },
+    Knob { name: "LCWGS_GLIMPSE_RECOMB", group: "lcwgs", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "Force K-INDEPENDENT Li-Stephens recomb 0.04*Ne/max(n_ref,Ne) (GLIMPSE2 form). is_ok() → MODE=1; now redundant since K-independent is the unconditional default (use LCWGS_KDEP_RECOMB to force the old K-dependent form). Cached." },
     Knob { name: "LCWGS_GS_MAIN", group: "lcwgs", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "Standalone Gauss-Seidel within-sample diploid sweep during main iters (also forced on when DMM is on). Raw var opt-in is_ok(); measured-negative alone. EFFECTIVE gs_main is ON by default because dm..." },
     Knob { name: "LCWGS_INDEL_FLANK", group: "lcwgs", kind: Kind::Value, default_repr: "25", user_facing: false, doc: "Reference flank (bp) around each indel for building local haplotypes. envu(i64 parser).max(1).unwrap_or(25), cast usize; floored at 1. Read inside IndelModel::build." },
     Knob { name: "LCWGS_INDEL_GAP_EXT", group: "lcwgs", kind: Kind::Value, default_repr: "10", user_facing: false, doc: "Pair-HMM indel gap-extension Phred. ⚠ parsed via i64 envu helper then cast f64 (registry kind u32 is logical; underlying parse is i64). unwrap_or(10)." },
@@ -75,6 +75,7 @@ static KNOBS: &[Knob] = &[
     Knob { name: "LCWGS_NO_RARE_CARRIER", group: "lcwgs", kind: Kind::Bool, default_repr: "true", user_facing: false, doc: "Rare-allele carrier augmentation with sampled-state reinforcement is default ON; presence disables it. rare_carrier = is_err()." },
     Knob { name: "LCWGS_NO_SPLIT", group: "lcwgs", kind: Kind::Bool, default_repr: "true", user_facing: false, doc: "⚠ Common/rare deep-split: if is_ok() return None (presence DISABLES split). Effective default-ON is CONDITIONAL — split also auto-gates on big-panel (kpbwt>3000) + soft-GL, so on a small/high-cover..." },
     Knob { name: "LCWGS_PHASE_MAIN_EVERY", group: "lcwgs", kind: Kind::Value, default_repr: "1", user_facing: false, doc: "Re-phase cadence in the main phase (1=every iteration=byte-identical); N>1 re-phases only every Nth main iter. envu.filter(n>=1).unwrap_or(1)." },
+    Knob { name: "LCWGS_RARE_CARRIER_ALT_ONLY", group: "lcwgs", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "Legacy rare-carrier behaviour: always treat ALT as the rare allele instead of the minor allele min(ac, n_ref-ac). present(); default OFF = minor-allele (handles REF-minor sites like GLIMPSE2). Set to reproduce the prior ALT-only path for A/B." },
     Knob { name: "LCWGS_RARE_CARRIER_MAX", group: "lcwgs", kind: Kind::Value, default_repr: "64", user_facing: false, doc: "Max panel minor-allele count for a site to be treated as rare for carrier augmentation. envu.unwrap_or(64)." },
     Knob { name: "LCWGS_SCAFFOLD", group: "lcwgs", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "Scaffold mode: run HMM FB only on common sites and interpolate posterior to rare sites (default off = full FB over all sites). is_ok()." },
     Knob { name: "LCWGS_SELECT_REFRESH", group: "lcwgs", kind: Kind::Value, default_repr: "5", user_facing: false, doc: "PBWT conditioning-set refresh interval in iterations. envu.filter(r>=1).unwrap_or(5); values <1 ignored." },
@@ -270,7 +271,9 @@ mod tests {
                 if p.is_dir() { stack.push(p); continue; }
                 if p.extension().and_then(|e| e.to_str()) != Some("rs") { continue; }
                 let txt = std::fs::read_to_string(&p).unwrap();
-                for pat in ["env::var(\"", "envu(\"", "envf(\"", "envs(\""] {
+                for pat in ["env::var(\"", "envu(\"", "envf(\"", "envs(\"",
+                            "present(\"", "is_one(\"", "raw(\"",
+                            "usize_or(\"", "i64_or(\"", "f64_or(\""] {
                     let mut from = 0usize;
                     while let Some(i) = txt[from..].find(pat) {
                         let start = from + i + pat.len();
