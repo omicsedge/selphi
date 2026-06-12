@@ -200,7 +200,7 @@ fn adapt_emit_pow() -> Option<f32> {
 /// were already K-independent under the old adaptive rule, so this only changes the
 /// panel-matched regime — for the better, on real data.) `LCWGS_GLIMPSE_RECOMB=1`
 /// also forces K-indep (now redundant); `LCWGS_KDEP_RECOMB=1` restores the old K-dep.
-fn recomb_scale(ne: f32, k: usize, n_ref: usize, _kpbwt: usize) -> f64 {
+fn recomb_scale(ne: f32, k: usize, n_ref: usize) -> f64 {
     use std::sync::OnceLock;
     // 0 = K-independent (default), 1 = force K-independent, 2 = force K-dependent.
     static MODE: OnceLock<u8> = OnceLock::new();
@@ -399,7 +399,7 @@ pub fn run_forward_backward(
     // touching common-common boundaries. None = identity.
     TL_PREC.with(|cell| {
         let mut buf = cell.borrow_mut();
-        let scale = recomb_scale(params.ne, k, ref_bm.n_haps, params.kpbwt);
+        let scale = recomb_scale(params.ne, k, ref_bm.n_haps);
         precompute_prec(cm, n_var, scale, recomb_mult, &mut buf);
     });
 
@@ -742,7 +742,7 @@ unsafe fn run_fb_avx512(
         // emission per (variant, allele)
         precompute_emit(hl, n_var, ee, ed, &mut emit);
         // p_rec
-        let scale = recomb_scale(params.ne, k, ref_bm.n_haps, params.kpbwt);
+        let scale = recomb_scale(params.ne, k, ref_bm.n_haps);
         precompute_prec(cm, n_var, scale, recomb_mult, &mut p_rec);
         // Bit-packed conditioning alleles (1 bit/state). Branchless + word-at-a-
         // time: accumulate 64 consecutive states into a register, store once per
@@ -991,7 +991,7 @@ unsafe fn run_fb_avx2(
         let mut condbits = cc.borrow_mut();
 
         precompute_emit(hl, n_var, ee, ed, &mut emit);
-        let scale = recomb_scale(params.ne, k, ref_bm.n_haps, params.kpbwt);
+        let scale = recomb_scale(params.ne, k, ref_bm.n_haps);
         precompute_prec(cm, n_var, scale, recomb_mult, &mut p_rec);
         // Bit-packed conditioning alleles (1 bit/state) — identical to the AVX-512 pack.
         let timing = hmm_timing();
@@ -1269,7 +1269,7 @@ unsafe fn run_fb_neon(
         let mut condbits = cc.borrow_mut();
 
         precompute_emit(hl, n_var, ee, ed, &mut emit);
-        let scale = recomb_scale(params.ne, k, ref_bm.n_haps, params.kpbwt);
+        let scale = recomb_scale(params.ne, k, ref_bm.n_haps);
         precompute_prec(cm, n_var, scale, recomb_mult, &mut p_rec);
         // Bit-packed conditioning alleles (1 bit/state) — identical pack to AVX2.
         let timing = hmm_timing();
