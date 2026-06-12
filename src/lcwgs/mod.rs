@@ -115,11 +115,18 @@ impl LcwgsParams {
     /// cM span of each chunk's core region (whose dosage is kept). A single
     /// conditioning set of K haps must capture the target's mosaic within the
     /// full window (core + 2×buffer); too large → K dilutes across the window
-    /// (the whole-chromosome failure mode), too small → more chunks + overhead.
-    /// Empirically a ~2 cM core (≈3 cM window) keeps K-selection concentrated.
-    /// Override with `LCWGS_CHUNK_CORE_CM` for tuning.
+    /// AND the whole-chromosome HMM dynamics start to regress some samples'
+    /// common bins, too small → the FB window is too short to copy a long-range
+    /// rare carrier across read-less sites, and more chunks + overhead.
+    /// DEFAULT 16 cM: a real-GIAB chunk-size sweep (HG002/HG003/HG004, ~1.8×
+    /// chr22) found 16 cM the overall-R² sweet spot — mean OVERALL 0.9201 vs
+    /// 0.9184 at the old 2 cM and vs GLIMPSE2's 0.9155 (+0.0046), at ~1.5× the
+    /// 2-cM wall (still ~2.7× faster than GLIMPSE2 single-sample). The whole-
+    /// chromosome window (one chunk) edges the rarest bin higher but regresses
+    /// some samples' overall and costs ~4× more wall. Override with
+    /// `LCWGS_CHUNK_CORE_CM` (e.g. 2.0 restores the prior faster-but-lower default).
     pub fn chunk_core_cm(&self) -> f64 {
-        crate::config::f64_or("LCWGS_CHUNK_CORE_CM", 2.0)
+        crate::config::f64_or("LCWGS_CHUNK_CORE_CM", 16.0)
     }
 
     /// cM buffer added each side of the core. The HMM runs over core+2×buffer
