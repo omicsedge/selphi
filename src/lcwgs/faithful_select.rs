@@ -2,15 +2,15 @@
 //! engine. **DEFAULT ON** (opt out with `LCWGS_NO_FAITHFUL_SELECT=1`; the legacy
 //! `LCWGS_FAITHFUL_SELECT` force-on is a no-op now that it is the default). It is
 //! the production selection at big-panel scale (UPDATE 52). FOOTGUN: this module —
-//! and thus the DEFAULT `--lcwgs` engine — depends on `crate::glimpse2`
-//! (ref_haplotype_set / haplotype_set / rng), so `src/glimpse2/` is NOT dead
-//! weight: deleting it breaks the default lcWGS path, not just `--glimpse2-exact`.
+//! and thus the DEFAULT `--lcwgs` engine — depends on `crate::sparse_ls`
+//! (ref_haplotype_set / haplotype_set / rng), so `src/sparse_ls/` is NOT dead
+//! weight: deleting it breaks the default lcWGS path, not just `--ls-exact`.
 //!
 //! The shipped hybrid engine selects per-target-hap conditioning with the
 //! heuristic [`super::pbwt_select::select_conditioning_haps`] sweep, then adds
 //! rare-allele carriers on top. GLIMPSE2's edge on the COMMON bins comes from a
 //! more efficient per-individual selection driven by its compressed sparse PBWT
-//! (`src/glimpse2`). This module grafts that faithful selection in as a *drop-in
+//! (`src/sparse_ls`). This module grafts that faithful selection in as a *drop-in
 //! producer* of the SAME `cond_cache: Vec<Vec<u32>>` shape (one Vec of ref-hap
 //! indices PER TARGET HAP, len = `2*n_samples`), so everything downstream — the
 //! rare-carrier augmentation, the HMM, the GLIMPSE2/DMM rephase — is unchanged.
@@ -26,19 +26,19 @@
 //! both to the flattened, deduped union of that sample's PBWT layers (capped at
 //! `kpbwt`). This matches GLIMPSE2's per-individual conditioning.
 //!
-//! The driving logic mirrors `glimpse2::caller::phase_iteration`'s SELECTION half
+//! The driving logic mirrors `sparse_ls::caller::phase_iteration`'s SELECTION half
 //! (INIT: `init_rare_tar` + `perform_selection_rare_init_gl`; else:
 //! `update_haplotypes` + `transpose_rare_tar` + `match_haps_from_compressed_pbwt_small`),
 //! but feeds it the HYBRID's current state (its `gl3` + `hap_alleles`) instead of
 //! GLIMPSE2's own `Genotype` store.
 
 use crate::common::HaplotypeBitmatrix;
-use crate::glimpse2::haplotype_set::{GenotypeView, TargetHaplotypeSet};
-use crate::lcwgs::g2_params::Glimpse2Params;
-use crate::glimpse2::ref_haplotype_set::RefHaplotypeSet;
-use crate::glimpse2::rng::Mt19937Rng;
-use crate::glimpse2::unphred;
-use crate::glimpse2::variant::{Variant, VariantMap};
+use crate::sparse_ls::haplotype_set::{GenotypeView, TargetHaplotypeSet};
+use crate::lcwgs::ls_params::LsParams;
+use crate::sparse_ls::ref_haplotype_set::RefHaplotypeSet;
+use crate::sparse_ls::rng::Mt19937Rng;
+use crate::sparse_ls::unphred;
+use crate::sparse_ls::variant::{Variant, VariantMap};
 use super::LcwgsParams;
 
 /// Persistent state for faithful selection across the Gibbs iterations of one
@@ -132,7 +132,7 @@ impl FaithfulSelector {
         // --- GLIMPSE2 params mapped from LcwgsParams. ---
         // kpbwt is clamped to n_ref-1 in build() below (if >= n_ref the C++
         // selection short-circuits to "whole panel"; we want the PBWT path).
-        let g2_params = Glimpse2Params {
+        let ls_params = LsParams {
             err_phase: 1e-4,
             err_imp: params.epsilon,
             ne: params.ne as f64,
@@ -150,8 +150,8 @@ impl FaithfulSelector {
             params.pbwt_depth as i32,
             params.pbwt_modulo_cm,
             &vmap,
-            g2_params.kinit as i32,
-            g2_params.kpbwt as i32,
+            ls_params.kinit as i32,
+            ls_params.kpbwt as i32,
         );
 
         // --- Per-sample PHRED gl bytes + flat mask (static). ---

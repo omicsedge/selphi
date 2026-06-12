@@ -1,4 +1,4 @@
-//! Faithful 1:1 port of GLIMPSE2's per-target genotype / haplotype-likelihood
+//! Faithful reimplementation of GLIMPSE2's per-target genotype / haplotype-likelihood
 //! container.
 //!
 //! C++ sources:
@@ -38,7 +38,7 @@
 //! HET-ness is decided later from the sampled H0/H1. See [`set_flat_from_pl`].
 //! ==========================================================================
 
-use crate::glimpse2::unphred::unphred;
+use crate::sparse_ls::unphred::unphred;
 
 // ---------------------------------------------------------------------------
 // inferred_genotype  (genotype.h:38-78)
@@ -104,8 +104,8 @@ impl InferredGenotype {
 // haplotype_set.rs already declares a `GenotypeView<'a>` with the exact fields
 // {ploidy:i32, gl:&[u8], flat:&[bool], h0:&[bool], h1:&[bool]}. The SELECTION
 // code consumes THAT one. `Genotype::view()` below builds it (re-exported here
-// so callers can `use crate::glimpse2::genotype::GenotypeView`).
-pub use crate::glimpse2::haplotype_set::GenotypeView;
+// so callers can `use crate::sparse_ls::genotype::GenotypeView`).
+pub use crate::sparse_ls::haplotype_set::GenotypeView;
 
 // ---------------------------------------------------------------------------
 // genotype  (genotype.h:81-136, genotype.cpp)

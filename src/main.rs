@@ -225,37 +225,37 @@ fn main() {
             .unwrap_or_else(|e| { eprintln!("Failed to open SRP: {}", e); std::process::exit(1); });
         selphi_info!("  SRP loaded: {} variants, {} haps", srp.metadata.n_variants, srp.metadata.n_haps);
 
-        // GLIMPSE2-FAITHFUL engine (--glimpse2-exact): a 1:1 port of GLIMPSE2's
+        // reference-faithful engine (--ls-exact): a faithful reimplementation of GLIMPSE2's
         // phase/ Gibbs caller. PL-VCF input only (BAM-native GL not yet wired for
         // this path). Routes through the same LcwgsOutput writer below.
-        if args.glimpse2_exact {
+        if args.ls_exact {
             if bam_mode {
-                eprintln!("Error: --glimpse2-exact requires --input (PL VCF/BCF); BAM input is not yet supported on this path");
+                eprintln!("Error: --ls-exact requires --input (PL VCF/BCF); BAM input is not yet supported on this path");
                 std::process::exit(1);
             }
-            selphi_info!("  engine:   glimpse2-exact (faithful GLIMPSE2 port)");
-            let mut g2params = selphi::lcwgs::g2_params::Glimpse2Params::default();
-            // RESEARCH knob: override the conditioning size (LCWGS_G2X_KPBWT) to probe
+            selphi_info!("  engine:   ls-exact (faithful GLIMPSE2-model reimplementation)");
+            let mut g2params = selphi::lcwgs::ls_params::LsParams::default();
+            // RESEARCH knob: override the conditioning size (LCWGS_LSX_KPBWT) to probe
             // selection headroom — e.g. = n_ref for an all-cond upper bound.
-            if let Some(k) = selphi::config::raw("LCWGS_G2X_KPBWT") {
+            if let Some(k) = selphi::config::raw("LCWGS_LSX_KPBWT") {
                 if let Ok(k) = k.parse::<usize>() { g2params.kpbwt = k; g2params.kinit = k; }
             }
-            // RESEARCH knobs: override the Gibbs schedule (LCWGS_G2X_BURNIN /
-            // LCWGS_G2X_MAIN) to probe convergence headroom vs GLIMPSE2's 5/15.
-            if let Some(b) = selphi::config::raw("LCWGS_G2X_BURNIN") {
+            // RESEARCH knobs: override the Gibbs schedule (LCWGS_LSX_BURNIN /
+            // LCWGS_LSX_MAIN) to probe convergence headroom vs GLIMPSE2's 5/15.
+            if let Some(b) = selphi::config::raw("LCWGS_LSX_BURNIN") {
                 if let Ok(b) = b.parse::<i32>() { g2params.burnin = b; }
             }
-            if let Some(m) = selphi::config::raw("LCWGS_G2X_MAIN") {
+            if let Some(m) = selphi::config::raw("LCWGS_LSX_MAIN") {
                 if let Ok(m) = m.parse::<i32>() { g2params.main = m; }
             }
-            let result = selphi::glimpse2::pipeline::run_pipeline(
+            let result = selphi::sparse_ls::pipeline::run_pipeline(
                 input, &srp, map, &g2params, args.seed as u64,
             ).unwrap_or_else(|e| {
-                eprintln!("glimpse2-exact pipeline failed: {}", e);
+                eprintln!("ls-exact pipeline failed: {}", e);
                 std::process::exit(1);
             });
             selphi_info!(
-                "  glimpse2-exact done: {} variants × {} samples in {:.1}s",
+                "  ls-exact done: {} variants × {} samples in {:.1}s",
                 result.n_variants, result.sample_ids.len(), start.elapsed().as_secs_f32(),
             );
             let vcf_path = PathBuf::from(format!("{}.vcf.gz", output));
