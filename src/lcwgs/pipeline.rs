@@ -429,6 +429,39 @@ fn run_chunked_gibbs(
     // skip it (single pass, byte-identical). Cost when on: ~2× the per-chunk Gibbs.
     let split_band: Option<(f64, f64, usize)> = resolve_split(gl3_shared, n_samples, n_shared, params);
 
+    // Chromosome-wide conditioning selection (LCWGS_CHRWIDE_PBWT, default OFF):
+    // select the conditioning set ONCE over the WHOLE chromosome's common-site
+    // scaffold (long-range IBD) and reuse it for every chunk, instead of the
+    // per-chunk local selection. Global panel-hap indices == chunk-local (each
+    // chunk_bm keeps all haps). Pairs with the K-independent sticky-copy default:
+    // gives the sticky copy better long-range rare-carrier candidates. Default-off
+    // → byte-identical to the per-chunk selection path.
+    let chrwide_cond: Option<Vec<Vec<u32>>> = if crate::config::present("LCWGS_CHRWIDE_PBWT") {
+        let full_bm = srp.extract_ref_alleles_bitmatrix(wgs_idx);
+        let n_ref = full_bm.n_haps;
+        let thr = params.rare_maf as f64;
+        let common: Vec<usize> = (0..n_shared)
+            .filter(|&v| {
+                let ac = full_bm.popcount_row(v, n_ref) as f64;
+                ac.min(n_ref as f64 - ac) / n_ref as f64 >= thr
+            })
+            .collect();
+        drop(full_bm); // common-site bitmatrix below is all the selector needs
+        let cwgs: Vec<usize> = common.iter().map(|&v| wgs_idx[v]).collect();
+        let cbm = srp.extract_ref_alleles_bitmatrix(&cwgs);
+        let ccm: Vec<f64> = common.iter().map(|&v| cm[v]).collect();
+        let mut cgl3: Vec<f32> = Vec::with_capacity(common.len() * n_samples * 3);
+        for &v in &common {
+            cgl3.extend_from_slice(&gl3_shared[v * n_samples * 3..(v + 1) * n_samples * 3]);
+        }
+        crate::selphi_info!(
+            "  chromosome-wide PBWT selection (LCWGS_CHRWIDE_PBWT): {} common sites of {}",
+            common.len(), n_shared);
+        Some(super::iterate::select_chrwide_cond(&cgl3, &cbm, &ccm, n_samples, params))
+    } else {
+        None
+    };
+
     // Per-chunk work as a closure so chunks can run in PARALLEL when the sample
     // count is too small to fill the cores (single/few-sample: the sample/hap
     // par_iter inside run_gibbs is degenerate → most cores idle). Chunks are fully
@@ -459,12 +492,12 @@ fn run_chunked_gibbs(
         let chunk_wgs: Vec<usize> = wgs_idx[buf_start..buf_end].to_vec();
         let chunk_bm = srp.extract_ref_alleles_bitmatrix(&chunk_wgs);
 
-        let mut out = run_gibbs(&chunk_gl3, &chunk_bm, &chunk_cm, n_samples, params, None);
+        let mut out = run_gibbs(&chunk_gl3, &chunk_bm, &chunk_cm, n_samples, params, None, chrwide_cond.as_ref());
         // Two-depth split: run the deep pass and overlay its dose/GP onto the band
         // sites (panel MAF ∈ [lo,hi)), routing by PANEL allele frequency only (known
         // a-priori; no truth). Byte-identical when `split_band` is None.
         if let Some((lo, hi, deep_k)) = split_band {
-            let out_deep = run_gibbs(&chunk_gl3, &chunk_bm, &chunk_cm, n_samples, params, Some(deep_k));
+            let out_deep = run_gibbs(&chunk_gl3, &chunk_bm, &chunk_cm, n_samples, params, Some(deep_k), chrwide_cond.as_ref());
             let n_ref = chunk_bm.n_haps;
             for lv in 0..chunk_bm.n_sites {
                 let ac = chunk_bm.popcount_row(lv, n_ref) as f64;
@@ -651,7 +684,7 @@ mod tests {
         params.n_main_iterations = 1;
         params.kpbwt = 3;
         params.pbwt_modulo_cm = 0.001;
-        let out = run_gibbs(&gl3, &bm, &cm, n_samples, &params, None);
+        let out = run_gibbs(&gl3, &bm, &cm, n_samples, &params, None, None);
         assert_eq!(out.dosage.len(), n_var * n_samples);
         for (v, &d) in out.dosage.iter().enumerate() {
             assert!(!d.is_nan(), "dose {} at v={} is NaN", d, v);
