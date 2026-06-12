@@ -1,6 +1,6 @@
-//! Faithful Rust port of GLIMPSE2's `caller` phasing/imputation driver loop.
+//! Faithful Rust reimplementation of GLIMPSE2's `caller` phasing/imputation driver loop.
 //!
-//! 1:1 port of the Gibbs schedule in
+//! reimplementation of the Gibbs schedule in
 //! `_archive/reference_code/GLIMPSE2/phase/src/caller/caller_algorithm.cpp`
 //! (`phase_loop` / `phase_iteration` / `phase_individual`).
 //!
@@ -69,18 +69,18 @@
 //! against a specific C++ thread schedule. (PORT_SPEC riskiest #1.)
 
 use crate::common::HaplotypeBitmatrix;
-use crate::glimpse2::conditioning_set::{
+use crate::sparse_ls::conditioning_set::{
     ConditioningSet, TargetSelectionView, STAGE_INIT, STAGE_MAIN,
 };
-use crate::glimpse2::genotype::{map_output_call, Genotype};
-use crate::glimpse2::haplotype_set::{GenotypeView, TargetHaplotypeSet};
-use crate::glimpse2::imputation_hmm::ImputationHmm;
-use crate::lcwgs::g2_params::Glimpse2Params;
+use crate::sparse_ls::genotype::{map_output_call, Genotype};
+use crate::sparse_ls::haplotype_set::{GenotypeView, TargetHaplotypeSet};
+use crate::sparse_ls::imputation_hmm::ImputationHmm;
+use crate::lcwgs::ls_params::LsParams;
 use crate::lcwgs::phasing_hmm::PhasingHmm;
-use crate::glimpse2::ref_haplotype_set::RefHaplotypeSet;
-use crate::glimpse2::rng::{Mt19937Rng, DEFAULT_SEED};
-use crate::glimpse2::unphred;
-use crate::glimpse2::variant::VariantMap;
+use crate::sparse_ls::ref_haplotype_set::RefHaplotypeSet;
+use crate::sparse_ls::rng::{Mt19937Rng, DEFAULT_SEED};
+use crate::sparse_ls::unphred;
+use crate::sparse_ls::variant::VariantMap;
 use rayon::prelude::*;
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -99,7 +99,7 @@ use rayon::prelude::*;
 // whole-panel and Kpbwt-based selection paths we run.
 //
 // TODO faithful: port haplotype_set::list_states + read_list_states for the
-// `--state-list` external-conditioning feature (unused by --glimpse2-exact).
+// `--state-list` external-conditioning feature (unused by --ls-exact).
 impl TargetSelectionView for TargetHaplotypeSet {
     #[inline]
     fn tar_ind2hapid(&self, ind: usize) -> i32 {
@@ -141,14 +141,14 @@ pub struct SampleCalls {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//   Glimpse2Caller
+//   LsExactCaller
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Per-WORKER scratch (one per rayon thread, reused across the samples that
 /// thread processes): the HLC/HP0/HP1 buffers + the conditioning set + the two
 /// HMMs. This mirrors GLIMPSE2's `COND[id_worker]`/`HMM[id_worker]`/`DMM[id_worker]`
 /// per-worker objects (caller_algorithm.cpp). The RNG is NOT here: each sample
-/// carries its own (see `Glimpse2Caller::run`).
+/// carries its own (see `LsExactCaller::run`).
 struct Worker {
     hlc: Vec<f32>,
     hp0: Vec<f32>,
@@ -164,11 +164,11 @@ impl Worker {
         vmap: &VariantMap,
         ref_hs: &RefHaplotypeSet,
         ref_bm: &HaplotypeBitmatrix,
-        params: &Glimpse2Params,
+        params: &LsParams,
     ) -> Self {
         // The conditioning-set constructor only classifies sites (no HvarRef read),
         // but it takes a `RefPanelView`, so feed it the production wrapper.
-        let rp = crate::glimpse2::conditioning_set::RefPanelWithBm { hs: ref_hs, ref_bm };
+        let rp = crate::sparse_ls::conditioning_set::RefPanelWithBm { hs: ref_hs, ref_bm };
         Worker {
             hlc: vec![0.0f32; 2 * n_tot],
             hp0: vec![0.0f32; 2 * n_tot],
@@ -188,22 +188,22 @@ fn sample_seed(base: u32, ind: usize) -> u32 {
 }
 
 /// OPT-IN rare-carrier injection config for the faithful engine
-/// (`LCWGS_G2X_RARE_CARRIER`, default OFF). When `enabled` is false, the engine
+/// (`LCWGS_LSX_RARE_CARRIER`, default OFF). When `enabled` is false, the engine
 /// is byte-identical to the pure faithful port. See
 /// [`ConditioningSet::inject_rare_carriers`].
 #[derive(Clone, Copy)]
 struct RareCarrierCfg {
-    /// Master switch (`LCWGS_G2X_RARE_CARRIER`).
+    /// Master switch (`LCWGS_LSX_RARE_CARRIER`).
     enabled: bool,
-    /// Only inject during MAIN iterations (`LCWGS_G2X_RC_MAIN_ONLY`, default ON):
+    /// Only inject during MAIN iterations (`LCWGS_LSX_RC_MAIN_ONLY`, default ON):
     /// burn-in/init phasing stays faithful, dose-accumulating iters get the edge.
     main_only: bool,
-    /// Panel minor-allele-count ceiling for a "rare" site (`LCWGS_G2X_RC_MAX_MAC`,
+    /// Panel minor-allele-count ceiling for a "rare" site (`LCWGS_LSX_RC_MAX_MAC`,
     /// default 64).
     max_mac: usize,
-    /// Carriers injected per eligible het rare site (`LCWGS_G2X_RC_TOP`, default 6).
+    /// Carriers injected per eligible het rare site (`LCWGS_LSX_RC_TOP`, default 6).
     top_per_site: usize,
-    /// Local IBD-run scan cap per side (`LCWGS_G2X_RC_RUN_CAP`, default 64).
+    /// Local IBD-run scan cap per side (`LCWGS_LSX_RC_RUN_CAP`, default 64).
     run_cap: usize,
 }
 
@@ -221,21 +221,21 @@ impl RareCarrierCfg {
         // common bins (mac32/top3 → 0.9379, full-aggressive → 0.9349). The sweet
         // spot reaches the rarest sites' true carriers without that pollution.
         RareCarrierCfg {
-            enabled: crate::config::present("LCWGS_G2X_RARE_CARRIER"),
+            enabled: crate::config::present("LCWGS_LSX_RARE_CARRIER"),
             // main-only by default (burn-in stays faithful; the dose-accumulating
-            // MAIN iters get the rare edge). LCWGS_G2X_RC_ALL_ITERS forces every iter.
-            main_only: !crate::config::present("LCWGS_G2X_RC_ALL_ITERS"),
-            max_mac: envu("LCWGS_G2X_RC_MAX_MAC").unwrap_or(16),
-            top_per_site: envu("LCWGS_G2X_RC_TOP").unwrap_or(3),
-            run_cap: envu("LCWGS_G2X_RC_RUN_CAP").unwrap_or(64),
+            // MAIN iters get the rare edge). LCWGS_LSX_RC_ALL_ITERS forces every iter.
+            main_only: !crate::config::present("LCWGS_LSX_RC_ALL_ITERS"),
+            max_mac: envu("LCWGS_LSX_RC_MAX_MAC").unwrap_or(16),
+            top_per_site: envu("LCWGS_LSX_RC_TOP").unwrap_or(3),
+            run_cap: envu("LCWGS_LSX_RC_RUN_CAP").unwrap_or(64),
         }
     }
 }
 
 /// The GLIMPSE2 caller driver (stateless marker; all scratch is per-`Worker`).
-pub struct Glimpse2Caller;
+pub struct LsExactCaller;
 
-impl Glimpse2Caller {
+impl LsExactCaller {
     /// The whole driver, allocating internal scratch and running the Gibbs
     /// schedule + finalize over `genotypes`. After it returns, every `Genotype`
     /// holds its finalized `stored_data`/`H0`/`H1` (see `collect_calls`).
@@ -252,7 +252,7 @@ impl Glimpse2Caller {
         vmap: &VariantMap,
         cm: &[f64],
         genotypes: &mut [Genotype],
-        params: &Glimpse2Params,
+        params: &LsParams,
         seed: u64,
     ) {
         let n_tot = vmap.len();
@@ -290,12 +290,12 @@ impl Glimpse2Caller {
         let mut sample_rngs: Vec<Mt19937Rng> = (0..n_samples)
             .map(|i| Mt19937Rng::new(sample_seed(seed32, i)))
             .collect();
-        let serial = crate::config::present("LCWGS_G2X_SERIAL") || n_samples <= 1;
+        let serial = crate::config::present("LCWGS_LSX_SERIAL") || n_samples <= 1;
 
         let rc_cfg = RareCarrierCfg::from_env();
         if rc_cfg.enabled {
             crate::selphi_info!(
-                "  glimpse2-exact: rare-carrier injection ON (max_mac={}, top={}, run_cap={}, main_only={})",
+                "  ls-exact: rare-carrier injection ON (max_mac={}, top={}, run_cap={}, main_only={})",
                 rc_cfg.max_mac, rc_cfg.top_per_site, rc_cfg.run_cap, rc_cfg.main_only
             );
         }
@@ -342,7 +342,7 @@ fn phase_iteration(
     tar: &mut TargetHaplotypeSet,
     genotypes: &mut [Genotype],
     sample_rngs: &mut [Mt19937Rng],
-    params: &Glimpse2Params,
+    params: &LsParams,
     min_gl: f32,
     rng: &mut Mt19937Rng,
     n_tot: usize,
@@ -413,7 +413,7 @@ fn phase_individual_one(
     vmap: &VariantMap,
     cm: &[f64],
     tar: &TargetHaplotypeSet,
-    params: &Glimpse2Params,
+    params: &LsParams,
     min_gl: f32,
     rc_cfg: &RareCarrierCfg,
 ) {
@@ -421,10 +421,10 @@ fn phase_individual_one(
 
     // COND[w]->select(ind, current_stage)  (cpp:57). The RefPanelView is the
     // production wrapper bundling ref_hs + ref_bm (HvarRef served from ref_bm).
-    let rp = crate::glimpse2::conditioning_set::RefPanelWithBm { hs: ref_hs, ref_bm };
+    let rp = crate::sparse_ls::conditioning_set::RefPanelWithBm { hs: ref_hs, ref_bm };
     w.cond.select(ind, stage, &rp, tar, vmap);
 
-    // OPT-IN rare-carrier injection (LCWGS_G2X_RARE_CARRIER). AFTER faithful
+    // OPT-IN rare-carrier injection (LCWGS_LSX_RARE_CARRIER). AFTER faithful
     // selection, append the panel carriers of the individual's het rare sites
     // (ranked by local IBD to the het-ALT hap) to the conditioning set so the
     // imputation HMM can copy onto the true rare carrier. Byte-identical no-op
@@ -504,7 +504,7 @@ fn phase_individual_one(
     }
 }
 
-// GLIMPSE2 caller defaults (caller_parameters.cpp). Not carried by Glimpse2Params.
+// GLIMPSE2 caller defaults (caller_parameters.cpp). Not carried by LsParams.
 const MIN_GL_DEFAULT: f32 = 1e-10;
 const PBWT_DEPTH_DEFAULT: i32 = 12;
 const PBWT_MODULO_CM_DEFAULT: f32 = 0.1;
@@ -526,7 +526,7 @@ fn build_views(genotypes: &[Genotype]) -> Vec<GenotypeView<'_>> {
 }
 
 /// Collect finalized per-sample dose + GP from the genotypes AFTER
-/// [`Glimpse2Caller::run`]. Maps each stored posterior through
+/// [`LsExactCaller::run`]. Maps each stored posterior through
 /// `map_output_call` (genotype_writer.cpp). Sites with no stored record get the
 /// Ref/Ref default (dose 0, GP=(1,0,0)).
 pub fn collect_calls(genotypes: &[Genotype], n_tot_sites: usize) -> Vec<SampleCalls> {
@@ -568,7 +568,7 @@ pub fn collect_calls(genotypes: &[Genotype], n_tot_sites: usize) -> Vec<SampleCa
 mod tests {
     use super::*;
     use crate::common::HaplotypeBitmatrix;
-    use crate::glimpse2::variant::{Variant, VariantMap};
+    use crate::sparse_ls::variant::{Variant, VariantMap};
 
     /// Build a tiny in-memory panel + variant map from an allele closure. Returns
     /// (RefHaplotypeSet, ref_bm, vmap, cm). cref/calt are popcounted from alleles.
@@ -648,7 +648,7 @@ mod tests {
         // Whole-panel-ish: Kpbwt >= n_haps disables the long-match merge and uses
         // the full panel as states (exercises the simplest selection branch);
         // Kinit small so INIT seeds via GL-called rares + uniform top-up.
-        let params = Glimpse2Params {
+        let params = LsParams {
             kpbwt: n_haps, // >= n_ref → whole panel
             kinit: 8,
             burnin: 2,
@@ -656,7 +656,7 @@ mod tests {
             ..Default::default()
         };
 
-        Glimpse2Caller::run(&ref_hs, &ref_bm, &vmap, &cm, &mut genotypes, &params, 0);
+        LsExactCaller::run(&ref_hs, &ref_bm, &vmap, &cm, &mut genotypes, &params, 0);
 
         let calls = collect_calls(&genotypes, n_sites);
         assert_eq!(calls.len(), 2);
@@ -690,14 +690,14 @@ mod tests {
         }
         let mut genotypes = vec![g];
 
-        let params = Glimpse2Params {
+        let params = LsParams {
             kpbwt: n_haps,
             kinit: 6,
             burnin: 1,
             main: 2,
             ..Default::default()
         };
-        Glimpse2Caller::run(&ref_hs, &ref_bm, &vmap, &cm, &mut genotypes, &params, 12345);
+        LsExactCaller::run(&ref_hs, &ref_bm, &vmap, &cm, &mut genotypes, &params, 12345);
 
         let calls = collect_calls(&genotypes, n_sites);
         assert_eq!(calls[0].ploidy, 1);

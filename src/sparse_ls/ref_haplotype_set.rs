@@ -1,7 +1,7 @@
-//! Faithful SCALAR Rust port of GLIMPSE2's compressed sparse PBWT + reference
+//! Faithful scalar Rust reimplementation of GLIMPSE2's compressed sparse PBWT + reference
 //! structures.
 //!
-//! 1:1 port of
+//! reimplementation of
 //!   `_archive/reference_code/GLIMPSE2/common/src/containers/ref_haplotype_set.{h,cpp}`
 //! plus the structure-population logic from
 //!   `_archive/reference_code/GLIMPSE2/common/src/io/ref_genotype_reader.cpp`
@@ -36,7 +36,7 @@
 //! ref_haplotype_set.h:126). Here they are local scratch owned by the builder.
 
 use crate::common::HaplotypeBitmatrix;
-use crate::glimpse2::variant::VariantMap;
+use crate::sparse_ls::variant::VariantMap;
 
 // ---------------------------------------------------------------------------
 // pack3 — three-level run-length encoding (ref_haplotype_set.h:37-101)
@@ -763,7 +763,7 @@ mod tests {
         // Just checks the full-PBWT sweep runs and emits a nonempty Ypacked
         // with the right A_small_idx sizing. (Statistical-parity smoke test;
         // exhaustive parity is gated against GLIMPSE2 in Stage 1/5.)
-        use crate::glimpse2::variant::Variant;
+        use crate::sparse_ls::variant::Variant;
         let n_haps = 4;
         let n_sites = 2;
         // site0: haps {0,1}=1 -> calt=2,cref=2 (common); site1: hap0=1 -> ...

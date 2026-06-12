@@ -1,4 +1,4 @@
-//! Faithful port of GLIMPSE2's PHRED→likelihood table (`otools.h:98`).
+//! Faithful reimplementation of GLIMPSE2's PHRED→likelihood table (`otools.h:98`).
 //!
 //! `UNPHRED[i] = 10^(-i/10)` for i in 0..256, with `UNPHRED[0] = 1.0`.
 //! GLIMPSE2 builds it in f64 then uses it in f32 emission accumulation; we keep

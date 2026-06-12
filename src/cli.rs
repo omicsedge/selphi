@@ -145,7 +145,7 @@ pub struct Args {
     /// Palindromic SNPs (A/T, C/G) are strand-ambiguous and are matched only by exact
     /// equality (conform-gt / Michigan convention). `strand`/`full` carry a small
     /// false-match risk on non-palindromic SNPs, so they stay opt-in. Applies to the
-    /// chip/WGS genotype path (single- and multi-chr); lcWGS/GLIMPSE2-exact are
+    /// chip/WGS genotype path (single- and multi-chr); lcWGS/ls-exact are
     /// unaffected. Sites that already match exactly are never touched, so conforming
     /// input is byte-identical regardless of mode.
     #[arg(long, value_enum, default_value = "swap")]
@@ -189,13 +189,13 @@ pub struct Args {
     #[arg(long)]
     pub auto_route: bool,
 
-    /// (--lcwgs) Use the GLIMPSE2-FAITHFUL lcWGS engine (a 1:1 port of GLIMPSE2's
-    /// phase/ Gibbs caller: ref_haplotype_set + sparse PBWT selection + GL-aware
-    /// Li-Stephens FB + diplotype-mosaic rephasing + MT19937). Separate from the
-    /// default heuristic --lcwgs engine; produces GT:DS:GP via the same writer.
+    /// Use the reference-faithful lcWGS engine (a validation/ablation engine that
+    /// reimplements the GLIMPSE2 model: ref_haplotype_set + sparse PBWT selection +
+    /// GL-aware Li-Stephens FB + diplotype-mosaic rephasing + MT19937). Separate from
+    /// the default --lcwgs engine; produces GT:DS:GP via the same writer.
     /// Requires --input (PL VCF/BCF), --refpanel (.srp), and --map. Seed via --seed.
     #[arg(long)]
-    pub glimpse2_exact: bool,
+    pub ls_exact: bool,
 
     /// Panel ancestry labels (TSV: `sample_id<TAB>super_pop`, 1 header line).
     /// When both --panel-ancestry and --target-ancestry are provided, PBWT

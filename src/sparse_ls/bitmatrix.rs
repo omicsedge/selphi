@@ -1,4 +1,4 @@
-//! Faithful port of GLIMPSE2 `bitmatrix.h` (containers/bitmatrix.h:88-110).
+//! Faithful reimplementation of GLIMPSE2 `bitmatrix.h` (containers/bitmatrix.h:88-110).
 //!
 //! Row-major bit matrix, `n_cols/8` bytes per row, **MSB-first** within a byte.
 //! `allocate`/`reallocate` round BOTH `n_rows` and `n_cols` up to a multiple of 8.

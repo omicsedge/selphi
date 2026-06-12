@@ -1,7 +1,7 @@
-//! Faithful SCALAR Rust port of GLIMPSE2's TARGET-side haplotype set + the
+//! Faithful scalar Rust reimplementation of GLIMPSE2's TARGET-side haplotype set + the
 //! per-individual SELECTION (the conditioning the HMMs use).
 //!
-//! 1:1 port of the SELECTION half of
+//! reimplementation of the SELECTION half of
 //! `_archive/reference_code/GLIMPSE2/phase/src/containers/haplotype_set.{h,cpp}`.
 //!
 //! The C++ `haplotype_set : public ref_haplotype_set` mixes the (immutable)
@@ -40,8 +40,8 @@
 //!   selectKrare ............................. cpp:730-773 → `select_k_rare`
 //!   performSelection_RARE_INIT_GL ........... cpp:775-833 → `perform_selection_rare_init_gl`
 
-use crate::glimpse2::bitmatrix::BitMatrix;
-use crate::glimpse2::variant::VariantMap;
+use crate::sparse_ls::bitmatrix::BitMatrix;
+use crate::sparse_ls::variant::VariantMap;
 
 // ---------------------------------------------------------------------------
 // RNG injection
@@ -165,7 +165,7 @@ pub trait RefHapSet {
 /// `RefHapSet` trait this module consumes. Field names line up 1:1 with the C++
 /// `ref_haplotype_set` base class. This is what the real engine uses; the trait
 /// + [`SimpleRng`] only exist so this module also compiles/tests standalone.
-impl RefHapSet for crate::glimpse2::ref_haplotype_set::RefHaplotypeSet {
+impl RefHapSet for crate::sparse_ls::ref_haplotype_set::RefHaplotypeSet {
     #[inline]
     fn n_tot_sites(&self) -> usize {
         self.n_tot_sites

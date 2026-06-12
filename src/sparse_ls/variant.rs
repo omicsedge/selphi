@@ -1,4 +1,4 @@
-//! Faithful port of GLIMPSE2 `variant.h` / `variant_map.h`.
+//! Faithful reimplementation of GLIMPSE2 `variant.h` / `variant_map.h`.
 //!
 //! A reference-panel variant with PHRED counts and cM position. `mac()` is the
 //! minor-allele count used by the common/rare split and the sparse PBWT.
