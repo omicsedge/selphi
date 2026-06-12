@@ -12,7 +12,7 @@ pub const VAR_PEAK_HOM: i8 = -1;
 pub const VAR_FLAT_HET: i8 = -2;
 
 #[derive(Clone, Copy)]
-pub struct Glimpse2Params {
+pub struct LsParams {
     /// Phasing emission error (`err_phase`), ed_phs; ee_phs = 1 - err_phase.
     pub err_phase: f32,
     /// Imputation emission error (`err_imp`), clamped to [1e-12, 1e-3].
@@ -28,9 +28,9 @@ pub struct Glimpse2Params {
     pub main: i32,
 }
 
-impl Default for Glimpse2Params {
+impl Default for LsParams {
     fn default() -> Self {
-        Glimpse2Params {
+        LsParams {
             err_phase: 1e-4,
             err_imp: 1e-12,
             ne: 100_000.0,
@@ -42,7 +42,7 @@ impl Default for Glimpse2Params {
     }
 }
 
-impl Glimpse2Params {
+impl LsParams {
     /// K-independent recombination scale: GLIMPSE2 `nrho = -0.04 * ne / max(n_ref, ne)`
     /// (conditioning_set.cpp:34); with ne >= n_ref this is ~-0.04 cM^-1.
     pub fn nrho(&self, n_ref: usize) -> f64 {

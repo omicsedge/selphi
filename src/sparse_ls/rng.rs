@@ -32,7 +32,7 @@
 //! cpp refs use `random_number.h:NN` for GLIMPSE2's wrapper and
 //! `random.tcc:NN` / `uniform_int_dist.h:NN` / `stl_algo.h:NN` for libstdc++.
 
-use crate::glimpse2::haplotype_set::Rng as RngTrait;
+use crate::sparse_ls::haplotype_set::Rng as RngTrait;
 
 // ---------------------------------------------------------------------------
 // std::mt19937 — 32-bit Mersenne Twister (mersenne_twister_engine<uint_fast32_t,

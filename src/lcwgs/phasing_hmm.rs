@@ -1,6 +1,6 @@
-//! Faithful SCALAR Rust port of GLIMPSE2's phasing HMM (the DMM).
+//! Faithful scalar Rust reimplementation of GLIMPSE2's phasing HMM (the DMM).
 //!
-//! 1:1 port of `_archive/reference_code/GLIMPSE2/phase/src/models/phasing_hmm.{h,cpp}`.
+//! reimplementation of `_archive/reference_code/GLIMPSE2/phase/src/models/phasing_hmm.{h,cpp}`.
 //! This is the diplotype-mosaic segment phaser over `HAP_NUMBER=8` founder
 //! patterns. It is genotype-PRESERVING: it re-lays the phase of common (PEAK_HET)
 //! and rare (FLAT_HET) hets only and never touches homozygous calls.
@@ -42,12 +42,12 @@
 //!     cumulative-walk `sample` semantics but NOT libstdc++ bit-for-bit RNG.
 
 use crate::common::HaplotypeBitmatrix;
-use crate::lcwgs::g2_params::{
-    Glimpse2Params, HAP_NUMBER, VAR_FLAT_HET, VAR_PEAK_HET, VAR_PEAK_HOM,
+use crate::lcwgs::ls_params::{
+    LsParams, HAP_NUMBER, VAR_FLAT_HET, VAR_PEAK_HET, VAR_PEAK_HOM,
 };
 
 // ════════════════════════════════════════════════════════════════════════════
-//  SIMD DISPATCH (mirrors src/glimpse2/imputation_hmm.rs)
+//  SIMD DISPATCH (mirrors src/sparse_ls/imputation_hmm.rs)
 //
 //  The phasing-HMM kernels iterate over the `n_states` conditioning haplotypes
 //  (the big loop, k = 0..K) with an inner 8-lane founder body (HAP_NUMBER=8).
@@ -216,7 +216,7 @@ impl PhasingHmm {
     /// Literal layout (D=ed_phs, E=ee_phs), rows c=0,1,2 over h=0..7:
     ///   EMIT0[0] = D D D D E E E E ; EMIT0[1] = D D E E D D E E ; EMIT0[2] = D E D E D E D E
     ///   EMIT1 = the D<->E swap of EMIT0.
-    pub fn new(params: &Glimpse2Params) -> Self {
+    pub fn new(params: &LsParams) -> Self {
         let d = params.ed_phs();
         let e = params.ee_phs();
         // Transcribed column-by-column from phasing_hmm.cpp:39-46 (EMIT0).
@@ -1749,7 +1749,7 @@ impl PhasingHmm {
         cond_haps: &[u32],
         ref_bm: &HaplotypeBitmatrix,
         cm: &[f64],
-        params: &Glimpse2Params,
+        params: &LsParams,
         poly_sites: &[i32],
         mono_sites: &[i32],
         lq: &[bool],
@@ -1903,7 +1903,7 @@ mod tests {
     /// EMIT0/EMIT1 must match the literal C++ table (phasing_hmm.cpp:38-56).
     #[test]
     fn emit_tables_literal() {
-        let p = Glimpse2Params { err_phase: 0.25, ..Default::default() };
+        let p = LsParams { err_phase: 0.25, ..Default::default() };
         let hmm = PhasingHmm::new(&p);
         let d = 0.25f32; // ed
         let e = 0.75f32; // ee
@@ -1958,7 +1958,7 @@ mod tests {
         let poly_sites: Vec<i32> = vec![0, 1, 2, 3, 4];
         let mono_sites: Vec<i32> = vec![5];
 
-        let params = Glimpse2Params::default();
+        let params = LsParams::default();
         let mut hmm = PhasingHmm::new(&params);
 
         // Deterministic RNG stand-in cycling through a fixed sequence.

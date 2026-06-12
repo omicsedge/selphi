@@ -1,6 +1,6 @@
-//! Faithful SCALAR Rust port of GLIMPSE2's `imputation_hmm.{h,cpp}`.
+//! Faithful scalar Rust reimplementation of GLIMPSE2's `imputation_hmm.{h,cpp}`.
 //!
-//! 1:1 port of
+//! reimplementation of
 //! `_archive/reference_code/GLIMPSE2/phase/src/models/imputation_hmm.{h,cpp}`.
 //!
 //! This is the DOSE producer: the per-haplotype Li–Stephens forward-backward over
@@ -45,7 +45,7 @@
 //! formed from the *unconditioned* hidden posterior, then multiplied by `HL` only
 //! when it is LQ-but-not-flat, cpp:262-266). Otherwise it emits with `Emissions[2s]`.
 
-use crate::glimpse2::conditioning_set::ConditioningSet;
+use crate::sparse_ls::conditioning_set::ConditioningSet;
 
 // ════════════════════════════════════════════════════════════════════════════
 //  SIMD DISPATCH (mirrors src/lcwgs/hmm.rs)
@@ -60,12 +60,12 @@ use crate::glimpse2::conditioning_set::ConditioningSet;
 //  convention as lcwgs/hmm.rs.
 //
 //  The emission select needs each state's allele as an LSB-indexed bitmask. The
-//  `hvar` BitMatrix is MSB-first per byte (glimpse2 layout), so we materialize an
+//  `hvar` BitMatrix is MSB-first per byte (reference layout), so we materialize an
 //  LSB-first bit-packed copy (`condbits`, `p × ceil(n_states/64)` u64) once per
 //  call — bit j of row l == `hvar.get(l, j)` — mirroring lcwgs's `TL_CONDBITS`.
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Whether to use the AVX-512 glimpse2 imputation-HMM path. Cached.
+/// Whether to use the AVX-512 imputation-HMM path. Cached.
 /// `SELPHI_FORCE_SCALAR=1` → scalar (byte-identical reference); `SELPHI_FORCE_AVX2=1`
 /// → drop to AVX2 even on an AVX-512 host. Same convention as `use_avx512_lcwgs`.
 #[cfg(target_arch = "x86_64")]
@@ -83,7 +83,7 @@ fn use_avx512_g2x() -> bool {
     })
 }
 
-/// Whether to use the AVX2 glimpse2 imputation-HMM path (AVX2+FMA, no AVX-512, or
+/// Whether to use the AVX2 imputation-HMM path (AVX2+FMA, no AVX-512, or
 /// `SELPHI_FORCE_AVX2=1`). Checked after [`use_avx512_g2x`]. Cached.
 #[cfg(target_arch = "x86_64")]
 fn use_avx2_g2x() -> bool {
@@ -101,7 +101,7 @@ fn use_avx2_g2x() -> bool {
 ///
 /// Borrows the [`ConditioningSet`] for the lifetime of a `compute_posteriors`
 /// call (the C++ holds a `conditioning_set *` member; we take it per-call to keep
-/// the struct borrow-free, matching the rest of the glimpse2 port).
+/// the struct borrow-free, matching the rest of this reference engine).
 ///
 /// `modK` in the C++ is the 8-padded state count; in this scalar port we keep an
 /// explicit `mod_k` field set to `n_states` (no padding) so the `Alpha` indexing
@@ -1407,11 +1407,11 @@ impl ImputationHmm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::glimpse2::conditioning_set::{
+    use crate::sparse_ls::conditioning_set::{
         ConditioningSet, InMemoryRefPanel, TargetSelectionView, STAGE_MAIN,
     };
-    use crate::lcwgs::g2_params::Glimpse2Params;
-    use crate::glimpse2::variant::{Variant, VariantMap};
+    use crate::lcwgs::ls_params::LsParams;
+    use crate::sparse_ls::variant::{Variant, VariantMap};
     use crate::common::HaplotypeBitmatrix;
 
     struct TestTarget {
@@ -1540,7 +1540,7 @@ mod tests {
             pbwt: vec![vec![]],
             list: vec![vec![], vec![]],
         };
-        let params = Glimpse2Params {
+        let params = LsParams {
             kpbwt: n_haps, // whole panel
             kinit: 0,
             ..Default::default()
@@ -1607,7 +1607,7 @@ mod tests {
             pbwt: vec![vec![]],
             list: vec![vec![0, 1]],
         };
-        let params = Glimpse2Params {
+        let params = LsParams {
             kpbwt: 0, // fall through to list merge
             kinit: 0,
             ..Default::default()
@@ -1672,7 +1672,7 @@ mod tests {
             pbwt: vec![vec![]],
             list: vec![vec![], vec![]],
         };
-        let params = Glimpse2Params {
+        let params = LsParams {
             kpbwt: n_haps,
             kinit: 0,
             ..Default::default()

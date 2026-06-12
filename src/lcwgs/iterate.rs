@@ -257,16 +257,16 @@ struct GibbsConfig {
     /// still accumulated MAIN-only. Byte-identical when off.
     burnin_diploid: bool,
     /// DEFAULT-ON (2026-06-06): replace the heuristic DMM re-phase with the FAITHFUL
-    /// GLIMPSE2 phasing HMM port (crate::lcwgs::phasing_hmm) run EVERY iteration
+    /// GLIMPSE2-model phasing HMM (crate::lcwgs::phasing_hmm) run EVERY iteration
     /// (GLIMPSE2 schedule). Validated clean win in every regime, NO tradeoff: canonical
     /// r12 (54s) OVERALL 0.9403→0.9511 beating GLIMPSE2 0.9429 on EVERY bin; full-chr22
     /// 0.9119→0.9255 (vs GLIMPSE2 0.9155, every bin incl rare 0.5-1%); adriano real
     /// 0.843→0.8675; sim-solo 0.9756→0.9775. Cost: phasing-every-iter is ~2× wall on
     /// multi-sample (single-sample is still 4× faster than GLIMPSE2). Opt out with
-    /// `LCWGS_NO_GLIMPSE2_PHASE=1` → reverts to the (faster) heuristic DMM sweep.
-    glimpse2_phase: bool,
+    /// `LCWGS_NO_FOUNDER_PHASE=1` → reverts to the (faster) heuristic DMM sweep.
+    founder_phase: bool,
     /// FAITHFUL GLIMPSE2 compressed-sparse-PBWT per-INDIVIDUAL selection
-    /// (`super::faithful_select`, reusing `crate::glimpse2`), replacing the
+    /// (`super::faithful_select`, reusing `crate::sparse_ls`), replacing the
     /// heuristic per-hap PBWT selection (`select_conditioning_haps`). Everything
     /// downstream (rare-carrier augmentation, HMM, GLIMPSE2/DMM rephase) is
     /// UNCHANGED. **DEFAULT ON** (opt out `LCWGS_NO_FAITHFUL_SELECT=1` → the
@@ -274,7 +274,7 @@ struct GibbsConfig {
     /// neighbours when choosing K of a LARGE panel: on the 75552-hap production
     /// panel (HG002 1×, chr22) it scores OVERALL 0.9196 vs the faithful selection's
     /// 0.9688 (+0.049, ~80% of the gap to GLIMPSE2 0.9806; the residual ~0.011 is
-    /// the imputation HMM — for full parity use `--glimpse2-exact` 0.9800). On the
+    /// the imputation HMM — for full parity use `--ls-exact` 0.9800). On the
     /// panel-matched r12 benchmark it is NEUTRAL (0.9524 vs heuristic 0.9531, still
     /// beats GLIMPSE2 0.9429) → strict win, no regime tradeoff. Costs ~2× wall on
     /// small panels (one-time compressed-PBWT build per chunk; amortized multi-sample).
@@ -290,9 +290,9 @@ struct GibbsConfig {
     /// (the one bin --lcwgs wins). See the `phase=` split under `LCWGS_TIMING`.
     phase_main_every: usize,
     /// Phasing-HMM conditioning uses the UNION of both haps' cond sets
-    /// (`LCWGS_G2_RICH_COND`). Read once here (was a per-iteration env read).
+    /// (`LCWGS_LS_RICH_COND`). Read once here (was a per-iteration env read).
     rich_cond: bool,
-    /// GLIMPSE2-exact flat rule (`LCWGS_G2_FLAT_EXACT`): a site is flat ⟺ its GL
+    /// GLIMPSE2-exact flat rule (`LCWGS_LS_FLAT_EXACT`): a site is flat ⟺ its GL
     /// triple is all-equal. Read once here (was a per-iteration env read).
     flat_exact: bool,
     /// DEFAULT ON (opt out `LCWGS_NO_POLY_SKIP=1`). Faithful GLIMPSE2
@@ -354,11 +354,11 @@ impl GibbsConfig {
             dmm_rc,
             dmm_rc_budget: envu("LCWGS_DMM_RC_BUDGET").unwrap_or(6),
             burnin_diploid: crate::config::present("LCWGS_BURNIN_DIPLOID"),
-            glimpse2_phase: !crate::config::present("LCWGS_NO_GLIMPSE2_PHASE"),
+            founder_phase: !crate::config::present("LCWGS_NO_FOUNDER_PHASE"),
             faithful_select: !crate::config::present("LCWGS_NO_FAITHFUL_SELECT"),
             phase_main_every: envu("LCWGS_PHASE_MAIN_EVERY").filter(|&n| n >= 1).unwrap_or(1),
-            rich_cond: crate::config::present("LCWGS_G2_RICH_COND"),
-            flat_exact: crate::config::present("LCWGS_G2_FLAT_EXACT"),
+            rich_cond: crate::config::present("LCWGS_LS_RICH_COND"),
+            flat_exact: crate::config::present("LCWGS_LS_FLAT_EXACT"),
             // DEFAULT ON (2026-06-10): R²-safe poly/mono skip (phaser + imputation FB).
             // Opt out with LCWGS_NO_POLY_SKIP=1 (reverts to the dense all-sites kernels).
             poly_skip: !crate::config::present("LCWGS_NO_POLY_SKIP"),
@@ -506,7 +506,7 @@ pub fn run_gibbs(
     // Loop-invariant phasing-HMM inputs (constant across all iterations): poly =
     // every site, no monomorphic, no low-qual. Built once (only when the faithful
     // phaser is active) instead of reallocating n_var-length Vecs every iteration.
-    let (poly_sites, mono_sites, lq): (Vec<i32>, Vec<i32>, Vec<bool>) = if cfg.glimpse2_phase {
+    let (poly_sites, mono_sites, lq): (Vec<i32>, Vec<i32>, Vec<bool>) = if cfg.founder_phase {
         ((0..n_var as i32).collect(), Vec::new(), vec![false; n_var])
     } else {
         (Vec::new(), Vec::new(), Vec::new())
@@ -543,7 +543,7 @@ pub fn run_gibbs(
     // of rebuilding it inside the per-iteration per-sample rephase closure (was
     // O(n_samples·n_var) GL reads + a Vec alloc per sample × every iteration). Phaser-
     // only; empty when the GLIMPSE2 phaser is off. Byte-identical (same values).
-    let flat_all: Vec<Vec<bool>> = if cfg.glimpse2_phase {
+    let flat_all: Vec<Vec<bool>> = if cfg.founder_phase {
         let flat_exact = cfg.flat_exact;
         (0..n_samples).map(|s| {
             (0..n_var).map(|v| {
@@ -696,17 +696,17 @@ pub fn run_gibbs(
         // re-phase each sample's H0/H1 via the ported phasing_hmm (8-founder diplotype
         // SAMPLE_DIP). Replaces the heuristic DMM. Genotype-preserving (re-phases hets);
         // feeds the next iteration's selection + partner conditioning, like the DMM.
-        if cfg.glimpse2_phase && phase_this_iter {
-            let g2p = crate::lcwgs::g2_params::Glimpse2Params {
+        if cfg.founder_phase && phase_this_iter {
+            let g2p = crate::lcwgs::ls_params::LsParams {
                 ne: params.ne as f64,
                 ..Default::default()
             };
             // poly_sites / mono_sites / lq are hoisted above the iteration loop.
-            // Richer phasing conditioning (LCWGS_G2_RICH_COND): use the UNION of both
+            // Richer phasing conditioning (LCWGS_LS_RICH_COND): use the UNION of both
             // haps' cond sets (GLIMPSE2 phases against the individual's shared set, not
             // one hap's) so the diplotype Viterbi sees both haps' candidate copies.
             let rich_cond = cfg.rich_cond;
-            // FAITHFUL flat rule (LCWGS_G2_FLAT_EXACT). GLIMPSE2 genotype_reader.cpp:580
+            // FAITHFUL flat rule (LCWGS_LS_FLAT_EXACT). GLIMPSE2 genotype_reader.cpp:580
             // sets flat ⟺ the GL triple is all-equal (PL[0]==PL[1]==PL[2], i.e. no
             // informative read), NOT a peakedness threshold. Our default `<1/3+1e-3`
             // over-marks weakly-informative sites as flat; this restores the exact rule.
@@ -788,7 +788,7 @@ pub fn run_gibbs(
                 }
             }
         }
-        if cfg.dmm && (is_main || cfg.burnin_diploid) && !cfg.glimpse2_phase && phase_this_iter {
+        if cfg.dmm && (is_main || cfg.burnin_diploid) && !cfg.founder_phase && phase_this_iter {
             let dcfg = dmm_cfg.as_ref().unwrap();
             let rephased: Vec<(usize, Vec<u8>, Vec<u8>)> = (0..n_samples).into_par_iter().map(|s| {
                 let (h0i, h1i) = (2 * s, 2 * s + 1);

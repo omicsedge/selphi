@@ -1,6 +1,6 @@
-//! Faithful SCALAR Rust port of GLIMPSE2's `conditioning_set.{h,cpp}`.
+//! Faithful scalar Rust reimplementation of GLIMPSE2's `conditioning_set.{h,cpp}`.
 //!
-//! 1:1 port of
+//! reimplementation of
 //! `_archive/reference_code/GLIMPSE2/phase/src/containers/conditioning_set.{h,cpp}`.
 //!
 //! The conditioning set is rebuilt PER (individual, iteration) by `select`
@@ -40,9 +40,9 @@
 //! port its branch verbatim for completeness.
 
 use crate::common::HaplotypeBitmatrix;
-use crate::glimpse2::bitmatrix::BitMatrix;
-use crate::lcwgs::g2_params::Glimpse2Params;
-use crate::glimpse2::variant::VariantMap;
+use crate::sparse_ls::bitmatrix::BitMatrix;
+use crate::lcwgs::ls_params::LsParams;
+use crate::sparse_ls::variant::VariantMap;
 
 /// GLIMPSE2 `otools.h:83-86`.
 pub const STAGE_INIT: i32 = 0;
@@ -98,7 +98,7 @@ pub trait RefPanelView {
     /// (`inject_rare_carriers`) to find a rare site's panel carriers in O(carriers)
     /// without scanning every hap. Default returns `&[]` so any view that does not
     /// store the transpose simply disables the injection (no-op) — it is ONLY read
-    /// by the opt-in `LCWGS_G2X_RARE_CARRIER` path.
+    /// by the opt-in `LCWGS_LSX_RARE_CARRIER` path.
     fn svar_ref(&self, _abs: usize) -> &[i32] {
         &[]
     }
@@ -151,7 +151,7 @@ impl RefPanelView for InMemoryRefPanel<'_> {
 ///
 /// This is the production wiring: `cs.select(ind, stage, &RefPanelWithBm{hs, ref_bm}, tar, &map)`.
 pub struct RefPanelWithBm<'a> {
-    pub hs: &'a crate::glimpse2::ref_haplotype_set::RefHaplotypeSet,
+    pub hs: &'a crate::sparse_ls::ref_haplotype_set::RefHaplotypeSet,
     pub ref_bm: &'a HaplotypeBitmatrix,
 }
 
@@ -228,7 +228,7 @@ pub trait TargetSelectionView {
 ///
 /// `mapG`/`H` in the C++ are held by const-reference; here the per-call data is
 /// passed into `select` so the struct stays free of borrow lifetimes (mirrors how
-/// the rest of the `glimpse2` port keeps HMM scratch borrow-free).
+/// the rest of the reference engine keeps HMM scratch borrow-free).
 pub struct ConditioningSet {
     // ---- COUNTS (conditioning_set.h:44-49) ----
     pub n_ref_haps: usize,
@@ -350,13 +350,13 @@ impl ConditioningSet {
         }
     }
 
-    /// Construct directly from a `Glimpse2Params` (convenience; mirrors how the
+    /// Construct directly from a `LsParams` (convenience; mirrors how the
     /// caller threads its params). `use_list` defaults to TRUE (the phase binary).
     pub fn from_params(
         map_g: &VariantMap,
         ref_panel: &impl RefPanelView,
         n_eff_haps: usize,
-        params: &Glimpse2Params,
+        params: &LsParams,
     ) -> Self {
         let n_ref = ref_panel.n_ref_haps();
         // Kpbwt / Kinit are clamped to n_ref at use (params blueprint); GLIMPSE2
@@ -618,7 +618,7 @@ impl ConditioningSet {
         }
     }
 
-    /// OPT-IN rare-carrier injection (`LCWGS_G2X_RARE_CARRIER`, default OFF).
+    /// OPT-IN rare-carrier injection (`LCWGS_LSX_RARE_CARRIER`, default OFF).
     ///
     /// AFTER [`Self::select`] has built the GLIMPSE2-faithful conditioning set,
     /// add — for the individual's currently HET RARE sites — that site's panel
@@ -831,7 +831,7 @@ impl AscendingDedupSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::glimpse2::variant::Variant;
+    use crate::sparse_ls::variant::Variant;
 
     /// Minimal `TargetSelectionView` for tests.
     struct TestTarget {
@@ -964,7 +964,7 @@ mod tests {
             list: vec![vec![], vec![]],
         };
 
-        let params = Glimpse2Params {
+        let params = LsParams {
             kpbwt: n_haps, // == n_ref → whole panel
             kinit: 0,
             ..Default::default()
@@ -1047,7 +1047,7 @@ mod tests {
             pbwt: vec![vec![]],
             list: vec![vec![0, 1]],
         };
-        let params = Glimpse2Params {
+        let params = LsParams {
             kpbwt: 0, // fall through to list-merge
             kinit: 0,
             ..Default::default()
@@ -1095,7 +1095,7 @@ mod tests {
             pbwt: vec![vec![vec![10, 20, 30], vec![40, 50, 60]]],
             list: vec![vec![]],
         };
-        let params = Glimpse2Params {
+        let params = LsParams {
             kpbwt: 5,
             kinit: 0,
             ..Default::default()
@@ -1171,7 +1171,7 @@ mod tests {
             pbwt: vec![vec![]],
             list: vec![vec![0, 1], vec![0, 1]],
         };
-        let params = Glimpse2Params { kpbwt: 0, kinit: 0, ..Default::default() };
+        let params = LsParams { kpbwt: 0, kinit: 0, ..Default::default() };
         let mut cs = ConditioningSet::from_params(&map_g, &ref_panel, n_haps, &params);
         cs.select(0, STAGE_MAIN, &ref_panel, &tar, &map_g);
         // site1 has no selected carrier → MONO before injection.

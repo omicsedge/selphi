@@ -195,17 +195,17 @@ fn adapt_emit_pow() -> Option<f32> {
 /// (HG002/HG003/HG004, ~1.8× chr22, 4478-hap panel) the K-dependent form was the
 /// whole real-data accuracy gap: K-independent lifts per-sample R² 0.9141→0.9185
 /// (HG002), 0.9148→0.9185 (HG003), 0.9078→0.9183 (HG004), beating GLIMPSE2
-/// (0.9171/0.9177/0.9116) on all three AND the --glimpse2-exact port, at the fast
+/// (0.9171/0.9177/0.9116) on all three AND the --ls-exact port, at the fast
 /// default speed. So K-independent is now the unconditional default. (Big panels
 /// were already K-independent under the old adaptive rule, so this only changes the
-/// panel-matched regime — for the better, on real data.) `LCWGS_GLIMPSE_RECOMB=1`
+/// panel-matched regime — for the better, on real data.) `LCWGS_KINDEP_RECOMB=1`
 /// also forces K-indep (now redundant); `LCWGS_KDEP_RECOMB=1` restores the old K-dep.
 fn recomb_scale(ne: f32, k: usize, n_ref: usize) -> f64 {
     use std::sync::OnceLock;
     // 0 = K-independent (default), 1 = force K-independent, 2 = force K-dependent.
     static MODE: OnceLock<u8> = OnceLock::new();
     let mode = *MODE.get_or_init(|| {
-        if crate::config::present("LCWGS_GLIMPSE_RECOMB") {
+        if crate::config::present("LCWGS_KINDEP_RECOMB") {
             1
         } else if crate::config::present("LCWGS_KDEP_RECOMB") {
             2
@@ -215,7 +215,7 @@ fn recomb_scale(ne: f32, k: usize, n_ref: usize) -> f64 {
     });
     let kindep = match mode {
         2 => false,           // K-dependent (uses `k` below); old small-panel form
-        _ => true,            // default + explicit LCWGS_GLIMPSE_RECOMB: K-independent
+        _ => true,            // default + explicit LCWGS_KINDEP_RECOMB: K-independent
     };
     if kindep {
         0.04f64 * (ne as f64) / (n_ref.max(ne as usize) as f64)

@@ -1,8 +1,8 @@
-//! `--glimpse2-exact` orchestrator: SRP panel + PL target → GLIMPSE2-faithful
-//! lcWGS imputation via [`crate::glimpse2::caller::Glimpse2Caller`].
+//! `--ls-exact` orchestrator: SRP panel + PL target → GLIMPSE2-faithful
+//! lcWGS imputation via [`crate::sparse_ls::caller::LsExactCaller`].
 //!
 //! This is the thin glue that turns the existing loaders' outputs into the
-//! `glimpse2` module's data structures and writes the result through the
+//! `sparse_ls` module's data structures and writes the result through the
 //! EXISTING lcWGS output writer (`crate::lcwgs::output::write_lcwgs_vcf`). The
 //! algorithm itself is 100% the faithful port; only ingest/output is reused.
 //!
@@ -14,10 +14,10 @@
 //!   * `crate::lcwgs::pipeline::LcwgsOutput` + `crate::lcwgs::output::write_lcwgs_vcf`.
 
 use crate::common::HaplotypeBitmatrix;
-use crate::glimpse2::caller::{collect_calls, Glimpse2Caller};
-use crate::glimpse2::genotype::Genotype;
-use crate::lcwgs::g2_params::Glimpse2Params;
-use crate::glimpse2::variant::{Variant, VariantMap};
+use crate::sparse_ls::caller::{collect_calls, LsExactCaller};
+use crate::sparse_ls::genotype::Genotype;
+use crate::lcwgs::ls_params::LsParams;
+use crate::sparse_ls::variant::{Variant, VariantMap};
 use crate::lcwgs::pipeline::LcwgsOutput;
 use crate::srp::SrpReader;
 
@@ -54,7 +54,7 @@ pub fn run_pipeline(
     target_vcf: &str,
     srp: &SrpReader,
     map_path: &str,
-    params: &Glimpse2Params,
+    params: &LsParams,
     seed: u64,
 ) -> std::io::Result<LcwgsOutput> {
     use crate::io::target_io::intersect_variants;
@@ -79,7 +79,7 @@ pub fn run_pipeline(
     let n_ref_haps = srp.metadata.n_haps;
 
     crate::selphi_info!(
-        "  glimpse2-exact: {} samples, {} target variants, {} ref haps",
+        "  ls-exact: {} samples, {} target variants, {} ref haps",
         n_samples, n_target_variants, n_ref_haps,
     );
 
@@ -120,7 +120,7 @@ pub fn run_pipeline(
         })
         .collect();
 
-    // Build the glimpse2 VariantMap: cref/calt by popcount over the ref bitmatrix
+    // Build the reference VariantMap: cref/calt by popcount over the ref bitmatrix
     // (GLIMPSE2's reader counts alleles the same way), cm from the map, lq=false
     // (the SRP has no per-site LQ; all sites emit — matches a SNP-only panel).
     let mut vmap = VariantMap::new();
@@ -143,7 +143,7 @@ pub fn run_pipeline(
     }
 
     // --- 5. Build the reference haplotype set + compressed sparse PBWT. ---
-    let mut ref_hs = crate::glimpse2::ref_haplotype_set::RefHaplotypeSet::new();
+    let mut ref_hs = crate::sparse_ls::ref_haplotype_set::RefHaplotypeSet::new();
     ref_hs.build_from_panel(&ref_bm, &vmap);
     ref_hs.build_sparse_pbwt(&vmap, &ref_bm);
 
@@ -170,7 +170,7 @@ pub fn run_pipeline(
     drop(gl3_input);
 
     // --- 7. Run the faithful caller (Gibbs schedule + finalize). ---
-    Glimpse2Caller::run(&ref_hs, &ref_bm, &vmap, &cm, &mut genotypes, params, seed);
+    LsExactCaller::run(&ref_hs, &ref_bm, &vmap, &cm, &mut genotypes, params, seed);
 
     // --- 8. Collect dose/GP → LcwgsOutput (panel-shared order, n_samples cols). ---
     let calls = collect_calls(&genotypes, n_shared);
