@@ -1,45 +1,44 @@
-//! Faithful scalar Rust reimplementation of GLIMPSE2's phasing HMM (the DMM).
+//! Scalar Rust implementation of the GLIMPSE2 phasing-HMM model (the DMM).
 //!
-//! reimplementation of `_archive/reference_code/GLIMPSE2/phase/src/models/phasing_hmm.{h,cpp}`.
 //! This is the diplotype-mosaic segment phaser over `HAP_NUMBER=8` founder
 //! patterns. It is genotype-PRESERVING: it re-lays the phase of common (PEAK_HET)
 //! and rare (FLAT_HET) hets only and never touches homozygous calls.
 //!
-//! SCALAR ONLY (no SIMD). The C++ accumulates the 8 founder lanes in AVX2 with a
-//! specific `horizontal_add` reduction tree; this scalar port differs in the last
+//! SCALAR ONLY (no SIMD). The SIMD paths accumulate the 8 founder lanes with a
+//! specific `horizontal_add` reduction tree; this scalar path differs in the last
 //! ULPs (|Δ|~1e-4, R²-equivalent) but is otherwise algorithmically identical.
 //!
-//! Kernel ↔ C++ line cross-reference (phasing_hmm.h unless noted):
-//!   EMIT0/EMIT1 tables ......... phasing_hmm.cpp:38-56
-//!   INIT_PEAK_HET .............. phasing_hmm.h:139-152
-//!   INIT_PEAK_HOM .............. phasing_hmm.h:154-167
-//!   INIT_FLAT_HET .............. phasing_hmm.h:169-174
-//!   RUN_PEAK_HET ............... phasing_hmm.h:176-192
-//!   RUN_PEAK_HOM ............... phasing_hmm.h:194-212
-//!   RUN_FLAT_HET ............... phasing_hmm.h:214-228
-//!   COLLAPSE_PEAK_HET .......... phasing_hmm.h:230-246
-//!   COLLAPSE_PEAK_HOM .......... phasing_hmm.h:248-266
-//!   COLLAPSE_FLAT_HET .......... phasing_hmm.h:268-282
-//!   SUMK ....................... phasing_hmm.h:285-289
-//!   TRANS_HAP .................. phasing_hmm.h:291-313
-//!   SAMPLE_DIP ................. phasing_hmm.h:315-327
-//!   IMPUTE_FLAT_HET ............ phasing_hmm.h:329-350
-//!   reallocate (VAR_*/segments)  phasing_hmm.cpp:65-140
-//!   forward .................... phasing_hmm.cpp:142-191
-//!   backward ................... phasing_hmm.cpp:193-245
-//!   rephaseHaplotypes .......... phasing_hmm.cpp:247-302
+//! Kernel map (the per-variant-type stages of the segment HMM):
+//!   EMIT0/EMIT1 tables ......... emission tables
+//!   INIT_PEAK_HET .............. init at a common het
+//!   INIT_PEAK_HOM .............. init at a hom
+//!   INIT_FLAT_HET .............. init at a rare het
+//!   RUN_PEAK_HET ............... within-segment step at a common het
+//!   RUN_PEAK_HOM ............... within-segment step at a hom
+//!   RUN_FLAT_HET ............... within-segment step at a rare het
+//!   COLLAPSE_PEAK_HET .......... segment-boundary step at a common het
+//!   COLLAPSE_PEAK_HOM .......... segment-boundary step at a hom
+//!   COLLAPSE_FLAT_HET .......... segment-boundary step at a rare het
+//!   SUMK ....................... per-state row sum
+//!   TRANS_HAP .................. haplotype transition probabilities
+//!   SAMPLE_DIP ................. diplotype sampling
+//!   IMPUTE_FLAT_HET ............ rare-het allele probability
+//!   reallocate (VAR_*/segments)  variant typing + segmentation + sizing
+//!   forward .................... forward pass
+//!   backward ................... backward pass
+//!   rephaseHaplotypes .......... public re-phasing entry
 //!
-//! Differences from the C++ that are deliberate (documented at the end of file):
-//!   - `C->Hvar.get(curr_rel_locus, k)` is replaced by `ref_bm.get(abs, cond_haps[k])`.
-//!     GLIMPSE2 pre-builds a per-conditioning-set `Hvar` bitmatrix (variant-major,
-//!     rows = relative polymorphic-site index, cols = state) in compact_selection;
-//!     here we read the reference panel directly at the absolute site for the k-th
-//!     conditioning hap. `cond_haps[k]` is the global reference-hap id of state k.
-//!   - `getTransition` is computed inline from the genetic map (`cm`) using the
-//!     K-independent `nrho` (conditioning_set.h:94-96, .cpp:34).
-//!   - `rng.sample` / `rng.getFloat` are supplied by the caller via `rng_u01`
-//!     (a closure returning a uniform [0,1) f32). We reproduce GLIMPSE2's
-//!     cumulative-walk `sample` semantics but NOT libstdc++ bit-for-bit RNG.
+//! Deliberate implementation choices (documented at the end of file):
+//!   - The conditioning-allele lookup `ref_bm.get(abs, cond_haps[k])` reads the
+//!     reference panel directly at the absolute site for the k-th conditioning
+//!     hap, rather than building a per-conditioning-set variant-major bitmatrix
+//!     (rows = relative polymorphic-site index, cols = state) up front.
+//!     `cond_haps[k]` is the global reference-hap id of state k.
+//!   - The transition probability is computed inline from the genetic map (`cm`)
+//!     using the K-independent recombination scale `nrho`.
+//!   - The RNG draws are supplied by the caller via `rng_u01` (a closure
+//!     returning a uniform [0,1) f32). We reproduce the cumulative-walk `sample`
+//!     semantics but NOT any specific bit-for-bit RNG implementation.
 
 use crate::common::HaplotypeBitmatrix;
 use crate::lcwgs::ls_params::{
@@ -125,14 +124,14 @@ fn resolve_simd_mode() -> SimdMode {
     SimdMode::Scalar
 }
 
-/// ALLELE(hap, pos) = (hap & (1 << pos)) != 0  (phasing_hmm.h:45).
+/// ALLELE(hap, pos) = (hap & (1 << pos)) != 0.
 #[inline(always)]
 fn allele(hap: usize, pos: usize) -> bool {
     (hap & (1usize << pos)) != 0
 }
 
-/// Float `f32::MIN_POSITIVE`-equivalent guard used by GLIMPSE2's
-/// `std::numeric_limits<float>::min()` underflow checks.
+/// Float `f32::MIN_POSITIVE`-equivalent guard for the GLIMPSE2-model
+/// underflow checks (smallest normal float).
 const F32_TINY: f32 = f32::MIN_POSITIVE;
 
 /// The phasing HMM (DMM). Holds all per-individual scratch, sized lazily in
@@ -205,13 +204,12 @@ pub struct PhasingHmm {
 }
 
 impl PhasingHmm {
-    /// Build the EMIT0/EMIT1 tables VERBATIM from the literal 24-entry C++
-    /// assignment (phasing_hmm.cpp:38-56). `ed = err_phase`, `ee = 1 - err_phase`.
+    /// Build the EMIT0/EMIT1 tables as the literal 24-entry assignment.
+    /// `ed = err_phase`, `ee = 1 - err_phase`.
     ///
-    /// NB the literal table is `EMIT0[c][h] = ALLELE(h, 2-c) ? ee : ed` (and the
-    /// swap for EMIT1) — i.e. mismatch (ALLELE set) gets `ee`, match gets `ed`.
-    /// (PORT_SPEC.md states the inverse `? ed : ee`; that is wrong — the literal
-    /// C++ table below is authoritative, so we transcribe it directly.)
+    /// NB the table is `EMIT0[c][h] = ALLELE(h, 2-c) ? ee : ed` (and the swap for
+    /// EMIT1) — i.e. mismatch (ALLELE set) gets `ee`, match gets `ed`. (NOT the
+    /// inverse `? ed : ee`; the literal table below is authoritative.)
     ///
     /// Literal layout (D=ed_phs, E=ee_phs), rows c=0,1,2 over h=0..7:
     ///   EMIT0[0] = D D D D E E E E ; EMIT0[1] = D D E E D D E E ; EMIT0[2] = D E D E D E D E
@@ -219,13 +217,13 @@ impl PhasingHmm {
     pub fn new(params: &LsParams) -> Self {
         let d = params.ed_phs();
         let e = params.ee_phs();
-        // Transcribed column-by-column from phasing_hmm.cpp:39-46 (EMIT0).
+        // EMIT0, column-by-column.
         let emit0: [[f32; HAP_NUMBER]; 3] = [
             [d, d, d, d, e, e, e, e], // c=0
             [d, d, e, e, d, d, e, e], // c=1
             [d, e, d, e, d, e, d, e], // c=2
         ];
-        // Transcribed from phasing_hmm.cpp:49-56 (EMIT1 = EMIT0 with D<->E).
+        // EMIT1 = EMIT0 with D<->E.
         let emit1: [[f32; HAP_NUMBER]; 3] = [
             [e, e, e, e, d, d, d, d], // c=0
             [e, e, d, d, e, e, d, d], // c=1
@@ -276,7 +274,7 @@ impl PhasingHmm {
     //                          TRANSITION
     // ===================================================================
 
-    /// getTransition(prev_abs, next_abs) (conditioning_set.h:94-96):
+    /// getTransition(prev_abs, next_abs):
     /// `clamp(-expm1(nrho * (cm[next] - cm[prev])), 1e-7, 1 - 1e-7)`.
     /// `-expm1(x) = 1 - exp(x)`; with nrho < 0 and Δcm >= 0 this is in (0,1).
     #[inline]
@@ -292,8 +290,8 @@ impl PhasingHmm {
     // ===================================================================
 
     /// Hvar lookup: allele of conditioning state `k` at the current relative site.
-    /// GLIMPSE2: `C->Hvar.get(curr_rel_locus, k)`. Here we read the reference panel
-    /// directly at the absolute site for the global hap id `cond_haps[k]`.
+    /// We read the reference panel directly at the absolute site for the global
+    /// hap id `cond_haps[k]` (rather than a precomputed variant-major bitmatrix).
     #[inline(always)]
     fn hvar(&self, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32], k: usize) -> bool {
         ref_bm.get(self.curr_abs_locus as usize, cond_haps[k] as usize)
@@ -325,7 +323,7 @@ impl PhasingHmm {
         }
     }
 
-    /// INIT_PEAK_HET (phasing_hmm.h:139-152). Dispatch wrapper.
+    /// INIT_PEAK_HET. Dispatch wrapper.
     fn init_peak_het(&mut self, curr_het: usize, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32]) {
         #[cfg(target_arch = "x86_64")]
         match self.simd {
@@ -362,7 +360,7 @@ impl PhasingHmm {
         self.prob_sum_t = hadd(&sum);
     }
 
-    /// INIT_PEAK_HOM (phasing_hmm.h:154-167). Dispatch wrapper.
+    /// INIT_PEAK_HOM. Dispatch wrapper.
     fn init_peak_hom(&mut self, ag: bool, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32], mism: f32) {
         #[cfg(target_arch = "x86_64")]
         match self.simd {
@@ -398,7 +396,7 @@ impl PhasingHmm {
         self.prob_sum_t = hadd(&sum);
     }
 
-    /// INIT_FLAT_HET (phasing_hmm.h:169-174).
+    /// INIT_FLAT_HET.
     fn init_flat_het(&mut self) {
         let v = 1.0f32 / (HAP_NUMBER as f32 * self.n_states as f32);
         for x in self.prob.iter_mut().take(self.n_states * HAP_NUMBER) {
@@ -409,7 +407,7 @@ impl PhasingHmm {
         self.prob_sum_t = 1.0;
     }
 
-    /// RUN_PEAK_HET (phasing_hmm.h:176-192). Dispatch wrapper.
+    /// RUN_PEAK_HET. Dispatch wrapper.
     fn run_peak_het(&mut self, curr_het: usize, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32]) {
         #[cfg(target_arch = "x86_64")]
         match self.simd {
@@ -452,7 +450,7 @@ impl PhasingHmm {
         self.prob_sum_t = hadd(&sum);
     }
 
-    /// RUN_PEAK_HOM (phasing_hmm.h:194-212). Dispatch wrapper.
+    /// RUN_PEAK_HOM. Dispatch wrapper.
     fn run_peak_hom(&mut self, ag: bool, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32], mism: f32) {
         #[cfg(target_arch = "x86_64")]
         match self.simd {
@@ -497,7 +495,7 @@ impl PhasingHmm {
         self.prob_sum_t = hadd(&sum);
     }
 
-    /// RUN_FLAT_HET (phasing_hmm.h:214-228). Dispatch wrapper.
+    /// RUN_FLAT_HET. Dispatch wrapper.
     fn run_flat_het(&mut self) {
         #[cfg(target_arch = "x86_64")]
         match self.simd {
@@ -535,7 +533,7 @@ impl PhasingHmm {
         self.prob_sum_t = hadd(&sum);
     }
 
-    /// COLLAPSE_PEAK_HET (phasing_hmm.h:230-246). Dispatch wrapper.
+    /// COLLAPSE_PEAK_HET. Dispatch wrapper.
     fn collapse_peak_het(&mut self, curr_het: usize, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32]) {
         #[cfg(target_arch = "x86_64")]
         match self.simd {
@@ -579,7 +577,7 @@ impl PhasingHmm {
         self.prob_sum_t = hadd(&sum);
     }
 
-    /// COLLAPSE_PEAK_HOM (phasing_hmm.h:248-266). Dispatch wrapper.
+    /// COLLAPSE_PEAK_HOM. Dispatch wrapper.
     fn collapse_peak_hom(&mut self, ag: bool, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32], mism: f32) {
         #[cfg(target_arch = "x86_64")]
         match self.simd {
@@ -625,7 +623,7 @@ impl PhasingHmm {
         self.prob_sum_t = hadd(&sum);
     }
 
-    /// COLLAPSE_FLAT_HET (phasing_hmm.h:268-282). Dispatch wrapper.
+    /// COLLAPSE_FLAT_HET. Dispatch wrapper.
     fn collapse_flat_het(&mut self) {
         #[cfg(target_arch = "x86_64")]
         match self.simd {
@@ -664,7 +662,7 @@ impl PhasingHmm {
         self.prob_sum_t = hadd(&sum);
     }
 
-    /// SUMK (phasing_hmm.h:285-289). probSumK[k] = Σ_h prob[k*8+h].
+    /// SUMK. probSumK[k] = Σ_h prob[k*8+h].
     fn sumk(&mut self) {
         for k in 0..self.n_states {
             let base = k * HAP_NUMBER;
@@ -672,7 +670,7 @@ impl PhasingHmm {
         }
     }
 
-    /// TRANS_HAP (phasing_hmm.h:291-313). Returns true on numerical failure.
+    /// TRANS_HAP. Returns true on numerical failure.
     /// Builds HProbs[h1*8 + h2] = Σ_k (prob[k*8+h1]*nt/probSumT
     ///   + (probSumH[h1]/probSumT)*yt/K) * phasingProb[(seg+1)*K*8 + k*8 + h2].
     fn trans_hap(&mut self, cm: &[f64]) -> bool {
@@ -721,7 +719,7 @@ impl PhasingHmm {
         }
     }
 
-    /// SAMPLE_DIP (phasing_hmm.h:315-327). Returns true on numerical failure;
+    /// SAMPLE_DIP. Returns true on numerical failure;
     /// otherwise samples dip_sampled[seg+1] via the supplied uniform [0,1) draw.
     fn sample_dip(&mut self, rng_u01: &mut impl FnMut() -> f32) -> bool {
         self.sum_dprobs = 0.0;
@@ -740,7 +738,7 @@ impl PhasingHmm {
         false
     }
 
-    /// IMPUTE_FLAT_HET (phasing_hmm.h:329-350). Combines the forward `prob` with
+    /// IMPUTE_FLAT_HET. Combines the forward `prob` with
     /// the stored backward `imputeProb` to get the per-lane P(allele==1) at this
     /// FLAT_HET, clamped to [0,1] into imputeProbOf1s[miss*8 + lane].
     fn impute_flat_het(&mut self, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32]) {
@@ -1433,12 +1431,12 @@ impl PhasingHmm {
     //                          REALLOCATE
     // ===================================================================
 
-    /// reallocate (phasing_hmm.cpp:65-140). Builds VAR_TYP/ALT/ABS/REL from the
-    /// current H0/H1 + flat over the polymorphic sites, computes the 4-het
-    /// segmentation, and sizes all scratch arrays.
+    /// reallocate. Builds VAR_TYP/ALT/ABS/REL from the current H0/H1 + flat over
+    /// the polymorphic sites, computes the 4-het segmentation, and sizes all
+    /// scratch arrays.
     ///
     /// `poly_sites[l]` = absolute site index of the l-th polymorphic site.
-    /// `lq[abs]` = the C++ `C->lq_flag[abs]` (true => not HQ => emission-skipped).
+    /// `lq[abs]` = the per-site low-quality flag (true => not HQ => emission-skipped).
     fn reallocate(
         &mut self,
         h0: &[bool],
@@ -1447,7 +1445,7 @@ impl PhasingHmm {
         poly_sites: &[i32],
         lq: &[bool],
     ) {
-        // ---- VARIANT TYPE AND INDEXING (cpp:66-96) ----
+        // ---- VARIANT TYPE AND INDEXING ----
         self.var_typ.clear();
         self.var_alt.clear();
         self.var_abs.clear();
@@ -1479,7 +1477,7 @@ impl PhasingHmm {
             // flat/lq HOMs are skipped entirely.
         }
 
-        // ---- SEGMENTATION (cpp:99-116) ----
+        // ---- SEGMENTATION ----
         // Segments of exactly 4 PEAK_HETs; the 4th het OPENS the next segment
         // (do NOT advance l, do NOT count this var into nv when n_hets==4).
         let mut nv: i32 = 0;
@@ -1504,7 +1502,7 @@ impl PhasingHmm {
         self.n_segs = self.segments.len();
         self.dip_sampled = vec![-1; self.n_segs];
 
-        // ---- REALLOCATE MEMORY (cpp:118-139) ----
+        // ---- REALLOCATE MEMORY ----
         let k = self.n_states;
         self.prob.resize(k * HAP_NUMBER, 0.0);
         self.prob_sum_k.resize(k, 0.0);
@@ -1531,7 +1529,7 @@ impl PhasingHmm {
     //                          FORWARD
     // ===================================================================
 
-    /// forward (phasing_hmm.cpp:142-191).
+    /// forward pass.
     fn forward(
         &mut self,
         ref_bm: &HaplotypeBitmatrix,
@@ -1627,7 +1625,7 @@ impl PhasingHmm {
     //                          BACKWARD
     // ===================================================================
 
-    /// backward (phasing_hmm.cpp:193-245).
+    /// backward pass.
     fn backward(&mut self, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32], cm: &[f64], mism: f32) {
         let n_var = self.var_typ.len() as i32;
         self.curr_segment_index = self.n_segs as i32 - 1;
@@ -1725,7 +1723,7 @@ impl PhasingHmm {
     //                          REPHASE (public entry)
     // ===================================================================
 
-    /// rephaseHaplotypes (phasing_hmm.cpp:247-302).
+    /// rephaseHaplotypes.
     ///
     /// Re-lays the phase of the het sites in `h0`/`h1` (both indexed by ABSOLUTE
     /// site) using the diplotype-mosaic segment HMM, given:
@@ -1734,9 +1732,9 @@ impl PhasingHmm {
     ///   - `ref_bm`        : the reference panel (`get(abs_site, hap_id)`),
     ///   - `cm`            : per-absolute-site genetic position in cM,
     ///   - `params`        : phasing emission error + Ne (for `nrho`),
-    ///   - `poly_sites`    : absolute indices of the polymorphic sites (C->polymorphic_sites),
-    ///   - `mono_sites`    : absolute indices of the monomorphic sites (C->monomorphic_sites),
-    ///   - `lq`            : per-site C->lq_flag (true => emission-skipped),
+    ///   - `poly_sites`    : absolute indices of the polymorphic sites,
+    ///   - `mono_sites`    : absolute indices of the monomorphic sites,
+    ///   - `lq`            : per-site low-quality flag (true => emission-skipped),
     ///   - `rng_u01`       : caller's deterministic uniform [0,1) source.
     ///
     /// `cond_haps.len()` defines K = the number of conditioning states.
@@ -1769,7 +1767,7 @@ impl PhasingHmm {
         }
         self.backward(ref_bm, cond_haps, cm, mism);
 
-        // Seed dip_sampled[0] from the segment-0 backward marginals (cpp:250-256).
+        // Seed dip_sampled[0] from the segment-0 backward marginals.
         self.sum_dprobs = 0.0;
         let sss0 = self.phasing_prob_sum_sum[0];
         for d in 0..HAP_NUMBER {
@@ -1782,7 +1780,7 @@ impl PhasingHmm {
         // forward (fills dip_sampled[seg+1] + imputeProbOf1s).
         self.forward(ref_bm, cond_haps, cm, mism, rng_u01);
 
-        // Re-lay H0/H1 at PEAK_HET and FLAT_HET sites (cpp:258-292).
+        // Re-lay H0/H1 at PEAK_HET and FLAT_HET sites.
         self.curr_segment_index = 0;
         self.curr_segment_locus = 0;
         self.curr_missing_locus = 0;
@@ -1819,8 +1817,8 @@ impl PhasingHmm {
                 p10 = (p10 / sum).clamp(0.0, 1.0);
                 sum = p01 + p10;
                 let rf = (rng_u01() * sum) < p01;
-                // VERBATIM GLIMPSE2 DOUBLE-WRITE QUIRK (cpp:283-284): both lines
-                // write H0; H1 is never written here, so H0 ends as !rf.
+                // GLIMPSE2-MODEL DOUBLE-WRITE QUIRK: both lines write H0; H1 is
+                // never written here, so H0 ends as !rf.
                 h0[abs] = rf;
                 h0[abs] = !rf;
                 self.curr_missing_locus += 1;
@@ -1835,11 +1833,11 @@ impl PhasingHmm {
             idx += 1;
         }
 
-        // Shuffle het at monomorphic sites (cpp:294-301).
+        // Shuffle het at monomorphic sites.
         self.shuffle_monomorphic_hets(h0, h1, mono_sites, rng_u01);
     }
 
-    /// Het-at-monomorphic shuffle (cpp:294-301): for each mono site where
+    /// Het-at-monomorphic shuffle: for each mono site where
     /// H0 != H1, randomly assign H0=rf, H1=!rf with rf ~ U<0.5.
     fn shuffle_monomorphic_hets(
         &self,
@@ -1859,7 +1857,7 @@ impl PhasingHmm {
     }
 }
 
-/// Horizontal add of 8 f32 lanes. GLIMPSE2 uses an AVX2 reduction tree
+/// Horizontal add of 8 f32 lanes. The SIMD paths use an AVX2 reduction tree
 /// (low128+high128, movehdup, movehl); this scalar left-to-right sum differs
 /// in the last ULPs but is R²-equivalent (see module doc).
 #[inline]
@@ -1880,7 +1878,7 @@ fn hadd_slice(a: &[f32]) -> f32 {
     s
 }
 
-/// GLIMPSE2 `rng.sample(probs, sum)` (random_number.h:73-97 semantics):
+/// Cumulative-walk `sample(probs, sum)` semantics:
 /// `u = get_float()*sum; csum = v[0]; for i in 0..len-1 {if u<=csum return i; csum+=v[i+1]}; len-1`.
 /// `rng_u01()` supplies the uniform [0,1) draw (= get_float()).
 #[inline]
@@ -1900,7 +1898,7 @@ fn rng_sample(probs: &[f32; HAP_NUMBER], sum: f32, rng_u01: &mut impl FnMut() ->
 mod tests {
     use super::*;
 
-    /// EMIT0/EMIT1 must match the literal C++ table (phasing_hmm.cpp:38-56).
+    /// EMIT0/EMIT1 must match the literal emission table.
     #[test]
     fn emit_tables_literal() {
         let p = LsParams { err_phase: 0.25, ..Default::default() };
@@ -1989,7 +1987,7 @@ mod tests {
         // Mono het: the shuffle keeps it het (H0=rf, H1=!rf).
         assert_ne!(h0[5], h1[5], "mono het site5 became homozygous");
 
-        // FLAT_HET site4: due to the verbatim GLIMPSE2 double-write quirk, only
+        // FLAT_HET site4: due to the GLIMPSE2-model double-write quirk, only
         // H0 is rewritten; H1 keeps its incoming value. We only assert it ran
         // (no panic) and h0[4] is a valid bool — covered by reaching here.
         let _ = (h0[4], h1[4]);

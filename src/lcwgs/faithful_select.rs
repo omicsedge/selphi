@@ -26,11 +26,11 @@
 //! both to the flattened, deduped union of that sample's PBWT layers (capped at
 //! `kpbwt`). This matches GLIMPSE2's per-individual conditioning.
 //!
-//! The driving logic mirrors `sparse_ls::caller::phase_iteration`'s SELECTION half
+//! The driving logic reuses `sparse_ls::caller::phase_iteration`'s SELECTION half
 //! (INIT: `init_rare_tar` + `perform_selection_rare_init_gl`; else:
 //! `update_haplotypes` + `transpose_rare_tar` + `match_haps_from_compressed_pbwt_small`),
 //! but feeds it the HYBRID's current state (its `gl3` + `hap_alleles`) instead of
-//! GLIMPSE2's own `Genotype` store.
+//! a standalone `Genotype` store.
 
 use crate::common::HaplotypeBitmatrix;
 use crate::sparse_ls::haplotype_set::{GenotypeView, TargetHaplotypeSet};
@@ -129,9 +129,9 @@ impl FaithfulSelector {
         ref_hs.build_from_panel(ref_bm, &vmap);
         ref_hs.build_sparse_pbwt(&vmap, ref_bm);
 
-        // --- GLIMPSE2 params mapped from LcwgsParams. ---
-        // kpbwt is clamped to n_ref-1 in build() below (if >= n_ref the C++
-        // selection short-circuits to "whole panel"; we want the PBWT path).
+        // --- Selection params mapped from LcwgsParams. ---
+        // kpbwt is clamped to n_ref-1 in build() below (if >= n_ref the selection
+        // short-circuits to "whole panel"; we want the PBWT path).
         let ls_params = LsParams {
             err_phase: 1e-4,
             err_imp: params.epsilon,
@@ -215,7 +215,7 @@ impl FaithfulSelector {
     /// return the per-target-hap conditioning (`Vec<Vec<u32>>`, len 2*n_samples).
     /// The FIRST call runs the INIT stage (GL-seeded rare init + uniform top-up);
     /// every subsequent call runs the iterate stage (update + transpose +
-    /// compressed-PBWT match). Mirrors `caller::phase_iteration`'s selection half.
+    /// compressed-PBWT match), reusing `caller::phase_iteration`'s selection half.
     pub fn select(&mut self, hap_alleles: &[u8]) -> Vec<Vec<u32>> {
         self.refresh_haps(hap_alleles);
 

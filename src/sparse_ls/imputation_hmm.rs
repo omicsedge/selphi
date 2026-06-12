@@ -1,7 +1,4 @@
-//! Faithful scalar Rust reimplementation of GLIMPSE2's `imputation_hmm.{h,cpp}`.
-//!
-//! reimplementation of
-//! `_archive/reference_code/GLIMPSE2/phase/src/models/imputation_hmm.{h,cpp}`.
+//! Scalar Rust implementation of the GLIMPSE2 imputation HMM.
 //!
 //! This is the DOSE producer: the per-haplotype Li–Stephens forward-backward over
 //! the conditioning set's `polymorphic_sites`. It consumes a [`ConditioningSet`]
@@ -11,39 +8,36 @@
 //! and writes the leave-one-out posterior allele probabilities `HP` (length
 //! `2*n_tot_sites`) for ALL absolute sites. Stage-2 of the caller turns two `HP`
 //! arrays (one per haplotype of a diploid) into DS/GP via `store_genotype_posteriors`
-//! (genotype.cpp) — NOT done here; this module stops at `HP`.
+//! — NOT done here; this module stops at `HP`.
 //!
 //! ─────────────────────────────────────────────────────────────────────────────
-//! WHY SCALAR (not the AVX2 reference verbatim):
+//! WHY SCALAR (not the SIMD reference verbatim):
 //!
-//! GLIMPSE2's `forward`/`backward` are written in AVX2 with a `horizontal_add`
-//! reduction tree (low128+high128, movehdup, movehl — imputation_hmm.cpp:28-39).
-//! The C++ runs the SIMD body over `nstatesMD8 = (n_states/8)*8` lanes then a
-//! SCALAR tail over `[nstatesMD8, n_states)`. The SCALAR TAIL loops (cpp:111-114,
-//! 138-142, 164-168, 217-221, 252-257, 299-304, 336-342) are the canonical math;
-//! this port reproduces EXACTLY those scalar recurrences for ALL k in 0..n_states.
-//! That is GLIMPSE2's own non-SIMD definition of the recursion, so it is faithful;
-//! it differs from the AVX2 path only in f32 reduction ORDER (last ULPs), exactly
-//! as PORT_SPEC riskiest_parts #3 describes (R²-equivalent, |Δ|~1e-4, NOT
-//! bit-identical to the AVX2 horizontal-add). For bit-identity against an AVX2
-//! golden dump, replicate the lane layout + reduction tree (future SIMD port).
+//! The GLIMPSE2 forward/backward are written in AVX2 with a horizontal-add
+//! reduction tree (low128+high128, movehdup, movehl). The SIMD body runs over
+//! `nstatesMD8 = (n_states/8)*8` lanes then a SCALAR tail over the remainder. The
+//! scalar tail loops are the canonical math; this implementation reproduces EXACTLY
+//! those scalar recurrences for ALL k in 0..n_states.
+//! That is the non-SIMD definition of the recursion, so it is faithful;
+//! it differs from the AVX2 path only in f32 reduction ORDER (last ULPs)
+//! (R²-equivalent, |Δ|~1e-4, NOT bit-identical to the AVX2 horizontal-add). For
+//! bit-identity against an AVX2 dump, replicate the lane layout + reduction tree.
 //!
-//! In the scalar port `modK == n_states` (no 8-padding), so `Alpha[l*modK+k]`
-//! becomes `alpha[l*n_states + k]`. `Hvar.getByte` (the SIMD bit-broadcast,
-//! cpp:130/155/204/234/282/316) is never needed; the scalar tail's per-bit
-//! `Hvar.get(l, k)` is used for every k.
+//! In the scalar path `modK == n_states` (no 8-padding), so `Alpha[l*modK+k]`
+//! becomes `alpha[l*n_states + k]`. The SIMD bit-broadcast (`getByte`) is never
+//! needed; the scalar tail's per-bit `Hvar.get(l, k)` is used for every k.
 //!
 //! ─────────────────────────────────────────────────────────────────────────────
-//! SITE INDEX SPACES (mirror the C++ exactly):
+//! SITE INDEX SPACES:
 //!   * `l`   — relative index into `polymorphic_sites` (0..P) — the HMM time axis.
 //!   * `s = polymorphic_sites[l]` — ABSOLUTE site index (0..n_tot_sites).
 //!   * `flat` / `lq_flag` / `Emissions` / `HL` / `HP` are indexed by ABSOLUTE site.
 //!   * `Hvar.get(l, k)` is indexed by RELATIVE poly-site `l` (variant-major rows).
 //!
-//! EMISSION / SKIP RULE (cpp:88/195): a polymorphic site whose `flat[s] || lq_flag[s]`
+//! EMISSION / SKIP RULE: a polymorphic site whose `flat[s] || lq_flag[s]`
 //! is true does NOT emit (transition-only forward; in backward its `prob_obs` is
 //! formed from the *unconditioned* hidden posterior, then multiplied by `HL` only
-//! when it is LQ-but-not-flat, cpp:262-266). Otherwise it emits with `Emissions[2s]`.
+//! when it is LQ-but-not-flat). Otherwise it emits with `Emissions[2s]`.
 
 use crate::sparse_ls::conditioning_set::ConditioningSet;
 
@@ -97,23 +91,23 @@ fn use_avx2_g2x() -> bool {
     })
 }
 
-/// Faithful port of `class imputation_hmm` (imputation_hmm.h:39-61).
+/// The imputation HMM (the `imputation_hmm` class in the GLIMPSE2 model).
 ///
 /// Borrows the [`ConditioningSet`] for the lifetime of a `compute_posteriors`
-/// call (the C++ holds a `conditioning_set *` member; we take it per-call to keep
-/// the struct borrow-free, matching the rest of this reference engine).
+/// call (rather than holding it as a member; we take it per-call to keep
+/// the struct borrow-free, matching the rest of this engine).
 ///
-/// `modK` in the C++ is the 8-padded state count; in this scalar port we keep an
+/// `modK` is the 8-padded state count; in this scalar path we keep an
 /// explicit `mod_k` field set to `n_states` (no padding) so the `Alpha` indexing
-/// arithmetic `l*mod_k + k` reads identically to the C++ `l*modK+k`.
+/// arithmetic `l*mod_k + k` reads identically to `l*modK+k`.
 pub struct ImputationHmm {
-    /// `modK` (imputation_hmm.h:42). Scalar port: `mod_k == C->n_states`.
+    /// `modK`. Scalar path: `mod_k == C->n_states`.
     mod_k: usize,
-    /// `Emissions` — per-ABSOLUTE-site normalized emission pair, length `2*n_tot`
-    /// (imputation_hmm.h:45). `Emissions[2s+a]` = P(obs allele | hidden=a)-ish.
+    /// `Emissions` — per-ABSOLUTE-site normalized emission pair, length `2*n_tot`.
+    /// `Emissions[2s+a]` = P(obs allele | hidden=a)-ish.
     emissions: Vec<f32>,
-    /// FORWARD-CHECKPOINTED `Alpha` (memory win, bit-identical). GLIMPSE2 stores the
-    /// full forward matrix `polymorphic_sites.len() × mod_k` (imputation_hmm.h:46),
+    /// FORWARD-CHECKPOINTED `Alpha` (memory win, bit-identical). The full forward
+    /// matrix is `polymorphic_sites.len() × mod_k`,
     /// which is the dominant transient (≈ p·K·4 bytes ⇒ multi-GB at biobank K).
     /// We instead store forward COLUMNS only at √p CHECKPOINTS (`alpha`, here reused
     /// as the checkpoint store, `n_chk × mod_k`) plus one recomputed BLOCK
@@ -127,9 +121,9 @@ pub struct ImputationHmm {
     /// √p checkpoint stride (number of forward columns per block). The per-block
     /// forward-recompute scratch is a short-lived local `blk` in the backward.
     chk_stride: usize,
-    /// `AlphaSum` — per-poly-site forward normalizer (imputation_hmm.h:47). FULL.
+    /// `AlphaSum` — per-poly-site forward normalizer. FULL.
     alpha_sum: Vec<f32>,
-    /// `Beta` — backward row, length `mod_k` (imputation_hmm.h:48).
+    /// `Beta` — backward row, length `mod_k`.
     beta: Vec<f32>,
     /// LSB-first bit-packed conditioning alleles for the SIMD paths:
     /// `polymorphic_sites.len() × ceil(n_states/64)` u64, bit `k` of row `l`
@@ -147,9 +141,9 @@ impl Default for ImputationHmm {
 }
 
 impl ImputationHmm {
-    /// `imputation_hmm(conditioning_set *)` (imputation_hmm.cpp:41-45).
+    /// Construct an empty `ImputationHmm`.
     ///
-    /// The C++ ctor sizes `Emissions` to `2*C->n_tot_sites` immediately; we defer
+    /// `Emissions` is normally sized to `2*C->n_tot_sites` at construction; we defer
     /// that to `resize()`/`init()` (called from `compute_posteriors`) so the struct
     /// holds no borrow. `modK = 0`.
     pub fn new() -> Self {
@@ -164,18 +158,18 @@ impl ImputationHmm {
         }
     }
 
-    /// `resize()` (imputation_hmm.cpp:53-59).
+    /// Size `Alpha`/`AlphaSum`/`Beta` for the current conditioning set.
     ///
-    /// C++: `modK = ((n_states/8)+(n_states%8?1:0))*8` then sizes Alpha/AlphaSum/Beta.
-    /// Scalar port: `mod_k = n_states` (no 8-padding — the scalar recurrence over
+    /// The reference uses `modK = ((n_states/8)+(n_states%8?1:0))*8`.
+    /// Scalar path: `mod_k = n_states` (no 8-padding — the scalar recurrence over
     /// all k in 0..n_states is the canonical math; padding lanes only exist to feed
     /// the AVX2 body, and the padded entries never affect the scalar sums because
     /// the scalar tail covers exactly `[0, n_states)`).
     fn resize(&mut self, c: &ConditioningSet) {
-        // cpp:55 — modK = roundup8(n_states). Scalar: use n_states directly.
+        // modK = roundup8(n_states). Scalar: use n_states directly.
         self.mod_k = c.n_states;
         let p = c.polymorphic_sites.len();
-        // cpp:56-58 — AlphaSum kept FULL (p scalars). Beta is one row (mod_k).
+        // AlphaSum kept FULL (p scalars). Beta is one row (mod_k).
         self.alpha_sum.clear();
         self.alpha_sum.resize(p, 0.0f32);
         self.beta.clear();
@@ -191,19 +185,18 @@ impl ImputationHmm {
         self.alpha.resize(need_chk, 0.0f32);
     }
 
-    /// `init(const std::vector<float>& HL)` (imputation_hmm.cpp:61-71).
+    /// Initialize `Emissions` from the per-haplotype genotype likelihoods `HL`.
     ///
     /// Per ABSOLUTE site `l`, the normalized emission pair:
     ///   p0 = HL[2l]*ee_imp + HL[2l+1]*ed_imp
     ///   p1 = HL[2l]*ed_imp + HL[2l+1]*ee_imp
     ///   Emissions[2l+a] = pa / (p0+p1)
-    /// `ee_imp`/`ed_imp` are f32 (conditioning_set.h:71-73); all math is f32.
+    /// `ee_imp`/`ed_imp` are f32; all math is f32.
     fn init(&mut self, c: &ConditioningSet, hl: &[f32]) {
         self.emissions.clear();
         self.emissions.resize(2 * c.n_tot_sites, 0.0f32);
         let ee = c.ee_imp;
         let ed = c.ed_imp;
-        // cpp:63-69
         for l in 0..c.n_tot_sites {
             let h0 = hl[2 * l];
             let h1 = hl[2 * l + 1];
@@ -215,7 +208,7 @@ impl ImputationHmm {
         }
     }
 
-    /// `computePosteriors(HL, flat, HP)` (imputation_hmm.cpp:73-78).
+    /// Compute the leave-one-out posterior allele probabilities `HP`.
     ///
     /// `HL`  : length `2*n_tot_sites` per-haplotype genotype likelihoods.
     /// `flat`: length `n_tot_sites` per-site "no informative GL" mask.
@@ -234,7 +227,6 @@ impl ImputationHmm {
         debug_assert_eq!(hl.len(), 2 * c.n_tot_sites, "HL must be 2*n_tot_sites");
         debug_assert!(flat.len() >= c.n_tot_sites, "flat must cover n_tot_sites");
         debug_assert!(hp.len() >= 2 * c.n_tot_sites, "HP must be >= 2*n_tot_sites");
-        // cpp:74-77
         self.resize(c);
         self.init(c, hl);
 
@@ -300,16 +292,16 @@ impl ImputationHmm {
         }
     }
 
-    /// `forward(std::vector<bool>& flat)` (imputation_hmm.cpp:80-172).
+    /// Li–Stephens forward over `polymorphic_sites`.
     ///
-    /// Li–Stephens forward over `polymorphic_sites`. Scalar reproduction of the
-    /// canonical recurrence (the C++ scalar TAIL loops, applied to all k):
-    ///   fact1 = (l==0 ? 1/nstates : t[l-1]/nstates)   [cpp:97/124/146]
-    ///   fact2 = nt[l-1] / AlphaSum[l-1]               [cpp:98/147]
-    ///   skip(flat||lq): Alpha[l,k] = Alpha[l-1,k]*fact2 + fact1          (cpp:112)
-    ///   emit:           Alpha[l,k] = (Alpha[l-1,k]*fact2 + fact1)*emit[a](cpp:166)
-    ///   l==0 skip:      Alpha[0,k] = 1/nstates, AlphaSum=1               (cpp:92-93)
-    ///   l==0 emit:      Alpha[0,k] = emit[a]/nstates                     (cpp:140)
+    /// Scalar reproduction of the canonical recurrence (the scalar tail loops,
+    /// applied to all k):
+    ///   fact1 = (l==0 ? 1/nstates : t[l-1]/nstates)
+    ///   fact2 = nt[l-1] / AlphaSum[l-1]
+    ///   skip(flat||lq): Alpha[l,k] = Alpha[l-1,k]*fact2 + fact1
+    ///   emit:           Alpha[l,k] = (Alpha[l-1,k]*fact2 + fact1)*emit[a]
+    ///   l==0 skip:      Alpha[0,k] = 1/nstates, AlphaSum=1
+    ///   l==0 emit:      Alpha[0,k] = emit[a]/nstates
     ///   AlphaSum[l]     = Σ_k Alpha[l,k]  (Alpha is NOT renormalized;
     ///                     the scaling is folded into fact2 = nt/AlphaSum[l-1]).
     /// One scalar forward COLUMN step: compute column `l` into `curr` from `prev`
@@ -401,25 +393,25 @@ impl ImputationHmm {
         }
     }
 
-    /// `backward(HL, flat, HP)` (imputation_hmm.cpp:174-367).
+    /// Backward pass + posterior emission.
     ///
-    /// Backward pass + posterior emission. `Beta` initialised to all 1 (cpp:183);
-    /// `betaSumNext` carries the `l+1` normalizer (cpp:176, 352). For each poly site
+    /// `Beta` initialised to all 1;
+    /// `betaSumNext` carries the `l+1` normalizer. For each poly site
     /// (l descending) it accumulates the per-allele hidden posterior `prob_hid`,
     /// folds the emission error into `prob_obs`, then normalizes into `HP[2s+{0,1}]`.
-    /// Finally the monomorphic sites are imputed by direct emission (cpp:354-366).
+    /// Finally the monomorphic sites are imputed by direct emission.
     ///
-    /// KEY subtleties (PORT_SPEC imputation_hmm_spec):
-    ///   * fact1 = (l==last ? 1/nstates : t[l]/nstates)   [cpp:199/226/276/308]
-    ///   * fact2 = nt[l] / betaSumNext                     [cpp:227/309]
+    /// KEY subtleties:
+    ///   * fact1 = (l==last ? 1/nstates : t[l]/nstates)
+    ///   * fact2 = nt[l] / betaSumNext
     ///   * EMIT site: `prob_hid` accumulates the PRE-emission Beta
-    ///     (Beta[k]*fact2+fact1) BEFORE multiplying Beta by emit (cpp:339-340), and
-    ///     at l==last accumulates the bare Alpha (pre-Beta, cpp:301). Then the
-    ///     LEAVE-ONE-OUT divide `prob_hid[a] /= emit[a]` (cpp:344-345) removes this
-    ///     site's own emission contribution before re-applying HL (cpp:346-347).
-    ///   * SKIP site (flat||lq): `prob_obs` formed from `prob_hid` via ee/ed
-    ///     (cpp:260-261); multiplied by HL ONLY if !flat (i.e. LQ-but-has-data,
-    ///     cpp:262-266). flat skip sites get NO HL factor.
+    ///     (Beta[k]*fact2+fact1) BEFORE multiplying Beta by emit, and
+    ///     at l==last accumulates the bare Alpha (pre-Beta). Then the
+    ///     LEAVE-ONE-OUT divide `prob_hid[a] /= emit[a]` removes this
+    ///     site's own emission contribution before re-applying HL.
+    ///   * SKIP site (flat||lq): `prob_obs` formed from `prob_hid` via ee/ed;
+    ///     multiplied by HL ONLY if !flat (i.e. LQ-but-has-data).
+    ///     flat skip sites get NO HL factor.
     /// One scalar backward COLUMN step at poly-index `l`, reading the forward column
     /// `acol` (= `Alpha[l]`) and rolling `self.beta`/`beta_sum_next`. Writes the two
     /// `HP` entries for the absolute site. Returns this column's `beta_sum` (the next
@@ -514,7 +506,7 @@ impl ImputationHmm {
         let stride = self.chk_stride;
         let n_chk = self.alpha.len() / mod_k.max(1);
 
-        // cpp:176/183 — running normalizers + Beta all 1.
+        // Running normalizers + Beta all 1.
         let mut beta_sum_next = 0.0f32;
         for b in self.beta.iter_mut() {
             *b = 1.0f32;
@@ -534,7 +526,7 @@ impl ImputationHmm {
                 let (left, right) = blk.split_at_mut(i * mod_k);
                 self.fwd_col_scalar(c, flat, l, &left[(i - 1) * mod_k..i * mod_k], &mut right[0..mod_k]);
             }
-            // cpp:185 — l descending over this block. `blk` is a LOCAL buffer (does
+            // l descending over this block. `blk` is a LOCAL buffer (does
             // not borrow self), so `&blk[..]` (read) and `&mut self` (beta) in
             // bwd_col_scalar are disjoint — no per-column copy needed.
             for l in (lo..hi).rev() {
@@ -546,7 +538,7 @@ impl ImputationHmm {
             }
         }
 
-        // cpp:354-366 — MONOMORPHIC sites: direct emission toward the major allele,
+        // MONOMORPHIC sites: direct emission toward the major allele,
         // no HMM. `major_alleles[abs]` (bool) indexes which prob_obs lane gets ee.
         let ee = c.ee_imp;
         let ed = c.ed_imp;
@@ -554,15 +546,13 @@ impl ImputationHmm {
             let abs = abs_i as usize;
             let maj = c.major_alleles[abs] as usize;
             let mut prob_obs = [0.0f32; 2];
-            // cpp:357-358
             prob_obs[maj] = ee;
             prob_obs[1 - maj] = ed;
-            // cpp:359-363 — apply HL only if NOT flat.
+            // Apply HL only if NOT flat.
             if !flat[abs] {
                 prob_obs[0] *= hl[2 * abs];
                 prob_obs[1] *= hl[2 * abs + 1];
             }
-            // cpp:364-365
             let denom = prob_obs[0] + prob_obs[1];
             hp[2 * abs] = prob_obs[0] / denom;
             hp[2 * abs + 1] = prob_obs[1] / denom;
@@ -968,7 +958,7 @@ impl ImputationHmm {
                         k += 1;
                     }
                 }
-                // LEAVE-ONE-OUT divide + re-apply HL (cpp:344-347).
+                // LEAVE-ONE-OUT divide + re-apply HL.
                 prob_hid[0] /= e0s;
                 prob_hid[1] /= e1s;
                 prob_obs = [

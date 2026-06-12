@@ -1,11 +1,6 @@
-//! Faithful reimplementation of GLIMPSE2's per-target genotype / haplotype-likelihood
-//! container.
-//!
-//! C++ sources:
-//!   - `phase/src/objects/genotype.cpp` / `genotype.h` (the `genotype` class +
-//!     `inferred_genotype` struct).
-//!   - `phase/src/io/genotype_reader.cpp` (the `flat` rule + PL/GL → byte ingest).
-//!   - `phase/src/io/genotype_writer.cpp` (GP/DS/GT output mapping).
+//! Reimplementation of the GLIMPSE2 per-target genotype / haplotype-likelihood
+//! container (the `genotype` class + `inferred_genotype` struct, the `flat` rule
+//! and PL/GL → byte ingest, and the GP/DS/GT output mapping).
 //!
 //! This holds: the PHRED `GL` byte store ((ploidy+1)·n_var), the `flat`/peaked
 //! classification, the current-phase `h0`/`h1` bool storage, the HL (haploid
@@ -16,40 +11,38 @@
 //! HMM code consume.
 //!
 //! ==========================================================================
-//! IMPORTANT CORRECTION TO PORT_SPEC.md (flagged as UNKNOWN #1 in the report):
+//! IMPORTANT CORRECTNESS NOTE on the `flat` classification:
 //!
-//! PORT_SPEC.md says the flat classification is "peakedness < 1/3 threshold ->
-//! VAR_FLAT_HET". That is NOT what GLIMPSE2 does. There is NO 1/3 (0.3333…)
-//! constant ANYWHERE in the GLIMPSE2 source (grepped: no `1.0f/3`, `0.333`,
-//! `peaked`, etc.). The ACTUAL rule, verbatim from the reader:
+//! The flat classification is NOT a "peakedness < 1/3 threshold" test. There is
+//! no 1/3 (0.3333…) constant and no peakedness ratio anywhere. The actual rule:
 //!
-//!   genotype::allocate (genotype.cpp:51):  flat = vector<bool>(n_variants, TRUE)
-//!   genotype_reader (genotype_reader.cpp:370/402/580/628):
-//!       if (!(gl[0]==gl[1] && gl[0]==gl[ploidy]))  G->flat[i_site] = false;
+//!   `flat` is allocated all-TRUE for every site, then for each site cleared via
+//!       if (!(gl[0]==gl[1] && gl[0]==gl[ploidy]))  flat[i_site] = false;
 //!
 //! i.e. a site is `flat` (== "no genotype information for this sample") IFF its
 //! stored PL/GL triple is exactly constant (all bytes equal — typically all 0,
 //! the allocation default for a site with no reads). Any non-constant triple
 //! makes it NON-flat ("peaked"). There is no threshold and no peakedness ratio.
 //!
-//! VAR_FLAT_HET (phasing_hmm) is a DOWNSTREAM label assigned in the DMM, NOT a
-//! peakedness test: it means a HET (H0!=H1) at a site that is `flat` OR low-Q.
-//! So the genotype module's job re: "flat" is purely the all-equal-PL test; the
+//! VAR_FLAT_HET is a DOWNSTREAM label assigned in the DMM, NOT a peakedness
+//! test: it means a HET (H0!=H1) at a site that is `flat` OR low-Q. So the
+//! genotype module's job re: "flat" is purely the all-equal-PL test; the
 //! HET-ness is decided later from the sampled H0/H1. See [`set_flat_from_pl`].
 //! ==========================================================================
 
 use crate::sparse_ls::unphred::unphred;
 
 // ---------------------------------------------------------------------------
-// inferred_genotype  (genotype.h:38-78)
+// inferred_genotype
 // ---------------------------------------------------------------------------
 
-/// Sparse per-variant stored posterior. (genotype.h:38-78, `inferred_genotype`.)
+/// Sparse per-variant stored posterior (the `inferred_genotype` record).
 ///
-/// Layout note: GLIMPSE2 packs the iteration "skip" offset into `gp0` (an integer
-/// number of 1.0f added when a variant is first stored on a late iteration), so
-/// the averaged dose stays correct after dividing by `stored_cnt`. We reproduce
-/// that EXACTLY (see [`Genotype::store_genotype_posteriors`] /
+/// Layout note: the GLIMPSE2 model packs the iteration "skip" offset into `gp0`
+/// (an integer number of 1.0f added when a variant is first stored on a late
+/// iteration), so the averaged dose stays correct after dividing by
+/// `stored_cnt`. We reproduce that EXACTLY (see
+/// [`Genotype::store_genotype_posteriors`] /
 /// `store_genotype_posteriors_haploid`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InferredGenotype {
@@ -60,15 +53,15 @@ pub struct InferredGenotype {
 }
 
 impl InferredGenotype {
-    /// genotype.h:43-48 default ctor (idx=0, gp0=gp1=0, hds=false).
+    /// Default ctor (idx=0, gp0=gp1=0, hds=false).
     #[inline]
     pub fn new(idx: i32, gp0: f32, gp1: f32, hds: bool) -> Self {
         InferredGenotype { idx, gp0, gp1, hds }
     }
 
-    /// genotype.h:54-60 `infer()` — argmax over (gp0, gp1, gp2=1-gp1-gp0).
+    /// `infer()` — argmax over (gp0, gp1, gp2=1-gp1-gp0).
     /// Returns 0 (0/0), 1 (0/1), or 2 (1/1). Strict `>` on all three with a
-    /// final `return 0` tie/fallthrough — ties resolve to 0 (verbatim).
+    /// final `return 0` tie/fallthrough — ties resolve to 0.
     #[inline]
     pub fn infer(&self) -> i32 {
         let gp2 = 1.0f32 - self.gp1 - self.gp0;
@@ -84,13 +77,13 @@ impl InferredGenotype {
         0
     }
 
-    /// genotype.h:62-64 `getGp2()` — clamp(1 - gp1 - gp0, 0, 1).
+    /// `getGp2()` — clamp(1 - gp1 - gp0, 0, 1).
     #[inline]
     pub fn get_gp2(&self) -> f32 {
         (1.0f32 - self.gp1 - self.gp0).clamp(0.0, 1.0)
     }
 
-    /// genotype.h:66-68 `infer_haploid()` — gp1 > gp0.
+    /// `infer_haploid()` — gp1 > gp0.
     #[inline]
     pub fn infer_haploid(&self) -> bool {
         self.gp1 > self.gp0
@@ -108,44 +101,44 @@ impl InferredGenotype {
 pub use crate::sparse_ls::haplotype_set::GenotypeView;
 
 // ---------------------------------------------------------------------------
-// genotype  (genotype.h:81-136, genotype.cpp)
+// genotype
 // ---------------------------------------------------------------------------
 
-/// Per-target-individual genotype state. (genotype.h:81-136, class `genotype`.)
+/// Per-target-individual genotype state (the `genotype` class).
 pub struct Genotype {
-    // --- INTERNAL DATA (genotype.h:84-89) ---
+    // --- INTERNAL DATA ---
     pub name: String,
-    /// Index in the genotype_set container (genotype.h:85).
+    /// Index in the genotype_set container.
     pub index: i32,
-    /// Number of variants (== n_tot_sites). (genotype.h:86)
+    /// Number of variants (== n_tot_sites).
     pub n_variants: usize,
-    /// 1 or 2 (2 is the default). (genotype.h:87)
+    /// 1 or 2 (2 is the default).
     pub ploidy: i32,
-    /// First target-hap id for this individual. (genotype.h:88)
+    /// First target-hap id for this individual.
     pub hapid: i32,
-    /// Number of MAIN-stage iterations stored so far. (genotype.h:89)
+    /// Number of MAIN-stage iterations stored so far.
     pub stored_cnt: i32,
 
     /// Original PHRED genotype likelihoods, layout `(ploidy+1)*n_variants`,
-    /// each in 0..=255 (already min-capped at read time). (genotype.h:91)
+    /// each in 0..=255 (already min-capped at read time).
     pub gl: Vec<u8>,
     /// `flat[l]` — TRUE iff the PL triple at l is all-equal (no info). Default
-    /// TRUE for every site. (genotype.h:92, genotype.cpp:51)
+    /// TRUE for every site.
     pub flat: Vec<bool>,
 
-    /// Sparse GP/HS store. (genotype.h:95)
+    /// Sparse GP/HS store.
     pub stored_data: Vec<InferredGenotype>,
 
-    /// First haplotype hard calls, per absolute site. (genotype.h:98)
+    /// First haplotype hard calls, per absolute site.
     pub h0: Vec<bool>,
-    /// Second haplotype hard calls (empty / unused if ploidy==1). (genotype.h:99)
+    /// Second haplotype hard calls (empty / unused if ploidy==1).
     pub h1: Vec<bool>,
 }
 
 impl Genotype {
-    /// genotype.cpp:28-36 ctor + genotype.cpp:49-54 `allocate()`, fused.
+    /// Construct + allocate, fused.
     /// `GL` allocated to `(ploidy+1)*n_variants` zeros; `flat` all-true; `H0`
-    /// all-false; `H1` all-false only when diploid. (genotype.cpp:50-53)
+    /// all-false; `H1` all-false only when diploid.
     pub fn new(name: String, index: i32, n_variants: usize, ploidy: i32, hapid: i32) -> Self {
         let p1 = (ploidy + 1) as usize;
         Genotype {
@@ -169,8 +162,8 @@ impl Genotype {
 
     /// Borrow this individual's state as the [`GenotypeView`] the selection +
     /// HMM modules consume (one per individual, rebuilt each iteration since the
-    /// caller hands it the freshly-sampled H0/H1). Mirrors the C++ pattern of
-    /// passing `*G.vecG[ind]` fields straight into the selection routines.
+    /// caller hands it the freshly-sampled H0/H1). The per-individual fields are
+    /// passed straight into the selection routines.
     #[inline]
     pub fn view(&self) -> GenotypeView<'_> {
         GenotypeView {
@@ -179,27 +172,24 @@ impl Genotype {
             flat: &self.flat,
             h0: &self.h0,
             // h1 is empty for haploids; the selection code only reads it when
-            // ploidy>1, matching the C++ which never touches H1 for haploids.
+            // ploidy>1 and never touches H1 for haploids.
             h1: &self.h1,
         }
     }
 
     // -----------------------------------------------------------------------
-    // GL ingest helpers (genotype_reader.cpp)
+    // GL ingest helpers
     // -----------------------------------------------------------------------
 
-    /// Store one PL/GL triple for absolute site `l` and update `flat`, EXACTLY
-    /// as the reader does. (genotype_reader.cpp:382-403 / 608-628 PL path,
-    /// and :346-372 / 556-580 GL path.)
+    /// Store one PL/GL triple for absolute site `l` and update `flat`.
     ///
     /// `pl` holds the already-decoded, already-min(·,255)-capped PHRED bytes:
     /// for diploid pass `[p00, p01, p11]`, for haploid pass `[p0, p1, _]` (the
-    /// 3rd is ignored when ploidy==1). The reader caps with
-    /// `min(ptr[j], 255)` for PL (genotype_reader.cpp:398-401) or
-    /// `min(lroundf(-10*GL), 255)` for GL (:366-369). We take the bytes
-    /// post-cap so this helper is format-agnostic.
+    /// 3rd is ignored when ploidy==1). The reader caps with `min(ptr[j], 255)`
+    /// for PL or `min(lroundf(-10*GL), 255)` for GL. We take the bytes post-cap
+    /// so this helper is format-agnostic.
     ///
-    /// flat rule (genotype_reader.cpp:402 — the ACTUAL one, not "1/3"):
+    /// flat rule (the ACTUAL one, not "1/3"):
     ///   if !(gl[0]==gl[1] && gl[0]==gl[ploidy]) flat[l]=false;
     /// note `gl[ploidy]` is `gl[1]` for haploid and `gl[2]` for diploid.
     pub fn set_pl(&mut self, l: usize, pl: &[u8; 3]) {
@@ -213,14 +203,14 @@ impl Genotype {
         self.set_flat_from_pl(l);
     }
 
-    /// Recompute `flat[l]` from the currently-stored GL bytes at site `l`.
-    /// (genotype_reader.cpp:402: `flat[l]=false` iff the triple is non-constant.)
-    /// NB this is a ONE-WAY transition in GLIMPSE2: the reader only ever clears
-    /// `flat` (never re-sets it to true), and a site with no data keeps its
-    /// allocation default of `true`. We mirror that: we set false on non-constant,
-    /// and leave it untouched (true) otherwise — so repeated/absent writes never
-    /// resurrect a `false` back to `true`, exactly as the reader's `continue`
-    /// paths (missing/vector-end) leave it.
+    /// Recompute `flat[l]` from the currently-stored GL bytes at site `l`:
+    /// `flat[l]=false` iff the triple is non-constant.
+    /// NB this is a ONE-WAY transition: the reader only ever clears `flat`
+    /// (never re-sets it to true), and a site with no data keeps its allocation
+    /// default of `true`. We mirror that: we set false on non-constant, and
+    /// leave it untouched (true) otherwise — so repeated/absent writes never
+    /// resurrect a `false` back to `true`, exactly as the missing/vector-end
+    /// paths leave it.
     #[inline]
     pub fn set_flat_from_pl(&mut self, l: usize) {
         let p1 = (self.ploidy + 1) as usize;
@@ -237,8 +227,8 @@ impl Genotype {
     // Haplotype-likelihood construction
     // -----------------------------------------------------------------------
 
-    /// genotype.cpp:56-91 `initHaplotypeLikelihoods` — the UNCONDITIONED HL used
-    /// at INIT-stage diploid H0 and for ALL haploid emissions.
+    /// `initHaplotypeLikelihoods` — the UNCONDITIONED HL used at INIT-stage
+    /// diploid H0 and for ALL haploid emissions.
     ///
     /// For each site l:
     ///  - if !flat[l]: tmp = unphred(GL[(p+1)l + {0,1,2}]); normalize to sum 1;
@@ -248,10 +238,10 @@ impl Genotype {
     ///  - floor (BOTH directions): if HL[2l]<min_gl -> (min_gl, 1-min_gl);
     ///       if HL[2l+1]<min_gl -> (1-min_gl, min_gl).
     ///
-    /// NB the C++ accumulates in `float` (std::array<float,3>) using the f64
-    /// `unphred` table value implicitly narrowed to float at assignment; we cast
-    /// `unphred` (f64) to f32 at the same point and accumulate in f32. (UNKNOWN
-    /// #4: exact narrowing order — see report.)
+    /// NB the reference accumulates in `float` using the f64 `unphred` table
+    /// value implicitly narrowed to float at assignment; we cast `unphred`
+    /// (f64) to f32 at the same point and accumulate in f32 (exact narrowing
+    /// order matters here).
     pub fn init_haplotype_likelihoods(&self, hl: &mut [f32], min_gl: f32) {
         let p1 = (self.ploidy + 1) as usize;
         let diploid = self.ploidy > 1;
@@ -270,21 +260,21 @@ impl Genotype {
                 t1 /= sum;
                 t2 /= sum;
 
-                // for ploidy==1 this is it (genotype.cpp:73-74)
+                // for ploidy==1 this is it
                 hl[2 * l] = t0;
                 hl[2 * l + 1] = t1;
 
-                // ploidy==2 folds the het mass (genotype.cpp:77-81)
+                // ploidy==2 folds the het mass
                 if diploid {
                     hl[2 * l] += 0.5 * t1;
                     hl[2 * l + 1] = 0.5 * t1 + t2;
                 }
             } else {
-                // genotype.cpp:85-86
+                // flat site -> uninformative 0.5/0.5
                 hl[2 * l] = 0.5;
                 hl[2 * l + 1] = 0.5;
             }
-            // genotype.cpp:88-89 — floor in BOTH directions.
+            // floor in BOTH directions.
             if hl[2 * l] < min_gl {
                 hl[2 * l] = min_gl;
                 hl[2 * l + 1] = 1.0 - min_gl;
@@ -296,21 +286,20 @@ impl Genotype {
         }
     }
 
-    /// genotype.cpp:93-116 `makeHaplotypeLikelihoods` — DIPLOID-ONLY conditional
-    /// HL. Conditions one haplotype's emission on the OTHER haplotype's current
-    /// allele.
+    /// `makeHaplotypeLikelihoods` — DIPLOID-ONLY conditional HL. Conditions one
+    /// haplotype's emission on the OTHER haplotype's current allele.
     ///
     /// `first==true`  => building H0's emission, condition on H1[l].
     /// `first==false` => building H1's emission, condition on H0[l].
-    /// (genotype.cpp:108: `condAllele = first ? H1[l] : H0[l]`.)
+    /// (`condAllele = first ? H1[l] : H0[l]`.)
     ///
-    /// Only !flat sites are written; flat sites are left STALE (the C++ leaves
-    /// them untouched — the imputation HMM ignores emission at flat sites, so the
-    /// stale value is never read). We mirror that (do NOT touch hl at flat sites).
+    /// Only !flat sites are written; flat sites are left STALE (untouched — the
+    /// imputation HMM ignores emission at flat sites, so the stale value is
+    /// never read). We do NOT touch hl at flat sites.
     ///
-    /// GL layout here is hard-coded `3*l + {0,1,2}` because this is diploid-only
-    /// (genotype.cpp:100-102). condAllele ∈ {0,1} indexes into the 3-vector to
-    /// pick the {hom-or-het} pair consistent with the conditioned allele.
+    /// GL layout here is hard-coded `3*l + {0,1,2}` because this is diploid-only.
+    /// condAllele ∈ {0,1} indexes into the 3-vector to pick the {hom-or-het}
+    /// pair consistent with the conditioned allele.
     pub fn make_haplotype_likelihoods(&self, hl: &mut [f32], first: bool, min_gl: f32) {
         debug_assert!(self.ploidy > 1, "makeHaplotypeLikelihoods assumes diploid");
         for l in 0..self.n_variants {
@@ -326,18 +315,18 @@ impl Genotype {
                 t[1] /= sum;
                 t[2] /= sum;
 
-                // genotype.cpp:108
+                // pick the conditioned allele from the partner haplotype
                 let cond_allele = if first {
                     self.h1[l] as usize
                 } else {
                     self.h0[l] as usize
                 };
-                // genotype.cpp:109-110
+                // renormalize the conditioned (hom-or-het) pair
                 let denom = t[cond_allele] + t[1 + cond_allele];
                 hl[2 * l] = t[cond_allele] / denom;
                 hl[2 * l + 1] = t[1 + cond_allele] / denom;
 
-                // genotype.cpp:112-113 — floor in BOTH directions.
+                // floor in BOTH directions.
                 if hl[2 * l] < min_gl {
                     hl[2 * l] = min_gl;
                     hl[2 * l + 1] = 1.0 - min_gl;
@@ -347,7 +336,7 @@ impl Genotype {
                     hl[2 * l + 1] = min_gl;
                 }
             }
-            // flat[l]: left stale (genotype.cpp has no else branch).
+            // flat[l]: left stale (no else branch).
         }
     }
 
@@ -355,22 +344,22 @@ impl Genotype {
     // Gibbs sampling of the current phase
     // -----------------------------------------------------------------------
 
-    /// genotype.cpp:118-120 `sampleHaplotypeH0`.
+    /// `sampleHaplotypeH0`.
     /// `for l: H0[l] = (rng.getFloat() > HP0[2l])`.
     ///
     /// `rng_u01` supplies one `getFloat()` draw per site, in ascending l order
-    /// (n_var draws). The C++ `getFloat()` returns a `double` from a
+    /// (n_var draws). `getFloat()` returns a `double` from a
     /// `uniform_real_distribution<float>(0,1)`; the comparison is therefore in
     /// `double` against the f32 `HP0` promoted to double. We pass an f64 draw and
-    /// compare in f64 to match. (UNKNOWN #2: exact libstdc++ float draw —
-    /// statistical not bit parity unless the RNG is hand-matched.)
+    /// compare in f64 to match (statistical, not bit, parity unless the RNG is
+    /// hand-matched).
     pub fn sample_haplotype_h0(&mut self, hp0: &[f32], rng_u01: &mut impl FnMut() -> f64) {
         for l in 0..self.n_variants {
             self.h0[l] = rng_u01() > hp0[2 * l] as f64;
         }
     }
 
-    /// genotype.cpp:122-125 `sampleHaplotypeH1` (diploid only).
+    /// `sampleHaplotypeH1` (diploid only).
     /// `for l: H1[l] = (rng.getFloat() > HP1[2l])`.
     pub fn sample_haplotype_h1(&mut self, hp1: &[f32], rng_u01: &mut impl FnMut() -> f64) {
         debug_assert!(self.ploidy > 1, "sampleHaplotypeH1 assumes diploid");
@@ -383,8 +372,7 @@ impl Genotype {
     // MAIN-stage dose accumulation
     // -----------------------------------------------------------------------
 
-    /// genotype.cpp:127-166 `storeGenotypePosteriorsAndHaplotypes(HP0)` —
-    /// HAPLOID case.
+    /// `storeGenotypePosteriorsAndHaplotypes(HP0)` — HAPLOID case.
     ///
     /// First pass updates already-stored variants:
     ///   p0=HP0[2idx], p1=HP0[2idx+1], sc=1/(p0+p1);
@@ -392,11 +380,11 @@ impl Genotype {
     /// Second pass stores NEW variants (those never stored) IFF p0*sc < 0.99999,
     /// seeding gp0 with the packing offset `+(stored_cnt%16)*1.0f` so the late
     /// first-store still averages correctly after the final `/stored_cnt`.
-    /// (genotype.cpp:161 — note `%16` for haploid; diploid uses raw stored_cnt.)
+    /// (Note `%16` for haploid; diploid uses raw stored_cnt.)
     /// Finally stored_cnt++.
     pub fn store_genotype_posteriors_haploid(&mut self, hp0: &[f32]) {
         let mut flag = vec![false; self.n_variants];
-        // genotype.cpp:132-148 — already-stored.
+        // already-stored.
         for e in &mut self.stored_data {
             let var_idx = e.idx as usize;
             let p0 = hp0[2 * var_idx];
@@ -404,10 +392,10 @@ impl Genotype {
             let sc = 1.0f32 / (p0 + p1);
             e.gp0 += p0 * sc;
             e.gp1 += p1 * sc;
-            e.hds = false; // genotype.cpp:145
+            e.hds = false;
             flag[var_idx] = true;
         }
-        // genotype.cpp:150-164 — newly-stored.
+        // newly-stored.
         let off = (self.stored_cnt % 16) as f32;
         for l in 0..self.n_variants {
             if !flag[l] {
@@ -420,11 +408,10 @@ impl Genotype {
                 }
             }
         }
-        self.stored_cnt += 1; // genotype.cpp:165
+        self.stored_cnt += 1;
     }
 
-    /// genotype.cpp:168-209 `storeGenotypePosteriorsAndHaplotypes(HP0, HP1)` —
-    /// DIPLOID case.
+    /// `storeGenotypePosteriorsAndHaplotypes(HP0, HP1)` — DIPLOID case.
     ///
     /// Per variant the three genotype posteriors are:
     ///   p0 = clamp(HP0[2l]·HP1[2l], 0, 1)                                  (0/0)
@@ -433,11 +420,11 @@ impl Genotype {
     /// gp0 += p0/(p0+p1+p2); gp1 += p1/(p0+p1+p2);
     /// hds = (HP0[2l+1] < HP1[2l+1])  (which hap carries the alt for a het call).
     /// New variants stored IFF p0/(p0+p1+p2) < 0.99999, seeding gp0 with the
-    /// packing offset `+stored_cnt*1.0f` (RAW stored_cnt for diploid;
-    /// genotype.cpp:203). Finally stored_cnt++.
+    /// packing offset `+stored_cnt*1.0f` (RAW stored_cnt for diploid). Finally
+    /// stored_cnt++.
     pub fn store_genotype_posteriors(&mut self, hp0: &[f32], hp1: &[f32]) {
         let mut flag = vec![false; self.n_variants];
-        // genotype.cpp:172-188 — already-stored.
+        // already-stored.
         for e in &mut self.stored_data {
             let var_idx = e.idx as usize;
             let p0 = (hp0[2 * var_idx] * hp1[2 * var_idx]).clamp(0.0, 1.0);
@@ -448,10 +435,10 @@ impl Genotype {
             let denom = p0 + p1 + p2;
             e.gp0 += p0 / denom;
             e.gp1 += p1 / denom;
-            e.hds = hp0[2 * var_idx + 1] < hp1[2 * var_idx + 1]; // genotype.cpp:185
+            e.hds = hp0[2 * var_idx + 1] < hp1[2 * var_idx + 1];
             flag[var_idx] = true;
         }
-        // genotype.cpp:190-207 — newly-stored.
+        // newly-stored.
         let off = self.stored_cnt as f32;
         for l in 0..self.n_variants {
             if !flag[l] {
@@ -470,32 +457,32 @@ impl Genotype {
                 }
             }
         }
-        self.stored_cnt += 1; // genotype.cpp:208
+        self.stored_cnt += 1;
     }
 
     // -----------------------------------------------------------------------
     // Finalize
     // -----------------------------------------------------------------------
 
-    /// genotype.cpp:211-244 `sortAndNormAndInferGenotype`.
+    /// `sortAndNormAndInferGenotype`.
     ///
-    /// 1. sort stored_data by idx (genotype.cpp:215, `operator<` on idx).
-    /// 2. gp0 /= stored_cnt; gp1 /= stored_cnt (genotype.cpp:218-221).
+    /// 1. sort stored_data by idx.
+    /// 2. gp0 /= stored_cnt; gp1 /= stored_cnt.
     /// 3. walk all n_variants; unstored sites => 0/0 hom-major (H0=H1=false);
     ///    stored sites => `infer()` (diploid) or `infer_haploid()` (haploid)
-    ///    written back into H0/H1 (genotype.cpp:224-243).
+    ///    written back into H0/H1.
     pub fn sort_and_norm_and_infer_genotype(&mut self) {
-        // genotype.cpp:215 — stable sort by idx (operator< compares idx only).
+        // stable sort by idx (ordering compares idx only).
         self.stored_data.sort_by_key(|g| g.idx);
 
-        // genotype.cpp:218-221 — normalize.
+        // normalize.
         let scnt = self.stored_cnt as f32;
         for e in &mut self.stored_data {
             e.gp0 /= scnt;
             e.gp1 /= scnt;
         }
 
-        // genotype.cpp:224-243 — infer hard calls.
+        // infer hard calls.
         let diploid = self.ploidy > 1;
         let mut e = 0usize;
         for l in 0..self.n_variants {
@@ -535,34 +522,34 @@ impl Genotype {
 }
 
 // ===========================================================================
-// Output mapping helper (genotype_writer.cpp:113-171)
+// Output mapping helper
 // ===========================================================================
 
 /// Per-sample VCF output triple computed from a finalized `InferredGenotype`
 /// (or the all-default Ref/Ref when no record was stored at a site).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OutputCall {
-    /// Rounded dosage `round(ds*1000)/1000`. (genotype_writer.cpp:151)
+    /// Rounded dosage `round(ds*1000)/1000`.
     pub ds: f32,
     /// `floor(gp*1000)/1000` for gp0/gp1/gp2 after the sum>=0.9999 fixup.
     /// gp[2] is unused (NaN/sentinel role) for a haploid sample.
     pub gp: [f32; 3],
     /// Phased GT alleles (length = ploidy). `true`=ALT. For a diploid het the
-    /// alt allele lands on hap `hds`. (genotype_writer.cpp:127-146)
+    /// alt allele lands on hap `hds`.
     pub gt: [bool; 2],
 }
 
-/// Map a finalized stored posterior to the VCF GP/DS/GT output, EXACTLY as
-/// `genotype_writer.cpp:116-171` does for a single sample at a single site.
+/// Map a finalized stored posterior to the VCF GP/DS/GT output for a single
+/// sample at a single site.
 /// `stored` is `Some` iff this site had a stored record for this sample;
 /// `None` => the all-Ref/Ref default (gp0=1, ds=0, GT=0/0). `ploidy` ∈ {1,2}.
 ///
-/// NB: this reproduces GLIMPSE2's `floor`-then-fixup rounding for GP and its
-/// `map_ps` ascending-residual fixup that nudges the largest-residual entries up
-/// by 0.001 until the rounded GP sums to >= 0.9999 (genotype_writer.cpp:154-171).
+/// NB: this reproduces the GLIMPSE2 model's `floor`-then-fixup rounding for GP
+/// and its `map_ps` ascending-residual fixup that nudges the largest-residual
+/// entries up by 0.001 until the rounded GP sums to >= 0.9999.
 pub fn map_output_call(stored: Option<&InferredGenotype>, ploidy: i32) -> OutputCall {
     let diploid = ploidy > 1;
-    // Defaults: Ref/Ref. (genotype_writer.cpp:116)
+    // Defaults: Ref/Ref.
     let mut ds = 0.0f32;
     let mut gp0 = 1.0f32;
     let mut gp1 = 0.0f32;
@@ -574,14 +561,14 @@ pub fn map_output_call(stored: Option<&InferredGenotype>, ploidy: i32) -> Output
             gp0 = g.gp0;
             gp1 = g.gp1;
             gp2 = g.get_gp2();
-            ds = gp1 + 2.0 * gp2; // genotype_writer.cpp:126
+            ds = gp1 + 2.0 * gp2;
             if gp1 > gp0 && gp1 > gp2 {
-                // het: alt allele on hap `hds`. (genotype_writer.cpp:127-132)
+                // het: alt allele on hap `hds`.
                 let hds = g.hds as usize;
                 gt[hds] = true;
                 gt[1 - hds] = false;
             } else {
-                // hom: both alleles = (gp0 < gp2). (genotype_writer.cpp:135-136)
+                // hom: both alleles = (gp0 < gp2).
                 let alt = gp0 < gp2;
                 gt[0] = alt;
                 gt[1] = alt;
@@ -589,15 +576,15 @@ pub fn map_output_call(stored: Option<&InferredGenotype>, ploidy: i32) -> Output
         } else {
             gp0 = g.gp0;
             gp1 = g.gp1;
-            ds = gp1; // genotype_writer.cpp:143
-            gt[0] = gp0 < gp1; // genotype_writer.cpp:144
+            ds = gp1;
+            gt[0] = gp0 < gp1;
         }
     }
 
-    // DS rounding (genotype_writer.cpp:151).
+    // DS rounding.
     let ds_out = (ds * 1000.0).round() / 1000.0;
 
-    // GP floor (genotype_writer.cpp:152-153,162).
+    // GP floor.
     let mut p = [0.0f32; 3];
     p[0] = (gp0 * 1000.0).floor() / 1000.0;
     p[1] = (gp1 * 1000.0).floor() / 1000.0;
@@ -605,14 +592,13 @@ pub fn map_output_call(stored: Option<&InferredGenotype>, ploidy: i32) -> Output
         p[2] = ((1.0f32 - (p[0] + p[1])).max(0.0) * 1000.0).floor() / 1000.0;
     }
 
-    // map_ps residual fixup (genotype_writer.cpp:154-171). Build (residual,idx)
-    // pairs where residual = 1 - (gp - floored_gp); std::map orders ascending by
-    // residual (i.e. visits the entries whose floor lost the MOST first). While
-    // the rounded GP sums to < 0.9999, bump the next entry by 0.001.
+    // map_ps residual fixup. Build (residual,idx) pairs where residual =
+    // 1 - (gp - floored_gp); order ascending by residual (i.e. visit the
+    // entries whose floor lost the MOST first). While the rounded GP sums to
+    // < 0.9999, bump the next entry by 0.001.
     //
-    // std::map<float,float*> is a UNIQUE-KEY ordered map: if two residuals tie,
-    // the SECOND insert is dropped (UNKNOWN #5 — tie handling; GLIMPSE2 inherits
-    // libstdc++ map's "insert keeps first" so a tied entry is never bumped).
+    // The ordered map has UNIQUE keys: if two residuals tie, the SECOND insert
+    // is dropped ("insert keeps first"), so a tied entry is never bumped.
     let raw = [gp0, gp1, gp2];
     let n_gp = if diploid { 3usize } else { 2usize };
     // residual keys; track insertion to honor unique-key "first wins".
@@ -640,7 +626,7 @@ pub fn map_output_call(stored: Option<&InferredGenotype>, ploidy: i32) -> Output
 
 #[inline]
 fn entries_iter(raw: &[f32; 3], floored: &[f32; 3], n: usize) -> Vec<(f32, usize)> {
-    // residual key = 1 - (raw_gp - floored_gp)  (genotype_writer.cpp:155-156,163)
+    // residual key = 1 - (raw_gp - floored_gp)
     let mut v = Vec::with_capacity(n);
     for i in 0..n {
         v.push((1.0f32 - (raw[i] - floored[i]), i));

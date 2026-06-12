@@ -1,7 +1,4 @@
-//! Faithful scalar Rust reimplementation of GLIMPSE2's `conditioning_set.{h,cpp}`.
-//!
-//! reimplementation of
-//! `_archive/reference_code/GLIMPSE2/phase/src/containers/conditioning_set.{h,cpp}`.
+//! Scalar Rust implementation of the GLIMPSE2 model's conditioning set.
 //!
 //! The conditioning set is rebuilt PER (individual, iteration) by `select`
 //! (= `compactSelection` + `updateTransitions`). It decides:
@@ -16,83 +13,81 @@
 //!   - `t`/`nt`           : per-polymorphic-interval recombination / no-recomb probs.
 //!
 //! ─────────────────────────────────────────────────────────────────────────────
-//! DEPENDENCIES (NOT YET PORTED) → expressed as traits:
+//! DEPENDENCIES expressed as traits:
 //!
-//!   * `RefPanelView`        — the reference side (GLIMPSE2 `ref_haplotype_set`,
-//!     inherited into `haplotype_set H`): `flag_common`, `major_alleles`,
+//!   * `RefPanelView`        — the reference side: `flag_common`, `major_alleles`,
 //!     `common2tot`, `ShapRef` (per-hap sorted minor-allele absolute sites),
 //!     `HvarRef` (common-site × ref-hap bitmatrix), `n_ref_haps`.
 //!
-//!   * `TargetSelectionView` — the target side (GLIMPSE2 `haplotype_set H`):
+//!   * `TargetSelectionView` — the target side:
 //!     `tar_ind2hapid`, `tar_ploidy`, and the three per-iteration selection-state
 //!     containers `init_states[ind]` (a SET), `pbwt_states[ind]` (layered lists),
 //!     `list_states[hapid]` (PBWT "long match" list, indexed by HAP id).
 //!
-//! When `ref_haplotype_set.rs` / `haplotype_set.rs` land, implement these two
-//! traits on the concrete types (or pass concrete refs). The numerics here are
-//! complete and independent of how those are stored.
+//! Implement these two traits on the concrete reference/target types (or pass
+//! concrete refs). The numerics here are complete and independent of how those
+//! are stored.
 //!
 //! ─────────────────────────────────────────────────────────────────────────────
-//! STAGE constants (GLIMPSE2 `otools.h:83-86`). The `iter` argument to `select`
-//! / `compact_selection` is the CURRENT STAGE (caller passes `current_stage`):
+//! STAGE constants. The `iter` argument to `select` / `compact_selection` is the
+//! CURRENT STAGE (caller passes `current_stage`):
 //!   STAGE_INIT=0, STAGE_BURN=1, STAGE_MAIN=2, STAGE_RESTRICT=3.
-//! STAGE_RESTRICT is DEAD in the phase binary (never the current stage), but we
-//! port its branch verbatim for completeness.
+//! STAGE_RESTRICT is DEAD in the phase binary (never the current stage), but its
+//! branch is implemented for completeness.
 
 use crate::common::HaplotypeBitmatrix;
 use crate::sparse_ls::bitmatrix::BitMatrix;
 use crate::lcwgs::ls_params::LsParams;
 use crate::sparse_ls::variant::VariantMap;
 
-/// GLIMPSE2 `otools.h:83-86`.
+/// Iteration-stage codes.
 pub const STAGE_INIT: i32 = 0;
 pub const STAGE_BURN: i32 = 1;
 pub const STAGE_MAIN: i32 = 2;
 pub const STAGE_RESTRICT: i32 = 3;
 
-/// `var_type` codes (conditioning_set.h:34-36).
+/// `var_type` codes.
 pub const TYPE_COMMON: u8 = 0;
 pub const TYPE_RARE: u8 = 1;
 pub const TYPE_MONO: u8 = 2;
 
-/// One-minus-epsilon transition clamp (conditioning_set.cpp:35, `1.0 - 1e-7`).
+/// One-minus-epsilon transition clamp (`1.0 - 1e-7`).
 const ONE_L: f64 = 1.0 - 1e-7;
-/// Lower transition clamp (conditioning_set.h:96, conditioning_set.cpp:162, `1e-7`).
+/// Lower transition clamp (`1e-7`).
 const T_LO: f64 = 1e-7;
 
 // ════════════════════════════════════════════════════════════════════════════
 //                           DEPENDENCY TRAITS
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Reference-panel side of GLIMPSE2's `haplotype_set` (inherited from
-/// `ref_haplotype_set`). Everything `compactSelection` reads about the panel.
+/// Reference-panel side of the model. Everything `compact_selection` reads about
+/// the panel.
 ///
-/// PLACEHOLDER until `ref_haplotype_set.rs` lands. The two ALLELE-bearing
-/// methods are the hot ones:
+/// The two ALLELE-bearing methods are the hot ones:
 ///   * `shap_ref(hap)`  → `ShapRef[hap]`: ascending ABSOLUTE site indices where
 ///     reference hap `hap` carries its MINOR allele (rare-site sparse carriers).
 ///   * `hvar_ref(common_idx, hap)` → `HvarRef.get(common_idx, hap)`: the allele
 ///     of reference hap `hap` at the `common_idx`-th COMMON site.
 pub trait RefPanelView {
-    /// `H.n_ref_haps` — number of reference haplotypes in the panel.
+    /// Number of reference haplotypes in the panel.
     fn n_ref_haps(&self) -> usize;
 
-    /// `H.flag_common[l]` — is absolute site `l` a common (plain-matrix) site?
+    /// `flag_common[l]` — is absolute site `l` a common (plain-matrix) site?
     fn flag_common(&self, l: usize) -> bool;
 
-    /// `H.major_alleles[l]` — major allele at absolute site `l`
+    /// `major_alleles[l]` — major allele at absolute site `l`
     /// (TRUE ⇒ ALT is major, i.e. `calt > cref`).
     fn major_allele(&self, l: usize) -> bool;
 
-    /// `H.ShapRef[hap]` — ascending ABSOLUTE site indices where `hap` carries the
+    /// `ShapRef[hap]` — ascending ABSOLUTE site indices where `hap` carries the
     /// minor allele. (Used to scatter into `Svar`.)
     fn shap_ref(&self, hap: usize) -> &[i32];
 
-    /// `H.HvarRef.get(common_idx, hap)` — allele of `hap` at the `common_idx`-th
+    /// `HvarRef.get(common_idx, hap)` — allele of `hap` at the `common_idx`-th
     /// common site (the common-only variant-major panel bitmatrix).
     fn hvar_ref(&self, common_idx: usize, hap: usize) -> bool;
 
-    /// `H.SvarRef[abs]` — ascending ref-hap ids that carry the MINOR allele at
+    /// `SvarRef[abs]` — ascending ref-hap ids that carry the MINOR allele at
     /// rare ABSOLUTE site `abs` (the transpose of `ShapRef`; empty for common
     /// sites). Used by the optional rare-carrier injection
     /// (`inject_rare_carriers`) to find a rare site's panel carriers in O(carriers)
@@ -107,8 +102,8 @@ pub trait RefPanelView {
 /// Convenience blanket: a `(HaplotypeBitmatrix, …)`-backed concrete impl is the
 /// expected production shape, but to keep this module self-contained we expose a
 /// thin in-memory implementor (`InMemoryRefPanel`) for unit tests / Stage-3
-/// golden-dump replay. Production wiring will impl `RefPanelView` on the real
-/// `RefHapSet` instead.
+/// replay. Production wiring impls `RefPanelView` on the real `RefHapSet`
+/// instead.
 pub struct InMemoryRefPanel<'a> {
     pub n_ref_haps: usize,
     pub flag_common: &'a [bool],
@@ -143,7 +138,7 @@ impl RefPanelView for InMemoryRefPanel<'_> {
     }
 }
 
-/// Production `RefPanelView`: bundles the ported `RefHaplotypeSet` with the
+/// Production `RefPanelView`: bundles the `RefHaplotypeSet` with the
 /// all-sites `ref_bm` panel (a [`HaplotypeBitmatrix`]). `RefHaplotypeSet` no
 /// longer stores the redundant common-site `HvarRef` bitmatrix, so `hvar_ref`
 /// is served from `ref_bm` via `common2tot` (the common-site index → absolute
@@ -187,10 +182,8 @@ impl RefPanelView for RefPanelWithBm<'_> {
     }
 }
 
-/// Target side of GLIMPSE2's `haplotype_set` — the per-iteration selection state
-/// that `compactSelection` consumes to assemble `idx_haps_ref`.
-///
-/// PLACEHOLDER until `haplotype_set.rs` lands.
+/// Target side of the model — the per-iteration selection state that
+/// `compact_selection` consumes to assemble `idx_haps_ref`.
 ///
 /// NB the two index spaces:
 ///   * `ind`   — individual index (into `init_states`, `pbwt_states`),
@@ -198,24 +191,23 @@ impl RefPanelView for RefPanelWithBm<'_> {
 ///     PBWT long-match `list_states` is indexed by HAP id (so a diploid uses
 ///     `list_states[hapid]` and `list_states[hapid+1]`).
 pub trait TargetSelectionView {
-    /// `H.tar_ind2hapid[ind]` — first reference-hap-space hap id of individual `ind`.
+    /// `tar_ind2hapid[ind]` — first reference-hap-space hap id of individual `ind`.
     fn tar_ind2hapid(&self, ind: usize) -> i32;
 
-    /// `H.tar_ploidy[ind]` — ploidy (1 or 2) of individual `ind`.
+    /// `tar_ploidy[ind]` — ploidy (1 or 2) of individual `ind`.
     fn tar_ploidy(&self, ind: usize) -> i32;
 
-    /// `H.init_states[ind]` — INIT-stage candidate ref haps, as an ASCENDING set.
-    /// We return a slice that MUST already be sorted ascending and deduped, since
-    /// GLIMPSE2's `std::set<int>` iterates in ascending order and `std::copy`
-    /// appends in that order (conditioning_set.cpp:82).
+    /// `init_states[ind]` — INIT-stage candidate ref haps, as an ASCENDING set.
+    /// The returned slice MUST already be sorted ascending and deduped, since the
+    /// set iterates in ascending order and is appended in that order.
     fn init_states(&self, ind: usize) -> &[i32];
 
-    /// `H.pbwt_states[ind]` — layered PBWT neighbor lists. Outer = layer/length
-    /// bucket, inner = ref-hap ids (insertion order matters: `compactSelection`
+    /// `pbwt_states[ind]` — layered PBWT neighbor lists. Outer = layer/length
+    /// bucket, inner = ref-hap ids (insertion order matters: `compact_selection`
     /// walks layers `i` ASCENDING and within a layer `j` DESCENDING).
     fn pbwt_states(&self, ind: usize) -> &[Vec<i32>];
 
-    /// `H.list_states[hapid]` — PBWT "long-match" list for HAP id `hapid`.
+    /// `list_states[hapid]` — PBWT "long-match" list for HAP id `hapid`.
     fn list_states(&self, hapid: usize) -> &[i32];
 }
 
@@ -223,34 +215,34 @@ pub trait TargetSelectionView {
 //                            CONDITIONING SET
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Faithful port of `class conditioning_set`. Holds the per-(individual,iteration)
-/// conditioning state plus the constants (`nrho`, `one_l`, emission errors).
+/// The conditioning set. Holds the per-(individual,iteration) conditioning state
+/// plus the constants (`nrho`, `one_l`, emission errors).
 ///
-/// `mapG`/`H` in the C++ are held by const-reference; here the per-call data is
-/// passed into `select` so the struct stays free of borrow lifetimes (mirrors how
-/// the rest of the reference engine keeps HMM scratch borrow-free).
+/// The map and panel are passed into `select` per call so the struct stays free
+/// of borrow lifetimes (matching how the rest of the engine keeps HMM scratch
+/// borrow-free).
 pub struct ConditioningSet {
-    // ---- COUNTS (conditioning_set.h:44-49) ----
+    // ---- COUNTS ----
     pub n_ref_haps: usize,
     pub n_eff_haps: usize,
     pub n_com_sites: usize,
     pub n_tot_sites: usize,
     pub n_states: usize,
 
-    // ---- CONST (conditioning_set.h:52-53) ----
+    // ---- CONST ----
     /// `nrho = use_list ? (-0.04*n_eff)/max(n_ref,n_eff) : (-0.04*n_eff)/n_ref`.
     pub nrho: f64,
     /// `one_l = 1 - 1e-7`.
     pub one_l: f64,
 
-    // ---- VARIANT TYPES (conditioning_set.h:56-60) ----
+    // ---- VARIANT TYPES ----
     pub var_type: Vec<u8>,
     pub major_alleles: Vec<bool>,
     pub polymorphic_sites: Vec<i32>,
     pub monomorphic_sites: Vec<i32>,
     pub lq_flag: Vec<bool>,
 
-    // ---- CONDITIONING STATES (conditioning_set.h:63-65) ----
+    // ---- CONDITIONING STATES ----
     /// `idxHaps_ref` — GLOBAL ref-hap ids of the K conditioning states.
     pub idx_haps_ref: Vec<i32>,
     /// `Svar` — per absolute site, the LOCAL (0..K) state indices carrying the
@@ -264,7 +256,7 @@ pub struct ConditioningSet {
     /// `Hvar` — variant-major (rows = relative poly-site, cols = state) allele bits.
     pub hvar: BitMatrix,
 
-    // ---- TRANSITIONS & EMISSIONS (conditioning_set.h:68-73) ----
+    // ---- TRANSITIONS & EMISSIONS ----
     pub t: Vec<f32>,
     pub nt: Vec<f32>,
     pub ed_phs: f32,
@@ -272,24 +264,23 @@ pub struct ConditioningSet {
     pub ed_imp: f32,
     pub ee_imp: f32,
 
-    // ---- DEPTHS (conditioning_set.h:75-76) ----
+    // ---- DEPTHS ----
     pub kinit: i32,
     pub kpbwt: i32,
 }
 
 impl ConditioningSet {
-    /// Constructor (conditioning_set.cpp:29-53).
+    /// Constructor.
     ///
-    /// `n_tot_sites = mapG.size()`, `n_com_sites = common2tot.len()`.
-    /// `lq_flag[l] = mapG.vec_pos[l]->LQ` — NB by VALUE this stores "is HQ"
-    /// (SNP && pos != prev_pos); see PORT_SPEC riskiest_parts #5. The downstream
-    /// HMM treats `lq_flag` as "emission-skipped", so production `VariantMap.lq`
-    /// must be populated with the SAME VALUE GLIMPSE2 stores in `variant.LQ`.
+    /// `n_tot_sites = map_g.len()`, `n_com_sites = common2tot.len()`.
+    /// `lq_flag[l]` — NB by VALUE this stores "is HQ" (SNP && pos != prev_pos).
+    /// The downstream HMM treats `lq_flag` as "emission-skipped", so production
+    /// `VariantMap.lq` must be populated with the matching per-variant value.
     ///
-    /// `use_list` toggles the `nrho` denominator (cpp:34): with `use_list` it is
+    /// `use_list` toggles the `nrho` denominator: with `use_list` it is
     /// `max(n_ref, n_eff)`, else `n_ref`. The phasing binary calls with
-    /// `use_list = true` (see compact_selection, which sets `use_list=true` at the
-    /// top of every call).
+    /// `use_list = true` (see `compact_selection`, which sets `use_list = true`
+    /// at the top of every call).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         map_g: &VariantMap,
@@ -315,10 +306,10 @@ impl ConditioningSet {
             (-0.04 * n_eff_haps as f64) / (n_ref_haps as f64)
         };
 
-        // major_alleles = H.major_alleles (copied, cpp:43).
+        // major_alleles copied from the panel.
         let major_alleles: Vec<bool> = (0..n_tot_sites).map(|l| ref_panel.major_allele(l)).collect();
 
-        // lq_flag initialised to true then overwritten from the map (cpp:51-52).
+        // lq_flag taken per-site from the variant map.
         let lq_flag: Vec<bool> = (0..n_tot_sites).map(|l| map_g.vars[l].lq).collect();
 
         ConditioningSet {
@@ -359,9 +350,8 @@ impl ConditioningSet {
         params: &LsParams,
     ) -> Self {
         let n_ref = ref_panel.n_ref_haps();
-        // Kpbwt / Kinit are clamped to n_ref at use (params blueprint); GLIMPSE2
-        // stores the raw value and compares against H.n_ref_haps in the branches,
-        // so we keep them raw here too.
+        // Kpbwt / Kinit are clamped to n_ref at use; the raw value is stored here
+        // and compared against n_ref_haps in the branches, so we keep them raw.
         ConditioningSet::new(
             map_g,
             ref_panel,
@@ -375,7 +365,7 @@ impl ConditioningSet {
         )
     }
 
-    /// `clear()` — GLIMPSE2 destructor-ish reset (conditioning_set.cpp:55-66).
+    /// `clear()` — reset the per-iteration state.
     pub fn clear(&mut self) {
         self.n_eff_haps = 0;
         self.n_tot_sites = 0;
@@ -393,8 +383,8 @@ impl ConditioningSet {
     //                              SELECT
     // ────────────────────────────────────────────────────────────────────────
 
-    /// `select(ind, iter)` (conditioning_set.cpp:68-71) =
-    /// `compactSelection(ind, iter)` then `updateTransitions()`.
+    /// `select(ind, iter)` = `compact_selection(ind, iter)` then
+    /// `update_transitions()`.
     ///
     /// `iter` is the CURRENT STAGE (STAGE_INIT/BURN/MAIN/RESTRICT). `ref_panel`
     /// supplies `ShapRef`/`HvarRef`/`flag_common`, `tar` the selection-state lists.
@@ -410,7 +400,7 @@ impl ConditioningSet {
         self.update_transitions(map_g);
     }
 
-    /// `compactSelection(ind, iter)` (conditioning_set.cpp:73-153).
+    /// `compact_selection(ind, iter)`.
     ///
     /// Assembles `idx_haps_ref` from the stage-appropriate selection-state
     /// container, then (re)builds `Svar`, `var_type`, `polymorphic/monomorphic
@@ -422,20 +412,19 @@ impl ConditioningSet {
         ref_panel: &impl RefPanelView,
         tar: &impl TargetSelectionView,
     ) {
-        // cpp:75-78
         let mut use_list = true;
         let hapid = tar.tar_ind2hapid(ind);
         let ploidy_m1 = tar.tar_ploidy(ind) - 1;
         self.idx_haps_ref.clear();
 
-        let n_ref_haps = ref_panel.n_ref_haps() as i32; // == H.n_ref_haps
+        let n_ref_haps = ref_panel.n_ref_haps() as i32;
 
-        // ---- STAGE-DEPENDENT BASE SELECTION (cpp:80-108) ----
+        // ---- STAGE-DEPENDENT BASE SELECTION ----
         if iter == STAGE_INIT && self.kinit > 0 {
-            // cpp:80-83: copy the (ascending) init_states set verbatim.
+            // Copy the (ascending) init_states set verbatim.
             self.idx_haps_ref.extend_from_slice(tar.init_states(ind));
         } else if iter == STAGE_RESTRICT && self.kpbwt > 0 {
-            // cpp:84-93: DEAD in the phase binary, but ported verbatim.
+            // DEAD in the phase binary, but implemented for completeness.
             // k_pbwt = max(Kpbwt/10, 350). Walk layers i ascending while the set
             // is below k_pbwt OR i<=1; within each layer walk j DESCENDING.
             let k_pbwt = (self.kpbwt / 10).max(350) as usize;
@@ -453,8 +442,8 @@ impl ConditioningSet {
             }
             self.idx_haps_ref.extend(states_ind.into_sorted_vec());
         } else if self.kpbwt > 0 && self.kpbwt < n_ref_haps {
-            // cpp:94-102: the BURN/MAIN path. Cap at Kpbwt; check the cap in BOTH
-            // loop guards (outer and inner), so the cap can stop mid-layer.
+            // The BURN/MAIN path. Cap at Kpbwt; check the cap in BOTH loop guards
+            // (outer and inner), so the cap can stop mid-layer.
             let kpbwt = self.kpbwt as usize;
             let mut states_ind = AscendingDedupSet::new();
             let layers = tar.pbwt_states(ind);
@@ -470,14 +459,14 @@ impl ConditioningSet {
             }
             self.idx_haps_ref.extend(states_ind.into_sorted_vec());
         } else if self.kpbwt >= n_ref_haps {
-            // cpp:103-108: use the WHOLE panel (iota 0..n_ref), and DISABLE the
-            // long-match list merge below.
+            // Use the WHOLE panel (iota 0..n_ref), and DISABLE the long-match
+            // list merge below.
             self.idx_haps_ref = (0..n_ref_haps).collect();
             use_list = false;
         }
-        // Kpbwt == 0: fall straight through to the list-merge below (cpp:109).
+        // Kpbwt == 0: fall straight through to the list-merge below.
 
-        // ---- LONG-MATCH LIST MERGE (cpp:110-116) ----
+        // ---- LONG-MATCH LIST MERGE ----
         // If enabled and either hap of this individual has a long-match list,
         // append both haps' lists, then sort+unique the whole idx_haps_ref.
         let hapid_u = hapid as usize;
@@ -490,27 +479,27 @@ impl ConditioningSet {
         if use_list && (!list0.is_empty() || !list1.is_empty()) {
             self.idx_haps_ref.extend_from_slice(list0);
             if ploidy_m1 != 0 {
-                // NB cpp:113 uses list_states[hapid+1] (not hapid+ploidyM1); for
-                // ploidy 2, ploidyM1==1 so these coincide. We mirror cpp exactly.
+                // NB the second hap uses list_states[hapid+1] (not hapid+ploidyM1);
+                // for ploidy 2, ploidyM1==1 so these coincide.
                 self.idx_haps_ref.extend_from_slice(tar.list_states(hapid_u + 1));
             }
             self.idx_haps_ref.sort_unstable();
             self.idx_haps_ref.dedup();
         }
 
-        // ---- CHECK #STATES (cpp:118-120) ----
+        // ---- CHECK #STATES ----
         self.n_states = self.idx_haps_ref.len();
         assert!(
             self.n_states != 0,
             "States for individual {ind} are zero. Error during selection."
         );
 
-        // ---- REBUILD Svar / var_type / poly-mono / Hvar (cpp:122-152) ----
+        // ---- REBUILD Svar / var_type / poly-mono / Hvar ----
         self.rebuild_from_idx_haps(ref_panel);
     }
 
     /// Rebuild `Svar`, `var_type`, `polymorphic/monomorphic_sites`, and `Hvar`
-    /// from the CURRENT `idx_haps_ref` (cpp:122-152). Factored out of
+    /// from the CURRENT `idx_haps_ref`. Factored out of
     /// [`Self::compact_selection`] so the optional rare-carrier injection can
     /// extend `idx_haps_ref` and recompute these dependents with the exact same
     /// math. Sets `self.n_states = idx_haps_ref.len()`.
@@ -524,10 +513,10 @@ impl ConditioningSet {
     fn rebuild_from_idx_haps(&mut self, ref_panel: &impl RefPanelView) {
         self.n_states = self.idx_haps_ref.len();
 
-        // ---- UPDATE Svar (cpp:122-128) ----
+        // ---- UPDATE Svar ----
         // For each selected hap k, scatter its minor-allele ABSOLUTE sites into
         // Svar[abs] as the LOCAL index k. CSR build (two passes over the carrier
-        // entries) reproduces the old Vec<Vec> push order EXACTLY (ascending k per
+        // entries) reproduces the Vec<Vec> push order EXACTLY (ascending k per
         // site), without the per-site Vec headers.
         let n_tot = self.n_tot_sites;
         // Pass 1: per-site carrier counts, accumulated in svar_off[0..n_tot].
@@ -561,7 +550,7 @@ impl ConditioningSet {
             }
         }
 
-        // ---- UPDATE var_type + poly/mono lists (cpp:129-138) ----
+        // ---- UPDATE var_type + poly/mono lists ----
         self.monomorphic_sites.clear();
         self.polymorphic_sites.clear();
         for l in 0..self.n_tot_sites {
@@ -580,7 +569,7 @@ impl ConditioningSet {
             }
         }
 
-        // ---- BUILD Hvar (cpp:140-152) ----
+        // ---- BUILD Hvar ----
         // Variant-major bitmatrix: rows = relative polymorphic-site index (lrel),
         // cols = state k. COMMON rows read HvarRef at the common index (lcom);
         // RARE rows are set to the major allele then flipped to !major at the
@@ -620,7 +609,7 @@ impl ConditioningSet {
 
     /// OPT-IN rare-carrier injection (`LCWGS_LSX_RARE_CARRIER`, default OFF).
     ///
-    /// AFTER [`Self::select`] has built the GLIMPSE2-faithful conditioning set,
+    /// AFTER [`Self::select`] has built the conditioning set,
     /// add — for the individual's currently HET RARE sites — that site's panel
     /// carriers into `idx_haps_ref`, ranked by LOCAL IBD-run length to the
     /// het-ALT haplotype (the analogue of the hybrid lcWGS engine's
@@ -746,7 +735,7 @@ impl ConditioningSet {
     //                          UPDATE TRANSITIONS
     // ────────────────────────────────────────────────────────────────────────
 
-    /// `updateTransitions()` (conditioning_set.cpp:155-165).
+    /// `update_transitions()`.
     ///
     /// `t[l-1] = clamp(-expm1(nrho * (cm[poly[l]] - cm[poly[l-1]])), 1e-7, one_l)`
     /// over the polymorphic intervals; `nt[l-1] = 1 - t[l-1]`. Recombination is
@@ -768,7 +757,7 @@ impl ConditioningSet {
         }
     }
 
-    /// `getTransition(prev_abs, next_abs)` (conditioning_set.h:93-97).
+    /// `get_transition(prev_abs, next_abs)`.
     ///
     /// The K-independent recomb prob between any two ABSOLUTE sites:
     /// `clamp(-expm1(nrho * (cm[next] - cm[prev])), 1e-7, one_l)`, computed in
@@ -782,24 +771,24 @@ impl ConditioningSet {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//      ASCENDING-DEDUP SET (mirrors std::set<int> insert + ascending iterate)
+//      ASCENDING-DEDUP SET (insert + ascending iterate semantics)
 // ════════════════════════════════════════════════════════════════════════════
 
-/// A faithful stand-in for the `std::set<int>` used in `compactSelection`
-/// (cpp:87/96). GLIMPSE2 relies on TWO `std::set` properties:
-///   1. `size()` reflects unique-element count (drives the Kpbwt cap), and
+/// An ordered, deduped integer set used in `compact_selection`. Two properties
+/// are relied upon:
+///   1. `len()` reflects unique-element count (drives the Kpbwt cap), and
 ///   2. iteration (and thus the appended `idx_haps_ref` prefix from the PBWT
 ///      path) is ASCENDING.
 /// We use a `BTreeSet<i32>` for exactly those semantics. The cap is checked by
-/// the CALLER against `len()` between inserts (matching cpp's loop guards), so a
-/// duplicate insert does NOT advance the count — identical to `std::set`.
+/// the CALLER against `len()` between inserts (matching the loop guards), so a
+/// duplicate insert does NOT advance the count.
 ///
-/// SUBTLE PARITY POINT (PORT_SPEC riskiest #7): the C++ inserts in
-/// "outer i ascending, inner j DESCENDING" order, but because `std::set` is
-/// ORDER-INDEPENDENT for membership and ascending for iteration, the FINAL set
-/// content depends only on WHICH elements were inserted before the cap was hit —
-/// which in turn depends on the j-descending visit order. We preserve that visit
-/// order in the caller (so the cap trims the SAME elements), and emit ascending.
+/// SUBTLE PARITY POINT: inserts happen in "outer i ascending, inner j DESCENDING"
+/// order, but because the set is ORDER-INDEPENDENT for membership and ascending
+/// for iteration, the FINAL set content depends only on WHICH elements were
+/// inserted before the cap was hit — which in turn depends on the j-descending
+/// visit order. We preserve that visit order in the caller (so the cap trims the
+/// SAME elements), and emit ascending.
 struct AscendingDedupSet {
     set: std::collections::BTreeSet<i32>,
 }
