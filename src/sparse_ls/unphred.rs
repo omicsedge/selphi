@@ -1,8 +1,8 @@
-//! Faithful reimplementation of GLIMPSE2's PHRED→likelihood table (`otools.h:98`).
+//! PHRED→likelihood lookup table, as used by the GLIMPSE2 model.
 //!
 //! `UNPHRED[i] = 10^(-i/10)` for i in 0..256, with `UNPHRED[0] = 1.0`.
-//! GLIMPSE2 builds it in f64 then uses it in f32 emission accumulation; we keep
-//! the f64 table and let callers cast at the same points the C++ does.
+//! The table is built in f64 then consumed in f32 emission accumulation; we keep
+//! the f64 table and let callers cast at the corresponding points.
 
 use std::sync::OnceLock;
 
@@ -20,7 +20,7 @@ pub fn table() -> &'static [f64; 256] {
     })
 }
 
-/// PHRED byte → likelihood (clamped to 0..=255, matching the C++ table bound).
+/// PHRED byte → likelihood (clamped to 0..=255, the table bound).
 #[inline]
 pub fn unphred(pl: i32) -> f64 {
     table()[pl.clamp(0, 255) as usize]

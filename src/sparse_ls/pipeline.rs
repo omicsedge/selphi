@@ -4,7 +4,8 @@
 //! This is the thin glue that turns the existing loaders' outputs into the
 //! `sparse_ls` module's data structures and writes the result through the
 //! EXISTING lcWGS output writer (`crate::lcwgs::output::write_lcwgs_vcf`). The
-//! algorithm itself is 100% the faithful port; only ingest/output is reused.
+//! algorithm itself is the standalone GLIMPSE2-model engine; only ingest/output
+//! is reused.
 //!
 //! Reused loaders (NO behavior change to the existing engine):
 //!   * `crate::lcwgs::pl_reader::parse_pl_vcf`  — target VCF/BCF PL → gl3.
@@ -22,9 +23,9 @@ use crate::lcwgs::pipeline::LcwgsOutput;
 use crate::srp::SrpReader;
 
 /// Convert a normalized likelihood (∈[0,1]) to a GLIMPSE2-style PHRED byte:
-/// `min(round(-10·log10(l)), 255)`, with `l<=0 → 255` (genotype_reader.cpp:398).
+/// `min(round(-10·log10(l)), 255)`, with `l<=0 → 255`.
 /// A flat `[1/3,1/3,1/3]` triple maps to three equal bytes → `Genotype.flat` true,
-/// exactly as GLIMPSE2 treats a no-information site.
+/// exactly as the GLIMPSE2 model treats a no-information site.
 #[inline]
 fn lik_to_phred_byte(l: f32) -> u8 {
     if l <= 0.0 {
@@ -86,8 +87,8 @@ pub fn run_pipeline(
     // --- 2. Intersect target markers against the panel. ---
     // (wgs_idx[k] = panel index, target_idx[k] = target-marker index, of the
     //  k-th shared variant — same contract as run_lcwgs.)
-    // GLIMPSE2-exact reproduces GLIMPSE2 1:1; no allele reconciliation (and GL is
-    // reference-oriented anyway).
+    // This engine follows the GLIMPSE2 model exactly; no allele reconciliation
+    // (and GL is reference-oriented anyway).
     let (wgs_idx, target_idx, _) =
         intersect_variants(srp, &markers, crate::io::target_io::AlleleMatch::None);
     let n_shared = wgs_idx.len();

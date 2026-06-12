@@ -1,4 +1,4 @@
-//! Faithful reimplementation of GLIMPSE2 `variant.h` / `variant_map.h`.
+//! Reference-panel variant map for the GLIMPSE2 model.
 //!
 //! A reference-panel variant with PHRED counts and cM position. `mac()` is the
 //! minor-allele count used by the common/rare split and the sparse PBWT.
@@ -17,14 +17,14 @@ pub struct Variant {
     pub cref: u32,
     /// Alternate-allele count in the panel.
     pub calt: u32,
-    /// Genetic position (cM), f64 to match GLIMPSE2.
+    /// Genetic position (cM), f64 to match the GLIMPSE2 model.
     pub cm: f64,
     /// Low-quality flag (very-soft GL site routed through the emission-skip path).
     pub lq: bool,
 }
 
 impl Variant {
-    /// Minor-allele count = min(cref, calt). (variant.h `getMAC`)
+    /// Minor-allele count = min(cref, calt).
     #[inline]
     pub fn mac(&self) -> u32 {
         self.cref.min(self.calt)

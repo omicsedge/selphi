@@ -1,45 +1,41 @@
-//! Faithful scalar Rust reimplementation of GLIMPSE2's compressed sparse PBWT + reference
+//! Scalar Rust implementation of the GLIMPSE2 compressed sparse PBWT + reference
 //! structures.
 //!
-//! reimplementation of
-//!   `_archive/reference_code/GLIMPSE2/common/src/containers/ref_haplotype_set.{h,cpp}`
-//! plus the structure-population logic from
-//!   `_archive/reference_code/GLIMPSE2/common/src/io/ref_genotype_reader.cpp`
-//! (because Selphi has no GLIMPSE2 `.bin` — we build the PBWT FROM a
-//! `HaplotypeBitmatrix` panel + `VariantMap`, replacing the BCF scan).
+//! Builds the PBWT directly FROM a `HaplotypeBitmatrix` panel + `VariantMap`,
+//! deriving the variant classification and structures on the fly (Selphi has no
+//! GLIMPSE2 `.bin`, so there is no BCF scan).
 //!
-//! This is the densest, most index-fragile module in the port. Every function
-//! carries a `cpp:line` cross-reference. The pack3 three-level RLE codec, the
-//! full/small PBWT alternation, the init_common splice and the init_small_rare
-//! big->small remap are ported with the index arithmetic preserved EXACTLY.
+//! This is the densest, most index-fragile module in the engine. The pack3
+//! three-level RLE codec, the full/small PBWT alternation, the init_common
+//! splice and the init_small_rare big->small remap all rely on index arithmetic
+//! that must be preserved EXACTLY.
 //!
 //! Statistical parity, not bit-identity: there is NO RNG in this module (the
-//! PBWT build is fully deterministic), so this port should be bit-identical to
-//! GLIMPSE2 given an identical panel + variant classification. The only thing
+//! PBWT build is fully deterministic), so this matches the GLIMPSE2 model
+//! given an identical panel + variant classification. The only thing
 //! that can differ is the *upstream* classification (flag_common / major_alleles
 //! / LQ / cref / calt), which we recompute here from the panel — see
 //! `build_from_panel` and the UNKNOWNS section at the bottom of this file.
 //!
-//! Function ↔ C++ cross-reference (ref_haplotype_set.cpp unless noted):
-//!   pack3init / pack3Add / pack3 ....... ref_haplotype_set.h:56-101
-//!   p3decode (decode table) ............ ref_haplotype_set.h:37 + pack3init
-//!   allocate ........................... :41-45
-//!   build_sparsePBWT ................... :47-103
-//!   update_full_pbwt_ay ................ :105-126
-//!   update_small_pbwt_ay .............. :128-148
-//!   build_init_common ................. :150-164
-//!   init_small_rare ................... :166-193
-//!   build_from_panel (structures) ..... ref_genotype_reader.cpp:141-275
+//! Builder function map:
+//!   pack3init / pack3Add / pack3 ....... pack3 RLE codec
+//!   p3decode (decode table) ............ built once by pack3init
+//!   allocate ........................... structure allocation
+//!   build_sparsePBWT ................... compressed sparse PBWT build
+//!   update_full_pbwt_ay ................ full-panel sweep
+//!   update_small_pbwt_ay .............. small-panel sweep
+//!   build_init_common ................. small->full splice
+//!   init_small_rare ................... small-set setup
+//!   build_from_panel (structures) ..... structure population from the panel
 //!
-//! The C++ stores `pbwt_array_A/B`, `pbwt_small_A/B` as members but explicitly
-//! does NOT serialize them ("we declare pbwt arrays but we don't store them",
-//! ref_haplotype_set.h:126). Here they are local scratch owned by the builder.
+//! `pbwt_array_A/B`, `pbwt_small_A/B` are NOT serialized (they are derivable
+//! scratch); here they are local state owned by the builder.
 
 use crate::common::HaplotypeBitmatrix;
 use crate::sparse_ls::variant::VariantMap;
 
 // ---------------------------------------------------------------------------
-// pack3 — three-level run-length encoding (ref_haplotype_set.h:37-101)
+// pack3 — three-level run-length encoding
 // ---------------------------------------------------------------------------
 //
 // Code by Richard Durbin [https://github.com/richarddurbin/pbwt], doi:
@@ -53,15 +49,15 @@ use crate::sparse_ls::variant::VariantMap;
 //     yp & 0x20 == 1  implies n = (yp & 0x1f) << 11
 // This allows coding runs up to 64 * 32 * 32 = 64k in 3 bytes.
 
-// `#define ENCODE_MAX1 64`              (~64)              ref_haplotype_set.h:38
+// ENCODE_MAX1 = 64                 (~64)
 const ENCODE_MAX1: u32 = 64;
-// `#define ENCODE_MAX2 ((95-63) << 6)`  (~1k)              ref_haplotype_set.h:39
+// ENCODE_MAX2 = (95-63) << 6       (~1k)
 const ENCODE_MAX2: u32 = (95 - 63) << 6; // = 32<<6 = 2048
-// `#define ENCODE_MAX3 ((127-96) << 11)`(~64k)             ref_haplotype_set.h:40
+// ENCODE_MAX3 = (127-96) << 11     (~64k)
 const ENCODE_MAX3: u32 = (127 - 96) << 11; // = 31<<11 = 63488
 
-/// Decode lookup table — `static int p3decode[128]` filled by `pack3init`
-/// (ref_haplotype_set.h:37,56-62). Built once via `Lazy`-style const fn.
+/// Decode lookup table — a 128-entry table filled by `pack3init`.
+/// Built once via a `const fn`.
 ///
 ///   n in   0..64  -> n
 ///   n in  64..96  -> (n-64) << 6
@@ -99,7 +95,7 @@ pub fn pack3_decode_byte(yp: u8) -> (bool, i32) {
 }
 
 /// Append a run of `n` copies of symbol `y` (0/1) to `compressed_y`.
-/// Verbatim port of `pack3Add` (ref_haplotype_set.h:64-85).
+/// Implements the `pack3Add` codec.
 ///
 /// IMPORTANT: `y <<= 7` moves the symbol bit (0/1) to the top bit BEFORE the
 /// run-length nibbles are OR'd in. The cascade emits as many ENCODE_MAX3 chunks
@@ -109,36 +105,35 @@ pub fn pack3_decode_byte(yp: u8) -> (bool, i32) {
 /// the three-level decode unambiguous.
 #[inline]
 pub fn pack3_add(y: u8, mut n: u32, compressed_y: &mut Vec<u8>) {
-    let y = y << 7; // ref_haplotype_set.h:67 — symbol -> top bit
+    let y = y << 7; // symbol -> top bit
 
-    // while (n >= ENCODE_MAX3) { push(y|0x7f); n -= ENCODE_MAX3; }   h:69-73
+    // while (n >= ENCODE_MAX3) { push(y|0x7f); n -= ENCODE_MAX3; }
     while n >= ENCODE_MAX3 {
         compressed_y.push(y | 0x7f);
         n -= ENCODE_MAX3;
     }
-    // if (n >= ENCODE_MAX2) { push(y|0x60|(n>>11)); n &= 0x7ff; }     h:74-78
+    // if (n >= ENCODE_MAX2) { push(y|0x60|(n>>11)); n &= 0x7ff; }
     if n >= ENCODE_MAX2 {
         compressed_y.push(y | 0x60 | ((n >> 11) as u8));
         n &= 0x7ff;
     }
-    // if (n >= ENCODE_MAX1) { push(y|0x40|(n>>6)); n &= 0x3f; }       h:79-83
+    // if (n >= ENCODE_MAX1) { push(y|0x40|(n>>6)); n &= 0x3f; }
     if n >= ENCODE_MAX1 {
         compressed_y.push(y | 0x40 | ((n >> 6) as u8));
         n &= 0x3f;
     }
-    // if (n) push(y|n);                                               h:84
+    // if (n) push(y|n);
     if n != 0 {
         compressed_y.push(y | (n as u8));
     }
 }
 
 /// Compress a full 0/1 symbol vector (length `n_chars`) into `compressed_y`.
-/// Verbatim port of `pack3` (ref_haplotype_set.h:87-101). Coalesces maximal
-/// runs of equal symbols and emits each via `pack3_add`.
+/// Implements the `pack3` codec: coalesces maximal runs of equal symbols and
+/// emits each via `pack3_add`.
 ///
 /// (Not called by `build_sparsePBWT` — that path appends per-PBWT-run via
-/// `pack3_add` directly — but ported for completeness / parity with the C++ API
-/// and useful for unit tests.)
+/// `pack3_add` directly — but kept for completeness and useful for unit tests.)
 pub fn pack3(uncompressed_y: &[u8], n_chars: usize, compressed_y: &mut Vec<u8>) {
     let mut m = 0usize;
     let mut i = 0usize;
@@ -161,21 +156,21 @@ pub fn pack3(uncompressed_y: &[u8], n_chars: usize, compressed_y: &mut Vec<u8>) 
 
 /// Compressed sparse PBWT + reference structures.
 ///
-/// Field ↔ C++ member (ref_haplotype_set.h:104-130):
-///   sparse_maf        -> sparse_maf
-///   n_tot_sites       -> n_tot_sites      (#variants, sparse + bitmatrix)
-///   n_rar_sites       -> n_rar_sites      (#variants, rare / sparse)
-///   n_com_sites       -> n_com_sites      (#variants, common / plain)
-///   n_com_sites_hq    -> n_com_sites_hq   (#common SNP sites w/ distinct pos)
-///   n_ref_haps        -> n_ref_haps       (#reference haplotypes)
-///   flag_common       -> flag_common      (Vec<bool>, per abs site)
-///   major_alleles     -> major_alleles    (Vec<bool>, TRUE => ALT is major)
-///   common2tot        -> common2tot       (common idx -> abs site idx)
-///   shap_ref          -> ShapRef          (per-hap sorted minor-allele sites)
-///   svar_ref          -> SvarRef          (transpose: site -> ref hap ids)
-///   hvar_ref          -> HvarRef          (BitMatrix n_com_sites x n_ref_haps)
-///   ypacked           -> Ypacked          (pack3 stream, all PBWT layers)
-///   a_small_idx       -> A_small_idx      (per-HQ-common big->small hap maps)
+/// Field reference:
+///   sparse_maf        sparse/common MAF threshold
+///   n_tot_sites       #variants, sparse + bitmatrix
+///   n_rar_sites       #variants, rare / sparse
+///   n_com_sites       #variants, common / plain
+///   n_com_sites_hq    #common SNP sites w/ distinct pos
+///   n_ref_haps        #reference haplotypes
+///   flag_common       Vec<bool>, per abs site
+///   major_alleles     Vec<bool>, TRUE => ALT is major
+///   common2tot        common idx -> abs site idx
+///   shap_ref          ShapRef: per-hap sorted minor-allele sites
+///   svar_ref          SvarRef: transpose: site -> ref hap ids
+///   hvar_ref          HvarRef: BitMatrix n_com_sites x n_ref_haps (not stored)
+///   ypacked           Ypacked: pack3 stream, all PBWT layers
+///   a_small_idx       A_small_idx: per-HQ-common big->small hap maps
 #[derive(Default)]
 pub struct RefHaplotypeSet {
     pub sparse_maf: f64,
@@ -193,7 +188,7 @@ pub struct RefHaplotypeSet {
     pub common2tot: Vec<i32>,
     pub shap_ref: Vec<Vec<i32>>, // ShapRef: rare (minor) alleles per haplotype
     pub svar_ref: Vec<Vec<i32>>, // SvarRef: per rare site, carrying ref hap ids
-    // NB: GLIMPSE2's `HvarRef` (a common-site×ref-hap bitmatrix) is NOT stored.
+    // NB: `HvarRef` (a common-site×ref-hap bitmatrix) is NOT stored.
     // It is byte-for-byte redundant with the all-sites `ref_bm` panel restricted
     // to common sites, so common-site alleles are read on demand from `ref_bm`
     // via `common2tot` (`update_full_pbwt_ay` + `conditioning_set::RefPanelWithBm`),
@@ -202,9 +197,9 @@ pub struct RefHaplotypeSet {
     pub ypacked: Vec<u8>,        // Ypacked: pack3 stream (all PBWT sweeps)
     pub a_small_idx: Vec<Vec<i32>>, // A_small_idx
 
-    // PBWT scratch — declared but NOT serialized in C++ (ref_haplotype_set.h:126-130).
-    // Kept as builder-local fields so the four sweep fns can share them exactly
-    // as the C++ methods do (they mutate `pbwt_array_*`/`pbwt_small_*` members).
+    // PBWT scratch — derivable, so NOT serialized.
+    // Kept as builder-local fields so the four sweep fns can share them
+    // (they mutate `pbwt_array_*`/`pbwt_small_*`).
     pbwt_array_a: Vec<i32>,
     pbwt_array_b: Vec<i32>,
     pbwt_small_a: Vec<i32>,
@@ -213,14 +208,14 @@ pub struct RefHaplotypeSet {
 
 impl RefHaplotypeSet {
     pub fn new() -> Self {
-        // C++ ctor (ref_haplotype_set.cpp:29): all counts 0, sparse_maf=0.001.
+        // ctor defaults: all counts 0, sparse_maf=0.001.
         RefHaplotypeSet {
             sparse_maf: 0.001,
             ..Default::default()
         }
     }
 
-    /// `allocate()` (ref_haplotype_set.cpp:41-45).
+    /// `allocate()`: allocate the per-hap structures.
     ///   HvarRef.allocate(n_com_sites, n_ref_haps);
     ///   ShapRef = vector<vector<int>>(n_ref_haps);
     pub fn allocate(&mut self) {
@@ -230,27 +225,26 @@ impl RefHaplotypeSet {
 
     // -----------------------------------------------------------------------
     // Structure population FROM a HaplotypeBitmatrix panel.
-    // Replaces ref_genotype_reader.cpp:141-275 (the two-pass BCF scan), since
+    // Builds the structures directly from the panel (a two-pass scan), since
     // Selphi has no GLIMPSE2 .bin. `panel.get(site, hap)` gives the allele at
     // (abs site, global ref hap). `vmap` supplies cref/calt/lq per site.
     //
-    // The classification MUST match the GLIMPSE2 reader EXACTLY:
+    // The classification follows the GLIMPSE2 model:
     //   is_common      = MAF >= sparse_maf,  MAF = min(cref,calt)/(cref+calt)
-    //                    (NOTE: GLIMPSE2 uses `>=` and the FLOAT division
-    //                     min(cref/(cref+calt), calt/(cref+calt)); reader.cpp:171-172)
-    //   major_alleles  = calt > cref                 (reader.cpp:174)
-    //   drop site      = min(calt,cref)==0 && !keep_mono  (reader.cpp:168)  *** see UNKNOWN #1
+    //                    (NOTE: uses `>=` and the FLOAT division
+    //                     min(cref/(cref+calt), calt/(cref+calt)))
+    //   major_alleles  = calt > cref
+    //   drop site      = min(calt,cref)==0 && !keep_mono        *** see UNKNOWN #1
     //   n_com_sites_hq = is_common && SNP && pos != prev_pos
-    //                    -> here: is_common && !vmap.lq   (reader.cpp:181)   *** see UNKNOWN #2
-    //   common2tot     = abs-site index for each common site (reader.cpp:177)
-    //   HvarRef.set(i_common, hap)        for common minor carriers (reader.cpp:253)
-    //   ShapRef[hap].push(i_site)         for rare minor carriers   (reader.cpp:265)
+    //                    -> here: is_common && !vmap.lq         *** see UNKNOWN #2
+    //   common2tot     = abs-site index for each common site
+    //   HvarRef.set(i_common, hap)        for common minor carriers
+    //   ShapRef[hap].push(i_site)         for rare minor carriers
     //
     // PRECONDITION: `vmap.vars[k].cref/calt/lq` are already populated and the
     // monomorphic-drop has ALREADY been applied to the variant list (i.e.
-    // `vmap` and `panel` contain only the kept sites, in the same order). This
-    // mirrors GLIMPSE2 where the scan pass (reader.cpp:141-185) builds the
-    // kept-variant list before parseRefGenotypes fills the matrices.
+    // `vmap` and `panel` contain only the kept sites, in the same order). The
+    // scan pass builds the kept-variant list before the matrices are filled.
     // -----------------------------------------------------------------------
     pub fn build_from_panel(&mut self, panel: &HaplotypeBitmatrix, vmap: &VariantMap) {
         let n_sites = vmap.len();
@@ -264,7 +258,7 @@ impl RefHaplotypeSet {
             .sparse_maf
             .max(0.0); // keep whatever was set; default 0.001 from new()
 
-        // ---- PASS 1: classify (reader.cpp:170-184) ----
+        // ---- PASS 1: classify ----
         self.n_tot_sites = 0;
         self.n_com_sites = 0;
         self.n_rar_sites = 0;
@@ -277,7 +271,7 @@ impl RefHaplotypeSet {
             let v = &vmap.vars[k];
             let cref = v.cref as f64;
             let calt = v.calt as f64;
-            // MAF = min(cref/(cref+calt), calt/(cref+calt))   (reader.cpp:171)
+            // MAF = min(cref/(cref+calt), calt/(cref+calt))
             // GLIMPSE2 does this in FLOAT (cref*1.0f/...) — we use f64; the only
             // place this matters is a value sitting *exactly* on the sparse_maf
             // boundary. See UNKNOWN #3.
@@ -287,39 +281,39 @@ impl RefHaplotypeSet {
             } else {
                 0.0
             };
-            let is_common = maf >= self.sparse_maf; // reader.cpp:172 (`>=`)
+            let is_common = maf >= self.sparse_maf; // note the `>=`
             self.flag_common.push(is_common);
-            self.major_alleles.push(v.calt > v.cref); // reader.cpp:174
+            self.major_alleles.push(v.calt > v.cref);
             if is_common {
                 self.n_com_sites += 1;
             } else {
                 self.n_rar_sites += 1;
             }
             if is_common {
-                // common2tot.push_back(n_tot_sites)  (reader.cpp:177)
+                // common2tot.push_back(n_tot_sites)
                 self.common2tot.push(self.n_tot_sites as i32);
             }
             self.n_tot_sites += 1;
             // n_com_sites_hq += is_common && SNP && pos!=prev_pos
-            // We do not have line_type/prev_pos here; the reader stores that as
-            // `hq = SNP && pos!=prev_pos` and `variant.LQ = !hq`. So
-            //   is_common && !v.lq  ==  is_common && hq.        (reader.cpp:181)
+            // We do not have line_type/prev_pos here; the classification stores
+            // that as `hq = SNP && pos!=prev_pos` and `variant.LQ = !hq`. So
+            //   is_common && !v.lq  ==  is_common && hq.
             if is_common && !v.lq {
                 self.n_com_sites_hq += 1;
             }
         }
 
-        // ---- allocate HvarRef + ShapRef (reader.cpp:85 -> allocate()) ----
+        // ---- allocate HvarRef + ShapRef ----
         self.allocate();
 
-        // ---- PASS 2: fill ShapRef (rare minor carriers) (reader.cpp:247-274).
-        // GLIMPSE2 also fills HvarRef for common sites here; we skip that — common
+        // ---- PASS 2: fill ShapRef (rare minor carriers).
+        // HvarRef for common sites would also be filled here; we skip that — common
         // alleles are read on demand from `ref_bm` via `common2tot` (the redundant
         // common-site bitmatrix is not stored). `common2tot` is already populated
         // in PASS 1, so nothing else changes.
         for i_site in 0..n_sites {
             if !self.flag_common[i_site] {
-                // rare: if (a != major) ShapRef[hap].push(i_site)  (reader.cpp:265)
+                // rare: if (a != major) ShapRef[hap].push(i_site)
                 let major = self.major_alleles[i_site];
                 for hap in 0..self.n_ref_haps {
                     let a = panel.get(i_site, hap);
@@ -330,11 +324,11 @@ impl RefHaplotypeSet {
             }
         }
         // ShapRef[hap] is naturally ascending in i_site (we iterate sites in
-        // order), matching the GLIMPSE2 invariant that ShapRef is per-hap sorted.
+        // order), maintaining the invariant that ShapRef is per-hap sorted.
     }
 
     // -----------------------------------------------------------------------
-    // build_sparsePBWT (ref_haplotype_set.cpp:47-103)
+    // build_sparsePBWT
     // -----------------------------------------------------------------------
     /// Build the compressed sparse PBWT from the already-populated structures
     /// (flag_common / major_alleles / HvarRef / ShapRef). Produces `Ypacked`
@@ -342,7 +336,7 @@ impl RefHaplotypeSet {
     ///
     /// Requires `build_from_panel` (or an equivalent reader) to have run first.
     pub fn build_sparse_pbwt(&mut self, vmap: &VariantMap, ref_bm: &HaplotypeBitmatrix) {
-        // if (SvarRef.empty()) build the transpose ShapRef -> SvarRef  (:51-57)
+        // if (SvarRef.empty()) build the transpose ShapRef -> SvarRef
         if self.svar_ref.is_empty() {
             self.svar_ref = vec![Vec::new(); self.n_tot_sites];
             for h in 0..self.n_ref_haps {
@@ -352,41 +346,41 @@ impl RefHaplotypeSet {
                 }
             }
             // NB: SvarRef[site] is built by iterating h ascending, so it is
-            // ascending in hap id — matches reader/C++ (push order = h order).
+            // ascending in hap id (push order = h order).
         }
 
         // ref_small_hap(n_ref_haps,false); map_big_small(n_ref_haps,-1);
-        // pbwt_ref_idx(n_ref_haps);                                    (:59-61)
+        // pbwt_ref_idx(n_ref_haps);
         let mut ref_small_hap = vec![false; self.n_ref_haps];
         let mut map_big_small = vec![-1i32; self.n_ref_haps];
         let mut pbwt_ref_idx = vec![0i32; self.n_ref_haps];
 
-        // pbwt_array_A/B = vector<int>(n_ref_haps); iota A; iota pbwt_ref_idx (:63-67)
+        // pbwt_array_A/B = vector<int>(n_ref_haps); iota A; iota pbwt_ref_idx
         self.pbwt_array_a = (0..self.n_ref_haps as i32).collect();
         self.pbwt_array_b = vec![0i32; self.n_ref_haps];
         for (h, slot) in pbwt_ref_idx.iter_mut().enumerate() {
             *slot = h as i32;
         }
 
-        // Ypacked.reserve(rintf(sqrtf(n_ref_haps)) * n_tot_sites * 2)   (:69)
+        // Ypacked.reserve(rintf(sqrtf(n_ref_haps)) * n_tot_sites * 2)
         let reserve =
             (self.n_ref_haps as f32).sqrt().round() as usize * self.n_tot_sites * 2;
         self.ypacked = Vec::with_capacity(reserve);
 
-        // A_small_idx = vector<vector<int>>(n_com_sites_hq+1)           (:71)
+        // A_small_idx = vector<vector<int>>(n_com_sites_hq+1)
         self.a_small_idx = vec![Vec::new(); self.n_com_sites_hq + 1];
 
-        // pbwt_small_A/B start empty (members; only resized in init_small_rare).
+        // pbwt_small_A/B start empty (only resized in init_small_rare).
         self.pbwt_small_a.clear();
         self.pbwt_small_b.clear();
 
-        // int l_hq=0; int last_k=-1; int l_all=0;                       (:73-74)
+        // int l_hq=0; int last_k=-1; int l_all=0;
         let mut l_hq: usize = 0;
         let mut last_k: i64 = -1;
         let mut l_all: i32 = 0;
 
         for k in 0..self.n_tot_sites {
-            // if (M.vec_pos[k]->LQ) { l_all += flag_common[k]; continue; } (:77-81)
+            // if (M.vec_pos[k]->LQ) { l_all += flag_common[k]; continue; }
             if vmap.vars[k].lq {
                 l_all += self.flag_common[k] as i32;
                 continue;
@@ -394,25 +388,25 @@ impl RefHaplotypeSet {
 
             if self.flag_common[k] {
                 // if (pbwt_small_A.size()>0 && !(last_k>=0 && flag_common[last_k]))
-                //     build_init_common(l_hq);                          (:85)
+                //     build_init_common(l_hq);
                 // i.e. when we ARRIVE at a common HQ site and the previous KEPT
                 // site was rare (so we have a live small-PBWT to splice back into
                 // the full layout). last_k tracks the previous *processed* site
                 // (rare or common; LQ sites do NOT update last_k — they `continue`
-                // before the `last_k=k` at :98).
+                // before the `last_k=k` below).
                 let prev_common = last_k >= 0 && self.flag_common[last_k as usize];
                 if !self.pbwt_small_a.is_empty() && !prev_common {
                     self.build_init_common(l_hq);
                 }
-                // ref_rac_l = M.vec_pos[k]->cref  (count of REF alleles)   (:86)
+                // ref_rac_l = M.vec_pos[k]->cref  (count of REF alleles)
                 let ref_rac_l = vmap.vars[k].cref as i32;
-                // update_full_pbwt_ay(ref_rac_l, l_all, pbwt_ref_idx)      (:87)
+                // update_full_pbwt_ay(ref_rac_l, l_all, pbwt_ref_idx)
                 self.update_full_pbwt_ay(ref_rac_l, l_all, &mut pbwt_ref_idx, ref_bm);
-                l_hq += 1; // ++l_hq                                        (:88)
+                l_hq += 1; // ++l_hq
                 l_all += 1; // ++l_all
             } else {
                 // if (last_k<0 || flag_common[last_k])
-                //     init_small_rare(M,k,l_hq,pbwt_ref_idx,ref_small_hap,map_big_small); (:92)
+                //     init_small_rare(M,k,l_hq,pbwt_ref_idx,ref_small_hap,map_big_small);
                 // i.e. first rare site of a rare run (previous kept site was
                 // common, or this is the very first kept site).
                 let prev_common = last_k < 0 || self.flag_common[last_k as usize];
@@ -426,12 +420,12 @@ impl RefHaplotypeSet {
                         &mut map_big_small,
                     );
                 }
-                // std::fill(ref_small_hap, major_alleles[k])              (:93)
+                // std::fill(ref_small_hap, major_alleles[k])
                 let major = self.major_alleles[k];
                 for x in ref_small_hap.iter_mut() {
                     *x = major;
                 }
-                // for j in SvarRef[k]: ref_small_hap[map_big_small[SvarRef[k][j]]] = !major (:94)
+                // for j in SvarRef[k]: ref_small_hap[map_big_small[SvarRef[k][j]]] = !major
                 for &gh in &self.svar_ref[k] {
                     let small = map_big_small[gh as usize];
                     debug_assert!(
@@ -442,27 +436,27 @@ impl RefHaplotypeSet {
                     );
                     ref_small_hap[small as usize] = !major;
                 }
-                // ref_rac_l = major ? n_ref_haps - calt : pbwt_small_A.size() - calt (:95)
+                // ref_rac_l = major ? n_ref_haps - calt : pbwt_small_A.size() - calt
                 let calt = vmap.vars[k].calt as i32;
                 let ref_rac_l = if major {
                     self.n_ref_haps as i32 - calt
                 } else {
                     self.pbwt_small_a.len() as i32 - calt
                 };
-                // update_small_pbwt_ay(ref_rac_l, ref_small_hap)         (:96)
+                // update_small_pbwt_ay(ref_rac_l, ref_small_hap)
                 self.update_small_pbwt_ay(ref_rac_l, &ref_small_hap);
             }
-            last_k = k as i64; // last_k = k                              (:98)
+            last_k = k as i64; // last_k = k
         }
-        self.ypacked.shrink_to_fit(); // Ypacked.shrink_to_fit()         (:100)
+        self.ypacked.shrink_to_fit(); // Ypacked.shrink_to_fit()
     }
 
     // -----------------------------------------------------------------------
-    // update_full_pbwt_ay (ref_haplotype_set.cpp:105-126)
+    // update_full_pbwt_ay
     // -----------------------------------------------------------------------
     /// One full-panel PBWT sweep at a common HQ site.
     ///   `l`         = `l_all` (absolute COMMON-site emission index into HvarRef;
-    ///                 see UNKNOWN #4 — note C++ passes `l_all`, the running
+    ///                 see UNKNOWN #4 — note we pass `l_all`, the running
     ///                 common index counting LQ commons too).
     ///   `ref_rac_l` = count of REF alleles = `cref` = the v-occ split offset.
     ///
@@ -476,93 +470,92 @@ impl RefHaplotypeSet {
         pbwt_ref_idx: &mut [i32],
         ref_bm: &HaplotypeBitmatrix,
     ) {
-        let mut u: i32 = 0; // occ[0] start (REF bucket)        (:108)
-        let mut v: i32 = ref_rac_l; // occ[1] start (ALT bucket) (:109)
-        let mut m: usize = 0; // (:110)
+        let mut u: i32 = 0; // occ[0] start (REF bucket)
+        let mut v: i32 = ref_rac_l; // occ[1] start (ALT bucket)
+        let mut m: usize = 0;
         let n = self.n_ref_haps;
         let lrow = l as usize; // HvarRef row = common-site index
         // common-site index -> absolute site index in the all-sites `ref_bm`.
-        // `ref_bm.get(abs, hap)` returns the identical bool the old HvarRef did
-        // (build_from_panel populated HvarRef from this same panel; only the
+        // `ref_bm.get(abs, hap)` returns the identical bool a materialized HvarRef
+        // would (HvarRef would be populated from this same panel; only the
         // bit-packing layout differs, never the value).
         let abs = self.common2tot[lrow] as usize;
 
-        // while (m < n_ref_haps)                                (:114)
+        // while (m < n_ref_haps)
         while m < n {
-            // z = HvarRef.get(l, pbwt_array_A[m])               (:116)
+            // z = HvarRef.get(l, pbwt_array_A[m])
             let z = ref_bm.get(abs, self.pbwt_array_a[m] as usize);
-            let m0 = m; // (:117)
-            // while (++m<n && HvarRef.get(l,A[m])==z);          (:118)
+            let m0 = m;
+            // while (++m<n && HvarRef.get(l,A[m])==z);
             m += 1;
             while m < n && ref_bm.get(abs, self.pbwt_array_a[m] as usize) == z {
                 m += 1;
             }
-            // std::copy(A[m0..m] -> B[ *occ[z] ])               (:119)
+            // std::copy(A[m0..m] -> B[ *occ[z] ])
             let dst = if z { v } else { u } as usize;
             self.pbwt_array_b[dst..dst + (m - m0)]
                 .copy_from_slice(&self.pbwt_array_a[m0..m]);
-            // pack3Add(z, m-m0, Ypacked)                        (:120)
+            // pack3Add(z, m-m0, Ypacked)
             pack3_add(z as u8, (m - m0) as u32, &mut self.ypacked);
-            // *occ[z] += m-m0                                   (:121)
+            // *occ[z] += m-m0
             if z {
                 v += (m - m0) as i32;
             } else {
                 u += (m - m0) as i32;
             }
         }
-        // pbwt_array_B.swap(pbwt_array_A)                       (:123)
+        // pbwt_array_B.swap(pbwt_array_A)
         std::mem::swap(&mut self.pbwt_array_a, &mut self.pbwt_array_b);
-        // for h: pbwt_ref_idx[pbwt_array_A[h]] = h              (:125)
+        // for h: pbwt_ref_idx[pbwt_array_A[h]] = h
         for h in 0..n {
             pbwt_ref_idx[self.pbwt_array_a[h] as usize] = h as i32;
         }
     }
 
     // -----------------------------------------------------------------------
-    // update_small_pbwt_ay (ref_haplotype_set.cpp:128-148)
+    // update_small_pbwt_ay
     // -----------------------------------------------------------------------
     /// One small-panel PBWT sweep at a rare site. Operates only over the
     /// `pbwt_small_A` set (the haps that carry ANY rare minor allele in the
     /// current rare run, plus those folded in by init_small_rare). `ref_rac_l`
     /// is the split offset (REF/major bucket vs ALT/minor bucket).
     ///
-    /// NB: C++ takes `rare_small_haps` BY VALUE (a copy). We take a slice — the
-    /// function never mutates it, so this is behaviorally identical.
+    /// NB: `rare_small_haps` is taken by slice; the function never mutates it.
     fn update_small_pbwt_ay(&mut self, ref_rac_l: i32, rare_small_haps: &[bool]) {
-        let mut u: i32 = 0; // occ[0]                            (:131)
-        let mut v: i32 = ref_rac_l; // occ[1]                    (:132)
-        let mut m: usize = 0; // (:133)
-        let size_a = self.pbwt_small_a.len(); // (:136)
+        let mut u: i32 = 0; // occ[0]
+        let mut v: i32 = ref_rac_l; // occ[1]
+        let mut m: usize = 0;
+        let size_a = self.pbwt_small_a.len();
 
-        // while (m < size_a)                                    (:138)
+        // while (m < size_a)
         while m < size_a {
-            // z = rare_small_haps[pbwt_small_A[m]]              (:140)
+            // z = rare_small_haps[pbwt_small_A[m]]
             let z = rare_small_haps[self.pbwt_small_a[m] as usize];
-            let m0 = m; // (:141)
-            // while (++m<size_a && rare_small_haps[A[m]]==z);   (:142)
+            let m0 = m;
+            // while (++m<size_a && rare_small_haps[A[m]]==z);
             m += 1;
             while m < size_a && rare_small_haps[self.pbwt_small_a[m] as usize] == z {
                 m += 1;
             }
-            // std::copy(A[m0..m] -> B[ *occ[z] ])               (:143)
+            // std::copy(A[m0..m] -> B[ *occ[z] ])
             let dst = if z { v } else { u } as usize;
             self.pbwt_small_b[dst..dst + (m - m0)]
                 .copy_from_slice(&self.pbwt_small_a[m0..m]);
-            // pack3Add(z, m-m0, Ypacked)                        (:144)
+            // pack3Add(z, m-m0, Ypacked)
             pack3_add(z as u8, (m - m0) as u32, &mut self.ypacked);
-            // *occ[z] += m-m0                                   (:145)
+            // *occ[z] += m-m0
             if z {
                 v += (m - m0) as i32;
             } else {
                 u += (m - m0) as i32;
             }
         }
-        // pbwt_small_B.swap(pbwt_small_A)                       (:147)
+        // pbwt_small_B.swap(pbwt_small_A)
         std::mem::swap(&mut self.pbwt_small_a, &mut self.pbwt_small_b);
     }
 
     // -----------------------------------------------------------------------
-    // build_init_common (ref_haplotype_set.cpp:150-164)
+    // build_init_common
     // -----------------------------------------------------------------------
     /// Splice the live small-PBWT order back into the full PBWT order when we
     /// transition from a rare run back to a common HQ site at HQ-common index
@@ -577,18 +570,18 @@ impl RefHaplotypeSet {
     /// see init_small_rare). So `pbwt_array_A[small_idx[...]]` reads the global
     /// hap id sitting at that full-PBWT position.
     fn build_init_common(&mut self, l: usize) {
-        // set_big_small(n_ref_haps, true)                       (:152)
+        // set_big_small(n_ref_haps, true)
         let mut set_big_small = vec![true; self.n_ref_haps];
-        // const small_idx = A_small_idx[l]                      (:153)
+        // const small_idx = A_small_idx[l]
         // (clone to avoid borrow conflict with pbwt_array_* below)
         let small_idx = self.a_small_idx[l].clone();
-        // for htr in small_idx: set_big_small[small_idx[htr]] = false (:154)
+        // for htr in small_idx: set_big_small[small_idx[htr]] = false
         for &p in &small_idx {
             set_big_small[p as usize] = false;
         }
 
         // n_zeros=0; for htr in 0..n_ref_haps:
-        //   if set_big_small[htr] B[n_zeros++] = A[htr]         (:156-158)
+        //   if set_big_small[htr] B[n_zeros++] = A[htr]
         let mut n_zeros = 0usize;
         for htr in 0..self.n_ref_haps {
             if set_big_small[htr] {
@@ -597,19 +590,19 @@ impl RefHaplotypeSet {
             }
         }
         // for htr in 0..pbwt_small_A.size(): (++n_zeros)
-        //   B[n_zeros] = A[ small_idx[ pbwt_small_A[htr] ] ]    (:160-161)
+        //   B[n_zeros] = A[ small_idx[ pbwt_small_A[htr] ] ]
         for htr in 0..self.pbwt_small_a.len() {
             let small_pos = self.pbwt_small_a[htr] as usize;
             let full_pos = small_idx[small_pos] as usize;
             self.pbwt_array_b[n_zeros] = self.pbwt_array_a[full_pos];
             n_zeros += 1;
         }
-        // pbwt_array_B.swap(pbwt_array_A)                       (:163)
+        // pbwt_array_B.swap(pbwt_array_A)
         std::mem::swap(&mut self.pbwt_array_a, &mut self.pbwt_array_b);
     }
 
     // -----------------------------------------------------------------------
-    // init_small_rare (ref_haplotype_set.cpp:166-193)
+    // init_small_rare
     // -----------------------------------------------------------------------
     /// At the FIRST rare site of a rare run (HQ-common index `l` = `l_hq`),
     /// collect the union of all ref haps carrying ANY rare minor allele up to
@@ -631,11 +624,11 @@ impl RefHaplotypeSet {
         ref_small_hap: &mut Vec<bool>,
         map_big_small: &mut [i32],
     ) {
-        // if (l>0) for htr in A_small_idx[l-1]: map_big_small[..]= -1 (reset) (:170)
+        // if (l>0) for htr in A_small_idx[l-1]: map_big_small[..]= -1 (reset)
         // Reset ONLY the entries that the previous rare run set, not the whole
-        // vector — that is the C++ behavior and is load-bearing for perf, but
-        // since each run fully overwrites the entries it uses below, the net
-        // result is identical to a full reset. We mirror the C++ exactly.
+        // vector — this is load-bearing for perf, but since each run fully
+        // overwrites the entries it uses below, the net result is identical to a
+        // full reset.
         if l > 0 {
             for &p in &self.a_small_idx[l - 1] {
                 map_big_small[p as usize] = -1;
@@ -644,7 +637,7 @@ impl RefHaplotypeSet {
 
         // Collect union of SvarRef over the rare run [k .. next common HQ).
         // for kk=k.. : if LQ continue; if flag_common[kk] break;
-        //              rare_ref_haps += SvarRef[kk]                  (:172-177)
+        //              rare_ref_haps += SvarRef[kk]
         let mut rare_ref_haps: Vec<i32> = Vec::new();
         let mut kk = k;
         while kk < self.n_tot_sites {
@@ -658,17 +651,17 @@ impl RefHaplotypeSet {
             rare_ref_haps.extend_from_slice(&self.svar_ref[kk]);
             kk += 1;
         }
-        // sort + unique                                              (:178-179)
+        // sort + unique
         rare_ref_haps.sort_unstable();
         rare_ref_haps.dedup();
 
-        // Build an ordered map keyed by pbwt_ref_idx[hap] -> hap.    (:181)
-        //   std::map<int,int> pbwt_small_ref_idx_map;
+        // Build an ordered map keyed by pbwt_ref_idx[hap] -> hap.
+        //   map<int,int> pbwt_small_ref_idx_map;
         //   for h: map.insert({pbwt_ref_idx[rare_ref_haps[h]], rare_ref_haps[h]})
-        // std::map is ORDERED by key ascending; insert keeps the FIRST value for
+        // The map is ORDERED by key ascending; insert keeps the FIRST value for
         // a duplicate key. pbwt_ref_idx is a permutation (every hap a distinct
         // full-PBWT position) so keys are unique — no dup-key ambiguity here.
-        // We replicate with a sort-by-key.
+        // Realized here as a sort-by-key.
         let mut pairs: Vec<(i32, i32)> = rare_ref_haps
             .iter()
             .map(|&h| (pbwt_ref_idx[h as usize], h))
@@ -677,7 +670,7 @@ impl RefHaplotypeSet {
 
         // A_small_idx[l] = vector<int>(map.size());
         // for iter, kk2: map_big_small[iter->second]=kk2;
-        //                A_small_idx[l][kk2]=iter->first;            (:183-188)
+        //                A_small_idx[l][kk2]=iter->first;
         let size = pairs.len();
         self.a_small_idx[l] = vec![0i32; size];
         for (kk2, &(key, hap)) in pairs.iter().enumerate() {
@@ -686,7 +679,7 @@ impl RefHaplotypeSet {
         }
 
         // pbwt_small_A.resize(size); iota; pbwt_small_B.resize(size);
-        // ref_small_hap.resize(size);                                (:189-192)
+        // ref_small_hap.resize(size);
         self.pbwt_small_a = (0..size as i32).collect();
         self.pbwt_small_b = vec![0i32; size];
         ref_small_hap.resize(size, false);
@@ -699,7 +692,7 @@ mod tests {
 
     #[test]
     fn p3decode_table() {
-        // ref_haplotype_set.h:56-62 boundaries.
+        // pack3 decode-table boundaries.
         assert_eq!(P3DECODE[0], 0);
         assert_eq!(P3DECODE[63], 63);
         assert_eq!(P3DECODE[64], 0); // (64-64)<<6
@@ -762,7 +755,7 @@ mod tests {
         // Minimal end-to-end: 2 common sites, 4 haps, no rare sites.
         // Just checks the full-PBWT sweep runs and emits a nonempty Ypacked
         // with the right A_small_idx sizing. (Statistical-parity smoke test;
-        // exhaustive parity is gated against GLIMPSE2 in Stage 1/5.)
+        // exhaustive parity is gated end-to-end in Stage 1/5.)
         use crate::sparse_ls::variant::Variant;
         let n_haps = 4;
         let n_sites = 2;
