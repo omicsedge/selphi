@@ -1,4 +1,4 @@
-//! Port of Beagle `Stage2Baum`.
+//! Stage-2 Baum forward/backward phasing pass over the rare-marker HMM.
 //!
 //! Given the per-stage-1-marker state probabilities from `HmmStateProbs`,
 //! imputes phase (and missing alleles) at each rare marker between two
@@ -6,9 +6,6 @@
 //! target haplotype is computed by interpolating the state probabilities
 //! at the flanking stage-1 markers and weighting each state's contribution
 //! by whether its haplotype carries the target's rare allele.
-//!
-//! Reference (line-by-line port target):
-//! `_archive/reference_code/beagle_source_code/phase/Stage2Baum.java`.
 
 use super::{Stage2Input, pbwt_ibs::LowFreqPbwtPhaseIbs, hmm_state_probs::HmmStateProbs};
 
@@ -59,15 +56,13 @@ impl<'a> Stage2Baum<'a> {
     /// At a heterozygous rare marker, the call MAY emit a swap of the two
     /// alleles based on the integrated state probabilities; at a missing
     /// rare marker, the call emits imputed alleles.
-    ///
-    /// Verbatim from Beagle Stage2Baum.phase.
     pub fn phase<F>(&mut self, sample: usize, mut write: F)
     where
         F: FnMut(usize, usize, u8, u8),
     {
         let h1 = sample << 1;
         let h2 = h1 | 0b1;
-        // Re-seed rng per Beagle: rand.setSeed(seed + sample)
+        // Re-seed the rng per sample (seed + sample) for reproducible draws.
         self.rng = crate::haploid::rng::JavaRandom::new(
             (self.input.seed as i64).wrapping_add(sample as i64),
         );
@@ -145,11 +140,11 @@ impl<'a> Stage2Baum<'a> {
                 self.n_het_seen += 1;
                 let is_tie = p1 == p2;
                 if is_tie { self.n_tie_coinflip += 1; }
-                // Beagle's rule is `swap = p1 < p2 || (p1 == p2 && rand.nextBoolean())`,
+                // The canonical rule is `swap = p1 < p2 || (p1 == p2 && rand.nextBoolean())`,
                 // but on Selphi data ties happen ~65% of the time (degenerate al_probs
                 // when no IBS-carrier states fire), so coin-flipping them destroys ~32%
                 // of already-correct stage-1 phasing. Trust stage-1 on ties instead —
-                // STAGE2_COIN_FLIP_TIES=1 restores Beagle-exact behaviour for parity tests.
+                // STAGE2_COIN_FLIP_TIES=1 restores the coin-flip-on-tie behaviour for parity tests.
                 let coinflip_ties = crate::config::is_one("STAGE2_COIN_FLIP_TIES");
                 let swap = p1 < p2 || (is_tie && coinflip_ties && self.rng.next_boolean());
                 if swap {
@@ -163,16 +158,16 @@ impl<'a> Stage2Baum<'a> {
         }
     }
 
-    /// Lookup the precomputed `(prev_stage1_marker[m], prev_stage1_wt[m])`.
-    /// Mirrors Beagle's `(fpd.prevStage1Marker[m], fpd.prevStage1Wt[m])`
+    /// Lookup the precomputed `(prev_stage1_marker[m], prev_stage1_wt[m])`,
+    /// the index of and interpolation weight for the preceding stage-1 marker,
     /// indexed in global marker coords.
     fn prev_stage1_marker_and_wt(&self, m: usize) -> (usize, f32) {
         (self.input.prev_stage1_marker[m], self.input.prev_stage1_wt[m])
     }
 
-    /// Whether `allele` at global marker `m` is the low-frequency allele
-    /// (Beagle's `fpd.isLowFreq(m, al)`). Returns true iff the marker has
-    /// a designated rare allele AND `allele` equals that designation.
+    /// Whether `allele` at global marker `m` is the low-frequency allele.
+    /// Returns true iff the marker has a designated rare allele AND `allele`
+    /// equals that designation.
     fn is_low_freq(&self, m: usize, allele: u8) -> bool {
         if m >= self.input.rare_allele.len() { return false; }
         let r = self.input.rare_allele[m];
@@ -207,8 +202,6 @@ pub fn allele(all_haps_packed: &[u64], n_haps: usize, _n_markers: usize, marker:
 /// Compute unscaled allele probabilities at rare marker `m` for one of the
 /// two target haplotypes (`hap_bit = 0` or `1`).
 ///
-/// Mirrors Beagle `Stage2Baum.unscaledAlProbs(m, hapBit, a1, a2)`.
-///
 /// Inputs:
 /// - `all_haps_packed`, `n_haps`, `n_markers`, `n_target_haps`: the
 ///   post-stage-1 phased panel (target + reference)
@@ -229,14 +222,11 @@ pub fn allele(all_haps_packed: &[u64], n_haps: usize, _n_markers: usize, marker:
 /// `hap_bit`-th target haplotype at this rare marker, integrating over
 /// the K composite states.
 ///
-/// The Beagle rule for the rare-allele weighting at a heterozygous state
-/// (b1 != b2 in Beagle source):
+/// The rule for the rare-allele weighting at a heterozygous state (b1 != b2):
 /// - if `target_a1` is rare and exactly one of `b1, b2` equals `target_a1`,
 ///   add `prob` to `al_probs[a1]`
 /// - similarly for `target_a2`
 /// - exclusive-or (^) on the match flags: skip when both match or neither
-///
-/// Verbatim from Stage2Baum.java:165-203.
 pub fn unscaled_al_probs(
     al_probs: &mut [f32],
     n_alleles: usize,
@@ -264,8 +254,8 @@ pub fn unscaled_al_probs(
         let partner = hap_u ^ 0b1;
         let b1 = allele(all_haps_packed, n_haps, n_markers, m, hap_u);
         let b2 = allele(all_haps_packed, n_haps, n_markers, m, partner);
-        // Beagle treats missing as < 0; in our bitmatrix b1/b2 are always 0
-        // or 1, so we don't need a missing-allele guard here.
+        // A missing allele would be encoded as < 0; in our bitmatrix b1/b2 are
+        // always 0 or 1, so we don't need a missing-allele guard here.
         let prob = wt_a * probs_a[j] + one_minus_wt * probs_b[j];
         if b1 == b2 {
             al_probs[b1 as usize] += prob;

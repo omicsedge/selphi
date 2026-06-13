@@ -1,5 +1,5 @@
 //! Glue layer between Selphi's haploid `phase_genotypes_inner` (stage-1)
-//! and the Beagle-port `stage2` module.
+//! and the `stage2` rare-variant phasing module.
 //!
 //! Responsibilities:
 //! 1. Combine the phased target (`global_phased`, byte-per-hap, marker-major)
@@ -19,14 +19,14 @@
 use crate::common::HaplotypeBitmatrix;
 use super::stage2;
 
-/// Beagle MAX_HIFREQ_PROP gate constant. Implicitly checked in
-/// `stage2::should_run_stage2`; exposed here for the inverse threshold
-/// (a marker is "rare" if its MAF is below `RARE_MAF_THRESHOLD`).
+/// Inverse of the MAX_HIFREQ_PROP=0.75 high-frequency-proportion gate
+/// (implicitly checked in `stage2::should_run_stage2`): a marker is "rare"
+/// if its MAF is below `RARE_MAF_THRESHOLD`.
 const RARE_MAF_THRESHOLD: f64 = 0.001;
 /// Effective population size used to derive the per-marker recombination
-/// probability `p_rec = 1 - exp(-d * 0.04 * Ne / n_haps)`.
-/// Beagle uses `Ne = 100_000` for stage-2 (HmmStateProbs uses
-/// `phaseData.pRecomb()` which is precomputed with the same Ne as stage-1).
+/// probability `p_rec = 1 - exp(-d * 0.04 * Ne / n_haps)`. Stage-2 uses
+/// `Ne = 100_000`, the same value the stage-1 recombination map is
+/// precomputed with.
 const STAGE2_NE: f64 = 100_000.0;
 
 /// Run stage-2 rare-variant phasing on the post-stage-1 phased haplotypes.
@@ -78,7 +78,7 @@ pub fn run_stage2_after_stage1(
         .filter(|&m| rare_carriers[m].is_empty())
         .collect();
 
-    // 4) PBWT step boundaries on the stage-1 scaffold. Beagle uses
+    // 4) PBWT step boundaries on the stage-1 scaffold. Step size is
     //    `ibs_step = step_scale × medianDiff(stage1_cm)` with `step_scale = 3.0`.
     //    The earlier 0.05 cM hardcode was 100× too coarse and reduced
     //    PBWT carrier-graph hit rate to <2%, causing 76% of het swap
@@ -90,32 +90,33 @@ pub fn run_stage2_after_stage1(
         return false; // no stage-1 scaffold → nothing to anchor stage-2 to
     }
 
-    // 5) Per-stage-1-marker recombination probabilities (used by HmmStateProbs).
+    // 5) Per-stage-1-marker recombination probabilities (used by the
+    //    state-probability HMM).
     let p_recomb_per_stage1 = compute_p_recomb(&stage1_cm, n_haps, STAGE2_NE);
 
     // 5b) Per-global-marker prev-stage1-marker index + cM-weighted
-    //     interpolation weight. Beagle FixedPhaseData prevWt + prevStage1Marker.
+    //     interpolation weight.
     let (prev_stage1_marker, prev_stage1_wt) =
         build_prev_stage1_arrays(chip_cm, &stage1_to_global);
 
-    // 6) min_steps mirrors Beagle: max(200, ceil(1 cM / ibs_step_cm))
+    // 6) min_steps = max(200, ceil(1 cM / ibs_step_cm))
     let min_steps = std::cmp::max(200, (1.0 / ibs_step_cm.max(1e-9)).ceil() as usize);
 
     // 7) Stage2Input wiring.
     //
-    // Beagle's Par.liStephensPMismatch(nHaps):
+    // Li-Stephens p-mismatch as a function of nHaps:
     //   theta = 1 / (ln(nHaps) + 0.5)
     //   pMismatch = theta / (2 * (theta + nHaps))
-    // For our trio chr22 with n_haps=4586 this gives ≈ 1.22e-5; my earlier
+    // For our trio chr22 with n_haps=4586 this gives ≈ 1.22e-5; an earlier
     // hardcoded 1e-4 was ~10× too large, biasing the HMM toward false
     // "mismatch" emissions and washing out the state-probability signal.
     let theta = 1.0_f64 / ((n_haps as f64).ln() + 0.5);
     let p_mismatch = (theta / (2.0 * (theta + n_haps as f64))) as f32;
-    let max_states: usize = 140;  // Beagle phase_states / 2 = 280 / 2 = 140
-    // Beagle STAGE2_CANDIDATES = 10. Random-fallback window must be SMALL so
-    // the chosen hap is actually PBWT-adjacent (and therefore likely IBS).
+    let max_states: usize = 140;  // phase_states / 2 = 280 / 2 = 140
+    // Candidate cap STAGE2_CANDIDATES = 10. Random-fallback window must be
+    // SMALL so the chosen hap is actually PBWT-adjacent (and therefore likely IBS).
     let n_candidates: usize = 10;
-    // Beagle MAX_BACKOFF_CM = 0.3 cM; scale by step size.
+    // MAX_BACKOFF_CM = 0.3 cM; scale by step size.
     let max_backoff_steps: usize = ((0.3_f64 / ibs_step_cm.max(1e-9)).round() as usize).max(2);
     let no_ibs2: Vec<i32> = Vec::new();
 
@@ -264,8 +265,8 @@ fn build_combined_panel(
     panel
 }
 
-/// Compute Beagle's `ibsStep = step_scale × medianDiff(stage1_cm)`.
-/// `step_scale = 3.0` is Beagle's `D_STEP_SCALE`. Falls back to a
+/// Compute `ibsStep = step_scale × medianDiff(stage1_cm)`.
+/// `step_scale = 3.0` is the `D_STEP_SCALE` factor. Falls back to a
 /// 0.001 cM floor for degenerate (all-same-cM) maps so we never
 /// produce zero-length steps.
 fn compute_ibs_step_cm(stage1_cm: &[f64]) -> f64 {
@@ -303,15 +304,15 @@ fn build_steps(stage1_cm: &[f64], step_cm: f64) -> Vec<(usize, usize)> {
     steps
 }
 
-/// Beagle FixedPhaseData.prevStage1Marker + prevStage1Wt precomputation.
+/// Precompute the prev-stage1-marker index + cM-weighted interpolation weight.
 /// For each global marker `m`, store:
 /// - `prev_marker[m]` = index in stage-1 marker list of the closest stage-1
 ///   marker preceding (or AT) m. If m is before the first stage-1 marker
-///   we use index 0 (Beagle default int[] init behaviour).
+///   we use index 0 (the zero-init default).
 /// - `prev_wt[m]` = `(posB - posM) / (posB - posA)` where posA and posB
 ///   are the cM positions of the flanking stage-1 markers. At stage-1
 ///   markers themselves the weight is 1.0. At markers outside the stage-1
-///   range we use 1.0 (Beagle Arrays.fill default).
+///   range we use 1.0 (fill default).
 fn build_prev_stage1_arrays(chip_cm: &[f64], stage1_to_global: &[usize]) -> (Vec<usize>, Vec<f32>) {
     let n_markers = chip_cm.len();
     let n_hi = stage1_to_global.len();
@@ -323,9 +324,9 @@ fn build_prev_stage1_arrays(chip_cm: &[f64], stage1_to_global: &[usize]) -> (Vec
 
     // For each consecutive pair of stage-1 markers, fill the in-between
     // global markers with cM-weighted prev weight + record prev index.
-    // Mirrors Beagle FixedPhaseData.prevStage1Marker:
+    // prev_marker:
     //   for j in 2..nHiFreq: mkrA[stage1[j-1]..stage1[j]] = j-1
-    // and prevWt:
+    // prev_wt:
     //   for j in 1..nHiFreq: prev_wt[m] = (posB - posM)/(posB - posA)
     //                        for m in (stage1[j-1], stage1[j])
     //                        and prev_wt[stage1[j-1]] = 1.0
@@ -333,7 +334,7 @@ fn build_prev_stage1_arrays(chip_cm: &[f64], stage1_to_global: &[usize]) -> (Vec
     //   prev_wt[0..stage1[0]] = 1.0
     //   prev_wt[stage1[last]..n_markers] = 1.0
     //   prev_marker[stage1[last]..n_markers] = n_hi - 1
-    //   prev_marker[0..stage1[1]] = 0  (the default zero init from Beagle int[])
+    //   prev_marker[0..stage1[1]] = 0  (the zero-init default)
 
     if n_hi >= 2 {
         let mut start = stage1_to_global[1];

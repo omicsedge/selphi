@@ -32,7 +32,7 @@ fn lr_threshold(it: usize, n_burnin: usize, n_phasing: usize) -> f64 {
 }
 
 fn pmismatch(n_haps: usize) -> f64 {
-    // Par.java: theta = 1/((Math.log(nHaps) + 0.5))
+    // Li-Stephens p-mismatch as a function of nHaps: theta = 1/(ln(nHaps) + 0.5)
     // NOTE: 0.5 is ADDED to ln(nHaps), NOT inside the ln()
     let theta = 1.0 / ((n_haps as f64).ln() + 0.5);
     theta / (2.0 * (theta + n_haps as f64))
@@ -42,10 +42,9 @@ fn n_candidates(it: usize, n_burnin: usize, n_phasing: usize) -> i32 {
     if it < n_burnin { return 100; }
     let remaining = (n_burnin + n_phasing - it) as f64;
     let v = remaining / n_phasing as f64 * 90.0;
-    // Banker's rounding at the x.5 iterations (it=4, it=8). Beagle uses Java
-    // Math.round (half-up) here; we tried matching it and it REGRESSED chr22
-    // 1KG by -0.0002 (the extra candidate at it=4/8 was a slight net
-    // negative), so we keep the half-to-even variant.
+    // Banker's rounding (half-to-even) at the x.5 iterations (it=4, it=8). A
+    // half-up rounding here REGRESSED chr22 1KG by -0.0002 (the extra candidate
+    // at it=4/8 was a slight net negative), so we keep the half-to-even variant.
     let nc = if (v - v.floor() - 0.5).abs() < 1e-9 {
         let f = v.floor() as i32;
         if f % 2 == 0 { f } else { f + 1 }
@@ -157,11 +156,10 @@ fn phase_genotypes_inner(
         };
 
         // Coarse steps (standard, scale=3.0)
-        // minSteps floors the composite-segment eviction window. Beagle uses
-        // `max(200, ceil(1/phaseStep))` ("200 steps and 1 cM",
-        // BasicPhaseStates.java:84); without the 200 floor we evict composite
-        // segments ~3× sooner on dense chip maps (shorter IBS-anchored
-        // segments). Match Beagle.
+        // minSteps floors the composite-segment eviction window at
+        // `max(200, ceil(1/phaseStep))` ("200 steps and 1 cM"); without the 200
+        // floor we evict composite segments ~3× sooner on dense chip maps
+        // (shorter IBS-anchored segments).
         let (w_starts, w_ends) = compute_step_boundaries(&w_gen_pos, 3.0);
         let w_n = w_starts.len();
         let ibs_step = (3.0 * median).max(1e-7);
@@ -209,7 +207,7 @@ fn phase_genotypes_inner(
         window_seeds[wi] = rng_obj.next_long();
     }
 
-    // IBS2 restrictions are computed PER WINDOW (stage1Ibs2 per FixedPhaseData)
+    // IBS2 restrictions are computed PER WINDOW (one stage-1 IBS2 set per window)
     // Global output arrays
     let mut global_phased = vec![0u8; n_var * n_targ_haps];
     // Per-window EM-estimated recombIntensity (0.04 * Ne / nHaps) + owned range
@@ -227,7 +225,7 @@ fn phase_genotypes_inner(
         let overlap = if wi == 0 { 0 } else { windows[wi-1].3 - ws };
 
         // --- Init phase for this window ---
-        // SplicedGT: overlap markers use previous window's PHASED alleles
+        // Spliced genotypes: overlap markers use previous window's PHASED alleles
         let w_tg: std::borrow::Cow<[u8]> = if overlap > 0 {
             let mut tg = target_geno[ws * n_samples * 2..(ws + w_size) * n_samples * 2].to_vec();
             for m in 0..overlap {
@@ -263,7 +261,7 @@ fn phase_genotypes_inner(
             }
         }
 
-        // Per-window IBS2 restrictions (stage1Ibs2 per window, uses enforced genPos)
+        // Per-window IBS2 restrictions (stage-1 IBS2 per window, uses enforced genPos)
         // MAF computed from ref+target , not target-only
         let mut w_gt_sums = vec![0i8; w_size * n_samples];
         let mut w_maf = vec![0.0f32; w_size];
@@ -275,7 +273,7 @@ fn phase_genotypes_inner(
                 if a0 < 0 || a1 < 0 { w_gt_sums[m * n_samples + s] = -1; }
                 else { w_gt_sums[m * n_samples + s] = a0 + a1; }
             }
-            // MAF from ref+target (: stage1Maf)
+            // MAF from ref+target (stage-1 MAF)
             let mut alt_count = 0u32;
             let mut tot_count = 0u32;
             // Target alleles
@@ -388,10 +386,9 @@ fn phase_genotypes_inner(
             dd.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             crate::common::utils::median(&dd)
         }.max(1e-7);
-        // PBWT batch overlap buffer. Beagle uses D_BUFFER = 1.0 cM
-        // (PbwtIbsData.java:75, Par.java). We previously used 0.35 cM, a ~3×
-        // narrower warm-up that can truncate PBWT context for boundary
-        // haplotypes between parallel batches. Match Beagle.
+        // PBWT batch overlap buffer: D_BUFFER = 1.0 cM. We previously used
+        // 0.35 cM, a ~3× narrower warm-up that can truncate PBWT context for
+        // boundary haplotypes between parallel batches.
         const PBWT_BUFFER_CM: f64 = 1.0;
         // Coarse batch params
         let steps_per_batch = w_n_steps.div_ceil(n_threads);
@@ -412,13 +409,13 @@ fn phase_genotypes_inner(
         let mut converged = vec![false; n_samples];
         let convergence_start_iter = 8usize; // start checking after 8 iterations
         let convergence_threshold = 0.01f64; // swap rate < 1%
-        // Beagle adaptive burnin (Main.java:256-257): if the burnin swap rate
-        // drops below 1% the remaining burnin iterations are skipped and we
-        // advance straight to the first phasing iteration. Opt-in via
-        // SELPHI_HAPLOID_BURNIN_EARLYSTOP=1 (gated: changes the iteration
-        // schedule, so kept off by default until validated on trio SER — see
-        // feedback_r2_never_regress). The audit flags this as the likely
-        // remaining cause of the ~0.01 pp trio-SER gap vs Beagle.
+        // Adaptive burnin: if the burnin swap rate drops below 1% the remaining
+        // burnin iterations are skipped and we advance straight to the first
+        // phasing iteration. Opt-in via SELPHI_HAPLOID_BURNIN_EARLYSTOP=1
+        // (gated: changes the iteration schedule, so kept off by default until
+        // validated on trio SER — see feedback_r2_never_regress). The audit
+        // flags this as the likely remaining cause of the ~0.01 pp trio-SER gap
+        // vs Beagle.
         let burnin_earlystop = crate::config::is_one("SELPHI_HAPLOID_BURNIN_EARLYSTOP");
         let mut it = 0usize;
         while it < n_total {
@@ -585,8 +582,8 @@ fn phase_genotypes_inner(
                 let max_samples_to_analyze = 500;
                 let em_samp: Vec<usize> = if n_samples > max_samples_to_analyze {
                     let mut ia: Vec<usize> = (0..n_samples).collect();
-                    // Utilities.shuffle(ia, maxSamplesToAnalyze, rand)
-                    // Uses Random(pd.seed()) = Random(seed + it)
+                    // Partial Fisher-Yates shuffle of `ia` to pick maxSamplesToAnalyze.
+                    // Seeded per iteration: seed + it.
                     let mut em_rng = rng::JavaRandom::new(window_seeds[wi] + it as i64);
                     for j in 0..max_samples_to_analyze {
                         // Clamp the cast: next_int takes i32, and (n_samples - j) as i32
@@ -626,7 +623,7 @@ fn phase_genotypes_inner(
                         })
                     }).collect();
                     let (mut wc, mut wm, mut wg, mut wsp) = (0i32, 0.0f64, 0.0f64, 0.0f64);
-                    // ParamEstimates: sort entries before summing for reproducibility
+                    // Parameter estimates: sort entries before summing for reproducibility
                     let mut sorted_switch: Vec<(f64, f64)> = em_results.iter()
                         .filter(|(_, _, g, s)| *g > 0.0 && *s > 0.0 && g.is_finite() && s.is_finite())
                         .map(|(_, _, g, s)| (*g, *s)).collect();
@@ -787,10 +784,10 @@ fn phase_genotypes_inner(
                 pbwt_ms, em_ms, hmm_ms, skip_str,
                 if is_last { " (final)" } else { "" });
 
-            // Advance iteration. Beagle adaptive burnin: a burnin iteration
-            // whose swap rate already ≤ 1% jumps to the first phasing iteration
-            // (skips the rest of burnin), so EM/candidate ramping doesn't keep
-            // churning an already-stable phase. Only when opted in.
+            // Advance iteration. Adaptive burnin: a burnin iteration whose swap
+            // rate already ≤ 1% jumps to the first phasing iteration (skips the
+            // rest of burnin), so EM/candidate ramping doesn't keep churning an
+            // already-stable phase. Only when opted in.
             if burnin_earlystop && it + 1 < n_burnin && sr <= convergence_threshold {
                 it = n_burnin; // advance to first phasing iteration
             } else {
@@ -801,9 +798,9 @@ fn phase_genotypes_inner(
         // Save per-window EM recombIntensity (owned region boundaries in global coords)
         window_ri.push((ri_f32, ows, owe));
 
-        // Copy ALL window results to global arrays (SamplePhase swaps apply to entire window).
+        // Copy ALL window results to global arrays (per-sample phase swaps apply to entire window).
         // Owned region: authoritative phase.
-        // Non-owned (overlap): needed by next window's SplicedGT for initial phase.
+        // Non-owned (overlap): needed by next window's spliced-genotype initial phase.
         for h in 0..n_targ_haps {
             let h_off = h * hap_byte_stride;
             for bi in 0..(w_size >> 3) {
@@ -831,11 +828,11 @@ fn phase_genotypes_inner(
     // which is available in the diploid engine's phase_rare but not here.
 
     // Stage-2 rare-variant phasing (opt-in via SELPHI_HAPLOID_STAGE2=1).
-    // Beagle-equivalent stage-2 PBWT+HMM that refines phase at rare markers
-    // using the stage-1 common-variant scaffold; targets the SER gap
-    // measured on the 1KG 54-trio benchmark (Selphi haploid 2.569% chr22
-    // / 1.876% chr1 vs Beagle 5.5 2.548% / 1.865%). Default off until
-    // validated; gated by env var to keep the regression-safe baseline.
+    // A stage-2 PBWT+HMM that refines phase at rare markers using the stage-1
+    // common-variant scaffold; targets the SER gap measured on the 1KG 54-trio
+    // benchmark (Selphi haploid 2.569% chr22 / 1.876% chr1 vs Beagle 5.5
+    // 2.548% / 1.865%). Default off until validated; gated by env var to keep
+    // the regression-safe baseline.
     if stage2_integration::stage2_enabled() {
         let stage2_t0 = Instant::now();
         eprintln!("  [stage2] running rare-variant phasing pass...");

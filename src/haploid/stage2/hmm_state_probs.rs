@@ -1,12 +1,9 @@
-//! Port of Beagle `HmmStateProbs`.
+//! Stage-2 HMM state probabilities.
 //!
 //! Given the composite haplotype states built by `LowFreqPhaseStates`, runs
 //! a Li-Stephens forward-backward HMM with a uniform mismatch probability,
 //! producing per-marker per-state posterior probabilities normalized over
 //! the K states at the last marker.
-//!
-//! Reference (line-by-line port target):
-//! `_archive/reference_code/beagle_source_code/phase/HmmStateProbs.java`.
 
 use super::{Stage2Input, pbwt_ibs::LowFreqPbwtPhaseIbs, phase_states::LowFreqPhaseStates};
 
@@ -33,7 +30,6 @@ impl<'a> HmmStateProbs<'a> {
     }
 
     /// Full pass: build states from IBS, run forward, run backward.
-    /// Mirrors `HmmStateProbs.run` (Java).
     pub fn run(
         &mut self,
         targ_hap: usize,
@@ -61,8 +57,6 @@ impl<'a> HmmStateProbs<'a> {
 /// ```
 ///
 /// Base case at `m = 0`: `probs[0][j] = pMismatch[mismatch[0][j]]`.
-///
-/// Verbatim from Beagle `HmmStateProbs.runFwd`.
 pub fn run_fwd(
     probs: &mut [Vec<f32>],
     mismatch: &[Vec<u8>],
@@ -99,11 +93,11 @@ pub fn run_fwd(
 /// `bwd_buf` is a scratch array of length ≥ `n_states` provided by the
 /// caller (reused across target haps to avoid reallocation).
 ///
-/// Verbatim from Beagle `HmmStateProbs.runBwd`. Note Beagle's odd indexing:
+/// Note the off-by-one indexing this recurrence relies on:
 /// `bwd[j] *= pMismatch[mismatch[m+1][j]]` uses the NEXT marker's mismatch,
 /// then `pRecomb[m+1]` is used for the scale/shift, then `probs[m][j]` is
-/// multiplied by `bwd[j]` and rows are normalized. Be careful preserving
-/// this order on the port.
+/// multiplied by `bwd[j]` and rows are normalized. Preserve this exact
+/// order — the result depends on it.
 pub fn run_bwd(
     probs: &mut [Vec<f32>],
     mismatch: &[Vec<u8>],
@@ -115,11 +109,11 @@ pub fn run_bwd(
     let n_markers = probs.len();
     if n_markers == 0 || n_states == 0 { return; }
 
-    // Initial backward: uniform 1/nStates at the last marker. The Beagle
-    // code does NOT update probs[inclEnd] in the backward pass — it stays
-    // as the forward-pass value, which is already the joint posterior up
-    // to normalisation by the row sum (Beagle never normalises that last
-    // row because the loop runs for `m in (inclEnd-1) downto 0` only).
+    // Initial backward: uniform 1/nStates at the last marker. The backward
+    // pass does NOT update probs[inclEnd] — it stays as the forward-pass
+    // value, which is already the joint posterior up to normalisation by the
+    // row sum (that last row is left un-normalised because the loop runs for
+    // `m in (inclEnd-1) downto 0` only).
     let incl_end = n_markers - 1;
     for j in 0..n_states {
         bwd_buf[j] = 1.0 / (n_states as f32);
