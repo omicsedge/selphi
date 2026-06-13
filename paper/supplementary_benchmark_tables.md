@@ -39,7 +39,7 @@ full phase+impute pipeline. Reference: Beagle 5.5 (03Oct25).
 | Chr | Mode | Bin | Selphi 2 R² | Beagle 5.5 R² | Winner | Status |
 |---|---|---|---:|---:|---|---|
 | 22 | phased   | OVERALL   | **0.4797** | 0.4680 | Selphi | FINAL |
-| 22 | unphased | OVERALL   | **0.4822** | 0.4727 | Selphi | FINAL |
+| 22 | unphased | OVERALL   | **0.4825** | 0.4727 | Selphi | FINAL |
 | 22 | phased   | per-sample mean | **0.9159** | 0.9077 | Selphi | FINAL |
 | 22 | phased   | 0.05–0.1% | **0.2680** | 0.2672 | tie | FINAL |
 | 22 | phased   | 0.5–1%    | **0.5062** | 0.4850 | Selphi | FINAL |
@@ -50,12 +50,15 @@ full phase+impute pipeline. Reference: Beagle 5.5 (03Oct25).
 | 1  | phased   | 0.5–1%    | **0.6093** | 0.5912 | Selphi | FINAL |
 | 1  | phased   | 20–50%    | **0.9309** | 0.9249 | Selphi | FINAL |
 
-> **Reconciliation flag.** The main-text Table 1 in `selphi2_paper.md` carries
-> slightly different values for a few of these cells (chr22 OVERALL 0.4825 vs
-> 0.4822; chr22 0.5–1% 0.5076 vs 0.5062; chr1 0.5–1% 0.6112 vs 0.6093; chr22
-> 20–50% 0.8407 vs 0.8427). These are small seed/rounding/run divergences. **Pin
-> one source before submission** by re-running playbook Test-A/Test-B once and
-> making the survivor authoritative across both the main text and this table.
+> **Reconciliation.** The main-text Table 1 reports the **unphased full-pipeline**
+> mode (chip in, dosage out), pinned to the 2026-06-12 re-measurement campaign
+> (chr22 OVERALL 0.4825, per-sample mean 0.9150; chr1 OVERALL 0.5702); the chr22
+> unphased OVERALL cell above is pinned to match. The per-bin cells in this table
+> are **phased impute-only** — a different mode — so small deltas versus Table 1's
+> unphased per-bin cells (e.g. chr22 0.5–1% 0.5062 here vs 0.5076 in Table 1) are
+> expected, not errors. To present a single matching per-bin breakdown, re-run
+> playbook Test-B (unphased) once and make it authoritative across both the main
+> text and this table.
 
 ## Table S-B · Imputation accuracy (R²) — biobank-scale MESA × TOPMed
 
@@ -82,6 +85,13 @@ This is the candidate-set-size (`mc`) sweep behind the biobank claim.
 > panel (top-2500 = 1.5 % of the panel truncates rare signal); raising `mc` to
 > 120–150 K flips Selphi to win **every** MAF bin and OVERALL. Beyond 150 K is
 > wasteful (mc=170K = +0.0002 for +22 min).
+>
+> **Camera-ready headline (matches main-text Results).** The MESA 5K × TOPMed
+> figure in the paper is Selphi 2 **0.6157** vs Beagle 5.5 **0.5921** (Δ +0.0236;
+> per-sample 0.9023 vs 0.8845), from the 2026-06-12 campaign over the full
+> 17.9 M variants with `--sample-batch-size`. The mc-sweep rows above use an
+> earlier Beagle 5.5 baseline (0.5975) and are retained to show the `mc`
+> trajectory; pin the campaign numbers as authoritative for the headline.
 
 ## Table S-C · Leak-free GIAB validation — chip→WGS
 
@@ -111,12 +121,20 @@ leak-free. EC2 r7a.4xlarge, 16 threads. Reference: Beagle 5 (03Oct25); old Selph
 Current default engine = GLIMPSE2-faithful 8-founder phasing HMM run every iteration
 (`GLIMPSE2_PHASE`, default-on). r12 = chr22:30–42 Mb, 54 sim children, 4478-hap
 no-trios panel. Big prod panel = 75 552 haps, GIAB samples, proper hiconf truth.
+**The paper's headline lcWGS result is the real-GIAB single-sample mean (0.9201 vs
+GLIMPSE2 0.9155; top rows, = main-text Table 5).** The simulated full-chr22
+54-sample rows (e.g. OVERALL 0.9255) run hotter than real reads and are retained
+as a secondary/ablation comparison, not the headline.
 
 | Benchmark | Cov | Bin | Selphi 2 R² | GLIMPSE2 R² | Winner | Status |
 |---|---|---|---:|---:|---|---|
-| canonical r12 (54s) | 1× | OVERALL | **0.9511** | 0.9429 | Selphi | FINAL |
+| **real GIAB HG002 (single-sample, 4478-hap) — PAPER HEADLINE** | ~1.8× | OVERALL | **0.9212** | 0.9171 | Selphi | FINAL |
+| **real GIAB HG003 (single-sample, 4478-hap)** | ~1.8× | OVERALL | **0.9214** | 0.9177 | Selphi | FINAL |
+| **real GIAB HG004 (single-sample, 4478-hap)** | ~1.8× | OVERALL | **0.9177** | 0.9116 | Selphi | FINAL |
+| **real GIAB mean (HG002/3/4)** | ~1.8× | OVERALL | **0.9201** | 0.9155 | Selphi | FINAL |
+| canonical r12 (54s, simulated) | 1× | OVERALL | **0.9511** | 0.9429 | Selphi | FINAL |
 | canonical r12 (54s) | 1× | 0.5–1% | **0.9289** | 0.9237 | Selphi | FINAL |
-| full-chr22 (54s, 326K sites) | 1× | OVERALL | **0.9255** | 0.9155 | Selphi | FINAL |
+| full-chr22 (54s, simulated, 326K sites) | 1× | OVERALL | **0.9255** | 0.9155 | Selphi | FINAL |
 | full-chr22 (54s) | 1× | 0.5–1% | **0.8888** | 0.8813 | Selphi | FINAL |
 | full-chr22 (54s) | 1× | 1–5% | **0.9173** | 0.9027 | Selphi | FINAL |
 | full-chr22 (54s) | 1× | 5–10% | **0.9445** | 0.9319 | Selphi | FINAL |
@@ -177,10 +195,11 @@ Reference: Beagle 5.5, SHAPEIT5 v5.1.1.
 | chr22 1KG 801s, chip→WGS | wall (phased/unphased) | **69 s / 82 s** | Beagle 5.5: 58 s / 84 s | tie | FINAL |
 | chr22 1KG 801s, chip→WGS | peak RAM | **13.2 / 13.1 GB** | Beagle 5.5: 21.7 / 14.6 GB | Selphi | FINAL |
 | chr1 1KG 801s, chip→WGS | wall (phased/unphased) | **373 s / 437 s** | Beagle 5.5: 207 s / 321 s | reference | FINAL |
-| TOPMed MESA 5K chr20 (171K-hap, 17.9M var) | wall (phased/unphased) | **41 min / 45 min** | Beagle 5.4: 55 min / 57 min | Selphi | FINAL |
-| TOPMed MESA 5K chr20 | peak RAM | **120 GB** | Beagle 5.4: 103 GB | reference | FINAL |
+| TOPMed MESA 5K chr20 (171K-hap, 17.9M var), full pipeline | wall | **12,345 s (~3.4 h)** | Beagle 5.5: 4,148 s | reference | FINAL |
+| TOPMed MESA 5K chr20 | peak RAM | **66.8 GB** | Beagle 5.5: 96.5 GB | Selphi | FINAL |
 | lcWGS full-chr22 (54s), current default engine | wall | **41:50** | GLIMPSE2: 21:36 | reference | FINAL |
-| lcWGS single-sample (chr22), current default engine | wall | **1:22** | GLIMPSE2: 5:44 | Selphi | FINAL |
+| lcWGS single-sample (chr22), real GIAB, current default engine | wall | **~2:01** | GLIMPSE2: ~5:22 | Selphi | FINAL |
+| lcWGS single-sample (chr22), real GIAB | peak RAM | **~3.3 GB** | GLIMPSE2: ~2.1 GB | reference | FINAL |
 | lcWGS big prod panel multicov (HG002, 0.5–4×) | wall | **2:10–2:34** | GLIMPSE2: 4:41–4:49 | Selphi | FINAL |
 | lcWGS big prod panel multicov | peak RAM | **~2.9–3.2 GB** | GLIMPSE2: ~2.2–2.6 GB | tie | FINAL |
 | lcWGS real-data BAM (chr1:30–45 Mb, 1 sample) | wall | **31 s (fast) / 51 s (default)** | GLIMPSE2: 102 s | Selphi | FINAL |
