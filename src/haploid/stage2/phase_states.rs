@@ -1,4 +1,4 @@
-//! Port of Beagle `LowFreqPhaseStates` and `CompHapSegment`.
+//! Low-frequency composite phase-state builder.
 //!
 //! Combines per-step forward and backward IBS neighbors (produced upstream
 //! by `LowFreqPbwtPhaseIbs`) into a max-`max_states` composite haplotype
@@ -10,9 +10,6 @@
 //! `haps[m][j]` = reference haplotype assigned to state `j` at marker `m`,
 //! `mismatches[m][j] ∈ {0, 1}` = whether that reference allele matches
 //! the target's allele at marker `m`.
-//!
-//! Reference (line-by-line port target):
-//! `_archive/reference_code/beagle_source_code/phase/LowFreqPhaseStates.java`.
 
 use std::collections::{BinaryHeap, HashMap};
 
@@ -89,8 +86,6 @@ impl<'a> LowFreqPhaseStates<'a> {
 
     /// Fill `haps[m][j]` and `mismatches[m][j]` for `targ_hap`. Returns the
     /// number of composite states actually built (≤ `max_states`).
-    ///
-    /// Mirrors `LowFreqPhaseStates.ibsStates` (Java).
     pub fn ibs_states(
         &mut self,
         targ_hap: usize,
@@ -102,7 +97,8 @@ impl<'a> LowFreqPhaseStates<'a> {
         n_comp_haps
     }
 
-    /// Mirrors `setCompRefHaps` (Java).
+    /// Build the composite reference-hap segments for `targ_hap` from its
+    /// forward/backward IBS hits, falling back to random haps if none exist.
     fn set_comp_ref_haps(&mut self, targ_hap: usize) -> usize {
         self.q.clear();
         self.hap_to_last_step.clear();
@@ -130,7 +126,8 @@ impl<'a> LowFreqPhaseStates<'a> {
         self.finalize_segments()
     }
 
-    /// Mirrors `addIbsHap` (Java).
+    /// Incorporate one IBS hit `ibs_hap` (seen at `step`) into the segment
+    /// queue: extend an existing composite hap or open a new one.
     fn add_ibs_hap(&mut self, ibs_hap: i32, step: usize) {
         if ibs_hap < 0 { return; }
 
@@ -170,11 +167,10 @@ impl<'a> LowFreqPhaseStates<'a> {
         self.hap_to_last_step.insert(ibs_hap, step);
     }
 
-    /// Mirrors `updateHeadOfQ` (Java): when a hap was last seen at a later
-    /// step than recorded in the queue head, re-insert with the updated
-    /// step so the heap order remains correct. (Beagle's queue stores
-    /// stale `last_ibs_step` values because the hap-to-step map is
-    /// updated lazily.)
+    /// When a hap was last seen at a later step than recorded in the queue
+    /// head, re-insert with the updated step so the heap order remains
+    /// correct. The queue can store stale `last_ibs_step` values because the
+    /// hap-to-step map is updated lazily.
     fn update_head_of_q(&mut self) {
         while let Some(head) = self.q.peek().copied() {
             let lazy_step = *self.hap_to_last_step.get(&head.hap).unwrap_or(&head.last_ibs_step);
@@ -186,14 +182,13 @@ impl<'a> LowFreqPhaseStates<'a> {
         }
     }
 
-    /// Mirrors `setFinalRefSegs` (Java): close off each composite hap's
-    /// last segment by appending the sentinel end-marker, then initialize
-    /// the `comp_hap_to_*` cache to the first segment.
+    /// Close off each composite hap's last segment by appending the sentinel
+    /// end-marker, then initialize the `comp_hap_to_*` cache to the first
+    /// segment.
     ///
-    /// Beagle's segment ends are indexed in **stage-1 marker space**
-    /// (the `nMarkers` Beagle uses inside LowFreqPhaseStates is
-    /// `allHaps.nMarkers()` = stage-1 marker count, NOT the global VCF
-    /// marker count). So the sentinel here is `n_stage1_markers`.
+    /// Segment ends are indexed in **stage-1 marker space** (the marker count
+    /// used here is the stage-1 scaffold count, NOT the global VCF marker
+    /// count). So the sentinel here is `n_stage1_markers`.
     fn finalize_segments(&mut self) -> usize {
         let n_comp_haps = self.q.len();
         let comp_hap_indices: Vec<usize> = self.q.iter().map(|s| s.comp_hap_index).collect();
@@ -209,11 +204,11 @@ impl<'a> LowFreqPhaseStates<'a> {
         n_comp_haps
     }
 
-    /// Mirrors `copyData` (Java). Iterates over **stage-1 marker indices**
-    /// (Beagle's `nMarkers` here = `allHaps.nMarkers()` = stage-1 scaffold
-    /// count, not global VCF markers). Each stage-1 index is translated to
-    /// the global marker via `stage1_to_global` to look up alleles in the
-    /// post-stage-1 phased panel.
+    /// Materialize the per-marker state matrix. Iterates over **stage-1
+    /// marker indices** (the marker count here is the stage-1 scaffold count,
+    /// not global VCF markers). Each stage-1 index is translated to the global
+    /// marker via `stage1_to_global` to look up alleles in the post-stage-1
+    /// phased panel.
     fn copy_data(
         &mut self,
         targ_hap: usize,
@@ -243,11 +238,11 @@ impl<'a> LowFreqPhaseStates<'a> {
         }
     }
 
-    /// Mirrors `fillQWithRandomHaps` (Java). Used when the PBWT IBS sweep
-    /// returned no neighbors for this target — fall back to random ref haps.
+    /// Used when the PBWT IBS sweep returned no neighbors for this target —
+    /// fall back to random ref haps.
     ///
-    /// Uses `JavaRandom` (Selphi's exact port of `java.util.Random`) so the
-    /// random sequence is byte-identical to Beagle for the same seed+hap.
+    /// Uses `JavaRandom` (an exact reimplementation of `java.util.Random`) so
+    /// the random sequence is deterministic for the same seed+hap.
     fn fill_q_with_random_haps(&mut self, hap: usize) {
         debug_assert!(self.q.is_empty());
         let n_haps = self.input.n_haps;

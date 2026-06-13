@@ -1,19 +1,14 @@
-//! Port of Beagle `LowFreqPbwtPhaseIbs` + `PbwtDivUpdater`.
+//! Low-frequency PBWT phasing IBS selection + the PBWT divergence updater.
 //!
 //! Runs PBWT forward and backward sweeps over the phased haplotype panel
 //! (target + reference) at the stage-1 step boundaries. For each (step,
 //! target hap) it picks the best IBS neighbor, preferentially choosing
 //! haplotypes that share a rare-allele carrier set with the target.
-//!
-//! References (line-by-line port targets):
-//! - `_archive/reference_code/beagle_source_code/phase/LowFreqPbwtPhaseIbs.java`
-//! - `_archive/reference_code/beagle_source_code/beagleutil/PbwtDivUpdater.java`
 
 use super::Stage2Input;
 
 // ---------------------------------------------------------------------------
 // PbwtDivUpdater: standard Durbin PBWT update with divergence tracking.
-// Port of Beagle beagleutil/PbwtDivUpdater.java.
 // ---------------------------------------------------------------------------
 
 /// PBWT forward / backward update primitive that maintains the prefix
@@ -76,7 +71,6 @@ impl PbwtDivUpdater {
     /// p-array seed (`marker±1`), the divergence accumulation (max vs min),
     /// and the per-bucket reset sentinel (`i32::MIN`/`MAX`) — the two
     /// monomorphizations match the previous hand-written fwd/bwd bodies.
-    /// Verbatim from PbwtDivUpdater.fwdUpdate / bwdUpdate.
     #[inline]
     fn update<const FWD: bool>(
         &mut self, rec: &[i32], n_alleles: usize, marker: i32,
@@ -123,7 +117,7 @@ impl PbwtDivUpdater {
 // ---------------------------------------------------------------------------
 // LowFreqPbwtPhaseIbs: orchestrator that runs fwd+bwd PBWT sweeps and
 // records the best IBS neighbor per (step, target_hap) with rare-allele
-// preference. Port of phase/LowFreqPbwtPhaseIbs.java.
+// preference.
 // ---------------------------------------------------------------------------
 
 pub struct LowFreqPbwtPhaseIbs {
@@ -134,9 +128,9 @@ pub struct LowFreqPbwtPhaseIbs {
 }
 
 impl LowFreqPbwtPhaseIbs {
-    /// Build the fwd + bwd IBS sweeps from a Stage2Input. Single-threaded
-    /// reference port; parallelization is a follow-up optimization once the
-    /// algorithm is validated against Beagle SER.
+    /// Build the fwd + bwd IBS sweeps from a Stage2Input. Single-threaded;
+    /// parallelization is a follow-up optimization once the algorithm is
+    /// validated against the SER benchmark.
     ///
     /// Algorithm (per direction):
     ///
@@ -152,11 +146,11 @@ impl LowFreqPbwtPhaseIbs {
     ///    from the PBWT-adjacent window of size `n_candidates`.
     /// 5. Store the picked neighbor in `ibs_haps[step][target_hap]`.
     ///
-    /// `n_candidates` controls the random-fallback window size. Beagle
-    /// default is the same `phase_states/2` used for the composite state
-    /// count; we expose it via `Stage2Input::max_states` (already passed).
+    /// `n_candidates` controls the random-fallback window size. The default
+    /// is the same `phase_states/2` used for the composite state count; we
+    /// expose it via `Stage2Input::max_states` (already passed).
     pub fn new(input: &Stage2Input) -> Self {
-        // Multi-marker coded-step encoding (Beagle CodedSteps equivalent).
+        // Multi-marker coded-step encoding.
         // For each stage-1 step, encode each hap's allele pattern across
         // the markers in the step. step_len <= 20 → bit-pack into u32;
         // longer steps → FNV-1a hash. Then normalize to sequential indices.
@@ -188,10 +182,10 @@ impl LowFreqPbwtPhaseIbs {
 }
 
 // ---------------------------------------------------------------------------
-// Per-step allele coding builder. Each Beagle "coded step" is the allele
-// index at that step for each hap; here we use a representative marker per
-// step (the step's center marker) and assume biallelic. Multi-allelic
-// panels would need richer coding — left as TODO since SNV panels dominate.
+// Per-step allele coding builder. Each "coded step" is the allele index at
+// that step for each hap; here we use a representative marker per step (the
+// step's center marker) and assume biallelic. Multi-allelic panels would
+// need richer coding — left as TODO since SNV panels dominate.
 // ---------------------------------------------------------------------------
 
 /// Encode each step as a per-hap integer code by packing the bits of the
@@ -203,9 +197,9 @@ impl LowFreqPbwtPhaseIbs {
 ///   (an integer in 0..n_alleles_per_step[step]).
 /// - `n_alleles_per_step[step]` = number of distinct allele codes at step.
 ///
-/// This is the Beagle `CodedSteps` equivalent: multiple distinct allele
-/// codes per step let the PBWT sort haps into TIGHT groups with shared
-/// multi-marker patterns, keeping divergences "recent" enough that the
+/// Multiple distinct allele codes per step let the PBWT sort haps into
+/// TIGHT groups with shared multi-marker patterns, keeping divergences
+/// "recent" enough that the
 /// IBS-neighbor window expansion finds real neighbors. The previous
 /// single-marker version gave only n_alleles=2 per step, which created
 /// ~2293/2293 splits that left divergences stale (step - log2(n_haps))
@@ -280,8 +274,7 @@ pub(super) fn build_coded_steps(input: &Stage2Input) -> (Vec<i32>, Vec<usize>) {
 
 // ---------------------------------------------------------------------------
 // best_stage2_index<FWD>: pick the IBS neighbor at PBWT position `i` using the
-// carrier-link graph + divergence walk + IBS2 skip. Port of
-// LowFreqPbwtPhaseIbs.bestFwdStage2Index / bestBwdStage2Index.
+// carrier-link graph + divergence walk + IBS2 skip.
 // ---------------------------------------------------------------------------
 
 /// Pick the IBS neighbour at PBWT position `i`, walking the carrier-link graph
@@ -289,7 +282,7 @@ pub(super) fn build_coded_steps(input: &Stage2Input) -> (Vec<i32>, Vec<usize>) {
 /// Returns the PBWT-array INDEX (not hap) of the chosen neighbor, or -1.
 ///
 /// `FWD` const-folds the divergence direction so the two monomorphizations
-/// match the previous bestFwd/bestBwdStage2Index bodies:
+/// match the previous forward/backward best-index bodies:
 /// - forward tracks "match start" — extreme = min(d[i], d[i+1]), bound `+backoff`
 ///   capped at `step`, walk while `d <= bound` accumulating with `max`, and
 ///   prefers the prev side when its bound is STRICTLY smaller;
@@ -394,7 +387,7 @@ fn best_stage2_index<const FWD: bool>(
         }
     }
 
-    // Beagle's tie-breaker: prefer the prev side iff its bound is STRICTLY
+    // Tie-breaker: prefer the prev side iff its bound is STRICTLY
     // smaller (fwd) / larger (bwd) AND a match was found.
     let prefer_prev = if FWD { prev_bound < next_bound } else { prev_bound > next_bound };
     if prefer_prev && best_prev_match != -1 {
@@ -406,7 +399,6 @@ fn best_stage2_index<const FWD: bool>(
 
 // ---------------------------------------------------------------------------
 // Random fallback: pick a hap from a PBWT-adjacent window, skipping IBS2 sibs.
-// Port of LowFreqPbwtPhaseIbs.getMatch.
 // ---------------------------------------------------------------------------
 
 pub fn get_match(
@@ -430,12 +422,12 @@ pub fn get_match(
     let mut index = i_start + (rng.next_int(i_length as i32) as usize);
     for _ in 0..i_length {
         let cand_sample = (a[index] >> 1) as u32;
-        // Skip both haps of the target's own sample. Beagle's getMatch relies
-        // on the Ibs2 lookup to filter these out implicitly, but we always
-        // run with empty IBS2 data, so we add an explicit self-sample check
-        // to avoid returning the target's own hap as its "IBS neighbor"
-        // (which would produce a fake-perfect-match state and corrupt the
-        // HMM posterior).
+        // Skip both haps of the target's own sample. The match picker would
+        // normally rely on the IBS2 lookup to filter these out implicitly,
+        // but we always run with empty IBS2 data, so we add an explicit
+        // self-sample check to avoid returning the target's own hap as its
+        // "IBS neighbor" (which would produce a fake-perfect-match state and
+        // corrupt the HMM posterior).
         if cand_sample != target_sample
             && !are_ibs2(
                 target_sample, cand_sample,
@@ -630,9 +622,8 @@ fn set_inv(prefix: &[i32], inv_a: &mut [i32]) {
 /// CRITICAL: `stage1_steps[step]` returns boundaries in **stage-1 marker**
 /// index space (positions into `stage1_to_global`), while `rare_carriers`
 /// is indexed by **global VCF marker** index. We must translate via
-/// `stage1_to_global` before looking up carriers. Beagle does the same in
-/// `LowFreqPbwtPhaseIbs.lowFreqHapLists` (translates stage-1 step bounds
-/// into global marker bounds via `stage1To2`).
+/// `stage1_to_global` before looking up carriers (translate the stage-1 step
+/// bounds into global marker bounds via the stage-1-to-global map first).
 fn collect_step_carriers(input: &Stage2Input, stage1_start: usize, stage1_end_excl: usize) -> Vec<Vec<u32>> {
     let n_stage1 = input.stage1_to_global.len();
     if n_stage1 == 0 { return Vec::new(); }
@@ -652,13 +643,13 @@ fn collect_step_carriers(input: &Stage2Input, stage1_start: usize, stage1_end_ex
     } else {
         input.n_markers
     };
-    // Note on partner expansion: Beagle's `hapList(carriers)` adds BOTH haps
-    // of each carrier sample to the graph (even the non-carrier partner of a
-    // het sample). I tested that here and it 2.25x'd carrier_hit (8890 →
+    // Note on partner expansion: an alternative is to add BOTH haps of each
+    // carrier sample to the graph (even the non-carrier partner of a het
+    // sample). I tested that here and it 2.25x'd carrier_hit (8890 →
     // 20048) but SER regressed (2.5622% → 2.5731% on chr22). The extra non-
     // carrier states are noisy enough to outweigh the denser graph. Keeping
-    // Selphi-style "real carriers only" — the difference cancels because we
-    // already have a good stage-1 phasing input that Beagle does not.
+    // "real carriers only" — the difference cancels because we already have
+    // a good stage-1 phasing input feeding this pass.
     let mut out: Vec<Vec<u32>> = Vec::new();
     for m in global_start..global_end {
         if m < input.rare_carriers.len() {
@@ -675,10 +666,10 @@ fn collect_step_carriers(input: &Stage2Input, stage1_start: usize, stage1_end_ex
 /// haps or both sides have exhausted matches reaching `step` — the random
 /// fallback window for `get_match`.
 ///
-/// Closer to Beagle's logic: instead of `break`ing when an edge is hit, we
-/// kill that side's match value so the loop can keep expanding the other side.
-/// Otherwise an early v- or u-edge prematurely truncates the window and
-/// produces 1-hap windows that `get_match` reports as -1.
+/// Instead of `break`ing when an edge is hit, we kill that side's match value
+/// so the loop can keep expanding the other side. Otherwise an early v- or
+/// u-edge prematurely truncates the window and produces 1-hap windows that
+/// `get_match` reports as -1.
 ///
 /// `FWD` const-folds the divergence direction so the two monomorphizations
 /// match the previous get{fwd,bwd}IbsHaps bodies:
@@ -686,8 +677,6 @@ fn collect_step_carriers(input: &Stage2Input, stage1_start: usize, stage1_end_ex
 ///   open while its value ≤ step, accumulates with `max`, exhausts to i32::MAX;
 /// - backward: divergence is a "match end" (large = long match); open while
 ///   value ≥ step, accumulates with `min`, exhausts to i32::MIN.
-///
-/// Literal port of Beagle `LowFreqPbwtPhaseIbs.get{fwd,bwd}IbsHaps`.
 #[inline]
 fn expand_window<const FWD: bool>(
     i: usize, d: &[i32], step: i32, n_haps: usize, n_candidates: usize,
@@ -722,7 +711,6 @@ fn expand_window<const FWD: bool>(
 
 // ---------------------------------------------------------------------------
 // IBS2 lookup: are sample1 and sample2 in an IBS2 segment over [m_start, m_end]?
-// Port of phase.Ibs2.areIbs2(sample1, sample2, mStart, mInclEnd).
 // ---------------------------------------------------------------------------
 
 #[inline]
@@ -736,9 +724,9 @@ pub fn are_ibs2(
     ibs2_end: &[i32],
     ibs2_other: &[i32],
 ) -> bool {
-    // Same sample is trivially IBS2 with itself. Beagle relies on the Ibs2
-    // class being non-empty (stage-1 always computes it), but Selphi runs
-    // stage-2 with empty IBS2 data, so this self-skip must be explicit —
+    // Same sample is trivially IBS2 with itself. When the IBS2 table is
+    // non-empty (stage-1 always computes it) this is implicit, but stage-2
+    // here runs with empty IBS2 data, so this self-skip must be explicit —
     // otherwise the carrier-link picker can return the target's OWN partner
     // hap as its IBS neighbor (a circular state that wrecks the swap test).
     if sample1 == sample2 { return true; }
@@ -761,7 +749,6 @@ pub fn are_ibs2(
 // ---------------------------------------------------------------------------
 // Per-step iToPrevI / iToNextI builder: links the PBWT-array positions of
 // haplotypes that co-carry a rare allele at the current step.
-// Port of LowFreqPbwtPhaseIbs.setIToPrevNextI.
 // ---------------------------------------------------------------------------
 
 /// For each PBWT-array position `i`, populates `i_to_prev[i]` (largest `i' < i`
