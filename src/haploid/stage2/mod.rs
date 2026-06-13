@@ -1,9 +1,10 @@
 //! Selphi haploid stage-2 rare-variant phasing.
 //!
-//! Port of Beagle 5.x `phase.PhaseLS.runStage2` and the supporting classes
-//! (`LowFreqPbwtPhaseIbs`, `LowFreqPhaseStates`, `HmmStateProbs`, `Stage2Baum`,
-//! `Stage2Haps`). See `src/haploid/stage2_design.md` for the algorithm
-//! description, data flow, and Rust API design.
+//! Stage-2 driver: a Li-Stephens HMM over the rare-marker mosaic, with its
+//! supporting passes (low-frequency PBWT IBS selection, phase-state assembly,
+//! per-marker state probabilities, and the Baum forward/backward solve). See
+//! `src/haploid/stage2_design.md` for the algorithm description, data flow,
+//! and Rust API design.
 //!
 //! Triggered after stage-1 has phased the common-variant scaffold. For WGS-
 //! density input (> 25% markers below the high-frequency threshold), it runs
@@ -40,20 +41,18 @@ pub struct Stage2Input<'a> {
     /// Per-marker rare-allele code: 0 or 1 if that allele is the rare one
     /// at marker `m`, `-1` if the marker is common (no rare allele). Used
     /// by `Stage2Baum::is_low_freq` to determine whether a target's allele
-    /// at a rare marker IS the rare allele (Beagle's `fpd.isLowFreq(m, al)`).
+    /// at a rare marker IS the rare allele.
     pub rare_allele: &'a [i8],
 
     /// Per-(global)-marker index of the previous stage-1 marker (in the
     /// stage-1 list, not in global VCF coords). Used by Stage2Baum to
     /// interpolate state probabilities between flanking stage-1 markers.
-    /// Beagle: `FixedPhaseData.prevStage1Marker[m]`.
     pub prev_stage1_marker: &'a [usize],
 
     /// Per-(global)-marker interpolation weight on the previous stage-1
     /// marker. `prev_wt[m] = (posB - posM) / (posB - posA)` where posA is
     /// the cM of the previous stage-1 marker and posB the cM of the next.
-    /// At a stage-1 marker itself the weight is 1.0. Beagle:
-    /// `FixedPhaseData.prevStage1Wt[m]`.
+    /// At a stage-1 marker itself the weight is 1.0.
     pub prev_stage1_wt: &'a [f32],
 
     /// Stage-1 step boundaries in stage-1-marker coords: `(start, end_excl)`.
@@ -65,31 +64,31 @@ pub struct Stage2Input<'a> {
     /// Mismatch probability (Li-Stephens emission for a single allele mismatch).
     pub p_mismatch: f32,
 
-    /// Maximum composite reference haplotypes per target hap (Beagle default
-    /// `par.phase_states()/2`, typically 140).
+    /// Maximum composite reference haplotypes per target hap (the default is
+    /// `phase_states / 2`, typically 140).
     pub max_states: usize,
 
     /// Random-fallback window size when the PBWT carrier-link picker fails.
-    /// Beagle uses `STAGE2_CANDIDATES = 10` (much smaller than `max_states`)
-    /// to keep the fallback picks PBWT-adjacent — random haps far away in
-    /// PBWT order are not actually IBS with the target and pollute the
+    /// The candidate cap `STAGE2_CANDIDATES = 10` (much smaller than
+    /// `max_states`) keeps the fallback picks PBWT-adjacent — random haps far
+    /// away in PBWT order are not actually IBS with the target and pollute the
     /// composite state set with noise.
     pub n_candidates: usize,
 
     /// Maximum number of PBWT steps to back off when searching for an IBS
-    /// neighbor (Beagle: `phaseData.maxBackoffSteps()`).
+    /// neighbor.
     pub max_backoff_steps: usize,
 
     /// Minimum segment length (in PBWT steps) before a composite-haplotype
-    /// segment can be replaced. Beagle: `max(200, ceil(1.0 / ibsStep))` where
-    /// `ibsStep = par.step_scale() * medianDiff(stage1Map.genPos())`. Caller
+    /// segment can be replaced: `max(200, ceil(1.0 / ibsStep))` where
+    /// `ibsStep = step_scale * medianDiff(stage1 genetic positions)`. Caller
     /// (Selphi haploid pipeline) computes from its own genetic map config.
     pub min_steps: usize,
 
     /// IBS2 lookup arrays (flat layout from `haploid::ibs2::build_ibs2_lookup`).
     /// Used to skip identical-by-descent siblings when picking the IBS
-    /// neighbor. Empty slices = no IBS2 restrictions (matches Beagle behavior
-    /// when no IBS2 has been computed).
+    /// neighbor. Empty slices = no IBS2 restrictions (the behavior when no
+    /// IBS2 has been computed).
     pub ibs2_offsets: &'a [i32],
     pub ibs2_start: &'a [i32],
     pub ibs2_end: &'a [i32],
@@ -98,8 +97,8 @@ pub struct Stage2Input<'a> {
     /// Per-marker `Vec<u32>` of haplotypes carrying the rare-allele for
     /// each *low-frequency* allele at that marker. Length = `n_markers`.
     /// Marker indexed by *global* marker index. Empty vec = marker is
-    /// high-frequency, no carriers tracked. Beagle equivalent:
-    /// `fpd.carriers(m, al)` for each rare al at marker m.
+    /// high-frequency, no carriers tracked: the carrier list of each rare
+    /// allele `al` at marker `m`.
     /// This is identical to the existing `rare_carriers` field above —
     /// kept as alias for clarity in the PBWT IBS sweep, which consumes
     /// the carrier lists per stage-1 STEP.
@@ -108,7 +107,7 @@ pub struct Stage2Input<'a> {
     pub seed: u64,
 }
 
-/// Entry point: run Beagle-equivalent stage-2 rare-variant phasing.
+/// Entry point: run stage-2 rare-variant phasing.
 ///
 /// The caller must have already phased the target at common (high-frequency)
 /// markers (stage-1). The phased haplotypes plus the reference panel must
@@ -132,13 +131,12 @@ where
     }
 }
 
-/// Whether the Beagle gating condition is met to run stage-2: > 25% of markers
-/// must be low-frequency (mirrors Beagle's `MAX_HIFREQ_PROP=0.75` check in
-/// `FixedPhaseData.java:125-127`). When not met, stage-2 is a no-op and the
-/// caller should skip the call entirely.
+/// Whether the gating condition is met to run stage-2: > 25% of markers
+/// must be low-frequency (the `MAX_HIFREQ_PROP=0.75` gate). When not met,
+/// stage-2 is a no-op and the caller should skip the call entirely.
 pub fn should_run_stage2(n_high_freq_markers: usize, n_total_markers: usize) -> bool {
     const MAX_HIFREQ_PROP: f64 = 0.75;
-    // Mirror Beagle: skip stage-2 if too few hi-freq (length<2) OR too many
+    // Skip stage-2 if too few hi-freq (length<2) OR too many
     // (length > 0.75 * total).
     if n_high_freq_markers < 2 {
         return false;
@@ -152,7 +150,7 @@ mod tests {
 
     #[test]
     fn gating_skips_when_mostly_common() {
-        // 90% common, 10% rare → skip stage-2 (Beagle convention)
+        // 90% common, 10% rare → skip stage-2
         assert!(!should_run_stage2(9000, 10000));
     }
 
