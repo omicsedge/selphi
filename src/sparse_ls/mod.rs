@@ -1,8 +1,7 @@
 //! Reference-faithful lcWGS engine (reimplementation of the GLIMPSE2 phase model).
 //!
 //! ATTRIBUTION: this module reimplements the GLIMPSE2 model (Rubinacci & Delaneau;
-//! https://github.com/odelaneau/GLIMPSE, MIT License). See the repository `NOTICE`
-//! file for the required license attribution.
+//! https://github.com/odelaneau/GLIMPSE, MIT License).
 //!
 //! Goal: reproduce GLIMPSE2's lcWGS imputation OUTPUT (statistical parity, and
 //! bit-identity where the RNG/SIMD allow), as a SEPARATE engine from the existing
