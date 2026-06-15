@@ -31,7 +31,7 @@ pub mod imputation;
 pub mod lcwgs;
 
 // Reference-faithful lcWGS engine (validation/ablation, --ls-exact); reimplements
-// the GLIMPSE2 model — see the repo NOTICE for attribution.
+// the GLIMPSE2 model.
 pub mod sparse_ls;
 
 // I/O and output
