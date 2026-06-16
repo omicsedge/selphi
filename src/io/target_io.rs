@@ -1260,7 +1260,22 @@ pub fn intersect_variants(
             n_swap, n_strand);
     }
 
-    // Already sorted by wgs_idx (ref is in genomic order, merge preserves it)
+    // wgs_idx is monotone EXCEPT at multiallelic-split duplicate positions, where the
+    // target's ALT order can differ from the panel's split-record order, producing a
+    // locally descending pair. Downstream (pipeline.rs own_wgs_start / vp_start) and
+    // build_intervals require wgs_idx non-decreasing (a descending pair on a window
+    // boundary underflows -> is_chip[usize::MAX] panic; interior pairs silently
+    // mis-order/drop an interval). Stable co-sort the three lockstep vectors by
+    // wgs_idx: positions are already sorted, so this is the identity permutation
+    // unless a same-position inversion exists -> unchanged for already-monotone inputs.
+    let mut order: Vec<usize> = (0..wgs_idx.len()).collect();
+    order.sort_by_key(|&i| wgs_idx[i]); // stable
+    if order.iter().enumerate().any(|(k, &i)| k != i) {
+        let wgs_idx = order.iter().map(|&i| wgs_idx[i]).collect::<Vec<_>>();
+        let target_idx = order.iter().map(|&i| target_idx[i]).collect::<Vec<_>>();
+        let transforms = order.iter().map(|&i| transforms[i]).collect::<Vec<_>>();
+        return (wgs_idx, target_idx, transforms);
+    }
     (wgs_idx, target_idx, transforms)
 }
 
@@ -1432,6 +1447,18 @@ pub fn intersect_variants_for_chr(
             ref_chrom, n_swap, n_strand);
     }
 
+    // Same monotonicity guarantee as intersect_variants: multiallelic-split duplicate
+    // positions can produce a locally descending wgs_idx pair (target ALT order != panel
+    // split order). Downstream requires non-decreasing wgs_idx. Stable co-sort; identity
+    // permutation (unchanged) whenever already monotone.
+    let mut order: Vec<usize> = (0..wgs_idx.len()).collect();
+    order.sort_by_key(|&i| wgs_idx[i]); // stable
+    if order.iter().enumerate().any(|(k, &i)| k != i) {
+        let wgs_idx = order.iter().map(|&i| wgs_idx[i]).collect::<Vec<_>>();
+        let target_idx = order.iter().map(|&i| target_idx[i]).collect::<Vec<_>>();
+        let transforms = order.iter().map(|&i| transforms[i]).collect::<Vec<_>>();
+        return (wgs_idx, target_idx, transforms);
+    }
     (wgs_idx, target_idx, transforms)
 }
 
