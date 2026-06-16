@@ -390,13 +390,18 @@ fn phase_genotypes_inner(
         // 0.35 cM, a ~3× narrower warm-up that can truncate PBWT context for
         // boundary haplotypes between parallel batches.
         const PBWT_BUFFER_CM: f64 = 1.0;
+        // DETERMINISM: pin the PBWT batch partition to a FIXED divisor (not n_threads / the
+        // live rayon pool) so the per-window batch geometry — and thus every boundary IBS
+        // pick — is identical regardless of thread count or CPU contention (Beagle-like:
+        // reproducible at fixed settings). See determinism fix notes.
+        const PBWT_BATCH_DIVISOR: usize = 16;
         // Coarse batch params
-        let steps_per_batch = w_n_steps.div_ceil(n_threads);
+        let steps_per_batch = w_n_steps.div_ceil(PBWT_BATCH_DIVISOR);
         let n_batches = w_n_steps.div_ceil(steps_per_batch);
         let n_overlap_steps = (PBWT_BUFFER_CM / (3.0 * median_dist)).round() as usize;
         // Fine batch params
         let w_n_steps_f = window_n_steps_fine[wi];
-        let steps_per_batch_f = w_n_steps_f.div_ceil(n_threads);
+        let steps_per_batch_f = w_n_steps_f.div_ceil(PBWT_BATCH_DIVISOR);
         let n_batches_f = w_n_steps_f.div_ceil(steps_per_batch_f);
         let n_overlap_steps_f = (PBWT_BUFFER_CM / (1.0 * median_dist)).round() as usize;
 
