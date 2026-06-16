@@ -582,7 +582,11 @@ fn hi_freq_windows(gen_pos: &[f64], n_threads: usize) -> Vec<(usize, usize)> {
     if n_markers == 0 { return vec![]; }
     let total_cm = gen_pos[n_markers - 1] - gen_pos[0];
     let overlap_cm = 0.5;
-    let advance_cm = f64::max(4.0 * overlap_cm, total_cm / n_threads as f64);
+    // DETERMINISM: pinned to a FIXED divisor (not n_threads) so initial-phasing window
+    // boundaries are identical regardless of thread count / contention.
+    const HI_FREQ_DIVISOR: f64 = 16.0;
+    let _ = n_threads;
+    let advance_cm = f64::max(4.0 * overlap_cm, total_cm / HI_FREQ_DIVISOR);
     let mut windows: Vec<(usize, usize)> = Vec::new();
     let mut from = 0usize;
     let mut to = to_marker(gen_pos, gen_pos[from] + advance_cm);
