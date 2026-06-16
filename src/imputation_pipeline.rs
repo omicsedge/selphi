@@ -388,6 +388,9 @@ struct PhasingInputs<'a> {
     ref_positions: &'a [i64],
     wgs_idx: &'a [usize],
     n_chip: usize, n_samples: usize, n_ref: usize,
+    /// Phasing RNG seed for this run. Normally `args.seed`; the phase-ensemble
+    /// path overrides it per ensemble member (`args.seed + i`).
+    seed: i64,
 }
 
 /// Phasing pipeline result. `ref_bm_full` is `None` only for phase-only
@@ -407,7 +410,7 @@ struct PhasingResult {
 fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
     let PhasingInputs {
         args, srp, map_path, targ_alleles, raw_chip_cm, chip_bps,
-        ref_positions, wgs_idx, n_chip, n_samples, n_ref,
+        ref_positions, wgs_idx, n_chip, n_samples, n_ref, seed,
     } = *inp;
 
     selphi_step!("Input is unphased — running phasing pipeline...");
@@ -463,7 +466,7 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
                 raw_chip_cm, chip_bps,
                 &ref_bp, &map_bp_raw, &map_cm_raw,
                 n_chip, n_samples, n_ref,
-                args.seed, args.threads, args.max_cond_haps,
+                seed, args.threads, args.max_cond_haps,
             )
         }
         ResolvedEngine::Haploid => {
@@ -474,7 +477,7 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
                 raw_chip_cm, chip_bps,
                 &ref_bp, &map_bp_raw, &map_cm_raw,
                 n_chip, n_samples, n_ref,
-                args.seed, args.threads, args.max_windows,
+                seed, args.threads, args.max_windows,
             )
         }
     };
@@ -747,6 +750,82 @@ fn compute_maf_adaptive_ne(
     Some(ne_maf)
 }
 
+/// One phase-ensemble member's imputation inputs, all derived from a single
+/// phased scaffold (one phasing run with a distinct RNG seed). Member 0 uses
+/// the run's primary locals; extra members are carried in a `Vec<ImpScaffold>`.
+struct ImpScaffold {
+    /// Phased target as a haplotype bitmatrix (the imputation HMM scaffold).
+    targ_bm: selphi::common::HaplotypeBitmatrix,
+    /// Per-target precomputed PBWT candidates (None → built per window).
+    candidates: Option<Vec<Vec<u32>>>,
+    /// Per-site EM Ne for this member's phasing (None → use calibrated default).
+    final_ne_per_site: Option<Vec<f64>>,
+    /// Cross-window HMM forward-state passthrough, private to this member.
+    hap_priors: Vec<Option<Vec<f64>>>,
+}
+
+/// Average one CSR weight matrix across ensemble members. Every member shares
+/// the same shape (`n_rows` = chip intervals in the window, `n_cols` = panel
+/// haplotypes) but selects different panel columns per row. The averaged row is
+/// the union of columns with summed weights divided by the member count.
+///
+/// Interpolation is linear in these weights (dosage = Σ w·panel_allele), so the
+/// averaged weights yield exactly the mean imputed dosage over the members —
+/// i.e. marginalizing phase uncertainty in dosage space.
+fn average_csr(members: &[&selphi::imputation::hmm::CsrWeights]) -> selphi::imputation::hmm::CsrWeights {
+    use std::collections::HashMap;
+    let n = members.len();
+    let n_rows = members[0].n_rows;
+    let n_cols = members[0].n_cols;
+    let inv = 1.0f32 / n as f32;
+    let mut indptr = Vec::with_capacity(n_rows + 1);
+    let mut indices: Vec<i32> = Vec::new();
+    let mut data: Vec<f32> = Vec::new();
+    indptr.push(0i32);
+    let mut acc: HashMap<i32, f32> = HashMap::new();
+    for r in 0..n_rows {
+        acc.clear();
+        for m in members {
+            let s = m.indptr[r] as usize;
+            let e = m.indptr[r + 1] as usize;
+            for k in s..e {
+                *acc.entry(m.indices[k]).or_insert(0.0) += m.data[k];
+            }
+        }
+        let mut row: Vec<(i32, f32)> = acc.iter().map(|(&c, &v)| (c, v * inv)).collect();
+        row.sort_unstable_by_key(|&(c, _)| c);
+        for (c, v) in row {
+            indices.push(c);
+            data.push(v);
+        }
+        indptr.push(indices.len() as i32);
+    }
+    selphi::imputation::hmm::CsrWeights { indptr, indices, data, n_rows, n_cols }
+}
+
+/// Average the full per-hap `all_weights` of a window across ensemble members.
+/// Each member's `all_weights[h]` is `[(idx, csr)]` (one interval per hap); the
+/// `idx` is identical across members (the target index), so we keep member 0's
+/// `idx` and average the CSRs.
+fn average_all_weights(
+    members: &[&Vec<Vec<(usize, selphi::imputation::hmm::CsrWeights)>>],
+) -> Vec<Vec<(usize, selphi::imputation::hmm::CsrWeights)>> {
+    let n_haps = members[0].len();
+    (0..n_haps)
+        .map(|h| {
+            let n_entries = members[0][h].len();
+            (0..n_entries)
+                .map(|e| {
+                    let idx = members[0][h][e].0;
+                    let csrs: Vec<&selphi::imputation::hmm::CsrWeights> =
+                        members.iter().map(|m| &m[h][e].1).collect();
+                    (idx, average_csr(&csrs))
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// Run single-chromosome imputation (or phase-only) end-to-end.
 ///
 /// The body is an inline port of the original `main()` single-chr branch;
@@ -928,12 +1007,33 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         ref_positions.iter().copied().max().unwrap_or(0),
     );
 
-    let (targ_alleles, em_ne_per_site, ref_bm_from_phasing) = if needs_phasing {
+    // Phase-ensemble: when N>1, phase the target N times with seeds
+    // {seed, seed+1, ..., seed+N-1}. Member 0 flows through the primary locals
+    // below; members 1.. are carried in `extra_phased` and turned into extra
+    // `ImpScaffold`s, whose per-window Li-Stephens weights are averaged with
+    // member 0's before interpolation (marginalizing phase uncertainty). N=1
+    // (default) is byte-identical to the non-ensemble path.
+    let ensemble_n = if needs_phasing && !args.phase_only {
+        args.phase_ensemble.max(1)
+    } else {
+        if args.phase_ensemble > 1 && args.phase_only {
+            selphi_info!("  Note: --phase-ensemble is ignored with --phase-only (a single phased VCF is emitted).");
+        }
+        1
+    };
+    // Keep the unphased target for the extra ensemble members (phasing consumes
+    // a phased copy into `targ_alleles`).
+    let unphased_for_ensemble = if ensemble_n > 1 { Some(targ_alleles.clone()) } else { None };
+    if ensemble_n > 1 {
+        selphi_step!("Phase-ensemble: {} members (seeds {}..{})", ensemble_n, args.seed, args.seed + ensemble_n as i64 - 1);
+    }
+
+    let (targ_alleles, em_ne_per_site, ref_bm_from_phasing, extra_phased) = if needs_phasing {
         let pr = run_phasing_engines(&PhasingInputs {
             args, srp: &srp, map_path,
             targ_alleles: &targ_alleles, raw_chip_cm: &raw_chip_cm, chip_bps: &chip_bps,
             ref_positions: &ref_positions, wgs_idx: &wgs_idx,
-            n_chip, n_samples, n_ref,
+            n_chip, n_samples, n_ref, seed: args.seed,
         });
         let em_ne = em_ne_from_window_ri(&pr.window_ri, args.est_ne, n_chip, n_ref);
 
@@ -954,13 +1054,31 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         // Diploid phasing already feeds its own Ne back through the HMM; for
         // haploid we forward the per-site EM Ne unless --no-em-ne disables it.
         let em_ne_to_use = if args.no_em_ne || pr.engine == ResolvedEngine::Diploid { None } else { Some(em_ne) };
-        (pr.phased_alleles, em_ne_to_use, pr.ref_bm_full)
+
+        // Extra ensemble members (seeds seed+1 .. seed+N-1).
+        let mut extra_phased: Vec<(Vec<u8>, Option<Vec<f64>>)> = Vec::new();
+        if let Some(ref unph) = unphased_for_ensemble {
+            for i in 1..ensemble_n {
+                let m_seed = args.seed + i as i64;
+                selphi_step!("Phase-ensemble member {}/{} (seed {})", i + 1, ensemble_n, m_seed);
+                let pri = run_phasing_engines(&PhasingInputs {
+                    args, srp: &srp, map_path,
+                    targ_alleles: unph, raw_chip_cm: &raw_chip_cm, chip_bps: &chip_bps,
+                    ref_positions: &ref_positions, wgs_idx: &wgs_idx,
+                    n_chip, n_samples, n_ref, seed: m_seed,
+                });
+                let emi = em_ne_from_window_ri(&pri.window_ri, args.est_ne, n_chip, n_ref);
+                let emi_use = if args.no_em_ne || pri.engine == ResolvedEngine::Diploid { None } else { Some(emi) };
+                extra_phased.push((pri.phased_alleles, emi_use));
+            }
+        }
+        (pr.phased_alleles, em_ne_to_use, pr.ref_bm_full, extra_phased)
     } else {
         if args.phase_only {
             selphi_info!("WARNING: --phase_only requested but input is already phased. Nothing to do.");
             return;
         }
-        (targ_alleles, None, None)
+        (targ_alleles, None, None, Vec::new())
     };
 
     // 6c. LD correction using shared bitmatrix (no re-extraction from SRP).
@@ -1073,6 +1191,24 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     let targ_bm = selphi::common::HaplotypeBitmatrix::from_byte_slice_all(
         n_chip, n_haps, &targ_alleles, n_haps);
     drop(targ_alleles);
+
+    // Phase-ensemble: build the extra members' imputation scaffolds (candidates,
+    // EM-Ne, per-member cross-window prior state). Empty unless --phase-ensemble>1.
+    let mut extra_scaffolds: Vec<ImpScaffold> = extra_phased.into_iter().map(|(pa, emi)| {
+        let maf_ne = compute_maf_adaptive_ne(args, &emi, &ref_bm_imp, est_ne, n_chip, n_ref);
+        let final_ne = emi.or(maf_ne);
+        let cand = maybe_precompute_candidates(
+            args, output_path, &ref_bm_imp, &pa, &chip_cm,
+            panel_anc.as_deref(), target_anc.as_deref(), ancestry_active,
+            needs_phasing, effective_mc, n_chip, n_ref, n_haps,
+        );
+        let tb = selphi::common::HaplotypeBitmatrix::from_byte_slice_all(n_chip, n_haps, &pa, n_haps);
+        ImpScaffold { targ_bm: tb, candidates: cand, final_ne_per_site: final_ne, hap_priors: vec![None; n_haps] }
+    }).collect();
+    if !extra_scaffolds.is_empty() && batched_any_active {
+        selphi_error!("--phase-ensemble N>1 is not supported with --sample-batch-size (batched streaming output); run without sample batching.");
+        std::process::exit(1);
+    }
 
     // 11. Process each window: PBWT → HMM, then overlap VCF write with next window's PBWT.
     // Cross-window HMM state passthrough: forward state from window N → prior for window N+1
@@ -1281,7 +1417,39 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                 None,
             )
         };
-        let all_weights = hmm_output.all_weights;
+        let mut all_weights = hmm_output.all_weights;
+
+        // Phase-ensemble: re-run this window's HMM on each extra member's phased
+        // scaffold and average the per-hap Li-Stephens weights with member 0's.
+        // Interpolation below is linear in the weights, so the averaged weights
+        // produce the exact mean imputed dosage over all members — the panel is
+        // read and interpolated only ONCE. (Excluded under batched streaming.)
+        if !extra_scaffolds.is_empty() {
+            let mut per_member: Vec<Vec<Vec<(usize, selphi::imputation::hmm::CsrWeights)>>> =
+                Vec::with_capacity(extra_scaffolds.len());
+            for sc in extra_scaffolds.iter_mut() {
+                let inputs_m = selphi::imputation::window_process::ImputeWindowInputs {
+                    ref_bm: &ref_bm_imp,
+                    targ_alleles: &sc.targ_bm,
+                    chip_cm: &chip_cm,
+                    ne_per_site: sc.final_ne_per_site.as_deref(),
+                    site_conf_per_sample: target_site_conf_per_sample.as_deref(),
+                    n_samples,
+                    chip_start: window.chip_start,
+                    chip_end: window.chip_end,
+                };
+                let cand = sc.candidates.as_ref();
+                let out_m = selphi::imputation::window_process::impute_window(
+                    &inputs_m, &hmm_params, cand, &mut sc.hap_priors, None,
+                );
+                per_member.push(out_m.all_weights);
+            }
+            let mut refs: Vec<&Vec<Vec<(usize, selphi::imputation::hmm::CsrWeights)>>> =
+                Vec::with_capacity(per_member.len() + 1);
+            refs.push(&all_weights);
+            for m in &per_member { refs.push(m); }
+            all_weights = average_all_weights(&refs);
+        }
 
         let hmm_secs = t0_hmm.elapsed().as_secs_f64();
         let cpu_hmm = selphi::log::cpu_time_secs();
