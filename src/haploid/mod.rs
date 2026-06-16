@@ -405,14 +405,18 @@ fn phase_genotypes_inner(
         let n_batches_f = w_n_steps_f.div_ceil(steps_per_batch_f);
         let n_overlap_steps_f = (PBWT_BUFFER_CM / (1.0 * median_dist)).round() as usize;
 
-        // Adaptive step scale: fine steps for first 5 iterations (phase is uncertain,
+        // Adaptive step scale: fine steps for first N iterations (phase is uncertain,
         // need error tolerance), coarse for remaining (phase is good, need discrimination).
-        const FINE_STEP_ITERS: usize = 5;
+        // Env-gated (A/B vs Beagle PhaseBaum2, which uses one fixed coarse step for all iters):
+        // default 5 = current behavior (byte-identical); 0 = Beagle-faithful single-resolution.
+        let fine_step_iters = crate::config::usize_or("SELPHI_HAPLOID_FINE_STEP_ITERS", 5);
 
         // --- Iteration loop for this window ---
         let n_total = n_burnin + n_phasing;
         let mut converged = vec![false; n_samples];
-        let convergence_start_iter = 8usize; // start checking after 8 iterations
+        // Per-sample convergence freeze; SELPHI_HAPLOID_NO_FREEZE=1 disables it (Beagle re-phases
+        // every sample every iter). Default = freeze from iter 8 (byte-identical).
+        let convergence_start_iter = if crate::config::is_one("SELPHI_HAPLOID_NO_FREEZE") { usize::MAX } else { 8usize };
         let convergence_threshold = 0.01f64; // swap rate < 1%
         // Adaptive burnin: if the burnin swap rate drops below 1% the remaining
         // burnin iterations are skipped and we advance straight to the first
@@ -430,7 +434,7 @@ fn phase_genotypes_inner(
             let nc = n_candidates(it, n_burnin, n_phasing);
 
             // Select step resolution for this iteration
-            let use_fine = it < FINE_STEP_ITERS;
+            let use_fine = it < fine_step_iters;
             let (it_starts, it_ends, it_n_steps, it_step_size, it_min_steps,
                  it_spb, it_nb, it_overlap) = if use_fine {
                 (&window_coded_starts_fine[wi], &window_coded_ends_fine[wi],
