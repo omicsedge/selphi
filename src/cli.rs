@@ -263,6 +263,17 @@ pub struct Args {
     #[arg(long, default_value = "33")]
     pub seed: i64,
 
+    /// Phasing ensemble size (default 1). When N>1, phasing is run N times with
+    /// seeds {seed, seed+1, ..., seed+N-1} and the per-haplotype Li-Stephens
+    /// copying weights are AVERAGED before interpolation, marginalizing
+    /// phase uncertainty. The reference panel is read once and the output is
+    /// encoded once (interpolation is linear in the weights, so the averaged
+    /// weights yield the exact mean imputed dosage). Recovers most of the
+    /// internal-phasing accuracy gap on sparse chip panels. N=1 is byte-identical
+    /// to the non-ensemble path. Cost ≈ N× phasing + N× HMM, 1× panel I/O + interp.
+    #[arg(long, default_value = "1")]
+    pub phase_ensemble: usize,
+
     /// Imputation window size in cM (0 = no windowing)
     #[arg(long, default_value = "80.0")]
     pub window_cm: f64,
