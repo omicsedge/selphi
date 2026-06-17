@@ -412,6 +412,29 @@ pub struct Args {
     #[arg(long)]
     pub truth: Option<String>,
 
+    /// (--evaluate) Absent-from-truth handling: `auto` (default) decides per truth file —
+    /// a variant-only truth (no explicit 0/0) scores absent sites as hom-ref (the standard
+    /// imputation-R² convention), a complete callset scores matched sites only (legacy).
+    /// `on` forces hom-ref scoring; `off` forces the legacy matched-sites-only path.
+    #[arg(long, default_value = "auto")]
+    pub homref_absent: String,
+
+    /// (--evaluate) Raw / unfiltered truth VCF/BCF. A site a sample carries in the raw
+    /// truth but NOT in the (quality-filtered) `--truth` is excluded for that sample
+    /// rather than scored as hom-ref. Optional; only used when hom-ref scoring is active.
+    #[arg(long)]
+    pub truth_raw: Option<String>,
+
+    /// (--evaluate) Sites to exclude from scoring entirely (e.g. the chip/typed sites,
+    /// any VCF/BCF). Matched on (contig,pos,ref,alt). Optional.
+    #[arg(long)]
+    pub exclude_sites: Option<String>,
+
+    /// (--evaluate) Also break the report down into SNP vs indel (the combined total is
+    /// always reported regardless). Off by default = combined only, as before.
+    #[arg(long)]
+    pub by_type: bool,
+
     /// Chunk size for SRP creation (0 = auto-calibrate)
     #[arg(long, default_value = "0")]
     pub chunk_size: usize,
