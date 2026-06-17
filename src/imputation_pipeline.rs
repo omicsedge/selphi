@@ -704,13 +704,34 @@ fn evaluate_against_truth(args: &Args, output_path: &str, final_path: &Path) {
         selphi_info!("  No shared samples — skipping evaluation");
         return;
     }
-    let (site_acc, sample_acc, counts) = selphi::eval::accuracy::evaluate(
-        final_path, truth_path, &shared,
-    ).expect("Evaluation failed");
-    selphi::eval::accuracy::print_summary(&site_acc, &sample_acc, &counts);
+    // Same absent-from-truth resolution as standalone --evaluate: `auto` scores a
+    // variant-only truth as absent→hom-ref (standard imputation R²) and a complete
+    // callset as matched-sites-only (legacy).
+    let homref = match args.homref_absent.as_str() {
+        "on" | "true" | "1" => true,
+        "off" | "false" | "0" => false,
+        _ => !selphi::eval::accuracy::truth_has_ref_calls(truth_path).unwrap_or(true),
+    };
     let json_path = PathBuf::from(output_path).with_extension("eval.json");
-    selphi::eval::accuracy::write_json_summary(&json_path, &site_acc, &sample_acc, &counts, Some(&shared))
-        .expect("Failed to write JSON summary");
+    if homref {
+        selphi_info!("  homref:   absent→hom-ref (truth is variant-only)");
+        let raw_path = args.truth_raw.as_deref().map(Path::new);
+        let excl_path = args.exclude_sites.as_deref().map(Path::new);
+        let (comb, snp, indel, counts) = selphi::eval::accuracy::evaluate_imputation(
+            final_path, truth_path, &shared, raw_path, excl_path,
+        ).expect("Evaluation failed");
+        let n_excluded = counts.n_imp_variants.saturating_sub(counts.n_matched);
+        selphi::eval::accuracy::print_imputation_summary(&comb, &snp, &indel, args.by_type, &counts, n_excluded);
+        selphi::eval::accuracy::write_imputation_json(&json_path, &comb, &snp, &indel, args.by_type, &counts, Some(&shared))
+            .expect("Failed to write JSON summary");
+    } else {
+        let (site_acc, sample_acc, counts) = selphi::eval::accuracy::evaluate(
+            final_path, truth_path, &shared,
+        ).expect("Evaluation failed");
+        selphi::eval::accuracy::print_summary(&site_acc, &sample_acc, &counts);
+        selphi::eval::accuracy::write_json_summary(&json_path, &site_acc, &sample_acc, &counts, Some(&shared))
+            .expect("Failed to write JSON summary");
+    }
     selphi_step!("Accuracy: {}", json_path.display());
 }
 

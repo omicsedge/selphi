@@ -370,16 +370,46 @@ fn main() {
             std::process::exit(1);
         }
 
-        selphi_step!("Stream-merging VCFs...");
-        let (site_acc, sample_acc, counts) = selphi::eval::accuracy::evaluate(
-            imp_path, truth_path, &shared,
-        ).expect("Evaluation failed");
-
-        selphi::eval::accuracy::print_summary(&site_acc, &sample_acc, &counts);
+        // Resolve absent-from-truth handling. `auto` inspects the truth: a complete
+        // callset (explicit 0/0) scores matched sites only (legacy); a variant-only
+        // truth scores absent sites as hom-ref (the standard imputation-R² convention).
+        let homref = match args.homref_absent.as_str() {
+            "on" | "true" | "1" => true,
+            "off" | "false" | "0" => false,
+            _ /* auto */ => {
+                let complete = selphi::eval::accuracy::truth_has_ref_calls(truth_path).unwrap_or(true);
+                if complete {
+                    selphi_info!("  homref:   auto → OFF (truth is a complete callset; scoring matched sites only)");
+                } else {
+                    selphi_info!("  homref:   auto → ON (truth is variant-only; absent sites scored as hom-ref)");
+                }
+                !complete
+            }
+        };
 
         let json_path = PathBuf::from(output).with_extension("json");
-        selphi::eval::accuracy::write_json_summary(&json_path, &site_acc, &sample_acc, &counts, Some(&shared))
-            .expect("Failed to write JSON summary");
+        if homref {
+            let raw_path = args.truth_raw.as_deref().map(Path::new);
+            let excl_path = args.exclude_sites.as_deref().map(Path::new);
+            if let Some(p) = raw_path { selphi_info!("  raw:      {}", p.display()); }
+            if let Some(p) = excl_path { selphi_info!("  exclude:  {}", p.display()); }
+            selphi_step!("Scoring imputation R² (absent→hom-ref)...");
+            let (comb, snp, indel, counts) = selphi::eval::accuracy::evaluate_imputation(
+                imp_path, truth_path, &shared, raw_path, excl_path,
+            ).expect("Evaluation failed");
+            let n_excluded = counts.n_imp_variants.saturating_sub(counts.n_matched);
+            selphi::eval::accuracy::print_imputation_summary(&comb, &snp, &indel, args.by_type, &counts, n_excluded);
+            selphi::eval::accuracy::write_imputation_json(&json_path, &comb, &snp, &indel, args.by_type, &counts, Some(&shared))
+                .expect("Failed to write JSON summary");
+        } else {
+            selphi_step!("Stream-merging VCFs...");
+            let (site_acc, sample_acc, counts) = selphi::eval::accuracy::evaluate(
+                imp_path, truth_path, &shared,
+            ).expect("Evaluation failed");
+            selphi::eval::accuracy::print_summary(&site_acc, &sample_acc, &counts);
+            selphi::eval::accuracy::write_json_summary(&json_path, &site_acc, &sample_acc, &counts, Some(&shared))
+                .expect("Failed to write JSON summary");
+        }
         selphi_step!("Results: {}", json_path.display());
 
         let elapsed = start.elapsed().as_secs_f64();
