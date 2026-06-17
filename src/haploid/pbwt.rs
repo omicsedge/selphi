@@ -222,42 +222,57 @@ fn select_ibs_candidate(
 ) -> i32 {
     let n = v - u;
     if n <= 1 { return -1; }
-    let rand_val = rng.next_int(n as i32);
-    let start_off = rand_val as usize;
     let t_sample = t / 2;
-    for j in 0..n {
-        let idx = u + (start_off + j) % n;
-        if idx == i { continue; }
+    // Validity of candidate at prefix position `idx`: returns Some(cand) if it is
+    // a usable IBS neighbour (not self-position, not same-sample, not IBS2-overlapping),
+    // else None. Shared by the random (Beagle-faithful) and deterministic branches.
+    let check = |idx: usize| -> Option<i32> {
+        if idx == i { return None; }
         let cand = a[idx] as usize;
-        // areIbs2: returns true for same-sample (always excluded) AND for
-        // IBS2 segment overlap. Check both.
         let cand_is_targ = if targ_first { cand < n_targ } else { cand >= n_ref };
         if cand_is_targ {
             let cand_t = if targ_first { cand } else { cand - n_ref };
             let cand_sample = cand_t / 2;
-            // Same-sample exclusion (areIbs2 returns true for s1==s2)
-            if cand_sample == t_sample { continue; }
-            // IBS2 segment restriction
+            if cand_sample == t_sample { return None; }
             if check_ibs2 {
                 let ms_g = ms + marker_offset;
                 let me_g = me + marker_offset;
                 let off_s = ibs2_offsets[t_sample] as usize;
                 let off_e = ibs2_offsets[t_sample + 1] as usize;
-                let mut forbidden = false;
                 for k in off_s..off_e {
                     if ibs2_other[k] as usize == cand_sample {
                         let rs = ibs2_start[k] as usize;
                         let re = ibs2_end[k] as usize;
-                        if ms_g.max(rs) < me_g.min(re) {
-                            forbidden = true;
-                            break;
-                        }
+                        if ms_g.max(rs) < me_g.min(re) { return None; }
                     }
                 }
-                if forbidden { continue; }
             }
         }
-        return cand as i32;
+        Some(cand as i32)
+    };
+
+    // Deterministic nearest-neighbour pick (SELPHI_HAPLOID_DET_PICK): instead of a
+    // uniform-random member of the IBS equivalence class [u,v), take the candidate
+    // CLOSEST to the target's prefix position `i` (i-1, i+1, i-2, i+2, …). Adjacent
+    // positions in the PBWT prefix array share the longest match BEYOND the step
+    // interval, so the nearest valid neighbour is the most-similar conditioning hap.
+    // Zero RNG → zero realization variance (single-run, no ensemble cost).
+    if crate::config::is_one("SELPHI_HAPLOID_DET_PICK") {
+        let (mut lo, mut hi) = (i, i);
+        loop {
+            let mut advanced = false;
+            if lo > u { lo -= 1; advanced = true; if let Some(c) = check(lo) { return c; } }
+            if hi + 1 < v { hi += 1; advanced = true; if let Some(c) = check(hi) { return c; } }
+            if !advanced { break; }
+        }
+        return -1;
+    }
+
+    let rand_val = rng.next_int(n as i32);
+    let start_off = rand_val as usize;
+    for j in 0..n {
+        let idx = u + (start_off + j) % n;
+        if let Some(c) = check(idx) { return c; }
     }
     -1
 }
@@ -324,6 +339,10 @@ pub fn pbwt_coded_ibs_fwd_batch(
             coded_vals, n_alleles, step as i32, m_total,
             &mut a, &mut d, &mut grp_a, &mut grp_d,
             &mut grp_counts, &mut grp_offsets, &mut p_arr);
+
+        if crate::haploid::debug::ad_dump_enabled() {
+            crate::haploid::debug::dump_pbwt_ad_step(step as i32, &a, &d, m_total);
+        }
 
         // Only extract IBS for steps in [batch_start, batch_end)
         if step < batch_start {
@@ -427,6 +446,10 @@ pub fn pbwt_coded_ibs_bwd_batch(
             &mut a, &mut d, &mut grp_a, &mut grp_d,
             &mut grp_counts, &mut grp_offsets, &mut p_arr);
 
+        if crate::haploid::debug::ad_dump_enabled() {
+            crate::haploid::debug::dump_pbwt_ad_step(step_i as i32, &a, &d, m_total);
+        }
+
         // Only extract IBS for steps in [batch_start, batch_end)
         if step_i >= batch_end || step_i < batch_start { continue; }
 
@@ -447,6 +470,10 @@ pub fn pbwt_coded_ibs_bwd_batch(
                 check_ibs2, ms, me, marker_offset,
                 ibs2_offsets, ibs2_start, ibs2_end, ibs2_other,
             );
+            if crate::haploid::debug::ad_dump_enabled() && (t == 0 || t == 1) {
+                crate::haploid::debug::dump_ibs_window(step_i as i32, t, i, u, v,
+                    ibs_out[(step_i - batch_start) * n_targ + t]);
+            }
         }
     }
     ibs_out
@@ -583,10 +610,15 @@ fn hi_freq_windows(gen_pos: &[f64], n_threads: usize) -> Vec<(usize, usize)> {
     let total_cm = gen_pos[n_markers - 1] - gen_pos[0];
     let overlap_cm = 0.5;
     // DETERMINISM: pinned to a FIXED divisor (not n_threads) so initial-phasing window
-    // boundaries are identical regardless of thread count / contention.
-    const HI_FREQ_DIVISOR: f64 = 16.0;
+    // boundaries are identical regardless of thread count / contention. Beagle's initPhase
+    // runs GLOBALLY over the whole chromosome (advanceCM = chrCM/nThreads); Selphi runs this
+    // PER haploid window, so the same divisor over a 40cM window gives ~2.5cM sub-windows =
+    // far more seams than Beagle. SELPHI_HAPLOID_HFW_DIVISOR overrides 16.0 (smaller = larger
+    // sub-windows = fewer initial-phase seams) — A/B for the isolated initial-phase deficit.
+    let hi_freq_divisor: f64 = crate::config::raw("SELPHI_HAPLOID_HFW_DIVISOR")
+        .and_then(|v| v.parse::<f64>().ok()).unwrap_or(16.0);
     let _ = n_threads;
-    let advance_cm = f64::max(4.0 * overlap_cm, total_cm / HI_FREQ_DIVISOR);
+    let advance_cm = f64::max(4.0 * overlap_cm, total_cm / hi_freq_divisor);
     let mut windows: Vec<(usize, usize)> = Vec::new();
     let mut from = 0usize;
     let mut to = to_marker(gen_pos, gen_pos[from] + advance_cm);
@@ -633,6 +665,13 @@ fn phase_subwindow(
     let n_haps = n_ref + n_targ_haps;
     let win_size = win_end - win_start;
 
+    // Missing target genotypes are encoded `>=128` in target_geno (the haploid+phasing path:
+    // imputation_pipeline emits 128 only there). Decode to -1 so the PBWT initial phaser
+    // IMPUTES missing (Beagle-faithful) instead of conditioning on a phantom positive allele
+    // (the original `as i32` made missing 128 → never <0 → dead missing-impute branch + half-
+    // missing mis-classified as het). On all other paths missing is already 0 → no-op.
+    let decode = |b: u8| -> i32 { if b >= 128 { -1 } else { b as i32 } };
+
     // Forward pass (FwdPbwtPhaser)
     let mut fwd_alleles_store = vec![0i32; win_size * n_targ_haps]; // [local_m * n_targ_haps + h]
     let mut fwd_a: Vec<i32> = (0..n_haps as i32).collect();
@@ -660,8 +699,8 @@ fn phase_subwindow(
             for s in 0..n_samples {
                 let h1 = s * 2;
                 let h2 = h1 + 1;
-                let a1 = target_geno[m * n_samples * 2 + s * 2] as i32;
-                let a2 = target_geno[m * n_samples * 2 + s * 2 + 1] as i32;
+                let a1 = decode(target_geno[m * n_samples * 2 + s * 2]);
+                let a2 = decode(target_geno[m * n_samples * 2 + s * 2 + 1]);
                 bwd_alleles[h1] = a1;
                 bwd_alleles[h2] = a2;
                 bwd_unph_het[s] = m >= overlap && a1 >= 0 && a2 >= 0 && a1 != a2;
@@ -726,8 +765,8 @@ fn phase_subwindow(
         for s in 0..n_samples {
             let h1 = s * 2;
             let h2 = h1 + 1;
-            let a1 = target_geno[m * n_samples * 2 + s * 2] as i32;
-            let a2 = target_geno[m * n_samples * 2 + s * 2 + 1] as i32;
+            let a1 = decode(target_geno[m * n_samples * 2 + s * 2]);
+            let a2 = decode(target_geno[m * n_samples * 2 + s * 2 + 1]);
             alleles[h1] = a1;
             alleles[h2] = a2;
             unph_het[s] = m >= overlap && a1 >= 0 && a2 >= 0 && a1 != a2;
@@ -868,6 +907,34 @@ pub fn initial_phase_pbwt(target_geno: &[u8], ref_alleles: &[u8],
     seed: i64, n_threads: usize, overlap: usize) -> (Vec<u8>, Vec<u8>)
 {
     let n_targ_haps = n_samples * 2;
+
+    // ISOLATION A/B (SELPHI_HAPLOID_INIT_FROM_INPUT): use the INPUT's phase as the
+    // initial phase instead of re-deriving it (PBWT initial phaser). Lets us feed an
+    // external (e.g. Beagle) phase as the starting scaffold and run ONLY Selphi's
+    // iterations — isolating whether the gap is in the initial phase or the iterations.
+    if crate::config::is_one("SELPHI_HAPLOID_INIT_FROM_INPUT") {
+        let mut phased = vec![0u8; n_var * n_targ_haps];
+        for m in 0..n_var {
+            for h in 0..n_targ_haps {
+                let v = target_geno[m * n_targ_haps + h];
+                phased[m * n_targ_haps + h] = if v >= 128 { 0 } else { v & 1 };
+            }
+        }
+        // resolved = first non-overlap het per sample (same convention as the PBWT path)
+        let mut resolved = vec![0u8; n_var * n_samples];
+        for s in 0..n_samples {
+            let mut found = false;
+            for m in 0..n_var {
+                let a1 = target_geno[m * n_samples * 2 + s * 2];
+                let a2 = target_geno[m * n_samples * 2 + s * 2 + 1];
+                if a1 != a2 && a1 < 128 && a2 < 128 {
+                    if m < overlap { resolved[m * n_samples + s] = 1; }
+                    else if !found { resolved[m * n_samples + s] = 1; found = true; break; }
+                }
+            }
+        }
+        return (phased, resolved);
+    }
 
     // 1. Compute hiFreqWindows
     let windows = hi_freq_windows(chip_cm, n_threads);

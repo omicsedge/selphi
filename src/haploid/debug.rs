@@ -4,9 +4,76 @@
 use crate::selphi_debug;
 use std::fs;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub fn is_debug() -> bool {
     crate::log::is_debug()
+}
+
+// ============================================================
+// PBWT a[]/d[] differential-debug dumps (microtest vs Beagle PbwtDivUpdater)
+// ============================================================
+
+/// When set, the coded-IBS batch loops append per-step (a[], d[]) snapshots to
+/// `{debug_dir}/pbwt_ad.bin`. Set ON only around the window0/iter0 single-batch
+/// call so the dump is a single sequential PBWT directly comparable to Beagle's.
+static AD_DUMP: AtomicBool = AtomicBool::new(false);
+
+pub fn ad_dump_enabled() -> bool { AD_DUMP.load(Ordering::Relaxed) }
+
+/// Enable/disable the per-step a[]/d[] dump. Truncates the files when enabling.
+pub fn set_ad_dump(on: bool) {
+    if on {
+        let dd = debug_dir();
+        let _ = fs::File::create(format!("{}/pbwt_ad.bin", dd.display()));
+        let _ = fs::File::create(format!("{}/ibs_window.txt", dd.display()));
+    }
+    AD_DUMP.store(on, Ordering::Relaxed);
+}
+
+/// Append one (sample-0 hap) IBS window record: the prefix position `i`, the
+/// divergence-expanded equivalence-class window `[u, v)` (size n), and the
+/// realized pick. The window is a pure function of (i, d[], step, nc) — seed
+/// independent — so it must match Beagle's `getBwdIbsHaps` expansion exactly
+/// when d[] is identical. Only the `pick` column carries RNG-seed dependence.
+pub fn dump_ibs_window(step: i32, t: usize, i: usize, u: usize, v: usize, pick: i32) {
+    let dd = debug_dir();
+    let Ok(mut f) = fs::OpenOptions::new().append(true).create(true)
+        .open(format!("{}/ibs_window.txt", dd.display())) else { return };
+    let _ = writeln!(f, "{}\t{}\t{}\t{}\t{}\t{}\t{}", step, t, i, u, v, v - u, pick);
+}
+
+/// Append one step's PBWT prefix array a[0..m_total] and divergence array
+/// d[0..=m_total] to `pbwt_ad.bin` (little-endian i32):
+///   [step:i32][a[0..m_total]:i32][d[0..=m_total]:i32]
+/// Called AFTER pbwt_div_update_step (so d already carries the step's sentinels).
+pub fn dump_pbwt_ad_step(step: i32, a: &[i32], d: &[i32], m_total: usize) {
+    let dd = debug_dir();
+    let Ok(mut f) = fs::OpenOptions::new().append(true).create(true)
+        .open(format!("{}/pbwt_ad.bin", dd.display())) else { return };
+    let mut buf = Vec::with_capacity((2 + 2 * m_total) * 4);
+    buf.extend_from_slice(&step.to_le_bytes());
+    for &x in &a[..m_total] { buf.extend_from_slice(&x.to_le_bytes()); }
+    for &x in &d[..=m_total] { buf.extend_from_slice(&x.to_le_bytes()); }
+    let _ = f.write_all(&buf);
+}
+
+/// Dump the coded-step matrix for one window/iteration so an external harness
+/// can drive Beagle's PbwtDivUpdater on the IDENTICAL input. Binary, LE i32:
+///   [n_steps:i32][m_all:i32] then per step: [n_alleles:i32][codes[0..m_all]:i32]
+pub fn dump_coded_steps(precoded: &[i32], pre_na: &[usize], n_steps: usize, m_all: usize) {
+    let dd = debug_dir();
+    let Ok(mut f) = fs::File::create(format!("{}/coded_steps.bin", dd.display())) else { return };
+    let mut buf = Vec::with_capacity((2 + n_steps * (1 + m_all)) * 4);
+    buf.extend_from_slice(&(n_steps as i32).to_le_bytes());
+    buf.extend_from_slice(&(m_all as i32).to_le_bytes());
+    for s in 0..n_steps {
+        buf.extend_from_slice(&(pre_na[s] as i32).to_le_bytes());
+        for h in 0..m_all { buf.extend_from_slice(&precoded[s * m_all + h].to_le_bytes()); }
+    }
+    let _ = f.write_all(&buf);
+    selphi_debug!("  [DEBUG] Dumped coded steps ({} steps x {} haps) to {}/coded_steps.bin",
+        n_steps, m_all, dd.display());
 }
 
 pub fn debug_sample() -> usize {
