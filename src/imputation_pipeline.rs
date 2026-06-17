@@ -402,6 +402,10 @@ struct PhasingResult {
     window_ri: Vec<(f32, usize, usize)>,
     ref_bm_full: Option<selphi::common::HaplotypeBitmatrix>,
     engine: ResolvedEngine,
+    /// Soft-phase (SELPHI_HAPLOID_SOFT_PHASE): per-(chip-site, sample) phase
+    /// confidence ∈ [0,1], row-major `[site * n_samples + sample]`, used as the
+    /// imputation emission confidence `c`. None unless soft-phase + haploid.
+    phase_conf: Option<Vec<f32>>,
 }
 
 /// Run the resolved phasing engine (haploid or diploid). Extracts the full
@@ -429,20 +433,24 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
         Some(bm)
     } else { None };
 
-    let (phased, window_ri) = match engine {
+    let (phased, window_ri, phase_conf) = match engine {
         ResolvedEngine::Diploid => {
             selphi_step!("Using Diploid phasing");
             // Common-MAF chip subset (MAF >= 0.001 on target). Diploid runs
             // on common variants only; rare ones are re-imputed by the HMM.
-            let target_an = (n_samples * 2) as u32;
             let common_chip_indices: Vec<usize> = (0..n_chip).into_par_iter().filter(|&v| {
-                let mut ac = 0u32;
+                // Mask the 128 missing sentinel (and count its AN) so MAF is over called
+                // alleles only — a missing GT must not inflate AC by 128.
+                let mut ac = 0u32; let mut an = 0u32;
                 for si in 0..n_samples {
-                    ac += targ_alleles[v * n_samples * 2 + si * 2] as u32;
-                    ac += targ_alleles[v * n_samples * 2 + si * 2 + 1] as u32;
+                    let a0 = targ_alleles[v * n_samples * 2 + si * 2];
+                    let a1 = targ_alleles[v * n_samples * 2 + si * 2 + 1];
+                    if a0 <= 1 { ac += a0 as u32; an += 1; }
+                    if a1 <= 1 { ac += a1 as u32; an += 1; }
                 }
-                let mac = ac.min(target_an - ac);
-                (mac as f32 / target_an as f32) >= 0.001f32
+                if an == 0 { return false; }
+                let mac = ac.min(an - ac);
+                (mac as f32 / an as f32) >= 0.001f32
             }).collect();
             let common_ref_bm = if let Some(ref full_bm) = ref_bm_full {
                 selphi::diploid::pbwt_neighbor::HaplotypeBitmatrix::from_subset(
@@ -460,14 +468,15 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
             // phase-only diploid path `ref_bm_full` is `None` (we only
             // extract the common subset to save RAM); phase_rare falls
             // back to target-only.
-            selphi::diploid::diploid_phase_bm_prefiltered(
+            let (dp, dr) = selphi::diploid::diploid_phase_bm_prefiltered(
                 targ_alleles, common_ref_bm, &common_chip_indices,
                 ref_bm_full.as_ref(),
                 raw_chip_cm, chip_bps,
                 &ref_bp, &map_bp_raw, &map_cm_raw,
                 n_chip, n_samples, n_ref,
                 seed, args.threads, args.max_cond_haps,
-            )
+            );
+            (dp, dr, None)  // diploid soft-phase not wired
         }
         ResolvedEngine::Haploid => {
             selphi_step!("Using haploid phasing engine");
@@ -483,7 +492,7 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
     };
     selphi_step!("Phasing complete: {} samples phased, {} EM windows",
         n_samples, window_ri.len());
-    PhasingResult { phased_alleles: phased, window_ri, ref_bm_full, engine }
+    PhasingResult { phased_alleles: phased, window_ri, ref_bm_full, engine, phase_conf }
 }
 
 /// Convert per-window recombIntensity (`ri`) from phasing into a per-site
@@ -974,13 +983,38 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         target_batch_size_haps_estimate, needs_phasing_estimate,
     );
 
-    // 5. Extract target alleles at chip sites (before ref — needed for MAF filter)
-    let targ_alleles = extract_target_alleles(&target_genotypes, &target_idx, n_chip, n_haps, &allele_transforms);
+    // 5. Extract target alleles at chip sites (before ref — needed for MAF filter).
+    // ROOT-CAUSE FIX: on the PHASING path, encode missing as 128 so the phasing IMPUTES it
+    // (Beagle does) instead of conditioning on a false hom-REF — the cause of the ~0.007 phase
+    // gap vs Beagle (+0.0036 R² on haploid, beats Beagle-full). BOTH engines: haploid's
+    // phase_subwindow decodes 128→-1 and imputes; diploid's build_graph marks 128 sites missing
+    // (set_missing → run_mis HMM imputes). After phasing the imputed alleles replace these.
+    // The MAF-filter AC sums below MASK 128. Impute-only (no phasing) stays 0 → byte-identical.
+    let miss_val_extract: u8 = if needs_phasing_estimate { 128 } else { 0 };
+    let targ_alleles = extract_target_alleles(&target_genotypes, &target_idx, n_chip, n_haps, &allele_transforms, miss_val_extract);
 
     // 6. Genetic map
     let chip_bps: Vec<i64> = wgs_idx.iter().map(|&wi| ref_positions[wi]).collect();
     let raw_chip_cm = genmap::load_and_interpolate_genetic_map(Path::new(map_path), &chip_bps)
         .unwrap_or_else(|e| { selphi_error!("Cannot read genetic map {}: {}", map_path, e); std::process::exit(1); });
+    // Refuse a degenerate (zero cM span) map on a recombining contig: an empty/malformed map
+    // makes the loader return cM=0 everywhere, collapsing the whole chromosome to one window
+    // (no recombination structure) and silently degrading accuracy. Mirrors the multi-chr guard.
+    // Escape hatch SELPHI_ALLOW_NONRECOMB=1 for chrY/chrMT (which legitimately lack a cM map).
+    if n_chip > 1 {
+        let cm_min = raw_chip_cm.iter().cloned().fold(f64::INFINITY, f64::min);
+        let cm_max = raw_chip_cm.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let chr = srp.chromosome();
+        let is_nonrecomb = matches!(selphi::contig::classify_contig(chr),
+            selphi::contig::ContigClass::ChrY | selphi::contig::ContigClass::ChrMt);
+        if (cm_max - cm_min) <= 0.0 && !(selphi::contig::allow_nonrecomb() && is_nonrecomb) {
+            selphi_error!("Genetic map {} yields a zero cM span over {} chip sites on contig {} — \
+                the chromosome would collapse to one window (cM=0 everywhere) and silently degrade \
+                accuracy. Provide a valid genetic map (or set SELPHI_ALLOW_NONRECOMB=1 for chrY/chrMT).",
+                map_path, n_chip, chr);
+            std::process::exit(1);
+        }
+    }
 
     // 6b. Phase if input is unphased (in-memory fusion — no VCF round-trip)
     let needs_phasing = !is_phased || args.force_phasing;
@@ -1018,7 +1052,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         selphi_step!("Phase-ensemble: {} members (seeds {}..{})", ensemble_n, args.seed, args.seed + ensemble_n as i64 - 1);
     }
 
-    let (targ_alleles, em_ne_per_site, ref_bm_from_phasing, extra_phased) = if needs_phasing {
+    let (targ_alleles, em_ne_per_site, ref_bm_from_phasing, extra_phased, phase_conf_imp) = if needs_phasing {
         let pr = run_phasing_engines(&PhasingInputs {
             args, srp: &srp, map_path,
             targ_alleles: &targ_alleles, raw_chip_cm: &raw_chip_cm, chip_bps: &chip_bps,
@@ -1073,13 +1107,27 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         } else {
             Vec::new()
         };
-        (pr.phased_alleles, em_ne_to_use, pr.ref_bm_full, extra_phased)
+        (pr.phased_alleles, em_ne_to_use, pr.ref_bm_full, extra_phased, pr.phase_conf)
     } else {
         if args.phase_only {
             selphi_info!("WARNING: --phase_only requested but input is already phased. Nothing to do.");
             return;
         }
-        (targ_alleles, None, None, Vec::new())
+        (targ_alleles, None, None, Vec::new(), None)
+    };
+
+    // Soft-phase: fold the phasing per-(site,sample) confidence into the
+    // imputation emission confidence. Combine with any --refine confidence by
+    // element-wise MIN (a site soft for EITHER reason is softened). Layout
+    // matches `target_site_conf_per_sample`: row-major [site * n_samples + sample].
+    let target_site_conf_per_sample: Option<Vec<f64>> = match (target_site_conf_per_sample, phase_conf_imp) {
+        (Some(mut refine_c), Some(pc)) => {
+            for (r, &p) in refine_c.iter_mut().zip(pc.iter()) { *r = r.min(p as f64); }
+            Some(refine_c)
+        }
+        (Some(refine_c), None) => Some(refine_c),
+        (None, Some(pc)) => Some(pc.iter().map(|&p| p as f64).collect()),
+        (None, None) => None,
     };
 
     // 6c. LD correction using shared bitmatrix (no re-extraction from SRP).
