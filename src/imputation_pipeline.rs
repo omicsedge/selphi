@@ -1055,12 +1055,21 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         // haploid we forward the per-site EM Ne unless --no-em-ne disables it.
         let em_ne_to_use = if args.no_em_ne || pr.engine == ResolvedEngine::Diploid { None } else { Some(em_ne) };
 
-        // Extra ensemble members (seeds seed+1 .. seed+N-1).
-        let mut extra_phased: Vec<(Vec<u8>, Option<Vec<f64>>)> = Vec::new();
-        if let Some(ref unph) = unphased_for_ensemble {
-            for i in 1..ensemble_n {
+        // Extra ensemble members (seeds seed+1 .. seed+N-1). Each member is an
+        // independent phasing run, so they execute in PARALLEL: a single phasing
+        // of few samples leaves CPU cores idle (one sample = 2 haplotypes worth
+        // of internal parallelism), so running the members concurrently fills
+        // the cores — the speedup is largest for the single-sample production
+        // case. Determinism is preserved: each member's seed is fixed and its
+        // phasing is bit-deterministic (thread-count-independent), and
+        // `par_iter().collect()` yields results in member order, so the
+        // downstream weight averaging sums in a fixed order. Bit-identical to the
+        // serial loop.
+        let extra_phased: Vec<(Vec<u8>, Option<Vec<f64>>)> = if let Some(unph) = unphased_for_ensemble.as_ref() {
+            selphi_step!("Phase-ensemble: phasing {} extra members in parallel (seeds {}..{})",
+                ensemble_n - 1, args.seed + 1, args.seed + ensemble_n as i64 - 1);
+            (1..ensemble_n).into_par_iter().map(|i| {
                 let m_seed = args.seed + i as i64;
-                selphi_step!("Phase-ensemble member {}/{} (seed {})", i + 1, ensemble_n, m_seed);
                 let pri = run_phasing_engines(&PhasingInputs {
                     args, srp: &srp, map_path,
                     targ_alleles: unph, raw_chip_cm: &raw_chip_cm, chip_bps: &chip_bps,
@@ -1069,9 +1078,11 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                 });
                 let emi = em_ne_from_window_ri(&pri.window_ri, args.est_ne, n_chip, n_ref);
                 let emi_use = if args.no_em_ne || pri.engine == ResolvedEngine::Diploid { None } else { Some(emi) };
-                extra_phased.push((pri.phased_alleles, emi_use));
-            }
-        }
+                (pri.phased_alleles, emi_use)
+            }).collect()
+        } else {
+            Vec::new()
+        };
         (pr.phased_alleles, em_ne_to_use, pr.ref_bm_full, extra_phased)
     } else {
         if args.phase_only {
