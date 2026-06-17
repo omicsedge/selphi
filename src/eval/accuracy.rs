@@ -241,6 +241,18 @@ fn match_alleles(imp_ref: &[u8], imp_alt: &[u8], truth_ref: &[u8], truth_alt: &[
     (false, false)
 }
 
+/// Normalize a contig name for cross-file matching: strip a leading `chr`
+/// (case-insensitive) so `chr22` and `22` compare equal. The merge below keys
+/// on (normalized-contig, pos) — without this it matched on POSITION ALONE,
+/// silently producing wrong cross-chromosome pairings when the truth was a
+/// multi-contig (e.g. whole-genome) file whose contig names didn't align with
+/// the (single-chr) imputed file. For aligned single-contig inputs this is a
+/// no-op (behaviour byte-for-byte unchanged).
+#[inline]
+fn norm_contig(c: &[u8]) -> &[u8] {
+    if c.len() > 3 && c[..3].eq_ignore_ascii_case(b"chr") { &c[3..] } else { c }
+}
+
 /// Strip a trailing `\n` or `\r\n` from a line read via `read_until(b'\n', ...)`.
 #[inline]
 fn strip_line_endings(line: &[u8]) -> &[u8] {
@@ -939,14 +951,22 @@ pub fn evaluate_parallel(
                 while let (Some(imp), Some(truth)) = (&imp_rec, &truth_rec) {
                     if imp.1 >= region_end && truth.1 >= region_end { break; }
 
-                    if imp.1 < truth.1 {
+                    // Key on (normalized-contig, pos) so chr22≡22 AND records on
+                    // DIFFERENT chromosomes are never matched (previously the merge
+                    // compared pos ALONE → a multi-contig truth silently produced
+                    // wrong cross-chromosome pairings). For aligned single-contig
+                    // inputs (the per-chromosome imputation path) the contig keys are
+                    // always equal, so this reduces to the original pos comparison.
+                    let ik = (norm_contig(&imp.0), imp.1);
+                    let tk = (norm_contig(&truth.0), truth.1);
+                    if ik < tk {
                         if imp.1 < region_end { n_imp += 1; }
                         imp_rec = imp_reader.next_record(&mut imp_ds_raw);
-                    } else if imp.1 > truth.1 {
+                    } else if ik > tk {
                         if truth.1 < region_end { n_truth += 1; }
                         truth_rec = truth_reader.next_record(&mut truth_ds_raw);
                     } else if imp.1 < region_end {
-                        // Same position, in-region.
+                        // Same (contig, position), in-region.
                         n_imp += 1;
                         n_truth += 1;
 
@@ -1094,6 +1114,14 @@ pub fn print_summary(site_acc: &SiteAccumulator, sample_acc: &SampleAccumulator,
     if !counts.chromosomes.is_empty() {
         crate::selphi_info!("  Chromosomes: {} ({})", counts.chromosomes.len(),
             counts.chromosomes.join(", "));
+    }
+    // Both files have variants but nothing matched → almost always a scope/contig
+    // mismatch (e.g. a whole-genome truth vs a single-chromosome imputed file, or
+    // disjoint chromosomes). The merge keys on (normalized-contig, pos), so a 0
+    // here means the contig SETS don't overlap — not a real accuracy of zero.
+    if n_matched == 0 && counts.n_imp_variants > 0 && counts.n_truth_variants > 0 {
+        crate::selphi_info!("  [WARN] 0 variants matched despite non-empty inputs — imputed and truth \
+likely cover different chromosomes (check that both span the same contig set; chr-prefix is handled).");
     }
 }
 
