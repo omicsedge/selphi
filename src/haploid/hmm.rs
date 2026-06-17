@@ -152,6 +152,12 @@ pub struct PhaseResult {
     pub n_lock: i32,
     pub swap_ranges: Vec<(usize, usize, usize)>,  // (range_start, range_end, h0) — window-local markers
     pub locks: Vec<(usize, usize)>,
+    /// Soft-phase: per-het (global_marker, decision_confidence) for hets DECIDED
+    /// this iteration (conf_a = likelihood ratio of the chosen vs rejected
+    /// orientation, ≥1). Empty unless soft-phase is requested. The caller maps
+    /// confidence → a per-site emission confidence c so uncertain hets are
+    /// down-weighted in imputation (a 1-run marginalization of phase uncertainty).
+    pub het_conf: Vec<(usize, f32)>,
 }
 
 
@@ -229,9 +235,10 @@ pub fn phase_one(hbm:&[u8],hbs:usize,ibs:&[i32],hmask:&[u8],cm:&[f64],cst:&[i32]
     // the post-EM `recomb_intensity`). Indexed by window marker; `p_recomb[0]==0`.
     p_recomb:&[f32],
     dbg_it:usize,dbg_wi:usize,
+    want_conf:bool,
 ) -> PhaseResult {
     let(h0,h1)=(si*2,si*2+1);
-    let empty = PhaseResult { n_swap:0, n_own:0, n_lock:0, swap_ranges:vec![], locks:vec![] };
+    let empty = PhaseResult { n_swap:0, n_own:0, n_lock:0, swap_ranges:vec![], locks:vec![], het_conf:vec![] };
     let mut nho=0i32;
     for m in 0..wsz{let vg=ws+m;if vg>=os&&vg<oe&&hmask[vg*nsa+si]!=0{nho+=1}}
     if nho<2{return empty}
@@ -496,6 +503,7 @@ pub fn phase_one(hbm:&[u8],hbs:usize,ibs:&[i32],hmask:&[u8],cm:&[f64],cst:&[i32]
     // Apply swaps to ALL window markers (not just owned).
     // But only report locks for owned region.
     let mut swap_ranges=Vec::new();let mut locks=Vec::new();
+    let mut het_conf=Vec::new();
     let(mut nsw,mut nown,mut nlk)=(0i32,0i32,0i32);
     for h2 in 0..nhet{
         let vg=ws+pw.hs2[h2];
@@ -506,8 +514,17 @@ pub fn phase_one(hbm:&[u8],hbs:usize,ibs:&[i32],hmask:&[u8],cm:&[f64],cst:&[i32]
             swap_ranges.push((range_start, range_end, h0));
             nsw+=1;
         }
-        if pw.lck_a[h2]!=0&&locked[vg*nsa+si]==0{locks.push((vg,si));nlk+=1}}
+        if pw.lck_a[h2]!=0&&locked[vg*nsa+si]==0{locks.push((vg,si));nlk+=1}
+        // Soft-phase: emit confidence for hets DECIDED this iteration (entered the
+        // standard `!hl2` or masked `hm2` branch, so conf_a is freshly the decision
+        // likelihood ratio). Locked-on-entry hets keep conf_a=1.0 (init) and are
+        // skipped — the caller's last-decision-wins overwrite preserves their
+        // confidence from the iteration in which they were decided/locked.
+        if want_conf && (pw.hm2[h2] || !pw.hl2[h2]) {
+            het_conf.push((vg, pw.conf_a[h2]));
+        }
+    }
     // Return workspace to thread-local for reuse
     TL_PW.with(|w| { let mut ws = w.borrow_mut(); std::mem::swap(&mut *ws, &mut pw); });
-    PhaseResult { n_swap: nsw, n_own: nown, n_lock: nlk, swap_ranges, locks }
+    PhaseResult { n_swap: nsw, n_own: nown, n_lock: nlk, swap_ranges, locks, het_conf }
 }

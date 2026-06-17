@@ -230,8 +230,13 @@ pub fn detect_haploid_chrx(
             if par_site.is_some_and(|p| p.get(v).copied().unwrap_or(false)) { continue; }
             let a0 = alleles[v * n_haps + si * 2];
             let a1 = alleles[v * n_haps + si * 2 + 1];
-            if a0 <= 1 && a1 <= 1 { n_total += 1; }
-            if a0 != a1 { n_het += 1; }
+            // Count het ONLY among sites where both alleles are real (≤1). A half-missing
+            // GT (e.g. 128 != 1) must not bump the het numerator without the denominator,
+            // which would inflate the het-rate and hide a true haploid (chrX male).
+            if a0 <= 1 && a1 <= 1 {
+                n_total += 1;
+                if a0 != a1 { n_het += 1; }
+            }
         }
         if n_total > 100 && (n_het as f64 / n_total as f64) < 0.01 {
             haploids.insert(si);

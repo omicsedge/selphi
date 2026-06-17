@@ -78,11 +78,12 @@ pub fn phase_panel(
     }).collect();
     let empty_ref = HaplotypeBitmatrix::from_raw(vec![], 0, 0);
     // ref_bp = cohort bp (only used for ref-side map alignment; n_ref=0 so inert)
-    phase_genotypes_inner(
+    let (h, ri, _conf) = phase_genotypes_inner(
         cohort_geno, &empty_ref, &chip_cm, bp,
         bp, map_bp, map_cm, n_var, n_samples, /* n_ref = */ 0,
         seed, n_threads, max_windows, N_BURNIN, N_PHASING,
-    )
+    );
+    (h, ri)
 }
 
 /// Main phasing entry point (window-major, ).
@@ -92,7 +93,7 @@ pub fn phase_genotypes(
     ref_bp: &[i64], map_bp: &[i64], map_cm: &[f64],
     n_var: usize, n_samples: usize, n_ref: usize,
     seed: i64, n_threads: usize, max_windows: usize,
-) -> (Vec<u8>, Vec<(f32, usize, usize)>) {
+) -> (Vec<u8>, Vec<(f32, usize, usize)>, Option<Vec<f32>>) {
     phase_genotypes_inner(target_geno, ref_bm, chip_cm, chip_bp,
         ref_bp, map_bp, map_cm, n_var, n_samples, n_ref,
         seed, n_threads, max_windows, N_BURNIN, N_PHASING)
@@ -106,13 +107,29 @@ fn phase_genotypes_inner(
     n_var: usize, n_samples: usize, n_ref: usize,
     seed: i64, n_threads: usize, max_windows: usize,
     n_burnin: usize, n_phasing: usize,
-) -> (Vec<u8>, Vec<(f32, usize, usize)>) {
+) -> (Vec<u8>, Vec<(f32, usize, usize)>, Option<Vec<f32>>) {
     rayon::ThreadPoolBuilder::new().num_threads(n_threads).build_global().ok();
     let t0 = Instant::now();
 
     let n_targ_haps = n_samples * 2;
     let n_haps_total = n_ref + n_targ_haps;
     let m_all = n_haps_total;
+
+    // Long-range coherence A/B: scale the phasing recombination intensity. The
+    // Selphi-vs-Beagle phase disagreements concentrate at LARGE inter-het gaps,
+    // suggesting Selphi may over-switch across gaps. ri_scale<1 lowers recomb
+    // (≈higher Ne) → maintains phase across gaps more. Default 1.0 (byte-identical).
+    let ri_scale = crate::config::raw("SELPHI_HAPLOID_RI_SCALE")
+        .and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
+
+    // Soft-phase imputer (SELPHI_HAPLOID_SOFT_PHASE): carry the per-het phase
+    // decision confidence into a per-(site,sample) emission confidence so that
+    // uncertain hets are down-weighted in the imputation Li-Stephens matching —
+    // a single-run marginalization of phase uncertainty (vs the N× --phase-ensemble).
+    // phase_conf[site * n_samples + sample] ∈ [0,1]; 1.0 = fully confident (no
+    // softening), homozygous sites stay 1.0. None when the knob is off.
+    let soft_phase = crate::config::is_one("SELPHI_HAPLOID_SOFT_PHASE");
+    let mut phase_conf: Vec<f32> = if soft_phase { vec![1.0f32; n_var * n_samples] } else { Vec::new() };
 
     // chip_cm is raw (no LD correction), using standard linear interpolation
 
@@ -207,6 +224,26 @@ fn phase_genotypes_inner(
         window_seeds[wi] = rng_obj.next_long();
     }
 
+    // GLOBAL INITIAL PHASE (SELPHI_HAPLOID_GLOBAL_INIT): Beagle runs initPhase ONCE over the
+    // whole chromosome; Selphi's default runs the PBWT initial phaser per 40cM haploid window.
+    // The injection A/B isolated the phase gap to the initial phase, and the HFW-divisor sweep
+    // showed it is the GLOBAL-vs-PER-WINDOW structure (not sub-window size). Compute the initial
+    // phase once over all markers here; the window loop slices it. Default off (byte-identical).
+    let global_init = crate::config::is_one("SELPHI_HAPLOID_GLOBAL_INIT");
+    let global_init_phased: Vec<u8> = if global_init && n_ref > 0 {
+        let g_gen_pos = window::enforce_gen_pos(chip_cm, chip_bp);
+        let mut full_ref = vec![0u8; n_var * n_ref];
+        for m in 0..n_var {
+            for r in 0..n_ref {
+                if ref_bm.get(m, r) { full_ref[m * n_ref + r] = 1; }
+            }
+        }
+        let (gp, _gr) = pbwt::initial_phase_pbwt(
+            target_geno, &full_ref, &g_gen_pos, n_var, n_samples, n_ref, seed, n_threads, 0);
+        selphi_debug!("  [Rust] GLOBAL initial_phase: {:.1}s", t0.elapsed().as_secs_f64());
+        gp
+    } else { Vec::new() };
+
     // IBS2 restrictions are computed PER WINDOW (one stage-1 IBS2 set per window)
     // Global output arrays
     let mut global_phased = vec![0u8; n_var * n_targ_haps];
@@ -225,30 +262,49 @@ fn phase_genotypes_inner(
         let overlap = if wi == 0 { 0 } else { windows[wi-1].3 - ws };
 
         // --- Init phase for this window ---
-        // Spliced genotypes: overlap markers use previous window's PHASED alleles
-        let w_tg: std::borrow::Cow<[u8]> = if overlap > 0 {
-            let mut tg = target_geno[ws * n_samples * 2..(ws + w_size) * n_samples * 2].to_vec();
-            for m in 0..overlap {
-                let gm = ws + m;
-                for s in 0..n_samples {
-                    tg[m * n_samples * 2 + s * 2] = global_phased[gm * n_targ_haps + s * 2];
-                    tg[m * n_samples * 2 + s * 2 + 1] = global_phased[gm * n_targ_haps + s * 2 + 1];
+        let (init_phased, w_resolved) = if global_init && n_ref > 0 {
+            // GLOBAL init: slice the chromosome-wide initial phase (Beagle-faithful);
+            // recompute the per-window first-het resolved frame (iteration anchor).
+            let ip = global_init_phased[ws * n_targ_haps..we * n_targ_haps].to_vec();
+            let mut res = vec![0u8; w_size * n_samples];
+            for s in 0..n_samples {
+                let mut found = false;
+                for m in 0..w_size {
+                    let gm = ws + m;
+                    let a1 = target_geno[gm * n_samples * 2 + s * 2];
+                    let a2 = target_geno[gm * n_samples * 2 + s * 2 + 1];
+                    if a1 != a2 && a1 < 128 && a2 < 128 {
+                        if m < overlap { res[m * n_samples + s] = 1; }
+                        else if !found { res[m * n_samples + s] = 1; found = true; break; }
+                    }
                 }
             }
-            std::borrow::Cow::Owned(tg)
+            (ip, res)
         } else {
-            std::borrow::Cow::Borrowed(&target_geno[ws * n_samples * 2..(ws + w_size) * n_samples * 2])
-        };
-        // Extract ref alleles for this window from bitmatrix (byte-per-allele for initial_phase_pbwt)
-        let mut w_ra = vec![0u8; w_size * n_ref];
-        for m in 0..w_size {
-            for r in 0..n_ref {
-                if ref_bm.get(ws + m, r) { w_ra[m * n_ref + r] = 1; }
+            // Per-window init (default). Spliced overlap = previous window's PHASED alleles.
+            let w_tg: std::borrow::Cow<[u8]> = if overlap > 0 {
+                let mut tg = target_geno[ws * n_samples * 2..(ws + w_size) * n_samples * 2].to_vec();
+                for m in 0..overlap {
+                    let gm = ws + m;
+                    for s in 0..n_samples {
+                        tg[m * n_samples * 2 + s * 2] = global_phased[gm * n_targ_haps + s * 2];
+                        tg[m * n_samples * 2 + s * 2 + 1] = global_phased[gm * n_targ_haps + s * 2 + 1];
+                    }
+                }
+                std::borrow::Cow::Owned(tg)
+            } else {
+                std::borrow::Cow::Borrowed(&target_geno[ws * n_samples * 2..(ws + w_size) * n_samples * 2])
+            };
+            let mut w_ra = vec![0u8; w_size * n_ref];
+            for m in 0..w_size {
+                for r in 0..n_ref {
+                    if ref_bm.get(ws + m, r) { w_ra[m * n_ref + r] = 1; }
+                }
             }
-        }
-        let (init_phased, w_resolved) = pbwt::initial_phase_pbwt(
-            &w_tg, &w_ra, &window_gen_pos[wi],
-            w_size, n_samples, n_ref, window_seeds[wi], n_threads, overlap);
+            pbwt::initial_phase_pbwt(
+                &w_tg, &w_ra, &window_gen_pos[wi],
+                w_size, n_samples, n_ref, window_seeds[wi], n_threads, overlap)
+        };
         selphi_debug!("  [Rust] W{} initial_phase: {:.1}s (overlap={})", wi+1, t0.elapsed().as_secs_f64(), overlap);
 
         // Per-window het mask (uses ORIGINAL genotype, not spliced)
@@ -446,14 +502,36 @@ fn phase_genotypes_inner(
                  steps_per_batch, n_batches, n_overlap_steps)
             };
 
+            // Microtest / A-B: force a single sequential PBWT (no multi-batch buffer
+            // warm-up approximation). SELPHI_HAPLOID_SINGLE_BATCH=1 forces ALL
+            // windows/iters single-batch (debug only) — used both for the win0/iter0
+            // a[]/d[] dump AND to A/B whether the production multi-batch buffer
+            // warm-up degrades the IBS selection vs a clean single pass.
+            let it_nb = if crate::config::is_one("SELPHI_HAPLOID_SINGLE_BATCH") { 1 } else { it_nb };
+
             // Pre-compute coded step values in parallel from hap_bits
             let (w_precoded, w_pre_na) = pbwt::precompute_coded_steps_parallel(
                 &w_hap_bits, hap_byte_stride,
                 it_starts, it_ends, m_all);
 
+            if debug::is_debug() && it == 0 && wi == 0 {
+                debug::dump_coded_steps(&w_precoded, &w_pre_na, it_n_steps, m_all);
+            }
+            let dump_ad = debug::is_debug() && it == 0 && wi == 0;
+            if dump_ad { debug::set_ad_dump(true); }
+
             // --- PBWT coded IBS ---
             let t_pbwt = Instant::now();
-            let w_seed = window_seeds[wi] + it as i64;
+            // Microtest A/B: Beagle seeds the per-step IBS-pick RNG with the
+            // GLOBAL seed (`new Random(seed + step)`); Selphi derives a per-window
+            // seed chain (`window_seeds[wi] = JavaRandom(seed).next_long()`).
+            // SELPHI_HAPLOID_BEAGLE_SEED=1 swaps in the Beagle global scheme so the
+            // pick divergence can be isolated to the seed (windows are unchanged).
+            let w_seed = if crate::config::is_one("SELPHI_HAPLOID_BEAGLE_SEED") {
+                seed + it as i64
+            } else {
+                window_seeds[wi] + it as i64
+            };
 
             if debug::is_debug() && it == 0 && wi == 0 {
                 selphi_debug!("  [PBWT] n_batches={} steps_per_batch={} n_overlap={} n_steps={} fine={}",
@@ -518,6 +596,7 @@ fn phase_genotypes_inner(
                 }
                 out
             };
+            if dump_ad { debug::set_ad_dump(false); }
 
             // Debug: dump IBS
             if debug::is_debug() && it == debug::debug_iter() {
@@ -685,9 +764,11 @@ fn phase_genotypes_inner(
             // Per-marker recombination prob is loop-invariant across the per-sample phasing
             // HMM (pure function of the window map gaps and the post-EM ri) — hoist the
             // -expm1 transcendental out of phase_one. Byte-identical.
+            // ri_eff: EM-derived recomb intensity scaled by the A/B knob (1.0 = unchanged).
+            let ri_eff = ri_f32 * ri_scale;
             let mut p_recomb_hmm = vec![0.0f32; w_size];
             for m in 1..w_size {
-                let prod = ri_f32 * (w_cm[m] - w_cm[m - 1]) as f32;
+                let prod = ri_eff * (w_cm[m] - w_cm[m - 1]) as f32;
                 p_recomb_hmm[m] = -(-(prod as f64)).exp_m1() as f32;
             }
             let active_results: Vec<(usize, hmm::PhaseResult)> = active_samples.par_iter().map(|&si| {
@@ -696,10 +777,25 @@ fn phase_genotypes_inner(
                     it_starts, it_step_size, it_min_steps, &w_locked, &w_resolved,
                     si, w_size, n_targ_haps, n_samples, it_n_steps,
                     0, own_start_local, own_end_local, m_all, w_size, N_MOSAIC,
-                    lr_f32, ri_f32, pm_f32, n_haps_total, w_bp,
+                    lr_f32, ri_eff, pm_f32, n_haps_total, w_bp,
                     &p_recomb_hmm,
-                    it, wi))
+                    it, wi, soft_phase))
             }).collect();
+
+            // Soft-phase: fold each decided het's confidence into the global
+            // per-(site,sample) emission-confidence array. κ = (conf-1)/(conf+1)
+            // ∈ [0,1] (conf is the orientation likelihood ratio ≥1): a coin-flip
+            // het (conf≈1) → κ≈0 (fully softened), a confident/locked het
+            // (conf large) → κ≈1 (no softening). Last decision wins (overwrite):
+            // a het locked at iteration k keeps its iteration-k confidence.
+            if soft_phase {
+                for (si, r) in &active_results {
+                    for &(vg, conf) in &r.het_conf {
+                        let kappa = ((conf - 1.0) / (conf + 1.0)).clamp(0.0, 1.0);
+                        phase_conf[vg * n_samples + si] = kappa;
+                    }
+                }
+            }
 
             // Debug: dump pre-swap phase for sample 0
             if debug::is_debug() && it == debug::debug_iter() {
@@ -855,5 +951,6 @@ fn phase_genotypes_inner(
         }
     }
 
-    (global_phased, window_ri)
+    let phase_conf_out = if soft_phase { Some(std::mem::take(&mut phase_conf)) } else { None };
+    (global_phased, window_ri, phase_conf_out)
 }

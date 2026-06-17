@@ -238,6 +238,13 @@ fn _diploid_run(
         n_var, n_samples, n_ref, 1, 15000.0, common_indices,
     );
 
+    // Safety clamp: missing genotypes enter as the 128 sentinel so the genotype graph
+    // marks them missing (set_missing → run_mis imputes the COMMON sites; the imputed 0/1
+    // overwrites them above). Any residual sentinel (e.g. a rare missing site phase_rare
+    // did not impute) is clamped to 0 so the downstream imputation never sees 128 — no worse
+    // than the old missing→REF behavior for that residual. No-op when there is no missing.
+    for g in phased.iter_mut() { if *g > 1 { *g = 0; } }
+
     // EM-estimated Ne not returned as window_ri for now (diploid uses different HMM structure)
     let window_ri = vec![];
 

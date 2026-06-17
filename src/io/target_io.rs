@@ -722,9 +722,14 @@ fn ramp(x: f64, lo: f64, hi: f64) -> f64 {
 /// present (the site is treated as a fully trusted hard call → untouched HMM).
 #[inline]
 fn sample_confidence(
+    gt_missing: bool,
     gq: Option<i64>, pl: Option<[i32; 3]>, dp: Option<i64>,
     gq_lo: f64, gq_hi: f64,
 ) -> f64 {
+    // A MISSING genotype call has zero genotype confidence regardless of GQ/PL/DP — it must be
+    // re-routed to the imputed dosage, never trusted as a confident hom-REF (the old `(None,None,
+    // None)→1.0` default did exactly that for a './.' with no confidence fields). Override to 0.0.
+    if gt_missing { return 0.0; }
     // GQ-equivalent: real GQ if present, else (2nd-smallest PL − smallest PL).
     let gq_eq: Option<f64> = match gq {
         Some(g) => Some(g as f64),
@@ -832,7 +837,9 @@ fn line_min_confidence(
         let gq = gq_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
         let pl = pl_i.and_then(|i| nth_subfield(field, i)).and_then(parse_pl_triple);
         let dp = dp_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
-        let c = sample_confidence(gq, pl, dp, gq_lo, gq_hi);
+        // GT is subfield 0; a '.' allele = a missing call → confidence 0 (re-route to imputed).
+        let gt_missing = nth_subfield(field, 0).map(|g| g.iter().any(|&b| b == b'.')).unwrap_or(true);
+        let c = sample_confidence(gt_missing, gq, pl, dp, gq_lo, gq_hi);
         if c < min_c { min_c = c; }
         field_start = if field_end < gt_region.len() { field_end + 1 } else { gt_region.len() };
     }
@@ -865,7 +872,8 @@ fn line_per_sample_confidence(
         let gq = gq_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
         let pl = pl_i.and_then(|i| nth_subfield(field, i)).and_then(parse_pl_triple);
         let dp = dp_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
-        out.push(sample_confidence(gq, pl, dp, gq_lo, gq_hi));
+        let gt_missing = nth_subfield(field, 0).map(|g| g.iter().any(|&b| b == b'.')).unwrap_or(true);
+        out.push(sample_confidence(gt_missing, gq, pl, dp, gq_lo, gq_hi));
         field_start = if field_end < gt_region.len() { field_end + 1 } else { gt_region.len() };
     }
 }
@@ -988,7 +996,16 @@ fn extract_site_confidence_bcf(path: &str, gq_lo: f64, gq_hi: f64) -> Vec<f64> {
                 _ => None,
             };
             if gq.is_some() || pl.is_some() || dp.is_some() { any_field = true; }
-            let c = sample_confidence(gq, pl, dp, gq_lo, gq_hi);
+            // A no-call GT (any allele '.') → confidence 0 (re-route to imputed), never trusted REF.
+            let gt_missing = match sample.get("GT").flatten() {
+                Some(Value::Genotype(gt)) => {
+                    let al = gt.as_ref();
+                    al.first().map(|a| a.position().is_none()).unwrap_or(true)
+                        || al.get(1).map(|a| a.position().is_none()).unwrap_or(false)
+                }
+                _ => true,
+            };
+            let c = sample_confidence(gt_missing, gq, pl, dp, gq_lo, gq_hi);
             if c < min_c { min_c = c; }
         }
         conf.push(if any_field && min_c.is_finite() { min_c } else { 1.0 });
@@ -1069,7 +1086,15 @@ fn extract_site_confidence_per_sample_bcf(path: &str, gq_lo: f64, gq_hi: f64) ->
                 Some(v) => bcf_value_to_pl3(v),
                 _ => None,
             };
-            conf.push(sample_confidence(gq, pl, dp, gq_lo, gq_hi));
+            let gt_missing = match sample.get("GT").flatten() {
+                Some(Value::Genotype(gt)) => {
+                    let al = gt.as_ref();
+                    al.first().map(|a| a.position().is_none()).unwrap_or(true)
+                        || al.get(1).map(|a| a.position().is_none()).unwrap_or(false)
+                }
+                _ => true,
+            };
+            conf.push(sample_confidence(gt_missing, gq, pl, dp, gq_lo, gq_hi));
             row_n += 1;
         }
         if row_n > n_samples { n_samples = row_n; }
@@ -1143,27 +1168,29 @@ pub fn extract_target_alleles(
     n_chip: usize,
     n_haps: usize,
     transforms: &[u8],
+    // ROOT-CAUSE FIX: the long-standing default folds a MISSING target GT to 0 = hom-REF,
+    // which corrupts the phasing (it conditions on a false REF call) — the isolated cause of
+    // the ~0.007 phase gap vs Beagle, which IMPUTES missing during phasing. `missing_val=128`
+    // (the haploid missing sentinel) makes the phasing impute it instead. Callers pass 128
+    // ONLY on the haploid+phasing path (after phasing the imputed alleles replace these);
+    // 0 everywhere else (diploid / refine / impute-only) → byte-identical.
+    missing_val: u8,
 ) -> Vec<u8> {
     let n_samples = n_haps / 2;
     let mut out = vec![0u8; n_chip * n_haps];
+    let miss_val = missing_val;
     for (ci, &ti) in target_idx.iter().enumerate() {
         if ti >= genotypes.len() { continue; }
         let gt = &genotypes[ti];
         let swap = transforms.get(ci).copied().unwrap_or(0) == 1;
         for s in 0..n_samples.min(gt.len()) {
-            // Fold a MISSING sentinel (>1) back to 0 = hom-ref — imputation's
-            // long-standing treatment of a missing target GT. Byte-identical for real
-            // {0,1} alleles (the fold is a no-op; the swap arm's old `.min(1)` was too).
-            let g0 = if gt[s][0] > 1 { 0 } else { gt[s][0] };
-            let g1 = if gt[s][1] > 1 { 0 } else { gt[s][1] };
-            if swap {
-                // Biallelic 0↔1 recode (alleles are projected to {0,1} upstream).
-                out[ci * n_haps + s * 2] = 1 - g0;
-                out[ci * n_haps + s * 2 + 1] = 1 - g1;
-            } else {
-                out[ci * n_haps + s * 2] = g0;
-                out[ci * n_haps + s * 2 + 1] = g1;
-            }
+            let m0 = gt[s][0] > 1;
+            let m1 = gt[s][1] > 1;
+            let g0 = if m0 { 0 } else { gt[s][0] };
+            let g1 = if m1 { 0 } else { gt[s][1] };
+            // Missing → miss_val (preserved across the swap recode); real {0,1} → recode.
+            out[ci * n_haps + s * 2]     = if m0 { miss_val } else if swap { 1 - g0 } else { g0 };
+            out[ci * n_haps + s * 2 + 1] = if m1 { miss_val } else if swap { 1 - g1 } else { g1 };
         }
     }
     out
@@ -1530,9 +1557,9 @@ mod allele_match_tests {
     fn extract_applies_swap_transform() {
         // One chip site, 1 sample diploid [0,1]; swap transform → [1,0].
         let geno = vec![vec![[0u8, 1u8]]];
-        let plain = extract_target_alleles(&geno, &[0], 1, 2, &[]);
+        let plain = extract_target_alleles(&geno, &[0], 1, 2, &[], 0);
         assert_eq!(plain, vec![0, 1]);
-        let swapped = extract_target_alleles(&geno, &[0], 1, 2, &[1]);
+        let swapped = extract_target_alleles(&geno, &[0], 1, 2, &[1], 0);
         assert_eq!(swapped, vec![1, 0]);
     }
 }
