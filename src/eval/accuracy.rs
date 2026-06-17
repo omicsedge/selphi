@@ -253,6 +253,14 @@ fn norm_contig(c: &[u8]) -> &[u8] {
     if c.len() > 3 && c[..3].eq_ignore_ascii_case(b"chr") { &c[3..] } else { c }
 }
 
+/// FNV-1a hash of a (chr-prefix-normalized) contig name, for alloc-free site keys.
+#[inline]
+fn contig_hash(c: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in c { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+    h
+}
+
 /// Strip a trailing `\n` or `\r\n` from a line read via `read_until(b'\n', ...)`.
 #[inline]
 fn strip_line_endings(line: &[u8]) -> &[u8] {
@@ -1070,6 +1078,149 @@ pub fn evaluate(
     evaluate_parallel(imputed_path, truth_path, shared_samples, n_threads)
 }
 
+/// FNV-1a hash of REF+ALT bytes (for an alloc-free site key).
+#[inline]
+fn refalt_hash(r: &[u8], a: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in r { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+    h ^= b'/' as u64; h = h.wrapping_mul(0x100000001b3);
+    for &b in a { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+    h
+}
+#[inline]
+fn site_key(c: &[u8], pos: i64, r: &[u8], a: &[u8]) -> (u64, i64, u64) {
+    (contig_hash(norm_contig(c)), pos, refalt_hash(r, a))
+}
+
+/// Reindex `shared` sample names to their column positions in `path`'s header.
+fn shared_reindex(path: &Path, shared: &[String]) -> io::Result<Vec<usize>> {
+    let (_, names) = VariantReader::open(path)?;
+    let m: std::collections::HashMap<&str, usize> =
+        names.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+    Ok(shared.iter().map(|s| *m.get(s.as_str()).expect("shared sample missing from file")).collect())
+}
+
+/// Load a variant-only VCF/BCF into a (contig,pos,ref/alt)→per-shared-sample-dosage map.
+fn load_dosage_map(path: &Path, shared: &[String])
+    -> io::Result<std::collections::HashMap<(u64, i64, u64), Vec<f32>>> {
+    let ri = shared_reindex(path, shared)?;
+    let (mut r, _) = VariantReader::open(path)?;
+    r.set_sample_filter(ri);
+    let mut buf: Vec<f32> = Vec::new();
+    let mut map = std::collections::HashMap::new();
+    while let Some(rec) = r.next_record(&mut buf) {
+        map.insert(site_key(&rec.0, rec.1, &rec.2, &rec.3), buf.clone());
+    }
+    Ok(map)
+}
+
+/// Returns true if the truth VCF/BCF contains an EXPLICIT homozygous-reference call
+/// (GT 0/0 or 0|0) in its first `sample_limit` data records — i.e. it is a COMPLETE
+/// callset rather than variant-only. Used to auto-decide `--homref-absent`: a complete
+/// truth needs no absent→hom-ref (evaluate matched sites only, the legacy behaviour);
+/// a variant-only truth does. Reads the raw GT (not the folded dosage, which can't tell
+/// 0/0 from ./.). VCF.gz: text scan. BCF: parse GT via the BCF reader.
+pub fn truth_has_ref_calls(path: &Path) -> io::Result<bool> {
+    let s = path.to_string_lossy();
+    let is_bcf = s.ends_with(".bcf") || s.ends_with(".bcf.gz");
+    let mut seen = 0usize;
+    if !is_bcf {
+        let f = std::fs::File::open(path)?;
+        let bgzf = noodles_bgzf::io::Reader::new(BufReader::new(f));
+        let reader = BufReader::new(bgzf);
+        for line in reader.lines() {
+            let line = line?;
+            if line.starts_with('#') { continue; }
+            // scan sample columns for an explicit ref genotype
+            if line.contains("\t0/0") || line.contains("\t0|0")
+                || line.contains(":0/0") || line.contains(":0|0")
+                || line.contains("0/0:") || line.contains("0|0:")
+                || line.ends_with("0/0") || line.ends_with("0|0") {
+                return Ok(true);
+            }
+            seen += 1;
+            if seen >= 4000 { break; }
+        }
+        return Ok(false);
+    }
+    // BCF: the dosage decode folds 0/0 and ./. to the same value, and a het's ref
+    // allele is also an explicit ref byte, so distinguishing a complete callset from
+    // a variant-only one needs the raw per-sample GT — not exposed cheaply here. A BCF
+    // truth is therefore assumed COMPLETE (the safe legacy matched-only path); pass
+    // `--homref-absent on` for the rare variant-only BCF truth. (Variant-only truths
+    // are almost always VCF.gz, handled exactly above.)
+    Ok(true)
+}
+
+/// Standard imputation-R² evaluation (the field convention; reproduces the benchmark
+/// `06_eval.py`). For every imputed site:
+///   * if it is in `exclude` (e.g. the chip/typed sites) → drop the site entirely;
+///   * per shared sample `s`:
+///       - if `s` carries the variant in the STRONG truth (dosage ≥ 0.5) → truth = strong dosage;
+///       - else if `s` carries it in the RAW (called-but-quality-filtered) truth → skip `s` here;
+///       - else → truth = 0 (absent-from-truth ⇒ hom-ref).
+/// Splits SNP vs indel and also accumulates the combined total. Truth/raw/exclude are
+/// loaded as (norm-contig,pos,ref/alt-hash) maps (cheap per-chromosome; streams the imputed file).
+pub fn evaluate_imputation(
+    imputed_path: &Path,
+    strong_path: &Path,
+    shared: &[String],
+    raw_path: Option<&Path>,
+    exclude_path: Option<&Path>,
+) -> io::Result<(SampleAccumulator, SampleAccumulator, SampleAccumulator, EvalCounts)> {
+    let n = shared.len();
+    let strong = load_dosage_map(strong_path, shared)?;
+    let raw = match raw_path { Some(p) => Some(load_dosage_map(p, shared)?), None => None };
+    let exclude: std::collections::HashSet<(u64, i64, u64)> = match exclude_path {
+        Some(p) => {
+            let (mut r, _) = VariantReader::open(p)?;
+            let mut b: Vec<f32> = Vec::new();
+            let mut set = std::collections::HashSet::new();
+            while let Some(rec) = r.next_record(&mut b) { set.insert(site_key(&rec.0, rec.1, &rec.2, &rec.3)); }
+            set
+        }
+        None => std::collections::HashSet::new(),
+    };
+
+    let iri = shared_reindex(imputed_path, shared)?;
+    let (mut imp, _) = VariantReader::open(imputed_path)?;
+    imp.set_sample_filter(iri);
+
+    let mut comb = SampleAccumulator::new(n);
+    let mut snp = SampleAccumulator::new(n);
+    let mut indel = SampleAccumulator::new(n);
+    let mut counts = EvalCounts {
+        n_matched: 0,
+        n_imp_variants: 0,
+        n_truth_variants: strong.len() as u64,
+        chromosomes: vec![],
+    };
+    let mut ibuf: Vec<f32> = Vec::new();
+    let mut truth_ds = vec![0f32; n];
+    while let Some(rec) = imp.next_record(&mut ibuf) {
+        counts.n_imp_variants += 1;
+        let key = site_key(&rec.0, rec.1, &rec.2, &rec.3);
+        if exclude.contains(&key) { continue; }
+        let is_snp = rec.2.len() == 1 && rec.3.len() == 1;
+        let sv = strong.get(&key);
+        let rv = raw.as_ref().and_then(|m| m.get(&key));
+        for s in 0..n {
+            if let Some(v) = sv {
+                if v[s] >= 0.5 { truth_ds[s] = v[s]; continue; }
+            }
+            if rv.map(|v| v[s] >= 0.5).unwrap_or(false) {
+                truth_ds[s] = -1.0; // raw-but-not-strong: quality-filtered ⇒ skip this sample here
+            } else {
+                truth_ds[s] = 0.0; // absent from truth ⇒ hom-ref
+            }
+        }
+        comb.add_variant(&ibuf, &truth_ds);
+        if is_snp { snp.add_variant(&ibuf, &truth_ds); } else { indel.add_variant(&ibuf, &truth_ds); }
+        counts.n_matched += 1;
+    }
+    Ok((comb, snp, indel, counts))
+}
+
 /// Print MAF-binned summary table.
 pub fn print_summary(site_acc: &SiteAccumulator, sample_acc: &SampleAccumulator, counts: &EvalCounts) {
     let n_matched = counts.n_matched;
@@ -1123,6 +1274,70 @@ pub fn print_summary(site_acc: &SiteAccumulator, sample_acc: &SampleAccumulator,
         crate::selphi_info!("  [WARN] 0 variants matched despite non-empty inputs — imputed and truth \
 likely cover different chromosomes (check that both span the same contig set; chr-prefix is handled).");
     }
+}
+
+/// Mean per-sample R² over an accumulator (the imputation-R² headline).
+fn mean_sample_r2(acc: &SampleAccumulator) -> (f64, usize) {
+    let r2 = acc.compute_r2();
+    let used: Vec<f64> = (0..acc.n_samples).filter(|&s| acc.n_total[s] >= 2).map(|s| r2[s]).collect();
+    if used.is_empty() { (0.0, 0) } else { (used.iter().sum::<f64>() / used.len() as f64, used.len()) }
+}
+
+/// Print the standard imputation-R² summary (combined always; SNP/indel when `by_type`).
+pub fn print_imputation_summary(
+    comb: &SampleAccumulator, snp: &SampleAccumulator, indel: &SampleAccumulator,
+    by_type: bool, counts: &EvalCounts, n_excluded: u64,
+) {
+    crate::selphi_info!("\n{}", crate::log::bold(&format!("{:<14} {:>14} {:>12}", "Type", "N sites", "Mean R²")));
+    crate::selphi_info!("{}", "-".repeat(42));
+    if by_type {
+        let (rs, _) = mean_sample_r2(snp);
+        let (ri, _) = mean_sample_r2(indel);
+        crate::selphi_info!("{:<14} {:>14} {:>12.4}", "SNP", snp.n_variants, rs);
+        crate::selphi_info!("{:<14} {:>14} {:>12.4}", "indel", indel.n_variants, ri);
+        crate::selphi_info!("{}", "-".repeat(42));
+    }
+    let (rc, nc) = mean_sample_r2(comb);
+    crate::selphi_info!("{} {:>14} {}", crate::log::bold(&format!("{:<14}", "COMBINED")),
+        comb.n_variants, crate::log::cyan(&format!("{:>12.4}", rc)));
+    crate::selphi_info!("\nPer-sample (n={}): combined mean R² = {}",
+        nc, crate::log::cyan(&format!("{:.6}", rc)));
+    crate::selphi_info!("  Imputed:  {} sites", counts.n_imp_variants);
+    crate::selphi_info!("  Truth:    {} sites (strong)", counts.n_truth_variants);
+    crate::selphi_info!("  Scored:   {} sites  ({} excluded)", counts.n_matched, n_excluded);
+}
+
+/// Write the imputation-R² summary to JSON.
+pub fn write_imputation_json(
+    path: &Path, comb: &SampleAccumulator, snp: &SampleAccumulator, indel: &SampleAccumulator,
+    by_type: bool, counts: &EvalCounts, sample_names: Option<&[String]>,
+) -> io::Result<()> {
+    use std::io::Write;
+    let round6 = |x: f64| (x * 1e6).round() / 1e6;
+    let mut map = serde_json::Map::new();
+    let (rc, nc) = mean_sample_r2(comb);
+    map.insert("combined_mean_r2".into(), serde_json::json!(round6(rc)));
+    map.insert("n_samples".into(), serde_json::json!(nc));
+    map.insert("n_sites_scored".into(), serde_json::json!(counts.n_matched));
+    map.insert("n_imputed_sites".into(), serde_json::json!(counts.n_imp_variants));
+    map.insert("n_truth_strong_sites".into(), serde_json::json!(counts.n_truth_variants));
+    if by_type {
+        let (rs, _) = mean_sample_r2(snp);
+        let (ri, _) = mean_sample_r2(indel);
+        map.insert("snp_mean_r2".into(), serde_json::json!(round6(rs)));
+        map.insert("snp_n_sites".into(), serde_json::json!(snp.n_variants));
+        map.insert("indel_mean_r2".into(), serde_json::json!(round6(ri)));
+        map.insert("indel_n_sites".into(), serde_json::json!(indel.n_variants));
+    }
+    if let Some(names) = sample_names {
+        let r2 = comb.compute_r2();
+        let per: serde_json::Map<String, serde_json::Value> = names.iter().enumerate()
+            .map(|(i, nm)| (nm.clone(), serde_json::json!(round6(r2[i])))).collect();
+        map.insert("per_sample_combined_r2".into(), serde_json::Value::Object(per));
+    }
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(serde_json::to_string_pretty(&serde_json::Value::Object(map))?.as_bytes())?;
+    Ok(())
 }
 
 /// Write JSON summary to file.
