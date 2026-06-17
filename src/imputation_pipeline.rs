@@ -785,66 +785,35 @@ struct ImpScaffold {
     hap_priors: Vec<Option<Vec<f64>>>,
 }
 
-/// Average one CSR weight matrix across ensemble members. Every member shares
-/// the same shape (`n_rows` = chip intervals in the window, `n_cols` = panel
-/// haplotypes) but selects different panel columns per row. The averaged row is
-/// the union of columns with summed weights divided by the member count.
-///
-/// Interpolation is linear in these weights (dosage = Σ w·panel_allele), so the
-/// averaged weights yield exactly the mean imputed dosage over the members —
-/// i.e. marginalizing phase uncertainty in dosage space.
-fn average_csr(members: &[&selphi::imputation::hmm::CsrWeights]) -> selphi::imputation::hmm::CsrWeights {
+/// Sum CSR `b` into `a` (column union, per-row left-fold f32 in member order),
+/// WITHOUT the 1/n divide. The phase-ensemble accumulates members one at a time
+/// (peak holds 2 weight-sets, not N) then divides once at the end. Interpolation
+/// is linear in these weights (dosage = Σ w·panel_allele), so the averaged weights
+/// yield exactly the mean imputed dosage over the members — marginalizing phase
+/// uncertainty in dosage space. The per-row f32 left-fold `((m0+m1)+m2)…` and the
+/// single final ×(1/n) make this byte-identical to a one-shot batch average.
+fn sum_csr_into(a: &selphi::imputation::hmm::CsrWeights, b: &selphi::imputation::hmm::CsrWeights)
+    -> selphi::imputation::hmm::CsrWeights {
     use std::collections::HashMap;
-    let n = members.len();
-    let n_rows = members[0].n_rows;
-    let n_cols = members[0].n_cols;
-    let inv = 1.0f32 / n as f32;
+    let n_rows = a.n_rows;
+    let n_cols = a.n_cols;
     let mut indptr = Vec::with_capacity(n_rows + 1);
+    indptr.push(0i32);
     let mut indices: Vec<i32> = Vec::new();
     let mut data: Vec<f32> = Vec::new();
-    indptr.push(0i32);
     let mut acc: HashMap<i32, f32> = HashMap::new();
     for r in 0..n_rows {
         acc.clear();
-        for m in members {
-            let s = m.indptr[r] as usize;
-            let e = m.indptr[r + 1] as usize;
-            for k in s..e {
-                *acc.entry(m.indices[k]).or_insert(0.0) += m.data[k];
-            }
-        }
-        let mut row: Vec<(i32, f32)> = acc.iter().map(|(&c, &v)| (c, v * inv)).collect();
+        let (sa, ea) = (a.indptr[r] as usize, a.indptr[r + 1] as usize);
+        for k in sa..ea { *acc.entry(a.indices[k]).or_insert(0.0) += a.data[k]; }
+        let (sb, eb) = (b.indptr[r] as usize, b.indptr[r + 1] as usize);
+        for k in sb..eb { *acc.entry(b.indices[k]).or_insert(0.0) += b.data[k]; }
+        let mut row: Vec<(i32, f32)> = acc.iter().map(|(&c, &v)| (c, v)).collect();
         row.sort_unstable_by_key(|&(c, _)| c);
-        for (c, v) in row {
-            indices.push(c);
-            data.push(v);
-        }
+        for (c, v) in row { indices.push(c); data.push(v); }
         indptr.push(indices.len() as i32);
     }
     selphi::imputation::hmm::CsrWeights { indptr, indices, data, n_rows, n_cols }
-}
-
-/// Average the full per-hap `all_weights` of a window across ensemble members.
-/// Each member's `all_weights[h]` is `[(idx, csr)]` (one interval per hap); the
-/// `idx` is identical across members (the target index), so we keep member 0's
-/// `idx` and average the CSRs.
-fn average_all_weights(
-    members: &[&Vec<Vec<(usize, selphi::imputation::hmm::CsrWeights)>>],
-) -> Vec<Vec<(usize, selphi::imputation::hmm::CsrWeights)>> {
-    let n_haps = members[0].len();
-    (0..n_haps)
-        .map(|h| {
-            let n_entries = members[0][h].len();
-            (0..n_entries)
-                .map(|e| {
-                    let idx = members[0][h][e].0;
-                    let csrs: Vec<&selphi::imputation::hmm::CsrWeights> =
-                        members.iter().map(|m| &m[h][e].1).collect();
-                    (idx, average_csr(&csrs))
-                })
-                .collect()
-        })
-        .collect()
 }
 
 /// Run single-chromosome imputation (or phase-only) end-to-end.
@@ -1457,8 +1426,13 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         // produce the exact mean imputed dosage over all members — the panel is
         // read and interpolated only ONCE. (Excluded under batched streaming.)
         if !extra_scaffolds.is_empty() {
-            let mut per_member: Vec<Vec<Vec<(usize, selphi::imputation::hmm::CsrWeights)>>> =
-                Vec::with_capacity(extra_scaffolds.len());
+            // Accumulate each extra member's window weights into `all_weights` ONE AT A
+            // TIME (sum, then divide once at the end), instead of holding all N members'
+            // weight-sets and batch-averaging. Peak now holds 2 weight-sets (the running
+            // sum + the current member) rather than N. Byte-identical to the old batch
+            // average: same member-order f32 left-fold and one final ×(1/n). `all_weights`
+            // starts as member 0's weights (count=1).
+            let mut count = 1usize;
             for sc in extra_scaffolds.iter_mut() {
                 let inputs_m = selphi::imputation::window_process::ImputeWindowInputs {
                     ref_bm: &ref_bm_imp,
@@ -1474,13 +1448,21 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                 let out_m = selphi::imputation::window_process::impute_window(
                     &inputs_m, &hmm_params, cand, &mut sc.hap_priors, None,
                 );
-                per_member.push(out_m.all_weights);
+                for h in 0..all_weights.len() {
+                    let mh = &out_m.all_weights[h];
+                    for (e, (_, csr)) in all_weights[h].iter_mut().enumerate() {
+                        *csr = sum_csr_into(csr, &mh[e].1);
+                    }
+                }
+                count += 1;
+                // out_m dropped here → only the running sum + one member ever resident.
             }
-            let mut refs: Vec<&Vec<Vec<(usize, selphi::imputation::hmm::CsrWeights)>>> =
-                Vec::with_capacity(per_member.len() + 1);
-            refs.push(&all_weights);
-            for m in &per_member { refs.push(m); }
-            all_weights = average_all_weights(&refs);
+            let inv = 1.0f32 / count as f32;
+            for hw in all_weights.iter_mut() {
+                for (_, csr) in hw.iter_mut() {
+                    for v in csr.data.iter_mut() { *v *= inv; }
+                }
+            }
         }
 
         let hmm_secs = t0_hmm.elapsed().as_secs_f64();
