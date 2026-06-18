@@ -238,11 +238,41 @@ fn _diploid_run(
         n_var, n_samples, n_ref, 1, 15000.0, common_indices,
     );
 
+    // No-call scaffold fill: original missing genotypes (the 128 sentinel from the
+    // phasing extract path) leave the diploid scaffold at REF (common-missing → graph
+    // returns 0/0; rare-missing → residual sentinel). Clamping those to REF biases the
+    // downstream imputer's PBWT candidate selection (it conditions on a REF scaffold at
+    // exactly the sites we most need to impute). Instead fill each no-call (variant, hap)
+    // with a local copying consensus — the majority allele over the K nearest backward-PBWT
+    // neighbours among the target phased haps + the full-chip reference panel. This mirrors
+    // the haploid no-call vote so both engines feed the imputer a real local-haplotype
+    // scaffold at no-calls. Default-on; opt out with SELPHI_DIPLOID_NOCALL_REF=1 (revert to
+    // clamp-REF). No-op (byte-identical) when there is no missing genotype.
+    if !crate::config::is_one("SELPHI_DIPLOID_NOCALL_REF") {
+        // No-call mask from the ORIGINAL target genotypes (the scaffold has already been
+        // partly overwritten to REF, so it can't be trusted to flag the no-calls).
+        let mut nocall = vec![false; n_var * n_haps];
+        let mut any = false;
+        for v in 0..n_var {
+            for h in 0..n_haps {
+                if target_geno[v * n_haps + h] > 1 {
+                    nocall[v * n_haps + h] = true;
+                    any = true;
+                }
+            }
+        }
+        if any {
+            let k = crate::config::usize_or("SELPHI_HAPLOID_NOCALL_K", 50);
+            fill_missing_local_vote(&mut phased, n_var, n_haps, full_chip_ref_bm, n_ref, &nocall, k);
+        }
+    }
+
     // Safety clamp: missing genotypes enter as the 128 sentinel so the genotype graph
     // marks them missing (set_missing → run_mis imputes the COMMON sites; the imputed 0/1
     // overwrites them above). Any residual sentinel (e.g. a rare missing site phase_rare
-    // did not impute) is clamped to 0 so the downstream imputation never sees 128 — no worse
-    // than the old missing→REF behavior for that residual. No-op when there is no missing.
+    // did not impute, or a no-call the fill above left untouched) is clamped to 0 so the
+    // downstream imputation never sees 128 — no worse than the old missing→REF behavior for
+    // that residual. No-op when there is no missing.
     for g in phased.iter_mut() { if *g > 1 { *g = 0; } }
 
     // EM-estimated Ne not returned as window_ri for now (diploid uses different HMM structure)
@@ -251,4 +281,76 @@ fn _diploid_run(
     crate::selphi_info!("  Phasing complete");
 
     (phased, window_ri)
+}
+
+/// Fill no-call sites in the diploid phased scaffold with a local copying
+/// consensus instead of leaving them at REF. For each missing (variant, target
+/// hap), vote the majority allele over the `k` nearest neighbours in a backward
+/// PBWT built over the target phased haplotypes plus the full-chip reference
+/// panel. Sweeps markers right-to-left so the PBWT prefix at marker `m` is
+/// sorted by the suffix `(m+1..]` — the standard reverse-PBWT match context.
+/// Mirrors the haploid no-call vote (`phase_subwindow`) so both engines hand the
+/// imputer a real local-haplotype scaffold at no-calls.
+///
+/// `phased` is `n_var * n_targ` (row-major, target haps only). Missing neighbours
+/// (other not-yet-voted no-calls) carry allele `-1` and are skipped in the tally.
+fn fill_missing_local_vote(
+    phased: &mut [u8],
+    n_var: usize,
+    n_targ: usize,
+    ref_bm: Option<&pbwt_neighbor::HaplotypeBitmatrix>,
+    n_ref: usize,
+    nocall: &[bool],
+    k: usize,
+) {
+    let n_haps = n_targ + n_ref;
+    if n_haps == 0 { return; }
+    let mut a: Vec<i32> = (0..n_haps as i32).collect();
+    let mut alleles = vec![0i32; n_haps]; // allele per ORIGINAL hap index at the current marker
+    let mut inv = vec![0i32; n_haps];     // hap index -> position in `a`
+    let mut have_prev = false;
+
+    for step in 0..n_var {
+        let m = n_var - 1 - step;
+        // Advance the prefix using the PREVIOUS marker's alleles (the suffix m+1..),
+        // so `a` is now sorted by the suffix to the right of m.
+        if have_prev {
+            crate::haploid::pbwt::pbwt_update_prefix(&mut a, &alleles, n_haps);
+        }
+        // Lay down this marker's alleles: target haps (no-call -> -1), then ref haps.
+        for h in 0..n_targ {
+            alleles[h] = if nocall[m * n_targ + h] { -1 } else { phased[m * n_targ + h] as i32 };
+        }
+        if let Some(rb) = ref_bm {
+            for r in 0..n_ref {
+                alleles[n_targ + r] = rb.get(m, r) as i32;
+            }
+        }
+        // Vote at this marker's no-calls (if any), using the suffix-sorted prefix.
+        let mut has_missing = false;
+        for h in 0..n_targ { if nocall[m * n_targ + h] { has_missing = true; break; } }
+        if has_missing {
+            for (pos, &hp) in a.iter().enumerate() { inv[hp as usize] = pos as i32; }
+            for h in 0..n_targ {
+                if !nocall[m * n_targ + h] { continue; }
+                let p = inv[h];
+                let (mut n0, mut n1) = (0i32, 0i32);
+                let mut off = 1i32;
+                let nh = n_haps as i32;
+                while (n0 + n1) < k as i32 && off < nh {
+                    for q in [p - off, p + off] {
+                        if q >= 0 && q < nh {
+                            let v = alleles[a[q as usize] as usize];
+                            if v == 0 { n0 += 1; } else if v > 0 { n1 += 1; }
+                        }
+                    }
+                    off += 1;
+                }
+                let bit = if n1 > n0 { 1u8 } else { 0u8 };
+                phased[m * n_targ + h] = bit;
+                alleles[h] = bit as i32; // use the voted value for the next prefix update
+            }
+        }
+        have_prev = true;
+    }
 }
