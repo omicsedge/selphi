@@ -97,6 +97,9 @@ This is the candidate-set-size (`mc`) sweep behind the biobank claim.
 
 6 GIAB samples (HG002–007), production panel v3 (37 776 samples / 75 552 haps),
 leak-free. EC2 r7a.4xlarge, 16 threads. Reference: Beagle 5 (03Oct25); old Selphi 1.5.3.
+This is the GIAB overlay validation set (no array no-calls), distinct from the
+consumer-array GSA benchmark in the main paper (Table 3); the missing-genotype
+phasing fix does not affect these rows.
 
 | Chr | Mode | Metric | Selphi 2 | Beagle 5 | Winner | Status |
 |---|---|---|---:|---:|---|---|
