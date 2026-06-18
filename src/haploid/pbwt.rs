@@ -665,6 +665,16 @@ fn phase_subwindow(
     let n_haps = n_ref + n_targ_haps;
     let win_size = win_end - win_start;
 
+    // No-call imputation in the init PBWT phaser. Beagle-faithful default = a random
+    // draw weighted by the GLOBAL allele CDF (RevPbwtPhaser.imputeAllele). The gated
+    // path replaces it with a LOCAL copying impute: a majority vote over the K nearest
+    // PBWT neighbours (the haps adjacent to the target in the divergence-sorted prefix
+    // array), i.e. the local copying consensus — closer to what Beagle's PhaseBaum HMM
+    // recovers for missing sites. Only fires when a target genotype is actually missing,
+    // so it is a no-op (byte-identical) on no-missing input (e.g. curated WGS / 1KG).
+    let nocall_local = crate::config::is_one("SELPHI_HAPLOID_NOCALL_LOCAL");
+    let nocall_k: usize = crate::config::usize_or("SELPHI_HAPLOID_NOCALL_K", 50).max(1);
+
     // Missing target genotypes are encoded `>=128` in target_geno (the haploid+phasing path:
     // imputation_pipeline emits 128 only there). Decode to -1 so the PBWT initial phaser
     // IMPUTES missing (Beagle-faithful) instead of conditioning on a phantom positive allele
@@ -714,6 +724,15 @@ fn phase_subwindow(
             }
             // RevPbwtPhaser.finishPhasing: randomly resolve remaining hets, impute missing
             if m >= overlap {
+                // LOCAL no-call impute: build the inverse prefix (hap → PBWT position)
+                // once per marker, but only when (a) the gated path is on AND (b) some
+                // target hap is actually missing here. Off-path / no-missing → not built.
+                let inv: Option<Vec<i32>> = if nocall_local
+                    && (0..n_targ_haps).any(|h| bwd_alleles[h] < 0) {
+                    let mut iv = vec![0i32; n_haps];
+                    for (pos, &hp) in bwd_a.iter().enumerate() { iv[hp as usize] = pos as i32; }
+                    Some(iv)
+                } else { None };
                 for s in 0..n_samples {
                     let h1 = s * 2;
                     let h2 = h1 + 1;
@@ -723,21 +742,37 @@ fn phase_subwindow(
                         }
                         bwd_unph_het[s] = false;
                     } else {
-                        // Impute missing using allele CDF 
                         for &hh in &[h1, h2] {
                             if bwd_alleles[hh] < 0 {
-                                // Use allele CDF from current PBWT neighbors
-                                let mut n0 = 0i32; let mut n1 = 0i32;
-                                for i in 0..n_haps {
-                                    let v = bwd_alleles[bwd_a[i] as usize];
-                                    if v == 0 { n0 += 1; } else if v > 0 { n1 += 1; }
-                                }
-                                // imputeAllele: random weighted by CDF
-                                if n0 + n1 > 0 {
-                                    let r = bwd_rng.next_int(n0 + n1);
-                                    bwd_alleles[hh] = if r < n0 { 0 } else { 1 };
+                                if let Some(ref iv) = inv {
+                                    // Local copying consensus: majority over the K nearest
+                                    // PBWT neighbours (expand outward, skipping missing).
+                                    let p = iv[hh as usize];
+                                    let (mut n0, mut n1) = (0i32, 0i32);
+                                    let mut off = 1i32;
+                                    while (n0 + n1) < nocall_k as i32 && off < n_haps as i32 {
+                                        for q in [p - off, p + off] {
+                                            if q >= 0 && (q as usize) < n_haps {
+                                                let v = bwd_alleles[bwd_a[q as usize] as usize];
+                                                if v == 0 { n0 += 1; } else if v > 0 { n1 += 1; }
+                                            }
+                                        }
+                                        off += 1;
+                                    }
+                                    bwd_alleles[hh] = if n1 > n0 { 1 } else { 0 };
                                 } else {
-                                    bwd_alleles[hh] = bwd_rng.next_int(2);
+                                    // Beagle-faithful default: random weighted by GLOBAL allele CDF.
+                                    let mut n0 = 0i32; let mut n1 = 0i32;
+                                    for i in 0..n_haps {
+                                        let v = bwd_alleles[bwd_a[i] as usize];
+                                        if v == 0 { n0 += 1; } else if v > 0 { n1 += 1; }
+                                    }
+                                    if n0 + n1 > 0 {
+                                        let r = bwd_rng.next_int(n0 + n1);
+                                        bwd_alleles[hh] = if r < n0 { 0 } else { 1 };
+                                    } else {
+                                        bwd_alleles[hh] = bwd_rng.next_int(2);
+                                    }
                                 }
                             }
                         }
