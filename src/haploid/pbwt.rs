@@ -577,7 +577,7 @@ fn pbwt_rec_phase_marker(a: &[i32], n_haps: usize, n_targ_samples: usize,
 
 /// PBWT prefix-only update (matches PbwtUpdater.update for biallelic markers).
 /// Only updates the prefix array a[], no divergence tracking.
-fn pbwt_update_prefix(a: &mut [i32], alleles: &[i32], n_haps: usize) {
+pub(crate) fn pbwt_update_prefix(a: &mut [i32], alleles: &[i32], n_haps: usize) {
     // Stable partition: 0-alleles first, then 1-alleles, preserving order within each group
     // We need a temporary buffer to avoid overwriting a[] while reading it
     let mut buf = vec![0i32; n_haps];
