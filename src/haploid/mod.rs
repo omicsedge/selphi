@@ -268,14 +268,13 @@ fn phase_genotypes_inner(
             let ip = global_init_phased[ws * n_targ_haps..we * n_targ_haps].to_vec();
             let mut res = vec![0u8; w_size * n_samples];
             for s in 0..n_samples {
-                let mut found = false;
                 for m in 0..w_size {
                     let gm = ws + m;
                     let a1 = target_geno[gm * n_samples * 2 + s * 2];
                     let a2 = target_geno[gm * n_samples * 2 + s * 2 + 1];
                     if a1 != a2 && a1 < 128 && a2 < 128 {
-                        if m < overlap { res[m * n_samples + s] = 1; }
-                        else if !found { res[m * n_samples + s] = 1; found = true; break; }
+                        res[m * n_samples + s] = 1;
+                        if m >= overlap { break; }
                     }
                 }
             }
