@@ -906,7 +906,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // MEMORY: the per-sample matrix is dense [n_chip × n_samples] f64. Fine for
     // refine cohorts (chip-density n_chip, modest n_samples); for very large
     // multi-sample refine runs this is n_chip*n_samples*8 bytes.
-    let (target_site_conf, target_site_conf_per_sample): (Option<Vec<f64>>, Option<Vec<f64>>) = if args.refine {
+    let (refine_site_conf, refine_site_conf_per_sample): (Option<Vec<f64>>, Option<Vec<f64>>) = if args.refine {
         let marker_conf = extract_target_site_confidence(target_path);
         let mut aligned = align_confidence_to_chip(&marker_conf, &target_idx, n_chip);
         let (marker_conf_ps, ps_n) = extract_target_site_confidence_per_sample(target_path);
@@ -938,6 +938,48 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         (aligned, aligned_ps)
     } else {
         (None, None)
+    };
+
+    // No-call re-route (default ON; opt out SELPHI_NO_NOCALL_REROUTE=1): a MISSING target genotype
+    // has zero genotype confidence, so it is re-routed to the LS-imputed dosage instead of the
+    // scaffold value — which the diploid clamps to REF and the haploid fills with a neighbour vote
+    // (≈70% of missing carriers were emitted as hom-REF). Derived directly from the GT_MISSING
+    // sentinel in target_genotypes (independent of --refine and of GQ/PL/DP, which the
+    // per-site confidence does not detect for a GT-only chip). Byte-identical when there are no
+    // no-calls: the confidence stays all-1.0 → None → the merge is a no-op.
+    let (target_site_conf, target_site_conf_per_sample): (Option<Vec<f64>>, Option<Vec<f64>>) = {
+        let (nc_site, nc_ps): (Option<Vec<f64>>, Option<Vec<f64>>) =
+            if !selphi::config::is_one("SELPHI_NO_NOCALL_REROUTE") {
+                let mut ps = vec![1.0f64; n_chip * n_samples];
+                let mut site = vec![1.0f64; n_chip];
+                let mut any = false;
+                for c in 0..n_chip {
+                    let gv = &target_genotypes[target_idx[c]];
+                    for s in 0..n_samples {
+                        if gv[s][0] >= selphi::io::target_io::GT_MISSING
+                            || gv[s][1] >= selphi::io::target_io::GT_MISSING {
+                            ps[c * n_samples + s] = 0.0;
+                            site[c] = 0.0;
+                            any = true;
+                        }
+                    }
+                }
+                if any {
+                    let nmiss = ps.iter().filter(|&&x| x == 0.0).count();
+                    selphi_step!("No-call re-route: {} (chip-site,sample) no-call genotype(s) → imputed dosage", nmiss);
+                    (Some(site), Some(ps))
+                } else { (None, None) }
+            } else { (None, None) };
+        // Element-wise min merge with the refine confidence (None acts as fully confident).
+        let mm = |a: Option<Vec<f64>>, b: Option<Vec<f64>>| -> Option<Vec<f64>> {
+            match (a, b) {
+                (Some(mut x), Some(y)) => { for i in 0..x.len().min(y.len()) { x[i] = x[i].min(y[i]); } Some(x) }
+                (Some(x), None) => Some(x),
+                (None, Some(y)) => Some(y),
+                (None, None) => None,
+            }
+        };
+        (mm(refine_site_conf, nc_site), mm(refine_site_conf_per_sample, nc_ps))
     };
     // R3 re-route threshold: chip sites with confidence < thr are emitted as the
     // HMM/panel-derived (imputed) dosage instead of verbatim hard calls. From
