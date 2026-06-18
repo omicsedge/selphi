@@ -923,13 +923,12 @@ pub fn initial_phase_pbwt(target_geno: &[u8], ref_alleles: &[u8],
         // resolved = first non-overlap het per sample (same convention as the PBWT path)
         let mut resolved = vec![0u8; n_var * n_samples];
         for s in 0..n_samples {
-            let mut found = false;
             for m in 0..n_var {
                 let a1 = target_geno[m * n_samples * 2 + s * 2];
                 let a2 = target_geno[m * n_samples * 2 + s * 2 + 1];
                 if a1 != a2 && a1 < 128 && a2 < 128 {
-                    if m < overlap { resolved[m * n_samples + s] = 1; }
-                    else if !found { resolved[m * n_samples + s] = 1; found = true; break; }
+                    resolved[m * n_samples + s] = 1;
+                    if m >= overlap { break; }
                 }
             }
         }
