@@ -30,6 +30,7 @@
   - [Full pipeline (phase + impute)](#full-pipeline-phase--impute)
   - [Phase-only](#phase-only)
   - [Allele reconciliation (--allele-match)](#allele-reconciliation---allele-match)
+  - [Missing genotypes](#missing-genotypes)
   - [Sex chromosomes](#sex-chromosomes)
   - [Panel phasing (de-novo, no reference)](#panel-phasing-de-novo-no-reference)
   - [Whole-genome imputation](#whole-genome-imputation)
@@ -131,6 +132,10 @@ selphi ... --allele-match full        # none | swap (default) | strand | full
 - `full`: swap + strand
 
 `strand`/`full` carry a small false-match risk on non-palindromic SNPs (a target variant absent from the panel can reverse-complement onto a different one), so they stay opt-in. Palindromic SNPs (A/T, C/G) are matched by exact equality only. Sites that already match exactly are never touched, so conforming input is bit-identical regardless of mode. The number of reconciled sites is reported in the log.
+
+### Missing genotypes
+
+No-call genotypes in the target (`./.`, common on genotyping arrays at ~1–2% of sites per sample) are carried through phasing as missing and imputed by the HMM, not set to the reference allele. Conditioning the phasing scaffold on a falsely homozygous-reference call degrades downstream imputation, so this matters on real array data; on a complete callset (e.g. curated WGS) there is nothing to impute and the behavior is unchanged.
 
 ### Sex chromosomes
 
@@ -298,7 +303,25 @@ selphi --refpanel reference.srp --input chip.vcf.gz --map genetic_map.map --out 
 
 # Standalone: evaluate an existing imputed file
 selphi --evaluate imputed.vcf.gz --truth wgs_truth.vcf.gz --out eval_results
+
+# Standard imputation-R² convention (reproduces the field-standard scoring): absent-from-truth
+# sites count as hom-ref, raw-but-quality-filtered calls are excluded (not scored as hom-ref),
+# the typed/chip sites are excluded, and the report is split SNP vs indel.
+selphi --evaluate imputed.vcf.gz --truth wgs_truth.strong.vcf.gz \
+       --truth-raw wgs_truth.raw.vcf.gz --exclude-sites chip_sites.vcf.gz \
+       --homref-absent on --by-type --out eval_results
 ```
+
+By default `--homref-absent auto` inspects the truth: a complete callset (explicit `0/0`) scores
+matched sites only (legacy), while a variant-only truth scores absent sites as hom-ref (the standard
+imputation-R² convention). Contig names are matched tolerant to the `chr` prefix (so `22` ≡ `chr22`),
+and only samples shared between the imputed and truth files are scored. `--truth-raw` takes the
+unfiltered truth: a site a sample carries in the raw call set but not in the quality-filtered `--truth`
+is dropped for that sample rather than mis-scored as hom-ref. `--exclude-sites` removes the typed
+(array) sites so only imputed variants are scored. In this mode sites are matched on exact
+`(contig, pos, REF, ALT)`, so the truth and imputed files must share allele representation
+(left-aligned, same REF/ALT orientation); for indels, give a truth normalized the same way as the
+panel (e.g. `bcftools norm`) so they are not silently missed.
 
 | Metric | Scope | Description |
 |---|---|---|
@@ -357,6 +380,10 @@ selphi --self-test --refpanel panel.srp --input target.vcf.gz --map chr.map --ou
 | **Accuracy evaluation** | | |
 | `--evaluate PATH` | Evaluate imputed VCF/BCF against truth (standalone mode) | |
 | `--truth PATH` | Truth VCF/BCF with WGS genotypes | |
+| `--homref-absent MODE` | Absent-from-truth handling: `auto`, `on` (absent→hom-ref, standard imputation-R²), `off` (matched sites only) | `auto` |
+| `--truth-raw PATH` | Unfiltered truth; a site carried in raw but not in `--truth` is dropped for that sample (not scored as hom-ref) | |
+| `--exclude-sites PATH` | VCF/BCF of sites to exclude from scoring (e.g. the typed/array sites) | |
+| `--by-type` | Also break the report into SNP vs indel (combined total always reported) | off |
 | **Indexing** | | |
 | `--index PATH` | Build TBI/CSI index for a VCF.gz or BCF file | |
 | `--index-stats PATH` | Show file statistics and per-contig genomic ranges | |
