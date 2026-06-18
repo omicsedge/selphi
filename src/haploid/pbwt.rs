@@ -672,7 +672,9 @@ fn phase_subwindow(
     // array), i.e. the local copying consensus — closer to what Beagle's PhaseBaum HMM
     // recovers for missing sites. Only fires when a target genotype is actually missing,
     // so it is a no-op (byte-identical) on no-missing input (e.g. curated WGS / 1KG).
-    let nocall_local = crate::config::is_one("SELPHI_HAPLOID_NOCALL_LOCAL");
+    // DEFAULT-ON: local copying consensus for no-call imputation. Opt out with
+    // SELPHI_HAPLOID_NOCALL_GLOBAL=1 to restore the Beagle-faithful global-CDF draw.
+    let nocall_local = !crate::config::is_one("SELPHI_HAPLOID_NOCALL_GLOBAL");
     let nocall_k: usize = crate::config::usize_or("SELPHI_HAPLOID_NOCALL_K", 50).max(1);
 
     // Missing target genotypes are encoded `>=128` in target_geno (the haploid+phasing path:
