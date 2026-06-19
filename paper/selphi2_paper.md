@@ -231,6 +231,18 @@ To isolate the contribution of the new sizing rule, we ran Selphi 2 on the same 
 
 The gain is monotonically larger at rarer MAF bins, confirming that the fixed cap in Selphi 1 was preferentially truncating rare-variant carriers. The panel-adaptive formula recovers this accuracy without manual tuning.
 
+To test whether this candidate-set truncation falls preferentially on minority ancestries, as the proposed mechanism predicts, we re-imputed the full 5,000-sample cohort twice (fixed mc = 2,500 and panel-adaptive mc = 132,676, identical in every other respect) and stratified the per-sample accuracy gain by self-reported ancestry (3,948 of 5,000 samples carry an ancestry label). On the full cohort the fixed cap yields per-sample mean R² 0.8890 and the adaptive formula 0.8980 (overall per-variant R² 0.5560 versus 0.6148, reproducing the Table 2 effect at full cohort size). The gain is largest for the populations most diverged from the European-majority panel: African-American samples gain +0.0157 in per-sample R² and Hispanic samples +0.0105, versus +0.0084 for European-ancestry (White) samples, a 1.9-fold and 1.3-fold larger gain respectively (Table 2b). East-Asian (Chinese-American) samples, a comparatively homogeneous group already well served by a small candidate set, show no gain (-0.0033). This pattern is consistent with the mechanism: a fixed candidate cap calibrated on a European-majority panel preferentially excludes the rare-allele-carrying haplotypes of the populations most diverged from the panel majority, and the panel-adaptive sizing recovers them.
+
+**Table 2b. Candidate-set gain by ancestry, MESA cohort.** Per-sample mean R² (over all chr20 variants) for the fixed (mc = 2,500) and panel-adaptive (mc = 132,676) candidate-set sizes, stratified by self-reported ancestry, on the full 5,000-sample MESA cohort imputed against the TOPMed panel. Both runs are identical except for the candidate-set size. n is the number of labelled samples in each group.
+
+| Ancestry (n) | Fixed mc = 2,500 | Adaptive mc = 132,676 | Gain |
+|---|---|---|---|
+| African-American (924) | 0.8779 | 0.8936 | +0.0157 |
+| Hispanic (859)         | 0.8870 | 0.8975 | +0.0105 |
+| White (1,631)          | 0.8942 | 0.9026 | +0.0084 |
+| Chinese-American (534) | 0.8958 | 0.8925 | -0.0033 |
+| All labelled (3,948)   | 0.8890 | 0.8980 | +0.0090 |
+
 ## **Independent validation against leak-free GIAB truth**
 
 The 1000 Genomes panel benchmarks share haplotypes with the held-out targets via descent, which can inflate measured accuracy. As an independent validation we used the Genome in a Bottle (GIAB) reference samples HG002–HG007, none of which are in the 1000 Genomes Project, as held-out targets against a 75,552-haplotype production reference panel that contains the full 1000 Genomes cohort. Truth genotypes were taken from the GIAB v4.2.1 high-confidence regions restricted to common variants (MAF 5–50%, n = 73,710 sites on chr21 after restriction; n = 409,392 on chr1).
