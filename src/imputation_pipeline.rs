@@ -1548,6 +1548,19 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
             // average: same member-order f32 left-fold and one final ×(1/n). `all_weights`
             // starts as member 0's weights (count=1).
             let mut count = 1usize;
+            // Memory-bounded streaming: process each extra member's window in hap
+            // batches and fold each batch's weights into the running sum (`all_weights`)
+            // immediately via impute_window's streaming callback, instead of
+            // materializing the member's full weight-set. Peak now holds the running
+            // sum + ONE hap-batch (≈STREAM_CHUNK haps) rather than a second full
+            // member — the dominant RAM cost of the ensemble at many samples. Output is
+            // bit-identical: per-target HMM weights are independent of batch size, and
+            // the sum_csr_into fold runs in the same hap order with the same final
+            // ×(1/count). Each window has a single weight block per hap (breaks_w is
+            // one block), so all_weights[h] has exactly one entry — index [0].
+            const STREAM_CHUNK: usize = 256;
+            let mut params_m = hmm_params.clone();
+            params_m.target_batch_size = STREAM_CHUNK;
             for sc in extra_scaffolds.iter_mut() {
                 let inputs_m = selphi::imputation::window_process::ImputeWindowInputs {
                     ref_bm: &ref_bm_imp,
@@ -1560,17 +1573,20 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                     chip_end: window.chip_end,
                 };
                 let cand = sc.candidates.as_ref();
-                let out_m = selphi::imputation::window_process::impute_window(
-                    &inputs_m, &hmm_params, cand, &mut sc.hap_priors, None,
-                );
-                for h in 0..all_weights.len() {
-                    let mh = &out_m.all_weights[h];
-                    for (e, (_, csr)) in all_weights[h].iter_mut().enumerate() {
-                        *csr = sum_csr_into(csr, &mh[e].1);
+                let mut accumulate = |bstart: usize, bend: usize,
+                                      refs: &[&selphi::imputation::hmm::CsrWeights]|
+                 -> std::io::Result<()> {
+                    for (j, h) in (bstart..bend).enumerate() {
+                        let csr = &mut all_weights[h][0].1;
+                        *csr = sum_csr_into(csr, refs[j]);
                     }
-                }
+                    Ok(())
+                };
+                let _ = selphi::imputation::window_process::impute_window(
+                    &inputs_m, &params_m, cand, &mut sc.hap_priors, Some(&mut accumulate),
+                );
                 count += 1;
-                // out_m dropped here → only the running sum + one member ever resident.
+                // Only the running sum + one hap-batch of the current member resident.
             }
             let inv = 1.0f32 / count as f32;
             for hw in all_weights.iter_mut() {

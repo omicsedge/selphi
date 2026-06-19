@@ -19,6 +19,7 @@ use super::pbwt;
 const FULL_PANEL_HMM_THRESHOLD: usize = 100;
 
 /// Parameters for per-window HMM processing.
+#[derive(Clone)]
 pub struct WindowHmmParams {
     pub n_ref: usize,
     pub n_haps: usize,
