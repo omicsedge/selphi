@@ -103,6 +103,10 @@ pub fn run_phase_common_bm(
     chip_bp: Option<&[i64]>,
     target_geno: &[u8],
     max_cond_haps: usize,
+    // When Some, each Main MCMC iteration's per-sample (h0,h1) common-variant
+    // haplotypes are captured here (outer = Main-iter index, inner = per target
+    // sample). Used by the intra-run phase ensemble (Route A). None = no capture.
+    main_samples: Option<&mut Vec<Vec<(Vec<u8>, Vec<u8>)>>>,
 ) {
     let n_haps = n_samples * 2;
     let n_haps_total = n_ref + n_haps;
@@ -381,7 +385,7 @@ pub fn run_phase_common_bm(
         &mut pbwt_idx, &mut ibd2, &cm_f64, &mut hmm_params, &allele_counts,
         &stages, &ordering, &mut o_iterator, &mut rng,
         n_var, n_samples, n_ref, n_haps_total, target_geno, chip_bp,
-        max_cond_haps,
+        max_cond_haps, main_samples,
     );
 
     crate::selphi_debug!("  [diploid] phase_common complete");
@@ -407,6 +411,7 @@ fn _run_iterations(
     _target_geno: &[u8],
     _chip_bp: Option<&[i64]>,
     max_cond_haps: usize,
+    mut main_samples: Option<&mut Vec<Vec<(Vec<u8>, Vec<u8>)>>>,
 ) {
     let _n_haps = n_samples * 2;
     let n_iterations = stages.len();
@@ -750,11 +755,21 @@ fn _run_iterations(
 
         // 3. Update bitmatrices directly from graph output (no byte array needed).
         // Reads from contiguous h0/h1 vecs (L2-friendly) instead of 4.8GB strided array.
+        // When capturing for the intra-run phase ensemble, snapshot each Main
+        // iteration's per-sample haplotypes (the sampled diplotype, before the
+        // final Viterbi solve) — these are free posterior phase samples.
+        let capturing = main_samples.is_some() && matches!(stage, Stage::Main);
+        let mut this_main: Vec<(Vec<u8>, Vec<u8>)> =
+            if capturing { Vec::with_capacity(n_samples) } else { Vec::new() };
         for (si, graph) in graphs.iter().enumerate() {
             let (h0, h1) = graph.extract_haplotypes();
             // Single unified bitmatrix: update all sites (used for both PBWT and HMM)
             hap_bm.update_hap_all_from_vec(si * 2, &h0);
             hap_bm.update_hap_all_from_vec(si * 2 + 1, &h1);
+            if capturing { this_main.push((h0, h1)); }
+        }
+        if capturing {
+            if let Some(ms) = main_samples.as_deref_mut() { ms.push(this_main); }
         }
 
         // EM-Ne online update during burnin. Diverges from SHAPEIT5 (which
