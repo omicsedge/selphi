@@ -398,6 +398,11 @@ struct PhasingResult {
     window_ri: Vec<(f32, usize, usize)>,
     ref_bm_full: Option<selphi::common::HaplotypeBitmatrix>,
     engine: ResolvedEngine,
+    /// Diploid intra-run phase ensemble: extra phased scaffolds (the thinned Main
+    /// MCMC samples from the SAME phasing chain). Empty unless the diploid intra
+    /// ensemble is active. These become ensemble members in the weight averaging,
+    /// giving an ensemble at ~1x phasing cost (vs N independent phasings).
+    extra_scaffolds: Vec<Vec<u8>>,
     /// Soft-phase (SELPHI_HAPLOID_SOFT_PHASE): per-(chip-site, sample) phase
     /// confidence ∈ [0,1], row-major `[site * n_samples + sample]`, used as the
     /// imputation emission confidence `c`. None unless soft-phase + haploid.
@@ -429,7 +434,7 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
         Some(bm)
     } else { None };
 
-    let (phased, window_ri, phase_conf) = match engine {
+    let (phased, window_ri, phase_conf, extra_scaffolds) = match engine {
         ResolvedEngine::Diploid => {
             selphi_step!("Using Diploid phasing");
             // Common-MAF chip subset (MAF >= 0.001 on target). Diploid runs
@@ -464,31 +469,48 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
             // phase-only diploid path `ref_bm_full` is `None` (we only
             // extract the common subset to save RAM); phase_rare falls
             // back to target-only.
-            let (dp, dr) = selphi::diploid::diploid_phase_bm_prefiltered(
+            // Intra-run phase ensemble member count: default SELPHI_DIPLOID_INTRA_N
+            // (4), overridden by --phase-ensemble N when N>1, forced to 1 (single
+            // Viterbi solve, byte-identical to the pre-intra default) under
+            // --sample-batch-size (streaming output) and --phase-only (no imputation).
+            let intra_default = selphi::config::usize_or("SELPHI_DIPLOID_INTRA_N", 2).max(1);
+            let n_members = if args.sample_batch_size > 0 || args.phase_only {
+                1
+            } else if args.phase_ensemble > 1 {
+                args.phase_ensemble
+            } else {
+                intra_default
+            };
+            if n_members > 1 {
+                selphi_step!("Diploid intra-run phase ensemble: {} members (1× phasing)", n_members);
+            }
+            let (mut dp, dr) = selphi::diploid::diploid_phase_bm_prefiltered(
                 targ_alleles, common_ref_bm, &common_chip_indices,
                 ref_bm_full.as_ref(),
                 raw_chip_cm, chip_bps,
                 &ref_bp, &map_bp_raw, &map_cm_raw,
                 n_chip, n_samples, n_ref,
-                seed, args.threads, args.max_cond_haps,
+                seed, args.threads, args.max_cond_haps, n_members,
             );
-            (dp, dr, None)  // diploid soft-phase not wired
+            let phased0 = dp.remove(0);
+            (phased0, dr, None, dp)  // remaining scaffolds = intra-run extra members
         }
         ResolvedEngine::Haploid => {
             selphi_step!("Using haploid phasing engine");
             let ref_bm = ref_bm_full.as_ref().unwrap();
-            haploid::phase_genotypes(
+            let (p, w, c) = haploid::phase_genotypes(
                 targ_alleles, ref_bm,
                 raw_chip_cm, chip_bps,
                 &ref_bp, &map_bp_raw, &map_cm_raw,
                 n_chip, n_samples, n_ref,
                 seed, args.threads, args.max_windows,
-            )
+            );
+            (p, w, c, Vec::new())
         }
     };
     selphi_step!("Phasing complete: {} samples phased, {} EM windows",
         n_samples, window_ri.len());
-    PhasingResult { phased_alleles: phased, window_ri, ref_bm_full, engine, phase_conf }
+    PhasingResult { phased_alleles: phased, window_ri, ref_bm_full, engine, phase_conf, extra_scaffolds }
 }
 
 /// Convert per-window recombIntensity (`ri`) from phasing into a per-site
@@ -1091,7 +1113,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     }
 
     let (targ_alleles, em_ne_per_site, ref_bm_from_phasing, extra_phased, phase_conf_imp) = if needs_phasing {
-        let pr = run_phasing_engines(&PhasingInputs {
+        let mut pr = run_phasing_engines(&PhasingInputs {
             args, srp: &srp, map_path,
             targ_alleles: &targ_alleles, raw_chip_cm: &raw_chip_cm, chip_bps: &chip_bps,
             ref_positions: &ref_positions, wgs_idx: &wgs_idx,
@@ -1127,7 +1149,14 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         // `par_iter().collect()` yields results in member order, so the
         // downstream weight averaging sums in a fixed order. Bit-identical to the
         // serial loop.
-        let extra_phased: Vec<(Vec<u8>, Option<Vec<f64>>)> = if let Some(unph) = unphased_for_ensemble.as_ref() {
+        let extra_phased: Vec<(Vec<u8>, Option<Vec<f64>>)> = if pr.engine == ResolvedEngine::Diploid && !pr.extra_scaffolds.is_empty() {
+            // Diploid intra-run ensemble: the extra members are thinned Main MCMC
+            // samples captured from the SAME phasing chain (≈1× phasing cost, vs N
+            // independent phasings). em_ne is unused for the diploid engine.
+            let intra = std::mem::take(&mut pr.extra_scaffolds);
+            selphi_step!("Diploid intra-run ensemble: averaging {} members from one phasing chain", intra.len() + 1);
+            intra.into_iter().map(|sc| (sc, None)).collect()
+        } else if let Some(unph) = unphased_for_ensemble.as_ref() {
             selphi_step!("Phase-ensemble: phasing {} extra members in parallel (seeds {}..{})",
                 ensemble_n - 1, args.seed + 1, args.seed + ensemble_n as i64 - 1);
             (1..ensemble_n).into_par_iter().map(|i| {
