@@ -85,11 +85,13 @@ pub fn diploid_phase_panel(
     let empty_ref = pbwt_neighbor::HaplotypeBitmatrix::from_raw(vec![], 0, 0);
     let _ = n_haps; // documented; used inside _diploid_run
 
-    _diploid_run(
+    // De-novo panel phasing returns a single phased scaffold (no intra-run ensemble).
+    let (mut scaffolds, window_ri) = _diploid_run(
         cohort_geno, empty_ref, &common_indices, None,
         CommonPrep { target_geno_common, cm_common, cm_full, bp_common },
-        bp, n_var, n_samples, /* n_ref = */ 0, seed, n_threads, max_cond_haps,
-    )
+        bp, n_var, n_samples, /* n_ref = */ 0, seed, n_threads, max_cond_haps, 1,
+    );
+    (scaffolds.remove(0), window_ri)
 }
 
 /// Diploid phasing with pre-filtered common_ref_bm (no full ref_bm ever allocated).
@@ -103,7 +105,10 @@ pub fn diploid_phase_bm_prefiltered(
     _chip_cm: &[f64], chip_bp: &[i64], _ref_bp: &[i64], map_bp: &[i64], map_cm: &[f64],
     n_var: usize, n_samples: usize, n_ref: usize, seed: i64, n_threads: usize,
     max_cond_haps: usize,
-) -> (Vec<u8>, Vec<(f32, usize, usize)>) {
+    // Intra-run phase ensemble member count (>=1). Returns this many phased
+    // scaffolds (slot 0 = Viterbi solve, slots 1.. = thinned Main MCMC samples).
+    n_members: usize,
+) -> (Vec<Vec<u8>>, Vec<(f32, usize, usize)>) {
     let seed = if seed == 33 { 15052011 } else { seed };
     let n_haps = n_samples * 2;
     let _n_haps_total = n_ref + n_haps;
@@ -132,7 +137,7 @@ pub fn diploid_phase_bm_prefiltered(
     _diploid_run(
         target_geno, common_ref_bm, common_chip_indices, full_chip_ref_bm,
         CommonPrep { target_geno_common, cm_common, cm_full: chip_cm_full, bp_common },
-        chip_bp, n_var, n_samples, n_ref, seed, n_threads, max_cond_haps,
+        chip_bp, n_var, n_samples, n_ref, seed, n_threads, max_cond_haps, n_members,
     )
 }
 
@@ -153,7 +158,11 @@ fn _diploid_run(
     chip_bp: &[i64],
     n_var: usize, n_samples: usize, n_ref: usize, seed: i64, n_threads: usize,
     max_cond_haps: usize,
-) -> (Vec<u8>, Vec<(f32, usize, usize)>) {
+    // Intra-run phase ensemble: number of phased scaffolds to return (>=1).
+    // Slot 0 = the Viterbi solve (byte-identical to the single-run default);
+    // slots 1.. = thinned post-burn-in Main MCMC samples from the SAME chain.
+    n_members: usize,
+) -> (Vec<Vec<u8>>, Vec<(f32, usize, usize)>) {
     use rayon::prelude::*;
     let seed = if seed == 33 { 15052011 } else { seed };
     let n_haps = n_samples * 2;
@@ -199,111 +208,102 @@ fn _diploid_run(
     drop(target_haps_tmp);
     drop(common_ref_bm);
 
-    // Intra-run phase ensemble (Route A, prototype): SELPHI_DIPLOID_MAIN_SAMPLE=m
-    // commits the m-th Main MCMC sample as the phase instead of the Viterbi solve,
-    // so averaging imputations over m=0..K-1 at the SAME seed marginalizes phase
-    // uncertainty from a SINGLE phasing chain (free posterior samples). Unset =
-    // solve() (byte-identical default).
-    let main_sample_sel = crate::config::raw("SELPHI_DIPLOID_MAIN_SAMPLE")
-        .and_then(|s| s.parse::<usize>().ok());
+    // Intra-run phase ensemble: produce `n_members` phased scaffolds from ONE
+    // phasing chain. Slot 0 is the Viterbi solve (byte-identical to the single-run
+    // default); slots 1.. are thinned post-burn-in Main MCMC samples — full
+    // posterior phase draws the chain computes and would otherwise discard.
+    // Averaging the downstream imputation over them marginalises phase uncertainty
+    // at ~1x phasing cost. n_members == 1 (or no missing capture) is byte-identical.
+    let n_members = n_members.max(1);
+    // The default scheme has 5 Main iterations → up to 5 capturable samples. Need
+    // more only when n_members-1 > 5; then lengthen the Main phase. For the common
+    // case (n_members <= 6) the scheme — and therefore the slot-0 solve — is unchanged.
+    let n_main = (n_members.saturating_sub(1)).max(5);
+    let scheme = if n_main == 5 {
+        "5b,1p,1b,1p,1b,1p,5m".to_string()
+    } else {
+        format!("5b,1p,1b,1p,1b,1p,{}m", n_main)
+    };
     let mut main_samples: Vec<Vec<(Vec<u8>, Vec<u8>)>> = Vec::new();
     // Run phase_common on COMMON variants only (bitmatrix-native)
     phase_common::run_phase_common_bm(
         &mut graphs, unified_bm, &cm_common,
         n_common, n_samples, n_ref, seed, n_threads,
-        "5b,1p,1b,1p,1b,1p,5m",
+        &scheme,
         Some(&bp_common),
         &target_geno_common,
         max_cond_haps,
-        if main_sample_sel.is_some() { Some(&mut main_samples) } else { None },
+        if n_members > 1 { Some(&mut main_samples) } else { None },
     );
 
-    // Extract phased haplotypes from solved graphs (COMMON variants only)
-    let mut phased = vec![0u8; n_var * n_haps];
-
-    // Initialize ALL variants from target genotypes (unphased baseline)
-    for v in 0..n_var {
-        for si in 0..n_samples {
-            phased[v * n_haps + si * 2] = target_geno[v * n_samples * 2 + si * 2];
-            phased[v * n_haps + si * 2 + 1] = target_geno[v * n_samples * 2 + si * 2 + 1];
-        }
-    }
-
-    // Overwrite common variants with the committed phase. Default = the Viterbi
-    // solve held in the graphs; with SELPHI_DIPLOID_MAIN_SAMPLE=m, commit the
-    // captured m-th Main MCMC sample instead (Route A intra-run ensemble prototype).
-    let use_main = main_sample_sel.filter(|&m| m < main_samples.len());
-    if let Some(m) = use_main {
-        crate::selphi_info!("  [diploid] committing Main MCMC sample {} of {} (intra-run ensemble) instead of Viterbi solve",
-            m, main_samples.len());
-        for (si, (h0, h1)) in main_samples[m].iter().enumerate() {
-            for (ci, &v) in common_indices.iter().enumerate() {
-                phased[v * n_haps + si * 2] = h0[ci];
-                phased[v * n_haps + si * 2 + 1] = h1[ci];
-            }
-        }
+    // No-call mask from the ORIGINAL target genotypes (the 128 sentinel) — the same
+    // for every scaffold, so compute it once. See the no-call scaffold fill below.
+    let nocall_ref = crate::config::is_one("SELPHI_DIPLOID_NOCALL_REF");
+    let nocall_k = crate::config::usize_or("SELPHI_HAPLOID_NOCALL_K", 50);
+    let (nocall_mask, any_nocall) = if nocall_ref {
+        (Vec::new(), false)
     } else {
-        for (si, graph) in graphs.iter().enumerate() {
-            let (h0, h1) = graph.extract_haplotypes();
-            for (ci, &v) in common_indices.iter().enumerate() {
-                phased[v * n_haps + si * 2] = h0[ci];
-                phased[v * n_haps + si * 2 + 1] = h1[ci];
-            }
-        }
-    }
-
-    // Phase rare het variants using common-variant scaffold. When the
-    // full-chip reference panel is available, weave it into the PBWT
-    // context so rare-variant phasing benefits from biobank-scale ref
-    // matches instead of running target-only.
-    phase_rare::run_phase_rare(
-        &mut phased, full_chip_ref_bm, target_geno, &cm_full, chip_bp,
-        n_var, n_samples, n_ref, 1, 15000.0, common_indices,
-    );
-
-    // No-call scaffold fill: original missing genotypes (the 128 sentinel from the
-    // phasing extract path) leave the diploid scaffold at REF (common-missing → graph
-    // returns 0/0; rare-missing → residual sentinel). Clamping those to REF biases the
-    // downstream imputer's PBWT candidate selection (it conditions on a REF scaffold at
-    // exactly the sites we most need to impute). Instead fill each no-call (variant, hap)
-    // with a local copying consensus — the majority allele over the K nearest backward-PBWT
-    // neighbours among the target phased haps + the full-chip reference panel. This mirrors
-    // the haploid no-call vote so both engines feed the imputer a real local-haplotype
-    // scaffold at no-calls. Default-on; opt out with SELPHI_DIPLOID_NOCALL_REF=1 (revert to
-    // clamp-REF). No-op (byte-identical) when there is no missing genotype.
-    if !crate::config::is_one("SELPHI_DIPLOID_NOCALL_REF") {
-        // No-call mask from the ORIGINAL target genotypes (the scaffold has already been
-        // partly overwritten to REF, so it can't be trusted to flag the no-calls).
-        let mut nocall = vec![false; n_var * n_haps];
+        let mut m = vec![false; n_var * n_haps];
         let mut any = false;
         for v in 0..n_var {
             for h in 0..n_haps {
-                if target_geno[v * n_haps + h] > 1 {
-                    nocall[v * n_haps + h] = true;
-                    any = true;
-                }
+                if target_geno[v * n_haps + h] > 1 { m[v * n_haps + h] = true; any = true; }
             }
         }
-        if any {
-            let k = crate::config::usize_or("SELPHI_HAPLOID_NOCALL_K", 50);
-            fill_missing_local_vote(&mut phased, n_var, n_haps, full_chip_ref_bm, n_ref, &nocall, k);
-        }
-    }
+        (m, any)
+    };
 
-    // Safety clamp: missing genotypes enter as the 128 sentinel so the genotype graph
-    // marks them missing (set_missing → run_mis imputes the COMMON sites; the imputed 0/1
-    // overwrites them above). Any residual sentinel (e.g. a rare missing site phase_rare
-    // did not impute, or a no-call the fill above left untouched) is clamped to 0 so the
-    // downstream imputation never sees 128 — no worse than the old missing→REF behavior for
-    // that residual. No-op when there is no missing.
-    for g in phased.iter_mut() { if *g > 1 { *g = 0; } }
+    // Build one full phased scaffold from a common-variant phase source:
+    //   init from target genotypes → overwrite common variants with this source →
+    //   phase rare variants onto it → fill no-calls with a local copying consensus
+    //   (instead of clamping to REF, which biases the imputer's PBWT selection) →
+    //   clamp any residual missing sentinel. Used identically for the solve (slot 0)
+    //   and every Main sample, so the default (slot 0 only) is byte-identical.
+    let build_scaffold = |common_src: &[(Vec<u8>, Vec<u8>)]| -> Vec<u8> {
+        let mut phased = vec![0u8; n_var * n_haps];
+        for v in 0..n_var {
+            for si in 0..n_samples {
+                phased[v * n_haps + si * 2] = target_geno[v * n_samples * 2 + si * 2];
+                phased[v * n_haps + si * 2 + 1] = target_geno[v * n_samples * 2 + si * 2 + 1];
+            }
+        }
+        for (si, (h0, h1)) in common_src.iter().enumerate() {
+            for (ci, &v) in common_indices.iter().enumerate() {
+                phased[v * n_haps + si * 2] = h0[ci];
+                phased[v * n_haps + si * 2 + 1] = h1[ci];
+            }
+        }
+        phase_rare::run_phase_rare(
+            &mut phased, full_chip_ref_bm, target_geno, &cm_full, chip_bp,
+            n_var, n_samples, n_ref, 1, 15000.0, common_indices,
+        );
+        if !nocall_ref && any_nocall {
+            fill_missing_local_vote(&mut phased, n_var, n_haps, full_chip_ref_bm, n_ref, &nocall_mask, nocall_k);
+        }
+        for g in phased.iter_mut() { if *g > 1 { *g = 0; } }
+        phased
+    };
+
+    // Slot 0: the Viterbi solve held in the graphs (the committed default phase).
+    let final_src: Vec<(Vec<u8>, Vec<u8>)> = graphs.iter().map(|g| g.extract_haplotypes()).collect();
+    let mut scaffolds: Vec<Vec<u8>> = Vec::with_capacity(n_members);
+    scaffolds.push(build_scaffold(&final_src));
+
+    // Slots 1..n_members: thinned Main samples, spread evenly across the captured set.
+    let n_extra = (n_members - 1).min(main_samples.len());
+    for j in 0..n_extra {
+        let idx = if n_extra == 1 { main_samples.len() - 1 }
+                  else { j * (main_samples.len() - 1) / (n_extra - 1) };
+        scaffolds.push(build_scaffold(&main_samples[idx]));
+    }
 
     // EM-estimated Ne not returned as window_ri for now (diploid uses different HMM structure)
     let window_ri = vec![];
 
-    crate::selphi_info!("  Phasing complete");
+    crate::selphi_info!("  Phasing complete ({} ensemble member{})",
+        scaffolds.len(), if scaffolds.len() == 1 { "" } else { "s" });
 
-    (phased, window_ri)
+    (scaffolds, window_ri)
 }
 
 /// Fill no-call sites in the diploid phased scaffold with a local copying
