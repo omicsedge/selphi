@@ -199,6 +199,14 @@ fn _diploid_run(
     drop(target_haps_tmp);
     drop(common_ref_bm);
 
+    // Intra-run phase ensemble (Route A, prototype): SELPHI_DIPLOID_MAIN_SAMPLE=m
+    // commits the m-th Main MCMC sample as the phase instead of the Viterbi solve,
+    // so averaging imputations over m=0..K-1 at the SAME seed marginalizes phase
+    // uncertainty from a SINGLE phasing chain (free posterior samples). Unset =
+    // solve() (byte-identical default).
+    let main_sample_sel = crate::config::raw("SELPHI_DIPLOID_MAIN_SAMPLE")
+        .and_then(|s| s.parse::<usize>().ok());
+    let mut main_samples: Vec<Vec<(Vec<u8>, Vec<u8>)>> = Vec::new();
     // Run phase_common on COMMON variants only (bitmatrix-native)
     phase_common::run_phase_common_bm(
         &mut graphs, unified_bm, &cm_common,
@@ -207,6 +215,7 @@ fn _diploid_run(
         Some(&bp_common),
         &target_geno_common,
         max_cond_haps,
+        if main_sample_sel.is_some() { Some(&mut main_samples) } else { None },
     );
 
     // Extract phased haplotypes from solved graphs (COMMON variants only)
@@ -220,12 +229,26 @@ fn _diploid_run(
         }
     }
 
-    // Overwrite common variants with phase_common results
-    for (si, graph) in graphs.iter().enumerate() {
-        let (h0, h1) = graph.extract_haplotypes();
-        for (ci, &v) in common_indices.iter().enumerate() {
-            phased[v * n_haps + si * 2] = h0[ci];
-            phased[v * n_haps + si * 2 + 1] = h1[ci];
+    // Overwrite common variants with the committed phase. Default = the Viterbi
+    // solve held in the graphs; with SELPHI_DIPLOID_MAIN_SAMPLE=m, commit the
+    // captured m-th Main MCMC sample instead (Route A intra-run ensemble prototype).
+    let use_main = main_sample_sel.filter(|&m| m < main_samples.len());
+    if let Some(m) = use_main {
+        crate::selphi_info!("  [diploid] committing Main MCMC sample {} of {} (intra-run ensemble) instead of Viterbi solve",
+            m, main_samples.len());
+        for (si, (h0, h1)) in main_samples[m].iter().enumerate() {
+            for (ci, &v) in common_indices.iter().enumerate() {
+                phased[v * n_haps + si * 2] = h0[ci];
+                phased[v * n_haps + si * 2 + 1] = h1[ci];
+            }
+        }
+    } else {
+        for (si, graph) in graphs.iter().enumerate() {
+            let (h0, h1) = graph.extract_haplotypes();
+            for (ci, &v) in common_indices.iter().enumerate() {
+                phased[v * n_haps + si * 2] = h0[ci];
+                phased[v * n_haps + si * 2 + 1] = h1[ci];
+            }
         }
     }
 
