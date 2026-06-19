@@ -129,15 +129,8 @@ pub fn run_phase_rare(
     // Find which rare sites have het carriers per sample
     // rare_het_samples[rare_idx] = Vec of sample indices that are het at this rare site
     let mut rare_het_samples: Vec<Vec<usize>> = vec![Vec::new(); rare_sites.len()];
-    // major_allele[rare_idx]: true if ALT is the major allele
-    let mut major_alleles: Vec<bool> = vec![false; rare_sites.len()];
 
     for (ri, &rv) in rare_sites.iter().enumerate() {
-        // major_allele from target haps only (n_haplotypes = 2*n_samples)
-        let mut ac = 0u32;
-        for h in 0..n_haps { ac += phased[rv * n_haps + h] as u32; }
-        major_alleles[ri] = ac as usize > n_haps / 2;
-
         for si in 0..n_samples {
             let a0 = target_geno[rv * n_samples * 2 + si * 2];
             let a1 = target_geno[rv * n_samples * 2 + si * 2 + 1];
@@ -263,7 +256,7 @@ pub fn run_phase_rare(
     // Forward writes to phased[] immediately, backward sees updated state.
     run_pbwt_phase(
         &variant_order, &scaffold_sites, &rare_sites,
-        &rare_het_samples, &major_alleles,
+        &rare_het_samples,
         &scaffold_bm, phased, full_chip_ref_bm,
         n_var, n_haps, n_haps_total,
         cm, &scaffold_cm, &mut phase_fwd, true, &ibd2_global,
@@ -288,7 +281,7 @@ pub fn run_phase_rare(
 
     run_pbwt_phase(
         &variant_order, &scaffold_sites, &rare_sites,
-        &rare_het_samples, &major_alleles,
+        &rare_het_samples,
         &scaffold_bm, phased, full_chip_ref_bm,
         n_var, n_haps, n_haps_total,
         cm, &scaffold_cm, &mut phase_bwd, false, &ibd2_global,
@@ -345,7 +338,6 @@ fn run_pbwt_phase(
     scaffold_sites: &[usize],
     rare_sites: &[usize],
     rare_het_samples: &[Vec<usize>],
-    _major_alleles: &[bool],
     scaffold_bm: &super::pbwt_neighbor::HaplotypeBitmatrix,
     phased: &[u8],
     full_chip_ref_bm: Option<&super::pbwt_neighbor::HaplotypeBitmatrix>,
