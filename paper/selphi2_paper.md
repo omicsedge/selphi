@@ -331,7 +331,7 @@ The 1000 Genomes Project Phase 3 reference panel [19] and the Genome in a Bottle
 
 # **Code availability**
 
-Selphi 2 is distributed as a self-contained statically compiled binary, together with documentation and the reference-panel preparation utilities required to reproduce the analyses in this work. The binary and usage instructions are available from the authors on request and at the Selphi project page. [Repository/DOI and license to be finalized at acceptance.]
+The Selphi 2 source code is openly available for academic and non-commercial use under a non-commercial license, consistent with the terms under which Selphi 1 was released. The repository provides the source, a self-contained statically compiled binary, documentation, and the reference-panel preparation utilities required to reproduce the analyses in this work. [Repository URL and archival DOI to be finalized at acceptance.]
 
 # **Author contributions**
 
