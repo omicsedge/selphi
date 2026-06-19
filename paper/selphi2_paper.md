@@ -251,6 +251,16 @@ Given both tools the same Beagle-derived phasing, Selphi 2's imputation exceeds 
 | Selphi 2 (haploid engine, internal phasing) | 0.9587 | 0.7909 |
 | Selphi 2 (diploid engine, internal phasing) | **0.9605** | **0.7935** |
 
+Beyond accuracy, Selphi 2's default diploid engine is faster and substantially leaner than Beagle 5.5 on this benchmark. Imputing the six-sample cohort against the 75,552-haplotype panel on a single 16-thread node (one chromosome at a time), Selphi 2 completes chromosome 1 in 105 s at 27 GB peak memory and chromosome 22 in 20 s at 10 GB, versus Beagle's 135 s / 52 GB and 39 s / 29 GB — roughly 1.3–2× faster at one-half to one-third the peak memory, even though the default intra-run ensemble (Methods) runs two imputation passes. With the ensemble disabled the diploid engine is faster still (74 s / 20 GB on chromosome 1; Table 3b).
+
+**Table 3b. Wall time and peak memory on the consumer-array benchmark.** Six-sample cohort imputed against the 75,552-haplotype production panel, 16 threads, one chromosome at a time on the same node. "N = 2" is the default diploid intra-run phase ensemble (Methods); "N = 1" disables it (single Viterbi solve). Beagle 5.5 is the full phase-plus-impute pipeline.
+
+| Tool / mode | chr1 wall | chr1 peak RAM | chr22 wall | chr22 peak RAM |
+|---|---|---|---|---|
+| Selphi 2 diploid, N = 2 (default) | 105 s | 27.2 GB | 20 s | 10.0 GB |
+| Selphi 2 diploid, N = 1 | 74 s | 20.4 GB | 15 s | 8.1 GB |
+| Beagle 5.5 (phase + impute) | 135 s | 52.0 GB | 39 s | 29.2 GB |
+
 ## **Phasing accuracy on the 1000 Genomes trio dataset**
 
 We evaluated phasing accuracy on the 1000 Genomes trio dataset using 54 trio children for whom both parents are independently sequenced and therefore the parent-of-origin truth phase at each heterozygous site can be established by Mendelian inheritance. All 54 children's whole-genome sequencing genotypes for chromosomes 1 and 22 were phased against the 2,239-sample 1000 Genomes reference panel from which the trio members had been removed ("no-trios" panel). For SHAPEIT5 v5.1.1, the full pipeline was run (phase_common at MAF ≥ 0.001, then phase_rare on the common-variant scaffold). For Beagle 5.5, the default phasing pass was used. Switch error rate (SER) was computed against the parent-of-origin truth using `bcftools +trio-switch-rate`. The set of testable heterozygous sites was determined by the trio genotypes and was therefore the same for every tool (1,992,617 sites on chr22; 10,632,243 sites on chr1, summed across the 54 trios).
