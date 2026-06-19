@@ -29,10 +29,12 @@ use crate::cli::{Args, PhasingEngine};
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ResolvedEngine { Haploid, Diploid }
 
-/// Resolve the phasing engine from CLI args and target variant count.
-/// `--wgs-phasing` forces `Diploid`; otherwise `--phasing-engine` is honoured,
-/// with `Auto` choosing `Diploid` when the chip target exceeds ~50K variants
-/// and `Haploid` otherwise (chip-array regime).
+/// Resolve the phasing engine from CLI args. `--wgs-phasing` forces `Diploid`;
+/// otherwise `--phasing-engine` is honoured, with `Auto` (the default) choosing
+/// `Diploid` for ALL inputs — the diploid engine matches or exceeds the haploid
+/// engine on SNPs at every density tested (chip arrays and WGS), wins phasing
+/// switch-error, and runs ~2.5x faster. `--phasing-engine haploid` selects the
+/// haploid composite-HMM engine explicitly.
 fn resolve_phasing_engine(args: &Args, n_chip: usize) -> ResolvedEngine {
     if args.wgs_phasing {
         return ResolvedEngine::Diploid;
@@ -41,14 +43,8 @@ fn resolve_phasing_engine(args: &Args, n_chip: usize) -> ResolvedEngine {
         PhasingEngine::Diploid => ResolvedEngine::Diploid,
         PhasingEngine::Haploid => ResolvedEngine::Haploid,
         PhasingEngine::Auto => {
-            let is_wgs = n_chip > 50_000;
-            if is_wgs {
-                selphi_info!("  Auto-detected WGS input ({} variants > 50K) → Diploid engine", n_chip);
-                ResolvedEngine::Diploid
-            } else {
-                selphi_info!("  Auto-detected chip input ({} variants ≤ 50K) → Haploid engine", n_chip);
-                ResolvedEngine::Haploid
-            }
+            selphi_info!("  Phasing engine: Diploid (default; {} target variants)", n_chip);
+            ResolvedEngine::Diploid
         }
     }
 }
