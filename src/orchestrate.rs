@@ -397,13 +397,13 @@ pub fn run_multi_chr(
             // Extract bitmatrix for phasing
             let ref_bm = srp.extract_ref_alleles_bitmatrix(&wgs_idx);
 
-            // Engine selection: auto (chip=haploid, WGS=diploid) or user override.
-            // Diploid phasing is per-chr self-contained (no cross-chr state), so it
-            // is equivalent to running the single-chr diploid engine on each chr;
-            // we mirror run_phasing_engines (imputation_pipeline.rs) exactly.
+            // Engine selection: auto (the default) → diploid for ALL inputs, or
+            // user override. Diploid phasing is per-chr self-contained (no cross-chr
+            // state), so it is equivalent to running the single-chr diploid engine on
+            // each chr; we mirror run_phasing_engines (imputation_pipeline.rs) exactly.
             let use_diploid = config.wgs_phasing
                 || config.phasing_engine == "diploid"
-                || (config.phasing_engine == "auto" && n_chip > 50_000);
+                || config.phasing_engine == "auto";
             let phased = if use_diploid {
                 // Common-MAF chip subset (MAF >= 0.001 on target). Diploid phases
                 // common variants; rare ones are re-imputed/woven by phase_rare.

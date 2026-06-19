@@ -8,7 +8,8 @@ pub use selphi::io::target_io::AlleleMatch;
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
 pub enum PhasingEngine {
-    /// Auto-detect: diploid for WGS (>50K variants), haploid for chip
+    /// Default: diploid for all inputs (matches/exceeds haploid on SNPs at every
+    /// density, wins phasing switch-error, ~2.5x faster)
     Auto,
     /// Haploid phasing (15-iteration coded-step PBWT + composite HMM)
     Haploid,
@@ -353,7 +354,8 @@ pub struct Args {
     pub vcf: bool,
 
     /// Phasing engine: auto (default), haploid, or diploid.
-    /// Auto selects diploid for WGS (>50K variants) and haploid for chip.
+    /// Auto selects the diploid engine for all inputs (chip and WGS); use
+    /// --phasing-engine haploid to force the haploid composite-HMM engine.
     #[arg(long, value_enum, default_value = "auto")]
     pub phasing_engine: PhasingEngine,
 
