@@ -267,6 +267,10 @@ Across all 22 autosomes, Selphi 2 (default diploid engine) exceeds Beagle 5.5 in
 | Admixed-American (62)              | **0.9626** | 0.9569 | +0.0057 |
 | All (925)                          | **0.9395** | 0.9329 | +0.0067 |
 
+![Figure 2](figures/figure2_accuracy.png)
+
+**Figure 2. Imputation accuracy across the allele-frequency spectrum.** (a) 1000 Genomes chromosome 22: per-MAF R² for Selphi 2 versus Beagle 5.5, IMPUTE5 and Minimac4 (Table 1); Selphi 2 leads at every bin above the rarest. (b) Rare-variant accuracy recovered by the panel-adaptive candidate sizing (adaptive minus fixed mc), stratified by self-reported ancestry on the MESA cohort (Table 2b); the recovery is largest for the most admixed/diverged populations and concentrated at rare variants. (c) Out-of-panel generalization, genome-wide: per-sample R² for 925 HGDP individuals imputed against a 1000 Genomes panel, by continental region (Table 2c); Selphi 2 exceeds Beagle 5.5 in every region, including Oceanian and Middle-Eastern ancestries absent from the panel (asterisk). (d) Low-coverage sequencing coverage sweep: per-sample R² for Selphi 2, GLIMPSE2 and QUILT2 on GIAB samples from 0.5× to 4× (Table 6b); the three tools are statistically indistinguishable.
+
 ## **Independent validation against leak-free GIAB truth**
 
 The 1000 Genomes panel benchmarks share haplotypes with the held-out targets via descent, which can inflate measured accuracy. As an independent validation we used the Genome in a Bottle (GIAB) reference samples HG002–HG007, none of which are in the 1000 Genomes Project, as held-out targets against a 75,552-haplotype production reference panel that contains the full 1000 Genomes cohort. Truth genotypes were taken from the GIAB v4.2.1 high-confidence regions restricted to common variants (MAF 5–50%, n = 73,710 sites on chr21 after restriction; n = 409,392 on chr1).
@@ -330,7 +334,11 @@ Table 5 summarizes wall time and peak resident memory for Selphi 2, Selphi 1.5.3
 | chr1 1KG 801s (impute-only, phased input) | 373 s / 21.9 GB | n/a | 207 s / 20.2 GB |
 | chr21 GIAB 6 samples (impute-only) | 7.2 s / 6.2 GB | 112.8 s / 7.1 GB | 12.5 s / 14.5 GB |
 | chr1 GIAB 6 samples (impute-only) | 38.8 s / 16.3 GB | 1923 s / 22.1 GB | 43.2 s / 39.2 GB |
-| MESA 5K × TOPMed chr20 (full pipeline) | 12345 s / 66.8 GB | did not finish | 4148 s / 96.5 GB |
+| MESA 5K × TOPMed chr20 (full pipeline) | 11289 s / 65.5 GB | did not finish | 4148 s / 96.5 GB |
+
+![Figure 3](figures/figure3_efficiency.png)
+
+**Figure 3. Computational efficiency.** (a) Wall time and (b) peak memory on the production-array benchmark (six samples against the 75,552-haplotype panel, 16 threads, one chromosome at a time): Selphi 2's default diploid engine is faster than Beagle 5.5's full pipeline at one-half to one-third the peak memory (Table 3b). (c) Per-sample low-coverage wall time (log scale): Selphi 2 imputes the entire chromosome 22 in 141 s, whereas GLIMPSE2 and QUILT2 take 85 s and ~21 minutes respectively for just the 10 Mb evaluation region, so Selphi 2 is roughly 2.4× faster than GLIMPSE2 and more than 30× faster than QUILT2 per unit of sequence (Table 6b).
 
 Selphi 2's wall time is 16× to 50× lower than Selphi 1.5.3 on the imputation-only GIAB workloads, and its peak memory is 39–58% lower than Beagle's on the 1000 Genomes chromosome 22 and both GIAB benchmarks, and comparable to Beagle on 1000 Genomes chromosome 1 (21.9 GB versus 20.2 GB). On the TOPMed biobank-scale run, Selphi 2 is slower than Beagle 5.5 (3.0×) but its peak memory is 31% lower (66.8 GB versus 96.5 GB). The runtime cost on the biobank-scale panel is the price paid for the larger candidate-set retained per target (mc = 132,676 versus Beagle's window-local composite haplotypes); the corresponding accuracy gain is +0.0236 overall R² and is concentrated on the rare-variant bins.
 
@@ -340,7 +348,7 @@ We assessed the lcWGS engine (`--lcwgs`) on real low-coverage sequencing of the 
 
 Selphi 2's lcWGS engine imputes each target sample independently against the reference panel with a genotype-likelihood-aware Li-Stephens forward-backward: sparse-PBWT conditioning-set selection, a faithful eight-founder phasing HMM re-committed at each Gibbs iteration, and a recombination rate that is independent of the conditioning-set size, giving a sticky copying model that carries a reference haplotype across read-depleted sites. A rare-carrier-aware extension feeds each heterozygous rare site's locally-best-matching panel carriers into the per-segment phase commitment, so the rarest carriers are committed without perturbing the global conditioning HMM. The chromosome is processed in overlapping cM windows whose reference bitmatrix is extracted from the SRP and discarded per window, and the forward matrix is stored only at √n checkpoint columns and recomputed per block during the backward pass, so the full-chromosome reference panel is never materialized in memory.
 
-On the GIAB samples Selphi 2 exceeds GLIMPSE2 in overall per-sample R² on all three: 0.9212 versus 0.9171 (HG002), 0.9214 versus 0.9177 (HG003), and 0.9177 versus 0.9116 (HG004), mean 0.9201 versus 0.9155 (Δ = +0.0046; Table 6). At the rarest testable frequencies (MAF 0–0.5%) the two tools are within ≈0.003 R² (effectively tied). Because each sample is imputed independently against the panel, the engine's natural mode is one sample at a time: a single chromosome-22 sample completes in approximately 2.0 minutes on 16 cores at a few GB of peak memory, versus approximately 5.4 minutes for GLIMPSE2's per-sample phasing, about 2.7× faster, with the full reference panel never resident (GLIMPSE2's one-time reference-splitting step, analogous to building Selphi 2's SRP, is excluded from both). The Gibbs iteration count and the cM window size are explicit accuracy/speed controls. These results are on chromosome 22; a whole-genome evaluation across additional cohorts and depths is in progress.
+On the GIAB samples Selphi 2 exceeds GLIMPSE2 in overall per-sample R² on all three: 0.9212 versus 0.9171 (HG002), 0.9214 versus 0.9177 (HG003), and 0.9177 versus 0.9116 (HG004), mean 0.9201 versus 0.9155 (Δ = +0.0046; Table 6). At the rarest testable frequencies (MAF 0–0.5%) the two tools are within ≈0.003 R² (effectively tied). Because each sample is imputed independently against the panel, the engine's natural mode is one sample at a time: a single chromosome-22 sample completes in approximately 2.0 minutes on 16 cores at a few GB of peak memory, versus approximately 5.4 minutes for GLIMPSE2's per-sample phasing, about 2.7× faster, with the full reference panel never resident (GLIMPSE2's one-time reference-splitting step, analogous to building Selphi 2's SRP, is excluded from both). The Gibbs iteration count and the cM window size are explicit accuracy/speed controls. A coverage sweep from 0.5× to 4× and a three-way comparison that adds QUILT2 [12] as a second low-coverage baseline are reported below (Table 6b).
 
 **Table 6. Low-coverage sequencing imputation accuracy and efficiency versus GLIMPSE2.** Real low-coverage sequencing (~1.8× chromosome 22) of the GIAB reference samples HG002, HG003, and HG004, none in the 1000 Genomes Project, each imputed independently against the 4,478-haplotype (2,239-sample) no-trios 1000 Genomes panel. Per-sample dosage R² is computed against the GIAB v4.2.1 high-confidence truth at the variants present in both tools' output. Wall time and peak memory are for a single chromosome-22 sample on 16 cores; GLIMPSE2's one-time reference-splitting step (analogous to building Selphi 2's SRP) is excluded from both tools.
 
@@ -382,11 +390,11 @@ The Selphi 2 source code is openly available for academic and non-commercial use
 
 # **Author contributions**
 
-[To be completed.]
+Conceptualization and methodology, A.D.M. and P.G.Y.; data curation, A.D.M., S.B., A.To. and S.L.; formal analysis, A.D.M., S.B., J.L.J. and S.L.; software, A.D.M. and S.B.; investigation, A.D.M., S.B., J.L.J. and B.N.; visualization, A.D.M., S.B., J.L.J. and B.N.; writing, original draft, A.D.M. and B.N.; writing, review and editing, A.D.M., S.B., J.L.J., B.N., S.L., A.Te. and A.To.; funding acquisition, project administration, resources and supervision, P.G.Y. and A.To. (A.Te. = A. Terpolovsky; A.To. = A. Torkamani.)
 
 # **Competing interests**
 
-[To be completed.]
+A.D.M., S.B., J.L.J., B.N., A.Te., A.To. and P.G.Y. are either employed by and/or hold stock or stock options in Omicsedge, a subsidiary of Genius Labs. In addition, P.G.Y. has equity in Systomic Health LLC and Ethobiotics LLC. This does not alter our adherence to journal policies on sharing data and materials. There are no other relevant activities or financial relationships which have influenced this work.
 
 # **References**
 
