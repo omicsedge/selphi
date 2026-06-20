@@ -189,24 +189,24 @@ We evaluated Selphi 2 against Beagle 5.5 and the original Selphi 1.5.3 on three 
 
 ## **Imputation accuracy on the 1000 Genomes Phase 3 reference panel**
 
-On chromosome 22 of the 1000 Genomes Phase 3 panel (4,802 haplotypes, 1,070,401 variants) imputed for 801 held-out samples, Selphi 2's default diploid engine attains an overall R² of 0.4832 against the whole-genome-sequenced truth, compared to 0.4727 for Beagle 5.5, 0.4594 for IMPUTE5, and 0.4471 for Minimac4, with all four tools imputing the identical phased target against the identical 1000 Genomes reference panel. The per-sample mean R² is 0.9159 (Selphi 2) versus 0.9048 (Beagle 5.5), 0.9025 (IMPUTE5), and 0.8964 (Minimac4). The same comparison on chromosome 1 (5,769,087 variants) gives overall R² 0.5739 (Selphi 2) versus 0.5640 (Beagle 5.5), and per-sample mean 0.9564 versus 0.9507. Selphi 2 attains the highest R² of the four tools in every MAF bin from 0.1% upward on chromosome 22, and exceeds Beagle 5.5 in every bin from 0.1% upward on chromosome 1; only at the rarest bin (MAF 0.05–0.1%) does Beagle 5.5 narrowly lead (Table 1).
+On chromosome 22 of the 1000 Genomes Phase 3 panel (4,802 haplotypes, 1,070,401 variants) imputed for 801 held-out samples, Selphi 2's default diploid engine attains an overall R² of 0.4832 against the whole-genome-sequenced truth, compared to 0.4727 for Beagle 5.5, 0.4688 for Minimac4, and 0.4594 for IMPUTE5, with all four tools imputing the identical phased target against the identical 1000 Genomes reference panel. The per-sample mean R² is 0.9159 (Selphi 2) versus 0.9048 (Beagle 5.5), 0.9030 (Minimac4), and 0.9025 (IMPUTE5). The same comparison on chromosome 1 (5,769,087 variants) gives overall R² 0.5739 (Selphi 2) versus 0.5640 (Beagle 5.5), and per-sample mean 0.9564 versus 0.9507. Selphi 2 attains the highest R² of the four tools in every MAF bin from 0.1% upward on chromosome 22, and exceeds Beagle 5.5 in every bin from 0.1% upward on chromosome 1; only at the rarest bin (MAF 0.05–0.1%) does Beagle 5.5 narrowly lead (Table 1).
 
 **Table 1. Imputation R² on the 1000 Genomes Phase 3 panel, by MAF.** Each cell reports R² between imputed dosage and whole-genome-sequenced truth, computed at variants in the indicated MAF bin (frequencies in the 1000 Genomes reference panel). n = 801 held-out samples per chromosome; full-pipeline mode (unphased target chip in, imputed dosage out); Selphi 2 uses its default diploid phasing engine. IMPUTE5 and Minimac4 were each given the identical phased target and the identical 1000 Genomes reference panel and were evaluated on chromosome 22; Beagle 5.5 and Selphi 2 were additionally evaluated on chromosome 1. Bold marks the highest R² in each chromosome group.
 
 | MAF | chr22 Selphi 2 | chr22 Beagle 5.5 | chr22 IMPUTE5 | chr22 Minimac4 | chr1 Selphi 2 | chr1 Beagle 5.5 |
 |---|---|---|---|---|---|---|
-| 0.05–0.1% | 0.2768 | **0.2800** | 0.2613 | 0.2545 | 0.3616 | **0.3638** |
-| 0.1–0.2%  | **0.3262** | 0.3177 | 0.3029 | 0.2929 | **0.4175** | 0.4065 |
-| 0.2–0.5%  | **0.4237** | 0.4073 | 0.3936 | 0.3790 | **0.5134** | 0.4950 |
-| 0.5–1%    | **0.5074** | 0.4866 | 0.4763 | 0.4605 | **0.6146** | 0.5924 |
-| 1–2%      | **0.5719** | 0.5480 | 0.5415 | 0.5240 | **0.6805** | 0.6578 |
-| 2–5%      | **0.6758** | 0.6519 | 0.6486 | 0.6324 | **0.7556** | 0.7338 |
-| 5–10%     | **0.7591** | 0.7385 | 0.7355 | 0.7187 | **0.8500** | 0.8343 |
-| 10–20%    | **0.7955** | 0.7789 | 0.7769 | 0.7605 | **0.9010** | 0.8901 |
-| 20–50%    | **0.8414** | 0.8270 | 0.8255 | 0.8090 | **0.9311** | 0.9231 |
-| OVERALL   | **0.4832** | 0.4727 | 0.4594 | 0.4471 | **0.5739** | 0.5640 |
+| 0.05–0.1% | 0.2768 | **0.2800** | 0.2613 | 0.2757 | 0.3616 | **0.3638** |
+| 0.1–0.2%  | **0.3262** | 0.3177 | 0.3029 | 0.3155 | **0.4175** | 0.4065 |
+| 0.2–0.5%  | **0.4237** | 0.4073 | 0.3936 | 0.4010 | **0.5134** | 0.4950 |
+| 0.5–1%    | **0.5074** | 0.4866 | 0.4763 | 0.4807 | **0.6146** | 0.5924 |
+| 1–2%      | **0.5719** | 0.5480 | 0.5415 | 0.5442 | **0.6805** | 0.6578 |
+| 2–5%      | **0.6758** | 0.6519 | 0.6486 | 0.6503 | **0.7556** | 0.7338 |
+| 5–10%     | **0.7591** | 0.7385 | 0.7355 | 0.7358 | **0.8500** | 0.8343 |
+| 10–20%    | **0.7955** | 0.7789 | 0.7769 | 0.7731 | **0.9010** | 0.8901 |
+| 20–50%    | **0.8414** | 0.8270 | 0.8255 | 0.8215 | **0.9311** | 0.9231 |
+| OVERALL   | **0.4832** | 0.4727 | 0.4594 | 0.4688 | **0.5739** | 0.5640 |
 
-At the rarest bin (MAF 0.05–0.1%), Beagle 5.5 narrowly outperforms Selphi 2 on both chromosomes (Δ ≈ -0.002 to -0.003), the only frequency at which any tool exceeds Selphi 2; IMPUTE5 and Minimac4 trail Selphi 2 in every bin, including the rarest. At MAF ≥ 0.1% Selphi 2 leads by margins that grow with allele frequency (chr22 20–50% MAF: +0.0144 over Beagle 5.5, +0.0159 over IMPUTE5, +0.0324 over Minimac4). The crossover at the rarest bin reflects the differing trade-offs in candidate selection: at the rarest frequencies, Beagle 5.5's window-local composite-haplotype reconstruction better preserves single-carrier reference haplotypes, while at common frequencies the long-range, large-window PBWT scan of Selphi 2 retains more informative haplotypes per target.
+At the rarest bin (MAF 0.05–0.1%), Beagle 5.5 narrowly outperforms Selphi 2 on both chromosomes (Δ ≈ -0.002 to -0.003), the only frequency at which any tool exceeds Selphi 2; IMPUTE5 and Minimac4 trail Selphi 2 in every bin, including the rarest. At MAF ≥ 0.1% Selphi 2 leads by margins that grow with allele frequency (chr22 20–50% MAF: +0.0144 over Beagle 5.5, +0.0199 over Minimac4, +0.0159 over IMPUTE5). The crossover at the rarest bin reflects the differing trade-offs in candidate selection: at the rarest frequencies, Beagle 5.5's window-local composite-haplotype reconstruction better preserves single-carrier reference haplotypes, while at common frequencies the long-range, large-window PBWT scan of Selphi 2 retains more informative haplotypes per target.
 
 ## **Imputation accuracy on a biobank-scale admixed cohort**
 
