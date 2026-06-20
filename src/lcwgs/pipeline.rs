@@ -27,7 +27,7 @@ use crate::io::target_io::intersect_variants;
 use crate::srp::SrpReader;
 use crate::selphi_info;
 
-use super::iterate::run_gibbs;
+use super::iterate::run_gibbs_ensemble;
 
 /// Current process RSS in GB (Linux /proc/self/statm field 2 = resident pages).
 fn rss_gb() -> f64 {
@@ -492,12 +492,12 @@ fn run_chunked_gibbs(
         let chunk_wgs: Vec<usize> = wgs_idx[buf_start..buf_end].to_vec();
         let chunk_bm = srp.extract_ref_alleles_bitmatrix(&chunk_wgs);
 
-        let mut out = run_gibbs(&chunk_gl3, &chunk_bm, &chunk_cm, n_samples, params, None, chrwide_cond.as_ref());
+        let mut out = run_gibbs_ensemble(&chunk_gl3, &chunk_bm, &chunk_cm, n_samples, params, None, chrwide_cond.as_ref());
         // Two-depth split: run the deep pass and overlay its dose/GP onto the band
         // sites (panel MAF ∈ [lo,hi)), routing by PANEL allele frequency only (known
         // a-priori; no truth). Byte-identical when `split_band` is None.
         if let Some((lo, hi, deep_k)) = split_band {
-            let out_deep = run_gibbs(&chunk_gl3, &chunk_bm, &chunk_cm, n_samples, params, Some(deep_k), chrwide_cond.as_ref());
+            let out_deep = run_gibbs_ensemble(&chunk_gl3, &chunk_bm, &chunk_cm, n_samples, params, Some(deep_k), chrwide_cond.as_ref());
             let n_ref = chunk_bm.n_haps;
             for lv in 0..chunk_bm.n_sites {
                 let ac = chunk_bm.popcount_row(lv, n_ref) as f64;

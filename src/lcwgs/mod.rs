@@ -104,12 +104,18 @@ pub struct LcwgsParams {
     /// over-trust). `0` disables. `LCWGS_MIN_GL` sets it; `LCWGS_ADAPT_MIN_GL`
     /// coverage-scales it (see `pipeline::impute_from_gl3`).
     pub min_gl: f32,
+    /// RNG seed for Gibbs initialization (GLIMPSE2 default 15052011). A single
+    /// deterministic chain uses this value; `run_gibbs_ensemble` varies it
+    /// (seed, seed+1, …) across independent restarts whose dosages are averaged
+    /// (LCWGS_GIBBS_RESTARTS), marginalising chain stochasticity like the
+    /// genotype path's `--phase-ensemble`.
+    pub seed: u64,
 }
 
 impl LcwgsParams {
     /// RNG seed for Gibbs initialization. GLIMPSE2 default: 15052011.
     pub fn seed_or_default(&self) -> u64 {
-        15_052_011
+        self.seed
     }
 
     /// cM span of each chunk's core region (whose dosage is kept). A single
@@ -178,6 +184,7 @@ impl Default for LcwgsParams {
             // 0.9196→0.9239 (plateaus by 1e-8). Tunable via LCWGS_EPSILON.
             epsilon: envf("LCWGS_EPSILON", 1e-12),
             min_gl: envf("LCWGS_MIN_GL", 1e-10),
+            seed: 15_052_011,
         }
     }
 }

@@ -932,6 +932,49 @@ pub fn run_gibbs(
     GibbsOutput { dosage, gp, cond_final }
 }
 
+/// Multi-restart Gibbs averaging. Runs `LCWGS_GIBBS_RESTARTS` (default 1)
+/// independent Gibbs chains with seeds (seed, seed+1, …) and averages their
+/// per-(variant×sample) dosages and genotype posteriors. With the default of 1
+/// this is `run_gibbs` verbatim (byte-identical). For N>1 it marginalises the
+/// chain's RNG/phase stochasticity in dosage space, exactly as the genotype
+/// path's `--phase-ensemble` averages per-haplotype copying weights: the final
+/// dosage is the mean over N otherwise-identical chains differing only in seed.
+/// Cost is linear in N, so the knob is opt-in.
+pub fn run_gibbs_ensemble(
+    gl3: &[f32],
+    ref_bm: &HaplotypeBitmatrix,
+    cm: &[f64],
+    n_samples: usize,
+    params: &LcwgsParams,
+    k_max_override: Option<usize>,
+    precomputed_cond: Option<&Vec<Vec<u32>>>,
+) -> GibbsOutput {
+    let n_restarts = crate::config::usize_or("LCWGS_GIBBS_RESTARTS", 1).max(1);
+    if n_restarts == 1 {
+        return run_gibbs(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond);
+    }
+    let base = params.seed_or_default();
+    let mut acc_d: Vec<f64> = Vec::new();
+    let mut acc_g: Vec<f64> = Vec::new();
+    for i in 0..n_restarts {
+        let mut p = params.clone();
+        p.seed = base.wrapping_add(i as u64);
+        let out = run_gibbs(gl3, ref_bm, cm, n_samples, &p, k_max_override, precomputed_cond);
+        if acc_d.is_empty() {
+            acc_d = vec![0.0f64; out.dosage.len()];
+            acc_g = vec![0.0f64; out.gp.len()];
+        }
+        for (a, &d) in acc_d.iter_mut().zip(out.dosage.iter()) { *a += d as f64; }
+        for (a, &g) in acc_g.iter_mut().zip(out.gp.iter()) { *a += g as f64; }
+    }
+    let inv = 1.0 / n_restarts as f64;
+    GibbsOutput {
+        dosage: acc_d.iter().map(|&d| (d * inv) as f32).collect(),
+        gp: acc_g.iter().map(|&g| (g * inv) as f32).collect(),
+        cond_final: Vec::new(),
+    }
+}
+
 /// Build the per-individual polymorphic/monomorphic split inputs for the phasing
 /// HMM (`LCWGS_POLY_SKIP`), mirroring GLIMPSE2 `conditioning_set::compactSelection`
 /// (conditioning_set.cpp:122-138): a site is COMMON (always polymorphic) when its
