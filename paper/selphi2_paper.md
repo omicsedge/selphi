@@ -1,9 +1,8 @@
 # **Selphi 2: integrated phasing and whole-genome genotype imputation in a single Rust binary**
 
-Authors: Adriano De Marino^1^, Sandra Bohn^1^, Jon Lerga-Jaso^1^, Biljana Novković^1^, Salvatore Loguercio^2^, Andrew Terpolovsky^1^, Ali Torkamani^2^, Puya G. Yazdi^1,\*^
+Authors: Adriano De Marino^1^, Sandra Bohn^1^, Jon Lerga-Jaso^1^, Biljana Novković^1^, Andrew Terpolovsky^1^, Puya G. Yazdi^1,\*^
 
 ^1^ Research and Development, Omicsedge, Miami, FL, USA
-^2^ Scripps Research Translational Institute, La Jolla, CA, USA
 \* Corresponding author: pyazdi@omicsedge.com
 
 # **Abstract**
@@ -390,11 +389,11 @@ The Selphi 2 source code is openly available for academic and non-commercial use
 
 # **Author contributions**
 
-Conceptualization and methodology, A.D.M. and P.G.Y.; data curation, A.D.M., S.B., A.To. and S.L.; formal analysis, A.D.M., S.B., J.L.J. and S.L.; software, A.D.M. and S.B.; investigation, A.D.M., S.B., J.L.J. and B.N.; visualization, A.D.M., S.B., J.L.J. and B.N.; writing, original draft, A.D.M. and B.N.; writing, review and editing, A.D.M., S.B., J.L.J., B.N., S.L., A.Te. and A.To.; funding acquisition, project administration, resources and supervision, P.G.Y. and A.To. (A.Te. = A. Terpolovsky; A.To. = A. Torkamani.)
+Conceptualization and methodology, A.D.M. and P.G.Y.; data curation, A.D.M. and S.B.; formal analysis, A.D.M., S.B. and J.L.J.; software, A.D.M. and S.B.; investigation, A.D.M., S.B., J.L.J. and B.N.; visualization, A.D.M., S.B., J.L.J. and B.N.; writing, original draft, A.D.M. and B.N.; writing, review and editing, A.D.M., S.B., J.L.J., B.N. and A.T.; funding acquisition, project administration, resources and supervision, P.G.Y.
 
 # **Competing interests**
 
-A.D.M., S.B., J.L.J., B.N., A.Te., A.To. and P.G.Y. are either employed by and/or hold stock or stock options in Omicsedge, a subsidiary of Genius Labs. In addition, P.G.Y. has equity in Systomic Health LLC and Ethobiotics LLC. This does not alter our adherence to journal policies on sharing data and materials. There are no other relevant activities or financial relationships which have influenced this work.
+A.D.M., S.B., J.L.J., B.N., A.T. and P.G.Y. are either employed by and/or hold stock or stock options in Omicsedge, a subsidiary of Genius Labs. In addition, P.G.Y. has equity in Systomic Health LLC and Ethobiotics LLC. This does not alter our adherence to journal policies on sharing data and materials. There are no other relevant activities or financial relationships which have influenced this work.
 
 # **References**
 
