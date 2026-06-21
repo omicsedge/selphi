@@ -419,7 +419,7 @@ A.D.M., S.B., J.L.J., B.N., A.T. and P.G.Y. are either employed by and/or hold s
 20. Browning BL, Browning SR. A unified approach to genotype imputation and haplotype-phase inference for large data sets of trios and unrelated individuals. *Am J Hum Genet*. 2009;84(2):210-223.
 21. Danecek P, Bonfield JK, Liddle J, et al. Twelve years of SAMtools and BCFtools. *GigaScience*. 2021;10(2):giab008.
 22. Myers S, Bottolo L, Freeman C, McVean G, Donnelly P. A fine-scale map of recombination rates and hotspots across the human genome. *Science*. 2005;310(5746):321-324.
-23. De Marino A, Mahmoud AA, Bohn S, Lerga-Jaso J, Novković B, Manson C, Loguercio S, Terpolovsky A, Matushyn M, Torkamani A, Yazdi PG. Empowering GWAS discovery through enhanced genotype imputation. *medRxiv*. 2023. doi:10.1101/2023.12.18.23300143.
+23. De Marino A, Mahmoud AA, Bohn S, Lerga-Jaso J, Novković B, Manson C, Loguercio S, Terpolovsky A, Matushyn M, Torkamani A, Yazdi PG. Selphi, a tool for improving genotype imputation accuracy. *Sci Rep*. 2026;16:58420. doi:10.1038/s41598-026-58420-2.
 24. Taliun D, Harris DN, Kessler MD, et al. Sequencing of 53,831 diverse genomes from the NHLBI TOPMed Program. *Nature*. 2021;590(7845):290-299. doi:10.1038/s41586-021-03205-y.
 
 25. Koenig Z, Yohannes MT, Nkambule LL, et al. A harmonized public resource of deeply sequenced diverse human genomes. *Genome Res*. 2024;34(5):796-809. doi:10.1101/gr.278378.123.

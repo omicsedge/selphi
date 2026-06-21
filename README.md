@@ -429,13 +429,13 @@ A short overview; see the paper for the full method, parameters, and benchmarks.
 If you use Selphi in your research, please cite:
 
 ```
-Empowering GWAS Discovery through Enhanced Genotype Imputation
+Selphi, a tool for improving genotype imputation accuracy
 Adriano De Marino, Abdallah Amr Mahmoud, Sandra Bohn, Jon Lerga-Jaso, Biljana Novković,
 Charlie Manson, Salvatore Loguercio, Andrew Terpolovsky, Mykyta Matushyn, Ali Torkamani, Puya G. Yazdi
-medRxiv 2023.12.18.23300143; doi: https://doi.org/10.1101/2023.12.18.23300143
+Scientific Reports 16, 58420 (2026); doi: https://doi.org/10.1038/s41598-026-58420-2
 ```
 
-Full project description: [preprint](https://www.medrxiv.org/content/10.1101/2023.12.18.23300143v2).
+Full article: [Scientific Reports](https://www.nature.com/articles/s41598-026-58420-2).
 
 # Non-Commercial Use License
 
