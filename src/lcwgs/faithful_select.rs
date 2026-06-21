@@ -288,7 +288,7 @@ impl FaithfulSelector {
                         let h = x as u32;
                         if seen.insert(h) {
                             u.push(h);
-                            if self.kpbwt > 0 && u.len() >= self.kpbwt as usize {
+                            if self.kpbwt > 0 && u.len() >= self.kpbwt {
                                 break 'outer;
                             }
                         }
@@ -304,8 +304,8 @@ impl FaithfulSelector {
                 }
                 u.sort_unstable();
                 u.dedup();
-                if self.kpbwt > 0 && u.len() > self.kpbwt as usize {
-                    u.truncate(self.kpbwt as usize);
+                if self.kpbwt > 0 && u.len() > self.kpbwt {
+                    u.truncate(self.kpbwt);
                 }
                 u
             };

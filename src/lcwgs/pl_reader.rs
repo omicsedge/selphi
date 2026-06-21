@@ -272,7 +272,7 @@ fn parse_pl_bcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Result<P
         let samples = rec.samples();
         for (s, sample) in samples.values().enumerate() {
             if s >= n_samples { break; }
-            let pl_opt = sample.get("PL").flatten().and_then(|v| bcf_value_to_pl3(v));
+            let pl_opt = sample.get("PL").flatten().and_then(bcf_value_to_pl3);
             let (_, glp, valid) = pl_to_hl_gl3(pl_opt);
             if !valid { n_missing_pl += 1; }
             gl3[gl_off + 3 * s] = glp[0];

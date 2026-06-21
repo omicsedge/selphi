@@ -1205,9 +1205,8 @@ pub fn evaluate_imputation(
         let sv = strong.get(&key);
         let rv = raw.as_ref().and_then(|m| m.get(&key));
         for s in 0..n {
-            if let Some(v) = sv {
-                if v[s] >= 0.5 { truth_ds[s] = v[s]; continue; }
-            }
+            if let Some(v) = sv
+                && v[s] >= 0.5 { truth_ds[s] = v[s]; continue; }
             if rv.map(|v| v[s] >= 0.5).unwrap_or(false) {
                 truth_ds[s] = -1.0; // raw-but-not-strong: quality-filtered ⇒ skip this sample here
             } else {

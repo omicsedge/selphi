@@ -178,17 +178,11 @@ fn inval<E: std::fmt::Display>(e: E) -> io::Error { io::Error::new(io::ErrorKind
 
 /// Reused per-read scratch for the pair-HMM + window extraction (zero-alloc in
 /// steady state). One per pileup thread.
+#[derive(Default)]
 pub(crate) struct IndelScratch {
     wb: Vec<u8>, wq: Vec<u8>,
     mp: Vec<f64>, ip: Vec<f64>, dp: Vec<f64>,
     mc: Vec<f64>, ic: Vec<f64>, dc: Vec<f64>,
-}
-impl Default for IndelScratch {
-    fn default() -> Self {
-        IndelScratch { wb: Vec::new(), wq: Vec::new(),
-            mp: Vec::new(), ip: Vec::new(), dp: Vec::new(),
-            mc: Vec::new(), ic: Vec::new(), dc: Vec::new() }
-    }
 }
 
 const MIN_ANCHOR: i64 = 3; // read must extend ≥ this many bp beyond the indel core on each side

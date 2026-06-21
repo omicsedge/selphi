@@ -749,7 +749,7 @@ fn phase_subwindow(
                                 if let Some(ref iv) = inv {
                                     // Local copying consensus: majority over the K nearest
                                     // PBWT neighbours (expand outward, skipping missing).
-                                    let p = iv[hh as usize];
+                                    let p = iv[hh];
                                     let (mut n0, mut n1) = (0i32, 0i32);
                                     let mut off = 1i32;
                                     while (n0 + n1) < nocall_k as i32 && off < n_haps as i32 {

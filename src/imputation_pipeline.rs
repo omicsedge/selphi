@@ -931,9 +931,9 @@ fn build_target_confidence(
         // real driver is the GQ/PL/DP confidence above. Applied to BOTH the
         // per-site min (re-route) AND every sample's column (per-hap emission)
         // so the two views stay consistent.
-        if let Some(s) = selphi::config::raw("SELPHI_REFINE_TEST_SOFT_FRAC") {
-            if let Ok(f) = s.trim().parse::<f64>() {
-                if f > 0.0 {
+        if let Some(s) = selphi::config::raw("SELPHI_REFINE_TEST_SOFT_FRAC")
+            && let Ok(f) = s.trim().parse::<f64>()
+                && f > 0.0 {
                     let n_force = ((f.min(1.0)) * n_chip as f64).floor() as usize;
                     if n_force > 0 {
                         let v = aligned.get_or_insert_with(|| vec![1.0f64; n_chip]);
@@ -945,8 +945,6 @@ fn build_target_confidence(
                         selphi_step!("--refine TEST: forced {} chip site(s) to confidence 0.0 (SELPHI_REFINE_TEST_SOFT_FRAC={})", n_force, f);
                     }
                 }
-            }
-        }
         let n_soft = aligned.as_ref().map(|c| c.iter().filter(|&&x| x < 1.0).count()).unwrap_or(0);
         selphi_step!("--refine: {} chip site(s) with input confidence < 1.0 (of {})", n_soft, n_chip);
         (aligned, aligned_ps)

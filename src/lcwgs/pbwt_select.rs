@@ -176,7 +176,7 @@ pub fn select_conditioning_haps(
         // each by its match length.
         let storage_idx_i = storage_idx as i32;
         for h in 0..n_target_haps {
-            let pos = inv[h] as i32;
+            let pos = inv[h];
             let mlh = &mut match_len[h];
 
             // Walk left + right alternately, accumulating up to `depth`

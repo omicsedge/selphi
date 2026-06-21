@@ -566,7 +566,7 @@ fn run_chunked_gibbs(
                     let lv = v - buf_start;
                     let wi = chunk_wgs[lv];
                     let var = &srp.variants[wi];
-                    if !targets.contains(&(var.pos as i64)) { continue; }
+                    if !targets.contains(&{ var.pos }) { continue; }
                     let ac = chunk_bm.popcount_row(lv, n_ref) as f32;
                     let af = ac / n_ref as f32;
                     let dose = out.dosage[lv * n_samples + strace];
@@ -626,13 +626,13 @@ fn run_chunked_gibbs(
             while start < n_chunks {
                 let end = (start + max_live).min(n_chunks);
                 let wave: Vec<_> =
-                    (start..end).into_par_iter().map(|c| process_chunk(c)).collect();
+                    (start..end).into_par_iter().map(&process_chunk).collect();
                 results.extend(wave);
                 start = end;
             }
             results
         } else {
-            (0..n_chunks).map(|c| process_chunk(c)).collect()
+            (0..n_chunks).map(process_chunk).collect()
         };
 
     // Merge each chunk's CORE dosage + GP into the global output (in index order).

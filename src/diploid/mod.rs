@@ -30,7 +30,7 @@ pub mod phase_rare;
 ///
 /// `cohort_geno`: (n_var × n_samples × 2) row-major genotypes (allele bytes;
 /// >1 = missing, coerced upstream). `bp`: per-variant base-pair positions.
-/// Returns phased haplotypes (n_var × n_haps), row-major.
+/// > Returns phased haplotypes (n_var × n_haps), row-major.
 #[allow(clippy::too_many_arguments)]
 pub fn diploid_phase_panel(
     cohort_geno: &[u8],

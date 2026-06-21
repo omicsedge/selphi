@@ -107,8 +107,8 @@ fn reconcile_ladder(
         }
     }
     // Rung 2 — strand flip (reverse-complement the target SNP), then exact or swap.
-    if matches!(mode, AlleleMatch::Strand | AlleleMatch::Full) {
-        if let (Some(rc_r), Some(rc_a)) = (rc_snp_base(tgt_ref_lit), rc_snp_base(tgt_alt_lit)) {
+    if matches!(mode, AlleleMatch::Strand | AlleleMatch::Full)
+        && let (Some(rc_r), Some(rc_a)) = (rc_snp_base(tgt_ref_lit), rc_snp_base(tgt_alt_lit)) {
             let (rk, ak) = (key(&rc_r), key(&rc_a));
             let mut rj = ri;
             while rj < variants.len() && variants[rj].pos == tpos {
@@ -123,7 +123,6 @@ fn reconcile_ladder(
                 rj += 1;
             }
         }
-    }
     None
 }
 
@@ -838,7 +837,7 @@ fn line_min_confidence(
         let pl = pl_i.and_then(|i| nth_subfield(field, i)).and_then(parse_pl_triple);
         let dp = dp_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
         // GT is subfield 0; a '.' allele = a missing call → confidence 0 (re-route to imputed).
-        let gt_missing = nth_subfield(field, 0).map(|g| g.iter().any(|&b| b == b'.')).unwrap_or(true);
+        let gt_missing = nth_subfield(field, 0).map(|g| g.contains(&b'.')).unwrap_or(true);
         let c = sample_confidence(gt_missing, gq, pl, dp, gq_lo, gq_hi);
         if c < min_c { min_c = c; }
         field_start = if field_end < gt_region.len() { field_end + 1 } else { gt_region.len() };
@@ -859,7 +858,7 @@ fn line_per_sample_confidence(
     let pl_i = format_field_index(format_bytes, b"PL");
     let dp_i = format_field_index(format_bytes, b"DP");
     if gq_i.is_none() && pl_i.is_none() && dp_i.is_none() {
-        out.extend(std::iter::repeat(1.0f64).take(n_samples));
+        out.extend(std::iter::repeat_n(1.0f64, n_samples));
         return;
     }
     let mut field_start = 0usize;
@@ -872,7 +871,7 @@ fn line_per_sample_confidence(
         let gq = gq_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
         let pl = pl_i.and_then(|i| nth_subfield(field, i)).and_then(parse_pl_triple);
         let dp = dp_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
-        let gt_missing = nth_subfield(field, 0).map(|g| g.iter().any(|&b| b == b'.')).unwrap_or(true);
+        let gt_missing = nth_subfield(field, 0).map(|g| g.contains(&b'.')).unwrap_or(true);
         out.push(sample_confidence(gt_missing, gq, pl, dp, gq_lo, gq_hi));
         field_start = if field_end < gt_region.len() { field_end + 1 } else { gt_region.len() };
     }
@@ -1043,7 +1042,7 @@ pub fn extract_target_site_confidence_per_sample(path: &str) -> (Vec<f64>, usize
         let Some(f) = split_vcf_fields(line) else { continue };
         match vcf_format_bytes(line) {
             Some(fmt) => line_per_sample_confidence(fmt, f.gt_region, n_samples, gq_lo, gq_hi, &mut conf),
-            None => conf.extend(std::iter::repeat(1.0f64).take(n_samples)),
+            None => conf.extend(std::iter::repeat_n(1.0f64, n_samples)),
         }
     }
     (conf, n_samples)
@@ -1264,8 +1263,8 @@ pub fn intersect_variants(
             rj += 1;
         }
         // Opt-in fallback: only when the exact match failed.
-        if !matched && mode != AlleleMatch::None {
-            if let Some(hit) = reconcile_ladder(
+        if !matched && mode != AlleleMatch::None
+            && let Some(hit) = reconcile_ladder(
                 &srp.variants, ri, tpos,
                 &targets[ti].ref_hash, &targets[ti].alt_hash,
                 &targets[ti].ref_allele, &targets[ti].alt_allele,
@@ -1276,7 +1275,6 @@ pub fn intersect_variants(
                 transforms.push(hit.transform);
                 match hit.kind { ReconKind::Swap => n_swap += 1, ReconKind::Strand => n_strand += 1 }
             }
-        }
     }
     if n_hash_matches > 0 || n_plain_matches > 0 {
         selphi_info!("  Variant intersection: {} hash matches, {} plain matches",
@@ -1455,8 +1453,8 @@ pub fn intersect_variants_for_chr(
             }
             rj += 1;
         }
-        if !matched && mode != AlleleMatch::None {
-            if let Some(hit) = reconcile_ladder(
+        if !matched && mode != AlleleMatch::None
+            && let Some(hit) = reconcile_ladder(
                 ref_variants, ri, tpos,
                 &targets_ref[ti].ref_hash, &targets_ref[ti].alt_hash,
                 &targets_ref[ti].ref_allele, &targets_ref[ti].alt_allele,
@@ -1467,7 +1465,6 @@ pub fn intersect_variants_for_chr(
                 transforms.push(hit.transform);
                 match hit.kind { ReconKind::Swap => n_swap += 1, ReconKind::Strand => n_strand += 1 }
             }
-        }
     }
     if n_swap > 0 || n_strand > 0 {
         selphi_info!("  --allele-match [{}]: reconciled {} swap, {} strand site(s)",

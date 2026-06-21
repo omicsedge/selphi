@@ -426,7 +426,7 @@ impl SegmentHmm {
             } else {
                 unsafe { self.run_hom_bm_scalar_x86(target_allele, bm_row, nt, yt); }
             }
-            return true;
+            true
         }
         #[cfg(target_arch = "aarch64")]
         {
