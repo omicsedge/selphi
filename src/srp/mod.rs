@@ -158,6 +158,17 @@ impl SparseTile {
             .chunks_exact(4)
             .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
             .collect();
+        // Validate the CSC column pointers before they index `indices`:
+        // `col_range` returns `(indptr[col], indptr[col+1])` and consumers slice
+        // `indices[lo..hi]`, so a non-monotone or out-of-range indptr would
+        // slice-OOB. Require indptr[0]==0, non-decreasing, and last == nnz.
+        assert!(indptr.first().copied() == Some(0),
+            "SparseTile::from_bytes: indptr[0] must be 0 (corrupt tile)");
+        assert!(indptr.windows(2).all(|w| w[0] <= w[1]),
+            "SparseTile::from_bytes: indptr must be non-decreasing (corrupt tile)");
+        assert!(indptr.last().copied() == Some(nnz as u32),
+            "SparseTile::from_bytes: indptr last ({:?}) must equal nnz ({}) (corrupt tile)",
+            indptr.last(), nnz);
         let indices: Vec<u16> = data[indptr_end..indices_end]
             .chunks_exact(2)
             .map(|b| u16::from_le_bytes(b.try_into().unwrap()))
@@ -251,19 +262,48 @@ pub(crate) fn parse_raw_chunk(compressed: &[u8]) -> CscChunk {
     let buf = &decompressed;
 
     assert!(buf.len() >= 12, "chunk too small for header");
-    let rows = i32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
-    let cols = i32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
-    let nnz = i32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+    let rows_i = i32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let cols_i = i32::from_le_bytes(buf[4..8].try_into().unwrap());
+    let nnz_i = i32::from_le_bytes(buf[8..12].try_into().unwrap());
+    // Reject negative on-disk counts BEFORE casting: a negative i32 sign-extends
+    // to a huge usize and the size arithmetic below would wrap in release builds,
+    // defeating the truncation assert. Regenerate-the-panel style message.
+    assert!(rows_i >= 0 && cols_i >= 0 && nnz_i >= 0,
+        "corrupt chunk header: negative count (rows={} cols={} nnz={}); regenerate the panel",
+        rows_i, cols_i, nnz_i);
+    let rows = rows_i as usize;
+    let cols = cols_i as usize;
+    let nnz = nnz_i as usize;
 
-    let indptr_bytes = (cols + 1) * 4;
-    let indptr_end = 12 + indptr_bytes;
-    let indices_end = indptr_end + nnz * 4;
+    // Use checked arithmetic for the offsets so a huge cols/nnz cannot wrap the
+    // end index past the truncation assert.
+    let overflow = || -> ! {
+        panic!("corrupt chunk header: size overflow (cols={} nnz={}); regenerate the panel", cols, nnz)
+    };
+    let indptr_end = (cols + 1).checked_mul(4)
+        .and_then(|b| b.checked_add(12))
+        .unwrap_or_else(|| overflow());
+    let indices_end = nnz.checked_mul(4)
+        .and_then(|b| indptr_end.checked_add(b))
+        .unwrap_or_else(|| overflow());
     assert!(buf.len() >= indices_end, "chunk truncated: need {} bytes, got {}", indices_end, buf.len());
 
     let indptr: Vec<i32> = buf[12..indptr_end]
         .chunks_exact(4)
         .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
         .collect();
+    // Validate the CSC column pointers before they index `indices`: consumers
+    // loop `indices[indptr[col]..indptr[col+1]]`, so a non-monotone or
+    // out-of-range indptr would slice-OOB. Require indptr[0]==0, non-decreasing,
+    // and last == nnz (the exact contract the writer emits).
+    assert!(indptr.first().copied() == Some(0),
+        "corrupt chunk: indptr[0] must be 0; regenerate the panel");
+    assert!(indptr.windows(2).all(|w| w[0] <= w[1]),
+        "corrupt chunk: indptr must be non-decreasing; regenerate the panel");
+    assert!(indptr.last().copied() == Some(nnz as i32),
+        "corrupt chunk: indptr last ({:?}) must equal nnz ({}); regenerate the panel",
+        indptr.last(), nnz);
+
     let indices: Vec<i32> = buf[indptr_end..indices_end]
         .chunks_exact(4)
         .map(|b| i32::from_le_bytes(b.try_into().unwrap()))

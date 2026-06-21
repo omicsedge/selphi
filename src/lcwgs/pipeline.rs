@@ -18,7 +18,6 @@
 //! ```
 //!
 //! TODO post-MVP:
-//! - Multi-chr orchestration (`MultiChrSrpReader`)
 //! - Streaming output (current MVP holds dosages in memory)
 //! - Phased GT output (currently emits unphased from dose argmax)
 

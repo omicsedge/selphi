@@ -940,6 +940,10 @@ pub fn run_gibbs(
 /// path's `--phase-ensemble` averages per-haplotype copying weights: the final
 /// dosage is the mean over N otherwise-identical chains differing only in seed.
 /// Cost is linear in N, so the knob is opt-in.
+///
+/// NOTE: the `LCWGS_COND_DUMP`/`LCWGS_TRACE_POS` conditioning diagnostics are
+/// single-chain only — for N>1 the ensemble path returns an empty `cond_final`
+/// (there is no single conditioning set to report across the averaged chains).
 pub fn run_gibbs_ensemble(
     gl3: &[f32],
     ref_bm: &HaplotypeBitmatrix,
@@ -950,6 +954,25 @@ pub fn run_gibbs_ensemble(
     precomputed_cond: Option<&Vec<Vec<u32>>>,
 ) -> GibbsOutput {
     let n_restarts = crate::config::usize_or("LCWGS_GIBBS_RESTARTS", 1).max(1);
+    run_gibbs_ensemble_n(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts)
+}
+
+/// Inner ensemble with an explicit restart count (the env-read entry point
+/// `run_gibbs_ensemble` forwards `LCWGS_GIBBS_RESTARTS` here). Split out so the
+/// averaging can be unit-tested deterministically without touching process env.
+/// `n_restarts` is clamped to ≥1; `n_restarts == 1` is `run_gibbs` verbatim.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_gibbs_ensemble_n(
+    gl3: &[f32],
+    ref_bm: &HaplotypeBitmatrix,
+    cm: &[f64],
+    n_samples: usize,
+    params: &LcwgsParams,
+    k_max_override: Option<usize>,
+    precomputed_cond: Option<&Vec<Vec<u32>>>,
+    n_restarts: usize,
+) -> GibbsOutput {
+    let n_restarts = n_restarts.max(1);
     if n_restarts == 1 {
         return run_gibbs(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond);
     }
@@ -1136,6 +1159,58 @@ mod tests {
         assert_eq!(out.dosage.len(), n_var * n_samples);
         for &d in &out.dosage {
             assert!((0.0..=2.0).contains(&d), "dose {} out of range", d);
+        }
+    }
+
+    /// Build the minimal synthetic Gibbs input shared by the ensemble tests.
+    fn tiny_ensemble_input() -> (Vec<f32>, HaplotypeBitmatrix, Vec<f64>, usize, LcwgsParams) {
+        let n_var = 4;
+        let n_ref = 4;
+        let n_samples = 1;
+        let ref_alleles: Vec<u8> = vec![
+            0, 1, 0, 1,
+            0, 1, 1, 0,
+            0, 1, 0, 1,
+            0, 1, 1, 0,
+        ];
+        let bm = HaplotypeBitmatrix::from_byte_slice_all(n_var, n_ref, &ref_alleles, n_ref);
+        let gl3: Vec<f32> = vec![1.0 / 3.0; n_var * n_samples * 3];
+        let cm = vec![0.0, 0.01, 0.02, 0.03];
+        let mut params = LcwgsParams::default();
+        params.ne = 10.0;
+        params.n_iterations = 3;
+        params.n_main_iterations = 1;
+        params.kpbwt = 3;
+        params.pbwt_modulo_cm = 0.001;
+        (gl3, bm, cm, n_samples, params)
+    }
+
+    /// n_restarts = 1 is byte/bit-identical to a direct run_gibbs call, and
+    /// n_restarts = 0 is clamped to 1 (no panic / divide-by-zero).
+    #[test]
+    fn ensemble_n1_is_bit_identical_to_run_gibbs() {
+        let (gl3, bm, cm, n_samples, params) = tiny_ensemble_input();
+        let direct = run_gibbs(&gl3, &bm, &cm, n_samples, &params, None, None);
+        let ens1 = run_gibbs_ensemble_n(&gl3, &bm, &cm, n_samples, &params, None, None, 1);
+        assert_eq!(direct.dosage, ens1.dosage, "n=1 dosage must equal run_gibbs");
+        assert_eq!(direct.gp, ens1.gp, "n=1 GP must equal run_gibbs");
+
+        // n_restarts = 0 clamps to 1 → same as the direct call, no panic.
+        let ens0 = run_gibbs_ensemble_n(&gl3, &bm, &cm, n_samples, &params, None, None, 0);
+        assert_eq!(direct.dosage, ens0.dosage, "n=0 must clamp to 1");
+        assert_eq!(direct.gp, ens0.gp, "n=0 must clamp to 1");
+    }
+
+    /// For n_restarts = 2 the per-(variant,sample) GP triple still sums to ~1.0.
+    #[test]
+    fn ensemble_n2_gp_triples_sum_to_one() {
+        let (gl3, bm, cm, n_samples, params) = tiny_ensemble_input();
+        let out = run_gibbs_ensemble_n(&gl3, &bm, &cm, n_samples, &params, None, None, 2);
+        let n_var = cm.len();
+        assert_eq!(out.gp.len(), n_var * n_samples * 3);
+        for vs in 0..(n_var * n_samples) {
+            let s = out.gp[vs * 3] + out.gp[vs * 3 + 1] + out.gp[vs * 3 + 2];
+            assert!((s - 1.0).abs() < 1e-5, "GP triple {} sums to {}, expected ~1.0", vs, s);
         }
     }
 }

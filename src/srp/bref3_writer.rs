@@ -9,9 +9,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use rayon::prelude::*;
 
-const MAGIC_NUMBER_V3: i32 = 2055763188;
-const SEQ_CODED: u8 = 0;
-const ALLELE_CODED: u8 = 1;
+use super::bref3::{MAGIC_NUMBER_V3, SEQ_CODED, ALLELE_CODED};
 const BATCH_SIZE: usize = 2048;
 
 fn default_max_n_seq(n_samples: usize) -> u16 {

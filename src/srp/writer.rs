@@ -310,8 +310,7 @@ pub fn build_srp_from_panel(
 // SRP Unified Format (v2): single file with chunks + tiles
 // ============================================================================
 
-/// Magic for single-chromosome SRP format.
-const SRP_SINGLE_CHR_MAGIC: &[u8; 8] = b"SRP\x00\x02\x00\x00\x00";
+use super::SRP_SINGLE_CHR_MAGIC;
 
 /// Build unified SRP file from BCF source.
 /// Produces a SINGLE .srp file containing metadata, variants, chunks, and tiles.
