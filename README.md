@@ -158,7 +158,7 @@ selphi --phase-panel \
 selphi --phase-panel --input cohort.vcf.gz --map map.map --out panel --region 22:16000000-20000000
 ```
 
-Engine: `--phasing-engine diploid` (default, best for WGS) or `haploid`. Output is always `panel.vcf.gz`; `--srp`/`--bref3` additionally emit native reference panels (the `.srp` is directly usable as `--refpanel`). Large cohorts auto-chunk by genetic distance with ligation; `--chunk-vars N` overrides the chunk size.
+Engine: `--phasing-engine diploid` (default, used for all inputs) or `haploid`. Output is always `panel.vcf.gz`; `--srp`/`--bref3` additionally emit native reference panels (the `.srp` is directly usable as `--refpanel`). Large cohorts auto-chunk by genetic distance with ligation; `--chunk-vars N` overrides the chunk size.
 
 ### Whole-genome imputation
 
@@ -418,7 +418,7 @@ selphi --self-test --refpanel panel.srp --input target.vcf.gz --map chr.map --ou
 A short overview; see the paper for the full method, parameters, and benchmarks.
 
 - **Bitmatrix-native.** The reference panel is stored as 1 bit per allele and shared in memory between phasing and imputation (no VCF round-trip), so memory stays low and the pipeline is fully native (no external bioinformatics tools at runtime).
-- **Phasing.** Two engines, auto-selected by variant density: a **haploid** composite-HMM with greedy swap (for chip arrays, up to ~50K variants), and a **diploid** genotype-graph + MCMC engine with two-stage common-then-rare phasing (for WGS).
+- **Phasing.** Two engines. By default the **diploid** genotype-graph + MCMC engine (two-stage common-then-rare phasing) is used for **all** inputs, chip and WGS alike; the **haploid** composite-HMM with greedy swap remains available for chip arrays via `--phasing-engine haploid`.
 - **Imputation.** Per target haplotype and window, a coded-step PBWT selects reference candidates and a Li-Stephens HMM (f32 forward, f64 backward) produces per-site weights, interpolated to full panel density via cache-friendly tiles fused to output encoding. The effective population size is calibrated to panel size.
 - **Low-coverage WGS.** The `--lcwgs` engine works directly on genotype likelihoods (GL-weighted Li-Stephens forward-backward with sparse-PBWT selection and diplotype-mosaic phase commitment), processing the chromosome in cM chunks so the panel is never fully resident.
 - **SRP panel format.** A single binary file holds one or many chromosomes as 2D zstd-compressed sparse tiles (1024 variants × 4096 haplotypes) for L2-cache-friendly streaming. Creation is fully streaming (hundreds of MB for a full chromosome) and the BCF reader uses parallel CSI-indexed regional reads.
