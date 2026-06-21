@@ -843,51 +843,29 @@ fn sum_csr_into(a: &selphi::imputation::hmm::CsrWeights, b: &selphi::imputation:
     selphi::imputation::hmm::CsrWeights { indptr, indices, data, n_rows, n_cols }
 }
 
-/// Run single-chromosome imputation (or phase-only) end-to-end.
-///
-/// The body is an inline port of the original `main()` single-chr branch;
-/// its internal `return;` statements exit the pipeline function, leaving
-/// `main` free to continue to any post-pipeline work (currently none).
-pub fn run(args: &Args, target_path: &str, output_path: &str) {
-    // Single-chr path: --map is required
-    let map_path = args.map_path.as_deref().expect("--map is required");
+/// Target load + panel intersection result. Bundles the values the original
+/// inline steps 2-3 of `run` produced so they can be returned from one helper.
+struct LoadedTarget {
+    sample_names: Vec<String>,
+    target_markers: Vec<selphi::io::target_io::TargetMarker>,
+    target_genotypes: Vec<Vec<[u8; 2]>>,
+    is_phased: bool,
+    n_samples: usize,
+    n_haps: usize,
+    wgs_idx: Vec<usize>,
+    target_idx: Vec<usize>,
+    allele_transforms: Vec<u8>,
+    n_chip: usize,
+}
 
-    // Initialize global logger (writes to stderr + .log file)
-    let log_path = PathBuf::from(output_path).with_extension("log");
-    selphi::log::init(&log_path, args.debug);
-
-    let version = env!("CARGO_PKG_VERSION");
-    selphi::log::print_banner(version);
-    selphi_info!("  input:    {}", target_path);
-    selphi_info!("  refpanel: {}", args.refpanel);
-    selphi_info!("  map:      {}", map_path);
-    selphi_info!("  output:   {}", output_path);
-    selphi_info!("  threads:  {}", args.threads);
-    if args.debug { selphi_info!("  debug:    enabled"); }
-    selphi_info!("  log:      {}", log_path.display());
-    selphi_info!("");
-
-    let start_time = Instant::now();
-
-    // 1. Load reference panel
-    let srp = Arc::new(SrpReader::open(&args.refpanel, args.threads * 2)
-        .expect("Failed to load SRP reference panel"));
-    let n_ref_variants = srp.n_variants();
-    let n_ref = srp.n_haps();
-    let ref_positions: Vec<i64> = srp.variants.iter().map(|v| v.pos).collect();
-    selphi_step!("Loaded SRP: {} variants, {} haplotypes", n_ref_variants, n_ref);
-
-    // Refuse chrY/chrMT: the Li-Stephens recombination model does not apply to a
-    // non-recombining / haploid / homoplasmic contig (panels omit them too).
-    // Override with SELPHI_ALLOW_NONRECOMB=1. Autosomes/chrX are unaffected.
-    if let Some(msg) = selphi::contig::nonrecomb_refusal(srp.chromosome()) {
-        selphi_error!("{}", msg);
-        std::process::exit(2);
-    }
-
+/// Read the target VCF/BCF (samples, variants, genotypes, phased flag) and
+/// intersect its markers against the reference panel. Pure code-motion out of
+/// `run`: same calls, same timing/logging, same `n_chip == 0` abort. Aborts the
+/// process when there are no shared variants (identical to the inline branch).
+fn load_and_intersect(args: &Args, target_path: &str, srp: &SrpReader) -> LoadedTarget {
     // 2. Read target VCF: sample names, variants, genotypes
     let (sample_names, target_markers, target_genotypes, is_phased) =
-        read_target_vcf(target_path, &srp);
+        read_target_vcf(target_path, srp);
     selphi_step!("Target: {} samples, {} variants, phased={}",
         sample_names.len(), target_markers.len(), is_phased);
 
@@ -897,7 +875,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // 3. Variant intersection (merge-join on sorted positions)
     let t0_isect = std::time::Instant::now();
     let (wgs_idx, target_idx, allele_transforms) =
-        intersect_variants(&srp, &target_markers, args.allele_match);
+        intersect_variants(srp, &target_markers, args.allele_match);
     selphi_debug!("  Intersect: {:.1}ms", t0_isect.elapsed().as_secs_f64() * 1000.0);
     let n_chip = wgs_idx.len();
     selphi_step!("Shared markers: {} ({:.1}% of target)",
@@ -908,6 +886,24 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         std::process::exit(1);
     }
 
+    LoadedTarget {
+        sample_names, target_markers, target_genotypes, is_phased,
+        n_samples, n_haps, wgs_idx, target_idx, allele_transforms, n_chip,
+    }
+}
+
+/// Build the per-chip-site and per-(chip-site, sample) input confidence used by
+/// the `--refine` / no-call re-route paths, plus the re-route threshold.
+///
+/// Returns `(target_site_conf, target_site_conf_per_sample, refine_thr)`. The
+/// two confidence views are both `None` (→ byte-identical scalar emission) when
+/// refine is off and there are no no-call genotypes. Pure code-motion out of
+/// `run`: same env reads, same merges, same logging, same order.
+fn build_target_confidence(
+    args: &Args, target_path: &str,
+    target_genotypes: &[Vec<[u8; 2]>], target_idx: &[usize],
+    n_chip: usize, n_samples: usize,
+) -> (Option<Vec<f64>>, Option<Vec<f64>>, f64) {
     // --refine input confidence c ∈ [0,1] from the target VCF (GQ/PL/DP). Built
     // ONLY under --refine; aligned to post-intersection chip-site order via
     // target_idx. Two views:
@@ -926,9 +922,9 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // multi-sample refine runs this is n_chip*n_samples*8 bytes.
     let (refine_site_conf, refine_site_conf_per_sample): (Option<Vec<f64>>, Option<Vec<f64>>) = if args.refine {
         let marker_conf = extract_target_site_confidence(target_path);
-        let mut aligned = align_confidence_to_chip(&marker_conf, &target_idx, n_chip);
+        let mut aligned = align_confidence_to_chip(&marker_conf, target_idx, n_chip);
         let (marker_conf_ps, ps_n) = extract_target_site_confidence_per_sample(target_path);
-        let mut aligned_ps = align_confidence_to_chip_per_sample(&marker_conf_ps, ps_n, &target_idx, n_chip);
+        let mut aligned_ps = align_confidence_to_chip_per_sample(&marker_conf_ps, ps_n, target_idx, n_chip);
         // R3 TEST-ONLY hook: synthesize confidence = 0.0 for the first ⌊f·n_chip⌋
         // chip sites so the low-confidence → imputed re-route fires on a chip
         // benchmark (which carries no genuine soft sites). Off by default; the
@@ -1010,6 +1006,63 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     let refine_thr: f64 = selphi::config::raw("SELPHI_REFINE_THR")
         .and_then(|s| s.trim().parse::<f64>().ok())
         .unwrap_or(0.1);
+
+    (target_site_conf, target_site_conf_per_sample, refine_thr)
+}
+
+/// Run single-chromosome imputation (or phase-only) end-to-end.
+///
+/// The body is an inline port of the original `main()` single-chr branch;
+/// its internal `return;` statements exit the pipeline function, leaving
+/// `main` free to continue to any post-pipeline work (currently none).
+pub fn run(args: &Args, target_path: &str, output_path: &str) {
+    // Single-chr path: --map is required
+    let map_path = args.map_path.as_deref().expect("--map is required");
+
+    // Initialize global logger (writes to stderr + .log file)
+    let log_path = PathBuf::from(output_path).with_extension("log");
+    selphi::log::init(&log_path, args.debug);
+
+    let version = env!("CARGO_PKG_VERSION");
+    selphi::log::print_banner(version);
+    selphi_info!("  input:    {}", target_path);
+    selphi_info!("  refpanel: {}", args.refpanel);
+    selphi_info!("  map:      {}", map_path);
+    selphi_info!("  output:   {}", output_path);
+    selphi_info!("  threads:  {}", args.threads);
+    if args.debug { selphi_info!("  debug:    enabled"); }
+    selphi_info!("  log:      {}", log_path.display());
+    selphi_info!("");
+
+    let start_time = Instant::now();
+
+    // 1. Load reference panel
+    let srp = Arc::new(SrpReader::open(&args.refpanel, args.threads * 2)
+        .expect("Failed to load SRP reference panel"));
+    let n_ref_variants = srp.n_variants();
+    let n_ref = srp.n_haps();
+    let ref_positions: Vec<i64> = srp.variants.iter().map(|v| v.pos).collect();
+    selphi_step!("Loaded SRP: {} variants, {} haplotypes", n_ref_variants, n_ref);
+
+    // Refuse chrY/chrMT: the Li-Stephens recombination model does not apply to a
+    // non-recombining / haploid / homoplasmic contig (panels omit them too).
+    // Override with SELPHI_ALLOW_NONRECOMB=1. Autosomes/chrX are unaffected.
+    if let Some(msg) = selphi::contig::nonrecomb_refusal(srp.chromosome()) {
+        selphi_error!("{}", msg);
+        std::process::exit(2);
+    }
+
+    // 2-3. Read the target VCF + intersect against the panel (see `load_and_intersect`).
+    let LoadedTarget {
+        sample_names, target_markers, target_genotypes, is_phased,
+        n_samples, n_haps, wgs_idx, target_idx, allele_transforms, n_chip,
+    } = load_and_intersect(args, target_path, &srp);
+
+    // --refine / no-call input confidence + the re-route threshold. See
+    // `build_target_confidence` for the full rationale.
+    let (target_site_conf, target_site_conf_per_sample, refine_thr) = build_target_confidence(
+        args, target_path, &target_genotypes, &target_idx, n_chip, n_samples,
+    );
 
     // Resolve auto max_candidates and the batched-output cap BEFORE memory
     // estimation so the estimator reflects the actual runtime configuration
