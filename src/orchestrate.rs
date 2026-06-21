@@ -159,6 +159,167 @@ fn prepare_chr_target(
     Some((wgs_idx, target_idx, targ_alleles, chip_bps, n_chip))
 }
 
+/// Load the genetic map for every chromosome, either from a per-chr directory
+/// (`config.map_dir`, the `--map-dir` path) or from a single unified map file
+/// (`map_path`). Pure code motion of step 3 of `run_multi_chr`: the discovery
+/// order, the candidate-pattern list, the glob fallback, every log line and the
+/// `?` error propagation are identical to the inline block it replaces.
+fn load_maps(
+    config: &MultiChrImputeConfig,
+    chromosomes: &[String],
+    map_path: &Path,
+) -> std::io::Result<std::collections::BTreeMap<String, (Vec<i64>, Vec<f64>)>> {
+    let multi_map = if let Some(ref dir) = config.map_dir {
+        selphi_step!("Loading genetic maps from directory...");
+        let map_dir = std::path::Path::new(dir);
+        let mut combined = std::collections::BTreeMap::new();
+        for chr_name in chromosomes {
+            let key = chr_name.strip_prefix("chr").unwrap_or(chr_name);
+            // Try common patterns: chr{N}.map, {N}.map, plink.chr{N}.*.map
+            let candidates = [
+                format!("chr{}.map", key),
+                format!("{}.map", key),
+                format!("plink.chr{}.GRCh38.map", key),
+                format!("plink.chr{}.GRCh37.map", key),
+            ];
+            let mut found = false;
+            for pattern in &candidates {
+                let path = map_dir.join(pattern);
+                if path.exists() {
+                    let (bp, cm) = genmap::load_genetic_map_raw(&path)?;
+                    combined.insert(key.to_string(), (bp, cm));
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                // Glob fallback: any file containing the chr name
+                if let Ok(entries) = std::fs::read_dir(map_dir) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.contains(&format!("chr{}", key)) && name.ends_with(".map") {
+                            let (bp, cm) = genmap::load_genetic_map_raw(&entry.path())?;
+                            combined.insert(key.to_string(), (bp, cm));
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !found {
+                selphi_info!("  WARNING: no map found for chr{} in {}", key, dir);
+            }
+        }
+        selphi_info!("  maps: {} chromosomes loaded from {}", combined.len(), dir);
+        combined
+    } else {
+        selphi_step!("Loading unified genetic map...");
+        let multi_map = genmap::load_genetic_map_multi_chr(map_path)?;
+        selphi_info!("  map: {} chromosomes loaded", multi_map.len());
+        multi_map
+    };
+    Ok(multi_map)
+}
+
+/// Phase one chromosome's target (when phasing is needed) and return the
+/// possibly-rephased target alleles, the EM-Ne-per-site vector (always None on
+/// this path) and the phasing-side reference bitmatrix (Some when phasing ran,
+/// so the caller can reuse it for imputation). Pure code motion of the per-chr
+/// phasing block of `run_multi_chr`: the engine selection, the common-MAF
+/// subset computation, every `phase_genotypes`/`diploid_phase_bm_prefiltered`
+/// call, every argument and every log line are identical to the inline block.
+/// When `needs_phasing` is false the input `targ_alleles` are returned unchanged.
+#[allow(clippy::too_many_arguments)]
+fn phase_chr(
+    needs_phasing: bool,
+    multi_map: &std::collections::BTreeMap<String, (Vec<i64>, Vec<f64>)>,
+    chr_name: &str,
+    srp: &selphi::srp::SrpReader,
+    wgs_idx: &[usize],
+    raw_chip_cm: &[f64],
+    chip_bps: &[i64],
+    targ_alleles: Vec<u8>,
+    n_chip: usize,
+    n_samples: usize,
+    n_ref: usize,
+    config: &MultiChrImputeConfig,
+) -> (Vec<u8>, Option<Vec<f64>>, Option<selphi::common::HaplotypeBitmatrix>) {
+    if needs_phasing {
+        let (map_bp_raw, map_cm_raw) = multi_map.get(
+            chr_name.strip_prefix("chr").unwrap_or(chr_name)
+        ).cloned().unwrap_or_else(|| {
+            multi_map.get(chr_name).cloned().unwrap_or_default()
+        });
+        let ref_bp: Vec<i64> = srp.variants.iter().map(|v| v.pos).collect();
+
+        // Extract bitmatrix for phasing
+        let ref_bm = srp.extract_ref_alleles_bitmatrix(wgs_idx);
+
+        // Engine selection: auto (the default) → diploid for ALL inputs, or
+        // user override. Diploid phasing is per-chr self-contained (no cross-chr
+        // state), so it is equivalent to running the single-chr diploid engine on
+        // each chr; we mirror run_phasing_engines (imputation_pipeline.rs) exactly.
+        let use_diploid = config.wgs_phasing
+            || config.phasing_engine == "diploid"
+            || config.phasing_engine == "auto";
+        let phased = if use_diploid {
+            // Common-MAF chip subset (MAF >= 0.001 on target). Diploid phases
+            // common variants; rare ones are re-imputed/woven by phase_rare.
+            let _target_an = (n_samples * 2) as u32;
+            let common_chip_indices: Vec<usize> = (0..n_chip).into_par_iter().filter(|&v| {
+                // Mask the 128 missing sentinel so MAF is over CALLED alleles only.
+                let mut ac = 0u32; let mut an = 0u32;
+                for si in 0..n_samples {
+                    let a0 = targ_alleles[v * n_samples * 2 + si * 2];
+                    let a1 = targ_alleles[v * n_samples * 2 + si * 2 + 1];
+                    if a0 <= 1 { ac += a0 as u32; an += 1; }
+                    if a1 <= 1 { ac += a1 as u32; an += 1; }
+                }
+                if an == 0 { return false; }
+                let mac = ac.min(an - ac);
+                (mac as f32 / an as f32) >= 0.001f32
+            }).collect();
+            if common_chip_indices.is_empty() {
+                // No common scaffold for diploid — fall back to haploid.
+                selphi_info!("    Phasing: diploid requested but no common-MAF variants; using haploid");
+                let (phased, _ri, _conf) = selphi::haploid::phase_genotypes(
+                    &targ_alleles, &ref_bm, raw_chip_cm, chip_bps,
+                    &ref_bp, &map_bp_raw, &map_cm_raw,
+                    n_chip, n_samples, n_ref, config.seed, config.threads, 0,
+                );
+                phased
+            } else {
+                selphi_info!("    Phasing: diploid engine ({} / {} common-MAF variants)",
+                    common_chip_indices.len(), n_chip);
+                let common_ref_bm =
+                    selphi::diploid::pbwt_neighbor::HaplotypeBitmatrix::from_subset(
+                        &ref_bm, &common_chip_indices);
+                // Multi-chr path: single phased scaffold (intra-run ensemble is
+                // applied in the single-chr pipeline; here n_members = 1).
+                let (mut scaffolds, _ri) = selphi::diploid::diploid_phase_bm_prefiltered(
+                    &targ_alleles, common_ref_bm, &common_chip_indices, Some(&ref_bm),
+                    raw_chip_cm, chip_bps, &ref_bp, &map_bp_raw, &map_cm_raw,
+                    n_chip, n_samples, n_ref,
+                    config.seed, config.threads, config.max_cond_haps, 1,
+                );
+                scaffolds.remove(0)
+            }
+        } else {
+            selphi_info!("    Phasing: haploid engine");
+            let (phased, _switch_info, _conf) = selphi::haploid::phase_genotypes(
+                &targ_alleles, &ref_bm, raw_chip_cm, chip_bps,
+                &ref_bp, &map_bp_raw, &map_cm_raw,
+                n_chip, n_samples, n_ref,
+                config.seed, config.threads, 0,
+            );
+            phased
+        };
+        (phased, None::<Vec<f64>>, Some(ref_bm))
+    } else {
+        (targ_alleles, None::<Vec<f64>>, None::<selphi::common::HaplotypeBitmatrix>)
+    }
+}
+
 /// Run multi-chromosome imputation from a unified multi-chr SRP file.
 pub fn run_multi_chr(
     srp_path: &Path,
@@ -221,55 +382,7 @@ pub fn run_multi_chr(
         n_samples, target_by_chr.len(), is_phased);
 
     // 3. Load genetic map (unified file or per-chr directory)
-    let multi_map = if let Some(ref dir) = config.map_dir {
-        selphi_step!("Loading genetic maps from directory...");
-        let map_dir = std::path::Path::new(dir);
-        let mut combined = std::collections::BTreeMap::new();
-        for chr_name in &chromosomes {
-            let key = chr_name.strip_prefix("chr").unwrap_or(chr_name);
-            // Try common patterns: chr{N}.map, {N}.map, plink.chr{N}.*.map
-            let candidates = [
-                format!("chr{}.map", key),
-                format!("{}.map", key),
-                format!("plink.chr{}.GRCh38.map", key),
-                format!("plink.chr{}.GRCh37.map", key),
-            ];
-            let mut found = false;
-            for pattern in &candidates {
-                let path = map_dir.join(pattern);
-                if path.exists() {
-                    let (bp, cm) = genmap::load_genetic_map_raw(&path)?;
-                    combined.insert(key.to_string(), (bp, cm));
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                // Glob fallback: any file containing the chr name
-                if let Ok(entries) = std::fs::read_dir(map_dir) {
-                    for entry in entries.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if name.contains(&format!("chr{}", key)) && name.ends_with(".map") {
-                            let (bp, cm) = genmap::load_genetic_map_raw(&entry.path())?;
-                            combined.insert(key.to_string(), (bp, cm));
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if !found {
-                selphi_info!("  WARNING: no map found for chr{} in {}", key, dir);
-            }
-        }
-        selphi_info!("  maps: {} chromosomes loaded from {}", combined.len(), dir);
-        combined
-    } else {
-        selphi_step!("Loading unified genetic map...");
-        let multi_map = genmap::load_genetic_map_multi_chr(map_path)?;
-        selphi_info!("  map: {} chromosomes loaded", multi_map.len());
-        multi_map
-    };
+    let multi_map = load_maps(config, &chromosomes, map_path)?;
     selphi_info!("");
 
     // 3b. Refuse to silently impute a chromosome at cM=0. Every chromosome present
@@ -386,80 +499,10 @@ pub fn run_multi_chr(
 
         // Phasing (if needed)
         let needs_phasing = !is_phased || config.force_phasing;
-        let (targ_alleles, em_ne_per_site, ref_bm_from_phasing) = if needs_phasing {
-            let (map_bp_raw, map_cm_raw) = multi_map.get(
-                chr_name.strip_prefix("chr").unwrap_or(chr_name)
-            ).cloned().unwrap_or_else(|| {
-                multi_map.get(chr_name).cloned().unwrap_or_default()
-            });
-            let ref_bp: Vec<i64> = srp.variants.iter().map(|v| v.pos).collect();
-
-            // Extract bitmatrix for phasing
-            let ref_bm = srp.extract_ref_alleles_bitmatrix(&wgs_idx);
-
-            // Engine selection: auto (the default) → diploid for ALL inputs, or
-            // user override. Diploid phasing is per-chr self-contained (no cross-chr
-            // state), so it is equivalent to running the single-chr diploid engine on
-            // each chr; we mirror run_phasing_engines (imputation_pipeline.rs) exactly.
-            let use_diploid = config.wgs_phasing
-                || config.phasing_engine == "diploid"
-                || config.phasing_engine == "auto";
-            let phased = if use_diploid {
-                // Common-MAF chip subset (MAF >= 0.001 on target). Diploid phases
-                // common variants; rare ones are re-imputed/woven by phase_rare.
-                let _target_an = (n_samples * 2) as u32;
-                let common_chip_indices: Vec<usize> = (0..n_chip).into_par_iter().filter(|&v| {
-                    // Mask the 128 missing sentinel so MAF is over CALLED alleles only.
-                    let mut ac = 0u32; let mut an = 0u32;
-                    for si in 0..n_samples {
-                        let a0 = targ_alleles[v * n_samples * 2 + si * 2];
-                        let a1 = targ_alleles[v * n_samples * 2 + si * 2 + 1];
-                        if a0 <= 1 { ac += a0 as u32; an += 1; }
-                        if a1 <= 1 { ac += a1 as u32; an += 1; }
-                    }
-                    if an == 0 { return false; }
-                    let mac = ac.min(an - ac);
-                    (mac as f32 / an as f32) >= 0.001f32
-                }).collect();
-                if common_chip_indices.is_empty() {
-                    // No common scaffold for diploid — fall back to haploid.
-                    selphi_info!("    Phasing: diploid requested but no common-MAF variants; using haploid");
-                    let (phased, _ri, _conf) = selphi::haploid::phase_genotypes(
-                        &targ_alleles, &ref_bm, &raw_chip_cm, &chip_bps,
-                        &ref_bp, &map_bp_raw, &map_cm_raw,
-                        n_chip, n_samples, n_ref, config.seed, config.threads, 0,
-                    );
-                    phased
-                } else {
-                    selphi_info!("    Phasing: diploid engine ({} / {} common-MAF variants)",
-                        common_chip_indices.len(), n_chip);
-                    let common_ref_bm =
-                        selphi::diploid::pbwt_neighbor::HaplotypeBitmatrix::from_subset(
-                            &ref_bm, &common_chip_indices);
-                    // Multi-chr path: single phased scaffold (intra-run ensemble is
-                    // applied in the single-chr pipeline; here n_members = 1).
-                    let (mut scaffolds, _ri) = selphi::diploid::diploid_phase_bm_prefiltered(
-                        &targ_alleles, common_ref_bm, &common_chip_indices, Some(&ref_bm),
-                        &raw_chip_cm, &chip_bps, &ref_bp, &map_bp_raw, &map_cm_raw,
-                        n_chip, n_samples, n_ref,
-                        config.seed, config.threads, config.max_cond_haps, 1,
-                    );
-                    scaffolds.remove(0)
-                }
-            } else {
-                selphi_info!("    Phasing: haploid engine");
-                let (phased, _switch_info, _conf) = selphi::haploid::phase_genotypes(
-                    &targ_alleles, &ref_bm, &raw_chip_cm, &chip_bps,
-                    &ref_bp, &map_bp_raw, &map_cm_raw,
-                    n_chip, n_samples, n_ref,
-                    config.seed, config.threads, 0,
-                );
-                phased
-            };
-            (phased, None::<Vec<f64>>, Some(ref_bm))
-        } else {
-            (targ_alleles, None::<Vec<f64>>, None::<selphi::common::HaplotypeBitmatrix>)
-        };
+        let (targ_alleles, em_ne_per_site, ref_bm_from_phasing) = phase_chr(
+            needs_phasing, &multi_map, chr_name, &srp, &wgs_idx, &raw_chip_cm,
+            &chip_bps, targ_alleles, n_chip, n_samples, n_ref, config,
+        );
 
         // Ref bitmatrix for imputation
         let ref_bm_imp: selphi::common::HaplotypeBitmatrix = ref_bm_from_phasing.unwrap_or_else(|| {
