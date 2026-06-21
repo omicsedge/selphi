@@ -203,6 +203,146 @@ pub struct PhasingHmm {
     condbits: Vec<u64>,
 }
 
+/// Generate the AVX2 (8-wide) phasing kernels from their per-kernel parts.
+///
+/// All transition kernels share the same prologue (`scale`/`nt_s`/`psh`/
+/// `tfreq`/`nts`), loop framing (`base`, store `p`, accumulate `sumv`) and
+/// final [`PhasingHmm::store_sum256`]; they differ only in the optional
+/// per-kernel `setup`, the `stay` term (load-from-`prob` vs broadcast
+/// `prob_sum_k`) and the `sel` factor (het emission / hom mismatch / none).
+/// `init` kernels have no transition prologue and provide the whole loop body.
+/// Each arm expands to the same intrinsic sequence as the original
+/// hand-written kernel.
+#[cfg(target_arch = "x86_64")]
+macro_rules! phasing_kernel_avx2 {
+    (
+        $(#[$attr:meta])*
+        trans fn $name:ident(&mut $self:ident $(, $arg:ident : $aty:ty)*);
+        ctx { $pp:ident $k:ident $base:ident $p:ident $scale:ident $nt_s:ident $tfreq:ident $nts:ident $sumv:ident }
+        setup { $($setup:tt)* }
+        stay  { $($stay:tt)* }
+        sel   { $($sel:tt)* }
+    ) => {
+        $(#[$attr])*
+        #[cfg(target_arch = "x86_64")]
+        #[target_feature(enable = "avx2,fma")]
+        unsafe fn $name(&mut $self $(, $arg : $aty)*) { unsafe {
+            use core::arch::x86_64::*;
+            let $scale = $self.yt / ($self.n_states as f32 * $self.prob_sum_t);
+            let $nt_s = $self.nt / $self.prob_sum_t;
+            let psh = _mm256_loadu_ps($self.prob_sum_h.as_ptr());
+            let $tfreq = _mm256_mul_ps(psh, _mm256_set1_ps($scale));
+            let $nts = _mm256_set1_ps($nt_s);
+            $($setup)*
+            let mut $sumv = _mm256_setzero_ps();
+            let $pp = $self.prob.as_mut_ptr();
+            for $k in 0..$self.n_states {
+                let $base = $k * HAP_NUMBER;
+                $($stay)*
+                $($sel)*
+                _mm256_storeu_ps($pp.add($base), $p);
+                $sumv = _mm256_add_ps($sumv, $p);
+            }
+            $self.store_sum256($sumv);
+        }}
+    };
+    (
+        $(#[$attr:meta])*
+        init fn $name:ident(&mut $self:ident $(, $arg:ident : $aty:ty)*);
+        ctx { $pp:ident $k:ident $sumv:ident }
+        setup { $($setup:tt)* }
+        body  { $($body:tt)* }
+    ) => {
+        $(#[$attr])*
+        #[cfg(target_arch = "x86_64")]
+        #[target_feature(enable = "avx2,fma")]
+        unsafe fn $name(&mut $self $(, $arg : $aty)*) { unsafe {
+            use core::arch::x86_64::*;
+            $($setup)*
+            let mut $sumv = _mm256_setzero_ps();
+            let $pp = $self.prob.as_mut_ptr();
+            for $k in 0..$self.n_states {
+                $($body)*
+            }
+            $self.store_sum256($sumv);
+        }}
+    };
+}
+
+/// Generate the AVX-512 (16-wide, two k per vector) phasing kernels. Same idea
+/// as [`phasing_kernel_avx2`]: shared 512-bit prologue + `while k < kpair`
+/// pair-loop + [`PhasingHmm::store_sum512`] + odd-`k` `tail` dispatch; the
+/// `setup`/`stay`/`sel`/`tail` parts are the only per-kernel differences. Each
+/// arm expands to the same intrinsic sequence as the original.
+#[cfg(target_arch = "x86_64")]
+macro_rules! phasing_kernel_avx512 {
+    (
+        $(#[$attr:meta])*
+        trans fn $name:ident(&mut $self:ident $(, $arg:ident : $aty:ty)*);
+        ctx { $pp:ident $k:ident $base:ident $p:ident $scale:ident $nt_s:ident $tfreq:ident $nts:ident $sumv:ident $kpair:ident }
+        setup { $($setup:tt)* }
+        stay  { $($stay:tt)* }
+        sel   { $($sel:tt)* }
+        tail  { $($tail:tt)* }
+    ) => {
+        $(#[$attr])*
+        #[cfg(target_arch = "x86_64")]
+        #[target_feature(enable = "avx512f,avx512dq")]
+        unsafe fn $name(&mut $self $(, $arg : $aty)*) { unsafe {
+            use core::arch::x86_64::*;
+            let $scale = $self.yt / ($self.n_states as f32 * $self.prob_sum_t);
+            let $nt_s = $self.nt / $self.prob_sum_t;
+            let $tfreq = _mm512_mul_ps(Self::dup8_to_512($self.prob_sum_h.as_ptr()), _mm512_set1_ps($scale));
+            let $nts = _mm512_set1_ps($nt_s);
+            $($setup)*
+            let $kpair = $self.n_states & !1usize;
+            let $pp = $self.prob.as_mut_ptr();
+            let mut $sumv = _mm512_setzero_ps();
+            let mut $k = 0;
+            while $k < $kpair {
+                let $base = $k * HAP_NUMBER;
+                $($stay)*
+                $($sel)*
+                _mm512_storeu_ps($pp.add($base), $p);
+                $sumv = _mm512_add_ps($sumv, $p);
+                $k += 2;
+            }
+            $self.store_sum512($sumv);
+            if $k < $self.n_states {
+                $($tail)*
+            }
+        }}
+    };
+    (
+        $(#[$attr:meta])*
+        init fn $name:ident(&mut $self:ident $(, $arg:ident : $aty:ty)*);
+        ctx { $pp:ident $k:ident $sumv:ident $kpair:ident }
+        setup { $($setup:tt)* }
+        body  { $($body:tt)* }
+        tail  { $($tail:tt)* }
+    ) => {
+        $(#[$attr])*
+        #[cfg(target_arch = "x86_64")]
+        #[target_feature(enable = "avx512f,avx512dq")]
+        unsafe fn $name(&mut $self $(, $arg : $aty)*) { unsafe {
+            use core::arch::x86_64::*;
+            $($setup)*
+            let $kpair = $self.n_states & !1usize;
+            let $pp = $self.prob.as_mut_ptr();
+            let mut $sumv = _mm512_setzero_ps();
+            let mut $k = 0;
+            while $k < $kpair {
+                $($body)*
+                $k += 2;
+            }
+            $self.store_sum512($sumv);
+            if $k < $self.n_states {
+                $($tail)*
+            }
+        }}
+    };
+}
+
 impl PhasingHmm {
     /// Build the EMIT0/EMIT1 tables as the literal 24-entry assignment.
     /// `ed = err_phase`, `ee = 1 - err_phase`.
@@ -804,188 +944,132 @@ impl PhasingHmm {
 
     // ---- AVX2 (8-wide) ----------------------------------------------------
 
-    /// INIT_PEAK_HET AVX2. p[h] = emits[h] (emit0/emit1 by allele).
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,fma")]
-    unsafe fn init_peak_het_avx2(&mut self, curr_het: usize) { unsafe {
-        use core::arch::x86_64::*;
-        let e0 = _mm256_loadu_ps(self.emit0[curr_het].as_ptr());
-        let e1 = _mm256_loadu_ps(self.emit1[curr_het].as_ptr());
-        let mut sumv = _mm256_setzero_ps();
-        let pp = self.prob.as_mut_ptr();
-        for k in 0..self.n_states {
+    phasing_kernel_avx2! {
+        /// INIT_PEAK_HET AVX2. p[h] = emits[h] (emit0/emit1 by allele).
+        init fn init_peak_het_avx2(&mut self, curr_het: usize);
+        ctx { pp k sumv }
+        setup {
+            let e0 = _mm256_loadu_ps(self.emit0[curr_het].as_ptr());
+            let e1 = _mm256_loadu_ps(self.emit1[curr_het].as_ptr());
+        }
+        body {
             let ev = if self.cond_bit(k) { e1 } else { e0 };
             _mm256_storeu_ps(pp.add(k * HAP_NUMBER), ev);
             sumv = _mm256_add_ps(sumv, ev);
         }
-        self.store_sum256(sumv);
-    }}
+    }
 
-    /// INIT_PEAK_HOM AVX2. p[h] = (ah!=ag ? mism : 1.0), broadcast.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,fma")]
-    unsafe fn init_peak_hom_avx2(&mut self, ag: bool, mism: f32) { unsafe {
-        use core::arch::x86_64::*;
-        let one = _mm256_set1_ps(1.0);
-        let mv = _mm256_set1_ps(mism);
-        let mut sumv = _mm256_setzero_ps();
-        let pp = self.prob.as_mut_ptr();
-        for k in 0..self.n_states {
+    phasing_kernel_avx2! {
+        /// INIT_PEAK_HOM AVX2. p[h] = (ah!=ag ? mism : 1.0), broadcast.
+        init fn init_peak_hom_avx2(&mut self, ag: bool, mism: f32);
+        ctx { pp k sumv }
+        setup {
+            let one = _mm256_set1_ps(1.0);
+            let mv = _mm256_set1_ps(mism);
+        }
+        body {
             let ah = self.cond_bit(k);
             let v = if ah != ag { mv } else { one };
             _mm256_storeu_ps(pp.add(k * HAP_NUMBER), v);
             sumv = _mm256_add_ps(sumv, v);
         }
-        self.store_sum256(sumv);
-    }}
+    }
 
-    /// RUN_PEAK_HET AVX2. p = (prob*nt_s + tfreq) * emits.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,fma")]
-    unsafe fn run_peak_het_avx2(&mut self, curr_het: usize) { unsafe {
-        use core::arch::x86_64::*;
-        let scale = self.yt / (self.n_states as f32 * self.prob_sum_t);
-        let nt_s = self.nt / self.prob_sum_t;
-        let psh = _mm256_loadu_ps(self.prob_sum_h.as_ptr());
-        let tfreq = _mm256_mul_ps(psh, _mm256_set1_ps(scale));
-        let nts = _mm256_set1_ps(nt_s);
-        let e0 = _mm256_loadu_ps(self.emit0[curr_het].as_ptr());
-        let e1 = _mm256_loadu_ps(self.emit1[curr_het].as_ptr());
-        let mut sumv = _mm256_setzero_ps();
-        let pp = self.prob.as_mut_ptr();
-        for k in 0..self.n_states {
-            let base = k * HAP_NUMBER;
+    phasing_kernel_avx2! {
+        /// RUN_PEAK_HET AVX2. p = (prob*nt_s + tfreq) * emits.
+        trans fn run_peak_het_avx2(&mut self, curr_het: usize);
+        ctx { pp k base p scale nt_s tfreq nts sumv }
+        setup {
+            let e0 = _mm256_loadu_ps(self.emit0[curr_het].as_ptr());
+            let e1 = _mm256_loadu_ps(self.emit1[curr_het].as_ptr());
+        }
+        stay {
             let pv = _mm256_loadu_ps(pp.add(base));
             let t = _mm256_fmadd_ps(pv, nts, tfreq); // prob*nt_s + tfreq
+        }
+        sel {
             let ev = if self.cond_bit(k) { e1 } else { e0 };
             let p = _mm256_mul_ps(t, ev);
-            _mm256_storeu_ps(pp.add(base), p);
-            sumv = _mm256_add_ps(sumv, p);
         }
-        self.store_sum256(sumv);
-    }}
+    }
 
-    /// RUN_PEAK_HOM AVX2. p = (prob*nt_s + tfreq) * (mism if mismatch else 1).
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,fma")]
-    unsafe fn run_peak_hom_avx2(&mut self, ag: bool, mism: f32) { unsafe {
-        use core::arch::x86_64::*;
-        let scale = self.yt / (self.n_states as f32 * self.prob_sum_t);
-        let nt_s = self.nt / self.prob_sum_t;
-        let psh = _mm256_loadu_ps(self.prob_sum_h.as_ptr());
-        let tfreq = _mm256_mul_ps(psh, _mm256_set1_ps(scale));
-        let nts = _mm256_set1_ps(nt_s);
-        let mv = _mm256_set1_ps(mism);
-        let one = _mm256_set1_ps(1.0);
-        let mut sumv = _mm256_setzero_ps();
-        let pp = self.prob.as_mut_ptr();
-        for k in 0..self.n_states {
-            let base = k * HAP_NUMBER;
+    phasing_kernel_avx2! {
+        /// RUN_PEAK_HOM AVX2. p = (prob*nt_s + tfreq) * (mism if mismatch else 1).
+        trans fn run_peak_hom_avx2(&mut self, ag: bool, mism: f32);
+        ctx { pp k base p scale nt_s tfreq nts sumv }
+        setup {
+            let mv = _mm256_set1_ps(mism);
+            let one = _mm256_set1_ps(1.0);
+        }
+        stay {
             let pv = _mm256_loadu_ps(pp.add(base));
             let t = _mm256_fmadd_ps(pv, nts, tfreq);
+        }
+        sel {
             let mism_lane = if ag != self.cond_bit(k) { mv } else { one };
             let p = _mm256_mul_ps(t, mism_lane);
-            _mm256_storeu_ps(pp.add(base), p);
-            sumv = _mm256_add_ps(sumv, p);
         }
-        self.store_sum256(sumv);
-    }}
+    }
 
-    /// RUN_FLAT_HET AVX2. p = prob*nt_s + tfreq (no emission).
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,fma")]
-    unsafe fn run_flat_het_avx2(&mut self) { unsafe {
-        use core::arch::x86_64::*;
-        let scale = self.yt / (self.n_states as f32 * self.prob_sum_t);
-        let nt_s = self.nt / self.prob_sum_t;
-        let psh = _mm256_loadu_ps(self.prob_sum_h.as_ptr());
-        let tfreq = _mm256_mul_ps(psh, _mm256_set1_ps(scale));
-        let nts = _mm256_set1_ps(nt_s);
-        let mut sumv = _mm256_setzero_ps();
-        let pp = self.prob.as_mut_ptr();
-        for k in 0..self.n_states {
-            let base = k * HAP_NUMBER;
+    phasing_kernel_avx2! {
+        /// RUN_FLAT_HET AVX2. p = prob*nt_s + tfreq (no emission).
+        trans fn run_flat_het_avx2(&mut self);
+        ctx { pp k base p scale nt_s tfreq nts sumv }
+        setup {}
+        stay {
             let pv = _mm256_loadu_ps(pp.add(base));
             let p = _mm256_fmadd_ps(pv, nts, tfreq);
-            _mm256_storeu_ps(pp.add(base), p);
-            sumv = _mm256_add_ps(sumv, p);
         }
-        self.store_sum256(sumv);
-    }}
+        sel {}
+    }
 
-    /// COLLAPSE_PEAK_HET AVX2. p = (psk*nt_s + tfreq) * emits (psk broadcast).
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,fma")]
-    unsafe fn collapse_peak_het_avx2(&mut self, curr_het: usize) { unsafe {
-        use core::arch::x86_64::*;
-        let scale = self.yt / (self.n_states as f32 * self.prob_sum_t);
-        let nt_s = self.nt / self.prob_sum_t;
-        let psh = _mm256_loadu_ps(self.prob_sum_h.as_ptr());
-        let tfreq = _mm256_mul_ps(psh, _mm256_set1_ps(scale));
-        let nts = _mm256_set1_ps(nt_s);
-        let e0 = _mm256_loadu_ps(self.emit0[curr_het].as_ptr());
-        let e1 = _mm256_loadu_ps(self.emit1[curr_het].as_ptr());
-        let mut sumv = _mm256_setzero_ps();
-        let pp = self.prob.as_mut_ptr();
-        for k in 0..self.n_states {
-            let base = k * HAP_NUMBER;
+    phasing_kernel_avx2! {
+        /// COLLAPSE_PEAK_HET AVX2. p = (psk*nt_s + tfreq) * emits (psk broadcast).
+        trans fn collapse_peak_het_avx2(&mut self, curr_het: usize);
+        ctx { pp k base p scale nt_s tfreq nts sumv }
+        setup {
+            let e0 = _mm256_loadu_ps(self.emit0[curr_het].as_ptr());
+            let e1 = _mm256_loadu_ps(self.emit1[curr_het].as_ptr());
+        }
+        stay {
             let pskv = _mm256_set1_ps(self.prob_sum_k[k]);
             let t = _mm256_fmadd_ps(pskv, nts, tfreq); // psk*nt_s + tfreq
+        }
+        sel {
             let ev = if self.cond_bit(k) { e1 } else { e0 };
             let p = _mm256_mul_ps(t, ev);
-            _mm256_storeu_ps(pp.add(base), p);
-            sumv = _mm256_add_ps(sumv, p);
         }
-        self.store_sum256(sumv);
-    }}
+    }
 
-    /// COLLAPSE_PEAK_HOM AVX2. p = (psk*nt_s + tfreq) * (mism if mismatch else 1).
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,fma")]
-    unsafe fn collapse_peak_hom_avx2(&mut self, ag: bool, mism: f32) { unsafe {
-        use core::arch::x86_64::*;
-        let scale = self.yt / (self.n_states as f32 * self.prob_sum_t);
-        let nt_s = self.nt / self.prob_sum_t;
-        let psh = _mm256_loadu_ps(self.prob_sum_h.as_ptr());
-        let tfreq = _mm256_mul_ps(psh, _mm256_set1_ps(scale));
-        let nts = _mm256_set1_ps(nt_s);
-        let mv = _mm256_set1_ps(mism);
-        let one = _mm256_set1_ps(1.0);
-        let mut sumv = _mm256_setzero_ps();
-        let pp = self.prob.as_mut_ptr();
-        for k in 0..self.n_states {
-            let base = k * HAP_NUMBER;
+    phasing_kernel_avx2! {
+        /// COLLAPSE_PEAK_HOM AVX2. p = (psk*nt_s + tfreq) * (mism if mismatch else 1).
+        trans fn collapse_peak_hom_avx2(&mut self, ag: bool, mism: f32);
+        ctx { pp k base p scale nt_s tfreq nts sumv }
+        setup {
+            let mv = _mm256_set1_ps(mism);
+            let one = _mm256_set1_ps(1.0);
+        }
+        stay {
             let pskv = _mm256_set1_ps(self.prob_sum_k[k]);
             let t = _mm256_fmadd_ps(pskv, nts, tfreq);
+        }
+        sel {
             let mism_lane = if ag != self.cond_bit(k) { mv } else { one };
             let p = _mm256_mul_ps(t, mism_lane);
-            _mm256_storeu_ps(pp.add(base), p);
-            sumv = _mm256_add_ps(sumv, p);
         }
-        self.store_sum256(sumv);
-    }}
+    }
 
-    /// COLLAPSE_FLAT_HET AVX2. p = psk*nt_s + tfreq.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,fma")]
-    unsafe fn collapse_flat_het_avx2(&mut self) { unsafe {
-        use core::arch::x86_64::*;
-        let scale = self.yt / (self.n_states as f32 * self.prob_sum_t);
-        let nt_s = self.nt / self.prob_sum_t;
-        let psh = _mm256_loadu_ps(self.prob_sum_h.as_ptr());
-        let tfreq = _mm256_mul_ps(psh, _mm256_set1_ps(scale));
-        let nts = _mm256_set1_ps(nt_s);
-        let mut sumv = _mm256_setzero_ps();
-        let pp = self.prob.as_mut_ptr();
-        for k in 0..self.n_states {
-            let base = k * HAP_NUMBER;
+    phasing_kernel_avx2! {
+        /// COLLAPSE_FLAT_HET AVX2. p = psk*nt_s + tfreq.
+        trans fn collapse_flat_het_avx2(&mut self);
+        ctx { pp k base p scale nt_s tfreq nts sumv }
+        setup {}
+        stay {
             let pskv = _mm256_set1_ps(self.prob_sum_k[k]);
             let p = _mm256_fmadd_ps(pskv, nts, tfreq);
-            _mm256_storeu_ps(pp.add(base), p);
-            sumv = _mm256_add_ps(sumv, p);
         }
-        self.store_sum256(sumv);
-    }}
+        sel {}
+    }
 
     /// Store an 8-lane `sum` accumulator into `prob_sum_h` + `prob_sum_t`.
     #[cfg(target_arch = "x86_64")]
@@ -1072,233 +1156,159 @@ impl PhasingHmm {
         _mm512_mask_blend_ps(m, e0, e1)
     }}
 
-    /// INIT_PEAK_HET AVX-512 (two k per __m512).
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512dq")]
-    unsafe fn init_peak_het_avx512(&mut self, curr_het: usize) { unsafe {
-        use core::arch::x86_64::*;
-        let e0 = Self::dup8_to_512(self.emit0[curr_het].as_ptr());
-        let e1 = Self::dup8_to_512(self.emit1[curr_het].as_ptr());
-        let kpair = self.n_states & !1usize;
-        let pp = self.prob.as_mut_ptr();
-        let mut sumv = _mm512_setzero_ps();
-        let mut k = 0;
-        while k < kpair {
+    phasing_kernel_avx512! {
+        /// INIT_PEAK_HET AVX-512 (two k per __m512).
+        init fn init_peak_het_avx512(&mut self, curr_het: usize);
+        ctx { pp k sumv kpair }
+        setup {
+            let e0 = Self::dup8_to_512(self.emit0[curr_het].as_ptr());
+            let e1 = Self::dup8_to_512(self.emit1[curr_het].as_ptr());
+        }
+        body {
             let ev = self.emit_pair512(k, e0, e1);
             _mm512_storeu_ps(pp.add(k * HAP_NUMBER), ev);
             sumv = _mm512_add_ps(sumv, ev);
-            k += 2;
         }
-        self.store_sum512(sumv);
-        if k < self.n_states {
+        tail {
             self.tail_init_het(curr_het, k);
         }
-    }}
+    }
 
-    /// INIT_PEAK_HOM AVX-512.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512dq")]
-    unsafe fn init_peak_hom_avx512(&mut self, ag: bool, mism: f32) { unsafe {
-        use core::arch::x86_64::*;
-        let one = _mm512_set1_ps(1.0);
-        let mv = _mm512_set1_ps(mism);
-        let kpair = self.n_states & !1usize;
-        let pp = self.prob.as_mut_ptr();
-        let mut sumv = _mm512_setzero_ps();
-        let mut k = 0;
-        while k < kpair {
+    phasing_kernel_avx512! {
+        /// INIT_PEAK_HOM AVX-512.
+        init fn init_peak_hom_avx512(&mut self, ag: bool, mism: f32);
+        ctx { pp k sumv kpair }
+        setup {
+            let one = _mm512_set1_ps(1.0);
+            let mv = _mm512_set1_ps(mism);
+        }
+        body {
             let m = self.hom_mask_pair(k, ag);
             let v = _mm512_mask_blend_ps(m, one, mv);
             _mm512_storeu_ps(pp.add(k * HAP_NUMBER), v);
             sumv = _mm512_add_ps(sumv, v);
-            k += 2;
         }
-        self.store_sum512(sumv);
-        if k < self.n_states {
+        tail {
             self.tail_init_hom(ag, mism, k);
         }
-    }}
+    }
 
-    /// RUN_PEAK_HET AVX-512.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512dq")]
-    unsafe fn run_peak_het_avx512(&mut self, curr_het: usize) { unsafe {
-        use core::arch::x86_64::*;
-        let scale = self.yt / (self.n_states as f32 * self.prob_sum_t);
-        let nt_s = self.nt / self.prob_sum_t;
-        let tfreq = _mm512_mul_ps(Self::dup8_to_512(self.prob_sum_h.as_ptr()), _mm512_set1_ps(scale));
-        let nts = _mm512_set1_ps(nt_s);
-        let e0 = Self::dup8_to_512(self.emit0[curr_het].as_ptr());
-        let e1 = Self::dup8_to_512(self.emit1[curr_het].as_ptr());
-        let kpair = self.n_states & !1usize;
-        let pp = self.prob.as_mut_ptr();
-        let mut sumv = _mm512_setzero_ps();
-        let mut k = 0;
-        while k < kpair {
-            let base = k * HAP_NUMBER;
+    phasing_kernel_avx512! {
+        /// RUN_PEAK_HET AVX-512.
+        trans fn run_peak_het_avx512(&mut self, curr_het: usize);
+        ctx { pp k base p scale nt_s tfreq nts sumv kpair }
+        setup {
+            let e0 = Self::dup8_to_512(self.emit0[curr_het].as_ptr());
+            let e1 = Self::dup8_to_512(self.emit1[curr_het].as_ptr());
+        }
+        stay {
             let pv = _mm512_loadu_ps(pp.add(base));
             let t = _mm512_fmadd_ps(pv, nts, tfreq);
+        }
+        sel {
             let ev = self.emit_pair512(k, e0, e1);
             let p = _mm512_mul_ps(t, ev);
-            _mm512_storeu_ps(pp.add(base), p);
-            sumv = _mm512_add_ps(sumv, p);
-            k += 2;
         }
-        self.store_sum512(sumv);
-        if k < self.n_states {
+        tail {
             self.tail_run_het(curr_het, scale, nt_s, k);
         }
-    }}
+    }
 
-    /// RUN_PEAK_HOM AVX-512.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512dq")]
-    unsafe fn run_peak_hom_avx512(&mut self, ag: bool, mism: f32) { unsafe {
-        use core::arch::x86_64::*;
-        let scale = self.yt / (self.n_states as f32 * self.prob_sum_t);
-        let nt_s = self.nt / self.prob_sum_t;
-        let tfreq = _mm512_mul_ps(Self::dup8_to_512(self.prob_sum_h.as_ptr()), _mm512_set1_ps(scale));
-        let nts = _mm512_set1_ps(nt_s);
-        let mv = _mm512_set1_ps(mism);
-        let one = _mm512_set1_ps(1.0);
-        let kpair = self.n_states & !1usize;
-        let pp = self.prob.as_mut_ptr();
-        let mut sumv = _mm512_setzero_ps();
-        let mut k = 0;
-        while k < kpair {
-            let base = k * HAP_NUMBER;
+    phasing_kernel_avx512! {
+        /// RUN_PEAK_HOM AVX-512.
+        trans fn run_peak_hom_avx512(&mut self, ag: bool, mism: f32);
+        ctx { pp k base p scale nt_s tfreq nts sumv kpair }
+        setup {
+            let mv = _mm512_set1_ps(mism);
+            let one = _mm512_set1_ps(1.0);
+        }
+        stay {
             let pv = _mm512_loadu_ps(pp.add(base));
             let t = _mm512_fmadd_ps(pv, nts, tfreq);
+        }
+        sel {
             let m = self.hom_mask_pair(k, ag);
             let ml = _mm512_mask_blend_ps(m, one, mv);
             let p = _mm512_mul_ps(t, ml);
-            _mm512_storeu_ps(pp.add(base), p);
-            sumv = _mm512_add_ps(sumv, p);
-            k += 2;
         }
-        self.store_sum512(sumv);
-        if k < self.n_states {
+        tail {
             self.tail_run_hom(ag, mism, scale, nt_s, k);
         }
-    }}
+    }
 
-    /// RUN_FLAT_HET AVX-512.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512dq")]
-    unsafe fn run_flat_het_avx512(&mut self) { unsafe {
-        use core::arch::x86_64::*;
-        let scale = self.yt / (self.n_states as f32 * self.prob_sum_t);
-        let nt_s = self.nt / self.prob_sum_t;
-        let tfreq = _mm512_mul_ps(Self::dup8_to_512(self.prob_sum_h.as_ptr()), _mm512_set1_ps(scale));
-        let nts = _mm512_set1_ps(nt_s);
-        let kpair = self.n_states & !1usize;
-        let pp = self.prob.as_mut_ptr();
-        let mut sumv = _mm512_setzero_ps();
-        let mut k = 0;
-        while k < kpair {
-            let base = k * HAP_NUMBER;
+    phasing_kernel_avx512! {
+        /// RUN_FLAT_HET AVX-512.
+        trans fn run_flat_het_avx512(&mut self);
+        ctx { pp k base p scale nt_s tfreq nts sumv kpair }
+        setup {}
+        stay {
             let pv = _mm512_loadu_ps(pp.add(base));
             let p = _mm512_fmadd_ps(pv, nts, tfreq);
-            _mm512_storeu_ps(pp.add(base), p);
-            sumv = _mm512_add_ps(sumv, p);
-            k += 2;
         }
-        self.store_sum512(sumv);
-        if k < self.n_states {
+        sel {}
+        tail {
             self.tail_flat(scale, nt_s, k, false);
         }
-    }}
+    }
 
-    /// COLLAPSE_PEAK_HET AVX-512.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512dq")]
-    unsafe fn collapse_peak_het_avx512(&mut self, curr_het: usize) { unsafe {
-        use core::arch::x86_64::*;
-        let scale = self.yt / (self.n_states as f32 * self.prob_sum_t);
-        let nt_s = self.nt / self.prob_sum_t;
-        let tfreq = _mm512_mul_ps(Self::dup8_to_512(self.prob_sum_h.as_ptr()), _mm512_set1_ps(scale));
-        let nts = _mm512_set1_ps(nt_s);
-        let e0 = Self::dup8_to_512(self.emit0[curr_het].as_ptr());
-        let e1 = Self::dup8_to_512(self.emit1[curr_het].as_ptr());
-        let kpair = self.n_states & !1usize;
-        let pp = self.prob.as_mut_ptr();
-        let mut sumv = _mm512_setzero_ps();
-        let mut k = 0;
-        while k < kpair {
-            let base = k * HAP_NUMBER;
+    phasing_kernel_avx512! {
+        /// COLLAPSE_PEAK_HET AVX-512.
+        trans fn collapse_peak_het_avx512(&mut self, curr_het: usize);
+        ctx { pp k base p scale nt_s tfreq nts sumv kpair }
+        setup {
+            let e0 = Self::dup8_to_512(self.emit0[curr_het].as_ptr());
+            let e1 = Self::dup8_to_512(self.emit1[curr_het].as_ptr());
+        }
+        stay {
             // psk broadcast: low half = prob_sum_k[k], high half = prob_sum_k[k+1].
             let pskv = self.psk_pair512(k);
             let t = _mm512_fmadd_ps(pskv, nts, tfreq);
+        }
+        sel {
             let ev = self.emit_pair512(k, e0, e1);
             let p = _mm512_mul_ps(t, ev);
-            _mm512_storeu_ps(pp.add(base), p);
-            sumv = _mm512_add_ps(sumv, p);
-            k += 2;
         }
-        self.store_sum512(sumv);
-        if k < self.n_states {
+        tail {
             self.tail_collapse_het(curr_het, scale, nt_s, k);
         }
-    }}
+    }
 
-    /// COLLAPSE_PEAK_HOM AVX-512.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512dq")]
-    unsafe fn collapse_peak_hom_avx512(&mut self, ag: bool, mism: f32) { unsafe {
-        use core::arch::x86_64::*;
-        let scale = self.yt / (self.n_states as f32 * self.prob_sum_t);
-        let nt_s = self.nt / self.prob_sum_t;
-        let tfreq = _mm512_mul_ps(Self::dup8_to_512(self.prob_sum_h.as_ptr()), _mm512_set1_ps(scale));
-        let nts = _mm512_set1_ps(nt_s);
-        let mv = _mm512_set1_ps(mism);
-        let one = _mm512_set1_ps(1.0);
-        let kpair = self.n_states & !1usize;
-        let pp = self.prob.as_mut_ptr();
-        let mut sumv = _mm512_setzero_ps();
-        let mut k = 0;
-        while k < kpair {
-            let base = k * HAP_NUMBER;
+    phasing_kernel_avx512! {
+        /// COLLAPSE_PEAK_HOM AVX-512.
+        trans fn collapse_peak_hom_avx512(&mut self, ag: bool, mism: f32);
+        ctx { pp k base p scale nt_s tfreq nts sumv kpair }
+        setup {
+            let mv = _mm512_set1_ps(mism);
+            let one = _mm512_set1_ps(1.0);
+        }
+        stay {
             let pskv = self.psk_pair512(k);
             let t = _mm512_fmadd_ps(pskv, nts, tfreq);
+        }
+        sel {
             let m = self.hom_mask_pair(k, ag);
             let ml = _mm512_mask_blend_ps(m, one, mv);
             let p = _mm512_mul_ps(t, ml);
-            _mm512_storeu_ps(pp.add(base), p);
-            sumv = _mm512_add_ps(sumv, p);
-            k += 2;
         }
-        self.store_sum512(sumv);
-        if k < self.n_states {
+        tail {
             self.tail_collapse_hom(ag, mism, scale, nt_s, k);
         }
-    }}
+    }
 
-    /// COLLAPSE_FLAT_HET AVX-512.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512dq")]
-    unsafe fn collapse_flat_het_avx512(&mut self) { unsafe {
-        use core::arch::x86_64::*;
-        let scale = self.yt / (self.n_states as f32 * self.prob_sum_t);
-        let nt_s = self.nt / self.prob_sum_t;
-        let tfreq = _mm512_mul_ps(Self::dup8_to_512(self.prob_sum_h.as_ptr()), _mm512_set1_ps(scale));
-        let nts = _mm512_set1_ps(nt_s);
-        let kpair = self.n_states & !1usize;
-        let pp = self.prob.as_mut_ptr();
-        let mut sumv = _mm512_setzero_ps();
-        let mut k = 0;
-        while k < kpair {
-            let base = k * HAP_NUMBER;
+    phasing_kernel_avx512! {
+        /// COLLAPSE_FLAT_HET AVX-512.
+        trans fn collapse_flat_het_avx512(&mut self);
+        ctx { pp k base p scale nt_s tfreq nts sumv kpair }
+        setup {}
+        stay {
             let pskv = self.psk_pair512(k);
             let p = _mm512_fmadd_ps(pskv, nts, tfreq);
-            _mm512_storeu_ps(pp.add(base), p);
-            sumv = _mm512_add_ps(sumv, p);
-            k += 2;
         }
-        self.store_sum512(sumv);
-        if k < self.n_states {
+        sel {}
+        tail {
             self.tail_flat(scale, nt_s, k, true);
         }
-    }}
+    }
 
     /// 16-lane mask for the hom mismatch (`ag != allele`) over states k, k+1.
     #[cfg(target_arch = "x86_64")]
