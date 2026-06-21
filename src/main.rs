@@ -116,7 +116,7 @@ fn main() {
         // Resolve the effective engine: explicit `--engine` first, else the legacy
         // booleans (`--lcwgs` → lcwgs, `--refine` → refine), else `auto` (which is
         // also what bare `--auto-route` and "no engine flag at all" mean now).
-        let engine = args.engine.unwrap_or_else(|| {
+        let engine = args.engine.unwrap_or({
             if args.lcwgs { cli::Engine::Lcwgs }
             else if args.refine { cli::Engine::Refine }
             else { cli::Engine::Auto }
@@ -237,17 +237,14 @@ fn main() {
             let mut g2params = selphi::lcwgs::ls_params::LsParams::default();
             // RESEARCH knob: override the conditioning size (LCWGS_LSX_KPBWT) to probe
             // selection headroom — e.g. = n_ref for an all-cond upper bound.
-            if let Some(k) = selphi::config::raw("LCWGS_LSX_KPBWT") {
-                if let Ok(k) = k.parse::<usize>() { g2params.kpbwt = k; g2params.kinit = k; }
-            }
+            if let Some(k) = selphi::config::raw("LCWGS_LSX_KPBWT")
+                && let Ok(k) = k.parse::<usize>() { g2params.kpbwt = k; g2params.kinit = k; }
             // RESEARCH knobs: override the Gibbs schedule (LCWGS_LSX_BURNIN /
             // LCWGS_LSX_MAIN) to probe convergence headroom vs GLIMPSE2's 5/15.
-            if let Some(b) = selphi::config::raw("LCWGS_LSX_BURNIN") {
-                if let Ok(b) = b.parse::<i32>() { g2params.burnin = b; }
-            }
-            if let Some(m) = selphi::config::raw("LCWGS_LSX_MAIN") {
-                if let Ok(m) = m.parse::<i32>() { g2params.main = m; }
-            }
+            if let Some(b) = selphi::config::raw("LCWGS_LSX_BURNIN")
+                && let Ok(b) = b.parse::<i32>() { g2params.burnin = b; }
+            if let Some(m) = selphi::config::raw("LCWGS_LSX_MAIN")
+                && let Ok(m) = m.parse::<i32>() { g2params.main = m; }
             let result = selphi::sparse_ls::pipeline::run_pipeline(
                 input, &srp, map, &g2params, args.seed as u64,
             ).unwrap_or_else(|e| {

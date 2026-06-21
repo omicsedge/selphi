@@ -192,7 +192,7 @@ fn pileup_one(
         return pileup_one_cram(path, chrom, pos, ref_base, alt_base, is_snp, region, reference, indel_model, params, lut);
     }
     let n_var = pos.len();
-    let mut reader = bam::io::reader::Builder::default().build_from_path(path)?;
+    let mut reader = bam::io::reader::Builder.build_from_path(path)?;
     let header = reader.read_header()?;
 
     let sample_id = read_group_sample_id(&header, path);

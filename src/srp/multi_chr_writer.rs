@@ -718,12 +718,12 @@ fn strip_idx_from_contig(line: &str) -> String {
     // Remove ",IDX=N" or "IDX=N," patterns
     let mut result = line.to_string();
     if let Some(idx_pos) = result.find(",IDX=") {
-        let end = result[idx_pos+5..].find(|c: char| c == ',' || c == '>')
+        let end = result[idx_pos+5..].find([',', '>'])
             .map(|p| idx_pos + 5 + p)
             .unwrap_or(result.len());
         result = format!("{}{}", &result[..idx_pos], &result[end..]);
     } else if let Some(idx_pos) = result.find("IDX=") {
-        let end = result[idx_pos+4..].find(|c: char| c == ',' || c == '>')
+        let end = result[idx_pos+4..].find([',', '>'])
             .map(|p| idx_pos + 4 + p)
             .unwrap_or(result.len());
         let start = if idx_pos > 0 && result.as_bytes()[idx_pos-1] == b',' { idx_pos - 1 } else { idx_pos };

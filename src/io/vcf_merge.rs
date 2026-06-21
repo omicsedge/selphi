@@ -178,7 +178,7 @@ fn skip_vcf_header(reader: &mut BufReader<BgzfReader<std::fs::File>>) -> std::io
 fn parse_contig_id(contig_field: &str) -> Option<String> {
     let s = contig_field.find("ID=")? + 3;
     let rest = &contig_field[s..];
-    let e = rest.find(|c: char| c == ',' || c == '>').unwrap_or(rest.len());
+    let e = rest.find([',', '>']).unwrap_or(rest.len());
     Some(rest[..e].to_string())
 }
 

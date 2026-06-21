@@ -768,9 +768,8 @@ fn _run_iterations(
             hap_bm.update_hap_all_from_vec(si * 2 + 1, &h1);
             if capturing { this_main.push((h0, h1)); }
         }
-        if capturing {
-            if let Some(ms) = main_samples.as_deref_mut() { ms.push(this_main); }
-        }
+        if capturing
+            && let Some(ms) = main_samples.as_deref_mut() { ms.push(this_main); }
 
         // EM-Ne online update during burnin. Diverges from SHAPEIT5 (which
         // uses a fixed Ne) and the formula is admittedly crude — it uses
