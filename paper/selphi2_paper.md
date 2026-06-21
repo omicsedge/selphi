@@ -294,15 +294,14 @@ Given both tools the same Beagle-derived phasing, Selphi 2's imputation exceeds 
 | Selphi 2 (haploid engine, internal phasing) | 0.9587 | 0.7909 |
 | Selphi 2 (diploid engine, internal phasing) | **0.9605** | **0.7935** |
 
-Beyond accuracy, Selphi 2's default diploid engine is faster and substantially leaner than Beagle 5.5 on this benchmark. Imputing the six-sample cohort against the 75,552-haplotype panel on a single 16-thread node (one chromosome at a time), Selphi 2 completes chromosome 1 in 105 s at 27 GB peak memory and chromosome 22 in 20 s at 10 GB, versus Beagle's 135 s / 52 GB and 39 s / 29 GB, roughly 1.3–2× faster at one-half to one-third the peak memory, even though the default intra-run ensemble (Methods) runs two imputation passes. With the ensemble disabled the diploid engine is faster still (74 s / 20 GB on chromosome 1; Table 3b).
+Beyond accuracy, Selphi 2's default diploid engine is faster and leaner than Beagle 5.5 on this benchmark. Imputing the six-sample cohort against the 75,552-haplotype panel on a single 16-thread node (one chromosome at a time), Selphi 2 completes all 22 autosomes in 27.7 minutes versus Beagle's 36.4 minutes (1.3× faster end-to-end), at a peak resident memory of about 25 GB versus Beagle's roughly 40 GB (about 1.6× leaner), even though the default intra-run ensemble (Methods) runs two imputation passes; disabling the ensemble is faster still (Table 3b). Per-chromosome wall times on this shared node fluctuate with system load, so the whole-genome total is the stable measure.
 
-**Table 3b. Wall time and peak memory on the consumer-array benchmark.** Six-sample cohort imputed against the 75,552-haplotype production panel, 16 threads, one chromosome at a time on the same node. "N = 2" is the default diploid intra-run phase ensemble (Methods); "N = 1" disables it (single Viterbi solve). Beagle 5.5 is the full phase-plus-impute pipeline.
+**Table 3b. Whole-genome wall time and peak memory on the consumer-array benchmark.** Six-sample cohort imputed against the 75,552-haplotype production panel across all 22 autosomes, 16 threads, one chromosome at a time on the same node. Wall time is summed over the 22 autosomes; peak memory is the maximum resident set during the run, reached on the largest chromosome. Selphi 2 uses its default diploid engine (intra-run phase ensemble on; disabling it is faster still). Beagle 5.5 is the full phase-plus-impute pipeline. Per-chromosome wall times on this shared node fluctuate with system load (Selphi's memory-bandwidth-bound interpolation varies roughly 15% run to run), so the whole-genome total is the stable comparison; Beagle's peak memory is JVM-garbage-collector-dependent (31–51 GB across repeats, median ≈ 40 GB).
 
-| Tool / mode | chr1 wall | chr1 peak RAM | chr22 wall | chr22 peak RAM |
-|---|---|---|---|---|
-| Selphi 2 diploid, N = 2 (default) | 105 s | 27.2 GB | 20 s | 10.0 GB |
-| Selphi 2 diploid, N = 1 | 74 s | 20.4 GB | 15 s | 8.1 GB |
-| Beagle 5.5 (phase + impute) | 135 s | 52.0 GB | 39 s | 29.2 GB |
+| Tool | Whole-genome wall time | Peak memory |
+|---|---|---|
+| Selphi 2 (default diploid) | 27.7 min | ≈ 25 GB |
+| Beagle 5.5 (phase + impute) | 36.4 min | ≈ 40 GB |
 
 ## **Phasing accuracy on the 1000 Genomes trio dataset**
 
@@ -337,7 +336,7 @@ Table 5 summarizes wall time and peak resident memory for Selphi 2, Selphi 1.5.3
 
 ![Figure 3](figures/figure3_efficiency.png)
 
-**Figure 3. Computational efficiency.** (a) Wall time and (b) peak memory on the production-array benchmark (six samples against the 75,552-haplotype panel, 16 threads, one chromosome at a time): Selphi 2's default diploid engine is faster than Beagle 5.5's full pipeline at one-half to one-third the peak memory (Table 3b). (c) Per-sample low-coverage wall time for chromosome 22, all three tools measured on the entire chromosome (1× coverage, 16 threads, same machine; log scale): 113 s for Selphi 2 versus 287 s for GLIMPSE2 (its 15 native chunks plus ligation) and 1,729 s for QUILT2 (tiled across the chromosome), so Selphi 2 is roughly 2.5× faster than GLIMPSE2 and 15× faster than QUILT2 (Table 6b).
+**Figure 3. Computational efficiency.** (a) Whole-genome wall time and (b) peak memory on the production-array benchmark (six samples against the 75,552-haplotype panel, all 22 autosomes, 16 threads, one chromosome at a time): Selphi 2's default diploid engine completes the genome in 27.7 min versus Beagle 5.5's 36.4 min (1.3× faster) at about 25 GB versus 40 GB peak memory (~1.6× leaner; Table 3b). (c) Per-sample low-coverage wall time for chromosome 22, all three tools measured on the entire chromosome (1× coverage, 16 threads, same machine; log scale): 113 s for Selphi 2 versus 287 s for GLIMPSE2 (its 15 native chunks plus ligation) and 1,729 s for QUILT2 (tiled across the chromosome), so Selphi 2 is roughly 2.5× faster than GLIMPSE2 and 15× faster than QUILT2 (Table 6b).
 
 Selphi 2's wall time is 16× to 50× lower than Selphi 1.5.3 on the imputation-only GIAB workloads, and its peak memory is 39–58% lower than Beagle's on the 1000 Genomes chromosome 22 and both GIAB benchmarks, and comparable to Beagle on 1000 Genomes chromosome 1 (21.9 GB versus 20.2 GB). On the TOPMed biobank-scale run, Selphi 2 is slower than Beagle 5.5 (3.0×) but its peak memory is 31% lower (66.8 GB versus 96.5 GB). The runtime cost on the biobank-scale panel is the price paid for the larger candidate-set retained per target (mc = 132,676 versus Beagle's window-local composite haplotypes); the corresponding accuracy gain is +0.0236 overall R² and is concentrated on the rare-variant bins.
 
