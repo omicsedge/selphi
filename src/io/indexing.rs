@@ -241,15 +241,14 @@ fn scan_vcf(bgzf: &mut impl io::Read) -> io::Result<FileInfo> {
         // Parse chr + pos
         if let Some(tab1) = line.iter().position(|&b| b == b'\t') {
             let chr = std::str::from_utf8(&line[..tab1]).unwrap_or("?").to_string();
-            if let Some(tab2) = line[tab1+1..].iter().position(|&b| b == b'\t') {
-                if let Ok(pos) = std::str::from_utf8(&line[tab1+1..tab1+1+tab2])
+            if let Some(tab2) = line[tab1+1..].iter().position(|&b| b == b'\t')
+                && let Ok(pos) = std::str::from_utf8(&line[tab1+1..tab1+1+tab2])
                     .unwrap_or("0").parse::<i64>() {
                     let entry = regions.entry(chr).or_insert((pos, pos, 0));
                     entry.0 = entry.0.min(pos);
                     entry.1 = entry.1.max(pos);
                     entry.2 += 1;
                 }
-            }
 
             // Check phase from first data line
             if !checked_phase {
@@ -304,19 +303,19 @@ fn parse_header(header: &str) -> HeaderMeta {
         } else if line.starts_with("##contig=") {
             if let Some(i) = line.find("ID=") {
                 let rest = &line[i + 3..];
-                let name = rest.split(|c| c == ',' || c == '>').next().unwrap_or("");
+                let name = rest.split([',', '>']).next().unwrap_or("");
                 contig_names.push(name.to_string());
             }
         } else if line.starts_with("##FORMAT=") {
             if let Some(i) = line.find("ID=") {
                 let rest = &line[i + 3..];
-                let name = rest.split(|c| c == ',' || c == '>').next().unwrap_or("");
+                let name = rest.split([',', '>']).next().unwrap_or("");
                 format_fields.push(name.to_string());
             }
         } else if line.starts_with("##INFO=") {
             if let Some(i) = line.find("ID=") {
                 let rest = &line[i + 3..];
-                let name = rest.split(|c| c == ',' || c == '>').next().unwrap_or("");
+                let name = rest.split([',', '>']).next().unwrap_or("");
                 info_fields.push(name.to_string());
             }
         } else if line.starts_with("#CHROM") {

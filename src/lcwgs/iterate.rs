@@ -683,7 +683,7 @@ pub fn run_gibbs(
         // N=1 this is byte-identical to the shipped schedule modulo that free skip.
         let is_last_iter = it + 1 == params.n_iterations;
         let phase_this_iter = !is_last_iter
-            && (it < n_burnin || (it - n_burnin) % cfg.phase_main_every == 0);
+            && (it < n_burnin || (it - n_burnin).is_multiple_of(cfg.phase_main_every));
         let tp0 = if timing { Some(std::time::Instant::now()) } else { None };
 
         // DMM segment phase-commitment (LCWGS_DMM, main iters only): re-phase each

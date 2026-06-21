@@ -200,13 +200,12 @@ pub struct R4bHardcall<'a> {
 /// indexed by the global sample (`sample_offset + s`).
 #[inline]
 fn r4b_ap(alt_probs: &[f32], tile_n: usize, v: usize, s: usize, hc: Option<&R4bHardcall>) -> (f32, f32) {
-    if let Some(h) = hc {
-        if h.mask[s] {
+    if let Some(h) = hc
+        && h.mask[s] {
             let gs = h.sample_offset + s;
             return (h.chip_genotypes.get(h.chip_idx, gs * 2) as u8 as f32,
                     h.chip_genotypes.get(h.chip_idx, gs * 2 + 1) as u8 as f32);
         }
-    }
     (alt_probs[(s * 2) * tile_n + v], alt_probs[(s * 2 + 1) * tile_n + v])
 }
 

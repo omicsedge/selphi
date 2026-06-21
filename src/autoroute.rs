@@ -251,13 +251,12 @@ fn sniff_vcf_text(raw: &[u8]) -> Sniff {
         n_records += 1;
         if let Some((chrom, pos)) = chrom_pos(line) {
             if first_chrom.is_none() { first_chrom = Some(chrom); }
-            if first_chrom == Some(chrom) {
-                if let Some(p) = parse_pos(pos) {
+            if first_chrom == Some(chrom)
+                && let Some(p) = parse_pos(pos) {
                     s.dens_n += 1;
                     dmin = dmin.min(p);
                     dmax = dmax.max(p);
                 }
-            }
         }
     }
     if n_records == 0 { return s; }
@@ -367,14 +366,13 @@ fn sniff_bcf(path: &str) -> std::io::Result<Sniff> {
         taken += 1;
         let chrom = rec.reference_sequence_name().to_string();
         if first_chrom.is_none() { first_chrom = Some(chrom.clone()); }
-        if first_chrom.as_deref() == Some(chrom.as_str()) {
-            if let Some(p) = rec.variant_start() {
+        if first_chrom.as_deref() == Some(chrom.as_str())
+            && let Some(p) = rec.variant_start() {
                 let p = usize::from(p) as u64;
                 s.dens_n += 1;
                 dmin = dmin.min(p);
                 dmax = dmax.max(p);
             }
-        }
         let samples = rec.samples();
         // Field presence: a key is present if a sample carries that subfield.
         // (Mirrors extract_site_confidence_bcf's per-sample `.get()` probing —

@@ -165,11 +165,11 @@ fn lcwgs_loo() -> bool {
 /// low-confidence (soft real-data, low-DP) reads lean on LD/copying while sharp
 /// reads pass through trusted. `pow` from `LCWGS_ADAPT_EMIT_POW` (default 1.0;
 /// >1 = more aggressive softening of the moderate band, <1 = gentler). Returns
-/// None (no-op → byte-identical) when unset. Applied once in
-/// [`run_forward_backward`] so it flows through every SIMD path and the backward
-/// fold-in consistently. Prior arc: a per-site-epsilon variant was a tradeoff on
-/// an older HEAD (real +0.004-0.006 / sim −0.0028, UPDATE 33) before the joint
-/// phaser became default; re-tested here on real soft GL where it helped.
+/// > None (no-op → byte-identical) when unset. Applied once in
+/// > [`run_forward_backward`] so it flows through every SIMD path and the backward
+/// > fold-in consistently. Prior arc: a per-site-epsilon variant was a tradeoff on
+/// > an older HEAD (real +0.004-0.006 / sim −0.0028, UPDATE 33) before the joint
+/// > phaser became default; re-tested here on real soft GL where it helped.
 fn adapt_emit_pow() -> Option<f32> {
     use std::sync::OnceLock;
     static V: OnceLock<Option<f32>> = OnceLock::new();
