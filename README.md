@@ -18,6 +18,14 @@
   </picture>
 </p>
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="img/speed_dark.svg"/>
+    <source media="(prefers-color-scheme: light)" srcset="img/speed_light.svg"/>
+    <img src="img/speed_dark.svg" alt="Whole-genome phasing + imputation wall time: Selphi 2 27.7 min vs Beagle 5.5 36.4 min (6 samples vs the 75,552-haplotype panel, 22 autosomes, 16 threads)" width="720"/>
+  </picture>
+</p>
+
 > Methodology, parameters, and full benchmark tables (accuracy, phasing switch-error, speed/memory, and comparisons to Beagle, SHAPEIT5, and GLIMPSE2) are in the paper. This README is a usage reference.
 
 ## Contents
