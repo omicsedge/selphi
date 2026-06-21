@@ -6,9 +6,7 @@ use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
-use super::{CscChunk, Variant, SrpMetadata, parse_raw_chunk};
-
-const MAGIC: &[u8; 8] = b"SRP\x00\x02\x00\x00\x00";
+use super::{CscChunk, Variant, SrpMetadata, parse_raw_chunk, SRP_SINGLE_CHR_MAGIC};
 
 pub struct SrpReader {
     pub metadata: SrpMetadata,
@@ -29,7 +27,7 @@ impl SrpReader {
 
         let mut magic = [0u8; 8];
         f.read_exact(&mut magic)?;
-        if &magic != MAGIC {
+        if &magic != SRP_SINGLE_CHR_MAGIC {
             let hint = if &magic == super::SRP_MULTI_CHR_MAGIC {
                 "Detected multi-chromosome SRP file. Use MultiChrSrpReader for multi-chromosome panels."
             } else if &magic[..2] == b"PK" {
@@ -69,10 +67,21 @@ impl SrpReader {
         // Contig field (skip)
         let _ = super::helpers::read_section(&mut f)?;
 
+        // Total file length, used to cap the eager zero-fill allocations driven
+        // by the untrusted u32 chunk/tile counts below: a count*stride that
+        // exceeds the whole file cannot be valid, so reject it before allocating
+        // (the following read_exact would fail anyway, but only after a possibly
+        // multi-GB allocation). Matches the BREF3/CSI capped-reservation idiom.
+        let file_len = f.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+
         // Chunk index
         f.read_exact(&mut buf4)?;
         let n_chunks = u32::from_le_bytes(buf4) as usize;
         let chunk_index = if n_chunks > 0 {
+            if n_chunks as u64 * 16 > file_len {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!(
+                    "corrupt SRP: chunk index count {} exceeds file size; regenerate the panel", n_chunks)));
+            }
             let mut cidx = vec![0u8; n_chunks * 16];
             f.read_exact(&mut cidx)?;
             let idx: Vec<(u64, u32, u32)> = (0..n_chunks).map(|i| {
@@ -89,6 +98,10 @@ impl SrpReader {
         // Tile index
         f.read_exact(&mut buf4)?;
         let n_tiles = u32::from_le_bytes(buf4) as usize;
+        if n_tiles as u64 * 12 > file_len {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!(
+                "corrupt SRP: tile index count {} exceeds file size; regenerate the panel", n_tiles)));
+        }
         let mut tidx = vec![0u8; n_tiles * 12];
         f.read_exact(&mut tidx)?;
 
@@ -156,7 +169,15 @@ impl SrpReader {
     pub fn load_chunk_from_source(&self, chunk_id: usize) -> CscChunk {
         if let Some(ref mmap) = self.mmap && chunk_id < self.chunk_index.len() {
             let (off, cs, _) = self.chunk_index[chunk_id];
-            return parse_raw_chunk(&mmap[off as usize..(off as usize + cs as usize)]);
+            // Bounds-check the on-disk (offset, size) against the mmap so a
+            // corrupt chunk index produces a clear error, not a slice-OOB panic.
+            let end = (off as usize).checked_add(cs as usize)
+                .filter(|&e| e <= mmap.len())
+                .unwrap_or_else(|| panic!(
+                    "corrupt chunk index: chunk {} spans [{}, {}+{}) past file end ({}); \
+                     regenerate panel: selphi --prepare-reference-from panel.bcf --out panel",
+                    chunk_id, off, off, cs, mmap.len()));
+            return parse_raw_chunk(&mmap[off as usize..end]);
         }
         panic!("No chunk data available. Regenerate panel: selphi --prepare-reference-from panel.bcf --out panel");
     }

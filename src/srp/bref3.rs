@@ -5,9 +5,9 @@
 use std::io::{Read, BufReader};
 use std::path::Path;
 
-const MAGIC_NUMBER_V3: i32 = 2055763188;
-const SEQ_CODED: u8 = 0;
-const ALLELE_CODED: u8 = 1;
+pub(crate) const MAGIC_NUMBER_V3: i32 = 2055763188;
+pub(crate) const SEQ_CODED: u8 = 0;
+pub(crate) const ALLELE_CODED: u8 = 1;
 
 /// SNV permutation table: all 24 permutations of [A, C, G, T] in lexicographic order.
 fn snv_perms() -> Vec<Vec<String>> {
