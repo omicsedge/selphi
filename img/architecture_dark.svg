@@ -122,7 +122,7 @@
 
   <!-- ===== auto-route animation: each scenario lights its active path and dims the rest (SMIL, 15s loop) ===== -->
   <!-- scenario captions (top-right, beside the title) -->
-  <text x="886" y="34" text-anchor="end" font-size="12" font-weight="700" fill="#f97316" opacity="0">&#x25b6; chip array &#x2192; haploid (opt-in) + genotype
+  <text x="886" y="34" text-anchor="end" font-size="12" font-weight="700" fill="#f97316" opacity="0">&#x25b6; chip array &#x2192; diploid + genotype
     <animate attributeName="opacity" values="1;1;0;0;0;0;1" keyTimes="0;0.31;0.35;0.64;0.68;0.97;1" dur="15s" repeatCount="indefinite"/></text>
   <text x="886" y="34" text-anchor="end" font-size="12" font-weight="700" fill="#2563eb" opacity="0">&#x25b6; WGS &#x2192; diploid + genotype
     <animate attributeName="opacity" values="0;0;1;1;0;0;0" keyTimes="0;0.31;0.35;0.64;0.68;0.97;1" dur="15s" repeatCount="indefinite"/></text>
