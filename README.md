@@ -8,7 +8,7 @@
 
 <img align="right" width="200" src="icons/selphi-logo.svg" alt="Selphi">
 
-**Selphi** is a genotype phasing and imputation tool implemented in Rust. It provides two phasing engines (haploid and diploid) and two imputation engines: a Li-Stephens PBWT engine for chip/WGS hard calls, and a genotype-likelihood-aware engine for low-coverage WGS (`--lcwgs`). Everything runs in a unified, memory-efficient pipeline. All internal data structures use a bitmatrix representation (1 bit per allele), HMM kernels are SIMD-accelerated (AVX-512/AVX2 on x86, NEON on Apple Silicon), and results are fully deterministic across runs.
+**Selphi** is a genotype phasing and imputation tool implemented in Rust. It provides two phasing engines (a diploid genotype-graph engine used by default for all inputs, and an opt-in haploid composite-HMM for chip arrays) and two imputation engines: a Li-Stephens PBWT engine for chip/WGS hard calls, and a genotype-likelihood-aware engine for low-coverage WGS (`--lcwgs`). Everything runs in a unified, memory-efficient pipeline. All internal data structures use a bitmatrix representation (1 bit per allele), HMM kernels are SIMD-accelerated (AVX-512/AVX2 on x86, NEON on Apple Silicon), and results are fully deterministic across runs.
 
 <p align="center">
   <picture>
@@ -92,7 +92,7 @@ Input is a standard VCF or BCF, phased (`0|1`) or unphased (`0/1`); phase is aut
 
 ### Engine selection (`--engine`)
 
-`--engine auto` (the default) sniffs the target and picks the imputation engine: aligned reads or a `PL` VCF route to the low-coverage engine; confident WGS-density calls with a GQ/DP field route to the genotype engine with GL-aware refinement; a chip array or GT-only input routes to the plain genotype engine. Force a specific engine with `--engine lcwgs | genotype | refine` (the legacy `--lcwgs` and `--refine` flags still work and map onto these; `--engine genotype` is the explicit force-off). The phasing engine is selected separately by `--phasing-engine auto | haploid | diploid`.
+`--engine auto` (the default) sniffs the target and picks the imputation engine: aligned reads or a `PL` VCF route to the low-coverage engine; confident WGS-density calls with a GQ/DP field route to the genotype engine with GL-aware refinement; a chip array or GT-only input routes to the plain genotype engine. Force a specific engine with `--engine lcwgs | genotype | refine` (the legacy `--lcwgs` and `--refine` flags still work and map onto these; `--engine genotype` is the explicit force-off). The phasing engine is selected separately by `--phasing-engine auto | haploid | diploid`; `auto` (the default) uses the diploid engine for all inputs (chip and WGS), with the haploid composite-HMM available as an opt-in for chip arrays.
 
 ### Full pipeline (phase + impute)
 
@@ -362,7 +362,7 @@ selphi --self-test --refpanel panel.srp --input target.vcf.gz --map chr.map --ou
 | `--threads N` | Number of threads | all CPUs |
 | `--truth PATH` | Truth VCF/BCF; auto-runs post-hoc evaluation after imputation | |
 | `--engine ENGINE` | Imputation engine: `auto` (default, sniffs the target), `lcwgs`, `genotype`, or `refine` | `auto` |
-| `--phasing-engine ENGINE` | Phasing engine: `auto`, `haploid`, or `diploid` | `auto` |
+| `--phasing-engine ENGINE` | Phasing engine: `auto` (= diploid for all inputs), `haploid`, or `diploid` | `auto` |
 | `--phase-only` | Output phased haplotypes only (skip imputation) | off |
 | `--force-phasing` | Re-phase even if input is already phased | off |
 | `--allele-match MODE` | Target/panel allele reconciliation: `none`, `swap`, `strand`, `full` | `swap` |
