@@ -230,22 +230,22 @@ To isolate the contribution of the new sizing rule, we ran Selphi 2 on the same 
 
 The gain is monotonically larger at rarer MAF bins, confirming that the fixed cap in Selphi 1 was preferentially truncating rare-variant carriers. The panel-adaptive formula recovers this accuracy without manual tuning.
 
-To test whether this candidate-set truncation falls preferentially on minority ancestries, as the proposed mechanism predicts, we re-imputed the full 5,000-sample cohort twice (fixed mc = 2,500 versus panel-adaptive mc = 132,676, identical in every other respect) and stratified the recovered accuracy (adaptive minus fixed) by self-reported ancestry and minor-allele frequency (3,948 of 5,000 samples carry an ancestry label; per-variant R² binned by within-group MAF). The recovery is concentrated at rare variants and is largest for the most admixed or diverged populations (Table 2b): at the rarest bin (MAF 0.05–0.1%) the panel-adaptive sizing recovers +0.172 R² for Hispanic and +0.139 for African-American samples, versus +0.120 for European-ancestry (White) samples, and the gap widens across the low-frequency range (at 0.2–0.5% MAF, +0.127 and +0.089 versus +0.059). Aggregated over all variants the recovery is +0.113 (Hispanic), +0.087 (African-American), and +0.054 (White); the comparatively homogeneous East-Asian (Chinese-American) group, already well served by a small candidate set, gains least (per-sample R² essentially unchanged). The monotonic decay from rare to common variants, and the ordering by population admixture and divergence, are the signature of the proposed mechanism: a fixed candidate cap calibrated on a European-majority panel preferentially excludes the rare-allele-carrying haplotypes of admixed and diverged populations, and the panel-adaptive sizing recovers them.
+To test whether this candidate-set truncation falls preferentially on minority ancestries, as the proposed mechanism predicts, we re-imputed the full 5,000-sample cohort twice (fixed mc = 2,500 versus panel-adaptive mc = 132,676, identical in every other respect) and stratified the recovered accuracy (adaptive minus fixed) by self-reported ancestry and minor-allele frequency (3,948 of 5,000 samples carry an ancestry label; per-variant R² binned by within-group MAF). The recovery is concentrated at rare variants and is largest for the most admixed or diverged populations (Table 2b): at the rarest bin (MAF 0.05–0.1%) the panel-adaptive sizing recovers +0.172 R² for Hispanic and +0.139 for African-American samples, versus +0.120 for European-ancestry (White) samples, and the gap widens across the low-frequency range (at 0.2–0.5% MAF, +0.127 and +0.089 versus +0.059). Aggregated over all variants the recovery is +0.113 (Hispanic), +0.087 (African-American), and +0.054 (White); the comparatively homogeneous East-Asian (Chinese-American) group, already well served by a small candidate set, gains essentially nothing (overall +0.001, and marginally negative at common variants where the larger candidate set slightly over-conditions this homogeneous group; Table 2b). The monotonic decay from rare to common variants, and the ordering by population admixture and divergence, are the signature of the proposed mechanism: a fixed candidate cap calibrated on a European-majority panel preferentially excludes the rare-allele-carrying haplotypes of admixed and diverged populations, and the panel-adaptive sizing recovers them.
 
 **Table 2b. Rare-variant accuracy recovered by panel-adaptive candidate sizing, stratified by ancestry.** Per-variant R² gain (panel-adaptive mc = 132,676 minus fixed mc = 2,500) on the full 5,000-sample MESA cohort imputed against the TOPMed panel (chr20), binned by within-group minor-allele frequency. Both runs are identical except for the candidate-set size. n = labelled samples per group.
 
-| MAF | African-American (924) | Hispanic (859) | White (1,631) |
-|---|---|---|---|
-| 0.05–0.1% | +0.1391 | **+0.1715** | +0.1195 |
-| 0.1–0.2%  | +0.1211 | +0.1554 | +0.0858 |
-| 0.2–0.5%  | +0.0885 | +0.1268 | +0.0587 |
-| 0.5–1%    | +0.0642 | +0.0968 | +0.0381 |
-| 1–2%      | +0.0528 | +0.0692 | +0.0242 |
-| 2–5%      | +0.0436 | +0.0436 | +0.0141 |
-| 5–10%     | +0.0343 | +0.0255 | +0.0128 |
-| 10–20%    | +0.0266 | +0.0199 | +0.0114 |
-| 20–50%    | +0.0173 | +0.0125 | +0.0063 |
-| OVERALL   | +0.0874 | +0.1133 | +0.0539 |
+| MAF | African-American (924) | Hispanic (859) | White (1,631) | Chinese-American (534) |
+|---|---|---|---|---|
+| 0.05–0.1% | +0.1391 | **+0.1715** | +0.1195 | +0.0170 |
+| 0.1–0.2%  | +0.1211 | +0.1554 | +0.0858 | +0.0123 |
+| 0.2–0.5%  | +0.0885 | +0.1268 | +0.0587 | +0.0055 |
+| 0.5–1%    | +0.0642 | +0.0968 | +0.0381 | +0.0008 |
+| 1–2%      | +0.0528 | +0.0692 | +0.0242 | -0.0034 |
+| 2–5%      | +0.0436 | +0.0436 | +0.0141 | -0.0055 |
+| 5–10%     | +0.0343 | +0.0255 | +0.0128 | -0.0060 |
+| 10–20%    | +0.0266 | +0.0199 | +0.0114 | -0.0059 |
+| 20–50%    | +0.0173 | +0.0125 | +0.0063 | -0.0038 |
+| OVERALL   | +0.0874 | +0.1133 | +0.0539 | +0.0011 |
 
 ## **Out-of-panel generalization to ancestries absent from the reference panel**
 
@@ -268,7 +268,7 @@ Across all 22 autosomes, Selphi 2 (default diploid engine) exceeds Beagle 5.5 in
 
 ![Figure 2](figures/figure2_accuracy.png)
 
-**Figure 2. Imputation accuracy across the allele-frequency spectrum.** (a) 1000 Genomes genome-wide (20 autosomes; chr8 and chr11 excluded because Beagle aborted on a duplicate panel marker, so all four tools use the identical chromosome set): n-weighted per-MAF R² for Selphi 2 versus Beagle 5.5, Minimac4 and IMPUTE5; Selphi 2 leads at every bin above the rarest. (b) Rare-variant accuracy recovered by the panel-adaptive candidate sizing (adaptive minus fixed mc), stratified by self-reported ancestry on the MESA cohort (Table 2b); the recovery is largest for the most admixed/diverged populations and concentrated at rare variants. (c) Out-of-panel generalization, genome-wide: per-sample R² for 925 HGDP individuals imputed against a 1000 Genomes panel, by continental region (Table 2c); Selphi 2 exceeds Beagle 5.5 in every region, including Oceanian and Middle-Eastern ancestries absent from the panel (asterisk). (d) Low-coverage sequencing coverage sweep: per-sample R² for Selphi 2, GLIMPSE2 and QUILT2 on GIAB samples from 0.5× to 4× (Table 6b); the three tools are statistically indistinguishable.
+**Figure 2. Imputation accuracy across the allele-frequency spectrum.** (a) 1000 Genomes genome-wide (20 autosomes; chr8 and chr11 excluded because Beagle aborted on a duplicate panel marker, so all four tools use the identical chromosome set): n-weighted per-MAF R² for Selphi 2 versus Beagle 5.5, Minimac4 and IMPUTE5; Selphi 2 leads at every bin above the rarest. (b) Rare-variant accuracy recovered by the panel-adaptive candidate sizing (adaptive minus fixed mc), stratified by self-reported ancestry on the MESA cohort (all four groups; Table 2b); the recovery is largest for the most admixed/diverged populations and concentrated at rare variants, and essentially zero for the homogeneous East-Asian group. (c) Out-of-panel generalization, genome-wide: per-sample R² for 925 HGDP individuals imputed against a 1000 Genomes panel, by continental region (Table 2c); Selphi 2 exceeds Beagle 5.5 in every region, including Oceanian and Middle-Eastern ancestries absent from the panel (asterisk). (d) Low-coverage sequencing coverage sweep: per-sample R² for Selphi 2, GLIMPSE2 and QUILT2 on GIAB samples from 0.5× to 4× (Table 6b); the three tools are statistically indistinguishable.
 
 ## **Independent validation against leak-free GIAB truth**
 
