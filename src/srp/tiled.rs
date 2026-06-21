@@ -129,6 +129,14 @@ impl TiledSrpReader {
         file.read_exact(&mut n_tiles_buf)?;
         let n_tiles = u32::from_le_bytes(n_tiles_buf) as usize;
 
+        // Cap the eager zero-fill against the file size so a corrupt u32 count
+        // cannot request a multi-GB allocation before the read fails (matches
+        // the single-chr reader / BREF3 / CSI capped-reservation idiom).
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+        if n_tiles as u64 * 12 > file_len {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                "corrupt tiled SRP: tile index count {} exceeds file size; regenerate the panel", n_tiles)));
+        }
         let mut idx_data = vec![0u8; n_tiles * 12];
         file.read_exact(&mut idx_data)?;
         let tile_index: Vec<TileEntry> = (0..n_tiles).map(|i| {

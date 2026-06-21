@@ -204,6 +204,14 @@ impl MultiChrSrpReader {
         f.read_exact(&mut buf4)?;
         let n_tiles = u32::from_le_bytes(buf4) as usize;
 
+        // Cap the eager zero-fill against the file size so a corrupt u32 count
+        // cannot request a multi-GB allocation before the read fails (matches
+        // the single-chr reader / BREF3 / CSI capped-reservation idiom).
+        let file_len = f.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+        if n_tiles as u64 * 12 > file_len {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                "corrupt SRP: tile index count {} exceeds file size; regenerate the panel", n_tiles)));
+        }
         let mut tidx = vec![0u8; n_tiles * 12];
         f.read_exact(&mut tidx)?;
 
