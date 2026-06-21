@@ -229,21 +229,29 @@ fn prune_row(row: &mut [f32], row_sum: f64, prune_threshold: f64) {
     }
 }
 
+/// Shared model/emission parameter bundle for the Li-Stephens forward and
+/// backward passes. Holds exactly the fields both passes read identically
+/// (borrows for slices, Copy scalars). The `precomb` slice is the per-pass
+/// recombination probabilities (forward `f_precomb` / reverse `r_precomb`).
+struct LsHmmModel<'a> {
+    dense_matches: &'a [Vec<usize>],
+    n_matches: &'a [usize],
+    n_haps: &'a [f64],
+    precomb: &'a [f64],
+    n_states: usize,
+    p_err: f64,
+    group_sizes: Option<&'a [f64]>,
+    emission_ratios: Option<&'a [Vec<f64>]>,
+    // R1 hybrid emission: per-chip-site mismatch prob ε_eff. None → use the scalar
+    // `p_err` (byte-identical to the shipped path). Some(sp) → sp[chip_idx] per site.
+    site_perr: Option<&'a [f64]>,
+}
+
 /// Forward pass of the Li-Stephens HMM.
 ///
 /// Returns (fwd, last_alpha, last_sum) where fwd is (n_rows, n_states) row-major.
 fn compute_forward(
-    dense_matches: &[Vec<usize>],
-    n_matches: &[usize],
-    n_haps: &[f64],
-    f_precomb: &[f64],
-    n_states: usize,
-    p_err: f64,
-    group_sizes: Option<&[f64]>,
-    emission_ratios: Option<&[Vec<f64>]>,
-    // R1 hybrid emission: per-chip-site mismatch prob ε_eff. None → use the scalar
-    // `p_err` (byte-identical to the shipped path). Some(sp) → sp[chip_idx] per site.
-    site_perr: Option<&[f64]>,
+    model: &LsHmmModel,
     start: usize,
     stop: usize,
     is_last: bool,
@@ -251,6 +259,17 @@ fn compute_forward(
     init_last_sum: f64,
     prune_threshold: f64,
 ) -> (Vec<f32>, Vec<f64>, f64) {
+    let &LsHmmModel {
+        dense_matches,
+        n_matches,
+        n_haps,
+        precomb: f_precomb,
+        n_states,
+        p_err,
+        group_sizes,
+        emission_ratios,
+        site_perr,
+    } = model;
     let p_no_err = 1.0 - p_err;
     let n_rows = stop - start;
     let needed = n_rows * n_states;
@@ -379,16 +398,7 @@ fn compute_forward(
 #[allow(clippy::too_many_arguments)]
 fn streaming_backward_combine(
     fwd: &[f32],
-    dense_matches: &[Vec<usize>],
-    n_matches: &[usize],
-    n_haps: &[f64],
-    r_precomb: &[f64],
-    n_states: usize,
-    p_err: f64,
-    group_sizes: Option<&[f64]>,
-    emission_ratios: Option<&[Vec<f64>]>,
-    // R1 hybrid emission: per-chip-site mismatch prob ε_eff (None → scalar p_err).
-    site_perr: Option<&[f64]>,
+    model: &LsHmmModel,
     start: usize,
     stop: usize,
     is_first: bool,
@@ -403,6 +413,17 @@ fn streaming_backward_combine(
     last_sum_out: &mut f64,
     beta_out: &mut Option<Vec<f64>>,
 ) -> CsrWeights {
+    let &LsHmmModel {
+        dense_matches,
+        n_matches,
+        n_haps,
+        precomb: r_precomb,
+        n_states,
+        p_err,
+        group_sizes,
+        emission_ratios,
+        site_perr,
+    } = model;
     let p_no_err = 1.0 - p_err;
     let n_rows = stop - start;
     let use_weighted = emission_ratios.is_some();
@@ -853,11 +874,19 @@ pub fn calculate_weights(
         let is_last = stop == output_breaks.last().unwrap().1;
         let n_rows = stop - start;
 
+        let fwd_model = LsHmmModel {
+            dense_matches: &dense_matches,
+            n_matches: &n_matches,
+            n_haps: &n_haps_per_site,
+            precomb: &f_precomb,
+            n_states,
+            p_err,
+            group_sizes: group_sizes_f64.as_deref(),
+            emission_ratios: dense_emission_ratios.as_deref(),
+            site_perr: site_perr.as_deref(),
+        };
         let (fwd, new_alpha, new_sum) = compute_forward(
-            &dense_matches, &n_matches, &n_haps_per_site, &f_precomb,
-            n_states, p_err, group_sizes_f64.as_deref(),
-            dense_emission_ratios.as_deref(),
-            site_perr.as_deref(),
+            &fwd_model,
             start, stop, is_last,
             alpha.as_deref(), last_sum_fwd, prune_threshold,
         );
@@ -911,12 +940,19 @@ pub fn calculate_weights(
         // Clone beta to avoid borrow conflict (beta read + written)
         let init_beta = beta.clone();
         let init_sum = last_sum_bwd;
+        let bwd_model = LsHmmModel {
+            dense_matches: &dense_matches,
+            n_matches: &n_matches,
+            n_haps: &n_haps_per_site,
+            precomb: &r_precomb,
+            n_states,
+            p_err,
+            group_sizes: group_sizes_f64.as_deref(),
+            emission_ratios: dense_emission_ratios.as_deref(),
+            site_perr: site_perr.as_deref(),
+        };
         let csr = streaming_backward_combine(
-            fwd, &dense_matches, &n_matches, &n_haps_per_site,
-            &r_precomb, n_states, p_err,
-            group_sizes_f64.as_deref(),
-            dense_emission_ratios.as_deref(),
-            site_perr.as_deref(),
+            fwd, &bwd_model,
             start, stop, is_first,
             init_beta.as_deref(), init_sum, prune_threshold,
             n_hid, &state_to_hap, gm_ref,
