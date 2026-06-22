@@ -41,7 +41,7 @@
 
   <rect x="30" y="172" width="720" height="190" rx="8" fill="#fff" stroke="#1565c0" stroke-width="1.5"/>
   <text x="390" y="193" text-anchor="middle" fill="#1565c0" font-size="13" font-weight="700">PHASING</text>
-  <text x="390" y="208" text-anchor="middle" fill="#666" font-size="10">Auto-select by variant density: chip (up to 50K) &#x2192; Haploid | WGS (&gt;50K) &#x2192; Diploid</text>
+  <text x="390" y="208" text-anchor="middle" fill="#666" font-size="10">Phasing: diploid engine by default for all inputs; haploid optional for chip arrays</text>
 
   <!-- Haploid box -->
   <rect x="50" y="220" width="330" height="130" rx="6" fill="#fff8e1" stroke="#f57f17" stroke-width="1.2"/>
