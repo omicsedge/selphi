@@ -548,6 +548,31 @@ fn main() {
             Path::new(source).with_extension("srp").to_string_lossy().to_string()
         };
         let output = args.out.as_deref().unwrap_or(&auto_output);
+
+        // Fast native panel decode: BREF3/SRP → VCF.gz or BCF (replaces Beagle
+        // UnBref3). Triggers only on a .bref3/.srp source with an explicit
+        // .vcf.gz / .bcf output, so every existing prepare-reference /
+        // export-bref3 path is unchanged.
+        let want_decode = (source.ends_with(".bref3") || is_srp_input)
+            && (output.ends_with(".vcf.gz") || output.ends_with(".bcf"));
+        if want_decode {
+            let log_path = PathBuf::from(output).with_extension("log");
+            selphi::log::init(&log_path, args.debug);
+            selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
+            let in_fmt = if is_srp_input { "SRP" } else { "BREF3" };
+            let out_fmt = if output.ends_with(".bcf") { "BCF" } else { "VCF.gz" };
+            selphi_info!("  mode:     decode ({} → {})", in_fmt, out_fmt);
+            selphi_info!("  source:   {} ({})", source, in_fmt);
+            selphi_info!("  output:   {}", output);
+            selphi_info!("  threads:  {}\n", args.threads);
+            let start_time = Instant::now();
+            selphi::srp::decode::decode_panel(Path::new(source), Path::new(output), args.threads)
+                .unwrap_or_else(|e| { selphi_error!("decode failed: {}", e); std::process::exit(1); });
+            selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB",
+                start_time.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
+            return;
+        }
+
         let output_bref3 = output.ends_with(".bref3") || is_srp_input;
 
         let log_path = PathBuf::from(output).with_extension("log");

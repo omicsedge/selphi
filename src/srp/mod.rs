@@ -18,6 +18,7 @@ pub mod helpers;
 pub mod writer;
 pub mod bref3;
 pub mod bref3_writer;
+pub mod decode;
 pub mod bcf_reader;
 pub(crate) mod bcf_types;
 pub mod csi;
