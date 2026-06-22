@@ -262,6 +262,25 @@ selphi --prepare-reference-from /path/to/bcfs/ --out all_chromosomes --threads 1
 selphi --merge-srps-dir /path/to/srps/ --out all_chromosomes                        # merge per-chr SRPs
 ```
 
+#### Decode a panel back to VCF / BCF
+
+A `.bref3` or `.srp` panel can be decoded straight to phased VCF.gz or BCF — a fast,
+multithreaded native replacement for Beagle's `unbref3` (no Java, no external converter).
+The direction is selected by the output extension: a `.bref3`/`.srp` source with a
+`.vcf.gz` or `.bcf` output decodes instead of building a panel.
+
+```bash
+selphi --prepare-reference-from panel.bref3 --out panel.bcf    --threads 16   # BREF3 → BCF (fastest)
+selphi --prepare-reference-from panel.bref3 --out panel.vcf.gz --threads 16   # BREF3 → VCF.gz
+selphi --prepare-reference-from panel.srp   --out panel.bcf    --threads 16   # SRP   → BCF
+```
+
+The decoder streams one bounded batch at a time and runs as a three-stage pipeline (panel
+read → per-record formatting → BGZF compression), so peak memory stays well under 1.5 GB
+regardless of panel length, and the output is coordinate-sorted, phased, and indexed
+(`.csi`/`.tbi`). On a 75,552-haplotype panel (37,776 samples × 2.58 M chr21 variants) BREF3 → BCF
+runs in ≈2.8 min (BREF3 → VCF.gz ≈6 min) and is byte-identical to `unbref3` on the genotypes.
+
 ## Output formats
 
 Selphi supports five output formats. Formats are additive: combine any flags to produce multiple outputs in a single pass (interpolation runs once, encoding fans out to all active formats). `--bcf` replaces VCF; the rest are additive. `--all-formats` enables VCF + Parquet + PGEN + SelfDecode.
