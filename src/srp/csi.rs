@@ -253,6 +253,33 @@ pub fn parse_csi_all_contigs(path: &Path) -> io::Result<Vec<ContigCsiIndex>> {
     Ok(result)
 }
 
+/// Count contigs that actually carry records, using the INDEX (which lists only
+/// data-bearing reference sequences) rather than the header's `##contig`
+/// dictionary. A `bcftools merge`/`concat` output keeps the full genome dictionary
+/// in its header even when it holds data for a single chromosome, so the
+/// multi-chr-SRP decision must key off real *data* contigs, not header lines.
+/// Tries `<source>.csi` then `<source>.tbi`; returns `None` if neither index is
+/// present (the caller falls back to the header `##contig` count).
+pub fn count_data_contigs(source: &Path) -> Option<usize> {
+    let mut csi = source.as_os_str().to_owned();
+    csi.push(".csi");
+    let csi = std::path::PathBuf::from(csi);
+    if csi.exists() {
+        if let Ok(v) = parse_csi_all_contigs(&csi) {
+            return Some(v.len());
+        }
+    }
+    let mut tbi = source.as_os_str().to_owned();
+    tbi.push(".tbi");
+    let tbi = std::path::PathBuf::from(tbi);
+    if tbi.exists() {
+        if let Ok(idx) = parse_tbi(&tbi) {
+            return Some(idx.linear.iter().filter(|l| !l.is_empty()).count());
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // TBI parser
 // ---------------------------------------------------------------------------

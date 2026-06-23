@@ -614,10 +614,18 @@ fn main() {
                 Path::new(source), &srp_path, args.threads, args.chunk_size)
                 .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
         } else {
-            // Auto-detect multi-contig: check if BCF/VCF has multiple contigs with data
-            let is_multi_contig = {
-                let hdr = selphi::srp::bcf_reader::read_header_only(Path::new(source)).ok();
-                hdr.as_ref().map(|h| h.contig_names.len() > 1).unwrap_or(false)
+            // Auto-detect multi-contig: count contigs that actually carry records (from the
+            // index), NOT the header `##contig` dictionary — a bcftools-merged BCF/VCF keeps the
+            // full genome dictionary in its header even with single-chromosome data, which would
+            // mis-route it to the multi-chr build (a degraded single-chr panel). Fall back to the
+            // header count only when no index is present.
+            let is_multi_contig = match selphi::srp::csi::count_data_contigs(Path::new(source)) {
+                Some(n) => n > 1,
+                None => selphi::srp::bcf_reader::read_header_only(Path::new(source))
+                    .ok()
+                    .as_ref()
+                    .map(|h| h.contig_names.len() > 1)
+                    .unwrap_or(false),
             };
 
             let srp_path = if Path::new(output).extension().is_none_or(|e| e != "srp") {
