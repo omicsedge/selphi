@@ -1560,3 +1560,61 @@ mod allele_match_tests {
         assert_eq!(swapped, vec![1, 0]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Incremental panel VCF writer — for STREAMING panel phasing. Emits the SAME
+// records as `write_panel_vcf` (byte-identical decompressed output) but one
+// chunk at a time, so the full phased matrix is never materialised.
+// ---------------------------------------------------------------------------
+
+/// Streaming writer for the phased panel VCF.gz. Header written on `create`;
+/// `write_variant` appends one record (mirroring `write_panel_vcf` exactly);
+/// `finish` flushes the BGZF stream and builds the TBI index.
+pub struct PanelVcfWriter {
+    w: std::io::BufWriter<noodles_bgzf::io::multithreaded_writer::MultithreadedWriter<std::fs::File>>,
+    n_samples: usize,
+    n_haps: usize,
+    line_buf: String,
+    path: std::path::PathBuf,
+}
+
+impl PanelVcfWriter {
+    /// Create the writer and emit the header (contig taken from `chrom`).
+    pub fn create(
+        output_path: &Path, sample_names: &[String], chrom: &str, n_haps: usize,
+    ) -> std::io::Result<Self> {
+        use std::io::BufWriter;
+        let file = std::fs::File::create(output_path)?;
+        let bgzf = noodles_bgzf::io::multithreaded_writer::Builder::default()
+            .set_worker_count(std::num::NonZeroUsize::new(4).unwrap())
+            .build_from_writer(file);
+        let mut w = BufWriter::with_capacity(4 << 20, bgzf);
+        let contig = format!("##contig=<ID={}>", chrom);
+        write_gt_vcf_header(&mut w, " (panel-phasing)", Some(&contig), sample_names)?;
+        Ok(Self { w, n_samples: n_haps / 2, n_haps, line_buf: String::with_capacity(n_haps * 2), path: output_path.to_path_buf() })
+    }
+
+    /// Append one variant's record. `row` is the variant's `n_haps` phased
+    /// alleles (PANEL orientation). Byte-identical to `write_panel_vcf`'s loop.
+    pub fn write_variant(&mut self, m: &TargetMarker, row: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        let ac = build_phased_gt_row(&mut self.line_buf, row, self.n_samples, true);
+        let af = ac as f64 / self.n_haps as f64;
+        let id = if m.id.is_empty() { "." } else { m.id.as_str() };
+        writeln!(self.w, "{}\t{}\t{}\t{}\t{}\t.\tPASS\tAF={:.4};AC={};AN={}\tGT\t{}",
+            m.chrom, m.pos, id, m.ref_allele, m.alt_allele, af, ac, self.n_haps, self.line_buf)
+    }
+
+    /// Flush + finalize the BGZF stream and build the TBI index.
+    pub fn finish(self) -> std::io::Result<()> {
+        use std::io::Write;
+        let PanelVcfWriter { mut w, path, .. } = self;
+        w.flush()?;
+        let mut bgzf = w.into_inner().map_err(|e| std::io::Error::other(e.to_string()))?;
+        bgzf.finish()?;
+        if let Err(e) = crate::srp::csi::build_tbi_index(&path) {
+            selphi_info!("  WARN: TBI index build failed for {}: {} — VCF is still valid, just unindexed.", path.display(), e);
+        }
+        Ok(())
+    }
+}
