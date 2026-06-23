@@ -365,3 +365,289 @@ fn ru32eof<R: Read>(r: &mut R) -> io::Result<Option<u32>> {
 }
 // BCF typed-atom parsers shared with bref3_writer + eval::accuracy.
 use super::bcf_types::{read_typed_i32 as rtint, read_typed_str as rtstr};
+
+// ---------------------------------------------------------------------------
+// Parallel DENSE genotype reader for panel phasing (additive; not yet wired).
+//
+// Replaces the single-threaded noodles `record_bufs` loop in
+// `io::target_io::read_target_bcf` with the same CSI-region split + native GT
+// decode the SRP builder uses — but keeps per-sample diploid [a0,a1] in RAM
+// (panel phasing needs the dense matrix + phase, not sparse SRP tiles).
+//
+// GT projection matches read_target_bcf EXACTLY: a present allele projects to
+// {0,1} (min(1), so any ALT incl. multiallelic → 1); a missing allele → 3
+// (== common::GT_MISSING); a haploid 2nd slot (end-of-vector 0x81) → 0; phase
+// is taken from the 2nd allele's separator bit. `is_phased` mirrors the
+// original heuristic: the first ≤10 samples of the first variant (region 0).
+//
+// NOTE: assumes int8 diploid GT (vl=2, es=1) — the universal panel encoding,
+// same assumption as `process_region`. Validate byte-identical against
+// read_target_bcf before wiring (see read_target_bcf dispatch).
+// ---------------------------------------------------------------------------
+
+/// Locus metadata decoded from a BCF record (contig as index into
+/// `BcfHeader::contig_names`); first ALT only, multiallelic flagged.
+pub struct RawVariant {
+    pub chrom_id: i32,
+    pub pos: i64,
+    pub ref_allele: String,
+    pub alt_allele: String,
+    pub id: String,
+    pub multiallelic: bool,
+}
+
+const GT_MISSING_DENSE: u8 = 3; // must equal crate::common::GT_MISSING
+
+#[inline]
+fn decode_diploid_gt(b0: u8, b1: u8) -> (u8, u8, bool) {
+    // BCF GT int8: value = (allele+1)<<1 | phased. So (value>>1) == allele+1;
+    // (value>>1)==0 ⇒ MISSING allele ('.'). 0x80 = int8 end-of-vector (the
+    // sample is haploid here → no 2nd allele). Project present alleles to {0,1}
+    // (any ALT → 1) exactly like read_target_bcf; missing → GT_MISSING.
+    #[inline]
+    fn allele(b: u8) -> u8 {
+        let ap1 = b >> 1;            // allele + 1
+        if ap1 == 0 { GT_MISSING_DENSE } else { (ap1 - 1).min(1) }
+    }
+    // First allele: its phase bit is meaningless in BCF and ignored.
+    let a0 = if b0 == 0x80 { GT_MISSING_DENSE } else { allele(b0) };
+    // Second allele: 0x80 end-of-vector ⇒ haploid (read_target_bcf: no 2nd
+    // allele → REF slot 0, treated as phased); else decode, phase = low bit.
+    let (a1, phased) = if b1 == 0x80 { (0u8, true) } else { (allele(b1), (b1 & 1) == 1) };
+    (a0, a1, phased)
+}
+
+/// Decode one byte-balanced region into dense markers + genotypes (in RAM).
+fn decode_region_dense(
+    path: &Path, start_vp: VirtualPosition, start_pos: i64, end_pos: i64,
+    target_ref_id: i32, gtk: u16, ns: usize, ti: usize,
+) -> io::Result<(usize, Vec<RawVariant>, Vec<Vec<[u8; 2]>>, bool)> {
+    let f = std::fs::File::open(path)?;
+    let mut bgzf = noodles_bgzf::io::Reader::new(BufReader::with_capacity(2 << 20, f));
+    bgzf.seek(start_vp)?;
+
+    let mut variants: Vec<RawVariant> = Vec::new();
+    let mut genos: Vec<Vec<[u8; 2]>> = Vec::new();
+    let mut region_phased = true;
+    let mut phase_checks: i32 = 10; // mirrors read_target_bcf (first variant, ≤10 samples)
+    let mut sb = Vec::with_capacity(512);
+    let mut ib = Vec::with_capacity(ns * 4);
+    let mut skip = [0u8; 65536];
+
+    loop {
+        let ls = match ru32eof(&mut bgzf)? { Some(0) | None => break, Some(n) => n as usize };
+        let li = ru32(&mut bgzf)? as usize;
+        sb.resize(ls, 0); bgzf.read_exact(&mut sb)?;
+        if ls < 24 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("BCF record SHARED block too short: l_shared={} < 24", ls)));
+        }
+        let ci = i32::from_le_bytes(sb[0..4].try_into().unwrap());
+        let na = u16::from_le_bytes(sb[18..20].try_into().unwrap()) as usize;
+        let rec_pos = i32::from_le_bytes(sb[4..8].try_into().unwrap()) as i64 + 1;
+        if ci != target_ref_id || rec_pos <= start_pos || na < 2 {
+            let mut rem = li; while rem > 0 { let c = rem.min(skip.len()); bgzf.read_exact(&mut skip[..c])?; rem -= c; }
+            continue;
+        }
+        if rec_pos > end_pos { break; }
+        ib.resize(li, 0); bgzf.read_exact(&mut ib)?;
+
+        let nf = (u32::from_le_bytes(sb[20..24].try_into().unwrap()) >> 24) as usize;
+        let mut o = 24usize;
+        let id = rtstr(&sb, &mut o);
+        let mut al = Vec::with_capacity(na);
+        for _ in 0..na { al.push(rtstr(&sb, &mut o)); }
+
+        // Locate the GT FORMAT field and decode dense [a0,a1] per sample.
+        let mut var = vec![[0u8, 0u8]; ns];
+        let mut io2 = 0usize;
+        for _ in 0..nf {
+            if io2 >= ib.len() { break; }
+            let k = rtint(&ib, &mut io2) as u16;
+            if io2 >= ib.len() { break; }
+            let tb = ib[io2]; io2 += 1;
+            let tid2 = tb & 0x0F;
+            let vl = { let r = (tb >> 4) as usize; if r == 15 { rtint(&ib, &mut io2) as usize } else { r } };
+            let es: usize = match tid2 { 1 => 1, 2 => 2, 3 => 4, 5 => 4, 7 => 1, _ => 1 };
+            let fs = vl * es * ns;
+            if k == gtk {
+                let ge = (io2 + fs).min(ib.len());
+                for si in 0..ns {
+                    let b = io2 + si * vl * es;
+                    if b + 1 >= ge { break; }
+                    let (a0, a1, phased) = decode_diploid_gt(ib[b], ib[b + 1]);
+                    var[si] = [a0, a1];
+                    if phase_checks > 0 { if !phased { region_phased = false; } phase_checks -= 1; }
+                }
+                break;
+            }
+            io2 += fs;
+        }
+
+        let alt = al.get(1).map(|s| s.as_str()).unwrap_or("").to_string();
+        variants.push(RawVariant {
+            chrom_id: ci, pos: rec_pos, ref_allele: al[0].clone(), alt_allele: alt,
+            id, multiallelic: na > 2,
+        });
+        genos.push(var);
+    }
+    Ok((ti, variants, genos, region_phased))
+}
+
+/// Parallel dense genotype read of an indexed BCF (CSI required). Returns
+/// variants in genomic order + per-sample diploid genotypes + cohort phase.
+/// Byte-identity target: `io::target_io::read_target_bcf`.
+pub fn read_bcf_genotypes_parallel(
+    path: &Path,
+) -> io::Result<(BcfHeader, Vec<RawVariant>, Vec<Vec<[u8; 2]>>, bool)> {
+    let header = read_header_only(path)?;
+    let csi_path = { let mut p = path.as_os_str().to_owned(); p.push(".csi"); PathBuf::from(p) };
+    let csi = super::csi::parse_csi(&csi_path).map_err(|e|
+        io::Error::new(io::ErrorKind::NotFound,
+            format!("CSI index error: {}. Run: bcftools index {}", e, path.display())))?;
+    if csi.checkpoints.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "CSI has 0 checkpoints"));
+    }
+    let target_ref_id = csi.ref_seq_id as i32;
+    let file_size = std::fs::metadata(path)?.len();
+    let mut regions = split_regions(&csi.checkpoints, file_size, true);
+    // Region 0 must start at the FIRST data record, not the first CSI checkpoint
+    // — records before the earliest bin checkpoint (common in sliced BCFs) would
+    // otherwise be skipped. `first_offset` is the minimum record virtual position.
+    if let Some(r0) = regions.first_mut() {
+        r0.1 = first_record_vp(path)?;
+    }
+    let gtk = header.gt_key_id;
+    let ns = header.n_samples;
+
+    let mut parts: Vec<(usize, Vec<RawVariant>, Vec<Vec<[u8; 2]>>, bool)> = regions
+        .par_iter()
+        .map(|&(ti, vp, sp, ep)| decode_region_dense(path, vp, sp, ep, target_ref_id, gtk, ns, ti))
+        .collect::<io::Result<Vec<_>>>()?;
+    parts.sort_by_key(|p| p.0); // genomic order
+
+    // is_phased = region 0's flag (region 0 starts at genomic pos 0, so its
+    // first variant's first ≤10 samples == the original global heuristic).
+    let is_phased = parts.iter().find(|p| p.0 == 0).map(|p| p.3).unwrap_or(true);
+    let total: usize = parts.iter().map(|p| p.1.len()).sum();
+    let mut variants = Vec::with_capacity(total);
+    let mut genos = Vec::with_capacity(total);
+    for (_, vs, gs, _) in parts { variants.extend(vs); genos.extend(gs); }
+    Ok((header, variants, genos, is_phased))
+}
+
+// ---------------------------------------------------------------------------
+// Markers-only parallel read + position-range genotype read — the foundation
+// for STREAMING panel phasing (load one chunk's genotypes at a time instead of
+// the whole n_var×n_haps matrix). Additive; reuses split_regions + the native
+// decode. Build/validate before wiring.
+// ---------------------------------------------------------------------------
+
+/// Decode one region's MARKERS ONLY (skip the per-sample GT block). Fast pre-pass
+/// to define chunk boundaries without materialising any genotypes.
+fn decode_region_meta(
+    path: &Path, start_vp: VirtualPosition, start_pos: i64, end_pos: i64,
+    target_ref_id: i32, ti: usize,
+) -> io::Result<(usize, Vec<RawVariant>)> {
+    let f = std::fs::File::open(path)?;
+    let mut bgzf = noodles_bgzf::io::Reader::new(BufReader::with_capacity(2 << 20, f));
+    bgzf.seek(start_vp)?;
+    let mut variants: Vec<RawVariant> = Vec::new();
+    let mut sb = Vec::with_capacity(512);
+    let mut skip = [0u8; 65536];
+    loop {
+        let ls = match ru32eof(&mut bgzf)? { Some(0) | None => break, Some(n) => n as usize };
+        let li = ru32(&mut bgzf)? as usize;
+        sb.resize(ls, 0); bgzf.read_exact(&mut sb)?;
+        if ls < 24 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("BCF SHARED block too short: l_shared={} < 24", ls)));
+        }
+        let ci = i32::from_le_bytes(sb[0..4].try_into().unwrap());
+        let na = u16::from_le_bytes(sb[18..20].try_into().unwrap()) as usize;
+        let rec_pos = i32::from_le_bytes(sb[4..8].try_into().unwrap()) as i64 + 1;
+        // skip the INDIV (GT) block regardless — meta pass never reads it
+        let mut rem = li; while rem > 0 { let c = rem.min(skip.len()); bgzf.read_exact(&mut skip[..c])?; rem -= c; }
+        if ci != target_ref_id || rec_pos <= start_pos || na < 2 { continue; }
+        if rec_pos > end_pos { break; }
+        let mut o = 24usize;
+        let id = rtstr(&sb, &mut o);
+        let mut al = Vec::with_capacity(na);
+        for _ in 0..na { al.push(rtstr(&sb, &mut o)); }
+        let alt = al.get(1).map(|s| s.as_str()).unwrap_or("").to_string();
+        variants.push(RawVariant { chrom_id: ci, pos: rec_pos, ref_allele: al[0].clone(), alt_allele: alt, id, multiallelic: na > 2 });
+    }
+    Ok((ti, variants))
+}
+
+/// Parallel markers-only read (no genotypes) — genomic order.
+pub fn read_bcf_markers_parallel(path: &Path) -> io::Result<(BcfHeader, Vec<RawVariant>)> {
+    let header = read_header_only(path)?;
+    let csi_path = { let mut p = path.as_os_str().to_owned(); p.push(".csi"); PathBuf::from(p) };
+    let csi = super::csi::parse_csi(&csi_path).map_err(|e|
+        io::Error::new(io::ErrorKind::NotFound, format!("CSI error: {}", e)))?;
+    if csi.checkpoints.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "CSI has 0 checkpoints"));
+    }
+    let target_ref_id = csi.ref_seq_id as i32;
+    let file_size = std::fs::metadata(path)?.len();
+    let mut regions = split_regions(&csi.checkpoints, file_size, true);
+    if let Some(r0) = regions.first_mut() {
+        r0.1 = first_record_vp(path)?;
+    }
+    let mut parts: Vec<(usize, Vec<RawVariant>)> = regions.par_iter()
+        .map(|&(ti, vp, sp, ep)| decode_region_meta(path, vp, sp, ep, target_ref_id, ti))
+        .collect::<io::Result<Vec<_>>>()?;
+    parts.sort_by_key(|p| p.0);
+    let total: usize = parts.iter().map(|p| p.1.len()).sum();
+    let mut variants = Vec::with_capacity(total);
+    for (_, vs) in parts { variants.extend(vs); }
+    Ok((header, variants))
+}
+
+/// Virtual position of the FIRST data record (immediately after the BCF
+/// header). Robust head anchor for region 0 / pre-checkpoint windows — CSI
+/// offsets can point past records that precede the earliest bin.
+fn first_record_vp(path: &Path) -> io::Result<VirtualPosition> {
+    let f = std::fs::File::open(path)?;
+    let mut r = noodles_bgzf::io::Reader::new(BufReader::with_capacity(1 << 20, f));
+    let mut magic = [0u8; 5]; r.read_exact(&mut magic)?;
+    let mut lt = [0u8; 4]; r.read_exact(&mut lt)?;
+    let l_text = u32::from_le_bytes(lt) as usize;
+    let mut hdr = vec![0u8; l_text]; r.read_exact(&mut hdr)?;
+    Ok(r.virtual_position())
+}
+
+/// Find the seek virtual-position for a target genomic position: the latest CSI
+/// checkpoint at or before `pos`. When `pos` precedes every checkpoint, fall
+/// back to `first_offset` (the first data record) — NOT the first checkpoint,
+/// which would skip head records before the earliest bin.
+fn seek_vp_for_pos(
+    checkpoints: &[(i64, VirtualPosition)], first_offset: VirtualPosition, pos: i64,
+) -> VirtualPosition {
+    let mut by_pos: Vec<(i64, VirtualPosition)> = checkpoints.to_vec();
+    by_pos.sort_by_key(|&(p, _)| p);
+    let mut best: Option<VirtualPosition> = None;
+    for &(p, vp) in &by_pos {
+        if p <= pos { best = Some(vp); } else { break; }
+    }
+    best.unwrap_or(first_offset)
+}
+
+/// Read genotypes for variants in the inclusive position window [pos_lo, pos_hi]
+/// (single chunk; CSI-seeks to the window so cost is proportional to the window,
+/// not the file). Returns markers + dense per-sample [a0,a1] in genomic order.
+pub fn read_bcf_genotypes_range(
+    path: &Path, pos_lo: i64, pos_hi: i64,
+) -> io::Result<(BcfHeader, Vec<RawVariant>, Vec<Vec<[u8; 2]>>)> {
+    let header = read_header_only(path)?;
+    let csi_path = { let mut p = path.as_os_str().to_owned(); p.push(".csi"); PathBuf::from(p) };
+    let csi = super::csi::parse_csi(&csi_path).map_err(|e|
+        io::Error::new(io::ErrorKind::NotFound, format!("CSI error: {}", e)))?;
+    let target_ref_id = csi.ref_seq_id as i32;
+    let vp = seek_vp_for_pos(&csi.checkpoints, first_record_vp(path)?, pos_lo);
+    // start_pos is exclusive in decode_region_dense → pos_lo - 1 keeps pos_lo.
+    let (_, variants, genos, _) = decode_region_dense(
+        path, vp, pos_lo - 1, pos_hi, target_ref_id, header.gt_key_id, header.n_samples, 0)?;
+    Ok((header, variants, genos))
+}
