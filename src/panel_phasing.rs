@@ -408,6 +408,12 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
             ignored.join(", "));
     }
 
+    // Streaming fast-path: for a large indexed-BCF cohort, phase chunk-by-chunk
+    // with bounded memory (the in-RAM path below holds the full n_var×n_haps
+    // input + output arrays → OOM on biobank×WGS panels). Falls through to the
+    // in-RAM path for small / non-BCF / region-restricted inputs (byte-identical).
+    if run_streaming(args, input_path, output_path, map_path) { return; }
+
     let start = Instant::now();
 
     // 1. Read cohort (VCF.gz or SRP). Input phase is ignored — we re-phase.
@@ -600,4 +606,207 @@ fn write_reference_panels(
         selphi_step!("Phased panel BREF3: {}", bref3_out.display());
     }
     // _tmp_keep (if any) drops here → intermediate SRP removed.
+}
+
+// ===========================================================================
+// STREAMING panel phasing — bounded memory for biobank × WGS panels.
+//
+// The default `run()` path holds the full n_var×n_haps input AND output arrays
+// in RAM (~376 GB each at 44k samples × 4.2M sites → OOM). This path never
+// materialises either: it reads markers once (no GT), then loops chunks
+// SEQUENTIALLY, range-reading only one chunk's genotypes from the indexed BCF,
+// phasing it, ligating against the previous chunk's kept tail, and emitting the
+// finalised variants straight to the phased VCF. Peak ≈ a few chunks
+// (chunk_vars × n_haps), independent of chromosome length — mirroring the SRP
+// builder's streaming model. Phased GTs are byte-identical to the sequential
+// in-RAM path (same chunking, phase_cohort, and flip math).
+// ===========================================================================
+
+/// Per-sample phase-flip + finalise of one chunk, sourced from the previous
+/// chunk's kept phased tail (`prev_phased`, indexed from `prev_cs`) rather than
+/// a full `global` array. Returns the flipped chunk over [cs,ce). Flip decision
+/// is byte-identical to `ligate_chunk` (same overlap agree/disagree vote).
+#[allow(clippy::too_many_arguments)]
+fn ligate_streaming(
+    prev_phased: &[u8], prev_cs: usize, cphased: &[u8],
+    cs: usize, ce: usize, prev_end: usize, n_samples: usize, n_haps: usize,
+) -> Vec<u8> {
+    let cn = ce - cs;
+    let mut out = vec![0u8; cn * n_haps];
+    let ov_start = cs;
+    let ov_end = prev_end.min(ce);
+    for sa in 0..n_samples {
+        let h0 = sa * 2;
+        let h1 = sa * 2 + 1;
+        let mut agree = 0i64;
+        let mut disagree = 0i64;
+        for v in ov_start..ov_end {
+            let pg = (v - prev_cs) * n_haps;
+            let g0 = prev_phased[pg + h0];
+            let g1 = prev_phased[pg + h1];
+            if g0 == g1 { continue; }
+            let rel = (v - cs) * n_haps;
+            let c0 = cphased[rel + h0];
+            let c1 = cphased[rel + h1];
+            if c0 == c1 { continue; }
+            if c0 == g0 && c1 == g1 { agree += 1; } else { disagree += 1; }
+        }
+        let flip = disagree > agree;
+        for v in cs..ce {
+            let rel = (v - cs) * n_haps;
+            let (a0, a1) = (cphased[rel + h0], cphased[rel + h1]);
+            if flip { out[rel + h0] = a1; out[rel + h1] = a0; }
+            else    { out[rel + h0] = a0; out[rel + h1] = a1; }
+        }
+    }
+    out
+}
+
+/// Streaming entry. Returns true if it handled the input (caller returns),
+/// false to fall back to the in-RAM `run()` path.
+fn run_streaming(args: &Args, input_path: &str, output_path: &str, map_path: &str) -> bool {
+    use selphi::srp::bcf_reader;
+    use selphi::io::target_io::PanelVcfWriter;
+
+    // Gate: indexed BCF only, and only when the dense in-RAM matrices would be
+    // large. Threshold on sample count (env-overridable; the test forces it low).
+    if !input_path.ends_with(".bcf") { return false; }
+    let csi = format!("{}.csi", input_path);
+    if !Path::new(&csi).exists() { return false; }
+    let min_samples: usize = selphi::config::usize_or("SELPHI_PHASE_STREAM_MIN_SAMPLES", 16_000);
+    let hdr = match bcf_reader::read_header_only(Path::new(input_path)) { Ok(h) => h, Err(_) => return false };
+    if hdr.n_samples < min_samples { return false; }
+    if args.region.is_some() {
+        selphi_info!("  NOTE: --region with streaming not yet supported → in-RAM path.");
+        return false;
+    }
+
+    let start = Instant::now();
+    let n_samples = hdr.n_samples;
+    let n_haps = n_samples * 2;
+    let sample_names = hdr.sample_names.clone();
+
+    // 1. Markers-only pre-pass (parallel, no GT) → chunk boundaries.
+    selphi_step!("STREAMING phase: markers pre-pass...");
+    let (_, raw) = match bcf_reader::read_bcf_markers_parallel(Path::new(input_path)) {
+        Ok(r) => r, Err(e) => { selphi_error!("markers read failed: {}", e); std::process::exit(1); }
+    };
+    let n_var = raw.len();
+    if n_var == 0 { selphi_error!("empty cohort"); std::process::exit(1); }
+    let chrom = hdr.contig_names.get(raw[0].chrom_id as usize).cloned().unwrap_or_else(|| raw[0].chrom_id.to_string());
+    let markers: Vec<TargetMarker> = raw.iter().map(|v| TargetMarker {
+        chrom: hdr.contig_names.get(v.chrom_id as usize).cloned().unwrap_or_else(|| v.chrom_id.to_string()),
+        pos: v.pos, ref_allele: v.ref_allele.clone(), alt_allele: v.alt_allele.clone(),
+        ref_hash: String::new(), alt_hash: String::new(), id: v.id.clone(),
+    }).collect();
+    let bp: Vec<i64> = markers.iter().map(|m| m.pos).collect();
+    {
+        let mut ch: Vec<&str> = markers.iter().map(|m| m.chrom.as_str()).collect();
+        ch.sort_unstable(); ch.dedup();
+        if ch.len() > 1 { selphi_error!("--phase-panel needs a single chromosome (got {})", ch.len()); std::process::exit(1); }
+    }
+    selphi_step!("Cohort: {} samples, {} variants (streaming, re-phasing)", n_samples, n_var);
+
+    // 2. Genetic map + engine.
+    let (map_bp, map_cm) = genmap::load_genetic_map_raw(Path::new(map_path))
+        .unwrap_or_else(|e| { selphi_error!("Cannot read genetic map {}: {}", map_path, e); std::process::exit(1); });
+    let engine = match args.phasing_engine { PhasingEngine::Haploid => PhasingEngine::Haploid, _ => PhasingEngine::Diploid };
+    let n_threads = args.threads.max(1);
+
+    // 3. Chunk sizing — same per_var_bytes as run(); NO 2×array reservation
+    //    (streaming holds no full arrays), so the whole budget funds chunks.
+    let sys_gb = selphi::log::system_ram_mb() / 1024.0;
+    let budget_frac = if matches!(engine, PhasingEngine::Haploid) { 0.50 } else { 0.55 };
+    let budget_gb = (budget_frac * sys_gb).max(4.0);
+    let per_var_bytes = match engine {
+        PhasingEngine::Haploid => 85.0 * n_haps as f64 * (n_threads as f64 / 16.0).max(0.25) + 30_000.0,
+        _ => n_haps as f64 * 4.0 * 1.5,
+    };
+    let chunk_vars = if args.chunk_vars > 0 { args.chunk_vars }
+        else { ((budget_gb * 1e9 / per_var_bytes) as usize).max(20_000) }.min(n_var);
+    let overlap = (chunk_vars / 20).clamp(2_000, 30_000).min(chunk_vars / 2);
+    let step = (chunk_vars - overlap).max(1);
+
+    // Chunk list, snapped so boundaries never split a shared genomic position
+    // (range-reads are by position → a split would mis-align the chunk).
+    let snap = |mut i: usize| -> usize { // advance to a position boundary
+        while i < n_var && i > 0 && bp[i] == bp[i - 1] { i += 1; }
+        i
+    };
+    let mut chunks: Vec<(usize, usize)> = Vec::new();
+    let mut s = 0usize;
+    while s < n_var {
+        let e = snap((s + chunk_vars).min(n_var));
+        chunks.push((s, e));
+        if e >= n_var { break; }
+        s = snap((s + step).min(n_var));
+    }
+    selphi_step!("STREAMING: {} chunks of ≤{} vars (overlap {}), {} engine, {} threads, budget {:.0} GB",
+        chunks.len(), chunk_vars, overlap,
+        if engine == PhasingEngine::Haploid { "haploid" } else { "diploid" }, n_threads, budget_gb);
+
+    // 4. Output VCF.gz (incremental) + streaming chunk loop.
+    let out_path = PathBuf::from(output_path);
+    let out_vcf = if out_path.extension().is_none_or(|e| e != "gz") { out_path.with_extension("vcf.gz") } else { out_path.clone() };
+    let mut writer = PanelVcfWriter::create(&out_vcf, &sample_names, &chrom, n_haps)
+        .unwrap_or_else(|e| { selphi_error!("Cannot create {}: {}", out_vcf.display(), e); std::process::exit(1); });
+
+    let mut prev_phased: Vec<u8> = Vec::new();
+    let mut prev_cs = 0usize;
+    let mut prev_end = 0usize;
+    for (ci, &(cs, ce)) in chunks.iter().enumerate() {
+        let cn = ce - cs;
+        let t0 = Instant::now();
+        // Range-read this chunk's genotypes (only ~cn variants × n_haps).
+        let (_, rv, geno) = bcf_reader::read_bcf_genotypes_range(Path::new(input_path), bp[cs], bp[ce - 1])
+            .unwrap_or_else(|e| { selphi_error!("chunk range read failed: {}", e); std::process::exit(1); });
+        if rv.len() != cn {
+            selphi_error!("chunk {} alignment: read {} variants, expected {} ([{}..{}) pos {}..{}) — boundary split?",
+                ci, rv.len(), cn, cs, ce, bp[cs], bp[ce - 1]); std::process::exit(1);
+        }
+        // Flatten to (cn × n_haps), folding missing (3) → 0 (panel engine expects {0,1}).
+        let mut chunk_geno = vec![0u8; cn * n_haps];
+        for (vi, g) in geno.iter().enumerate() {
+            for (si, &[a0, a1]) in g.iter().enumerate() {
+                chunk_geno[vi * n_haps + si * 2]     = if a0 > 1 { 0 } else { a0 };
+                chunk_geno[vi * n_haps + si * 2 + 1] = if a1 > 1 { 0 } else { a1 };
+            }
+        }
+        let cphased = phase_cohort(engine, args, n_threads, &chunk_geno, &bp[cs..ce], &map_bp, &map_cm, cn, n_samples);
+        drop(chunk_geno);
+
+        let (finalized, emit_start) = if ci == 0 {
+            (cphased, cs)
+        } else {
+            (ligate_streaming(&prev_phased, prev_cs, &cphased, cs, ce, prev_end, n_samples, n_haps), prev_end)
+        };
+        for v in emit_start..ce {
+            let rel = (v - cs) * n_haps;
+            writer.write_variant(&markers[v], &finalized[rel..rel + n_haps])
+                .unwrap_or_else(|e| { selphi_error!("VCF write failed: {}", e); std::process::exit(1); });
+        }
+        selphi_step!("  chunk {}/{} [{}..{}) phased+emitted in {:.0}s [{:.0} MB]",
+            ci + 1, chunks.len(), cs, ce, t0.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
+        prev_phased = finalized; prev_cs = cs; prev_end = ce;
+    }
+    writer.finish().unwrap_or_else(|e| { selphi_error!("VCF finish failed: {}", e); std::process::exit(1); });
+    selphi_step!("Phased panel VCF: {} [{:.0}s | {:.0} MB peak]", out_vcf.display(), start.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
+
+    // 5. Optional native panels — build from the streamed VCF (also streaming).
+    if args.srp || args.bref3 {
+        let mut base = out_path.clone();
+        if base.extension().is_some_and(|e| e == "gz") { base.set_extension(""); }
+        if base.extension().is_some_and(|e| e == "vcf") { base.set_extension(""); }
+        let srp_path = base.with_extension("srp");
+        selphi_step!("Building SRP from streamed VCF...");
+        selphi::srp::writer::build_srp_unified(&out_vcf, &srp_path, n_threads, args.chunk_size)
+            .unwrap_or_else(|e| { selphi_error!("SRP build failed: {}", e); std::process::exit(1); });
+        if args.bref3 {
+            let bref3_path = base.with_extension("bref3");
+            write_bref3_from_srp(&srp_path, &bref3_path)
+                .unwrap_or_else(|e| { selphi_error!("BREF3 build failed: {}", e); std::process::exit(1); });
+        }
+    }
+    selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB", start.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
+    true
 }
