@@ -127,6 +127,14 @@ fn run_one_hap<F: Fn(usize) -> usize>(
         let mut hl_poly: Vec<f32> = Vec::with_capacity(n_var * 2);
         let mut cm_poly: Vec<f64> = Vec::with_capacity(n_var);
         let mut mono: Vec<usize> = Vec::new();
+        // Band-mode recombination (LCWGS_RECOMB_DENOM=band): raise ONLY rare-site
+        // (is_common==false) boundary transitions to GLIMPSE2's /n_ref rate so the copy
+        // can un-stick onto the true rare carrier, while common-site transitions keep
+        // the tuned /max(n_ref,Ne) rate that wins the common bins. The per-poly-site
+        // multiplier is filled IN THIS LOOP (no extra pass / alloc when off). `band_r`
+        // is None for the default `max`/`nref` modes ⇒ recomb_mult=None ⇒ byte-identical.
+        let band_r = crate::lcwgs::hmm::recomb_band_mult(ref_bm.n_haps, params.ne);
+        let mut rmult: Vec<f32> = if band_r.is_some() { Vec::with_capacity(n_var) } else { Vec::new() };
         let mut ci = 0usize;
         for v in 0..n_var {
             let v32 = v as u32;
@@ -137,22 +145,16 @@ fn run_one_hap<F: Fn(usize) -> usize>(
                 hl_poly.push(hap_hl[2 * v]);
                 hl_poly.push(hap_hl[2 * v + 1]);
                 cm_poly.push(cm[v]);
+                if let Some(r) = band_r { rmult.push(if is_common[v] { 1.0 } else { r }); }
             } else {
                 mono.push(v);
             }
         }
         let mut dose = vec![0.0f32; n_var];
         if !poly_sites.is_empty() {
-            // Band-mode recombination (LCWGS_RECOMB_DENOM=band): raise ONLY rare-site
-            // (is_common==false) boundary transitions to GLIMPSE2's /n_ref rate so the
-            // copy can un-stick onto the true rare carrier, while common-site
-            // transitions keep the tuned /max(n_ref,Ne) rate that wins the common bins.
-            // `None` (default) ⇒ byte-identical. Built on the compacted poly axis.
-            let rmult: Option<Vec<f32>> =
-                crate::lcwgs::hmm::recomb_band_mult(ref_bm.n_haps, params.ne)
-                    .map(|r| poly_sites.iter().map(|&v| if is_common[v] { 1.0 } else { r }).collect());
             let dp = run_forward_backward(
-                &hl_poly, cond, ref_bm, &cm_poly, params, rmult.as_deref(), Some(&poly_sites),
+                &hl_poly, cond, ref_bm, &cm_poly, params,
+                band_r.map(|_| rmult.as_slice()), Some(&poly_sites),
             ).dosage;
             for (i, &v) in poly_sites.iter().enumerate() { dose[v] = dp[i]; }
         }
