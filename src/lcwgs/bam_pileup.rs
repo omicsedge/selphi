@@ -45,6 +45,16 @@ pub struct PileupParams {
     pub min_mapq: u8,
     pub min_bq: u8,
     pub max_depth: u32,
+    /// Keep ANOMALOUS read pairs (paired but not flagged proper-pair, 0x2).
+    /// Default `false` = discard them, matching bcftools/samtools mpileup's default
+    /// (`--count-orphans` off): such reads — typically soft-clipped near structural
+    /// breakpoints — carry spurious alt alleles that manufacture false hets and
+    /// degrade the ultra-rare bin. `LCWGS_COUNT_ORPHANS` flips it on (samtools `-A`).
+    pub count_orphans: bool,
+    /// SNP genotype-likelihood model. `false` (default) = faithful samtools/bcftools
+    /// revised-MAQ errmod (correlated-read dependency cap + mapQ/neighbour baseQ caps).
+    /// `true` (`LCWGS_NAIVE_GL`) = prior naive independent-product model (A/B only).
+    pub naive_gl: bool,
 }
 impl Default for PileupParams {
     fn default() -> Self {
@@ -53,8 +63,32 @@ impl Default for PileupParams {
             min_mapq: envu("LCWGS_MIN_MAPQ", 20) as u8,
             min_bq: envu("LCWGS_MIN_BQ", 20) as u8,
             max_depth: envu("LCWGS_MAX_DEPTH", 250),
+            count_orphans: crate::config::present("LCWGS_COUNT_ORPHANS"),
+            naive_gl: crate::config::present("LCWGS_NAIVE_GL"),
         }
     }
+}
+
+/// ASCII nucleotide → 2-bit base (A=0,C=1,G=2,T=3; anything else=4), matching
+/// htslib `seq_nt16_int`. Used to pack pileup bases for the errmod model.
+#[inline]
+fn ascii_to_base4(b: u8) -> usize {
+    match b {
+        b'A' | b'a' => 0,
+        b'C' | b'c' => 1,
+        b'G' | b'g' => 2,
+        b'T' | b't' => 3,
+        _ => 4,
+    }
+}
+
+/// Discard a read if it is part of an ANOMALOUS pair: paired (flag 0x1) but NOT
+/// flagged proper-pair (0x2). Matches bcftools/samtools mpileup's default read
+/// filtering (opt out via `LCWGS_COUNT_ORPHANS` → `count_orphans`). Single-end
+/// reads (no 0x1) are always kept. `flags` is the raw SAM flag word.
+#[inline]
+fn is_anomalous_pair(flags: u16, count_orphans: bool) -> bool {
+    !count_orphans && (flags & 0x1) != 0 && (flags & 0x2) == 0
 }
 
 // SAM flag bits to exclude (unmapped, secondary, qc-fail, duplicate, supplementary).
@@ -143,12 +177,20 @@ pub fn pileup_bams(
     let n_samples = bam_paths.len();
     assert_eq!(ref_base.len(), n_var);
     let lut = PhredLut::new();
+    // Faithful samtools/bcftools SNP GL model (errmod). Built ONCE (shares its
+    // ~33 MB tables across all samples). Skipped under LCWGS_NAIVE_GL or on the
+    // indel-realign path (which uses the naive product). Default path.
+    let em = if params.naive_gl || indel_model.is_some() {
+        None
+    } else {
+        Some(crate::lcwgs::errmod::ErrMod::new())
+    };
 
     // Per-sample pileup in parallel (BAM/CRAM are independent). Each produces its
     // own [n_var*3] normalised GL block; assembled into the interleaved gl3 after.
     let per_sample: Vec<io::Result<(String, Vec<f32>)>> = bam_paths
         .par_iter()
-        .map(|path| pileup_one(path, chrom, pos, ref_base, alt_base, is_snp, region, reference, indel_model, &params, &lut))
+        .map(|path| pileup_one(path, chrom, pos, ref_base, alt_base, is_snp, region, reference, indel_model, &params, &lut, em.as_ref()))
         .collect();
 
     let mut sample_ids = Vec::with_capacity(n_samples);
@@ -187,9 +229,10 @@ fn pileup_one(
     indel_model: Option<&IndelModel>,
     params: &PileupParams,
     lut: &PhredLut,
+    em: Option<&crate::lcwgs::errmod::ErrMod>,
 ) -> io::Result<(String, Vec<f32>)> {
     if path.to_ascii_lowercase().ends_with(".cram") {
-        return pileup_one_cram(path, chrom, pos, ref_base, alt_base, is_snp, region, reference, indel_model, params, lut);
+        return pileup_one_cram(path, chrom, pos, ref_base, alt_base, is_snp, region, reference, indel_model, params, lut, em);
     }
     let n_var = pos.len();
     let mut reader = bam::io::reader::Builder.build_from_path(path)?;
@@ -200,8 +243,10 @@ fn pileup_one(
     // Map chrom name → reference id in this BAM (chr-prefix tolerant).
     let resolved = resolve_contig(&header, chrom);
 
-    // Per-genotype log10-likelihood accumulators + read-depth (for cap).
+    // errmod (default) collects packed bases per site; naive accumulates log-Ls.
+    let use_em = em.is_some();
     let mut ll = vec![[0.0f64; 3]; n_var];
+    let mut bases: Vec<Vec<u16>> = if use_em { vec![Vec::new(); n_var] } else { Vec::new() };
     let mut depth = vec![0u32; n_var];
     let last_pos = pos[n_var - 1];
 
@@ -216,7 +261,9 @@ fn pileup_one(
                 Some(Ok(rid)) if rid == target_rid => {}
                 _ => return,
             }
-            if record.flags().bits() & FLAG_EXCLUDE != 0 { return; }
+            let fl = record.flags().bits();
+            if fl & FLAG_EXCLUDE != 0 { return; }
+            if is_anomalous_pair(fl, params.count_orphans) { return; }
             let mapq = record.mapping_quality().map(|m| m.get()).unwrap_or(0);
             if mapq < params.min_mapq { return; }
             let start = match record.alignment_start() {
@@ -232,21 +279,31 @@ fn pileup_one(
             }
             // Fragment hash (paired mates share a QNAME) → count overlap once.
             let qhash = record.name().map(|n| fnv1a(n.as_ref())).unwrap_or((start as u64) << 1 | 1);
-            walk_record(
-                start, last_pos, &cigar_buf,
-                |qi| seq.get(qi).unwrap_or(b'N'),
-                |qi| qbytes.get(qi).copied().unwrap_or(0),
-                pos, ref_base, alt_base, is_snp, params, lut, &mut ll, &mut depth,
-                qhash, &mut ov,
-            );
-            if let Some(model) = indel_model {
-                super::indel_realign::score_read(
-                    start, &cigar_buf,
+            if use_em {
+                walk_record_em(
+                    start, last_pos, &cigar_buf,
                     |qi| seq.get(qi).unwrap_or(b'N'),
                     |qi| qbytes.get(qi).copied().unwrap_or(0),
-                    model, lut, &mut iscratch, &mut ll, &mut depth,
-                    params.max_depth, params.min_bq, qhash, &mut ov.last_frag,
+                    qbytes.len(), mapq, fl & 0x10 != 0,
+                    pos, is_snp, params, &mut bases, &mut depth, qhash, &mut ov,
                 );
+            } else {
+                walk_record(
+                    start, last_pos, &cigar_buf,
+                    |qi| seq.get(qi).unwrap_or(b'N'),
+                    |qi| qbytes.get(qi).copied().unwrap_or(0),
+                    pos, ref_base, alt_base, is_snp, params, lut, &mut ll, &mut depth,
+                    qhash, &mut ov,
+                );
+                if let Some(model) = indel_model {
+                    super::indel_realign::score_read(
+                        start, &cigar_buf,
+                        |qi| seq.get(qi).unwrap_or(b'N'),
+                        |qi| qbytes.get(qi).copied().unwrap_or(0),
+                        model, lut, &mut iscratch, &mut ll, &mut depth,
+                        params.max_depth, params.min_bq, qhash, &mut ov.last_frag,
+                    );
+                }
             }
         };
 
@@ -270,7 +327,11 @@ fn pileup_one(
         }
     }
 
-    Ok((sample_id, finalize_gl(&ll, &depth)))
+    let gl = match em {
+        Some(e) => finalize_gl_errmod(&mut bases, ref_base, alt_base, is_snp, e),
+        None => finalize_gl(&ll, &depth),
+    };
+    Ok((sample_id, gl))
 }
 
 /// Convert per-site log10-likelihoods → normalised 3-way GL. Sites with no
@@ -315,6 +376,7 @@ fn pileup_one_cram(
     indel_model: Option<&IndelModel>,
     params: &PileupParams,
     lut: &PhredLut,
+    em: Option<&crate::lcwgs::errmod::ErrMod>,
 ) -> io::Result<(String, Vec<f32>)> {
     let n_var = pos.len();
     let ref_path = reference.ok_or_else(|| io::Error::new(
@@ -332,7 +394,9 @@ fn pileup_one_cram(
 
     let sample_id = read_group_sample_id(&header, path);
 
+    let use_em = em.is_some();
     let mut ll = vec![[0.0f64; 3]; n_var];
+    let mut bases: Vec<Vec<u16>> = if use_em { vec![Vec::new(); n_var] } else { Vec::new() };
     let mut depth = vec![0u32; n_var];
     let (target_rid, contig_name) = match resolve_contig(&header, chrom) {
         Some(x) => x,
@@ -346,7 +410,9 @@ fn pileup_one_cram(
     // Same guards + walk as the BAM path, over decoded RecordBufs.
     let mut process = |record: &RecordBuf| {
         if record.reference_sequence_id() != Some(target_rid) { return; }
-        if record.flags().bits() & FLAG_EXCLUDE != 0 { return; }
+        let fl = record.flags().bits();
+        if fl & FLAG_EXCLUDE != 0 { return; }
+        if is_anomalous_pair(fl, params.count_orphans) { return; }
         let mapq = record.mapping_quality().map(|m| m.get()).unwrap_or(0);
         if mapq < params.min_mapq { return; }
         let start = match record.alignment_start() { Some(p) => usize::from(p) as i64, None => return };
@@ -356,21 +422,31 @@ fn pileup_one_cram(
         cigar_buf.clear();
         for op in record.cigar().as_ref() { cigar_buf.push((op.kind(), op.len())); }
         let qhash = record.name().map(|n| fnv1a(n.as_ref())).unwrap_or((start as u64) << 1 | 1);
-        walk_record(
-            start, last_pos, &cigar_buf,
-            |qi| seq.get(qi).unwrap_or(b'N'),
-            |qi| qbytes.get(qi).copied().unwrap_or(0),
-            pos, ref_base, alt_base, is_snp, params, lut, &mut ll, &mut depth,
-            qhash, &mut ov,
-        );
-        if let Some(model) = indel_model {
-            super::indel_realign::score_read(
-                start, &cigar_buf,
+        if use_em {
+            walk_record_em(
+                start, last_pos, &cigar_buf,
                 |qi| seq.get(qi).unwrap_or(b'N'),
                 |qi| qbytes.get(qi).copied().unwrap_or(0),
-                model, lut, &mut iscratch, &mut ll, &mut depth,
-                params.max_depth, params.min_bq, qhash, &mut ov.last_frag,
+                qbytes.len(), mapq, fl & 0x10 != 0,
+                pos, is_snp, params, &mut bases, &mut depth, qhash, &mut ov,
             );
+        } else {
+            walk_record(
+                start, last_pos, &cigar_buf,
+                |qi| seq.get(qi).unwrap_or(b'N'),
+                |qi| qbytes.get(qi).copied().unwrap_or(0),
+                pos, ref_base, alt_base, is_snp, params, lut, &mut ll, &mut depth,
+                qhash, &mut ov,
+            );
+            if let Some(model) = indel_model {
+                super::indel_realign::score_read(
+                    start, &cigar_buf,
+                    |qi| seq.get(qi).unwrap_or(b'N'),
+                    |qi| qbytes.get(qi).copied().unwrap_or(0),
+                    model, lut, &mut iscratch, &mut ll, &mut depth,
+                    params.max_depth, params.min_bq, qhash, &mut ov.last_frag,
+                );
+            }
         }
     };
 
@@ -403,7 +479,11 @@ fn pileup_one_cram(
         }
     }
 
-    Ok((sample_id, finalize_gl(&ll, &depth)))
+    let gl = match em {
+        Some(e) => finalize_gl_errmod(&mut bases, ref_base, alt_base, is_snp, e),
+        None => finalize_gl(&ll, &depth),
+    };
+    Ok((sample_id, gl))
 }
 
 /// FNV-1a 64-bit hash of a read name, used to detect overlapping paired-end
@@ -421,10 +501,13 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// `first_qual` hold that observation so the partner mate can be merged in
 /// (agreeing bases → best quality kept; disagreeing → higher-quality base,
 /// quality reduced by the conflict) rather than double-counted.
-struct OverlapState { last_frag: Vec<u64>, first_base: Vec<u8>, first_qual: Vec<u8> }
+/// `first_idx[v]` is the index in the errmod `bases[v]` buffer of the current
+/// fragment's first-mate observation, so the overlapping mate can be merged into
+/// it in place (the errmod path; the naive path uses `first_base`/`first_qual`).
+struct OverlapState { last_frag: Vec<u64>, first_base: Vec<u8>, first_qual: Vec<u8>, first_idx: Vec<u32> }
 impl OverlapState {
     fn new(n: usize) -> Self {
-        OverlapState { last_frag: vec![u64::MAX; n], first_base: vec![0; n], first_qual: vec![0; n] }
+        OverlapState { last_frag: vec![u64::MAX; n], first_base: vec![0; n], first_qual: vec![0; n], first_idx: vec![0; n] }
     }
 }
 
@@ -519,6 +602,138 @@ fn walk_record<B: Fn(usize) -> u8, Q: Fn(usize) -> u8>(
         }
         if refcur > last_pos { break; }
     }
+}
+
+/// errmod variant of [`walk_record`]: instead of accumulating the naive
+/// independent-product log-likelihood, it COLLECTS each covered SNP site's read
+/// base as a packed `u16` (`qual<<5 | strand<<4 | base`, base 0..=3) into
+/// `bases[v]`, applying bcftools `mpileup`'s exact per-base quality processing:
+/// neighbour-quality cap (`q ≤ neighbour+30`), `min_baseQ` skip, `max_baseQ=60`
+/// cap, mapping-quality cap (`q ≤ min(mapQ,60)`), and the `[4,63]` clamp. The
+/// per-site base lists are later fed to [`crate::lcwgs::errmod::ErrMod::cal`].
+/// Overlapping mates of one fragment are counted once (keep first).
+#[allow(clippy::too_many_arguments)]
+fn walk_record_em<B: Fn(usize) -> u8, Q: Fn(usize) -> u8>(
+    start: i64,
+    last_pos: i64,
+    cigar: &[(Kind, usize)],
+    base_at: B,
+    qual_at: Q,
+    read_len: usize,
+    mapq: u8,
+    is_rev: bool,
+    pos: &[i64],
+    is_snp: &[bool],
+    params: &PileupParams,
+    bases: &mut [Vec<u16>],
+    depth: &mut [u32],
+    qhash: u64,
+    ov: &mut OverlapState,
+) {
+    let n_var = pos.len();
+    let ref_span: i64 = cigar.iter().map(|&(k, l)| match k {
+        Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion | Kind::Skip => l as i64,
+        _ => 0,
+    }).sum();
+    let mut si = pos.partition_point(|&p| p < start);
+    if si >= n_var || pos[si] > start + ref_span { return; }
+    let mq_cap = (mapq as i32).min(60);
+    let strand_bit = (is_rev as u16) << 4;
+    let mut refcur = start;
+    let mut qcur: usize = 0;
+    for &(kind, len) in cigar {
+        match kind {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                let ref_end = refcur + len as i64;
+                while si < n_var && pos[si] < refcur { si += 1; }
+                while si < n_var && pos[si] < ref_end {
+                    let v = si;
+                    if is_snp[v] {
+                        let qi = qcur + (pos[v] - refcur) as usize;
+                        let base4 = ascii_to_base4(base_at(qi));
+                        if base4 <= 3 && (depth[v] < params.max_depth || ov.last_frag[v] == qhash) {
+                            let mut q = qual_at(qi) as i32;
+                            // neighbour-quality cap (bcftools delta_baseQ = 30)
+                            if qi > 0 { let nq = qual_at(qi - 1) as i32; if q > nq + 30 { q = nq + 30; } }
+                            if qi + 1 < read_len { let nq = qual_at(qi + 1) as i32; if q > nq + 30 { q = nq + 30; } }
+                            if q >= params.min_bq as i32 {
+                                if q > 60 { q = 60; }          // max_baseQ
+                                if q > mq_cap { q = mq_cap; }   // mapping-quality cap
+                                if q > 63 { q = 63; }
+                                if q < 4 { q = 4; }
+                                if ov.last_frag[v] == qhash {
+                                    // Overlapping mate of one fragment: merge into the first
+                                    // mate's buffered base (samtools tweak_overlap_quality):
+                                    // agreeing bases → SUM the qualities (cap 60); disagreeing
+                                    // → keep the higher-quality base at 0.8×, drop the other.
+                                    let idx = ov.first_idx[v] as usize;
+                                    let p = bases[v][idx];
+                                    let q1 = (p >> 5) as i32;
+                                    let bs1 = p & 0x1f; // first mate's strand|base
+                                    let base1 = (p & 0xf) as usize;
+                                    let (keep_bs, nq) = if base4 == base1 {
+                                        (bs1, (q1 + q).min(60))
+                                    } else if q > q1 {
+                                        (strand_bit | base4 as u16, ((q as f64 * 0.8) as i32).max(4))
+                                    } else {
+                                        (bs1, ((q1 as f64 * 0.8) as i32).max(4))
+                                    };
+                                    let nq = nq.clamp(4, 63) as u16;
+                                    bases[v][idx] = (nq << 5) | keep_bs;
+                                } else {
+                                    ov.first_idx[v] = bases[v].len() as u32;
+                                    bases[v].push(((q as u16) << 5) | strand_bit | base4 as u16);
+                                    depth[v] += 1;
+                                    ov.last_frag[v] = qhash;
+                                }
+                            }
+                        }
+                    }
+                    si += 1;
+                }
+                refcur = ref_end;
+                qcur += len;
+            }
+            Kind::Deletion | Kind::Skip => { refcur += len as i64; }
+            Kind::Insertion | Kind::SoftClip => { qcur += len; }
+            Kind::HardClip | Kind::Pad => {}
+        }
+        if refcur > last_pos { break; }
+    }
+}
+
+/// Per-site 3-way GL from the collected errmod bases. For each SNP site runs the
+/// samtools/bcftools `errmod_cal` over `bases[v]`, extracts the (REF,REF),
+/// (REF,ALT), (ALT,ALT) phred likelihoods for the panel alleles and normalises
+/// to a 3-way GL. Sites with no reads (or non-ACGT alleles) stay flat `[⅓,⅓,⅓]`.
+fn finalize_gl_errmod(
+    bases: &mut [Vec<u16>],
+    ref_base: &[u8],
+    alt_base: &[u8],
+    is_snp: &[bool],
+    em: &crate::lcwgs::errmod::ErrMod,
+) -> Vec<f32> {
+    let n_var = bases.len();
+    let mut out = vec![1.0f32 / 3.0; n_var * 3];
+    let mut q = [0.0f32; 25];
+    for v in 0..n_var {
+        if !is_snp[v] || bases[v].is_empty() { continue; }
+        let r = ascii_to_base4(ref_base[v]);
+        let a = ascii_to_base4(alt_base[v]);
+        if r > 3 || a > 3 { continue; }
+        em.cal(&mut bases[v], 5, &mut q);
+        // phred → likelihood (lower phred = more likely); normalise.
+        let l0 = 10f64.powf(-(q[r * 5 + r] as f64) / 10.0);
+        let l1 = 10f64.powf(-(q[r * 5 + a] as f64) / 10.0);
+        let l2 = 10f64.powf(-(q[a * 5 + a] as f64) / 10.0);
+        let s = l0 + l1 + l2;
+        if s > 0.0 {
+            out[v * 3] = (l0 / s) as f32;
+            out[v * 3 + 1] = (l1 / s) as f32;
+            out[v * 3 + 2] = (l2 / s) as f32;
+        }
+    }
+    out
 }
 
 /// Accumulate one read base into the 3 genotype log10-likelihoods, scaled by
