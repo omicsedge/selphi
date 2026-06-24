@@ -218,9 +218,52 @@ fn recomb_scale(ne: f32, k: usize, n_ref: usize) -> f64 {
         _ => true,            // default + explicit LCWGS_KINDEP_RECOMB: K-independent
     };
     if kindep {
-        0.04f64 * (ne as f64) / (n_ref.max(ne as usize) as f64)
+        // Recombination denominator (LCWGS_RECOMB_DENOM): the K-independent default
+        // `max(n_ref, Ne)` (mode `max`) gives a sticky copy that wins the common/
+        // OVERALL bins. GLIMPSE2's actual non-`--state-list` default is `/n_ref`
+        // (conditioning_set.cpp:34, use_list=false), ~16× higher recombination on a
+        // small panel — better on the ULTRA-RARE bin (a copied non-carrier un-sticks
+        // onto the true rare carrier) but riskier for the common-bin win. Mode `nref`
+        // applies `/n_ref` globally; mode `band` (the principled choice) keeps the
+        // tuned `/max` rate here and raises ONLY rare-site transitions via the
+        // per-site `recomb_mult` (see `recomb_band_mult`), so it cannot regress the
+        // common bins. Default `max` ⇒ byte-identical.
+        match recomb_denom_mode() {
+            1 => 0.04f64 * (ne as f64) / (n_ref as f64), // nref: GLIMPSE2 default, global
+            _ => 0.04f64 * (ne as f64) / (n_ref.max(ne as usize) as f64), // max (default) / band base
+        }
     } else {
         0.04f64 * (ne as f64) / (k as f64)
+    }
+}
+
+/// Recombination-denominator mode (`LCWGS_RECOMB_DENOM`): 0=`max` (prior shipped
+/// behaviour, opt-out, byte-identical), 1=`nref` (global GLIMPSE2 `/n_ref`),
+/// 2=`band` (rare-site-only `/n_ref` via [`recomb_band_mult`]). **DEFAULT = `band`**
+/// (2): the prior `max` denominator was GLIMPSE2's `--state-list` expert-mode form,
+/// ~16× too sticky on a small panel — `band` restores GLIMPSE2's real default
+/// recombination rate at rare sites only (lifts the ultra-rare R² markedly,
+/// raises OVERALL slightly, cannot regress the common bins; a no-op when n_ref ≥ Ne).
+/// Opt out with `LCWGS_RECOMB_DENOM=max` for the prior byte-identical output. Cached once.
+pub fn recomb_denom_mode() -> u8 {
+    use std::sync::OnceLock;
+    static M: OnceLock<u8> = OnceLock::new();
+    *M.get_or_init(|| match crate::config::raw("LCWGS_RECOMB_DENOM").as_deref() {
+        Some("max") => 0,    // opt-out: prior shipped /max(n_ref,Ne) (byte-identical)
+        Some("nref") => 1,   // global /n_ref
+        _ => 2,              // "band" (default) / explicit "band"
+    })
+}
+
+/// Per-rare-site recombination-rate multiplier for the `band` mode: `Some(r)` where
+/// `r = max(n_ref, Ne) / n_ref` raises a rare-site boundary's rate from the tuned
+/// `0.04·Ne/max(n_ref,Ne)` up to GLIMPSE2's `0.04·Ne/n_ref`. `None` for non-`band`
+/// modes (caller passes `recomb_mult = None`, i.e. the byte-identical default).
+pub fn recomb_band_mult(n_ref: usize, ne: f32) -> Option<f32> {
+    if recomb_denom_mode() == 2 {
+        Some((n_ref.max(ne as usize) as f32) / (n_ref as f32))
+    } else {
+        None
     }
 }
 

@@ -143,8 +143,16 @@ fn run_one_hap<F: Fn(usize) -> usize>(
         }
         let mut dose = vec![0.0f32; n_var];
         if !poly_sites.is_empty() {
+            // Band-mode recombination (LCWGS_RECOMB_DENOM=band): raise ONLY rare-site
+            // (is_common==false) boundary transitions to GLIMPSE2's /n_ref rate so the
+            // copy can un-stick onto the true rare carrier, while common-site
+            // transitions keep the tuned /max(n_ref,Ne) rate that wins the common bins.
+            // `None` (default) ⇒ byte-identical. Built on the compacted poly axis.
+            let rmult: Option<Vec<f32>> =
+                crate::lcwgs::hmm::recomb_band_mult(ref_bm.n_haps, params.ne)
+                    .map(|r| poly_sites.iter().map(|&v| if is_common[v] { 1.0 } else { r }).collect());
             let dp = run_forward_backward(
-                &hl_poly, cond, ref_bm, &cm_poly, params, None, Some(&poly_sites),
+                &hl_poly, cond, ref_bm, &cm_poly, params, rmult.as_deref(), Some(&poly_sites),
             ).dosage;
             for (i, &v) in poly_sites.iter().enumerate() { dose[v] = dp[i]; }
         }
