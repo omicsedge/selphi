@@ -171,8 +171,9 @@ fn format_bcf(out: &mut Vec<u8>, s: &SiteRec, n_samples: usize) {
     // FORMAT GT: key, then a (ploidy, type) descriptor, then ploidy values/sample.
     encode_typed_int(out, FMT_GT_IDX);
     let al = &s.alleles;
-    // (allele+1)<<1 | phase. Max encoded = n_allele<<1|1; int8 fits if <=127.
-    if (n_allele as u32) << 1 | 1 <= 127 {
+    // (allele+1)<<1 | phase. Largest encoded GT value = (n_allele<<1)|1; int8 fits if <=127.
+    let max_gt_code = ((n_allele as u32) << 1) | 1;
+    if max_gt_code <= 127 {
         out.push((2 << 4) | TY_INT8);
         for k in 0..n_samples {
             let a = al[2 * k] as i32;
