@@ -12,22 +12,22 @@
 <line x1="120" y1="78.0" x2="548" y2="78.0" stroke="#30363d" stroke-width="1"/>
 <text x="110" y="82.0" text-anchor="end" fill="#8b949e" font-size="11">0.998</text>
 <text x="120.0" y="320.0" text-anchor="middle" fill="#8b949e" font-size="12">0.5&#215;</text>
-<text x="262.7" y="320.0" text-anchor="middle" fill="#8b949e" font-size="12">1&#215;</text>
-<text x="405.3" y="320.0" text-anchor="middle" fill="#8b949e" font-size="12">2&#215;</text>
+<text x="181.1" y="320.0" text-anchor="middle" fill="#8b949e" font-size="12">1&#215;</text>
+<text x="303.4" y="320.0" text-anchor="middle" fill="#8b949e" font-size="12">2&#215;</text>
 <text x="548.0" y="320.0" text-anchor="middle" fill="#8b949e" font-size="12">4&#215;</text>
 <text x="334.0" y="340.0" text-anchor="middle" fill="#8b949e" font-size="12" font-weight="600">Sequencing coverage</text>
 <line x1="120" y1="78" x2="120" y2="298" stroke="#30363d" stroke-width="1"/>
-<polyline points="120.0,254.0 262.7,174.2 405.3,113.7 548.0,91.7" fill="none" stroke="#d29922" stroke-width="2.4"/><rect x="115.8" y="249.8" width="8.4" height="8.4" rx="1" fill="#d29922"/><rect x="258.5" y="170.0" width="8.4" height="8.4" rx="1" fill="#d29922"/><rect x="401.1" y="109.5" width="8.4" height="8.4" rx="1" fill="#d29922"/><rect x="543.8" y="87.5" width="8.4" height="8.4" rx="1" fill="#d29922"/>
-<polyline points="120.0,245.7 262.7,177.0 405.3,111.0 548.0,97.3" fill="none" stroke="#3fb950" stroke-width="2.4"/><polygon points="120.0,241.0 115.3,249.9 124.7,249.9" fill="#3fb950"/><polygon points="262.7,172.3 258.0,181.2 267.4,181.2" fill="#3fb950"/><polygon points="405.3,106.3 400.6,115.2 410.0,115.2" fill="#3fb950"/><polygon points="548.0,92.6 543.3,101.5 552.7,101.5" fill="#3fb950"/>
-<polyline points="120.0,232.0 262.7,160.5 405.3,102.8 548.0,80.7" fill="none" stroke="#58a6ff" stroke-width="2.4"/><circle cx="120.0" cy="232.0" r="4.2" fill="#58a6ff"/><circle cx="262.7" cy="160.5" r="4.2" fill="#58a6ff"/><circle cx="405.3" cy="102.8" r="4.2" fill="#58a6ff"/><circle cx="548.0" cy="80.7" r="4.2" fill="#58a6ff"/>
-<line x1="398" y1="84" x2="420" y2="84" stroke="#58a6ff" stroke-width="2.4"/>
-<circle cx="409.0" cy="84.0" r="4.2" fill="#58a6ff"/>
-<text x="428" y="88" fill="#e6edf3" font-size="12" font-weight="600">Selphi 2</text>
-<line x1="398" y1="104" x2="420" y2="104" stroke="#d29922" stroke-width="2.4"/>
-<rect x="404.8" y="99.8" width="8.4" height="8.4" rx="1" fill="#d29922"/>
-<text x="428" y="108" fill="#e6edf3" font-size="12" font-weight="600">GLIMPSE2</text>
-<line x1="398" y1="124" x2="420" y2="124" stroke="#3fb950" stroke-width="2.4"/>
-<polygon points="409.0,119.3 404.3,128.2 413.7,128.2" fill="#3fb950"/>
-<text x="428" y="128" fill="#e6edf3" font-size="12" font-weight="600">QUILT2</text>
+<polyline points="120.0,254.0 181.1,174.2 303.4,113.7 548.0,91.7" fill="none" stroke="#d29922" stroke-width="2.4"/><rect x="115.8" y="249.8" width="8.4" height="8.4" rx="1" fill="#d29922"/><rect x="176.9" y="170.0" width="8.4" height="8.4" rx="1" fill="#d29922"/><rect x="299.2" y="109.5" width="8.4" height="8.4" rx="1" fill="#d29922"/><rect x="543.8" y="87.5" width="8.4" height="8.4" rx="1" fill="#d29922"/>
+<polyline points="120.0,245.7 181.1,177.0 303.4,111.0 548.0,97.3" fill="none" stroke="#3fb950" stroke-width="2.4"/><polygon points="120.0,241.0 115.3,249.9 124.7,249.9" fill="#3fb950"/><polygon points="181.1,172.3 176.4,181.2 185.8,181.2" fill="#3fb950"/><polygon points="303.4,106.3 298.7,115.2 308.1,115.2" fill="#3fb950"/><polygon points="548.0,92.6 543.3,101.5 552.7,101.5" fill="#3fb950"/>
+<polyline points="120.0,232.0 181.1,160.5 303.4,102.8 548.0,80.7" fill="none" stroke="#58a6ff" stroke-width="2.4"/><circle cx="120.0" cy="232.0" r="4.2" fill="#58a6ff"/><circle cx="181.1" cy="160.5" r="4.2" fill="#58a6ff"/><circle cx="303.4" cy="102.8" r="4.2" fill="#58a6ff"/><circle cx="548.0" cy="80.7" r="4.2" fill="#58a6ff"/>
+<line x1="413" y1="234" x2="435" y2="234" stroke="#58a6ff" stroke-width="2.4"/>
+<circle cx="424.0" cy="234.0" r="4.2" fill="#58a6ff"/>
+<text x="443" y="238" fill="#e6edf3" font-size="12" font-weight="600">Selphi 2</text>
+<line x1="413" y1="254" x2="435" y2="254" stroke="#d29922" stroke-width="2.4"/>
+<rect x="419.8" y="249.8" width="8.4" height="8.4" rx="1" fill="#d29922"/>
+<text x="443" y="258" fill="#e6edf3" font-size="12" font-weight="600">GLIMPSE2</text>
+<line x1="413" y1="274" x2="435" y2="274" stroke="#3fb950" stroke-width="2.4"/>
+<polygon points="424.0,269.3 419.3,278.2 428.7,278.2" fill="#3fb950"/>
+<text x="443" y="278" fill="#e6edf3" font-size="12" font-weight="600">QUILT2</text>
 <text x="16" y="374" fill="#3fb950" font-size="13" font-weight="700">Selphi 2 leads both tools at every coverage &#183; &#8776;2.5&#215; faster than GLIMPSE2, single-sample</text>
 </svg>
