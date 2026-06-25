@@ -198,6 +198,14 @@ selphi --lcwgs \
 
 Output is `GT:DS:GP`. The engine alternates sparse-PBWT haplotype selection with a GL-weighted Li-Stephens forward-backward (a conditional-HL diploid Gibbs sampler) and a diplotype-mosaic phase-commitment step, processing the chromosome in cM chunks so the full panel is never held in memory. The forward-backward is SIMD-accelerated and √n-checkpointed (bit-identical, ~2× faster and ~10× lower peak memory). On the default engine Selphi matches or beats GLIMPSE2 across MAF bins, winning overall and on every bin up to 2× coverage; single-sample it runs several× faster, while multi-sample whole-chromosome trades wall time for the accuracy gain. Full MAF-binned and multi-coverage numbers are in the paper. Expert knobs are exposed via `LCWGS_*` environment variables; defaults are calibrated for 1× data.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="img/lcwgs_dark.svg"/>
+    <source media="(prefers-color-scheme: light)" srcset="img/lcwgs_light.svg"/>
+    <img src="img/lcwgs_dark.svg" alt="Low-coverage imputation accuracy across coverage: per-sample R² for Selphi 2 vs GLIMPSE2 and QUILT2 on GIAB HG002/HG003/HG004 chr22 at 0.5×–4×; Selphi 2 leads both tools at every coverage" width="720"/>
+  </picture>
+</p>
+
 #### Native BAM/CRAM input
 
 Point `--lcwgs` directly at aligned reads and Selphi computes the genotype likelihoods natively at the panel's sites (no `bcftools mpileup`). One file per sample; `--bam-list` takes a file with one path per line. CRAM also needs the reference FASTA (with a `.fai`):
