@@ -256,15 +256,18 @@ pub fn recomb_denom_mode() -> u8 {
 }
 
 /// Per-rare-site recombination-rate multiplier for the `band` mode: `Some(r)` where
-/// `r = max(n_ref, Ne) / n_ref` raises a rare-site boundary's rate from the tuned
-/// `0.04·Ne/max(n_ref,Ne)` up to GLIMPSE2's `0.04·Ne/n_ref`. `None` for non-`band`
-/// modes (caller passes `recomb_mult = None`, i.e. the byte-identical default).
+/// `r = max(n_ref, Ne) / n_ref > 1` raises a rare-site boundary's rate from the tuned
+/// `0.04·Ne/max(n_ref,Ne)` up to GLIMPSE2's `0.04·Ne/n_ref`. Returns `None` (→ the
+/// caller passes `recomb_mult = None`, the byte-identical default-path) when not in
+/// `band` mode OR when there is no lift to apply — i.e. `n_ref ≥ Ne` (then the base
+/// scale already equals `/n_ref` so `r` would be 1.0) — so huge panels skip the
+/// pointless per-site multiplier Vec. `n_ref == 0` also yields `None` (no division).
 pub fn recomb_band_mult(n_ref: usize, ne: f32) -> Option<f32> {
-    if recomb_denom_mode() == 2 {
-        Some((n_ref.max(ne as usize) as f32) / (n_ref as f32))
-    } else {
-        None
+    if recomb_denom_mode() != 2 || n_ref == 0 {
+        return None;
     }
+    let r = (n_ref.max(ne as usize) as f32) / (n_ref as f32);
+    if r > 1.0 { Some(r) } else { None } // no lift when n_ref ≥ Ne (r == 1.0)
 }
 
 /// Precompute the normalized per-(variant, allele) emission into `out`
@@ -1740,6 +1743,30 @@ mod tests {
         let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None);
         assert!(out.dosage[0] > 0.95,
             "strong ALT HL should give dose ≈ 1, got {}", out.dosage[0]);
+    }
+
+    /// Band-mode recombination math: the band multiplier `r = max(n_ref,Ne)/n_ref`
+    /// lifts the tuned `/max` base scale (`0.04·Ne/max(n_ref,Ne)`) EXACTLY to
+    /// GLIMPSE2's `/n_ref` rate (`0.04·Ne/n_ref`) — the identity the integration-R²
+    /// benchmarks rely on. Plus the env-independent `recomb_band_mult` guards: `None`
+    /// for a zero-hap panel and `None` when there is no lift (n_ref ≥ Ne), regardless
+    /// of the cached recomb-denominator mode. (The mode-gated Some(..) path is covered
+    /// by the band-vs-max integration benchmarks, which need a fixed env.)
+    #[test]
+    fn band_recomb_multiplier_math() {
+        let ne = 100_000.0f64;
+        for &n_ref in &[6332usize, 4478, 75552, 171_054] {
+            let base = 0.04 * ne / (n_ref.max(ne as usize) as f64);  // /max base scale
+            let r = (n_ref.max(ne as usize) as f64) / (n_ref as f64); // band multiplier
+            let nref_rate = 0.04 * ne / (n_ref as f64);
+            assert!((base * r - nref_rate).abs() < 1e-12,
+                "n_ref={n_ref}: band base×mult {} should equal /n_ref rate {}", base * r, nref_rate);
+            if (n_ref as f64) < ne { assert!(r > 1.0, "lift expected for n_ref<Ne"); }
+            else { assert!((r - 1.0).abs() < 1e-12, "no lift for n_ref>=Ne"); }
+        }
+        // Guards independent of the cached LCWGS_RECOMB_DENOM mode:
+        assert_eq!(recomb_band_mult(0, ne as f32), None, "no division on a zero-hap panel");
+        assert_eq!(recomb_band_mult(200_000, ne as f32), None, "no lift when n_ref >= Ne");
     }
 
     /// Three sites, two ref haps (one all-REF, one all-ALT). Target HL flat
