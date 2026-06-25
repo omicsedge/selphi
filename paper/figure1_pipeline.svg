@@ -87,10 +87,10 @@
   <rect x="50" y="480" width="330" height="138" rx="6" fill="#fce4ec" stroke="#c2185b" stroke-width="1.2"/>
   <text x="215" y="500" text-anchor="middle" fill="#880e4f" font-size="12" font-weight="700">Genotype Imputation</text>
   <text x="215" y="515" text-anchor="middle" fill="#888" font-size="9" font-style="italic">chip / WGS confident hard calls</text>
-  <text x="215" y="535" text-anchor="middle" fill="#333" font-size="10.5">PBWT candidate selection (up to 2,500)</text>
+  <text x="215" y="535" text-anchor="middle" fill="#333" font-size="10.5">PBWT candidate selection (panel-adaptive, min 2,500)</text>
   <text x="215" y="552" text-anchor="middle" fill="#333" font-size="10.5">Li-Stephens HMM (f32 fwd / f64 bwd)</text>
   <text x="215" y="569" text-anchor="middle" fill="#333" font-size="10.5">Haplotype deduplication</text>
-  <text x="215" y="586" text-anchor="middle" fill="#333" font-size="10.5">Adaptive Ne = 36 &#xd7; n_ref, MAF-scaled</text>
+  <text x="215" y="586" text-anchor="middle" fill="#333" font-size="10.5">Adaptive Ne = 36.4 &#xd7; n_ref, MAF-scaled</text>
   <text x="215" y="608" text-anchor="middle" fill="#b0457b" font-size="9" font-style="italic">hard calls in &#x2192; dosages out</text>
 
   <!-- Low-coverage WGS imputation engine (GL-aware) -->
