@@ -78,6 +78,12 @@ fn run_one_hap<F: Fn(usize) -> usize>(
     // full-axis FB (byte-identical default). `is_common[v]`=panel MAF≥rare_maf;
     // `shap_ref[h]`=ascending rare sites where panel hap h carries the minor allele.
     poly_skip: Option<(&[bool], &[Vec<u32>])>,
+    // Band-mode recombination multiplier for the FULL-AXIS imputation FB (one entry
+    // per `n_var` site, common->1.0 / rare->band lift). Used ONLY on the full-axis
+    // branch (poly-skip OFF, scaffold OFF): the poly-skip branch builds its own
+    // compacted multiplier inline, and the scaffold branch visits only common sites
+    // so band is N/A there. `None` => uniform rate (byte-identical to pre-band).
+    full_axis_rmult: Option<&[f32]>,
 ) -> (Vec<f32>, Vec<u8>) {
     let mut hap_hl = vec![0.0f32; n_var * 2];
     let mg = params.min_gl; // GLIMPSE2 per-hap GL floor (0 = disabled)
@@ -109,6 +115,10 @@ fn run_one_hap<F: Fn(usize) -> usize>(
     let dose: Vec<f32> = if cond.is_empty() {
         (0..n_var).map(|v| hap_hl[2 * v + 1]).collect()
     } else if use_scaffold {
+        // Band-mode recombination is N/A in scaffold mode by construction: the
+        // scaffold FB visits ONLY the common (scaffold) sites and interpolates the
+        // rare sites afterwards, so there are no rare-site boundary transitions to
+        // lift. `full_axis_rmult` is never built for this path.
         run_forward_backward_scaffold(&hap_hl, common_idx, cond, ref_bm, cm, params).dosage
     } else if let Some((is_common, shap_ref)) = poly_skip {
         // POLY/MONO SKIP (GLIMPSE2 conditioning_set::compactSelection analogue).
@@ -176,7 +186,11 @@ fn run_one_hap<F: Fn(usize) -> usize>(
         }
         dose
     } else {
-        run_forward_backward(&hap_hl, cond, ref_bm, cm, params, None, None).dosage
+        // FULL-AXIS FB (poly-skip OFF, e.g. LCWGS_NO_POLY_SKIP). `full_axis_rmult`
+        // carries the band-mode per-site recombination lift (common->1.0, rare->band)
+        // precomputed once by the caller; `None` for the default `max`/`nref` modes
+        // ⇒ uniform rate ⇒ byte-identical to the pre-band full-axis path.
+        run_forward_backward(&hap_hl, cond, ref_bm, cm, params, full_axis_rmult, None).dosage
     };
     // Sample a fresh allele per site from the posterior dose (deterministic
     // splitmix64 stream keyed by seed/iteration/hap/variant → reproducible).
@@ -547,6 +561,34 @@ pub fn run_gibbs(
             None
         };
 
+    // Band-mode recombination on the FULL-AXIS imputation FB (poly-skip OFF, e.g.
+    // LCWGS_NO_POLY_SKIP). The poly-skip branch builds its own compacted per-poly-site
+    // multiplier inline; when poly-skip is disabled the full-axis FB would otherwise
+    // ignore band entirely, so precompute the full `n_var` multiplier ONCE here
+    // (loop-invariant): common sites → 1.0 (keep the tuned /max rate), rare sites →
+    // the band lift `r` (= /n_ref rate). `None` for the default `max`/`nref` modes,
+    // when poly-skip is on (its own path handles band), or in scaffold mode (the FB
+    // visits only common sites) ⇒ byte-identical to the pre-band full-axis path. The
+    // `is_common` rule mirrors `build_poly_skip_structures` exactly.
+    let full_axis_rmult: Option<Vec<f32>> =
+        match crate::lcwgs::hmm::recomb_band_mult(ref_bm.n_haps, params.ne) {
+            Some(r) if !cfg.poly_skip && !use_scaffold => {
+                let n_ref = ref_bm.n_haps;
+                let nf = n_ref as f64;
+                let thr = params.rare_maf as f64;
+                Some(
+                    (0..n_var)
+                        .map(|v| {
+                            let ac = ref_bm.popcount_row(v, n_ref) as f64;
+                            let maf = ac.min(nf - ac) / nf;
+                            if maf >= thr { 1.0f32 } else { r }
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        };
+
     // Per-sample phasing `flat` GL mask (read-uninformative sites). It depends ONLY
     // on the static input `gl3` and the `flat_exact` rule — the Gibbs loop re-samples
     // `hap_alleles`, never `gl3` — so it is loop-invariant. Build it ONCE here instead
@@ -654,12 +696,14 @@ pub fn run_gibbs(
                         h0, s, it, seed,
                         |v| prev_alleles[v * n_target_haps + h1] as usize,
                         &cond_per_hap[h0], gl3, ref_bm, cm, params,
-                        use_scaffold, &common_idx, n_var, n_samples, poly_skip_arg);
+                        use_scaffold, &common_idx, n_var, n_samples, poly_skip_arg,
+                        full_axis_rmult.as_deref());
                     let (d1, samp1) = run_one_hap(
                         h1, s, it, seed,
                         |v| samp0[v] as usize,
                         &cond_per_hap[h1], gl3, ref_bm, cm, params,
-                        use_scaffold, &common_idx, n_var, n_samples, poly_skip_arg);
+                        use_scaffold, &common_idx, n_var, n_samples, poly_skip_arg,
+                        full_axis_rmult.as_deref());
                     vec![(h0, d0, samp0), (h1, d1, samp1)]
                 }).collect();
             per_sample.into_iter().flatten().collect()
@@ -671,7 +715,8 @@ pub fn run_gibbs(
                     h, s, it, seed,
                     |v| prev_alleles[v * n_target_haps + partner] as usize,
                     &cond_per_hap[h], gl3, ref_bm, cm, params,
-                    use_scaffold, &common_idx, n_var, n_samples, poly_skip_arg);
+                    use_scaffold, &common_idx, n_var, n_samples, poly_skip_arg,
+                    full_axis_rmult.as_deref());
                 (h, dose, sampled)
             }).collect()
         };
