@@ -216,6 +216,41 @@ Reference: Beagle 5.5, SHAPEIT5 v5.1.1.
 
 ---
 
+## Table S-G · Phasing × imputer matrix (overall R²) — 1KG, chip→WGS
+
+A genuinely-unphased 1KG array target (801 held-out samples) phased by each of
+three tools, then imputed by each of two imputers against the 1000 Genomes Phase 3
+panel; overall R² vs WGS truth on imputed-only sites. Within a fixed imputer the
+three phasings differ by ≤0.002; switching the imputer (Beagle→Selphi) moves R²
+by +0.007 to +0.010 regardless of phaser — i.e. the phaser is practically
+interchangeable for array imputation and the accuracy gain lives in the imputer.
+
+| Phasing ↓ / Imputer → | chr22 Beagle | chr22 Selphi | chr1 Beagle | chr1 Selphi |
+|---|---:|---:|---:|---:|
+| Selphi 2   | 0.4723 | 0.4821 | 0.5655 | 0.5730 |
+| Beagle 5.5 | 0.4727 | 0.4815 | 0.5639 | 0.5710 |
+| SHAPEIT5   | 0.4728 | 0.4834 | 0.5646 | 0.5726 |
+
+> Backs the Discussion "phaser vs imputer" paragraph. Contrast with Table 4c,
+> where adding **pedigree information** (not changing the phaser) does move
+> downstream imputation (+0.016–0.022 R²).
+
+## Table S-H · Reference-panel re-phasing (chr22)
+
+The 1000 Genomes Phase 3 panel re-phased de-novo with Selphi 2 (`--phase-panel`,
+2,401 samples) versus its original published phasing; the same Selphi-phased
+target is imputed against each panel. Re-phasing a well-phased panel is
+net-negative on overall R², driven entirely by the rarest bins (it helps common
+variants but loses rare-allele fidelity), so a panel's published phasing is best
+retained.
+
+| Imputer | original panel | Selphi-rephased panel | Δ overall | rarest-bin Δ (0.05–0.1%) | common-bin Δ (0.5–50%) |
+|---|---:|---:|---:|---:|---:|
+| Beagle 5.5 | 0.4723 | 0.4696 | −0.0028 | −0.014 | +0.001 to +0.004 |
+| Selphi 2   | 0.4821 | 0.4788 | −0.0033 | −0.013 | +0.001 to +0.003 |
+
+---
+
 ## Provenance & reproduction
 
 - Source corpus: `reference_benchmark_tables` (auto-memory), itself compiled from
