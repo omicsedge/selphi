@@ -97,18 +97,65 @@ def full_width_and_borders(t):
         b.set(W('val'), 'single'); b.set(W('sz'), '4'); b.set(W('space'), '0'); b.set(W('color'), BORDER)
         bd.append(b)
     tblPr.append(bd)
+# usable text width (twips) = page width - margins; fallback US-Letter 1in margins
+sec = doc.sections[0]
+try:
+    usable_tw = int((sec.page_width - sec.left_margin - sec.right_margin) / 635)
+except Exception:
+    usable_tw = 9360
+if not usable_tw or usable_tw < 3000:
+    usable_tw = 9360
+FLOOR = 720  # min column width (~0.5 in) so short numeric/label cells don't wrap
+
+CHARW = 105  # ~twips per char at 10pt Times; PAD = cell L/R margins + slack
+def col_metrics(t):
+    ncol = len(t.rows[0].cells)
+    ml = [0] * ncol
+    for row in t.rows:
+        for ci, cell in enumerate(row.cells):
+            if ci < ncol:
+                ml[ci] = max(ml[ci], len(cell.text.strip()))
+    natural = [m * CHARW + 260 for m in ml]        # width to show the longest cell on one line
+    wide = [m > 20 for m in ml]                     # long-text columns: allowed to wrap
+    if any(wide):
+        narrow_sum = sum(natural[i] for i in range(ncol) if not wide[i])
+        rem = max(usable_tw - narrow_sum, 1400 * sum(wide))   # remainder for the wide columns
+        wtot = sum(ml[i] for i in range(ncol) if wide[i]) or 1
+        cw = [ (int(rem * ml[i] / wtot) if wide[i] else natural[i]) for i in range(ncol) ]
+    else:                                            # all short: scale naturals to fill the page
+        tot = sum(natural) or 1
+        cw = [int(usable_tw * n / tot) for n in natural]
+    cw = [max(c, FLOOR) for c in cw]
+    cw[ml.index(max(ml))] += usable_tw - sum(cw)     # widest column absorbs slack -> total == usable
+    return ml, cw
+
 ntab = 0
 for t in doc.tables:
-    t.alignment = WD_TABLE_ALIGNMENT.CENTER; t.autofit = True
+    t.alignment = WD_TABLE_ALIGNMENT.CENTER; t.autofit = False
     full_width_and_borders(t)
+    ml, cw = col_metrics(t); ncol = len(cw)
+    tblPr = t._tbl.tblPr
+    for e in tblPr.findall(W('tblLayout')): tblPr.remove(e)
+    tl = OxmlElement('w:tblLayout'); tl.set(W('type'), 'fixed'); tblPr.append(tl)
+    for e in tblPr.findall(W('tblW')): tblPr.remove(e)
+    tw = OxmlElement('w:tblW'); tw.set(W('type'), 'dxa'); tw.set(W('w'), str(sum(cw))); tblPr.append(tw)
+    grid = t._tbl.find(W('tblGrid'))
+    if grid is not None:
+        for i, gc in enumerate(grid.findall(W('gridCol'))):
+            if i < ncol: gc.set(W('w'), str(cw[i]))
+    left_col = [m > 18 for m in ml]                # text-heavy columns -> left aligned
     for ri, row in enumerate(t.rows):
         header = (ri == 0)
         fill = HEADER_FILL if header else (ROW_DARK if ri % 2 == 0 else ROW_LIGHT)
-        for cell in row.cells:
+        for ci, cell in enumerate(row.cells):
             set_cell_bg(cell, fill)
             cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+            tcPr = cell._tc.get_or_add_tcPr()
+            for e in tcPr.findall(W('tcW')): tcPr.remove(e)
+            cwe = OxmlElement('w:tcW'); cwe.set(W('type'), 'dxa'); cwe.set(W('w'), str(cw[ci] if ci < ncol else FLOOR)); tcPr.append(cwe)
+            align = WD_ALIGN_PARAGRAPH.LEFT if (not header and ci < ncol and left_col[ci]) else WD_ALIGN_PARAGRAPH.CENTER
             for p in cell.paragraphs:
-                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                p.alignment = align
                 for r in p.runs: set_run(r, size=TABLE_SZ, bold=True if header else None, white=header)
     ntab += 1
 
