@@ -133,10 +133,17 @@ def find_idx(name):
     return None
 abs_i, ref_i = find_idx('Abstract'), find_idx('References')
 
-# 1b. anchor each reference (numbered list items after the References heading)
+# 1b. anchor each reference (numbered list items after the References heading,
+#     stopping at the next heading so appended Supplementary content is untouched)
+def pstyle(p):
+    pPr = p.find(W('pPr'))
+    st = pPr.find(W('pStyle')) if pPr is not None else None
+    return st.get(W('val')) if st is not None else ''
 nref = 0
 if ref_i is not None:
     for p in paras[ref_i + 1:]:
+        if nref > 0 and (pstyle(p).startswith('Heading') or pstyle(p) == 'Title'):
+            break
         if p.find('.//' + W('numPr')) is not None:
             nref += 1
             bs = OxmlElement('w:bookmarkStart'); bs.set(W('id'), str(4000 + nref)); bs.set(W('name'), f'ref{nref}')
@@ -162,6 +169,17 @@ for p in paras[lo:hi]:
             p.insert(idx, sup_link_run(tok, anchor=f'ref{tok}' if tok.isdigit() else None)); idx += 1
             nlink += 1
 
+# page break before the Supplementary Information section (if present)
+npb = 0
+for p in paras:
+    if ptext(p).strip() == 'Supplementary Information':
+        pPr = p.find(W('pPr'))
+        if pPr is None:
+            pPr = OxmlElement('w:pPr'); p.insert(0, pPr)
+        if pPr.find(W('pageBreakBefore')) is None:
+            pPr.insert(0, OxmlElement('w:pageBreakBefore')); npb = 1
+        break
+
 doc.save(outp)
 print(f"bookmarks removed: {nbk}; font->{FONT}; images centered: {nimg}; justified: {njust}; "
-      f"captions {cap_sz.pt:.0f}pt: {ncap}; tables: {ntab}; ref anchors: {nref}; citation links: {nlink}")
+      f"captions {cap_sz.pt:.0f}pt: {ncap}; tables: {ntab}; ref anchors: {nref}; citation links: {nlink}; supp page-break: {npb}")
