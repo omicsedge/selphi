@@ -110,24 +110,29 @@ FLOOR = 720  # min column width (~0.5 in) so short numeric/label cells don't wra
 CHARW = 105  # ~twips per char at 10pt Times; PAD = cell L/R margins + slack
 def col_metrics(t):
     ncol = len(t.rows[0].cells)
-    ml = [0] * ncol
-    for row in t.rows:
+    data_ml = [0] * ncol     # longest DATA cell (drives width; headers may wrap)
+    word_ml = [0] * ncol     # longest single word (so headers wrap at spaces, not mid-word)
+    for ri, row in enumerate(t.rows):
         for ci, cell in enumerate(row.cells):
-            if ci < ncol:
-                ml[ci] = max(ml[ci], len(cell.text.strip()))
-    natural = [m * CHARW + 260 for m in ml]        # width to show the longest cell on one line
-    wide = [m > 20 for m in ml]                     # long-text columns: allowed to wrap
+            if ci >= ncol: continue
+            txt = cell.text.strip()
+            if ri > 0:
+                data_ml[ci] = max(data_ml[ci], len(txt))
+            for wd in txt.split():
+                word_ml[ci] = max(word_ml[ci], len(wd))
+    nat = [max(data_ml[i], word_ml[i]) * CHARW + 260 for i in range(ncol)]  # no-wrap on data
+    wide = [data_ml[i] > 20 for i in range(ncol)]   # text columns (by DATA) get the remainder
     if any(wide):
-        narrow_sum = sum(natural[i] for i in range(ncol) if not wide[i])
-        rem = max(usable_tw - narrow_sum, 1400 * sum(wide))   # remainder for the wide columns
-        wtot = sum(ml[i] for i in range(ncol) if wide[i]) or 1
-        cw = [ (int(rem * ml[i] / wtot) if wide[i] else natural[i]) for i in range(ncol) ]
+        narrow_sum = sum(nat[i] for i in range(ncol) if not wide[i])
+        rem = max(usable_tw - narrow_sum, 1600 * sum(wide))
+        wtot = sum(data_ml[i] for i in range(ncol) if wide[i]) or 1
+        cw = [ (int(rem * data_ml[i] / wtot) if wide[i] else nat[i]) for i in range(ncol) ]
     else:                                            # all short: scale naturals to fill the page
-        tot = sum(natural) or 1
-        cw = [int(usable_tw * n / tot) for n in natural]
+        tot = sum(nat) or 1
+        cw = [int(usable_tw * n / tot) for n in nat]
     cw = [max(c, FLOOR) for c in cw]
-    cw[ml.index(max(ml))] += usable_tw - sum(cw)     # widest column absorbs slack -> total == usable
-    return ml, cw
+    cw[data_ml.index(max(data_ml))] += usable_tw - sum(cw)   # widest-data column absorbs slack
+    return data_ml, cw
 
 ntab = 0
 for t in doc.tables:
