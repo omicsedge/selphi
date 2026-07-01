@@ -1,4 +1,4 @@
-# **Selphi 2: integrated phasing and whole-genome genotype imputation in a single Rust binary**
+# **One binary, whole genome: Selphi 2 unifies phasing, imputation, and low-coverage sequencing**
 
 Authors: Adriano De Marino^1^, Sandra Bohn^1^, Jon Lerga-Jaso^1^, Biljana Novković^1^, Andrew Terpolovsky^1^, Puya G. Yazdi^1,\*^
 
