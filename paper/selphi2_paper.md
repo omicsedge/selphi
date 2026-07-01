@@ -349,12 +349,12 @@ To confirm that the pedigree improves phasing in a way that is real rather than 
 
 Table 5 summarizes wall time and peak resident memory for Selphi 2, Selphi 1.5.3, and Beagle on the three reference panels evaluated above, on the same machine (16 threads) and on identical inputs.
 
-**Table 5. Wall time and peak memory.** All numbers measured on a single workstation (16-thread CPU) with /usr/bin/time -v; Selphi 1.5.3 memory measured via docker stats. The MESA 5K $\times$ TOPMed row reflects Selphi 2 at its panel-adaptive default $m_c$ (132,676) and Beagle 5.5 at its default settings, both consuming an unphased chip target and producing imputed dosages. On the 1000 Genomes 801-sample impute-only benchmark Selphi 1.5.3 completed chromosome 22 in 1,486 s but required 123.1 GB (the full system memory); the larger chromosome 1 exceeded available RAM and did not finish, as did the MESA 5K $\times$ TOPMed run (within a reasonable wall-time budget). The Beagle column is Beagle 5.5 (build 03 Oct 2025) throughout.
+**Table 5. Wall time and peak memory.** All numbers measured on a single workstation (16-thread CPU) with /usr/bin/time -v; Selphi 1.5.3 memory measured via docker stats. The MESA 5K $\times$ TOPMed row reflects Selphi 2 at its panel-adaptive default $m_c$ (132,676) and Beagle 5.5 at its default settings, both consuming an unphased chip target and producing imputed dosages. On the 1000 Genomes 801-sample impute-only benchmark Selphi 1.5.3 (run with its published chunked-reference setting) completed both chromosomes but 22$\times$ (chr22) to 41$\times$ (chr1) slower than Selphi 2 at comparable peak memory; it did not complete the MESA 5K $\times$ TOPMed full-pipeline run within a reasonable wall-time budget. The Beagle column is Beagle 5.5 (build 03 Oct 2025) throughout.
 
 | Benchmark | Selphi 2 | Selphi 1.5.3 | Beagle |
 |---|---|---|---|
-| chr22 1KG 801s (impute-only, phased input) | 69 s / 13.2 GB | 1,486 s / 123.1 GB | 58 s / 21.7 GB |
-| chr1 1KG 801s (impute-only, phased input) | 373 s / 21.9 GB | did not finish | 207 s / 20.2 GB |
+| chr22 1KG 801s (impute-only, phased input) | 69 s / 13.2 GB | 1,532 s / 15.6 GB | 58 s / 21.7 GB |
+| chr1 1KG 801s (impute-only, phased input) | 373 s / 21.9 GB | 15,338 s / 32.6 GB | 207 s / 20.2 GB |
 | chr21 GIAB 6 samples (impute-only) | 7.2 s / 6.2 GB | 112.8 s / 7.1 GB | 12.5 s / 14.5 GB |
 | chr1 GIAB 6 samples (impute-only) | 38.8 s / 16.3 GB | 1923 s / 22.1 GB | 43.2 s / 39.2 GB |
 | MESA 5K $\times$ TOPMed chr20 (full pipeline) | 11289 s / 65.5 GB | did not finish | 4148 s / 96.5 GB |
