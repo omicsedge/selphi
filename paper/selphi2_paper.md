@@ -349,7 +349,7 @@ To confirm that the pedigree improves phasing in a way that is real rather than 
 
 Table 5 summarizes wall time and peak resident memory for Selphi 2, Selphi 1.5.3, and Beagle on the three reference panels evaluated above, on the same machine (16 threads) and on identical inputs.
 
-**Table 5. Wall time and peak memory.** All numbers measured on a single workstation (16-thread CPU) with /usr/bin/time -v; Selphi 1.5.3 memory measured via docker stats. The MESA 5K $\times$ TOPMed row reflects Selphi 2 at its panel-adaptive default $m_c$ (132,676) and Beagle 5.5 at its default settings, both consuming an unphased chip target and producing imputed dosages. On the 1000 Genomes 801-sample impute-only benchmark Selphi 1.5.3 (run with its published chunked-reference setting) completed both chromosomes but 22$\times$ (chr22) to 41$\times$ (chr1) slower than Selphi 2 at comparable peak memory; it did not complete the MESA 5K $\times$ TOPMed full-pipeline run within a reasonable wall-time budget. The Beagle column is Beagle 5.5 (build 03 Oct 2025) throughout.
+**Table 5. Wall time and peak memory.** All numbers measured on a single workstation (16-thread CPU) with /usr/bin/time -v; Selphi 1.5.3 memory measured via docker stats. The MESA 5K $\times$ TOPMed row reflects Selphi 2 at its panel-adaptive default $m_c$ (132,676) and Beagle 5.5 at its default settings, both consuming an unphased chip target and producing imputed dosages. On the 1000 Genomes 801-sample impute-only benchmark Selphi 1.5.3 (run with its published chunked-reference setting) completed both chromosomes but 22$\times$ (chr22) to 41$\times$ (chr1) slower than Selphi 2 at comparable peak memory. Selphi 1.5.3 requires a pre-phased target and does not perform phasing, so on the MESA 5K $\times$ TOPMed chr20 benchmark it runs impute-only (given a phased target), completing in ~4 h 18 min at ~98 GB; the Selphi 2 and Beagle figures in that row are the full phase-plus-impute pipeline. The Beagle column is Beagle 5.5 (build 03 Oct 2025) throughout.
 
 | Benchmark | Selphi 2 | Selphi 1.5.3 | Beagle |
 |---|---|---|---|
@@ -357,7 +357,7 @@ Table 5 summarizes wall time and peak resident memory for Selphi 2, Selphi 1.5.3
 | chr1 1KG 801s (impute-only, phased input) | 373 s / 21.9 GB | 15,338 s / 32.6 GB | 207 s / 20.2 GB |
 | chr21 GIAB 6 samples (impute-only) | 7.2 s / 6.2 GB | 112.8 s / 7.1 GB | 12.5 s / 14.5 GB |
 | chr1 GIAB 6 samples (impute-only) | 38.8 s / 16.3 GB | 1923 s / 22.1 GB | 43.2 s / 39.2 GB |
-| MESA 5K $\times$ TOPMed chr20 (full pipeline) | 11289 s / 65.5 GB | did not finish | 4148 s / 96.5 GB |
+| MESA 5K $\times$ TOPMed chr20 (full pipeline) | 11289 s / 65.5 GB | ~15,480 s / ~98 GB (impute-only) | 4148 s / 96.5 GB |
 
 ![Figure 3](figures/figure3_efficiency.png)
 
