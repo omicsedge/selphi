@@ -142,7 +142,7 @@ three phasings differ by ≤0.002; switching the imputer (Beagle to Selphi) move
 by +0.007 to +0.010 regardless of phaser - i.e. the phaser is practically
 interchangeable for array imputation and the accuracy gain lives in the imputer.
 
-| Phasing ↓ / Imputer to | chr22 Beagle | chr22 Selphi | chr1 Beagle | chr1 Selphi |
+| Phasing / Imputer | chr22 Beagle | chr22 Selphi | chr1 Beagle | chr1 Selphi |
 |---|---:|---:|---:|---:|
 | Selphi 2  | 0.4723 | 0.4821 | 0.5655 | 0.5730 |
 | Beagle 5.5 | 0.4727 | 0.4815 | 0.5639 | 0.5710 |
