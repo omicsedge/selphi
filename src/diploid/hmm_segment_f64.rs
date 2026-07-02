@@ -420,7 +420,7 @@ impl SegmentHmmF64 {
         let locus_last = graph.segment_start(seg_last) + graph.lengths[seg_last] as usize - 1;
         let _abs_locus = locus_last;
         let mut abs_ambiguous = 0usize;
-        for s in seg_first..=seg_last {
+        for s in 0..=seg_last {
             let start = graph.segment_start(s);
             for vrel in 0..graph.lengths[s] as usize {
                 let vi = start + vrel;
