@@ -87,8 +87,8 @@ This is the candidate-set-size (`mc`) sweep behind the biobank claim.
 > wasteful (mc=170K = +0.0002 for +22 min).
 >
 > **Camera-ready headline (matches main-text Results).** The MESA 5K × TOPMed
-> figure in the paper is Selphi 2 **0.6157** vs Beagle 5.5 **0.5921** (Δ +0.0236;
-> per-sample 0.9023 vs 0.8845), from the 2026-06-12 campaign over the full
+> figure in the paper is Selphi 2 (default diploid engine) **0.6148** vs Beagle 5.5 **0.5921** (Δ +0.0227;
+> per-sample 0.8978 vs 0.8764), over the full
 > 17.9 M variants with `--sample-batch-size`. The mc-sweep rows above use an
 > earlier Beagle 5.5 baseline (0.5975) and are retained to show the `mc`
 > trajectory; pin the campaign numbers as authoritative for the headline.
