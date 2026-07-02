@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-"""Publication figures for the Selphi 2 paper. All values are the measured
-numbers in the paper tables (1, 2b, 2c, 6b, 5/3b)."""
+"""Publication figures for the Selphi 2 paper. Panel sources:
+2a = genome-wide (20-autosome) n-weighted per-MAF R^2, four-way (Supplementary Table S9;
+     OVERALL aggregates in Results text). 2b = MESA per-ancestry per-sample-mean R^2
+     (mc=132,676 run; deltas match Table 2b prose). 2c = Table 2c. 2d = Table 6b.
+     3a/3b = Table 3b. 3c = Figure 3c / Table 6b speed."""
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -16,8 +19,7 @@ plt.rcParams.update({
 })
 # Okabe-Ito colorblind-safe palette
 C = {"selphi": "#0072B2", "beagle": "#E69F00", "impute5": "#009E73",
-     "minimac4": "#CC79A7", "glimpse2": "#E69F00", "quilt2": "#009E73",
-     "afram": "#D55E00", "hisp": "#CC79A7", "white": "#0072B2", "eas": "#009E73"}
+     "minimac4": "#CC79A7", "glimpse2": "#E69F00", "quilt2": "#009E73"}
 
 maf_lbl = ["0.05-0.1", "0.1-0.2", "0.2-0.5", "0.5-1", "1-2", "2-5", "5-10", "10-20", "20-50"]
 x = np.arange(len(maf_lbl))
@@ -28,11 +30,6 @@ t1 = {"selphi":[.3578,.4275,.5274,.6273,.6926,.7630,.8531,.8965,.9255],
       "beagle":[.3619,.4196,.5117,.6090,.6742,.7458,.8410,.8881,.9192],
       "impute5":[.3458,.4061,.5005,.5991,.6654,.7381,.8355,.8840,.9160],
       "minimac4":[.3530,.4131,.5048,.6013,.6663,.7367,.8323,.8803,.9112]}
-# 2b: MESA candidate-cap RECOVERY (adaptive - fixed) by ancestry x MAF (Table 2b)
-t2b = {"afram":[.1391,.1211,.0885,.0642,.0528,.0436,.0343,.0266,.0173],
-       "hisp":[.1715,.1554,.1268,.0968,.0692,.0436,.0255,.0199,.0125],
-       "white":[.1195,.0858,.0587,.0381,.0242,.0141,.0128,.0114,.0063],
-       "eas":[.0170,.0123,.0055,.0008,-.0034,-.0055,-.0060,-.0059,-.0038]}
 # 2c: HGDP out-of-panel per-region per-sample R2 (Table 2c genome-wide)
 regions = ["Oceanian*","Mid-East*","African","E.Asian","C/S.Asian","European","Adm.Amer."]
 hgdp_s = [.8984,.9386,.8778,.9506,.9465,.9572,.9626]
@@ -53,6 +50,8 @@ a.set_title("(a) 1000 Genomes genome-wide, four-way", loc="left", fontweight="bo
 a.legend(frameon=False, loc="lower right"); a.grid(alpha=.25, lw=.5)
 
 # (b) MESA per-sample R2 by ancestry: Selphi 2 vs Beagle 5.5 (competitive, per-sample)
+# per-sample-mean R2 by MESA ancestry group at the panel-adaptive mc=132,676 run;
+# per-group deltas (+0.019..+0.032) match the Table 2b / Results prose.
 b = ax[0,1]
 pop_lbl = ["African-\nAmerican","Hispanic","European\n(White)","East-Asian"]
 sel_r2  = [0.8936, 0.8975, 0.9026, 0.8925]
