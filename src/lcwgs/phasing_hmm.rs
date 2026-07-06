@@ -213,7 +213,10 @@ pub struct PhasingHmm {
 /// `init` kernels have no transition prologue and provide the whole loop body.
 /// Each arm expands to the same intrinsic sequence as the original
 /// hand-written kernel.
-#[cfg(target_arch = "x86_64")]
+// NOTE: definition made arch-independent so the ARM build resolves the macro;
+// every item the macro expands to is itself #[cfg(target_arch = "x86_64")],
+// so on non-x86 the invocations expand to nothing (scalar path is used).
+#[allow(unused_macros)]
 macro_rules! phasing_kernel_avx2 {
     (
         $(#[$attr:meta])*
@@ -274,7 +277,7 @@ macro_rules! phasing_kernel_avx2 {
 /// pair-loop + [`PhasingHmm::store_sum512`] + odd-`k` `tail` dispatch; the
 /// `setup`/`stay`/`sel`/`tail` parts are the only per-kernel differences. Each
 /// arm expands to the same intrinsic sequence as the original.
-#[cfg(target_arch = "x86_64")]
+#[allow(unused_macros)]
 macro_rules! phasing_kernel_avx512 {
     (
         $(#[$attr:meta])*
