@@ -1734,6 +1734,7 @@ dependencies = [
  "blake2",
  "clap",
  "lazy_static",
+ "libc",
  "lz4_flex",
  "memmap2",
  "mimalloc",
