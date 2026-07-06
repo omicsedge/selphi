@@ -246,12 +246,15 @@ Supported for all output formats, which can be combined (e.g. `--bcf --parquet -
 Create an SRP reference panel from VCF, BCF, or BREF3 (source format auto-detected). The `.srp` is written next to the source by default (`panel.bcf` → `panel.srp`).
 
 ```bash
-# From BCF (fastest: parallel native BCF reader, 16 threads)
+# From BCF (native parallel reader, 16 threads)
 selphi --prepare-reference-from panel.bcf --threads 16
 
-# From VCF.gz / BREF3
-selphi --prepare-reference-from panel.vcf.gz
+# From BREF3
 selphi --prepare-reference-from panel.bref3
+
+# From VCF.gz: convert to BCF first (the SRP builder reads BCF/BREF3, not VCF text)
+bcftools view -Ob -o panel.bcf panel.vcf.gz && bcftools index panel.bcf
+selphi --prepare-reference-from panel.bcf
 
 # Explicit output path + custom chunk size
 selphi --prepare-reference-from panel.bcf --out custom_name.srp --chunk-size 10000
@@ -260,8 +263,8 @@ selphi --prepare-reference-from panel.bcf --out custom_name.srp --chunk-size 100
 | Source | Index required | Notes |
 |---|---|---|
 | `.bcf` | `.bcf.csi` | Parallel regional reads via CSI index; multi-contig supported. |
-| `.vcf.gz` | none | Pure Rust text parsing. |
 | `.bref3` | none | Native BREF3 reader (ported from Java). |
+| `.vcf.gz` | — | Not read directly; convert to `.bcf` first (`bcftools view -Ob`). |
 
 All three sources produce identical SRP files and imputation results. For whole-genome panels, build a single multi-chromosome SRP from a directory of per-chr files, or merge existing per-chr SRPs:
 
