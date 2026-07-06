@@ -559,6 +559,18 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
 /// (the format the imputation reader consumes) with no BCF/VCF round-trip;
 /// BREF3 reuses the byte-identical SRP→BREF3 converter. Both derive from the
 /// in-memory `phased` array, so this is cheap relative to phasing itself.
+/// Append `.ext` to a base that may legitimately contain dots (e.g. a
+/// chromosome tag like `panel.chr22`). `Path::with_extension` would REPLACE the
+/// last dotted component (`panel.chr22` → `panel.srp`), silently dropping the
+/// chromosome tag and colliding across chromosomes; appending keeps it
+/// (`panel.chr22` → `panel.chr22.srp`), matching the emitted `.vcf.gz`.
+fn append_ext(base: &Path, ext: &str) -> PathBuf {
+    let mut s = base.as_os_str().to_os_string();
+    s.push(".");
+    s.push(ext);
+    PathBuf::from(s)
+}
+
 fn write_reference_panels(
     args: &Args, phased: &[u8], markers: &[TargetMarker],
     sample_names: &[String], n_haps: usize, out_path: &Path,
@@ -579,7 +591,7 @@ fn write_reference_panels(
     // SRP is needed for either output; write it to its final location when
     // --srp was requested, otherwise to a tempdir on the same filesystem
     // (kept off /tmp) that is removed once BREF3 is built.
-    let srp_out = base.with_extension("srp");
+    let srp_out = append_ext(&base, "srp");
     let mut _tmp_keep: Option<tempfile::TempDir> = None;
     let srp_path: PathBuf = if args.srp {
         srp_out.clone()
@@ -600,7 +612,7 @@ fn write_reference_panels(
     }
 
     if args.bref3 {
-        let bref3_out = base.with_extension("bref3");
+        let bref3_out = append_ext(&base, "bref3");
         write_bref3_from_srp(&srp_path, &bref3_out)
             .unwrap_or_else(|e| { selphi_error!("Failed to write phased panel BREF3: {}", e); std::process::exit(1); });
         selphi_step!("Phased panel BREF3: {}", bref3_out.display());
@@ -797,12 +809,12 @@ fn run_streaming(args: &Args, input_path: &str, output_path: &str, map_path: &st
         let mut base = out_path.clone();
         if base.extension().is_some_and(|e| e == "gz") { base.set_extension(""); }
         if base.extension().is_some_and(|e| e == "vcf") { base.set_extension(""); }
-        let srp_path = base.with_extension("srp");
+        let srp_path = append_ext(&base, "srp");
         selphi_step!("Building SRP from streamed VCF...");
         selphi::srp::writer::build_srp_unified(&out_vcf, &srp_path, n_threads, args.chunk_size)
             .unwrap_or_else(|e| { selphi_error!("SRP build failed: {}", e); std::process::exit(1); });
         if args.bref3 {
-            let bref3_path = base.with_extension("bref3");
+            let bref3_path = append_ext(&base, "bref3");
             write_bref3_from_srp(&srp_path, &bref3_path)
                 .unwrap_or_else(|e| { selphi_error!("BREF3 build failed: {}", e); std::process::exit(1); });
         }
