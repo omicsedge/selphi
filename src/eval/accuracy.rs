@@ -354,10 +354,22 @@ pub fn parse_vcf_line(line: &[u8], n_samples: usize, ds_buf: &mut Vec<f32>) -> O
     Some((chrom, pos, ref_a, alt_a))
 }
 
+/// Content-sniff whether `path` is a binary BCF (BGZF magic "BCF"), so a BCF
+/// misnamed `.vcf.gz` is routed by content rather than extension alone
+/// (mirrors the sniff in io::target_io / lcwgs::pl_reader). False on any read
+/// error → treated as text/VCF.
+fn sniff_bcf(path: &Path) -> bool {
+    std::fs::File::open(path).ok().and_then(|f| {
+        let mut bgzf = noodles_bgzf::io::Reader::new(BufReader::new(f));
+        let mut magic = [0u8; 5];
+        bgzf.read_exact(&mut magic).ok().map(|_| &magic[..3] == b"BCF")
+    }).unwrap_or(false)
+}
+
 /// Parse VCF/BCF header to get sample names.
 pub fn parse_header_samples(path: &Path) -> io::Result<Vec<String>> {
     let p = path.to_string_lossy();
-    let is_bcf = p.ends_with(".bcf") || p.ends_with(".bcf.gz");
+    let is_bcf = sniff_bcf(path) || p.ends_with(".bcf") || p.ends_with(".bcf.gz");
 
     if is_bcf {
         let hdr = crate::srp::bcf_reader::read_header_only(path)?;
@@ -432,7 +444,7 @@ enum VariantReader {
 impl VariantReader {
     fn open(path: &Path) -> io::Result<(Self, Vec<String>)> {
         let s = path.to_string_lossy();
-        let is_bcf = s.ends_with(".bcf") || s.ends_with(".bcf.gz");
+        let is_bcf = sniff_bcf(path) || s.ends_with(".bcf") || s.ends_with(".bcf.gz");
 
         if is_bcf {
             let hdr = crate::srp::bcf_reader::read_header_only(path)?;
@@ -763,7 +775,7 @@ fn rtstr(buf: &[u8], o: &mut usize) -> String {
 /// Returns None if no index is present next to the file.
 fn load_checkpoint_positions(path: &Path) -> Option<Vec<i64>> {
     let s = path.to_string_lossy();
-    if s.ends_with(".bcf") || s.ends_with(".bcf.gz") {
+    if sniff_bcf(path) || s.ends_with(".bcf") || s.ends_with(".bcf.gz") {
         let csi_path = {
             let mut p = path.as_os_str().to_owned();
             p.push(".csi");
@@ -849,7 +861,7 @@ fn build_eval_regions(imputed_path: &Path, n_regions: usize) -> Vec<(i64, i64)> 
 /// exists next to the file.
 fn ensure_seek_index(path: &Path) -> io::Result<()> {
     let s = path.to_string_lossy();
-    let is_bcf = s.ends_with(".bcf") || s.ends_with(".bcf.gz");
+    let is_bcf = sniff_bcf(path) || s.ends_with(".bcf") || s.ends_with(".bcf.gz");
     if is_bcf {
         let csi = { let mut p = path.as_os_str().to_owned(); p.push(".csi"); std::path::PathBuf::from(p) };
         if !csi.exists() {
@@ -1122,7 +1134,7 @@ fn load_dosage_map(path: &Path, shared: &[String])
 /// 0/0 from ./.). VCF.gz: text scan. BCF: parse GT via the BCF reader.
 pub fn truth_has_ref_calls(path: &Path) -> io::Result<bool> {
     let s = path.to_string_lossy();
-    let is_bcf = s.ends_with(".bcf") || s.ends_with(".bcf.gz");
+    let is_bcf = sniff_bcf(path) || s.ends_with(".bcf") || s.ends_with(".bcf.gz");
     let mut seen = 0usize;
     if !is_bcf {
         let f = std::fs::File::open(path)?;

@@ -702,7 +702,7 @@ pub fn build_multi_chr_srp_from_dir(
     for (i, (chr, bcf_path)) in bcf_files.iter().enumerate() {
         selphi_step!("[{}/{}] Building SRP for chr{}...", i + 1, bcf_files.len(), chr);
         let tmp_srp = tmp_dir.path().join(format!("chr{}.srp", chr));
-        super::writer::build_srp_unified(bcf_path, &tmp_srp, threads, chunk_size_override)
+        super::writer::build_srp_any(bcf_path, &tmp_srp, threads, chunk_size_override)
             .map_err(|e| io::Error::other(format!("chr{}: {}", chr, e)))?;
         srp_paths.push(tmp_srp);
     }

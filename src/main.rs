@@ -608,9 +608,19 @@ fn main() {
             if is_srp_input {
                 selphi::srp::bref3_writer::write_bref3_from_srp(Path::new(source), Path::new(output))
                     .unwrap_or_else(|e| { selphi_error!("BREF3 write failed: {}", e); std::process::exit(1); });
-            } else {
+            } else if source.ends_with(".bcf") {
                 selphi::srp::bref3_writer::write_bref3_from_bcf(Path::new(source), Path::new(output))
                     .unwrap_or_else(|e| { selphi_error!("BREF3 write failed: {}", e); std::process::exit(1); });
+            } else {
+                // VCF/VCF.gz: no direct VCF→BREF3 reader; build a VCF-capable
+                // interim SRP then convert (byte-identical to a BCF-built BREF3).
+                let tmp_srp = std::env::temp_dir()
+                    .join(format!("selphi_bref3_interim_{}.srp", std::process::id()));
+                selphi::srp::writer::build_srp_any(Path::new(source), &tmp_srp, args.threads, args.chunk_size)
+                    .unwrap_or_else(|e| { selphi_error!("BREF3 write failed (SRP stage): {}", e); std::process::exit(1); });
+                selphi::srp::bref3_writer::write_bref3_from_srp(&tmp_srp, Path::new(output))
+                    .unwrap_or_else(|e| { selphi_error!("BREF3 write failed: {}", e); std::process::exit(1); });
+                let _ = std::fs::remove_file(&tmp_srp);
             }
         } else if is_bref3 {
             let srp_path = if Path::new(output).extension().is_none_or(|e| e != "srp") {
