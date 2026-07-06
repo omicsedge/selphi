@@ -200,6 +200,7 @@ pub struct PhasingHmm {
     /// Refreshed by [`Self::pack_condbits`] at the head of each emission kernel
     /// (the allele depends on `curr_abs_locus`, which advances each call). Only
     /// used by the SIMD emission/hom kernels. `[n_states, 64·w64)` left 0.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))] // read only by x86 SIMD kernels
     condbits: Vec<u64>,
 }
 
