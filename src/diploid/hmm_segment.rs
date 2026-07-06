@@ -138,7 +138,7 @@ fn use_avx512() -> bool {
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn neon_hsum8(lo: float32x4_t, hi: float32x4_t) -> f32 {
-    vaddvq_f32(vaddq_f32(lo, hi))
+    unsafe { vaddvq_f32(vaddq_f32(lo, hi)) }
 }
 
 /// Segment HMM state for one sample in one window.

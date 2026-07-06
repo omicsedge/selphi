@@ -440,7 +440,7 @@ pub unsafe fn dot4_scalar(f1: &[f32], f2: &[f32], b1: &[f32], b2: &[f32], ns: us
 
 #[cfg(not(target_arch = "aarch64"))]
 pub unsafe fn em_bwd_update_scalar(bwd: &mut [f32], discord: &[u8], em_probs: [f32; 2], ns: usize) -> f32 {
-    bwd_update_scalar(bwd, discord, em_probs, ns)
+    unsafe { bwd_update_scalar(bwd, discord, em_probs, ns) }
 }
 
 #[cfg(not(target_arch = "aarch64"))]

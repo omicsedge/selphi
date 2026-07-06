@@ -131,6 +131,7 @@ pub struct ImputationHmm {
     /// only when a SIMD path is active. Mirrors lcwgs's `condbits` pack; the only
     /// purpose is to load 16 (AVX-512) / 8 (AVX2) allele bits as a lane mask for
     /// the emission select without re-deriving the MSB-first `hvar` byte layout.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))] // read only by x86 SIMD kernels
     condbits: Vec<u64>,
 }
 
