@@ -613,20 +613,47 @@ fn main() {
             selphi::srp::writer::build_srp_from_bref3(
                 Path::new(source), &srp_path, args.threads, args.chunk_size)
                 .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
-        } else {
-            // The SRP builder reads panels through the native parallel BCF reader
-            // (CSI-seeked binary records); it does not parse VCF text. Fail early
-            // with actionable guidance instead of the opaque "not BCF" I/O error
-            // raised deep in the reader when a .vcf/.vcf.gz source is passed.
-            if !source.ends_with(".bcf") {
-                selphi_error!(
-                    "--prepare-reference-from requires a BCF panel; VCF/VCF.gz parsing is not \
-                     implemented in the SRP builder. Convert once, then build the panel:\n    \
-                     bcftools view -Ob -o panel.bcf {source} && bcftools index panel.bcf\n    \
-                     selphi --prepare-reference-from panel.bcf --out {output}");
+        } else if !source.ends_with(".bcf") {
+            // VCF/VCF.gz panel: the native reader below decodes only binary BCF
+            // (CSI-seeked records). Stream the phased cohort straight into an
+            // in-memory panel and scatter it to an SRP — the same in-memory path
+            // `--phase-panel --srp` uses — so a VCF is a first-class reference
+            // source. Peak memory is bounded to the panel (no whole-file text
+            // buffer, no intermediate genotype matrix).
+            let srp_path = if Path::new(output).extension().is_none_or(|e| e != "srp") {
+                PathBuf::from(output).with_extension("srp")
+            } else { PathBuf::from(output) };
+
+            selphi_step!("Reading VCF panel (streaming)...");
+            let (sample_names, markers, phased, n_haps, is_phased) =
+                selphi::io::target_io::read_cohort_phased_vcf_stream(source);
+            if markers.is_empty() {
+                selphi_error!("no biallelic variants read from {}", source);
+                std::process::exit(1);
+            }
+            if !is_phased {
+                selphi_error!("--prepare-reference-from: the VCF panel is unphased; a reference \
+                    panel must contain phased haplotypes (phase it first, e.g. --phase-panel)");
+                std::process::exit(1);
+            }
+            if markers.iter().any(|m| m.chrom != markers[0].chrom) {
+                selphi_error!("--prepare-reference-from: multi-chromosome VCF is not supported \
+                    directly; build one SRP per chromosome, or pass a directory of per-chr BCFs");
                 std::process::exit(1);
             }
 
+            let pvs: Vec<selphi::srp::writer::PanelVariant> = markers.iter()
+                .map(|m| selphi::srp::writer::PanelVariant {
+                    chrom: &m.chrom, pos: m.pos, ref_allele: &m.ref_allele,
+                    alt_allele: &m.alt_allele, id: &m.id })
+                .collect();
+            selphi_step!("Writing SRP ({} variants × {} haplotypes)...", markers.len(), n_haps);
+            selphi::srp::writer::build_srp_from_panel(&phased, &pvs, &sample_names, n_haps, &srp_path)
+                .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
+            selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB",
+                start_time.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
+            return;
+        } else {
             // Auto-detect multi-contig: count contigs that actually carry records (from the
             // index), NOT the header `##contig` dictionary — a bcftools-merged BCF/VCF keeps the
             // full genome dictionary in its header even with single-chromosome data, which would
