@@ -266,8 +266,16 @@ fn setup_output_writers(
         pgen: args.pgen || args.all_formats,
         selfdecode: args.selfdecode || args.all_formats,
     };
-    let out_file = if formats.bcf { out_path.with_extension("bcf") }
-        else { out_path.with_extension("vcf.gz") };
+    // Append the format extension only when absent, so `--out x.vcf.gz` is not
+    // rewritten to `x.vcf.vcf.gz` (with_extension replaces only the final `.gz`).
+    let out_file = if formats.bcf {
+        if out_path.extension().is_none_or(|e| e != "bcf") { out_path.with_extension("bcf") }
+        else { out_path.to_path_buf() }
+    } else if out_path.extension().is_none_or(|e| e != "gz") {
+        out_path.with_extension("vcf.gz")
+    } else {
+        out_path.to_path_buf()
+    };
 
     // sample_batch_size is in SAMPLES; HMM internals work in haps (× 2).
     let target_batch_size_haps = args.sample_batch_size.saturating_mul(2);
