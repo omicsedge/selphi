@@ -12,7 +12,7 @@ use selphi::{selphi_info, selphi_step, selphi_error};
 use selphi::genmap;
 use selphi::io::target_io::{read_cohort_vcf, write_panel_vcf, TargetMarker};
 use selphi::srp::SrpReader;
-use selphi::srp::writer::{build_srp_from_panel, PanelVariant};
+use selphi::srp::writer::{build_srp_from_panel, PanelVariant, SrpPanelWriter};
 use selphi::srp::bref3_writer::write_bref3_from_srp;
 use selphi::srp::bref3::open_bref3_stream;
 
@@ -763,6 +763,22 @@ fn run_streaming(args: &Args, input_path: &str, output_path: &str, map_path: &st
     let mut writer = PanelVcfWriter::create(&out_vcf, &sample_names, &chrom, n_haps)
         .unwrap_or_else(|e| { selphi_error!("Cannot create {}: {}", out_vcf.display(), e); std::process::exit(1); });
 
+    // Native SRP built incrementally alongside the VCF — the same finalized rows
+    // are scattered into tile stripes as they are emitted, so no re-read and
+    // memory bounded to one stripe batch (the whole point of the streaming path).
+    let mut srp_writer = if args.srp || args.bref3 {
+        let mut base = out_path.clone();
+        if base.extension().is_some_and(|e| e == "gz") { base.set_extension(""); }
+        if base.extension().is_some_and(|e| e == "vcf") { base.set_extension(""); }
+        let srp_path = append_ext(&base, "srp");
+        let pvs: Vec<PanelVariant> = markers.iter().map(|m| PanelVariant {
+            chrom: &m.chrom, pos: m.pos, ref_allele: &m.ref_allele,
+            alt_allele: &m.alt_allele, id: &m.id,
+        }).collect();
+        Some(SrpPanelWriter::new(&pvs, &sample_names, n_haps, &srp_path)
+            .unwrap_or_else(|e| { selphi_error!("SRP init failed: {}", e); std::process::exit(1); }))
+    } else { None };
+
     let mut prev_phased: Vec<u8> = Vec::new();
     let mut prev_cs = 0usize;
     let mut prev_end = 0usize;
@@ -794,8 +810,13 @@ fn run_streaming(args: &Args, input_path: &str, output_path: &str, map_path: &st
         };
         for v in emit_start..ce {
             let rel = (v - cs) * n_haps;
-            writer.write_variant(&markers[v], &finalized[rel..rel + n_haps])
+            let row = &finalized[rel..rel + n_haps];
+            writer.write_variant(&markers[v], row)
                 .unwrap_or_else(|e| { selphi_error!("VCF write failed: {}", e); std::process::exit(1); });
+            if let Some(sw) = srp_writer.as_mut() {
+                sw.push_row(row)
+                    .unwrap_or_else(|e| { selphi_error!("SRP row scatter failed: {}", e); std::process::exit(1); });
+            }
         }
         selphi_step!("  chunk {}/{} [{}..{}) phased+emitted in {:.0}s [{:.0} MB]",
             ci + 1, chunks.len(), cs, ce, t0.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
@@ -804,17 +825,12 @@ fn run_streaming(args: &Args, input_path: &str, output_path: &str, map_path: &st
     writer.finish().unwrap_or_else(|e| { selphi_error!("VCF finish failed: {}", e); std::process::exit(1); });
     selphi_step!("Phased panel VCF: {} [{:.0}s | {:.0} MB peak]", out_vcf.display(), start.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
 
-    // 5. Optional native panels — build from the streamed VCF (also streaming).
-    if args.srp || args.bref3 {
-        let mut base = out_path.clone();
-        if base.extension().is_some_and(|e| e == "gz") { base.set_extension(""); }
-        if base.extension().is_some_and(|e| e == "vcf") { base.set_extension(""); }
-        let srp_path = append_ext(&base, "srp");
-        selphi_step!("Building SRP from streamed VCF...");
-        selphi::srp::writer::build_srp_unified(&out_vcf, &srp_path, n_threads, args.chunk_size)
-            .unwrap_or_else(|e| { selphi_error!("SRP build failed: {}", e); std::process::exit(1); });
+    // 5. Finalize the incrementally-built native panels (no VCF re-read).
+    if let Some(sw) = srp_writer {
+        let srp_path = sw.finish()
+            .unwrap_or_else(|e| { selphi_error!("SRP finish failed: {}", e); std::process::exit(1); });
         if args.bref3 {
-            let bref3_path = append_ext(&base, "bref3");
+            let bref3_path = srp_path.with_extension("bref3");
             write_bref3_from_srp(&srp_path, &bref3_path)
                 .unwrap_or_else(|e| { selphi_error!("BREF3 build failed: {}", e); std::process::exit(1); });
         }
