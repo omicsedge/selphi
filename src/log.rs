@@ -130,8 +130,17 @@ pub fn elapsed_secs() -> f64 {
     LOGGER.lock().unwrap().start.elapsed().as_secs_f64()
 }
 
+/// getrusage(RUSAGE_SELF) — portable (Linux + macOS) CPU-time and peak-RSS
+/// source, used as the non-Linux fallback for the /proc-based readers below.
+fn getrusage_self() -> Option<libc::rusage> {
+    unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut ru) == 0 { Some(ru) } else { None }
+    }
+}
+
 /// Total CPU time (user+system, all threads) in seconds.
-/// Reads from /proc/self/stat (fields 14+15 = utime+stime in clock ticks).
+/// Linux: /proc/self/stat (utime+stime in clock ticks); otherwise getrusage.
 pub fn cpu_time_secs() -> f64 {
     if let Ok(stat) = std::fs::read_to_string("/proc/self/stat") {
         // Fields are space-separated. Field 14 = utime, 15 = stime (1-indexed).
@@ -147,6 +156,12 @@ pub fn cpu_time_secs() -> f64 {
                 return (utime + stime) as f64 / ticks_per_sec;
             }
         }
+    }
+    // Non-Linux (macOS): user+system time via getrusage.
+    if let Some(ru) = getrusage_self() {
+        let u = ru.ru_utime.tv_sec as f64 + ru.ru_utime.tv_usec as f64 / 1e6;
+        let s = ru.ru_stime.tv_sec as f64 + ru.ru_stime.tv_usec as f64 / 1e6;
+        return u + s;
     }
     0.0
 }
@@ -165,19 +180,11 @@ pub fn peak_mem_mb() -> f64 {
             }
         }
     }
-    // macOS fallback: parse `ps` output for RSS
+    // macOS: getrusage ru_maxrss is the true peak (VmHWM analogue), not the
+    // current RSS `ps` reports. On Darwin ru_maxrss is in BYTES (Linux: KB).
     #[cfg(target_os = "macos")]
-    {
-        if let Ok(out) = std::process::Command::new("ps")
-            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-            .output()
-        {
-            if let Ok(s) = String::from_utf8(out.stdout) {
-                if let Ok(kb) = s.trim().parse::<f64>() {
-                    return kb / 1024.0;
-                }
-            }
-        }
+    if let Some(ru) = getrusage_self() {
+        return ru.ru_maxrss as f64 / (1024.0 * 1024.0);
     }
     0.0
 }

@@ -29,11 +29,13 @@ use crate::selphi_info;
 use super::iterate::run_gibbs_ensemble;
 
 /// Current process RSS in GB (Linux /proc/self/statm field 2 = resident pages).
+/// Off Linux (macOS) /proc is absent; fall back to the getrusage-based peak
+/// reporter in `log` (peak rather than current, adequate for a memory trace).
 fn rss_gb() -> f64 {
     std::fs::read_to_string("/proc/self/statm").ok()
         .and_then(|s| s.split_whitespace().nth(1).and_then(|p| p.parse::<u64>().ok()))
         .map(|pages| pages as f64 * 4096.0 / 1.073_741_824e9)
-        .unwrap_or(0.0)
+        .unwrap_or_else(|| crate::log::peak_mem_mb() / 1024.0)
 }
 /// Gated RSS checkpoint (`LCWGS_MEMTRACE`) for locating the memory peak.
 fn memtrace(label: &str) {
