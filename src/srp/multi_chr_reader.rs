@@ -117,9 +117,16 @@ impl MultiChrSrpReader {
             let mut entry_buf = [0u8; 32];
             f.read_exact(&mut entry_buf)?;
 
-            let chr_name_len = u32::from_le_bytes(entry_buf[0..4].try_into().unwrap()) as usize;
-            let chr_name = std::str::from_utf8(&entry_buf[4..4 + chr_name_len.min(12)])
-                .unwrap_or("").trim_end_matches('\0').to_string();
+            // The 12-byte binary name field truncates contigs longer than 12 chars,
+            // which collides distinct chromosomes (→ dropped/unreachable data). The
+            // full names are stored losslessly in the JSON metadata; use those, in
+            // the same order as the directory, and fall back to the (truncated)
+            // binary field only if the JSON list is unexpectedly short.
+            let chr_name = global_meta.chromosomes.get(i).cloned().unwrap_or_else(|| {
+                let len = u32::from_le_bytes(entry_buf[0..4].try_into().unwrap()) as usize;
+                std::str::from_utf8(&entry_buf[4..4 + len.min(12)])
+                    .unwrap_or("").trim_end_matches('\0').to_string()
+            });
             let data_offset = u64::from_le_bytes(entry_buf[16..24].try_into().unwrap());
             let n_variants = u32::from_le_bytes(entry_buf[24..28].try_into().unwrap());
             let n_tiles = u32::from_le_bytes(entry_buf[28..32].try_into().unwrap());
