@@ -46,6 +46,7 @@ from datetime import datetime
 from zipfile import ZipFile, BadZipFile
 from tempfile import TemporaryDirectory
 import concurrent.futures
+import threading
 
 from zstd import compress, uncompress
 import numpy as np
@@ -83,6 +84,7 @@ class SparseReferencePanel:
         self.original_ids: List[str] = self._load_original_ids()
         self.sample_ids: List[str] = self._load_sample_ids()
         self._cache = LRUCache(maxsize=cache_size)
+        self._cache_lock = threading.RLock()
 
     def __len__(self):
         return self.n_variants
@@ -430,7 +432,7 @@ class SparseReferencePanel:
             return np.reshape(chunks_, (self.n_chunks, 3))
         return chunks_
 
-    @cachedmethod(lambda self: self._cache)
+    @cachedmethod(lambda self: self._cache, lock=lambda self: self._cache_lock)
     def _load_haplotypes(self, chunk: int) -> sparse.csc_matrix:
         """Load a sparse matrix from archived npz"""
         with ZipFile(self.filepath, mode="r") as archive:
