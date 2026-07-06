@@ -12,7 +12,7 @@ use std::arch::x86_64::*;
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
-pub unsafe fn bwd_update(b: &mut [f32], mr: &[u8], el: [f32; 2], ns: usize) -> f32 { unsafe {
+pub unsafe fn bwd_update_avx512(b: &mut [f32], mr: &[u8], el: [f32; 2], ns: usize) -> f32 { unsafe {
     let el0 = _mm512_set1_ps(el[0]);
     let el1 = _mm512_set1_ps(el[1]);
     let zero = _mm512_setzero_si512();
@@ -36,7 +36,7 @@ pub unsafe fn bwd_update(b: &mut [f32], mr: &[u8], el: [f32; 2], ns: usize) -> f
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
-pub unsafe fn fwd_update(f: &mut [f32], mr: &[u8], el: [f32; 2], scl: f32, shf: f32, ns: usize) -> f32 { unsafe {
+pub unsafe fn fwd_update_avx512(f: &mut [f32], mr: &[u8], el: [f32; 2], scl: f32, shf: f32, ns: usize) -> f32 { unsafe {
     let el0 = _mm512_set1_ps(el[0]);
     let el1 = _mm512_set1_ps(el[1]);
     let scl_v = _mm512_set1_ps(scl);
@@ -63,7 +63,7 @@ pub unsafe fn fwd_update(f: &mut [f32], mr: &[u8], el: [f32; 2], scl: f32, shf: 
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-pub unsafe fn scale_shift(b: &mut [f32], sc: f32, sh: f32, ns: usize) { unsafe {
+pub unsafe fn scale_shift_avx512(b: &mut [f32], sc: f32, sh: f32, ns: usize) { unsafe {
     let sc_v = _mm512_set1_ps(sc);
     let sh_v = _mm512_set1_ps(sh);
     let chunks = ns / 16;
@@ -77,7 +77,7 @@ pub unsafe fn scale_shift(b: &mut [f32], sc: f32, sh: f32, ns: usize) { unsafe {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-pub unsafe fn dot4(f1: &[f32], f2: &[f32], b1: &[f32], b2: &[f32], ns: usize) -> (f32, f32, f32, f32) { unsafe {
+pub unsafe fn dot4_avx512(f1: &[f32], f2: &[f32], b1: &[f32], b2: &[f32], ns: usize) -> (f32, f32, f32, f32) { unsafe {
     let mut p11_v = _mm512_setzero_ps();
     let mut p12_v = _mm512_setzero_ps();
     let mut p21_v = _mm512_setzero_ps();
@@ -106,13 +106,13 @@ pub unsafe fn dot4(f1: &[f32], f2: &[f32], b1: &[f32], b2: &[f32], ns: usize) ->
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
-pub unsafe fn em_bwd_update(bwd: &mut [f32], discord: &[u8], em_probs: [f32; 2], ns: usize) -> f32 { unsafe {
-    bwd_update(bwd, discord, em_probs, ns)
+pub unsafe fn em_bwd_update_avx512(bwd: &mut [f32], discord: &[u8], em_probs: [f32; 2], ns: usize) -> f32 { unsafe {
+    bwd_update_avx512(bwd, discord, em_probs, ns)
 }}
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
-pub unsafe fn em_fwd_update(
+pub unsafe fn em_fwd_update_avx512(
     fwd: &mut [f32], saved_bwd: &[f32], discord: &[u8],
     em_probs: [f32; 2], scale: f32, shift: f32, no_switch_scale: f32, ns: usize,
 ) -> (f32, f32, f32, f32) { unsafe {
@@ -173,6 +173,50 @@ pub unsafe fn em_fwd_update(
     }
     (jss, fs, ss, ms)
 }}
+
+// ============================================================================
+// x86_64 runtime dispatch — pick AVX-512 when the CPU has it, else the scalar
+// kernels. The build baseline (x86-64-v3) excludes AVX-512, so calling the
+// avx512 kernels unconditionally SIGILLs on a non-AVX-512 CPU; select at
+// runtime (same pattern as the diploid engine). SELPHI_FORCE_SCALAR=1 forces scalar.
+// ============================================================================
+#[cfg(target_arch = "x86_64")]
+fn use_avx512() -> bool {
+    use std::sync::OnceLock;
+    static USE: OnceLock<bool> = OnceLock::new();
+    *USE.get_or_init(|| {
+        if crate::config::is_one("SELPHI_FORCE_SCALAR") { return false; }
+        is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw")
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn bwd_update(b: &mut [f32], mr: &[u8], el: [f32; 2], ns: usize) -> f32 {
+    unsafe { if use_avx512() { bwd_update_avx512(b, mr, el, ns) } else { bwd_update_scalar(b, mr, el, ns) } }
+}
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn fwd_update(f: &mut [f32], mr: &[u8], el: [f32; 2], scl: f32, shf: f32, ns: usize) -> f32 {
+    unsafe { if use_avx512() { fwd_update_avx512(f, mr, el, scl, shf, ns) } else { fwd_update_scalar(f, mr, el, scl, shf, ns) } }
+}
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn scale_shift(b: &mut [f32], sc: f32, sh: f32, ns: usize) {
+    unsafe { if use_avx512() { scale_shift_avx512(b, sc, sh, ns) } else { scale_shift_scalar(b, sc, sh, ns) } }
+}
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn dot4(f1: &[f32], f2: &[f32], b1: &[f32], b2: &[f32], ns: usize) -> (f32, f32, f32, f32) {
+    unsafe { if use_avx512() { dot4_avx512(f1, f2, b1, b2, ns) } else { dot4_scalar(f1, f2, b1, b2, ns) } }
+}
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn em_bwd_update(bwd: &mut [f32], discord: &[u8], em_probs: [f32; 2], ns: usize) -> f32 {
+    unsafe { if use_avx512() { em_bwd_update_avx512(bwd, discord, em_probs, ns) } else { em_bwd_update_scalar(bwd, discord, em_probs, ns) } }
+}
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn em_fwd_update(fwd: &mut [f32], saved_bwd: &[f32], discord: &[u8], em_probs: [f32; 2], scale: f32, shift: f32, no_switch_scale: f32, ns: usize) -> (f32, f32, f32, f32) {
+    unsafe {
+        if use_avx512() { em_fwd_update_avx512(fwd, saved_bwd, discord, em_probs, scale, shift, no_switch_scale, ns) }
+        else { em_fwd_update_scalar(fwd, saved_bwd, discord, em_probs, scale, shift, no_switch_scale, ns) }
+    }
+}
 
 // ============================================================================
 // aarch64 NEON implementation (4 × f32)
@@ -365,27 +409,27 @@ pub unsafe fn em_fwd_update(
 // Scalar fallback (any other architecture)
 // ============================================================================
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub unsafe fn bwd_update(b: &mut [f32], mr: &[u8], el: [f32; 2], ns: usize) -> f32 {
+#[cfg(not(target_arch = "aarch64"))]
+pub unsafe fn bwd_update_scalar(b: &mut [f32], mr: &[u8], el: [f32; 2], ns: usize) -> f32 {
     let mut sum = 0.0f32;
     for j in 0..ns { b[j] *= el[mr[j] as usize]; sum += b[j]; }
     sum
 }
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub unsafe fn fwd_update(f: &mut [f32], mr: &[u8], el: [f32; 2], scl: f32, shf: f32, ns: usize) -> f32 {
+#[cfg(not(target_arch = "aarch64"))]
+pub unsafe fn fwd_update_scalar(f: &mut [f32], mr: &[u8], el: [f32; 2], scl: f32, shf: f32, ns: usize) -> f32 {
     let mut sum = 0.0f32;
     for j in 0..ns { let v = scl * f[j] + shf; f[j] = el[mr[j] as usize] * v; sum += f[j]; }
     sum
 }
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub unsafe fn scale_shift(b: &mut [f32], sc: f32, sh: f32, ns: usize) {
+#[cfg(not(target_arch = "aarch64"))]
+pub unsafe fn scale_shift_scalar(b: &mut [f32], sc: f32, sh: f32, ns: usize) {
     for j in 0..ns { b[j] = sc * b[j] + sh; }
 }
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub unsafe fn dot4(f1: &[f32], f2: &[f32], b1: &[f32], b2: &[f32], ns: usize) -> (f32, f32, f32, f32) {
+#[cfg(not(target_arch = "aarch64"))]
+pub unsafe fn dot4_scalar(f1: &[f32], f2: &[f32], b1: &[f32], b2: &[f32], ns: usize) -> (f32, f32, f32, f32) {
     let (mut p11, mut p12, mut p21, mut p22) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     for j in 0..ns {
         p11 += f1[j] * b1[j]; p12 += f1[j] * b2[j];
@@ -394,13 +438,13 @@ pub unsafe fn dot4(f1: &[f32], f2: &[f32], b1: &[f32], b2: &[f32], ns: usize) ->
     (p11, p12, p21, p22)
 }
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub unsafe fn em_bwd_update(bwd: &mut [f32], discord: &[u8], em_probs: [f32; 2], ns: usize) -> f32 {
-    bwd_update(bwd, discord, em_probs, ns)
+#[cfg(not(target_arch = "aarch64"))]
+pub unsafe fn em_bwd_update_scalar(bwd: &mut [f32], discord: &[u8], em_probs: [f32; 2], ns: usize) -> f32 {
+    bwd_update_scalar(bwd, discord, em_probs, ns)
 }
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub unsafe fn em_fwd_update(
+#[cfg(not(target_arch = "aarch64"))]
+pub unsafe fn em_fwd_update_scalar(
     fwd: &mut [f32], saved_bwd: &[f32], discord: &[u8],
     em_probs: [f32; 2], scale: f32, shift: f32, no_switch_scale: f32, ns: usize,
 ) -> (f32, f32, f32, f32) {
@@ -419,3 +463,20 @@ pub unsafe fn em_fwd_update(
     }
     (jss, fs, ss, ms)
 }
+
+// ============================================================================
+// Fallback-arch dispatch: expose the public kernel names via the scalar impls
+// on architectures with neither AVX-512 nor NEON.
+// ============================================================================
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub unsafe fn bwd_update(b: &mut [f32], mr: &[u8], el: [f32; 2], ns: usize) -> f32 { unsafe { bwd_update_scalar(b, mr, el, ns) } }
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub unsafe fn fwd_update(f: &mut [f32], mr: &[u8], el: [f32; 2], scl: f32, shf: f32, ns: usize) -> f32 { unsafe { fwd_update_scalar(f, mr, el, scl, shf, ns) } }
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub unsafe fn scale_shift(b: &mut [f32], sc: f32, sh: f32, ns: usize) { unsafe { scale_shift_scalar(b, sc, sh, ns) } }
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub unsafe fn dot4(f1: &[f32], f2: &[f32], b1: &[f32], b2: &[f32], ns: usize) -> (f32, f32, f32, f32) { unsafe { dot4_scalar(f1, f2, b1, b2, ns) } }
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub unsafe fn em_bwd_update(bwd: &mut [f32], discord: &[u8], em_probs: [f32; 2], ns: usize) -> f32 { unsafe { em_bwd_update_scalar(bwd, discord, em_probs, ns) } }
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub unsafe fn em_fwd_update(fwd: &mut [f32], saved_bwd: &[f32], discord: &[u8], em_probs: [f32; 2], scale: f32, shift: f32, no_switch_scale: f32, ns: usize) -> (f32, f32, f32, f32) { unsafe { em_fwd_update_scalar(fwd, saved_bwd, discord, em_probs, scale, shift, no_switch_scale, ns) } }
