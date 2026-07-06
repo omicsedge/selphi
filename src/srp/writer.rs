@@ -340,6 +340,41 @@ pub(crate) fn scatter_chunk_into_active(
     }
 }
 
+/// Build a single-chromosome SRP from a `.bcf` (native parallel reader) or a
+/// `.vcf.gz`/`.vcf` (streamed in-memory phased panel). Convenience dispatcher
+/// for per-chromosome sources whose format may be either — keeps the VCF path
+/// (added for `--prepare-reference-from`) available to the multi-chr directory
+/// builder and the BREF3 export without duplicating the format branch.
+pub fn build_srp_any(
+    source: &Path,
+    output_path: &Path,
+    threads: usize,
+    chunk_size_override: usize,
+) -> Result<(), SrpWriterError> {
+    let s = source.to_string_lossy();
+    if s.ends_with(".bcf") {
+        return build_srp_unified(source, output_path, threads, chunk_size_override);
+    }
+    let (sample_names, markers, phased, n_haps, is_phased) =
+        crate::io::target_io::read_cohort_phased_vcf_stream(s.as_ref());
+    if markers.is_empty() {
+        return Err(SrpWriterError::NoVariants);
+    }
+    if !is_phased {
+        return Err(SrpWriterError::InvalidInput(
+            "VCF panel is unphased; a reference panel must contain phased haplotypes".into()));
+    }
+    if markers.iter().any(|m| m.chrom != markers[0].chrom) {
+        return Err(SrpWriterError::InvalidInput(
+            "multi-chromosome VCF is not supported here; build one SRP per chromosome".into()));
+    }
+    let pvs: Vec<PanelVariant> = markers.iter().map(|m| PanelVariant {
+        chrom: &m.chrom, pos: m.pos, ref_allele: &m.ref_allele,
+        alt_allele: &m.alt_allele, id: &m.id,
+    }).collect();
+    build_srp_from_panel(&phased, &pvs, &sample_names, n_haps, output_path)
+}
+
 pub fn build_srp_unified(
     source_path: &Path,
     output_path: &Path,
