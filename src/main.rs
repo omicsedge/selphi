@@ -269,12 +269,20 @@ fn main() {
         let params = selphi::lcwgs::LcwgsParams::default();
         // Optional --region "chr:start-end" (or "chr") to bound BAM-mode imputation.
         let bam_region: Option<(String, i64, i64)> = args.region.as_deref().map(|r| {
+            // Default only on an absent bound; a non-empty unparseable coordinate
+            // is a hard error, not a silent widen to the whole chromosome.
+            let parse = |t: &str, default: i64| -> i64 {
+                let t = t.replace(',', "");
+                if t.is_empty() { return default; }
+                t.parse::<i64>().unwrap_or_else(|_| {
+                    selphi_error!("--region: malformed coordinate '{}' in '{}'", t, r);
+                    std::process::exit(1);
+                })
+            };
             match r.split_once(':') {
                 Some((c, range)) => {
                     let (s, e) = range.split_once('-').unwrap_or((range, range));
-                    let s = s.replace(',', "").parse::<i64>().unwrap_or(1);
-                    let e = e.replace(',', "").parse::<i64>().unwrap_or(i64::MAX);
-                    (c.to_string(), s, e)
+                    (c.to_string(), parse(s, 1), parse(e, i64::MAX))
                 }
                 None => (r.to_string(), 1, i64::MAX),
             }
