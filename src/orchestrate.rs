@@ -428,12 +428,18 @@ pub fn run_multi_chr(
         selfdecode: config.selfdecode || config.all_formats,
     };
 
-    // 5. Setup single output writer for ALL chromosomes
+    // 5. Setup single output writer for ALL chromosomes.
+    // Only append the format extension when it is not already present, so an
+    // explicit `--out panel.vcf.gz` stays `panel.vcf.gz` (with_extension would
+    // otherwise yield `panel.vcf.vcf.gz`).
     let out_base = PathBuf::from(output_path);
     let out_file = if formats.bcf {
-        out_base.with_extension("bcf")
-    } else {
+        if out_base.extension().is_none_or(|e| e != "bcf") { out_base.with_extension("bcf") }
+        else { out_base.clone() }
+    } else if out_base.extension().is_none_or(|e| e != "gz") {
         out_base.with_extension("vcf.gz")
+    } else {
+        out_base.clone()
     };
 
     let all_contig_fields = &multi_srp.global_meta.contig_fields;
