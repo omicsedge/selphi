@@ -219,6 +219,14 @@ fn process_region(
             let es = match tid2 { 1=>1, 2=>2, 3=>4, 5=>4, 7=>1, _=>1 };
             let fs = vl * es * ns;
             if k == gtk {
+                // The dense/sparse GT decoders assume int8, diploid-width vectors
+                // (2 bytes/sample). A haploid-width (vl=1) or int16 (type 2) GT
+                // would be read with the wrong stride → silent mis-decode; reject it.
+                if tid2 != 1 || vl != 2 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                        "GT is not int8 diploid (type_id={}, ploidy={}); Selphi requires diploid \
+                         int8 GT panels — normalize haploid/multi-ploidy records first", tid2, vl)));
+                }
                 let ge = (io2 + fs).min(ib.len());
                 for si in 0..ns {
                     let b = io2 + si * vl * es;
@@ -409,11 +417,16 @@ fn decode_diploid_gt(b0: u8, b1: u8) -> (u8, u8, bool) {
         let ap1 = b >> 1;            // allele + 1
         if ap1 == 0 { GT_MISSING_DENSE } else { (ap1 - 1).min(1) }
     }
+    // BCF reserved GT bytes: 0x80 = missing, 0x81 = end-of-vector (a haploid
+    // sample padded in a diploid-width vector, e.g. males on chrX non-PAR).
+    // BOTH must bypass allele(): 0x81 otherwise decodes as a spurious ALT
+    // (0x81>>1 = 64 → (64-1).min(1) = 1). Guard `>= 0x80` to match the sparse
+    // builder (process_region), which excludes both.
     // First allele: its phase bit is meaningless in BCF and ignored.
-    let a0 = if b0 == 0x80 { GT_MISSING_DENSE } else { allele(b0) };
-    // Second allele: 0x80 end-of-vector ⇒ haploid (read_target_bcf: no 2nd
-    // allele → REF slot 0, treated as phased); else decode, phase = low bit.
-    let (a1, phased) = if b1 == 0x80 { (0u8, true) } else { (allele(b1), (b1 & 1) == 1) };
+    let a0 = if b0 >= 0x80 { GT_MISSING_DENSE } else { allele(b0) };
+    // Second allele: reserved ⇒ haploid (read_target_bcf: no 2nd allele → REF
+    // slot 0, treated as phased); else decode, phase = low bit.
+    let (a1, phased) = if b1 >= 0x80 { (0u8, true) } else { (allele(b1), (b1 & 1) == 1) };
     (a0, a1, phased)
 }
 
@@ -471,6 +484,14 @@ fn decode_region_dense(
             let es: usize = match tid2 { 1 => 1, 2 => 2, 3 => 4, 5 => 4, 7 => 1, _ => 1 };
             let fs = vl * es * ns;
             if k == gtk {
+                // The dense/sparse GT decoders assume int8, diploid-width vectors
+                // (2 bytes/sample). A haploid-width (vl=1) or int16 (type 2) GT
+                // would be read with the wrong stride → silent mis-decode; reject it.
+                if tid2 != 1 || vl != 2 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                        "GT is not int8 diploid (type_id={}, ploidy={}); Selphi requires diploid \
+                         int8 GT panels — normalize haploid/multi-ploidy records first", tid2, vl)));
+                }
                 let ge = (io2 + fs).min(ib.len());
                 for si in 0..ns {
                     let b = io2 + si * vl * es;
