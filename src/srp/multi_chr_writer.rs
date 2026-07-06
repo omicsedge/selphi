@@ -437,21 +437,25 @@ pub fn merge_samples_single_chr(
         }
     }
 
-    // 3. Build union of variants by (pos, ref, alt) → index
-    let mut var_map: BTreeMap<(i64, String, String), usize> = BTreeMap::new();
-    let mut merged_variants: Vec<Variant> = Vec::new();
-
+    // 3. Build union of variants by (pos, ref, alt), then assign merged indices in
+    //    SORTED (position) order. The on-disk variant order equals the merged index;
+    //    first-encountered order would interleave two readers' positions and break
+    //    the position-sorted invariant that downstream relies on (the intersect
+    //    forward-only cursor in target_io, and consecutive-site cM deltas in genmap).
+    let mut uniq: BTreeMap<(i64, String, String), Variant> = BTreeMap::new();
     for r in &readers {
         for v in &r.variants {
-            let key = (v.pos, v.ref_allele.clone(), v.alt_allele.clone());
-            if let std::collections::btree_map::Entry::Vacant(e) = var_map.entry(key) {
-                let idx = merged_variants.len();
-                e.insert(idx);
-                merged_variants.push(v.clone());
-            }
+            uniq.entry((v.pos, v.ref_allele.clone(), v.alt_allele.clone()))
+                .or_insert_with(|| v.clone());
         }
     }
-    let n_variants = merged_variants.len();
+    let n_variants = uniq.len();
+    let mut var_map: BTreeMap<(i64, String, String), usize> = BTreeMap::new();
+    let mut merged_variants: Vec<Variant> = Vec::with_capacity(n_variants);
+    for (i, (key, var)) in uniq.into_iter().enumerate() {
+        var_map.insert(key, i);
+        merged_variants.push(var);
+    }
     selphi_info!("  Union variants: {}", n_variants);
 
     // 4. For each reader, build mapping: reader_var_idx → merged_var_idx
