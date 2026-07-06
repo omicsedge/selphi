@@ -255,7 +255,8 @@ fn main() {
                 "  ls-exact done: {} variants × {} samples in {:.1}s",
                 result.n_variants, result.sample_ids.len(), start.elapsed().as_secs_f32(),
             );
-            let vcf_path = PathBuf::from(format!("{}.vcf.gz", output));
+            let vcf_path = PathBuf::from(format!("{}.vcf.gz",
+            output.strip_suffix(".vcf.gz").or_else(|| output.strip_suffix(".bcf")).unwrap_or(output)));
             if let Err(e) = selphi::lcwgs::output::write_lcwgs_vcf(&result, &vcf_path) {
                 eprintln!("Failed to write {}: {}", vcf_path.display(), e);
                 std::process::exit(1);
@@ -292,7 +293,8 @@ fn main() {
         );
 
         // Write imputed VCF.gz with GT:DS:GP.
-        let vcf_path = PathBuf::from(format!("{}.vcf.gz", output));
+        let vcf_path = PathBuf::from(format!("{}.vcf.gz",
+            output.strip_suffix(".vcf.gz").or_else(|| output.strip_suffix(".bcf")).unwrap_or(output)));
         if let Err(e) = selphi::lcwgs::output::write_lcwgs_vcf(&result, &vcf_path) {
             eprintln!("Failed to write {}: {}", vcf_path.display(), e);
             std::process::exit(1);
@@ -302,7 +304,8 @@ fn main() {
         // Also emit a bgzf dosage TSV (chrom:pos:ref:alt per row) for fast
         // identity-matched evaluation, gated by --parquet-like flag reuse:
         // always write it next to the VCF for benchmarking convenience.
-        let tsv_path = PathBuf::from(format!("{}.dose.tsv.gz", output));
+        let tsv_path = PathBuf::from(format!("{}.dose.tsv.gz",
+            output.strip_suffix(".vcf.gz").or_else(|| output.strip_suffix(".bcf")).unwrap_or(output)));
         let n_var = result.n_variants;
         let n_samp = result.sample_ids.len();
         if let Err(e) = (|| -> std::io::Result<()> {
@@ -417,15 +420,17 @@ fn main() {
 
     // --- Multi-chromosome mode (per-chr directory) ---
     //
-    // Auto-merges the per-chr SRPs into a temporary multi-chr SRP under
-    // /data/tmp/ and then runs the native in-process orchestrator. No
+    // Auto-merges the per-chr SRPs into a temporary multi-chr SRP under the
+    // system temp dir and then runs the native in-process orchestrator. No
     // subprocess bcftools, no per-chr selphi fan-out.
     if let Some(ref panel_dir) = args.refpanel_dir {
         let input = args.input.as_ref().expect("--input required with --refpanel-dir");
         let map_dir = args.map_dir.as_ref().expect("--map-dir required with --refpanel-dir");
         let out = args.out.as_deref().unwrap_or("imputed");
 
-        let temp_srp = std::path::PathBuf::from("/data/tmp")
+        // std::env::temp_dir() honours TMPDIR (macOS → /var/folders/…) and falls
+        // back to /tmp on Linux; a hardcoded /data/tmp does not exist off the dev box.
+        let temp_srp = std::env::temp_dir()
             .join(format!("selphi_refpanel_dir_{}.srp", std::process::id()));
         selphi_step!("Merging per-chr SRPs from {} → {}", panel_dir, temp_srp.display());
         selphi::srp::multi_chr_writer::merge_srps_from_dir(
@@ -542,11 +547,12 @@ fn main() {
         }
 
         let is_srp_input = source.ends_with(".srp");
-        let auto_output = if is_srp_input {
-            Path::new(source).with_extension("bref3").to_string_lossy().to_string()
-        } else {
-            Path::new(source).with_extension("srp").to_string_lossy().to_string()
-        };
+        // Strip the compound panel suffix before appending, so panel.vcf.gz →
+        // panel.srp (not panel.vcf.srp, which with_extension would leave).
+        let stem = source.strip_suffix(".vcf.gz").or_else(|| source.strip_suffix(".bcf"))
+            .or_else(|| source.strip_suffix(".bref3")).or_else(|| source.strip_suffix(".srp"))
+            .unwrap_or(source);
+        let auto_output = format!("{}.{}", stem, if is_srp_input { "bref3" } else { "srp" });
         let output = args.out.as_deref().unwrap_or(&auto_output);
 
         // Fast native panel decode: BREF3/SRP → VCF.gz or BCF (replaces Beagle
