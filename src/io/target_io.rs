@@ -272,18 +272,27 @@ fn parse_gt_region(
             *phase_checks -= 1;
         }
 
-        let (a0, a1) = if gt.len() >= 3 {
-            // Diploid "a/b" or "a|b" (separator at index 1). A missing allele ('.')
-            // is marked GT_MISSING (not folded to 0) so the pedigree scaffold can
-            // distinguish a truly-missing parent from a real hom-ref; the imputation
-            // path folds it back to 0 in extract_target_alleles (byte-identical there).
-            (if gt[0].is_ascii_digit() { (gt[0] - b'0').min(1) } else { GT_MISSING },
-             if gt[2].is_ascii_digit() { (gt[2] - b'0').min(1) } else { GT_MISSING })
-        } else if !gt.is_empty() {
-            // Haploid "a" — keep the allele in slot 0 (matches read_target_bcf).
-            (if gt[0].is_ascii_digit() { (gt[0] - b'0').min(1) } else { GT_MISSING }, 0)
-        } else {
+        // Parse one allele token → {0,1} (any nonzero ALT index → 1, matching the
+        // BCF path's integer projection); '.'/empty → GT_MISSING. A missing allele
+        // stays GT_MISSING (not folded to 0) so the pedigree scaffold can tell a
+        // truly-missing parent from a real hom-ref; the imputation path folds it
+        // back to 0 in extract_target_alleles (byte-identical there).
+        let allele_of = |s: &[u8]| -> u8 {
+            if s.is_empty() || s == b"." { return GT_MISSING; }
+            let mut v: u32 = 0;
+            for &c in s {
+                if c.is_ascii_digit() { v = v * 10 + (c - b'0') as u32; } else { return GT_MISSING; }
+            }
+            v.min(1) as u8
+        };
+        // Locate the '/'|'|' separator by scanning — allele indices can be
+        // multi-digit at multiallelic sites, so it is not always at byte 1.
+        let (a0, a1) = if gt.is_empty() {
             (GT_MISSING, GT_MISSING)
+        } else if let Some(i) = gt.iter().position(|&b| b == b'/' || b == b'|') {
+            (allele_of(&gt[..i]), allele_of(&gt[i + 1..]))
+        } else {
+            (allele_of(gt), 0) // haploid — allele in slot 0 (matches read_target_bcf)
         };
         var_gts.push([a0, a1]);
 
