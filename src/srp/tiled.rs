@@ -248,7 +248,6 @@ impl TiledSrpReader {
         sorted.sort_by_key(|(s, _)| *s);
 
         let bits_ptr = bits.as_mut_ptr() as usize;
-        let bits_len = bits.len();
         let n_tc = self.n_tile_cols;
 
         for batch in sorted.chunks(400) {
@@ -257,7 +256,10 @@ impl TiledSrpReader {
             let loaded = self.preload_stripes(fs, ls - fs + 1).expect("preload failed");
 
             batch.par_iter().for_each(|(stripe, sites)| {
-                let bs = unsafe { std::slice::from_raw_parts_mut(bits_ptr as *mut u64, bits_len) };
+                // Stripes are row-disjoint across workers, so no two workers touch the
+                // same word; write through the raw base pointer instead of materializing
+                // a full-length &mut per worker (overlapping &mut = aliasing UB).
+                let base = bits_ptr as *mut u64;
                 // Per-stripe row(cr) → chip-indices(ci) map, built ONCE per stripe.
                 // Replaces the inner per-nnz `for &(ci,cr) in sites` linear scan
                 // (O(nnz × |sites|), pathological for dense extraction where |sites|
@@ -277,7 +279,9 @@ impl TiledSrpReader {
                         for k in lo..hi {
                             let lr = tile.indices[k] as usize;
                             if let Some(cis) = row_cis.get(&lr) {
-                                for &ci in cis { bs[ci * n_words + wi] |= bit; }
+                                for &ci in cis {
+                                    unsafe { let p = base.add(ci * n_words + wi); *p |= bit; }
+                                }
                             }
                         }
                     }
