@@ -9,7 +9,7 @@
 //!   Phase 3: Stream tiles into the single-file .srp (StreamingTileWriter)
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 
 use crate::{selphi_info, selphi_step};
@@ -210,14 +210,137 @@ pub fn build_srp_from_bref3(
 // In-memory phased panel → SRP (native tiled, no BCF/VCF round-trip)
 // ---------------------------------------------------------------------------
 
+/// Streaming builder for a single-chromosome SRP written one variant row at a
+/// time. All variant metadata is known up front (the caller holds the full
+/// marker list), so the header, variant index and tiling geometry are finalized
+/// in [`SrpPanelWriter::new`]; haplotype rows are then scattered into tile
+/// stripes as they arrive ([`push_row`](Self::push_row)) and flushed in batches,
+/// so peak memory is one stripe batch (a few tiles) rather than the whole panel.
+///
+/// This is the single source of truth for the panel→SRP scatter:
+/// [`build_srp_from_panel`] is the materialized-slice convenience over it, and
+/// streaming panel phasing feeds it live to build the SRP with no re-read and
+/// no full-panel buffer. Rows MUST be pushed in variant order, exactly
+/// `n_variants` times, before [`finish`](Self::finish).
+pub struct SrpPanelWriter {
+    tile_writer: StreamingTileWriter,
+    srp_path: PathBuf,
+    n_haps: usize,
+    n_variants: usize,
+    batch_size: usize,
+    /// Per-haplotype set-bit rows for the stripe currently being filled.
+    stripe_cols: Vec<Vec<u16>>,
+    current_stripe: usize,
+    pending_stripes: Vec<(usize, Vec<Vec<u16>>)>,
+    next_vi: usize,
+}
+
+impl SrpPanelWriter {
+    pub fn new(
+        variants: &[PanelVariant],
+        sample_names: &[String],
+        n_haps: usize,
+        output_path: &Path,
+    ) -> Result<Self, SrpWriterError> {
+        let n_variants = variants.len();
+        if n_variants == 0 { return Err(SrpWriterError::NoVariants); }
+        let n_samples = n_haps / 2;
+
+        // Variant index (vbin / IDs / original_IDs) — identical encoding to the
+        // BREF3 path so a panel-built SRP is indistinguishable from a converted one.
+        let chromosome = variants[0].chrom.to_string();
+        let mut min_pos = i64::MAX;
+        let mut max_pos = i64::MIN;
+        let mut vbin = Vec::with_capacity(n_variants * 20);
+        let mut ids = Vec::with_capacity(n_variants * 24);
+        let mut orig_ids = Vec::with_capacity(n_variants * 2);
+        let mut first_id = true;
+        for v in variants {
+            if v.pos < min_pos { min_pos = v.pos; }
+            if v.pos > max_pos { max_pos = v.pos; }
+            push_variant_index(&mut vbin, &mut ids, &mut orig_ids, first_id,
+                v.chrom, v.pos, v.ref_allele, v.alt_allele, v.id)?;
+            first_id = false;
+        }
+
+        let chunk_size = auto_chunk_size(n_variants, n_haps);
+        let n_chunks = n_variants.div_ceil(chunk_size);
+        let mut row_counts = Vec::with_capacity(n_chunks);
+        for ci in 0..n_chunks {
+            row_counts.push(if ci < n_chunks - 1 { chunk_size } else { n_variants - (n_chunks - 1) * chunk_size });
+        }
+        let contig_field = format!("##contig=<ID={}>", chromosome);
+
+        let srp_path = if output_path.extension().is_none_or(|e| e != "srp") {
+            output_path.with_extension("srp")
+        } else { output_path.to_path_buf() };
+
+        selphi_info!("  samples:  {} ({} haplotypes)", n_samples, n_haps);
+        selphi_info!("  variants: {} (chr{}, {}–{})", n_variants, chromosome, min_pos, max_pos);
+        selphi_step!("Streaming phased panel → tiles ({} threads)...", rayon::current_num_threads());
+
+        let tile_writer = StreamingTileWriter::new(&srp_path, &SrpMetadataForWrite {
+            n_variants, n_haps, n_samples, n_chunks, chunk_size,
+            row_counts, chromosome, min_pos, max_pos, contig_field,
+            sample_names: sample_names.to_vec(), vbin, ids, orig_ids,
+        })?;
+
+        let batch_size = (rayon::current_num_threads() * 4).max(16);
+        Ok(Self {
+            tile_writer, srp_path, n_haps, n_variants, batch_size,
+            stripe_cols: (0..n_haps).map(|_| Vec::new()).collect(),
+            current_stripe: 0,
+            pending_stripes: Vec::with_capacity(batch_size),
+            next_vi: 0,
+        })
+    }
+
+    /// Scatter one variant's haplotype row (`n_haps` allele bytes, 0 = ref /
+    /// ≥1 = alt) into the current tile stripe, flushing a completed batch when
+    /// the stripe advances. Rows arrive in variant order.
+    #[inline]
+    pub fn push_row(&mut self, row: &[u8]) -> Result<(), SrpWriterError> {
+        let vi = self.next_vi;
+        let stripe = vi / super::TILE_ROWS;
+        let local_row = (vi % super::TILE_ROWS) as u16;
+        if stripe > self.current_stripe {
+            let completed = std::mem::replace(
+                &mut self.stripe_cols, (0..self.n_haps).map(|_| Vec::new()).collect());
+            self.pending_stripes.push((self.current_stripe, completed));
+            if self.pending_stripes.len() >= self.batch_size {
+                flush_stripe_batch(&mut self.tile_writer, &mut self.pending_stripes, self.n_haps)?;
+            }
+            self.current_stripe = stripe;
+        }
+        for (h, &a) in row.iter().enumerate() {
+            if a != 0 { self.stripe_cols[h].push(local_row); }
+        }
+        self.next_vi += 1;
+        Ok(())
+    }
+
+    /// Flush the final stripe, finalize the file, and return the `.srp` path.
+    pub fn finish(mut self) -> Result<PathBuf, SrpWriterError> {
+        if self.next_vi != self.n_variants {
+            return Err(SrpWriterError::InvalidInput(format!(
+                "SrpPanelWriter: pushed {} rows, expected {}", self.next_vi, self.n_variants)));
+        }
+        let last = std::mem::take(&mut self.stripe_cols);
+        self.pending_stripes.push((self.current_stripe, last));
+        flush_stripe_batch(&mut self.tile_writer, &mut self.pending_stripes, self.n_haps)?;
+        let file_size = self.tile_writer.finish()?;
+        selphi_step!("SRP written: {} ({:.1} MB)", self.srp_path.display(), file_size as f64 / 1e6);
+        Ok(self.srp_path)
+    }
+}
+
 /// Build a native tiled SRP directly from an in-memory phased panel.
 ///
 /// `phased` is `n_var × n_haps` row-major allele bytes (0 = ref, ≥1 = alt) —
 /// the layout produced by the phasing engines. `variants` carries one entry
-/// per row in the same order. This is the BREF3→SRP scatter path
-/// ([`build_srp_from_bref3`]) reading from memory instead of a stream, so a
-/// freshly phased cohort can be written as a live `.srp` (the same format the
-/// imputation reader consumes) without converting through BCF.
+/// per row in the same order. Thin materialized-slice wrapper over
+/// [`SrpPanelWriter`]: a freshly phased cohort held in memory is written as a
+/// live `.srp` without converting through BCF.
 pub fn build_srp_from_panel(
     phased: &[u8],
     variants: &[PanelVariant],
@@ -226,83 +349,15 @@ pub fn build_srp_from_panel(
     output_path: &Path,
 ) -> Result<(), SrpWriterError> {
     let n_variants = variants.len();
-    if n_variants == 0 { return Err(SrpWriterError::NoVariants); }
     if phased.len() != n_variants * n_haps {
         return Err(SrpWriterError::InvalidInput(format!(
             "phased panel size {} != n_var {} × n_haps {}", phased.len(), n_variants, n_haps)));
     }
-    let n_samples = n_haps / 2;
-
-    // Variant index (vbin / IDs / original_IDs) — identical encoding to the
-    // BREF3 path so a panel-built SRP is indistinguishable from a converted one.
-    let chromosome = variants[0].chrom.to_string();
-    let mut min_pos = i64::MAX;
-    let mut max_pos = i64::MIN;
-    let mut vbin = Vec::with_capacity(n_variants * 20);
-    let mut ids = Vec::with_capacity(n_variants * 24);
-    let mut orig_ids = Vec::with_capacity(n_variants * 2);
-    let mut first_id = true;
-    for v in variants {
-        if v.pos < min_pos { min_pos = v.pos; }
-        if v.pos > max_pos { max_pos = v.pos; }
-        push_variant_index(&mut vbin, &mut ids, &mut orig_ids, first_id,
-            v.chrom, v.pos, v.ref_allele, v.alt_allele, v.id)?;
-        first_id = false;
-    }
-
-    let chunk_size = auto_chunk_size(n_variants, n_haps);
-    let n_chunks = n_variants.div_ceil(chunk_size);
-    let mut row_counts = Vec::with_capacity(n_chunks);
-    for ci in 0..n_chunks {
-        row_counts.push(if ci < n_chunks - 1 { chunk_size } else { n_variants - (n_chunks - 1) * chunk_size });
-    }
-    let contig_field = format!("##contig=<ID={}>", chromosome);
-
-    let srp_path = if output_path.extension().is_none_or(|e| e != "srp") {
-        output_path.with_extension("srp")
-    } else { output_path.to_path_buf() };
-
-    selphi_info!("  samples:  {} ({} haplotypes)", n_samples, n_haps);
-    selphi_info!("  variants: {} (chr{}, {}–{})", n_variants, chromosome, min_pos, max_pos);
-    selphi_step!("Streaming phased panel → tiles ({} threads)...", rayon::current_num_threads());
-
-    let mut tile_writer = StreamingTileWriter::new(&srp_path, &SrpMetadataForWrite {
-        n_variants, n_haps, n_samples, n_chunks, chunk_size,
-        row_counts, chromosome, min_pos, max_pos, contig_field,
-        sample_names: sample_names.to_vec(), vbin, ids, orig_ids,
-    })?;
-
-    // Scatter variants into per-haplotype stripe columns; flush complete
-    // stripes in parallel batches. Mirrors the BREF3 streaming scatter, but
-    // the allele row comes from `phased` rather than a decoded stream.
-    let batch_size = (rayon::current_num_threads() * 4).max(16);
-    let mut stripe_cols: Vec<Vec<u16>> = (0..n_haps).map(|_| Vec::new()).collect();
-    let mut current_stripe = 0usize;
-    let mut pending_stripes: Vec<(usize, Vec<Vec<u16>>)> = Vec::with_capacity(batch_size);
-
+    let mut writer = SrpPanelWriter::new(variants, sample_names, n_haps, output_path)?;
     for vi in 0..n_variants {
-        let stripe = vi / super::TILE_ROWS;
-        let local_row = (vi % super::TILE_ROWS) as u16;
-        if stripe > current_stripe {
-            let completed = std::mem::replace(
-                &mut stripe_cols, (0..n_haps).map(|_| Vec::new()).collect());
-            pending_stripes.push((current_stripe, completed));
-            if pending_stripes.len() >= batch_size {
-                flush_stripe_batch(&mut tile_writer, &mut pending_stripes, n_haps)?;
-            }
-            current_stripe = stripe;
-        }
-        let base = vi * n_haps;
-        let row = &phased[base..base + n_haps];
-        for (h, &a) in row.iter().enumerate() {
-            if a != 0 { stripe_cols[h].push(local_row); }
-        }
+        writer.push_row(&phased[vi * n_haps..(vi + 1) * n_haps])?;
     }
-    pending_stripes.push((current_stripe, stripe_cols));
-    flush_stripe_batch(&mut tile_writer, &mut pending_stripes, n_haps)?;
-
-    let file_size = tile_writer.finish()?;
-    selphi_step!("SRP written: {} ({:.1} MB)", srp_path.display(), file_size as f64 / 1e6);
+    writer.finish()?;
     Ok(())
 }
 
