@@ -614,6 +614,19 @@ fn main() {
                 Path::new(source), &srp_path, args.threads, args.chunk_size)
                 .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
         } else {
+            // The SRP builder reads panels through the native parallel BCF reader
+            // (CSI-seeked binary records); it does not parse VCF text. Fail early
+            // with actionable guidance instead of the opaque "not BCF" I/O error
+            // raised deep in the reader when a .vcf/.vcf.gz source is passed.
+            if !source.ends_with(".bcf") {
+                selphi_error!(
+                    "--prepare-reference-from requires a BCF panel; VCF/VCF.gz parsing is not \
+                     implemented in the SRP builder. Convert once, then build the panel:\n    \
+                     bcftools view -Ob -o panel.bcf {source} && bcftools index panel.bcf\n    \
+                     selphi --prepare-reference-from panel.bcf --out {output}");
+                std::process::exit(1);
+            }
+
             // Auto-detect multi-contig: count contigs that actually carry records (from the
             // index), NOT the header `##contig` dictionary — a bcftools-merged BCF/VCF keeps the
             // full genome dictionary in its header even with single-chromosome data, which would
