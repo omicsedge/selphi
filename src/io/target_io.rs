@@ -367,6 +367,82 @@ pub fn read_cohort_vcf(
     (sample_names, markers, genotypes, is_phased)
 }
 
+/// Stream a phased biallelic **VCF/VCF.gz** cohort straight into a row-major
+/// `phased` panel (`n_var × n_haps`, 0 = ref, 1 = alt) plus per-variant markers,
+/// for building a reference SRP from a VCF source (see `--prepare-reference-from`).
+///
+/// Unlike [`read_cohort_vcf`] this does not buffer the whole decompressed file
+/// or an intermediate genotype matrix: it reads BGZF line by line and appends
+/// each variant's alleles directly, so peak memory is just the panel itself
+/// (the floor `build_srp_from_panel` needs). Genotype/phasing semantics are
+/// identical to [`read_cohort_vcf`] — it reuses the same `split_vcf_fields` /
+/// `parse_gt_region` primitives (first ALT kept, missing → 0). BCF sources use
+/// the native streaming BCF reader instead. Returns
+/// `(sample_names, markers, phased, n_haps, is_phased)`.
+pub fn read_cohort_phased_vcf_stream(
+    path: &str,
+) -> (Vec<String>, Vec<TargetMarker>, Vec<u8>, usize, bool) {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path)
+        .unwrap_or_else(|e| { selphi_error!("Cannot open {}: {}", path, e); std::process::exit(1) });
+    let mut reader: Box<dyn BufRead> = if path.ends_with(".gz") {
+        Box::new(BufReader::with_capacity(1 << 20,
+            noodles_bgzf::io::Reader::new(BufReader::new(file))))
+    } else {
+        Box::new(BufReader::with_capacity(1 << 20, file))
+    };
+
+    let mut sample_names: Vec<String> = Vec::new();
+    let mut markers: Vec<TargetMarker> = Vec::new();
+    let mut phased: Vec<u8> = Vec::new();
+    let mut n_haps = 0usize;
+    let mut is_phased = true;
+    let mut phase_checks = 10i32;
+    let mut n_multiallelic = 0usize;
+    let mut line: Vec<u8> = Vec::with_capacity(1 << 16);
+
+    loop {
+        line.clear();
+        let n = reader.read_until(b'\n', &mut line)
+            .unwrap_or_else(|e| { selphi_error!("Read error on {}: {}", path, e); std::process::exit(1) });
+        if n == 0 { break; }
+        if line.last() == Some(&b'\n') { line.pop(); }
+        if line.is_empty() || line.starts_with(b"##") { continue; }
+        if line.starts_with(b"#CHROM") {
+            let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
+            if fields.len() > 9 {
+                sample_names = fields[9..].iter()
+                    .map(|f| std::str::from_utf8(f).unwrap_or("").to_string()).collect();
+                n_haps = sample_names.len() * 2;
+            }
+            continue;
+        }
+        let Some(f) = split_vcf_fields(&line) else { continue };
+        if f.multiallelic { n_multiallelic += 1; }
+        markers.push(TargetMarker {
+            chrom: f.chrom.to_string(), pos: f.pos,
+            ref_allele: f.ref_allele.to_string(), alt_allele: f.alt_allele.to_string(),
+            ref_hash: String::new(), alt_hash: String::new(), id: f.id.to_string(),
+        });
+        // Same GT binarisation as read_cohort_vcf; fold the missing sentinel to 0.
+        let gts = parse_gt_region(f.gt_region, sample_names.len(), &mut is_phased, &mut phase_checks);
+        phased.reserve(n_haps);
+        for g in &gts {
+            phased.push(if g[0] > 1 { 0 } else { g[0] });
+            phased.push(if g[1] > 1 { 0 } else { g[1] });
+        }
+    }
+
+    if sample_names.is_empty() {
+        selphi_error!("No samples found in {}", path);
+        std::process::exit(1);
+    }
+    if n_multiallelic > 0 {
+        selphi_info!("  WARNING: {} multi-allelic sites — kept first ALT, genotypes binarised (ref vs any-alt). Split multiallelics beforehand for exact handling.", n_multiallelic);
+    }
+    (sample_names, markers, phased, n_haps, is_phased)
+}
+
 // ---------------------------------------------------------------------------
 // read_target_vcf
 // ---------------------------------------------------------------------------
