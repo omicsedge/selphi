@@ -24,7 +24,7 @@ full phase+impute pipeline. Reference: Beagle 5.5 (03Oct25).
 
 Target: MESA admixed cohort, chr20. Panel: TOPMed 171 K-hap (85 K samples; disjoint
 from target). `mc` = max conditioning candidates. Reference: Beagle 5.5 unless noted.
-The first row is the camera-ready headline that matches main-text Table 2 (full
+The first row is the camera-ready headline that matches the main-text MESA result and Figure 2b (full
 17.9 M-variant set, `--sample-batch-size`, panel-adaptive `mc` = 132,676); the
 subsequent rows are the candidate-set-size (`mc`) sweep behind the biobank claim,
 measured against an earlier Beagle 5.5 baseline (0.5975) and retained to show the
@@ -32,7 +32,7 @@ measured against an earlier Beagle 5.5 baseline (0.5975) and retained to show th
 
 | Cohort | `mc` | Bin | Selphi 2 R² | Beagle R² | Winner |
 |---|---|---|---:|---:|---|
-| MESA 5K | 132676 (auto), full 17.9 M var | OVERALL (headline, = Table 2, diploid default) | **0.6148** | 0.5921 | Selphi |
+| MESA 5K | 132676 (auto), full 17.9 M var | OVERALL (headline, diploid default) | **0.6148** | 0.5921 | Selphi |
 | MESA 5K | 150K | OVERALL (haploid, larger mc) | **0.6162** | 0.5975 | Selphi |
 | MESA 5K | 132676 (auto) | OVERALL (haploid auto-mc) | **0.6156** | 0.5975 | Selphi |
 | MESA 5K | 132676 (auto), full 17.9 M var | per-sample mean (headline, diploid default) | **0.8978** | 0.8764 | Selphi |
@@ -145,7 +145,7 @@ Reference: Beagle 5.5, SHAPEIT5 v5.1.1.
 | lcWGS single-sample (chr22), real GIAB | peak RAM | ~3.3 GB | GLIMPSE2: ~2.1 GB | reference |
 | lcWGS 54-sample multi-sample whole-chr22 (simulated; only regime Selphi is slower) | wall | 41:50 | GLIMPSE2: 21:36 | reference |
 | lcWGS 75,552-haplotype panel multicov (HG002, 0.5-4×) | wall | **2:10-2:34** | GLIMPSE2: 4:41-4:49 | Selphi |
-| lcWGS 75,552-haplotype panel multicov | peak RAM | ~2.9-3.2 GB | GLIMPSE2: ~2.2-2.6 GB | tie |
+| lcWGS 75,552-haplotype panel multicov | peak RAM | ~2.9-3.2 GB | GLIMPSE2: ~2.2-2.6 GB | reference |
 | lcWGS real-data BAM (chr1:30-45 Mb, 1 sample) | wall | **31 s (fast) / 51 s (default)** | GLIMPSE2: 102 s | Selphi |
 
 ## Table S7. Phasing × imputer matrix (overall R²) - 1KG, chip to WGS
@@ -154,7 +154,7 @@ A genuinely-unphased 1KG array target (801 held-out samples) phased by each of
 three tools, then imputed by each of two imputers against the 1000 Genomes Phase 3
 panel; overall R² vs WGS truth on imputed-only sites. Within a fixed imputer the
 three phasings differ by ≤0.002; switching the imputer (Beagle to Selphi) moves R²
-by +0.007 to +0.010 regardless of phaser - i.e. the phaser is practically
+by +0.007 to +0.011 regardless of phaser - i.e. the phaser is practically
 interchangeable for array imputation and the accuracy gain lives in the imputer.
 
 | Phasing / Imputer | chr22 Beagle | chr22 Selphi | chr1 Beagle | chr1 Selphi |
@@ -204,10 +204,11 @@ row matches the genome-wide aggregate reported in Results.
 Each component is varied from the Selphi 2 default with phasing and everything else held
 fixed (impute-only against the phased target, so the effect is isolated from phasing). The
 "Default" row is identical to the chromosome-22 impute-only row of Table S1. The long-range
-PBWT scan (realized as an 80-haplotype-spanning 80 cM window) is worth +0.013 overall R² over
-a short IMPUTE5-like 8 cM window, and an 80 cM window already matches a whole-chromosome pass
-(the Selphi 1 mode) at lower cost; the panel-adaptive effective population size is worth +0.008
-over a fixed Ne. The candidate-set-size component is ablated separately in Table 2b.
+PBWT scan realized as an 80 cM window is worth +0.013 overall R² over a short IMPUTE5-like 8 cM
+window; because chromosome 22 is shorter than 80 cM, the default 80 cM window already spans the
+whole chromosome, so the 80 cM and whole-chromosome rows coincide by construction (confirming
+that windowing at 80 cM imposes no penalty relative to Selphi 1's whole-chromosome pass on this
+chromosome). The panel-adaptive effective population size is worth +0.008 over a fixed Ne = 20,000. The candidate-set-size component is ablated separately in Table 2b.
 
 | Configuration | Overall R² | 0.05-0.1% | 0.5-1% | 20-50% |
 |---|---:|---:|---:|---:|
