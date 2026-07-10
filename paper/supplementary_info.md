@@ -261,3 +261,22 @@ higher value in each chromosome group.
 | 10-20%    | 0.7962 | **0.7972** | 0.8999 | **0.9007** |
 | 20-50%    | 0.8418 | **0.8432** | 0.9305 | **0.9312** |
 | OVERALL   | **0.4776** | 0.4703 | **0.5643** | 0.5581 |
+
+## Table S13. Per-MAF imputation R² versus effective population size (1KG Phase 3 chr22)
+
+801 held-out samples, impute-only against the 4,802-haplotype panel, at a fixed base effective
+population size (`--est-ne`). The panel-adaptive formula selects Ne = 36.4 × n_ref ≈ 175,000 for
+this panel (the "auto" row, byte-identical to the Ne = 175,000 row). Overall R² is maximised at
+the formula's value; rare variants favour a lower Ne (≈50,000) and common variants a higher one
+(≈350,000), so the formula's choice balances the rare-common tradeoff. Bold marks each column's
+maximum.
+
+| Ne | 0.05-0.1% (rare) | 0.5-1% | 2-5% | 20-50% (common) | OVERALL |
+|---|---:|---:|---:|---:|---:|
+| 20,000 | 0.2687 | 0.4884 | 0.6603 | 0.8312 | 0.4696 |
+| 50,000 | **0.2696** | 0.4959 | 0.6671 | 0.8361 | 0.4742 |
+| 100,000 | 0.2688 | 0.5009 | 0.6719 | 0.8396 | 0.4769 |
+| 175,000 (formula / auto) | 0.2661 | **0.5033** | 0.6749 | 0.8418 | **0.4776** |
+| 350,000 | 0.2587 | 0.5026 | **0.6762** | **0.8430** | 0.4749 |
+| 700,000 | 0.2452 | 0.4963 | 0.6741 | 0.8424 | 0.4670 |
+| 1,400,000 | 0.2282 | 0.4858 | 0.6690 | 0.8403 | 0.4554 |
