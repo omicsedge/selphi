@@ -110,8 +110,10 @@ ultra-rare (MAF 0-0.5%).
 | 4×   | 0-0.5% (ultra-rare) | **0.9704** | 0.9638 | 0.9437 | Selphi |
 
 > Earlier lcWGS benchmark rounds (simulated 54-sample chr22 sets, and a 75,552-haplotype
-> large-panel multi-coverage sweep) were superseded by the real-read measurements above
-> and are not reproduced here; the real-GIAB numbers are the ones reported in the paper.
+> large-panel multi-coverage sweep) were superseded for accuracy by the real-read measurements
+> above, so their accuracy is not reproduced here and the real-GIAB numbers are the accuracy
+> reported in the paper; the large-panel run's wall time and peak memory are retained as an
+> efficiency data point in Table S6.
 
 ## Table S5. Phasing accuracy - switch-error rate (SER %)
 
@@ -216,3 +218,46 @@ chromosome). The panel-adaptive effective population size is worth +0.008 over a
 | Short 8 cM window (IMPUTE5-like) | 0.4645 | 0.2667 | 0.4759 | 0.8250 |
 | Whole-chromosome window (Selphi 1 mode) | 0.4776 | 0.2661 | 0.5033 | 0.8418 |
 | Fixed Ne = 20,000 (IMPUTE5 default) | 0.4696 | 0.2687 | 0.4884 | 0.8312 |
+
+## Table S11. Biobank-scale MESA × TOPMed, per-MAF, four imputers
+
+MESA cohort (5,000 samples, chr20) imputed against the TOPMed Freeze 8 panel (171,054
+haplotypes), scored on the identical set of 17,900,635 variants for all tools. Selphi 2 uses
+its panel-adaptive candidate set (mc = 132,676); IMPUTE5 (L = 4 conditioning states) and
+Minimac4 (block-based state reduction) use their default settings. Beagle 5.5 attains overall
+R² 0.5921 on the same set (main text). Selphi 2 leads at every MAF bin.
+
+| MAF | Selphi 2 | IMPUTE5 | Minimac4 |
+|---|---:|---:|---:|
+| 0.05-0.1% | **0.5224** | 0.3819 | 0.3693 |
+| 0.1-0.2%  | **0.5665** | 0.4107 | 0.3983 |
+| 0.2-0.5%  | **0.6131** | 0.4689 | 0.4531 |
+| 0.5-1%    | **0.6537** | 0.5342 | 0.5150 |
+| 1-2%      | **0.6698** | 0.5695 | 0.5494 |
+| 2-5%      | **0.6603** | 0.5753 | 0.5567 |
+| 5-10%     | **0.6780** | 0.6084 | 0.5909 |
+| 10-20%    | **0.7322** | 0.6720 | 0.6537 |
+| 20-50%    | **0.6631** | 0.6249 | 0.6084 |
+| OVERALL   | **0.6148** | 0.4967 | 0.4795 |
+
+## Table S12. Selphi 2 vs Selphi 1.5.3, per-MAF (1KG Phase 3, impute-only)
+
+Both tools imputed the identical phased target (801 held-out samples) against the identical 1000
+Genomes Phase 3 panel, impute-only — the mode in which the original Selphi 1.5.3, which requires
+pre-phased input, is run — and scored on imputed-only sites. This isolates the imputer from
+phasing. Selphi 2 matches or exceeds Selphi 1.5.3 overall and at every bin from the rarest through
+low frequency; at the most common bins the two are within ≈0.001 (seed-level noise). Bold marks the
+higher value in each chromosome group.
+
+| MAF | chr22 Selphi 2 | chr22 Selphi 1.5.3 | chr1 Selphi 2 | chr1 Selphi 1.5.3 |
+|---|---:|---:|---:|---:|
+| 0.05-0.1% | **0.2661** | 0.2502 | **0.3453** | 0.3321 |
+| 0.1-0.2%  | **0.3166** | 0.3051 | **0.4014** | 0.3910 |
+| 0.2-0.5%  | **0.4160** | 0.4064 | **0.5019** | 0.4944 |
+| 0.5-1%    | **0.5033** | 0.4986 | **0.6077** | 0.6036 |
+| 1-2%      | **0.5702** | 0.5696 | **0.6759** | 0.6745 |
+| 2-5%      | 0.6749 | **0.6753** | 0.7521 | **0.7528** |
+| 5-10%     | 0.7588 | **0.7598** | 0.8485 | **0.8497** |
+| 10-20%    | 0.7962 | **0.7972** | 0.8999 | **0.9007** |
+| 20-50%    | 0.8418 | **0.8432** | 0.9305 | **0.9312** |
+| OVERALL   | **0.4776** | 0.4703 | **0.5643** | 0.5581 |
