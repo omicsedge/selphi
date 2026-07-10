@@ -6,19 +6,19 @@ Panel: 1KG Phase 3, 4802 haps. Targets: 801 samples, chr22 (1.07 M variants) and
 chr1 (5.77 M variants). 16 threads. PHASED = impute-only (input phased); UNPHASED =
 full phase+impute pipeline. Reference: Beagle 5.5 (03Oct25).
 
-| Chr | Mode | Bin | Selphi 2 R² | Beagle 5.5 R² | Winner | Status |
-|---|---|---|---:|---:|---|---|
-| 22 | phased  | OVERALL  | **0.4776** | 0.4680 | Selphi | FINAL |
-| 22 | unphased | OVERALL  | **0.4832** | 0.4727 | Selphi | FINAL |
-| 22 | phased  | per-sample mean | **0.9152** | 0.9077 | Selphi | FINAL |
-| 22 | phased  | 0.05-0.1% | **0.2661** | 0.2672 | reference | FINAL |
-| 22 | phased  | 0.5-1%  | **0.5033** | 0.4850 | Selphi | FINAL |
-| 22 | phased  | 20-50%  | **0.8418** | 0.8313 | Selphi | FINAL |
-| 1 | phased  | OVERALL  | **0.5643** | 0.5571 | Selphi | FINAL |
-| 1 | unphased | OVERALL  | **0.5739** | 0.5640 | Selphi | FINAL |
-| 1 | phased  | 0.05-0.1% | **0.3453** | 0.3495 | reference | FINAL |
-| 1 | phased  | 0.5-1%  | **0.6077** | 0.5912 | Selphi | FINAL |
-| 1 | phased  | 20-50%  | **0.9305** | 0.9249 | Selphi | FINAL |
+| Chr | Mode | Bin | Selphi 2 R² | Beagle 5.5 R² | Winner |
+|---|---|---|---:|---:|---|
+| 22 | phased  | OVERALL  | **0.4776** | 0.4680 | Selphi |
+| 22 | unphased | OVERALL  | **0.4832** | 0.4727 | Selphi |
+| 22 | phased  | per-sample mean | **0.9152** | 0.9077 | Selphi |
+| 22 | phased  | 0.05-0.1% | 0.2661 | **0.2672** | reference |
+| 22 | phased  | 0.5-1%  | **0.5033** | 0.4850 | Selphi |
+| 22 | phased  | 20-50%  | **0.8418** | 0.8313 | Selphi |
+| 1 | phased  | OVERALL  | **0.5643** | 0.5571 | Selphi |
+| 1 | unphased | OVERALL  | **0.5739** | 0.5640 | Selphi |
+| 1 | phased  | 0.05-0.1% | 0.3453 | **0.3495** | reference |
+| 1 | phased  | 0.5-1%  | **0.6077** | 0.5912 | Selphi |
+| 1 | phased  | 20-50%  | **0.9305** | 0.9249 | Selphi |
 
 ## Table S2. Imputation accuracy (R²) - biobank-scale MESA × TOPMed
 
@@ -30,21 +30,21 @@ subsequent rows are the candidate-set-size (`mc`) sweep behind the biobank claim
 measured against an earlier Beagle 5.5 baseline (0.5975) and retained to show the
 `mc` trajectory (so their Beagle column differs from the headline by design).
 
-| Cohort | `mc` | Bin | Selphi 2 R² | Beagle R² | Winner | Status |
-|---|---|---|---:|---:|---|---|
-| MESA 5K | 132676 (auto), full 17.9 M var | OVERALL (headline, = Table 2, diploid default) | **0.6148** | 0.5921 | Selphi | FINAL |
-| MESA 5K | 150K | OVERALL (haploid, larger mc) | **0.6162** | 0.5975 | Selphi | FINAL |
-| MESA 5K | 132676 (auto) | OVERALL (haploid auto-mc) | **0.6156** | 0.5975 | Selphi | FINAL |
-| MESA 5K | 132676 (auto), full 17.9 M var | per-sample mean (headline, diploid default) | **0.8978** | 0.8764 | Selphi | FINAL |
-| MESA 5K | 150K | 0.05-0.1% (rarest, Ne-default) | **0.5211** | 0.5020 | Selphi | FINAL |
-| MESA 5K | 120K | 0.5-1% | **0.6554** | 0.6360 | Selphi | FINAL |
-| MESA 5K | 120K | 5-10% | **0.6809** | 0.6635 | Selphi | FINAL |
-| MESA 5K | 120K | 20-50% | **0.6653** | 0.6541 | Selphi | FINAL |
-| MESA 100s set1 | 9800 | OVERALL | **0.6624** | 0.6242 | Selphi | FINAL |
-| MESA 100s set1 | 9800 | 0.5-1% | **0.6548** | 0.6079 | Selphi | FINAL |
-| MESA 100s set2 | 9800 | OVERALL | **0.6645** | 0.6290 | Selphi | FINAL |
-| MESA 100s set1 | per-window default | OVERALL (Test B) | **0.6506** | 0.6507 | tie | FINAL |
-| MESA 100s set2 | per-window default | OVERALL (Test B) | **0.6549** | 0.6546 | tie | FINAL |
+| Cohort | `mc` | Bin | Selphi 2 R² | Beagle R² | Winner |
+|---|---|---|---:|---:|---|
+| MESA 5K | 132676 (auto), full 17.9 M var | OVERALL (headline, = Table 2, diploid default) | **0.6148** | 0.5921 | Selphi |
+| MESA 5K | 150K | OVERALL (haploid, larger mc) | **0.6162** | 0.5975 | Selphi |
+| MESA 5K | 132676 (auto) | OVERALL (haploid auto-mc) | **0.6156** | 0.5975 | Selphi |
+| MESA 5K | 132676 (auto), full 17.9 M var | per-sample mean (headline, diploid default) | **0.8978** | 0.8764 | Selphi |
+| MESA 5K | 150K | 0.05-0.1% (rarest, Ne-default) | **0.5211** | 0.5020 | Selphi |
+| MESA 5K | 120K | 0.5-1% | **0.6554** | 0.6360 | Selphi |
+| MESA 5K | 120K | 5-10% | **0.6809** | 0.6635 | Selphi |
+| MESA 5K | 120K | 20-50% | **0.6653** | 0.6541 | Selphi |
+| MESA 100s set1 | 9800 | OVERALL | **0.6624** | 0.6242 | Selphi |
+| MESA 100s set1 | 9800 | 0.5-1% | **0.6548** | 0.6079 | Selphi |
+| MESA 100s set2 | 9800 | OVERALL | **0.6645** | 0.6290 | Selphi |
+| MESA 100s set1 | per-window default | OVERALL (Test B) | 0.6506 | 0.6507 | tie |
+| MESA 100s set2 | per-window default | OVERALL (Test B) | 0.6549 | 0.6546 | tie |
 
 ## Table S3. Leak-free GIAB validation - chip to WGS
 
@@ -54,18 +54,18 @@ This is the GIAB overlay validation set (no array no-calls), distinct from the
 consumer-array GSA benchmark in the main paper (Table 3); the missing-genotype
 phasing fix does not affect these rows.
 
-| Chr | Mode | Metric | Selphi 2 | Beagle 5 | Winner | Status |
-|---|---|---|---:|---:|---|---|
-| 21 | impute-only | OVERALL R² | **0.9704** | 0.9676 | Selphi | FINAL |
-| 21 | impute-only | concordance | **0.9777** | 0.9762 | Selphi | FINAL |
-| 21 | impute-only | wall | **7.2 s** | 12.5 s | Selphi | FINAL |
-| 21 | impute-only | peak RAM | **6.2 GB** | 14.5 GB | Selphi | FINAL |
-| 21 | full pipeline (diploid) | OVERALL R² | **0.9734** | 0.9707 | Selphi | FINAL |
-| 21 | full pipeline (haploid auto) | OVERALL R² | **0.9705** | 0.9707 | tie | FINAL |
-| 1 | impute-only | OVERALL R² | **0.9815** | 0.9825 | reference | FINAL |
-| 1 | impute-only | wall | **38.8 s** | 43.2 s | Selphi | FINAL |
-| 1 | impute-only | peak RAM | **16.3 GB** | 39.2 GB | Selphi | FINAL |
-| 1 | full pipeline (diploid) | OVERALL R² | **0.9812** | 0.9820 | reference | FINAL |
+| Chr | Mode | Metric | Selphi 2 | Beagle 5 | Winner |
+|---|---|---|---:|---:|---|
+| 21 | impute-only | OVERALL R² | **0.9704** | 0.9676 | Selphi |
+| 21 | impute-only | concordance | **0.9777** | 0.9762 | Selphi |
+| 21 | impute-only | wall | **7.2 s** | 12.5 s | Selphi |
+| 21 | impute-only | peak RAM | **6.2 GB** | 14.5 GB | Selphi |
+| 21 | full pipeline (diploid) | OVERALL R² | **0.9734** | 0.9707 | Selphi |
+| 21 | full pipeline (haploid auto) | OVERALL R² | 0.9705 | 0.9707 | tie |
+| 1 | impute-only | OVERALL R² | 0.9815 | **0.9825** | reference |
+| 1 | impute-only | wall | **38.8 s** | 43.2 s | Selphi |
+| 1 | impute-only | peak RAM | **16.3 GB** | 39.2 GB | Selphi |
+| 1 | full pipeline (diploid) | OVERALL R² | 0.9812 | **0.9820** | reference |
 
 ## Table S4. Low-coverage WGS (lcWGS) accuracy (R²) - vs GLIMPSE2 and QUILT2
 
@@ -82,15 +82,15 @@ independently against the 4,478-haplotype (2,239-sample) no-trios 1000 Genomes
 panel. Per-sample dosage R² over the high-confidence variant sites carrying a
 non-reference allele (≈37-40k per sample), identical site set for both tools.
 
-| Sample | Selphi 2 R² | GLIMPSE2 R² | Winner | Status |
-|---|---:|---:|---|---|
-| HG002 | **0.9457** | 0.9421 | Selphi | FINAL |
-| HG003 | **0.9515** | 0.9459 | Selphi | FINAL |
-| HG004 | **0.9479** | 0.9435 | Selphi | FINAL |
-| HG005 | **0.9455** | 0.9416 | Selphi | FINAL |
-| HG006 | **0.9547** | 0.9496 | Selphi | FINAL |
-| HG007 | 0.9502 | 0.9504 | tie | FINAL |
-| Mean  | **0.9493** | 0.9455 | Selphi | FINAL |
+| Sample | Selphi 2 R² | GLIMPSE2 R² | Winner |
+|---|---:|---:|---|
+| HG002 | **0.9457** | 0.9421 | Selphi |
+| HG003 | **0.9515** | 0.9459 | Selphi |
+| HG004 | **0.9479** | 0.9435 | Selphi |
+| HG005 | **0.9455** | 0.9416 | Selphi |
+| HG006 | **0.9547** | 0.9496 | Selphi |
+| HG007 | 0.9502 | 0.9504 | tie |
+| Mean  | **0.9493** | 0.9455 | Selphi |
 
 **S4b. Three-way coverage sweep (= main-text Table 6b).** Mean per-sample dosage R²
 over GIAB HG002/HG003/HG004 downsampled to each depth over chr22:20-30 Mb, imputed
@@ -98,16 +98,16 @@ against a leak-free 1000 Genomes panel (6,332 haplotypes), scored (reference-hom
 sites as dosage zero) on the set of sites imputed by all three tools. Overall and
 ultra-rare (MAF 0-0.5%).
 
-| Coverage | Bin | Selphi 2 R² | GLIMPSE2 R² | QUILT2 R² | Winner | Status |
-|---|---|---:|---:|---:|---|---|
-| 0.5× | OVERALL | **0.9924** | 0.9916 | 0.9919 | Selphi | FINAL |
-| 1×   | OVERALL | **0.9950** | 0.9945 | 0.9944 | Selphi | FINAL |
-| 2×   | OVERALL | **0.9971** | 0.9967 | 0.9968 | Selphi | FINAL |
-| 4×   | OVERALL | **0.9979** | 0.9975 | 0.9973 | Selphi | FINAL |
-| 0.5× | 0-0.5% (ultra-rare) | 0.8997 | **0.9023** | 0.8864 | reference | FINAL |
-| 1×   | 0-0.5% (ultra-rare) | 0.9243 | **0.9252** | 0.9150 | tie | FINAL |
-| 2×   | 0-0.5% (ultra-rare) | **0.9522** | 0.9495 | 0.9415 | Selphi | FINAL |
-| 4×   | 0-0.5% (ultra-rare) | **0.9704** | 0.9638 | 0.9437 | Selphi | FINAL |
+| Coverage | Bin | Selphi 2 R² | GLIMPSE2 R² | QUILT2 R² | Winner |
+|---|---|---:|---:|---:|---|
+| 0.5× | OVERALL | **0.9924** | 0.9916 | 0.9919 | Selphi |
+| 1×   | OVERALL | **0.9950** | 0.9945 | 0.9944 | Selphi |
+| 2×   | OVERALL | **0.9971** | 0.9967 | 0.9968 | Selphi |
+| 4×   | OVERALL | **0.9979** | 0.9975 | 0.9973 | Selphi |
+| 0.5× | 0-0.5% (ultra-rare) | 0.8997 | **0.9023** | 0.8864 | reference |
+| 1×   | 0-0.5% (ultra-rare) | 0.9243 | 0.9252 | 0.9150 | tie |
+| 2×   | 0-0.5% (ultra-rare) | **0.9522** | 0.9495 | 0.9415 | Selphi |
+| 4×   | 0-0.5% (ultra-rare) | **0.9704** | 0.9638 | 0.9437 | Selphi |
 
 > Earlier lcWGS benchmark rounds (simulated 54-sample chr22 sets, and a 75,552-haplotype
 > large-panel multi-coverage sweep) were superseded by the real-read measurements above
@@ -118,35 +118,35 @@ ultra-rare (MAF 0-0.5%).
 1KG 54-trio benchmark, no-trios panel (~2,239 samples). Lower is better.
 Reference: Beagle 5.5, SHAPEIT5 v5.1.1.
 
-| Chr | Engine | Selphi 2 SER % | Beagle 5.5 | SHAPEIT5 | vs Beagle | vs SHAPEIT5 | Status |
-|---|---|---:|---:|---:|---|---|---|
-| 22 | diploid | **2.521** | 2.548 | 2.611 | Selphi | Selphi | FINAL |
-| 22 | haploid | **2.569** | 2.548 | 2.611 | reference | Selphi | FINAL |
-| 1 | diploid | **1.876** | 1.865 | 1.935 | reference | Selphi | FINAL |
-| 1 | haploid | **1.876** | 1.865 | 1.935 | reference | Selphi | FINAL |
+| Chr | Engine | Selphi 2 SER % | Beagle 5.5 | SHAPEIT5 | vs Beagle | vs SHAPEIT5 |
+|---|---|---:|---:|---:|---|---|
+| 22 | diploid | **2.521** | 2.548 | 2.611 | Selphi | Selphi |
+| 22 | haploid | 2.569 | **2.548** | 2.611 | reference | Selphi |
+| 1 | diploid | 1.876 | **1.865** | 1.935 | reference | Selphi |
+| 1 | haploid | 1.876 | **1.865** | 1.935 | reference | Selphi |
 
 ## Table S6. Speed & memory
 
 16 threads unless noted. Wall as reported by the source benchmark.
 
-| Benchmark | Metric | Selphi 2 | Reference | Winner | Status |
-|---|---|---:|---:|---|---|
-| GIAB chr21, 6s, 75,552-haplotype panel, impute-only | wall | **7.2 s** | Beagle 5: 12.5 s | Selphi | FINAL |
-| GIAB chr21, 6s, 75,552-haplotype panel, impute-only | peak RAM | **6.2 GB** | Beagle 5: 14.5 GB | Selphi | FINAL |
-| GIAB chr1, 6s, 75,552-haplotype panel, impute-only | wall | **38.8 s** | Beagle 5: 43.2 s | Selphi | FINAL |
-| GIAB chr1, 6s, 75,552-haplotype panel, impute-only | peak RAM | **16.3 GB** | Beagle 5: 39.2 GB | Selphi | FINAL |
-| chr22 1KG 801s, chip to WGS | wall (phased/unphased) | **69 s / 82 s** | Beagle 5.5: 58 s / 84 s | tie | FINAL |
-| chr22 1KG 801s, chip to WGS | peak RAM | **13.2 / 13.1 GB** | Beagle 5.5: 21.7 / 14.6 GB | Selphi | FINAL |
-| chr1 1KG 801s, chip to WGS | wall (phased/unphased) | **373 s / 437 s** | Beagle 5.5: 207 s / 321 s | reference | FINAL |
-| TOPMed MESA 5K chr20 (171K-hap, 17.9M var), full pipeline | wall | **11,289 s (~3.1 h)** | Beagle 5.5: 4,148 s | reference | FINAL |
-| TOPMed MESA 5K chr20 | peak RAM | **65.5 GB** | Beagle 5.5: 96.5 GB | Selphi | FINAL |
-| lcWGS whole-chr22, 1 sample @1× (= Fig 3c) | wall | **115 s** | GLIMPSE2: 287 s; QUILT2: 1,729 s | Selphi | FINAL |
-| lcWGS single-sample (chr22), real GIAB ~1.8× | wall | **~2:01** | GLIMPSE2: ~5:22 | Selphi | FINAL |
-| lcWGS single-sample (chr22), real GIAB | peak RAM | **~3.3 GB** | GLIMPSE2: ~2.1 GB | reference | FINAL |
-| lcWGS 54-sample multi-sample whole-chr22 (simulated; only regime Selphi is slower) | wall | **41:50** | GLIMPSE2: 21:36 | reference | FINAL |
-| lcWGS 75,552-haplotype panel multicov (HG002, 0.5-4×) | wall | **2:10-2:34** | GLIMPSE2: 4:41-4:49 | Selphi | FINAL |
-| lcWGS 75,552-haplotype panel multicov | peak RAM | **~2.9-3.2 GB** | GLIMPSE2: ~2.2-2.6 GB | tie | FINAL |
-| lcWGS real-data BAM (chr1:30-45 Mb, 1 sample) | wall | **31 s (fast) / 51 s (default)** | GLIMPSE2: 102 s | Selphi | FINAL |
+| Benchmark | Metric | Selphi 2 | Reference | Winner |
+|---|---|---:|---:|---|
+| GIAB chr21, 6s, 75,552-haplotype panel, impute-only | wall | **7.2 s** | Beagle 5: 12.5 s | Selphi |
+| GIAB chr21, 6s, 75,552-haplotype panel, impute-only | peak RAM | **6.2 GB** | Beagle 5: 14.5 GB | Selphi |
+| GIAB chr1, 6s, 75,552-haplotype panel, impute-only | wall | **38.8 s** | Beagle 5: 43.2 s | Selphi |
+| GIAB chr1, 6s, 75,552-haplotype panel, impute-only | peak RAM | **16.3 GB** | Beagle 5: 39.2 GB | Selphi |
+| chr22 1KG 801s, chip to WGS | wall (phased/unphased) | 69 s / 82 s | Beagle 5.5: 58 s / 84 s | tie |
+| chr22 1KG 801s, chip to WGS | peak RAM | **13.2 / 13.1 GB** | Beagle 5.5: 21.7 / 14.6 GB | Selphi |
+| chr1 1KG 801s, chip to WGS | wall (phased/unphased) | 373 s / 437 s | Beagle 5.5: 207 s / 321 s | reference |
+| TOPMed MESA 5K chr20 (171K-hap, 17.9M var), full pipeline | wall | 11,289 s (~3.1 h) | Beagle 5.5: 4,148 s | reference |
+| TOPMed MESA 5K chr20 | peak RAM | **65.5 GB** | Beagle 5.5: 96.5 GB | Selphi |
+| lcWGS whole-chr22, 1 sample @1× (= Fig 3c) | wall | **115 s** | GLIMPSE2: 287 s; QUILT2: 1,729 s | Selphi |
+| lcWGS single-sample (chr22), real GIAB ~1.8× | wall | **~2:01** | GLIMPSE2: ~5:22 | Selphi |
+| lcWGS single-sample (chr22), real GIAB | peak RAM | ~3.3 GB | GLIMPSE2: ~2.1 GB | reference |
+| lcWGS 54-sample multi-sample whole-chr22 (simulated; only regime Selphi is slower) | wall | 41:50 | GLIMPSE2: 21:36 | reference |
+| lcWGS 75,552-haplotype panel multicov (HG002, 0.5-4×) | wall | **2:10-2:34** | GLIMPSE2: 4:41-4:49 | Selphi |
+| lcWGS 75,552-haplotype panel multicov | peak RAM | ~2.9-3.2 GB | GLIMPSE2: ~2.2-2.6 GB | tie |
+| lcWGS real-data BAM (chr1:30-45 Mb, 1 sample) | wall | **31 s (fast) / 51 s (default)** | GLIMPSE2: 102 s | Selphi |
 
 ## Table S7. Phasing × imputer matrix (overall R²) - 1KG, chip to WGS
 
@@ -198,3 +198,20 @@ row matches the genome-wide aggregate reported in Results.
 | 10-20%    | **0.8965** | 0.8881 | 0.8840 | 0.8803 |
 | 20-50%    | **0.9255** | 0.9192 | 0.9160 | 0.9112 |
 | OVERALL   | **0.5838** | 0.5764 | 0.5635 | 0.5668 |
+
+## Table S10. Component ablation (1KG chromosome 22, 801 held-out samples)
+
+Each component is varied from the Selphi 2 default with phasing and everything else held
+fixed (impute-only against the phased target, so the effect is isolated from phasing). The
+"Default" row is identical to the chromosome-22 impute-only row of Table S1. The long-range
+PBWT scan (realized as an 80-haplotype-spanning 80 cM window) is worth +0.013 overall R² over
+a short IMPUTE5-like 8 cM window, and an 80 cM window already matches a whole-chromosome pass
+(the Selphi 1 mode) at lower cost; the panel-adaptive effective population size is worth +0.008
+over a fixed Ne. The candidate-set-size component is ablated separately in Table 2b.
+
+| Configuration | Overall R² | 0.05-0.1% | 0.5-1% | 20-50% |
+|---|---:|---:|---:|---:|
+| Default (80 cM window, panel-adaptive Ne) | **0.4776** | 0.2661 | 0.5033 | 0.8418 |
+| Short 8 cM window (IMPUTE5-like) | 0.4645 | 0.2667 | 0.4759 | 0.8250 |
+| Whole-chromosome window (Selphi 1 mode) | 0.4776 | 0.2661 | 0.5033 | 0.8418 |
+| Fixed Ne = 20,000 (IMPUTE5 default) | 0.4696 | 0.2687 | 0.4884 | 0.8312 |
