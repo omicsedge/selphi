@@ -179,27 +179,34 @@ retained.
 | Beagle 5.5 | 0.4723 | 0.4696 | -0.0028 | -0.014 | +0.001 to +0.004 |
 | Selphi 2  | 0.4821 | 0.4788 | -0.0033 | -0.013 | +0.001 to +0.003 |
 
-## Table S9. Genome-wide per-MAF R² underlying Figure 2a (1KG, four-way)
+## Table S9. Genome-wide per-MAF R² underlying Figure 2a (1KG, five-way, imputation-only)
 
 Source data for Figure 2a: n-weighted imputation R² by MAF bin, aggregated genome-wide
 across 20 autosomes (chromosomes 8 and 11 excluded because Beagle aborted on a duplicate
-panel marker, so all four tools span the identical chromosome set). 801 held-out 1000
-Genomes samples, full phase-and-impute pipeline (Selphi 2 default diploid engine),
-imputed against the 1000 Genomes Phase 3 panel; scored against WGS truth. The OVERALL
-row matches the genome-wide aggregate reported in Results.
+panel marker, so all tools span the identical chromosome set). 801 held-out 1000 Genomes
+samples imputed against the 1000 Genomes Phase 3 panel (2,401 samples / 4,802 haplotypes
+per chromosome), scored against WGS truth. This is a like-for-like **imputation-only**
+comparison: every tool receives the *identical* phased target haplotypes (the same input
+file) and the same reference panel, so the figure isolates the imputation step. All five
+tools impute directly from the supplied phasing; because the target is fully phased and
+contains no missing genotypes, Beagle 5.5 likewise imputes without re-estimating phase, so
+every row reflects imputation from identical input haplotypes. Bold marks the per-row maximum. Selphi 2's full phase-and-
+impute pipeline (its own internal phasing) reaches a higher genome-wide overall R² of
+0.5838 (Table 1; Results); the 0.5808 here is Selphi 2 imputing from the shared external
+phasing. The OVERALL row matches the genome-wide aggregate reported in Results.
 
-| MAF | Selphi 2 | Beagle 5.5 | IMPUTE5 | Minimac4 |
-|---|---:|---:|---:|---:|
-| 0.05-0.1% | 0.3578 | **0.3619** | 0.3458 | 0.3530 |
-| 0.1-0.2%  | **0.4275** | 0.4196 | 0.4061 | 0.4131 |
-| 0.2-0.5%  | **0.5274** | 0.5117 | 0.5005 | 0.5048 |
-| 0.5-1%    | **0.6273** | 0.6090 | 0.5991 | 0.6013 |
-| 1-2%      | **0.6926** | 0.6742 | 0.6654 | 0.6663 |
-| 2-5%      | **0.7630** | 0.7458 | 0.7381 | 0.7367 |
-| 5-10%     | **0.8531** | 0.8410 | 0.8355 | 0.8323 |
-| 10-20%    | **0.8965** | 0.8881 | 0.8840 | 0.8803 |
-| 20-50%    | **0.9255** | 0.9192 | 0.9160 | 0.9112 |
-| OVERALL   | **0.5838** | 0.5764 | 0.5635 | 0.5668 |
+| MAF | Selphi 2 | Selphi 1.5.3 | Beagle 5.5 | Minimac4 | IMPUTE5 |
+|---|---:|---:|---:|---:|---:|
+| 0.05-0.1% | 0.3528 | 0.3375 | **0.3570** | 0.3529 | 0.3458 |
+| 0.1-0.2%  | **0.4222** | 0.4106 | 0.4151 | 0.4132 | 0.4062 |
+| 0.2-0.5%  | **0.5235** | 0.5149 | 0.5092 | 0.5048 | 0.5005 |
+| 0.5-1%    | **0.6250** | 0.6207 | 0.6083 | 0.6013 | 0.5991 |
+| 1-2%      | **0.6910** | 0.6898 | 0.6742 | 0.6663 | 0.6654 |
+| 2-5%      | 0.7618 | **0.7629** | 0.7460 | 0.7367 | 0.7381 |
+| 5-10%     | 0.8525 | **0.8539** | 0.8414 | 0.8323 | 0.8355 |
+| 10-20%    | 0.8962 | **0.8973** | 0.8885 | 0.8803 | 0.8840 |
+| 20-50%    | 0.9254 | **0.9262** | 0.9196 | 0.9112 | 0.9160 |
+| OVERALL   | **0.5808** | 0.5739 | 0.5739 | 0.5668 | 0.5635 |
 
 ## Table S10. Component ablation (1KG chromosome 22, 801 held-out samples)
 
