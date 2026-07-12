@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Publication figures for the Selphi 2 paper. Panel sources:
-2a = genome-wide (20-autosome) n-weighted per-MAF R^2, four-way (Supplementary Table S9;
+2a = genome-wide (20-autosome) n-weighted per-MAF R^2, five-way imputation-only (all tools
+     impute from the identical phased target + panel; Supplementary Table S9;
      OVERALL aggregates in Results text). 2b = MESA per-ancestry per-sample-mean R^2
      (mc=132,676 run; deltas match Table 2b prose). 2c = Table 2c. 2d = Table 6b.
      3a/3b = Table 3b. 3c = Figure 3c / Table 6b speed."""
@@ -18,18 +19,20 @@ plt.rcParams.update({
     "axes.spines.top": False, "axes.spines.right": False, "figure.dpi": 150,
 })
 # Okabe-Ito colorblind-safe palette
-C = {"selphi": "#0072B2", "beagle": "#E69F00", "impute5": "#009E73",
+C = {"selphi": "#0072B2", "selphi153": "#56B4E9", "beagle": "#E69F00", "impute5": "#009E73",
      "minimac4": "#CC79A7", "glimpse2": "#E69F00", "quilt2": "#009E73"}
 
 maf_lbl = ["0.05-0.1", "0.1-0.2", "0.2-0.5", "0.5-1", "1-2", "2-5", "5-10", "10-20", "20-50"]
 x = np.arange(len(maf_lbl))
 
 # ---- data (from paper tables) ----
-# 2a: 1KG genome-wide (20 autosomes) R2 by MAF, four-way (n-weighted)
-t1 = {"selphi":[.3578,.4275,.5274,.6273,.6926,.7630,.8531,.8965,.9255],
-      "beagle":[.3619,.4196,.5117,.6090,.6742,.7458,.8410,.8881,.9192],
-      "impute5":[.3458,.4061,.5005,.5991,.6654,.7381,.8355,.8840,.9160],
-      "minimac4":[.3530,.4131,.5048,.6013,.6663,.7367,.8323,.8803,.9112]}
+# 2a: 1KG genome-wide (20 autosomes) R2 by MAF, five-way, imputation-only (n-weighted;
+#     all tools impute from the identical phased target + panel; Supplementary Table S9)
+t1 = {"selphi":   [.3528,.4222,.5235,.6250,.6910,.7618,.8525,.8962,.9254],
+      "selphi153":[.3375,.4106,.5149,.6207,.6898,.7629,.8539,.8973,.9262],
+      "beagle":   [.3570,.4151,.5092,.6083,.6742,.7460,.8414,.8885,.9196],
+      "impute5":  [.3458,.4062,.5005,.5991,.6654,.7381,.8355,.8840,.9160],
+      "minimac4": [.3529,.4132,.5048,.6013,.6663,.7367,.8323,.8803,.9112]}
 # 2c: HGDP out-of-panel per-region per-sample R2 (Table 2c genome-wide)
 regions = ["Oceanian*","Mid-East*","African","E.Asian","C/S.Asian","European","Adm.Amer."]
 hgdp_s = [.8984,.9386,.8778,.9506,.9465,.9572,.9626]
@@ -40,13 +43,16 @@ lc = {"selphi":[.9924,.9950,.9971,.9979],"glimpse2":[.9916,.9945,.9967,.9975],"q
 
 fig, ax = plt.subplots(2, 2, figsize=(9.2, 7.0))
 
-# (a) 1KG four-way
+# (a) 1KG five-way, imputation-only (all tools from the identical phased target + panel)
 a = ax[0,0]
-for k,lab,m in [("selphi","Selphi 2","o"),("beagle","Beagle 5.5","s"),("impute5","IMPUTE5","^"),("minimac4","Minimac4","D")]:
-    a.plot(x, t1[k], marker=m, ms=4, lw=1.6, color=C[k], label=lab)
+for k,lab,m,lw in [("impute5","IMPUTE5","^",1.4),("minimac4","Minimac4","D",1.4),
+                   ("beagle","Beagle 5.5","s",1.4),("selphi153","Selphi 1.5.3","v",1.4),
+                   ("selphi","Selphi 2","o",2.1)]:
+    a.plot(x, t1[k], marker=m, ms=4, lw=lw, color=C[k], label=lab,
+           zorder=5 if k=="selphi" else 3)
 a.set_xticks(x); a.set_xticklabels(maf_lbl, rotation=45, ha="right")
 a.set_ylabel("Imputation R²"); a.set_xlabel("Minor allele frequency (%)")
-a.set_title("(a) 1000 Genomes genome-wide, four-way", loc="left", fontweight="bold")
+a.set_title("(a) 1000 Genomes genome-wide, imputation-only", loc="left", fontweight="bold")
 a.legend(frameon=False, loc="lower right"); a.grid(alpha=.25, lw=.5)
 
 # (b) MESA per-sample R2 by ancestry: Selphi 2 vs Beagle 5.5 (competitive, per-sample)
