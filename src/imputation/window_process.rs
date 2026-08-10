@@ -225,7 +225,12 @@ pub fn process_window_hmm(
                     n_rows: n_var_w,
                     n_cols: n_ref,
                 };
-                return (tgt, HmmResult { weights: vec![(tgt, empty)], hap_posterior: None });
+                // The tuple's `.0` is the weight block's START CHIP SITE (this
+                // window has a single block, `breaks_w = [(0, n_var_w)]`, so it is
+                // always 0) — NOT the target-hap index. Every consumer currently
+                // reads `w[0].1` only, but emitting `tgt` here would be a live bug
+                // the moment one of them starts honouring the offset.
+                return (tgt, HmmResult { weights: vec![(0, empty)], hap_posterior: None });
             }
             let is_full = n_cand < FULL_PANEL_HMM_THRESHOLD;
             let m_red = if is_full { m } else { n_cand + 1 };
