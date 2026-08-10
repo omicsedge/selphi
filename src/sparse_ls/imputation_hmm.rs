@@ -1545,8 +1545,9 @@ mod tests {
         // HL: confident allele-1 at site0, neutral elsewhere.
         // HL layout: HL[2l]=P(hap allele 0), HL[2l+1]=P(hap allele 1).
         let mut hl = vec![0.5f32; 2 * n_sites];
-        hl[2 * 0] = 0.01; // site0 very unlikely allele 0
-        hl[2 * 0 + 1] = 0.99; // site0 very likely allele 1
+        // site 0 → HL indices 0 (allele 0) and 1 (allele 1).
+        hl[0] = 0.01; // site0 very unlikely allele 0
+        hl[1] = 0.99; // site0 very likely allele 1
         let flat = vec![false; n_sites];
 
         let mut hp = vec![0.0f32; 2 * n_sites];
@@ -1557,7 +1558,7 @@ mod tests {
         // The site-0 posterior should lean toward allele 1 given the strong GL +
         // err_imp=1e-12 (near-deterministic emission).
         assert!(
-            hp[2 * 0 + 1] > hp[2 * 0],
+            hp[1] > hp[0],
             "site0 HP should favor allele 1: {:?}",
             &hp[0..2]
         );
