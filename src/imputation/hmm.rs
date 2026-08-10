@@ -622,6 +622,23 @@ fn finalize_weights(
                 weights[base + j] = 0.0;
             }
         }
+
+        // The threshold above discards mass WITHOUT renormalising, so each row's
+        // surviving sum is 1 - (truncated mass) and differs from row to row.
+        // Interpolation divides by `(1-t)*Sum_w(start) + t*Sum_w(end)`, so a row that
+        // lost more mass is slightly down-weighted against its neighbour; and summing
+        // CSRs across phase-ensemble members is a mass-weighted, not arithmetic, mean
+        // of the member dosages. `SELPHI_HMM_RENORM=1` restores Sum = 1 per row and
+        // makes both exact. Measured R2-neutral on chr22 801s (OVERALL 0.4776
+        // unchanged, per-sample 0.915204 -> 0.915205), so it stays opt-in and the
+        // default output is byte-identical.
+        if crate::config::is_one("SELPHI_HMM_RENORM") {
+            let kept: f64 = weights[base..base + n_states].iter().map(|&v| v as f64).sum();
+            if kept > 0.0 {
+                let re = (1.0 / kept) as f32;
+                for v in weights[base..base + n_states].iter_mut() { *v *= re; }
+            }
+        }
     }
 
     build_csr_from_weights(weights, n_rows, n_states, n_hid, state_to_hap, group_members)
