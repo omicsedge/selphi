@@ -47,6 +47,17 @@ fn compute_em_stats_f32(
     bwd: &mut Vec<f32>, saved_bwd: &mut Vec<f32>, fwd: &mut Vec<f32>,
     al_match: &mut Vec<u8>,
 ) -> (i32, f64, f64, f64) {
+    // The SIMD EM kernels stage `ev`/`old_fwd` in `[f32; N_MOSAIC]` STACK arrays and
+    // index them by state, so `n_states` must never exceed N_MOSAIC or they write
+    // past the frame. `build_comp` caps its return at the `nmo` it is given and every
+    // caller passes `nmo = N_MOSAIC`, so this holds — assert it rather than leave it
+    // as an unwritten invariant one refactor away from stack corruption.
+    debug_assert!(
+        n_states <= super::N_MOSAIC,
+        "n_states {} exceeds N_MOSAIC {} — SIMD EM kernels would overflow their stack buffers",
+        n_states, super::N_MOSAIC
+    );
+
     // Pre-compute mismatch flags for ALL markers.
     // Extracts discord bytes ONCE; both backward and forward read from this.
     // Key: don't zero — just resize (reuses previous allocation).

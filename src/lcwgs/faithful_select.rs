@@ -383,7 +383,8 @@ mod tests {
         // gl3: a couple of confident hets, rest flat.
         let mut gl3 = vec![1.0f32 / 3.0; n_var * n_samples * 3];
         for s in 0..n_samples {
-            let b = 0 * n_samples * 3 + 3 * s;
+            // variant 0 → row base 0; sample `s` occupies the 3 entries at 3*s.
+            let b = 3 * s;
             gl3[b] = 0.05;
             gl3[b + 1] = 0.90;
             gl3[b + 2] = 0.05;
