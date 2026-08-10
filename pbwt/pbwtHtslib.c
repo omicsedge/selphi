@@ -147,7 +147,13 @@ PBWT *pbwtReadVcfGT (char *filename) {
           Site *s = arrayp(p->sites, p->N++, Site);
           s->x = pos;
           s->varD = variation(p, REF, ALT);
+          
+          /* free ALT string if it was allocated */
+          if (!no_alt && ALT) { free(ALT); ALT = NULL; }
         }
+
+      /* free REF string after processing all alleles for this line */
+      if (REF) { free(REF); REF = NULL; }
 
       if (nCheckPoint && !(p->N % nCheckPoint))  pbwtCheckPoint (u, p) ;
     }

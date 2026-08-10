@@ -1,4 +1,7 @@
-CFLAGS= -g -O3 --signed-char
+CFLAGS= -O3 --signed-char
+ifeq ($(DEBUG), 1)
+CFLAGS += -g -fsanitize=address
+endif
 CPPFLAGS=-I$(HTSDIR)
 HTSLIB=$(HTSDIR)/libhts.a
 LDLIBS=-pthread $(HTSLIB) -lz -lm -lbz2 -llzma -lcurl -lzip
