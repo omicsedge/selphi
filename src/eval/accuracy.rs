@@ -204,8 +204,14 @@ pub fn site_r2(ds: &[f32], gt: &[f32], n: usize) -> (f64, f64) {
     let num = nf * sum_dg - sum_d * sum_g;
     let den_x = nf * sum_d2 - sum_d * sum_d;
     let den_y = nf * sum_g2 - sum_g * sum_g;
-    let den = (den_x * den_y).max(0.0).sqrt();
-    let r2 = if den > 0.0 { (num / den).powi(2) } else { f64::NAN };
+    // Clamp each variance term at zero BEFORE multiplying, and clamp r² to [0, 1]
+    // — the same guards `SampleAccumulator::compute_r2` already applies. Clamping
+    // only the product lets a site where BOTH terms round to a tiny negative
+    // (dosages and truth both effectively constant) produce a tiny positive
+    // denominator and hence an unbounded r² > 1 that would then be summed into the
+    // MAF-bin means.
+    let den = (den_x.max(0.0) * den_y.max(0.0)).sqrt();
+    let r2 = if den > 0.0 { (num / den).powi(2).clamp(0.0, 1.0) } else { f64::NAN };
 
     // Concordance
     let mut correct = 0u32;
