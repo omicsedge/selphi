@@ -108,6 +108,11 @@ pub fn run_phase_common_bm(
     // sample). Used by the intra-run phase ensemble (Route A). None = no capture.
     main_samples: Option<&mut Vec<Vec<(Vec<u8>, Vec<u8>)>>>,
 ) {
+    // SELPHI_DIPLOID_DISPATCH_DIAG: per-run counters (see hmm_segment.rs).
+    if rare_dispatch_diag() {
+        DIAG_SKIP_WINDOW_HEAD.store(0, Ordering::Relaxed);
+        DIAG_SKIP_SEG_HEAD.store(0, Ordering::Relaxed);
+    }
     let n_haps = n_samples * 2;
     let n_haps_total = n_ref + n_haps;
     let stages = expand_scheme(&parse_mcmc_scheme(scheme));
@@ -817,4 +822,10 @@ fn _run_iterations(
         sampling::solve(graph);
     }
 
+    if rare_dispatch_diag() {
+        eprintln!("[selphi] diploid dispatch diag: forward rare-hom skips at window head \
+                   (INIT shadowed) = {}, at segment head (COLLAPSE shadowed) = {}",
+            DIAG_SKIP_WINDOW_HEAD.load(Ordering::Relaxed),
+            DIAG_SKIP_SEG_HEAD.load(Ordering::Relaxed));
+    }
 }
