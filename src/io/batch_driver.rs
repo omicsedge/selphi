@@ -49,6 +49,11 @@ pub struct WindowBatchInput<'a> {
     /// R3 --refine: chip sites with confidence `< refine_thr` re-route to the
     /// imputed output branch. Ignored when `site_conf` is `None`.
     pub refine_thr: f64,
+    /// SELPHI_INTERP_CM: per-reference-variant cumulative floored cM
+    /// (`genmap::cumulative_cm_floored`) — the interpolation fraction t becomes
+    /// linear in cM between anchors instead of variant ordinal. `None` (default)
+    /// keeps the rank-linear t byte-identical.
+    pub interp_cum_cm: Option<&'a [f64]>,
 }
 
 /// One batch's sample / haplotype range (haps = 2 × samples).
@@ -214,6 +219,7 @@ pub fn run_window<S: BatchSink>(
     site_conf: Option<&[f64]>,
     site_conf_per_sample: Option<&[f64]>,
     refine_thr: f64,
+    interp_cum_cm: Option<&[f64]>,
 ) -> std::io::Result<()> {
     use crate::srp::TILE_ROWS;
 
@@ -358,7 +364,9 @@ pub fn run_window<S: BatchSink>(
                 while ts < n {
                     let tn = (n - ts).min(tile_size);
                     let gs = iv.wgs_start + ts;
-                    let t_vals: Vec<f32> = (0..tn).map(|v| (ts + v) as f32 / full_range).collect();
+                    let t_vals: Vec<f32> = interp_cum_cm
+                        .and_then(|cum| crate::io::pipeline::cm_t_values(cum, iv.wgs_start, iv.wgs_end, ts, tn))
+                        .unwrap_or_else(|| (0..tn).map(|v| (ts + v) as f32 / full_range).collect());
                     let alt_probs = crate::io::pipeline::interpolate_tile_batch(
                         &stripe_tiles, b_first_stripe, n_tiled_variants, n_tile_cols,
                         weights, iv.weight_s, iv.weight_e, gs, tn, &t_vals, n_haps_in_batch,
@@ -386,7 +394,9 @@ pub fn run_window<S: BatchSink>(
             while ts < n {
                 let tn = (n - ts).min(tile_size);
                 let gs = iv.wgs_start + ts;
-                let t_vals: Vec<f32> = (0..tn).map(|v| (ts + v) as f32 / full_range).collect();
+                let t_vals: Vec<f32> = interp_cum_cm
+                    .and_then(|cum| crate::io::pipeline::cm_t_values(cum, iv.wgs_start, iv.wgs_end, ts, tn))
+                    .unwrap_or_else(|| (0..tn).map(|v| (ts + v) as f32 / full_range).collect());
                 let alt_probs = crate::io::pipeline::interpolate_tile_preloaded(
                     &chunk_cache, window_first_chunk, weights,
                     iv.weight_s, iv.weight_e, gs, tn, &t_vals, n_haps_in_batch, chunk_size,

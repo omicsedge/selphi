@@ -862,6 +862,12 @@ pub struct WindowInput<'a> {
     /// R3 --refine: chip sites with confidence `< refine_thr` re-route to the
     /// imputed output branch. Ignored when `site_conf` is `None`.
     pub refine_thr: f64,
+    /// SELPHI_INTERP_CM: cumulative floored genetic position per reference
+    /// variant (`genmap::cumulative_cm_floored`, length `n_ref_variants`) —
+    /// the interpolation fraction t becomes linear in cM between the interval's
+    /// anchors instead of variant ordinal. `None` (default) keeps the
+    /// rank-linear t byte-identical.
+    pub interp_cum_cm: Option<&'a [f64]>,
 }
 
 /// Active output sinks. Only the ones requested by `OutputFormats` are
@@ -907,6 +913,7 @@ pub fn write_window_multiformat(
         srp, all_weights, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples, chip_genotypes, no_ap,
         preloaded_chunks, preloaded_stripes, site_conf, site_conf_per_sample, refine_thr,
+        interp_cum_cm,
     } = input;
     let WindowWriters { parquet: parquet_writer, pgen: pgen_writer, selfdecode: sd_writer, vcf_tx } = writers;
 
@@ -1137,7 +1144,7 @@ pub fn write_window_multiformat(
         let mut next_io_handle: Option<std::thread::JoinHandle<std::io::Result<crate::srp::tiled::PreloadedStripes>>> = None;
 
         #[allow(clippy::upper_case_acronyms)]
-        struct BTD { ts: usize, tile_n: usize, gs: usize, ws: usize, we: usize, full_range: f32 }
+        struct BTD { ts: usize, tile_n: usize, gs: usize, ws: usize, we: usize, full_range: f32, iv_end: usize }
 
         for (bi, &(bstart, bend)) in batches.iter().enumerate() {
             let batch_ivs = &setup.intervals[bstart..bend];
@@ -1201,7 +1208,7 @@ pub fn write_window_multiformat(
                 while ts < n {
                     let tn = (n - ts).min(tile_size);
                     all_descs.push(BTD { ts, tile_n: tn, gs: iv.wgs_start + ts,
-                        ws: iv.weight_s, we: iv.weight_e, full_range: n as f32 });
+                        ws: iv.weight_s, we: iv.weight_e, full_range: n as f32, iv_end: iv.wgs_end });
                     ts += tn;
                     cnt += 1;
                 }
@@ -1209,7 +1216,10 @@ pub fn write_window_multiformat(
             }
 
             let all_tiles: Vec<Vec<f32>> = all_descs.par_iter().map(|desc| {
-                let t: Vec<f32> = (0..desc.tile_n).map(|v| (desc.ts + v) as f32 / desc.full_range).collect();
+                // Interval anchors sit at variant indices `gs - ts` and `iv_end`.
+                let t: Vec<f32> = interp_cum_cm
+                    .and_then(|cum| cm_t_values(cum, desc.gs - desc.ts, desc.iv_end, desc.ts, desc.tile_n))
+                    .unwrap_or_else(|| (0..desc.tile_n).map(|v| (desc.ts + v) as f32 / desc.full_range).collect());
                 interpolate_tile_batch(
                     &stripe_tiles, b_first_stripe, n_tiled_variants, n_tile_cols,
                     &setup.weight_refs, desc.ws, desc.we,
@@ -1308,7 +1318,9 @@ pub fn write_window_multiformat(
             while ts < n_total_vars {
                 let tn = (n_total_vars - ts).min(tile_size);
                 let gs = interval.wgs_start + ts;
-                let t_vals: Vec<f32> = (0..tn).map(|v| (ts + v) as f32 / full_range).collect();
+                let t_vals: Vec<f32> = interp_cum_cm
+                    .and_then(|cum| cm_t_values(cum, interval.wgs_start, interval.wgs_end, ts, tn))
+                    .unwrap_or_else(|| (0..tn).map(|v| (ts + v) as f32 / full_range).collect());
                 let alt_probs = interpolate_tile_preloaded(
                     &chunk_cache, window_first_chunk, &setup.weight_refs,
                     interval.weight_s, interval.weight_e,
@@ -1328,6 +1340,29 @@ pub fn write_window_multiformat(
     crate::selphi_debug!("  [multiformat] interp+encode={:.2}s", total_secs);
 
     Ok(())
+}
+
+/// SELPHI_INTERP_CM tile fractions: t linear in cumulative genetic position
+/// between the interval's anchor variants `[iv_start, iv_end]` instead of
+/// variant ordinal. `cum` is the floored cumulative cM
+/// (`genmap::cumulative_cm_floored`), so the anchor span is `>= 1e-7 cM ×
+/// (iv_end - iv_start) > 0` and `t == 0.0` exactly at the left anchor.
+/// Computed in f64, clamped to [0,1], stored f32.
+///
+/// Returns `None` when `iv_end` is not a variant index (the trailing interval
+/// ends at `n_ref_variants`, one past the last variant): there
+/// `weight_s == weight_e` makes t inert, so the caller keeps the rank-linear t.
+pub(crate) fn cm_t_values(
+    cum: &[f64],
+    iv_start: usize, iv_end: usize,
+    ts: usize, tn: usize,
+) -> Option<Vec<f32>> {
+    if iv_end >= cum.len() { return None; }
+    let c0 = cum[iv_start];
+    let span = cum[iv_end] - c0;
+    Some((0..tn)
+        .map(|v| (((cum[iv_start + ts + v] - c0) / span).clamp(0.0, 1.0)) as f32)
+        .collect())
 }
 
 pub fn interpolate_tile_preloaded(

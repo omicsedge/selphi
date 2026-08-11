@@ -141,6 +141,27 @@ fn strip_chr(s: &str) -> &str {
     s.strip_prefix("chr").unwrap_or(s)
 }
 
+/// Cumulative genetic position per variant, with Beagle's floored construction
+/// (ImpData.cumPos): `cum[0] = 0`, `cum[j] = cum[j-1] + max(|cm[j]-cm[j-1]|, 1e-7)`.
+///
+/// The strictly positive per-step floor keeps every inter-variant span nonzero,
+/// so a flat (or empty) map region degrades to uniform rank spacing and any
+/// anchor-to-anchor denominator built from `cum` is nonzero by construction.
+/// Used by the SELPHI_INTERP_CM interpolation (io/pipeline.rs, io/batch_driver.rs).
+pub fn cumulative_cm_floored(map_bp: &[i64], map_cm: &[f64], positions: &[i64]) -> Vec<f64> {
+    use rayon::prelude::*;
+    const MIN_CM_DIST: f64 = 1e-7;
+    if positions.is_empty() { return Vec::new(); }
+    let gen_pos: Vec<f64> = positions.par_iter()
+        .map(|&bp| interpolate_cm(map_bp, map_cm, bp))
+        .collect();
+    let mut cum = vec![0.0f64; positions.len()];
+    for j in 1..gen_pos.len() {
+        cum[j] = cum[j - 1] + (gen_pos[j] - gen_pos[j - 1]).abs().max(MIN_CM_DIST);
+    }
+    cum
+}
+
 /// Linear interpolation of a single BP position.
 ///
 /// Clamps to map range (safe for imputation, used by chip phasing).

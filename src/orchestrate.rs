@@ -385,6 +385,13 @@ pub fn run_multi_chr(
     let multi_map = load_maps(config, &chromosomes, map_path)?;
     selphi_info!("");
 
+    // SELPHI_INTERP_CM: read once here (never in the per-tile loops); the
+    // per-chr cumulative-cM array is built inside the chromosome loop.
+    let interp_cm_enabled = selphi::config::is_one("SELPHI_INTERP_CM");
+    if interp_cm_enabled {
+        selphi_step!("SELPHI_INTERP_CM: interpolating untyped sites in genetic distance (cM)");
+    }
+
     // 3b. Refuse to silently impute a chromosome at cM=0. Every chromosome present
     // in BOTH the reference panel and the target (i.e. one that will actually be
     // imputed) must have a genetic map; without one, interpolate_for_chr falls back
@@ -521,6 +528,19 @@ pub fn run_multi_chr(
         } else {
             genmap::compute_ld_correction_bm(&ref_bm_imp, &raw_chip_cm, n_chip, n_ref, 100)
         };
+
+        // SELPHI_INTERP_CM: cumulative floored genetic position for EVERY panel
+        // variant of this chromosome (anchors t in cM instead of variant ordinal).
+        // An absent map degrades to all-zero cM → the 1e-7 floor reproduces the
+        // rank-linear spacing (same fallback as interpolate_for_chr).
+        let interp_cum_cm: Option<Vec<f64>> = if interp_cm_enabled {
+            let key = chr_name.strip_prefix("chr").unwrap_or(chr_name);
+            let (map_bp, map_cm) = multi_map.get(key).or_else(|| multi_map.get(chr_name))
+                .map(|(bp, cm)| (bp.as_slice(), cm.as_slice()))
+                .unwrap_or((&[], &[]));
+            let ref_bp: Vec<i64> = srp.variants.iter().map(|v| v.pos).collect();
+            Some(genmap::cumulative_cm_floored(map_bp, map_cm, &ref_bp))
+        } else { None };
 
         // Auto-calibrate parameters — shared verbatim with the single-chr
         // pipeline so the two impute paths cannot drift in match_length / fl_fwd
@@ -716,6 +736,7 @@ pub fn run_multi_chr(
                     site_conf: None,
                     site_conf_per_sample: None,
                     refine_thr: 0.5,
+                    interp_cum_cm: interp_cum_cm.as_deref(),
                 },
                 selphi::io::pipeline::WindowWriters {
                     // Per-chr parquet/pgen/selfdecode not wired yet in multi-chr mode.
