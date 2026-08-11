@@ -4,6 +4,7 @@
 //! that are used by the interpolation step to compute dosages.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use crate::selphi_debug;
 use crate::imputation::pbwt::CscMatchMatrix;
 use crate::imputation::hap_dedup::{self, DedupResult};
@@ -13,6 +14,75 @@ use crate::imputation::match_processing;
 thread_local! {
     static TL_FWD_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     static TL_WGT_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
+// ---------------------------------------------------------------------------
+// A/B knobs — OnceLock-cached: `calculate_weights` runs once per target hap
+// per window, so the env (a global lock) must not be re-read there.
+// ---------------------------------------------------------------------------
+
+/// Cached `SELPHI_NO_P10_FILTER`: keep EVERY matched haplotype (skip the
+/// 10th-percentile eviction in `filter_matches_fast`) while still deriving
+/// `p_err` from the same cutoff — isolates the filter from the error rate.
+fn no_p10_filter() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| crate::config::is_one("SELPHI_NO_P10_FILTER"))
+}
+
+/// Cached `SELPHI_PERR_OVERRIDE`: replaces the cutoff-derived emission error
+/// rate outright, bypassing BOTH the 1e-4 floor and the `--p-err` CLI floor
+/// (`min_perr`), so p_err can be swept below the 0.025 default. None = unset.
+fn perr_override() -> Option<f64> {
+    use std::sync::OnceLock;
+    static V: OnceLock<Option<f64>> = OnceLock::new();
+    *V.get_or_init(|| crate::config::raw("SELPHI_PERR_OVERRIDE").and_then(|s| s.parse::<f64>().ok()))
+}
+
+/// Cached `SELPHI_PRUNE_THRESH`: the row-mass fraction below which `prune_row`
+/// zeroes a state when n_states > 5000. Default 0.005 = the shipped constant.
+fn prune_thresh_frac() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| crate::config::f64_or("SELPHI_PRUNE_THRESH", 0.005))
+}
+
+/// Cached `SELPHI_PRUNE_DIAG` flag: gates the surviving-state / CSR-nnz
+/// counters so the production row loops carry only a local-bool branch.
+fn prune_diag() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| crate::config::is_one("SELPHI_PRUNE_DIAG"))
+}
+
+// `SELPHI_PRUNE_DIAG` aggregators: relaxed per-hap adds from the rayon pool,
+// drained once per window by `prune_diag_report`. SURV_* counts post-prune
+// nonzero states over every row `prune_row` ran on (forward AND backward
+// passes, so each chip row contributes ~twice per hap); NNZ_*/CSR_ROWS are
+// the final CSR totals (post 1/(n_states+1) threshold); STATES_SUM/CALLS give
+// the mean HMM state count for context (survivors ≪ states ⇒ the prune binds).
+static PRUNE_SURV_SUM: AtomicU64 = AtomicU64::new(0);
+static PRUNE_SURV_ROWS: AtomicU64 = AtomicU64::new(0);
+static PRUNE_NNZ_SUM: AtomicU64 = AtomicU64::new(0);
+static PRUNE_CSR_ROWS: AtomicU64 = AtomicU64::new(0);
+static PRUNE_STATES_SUM: AtomicU64 = AtomicU64::new(0);
+static PRUNE_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Print + reset the `SELPHI_PRUNE_DIAG` aggregate. Called once per window
+/// (from `process_window_hmm`, after all target haps); no-op unless set.
+pub fn prune_diag_report(chip_start: usize, chip_end: usize) {
+    if !prune_diag() { return; }
+    let surv = PRUNE_SURV_SUM.swap(0, AtomicOrdering::Relaxed);
+    let surv_rows = PRUNE_SURV_ROWS.swap(0, AtomicOrdering::Relaxed);
+    let nnz = PRUNE_NNZ_SUM.swap(0, AtomicOrdering::Relaxed);
+    let csr_rows = PRUNE_CSR_ROWS.swap(0, AtomicOrdering::Relaxed);
+    let states = PRUNE_STATES_SUM.swap(0, AtomicOrdering::Relaxed);
+    let calls = PRUNE_CALLS.swap(0, AtomicOrdering::Relaxed);
+    let mean = |num: u64, den: u64| if den > 0 { num as f64 / den as f64 } else { 0.0 };
+    crate::selphi_info!(
+        "  [PRUNE-DIAG] window {}..{}: hmm_calls={} mean_states={:.1} mean_surviving_per_row={:.1} ({} rows) mean_csr_nnz_per_row={:.2} ({} rows)",
+        chip_start, chip_end, calls, mean(states, calls),
+        mean(surv, surv_rows), surv_rows, mean(nnz, csr_rows), csr_rows);
 }
 
 // ---------------------------------------------------------------------------
@@ -39,11 +109,20 @@ impl CsrWeights {
 // ---------------------------------------------------------------------------
 
 /// Filter matches by keeping only haplotypes above 10th percentile frequency.
+///
+/// The percentile cutoff has TWO entangled effects: it evicts low-count haps
+/// AND it sets the emission error rate (`p_err = cutoff/n_sites`, floored).
+/// `SELPHI_NO_P10_FILTER=1` disables only the eviction (p_err unchanged);
+/// `SELPHI_PERR_OVERRIDE` replaces only p_err (filter unchanged) — together
+/// they let each effect be A/B'd on its own.
 fn filter_matches_fast(
     ordered_matches: &[Vec<i64>],
     n_ref_haps: usize,
     min_perr: f64,
 ) -> (Vec<Vec<i64>>, f64) {
+    let no_filter = no_p10_filter();
+    let p_err_override = perr_override();
+
     // Count occurrences per haplotype
     let mut counts = vec![0u32; n_ref_haps];
     for site in ordered_matches {
@@ -54,7 +133,8 @@ fn filter_matches_fast(
 
     let mut nonzero_counts: Vec<u32> = counts.iter().copied().filter(|&c| c > 0).collect();
     if nonzero_counts.is_empty() {
-        return (ordered_matches.to_vec(), min_perr.max(0.0001));
+        let p_err = p_err_override.unwrap_or_else(|| min_perr.max(0.0001));
+        return (ordered_matches.to_vec(), p_err);
     }
 
     // 10th percentile
@@ -64,7 +144,15 @@ fn filter_matches_fast(
     let cutoff = nonzero_counts[p10_idx].min(nonzero_counts[nonzero_counts.len() - 1] - 1);
 
     let n_sites = ordered_matches.len();
-    let p_err = (cutoff as f64 / n_sites as f64).max(0.0001).max(min_perr);
+    // The override bypasses both floors: `min_perr` is the CLI `--p-err`
+    // (default 0.025), normally a FLOOR here, so sweeping p_err down to ~1e-4
+    // is impossible without it.
+    let p_err = p_err_override
+        .unwrap_or_else(|| (cutoff as f64 / n_sites as f64).max(0.0001).max(min_perr));
+
+    if no_filter {
+        return (ordered_matches.to_vec(), p_err);
+    }
 
     let is_kept: Vec<bool> = counts.iter().map(|&c| c > cutoff).collect();
 
@@ -302,6 +390,9 @@ fn compute_forward(
     }
     let mut last_sum = if init_alpha.is_some() { init_last_sum } else { 1.0 };
 
+    let diag = prune_diag();
+    let (mut diag_surv, mut diag_rows) = (0u64, 0u64);
+
     // Forward iterations — f32 for 2× cache + 2× SIMD width.
     for row in 1..n_rows {
         let chip_idx = start + row - 1;
@@ -362,6 +453,15 @@ fn compute_forward(
 
         // State pruning for large panels
         prune_row(cur, last_sum, prune_threshold);
+        if diag {
+            diag_surv += cur.iter().filter(|&&v| v > 0.0).count() as u64;
+            diag_rows += 1;
+        }
+    }
+
+    if diag && diag_rows > 0 {
+        PRUNE_SURV_SUM.fetch_add(diag_surv, AtomicOrdering::Relaxed);
+        PRUNE_SURV_ROWS.fetch_add(diag_rows, AtomicOrdering::Relaxed);
     }
 
     // Boundary condition for last block
@@ -454,6 +554,9 @@ fn streaming_backward_combine(
     }
     let mut last_sum = if init_beta.is_some() { init_last_sum } else { 1.0 };
 
+    let diag = prune_diag();
+    let (mut diag_surv, mut diag_rows) = (0u64, 0u64);
+
     // Combine last row: weights[n_rows-1] = fwd[n_rows-1] * bwd[n_rows-1]
     {
         let fwd_base = (n_rows - 1) * n_states;
@@ -510,6 +613,10 @@ fn streaming_backward_combine(
             last_sum = row_sum;
 
             prune_row(&mut cur_bwd, last_sum, prune_threshold);
+            if diag {
+                diag_surv += cur_bwd.iter().filter(|&&v| v > 0.0).count() as u64;
+                diag_rows += 1;
+            }
         }
 
         // Combine: weights[row] = fwd[row] * cur_bwd — branch-free, auto-vectorizes
@@ -533,6 +640,11 @@ fn streaming_backward_combine(
             weights[j] = fwd[j] * next_bwd[j];
         }
         last_sum = 1.0;
+    }
+
+    if diag && diag_rows > 0 {
+        PRUNE_SURV_SUM.fetch_add(diag_surv, AtomicOrdering::Relaxed);
+        PRUNE_SURV_ROWS.fetch_add(diag_rows, AtomicOrdering::Relaxed);
     }
 
     // Output beta (first row of backward = next_bwd after final swap)
@@ -805,9 +917,15 @@ pub fn calculate_weights(
     // n_hid = total reference haplotypes (NOT reduced n_states)
     let (f_precomb, r_precomb) = compute_precomb(distances_cm, &n_haps_per_site, est_ne, n_ref_haps, ne_per_site);
 
-    // 8. Pruning threshold
+    // 8. Pruning threshold. Above 5000 states every row of both HMM passes is
+    // pruned to states holding ≥ this fraction of row mass (default 0.005 →
+    // at most ~200 survivors/row — exactly the regime auto-mc deliberately
+    // grows the candidate set into; SELPHI_PRUNE_THRESH makes the fraction
+    // A/B-tunable). The .max(1/n_states) arm is unreachable at the default for
+    // n_states > 5000 (1/n_states < 2e-4 < 0.005); it stays to floor a
+    // configured fraction below one uniform state's share of the row.
     let prune_threshold = if n_states > 5000 {
-        (0.005f64).max(1.0 / n_states as f64)
+        prune_thresh_frac().max(1.0 / n_states as f64)
     } else {
         0.0
     };
@@ -1005,6 +1123,15 @@ pub fn calculate_weights(
 
     // Reverse to ascending order by start
     results.reverse();
+
+    if prune_diag() {
+        let nnz: u64 = results.iter().map(|(_, c)| c.nnz() as u64).sum();
+        let rows: u64 = results.iter().map(|(_, c)| c.n_rows as u64).sum();
+        PRUNE_NNZ_SUM.fetch_add(nnz, AtomicOrdering::Relaxed);
+        PRUNE_CSR_ROWS.fetch_add(rows, AtomicOrdering::Relaxed);
+        PRUNE_STATES_SUM.fetch_add(n_states as u64, AtomicOrdering::Relaxed);
+        PRUNE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+    }
 
     // Build hap_posterior only when requested (cross-window passthrough).
     // On the last window this is never consumed — skip the n_ref_haps f64 alloc.

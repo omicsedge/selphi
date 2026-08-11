@@ -351,5 +351,9 @@ pub fn process_window_hmm(
         }
     }
 
+    // SELPHI_PRUNE_DIAG: drain + print the window's aggregated pruning stats
+    // (no-op unless the knob is set).
+    super::hmm::prune_diag_report(chip_start, chip_start + n_var_w);
+
     WindowHmmOutput { all_weights }
 }
