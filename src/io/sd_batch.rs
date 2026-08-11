@@ -132,11 +132,12 @@ pub fn write_window_sd_batched(
     let WindowBatchInput {
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples_total, chip_genotypes, no_ap: _, site_conf, site_conf_per_sample, refine_thr,
+        interp_cum_cm,
     } = input;
     let mut sink = SdSink { bw, gt1: Vec::new(), gt2: Vec::new(), ap1: Vec::new(), ap2: Vec::new(), hc_mask: Vec::new() };
     crate::io::batch_driver::run_window(
         &mut sink, srp.as_ref(), weights, hap_start, hap_end,
         win_chip_start, own_chip_start, own_chip_end, wgs_idx, n_samples_total, chip_genotypes,
-        site_conf, site_conf_per_sample, refine_thr,
+        site_conf, site_conf_per_sample, refine_thr, interp_cum_cm,
     )
 }

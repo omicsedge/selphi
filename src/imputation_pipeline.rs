@@ -1135,6 +1135,18 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         }
     }
 
+    // SELPHI_INTERP_CM: cumulative floored genetic position for EVERY panel
+    // variant — untyped-site interpolation becomes linear in cM between its
+    // flanking anchors (Beagle/IMPUTE5/minimac semantics) instead of variant
+    // ordinal. Built once per chromosome; the knob is read once here (never in
+    // the per-tile loops). None (default) keeps the rank-linear t byte-identical.
+    let interp_cum_cm: Option<Vec<f64>> = if selphi::config::is_one("SELPHI_INTERP_CM") {
+        let (map_bp_raw, map_cm_raw) = genmap::load_genetic_map_raw(Path::new(map_path))
+            .unwrap_or_else(|e| { selphi_error!("Cannot read genetic map {}: {}", map_path, e); std::process::exit(1); });
+        selphi_step!("SELPHI_INTERP_CM: interpolating untyped sites in genetic distance (cM)");
+        Some(genmap::cumulative_cm_floored(&map_bp_raw, &map_cm_raw, &ref_positions))
+    } else { None };
+
     // 6b. Phase if input is unphased (in-memory fusion — no VCF round-trip)
     let needs_phasing = !is_phased || args.force_phasing;
     let mut targ_alleles = targ_alleles;
@@ -1543,6 +1555,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                     // R4b: per-(chip-site, sample) confidence for per-sample output.
                     site_conf_per_sample: target_site_conf_per_sample.as_deref(),
                     refine_thr,
+                    interp_cum_cm: interp_cum_cm.as_deref(),
                 };
                 // Find this batch's writer by hap_start, asserting its hap_end matches.
                 macro_rules! find_bi {
@@ -1694,6 +1707,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                 // at re-routed sites — confident samples keep their verbatim call.
                 site_conf_per_sample: target_site_conf_per_sample.as_deref(),
                 refine_thr,
+                interp_cum_cm: interp_cum_cm.as_deref(),
             },
             selphi::io::pipeline::WindowWriters {
                 parquet: parquet_writer.as_mut().map(|(w, s)| (w, &*s)),
