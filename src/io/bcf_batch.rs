@@ -222,6 +222,7 @@ pub fn write_window_bcf_batched(
     let WindowBatchInput {
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples_total, chip_genotypes, no_ap, site_conf, site_conf_per_sample, refine_thr,
+        interp_cum_cm,
     } = input;
     // Intermediate always carries AP1/AP2 (see setup_batch_writers); the merger
     // needs them to count AC, and the final BCF drops AP per --no-ap.
@@ -230,6 +231,6 @@ pub fn write_window_bcf_batched(
     crate::io::batch_driver::run_window(
         &mut sink, srp.as_ref(), weights, hap_start, hap_end,
         win_chip_start, own_chip_start, own_chip_end, wgs_idx, n_samples_total, chip_genotypes,
-        site_conf, site_conf_per_sample, refine_thr,
+        site_conf, site_conf_per_sample, refine_thr, interp_cum_cm,
     )
 }
