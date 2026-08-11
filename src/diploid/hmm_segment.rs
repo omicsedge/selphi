@@ -16,6 +16,8 @@ use std::arch::x86_64::*;
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use super::params::{HAP_NUMBER, ED, EE};
 use super::genotype_graph::*;
 
@@ -140,6 +142,34 @@ fn use_avx512() -> bool {
 unsafe fn neon_hsum8(lo: float32x4_t, hi: float32x4_t) -> f32 {
     unsafe { vaddvq_f32(vaddq_f32(lo, hi)) }
 }
+
+/// `SELPHI_DIPLOID_RARE_DISPATCH=1`: dispatch both forward passes position-first
+/// (INIT / COLLAPSE unconditional, the rare-hom skip applied only in the RUN
+/// position), matching SHAPEIT5's forward() and this file's own backward. The
+/// shipped default tests the skip FIRST, so a skipped locus landing on a window
+/// head shadows INIT (state vector stays zeroed) and one on a segment head
+/// shadows COLLAPSE. The env var is read exactly once.
+pub(crate) fn rare_dispatch_position_first() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::config::is_one("SELPHI_DIPLOID_RARE_DISPATCH"))
+}
+
+/// `SELPHI_DIPLOID_DISPATCH_DIAG=1`: count forward rare-hom skips that land on
+/// window / segment heads under the default skip-first order. The env var is
+/// read exactly once.
+pub(crate) fn rare_dispatch_diag() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::config::is_one("SELPHI_DIPLOID_DISPATCH_DIAG"))
+}
+
+/// Diag counters: forward rare-hom skips shadowing INIT (window head) or
+/// COLLAPSE (segment head), aggregated over samples × iterations × windows for
+/// both the f32 and the f64 forward pass (a window that falls back to f64
+/// contributes to both). Reset + printed per phasing run (phase_common.rs).
+pub(crate) static DIAG_SKIP_WINDOW_HEAD: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DIAG_SKIP_SEG_HEAD: AtomicU64 = AtomicU64::new(0);
 
 /// Segment HMM state for one sample in one window.
 pub struct SegmentHmm {
@@ -975,6 +1005,8 @@ impl SegmentHmm {
 
         let mut prev_abs_locus = abs_locus;
         let bm_ptr = cond_bm.as_ptr();
+        let dispatch_first = rare_dispatch_position_first();
+        let dispatch_diag = rare_dispatch_diag();
 
         for seg in seg_first..=seg_last {
             let seg_len = graph.lengths[seg] as usize;
@@ -993,7 +1025,29 @@ impl SegmentHmm {
                     let target_allele = var_get_hap0(e, byte);
                     let rare = if vi < rare_allele.len() { rare_allele[vi] } else { -1 };
                     let skip_rare = rare >= 0 && (target_allele as i8) != rare;
-                    if skip_rare {
+                    if dispatch_first {
+                        // Position-first order (SHAPEIT5 forward(), and the backward
+                        // below): INIT/COLLAPSE unconditional, skip only in the RUN
+                        // position, where prev_abs_locus stays stale like backward's.
+                        if is_first_seg && is_first_in_seg {
+                            self.init_hom_bm(target_allele, bm_row);
+                            prev_abs_locus = vi;
+                        } else if is_first_in_seg {
+                            let (nt, yt) = self.transition_params_full(vi, prev_abs_locus, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+                            self.collapse_hom_bm(target_allele, bm_row, nt, yt);
+                            prev_abs_locus = vi;
+                        } else if !skip_rare {
+                            let (nt, yt) = self.transition_params_full(vi, prev_abs_locus, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+                            self.run_hom_bm(target_allele, bm_row, nt, yt);
+                            prev_abs_locus = vi;
+                        }
+                    } else if skip_rare {
+                        // Skip-first: a skip on a head locus shadows INIT/COLLAPSE
+                        // (at a window head the state vector stays zeroed).
+                        if dispatch_diag && is_first_in_seg {
+                            let c = if is_first_seg { &DIAG_SKIP_WINDOW_HEAD } else { &DIAG_SKIP_SEG_HEAD };
+                            c.fetch_add(1, Ordering::Relaxed);
+                        }
                     } else if is_first_seg && is_first_in_seg {
                         self.init_hom_bm(target_allele, bm_row);
                         prev_abs_locus = vi;

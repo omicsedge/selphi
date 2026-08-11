@@ -1,8 +1,12 @@
 //! f64 fallback HMM for when f32 underflows.
 //! Scalar (no AVX2) — only used as rare fallback, performance not critical.
 
+use std::sync::atomic::Ordering;
+
 use super::params::{HAP_NUMBER, ED, EE};
 use super::genotype_graph::*;
+use super::hmm_segment::{rare_dispatch_position_first, rare_dispatch_diag,
+    DIAG_SKIP_WINDOW_HEAD, DIAG_SKIP_SEG_HEAD};
 
 const MISMATCH: f64 = (ED / EE) as f64;
 
@@ -346,6 +350,8 @@ impl SegmentHmmF64 {
 
         let mut prev_abs = abs_locus;
         let mut ca = vec![false; n_cond];
+        let dispatch_first = rare_dispatch_position_first();
+        let dispatch_diag = rare_dispatch_diag();
         for seg in seg_first..=seg_last {
             for vrel in 0..graph.lengths[seg] as usize {
                 let vi = abs_locus;
@@ -357,8 +363,23 @@ impl SegmentHmmF64 {
                 if var_is_hom(e, byte) {
                     let ta = var_get_hap0(e, byte);
                     let rare = if vi < rare_allele.len() { rare_allele[vi] } else { -1 };
-                    if rare >= 0 && (ta as i8) != rare {
-                        // skip
+                    if dispatch_first {
+                        // Position-first order (see hmm_segment.rs forward_impl_direct).
+                        if first_seg && first_in {
+                            self.init_hom(ta, &ca); prev_abs = vi;
+                        } else if first_in {
+                            let (nt, yt) = self.transition_params_f64(vi, prev_abs, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+                            self.collapse_hom(ta, &ca, nt, yt); prev_abs = vi;
+                        } else if !(rare >= 0 && (ta as i8) != rare) {
+                            let (nt, yt) = self.transition_params_f64(vi, prev_abs, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+                            self.run_hom(ta, &ca, nt, yt); prev_abs = vi;
+                        }
+                    } else if rare >= 0 && (ta as i8) != rare {
+                        // skip (on a head locus this shadows INIT/COLLAPSE)
+                        if dispatch_diag && first_in {
+                            let c = if first_seg { &DIAG_SKIP_WINDOW_HEAD } else { &DIAG_SKIP_SEG_HEAD };
+                            c.fetch_add(1, Ordering::Relaxed);
+                        }
                     } else if first_seg && first_in {
                         self.init_hom(ta, &ca); prev_abs = vi;
                     } else if first_in {
