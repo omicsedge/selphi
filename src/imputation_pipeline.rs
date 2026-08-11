@@ -478,7 +478,7 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
             // extract the common subset to save RAM); phase_rare falls
             // back to target-only.
             // Intra-run phase ensemble member count: default SELPHI_DIPLOID_INTRA_N
-            // (4), overridden by --phase-ensemble N when N>1, forced to 1 (single
+            // (2), overridden by --phase-ensemble N when N>1, forced to 1 (single
             // Viterbi solve, byte-identical to the pre-intra default) under
             // --sample-batch-size (streaming output) and --phase-only (no imputation).
             let intra_default = selphi::config::usize_or("SELPHI_DIPLOID_INTRA_N", 2).max(1);

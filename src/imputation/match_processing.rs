@@ -14,6 +14,28 @@
 
 use crate::imputation::pbwt::CscMatchMatrix;
 
+// A/B knobs — OnceLock-cached: `process_matches` runs once per target hap per
+// window, so the env (a global lock) must not be re-read there.
+
+/// Cached `SELPHI_MP_MIN_COUNT`: a haplotype must appear MORE than this many
+/// times across the window's per-variant top-K lists to survive the step-8
+/// eviction. Default 1 = the shipped `c > 1`; 0 keeps every hap that appears
+/// at all (eviction disabled).
+fn mp_min_count() -> u32 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| crate::config::usize_or("SELPHI_MP_MIN_COUNT", 1) as u32)
+}
+
+/// Cached `SELPHI_MP_FREQ_WEIGHT`: "0" disables the global-similarity
+/// weighting in `compute_normed_scores` (raw match lengths instead). Default
+/// on — unset or any other value keeps the shipped weighting.
+fn mp_freq_weight() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| crate::config::raw("SELPHI_MP_FREQ_WEIGHT").as_deref() != Some("0"))
+}
+
 /// Process a PBWT match matrix into per-site haplotype lists.
 ///
 /// Processes PBWT match matrix into per-site haplotype lists.
@@ -101,14 +123,17 @@ pub fn process_matches(csc: &CscMatchMatrix, kept_matches: usize) -> Vec<Vec<i64
         &inv_indptr, &inv_indices, &normed, &threshold,
         &csr_indptr, n_var, kept_matches, &missing_source,
     );
-    // 8. Frequency filter: keep haps appearing > 1 time
+    // 8. Frequency filter: keep haps appearing > SELPHI_MP_MIN_COUNT times
+    // (default 1 = evict single-appearance haps; 0 disables the eviction).
+    // The per-variant fallback below keeps all top-K when a site would empty.
     let mut hap_counts = vec![0u32; n_ref];
     for v in 0..n_var {
         for i in 0..n_per_site[v] {
             hap_counts[top_matches[v * kept_matches + i] as usize] += 1;
         }
     }
-    let is_kept: Vec<bool> = hap_counts.iter().map(|&c| c > 1).collect();
+    let min_count = mp_min_count();
+    let is_kept: Vec<bool> = hap_counts.iter().map(|&c| c > min_count).collect();
 
     let mut filtered_matches: Vec<Vec<i64>> = Vec::with_capacity(n_var);
     for v in 0..n_var {
@@ -290,6 +315,17 @@ fn build_inverted_index(starts: &[i32], stops: &[i32], n_var: usize) -> (Vec<i64
 fn compute_normed_scores(
     csr_data: &[i32], csr_indptr: &[i64], n_haps: usize, added_freq: &[i32],
 ) -> Vec<f64> {
+    // SELPHI_MP_FREQ_WEIGHT=0: score each match by its RAW length, skipping
+    // the weighting below (which scales a match by freq ∈ [0.1, 1.0] of its
+    // hap's whole-window total — up to 10× against a globally-dissimilar hap
+    // that matches well in one region). This arm also stands in for the
+    // degenerate rmax == rmin branch: there the weighting is the constant
+    // 0.55, which cancels out of the threshold comparison and the top-K
+    // ordering, so raw length selects identically.
+    if !mp_freq_weight() {
+        return csr_data.iter().map(|&d| d as f64).collect();
+    }
+
     let mut hap_totals = vec![0.0f64; n_haps];
     for h in 0..n_haps {
         let mut total = 0.0;
