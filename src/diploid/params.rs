@@ -1,6 +1,9 @@
 //! Diploid HMM parameters.
 //!
-//! Fixed Ne=15000, ed=0.0001, ee=0.9999 (no EM estimation).
+//! Ne seeds at 15000 but is NOT fixed: phase_common re-estimates it during
+//! burn-in and, on real data, that estimate saturates at its 1e6 clamp, so the
+//! effective switch rate is 0.04*1e6/n_haps per cM unless SELPHI_PHASE_NE or
+//! SELPHI_PHASE_NE_PER_HAP pins it. ed=0.0001, ee=0.9999.
 //! Transition probabilities precomputed from genetic distances.
 
 /// Default effective population size.
