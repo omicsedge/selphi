@@ -452,6 +452,25 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
             selphi_step!("Using Diploid phasing");
             // Common-MAF chip subset (MAF >= 0.001 on target). Diploid runs
             // on common variants only; rare ones are re-imputed by the HMM.
+            // The frequency is the TARGET COHORT's, so the scaffold shrinks with
+            // the batch: at one sample AN is 2 and only heterozygous sites clear
+            // the threshold (1802 of 9283 on chr22 GSA), which starves the
+            // conditioning PBWT of the sites it matches on. SELPHI_DIPLOID_SCAFFOLD_MAF
+            // makes the threshold settable (0 = every called site) to A/B that.
+            let scaffold_maf = selphi::config::f32_or("SELPHI_DIPLOID_SCAFFOLD_MAF", 0.001);
+            // Frequency SOURCE. Default "cohort" keeps the shipped behaviour. "panel"
+            // takes the frequency from the reference panel instead, which is what
+            // "common variant" is supposed to mean and what SHAPEIT5 reads from AC/AN
+            // tags: it removes the batch dependence without removing the filter.
+            // Needs the chip-site panel bitmatrix, which the phase-only path does not
+            // build — there the request is reported and ignored rather than silently
+            // changing which sites are selected.
+            let scaffold_panel =
+                selphi::config::raw("SELPHI_DIPLOID_SCAFFOLD_SOURCE").as_deref() == Some("panel");
+            let panel_bm = if scaffold_panel { ref_bm_full.as_ref() } else { None };
+            if scaffold_panel && panel_bm.is_none() {
+                selphi_info!("    SELPHI_DIPLOID_SCAFFOLD_SOURCE=panel ignored (no chip-site panel bitmatrix on this path)");
+            }
             let common_chip_indices: Vec<usize> = (0..n_chip).into_par_iter().filter(|&v| {
                 // Mask the 128 missing sentinel (and count its AN) so MAF is over called
                 // alleles only — a missing GT must not inflate AC by 128.
@@ -462,9 +481,18 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
                     if a0 <= 1 { ac += a0 as u32; an += 1; }
                     if a1 <= 1 { ac += a1 as u32; an += 1; }
                 }
+                // A site with no called target allele carries no phase information
+                // whatever the frequency source says, so it is dropped either way.
                 if an == 0 { return false; }
+                if let Some(bm) = panel_bm {
+                    let pac: u32 = bm.row(v).iter().map(|w| w.count_ones()).sum();
+                    let pn = bm.n_haps as u32;
+                    if pn == 0 { return false; }
+                    let pmac = pac.min(pn - pac);
+                    return (pmac as f32 / pn as f32) >= scaffold_maf;
+                }
                 let mac = ac.min(an - ac);
-                (mac as f32 / an as f32) >= 0.001f32
+                (mac as f32 / an as f32) >= scaffold_maf
             }).collect();
             let common_ref_bm = if let Some(ref full_bm) = ref_bm_full {
                 selphi::diploid::pbwt_neighbor::HaplotypeBitmatrix::from_subset(

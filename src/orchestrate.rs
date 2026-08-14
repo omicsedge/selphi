@@ -266,6 +266,10 @@ fn phase_chr(
             // Common-MAF chip subset (MAF >= 0.001 on target). Diploid phases
             // common variants; rare ones are re-imputed/woven by phase_rare.
             let _target_an = (n_samples * 2) as u32;
+            // Threshold is over the TARGET COHORT's frequency, so the scaffold
+            // shrinks with the batch (see the single-chr twin in
+            // imputation_pipeline.rs). SELPHI_DIPLOID_SCAFFOLD_MAF overrides it.
+            let scaffold_maf = selphi::config::f32_or("SELPHI_DIPLOID_SCAFFOLD_MAF", 0.001);
             let common_chip_indices: Vec<usize> = (0..n_chip).into_par_iter().filter(|&v| {
                 // Mask the 128 missing sentinel so MAF is over CALLED alleles only.
                 let mut ac = 0u32; let mut an = 0u32;
@@ -277,7 +281,7 @@ fn phase_chr(
                 }
                 if an == 0 { return false; }
                 let mac = ac.min(an - ac);
-                (mac as f32 / an as f32) >= 0.001f32
+                (mac as f32 / an as f32) >= scaffold_maf
             }).collect();
             if common_chip_indices.is_empty() {
                 // No common scaffold for diploid — fall back to haploid.
