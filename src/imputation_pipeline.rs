@@ -186,9 +186,14 @@ pub(crate) fn auto_calibrate_pbwt_params(
     });
     let est_ne = if est_ne_override <= 0 {
         // Adaptive Ne: scales linearly with panel size — constant ratio
-        // Ne / n_ref ≈ 36 across panels validated above.
+        // Ne / n_ref ≈ 36 across panels validated above. The linear rule is
+        // calibrated on panels >= ~4,800 haplotypes; below that it under-sets Ne
+        // (the optimum plateaus ~175k rather than scaling down), so a floor keeps
+        // small panels near their optimum while leaving large panels untouched
+        // (their 36.4*n_ref already >> floor). Floor is a knob so the default stays
+        // byte-identical; raise SELPHI_NE_FLOOR (~175000) for small-panel accuracy.
         let auto_ne = (36.4 * n_ref as f64).round() as i64;
-        auto_ne.max(20_000)
+        auto_ne.max(selphi::config::i64_or("SELPHI_NE_FLOOR", 20_000))
     } else {
         est_ne_override
     };
