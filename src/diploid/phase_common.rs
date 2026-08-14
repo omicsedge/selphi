@@ -86,6 +86,38 @@ fn compute_het_overlap_bm(
     if union_het > 0 { inter_het as f32 / union_het as f32 } else { 0.0 }
 }
 
+/// Explicit phasing Ne, if the run asks for one. `SELPHI_PHASE_NE` pins an
+/// absolute value; `SELPHI_PHASE_NE_PER_HAP` asks for `k * n_haps`, which keeps
+/// the 0.04*Ne/n_haps switch rate constant across panel sizes. Unset on both =>
+/// None, and the shipped seed + EM path runs unchanged.
+fn phase_ne_override(n_haps_total: usize) -> Option<f64> {
+    if let Some(ne) = crate::config::f64_opt("SELPHI_PHASE_NE") { return Some(ne); }
+    crate::config::f64_opt("SELPHI_PHASE_NE_PER_HAP").map(|k| k * n_haps_total as f64)
+}
+
+/// Seed Ne for the segment HMM: an override when one is requested, else the
+/// shipped default.
+fn resolve_phase_ne(n_haps_total: usize) -> f64 {
+    phase_ne_override(n_haps_total).unwrap_or(DEFAULT_NE)
+}
+
+/// Upper bound the burn-in re-estimation may reach.
+///
+/// The re-estimate always runs past its old 1e6 ceiling (its switch-rate proxy is
+/// an edge count), so that ceiling, not the seed, is what actually sets Ne. Since
+/// the transition divides by `n_haps_total` while the HMM only ever conditions on
+/// ~400 haplotypes whatever the panel size, a fixed ceiling makes the per-cM
+/// switch rate 0.04*Ne/n_haps drift with panel size: 24.9/cM at 1.6k haplotypes
+/// against 0.23/cM at 171k. Scaling the ceiling with `n_haps_total` instead holds
+/// that rate at 0.04*`SELPHI_PHASE_NE_CAP_PER_HAP` per cM until the old 1e6
+/// ceiling binds, which it does from ~12.9k haplotypes upward — so every panel at
+/// or above that size keeps its shipped behaviour exactly.
+fn phase_ne_ceiling(n_haps_total: usize) -> f64 {
+    let per_hap = crate::config::f64_or("SELPHI_PHASE_NE_CAP_PER_HAP", 77.5);
+    if per_hap <= 0.0 { return 1_000_000.0; }
+    (per_hap * n_haps_total as f64).min(1_000_000.0)
+}
+
 /// Run phase_common on all samples.
 /// Memory-efficient entry: target_haps (small) + ref bitmatrix (compact).
 /// Builds combined bitmatrices directly without 8GB intermediate flat array.
@@ -136,7 +168,17 @@ pub fn run_phase_common_bm(
         cmis
     }).collect();
 
-    let mut hmm_params = HmmParams::with_allele_freqs(cm, n_haps_total, DEFAULT_NE, Some(&allele_counts));
+    // Effective phasing Ne. DEFAULT_NE is only the seed: the burn-in EM update
+    // below drives Ne to its 1e6 clamp on real data, so the per-cM switch rate
+    // 0.04*Ne/n_haps ends up scaling as 1/n_haps — about 27/cM on a 1500-haplotype
+    // panel against 0.2/cM at 171k. That regime was validated at the large-panel
+    // end, which leaves the small-panel end untested. SELPHI_PHASE_NE pins Ne
+    // outright; SELPHI_PHASE_NE_PER_HAP sets Ne = k*n_haps, holding the switch
+    // rate at 0.04*k per cM whatever the panel size, the way the imputation Ne
+    // (36.4*n_ref) already does. Either knob also disables the EM update, which
+    // would otherwise overwrite the requested value on the first burn-in pass.
+    let ne_init = resolve_phase_ne(n_haps_total);
+    let mut hmm_params = HmmParams::with_allele_freqs(cm, n_haps_total, ne_init, Some(&allele_counts));
 
     // IBD2 detection: read from target_haps + ref_bm
     let mut ibd2 = {
@@ -421,6 +463,10 @@ fn _run_iterations(
     let _n_haps = n_samples * 2;
     let n_iterations = stages.len();
     const N_RANDOM_HAPS: usize = 100;
+    // An explicit Ne request switches the burn-in EM update off; read once, never
+    // inside the iteration loop.
+    let em_ne_enabled = phase_ne_override(n_haps_total).is_none();
+    let ne_ceiling = phase_ne_ceiling(n_haps_total);
 
     for (it, &stage) in stages.iter().enumerate() {
         let t0 = std::time::Instant::now();
@@ -787,7 +833,7 @@ fn _run_iterations(
         // on 1KG it cost only +0.0003. A large diverse panel needs more
         // haplotype switching (finer mosaic) than SHAPEIT5's population-scale
         // Ne=15000 assumes. Keep it. See project_phasing_engine_mesa5k.
-        if stage == Stage::Burnin {
+        if stage == Stage::Burnin && em_ne_enabled {
             let mut total_switches = 0u64;
             let mut total_sites = 0u64;
             for graph in graphs.iter() {
@@ -801,7 +847,7 @@ fn _run_iterations(
                 } else { 0.01 };
                 if obs_switch_rate > 0.0 && avg_dist_cm > 1e-7 {
                     let estimated_ne = obs_switch_rate * n_haps_total as f64 / (0.04 * avg_dist_cm);
-                    let new_ne = estimated_ne.clamp(1000.0, 1_000_000.0);
+                    let new_ne = estimated_ne.clamp(1000.0, ne_ceiling);
                     if (new_ne - hmm_params.ne).abs() / hmm_params.ne > 0.05 {
                         crate::selphi_debug!("    [EM-Ne] iter {}: Ne {:.0} → {:.0} (switch_rate={:.6}, avg_dist={:.6}cM)",
                             it + 1, hmm_params.ne, new_ne, obs_switch_rate, avg_dist_cm);
