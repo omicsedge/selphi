@@ -65,8 +65,9 @@ pub fn resolve_max_candidates(
     let raw = (n_ref as f64) * scale;
     let auto = if raw >= usize::MAX as f64 { usize::MAX } else { raw as usize };
     // Floor at MIN_MAX_CANDIDATES, cap at the configured maximum, and never
-    // exceed the panel itself.
-    (auto.clamp(MIN_MAX_CANDIDATES, cap).min(n_ref), true)
+    // exceed the panel itself. A user cap below the floor wins (they asked for
+    // less memory) — and keeps the clamp bounds ordered instead of panicking.
+    (auto.clamp(MIN_MAX_CANDIDATES.min(cap), cap).min(n_ref), true)
 }
 
 #[cfg(test)]
@@ -88,6 +89,15 @@ mod max_candidates_tests {
         // Exactly at the threshold: still all.
         assert_eq!(resolve_max_candidates(0, SMALL_PANEL_USE_ALL, 0.2, 0.10, 0.80, 1_000_000),
                    (SMALL_PANEL_USE_ALL, true));
+    }
+
+    #[test]
+    fn cap_below_floor_wins_without_panicking() {
+        // --adaptive-mc-max below MIN_MAX_CANDIDATES (memory-constrained user):
+        // the cap must win — clamp(2500, 2000) used to panic on inverted bounds.
+        assert_eq!(resolve_max_candidates(0, 200_000, 0.8, 0.10, 0.80, 2_000), (2_000, true));
+        // Small-panel arm with a tiny cap: same, capped not panicking.
+        assert_eq!(resolve_max_candidates(0, 6_332, 0.35, 0.10, 0.80, 2_000), (2_000, true));
     }
 
     #[test]

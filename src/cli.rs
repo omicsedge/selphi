@@ -330,7 +330,7 @@ pub struct Args {
     pub sample_batch_size: usize,
 
     /// Emission error probability
-    #[arg(long, default_value = "0.025")]
+    #[arg(long, default_value = "0.025", value_parser = parse_p_err)]
     pub p_err: f64,
 
     /// Disable EM-estimated Ne from phasing (use global Ne for imputation)
@@ -493,6 +493,17 @@ pub struct Args {
     /// (GRCh38 chrX is longer than GRCh37). Aliases hg19→grch37, hg38→grch38.
     #[arg(long, value_enum, default_value = "auto")]
     pub build: BuildArg,
+}
+
+/// Validate `--p-err`: a mismatch probability above 0.5 inverts the HMM
+/// emission (mismatching haplotypes outweigh matching ones), so only
+/// [0, 0.5] is meaningful. 0 is accepted (the pipeline floors it at 1e-4).
+fn parse_p_err(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    if !v.is_finite() || !(0.0..=0.5).contains(&v) {
+        return Err(format!("--p-err must be in [0, 0.5], got {s} (values above 0.5 would invert the emission model)"));
+    }
+    Ok(v)
 }
 
 /// Reference-build selector for chrX PAR coordinates.
