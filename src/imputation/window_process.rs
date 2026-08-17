@@ -210,28 +210,12 @@ pub fn process_window_hmm(
                 pbwt::select_candidates(coded, n_ref + tgt, n_ref, max_candidates)
             };
             let n_cand = candidates.len();
-            if n_cand == 0 {
-                // No PBWT conditioning candidates for this target hap. Emit a
-                // VALID all-zero CsrWeights (per-chip-site indptr of length
-                // n_var_w+1, no entries) rather than an empty `weights` vec:
-                // downstream interpolation indexes weights[0].indptr[chip_site]
-                // (io/pipeline.rs / streaming), so an empty vec panicked. A
-                // zero-weight matrix contributes nothing for this hap (the only
-                // sound result with no reference support) instead of crashing.
-                let empty = super::hmm::CsrWeights {
-                    indptr: vec![0i32; n_var_w + 1],
-                    indices: Vec::new(),
-                    data: Vec::new(),
-                    n_rows: n_var_w,
-                    n_cols: n_ref,
-                };
-                // The tuple's `.0` is the weight block's START CHIP SITE (this
-                // window has a single block, `breaks_w = [(0, n_var_w)]`, so it is
-                // always 0) — NOT the target-hap index. Every consumer currently
-                // reads `w[0].1` only, but emitting `tgt` here would be a live bug
-                // the moment one of them starts honouring the offset.
-                return (tgt, HmmResult { weights: vec![(0, empty)], hap_posterior: None });
-            }
+            // n_cand == 0 (no reference hap shares a coded-step group with this
+            // target — likelier on small panels and dense targets) falls through
+            // to the full-panel PBWT below, which ignores `candidates` entirely.
+            // The reference panel is fully available in ref_bm, so this hap gets
+            // real copying weights; the old early-return emitted an all-zero CSR
+            // that silently imputed the whole window as hom-REF for this hap.
             let is_full = n_cand < FULL_PANEL_HMM_THRESHOLD;
             let m_red = if is_full { m } else { n_cand + 1 };
 
