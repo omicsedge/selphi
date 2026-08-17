@@ -115,7 +115,11 @@ fn resolve_phase_ne(n_haps_total: usize) -> f64 {
 fn phase_ne_ceiling(n_haps_total: usize) -> f64 {
     let per_hap = crate::config::f64_or("SELPHI_PHASE_NE_CAP_PER_HAP", 77.5);
     if per_hap <= 0.0 { return 1_000_000.0; }
-    (per_hap * n_haps_total as f64).min(1_000_000.0)
+    // Floor at the EM re-estimate's own 1000.0 lower clamp: below ~13 total
+    // haplotypes (a tiny --phase-panel cohort) or under a small per-hap
+    // override, the scaled ceiling would drop beneath that floor and
+    // `estimated_ne.clamp(1000.0, ne_ceiling)` would panic on inverted bounds.
+    (per_hap * n_haps_total as f64).min(1_000_000.0).max(1000.0)
 }
 
 /// Run phase_common on all samples.
@@ -873,5 +877,24 @@ fn _run_iterations(
                    (INIT shadowed) = {}, at segment head (COLLAPSE shadowed) = {}",
             DIAG_SKIP_WINDOW_HEAD.load(Ordering::Relaxed),
             DIAG_SKIP_SEG_HEAD.load(Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod phase_ne_ceiling_tests {
+    use super::*;
+
+    #[test]
+    fn ceiling_never_drops_below_the_em_floor() {
+        // A --phase-panel cohort of 6 samples: n_haps_total = 12 →
+        // 77.5 * 12 = 930, which used to make estimated_ne.clamp(1000.0, 930.0)
+        // panic on the first burn-in EM-Ne update. The ceiling must floor at
+        // the EM re-estimate's own 1000.0 lower clamp.
+        let c = phase_ne_ceiling(12);
+        assert!(c >= 1000.0, "ceiling {c} below the EM floor");
+        // Large panels: unchanged (1e6 cap binds from ~12.9k haps).
+        assert_eq!(phase_ne_ceiling(171_054), 1_000_000.0);
+        // Mid panel: linear scaling intact.
+        assert_eq!(phase_ne_ceiling(1_710), 77.5 * 1_710.0);
     }
 }
