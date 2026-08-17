@@ -55,6 +55,19 @@ fn prune_diag() -> bool {
     *V.get_or_init(|| crate::config::is_one("SELPHI_PRUNE_DIAG"))
 }
 
+/// Warn (once per process, loudly) that the cutoff/n_sites error-rate
+/// heuristic saturated and the `--p-err` floor was used instead. Runs per
+/// target hap per window, so everything past the first hit is one relaxed
+/// atomic add; the count is per (hap × window) occurrence.
+static PERR_SATURATED: AtomicU64 = AtomicU64::new(0);
+fn perr_saturation_warn(raw: f64, min_perr: f64) {
+    if PERR_SATURATED.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
+        crate::selphi_step!(
+            "WARN: emission error-rate heuristic saturated (match-count cutoff fraction {:.4} > 0.5; small-panel regime) — using --p-err floor {} instead",
+            raw, min_perr.max(0.0001));
+    }
+}
+
 // `SELPHI_PRUNE_DIAG` aggregators: relaxed per-hap adds from the rayon pool,
 // drained once per window by `prune_diag_report`. SURV_* counts post-prune
 // nonzero states over every row `prune_row` ran on (forward AND backward
@@ -147,8 +160,24 @@ fn filter_matches_fast(
     // The override bypasses both floors: `min_perr` is the CLI `--p-err`
     // (default 0.025), normally a FLOOR here, so sweeping p_err down to ~1e-4
     // is impossible without it.
-    let p_err = p_err_override
-        .unwrap_or_else(|| (cutoff as f64 / n_sites as f64).max(0.0001).max(min_perr));
+    //
+    // Saturation guard: cutoff/n_sites presumes the 10th-percentile haplotype
+    // matches at a small fraction of sites (the large-panel regime). On a small
+    // panel the PBWT candidate set saturates — every haplotype matches at every
+    // site — so cutoff → n_sites-1 and the "error rate" → ~1.0, which inverts
+    // the emission (mismatch outweighs match) and makes the hybrid-emission
+    // `clamp(p_err, 0.5)` panic (min > max). A mismatch rate above 0.5 carries
+    // no information about match quality, so a saturated window falls back to
+    // the same floor the heuristic targets on large panels.
+    let raw_perr = cutoff as f64 / n_sites as f64;
+    let p_err = p_err_override.unwrap_or_else(|| {
+        if raw_perr > 0.5 {
+            perr_saturation_warn(raw_perr, min_perr);
+            min_perr.max(0.0001)
+        } else {
+            raw_perr.max(0.0001).max(min_perr)
+        }
+    });
 
     if no_filter {
         return (ordered_matches.to_vec(), p_err);
@@ -960,14 +989,16 @@ pub fn calculate_weights(
             "site confidence length {} != n_sites {}", cv.len(), distances_cm.len());
         // Collapse to None when every site is fully confident → byte-identical.
         if cv.iter().any(|&c| c < 1.0) {
+            // p_err.min(0.5): keep min ≤ max even if SELPHI_PERR_OVERRIDE pushes
+            // p_err above 0.5 (the saturation guard caps the organic path).
             Some(cv.iter().map(|&c| {
-                ((1.0 - c) * 0.5 + c * p_err).clamp(p_err, 0.5)
+                ((1.0 - c) * 0.5 + c * p_err).clamp(p_err.min(0.5), 0.5)
             }).collect())
         } else {
             None
         }
     } else if let Some(c) = const_c_env.filter(|&c| c < 1.0) {
-        let eps = ((1.0 - c) * 0.5 + c * p_err).clamp(p_err, 0.5);
+        let eps = ((1.0 - c) * 0.5 + c * p_err).clamp(p_err.min(0.5), 0.5);
         Some(vec![eps; distances_cm.len()])
     } else {
         None
@@ -1195,6 +1226,42 @@ mod tests {
         // All haps have high frequency, so all should be kept
         assert_eq!(filtered.len(), 5);
         assert!(perr >= 0.05);
+    }
+
+    #[test]
+    fn test_filter_matches_saturated_perr_falls_back_to_floor() {
+        // Small-panel saturation: every hap matches at EVERY site → the p10
+        // count == n_sites, cutoff == n_sites-1, and the raw cutoff/n_sites
+        // "error rate" ≈ 1.0 (the Emirati chr9/11/12 crash: clamp(p_err, 0.5)
+        // paniced with p_err = 1975/1976). The guard must fall back to the
+        // --p-err floor and keep p_err ≤ 0.5.
+        let n_sites = 1976;
+        let n_haps = 8;
+        let all: Vec<i64> = (0..n_haps as i64).collect();
+        let matches = vec![all; n_sites];
+        let (filtered, perr) = filter_matches_fast(&matches, n_haps, 0.025);
+        assert_eq!(filtered.len(), n_sites);
+        assert!(perr <= 0.5, "saturated p_err must not exceed 0.5, got {perr}");
+        assert!((perr - 0.025).abs() < 1e-12, "expected the --p-err floor, got {perr}");
+        // And the hybrid-emission clamp that crashed must now be panic-free:
+        let eps = ((1.0f64 - 0.0) * 0.5 + 0.0 * perr).clamp(perr.min(0.5), 0.5);
+        assert!((0.0..=0.5).contains(&eps));
+    }
+
+    #[test]
+    fn test_filter_matches_unsaturated_perr_unchanged() {
+        // Non-degenerate matrix (the large-panel regime): the guard must not
+        // change the computed rate. Counts: hap0=4, hap1=3, hap2=1, hap3=1 →
+        // p10 count 1, cutoff = min(1, 4-1) = 1, raw = 1/4 = 0.25 > floor
+        // → p_err = 0.25.
+        let matches = vec![
+            vec![0i64, 1],
+            vec![0, 1, 3],
+            vec![0, 1],
+            vec![0, 2],
+        ];
+        let (_, perr) = filter_matches_fast(&matches, 4, 0.025);
+        assert!((perr - 0.25).abs() < 1e-12, "unsaturated p_err must be raw cutoff/n_sites, got {perr}");
     }
 
     #[test]
