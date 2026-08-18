@@ -785,12 +785,13 @@ fn evaluate_against_truth(args: &Args, output_path: &str, final_path: &Path) {
         selphi_info!("  homref:   absent→hom-ref (truth is variant-only)");
         let raw_path = args.truth_raw.as_deref().map(Path::new);
         let excl_path = args.exclude_sites.as_deref().map(Path::new);
-        let (comb, snp, indel, counts) = selphi::eval::accuracy::evaluate_imputation(
+        let (comb, snp, indel, counts, site) = selphi::eval::accuracy::evaluate_imputation(
             final_path, truth_path, &shared, raw_path, excl_path,
         ).expect("Evaluation failed");
         let n_excluded = counts.n_imp_variants.saturating_sub(counts.n_matched);
         selphi::eval::accuracy::print_imputation_summary(&comb, &snp, &indel, args.by_type, &counts, n_excluded);
-        selphi::eval::accuracy::write_imputation_json(&json_path, &comb, &snp, &indel, args.by_type, &counts, Some(&shared))
+        selphi::eval::accuracy::print_maf_bins(&site);
+        selphi::eval::accuracy::write_imputation_json(&json_path, &comb, &snp, &indel, args.by_type, &counts, Some(&shared), Some(&site))
             .expect("Failed to write JSON summary");
     } else {
         let (site_acc, sample_acc, counts) = selphi::eval::accuracy::evaluate(

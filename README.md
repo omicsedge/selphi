@@ -347,6 +347,11 @@ selphi --evaluate imputed.vcf.gz --truth wgs_truth.strong.vcf.gz \
        --homref-absent on --by-type --out eval_results
 ```
 
+Under `--homref-absent on` the report also carries a per-MAF-bin breakdown (printed, and written to
+the JSON under `maf_bins` alongside `overall_site_r2`). Bin MAF comes from the truth cohort, so the
+finest resolvable bin is one allele copy in it — `1/(2·n_truth)`, e.g. 0.48% with 105 truth samples,
+below which the bins are structurally empty.
+
 By default `--homref-absent auto` inspects the truth: a complete callset (explicit `0/0`) scores
 matched sites only (legacy), while a variant-only truth scores absent sites as hom-ref (the standard
 imputation-R² convention). Contig names are matched tolerant to the `chr` prefix (so `22` ≡ `chr22`),
