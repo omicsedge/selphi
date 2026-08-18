@@ -1185,7 +1185,7 @@ pub fn evaluate_imputation(
     shared: &[String],
     raw_path: Option<&Path>,
     exclude_path: Option<&Path>,
-) -> io::Result<(SampleAccumulator, SampleAccumulator, SampleAccumulator, EvalCounts)> {
+) -> io::Result<(SampleAccumulator, SampleAccumulator, SampleAccumulator, EvalCounts, SiteAccumulator)> {
     let n = shared.len();
     let strong = load_dosage_map(strong_path, shared)?;
     let raw = match raw_path { Some(p) => Some(load_dosage_map(p, shared)?), None => None };
@@ -1207,6 +1207,12 @@ pub fn evaluate_imputation(
     let mut comb = SampleAccumulator::new(n);
     let mut snp = SampleAccumulator::new(n);
     let mut indel = SampleAccumulator::new(n);
+    // Per-site MAF-binned R², alongside the per-sample accumulators. MAF is
+    // derived from the truth dosages at each scored site, the same convention
+    // the MAF-binned evaluator path uses, so the resolution floor is one allele
+    // copy in the truth cohort (1/(2·n_truth): 0.48% at 105 samples) — bins
+    // below that are structurally empty and reported as such.
+    let mut site = SiteAccumulator::new();
     let mut counts = EvalCounts {
         n_matched: 0,
         n_imp_variants: 0,
@@ -1233,9 +1239,37 @@ pub fn evaluate_imputation(
         }
         comb.add_variant(&ibuf, &truth_ds);
         if is_snp { snp.add_variant(&ibuf, &truth_ds); } else { indel.add_variant(&ibuf, &truth_ds); }
+        let mut gt_sum = 0.0f64;
+        let mut gt_n = 0u32;
+        for s in 0..n {
+            if truth_ds[s] >= 0.0 { gt_sum += truth_ds[s] as f64; gt_n += 1; }
+        }
+        let maf = if gt_n > 0 { let af = gt_sum / (gt_n as f64 * 2.0); af.min(1.0 - af) } else { 0.0 };
+        let (r2, conc) = site_r2(&ibuf, &truth_ds, n);
+        site.add(maf, r2, conc);
         counts.n_matched += 1;
     }
-    Ok((comb, snp, indel, counts))
+    Ok((comb, snp, indel, counts, site))
+}
+
+/// Print the MAF-bin table that accompanies the imputation-R² summary.
+/// Bins below one allele copy in the truth cohort are structurally empty.
+pub fn print_maf_bins(site_acc: &SiteAccumulator) {
+    if site_acc.total_r2_n == 0 { return; }
+    crate::selphi_info!("\n{}", crate::log::bold(&format!("{:<20} {:>12} {:>10} {:>12}", "MAF bin", "N variants", "Mean R²", "Concordance")));
+    crate::selphi_info!("{}", "-".repeat(60));
+    for (bi, &(_, _, label)) in MAF_BINS.iter().enumerate() {
+        let n = site_acc.bin_n[bi];
+        if n == 0 {
+            crate::selphi_info!("{:<20} {:>12} {:>10} {:>12}", label, "0", "N/A", "N/A");
+        } else {
+            crate::selphi_info!("{:<20} {:>12} {:>10.4} {:>12.4}", label, n,
+                site_acc.bin_r2_sum[bi] / n as f64, site_acc.bin_conc_sum[bi] / n as f64);
+        }
+    }
+    crate::selphi_info!("{}", "-".repeat(60));
+    crate::selphi_info!("{} {:>12} {}", crate::log::bold(&format!("{:<20}", "OVERALL (site)")),
+        site_acc.total_r2_n, crate::log::cyan(&format!("{:>10.4}", site_acc.total_r2_sum / site_acc.total_r2_n as f64)));
 }
 
 /// Print MAF-binned summary table.
@@ -1328,6 +1362,7 @@ pub fn print_imputation_summary(
 pub fn write_imputation_json(
     path: &Path, comb: &SampleAccumulator, snp: &SampleAccumulator, indel: &SampleAccumulator,
     by_type: bool, counts: &EvalCounts, sample_names: Option<&[String]>,
+    site: Option<&SiteAccumulator>,
 ) -> io::Result<()> {
     use std::io::Write;
     let round6 = |x: f64| (x * 1e6).round() / 1e6;
@@ -1351,6 +1386,27 @@ pub fn write_imputation_json(
         let per: serde_json::Map<String, serde_json::Value> = names.iter().enumerate()
             .map(|(i, nm)| (nm.clone(), serde_json::json!(round6(r2[i])))).collect();
         map.insert("per_sample_combined_r2".into(), serde_json::Value::Object(per));
+    }
+    // Per-MAF-bin site R², under `maf_bins` so the top-level keys above stay
+    // exactly as they were for anything already parsing this file.
+    if let Some(sa) = site {
+        let mut bins = serde_json::Map::new();
+        for (bi, &(_, _, label)) in MAF_BINS.iter().enumerate() {
+            let n = sa.bin_n[bi];
+            let mut bin = serde_json::Map::new();
+            bin.insert("n".into(), serde_json::json!(n));
+            if n > 0 {
+                bin.insert("mean_r2".into(), serde_json::json!(round6(sa.bin_r2_sum[bi] / n as f64)));
+                bin.insert("concordance".into(), serde_json::json!(round6(sa.bin_conc_sum[bi] / n as f64)));
+            }
+            bins.insert(label.to_string(), serde_json::Value::Object(bin));
+        }
+        map.insert("maf_bins".into(), serde_json::Value::Object(bins));
+        if sa.total_r2_n > 0 {
+            map.insert("overall_site_r2".into(),
+                serde_json::json!(round6(sa.total_r2_sum / sa.total_r2_n as f64)));
+            map.insert("overall_site_r2_n".into(), serde_json::json!(sa.total_r2_n));
+        }
     }
     let mut f = std::fs::File::create(path)?;
     f.write_all(serde_json::to_string_pretty(&serde_json::Value::Object(map))?.as_bytes())?;

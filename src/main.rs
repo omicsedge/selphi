@@ -402,12 +402,13 @@ fn main() {
             if let Some(p) = raw_path { selphi_info!("  raw:      {}", p.display()); }
             if let Some(p) = excl_path { selphi_info!("  exclude:  {}", p.display()); }
             selphi_step!("Scoring imputation R² (absent→hom-ref)...");
-            let (comb, snp, indel, counts) = selphi::eval::accuracy::evaluate_imputation(
+            let (comb, snp, indel, counts, site) = selphi::eval::accuracy::evaluate_imputation(
                 imp_path, truth_path, &shared, raw_path, excl_path,
             ).expect("Evaluation failed");
             let n_excluded = counts.n_imp_variants.saturating_sub(counts.n_matched);
             selphi::eval::accuracy::print_imputation_summary(&comb, &snp, &indel, args.by_type, &counts, n_excluded);
-            selphi::eval::accuracy::write_imputation_json(&json_path, &comb, &snp, &indel, args.by_type, &counts, Some(&shared))
+            selphi::eval::accuracy::print_maf_bins(&site);
+            selphi::eval::accuracy::write_imputation_json(&json_path, &comb, &snp, &indel, args.by_type, &counts, Some(&shared), Some(&site))
                 .expect("Failed to write JSON summary");
         } else {
             selphi_step!("Stream-merging VCFs...");
