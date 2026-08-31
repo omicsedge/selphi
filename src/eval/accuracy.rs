@@ -107,6 +107,26 @@ impl SampleAccumulator {
     }
 }
 
+/// Why `--truth-raw` did or did not change the score.
+///
+/// A raw truth only ever acts through one narrow path: a (site, sample) where
+/// the filtered truth has no alt call but the raw truth does, so the sample is
+/// SKIPPED at that site instead of being scored as hom-ref. Zero rescues is a
+/// legitimate outcome (the filtered truth already holds every carrier at the
+/// scored sites), but it is indistinguishable from a key-matching failure
+/// unless the intermediate counts are reported — so report them.
+#[derive(Default, Clone, Copy)]
+pub struct RawTruthDiag {
+    /// Records loaded from the raw truth file.
+    pub raw_sites_loaded: u64,
+    /// Scored sites whose (contig, pos, REF, ALT) key was found in the raw truth.
+    pub scored_sites_matched: u64,
+    /// (site, sample) pairs the raw truth rescued from hom-ref scoring.
+    pub genotypes_rescued: u64,
+    /// Scored sites absent from the filtered truth entirely.
+    pub scored_sites_absent_from_strong: u64,
+}
+
 /// Per-site accumulator for MAF-binned R².
 pub struct SiteAccumulator {
     // Per-MAF-bin: sum of R², count, sum of concordance (only R²-valid variants)
@@ -1185,7 +1205,7 @@ pub fn evaluate_imputation(
     shared: &[String],
     raw_path: Option<&Path>,
     exclude_path: Option<&Path>,
-) -> io::Result<(SampleAccumulator, SampleAccumulator, SampleAccumulator, EvalCounts, SiteAccumulator)> {
+) -> io::Result<(SampleAccumulator, SampleAccumulator, SampleAccumulator, EvalCounts, SiteAccumulator, RawTruthDiag)> {
     let n = shared.len();
     let strong = load_dosage_map(strong_path, shared)?;
     let raw = match raw_path { Some(p) => Some(load_dosage_map(p, shared)?), None => None };
@@ -1213,6 +1233,10 @@ pub fn evaluate_imputation(
     // copy in the truth cohort (1/(2·n_truth): 0.48% at 105 samples) — bins
     // below that are structurally empty and reported as such.
     let mut site = SiteAccumulator::new();
+    let mut diag = RawTruthDiag {
+        raw_sites_loaded: raw.as_ref().map(|m| m.len() as u64).unwrap_or(0),
+        ..Default::default()
+    };
     let mut counts = EvalCounts {
         n_matched: 0,
         n_imp_variants: 0,
@@ -1228,11 +1252,14 @@ pub fn evaluate_imputation(
         let is_snp = rec.2.len() == 1 && rec.3.len() == 1;
         let sv = strong.get(&key);
         let rv = raw.as_ref().and_then(|m| m.get(&key));
+        if sv.is_none() { diag.scored_sites_absent_from_strong += 1; }
+        if rv.is_some() { diag.scored_sites_matched += 1; }
         for s in 0..n {
             if let Some(v) = sv
                 && v[s] >= 0.5 { truth_ds[s] = v[s]; continue; }
             if rv.map(|v| v[s] >= 0.5).unwrap_or(false) {
                 truth_ds[s] = -1.0; // raw-but-not-strong: quality-filtered ⇒ skip this sample here
+                diag.genotypes_rescued += 1;
             } else {
                 truth_ds[s] = 0.0; // absent from truth ⇒ hom-ref
             }
@@ -1249,7 +1276,23 @@ pub fn evaluate_imputation(
         site.add(maf, r2, conc);
         counts.n_matched += 1;
     }
-    Ok((comb, snp, indel, counts, site))
+    Ok((comb, snp, indel, counts, site, diag))
+}
+
+/// Report what `--truth-raw` actually did. Printed only when a raw truth was
+/// supplied, so the default output is unchanged.
+pub fn print_raw_truth_diag(d: &RawTruthDiag) {
+    if d.raw_sites_loaded == 0 { return; }
+    crate::selphi_info!("\n  --truth-raw: {} raw site(s) loaded; {} scored site(s) matched by key; \
+{} site(s) absent from the filtered truth; {} genotype(s) rescued from hom-ref scoring",
+        d.raw_sites_loaded, d.scored_sites_matched, d.scored_sites_absent_from_strong, d.genotypes_rescued);
+    if d.scored_sites_matched == 0 {
+        crate::selphi_info!("  --truth-raw: NO scored site matched the raw truth by (contig, pos, REF, ALT) — \
+the raw file does not overlap the scored sites (check it covers this region and shares the panel's allele representation)");
+    } else if d.genotypes_rescued == 0 {
+        crate::selphi_info!("  --truth-raw: keys matched but nothing was rescued — the filtered truth already \
+holds every alt call the raw truth has at the scored sites, so the score is correctly unchanged");
+    }
 }
 
 /// Print the MAF-bin table that accompanies the imputation-R² summary.
@@ -1362,7 +1405,7 @@ pub fn print_imputation_summary(
 pub fn write_imputation_json(
     path: &Path, comb: &SampleAccumulator, snp: &SampleAccumulator, indel: &SampleAccumulator,
     by_type: bool, counts: &EvalCounts, sample_names: Option<&[String]>,
-    site: Option<&SiteAccumulator>,
+    site: Option<&SiteAccumulator>, raw_diag: Option<&RawTruthDiag>,
 ) -> io::Result<()> {
     use std::io::Write;
     let round6 = |x: f64| (x * 1e6).round() / 1e6;
@@ -1386,6 +1429,14 @@ pub fn write_imputation_json(
         let per: serde_json::Map<String, serde_json::Value> = names.iter().enumerate()
             .map(|(i, nm)| (nm.clone(), serde_json::json!(round6(r2[i])))).collect();
         map.insert("per_sample_combined_r2".into(), serde_json::Value::Object(per));
+    }
+    if let Some(d) = raw_diag.filter(|d| d.raw_sites_loaded > 0) {
+        let mut m = serde_json::Map::new();
+        m.insert("raw_sites_loaded".into(), serde_json::json!(d.raw_sites_loaded));
+        m.insert("scored_sites_matched".into(), serde_json::json!(d.scored_sites_matched));
+        m.insert("scored_sites_absent_from_strong".into(), serde_json::json!(d.scored_sites_absent_from_strong));
+        m.insert("genotypes_rescued".into(), serde_json::json!(d.genotypes_rescued));
+        map.insert("truth_raw_diag".into(), serde_json::Value::Object(m));
     }
     // Per-MAF-bin site R², under `maf_bins` so the top-level keys above stay
     // exactly as they were for anything already parsing this file.
