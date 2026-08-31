@@ -347,6 +347,12 @@ selphi --evaluate imputed.vcf.gz --truth wgs_truth.strong.vcf.gz \
        --homref-absent on --by-type --out eval_results
 ```
 
+When `--truth-raw` is given, the report says what it did: raw sites loaded, scored sites matched by
+key, and genotypes rescued from hom-ref scoring (JSON: `truth_raw_diag`). A raw truth acts only where
+the filtered truth has no alt call for a sample but the raw truth does, so zero rescues is a normal
+result — it means the filtered truth already holds every alt call at the scored sites — and the counts
+distinguish that from a raw file that simply does not overlap the scored sites.
+
 Under `--homref-absent on` the report also carries a per-MAF-bin breakdown (printed, and written to
 the JSON under `maf_bins` alongside `overall_site_r2`). Bin MAF comes from the truth cohort, so the
 finest resolvable bin is one allele copy in it — `1/(2·n_truth)`, e.g. 0.48% with 105 truth samples,
