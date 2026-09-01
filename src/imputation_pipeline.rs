@@ -187,13 +187,21 @@ pub(crate) fn auto_calibrate_pbwt_params(
     let est_ne = if est_ne_override <= 0 {
         // Adaptive Ne: scales linearly with panel size — constant ratio
         // Ne / n_ref ≈ 36 across panels validated above. The linear rule is
-        // calibrated on panels >= ~4,800 haplotypes; below that it under-sets Ne
-        // (the optimum plateaus ~175k rather than scaling down), so a floor keeps
-        // small panels near their optimum while leaving large panels untouched
-        // (their 36.4*n_ref already >> floor). Floor is a knob so the default stays
-        // byte-identical; raise SELPHI_NE_FLOOR (~175000) for small-panel accuracy.
+        // calibrated on panels >= ~4,800 haplotypes; below that it under-sets Ne,
+        // because the optimum does not keep scaling down with the panel — so a
+        // floor holds small panels near their optimum while leaving large panels
+        // untouched (36.4*n_ref already exceeds the floor from 2,747 haplotypes
+        // up, so every panel at or above ~1,374 samples is bit-identical).
+        //
+        // The floor is 100,000, measured on two independent 1,400-1,500-haplotype
+        // panels (a 750-WGS population-specific panel with array targets, and a
+        // 696-sample 1000 Genomes panel): against the un-floored 36.4*n_ref it
+        // gains per-sample R² (+0.0023) and site R² in every MAF bin except the
+        // rarest, where it loses ~0.001. It is also the value that wins on both
+        // metric families at once — the un-floored rule and 175,000 each win only
+        // one — which is what a default should do. SELPHI_NE_FLOOR overrides it.
         let auto_ne = (36.4 * n_ref as f64).round() as i64;
-        auto_ne.max(selphi::config::i64_or("SELPHI_NE_FLOOR", 20_000))
+        auto_ne.max(selphi::config::i64_or("SELPHI_NE_FLOOR", 100_000))
     } else {
         est_ne_override
     };
