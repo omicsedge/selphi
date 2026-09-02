@@ -646,23 +646,30 @@ pub fn run_gibbs(
         //     site's panel carriers to each target hap currently sampled ALT there.
         let t0 = if timing { Some(std::time::Instant::now()) } else { None };
         let cond_storage: Option<Vec<Vec<u32>>> = if rare_carrier {
+            // Per target hap, in parallel: each hap's list depends only on its own
+            // sampled alleles, and the carriers are appended in `rare_sites` order,
+            // so the result is byte-identical to the former serial site-major loop
+            // (which was O(n_rare × n_haps) on one core, every iteration).
             let mut aug = base_cond.clone();
-            for (v, minor_allele, carriers) in &rare_sites {
-                let base = v * n_target_haps;
-                for h in 0..n_target_haps {
+            let hap_alleles_ro: &[u8] = &hap_alleles;
+            let rare_sites_ro = &rare_sites;
+            aug.par_iter_mut().enumerate().for_each(|(h, c)| {
+                for (v, minor_allele, carriers) in rare_sites_ro.iter() {
                     // Augment a target hap currently sampled as this site's MINOR
                     // (rare) allele with that allele's panel carriers.
-                    if hap_alleles[base + h] == *minor_allele { aug[h].extend_from_slice(carriers); }
+                    if hap_alleles_ro[v * n_target_haps + h] == *minor_allele { c.extend_from_slice(carriers); }
                 }
-            }
-            if let Some(kmax) = k_max {
-                // Priority-preserving dedup + cap: base (IBD-ranked) stays ahead of
-                // appended carriers; truncate drops only the lowest-priority overflow.
-                let mut seen = std::collections::HashSet::new();
-                for c in aug.iter_mut() { seen.clear(); c.retain(|&x| seen.insert(x)); c.truncate(kmax); }
-            } else {
-                for c in aug.iter_mut() { c.sort_unstable(); c.dedup(); }
-            }
+                if let Some(kmax) = k_max {
+                    // Priority-preserving dedup + cap: base (IBD-ranked) stays ahead of
+                    // appended carriers; truncate drops only the lowest-priority overflow.
+                    let mut seen = std::collections::HashSet::with_capacity(c.len());
+                    c.retain(|&x| seen.insert(x));
+                    c.truncate(kmax);
+                } else {
+                    c.sort_unstable();
+                    c.dedup();
+                }
+            });
             Some(aug)
         } else { None };
         let cond_per_hap: &Vec<Vec<u32>> = cond_storage.as_ref().unwrap_or(base_cond);
@@ -725,9 +732,21 @@ pub fn run_gibbs(
         // 3. Write back sampled alleles; accumulate per-hap dose into GP + dosage.
         let t0 = if timing { Some(std::time::Instant::now()) } else { None };
         let mut hap_dose: Vec<Option<Vec<f32>>> = (0..n_target_haps).map(|_| None).collect();
+        let mut sampled_by_hap: Vec<Option<Vec<u8>>> = (0..n_target_haps).map(|_| None).collect();
         for (h, dose, sampled) in results {
-            for v in 0..n_var { hap_alleles[v * n_target_haps + h] = sampled[v]; }
             hap_dose[h] = Some(dose);
+            sampled_by_hap[h] = Some(sampled);
+        }
+        // Site-major write-back in parallel over sites: each row of `hap_alleles`
+        // (one site, n_target_haps bytes) is written contiguously instead of the
+        // former per-hap strided sweep (n_var × n_haps scattered stores on one core).
+        {
+            let sb = &sampled_by_hap;
+            hap_alleles.par_chunks_mut(n_target_haps).enumerate().for_each(|(v, row)| {
+                for (h, slot) in row.iter_mut().enumerate() {
+                    if let Some(sm) = &sb[h] { *slot = sm[v]; }
+                }
+            });
         }
 
         // Re-phase cadence (LCWGS_PHASE_MAIN_EVERY, default 1 = every iteration).
@@ -835,13 +854,7 @@ pub fn run_gibbs(
                  h0.iter().map(|&b| b as u8).collect(),
                  h1.iter().map(|&b| b as u8).collect())
             }).collect();
-            for (s, h0, h1) in rephased {
-                let (h0i, h1i) = (2 * s, 2 * s + 1);
-                for v in 0..n_var {
-                    hap_alleles[v * n_target_haps + h0i] = h0[v];
-                    hap_alleles[v * n_target_haps + h1i] = h1[v];
-                }
-            }
+            write_back_rephased(&mut hap_alleles, n_samples, n_target_haps, rephased);
         }
         if cfg.dmm && (is_main || cfg.burnin_diploid) && !cfg.founder_phase && phase_this_iter {
             let dcfg = dmm_cfg.as_ref().unwrap();
@@ -938,29 +951,29 @@ pub fn run_gibbs(
                 super::dmm::rephase_diplotype(&mut h0, &mut h1, &ph, ref_bm, cm, dcfg, weight.as_deref());
                 (s, h0, h1)
             }).collect();
-            for (s, h0, h1) in rephased {
-                let (h0i, h1i) = (2 * s, 2 * s + 1);
-                for v in 0..n_var {
-                    hap_alleles[v * n_target_haps + h0i] = h0[v];
-                    hap_alleles[v * n_target_haps + h1i] = h1[v];
-                }
-            }
+            write_back_rephased(&mut hap_alleles, n_samples, n_target_haps, rephased);
         }
         if let Some(t) = tp0 { t_phase += t.elapsed().as_secs_f64(); }
         if is_main {
-            for s in 0..n_samples {
-                let d0 = hap_dose[2 * s].as_ref().unwrap();
-                let d1 = hap_dose[2 * s + 1].as_ref().unwrap();
-                for v in 0..n_var {
-                    let a0 = d0[v] as f64; // P(hap0 = ALT)
-                    let a1 = d1[v] as f64; // P(hap1 = ALT)
-                    let gp_off = (v * n_samples + s) * 3;
-                    acc_gp[gp_off]     += ((1.0 - a0) * (1.0 - a1)) as f32;     // P(00)
-                    acc_gp[gp_off + 1] += (a0 * (1.0 - a1) + (1.0 - a0) * a1) as f32; // P(01)
-                    acc_gp[gp_off + 2] += (a0 * a1) as f32;                     // P(11)
-                    acc_dosage[v * n_samples + s] += a0 + a1;          // E[ALT]
-                }
-            }
+            // Accumulate in parallel over sites: one row of acc_gp (n_samples × 3)
+            // and acc_dosage (n_samples) per site, each cell receiving exactly the
+            // one addition it received before, in the same order across iterations
+            // → byte-identical to the former sample-major serial loop, whose inner
+            // loop strode n_samples×3 floats between consecutive sites.
+            let hd = &hap_dose;
+            acc_gp.par_chunks_mut(n_samples * 3)
+                .zip(acc_dosage.par_chunks_mut(n_samples))
+                .enumerate()
+                .for_each(|(v, (gp_row, dose_row))| {
+                    for s in 0..n_samples {
+                        let a0 = hd[2 * s].as_ref().unwrap()[v] as f64; // P(hap0 = ALT)
+                        let a1 = hd[2 * s + 1].as_ref().unwrap()[v] as f64; // P(hap1 = ALT)
+                        gp_row[3 * s]     += ((1.0 - a0) * (1.0 - a1)) as f32;     // P(00)
+                        gp_row[3 * s + 1] += (a0 * (1.0 - a1) + (1.0 - a0) * a1) as f32; // P(01)
+                        gp_row[3 * s + 2] += (a0 * a1) as f32;                     // P(11)
+                        dose_row[s] += a0 + a1;          // E[ALT]
+                    }
+                });
             n_acc += 1;
         }
         if let Some(t) = t0 { t_wb += t.elapsed().as_secs_f64(); }
@@ -985,6 +998,23 @@ pub fn run_gibbs(
     let cond_final = if cfg.cond_dump { cond_cache } else { Vec::new() };
 
     GibbsOutput { dosage, gp, cond_final }
+}
+
+/// Write re-phased per-sample haplotypes back into the site-major
+/// `hap_alleles`, in parallel over sites (one contiguous row per site). Same
+/// values, same cells as the former per-sample strided loop → byte-identical.
+fn write_back_rephased(hap_alleles: &mut [u8], n_samples: usize, n_target_haps: usize, rephased: Vec<(usize, Vec<u8>, Vec<u8>)>) {
+    let mut by_sample: Vec<Option<(Vec<u8>, Vec<u8>)>> = (0..n_samples).map(|_| None).collect();
+    for (s, h0, h1) in rephased { by_sample[s] = Some((h0, h1)); }
+    let bs = &by_sample;
+    hap_alleles.par_chunks_mut(n_target_haps).enumerate().for_each(|(v, row)| {
+        for (s, e) in bs.iter().enumerate() {
+            if let Some((h0, h1)) = e {
+                row[2 * s] = h0[v];
+                row[2 * s + 1] = h1[v];
+            }
+        }
+    });
 }
 
 /// Multi-restart Gibbs averaging. Runs `LCWGS_GIBBS_RESTARTS` (default 1)

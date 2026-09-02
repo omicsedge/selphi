@@ -199,16 +199,19 @@ impl FaithfulSelector {
     /// Refresh the per-sample H0/H1 hard calls from the hybrid's current sampled
     /// `hap_alleles` (layout `hap_alleles[v*n_target_haps + h]`, h0=2s, h1=2s+1).
     fn refresh_haps(&mut self, hap_alleles: &[u8]) {
+        use rayon::prelude::*;
         let n_tar = 2 * self.n_samples;
-        for s in 0..self.n_samples {
-            let h0 = 2 * s;
-            let h1 = 2 * s + 1;
-            for v in 0..self.n_var {
+        let n_var = self.n_var;
+        // Per sample in parallel (independent destinations, pure copies): this ran
+        // O(n_var × n_samples) on one core at every iteration.
+        self.h0.par_iter_mut().zip(self.h1.par_iter_mut()).enumerate().for_each(|(s, (h0, h1))| {
+            let (i0, i1) = (2 * s, 2 * s + 1);
+            for v in 0..n_var {
                 let base = v * n_tar;
-                self.h0[s][v] = hap_alleles[base + h0] != 0;
-                self.h1[s][v] = hap_alleles[base + h1] != 0;
+                h0[v] = hap_alleles[base + i0] != 0;
+                h1[v] = hap_alleles[base + i1] != 0;
             }
-        }
+        });
     }
 
     /// Run ONE faithful-selection pass against the hybrid's current state and
