@@ -910,10 +910,29 @@ pub fn evaluate_parallel(
     truth_path: &Path,
     shared_samples: &[String],
     n_threads: usize,
+    // Sites to drop entirely (`--exclude-sites`, normally the genotyped/chip
+    // sites, which are observed rather than imputed and would otherwise inflate
+    // every bin). This path used to ignore the flag: it was only ever plumbed
+    // into `evaluate_imputation` (the absent->hom-ref path), so a run with a
+    // COMPLETE truth callset — which is what `--homref-absent auto` resolves to,
+    // and the default — scored the typed sites in silence.
+    exclude_path: Option<&Path>,
 ) -> io::Result<(SiteAccumulator, SampleAccumulator, EvalCounts)> {
     use rayon::prelude::*;
 
     let n_samples = shared_samples.len();
+    let exclude: std::collections::HashSet<(u64, i64, u64)> = match exclude_path {
+        Some(p) => {
+            let (mut r, _) = VariantReader::open(p)?;
+            let mut b: Vec<f32> = Vec::new();
+            let mut set = std::collections::HashSet::new();
+            while let Some(rec) = r.next_record(&mut b) { set.insert(site_key(&rec.0, rec.1, &rec.2, &rec.3)); }
+            crate::selphi_info!("  exclude:  {} sites from {}", set.len(), p.display());
+            set
+        }
+        None => std::collections::HashSet::new(),
+    };
+    let exclude_ref = &exclude;
 
     // Ensure parallel-seek indexes exist so each thread can pread-seek its
     // region instead of re-scanning from BOF. Without this, 16 threads each
@@ -1017,7 +1036,12 @@ pub fn evaluate_parallel(
                         n_truth += 1;
 
                         let (matched, swapped) = match_alleles(&imp.2, &imp.3, &truth.2, &truth.3);
-                        if matched {
+                        // An excluded site is dropped before scoring; it still counted
+                        // into n_imp/n_truth above, so the summary's
+                        // n_imp_variants - n_matched still reports it as excluded.
+                        let excluded = !exclude_ref.is_empty()
+                            && exclude_ref.contains(&site_key(&imp.0, imp.1, &imp.2, &imp.3));
+                        if matched && !excluded {
                             chr_set.insert(String::from_utf8_lossy(&imp.0).to_string());
                             imp_ds[..n_samples].copy_from_slice(&imp_ds_raw[..n_samples]);
                             if swapped { for si in 0..n_samples { if imp_ds[si] >= 0.0 { imp_ds[si] = 2.0 - imp_ds[si]; } } }
@@ -1111,9 +1135,10 @@ pub fn evaluate(
     imputed_path: &Path,
     truth_path: &Path,
     shared_samples: &[String],
+    exclude_path: Option<&Path>,
 ) -> io::Result<(SiteAccumulator, SampleAccumulator, EvalCounts)> {
     let n_threads = rayon::current_num_threads().max(1);
-    evaluate_parallel(imputed_path, truth_path, shared_samples, n_threads)
+    evaluate_parallel(imputed_path, truth_path, shared_samples, n_threads, exclude_path)
 }
 
 /// FNV-1a hash of REF+ALT bytes (for an alloc-free site key).
