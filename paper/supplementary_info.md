@@ -484,8 +484,8 @@ R² 0.5921 on the same set (main text). Selphi 2 leads at every MAF bin.
 ## Table S12. Selphi 2 vs Selphi 1.5.3, per-MAF (1KG Phase 3, impute-only)
 
 Both tools imputed the identical phased target (801 held-out samples) against the identical 1000
-Genomes Phase 3 panel, impute-only — the mode in which the original Selphi 1.5.3, which requires
-pre-phased input, is run — and scored on imputed-only sites. This isolates the imputer from
+Genomes Phase 3 panel, impute-only, the mode in which the original Selphi 1.5.3, which requires
+pre-phased input, is run, and scored on imputed-only sites. This isolates the imputer from
 phasing. Selphi 2 matches or exceeds Selphi 1.5.3 overall and at every bin from the rarest through
 low frequency; at the most common bins the two are within ≈0.001 (seed-level noise). Bold marks the
 higher value in each chromosome group.
