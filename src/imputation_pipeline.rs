@@ -826,8 +826,12 @@ fn evaluate_against_truth(args: &Args, output_path: &str, final_path: &Path) {
         selphi::eval::accuracy::write_imputation_json(&json_path, &comb, &snp, &indel, args.by_type, &counts, Some(&shared), Some(&site), Some(&rawdiag))
             .expect("Failed to write JSON summary");
     } else {
+        if args.truth_raw.is_some() {
+            selphi_info!("  WARNING: --truth-raw is only used on the absent→hom-ref path; \
+pass --homref-absent on to apply it (matched-sites scoring ignores it)");
+        }
         let (site_acc, sample_acc, counts) = selphi::eval::accuracy::evaluate(
-            final_path, truth_path, &shared,
+            final_path, truth_path, &shared, args.exclude_sites.as_deref().map(Path::new),
         ).expect("Evaluation failed");
         selphi::eval::accuracy::print_summary(&site_acc, &sample_acc, &counts);
         selphi::eval::accuracy::write_json_summary(&json_path, &site_acc, &sample_acc, &counts, Some(&shared))
