@@ -41,23 +41,31 @@ pub fn diploid_phase_panel(
     let seed = if seed == 33 { 15052011 } else { seed };
     let n_haps = n_samples * 2;
 
-    // MAF filter the cohort itself → common variants (matches SHAPEIT5
-    // --filter-maf 0.001). Self-AN = cohort allele count.
+    // Scaffold = the cohort's own common variants (mac/an >= 0.001 over CALLED
+    // alleles; a missing allele — the >1 sentinel — counts in neither ac nor an,
+    // the way the imputation-path filter already did). NB this is the run cohort's
+    // frequency, not a population AC/AN as SHAPEIT5 --filter-maf would read; the
+    // absolute MAC cutoff therefore grows with cohort size.
     use rayon::prelude::*;
     let filter_maf = 0.001f64;
-    let an = (n_samples * 2) as u32;
+    let mut n_missing_alleles = 0u64;
     let common_indices: Vec<usize> = (0..n_var).into_par_iter().filter(|&v| {
         let mut ac = 0u32;
+        let mut an = 0u32;
         for si in 0..n_samples {
-            ac += cohort_geno[v * n_samples * 2 + si * 2] as u32;
-            ac += cohort_geno[v * n_samples * 2 + si * 2 + 1] as u32;
+            let a0 = cohort_geno[v * n_samples * 2 + si * 2];
+            let a1 = cohort_geno[v * n_samples * 2 + si * 2 + 1];
+            if a0 <= 1 { ac += a0 as u32; an += 1; }
+            if a1 <= 1 { ac += a1 as u32; an += 1; }
         }
+        if an == 0 { return false; }
         let mac = ac.min(an - ac);
         (mac as f32 / an as f32) >= filter_maf as f32
     }).collect();
+    for &a in cohort_geno.iter() { if a > 1 { n_missing_alleles += 1; } }
     let n_common = common_indices.len();
-    crate::selphi_debug!("  [diploid panel] MAF filter: {}/{} common (self-AN={})",
-        n_common, n_var, an);
+    crate::selphi_debug!("  [diploid panel] MAF filter: {}/{} common (self-AN<={}, {} missing alleles)",
+        n_common, n_var, n_samples * 2, n_missing_alleles);
     if common_indices.is_empty() {
         crate::selphi_info!("  WARNING: no common variants — returning input unphased");
         return (cohort_geno.to_vec(), vec![]);
