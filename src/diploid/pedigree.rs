@@ -80,6 +80,10 @@ pub fn apply_pedigree_scaffold(
     n_var: usize,
     n_samples: usize,
     n_haps: usize,
+    // (n_var × n_samples) mask, set at every het this function phases from the
+    // trio/duo. The phasing engine locks those hets (SHAPEIT5's VAR_SCA) so the
+    // MCMC cannot re-sample a phase the pedigree already determined.
+    mut locked: Option<&mut [bool]>,
 ) -> (usize, usize, usize, usize) {
     let mut n_phased = 0usize;
     let mut n_imputed = 0usize;
@@ -141,24 +145,28 @@ pub fn apply_pedigree_scaffold(
                         phased[v * n_haps + ch0] = 0;
                         phased[v * n_haps + ch1] = 1;
                         n_phased += 1;
+                        if let Some(l) = locked.as_deref_mut() { l[v * n_samples + ci] = true; }
                     }
                     (1, 0) | (2, 0) => {
                         // Mother hom-ref → child got REF from mother
                         phased[v * n_haps + ch0] = 1;
                         phased[v * n_haps + ch1] = 0;
                         n_phased += 1;
+                        if let Some(l) = locked.as_deref_mut() { l[v * n_samples + ci] = true; }
                     }
                     (1, 2) => {
                         // Mother hom-alt → child got ALT from mother
                         phased[v * n_haps + ch0] = 0;
                         phased[v * n_haps + ch1] = 1;
                         n_phased += 1;
+                        if let Some(l) = locked.as_deref_mut() { l[v * n_samples + ci] = true; }
                     }
                     (2, 1) => {
                         // Father hom-alt → child got ALT from father
                         phased[v * n_haps + ch0] = 1;
                         phased[v * n_haps + ch1] = 0;
                         n_phased += 1;
+                        if let Some(l) = locked.as_deref_mut() { l[v * n_samples + ci] = true; }
                     }
                     (1, 1) => { n_unsolved += 1; } // Both het → cannot determine
                     _ => {}
@@ -173,11 +181,13 @@ pub fn apply_pedigree_scaffold(
                         phased[v * n_haps + ch0] = 0;
                         phased[v * n_haps + ch1] = 1;
                         n_phased += 1;
+                        if let Some(l) = locked.as_deref_mut() { l[v * n_samples + ci] = true; }
                     }
                     2 => {
                         phased[v * n_haps + ch0] = 1;
                         phased[v * n_haps + ch1] = 0;
                         n_phased += 1;
+                        if let Some(l) = locked.as_deref_mut() { l[v * n_samples + ci] = true; }
                     }
                     1 => { n_unsolved += 1; }
                     _ => {}
@@ -192,11 +202,13 @@ pub fn apply_pedigree_scaffold(
                         phased[v * n_haps + ch0] = 1;
                         phased[v * n_haps + ch1] = 0;
                         n_phased += 1;
+                        if let Some(l) = locked.as_deref_mut() { l[v * n_samples + ci] = true; }
                     }
                     2 => {
                         phased[v * n_haps + ch0] = 0;
                         phased[v * n_haps + ch1] = 1;
                         n_phased += 1;
+                        if let Some(l) = locked.as_deref_mut() { l[v * n_samples + ci] = true; }
                     }
                     1 => { n_unsolved += 1; }
                     _ => {}
@@ -397,7 +409,7 @@ mod par_tests {
         let ped = vec![PedEntry { child_idx: 0, father_idx: Some(1), mother_idx: Some(2) }];
         let mut phased = vec![0u8; n_var * n_haps];
         let (n_phased, n_imputed, _, n_errors) =
-            apply_pedigree_scaffold(&mut phased, &geno, &ped, n_var, n_samples, n_haps);
+            apply_pedigree_scaffold(&mut phased, &geno, &ped, n_var, n_samples, n_haps, None);
         assert_eq!(n_errors, 0, "a missing parent must NOT count as a Mendelian error");
         assert_eq!(n_phased, 1, "the available hom-ref mother should phase the child");
         assert_eq!(n_imputed, 0);
@@ -409,7 +421,33 @@ mod par_tests {
         let geno2: Vec<u8> = vec![0, 1, 0, 0, 0, 0];
         let mut phased2 = vec![0u8; n_var * n_haps];
         let (_, _, _, n_err2) =
-            apply_pedigree_scaffold(&mut phased2, &geno2, &ped, n_var, n_samples, n_haps);
+            apply_pedigree_scaffold(&mut phased2, &geno2, &ped, n_var, n_samples, n_haps, None);
         assert_eq!(n_err2, 1, "real hom-ref + hom-ref parents with a het child = Mendelian error");
+    }
+
+    #[test]
+    fn pedigree_marks_the_locked_hets() {
+        // Every het the scaffold resolves must be reported in the lock mask, so the
+        // diploid engine can carry it as VAR_SCA instead of re-sampling it. Before
+        // 2026-09-02 no lock mask existed and the resolved phase was silently
+        // re-derived by the MCMC.
+        let (n_var, n_samples, n_haps) = (2usize, 3usize, 6usize);
+        // var 0: child het, father hom-ref, mother het  -> resolvable
+        // var 1: child het, both parents het            -> unsolved
+        let geno: Vec<u8> = vec![
+            0, 1, 0, 0, 0, 1,
+            0, 1, 0, 1, 0, 1,
+        ];
+        let ped = vec![PedEntry { child_idx: 0, father_idx: Some(1), mother_idx: Some(2) }];
+        let mut phased = vec![0u8; n_var * n_haps];
+        let mut locked = vec![false; n_var * n_samples];
+        let (n_phased, _, n_unsolved, _) = apply_pedigree_scaffold(
+            &mut phased, &geno, &ped, n_var, n_samples, n_haps, Some(&mut locked));
+        assert_eq!(n_phased, 1);
+        assert_eq!(n_unsolved, 1);
+        assert!(locked[0 * n_samples], "the resolved het must be locked");
+        assert!(!locked[1 * n_samples], "the unsolved het must stay free");
+        assert!(!locked[0 * n_samples + 1] && !locked[0 * n_samples + 2],
+            "only the child is locked, never the parents");
     }
 }

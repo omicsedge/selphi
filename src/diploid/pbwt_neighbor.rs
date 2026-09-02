@@ -479,10 +479,13 @@ impl PbwtNeighborIndex {
 
     /// Get union of conditioning sets for h0 and h1 (fast bitwise OR).
     pub fn get_conditioning_union(&self, h0: usize, h1: usize) -> Vec<usize> {
-        // Fallback: merge two sets
+        // Merge the two sets. Membership goes through a HashSet (O(1)) instead of
+        // a linear `cs.contains` (O(n^2) on a few-hundred-hap conditioning set);
+        // push order is preserved, so the result is byte-identical.
         let mut cs = self.get_conditioning_set(h0);
+        let mut seen: std::collections::HashSet<usize> = cs.iter().copied().collect();
         for c in self.get_conditioning_set(h1) {
-            if !cs.contains(&c) { cs.push(c); }
+            if seen.insert(c) { cs.push(c); }
         }
         cs
     }

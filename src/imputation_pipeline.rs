@@ -53,6 +53,8 @@ fn resolve_phasing_engine(args: &Args, n_chip: usize) -> ResolvedEngine {
 /// constraints from parent-child relationships pre-phase deterministic sites
 /// before the HMM-based phasing runs. No-op when `--ped` is absent or when
 /// the target is already phased.
+/// Returns the (n_chip × n_samples) mask of hets the pedigree phased, so the
+/// diploid engine can lock them instead of re-sampling them in the MCMC.
 fn apply_pedigree_prephase(
     args: &Args, needs_phasing: bool,
     targ_alleles: &mut [u8],
@@ -60,20 +62,23 @@ fn apply_pedigree_prephase(
     target_idx: &[usize], target_genotypes: &[Vec<[u8; 2]>],
     n_chip: usize, n_samples: usize, n_haps: usize,
     transforms: &[u8],
-) {
-    let Some(ped_path) = args.ped.as_deref() else { return; };
-    if !needs_phasing { return; }
+) -> Option<Vec<bool>> {
+    let ped_path = args.ped.as_deref()?;
+    if !needs_phasing { return None; }
     let ped_entries = selphi::diploid::pedigree::parse_ped(Path::new(ped_path), sample_names)
         .unwrap_or_else(|e| { selphi_error!("Cannot read PED file: {}", e); std::process::exit(1); });
-    if ped_entries.is_empty() { return; }
+    if ped_entries.is_empty() { return None; }
     // Recode to panel orientation so the scaffold reads the same frame it writes.
     let flat_geno = selphi::diploid::pedigree::build_flat_genotypes(
         target_idx, target_genotypes, n_chip, n_samples, transforms);
+    let mut locked = vec![false; n_chip * n_samples];
     let (n_phased, n_imp, n_uns, n_err) = selphi::diploid::pedigree::apply_pedigree_scaffold(
         targ_alleles, &flat_geno, &ped_entries, n_chip, n_samples, n_haps,
+        Some(&mut locked),
     );
     selphi_step!("Pedigree scaffold: {} trios/duos, {} phased, {} imputed, {} unsolved, {} Mendelian errors",
         ped_entries.len(), n_phased, n_imp, n_uns, n_err);
+    Some(locked)
 }
 
 /// Detect haploid samples (chromosome X males by heterozygosity, or a
@@ -405,6 +410,9 @@ struct PhasingInputs<'a> {
     ref_positions: &'a [i64],
     wgs_idx: &'a [usize],
     n_chip: usize, n_samples: usize, n_ref: usize,
+    /// (n_chip × n_samples) mask of hets already resolved by `--ped`. The
+    /// diploid engine locks these (VAR_SCA) so the MCMC cannot re-sample them.
+    ped_locked: Option<&'a [bool]>,
     /// Phasing RNG seed for this run. Normally `args.seed`; the phase-ensemble
     /// path overrides it per ensemble member (`args.seed + i`).
     seed: i64,
@@ -436,7 +444,7 @@ struct PhasingResult {
 fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
     let PhasingInputs {
         args, srp, map_path, targ_alleles, raw_chip_cm, chip_bps,
-        ref_positions, wgs_idx, n_chip, n_samples, n_ref, seed,
+        ref_positions, wgs_idx, n_chip, n_samples, n_ref, ped_locked, seed,
     } = *inp;
 
     selphi_step!("Input is unphased — running phasing pipeline...");
@@ -447,8 +455,22 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
     let engine = resolve_phasing_engine(args, n_chip);
 
     // Full ref bitmatrix is shared between phasing and imputation. Phase-only
-    // diploid is the one path that skips it (only the common subset is needed).
-    let ref_bm_full = if !args.phase_only || engine != ResolvedEngine::Diploid {
+    // diploid does not need it for phase_common (the common-MAF subset is enough),
+    // but phase_rare weaves it into its PBWT context, and without it rare-variant
+    // phasing falls back to target haplotypes only — strictly worse than what the
+    // integrated run produces, silently. So build it here too when it fits
+    // SELPHI_PHASE_ONLY_RARE_REF_GB (a chr22 array × 1KG is 5.6 MB; a WGS target ×
+    // TOPMed would be ~21 GB, which is why it is budgeted rather than unconditional).
+    let want_full = !args.phase_only || engine != ResolvedEngine::Diploid || {
+        let bytes = n_chip * n_ref.div_ceil(64) * 8;
+        let budget = (selphi::config::f64_or("SELPHI_PHASE_ONLY_RARE_REF_GB", 2.0) * 1e9) as usize;
+        if bytes > budget {
+            selphi_step!("Phase-only diploid: full-chip ref bitmatrix skipped ({:.1} GB > {:.1} GB budget) — phase_rare runs target-only",
+                bytes as f64 / 1e9, budget as f64 / 1e9);
+            false
+        } else { true }
+    };
+    let ref_bm_full = if want_full {
         let bm = srp.extract_ref_alleles_bitmatrix(wgs_idx);
         selphi_step!("Ref bitmatrix extracted ({} chip × {} haps, {:.1} MB)",
             n_chip, n_ref, (bm.n_words() * n_chip * 8) as f64 / 1e6);
@@ -540,6 +562,7 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
                 &ref_bp, &map_bp_raw, &map_cm_raw,
                 n_chip, n_samples, n_ref,
                 seed, args.threads, args.max_cond_haps, n_members,
+                ped_locked,
             );
             let phased0 = dp.remove(0);
             (phased0, dr, None, dp)  // remaining scaffolds = intra-run extra members
@@ -1193,7 +1216,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // 6b. Phase if input is unphased (in-memory fusion — no VCF round-trip)
     let needs_phasing = !is_phased || args.force_phasing;
     let mut targ_alleles = targ_alleles;
-    apply_pedigree_prephase(
+    let ped_locked = apply_pedigree_prephase(
         args, needs_phasing, &mut targ_alleles,
         &sample_names, &target_idx, &target_genotypes,
         n_chip, n_samples, n_haps, &allele_transforms,
@@ -1231,7 +1254,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
             args, srp: &srp, map_path,
             targ_alleles: &targ_alleles, raw_chip_cm: &raw_chip_cm, chip_bps: &chip_bps,
             ref_positions: &ref_positions, wgs_idx: &wgs_idx,
-            n_chip, n_samples, n_ref, seed: args.seed,
+            n_chip, n_samples, n_ref, ped_locked: ped_locked.as_deref(), seed: args.seed,
         });
         let em_ne = em_ne_from_window_ri(&pr.window_ri, args.est_ne, n_chip, n_ref);
 
@@ -1279,7 +1302,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                     args, srp: &srp, map_path,
                     targ_alleles: unph, raw_chip_cm: &raw_chip_cm, chip_bps: &chip_bps,
                     ref_positions: &ref_positions, wgs_idx: &wgs_idx,
-                    n_chip, n_samples, n_ref, seed: m_seed,
+                    n_chip, n_samples, n_ref, ped_locked: ped_locked.as_deref(), seed: m_seed,
                 });
                 let emi = em_ne_from_window_ri(&pri.window_ri, args.est_ne, n_chip, n_ref);
                 let emi_use = if args.no_em_ne || pri.engine == ResolvedEngine::Diploid { None } else { Some(emi) };

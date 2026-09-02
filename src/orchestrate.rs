@@ -305,6 +305,9 @@ fn phase_chr(
                     raw_chip_cm, chip_bps, &ref_bp, &map_bp_raw, &map_cm_raw,
                     n_chip, n_samples, n_ref,
                     config.seed, config.threads, config.max_cond_haps, 1,
+                    // Multi-chr has no --ped path (the pedigree scaffold is applied
+                    // in the single-chr pipeline only), so nothing to lock here.
+                    None,
                 );
                 scaffolds.remove(0)
             }

@@ -16,15 +16,23 @@ struct CFlip {
     pgenotype: u8,
     /// Support score (absolute value = confidence)
     score: f32,
+    /// Which pass produced it: 1 = threshold vote (integer neighbour counts,
+    /// |score| >= 2), 2 = divergence-weighted vote (a cM-scaled sum). The two
+    /// are in DIFFERENT UNITS, so comparing |score| across them let a
+    /// low-information pass-2 result with long flanking matches outrank a
+    /// pass-1 result that had actual carrier votes. 0 = unset.
+    pass: u8,
 }
 
 impl CFlip {
-    fn new(pgenotype: u8, score: f32) -> Self {
-        Self { pgenotype, score }
+    fn new(pgenotype: u8, score: f32, pass: u8) -> Self {
+        Self { pgenotype, score, pass }
     }
 
-    /// True if this result is more confident than other.
+    /// True if this result is more confident than `other`: a pass-1 result
+    /// always beats a pass-2 one, and within a pass the larger |score| wins.
     fn better_than(&self, other: &CFlip) -> bool {
+        if self.pass != other.pass { return self.pass < other.pass; }
         self.score.abs() > other.score.abs()
     }
 }
@@ -98,12 +106,14 @@ pub fn run_phase_rare(
     for &v in &scaffold_sites { var_type[v] = 1; }
     for v in 0..n_var {
         if scaffold_set.contains(&v) { continue; }
-        // Check if any target sample is het at this site
+        // Check if any target sample is het at this site. A genotype with a
+        // missing allele (the >1 sentinel) is a NO-CALL, not a het: comparing the
+        // raw bytes made `./1` look heterozygous and added a phantom rare het.
         let mut has_het = false;
         for si in 0..n_samples {
             let a0 = target_geno[v * n_samples * 2 + si * 2];
             let a1 = target_geno[v * n_samples * 2 + si * 2 + 1];
-            if a0 != a1 { has_het = true; break; }
+            if a0 <= 1 && a1 <= 1 && a0 != a1 { has_het = true; break; }
         }
         if has_het {
             var_type[v] = 2;
@@ -134,7 +144,7 @@ pub fn run_phase_rare(
         for si in 0..n_samples {
             let a0 = target_geno[rv * n_samples * 2 + si * 2];
             let a1 = target_geno[rv * n_samples * 2 + si * 2 + 1];
-            if a0 != a1 { // het
+            if a0 <= 1 && a1 <= 1 && a0 != a1 { // het (a missing allele is a no-call)
                 rare_het_samples[ri].push(si);
             }
         }
@@ -217,10 +227,10 @@ pub fn run_phase_rare(
 
     // Phase state: per rare het, accumulate forward/backward results
     let mut phase_fwd: Vec<Vec<CFlip>> = rare_sites.iter().enumerate().map(|(ri, _)| {
-        vec![CFlip::new(0, 0.0); rare_het_samples[ri].len()]
+        vec![CFlip::new(0, 0.0, 0); rare_het_samples[ri].len()]
     }).collect();
     let mut phase_bwd: Vec<Vec<CFlip>> = rare_sites.iter().enumerate().map(|(ri, _)| {
-        vec![CFlip::new(0, 0.0); rare_het_samples[ri].len()]
+        vec![CFlip::new(0, 0.0, 0); rare_het_samples[ri].len()]
     }).collect();
 
     // Build scaffold bitmatrix. If a full-chip reference panel is supplied
@@ -298,7 +308,7 @@ pub fn run_phase_rare(
             let bwd = &phase_bwd[ri][hi];
 
             let best = if fwd.pgenotype == 0 && bwd.pgenotype == 0 {
-                CFlip::new(2, 0.0)
+                CFlip::new(2, 0.0, 2)
             } else if fwd.pgenotype == 0 {
                 *bwd
             } else if bwd.pgenotype == 0 {
@@ -322,9 +332,14 @@ pub fn run_phase_rare(
 
     crate::selphi_debug!("  [diploid] phase_rare complete: {} rare hets phased", n_phased);
 
-    // Post-hoc singleton phasing: use IBD segment lengths for MAC=1 variants
-    let n_haps = n_samples * 2;
-    phase_singletons_ibd(phased, target_geno, cm, n_var, n_samples, n_haps, &scaffold_sites);
+    // MAC<=1 hets keep the forward/backward vote. A post-hoc override used to
+    // reassign every one of them from the length of the haplotype's own allele
+    // run at scaffold sites, in the direction OPPOSITE to SHAPEIT5's
+    // phaseCoalescentViterbi. It was removed: the vote's second pass already
+    // implements the coalescent rule with the right quantity (the PBWT
+    // divergence, i.e. a real match length) in the right direction, and the
+    // override cost 13.9 pp of singleton switch error (48.98% -> 35.10% on a
+    // 696-sample de-novo re-phasing) and 1.59 pp of 54-trio SER.
 }
 
 /// Run one direction of PBWT sweep (forward or backward) and phase rare hets.
@@ -510,11 +525,11 @@ fn run_pbwt_phase(
                     if v > thresh {
                         c_vec[h0] = 1;
                         c_vec[h1] = -1;
-                        phase_results[ri][hi] = CFlip::new(2, v);
+                        phase_results[ri][hi] = CFlip::new(2, v, 1);
                     } else if v < -thresh {
                         c_vec[h0] = -1;
                         c_vec[h1] = 1;
-                        phase_results[ri][hi] = CFlip::new(1, v);
+                        phase_results[ri][hi] = CFlip::new(1, v, 1);
                     } else {
                         next_unphased.push(hi);
                     }
@@ -585,133 +600,13 @@ fn run_pbwt_phase(
                 if v > 0.0 {
                     c_vec[h0] = 1;
                     c_vec[h1] = -1;
-                    phase_results[ri][hi] = CFlip::new(2, v);
+                    phase_results[ri][hi] = CFlip::new(2, v, 2);
                 } else {
                     c_vec[h0] = -1;
                     c_vec[h1] = 1;
-                    phase_results[ri][hi] = CFlip::new(1, v);
+                    phase_results[ri][hi] = CFlip::new(1, v, 2);
                 }
             }
         }
     }
 }
-
-/// Singleton phasing via IBD segment length at scaffold sites.
-///
-/// For each singleton het (MAC=1 among targets), identifies the haplotype with
-/// the longer consistent run at scaffold sites (proxy for IBD segment length).
-/// The singleton allele is assigned to the haplotype with the LONGER segment
-/// (matching SHAPEIT5's phaseCoalescentViterbi logic).
-///
-/// Confidence = max(w0, w1) / (w0 + w1), range [0.5, 1.0].
-pub fn phase_singletons_ibd(
-    phased: &mut [u8],
-    target_geno: &[u8],
-    cm: &[f64],
-    n_var: usize,
-    n_samples: usize,
-    n_haps: usize,
-    scaffold_indices: &[usize],
-) {
-    if scaffold_indices.is_empty() || n_samples == 0 { return; }
-
-    let n_scaffold = scaffold_indices.len();
-    let mut n_phased = 0u32;
-
-    // Per-site folded allele count (ALT-allele sum over all 2·n_samples haplotypes).
-    // This is a SITE property — invariant across the per-sample loop below, which only
-    // ever writes `phased`, never `target_geno`. Precompute it ONCE instead of redoing
-    // the O(n_samples) fold inside the per-(sample × het-site) inner loop (which made
-    // the singleton scan O(n_var · n_samples²)). Byte-identical; quadratic→linear in n.
-    let site_ac: Vec<u32> = (0..n_var).map(|v| {
-        let mut ac = 0u32;
-        for s2 in 0..n_samples {
-            ac += target_geno[v * n_samples * 2 + s2 * 2] as u32;
-            ac += target_geno[v * n_samples * 2 + s2 * 2 + 1] as u32;
-        }
-        ac
-    }).collect();
-
-    for si in 0..n_samples {
-        let h0 = si * 2;
-        let h1 = si * 2 + 1;
-
-        // Build per-haplotype "run-length map" at scaffold sites:
-        // For each scaffold site, measure length of consistent allele run
-        // containing that site (forward + backward until allele changes).
-        // This is a proxy for the Viterbi IBD segment length.
-        let mut seg_len_h0 = vec![0.0f64; n_scaffold];
-        let mut seg_len_h1 = vec![0.0f64; n_scaffold];
-
-        // Forward sweep: measure run starts
-        let mut run_start_h0 = 0usize;
-        let mut run_start_h1 = 0usize;
-        for i in 1..n_scaffold {
-            let sv = scaffold_indices[i];
-            let sv_prev = scaffold_indices[i - 1];
-            if phased[sv * n_haps + h0] != phased[sv_prev * n_haps + h0] {
-                // State change on h0: record run for previous segment
-                let run_cm = cm[scaffold_indices[i - 1]] - cm[scaffold_indices[run_start_h0]];
-                for j in run_start_h0..i {
-                    seg_len_h0[j] = run_cm;
-                }
-                run_start_h0 = i;
-            }
-            if phased[sv * n_haps + h1] != phased[sv_prev * n_haps + h1] {
-                let run_cm = cm[scaffold_indices[i - 1]] - cm[scaffold_indices[run_start_h1]];
-                for j in run_start_h1..i {
-                    seg_len_h1[j] = run_cm;
-                }
-                run_start_h1 = i;
-            }
-        }
-        // Final runs
-        if n_scaffold > 0 {
-            let run_cm = cm[scaffold_indices[n_scaffold - 1]] - cm[scaffold_indices[run_start_h0]];
-            for j in run_start_h0..n_scaffold { seg_len_h0[j] = run_cm; }
-            let run_cm = cm[scaffold_indices[n_scaffold - 1]] - cm[scaffold_indices[run_start_h1]];
-            for j in run_start_h1..n_scaffold { seg_len_h1[j] = run_cm; }
-        }
-
-        // Phase singletons
-        for v in 0..n_var {
-            let g0 = target_geno[v * n_samples * 2 + si * 2];
-            let g1 = target_geno[v * n_samples * 2 + si * 2 + 1];
-            if g0 == g1 || g0 + g1 != 1 { continue; }
-
-            // Check if singleton (MAC=1) — folded count from the precomputed site_ac.
-            let mac = site_ac[v];
-            if mac.min(n_samples as u32 * 2 - mac) > 1 { continue; }
-
-            // Find flanking scaffold position
-            let pos_cm = cm.get(v).copied().unwrap_or(0.0);
-            let idx = scaffold_indices.partition_point(|&s| cm[s] < pos_cm);
-
-            // Get IBD segment lengths for both haplotypes (max of flanking)
-            let w0 = if idx == 0 { seg_len_h0[0] }
-                else if idx >= n_scaffold { seg_len_h0[n_scaffold - 1] }
-                else { seg_len_h0[idx - 1].max(seg_len_h0[idx]) };
-
-            let w1 = if idx == 0 { seg_len_h1[0] }
-                else if idx >= n_scaffold { seg_len_h1[n_scaffold - 1] }
-                else { seg_len_h1[idx - 1].max(seg_len_h1[idx]) };
-
-            // Assign singleton to haplotype with LONGER IBD segment
-            if w0 > w1 {
-                phased[v * n_haps + h0] = 1;
-                phased[v * n_haps + h1] = 0;
-                n_phased += 1;
-            } else if w1 > w0 {
-                phased[v * n_haps + h0] = 0;
-                phased[v * n_haps + h1] = 1;
-                n_phased += 1;
-            }
-            // w0 == w1: keep existing phase (50/50 confidence)
-        }
-    }
-
-    if n_phased > 0 {
-        crate::selphi_debug!("  [singleton] Phased {} singletons via IBD segment length", n_phased);
-    }
-}
-

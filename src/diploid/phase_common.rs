@@ -143,6 +143,11 @@ pub fn run_phase_common_bm(
     // haplotypes are captured here (outer = Main-iter index, inner = per target
     // sample). Used by the intra-run phase ensemble (Route A). None = no capture.
     main_samples: Option<&mut Vec<Vec<(Vec<u8>, Vec<u8>)>>>,
+    // (n_var × n_samples) mask of hets a pedigree already resolved. Those are
+    // skipped by the PBWT initialisation sweep and rebuilt as VAR_SCA, so the
+    // segment HMM treats them as one fixed orientation per segment (SHAPEIT5's
+    // scaffold semantics) instead of re-sampling each of them.
+    locked: Option<&[bool]>,
 ) {
     // SELPHI_DIPLOID_DISPATCH_DIAG: per-run counters (see hmm_segment.rs).
     if rare_dispatch_diag() {
@@ -181,6 +186,10 @@ pub fn run_phase_common_bm(
     // rate at 0.04*k per cM whatever the panel size, the way the imputation Ne
     // (36.4*n_ref) already does. Either knob also disables the EM update, which
     // would otherwise overwrite the requested value on the first burn-in pass.
+    // Opt out of voting an allele for no-calls in the PBWT initialisation sweep
+    // (restores the pre-2026-09-02 behaviour, where a no-call entered the sweep,
+    // the graph rebuild and the MCMC as hom-REF). Read once, outside the sweep.
+    let mis_vote = !crate::config::is_one("SELPHI_SWEEP_NO_MIS_VOTE");
     let ne_init = resolve_phase_ne(n_haps_total);
     let mut hmm_params = HmmParams::with_allele_freqs(cm, n_haps_total, ne_init, Some(&allele_counts));
 
@@ -291,50 +300,113 @@ pub fn run_phase_common_bm(
                 }
 
                 let mut n_het = 0u32;
+                let mut n_mis = 0u32;
                 for h in 0..n_hap {
                     g_score[h] = if row_buf[h] != 0 { 1.0 } else { -1.0 };
                 }
 
                 let mut amb = vec![false; n_ind];
                 let mut het = vec![false; n_ind];
+                let mut mis = vec![false; n_ind];
                 for si in 0..n_samples {
                     let h0 = si * 2;
                     let h1 = si * 2 + 1;
                     let tg0 = target_geno[l * n_samples * 2 + si * 2];
                     let tg1 = target_geno[l * n_samples * 2 + si * 2 + 1];
-                    if tg0 != tg1 {
+                    // A pedigree-locked het keeps its resolved orientation: it is
+                    // not made ambiguous here and it keeps voting as a neighbour.
+                    let is_locked = locked.is_some_and(|m| m[l * n_samples + si]);
+                    if mis_vote && (tg0 > 1 || tg1 > 1) {
+                        // No-call (or half-call): BOTH alleles are unknown. Zeroing the
+                        // score stops a no-call from voting REF for its PBWT neighbours,
+                        // and the two passes below vote an allele for each of its haps
+                        // (SHAPEIT5 conditioning_set_solve.cpp:112-121 and :149-157).
+                        // Without this a no-call entered the sweep, the graph rebuild and
+                        // the whole MCMC as hom-REF.
+                        mis[si] = true; amb[si] = true;
+                        g_score[h0] = 0.0; g_score[h1] = 0.0;
+                        n_mis += 1;
+                    } else if tg0 != tg1 && !is_locked {
                         het[si] = true; amb[si] = true;
                         g_score[h0] = 0.0; g_score[h1] = 0.0;
                         n_het += 1;
                     }
                 }
 
-                if n_het > 0 && do_phase {
+                if (n_het > 0 || n_mis > 0) && do_phase {
                     let mut thresh = 2.5f64;
                     let mut remaining = n_het;
+                    let mut remaining_mis = n_mis;
                     while remaining > 0 && thresh > 0.5 {
                         let old_remaining = remaining;
                         remaining = 0;
+                        remaining_mis = 0;
                         for si in 0..n_samples {
-                            if !amb[si] || !het[si] { continue; }
+                            if !amb[si] { continue; }
                             let h0 = si * 2; let h1 = si * 2 + 1;
                             let r0 = r_arr[h0] as usize; let r1 = r_arr[h1] as usize;
-                            let mut s = 0.0f64;
-                            if r0 > 0 { s += g_score[a[r0 - 1] as usize] as f64; }
-                            if r0 < n_hap - 1 { s += g_score[a[r0 + 1] as usize] as f64; }
-                            if r1 > 0 { s -= g_score[a[r1 - 1] as usize] as f64; }
-                            if r1 < n_hap - 1 { s -= g_score[a[r1 + 1] as usize] as f64; }
-                            if s > thresh {
-                                g_score[h0] = 1.0; g_score[h1] = -1.0; amb[si] = false;
-                            } else if s < -thresh {
-                                g_score[h0] = -1.0; g_score[h1] = 1.0; amb[si] = false;
-                            } else { remaining += 1; }
+                            if het[si] {
+                                let mut s = 0.0f64;
+                                if r0 > 0 { s += g_score[a[r0 - 1] as usize] as f64; }
+                                if r0 < n_hap - 1 { s += g_score[a[r0 + 1] as usize] as f64; }
+                                if r1 > 0 { s -= g_score[a[r1 - 1] as usize] as f64; }
+                                if r1 < n_hap - 1 { s -= g_score[a[r1 + 1] as usize] as f64; }
+                                if s > thresh {
+                                    g_score[h0] = 1.0; g_score[h1] = -1.0; amb[si] = false;
+                                } else if s < -thresh {
+                                    g_score[h0] = -1.0; g_score[h1] = 1.0; amb[si] = false;
+                                } else { remaining += 1; }
+                            } else if mis[si] {
+                                // Both haps voted independently; committed only when both
+                                // neighbours agree (the +-2 patterns). s0/s1 start at 0 —
+                                // SHAPEIT5 leaves them stale at the array boundary, which
+                                // is a latent bug there, not behaviour worth copying.
+                                let mut s0 = 0.0f64;
+                                let mut s1 = 0.0f64;
+                                if r0 > 0 { s0 += g_score[a[r0 - 1] as usize] as f64; }
+                                if r0 < n_hap - 1 { s0 += g_score[a[r0 + 1] as usize] as f64; }
+                                if r1 > 0 { s1 += g_score[a[r1 - 1] as usize] as f64; }
+                                if r1 < n_hap - 1 { s1 += g_score[a[r1 + 1] as usize] as f64; }
+                                if (s0 == -2.0 || s0 == 2.0) && (s1 == -2.0 || s1 == 2.0) {
+                                    g_score[h0] = if s0 > 0.0 { 1.0 } else { -1.0 };
+                                    g_score[h1] = if s1 > 0.0 { 1.0 } else { -1.0 };
+                                    amb[si] = false;
+                                } else { remaining_mis += 1; }
+                            }
                         }
                         if remaining == old_remaining { thresh -= 1.0; }
                     }
-                    if remaining > 0 {
+                    if remaining > 0 || remaining_mis > 0 {
                         for si in 0..n_samples {
-                            if !amb[si] || !het[si] { continue; }
+                            if !amb[si] { continue; }
+                            if mis[si] {
+                                // Divergence-weighted vote per haplotype, no agreement
+                                // requirement (conditioning_set_solve.cpp:149-157).
+                                let h0 = si * 2; let h1 = si * 2 + 1;
+                                let r0 = r_arr[h0] as usize; let r1 = r_arr[h1] as usize;
+                                let mut s0 = 0.0f64;
+                                let mut s1 = 0.0f64;
+                                if r0 > 0 {
+                                    s0 += (g_score[a[r0 - 1] as usize]
+                                        * score_bit[(l as i32 - c_arr[r0] + 1).max(1) as usize]) as f64;
+                                }
+                                if r0 < n_hap - 1 {
+                                    s0 += (g_score[a[r0 + 1] as usize]
+                                        * score_bit[(l as i32 - c_arr[r0 + 1] + 1).max(1) as usize]) as f64;
+                                }
+                                if r1 > 0 {
+                                    s1 += (g_score[a[r1 - 1] as usize]
+                                        * score_bit[(l as i32 - c_arr[r1] + 1).max(1) as usize]) as f64;
+                                }
+                                if r1 < n_hap - 1 {
+                                    s1 += (g_score[a[r1 + 1] as usize]
+                                        * score_bit[(l as i32 - c_arr[r1 + 1] + 1).max(1) as usize]) as f64;
+                                }
+                                g_score[h0] = if s0 > 0.0 { 1.0 } else { -1.0 };
+                                g_score[h1] = if s1 > 0.0 { 1.0 } else { -1.0 };
+                                continue;
+                            }
+                            if !het[si] { continue; }
                             let h0 = si * 2; let h1 = si * 2 + 1;
                             let r0 = r_arr[h0] as usize; let r1 = r_arr[h1] as usize;
                             let mut s = 0.0f64;
@@ -369,7 +441,7 @@ pub fn run_phase_common_bm(
                     // written, and chunk assignments are disjoint, so no data race.
                     let row_base = l * bm_n_words;
                     for si in 0..n_samples {
-                        if het[si] {
+                        if het[si] || mis[si] {
                             let h0 = si * 2; let h1 = si * 2 + 1;
                             let v0 = if g_score[h0] > 0.0 { 1u8 } else { 0 };
                             let v1 = if g_score[h1] > 0.0 { 1u8 } else { 0 };
@@ -416,12 +488,15 @@ pub fn run_phase_common_bm(
                 geno[v * 2] = if hap_bm.get(v, h0) { 1 } else { 0 };
                 geno[v * 2 + 1] = if hap_bm.get(v, h1) { 1 } else { 0 };
             }
-            graphs[si] = build_graph(si, &geno, n_var, None);
+            let flags: Option<Vec<bool>> = locked.map(|l|
+                (0..n_var).map(|v| l[v * n_samples + si]).collect());
+            graphs[si] = build_graph(si, &geno, n_var, flags.as_deref());
         }
 
         let total_segments: usize = graphs.iter().map(|g| g.n_segments).sum();
-        crate::selphi_debug!("  [diploid] PBWT phasing sweep: {:.0}ms, {} segments after re-graph",
-            t0_sweep.elapsed().as_secs_f64() * 1000.0, total_segments);
+        let total_missing: usize = graphs.iter().map(|g| g.n_missing).sum();
+        crate::selphi_debug!("  [diploid] PBWT phasing sweep: {:.0}ms, {} segments after re-graph, n_missing={}",
+            t0_sweep.elapsed().as_secs_f64() * 1000.0, total_segments, total_missing);
 
         // Recompute allele counts from bitmatrix
         for v in 0..n_var {

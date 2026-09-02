@@ -90,6 +90,7 @@ pub fn diploid_phase_panel(
         cohort_geno, empty_ref, &common_indices, None,
         CommonPrep { target_geno_common, cm_common, cm_full, bp_common },
         bp, n_var, n_samples, /* n_ref = */ 0, seed, n_threads, max_cond_haps, 1,
+        None,
     );
     (scaffolds.remove(0), window_ri)
 }
@@ -108,6 +109,10 @@ pub fn diploid_phase_bm_prefiltered(
     // Intra-run phase ensemble member count (>=1). Returns this many phased
     // scaffolds (slot 0 = Viterbi solve, slots 1.. = thinned Main MCMC samples).
     n_members: usize,
+    // (n_var × n_samples) mask of hets `--ped` already resolved. Those become
+    // VAR_SCA (pre-phased) in the genotype graph, so the segment HMM carries
+    // them as one orientation per segment instead of re-sampling each one.
+    ped_locked: Option<&[bool]>,
 ) -> (Vec<Vec<u8>>, Vec<(f32, usize, usize)>) {
     let seed = if seed == 33 { 15052011 } else { seed };
     let n_haps = n_samples * 2;
@@ -134,10 +139,37 @@ pub fn diploid_phase_bm_prefiltered(
             .copy_from_slice(&target_geno[src..src + n_samples * 2]);
     }
 
+    // Restrict the lock mask to the common-variant subset the engine runs on.
+    //
+    // OPT-IN, and deliberately so. Locking the pedigree's hets as VAR_SCA is what
+    // SHAPEIT5 does with a scaffold, and until 2026-09-02 it was unreachable here
+    // (no call site ever passed `phased_flags`), so `--ped` resolved a phase that
+    // the MCMC then re-sampled from scratch. Wiring it up is faithful — and it
+    // MEASURED WORSE. On 54 trios at 9,283 array sites (162-sample cohort, 75,757
+    // hets locked, verified 99.95% correct against the children's WGS truth) it
+    // costs 0.0037 site R2 and 0.0021 per-sample R2 (paired t = -5.71, 43/54
+    // children worse) and raises switch error against an independent truth from
+    // 1.08% to 1.41%. The phase being locked is right; what hurts is the graph it
+    // produces: with 82% of hets fixed, segments run to the MAX_AMB=22 ceiling
+    // instead of breaking every 3 hets (91,629 -> 69,107 segments), and the
+    // segment HMM cannot change copied haplotype inside a segment. SHAPEIT5's
+    // scaffold is a small residual set, not four hets in five.
+    // Set SELPHI_PED_LOCK=1 to enable; default keeps the shipped behaviour.
+    let ped_locked = if crate::config::is_one("SELPHI_PED_LOCK") { ped_locked } else { None };
+    let locked_common: Option<Vec<bool>> = ped_locked.map(|l| {
+        let mut m = vec![false; n_common * n_samples];
+        for (ci, &v) in common_chip_indices.iter().enumerate() {
+            m[ci * n_samples..(ci + 1) * n_samples]
+                .copy_from_slice(&l[v * n_samples..(v + 1) * n_samples]);
+        }
+        m
+    });
+
     _diploid_run(
         target_geno, common_ref_bm, common_chip_indices, full_chip_ref_bm,
         CommonPrep { target_geno_common, cm_common, cm_full: chip_cm_full, bp_common },
         chip_bp, n_var, n_samples, n_ref, seed, n_threads, max_cond_haps, n_members,
+        locked_common.as_deref(),
     )
 }
 
@@ -162,6 +194,9 @@ fn _diploid_run(
     // Slot 0 = the Viterbi solve (byte-identical to the single-run default);
     // slots 1.. = thinned post-burn-in Main MCMC samples from the SAME chain.
     n_members: usize,
+    // (n_common × n_samples) `--ped` lock mask, already restricted to the
+    // common-variant subset. None on every path without a pedigree.
+    locked_common: Option<&[bool]>,
 ) -> (Vec<Vec<u8>>, Vec<(f32, usize, usize)>) {
     use rayon::prelude::*;
     let seed = if seed == 33 { 15052011 } else { seed };
@@ -181,14 +216,17 @@ fn _diploid_run(
                 geno[ci * 2] = target_geno_common[ci * n_samples * 2 + si * 2];
                 geno[ci * 2 + 1] = target_geno_common[ci * n_samples * 2 + si * 2 + 1];
             }
-            genotype_graph::build_graph(si, &geno, n_common, None)
+            let flags: Option<Vec<bool>> = locked_common.map(|l|
+                (0..n_common).map(|ci| l[ci * n_samples + si]).collect());
+            genotype_graph::build_graph(si, &geno, n_common, flags.as_deref())
         })
         .collect();
 
     let total_segments: usize = graphs.iter().map(|g| g.n_segments).sum();
     let total_amb: usize = graphs.iter().map(|g| g.n_ambiguous).sum();
-    crate::selphi_debug!("  [diploid] {} graphs: {} total segments, {} ambiguous sites",
-        n_samples, total_segments, total_amb);
+    let total_mis: usize = graphs.iter().map(|g| g.n_missing).sum();
+    crate::selphi_debug!("  [diploid] {} graphs: {} total segments, {} ambiguous sites, {} missing",
+        n_samples, total_segments, total_amb, total_mis);
 
     // Build unified bitmatrix: target haps from graphs + ref haps from common_ref_bm
     // No intermediate byte array — saves ~200 MB (54 samples) to ~100 GB (50K samples)
@@ -234,6 +272,7 @@ fn _diploid_run(
         &target_geno_common,
         max_cond_haps,
         if n_members > 1 { Some(&mut main_samples) } else { None },
+        locked_common,
     );
 
     // No-call mask from the ORIGINAL target genotypes (the 128 sentinel) — the same
