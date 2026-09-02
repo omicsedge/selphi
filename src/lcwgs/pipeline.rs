@@ -107,7 +107,12 @@ pub fn run_lcwgs(
     // intersect_variants returns (wgs_idx, target_idx) in THAT order:
     //   wgs_idx[k]    = panel variant index of the k-th shared variant
     //   target_idx[k] = target-marker index of the k-th shared variant
-    // lcWGS PL is read-derived (reference orientation); no allele reconciliation.
+    // lcWGS PL is read-derived (reference orientation); no allele reconciliation,
+    // whatever --allele-match says: a PL triple is ordered REF/REF, REF/ALT, ALT/ALT,
+    // so a REF/ALT-swapped site would need its likelihoods reversed as well as its
+    // genotype recoded, and that is not implemented. Say so rather than let the
+    // flag look honoured.
+    selphi_info!("  lcWGS: allele reconciliation not applied (PL order is REF/ALT-dependent); sites must match the panel's REF/ALT exactly");
     let (wgs_idx, target_idx, _) =
         intersect_variants(srp, &markers, crate::io::target_io::AlleleMatch::None);
     let n_shared = wgs_idx.len();

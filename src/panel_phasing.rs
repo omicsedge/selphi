@@ -182,9 +182,15 @@ fn phase_cohort(
     n_var: usize, n_samples: usize,
 ) -> Vec<u8> {
     let (phased, _r) = match engine {
-        PhasingEngine::Haploid => selphi::haploid::phase_panel(
-            geno, bp, map_bp, map_cm, n_var, n_samples,
-            args.seed, n_threads, args.max_windows),
+        PhasingEngine::Haploid => {
+            // The haploid engine has no missing-genotype state: fold the >1
+            // sentinel to REF here, exactly as the loaders did for both engines
+            // before 2026-09-02, so this opt-in path stays byte-identical.
+            let folded: Vec<u8> = geno.iter().map(|&a| if a > 1 { 0 } else { a }).collect();
+            selphi::haploid::phase_panel(
+                &folded, bp, map_bp, map_cm, n_var, n_samples,
+                args.seed, n_threads, args.max_windows)
+        }
         _ => selphi::diploid::diploid_phase_panel(
             geno, bp, map_bp, map_cm, n_var, n_samples,
             args.seed, n_threads, args.max_cond_haps),
@@ -792,12 +798,14 @@ fn run_streaming(args: &Args, input_path: &str, output_path: &str, map_path: &st
             selphi_error!("chunk {} alignment: read {} variants, expected {} ([{}..{}) pos {}..{}) — boundary split?",
                 ci, rv.len(), cn, cs, ce, bp[cs], bp[ce - 1]); std::process::exit(1);
         }
-        // Flatten to (cn × n_haps), folding missing (3) → 0 (panel engine expects {0,1}).
+        // Flatten to (cn × n_haps). The missing sentinel (>1) is kept: the diploid
+        // engine treats it as a no-call (see read_cohort_vcf); phase_cohort folds
+        // it only for the haploid engine.
         let mut chunk_geno = vec![0u8; cn * n_haps];
         for (vi, g) in geno.iter().enumerate() {
             for (si, &[a0, a1]) in g.iter().enumerate() {
-                chunk_geno[vi * n_haps + si * 2]     = if a0 > 1 { 0 } else { a0 };
-                chunk_geno[vi * n_haps + si * 2 + 1] = if a1 > 1 { 0 } else { a1 };
+                chunk_geno[vi * n_haps + si * 2]     = a0;
+                chunk_geno[vi * n_haps + si * 2 + 1] = a1;
             }
         }
         let cphased = phase_cohort(engine, args, n_threads, &chunk_geno, &bp[cs..ce], &map_bp, &map_cm, cn, n_samples);

@@ -313,22 +313,21 @@ fn parse_gt_region(
 pub fn read_cohort_vcf(
     path: &str,
 ) -> (Vec<String>, Vec<TargetMarker>, Vec<Vec<[u8; 2]>>, bool) {
-    // Panel self-phasing has no pedigree consumer; fold the GT_MISSING sentinel that
-    // read_target_bcf / parse_gt_region now emit back to 0 (the phasing engine expects
-    // {0,1}), keeping this path byte-identical to the pre-sentinel behaviour.
-    let fold_missing = |mut r: (Vec<String>, Vec<TargetMarker>, Vec<Vec<[u8; 2]>>, bool)| {
-        for v in r.2.iter_mut() {
-            for g in v.iter_mut() { if g[0] > 1 { g[0] = 0; } if g[1] > 1 { g[1] = 0; } }
-        }
-        r
-    };
+    // The GT_MISSING sentinel is passed THROUGH to the panel phaser. Until 2026-09-02
+    // this function folded it to 0, so every no-call in a cohort being phased as a
+    // reference panel entered the engine as hom-REF and left it as a confidently
+    // phased REF allele: no missing flag, no neighbour vote, and a systematic REF
+    // bias at exactly the rare sites where a carrier's call is most likely to be
+    // absent. The diploid engine marks >1 as missing, votes an allele for it in
+    // the PBWT sweep and fills it from its nearest neighbours before output; the
+    // haploid engine still expects {0,1} and folds in `phase_cohort`.
     // Real binary BCF → noodles decoder (captures the variant ID for panel output).
     if path.ends_with(".bcf") {
-        return fold_missing(read_target_bcf(path, false, true));
+        return read_target_bcf(path, false, true);
     }
     let raw = read_vcf_raw(path);
     if raw.starts_with(b"BCF\x02\x02") {
-        return fold_missing(read_target_bcf(path, false, true));
+        return read_target_bcf(path, false, true);
     }
 
     let mut markers = Vec::new();
