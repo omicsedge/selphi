@@ -1,0 +1,58 @@
+{
+  "label": "new_default",
+  "sites_total": 869043,
+  "sites_excluded_typed": 9018,
+  "sites_in_highconf": 675286,
+  "sites_evaluated": 675214,
+  "no_call": 0,
+  "call_rate_pct": 100.0,
+  "skipped_allele_mismatch": 72,
+  "skipped_multiallelic_or_missing_truth_gt": 0,
+  "overall_concordance_pct": 99.8236,
+  "nonref_concordance_pct": 98.1225,
+  "het_recall_pct": 97.5548,
+  "het_precision_pct": 97.6917,
+  "homalt_recall_pct": 99.2329,
+  "truth_class_counts": {
+    "homref": 637451,
+    "het": 24988,
+    "homalt": 12775
+  },
+  "confusion_truth_rows_call_cols": [
+    [
+      636969,
+      480,
+      2
+    ],
+    [
+      512,
+      24377,
+      99
+    ],
+    [
+      2,
+      96,
+      12677
+    ]
+  ],
+  "by_af": {
+    "common_maf>=5%": {
+      "n": 80535,
+      "overall_pct": 99.164,
+      "nonref_pct": 98.744,
+      "het_recall_pct": 98.47
+    },
+    "low_maf_0.5-5%": {
+      "n": 110574,
+      "overall_pct": 99.823,
+      "nonref_pct": 95.453,
+      "het_recall_pct": 93.249
+    },
+    "rare_maf<0.5%": {
+      "n": 484105,
+      "overall_pct": 99.933,
+      "nonref_pct": 87.767,
+      "het_recall_pct": 81.257
+    }
+  }
+}

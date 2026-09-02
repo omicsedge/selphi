@@ -60,7 +60,7 @@ base = (doc.styles["Normal"].font.size or Pt(12)) if "Normal" in [s.name for s i
 cap_sz = Pt(max(9, int(base.pt) - 2))
 
 def has_image(p): return len(p._p.findall('.//' + W('drawing'))) > 0
-def is_caption(p): return p.text.strip().startswith(("Figure 1.", "Figure 2.", "Figure 3."))
+def is_caption(p): return p.text.strip().startswith(("Figure 1.", "Figure 2.", "Figure 3.", "Figure 4."))
 def set_run(r, size=None, bold=None, white=False):
     set_fonts(r._element.get_or_add_rPr())
     if size is not None: r.font.size = size

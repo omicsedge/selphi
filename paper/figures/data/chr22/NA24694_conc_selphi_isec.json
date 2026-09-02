@@ -1,0 +1,58 @@
+{
+  "label": "NA24694_selphi_on_g2sites",
+  "sites_total": 869043,
+  "sites_excluded_typed": 9018,
+  "sites_in_highconf": 669074,
+  "sites_evaluated": 669015,
+  "no_call": 0,
+  "call_rate_pct": 100.0,
+  "skipped_allele_mismatch": 59,
+  "skipped_multiallelic_or_missing_truth_gt": 0,
+  "overall_concordance_pct": 99.8401,
+  "nonref_concordance_pct": 98.1534,
+  "het_recall_pct": 97.2285,
+  "het_precision_pct": 97.2386,
+  "homalt_recall_pct": 99.2434,
+  "truth_class_counts": {
+    "homref": 633598,
+    "het": 19159,
+    "homalt": 16258
+  },
+  "confusion_truth_rows_call_cols": [
+    [
+      633182,
+      411,
+      5
+    ],
+    [
+      411,
+      18628,
+      120
+    ],
+    [
+      5,
+      118,
+      16135
+    ]
+  ],
+  "by_af": {
+    "common_maf>=5%": {
+      "n": 79799,
+      "overall_pct": 99.261,
+      "nonref_pct": 98.815,
+      "het_recall_pct": 98.429
+    },
+    "low_maf_0.5-5%": {
+      "n": 109718,
+      "overall_pct": 99.853,
+      "nonref_pct": 95.42,
+      "het_recall_pct": 92.178
+    },
+    "rare_maf<0.5%": {
+      "n": 479498,
+      "overall_pct": 99.933,
+      "nonref_pct": 87.929,
+      "het_recall_pct": 81.236
+    }
+  }
+}
