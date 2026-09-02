@@ -239,10 +239,10 @@ re-run); 12-sample and 20-iteration speed rows PROV (see notes).
 
 | Run | Selphi 2 native + BAQ | GLIMPSE2 (chunk + phase + ligate) | Ratio | Winner | Status |
 |---|---:|---:|---:|---|---|
-| 1 sample | wall **107 s**, peak RSS 5.7 GB | 327 s | 3.1$\times$ | Selphi | FINAL |
-| 6 samples, one run | wall **202 s** (34 s/sample), peak RSS 14.9 GB | 389 s (65 s/sample), 8.7 GB largest chunk | 1.9$\times$ | Selphi (wall); reference (RAM) | FINAL |
-| 12 samples, one run (timing only: 6 real + 6 relabelled duplicates) | wall **375 s** (31 s/sample), peak RSS 17.6 GB | 460 s (38 s/sample) | 1.2$\times$ | Selphi | FINAL (after commit 2f11536; 534 s before the chunk-scheduling fix) |
-| 6 samples at GLIMPSE2's iteration count (20 = 5 burn-in + 15 main) | wall **91 s** (15 s/sample); Δ non-ref vs GLIMPSE2 +0.198 pp (vs +0.193 pp at the default 50/25 schedule, same run) | 389 s (its default 20 iterations) | 4.3$\times$ | Selphi | PROV |
+| 1 sample | wall **104 s**, peak RSS 5.0 GB | 327 s | 3.1$\times$ | Selphi | FINAL |
+| 6 samples, one run | wall **170 s** (28 s/sample), peak RSS 14.5 GB | 389 s (65 s/sample), 8.7 GB largest chunk | 2.3$\times$ | Selphi (wall); reference (RAM) | FINAL |
+| 12 samples, one run (timing only: 6 real + 6 relabelled duplicates) | wall **313 s** (26 s/sample), peak RSS 16.5 GB | 460 s (38 s/sample) | 1.5$\times$ | Selphi | FINAL (after commits 2f11536 chunk scheduling and 9d4b398 shared conditioning pack; 534 s and 375 s before them) |
+| 6 samples at GLIMPSE2's iteration count (20 = 5 burn-in + 15 main) | wall **79 s** (13 s/sample); Δ non-ref vs GLIMPSE2 +0.198 pp (vs +0.193 pp at the default 50/25 schedule, same run) | 389 s (its default 20 iterations) | 4.3$\times$ | Selphi | PROV |
 
 > Notes. (1) BAQ: the native pileup applies extended BAQ exactly as `bcftools mpileup` does by
 > default (bit-exact port of htslib `probaln_glocal`/`sam_prob_realn`; 7.6 % of reads realigned on

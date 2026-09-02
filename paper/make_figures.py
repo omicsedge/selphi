@@ -324,15 +324,16 @@ print("wrote figure3_accuracy.pdf/.png")
 fig2, (axl, axw, axm) = plt.subplots(1, 3, figsize=(11.5, 3.6))
 # (a) lcWGS wall time per run, whole chr22, 16 threads, log scale, two labelled clusters.
 #     Capture-library cluster (4,796-hap panel, BAM in -> imputed out), quiet machine,
-#     2026-09-02: Selphi 2 native pileup 107 s (5.7 GB peak) vs GLIMPSE2 327 s for one sample;
-#     202 s vs 389 s for six samples in one run.
+#     2026-09-02, after the shared conditioning pack (commit 9d4b398): Selphi 2 native
+#     pileup 104 s (5.0 GB peak) vs GLIMPSE2 327 s for one sample; 170 s vs 389 s for six
+#     samples in one run.
 #     Downsampled cluster (1x, 6,332-hap panel, 1 sample): Selphi 115 s, GLIMPSE2 287 s
 #     (15 native chunks + ligate), QUILT2 1,729 s (tiled) -- the former Figure 3c values,
 #     unchanged. No scaling.
 tool_col = {"Selphi 2": C["selphi"], "GLIMPSE2": C["glimpse2"], "QUILT2": C["quilt2"]}
 speed_groups = [  # (x0, tick label, [(tool, seconds), ...])
-    (0.0, "1 sample",            [("Selphi 2", 107), ("GLIMPSE2", 327)]),
-    (2.4, "6 samples\n(one run)", [("Selphi 2", 202), ("GLIMPSE2", 389)]),
+    (0.0, "1 sample",            [("Selphi 2", 104), ("GLIMPSE2", 327)]),
+    (2.4, "6 samples\n(one run)", [("Selphi 2", 170), ("GLIMPSE2", 389)]),
     (5.3, "1 sample",            [("Selphi 2", 115), ("GLIMPSE2", 287), ("QUILT2", 1729)]),
 ]
 bw = 0.78; tick_pos = []; tick_lbl = []; seen = set()
@@ -374,7 +375,7 @@ plt.tight_layout()
 plt.savefig(f"{OUT}/figure4_efficiency.pdf", bbox_inches="tight")
 plt.savefig(f"{OUT}/figure4_efficiency.png", dpi=600, bbox_inches="tight")
 print("wrote figure4_efficiency.pdf/.png")
-print("  (a) capture 1 sample: Selphi 107 s / GLIMPSE2 327 s; 6 samples one run: 202 s / 389 s;"
+print("  (a) capture 1 sample: Selphi 104 s / GLIMPSE2 327 s; 6 samples one run: 170 s / 389 s;"
       " downsampled 1x: 115 / 287 / 1,729 s")
 
 # =====================================================================================

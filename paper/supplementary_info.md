@@ -354,13 +354,13 @@ Reference: Beagle 5.5, SHAPEIT5 v5.1.1.
 | TOPMed MESA 5K chr20 (171K-hap, 17.9M var), full pipeline | wall | 11,289 s (~3.1 h) | Beagle 5.5: 4,148 s | reference |
 | TOPMed MESA 5K chr20 | peak RAM | **65.5 GB** | Beagle 5.5: 96.5 GB | Selphi |
 | lcWGS whole-chr22, 1 sample @1× (= Fig 4a, downsampled cluster) | wall | **115 s** | GLIMPSE2: 287 s; QUILT2: 1,729 s | Selphi |
-| lcWGS capture library chr22, 1 sample, native `--bam` + BAQ, BAM in to imputed VCF out (= Fig 4a, capture cluster) | wall | **107 s** | GLIMPSE2: 327 s (chunk + phase + ligate) | Selphi |
-| lcWGS capture library chr22, 1 sample, native `--bam` + BAQ | peak RAM | 5.7 GB | GLIMPSE2: not recorded | n/a |
-| lcWGS capture library chr22, 6 samples in one run | wall | **202 s (34 s/sample)** | GLIMPSE2: 389 s (65 s/sample) | Selphi |
-| lcWGS capture library chr22, 6 samples in one run | peak RAM | 14.9 GB | GLIMPSE2: 8.7 GB (largest chunk) | reference |
-| lcWGS capture library chr22, 12 samples in one run (timing only: 6 real + 6 relabelled duplicates) | wall | **375 s (31 s/sample)** | GLIMPSE2: 460 s (38 s/sample) | Selphi |
-| lcWGS capture library chr22, 12 samples in one run | peak RAM | 17.6 GB | GLIMPSE2: not recorded | n/a |
-| lcWGS capture library chr22, 6 samples at GLIMPSE2's iteration count (20 = 5 burn-in + 15 main) | wall | **91 s (15 s/sample)** | GLIMPSE2: 389 s (its default 20 iterations) | Selphi |
+| lcWGS capture library chr22, 1 sample, native `--bam` + BAQ, BAM in to imputed VCF out (= Fig 4a, capture cluster) | wall | **104 s** | GLIMPSE2: 327 s (chunk + phase + ligate) | Selphi |
+| lcWGS capture library chr22, 1 sample, native `--bam` + BAQ | peak RAM | 5.0 GB | GLIMPSE2: not recorded | n/a |
+| lcWGS capture library chr22, 6 samples in one run | wall | **170 s (28 s/sample)** | GLIMPSE2: 389 s (65 s/sample) | Selphi |
+| lcWGS capture library chr22, 6 samples in one run | peak RAM | 14.5 GB | GLIMPSE2: 8.7 GB (largest chunk) | reference |
+| lcWGS capture library chr22, 12 samples in one run (timing only: 6 real + 6 relabelled duplicates) | wall | **313 s (26 s/sample)** | GLIMPSE2: 460 s (38 s/sample) | Selphi |
+| lcWGS capture library chr22, 12 samples in one run | peak RAM | 16.5 GB | GLIMPSE2: not recorded | n/a |
+| lcWGS capture library chr22, 6 samples at GLIMPSE2's iteration count (20 = 5 burn-in + 15 main) | wall | **79 s (13 s/sample)** | GLIMPSE2: 389 s (its default 20 iterations) | Selphi |
 | lcWGS single-sample (chr22), downsampled GIAB ~1.8× (= Table 2) | wall | **~2:01** | GLIMPSE2: ~5:22 | Selphi |
 | lcWGS single-sample (chr22), downsampled GIAB ~1.8× (= Table 2) | peak RAM | ~3.3 GB | GLIMPSE2: ~2.1 GB | reference |
 | lcWGS 54-sample multi-sample whole-chr22 (simulated; only regime Selphi is slower) | wall | 41:50 | GLIMPSE2: 21:36 | reference |
@@ -370,17 +370,17 @@ Reference: Beagle 5.5, SHAPEIT5 v5.1.1.
 
 > Capture-library timings: quiet 16-core host, one job at a time, `/usr/bin/time` wall from
 > BAM in to imputed VCF out; GLIMPSE2 = `chunk` + `phase` + `ligate`. Single-sample ratio
-> 3.1$\times$ (327 s / 107 s); six samples in one run 1.9$\times$ (389 s / 202 s); twelve
-> samples 1.2$\times$ (460 s / 375 s). Above seven samples on 16 threads the chunk-level
+> 3.1$\times$ (327 s / 104 s); six samples in one run 2.3$\times$ (389 s / 170 s); twelve
+> samples 1.5$\times$ (460 s / 313 s). Above seven samples on 16 threads the chunk-level
 > parallelism now sizes its waves from the measured memory of the first chunk instead of
-> running chunks sequentially; before that change the 12-sample run took 534 s. The
+> running chunks sequentially; before that change the 12-sample run took 534 s, and 375 s before the conditioning-pack sharing. The
 > 20-iteration row uses GLIMPSE2's default iteration count (5 burn-in + 15 main) instead of
 > Selphi 2's default schedule (50/25): in the same six-sample run the non-reference Delta versus
 > GLIMPSE2 is +0.198 pp at 20 iterations versus +0.193 pp at 50/25. GLIMPSE2's six-sample
 > accuracy equals its single-sample accuracy (+0.0025 pp non-reference, n = 6). Earlier
 > capture-library timings taken under CPU contention are not reported. The 2.7$\times$
 > (~1.8$\times$ downsampled, 4,478-haplotype panel) and 2.5$\times$ (1$\times$,
-> 6,332-haplotype panel) ratios of the downsampled rows keep their own conditions. The 5.7 GB
+> 6,332-haplotype panel) ratios of the downsampled rows keep their own conditions. The 5.0 GB
 > single-sample peak versus ~3.3 GB in the downsampled row reflects the 1,070,399-site panel
 > with indels versus the SNP-only 4,478-haplotype panel.
 
