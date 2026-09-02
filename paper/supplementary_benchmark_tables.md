@@ -174,7 +174,7 @@ the real capture-plus-low-pass libraries (the paper's lead result) are in Table 
 ## Table S-I · Capture-library benchmark (genotype concordance, pp) · chr22 FINAL, chr20/10/1 PROV
 
 Six GIAB capture-plus-low-pass libraries (HG002=NA24385, HG003=NA24149, HG004=NA24143,
-HG005=NA24631, HG006=NA24694, HG007=NA24695; [SLOT:provider], MGI DNBSEQ 2×150 bp, GSA
+HG005=NA24631, HG006=NA24694, HG007=NA24695; Gene by Gene, MGI DNBSEQ 2×150 bp, GSA
 capture over 613,711 sites, 1.6–2.7× off-target background). Panel = leak-free NYGC 1000 Genomes
 30× GRCh38, 2,398 samples / 4,796 haps, NA12878 trio removed (chr22: 1,070,399 sites for Selphi,
 1,015,993 polymorphic sites for GLIMPSE2; chr20/10/1: one shared polymorphic-only panel for both
@@ -263,7 +263,7 @@ re-run); 12-sample and 20-iteration speed rows PROV (see notes).
 > comparison, not the default. Earlier capture timings (125 s / 2.6×, 97.7 s / 3.35×) were taken
 > under CPU contention or excluded the external caller and must not be used. The 2.7× (~1.8×,
 > 4,478-hap) and 2.5× (1×, 6,332-hap) downsampled ratios keep their own conditions. (7) Open
-> slots: [SLOT:provider], [SLOT:QUILT2-version] (QUILT2 was not run on the capture libraries).
+> (QUILT2 was not run on the capture libraries.)
 
 ---
 
@@ -370,5 +370,5 @@ retained.
   ≈0.0003–0.002 deltas vs main-text Table 3 and pin one authoritative source;
   (2) re-confirm the lcWGS 5–10 % bin and small-panel out-of-panel rows;
   (3) freeze tool versions (Beagle `03Oct25.f35702`, GLIMPSE2 v2.0.0 commit 2cee597, SHAPEIT5 v5.1.1,
-  QUILT2 [SLOT:QUILT2-version]); (4) promote the chr20/10/1 rows of Table S-I from PROV to FINAL after a
+  QUILT2 v2.0.4); (4) promote the chr20/10/1 rows of Table S-I from PROV to FINAL after a
   determinism re-run.

@@ -85,7 +85,7 @@ not run on the capture libraries. Concordance (S4a-S4d) and dosage R² (S4e-S4f)
 complementary metrics and are not interchangeable.
 
 Capture-library common ground: six GIAB samples (Ashkenazi and Han Chinese trios) sequenced by
-[SLOT:provider] on an MGI DNBSEQ instrument (2$\times$150 bp) with a hybridization-capture
+Gene by Gene on an MGI DNBSEQ instrument (2$\times$150 bp) with a hybridization-capture
 library over the 613,711 autosomal Global Screening Array (GSA) SNP sites and a
 1.6-2.7$\times$ off-target genome-wide background; these are real libraries, not downsampled
 genomes, and their depth is strongly heterogeneous. Reference panel: NYGC 1000 Genomes
