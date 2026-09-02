@@ -91,6 +91,129 @@ thread_local! {
     static TL_CONDBITS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Conditioning-bitmatrix pack shared by the two haplotypes of one sample and
+/// by its phasing pass.
+///
+/// Both haplotypes of a sample start from the same IBD-selected conditioning
+/// set; only the rare-carrier tail appended per haplotype differs, and the
+/// priority-preserving cap keeps that shared part in front. Packing the panel
+/// alleles of the K conditioning haplotypes into 1 bit per state, for every
+/// site, is a random gather that costs more than the forward-backward it feeds
+/// (measured 1.8x). So the shared prefix — the `b` leading states — is packed
+/// once per sample over the union of the two haplotypes' site axes, and each
+/// haplotype's full pack is then assembled by copying those prefix words and
+/// gathering only its own tail states. The words produced are identical to a
+/// direct pack of the full conditioning set.
+pub struct BasePack {
+    /// Row-major: `words[row * wb + w]`; bit `k` of a row = allele of base state
+    /// `k` at that row's site. Bits `[b, 64·wb)` are 0.
+    pub words: Vec<u64>,
+    /// Number of shared-prefix states packed.
+    pub b: usize,
+    /// Words per row, `ceil(b / 64)`.
+    pub wb: usize,
+    /// Absolute site → row (`u32::MAX` = site not packed).
+    pub row_of_abs: Vec<u32>,
+}
+impl Default for BasePack {
+    fn default() -> Self { Self::new() }
+}
+impl BasePack {
+    pub const fn new() -> Self {
+        BasePack { words: Vec::new(), b: 0, wb: 0, row_of_abs: Vec::new() }
+    }
+    /// Pack the alleles of `base` (the shared conditioning prefix) at the
+    /// absolute sites `sites_abs` (ascending). `n_sites_total` sizes the
+    /// site → row map. Counted in the pack profile like the per-haplotype pack.
+    pub fn build(&mut self, ref_bm: &HaplotypeBitmatrix, base: &[u32], sites_abs: &[usize], n_sites_total: usize) {
+        let timing = hmm_timing();
+        let t0 = if timing { Some(std::time::Instant::now()) } else { None };
+        self.b = base.len();
+        self.wb = self.b.div_ceil(64);
+        self.words.clear();
+        self.words.resize(sites_abs.len() * self.wb, 0u64);
+        self.row_of_abs.clear();
+        self.row_of_abs.resize(n_sites_total, u32::MAX);
+        for (r, &a) in sites_abs.iter().enumerate() {
+            self.row_of_abs[a] = r as u32;
+            if self.b == 0 { continue; }
+            let rp = ref_bm.row(a).as_ptr();
+            let out = &mut self.words[r * self.wb..(r + 1) * self.wb];
+            let mut widx = 0usize;
+            let mut word = 0u64;
+            let mut bitpos = 0u32;
+            for &h in base {
+                let h = h as usize;
+                // SAFETY: h < n_haps by construction, so h>>6 indexes a valid word of the row.
+                let bit = unsafe { (*rp.add(h >> 6) >> (h & 63)) & 1 };
+                word |= bit << bitpos;
+                bitpos += 1;
+                if bitpos == 64 { out[widx] = word; widx += 1; word = 0; bitpos = 0; }
+            }
+            if bitpos > 0 { out[widx] = word; }
+        }
+        if let Some(t) = t0 { PROF_PACK_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
+    }
+}
+
+/// Pack one haplotype's conditioning alleles, 1 bit per state, one row per site
+/// of its (possibly compacted) axis: `out[v * w64 + w]`, `w64 = ceil(K/64)`,
+/// bit `k` of row `v` = `ref_bm.get(site(v), cond[k])` with `site(v) =
+/// poly_sites[v]` (or `v`). Branchless word-at-a-time gather.
+///
+/// With `base = Some(bp)`, `cond[..bp.b]` MUST equal the base states `bp` was
+/// built from (the caller's shared prefix): rows whose site is in the base pack
+/// copy the prefix words and gather only `cond[bp.b..]`; the output is identical
+/// to the direct pack. Sites absent from the base pack fall back to the direct
+/// gather. Counted in the pack profile.
+pub fn pack_cond_rows(
+    ref_bm: &HaplotypeBitmatrix,
+    cond: &[u32],
+    poly_sites: Option<&[usize]>,
+    n_var: usize,
+    base: Option<&BasePack>,
+    out: &mut Vec<u64>,
+) {
+    let timing = hmm_timing();
+    let t0 = if timing { Some(std::time::Instant::now()) } else { None };
+    let k = cond.len();
+    let w64 = k.div_ceil(64);
+    out.clear();
+    out.resize(n_var * w64, 0u64);
+    let base = base.filter(|bp| bp.b > 0 && bp.b <= k);
+    for v in 0..n_var {
+        let a = poly_sites.map_or(v, |ps| ps[v]);
+        let rp = ref_bm.row(a).as_ptr();
+        let row = &mut out[v * w64..(v + 1) * w64];
+        let mut widx = 0usize;
+        let mut word = 0u64;
+        let mut bitpos = 0u32;
+        let mut kstart = 0usize;
+        if let Some(bp) = base {
+            let r = bp.row_of_abs.get(a).copied().unwrap_or(u32::MAX);
+            if r != u32::MAX {
+                let src = &bp.words[r as usize * bp.wb..(r as usize + 1) * bp.wb];
+                let nfull = bp.b / 64;
+                row[..nfull].copy_from_slice(&src[..nfull]);
+                widx = nfull;
+                bitpos = (bp.b % 64) as u32;
+                word = if bitpos > 0 { src[nfull] } else { 0 };
+                kstart = bp.b;
+            }
+        }
+        for &h in &cond[kstart..] {
+            let h = h as usize;
+            // SAFETY: h < n_haps by construction, so h>>6 indexes a valid word of the row.
+            let bit = unsafe { (*rp.add(h >> 6) >> (h & 63)) & 1 };
+            word |= bit << bitpos;
+            bitpos += 1;
+            if bitpos == 64 { row[widx] = word; widx += 1; word = 0; bitpos = 0; }
+        }
+        if bitpos > 0 { row[widx] = word; }
+    }
+    if let Some(t) = t0 { PROF_PACK_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
+}
+
 /// Whether to use the AVX-512 lcWGS HMM path. Cached. `SELPHI_FORCE_SCALAR=1`
 /// forces the scalar path (for scalar/SIMD parity validation), matching the
 /// convention used by the diploid `run_hom_bm` dispatch.
@@ -377,6 +500,11 @@ pub fn run_forward_backward(
     // full-axis path. (`ps.len()` must equal `cm.len()`.) See the U²=U transition
     // identity: dropping a uniform-emission site and spanning its cM gap is exact.
     poly_sites: Option<&[usize]>,
+    // Pre-packed conditioning bitmatrix for THIS haplotype (`n_var × ceil(K/64)`
+    // words, see [`pack_cond_rows`]), built by the caller so the two haplotypes
+    // of a sample can share their prefix. `None` ⇒ the SIMD kernels pack it
+    // themselves; the scalar path always reads the panel directly.
+    prepack: Option<&[u64]>,
 ) -> HmmOutput {
     let n_var = cm.len();
     let k = cond_haps.len();
@@ -407,17 +535,17 @@ pub fn run_forward_backward(
     // back to the scalar path below on non-AVX-512 hosts or SELPHI_FORCE_SCALAR=1.
     #[cfg(target_arch = "x86_64")]
     if use_avx512_lcwgs() {
-        return unsafe { run_fb_avx512(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites) };
+        return unsafe { run_fb_avx512(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack) };
     }
     #[cfg(target_arch = "x86_64")]
     if use_avx2_lcwgs() {
-        return unsafe { run_fb_avx2(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites) };
+        return unsafe { run_fb_avx2(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack) };
     }
     // NEON fast path (aarch64: Apple Silicon / ARM servers). 4-wide analogue of
     // the AVX2 path; falls back to scalar below under SELPHI_FORCE_SCALAR=1.
     #[cfg(target_arch = "aarch64")]
     if use_neon_lcwgs() {
-        return unsafe { run_fb_neon(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites) };
+        return unsafe { run_fb_neon(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack) };
     }
 
     let inv_k = 1.0f32 / (k as f32);
@@ -764,6 +892,7 @@ unsafe fn run_fb_avx512(
     params: &LcwgsParams,
     recomb_mult: Option<&[f32]>,
     poly_sites: Option<&[usize]>, // compacted→absolute ref_bm row map (LCWGS_POLY_SKIP)
+    prepack: Option<&[u64]>,      // caller-built condbits (see pack_cond_rows), else pack here
 ) -> HmmOutput { unsafe {
     use core::arch::x86_64::*;
     let n_var = cm.len();
@@ -790,43 +919,15 @@ unsafe fn run_fb_avx512(
         // p_rec
         let scale = recomb_scale(params.ne, k, ref_bm.n_haps);
         precompute_prec(cm, n_var, scale, recomb_mult, &mut p_rec);
-        // Bit-packed conditioning alleles (1 bit/state). Branchless + word-at-a-
-        // time: accumulate 64 consecutive states into a register, store once per
-        // word. The previous form did a branch on each (random) allele bit — a
-        // ~50% mispredict rate — plus a read-modify-write into condbits per set
-        // bit. Casting the bool allele to u64 and shifting it in is branchless,
-        // and building the whole word in a register removes the per-bit RMW.
-        // Every word is fully written (no pre-zero needed); the trailing partial
-        // word has its unused high bits left 0, and they are never read (mask16
-        // only touches states < k). Output is identical to the old pack.
+        // Bit-packed conditioning alleles (1 bit/state): the caller's pre-built
+        // pack when it has one (shared-prefix assembly across a sample's two
+        // haplotypes), else packed here into thread-local scratch. Both routes
+        // produce identical words (see `pack_cond_rows`).
         let timing = hmm_timing();
-        let t_pack = if timing { Some(std::time::Instant::now()) } else { None };
-        condbits.clear(); condbits.resize(n_var * w64, 0u64);
-        let cbm = condbits.as_mut_ptr();
-        for v in 0..n_var {
-            // Hoist the site row once (one bounds check), then read each
-            // conditioning hap's allele bit unchecked — h < n_haps by
-            // construction, so h>>6 is always a valid word in this row.
-            let rp = ref_bm.row(poly_sites.map_or(v, |ps| ps[v])).as_ptr();
-            let base = v * w64;
-            let mut widx = 0usize;
-            let mut word = 0u64;
-            let mut bitpos = 0u32;
-            for &h in cond_haps.iter() {
-                let h = h as usize;
-                let bit = (*rp.add(h >> 6) >> (h & 63)) & 1;
-                word |= bit << bitpos;
-                bitpos += 1;
-                if bitpos == 64 {
-                    *cbm.add(base + widx) = word;
-                    widx += 1; word = 0; bitpos = 0;
-                }
-            }
-            if bitpos > 0 { *cbm.add(base + widx) = word; }
-        }
-        if let Some(t) = t_pack {
-            PROF_PACK_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        }
+        let cbp: *const u64 = match prepack {
+            Some(p) => { debug_assert!(p.len() >= n_var * w64); p.as_ptr() }
+            None => { pack_cond_rows(ref_bm, cond_haps, poly_sites, n_var, None, &mut condbits); condbits.as_ptr() }
+        };
         let t_fb = if timing { Some(std::time::Instant::now()) } else { None };
 
         // --- Checkpointed forward + block-recompute backward (memory/cache win) ---
@@ -845,7 +946,6 @@ unsafe fn run_fb_avx512(
         alpha.set_len(need_chk); alpha_sum.set_len(n_var); beta.set_len(k);
         let chkp = alpha.as_mut_ptr();  // checkpoint columns: n_chk × k
         let bp = beta.as_mut_ptr();
-        let cbp = condbits.as_ptr();
         // Block recompute buffer (chk_stride × k) + rolling forward columns (2 × k),
         // from thread-local scratch (no per-call alloc in the hot path).
         let blkp = tl_scratch_ptr(&TL_BLK, chk_stride * k);
@@ -1015,6 +1115,7 @@ unsafe fn run_fb_avx2(
     params: &LcwgsParams,
     recomb_mult: Option<&[f32]>,
     poly_sites: Option<&[usize]>, // compacted→absolute ref_bm row map (LCWGS_POLY_SKIP)
+    prepack: Option<&[u64]>,      // caller-built condbits (see pack_cond_rows), else pack here
 ) -> HmmOutput { unsafe {
     use core::arch::x86_64::*;
     let n_var = cm.len();
@@ -1039,27 +1140,15 @@ unsafe fn run_fb_avx2(
         precompute_emit(hl, n_var, ee, ed, &mut emit);
         let scale = recomb_scale(params.ne, k, ref_bm.n_haps);
         precompute_prec(cm, n_var, scale, recomb_mult, &mut p_rec);
-        // Bit-packed conditioning alleles (1 bit/state) — identical to the AVX-512 pack.
+        // Bit-packed conditioning alleles (1 bit/state): the caller's pre-built
+        // pack when it has one (shared-prefix assembly across a sample's two
+        // haplotypes), else packed here into thread-local scratch. Both routes
+        // produce identical words (see `pack_cond_rows`).
         let timing = hmm_timing();
-        let t_pack = if timing { Some(std::time::Instant::now()) } else { None };
-        condbits.clear(); condbits.resize(n_var * w64, 0u64);
-        let cbm = condbits.as_mut_ptr();
-        for v in 0..n_var {
-            let rp = ref_bm.row(poly_sites.map_or(v, |ps| ps[v])).as_ptr();
-            let base = v * w64;
-            let mut widx = 0usize;
-            let mut word = 0u64;
-            let mut bitpos = 0u32;
-            for &h in cond_haps.iter() {
-                let h = h as usize;
-                let bit = (*rp.add(h >> 6) >> (h & 63)) & 1;
-                word |= bit << bitpos;
-                bitpos += 1;
-                if bitpos == 64 { *cbm.add(base + widx) = word; widx += 1; word = 0; bitpos = 0; }
-            }
-            if bitpos > 0 { *cbm.add(base + widx) = word; }
-        }
-        if let Some(t) = t_pack { PROF_PACK_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
+        let cbp: *const u64 = match prepack {
+            Some(p) => { debug_assert!(p.len() >= n_var * w64); p.as_ptr() }
+            None => { pack_cond_rows(ref_bm, cond_haps, poly_sites, n_var, None, &mut condbits); condbits.as_ptr() }
+        };
         let t_fb = if timing { Some(std::time::Instant::now()) } else { None };
 
         // Checkpointed forward + block-recompute backward (see run_fb_avx512).
@@ -1073,7 +1162,6 @@ unsafe fn run_fb_avx2(
         alpha.set_len(need_chk); alpha_sum.set_len(n_var); beta.set_len(k);
         let chkp = alpha.as_mut_ptr();
         let bp = beta.as_mut_ptr();
-        let cbp = condbits.as_ptr();
         let blkp = tl_scratch_ptr(&TL_BLK, chk_stride * k);
         let fcolp = tl_scratch_ptr(&TL_FCOL, 2 * k);
         let last = n_var - 1;
@@ -1292,6 +1380,7 @@ unsafe fn run_fb_neon(
     params: &LcwgsParams,
     recomb_mult: Option<&[f32]>,
     poly_sites: Option<&[usize]>, // compacted→absolute ref_bm row map (LCWGS_POLY_SKIP)
+    prepack: Option<&[u64]>,      // caller-built condbits (see pack_cond_rows), else pack here
 ) -> HmmOutput { unsafe {
     use core::arch::aarch64::*;
     let n_var = cm.len();
@@ -1317,27 +1406,15 @@ unsafe fn run_fb_neon(
         precompute_emit(hl, n_var, ee, ed, &mut emit);
         let scale = recomb_scale(params.ne, k, ref_bm.n_haps);
         precompute_prec(cm, n_var, scale, recomb_mult, &mut p_rec);
-        // Bit-packed conditioning alleles (1 bit/state) — identical pack to AVX2.
+        // Bit-packed conditioning alleles (1 bit/state): the caller's pre-built
+        // pack when it has one (shared-prefix assembly across a sample's two
+        // haplotypes), else packed here into thread-local scratch. Both routes
+        // produce identical words (see `pack_cond_rows`).
         let timing = hmm_timing();
-        let t_pack = if timing { Some(std::time::Instant::now()) } else { None };
-        condbits.clear(); condbits.resize(n_var * w64, 0u64);
-        let cbm = condbits.as_mut_ptr();
-        for v in 0..n_var {
-            let rp = ref_bm.row(poly_sites.map_or(v, |ps| ps[v])).as_ptr();
-            let base = v * w64;
-            let mut widx = 0usize;
-            let mut word = 0u64;
-            let mut bitpos = 0u32;
-            for &h in cond_haps.iter() {
-                let h = h as usize;
-                let bit = (*rp.add(h >> 6) >> (h & 63)) & 1;
-                word |= bit << bitpos;
-                bitpos += 1;
-                if bitpos == 64 { *cbm.add(base + widx) = word; widx += 1; word = 0; bitpos = 0; }
-            }
-            if bitpos > 0 { *cbm.add(base + widx) = word; }
-        }
-        if let Some(t) = t_pack { PROF_PACK_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
+        let cbp: *const u64 = match prepack {
+            Some(p) => { debug_assert!(p.len() >= n_var * w64); p.as_ptr() }
+            None => { pack_cond_rows(ref_bm, cond_haps, poly_sites, n_var, None, &mut condbits); condbits.as_ptr() }
+        };
         let t_fb = if timing { Some(std::time::Instant::now()) } else { None };
 
         // Checkpointed forward + block-recompute backward (see run_fb_avx512).
@@ -1351,7 +1428,6 @@ unsafe fn run_fb_neon(
         alpha.set_len(need_chk); alpha_sum.set_len(n_var); beta.set_len(k);
         let chkp = alpha.as_mut_ptr();
         let bp = beta.as_mut_ptr();
-        let cbp = condbits.as_ptr();
         let blkp = tl_scratch_ptr(&TL_BLK, chk_stride * k);
         let fcolp = tl_scratch_ptr(&TL_FCOL, 2 * k);
         let last = n_var - 1;
@@ -1522,7 +1598,7 @@ pub fn run_forward_backward_scaffold(
     let n_s = common_idx.len();
     let k = cond_haps.len();
     if n_s == 0 || k == 0 {
-        return run_forward_backward(hl, cond_haps, ref_bm, cm, params, None, None);
+        return run_forward_backward(hl, cond_haps, ref_bm, cm, params, None, None, None);
     }
 
     let inv_k = 1.0f32 / (k as f32);
@@ -1695,6 +1771,47 @@ pub fn run_forward_backward_scaffold(
 mod tests {
     use super::*;
 
+    /// The shared-prefix assembly must reproduce the direct pack bit for bit,
+    /// for every prefix length (word-aligned or not), on a compacted or full
+    /// site axis, including sites absent from the base pack.
+    #[test]
+    fn shared_prefix_pack_matches_direct_pack() {
+        // Deterministic pseudo-random panel: 300 sites × 700 haps.
+        let (n_sites, n_haps) = (300usize, 700usize);
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        let mut alleles = vec![false; n_sites * n_haps];
+        for a in alleles.iter_mut() { *a = next() & 1 == 1; }
+        let bm = HaplotypeBitmatrix::from_panel(
+            n_sites, n_haps, &|v: usize, h: usize| alleles[v * n_haps + h], &vec![true; n_sites]);
+        // Two conditioning sets sharing a prefix (deduped, mixed order).
+        let mut c0: Vec<u32> = (0..n_haps as u32).filter(|_| next() % 3 == 0).collect();
+        c0.truncate(200);
+        for b in [0usize, 1, 63, 64, 65, 128, 150, 200] {
+            let mut c1: Vec<u32> = c0[..b].to_vec();
+            let mut extra: Vec<u32> = (0..n_haps as u32).filter(|h| !c0.contains(h) && next() % 5 == 0).collect();
+            extra.truncate(70);
+            c1.extend(extra);
+            let mut c0b = c0.clone();
+            if b < c0.len() { c0b.truncate(b); c0b.extend((0..n_haps as u32).filter(|h| !c0.contains(h)).take(90)); }
+            // Compacted axes: odd sites for hap 0, sites ≡ 0,1 mod 3 for hap 1.
+            let poly0: Vec<usize> = (0..n_sites).filter(|v| v % 2 == 1).collect();
+            let poly1: Vec<usize> = (0..n_sites).filter(|v| v % 3 != 2).collect();
+            let mut union = Vec::new();
+            for v in 0..n_sites { if v % 2 == 1 || v % 3 != 2 { union.push(v); } }
+            let mut base = BasePack::new();
+            base.build(&bm, &c0b[..b], &union, n_sites);
+            for (c, ps) in [(&c0b, Some(poly0.as_slice())), (&c1, Some(poly1.as_slice())), (&c0b, None), (&c1, None)] {
+                let n = ps.map_or(n_sites, |p| p.len());
+                let mut direct = Vec::new();
+                pack_cond_rows(&bm, c, ps, n, None, &mut direct);
+                let mut shared = Vec::new();
+                pack_cond_rows(&bm, c, ps, n, Some(&base), &mut shared);
+                assert_eq!(direct, shared, "prefix b={} axis={} k={}", b, ps.map_or("full", |_| "poly"), c.len());
+            }
+        }
+    }
+
     /// Build a synthetic ref panel and HL likelihood — verify dosage matches
     /// expected analytical value on a one-site, two-state model.
     #[test]
@@ -1709,7 +1826,7 @@ mod tests {
         let cm = vec![0.0f64];
         let cond = vec![0u32, 1];
         let params = LcwgsParams::default();
-        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None);
+        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None, None);
         assert_eq!(out.dosage.len(), 1);
         assert!((out.dosage[0] - 0.5).abs() < 1e-3,
             "flat HL on 50/50 panel should give dose ≈ 0.5, got {}", out.dosage[0]);
@@ -1725,7 +1842,7 @@ mod tests {
         let cm = vec![0.0];
         let cond = vec![0u32, 1];
         let params = LcwgsParams::default();
-        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None);
+        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None, None);
         assert!(out.dosage[0] < 0.05,
             "strong REF HL should give dose ≈ 0, got {}", out.dosage[0]);
     }
@@ -1740,7 +1857,7 @@ mod tests {
         let cm = vec![0.0];
         let cond = vec![0u32, 1];
         let params = LcwgsParams::default();
-        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None);
+        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None, None);
         assert!(out.dosage[0] > 0.95,
             "strong ALT HL should give dose ≈ 1, got {}", out.dosage[0]);
     }
@@ -1782,7 +1899,7 @@ mod tests {
         let cm = vec![0.0f64, 0.5, 1.0];
         let cond = vec![0u32, 1];
         let params = LcwgsParams::default();
-        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None);
+        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None, None);
         for v in 0..3 {
             assert!((out.dosage[v] - 0.5).abs() < 1e-2,
                 "site {} dose={} should be ≈ 0.5", v, out.dosage[v]);
@@ -1807,7 +1924,7 @@ mod tests {
         // (real lcWGS workloads have K≈2000 so default Ne=100000 is fine).
         let mut params = LcwgsParams::default();
         params.ne = 10.0;
-        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None);
+        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None, None);
         // Site 1 should be close to 1 (strong direct evidence)
         assert!(out.dosage[1] > 0.85, "site 1 dose={}", out.dosage[1]);
         // Sites 0 and 2 should be > 0.5 (spread via HMM transition)
@@ -1837,7 +1954,7 @@ mod tests {
         let cm = vec![0.0f64, 0.05, 0.10, 0.15, 0.20];
         let cond: Vec<u32> = (0..k as u32).collect();
         let params = LcwgsParams::default();
-        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None);
+        let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None, None);
         // Middle: strong ALT evidence
         assert!(out.dosage[2] > 0.85, "middle dose={}", out.dosage[2]);
         // Adjacent sites should be tugged toward ALT but less than middle
@@ -1892,8 +2009,8 @@ mod tests {
         let cond: Vec<u32> = (0..k as u32).collect();
         let params = LcwgsParams::default();
 
-        let a = unsafe { run_fb_avx512(&hl, &cond, &bm, &cm, &params, None, None) };
-        let b = unsafe { run_fb_avx2(&hl, &cond, &bm, &cm, &params, None, None) };
+        let a = unsafe { run_fb_avx512(&hl, &cond, &bm, &cm, &params, None, None, None) };
+        let b = unsafe { run_fb_avx2(&hl, &cond, &bm, &cm, &params, None, None, None) };
         assert_eq!(a.dosage.len(), n_var);
         assert_eq!(b.dosage.len(), n_var);
         let max_abs = a.dosage.iter().zip(&b.dosage)
