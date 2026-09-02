@@ -57,6 +57,7 @@ pub mod hmm;
 pub mod pbwt_select;
 pub mod faithful_select;
 pub mod bam_pileup;
+pub mod baq;
 pub mod errmod;
 pub mod indel_realign;
 pub mod iterate;
