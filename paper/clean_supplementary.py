@@ -4,7 +4,7 @@
 #    line(s), and the table; drop the read-first box, scoreboard, ">" notes, provenance.
 #  - scrub "production/prod panel" -> neutral "75,552-haplotype panel".
 import re
-SRC="/data/projects/.claude_home/gt/selphi/mayor/rig/paper/supplementary_benchmark_tables.md"
+SRC="/data/projects/.claude_home/gt/selphi/mayor/rig/paper/internal_notes/benchmark_lab_notes.md"
 OUT="/data/projects/.claude_home/gt/selphi/mayor/rig/paper/supplementary_info.md"
 lines=open(SRC).read().split("\n")
 
