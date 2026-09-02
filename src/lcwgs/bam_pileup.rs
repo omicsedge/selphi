@@ -70,6 +70,16 @@ pub struct PileupParams {
     /// selects (bcftools `-D`, `--full-BAQ`). `LCWGS_FULL_BAQ`. Measured slightly
     /// worse than partial (−0.05 pp non-ref concordance), kept for A/B.
     pub full_baq: bool,
+    /// Reproduce bcftools' streaming artefact exactly: a realigned read keeps its
+    /// RAW qualities at the pileup columns before the one that triggered its
+    /// realignment (bcftools has already consumed those columns when it
+    /// realigns). Default off = BAQ qualities at every column of a realigned
+    /// read. `LCWGS_BAQ_STREAMING` (A/B).
+    pub baq_streaming: bool,
+    /// Keep supplementary alignments (flag 0x800), as `bcftools mpileup` does by
+    /// default (its `--ff` excludes only UNMAP,SECONDARY,QCFAIL,DUP). Default off
+    /// = drop them, as GLIMPSE2 does. `LCWGS_KEEP_SUPPLEMENTARY` (A/B).
+    pub keep_supplementary: bool,
 }
 impl Default for PileupParams {
     fn default() -> Self {
@@ -82,6 +92,8 @@ impl Default for PileupParams {
             naive_gl: crate::config::present("LCWGS_NAIVE_GL"),
             baq: !crate::config::present("LCWGS_NO_BAQ"),
             full_baq: crate::config::present("LCWGS_FULL_BAQ"),
+            baq_streaming: crate::config::present("LCWGS_BAQ_STREAMING"),
+            keep_supplementary: crate::config::present("LCWGS_KEEP_SUPPLEMENTARY"),
         }
     }
 }
@@ -516,8 +528,9 @@ fn pileup_core(
 ) -> io::Result<(Vec<f32>, PileupReport)> {
     let n_var = sites.pos.len();
     let mut report = PileupReport::default();
+    let excl = if params.keep_supplementary { FLAG_EXCLUDE & !0x800 } else { FLAG_EXCLUDE };
     let accept = |r: &ReadView| -> bool {
-        r.flags & FLAG_EXCLUDE == 0
+        r.flags & excl == 0
             && !is_anomalous_pair(r.flags, params.count_orphans)
             && r.mapq >= params.min_mapq
             && !r.qual.is_empty()
@@ -598,15 +611,26 @@ impl PassState<'_> {
         let mut realigned = false;
         if let (Some(b), Some((stats, trig))) = (self.baq, self.baq_sel) {
             let mut decision: Option<bool> = None;
+            let mut trigger_v: usize = 0;
             for_each_covered_site(r.start, self.last_pos, r.cigar, self.sites.pos, |v, _| {
                 if decision.is_none() && trig[v] {
                     decision = Some(baq::read_passes_realign_rule(r.qual.len(), r.cigar, stats.nt[v], stats.has_clip[v], b.partial));
+                    trigger_v = v;
                 }
             });
             if decision == Some(true) {
                 if baq::baq_effective_quals(r.start - 1, r.cigar, r.seq, r.qual, b.ref_seq, b.ref_off, &mut self.bsc, &mut self.eq) {
                     realigned = true;
                     self.report.n_realigned += 1;
+                    if self.params.baq_streaming {
+                        // bcftools realigns the read when its pileup reaches the
+                        // trigger column; columns before it were scored with raw
+                        // qualities. Restore them for the query bases up to that column.
+                        if let Some(qi) = query_index_at(r.start, r.cigar, self.sites.pos[trigger_v]) {
+                            let qi = qi.min(self.eq.len());
+                            self.eq[..qi].copy_from_slice(&r.qual[..qi]);
+                        }
+                    }
                 } else {
                     self.report.n_baq_noop += 1;
                 }
@@ -636,6 +660,32 @@ impl PassState<'_> {
             }
         }
     }
+}
+
+/// Query (read) index of the base aligned at 1-based reference position
+/// `target`; for a position spanned by a deletion/skip, the index of the next
+/// aligned base. `None` if the read's aligned span does not reach `target`.
+fn query_index_at(start: i64, cigar: &[(Kind, usize)], target: i64) -> Option<usize> {
+    let mut refcur = start;
+    let mut qcur: usize = 0;
+    for &(kind, len) in cigar {
+        match kind {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                if target >= refcur && target < refcur + len as i64 {
+                    return Some(qcur + (target - refcur) as usize);
+                }
+                refcur += len as i64;
+                qcur += len;
+            }
+            Kind::Deletion | Kind::Skip => {
+                if target >= refcur && target < refcur + len as i64 { return Some(qcur); }
+                refcur += len as i64;
+            }
+            Kind::Insertion | Kind::SoftClip => { qcur += len; }
+            Kind::HardClip | Kind::Pad => {}
+        }
+    }
+    None
 }
 
 /// Visit every panel site a read's alignment covers, in ascending order — bases
