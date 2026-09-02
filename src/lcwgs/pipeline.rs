@@ -280,8 +280,34 @@ pub fn run_lcwgs_bam(
     let n_snp = is_snp.iter().filter(|&&b| b).count();
     let n_indel = n_shared - n_snp;
 
-    selphi_info!("  lcWGS-BAM: {} BAM(s), chrom {}, {} panel sites ({} SNPs, {} indels) to impute",
+    selphi_info!("  lcWGS-BAM: {} BAM(s), chrom {}, {} panel sites ({} SNPs, {} indels)",
         bam_paths.len(), chrom, n_shared, n_snp, n_indel);
+
+    // Non-SNP panel sites carry NO read evidence on the default path (their GL is
+    // the flat prior), yet as members of the target set they still enter PBWT
+    // selection and the Gibbs sweeps. The PL-VCF path never sees them (a caller
+    // emits no PL record there) and measurably imputes SNPs better for it
+    // (chr22, 6 GIAB samples: +0.04 pp non-ref concordance). Match it: drop them
+    // unless indel realignment will score them from reads, or the caller asks to
+    // keep the old flat-from-scaffold behaviour (LCWGS_BAM_KEEP_INDELS).
+    let enable_indel = crate::config::present("LCWGS_INDEL_REALIGN");
+    let keep_indels = crate::config::present("LCWGS_BAM_KEEP_INDELS");
+    let (wgs_idx, pos, ref_base, alt_base, is_snp, n_shared) = if n_indel > 0 && !(enable_indel && reference.is_some()) && !keep_indels {
+        let keep: Vec<usize> = (0..n_shared).filter(|&i| is_snp[i]).collect();
+        selphi_info!("  lcWGS-BAM: {} indel panel sites excluded from the target set (no read evidence; as the PL path). LCWGS_BAM_KEEP_INDELS=1 keeps them flat, LCWGS_INDEL_REALIGN=1 + --reference scores them",
+            n_indel);
+        (
+            keep.iter().map(|&i| wgs_idx[i]).collect::<Vec<usize>>(),
+            keep.iter().map(|&i| pos[i]).collect::<Vec<i64>>(),
+            keep.iter().map(|&i| ref_base[i]).collect::<Vec<u8>>(),
+            keep.iter().map(|&i| alt_base[i]).collect::<Vec<u8>>(),
+            vec![true; keep.len()],
+            keep.len(),
+        )
+    } else {
+        (wgs_idx, pos, ref_base, alt_base, is_snp, n_shared)
+    };
+    let n_indel = n_shared - is_snp.iter().filter(|&&b| b).count();
 
     // Indel sites: by DEFAULT left flat (imputed from the haplotype scaffold/LD),
     // matching GLIMPSE2's default. At low coverage the per-read indel genotype
@@ -290,7 +316,6 @@ pub fn run_lcwgs_bam(
     // benchmark: SNP r² 0.960 with indels flat vs 0.950 with read-based indel
     // GLs). Opt in with LCWGS_INDEL_REALIGN=1 (needs --reference); the read-vs-
     // haplotype pair-HMM is then used to score indels (see `super::indel_realign`).
-    let enable_indel = crate::config::present("LCWGS_INDEL_REALIGN");
     let indel_model = if n_indel > 0 && enable_indel {
         match reference {
             Some(refp) => {

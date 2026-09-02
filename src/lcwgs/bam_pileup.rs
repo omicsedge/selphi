@@ -16,6 +16,13 @@
 //! local read-vs-haplotype realignment (a pair-HMM; see [`super::indel_realign`])
 //! when a reference FASTA is supplied; otherwise they too stay flat.
 //!
+//! Base Alignment Quality (BAQ, [`super::baq`]) is applied when a reference
+//! FASTA is given, exactly as `bcftools mpileup` does by default: a first pass
+//! over the reads gathers per-column indel/soft-clip statistics, a second pass
+//! realigns the reads bcftools' partial heuristic selects and deposits their
+//! BAQ-capped base qualities. Without `--reference` (or under `LCWGS_NO_BAQ`)
+//! the single-pass raw-quality pileup runs unchanged.
+//!
 //! Model (per read base `b`, phred base-quality `q`, error `ε = 10^(-q/10)`):
 //! `P(b|REF)=1-ε if b==ref else ε/3`, `P(b|ALT)` likewise, `P(b|het)=½P(b|REF)+½P(b|ALT)`.
 //! `gl3` is `P(reads|genotype)` normalised to sum 1, identical to the PL path.
@@ -30,6 +37,7 @@ use noodles_sam::alignment::record::cigar::op::Kind;
 use noodles_sam::alignment::RecordBuf;
 use noodles_sam::Header;
 use super::indel_realign::{IndelModel, IndelScratch};
+use super::baq::{self, BaqScratch, ColumnStats};
 
 /// Per-sample GL pileup result, ready for the Gibbs engine.
 pub struct BamGl {
@@ -55,6 +63,13 @@ pub struct PileupParams {
     /// revised-MAQ errmod (correlated-read dependency cap + mapQ/neighbour baseQ caps).
     /// `true` (`LCWGS_NAIVE_GL`) = prior naive independent-product model (A/B only).
     pub naive_gl: bool,
+    /// Apply BAQ (needs a reference FASTA). Default on, matching bcftools mpileup;
+    /// `LCWGS_NO_BAQ` turns it off (bcftools `-B`).
+    pub baq: bool,
+    /// Realign EVERY read rather than only those bcftools' partial heuristic
+    /// selects (bcftools `-D`, `--full-BAQ`). `LCWGS_FULL_BAQ`. Measured slightly
+    /// worse than partial (−0.05 pp non-ref concordance), kept for A/B.
+    pub full_baq: bool,
 }
 impl Default for PileupParams {
     fn default() -> Self {
@@ -65,6 +80,8 @@ impl Default for PileupParams {
             max_depth: envu("LCWGS_MAX_DEPTH", 250),
             count_orphans: crate::config::present("LCWGS_COUNT_ORPHANS"),
             naive_gl: crate::config::present("LCWGS_NAIVE_GL"),
+            baq: !crate::config::present("LCWGS_NO_BAQ"),
+            full_baq: crate::config::present("LCWGS_FULL_BAQ"),
         }
     }
 }
@@ -73,13 +90,7 @@ impl Default for PileupParams {
 /// htslib `seq_nt16_int`. Used to pack pileup bases for the errmod model.
 #[inline]
 fn ascii_to_base4(b: u8) -> usize {
-    match b {
-        b'A' | b'a' => 0,
-        b'C' | b'c' => 1,
-        b'G' | b'g' => 2,
-        b'T' | b't' => 3,
-        _ => 4,
-    }
+    baq::nt4(b) as usize
 }
 
 /// Discard a read if it is part of an ANOMALOUS pair: paired (flag 0x1) but NOT
@@ -155,6 +166,39 @@ impl PhredLut {
     }
 }
 
+/// The reference bases BAQ realigns against: `seq[0]` sits at 0-based genome
+/// position `off`. Loaded once per contig (or region window) and shared by all
+/// samples.
+pub struct RefWindow {
+    pub seq: Vec<u8>,
+    pub off: i64,
+}
+
+/// Load the reference bases for `chrom` from an indexed FASTA — the whole contig,
+/// or `[rs - margin, re + margin]` when a region is given (reads overlapping the
+/// region, ≤ 500 bp for BAQ, never reach past the margin). Contig name resolution
+/// is `chr`-prefix tolerant, as everywhere else in the pipeline.
+pub fn load_reference_window(reference: &str, chrom: &str, region: Option<(i64, i64)>) -> io::Result<RefWindow> {
+    let mut ir = fasta::io::indexed_reader::Builder::default().build_from_path(reference)?;
+    let recs: Vec<(Vec<u8>, usize)> = ir.index().as_ref().iter()
+        .map(|r| (r.name().to_vec(), r.length() as usize)).collect();
+    let find = |n: &[u8]| recs.iter().find(|(x, _)| x.as_slice() == n).cloned();
+    let hit = find(chrom.as_bytes())
+        .or_else(|| chrom.strip_prefix("chr").and_then(|s| find(s.as_bytes())))
+        .or_else(|| if chrom.starts_with("chr") { None } else { find(format!("chr{chrom}").as_bytes()) });
+    let (name, len) = hit.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput,
+        format!("reference FASTA has no contig matching '{chrom}' (tried with/without 'chr')")))?;
+    const MARGIN: i64 = 2000;
+    let (lo, hi) = match region {
+        Some((rs, re)) => ((rs - MARGIN).max(1), (re + MARGIN).min(len as i64).max(1)),
+        None => (1, len as i64),
+    };
+    let inval = |e: std::num::TryFromIntError| io::Error::new(io::ErrorKind::InvalidInput, e);
+    let reg = Region::new(name, Position::try_from(lo as usize).map_err(inval)?..=Position::try_from(hi as usize).map_err(inval)?);
+    let rec = ir.query(&reg)?;
+    Ok(RefWindow { seq: rec.sequence().as_ref().to_vec(), off: lo - 1 })
+}
+
 /// Compute per-sample 3-way GLs at the given panel SNP sites by piling up the
 /// BAM(s). `chrom` is the contig the sites live on; `sites` are
 /// `(pos_1based, ref_base, alt_base)` ascending by pos, with `is_snp` marking
@@ -186,17 +230,43 @@ pub fn pileup_bams(
         Some(crate::lcwgs::errmod::ErrMod::new())
     };
 
+    // BAQ needs the reference. Loaded once, shared read-only across samples.
+    let ref_win: Option<RefWindow> = if params.baq {
+        match reference {
+            Some(p) => {
+                let w = load_reference_window(p, chrom, region)?;
+                crate::selphi_info!("  lcWGS-BAM: BAQ on (extended, {} heuristic — bcftools mpileup default); reference window {} bp",
+                    if params.full_baq { "full-realignment" } else { "partial-realignment" }, w.seq.len());
+                Some(w)
+            }
+            None => {
+                crate::selphi_info!("  lcWGS-BAM: BAQ off — no --reference given (bcftools mpileup applies BAQ by default; pass --reference <fasta> to enable)");
+                None
+            }
+        }
+    } else {
+        crate::selphi_info!("  lcWGS-BAM: BAQ off (LCWGS_NO_BAQ)");
+        None
+    };
+    let sites = SiteCtx { pos, ref_base, alt_base, is_snp };
+    let baq_ctx = ref_win.as_ref().map(|w| BaqCtx { ref_seq: &w.seq, ref_off: w.off, partial: !params.full_baq });
+
     // Per-sample pileup in parallel (BAM/CRAM are independent). Each produces its
     // own [n_var*3] normalised GL block; assembled into the interleaved gl3 after.
-    let per_sample: Vec<io::Result<(String, Vec<f32>)>> = bam_paths
+    let per_sample: Vec<io::Result<(String, Vec<f32>, PileupReport)>> = bam_paths
         .par_iter()
-        .map(|path| pileup_one(path, chrom, pos, ref_base, alt_base, is_snp, region, reference, indel_model, &params, &lut, em.as_ref()))
+        .map(|path| pileup_one(path, chrom, &sites, region, reference, indel_model, &params, &lut, em.as_ref(), baq_ctx.as_ref()))
         .collect();
 
     let mut sample_ids = Vec::with_capacity(n_samples);
     let mut blocks: Vec<Vec<f32>> = Vec::with_capacity(n_samples);
     for r in per_sample {
-        let (id, blk) = r?;
+        let (id, blk, rep) = r?;
+        if baq_ctx.is_some() {
+            crate::selphi_info!("  lcWGS-BAM: {}: {} reads, {} triggering sites, {} realigned ({:.1}%), {} BAQ no-ops",
+                id, rep.n_reads, rep.n_trigger_sites, rep.n_realigned,
+                100.0 * rep.n_realigned as f64 / rep.n_reads.max(1) as f64, rep.n_baq_noop);
+        }
         sample_ids.push(id);
         blocks.push(blk);
     }
@@ -214,124 +284,403 @@ pub fn pileup_bams(
     Ok(BamGl { gl3, sample_ids })
 }
 
+/// The panel sites being piled up.
+struct SiteCtx<'a> {
+    pos: &'a [i64],
+    ref_base: &'a [u8],
+    alt_base: &'a [u8],
+    is_snp: &'a [bool],
+}
+
+/// BAQ inputs: the reference window and the realignment-selection mode.
+struct BaqCtx<'a> {
+    ref_seq: &'a [u8],
+    ref_off: i64,
+    partial: bool,
+}
+
+/// What the pileup did with a sample's reads (for the log).
+#[derive(Default)]
+pub struct PileupReport {
+    pub n_reads: u64,
+    pub n_realigned: u64,
+    pub n_baq_noop: u64,
+    pub n_trigger_sites: usize,
+}
+
+/// One aligned read as the pileup core sees it — the BAM and CRAM adapters fill
+/// this from their own record types, so the two-pass logic exists once.
+struct ReadView<'a> {
+    /// 1-based alignment start.
+    start: i64,
+    flags: u16,
+    mapq: u8,
+    cigar: &'a [(Kind, usize)],
+    /// Read bases, ASCII.
+    seq: &'a [u8],
+    /// Raw phred base qualities.
+    qual: &'a [u8],
+    /// Fragment hash (paired mates share a QNAME), for overlap collapsing.
+    qhash: u64,
+}
+
+/// A record source replays every record of the sample on `chrom` (the contig
+/// filter is the adapter's) to the sink. It is invoked once (raw pileup) or
+/// twice (BAQ: statistics pass, then pileup pass).
+type RecordSource<'s> = dyn FnMut(&mut dyn FnMut(&ReadView)) -> io::Result<()> + 's;
+
 /// Pileup a single BAM/CRAM → per-site normalised 3-way GL (`[n_var*3]`).
 /// `.cram` is dispatched to the CRAM path (which needs `reference`).
 #[allow(clippy::too_many_arguments)]
 fn pileup_one(
     path: &str,
     chrom: &str,
-    pos: &[i64],
-    ref_base: &[u8],
-    alt_base: &[u8],
-    is_snp: &[bool],
+    sites: &SiteCtx,
     region: Option<(i64, i64)>,
     reference: Option<&str>,
     indel_model: Option<&IndelModel>,
     params: &PileupParams,
     lut: &PhredLut,
     em: Option<&crate::lcwgs::errmod::ErrMod>,
-) -> io::Result<(String, Vec<f32>)> {
+    baq: Option<&BaqCtx>,
+) -> io::Result<(String, Vec<f32>, PileupReport)> {
     if path.to_ascii_lowercase().ends_with(".cram") {
-        return pileup_one_cram(path, chrom, pos, ref_base, alt_base, is_snp, region, reference, indel_model, params, lut, em);
+        return pileup_one_cram(path, chrom, sites, region, reference, indel_model, params, lut, em, baq);
     }
-    let n_var = pos.len();
     let mut reader = bam::io::reader::Builder.build_from_path(path)?;
     let header = reader.read_header()?;
-
     let sample_id = read_group_sample_id(&header, path);
 
     // Map chrom name → reference id in this BAM (chr-prefix tolerant).
-    let resolved = resolve_contig(&header, chrom);
+    let Some((target_rid, contig_name)) = resolve_contig(&header, chrom) else {
+        // Contig absent → every site flat.
+        return Ok((sample_id, vec![1.0f32 / 3.0; sites.pos.len() * 3], PileupReport::default()));
+    };
+    // Region mode with a .bai index → fetch only the region's reads (avoids
+    // reading the whole file). Otherwise stream all records (zero-alloc reuse).
+    let bai_path = format!("{path}.bai");
+    let region_query = region.filter(|_| std::path::Path::new(&bai_path).exists());
+    let index = match region_query { Some(_) => Some(bam::bai::fs::read(&bai_path)?), None => None };
 
-    // errmod (default) collects packed bases per site; naive accumulates log-Ls.
-    let use_em = em.is_some();
-    let mut ll = vec![[0.0f64; 3]; n_var];
-    let mut bases: Vec<Vec<u16>> = if use_em { vec![Vec::new(); n_var] } else { Vec::new() };
-    let mut depth = vec![0u32; n_var];
-    let last_pos = pos[n_var - 1];
-
-    if let Some((target_rid, contig_name)) = resolved {
-        // Shared per-record pileup: CIGAR-walk + GL accumulation. Used by both the
-        // whole-file streaming path and the indexed region-query path.
-        let mut cigar_buf: Vec<(Kind, usize)> = Vec::with_capacity(16);
-        let mut iscratch = IndelScratch::default();
-        let mut ov = OverlapState::new(n_var); // mate-overlap collapse state
-        let mut process = |record: &bam::Record| {
+    let mut cigar_buf: Vec<(Kind, usize)> = Vec::with_capacity(16);
+    let mut seq_buf: Vec<u8> = Vec::with_capacity(256);
+    let mut source = |sink: &mut dyn FnMut(&ReadView)| -> io::Result<()> {
+        // A fresh reader per replay: the BGZF stream is not rewindable.
+        let mut reader = bam::io::reader::Builder.build_from_path(path)?;
+        let header = reader.read_header()?;
+        let mut record = bam::Record::default();
+        let mut emit = |record: &bam::Record, sink: &mut dyn FnMut(&ReadView)| {
             match record.reference_sequence_id() {
                 Some(Ok(rid)) if rid == target_rid => {}
                 _ => return,
             }
-            let fl = record.flags().bits();
-            if fl & FLAG_EXCLUDE != 0 { return; }
-            if is_anomalous_pair(fl, params.count_orphans) { return; }
-            let mapq = record.mapping_quality().map(|m| m.get()).unwrap_or(0);
-            if mapq < params.min_mapq { return; }
             let start = match record.alignment_start() {
                 Some(Ok(p)) => usize::from(p) as i64, // 1-based
                 _ => return,
             };
-            let seq = record.sequence();
-            let qbytes = record.quality_scores().as_bytes();
-            if qbytes.is_empty() { return; } // no base qualities → can't score
+            let mapq = record.mapping_quality().map(|m| m.get()).unwrap_or(0);
             cigar_buf.clear();
             for op in record.cigar().iter() {
                 match op { Ok(o) => cigar_buf.push((o.kind(), o.len())), Err(_) => return }
             }
-            // Fragment hash (paired mates share a QNAME) → count overlap once.
+            seq_buf.clear();
+            seq_buf.extend(record.sequence().iter());
+            let qual = record.quality_scores().as_bytes();
             let qhash = record.name().map(|n| fnv1a(n.as_ref())).unwrap_or((start as u64) << 1 | 1);
-            if use_em {
-                walk_record_em(
-                    start, last_pos, &cigar_buf,
-                    |qi| seq.get(qi).unwrap_or(b'N'),
-                    |qi| qbytes.get(qi).copied().unwrap_or(0),
-                    qbytes.len(), mapq, fl & 0x10 != 0,
-                    pos, is_snp, params, &mut bases, &mut depth, qhash, &mut ov,
-                );
-            } else {
-                walk_record(
-                    start, last_pos, &cigar_buf,
-                    |qi| seq.get(qi).unwrap_or(b'N'),
-                    |qi| qbytes.get(qi).copied().unwrap_or(0),
-                    pos, ref_base, alt_base, is_snp, params, lut, &mut ll, &mut depth,
-                    qhash, &mut ov,
-                );
-                if let Some(model) = indel_model {
-                    super::indel_realign::score_read(
-                        start, &cigar_buf,
-                        |qi| seq.get(qi).unwrap_or(b'N'),
-                        |qi| qbytes.get(qi).copied().unwrap_or(0),
-                        model, lut, &mut iscratch, &mut ll, &mut depth,
-                        params.max_depth, params.min_bq, qhash, &mut ov.last_frag,
-                    );
-                }
-            }
+            sink(&ReadView { start, flags: record.flags().bits(), mapq, cigar: &cigar_buf, seq: &seq_buf, qual, qhash });
         };
-
-        // Region mode with a .bai index → fetch only the region's reads (avoids
-        // reading the whole file). Otherwise stream all records (zero-alloc reuse).
-        let bai_path = format!("{path}.bai");
-        let region_query = region.filter(|_| std::path::Path::new(&bai_path).exists());
-        if let Some((rs, re)) = region_query {
-            let index = bam::bai::fs::read(&bai_path)?;
+        if let (Some((rs, re)), Some(index)) = (region_query, index.as_ref()) {
             let reg = build_region(contig_name.clone(), rs, re)?;
-            let mut q = reader.query(&header, &index, &reg)?;
-            let mut record = bam::Record::default();
+            let mut q = reader.query(&header, index, &reg)?;
             while q.read_record(&mut record)? != 0 {
-                process(&record);
+                emit(&record, sink);
             }
         } else {
-            let mut record = bam::Record::default();
             while reader.read_record(&mut record)? != 0 {
-                process(&record);
+                emit(&record, sink);
+            }
+        }
+        Ok(())
+    };
+
+    let (gl, rep) = pileup_core(&mut source, sites, params, lut, em, indel_model, baq)?;
+    Ok((sample_id, gl, rep))
+}
+
+/// Pileup a single CRAM → per-site normalised 3-way GL (`[n_var*3]`).
+///
+/// CRAM stores read bases as differences from a reference, so a FASTA reference
+/// (with a `.fai`) is required to decode them — passed via `--reference`. Each
+/// sample opens its own reference repository (avoids contending on a shared
+/// FASTA reader across the rayon sample threads). The per-read CIGAR-walk + GL
+/// model is the SAME as the BAM path (`pileup_core`); the only difference is the
+/// record source. With a `.crai` index and a region, only the region is decoded.
+#[allow(clippy::too_many_arguments)]
+fn pileup_one_cram(
+    path: &str,
+    chrom: &str,
+    sites: &SiteCtx,
+    region: Option<(i64, i64)>,
+    reference: Option<&str>,
+    indel_model: Option<&IndelModel>,
+    params: &PileupParams,
+    lut: &PhredLut,
+    em: Option<&crate::lcwgs::errmod::ErrMod>,
+    baq: Option<&BaqCtx>,
+) -> io::Result<(String, Vec<f32>, PileupReport)> {
+    let ref_path = reference.ok_or_else(|| io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("CRAM input ({path}) requires --reference <fasta> (with .fai) to decode read bases"),
+    ))?;
+    let open = || -> io::Result<(cram::io::Reader<std::fs::File>, Header)> {
+        let ir = fasta::io::indexed_reader::Builder::default().build_from_path(ref_path)?;
+        let repo = fasta::Repository::new(fasta::repository::adapters::IndexedReader::new(ir));
+        let mut reader = cram::io::reader::Builder::default()
+            .set_reference_sequence_repository(repo)
+            .build_from_path(path)?;
+        let header = reader.read_header()?;
+        Ok((reader, header))
+    };
+    let (_, header) = open()?;
+    let sample_id = read_group_sample_id(&header, path);
+    let Some((target_rid, contig_name)) = resolve_contig(&header, chrom) else {
+        return Ok((sample_id, vec![1.0f32 / 3.0; sites.pos.len() * 3], PileupReport::default()));
+    };
+    // Region mode with a .crai index → decode only the region. Else stream all.
+    let crai_path = format!("{path}.crai");
+    let region_query = region.filter(|_| std::path::Path::new(&crai_path).exists());
+    let index: Option<cram::crai::Index> = match region_query {
+        Some((rs, re)) => {
+            // noodles' CRAM Query decodes EVERY container of the reference sequence
+            // (it filters reads by interval only after decoding, no container skip /
+            // early-stop). Pre-filter the crai to the containers whose ref span
+            // overlaps [rs,re] so only those are seeked + decoded — O(region), not
+            // O(chromosome). The per-read interval filter inside Query still applies.
+            Some(cram::crai::fs::read(&crai_path)?
+                .into_iter()
+                .filter(|r| {
+                    r.reference_sequence_id() == Some(target_rid) && {
+                        let astart = r.alignment_start().map(|p| usize::from(p) as i64).unwrap_or(0);
+                        let aend = astart + r.alignment_span() as i64; // exclusive max read end
+                        astart <= re && aend >= rs
+                    }
+                })
+                .collect())
+        }
+        None => None,
+    };
+
+    let mut cigar_buf: Vec<(Kind, usize)> = Vec::with_capacity(16);
+    let mut seq_buf: Vec<u8> = Vec::with_capacity(256);
+    let mut source = |sink: &mut dyn FnMut(&ReadView)| -> io::Result<()> {
+        let (mut reader, header) = open()?;
+        let mut emit = |record: &RecordBuf, sink: &mut dyn FnMut(&ReadView)| {
+            if record.reference_sequence_id() != Some(target_rid) { return; }
+            let start = match record.alignment_start() { Some(p) => usize::from(p) as i64, None => return };
+            let mapq = record.mapping_quality().map(|m| m.get()).unwrap_or(0);
+            cigar_buf.clear();
+            for op in record.cigar().as_ref() { cigar_buf.push((op.kind(), op.len())); }
+            seq_buf.clear();
+            seq_buf.extend_from_slice(record.sequence().as_ref());
+            let qual: &[u8] = record.quality_scores().as_ref();
+            let qhash = record.name().map(|n| fnv1a(n.as_ref())).unwrap_or((start as u64) << 1 | 1);
+            sink(&ReadView { start, flags: record.flags().bits(), mapq, cigar: &cigar_buf, seq: &seq_buf, qual, qhash });
+        };
+        if let (Some((rs, re)), Some(index)) = (region_query, index.as_ref()) {
+            let reg = build_region(contig_name.clone(), rs, re)?;
+            for result in reader.query(&header, index, &reg)? {
+                emit(&result?, sink);
+            }
+        } else {
+            for result in reader.records(&header) {
+                emit(&result?, sink);
+            }
+        }
+        Ok(())
+    };
+
+    let (gl, rep) = pileup_core(&mut source, sites, params, lut, em, indel_model, baq)?;
+    Ok((sample_id, gl, rep))
+}
+
+/// Format-agnostic pileup of one sample: read filtering, the optional BAQ
+/// statistics pass, then the GL-accumulating pass, then GL finalisation.
+fn pileup_core(
+    source: &mut RecordSource,
+    sites: &SiteCtx,
+    params: &PileupParams,
+    lut: &PhredLut,
+    em: Option<&crate::lcwgs::errmod::ErrMod>,
+    indel_model: Option<&IndelModel>,
+    baq: Option<&BaqCtx>,
+) -> io::Result<(Vec<f32>, PileupReport)> {
+    let n_var = sites.pos.len();
+    let mut report = PileupReport::default();
+    let accept = |r: &ReadView| -> bool {
+        r.flags & FLAG_EXCLUDE == 0
+            && !is_anomalous_pair(r.flags, params.count_orphans)
+            && r.mapq >= params.min_mapq
+            && !r.qual.is_empty()
+    };
+
+    // Pass 1 (BAQ only): per-column read statistics for bcftools' realignment
+    // heuristic, over exactly the reads the pileup will use.
+    let baq_sel: Option<(ColumnStats, Vec<bool>)> = match baq {
+        Some(b) => {
+            let mut stats = ColumnStats::new(n_var);
+            let last_pos = sites.pos[n_var - 1];
+            source(&mut |r: &ReadView| {
+                if !accept(r) { return; }
+                let has_indel = r.cigar.iter().any(|&(k, _)| matches!(k, Kind::Insertion | Kind::Deletion | Kind::Skip));
+                let has_clip = r.cigar.iter().any(|&(k, _)| k == Kind::SoftClip);
+                for_each_covered_site(r.start, last_pos, r.cigar, sites.pos, |v, indel_after| {
+                    stats.add(v, has_indel, has_clip, indel_after);
+                });
+            })?;
+            let trig: Vec<bool> = (0..n_var)
+                .map(|v| if b.partial { stats.triggers_realign(v) } else { stats.nt[v] > 0 })
+                .collect();
+            report.n_trigger_sites = trig.iter().filter(|&&t| t).count();
+            Some((stats, trig))
+        }
+        None => None,
+    };
+
+    // Pass 2: pile up, with BAQ-capped qualities on the reads selected above.
+    let use_em = em.is_some();
+    let mut st = PassState {
+        sites, params, lut, em, indel_model, baq, baq_sel: baq_sel.as_ref(),
+        ll: vec![[0.0f64; 3]; n_var],
+        bases: if use_em { vec![Vec::new(); n_var] } else { Vec::new() },
+        depth: vec![0u32; n_var],
+        ov: OverlapState::new(n_var),
+        iscratch: IndelScratch::default(),
+        bsc: BaqScratch::new(),
+        eq: Vec::with_capacity(256),
+        last_pos: sites.pos[n_var - 1],
+        report: &mut report,
+    };
+    source(&mut |r: &ReadView| { if accept(r) { st.on_read(r); } })?;
+    let PassState { mut bases, ll, depth, .. } = st;
+
+    let gl = match em {
+        Some(e) => finalize_gl_errmod(&mut bases, sites.ref_base, sites.alt_base, sites.is_snp, e),
+        None => finalize_gl(&ll, &depth),
+    };
+    Ok((gl, report))
+}
+
+/// Mutable state of the GL-accumulating pass.
+struct PassState<'a> {
+    sites: &'a SiteCtx<'a>,
+    params: &'a PileupParams,
+    lut: &'a PhredLut,
+    em: Option<&'a crate::lcwgs::errmod::ErrMod>,
+    indel_model: Option<&'a IndelModel>,
+    baq: Option<&'a BaqCtx<'a>>,
+    baq_sel: Option<&'a (ColumnStats, Vec<bool>)>,
+    ll: Vec<[f64; 3]>,
+    bases: Vec<Vec<u16>>,
+    depth: Vec<u32>,
+    ov: OverlapState,
+    iscratch: IndelScratch,
+    bsc: BaqScratch,
+    /// BAQ-capped qualities of the current read (when realigned).
+    eq: Vec<u8>,
+    last_pos: i64,
+    report: &'a mut PileupReport,
+}
+impl PassState<'_> {
+    fn on_read(&mut self, r: &ReadView) {
+        self.report.n_reads += 1;
+        // BAQ: judge the read once, at the first triggering column it covers
+        // (bcftools marks a read realigned at that column whatever the outcome).
+        let mut realigned = false;
+        if let (Some(b), Some((stats, trig))) = (self.baq, self.baq_sel) {
+            let mut decision: Option<bool> = None;
+            for_each_covered_site(r.start, self.last_pos, r.cigar, self.sites.pos, |v, _| {
+                if decision.is_none() && trig[v] {
+                    decision = Some(baq::read_passes_realign_rule(r.qual.len(), r.cigar, stats.nt[v], stats.has_clip[v], b.partial));
+                }
+            });
+            if decision == Some(true) {
+                if baq::baq_effective_quals(r.start - 1, r.cigar, r.seq, r.qual, b.ref_seq, b.ref_off, &mut self.bsc, &mut self.eq) {
+                    realigned = true;
+                    self.report.n_realigned += 1;
+                } else {
+                    self.report.n_baq_noop += 1;
+                }
+            }
+        }
+        let quals: &[u8] = if realigned { &self.eq } else { r.qual };
+        let base_at = |qi: usize| r.seq.get(qi).copied().unwrap_or(b'N');
+        let qual_at = |qi: usize| quals.get(qi).copied().unwrap_or(0);
+        if self.em.is_some() {
+            walk_record_em(
+                r.start, self.last_pos, r.cigar, base_at, qual_at,
+                quals.len(), r.mapq, r.flags & 0x10 != 0,
+                self.sites.pos, self.sites.is_snp, self.params, &mut self.bases, &mut self.depth, r.qhash, &mut self.ov,
+            );
+        } else {
+            walk_record(
+                r.start, self.last_pos, r.cigar, base_at, qual_at,
+                self.sites.pos, self.sites.ref_base, self.sites.alt_base, self.sites.is_snp, self.params, self.lut,
+                &mut self.ll, &mut self.depth, r.qhash, &mut self.ov,
+            );
+            if let Some(model) = self.indel_model {
+                super::indel_realign::score_read(
+                    r.start, r.cigar, base_at, qual_at,
+                    model, self.lut, &mut self.iscratch, &mut self.ll, &mut self.depth,
+                    self.params.max_depth, self.params.min_bq, r.qhash, &mut self.ov.last_frag,
+                );
             }
         }
     }
+}
 
-    let gl = match em {
-        Some(e) => finalize_gl_errmod(&mut bases, ref_base, alt_base, is_snp, e),
-        None => finalize_gl(&ll, &depth),
-    };
-    Ok((sample_id, gl))
+/// Visit every panel site a read's alignment covers, in ascending order — bases
+/// under M/=/X ops and positions spanned by D/N ops (a deleted base is still a
+/// member of the pileup column). `indel_after` is htslib's `p->indel`: the
+/// signed length of an insertion (+) or deletion (−) immediately following this
+/// base, 0 otherwise.
+fn for_each_covered_site(start: i64, last_pos: i64, cigar: &[(Kind, usize)], pos: &[i64], mut f: impl FnMut(usize, i32)) {
+    let n_var = pos.len();
+    let ref_span: i64 = cigar.iter().map(|&(k, l)| match k {
+        Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion | Kind::Skip => l as i64,
+        _ => 0,
+    }).sum();
+    let mut si = pos.partition_point(|&p| p < start);
+    if si >= n_var || pos[si] > start + ref_span { return; }
+    let mut refcur = start;
+    for (idx, &(kind, len)) in cigar.iter().enumerate() {
+        match kind {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                let ref_end = refcur + len as i64;
+                let indel_after: i32 = match cigar.get(idx + 1) {
+                    Some(&(Kind::Insertion, l)) => l as i32,
+                    Some(&(Kind::Deletion, l)) => -(l as i32),
+                    _ => 0,
+                };
+                while si < n_var && pos[si] < refcur { si += 1; }
+                while si < n_var && pos[si] < ref_end {
+                    f(si, if pos[si] == ref_end - 1 { indel_after } else { 0 });
+                    si += 1;
+                }
+                refcur = ref_end;
+            }
+            Kind::Deletion | Kind::Skip => {
+                let ref_end = refcur + len as i64;
+                while si < n_var && pos[si] < refcur { si += 1; }
+                while si < n_var && pos[si] < ref_end {
+                    f(si, 0);
+                    si += 1;
+                }
+                refcur = ref_end;
+            }
+            Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
+        }
+        if refcur > last_pos { break; }
+    }
 }
 
 /// Convert per-site log10-likelihoods → normalised 3-way GL. Sites with no
@@ -353,137 +702,6 @@ fn finalize_gl(ll: &[[f64; 3]], depth: &[u32]) -> Vec<f32> {
         }
     }
     out
-}
-
-/// Pileup a single CRAM → per-site normalised 3-way GL (`[n_var*3]`).
-///
-/// CRAM stores read bases as differences from a reference, so a FASTA reference
-/// (with a `.fai`) is required to decode them — passed via `--reference`. Each
-/// sample opens its own reference repository (avoids contending on a shared
-/// FASTA reader across the rayon sample threads). The per-read CIGAR-walk + GL
-/// model is the SAME as the BAM path (`walk_record`); the only difference is the
-/// record source. With a `.crai` index and a region, only the region is decoded.
-#[allow(clippy::too_many_arguments)]
-fn pileup_one_cram(
-    path: &str,
-    chrom: &str,
-    pos: &[i64],
-    ref_base: &[u8],
-    alt_base: &[u8],
-    is_snp: &[bool],
-    region: Option<(i64, i64)>,
-    reference: Option<&str>,
-    indel_model: Option<&IndelModel>,
-    params: &PileupParams,
-    lut: &PhredLut,
-    em: Option<&crate::lcwgs::errmod::ErrMod>,
-) -> io::Result<(String, Vec<f32>)> {
-    let n_var = pos.len();
-    let ref_path = reference.ok_or_else(|| io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!("CRAM input ({path}) requires --reference <fasta> (with .fai) to decode read bases"),
-    ))?;
-    let repo = {
-        let ir = fasta::io::indexed_reader::Builder::default().build_from_path(ref_path)?;
-        fasta::Repository::new(fasta::repository::adapters::IndexedReader::new(ir))
-    };
-    let mut reader = cram::io::reader::Builder::default()
-        .set_reference_sequence_repository(repo)
-        .build_from_path(path)?;
-    let header = reader.read_header()?;
-
-    let sample_id = read_group_sample_id(&header, path);
-
-    let use_em = em.is_some();
-    let mut ll = vec![[0.0f64; 3]; n_var];
-    let mut bases: Vec<Vec<u16>> = if use_em { vec![Vec::new(); n_var] } else { Vec::new() };
-    let mut depth = vec![0u32; n_var];
-    let (target_rid, contig_name) = match resolve_contig(&header, chrom) {
-        Some(x) => x,
-        None => return Ok((sample_id, finalize_gl(&ll, &depth))), // contig absent → all flat
-    };
-    let last_pos = pos[n_var - 1];
-    let mut cigar_buf: Vec<(Kind, usize)> = Vec::with_capacity(16);
-    let mut iscratch = IndelScratch::default();
-    let mut ov = OverlapState::new(n_var); // mate-overlap collapse state
-
-    // Same guards + walk as the BAM path, over decoded RecordBufs.
-    let mut process = |record: &RecordBuf| {
-        if record.reference_sequence_id() != Some(target_rid) { return; }
-        let fl = record.flags().bits();
-        if fl & FLAG_EXCLUDE != 0 { return; }
-        if is_anomalous_pair(fl, params.count_orphans) { return; }
-        let mapq = record.mapping_quality().map(|m| m.get()).unwrap_or(0);
-        if mapq < params.min_mapq { return; }
-        let start = match record.alignment_start() { Some(p) => usize::from(p) as i64, None => return };
-        let seq = record.sequence();
-        let qbytes = record.quality_scores().as_ref();
-        if qbytes.is_empty() { return; }
-        cigar_buf.clear();
-        for op in record.cigar().as_ref() { cigar_buf.push((op.kind(), op.len())); }
-        let qhash = record.name().map(|n| fnv1a(n.as_ref())).unwrap_or((start as u64) << 1 | 1);
-        if use_em {
-            walk_record_em(
-                start, last_pos, &cigar_buf,
-                |qi| seq.get(qi).unwrap_or(b'N'),
-                |qi| qbytes.get(qi).copied().unwrap_or(0),
-                qbytes.len(), mapq, fl & 0x10 != 0,
-                pos, is_snp, params, &mut bases, &mut depth, qhash, &mut ov,
-            );
-        } else {
-            walk_record(
-                start, last_pos, &cigar_buf,
-                |qi| seq.get(qi).unwrap_or(b'N'),
-                |qi| qbytes.get(qi).copied().unwrap_or(0),
-                pos, ref_base, alt_base, is_snp, params, lut, &mut ll, &mut depth,
-                qhash, &mut ov,
-            );
-            if let Some(model) = indel_model {
-                super::indel_realign::score_read(
-                    start, &cigar_buf,
-                    |qi| seq.get(qi).unwrap_or(b'N'),
-                    |qi| qbytes.get(qi).copied().unwrap_or(0),
-                    model, lut, &mut iscratch, &mut ll, &mut depth,
-                    params.max_depth, params.min_bq, qhash, &mut ov.last_frag,
-                );
-            }
-        }
-    };
-
-    // Region mode with a .crai index → decode only the region. Else stream all.
-    let crai_path = format!("{path}.crai");
-    let region_query = region.filter(|_| std::path::Path::new(&crai_path).exists());
-    if let Some((rs, re)) = region_query {
-        // noodles' CRAM Query decodes EVERY container of the reference sequence
-        // (it filters reads by interval only after decoding, no container skip /
-        // early-stop). Pre-filter the crai to the containers whose ref span
-        // overlaps [rs,re] so only those are seeked + decoded — O(region), not
-        // O(chromosome). The per-read interval filter inside Query still applies.
-        let index: cram::crai::Index = cram::crai::fs::read(&crai_path)?
-            .into_iter()
-            .filter(|r| {
-                r.reference_sequence_id() == Some(target_rid) && {
-                    let astart = r.alignment_start().map(|p| usize::from(p) as i64).unwrap_or(0);
-                    let aend = astart + r.alignment_span() as i64; // exclusive max read end
-                    astart <= re && aend >= rs
-                }
-            })
-            .collect();
-        let reg = build_region(contig_name.clone(), rs, re)?;
-        for result in reader.query(&header, &index, &reg)? {
-            process(&result?);
-        }
-    } else {
-        for result in reader.records(&header) {
-            process(&result?);
-        }
-    }
-
-    let gl = match em {
-        Some(e) => finalize_gl_errmod(&mut bases, ref_base, alt_base, is_snp, e),
-        None => finalize_gl(&ll, &depth),
-    };
-    Ok((sample_id, gl))
 }
 
 /// FNV-1a 64-bit hash of a read name, used to detect overlapping paired-end
@@ -778,5 +996,15 @@ mod tests {
         accumulate(&mut llh, b'A', b'A', b'G', 30, &lut, 1.0);
         accumulate(&mut llh, b'G', b'A', b'G', 30, &lut, 1.0);
         assert!(llh[1] > llh[0] && llh[1] > llh[2], "A+G: het wins, got {:?}", llh);
+    }
+
+    #[test]
+    fn covered_sites_report_indel_after_last_base_and_deleted_columns() {
+        // read: 10M 2I 5M 3D 4M starting at 100 → ref 100..109 (M), 110..114 (M), 115..117 (D), 118..121 (M)
+        let cigar = vec![(Kind::Match, 10), (Kind::Insertion, 2), (Kind::Match, 5), (Kind::Deletion, 3), (Kind::Match, 4)];
+        let pos: Vec<i64> = vec![99, 105, 109, 114, 116, 121, 122];
+        let mut seen = Vec::new();
+        for_each_covered_site(100, 200, &cigar, &pos, |v, ia| seen.push((pos[v], ia)));
+        assert_eq!(seen, vec![(105, 0), (109, 2), (114, -3), (116, 0), (121, 0)]);
     }
 }

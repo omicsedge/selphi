@@ -222,7 +222,11 @@ selphi --lcwgs --bam-list bams.txt --reference GRCh38.fa --refpanel reference.sr
   --region chr20:1000000-2000000 --out imputed --threads 16
 ```
 
-The pileup is CIGAR-aware and applies the standard mapping/base-quality filters (`LCWGS_MIN_MAPQ`, `LCWGS_MIN_BQ`, `LCWGS_MAX_DEPTH`), collapsing overlapping paired-end mates so a fragment is not double-counted; its GLs match `bcftools mpileup` at the same filters. Contig names are matched tolerant to the `chr` prefix. Indels are imputed flat by default (per-read indel GLs are unreliable at low coverage); opt in with `LCWGS_INDEL_REALIGN=1` (needs `--reference`) for a pair-HMM realignment.
+The pileup is CIGAR-aware and applies the standard mapping/base-quality filters (`LCWGS_MIN_MAPQ`, `LCWGS_MIN_BQ`, `LCWGS_MAX_DEPTH`), collapsing overlapping paired-end mates so a fragment is not double-counted; its GLs match `bcftools mpileup` at the same filters. Contig names are matched tolerant to the `chr` prefix.
+
+**Pass `--reference` for BAM input too.** With the reference FASTA available, Selphi applies Base Alignment Quality (BAQ) exactly as `bcftools mpileup` does by default: extended BAQ (a re-alignment HMM that caps the quality of bases whose placement near an indel or soft clip is uncertain) on the reads bcftools' partial-realignment heuristic selects. The port is bit-identical to htslib/bcftools 1.22 (verified against `samtools calmd -r -E` on 28,596 reads). Without `--reference` BAQ cannot run and the pileup uses raw base qualities, which measurably costs accuracy at low coverage (chr22, six GIAB samples: −0.14 percentage points of non-reference concordance). `LCWGS_NO_BAQ=1` disables it (bcftools `-B`); `LCWGS_FULL_BAQ=1` realigns every read (bcftools `-D`, slightly worse than the partial default).
+
+Indel panel sites carry no read evidence on the default path, so they are left out of the imputation target set, as on the PL-VCF path (a caller emits no PL record there). `LCWGS_BAM_KEEP_INDELS=1` keeps them with a flat prior, the previous behaviour (measured −0.04 points on SNP concordance); `LCWGS_INDEL_REALIGN=1` (needs `--reference`) scores them from the reads with a pair-HMM realignment instead.
 
 ### Memory-bounded mode (biobank-scale)
 
@@ -414,7 +418,7 @@ selphi --self-test --refpanel panel.srp --input target.vcf.gz --map chr.map --ou
 | `--allele-match MODE` | Target/panel allele reconciliation: `none`, `swap`, `strand`, `full` | `swap` |
 | `--lcwgs` | Legacy alias for `--engine lcwgs`; also enables PL/BAM low-coverage input | off |
 | `--bam PATH` / `--bam-list PATH` | Aligned reads for `--lcwgs` (single file, or a list) | |
-| `--reference PATH` | Reference FASTA (required for CRAM input) | |
+| `--reference PATH` | Reference FASTA (required for CRAM input; enables BAQ for BAM input) | |
 | `--chrx-par` / `--build B` | PAR-aware chrX male ploidy; `B` = `grch38`/`grch37`/`auto` | off |
 | `--no-ap` | Omit AP1/AP2 fields from output | off |
 | `--bcf` | Write native BCF output (replaces VCF) | off |
