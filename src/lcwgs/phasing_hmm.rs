@@ -202,6 +202,13 @@ pub struct PhasingHmm {
     /// used by the SIMD emission/hom kernels. `[n_states, 64·w64)` left 0.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))] // read only by x86 SIMD kernels
     condbits: Vec<u64>,
+    /// Optional shared-prefix pack for the CURRENT `rephase` call (null when
+    /// none): the caller packed the leading `b` conditioning states once per
+    /// sample (see [`crate::lcwgs::hmm::BasePack`]); `pack_condbits` copies
+    /// those words for the current site and gathers only the tail states. Set
+    /// at the head of `rephase`, cleared at its end; never outlives the call.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    base_pack: *const crate::lcwgs::hmm::BasePack,
 }
 
 /// Generate the AVX2 (8-wide) phasing kernels from their per-kernel parts.
@@ -411,6 +418,7 @@ impl PhasingHmm {
             n_states: 0,
             simd: SimdMode::Scalar,
             condbits: Vec::new(),
+            base_pack: std::ptr::null(),
         }
     }
 
@@ -455,15 +463,29 @@ impl PhasingHmm {
             self.condbits.resize(w64, 0u64);
         }
         let abs = self.curr_abs_locus as usize;
-        for w in 0..w64 {
-            let mut word = 0u64;
-            let kmax = ((w + 1) * 64).min(nstates);
-            for k in (w * 64)..kmax {
-                if ref_bm.get(abs, cond_haps[k] as usize) {
-                    word |= 1u64 << (k - w * 64);
+        for w in 0..w64 { self.condbits[w] = 0; }
+        // Shared-prefix fast path: copy the base words for this site (states
+        // `[0, b)`, whose ids equal `cond_haps[..b]` by the caller's contract),
+        // then gather only the tail. Identical bits to the full gather below.
+        let mut kstart = 0usize;
+        if !self.base_pack.is_null() {
+            // SAFETY: set by `rephase` from a reference that outlives the call.
+            let bp = unsafe { &*self.base_pack };
+            if bp.b > 0 && bp.b <= nstates {
+                let r = bp.row_of_abs.get(abs).copied().unwrap_or(u32::MAX);
+                if r != u32::MAX {
+                    let src = &bp.words[r as usize * bp.wb..(r as usize + 1) * bp.wb];
+                    let nfull = bp.b / 64;
+                    self.condbits[..nfull].copy_from_slice(&src[..nfull]);
+                    if bp.b % 64 != 0 { self.condbits[nfull] = src[nfull]; }
+                    kstart = bp.b;
                 }
             }
-            self.condbits[w] = word;
+        }
+        for k in kstart..nstates {
+            if ref_bm.get(abs, cond_haps[k] as usize) {
+                self.condbits[k >> 6] |= 1u64 << (k & 63);
+            }
         }
     }
 
@@ -1766,8 +1788,12 @@ impl PhasingHmm {
         mono_sites: &[i32],
         lq: &[bool],
         rng_u01: &mut impl FnMut() -> f32,
+        // Shared-prefix conditioning pack (see `pack_condbits`); the caller
+        // guarantees `cond_haps[..base.b] == base states`. None = gather every site.
+        base_pack: Option<&crate::lcwgs::hmm::BasePack>,
     ) {
         self.n_states = cond_haps.len();
+        self.base_pack = base_pack.map_or(std::ptr::null(), |b| b as *const _);
         self.nrho = params.nrho(ref_bm.n_haps);
         let mism = params.ed_phs() / params.ee_phs();
         self.simd = resolve_simd_mode();
@@ -1777,6 +1803,7 @@ impl PhasingHmm {
         if self.var_typ.is_empty() {
             // No polymorphic het/hom sites in scope: still shuffle hets at monos.
             self.shuffle_monomorphic_hets(h0, h1, mono_sites, rng_u01);
+            self.base_pack = std::ptr::null();
             return;
         }
         self.backward(ref_bm, cond_haps, cm, mism);
@@ -1849,6 +1876,7 @@ impl PhasingHmm {
 
         // Shuffle het at monomorphic sites.
         self.shuffle_monomorphic_hets(h0, h1, mono_sites, rng_u01);
+        self.base_pack = std::ptr::null();
     }
 
     /// Het-at-monomorphic shuffle: for each mono site where
@@ -1984,7 +2012,7 @@ mod tests {
 
         hmm.rephase(
             &mut h0, &mut h1, &flat, &cond_haps, &bm, &cm, &params,
-            &poly_sites, &mono_sites, &lq, &mut rng,
+            &poly_sites, &mono_sites, &lq, &mut rng, None,
         );
 
         // Homozygous sites must be untouched (PEAK_HOM never written).
