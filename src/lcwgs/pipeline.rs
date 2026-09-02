@@ -623,43 +623,75 @@ fn run_chunked_gibbs(
         Some((core_start, core_end, buf_start, out))
     };
 
-    // Run chunks in parallel only when the sample count underutilizes the cores
-    // (few-sample regime). Multi-sample keeps sequential chunks: run_gibbs already
-    // parallelizes over samples, and this bounds peak memory (one chunk slice live).
+    // Chunk scheduling. Chunks are fully independent and deterministic, so any
+    // schedule is BIT-IDENTICAL to sequential; what differs is wall time and
+    // peak memory.
+    //
+    // Few samples (2·n_samples < threads): the per-sample parallelism inside
+    // run_gibbs cannot fill the cores, so chunks run in waves sized by a memory
+    // budget from the panel-only per-chunk estimate (the shipped rule).
+    //
+    // Many samples: chunks used to run strictly one after another, on the
+    // assumption that per-sample parallelism alone fills the machine. It does
+    // not: every iteration has serial sections (selection, write-back) and the
+    // per-sample loops leave cores idle at their tails, so a 12-sample chr22 run
+    // took 44 s/sample against 34 s/sample at 6 samples (16 threads). Per-chunk
+    // memory in this regime is dominated by per-sample state and is not well
+    // predicted by the panel-only estimate, so it is MEASURED: chunk 0 runs
+    // alone while the process high-water mark is watched, and the remaining
+    // chunks run in waves sized to a budget (default half the machine's RAM;
+    // `LCWGS_MEM_BUDGET_GB` overrides). A machine too small for two chunks
+    // keeps today's sequential behaviour exactly.
     let threads = rayon::current_num_threads().max(1);
-    let chunk_parallel = 2 * n_samples < threads;
+    let few_samples = 2 * n_samples < threads;
+    let n_ref = srp.metadata.n_haps;
+    let avg_chunk_n = (n_shared / n_chunks).max(1);
+    // Panel part of a chunk ≈ ref_bm (chunk_n × ceil(n_ref/64) × 8) × ~1.9
+    // (RefHapSet + PBWT scratch + HMM + allocator overhead; calibrated to RSS).
+    let panel_chunk_gb = (avg_chunk_n * n_ref.div_ceil(64) * 8) as f64 / 1e9 * 1.9;
+    let run_waves = |first: usize, max_live: usize| -> Vec<Option<(usize, usize, usize, super::iterate::GibbsOutput)>> {
+        use rayon::prelude::*;
+        let mut results = Vec::with_capacity(n_chunks - first);
+        let mut start = first;
+        while start < n_chunks {
+            let end = (start + max_live).min(n_chunks);
+            let wave: Vec<_> = (start..end).into_par_iter().map(&process_chunk).collect();
+            results.extend(wave);
+            start = end;
+        }
+        results
+    };
     let chunk_results: Vec<Option<(usize, usize, usize, super::iterate::GibbsOutput)>> =
-        if chunk_parallel {
-            use rayon::prelude::*;
-            // All-chunks-parallel holds EVERY chunk's ref_bm + selection structures
-            // live at once (peak ≈ n_chunks × per-chunk) — fast but memory-spiky on a
-            // big panel. Process in WAVES of `max_live` so peak ≈ a memory budget,
-            // keeping most of the parallel speedup. Byte-identical: chunks are
-            // independent + deterministic, and the merge is by core index.
-            let n_ref = srp.metadata.n_haps;
-            let avg_chunk_n = (n_shared / n_chunks).max(1);
-            // per-chunk ≈ ref_bm (chunk_n × ceil(n_ref/64) × 8) × ~1.9 (RefHapSet +
-            // PBWT scratch + HMM + allocator overhead; calibrated to measured RSS).
-            let per_chunk_gb =
-                (avg_chunk_n * n_ref.div_ceil(64) * 8) as f64 / 1e9 * 1.9;
+        if few_samples {
             let budget_gb = crate::config::f64_or("LCWGS_MEM_BUDGET_GB", 2.5);
-            let max_live = ((budget_gb / per_chunk_gb.max(1e-9)).floor() as usize)
+            let max_live = ((budget_gb / panel_chunk_gb.max(1e-9)).floor() as usize)
                 .clamp(1, n_chunks.min(threads));
             crate::selphi_info!(
                 "  chunk parallelism: {} live (budget {:.1} GB, ~{:.2} GB/chunk)",
-                max_live, budget_gb, per_chunk_gb);
-            let mut results = Vec::with_capacity(n_chunks);
-            let mut start = 0;
-            while start < n_chunks {
-                let end = (start + max_live).min(n_chunks);
-                let wave: Vec<_> =
-                    (start..end).into_par_iter().map(&process_chunk).collect();
-                results.extend(wave);
-                start = end;
-            }
+                max_live, budget_gb, panel_chunk_gb);
+            run_waves(0, max_live)
+        } else if n_chunks > 1 {
+            let budget_gb = crate::config::f64_opt("LCWGS_MEM_BUDGET_GB")
+                .unwrap_or_else(|| (crate::log::system_ram_mb() / 1024.0 * 0.5).max(2.5));
+            let hwm_before = (crate::log::peak_mem_mb() / 1024.0).max(rss_gb());
+            let first = process_chunk(0);
+            let hwm_after = crate::log::peak_mem_mb() / 1024.0;
+            let measured_gb = hwm_after - hwm_before;
+            // Fallback when the high-water mark did not move (an earlier stage
+            // peaked higher): panel part + a per-sample term calibrated on a
+            // 12-sample chr22 run (~5 KB per sample per site at peak).
+            let est_gb = panel_chunk_gb + 5.0e-6 * n_samples as f64 * avg_chunk_n as f64;
+            let per_chunk_gb = if measured_gb > 0.05 { measured_gb } else { est_gb };
+            let max_live = ((budget_gb / per_chunk_gb.max(1e-9)).floor() as usize)
+                .clamp(1, (n_chunks - 1).min(threads));
+            crate::selphi_info!(
+                "  chunk parallelism: calibrated on chunk 1 → {:.2} GB/chunk ({}); {} live for the remaining {} (budget {:.1} GB)",
+                per_chunk_gb, if measured_gb > 0.05 { "measured" } else { "estimated" }, max_live, n_chunks - 1, budget_gb);
+            let mut results = vec![first];
+            results.extend(run_waves(1, max_live));
             results
         } else {
-            (0..n_chunks).map(process_chunk).collect()
+            vec![process_chunk(0)]
         };
 
     // Merge each chunk's CORE dosage + GP into the global output (in index order).
