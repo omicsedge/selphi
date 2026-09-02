@@ -586,7 +586,7 @@ mod tests {
         use noodles_fasta as fasta;
         use noodles_core::{Position, Region};
         use noodles_sam::alignment::record::data::field::Value;
-        let (Ok(bam_path), Ok(fa_path)) = (std::env::var("SELPHI_BAQ_ORACLE_BAM"), std::env::var("SELPHI_BAQ_ORACLE_FASTA")) else {
+        let (Some(bam_path), Some(fa_path)) = (crate::config::raw("SELPHI_BAQ_ORACLE_BAM"), crate::config::raw("SELPHI_BAQ_ORACLE_FASTA")) else {
             eprintln!("oracle env not set; skipping");
             return;
         };

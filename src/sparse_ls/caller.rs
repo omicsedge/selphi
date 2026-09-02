@@ -488,6 +488,7 @@ fn phase_individual_one(
             &w.cond.monomorphic_sites,
             &w.cond.lq_flag,
             &mut draw,
+            None,
         );
     }
 

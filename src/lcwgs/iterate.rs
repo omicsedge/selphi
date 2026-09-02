@@ -32,6 +32,59 @@
 //!   the inner rayon loop.
 
 use rayon::prelude::*;
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use crate::lcwgs::hmm::{pack_cond_rows, BasePack};
+
+thread_local! {
+    /// Shared-prefix conditioning pack of the sample being processed on this thread.
+    static TL_BASE: RefCell<BasePack> = const { RefCell::new(BasePack::new()) };
+    /// One haplotype's full conditioning pack (reused for h0 then h1).
+    static TL_HAPPACK: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    /// Union of the two haplotypes' site axes (rows of the base pack).
+    static TL_UNION: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+/// Time spent in the fused per-sample re-phasing, SUMMED over threads
+/// (`LCWGS_TIMING` only) — the phase now runs inside the parallel per-sample
+/// task, so it has no separate wall-clock share of its own; `hmm` is that
+/// task's wall time and already contains it.
+static PHASE_NS: AtomicU64 = AtomicU64::new(0);
+
+/// One haplotype's polymorphic / monomorphic-in-conditioning-set split
+/// (LCWGS_POLY_SKIP): `poly` = every common site + every rare site carried by
+/// at least one of its conditioning haplotypes (ascending absolute indices);
+/// `mono` = the rest.
+struct PolySplit { poly: Vec<usize>, mono: Vec<usize> }
+
+/// GLIMPSE2 `conditioning_set::compactSelection` analogue for one conditioning set.
+fn poly_split(cond: &[u32], is_common: &[bool], shap_ref: &[Vec<u32>], n_var: usize) -> PolySplit {
+    let mut carried: Vec<u32> = Vec::new();
+    for &c in cond { carried.extend_from_slice(&shap_ref[c as usize]); }
+    carried.sort_unstable();
+    carried.dedup();
+    let mut poly = Vec::with_capacity(n_var);
+    let mut mono = Vec::new();
+    let mut ci = 0usize;
+    for v in 0..n_var {
+        let v32 = v as u32;
+        while ci < carried.len() && carried[ci] < v32 { ci += 1; }
+        let carried_v = ci < carried.len() && carried[ci] == v32;
+        if is_common[v] || carried_v { poly.push(v); } else { mono.push(v); }
+    }
+    PolySplit { poly, mono }
+}
+
+/// Merge two ascending, duplicate-free site lists into `out` (ascending, deduped).
+fn merge_sorted(a: &[usize], b: &[usize], out: &mut Vec<usize>) {
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        if a[i] < b[j] { out.push(a[i]); i += 1; }
+        else if b[j] < a[i] { out.push(b[j]); j += 1; }
+        else { out.push(a[i]); i += 1; j += 1; }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+}
 
 use super::pbwt_select::select_conditioning_haps;
 use super::hmm::{run_forward_backward, run_forward_backward_scaffold};
@@ -71,19 +124,23 @@ fn run_one_hap<F: Fn(usize) -> usize>(
     gl3: &[f32], ref_bm: &HaplotypeBitmatrix, cm: &[f64], params: &LcwgsParams,
     use_scaffold: bool, common_idx: &[usize],
     n_var: usize, n_samples: usize,
-    // POLY/MONO SKIP (LCWGS_POLY_SKIP). `Some((is_common, shap_ref))` ⇒ run the
+    // POLY/MONO SKIP (LCWGS_POLY_SKIP). `Some((split, is_common))` ⇒ run the
     // imputation FB only over this hap's POLYMORPHIC-in-conditioning-set sites
-    // (every common site + every rare site carried by ≥1 of `cond`) and
-    // direct-impute the monomorphic-in-cond sites in closed form. None ⇒ the
-    // full-axis FB (byte-identical default). `is_common[v]`=panel MAF≥rare_maf;
-    // `shap_ref[h]`=ascending rare sites where panel hap h carries the minor allele.
-    poly_skip: Option<(&[bool], &[Vec<u32>])>,
+    // (`split.poly`, precomputed by the caller with [`poly_split`]) and
+    // direct-impute the monomorphic-in-cond sites (`split.mono`) in closed form.
+    // None ⇒ the full-axis FB (byte-identical default). `is_common[v]` = panel
+    // MAF ≥ rare_maf, used for the band-mode recombination multiplier.
+    poly: Option<(&PolySplit, &[bool])>,
     // Band-mode recombination multiplier for the FULL-AXIS imputation FB (one entry
     // per `n_var` site, common->1.0 / rare->band lift). Used ONLY on the full-axis
     // branch (poly-skip OFF, scaffold OFF): the poly-skip branch builds its own
     // compacted multiplier inline, and the scaffold branch visits only common sites
     // so band is N/A there. `None` => uniform rate (byte-identical to pre-band).
     full_axis_rmult: Option<&[f32]>,
+    // This hap's conditioning bitmatrix, pre-packed by the caller over the same
+    // site axis the FB will run on (`split.poly` or the full axis), so the two
+    // haplotypes of a sample share their prefix pack. None ⇒ the kernel packs.
+    prepack: Option<&[u64]>,
 ) -> (Vec<f32>, Vec<u8>) {
     let mut hap_hl = vec![0.0f32; n_var * 2];
     let mg = params.min_gl; // GLIMPSE2 per-hap GL floor (0 = disabled)
@@ -120,7 +177,7 @@ fn run_one_hap<F: Fn(usize) -> usize>(
         // rare sites afterwards, so there are no rare-site boundary transitions to
         // lift. `full_axis_rmult` is never built for this path.
         run_forward_backward_scaffold(&hap_hl, common_idx, cond, ref_bm, cm, params).dosage
-    } else if let Some((is_common, shap_ref)) = poly_skip {
+    } else if let Some((split, is_common)) = poly {
         // POLY/MONO SKIP (GLIMPSE2 conditioning_set::compactSelection analogue).
         // Polymorphic = every common site + every rare site carried by ≥1 of this
         // hap's conditioning haps; the rest are monomorphic-in-cond (every cond hap
@@ -129,42 +186,27 @@ fn run_one_hap<F: Fn(usize) -> usize>(
         // (transitions span the skipped sites' cM gaps — exact, since T(d1+d2)=
         // T(d2)∘T(d1) for r=1-exp(scale·Δcm)), then scatter poly doses back and
         // direct-impute the mono sites in closed form.
-        let mut carried: Vec<u32> = Vec::new();
-        for &c in cond { carried.extend_from_slice(&shap_ref[c as usize]); }
-        carried.sort_unstable();
-        carried.dedup();
-        let mut poly_sites: Vec<usize> = Vec::with_capacity(n_var);
-        let mut hl_poly: Vec<f32> = Vec::with_capacity(n_var * 2);
-        let mut cm_poly: Vec<f64> = Vec::with_capacity(n_var);
-        let mut mono: Vec<usize> = Vec::new();
+        let poly_sites: &[usize] = &split.poly;
+        let mut hl_poly: Vec<f32> = Vec::with_capacity(poly_sites.len() * 2);
+        let mut cm_poly: Vec<f64> = Vec::with_capacity(poly_sites.len());
         // Band-mode recombination (LCWGS_RECOMB_DENOM=band): raise ONLY rare-site
         // (is_common==false) boundary transitions to GLIMPSE2's /n_ref rate so the copy
         // can un-stick onto the true rare carrier, while common-site transitions keep
-        // the tuned /max(n_ref,Ne) rate that wins the common bins. The per-poly-site
-        // multiplier is filled IN THIS LOOP (no extra pass / alloc when off). `band_r`
-        // is None for the default `max`/`nref` modes ⇒ recomb_mult=None ⇒ byte-identical.
+        // the tuned /max(n_ref,Ne) rate that wins the common bins. `band_r` is None
+        // for the default `max`/`nref` modes ⇒ recomb_mult=None ⇒ byte-identical.
         let band_r = crate::lcwgs::hmm::recomb_band_mult(ref_bm.n_haps, params.ne);
-        let mut rmult: Vec<f32> = if band_r.is_some() { Vec::with_capacity(n_var) } else { Vec::new() };
-        let mut ci = 0usize;
-        for v in 0..n_var {
-            let v32 = v as u32;
-            while ci < carried.len() && carried[ci] < v32 { ci += 1; }
-            let carried_v = ci < carried.len() && carried[ci] == v32;
-            if is_common[v] || carried_v {
-                poly_sites.push(v);
-                hl_poly.push(hap_hl[2 * v]);
-                hl_poly.push(hap_hl[2 * v + 1]);
-                cm_poly.push(cm[v]);
-                if let Some(r) = band_r { rmult.push(if is_common[v] { 1.0 } else { r }); }
-            } else {
-                mono.push(v);
-            }
+        let mut rmult: Vec<f32> = if band_r.is_some() { Vec::with_capacity(poly_sites.len()) } else { Vec::new() };
+        for &v in poly_sites {
+            hl_poly.push(hap_hl[2 * v]);
+            hl_poly.push(hap_hl[2 * v + 1]);
+            cm_poly.push(cm[v]);
+            if let Some(r) = band_r { rmult.push(if is_common[v] { 1.0 } else { r }); }
         }
         let mut dose = vec![0.0f32; n_var];
         if !poly_sites.is_empty() {
             let dp = run_forward_backward(
                 &hl_poly, cond, ref_bm, &cm_poly, params,
-                band_r.map(|_| rmult.as_slice()), Some(&poly_sites),
+                band_r.map(|_| rmult.as_slice()), Some(poly_sites), prepack,
             ).dosage;
             for (i, &v) in poly_sites.iter().enumerate() { dose[v] = dp[i]; }
         }
@@ -174,7 +216,7 @@ fn run_one_hap<F: Fn(usize) -> usize>(
         // exact full-FB dose: ed·h1/(ee·h0+ed·h1) (REF-major) or ee·h1/(ed·h0+ee·h1).
         let ee = 1.0f32 - params.epsilon;
         let ed = params.epsilon;
-        for &v in &mono {
+        for &v in &split.mono {
             let m_alt = ref_bm.get(v, cond[0] as usize);
             dose[v] = crate::lcwgs::hmm::finalize_site(
                 false,
@@ -190,7 +232,7 @@ fn run_one_hap<F: Fn(usize) -> usize>(
         // carries the band-mode per-site recombination lift (common->1.0, rare->band)
         // precomputed once by the caller; `None` for the default `max`/`nref` modes
         // ⇒ uniform rate ⇒ byte-identical to the pre-band full-axis path.
-        run_forward_backward(&hap_hl, cond, ref_bm, cm, params, full_axis_rmult, None).dosage
+        run_forward_backward(&hap_hl, cond, ref_bm, cm, params, full_axis_rmult, None, prepack).dosage
     };
     // Sample a fresh allele per site from the posterior dose (deterministic
     // splitmix64 stream keyed by seed/iteration/hap/variant → reproducible).
@@ -687,49 +729,183 @@ pub fn run_gibbs(
         if let Some(t) = t0 { t_clone += t.elapsed().as_secs_f64(); }
 
         let is_main = it >= n_burnin;
-        let t0 = if timing { Some(std::time::Instant::now()) } else { None };
-        let results: Vec<(usize, Vec<f32>, Vec<u8>)> = if cfg.gs_main && (is_main || cfg.burnin_diploid) {
-            // Gauss-Seidel diploid sweep (MAIN iters only): per sample, sample h0
-            // conditioned on the snapshot partner, then h1 conditioned on h0's
-            // FRESH sample. Samples stay independent → parallel over samples (no
-            // races). Seeds the (ALT,REF)=het commitment a Jacobi snapshot sweep
-            // cannot establish; restricted to main iters so it does not amplify
-            // burn-in noise (cf. the always-on sequential-diploid scan, e54436b).
-            let per_sample: Vec<Vec<(usize, Vec<f32>, Vec<u8>)>> =
-                (0..n_samples).into_par_iter().map(|s| {
-                    let h0 = 2 * s;
-                    let h1 = 2 * s + 1;
-                    let (d0, samp0) = run_one_hap(
-                        h0, s, it, seed,
-                        |v| prev_alleles[v * n_target_haps + h1] as usize,
-                        &cond_per_hap[h0], gl3, ref_bm, cm, params,
-                        use_scaffold, &common_idx, n_var, n_samples, poly_skip_arg,
-                        full_axis_rmult.as_deref());
-                    let (d1, samp1) = run_one_hap(
-                        h1, s, it, seed,
-                        |v| samp0[v] as usize,
-                        &cond_per_hap[h1], gl3, ref_bm, cm, params,
-                        use_scaffold, &common_idx, n_var, n_samples, poly_skip_arg,
-                        full_axis_rmult.as_deref());
-                    vec![(h0, d0, samp0), (h1, d1, samp1)]
-                }).collect();
-            per_sample.into_iter().flatten().collect()
-        } else {
-            (0..n_target_haps).into_par_iter().map(|h| {
-                let s = h / 2;
-                let partner = if h & 1 == 0 { h + 1 } else { h - 1 };
-                let (dose, sampled) = run_one_hap(
-                    h, s, it, seed,
-                    |v| prev_alleles[v * n_target_haps + partner] as usize,
-                    &cond_per_hap[h], gl3, ref_bm, cm, params,
-                    use_scaffold, &common_idx, n_var, n_samples, poly_skip_arg,
-                    full_axis_rmult.as_deref());
-                (h, dose, sampled)
-            }).collect()
-        };
-        if let Some(t) = t0 { t_hmm += t.elapsed().as_secs_f64(); }
+        // Re-phase cadence (LCWGS_PHASE_MAIN_EVERY, default 1 = every iteration).
+        // Burn-in always re-phases; MAIN re-phases every Nth iter; the FINAL
+        // iteration's re-phase is ALWAYS skipped — it is dead work (its only
+        // consumer is the next iteration, which does not exist, and this
+        // iteration's dose is accumulated from the FB dose, not the phase). With
+        // N=1 this is byte-identical to the shipped schedule modulo that free skip.
+        let is_last_iter = it + 1 == params.n_iterations;
+        let phase_this_iter = !is_last_iter
+            && (it < n_burnin || (it - n_burnin).is_multiple_of(cfg.phase_main_every));
+        // Gauss-Seidel diploid sweep (MAIN iters only): h1 conditions on h0's FRESH
+        // sample instead of the snapshot. Seeds the (ALT,REF)=het commitment a
+        // Jacobi snapshot sweep cannot establish; restricted to main iters so it
+        // does not amplify burn-in noise (cf. the always-on sequential-diploid scan,
+        // e54436b). Burn-in (Jacobi): both haps condition on the snapshot partner.
+        let gs = cfg.gs_main && (is_main || cfg.burnin_diploid);
+        // FAITHFUL GLIMPSE2 phasing HMM: every re-phase iteration, re-phase each
+        // sample's H0/H1 via the ported phasing_hmm (8-founder diplotype SAMPLE_DIP).
+        // Genotype-preserving (re-phases hets); feeds the next iteration's selection
+        // + partner conditioning. It reads only ITS OWN sample's alleles, conditioning
+        // set and GLs, so it runs inside the per-sample task below, right after the
+        // two FBs, where the sample's shared conditioning pack is still resident.
+        let fuse_phase = cfg.founder_phase && phase_this_iter;
+        let g2p = crate::lcwgs::ls_params::LsParams { ne: params.ne as f64, ..Default::default() };
+        // Richer phasing conditioning (LCWGS_LS_RICH_COND): the UNION of both haps'
+        // cond sets (GLIMPSE2 phases against the individual's shared set, not one
+        // hap's) so the diplotype Viterbi sees both haps' candidate copies.
+        let rich_cond = cfg.rich_cond;
 
-        // 3. Write back sampled alleles; accumulate per-hap dose into GP + dosage.
+        // 2. Per-SAMPLE task: h0's FB, h1's FB, then (when due) the re-phase.
+        //
+        // The two haplotypes of a sample share the leading `b` states of their
+        // conditioning sets (the IBD-selected base is identical and the
+        // priority-preserving cap keeps it in front; only the appended rare
+        // carriers differ). Packing the conditioning alleles 1 bit/state per site
+        // is a random gather that costs more than the FB it feeds (~1.8×), so the
+        // shared prefix is packed ONCE per sample over the union of the two haps'
+        // site axes, each hap's pack is assembled from those words plus its own
+        // tail, and the re-phase reads the same prefix pack by absolute site. The
+        // packed words — and therefore every result — are identical to packing
+        // each hap in full (see `pack_cond_rows`). Samples are independent, so
+        // the task is parallel over samples in both the GS and Jacobi sweeps.
+        let t0 = if timing { Some(std::time::Instant::now()) } else { None };
+        let ic_all: &[bool] = poly_skip_arg.map_or(&[], |(ic, _)| ic);
+        let per_sample: Vec<[(usize, Vec<f32>, Vec<u8>); 2]> = (0..n_samples).into_par_iter().map(|s| {
+            let (h0i, h1i) = (2 * s, 2 * s + 1);
+            let (c0, c1): (&[u32], &[u32]) = (&cond_per_hap[h0i], &cond_per_hap[h1i]);
+            // Packing applies to the (compacted or full-axis) FB only: the scaffold
+            // FB and the no-conditioning shortcut read the panel directly.
+            let share = !use_scaffold && !c0.is_empty() && !c1.is_empty();
+            let split0 = poly_skip_arg.filter(|_| share).map(|(ic, sr)| poly_split(c0, ic, sr, n_var));
+            let split1 = poly_skip_arg.filter(|_| share).map(|(ic, sr)| poly_split(c1, ic, sr, n_var));
+            let b = if share { c0.iter().zip(c1.iter()).take_while(|(x, y)| x == y).count() } else { 0 };
+            TL_BASE.with(|cb| TL_HAPPACK.with(|ch| TL_UNION.with(|cu| {
+                let mut base = cb.borrow_mut();
+                let mut hp = ch.borrow_mut();
+                let mut un = cu.borrow_mut();
+                if share && b > 0 {
+                    un.clear();
+                    match (&split0, &split1) {
+                        (Some(a), Some(z)) => merge_sorted(&a.poly, &z.poly, &mut un),
+                        _ => un.extend(0..n_var),
+                    }
+                    base.build(ref_bm, &c0[..b], &un, n_var);
+                }
+                let base_opt: Option<&BasePack> = if share && b > 0 { Some(&*base) } else { None };
+                // Pack one hap's full conditioning set over its FB axis (prefix
+                // copied from `base`, tail gathered). Returns false when nothing
+                // is to be packed (no sharing, or an empty poly axis).
+                let pack_for = |c: &[u32], sp: Option<&PolySplit>, hp: &mut Vec<u64>| -> bool {
+                    if !share { return false; }
+                    let (ps, n) = match sp {
+                        Some(x) => (Some(x.poly.as_slice()), x.poly.len()),
+                        None => (None, n_var),
+                    };
+                    if n == 0 { return false; }
+                    pack_cond_rows(ref_bm, c, ps, n, base_opt, hp);
+                    true
+                };
+                let packed0 = pack_for(c0, split0.as_ref(), &mut hp);
+                let (d0, mut samp0) = run_one_hap(
+                    h0i, s, it, seed,
+                    |v| prev_alleles[v * n_target_haps + h1i] as usize,
+                    c0, gl3, ref_bm, cm, params,
+                    use_scaffold, &common_idx, n_var, n_samples,
+                    split0.as_ref().map(|x| (x, ic_all)),
+                    full_axis_rmult.as_deref(),
+                    if packed0 { Some(hp.as_slice()) } else { None });
+                let packed1 = pack_for(c1, split1.as_ref(), &mut hp);
+                let (d1, mut samp1) = run_one_hap(
+                    h1i, s, it, seed,
+                    |v| if gs { samp0[v] as usize } else { prev_alleles[v * n_target_haps + h0i] as usize },
+                    c1, gl3, ref_bm, cm, params,
+                    use_scaffold, &common_idx, n_var, n_samples,
+                    split1.as_ref().map(|x| (x, ic_all)),
+                    full_axis_rmult.as_deref(),
+                    if packed1 { Some(hp.as_slice()) } else { None });
+
+                if fuse_phase {
+                    let tp = if timing { Some(std::time::Instant::now()) } else { None };
+                    let mut h0: Vec<bool> = samp0.iter().map(|&a| a == 1).collect();
+                    let mut h1: Vec<bool> = samp1.iter().map(|&a| a == 1).collect();
+                    // flat[v]: read uninformative (≈ no/weak read) → emission-skipped het.
+                    // Loop-invariant (depends only on static gl3) → precomputed in flat_all.
+                    let flat: &[bool] = &flat_all[s];
+                    let cond_union: Vec<u32>;
+                    let cond_haps: &[u32] = if rich_cond {
+                        let mut seen = std::collections::HashSet::new();
+                        let mut u: Vec<u32> = Vec::with_capacity(c0.len() + c1.len());
+                        for &c in c0.iter().chain(c1.iter()) {
+                            if seen.insert(c) { u.push(c); }
+                        }
+                        cond_union = u;
+                        &cond_union
+                    } else {
+                        c0
+                    };
+                    // deterministic uniform [0,1) (xorshift64*), keyed by seed/iter/sample.
+                    let mut st = seed
+                        ^ (s as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        ^ (it as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)
+                        | 1;
+                    let mut rng_u01 = || {
+                        st ^= st >> 12; st ^= st << 25; st ^= st >> 27;
+                        let x = st.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                        (x >> 40) as f32 / (1u64 << 24) as f32
+                    };
+                    // Per-individual poly/mono split (LCWGS_POLY_SKIP): polymorphic =
+                    // every common site + every rare site carried by one of THIS sample's
+                    // conditioning haps; the rest is monomorphic-in-cond and skipped (a
+                    // het-at-mono goes to the random shuffle pass, a hom-at-mono is omitted
+                    // entirely — its uniform emission integrates out exactly). Mirrors
+                    // GLIMPSE2 conditioning_set.cpp:122-138.
+                    let (ps_owned, ms_owned): (Vec<i32>, Vec<i32>) = if cfg.poly_skip {
+                        let mut carried: Vec<u32> = Vec::new();
+                        for &h in cond_haps { carried.extend_from_slice(&ps_shap_ref[h as usize]); }
+                        carried.sort_unstable();
+                        carried.dedup();
+                        let mut ps_v: Vec<i32> = Vec::new();
+                        let mut ms_v: Vec<i32> = Vec::new();
+                        let mut ci = 0usize;
+                        for v in 0..n_var {
+                            let v32 = v as u32;
+                            while ci < carried.len() && carried[ci] < v32 { ci += 1; }
+                            let carried_v = ci < carried.len() && carried[ci] == v32;
+                            if ps_is_common[v] || carried_v {
+                                ps_v.push(v as i32);
+                            } else if h0[v] != h1[v] {
+                                ms_v.push(v as i32);
+                            }
+                        }
+                        (ps_v, ms_v)
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
+                    let (poly_ref, mono_ref): (&[i32], &[i32]) = if cfg.poly_skip {
+                        (&ps_owned, &ms_owned)
+                    } else {
+                        (&poly_sites, &mono_sites)
+                    };
+                    // The phaser's conditioning set starts with c0 in both modes, so the
+                    // sample's prefix pack applies to it as well.
+                    let phase_base = base_opt.filter(|bp| cond_haps.len() >= bp.b && cond_haps[..bp.b] == c0[..bp.b]);
+                    let mut hmm = crate::lcwgs::phasing_hmm::PhasingHmm::new(&g2p);
+                    hmm.rephase(&mut h0, &mut h1, flat, cond_haps, ref_bm, cm, &g2p,
+                                poly_ref, mono_ref, &lq, &mut rng_u01, phase_base);
+                    for v in 0..n_var { samp0[v] = h0[v] as u8; samp1[v] = h1[v] as u8; }
+                    if let Some(t) = tp { PHASE_NS.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed); }
+                }
+                [(h0i, d0, samp0), (h1i, d1, samp1)]
+            })))
+        }).collect();
+        let results: Vec<(usize, Vec<f32>, Vec<u8>)> = per_sample.into_iter().flatten().collect();
+        if let Some(t) = t0 { t_hmm += t.elapsed().as_secs_f64(); }
+        if timing { t_phase += PHASE_NS.swap(0, AtomicOrdering::Relaxed) as f64 / 1e9; }
+
+        // 3. Write back the final per-hap alleles (re-phased when a re-phase ran);
+        //    accumulate per-hap FB dose into GP + dosage.
         let t0 = if timing { Some(std::time::Instant::now()) } else { None };
         let mut hap_dose: Vec<Option<Vec<f32>>> = (0..n_target_haps).map(|_| None).collect();
         let mut sampled_by_hap: Vec<Option<Vec<u8>>> = (0..n_target_haps).map(|_| None).collect();
@@ -748,114 +924,13 @@ pub fn run_gibbs(
                 }
             });
         }
-
-        // Re-phase cadence (LCWGS_PHASE_MAIN_EVERY, default 1 = every iteration).
-        // Burn-in always re-phases; MAIN re-phases every Nth iter; the FINAL
-        // iteration's re-phase is ALWAYS skipped — it is dead work (its only
-        // consumer is the next iteration, which does not exist, and this
-        // iteration's dose was already accumulated from `hap_dose` above). With
-        // N=1 this is byte-identical to the shipped schedule modulo that free skip.
-        let is_last_iter = it + 1 == params.n_iterations;
-        let phase_this_iter = !is_last_iter
-            && (it < n_burnin || (it - n_burnin).is_multiple_of(cfg.phase_main_every));
         let tp0 = if timing { Some(std::time::Instant::now()) } else { None };
 
-        // DMM segment phase-commitment (LCWGS_DMM, main iters only): re-phase each
-        // sample's H0/H1 onto a per-segment committed diplotype copy so a
-        // segment-coherent low-noise phase feeds the next iteration's selection +
-        // partner conditioning (regularizes the GS-main coupling). Genotype-
-        // preserving → this iteration's accumulated dose (from hap_dose) is
-        // unchanged; only subsequent iterations' inputs differ.
-        // FAITHFUL GLIMPSE2 phasing HMM (LCWGS_GLIMPSE2_PHASE): every iteration,
-        // re-phase each sample's H0/H1 via the ported phasing_hmm (8-founder diplotype
-        // SAMPLE_DIP). Replaces the heuristic DMM. Genotype-preserving (re-phases hets);
-        // feeds the next iteration's selection + partner conditioning, like the DMM.
-        if cfg.founder_phase && phase_this_iter {
-            let g2p = crate::lcwgs::ls_params::LsParams {
-                ne: params.ne as f64,
-                ..Default::default()
-            };
-            // poly_sites / mono_sites / lq are hoisted above the iteration loop.
-            // Richer phasing conditioning (LCWGS_LS_RICH_COND): use the UNION of both
-            // haps' cond sets (GLIMPSE2 phases against the individual's shared set, not
-            // one hap's) so the diplotype Viterbi sees both haps' candidate copies.
-            let rich_cond = cfg.rich_cond;
-            // FAITHFUL flat rule (LCWGS_LS_FLAT_EXACT). GLIMPSE2 genotype_reader.cpp:580
-            // sets flat ⟺ the GL triple is all-equal (PL[0]==PL[1]==PL[2], i.e. no
-            // informative read), NOT a peakedness threshold. Our default `<1/3+1e-3`
-            // over-marks weakly-informative sites as flat; this restores the exact rule.
-            let rephased: Vec<(usize, Vec<u8>, Vec<u8>)> = (0..n_samples).into_par_iter().map(|s| {
-                let (h0i, h1i) = (2 * s, 2 * s + 1);
-                let mut h0: Vec<bool> = (0..n_var).map(|v| hap_alleles[v * n_target_haps + h0i] == 1).collect();
-                let mut h1: Vec<bool> = (0..n_var).map(|v| hap_alleles[v * n_target_haps + h1i] == 1).collect();
-                // flat[v]: read uninformative (≈ no/weak read) → emission-skipped het.
-                // Loop-invariant (depends only on static gl3) → precomputed in flat_all.
-                let flat: &[bool] = &flat_all[s];
-                let cond_union: Vec<u32>;
-                let cond_haps: &[u32] = if rich_cond {
-                    let mut seen = std::collections::HashSet::new();
-                    let mut u: Vec<u32> =
-                        Vec::with_capacity(cond_per_hap[h0i].len() + cond_per_hap[h1i].len());
-                    for &c in cond_per_hap[h0i].iter().chain(cond_per_hap[h1i].iter()) {
-                        if seen.insert(c) { u.push(c); }
-                    }
-                    cond_union = u;
-                    &cond_union
-                } else {
-                    &cond_per_hap[h0i]
-                };
-                // deterministic uniform [0,1) (xorshift64*), keyed by seed/iter/sample.
-                let mut st = seed
-                    ^ (s as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                    ^ (it as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)
-                    | 1;
-                let mut rng_u01 = || {
-                    st ^= st >> 12; st ^= st << 25; st ^= st >> 27;
-                    let x = st.wrapping_mul(0x2545_F491_4F6C_DD1D);
-                    (x >> 40) as f32 / (1u64 << 24) as f32
-                };
-                // Per-individual poly/mono split (LCWGS_POLY_SKIP): polymorphic =
-                // every common site + every rare site carried by one of THIS sample's
-                // conditioning haps; the rest is monomorphic-in-cond and skipped (a
-                // het-at-mono goes to the random shuffle pass, a hom-at-mono is omitted
-                // entirely — its uniform emission integrates out exactly). Mirrors
-                // GLIMPSE2 conditioning_set.cpp:122-138.
-                let (ps_owned, ms_owned): (Vec<i32>, Vec<i32>) = if cfg.poly_skip {
-                    let mut carried: Vec<u32> = Vec::new();
-                    for &h in cond_haps { carried.extend_from_slice(&ps_shap_ref[h as usize]); }
-                    carried.sort_unstable();
-                    carried.dedup();
-                    let mut ps_v: Vec<i32> = Vec::new();
-                    let mut ms_v: Vec<i32> = Vec::new();
-                    let mut ci = 0usize;
-                    for v in 0..n_var {
-                        let v32 = v as u32;
-                        while ci < carried.len() && carried[ci] < v32 { ci += 1; }
-                        let carried_v = ci < carried.len() && carried[ci] == v32;
-                        if ps_is_common[v] || carried_v {
-                            ps_v.push(v as i32);
-                        } else if h0[v] != h1[v] {
-                            ms_v.push(v as i32);
-                        }
-                    }
-                    (ps_v, ms_v)
-                } else {
-                    (Vec::new(), Vec::new())
-                };
-                let (poly_ref, mono_ref): (&[i32], &[i32]) = if cfg.poly_skip {
-                    (&ps_owned, &ms_owned)
-                } else {
-                    (&poly_sites, &mono_sites)
-                };
-                let mut hmm = crate::lcwgs::phasing_hmm::PhasingHmm::new(&g2p);
-                hmm.rephase(&mut h0, &mut h1, flat, cond_haps, ref_bm, cm, &g2p,
-                            poly_ref, mono_ref, &lq, &mut rng_u01);
-                (s,
-                 h0.iter().map(|&b| b as u8).collect(),
-                 h1.iter().map(|&b| b as u8).collect())
-            }).collect();
-            write_back_rephased(&mut hap_alleles, n_samples, n_target_haps, rephased);
-        }
+        // DMM segment phase-commitment (LCWGS_DMM, main iters only; runs ONLY when the
+        // founder phaser is off): re-phase each sample's H0/H1 onto a per-segment
+        // committed diplotype copy so a segment-coherent low-noise phase feeds the
+        // next iteration's selection + partner conditioning. Genotype-preserving →
+        // this iteration's accumulated dose (from hap_dose) is unchanged.
         if cfg.dmm && (is_main || cfg.burnin_diploid) && !cfg.founder_phase && phase_this_iter {
             let dcfg = dmm_cfg.as_ref().unwrap();
             let rephased: Vec<(usize, Vec<u8>, Vec<u8>)> = (0..n_samples).into_par_iter().map(|s| {
@@ -982,7 +1057,7 @@ pub fn run_gibbs(
     if timing {
         let (pack_ns, fb_ns) = super::hmm::take_hmm_profile();
         crate::selphi_info!(
-            "  [lcwgs timing] sel={:.2}s aug={:.2}s clone={:.2}s hmm={:.2}s wb={:.2}s (phase={:.2}s of wb) | max_K={} n_var={} n_haps={}",
+            "  [lcwgs timing] sel={:.2}s aug={:.2}s clone={:.2}s hmm={:.2}s wb={:.2}s | fused phase {:.2}s cpu-summed | max_K={} n_var={} n_haps={}",
             t_sel, t_aug, t_clone, t_hmm, t_wb, t_phase, max_k, n_var, n_target_haps);
         crate::selphi_info!(
             "  [lcwgs timing]   hmm split (cpu-time summed over threads): condbits-pack={:.1}s forward-backward={:.1}s",
