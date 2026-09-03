@@ -283,6 +283,9 @@ fn setup_output_writers(
         parquet: args.parquet || args.all_formats,
         pgen: args.pgen || args.all_formats,
         selfdecode: args.selfdecode || args.all_formats,
+        bcf_contig_names: if args.bcf {
+            selphi::io::bcf_encode::contig_names_from_header_lines(contig_field)
+        } else { Vec::new() },
     };
     // Append the format extension only when absent, so `--out x.vcf.gz` is not
     // rewritten to `x.vcf.vcf.gz` (with_extension replaces only the final `.gz`).

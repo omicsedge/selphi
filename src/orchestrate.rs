@@ -440,6 +440,11 @@ pub fn run_multi_chr(
         parquet: config.parquet || config.all_formats,
         pgen: config.pgen || config.all_formats,
         selfdecode: config.selfdecode || config.all_formats,
+        // The multi-chr header lists EVERY chromosome's contig; each record must
+        // carry its own index into that list (it used to write 0 for all of them).
+        bcf_contig_names: if config.bcf {
+            selphi::io::bcf_encode::contig_names_from_header_lines(&multi_srp.global_meta.contig_fields)
+        } else { Vec::new() },
     };
 
     // 5. Setup single output writer for ALL chromosomes.
