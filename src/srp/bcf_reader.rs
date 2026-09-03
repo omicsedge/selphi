@@ -165,6 +165,11 @@ fn process_region(
     let mut row = 0usize;
     let mut n_variants = 0usize;
     let mut chunk_idx = 0usize;
+    // Phase guard state: sample the first diploid calls of the region (the VCF
+    // panel path checks the first <=10 GTs of the first record; this is the same
+    // budget, spread over the region's first records).
+    let mut phase_checks: u32 = 10;
+    let mut unphased_seen = false;
     let mut sb = Vec::with_capacity(512);
     let mut ib = Vec::with_capacity(ns * 4);
     let mut skip_buf = [0u8; 65536];
@@ -236,6 +241,16 @@ fn process_region(
                     // were silently mis-mapped to ALT-63 by the >>1 -1 path
                     // (both yield 63 < 128 → spurious ALT). Skip them.
                     let b0 = ib[b]; let b1 = ib[b+1];
+                    // A reference panel must be phased: an unphased `0/1` has no
+                    // haplotype assignment, and reading its alleles in byte order
+                    // fabricates a haplotype the HMM then copies from. The VCF
+                    // panel path rejects this; this path never looked at the phase
+                    // bit (low bit of the 2nd allele). Check it on the first
+                    // `PHASE_CHECKS` diploid calls of the region, like the VCF guard.
+                    if phase_checks > 0 && b1 < 0x80 && (b1 >> 1) != 0 {
+                        phase_checks -= 1;
+                        if (b1 & 1) == 0 { unphased_seen = true; }
+                    }
                     if b0 < 0x80 {
                         let a0 = (b0 >> 1).wrapping_sub(1);
                         if a0 > 0 && a0 < 128 { cols[si*2].push(row as i32); }
@@ -275,6 +290,11 @@ fn process_region(
     }
     meta_w.flush()?;
 
+    if unphased_seen {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            "BCF panel is unphased (a '/' genotype separator was found); a reference panel must \
+contain phased haplotypes — phase it first (e.g. selphi --phase-panel) or supply the phased BCF"));
+    }
     Ok(RegionResult { meta_file: meta_path, chunk_files, chunk_row_counts, n_variants })
 }
 

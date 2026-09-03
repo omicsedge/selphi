@@ -132,6 +132,7 @@ fn encode_typed_float(buf: &mut Vec<u8>, v: f32) {
 #[inline]
 fn begin_record(
     buf: &mut Vec<u8>,
+    rid: i32,
     pos_0based: i32,
     rlen: i32,
     n_info: u16,
@@ -143,7 +144,7 @@ fn begin_record(
 ) -> usize {
     let shared_start = buf.len();
     buf.extend_from_slice(&[0u8; 8]); // placeholder for l_shared, l_indiv
-    buf.extend_from_slice(&0i32.to_le_bytes());          // chrom = 0 (single contig)
+    buf.extend_from_slice(&rid.to_le_bytes());           // chrom = header ##contig index
     buf.extend_from_slice(&pos_0based.to_le_bytes());     // pos (0-based)
     buf.extend_from_slice(&rlen.to_le_bytes());           // rlen = REF length
     buf.extend_from_slice(&QUAL_MISSING.to_le_bytes());   // qual = missing
@@ -283,6 +284,7 @@ fn emit_gt_chip(
 /// alt_probs layout: `alt_probs[(sample*2 + hap) * tile_n + variant_offset]`
 pub fn encode_imputed_record(
     buf: &mut Vec<u8>,
+    rid: i32,
     pos_0based: i32,
     id: &[u8],
     ref_allele: &[u8],
@@ -315,7 +317,7 @@ pub fn encode_imputed_record(
     let dr2 = dr2_f64 as f32;
 
     let shared_start = begin_record(
-        buf, pos_0based, ref_allele.len() as i32, n_info, n_fmt, n_samples,
+        buf, rid, pos_0based, ref_allele.len() as i32, n_info, n_fmt, n_samples,
         id, ref_allele, alt_allele,
     );
 
@@ -349,6 +351,7 @@ pub fn encode_imputed_record(
 /// where sample_local is 0..n_samples_in_batch (NOT the global sample index).
 pub fn encode_imputed_record_partial(
     buf: &mut Vec<u8>,
+    rid: i32,
     pos_0based: i32,
     id: &[u8],
     ref_allele: &[u8],
@@ -367,7 +370,7 @@ pub fn encode_imputed_record_partial(
     let n_info: u16 = 0;
 
     let shared_start = begin_record(
-        buf, pos_0based, ref_allele.len() as i32, n_info, n_fmt, n_samples_in_batch,
+        buf, rid, pos_0based, ref_allele.len() as i32, n_info, n_fmt, n_samples_in_batch,
         id, ref_allele, alt_allele,
     );
     // No INFO fields (merger recomputes them from concatenated dosages).
@@ -385,6 +388,7 @@ pub fn encode_imputed_record_partial(
 /// Merger recomputes AF/AC/AN at end. GT-only sample data.
 pub fn encode_chip_record_partial(
     buf: &mut Vec<u8>,
+    rid: i32,
     pos_0based: i32,
     id: &[u8],
     ref_allele: &[u8],
@@ -399,7 +403,7 @@ pub fn encode_chip_record_partial(
     let n_fmt: u8 = 1;
 
     let shared_start = begin_record(
-        buf, pos_0based, ref_allele.len() as i32, n_info, n_fmt, n_samples_in_batch,
+        buf, rid, pos_0based, ref_allele.len() as i32, n_info, n_fmt, n_samples_in_batch,
         id, ref_allele, alt_allele,
     );
 
@@ -411,6 +415,7 @@ pub fn encode_chip_record_partial(
 /// Encode a BCF2 record for a chip (genotyped) variant.
 pub fn encode_chip_record(
     buf: &mut Vec<u8>,
+    rid: i32,
     pos_0based: i32,
     id: &[u8],
     ref_allele: &[u8],
@@ -430,7 +435,7 @@ pub fn encode_chip_record(
     let af = ac as f32 / n_haps as f32;
 
     let shared_start = begin_record(
-        buf, pos_0based, ref_allele.len() as i32, n_info, n_fmt, n_samples,
+        buf, rid, pos_0based, ref_allele.len() as i32, n_info, n_fmt, n_samples,
         id, ref_allele, alt_allele,
     );
 
@@ -452,16 +457,35 @@ pub struct BcfVariantInfo {
     pub id: Vec<u8>,
     pub ref_allele: Vec<u8>,
     pub alt_allele: Vec<u8>,
+    /// Index of this record's contig in the header's `##contig` order (BCF `rid`).
+    /// Every record used to write 0 here: right for a one-contig header, wrong for
+    /// a multi-chromosome output (all 22 chromosomes filed under contig 0 with a
+    /// valid-looking index) and only right by luck when an SRP built from a BCF
+    /// carries the source's whole contig dictionary in its header.
+    pub rid: i32,
 }
 
 /// Parse SRP IDs into BCF variant info.
-pub fn parse_variant_infos(ids: &[String], original_ids: &[String], start: usize, end: usize) -> Vec<BcfVariantInfo> {
+/// `contig_names` is the header's `##contig` ID list in header order; a record
+/// whose chromosome is not in it gets rid 0 (and a one-contig header always
+/// yields 0, so single-chromosome output is unchanged).
+pub fn parse_variant_infos(ids: &[String], original_ids: &[String], start: usize, end: usize, contig_names: &[String]) -> Vec<BcfVariantInfo> {
+    let rid_of = |chrom: &str| -> i32 {
+        if contig_names.len() <= 1 { return 0; }
+        contig_names.iter().position(|c| c == chrom)
+            .or_else(|| {
+                // Tolerate a `chr` prefix mismatch between the panel IDs and the header.
+                let alt = chrom.strip_prefix("chr").map(str::to_string).unwrap_or_else(|| format!("chr{chrom}"));
+                contig_names.iter().position(|c| *c == alt)
+            })
+            .map(|p| p as i32).unwrap_or(0)
+    };
     (start..end).map(|i| {
         let id_str = &ids[i];
         // Right-split so chrom may contain '-' (rare assembly contigs).
-        let (_chrom, pos_str, ref_a, alt) = match crate::srp::helpers::parse_synthetic_id(id_str) {
+        let (chrom, pos_str, ref_a, alt) = match crate::srp::helpers::parse_synthetic_id(id_str) {
             Some(x) => x,
-            None => return BcfVariantInfo { pos_0based: 0, id: b".".to_vec(), ref_allele: b"N".to_vec(), alt_allele: b"N".to_vec() },
+            None => return BcfVariantInfo { pos_0based: 0, id: b".".to_vec(), ref_allele: b"N".to_vec(), alt_allele: b"N".to_vec(), rid: 0 },
         };
         let pos: i32 = pos_str.parse().unwrap_or(1) - 1; // 1-based → 0-based
         let oid = if !original_ids[i].is_empty() { &original_ids[i] } else { id_str };
@@ -470,6 +494,17 @@ pub fn parse_variant_infos(ids: &[String], original_ids: &[String], start: usize
             id: oid.as_bytes().to_vec(),
             ref_allele: ref_a.as_bytes().to_vec(),
             alt_allele: alt.as_bytes().to_vec(),
+            rid: rid_of(chrom),
         }
+    }).collect()
+}
+
+/// Parse the `##contig=<ID=...>` names out of the header text the writer emits,
+/// in header order — the order BCF `rid` indexes.
+pub fn contig_names_from_header_lines(contig_field: &str) -> Vec<String> {
+    contig_field.lines().filter_map(|l| {
+        let s = l.strip_prefix("##contig=<ID=")?;
+        let e = s.find(|c| c == ',' || c == '>')?;
+        Some(s[..e].to_string())
     }).collect()
 }

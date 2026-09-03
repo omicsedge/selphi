@@ -452,6 +452,25 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
         cohort.n_var = keep.len();
     }
     let Cohort { sample_names, markers, geno: cohort_geno, n_var, n_samples, was_phased } = cohort;
+
+    // Fail BEFORE phasing if a native panel was requested and any allele cannot be
+    // stored in it. The SRP record format keeps REF/ALT lengths in a u8, and the
+    // 1000 Genomes chr22 BCF alone carries a 266-bp REF; without this check an
+    // 85-minute whole-chromosome phasing completed, wrote the VCF, and only then
+    // failed on `--srp` with "pre-normalize before building the SRP".
+    if args.srp || args.bref3 {
+        let too_long: Vec<&TargetMarker> = markers.iter()
+            .filter(|m| m.ref_allele.len() > 255 || m.alt_allele.len() > 255 || m.chrom.len() > 255)
+            .collect();
+        if !too_long.is_empty() {
+            let m = too_long[0];
+            selphi_error!("{} variant(s) have a REF/ALT longer than 255 bp (first: {}:{} REF {} bp, ALT {} bp); \
+the --srp/--bref3 panel formats store allele lengths in one byte. Drop them first, e.g. \
+bcftools view -e 'strlen(REF)>255 || max(strlen(ALT))>255', or omit --srp/--bref3 to get the phased VCF only.",
+                too_long.len(), m.chrom, m.pos, m.ref_allele.len(), m.alt_allele.len());
+            std::process::exit(2);
+        }
+    }
     let n_haps = n_samples * 2;
     selphi_step!("Cohort: {} samples, {} variants, input_phased={} (re-phasing from genotypes)",
         n_samples, n_var, was_phased);

@@ -34,6 +34,9 @@ pub struct OutputFormats {
     pub parquet: bool,
     pub pgen: bool,
     pub selfdecode: bool,
+    /// `##contig` IDs in the order the BCF header writes them — the order BCF
+    /// `rid` indexes. Empty unless `bcf`; single-chr output has one entry.
+    pub bcf_contig_names: Vec<String>,
 }
 
 /// Per-window precomputed data shared across all output formats.
@@ -721,7 +724,7 @@ fn format_tile_batch_bcf(
 
             if is_chip[local_i] {
                 bcf_encode::encode_chip_record(
-                    &mut buf, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
+                    &mut buf, vi.rid, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
                     chip_genotypes, chip_local_idx[local_i], n_samples, n_haps,
                 );
             } else {
@@ -744,7 +747,7 @@ fn format_tile_batch_bcf(
                     _ => None,
                 };
                 bcf_encode::encode_imputed_record(
-                    &mut buf, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
+                    &mut buf, vi.rid, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
                     alt_probs, tile_n, v, n_samples, n_haps, no_ap, &mut ds_scratch,
                     hc.as_ref(),
                 );
@@ -774,7 +777,7 @@ fn format_chip_bcf(
 ) {
     let vi = &var_infos[vi_idx];
     super::bcf_encode::encode_chip_record(
-        buf, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
+        buf, vi.rid, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
         chip_gt, chip_idx[wgs_i], n_samples, n_haps,
     );
 }
@@ -931,6 +934,7 @@ pub fn write_window_multiformat(
     let var_infos = if formats.bcf {
         Some(super::bcf_encode::parse_variant_infos(
             &srp.ids, &srp.original_ids, setup.own_wgs_start, setup.own_wgs_end,
+            &formats.bcf_contig_names,
         ))
     } else { None };
 

@@ -144,8 +144,12 @@ struct BcfSink<'a> {
 
 impl BatchSink for BcfSink<'_> {
     fn begin_window(&mut self, ctx: &WindowCtx) -> std::io::Result<()> {
+        // The batched BCF path is single-chromosome only (imputation_pipeline.rs
+        // is its sole caller; orchestrate.rs writes unbatched), so the header has
+        // one contig and every record's rid is 0.
         self.var_infos = crate::io::bcf_encode::parse_variant_infos(
             &ctx.srp.ids, &ctx.srp.original_ids, ctx.own_wgs_start, ctx.own_wgs_end,
+            &[],
         );
         self.buf = Vec::with_capacity(8 * 1024 * 1024);
         self.hc_mask = vec![false; ctx.n_samples_in_batch];
@@ -156,7 +160,7 @@ impl BatchSink for BcfSink<'_> {
         let ci = ctx.chip_local_idx[local_i];
         let vi = &self.var_infos[local_i];
         crate::io::bcf_encode::encode_chip_record_partial(
-            &mut self.buf, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
+            &mut self.buf, vi.rid, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
             ctx.chip_genotypes, ci, ctx.n_samples_in_batch, ctx.sample_start, ctx.n_haps_total,
         );
         Ok(())
@@ -186,7 +190,7 @@ impl BatchSink for BcfSink<'_> {
             } else { None }
         } else { None };
         crate::io::bcf_encode::encode_imputed_record_partial(
-            &mut self.buf, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
+            &mut self.buf, vi.rid, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
             alt, tile_n, v, ctx.n_samples_in_batch, self.no_ap,
             hc.as_ref(),
         );

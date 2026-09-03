@@ -296,6 +296,20 @@ fn strip_line_endings(line: &[u8]) -> &[u8] {
     &line[..end]
 }
 
+/// `parse_vcf_line` plus the shared-sample reindex the BCF arm applies natively:
+/// parse the full `n_file_samples` row into `full_row`, then gather `indices`
+/// into `ds_buf`. With `indices == None` the row is returned as parsed.
+fn parse_vcf_line_reindexed(
+    line: &[u8], n_file_samples: usize, ds_buf: &mut Vec<f32>,
+    indices: Option<&[usize]>, full_row: &mut Vec<f32>,
+) -> Option<(Vec<u8>, i64, Vec<u8>, Vec<u8>)> {
+    let Some(idx) = indices else { return parse_vcf_line(line, n_file_samples, ds_buf); };
+    let rec = parse_vcf_line(line, n_file_samples, full_row)?;
+    ds_buf.clear();
+    ds_buf.extend(idx.iter().map(|&i| full_row.get(i).copied().unwrap_or(-1.0)));
+    Some(rec)
+}
+
 /// Parse a VCF/BCF text line to extract dosage for all samples.
 /// Returns (chrom, pos, ref, alt, dosages) where dosages[i] is DS for sample i.
 /// If DS not available, uses GT (0/0→0, 0/1→1, 1/1→2).
@@ -450,6 +464,12 @@ enum VariantReader {
         path: std::path::PathBuf,
         /// Virtual position of the first data line (post-header)
         header_end_vpos: u64,
+        /// File-column index of each shared sample, in shared order. `None` =
+        /// take the leading columns as they come, which is only right when the
+        /// file's samples ARE the shared set in that order.
+        sample_indices: Option<Vec<usize>>,
+        /// Scratch: the full per-file-sample dosage row before reindexing.
+        full_row: Vec<f32>,
     },
     Bcf {
         reader: noodles_bgzf::io::Reader<BufReader<std::fs::File>>,
@@ -543,15 +563,20 @@ impl VariantReader {
             Ok((VariantReader::Vcf {
                 reader, line_buf: Vec::with_capacity(ns * 8), n_file_samples: ns,
                 path: path.to_path_buf(), header_end_vpos,
+                sample_indices: None, full_row: Vec::new(),
             }, samples))
         }
     }
 
-    /// Set sample indices to extract (selective extraction for BCF only).
+    /// Set the file-column index of each shared sample (shared order). BCF
+    /// extracts selectively; VCF parses the full row and reindexes. The VCF arm
+    /// used to drop the request silently, so whenever a VCF.gz side's samples
+    /// were not the leading columns in shared order, file column i was scored
+    /// against file column i of the other side.
     fn set_sample_filter(&mut self, indices: Vec<usize>) {
         match self {
             VariantReader::Bcf { sample_indices, .. } => { *sample_indices = Some(indices); }
-            VariantReader::Vcf { .. } => { let _ = indices; }
+            VariantReader::Vcf { sample_indices, .. } => { *sample_indices = Some(indices); }
         }
     }
 
@@ -623,11 +648,11 @@ impl VariantReader {
 
     fn next_record_inner(&mut self, ds_buf: &mut Vec<f32>, skip_gt: bool) -> Option<(Vec<u8>, i64, Vec<u8>, Vec<u8>)> {
         match self {
-            VariantReader::Vcf { reader, line_buf, n_file_samples, .. } => {
+            VariantReader::Vcf { reader, line_buf, n_file_samples, sample_indices, full_row, .. } => {
                 loop {
                     line_buf.clear();
                     if reader.read_until(b'\n', line_buf).ok()? == 0 { return None; }
-                    if let Some(rec) = parse_vcf_line(line_buf, *n_file_samples, ds_buf) {
+                    if let Some(rec) = parse_vcf_line_reindexed(line_buf, *n_file_samples, ds_buf, sample_indices.as_deref(), full_row) {
                         return Some(rec);
                     }
                 }
