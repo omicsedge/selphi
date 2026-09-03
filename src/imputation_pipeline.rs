@@ -890,7 +890,7 @@ struct ImpScaffold {
     /// Per-site EM Ne for this member's phasing (None → use calibrated default).
     final_ne_per_site: Option<Vec<f64>>,
     /// Cross-window HMM forward-state passthrough, private to this member.
-    hap_priors: Vec<Option<Vec<f64>>>,
+    hap_priors: Vec<Option<Vec<(i64, f64)>>>,
 }
 
 /// Sum CSR `b` into `a` (column union, per-row left-fold f32 in member order),
@@ -1472,7 +1472,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
 
     // 11. Process each window: PBWT → HMM, then overlap VCF write with next window's PBWT.
     // Cross-window HMM state passthrough: forward state from window N → prior for window N+1
-    let mut hap_priors: Vec<Option<Vec<f64>>> = vec![None; n_haps];
+    let mut hap_priors: Vec<Option<Vec<(i64, f64)>>> = vec![None; n_haps];
     let n_cores = rayon::current_num_threads();
 
     // Run-level imputation-quality accumulator (mean DR2 over imputed sites).
@@ -1629,6 +1629,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                     site_conf_per_sample: target_site_conf_per_sample.as_deref(),
                     refine_thr,
                     interp_cum_cm: interp_cum_cm.as_deref(),
+                                    bcf_contig_names: &formats.bcf_contig_names,
                 };
                 // Find this batch's writer by hap_start, asserting its hap_end matches.
                 macro_rules! find_bi {
