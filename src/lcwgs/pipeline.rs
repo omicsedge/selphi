@@ -192,7 +192,11 @@ fn impute_from_gl3(
     let mut modified = false;
     if !crate::config::present("LCWGS_KPBWT") {
         let n_ref = srp.metadata.n_haps;
-        let adaptive = ((n_ref as f64 * 0.066).round() as usize).clamp(2000, 5000);
+        // Capped below n_ref as well as at 5000: a depth at or above the panel size
+        // makes the sparse-PBWT allocation short-circuit (see faithful_select.rs).
+        let adaptive = ((n_ref as f64 * 0.066).round() as usize)
+            .clamp(2000, 5000)
+            .min(n_ref.saturating_sub(1).max(1));
         if adaptive != eff.kpbwt {
             crate::selphi_info!("  adaptive K: kpbwt {} → {} (n_ref={})", eff.kpbwt, adaptive, n_ref);
             eff.kpbwt = adaptive;
