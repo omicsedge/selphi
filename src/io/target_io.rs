@@ -357,11 +357,11 @@ pub fn read_cohort_vcf(
             ref_allele: f.ref_allele.to_string(), alt_allele: f.alt_allele.to_string(),
             ref_hash: String::new(), alt_hash: String::new(), id: f.id.to_string(),
         });
-        // Cohort/panel self-phasing has no pedigree consumer, so fold the GT_MISSING
-        // sentinel back to 0 here (the panel phasing engine expects {0,1}); keeps this
-        // path byte-identical to the pre-sentinel behaviour (missing → hom-ref).
-        let mut gts = parse_gt_region(f.gt_region, sample_names.len(), &mut is_phased, &mut phase_checks);
-        for g in gts.iter_mut() { if g[0] > 1 { g[0] = 0; } if g[1] > 1 { g[1] = 0; } }
+        // Keep the GT_MISSING sentinel, exactly as the BCF branches above do. This
+        // loop used to carry its own second fold to hom-REF; because a cohort is
+        // very often handed over as .vcf.gz, that made the panel no-call fix inert
+        // on the most common input format while it worked on .bcf.
+        let gts = parse_gt_region(f.gt_region, sample_names.len(), &mut is_phased, &mut phase_checks);
         genotypes.push(gts);
     }
 
