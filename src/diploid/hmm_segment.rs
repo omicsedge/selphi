@@ -152,7 +152,14 @@ unsafe fn neon_hsum8(lo: float32x4_t, hi: float32x4_t) -> f32 {
 pub(crate) fn rare_dispatch_position_first() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::config::is_one("SELPHI_DIPLOID_RARE_DISPATCH"))
+    // DEFAULT-ON as of 2026-09-03: this is SHAPEIT5's order
+    // (haplotype_segment_single.cpp:105-117 dispatches on POSITION, with the rare
+    // test living only inside RUN_HOM) and it is already what this file's own
+    // backward pass does. Under the old skip-first default a rare-hom skip on the
+    // window's first locus shadowed INIT, leaving the state vector at the zeros
+    // resize_for filled, so the next RUN divided by prob_sum_t = 0 and poisoned the
+    // window with NaN. Opt out with SELPHI_DIPLOID_SKIP_FIRST_DISPATCH=1.
+    *ON.get_or_init(|| !crate::config::is_one("SELPHI_DIPLOID_SKIP_FIRST_DISPATCH"))
 }
 
 /// `SELPHI_DIPLOID_DISPATCH_DIAG=1`: count forward rare-hom skips that land on
@@ -1092,7 +1099,18 @@ impl SegmentHmm {
             }
 
             self.sum_k();
-            self.save_alpha(seg - seg_first, abs_locus - 1);
+            // The Alpha must be labelled with the locus that last UPDATED the state,
+            // not the segment's last locus. compute_trans_hap bridges
+            // (alpha_locus[seg-1] -> backward_prev_locus) and its own comment says
+            // this exists to "handle non-consecutive when rare sites are at segment
+            // boundaries" — but `abs_locus - 1` is that boundary locus even when a
+            // rare-hom skip left the state standing at an earlier one. Labelling it
+            // too late makes the bridge too short and yt too small, i.e. the phase
+            // too sticky, in the one case the field was added for. `prev_abs_locus`
+            // is exactly what the backward pass already stores (see :1219), and the
+            // two are equal whenever nothing was skipped, so this is byte-identical
+            // on any run whose rare path is inert.
+            self.save_alpha(seg - seg_first, prev_abs_locus);
             if seg < seg_last {
                 self.compute_h_probs();
             }
@@ -1127,7 +1145,12 @@ impl SegmentHmm {
             n_boundary += graph.count_diplotypes(s) * graph.count_diplotypes(s + 1);
         }
         let n_trans = dc0 + n_boundary;
-        let mut transition_probs = vec![0.0f64; n_trans];
+        // Uniform, matching the f64 twin (hmm_segment_f64.rs:438). Every entry is
+        // normally overwritten; the init only survives a compute_trans_hap early-out,
+        // and there an all-zero block makes the sampler commit the last diplotype
+        // while a uniform one degrades to an honest coin flip. The two twins
+        // disagreed (0.0 here, 1.0 there) and only one can be right.
+        let mut transition_probs = vec![1.0f64; n_trans];
         let missing_probs = vec![0.0f32; graph.n_missing * HAP_NUMBER];
         if n_window_segs < 2 || n_cond == 0 {
             transition_probs.fill(1.0 / n_trans.max(1) as f64);
@@ -1463,7 +1486,12 @@ impl SegmentHmm {
 
     /// Check for underflow: returns true if probabilities are too small.
     pub fn has_underflow(&self) -> bool {
-        self.prob_sum_t < 1e-30
+        // NaN must escalate. `NaN < 1e-30` is false, so a poisoned window used to
+        // report itself healthy: the f64 retry was never triggered, SET_FIRST_TRANS
+        // was skipped (`NaN > 0.0` is also false), the transition vector came out
+        // all-zero WITHOUT a NaN for the downstream guard to catch, and the sampler
+        // then picked the last diplotype of every affected segment deterministically.
+        !(self.prob_sum_t >= 1e-30)
     }
 }
 
