@@ -73,7 +73,7 @@ Extended detail behind main-text **Tables 1, 1b, 1c and 1d** (capture-plus-low-p
 libraries, genotype concordance in percentage points) and **Tables 2 and 2b** (uniformly
 downsampled GIAB genomes, dosage R²). Sub-tables follow main-text order: S4a-S4d are the
 capture-library benchmark, S4e-S4f the downsampled genomes. Default engine throughout = the
-reference-faithful 8-founder phasing HMM run every iteration (opt out
+8-founder phasing HMM run every iteration (opt out
 `LCWGS_NO_FOUNDER_PHASE=1`) with band-mode recombination (default; Methods). In the
 downsampled rows (S4e, S4f) every tool computes genotype likelihoods from the BAM with its own
 in-process pileup (no external caller) and is scored on the identical site set across the
