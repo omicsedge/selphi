@@ -140,16 +140,24 @@ struct BcfSink<'a> {
     var_infos: Vec<crate::io::bcf_encode::BcfVariantInfo>,
     /// R4b: reusable batch-local per-sample hard-call mask.
     hc_mask: Vec<bool>,
+    /// Output-header contig names, for the per-record `rid`.
+    contig_names: &'a [String],
 }
 
 impl BatchSink for BcfSink<'_> {
     fn begin_window(&mut self, ctx: &WindowCtx) -> std::io::Result<()> {
-        // The batched BCF path is single-chromosome only (imputation_pipeline.rs
-        // is its sole caller; orchestrate.rs writes unbatched), so the header has
-        // one contig and every record's rid is 0.
+        // Resolve each record's rid against the output header's contig list, the
+        // same list the unbatched path uses (pipeline.rs:943). Passing an empty
+        // slice here filed every record under rid 0: harmless when the SRP came
+        // from a single-contig source, wrong whenever its dictionary carries more
+        // than one contig and the run's chromosome is not the first entry — which
+        // is the normal shape of a per-chromosome 1000 Genomes or UK Biobank BCF.
+        // Dosages were never affected; the CHROM column was, behind a
+        // self-consistent index, and it broke the documented promise that batched
+        // output is bit-identical to unbatched.
         self.var_infos = crate::io::bcf_encode::parse_variant_infos(
             &ctx.srp.ids, &ctx.srp.original_ids, ctx.own_wgs_start, ctx.own_wgs_end,
-            &[],
+            self.contig_names,
         );
         self.buf = Vec::with_capacity(8 * 1024 * 1024);
         self.hc_mask = vec![false; ctx.n_samples_in_batch];
@@ -226,12 +234,14 @@ pub fn write_window_bcf_batched(
     let WindowBatchInput {
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples_total, chip_genotypes, no_ap, site_conf, site_conf_per_sample, refine_thr,
+        bcf_contig_names,
         interp_cum_cm,
     } = input;
     // Intermediate always carries AP1/AP2 (see setup_batch_writers); the merger
     // needs them to count AC, and the final BCF drops AP per --no-ap.
     let _ = no_ap;
-    let mut sink = BcfSink { tx, no_ap: false, buf: Vec::new(), var_infos: Vec::new(), hc_mask: Vec::new() };
+    let mut sink = BcfSink { tx, no_ap: false, buf: Vec::new(), var_infos: Vec::new(),
+                             hc_mask: Vec::new(), contig_names: bcf_contig_names };
     crate::io::batch_driver::run_window(
         &mut sink, srp.as_ref(), weights, hap_start, hap_end,
         win_chip_start, own_chip_start, own_chip_end, wgs_idx, n_samples_total, chip_genotypes,

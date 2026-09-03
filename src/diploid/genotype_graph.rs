@@ -405,7 +405,14 @@ impl GenotypeGraph {
 
         // Pass 6: count transitions
         self.n_transitions = self.count_transitions();
-        self.prob_mask = vec![false; self.n_transitions];
+        // Left EMPTY on purpose. sampling::store_probs treats `prob_mask.is_empty()`
+        // as "first storage for this graph" and builds the mask itself; pre-sizing it
+        // here trips that sentinel, so the first Main-stage store took the
+        // already-initialised path. Only pruning's clear() rescued it, and pruning
+        // returns early when n_segments < 2. Output-inert (the unrescued case has a
+        // uniform stored posterior and the sampler already hardcodes codes[0] there),
+        // but the sentinel should mean what it says.
+        self.prob_mask = Vec::new();
         self.prob_stored = Vec::new();
         self.prob_missing = Vec::new();
     }

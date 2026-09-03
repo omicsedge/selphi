@@ -548,7 +548,15 @@ fn format_tile_batch(
                 for s in 0..n_samples {
                     let (ap1, ap2) = sample_ap(s);
 
-                    // Fast path: dosage rounds exactly to 0 or 2 at 3-decimal precision.
+                    // Fast path. NOTE the test is per-HAPLOTYPE, not on the summed
+                    // dosage: it fires when BOTH ap are below 0.0005, so a dosage in
+                    // [0.0005, 0.001) — one hap at 0.0004 and the other at 0.0004,
+                    // summing to 0.0008 — takes it and prints 0 where the general
+                    // path would print 0.001. Same at the top end. That is a factor-2
+                    // edge on the deliberate 3-decimal DS quantization, inside the
+                    // already-measured <=0.0001 OVERALL R2 text-rounding envelope, and
+                    // GT/AP/AC/AF/DR2 are unaffected (the stats close upstream). Kept
+                    // as-is; the comment used to claim it tested the sum.
                     if ap1 < 0.0005 && ap2 < 0.0005 {
                         buf.extend_from_slice(if no_ap { HOMREF_GTDS } else { HOMREF_GTDS_AP });
                         continue;

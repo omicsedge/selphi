@@ -54,6 +54,12 @@ pub struct WindowBatchInput<'a> {
     /// linear in cM between anchors instead of variant ordinal. `None` (default)
     /// keeps the rank-linear t byte-identical.
     pub interp_cum_cm: Option<&'a [f64]>,
+    /// Contig names from the output header, in header order. The batched BCF sink
+    /// needs them to resolve each record's `rid`; it used to pass an empty slice
+    /// and every record went out as rid 0, the batched twin of the bug fixed on
+    /// the unbatched path in d775374. Empty is still accepted and means "single
+    /// contig, rid 0", which is what the non-BCF sinks pass.
+    pub bcf_contig_names: &'a [String],
 }
 
 /// One batch's sample / haplotype range (haps = 2 × samples).

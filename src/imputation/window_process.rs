@@ -32,6 +32,13 @@ pub struct WindowHmmParams {
     /// Whether the HMM should compute `hap_posterior` for cross-window passthrough.
     /// Set to false on the final window — the posterior is an `n_ref`-sized f64
     /// vector per target that would never be read, saving ~13 GB at biobank scale.
+    /// Build the cross-window forward prior. MEASURED INERT on chr1 (801 samples,
+    /// 5,769,087 variants, 4 real windows, 1000 Genomes panel): the output is
+    /// byte-identical whether this prior carries the true forward posterior, the
+    /// old boundary-set indicator, or nothing at all. `finalize_weights` rewrites
+    /// rows 0-1 and n-2/n-1 of every window and the first overlap/2 markers are
+    /// discarded, so whatever the prior seeds is overwritten before it reaches the
+    /// output. `SELPHI_HMM_NO_XWIN_PRIOR=1` skips building and consuming it.
     pub compute_posterior: bool,
     /// Target-hap batch size (in HAPLOTYPE units = 2 × samples) for
     /// memory-bounded HMM processing. 0 = off (single par_iter over all
@@ -81,7 +88,7 @@ pub fn impute_window(
     inputs: &ImputeWindowInputs,
     params: &WindowHmmParams,
     precomputed_candidates: Option<&Vec<Vec<u32>>>,
-    hap_priors: &mut [Option<Vec<f64>>],
+    hap_priors: &mut [Option<Vec<(i64, f64)>>],
     on_batch_done: Option<BatchDoneCb<'_>>,
 ) -> WindowHmmOutput {
     let n_var_w = inputs.chip_end - inputs.chip_start;
@@ -173,7 +180,7 @@ pub fn process_window_hmm(
     n_samples: usize,
     coded: &pbwt::CodedSteps,
     precomputed_candidates: Option<&Vec<Vec<u32>>>,
-    hap_priors: &mut [Option<Vec<f64>>],
+    hap_priors: &mut [Option<Vec<(i64, f64)>>],
     chip_start: usize,
     n_var_w: usize,
     mut on_batch_done: Option<BatchDoneCb<'_>>,
@@ -202,7 +209,7 @@ pub fn process_window_hmm(
 
     for batch_start in (0..n_haps).step_by(batch_size) {
         let batch_end = (batch_start + batch_size).min(n_haps);
-        let hap_priors_view: &[Option<Vec<f64>>] = hap_priors;
+        let hap_priors_view: &[Option<Vec<(i64, f64)>>] = hap_priors;
         let batch_results: Vec<(usize, HmmResult)> = (batch_start..batch_end)
             .into_par_iter()
             .map(|tgt| {

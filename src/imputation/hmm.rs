@@ -493,6 +493,22 @@ fn compute_forward(
         PRUNE_SURV_ROWS.fetch_add(diag_rows, AtomicOrdering::Relaxed);
     }
 
+    // The cross-window prior must be read BEFORE the boundary fill below. That
+    // fill replaces the last row with 1/nh at the matched states and 0 elsewhere,
+    // i.e. a match-set indicator that has forgotten everything the forward pass
+    // accumulated, and `last_alpha` used to be taken from the overwritten row —
+    // so every window handed the next one a near-content-free vector. The fill
+    // itself is harmless to the weights (finalize_weights rewrites rows n-2 and
+    // n-1 of every window anyway), which is why this went unnoticed.
+    // SELPHI_HMM_XWIN_BOUNDARY_PRIOR=1 restores the old content for A/B.
+    let pre_boundary_alpha: Option<Vec<f64>> = if is_last
+        && !crate::config::is_one("SELPHI_HMM_XWIN_BOUNDARY_PRIOR")
+    {
+        Some(fwd[(n_rows - 1) * n_states..n_rows * n_states].iter().map(|&v| v as f64).collect())
+    } else {
+        None
+    };
+
     // Boundary condition for last block
     if is_last {
         let last_base = (n_rows - 1) * n_states;
@@ -510,8 +526,9 @@ fn compute_forward(
     }
 
     // Convert last alpha back to f64 for cross-window prior
-    let last_alpha: Vec<f64> = fwd[(n_rows - 1) * n_states..n_rows * n_states]
-        .iter().map(|&v| v as f64).collect();
+    let last_alpha: Vec<f64> = pre_boundary_alpha.unwrap_or_else(|| {
+        fwd[(n_rows - 1) * n_states..n_rows * n_states].iter().map(|&v| v as f64).collect()
+    });
     (fwd, last_alpha, last_sum)
 }
 
@@ -853,7 +870,8 @@ pub struct HmmResult {
     pub weights: Vec<(usize, CsrWeights)>,
     /// Forward state at last site, expanded to per-haplotype (n_ref_haps).
     /// Used to initialize next window's HMM.
-    pub hap_posterior: Option<Vec<f64>>,
+    /// Sparse (hap id, weight) pairs sorted by hap id — see the build site.
+    pub hap_posterior: Option<Vec<(i64, f64)>>,
 }
 
 /// Source for reference alleles at chip sites during dedup: reads bits on
@@ -874,7 +892,7 @@ pub fn calculate_weights(
     n_chip: usize,
     site_emission_ratios: Option<&[f64]>,
     ne_per_site: Option<&[f64]>,
-    hap_prior: Option<&[f64]>,
+    hap_prior: Option<&[(i64, f64)]>,
     // R2 hybrid-emission spine: per-chip-site input confidence c[v] in [0,1]
     // (1 = fully trusted hard call). Slice is aligned to `distances_cm`
     // (post-intersection chip-site order). None (or all-1.0) -> the shipped
@@ -1043,10 +1061,16 @@ pub fn calculate_weights(
     // using state_to_hap mapping. This bridges forward state across windows with
     // different deduplication/candidate sets.
     let mut fwd_blocks: Vec<(Vec<f32>, usize)> = Vec::with_capacity(output_breaks.len());
-    let mut alpha: Option<Vec<f64>> = hap_prior.map(|prior| {
+    let hap_prior = if crate::config::is_one("SELPHI_HMM_NO_XWIN_PRIOR") { None } else { hap_prior };
+    let mut alpha: Option<Vec<f64>> = hap_prior.map(|prior: &[(i64, f64)]| {
         let mut a = vec![0.0f64; n_states];
         for (si, &hap_id) in state_to_hap.iter().enumerate() {
-            a[si] = prior[hap_id as usize];
+            // Sorted sparse lookup; a haplotype absent from the previous window's
+            // state set contributes 0.0, which is what the dense vector held.
+            a[si] = match prior.binary_search_by_key(&hap_id, |&(h, _)| h) {
+                Ok(k) => prior[k].1,
+                Err(_) => 0.0,
+            };
         }
         // Normalize
         let s: f64 = a.iter().sum();
@@ -1186,16 +1210,29 @@ pub fn calculate_weights(
     // Build hap_posterior only when requested (cross-window passthrough).
     // On the last window this is never consumed — skip the n_ref_haps f64 alloc.
     // At biobank scale (171K haps × 10K targets) this saves ~13 GB.
-    let hap_posterior = if compute_posterior {
+    let hap_posterior = if compute_posterior && !crate::config::is_one("SELPHI_HMM_NO_XWIN_PRIOR") {
         let last_alpha = &fwd_blocks.last().unwrap().0;
         let n_rows_last = fwd_blocks.last().unwrap().1;
         let alpha_end = &last_alpha[(n_rows_last - 1) * n_states..n_rows_last * n_states];
-        let mut hp = vec![0.0f64; n_ref_haps];
-        for (si, &hap_id) in state_to_hap.iter().enumerate() {
-            hp[hap_id as usize] += alpha_end[si] as f64;
-        }
-        let s: f64 = hp.iter().sum();
-        if s > 0.0 { for v in &mut hp { *v /= s; } }
+        // SPARSE, sorted by hap id. This used to be a dense `vec![0.0f64; n_ref_haps]`
+        // even though only `state_to_hap` — at most n_states entries — is ever
+        // written, and it is RETAINED per target haplotype across every window
+        // transition. With a few thousand states against a 171,000-haplotype panel
+        // that is over 95% zeros carried from window to window: 1.37 MB per target
+        // haplotype dense, tens of KB sparse.
+        //
+        // Bit-identical to the dense version, deliberately: a stable sort by hap id
+        // leaves duplicate ids in ascending `si` order, so the per-hap accumulation
+        // adds the same f64 terms in the same order the dense `+=` did; the
+        // normalising sum then walks ids ascending exactly as the dense iteration
+        // did, and the dense zeros it also visited cannot change an f64 sum.
+        let mut hp: Vec<(i64, f64)> = state_to_hap.iter().enumerate()
+            .map(|(si, &hap_id)| (hap_id, alpha_end[si] as f64))
+            .collect();
+        hp.sort_by_key(|&(h, _)| h);
+        hp.dedup_by(|b, a| if a.0 == b.0 { a.1 += b.1; true } else { false });
+        let s: f64 = hp.iter().map(|&(_, v)| v).sum();
+        if s > 0.0 { for (_, v) in &mut hp { *v /= s; } }
         Some(hp)
     } else {
         None

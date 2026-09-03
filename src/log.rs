@@ -320,7 +320,15 @@ fn compute_estimate_mb(
         n_haps
     };
     let weights_mb = (in_flight_haps as f64) * per_weights_mb;
-    let hap_posterior_mb = (in_flight_haps as f64 * n_ref as f64 * 8.0) / 1e6;
+    // Cross-window prior, now SPARSE: (i64 hap id, f64 weight) pairs, at most
+    // n_states of them, rather than a dense f64 per reference haplotype. n_states
+    // is bounded by the candidate set, not by the panel, so on a large panel this
+    // is one to two orders of magnitude smaller than the dense form it replaced
+    // (MESA 5K chr20, 171,054 haps x 10,000 target haps: 13.7 GB dense, ~0.4 GB
+    // sparse). Estimated with the measured mean state count, capped by the panel
+    // since the sparse form can never exceed one entry per haplotype.
+    let states_est = (max_candidates.max(1) as f64).min(n_ref as f64);
+    let hap_posterior_mb = (in_flight_haps as f64 * states_est * 16.0) / 1e6;
     let tile_cols = n_ref.div_ceil(4096);
     let stripes_per_batch = 300usize.min((n_chip * 100).div_ceil(1024));
     let stripe_decomp_mb = (stripes_per_batch * tile_cols * 500 * 1024) as f64 / 1e6;
