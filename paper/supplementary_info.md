@@ -402,16 +402,30 @@ interchangeable for array imputation and the accuracy gain lives in the imputer.
 ## Table S8. Reference-panel re-phasing (chr22)
 
 The 1000 Genomes Phase 3 panel re-phased de-novo with Selphi 2 (`--phase-panel`,
-2,401 samples) versus its original published phasing; the same Selphi-phased
-target is imputed against each panel. Re-phasing a well-phased panel is
-net-negative on overall R², driven entirely by the rarest bins (it helps common
-variants but loses rare-allele fidelity), so a panel's published phasing is best
-retained.
+2,401 samples, 1,070,399 sites after removing two records whose REF exceeds the
+255-byte limit of the panel formats) versus its original published phasing; the
+same Selphi-phased target (801 samples) is imputed against each panel and scored
+on the identical 1,070,397 sites. Re-phasing recovers slightly more than it
+costs: overall R² rises by 0.0019 for Selphi 2 and 0.0028 for Beagle 5.5, and no
+MAF bin falls by more than 0.0001. Against the panel's published phasing, the
+re-phasing itself has a switch error of 2.18% (37.55% at minor-allele count 1,
+over 105,538,882 heterozygous transitions). We nonetheless use the published
+phasing throughout this work, because it is the phasing the comparator tools are
+conventionally run against; these figures bound what that choice costs at
+0.0019 to 0.0028 in overall R².
 
-| Imputer | original panel | Selphi-rephased panel | Δ overall | rarest-bin Δ (0.05-0.1%) | common-bin Δ (0.5-50%) |
+| Imputer | original panel | Selphi-rephased panel | Δ overall | rarest-bin Δ (0.05-0.1%) | worst bin |
 |---|---:|---:|---:|---:|---:|
-| Beagle 5.5 | 0.4723 | 0.4696 | -0.0028 | -0.014 | +0.001 to +0.004 |
-| Selphi 2  | 0.4821 | 0.4788 | -0.0033 | -0.013 | +0.001 to +0.003 |
+| Beagle 5.5 | 0.4680 | 0.4707 | +0.0028 | +0.0031 | +0.0010 |
+| Selphi 2  | 0.4776 | 0.4795 | +0.0019 | +0.0033 | -0.0001 |
+
+An earlier version of this table, computed before the rare-variant phasing
+defect described under Rare variant phasing in Methods was corrected, reported
+the opposite sign (-0.0033 and -0.0028 overall, -0.013 and -0.014 in the rarest bin). The
+difference is the singleton-placement rule: at 2,401 samples the scaffold
+threshold sends every variant with a minor-allele count of four or fewer to the
+rare-variant pass, so the panel-wide effect of that rule is larger here than on
+any smaller cohort we measured.
 
 ## Table S9. Genome-wide per-MAF R² underlying Figure 3a (1KG, five-way, imputation-only)
 
