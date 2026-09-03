@@ -750,7 +750,7 @@ pub fn run_multi_chr(
         drop(targ_alleles);
 
         // Per-window imputation loop
-        let mut hap_priors: Vec<Option<Vec<f64>>> = vec![None; n_haps];
+        let mut hap_priors: Vec<Option<Vec<(i64, f64)>>> = vec![None; n_haps];
 
         for (wi, window) in windows.iter().enumerate() {
             let hmm_params = selphi::imputation::window_process::WindowHmmParams {

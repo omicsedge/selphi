@@ -398,7 +398,17 @@ impl PbwtNeighborIndex {
                     let mut off0 = 1usize; let mut off1 = 1usize;
                     let mut dg0 = -1i32; let mut dg1 = -1i32;
                     let tar_idx = group * n_target + chap;
-                    for nd in 0..self.depth {
+                    // Mirror the parallel loop (:334-339) and SHAPEIT5: a step where
+                    // NEITHER flank is addable must retry the SAME depth slot rather
+                    // than consume it. Using the loop counter as the write index left
+                    // that slot at its previous value — a stale neighbour, or an
+                    // uninitialised one — and returned a conditioning set shorter than
+                    // requested. Also break when both flanks are exhausted, which the
+                    // parallel loop does and the reference lacks (it would spin).
+                    let mut n_added = 0usize;
+                    while n_added < self.depth {
+                        if h < off0 && h + off1 >= n_hap { break; }
+                        let nd = n_added;
                         let (add0, hap0) = if h >= off0 {
                             let pos = h - off0;
                             dg0 = dg0.max(c[pos + 1]);
@@ -414,17 +424,17 @@ impl PbwtNeighborIndex {
                         if add0 && add1 {
                             if dg0 < dg1 {
                                 self.data[nd * addr_offset + tar_idx] = hap0 as i32;
-                                off0 += 1;
+                                off0 += 1; n_added += 1;
                             } else {
                                 self.data[nd * addr_offset + tar_idx] = hap1 as i32;
-                                off1 += 1;
+                                off1 += 1; n_added += 1;
                             }
                         } else if add0 {
                             self.data[nd * addr_offset + tar_idx] = hap0 as i32;
-                            off0 += 1;
+                            off0 += 1; n_added += 1;
                         } else if add1 {
                             self.data[nd * addr_offset + tar_idx] = hap1 as i32;
-                            off1 += 1;
+                            off1 += 1; n_added += 1;
                         } else { off0 += 1; off1 += 1; }
                     }
                 }

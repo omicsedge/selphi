@@ -208,6 +208,7 @@ pub fn write_window_parquet_batched(
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples_total, chip_genotypes, no_ap: _, site_conf, site_conf_per_sample, refine_thr,
         interp_cum_cm,
+        bcf_contig_names: _,
     } = input;
     let mut sink = ParquetSink {
         bw,
