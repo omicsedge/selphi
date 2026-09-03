@@ -118,6 +118,17 @@ pub fn impute_window(
     // [window_var * n_samples + sample]; each hap extracts its sample's column
     // inside process_window_hmm. None → byte-identical scalar emission.
     let ns = inputs.n_samples;
+    // `n_samples` is the row stride of that matrix, so a caller that supplies the
+    // confidence must supply the stride too. It was silently 0 on the multi-chr
+    // path for as long as the confidence there was hardcoded None; the slice below
+    // then collapses to empty and every per-hap column read panics with an
+    // unhelpful index message. Fail with the reason instead.
+    assert!(
+        inputs.site_conf_per_sample.is_none_or(|c| ns > 0 && c.len() % ns == 0),
+        "site_conf_per_sample has {} entries but n_samples (its row stride) is {} — \
+         the caller must set n_samples whenever it supplies the confidence matrix",
+        inputs.site_conf_per_sample.map_or(0, |c| c.len()), ns,
+    );
     let conf_w: Option<Vec<f64>> = inputs.site_conf_per_sample.map(|c| {
         c[inputs.chip_start * ns..inputs.chip_end * ns].to_vec()
     });

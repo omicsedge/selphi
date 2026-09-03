@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use rayon::prelude::*;
-use selphi::{selphi_info, selphi_step};
+use selphi::{selphi_info, selphi_step, selphi_error};
 use selphi::srp::MultiChrSrpReader;
 use selphi::io::target_io::{
     read_target_vcf_multi_chr, intersect_variants_for_chr, extract_target_alleles,
@@ -118,7 +118,7 @@ fn load_chr_data(
     // ROOT-CAUSE FIX (multi-chr): 128 when phasing will run (missing→imputed by the engine),
     // 0 for impute-only (byte-identical). See single-chr extract in imputation_pipeline.rs.
     miss_val: u8,
-) -> Option<(Arc<selphi::srp::SrpReader>, Vec<usize>, Vec<usize>, Vec<u8>, Vec<f64>, Vec<i64>, usize, usize, usize)> {
+) -> Option<(Arc<selphi::srp::SrpReader>, Vec<usize>, Vec<usize>, Vec<u8>, Vec<f64>, Vec<i64>, usize, usize, usize, NoCallConf)> {
     let chr_view = multi_srp.load_chr_view(chr_name).ok()?;
     let n_ref = chr_view.n_haps();
     let n_ref_variants = chr_view.n_variants();
@@ -129,11 +129,11 @@ fn load_chr_data(
     let (target_markers, target_genotypes) = target_by_chr.get(key)
         .or_else(|| target_by_chr.get(chr_name))?;
 
-    let (wgs_idx, target_idx, targ_alleles, chip_bps, n_chip) =
+    let (wgs_idx, target_idx, targ_alleles, chip_bps, n_chip, nocall) =
         prepare_chr_target(&srp, target_markers, target_genotypes, n_haps, allele_match, miss_val)?;
     let raw_chip_cm = genmap::interpolate_for_chr(multi_map, chr_name, &chip_bps);
 
-    Some((srp, wgs_idx, target_idx, targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip))
+    Some((srp, wgs_idx, target_idx, targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip, nocall))
 }
 
 /// Intersect target markers against a chromosome's reference panel, extract the
@@ -148,7 +148,7 @@ fn prepare_chr_target(
     n_haps: usize,
     allele_match: selphi::io::target_io::AlleleMatch,
     miss_val: u8,
-) -> Option<(Vec<usize>, Vec<usize>, Vec<u8>, Vec<i64>, usize)> {
+) -> Option<(Vec<usize>, Vec<usize>, Vec<u8>, Vec<i64>, usize, NoCallConf)> {
     let (wgs_idx, target_idx, transforms) = intersect_variants_for_chr(
         &srp.metadata.chromosome, &srp.variants, &srp.ids, target_markers, allele_match,
     );
@@ -156,7 +156,41 @@ fn prepare_chr_target(
     if n_chip == 0 { return None; }
     let targ_alleles = extract_target_alleles(target_genotypes, &target_idx, n_chip, n_haps, &transforms, miss_val);
     let chip_bps: Vec<i64> = wgs_idx.iter().map(|&wi| srp.variants[wi].pos).collect();
-    Some((wgs_idx, target_idx, targ_alleles, chip_bps, n_chip))
+    let nocall = build_nocall_conf(target_genotypes, &target_idx, n_chip, n_haps / 2);
+    Some((wgs_idx, target_idx, targ_alleles, chip_bps, n_chip, nocall))
+}
+
+/// Per-chip-site and per-(site,sample) confidence marking no-call genotypes, the
+/// multi-chr twin of the single-chr no-call re-route in
+/// `imputation_pipeline::build_target_confidence`. A chip site the target did not
+/// call is emitted as the HMM's imputed dosage instead of a verbatim hard call;
+/// without this the multi-chr path emitted no-call carriers as hom-REF, which is
+/// what the single-chr path stopped doing and this path never started.
+/// `None` when the target has no missing genotype, so a complete callset is
+/// byte-identical to before.
+pub type NoCallConf = Option<(Vec<f64>, Vec<f64>)>;
+
+fn build_nocall_conf(
+    target_genotypes: &[Vec<[u8; 2]>], target_idx: &[usize], n_chip: usize, n_samples: usize,
+) -> NoCallConf {
+    if selphi::config::is_one("SELPHI_NO_NOCALL_REROUTE") { return None; }
+    let mut ps = vec![1.0f64; n_chip * n_samples];
+    let mut site = vec![1.0f64; n_chip];
+    let mut n_missing = 0usize;
+    for c in 0..n_chip {
+        let gv = &target_genotypes[target_idx[c]];
+        for s in 0..n_samples {
+            if gv[s][0] >= selphi::io::target_io::GT_MISSING
+                || gv[s][1] >= selphi::io::target_io::GT_MISSING {
+                ps[c * n_samples + s] = 0.0;
+                site[c] = 0.0;
+                n_missing += 1;
+            }
+        }
+    }
+    if n_missing == 0 { return None; }
+    selphi_step!("No-call re-route: {} (chip-site,sample) no-call genotype(s) → imputed dosage", n_missing);
+    Some((site, ps))
 }
 
 /// Load the genetic map for every chromosome, either from a per-chr directory
@@ -298,8 +332,10 @@ fn phase_chr(
                 let common_ref_bm =
                     selphi::diploid::pbwt_neighbor::HaplotypeBitmatrix::from_subset(
                         &ref_bm, &common_chip_indices);
-                // Multi-chr path: single phased scaffold (intra-run ensemble is
-                // applied in the single-chr pipeline; here n_members = 1).
+                // Multi-chr path: single phased scaffold. The intra-run phase
+                // ensemble needs the per-window weights of every member summed
+                // before interpolation, which this loop does not carry, so it is
+                // not applied here — said out loud below rather than silently.
                 let (mut scaffolds, _ri) = selphi::diploid::diploid_phase_bm_prefiltered(
                     &targ_alleles, common_ref_bm, &common_chip_indices, Some(&ref_bm),
                     raw_chip_cm, chip_bps, &ref_bp, &map_bp_raw, &map_cm_raw,
@@ -434,6 +470,26 @@ pub fn run_multi_chr(
     }
 
     // 4. Determine output formats
+    // The multi-chromosome window loop hands the writer struct literal `None` for
+    // the Parquet, PGEN and SelfDecode slots (see WindowWriters below), so those
+    // three formats produce NO FILE AT ALL on this path — the flag was accepted and
+    // silently did nothing. Refuse instead, and name the way to get the format.
+    {
+        let mut unsupported: Vec<&str> = Vec::new();
+        if config.parquet || config.all_formats { unsupported.push("--parquet"); }
+        if config.pgen || config.all_formats { unsupported.push("--pgen"); }
+        if config.selfdecode || config.all_formats { unsupported.push("--selfdecode"); }
+        if !unsupported.is_empty() {
+            selphi_error!(
+                "{} not supported on the multi-chromosome path (a multi-chr .srp, or --refpanel-dir). \
+                 Only VCF.gz and BCF are written here. Run one chromosome at a time to get {}, \
+                 e.g. --refpanel chr22.srp --region 22 (or split the target and loop over chromosomes).",
+                unsupported.join(", "), unsupported.join(" / "),
+            );
+            std::process::exit(2);
+        }
+    }
+
     let formats = selphi::io::pipeline::OutputFormats {
         vcf: !config.bcf,
         bcf: config.bcf,
@@ -489,10 +545,31 @@ pub fn run_multi_chr(
         n_ref: usize,
         n_ref_variants: usize,
         n_chip: usize,
+        nocall: NoCallConf,
     }
 
     // 6. Process each chromosome with prefetch overlap
     let mut prefetch_result: Option<ChrPrefetchResult> = None;
+
+    // Two single-chr mechanisms this path does not carry. They were silent no-ops;
+    // say so once, at the top of the run, rather than letting a whole-genome job
+    // quietly differ from the per-chromosome one.
+    if !is_phased || config.force_phasing {
+        let intra_n = selphi::config::usize_or("SELPHI_DIPLOID_INTRA_N", 2).max(1);
+        if intra_n > 1 {
+            selphi_info!("  NOTE: the diploid intra-run phase ensemble (SELPHI_DIPLOID_INTRA_N={}) is not applied on the multi-chromosome path; phasing uses the single Viterbi solve. Run per chromosome to get it.", intra_n);
+        }
+        if config.phasing_engine == "haploid" {
+            selphi_info!("  NOTE: the haploid engine's per-window EM Ne is not forwarded to the imputation HMM on the multi-chromosome path, so --no-em-ne has no effect here.");
+        }
+    }
+
+    // Re-route threshold, read once. Same source and default as the single-chr path
+    // (imputation_pipeline::build_target_confidence) so the two agree on which chip
+    // sites are emitted as imputed dosage rather than as verbatim hard calls.
+    let nocall_thr: f64 = selphi::config::raw("SELPHI_REFINE_THR")
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(0.1);
 
     // Run-level imputation-quality accumulator + output variant tally (all chrs).
     let mut dr2_acc = selphi::io::dosage_stats::Dr2Summary::default();
@@ -503,11 +580,11 @@ pub fn run_multi_chr(
         selphi_info!("  [{}/{}] chr{}", chr_idx + 1, n_chr, chr_name);
 
         // Use prefetched data if available, otherwise load synchronously
-        let (srp, wgs_idx, _target_idx, targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip) =
+        let (srp, wgs_idx, _target_idx, targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip, nocall) =
             if let Some(pre) = prefetch_result.take() {
                 selphi_info!("    (prefetched)");
                 (pre.srp, pre.wgs_idx, pre.target_idx, pre.targ_alleles,
-                 pre.raw_chip_cm, pre.chip_bps, pre.n_ref, pre.n_ref_variants, pre.n_chip)
+                 pre.raw_chip_cm, pre.chip_bps, pre.n_ref, pre.n_ref_variants, pre.n_chip, pre.nocall)
             } else {
                 // Synchronous load for first chromosome (or if prefetch was skipped)
                 match load_chr_data(&multi_srp, chr_name, &target_by_chr, &multi_map, n_haps, config.allele_match, mc_miss_val) {
@@ -647,7 +724,7 @@ pub fn run_multi_chr(
                     let srp = Arc::new(chr_view.into_srp_reader());
 
                     let (target_markers, target_genotypes) = next_target.as_ref()?;
-                    let (wgs_idx, target_idx, targ_alleles, chip_bps, n_chip) =
+                    let (wgs_idx, target_idx, targ_alleles, chip_bps, n_chip, nocall) =
                         prepare_chr_target(&srp, target_markers, target_genotypes, n_h, allele_match, mc_mv)?;
                     let (map_bp, map_cm) = next_map?;
                     let raw_chip_cm: Vec<f64> = chip_bps.iter().map(|&bp| {
@@ -656,7 +733,7 @@ pub fn run_multi_chr(
 
                     Some(ChrPrefetchResult {
                         srp, wgs_idx, target_idx, targ_alleles, raw_chip_cm, chip_bps,
-                        n_ref, n_ref_variants, n_chip,
+                        n_ref, n_ref_variants, n_chip, nocall,
                     })
                 }))
             } else {
@@ -708,11 +785,15 @@ pub fn run_multi_chr(
                 targ_alleles: &targ_bm,
                 chip_cm: &chip_cm,
                 ne_per_site: final_ne_per_site.as_deref(),
-                // R2/R4 --refine is single-chr only for now: the multi-chr reader
-                // (read_target_vcf_multi_chr) does not yet capture per-site
-                // GQ/PL/DP, so confidence is None here (→ shipped scalar emission).
-                site_conf_per_sample: None,
-                n_samples: 0,
+                // --refine is single-chr only (the multi-chr reader does not capture
+                // per-site GQ/PL/DP), but the default-on no-call re-route is wired:
+                // `nocall` marks (site, sample) pairs the target did not call.
+                site_conf_per_sample: nocall.as_ref().map(|(_, ps)| ps.as_slice()),
+                // Row stride of that matrix. Was 0, which was harmless only while
+                // site_conf_per_sample was hardcoded None: the window slice
+                // c[chip_start*ns..chip_end*ns] collapses to empty and every
+                // per-hap column read panics.
+                n_samples,
                 chip_start: window.chip_start,
                 chip_end: window.chip_end,
             };
@@ -743,11 +824,12 @@ pub fn run_multi_chr(
                     no_ap: config.no_ap,
                     preloaded_chunks: None,
                     preloaded_stripes,
-                    // R3 --refine is not wired into the multi-chr orchestrate path
-                    // (same as R2): no per-site confidence here → no re-route.
-                    site_conf: None,
-                    site_conf_per_sample: None,
-                    refine_thr: 0.5,
+                    // --refine is not wired here (no GQ/PL/DP from the multi-chr
+                    // reader); the no-call re-route is. Same threshold source as the
+                    // single-chr path so the two agree on which sites re-route.
+                    site_conf: nocall.as_ref().map(|(site, _)| site.as_slice()),
+                    site_conf_per_sample: nocall.as_ref().map(|(_, ps)| ps.as_slice()),
+                    refine_thr: nocall_thr,
                     interp_cum_cm: interp_cum_cm.as_deref(),
                 },
                 selphi::io::pipeline::WindowWriters {
