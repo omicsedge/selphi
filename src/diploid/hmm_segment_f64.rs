@@ -41,7 +41,9 @@ impl SegmentHmmF64 {
         }
     }
 
-    pub fn has_underflow(&self) -> bool { self.prob_sum_t < 1e-300 }
+    /// NaN escalates: `NaN < 1e-300` is false, so this is the last place a poisoned
+    /// window can be caught before its transition vector is copied into all_trans.
+    pub fn has_underflow(&self) -> bool { !(self.prob_sum_t >= 1e-300) }
 
     // -- INIT --
     fn init_hom(&mut self, target_allele: bool, cond_alleles: &[bool]) {
@@ -414,7 +416,9 @@ impl SegmentHmmF64 {
                 abs_locus += 1;
             }
             self.sum_k();
-            self.save_alpha(seg - seg_first, abs_locus - 1);
+            // Same as the f32 twin: label the Alpha with the locus that last updated
+            // the state, not the segment's last locus. See hmm_segment.rs.
+            self.save_alpha(seg - seg_first, prev_abs);
         }
     }
 

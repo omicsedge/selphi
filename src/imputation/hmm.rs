@@ -931,9 +931,28 @@ pub fn calculate_weights(
         gs
     });
 
+    // Divisor of the per-site recombination shift. It sums the dedup group sizes
+    // over the haplotypes MATCHED at this site, while the shift is then added over
+    // ALL n_states (`p_rec * gs[j]` for every j, hmm.rs:446-456), so the total
+    // injected mass is p_rec * (sum over all states) / (sum over matched) — a
+    // per-site inflation of the same ratio, which on real runs is tens-fold.
+    // SELPHI_HMM_TOTAL_RECOMB_DENOM=1 switches the divisor to the all-states sum,
+    // which is what makes the kernel mass-preserving in the Beagle sense. It is NOT
+    // the default: the shipped auto-Ne (36.4 * n_ref, floor 100,000) was swept on
+    // top of this kernel, so the inflation is already absorbed into that constant
+    // and changing one without re-sweeping the other makes the copying model tens of
+    // times stickier than anything validated. Measured effect: see the A/B in
+    // project_unswept_subsystems_2026_09_03.
+    let total_state_mass: f64 = match group_sizes_f64 {
+        Some(ref gs) => gs.iter().sum(),
+        None => n_states as f64,
+    };
+    let use_total = crate::config::is_one("SELPHI_HMM_TOTAL_RECOMB_DENOM");
     let mut n_haps_per_site = vec![1.0f64; distances_cm.len()];
     for (site, dm) in dense_matches.iter().enumerate() {
-        let nh = if let Some(ref gs) = group_sizes_f64 {
+        let nh = if use_total {
+            total_state_mass
+        } else if let Some(ref gs) = group_sizes_f64 {
             dm.iter().map(|&j| gs[j]).sum::<f64>()
         } else {
             dm.len() as f64

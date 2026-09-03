@@ -186,7 +186,20 @@ fn sniff_variant_file(path: &str) -> Sniff {
     }
     let raw = match read_decompressed(path) {
         Ok(r) => r,
-        Err(_) => return Sniff::default(),
+        // A target we cannot read is NOT evidence about the target. Swallowing the
+        // error here returns an all-false Sniff, which auto_route_decision reads as
+        // "GT absent" and routes to lcWGS (branch 3) — a decision taken on zero
+        // evidence, announced in the log as if it had been sniffed. For a missing
+        // file that surfaces later as a confusing "lcWGS pipeline failed: No such
+        // file or directory"; for a truncated or corrupt .vcf.gz it can route a
+        // perfectly ordinary array to the wrong engine. Refuse instead.
+        Err(e) => {
+            crate::selphi_error!(
+                "cannot read the target file {} for engine selection: {}. Fix the file, or \
+                 pass --engine explicitly to skip the sniff.", path, e,
+            );
+            std::process::exit(2);
+        }
     };
     if raw.starts_with(b"BCF\x02\x02") {
         return sniff_bcf(path).unwrap_or_default();
