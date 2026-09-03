@@ -989,6 +989,23 @@ pub fn write_window_multiformat(
                             &setup.chip_local_idx, setup.n_haps, n_samples);
                         vcf_tx.send(buf).expect("VCF send failed");
                     }
+                    // Parquet gets the same variant the other four formats get here.
+                    // This arm was missing, so a chip site that falls outside every
+                    // interpolation interval reached VCF, BCF, PGEN and SelfDecode
+                    // but was dropped from the .parquet — silently, and asymmetric
+                    // with the .pvar written a few lines below. Emitted as a
+                    // one-variant tile: write_tile_to_parquet reads the genotype from
+                    // chip_genotypes for a chip site, so alt_probs is unused.
+                    if let Some((ref mut writer, _)) = pw {
+                        if let Some(ref sa) = schema_arc {
+                            let vp_start = next_wgs - setup.own_wgs_start;
+                            super::parquet_output::write_tile_to_parquet(
+                                writer, sa, &[], 1, n_samples, setup.n_haps,
+                                next_wgs, &setup.vid_prefixes, vp_start, &setup.is_chip,
+                                &setup.chip_local_idx, chip_genotypes, setup.n_ref_variants,
+                                &setup.is_input_chip, setup.site_conf_per_sample.as_deref(), setup.refine_thr)?;
+                        }
+                    }
                     if formats.pgen || formats.selfdecode {
                         let ci = setup.chip_local_idx[local_idx];
                         if formats.pgen {

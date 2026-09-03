@@ -47,7 +47,14 @@ pub struct BamGl {
     pub sample_ids: Vec<String>,
 }
 
-/// Read-filtering thresholds (defaults match GLIMPSE2 / bcftools mpileup).
+/// Read-filtering thresholds. These are OURS and are deliberately stricter than
+/// either reference — the earlier claim that they match GLIMPSE2 or bcftools
+/// mpileup was wrong on every threshold. GLIMPSE2 defaults to mapq 10 and baseq 10
+/// (`GLIMPSE2/phase/src/caller/caller_parameters.cpp:81-82`); bcftools mpileup's
+/// documented defaults are looser still. We use 20/20 and a 250-read depth cap.
+/// The paper's low-coverage results were all measured at these values, so treat a
+/// change as a re-measurement, not a tweak (`LCWGS_MIN_MAPQ`, `LCWGS_MIN_BQ`,
+/// `LCWGS_MAX_DEPTH`).
 #[derive(Clone, Copy)]
 pub struct PileupParams {
     pub min_mapq: u8,
@@ -76,9 +83,14 @@ pub struct PileupParams {
     /// realigns). Default off = BAQ qualities at every column of a realigned
     /// read. `LCWGS_BAQ_STREAMING` (A/B).
     pub baq_streaming: bool,
-    /// Keep supplementary alignments (flag 0x800), as `bcftools mpileup` does by
-    /// default (its `--ff` excludes only UNMAP,SECONDARY,QCFAIL,DUP). Default off
-    /// = drop them, as GLIMPSE2 does. `LCWGS_KEEP_SUPPLEMENTARY` (A/B).
+    /// Keep supplementary alignments (flag 0x800). Default off = drop them, which
+    /// is a deviation from BOTH references, not a match to either: bcftools
+    /// mpileup's `--ff` default excludes only UNMAP,SECONDARY,QCFAIL,DUP, and
+    /// GLIMPSE2 excludes only UNMAP and SECONDARY — its supplementary exclusion is
+    /// commented out in the source (`caller_initialise.cpp:196-199`), so it keeps
+    /// supplementary, QC-fail and duplicate reads. Dropping duplicates and QC-fail
+    /// for genotype-likelihood calling is standard and we keep doing it; the
+    /// supplementary half is UNMEASURED. `LCWGS_KEEP_SUPPLEMENTARY` (A/B).
     pub keep_supplementary: bool,
 }
 impl Default for PileupParams {
@@ -115,6 +127,8 @@ fn is_anomalous_pair(flags: u16, count_orphans: bool) -> bool {
 }
 
 // SAM flag bits to exclude (unmapped, secondary, qc-fail, duplicate, supplementary).
+// Stricter than GLIMPSE2, which excludes only UNMAP|SECONDARY
+// (`GLIMPSE2/phase/src/caller/caller_initialise.cpp:196`).
 const FLAG_EXCLUDE: u16 = 0x4 | 0x100 | 0x200 | 0x400 | 0x800;
 
 /// Resolve a panel contig name against a BAM/CRAM header, tolerant to the `chr`
@@ -390,7 +404,14 @@ fn pileup_one(
                 Some(Ok(p)) => usize::from(p) as i64, // 1-based
                 _ => return,
             };
-            let mapq = record.mapping_quality().map(|m| m.get()).unwrap_or(0);
+            // SAM reserves 255 for "mapping quality unavailable", and noodles models
+            // that as None (MappingQuality::new(255) is None). Folding it to 0 made
+            // every such read fail the min-MAPQ filter below AND, via mq_cap =
+            // min(mapq, 60) in the GL model, cap its base qualities to zero. STAR
+            // emits 255 for uniquely-mapped reads by default, so an entire library
+            // was being discarded. samtools and bcftools mpileup compare the raw
+            // value, i.e. 255 passes -q and caps nothing; match them.
+            let mapq = record.mapping_quality().map_or(255, |m| m.get());
             cigar_buf.clear();
             for op in record.cigar().iter() {
                 match op { Ok(o) => cigar_buf.push((o.kind(), o.len())), Err(_) => return }
@@ -489,7 +510,14 @@ fn pileup_one_cram(
         let mut emit = |record: &RecordBuf, sink: &mut dyn FnMut(&ReadView)| {
             if record.reference_sequence_id() != Some(target_rid) { return; }
             let start = match record.alignment_start() { Some(p) => usize::from(p) as i64, None => return };
-            let mapq = record.mapping_quality().map(|m| m.get()).unwrap_or(0);
+            // SAM reserves 255 for "mapping quality unavailable", and noodles models
+            // that as None (MappingQuality::new(255) is None). Folding it to 0 made
+            // every such read fail the min-MAPQ filter below AND, via mq_cap =
+            // min(mapq, 60) in the GL model, cap its base qualities to zero. STAR
+            // emits 255 for uniquely-mapped reads by default, so an entire library
+            // was being discarded. samtools and bcftools mpileup compare the raw
+            // value, i.e. 255 passes -q and caps nothing; match them.
+            let mapq = record.mapping_quality().map_or(255, |m| m.get());
             cigar_buf.clear();
             for op in record.cigar().as_ref() { cigar_buf.push((op.kind(), op.len())); }
             seq_buf.clear();
