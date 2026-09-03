@@ -438,6 +438,11 @@ pass --homref-absent on to apply it (matched-sites scoring ignores it)");
     // system temp dir and then runs the native in-process orchestrator. No
     // subprocess bcftools, no per-chr selphi fan-out.
     if let Some(ref panel_dir) = args.refpanel_dir {
+        if args.phase_only {
+            selphi_error!("--phase-only is not supported on the multi-chromosome path (--refpanel-dir); \
+run per chromosome with a single-chr .srp, or drop --phase-only");
+            std::process::exit(2);
+        }
         let input = args.input.as_ref().expect("--input required with --refpanel-dir");
         let map_dir = args.map_dir.as_ref().expect("--map-dir required with --refpanel-dir");
         let out = args.out.as_deref().unwrap_or("imputed");
@@ -751,6 +756,13 @@ pass --homref-absent on to apply it (matched-sites scoring ignores it)");
         selphi_info!("  threads:  {}", args.threads);
         selphi_info!("  log:      {}\n", log_path.display());
 
+        if args.phase_only {
+            // orchestrate.rs never reads phase_only: without this guard a phased-VCF
+            // request against a multi-chr panel ran a full imputation and wrote dosages.
+            selphi_error!("--phase-only is not supported on the multi-chromosome path (multi-chr .srp); \
+run per chromosome with a single-chr .srp, or drop --phase-only");
+            std::process::exit(2);
+        }
         let config = orchestrate::MultiChrImputeConfig::from_args(&args, args.map_dir.clone());
         orchestrate::run_multi_chr(
             Path::new(&args.refpanel), target_path, Path::new(map_path), output_path, &config,
