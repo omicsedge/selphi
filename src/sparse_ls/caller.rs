@@ -170,7 +170,15 @@ impl Worker {
             hlc: vec![0.0f32; 2 * n_tot],
             hp0: vec![0.0f32; 2 * n_tot],
             hp1: vec![0.0f32; 2 * n_tot],
-            cond: ConditioningSet::from_params(vmap, &rp, ref_hs.n_ref_haps, params),
+            // n_eff_haps is Ne, NOT the panel size. GLIMPSE2 passes the two
+            // separately — `conditioning_set(V, H, H.n_ref_haps, ne, ...)`,
+            // caller_initialise.cpp:157 — and nrho is `-0.04 * n_eff / n_ref`
+            // (conditioning_set.cpp:34). Passing the panel size here collapsed that
+            // to a constant -0.04, i.e. ne/n_ref times too little recombination per
+            // cM: on a 4,478-haplotype panel with the default Ne = 100,000 this
+            // module, whose ONLY purpose is to be a faithful GLIMPSE2 oracle for
+            // ablations, was 22x stickier than the tool it stands in for.
+            cond: ConditioningSet::from_params(vmap, &rp, params.ne.round() as usize, params),
             imp_hmm: ImputationHmm::new(),
             phs_hmm: PhasingHmm::new(params),
         }

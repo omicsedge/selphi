@@ -170,6 +170,20 @@ fn run_one_hap<F: Fn(usize) -> usize>(
         }
     }
     let dose: Vec<f32> = if cond.is_empty() {
+        // No conditioning haplotype at all: the copying model has nothing to copy
+        // from, so this emits the raw per-haplotype GL — 0.5 at every read-less
+        // site — i.e. the panel contributes nothing. That is never a correct
+        // outcome, and it used to happen for EVERY haplotype of EVERY panel with
+        // kpbwt >= n_ref without a single line of output. GLIMPSE2 treats zero
+        // states as fatal (conditioning_set.cpp:119-120). Say it once, loudly.
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::selphi_info!(
+                "  ⚠ empty conditioning set — this haplotype is imputed from its genotype \
+                 likelihoods alone, with NO reference panel. Check LCWGS_KPBWT against the \
+                 panel size and the selection logs.",
+            );
+        }
         (0..n_var).map(|v| hap_hl[2 * v + 1]).collect()
     } else if use_scaffold {
         // Band-mode recombination is N/A in scaffold mode by construction: the

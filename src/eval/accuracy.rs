@@ -73,22 +73,31 @@ impl SampleAccumulator {
     }
 
     /// Compute per-sample R² from accumulated statistics.
+    /// Per-sample R2. **NaN means UNDEFINED, not zero**: a sample with fewer than
+    /// two comparable genotypes, or with no variance on either side, has no
+    /// correlation to report. Returning 0.0 for those made the mean punish a
+    /// sample for the truth's silence — with 20 of 40 truth genotypes no-called
+    /// and the imputation exact, the per-sample mean read 0.5000 because the
+    /// twenty samples with nothing to score contributed a zero each. Callers must
+    /// average over the finite entries only.
     pub fn compute_r2(&self) -> Vec<f64> {
         (0..self.n_samples).map(|s| {
             let n = self.n_total[s] as f64;
-            if n < 2.0 { return 0.0; }
+            if n < 2.0 { return f64::NAN; }
             let num = n * self.sum_ds_gt[s] - self.sum_ds[s] * self.sum_gt[s];
             let den_x = n * self.sum_ds2[s] - self.sum_ds[s] * self.sum_ds[s];
             let den_y = n * self.sum_gt2[s] - self.sum_gt[s] * self.sum_gt[s];
             let den = (den_x.max(0.0) * den_y.max(0.0)).sqrt();
-            if den > 0.0 { (num / den).powi(2).clamp(0.0, 1.0) } else { 0.0 }
+            if den > 0.0 { (num / den).powi(2).clamp(0.0, 1.0) } else { f64::NAN }
         }).collect()
     }
 
     /// Compute per-sample concordance.
+    /// Per-sample concordance; NaN when the sample has nothing to compare, for the
+    /// same reason as `compute_r2`.
     pub fn compute_concordance(&self) -> Vec<f64> {
         (0..self.n_samples).map(|s| {
-            if self.n_total[s] > 0 { self.n_correct[s] as f64 / self.n_total[s] as f64 } else { 0.0 }
+            if self.n_total[s] > 0 { self.n_correct[s] as f64 / self.n_total[s] as f64 } else { f64::NAN }
         }).collect()
     }
 
@@ -362,13 +371,25 @@ pub fn parse_vcf_line(line: &[u8], n_samples: usize, ds_buf: &mut Vec<f32>) -> O
                 ds_buf.push(-1.0);
             }
         } else if let Some(gi) = gt_idx {
-            // Fall back to GT. Missing alleles fold to 0 (hom-ref) to match
-            // SRP/BCF readers and keep MAF denominators aligned.
+            // Fall back to GT. A no-call is UNKNOWN, not hom-ref: it is pushed as
+            // the -1.0 missing sentinel every scoring loop in this file already
+            // skips (site_r2, the concordance loop, the per-sample accumulator),
+            // and which the MAF computation already excludes from its denominator
+            // (`if truth_ds[s] >= 0.0`), so an allele frequency is taken over the
+            // called genotypes — which is what it means. Folding it to 0 scored a
+            // perfect imputation as WRONG wherever the truth simply did not know:
+            // on a synthetic set with 20 of 40 truth genotypes no-called and the
+            // imputation exact, OVERALL R2 read 0.2591 and per-sample 0.5000
+            // instead of 1.0.
             if let Some(gt) = sample_field.split(|&b| b == b':').nth(gi) {
                 if gt.len() >= 3 {
-                    let a0 = if gt[0] == b'.' { 0i32 } else { (gt[0] - b'0') as i32 };
-                    let a1 = if gt[2] == b'.' { 0i32 } else { (gt[2] - b'0') as i32 };
+                    if gt[0] == b'.' || gt[2] == b'.' {
+                        ds_buf.push(-1.0);
+                    } else {
+                    let a0 = (gt[0] - b'0') as i32;
+                    let a1 = (gt[2] - b'0') as i32;
                     ds_buf.push((a0 + a1) as f32);
+                    }
                 } else if gt.len() == 1 {
                     // Haploid GT (e.g. chrX males): one allele → its biallelic ALT
                     // count (0/1). Matches the BCF reader's vector_end handling
@@ -752,16 +773,22 @@ impl VariantReader {
                         } else if k == gtk && !found_ds {
                             // GT field: int8 per sample × ploidy (selective if filter set)
                             let ge = (io2 + fs).min(ib.len());
-                            // Missing alleles are folded to 0 (hom-ref) to keep
-                            // MAF denominators aligned with the SRP truth reader
-                            // (1-bit-per-allele has no missing encoding).
+                            // A no-call is UNKNOWN, not hom-ref — see the VCF
+                            // reader above. 0x80 is BCF's missing allele and 0x81
+                            // its vector-end (haploid padding); the first means the
+                            // caller did not know, the second means the record is
+                            // haploid, so only the first becomes the -1.0 sentinel.
                             for_each_sample(si_filter, ns, |si| {
                                 let b = io2 + si * vl * es;
                                 if b + 1 < ge {
-                                    let a0c = gt_allele_to_dose(ib[b]);
-                                    let a1c = gt_allele_to_dose(ib[b+1]);
-                                    ds_buf.push(a0c as f32 + a1c as f32);
-                                } else { ds_buf.push(0.0); }
+                                    if ib[b] == 0x80 || ib[b + 1] == 0x80 {
+                                        ds_buf.push(-1.0);
+                                    } else {
+                                        let a0c = gt_allele_to_dose(ib[b]);
+                                        let a1c = gt_allele_to_dose(ib[b + 1]);
+                                        ds_buf.push(a0c as f32 + a1c as f32);
+                                    }
+                                } else { ds_buf.push(-1.0); }
                             });
                             found_gt = true;
                             io2 += fs;
@@ -1550,7 +1577,11 @@ pub fn write_json_summary(
     let sample_r2 = sample_acc.compute_r2();
     let sample_conc = sample_acc.compute_concordance();
     if !sample_r2.is_empty() {
-        let mean: f64 = sample_r2.iter().sum::<f64>() / sample_r2.len() as f64;
+        // Average over the samples that HAVE a value; a NaN means undefined.
+        let n_def = sample_r2.iter().filter(|v| v.is_finite()).count();
+        let mean: f64 = if n_def > 0 {
+            sample_r2.iter().filter(|v| v.is_finite()).sum::<f64>() / n_def as f64
+        } else { f64::NAN };
         map.insert("per_sample_mean_r2".into(), serde_json::json!((mean * 1e6).round() / 1e6));
 
         // Per-sample detail array
@@ -1559,8 +1590,16 @@ pub fn write_json_summary(
             if let Some(names) = sample_names {
                 obj.insert("sample".into(), serde_json::json!(names[s]));
             }
-            obj.insert("r2".into(), serde_json::json!((sample_r2[s] * 1e6).round() / 1e6));
-            obj.insert("concordance".into(), serde_json::json!((sample_conc[s] * 1e6).round() / 1e6));
+            // NaN is not representable in JSON: emit null so a consumer sees
+            // "undefined" rather than a zero it would average in.
+            let r2j = if sample_r2[s].is_finite() {
+                serde_json::json!((sample_r2[s] * 1e6).round() / 1e6)
+            } else { serde_json::Value::Null };
+            let cj = if sample_conc[s].is_finite() {
+                serde_json::json!((sample_conc[s] * 1e6).round() / 1e6)
+            } else { serde_json::Value::Null };
+            obj.insert("r2".into(), r2j);
+            obj.insert("concordance".into(), cj);
             obj.insert("n_correct".into(), serde_json::json!(sample_acc.n_correct[s]));
             obj.insert("n_total".into(), serde_json::json!(sample_acc.n_total[s]));
             serde_json::Value::Object(obj)
