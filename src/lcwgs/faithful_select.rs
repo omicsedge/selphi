@@ -130,14 +130,33 @@ impl FaithfulSelector {
         ref_hs.build_sparse_pbwt(&vmap, ref_bm);
 
         // --- Selection params mapped from LcwgsParams. ---
-        // kpbwt is clamped to n_ref-1 in build() below (if >= n_ref the selection
-        // short-circuits to "whole panel"; we want the PBWT path).
+        // kpbwt MUST be clamped below n_ref. This comment claimed the clamp
+        // existed; it did not, and the consequence was silent and total:
+        // allocate_pbwt returns before allocating any depth layer when
+        // `kpbwt >= n_ref` (sparse_ls/haplotype_set.rs:544), so pbwt_states stays
+        // empty, flatten_pbwt returns an empty set for every target haplotype, and
+        // iterate.rs's `if cond.is_empty()` shortcut emits the raw per-haplotype
+        // GL — no reference panel at all — from Gibbs iteration 1 onward, with no
+        // error and no warning. kpbwt defaults to 2000, so every panel of 2000
+        // haplotypes or fewer (1000 samples or fewer) was affected.
+        // GLIMPSE2 handles the case explicitly by switching to the whole panel
+        // (conditioning_set.cpp:103-108), and our own --ls-exact port does the same
+        // (sparse_ls/conditioning_set.rs:461-466). Clamping to n_ref-1 reaches the
+        // same place through the PBWT path: a depth of n_ref-1 can select every
+        // haplotype but this one, which IS the whole panel for this target.
+        let kpbwt_eff = params.kpbwt.min(n_ref.saturating_sub(1));
+        if kpbwt_eff != params.kpbwt {
+            crate::selphi_info!(
+                "  conditioning depth kpbwt {} exceeds the panel ({} haps) — clamped to {}",
+                params.kpbwt, n_ref, kpbwt_eff,
+            );
+        }
         let ls_params = LsParams {
             err_phase: 1e-4,
             err_imp: params.epsilon,
             ne: params.ne as f64,
-            kpbwt: params.kpbwt,
-            kinit: params.kpbwt, // INIT depth: reuse kpbwt as a sane budget
+            kpbwt: kpbwt_eff,
+            kinit: kpbwt_eff, // INIT depth: reuse kpbwt as a sane budget
             burnin: 0,           // schedule driven externally (see drive())
             main: 0,
         };
@@ -187,7 +206,7 @@ impl FaithfulSelector {
             unphred_table: *unphred::table(),
             n_samples,
             n_var,
-            kpbwt: params.kpbwt,
+            kpbwt: kpbwt_eff,
             gl_bytes,
             flat,
             h0: vec![vec![false; n_var]; n_samples],
