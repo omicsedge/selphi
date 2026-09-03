@@ -43,8 +43,21 @@ impl Default for LsParams {
 }
 
 impl LsParams {
-    /// K-independent recombination scale: GLIMPSE2 `nrho = -0.04 * ne / max(n_ref, ne)`
-    /// (conditioning_set.cpp:34); with ne >= n_ref this is ~-0.04 cM^-1.
+    /// K-independent recombination scale for the founder phasing HMM:
+    /// `-0.04 * ne / max(n_ref, ne)`, i.e. ~-0.04 cM^-1 whenever ne >= n_ref.
+    ///
+    /// This is a DELIBERATE DEVIATION from GLIMPSE2's default, not a port of it.
+    /// `conditioning_set.cpp:34` reads
+    /// `nrho(use_list ? -0.04*n_eff/max(n_ref,n_eff) : -0.04*n_eff/n_ref)` and
+    /// `caller_initialise.cpp:153` sets `use_list = options.count("state-list")`,
+    /// which is false in every normal run — so GLIMPSE2's shipped rate is
+    /// `/n_ref` for BOTH its HMMs, and on a 4,478-haplotype panel with the
+    /// default Ne = 100,000 ours is ~22x stickier.
+    /// A/B'd 2026-09-03 on the Table-6 rig (GIAB 1.8x chr22, 4,478-hap panel,
+    /// six samples, paired): switching this to `/n_ref` moved variant-only R2 by
+    /// +0.0003 (t = +1.44, 4/6) and the pooled ultra-rare bin by +0.0014 —
+    /// within noise, so the deviation stays. Note `LCWGS_RECOMB_DENOM` (hmm.rs)
+    /// tunes the IMPUTATION HMM only and does not reach this function.
     pub fn nrho(&self, n_ref: usize) -> f64 {
         -0.04 * self.ne / (n_ref as f64).max(self.ne)
     }
