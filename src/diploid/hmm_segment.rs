@@ -149,6 +149,8 @@ unsafe fn neon_hsum8(lo: float32x4_t, hi: float32x4_t) -> f32 {
 /// shipped default tests the skip FIRST, so a skipped locus landing on a window
 /// head shadows INIT (state vector stays zeroed) and one on a segment head
 /// shadows COLLAPSE. The env var is read exactly once.
+use super::alpha_diag;
+
 pub(crate) fn rare_dispatch_position_first() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -196,7 +198,12 @@ pub struct SegmentHmm {
     pub alpha_store: Vec<Vec<f32>>,       // per-segment: full prob[k*HAP+h] snapshot
     pub alpha_sum_store: Vec<[f32; HAP_NUMBER]>, // per-segment: probSumH snapshot
     alpha_sum_sum_store: Vec<f32>,    // per-segment: probSumT snapshot
-    alpha_locus: Vec<usize>,          // per-segment: which locus
+    alpha_locus: Vec<usize>,          // per-segment: locus that last UPDATED the state
+    /// Per-segment: the segment's LAST locus. Equal to `alpha_locus` unless a
+    /// rare-hom skip left the state standing earlier. Kept alongside so
+    /// `compute_trans_hap` can serve the A/B knob and the diagnostic without a
+    /// rebuild — see `alpha_diag`.
+    alpha_locus_seg_end: Vec<usize>,
 
     // Transition buffers
     h_probs: [f32; HAP_NUMBER * HAP_NUMBER],
@@ -216,6 +223,7 @@ impl SegmentHmm {
             alpha_sum_store: Vec::new(),
             alpha_sum_sum_store: Vec::new(),
             alpha_locus: Vec::new(),
+            alpha_locus_seg_end: Vec::new(),
             h_probs: [0.0; HAP_NUMBER * HAP_NUMBER],
             sum_h_probs: 0.0,
         }
@@ -894,7 +902,7 @@ impl SegmentHmm {
     // SAVE/RESTORE: for backward pass
     // -----------------------------------------------------------------------
 
-    fn save_alpha(&mut self, seg_idx: usize, locus: usize) {
+    fn save_alpha(&mut self, seg_idx: usize, locus_updated: usize, locus_seg_end: usize) {
         let n = self.n_cond * HAP_NUMBER;
         // Pre-allocate flat storage on first use
         if self.alpha_store.is_empty() || self.alpha_store[0].is_empty() {
@@ -904,6 +912,7 @@ impl SegmentHmm {
                 self.alpha_sum_store.push([0.0; HAP_NUMBER]);
                 self.alpha_sum_sum_store.push(0.0);
                 self.alpha_locus.push(0);
+                self.alpha_locus_seg_end.push(0);
             }
         }
         while self.alpha_store.len() <= seg_idx {
@@ -911,12 +920,14 @@ impl SegmentHmm {
             self.alpha_sum_store.push([0.0; HAP_NUMBER]);
             self.alpha_sum_sum_store.push(0.0);
             self.alpha_locus.push(0);
+            self.alpha_locus_seg_end.push(0);
         }
         // Copy without allocation (same size guaranteed)
         self.alpha_store[seg_idx].copy_from_slice(&self.prob);
         self.alpha_sum_store[seg_idx] = self.prob_sum_h;
         self.alpha_sum_sum_store[seg_idx] = self.prob_sum_t;
-        self.alpha_locus[seg_idx] = locus;
+        self.alpha_locus[seg_idx] = locus_updated;
+        self.alpha_locus_seg_end[seg_idx] = locus_seg_end;
     }
 
     // -----------------------------------------------------------------------
@@ -997,6 +1008,8 @@ impl SegmentHmm {
         self.alpha_sum_sum_store.resize(n_window_segs, 0.0f32);
         self.alpha_locus.clear();
         self.alpha_locus.resize(n_window_segs, 0usize);
+        self.alpha_locus_seg_end.clear();
+        self.alpha_locus_seg_end.resize(n_window_segs, 0usize);
 
         let mut abs_locus = graph.segment_start(seg_first);
         let mut abs_ambiguous = 0usize;
@@ -1107,10 +1120,15 @@ impl SegmentHmm {
             // rare-hom skip left the state standing at an earlier one. Labelling it
             // too late makes the bridge too short and yt too small, i.e. the phase
             // too sticky, in the one case the field was added for. `prev_abs_locus`
-            // is exactly what the backward pass already stores (see :1219), and the
-            // two are equal whenever nothing was skipped, so this is byte-identical
-            // on any run whose rare path is inert.
-            self.save_alpha(seg - seg_first, prev_abs_locus);
+            // is exactly what the backward pass already stores (see the backward's
+            // own store below), and the two are equal whenever nothing was skipped,
+            // so this is byte-identical on any run whose rare path is inert.
+            // Both labels are stored: `alpha_diag` serves the A/B knob and the
+            // magnitude counters off the pair without a rebuild.
+            self.save_alpha(seg - seg_first, prev_abs_locus, abs_locus - 1);
+            if alpha_diag::diag() {
+                alpha_diag::record_label(prev_abs_locus, abs_locus - 1, &hmm_params.cm_f32);
+            }
             if seg < seg_last {
                 self.compute_h_probs();
             }
@@ -1309,13 +1327,25 @@ impl SegmentHmm {
         } else {
             [1.0f32 / HAP_NUMBER as f32; HAP_NUMBER]
         };
-        let alpha_locus = self.alpha_locus.get(seg_rel - 1).copied().unwrap_or(0);
+        let locus_updated = self.alpha_locus.get(seg_rel - 1).copied().unwrap_or(0);
+        let locus_seg_end = self.alpha_locus_seg_end.get(seg_rel - 1).copied().unwrap_or(locus_updated);
+        // SELPHI_DIPLOID_ALPHA_SEG_END=1 restores the pre-2026-09-03 label.
+        let alpha_locus = if alpha_diag::label_seg_end() { locus_seg_end } else { locus_updated };
 
         // yt = getForwardTransProb(AlphaLocus[seg-1], prev_abs_locus)
         // Handles non-consecutive when rare sites are at segment boundaries.
         let (nt, yt) = self.transition_params_full(
             backward_prev_locus, alpha_locus,
             trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+        if alpha_diag::diag() {
+            // The magnitude that actually reaches the sampler: the same bridge
+            // measured from each label.
+            let (_, yt_fix) = self.transition_params_full(backward_prev_locus, locus_updated,
+                trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+            let (_, yt_old) = self.transition_params_full(backward_prev_locus, locus_seg_end,
+                trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+            alpha_diag::record_bridge(locus_updated, locus_seg_end, yt_fix as f64, yt_old as f64);
+        }
 
         let fact1 = nt / alpha_sum_sum.max(1e-30);
 
