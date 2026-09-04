@@ -11,9 +11,50 @@ use crate::imputation::hap_dedup::{self, DedupResult};
 use crate::imputation::match_processing;
 
 // Thread-local buffers: reused across haps to avoid ~156 MB allocation per call.
+//
+// They are sized `n_window_sites * n_states`, and `n_states` is the candidate
+// count the PBWT returned for THAT target haplotype, which varies by an order of
+// magnitude between haps. Reusing a buffer never shrinks its capacity, so
+// without `tl_take` below every rayon worker keeps the largest hap it ever saw
+// resident for the rest of the run.
+//
+// MEASURED, so nobody re-derives it from the shape of the code: releasing that
+// retention is worth 0.82 GB of a 42.98 GB peak (MESA 100 x TOPMed chr20, 16
+// threads, byte-identical output). It is real and free, but it is NOT where this
+// path's memory goes. The peak is the LIVE working set — as many haps in flight
+// as there are threads, each holding its own buffers — which is why the same rig
+// peaks at 43.3 GB on 16 threads and 21.9 GB on 4. Cutting the peak further
+// means cutting n_states or the number of haps in flight, not retention.
 thread_local! {
     static TL_FWD_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     static TL_WGT_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// How many times `needed` a retained thread-local buffer may be before it is
+/// dropped instead of reused. 2 keeps the reuse that matters (haps of similar
+/// size, the common case) and refuses to carry an outlier's footprint.
+/// `SELPHI_HMM_TL_KEEP_MAX=1` restores the old keep-forever behaviour.
+fn tl_slack() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| if crate::config::is_one("SELPHI_HMM_TL_KEEP_MAX") { usize::MAX } else { 2 })
+}
+
+/// Take a thread-local scratch buffer of at least `needed` f32s, or an empty Vec
+/// when the retained one is unusable. An over-large retained buffer is DROPPED
+/// here rather than handed back, which is what caps the per-thread footprint.
+/// Bit-identical either way: the caller fills every element it reads.
+fn tl_take(buf: &RefCell<Vec<f32>>, needed: usize) -> Vec<f32> {
+    let mut b = buf.borrow_mut();
+    let cap = b.capacity();
+    if cap >= needed && cap <= needed.saturating_mul(tl_slack()) {
+        b.clear();
+        b.resize(needed, 0.0f32);
+        std::mem::take(&mut *b)
+    } else {
+        if cap > needed { *b = Vec::new(); }
+        Vec::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -80,6 +121,11 @@ static PRUNE_NNZ_SUM: AtomicU64 = AtomicU64::new(0);
 static PRUNE_CSR_ROWS: AtomicU64 = AtomicU64::new(0);
 static PRUNE_STATES_SUM: AtomicU64 = AtomicU64::new(0);
 static PRUNE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Largest single-target state count in the window. The per-hap HMM working set
+/// is `n_window_sites * n_states`, so the run's memory peak follows this, not
+/// the mean: on MESA 100 x TOPMed the two differ by an order of magnitude and
+/// the peak is set by whichever big haps happen to be in flight together.
+static PRUNE_STATES_MAX: AtomicU64 = AtomicU64::new(0);
 
 /// Print + reset the `SELPHI_PRUNE_DIAG` aggregate. Called once per window
 /// (from `process_window_hmm`, after all target haps); no-op unless set.
@@ -91,10 +137,11 @@ pub fn prune_diag_report(chip_start: usize, chip_end: usize) {
     let csr_rows = PRUNE_CSR_ROWS.swap(0, AtomicOrdering::Relaxed);
     let states = PRUNE_STATES_SUM.swap(0, AtomicOrdering::Relaxed);
     let calls = PRUNE_CALLS.swap(0, AtomicOrdering::Relaxed);
+    let states_max = PRUNE_STATES_MAX.swap(0, AtomicOrdering::Relaxed);
     let mean = |num: u64, den: u64| if den > 0 { num as f64 / den as f64 } else { 0.0 };
     crate::selphi_info!(
-        "  [PRUNE-DIAG] window {}..{}: hmm_calls={} mean_states={:.1} mean_surviving_per_row={:.1} ({} rows) mean_csr_nnz_per_row={:.2} ({} rows)",
-        chip_start, chip_end, calls, mean(states, calls),
+        "  [PRUNE-DIAG] window {}..{}: hmm_calls={} mean_states={:.1} max_states={} mean_surviving_per_row={:.1} ({} rows) mean_csr_nnz_per_row={:.2} ({} rows)",
+        chip_start, chip_end, calls, mean(states, calls), states_max,
         mean(surv, surv_rows), surv_rows, mean(nnz, csr_rows), csr_rows);
 }
 
@@ -391,16 +438,7 @@ fn compute_forward(
     let n_rows = stop - start;
     let needed = n_rows * n_states;
     // Reuse thread-local buffer to avoid 78 MB allocation per hap
-    let mut fwd = TL_FWD_BUF.with(|buf| {
-        let mut b = buf.borrow_mut();
-        if b.capacity() >= needed {
-            b.clear();
-            b.resize(needed, 0.0f32);
-            std::mem::take(&mut *b)
-        } else {
-            Vec::new()
-        }
-    });
+    let mut fwd = TL_FWD_BUF.with(|buf| tl_take(buf, needed));
     if fwd.len() < needed {
         fwd = vec![0.0f32; needed];
     }
@@ -580,13 +618,7 @@ fn streaming_backward_combine(
 
     // Combined weights in f32 (reuse thread-local buffer)
     let needed_w = n_rows * n_states;
-    let mut weights = TL_WGT_BUF.with(|buf| {
-        let mut b = buf.borrow_mut();
-        if b.capacity() >= needed_w {
-            b.clear(); b.resize(needed_w, 0.0f32);
-            std::mem::take(&mut *b)
-        } else { Vec::new() }
-    });
+    let mut weights = TL_WGT_BUF.with(|buf| tl_take(buf, needed_w));
     if weights.len() < needed_w { weights = vec![0.0f32; needed_w]; }
 
     // Initialize last row of backward
@@ -1205,6 +1237,7 @@ pub fn calculate_weights(
         PRUNE_CSR_ROWS.fetch_add(rows, AtomicOrdering::Relaxed);
         PRUNE_STATES_SUM.fetch_add(n_states as u64, AtomicOrdering::Relaxed);
         PRUNE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+        PRUNE_STATES_MAX.fetch_max(n_states as u64, AtomicOrdering::Relaxed);
     }
 
     // Build hap_posterior only when requested (cross-window passthrough).
