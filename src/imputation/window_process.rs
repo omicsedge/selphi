@@ -76,6 +76,54 @@ pub struct ImputeWindowInputs<'a> {
     pub chip_end: usize,
 }
 
+/// `SELPHI_HMM_THREADS`: run the per-target PBWT+HMM map on a dedicated rayon
+/// pool of N threads instead of the global one. 0 (the default) uses the global
+/// pool, i.e. `--threads`.
+///
+/// This exists because the run's memory peak is that map and nothing else. Each
+/// in-flight target holds scratch sized `n_window_sites * n_states`, so the peak
+/// is (threads x per-target working set) on top of a genuinely fixed part.
+/// Measured on MESA 100 x TOPMed chr20, `--threads 16` throughout:
+///
+/// | SELPHI_HMM_THREADS | peak     | wall  |
+/// |--------------------|----------|-------|
+/// | 0 (= 16)           | 43.26 GB | 6:45  |
+/// | 8                  | 30.76 GB | 11:00 |
+/// | 4                  | 23.59 GB | 20:31 |
+///
+/// which fits `14.8 GB + 1.78 GB x threads` to within 6%. Byte-identical at every
+/// value (md5 0ecc944588ec0764e8db444cb883bc4e throughout): each target's weights
+/// are independent of every other's, and `collect()` restores target order
+/// whatever the pool.
+///
+/// BE HONEST ABOUT WHAT THIS BUYS. The premise was that interpolation, encoding
+/// and I/O are happy at 16 threads, so narrowing the reduction to the HMM would
+/// be nearly free. On this rig it is not: `--threads 4` for the WHOLE pipeline
+/// measures 21.94 GB / 21:22 against this knob's 23.59 GB / 20:31 at the same
+/// stage width, i.e. 51 seconds and 1.65 GB apart. The per-target map is
+/// essentially the whole runtime here, so there is little else to keep wide. The
+/// knob earns its place as a precise memory dial, and on a rig where the output
+/// side is the bulk of the work (many samples, many formats) the gap should widen
+/// — but nobody has measured that, and it is not a free lunch today.
+fn hmm_pool() -> Option<&'static rayon::ThreadPool> {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let n = crate::config::usize_or("SELPHI_HMM_THREADS", 0);
+        if n == 0 { return None; }
+        match rayon::ThreadPoolBuilder::new().num_threads(n).build() {
+            Ok(p) => {
+                crate::selphi_info!("  HMM stage pinned to {} threads (SELPHI_HMM_THREADS)", n);
+                Some(p)
+            }
+            Err(e) => {
+                crate::selphi_info!("  WARNING: SELPHI_HMM_THREADS={} ignored ({})", n, e);
+                None
+            }
+        }
+    }).as_ref()
+}
+
 /// Runs the per-window imputation pipeline: window sub-array extraction,
 /// coded-steps build, candidate selection, and Li-Stephens HMM over all
 /// target haplotypes. Shared between `main.rs` single-chr and `orchestrate.rs`
@@ -210,7 +258,7 @@ pub fn process_window_hmm(
     for batch_start in (0..n_haps).step_by(batch_size) {
         let batch_end = (batch_start + batch_size).min(n_haps);
         let hap_priors_view: &[Option<Vec<(i64, f64)>>] = hap_priors;
-        let batch_results: Vec<(usize, HmmResult)> = (batch_start..batch_end)
+        let run_batch = || -> Vec<(usize, HmmResult)> { (batch_start..batch_end)
             .into_par_iter()
             .map(|tgt| {
                 let prior = hap_priors_view[tgt].as_deref();
@@ -324,7 +372,11 @@ pub fn process_window_hmm(
                 ne_w, prior, conf_hap.as_deref(), 0.0, params.compute_posterior,
             ))
         })
-        .collect();
+        .collect() };
+        let batch_results = match hmm_pool() {
+            Some(p) => p.install(run_batch),
+            None => run_batch(),
+        };
 
         // Sequential update of hap_priors. If streaming callback present:
         //   - Stash batch's CSRs into a local Vec, call callback, drop.
