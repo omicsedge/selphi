@@ -780,68 +780,6 @@ fn finalize_batched_outputs(
     }
 }
 
-/// Post-imputation accuracy evaluation against a truth VCF/BCF. Reads only
-/// the shared samples between the imputed output and the truth file and
-/// writes a per-MAF-bin R² + concordance summary to `<output>.eval.json`.
-/// No-op when `--truth` is absent or the output is not VCF/BCF.
-fn evaluate_against_truth(args: &Args, output_path: &str, final_path: &Path) {
-    let Some(ref truth) = args.truth else { return; };
-    let truth_path = Path::new(truth);
-    if !truth_path.exists() { return; }
-
-    let imp_s = final_path.to_string_lossy();
-    let eval_supported = imp_s.ends_with(".vcf.gz") || imp_s.ends_with(".bcf");
-    if !eval_supported {
-        selphi_info!("  (evaluation requires VCF/BCF output; got {})", imp_s);
-        return;
-    }
-
-    selphi_step!("Evaluating accuracy vs truth...");
-    let (_imp, _truth, shared) = selphi::eval::accuracy::find_shared_samples(final_path, truth_path)
-        .expect("Failed to read sample headers");
-    selphi_info!("  imputed:  {}", final_path.display());
-    selphi_info!("  truth:    {}", truth);
-    selphi_info!("  shared:   {} samples", shared.len());
-    if shared.is_empty() {
-        selphi_info!("  No shared samples — skipping evaluation");
-        return;
-    }
-    // Same absent-from-truth resolution as standalone --evaluate: `auto` scores a
-    // variant-only truth as absent→hom-ref (standard imputation R²) and a complete
-    // callset as matched-sites-only (legacy).
-    let homref = match args.homref_absent.as_str() {
-        "on" | "true" | "1" => true,
-        "off" | "false" | "0" => false,
-        _ => !selphi::eval::accuracy::truth_has_ref_calls(truth_path).unwrap_or(true),
-    };
-    let json_path = PathBuf::from(output_path).with_extension("eval.json");
-    if homref {
-        selphi_info!("  homref:   absent→hom-ref (truth is variant-only)");
-        let raw_path = args.truth_raw.as_deref().map(Path::new);
-        let excl_path = args.exclude_sites.as_deref().map(Path::new);
-        let (comb, snp, indel, counts, site, rawdiag) = selphi::eval::accuracy::evaluate_imputation(
-            final_path, truth_path, &shared, raw_path, excl_path,
-        ).expect("Evaluation failed");
-        let n_excluded = counts.n_imp_variants.saturating_sub(counts.n_matched);
-        selphi::eval::accuracy::print_imputation_summary(&comb, &snp, &indel, args.by_type, &counts, n_excluded);
-        selphi::eval::accuracy::print_maf_bins(&site);
-        selphi::eval::accuracy::print_raw_truth_diag(&rawdiag);
-        selphi::eval::accuracy::write_imputation_json(&json_path, &comb, &snp, &indel, args.by_type, &counts, Some(&shared), Some(&site), Some(&rawdiag))
-            .expect("Failed to write JSON summary");
-    } else {
-        if args.truth_raw.is_some() {
-            selphi_info!("  WARNING: --truth-raw is only used on the absent→hom-ref path; \
-pass --homref-absent on to apply it (matched-sites scoring ignores it)");
-        }
-        let (site_acc, sample_acc, counts) = selphi::eval::accuracy::evaluate(
-            final_path, truth_path, &shared, args.exclude_sites.as_deref().map(Path::new),
-        ).expect("Evaluation failed");
-        selphi::eval::accuracy::print_summary(&site_acc, &sample_acc, &counts);
-        selphi::eval::accuracy::write_json_summary(&json_path, &site_acc, &sample_acc, &counts, Some(&shared))
-            .expect("Failed to write JSON summary");
-    }
-    selphi_step!("Accuracy: {}", json_path.display());
-}
 
 /// MAF-adaptive Ne per site: rare variants benefit from lower Ne
 /// (concentrated HMM, locks onto IBD haps), common from slightly higher Ne
@@ -1889,7 +1827,10 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // Post-imputation accuracy evaluation. Runs the same parallel eval that
     // `--evaluate` uses — the primary VCF/BCF output already contains the
     // full f32 dosages (BCF) or 3-decimal DS (VCF) that the evaluator needs.
-    evaluate_against_truth(args, output_path, &final_path);
+    // --truth: the same evaluation the multi-chr orchestrator runs (eval_run.rs).
+    if let Some(req) = crate::eval_run::EvalRequest::from_args(args) {
+        crate::eval_run::evaluate(&req, output_path, &final_path);
+    }
 
     let total = start_time.elapsed().as_secs_f64();
     let mem = selphi::log::peak_mem_mb();
