@@ -712,6 +712,11 @@ pub fn run_multi_chr(
         // chrX males are auto-detected — so before 2026-09-04 a whole-genome run
         // left every male chrX het standing.
         let needs_phasing = !is_phased || config.force_phasing;
+        if !needs_phasing && chr_idx == 0 {
+            // Same warning as the single-chr path: a pipe-separated target skips the
+            // phasing engine, and nothing else says so.
+            selphi_step!("Input is already phased — phasing SKIPPED (pass --force-phasing to re-phase)");
+        }
         // Borrowed, never cloned: the per-chr genotype matrix is the largest
         // per-chromosome object the target reader holds, and copying it here would
         // add its whole size to the peak for the sake of two read-only passes.
