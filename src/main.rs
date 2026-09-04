@@ -14,6 +14,7 @@ mod self_test;
 mod orchestrate;
 mod cli;
 mod autoroute;
+mod eval_run;
 mod imputation_pipeline;
 mod panel_phasing;
 

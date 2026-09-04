@@ -63,6 +63,10 @@ pub struct MultiChrImputeConfig {
     pub allele_match: selphi::io::target_io::AlleleMatch,
     /// `--chrx-par`: set so multi-chr can warn it is single-chr-only (no effect here yet).
     pub chrx_par: bool,
+    /// `--truth`: post-run accuracy evaluation. `None` when the flag is absent.
+    /// Before 2026-09-03 this path had no truth handling at all, so a
+    /// whole-genome benchmark run with `--truth` imputed and exited silently.
+    pub eval: Option<crate::eval_run::EvalRequest>,
 }
 
 impl MultiChrImputeConfig {
@@ -103,6 +107,7 @@ impl MultiChrImputeConfig {
             map_dir,
             allele_match: args.allele_match,
             chrx_par: args.chrx_par,
+            eval: crate::eval_run::EvalRequest::from_args(args),
         }
     }
 }
@@ -876,6 +881,13 @@ pub fn run_multi_chr(
         selphi_info!("  Imputation quality: mean DR2 {}  ·  {:.1}% of {} imputed variants DR2 \u{2265} 0.8",
             selphi::log::cyan(&format!("{:.4}", dr2_acc.mean())),
             dr2_acc.pct_ge08(), selphi::log::fmt_thousands(dr2_acc.n));
+    }
+
+    // --truth: identical evaluation to the single-chr path (eval_run.rs). The
+    // evaluator keys sites by contig, so a whole-genome output scores correctly;
+    // it does hold the whole truth callset in memory, as `--evaluate` always has.
+    if let Some(ref req) = config.eval {
+        crate::eval_run::evaluate(req, output_path, &out_file);
     }
 
     let total = start_time.elapsed().as_secs_f64();
