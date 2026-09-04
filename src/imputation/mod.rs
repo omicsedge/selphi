@@ -6,6 +6,7 @@ pub mod hap_dedup;
 pub mod match_processing;
 pub mod windows;
 pub mod window_process;
+pub mod ensemble;
 pub mod ancestry;
 
 /// Minimum value for `max_candidates`. Floors the auto-resolution formula on
