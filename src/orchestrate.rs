@@ -63,6 +63,15 @@ pub struct MultiChrImputeConfig {
     pub allele_match: selphi::io::target_io::AlleleMatch,
     /// `--chrx-par`: set so multi-chr can warn it is single-chr-only (no effect here yet).
     pub chrx_par: bool,
+    /// `--phase-ensemble N`: see `resolve_ensemble_n`. 1 = off.
+    pub phase_ensemble: usize,
+    /// `--ped`: pedigree pre-phasing + het locking.
+    pub ped: Option<String>,
+    /// `--haploids`: explicit haploid sample list (chrX males are auto-detected
+    /// without it).
+    pub haploids: Option<String>,
+    /// `--build`: only read when `--chrx-par` is set on a chrX run.
+    pub build: crate::cli::BuildArg,
     /// `--truth`: post-run accuracy evaluation. `None` when the flag is absent.
     /// Before 2026-09-03 this path had no truth handling at all, so a
     /// whole-genome benchmark run with `--truth` imputed and exited silently.
@@ -108,6 +117,10 @@ impl MultiChrImputeConfig {
             map_dir,
             allele_match: args.allele_match,
             chrx_par: args.chrx_par,
+            phase_ensemble: args.phase_ensemble,
+            ped: args.ped.clone(),
+            haploids: args.haploids.clone(),
+            build: args.build,
             eval: crate::eval_run::EvalRequest::from_args(args),
         }
     }
@@ -124,9 +137,6 @@ impl MultiChrImputeConfig {
 /// itself.
 fn warn_unsupported(args: &crate::cli::Args) {
     let mut dropped: Vec<&str> = Vec::new();
-    if args.phase_ensemble > 1 { dropped.push("--phase-ensemble (inter-run ensemble; the intra-run one still applies)"); }
-    if args.ped.is_some() { dropped.push("--ped (pedigree phase scaffolding)"); }
-    if args.haploids.is_some() { dropped.push("--haploids (explicit haploid sample list)"); }
     if args.refine { dropped.push("--refine (GL-aware refinement)"); }
     if args.local_ancestry { dropped.push("--local-ancestry"); }
     if args.export_local_ancestry { dropped.push("--export-local-ancestry"); }
@@ -152,7 +162,7 @@ fn load_chr_data(
     // ROOT-CAUSE FIX (multi-chr): 128 when phasing will run (missing→imputed by the engine),
     // 0 for impute-only (byte-identical). See single-chr extract in imputation_pipeline.rs.
     miss_val: u8,
-) -> Option<(Arc<selphi::srp::SrpReader>, Vec<usize>, Vec<usize>, Vec<u8>, Vec<f64>, Vec<i64>, usize, usize, usize, NoCallConf)> {
+) -> Option<(Arc<selphi::srp::SrpReader>, Vec<usize>, Vec<usize>, Vec<u8>, Vec<f64>, Vec<i64>, usize, usize, usize, NoCallConf, Vec<u8>)> {
     let chr_view = multi_srp.load_chr_view(chr_name).ok()?;
     let n_ref = chr_view.n_haps();
     let n_ref_variants = chr_view.n_variants();
@@ -163,11 +173,11 @@ fn load_chr_data(
     let (target_markers, target_genotypes) = target_by_chr.get(key)
         .or_else(|| target_by_chr.get(chr_name))?;
 
-    let (wgs_idx, target_idx, targ_alleles, chip_bps, n_chip, nocall) =
+    let (wgs_idx, target_idx, targ_alleles, chip_bps, n_chip, nocall, transforms) =
         prepare_chr_target(&srp, target_markers, target_genotypes, n_haps, allele_match, miss_val)?;
     let raw_chip_cm = genmap::interpolate_for_chr(multi_map, chr_name, &chip_bps);
 
-    Some((srp, wgs_idx, target_idx, targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip, nocall))
+    Some((srp, wgs_idx, target_idx, targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip, nocall, transforms))
 }
 
 /// Intersect target markers against a chromosome's reference panel, extract the
@@ -182,7 +192,7 @@ fn prepare_chr_target(
     n_haps: usize,
     allele_match: selphi::io::target_io::AlleleMatch,
     miss_val: u8,
-) -> Option<(Vec<usize>, Vec<usize>, Vec<u8>, Vec<i64>, usize, NoCallConf)> {
+) -> Option<(Vec<usize>, Vec<usize>, Vec<u8>, Vec<i64>, usize, NoCallConf, Vec<u8>)> {
     let (wgs_idx, target_idx, transforms) = intersect_variants_for_chr(
         &srp.metadata.chromosome, &srp.variants, &srp.ids, target_markers, allele_match,
     );
@@ -191,7 +201,7 @@ fn prepare_chr_target(
     let targ_alleles = extract_target_alleles(target_genotypes, &target_idx, n_chip, n_haps, &transforms, miss_val);
     let chip_bps: Vec<i64> = wgs_idx.iter().map(|&wi| srp.variants[wi].pos).collect();
     let nocall = build_nocall_conf(target_genotypes, &target_idx, n_chip, n_haps / 2);
-    Some((wgs_idx, target_idx, targ_alleles, chip_bps, n_chip, nocall))
+    Some((wgs_idx, target_idx, targ_alleles, chip_bps, n_chip, nocall, transforms))
 }
 
 /// Per-chip-site and per-(site,sample) confidence marking no-call genotypes, the
@@ -289,6 +299,44 @@ fn load_maps(
     Ok(multi_map)
 }
 
+/// Ensemble member count, resolved exactly as the single-chromosome pipeline
+/// resolves it (imputation_pipeline.rs): `SELPHI_DIPLOID_INTRA_N` (default 2)
+/// unless `--phase-ensemble N` asks for more, and forced to 1 under sample
+/// batching, whose streaming output cannot hold N weight-sets.
+///
+/// Until 2026-09-04 this path had no ensemble at all — not even the default
+/// intra-run one — so a whole-genome run was systematically worse than the same
+/// chromosomes imputed one at a time, for no reason the user could see.
+fn resolve_ensemble_n(config: &MultiChrImputeConfig) -> usize {
+    if config.target_batch_size > 0 { return 1; }
+    let intra_default = selphi::config::usize_or("SELPHI_DIPLOID_INTRA_N", 2).max(1);
+    if config.phase_ensemble > 1 { config.phase_ensemble } else { intra_default }
+}
+
+/// Chromosome-wide PBWT candidate precompute for one phased scaffold. Factored
+/// out so every ensemble member's candidates are built by the same code as
+/// member 0's — the two used to be one inline block, which is exactly how a
+/// member ends up conditioned on a different candidate set than the run.
+#[allow(clippy::too_many_arguments)]
+fn precompute_candidates_for(
+    enabled: bool,
+    ref_bm: &selphi::common::HaplotypeBitmatrix,
+    alleles: &[u8],
+    chip_cm: &[f64],
+    n_chip: usize,
+    n_ref: usize,
+    n_haps: usize,
+    max_cand: usize,
+) -> Option<Vec<Vec<u32>>> {
+    if !enabled { return None; }
+    let coded_full = selphi::imputation::pbwt::build_coded_steps_bm(
+        ref_bm, 0, n_chip, n_ref, alleles, n_haps, chip_cm, 0.05,
+    );
+    Some((0..n_haps).into_par_iter().map(|tgt| {
+        selphi::imputation::pbwt::select_candidates(&coded_full, n_ref + tgt, n_ref, max_cand)
+    }).collect())
+}
+
 /// Phase one chromosome's target (when phasing is needed) and return the
 /// possibly-rephased target alleles, the EM-Ne-per-site vector (always None on
 /// this path) and the phasing-side reference bitmatrix (Some when phasing ran,
@@ -310,8 +358,10 @@ fn phase_chr(
     n_chip: usize,
     n_samples: usize,
     n_ref: usize,
+    n_members: usize,
+    ped_locked: Option<&[bool]>,
     config: &MultiChrImputeConfig,
-) -> (Vec<u8>, Option<Vec<f64>>, Option<selphi::common::HaplotypeBitmatrix>) {
+) -> (Vec<u8>, Vec<Vec<u8>>, Option<Vec<f64>>, Option<selphi::common::HaplotypeBitmatrix>) {
     if needs_phasing {
         let (map_bp_raw, map_cm_raw) = multi_map.get(
             chr_name.strip_prefix("chr").unwrap_or(chr_name)
@@ -359,27 +409,30 @@ fn phase_chr(
                     &ref_bp, &map_bp_raw, &map_cm_raw,
                     n_chip, n_samples, n_ref, config.seed, config.threads, 0,
                 );
-                phased
+                (phased, Vec::new())
             } else {
                 selphi_info!("    Phasing: diploid engine ({} / {} common-MAF variants)",
                     common_chip_indices.len(), n_chip);
                 let common_ref_bm =
                     selphi::diploid::pbwt_neighbor::HaplotypeBitmatrix::from_subset(
                         &ref_bm, &common_chip_indices);
-                // Multi-chr path: single phased scaffold. The intra-run phase
-                // ensemble needs the per-window weights of every member summed
-                // before interpolation, which this loop does not carry, so it is
-                // not applied here — said out loud below rather than silently.
+                // Intra-run phase ensemble: `n_members` thinned Main-MCMC samples
+                // out of ONE chain (1x phasing cost). Member 0 is the Viterbi
+                // solve; the rest are folded into the per-window weights before
+                // interpolation by imputation::ensemble.
                 let (mut scaffolds, _ri) = selphi::diploid::diploid_phase_bm_prefiltered(
                     &targ_alleles, common_ref_bm, &common_chip_indices, Some(&ref_bm),
                     raw_chip_cm, chip_bps, &ref_bp, &map_bp_raw, &map_cm_raw,
                     n_chip, n_samples, n_ref,
-                    config.seed, config.threads, config.max_cond_haps, 1,
-                    // Multi-chr has no --ped path (the pedigree scaffold is applied
-                    // in the single-chr pipeline only), so nothing to lock here.
-                    None,
+                    config.seed, config.threads, config.max_cond_haps, n_members,
+                    ped_locked,
                 );
-                scaffolds.remove(0)
+                let member0 = scaffolds.remove(0);
+                if scaffolds.len() + 1 > 1 {
+                    selphi_info!("    Phase ensemble: {} members from one phasing chain",
+                        scaffolds.len() + 1);
+                }
+                (member0, scaffolds)
             }
         } else {
             selphi_info!("    Phasing: haploid engine");
@@ -389,11 +442,31 @@ fn phase_chr(
                 n_chip, n_samples, n_ref,
                 config.seed, config.threads, 0,
             );
-            phased
+            // The haploid engine's greedy swap converges to one solution rather
+            // than sampling a posterior, so it has no intra-run members: an
+            // ensemble here means N INDEPENDENT phasings, seeds {seed..seed+N-1},
+            // which is what --phase-ensemble asks for and what the single-chr
+            // pipeline does for this engine. Only run when explicitly requested.
+            let extras: Vec<Vec<u8>> = if config.phase_ensemble > 1 {
+                selphi_info!("    Phase ensemble: {} independent haploid phasings (seeds {}..{})",
+                    config.phase_ensemble, config.seed, config.seed + config.phase_ensemble as i64 - 1);
+                (1..config.phase_ensemble).into_par_iter().map(|i| {
+                    let (pa, _si, _c) = selphi::haploid::phase_genotypes(
+                        &targ_alleles, &ref_bm, raw_chip_cm, chip_bps,
+                        &ref_bp, &map_bp_raw, &map_cm_raw,
+                        n_chip, n_samples, n_ref,
+                        config.seed + i as i64, config.threads, 0,
+                    );
+                    pa
+                }).collect()
+            } else {
+                Vec::new()
+            };
+            (phased, extras)
         };
-        (phased, None::<Vec<f64>>, Some(ref_bm))
+        (phased.0, phased.1, None::<Vec<f64>>, Some(ref_bm))
     } else {
-        (targ_alleles, None::<Vec<f64>>, None::<selphi::common::HaplotypeBitmatrix>)
+        (targ_alleles, Vec::new(), None::<Vec<f64>>, None::<selphi::common::HaplotypeBitmatrix>)
     }
 }
 
@@ -580,6 +653,7 @@ pub fn run_multi_chr(
         n_ref_variants: usize,
         n_chip: usize,
         nocall: NoCallConf,
+        transforms: Vec<u8>,
     }
 
     // 6. Process each chromosome with prefetch overlap
@@ -614,11 +688,11 @@ pub fn run_multi_chr(
         selphi_info!("  [{}/{}] chr{}", chr_idx + 1, n_chr, chr_name);
 
         // Use prefetched data if available, otherwise load synchronously
-        let (srp, wgs_idx, _target_idx, targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip, nocall) =
+        let (srp, wgs_idx, target_idx, mut targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip, nocall, transforms) =
             if let Some(pre) = prefetch_result.take() {
                 selphi_info!("    (prefetched)");
                 (pre.srp, pre.wgs_idx, pre.target_idx, pre.targ_alleles,
-                 pre.raw_chip_cm, pre.chip_bps, pre.n_ref, pre.n_ref_variants, pre.n_chip, pre.nocall)
+                 pre.raw_chip_cm, pre.chip_bps, pre.n_ref, pre.n_ref_variants, pre.n_chip, pre.nocall, pre.transforms)
             } else {
                 // Synchronous load for first chromosome (or if prefetch was skipped)
                 match load_chr_data(&multi_srp, chr_name, &target_by_chr, &multi_map, n_haps, config.allele_match, mc_miss_val) {
@@ -633,11 +707,39 @@ pub fn run_multi_chr(
         }
         selphi_info!("    {} ref variants, {} shared markers", n_ref_variants, n_chip);
 
-        // Phasing (if needed)
+        // Pre-phasing passes, identical to the single-chr pipeline: the pedigree
+        // scaffold (--ped) and haploid handling. The latter is NOT flag-gated —
+        // chrX males are auto-detected — so before 2026-09-04 a whole-genome run
+        // left every male chrX het standing.
         let needs_phasing = !is_phased || config.force_phasing;
-        let (targ_alleles, em_ne_per_site, ref_bm_from_phasing) = phase_chr(
+        // Borrowed, never cloned: the per-chr genotype matrix is the largest
+        // per-chromosome object the target reader holds, and copying it here would
+        // add its whole size to the peak for the sake of two read-only passes.
+        let empty_geno: Vec<Vec<[u8; 2]>> = Vec::new();
+        let chr_genotypes: &[Vec<[u8; 2]>] = {
+            let key = chr_name.strip_prefix("chr").unwrap_or(chr_name);
+            target_by_chr.get(key).or_else(|| target_by_chr.get(chr_name))
+                .map(|(_, g)| g.as_slice()).unwrap_or(&empty_geno)
+        };
+        let ped_locked = crate::prephase::apply_pedigree_prephase(
+            config.ped.as_deref(), needs_phasing, &mut targ_alleles,
+            &sample_names, &target_idx, chr_genotypes,
+            n_chip, n_samples, n_haps, &transforms,
+        );
+        crate::prephase::apply_haploid_detection(
+            config.haploids.as_deref(), config.chrx_par, config.build,
+            needs_phasing, chr_name, &mut targ_alleles,
+            &sample_names, &target_idx, chr_genotypes,
+            n_chip, n_samples, n_haps, &chip_bps,
+            srp.variants.iter().map(|v| v.pos).max().unwrap_or(0),
+        );
+
+        // Phasing (if needed)
+        let ensemble_n = if needs_phasing { resolve_ensemble_n(config) } else { 1 };
+        let (targ_alleles, extra_phased, em_ne_per_site, ref_bm_from_phasing) = phase_chr(
             needs_phasing, &multi_map, chr_name, &srp, &wgs_idx, &raw_chip_cm,
-            &chip_bps, targ_alleles, n_chip, n_samples, n_ref, config,
+            &chip_bps, targ_alleles, n_chip, n_samples, n_ref, ensemble_n,
+            ped_locked.as_deref(), config,
         );
 
         // Ref bitmatrix for imputation
@@ -715,21 +817,25 @@ pub fn run_multi_chr(
         // avoids the admixed truncation bias).
         let precomp_bytes: u64 = (n_haps as u64) * (effective_mc as u64) * 4;
         let precomp_cap_bytes: u64 = 2 * 1024 * 1024 * 1024;
-        let precomputed_candidates: Option<Vec<Vec<u32>>> = if config.precompute_candidates && needs_phasing && precomp_bytes <= precomp_cap_bytes {
-            let coded_full = selphi::imputation::pbwt::build_coded_steps_bm(
-                &ref_bm_imp, 0, n_chip, n_ref, &targ_alleles, n_haps, &chip_cm, 0.05,
-            );
-            let max_cand = effective_mc;
-            let candidates: Vec<Vec<u32>> = (0..n_haps)
-                .into_par_iter()
-                .map(|tgt| {
-                    selphi::imputation::pbwt::select_candidates(&coded_full, n_ref + tgt, n_ref, max_cand)
-                })
-                .collect();
-            Some(candidates)
-        } else {
-            None
-        };
+        let precompute_on = config.precompute_candidates && needs_phasing && precomp_bytes <= precomp_cap_bytes;
+        let precomputed_candidates: Option<Vec<Vec<u32>>> = precompute_candidates_for(
+            precompute_on, &ref_bm_imp, &targ_alleles, &chip_cm, n_chip, n_ref, n_haps, effective_mc,
+        );
+
+        // Phase-ensemble members for this chromosome. Each carries its own
+        // scaffold, candidate set and cross-window prior state; their per-window
+        // Li-Stephens weights are folded into member 0's before interpolation, so
+        // the panel is still read and interpolated exactly once.
+        let mut ensemble_members: Vec<selphi::imputation::ensemble::Member> =
+            extra_phased.into_iter().map(|pa| {
+                let cand = precompute_candidates_for(
+                    precompute_on, &ref_bm_imp, &pa, &chip_cm, n_chip, n_ref, n_haps, effective_mc,
+                );
+                let tb = selphi::common::HaplotypeBitmatrix::from_byte_slice_all(
+                    n_chip, n_haps, &pa, n_haps);
+                selphi::imputation::ensemble::Member::new(
+                    tb, cand, final_ne_per_site.clone(), n_haps)
+            }).collect();
 
         // Spawn prefetch for NEXT chromosome (background I/O thread)
         let prefetch_handle: Option<std::thread::JoinHandle<Option<ChrPrefetchResult>>> =
@@ -758,7 +864,7 @@ pub fn run_multi_chr(
                     let srp = Arc::new(chr_view.into_srp_reader());
 
                     let (target_markers, target_genotypes) = next_target.as_ref()?;
-                    let (wgs_idx, target_idx, targ_alleles, chip_bps, n_chip, nocall) =
+                    let (wgs_idx, target_idx, targ_alleles, chip_bps, n_chip, nocall, transforms) =
                         prepare_chr_target(&srp, target_markers, target_genotypes, n_h, allele_match, mc_mv)?;
                     let (map_bp, map_cm) = next_map?;
                     let raw_chip_cm: Vec<f64> = chip_bps.iter().map(|&bp| {
@@ -767,7 +873,7 @@ pub fn run_multi_chr(
 
                     Some(ChrPrefetchResult {
                         srp, wgs_idx, target_idx, targ_alleles, raw_chip_cm, chip_bps,
-                        n_ref, n_ref_variants, n_chip, nocall,
+                        n_ref, n_ref_variants, n_chip, nocall, transforms,
                     })
                 }))
             } else {
@@ -838,7 +944,19 @@ pub fn run_multi_chr(
                     None, // multi-chr orchestrate.rs doesn't support batched streaming yet
                 )
             };
-            let all_weights = hmm_output.all_weights;
+            let mut all_weights = hmm_output.all_weights;
+            selphi::imputation::ensemble::fold_window(
+                &mut all_weights, &mut ensemble_members,
+                &selphi::imputation::ensemble::FoldContext {
+                    ref_bm: &ref_bm_imp,
+                    chip_cm: &chip_cm,
+                    site_conf_per_sample: nocall.as_ref().map(|(_, ps)| ps.as_slice()),
+                    n_samples,
+                    chip_start: window.chip_start,
+                    chip_end: window.chip_end,
+                },
+                &hmm_params,
+            );
 
             // Interpolation + output
             let preloaded_stripes = stripe_preload_handle.and_then(|h| h);

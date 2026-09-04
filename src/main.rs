@@ -17,6 +17,7 @@ mod autoroute;
 mod eval_run;
 mod imputation_pipeline;
 mod panel_phasing;
+mod prephase;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
