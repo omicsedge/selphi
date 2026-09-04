@@ -342,6 +342,9 @@ Built-in imputation accuracy evaluation against WGS truth genotypes: per-site an
 # Inline: add --truth to evaluate automatically after imputation (writes result.eval.json)
 selphi --refpanel reference.srp --input chip.vcf.gz --map genetic_map.map --out result --truth wgs_truth.vcf.gz
 
+# Whole-genome: the same inline flag on either multi-chromosome path
+selphi --refpanel all_chrs.srp --input whole_genome.vcf.gz --map-dir maps/ --out result --truth wgs_truth.vcf.gz
+
 # Standalone: evaluate an existing imputed file
 selphi --evaluate imputed.vcf.gz --truth wgs_truth.vcf.gz --out eval_results
 
@@ -367,7 +370,8 @@ below which the bins are structurally empty.
 By default `--homref-absent auto` inspects the truth: a complete callset (explicit `0/0`) scores
 matched sites only (legacy), while a variant-only truth scores absent sites as hom-ref (the standard
 imputation-R² convention). Contig names are matched tolerant to the `chr` prefix (so `22` ≡ `chr22`),
-and only samples shared between the imputed and truth files are scored. `--truth-raw` takes the
+and only samples shared between the imputed and truth files are scored. Sites are keyed by contig,
+position and alleles, so one whole-genome truth scores a multi-chromosome run in a single pass. `--truth-raw` takes the
 unfiltered truth: a site a sample carries in the raw call set but not in the quality-filtered `--truth`
 is dropped for that sample rather than mis-scored as hom-ref. `--exclude-sites` removes the typed
 (array) sites so only imputed variants are scored. In this mode sites are matched on exact
@@ -412,7 +416,7 @@ selphi --self-test --refpanel panel.srp --input target.vcf.gz --map chr.map --ou
 | `--map PATH` | Genetic map in PLINK format (single file or concatenated multi-chr) | required* |
 | `--out PATH` | Output path prefix | required |
 | `--threads N` | Number of threads | all CPUs |
-| `--truth PATH` | Truth VCF/BCF; auto-runs post-hoc evaluation after imputation | |
+| `--truth PATH` | Truth VCF/BCF; auto-runs post-hoc evaluation after imputation (single-chr and multi-chr alike) | |
 | `--engine ENGINE` | Imputation engine: `auto` (default, sniffs the target), `lcwgs`, `genotype`, or `refine` | `auto` |
 | `--phasing-engine ENGINE` | Phasing engine: `auto` (= diploid for all inputs), `haploid`, or `diploid` | `auto` |
 | `--phase-only` | Output phased haplotypes only (skip imputation) | off |
