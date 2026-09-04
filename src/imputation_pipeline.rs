@@ -1122,6 +1122,12 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
             selphi_info!("WARNING: --phase_only requested but input is already phased. Nothing to do.");
             return;
         }
+        // Say it out loud. A target whose GT are pipe-separated skips the phasing
+        // engine entirely, and the only prior hint was `phased=true` buried in the
+        // target line. That silence is how data/target/chr22_801s_chip_unphased.vcf.gz
+        // — pipes, despite the name — came to be used as the byte-identity gate for
+        // PHASING changes it could not possibly exercise.
+        selphi_step!("Input is already phased — phasing SKIPPED (pass --force-phasing to re-phase)");
         (targ_alleles, None, None, Vec::new(), None)
     };
 
