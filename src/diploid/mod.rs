@@ -12,6 +12,7 @@ pub mod cpp_rng;
 pub mod genotype_graph;
 pub mod pbwt_neighbor;
 pub mod ibd2_tracks;
+pub mod alpha_diag;
 pub mod hmm_segment;
 pub mod hmm_segment_f64;
 pub mod sampling;

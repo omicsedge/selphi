@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 
 use super::params::{HAP_NUMBER, ED, EE};
 use super::genotype_graph::*;
+use super::alpha_diag;
 use super::hmm_segment::{rare_dispatch_position_first, rare_dispatch_diag,
     DIAG_SKIP_WINDOW_HEAD, DIAG_SKIP_SEG_HEAD};
 
@@ -20,6 +21,8 @@ pub struct SegmentHmmF64 {
     alpha_sum_store: Vec<[f64; HAP_NUMBER]>,
     alpha_sum_sum_store: Vec<f64>,
     alpha_locus: Vec<usize>,
+    /// Segment's last locus; see the f32 twin.
+    alpha_locus_seg_end: Vec<usize>,
     h_probs: [f64; HAP_NUMBER * HAP_NUMBER],
     sum_h_probs: f64,
 }
@@ -36,6 +39,7 @@ impl SegmentHmmF64 {
             alpha_sum_store: Vec::new(),
             alpha_sum_sum_store: Vec::new(),
             alpha_locus: Vec::new(),
+            alpha_locus_seg_end: Vec::new(),
             h_probs: [0.0; HAP_NUMBER * HAP_NUMBER],
             sum_h_probs: 0.0,
         }
@@ -211,18 +215,20 @@ impl SegmentHmmF64 {
     }
 
     // -- ALPHA SAVE --
-    fn save_alpha(&mut self, seg_idx: usize, locus: usize) {
+    fn save_alpha(&mut self, seg_idx: usize, locus_updated: usize, locus_seg_end: usize) {
         let n = self.n_cond * HAP_NUMBER;
         while self.alpha_store.len() <= seg_idx {
             self.alpha_store.push(vec![0.0; n]);
             self.alpha_sum_store.push([0.0; HAP_NUMBER]);
             self.alpha_sum_sum_store.push(0.0);
             self.alpha_locus.push(0);
+            self.alpha_locus_seg_end.push(0);
         }
         self.alpha_store[seg_idx][..n].copy_from_slice(&self.prob[..n]);
         self.alpha_sum_store[seg_idx] = self.prob_sum_h;
         self.alpha_sum_sum_store[seg_idx] = self.prob_sum_t;
-        self.alpha_locus[seg_idx] = locus;
+        self.alpha_locus[seg_idx] = locus_updated;
+        self.alpha_locus_seg_end[seg_idx] = locus_seg_end;
     }
 
     // -- TRANSITION PARAMS --
@@ -268,11 +274,21 @@ impl SegmentHmmF64 {
         let alpha_sum = if seg_rel > 0 && seg_rel - 1 < self.alpha_sum_store.len() {
             self.alpha_sum_store[seg_rel-1]
         } else { [1.0/HAP_NUMBER as f64; HAP_NUMBER] };
-        let alpha_locus = self.alpha_locus.get(seg_rel-1).copied().unwrap_or(0);
+        let locus_updated = self.alpha_locus.get(seg_rel-1).copied().unwrap_or(0);
+        let locus_seg_end = self.alpha_locus_seg_end.get(seg_rel-1).copied().unwrap_or(locus_updated);
+        // SELPHI_DIPLOID_ALPHA_SEG_END=1 restores the pre-2026-09-03 label.
+        let alpha_locus = if alpha_diag::label_seg_end() { locus_seg_end } else { locus_updated };
 
         let (nt, yt) = self.transition_params_f64(
             backward_prev_locus, alpha_locus,
             trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+        if alpha_diag::diag() {
+            let (_, yt_fix) = self.transition_params_f64(backward_prev_locus, locus_updated,
+                trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+            let (_, yt_old) = self.transition_params_f64(backward_prev_locus, locus_seg_end,
+                trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+            alpha_diag::record_bridge(locus_updated, locus_seg_end, yt_fix, yt_old);
+        }
         let fact1 = nt / alpha_sum_sum.max(1e-300);
 
         self.h_probs = [0.0; HAP_NUMBER * HAP_NUMBER];
@@ -338,6 +354,7 @@ impl SegmentHmmF64 {
         self.alpha_sum_store = vec![[0.0; HAP_NUMBER]; n_segs];
         self.alpha_sum_sum_store = vec![0.0; n_segs];
         self.alpha_locus = vec![0; n_segs];
+        self.alpha_locus_seg_end = vec![0; n_segs];
 
         let mut abs_locus = graph.segment_start(seg_first);
         let mut abs_ambiguous = 0usize;
@@ -418,7 +435,10 @@ impl SegmentHmmF64 {
             self.sum_k();
             // Same as the f32 twin: label the Alpha with the locus that last updated
             // the state, not the segment's last locus. See hmm_segment.rs.
-            self.save_alpha(seg - seg_first, prev_abs);
+            self.save_alpha(seg - seg_first, prev_abs, abs_locus - 1);
+            if alpha_diag::diag() {
+                alpha_diag::record_label(prev_abs, abs_locus - 1, &hmm_params.cm_f32);
+            }
         }
     }
 

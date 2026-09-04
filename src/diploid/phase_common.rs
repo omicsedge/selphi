@@ -154,6 +154,9 @@ pub fn run_phase_common_bm(
         DIAG_SKIP_WINDOW_HEAD.store(0, Ordering::Relaxed);
         DIAG_SKIP_SEG_HEAD.store(0, Ordering::Relaxed);
     }
+    // SELPHI_DIPLOID_ALPHA_DIAG: how often, and by how much, the two Alpha locus
+    // labels disagree (see alpha_diag.rs).
+    if super::alpha_diag::diag() { super::alpha_diag::reset(); }
     let n_haps = n_samples * 2;
     let n_haps_total = n_ref + n_haps;
     let stages = expand_scheme(&parse_mcmc_scheme(scheme));
@@ -953,6 +956,7 @@ fn _run_iterations(
             DIAG_SKIP_WINDOW_HEAD.load(Ordering::Relaxed),
             DIAG_SKIP_SEG_HEAD.load(Ordering::Relaxed));
     }
+    if super::alpha_diag::diag() { super::alpha_diag::report(); }
 }
 
 #[cfg(test)]
