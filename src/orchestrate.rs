@@ -75,6 +75,7 @@ impl MultiChrImputeConfig {
     /// every other field is a verbatim copy of `args`, so both main.rs
     /// construction sites collapse to one call each (no field-drift risk).
     pub fn from_args(args: &crate::cli::Args, map_dir: Option<String>) -> Self {
+        warn_unsupported(args);
         Self {
             threads: args.threads,
             seed: args.seed,
@@ -109,6 +110,34 @@ impl MultiChrImputeConfig {
             chrx_par: args.chrx_par,
             eval: crate::eval_run::EvalRequest::from_args(args),
         }
+    }
+}
+
+/// Say out loud which flags this path does not honour.
+///
+/// `--truth` used to be one of these: accepted, then dropped without a word. The
+/// rest are still dropped, and a whole-genome run has no other way to find out —
+/// the flag parses, the run succeeds, and the output silently is not what was
+/// asked for. Only flags the user actually SET are listed, so a plain run stays
+/// quiet. `--vcf` and `--build` are deliberately absent: multi-chr already writes
+/// VCF.gz unless `--bcf`, and `--build` only feeds `--chrx-par`, which warns for
+/// itself.
+fn warn_unsupported(args: &crate::cli::Args) {
+    let mut dropped: Vec<&str> = Vec::new();
+    if args.phase_ensemble > 1 { dropped.push("--phase-ensemble (inter-run ensemble; the intra-run one still applies)"); }
+    if args.ped.is_some() { dropped.push("--ped (pedigree phase scaffolding)"); }
+    if args.haploids.is_some() { dropped.push("--haploids (explicit haploid sample list)"); }
+    if args.refine { dropped.push("--refine (GL-aware refinement)"); }
+    if args.local_ancestry { dropped.push("--local-ancestry"); }
+    if args.export_local_ancestry { dropped.push("--export-local-ancestry"); }
+    if args.panel_ancestry.is_some() { dropped.push("--panel-ancestry"); }
+    if args.target_ancestry.is_some() { dropped.push("--target-ancestry"); }
+    if args.max_windows > 0 { dropped.push("--max-windows"); }
+    if dropped.is_empty() { return; }
+    selphi_info!("  WARNING: the multi-chromosome path does not implement the following, \
+and they are being IGNORED — run per chromosome to use them:");
+    for d in dropped {
+        selphi_info!("             {}", d);
     }
 }
 
