@@ -166,10 +166,42 @@ impl PbwtWorkspace {
     }
 }
 
+/// One dense allele row per site, produced on demand.
+///
+/// The PBWT forward reads exactly one row at a time — site 0 up front, then
+/// site `var+1` after each step — so nothing in the algorithm needs the whole
+/// `n_var × m` byte matrix to exist. It did anyway, until 2026-09-05: every
+/// target built its own `reduced` array of `n_window_sites × n_candidates`
+/// BYTES, one byte per allele, and kept it in a thread-local sized to the
+/// largest target the thread had seen. `n_candidates` is the PBWT input set
+/// (up to `--max-candidates`, 132,676 on the auto setting against TOPMed), not
+/// the ~1,500 states left after match filtering, so on MESA 100 × TOPMed chr20
+/// that was 11,980 × ~132k = 1.59 GB PER THREAD — the entire thread-scaled part
+/// of the run's memory peak, measured at 1.78 GB/thread. Gathering the row on
+/// demand costs the same bit extractions the matrix build did, once each, and
+/// the values the kernel sees are the same bytes in the same order.
+pub trait AlleleRows {
+    /// Alleles (0/1) of all `m` haplotypes at site `var`, in haplotype order.
+    fn row(&mut self, var: usize) -> &[u8];
+}
+
+/// The historical dense `(n_var * m)` row-major byte array, as an `AlleleRows`.
+pub struct DenseRows<'a> {
+    pub alleles: &'a [u8],
+    pub m: usize,
+}
+
+impl AlleleRows for DenseRows<'_> {
+    #[inline]
+    fn row(&mut self, var: usize) -> &[u8] {
+        &self.alleles[var * self.m..(var + 1) * self.m]
+    }
+}
+
 /// PBWT forward pass using a pre-allocated workspace (zero allocations in hot path).
 pub fn pbwt_forward_with_workspace(
     ws: &mut PbwtWorkspace,
-    alleles: &[u8],
+    rows: &mut dyn AlleleRows,
     n_var: usize,
     m: usize,
     n_ref: usize,
@@ -184,7 +216,7 @@ pub fn pbwt_forward_with_workspace(
     let mut counts = vec![0i32; n_var];
 
     // Initial y
-    ws.y[..m].copy_from_slice(&alleles[..m]);
+    ws.y[..m].copy_from_slice(&rows.row(0)[..m]);
 
     for var in 0..n_var {
         let is_last = var >= n_var - 1;
@@ -237,9 +269,9 @@ pub fn pbwt_forward_with_workspace(
         pbwt_forwards_ad(&mut ws.a, &mut ws.a_inv, &mut ws.d, &ws.y, &mut ws.b, &mut ws.e, m, var);
 
         if var < n_var - 1 {
-            let row_base = (var + 1) * m;
+            let r = rows.row(var + 1);
             for i in 0..m {
-                ws.y[i] = alleles[row_base + ws.a[i] as usize];
+                ws.y[i] = r[ws.a[i] as usize];
             }
         }
     }
@@ -268,7 +300,8 @@ pub fn pbwt_forward_single(
     // by `pbwt_forward_single_matches_workspace`). Used by the rare full-panel
     // fallback in window_process, which has no per-thread workspace to reuse.
     let mut ws = PbwtWorkspace::new(m, n_ref);
-    pbwt_forward_with_workspace(&mut ws, alleles, n_var, m, n_ref, min_l, fl_fwd, target_abs)
+    let mut rows = DenseRows { alleles, m };
+    pbwt_forward_with_workspace(&mut ws, &mut rows, n_var, m, n_ref, min_l, fl_fwd, target_abs)
 }
 
 /// Insert a match into the sorted buffer at a specific variant position.
@@ -484,8 +517,9 @@ mod tests {
         }
 
         let mut ws = PbwtWorkspace::new(m, n_ref);
+        let mut rows = DenseRows { alleles: &alleles, m };
         let r_ws = pbwt_forward_with_workspace(
-            &mut ws, &alleles, n_var, m, n_ref, min_l, fl_fwd, target_abs,
+            &mut ws, &mut rows, n_var, m, n_ref, min_l, fl_fwd, target_abs,
         );
         let r_single = pbwt_forward_single(
             &alleles, n_var, m, n_ref, min_l, fl_fwd, target_abs,
@@ -658,7 +692,13 @@ pub fn select_candidates_weighted(
         return Vec::new();
     }
 
-    let mut seen = vec![false; n_ref];
+    // `seen` is an n_ref-wide mask (171k entries on TOPMed) that used to be
+    // allocated and zeroed per target. Thread-local, reset only where touched.
+    thread_local! {
+        static TL_SEEN: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let mut seen = TL_SEEN.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    if seen.len() < n_ref { seen.resize(n_ref, false); }
     let mut candidates = Vec::new();
 
     for s in 0..n_steps {
@@ -670,6 +710,8 @@ pub fn select_candidates_weighted(
             }
         }
     }
+    for &h in &candidates { seen[h as usize] = false; }
+    TL_SEEN.with(|c| { *c.borrow_mut() = seen; });
 
     // Ancestry rescoring: rank by (raw match count) × (ancestry multiplier).
     // Three regimes:
