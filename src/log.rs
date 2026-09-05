@@ -167,6 +167,21 @@ pub fn cpu_time_secs() -> f64 {
 }
 
 /// Peak resident set size in MB (Linux /proc/self/status).
+/// Current resident set (VmRSS, MB) — as opposed to `peak_mem_mb`'s high-water
+/// mark. For placing an allocation in time: the peak tells you how much, this
+/// tells you when.
+pub fn rss_mb() -> f64 {
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if line.starts_with("VmRSS:") {
+                let kb: f64 = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                return kb / 1024.0;
+            }
+        }
+    }
+    0.0
+}
+
 pub fn peak_mem_mb() -> f64 {
     // Linux: /proc/self/status VmHWM
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
@@ -299,18 +314,37 @@ fn compute_estimate_mb(
     let targ_mb = (n_chip * n_haps) as f64 / 1e6;
     let preload_mb = 500.0;
 
-    // HMM forward(f32) + backward(f64) scratch per thread, sized for one
-    // window. Window length ≈ window_cm / chip_cm × n_chip. Default
-    // window_cm=5 cM on a chr-scale chip (~70 cM) → roughly n_chip / 14 vars
-    // per window. State count is bounded by max_candidates.
-    // Empirical: at mc=132676 on MESA 5K chr20 the per-thread HMM scratch is
-    // ~1.5 GB and total HMM is ~24 GB at 16 threads — this formula matches.
+    // Per-thread (= per in-flight target) working set of the PBWT + HMM stage.
+    //
+    // Until 2026-09-05 this was `window_chip_vars * max_candidates * 12` and it
+    // was RIGHT: each target held an n_window_sites x n_candidates BYTE allele
+    // matrix for the PBWT (n_candidates saturates at max_candidates), plus two
+    // dense n_sites x n_states f32 HMM matrices — 1.75 GB/thread predicted,
+    // 1.78 measured on MESA 100 x TOPMed chr20. All three are gone: the PBWT
+    // gathers one allele row per site (pbwt::AlleleRows), the forward is
+    // sqrt(n)-checkpointed and the weights stream to CSR. What is left per
+    // thread is one allele row (m bytes), the PBWT workspace (five m-wide i32
+    // arrays + an n_ref-wide i64), the forward checkpoints (~2 sqrt(n_sites) x
+    // n_states f32) and the per-site match lists (~30 haps/site, four copies at
+    // worst). Measured after the change: the same rig peaks at 15.4 GB against
+    // 43.3 before, i.e. the thread-scaled term collapsed from ~1.78 GB to noise.
     let window_chip_vars = (n_chip / 14).clamp(100, 5000);
-    let hmm_per_thread_mb = (window_chip_vars * max_candidates.max(2500) * 12) as f64 / 1e6;
+    let m_cand = max_candidates.max(2500).min(n_ref) + n_haps;
+    let states_est_thread = (max_candidates.max(1) as f64).min(n_ref as f64).min(3000.0);
+    let hmm_per_thread_mb = (
+        m_cand as f64                                            // allele row (u8)
+        + 5.0 * m_cand as f64 * 4.0 + n_ref as f64 * 8.0        // PbwtWorkspace
+        + 2.0 * (window_chip_vars as f64).sqrt() * states_est_thread * 4.0  // fwd checkpoints
+        + window_chip_vars as f64 * 30.0 * 8.0 * 4.0             // match lists
+    ) / 1e6;
     let hmm_mb = n_threads as f64 * hmm_per_thread_mb;
 
     let n_chip_window = n_chip.min(15000);
-    let per_weights_mb = (n_chip_window as f64 * 4.0 + n_chip_window as f64 * 100.0 * 8.0) / 1e6;
+    // Kept CSR entries per chip row. Was 100; SELPHI_PRUNE_DIAG measures 14-29 on
+    // MESA 100/400 x TOPMed chr20 (mean_csr_nnz_per_row), and the 1/(n_states+1)
+    // threshold makes anything near 100 implausible. 32 is the honest upper end.
+    let csr_nnz_per_row = 32.0;
+    let per_weights_mb = (n_chip_window as f64 * 4.0 + n_chip_window as f64 * csr_nnz_per_row * 8.0) / 1e6;
     // With --sample-batch-size, weights and per-hap posterior are bounded to
     // one batch at a time (next batch starts only after the current one's
     // CSRs are streamed to its per-batch writer and dropped).
@@ -335,7 +369,11 @@ fn compute_estimate_mb(
     // Interpolation and VCF/BCF encode buffers scale with the in-flight hap
     // count (or sample count) and are also bounded by --sample-batch-size.
     let in_flight_samples = in_flight_haps / 2;
-    let interp_mb = (in_flight_haps * 1024 * 4 * stripes_per_batch) as f64 / 1e6;
+    // The interpolation batch is memory-CAPPED in io/pipeline.rs (mem_cap = 2 GiB
+    // over decompressed stripes + result tiles, stripes per batch adapt to n_haps),
+    // so this term cannot exceed that cap however large the cohort. The uncapped
+    // form (haps x 1024 x 4 x 300 stripes) over-counted by ~10 GB at 5,000 samples.
+    let interp_mb = ((in_flight_haps * 1024 * 4 * stripes_per_batch) as f64 / 1e6).min(2048.0);
     let vcf_mb = ((in_flight_samples as f64 * 12.0 * stripes_per_batch as f64 * 1024.0 * 2.0) / 1e6).min(2_000.0);
     let bgzf_mb = (n_threads as f64 * 64.0 * 1024.0) / 1e6;
     let thread_local_mb = n_threads as f64 * 20.0;
