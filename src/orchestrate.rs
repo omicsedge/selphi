@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use rayon::prelude::*;
-use selphi::{selphi_info, selphi_step, selphi_error};
+use selphi::{selphi_info, selphi_debug, selphi_step, selphi_error};
 use selphi::srp::MultiChrSrpReader;
 use selphi::io::target_io::{
     read_target_vcf_multi_chr, intersect_variants_for_chr, extract_target_alleles,
@@ -537,9 +537,10 @@ pub fn run_multi_chr(
 
     // SELPHI_INTERP_CM: read once here (never in the per-tile loops); the
     // per-chr cumulative-cM array is built inside the chromosome loop.
-    let interp_cm_enabled = selphi::config::is_one("SELPHI_INTERP_CM");
+    // Default since 2026-09-05 (see the single-chr twin); SELPHI_INTERP_RANK=1 opts out.
+    let interp_cm_enabled = !selphi::config::is_one("SELPHI_INTERP_RANK");
     if interp_cm_enabled {
-        selphi_step!("SELPHI_INTERP_CM: interpolating untyped sites in genetic distance (cM)");
+        selphi_debug!("Interpolating untyped sites in genetic distance (cM); SELPHI_INTERP_RANK=1 for variant rank");
     }
 
     // 3b. Refuse to silently impute a chromosome at cM=0. Every chromosome present

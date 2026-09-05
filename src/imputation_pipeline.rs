@@ -1010,10 +1010,14 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // flanking anchors (Beagle/IMPUTE5/minimac semantics) instead of variant
     // ordinal. Built once per chromosome; the knob is read once here (never in
     // the per-tile loops). None (default) keeps the rank-linear t byte-identical.
-    let interp_cum_cm: Option<Vec<f64>> = if selphi::config::is_one("SELPHI_INTERP_CM") {
+    // Default since 2026-09-05. Measured a uniform win on chr22-801 (every MAF bin
+    // up, none down, 2026-08-10) and never-regress on MESA 100 x TOPMed chr20
+    // (every bin >=, per-sample 0.899739 -> 0.899758); it is also what Beagle,
+    // IMPUTE5 and minimac do. SELPHI_INTERP_RANK=1 restores the rank-linear t.
+    let interp_cum_cm: Option<Vec<f64>> = if !selphi::config::is_one("SELPHI_INTERP_RANK") {
         let (map_bp_raw, map_cm_raw) = genmap::load_genetic_map_raw(Path::new(map_path))
             .unwrap_or_else(|e| { selphi_error!("Cannot read genetic map {}: {}", map_path, e); std::process::exit(1); });
-        selphi_step!("SELPHI_INTERP_CM: interpolating untyped sites in genetic distance (cM)");
+        selphi_debug!("Interpolating untyped sites in genetic distance (cM); SELPHI_INTERP_RANK=1 for variant rank");
         Some(genmap::cumulative_cm_floored(&map_bp_raw, &map_cm_raw, &ref_positions))
     } else { None };
 
@@ -1286,6 +1290,11 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         let t0_win = Instant::now();
         let cpu0_win = selphi::log::cpu_time_secs();
         let n_var_w = window.chip_end - window.chip_start;
+        // [MEM] markers (--debug): current RSS at each stage of the window, so a
+        // peak can be attributed to the stage that allocates it rather than
+        // inferred from the shape of the code — which has been wrong three
+        // times running on this path.
+        selphi_debug!("  [MEM] win{} start: rss={:.0} MB peak={:.0} MB", wi + 1, selphi::log::rss_mb(), selphi::log::peak_mem_mb());
 
 
         let t0_extract = Instant::now();
@@ -1484,6 +1493,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
             )
         };
         let mut all_weights = hmm_output.all_weights;
+        selphi_debug!("  [MEM] win{} after HMM (member 0): rss={:.0} MB peak={:.0} MB", wi + 1, selphi::log::rss_mb(), selphi::log::peak_mem_mb());
 
         // Phase-ensemble: re-run this window's HMM on each extra member's phased
         // scaffold and average the per-hap Li-Stephens weights with member 0's.
@@ -1522,6 +1532,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         // streamed to batch writers during HMM). Skip write_window_multiformat.
         let t0_interp = Instant::now();
 
+        selphi_debug!("  [MEM] win{} before interp/output: rss={:.0} MB peak={:.0} MB", wi + 1, selphi::log::rss_mb(), selphi::log::peak_mem_mb());
         if all_weights.is_empty() && batched_any_active {
             // Streaming path already wrote everything via callback; nothing to do here.
         } else {
