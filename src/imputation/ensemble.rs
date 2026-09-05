@@ -51,29 +51,61 @@ impl Member {
     }
 }
 
-/// Sum CSR `b` into `a` (column union, per-row left-fold f32 in member order),
-/// WITHOUT the 1/n divide. Members are accumulated one at a time (peak holds 2
-/// weight-sets, not N) and divided once at the end. The per-row f32 left-fold
-/// `((m0+m1)+m2)…` plus the single final ×(1/n) is byte-identical to a one-shot
-/// batch average.
+/// Sum CSR `b` into `a` (column union, per-row f32 add in member order), WITHOUT
+/// the 1/n divide. Members are accumulated one at a time (peak holds 2
+/// weight-sets, not N) and divided once at the end.
+///
+/// Rows are merged as two sorted runs. The previous version built a HashMap per
+/// row and sorted its contents, for every row of every target of every window —
+/// and since 2026-09-04 this runs by default on both pipelines. Output is
+/// bit-identical: a column present in one row only keeps its value exactly
+/// (the old `0.0 + v` was exact too), a column in both gets `a + b` in that
+/// order, and the result is ordered by column just as the old sort left it.
+/// Hap ids are unique within a row (states are distinct haplotypes and dedup
+/// groups are disjoint), which is what makes the merge equivalent; a row whose
+/// ids arrive out of column order (dedup-group expansion can do that) is sorted
+/// first.
 pub fn sum_csr_into(a: &CsrWeights, b: &CsrWeights) -> CsrWeights {
-    use std::collections::HashMap;
+    fn sorted_row(csr: &CsrWeights, r: usize, scratch: &mut Vec<(i32, f32)>) -> bool {
+        let (s, e) = (csr.indptr[r] as usize, csr.indptr[r + 1] as usize);
+        let idx = &csr.indices[s..e];
+        if idx.windows(2).all(|w| w[0] < w[1]) { return false; }
+        scratch.clear();
+        scratch.extend(idx.iter().copied().zip(csr.data[s..e].iter().copied()));
+        scratch.sort_unstable_by_key(|&(c, _)| c);
+        true
+    }
     let n_rows = a.n_rows;
     let n_cols = a.n_cols;
     let mut indptr = Vec::with_capacity(n_rows + 1);
+    let mut indices: Vec<i32> = Vec::with_capacity(a.indices.len() + b.indices.len());
+    let mut data: Vec<f32> = Vec::with_capacity(a.data.len() + b.data.len());
     indptr.push(0i32);
-    let mut indices: Vec<i32> = Vec::new();
-    let mut data: Vec<f32> = Vec::new();
-    let mut acc: HashMap<i32, f32> = HashMap::new();
+    let (mut sa, mut sb): (Vec<(i32, f32)>, Vec<(i32, f32)>) = (Vec::new(), Vec::new());
     for r in 0..n_rows {
-        acc.clear();
-        let (sa, ea) = (a.indptr[r] as usize, a.indptr[r + 1] as usize);
-        for k in sa..ea { *acc.entry(a.indices[k]).or_insert(0.0) += a.data[k]; }
-        let (sb, eb) = (b.indptr[r] as usize, b.indptr[r + 1] as usize);
-        for k in sb..eb { *acc.entry(b.indices[k]).or_insert(0.0) += b.data[k]; }
-        let mut row: Vec<(i32, f32)> = acc.iter().map(|(&c, &v)| (c, v)).collect();
-        row.sort_unstable_by_key(|&(c, _)| c);
-        for (c, v) in row { indices.push(c); data.push(v); }
+        // Borrow each row as (col, val) pairs, sorted; usually already sorted.
+        let ra: Vec<(i32, f32)>;
+        let rb: Vec<(i32, f32)>;
+        let ia: &[(i32, f32)] = if sorted_row(a, r, &mut sa) { &sa } else {
+            let (s, e) = (a.indptr[r] as usize, a.indptr[r + 1] as usize);
+            ra = a.indices[s..e].iter().copied().zip(a.data[s..e].iter().copied()).collect();
+            &ra
+        };
+        let ib: &[(i32, f32)] = if sorted_row(b, r, &mut sb) { &sb } else {
+            let (s, e) = (b.indptr[r] as usize, b.indptr[r + 1] as usize);
+            rb = b.indices[s..e].iter().copied().zip(b.data[s..e].iter().copied()).collect();
+            &rb
+        };
+        let (mut i, mut k) = (0usize, 0usize);
+        while i < ia.len() && k < ib.len() {
+            let (ca, va) = ia[i];
+            let (cb, vb) = ib[k];
+            if ca < cb { indices.push(ca); data.push(va); i += 1; }
+            else if cb < ca { indices.push(cb); data.push(vb); k += 1; }
+            else { indices.push(ca); data.push(va + vb); i += 1; k += 1; }
+        }
+        for &(c, v) in &ia[i..] { indices.push(c); data.push(v); }
+        for &(c, v) in &ib[k..] { indices.push(c); data.push(v); }
         indptr.push(indices.len() as i32);
     }
     CsrWeights { indptr, indices, data, n_rows, n_cols }

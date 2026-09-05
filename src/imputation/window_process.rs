@@ -157,6 +157,7 @@ pub fn impute_window(
         w
     };
     let targ_w: &[u8] = &targ_w_owned;
+    crate::selphi_debug!("  [MEM] impute_window: target unpacked: rss={:.0} MB", crate::log::rss_mb());
     let cm_w = &inputs.chip_cm[inputs.chip_start..inputs.chip_end];
 
     let coded = super::pbwt::build_coded_steps_bm(
@@ -188,13 +189,17 @@ pub fn impute_window(
         c[inputs.chip_start * ns..inputs.chip_end * ns].to_vec()
     });
 
-    process_window_hmm(
+    crate::selphi_debug!("  [MEM] impute_window: coded steps built ({} steps): rss={:.0} MB",
+        coded.starts.len().saturating_sub(1), crate::log::rss_mb());
+    let out = process_window_hmm(
         params, inputs.ref_bm, targ_w, cm_w,
         ne_w.as_deref(), conf_w.as_deref(), ns, &coded,
         precomputed_candidates,
         hap_priors, inputs.chip_start, n_var_w,
         on_batch_done,
-    )
+    );
+    crate::selphi_debug!("  [MEM] impute_window: HMM done: rss={:.0} MB", crate::log::rss_mb());
+    out
 }
 
 /// Callback invoked after each batch's HMM completes, when streaming mode is
@@ -276,6 +281,16 @@ pub fn process_window_hmm(
                 pbwt::select_candidates(coded, n_ref + tgt, n_ref, max_candidates)
             };
             let n_cand = candidates.len();
+            // First three targets only: the PBWT candidate-set size, i.e. the width
+            // of the per-thread `reduced` allele array below (n_var_w x n_cand bytes).
+            {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static N: AtomicUsize = AtomicUsize::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 3 {
+                    crate::selphi_debug!("  [PBWT-DEBUG] hap{}: n_cand={} (cap {}), reduced={} MB",
+                        tgt, n_cand, max_candidates, (n_var_w * (n_cand + 1)) / 1_000_000);
+                }
+            }
             // n_cand == 0 (no reference hap shares a coded-step group with this
             // target — likelier on small panels and dense targets) falls through
             // to the full-panel PBWT below, which ignores `candidates` entirely.
@@ -288,40 +303,51 @@ pub fn process_window_hmm(
             thread_local! {
                 static TL_RED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
             }
-            let mut reduced = TL_RED.with(|buf| {
+            // ONE allele row of scratch (m_red bytes), not n_var_w of them — see
+            // pbwt::AlleleRows for why the dense matrix this used to be was the
+            // thread-scaled part of the memory peak.
+            let row_buf = TL_RED.with(|buf| {
                 let mut b = buf.borrow_mut();
-                let needed = n_var_w * m_red;
-                if b.capacity() >= needed { b.clear(); b.resize(needed, 0u8); std::mem::take(&mut *b) }
-                else { vec![0u8; needed] }
+                if b.capacity() >= m_red { b.clear(); b.resize(m_red, 0u8); std::mem::take(&mut *b) }
+                else { vec![0u8; m_red] }
             });
 
             if is_full {
-                // Rare: n_cand < FULL_PANEL_HMM_THRESHOLD, need full ref+target array from bitmatrix.
-                for var in 0..n_var_w {
-                    let ci = chip_start + var;
-                    let row = ref_bm.row(ci);
-                    let dst_base = var * m;
-                    let ref_dst = &mut reduced[dst_base..dst_base + n_ref];
-                    for w in 0..ref_bm.n_words() {
-                        let mut word = row[w];
-                        let base = w * 64;
-                        while word != 0 {
-                            let k = word.trailing_zeros() as usize;
-                            let r = base + k;
-                            if r < n_ref { ref_dst[r] = 1; }
-                            word &= word - 1;
-                        }
-                    }
-                    reduced[dst_base + n_ref..dst_base + m]
-                        .copy_from_slice(&targ_w[var * n_haps..(var + 1) * n_haps]);
+                // Rare: n_cand < FULL_PANEL_HMM_THRESHOLD — run the PBWT over the whole
+                // panel plus the targets. Rows are gathered per site from the bitmatrix.
+                struct FullRows<'a> {
+                    bm: &'a HaplotypeBitmatrix, chip_start: usize, n_ref: usize,
+                    targ_w: &'a [u8], n_haps: usize, buf: Vec<u8>,
                 }
-                let fwd = pbwt::pbwt_forward_single(
-                    &reduced, n_var_w, m, n_ref, match_length, fl_fwd,
+                impl pbwt::AlleleRows for FullRows<'_> {
+                    fn row(&mut self, var: usize) -> &[u8] {
+                        let row = self.bm.row(self.chip_start + var);
+                        let n_ref = self.n_ref;
+                        self.buf[..n_ref].fill(0);
+                        for w in 0..self.bm.n_words() {
+                            let mut word = row[w];
+                            let base = w * 64;
+                            while word != 0 {
+                                let k = word.trailing_zeros() as usize;
+                                let r = base + k;
+                                if r < n_ref { self.buf[r] = 1; }
+                                word &= word - 1;
+                            }
+                        }
+                        let nh = self.n_haps;
+                        self.buf[n_ref..n_ref + nh].copy_from_slice(&self.targ_w[var * nh..(var + 1) * nh]);
+                        &self.buf[..n_ref + nh]
+                    }
+                }
+                let mut rows = FullRows { bm: ref_bm, chip_start, n_ref, targ_w, n_haps, buf: row_buf };
+                let mut ws_full = pbwt::PbwtWorkspace::new(m, n_ref);
+                let fwd = pbwt::pbwt_forward_with_workspace(
+                    &mut ws_full, &mut rows, n_var_w, m, n_ref, match_length, fl_fwd,
                     (n_ref + tgt) as i32,
                 );
                 let bwd = pbwt::backward_filter_single(&fwd, n_var_w, n_ref, fl_fwd, fl_bwd);
                 let csc = pbwt::build_csc_matrix(&bwd, n_ref, n_var_w, fl_bwd);
-                TL_RED.with(|buf| { *buf.borrow_mut() = reduced; });
+                TL_RED.with(|buf| { *buf.borrow_mut() = rows.buf; });
                 return (tgt, super::hmm::calculate_weights(
                     &csc, cm_w, &breaks_w, n_ref,
                     est_ne, p_err,
@@ -331,16 +357,25 @@ pub fn process_window_hmm(
                 ));
             }
 
-            // Common path: build reduced array from bitmatrix + targ_w
-            for var in 0..n_var_w {
-                let ci = chip_start + var;
-                let row = ref_bm.row(ci);
-                let dst = var * m_red;
-                for (i, &c) in candidates.iter().enumerate() {
-                    reduced[dst + i] = ((row[c as usize / 64] >> (c as usize % 64)) & 1) as u8;
-                }
-                reduced[dst + n_cand] = targ_w[var * n_haps + tgt];
+            // Common path: the candidates' alleles plus the target's, gathered from the
+            // bitmatrix one site at a time as the PBWT asks for them.
+            struct GatherRows<'a> {
+                bm: &'a HaplotypeBitmatrix, chip_start: usize, candidates: &'a [u32],
+                targ_w: &'a [u8], n_haps: usize, tgt: usize, buf: Vec<u8>,
             }
+            impl pbwt::AlleleRows for GatherRows<'_> {
+                #[inline]
+                fn row(&mut self, var: usize) -> &[u8] {
+                    let row = self.bm.row(self.chip_start + var);
+                    for (i, &c) in self.candidates.iter().enumerate() {
+                        self.buf[i] = ((row[c as usize / 64] >> (c as usize % 64)) & 1) as u8;
+                    }
+                    let n_cand = self.candidates.len();
+                    self.buf[n_cand] = self.targ_w[var * self.n_haps + self.tgt];
+                    &self.buf[..n_cand + 1]
+                }
+            }
+            let mut rows = GatherRows { bm: ref_bm, chip_start, candidates: &candidates, targ_w, n_haps, tgt, buf: row_buf };
 
             thread_local! {
                 static WS: std::cell::RefCell<Option<pbwt::PbwtWorkspace>> =
@@ -350,13 +385,13 @@ pub fn process_window_hmm(
                 let mut ws_opt = ws_cell.borrow_mut();
                 let ws = ws_opt.get_or_insert_with(|| pbwt::PbwtWorkspace::new(m_red, n_cand));
                 if ws.capacity() < m_red { *ws = pbwt::PbwtWorkspace::new(m_red, n_cand); }
-                pbwt::pbwt_forward_with_workspace(ws, &reduced, n_var_w, m_red, n_cand, match_length, fl_fwd, n_cand as i32)
+                pbwt::pbwt_forward_with_workspace(ws, &mut rows, n_var_w, m_red, n_cand, match_length, fl_fwd, n_cand as i32)
             });
             let bwd = pbwt::backward_filter_single(&fwd, n_var_w, n_cand, fl_fwd, fl_bwd);
             let mut csc = pbwt::build_csc_matrix(&bwd, n_cand, n_var_w, fl_bwd);
 
-            TL_RED.with(|buf| { *buf.borrow_mut() = reduced; });
-            // CSC indices are positions in reduced[0..n_cand] — remap to absolute haplotype IDs.
+            TL_RED.with(|buf| { *buf.borrow_mut() = rows.buf; });
+            // CSC indices are positions in the candidate list — remap to absolute haplotype IDs.
             for idx in &mut csc.indices {
                 debug_assert!((*idx as usize) < candidates.len(),
                     "CSC index {} out of bounds for {} candidates", idx, candidates.len());
