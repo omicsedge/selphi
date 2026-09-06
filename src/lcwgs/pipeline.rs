@@ -503,18 +503,11 @@ fn run_chunked_gibbs(
     // independent (disjoint core output; run_gibbs is deterministic, keyed only by
     // chunk-local indices) so parallel chunks are BIT-IDENTICAL to sequential.
     let process_chunk = |c: usize| -> Option<(usize, usize, usize, super::iterate::GibbsOutput)> {
-        let core_lo_cm = cm[0] + c as f64 * core_cm;
-        let core_hi_cm = core_lo_cm + core_cm;
-        let buf_lo_cm = core_lo_cm - buffer_cm;
-        let buf_hi_cm = core_hi_cm + buffer_cm;
-
-        // Variant index ranges (buffer = HMM window, core = kept output).
-        let buf_start = cm.partition_point(|&x| x < buf_lo_cm);
-        let buf_end = cm.partition_point(|&x| x < buf_hi_cm); // exclusive
-        if buf_end <= buf_start { return None; }
-        let core_start = cm.partition_point(|&x| x < core_lo_cm);
-        let core_end = cm.partition_point(|&x| x < core_hi_cm); // exclusive
-        if core_end <= core_start { return None; }
+        let (core, buffer) = super::chunk_ranges::chunk_ranges(
+            cm, c, n_chunks, core_cm, buffer_cm,
+        )?;
+        let (core_start, core_end) = (core.start, core.end);
+        let (buf_start, buf_end) = (buffer.start, buffer.end);
 
         let chunk_n = buf_end - buf_start;
         // Slice gl3 + cm for the buffer window
@@ -658,65 +651,56 @@ fn run_chunked_gibbs(
     // Panel part of a chunk ≈ ref_bm (chunk_n × ceil(n_ref/64) × 8) × ~1.9
     // (RefHapSet + PBWT scratch + HMM + allocator overhead; calibrated to RSS).
     let panel_chunk_gb = (avg_chunk_n * n_ref.div_ceil(64) * 8) as f64 / 1e9 * 1.9;
-    let run_waves = |first: usize, max_live: usize| -> Vec<Option<(usize, usize, usize, super::iterate::GibbsOutput)>> {
+    // Merge and release completed outputs after each wave. Retaining earlier
+    // waves defeats the live-chunk memory budget, especially with many samples.
+    let mut merge_chunk = |result: Option<(usize, usize, usize, super::iterate::GibbsOutput)>| {
+        if let Some((core_start, core_end, buf_start, out)) = result {
+            let dst = core_start * n_samples .. core_end * n_samples;
+            let src = (core_start - buf_start) * n_samples .. (core_end - buf_start) * n_samples;
+            dosage[dst.clone()].copy_from_slice(&out.dosage[src.clone()]);
+            gp[dst.start * 3 .. dst.end * 3].copy_from_slice(&out.gp[src.start * 3 .. src.end * 3]);
+        }
+    };
+    let run_waves = |first: usize, max_live: usize, merge: &mut dyn FnMut(Option<(usize, usize, usize, super::iterate::GibbsOutput)>)| {
         use rayon::prelude::*;
-        let mut results = Vec::with_capacity(n_chunks - first);
         let mut start = first;
         while start < n_chunks {
             let end = (start + max_live).min(n_chunks);
             let wave: Vec<_> = (start..end).into_par_iter().map(&process_chunk).collect();
-            results.extend(wave);
+            for result in wave { merge(result); }
             start = end;
         }
-        results
     };
-    let chunk_results: Vec<Option<(usize, usize, usize, super::iterate::GibbsOutput)>> =
-        if few_samples {
-            let budget_gb = crate::config::f64_or("LCWGS_MEM_BUDGET_GB", 2.5);
-            let max_live = ((budget_gb / panel_chunk_gb.max(1e-9)).floor() as usize)
-                .clamp(1, n_chunks.min(threads));
-            crate::selphi_info!(
-                "  chunk parallelism: {} live (budget {:.1} GB, ~{:.2} GB/chunk)",
-                max_live, budget_gb, panel_chunk_gb);
-            run_waves(0, max_live)
-        } else if n_chunks > 1 {
-            let budget_gb = crate::config::f64_opt("LCWGS_MEM_BUDGET_GB")
-                .unwrap_or_else(|| (crate::log::system_ram_mb() / 1024.0 * 0.5).max(2.5));
-            let hwm_before = (crate::log::peak_mem_mb() / 1024.0).max(rss_gb());
-            let first = process_chunk(0);
-            let hwm_after = crate::log::peak_mem_mb() / 1024.0;
-            let measured_gb = hwm_after - hwm_before;
-            // Fallback when the high-water mark did not move (an earlier stage
-            // peaked higher): panel part + a per-sample term calibrated on a
-            // 12-sample chr22 run (~5 KB per sample per site at peak).
-            let est_gb = panel_chunk_gb + 5.0e-6 * n_samples as f64 * avg_chunk_n as f64;
-            let per_chunk_gb = if measured_gb > 0.05 { measured_gb } else { est_gb };
-            let max_live = ((budget_gb / per_chunk_gb.max(1e-9)).floor() as usize)
-                .clamp(1, (n_chunks - 1).min(threads));
-            crate::selphi_info!(
-                "  chunk parallelism: calibrated on chunk 1 → {:.2} GB/chunk ({}); {} live for the remaining {} (budget {:.1} GB)",
-                per_chunk_gb, if measured_gb > 0.05 { "measured" } else { "estimated" }, max_live, n_chunks - 1, budget_gb);
-            let mut results = vec![first];
-            results.extend(run_waves(1, max_live));
-            results
-        } else {
-            vec![process_chunk(0)]
-        };
-
-    // Merge each chunk's CORE dosage + GP into the global output (in index order).
-    for (core_start, core_end, buf_start, out) in chunk_results.into_iter().flatten() {
-        for v in core_start..core_end {
-            let local_v = v - buf_start;
-            for s in 0..n_samples {
-                dosage[v * n_samples + s] = out.dosage[local_v * n_samples + s];
-                let g_dst = (v * n_samples + s) * 3;
-                let g_src = (local_v * n_samples + s) * 3;
-                gp[g_dst]     = out.gp[g_src];
-                gp[g_dst + 1] = out.gp[g_src + 1];
-                gp[g_dst + 2] = out.gp[g_src + 2];
-            }
-        }
-    }
+    if few_samples {
+        let budget_gb = crate::config::f64_or("LCWGS_MEM_BUDGET_GB", 2.5);
+        let max_live = ((budget_gb / panel_chunk_gb.max(1e-9)).floor() as usize)
+            .clamp(1, n_chunks.min(threads));
+        crate::selphi_info!(
+            "  chunk parallelism: {} live (budget {:.1} GB, ~{:.2} GB/chunk)",
+            max_live, budget_gb, panel_chunk_gb);
+        run_waves(0, max_live, &mut merge_chunk)
+    } else if n_chunks > 1 {
+        let budget_gb = crate::config::f64_opt("LCWGS_MEM_BUDGET_GB")
+            .unwrap_or_else(|| (crate::log::system_ram_mb() / 1024.0 * 0.5).max(2.5));
+        let hwm_before = (crate::log::peak_mem_mb() / 1024.0).max(rss_gb());
+        let first = process_chunk(0);
+        let hwm_after = crate::log::peak_mem_mb() / 1024.0;
+        let measured_gb = hwm_after - hwm_before;
+        // Fallback when the high-water mark did not move (an earlier stage
+        // peaked higher): panel part + a per-sample term calibrated on a
+        // 12-sample chr22 run (~5 KB per sample per site at peak).
+        let est_gb = panel_chunk_gb + 5.0e-6 * n_samples as f64 * avg_chunk_n as f64;
+        let per_chunk_gb = if measured_gb > 0.05 { measured_gb } else { est_gb };
+        let max_live = ((budget_gb / per_chunk_gb.max(1e-9)).floor() as usize)
+            .clamp(1, (n_chunks - 1).min(threads));
+        crate::selphi_info!(
+            "  chunk parallelism: calibrated on chunk 1 → {:.2} GB/chunk ({}); {} live for the remaining {} (budget {:.1} GB)",
+            per_chunk_gb, if measured_gb > 0.05 { "measured" } else { "estimated" }, max_live, n_chunks - 1, budget_gb);
+        merge_chunk(first);
+        run_waves(1, max_live, &mut merge_chunk)
+    } else {
+        merge_chunk(process_chunk(0));
+    };
 
     (dosage, gp)
 }

@@ -26,6 +26,51 @@ use crate::imputation::window_process::{ImputeWindowInputs, WindowHmmParams, imp
 /// batch they were computed in.
 const STREAM_CHUNK: usize = 256;
 
+/// How many phase-ensemble members to average, given the cohort size.
+///
+/// The ensemble costs N x the per-target HMM and nothing else, so its price is
+/// the HMM's share of the wall — and that share grows with the cohort until the
+/// HMM *is* the wall. Measured: +25-30% on chr22 x 801 samples, +72% on
+/// chr21+chr22 x 801, and ~+90% on MESA 5,000 x TOPMed, where window 1 spent
+/// 11,949 s in the HMM against 999 s of interpolation and output. What it buys
+/// does not grow the same way: +0.005 R2 on a 6-sample chip array, +0.0023 on
+/// 801 samples across two chromosomes.
+///
+/// `SELPHI_ENSEMBLE_MAX_SAMPLES` caps it: above that cohort size the default
+/// drops to a single member. It is **0 (no cap) by default**, deliberately. I
+/// built it to default to 1,000 and the very next measurement undermined that:
+/// the unbatched 5,000-sample run with 2 members scored OVERALL 0.6209 against
+/// 0.6148 for July's single-member run — which is a confounded comparison (that
+/// run was batched, on an older evaluator, with rank interpolation) but is the
+/// only evidence there is, and it points the wrong way for capping. The clean
+/// control, same binary and evaluator with one member, has not been run. Until
+/// it has, the default keeps the accuracy and the run says out loud what the
+/// ensemble is costing.
+///
+/// An explicit `SELPHI_DIPLOID_INTRA_N` or `--phase-ensemble` overrides the cap
+/// either way — asking for members is taken at face value.
+///
+/// Note what the cap replaced: until 2026-09-06 the only gate was
+/// `--sample-batch-size`, which forces 1 because streaming output cannot hold N
+/// weight sets. At biobank scale you HAD to batch, so you got 1 by accident.
+/// Once the memory work of 2026-09-05/06 made an unbatched 5,000-sample run fit,
+/// that implicit gate stopped firing.
+/// `phase_ensemble`: `--phase-ensemble N`; > 1 is an explicit request and wins.
+/// `forced_single`: true under `--sample-batch-size` or `--phase-only` — 1, no choice.
+pub fn resolve_members(n_samples: usize, phase_ensemble: usize, forced_single: bool) -> usize {
+    if forced_single { return 1; }
+    if phase_ensemble > 1 { return phase_ensemble; }
+    let explicit = crate::config::usize_opt("SELPHI_DIPLOID_INTRA_N");
+    if let Some(n) = explicit { return n.max(1); }
+    let cap = crate::config::usize_or("SELPHI_ENSEMBLE_MAX_SAMPLES", 0);
+    if cap > 0 && n_samples > cap { 1 } else { 2 }
+}
+
+/// Cohort size above which a 2-member ensemble roughly doubles the wall, because
+/// by then the per-target map is the whole runtime. Only used to decide whether
+/// to say so on the log.
+pub const ENSEMBLE_COSTLY_ABOVE: usize = 1000;
+
 /// One extra ensemble member's imputation inputs, all derived from a single
 /// phased scaffold. Member 0 uses the run's primary locals; extras live here.
 pub struct Member {
