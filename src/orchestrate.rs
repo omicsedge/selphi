@@ -307,10 +307,10 @@ fn load_maps(
 /// Until 2026-09-04 this path had no ensemble at all — not even the default
 /// intra-run one — so a whole-genome run was systematically worse than the same
 /// chromosomes imputed one at a time, for no reason the user could see.
-fn resolve_ensemble_n(config: &MultiChrImputeConfig) -> usize {
-    if config.target_batch_size > 0 { return 1; }
-    let intra_default = selphi::config::usize_or("SELPHI_DIPLOID_INTRA_N", 2).max(1);
-    if config.phase_ensemble > 1 { config.phase_ensemble } else { intra_default }
+fn resolve_ensemble_n(config: &MultiChrImputeConfig, n_samples: usize) -> usize {
+    selphi::imputation::ensemble::resolve_members(
+        n_samples, config.phase_ensemble, config.target_batch_size > 0,
+    )
 }
 
 /// Chromosome-wide PBWT candidate precompute for one phased scaffold. Factored
@@ -741,7 +741,7 @@ pub fn run_multi_chr(
         );
 
         // Phasing (if needed)
-        let ensemble_n = if needs_phasing { resolve_ensemble_n(config) } else { 1 };
+        let ensemble_n = if needs_phasing { resolve_ensemble_n(config, n_samples) } else { 1 };
         let (targ_alleles, extra_phased, em_ne_per_site, ref_bm_from_phasing) = phase_chr(
             needs_phasing, &multi_map, chr_name, &srp, &wgs_idx, &raw_chip_cm,
             &chip_bps, targ_alleles, n_chip, n_samples, n_ref, ensemble_n,
