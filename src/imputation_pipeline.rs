@@ -968,7 +968,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // initialised to args.threads in main.rs).
     let needs_phasing_estimate = !is_phased || args.force_phasing;
     let _effective_threads = selphi::log::estimate_and_warn_with_mc(
-        n_chip, n_ref, n_samples, args.threads, effective_mc,
+        n_chip, n_ref, srp.n_variants(), n_samples, args.threads, effective_mc,
         target_batch_size_haps_estimate, needs_phasing_estimate,
     );
 

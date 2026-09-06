@@ -90,29 +90,6 @@ impl WindowSetup<'_> {
     }
 }
 
-/// Partition `intervals` into contiguous batches each spanning at most
-/// `max_stripes_per_batch` tile stripes; returns `(start, end_excl)` index
-/// ranges. Shared by the non-batched multiformat path and the batched driver —
-/// only the per-caller stripe cap differs.
-pub(crate) fn partition_intervals(intervals: &[Interval], max_stripes_per_batch: usize) -> Vec<(usize, usize)> {
-    use crate::srp::TILE_ROWS;
-    let mut batches: Vec<(usize, usize)> = Vec::new();
-    if intervals.is_empty() { return batches; }
-    let mut bstart = 0;
-    let mut b_first_stripe = intervals[0].wgs_start / TILE_ROWS;
-    for i in 0..intervals.len() {
-        let iv_last = if intervals[i].wgs_end > 0 { (intervals[i].wgs_end - 1) / TILE_ROWS } else { b_first_stripe };
-        let n_stripes = iv_last - b_first_stripe + 1;
-        if n_stripes > max_stripes_per_batch && i > bstart {
-            batches.push((bstart, i));
-            bstart = i;
-            b_first_stripe = intervals[i].wgs_start / TILE_ROWS;
-        }
-    }
-    if bstart < intervals.len() { batches.push((bstart, intervals.len())); }
-    batches
-}
-
 /// Build interpolation intervals for the owned portion of a window.
 pub(crate) fn build_intervals(
     win_chip_start: usize,
@@ -372,8 +349,11 @@ pub fn setup_vcf_writer(
     let writer_handle = std::thread::spawn(move || -> std::io::Result<()> {
         let mut writer = BufWriter::with_capacity(4 << 20, bgzf_writer);
         // Collect record metadata for post-write index building
-        let mut record_meta: Vec<(String, i64, i64)> = Vec::new(); // (chrom, pos_0based, rlen)
+        let mut record_meta: Vec<crate::srp::csi::TbiRec> = Vec::new();
         let mut contig_names: Vec<String> = Vec::new();
+        // Contig resolved once per run of identical chrom bytes, not per record.
+        let mut last_chrom: Vec<u8> = Vec::new();
+        let mut last_ref_id: u32 = 0;
 
         for buf in rx {
             // Scan for record metadata while writing
@@ -388,11 +368,16 @@ pub fn setup_vcf_writer(
                         if b == b'\t' { if nt < 4 { tabs[nt] = i; } nt += 1; if nt >= 4 { break; } }
                     }
                     if nt >= 4 {
-                        let chrom = std::str::from_utf8(&line[..tabs[0]]).unwrap_or("").to_string();
+                        let chrom = &line[..tabs[0]];
+                        if chrom != last_chrom.as_slice() {
+                            last_chrom.clear();
+                            last_chrom.extend_from_slice(chrom);
+                            last_ref_id = crate::srp::csi::tbi_ref_id(&contig_names, chrom);
+                        }
                         let pos: i64 = std::str::from_utf8(&line[tabs[0]+1..tabs[1]])
                             .unwrap_or("0").parse().unwrap_or(0) - 1;
-                        let rlen = (tabs[3] - tabs[2] - 1).max(1) as i64;
-                        record_meta.push((chrom, pos, rlen));
+                        let rlen = (tabs[3] - tabs[2] - 1).max(1) as u32;
+                        record_meta.push(crate::srp::csi::TbiRec { pos, rlen, ref_id: last_ref_id });
                     }
                 } else if line.starts_with(b"##contig=<ID=") {
                     let s = b"##contig=<ID=".len();
@@ -1153,32 +1138,69 @@ pub fn write_window_multiformat(
         let stripe_preload_batch = (comp_mem_cap / stripe_comp.max(1)).max(10)
             .min(window_last_stripe - window_first_stripe + 1);
 
-        // Partition intervals into memory-bounded batches
+        // Partition the window's TILES — not its intervals — into memory-bounded
+        // batches. A tile is interpolated from the stripes that cover it and from
+        // its interval's two anchor weight rows, nothing else, so a batch boundary
+        // inside an interval is exact. Batching by interval, as this did until
+        // 2026-09-06, let one interval become one batch however long it was: the
+        // chip gap spanning the chr20 centromere against TOPMed is ~1M panel
+        // variants = 993 stripes against a 96-stripe cap, and that single batch
+        // held 5.6 GB of decompressed stripes, 1.5 GB of compressed preload and
+        // n_haps × 4 MB of result tiles at once. It was the run's memory peak —
+        // and 8 MB per SAMPLE of the per-sample slope — on a 100-sample run.
         let decomp_tile_bytes: usize = 500 * 1024;
         let bytes_per_stripe = n_tile_cols * decomp_tile_bytes;
         let result_bytes_per_stripe = setup.n_haps * TILE_ROWS * 4;
         let mem_cap: usize = 2 * 1024 * 1024 * 1024;
         let max_stripes_per_batch = (mem_cap / (bytes_per_stripe + result_bytes_per_stripe).max(1)).max(4);
 
-        let batches = partition_intervals(&setup.intervals, max_stripes_per_batch);
-
-        let batch_stripe_ranges: Vec<(usize, usize, usize)> = batches.iter().map(|&(bs, be)| {
-            let ivs = &setup.intervals[bs..be];
-            let fs = ivs[0].wgs_start / TILE_ROWS;
-            let ls = { let e = ivs.last().unwrap().wgs_end; if e > 0 { (e - 1) / TILE_ROWS } else { fs } };
-            (fs, ls, ls - fs + 1)
-        }).collect();
+        #[allow(clippy::upper_case_acronyms)]
+        struct BTD { iv: usize, ts: usize, tile_n: usize, gs: usize, ws: usize, we: usize, full_range: f32, iv_end: usize, last: bool }
+        let mut all_descs: Vec<BTD> = Vec::new();
+        for (iv_idx, iv) in setup.intervals.iter().enumerate() {
+            let n = iv.wgs_end - iv.wgs_start;
+            let mut ts = 0usize;
+            while ts < n {
+                let tn = (n - ts).min(tile_size);
+                all_descs.push(BTD { iv: iv_idx, ts, tile_n: tn, gs: iv.wgs_start + ts,
+                    ws: iv.weight_s, we: iv.weight_e, full_range: n as f32, iv_end: iv.wgs_end,
+                    last: ts + tn == n });
+                ts += tn;
+            }
+        }
+        let desc_stripes = |d: &BTD| (d.gs / TILE_ROWS, (d.gs + d.tile_n - 1) / TILE_ROWS);
+        // (first desc, end desc, first stripe, last stripe) per batch.
+        let batches: Vec<(usize, usize, usize, usize)> = {
+            let mut v = Vec::new();
+            let mut bs = 0usize;
+            let mut fs = 0usize;
+            for (i, d) in all_descs.iter().enumerate() {
+                let (dfs, dls) = desc_stripes(d);
+                if i == bs { fs = dfs; }
+                if dls - fs + 1 > max_stripes_per_batch && i > bs {
+                    let (_, pls) = desc_stripes(&all_descs[i - 1]);
+                    v.push((bs, i, fs, pls));
+                    bs = i;
+                    fs = dfs;
+                }
+            }
+            if bs < all_descs.len() {
+                let (_, ls) = desc_stripes(&all_descs[all_descs.len() - 1]);
+                v.push((bs, all_descs.len(), fs, ls));
+            }
+            v
+        };
 
         let mut stripe_loaded: Option<crate::srp::tiled::PreloadedStripes> = preloaded_stripes;
         let mut next_io_handle: Option<std::thread::JoinHandle<std::io::Result<crate::srp::tiled::PreloadedStripes>>> = None;
 
-        #[allow(clippy::upper_case_acronyms)]
-        struct BTD { ts: usize, tile_n: usize, gs: usize, ws: usize, we: usize, full_range: f32, iv_end: usize }
+        // Intervals are visited in order for chip-gap emission. Those that own no
+        // tile (zero length) are flushed when the next interval's first tile is
+        // reached, or at the end — the same points the interval-batched loop hit.
+        let mut iv_cursor = 0usize;
 
-        for (bi, &(bstart, bend)) in batches.iter().enumerate() {
-            let batch_ivs = &setup.intervals[bstart..bend];
-            if batch_ivs.is_empty() { continue; }
-            let (b_first_stripe, b_last_stripe, b_n_stripes) = batch_stripe_ranges[bi];
+        for (bi, &(d0, d1, b_first_stripe, b_last_stripe)) in batches.iter().enumerate() {
+            let b_n_stripes = b_last_stripe - b_first_stripe + 1;
 
             // Load compressed stripe data
             let loaded_ok = stripe_loaded.as_ref().is_some_and(|l|
@@ -1203,7 +1225,8 @@ pub fn write_window_multiformat(
 
             // Background I/O for next batch
             if bi + 1 < batches.len() {
-                let (next_fs, next_ls, next_ns) = batch_stripe_ranges[bi + 1];
+                let (_, _, next_fs, next_ls) = batches[bi + 1];
+                let next_ns = next_ls - next_fs + 1;
                 if !loaded.contains_stripe(next_fs) || !loaded.contains_stripe(next_ls) {
                     let tiled_path = tiled.file_path().to_path_buf();
                     let n_v = n_tiled_variants;
@@ -1217,6 +1240,11 @@ pub fn write_window_multiformat(
                 }
             }
 
+            crate::selphi_debug!("  [MEM] interp batch {}/{}: {} stripes, cap {} stripes/batch, stripe buf {} MB, all_tiles will be {} MB: rss={:.0} MB",
+                bi + 1, batches.len(), b_n_stripes, max_stripes_per_batch,
+                loaded.buf.len() / 1_000_000,
+                (b_n_stripes * TILE_ROWS * setup.n_haps * 4) / 1_000_000,
+                crate::log::rss_mb());
             // Decompress stripes
             let stripe_tiles: Vec<Vec<crate::srp::SparseTile>> = (0..b_n_stripes)
                 .into_par_iter()
@@ -1226,25 +1254,9 @@ pub fn write_window_multiformat(
                 })
                 .collect();
 
-            // Build tile descriptors + parallel interpolation
-            let mut all_descs: Vec<BTD> = Vec::new();
-            let mut desc_counts: Vec<usize> = Vec::with_capacity(batch_ivs.len());
-            for iv in batch_ivs {
-                let n = iv.wgs_end - iv.wgs_start;
-                if n == 0 { desc_counts.push(0); continue; }
-                let mut cnt = 0;
-                let mut ts = 0;
-                while ts < n {
-                    let tn = (n - ts).min(tile_size);
-                    all_descs.push(BTD { ts, tile_n: tn, gs: iv.wgs_start + ts,
-                        ws: iv.weight_s, we: iv.weight_e, full_range: n as f32, iv_end: iv.wgs_end });
-                    ts += tn;
-                    cnt += 1;
-                }
-                desc_counts.push(cnt);
-            }
-
-            let all_tiles: Vec<Vec<f32>> = all_descs.par_iter().map(|desc| {
+            // Parallel interpolation of this batch's tiles
+            let batch_descs = &all_descs[d0..d1];
+            let all_tiles: Vec<Vec<f32>> = batch_descs.par_iter().map(|desc| {
                 // Interval anchors sit at variant indices `gs - ts` and `iv_end`.
                 let t: Vec<f32> = interp_cum_cm
                     .and_then(|cum| cm_t_values(cum, desc.gs - desc.ts, desc.iv_end, desc.ts, desc.tile_n))
@@ -1255,23 +1267,34 @@ pub fn write_window_multiformat(
                     desc.gs, desc.tile_n, &t, setup.n_haps)
             }).collect();
             drop(stripe_tiles); // free decompressed stripes
+            crate::selphi_debug!("  [MEM] interp batch {}/{}: tiles interpolated: rss={:.0} MB", bi + 1, batches.len(), crate::log::rss_mb());
 
-            // Encode this batch's intervals immediately, then drop all_tiles
-            let mut buf_idx = 0;
-            for (li, _iv) in batch_ivs.iter().enumerate() {
-                let iv_idx = bstart + li;
-                let interval = &setup.intervals[iv_idx];
-
-                emit_chip_gap!(interval.wgs_start);
-
-                for di in 0..desc_counts[li] {
-                    let desc = &all_descs[buf_idx + di];
-                    encode_tile!(&all_tiles[buf_idx + di], desc.tile_n, desc.gs);
+            // Encode this batch's tiles immediately, then drop all_tiles
+            for (k, desc) in batch_descs.iter().enumerate() {
+                if desc.ts == 0 {
+                    while iv_cursor < desc.iv {
+                        let iv = &setup.intervals[iv_cursor];
+                        emit_chip_gap!(iv.wgs_start);
+                        next_wgs = iv.wgs_end;
+                        iv_cursor += 1;
+                    }
+                    emit_chip_gap!(setup.intervals[desc.iv].wgs_start);
                 }
-                buf_idx += desc_counts[li];
-                next_wgs = interval.wgs_end;
+                encode_tile!(&all_tiles[k], desc.tile_n, desc.gs);
+                if desc.last {
+                    next_wgs = desc.iv_end;
+                    iv_cursor = desc.iv + 1;
+                }
             }
             // all_tiles dropped here — batch memory freed
+            crate::selphi_debug!("  [MEM] interp batch {}/{}: encoded+sent: rss={:.0} MB", bi + 1, batches.len(), crate::log::rss_mb());
+        }
+        // Trailing intervals that own no tile.
+        while iv_cursor < setup.intervals.len() {
+            let iv = &setup.intervals[iv_cursor];
+            emit_chip_gap!(iv.wgs_start);
+            next_wgs = iv.wgs_end;
+            iv_cursor += 1;
         }
 
     } else {
