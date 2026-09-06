@@ -447,20 +447,22 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
             // phase-only diploid path `ref_bm_full` is `None` (we only
             // extract the common subset to save RAM); phase_rare falls
             // back to target-only.
-            // Intra-run phase ensemble member count: default SELPHI_DIPLOID_INTRA_N
-            // (2), overridden by --phase-ensemble N when N>1, forced to 1 (single
-            // Viterbi solve, byte-identical to the pre-intra default) under
-            // --sample-batch-size (streaming output) and --phase-only (no imputation).
-            let intra_default = selphi::config::usize_or("SELPHI_DIPLOID_INTRA_N", 2).max(1);
-            let n_members = if args.sample_batch_size > 0 || args.phase_only {
-                1
-            } else if args.phase_ensemble > 1 {
-                args.phase_ensemble
-            } else {
-                intra_default
-            };
+            // Intra-run phase ensemble member count — see ensemble::resolve_members
+            // for the cohort-size cap and why it exists.
+            let n_members = selphi::imputation::ensemble::resolve_members(
+                n_samples, args.phase_ensemble,
+                args.sample_batch_size > 0 || args.phase_only,
+            );
             if n_members > 1 {
                 selphi_step!("Diploid intra-run phase ensemble: {} members (1× phasing)", n_members);
+                if n_samples > selphi::imputation::ensemble::ENSEMBLE_COSTLY_ABOVE {
+                    // The ensemble runs the imputation HMM once per member. At this
+                    // cohort size that map is essentially the whole wall, so N members
+                    // means ~N x the run. Say it rather than let it be discovered.
+                    selphi_info!("           at {} samples each member costs a full HMM pass \
+(~{}x wall); SELPHI_ENSEMBLE_MAX_SAMPLES=1000 caps it at one member",
+                        n_samples, n_members);
+                }
             }
             let (mut dp, dr) = selphi::diploid::diploid_phase_bm_prefiltered(
                 targ_alleles, common_ref_bm, &common_chip_indices,

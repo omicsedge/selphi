@@ -76,6 +76,13 @@ pub struct ImputeWindowInputs<'a> {
     pub chip_end: usize,
 }
 
+/// Per-stage CPU microseconds inside the per-target map, summed over all worker
+/// threads. The window log has only ever reported the two together ("PBWT=..."),
+/// which is why "where does the wall go" was an inference from an mc sweep
+/// rather than a measurement. Printed per window under `--debug`.
+pub(crate) static STAGE_PBWT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static STAGE_HMM_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// `SELPHI_HMM_THREADS`: run the per-target PBWT+HMM map on a dedicated rayon
 /// pool of N threads instead of the global one. 0 (the default) uses the global
 /// pool, i.e. `--threads`.
@@ -381,6 +388,7 @@ pub fn process_window_hmm(
                 static WS: std::cell::RefCell<Option<pbwt::PbwtWorkspace>> =
                     const { std::cell::RefCell::new(None) };
             }
+            let t_pbwt = std::time::Instant::now();
             let fwd = WS.with(|ws_cell| {
                 let mut ws_opt = ws_cell.borrow_mut();
                 let ws = ws_opt.get_or_insert_with(|| pbwt::PbwtWorkspace::new(m_red, n_cand));
@@ -389,6 +397,7 @@ pub fn process_window_hmm(
             });
             let bwd = pbwt::backward_filter_single(&fwd, n_var_w, n_cand, fl_fwd, fl_bwd);
             let mut csc = pbwt::build_csc_matrix(&bwd, n_cand, n_var_w, fl_bwd);
+            STAGE_PBWT_US.fetch_add(t_pbwt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 
             TL_RED.with(|buf| { *buf.borrow_mut() = rows.buf; });
             // CSC indices are positions in the candidate list — remap to absolute haplotype IDs.
@@ -399,13 +408,16 @@ pub fn process_window_hmm(
             }
             csc.n_rows = n_ref;
 
-            (tgt, super::hmm::calculate_weights(
+            let t_hmm = std::time::Instant::now();
+            let w = super::hmm::calculate_weights(
                 &csc, cm_w, &breaks_w, n_ref,
                 est_ne, p_err,
                 Some(super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start }),
                 n_var_w, None,
                 ne_w, prior, conf_hap.as_deref(), 0.0, params.compute_posterior,
-            ))
+            );
+            STAGE_HMM_US.fetch_add(t_hmm.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            (tgt, w)
         })
         .collect() };
         let batch_results = match hmm_pool() {
@@ -443,6 +455,14 @@ pub fn process_window_hmm(
     // SELPHI_PRUNE_DIAG: drain + print the window's aggregated pruning stats
     // (no-op unless the knob is set).
     super::hmm::prune_diag_report(chip_start, chip_start + n_var_w);
+    {
+        let p = STAGE_PBWT_US.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+        let h = STAGE_HMM_US.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+        if p + h > 0.0 {
+            crate::selphi_debug!("  [STAGE] window {}..{}: PBWT {:.0} CPU-s ({:.0}%) | HMM {:.0} CPU-s ({:.0}%)",
+                chip_start, chip_start + n_var_w, p, 100.0 * p / (p + h), h, 100.0 * h / (p + h));
+        }
+    }
 
     WindowHmmOutput { all_weights }
 }
