@@ -1294,6 +1294,9 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         // peak can be attributed to the stage that allocates it rather than
         // inferred from the shape of the code — which has been wrong three
         // times running on this path.
+        // Return the previous window's (and, on wi == 0, the phasing stage's) freed
+        // pages before this window allocates on top of them. See common/mem.rs.
+        selphi::common::mem::release_freed_memory();
         selphi_debug!("  [MEM] win{} start: rss={:.0} MB peak={:.0} MB", wi + 1, selphi::log::rss_mb(), selphi::log::peak_mem_mb());
 
 

@@ -4,3 +4,4 @@ pub mod bitmatrix;
 pub mod utils;
 
 pub use bitmatrix::HaplotypeBitmatrix;
+pub mod mem;

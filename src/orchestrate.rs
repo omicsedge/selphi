@@ -899,6 +899,12 @@ pub fn run_multi_chr(
         let mut hap_priors: Vec<Option<Vec<(i64, f64)>>> = vec![None; n_haps];
 
         for (wi, window) in windows.iter().enumerate() {
+
+            // Return the previous window's freed pages before allocating on top of them
+
+            // (see common/mem.rs).
+
+            selphi::common::mem::release_freed_memory();
             let hmm_params = selphi::imputation::window_process::WindowHmmParams {
                 n_ref, n_haps, match_length, fl_fwd, fl_bwd,
                 est_ne: est_ne as f64, p_err: config.p_err,
