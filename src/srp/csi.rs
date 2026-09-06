@@ -814,12 +814,33 @@ pub fn build_tbi_index(vcf_gz_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// One record's index metadata, resolved at collection time: 16 bytes, no heap.
+///
+/// The writer threads used to keep `(String, i64, i64)` per record — a heap
+/// String holding the contig name, for every one of the 17.9M records a TOPMed
+/// chr20 run writes: ~1 GB resident for the whole run, released only after the
+/// index was built at the very end. Same information, sixteen bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct TbiRec {
+    pub pos: i64,
+    pub rlen: u32,
+    pub ref_id: u32,
+}
+
+/// Contig name → TBI reference id, exactly as `build_tbi_index_with_meta` used
+/// to resolve it from a `HashMap` built by inserting `contig_names` in order:
+/// the LAST contig with that name wins, an unknown name maps to 0.
+#[inline]
+pub fn tbi_ref_id(contig_names: &[String], chrom: &[u8]) -> u32 {
+    contig_names.iter().rposition(|c| c.as_bytes() == chrom).unwrap_or(0) as u32
+}
+
 /// Fast TBI index building with pre-collected metadata.
 /// Only scans for virtual positions (skip parsing — metadata already known).
 pub fn build_tbi_index_with_meta(
     vcf_gz_path: &Path,
     contig_names: &[String],
-    record_meta: &[(String, i64, i64)], // (chrom, pos_0based, rlen)
+    record_meta: &[TbiRec],
     tbi_path: &Path,
 ) -> io::Result<()> {
     use std::collections::BTreeMap;
@@ -830,9 +851,6 @@ pub fn build_tbi_index_with_meta(
     // own block buffer (`fill_buf` / `consume`) keeps vpos precise.
     let f = std::fs::File::open(vcf_gz_path)?;
     let mut bgzf = noodles_bgzf::io::Reader::new(BufReader::with_capacity(4 << 20, f));
-
-    let mut contig_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for (i, name) in contig_names.iter().enumerate() { contig_map.insert(name.clone(), i); }
 
     struct BinDataM { _loffset: u64, chunks: Vec<(u64, u64)> }
     let mut ref_bins: BTreeMap<usize, BTreeMap<u32, BinDataM>> = BTreeMap::new();
@@ -869,10 +887,9 @@ pub fn build_tbi_index_with_meta(
         let vpos_end: u64 = u64::from(bgzf.virtual_position());
 
         if rec_idx >= record_meta.len() { break; }
-        let (ref chrom, pos, rlen) = record_meta[rec_idx];
+        let TbiRec { pos, rlen, ref_id } = record_meta[rec_idx];
+        let (rlen, ref_id) = (rlen as i64, ref_id as usize);
         rec_idx += 1;
-
-        let ref_id = *contig_map.get(chrom.as_str()).unwrap_or(&0);
 
         let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, TBI_DEPTH);
         let bins = ref_bins.entry(ref_id).or_default();

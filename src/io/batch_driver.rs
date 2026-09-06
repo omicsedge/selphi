@@ -341,16 +341,42 @@ pub fn run_window<S: BatchSink>(
         let mem_cap: usize = 1024 * 1024 * 1024;
         let max_stripes_per_batch = (mem_cap / (bytes_per_stripe + result_bytes_per_stripe).max(1)).max(4);
 
-        let batches = crate::io::pipeline::partition_intervals(&intervals, max_stripes_per_batch);
+        // Tile-level batching (see io/pipeline.rs for why not interval-level: a
+        // single chip gap can span ~1,000 stripes and used to become one batch).
+        struct TD { iv: usize, ts: usize, tn: usize, gs: usize, last: bool }
+        let mut descs: Vec<TD> = Vec::new();
+        for (iv_idx, iv) in intervals.iter().enumerate() {
+            let n = iv.wgs_end - iv.wgs_start;
+            let mut ts = 0usize;
+            while ts < n {
+                let tn = (n - ts).min(tile_size);
+                descs.push(TD { iv: iv_idx, ts, tn, gs: iv.wgs_start + ts, last: ts + tn == n });
+                ts += tn;
+            }
+        }
+        let desc_stripes = |d: &TD| (d.gs / TILE_ROWS, (d.gs + d.tn - 1) / TILE_ROWS);
+        let mut batches: Vec<(usize, usize, usize, usize)> = Vec::new();
+        {
+            let mut bs = 0usize;
+            let mut fs = 0usize;
+            for (i, d) in descs.iter().enumerate() {
+                let (dfs, dls) = desc_stripes(d);
+                if i == bs { fs = dfs; }
+                if dls - fs + 1 > max_stripes_per_batch && i > bs {
+                    let (_, pls) = desc_stripes(&descs[i - 1]);
+                    batches.push((bs, i, fs, pls));
+                    bs = i;
+                    fs = dfs;
+                }
+            }
+            if bs < descs.len() {
+                let (_, ls) = desc_stripes(&descs[descs.len() - 1]);
+                batches.push((bs, descs.len(), fs, ls));
+            }
+        }
 
-        for &(bstart, bend) in &batches {
-            let batch_ivs = &intervals[bstart..bend];
-            if batch_ivs.is_empty() { continue; }
-            let b_first_stripe = batch_ivs[0].wgs_start / TILE_ROWS;
-            let b_last_stripe = {
-                let e = batch_ivs.last().unwrap().wgs_end;
-                if e > 0 { (e - 1) / TILE_ROWS } else { b_first_stripe }
-            };
+        let mut iv_cursor = 0usize;
+        for &(d0, d1, b_first_stripe, b_last_stripe) in &batches {
             let b_n_stripes = b_last_stripe - b_first_stripe + 1;
             let n_load = b_n_stripes.min(window_last_stripe - b_first_stripe + 1);
             let stripes = tiled.preload_stripes(b_first_stripe, n_load)?;
@@ -361,27 +387,38 @@ pub fn run_window<S: BatchSink>(
                 })
                 .collect();
 
-            for iv in batch_ivs {
-                chip_gap!(iv.wgs_start);
-                let n = iv.wgs_end - iv.wgs_start;
-                if n == 0 { next_wgs = iv.wgs_end; continue; }
-                let full_range = n as f32;
-                let mut ts = 0usize;
-                while ts < n {
-                    let tn = (n - ts).min(tile_size);
-                    let gs = iv.wgs_start + ts;
-                    let t_vals: Vec<f32> = interp_cum_cm
-                        .and_then(|cum| crate::io::pipeline::cm_t_values(cum, iv.wgs_start, iv.wgs_end, ts, tn))
-                        .unwrap_or_else(|| (0..tn).map(|v| (ts + v) as f32 / full_range).collect());
-                    let alt_probs = crate::io::pipeline::interpolate_tile_batch(
-                        &stripe_tiles, b_first_stripe, n_tiled_variants, n_tile_cols,
-                        weights, iv.weight_s, iv.weight_e, gs, tn, &t_vals, n_haps_in_batch,
-                    );
-                    emit_tile!(alt_probs, tn, gs);
-                    ts += tn;
+            for d in &descs[d0..d1] {
+                let iv = &intervals[d.iv];
+                if d.ts == 0 {
+                    while iv_cursor < d.iv {
+                        let z = &intervals[iv_cursor];
+                        chip_gap!(z.wgs_start);
+                        next_wgs = z.wgs_end;
+                        iv_cursor += 1;
+                    }
+                    chip_gap!(iv.wgs_start);
                 }
-                next_wgs = iv.wgs_end;
+                let n = iv.wgs_end - iv.wgs_start;
+                let full_range = n as f32;
+                let t_vals: Vec<f32> = interp_cum_cm
+                    .and_then(|cum| crate::io::pipeline::cm_t_values(cum, iv.wgs_start, iv.wgs_end, d.ts, d.tn))
+                    .unwrap_or_else(|| (0..d.tn).map(|v| (d.ts + v) as f32 / full_range).collect());
+                let alt_probs = crate::io::pipeline::interpolate_tile_batch(
+                    &stripe_tiles, b_first_stripe, n_tiled_variants, n_tile_cols,
+                    weights, iv.weight_s, iv.weight_e, d.gs, d.tn, &t_vals, n_haps_in_batch,
+                );
+                emit_tile!(alt_probs, d.tn, d.gs);
+                if d.last {
+                    next_wgs = iv.wgs_end;
+                    iv_cursor = d.iv + 1;
+                }
             }
+        }
+        while iv_cursor < intervals.len() {
+            let z = &intervals[iv_cursor];
+            chip_gap!(z.wgs_start);
+            next_wgs = z.wgs_end;
+            iv_cursor += 1;
         }
         chip_gap!(own_wgs_end);
     } else {
