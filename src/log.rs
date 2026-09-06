@@ -241,10 +241,10 @@ pub fn system_ram_mb() -> f64 {
 /// has more threads, the caller should wrap heavy work in
 /// `rayon::ThreadPoolBuilder::new().num_threads(N).build().unwrap().install(...)`.
 pub fn estimate_and_warn(
-    n_chip: usize, n_ref: usize, n_samples: usize, n_threads: usize,
+    n_chip: usize, n_ref: usize, n_ref_variants: usize, n_samples: usize, n_threads: usize,
     needs_phasing: bool,
 ) -> usize {
-    estimate_and_warn_with_mc(n_chip, n_ref, n_samples, n_threads, 2500, 0, needs_phasing)
+    estimate_and_warn_with_mc(n_chip, n_ref, n_ref_variants, n_samples, n_threads, 2500, 0, needs_phasing)
 }
 
 /// Same as [`estimate_and_warn`] but caller passes the actual resolved
@@ -256,7 +256,7 @@ pub fn estimate_and_warn(
 ///   `target_batch_size_haps × per_buffer` — the entire point of batched
 ///   output.
 pub fn estimate_and_warn_with_mc(
-    n_chip: usize, n_ref: usize, n_samples: usize, n_threads_init: usize,
+    n_chip: usize, n_ref: usize, n_ref_variants: usize, n_samples: usize, n_threads_init: usize,
     max_candidates_in: usize, target_batch_size_haps: usize,
     needs_phasing: bool,
 ) -> usize {
@@ -265,7 +265,7 @@ pub fn estimate_and_warn_with_mc(
 
     // Compute estimate for a given thread count.
     let est_for_threads = |n_threads: usize| -> f64 {
-        compute_estimate_mb(n_chip, n_ref, n_samples, n_threads,
+        compute_estimate_mb(n_chip, n_ref, n_ref_variants, n_samples, n_threads,
             max_candidates_in, target_batch_size_haps, needs_phasing)
     };
 
@@ -305,7 +305,7 @@ pub fn estimate_and_warn_with_mc(
 }
 
 fn compute_estimate_mb(
-    n_chip: usize, n_ref: usize, n_samples: usize, n_threads: usize,
+    n_chip: usize, n_ref: usize, n_ref_variants: usize, n_samples: usize, n_threads: usize,
     max_candidates: usize, target_batch_size_haps: usize, needs_phasing: bool,
 ) -> f64 {
     let n_haps = n_samples * 2;
@@ -313,6 +313,13 @@ fn compute_estimate_mb(
     let ref_bm_mb = (n_chip * n_ref_words * 8) as f64 / 1e6;
     let targ_mb = (n_chip * n_haps) as f64 / 1e6;
     let preload_mb = 500.0;
+    // The loaded panel's variant table: one `Variant` (chr/ref/alt Strings + pos)
+    // plus ids per reference variant, resident for the whole run. Never had a
+    // term here, which is why the estimate sat ~4.5 GB under the measurement on
+    // TOPMed once everything else had been fixed: RSS is 4,317 MB right after
+    // "Loaded SRP: 17,900,635 variants" = ~241 B/variant (340 MB / 1.07M on 1KG
+    // chr22 = ~318 B, the difference being fixed reader overhead). 241 is used.
+    let srp_table_mb = (n_ref_variants as f64 * 241.0) / 1e6;
 
     // Per-thread (= per in-flight target) working set of the PBWT + HMM stage.
     //
@@ -364,8 +371,16 @@ fn compute_estimate_mb(
     let states_est = (max_candidates.max(1) as f64).min(n_ref as f64);
     let hap_posterior_mb = (in_flight_haps as f64 * states_est * 16.0) / 1e6;
     let tile_cols = n_ref.div_ceil(4096);
-    let stripes_per_batch = 300usize.min((n_chip * 100).div_ceil(1024));
-    let stripe_decomp_mb = (stripes_per_batch * tile_cols * 500 * 1024) as f64 / 1e6;
+    // Stripes per interpolation batch. Mirrors io/pipeline.rs exactly: a 2 GiB
+    // cap over (decompressed stripes + result tiles), applied per TILE since
+    // 2026-09-06 so no single chip gap can exceed it (the chr20 centromere against
+    // TOPMed used to make one 993-stripe batch out of a 96-stripe cap).
+    let decomp_tile_bytes = 500usize * 1024;
+    let bytes_per_stripe = tile_cols * decomp_tile_bytes;
+    let result_bytes_per_stripe = in_flight_haps * 1024 * 4;
+    let cap_stripes = ((2usize << 30) / (bytes_per_stripe + result_bytes_per_stripe).max(1)).max(4);
+    let stripes_per_batch = cap_stripes.min((n_chip * 100).div_ceil(1024)).max(1);
+    let stripe_decomp_mb = (stripes_per_batch * bytes_per_stripe) as f64 / 1e6;
     // Interpolation and VCF/BCF encode buffers scale with the in-flight hap
     // count (or sample count) and are also bounded by --sample-batch-size.
     let in_flight_samples = in_flight_haps / 2;
@@ -378,7 +393,7 @@ fn compute_estimate_mb(
     let bgzf_mb = (n_threads as f64 * 64.0 * 1024.0) / 1e6;
     let thread_local_mb = n_threads as f64 * 20.0;
     let overhead_mb = 300.0;
-    let mut total_mb = ref_bm_mb + targ_mb + preload_mb + hmm_mb + weights_mb
+    let mut total_mb = srp_table_mb + ref_bm_mb + targ_mb + preload_mb + hmm_mb + weights_mb
         + hap_posterior_mb + stripe_decomp_mb + interp_mb + vcf_mb + bgzf_mb
         + thread_local_mb + overhead_mb;
     if needs_phasing {

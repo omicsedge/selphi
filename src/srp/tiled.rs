@@ -50,7 +50,7 @@ pub struct TileEntryPub {
 /// One sequential read from disk fills the buffer; decompress_tile reads from RAM.
 /// No page faults, no mmap — pure sequential I/O.
 pub struct PreloadedStripes {
-    buf: Vec<u8>,
+    pub buf: Vec<u8>,
     /// (offset_in_buf, comp_size) for each tile, indexed as [(stripe - first_stripe) * n_tile_cols + band]
     offsets: Vec<(usize, usize)>,
     pub first_stripe: usize,

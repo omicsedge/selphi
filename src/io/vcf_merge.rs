@@ -63,7 +63,7 @@ pub fn merge_batch_vcfs(
         &mut writer, all_sample_names, contig_field, version, no_ap, "")?;
 
     // Index metadata accumulated during merge for TBI building.
-    let mut record_meta: Vec<(String, i64, i64)> = Vec::new();
+    let mut record_meta: Vec<crate::srp::csi::TbiRec> = Vec::new();
     let mut contig_names: Vec<String> = Vec::new();
     if let Some(name) = parse_contig_id(contig_field) {
         contig_names.push(name);
@@ -121,7 +121,10 @@ pub fn merge_batch_vcfs(
 
         for (buf, chrom, pos, rlen) in merged {
             writer.write_all(&buf)?;
-            record_meta.push((chrom, pos, rlen));
+            record_meta.push(crate::srp::csi::TbiRec {
+                pos, rlen: rlen as u32,
+                ref_id: crate::srp::csi::tbi_ref_id(&contig_names, chrom.as_bytes()),
+            });
         }
 
         if any_eof { break; }
