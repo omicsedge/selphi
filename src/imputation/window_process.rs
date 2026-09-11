@@ -220,6 +220,367 @@ pub type BatchDoneCb<'a> = &'a mut dyn FnMut(
     &[&super::hmm::CsrWeights],          // weight refs for this batch
 ) -> std::io::Result<()>;
 
+// ---------------------------------------------------------------------------
+// Per-target PBWT: the two candidate regimes
+// ---------------------------------------------------------------------------
+
+/// Window-constant inputs to the per-target PBWT. Grouped so the two regimes
+/// below share one signature instead of ten positional arguments.
+struct PbwtCtx<'a> {
+    ref_bm: &'a HaplotypeBitmatrix,
+    chip_start: usize,
+    n_ref: usize,
+    targ_w: &'a [u8],
+    n_haps: usize,
+    n_var_w: usize,
+    match_length: usize,
+    fl_fwd: usize,
+    fl_bwd: usize,
+}
+
+// ONE allele row of scratch (m bytes), not n_var of them — see pbwt::AlleleRows
+// for why the dense matrix this used to be was the thread-scaled part of the peak.
+thread_local! {
+    static TL_RED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_row_buf(m_red: usize) -> Vec<u8> {
+    TL_RED.with(|buf| {
+        let mut b = buf.borrow_mut();
+        if b.capacity() >= m_red { b.clear(); b.resize(m_red, 0u8); std::mem::take(&mut *b) }
+        else { vec![0u8; m_red] }
+    })
+}
+
+fn give_row_buf(buf: Vec<u8>) {
+    TL_RED.with(|cell| { *cell.borrow_mut() = buf; });
+}
+
+fn take_mask(n_ref: usize, candidates: &[u32]) -> Vec<u64> {
+    CAND_MASK.with(|cell| {
+        let mut mask = std::mem::take(&mut *cell.borrow_mut());
+        let w = pbwt::mask_words(n_ref);
+        if mask.len() < w { mask.resize(w, 0); }
+        pbwt::mask_set(&mut mask, candidates);
+        mask
+    })
+}
+
+fn give_mask(mut mask: Vec<u64>, candidates: &[u32]) {
+    pbwt::mask_clear(&mut mask, candidates);
+    CAND_MASK.with(|cell| { *cell.borrow_mut() = mask; });
+}
+
+// Sort workspace + per-target `ht` buffers for the shared path, kept per worker
+// thread. The `ht` vectors are the shared design's real memory cost: one n_ref
+// i64 array PER TARGET IN FLIGHT, where the per-target path needed only one per
+// thread. 171,054 haps = 1.37 MB each.
+thread_local! {
+    static SHARED_WS: std::cell::RefCell<(Option<pbwt::PbwtWorkspace>, Vec<Vec<i64>>)> =
+        const { std::cell::RefCell::new((None, Vec::new())) };
+}
+
+/// `SELPHI_PBWT_SHARE=B`: run the PBWT sort ONCE for every B target haplotypes
+/// instead of once per target. 0 or 1 (the default) keeps the per-target sort.
+///
+/// The sort depends only on the panel, so this is byte-identical — it is the
+/// `SELPHI_FULL_PANEL_PBWT=2` geometry with the sort hoisted out of the target
+/// loop. What it costs is memory: every target in a group holds its own forward
+/// match buffers (`2 * n_var * fl_fwd * 4` bytes) and its own `ht` (`n_ref * 8`),
+/// all live at once, against one target's worth per thread before. On MESA 100 x
+/// TOPMed that is ~15.6 MB per in-flight target, so the peak grows by roughly
+/// `threads * (B - 1) * 15.6 MB`.
+///
+/// MEASURED ceiling (SELPHI_PBWT_SPLIT_DIAG): the sort is 67.6% of the forward on
+/// MESA x TOPMed and 43.2% on chr22 x 1KG, and the scan the other side of it grows
+/// ~1.29x under sharing because it walks past non-candidates. So B -> infinity is
+/// ~2.4x on the forward there and ~1.4x here, NOT the ~7,000x the raw sort-work
+/// ratio suggests. Most of B's benefit arrives by B = 8-16.
+fn share_batch() -> usize {
+    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *B.get_or_init(|| crate::config::usize_or("SELPHI_PBWT_SHARE", 0))
+}
+
+// `n_ref`-wide candidate mask for `SELPHI_FULL_PANEL_PBWT=2`, reset only where
+// it was touched (the same trick `select_candidates_weighted` uses for its
+// `seen` mask — a 171k-entry zeroing per target is not free).
+thread_local! {
+    static CAND_MASK: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `SELPHI_FULL_PANEL_PBWT`: take the full-panel regime for EVERY target, not
+/// just the ones whose candidate set fell under `FULL_PANEL_HMM_THRESHOLD`.
+///
+///   1 = full-panel sort, full-panel scan. The naive shared PBWT: no per-target
+///       candidate set at all.
+///   2 = full-panel sort, scan restricted to this target's candidate set. The
+///       sort is then target-independent (shareable) while the recorded matches
+///       stay exactly the per-target ones. Predicted, and to be checked,
+///       byte-identical to the default.
+///
+/// Mode 1 is the one the accuracy question was asked of. It loses: on MESA 100 x
+/// TOPMed (n_ref 171,054, mc 132,676) it is down in all six measurable MAF bins,
+/// OVERALL 0.692026 -> 0.691105. The per-target candidate ranking is not only a
+/// speed device — it keeps globally-irrelevant haplotypes out of the per-site
+/// top-K — so mode 2 is the variant that can actually be shipped.
+///
+/// This is the cheap stand-in for a shared PBWT, and it is an exact one. The
+/// sort is over the same `n_ref + n_haps` haplotypes for every target, so `a`
+/// and `d` at every site are identical from one target to the next; only the
+/// neighbour scan around `a_inv[target]` differs. A shared PBWT would compute
+/// that one sort once and let every target scan it. This computes the same sort
+/// per target and throws it away — same matches, same lengths, ~n_haps times the
+/// work. That makes it the right way to measure the ACCURACY of sharing before
+/// writing the shared sort: identical answers, honest cost.
+///
+/// NOT byte-identical to the default, and must not be reported as if it were:
+/// the per-site top-K now selects from the whole panel instead of from this
+/// target's candidate set.
+fn full_panel_mode() -> u8 {
+    static F: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *F.get_or_init(|| crate::config::usize_or("SELPHI_FULL_PANEL_PBWT", 0).min(255) as u8)
+}
+
+/// PBWT over the whole reference panel plus every target haplotype. Matches are
+/// recorded only at sort positions holding a reference hap (the
+/// `hap_at_pos < n_ref` test in `pbwt_forward_with_workspace`), so the other
+/// targets shift positions but never enter a match set. Returns a CSC already
+/// indexed by absolute haplotype ID.
+/// Allele rows over the WHOLE panel plus every target, gathered per site. Used by
+/// both the per-target full-panel regime and the shared-sort path — the sort they
+/// feed is the same sort, which is the reason sharing is possible at all.
+struct FullRows<'a> {
+    bm: &'a HaplotypeBitmatrix, chip_start: usize, n_ref: usize,
+    targ_w: &'a [u8], n_haps: usize, buf: Vec<u8>,
+}
+
+impl FullRows<'_> {
+    /// Hand the scratch row back so the caller can return it to its thread-local.
+    fn into_buf(self) -> Vec<u8> { self.buf }
+}
+
+impl pbwt::AlleleRows for FullRows<'_> {
+    fn row(&mut self, var: usize) -> &[u8] {
+        let row = self.bm.row(self.chip_start + var);
+        let n_ref = self.n_ref;
+        self.buf[..n_ref].fill(0);
+        for w in 0..self.bm.n_words() {
+            let mut word = row[w];
+            let base = w * 64;
+            while word != 0 {
+                let k = word.trailing_zeros() as usize;
+                let r = base + k;
+                if r < n_ref { self.buf[r] = 1; }
+                word &= word - 1;
+            }
+        }
+        let nh = self.n_haps;
+        self.buf[n_ref..n_ref + nh].copy_from_slice(&self.targ_w[var * nh..(var + 1) * nh]);
+        &self.buf[..n_ref + nh]
+    }
+}
+
+fn full_panel_rows<'a>(ctx: &PbwtCtx<'a>, buf: Vec<u8>) -> FullRows<'a> {
+    FullRows {
+        bm: ctx.ref_bm, chip_start: ctx.chip_start, n_ref: ctx.n_ref,
+        targ_w: ctx.targ_w, n_haps: ctx.n_haps, buf,
+    }
+}
+
+fn full_panel_csc(
+    ctx: &PbwtCtx, tgt: usize, buf: Vec<u8>, keep: Option<&[u64]>,
+) -> (pbwt::CscMatchMatrix, Vec<u8>) {
+    let m = ctx.n_ref + ctx.n_haps;
+    let mut rows = full_panel_rows(ctx, buf);
+    thread_local! {
+        static WS_FULL: std::cell::RefCell<Option<pbwt::PbwtWorkspace>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let fwd = WS_FULL.with(|cell| {
+        let mut ws_opt = cell.borrow_mut();
+        let ws = ws_opt.get_or_insert_with(|| pbwt::PbwtWorkspace::new(m, ctx.n_ref));
+        if ws.capacity() < m { *ws = pbwt::PbwtWorkspace::new(m, ctx.n_ref); }
+        let (nv, nr, ml, ff) = (ctx.n_var_w, ctx.n_ref, ctx.match_length, ctx.fl_fwd);
+        let tgt_abs = (ctx.n_ref + tgt) as i32;
+        match keep {
+            None => pbwt::pbwt_forward_filtered(
+                ws, &mut rows, nv, m, nr, ml, ff, tgt_abs, &pbwt::AllRefs),
+            Some(k) => pbwt::pbwt_forward_filtered(
+                ws, &mut rows, nv, m, nr, ml, ff, tgt_abs, &pbwt::OnlyCands(k)),
+        }
+    });
+    let bwd = pbwt::backward_filter_single(&fwd, ctx.n_var_w, ctx.n_ref, ctx.fl_fwd, ctx.fl_bwd);
+    (pbwt::build_csc_matrix(&bwd, ctx.n_ref, ctx.n_var_w, ctx.fl_bwd), rows.buf)
+}
+
+/// PBWT over this target's candidate set plus the target itself — the default
+/// regime. The candidates' alleles are gathered from the bitmatrix one site at
+/// a time as the PBWT asks for them. Returns a CSC whose candidate-local row
+/// indices have been remapped to absolute haplotype IDs.
+fn reduced_csc(
+    ctx: &PbwtCtx, tgt: usize, candidates: &[u32], buf: Vec<u8>,
+) -> (pbwt::CscMatchMatrix, Vec<u8>) {
+    struct GatherRows<'a> {
+        bm: &'a HaplotypeBitmatrix, chip_start: usize, candidates: &'a [u32],
+        targ_w: &'a [u8], n_haps: usize, tgt: usize, buf: Vec<u8>,
+    }
+    impl pbwt::AlleleRows for GatherRows<'_> {
+        #[inline]
+        fn row(&mut self, var: usize) -> &[u8] {
+            let row = self.bm.row(self.chip_start + var);
+            for (i, &c) in self.candidates.iter().enumerate() {
+                self.buf[i] = ((row[c as usize / 64] >> (c as usize % 64)) & 1) as u8;
+            }
+            let n_cand = self.candidates.len();
+            self.buf[n_cand] = self.targ_w[var * self.n_haps + self.tgt];
+            &self.buf[..n_cand + 1]
+        }
+    }
+    let n_cand = candidates.len();
+    let m_red = n_cand + 1;
+    let mut rows = GatherRows {
+        bm: ctx.ref_bm, chip_start: ctx.chip_start, candidates,
+        targ_w: ctx.targ_w, n_haps: ctx.n_haps, tgt, buf,
+    };
+    thread_local! {
+        static WS: std::cell::RefCell<Option<pbwt::PbwtWorkspace>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let fwd = WS.with(|ws_cell| {
+        let mut ws_opt = ws_cell.borrow_mut();
+        let ws = ws_opt.get_or_insert_with(|| pbwt::PbwtWorkspace::new(m_red, n_cand));
+        if ws.capacity() < m_red { *ws = pbwt::PbwtWorkspace::new(m_red, n_cand); }
+        pbwt::pbwt_forward_with_workspace(
+            ws, &mut rows, ctx.n_var_w, m_red, n_cand, ctx.match_length, ctx.fl_fwd,
+            n_cand as i32,
+        )
+    });
+    let bwd = pbwt::backward_filter_single(&fwd, ctx.n_var_w, n_cand, ctx.fl_fwd, ctx.fl_bwd);
+    let mut csc = pbwt::build_csc_matrix(&bwd, n_cand, ctx.n_var_w, ctx.fl_bwd);
+    // CSC indices are positions in the candidate list — remap to absolute haplotype IDs.
+    for idx in &mut csc.indices {
+        debug_assert!((*idx as usize) < candidates.len(),
+            "CSC index {} out of bounds for {} candidates", idx, candidates.len());
+        *idx = candidates[*idx as usize] as i32;
+    }
+    csc.n_rows = ctx.n_ref;
+    (csc, rows.buf)
+}
+
+// ---------------------------------------------------------------------------
+// SELPHI_PBWT_SUPERSET_DIAG — is the full-panel match set really a superset?
+// ---------------------------------------------------------------------------
+
+/// The claim a shared PBWT rests on: the full-panel match set CONTAINS the
+/// candidate-subset one, with identical lengths, plus matches to haplotypes the
+/// candidate pre-filter had excluded. The reasoning is that the divergence
+/// between a target and a reference haplotype is their longest common suffix,
+/// which does not depend on which other haplotypes sit in the panel, and that
+/// the neighbour scan terminates on match LENGTH rather than on a neighbour
+/// count — so every haplotype the reduced scan reaches, the full scan reaches
+/// too, at the same length.
+///
+/// `SELPHI_PBWT_SUPERSET_DIAG=N` tests that on the first N target haplotypes of
+/// every window by running BOTH regimes and comparing the resulting CSC match
+/// sets site by site. If the claim holds, `subset_only` is 0 everywhere and
+/// `full_only` is exactly what sharing adds.
+///
+/// Observation only: the imputed output still comes from the regime the run
+/// would have used anyway, so a diag run is byte-identical to a plain one.
+static DIAG_TARGETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_BOTH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_DISPLACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_ANOMALY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_FULL_ONLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_LEN_DIFF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_LEN_FULL_SHORTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn superset_diag_ntgt() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| crate::config::usize_or("SELPHI_PBWT_SUPERSET_DIAG", 0))
+}
+
+/// Site-by-site set comparison of two CSC match matrices for the same target,
+/// both indexed by absolute haplotype ID. Haplotypes are unique within a site
+/// (the left and right scans visit disjoint sort positions), so a per-site
+/// sorted lookup is enough.
+///
+/// A subset match missing from the full set is NOT automatically a loss. The
+/// raw match set is a superset, but `insert_match` keeps only the top `fl_bwd`
+/// per site, so a hap the reduced run kept can be evicted by longer matches the
+/// reduced run never saw. That is the ranking working as intended. The two are
+/// counted apart:
+///   - `displaced`: the full column is saturated (`fl_bwd` entries) and the
+///     missing match is no longer than the shortest one the full run kept, i.e.
+///     it lost its place to something at least as good;
+///   - `anomaly`: anything else — room left in the column, or the full run kept
+///     something SHORTER while dropping this. That would contradict the claim
+///     and is the number to watch.
+fn compare_match_sets(sub: &pbwt::CscMatchMatrix, full: &pbwt::CscMatchMatrix, fl_bwd: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (mut both, mut displaced, mut anomaly, mut full_only) = (0u64, 0u64, 0u64, 0u64);
+    let (mut len_diff, mut full_shorter) = (0u64, 0u64);
+    let mut fbuf: Vec<(i32, i32)> = Vec::new();
+    for v in 0..sub.n_cols {
+        let (fs, fe) = (full.indptr[v] as usize, full.indptr[v + 1] as usize);
+        fbuf.clear();
+        fbuf.extend((fs..fe).map(|k| (full.indices[k], full.data[k])));
+        // Shortest match the full run kept at this site, before sorting by hap.
+        let min_full_len = fbuf.iter().map(|&(_, l)| l).min().unwrap_or(i32::MAX);
+        let saturated = (fe - fs) >= fl_bwd;
+        fbuf.sort_unstable_by_key(|&(h, _)| h);
+        let (ss, se) = (sub.indptr[v] as usize, sub.indptr[v + 1] as usize);
+        let mut matched = 0u64;
+        for k in ss..se {
+            match fbuf.binary_search_by_key(&sub.indices[k], |&(fh, _)| fh) {
+                Ok(j) => {
+                    matched += 1;
+                    let (fl, sl) = (fbuf[j].1, sub.data[k]);
+                    if fl != sl {
+                        len_diff += 1;
+                        if fl < sl { full_shorter += 1; }
+                    }
+                }
+                Err(_) => {
+                    if saturated && sub.data[k] <= min_full_len { displaced += 1 }
+                    else { anomaly += 1 }
+                }
+            }
+        }
+        both += matched;
+        full_only += (fe - fs) as u64 - matched;
+    }
+    DIAG_TARGETS.fetch_add(1, Relaxed);
+    DIAG_BOTH.fetch_add(both, Relaxed);
+    DIAG_DISPLACED.fetch_add(displaced, Relaxed);
+    DIAG_ANOMALY.fetch_add(anomaly, Relaxed);
+    DIAG_FULL_ONLY.fetch_add(full_only, Relaxed);
+    DIAG_LEN_DIFF.fetch_add(len_diff, Relaxed);
+    DIAG_LEN_FULL_SHORTER.fetch_add(full_shorter, Relaxed);
+}
+
+/// Drain and print the window's superset-diag counters. No-op unless the knob is set.
+fn superset_diag_report(chip_start: usize, chip_end: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n_tgt = DIAG_TARGETS.swap(0, Relaxed);
+    if n_tgt == 0 { return; }
+    let both = DIAG_BOTH.swap(0, Relaxed);
+    let displaced = DIAG_DISPLACED.swap(0, Relaxed);
+    let anomaly = DIAG_ANOMALY.swap(0, Relaxed);
+    let full_only = DIAG_FULL_ONLY.swap(0, Relaxed);
+    let len_diff = DIAG_LEN_DIFF.swap(0, Relaxed);
+    let full_shorter = DIAG_LEN_FULL_SHORTER.swap(0, Relaxed);
+    let sub_total = both + displaced + anomaly;
+    let pct = |x: u64, d: u64| if d == 0 { 0.0 } else { 100.0 * x as f64 / d as f64 };
+    crate::selphi_info!(
+        "  [SUPERSET] window {}..{}: {} targets | subset {} | full {} | kept {} ({:.4}%) \
+         | displaced {} ({:.4}%) | ANOMALY {} ({:.4}%) | added {} | len differs {} (full shorter {})",
+        chip_start, chip_end, n_tgt, sub_total, both + full_only,
+        both, pct(both, sub_total), displaced, pct(displaced, sub_total),
+        anomaly, pct(anomaly, sub_total), full_only, len_diff, full_shorter,
+    );
+}
+
 /// Run PBWT + HMM for all target haplotypes in a single window.
 /// Returns per-haplotype sparse weights and updated priors.
 ///
@@ -270,10 +631,23 @@ pub fn process_window_hmm(
     for batch_start in (0..n_haps).step_by(batch_size) {
         let batch_end = (batch_start + batch_size).min(n_haps);
         let hap_priors_view: &[Option<Vec<(i64, f64)>>] = hap_priors;
-        let run_batch = || -> Vec<(usize, HmmResult)> { (batch_start..batch_end)
-            .into_par_iter()
-            .map(|tgt| {
-                let prior = hap_priors_view[tgt].as_deref();
+        let ctx = PbwtCtx {
+            ref_bm, chip_start, n_ref, targ_w, n_haps, n_var_w,
+            match_length, fl_fwd, fl_bwd,
+        };
+        // This target's candidate reference haplotypes.
+        let cands = |tgt: usize| -> Vec<u32> {
+            if let Some(pc) = precomputed_candidates {
+                pc[tgt].clone()
+            } else {
+                pbwt::select_candidates(coded, n_ref + tgt, n_ref, max_candidates)
+            }
+        };
+        // CSC -> copying weights. Shared by the per-target and the shared-sort
+        // paths so the two cannot drift: the shared path's entire claim is that
+        // it reproduces the per-target one byte for byte.
+        let finish = |tgt: usize, csc: &pbwt::CscMatchMatrix| -> (usize, HmmResult) {
+            let prior = hap_priors_view[tgt].as_deref();
             // R4 per-hap emission confidence: hap `tgt` belongs to sample tgt/2.
             // Extract that sample's column [var * n_samples + tgt/2] for v in
             // 0..n_var_w as a contiguous per-site vector for calculate_weights.
@@ -282,11 +656,21 @@ pub fn process_window_hmm(
                 let s = tgt / 2;
                 (0..n_var_w).map(|v| cw[v * n_samples + s]).collect()
             });
-            let candidates = if let Some(pc) = precomputed_candidates {
-                pc[tgt].clone()
-            } else {
-                pbwt::select_candidates(coded, n_ref + tgt, n_ref, max_candidates)
-            };
+            let t_hmm = std::time::Instant::now();
+            let w = super::hmm::calculate_weights(
+                csc, cm_w, &breaks_w, n_ref,
+                est_ne, p_err,
+                Some(super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start }),
+                n_var_w, None,
+                ne_w, prior, conf_hap.as_deref(), 0.0, params.compute_posterior,
+            );
+            STAGE_HMM_US.fetch_add(t_hmm.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            (tgt, w)
+        };
+
+        // One target, its own PBWT — the default.
+        let per_target = |tgt: usize| -> (usize, HmmResult) {
+            let candidates = cands(tgt);
             let n_cand = candidates.len();
             // First three targets only: the PBWT candidate-set size, i.e. the width
             // of the per-thread `reduced` allele array below (n_var_w x n_cand bytes).
@@ -304,122 +688,96 @@ pub fn process_window_hmm(
             // The reference panel is fully available in ref_bm, so this hap gets
             // real copying weights; the old early-return emitted an all-zero CSR
             // that silently imputed the whole window as hom-REF for this hap.
-            let is_full = n_cand < FULL_PANEL_HMM_THRESHOLD;
+            // Default: the reduced regime, unless this target's candidate set is
+            // too small to make a usable Li-Stephens state space. Forced for every
+            // target by SELPHI_FULL_PANEL_PBWT — see `full_panel_mode`.
+            let mode = full_panel_mode();
+            let is_full = n_cand < FULL_PANEL_HMM_THRESHOLD || mode != 0;
             let m_red = if is_full { m } else { n_cand + 1 };
+            let mut row_buf = take_row_buf(m_red);
 
-            thread_local! {
-                static TL_RED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-            }
-            // ONE allele row of scratch (m_red bytes), not n_var_w of them — see
-            // pbwt::AlleleRows for why the dense matrix this used to be was the
-            // thread-scaled part of the memory peak.
-            let row_buf = TL_RED.with(|buf| {
-                let mut b = buf.borrow_mut();
-                if b.capacity() >= m_red { b.clear(); b.resize(m_red, 0u8); std::mem::take(&mut *b) }
-                else { vec![0u8; m_red] }
-            });
-
-            if is_full {
-                // Rare: n_cand < FULL_PANEL_HMM_THRESHOLD — run the PBWT over the whole
-                // panel plus the targets. Rows are gathered per site from the bitmatrix.
-                struct FullRows<'a> {
-                    bm: &'a HaplotypeBitmatrix, chip_start: usize, n_ref: usize,
-                    targ_w: &'a [u8], n_haps: usize, buf: Vec<u8>,
-                }
-                impl pbwt::AlleleRows for FullRows<'_> {
-                    fn row(&mut self, var: usize) -> &[u8] {
-                        let row = self.bm.row(self.chip_start + var);
-                        let n_ref = self.n_ref;
-                        self.buf[..n_ref].fill(0);
-                        for w in 0..self.bm.n_words() {
-                            let mut word = row[w];
-                            let base = w * 64;
-                            while word != 0 {
-                                let k = word.trailing_zeros() as usize;
-                                let r = base + k;
-                                if r < n_ref { self.buf[r] = 1; }
-                                word &= word - 1;
-                            }
-                        }
-                        let nh = self.n_haps;
-                        self.buf[n_ref..n_ref + nh].copy_from_slice(&self.targ_w[var * nh..(var + 1) * nh]);
-                        &self.buf[..n_ref + nh]
-                    }
-                }
-                let mut rows = FullRows { bm: ref_bm, chip_start, n_ref, targ_w, n_haps, buf: row_buf };
-                let mut ws_full = pbwt::PbwtWorkspace::new(m, n_ref);
-                let fwd = pbwt::pbwt_forward_with_workspace(
-                    &mut ws_full, &mut rows, n_var_w, m, n_ref, match_length, fl_fwd,
-                    (n_ref + tgt) as i32,
-                );
-                let bwd = pbwt::backward_filter_single(&fwd, n_var_w, n_ref, fl_fwd, fl_bwd);
-                let csc = pbwt::build_csc_matrix(&bwd, n_ref, n_var_w, fl_bwd);
-                TL_RED.with(|buf| { *buf.borrow_mut() = rows.buf; });
-                return (tgt, super::hmm::calculate_weights(
-                    &csc, cm_w, &breaks_w, n_ref,
-                    est_ne, p_err,
-                    Some(super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start }),
-                    n_var_w, None,
-                    ne_w, prior, conf_hap.as_deref(), 0.0, params.compute_posterior,
-                ));
-            }
-
-            // Common path: the candidates' alleles plus the target's, gathered from the
-            // bitmatrix one site at a time as the PBWT asks for them.
-            struct GatherRows<'a> {
-                bm: &'a HaplotypeBitmatrix, chip_start: usize, candidates: &'a [u32],
-                targ_w: &'a [u8], n_haps: usize, tgt: usize, buf: Vec<u8>,
-            }
-            impl pbwt::AlleleRows for GatherRows<'_> {
-                #[inline]
-                fn row(&mut self, var: usize) -> &[u8] {
-                    let row = self.bm.row(self.chip_start + var);
-                    for (i, &c) in self.candidates.iter().enumerate() {
-                        self.buf[i] = ((row[c as usize / 64] >> (c as usize % 64)) & 1) as u8;
-                    }
-                    let n_cand = self.candidates.len();
-                    self.buf[n_cand] = self.targ_w[var * self.n_haps + self.tgt];
-                    &self.buf[..n_cand + 1]
-                }
-            }
-            let mut rows = GatherRows { bm: ref_bm, chip_start, candidates: &candidates, targ_w, n_haps, tgt, buf: row_buf };
-
-            thread_local! {
-                static WS: std::cell::RefCell<Option<pbwt::PbwtWorkspace>> =
-                    const { std::cell::RefCell::new(None) };
-            }
             let t_pbwt = std::time::Instant::now();
-            let fwd = WS.with(|ws_cell| {
-                let mut ws_opt = ws_cell.borrow_mut();
-                let ws = ws_opt.get_or_insert_with(|| pbwt::PbwtWorkspace::new(m_red, n_cand));
-                if ws.capacity() < m_red { *ws = pbwt::PbwtWorkspace::new(m_red, n_cand); }
-                pbwt::pbwt_forward_with_workspace(ws, &mut rows, n_var_w, m_red, n_cand, match_length, fl_fwd, n_cand as i32)
-            });
-            let bwd = pbwt::backward_filter_single(&fwd, n_var_w, n_cand, fl_fwd, fl_bwd);
-            let mut csc = pbwt::build_csc_matrix(&bwd, n_cand, n_var_w, fl_bwd);
+            // Both regimes return a CSC indexed by absolute haplotype ID with
+            // n_rows = n_ref, so the HMM call below is shared.
+            let csc = if is_full {
+                // Mode 2 restricts the scan to this target's candidates; a genuine
+                // shortage of candidates (the original trigger) still scans them all.
+                let filtered = mode == 2 && n_cand >= FULL_PANEL_HMM_THRESHOLD;
+                let (c, b) = if filtered {
+                    let mask = take_mask(n_ref, &candidates);
+                    let r = full_panel_csc(&ctx, tgt, row_buf, Some(&mask));
+                    give_mask(mask, &candidates);
+                    r
+                } else {
+                    full_panel_csc(&ctx, tgt, row_buf, None)
+                };
+                row_buf = b;
+                c
+            } else {
+                let (c, b) = reduced_csc(&ctx, tgt, &candidates, row_buf);
+                row_buf = b;
+                c
+            };
             STAGE_PBWT_US.fetch_add(t_pbwt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 
-            TL_RED.with(|buf| { *buf.borrow_mut() = rows.buf; });
-            // CSC indices are positions in the candidate list — remap to absolute haplotype IDs.
-            for idx in &mut csc.indices {
-                debug_assert!((*idx as usize) < candidates.len(),
-                    "CSC index {} out of bounds for {} candidates", idx, candidates.len());
-                *idx = candidates[*idx as usize] as i32;
+            // Observation only — `csc` above is what actually reaches the HMM.
+            if !is_full && tgt < superset_diag_ntgt() {
+                let (full_csc, _) = full_panel_csc(&ctx, tgt, vec![0u8; m], None);
+                compare_match_sets(&csc, &full_csc, fl_bwd);
             }
-            csc.n_rows = n_ref;
 
-            let t_hmm = std::time::Instant::now();
-            let w = super::hmm::calculate_weights(
-                &csc, cm_w, &breaks_w, n_ref,
-                est_ne, p_err,
-                Some(super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start }),
-                n_var_w, None,
-                ne_w, prior, conf_hap.as_deref(), 0.0, params.compute_posterior,
-            );
-            STAGE_HMM_US.fetch_add(t_hmm.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-            (tgt, w)
-        })
-        .collect() };
+            give_row_buf(row_buf);
+            finish(tgt, &csc)
+        };
+
+        // A group of targets sharing ONE sort. See `pbwt::pbwt_forward_shared`.
+        let shared_chunk = |chunk: &[usize]| -> Vec<(usize, HmmResult)> {
+            let cand_sets: Vec<Vec<u32>> = chunk.iter().map(|&t| cands(t)).collect();
+            // A target with too few candidates keeps the original "scan everything"
+            // behaviour; it just does so inside the shared sort.
+            let masks: Vec<Option<Vec<u64>>> = cand_sets.iter().map(|c| {
+                if c.len() < FULL_PANEL_HMM_THRESHOLD { return None; }
+                let mut mask = vec![0u64; pbwt::mask_words(n_ref)];
+                pbwt::mask_set(&mut mask, c);
+                Some(mask)
+            }).collect();
+            let targets: Vec<pbwt::SharedTarget<'_>> = chunk.iter().zip(masks.iter())
+                .map(|(&t, mk)| pbwt::SharedTarget {
+                    target_abs: (n_ref + t) as i32,
+                    keep: mk.as_deref(),
+                }).collect();
+
+            let t_pbwt = std::time::Instant::now();
+            let row_buf = take_row_buf(m);
+            let mut rows = full_panel_rows(&ctx, row_buf);
+            let fwds = SHARED_WS.with(|cell| {
+                let mut st = cell.borrow_mut();
+                let (ws, hts) = &mut *st;
+                let ws = ws.get_or_insert_with(|| pbwt::PbwtWorkspace::new(m, n_ref));
+                if ws.capacity() < m { *ws = pbwt::PbwtWorkspace::new(m, n_ref); }
+                pbwt::pbwt_forward_shared(
+                    ws, &mut rows, n_var_w, m, n_ref, match_length, fl_fwd, &targets, hts)
+            });
+            give_row_buf(rows.into_buf());
+
+            let cscs: Vec<pbwt::CscMatchMatrix> = fwds.iter().map(|fwd| {
+                let bwd = pbwt::backward_filter_single(fwd, n_var_w, n_ref, fl_fwd, fl_bwd);
+                pbwt::build_csc_matrix(&bwd, n_ref, n_var_w, fl_bwd)
+            }).collect();
+            STAGE_PBWT_US.fetch_add(t_pbwt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+
+            chunk.iter().zip(cscs.iter()).map(|(&t, csc)| finish(t, csc)).collect()
+        };
+
+        let share = share_batch();
+        let run_batch = || -> Vec<(usize, HmmResult)> {
+            if share <= 1 {
+                (batch_start..batch_end).into_par_iter().map(&per_target).collect()
+            } else {
+                let idxs: Vec<usize> = (batch_start..batch_end).collect();
+                idxs.par_chunks(share).flat_map(|c| shared_chunk(c)).collect()
+            }
+        };
         let batch_results = match hmm_pool() {
             Some(p) => p.install(run_batch),
             None => run_batch(),
@@ -455,6 +813,21 @@ pub fn process_window_hmm(
     // SELPHI_PRUNE_DIAG: drain + print the window's aggregated pruning stats
     // (no-op unless the knob is set).
     super::hmm::prune_diag_report(chip_start, chip_start + n_var_w);
+    superset_diag_report(chip_start, chip_start + n_var_w);
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let sort = pbwt::SPLIT_SORT_NS.swap(0, Relaxed) as f64 / 1e9;
+        let scan = pbwt::SPLIT_SCAN_NS.swap(0, Relaxed) as f64 / 1e9;
+        let steps = pbwt::SPLIT_SCAN_STEPS.swap(0, Relaxed);
+        if sort + scan > 0.0 {
+            let f = sort / (sort + scan);
+            crate::selphi_info!(
+                "  [SPLIT] window {}..{}: SORT {:.0} CPU-s ({:.1}%, shareable) | SCAN {:.0} CPU-s ({:.1}%, per-target) \
+                 | scan steps {} | ceiling on sharing {:.1}x",
+                chip_start, chip_start + n_var_w, sort, 100.0 * f, scan, 100.0 * (1.0 - f),
+                steps, 1.0 / (1.0 - f).max(1e-9));
+        }
+    }
     {
         let p = STAGE_PBWT_US.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
         let h = STAGE_HMM_US.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
