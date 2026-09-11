@@ -198,6 +198,86 @@ impl AlleleRows for DenseRows<'_> {
     }
 }
 
+/// Which reference haplotypes the neighbour scan is allowed to record a match
+/// for. Monomorphized, so the default `AllRefs` costs nothing in the hot loop.
+///
+/// `OnlyCands` exists for the shared-PBWT question: a full-panel sort whose scan
+/// records only this target's candidate haplotypes. The sort is then independent
+/// of the target and could be computed ONCE for every target, while the match set
+/// stays exactly the per-target one the reduced PBWT produces today — which is
+/// the point, since dropping the per-target candidate set measurably costs
+/// accuracy (see `SELPHI_FULL_PANEL_PBWT`).
+pub trait MatchFilter {
+    fn keep(&self, hap: i32) -> bool;
+}
+
+/// Record a match for any reference haplotype — the default.
+pub struct AllRefs;
+impl MatchFilter for AllRefs {
+    #[inline(always)]
+    fn keep(&self, _hap: i32) -> bool { true }
+}
+
+/// Record a match only for haplotypes flagged in an `n_ref`-wide BITSET.
+///
+/// A bitset, not a `[bool]`, because this predicate runs on every position the
+/// neighbour scan walks — 138 billion times in one MESA x TOPMed window — and
+/// the array it indexes is random-access by haplotype id. At `n_ref` = 171,054 a
+/// byte mask is 171 KB per target; with a group of 16 targets sharing a sort
+/// that is 2.7 MB of masks fighting for L2, and it MEASURED as the whole cost of
+/// sharing on that rig: scan steps grew the expected 1.25x while scan time grew
+/// 2.09x. One bit per haplotype puts the same information in 21 KB.
+pub struct OnlyCands<'a>(pub &'a [u64]);
+impl MatchFilter for OnlyCands<'_> {
+    #[inline(always)]
+    fn keep(&self, hap: i32) -> bool {
+        let h = hap as usize;
+        (self.0[h >> 6] >> (h & 63)) & 1 != 0
+    }
+}
+
+/// Number of `u64` words an `n_ref`-wide candidate bitset needs.
+#[inline]
+pub fn mask_words(n_ref: usize) -> usize { n_ref.div_ceil(64) }
+
+/// Set the bits of `candidates` in an already-zeroed bitset.
+#[inline]
+pub fn mask_set(mask: &mut [u64], candidates: &[u32]) {
+    for &h in candidates {
+        let h = h as usize;
+        mask[h >> 6] |= 1u64 << (h & 63);
+    }
+}
+
+/// Clear only the bits `mask_set` set — cheaper than zeroing the whole bitset
+/// when the candidate set is a small part of a biobank panel.
+#[inline]
+pub fn mask_clear(mask: &mut [u64], candidates: &[u32]) {
+    for &h in candidates {
+        let h = h as usize;
+        mask[h >> 6] &= !(1u64 << (h & 63));
+    }
+}
+
+/// `SELPHI_PBWT_SPLIT_DIAG=1`: split the forward pass's CPU time into the part a
+/// shared PBWT would amortise across targets and the part it would not.
+///
+///   SORT = `pbwt_forwards_ad` plus the `y[i] = row[a[i]]` gather. Depends only on
+///          the panel, so ONE shared sort serves every target.
+///   SCAN = the left/right neighbour walks around `a_inv[target]`. Per target, and
+///          under sharing it gets LONGER, because the walk passes non-candidates.
+///
+/// The ceiling on sharing is `1 / (1 - sort_fraction)`. Measure it before building
+/// the restructure — the wall is 97-99% "PBWT", but that label covers both halves.
+pub(crate) static SPLIT_SORT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static SPLIT_SCAN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static SPLIT_SCAN_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn split_diag() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| crate::config::is_one("SELPHI_PBWT_SPLIT_DIAG"))
+}
+
 /// PBWT forward pass using a pre-allocated workspace (zero allocations in hot path).
 pub fn pbwt_forward_with_workspace(
     ws: &mut PbwtWorkspace,
@@ -209,6 +289,24 @@ pub fn pbwt_forward_with_workspace(
     fl_fwd: usize,
     target_abs: i32,
 ) -> FwdResult {
+    pbwt_forward_filtered(ws, rows, n_var, m, n_ref, min_l, fl_fwd, target_abs, &AllRefs)
+}
+
+/// As `pbwt_forward_with_workspace`, with the scan's match recording restricted
+/// by `filter`. The sort itself is untouched — every haplotype still takes part
+/// in it, exactly as in the unfiltered pass.
+#[allow(clippy::too_many_arguments)]
+pub fn pbwt_forward_filtered<F: MatchFilter>(
+    ws: &mut PbwtWorkspace,
+    rows: &mut dyn AlleleRows,
+    n_var: usize,
+    m: usize,
+    n_ref: usize,
+    min_l: usize,
+    fl_fwd: usize,
+    target_abs: i32,
+    filter: &F,
+) -> FwdResult {
     ws.reset(m);
 
     let mut haps = vec![0i32; n_var * fl_fwd];
@@ -218,53 +316,25 @@ pub fn pbwt_forward_with_workspace(
     // Initial y
     ws.y[..m].copy_from_slice(&rows.row(0)[..m]);
 
+    let diag = split_diag();
+    let mut scan_steps = 0u64;
     for var in 0..n_var {
         let is_last = var >= n_var - 1;
 
+        let t_scan = if diag { Some(std::time::Instant::now()) } else { None };
         if var >= min_l {
-            let threshold = (var - min_l) as i32;
-            let ib = ws.a_inv[target_abs as usize] as usize;
-
-            // LEFT SCAN
-            {
-                let mut dmin: i32 = 0;
-                let mut pos = ib as isize - 1;
-                while pos >= 0 {
-                    let dv = ws.d[pos as usize + 1];
-                    if dv > dmin { dmin = dv; }
-                    if dmin > threshold { break; }
-                    let hap_at_pos = ws.a[pos as usize];
-                    if hap_at_pos < n_ref as i32 && (ws.y[ib] != ws.y[pos as usize] || is_last) {
-                        let mut length = var as i32 - dmin;
-                        if is_last && ws.y[ib] == ws.y[pos as usize] { length += 1; }
-                        insert_match(
-                            &mut haps, &mut lens, &mut counts, &mut ws.ht,
-                            n_var, fl_fwd, dmin as usize, hap_at_pos, length,
-                        );
-                    }
-                    pos -= 1;
-                }
-            }
-
-            // RIGHT SCAN
-            {
-                let mut dmin: i32 = 0;
-                for pos in (ib + 1)..m {
-                    let dv = ws.d[pos];
-                    if dv > dmin { dmin = dv; }
-                    if dmin > threshold { break; }
-                    let hap_at_pos = ws.a[pos];
-                    if hap_at_pos < n_ref as i32 && (ws.y[pos] != ws.y[ib] || is_last) {
-                        let mut length = var as i32 - dmin;
-                        if is_last && ws.y[ib] == ws.y[pos] { length += 1; }
-                        insert_match(
-                            &mut haps, &mut lens, &mut counts, &mut ws.ht,
-                            n_var, fl_fwd, dmin as usize, hap_at_pos, length,
-                        );
-                    }
-                }
-            }
+            let PbwtWorkspace { a, a_inv, d, y, ht, .. } = &mut *ws;
+            scan_steps += scan_site(
+                a, a_inv, d, y, m, n_ref, var, n_var, fl_fwd, min_l, is_last,
+                target_abs, filter, &mut haps, &mut lens, &mut counts, ht,
+            );
         }
+
+        let t_sort = if let Some(t) = t_scan {
+            let now = std::time::Instant::now();
+            SPLIT_SCAN_NS.fetch_add((now - t).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            Some(now)
+        } else { None };
 
         pbwt_forwards_ad(&mut ws.a, &mut ws.a_inv, &mut ws.d, &ws.y, &mut ws.b, &mut ws.e, m, var);
 
@@ -274,9 +344,191 @@ pub fn pbwt_forward_with_workspace(
                 ws.y[i] = r[ws.a[i] as usize];
             }
         }
+        if let Some(t) = t_sort {
+            SPLIT_SORT_NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
     }
+    if diag { SPLIT_SCAN_STEPS.fetch_add(scan_steps, std::sync::atomic::Ordering::Relaxed); }
 
     FwdResult { haps, lens, counts }
+}
+
+/// The neighbour scan at ONE site for ONE target: walk left and right from the
+/// target's sort position, recording matches until the running divergence says
+/// the match has become shorter than `min_l`.
+///
+/// Split out so the per-target forward and the shared forward run the SAME code
+/// — the two must not be able to drift, since the shared path's whole claim is
+/// that it reproduces the per-target one byte for byte.
+///
+/// Reads the sort state (`a`, `a_inv`, `d`, `y`) immutably: that is what makes
+/// the sort shareable. Everything it writes (`haps`, `lens`, `counts`, `ht`) is
+/// per-target.
+///
+/// Note `insert_match` is called with `dmin`, not `var`: a match is recorded at
+/// the site where it STARTED, not at the site the scan is standing on.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn scan_site<F: MatchFilter>(
+    a: &[i32], a_inv: &[i32], d: &[i32], y: &[u8], m: usize,
+    n_ref: usize, var: usize, n_var: usize, fl_fwd: usize, min_l: usize,
+    is_last: bool, target_abs: i32, filter: &F,
+    haps: &mut [i32], lens: &mut [i32], counts: &mut [i32], ht: &mut [i64],
+) -> u64 {
+    let threshold = (var - min_l) as i32;
+    let ib = a_inv[target_abs as usize] as usize;
+    let mut steps = 0u64;
+
+    // LEFT SCAN
+    {
+        let mut dmin: i32 = 0;
+        let mut pos = ib as isize - 1;
+        while pos >= 0 {
+            steps += 1;
+            let dv = d[pos as usize + 1];
+            if dv > dmin { dmin = dv; }
+            if dmin > threshold { break; }
+            let hap_at_pos = a[pos as usize];
+            if hap_at_pos < n_ref as i32 && filter.keep(hap_at_pos)
+                && (y[ib] != y[pos as usize] || is_last) {
+                let mut length = var as i32 - dmin;
+                if is_last && y[ib] == y[pos as usize] { length += 1; }
+                insert_match(haps, lens, counts, ht, n_var, fl_fwd, dmin as usize, hap_at_pos, length);
+            }
+            pos -= 1;
+        }
+    }
+
+    // RIGHT SCAN
+    {
+        let mut dmin: i32 = 0;
+        for pos in (ib + 1)..m {
+            steps += 1;
+            let dv = d[pos];
+            if dv > dmin { dmin = dv; }
+            if dmin > threshold { break; }
+            let hap_at_pos = a[pos];
+            if hap_at_pos < n_ref as i32 && filter.keep(hap_at_pos)
+                && (y[pos] != y[ib] || is_last) {
+                let mut length = var as i32 - dmin;
+                if is_last && y[ib] == y[pos] { length += 1; }
+                insert_match(haps, lens, counts, ht, n_var, fl_fwd, dmin as usize, hap_at_pos, length);
+            }
+        }
+    }
+    steps
+}
+
+/// One target taking part in a shared forward pass.
+pub struct SharedTarget<'a> {
+    /// The target's absolute index in the merged panel (`n_ref + tgt`).
+    pub target_abs: i32,
+    /// `n_ref`-wide candidate bitset; `None` records matches for every reference hap.
+    pub keep: Option<&'a [u64]>,
+}
+
+/// Forward pass with the SORT SHARED across a batch of targets.
+///
+/// This is the whole point of the exercise. The sort (`pbwt_forwards_ad` plus the
+/// `y[i] = row[a[i]]` gather) depends only on the panel, so it is advanced ONCE
+/// per site and every target in `targets` scans the same `a`/`d`/`y`. Per target
+/// only the neighbour scan runs, against its own candidate mask and its own
+/// `ht`/top-K buffers.
+///
+/// Byte-identical to calling `pbwt_forward_filtered` once per target with the
+/// same mask: same sort (it never depended on the target), same `scan_site`,
+/// same per-target state.
+///
+/// Cost model, measured on MESA 100 x TOPMed chr20: the sort is 67.6% of the
+/// forward and the scan 32.4%, so amortising the sort over B targets takes the
+/// forward to `0.324 + 0.676/B` of its per-target cost — before the ~1.29x the
+/// scan grows by, because it now walks past non-candidates too. The ceiling is
+/// therefore ~2.4x on the forward, not the ~7,000x the raw sort-work ratio
+/// suggests. On chr22 x 1KG the sort is only 43.2% and the ceiling ~1.4x.
+///
+/// `hts` must hold `targets.len()` buffers; they are resized and zeroed here.
+#[allow(clippy::too_many_arguments)]
+pub fn pbwt_forward_shared(
+    ws: &mut PbwtWorkspace,
+    rows: &mut dyn AlleleRows,
+    n_var: usize,
+    m: usize,
+    n_ref: usize,
+    min_l: usize,
+    fl_fwd: usize,
+    targets: &[SharedTarget<'_>],
+    hts: &mut Vec<Vec<i64>>,
+) -> Vec<FwdResult> {
+    ws.reset(m);
+    let n_t = targets.len();
+    let mut out: Vec<FwdResult> = (0..n_t).map(|_| FwdResult {
+        haps: vec![0i32; n_var * fl_fwd],
+        lens: vec![0i32; n_var * fl_fwd],
+        counts: vec![0i32; n_var],
+    }).collect();
+    while hts.len() < n_t { hts.push(Vec::new()); }
+    for h in hts[..n_t].iter_mut() {
+        if h.len() < n_ref { h.resize(n_ref, 0); }
+        h[..n_ref].fill(0);
+    }
+
+    ws.y[..m].copy_from_slice(&rows.row(0)[..m]);
+
+    let diag = split_diag();
+    let mut scan_steps = 0u64;
+    let mut order: Vec<(i32, usize)> = Vec::with_capacity(n_t);
+    for var in 0..n_var {
+        let is_last = var >= n_var - 1;
+
+        let t_scan = if diag { Some(std::time::Instant::now()) } else { None };
+        if var >= min_l {
+            let PbwtWorkspace { a, a_inv, d, y, .. } = &*ws;
+            // Scan the group in SORT-POSITION order, not target order. Each scan
+            // walks outward from `a_inv[target]` over the shared a/d/y, so targets
+            // that sit near each other in the sort walk overlapping memory; taking
+            // them consecutively keeps that memory hot. Ordering cannot affect the
+            // result — every target writes only its own buffers — and it is the
+            // one lever on the cost that sharing ADDS: per scan step the shared
+            // path measured 1.53x the per-target path, because B targets each walk
+            // a different region of a bigger array at every site.
+            order.clear();
+            order.extend(targets.iter().enumerate().map(|(t, tg)| (a_inv[tg.target_abs as usize], t)));
+            order.sort_unstable();
+            for &(_, t) in order.iter() {
+                let tg = &targets[t];
+                let o = &mut out[t];
+                let ht = &mut hts[t];
+                scan_steps += match tg.keep {
+                    None => scan_site(
+                        a, a_inv, d, y, m, n_ref, var, n_var, fl_fwd, min_l, is_last,
+                        tg.target_abs, &AllRefs, &mut o.haps, &mut o.lens, &mut o.counts, ht),
+                    Some(k) => scan_site(
+                        a, a_inv, d, y, m, n_ref, var, n_var, fl_fwd, min_l, is_last,
+                        tg.target_abs, &OnlyCands(k), &mut o.haps, &mut o.lens, &mut o.counts, ht),
+                };
+            }
+        }
+        let t_sort = if let Some(t) = t_scan {
+            let now = std::time::Instant::now();
+            SPLIT_SCAN_NS.fetch_add((now - t).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            Some(now)
+        } else { None };
+
+        pbwt_forwards_ad(&mut ws.a, &mut ws.a_inv, &mut ws.d, &ws.y, &mut ws.b, &mut ws.e, m, var);
+
+        if var < n_var - 1 {
+            let r = rows.row(var + 1);
+            for i in 0..m {
+                ws.y[i] = r[ws.a[i] as usize];
+            }
+        }
+        if let Some(t) = t_sort {
+            SPLIT_SORT_NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    if diag { SPLIT_SCAN_STEPS.fetch_add(scan_steps, std::sync::atomic::Ordering::Relaxed); }
+
+    out
 }
 
 /// PBWT forward pass with match finding for a single target haplotype.
