@@ -80,10 +80,46 @@ pub(crate) fn auto_calibrate_pbwt_params(
     n_ref: usize,
     n_chip: usize,
 ) -> PbwtParams {
+    // Minimum match length for the imputation PBWT: the neighbour scan walks
+    // outward from the target until the running divergence says the match has
+    // fallen below this many markers, so it sets both how much evidence a match
+    // needs and how long the walk is.
+    //
+    // MEASURED 2026-09-11 on a nested panel-size ladder cut from one source
+    // (chr22, 801 targets with WGS truth, leak-free at every rung), taking the
+    // largest value whose nine MAF bins are ALL at or above the old default:
+    //
+    //   750 haplotypes -> 5    3,000 -> 8      171,054 -> 10
+    //   1,500          -> 7    4,478 -> 9-10
+    //
+    // `clamp(round(1.6 * log2(n_ref) - 10.0), 5, 10)` reproduces every anchor.
+    // Slope and saturation are FITTED to those points, not derived; refit if new
+    // anchors appear.
+    //
+    // The offset is -10.0 rather than -10.3 because of one measured knife edge:
+    // at 4,802 haplotypes, 10 is a uniform win on all four 801-sample 1KG
+    // chromosomes but 9 dips chr1's rarest bin by 0.000212 over 730,942
+    // variants (non-monotonic: 5 -> 0.345376, 9 -> 0.345164, 10 -> 0.345385).
+    // -10.0 lands 4,478 on 9 (measured uniform) and 4,802 on 10 (measured
+    // uniform), which is the safe side of that edge in both directions.
+    //
+    // What this replaces: `min(log2(n_ref) - 7, n_chip/2000).max(5)`, which
+    // returned 5 on every panel below ~9,800 haplotypes — the floor did all the
+    // work — and above that let the chip-density cap hold a 171k-haplotype panel
+    // at 7 where 10 measures better in five of six bins. `n_chip` is gone: it was
+    // the binding term on exactly one rig and it was wrong there.
+    //
+    // The floor of 5 survives untouched and it is NOT cosmetic: at 750
+    // haplotypes, 7 regresses eight of nine bins and 10 regresses all nine. That
+    // is the small-panel regime we actually ship into.
+    //
+    // Worth ~+0.0004 OVERALL R² and -16% wall on the four 801-sample 1KG
+    // chromosomes; the accuracy gain and the speed gain come from the same
+    // change, because a longer minimum match is a shorter scan.
     let match_length = match_length_override.unwrap_or_else(|| {
-        // saturating_sub: log2(n_ref) < 7 when n_ref < 128 would underflow usize.
-        let ml = ((n_ref as f64).log2() as usize).saturating_sub(7);
-        ml.min(n_chip / 2000).max(5)
+        let _ = n_chip;
+        let ml = 1.6 * (n_ref.max(2) as f64).log2() - 10.0;
+        ml.round().clamp(5.0, 10.0) as usize
     });
     let log2_haps = (n_ref as f64).log2();
     let fl_fwd = fl_fwd_override.unwrap_or_else(|| {

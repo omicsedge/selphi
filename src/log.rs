@@ -204,6 +204,27 @@ pub fn peak_mem_mb() -> f64 {
     0.0
 }
 
+/// RAM the kernel says a new allocation can actually take right now, in MB —
+/// `MemAvailable`, not `MemTotal`. The difference matters on a shared box: this
+/// one routinely has several imputation runs on it, and a decision made against
+/// total RAM would happily double-book memory another job is already using.
+/// `MemAvailable` already discounts this process's own RSS (it is resident) and
+/// counts reclaimable page cache as available, which is the right answer for
+/// "can I grow by X without swapping".
+///
+/// Returns `None` when the kernel does not publish it (pre-3.14 Linux, macOS),
+/// so callers can fall back rather than silently treat 0 as "no room".
+pub fn available_ram_mb() -> Option<f64> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in info.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: f64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb / 1024.0);
+        }
+    }
+    None
+}
+
 /// Total system RAM in MB. Works on Linux (/proc/meminfo) and macOS (sysctl).
 pub fn system_ram_mb() -> f64 {
     // Linux
