@@ -281,7 +281,8 @@ thread_local! {
 }
 
 /// `SELPHI_PBWT_SHARE=B`: run the PBWT sort ONCE for every B target haplotypes
-/// instead of once per target. 0 or 1 (the default) keeps the per-target sort.
+/// instead of once per target. **0 (the default) means AUTO** — see
+/// `auto_share_batch`. 1 turns sharing off outright; any other value is used as B.
 ///
 /// The sort depends only on the panel, so this is byte-identical — it is the
 /// `SELPHI_FULL_PANEL_PBWT=2` geometry with the sort hoisted out of the target
@@ -299,6 +300,80 @@ thread_local! {
 fn share_batch() -> usize {
     static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *B.get_or_init(|| crate::config::usize_or("SELPHI_PBWT_SHARE", 0))
+}
+
+/// How wide the per-target map actually runs — `SELPHI_HMM_THREADS` if it narrows
+/// the stage, otherwise the global pool.
+fn hmm_pool_width() -> usize {
+    let n = crate::config::usize_or("SELPHI_HMM_THREADS", 0);
+    if n > 0 { n } else { rayon::current_num_threads().max(1) }
+}
+
+/// Largest share group this machine can afford RIGHT NOW, for THIS window.
+///
+/// Sharing the sort is byte-identical at every B, so this is purely a
+/// memory-for-time decision and it is safe to make it from the machine's state:
+/// two runs that pick different B produce the same output. What it costs is one
+/// forward match buffer (`2 * n_var * fl_fwd * 4`) plus one `ht` (`n_ref * 8`)
+/// per target IN FLIGHT, where the per-target sort needed one target's worth per
+/// thread — so the extra is `threads * (B - 1) * per_target`.
+///
+/// Deliberately timid, for three reasons. The budget is a third of `MemAvailable`
+/// (not of total RAM — this box runs several imputation jobs at once), it keeps a
+/// 4 GB floor untouched, and the run still has to grow into interpolation after
+/// this stage. Below `MIN_WORTH` the answer is "don't bother": the measured gain
+/// at B=4 is small and the memory is better left alone. Capped at `MAX_B` = 16,
+/// where the measurements flatten — chr22 at B=32 bought 1% more stage and lost
+/// more than that back to memory pressure.
+///
+/// Recomputed per window because `n_var` (hence the per-target cost) differs by
+/// window and because another job may have arrived in the meantime.
+fn auto_share_batch(n_var_w: usize, fl_fwd: usize, n_ref: usize) -> usize {
+    let Some(avail_mb) = crate::log::available_ram_mb() else { return 1 };
+    share_batch_for_budget(avail_mb, per_target_mb(n_var_w, fl_fwd, n_ref), hmm_pool_width())
+}
+
+/// Memory one target in flight costs the shared path: its forward match buffers
+/// (`haps` + `lens`, `n_var * fl_fwd` i32 each) plus its `ht` (`n_ref` i64).
+fn per_target_mb(n_var_w: usize, fl_fwd: usize, n_ref: usize) -> f64 {
+    (2.0 * n_var_w as f64 * fl_fwd as f64 * 4.0 + n_ref as f64 * 8.0) / (1024.0 * 1024.0)
+}
+
+/// The arithmetic of `auto_share_batch`, split out so it can be tested without
+/// having to starve the machine of memory first.
+fn share_batch_for_budget(avail_mb: f64, per_target_mb: f64, threads: usize) -> usize {
+    const MAX_B: usize = 16;
+    const MIN_WORTH: usize = 4;
+    const RESERVE_MB: f64 = 4096.0;
+    const BUDGET_FRACTION: f64 = 0.33;
+
+    let budget_mb = (avail_mb * BUDGET_FRACTION) - RESERVE_MB;
+    if budget_mb <= 0.0 || per_target_mb <= 0.0 || threads == 0 { return 1; }
+    let b = 1 + (budget_mb / (threads as f64 * per_target_mb)).floor() as usize;
+    if b < MIN_WORTH { 1 } else { b.min(MAX_B) }
+}
+
+/// Resolve the share group for this window: explicit knob if set, else auto.
+fn resolve_share(n_var_w: usize, fl_fwd: usize, n_ref: usize) -> usize {
+    let knob = share_batch();
+    if knob >= 1 { return knob; }
+    let b = auto_share_batch(n_var_w, fl_fwd, n_ref);
+    let per_target_mb = per_target_mb(n_var_w, fl_fwd, n_ref);
+    let avail = crate::log::available_ram_mb().unwrap_or(0.0);
+    if b > 1 {
+        crate::selphi_info!(
+            "  PBWT sort shared across {} targets (auto: {:.0} GB available, {:.1} MB per \
+             in-flight target x {} threads -> +{:.1} GB). Byte-identical; set \
+             SELPHI_PBWT_SHARE=1 to disable.",
+            b, avail / 1024.0, per_target_mb, hmm_pool_width(),
+            (b - 1) as f64 * hmm_pool_width() as f64 * per_target_mb / 1024.0);
+    } else {
+        crate::selphi_debug!(
+            "  PBWT sort kept per-target (auto: {:.0} GB available, {:.1} MB per in-flight \
+             target x {} threads — not enough headroom to be worth it)",
+            avail / 1024.0, per_target_mb, hmm_pool_width());
+    }
+    b
 }
 
 // `n_ref`-wide candidate mask for `SELPHI_FULL_PANEL_PBWT=2`, reset only where
@@ -769,7 +844,7 @@ pub fn process_window_hmm(
             chunk.iter().zip(cscs.iter()).map(|(&t, csc)| finish(t, csc)).collect()
         };
 
-        let share = share_batch();
+        let share = resolve_share(n_var_w, fl_fwd, n_ref);
         let run_batch = || -> Vec<(usize, HmmResult)> {
             if share <= 1 {
                 (batch_start..batch_end).into_par_iter().map(&per_target).collect()
@@ -838,4 +913,46 @@ pub fn process_window_hmm(
     }
 
     WindowHmmOutput { all_weights }
+}
+
+#[cfg(test)]
+mod share_tests {
+    use super::share_batch_for_budget;
+
+    /// MESA 100 x TOPMed shape: 11,980 sites x fl_fwd 149 + 171,054 haps = ~15.0 MB
+    /// per in-flight target, 16 threads.
+    const MESA_PER_TARGET_MB: f64 = 15.0;
+
+    #[test]
+    fn roomy_machine_takes_the_cap() {
+        // 116 GB free, as the dev box: budget is tens of GB, so the cap binds.
+        assert_eq!(share_batch_for_budget(116_000.0, MESA_PER_TARGET_MB, 16), 16);
+    }
+
+    #[test]
+    fn tight_machine_stays_per_target() {
+        // Below ~15 GB available the third-of-free budget cannot buy a group of 4,
+        // and anything smaller is not worth the memory.
+        assert_eq!(share_batch_for_budget(14_000.0, MESA_PER_TARGET_MB, 16), 1);
+        // Under the 4 GB reserve there is no budget at all.
+        assert_eq!(share_batch_for_budget(8_000.0, MESA_PER_TARGET_MB, 16), 1);
+        assert_eq!(share_batch_for_budget(0.0, MESA_PER_TARGET_MB, 16), 1);
+    }
+
+    #[test]
+    fn scales_down_with_threads_and_target_cost() {
+        // Same box, wider stage -> each extra B costs more -> smaller group.
+        let narrow = share_batch_for_budget(30_000.0, MESA_PER_TARGET_MB, 8);
+        let wide = share_batch_for_budget(30_000.0, MESA_PER_TARGET_MB, 64);
+        assert!(narrow > wide, "narrow {narrow} should exceed wide {wide}");
+        // A costlier window (more sites) also shrinks the group.
+        assert!(share_batch_for_budget(30_000.0, 200.0, 16)
+            < share_batch_for_budget(30_000.0, MESA_PER_TARGET_MB, 16));
+    }
+
+    #[test]
+    fn degenerate_inputs_are_off_not_panics() {
+        assert_eq!(share_batch_for_budget(116_000.0, 0.0, 16), 1);
+        assert_eq!(share_batch_for_budget(116_000.0, MESA_PER_TARGET_MB, 0), 1);
+    }
 }
