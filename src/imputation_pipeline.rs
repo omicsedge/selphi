@@ -229,14 +229,8 @@ fn setup_output_writers(
     };
     // Append the format extension only when absent, so `--out x.vcf.gz` is not
     // rewritten to `x.vcf.vcf.gz` (with_extension replaces only the final `.gz`).
-    let out_file = if formats.bcf {
-        if out_path.extension().is_none_or(|e| e != "bcf") { out_path.with_extension("bcf") }
-        else { out_path.to_path_buf() }
-    } else if out_path.extension().is_none_or(|e| e != "gz") {
-        out_path.with_extension("vcf.gz")
-    } else {
-        out_path.to_path_buf()
-    };
+    let out_file = if formats.bcf { selphi::common::utils::out_path(out_path, "bcf") }
+    else { selphi::common::utils::out_path(out_path, "vcf.gz") };
 
     // sample_batch_size is in SAMPLES; HMM internals work in haps (× 2).
     let target_batch_size_haps = args.sample_batch_size.saturating_mul(2);
@@ -254,12 +248,12 @@ fn setup_output_writers(
 
     // Non-batched single-stream writers (active when --sample-batch-size == 0).
     let parquet = if formats.parquet && !batched {
-        let pq_file = out_path.with_extension("parquet");
+        let pq_file = selphi::common::utils::out_path(out_path, "parquet");
         Some(selphi::io::parquet_output::setup_parquet_writer(&pq_file, sample_names)
             .expect("Failed to setup Parquet writer"))
     } else { None };
     let pgen = if formats.pgen && !batched {
-        let pgen_file = out_path.with_extension("pgen");
+        let pgen_file = selphi::common::utils::out_path(out_path, "pgen");
         selphi::io::pgen_output::write_psam(&pgen_file, sample_names).expect("Failed to write .psam");
         let pvar = selphi::io::pgen_output::write_pvar(&pgen_file).expect("Failed to write .pvar");
         let pg = selphi::io::pgen_output::PgenWriter::new(&pgen_file, n_samples).expect("Failed to create .pgen");
@@ -934,7 +928,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     let map_path = args.map_path.as_deref().expect("--map is required");
 
     // Initialize global logger (writes to stderr + .log file)
-    let log_path = PathBuf::from(output_path).with_extension("log");
+    let log_path = selphi::common::utils::out_path(std::path::Path::new(output_path), "log");
     selphi::log::init(&log_path, args.debug);
 
     let version = env!("CARGO_PKG_VERSION");

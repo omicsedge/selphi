@@ -42,6 +42,13 @@ fn main() {
             Err(e) => { eprintln!("ERROR: --config {cfg_path}: {e}"); std::process::exit(2); }
         }
     }
+    // --drop-long-alleles is a CLI flag over an engine knob, so it has to reach
+    // the environment before any engine read. Same position and same soundness
+    // argument as --config above: single-threaded, immediately post-parse.
+    if args.drop_long_alleles {
+        unsafe { std::env::set_var("SELPHI_DROP_LONG_ALLELES", "1"); }
+    }
+
     // --dump-config: print the full effective configuration (after --config + env) and exit.
     if args.dump_config {
         print!("{}", selphi::config::dump_config());
@@ -209,7 +216,7 @@ fn main() {
             .unwrap_or_else(|| { eprintln!("Error: --map is required for --lcwgs"); std::process::exit(1); });
         let output = args.out.as_deref().unwrap_or("lcwgs_imputed");
 
-        let log_path = PathBuf::from(output).with_extension("log");
+        let log_path = selphi::common::utils::out_path(std::path::Path::new(output), "log");
         selphi::log::init(&log_path, args.debug);
         selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
         selphi_info!("  mode:     lcwgs");
@@ -348,7 +355,7 @@ fn main() {
         let truth = args.truth.as_ref().expect("--truth required with --evaluate");
         let output = args.out.as_deref().unwrap_or("eval_results");
 
-        let log_path = PathBuf::from(output).with_extension("log");
+        let log_path = selphi::common::utils::out_path(std::path::Path::new(output), "log");
         selphi::log::init(&log_path, args.debug);
 
         selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
@@ -397,7 +404,7 @@ fn main() {
             }
         };
 
-        let json_path = PathBuf::from(output).with_extension("json");
+        let json_path = selphi::common::utils::out_path(std::path::Path::new(output), "json");
         if homref {
             let raw_path = args.truth_raw.as_deref().map(Path::new);
             let excl_path = args.exclude_sites.as_deref().map(Path::new);
@@ -505,7 +512,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
     // --- Merge per-chr SRP files into multi-chr ---
     if let Some(ref merge_list) = args.merge_srps {
         let output = args.out.as_deref().unwrap_or("merged");
-        let log_path = PathBuf::from(output).with_extension("log");
+        let log_path = selphi::common::utils::out_path(std::path::Path::new(output), "log");
         selphi::log::init(&log_path, args.debug);
         selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
         selphi_info!("  mode:     merge-srps (per-chr → multi-chr)");
@@ -526,7 +533,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
     // --- Merge SRP files from directory ---
     if let Some(ref dir) = args.merge_srps_dir {
         let output = args.out.as_deref().unwrap_or("merged");
-        let log_path = PathBuf::from(output).with_extension("log");
+        let log_path = selphi::common::utils::out_path(std::path::Path::new(output), "log");
         selphi::log::init(&log_path, args.debug);
         selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
         selphi_info!("  mode:     merge-srps-dir (directory → multi-chr SRP)");
@@ -546,7 +553,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
         // Directory mode: scan for per-chr BCF/VCF → build multi-chr SRP
         if Path::new(source).is_dir() {
             let output = args.out.as_deref().unwrap_or("panel");
-            let log_path = PathBuf::from(output).with_extension("log");
+            let log_path = selphi::common::utils::out_path(std::path::Path::new(output), "log");
             selphi::log::init(&log_path, args.debug);
             selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
             selphi_info!("  mode:     prepare-reference (directory → multi-chr SRP)");
@@ -583,7 +590,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
         let want_decode = (source.ends_with(".bref3") || is_srp_input)
             && (output.ends_with(".vcf.gz") || output.ends_with(".bcf"));
         if want_decode {
-            let log_path = PathBuf::from(output).with_extension("log");
+            let log_path = selphi::common::utils::out_path(std::path::Path::new(output), "log");
             selphi::log::init(&log_path, args.debug);
             selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
             let in_fmt = if is_srp_input { "SRP" } else { "BREF3" };
@@ -602,7 +609,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
 
         let output_bref3 = output.ends_with(".bref3") || is_srp_input;
 
-        let log_path = PathBuf::from(output).with_extension("log");
+        let log_path = selphi::common::utils::out_path(std::path::Path::new(output), "log");
         selphi::log::init(&log_path, args.debug);
 
         let version = env!("CARGO_PKG_VERSION");
@@ -743,7 +750,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
         }
         let map_path = args.map_path.as_deref().unwrap_or("unused"); // only used if --map-dir not set
 
-        let log_path = PathBuf::from(output_path).with_extension("log");
+        let log_path = selphi::common::utils::out_path(std::path::Path::new(output_path), "log");
         selphi::log::init(&log_path, args.debug);
         selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
         selphi_info!("  mode:     multi-chr imputation (unified SRP)");

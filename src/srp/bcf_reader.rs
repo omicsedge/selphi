@@ -30,6 +30,9 @@ pub struct RegionResult {
     pub chunk_files: Vec<PathBuf>,
     pub chunk_row_counts: Vec<usize>,  // n_rows per chunk (avoids decompressing to read header)
     pub n_variants: usize,
+    /// Records dropped for a REF/ALT longer than the SRP 255-byte cap
+    /// (`SELPHI_DROP_LONG_ALLELES`); 0 unless that knob is set.
+    pub n_skipped_long: usize,
 }
 
 /// Parallel BCF reader. Each thread writes to disk.
@@ -164,6 +167,8 @@ fn process_region(
     let mut cols: Vec<Vec<i32>> = vec![Vec::new(); nh];
     let mut row = 0usize;
     let mut n_variants = 0usize;
+    let mut n_skipped_long = 0usize;
+    let drop_long = crate::config::is_one("SELPHI_DROP_LONG_ALLELES");
     let mut chunk_idx = 0usize;
     // Phase guard state: sample the first diploid calls of the region (the VCF
     // panel path checks the first <=10 GTs of the first record; this is the same
@@ -211,6 +216,18 @@ fn process_region(
         let id = rtstr(&sb, &mut o);
         let mut al = Vec::with_capacity(na);
         for _ in 0..na { al.push(rtstr(&sb, &mut o)); }
+
+        // SELPHI_DROP_LONG_ALLELES: skip records whose REF or ALT exceeds the
+        // 255-byte cap the SRP variant index encodes lengths in. Done HERE,
+        // before the genotypes are extracted, so the row is never allocated and
+        // the variant index and the haplotype matrix cannot fall out of step —
+        // the reason this is not a post-hoc filter. Default off: the builder
+        // errors instead, because dropping panel variants silently is worse than
+        // stopping. Reported from a production panel build, 2026-09-13.
+        if drop_long && (al[0].len() > 255 || al.get(1).is_some_and(|a| a.len() > 255)) {
+            n_skipped_long += 1;
+            continue;
+        }
 
         // GT
         let mut io2 = 0usize;
@@ -295,7 +312,7 @@ fn process_region(
             "BCF panel is unphased (a '/' genotype separator was found); a reference panel must \
 contain phased haplotypes — phase it first (e.g. selphi --phase-panel) or supply the phased BCF"));
     }
-    Ok(RegionResult { meta_file: meta_path, chunk_files, chunk_row_counts, n_variants })
+    Ok(RegionResult { meta_file: meta_path, chunk_files, chunk_row_counts, n_variants, n_skipped_long })
 }
 
 fn compress_chunk(col_lists: &[Vec<i32>], n_rows: usize, n_haps: usize) -> Vec<u8> {
