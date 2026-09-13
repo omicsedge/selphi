@@ -11,7 +11,7 @@
 //! alongside position and alleles — so the multi-chr call is the same call, just
 //! against a whole-genome output and truth.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use selphi::{selphi_info, selphi_step};
 
@@ -78,7 +78,7 @@ pub fn evaluate(req: &EvalRequest, output_path: &str, final_path: &Path) {
         "off" | "false" | "0" => false,
         _ => !selphi::eval::accuracy::truth_has_ref_calls(truth_path).unwrap_or(true),
     };
-    let json_path = PathBuf::from(output_path).with_extension("eval.json");
+    let json_path = selphi::common::utils::out_path(Path::new(output_path), "eval.json");
     if homref {
         selphi_info!("  homref:   absent→hom-ref (truth is variant-only)");
         let raw_path = req.truth_raw.as_deref().map(Path::new);

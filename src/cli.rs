@@ -291,6 +291,16 @@ pub struct Args {
     #[arg(long)]
     pub fl_bwd: Option<usize>,
 
+    /// Drop reference-panel variants whose REF or ALT exceeds 255 bytes instead
+    /// of failing the build. The SRP variant index stores allele lengths as a
+    /// u8, so a longer allele cannot be represented; the default is to stop with
+    /// an error rather than quietly change the panel. Set this when the input
+    /// carries a handful of structural-scale indels and you want them excluded,
+    /// the same thing `bcftools view -e 'strlen(REF)>255 || strlen(ALT)>255'`
+    /// does as a pre-pass. The number of dropped records is logged.
+    #[arg(long)]
+    pub drop_long_alleles: bool,
+
     /// Maximum candidates retained from per-window PBWT top-K selection.
     /// 0 = AUTO: scaled by panel size and panel diversity. Set explicitly to
     /// override the auto value.

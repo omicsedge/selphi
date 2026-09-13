@@ -140,7 +140,7 @@ pub fn run(config: &SelfTestConfig) -> u32 {
     let SelfTestConfig { refpanel, input, map, out_base, truth, threads } = config;
     let t = format!("--threads={}", threads);
 
-    let log_path = PathBuf::from(out_base).with_extension("log");
+    let log_path = selphi::common::utils::out_path(std::path::Path::new(out_base), "log");
     selphi::log::init(&log_path, false);
     selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
     selphi_info!("  mode:     self-test");
