@@ -510,6 +510,10 @@ pub fn build_srp_unified(
 
     selphi_info!("  samples:  {} ({} haplotypes)", hdr.n_samples, n_haps);
     selphi_info!("  variants: {} (chr{}, {}–{})", n_variants, chromosome, min_pos, max_pos);
+    let n_dropped: usize = region_results.iter().map(|r| r.n_skipped_long).sum();
+    if n_dropped > 0 {
+        selphi_info!("  dropped {} variant(s) with REF/ALT >255 B (--drop-long-alleles)", n_dropped);
+    }
     selphi_info!("  chunks:   {} (chunk_size={})", total_chunks, chunk_size);
 
     let all_row_counts: Vec<usize> = region_results.iter()

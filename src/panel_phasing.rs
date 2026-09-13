@@ -388,7 +388,7 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
     let map_path = args.map_path.as_deref()
         .unwrap_or_else(|| { selphi_error!("--map is required for --phase-panel"); std::process::exit(1); });
 
-    let log_path = PathBuf::from(output_path).with_extension("log");
+    let log_path = selphi::common::utils::out_path(Path::new(output_path), "log");
     selphi::log::init(&log_path, args.debug);
     let version = env!("CARGO_PKG_VERSION");
     selphi::log::print_banner(version);
@@ -565,9 +565,7 @@ bcftools view -e 'strlen(REF)>255 || max(strlen(ALT))>255', or omit --srp/--bref
 
     // 7. Output phased VCF.gz (always — the canonical genotype output).
     let out_path = PathBuf::from(output_path);
-    let out_vcf = if out_path.extension().is_none_or(|e| e != "gz") {
-        out_path.with_extension("vcf.gz")
-    } else { out_path.clone() };
+    let out_vcf = selphi::common::utils::out_path(&out_path, "vcf.gz");
     write_panel_vcf(&phased, &markers, &sample_names, n_var, n_haps, &out_vcf)
         .unwrap_or_else(|e| { selphi_error!("Failed to write phased panel VCF: {}", e); std::process::exit(1); });
     selphi_step!("Phased panel VCF: {}", out_vcf.display());
@@ -784,7 +782,7 @@ fn run_streaming(args: &Args, input_path: &str, output_path: &str, map_path: &st
 
     // 4. Output VCF.gz (incremental) + streaming chunk loop.
     let out_path = PathBuf::from(output_path);
-    let out_vcf = if out_path.extension().is_none_or(|e| e != "gz") { out_path.with_extension("vcf.gz") } else { out_path.clone() };
+    let out_vcf = selphi::common::utils::out_path(&out_path, "vcf.gz");
     let mut writer = PanelVcfWriter::create(&out_vcf, &sample_names, &chrom, n_haps)
         .unwrap_or_else(|e| { selphi_error!("Cannot create {}: {}", out_vcf.display(), e); std::process::exit(1); });
 

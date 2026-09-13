@@ -78,7 +78,8 @@ pub fn check_record_lens(chrom: &[u8], ref_allele: &[u8], alt_allele: &[u8]) -> 
                 .map(|&c| if c.is_ascii_graphic() { c as char } else { '.' }).collect();
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!(
                 "SRP record {} length {} exceeds the 255-byte u8 limit (preview: '{}...'). \
-                 Pre-normalize with `bcftools norm -m-` or filter alleles >255 bp before building the SRP.",
+                 Pass --drop-long-alleles to exclude such records (the count is logged), \
+                 or pre-filter with `bcftools view -e 'strlen(REF)>255 || strlen(ALT)>255'`.",
                 field, b.len(), preview)));
         }
         Ok(())
