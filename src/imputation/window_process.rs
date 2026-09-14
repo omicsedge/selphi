@@ -328,15 +328,35 @@ fn hmm_pool_width() -> usize {
 ///
 /// Recomputed per window because `n_var` (hence the per-target cost) differs by
 /// window and because another job may have arrived in the meantime.
-fn auto_share_batch(n_var_w: usize, fl_fwd: usize, n_ref: usize) -> usize {
+fn auto_share_batch(n_var_w: usize, fl_fwd: usize, n_ref: usize, n_haps: usize) -> usize {
     let Some(avail_mb) = crate::log::available_ram_mb() else { return 1 };
-    share_batch_for_budget(avail_mb, per_target_mb(n_var_w, fl_fwd, n_ref), hmm_pool_width())
+    let threads = hmm_pool_width();
+    let by_memory = share_batch_for_budget(avail_mb, per_target_mb(n_var_w, fl_fwd, n_ref), threads);
+    // Sharing groups B targets onto ONE thread and sorts the WHOLE panel for them,
+    // where the per-target path sorts only each target's mc candidates, every target
+    // on its own thread. So it pays off only when there are far more targets than
+    // threads to keep busy: n_haps / B groups must still fill the pool. With 12
+    // target haplotypes on 16 threads it turned one parallel 24k-hap sort per target
+    // into one serial 75k-hap sort while 15 threads idled -- PBWT 3.0 s -> 37.0 s on a
+    // consumer-array chromosome (2026-09-14), and it had been silently on by default.
+    // The memory gate alone could never see that; RAM was plentiful.
+    let by_parallelism = n_haps / threads.max(1);
+    let b = by_memory.min(by_parallelism);
+    if b < 4 { 1 } else { b }
 }
 
 /// Memory one target in flight costs the shared path: its forward match buffers
 /// (`haps` + `lens`, `n_var * fl_fwd` i32 each) plus its `ht` (`n_ref` i64).
 fn per_target_mb(n_var_w: usize, fl_fwd: usize, n_ref: usize) -> f64 {
     (2.0 * n_var_w as f64 * fl_fwd as f64 * 4.0 + n_ref as f64 * 8.0) / (1024.0 * 1024.0)
+}
+
+/// Both gates together, pure, for the tests: memory budget AND enough target
+/// groups to keep every thread busy.
+#[cfg(test)]
+fn pick_share(avail_mb: f64, per_target_mb: f64, threads: usize, n_haps: usize) -> usize {
+    let b = share_batch_for_budget(avail_mb, per_target_mb, threads).min(n_haps / threads.max(1));
+    if b < 4 { 1 } else { b }
 }
 
 /// The arithmetic of `auto_share_batch`, split out so it can be tested without
@@ -354,10 +374,10 @@ fn share_batch_for_budget(avail_mb: f64, per_target_mb: f64, threads: usize) -> 
 }
 
 /// Resolve the share group for this window: explicit knob if set, else auto.
-fn resolve_share(n_var_w: usize, fl_fwd: usize, n_ref: usize) -> usize {
+fn resolve_share(n_var_w: usize, fl_fwd: usize, n_ref: usize, n_haps: usize) -> usize {
     let knob = share_batch();
     if knob >= 1 { return knob; }
-    let b = auto_share_batch(n_var_w, fl_fwd, n_ref);
+    let b = auto_share_batch(n_var_w, fl_fwd, n_ref, n_haps);
     let per_target_mb = per_target_mb(n_var_w, fl_fwd, n_ref);
     let avail = crate::log::available_ram_mb().unwrap_or(0.0);
     if b > 1 {
@@ -844,7 +864,7 @@ pub fn process_window_hmm(
             chunk.iter().zip(cscs.iter()).map(|(&t, csc)| finish(t, csc)).collect()
         };
 
-        let share = resolve_share(n_var_w, fl_fwd, n_ref);
+        let share = resolve_share(n_var_w, fl_fwd, n_ref, n_haps);
         let run_batch = || -> Vec<(usize, HmmResult)> {
             if share <= 1 {
                 (batch_start..batch_end).into_par_iter().map(&per_target).collect()
@@ -948,6 +968,17 @@ mod share_tests {
         // A costlier window (more sites) also shrinks the group.
         assert!(share_batch_for_budget(30_000.0, 200.0, 16)
             < share_batch_for_budget(30_000.0, MESA_PER_TARGET_MB, 16));
+    }
+
+    #[test]
+    fn small_cohort_never_shares() {
+        // The consumer-array case: 12 target haplotypes on 16 threads. Memory says
+        // "share 16", parallelism says "12/16 = 0 groups" -> off.
+        assert_eq!(super::pick_share(116_000.0, MESA_PER_TARGET_MB, 16, 12), 1);
+        // MESA 100 (200 haps) still shares, capped by groups-per-thread: 200/16 = 12.
+        assert_eq!(super::pick_share(116_000.0, MESA_PER_TARGET_MB, 16, 200), 12);
+        // 801 samples = 1,602 haps -> 100 groups; memory cap of 16 binds.
+        assert_eq!(super::pick_share(116_000.0, MESA_PER_TARGET_MB, 16, 1602), 16);
     }
 
     #[test]
