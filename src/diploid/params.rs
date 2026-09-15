@@ -2,11 +2,13 @@
 //!
 //! Ne seeds at 15000 but is NOT fixed: phase_common re-estimates it during
 //! burn-in and that estimate always overshoots (its switch-rate proxy is a graph
-//! edge count), so what actually sets Ne is the ceiling. The ceiling scales with
-//! panel size — `SELPHI_PHASE_NE_CAP_PER_HAP` (default 77.5) per haplotype,
-//! capped at 1e6 — which holds the per-cM switch rate 0.04*Ne/n_haps at 3.1/cM
-//! until the 1e6 cap binds from ~12.9k haplotypes upward, above which the rate
-//! decays as 1/n_haps as it always did. `SELPHI_PHASE_NE` /
+//! edge count), so what actually sets Ne is the ceiling. On ARRAY targets the
+//! ceiling scales with panel size — `SELPHI_PHASE_NE_CAP_PER_HAP` (default 77.5)
+//! per haplotype, capped at 1e6 — which holds the per-cM switch rate 0.04*Ne/n_haps
+//! at 3.1/cM until the 1e6 cap binds from ~12.9k haplotypes upward, above which the
+//! rate decays as 1/n_haps as it always did. WGS-density targets (>=
+//! `SELPHI_AUTOROUTE_WGS_DENSITY` scaffold sites/Mb) keep the flat 1e6: the scaled
+//! ceiling cost 0.012-0.026 pp trio switch error there (2026-09-15). `SELPHI_PHASE_NE` /
 //! `SELPHI_PHASE_NE_PER_HAP` pin Ne outright. ed=0.0001, ee=0.9999.
 //! Transition probabilities precomputed from genetic distances.
 
