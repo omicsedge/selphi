@@ -328,35 +328,49 @@ fn hmm_pool_width() -> usize {
 ///
 /// Recomputed per window because `n_var` (hence the per-target cost) differs by
 /// window and because another job may have arrived in the meantime.
-fn auto_share_batch(n_var_w: usize, fl_fwd: usize, n_ref: usize, n_haps: usize) -> usize {
+fn auto_share_batch(n_var_w: usize, fl_fwd: usize, n_ref: usize, n_batch: usize, max_candidates: usize) -> usize {
     let Some(avail_mb) = crate::log::available_ram_mb() else { return 1 };
     let threads = hmm_pool_width();
     let by_memory = share_batch_for_budget(avail_mb, per_target_mb(n_var_w, fl_fwd, n_ref), threads);
-    // Sharing groups B targets onto ONE thread and sorts the WHOLE panel for them,
-    // where the per-target path sorts only each target's mc candidates, every target
-    // on its own thread. So it pays off only when there are far more targets than
-    // threads to keep busy: n_haps / B groups must still fill the pool. With 12
-    // target haplotypes on 16 threads it turned one parallel 24k-hap sort per target
-    // into one serial 75k-hap sort while 15 threads idled -- PBWT 3.0 s -> 37.0 s on a
-    // consumer-array chromosome (2026-09-14), and it had been silently on by default.
-    // The memory gate alone could never see that; RAM was plentiful.
-    let by_parallelism = n_haps / threads.max(1);
-    let b = by_memory.min(by_parallelism);
-    if b < 4 { 1 } else { b }
+    pick_share_groups(by_memory, threads, n_batch, max_candidates, n_ref)
+}
+
+/// The two gates the memory budget cannot see. Sharing puts B targets on ONE thread
+/// and sorts + scans the WHOLE panel for them, where the per-target path handles only
+/// each target's `mc` candidates, every target on its own thread.
+///
+/// * Candidate fraction. The shared SCAN walks the full panel's neighbours (each
+///   target filtering through its bitset), so it costs about `n_ref / mc` of the
+///   per-target scan -- the 1.29x the split diag measured at mc/n_ref = 0.78. At 0.36
+///   (the 75,552-hap production panel, mc 27,541) the shared scan alone is roughly
+///   the whole per-target forward, so sharing loses at every B and every cohort size.
+///   Measured wins are at 0.78 (TOPMed, +1.16x at B=16) and 1.0 (1KG panels).
+/// * One round. `ceil(n / B)` equal groups are work-stolen over `threads` workers, so
+///   the stage takes `ceil(groups / threads)` rounds of one group each.
+///   `B = ceil(n / threads)` is the largest group that still fills the pool in ONE
+///   round. The RAM-only gate picked 16 for 12 target haplotypes on 16 threads -- one
+///   serial 75k-hap sort while 15 threads idled, PBWT 3.0 s -> 37.0 s on a
+///   consumer-array chromosome (2026-09-14). Flooring `n / threads` was wrong the other
+///   way: 200 haps / 16 = 12 -> 17 groups -> a second round on a single thread, where
+///   13 gives 16 groups.
+///
+/// `n` is the batch actually scheduled (`target_batch_size` splits the window), not
+/// the whole cohort.
+fn pick_share_groups(by_memory: usize, threads: usize, n: usize, max_candidates: usize, n_ref: usize) -> usize {
+    const MIN_CAND_FRACTION: f64 = 0.6;
+    const MIN_WORTH: usize = 4;
+    if by_memory < 2 || threads == 0 || n_ref == 0 { return 1; }
+    let cand_fraction = max_candidates.min(n_ref) as f64 / n_ref as f64;
+    if cand_fraction < MIN_CAND_FRACTION { return 1; }
+    let one_round = n.div_ceil(threads);
+    let b = by_memory.min(one_round);
+    if b < MIN_WORTH { 1 } else { b }
 }
 
 /// Memory one target in flight costs the shared path: its forward match buffers
 /// (`haps` + `lens`, `n_var * fl_fwd` i32 each) plus its `ht` (`n_ref` i64).
 fn per_target_mb(n_var_w: usize, fl_fwd: usize, n_ref: usize) -> f64 {
     (2.0 * n_var_w as f64 * fl_fwd as f64 * 4.0 + n_ref as f64 * 8.0) / (1024.0 * 1024.0)
-}
-
-/// Both gates together, pure, for the tests: memory budget AND enough target
-/// groups to keep every thread busy.
-#[cfg(test)]
-fn pick_share(avail_mb: f64, per_target_mb: f64, threads: usize, n_haps: usize) -> usize {
-    let b = share_batch_for_budget(avail_mb, per_target_mb, threads).min(n_haps / threads.max(1));
-    if b < 4 { 1 } else { b }
 }
 
 /// The arithmetic of `auto_share_batch`, split out so it can be tested without
@@ -374,24 +388,26 @@ fn share_batch_for_budget(avail_mb: f64, per_target_mb: f64, threads: usize) -> 
 }
 
 /// Resolve the share group for this window: explicit knob if set, else auto.
-fn resolve_share(n_var_w: usize, fl_fwd: usize, n_ref: usize, n_haps: usize) -> usize {
+fn resolve_share(n_var_w: usize, fl_fwd: usize, n_ref: usize, n_batch: usize, max_candidates: usize) -> usize {
     let knob = share_batch();
     if knob >= 1 { return knob; }
-    let b = auto_share_batch(n_var_w, fl_fwd, n_ref, n_haps);
+    let b = auto_share_batch(n_var_w, fl_fwd, n_ref, n_batch, max_candidates);
     let per_target_mb = per_target_mb(n_var_w, fl_fwd, n_ref);
     let avail = crate::log::available_ram_mb().unwrap_or(0.0);
+    let threads = hmm_pool_width();
+    let cand_fraction = max_candidates.min(n_ref) as f64 / n_ref.max(1) as f64;
     if b > 1 {
         crate::selphi_info!(
-            "  PBWT sort shared across {} targets (auto: {:.0} GB available, {:.1} MB per \
-             in-flight target x {} threads -> +{:.1} GB). Byte-identical; set \
-             SELPHI_PBWT_SHARE=1 to disable.",
-            b, avail / 1024.0, per_target_mb, hmm_pool_width(),
-            (b - 1) as f64 * hmm_pool_width() as f64 * per_target_mb / 1024.0);
+            "  PBWT sort shared across {} targets ({} groups on {} threads; auto: {:.0} GB \
+             available, {:.1} MB per in-flight target -> +{:.1} GB; mc/n_ref {:.2}). \
+             Byte-identical; set SELPHI_PBWT_SHARE=1 to disable.",
+            b, n_batch.div_ceil(b), threads, avail / 1024.0, per_target_mb,
+            (b - 1) as f64 * threads as f64 * per_target_mb / 1024.0, cand_fraction);
     } else {
         crate::selphi_debug!(
-            "  PBWT sort kept per-target (auto: {:.0} GB available, {:.1} MB per in-flight \
-             target x {} threads — not enough headroom to be worth it)",
-            avail / 1024.0, per_target_mb, hmm_pool_width());
+            "  PBWT sort kept per-target (auto: {} target haps on {} threads, mc/n_ref {:.2}, \
+             {:.0} GB available at {:.1} MB per in-flight target)",
+            n_batch, threads, cand_fraction, avail / 1024.0, per_target_mb);
     }
     b
 }
@@ -864,7 +880,7 @@ pub fn process_window_hmm(
             chunk.iter().zip(cscs.iter()).map(|(&t, csc)| finish(t, csc)).collect()
         };
 
-        let share = resolve_share(n_var_w, fl_fwd, n_ref, n_haps);
+        let share = resolve_share(n_var_w, fl_fwd, n_ref, batch_end - batch_start, max_candidates);
         let run_batch = || -> Vec<(usize, HmmResult)> {
             if share <= 1 {
                 (batch_start..batch_end).into_par_iter().map(&per_target).collect()
@@ -972,13 +988,36 @@ mod share_tests {
 
     #[test]
     fn small_cohort_never_shares() {
-        // The consumer-array case: 12 target haplotypes on 16 threads. Memory says
-        // "share 16", parallelism says "12/16 = 0 groups" -> off.
-        assert_eq!(super::pick_share(116_000.0, MESA_PER_TARGET_MB, 16, 12), 1);
-        // MESA 100 (200 haps) still shares, capped by groups-per-thread: 200/16 = 12.
-        assert_eq!(super::pick_share(116_000.0, MESA_PER_TARGET_MB, 16, 200), 12);
-        // 801 samples = 1,602 haps -> 100 groups; memory cap of 16 binds.
-        assert_eq!(super::pick_share(116_000.0, MESA_PER_TARGET_MB, 16, 1602), 16);
+        use super::pick_share_groups as pick;
+        // Memory says 16 in every case below; the TOPMed mc/n_ref (0.78) passes.
+        // The consumer-array case: 12 target haplotypes on 16 threads -> off.
+        assert_eq!(pick(16, 16, 12, 132_676, 171_054), 1);
+        // MESA 100 (200 haps): ceil(200 / 16) = 13 -> 16 groups, exactly one round.
+        // Flooring gave 12 -> 17 groups -> a second round on a single thread.
+        assert_eq!(pick(16, 16, 200, 132_676, 171_054), 13);
+        // The 50-sample whole-genome demo (100 haps): 7 -> 15 groups, one round.
+        assert_eq!(pick(16, 16, 100, 4_802, 4_802), 7);
+        // 40 haps: ceil(40 / 16) = 3 is under MIN_WORTH -> off.
+        assert_eq!(pick(16, 16, 40, 4_802, 4_802), 1);
+        // 801 samples = 1,602 haps -> 101 groups; the memory cap of 16 binds.
+        assert_eq!(pick(16, 16, 1602, 4_802, 4_802), 16);
+        // Memory said no -> no, whatever the cohort.
+        assert_eq!(pick(1, 16, 1602, 4_802, 4_802), 1);
+    }
+
+    #[test]
+    fn low_candidate_fraction_never_shares() {
+        use super::pick_share_groups as pick;
+        // The 75,552-hap production panel at mc 27,541 (0.36): the shared scan walks
+        // ~2.7x the haplotypes the per-target one does. Off at every cohort size.
+        assert_eq!(pick(16, 16, 12, 27_541, 75_552), 1);
+        assert_eq!(pick(16, 16, 1602, 27_541, 75_552), 1);
+        assert_eq!(pick(16, 16, 10_000, 27_541, 75_552), 1);
+        // TOPMed at 0.78 and a full-panel mc both still share.
+        assert_eq!(pick(16, 16, 1602, 132_676, 171_054), 16);
+        assert_eq!(pick(16, 16, 1602, 171_054, 171_054), 16);
+        // An mc cap above n_ref counts as the whole panel, not more.
+        assert_eq!(pick(16, 16, 1602, 1_000_000, 4_802), 16);
     }
 
     #[test]
