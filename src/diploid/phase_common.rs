@@ -112,14 +112,45 @@ fn resolve_phase_ne(n_haps_total: usize) -> f64 {
 /// that rate at 0.04*`SELPHI_PHASE_NE_CAP_PER_HAP` per cM until the old 1e6
 /// ceiling binds, which it does from ~12.9k haplotypes upward — so every panel at
 /// or above that size keeps its shipped behaviour exactly.
-fn phase_ne_ceiling(n_haps_total: usize) -> f64 {
+///
+/// ARRAY TARGETS ONLY. The scaling was measured on chip arrays (chr22 801s,
+/// `--force-phasing`: OVERALL R² 0.4834 → 0.4876, every MAF bin up). On a
+/// WGS-density target it costs switch error: 54 1KG trio children × 2,239-sample
+/// panel, chr22 mean per-trio SER 2.539–2.554% with the scaled ceiling against
+/// 2.527–2.528% with the flat 1e6, two seeds each and the same sign in both
+/// (2026-09-15) — enough to hand the chromosome to Beagle 5.5 (2.548%). So the
+/// scaled ceiling applies below `SELPHI_AUTOROUTE_WGS_DENSITY` sites/Mb (1000,
+/// the line the engine router already draws between a chip and a WGS callset)
+/// and WGS-density input keeps the flat 1e6 it had before 2026-08-14.
+/// `SELPHI_PHASE_NE_CAP_WGS=1` forces the scaled ceiling on WGS density (A/B).
+/// Density is that of the scaffold actually phased here: ~270 sites/Mb for a
+/// GSA chip, ~20,000 for the trio WGS, so the cut is not a close call.
+fn phase_ne_ceiling(n_haps_total: usize, density_per_mb: Option<f64>) -> f64 {
     let per_hap = crate::config::f64_or("SELPHI_PHASE_NE_CAP_PER_HAP", 77.5);
     if per_hap <= 0.0 { return 1_000_000.0; }
+    let wgs = density_per_mb.map_or(false, |d| d >= wgs_density_threshold());
+    if wgs && !crate::config::is_one("SELPHI_PHASE_NE_CAP_WGS") { return 1_000_000.0; }
     // Floor at the EM re-estimate's own 1000.0 lower clamp: below ~13 total
     // haplotypes (a tiny --phase-panel cohort) or under a small per-hap
     // override, the scaled ceiling would drop beneath that floor and
     // `estimated_ne.clamp(1000.0, ne_ceiling)` would panic on inverted bounds.
     (per_hap * n_haps_total as f64).min(1_000_000.0).max(1000.0)
+}
+
+/// Sites per megabase of the scaffold being phased; `None` when it cannot be
+/// told (no positions, fewer than two sites, zero span) — treated as an array,
+/// the regime the scaled ceiling was measured on.
+fn scaffold_density_per_mb(n_var: usize, bp: Option<&[i64]>) -> Option<f64> {
+    let bp = bp?;
+    if bp.len() < 2 || n_var < 2 { return None; }
+    let span = bp[bp.len() - 1] - bp[0];
+    if span <= 0 { return None; }
+    Some(n_var as f64 * 1.0e6 / span as f64)
+}
+
+/// The same chip/WGS density line `autoroute` uses, read from the same knob.
+fn wgs_density_threshold() -> f64 {
+    crate::config::f64_or("SELPHI_AUTOROUTE_WGS_DENSITY", 1000.0)
 }
 
 /// Run phase_common on all samples.
@@ -548,7 +579,14 @@ fn _run_iterations(
     // An explicit Ne request switches the burn-in EM update off; read once, never
     // inside the iteration loop.
     let em_ne_enabled = phase_ne_override(n_haps_total).is_none();
-    let ne_ceiling = phase_ne_ceiling(n_haps_total);
+    let density = scaffold_density_per_mb(n_var, _chip_bp);
+    let ne_ceiling = phase_ne_ceiling(n_haps_total, density);
+    crate::selphi_debug!(
+        "  [diploid] Ne ceiling {:.0} ({} scaffold sites/Mb -> {} regime, {} haplotypes)",
+        ne_ceiling,
+        density.map_or("unknown".to_string(), |d| format!("{:.0}", d)),
+        if density.map_or(false, |d| d >= wgs_density_threshold()) { "WGS-density" } else { "array" },
+        n_haps_total);
 
     for (it, &stage) in stages.iter().enumerate() {
         let t0 = std::time::Instant::now();
@@ -969,11 +1007,34 @@ mod phase_ne_ceiling_tests {
         // 77.5 * 12 = 930, which used to make estimated_ne.clamp(1000.0, 930.0)
         // panic on the first burn-in EM-Ne update. The ceiling must floor at
         // the EM re-estimate's own 1000.0 lower clamp.
-        let c = phase_ne_ceiling(12);
+        let c = phase_ne_ceiling(12, None);
         assert!(c >= 1000.0, "ceiling {c} below the EM floor");
         // Large panels: unchanged (1e6 cap binds from ~12.9k haps).
-        assert_eq!(phase_ne_ceiling(171_054), 1_000_000.0);
+        assert_eq!(phase_ne_ceiling(171_054, None), 1_000_000.0);
         // Mid panel: linear scaling intact.
-        assert_eq!(phase_ne_ceiling(1_710), 77.5 * 1_710.0);
+        assert_eq!(phase_ne_ceiling(1_710, None), 77.5 * 1_710.0);
+    }
+
+    #[test]
+    fn scaled_ceiling_is_for_arrays_only() {
+        // The trio rig: 4,586 haplotypes, ~20,000 scaffold sites/Mb -> flat 1e6, as
+        // before 2026-08-14 (the scaled 355k cost 0.012-0.026 pp SER there).
+        assert_eq!(phase_ne_ceiling(4_586, Some(20_000.0)), 1_000_000.0);
+        // A GSA chip on the same panel (~270 sites/Mb) keeps the scaled ceiling.
+        assert_eq!(phase_ne_ceiling(4_586, Some(270.0)), 77.5 * 4_586.0);
+        // Exactly at the router's line counts as WGS; just under it does not.
+        assert_eq!(phase_ne_ceiling(4_586, Some(1000.0)), 1_000_000.0);
+        assert_eq!(phase_ne_ceiling(4_586, Some(999.9)), 77.5 * 4_586.0);
+        // Unknown density is treated as an array (the measured regime).
+        assert_eq!(phase_ne_ceiling(4_586, None), 77.5 * 4_586.0);
+    }
+
+    #[test]
+    fn scaffold_density_math() {
+        // 1,000 sites over 10 Mb = 100 / Mb.
+        assert_eq!(scaffold_density_per_mb(1_000, Some(&[1_000_000, 11_000_000])), Some(100.0));
+        assert_eq!(scaffold_density_per_mb(1_000, None), None);
+        assert_eq!(scaffold_density_per_mb(1, Some(&[5])), None);
+        assert_eq!(scaffold_density_per_mb(10, Some(&[7, 7])), None);
     }
 }

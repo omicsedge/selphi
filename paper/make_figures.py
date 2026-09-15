@@ -249,15 +249,15 @@ x = np.arange(len(maf_lbl))
 # ---- data (from paper tables) ----
 # 3a: 1KG genome-wide (20 autosomes) R2 by MAF, five-way, imputation-only (n-weighted;
 #     all tools impute from the identical phased target + panel; Supplementary Table S9)
-t1 = {"selphi":   [.3528,.4222,.5235,.6250,.6910,.7618,.8525,.8962,.9254],
+t1 = {"selphi":   [.3531,.4232,.5245,.6260,.6920,.7627,.8532,.8968,.9259],
       "selphi153":[.3375,.4106,.5149,.6207,.6898,.7629,.8539,.8973,.9262],
       "beagle":   [.3570,.4151,.5092,.6083,.6742,.7460,.8414,.8885,.9196],
       "impute5":  [.3458,.4062,.5005,.5991,.6654,.7381,.8355,.8840,.9160],
       "minimac4": [.3529,.4132,.5048,.6013,.6663,.7367,.8323,.8803,.9112]}
 # 3c: HGDP out-of-panel per-region per-sample R2 (Table 4c genome-wide)
 regions = ["Oceanian*","Mid-East*","African","E.Asian","C/S.Asian","European","Adm.Amer."]
-hgdp_s = [.8984,.9386,.8778,.9506,.9465,.9572,.9626]
-hgdp_b = [.8880,.9326,.8652,.9431,.9418,.9532,.9569]
+hgdp_s = [.8983,.9391,.8784,.9509,.9472,.9578,.9627]
+hgdp_b = [.8879,.9325,.8655,.9429,.9416,.9531,.9568]
 # 3d: lcWGS coverage sweep per-sample R2 (Table 2b) — Selphi native --bam errmod GL (beats GLIMPSE2 and QUILT2 at every coverage)
 cov = [0.5,1,2,4]
 lc = {"selphi":[.9924,.9950,.9971,.9979],"glimpse2":[.9916,.9945,.9967,.9975],"quilt2":[.9919,.9944,.9968,.9973]}
@@ -278,10 +278,10 @@ a.legend(frameon=False, loc="lower right"); a.grid(alpha=.25, lw=.5)
 
 # (b) MESA per-sample R2 by ancestry: Selphi 2 vs Beagle 5.5 (competitive, per-sample)
 # per-sample-mean R2 by MESA ancestry group at the panel-adaptive mc=132,676 run;
-# per-group deltas (+0.019..+0.032) match the Table 4b / Results prose.
+# per-group deltas (+0.023..+0.038) match the Results prose (re-measured 2026-09-15).
 b = ax[0,1]
 pop_lbl = ["African-\nAmerican","Hispanic","European\n(White)","East-Asian"]
-sel_r2  = [0.8936, 0.8975, 0.9026, 0.8925]
+sel_r2  = [0.8976, 0.9018, 0.9066, 0.8975]
 bea_r2  = [0.8733, 0.8763, 0.8835, 0.8600]
 xp = np.arange(4); wp = 0.38
 b.bar(xp-wp/2, sel_r2, wp, color=C["selphi"], label="Selphi 2")

@@ -32,10 +32,10 @@ measured against an earlier Beagle 5.5 baseline (0.5975) and retained to show th
 
 | Cohort | `mc` | Bin | Selphi 2 R² | Beagle R² | Winner |
 |---|---|---|---:|---:|---|
-| MESA 5K | 132676 (auto), full 17.9 M var | OVERALL (headline, diploid default) | **0.6148** | 0.5921 | Selphi |
+| MESA 5K | 132676 (auto), full 17.9 M var | OVERALL (headline, diploid default) | **0.6210** | 0.5921 | Selphi |
 | MESA 5K | 150K | OVERALL (haploid, larger mc) | **0.6162** | 0.5975 | Selphi |
 | MESA 5K | 132676 (auto) | OVERALL (haploid auto-mc) | **0.6156** | 0.5975 | Selphi |
-| MESA 5K | 132676 (auto), full 17.9 M var | per-sample mean (headline, diploid default) | **0.8978** | 0.8764 | Selphi |
+| MESA 5K | 132676 (auto), full 17.9 M var | per-sample mean (headline, diploid default) | **0.9017** | 0.8764 | Selphi |
 | MESA 5K | 150K | 0.05-0.1% (rarest, Ne-default) | **0.5211** | 0.5020 | Selphi |
 | MESA 5K | 120K | 0.5-1% | **0.6554** | 0.6360 | Selphi |
 | MESA 5K | 120K | 5-10% | **0.6809** | 0.6635 | Selphi |
@@ -56,15 +56,15 @@ phasing fix does not affect these rows.
 
 | Chr | Mode | Metric | Selphi 2 | Beagle 5 | Winner |
 |---|---|---|---:|---:|---|
-| 21 | impute-only | OVERALL R² | **0.9704** | 0.9676 | Selphi |
+| 21 | impute-only | OVERALL R² | **0.9763** | 0.9732 | Selphi |
 | 21 | impute-only | concordance | **0.9777** | 0.9762 | Selphi |
-| 21 | impute-only | wall | **7.2 s** | 12.5 s | Selphi |
-| 21 | impute-only | peak RAM | **6.2 GB** | 14.5 GB | Selphi |
+| 21 | impute-only | wall | 6.9 s | **6.7 s** | tie |
+| 21 | impute-only | peak RAM | **3.2 GB** | 7.0 GB | Selphi |
 | 21 | full pipeline (diploid) | OVERALL R² | **0.9734** | 0.9707 | Selphi |
 | 21 | full pipeline (haploid auto) | OVERALL R² | 0.9705 | 0.9707 | tie |
-| 1 | impute-only | OVERALL R² | 0.9815 | **0.9825** | reference |
-| 1 | impute-only | wall | **38.8 s** | 43.2 s | Selphi |
-| 1 | impute-only | peak RAM | **16.3 GB** | 39.2 GB | Selphi |
+| 1 | impute-only | OVERALL R² | 0.9817 | **0.9834** | reference |
+| 1 | impute-only | wall | 40.1 s | **24.9 s** | reference |
+| 1 | impute-only | peak RAM | **7.2 GB** | 16.8 GB | Selphi |
 | 1 | full pipeline (diploid) | OVERALL R² | 0.9812 | **0.9820** | reference |
 
 ## Table S4. Low-coverage sequencing accuracy (R² and concordance) - vs GLIMPSE2 and QUILT2
@@ -333,10 +333,10 @@ Reference: Beagle 5.5, SHAPEIT5 v5.1.1.
 
 | Chr | Engine | Selphi 2 SER % | Beagle 5.5 | SHAPEIT5 | vs Beagle | vs SHAPEIT5 |
 |---|---|---:|---:|---:|---|---|
-| 22 | diploid | **2.521** | 2.548 | 2.611 | Selphi | Selphi |
-| 22 | haploid | 2.569 | **2.548** | 2.611 | reference | Selphi |
-| 1 | diploid | 1.876 | **1.865** | 1.935 | reference | Selphi |
-| 1 | haploid | 1.876 | **1.865** | 1.935 | reference | Selphi |
+| 22 | diploid | **2.528** | 2.548 | 2.607 | Selphi | Selphi |
+| 22 | haploid | 2.569 | **2.548** | 2.607 | reference | Selphi |
+| 1 | diploid | 1.879 | **1.865** | 1.929 | reference | Selphi |
+| 1 | haploid | 1.876 | **1.865** | 1.929 | reference | Selphi |
 
 ## Table S6. Speed & memory
 
@@ -344,10 +344,10 @@ Reference: Beagle 5.5, SHAPEIT5 v5.1.1.
 
 | Benchmark | Metric | Selphi 2 | Reference | Winner |
 |---|---|---:|---:|---|
-| GIAB chr21, 6s, 75,552-haplotype panel, impute-only | wall | **7.2 s** | Beagle 5: 12.5 s | Selphi |
-| GIAB chr21, 6s, 75,552-haplotype panel, impute-only | peak RAM | **6.2 GB** | Beagle 5: 14.5 GB | Selphi |
-| GIAB chr1, 6s, 75,552-haplotype panel, impute-only | wall | **38.8 s** | Beagle 5: 43.2 s | Selphi |
-| GIAB chr1, 6s, 75,552-haplotype panel, impute-only | peak RAM | **16.3 GB** | Beagle 5: 39.2 GB | Selphi |
+| GIAB chr21, 6s, 75,552-haplotype panel, impute-only | wall | 6.9 s | Beagle 5: **6.7 s** | tie |
+| GIAB chr21, 6s, 75,552-haplotype panel, impute-only | peak RAM | **3.2 GB** | Beagle 5: 7.0 GB | Selphi |
+| GIAB chr1, 6s, 75,552-haplotype panel, impute-only | wall | 40.1 s | Beagle 5: **24.9 s** | reference |
+| GIAB chr1, 6s, 75,552-haplotype panel, impute-only | peak RAM | **7.2 GB** | Beagle 5: 16.8 GB | Selphi |
 | chr22 1KG 801s, chip to WGS | wall (phased/unphased) | 59 s / 114 s | Beagle 5.5: 58 s / 84 s | tie (phased) / reference (unphased) |
 | chr22 1KG 801s, chip to WGS | peak RAM | **9.9 / 14.4 GB** | Beagle 5.5: 21.7 / 14.6 GB | Selphi |
 | chr1 1KG 801s, chip to WGS | wall (phased/unphased) | 315 s / 623 s | Beagle 5.5: 207 s / 321 s | reference |
@@ -484,16 +484,16 @@ R² 0.5921 on the same set (main text). Selphi 2 leads at every MAF bin.
 
 | MAF | Selphi 2 | IMPUTE5 | Minimac4 |
 |---|---:|---:|---:|
-| 0.05-0.1% | **0.5224** | 0.3819 | 0.3693 |
-| 0.1-0.2%  | **0.5665** | 0.4107 | 0.3983 |
-| 0.2-0.5%  | **0.6131** | 0.4689 | 0.4531 |
-| 0.5-1%    | **0.6537** | 0.5342 | 0.5150 |
-| 1-2%      | **0.6698** | 0.5695 | 0.5494 |
-| 2-5%      | **0.6603** | 0.5753 | 0.5567 |
-| 5-10%     | **0.6780** | 0.6084 | 0.5909 |
-| 10-20%    | **0.7322** | 0.6720 | 0.6537 |
-| 20-50%    | **0.6631** | 0.6249 | 0.6084 |
-| OVERALL   | **0.6148** | 0.4967 | 0.4795 |
+| 0.05-0.1% | **0.5306** | 0.3819 | 0.3693 |
+| 0.1-0.2%  | **0.5748** | 0.4107 | 0.3983 |
+| 0.2-0.5%  | **0.6205** | 0.4689 | 0.4531 |
+| 0.5-1%    | **0.6599** | 0.5342 | 0.5150 |
+| 1-2%      | **0.6749** | 0.5695 | 0.5494 |
+| 2-5%      | **0.6648** | 0.5753 | 0.5567 |
+| 5-10%     | **0.6822** | 0.6084 | 0.5909 |
+| 10-20%    | **0.7361** | 0.6720 | 0.6537 |
+| 20-50%    | **0.6657** | 0.6249 | 0.6084 |
+| OVERALL   | **0.6210** | 0.4967 | 0.4795 |
 
 ## Table S12. Selphi 2 vs Selphi 1.5.3, per-MAF (1KG Phase 3, impute-only)
 
