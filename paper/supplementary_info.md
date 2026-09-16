@@ -34,7 +34,7 @@ measured against an earlier Beagle 5.5 baseline (0.5975) and retained to show th
 |---|---|---|---:|---:|---|
 | MESA 5K | 132676 (auto), full 17.9 M var | OVERALL (headline, diploid default) | **0.6210** | 0.5921 | Selphi |
 | MESA 5K | 150K | OVERALL (haploid, larger mc) | **0.6162** | 0.5975 | Selphi |
-| MESA 5K | 132676 (auto) | OVERALL (haploid auto-mc) | **0.6156** | 0.5975 | Selphi |
+| MESA 5K | 132676 (auto) | OVERALL (haploid auto-mc) | **0.6158** | 0.5975 | Selphi |
 | MESA 5K | 132676 (auto), full 17.9 M var | per-sample mean (headline, diploid default) | **0.9017** | 0.8764 | Selphi |
 | MESA 5K | 150K | 0.05-0.1% (rarest, Ne-default) | **0.5211** | 0.5020 | Selphi |
 | MESA 5K | 120K | 0.5-1% | **0.6554** | 0.6360 | Selphi |
