@@ -49,7 +49,8 @@ measured against an earlier Beagle 5.5 baseline (0.5975) and retained to show th
 ## Table S3. Leak-free GIAB validation - chip to WGS
 
 6 GIAB samples (HG002-007), 75,552-haplotype reference panel (37,776 samples),
-leak-free. EC2 r7a.4xlarge, 16 threads. Reference: Beagle 5 (03Oct25); old Selphi 1.5.3.
+leak-free, 16 threads. Selphi 2 and Beagle 5 (03Oct25) rows: workstation, September 2026, one
+rebuilt chip input. Selphi 1.5.3 rows: EC2 r7a.4xlarge, May 2026, not re-run.
 This is the GIAB overlay validation set (no array no-calls), distinct from the
 consumer-array GSA benchmark in the main paper (Table 5); the missing-genotype
 phasing fix does not affect these rows.
