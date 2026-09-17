@@ -100,7 +100,7 @@
   <text x="565" y="535" text-anchor="middle" fill="#333" font-size="10.5">Input: PL VCF / BAM / CRAM (native pileup)</text>
   <text x="565" y="552" text-anchor="middle" fill="#333" font-size="10.5">Sparse-PBWT &#x21c4; GL-weighted Li-Stephens FB</text>
   <text x="565" y="569" text-anchor="middle" fill="#333" font-size="10.5">&#x221a;n-checkpointed forward-backward, SIMD</text>
-  <text x="565" y="586" text-anchor="middle" fill="#333" font-size="10.5">Diplotype-mosaic Gibbs (phase commitment)</text>
+  <text x="565" y="586" text-anchor="middle" fill="#333" font-size="10.5">Founder phasing HMM (phase re-commitment)</text>
   <text x="565" y="608" text-anchor="middle" fill="#00897b" font-size="9" font-style="italic">GLs in &#x2192; GT:DS:GP out</text>
 
   <!-- Shared interpolation + streaming output -->
