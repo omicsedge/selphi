@@ -289,62 +289,142 @@ impl FaithfulSelector {
 
     /// Flatten `pbwt_states[ind]` (per-depth-layer ref-hap ids) into the deduped
     /// union per sample → both haps of the sample get that union (capped kpbwt).
+    ///
+    /// The cap ORDER is the whole question when the union exceeds `kpbwt`, which
+    /// it did in every selection call measured (2026-09-17, `LCWGS_SEL_DIAG`): with
+    /// the default 0.002-cM storage sites on 16-cM chunks the pre-cap union is
+    /// 5,708-6,332 of the 6,332 1kGP haplotypes (median 6,295) and 3,956-4,796 of
+    /// 4,796 on the capture-panel rig, so the index-sorted truncate reduces the
+    /// selection to an almost fixed low-index subset — exactly haplotypes 0..1999
+    /// in several chunks, 0..~2030 with a few holes in the others — and the PBWT
+    /// selection is largely defeated. At GLIMPSE2's 0.1 cM / depth 12 the union is
+    /// 2,051-3,384 (median 2,891) on the same chunks, so the cap still bites and
+    /// its order still decides ~900 states. Three orders, `LCWGS_QUAL_TRUNC`:
+    /// - unset  → index order (shipped default; byte-identical).
+    /// - `1`    → rank layer 0 first, FORWARD within a layer (storage-site order).
+    /// - `g2`   → GLIMPSE2 `conditioning_set::compactSelection`: rank layers
+    ///            ascending, REVERSE within a layer (most recently stored storage
+    ///            site first), stop the instant the union reaches kpbwt, then
+    ///            emit the membership index-sorted (G2 keeps a std::set).
     fn flatten_pbwt(&self) -> Vec<Vec<u32>> {
-        let qual = qual_trunc();
+        let mode = qual_trunc();
+        let diag = sel_diag();
         let mut cond = vec![Vec::new(); 2 * self.n_samples];
+        let (mut d_union, mut d_sat, mut d_maxidx, mut d_layers) = (0usize, 0usize, 0usize, 0usize);
         for s in 0..self.n_samples {
-            let union: Vec<u32> = if qual {
-                // QUALITY-ordered cap (LCWGS_QUAL_TRUNC): the depth LAYER index is the
-                // match-rank (layer 0 = closest local match). Iterate layers best-first
-                // and keep each hap on its FIRST (best) appearance until kpbwt — so the
-                // cap (and the downstream kmax cap, which inherits this order) keeps the
-                // best-matching haps, NOT the lowest-index ones (the prior `sort_unstable
-                // + truncate` was match-quality-blind). The base is left in best-first
-                // order (NOT index-sorted) so the DOWNSTREAM kmax cap in iterate.rs —
-                // which keeps the first kmax of base — also keeps best-first. The
-                // layer-major + first-occurrence build is already deterministic.
-                let mut seen = std::collections::HashSet::new();
-                let mut u: Vec<u32> = Vec::new();
-                'outer: for layer in &self.tar.pbwt_states[s] {
-                    for &x in layer {
-                        let h = x as u32;
-                        if seen.insert(h) {
-                            u.push(h);
-                            if self.kpbwt > 0 && u.len() >= self.kpbwt {
+            let union: Vec<u32> = match mode {
+                CapOrder::Forward => {
+                    // Rank-first cap: the depth LAYER index is the neighbour rank
+                    // (layer 0 = nearest PBWT neighbour at each storage site). Keep
+                    // each hap on its FIRST (best) appearance until kpbwt. The base
+                    // is left in best-first order so the downstream kmax cap in
+                    // iterate.rs (first kmax of base) also keeps best-first.
+                    let mut seen = std::collections::HashSet::new();
+                    let mut u: Vec<u32> = Vec::new();
+                    'outer: for layer in &self.tar.pbwt_states[s] {
+                        for &x in layer {
+                            let h = x as u32;
+                            if seen.insert(h) {
+                                u.push(h);
+                                if self.kpbwt > 0 && u.len() >= self.kpbwt {
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                    u
+                }
+                CapOrder::G2 => {
+                    // GLIMPSE2 order: layers ascending, entries in REVERSE push order,
+                    // insert into the set until it holds kpbwt, output sorted.
+                    let mut set = std::collections::BTreeSet::new();
+                    'outer: for layer in &self.tar.pbwt_states[s] {
+                        for &x in layer.iter().rev() {
+                            set.insert(x as u32);
+                            if self.kpbwt > 0 && set.len() >= self.kpbwt {
                                 break 'outer;
                             }
                         }
                     }
+                    set.into_iter().collect()
                 }
-                u
-            } else {
-                // Union across all depth layers, dedup, ascending (priority-neutral —
-                // the downstream rare-carrier aug keeps base ahead of carriers).
-                let mut u: Vec<u32> = Vec::new();
-                for layer in &self.tar.pbwt_states[s] {
-                    u.extend(layer.iter().map(|&x| x as u32));
+                CapOrder::Index => {
+                    // Union across all depth layers, dedup, ascending, truncate —
+                    // quality-blind: keeps the LOWEST haplotype indices.
+                    let mut u: Vec<u32> = Vec::new();
+                    for layer in &self.tar.pbwt_states[s] {
+                        u.extend(layer.iter().map(|&x| x as u32));
+                    }
+                    u.sort_unstable();
+                    u.dedup();
+                    if self.kpbwt > 0 && u.len() > self.kpbwt {
+                        u.truncate(self.kpbwt);
+                    }
+                    u
                 }
-                u.sort_unstable();
-                u.dedup();
-                if self.kpbwt > 0 && u.len() > self.kpbwt {
-                    u.truncate(self.kpbwt);
-                }
-                u
             };
+            if diag {
+                // Pre-cap union size and saturation, so a cap-order claim can be
+                // checked against the number of candidates it actually had.
+                let mut all: Vec<u32> = Vec::new();
+                for layer in &self.tar.pbwt_states[s] { all.extend(layer.iter().map(|&x| x as u32)); }
+                all.sort_unstable();
+                all.dedup();
+                d_union += all.len();
+                if self.kpbwt > 0 && all.len() > self.kpbwt { d_sat += 1; }
+                d_maxidx += union.iter().copied().max().unwrap_or(0) as usize;
+                d_layers = d_layers.max(self.tar.pbwt_states[s].len());
+            }
             cond[2 * s + 1] = union.clone();
             cond[2 * s] = union;
+        }
+        if diag && self.n_samples > 0 {
+            eprintln!(
+                "[sel-diag] kpbwt {} order {:?} layers {}: pre-cap union mean {:.0} haps, capped {}/{} samples, retained max idx mean {:.0}",
+                self.kpbwt, mode, d_layers,
+                d_union as f64 / self.n_samples as f64, d_sat, self.n_samples,
+                d_maxidx as f64 / self.n_samples as f64,
+            );
         }
         cond
     }
 }
 
-/// `LCWGS_QUAL_TRUNC=1` → cap the per-sample conditioning union by MATCH QUALITY
-/// (best depth-layer first) instead of by haplotype index. Default off (the
-/// shipped index-order behavior, byte-identical). Cached once.
-fn qual_trunc() -> bool {
+/// Cap order for the per-sample conditioning union (see [`FaithfulSelector::flatten_pbwt`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CapOrder {
+    /// Shipped default: index-sorted truncate (quality-blind).
+    Index,
+    /// `LCWGS_QUAL_TRUNC=1`: rank layer first, forward within a layer.
+    Forward,
+    /// `LCWGS_QUAL_TRUNC=g2`: GLIMPSE2 compactSelection order (layers ascending, reverse within).
+    G2,
+}
+
+/// `LCWGS_QUAL_TRUNC` → how the per-sample conditioning union is capped at kpbwt:
+/// unset/empty/`0`/`false`/`no`/`off` = by haplotype index (shipped, byte-identical),
+/// `1`/`true`/`yes`/`on`/`fwd` = best rank layer first (forward within a layer),
+/// `g2` = GLIMPSE2's exact order. Case-insensitive. Cached once.
+fn qual_trunc() -> CapOrder {
+    use std::sync::OnceLock;
+    static V: OnceLock<CapOrder> = OnceLock::new();
+    *V.get_or_init(|| match crate::config::raw("LCWGS_QUAL_TRUNC").map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if v == "g2" => CapOrder::G2,
+        // Old configs exported the bool as "1"/"true"; "false"/"0"/"no"/"off" and
+        // an empty value stay OFF (index order) so a `--config` written before
+        // this knob became a value cannot switch the experiment on by accident.
+        Some(v) if matches!(v.as_str(), "1" | "true" | "yes" | "on" | "y" | "fwd" | "forward") => CapOrder::Forward,
+        _ => CapOrder::Index,
+    })
+}
+
+/// `LCWGS_SEL_DIAG=1` → print, per selection call, the pre-cap union size and how
+/// many samples the kpbwt cap actually bit (the number that decides whether the
+/// cap ORDER can matter at all). Cached once.
+fn sel_diag() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| crate::config::present("LCWGS_QUAL_TRUNC"))
+    *V.get_or_init(|| crate::config::present("LCWGS_SEL_DIAG"))
 }
 
 /// Build per-sample [`GenotypeView`]s from explicit field slices (so the caller
