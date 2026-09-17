@@ -186,7 +186,10 @@ impl Default for LcwgsParams {
             // 0.9196→0.9239 (plateaus by 1e-8). Tunable via LCWGS_EPSILON.
             epsilon: envf("LCWGS_EPSILON", 1e-12),
             min_gl: envf("LCWGS_MIN_GL", 1e-10),
-            seed: 15_052_011,
+            // GLIMPSE2's default seed. `LCWGS_SEED` overrides it: the Gibbs chain is
+            // deterministic for a fixed seed, so a second seed is the only way to
+            // measure how much of a per-sample delta is chain reshuffling.
+            seed: crate::config::usize_or("LCWGS_SEED", 15_052_011) as u64,
         }
     }
 }

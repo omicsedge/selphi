@@ -1012,16 +1012,30 @@ fn finalize_gl_errmod(
     let n_var = bases.len();
     let mut out = vec![1.0f32 / 3.0; n_var * 3];
     let mut q = [0.0f32; 25];
+    // `bcftools call` writes the same errmod phreds as INTEGER PLs, min-normalised
+    // and capped at 255 (bam2bcf.c), so the PL path sees a wrong genotype at no
+    // less than 10^-25.5 while this path, uncapped, can put it at 10^-90 on a deep
+    // on-target column. `LCWGS_NATIVE_PL_QUANT` reproduces the PL representation
+    // here, to measure whether that difference is the residual native-vs-bcftools
+    // gap (2026-09-17 A/B).
+    let quant = crate::config::is_one("LCWGS_NATIVE_PL_QUANT");
     for v in 0..n_var {
         if !is_snp[v] || bases[v].is_empty() { continue; }
         let r = ascii_to_base4(ref_base[v]);
         let a = ascii_to_base4(alt_base[v]);
         if r > 3 || a > 3 { continue; }
         em.cal(&mut bases[v], 5, &mut q);
+        let (mut q0, mut q1, mut q2) = (q[r * 5 + r] as f64, q[r * 5 + a] as f64, q[a * 5 + a] as f64);
+        if quant {
+            let qmin = q0.min(q1).min(q2);
+            q0 = ((q0 - qmin).round()).min(255.0);
+            q1 = ((q1 - qmin).round()).min(255.0);
+            q2 = ((q2 - qmin).round()).min(255.0);
+        }
         // phred → likelihood (lower phred = more likely); normalise.
-        let l0 = 10f64.powf(-(q[r * 5 + r] as f64) / 10.0);
-        let l1 = 10f64.powf(-(q[r * 5 + a] as f64) / 10.0);
-        let l2 = 10f64.powf(-(q[a * 5 + a] as f64) / 10.0);
+        let l0 = 10f64.powf(-q0 / 10.0);
+        let l1 = 10f64.powf(-q1 / 10.0);
+        let l2 = 10f64.powf(-q2 / 10.0);
         let s = l0 + l1 + l2;
         if s > 0.0 {
             out[v * 3] = (l0 / s) as f32;
