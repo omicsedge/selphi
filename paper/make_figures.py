@@ -20,7 +20,7 @@ Figure 3 (figure3_accuracy): 3a = genome-wide (20-autosome) n-weighted per-MAF R
 Figure 4 (figure4_efficiency): 4a = lcWGS wall time, whole chr22, 16 threads, two labelled clusters
      (capture libraries, 4,796-hap panel, BAM in -> imputed out, quiet-machine 2026-09-02;
      downsampled 1x, 6,332-hap panel = the former Figure 3c values, unchanged).
-     4b/4c = Table 5b whole-genome wall time / peak memory (content unchanged).
+     4b/4c = Table 5b whole-genome wall time / peak memory (re-measured 2026-09-14: 19.0 min / 8.5 GB).
 Supplementary (figureS_replication): per chromosome (22, 20, 10, 1) the mean paired delta
      non-reference concordance, Selphi 2 native pileup + BAQ minus GLIMPSE2 (pp), overall and by
      panel-MAF stratum, with the six per-sample points and k/6 wins (Table 1d). Per-sample deltas
@@ -358,14 +358,14 @@ axl.legend(frameon=False, loc="upper left", fontsize=7, handlelength=1.2, border
 axl.grid(alpha=.25, lw=.5, axis="y")
 tt = ["Selphi 2", "Beagle 5.5"]; xt = np.arange(2); tcol2 = [C["selphi"], C["beagle"]]
 # (b) whole-genome wall time: 6-sample array, 22 autosomes, full pipeline, 16 threads
-wg_wall = [27.7, 36.4]
+wg_wall = [19.0, 36.4]
 axw.bar(xt, wg_wall, 0.55, color=tcol2)
 for i,v in enumerate(wg_wall): axw.text(i, v+0.4, f"{v} min", ha="center", fontsize=8.5, fontweight="bold")
 axw.set_xticks(xt); axw.set_xticklabels(tt); axw.set_ylabel("Whole-genome wall time (min)")
 axw.set_ylim(0, 41); axw.set_title("(b) Whole-genome wall time", loc="left", fontweight="bold")
 axw.grid(alpha=.25, lw=.5, axis="y")
 # (c) peak memory, one chromosome at a time (peak = largest chromosome)
-wg_mem = [25, 40]
+wg_mem = [8.5, 40]
 axm.bar(xt, wg_mem, 0.55, color=tcol2)
 for i,v in enumerate(wg_mem): axm.text(i, v+0.5, f"{v} GB", ha="center", fontsize=8.5, fontweight="bold")
 axm.set_xticks(xt); axm.set_xticklabels(tt); axm.set_ylabel("Peak memory (GB, per chromosome)")
