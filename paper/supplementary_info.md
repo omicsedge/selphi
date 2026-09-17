@@ -327,6 +327,12 @@ ultra-rare (MAF 0-0.5%).
 > R² reported in the paper; the large-panel run's wall time and peak memory are retained as an
 > efficiency data point in Table S6.
 
+## Supplementary Figure S1. Replication of the capture-library head-to-head across chromosomes
+
+![Supplementary Figure S1](figures/figureS_replication.png)
+
+**Supplementary Figure S1. Replication of the capture-library head-to-head across chromosomes.** Paired difference in non-reference concordance, Selphi 2 native pileup with base alignment quality minus GLIMPSE2, in percentage points, for the six GIAB capture libraries (HG002-HG007) on chromosomes 22 (a), 20 (b), 10 (c) and 1 (d), overall and by panel minor-allele-frequency stratum (≥ 5%, 0.5-5%, < 0.5%). Bars are the mean over the six samples, points the individual samples, and k/6 the number of samples in which Selphi 2 is ahead. Both tools were scored on identical per-sample site lists inside the GIAB v4.2.1 high-confidence regions with typed array sites excluded; the number of evaluated sites per sample is given in each panel. The means and win counts are those of Table 1d: overall and at MAF ≥ 5% Selphi 2 leads in six of six samples on every chromosome (+0.18 to +0.26 pp), and at MAF < 0.5% the margin is inconsistent on chromosome 22 (+0.26 pp, three of six) but grows and becomes unanimous on chromosomes 10 and 1 (+0.41 and +0.66 pp, six of six).
+
 ## Table S5. Phasing accuracy - switch-error rate (SER %)
 
 1KG 54-trio benchmark, no-trios panel (~2,239 samples). Lower is better.
