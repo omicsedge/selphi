@@ -313,13 +313,13 @@ ultra-rare (MAF 0-0.5%).
 | Coverage | Bin | Selphi 2 R² | GLIMPSE2 R² | QUILT2 R² | Winner |
 |---|---|---:|---:|---:|---|
 | 0.5× | OVERALL | **0.9924** | 0.9916 | 0.9919 | Selphi |
-| 1×   | OVERALL | **0.9950** | 0.9945 | 0.9944 | Selphi |
+| 1×   | OVERALL | **0.9952** | 0.9945 | 0.9944 | Selphi |
 | 2×   | OVERALL | **0.9971** | 0.9967 | 0.9968 | Selphi |
-| 4×   | OVERALL | **0.9979** | 0.9975 | 0.9973 | Selphi |
-| 0.5× | 0-0.5% (ultra-rare) | 0.8997 | **0.9023** | 0.8864 | reference |
-| 1×   | 0-0.5% (ultra-rare) | 0.9243 | 0.9252 | 0.9150 | tie |
-| 2×   | 0-0.5% (ultra-rare) | **0.9522** | 0.9495 | 0.9415 | Selphi |
-| 4×   | 0-0.5% (ultra-rare) | **0.9704** | 0.9638 | 0.9437 | Selphi |
+| 4×   | OVERALL | **0.9978** | 0.9975 | 0.9973 | Selphi |
+| 0.5× | 0-0.5% (ultra-rare) | 0.8994 | **0.9023** | 0.8864 | reference |
+| 1×   | 0-0.5% (ultra-rare) | **0.9282** | 0.9252 | 0.9150 | Selphi |
+| 2×   | 0-0.5% (ultra-rare) | **0.9525** | 0.9495 | 0.9415 | Selphi |
+| 4×   | 0-0.5% (ultra-rare) | **0.9705** | 0.9638 | 0.9437 | Selphi |
 
 > Earlier lcWGS benchmark rounds (simulated 54-sample chr22 sets, and a 75,552-haplotype
 > large-panel multi-coverage sweep) were superseded for accuracy by the real-read measurements
