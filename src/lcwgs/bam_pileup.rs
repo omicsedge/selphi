@@ -92,6 +92,19 @@ pub struct PileupParams {
     /// for genotype-likelihood calling is standard and we keep doing it; the
     /// supplementary half is UNMEASURED. `LCWGS_KEEP_SUPPLEMENTARY` (A/B).
     pub keep_supplementary: bool,
+    /// Reconcile overlapping mates the way htslib's pileup does (`overlap_push` +
+    /// `tweak_overlap_quality`, the path bcftools mpileup and GLIMPSE2 both go
+    /// through): a paired read waits until its mate arrives (or the sweep passes its
+    /// end); over the overlap, agreeing bases put the SUMMED quality (cap 200) on the
+    /// higher-quality mate and zero on the other, disagreeing bases keep 0.8x on the
+    /// higher-quality mate and zero the other -- and only THEN do the base-quality
+    /// filter and caps run, so a zeroed mate is dropped and two agreeing Q15 bases
+    /// survive as one Q30. The per-site `OverlapState` merge it replaces got three
+    /// cases wrong (2026-09-17 audit): interleaved pairs at one site were counted
+    /// twice (it remembered only the LAST fragment), agreeing sub-threshold bases
+    /// were dropped before they could be summed, and a disagreement reduced to Q19
+    /// was kept against the Q20 filter. `LCWGS_OVERLAP_HTSLIB` (A/B until measured).
+    pub overlap_htslib: bool,
 }
 impl Default for PileupParams {
     fn default() -> Self {
@@ -106,6 +119,7 @@ impl Default for PileupParams {
             full_baq: crate::config::present("LCWGS_FULL_BAQ"),
             baq_streaming: crate::config::present("LCWGS_BAQ_STREAMING"),
             keep_supplementary: crate::config::present("LCWGS_KEEP_SUPPLEMENTARY"),
+            overlap_htslib: crate::config::present("LCWGS_OVERLAP_HTSLIB"),
         }
     }
 }
@@ -332,6 +346,8 @@ pub struct PileupReport {
     pub n_realigned: u64,
     pub n_baq_noop: u64,
     pub n_trigger_sites: usize,
+    /// `overlap_htslib`: fragments whose two mates overlapped and were reconciled.
+    pub n_overlap_pairs: u64,
 }
 
 /// One aligned read as the pileup core sees it — the BAM and CRAM adapters fill
@@ -348,6 +364,14 @@ struct ReadView<'a> {
     qual: &'a [u8],
     /// Fragment hash (paired mates share a QNAME), for overlap collapsing.
     qhash: u64,
+    /// QNAME bytes (htslib picks the surviving mate of an overlap by a hash of it).
+    name: &'a [u8],
+    /// 1-based mate alignment start, -1 when unset.
+    mpos: i64,
+    /// Template length (TLEN), 0 when unset.
+    isize: i64,
+    /// Mate placed on a different contig (mtid >= 0 and != tid).
+    mate_other_tid: bool,
 }
 
 /// A record source replays every record of the sample on `chrom` (the contig
@@ -420,7 +444,11 @@ fn pileup_one(
             seq_buf.extend(record.sequence().iter());
             let qual = record.quality_scores().as_bytes();
             let qhash = record.name().map(|n| fnv1a(n.as_ref())).unwrap_or((start as u64) << 1 | 1);
-            sink(&ReadView { start, flags: record.flags().bits(), mapq, cigar: &cigar_buf, seq: &seq_buf, qual, qhash });
+            let name: &[u8] = record.name().map(|n| n.as_ref()).unwrap_or(&[]);
+            let mpos = match record.mate_alignment_start() { Some(Ok(p)) => usize::from(p) as i64, _ => -1 };
+            let isize = record.template_length() as i64;
+            let mate_other_tid = matches!(record.mate_reference_sequence_id(), Some(Ok(mt)) if mt != target_rid);
+            sink(&ReadView { start, flags: record.flags().bits(), mapq, cigar: &cigar_buf, seq: &seq_buf, qual, qhash, name, mpos, isize, mate_other_tid });
         };
         if let (Some((rs, re)), Some(index)) = (region_query, index.as_ref()) {
             let reg = build_region(contig_name.clone(), rs, re)?;
@@ -524,7 +552,11 @@ fn pileup_one_cram(
             seq_buf.extend_from_slice(record.sequence().as_ref());
             let qual: &[u8] = record.quality_scores().as_ref();
             let qhash = record.name().map(|n| fnv1a(n.as_ref())).unwrap_or((start as u64) << 1 | 1);
-            sink(&ReadView { start, flags: record.flags().bits(), mapq, cigar: &cigar_buf, seq: &seq_buf, qual, qhash });
+            let name: &[u8] = record.name().map(|n| n.as_ref()).unwrap_or(&[]);
+            let mpos = record.mate_alignment_start().map_or(-1, |p| usize::from(p) as i64);
+            let isize = record.template_length() as i64;
+            let mate_other_tid = matches!(record.mate_reference_sequence_id(), Some(mt) if mt != target_rid);
+            sink(&ReadView { start, flags: record.flags().bits(), mapq, cigar: &cigar_buf, seq: &seq_buf, qual, qhash, name, mpos, isize, mate_other_tid });
         };
         if let (Some((rs, re)), Some(index)) = (region_query, index.as_ref()) {
             let reg = build_region(contig_name.clone(), rs, re)?;
@@ -600,14 +632,30 @@ fn pileup_core(
         eq: Vec::with_capacity(256),
         last_pos: sites.pos[n_var - 1],
         report: &mut report,
+        pending: Vec::new(),
     };
     source(&mut |r: &ReadView| { if accept(r) { st.on_read(r); } })?;
+    st.finish();
     let PassState { mut bases, ll, depth, .. } = st;
 
     let gl = match em {
         Some(e) => finalize_gl_errmod(&mut bases, sites.ref_base, sites.alt_base, sites.is_snp, e),
         None => finalize_gl(&ll, &depth),
     };
+    // Diagnostic: `LCWGS_GL_DUMP=<file>` appends every covered SNP site's likelihoods
+    // (pos, ref, alt, depth, P(hom-ref), P(het), P(hom-alt)) so they can be compared
+    // site by site with the PL another pileup produced from the same reads.
+    if let Some(path) = crate::config::raw("LCWGS_GL_DUMP") {
+        use std::io::Write;
+        let f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut w = std::io::BufWriter::new(f);
+        for v in 0..n_var {
+            if !sites.is_snp[v] || depth[v] == 0 { continue; }
+            writeln!(w, "{}\t{}\t{}\t{}\t{:.6e}\t{:.6e}\t{:.6e}", sites.pos[v], sites.ref_base[v] as char,
+                     sites.alt_base[v] as char, depth[v], gl[v * 3], gl[v * 3 + 1], gl[v * 3 + 2])?;
+        }
+        w.flush()?;
+    }
     Ok((gl, report))
 }
 
@@ -630,23 +678,271 @@ struct PassState<'a> {
     eq: Vec<u8>,
     last_pos: i64,
     report: &'a mut PileupReport,
+    /// `overlap_htslib`: paired reads waiting for their mate, in arrival order.
+    pending: Vec<PendingRead>,
 }
+
+/// A read held back until its mate arrives or the sweep passes its end
+/// (`PileupParams::overlap_htslib`). Qualities are RAW: bcftools' pileup applies
+/// the overlap tweak (htslib) before `mplp_realn` runs BAQ on the column
+/// (mpileup.c: `bam_mplp_auto`, then `mplp_realn`), so BAQ is applied at scoring
+/// time here, on the reconciled qualities.
+struct PendingRead {
+    start: i64,
+    /// 1-based inclusive last reference position covered.
+    end: i64,
+    flags: u16,
+    mapq: u8,
+    cigar: Vec<(Kind, usize)>,
+    seq: Vec<u8>,
+    quals: Vec<u8>,
+    qhash: u64,
+    name: Vec<u8>,
+    /// bcftools' partial-BAQ rule selected this read (decided on arrival, from the
+    /// column statistics); the realignment itself runs when the read is scored.
+    realign: bool,
+    /// Column that triggered the selection (for `baq_streaming`).
+    trigger_v: usize,
+}
+
+/// Reference span of a CIGAR (M/=/X/D/N).
+fn ref_span(cigar: &[(Kind, usize)]) -> i64 {
+    cigar.iter().map(|&(k, l)| match k {
+        Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion | Kind::Skip => l as i64,
+        _ => 0,
+    }).sum()
+}
+
+/// htslib `cigar_iref2iseq_set` / `cigar_iref2iseq_next` (sam.c), the iterator
+/// `tweak_overlap_quality` walks a read with: `iref` is the reference offset of the
+/// current base from the read start, `iseq` its query index, `i`/`icig` the CIGAR
+/// cursor. `next` returns -1 when the read has no more bases.
+struct CigIter<'c> { cigar: &'c [(Kind, usize)], i: usize, icig: i64, iseq: i64, iref: i64 }
+impl<'c> CigIter<'c> {
+    fn new(cigar: &'c [(Kind, usize)]) -> Self { CigIter { cigar, i: 0, icig: 0, iseq: 0, iref: 0 } }
+    /// Position on the first aligned base at or after read offset `pos`.
+    fn set(&mut self, pos: i64) -> i32 {
+        if pos < 0 { return -1; }
+        let mut pos = pos;
+        self.icig = 0; self.iseq = 0; self.iref = 0;
+        while self.i < self.cigar.len() {
+            let (k, n) = self.cigar[self.i]; let n = n as i64;
+            match k {
+                Kind::SoftClip => { self.i += 1; self.iseq += n; self.icig = 0; }
+                Kind::HardClip | Kind::Pad => { self.i += 1; self.icig = 0; }
+                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                    pos -= n;
+                    if pos < 0 { self.icig = n + pos; self.iseq += self.icig; self.iref += self.icig; return 0; }
+                    self.i += 1; self.iseq += n; self.icig = 0; self.iref += n;
+                }
+                Kind::Insertion => { self.i += 1; self.iseq += n; self.icig = 0; }
+                Kind::Deletion | Kind::Skip => {
+                    pos -= n; if pos < 0 { pos = 0; }
+                    self.i += 1; self.icig = 0; self.iref += n;
+                }
+            }
+        }
+        self.iseq = -1;
+        -1
+    }
+    /// Advance to the next aligned base.
+    fn next(&mut self) -> i32 {
+        while self.i < self.cigar.len() {
+            let (k, n) = self.cigar[self.i]; let n = n as i64;
+            match k {
+                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                    if self.icig >= n - 1 { self.icig = -1; self.i += 1; continue; }
+                    self.iseq += 1; self.icig += 1; self.iref += 1;
+                    return 0;
+                }
+                Kind::Deletion | Kind::Skip => { self.i += 1; self.iref += n; self.icig = -1; }
+                Kind::Insertion | Kind::SoftClip => { self.i += 1; self.iseq += n; self.icig = -1; }
+                Kind::HardClip | Kind::Pad => { self.i += 1; self.icig = -1; }
+            }
+        }
+        self.iseq = -1; self.iref = -1;
+        -1
+    }
+    /// `cigar > bam_get_cigar(b) && bam_cigar_op(cigar[-1]) == BAM_CDEL`
+    fn prev_is_del(&self) -> bool { self.i > 0 && self.cigar[self.i - 1].0 == Kind::Deletion }
+}
+
+/// khash `__ac_X31_hash_string` (u32, wrapping), as htslib hashes a QNAME.
+fn x31_hash(s: &[u8]) -> u32 {
+    let mut h = s.first().copied().unwrap_or(0) as u32;
+    if h != 0 {
+        for &c in &s[1..] { h = (h << 5).wrapping_sub(h).wrapping_add(c as u32); }
+    }
+    h
+}
+
+/// khash `__ac_Wang_hash` (u32, wrapping).
+fn wang_hash(mut key: u32) -> u32 {
+    key = key.wrapping_add(!(key << 15));
+    key ^= key >> 10;
+    key = key.wrapping_add(key << 3);
+    key ^= key >> 6;
+    key = key.wrapping_add(!(key << 11));
+    key ^= key >> 16;
+    key
+}
+
+/// htslib 1.22 `tweak_overlap_quality` (sam.c), ported statement for statement so
+/// that its edge behaviour is reproduced too: the walk starts at `b`'s start and
+/// ends when either read runs out of aligned bases (so bases of one mate opposite
+/// the other's TRAILING deletion are untouched); the surviving mate is chosen by
+/// `Wang(X31(qname)) & 1` (`a` when odd); agreeing bases give the summed quality
+/// (cap 200) to the survivor and 0 to the other; disagreeing bases keep 0.8x
+/// (truncated) on the higher-quality mate and 0 on the other, the survivor deciding
+/// a tie; bases opposite the mate's deletion keep 0.8x if their read is the
+/// survivor, else 0; a reference skip is "not supported": the first common base
+/// after it is stepped over untouched, as upstream.
+fn tweak_overlap_quality(a: &mut PendingRead, b: &mut PendingRead) {
+    let (a_pos, b_pos) = (a.start, b.start);
+    let mut ia = CigIter::new(&a.cigar);
+    let mut ib = CigIter::new(&b.cigar);
+    let mut iref = b_pos;
+    let mut a_ret = ia.set(iref - a_pos);
+    if a_ret < 0 { return; }
+    let mut b_ret = ib.set(iref - b_pos);
+    if b_ret < 0 { return; }
+    let (amul, bmul) = if wang_hash(x31_hash(&a.name)) & 1 == 1 { (true, false) } else { (false, true) };
+    let t8 = |q: u8| (q as f64 * 0.8) as u8;
+    loop {
+        while a_ret >= 0 && ia.iref >= 0 && ia.iref < iref - a_pos { a_ret = ia.next(); }
+        if a_ret < 0 { break; }
+        while b_ret >= 0 && ib.iref >= 0 && ib.iref < iref - b_pos { b_ret = ib.next(); }
+        if b_ret < 0 { break; }
+        if iref < ia.iref + a_pos { iref = ia.iref + a_pos; }
+        if iref < ib.iref + b_pos { iref = ib.iref + b_pos; }
+        iref += 1;
+        if ia.iref + a_pos != ib.iref + b_pos {
+            if ia.iref + a_pos < ib.iref + b_pos && ib.prev_is_del() {
+                // deletion in b: it moved on further than a
+                loop {
+                    let qi = ia.iseq as usize;
+                    if qi < a.quals.len() { a.quals[qi] = if amul { t8(a.quals[qi]) } else { 0 }; }
+                    a_ret = ia.next();
+                    if a_ret < 0 { return; }
+                    if ia.iref + a_pos >= ib.iref + b_pos { break; }
+                }
+            } else if ia.prev_is_del() {
+                loop {
+                    let qi = ib.iseq as usize;
+                    if qi < b.quals.len() { b.quals[qi] = if bmul { t8(b.quals[qi]) } else { 0 }; }
+                    b_ret = ib.next();
+                    if b_ret < 0 { return; }
+                    if ib.iref + b_pos >= ia.iref + a_pos { break; }
+                }
+            } else {
+                continue; // anything else, e.g. a reference skip: unsupported upstream
+            }
+        }
+        if ia.iseq > a.seq.len() as i64 || ib.iseq > b.seq.len() as i64 { return; }
+        let (qa_i, qb_i) = (ia.iseq as usize, ib.iseq as usize);
+        if qa_i >= a.quals.len() || qb_i >= b.quals.len() || qa_i >= a.seq.len() || qb_i >= b.seq.len() { return; }
+        let (qa, qb) = (a.quals[qa_i], b.quals[qb_i]);
+        if a.seq[qa_i].to_ascii_uppercase() == b.seq[qb_i].to_ascii_uppercase() {
+            let sum = (qa as u32 + qb as u32).min(200) as u8;
+            a.quals[qa_i] = if amul { sum } else { 0 };
+            b.quals[qb_i] = if bmul { sum } else { 0 };
+        } else if qa > qb {
+            a.quals[qa_i] = t8(qa); b.quals[qb_i] = 0;
+        } else if qa < qb {
+            b.quals[qb_i] = t8(qb); a.quals[qa_i] = 0;
+        } else {
+            a.quals[qa_i] = if amul { t8(qa) } else { 0 };
+            b.quals[qb_i] = if bmul { t8(qb) } else { 0 };
+        }
+    }
+}
+
 impl PassState<'_> {
+    /// Score every pending read that no later read can overlap (its end lies
+    /// before the sweep position), in arrival order.
+    fn flush_before(&mut self, start: i64) {
+        let mut i = 0;
+        while i < self.pending.len() {
+            if self.pending[i].end < start {
+                let p = self.pending.remove(i);
+                self.score_owned(&p);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// End of the record stream: score whatever is still waiting.
+    fn finish(&mut self) {
+        let rest = std::mem::take(&mut self.pending);
+        for p in &rest { self.score_owned(p); }
+    }
+
+    /// The scoring tail of `on_read`, for a read whose qualities were reconciled
+    /// with its mate (or that has no overlapping mate): BAQ runs here, on the
+    /// reconciled qualities, as bcftools runs `mplp_realn` after the pileup's tweak.
+    fn score_owned(&mut self, p: &PendingRead) {
+        let mut realigned = false;
+        if p.realign {
+            if let Some(b) = self.baq {
+                if baq::baq_effective_quals(p.start - 1, &p.cigar, &p.seq, &p.quals, b.ref_seq, b.ref_off, &mut self.bsc, &mut self.eq) {
+                    realigned = true;
+                    self.report.n_realigned += 1;
+                    if self.params.baq_streaming {
+                        if let Some(qi) = query_index_at(p.start, &p.cigar, self.sites.pos[p.trigger_v]) {
+                            let qi = qi.min(self.eq.len());
+                            self.eq[..qi].copy_from_slice(&p.quals[..qi]);
+                        }
+                    }
+                } else {
+                    self.report.n_baq_noop += 1;
+                }
+            }
+        }
+        let quals: Vec<u8> = if realigned { self.eq.clone() } else { p.quals.clone() };
+        let base_at = |qi: usize| p.seq.get(qi).copied().unwrap_or(b'N');
+        let qual_at = |qi: usize| quals.get(qi).copied().unwrap_or(0);
+        if self.em.is_some() {
+            walk_record_em(
+                p.start, self.last_pos, &p.cigar, base_at, qual_at,
+                quals.len(), p.mapq, p.flags & 0x10 != 0,
+                self.sites.pos, self.sites.is_snp, self.params, &mut self.bases, &mut self.depth, p.qhash, &mut self.ov,
+            );
+        } else {
+            walk_record(
+                p.start, self.last_pos, &p.cigar, base_at, qual_at,
+                self.sites.pos, self.sites.ref_base, self.sites.alt_base, self.sites.is_snp, self.params, self.lut,
+                &mut self.ll, &mut self.depth, p.qhash, &mut self.ov,
+            );
+            if let Some(model) = self.indel_model {
+                super::indel_realign::score_read(
+                    p.start, &p.cigar, base_at, qual_at,
+                    model, self.lut, &mut self.iscratch, &mut self.ll, &mut self.depth,
+                    self.params.max_depth, self.params.min_bq, p.qhash, &mut self.ov.last_frag,
+                );
+            }
+        }
+    }
+
     fn on_read(&mut self, r: &ReadView) {
         self.report.n_reads += 1;
         // BAQ: judge the read once, at the first triggering column it covers
         // (bcftools marks a read realigned at that column whatever the outcome).
         let mut realigned = false;
+        let mut selected_for_baq = false;
+        let mut trigger_v: usize = 0;
         if let (Some(b), Some((stats, trig))) = (self.baq, self.baq_sel) {
             let mut decision: Option<bool> = None;
-            let mut trigger_v: usize = 0;
             for_each_covered_site(r.start, self.last_pos, r.cigar, self.sites.pos, |v, _| {
                 if decision.is_none() && trig[v] {
                     decision = Some(baq::read_passes_realign_rule(r.qual.len(), r.cigar, stats.nt[v], stats.has_clip[v], b.partial));
                     trigger_v = v;
                 }
             });
-            if decision == Some(true) {
+            selected_for_baq = decision == Some(true);
+            if selected_for_baq && self.params.overlap_htslib {
+                // deferred: BAQ runs at scoring time, after the mate reconciliation
+            } else if decision == Some(true) {
                 if baq::baq_effective_quals(r.start - 1, r.cigar, r.seq, r.qual, b.ref_seq, b.ref_off, &mut self.bsc, &mut self.eq) {
                     realigned = true;
                     self.report.n_realigned += 1;
@@ -663,6 +959,39 @@ impl PassState<'_> {
                     self.report.n_baq_noop += 1;
                 }
             }
+        }
+        if self.params.overlap_htslib {
+            // htslib `overlap_push`: hold a read whose mate may still overlap it,
+            // reconcile the two RAW quality arrays when the mate arrives, then score
+            // both (BAQ runs inside `score_owned`, after the tweak, as in bcftools).
+            let end = r.start + ref_span(r.cigar) - 1;
+            let me = PendingRead {
+                start: r.start, end, flags: r.flags, mapq: r.mapq, cigar: r.cigar.to_vec(), seq: r.seq.to_vec(),
+                quals: r.qual.to_vec(), qhash: r.qhash, name: r.name.to_vec(), realign: selected_for_baq, trigger_v,
+            };
+            self.flush_before(r.start);
+            let l_qseq = r.seq.len() as i64;
+            // mapped mate, proper pair, same contig, and an overlap still possible
+            let eligible = r.flags & 0x8 == 0 && r.flags & 0x2 != 0 && !r.mate_other_tid
+                && !(r.isize.abs() >= 2 * l_qseq && r.mpos > end);
+            if eligible {
+                if let Some(i) = self.pending.iter().position(|q| q.qhash == r.qhash && q.name == r.name) {
+                    let mut mate = self.pending.remove(i);
+                    let mut me = me;
+                    tweak_overlap_quality(&mut mate, &mut me);
+                    self.report.n_overlap_pairs += 1;
+                    self.score_owned(&mate);
+                    self.score_owned(&me);
+                } else if r.mpos >= r.start || (r.flags & 0x1 != 0 && r.mpos < 0) {
+                    // only reads whose mate is still to arrive are kept
+                    self.pending.push(me);
+                } else {
+                    self.score_owned(&me);
+                }
+            } else {
+                self.score_owned(&me);
+            }
+            return;
         }
         let quals: &[u8] = if realigned { &self.eq } else { r.qual };
         let base_at = |qi: usize| r.seq.get(qi).copied().unwrap_or(b'N');
@@ -862,7 +1191,7 @@ fn walk_record<B: Fn(usize) -> u8, Q: Fn(usize) -> u8>(
                         let qraw = qual_at(qi);
                         if b != b'N' && qraw >= params.min_bq {
                             let q = (qraw as usize).min(93);
-                            if ov.last_frag[v] == qhash {
+                            if !params.overlap_htslib && ov.last_frag[v] == qhash {
                                 // Overlapping mate of the same fragment: merge into the
                                 // existing observation (one molecule) instead of adding.
                                 let fb = ov.first_base[v];
@@ -947,7 +1276,7 @@ fn walk_record_em<B: Fn(usize) -> u8, Q: Fn(usize) -> u8>(
                     if is_snp[v] {
                         let qi = qcur + (pos[v] - refcur) as usize;
                         let base4 = ascii_to_base4(base_at(qi));
-                        if base4 <= 3 && (depth[v] < params.max_depth || ov.last_frag[v] == qhash) {
+                        if base4 <= 3 && (depth[v] < params.max_depth || (!params.overlap_htslib && ov.last_frag[v] == qhash)) {
                             let mut q = qual_at(qi) as i32;
                             // neighbour-quality cap (bcftools delta_baseQ = 30)
                             if qi > 0 { let nq = qual_at(qi - 1) as i32; if q > nq + 30 { q = nq + 30; } }
@@ -957,7 +1286,7 @@ fn walk_record_em<B: Fn(usize) -> u8, Q: Fn(usize) -> u8>(
                                 if q > mq_cap { q = mq_cap; }   // mapping-quality cap
                                 if q > 63 { q = 63; }
                                 if q < 4 { q = 4; }
-                                if ov.last_frag[v] == qhash {
+                                if !params.overlap_htslib && ov.last_frag[v] == qhash {
                                     // Overlapping mate of one fragment: merge into the first
                                     // mate's buffered base (samtools tweak_overlap_quality):
                                     // agreeing bases → SUM the qualities (cap 60); disagreeing
@@ -1098,5 +1427,110 @@ mod tests {
         let mut seen = Vec::new();
         for_each_covered_site(100, 200, &cigar, &pos, |v, ia| seen.push((pos[v], ia)));
         assert_eq!(seen, vec![(105, 0), (109, 2), (114, -3), (116, 0), (121, 0)]);
+    }
+}
+
+#[cfg(test)]
+mod overlap_oracle_tests {
+    //! The twelve cases of Codex's independent htslib/pysam oracle
+    //! (`/data/tmp/codex_pileup_audit_20260917/overlap_oracle.{py,json}`, pysam 0.23.3 /
+    //! samtools 1.21, BAQ off, min base quality 1): mate `a` = forward, start 101, 20M,
+    //! MAPQ 25, all-A; mate `b` = reverse, start 103, MAPQ 60. Which mate keeps the
+    //! reconciled base is decided by `Wang(X31(qname)) & 1`: `read3` keeps `a`, `read0..2`
+    //! keep `b`. Expected observations are the oracle's, verbatim.
+    use super::*;
+
+    fn mate(name: &str, start: i64, cigar: &[(Kind, usize)], base: u8, q: u8, flags: u16, mapq: u8) -> PendingRead {
+        PendingRead {
+            start, end: start + ref_span(cigar) - 1, flags, mapq, cigar: cigar.to_vec(),
+            seq: vec![base; 20], quals: vec![q; 20], qhash: 1, name: name.as_bytes().to_vec(),
+            realign: false, trigger_v: 0,
+        }
+    }
+    const M20: [(Kind, usize); 1] = [(Kind::Match, 20)];
+    const DEL: [(Kind, usize); 3] = [(Kind::Match, 5), (Kind::Deletion, 2), (Kind::Match, 15)];
+
+    #[test]
+    fn survivor_is_chosen_by_qname_hash() {
+        assert_eq!(wang_hash(x31_hash(b"read3")) & 1, 1, "read3 keeps a");
+        for n in ["read0", "read1", "read2"] { assert_eq!(wang_hash(x31_hash(n.as_bytes())) & 1, 0, "{n} keeps b"); }
+    }
+
+    #[test]
+    fn agreeing_bases_sum_onto_the_survivor() {
+        // site 111: a index 10, b index 8; a A/Q30, b A/Q40 -> one observation at Q70
+        for (name, keep_a) in [("read0", false), ("read1", false), ("read2", false), ("read3", true)] {
+            let mut a = mate(name, 101, &M20, b'A', 30, 99, 25);
+            let mut b = mate(name, 103, &M20, b'A', 40, 147, 60);
+            tweak_overlap_quality(&mut a, &mut b);
+            if keep_a { assert_eq!((a.quals[10], b.quals[8]), (70, 0), "{name}"); }
+            else { assert_eq!((a.quals[10], b.quals[8]), (0, 70), "{name}"); }
+        }
+    }
+
+    #[test]
+    fn equal_quality_mismatch_keeps_survivor_at_0_8() {
+        // a A/Q30 vs b C/Q30 at site 111 -> survivor keeps trunc(0.8*30) = 24
+        for (name, keep_a) in [("read0", false), ("read1", false), ("read2", false), ("read3", true)] {
+            let mut a = mate(name, 101, &M20, b'A', 30, 99, 25);
+            let mut b = mate(name, 103, &M20, b'C', 30, 147, 60);
+            tweak_overlap_quality(&mut a, &mut b);
+            if keep_a { assert_eq!((a.quals[10], b.quals[8]), (24, 0), "{name}"); }
+            else { assert_eq!((a.quals[10], b.quals[8]), (0, 24), "{name}"); }
+        }
+    }
+
+    #[test]
+    fn base_opposite_mate_deletion() {
+        // b = 5M2D15M from 103: deletion covers 108-109; site 109 is a index 8.
+        for (name, keep_a) in [("read0", false), ("read1", false), ("read2", false), ("read3", true)] {
+            let mut a = mate(name, 101, &M20, b'A', 30, 99, 25);
+            let mut b = mate(name, 103, &DEL, b'A', 30, 147, 60);
+            tweak_overlap_quality(&mut a, &mut b);
+            assert_eq!(a.quals[8], if keep_a { 24 } else { 0 }, "{name}");
+            // and the matched positions past the deletion still sum: site 111 = a 10, b 7
+            let (qa, qb) = (a.quals[10], b.quals[7]);
+            assert_eq!(if keep_a { (qa, qb) } else { (qb, qa) }, (60, 0), "{name}");
+        }
+    }
+
+    #[test]
+    fn trailing_deletion_ends_the_walk_without_penalty() {
+        // a = 20M2D from 101 (bases 101-120, deletion 121-122), b = 20M from 103: htslib
+        // stops when a runs out of bases, so b's bases at 121-122 stay Q30 (both survivors).
+        for name in ["read0", "read3"] {
+            let mut a = mate(name, 101, &[(Kind::Match, 20), (Kind::Deletion, 2)], b'A', 30, 99, 25);
+            let mut b = mate(name, 103, &M20, b'A', 30, 147, 60);
+            tweak_overlap_quality(&mut a, &mut b);
+            assert_eq!((b.quals[18], b.quals[19]), (30, 30), "{name}");
+        }
+    }
+
+    #[test]
+    fn first_common_base_after_a_reference_skip_is_stepped_over() {
+        // b = 5M2N15M from 103 (bases 103-107, skip 108-109, bases 110-124): at 110 both
+        // mates keep Q30 (htslib does not support skips and steps past that base); 111 sums.
+        for name in ["read0", "read3"] {
+            let mut a = mate(name, 101, &M20, b'A', 30, 99, 25);
+            let mut b = mate(name, 103, &[(Kind::Match, 5), (Kind::Skip, 2), (Kind::Match, 15)], b'A', 30, 147, 60);
+            tweak_overlap_quality(&mut a, &mut b);
+            assert_eq!((a.quals[9], b.quals[5]), (30, 30), "{name} at 110");
+            assert_eq!(a.quals[10].max(b.quals[6]), 60, "{name} at 111");
+        }
+        // and with the skip in a: a = 5M2N15M from 101 (skip 106-107, bases 108-122), b = 20M from 103
+        for name in ["read0", "read3"] {
+            let mut a = mate(name, 101, &[(Kind::Match, 5), (Kind::Skip, 2), (Kind::Match, 15)], b'A', 30, 99, 25);
+            let mut b = mate(name, 103, &M20, b'A', 30, 147, 60);
+            tweak_overlap_quality(&mut a, &mut b);
+            assert_eq!((a.quals[5], b.quals[5]), (30, 30), "{name} at 108");
+        }
+    }
+
+    #[test]
+    fn unequal_mismatch_keeps_the_higher_quality_base() {
+        let mut a = mate("read0", 101, &M20, b'A', 24, 99, 25);
+        let mut b = mate("read0", 103, &M20, b'C', 30, 147, 60);
+        tweak_overlap_quality(&mut a, &mut b);
+        assert_eq!((a.quals[10], b.quals[8]), (0, 24));
     }
 }
