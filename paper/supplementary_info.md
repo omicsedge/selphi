@@ -496,6 +496,19 @@ R² 0.5921 on the same set (main text). Selphi 2 leads at every MAF bin.
 | 20-50%    | **0.6657** | 0.6249 | 0.6084 |
 | OVERALL   | **0.6210** | 0.4967 | 0.4795 |
 
+## Table S11b. MESA per-sample R² by self-reported ancestry (source data for Figure 3b)
+
+Per-sample mean R² over the labelled MESA samples imputed against the TOPMed panel (chr20, full
+phase-and-impute pipeline, Selphi 2 at its panel-adaptive mc = 132,676; Beagle 5.5 at its
+defaults). 3,948 of the 5,000 samples carry an ancestry label. Bold marks the higher value.
+
+| Group (n) | Selphi 2 | Beagle 5.5 | Δ |
+|---|---:|---:|---:|
+| African-American (924) | **0.8976** | 0.8733 | +0.0243 |
+| Hispanic (859) | **0.9018** | 0.8763 | +0.0255 |
+| White (1,631) | **0.9066** | 0.8835 | +0.0231 |
+| Chinese-American (534) | **0.8975** | 0.8600 | +0.0375 |
+
 ## Table S12. Selphi 2 vs Selphi 1.5.3, per-MAF (1KG Phase 3, impute-only)
 
 Both tools imputed the identical phased target (801 held-out samples) against the identical 1000

@@ -26,6 +26,7 @@ Supplementary (figureS_replication): per chromosome (22, 20, 10, 1) the mean pai
      panel-MAF stratum, with the six per-sample points and k/6 wins (Table 1d). Per-sample deltas
      are recomputed from figures/data/chrN/*_conc_{selphi_native,glimpse2}.json and cross-checked
      against figures/data/paper_numbers_multichr.json (arms.native)."""
+import re
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -36,6 +37,10 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = "/data/projects/.claude_home/gt/selphi/mayor/rig/paper/figures"
+import sys as _sys; _sys.path.insert(0, HERE)
+from paper_tables import table_after, column, row, row_line, num
+MAIN = open(os.path.join(HERE, "selphi2_paper.md"), encoding="utf-8").read()
+SUPP = open(os.path.join(HERE, "supplementary_info.md"), encoding="utf-8").read()
 DATA22 = os.path.join(HERE, "figures", "data", "chr22")
 os.makedirs(OUT, exist_ok=True)
 plt.rcParams.update({
@@ -246,21 +251,25 @@ for arm, (per, means, wins) in d_summary.items():
 maf_lbl = ["0.05-0.1", "0.1-0.2", "0.2-0.5", "0.5-1", "1-2", "2-5", "5-10", "10-20", "20-50"]
 x = np.arange(len(maf_lbl))
 
-# ---- data (from paper tables) ----
-# 3a: 1KG genome-wide (20 autosomes) R2 by MAF, five-way, imputation-only (n-weighted;
-#     all tools impute from the identical phased target + panel; Supplementary Table S9)
-t1 = {"selphi":   [.3531,.4232,.5245,.6260,.6920,.7627,.8532,.8968,.9259],
-      "selphi153":[.3375,.4106,.5149,.6207,.6898,.7629,.8539,.8973,.9262],
-      "beagle":   [.3570,.4151,.5092,.6083,.6742,.7460,.8414,.8885,.9196],
-      "impute5":  [.3458,.4062,.5005,.5991,.6654,.7381,.8355,.8840,.9160],
-      "minimac4": [.3529,.4132,.5048,.6013,.6663,.7367,.8323,.8803,.9112]}
+# ---- data: every number below is read from the manuscript tables (paper_tables.py) ----
+# 3a: 1KG genome-wide (20 autosomes) R2 by MAF, five-way, imputation-only = Supplementary Table S9
+_s9 = table_after(SUPP, "## Table S9.")
+_maf_rows = [r[0] for r in _s9[1:] if r[0] != "OVERALL"]
+assert len(_maf_rows) == 9, _maf_rows
+t1 = {k: column(_s9, h, exclude_prefixes=("OVERALL",)) for k, h in
+      [("selphi", "Selphi 2"), ("selphi153", "Selphi 1.5.3"), ("beagle", "Beagle 5.5"),
+       ("impute5", "IMPUTE5"), ("minimac4", "Minimac4")]}
 # 3c: HGDP out-of-panel per-region per-sample R2 (Table 4c genome-wide)
 regions = ["Oceanian*","Mid-East*","African","E.Asian","C/S.Asian","European","Adm.Amer."]
-hgdp_s = [.8983,.9391,.8784,.9509,.9472,.9578,.9627]
-hgdp_b = [.8879,.9325,.8655,.9429,.9416,.9531,.9568]
+_t4c = table_after(MAIN, "**Table 4c.")
+hgdp_s = column(_t4c, "Selphi 2", exclude_prefixes=("All (",))
+hgdp_b = column(_t4c, "Beagle 5.5", exclude_prefixes=("All (",))
+assert len(hgdp_s) == len(regions) == 7
 # 3d: lcWGS coverage sweep per-sample R2 (Table 2b) — Selphi native --bam errmod GL (beats GLIMPSE2 and QUILT2 at every coverage)
 cov = [0.5,1,2,4]
-lc = {"selphi":[.9924,.9950,.9971,.9979],"glimpse2":[.9916,.9945,.9967,.9975],"quilt2":[.9919,.9944,.9968,.9973]}
+_t2b = table_after(MAIN, "**Table 2b.")   # first table = overall per-sample R2
+lc = {"selphi": column(_t2b, "Selphi 2"), "glimpse2": column(_t2b, "GLIMPSE2"), "quilt2": column(_t2b, "QUILT2")}
+assert [num(r[0]) for r in _t2b[1:]] == cov
 
 fig, ax = plt.subplots(2, 2, figsize=(9.2, 7.0))
 
@@ -281,8 +290,10 @@ a.legend(frameon=False, loc="lower right"); a.grid(alpha=.25, lw=.5)
 # per-group deltas (+0.023..+0.038) match the Results prose (re-measured 2026-09-15).
 b = ax[0,1]
 pop_lbl = ["African-\nAmerican","Hispanic","European\n(White)","East-Asian"]
-sel_r2  = [0.8976, 0.9018, 0.9066, 0.8975]
-bea_r2  = [0.8733, 0.8763, 0.8835, 0.8600]
+_s11b = table_after(SUPP, "## Table S11b.")
+sel_r2  = column(_s11b, "Selphi 2")
+bea_r2  = column(_s11b, "Beagle 5.5")
+assert len(sel_r2) == 4
 xp = np.arange(4); wp = 0.38
 b.bar(xp-wp/2, sel_r2, wp, color=C["selphi"], label="Selphi 2")
 b.bar(xp+wp/2, bea_r2, wp, color=C["beagle"], label="Beagle 5.5")
@@ -331,10 +342,19 @@ fig2, (axl, axw, axm) = plt.subplots(1, 3, figsize=(11.5, 3.6))
 #     (15 native chunks + ligate), QUILT2 1,729 s (tiled) -- the former Figure 3c values,
 #     unchanged. No scaling.
 tool_col = {"Selphi 2": C["selphi"], "GLIMPSE2": C["glimpse2"], "QUILT2": C["quilt2"]}
-speed_groups = [  # (x0, tick label, [(tool, seconds), ...])
-    (0.0, "1 sample",            [("Selphi 2", 104), ("GLIMPSE2", 327)]),
-    (2.4, "6 samples\n(one run)", [("Selphi 2", 170), ("GLIMPSE2", 389)]),
-    (5.3, "1 sample",            [("Selphi 2", 115), ("GLIMPSE2", 287), ("QUILT2", 1729)]),
+def _s6_wall(key):
+    """Selphi wall and the comparators' walls from one Table S6 row: (selphi_s, {tool: s})."""
+    cells = row_line(SUPP, key)
+    others = {m.group(1): int(m.group(2).replace(",", "")) for m in
+              re.finditer(r"(GLIMPSE2|QUILT2): ([\d,]+) s", cells[3])}
+    return int(num(cells[2])), others
+_cap1, _cap1o = _s6_wall("lcWGS capture library chr22, 1 sample, native `--bam` + BAQ, BAM in to imputed VCF out")
+_cap6, _cap6o = _s6_wall("lcWGS capture library chr22, 6 samples in one run | wall")
+_ds1, _ds1o = _s6_wall("lcWGS whole-chr22, 1 sample @1")
+speed_groups = [  # (x0, tick label, [(tool, seconds), ...]) -- Supplementary Table S6
+    (0.0, "1 sample",            [("Selphi 2", _cap1), ("GLIMPSE2", _cap1o["GLIMPSE2"])]),
+    (2.4, "6 samples\n(one run)", [("Selphi 2", _cap6), ("GLIMPSE2", _cap6o["GLIMPSE2"])]),
+    (5.3, "1 sample",            [("Selphi 2", _ds1), ("GLIMPSE2", _ds1o["GLIMPSE2"]), ("QUILT2", _ds1o["QUILT2"])]),
 ]
 bw = 0.78; tick_pos = []; tick_lbl = []; seen = set()
 for x0, glab, bars_ in speed_groups:
@@ -358,16 +378,17 @@ axl.legend(frameon=False, loc="upper left", fontsize=7, handlelength=1.2, border
 axl.grid(alpha=.25, lw=.5, axis="y")
 tt = ["Selphi 2", "Beagle 5.5"]; xt = np.arange(2); tcol2 = [C["selphi"], C["beagle"]]
 # (b) whole-genome wall time: 6-sample array, 22 autosomes, full pipeline, 16 threads
-wg_wall = [19.0, 36.4]
+_t5b = table_after(MAIN, "**Table 5b.")
+wg_wall = [num(row(_t5b, "Selphi 2 (default diploid)")[1]), num(row(_t5b, "Beagle 5.5 (phase + impute)")[1])]
 axw.bar(xt, wg_wall, 0.55, color=tcol2)
-for i,v in enumerate(wg_wall): axw.text(i, v+0.4, f"{v} min", ha="center", fontsize=8.5, fontweight="bold")
+for i,v in enumerate(wg_wall): axw.text(i, v+0.4, f"{v:.1f} min", ha="center", fontsize=8.5, fontweight="bold")
 axw.set_xticks(xt); axw.set_xticklabels(tt); axw.set_ylabel("Whole-genome wall time (min)")
 axw.set_ylim(0, 41); axw.set_title("(b) Whole-genome wall time", loc="left", fontweight="bold")
 axw.grid(alpha=.25, lw=.5, axis="y")
 # (c) peak memory, one chromosome at a time (peak = largest chromosome)
-wg_mem = [8.5, 40]
+wg_mem = [num(row(_t5b, "Selphi 2 (default diploid)")[2]), num(row(_t5b, "Beagle 5.5 (phase + impute)")[2])]
 axm.bar(xt, wg_mem, 0.55, color=tcol2)
-for i,v in enumerate(wg_mem): axm.text(i, v+0.5, f"{v} GB", ha="center", fontsize=8.5, fontweight="bold")
+for i,v in enumerate(wg_mem): axm.text(i, v+0.5, f"{v:g} GB", ha="center", fontsize=8.5, fontweight="bold")
 axm.set_xticks(xt); axm.set_xticklabels(tt); axm.set_ylabel("Peak memory (GB, per chromosome)")
 axm.set_ylim(0, 47); axm.set_title("(c) Peak memory", loc="left", fontweight="bold")
 axm.grid(alpha=.25, lw=.5, axis="y")
