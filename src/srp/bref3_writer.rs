@@ -45,11 +45,7 @@ pub fn write_bref3_from_bcf(source_path: &Path, output_path: &Path) -> io::Resul
     let max_seq_coding_major_cnt = ((n_haps as f64 * 0.995) - 1.0).floor() as usize;
     let non_maj_threshold = n_haps - max_seq_coding_major_cnt;
 
-    let bref3_path = if output_path.extension().is_none_or(|e| e != "bref3") {
-        output_path.with_extension("bref3")
-    } else {
-        output_path.to_path_buf()
-    };
+    let bref3_path = super::helpers::with_panel_suffix(output_path, "bref3");
 
     crate::selphi_info!("  BREF3: {} samples, {} haps, maxNSeq={}, nonMajThreshold={}",
         n_samples, n_haps, max_n_seq, non_maj_threshold);
@@ -189,11 +185,7 @@ pub fn write_bref3_from_srp(source_path: &Path, output_path: &Path) -> io::Resul
     let max_seq_coding_major_cnt = ((n_haps as f64 * 0.995) - 1.0).floor() as usize;
     let non_maj_threshold = n_haps - max_seq_coding_major_cnt;
 
-    let bref3_path = if output_path.extension().is_none_or(|e| e != "bref3") {
-        output_path.with_extension("bref3")
-    } else {
-        output_path.to_path_buf()
-    };
+    let bref3_path = super::helpers::with_panel_suffix(output_path, "bref3");
 
     crate::selphi_info!("  BREF3: {} samples, {} haps, {} variants, maxNSeq={}, nonMajThreshold={}",
         n_samples, n_haps, n_variants, max_n_seq, non_maj_threshold);

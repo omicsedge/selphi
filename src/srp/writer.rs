@@ -128,9 +128,7 @@ pub fn build_srp_from_bref3(
     selphi_info!("  chunks:   {} (chunk_size={})", n_chunks, chunk_size);
 
     let contig_field = format!("##contig=<ID={}>", chromosome);
-    let srp_path = if output_path.extension().is_none_or(|e| e != "srp") {
-        output_path.with_extension("srp")
-    } else { output_path.to_path_buf() };
+    let srp_path = super::helpers::with_panel_suffix(output_path, "srp");
 
     // --- Pass 2: direct scatter + batched parallel compression ---
     // Read BREF3 sequentially, scatter to per-column stripe buffers.
@@ -271,9 +269,7 @@ impl SrpPanelWriter {
         }
         let contig_field = format!("##contig=<ID={}>", chromosome);
 
-        let srp_path = if output_path.extension().is_none_or(|e| e != "srp") {
-            output_path.with_extension("srp")
-        } else { output_path.to_path_buf() };
+        let srp_path = super::helpers::with_panel_suffix(output_path, "srp");
 
         selphi_info!("  samples:  {} ({} haplotypes)", n_samples, n_haps);
         selphi_info!("  variants: {} (chr{}, {}–{})", n_variants, chromosome, min_pos, max_pos);
@@ -523,9 +519,7 @@ pub fn build_srp_unified(
     let chunk_files: Vec<std::path::PathBuf> = region_results.iter()
         .flat_map(|rr| rr.chunk_files.iter().cloned()).collect();
 
-    let srp_path = if output_path.extension().is_none_or(|e| e != "srp") {
-        output_path.with_extension("srp")
-    } else { output_path.to_path_buf() };
+    let srp_path = super::helpers::with_panel_suffix(output_path, "srp");
 
     // Streaming tile writer: process chunks one at a time from disk
     selphi_step!("Building tiles ({} threads)...", rayon::current_num_threads());

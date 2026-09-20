@@ -149,3 +149,42 @@ mod tests {
         assert!(push_variant_vbin(&mut vbin, 1, "22", &long, "T").is_err());
     }
 }
+
+/// Resolve the on-disk path of a panel file the user named with `--out`.
+///
+/// `Path::with_extension` treats everything after the last dot as an extension,
+/// so `--out panel.chr22` used to come back as `panel.srp` — the chromosome tag
+/// silently dropped, which on a per-chromosome rebuild overwrites one file with
+/// the next (reported by the NYU-AD collaborator, 2026-09-20). A `--out` value
+/// is a NAME, not a stem: keep it whole and append the panel suffix unless it
+/// is already there. `ext` is `"srp"` or `"bref3"`.
+pub fn with_panel_suffix(path: &std::path::Path, ext: &str) -> std::path::PathBuf {
+    let s = path.to_string_lossy();
+    let dotted = format!(".{ext}");
+    if s.ends_with(&dotted) {
+        path.to_path_buf()
+    } else {
+        std::path::PathBuf::from(format!("{s}{dotted}"))
+    }
+}
+
+#[cfg(test)]
+mod panel_suffix_tests {
+    use super::with_panel_suffix;
+    use std::path::Path;
+    #[test]
+    fn a_chromosome_tag_is_kept() {
+        assert_eq!(with_panel_suffix(Path::new("panel.chr22"), "srp").to_str().unwrap(), "panel.chr22.srp");
+        assert_eq!(with_panel_suffix(Path::new("/x/y/v3.chr1"), "bref3").to_str().unwrap(), "/x/y/v3.chr1.bref3");
+    }
+    #[test]
+    fn an_existing_suffix_is_not_doubled() {
+        assert_eq!(with_panel_suffix(Path::new("panel.srp"), "srp").to_str().unwrap(), "panel.srp");
+        assert_eq!(with_panel_suffix(Path::new("panel.bref3"), "bref3").to_str().unwrap(), "panel.bref3");
+    }
+    #[test]
+    fn a_bare_name_gets_the_suffix() {
+        assert_eq!(with_panel_suffix(Path::new("panel"), "srp").to_str().unwrap(), "panel.srp");
+        assert_eq!(with_panel_suffix(Path::new("out/panel_v3"), "srp").to_str().unwrap(), "out/panel_v3.srp");
+    }
+}
