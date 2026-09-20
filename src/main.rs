@@ -651,9 +651,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
                 let _ = std::fs::remove_file(&tmp_srp);
             }
         } else if is_bref3 {
-            let srp_path = if Path::new(output).extension().is_none_or(|e| e != "srp") {
-                PathBuf::from(output).with_extension("srp")
-            } else { PathBuf::from(output) };
+            let srp_path = selphi::srp::helpers::with_panel_suffix(Path::new(output), "srp");
             selphi::srp::writer::build_srp_from_bref3(
                 Path::new(source), &srp_path, args.threads, args.chunk_size)
                 .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
@@ -664,9 +662,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
             // `--phase-panel --srp` uses — so a VCF is a first-class reference
             // source. Peak memory is bounded to the panel (no whole-file text
             // buffer, no intermediate genotype matrix).
-            let srp_path = if Path::new(output).extension().is_none_or(|e| e != "srp") {
-                PathBuf::from(output).with_extension("srp")
-            } else { PathBuf::from(output) };
+            let srp_path = selphi::srp::helpers::with_panel_suffix(Path::new(output), "srp");
 
             selphi_step!("Reading VCF panel (streaming)...");
             let (sample_names, markers, phased, n_haps, is_phased) =
@@ -712,9 +708,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
                     .unwrap_or(false),
             };
 
-            let srp_path = if Path::new(output).extension().is_none_or(|e| e != "srp") {
-                PathBuf::from(output).with_extension("srp")
-            } else { PathBuf::from(output) };
+            let srp_path = selphi::srp::helpers::with_panel_suffix(Path::new(output), "srp");
 
             if is_multi_contig {
                 selphi_info!("  Detected multi-contig source → building multi-chr SRP\n");

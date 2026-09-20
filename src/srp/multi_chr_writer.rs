@@ -60,11 +60,7 @@ pub fn build_multi_chr_srp(
         contig_order.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", "));
 
     // Create output file
-    let srp_path = if output_path.extension().is_none_or(|e| e != "srp") {
-        output_path.with_extension("srp")
-    } else {
-        output_path.to_path_buf()
-    };
+    let srp_path = super::helpers::with_panel_suffix(output_path, "srp");
     let out = std::fs::File::create(&srp_path)?;
     let mut w = std::io::BufWriter::with_capacity(4 << 20, out);
 
@@ -475,11 +471,7 @@ pub fn merge_samples_single_chr(
         n_tile_rows, n_tile_cols, n_tiles);
 
     // Write single-chr SRP
-    let srp_path = if output_path.extension().is_none_or(|e| e != "srp") {
-        output_path.with_extension("srp")
-    } else {
-        output_path.to_path_buf()
-    };
+    let srp_path = super::helpers::with_panel_suffix(output_path, "srp");
     let out = std::fs::File::create(&srp_path)?;
     let mut w = std::io::BufWriter::with_capacity(4 << 20, out);
 
@@ -832,11 +824,7 @@ pub fn merge_single_chr_srps(
     }
 
     // Create output file
-    let srp_path = if output_path.extension().is_none_or(|e| e != "srp") {
-        output_path.with_extension("srp")
-    } else {
-        output_path.to_path_buf()
-    };
+    let srp_path = super::helpers::with_panel_suffix(output_path, "srp");
     let out = std::fs::File::create(&srp_path)?;
     let mut w = std::io::BufWriter::with_capacity(4 << 20, out);
 
