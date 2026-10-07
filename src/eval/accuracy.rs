@@ -210,6 +210,14 @@ impl SiteAccumulator {
 /// Compute per-site R² for one variant (Pearson correlation²).
 /// ds: imputed dosage per sample. gt: truth genotype dosage per sample.
 #[inline]
+/// `SELPHI_EVAL_CONST_DS_NAN=1` → pre-2026-10-07 scoring (constant dosage at a variable
+/// truth site is dropped from its MAF bin instead of scoring r² = 0). Cached once.
+fn const_ds_nan() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| crate::config::present("SELPHI_EVAL_CONST_DS_NAN"))
+}
+
 pub fn site_r2(ds: &[f32], gt: &[f32], n: usize) -> (f64, f64) {
     let mut sum_d = 0.0f64;
     let mut sum_g = 0.0f64;
@@ -239,8 +247,21 @@ pub fn site_r2(ds: &[f32], gt: &[f32], n: usize) -> (f64, f64) {
     // (dosages and truth both effectively constant) produce a tiny positive
     // denominator and hence an unbounded r² > 1 that would then be summed into the
     // MAF-bin means.
-    let den = (den_x.max(0.0) * den_y.max(0.0)).sqrt();
-    let r2 = if den > 0.0 { (num / den).powi(2).clamp(0.0, 1.0) } else { f64::NAN };
+    // R² is undefined only when the TRUTH is constant at the site (nothing to predict).
+    // When the truth varies but the imputed dosage is constant, the tool explained none
+    // of the variance: that is r² = 0, not "undefined". Returning NaN there (as before
+    // 2026-10-07) dropped the site from the tool's MAF bin — a site set that differed by
+    // tool and rewarded a tool for emitting a flat dosage at hard sites (on 1000 Genomes
+    // chr22 the rarest bin held 132,804 sites for Beagle against 136,724 for Selphi 2).
+    // `SELPHI_EVAL_CONST_DS_NAN=1` restores the old behaviour for an exact A/B.
+    let r2 = if den_y.max(0.0) <= 0.0 {
+        f64::NAN
+    } else if den_x.max(0.0) <= 0.0 {
+        if const_ds_nan() { f64::NAN } else { 0.0 }
+    } else {
+        let den = (den_x * den_y).sqrt();
+        (num / den).powi(2).clamp(0.0, 1.0)
+    };
 
     // Concordance
     let mut correct = 0u32;
