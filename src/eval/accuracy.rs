@@ -1158,12 +1158,12 @@ pub fn evaluate_parallel(
                 Ok((site_acc, sample_acc, EvalCounts { n_matched, n_imp_variants: n_imp, n_truth_variants: n_truth, chromosomes: chr_set.into_iter().collect() }))
             })();
             let wall = t0.elapsed().as_secs_f64();
-            match result {
-                Ok((sa, sm, ec)) => (sa, sm, ec, wall),
-                Err(_) => (SiteAccumulator::new(), SampleAccumulator::new(n_samples), EvalCounts { n_matched: 0, n_imp_variants: 0, n_truth_variants: 0, chromosomes: Vec::new() }, wall),
-            }
+            // A region that fails must fail the evaluation: it used to come back
+            // as an empty accumulator, silently scoring ~1/n_regions fewer sites.
+            result.map(|(sa, sm, ec)| (sa, sm, ec, wall)).map_err(|e| io::Error::new(e.kind(),
+                format!("evaluation region [{}, {}) failed: {}", region_start, region_end, e)))
         })
-        .collect();
+        .collect::<io::Result<Vec<_>>>()?;
 
     // Log the slowest / fastest / median region wall time under --debug so
     // the imbalance between regions is visible without spamming on every run.
