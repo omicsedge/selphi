@@ -139,7 +139,10 @@ pub fn read_bcf_parallel(
     let target_ref_id = csi.ref_seq_id as i32;
     let file_size = std::fs::metadata(path)?.len();
 
-    let regions = split_regions(cps, file_size, /* dedup_same_pos = */ true);
+    let mut regions = split_regions(cps, file_size, /* dedup_same_pos = */ true);
+    // Region 0 starts at the first data record: records filed under parent bins
+    // can precede the first leaf checkpoint (as in the two readers below).
+    if let Some(r0) = regions.first_mut() { r0.1 = first_record_vp(path)?; }
 
     selphi_info!("  regions:  {} (from {} CSI checkpoints, file {:.1} GB)",
               regions.len(), cps.len(), file_size as f64 / 1e9);

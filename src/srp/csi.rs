@@ -11,7 +11,8 @@ use noodles_bgzf::VirtualPosition;
 
 /// Parsed CSI index for the data-bearing reference sequence.
 pub struct CsiIndex {
-    /// (genomic_position_start, virtual_offset) sorted by position.
+    /// (p, vp) sorted by p: every record at 0-based position >= p lies at or
+    /// after virtual offset vp (p is the end of a leaf bin's window).
     pub checkpoints: Vec<(i64, VirtualPosition)>,
     /// First virtual offset of actual data (after header).
     pub first_offset: VirtualPosition,
@@ -103,9 +104,19 @@ fn scan_ref_bins(
             ref_n_mapped = chunks[1].0;
         }
 
-        // Regular bins
-        if bin_id < 100_000 && loffset > 0 {
-            let pos = bin_to_pos(bin_id, min_shift, depth);
+        // Leaf bins only, keyed by the END of their window. A checkpoint (p, vp)
+        // must promise that every record at 0-based position >= p lies at or
+        // after vp, because readers seek to vp and own records by position.
+        // Keying a bin by its START broke that promise: a record that straddles
+        // a 16 kb window boundary is filed under a PARENT bin, and a parent's
+        // loffset is its own first record, which can lie tens of kb past the
+        // start the parent shares with a leaf. Deduplicating equal starts kept
+        // the parent, and on HGDP chr22 the evaluator seeked 32 kb into a region
+        // and dropped 1,041 records. A leaf's first record lies inside its
+        // window, so every record at or past the window's end follows it.
+        let leaf_first = ((1u64 << (depth as u64 * 3)) - 1) / 7;
+        if bin_id < 100_000 && (bin_id as u64) >= leaf_first && loffset > 0 {
+            let pos = bin_to_pos(bin_id, min_shift, depth) + (1i64 << min_shift);
             let vp = VirtualPosition::from(loffset);
             ref_checkpoints.push((pos, vp));
         }
@@ -1037,5 +1048,28 @@ mod tests {
         for v in [10u64, 10, 10, 5, 5] { exp.extend_from_slice(&v.to_le_bytes()); }
         assert_eq!(got, exp);
     }
-}
 
+    /// A parent bin that starts where a leaf starts but whose first record lies
+    /// 32 kb later (a window-straddling indel) must not become the seek target
+    /// for that position: HGDP chr22 lost 1,041 records to exactly this.
+    #[test]
+    fn a_parent_bin_sharing_a_leaf_start_does_not_become_a_checkpoint() {
+        let (min_shift, depth) = (14, 5);
+        let start: u64 = 45_613_056; // 16 kb- and 128 kb-aligned
+        let leaf = ((1u64 << 15) - 1) / 7 + (start >> 14);
+        let parent = ((1u64 << 12) - 1) / 7 + (start >> 17);
+        let (leaf_vp, parent_vp) = (1_000u64 << 16, 9_000u64 << 16);
+        let mut d = Vec::new();
+        for (bin, lo) in [(parent, parent_vp), (leaf, leaf_vp)] {
+            d.extend_from_slice(&(bin as u32).to_le_bytes());
+            d.extend_from_slice(&lo.to_le_bytes());
+            d.extend_from_slice(&1i32.to_le_bytes());
+            d.extend_from_slice(&lo.to_le_bytes());
+            d.extend_from_slice(&(lo + 1).to_le_bytes());
+        }
+        let mut off = 0;
+        let (cps, first, _) = scan_ref_bins(&d, &mut off, 2, min_shift, depth);
+        assert_eq!(cps, vec![((start + (1 << 14)) as i64, VirtualPosition::from(leaf_vp))]);
+        assert_eq!(u64::from(first), leaf_vp);
+    }
+}
