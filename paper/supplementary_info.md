@@ -292,34 +292,36 @@ both Selphi arms (3/6 and 4/6 wins; t = -0.87 and -0.86).
 (HG002-HG007), NovaSeq PCR-free 30$\times$ genomes uniformly downsampled to ~1.8$\times$,
 chromosome 22, imputed independently against the 4,478-haplotype (2,239-sample) no-trios
 1000 Genomes panel. Per-sample dosage R² over the high-confidence variant sites carrying a
-non-reference allele (≈37-40k per sample), identical site set for both tools.
+non-reference allele (36,930-40,170 per sample), identical site set and identical 861,018-site
+panel file for both tools.
 
 | Sample | Selphi 2 R² | GLIMPSE2 R² | Winner |
 |---|---:|---:|---|
-| HG002 | **0.9457** | 0.9421 | Selphi |
-| HG003 | **0.9515** | 0.9459 | Selphi |
-| HG004 | **0.9479** | 0.9435 | Selphi |
-| HG005 | **0.9455** | 0.9416 | Selphi |
-| HG006 | **0.9547** | 0.9496 | Selphi |
-| HG007 | 0.9502 | 0.9504 | tie |
-| Mean  | **0.9493** | 0.9455 | Selphi |
+| HG002 | **0.9457** | 0.9389 | Selphi |
+| HG003 | **0.9522** | 0.9447 | Selphi |
+| HG004 | **0.9489** | 0.9440 | Selphi |
+| HG005 | **0.9465** | 0.9416 | Selphi |
+| HG006 | **0.9546** | 0.9496 | Selphi |
+| HG007 | **0.9526** | 0.9504 | Selphi |
+| Mean  | **0.9501** | 0.9449 | Selphi |
 
-**S4f. Three-way coverage sweep (= main-text Table 2b).** Mean per-sample dosage R²
-over GIAB HG002/HG003/HG004 downsampled to each depth over chr22:20-30 Mb, imputed
-against a leak-free 1000 Genomes panel (6,332 haplotypes), scored (reference-homozygous
-sites as dosage zero) on the set of sites imputed by all three tools. Overall and
-ultra-rare (MAF 0-0.5%).
+**S4f. Three-way coverage sweep (= main-text Table 2b).** GIAB HG002/HG003/HG004
+downsampled to each depth over chr22:20-30 Mb; all three tools imputed the same region
+against a leak-free 1000 Genomes panel (6,332 haplotypes) and were scored
+(reference-homozygous sites as dosage zero) on the per-sample set of sites imputed by all
+three. OVERALL is the mean per-sample R²; the ultra-rare row (MAF 0-0.5%) is pooled over
+the three samples.
 
 | Coverage | Bin | Selphi 2 R² | GLIMPSE2 R² | QUILT2 R² | Winner |
 |---|---|---:|---:|---:|---|
-| 0.5× | OVERALL | **0.9924** | 0.9916 | 0.9919 | Selphi |
-| 1×   | OVERALL | **0.9952** | 0.9945 | 0.9944 | Selphi |
-| 2×   | OVERALL | **0.9971** | 0.9967 | 0.9968 | Selphi |
+| 0.5× | OVERALL | **0.9921** | 0.9916 | 0.9919 | Selphi |
+| 1×   | OVERALL | **0.9950** | 0.9945 | 0.9944 | Selphi |
+| 2×   | OVERALL | **0.9970** | 0.9967 | 0.9968 | Selphi |
 | 4×   | OVERALL | **0.9978** | 0.9975 | 0.9973 | Selphi |
-| 0.5× | 0-0.5% (ultra-rare) | 0.8994 | **0.9023** | 0.8864 | reference |
-| 1×   | 0-0.5% (ultra-rare) | **0.9282** | 0.9252 | 0.9150 | Selphi |
-| 2×   | 0-0.5% (ultra-rare) | **0.9525** | 0.9495 | 0.9415 | Selphi |
-| 4×   | 0-0.5% (ultra-rare) | **0.9705** | 0.9638 | 0.9437 | Selphi |
+| 0.5× | 0-0.5% (ultra-rare) | 0.9014 | **0.9023** | 0.8864 | reference |
+| 1×   | 0-0.5% (ultra-rare) | **0.9252** | **0.9252** | 0.9150 | tie |
+| 2×   | 0-0.5% (ultra-rare) | **0.9510** | 0.9495 | 0.9415 | Selphi |
+| 4×   | 0-0.5% (ultra-rare) | **0.9703** | 0.9638 | 0.9437 | Selphi |
 
 > Earlier lcWGS benchmark rounds (simulated 54-sample chr22 sets, and a 75,552-haplotype
 > large-panel multi-coverage sweep) were superseded for accuracy by the real-read measurements
@@ -360,35 +362,36 @@ Reference: Beagle 5.5, SHAPEIT5 v5.1.1.
 | chr1 1KG 801s, chip to WGS | wall (phased/unphased) | 315 s / 623 s | Beagle 5.5: 207 s / 321 s | reference |
 | TOPMed MESA 5K chr20 (171K-hap, 17.9M var), full pipeline | wall | 10,787 s (~3.0 h) | Beagle 5.5: 4,148 s | reference |
 | TOPMed MESA 5K chr20 | peak RAM | **79.4 GB** | Beagle 5.5: 96.5 GB | Selphi |
-| lcWGS whole-chr22, 1 sample @1× (= Fig 4a, downsampled cluster) | wall | **115 s** | GLIMPSE2: 287 s; QUILT2: 1,729 s | Selphi |
-| lcWGS capture library chr22, 1 sample, native `--bam` + BAQ, BAM in to imputed VCF out (= Fig 4a, capture cluster) | wall | **104 s** | GLIMPSE2: 327 s (chunk + phase + ligate) | Selphi |
-| lcWGS capture library chr22, 1 sample, native `--bam` + BAQ | peak RAM | 5.0 GB | GLIMPSE2: not recorded | n/a |
-| lcWGS capture library chr22, 6 samples in one run | wall | **170 s (28 s/sample)** | GLIMPSE2: 389 s (65 s/sample) | Selphi |
-| lcWGS capture library chr22, 6 samples in one run | peak RAM | 14.5 GB | GLIMPSE2: 8.7 GB (largest chunk) | reference |
-| lcWGS capture library chr22, 12 samples in one run (timing only: 6 real + 6 relabelled duplicates) | wall | **313 s (26 s/sample)** | GLIMPSE2: 460 s (38 s/sample) | Selphi |
-| lcWGS capture library chr22, 12 samples in one run | peak RAM | 16.5 GB | GLIMPSE2: not recorded | n/a |
-| lcWGS capture library chr22, 6 samples at GLIMPSE2's iteration count (20 = 5 burn-in + 15 main) | wall | **79 s (13 s/sample)** | GLIMPSE2: 389 s (its default 20 iterations) | Selphi |
-| lcWGS single-sample (chr22), downsampled GIAB ~1.8× (= Table 2) | wall | **~2:01** | GLIMPSE2: ~5:22 | Selphi |
-| lcWGS single-sample (chr22), downsampled GIAB ~1.8× (= Table 2) | peak RAM | ~3.3 GB | GLIMPSE2: ~2.1 GB | reference |
-| lcWGS 54-sample multi-sample whole-chr22 (simulated; only regime Selphi is slower) | wall | 41:50 | GLIMPSE2: 21:36 | reference |
-| lcWGS 75,552-haplotype panel multicov (HG002, 0.5-4×) | wall | **2:10-2:34** | GLIMPSE2: 4:41-4:49 | Selphi |
-| lcWGS 75,552-haplotype panel multicov | peak RAM | ~2.9-3.2 GB | GLIMPSE2: ~2.2-2.6 GB | reference |
-| lcWGS real-data BAM (chr1:30-45 Mb, 1 sample) | wall | **31 s (fast) / 51 s (default)** | GLIMPSE2: 102 s | Selphi |
+| lcWGS whole-chr22, 1 sample @1× (= Fig 4a, downsampled cluster) | wall | **105-109 s** | GLIMPSE2: 278 s (chunk + phase + ligate); QUILT2: 1,701 s | Selphi |
+| lcWGS capture library chr22, 1 sample, native `--bam` + BAQ, BAM in to imputed VCF out (= Fig 4a, capture cluster) | wall | **101 s** | GLIMPSE2: 334 s (chunk + phase + ligate) | Selphi |
+| lcWGS capture library chr22, 1 sample, native `--bam` + BAQ | peak RAM | 4.9 GB | GLIMPSE2: **2.1 GB** | reference |
+| lcWGS capture library chr22, 6 samples in one run | wall | **170 s (28 s/sample)** | GLIMPSE2: 386 s (64 s/sample) | Selphi |
+| lcWGS capture library chr22, 6 samples in one run | peak RAM | 13.4 GB | GLIMPSE2: **8.2 GB** | reference |
+| lcWGS capture library chr22, 12 samples in one run (timing only: 6 real + 6 relabelled duplicates) | wall | **307 s (26 s/sample)** | GLIMPSE2: 451 s (38 s/sample) | Selphi |
+| lcWGS capture library chr22, 12 samples in one run | peak RAM | **14.8 GB** | GLIMPSE2: 17.2 GB | Selphi |
+| lcWGS capture library chr22, 6 samples at GLIMPSE2's iteration count (20 = 5 burn-in + 15 main) | wall | **75 s (13 s/sample)** | GLIMPSE2: 386 s (its default 20 iterations) | Selphi |
+| lcWGS single-sample (chr22), downsampled GIAB ~1.8× (= Table 2) | wall | **117 s** | GLIMPSE2: 332 s (chunk + phase + ligate) | Selphi |
+| lcWGS single-sample (chr22), downsampled GIAB ~1.8× (= Table 2) | peak RAM | 4.2 GB | GLIMPSE2: **1.8 GB** | reference |
+| lcWGS 54-sample multi-sample whole-chr22 (simulated; only regime Selphi is slower; earlier build, not re-timed) | wall | 41:50 | GLIMPSE2: 21:36 | reference |
+| lcWGS 75,552-haplotype panel multicov (HG002, 0.5-4×; earlier build, not re-timed) | wall | **2:10-2:34** | GLIMPSE2: 4:41-4:49 | Selphi |
+| lcWGS 75,552-haplotype panel multicov (earlier build, not re-timed) | peak RAM | ~2.9-3.2 GB | GLIMPSE2: ~2.2-2.6 GB | reference |
+| lcWGS real-data BAM (chr1:30-45 Mb, 1 sample; earlier build, not re-timed) | wall | **31 s (fast) / 51 s (default)** | GLIMPSE2: 102 s | Selphi |
 
-> Capture-library timings: quiet 16-core host, one job at a time, `/usr/bin/time` wall from
-> BAM in to imputed VCF out; GLIMPSE2 = `chunk` + `phase` + `ligate`. Single-sample ratio
-> 3.1$\times$ (327 s / 104 s); six samples in one run 2.3$\times$ (389 s / 170 s); twelve
-> samples 1.5$\times$ (460 s / 313 s). Above seven samples on 16 threads the chunk-level
+> lcWGS timings: quiet 16-core host, one job at a time, both tools of a row timed in the same
+> session with the shipped binary, `/usr/bin/time` wall from BAM in to imputed VCF out;
+> GLIMPSE2 = `chunk` + `phase` + `ligate`. Single-sample ratio 3.3$\times$ (334 s / 101 s;
+> two repeats each within 0.7 s); six samples in one run 2.3$\times$ (386 s / 170 s); twelve
+> samples 1.5$\times$ (451 s / 307 s). Above seven samples on 16 threads the chunk-level
 > parallelism now sizes its waves from the measured memory of the first chunk instead of
 > running chunks sequentially; before that change the 12-sample run took 534 s, and 375 s before the conditioning-pack sharing. The
 > 20-iteration row uses GLIMPSE2's default iteration count (5 burn-in + 15 main) instead of
 > Selphi 2's default schedule (50/25): in the same six-sample run the non-reference Delta versus
 > GLIMPSE2 is +0.198 pp at 20 iterations versus +0.193 pp at 50/25. GLIMPSE2's six-sample
 > accuracy equals its single-sample accuracy (+0.0025 pp non-reference, n = 6). Earlier
-> capture-library timings taken under CPU contention are not reported. The 2.7$\times$
-> (~1.8$\times$ downsampled, 4,478-haplotype panel) and 2.5$\times$ (1$\times$,
-> 6,332-haplotype panel) ratios of the downsampled rows keep their own conditions. The 5.0 GB
-> single-sample peak versus ~3.3 GB in the downsampled row reflects the 1,070,399-site panel
+> capture-library timings taken under CPU contention are not reported. The 2.8$\times$
+> (~1.8$\times$ downsampled, 4,478-haplotype panel) and 2.6$\times$ (1$\times$,
+> 6,332-haplotype panel) ratios of the downsampled rows keep their own conditions. The 4.9 GB
+> single-sample peak versus 4.2 GB in the downsampled row reflects the 1,070,399-site panel
 > with indels versus the SNP-only 4,478-haplotype panel.
 
 ## Table S7. Phasing × imputer matrix (overall R²) - 1KG, chip to WGS
