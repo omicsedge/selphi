@@ -419,6 +419,179 @@ fn scan_site<F: MatchFilter>(
     steps
 }
 
+/// Per-site index that lets a target carrying the site's MAJORITY allele skip the
+/// walk over its whole match block (`SELPHI_PBWT_SPARSE_SCAN`, default on).
+///
+/// `scan_site` visits every position whose running divergence stays within
+/// `threshold`, but it records a match only where `y[pos] != y[ib]`. For a target
+/// carrying the majority allele those are exactly the minority-allele positions
+/// inside its block, usually a handful among tens of thousands. Built once per site
+/// and shared by every target of the group, this index holds those positions in
+/// sort order plus the maximum of `d` over each 64-position chunk, so the running
+/// divergence between two recorded positions is a range maximum instead of a walk.
+/// The recorded positions are then visited in the SAME order as `scan_site` (left
+/// side outward, then right side outward) with the SAME `dmin`, so the sequence of
+/// `insert_match` calls — and therefore the output — is byte-identical.
+pub(crate) struct SparseSite {
+    minority: u8,
+    pos: Vec<u32>,
+    cmax: Vec<i32>,
+}
+
+const SPARSE_CHUNK: usize = 64;
+
+impl SparseSite {
+    pub(crate) fn new() -> Self { Self { minority: 1, pos: Vec::new(), cmax: Vec::new() } }
+
+    /// Rebuild for the current site: O(m), shared by all targets of the group.
+    fn build(&mut self, d: &[i32], y: &[u8], m: usize) {
+        let ones = y[..m].iter().filter(|&&v| v != 0).count();
+        self.minority = if ones * 2 <= m { 1 } else { 0 };
+        let mi = self.minority;
+        self.pos.clear();
+        for (i, &v) in y[..m].iter().enumerate() {
+            if (v != 0) as u8 == mi { self.pos.push(i as u32); }
+        }
+        // chunk maxima over d[0..=m] (scan reads d[1..=m-1])
+        let n = m + 1;
+        let nc = n.div_ceil(SPARSE_CHUNK);
+        self.cmax.clear();
+        self.cmax.reserve(nc);
+        for c in 0..nc {
+            let lo = c * SPARSE_CHUNK;
+            let hi = (lo + SPARSE_CHUNK).min(n);
+            self.cmax.push(*d[lo..hi].iter().max().unwrap());
+        }
+    }
+
+    /// max(d[lo..=hi]); requires lo <= hi.
+    #[inline]
+    fn range_max(&self, d: &[i32], lo: usize, hi: usize) -> i32 {
+        let (cl, ch) = (lo / SPARSE_CHUNK, hi / SPARSE_CHUNK);
+        if cl == ch { return *d[lo..=hi].iter().max().unwrap(); }
+        let mut mx = *d[lo..(cl + 1) * SPARSE_CHUNK].iter().max().unwrap();
+        for c in (cl + 1)..ch { if self.cmax[c] > mx { mx = self.cmax[c]; } }
+        let t = *d[ch * SPARSE_CHUNK..=hi].iter().max().unwrap();
+        if t > mx { mx = t; }
+        mx
+    }
+
+    /// Largest j in [1, ib] with d[j] > thr (0 if none): left block = [k, ib-1].
+    #[inline]
+    fn left_bound(&self, d: &[i32], ib: usize, thr: i32) -> usize {
+        if ib == 0 { return 0; }
+        let mut j = ib;
+        // partial chunk containing ib
+        let c0 = j / SPARSE_CHUNK;
+        let start = (c0 * SPARSE_CHUNK).max(1);
+        while j >= start { if d[j] > thr { return j; } if j == 0 { break; } j -= 1; }
+        if c0 == 0 { return 0; }
+        let mut c = c0;
+        while c > 0 {
+            c -= 1;
+            if self.cmax[c] > thr {
+                let lo = (c * SPARSE_CHUNK).max(1);
+                let mut k = (c + 1) * SPARSE_CHUNK - 1;
+                loop { if d[k] > thr { return k; } if k == lo { break; } k -= 1; }
+                if c == 0 { return 0; }
+            }
+        }
+        0
+    }
+
+    /// Smallest j in [ib+1, m-1] with d[j] > thr (m if none): right block = [ib+1, r-1].
+    #[inline]
+    fn right_bound(&self, d: &[i32], ib: usize, thr: i32, m: usize) -> usize {
+        let mut j = ib + 1;
+        if j >= m { return m; }
+        let c0 = j / SPARSE_CHUNK;
+        let end = ((c0 + 1) * SPARSE_CHUNK).min(m);
+        while j < end { if d[j] > thr { return j; } j += 1; }
+        let nc = self.cmax.len();
+        let mut c = c0 + 1;
+        while c < nc && c * SPARSE_CHUNK < m {
+            if self.cmax[c] > thr {
+                let hi = ((c + 1) * SPARSE_CHUNK).min(m);
+                for k in c * SPARSE_CHUNK..hi { if d[k] > thr { return k; } }
+            }
+            c += 1;
+        }
+        m
+    }
+}
+
+/// Sparse equivalent of `scan_site` for a target whose allele at this site is the
+/// site's MAJORITY allele (caller checks; never used at the last site). Visits only
+/// the minority-allele positions inside the target's match block, in `scan_site`'s
+/// order, with the same running `dmin`; returns the positions visited (diag only).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn scan_site_sparse<F: MatchFilter>(
+    sp: &SparseSite,
+    a: &[i32], a_inv: &[i32], d: &[i32], m: usize,
+    n_ref: usize, var: usize, n_var: usize, fl_fwd: usize, min_l: usize,
+    target_abs: i32, filter: &F,
+    haps: &mut [i32], lens: &mut [i32], counts: &mut [i32], ht: &mut [i64],
+) -> u64 {
+    let threshold = (var - min_l) as i32;
+    let ib = a_inv[target_abs as usize] as usize;
+    let mut steps = 0u64;
+    let p = &sp.pos;
+    // index of the first minority position > ib (positions are sorted, ib itself is majority)
+    let split = p.partition_point(|&x| (x as usize) < ib);
+
+    // LEFT: positions in [k, ib-1], visited from ib-1 downward
+    if ib > 0 {
+        let k = sp.left_bound(d, ib, threshold);
+        let mut dmin: i32 = 0;
+        let mut prev = ib; // covered range so far is d[prev+1 ..= ib]; empty at start
+        let mut idx = split;
+        while idx > 0 {
+            idx -= 1;
+            let pos = p[idx] as usize;
+            if pos < k { break; }
+            steps += 1;
+            // extend running max over d[pos+1 ..= prev]
+            let gm = sp.range_max(d, pos + 1, prev);
+            if gm > dmin { dmin = gm; }
+            prev = pos;
+            let hap_at_pos = a[pos];
+            if hap_at_pos < n_ref as i32 && filter.keep(hap_at_pos) {
+                let length = var as i32 - dmin;
+                insert_match(haps, lens, counts, ht, n_var, fl_fwd, dmin as usize, hap_at_pos, length);
+            }
+        }
+    }
+    // RIGHT: positions in [ib+1, r-1], visited upward
+    {
+        let r = sp.right_bound(d, ib, threshold, m);
+        let mut dmin: i32 = 0;
+        let mut prev = ib; // covered range d[ib+1 ..= prev]; empty at start
+        for &pu in &p[split..] {
+            let pos = pu as usize;
+            if pos >= r { break; }
+            steps += 1;
+            let gm = sp.range_max(d, prev + 1, pos);
+            if gm > dmin { dmin = gm; }
+            prev = pos;
+            let hap_at_pos = a[pos];
+            if hap_at_pos < n_ref as i32 && filter.keep(hap_at_pos) {
+                let length = var as i32 - dmin;
+                insert_match(haps, lens, counts, ht, n_var, fl_fwd, dmin as usize, hap_at_pos, length);
+            }
+        }
+    }
+    steps
+}
+
+/// `SELPHI_PBWT_SPARSE_SCAN=0` disables the majority-allele sparse scan in the
+/// shared forward (A/B; the output is byte-identical either way). Cached once.
+pub(crate) fn sparse_scan_on() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| crate::config::raw("SELPHI_PBWT_SPARSE_SCAN").as_deref() != Some("0"))
+}
+
 /// One target taking part in a shared forward pass.
 pub struct SharedTarget<'a> {
     /// The target's absolute index in the merged panel (`n_ref + tgt`).
@@ -459,6 +632,22 @@ pub fn pbwt_forward_shared(
     targets: &[SharedTarget<'_>],
     hts: &mut Vec<Vec<i64>>,
 ) -> Vec<FwdResult> {
+    pbwt_forward_shared_impl(ws, rows, n_var, m, n_ref, min_l, fl_fwd, targets, hts, sparse_scan_on())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pbwt_forward_shared_impl(
+    ws: &mut PbwtWorkspace,
+    rows: &mut dyn AlleleRows,
+    n_var: usize,
+    m: usize,
+    n_ref: usize,
+    min_l: usize,
+    fl_fwd: usize,
+    targets: &[SharedTarget<'_>],
+    hts: &mut Vec<Vec<i64>>,
+    sparse: bool,
+) -> Vec<FwdResult> {
     ws.reset(m);
     let n_t = targets.len();
     let mut out: Vec<FwdResult> = (0..n_t).map(|_| FwdResult {
@@ -477,12 +666,15 @@ pub fn pbwt_forward_shared(
     let diag = split_diag();
     let mut scan_steps = 0u64;
     let mut order: Vec<(i32, usize)> = Vec::with_capacity(n_t);
+    let mut sp = SparseSite::new();
     for var in 0..n_var {
         let is_last = var >= n_var - 1;
 
         let t_scan = if diag { Some(std::time::Instant::now()) } else { None };
         if var >= min_l {
             let PbwtWorkspace { a, a_inv, d, y, .. } = &*ws;
+            let use_sparse = sparse && !is_last;
+            if use_sparse { sp.build(d, y, m); }
             // Scan the group in SORT-POSITION order, not target order. Each scan
             // walks outward from `a_inv[target]` over the shared a/d/y, so targets
             // that sit near each other in the sort walk overlapping memory; taking
@@ -498,6 +690,15 @@ pub fn pbwt_forward_shared(
                 let tg = &targets[t];
                 let o = &mut out[t];
                 let ht = &mut hts[t];
+                if use_sparse && y[a_inv[tg.target_abs as usize] as usize] != sp.minority {
+                    scan_steps += match tg.keep {
+                        None => scan_site_sparse(&sp, a, a_inv, d, m, n_ref, var, n_var, fl_fwd, min_l,
+                            tg.target_abs, &AllRefs, &mut o.haps, &mut o.lens, &mut o.counts, ht),
+                        Some(k) => scan_site_sparse(&sp, a, a_inv, d, m, n_ref, var, n_var, fl_fwd, min_l,
+                            tg.target_abs, &OnlyCands(k), &mut o.haps, &mut o.lens, &mut o.counts, ht),
+                    };
+                    continue;
+                }
                 scan_steps += match tg.keep {
                     None => scan_site(
                         a, a_inv, d, y, m, n_ref, var, n_var, fl_fwd, min_l, is_last,
@@ -1005,3 +1206,45 @@ pub fn select_candidates_weighted(
 
 
 
+
+#[cfg(test)]
+mod sparse_scan_tests {
+    use super::*;
+    /// The sparse majority-allele scan must reproduce the full walk exactly, on panels with
+    /// rare, common and majority-ALT sites, with and without candidate masks.
+    #[test]
+    fn sparse_scan_is_byte_identical_to_the_walk() {
+        let mut seed: u64 = 0x9E3779B97F4A7C15;
+        let mut rnd = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        for trial in 0..12 {
+            let n_ref = 300 + 37 * trial; let n_tgt = 9; let m = n_ref + n_tgt; let n_var = 220;
+            // site frequencies spanning rare -> majority-ALT
+            let mut alleles = vec![0u8; n_var * m];
+            let mut base: Vec<u8> = (0..m).map(|_| (rnd() % 2) as u8).collect();
+            for v in 0..n_var {
+                let f = [2u64, 5, 30, 50, 80, 97][(rnd() % 6) as usize];
+                for h in 0..m {
+                    if rnd() % 100 < 8 { base[h] = (rnd() % 100 < f) as u8; } // haplotype blocks with recombination
+                    alleles[v * m + h] = if rnd() % 100 < 3 { 1 - base[h] } else { base[h] };
+                }
+            }
+            let words = n_ref.div_ceil(64);
+            let mask: Vec<u64> = (0..words).map(|_| rnd()).collect();
+            let targets: Vec<SharedTarget> = (0..n_tgt).map(|t| SharedTarget {
+                target_abs: (n_ref + t) as i32, keep: if t % 2 == 0 { None } else { Some(&mask[..]) } }).collect();
+            for &min_l in &[3usize, 6] {
+                let mut ws1 = PbwtWorkspace::new(m, n_ref); let mut ws2 = PbwtWorkspace::new(m, n_ref);
+                let mut r1 = DenseRows { alleles: &alleles, m }; let mut r2 = DenseRows { alleles: &alleles, m };
+                let mut h1 = Vec::new(); let mut h2 = Vec::new();
+                let a = pbwt_forward_shared_impl(&mut ws1, &mut r1, n_var, m, n_ref, min_l, 5, &targets, &mut h1, false);
+                let b = pbwt_forward_shared_impl(&mut ws2, &mut r2, n_var, m, n_ref, min_l, 5, &targets, &mut h2, true);
+                for t in 0..n_tgt {
+                    assert_eq!(a[t].haps, b[t].haps, "haps differ trial {trial} min_l {min_l} target {t}");
+                    assert_eq!(a[t].lens, b[t].lens, "lens differ trial {trial} min_l {min_l} target {t}");
+                    assert_eq!(a[t].counts, b[t].counts, "counts differ trial {trial} min_l {min_l} target {t}");
+                    assert_eq!(h1[t], h2[t], "ht differ trial {trial} min_l {min_l} target {t}");
+                }
+            }
+        }
+    }
+}
