@@ -989,23 +989,12 @@ pub fn evaluate_parallel(
     // into `evaluate_imputation` (the absent->hom-ref path), so a run with a
     // COMPLETE truth callset — which is what `--homref-absent auto` resolves to,
     // and the default — scored the typed sites in silence.
-    exclude_path: Option<&Path>,
+    exclude: &super::exclude::SiteExclusion,
 ) -> io::Result<(SiteAccumulator, SampleAccumulator, EvalCounts)> {
     use rayon::prelude::*;
 
     let n_samples = shared_samples.len();
-    let exclude: std::collections::HashSet<(u64, i64, u64)> = match exclude_path {
-        Some(p) => {
-            let (mut r, _) = VariantReader::open(p)?;
-            let mut b: Vec<f32> = Vec::new();
-            let mut set = std::collections::HashSet::new();
-            while let Some(rec) = r.next_record(&mut b) { set.insert(site_key(&rec.0, rec.1, &rec.2, &rec.3)); }
-            crate::selphi_info!("  exclude:  {} sites from {}", set.len(), p.display());
-            set
-        }
-        None => std::collections::HashSet::new(),
-    };
-    let exclude_ref = &exclude;
+    let exclude_ref = exclude;
 
     // Ensure parallel-seek indexes exist so each thread can pread-seek its
     // region instead of re-scanning from BOF. Without this, 16 threads each
@@ -1208,10 +1197,10 @@ pub fn evaluate(
     imputed_path: &Path,
     truth_path: &Path,
     shared_samples: &[String],
-    exclude_path: Option<&Path>,
+    exclude: &super::exclude::SiteExclusion,
 ) -> io::Result<(SiteAccumulator, SampleAccumulator, EvalCounts)> {
     let n_threads = rayon::current_num_threads().max(1);
-    evaluate_parallel(imputed_path, truth_path, shared_samples, n_threads, exclude_path)
+    evaluate_parallel(imputed_path, truth_path, shared_samples, n_threads, exclude)
 }
 
 /// FNV-1a hash of REF+ALT bytes (for an alloc-free site key).
@@ -1224,8 +1213,23 @@ fn refalt_hash(r: &[u8], a: &[u8]) -> u64 {
     h
 }
 #[inline]
-fn site_key(c: &[u8], pos: i64, r: &[u8], a: &[u8]) -> (u64, i64, u64) {
+pub(crate) fn site_key(c: &[u8], pos: i64, r: &[u8], a: &[u8]) -> (u64, i64, u64) {
     (contig_hash(norm_contig(c)), pos, refalt_hash(r, a))
+}
+
+/// Add the site key of every biallelic record in `path` to `out`; returns how
+/// many were read. Genotypes are not decoded. A file that yields no sites is an
+/// error: an empty exclusion list used to score every site in silence.
+pub(crate) fn read_site_keys(path: &Path, out: &mut std::collections::HashSet<(u64, i64, u64)>) -> io::Result<usize> {
+    let (mut r, _) = VariantReader::open(path)?;
+    let mut b: Vec<f32> = Vec::new();
+    let mut n = 0usize;
+    while let Some(rec) = r.next_record_inner(&mut b, true) { out.insert(site_key(&rec.0, rec.1, &rec.2, &rec.3)); n += 1; }
+    if n == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+            "{}: no sites read for exclusion (a sites-only VCF needs at least one sample column)", path.display())));
+    }
+    Ok(n)
 }
 
 /// Reindex `shared` sample names to their column positions in `path`'s header.
@@ -1302,21 +1306,11 @@ pub fn evaluate_imputation(
     strong_path: &Path,
     shared: &[String],
     raw_path: Option<&Path>,
-    exclude_path: Option<&Path>,
+    exclude: &super::exclude::SiteExclusion,
 ) -> io::Result<(SampleAccumulator, SampleAccumulator, SampleAccumulator, EvalCounts, SiteAccumulator, RawTruthDiag)> {
     let n = shared.len();
     let strong = load_dosage_map(strong_path, shared)?;
     let raw = match raw_path { Some(p) => Some(load_dosage_map(p, shared)?), None => None };
-    let exclude: std::collections::HashSet<(u64, i64, u64)> = match exclude_path {
-        Some(p) => {
-            let (mut r, _) = VariantReader::open(p)?;
-            let mut b: Vec<f32> = Vec::new();
-            let mut set = std::collections::HashSet::new();
-            while let Some(rec) = r.next_record(&mut b) { set.insert(site_key(&rec.0, rec.1, &rec.2, &rec.3)); }
-            set
-        }
-        None => std::collections::HashSet::new(),
-    };
 
     let iri = shared_reindex(imputed_path, shared)?;
     let (mut imp, _) = VariantReader::open(imputed_path)?;
