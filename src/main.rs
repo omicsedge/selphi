@@ -405,14 +405,16 @@ fn main() {
         };
 
         let json_path = selphi::common::utils::out_path(std::path::Path::new(output), "json");
+        let exclude = selphi::eval::exclude::SiteExclusion::build(
+            args.exclude_sites.as_deref().map(Path::new),
+            args.exclude_panel_monomorphic.as_deref().map(Path::new),
+        ).expect("Failed to build the site exclusion set");
         if homref {
             let raw_path = args.truth_raw.as_deref().map(Path::new);
-            let excl_path = args.exclude_sites.as_deref().map(Path::new);
             if let Some(p) = raw_path { selphi_info!("  raw:      {}", p.display()); }
-            if let Some(p) = excl_path { selphi_info!("  exclude:  {}", p.display()); }
             selphi_step!("Scoring imputation R² (absent→hom-ref)...");
             let (comb, snp, indel, counts, site, rawdiag) = selphi::eval::accuracy::evaluate_imputation(
-                imp_path, truth_path, &shared, raw_path, excl_path,
+                imp_path, truth_path, &shared, raw_path, &exclude,
             ).expect("Evaluation failed");
             let n_excluded = counts.n_imp_variants.saturating_sub(counts.n_matched);
             selphi::eval::accuracy::print_imputation_summary(&comb, &snp, &indel, args.by_type, &counts, n_excluded);
@@ -427,7 +429,7 @@ fn main() {
 pass --homref-absent on to apply it (matched-sites scoring ignores it)");
             }
             let (site_acc, sample_acc, counts) = selphi::eval::accuracy::evaluate(
-                imp_path, truth_path, &shared, args.exclude_sites.as_deref().map(Path::new),
+                imp_path, truth_path, &shared, &exclude,
             ).expect("Evaluation failed");
             selphi::eval::accuracy::print_summary(&site_acc, &sample_acc, &counts);
             selphi::eval::accuracy::write_json_summary(&json_path, &site_acc, &sample_acc, &counts, Some(&shared))

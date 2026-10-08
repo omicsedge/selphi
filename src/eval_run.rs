@@ -26,6 +26,7 @@ pub struct EvalRequest {
     /// `--homref-absent`: `auto` | `on` | `off`.
     pub homref_absent: String,
     pub exclude_sites: Option<String>,
+    pub exclude_panel_monomorphic: Option<String>,
     pub by_type: bool,
 }
 
@@ -38,6 +39,7 @@ impl EvalRequest {
             truth_raw: args.truth_raw.clone(),
             homref_absent: args.homref_absent.clone(),
             exclude_sites: args.exclude_sites.clone(),
+            exclude_panel_monomorphic: args.exclude_panel_monomorphic.clone(),
             by_type: args.by_type,
         })
     }
@@ -79,12 +81,15 @@ pub fn evaluate(req: &EvalRequest, output_path: &str, final_path: &Path) {
         _ => !selphi::eval::accuracy::truth_has_ref_calls(truth_path).unwrap_or(true),
     };
     let json_path = selphi::common::utils::out_path(Path::new(output_path), "eval.json");
+    let exclude = selphi::eval::exclude::SiteExclusion::build(
+        req.exclude_sites.as_deref().map(Path::new),
+        req.exclude_panel_monomorphic.as_deref().map(Path::new),
+    ).expect("Failed to build the site exclusion set");
     if homref {
         selphi_info!("  homref:   absent→hom-ref (truth is variant-only)");
         let raw_path = req.truth_raw.as_deref().map(Path::new);
-        let excl_path = req.exclude_sites.as_deref().map(Path::new);
         let (comb, snp, indel, counts, site, rawdiag) = selphi::eval::accuracy::evaluate_imputation(
-            final_path, truth_path, &shared, raw_path, excl_path,
+            final_path, truth_path, &shared, raw_path, &exclude,
         ).expect("Evaluation failed");
         let n_excluded = counts.n_imp_variants.saturating_sub(counts.n_matched);
         selphi::eval::accuracy::print_imputation_summary(&comb, &snp, &indel, req.by_type, &counts, n_excluded);
@@ -98,7 +103,7 @@ pub fn evaluate(req: &EvalRequest, output_path: &str, final_path: &Path) {
 pass --homref-absent on to apply it (matched-sites scoring ignores it)");
         }
         let (site_acc, sample_acc, counts) = selphi::eval::accuracy::evaluate(
-            final_path, truth_path, &shared, req.exclude_sites.as_deref().map(Path::new),
+            final_path, truth_path, &shared, &exclude,
         ).expect("Evaluation failed");
         selphi::eval::accuracy::print_summary(&site_acc, &sample_acc, &counts);
         selphi::eval::accuracy::write_json_summary(&json_path, &site_acc, &sample_acc, &counts, Some(&shared))

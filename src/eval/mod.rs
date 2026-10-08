@@ -4,3 +4,4 @@
 //! Reads VCF.gz/BCF directly, parallel by genomic region, O(1) memory per variant.
 
 pub mod accuracy;
+pub mod exclude;

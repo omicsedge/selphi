@@ -442,6 +442,12 @@ pub struct Args {
     #[arg(long)]
     pub exclude_sites: Option<String>,
 
+    /// (--evaluate / --truth) Also exclude every site monomorphic in this reference
+    /// panel (.srp): an allele the panel does not carry cannot be imputed by any tool.
+    /// Pass the panel the imputation used. Optional.
+    #[arg(long, value_name = "SRP")]
+    pub exclude_panel_monomorphic: Option<String>,
+
     /// (--evaluate) Also break the report down into SNP vs indel (the combined total is
     /// always reported regardless). Off by default = combined only, as before.
     #[arg(long)]
