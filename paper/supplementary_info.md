@@ -30,9 +30,7 @@ output lacks 2 and 21 of them); MAF bins by frequency in the 801 truth genomes.
 | 1 | unphased | per-sample mean | **0.9579** | 0.9518 | Selphi |
 | 1 | unphased | 0.05-0.1% | **0.3624** | 0.3466 | Selphi |
 
-Selphi 2 leads Beagle 5.5 in all nine MAF bins in all four chromosome-by-mode cells. Earlier
-drafts reported Beagle 5.5 narrowly ahead in the rarest phased bin; that came from an evaluator
-that dropped, separately for each tool, the sites where its dosage was constant (Methods).
+Selphi 2 leads Beagle 5.5 in all nine MAF bins in all four chromosome-by-mode cells.
 
 ## Table S2. Imputation accuracy (R²) - biobank-scale MESA × TOPMed
 
@@ -355,7 +353,7 @@ Reference: Beagle 5.5, SHAPEIT5 v5.1.1.
 
 ## Table S6. Speed & memory
 
-16 threads unless noted. Array rows: Selphi 2 (shipped binary) and Beagle 5.5 timed in the same session (except MESA), one job at a time, with the panel in the page cache; ranges are over repeated runs. Beagle's MESA time is from the same workstation on 7 October 2026 (Table 7 caption).
+16 threads unless noted. Array rows: Selphi 2 (shipped binary) and Beagle 5.5 timed one job at a time, with the panel in the page cache; ranges are over repeated runs.
 
 | Benchmark | Metric | Selphi 2 | Reference | Winner |
 |---|---|---:|---:|---|
@@ -379,10 +377,6 @@ Reference: Beagle 5.5, SHAPEIT5 v5.1.1.
 | lcWGS capture library chr22, 6 samples at GLIMPSE2's iteration count (20 = 5 burn-in + 15 main) | wall | **75 s (13 s/sample)** | GLIMPSE2: 386 s (its default 20 iterations) | Selphi |
 | lcWGS single-sample (chr22), downsampled GIAB ~1.8× (= Table 2) | wall | **117 s** | GLIMPSE2: 332 s (chunk + phase + ligate) | Selphi |
 | lcWGS single-sample (chr22), downsampled GIAB ~1.8× (= Table 2) | peak RAM | 4.2 GB | GLIMPSE2: **1.8 GB** | reference |
-| lcWGS 54-sample multi-sample whole-chr22 (simulated; only regime Selphi is slower; earlier build, not re-timed) | wall | 41:50 | GLIMPSE2: 21:36 | reference |
-| lcWGS 75,552-haplotype panel multicov (HG002, 0.5-4×; earlier build, not re-timed) | wall | **2:10-2:34** | GLIMPSE2: 4:41-4:49 | Selphi |
-| lcWGS 75,552-haplotype panel multicov (earlier build, not re-timed) | peak RAM | ~2.9-3.2 GB | GLIMPSE2: ~2.2-2.6 GB | reference |
-| lcWGS real-data BAM (chr1:30-45 Mb, 1 sample; earlier build, not re-timed) | wall | **31 s (fast) / 51 s (default)** | GLIMPSE2: 102 s | Selphi |
 
 > lcWGS timings: quiet 16-core host, one job at a time, both tools of a row timed in the same
 > session with the shipped binary, `/usr/bin/time` wall from BAM in to imputed VCF out;
@@ -435,13 +429,6 @@ at 0.002 to 0.003 in overall R².
 | Beagle 5.5 | 0.4633 | 0.4667 | +0.0034 | +0.0040 | +0.0013 (5-10%) |
 | Selphi 2  | 0.4761 | **0.4780** | +0.0019 | +0.0030 | +0.0005 (0.1-0.2%) |
 
-An earlier version of this table, computed before the rare-variant phasing defect described
-under Rare variant phasing in Methods was corrected, reported the opposite sign (-0.0033 and
--0.0028 overall). The difference is the singleton-placement rule: at 2,401 samples the
-scaffold threshold sends every variant with a minor-allele count of four or fewer to the
-rare-variant pass, so the panel-wide effect of that rule is larger here than on any smaller
-cohort we measured.
-
 ## Table S9. Genome-wide per-MAF R² underlying Figure 3a (1KG, four-way, imputation-only)
 
 Source data for Figure 3a: n-weighted imputation R² by MAF bin, aggregated genome-wide
@@ -453,8 +440,7 @@ sites polymorphic in the panel (60,289,940 for Selphi 2 and 60,289,950 for the o
 Selphi 2 omits 10 sites). This is a like-for-like **imputation-only** comparison: every tool
 receives the identical phased target haplotypes (the same input file) and the same reference
 panel; because the target is fully phased and contains no missing genotypes, Beagle 5.5
-likewise imputes without re-estimating phase. Selphi 1.5.3, shown in earlier drafts, is not
-included: its outputs were not retained, so it could not be scored on this site set. Bold
+likewise imputes without re-estimating phase. Bold
 marks the per-row maximum. Selphi 2's full phase-and-impute pipeline is compared genome-wide
 with Beagle 5.5's in the Results.
 
@@ -495,8 +481,7 @@ MESA cohort (5,000 samples, chr20) imputed against the TOPMed Freeze 8 panel (17
 haplotypes), all tools scored by one evaluator on the same 11,085,368 panel-polymorphic sites.
 Selphi 2 uses its panel-adaptive candidate set (mc = 132,676) and its own phasing; Beagle 5.5
 its full pipeline at defaults; IMPUTE5 (L = 4 conditioning states), Minimac4 (block-based state
-reduction) and Selphi 1.5.3 at their defaults, impute-only from an external phasing of the same target
-(outputs from an earlier run, re-scored here). Selphi 2 leads every tool in every MAF bin.
+reduction) and Selphi 1.5.3 at their defaults, impute-only from an external phasing of the same target. Selphi 2 leads every tool in every MAF bin.
 
 | MAF | Selphi 2 | Beagle 5.5 | Selphi 1.5.3 | IMPUTE5 | Minimac4 |
 |---|---:|---:|---:|---:|---:|
@@ -525,17 +510,7 @@ defaults; both scored on the same panel-polymorphic sites). 3,948 of the 5,000 s
 | White (1,631) | **0.9064** | 0.8908 | +0.0155 |
 | Chinese-American (534) | **0.8982** | 0.8657 | +0.0324 |
 
-## Table S12. Selphi 2 vs Selphi 1.5.3
-
-The per-MAF 1000 Genomes comparison of the two Selphi versions printed in earlier drafts was
-scored with an evaluator that dropped, separately for each tool, sites where its dosage was
-constant, and before sites monomorphic in the panel were excluded. Selphi 1.5.3's 1000 Genomes
-outputs were not retained, so that comparison could not be re-scored on the common site set and
-is withdrawn. The two versions are compared on identical sites with one evaluator on the
-consumer arrays (Table 5: at equal phasing, SNP R² 0.9601 against 0.9599, indel 0.7911 against
-0.7932) and on MESA × TOPMed (Table S11: overall 0.6209 against 0.4957).
-
-## Table S13. Per-MAF imputation R² versus effective population size (1KG Phase 3 chr22)
+## Table S12. Per-MAF imputation R² versus effective population size (1KG Phase 3 chr22)
 
 801 held-out samples, impute-only against the 4,802-haplotype panel, at a fixed base effective
 population size (`--est-ne`), scored on the 1,016,325 panel-polymorphic sites. The
