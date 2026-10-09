@@ -372,59 +372,59 @@ As a full pipeline Selphi 2 leads at every frequency, the rarest bin included (+
 
 A fixed candidate-set size keeps a shrinking fraction of the panel as the panel grows: $m_c$ = 2,500 keeps 1.5% of the 171,054-haplotype TOPMed panel. We expected such a cap to exclude haplotypes that carry rare alleles in minority sub-populations, and tested this on the MESA cohort^28^ (5,000 multi-ethnic samples genotyped on a chip array) imputed against the TOPMed Freeze 8 panel (chromosome 20, 17.9 million variants). The cohort is admixed (African, Hispanic, Asian and European sub-populations) and fully held out from TOPMed.
 
-The panel-adaptive formula (Methods, Candidate selection and HMM) gives $m_c$ = 132,676 for TOPMed (tile-compression diversity CV = 0.845, scaled fraction 0.776). At this size Selphi 2's default diploid engine reaches overall $R^2$ 0.6210 on MESA against 0.5921 for Beagle 5.5 on the same 17.9 million variants ($\Delta$ = +0.0289). Per-sample mean $R^2$ is 0.9017 against 0.8764 ($\Delta$ = +0.0253), and Selphi 2 leads in all four self-reported ancestry groups (+0.023 to +0.037, largest for the East-Asian group; Figure 3b). Raising $m_c$ to 150,000 adds little, as the formula's diminishing-returns regime predicts (Supplementary Table S2). At their defaults on the same set, IMPUTE5 and Minimac4 reach 0.4967 and 0.4795, below Beagle 5.5 and Selphi 2: IMPUTE5's fixed $L$ = 4 conditioning states and Minimac4's block-based state reduction keep too few rare-allele carriers from a 171,054-haplotype panel, the truncation that the candidate-size ablation isolates. Selphi 2 leads both in every MAF bin (Supplementary Table S11).
+The panel-adaptive formula (Methods, Candidate selection and HMM) gives $m_c$ = 132,676 for TOPMed (tile-compression diversity CV = 0.845, scaled fraction 0.776). Every tool was scored by the same evaluator on the same 11,085,368 sites, the variants polymorphic in the panel (6,815,267 of the 17.9 million carry no alternate allele among the panel's haplotypes and cannot be imputed by any tool). At this size Selphi 2's default diploid engine reaches overall $R^2$ 0.6209 on MESA against 0.5916 for Beagle 5.5 ($\Delta$ = +0.0293). Per-sample mean $R^2$ is 0.9016 against 0.8842 ($\Delta$ = +0.0174), and Selphi 2 leads in all four self-reported ancestry groups (+0.015 to +0.032, largest for the East-Asian group; Figure 3b). At their defaults on the same set, Selphi 1.5.3, IMPUTE5 and Minimac4 reach 0.4957, 0.4947 and 0.4802: IMPUTE5's fixed $L$ = 4 conditioning states, Minimac4's block-based state reduction and Selphi 1.5.3's fixed per-variant match caps keep too few rare-allele carriers from a 171,054-haplotype panel, the truncation that the candidate-size ablation isolates. Selphi 2 leads all four tools in every MAF bin (Supplementary Table S11).
 
-To isolate the sizing rule, we ran Selphi 2 on the same cohort with $m_c$ fixed at 2,500. On a 500-sample MESA subset (chromosome 20, TOPMed), $m_c$ = 2,500 gave overall $R^2$ 0.5916 and the automatic $m_c$ = 132,676 gave 0.6453, a gain of +0.0536 from candidate-set size alone (Table 4).
+To isolate the sizing rule, we ran Selphi 2 on the same cohort with $m_c$ fixed at 2,500. On a 500-sample MESA subset (chromosome 20, TOPMed), $m_c$ = 2,500 gave overall $R^2$ 0.5680 and the automatic $m_c$ = 132,676 gave 0.6215, a gain of +0.0535 from candidate-set size alone (Table 4).
 
-**Table 4. Effect of candidate-set size on imputation $R^2$, MESA admixed cohort $\times$ TOPMed panel.** $R^2$ for two candidate-set sizes on a 500-sample subset of MESA, chr20, at representative MAF bins spanning the frequency range (the full nine-bin breakdown, stratified by ancestry, is in Table 4b). $m_c$ = 2,500 is a representative fixed candidate-set size; $m_c$ = 132,676 is the value chosen by the panel-adaptive formula (Methods).
+**Table 4. Effect of candidate-set size on imputation $R^2$, MESA admixed cohort $\times$ TOPMed panel.** $R^2$ for two candidate-set sizes on a 500-sample subset of MESA, chr20, at representative MAF bins spanning the frequency range (the full nine-bin breakdown, stratified by ancestry, is in Table 4b). $m_c$ = 2,500 is a representative fixed candidate-set size; $m_c$ = 132,676 is the value chosen by the panel-adaptive formula (Methods). Scored on the panel-polymorphic sites; the 0.05-0.1% bin is empty at 500 samples (one allele copy is 0.1%).
 
 | MAF | $m_c$ = 2,500 | $m_c$ = 132,676 (auto) | $\Delta$ |
 |---|---|---|---|
-| 0.1-0.2% | 0.5273 | 0.6220 | +0.0948 |
-| 0.2-0.5% | 0.5486 | 0.6143 | +0.0657 |
+| 0.1-0.2% | 0.4675 | 0.5570 | +0.0895 |
+| 0.2-0.5% | 0.5449 | 0.6105 | +0.0657 |
 | 0.5-1%   | 0.6097 | 0.6520 | +0.0422 |
 | 1-2%     | 0.6369 | 0.6684 | +0.0315 |
 | 5-10%    | 0.6656 | 0.6788 | +0.0132 |
 | 20-50%   | 0.6731 | 0.6778 | +0.0047 |
-| OVERALL  | 0.5916 | **0.6453** | **+0.0536** |
+| OVERALL  | 0.5680 | **0.6215** | **+0.0535** |
 
 The gain grows toward rarer MAF bins, as expected if the fixed cap truncates rare-variant carriers first. The panel-adaptive formula recovers this accuracy without manual tuning.
 
-If the truncation falls mainly on minority ancestries, the recovered accuracy should differ by ancestry. We re-imputed all 5,000 samples twice, with $m_c$ fixed at 2,500 and with the adaptive 132,676, identical otherwise, and stratified the difference by self-reported ancestry and within-group MAF (3,948 of 5,000 samples carry an ancestry label). The recovery is concentrated at rare variants and is largest in the most admixed or diverged groups (Table 4b). In the rarest bin (MAF 0.05-0.1%) it is +0.153 $R^2$ for Hispanic and +0.121 for African-American samples against +0.105 for European-ancestry (White) samples, and the gap widens across the low-frequency range (0.2-0.5% MAF: +0.110 and +0.070 against +0.047). Over all variants the recovery is +0.100 (Hispanic), +0.073 (African-American) and +0.045 (White). The more homogeneous East-Asian (Chinese-American) group, already well served by a small candidate set, gains nothing (overall -0.002, slightly negative from 0.5% MAF upward, where the larger set over-conditions it). The decay from rare to common variants and the ordering by admixture and divergence fit the proposed mechanism: a fixed cap filled by majority-ancestry haplotypes excludes the rare-allele carriers of admixed and diverged populations, and adaptive sizing restores them.
+If the truncation falls mainly on minority ancestries, the recovered accuracy should differ by ancestry. We re-imputed all 5,000 samples twice, with $m_c$ fixed at 2,500 and with the adaptive 132,676, identical otherwise, and stratified the difference by self-reported ancestry and within-group MAF (3,948 of 5,000 samples carry an ancestry label). The recovery is concentrated at rare variants and is largest in the most admixed or diverged groups (Table 4b). In the rarest bin (MAF 0.05-0.1%) it is +0.146 $R^2$ for Hispanic and +0.114 for African-American samples against +0.105 for European-ancestry (White) samples, and the gap widens across the low-frequency range (0.2-0.5% MAF: +0.109 and +0.070 against +0.047). Over all variants the recovery is +0.101 (Hispanic), +0.072 (African-American) and +0.046 (White). The more homogeneous East-Asian (Chinese-American) group, already well served by a small candidate set, gains little (overall +0.004; +0.014 in the rarest bin, slightly negative from 0.5% MAF upward, where the larger set over-conditions it). The decay from rare to common variants and the ordering by admixture and divergence fit the proposed mechanism: a fixed cap filled by majority-ancestry haplotypes excludes the rare-allele carriers of admixed and diverged populations, and adaptive sizing restores them.
 
-**Table 4b. Rare-variant accuracy recovered by panel-adaptive candidate sizing, stratified by ancestry.** Per-variant $R^2$ gain (panel-adaptive $m_c$ = 132,676 minus fixed $m_c$ = 2,500) on the full 5,000-sample MESA cohort imputed against the TOPMed panel (chr20), binned by within-group minor-allele frequency. Both runs are identical except for the candidate-set size. n = labelled samples per group.
+**Table 4b. Rare-variant accuracy recovered by panel-adaptive candidate sizing, stratified by ancestry.** Per-variant $R^2$ gain (panel-adaptive $m_c$ = 132,676 minus fixed $m_c$ = 2,500) on the full 5,000-sample MESA cohort imputed against the TOPMed panel (chr20), binned by within-group minor-allele frequency, on the panel-polymorphic sites. Both runs are identical except for the candidate-set size. n = labelled samples per group.
 
 | MAF | African-American (924) | Hispanic (859) | White (1,631) | Chinese-American (534) |
 |---|---|---|---|---|
-| 0.05-0.1% | +0.1206 | **+0.1529** | +0.1049 | +0.0093 |
-| 0.1-0.2%  | +0.0973 | +0.1362 | +0.0734 | +0.0097 |
-| 0.2-0.5%  | +0.0702 | +0.1095 | +0.0471 | +0.0031 |
-| 0.5-1%    | +0.0513 | +0.0830 | +0.0298 | -0.0007 |
+| 0.05-0.1% | +0.1140 | **+0.1460** | +0.1047 | +0.0137 |
+| 0.1-0.2%  | +0.0968 | +0.1351 | +0.0733 | +0.0122 |
+| 0.2-0.5%  | +0.0702 | +0.1093 | +0.0471 | +0.0042 |
+| 0.5-1%    | +0.0513 | +0.0830 | +0.0298 | -0.0006 |
 | 1-2%      | +0.0416 | +0.0573 | +0.0185 | -0.0045 |
 | 2-5%      | +0.0331 | +0.0356 | +0.0090 | -0.0054 |
 | 5-10%     | +0.0256 | +0.0201 | +0.0080 | -0.0058 |
 | 10-20%    | +0.0192 | +0.0142 | +0.0064 | -0.0054 |
 | 20-50%    | +0.0127 | +0.0092 | +0.0038 | -0.0039 |
-| OVERALL   | +0.0729 | +0.1003 | +0.0453 | -0.0021 |
+| OVERALL   | +0.0724 | +0.1008 | +0.0455 | +0.0038 |
 
 ## **Out-of-panel generalization to ancestries absent from the reference panel**
 
 The MESA experiment fixes the panel and varies the candidate-set size. A harder test is whether the advantage holds for ancestries absent from the panel. We built an out-of-panel benchmark from the gnomAD Human Genome Diversity Project and 1000 Genomes harmonized callset (22 autosomes, GRCh38, phased)^29^. The 3,166 1000 Genomes samples (6,332 haplotypes; African, admixed-American, East-Asian, European and Central/South-Asian ancestries) formed the panel, and the 925 HGDP individuals were held-out targets. Targets were masked to a common-SNP array (common variants thinned to approximately one per 5 kb), imputed back to full density and scored against their sequence genotypes. Two HGDP groups have no representation in the panel, Oceanian (n = 30) and Middle-Eastern (n = 157); others belong to represented continents but unrepresented populations (for example Central/South-Asian, n = 183).
 
-Across the 22 autosomes Selphi 2 (default diploid engine) exceeds Beagle 5.5 in per-sample $R^2$ in all seven continental regions, including the two absent from the panel (Oceanian +0.0105, Middle-Eastern +0.0066; African +0.0129, East-Asian +0.0079; Table 4c). It is higher in all 925 targets (mean $\Delta R^2$ = +0.0072, 95% CI [+0.0070, +0.0075], 20,000 paired bootstrap resamples; two-sided Wilcoxon $p < 10^{-100}$), and every per-region interval excludes zero. Per-variant $R^2$ is also higher overall (0.5372 against 0.5252) and in every MAF bin above 0.1%. In the rarest bin (0.05-0.1%) the two are level, Beagle ahead by 0.0004, the same bin where they converge on the in-panel 1000 Genomes benchmark. The same crossover in panel-present and panel-absent ancestries indicates that the accuracy profile belongs to the method rather than to a cohort, and that the advantage extends to ancestries not in the panel. This benchmark also prompted the small-panel conditioning rule (Methods). When the sizing formula subset this 6,332-haplotype panel to 2,500 haplotypes, the rare-allele carriers of the out-of-panel targets were dropped and the per-variant ranking inverted; conditioning on the full panel gives the result reported here.
+Across the 22 autosomes Selphi 2 (default diploid engine) exceeds Beagle 5.5 in per-sample $R^2$ in all seven continental regions, including the two absent from the panel (Oceanian +0.0107, Middle-Eastern +0.0067; African +0.0132, East-Asian +0.0080; Table 4c). It is higher in all 925 targets, every target of every region (mean $\Delta R^2$ = +0.0073, 95% CI [+0.0071, +0.0076], 20,000 paired bootstrap resamples). Per-variant $R^2$, scored on the sites polymorphic in the panel, is also higher overall (0.5356 against 0.5169) and in every MAF bin, the rarest included (0.05-0.1%: 0.3610 against 0.3495). Both tools' outputs were read in full on every chromosome (records written equal records scored). The advantage therefore extends to ancestries not in the panel. This benchmark also prompted the small-panel conditioning rule (Methods). When the sizing formula subset this 6,332-haplotype panel to 2,500 haplotypes, the rare-allele carriers of the out-of-panel targets were dropped and the per-variant ranking inverted; conditioning on the full panel gives the result reported here.
 
-**Table 4c. Out-of-panel generalization: HGDP targets imputed against a 1000 Genomes panel, genome-wide.** Per-sample mean $R^2$ (Selphi 2 default diploid engine versus Beagle 5.5) for 925 HGDP individuals imputed from a 3,166-sample 1000 Genomes reference panel (all 22 autosomes, GRCh38, common-SNP array input), by continental region. Oceanian and Middle-Eastern groups have no representation in the panel. n = targets per region.
+**Table 4c. Out-of-panel generalization: HGDP targets imputed against a 1000 Genomes panel, genome-wide.** Per-sample mean $R^2$ (Selphi 2 default diploid engine versus Beagle 5.5) for 925 HGDP individuals imputed from a 3,166-sample 1000 Genomes reference panel (all 22 autosomes, GRCh38, common-SNP array input), by continental region, scored on the sites polymorphic in the panel. Oceanian and Middle-Eastern groups have no representation in the panel. n = targets per region; Selphi 2 is higher in every target.
 
 | Region (n) | Selphi 2 | Beagle 5.5 | $\Delta$ |
 |---|---|---|---|
-| Oceanian, not in panel (30)        | **0.8983** | 0.8879 | +0.0105 |
-| Middle-Eastern, not in panel (157) | **0.9391** | 0.9325 | +0.0066 |
-| African (107)                      | **0.8784** | 0.8655 | +0.0129 |
-| East-Asian (233)                   | **0.9509** | 0.9429 | +0.0079 |
-| Central/South-Asian (183)          | **0.9472** | 0.9416 | +0.0056 |
-| European (153)                     | **0.9578** | 0.9531 | +0.0048 |
-| Admixed-American (62)              | **0.9627** | 0.9568 | +0.0060 |
-| All (925)                          | **0.9400** | 0.9328 | +0.0072 |
+| Oceanian, not in panel (30)        | **0.9132** | 0.9025 | +0.0107 |
+| Middle-Eastern, not in panel (157) | **0.9411** | 0.9344 | +0.0067 |
+| African (107)                      | **0.8847** | 0.8715 | +0.0132 |
+| East-Asian (233)                   | **0.9517** | 0.9437 | +0.0080 |
+| Central/South-Asian (183)          | **0.9485** | 0.9429 | +0.0056 |
+| European (153)                     | **0.9582** | 0.9534 | +0.0048 |
+| Admixed-American (62)              | **0.9650** | 0.9590 | +0.0060 |
+| All (925)                          | **0.9422** | 0.9349 | +0.0073 |
 
 ![Figure 3](figures/figure3_accuracy.png)
 
@@ -432,11 +432,11 @@ Across the 22 autosomes Selphi 2 (default diploid engine) exceeds Beagle 5.5 in 
 
 ## **Independent validation against leak-free GIAB truth**
 
-The 1000 Genomes benchmarks share haplotypes between panel and targets by descent, which can inflate accuracy. For independent validation we imputed the GIAB samples HG002-HG007, none of which are in the 1000 Genomes Project, against the 75,552-haplotype panel, which contains the full 1000 Genomes cohort. Truth came from the GIAB v4.2.1 high-confidence regions restricted to common variants (MAF 5-50%; 73,710 sites on chromosome 21 and 409,392 on chromosome 1).
+The 1000 Genomes benchmarks share haplotypes between panel and targets by descent, which can inflate accuracy. For independent validation we imputed the GIAB samples HG002-HG007, none of which are in the 1000 Genomes Project, against the 75,552-haplotype panel, which contains the full 1000 Genomes cohort. Truth came from the GIAB v4.2.1 high-confidence regions restricted to common variants (MAF 5-50%). Both tools imputed the same phased chip input against the same panel content (Beagle 5.5 received the bref3 file the SRP was built from), and both were scored on the same sites: 69,806 on chromosome 21 and 409,391 on chromosome 1.
 
-On chromosome 21 Selphi 2 reaches $R^2$ 0.9763 (concordance 0.9803) against 0.9732 (0.9817) for Beagle 5.5 (build 03 Oct 2025) on identical input; on chromosome 1 the order reverses, 0.9817 against 0.9834. The two tools are within 0.003 in both directions on this well-saturated panel. Selphi 1.5.3, measured in May 2026 on the same six samples with an earlier construction of the chip input and not re-run, was tied with Selphi 2 within run-to-run variation (chromosome 21 0.9704 against 0.9702; chromosome 1 0.9815 against 0.9815). This truth covers only common variants, where modern imputers are expected to converge; the leak-free test of rare-variant accuracy is the HGDP benchmark above, where Selphi 2 leads Beagle 5.5 at every frequency above the rarest.
+On chromosome 21 Selphi 2 reaches $R^2$ 0.9700 (concordance 0.9803) against 0.9633 (0.9783) for Beagle 5.5 (build 03 Oct 2025); on chromosome 1, 0.9771 (0.9864) against 0.9757 (0.9860). This truth covers only common variants, where modern imputers are expected to converge; the leak-free test of rare-variant accuracy is the HGDP benchmark above, where Selphi 2 leads Beagle 5.5 at every frequency.
 
-Resource use differs more. Selphi 2 imputes chromosome 21 in 6.9 s at 3.2 GB peak memory, Beagle 5.5 in 6.7 s at 7.0 GB, and Selphi 1.5.3 took 112.8 s at 7.1 GB in the May 2026 measurement. On chromosome 1 the speed-up over Selphi 1.5.3 is 48$\times$ (40.1 s against 1923 s), and Selphi 2 uses less than half Beagle's memory (7.2 GB against 16.8 GB). On this small six-sample input Beagle 5.5 is faster on chromosome 1 (24.9 s), where Selphi 2's time is dominated by writing the 16.3-million-variant output (Supplementary Table S3).
+Resource use differs more. Timed in one session, one job at a time, Selphi 2 imputes chromosome 21 in 6.6-7.2 s at 3.2 GB peak memory against 11.4-12.3 s for Beagle 5.5 (15.4 s on the first, cold-cache run) at 7.4-9.5 GB, and chromosome 1 in 38.2-41.3 s at 6.5-6.9 GB against 43.7-45.4 s (95.2 s cold) at 21-44 GB (four runs each; Supplementary Table S3). Selphi 1.5.3, measured in May 2026 in a separate session, took 112.8 s at 7.1 GB on chromosome 21 and 1,923 s on chromosome 1, about 48$\times$ Selphi 2's time.
 
 ## **Imputation accuracy on consumer arrays against high-coverage WGS truth**
 
