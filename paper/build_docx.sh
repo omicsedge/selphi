@@ -2,7 +2,7 @@
 # Build paper/selphi2_paper.docx = main manuscript + Supplementary Information (one reviewable doc).
 set -e
 cd "$(dirname "$0")/.."
-tmpmd=$(mktemp --suffix=.md); tmpdx=$(mktemp --suffix=.docx)
+mkdir -p /data/tmp/docx_build; tmpmd=$(mktemp -p /data/tmp/docx_build --suffix=.md); tmpdx=$(mktemp -p /data/tmp/docx_build --suffix=.docx)
 cat paper/selphi2_paper.md > "$tmpmd"
 printf '\n\n' >> "$tmpmd"
 cat paper/supplementary_info.md >> "$tmpmd"
