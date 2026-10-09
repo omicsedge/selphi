@@ -13,7 +13,7 @@ Figure 2 (figure2_lcwgs_capture): capture-plus-low-pass GIAB libraries, chromoso
           (*_conc_selphi_bam.json) is an ablation and is not plotted.
      2d = per reference-panel-MAF stratum delta non-reference concordance, Selphi 2 minus
           GLIMPSE2, both Selphi arms (Table 1c).
-Figure 3 (figure3_accuracy): 3a = genome-wide (20-autosome) n-weighted per-MAF R^2, five-way
+Figure 3 (figure3_accuracy): 3a = genome-wide (20-autosome) n-weighted per-MAF R^2, four-way
      imputation-only (all tools impute from the identical phased target + panel; Supplementary
      Table S9; OVERALL aggregates in Results text). 3b = MESA per-ancestry per-sample-mean R^2
      (mc=132,676 run; deltas match Table 4b prose). 3c = Table 4c. 3d = Table 2b coverage sweep.
@@ -252,12 +252,12 @@ maf_lbl = ["0.05-0.1", "0.1-0.2", "0.2-0.5", "0.5-1", "1-2", "2-5", "5-10", "10-
 x = np.arange(len(maf_lbl))
 
 # ---- data: every number below is read from the manuscript tables (paper_tables.py) ----
-# 3a: 1KG genome-wide (20 autosomes) R2 by MAF, five-way, imputation-only = Supplementary Table S9
+# 3a: 1KG genome-wide (20 autosomes) R2 by MAF, four-way, imputation-only = Supplementary Table S9
 _s9 = table_after(SUPP, "## Table S9.")
 _maf_rows = [r[0] for r in _s9[1:] if r[0] != "OVERALL"]
 assert len(_maf_rows) == 9, _maf_rows
 t1 = {k: column(_s9, h, exclude_prefixes=("OVERALL",)) for k, h in
-      [("selphi", "Selphi 2"), ("selphi153", "Selphi 1.5.3"), ("beagle", "Beagle 5.5"),
+      [("selphi", "Selphi 2"), ("beagle", "Beagle 5.5"),
        ("impute5", "IMPUTE5"), ("minimac4", "Minimac4")]}
 # 3c: HGDP out-of-panel per-region per-sample R2 (Table 4c genome-wide)
 regions = ["Oceanian*","Mid-East*","African","E.Asian","C/S.Asian","European","Adm.Amer."]
@@ -273,10 +273,10 @@ assert [num(r[0]) for r in _t2b[1:]] == cov
 
 fig, ax = plt.subplots(2, 2, figsize=(9.2, 7.0))
 
-# (a) 1KG five-way, imputation-only (all tools from the identical phased target + panel)
+# (a) 1KG four-way, imputation-only (all tools from the identical phased target + panel)
 a = ax[0,0]
 for k,lab,m,lw in [("impute5","IMPUTE5","^",1.4),("minimac4","Minimac4","D",1.4),
-                   ("beagle","Beagle 5.5","s",1.4),("selphi153","Selphi 1.5.3","v",1.4),
+                   ("beagle","Beagle 5.5","s",1.4),
                    ("selphi","Selphi 2","o",2.1)]:
     a.plot(x, t1[k], marker=m, ms=4, lw=lw, color=C[k], label=lab,
            zorder=5 if k=="selphi" else 3)
@@ -342,12 +342,19 @@ fig2, (axl, axw, axm) = plt.subplots(1, 3, figsize=(11.5, 3.6))
 #     (15 native chunks + ligate), QUILT2 1,729 s (tiled) -- the former Figure 3c values,
 #     unchanged. No scaling.
 tool_col = {"Selphi 2": C["selphi"], "GLIMPSE2": C["glimpse2"], "QUILT2": C["quilt2"]}
+def mid(cell):
+    """A cell's value, or the midpoint of a range such as "105-109 s" or "41.9-55.1 GB"."""
+    m = re.search(r"(\d+(?:,\d{3})*(?:\.\d+)?)\s*-\s*(\d+(?:,\d{3})*(?:\.\d+)?)", cell)
+    if m:
+        return (float(m.group(1).replace(",", "")) + float(m.group(2).replace(",", ""))) / 2
+    return num(cell)
+
 def _s6_wall(key):
     """Selphi wall and the comparators' walls from one Table S6 row: (selphi_s, {tool: s})."""
     cells = row_line(SUPP, key)
     others = {m.group(1): int(m.group(2).replace(",", "")) for m in
               re.finditer(r"(GLIMPSE2|QUILT2): ([\d,]+) s", cells[3])}
-    return int(num(cells[2])), others
+    return int(round(mid(cells[2]))), others
 _cap1, _cap1o = _s6_wall("lcWGS capture library chr22, 1 sample, native `--bam` + BAQ, BAM in to imputed VCF out")
 _cap6, _cap6o = _s6_wall("lcWGS capture library chr22, 6 samples in one run | wall")
 _ds1, _ds1o = _s6_wall("lcWGS whole-chr22, 1 sample @1")
@@ -386,18 +393,27 @@ axw.set_xticks(xt); axw.set_xticklabels(tt); axw.set_ylabel("Whole-genome wall t
 axw.set_ylim(0, 41); axw.set_title("(b) Whole-genome wall time", loc="left", fontweight="bold")
 axw.grid(alpha=.25, lw=.5, axis="y")
 # (c) peak memory, one chromosome at a time (peak = largest chromosome)
-wg_mem = [num(row(_t5b, "Selphi 2 (default diploid)")[2]), num(row(_t5b, "Beagle 5.5 (phase + impute)")[2])]
+_mem_cells = [row(_t5b, "Selphi 2 (default diploid)")[2], row(_t5b, "Beagle 5.5 (phase + impute)")[2]]
+wg_mem = [mid(c) for c in _mem_cells]
 axm.bar(xt, wg_mem, 0.55, color=tcol2)
-for i,v in enumerate(wg_mem): axm.text(i, v+0.5, f"{v:g} GB", ha="center", fontsize=8.5, fontweight="bold")
+for i, c in enumerate(_mem_cells):
+    lo_hi = re.findall(r"\d+(?:\.\d+)?", c)
+    if len(lo_hi) == 2:   # a range: draw it as an error bar and label it
+        lo, hi = map(float, lo_hi)
+        axm.errorbar(i, wg_mem[i], yerr=[[wg_mem[i] - lo], [hi - wg_mem[i]]], color="#333333", capsize=4, lw=1)
+        axm.text(i, hi + 0.8, f"{lo:g}-{hi:g} GB", ha="center", fontsize=8.5, fontweight="bold")
+    else:
+        axm.text(i, wg_mem[i] + 0.5, f"{wg_mem[i]:g} GB", ha="center", fontsize=8.5, fontweight="bold")
 axm.set_xticks(xt); axm.set_xticklabels(tt); axm.set_ylabel("Peak memory (GB, per chromosome)")
-axm.set_ylim(0, 47); axm.set_title("(c) Peak memory", loc="left", fontweight="bold")
+axm.set_ylim(0, 62); axm.set_title("(c) Peak memory", loc="left", fontweight="bold")
 axm.grid(alpha=.25, lw=.5, axis="y")
 plt.tight_layout()
 plt.savefig(f"{OUT}/figure4_efficiency.pdf", bbox_inches="tight")
 plt.savefig(f"{OUT}/figure4_efficiency.png", dpi=600, bbox_inches="tight")
 print("wrote figure4_efficiency.pdf/.png")
-print("  (a) capture 1 sample: Selphi 104 s / GLIMPSE2 327 s; 6 samples one run: 170 s / 389 s;"
-      " downsampled 1x: 115 / 287 / 1,729 s")
+print(f"  (a) capture 1 sample: Selphi {_cap1} s / GLIMPSE2 {_cap1o['GLIMPSE2']} s; 6 samples one run: "
+      f"{_cap6} s / {_cap6o['GLIMPSE2']} s; downsampled 1x: {_ds1} / {_ds1o['GLIMPSE2']} / {_ds1o['QUILT2']} s")
+print(f"  (b) whole genome: {wg_wall} min; (c) peak memory {wg_mem} GB (midpoints)")
 
 # =====================================================================================
 # ---- Supplementary figure: replication across chromosomes ----
