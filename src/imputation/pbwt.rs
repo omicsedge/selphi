@@ -378,9 +378,11 @@ fn scan_site<F: MatchFilter>(
     let threshold = (var - min_l) as i32;
     let ib = a_inv[target_abs as usize] as usize;
     let mut steps = 0u64;
+    let cap = walk_cap(n_ref);
 
     // LEFT SCAN
     {
+        let mut rec = 0usize;
         let mut dmin: i32 = 0;
         let mut pos = ib as isize - 1;
         while pos >= 0 {
@@ -394,6 +396,8 @@ fn scan_site<F: MatchFilter>(
                 let mut length = var as i32 - dmin;
                 if is_last && y[ib] == y[pos as usize] { length += 1; }
                 insert_match(haps, lens, counts, ht, n_var, fl_fwd, dmin as usize, hap_at_pos, length);
+                rec += 1;
+                if cap > 0 && rec >= cap { break; }
             }
             pos -= 1;
         }
@@ -401,6 +405,7 @@ fn scan_site<F: MatchFilter>(
 
     // RIGHT SCAN
     {
+        let mut rec = 0usize;
         let mut dmin: i32 = 0;
         for pos in (ib + 1)..m {
             steps += 1;
@@ -413,6 +418,8 @@ fn scan_site<F: MatchFilter>(
                 let mut length = var as i32 - dmin;
                 if is_last && y[ib] == y[pos] { length += 1; }
                 insert_match(haps, lens, counts, ht, n_var, fl_fwd, dmin as usize, hap_at_pos, length);
+                rec += 1;
+                if cap > 0 && rec >= cap { break; }
             }
         }
     }
@@ -537,6 +544,7 @@ fn scan_site_sparse<F: MatchFilter>(
     let ib = a_inv[target_abs as usize] as usize;
     let mut steps = 0u64;
     let p = &sp.pos;
+    let cap = walk_cap(n_ref);
     // index of the first minority position > ib (positions are sorted, ib itself is majority)
     let split = p.partition_point(|&x| (x as usize) < ib);
 
@@ -546,6 +554,7 @@ fn scan_site_sparse<F: MatchFilter>(
         let mut dmin: i32 = 0;
         let mut prev = ib; // covered range so far is d[prev+1 ..= ib]; empty at start
         let mut idx = split;
+        let mut rec = 0usize;
         while idx > 0 {
             idx -= 1;
             let pos = p[idx] as usize;
@@ -559,6 +568,8 @@ fn scan_site_sparse<F: MatchFilter>(
             if hap_at_pos < n_ref as i32 && filter.keep(hap_at_pos) {
                 let length = var as i32 - dmin;
                 insert_match(haps, lens, counts, ht, n_var, fl_fwd, dmin as usize, hap_at_pos, length);
+                rec += 1;
+                if cap > 0 && rec >= cap { break; }
             }
         }
     }
@@ -567,6 +578,7 @@ fn scan_site_sparse<F: MatchFilter>(
         let r = sp.right_bound(d, ib, threshold, m);
         let mut dmin: i32 = 0;
         let mut prev = ib; // covered range d[ib+1 ..= prev]; empty at start
+        let mut rec = 0usize;
         for &pu in &p[split..] {
             let pos = pu as usize;
             if pos >= r { break; }
@@ -578,10 +590,38 @@ fn scan_site_sparse<F: MatchFilter>(
             if hap_at_pos < n_ref as i32 && filter.keep(hap_at_pos) {
                 let length = var as i32 - dmin;
                 insert_match(haps, lens, counts, ht, n_var, fl_fwd, dmin as usize, hap_at_pos, length);
+                rec += 1;
+                if cap > 0 && rec >= cap { break; }
             }
         }
     }
     steps
+}
+
+/// Per-side cap on the matches one site's scan records (`SELPHI_PBWT_WALK_CAP`).
+///
+/// The walk meets matches longest first -- the running divergence only grows outward --
+/// so stopping after K records drops the shortest matches ending at that site. On a
+/// biobank panel a site's match block holds tens of thousands of haplotypes, nearly all
+/// of them short matches that never reach the kept top lists, and walking them was most
+/// of the imputation time. Measured with K = 200 on MESA 5,000 x TOPMed chr20
+/// (171,054 haplotypes): 9,047 -> 4,381 s, overall R2 0.62088 -> 0.62099, per-sample
+/// 0.90155 -> 0.90190, no MAF bin lower. On smaller panels the blocks are short, the
+/// time saved is a few percent, and on the 75,552-haplotype panel SNP R2 moved by
+/// -0.00015 (consumer arrays) and -0.0008 (GIAB chr21) -- so the cap is applied
+/// automatically only from `AUTO_CAP_MIN_HAPS` haplotypes up, and smaller panels keep the
+/// full walk (byte-identical to before). An explicit value always wins; `0` disables it.
+pub(crate) const AUTO_CAP_MIN_HAPS: usize = 100_000;
+pub(crate) const AUTO_CAP_K: usize = 200;
+
+#[inline]
+pub(crate) fn walk_cap(n_ref: usize) -> usize {
+    use std::sync::OnceLock;
+    static EXPLICIT: OnceLock<Option<usize>> = OnceLock::new();
+    match *EXPLICIT.get_or_init(|| crate::config::usize_opt("SELPHI_PBWT_WALK_CAP")) {
+        Some(k) => k,
+        None => if n_ref >= AUTO_CAP_MIN_HAPS { AUTO_CAP_K } else { 0 },
+    }
 }
 
 /// `SELPHI_PBWT_SPARSE_SCAN=0` disables the majority-allele sparse scan in the
