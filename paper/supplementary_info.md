@@ -22,51 +22,43 @@ full phase+impute pipeline. Reference: Beagle 5.5 (03Oct25).
 
 ## Table S2. Imputation accuracy (R²) - biobank-scale MESA × TOPMed
 
-Target: MESA admixed cohort, chr20. Panel: TOPMed 171 K-hap (85 K samples; disjoint
-from target). `mc` = max conditioning candidates. Reference: Beagle 5.5 unless noted.
-The first row is the camera-ready headline that matches the main-text MESA result and Figure 3b (full
-17.9 M-variant set, `--sample-batch-size`, panel-adaptive `mc` = 132,676); the
-subsequent rows are the candidate-set-size (`mc`) sweep behind the biobank claim,
-measured against an earlier Beagle 5.5 baseline (0.5975) and retained to show the
-`mc` trajectory (so their Beagle column differs from the headline by design).
+Target: MESA admixed cohort, chr20, 5,000 samples. Panel: TOPMed Freeze 8, 171,054 haplotypes
+(85,527 samples; disjoint from the target). `mc` = per-target candidate-set size. Every row was
+scored by one evaluator on the same 11,085,368 sites, the variants polymorphic in the panel
+(6,815,267 of the 17.9 M panel variants have no alternate allele among its haplotypes). Selphi 2
+rows: shipped binary, default diploid engine, full phase-and-impute pipeline; Beagle 5.5
+(03Oct25) at its defaults. Per-MAF values for all tools are in Table S11, per-ancestry values in
+Table S11b and Table 4b, and the 500-sample candidate-size ablation in Table 4.
 
-| Cohort | `mc` | Bin | Selphi 2 R² | Beagle R² | Winner |
+| Cohort | `mc` | Metric | Selphi 2 R² | Beagle 5.5 R² | Winner |
 |---|---|---|---:|---:|---|
-| MESA 5K | 132676 (auto), full 17.9 M var | OVERALL (headline, diploid default) | **0.6210** | 0.5921 | Selphi |
-| MESA 5K | 150K | OVERALL (haploid, larger mc) | **0.6162** | 0.5975 | Selphi |
-| MESA 5K | 132676 (auto) | OVERALL (haploid auto-mc) | **0.6158** | 0.5975 | Selphi |
-| MESA 5K | 132676 (auto), full 17.9 M var | per-sample mean (headline, diploid default) | **0.9017** | 0.8764 | Selphi |
-| MESA 5K | 150K | 0.05-0.1% (rarest, Ne-default) | **0.5211** | 0.5020 | Selphi |
-| MESA 5K | 120K | 0.5-1% | **0.6554** | 0.6360 | Selphi |
-| MESA 5K | 120K | 5-10% | **0.6809** | 0.6635 | Selphi |
-| MESA 5K | 120K | 20-50% | **0.6653** | 0.6541 | Selphi |
-| MESA 100s set1 | 9800 | OVERALL | **0.6624** | 0.6242 | Selphi |
-| MESA 100s set1 | 9800 | 0.5-1% | **0.6548** | 0.6079 | Selphi |
-| MESA 100s set2 | 9800 | OVERALL | **0.6645** | 0.6290 | Selphi |
-| MESA 100s set1 | per-window default | OVERALL (Test B) | 0.6506 | 0.6507 | tie |
-| MESA 100s set2 | per-window default | OVERALL (Test B) | 0.6549 | 0.6546 | tie |
+| MESA 5K | 132,676 (auto) | OVERALL | **0.6209** | 0.5916 | Selphi |
+| MESA 5K | 132,676 (auto) | per-sample mean | **0.9016** | 0.8842 | Selphi |
+| MESA 5K | 132,676 (auto) | 0.05-0.1% (rarest) | **0.5300** | 0.4956 | Selphi |
+| MESA 5K | 132,676 (auto) | 0.5-1% | **0.6599** | 0.6305 | Selphi |
+| MESA 5K | 132,676 (auto) | 20-50% | **0.6657** | 0.6503 | Selphi |
+| MESA 5K | 2,500 (fixed) | OVERALL | 0.5725 | **0.5916** | reference |
+| MESA 5K | 2,500 (fixed) | per-sample mean | **0.8982** | 0.8842 | Selphi |
 
 ## Table S3. Leak-free GIAB validation - chip to WGS
 
-6 GIAB samples (HG002-007), 75,552-haplotype reference panel (37,776 samples),
-leak-free, 16 threads. Selphi 2 and Beagle 5 (03Oct25) rows: workstation, September 2026, one
-rebuilt chip input. Selphi 1.5.3 rows: EC2 r7a.4xlarge, May 2026, not re-run.
-This is the GIAB overlay validation set (no array no-calls), distinct from the
-consumer-array GSA benchmark in the main paper (Table 5); the missing-genotype
-phasing fix does not affect these rows.
+6 GIAB samples (HG002-007), 75,552-haplotype reference panel (37,776 samples), leak-free,
+16 threads, impute-only from the same phased chip input. Beagle 5.5 (03Oct25) received the
+bref3 file the Selphi 2 SRP was built from, so both tools used the same panel content. Both
+were scored by one evaluator on the same sites (69,806 on chr21, 409,391 on chr1; GIAB v4.2.1
+high-confidence, MAF 5-50%). Timings: same session, one job at a time, four runs per tool
+(range; Beagle's first run on each chromosome was cold-cache and is given separately).
 
-| Chr | Mode | Metric | Selphi 2 | Beagle 5 | Winner |
-|---|---|---|---:|---:|---|
-| 21 | impute-only | OVERALL R² | **0.9763** | 0.9732 | Selphi |
-| 21 | impute-only | concordance | **0.9777** | 0.9762 | Selphi |
-| 21 | impute-only | wall | 6.9 s | **6.7 s** | tie |
-| 21 | impute-only | peak RAM | **3.2 GB** | 7.0 GB | Selphi |
-| 21 | full pipeline (diploid) | OVERALL R² | **0.9734** | 0.9707 | Selphi |
-| 21 | full pipeline (haploid auto) | OVERALL R² | 0.9705 | 0.9707 | tie |
-| 1 | impute-only | OVERALL R² | 0.9817 | **0.9834** | reference |
-| 1 | impute-only | wall | 40.1 s | **24.9 s** | reference |
-| 1 | impute-only | peak RAM | **7.2 GB** | 16.8 GB | Selphi |
-| 1 | full pipeline (diploid) | OVERALL R² | 0.9812 | **0.9820** | reference |
+| Chr | Metric | Selphi 2 | Beagle 5.5 | Winner |
+|---|---|---:|---:|---|
+| 21 | R² | **0.9700** | 0.9633 | Selphi |
+| 21 | concordance | **0.9803** | 0.9783 | Selphi |
+| 21 | wall | **6.6-7.2 s** | 11.4-12.3 s (15.4 s cold) | Selphi |
+| 21 | peak RAM | **3.2 GB** | 7.4-9.5 GB | Selphi |
+| 1 | R² | **0.9771** | 0.9757 | Selphi |
+| 1 | concordance | **0.9864** | 0.9860 | Selphi |
+| 1 | wall | **38.2-41.3 s** | 43.7-45.4 s (95.2 s cold) | Selphi |
+| 1 | peak RAM | **6.5-6.9 GB** | 21-44 GB | Selphi |
 
 ## Table S4. Low-coverage sequencing accuracy (R² and concordance) - vs GLIMPSE2 and QUILT2
 
@@ -396,46 +388,44 @@ Reference: Beagle 5.5, SHAPEIT5 v5.1.1.
 
 ## Table S7. Phasing × imputer matrix (overall R²) - 1KG, chip to WGS
 
-A genuinely-unphased 1KG array target (801 held-out samples) phased by each of
-three tools, then imputed by each of two imputers against the 1000 Genomes Phase 3
-panel; overall R² vs WGS truth on imputed-only sites. Within a fixed imputer the
-three phasings differ by ≤0.002; switching the imputer (Beagle to Selphi) moves R²
-by +0.007 to +0.011 regardless of phaser - i.e. the phaser is practically
-interchangeable for array imputation and the accuracy gain lives in the imputer.
+A genuinely unphased 1KG array target (801 held-out samples) phased by each of three tools,
+then imputed by each of two imputers against the 1000 Genomes Phase 3 panel (Beagle 5.5
+received a bref3 file built from the same SRP); overall R² against WGS truth on imputed-only
+sites polymorphic in the panel (1,016,325 on chr22, 5,482,279 on chr1; the Beagle-imputed arms
+score 2 and 21 fewer sites, which Beagle does not emit). Within a fixed imputer the three
+phasings differ by at most 0.003; switching the imputer from Beagle to Selphi raises R² by
+0.013-0.014 whatever the phaser, so the phasers are close to interchangeable for array
+imputation and the accuracy gain comes from the imputer.
 
 | Phasing / Imputer | chr22 Beagle | chr22 Selphi | chr1 Beagle | chr1 Selphi |
 |---|---:|---:|---:|---:|
-| Selphi 2  | 0.4723 | 0.4821 | 0.5655 | 0.5730 |
-| Beagle 5.5 | 0.4727 | 0.4815 | 0.5639 | 0.5710 |
-| SHAPEIT5  | 0.4728 | 0.4834 | 0.5646 | 0.5726 |
+| Selphi 2  | 0.4690 | **0.4823** | 0.5589 | **0.5720** |
+| Beagle 5.5 | 0.4666 | 0.4796 | 0.5560 | 0.5690 |
+| SHAPEIT5  | 0.4665 | 0.4807 | 0.5566 | 0.5701 |
 
 ## Table S8. Reference-panel re-phasing (chr22)
 
-The 1000 Genomes Phase 3 panel re-phased de-novo with Selphi 2 (`--phase-panel`,
-2,401 samples, 1,070,399 sites after removing two records whose REF exceeds the
-255-byte limit of the panel formats) versus its original published phasing; the
-same Selphi-phased target (801 samples) is imputed against each panel and scored
-on the identical 1,070,397 sites. Re-phasing recovers slightly more than it
-costs: overall R² rises by 0.0019 for Selphi 2 and 0.0028 for Beagle 5.5, and no
-MAF bin falls by more than 0.0001. Against the panel's published phasing, the
-re-phasing itself has a switch error of 2.18% (37.55% at minor-allele count 1,
-over 105,538,882 heterozygous transitions). We nonetheless use the published
-phasing throughout this work, because it is the phasing the comparator tools are
-conventionally run against; these figures bound what that choice costs at
-0.0019 to 0.0028 in overall R².
+The 1000 Genomes Phase 3 panel re-phased de novo with Selphi 2 (`--phase-panel`, 2,401
+samples, 1,070,399 sites after removing two records whose alleles exceed the 255-byte limit of
+the panel formats) versus its original published phasing. The same phased target (801
+samples) is imputed against each panel by each tool and scored on the identical 1,016,321
+panel-polymorphic sites (re-phasing does not change allele counts). Re-phasing raises overall
+R² by 0.0019 for Selphi 2 and 0.0034 for Beagle 5.5, and no MAF bin falls for either tool. We
+nonetheless use the published phasing throughout this work, because it is the phasing the
+comparator tools are conventionally run against; these figures bound what that choice costs
+at 0.002 to 0.003 in overall R².
 
-| Imputer | original panel | Selphi-rephased panel | Δ overall | rarest-bin Δ (0.05-0.1%) | worst bin |
+| Imputer | original panel | Selphi-rephased panel | Δ overall | rarest-bin Δ (0.05-0.1%) | smallest bin Δ |
 |---|---:|---:|---:|---:|---:|
-| Beagle 5.5 | 0.4680 | 0.4707 | +0.0028 | +0.0031 | +0.0010 |
-| Selphi 2  | 0.4776 | 0.4795 | +0.0019 | +0.0033 | -0.0001 |
+| Beagle 5.5 | 0.4633 | 0.4667 | +0.0034 | +0.0040 | +0.0013 (5-10%) |
+| Selphi 2  | 0.4761 | **0.4780** | +0.0019 | +0.0030 | +0.0005 (0.1-0.2%) |
 
-An earlier version of this table, computed before the rare-variant phasing
-defect described under Rare variant phasing in Methods was corrected, reported
-the opposite sign (-0.0033 and -0.0028 overall, -0.013 and -0.014 in the rarest bin). The
-difference is the singleton-placement rule: at 2,401 samples the scaffold
-threshold sends every variant with a minor-allele count of four or fewer to the
-rare-variant pass, so the panel-wide effect of that rule is larger here than on
-any smaller cohort we measured.
+An earlier version of this table, computed before the rare-variant phasing defect described
+under Rare variant phasing in Methods was corrected, reported the opposite sign (-0.0033 and
+-0.0028 overall). The difference is the singleton-placement rule: at 2,401 samples the
+scaffold threshold sends every variant with a minor-allele count of four or fewer to the
+rare-variant pass, so the panel-wide effect of that rule is larger here than on any smaller
+cohort we measured.
 
 ## Table S9. Genome-wide per-MAF R² underlying Figure 3a (1KG, five-way, imputation-only)
 
@@ -469,92 +459,80 @@ phasing. The OVERALL row matches the genome-wide aggregate reported in Results.
 ## Table S10. Component ablation (1KG chromosome 22, 801 held-out samples)
 
 Each component is varied from the Selphi 2 default with phasing and everything else held
-fixed (impute-only against the phased target, so the effect is isolated from phasing). The
-"Default" row is identical to the chromosome-22 impute-only row of Table S1. The long-range
-PBWT scan realized as an 80 cM window is worth +0.013 overall R² over a short IMPUTE5-like 8 cM
-window; because chromosome 22 is shorter than 80 cM, the default 80 cM window already spans the
-whole chromosome, so the 80 cM and whole-chromosome rows coincide by construction (confirming
-that windowing at 80 cM imposes no penalty relative to Selphi 1's whole-chromosome pass on this
-chromosome). The panel-adaptive effective population size is worth +0.008 over a fixed Ne = 20,000. The candidate-set-size component is ablated separately in Table 4b.
+fixed (impute-only against the phased target, so the effect is isolated from phasing), scored
+on the 1,016,325 panel-polymorphic sites. The "Default" row equals the chromosome-22
+impute-only result of Table S1. The long-range PBWT scan realised as an 80 cM window is worth
++0.020 overall R² over a short IMPUTE5-like 8 cM window; because chromosome 22 is shorter than
+80 cM, the 80 cM and whole-chromosome rows coincide by construction. The panel-adaptive
+effective population size is worth +0.009 over a fixed Ne = 20,000. The candidate-set-size
+component is ablated separately in Tables 4 and 4b.
 
 | Configuration | Overall R² | 0.05-0.1% | 0.5-1% | 20-50% |
 |---|---:|---:|---:|---:|
-| Default (80 cM window, panel-adaptive Ne) | **0.4776** | 0.2661 | 0.5033 | 0.8418 |
-| Short 8 cM window (IMPUTE5-like) | 0.4645 | 0.2667 | 0.4759 | 0.8250 |
-| Whole-chromosome window (Selphi 1 mode) | 0.4776 | 0.2661 | 0.5033 | 0.8418 |
-| Fixed Ne = 20,000 (IMPUTE5 default) | 0.4696 | 0.2687 | 0.4884 | 0.8312 |
+| Default (80 cM window, panel-adaptive Ne) | **0.4761** | 0.2626 | **0.5043** | **0.8424** |
+| Short 8 cM window (IMPUTE5-like) | 0.4559 | 0.2498 | 0.4779 | 0.8263 |
+| Whole-chromosome window (Selphi 1 mode) | 0.4761 | 0.2626 | 0.5043 | 0.8424 |
+| Fixed Ne = 20,000 (IMPUTE5 default) | 0.4672 | **0.2633** | 0.4897 | 0.8320 |
 
-## Table S11. Biobank-scale MESA × TOPMed, per-MAF, four imputers
+## Table S11. Biobank-scale MESA × TOPMed, per-MAF, five imputers
 
 MESA cohort (5,000 samples, chr20) imputed against the TOPMed Freeze 8 panel (171,054
-haplotypes), scored on the identical set of 17,900,635 variants for all tools. Selphi 2 uses
-its panel-adaptive candidate set (mc = 132,676); IMPUTE5 (L = 4 conditioning states) and
-Minimac4 (block-based state reduction) use their default settings. Beagle 5.5 attains overall
-R² 0.5921 on the same set (main text). Selphi 2 leads at every MAF bin.
+haplotypes), all tools scored by one evaluator on the same 11,085,368 panel-polymorphic sites.
+Selphi 2 uses its panel-adaptive candidate set (mc = 132,676) and its own phasing; Beagle 5.5
+its full pipeline at defaults; IMPUTE5 (L = 4 conditioning states), Minimac4 (block-based state
+reduction) and Selphi 1.5.3 at their defaults. Selphi 2 leads every tool in every MAF bin.
 
-| MAF | Selphi 2 | IMPUTE5 | Minimac4 |
-|---|---:|---:|---:|
-| 0.05-0.1% | **0.5306** | 0.3819 | 0.3693 |
-| 0.1-0.2%  | **0.5748** | 0.4107 | 0.3983 |
-| 0.2-0.5%  | **0.6205** | 0.4689 | 0.4531 |
-| 0.5-1%    | **0.6599** | 0.5342 | 0.5150 |
-| 1-2%      | **0.6749** | 0.5695 | 0.5494 |
-| 2-5%      | **0.6648** | 0.5753 | 0.5567 |
-| 5-10%     | **0.6822** | 0.6084 | 0.5909 |
-| 10-20%    | **0.7361** | 0.6720 | 0.6537 |
-| 20-50%    | **0.6657** | 0.6249 | 0.6084 |
-| OVERALL   | **0.6210** | 0.4967 | 0.4795 |
+| MAF | Selphi 2 | Beagle 5.5 | Selphi 1.5.3 | IMPUTE5 | Minimac4 |
+|---|---:|---:|---:|---:|---:|
+| 0.05-0.1% | **0.5300** | 0.4956 | 0.3338 | 0.3565 | 0.3495 |
+| 0.1-0.2%  | **0.5748** | 0.5404 | 0.4027 | 0.4080 | 0.3967 |
+| 0.2-0.5%  | **0.6205** | 0.5867 | 0.4753 | 0.4688 | 0.4530 |
+| 0.5-1%    | **0.6599** | 0.6305 | 0.5446 | 0.5342 | 0.5150 |
+| 1-2%      | **0.6749** | 0.6475 | 0.5799 | 0.5694 | 0.5494 |
+| 2-5%      | **0.6648** | 0.6403 | 0.5853 | 0.5753 | 0.5567 |
+| 5-10%     | **0.6822** | 0.6589 | 0.6187 | 0.6084 | 0.5909 |
+| 10-20%    | **0.7361** | 0.7107 | 0.6856 | 0.6720 | 0.6538 |
+| 20-50%    | **0.6657** | 0.6503 | 0.6394 | 0.6249 | 0.6084 |
+| OVERALL   | **0.6209** | 0.5916 | 0.4957 | 0.4947 | 0.4802 |
+| per-sample mean | **0.9016** | 0.8842 | 0.8320 | 0.8158 | 0.8066 |
 
 ## Table S11b. MESA per-sample R² by self-reported ancestry (source data for Figure 3b)
 
 Per-sample mean R² over the labelled MESA samples imputed against the TOPMed panel (chr20, full
 phase-and-impute pipeline, Selphi 2 at its panel-adaptive mc = 132,676; Beagle 5.5 at its
-defaults). 3,948 of the 5,000 samples carry an ancestry label. Bold marks the higher value.
+defaults; both scored on the same panel-polymorphic sites). 3,948 of the 5,000 samples carry an ancestry label. Bold marks the higher value.
 
 | Group (n) | Selphi 2 | Beagle 5.5 | Δ |
 |---|---:|---:|---:|
-| African-American (924) | **0.8976** | 0.8733 | +0.0243 |
-| Hispanic (859) | **0.9018** | 0.8763 | +0.0255 |
-| White (1,631) | **0.9066** | 0.8835 | +0.0231 |
-| Chinese-American (534) | **0.8975** | 0.8600 | +0.0375 |
+| African-American (924) | **0.8972** | 0.8823 | +0.0149 |
+| Hispanic (859) | **0.9016** | 0.8853 | +0.0163 |
+| White (1,631) | **0.9064** | 0.8908 | +0.0155 |
+| Chinese-American (534) | **0.8982** | 0.8657 | +0.0324 |
 
-## Table S12. Selphi 2 vs Selphi 1.5.3, per-MAF (1KG Phase 3, impute-only)
+## Table S12. Selphi 2 vs Selphi 1.5.3
 
-Both tools imputed the identical phased target (801 held-out samples) against the identical 1000
-Genomes Phase 3 panel, impute-only, the mode in which the original Selphi 1.5.3, which requires
-pre-phased input, is run, and scored on imputed-only sites. This isolates the imputer from
-phasing. Selphi 2 matches or exceeds Selphi 1.5.3 overall and at every bin from the rarest through
-low frequency; at the most common bins the two are within ≈0.001 (seed-level noise). Bold marks the
-higher value in each chromosome group.
-
-| MAF | chr22 Selphi 2 | chr22 Selphi 1.5.3 | chr1 Selphi 2 | chr1 Selphi 1.5.3 |
-|---|---:|---:|---:|---:|
-| 0.05-0.1% | **0.2661** | 0.2502 | **0.3453** | 0.3321 |
-| 0.1-0.2%  | **0.3166** | 0.3051 | **0.4014** | 0.3910 |
-| 0.2-0.5%  | **0.4160** | 0.4064 | **0.5019** | 0.4944 |
-| 0.5-1%    | **0.5033** | 0.4986 | **0.6077** | 0.6036 |
-| 1-2%      | **0.5702** | 0.5696 | **0.6759** | 0.6745 |
-| 2-5%      | 0.6749 | **0.6753** | 0.7521 | **0.7528** |
-| 5-10%     | 0.7588 | **0.7598** | 0.8485 | **0.8497** |
-| 10-20%    | 0.7962 | **0.7972** | 0.8999 | **0.9007** |
-| 20-50%    | 0.8418 | **0.8432** | 0.9305 | **0.9312** |
-| OVERALL   | **0.4776** | 0.4703 | **0.5643** | 0.5581 |
+The per-MAF 1000 Genomes comparison of the two Selphi versions printed in earlier drafts was
+scored with an evaluator that dropped, separately for each tool, sites where its dosage was
+constant, and before sites monomorphic in the panel were excluded. Selphi 1.5.3's 1000 Genomes
+outputs were not retained, so that comparison could not be re-scored on the common site set and
+is withdrawn. The two versions are compared on identical sites with one evaluator on the
+consumer arrays (Table 5: at equal phasing, SNP R² 0.9601 against 0.9599, indel 0.7911 against
+0.7932) and on MESA × TOPMed (Table S11: overall 0.6209 against 0.4957).
 
 ## Table S13. Per-MAF imputation R² versus effective population size (1KG Phase 3 chr22)
 
 801 held-out samples, impute-only against the 4,802-haplotype panel, at a fixed base effective
-population size (`--est-ne`). The panel-adaptive formula selects Ne = 36.4 × n_ref ≈ 175,000 for
-this panel (the "auto" row, byte-identical to the Ne = 175,000 row). Overall R² is maximised at
-the formula's value; rare variants favour a lower Ne (≈50,000) and common variants a higher one
-(≈350,000), so the formula's choice balances the rare-common tradeoff. Bold marks each column's
-maximum.
+population size (`--est-ne`), scored on the 1,016,325 panel-polymorphic sites. The
+panel-adaptive formula selects Ne = 36.4 × n_ref ≈ 175,000 for this panel (the "auto" row,
+identical to the Ne = 175,000 row). Overall R² is highest at the formula's value; rare variants
+favour a lower Ne (≈50,000) and common variants a higher one (≈350,000), so the formula's
+choice balances the rare-common tradeoff. Bold marks each column's maximum.
 
 | Ne | 0.05-0.1% (rare) | 0.5-1% | 2-5% | 20-50% (common) | OVERALL |
 |---|---:|---:|---:|---:|---:|
-| 20,000 | 0.2687 | 0.4884 | 0.6603 | 0.8312 | 0.4696 |
-| 50,000 | **0.2696** | 0.4959 | 0.6671 | 0.8361 | 0.4742 |
-| 100,000 | 0.2688 | 0.5009 | 0.6719 | 0.8396 | 0.4769 |
-| 175,000 (formula / auto) | 0.2661 | **0.5033** | 0.6749 | 0.8418 | **0.4776** |
-| 350,000 | 0.2587 | 0.5026 | **0.6762** | **0.8430** | 0.4749 |
-| 700,000 | 0.2452 | 0.4963 | 0.6741 | 0.8424 | 0.4670 |
-| 1,400,000 | 0.2282 | 0.4858 | 0.6690 | 0.8403 | 0.4554 |
+| 20,000 | 0.2633 | 0.4897 | 0.6610 | 0.8320 | 0.4672 |
+| 50,000 | **0.2650** | 0.4972 | 0.6678 | 0.8369 | 0.4723 |
+| 100,000 | 0.2647 | 0.5020 | 0.6727 | 0.8403 | 0.4753 |
+| 175,000 (formula / auto) | 0.2626 | **0.5043** | 0.6756 | 0.8424 | **0.4761** |
+| 350,000 | 0.2554 | 0.5033 | **0.6768** | **0.8436** | 0.4733 |
+| 700,000 | 0.2421 | 0.4969 | 0.6745 | 0.8430 | 0.4654 |
