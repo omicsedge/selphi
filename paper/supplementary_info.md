@@ -6,8 +6,8 @@ Panel: 1KG Phase 3, 4,802 haplotypes. Targets: 801 held-out samples, chr22 and c
 PHASED = impute-only (phased input, both tools given the same phasing); UNPHASED = full
 phase-plus-impute pipeline, both tools in one session. Reference: Beagle 5.5 (03Oct25), given a
 bref3 file built from the same SRP. Every value scored by one evaluator on the same sites, the
-untyped sites polymorphic in the panel (1,016,325 on chr22, 5,482,279 on chr1); MAF bins by
-frequency in the 801 truth genomes.
+untyped sites polymorphic in the panel (1,016,325 on chr22, 5,482,279 on chr1; Beagle's phased-input
+output lacks 2 and 21 of them); MAF bins by frequency in the 801 truth genomes.
 
 | Chr | Mode | Bin | Selphi 2 R² | Beagle 5.5 R² | Winner |
 |---|---|---|---:|---:|---|
@@ -355,7 +355,7 @@ Reference: Beagle 5.5, SHAPEIT5 v5.1.1.
 
 ## Table S6. Speed & memory
 
-16 threads unless noted. Array rows: Selphi 2 (shipped binary) and Beagle 5.5 timed in the same session, one job at a time, with the panel in the page cache; ranges are over repeated runs. Beagle's MESA time is from the same workstation on 7 October 2026 (Table 7 caption).
+16 threads unless noted. Array rows: Selphi 2 (shipped binary) and Beagle 5.5 timed in the same session (except MESA), one job at a time, with the panel in the page cache; ranges are over repeated runs. Beagle's MESA time is from the same workstation on 7 October 2026 (Table 7 caption).
 
 | Benchmark | Metric | Selphi 2 | Reference | Winner |
 |---|---|---:|---:|---|
@@ -414,7 +414,7 @@ imputation and the accuracy gain comes from the imputer.
 
 | Phasing / Imputer | chr22 Beagle | chr22 Selphi | chr1 Beagle | chr1 Selphi |
 |---|---:|---:|---:|---:|
-| Selphi 2  | 0.4690 | **0.4823** | 0.5589 | **0.5720** |
+| Selphi 2  | **0.4690** | **0.4823** | **0.5589** | **0.5720** |
 | Beagle 5.5 | 0.4666 | 0.4796 | 0.5560 | 0.5690 |
 | SHAPEIT5  | 0.4665 | 0.4807 | 0.5566 | 0.5701 |
 
@@ -495,7 +495,8 @@ MESA cohort (5,000 samples, chr20) imputed against the TOPMed Freeze 8 panel (17
 haplotypes), all tools scored by one evaluator on the same 11,085,368 panel-polymorphic sites.
 Selphi 2 uses its panel-adaptive candidate set (mc = 132,676) and its own phasing; Beagle 5.5
 its full pipeline at defaults; IMPUTE5 (L = 4 conditioning states), Minimac4 (block-based state
-reduction) and Selphi 1.5.3 at their defaults. Selphi 2 leads every tool in every MAF bin.
+reduction) and Selphi 1.5.3 at their defaults, impute-only from an external phasing of the same target
+(outputs from an earlier run, re-scored here). Selphi 2 leads every tool in every MAF bin.
 
 | MAF | Selphi 2 | Beagle 5.5 | Selphi 1.5.3 | IMPUTE5 | Minimac4 |
 |---|---:|---:|---:|---:|---:|
