@@ -4,7 +4,7 @@
   2. Times New Roman everywhere (docDefaults + every style + every run);
   3. body justified; figure images centered; figure captions centered + 10pt;
   4. tables: full width, grey borders, grey bold header + zebra grey rows,
-     cells centred (H+V), header & data 10pt;
+     cells centred (H+V), 10pt (smaller for many-column tables), widths by content;
   5. in-text citation superscripts -> blue clickable hyperlinks to the matching
      reference (multi-cites like "7,8" link each number separately).
 Usage: python3 postprocess_docx.py in.docx out.docx
@@ -60,7 +60,29 @@ base = (doc.styles["Normal"].font.size or Pt(12)) if "Normal" in [s.name for s i
 cap_sz = Pt(max(9, int(base.pt) - 2))
 
 def has_image(p): return len(p._p.findall('.//' + W('drawing'))) > 0
-def is_caption(p): return p.text.strip().startswith(("Figure 1.", "Figure 2.", "Figure 3.", "Figure 4."))
+CAP_RE = re.compile(r"^(Supplementary )?(Figure|Table) S?\d+[a-z]?\.")
+_body_children = list(doc.element.body)
+_small_ids = set()
+for _i, _el in enumerate(_body_children):
+    if _el.tag != W('tbl'): continue
+    _j = _i - 1                                   # caption paragraph(s) directly above a table
+    while _j >= 0 and _body_children[_j].tag == W('p') and ptext(_body_children[_j]).strip():
+        _st = _body_children[_j].find(W('pPr'))
+        _sty = _st.find(W('pStyle')).get(W('val')) if (_st is not None and _st.find(W('pStyle')) is not None) else ''
+        if _sty.startswith('Heading'): break
+        _small_ids.add(id(_body_children[_j])); _j -= 1
+        break
+    _j = _i + 1                                   # notes directly below a table (footnotes, block quotes)
+    while _j < len(_body_children) and _body_children[_j].tag == W('p'):
+        _t = ptext(_body_children[_j]).strip()
+        _st = _body_children[_j].find(W('pPr'))
+        _sty = _st.find(W('pStyle')).get(W('val')) if (_st is not None and _st.find(W('pStyle')) is not None) else ''
+        if _t.startswith(('*', '\u2020')) or 'Block' in _sty:
+            _small_ids.add(id(_body_children[_j])); _j += 1
+        else:
+            break
+def is_caption(p):
+    return bool(CAP_RE.match(p.text.strip())) or id(p._p) in _small_ids
 def set_run(r, size=None, bold=None, white=False):
     set_fonts(r._element.get_or_add_rPr())
     if size is not None: r.font.size = size
@@ -74,7 +96,7 @@ for p in doc.paragraphs:
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER; nimg += 1
         for r in p.runs: set_run(r)
     elif is_caption(p):
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER; ncap += 1
+        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY; ncap += 1
         for r in p.runs: set_run(r, size=cap_sz)
     else:
         p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY; njust += 1
@@ -105,45 +127,86 @@ except Exception:
     usable_tw = 9360
 if not usable_tw or usable_tw < 3000:
     usable_tw = 9360
-FLOOR = 720  # min column width (~0.5 in) so short numeric/label cells don't wrap
+PORTRAIT = (12240, 15840); MARG = 1440               # US Letter, 1 in margins (twips)
+LANDSCAPE_TW = PORTRAIT[1] - 2 * MARG
 
-CHARW = 105  # ~twips per char at 10pt Times; PAD = cell L/R margins + slack
-def col_metrics(t):
+def col_layout(t, avail):
+    """Font size, cell margin and column widths (twips) so the table fits the text width:
+    every column at least as wide as its longest word (no mid-word breaks), the remaining
+    width shared in proportion to how much each column would need to avoid wrapping."""
     ncol = len(t.rows[0].cells)
-    data_ml = [0] * ncol     # longest DATA cell (drives width; headers may wrap)
-    word_ml = [0] * ncol     # longest single word (so headers wrap at spaces, not mid-word)
+    data_ml = [0] * ncol; word_ml = [0] * ncol
     for ri, row in enumerate(t.rows):
-        for ci, cell in enumerate(row.cells):
-            if ci >= ncol: continue
+        for ci, cell in enumerate(row.cells[:ncol]):
             txt = cell.text.strip()
-            if ri > 0:
-                data_ml[ci] = max(data_ml[ci], len(txt))
-            for wd in txt.split():
-                word_ml[ci] = max(word_ml[ci], len(wd))
-    nat = [max(data_ml[i], word_ml[i]) * CHARW + 260 for i in range(ncol)]  # no-wrap on data
-    wide = [data_ml[i] > 20 for i in range(ncol)]   # text columns (by DATA) get the remainder
-    if any(wide):
-        narrow_sum = sum(nat[i] for i in range(ncol) if not wide[i])
-        rem = max(usable_tw - narrow_sum, 1600 * sum(wide))
-        wtot = sum(data_ml[i] for i in range(ncol) if wide[i]) or 1
-        cw = [ (int(rem * data_ml[i] / wtot) if wide[i] else nat[i]) for i in range(ncol) ]
-    else:                                            # all short: scale naturals to fill the page
-        tot = sum(nat) or 1
-        cw = [int(usable_tw * n / tot) for n in nat]
-    cw = [max(c, FLOOR) for c in cw]
-    cw[data_ml.index(max(data_ml))] += usable_tw - sum(cw)   # widest-data column absorbs slack
-    return data_ml, cw
+            if ri > 0: data_ml[ci] = max(data_ml[ci], len(txt))
+            for wd in txt.split(): word_ml[ci] = max(word_ml[ci], len(wd))
+    for size in (10, 9, 8, 7.5, 7):
+        mar = 100 if ncol <= 6 else 60                 # left/right cell margin (twips)
+        charw = 108 * size / 10.0                      # ~twips per character, Times New Roman
+        pad = 2 * mar + 40
+        mins = [int(word_ml[i] * charw + pad) for i in range(ncol)]
+        nats = [int(max(data_ml[i], word_ml[i]) * charw + pad) for i in range(ncol)]
+        if sum(mins) <= avail: break
+    if sum(nats) <= avail:                             # nothing wraps: share the slack by content
+        tot = sum(nats); cw = [int(avail * n / tot) for n in nats]
+    else:                                              # some wrap: grow from the minimum by need
+        need = [nats[i] - mins[i] for i in range(ncol)]; tn = sum(need) or 1
+        rem = max(avail - sum(mins), 0)
+        cw = [mins[i] + int(rem * need[i] / tn) for i in range(ncol)]
+    cw[-1] += avail - sum(cw)
+    return data_ml, cw, Pt(size), mar, sum(mins) <= avail
+
+def sect_pr(landscape):
+    sp = OxmlElement('w:sectPr')
+    pg = OxmlElement('w:pgSz')
+    w, h = (PORTRAIT[1], PORTRAIT[0]) if landscape else PORTRAIT
+    pg.set(W('w'), str(w)); pg.set(W('h'), str(h))
+    if landscape: pg.set(W('orient'), 'landscape')
+    sp.append(pg)
+    mg = OxmlElement('w:pgMar')
+    for k in ('top', 'right', 'bottom', 'left'): mg.set(W(k), str(MARG))
+    for k in ('header', 'footer', 'gutter'): mg.set(W(k), '0' if k == 'gutter' else '720')
+    sp.append(mg)
+    return sp
+
+def section_break_after(el, landscape):
+    """Insert an empty paragraph after `el` that ends a section with the given orientation."""
+    np_ = OxmlElement('w:p'); ppr = OxmlElement('w:pPr'); ppr.append(sect_pr(landscape)); np_.append(ppr)
+    el.addnext(np_); return np_
+
+# the document's final section: explicit portrait Letter
+_bs = doc.element.body.find(W('sectPr'))
+if _bs is not None: doc.element.body.remove(_bs)
+doc.element.body.append(sect_pr(False))
+nland = 0
 
 ntab = 0
 for t in doc.tables:
     t.alignment = WD_TABLE_ALIGNMENT.CENTER; t.autofit = False
     full_width_and_borders(t)
-    ml, cw = col_metrics(t); ncol = len(cw)
+    ml, cw, tsz, mar, fits = col_layout(t, usable_tw)
+    if not fits:                                   # too many columns for a portrait page
+        ml, cw, tsz, mar, fits = col_layout(t, LANDSCAPE_TW)
+        tel = t._tbl; start = tel.getprevious()     # caption paragraph goes with the table
+        end = tel
+        while end.getnext() is not None and end.getnext().tag == W('p') and id(end.getnext()) in _small_ids:
+            end = end.getnext()
+        before = start.getprevious() if start is not None and start.tag == W('p') else tel.getprevious()
+        section_break_after(before, landscape=False)
+        section_break_after(end, landscape=True)
+        nland += 1
+    ncol = len(cw)
     tblPr = t._tbl.tblPr
     for e in tblPr.findall(W('tblLayout')): tblPr.remove(e)
     tl = OxmlElement('w:tblLayout'); tl.set(W('type'), 'fixed'); tblPr.append(tl)
     for e in tblPr.findall(W('tblW')): tblPr.remove(e)
     tw = OxmlElement('w:tblW'); tw.set(W('type'), 'dxa'); tw.set(W('w'), str(sum(cw))); tblPr.append(tw)
+    for e in tblPr.findall(W('tblCellMar')): tblPr.remove(e)
+    cm = OxmlElement('w:tblCellMar')
+    for side, v in (('top', 30), ('left', mar), ('bottom', 30), ('right', mar)):
+        el = OxmlElement(f'w:{side}'); el.set(W('w'), str(v)); el.set(W('type'), 'dxa'); cm.append(el)
+    tblPr.append(cm)
     grid = t._tbl.find(W('tblGrid'))
     if grid is not None:
         for i, gc in enumerate(grid.findall(W('gridCol'))):
@@ -157,11 +220,12 @@ for t in doc.tables:
             cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
             tcPr = cell._tc.get_or_add_tcPr()
             for e in tcPr.findall(W('tcW')): tcPr.remove(e)
-            cwe = OxmlElement('w:tcW'); cwe.set(W('type'), 'dxa'); cwe.set(W('w'), str(cw[ci] if ci < ncol else FLOOR)); tcPr.append(cwe)
+            cwe = OxmlElement('w:tcW'); cwe.set(W('type'), 'dxa'); cwe.set(W('w'), str(cw[ci] if ci < ncol else 300)); tcPr.append(cwe)
             align = WD_ALIGN_PARAGRAPH.LEFT if (not header and ci < ncol and left_col[ci]) else WD_ALIGN_PARAGRAPH.CENTER
             for p in cell.paragraphs:
                 p.alignment = align
-                for r in p.runs: set_run(r, size=TABLE_SZ, bold=True if header else None, white=header)
+                pf = p.paragraph_format; pf.space_before = Pt(0); pf.space_after = Pt(0)
+                for r in p.runs: set_run(r, size=tsz, bold=True if header else None, white=header)
     ntab += 1
 
 # --- 5. citation superscripts -> blue clickable links to the references ---
@@ -233,5 +297,5 @@ for p in paras:
         break
 
 doc.save(outp)
-print(f"bookmarks removed: {nbk}; font->{FONT}; images centered: {nimg}; justified: {njust}; "
+print(f"landscape tables: {nland}; bookmarks removed: {nbk}; font->{FONT}; images centered: {nimg}; justified: {njust}; "
       f"captions {cap_sz.pt:.0f}pt: {ncap}; tables: {ntab}; ref anchors: {nref}; citation links: {nlink}; supp page-break: {npb}")
