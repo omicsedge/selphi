@@ -2,23 +2,37 @@
 
 ## Table S1. Imputation accuracy (R²) - 1KG Phase 3, chip to WGS
 
-Panel: 1KG Phase 3, 4802 haps. Targets: 801 samples, chr22 (1.07 M variants) and
-chr1 (5.77 M variants). 16 threads. PHASED = impute-only (input phased); UNPHASED =
-full phase+impute pipeline. Reference: Beagle 5.5 (03Oct25).
+Panel: 1KG Phase 3, 4,802 haplotypes. Targets: 801 held-out samples, chr22 and chr1. 16 threads.
+PHASED = impute-only (phased input, both tools given the same phasing); UNPHASED = full
+phase-plus-impute pipeline, both tools in one session. Reference: Beagle 5.5 (03Oct25), given a
+bref3 file built from the same SRP. Every value scored by one evaluator on the same sites, the
+untyped sites polymorphic in the panel (1,016,325 on chr22, 5,482,279 on chr1); MAF bins by
+frequency in the 801 truth genomes.
 
 | Chr | Mode | Bin | Selphi 2 R² | Beagle 5.5 R² | Winner |
 |---|---|---|---:|---:|---|
-| 22 | phased  | OVERALL  | **0.4782** | 0.4680 | Selphi |
-| 22 | unphased | OVERALL  | **0.4884** | 0.4727 | Selphi |
-| 22 | phased  | per-sample mean | **0.9155** | 0.9077 | Selphi |
-| 22 | phased  | 0.05-0.1% | 0.2665 | **0.2672** | reference |
-| 22 | phased  | 0.5-1%  | **0.5045** | 0.4850 | Selphi |
+| 22 | phased  | OVERALL  | **0.4761** | 0.4633 | Selphi |
+| 22 | phased  | per-sample mean | **0.9166** | 0.9088 | Selphi |
+| 22 | phased  | 0.05-0.1% | **0.2626** | 0.2583 | Selphi |
+| 22 | phased  | 0.1-0.2% | **0.3156** | 0.3062 | Selphi |
+| 22 | phased  | 0.5-1%  | **0.5043** | 0.4847 | Selphi |
 | 22 | phased  | 20-50%  | **0.8424** | 0.8313 | Selphi |
-| 1 | phased  | OVERALL  | **0.5649** | 0.5571 | Selphi |
-| 1 | unphased | OVERALL  | **0.5777** | 0.5640 | Selphi |
-| 1 | phased  | 0.05-0.1% | 0.3454 | **0.3495** | reference |
-| 1 | phased  | 0.5-1%  | **0.6087** | 0.5912 | Selphi |
-| 1 | phased  | 20-50%  | **0.9305** | 0.9249 | Selphi |
+| 22 | unphased | OVERALL  | **0.4864** | 0.4666 | Selphi |
+| 22 | unphased | per-sample mean | **0.9175** | 0.9062 | Selphi |
+| 22 | unphased | 0.05-0.1% | **0.2800** | 0.2673 | Selphi |
+| 1 | phased  | OVERALL  | **0.5624** | 0.5510 | Selphi |
+| 1 | phased  | per-sample mean | **0.9572** | 0.9529 | Selphi |
+| 1 | phased  | 0.05-0.1% | **0.3405** | 0.3370 | Selphi |
+| 1 | phased  | 0.1-0.2% | **0.3999** | 0.3880 | Selphi |
+| 1 | phased  | 0.5-1%  | **0.6085** | 0.5910 | Selphi |
+| 1 | phased  | 20-50%  | **0.9311** | 0.9249 | Selphi |
+| 1 | unphased | OVERALL  | **0.5755** | 0.5558 | Selphi |
+| 1 | unphased | per-sample mean | **0.9579** | 0.9518 | Selphi |
+| 1 | unphased | 0.05-0.1% | **0.3624** | 0.3466 | Selphi |
+
+Selphi 2 leads Beagle 5.5 in all nine MAF bins in all four chromosome-by-mode cells. Earlier
+drafts reported Beagle 5.5 narrowly ahead in the rarest phased bin; that came from an evaluator
+that dropped, separately for each tool, the sites where its dosage was constant (Methods).
 
 ## Table S2. Imputation accuracy (R²) - biobank-scale MESA × TOPMed
 
@@ -341,19 +355,20 @@ Reference: Beagle 5.5, SHAPEIT5 v5.1.1.
 
 ## Table S6. Speed & memory
 
-16 threads unless noted. Wall as reported by the source benchmark.
+16 threads unless noted. Array rows: Selphi 2 (shipped binary) and Beagle 5.5 timed in the same session, one job at a time, with the panel in the page cache; ranges are over repeated runs. Beagle's MESA time is from the same workstation on 7 October 2026 (Table 7 caption).
 
 | Benchmark | Metric | Selphi 2 | Reference | Winner |
 |---|---|---:|---:|---|
-| GIAB chr21, 6s, 75,552-haplotype panel, impute-only | wall | 6.9 s | Beagle 5: **6.7 s** | tie |
-| GIAB chr21, 6s, 75,552-haplotype panel, impute-only | peak RAM | **3.2 GB** | Beagle 5: 7.0 GB | Selphi |
-| GIAB chr1, 6s, 75,552-haplotype panel, impute-only | wall | 40.1 s | Beagle 5: **24.9 s** | reference |
-| GIAB chr1, 6s, 75,552-haplotype panel, impute-only | peak RAM | **7.2 GB** | Beagle 5: 16.8 GB | Selphi |
-| chr22 1KG 801s, chip to WGS | wall (phased/unphased) | 59 s / 114 s | Beagle 5.5: 58 s / 84 s | tie (phased) / reference (unphased) |
-| chr22 1KG 801s, chip to WGS | peak RAM | **9.9 / 14.4 GB** | Beagle 5.5: 21.7 / 14.6 GB | Selphi |
-| chr1 1KG 801s, chip to WGS | wall (phased/unphased) | 315 s / 623 s | Beagle 5.5: 207 s / 321 s | reference |
-| TOPMed MESA 5K chr20 (171K-hap, 17.9M var), full pipeline | wall | 10,787 s (~3.0 h) | Beagle 5.5: 4,148 s | reference |
-| TOPMed MESA 5K chr20 | peak RAM | **79.4 GB** | Beagle 5.5: 96.5 GB | Selphi |
+| GIAB chr21, 6s, 75,552-haplotype panel, impute-only | wall | **6.6-7.2 s** | Beagle 5.5: 11.4-12.3 s (15.4 s cold) | Selphi |
+| GIAB chr21, 6s, 75,552-haplotype panel, impute-only | peak RAM | **3.2 GB** | Beagle 5.5: 7.4-9.5 GB | Selphi |
+| GIAB chr1, 6s, 75,552-haplotype panel, impute-only | wall | **38.2-41.3 s** | Beagle 5.5: 43.7-45.4 s (95.2 s cold) | Selphi |
+| GIAB chr1, 6s, 75,552-haplotype panel, impute-only | peak RAM | **6.5-6.9 GB** | Beagle 5.5: 21-44 GB | Selphi |
+| chr22 1KG 801s, chip to WGS | wall (phased / unphased) | **55 s** / 112 s | Beagle 5.5: 62 s / **81 s** | Selphi (phased) / reference (unphased) |
+| chr22 1KG 801s, chip to WGS | peak RAM (phased / unphased) | **9.5** / 13.9 GB | Beagle 5.5: 16.2-21.7 / **12.5 GB** | Selphi (phased) / reference (unphased) |
+| chr1 1KG 801s, chip to WGS | wall (phased / unphased) | 296 s / 602 s | Beagle 5.5: **207 s / 321 s** | reference |
+| chr1 1KG 801s, chip to WGS | peak RAM (phased / unphased) | **15.5** / 21.6 GB | Beagle 5.5: 23.4-25.5 / **16.9 GB** | Selphi (phased) / reference (unphased) |
+| TOPMed MESA 5K chr20 (171K-hap, 17.9M var), full pipeline | wall | 9,047 s (2.5 h) | Beagle 5.5: **6,728 s** | reference |
+| TOPMed MESA 5K chr20 | peak RAM | **82.0 GB** | Beagle 5.5: 91.0 GB | Selphi |
 | lcWGS whole-chr22, 1 sample @1× (= Fig 4a, downsampled cluster) | wall | **105-109 s** | GLIMPSE2: 278 s (chunk + phase + ligate); QUILT2: 1,701 s | Selphi |
 | lcWGS capture library chr22, 1 sample, native `--bam` + BAQ, BAM in to imputed VCF out (= Fig 4a, capture cluster) | wall | **101 s** | GLIMPSE2: 334 s (chunk + phase + ligate) | Selphi |
 | lcWGS capture library chr22, 1 sample, native `--bam` + BAQ | peak RAM | 4.9 GB | GLIMPSE2: **2.1 GB** | reference |
@@ -427,34 +442,34 @@ scaffold threshold sends every variant with a minor-allele count of four or fewe
 rare-variant pass, so the panel-wide effect of that rule is larger here than on any smaller
 cohort we measured.
 
-## Table S9. Genome-wide per-MAF R² underlying Figure 3a (1KG, five-way, imputation-only)
+## Table S9. Genome-wide per-MAF R² underlying Figure 3a (1KG, four-way, imputation-only)
 
 Source data for Figure 3a: n-weighted imputation R² by MAF bin, aggregated genome-wide
 across 20 autosomes (chromosomes 8 and 11 excluded because Beagle aborted on a duplicate
 panel marker, so all tools span the identical chromosome set). 801 held-out 1000 Genomes
 samples imputed against the 1000 Genomes Phase 3 panel (2,401 samples / 4,802 haplotypes
-per chromosome), scored against WGS truth. This is a like-for-like **imputation-only**
-comparison: every tool receives the *identical* phased target haplotypes (the same input
-file) and the same reference panel, so the figure isolates the imputation step. All five
-tools impute directly from the supplied phasing; because the target is fully phased and
-contains no missing genotypes, Beagle 5.5 likewise imputes without re-estimating phase, so
-every row reflects imputation from identical input haplotypes. Bold marks the per-row maximum. Selphi 2's full phase-and-
-impute pipeline (its own internal phasing) reaches a higher genome-wide overall R² of
-0.5963 (Table 3; Results); the 0.5814 here is Selphi 2 imputing from the shared external
-phasing. The OVERALL row matches the genome-wide aggregate reported in Results.
+per chromosome), scored against WGS truth by one evaluator on the same sites, the untyped
+sites polymorphic in the panel (60,289,940 for Selphi 2 and 60,289,950 for the other tools;
+Selphi 2 omits 10 sites). This is a like-for-like **imputation-only** comparison: every tool
+receives the identical phased target haplotypes (the same input file) and the same reference
+panel; because the target is fully phased and contains no missing genotypes, Beagle 5.5
+likewise imputes without re-estimating phase. Selphi 1.5.3, shown in earlier drafts, is not
+included: its outputs were not retained, so it could not be scored on this site set. Bold
+marks the per-row maximum. Selphi 2's full phase-and-impute pipeline is compared genome-wide
+with Beagle 5.5's in the Results.
 
-| MAF | Selphi 2 | Selphi 1.5.3 | Beagle 5.5 | Minimac4 | IMPUTE5 |
-|---|---:|---:|---:|---:|---:|
-| 0.05-0.1% | 0.3531 | 0.3375 | **0.3570** | 0.3529 | 0.3458 |
-| 0.1-0.2%  | **0.4232** | 0.4106 | 0.4151 | 0.4132 | 0.4062 |
-| 0.2-0.5%  | **0.5245** | 0.5149 | 0.5092 | 0.5048 | 0.5005 |
-| 0.5-1%    | **0.6260** | 0.6207 | 0.6083 | 0.6013 | 0.5991 |
-| 1-2%      | **0.6920** | 0.6898 | 0.6742 | 0.6663 | 0.6654 |
-| 2-5%      | 0.7627 | **0.7629** | 0.7460 | 0.7367 | 0.7381 |
-| 5-10%     | 0.8532 | **0.8539** | 0.8414 | 0.8323 | 0.8355 |
-| 10-20%    | 0.8968 | **0.8973** | 0.8885 | 0.8803 | 0.8840 |
-| 20-50%    | 0.9259 | **0.9262** | 0.9196 | 0.9112 | 0.9160 |
-| OVERALL   | **0.5814** | 0.5739 | 0.5739 | 0.5668 | 0.5635 |
+| MAF | Selphi 2 | Beagle 5.5 | Minimac4 | IMPUTE5 |
+|---|---:|---:|---:|---:|
+| 0.05-0.1% | 0.3479 | 0.3434 | **0.3491** | 0.3440 |
+| 0.1-0.2%  | **0.4206** | 0.4088 | 0.4111 | 0.4052 |
+| 0.2-0.5%  | **0.5238** | 0.5076 | 0.5042 | 0.5002 |
+| 0.5-1%    | **0.6259** | 0.6080 | 0.6012 | 0.5990 |
+| 1-2%      | **0.6920** | 0.6742 | 0.6663 | 0.6654 |
+| 2-5%      | **0.7627** | 0.7460 | 0.7367 | 0.7381 |
+| 5-10%     | **0.8532** | 0.8414 | 0.8323 | 0.8355 |
+| 10-20%    | **0.8968** | 0.8885 | 0.8803 | 0.8840 |
+| 20-50%    | **0.9259** | 0.9196 | 0.9112 | 0.9160 |
+| OVERALL   | **0.5788** | 0.5673 | 0.5648 | 0.5626 |
 
 ## Table S10. Component ablation (1KG chromosome 22, 801 held-out samples)
 
