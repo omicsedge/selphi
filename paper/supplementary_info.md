@@ -44,11 +44,11 @@ Table S11b and Table 4b, and the 500-sample candidate-size ablation in Table 4.
 
 | Cohort | `mc` | Metric | Selphi 2 R² | Beagle 5.5 R² | Winner |
 |---|---|---|---:|---:|---|
-| MESA 5K | 132,676 (auto) | OVERALL | **0.6209** | 0.5916 | Selphi |
-| MESA 5K | 132,676 (auto) | per-sample mean | **0.9016** | 0.8842 | Selphi |
-| MESA 5K | 132,676 (auto) | 0.05-0.1% (rarest) | **0.5300** | 0.4956 | Selphi |
+| MESA 5K | 132,676 (auto) | OVERALL | **0.6210** | 0.5916 | Selphi |
+| MESA 5K | 132,676 (auto) | per-sample mean | **0.9019** | 0.8842 | Selphi |
+| MESA 5K | 132,676 (auto) | 0.05-0.1% (rarest) | **0.5304** | 0.4956 | Selphi |
 | MESA 5K | 132,676 (auto) | 0.5-1% | **0.6599** | 0.6305 | Selphi |
-| MESA 5K | 132,676 (auto) | 20-50% | **0.6657** | 0.6503 | Selphi |
+| MESA 5K | 132,676 (auto) | 20-50% | **0.6658** | 0.6503 | Selphi |
 | MESA 5K | 2,500 (fixed) | OVERALL | 0.5725 | **0.5916** | reference |
 | MESA 5K | 2,500 (fixed) | per-sample mean | **0.8982** | 0.8842 | Selphi |
 
@@ -365,8 +365,8 @@ Reference: Beagle 5.5, SHAPEIT5 v5.1.1.
 | chr22 1KG 801s, chip to WGS | peak RAM (phased / unphased) | **9.5** / 13.9 GB | Beagle 5.5: 16.2-21.7 / **12.5 GB** | Selphi (phased) / reference (unphased) |
 | chr1 1KG 801s, chip to WGS | wall (phased / unphased) | 296 s / 602 s | Beagle 5.5: **207 s / 321 s** | reference |
 | chr1 1KG 801s, chip to WGS | peak RAM (phased / unphased) | **15.5** / 21.6 GB | Beagle 5.5: 23.4-25.5 / **16.9 GB** | Selphi (phased) / reference (unphased) |
-| TOPMed MESA 5K chr20 (171K-hap, 17.9M var), full pipeline | wall | 9,047 s (2.5 h) | Beagle 5.5: **6,728 s** | reference |
-| TOPMed MESA 5K chr20 | peak RAM | **82.0 GB** | Beagle 5.5: 91.0 GB | Selphi |
+| TOPMed MESA 5K chr20 (171K-hap, 17.9M var), full pipeline | wall | **4,381 s** (1.2 h) | Beagle 5.5: 6,728 s | Selphi |
+| TOPMed MESA 5K chr20 | peak RAM | 91.9 GB | Beagle 5.5: **91.0 GB** | tie |
 | lcWGS whole-chr22, 1 sample @1× (= Fig 4a, downsampled cluster) | wall | **105-109 s** | GLIMPSE2: 278 s (chunk + phase + ligate); QUILT2: 1,701 s | Selphi |
 | lcWGS capture library chr22, 1 sample, native `--bam` + BAQ, BAM in to imputed VCF out (= Fig 4a, capture cluster) | wall | **101 s** | GLIMPSE2: 334 s (chunk + phase + ligate) | Selphi |
 | lcWGS capture library chr22, 1 sample, native `--bam` + BAQ | peak RAM | 4.9 GB | GLIMPSE2: **2.1 GB** | reference |
@@ -485,17 +485,17 @@ reduction) and Selphi 1.5.3 at their defaults, impute-only from an external phas
 
 | MAF | Selphi 2 | Beagle 5.5 | Selphi 1.5.3 | IMPUTE5 | Minimac4 |
 |---|---:|---:|---:|---:|---:|
-| 0.05-0.1% | **0.5300** | 0.4956 | 0.3338 | 0.3565 | 0.3495 |
+| 0.05-0.1% | **0.5304** | 0.4956 | 0.3338 | 0.3565 | 0.3495 |
 | 0.1-0.2%  | **0.5748** | 0.5404 | 0.4027 | 0.4080 | 0.3967 |
 | 0.2-0.5%  | **0.6205** | 0.5867 | 0.4753 | 0.4688 | 0.4530 |
 | 0.5-1%    | **0.6599** | 0.6305 | 0.5446 | 0.5342 | 0.5150 |
-| 1-2%      | **0.6749** | 0.6475 | 0.5799 | 0.5694 | 0.5494 |
+| 1-2%      | **0.6750** | 0.6475 | 0.5799 | 0.5694 | 0.5494 |
 | 2-5%      | **0.6648** | 0.6403 | 0.5853 | 0.5753 | 0.5567 |
 | 5-10%     | **0.6822** | 0.6589 | 0.6187 | 0.6084 | 0.5909 |
-| 10-20%    | **0.7361** | 0.7107 | 0.6856 | 0.6720 | 0.6538 |
-| 20-50%    | **0.6657** | 0.6503 | 0.6394 | 0.6249 | 0.6084 |
-| OVERALL   | **0.6209** | 0.5916 | 0.4957 | 0.4947 | 0.4802 |
-| per-sample mean | **0.9016** | 0.8842 | 0.8320 | 0.8158 | 0.8066 |
+| 10-20%    | **0.7362** | 0.7107 | 0.6856 | 0.6720 | 0.6538 |
+| 20-50%    | **0.6658** | 0.6503 | 0.6394 | 0.6249 | 0.6084 |
+| OVERALL   | **0.6210** | 0.5916 | 0.4957 | 0.4947 | 0.4802 |
+| per-sample mean | **0.9019** | 0.8842 | 0.8320 | 0.8158 | 0.8066 |
 
 ## Table S11b. MESA per-sample R² by self-reported ancestry (source data for Figure 3b)
 
@@ -505,10 +505,10 @@ defaults; both scored on the same panel-polymorphic sites). 3,948 of the 5,000 s
 
 | Group (n) | Selphi 2 | Beagle 5.5 | Δ |
 |---|---:|---:|---:|
-| African-American (924) | **0.8972** | 0.8823 | +0.0149 |
-| Hispanic (859) | **0.9016** | 0.8853 | +0.0163 |
-| White (1,631) | **0.9064** | 0.8908 | +0.0155 |
-| Chinese-American (534) | **0.8982** | 0.8657 | +0.0324 |
+| African-American (924) | **0.8974** | 0.8823 | +0.0151 |
+| Hispanic (859) | **0.9022** | 0.8853 | +0.0169 |
+| White (1,631) | **0.9066** | 0.8908 | +0.0158 |
+| Chinese-American (534) | **0.8989** | 0.8657 | +0.0332 |
 
 ## Table S12. Per-MAF imputation R² versus effective population size (1KG Phase 3 chr22)
 
