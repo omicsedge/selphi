@@ -35,7 +35,7 @@ for cov in 0.5x 1x 2x 4x; do for s in HG002 HG003 HG004; do
   $S --lcwgs --refpanel panel.srp --bam ${s}_${cov}.bam --reference $REF --map $MAP --region chr22:19000000-31000000 --out $O/reg_${s}_${cov} --threads 16 > $O/reg_${s}_${cov}.log 2>&1 || echo "RESULT REG $s $cov FAILED"
   bcftools index -t -f $O/reg_${s}_${cov}.vcf.gz 2>/dev/null
 done
-python3 /data/tmp/pbwt_share_2026_09_06/rare05/shared.py $cov "{\"selphi_reg\":\"$O/reg_%s_${cov}.vcf.gz\",\"selphi_whole\":\"/data/tmp/pbwt_share_2026_09_06/rare05/%s_${cov}_$( [ $cov = 0.5x ] && echo def || echo defkeep ).vcf.gz\",\"glimpse2\":\"$T/out/glimpse_%s_${cov}.bcf\",\"quilt2\":\"$T/out/quilt_%s_${cov}.vcf.gz\"}" > $O/shared_$cov.json 2> $O/shared_$cov.err
+python3 $(dirname $(readlink -f $0))/../helpers/shared.py $cov "{\"selphi_reg\":\"$O/reg_%s_${cov}.vcf.gz\",\"selphi_whole\":\"/data/tmp/pbwt_share_2026_09_06/rare05/%s_${cov}_$( [ $cov = 0.5x ] && echo def || echo defkeep ).vcf.gz\",\"glimpse2\":\"$T/out/glimpse_%s_${cov}.bcf\",\"quilt2\":\"$T/out/quilt_%s_${cov}.vcf.gz\"}" > $O/shared_$cov.json 2> $O/shared_$cov.err
 python3 - $O/shared_$cov.json $cov <<'PY'
 import json,sys,statistics as st; j=json.load(open(sys.argv[1])); T=('selphi_reg','selphi_whole','glimpse2','quilt2')
 ov={t:st.mean(r[t]['persample_r2'] for r in j['rows']) for t in T}; ur={t:j['pooled_bins'][t]['0-0.5']['r2'] for t in T}
