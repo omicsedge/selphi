@@ -449,8 +449,8 @@ fn run_chunked_gibbs(
     // Build chunk core boundaries by cM
     let total_cm = cm[n_shared - 1] - cm[0];
     let n_chunks = ((total_cm / core_cm).ceil() as usize).max(1);
-    crate::selphi_info!(
-        "  chunked Gibbs: {:.1} cM span → {} chunks (core {:.1} cM + {:.1} cM buffer each side)",
+    crate::selphi_step!(
+        "chunked Gibbs: {:.1} cM span → {} chunks (core {:.1} cM + {:.1} cM buffer each side)",
         total_cm, n_chunks, core_cm, buffer_cm);
 
     // Two-depth common/rare SPLIT — auto-gated by panel size + coverage (see

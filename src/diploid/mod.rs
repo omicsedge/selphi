@@ -348,7 +348,7 @@ fn _diploid_run(
     // EM-estimated Ne not returned as window_ri for now (diploid uses different HMM structure)
     let window_ri = vec![];
 
-    crate::selphi_info!("  Phasing complete ({} ensemble member{})",
+    crate::selphi_debug!("  Phasing complete ({} ensemble member{})",
         scaffolds.len(), if scaffolds.len() == 1 { "" } else { "s" });
 
     (scaffolds, window_ri)

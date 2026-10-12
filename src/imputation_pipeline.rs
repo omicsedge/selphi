@@ -409,7 +409,7 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
     };
     let ref_bm_full = if want_full {
         let bm = srp.extract_ref_alleles_bitmatrix(wgs_idx);
-        selphi_step!("Ref bitmatrix extracted ({} chip × {} haps, {:.1} MB)",
+        selphi_step!("Ref bitmatrix extracted ({} target sites × {} haps, {:.1} MB)",
             n_chip, n_ref, (bm.n_words() * n_chip * 8) as f64 / 1e6);
         Some(bm)
     } else { None };
@@ -519,8 +519,13 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
             (p, w, c, Vec::new())
         }
     };
-    selphi_step!("Phasing complete: {} samples phased, {} EM windows",
-        n_samples, window_ri.len());
+    // The diploid engine estimates Ne inside its MCMC and returns no EM windows.
+    if window_ri.is_empty() {
+        selphi_step!("Phasing complete: {} samples phased", n_samples);
+    } else {
+        selphi_step!("Phasing complete: {} samples phased, {} EM windows",
+            n_samples, window_ri.len());
+    }
     PhasingResult { phased_alleles: phased, window_ri, ref_bm_full, engine, phase_conf, extra_scaffolds }
 }
 
@@ -1186,7 +1191,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // input (no phasing ran), extract now.
     let ref_bm_imp = ref_bm_from_phasing.unwrap_or_else(|| {
         let bm = srp.extract_ref_alleles_bitmatrix(&wgs_idx);
-        selphi_step!("Ref bitmatrix extracted ({} chip × {} haps, {:.1} MB)",
+        selphi_step!("Ref bitmatrix extracted ({} target sites × {} haps, {:.1} MB)",
             n_chip, n_ref, (bm.n_words() * n_chip * 8) as f64 / 1e6);
         bm
     });

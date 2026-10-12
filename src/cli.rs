@@ -57,8 +57,9 @@ pub struct Args {
     #[arg(long)]
     pub bam_list: Option<String>,
 
-    /// lcWGS: reference FASTA (with .fai) for decoding CRAM read bases.
-    /// Required when --bam/--bam-list points at .cram input; ignored for BAM.
+    /// lcWGS: reference FASTA (with .fai). With --bam/--bam-list it turns on base
+    /// alignment quality (BAQ), as bcftools mpileup does; without it BAQ is skipped.
+    /// Required for .cram input, to decode the read bases.
     #[arg(long, alias = "fasta")]
     pub reference: Option<String>,
 
