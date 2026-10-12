@@ -335,7 +335,7 @@ print("wrote figure3_accuracy.pdf/.png")
 fig2, (axl, axw, axm) = plt.subplots(1, 3, figsize=(11.5, 3.6))
 # (a) lcWGS wall time per run, whole chr22, 16 threads, log scale, two labelled clusters.
 #     Capture-library cluster (4,796-hap panel, BAM in -> imputed out), quiet machine,
-#     2026-09-02, after the shared conditioning pack (commit 9d4b398): Selphi 2 native
+#     2026-09-02, after the shared conditioning pack (commit 76af4a9): Selphi 2 native
 #     pileup 104 s (5.0 GB peak) vs GLIMPSE2 327 s for one sample; 170 s vs 389 s for six
 #     samples in one run.
 #     Downsampled cluster (1x, 6,332-hap panel, 1 sample): Selphi 115 s, GLIMPSE2 287 s

@@ -1,5 +1,5 @@
 #!/bin/bash
-# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, c9062d8) with the CSI-seek fix (f5202b5).
+# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, cb4dc9f) with the CSI-seek fix (c76055a).
 # R7b: Tables S10 (component ablation), S13 (Ne sweep) and S8 (re-phasing the panel) were produced by a pre-2026-09-11
 # binary (default 0.4776 vs the current 0.4782 of Table S1). Re-run all on the current binary, chr22, 801 samples,
 # impute-only on the phased target, same panel, scored by the same evaluator. S8 also re-runs Beagle on both panels.

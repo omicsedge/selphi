@@ -1,5 +1,5 @@
 #!/bin/bash
-# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, c9062d8) with the CSI-seek fix (f5202b5).
+# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, cb4dc9f) with the CSI-seek fix (c76055a).
 # R7d: Table S7 (phaser x imputer matrix; June source dir deleted, June binary). 1KG 801 held-out array targets (truly
 # unphased), panel = 1KG 2,401 samples (same BCF for SHAPEIT5; SRP built from it for Selphi; bref3 from that SRP for
 # Beagle). Phasers: Selphi 2 --phase-only (default diploid), Beagle 5.5 impute=false, SHAPEIT5 phase_common. Imputers:

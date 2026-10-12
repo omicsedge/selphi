@@ -1,5 +1,5 @@
 #!/bin/bash
-# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, c9062d8) with the CSI-seek fix (f5202b5).
+# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, cb4dc9f) with the CSI-seek fix (c76055a).
 # R4c: MESA x TOPMed chr20 tables (Results, Table 4b, S2 headline, S11 four imputers, S11b/Figure 3b) re-scored with the
 # corrected per-site rule. Selphi outputs kept from the Sept runs (auto = headline default, mc2500 = ablation);
 # competitors' cached outputs: Beagle 5.5 (June, same panel/target), IMPUTE5, Minimac4, Selphi 1.5.3 (selphi_impr).

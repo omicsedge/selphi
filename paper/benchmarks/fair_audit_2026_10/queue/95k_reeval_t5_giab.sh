@@ -1,5 +1,5 @@
 #!/bin/bash
-# 95k (2026-10-08): Table 5 (consumer) and GIAB (Table 7/S3) were scored with the binary before f5202b5 (CSI seek bug
+# 95k (2026-10-08): Table 5 (consumer) and GIAB (Table 7/S3) were scored with the binary before c76055a (CSI seek bug
 # could drop records at evaluation-region boundaries). Re-score the kept outputs with the fixed binary and report whether
 # each JSON is identical to the earlier one. v3 panel has no monomorphic sites (95a), so no panel filter is needed.
 set -uo pipefail

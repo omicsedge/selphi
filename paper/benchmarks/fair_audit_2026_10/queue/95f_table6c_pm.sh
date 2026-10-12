@@ -1,5 +1,5 @@
 #!/bin/bash
-# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, c9062d8) with the CSI-seek fix (f5202b5).
+# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, cb4dc9f) with the CSI-seek fix (c76055a).
 # R7c: Table 6c (does the pedigree improve downstream imputation against an independent truth?). The June source dir was
 # deleted and its Beagle arm passed `ped=`, which Beagle 5.5 does not accept. Re-run: 54 children + parents masked to GSA
 # sites; phase WITHOUT pedigree (children alone) and WITH pedigree (Selphi --ped, SHAPEIT5 --pedigree; Beagle has no
