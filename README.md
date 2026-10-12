@@ -14,7 +14,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="img/pipeline_dark.svg"/>
     <source media="(prefers-color-scheme: light)" srcset="img/pipeline_light.svg"/>
-    <img src="img/pipeline_dark.svg" alt="Selphi auto-routes each input to the right engine: the full real log runs on top while the pipeline below lights up each stage in sync (chip, WGS, low-coverage)" width="900"/>
+    <img src="img/pipeline_dark.svg" alt="Three real runs replayed line by line with the colours Selphi prints (chip array phase + impute, WGS phase-only, low-coverage BAM); the pipeline diagram below lights up each stage as its log line appears" width="900"/>
   </picture>
 </p>
 
@@ -22,7 +22,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="img/speed_dark.svg"/>
     <source media="(prefers-color-scheme: light)" srcset="img/speed_light.svg"/>
-    <img src="img/speed_dark.svg" alt="Whole-genome phasing + imputation wall time: Selphi 2 27.7 min vs Beagle 5.5 36.4 min (6 samples vs the 75,552-haplotype panel, 22 autosomes, 16 threads)" width="720"/>
+    <img src="img/speed_dark.svg" alt="Whole-genome phasing + imputation wall time: Selphi 2 18.3 min vs Beagle 5.5 29.9 min, peak memory 6.8 GB vs 41.9-55.1 GB (6 samples vs the 75,552-haplotype panel, 22 autosomes, 16 threads)" width="720"/>
   </picture>
 </p>
 
@@ -196,23 +196,23 @@ selphi --lcwgs \
   --threads 16
 ```
 
-Output is `GT:DS:GP`. The engine alternates sparse-PBWT haplotype selection with a GL-weighted Li-Stephens forward-backward (a conditional-HL diploid Gibbs sampler) and an eight-founder phasing HMM re-committed at every iteration (`LCWGS_NO_FOUNDER_PHASE=1` reverts to the older diplotype-mosaic segment commitment), processing the chromosome in cM chunks so the full panel is never held in memory. The selected set is capped at `LCWGS_KPBWT` (2,000) haplotypes per sample; with the default storage-site spacing the union of PBWT neighbours across a chunk covers nearly the whole panel and the cap, applied in haplotype-index order, keeps an almost fixed low-index subset, so the target-specific part of the conditioning set is the per-haplotype rare-carrier augmentation (`LCWGS_SEL_DIAG=1` prints the pre-cap union size). `LCWGS_QUAL_TRUNC=1` (or `g2`, GLIMPSE2's order) caps by PBWT match rank instead: it lifts the 0.5× ultra-rare bin above GLIMPSE2 but lowers other bins and 1× accuracy, so it is opt-in. The forward-backward is SIMD-accelerated and √n-checkpointed (bit-identical, ~2× faster and ~10× lower peak memory). On the default engine Selphi matches or beats GLIMPSE2 across MAF bins, winning overall and on every bin up to 2× coverage; single-sample it runs several× faster, while multi-sample whole-chromosome trades wall time for the accuracy gain. Full MAF-binned and multi-coverage numbers are in the paper. Expert knobs are exposed via `LCWGS_*` environment variables; defaults are calibrated for 1× data.
+Output is `GT:DS:GP`. The engine alternates sparse-PBWT haplotype selection with a GL-weighted Li-Stephens forward-backward (a conditional-HL diploid Gibbs sampler) and an eight-founder phasing HMM re-committed at every iteration (`LCWGS_NO_FOUNDER_PHASE=1` reverts to the older diplotype-mosaic segment commitment), processing the chromosome in cM chunks so the full panel is never held in memory. The selected set is capped at `LCWGS_KPBWT` (2,000) haplotypes per sample; with the default storage-site spacing the union of PBWT neighbours across a chunk covers nearly the whole panel and the cap, applied in haplotype-index order, keeps an almost fixed low-index subset, so the target-specific part of the conditioning set is the per-haplotype rare-carrier augmentation (`LCWGS_SEL_DIAG=1` prints the pre-cap union size). `LCWGS_QUAL_TRUNC=1` (or `g2`, GLIMPSE2's order) caps by PBWT match rank instead: it lifts the 0.5× ultra-rare bin above GLIMPSE2 but lowers other bins and 1× accuracy, so it is opt-in. The forward-backward is SIMD-accelerated and √n-checkpointed (bit-identical, ~2× faster and ~10× lower peak memory). Against GLIMPSE2 and QUILT2 on GIAB genomes downsampled to 0.5-4×, Selphi has the highest overall per-sample R² at every depth; below 0.5% MAF it trails GLIMPSE2 at 0.5×, is level at 1× and leads at 2× and 4×, and in the other frequency bins no tool leads throughout. It is 2.6× faster than GLIMPSE2 on one sample (whole chromosome 22 at 1×) and 2.3× faster on six capture libraries in one run. Full MAF-binned and multi-coverage numbers are in the paper. Expert knobs are exposed via `LCWGS_*` environment variables; defaults are calibrated for 1× data.
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="img/lcwgs_dark.svg"/>
     <source media="(prefers-color-scheme: light)" srcset="img/lcwgs_light.svg"/>
-    <img src="img/lcwgs_dark.svg" alt="Low-coverage imputation accuracy across coverage: per-sample R² for Selphi 2 vs GLIMPSE2 and QUILT2 on GIAB HG002/HG003/HG004 chr22 at 0.5×–4×; Selphi 2 leads both tools at every coverage" width="720"/>
+    <img src="img/lcwgs_dark.svg" alt="Low-coverage imputation accuracy across coverage: per-sample R² for Selphi 2 vs GLIMPSE2 and QUILT2 on GIAB HG002/HG003/HG004 chr22:20-30 Mb at 0.5×-4×; Selphi 2 has the highest overall R² at every coverage" width="720"/>
   </picture>
 </p>
 
 #### Native BAM/CRAM input
 
-Point `--lcwgs` directly at aligned reads and Selphi computes the genotype likelihoods natively at the panel's sites (no `bcftools mpileup`). One file per sample; `--bam-list` takes a file with one path per line. CRAM also needs the reference FASTA (with a `.fai`):
+Point `--lcwgs` directly at aligned reads and Selphi computes the genotype likelihoods natively at the panel's sites (no `bcftools mpileup`); with `--bam` the default `--engine auto` picks this engine on its own, so `--lcwgs` is optional. One file per sample; `--bam-list` takes a file with one path per line. CRAM also needs the reference FASTA (with a `.fai`):
 
 ```bash
 # Single BAM
-selphi --lcwgs --bam sample.bam --refpanel reference.srp --map genetic_map.map --out imputed --threads 16
+selphi --lcwgs --bam sample.bam --reference GRCh38.fa --refpanel reference.srp --map genetic_map.map --out imputed --threads 16
 
 # CRAM (needs the reference FASTA used at compression)
 selphi --lcwgs --bam sample.cram --reference GRCh38.fa --refpanel reference.srp --map genetic_map.map --out imputed --threads 16
@@ -226,7 +226,7 @@ The pileup is CIGAR-aware and applies the standard mapping/base-quality filters 
 
 **Pass `--reference` for BAM input too.** With the reference FASTA available, Selphi applies Base Alignment Quality (BAQ) exactly as `bcftools mpileup` does by default: extended BAQ (a re-alignment HMM that caps the quality of bases whose placement near an indel or soft clip is uncertain) on the reads bcftools' partial-realignment heuristic selects. The port is bit-identical to htslib/bcftools 1.22 (verified against `samtools calmd -r -E` on 28,596 reads). Without `--reference` BAQ cannot run and the pileup uses raw base qualities, which measurably costs accuracy at low coverage (chr22, six GIAB samples: −0.14 percentage points of non-reference concordance). `LCWGS_NO_BAQ=1` disables it (bcftools `-B`); `LCWGS_FULL_BAQ=1` realigns every read (bcftools `-D`, slightly worse than the partial default).
 
-**Speed profile.** The Gibbs sampler runs 50 iterations by default (25 burn-in, 25 main), which is what wins the rare-variant bins. `LCWGS_N_ITER=20 LCWGS_N_MAIN=15` runs GLIMPSE2's schedule instead: on six real ~3× libraries (chromosome 22, 16 threads) it cut wall time from 202 s to 91 s with the same overall non-reference concordance (+0.20 vs +0.19 percentage points over GLIMPSE2), at a measured cost of about 0.04 points of non-reference concordance and 0.12 points of heterozygote recall on variants below 0.5% frequency. Many samples in one run stay parallel across chunks: above seven samples on 16 threads the scheduler measures the first chunk's memory and sizes the following waves to `LCWGS_MEM_BUDGET_GB` (default half the machine's RAM).
+**Speed profile.** The Gibbs sampler runs 50 iterations by default (25 burn-in, 25 main), which is what wins the rare-variant bins. `LCWGS_N_ITER=20 LCWGS_N_MAIN=15` runs GLIMPSE2's schedule instead: on six real ~3× libraries (chromosome 22, 16 threads) it cut wall time from 170 s to 75 s with the same overall non-reference concordance (+0.198 vs +0.193 percentage points over GLIMPSE2), at a measured cost of about 0.04 points of non-reference concordance and 0.12 points of heterozygote recall on variants below 0.5% frequency. Many samples in one run stay parallel across chunks: above seven samples on 16 threads the scheduler measures the first chunk's memory and sizes the following waves to `LCWGS_MEM_BUDGET_GB` (default half the machine's RAM).
 
 Indel panel sites carry no read evidence on the default path, so they are left out of the imputation target set, as on the PL-VCF path (a caller emits no PL record there). `LCWGS_BAM_KEEP_INDELS=1` keeps them with a flat prior, the previous behaviour (measured −0.04 points on SNP concordance); `LCWGS_INDEL_REALIGN=1` (needs `--reference`) scores them from the reads with a pair-HMM realignment instead.
 
@@ -475,8 +475,8 @@ A short overview; see the paper for the full method, parameters, and benchmarks.
 
 - **Bitmatrix-native.** The reference panel is stored as 1 bit per allele and shared in memory between phasing and imputation (no VCF round-trip), so memory stays low and the pipeline is fully native (no external bioinformatics tools at runtime).
 - **Phasing.** Two engines. By default the **diploid** genotype-graph + MCMC engine (two-stage common-then-rare phasing) is used for **all** inputs, chip and WGS alike; the **haploid** composite-HMM with greedy swap remains available for chip arrays via `--phasing-engine haploid`.
-- **Imputation.** Per target haplotype and window, a coded-step PBWT selects reference candidates and a Li-Stephens HMM (f32 state vectors, f64 recombination probabilities and row sums, streamed backward) produces per-site weights, interpolated to full panel density via cache-friendly tiles fused to output encoding. Untyped sites are placed between their flanking typed anchors in cumulative genetic distance (cM), as Beagle, IMPUTE5 and minimac do (`SELPHI_INTERP_RANK=1` restores variant-rank placement). The effective population size is calibrated to panel size.
-- **Low-coverage WGS.** The `--lcwgs` engine works directly on genotype likelihoods (GL-weighted Li-Stephens forward-backward with sparse-PBWT selection and diplotype-mosaic phase commitment), processing the chromosome in cM chunks so the panel is never fully resident.
+- **Imputation.** Per target haplotype and window, a coded-step PBWT selects reference candidates and a Li-Stephens HMM (f32 state vectors, f64 recombination probabilities and row sums, streamed backward) produces per-site weights, interpolated to full panel density via cache-friendly tiles fused to output encoding. Untyped sites are placed between their flanking typed anchors in cumulative genetic distance (cM), as Beagle, IMPUTE5 and minimac do (`SELPHI_INTERP_RANK=1` restores variant-rank placement). The effective population size is calibrated to panel size. On panels of 100,000 or more haplotypes the PBWT scan keeps the 200 longest matches per side at each site (`SELPHI_PBWT_WALK_CAP`; `0` turns it off), which halves the wall time on TOPMed with no MAF bin lower; below that size the scan is unchanged.
+- **Low-coverage WGS.** The `--lcwgs` engine works directly on genotype likelihoods (GL-weighted Li-Stephens forward-backward with sparse-PBWT selection, and an eight-founder phasing HMM that re-commits phase at every Gibbs iteration), processing the chromosome in cM chunks so the panel is never fully resident.
 - **SRP panel format.** A single binary file holds one or many chromosomes as 2D zstd-compressed sparse tiles (1024 variants × 4096 haplotypes) for L2-cache-friendly streaming. Creation is fully streaming (hundreds of MB for a full chromosome) and the BCF reader uses parallel CSI-indexed regional reads.
 - **Determinism.** Fixed-seed parallelism yields bit-identical results across runs; the same output is produced on AVX-512, AVX2, NEON, and scalar paths (up to f32 reduction-order differences).
 

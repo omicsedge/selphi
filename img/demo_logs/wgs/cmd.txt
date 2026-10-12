@@ -1,0 +1,2 @@
+selphi --refpanel chr22.srp --input wgs.vcf.gz --map chr22.map \
+    --out phased --phase-only --threads 16

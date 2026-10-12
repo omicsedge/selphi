@@ -1,213 +1,287 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 1222" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
-  <defs>
-    <marker id="arr" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
-      <path d="M0,0 L8,3 L0,6" fill="none" stroke="#8b949e" stroke-width="1.2"/>
-    </marker>
-    <linearGradient id="sg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#1c2333"/>
-      <stop offset="100%" stop-color="#161b22"/>
-    </linearGradient>
-    <filter id="gl">
-      <feGaussianBlur stdDeviation="2" result="blur"/>
-      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
-    </filter>
-  </defs>
-  <defs>
-    <clipPath id="t1_0"><rect x="58" y="75" width="0" height="22"><animate attributeName="width" values="0;0;455;455" keyTimes="0;0.0067;0.0433;1" dur="30s" repeatCount="indefinite"/></rect></clipPath>
-    <clipPath id="t2_0"><rect x="58" y="101" width="0" height="22"><animate attributeName="width" values="0;0;362;362" keyTimes="0;0.0467;0.0867;1" dur="30s" repeatCount="indefinite"/></rect></clipPath>
-    <clipPath id="t1_1"><rect x="58" y="75" width="0" height="22"><animate attributeName="width" values="0;0;446;446" keyTimes="0;0.3400;0.3767;1" dur="30s" repeatCount="indefinite"/></rect></clipPath>
-    <clipPath id="t2_1"><rect x="58" y="101" width="0" height="22"><animate attributeName="width" values="0;0;474;474" keyTimes="0;0.3800;0.4200;1" dur="30s" repeatCount="indefinite"/></rect></clipPath>
-    <clipPath id="t1_2"><rect x="58" y="75" width="0" height="22"><animate attributeName="width" values="0;0;502;502" keyTimes="0;0.6733;0.7100;1" dur="30s" repeatCount="indefinite"/></rect></clipPath>
-    <clipPath id="t2_2"><rect x="58" y="101" width="0" height="22"><animate attributeName="width" values="0;0;427;427" keyTimes="0;0.7133;0.7533;1" dur="30s" repeatCount="indefinite"/></rect></clipPath>
-  </defs>
-  <rect width="920" height="1222" rx="12" fill="#0d1117"/>
-  <g font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace">
-    <rect x="12" y="10" width="896" height="400" rx="9" fill="#0d1117" stroke="#30363d" stroke-width="1.4"/>
-    <circle cx="36" cy="32" r="5.5" fill="#ff5f56"/><circle cx="56" cy="32" r="5.5" fill="#ffbd2e"/><circle cx="76" cy="32" r="5.5" fill="#27c93f"/>
-    <line x1="12" y1="52" x2="908" y2="52" stroke="#21262d" stroke-width="1"/>
-    <g opacity="1"><animate attributeName="opacity" values="1;1;0;0;1" keyTimes="0;0.3293;0.3333;0.9960;1" dur="30s" repeatCount="indefinite"/>
-      <text x="844" y="37" text-anchor="end" fill="#6cb6ff" font-size="13" font-weight="700">chip array  →  diploid + genotype</text>
-      <text x="34" y="90" fill="#7ee787" font-size="16" font-weight="700">$</text>
-      <g clip-path="url(#t1_0)"><text x="58" y="90" fill="#e6edf3" font-size="15">selphi --refpanel chr22.srp --input chip.vcf.gz \</text></g>
-      <g clip-path="url(#t2_0)"><text x="58" y="116" fill="#e6edf3" font-size="15">    --map chr22.map --out imputed -t 16</text></g>
-      <rect width="9" height="18" fill="#7ee787" x="58" y="102"><animate attributeName="x" values="58;58;513;58;420;420" keyTimes="0;0.0067;0.0433;0.0467;0.0867;1" dur="30s" repeatCount="indefinite"/><animate attributeName="y" values="76;76;102;102" keyTimes="0;0.0433;0.0467;1" dur="30s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0;0.5;0.5;1" dur="0.9s" repeatCount="indefinite"/></rect>
-      <text x="34" y="150" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.0960;0.1000;1" dur="30s" repeatCount="indefinite"/><tspan fill="#56d4dd">[selphi]</tspan><tspan fill="#8b949e"> SIMD: </tspan><tspan fill="#7ee787">AVX-512F+DQ</tspan></text>
-      <text x="34" y="176" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.1127;0.1167;1" dur="30s" repeatCount="indefinite"/><tspan fill="#8b949e">  auto-route: GT-only · 262 sites/Mb  </tspan><tspan fill="#7ee787">→ genotype engine</tspan></text>
-      <text x="34" y="202" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.1293;0.1333;1" dur="30s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Loaded SRP: 1070401 variants, 4802 haplotypes  </tspan><tspan fill="#8b949e">[0.3s | 297 MB]</tspan></text>
-      <text x="34" y="228" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.1460;0.1500;1" dur="30s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Target: 801 samples, 9283 variants, phased=false</tspan></text>
-      <text x="34" y="254" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.1627;0.1667;1" dur="30s" repeatCount="indefinite"/><tspan fill="#8b949e">  chip input (9283 variants)  </tspan><tspan fill="#6cb6ff">→ Diploid phasing engine</tspan></text>
-      <text x="34" y="280" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.1793;0.1833;1" dur="30s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Phasing complete: 801 samples, 3 EM windows  </tspan><tspan fill="#8b949e">[14.2s | 856 MB]</tspan></text>
-      <text x="34" y="306" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.1960;0.2000;1" dur="30s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Window 1/1: PBWT 47.7s · interp 15.9s (9283 vars)</tspan></text>
-      <text x="34" y="332" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.2127;0.2167;1" dur="30s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Output: imputed.vcf.gz  </tspan><tspan fill="#8b949e">[86.7s | 12.5 GB]</tspan></text>
-      <text x="34" y="358" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.2293;0.2333;1" dur="30s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  OVERALL  1070401 variants   R² </tspan><tspan fill="#5eead4">0.4825</tspan><tspan fill="#c9d1d9">   conc 0.9890</tspan></text>
-      <text x="34" y="392" font-size="16" font-weight="700" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.2460;0.2500;1" dur="30s" repeatCount="indefinite"/><tspan fill="#7ee787">✓ imputed.vcf.gz</tspan><tspan fill="#8b949e">   ·   Total 89s  ·  Peak 12.5 GB</tspan></text>
-    </g>
-    <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.3293;0.3333;0.6627;0.6667;1" dur="30s" repeatCount="indefinite"/>
-      <text x="844" y="37" text-anchor="end" fill="#6cb6ff" font-size="13" font-weight="700">WGS  →  diploid  (--phase-only)</text>
-      <text x="34" y="90" fill="#7ee787" font-size="16" font-weight="700">$</text>
-      <g clip-path="url(#t1_1)"><text x="58" y="90" fill="#e6edf3" font-size="15">selphi --refpanel chr22.srp --input wgs.vcf.gz \</text></g>
-      <g clip-path="url(#t2_1)"><text x="58" y="116" fill="#e6edf3" font-size="15">    --map chr22.map --out phased --phase-only -t 16</text></g>
-      <rect width="9" height="18" fill="#7ee787" x="58" y="102"><animate attributeName="x" values="58;58;504;58;532;532" keyTimes="0;0.3400;0.3767;0.3800;0.4200;1" dur="30s" repeatCount="indefinite"/><animate attributeName="y" values="76;76;102;102" keyTimes="0;0.3767;0.3800;1" dur="30s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0;0.5;0.5;1" dur="0.9s" repeatCount="indefinite"/></rect>
-      <text x="34" y="150" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.4293;0.4333;1" dur="30s" repeatCount="indefinite"/><tspan fill="#56d4dd">[selphi]</tspan><tspan fill="#8b949e"> SIMD: </tspan><tspan fill="#7ee787">AVX-512F+DQ</tspan></text>
-      <text x="34" y="176" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.4460;0.4500;1" dur="30s" repeatCount="indefinite"/><tspan fill="#8b949e">  auto-route: GT-only · 26022 sites/Mb  </tspan><tspan fill="#7ee787">→ genotype engine</tspan></text>
-      <text x="34" y="202" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.4627;0.4667;1" dur="30s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Loaded SRP: 1070401 variants, 4478 haplotypes  </tspan><tspan fill="#8b949e">[0.4s | 567 MB]</tspan></text>
-      <text x="34" y="228" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.4793;0.4833;1" dur="30s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Target: 54 samples, 1070401 variants, phased=false</tspan></text>
-      <text x="34" y="254" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.4960;0.5000;1" dur="30s" repeatCount="indefinite"/><tspan fill="#8b949e">  WGS input (1070399 variants)  </tspan><tspan fill="#6cb6ff">→ Diploid engine (default)</tspan></text>
-      <text x="34" y="280" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.5127;0.5167;1" dur="30s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Common ref subset: 347061 / 1070399 variants  </tspan><tspan fill="#8b949e">[194.4 MB]</tspan></text>
-      <text x="34" y="306" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.5293;0.5333;1" dur="30s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Phasing complete: 54 samples, 0 EM windows  </tspan><tspan fill="#8b949e">[71.5s | 4.3 GB]</tspan></text>
-      <text x="34" y="392" font-size="16" font-weight="700" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.5460;0.5500;1" dur="30s" repeatCount="indefinite"/><tspan fill="#7ee787">✓ phased.vcf.gz</tspan><tspan fill="#8b949e">   ·   diploid · 54 samples   ·   Total 72s  ·  Peak 4.3 GB</tspan></text>
-    </g>
-    <g opacity="0"><animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.6627;0.6667;0.9960;1" dur="30s" repeatCount="indefinite"/>
-      <text x="844" y="37" text-anchor="end" fill="#5eead4" font-size="13" font-weight="700">low-coverage WGS  →  lcWGS</text>
-      <text x="34" y="90" fill="#7ee787" font-size="16" font-weight="700">$</text>
-      <g clip-path="url(#t1_2)"><text x="58" y="90" fill="#e6edf3" font-size="15">selphi --refpanel chr22.srp --input sample.gl.vcf.gz \</text></g>
-      <g clip-path="url(#t2_2)"><text x="58" y="116" fill="#e6edf3" font-size="15">    --map chr22.map --out lowcov --lcwgs -t 16</text></g>
-      <rect width="9" height="18" fill="#7ee787" x="58" y="102"><animate attributeName="x" values="58;58;560;58;485;485" keyTimes="0;0.6733;0.7100;0.7133;0.7533;1" dur="30s" repeatCount="indefinite"/><animate attributeName="y" values="76;76;102;102" keyTimes="0;0.7100;0.7133;1" dur="30s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0;0.5;0.5;1" dur="0.9s" repeatCount="indefinite"/></rect>
-      <text x="34" y="150" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.7627;0.7667;1" dur="30s" repeatCount="indefinite"/><tspan fill="#56d4dd">[selphi]</tspan><tspan fill="#8b949e"> SIMD: </tspan><tspan fill="#7ee787">AVX-512F+DQ</tspan></text>
-      <text x="34" y="176" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.7793;0.7833;1" dur="30s" repeatCount="indefinite"/><tspan fill="#8b949e">  mode: lcwgs  </tspan><tspan fill="#5eead4">→ low-coverage WGS engine (integrated phasing)</tspan></text>
-      <text x="34" y="202" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.7960;0.8000;1" dur="30s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  SRP loaded: 1070401 variants, 4478 haps</tspan></text>
-      <text x="34" y="228" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.8127;0.8167;1" dur="30s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  PL VCF: 1 sample, 929834 variants  </tspan><tspan fill="#8b949e">(296438 flat 0.5/0.5)</tspan></text>
-      <text x="34" y="254" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.8293;0.8333;1" dur="30s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  shared variants: 929834 / 929834 (100.0% of target)</tspan></text>
-      <text x="34" y="280" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.8460;0.8500;1" dur="30s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  chunked Gibbs: 82.4 cM span  </tspan><tspan fill="#8b949e">→ 42 chunks</tspan></text>
-      <text x="34" y="306" font-size="15.5" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.8627;0.8667;1" dur="30s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  lcwgs done: 929834 variants × 1 sample  </tspan><tspan fill="#8b949e">[117.6s]</tspan></text>
-      <text x="34" y="392" font-size="16" font-weight="700" opacity="0"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;0.8793;0.8833;1" dur="30s" repeatCount="indefinite"/><tspan fill="#7ee787">✓ lowcov.vcf.gz</tspan><tspan fill="#8b949e">   ·   </tspan><tspan fill="#5eead4">GT:DS:GP</tspan><tspan fill="#8b949e">   ·   GL-aware Li-Stephens</tspan></text>
-    </g>
-  </g>
-  <g transform="translate(0,422)">
-
-
-  <text x="460" y="34" text-anchor="middle" fill="#e6edf3" font-size="18" font-weight="600">Selphi 2 — Pipeline Architecture</text>
-
-  <!-- INPUT ROW -->
-  <rect x="30" y="54" width="195" height="50" rx="8" fill="#0d1117" stroke="#238636" stroke-width="1.5"/>
-  <text x="128" y="75" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">INPUT</text>
-  <text x="128" y="92" text-anchor="middle" fill="#c9d1d9" font-size="12">VCF / BCF / BAM / CRAM</text>
-
-  <rect x="248" y="54" width="195" height="50" rx="8" fill="#0d1117" stroke="#d29922" stroke-width="1.5"/>
-  <text x="346" y="75" text-anchor="middle" fill="#d29922" font-size="11" font-weight="600">REFERENCE</text>
-  <text x="346" y="92" text-anchor="middle" fill="#c9d1d9" font-size="13">SRP Panel</text>
-
-  <rect x="466" y="54" width="195" height="50" rx="8" fill="#0d1117" stroke="#8b949e" stroke-width="1.5"/>
-  <text x="564" y="75" text-anchor="middle" fill="#8b949e" font-size="11" font-weight="600">GENETIC MAP</text>
-  <text x="564" y="92" text-anchor="middle" fill="#c9d1d9" font-size="13">PLINK / directory</text>
-
-  <rect x="684" y="54" width="205" height="50" rx="8" fill="#0d1117" stroke="#6e7681" stroke-width="1" stroke-dasharray="4,3"/>
-  <text x="787" y="75" text-anchor="middle" fill="#6e7681" font-size="11" font-weight="600">OPTIONAL</text>
-  <text x="787" y="92" text-anchor="middle" fill="#8b949e" font-size="13">Pedigree / Haploids</text>
-
-  <line x1="128" y1="104" x2="128" y2="134" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
-  <line x1="346" y1="104" x2="346" y2="134" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
-
-  <!-- BITMATRIX -->
-  <rect x="60" y="136" width="640" height="38" rx="10" fill="url(#sg)" stroke="#8b5cf6" stroke-width="1.5"/>
-  <text x="380" y="153" text-anchor="middle" fill="#a78bfa" font-size="12" font-weight="700">Bitmatrix Extraction</text>
-  <text x="380" y="168" text-anchor="middle" fill="#8b949e" font-size="11">1 bit per allele · shared between phasing and imputation · SIMD-accelerated</text>
-
-  <line x1="380" y1="174" x2="380" y2="200" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
-
-  <!-- PHASING CONTAINER: two engines, auto-selected -->
-  <rect x="50" y="202" width="820" height="186" rx="10" fill="url(#sg)" stroke="#1f6feb" stroke-width="1.5" filter="url(#gl)"/>
-  <text x="460" y="224" text-anchor="middle" fill="#58a6ff" font-size="14" font-weight="700">Phasing</text>
-  <text x="460" y="241" text-anchor="middle" fill="#8b949e" font-size="11">if unphased — diploid engine by default for all inputs; haploid optional for chip arrays</text>
-
-  <rect x="70" y="252" width="380" height="124" rx="8" fill="#0d1117" stroke="#f97316" stroke-width="1.2"/>
-  <text x="260" y="274" text-anchor="middle" fill="#fb923c" font-size="13" font-weight="700">Haploid Engine</text>
-  <text x="260" y="295" text-anchor="middle" fill="#c9d1d9" font-size="11.5">Coded-step PBWT &#x2192; 280 composites</text>
-  <text x="260" y="313" text-anchor="middle" fill="#c9d1d9" font-size="11.5">3-channel composite HMM + greedy swap</text>
-  <text x="260" y="331" text-anchor="middle" fill="#c9d1d9" font-size="11.5">Adaptive step scale + carrier injection</text>
-  <text x="260" y="349" text-anchor="middle" fill="#c9d1d9" font-size="11.5">EM per-window (Ne, mismatch) · 15 iter</text>
-  <text x="260" y="369" text-anchor="middle" fill="#8b949e" font-size="10" font-style="italic">opt-in for chip arrays</text>
-
-  <rect x="470" y="252" width="380" height="124" rx="8" fill="#0d1117" stroke="#3b82f6" stroke-width="1.2"/>
-  <text x="660" y="274" text-anchor="middle" fill="#60a5fa" font-size="13" font-weight="700">Diploid Engine</text>
-  <text x="660" y="295" text-anchor="middle" fill="#c9d1d9" font-size="11.5">Genotype graph + MCMC (5b,3xp/b,5m)</text>
-  <text x="660" y="313" text-anchor="middle" fill="#c9d1d9" font-size="11.5">EM Ne estimation during burn-in</text>
-  <text x="660" y="331" text-anchor="middle" fill="#c9d1d9" font-size="11.5">Common &#x2192; rare two-stage phasing</text>
-  <text x="660" y="349" text-anchor="middle" fill="#c9d1d9" font-size="11.5">IBD2-aware PBWT + singleton IBD</text>
-  <text x="660" y="369" text-anchor="middle" fill="#8b949e" font-size="10" font-style="italic">default · all inputs</text>
-
-  <!-- Pedigree arrow -->
-  <path d="M787 104 L787 188 L895 188 L895 305 L872 305" fill="none" stroke="#6e7681" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arr)"/>
-  <text x="905" y="250" fill="#6e7681" font-size="9" transform="rotate(90,905,250)" text-anchor="middle">Mendelian scaffold</text>
-
-  <!-- Pre-phased bypass -->
-  <path d="M 28 104 L 12 104 L 12 540 L 48 540" fill="none" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arr)"/>
-  <text x="5" y="320" fill="#58a6ff" font-size="10" font-weight="600" transform="rotate(-90,5,320)" text-anchor="middle">pre-phased -> skip</text>
-
-  <!-- Phasing -> handoff -> imputation -->
-  <line x1="460" y1="388" x2="460" y2="404" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
-  <rect x="140" y="406" width="640" height="28" rx="8" fill="#0d1117" stroke="#238636" stroke-width="1" stroke-dasharray="6,3"/>
-  <text x="460" y="425" text-anchor="middle" fill="#7ee787" font-size="11">In-memory handoff: phased haplotypes + reference bitmatrix (no intermediate I/O)</text>
-  <line x1="460" y1="434" x2="460" y2="450" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
-
-  <!-- IMPUTATION CONTAINER: two engines, auto-selected by input -->
-  <rect x="50" y="452" width="820" height="186" rx="10" fill="url(#sg)" stroke="#ec4899" stroke-width="1.5" filter="url(#gl)"/>
-  <text x="460" y="474" text-anchor="middle" fill="#f472b6" font-size="14" font-weight="700">Imputation</text>
-  <text x="460" y="491" text-anchor="middle" fill="#8b949e" font-size="11">auto by input: confident genotypes &#x2192; genotype engine | low-coverage GL / reads &#x2192; lcWGS engine</text>
-
-  <rect x="70" y="502" width="380" height="104" rx="8" fill="#0d1117" stroke="#ec4899" stroke-width="1.2"/>
-  <text x="260" y="523" text-anchor="middle" fill="#f9a8d4" font-size="13" font-weight="700">Genotype Imputation</text>
-  <text x="260" y="539" text-anchor="middle" fill="#8b949e" font-size="10">chip / WGS confident hard calls</text>
-  <text x="260" y="559" text-anchor="middle" fill="#c9d1d9" font-size="11.5">PBWT selection + Li-Stephens HMM (f32/f64)</text>
-  <text x="260" y="577" text-anchor="middle" fill="#c9d1d9" font-size="11.5">Haplotype dedup · Adaptive Ne = 36 &#xd7; n_ref</text>
-  <text x="260" y="597" text-anchor="middle" fill="#f472b6" font-size="10" font-style="italic">hard calls in &#x2192; dosages out</text>
-
-  <rect x="470" y="502" width="380" height="104" rx="8" fill="#0d1117" stroke="#2dd4bf" stroke-width="1.2"/>
-  <text x="660" y="523" text-anchor="middle" fill="#5eead4" font-size="13" font-weight="700">Low-Coverage WGS Imputation</text>
-  <text x="660" y="539" text-anchor="middle" fill="#8b949e" font-size="10">low-coverage sequencing (genotype likelihoods)</text>
-  <text x="660" y="559" text-anchor="middle" fill="#c9d1d9" font-size="11.5">PL VCF / BAM / CRAM · sparse-PBWT &#x21c4; GL-weighted FB</text>
-  <text x="660" y="577" text-anchor="middle" fill="#c9d1d9" font-size="11.5">&#x221a;n-checkpointed · diplotype-mosaic Gibbs</text>
-  <text x="660" y="597" text-anchor="middle" fill="#2dd4bf" font-size="10" font-style="italic">GLs in &#x2192; GT:DS:GP out</text>
-
-  <text x="460" y="626" text-anchor="middle" fill="#c9d1d9" font-size="11">Tiled interpolation (1024 &#xd7; 4096, L2-cache) · fused interp&#x2192;encode&#x2192;stream · DR2 two-pass · LD-corrected</text>
-
-  <line x1="460" y1="638" x2="460" y2="664" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
-
-  <!-- OUTPUT -->
-  <rect x="50" y="666" width="820" height="50" rx="10" fill="url(#sg)" stroke="#238636" stroke-width="1.5"/>
-  <text x="460" y="686" text-anchor="middle" fill="#7ee787" font-size="13" font-weight="700">Multi-Format Output (single interpolation pass)</text>
-  <rect x="113" y="696" width="120" height="18" rx="4" fill="#238636" opacity="0.2"/>
-  <text x="173" y="709" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">VCF.gz</text>
-  <rect x="248" y="696" width="120" height="18" rx="4" fill="#238636" opacity="0.2"/>
-  <text x="308" y="709" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">BCF 2.2</text>
-  <rect x="383" y="696" width="120" height="18" rx="4" fill="#238636" opacity="0.2"/>
-  <text x="443" y="709" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">Parquet</text>
-  <rect x="518" y="696" width="155" height="18" rx="4" fill="#238636" opacity="0.2"/>
-  <text x="596" y="709" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">PGEN + dosage</text>
-  <rect x="688" y="696" width="120" height="18" rx="4" fill="#238636" opacity="0.2"/>
-  <text x="748" y="709" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">SelfDecode</text>
-
-  <!-- Multi-chr note -->
-  <rect x="50" y="728" width="820" height="28" rx="6" fill="#0d1117" stroke="#d29922" stroke-width="1" stroke-dasharray="4,3"/>
-  <text x="460" y="747" text-anchor="middle" fill="#d29922" font-size="11">Multi-chromosome: single SRP file, overlapped prefetch | Mixed-density: WGS + chip merged-panel builder</text>
-
-  
-    <g>
-      <rect x="470" y="252" width="380" height="124" rx="8" fill="#0d1117" opacity="0"><animate attributeName="opacity" values="0;0;0;0;0" keyTimes="0;0.3293;0.3333;0.9960;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="470" y="502" width="380" height="104" rx="8" fill="#0d1117" opacity="0.72"><animate attributeName="opacity" values="0.72;0.72;0;0;0.72" keyTimes="0;0.3293;0.3333;0.9960;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="70" y="252" width="380" height="124" rx="8" fill="#0d1117" opacity="0.72"><animate attributeName="opacity" values="0.72;0.72;0.72;0.72;0.72;0.72" keyTimes="0;0.3293;0.3333;0.6627;0.6667;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="140" y="406" width="640" height="28" rx="8" fill="#0d1117" opacity="0"><animate attributeName="opacity" values="0;0;0.72;0.72;0;0" keyTimes="0;0.3293;0.3333;0.6627;0.6667;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="70" y="502" width="380" height="104" rx="8" fill="#0d1117" opacity="0"><animate attributeName="opacity" values="0;0;0.72;0.72;0;0" keyTimes="0;0.3293;0.3333;0.6627;0.6667;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="470" y="502" width="380" height="104" rx="8" fill="#0d1117" opacity="0"><animate attributeName="opacity" values="0;0;0.72;0.72;0;0" keyTimes="0;0.3293;0.3333;0.6627;0.6667;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="49" y="201" width="822" height="188" rx="10" fill="#0d1117" opacity="0"><animate attributeName="opacity" values="0;0;0.72;0.72;0" keyTimes="0;0.6627;0.6667;0.9960;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="140" y="406" width="640" height="28" rx="8" fill="#0d1117" opacity="0"><animate attributeName="opacity" values="0;0;0.72;0.72;0" keyTimes="0;0.6627;0.6667;0.9960;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="70" y="502" width="380" height="104" rx="8" fill="#0d1117" opacity="0"><animate attributeName="opacity" values="0;0;0.72;0.72;0" keyTimes="0;0.6627;0.6667;0.9960;1" dur="30s" repeatCount="indefinite"/></rect>
-    </g>
-    <g fill="none">
-      <rect x="30" y="54" width="195" height="50" rx="8" stroke="#16a34a" stroke-width="3" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.1127;0.1167;0.3293;0.3333;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="60" y="136" width="640" height="38" rx="10" stroke="#8b5cf6" stroke-width="3" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.1293;0.1333;0.3293;0.3333;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="470" y="252" width="380" height="124" rx="8" stroke="#2563eb" stroke-width="3" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.1627;0.1667;0.3293;0.3333;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="140" y="406" width="640" height="28" rx="8" stroke="#16a34a" stroke-width="3" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.1793;0.1833;0.3293;0.3333;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="70" y="502" width="380" height="104" rx="8" stroke="#db2777" stroke-width="3" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.1960;0.2000;0.3293;0.3333;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="50" y="666" width="820" height="50" rx="10" stroke="#16a34a" stroke-width="3" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.2127;0.2167;0.3293;0.3333;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="30" y="54" width="195" height="50" rx="8" stroke="#16a34a" stroke-width="3" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.4460;0.4500;0.6627;0.6667;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="60" y="136" width="640" height="38" rx="10" stroke="#8b5cf6" stroke-width="3" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.4627;0.4667;0.6627;0.6667;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="470" y="252" width="380" height="124" rx="8" stroke="#2563eb" stroke-width="3" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.4960;0.5000;0.6627;0.6667;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="50" y="666" width="820" height="50" rx="10" stroke="#16a34a" stroke-width="3" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.5293;0.5333;0.6627;0.6667;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="30" y="54" width="195" height="50" rx="8" stroke="#16a34a" stroke-width="3" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.7793;0.7833;0.9960;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="60" y="136" width="640" height="38" rx="10" stroke="#8b5cf6" stroke-width="3" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.7960;0.8000;0.9960;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="470" y="502" width="380" height="104" rx="8" stroke="#0d9488" stroke-width="3" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.8460;0.8500;0.9960;1" dur="30s" repeatCount="indefinite"/></rect>
-      <rect x="50" y="666" width="820" height="50" rx="10" stroke="#16a34a" stroke-width="3" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.8627;0.8667;0.9960;1" dur="30s" repeatCount="indefinite"/></rect>
-    </g>
-  </g>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 1266" font-family="'Segoe UI', system-ui, -apple-system, Helvetica, Arial, sans-serif" xml:space="preserve">
+<defs>
+<marker id="arr" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="none" stroke="#8b949e" stroke-width="1.2"/></marker>
+<linearGradient id="sg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#1c2333"/><stop offset="100%" stop-color="#161b22"/></linearGradient>
+<clipPath id="vp"><rect x="12" y="65" width="896" height="376"/></clipPath>
+</defs>
+<rect width="920" height="1266" rx="12" fill="#0d1117"/>
+<g font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="12.5">
+<rect x="12" y="10" width="896" height="442" rx="9" fill="#0d1117" stroke="#30363d" stroke-width="1.4"/>
+<circle cx="36" cy="32" r="5.5" fill="#ff5f56"/><circle cx="56" cy="32" r="5.5" fill="#ffbd2e"/><circle cx="76" cy="32" r="5.5" fill="#27c93f"/>
+<text x="98" y="37" fill="#8b949e" font-family="'Segoe UI', system-ui, -apple-system, Helvetica, Arial, sans-serif" font-size="12">real runs · every line as printed · time compressed</text>
+<line x1="12" y1="52" x2="908" y2="52" stroke="#21262d" stroke-width="1"/>
+<g opacity="1"><animate attributeName="opacity" calcMode="discrete" values="1;0" keyTimes="0;0.43912" dur="43.14s" repeatCount="indefinite"/>
+<text x="890" y="37" text-anchor="end" fill="#6cb6ff" font-family="'Segoe UI', system-ui, -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="700">chip array  →  phase + impute</text>
+<g clip-path="url(#vp)"><g>
+<animateTransform attributeName="transform" type="translate" calcMode="discrete" values="0,0;0,-17;0,-34;0,-51;0,-68;0,-85;0,-102;0,-119;0,-136;0,-153;0,-170;0,-187;0,-204;0,-221;0,-238;0,-255;0,-272;0,-289;0,-306;0,-323;0,-340;0,-357;0,-374;0,-391;0,-408;0,-425;0,-442;0,-459;0,-476;0,-493;0,-510;0,-527;0,-544;0,-561;0,-578;0,-595;0,-612;0,-629;0,-646;0,-663;0,-680;0,-697;0,-714;0,-731;0,-748;0,-765;0,-782;0,-799;0,-816;0,-833;0,-850;0,-867;0,-884" keyTimes="0;0.14737;0.14865;0.14992;0.15120;0.15351;0.15582;0.15813;0.16044;0.16172;0.16299;0.16427;0.18338;0.18465;0.18592;0.21004;0.23415;0.23415;0.25827;0.28238;0.28366;0.28493;0.28770;0.29047;0.29323;0.29600;0.29877;0.30153;0.30430;0.30707;0.30983;0.31260;0.31537;0.31813;0.32090;0.32367;0.32643;0.32920;0.33197;0.33473;0.33750;0.34027;0.34304;0.34580;0.34857;0.35134;0.35410;0.35687;0.35964;0.36240;0.36368;0.36495;0.36843" dur="43.14s" repeatCount="indefinite"/>
+<clipPath id="c_chip_0"><rect x="48" y="64" height="17" width="0"><animate attributeName="width" values="0;0;618;896" keyTimes="0;0.01159;0.05519;1" dur="43.14s" repeatCount="indefinite"/></rect></clipPath>
+<text x="30" y="77" fill="#7ee787" font-weight="700">$</text>
+<g clip-path="url(#c_chip_0)"><text x="48" y="77" fill="#e6edf3">selphi --refpanel chr22.srp --input chip.vcf.gz --map chr22.map --out imputed \</text></g>
+<rect y="65" width="7.5" height="15" fill="#7ee787" x="48" opacity="1"><animate attributeName="opacity" calcMode="discrete" values="1;0" keyTimes="0;0.06098" dur="43.14s" repeatCount="indefinite"/><animate attributeName="x" values="48;48;642.5;642.5" keyTimes="0;0.01159;0.05519;1" dur="43.14s" repeatCount="indefinite"/></rect>
+<clipPath id="c_chip_1"><rect x="48" y="81" height="17" width="0"><animate attributeName="width" values="0;0;587;896" keyTimes="0;0.06098;0.10237;1" dur="43.14s" repeatCount="indefinite"/></rect></clipPath>
+<g clip-path="url(#c_chip_1)"><text x="48" y="94" fill="#e6edf3">    --truth truth.vcf.gz --exclude-panel-monomorphic chr22.srp --threads 16</text></g>
+<rect y="82" width="7.5" height="15" fill="#7ee787" x="48" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.05519;0.10817" dur="43.14s" repeatCount="indefinite"/><animate attributeName="x" values="48;48;612.4;612.4" keyTimes="0;0.06098;0.10237;1" dur="43.14s" repeatCount="indefinite"/></rect>
+<text x="30" y="111" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.11640;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#56d4dd" font-weight="700">[selphi]</tspan><tspan fill="#c9d1d9"> SIMD: </tspan><tspan fill="#7ee787">AVX-512F+DQ</tspan></text>
+<text x="30" y="128" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.11767;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  auto-route: sniff GT=true PL=false GQ=false DP=false call-rate=1.000 (of 1602000 GT entries) density=262/Mb</tspan></text>
+<text x="30" y="145" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.11767;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">(thr 1000) </tspan><tspan fill="#8b949e">[0.0s | 106 MB]</tspan></text>
+<text x="30" y="162" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.11895;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  auto-route: confident hard calls (GT-only, or GQ/DP below WGS density) </tspan><tspan fill="#7ee787">→ genotype engine (no refine)</tspan><tspan fill="#c9d1d9"> </tspan><tspan fill="#8b949e">[0.0s |</tspan></text>
+<text x="30" y="179" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.11895;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#8b949e">106 MB]</tspan></text>
+<text x="30" y="213" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.12257;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  ___ ___ _    ___ _  _ ___</tspan></text>
+<text x="30" y="230" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.12438;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9"> / __| __| |  | _ \ || |_ _|</tspan></text>
+<text x="30" y="247" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.12619;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9"> \__ \ _|| |__|  _/ __ || |</tspan></text>
+<text x="30" y="264" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.12800;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9"> |___/___|____|_| |_||_|___|</tspan></text>
+<text x="30" y="281" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.12981;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">      </tspan><tspan fill="#8b949e">v2.0.0</tspan><tspan fill="#c9d1d9"> 🦀 </tspan><tspan fill="#7ee787">SelfDecode™</tspan></text>
+<text x="30" y="315" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.13343;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  input:    chip.vcf.gz</tspan></text>
+<text x="30" y="332" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.13524;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  refpanel: chr22.srp</tspan></text>
+<text x="30" y="349" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.13705;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  map:      chr22.map</tspan></text>
+<text x="30" y="366" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.13886;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  output:   imputed</tspan></text>
+<text x="30" y="383" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.14067;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  threads:  16</tspan></text>
+<text x="30" y="400" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.14248;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  log:      imputed.log</tspan></text>
+<text x="30" y="434" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.14610;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Loaded SRP: 1070401 variants, 4802 haplotypes                </tspan><tspan fill="#8b949e">[0.2s | 340 MB]</tspan></text>
+<text x="30" y="451" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.14737;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Target: 801 samples, 9283 variants, phased=false             </tspan><tspan fill="#8b949e">[0.2s | 356 MB]</tspan></text>
+<text x="30" y="468" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.14865;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Variant intersection: 9283 hash matches, 0 plain matches</tspan></text>
+<text x="30" y="485" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.14992;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Shared markers: 9283 (100.0% of target)                      </tspan><tspan fill="#8b949e">[0.2s | 358 MB]</tspan></text>
+<text x="30" y="502" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.15120;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Auto max_candidates: n_ref=4802, chunk_cv=0.691, scale=0.652 → mc=4802 (clamp [2500..1000000]) </tspan><tspan fill="#8b949e">[0.2s | 386 MB]</tspan></text>
+<text x="30" y="519" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.15351;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Resources: 9.4 GB estimated, 123.1 GB system RAM, 16 threads (mc=4802)</tspan></text>
+<text x="30" y="536" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.15582;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Input is unphased — running phasing pipeline...              </tspan><tspan fill="#8b949e">[0.3s | 387 MB]</tspan></text>
+<text x="30" y="553" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.15813;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Phasing engine: Diploid (default; 9283 target variants)</tspan></text>
+<text x="30" y="570" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.16044;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Ref bitmatrix extracted (9283 target sites × 4802 haps, 5.6 MB) </tspan><tspan fill="#8b949e">[0.4s | 496 MB]</tspan></text>
+<text x="30" y="587" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.16172;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Using Diploid phasing                                        </tspan><tspan fill="#8b949e">[0.4s | 496 MB]</tspan></text>
+<text x="30" y="604" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.16299;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Common ref subset (8928 / 9283 variants, 5.4 MB)             </tspan><tspan fill="#8b949e">[0.4s | 496 MB]</tspan></text>
+<text x="30" y="621" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.16427;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Diploid intra-run phase ensemble: 2 members (1× phasing)     </tspan><tspan fill="#8b949e">[0.4s | 496 MB]</tspan></text>
+<text x="30" y="638" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.18338;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Phasing complete: 801 samples phased                         </tspan><tspan fill="#8b949e">[15.2s | 751 MB]</tspan></text>
+<text x="30" y="655" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.18465;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Diploid intra-run ensemble: averaging 2 members from one phasing chain </tspan><tspan fill="#8b949e">[15.2s | 751 MB]</tspan></text>
+<text x="30" y="672" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.18592;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Genetic map loaded + LD correction                           </tspan><tspan fill="#8b949e">[15.2s | 751 MB]</tspan></text>
+<text x="30" y="689" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.21004;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  formats:  VCF.gz</tspan></text>
+<text x="30" y="706" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.23415;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  PBWT sort shared across 16 targets (101 groups on 16 threads; auto: 118 GB available, 15.1 MB per in-flight</tspan></text>
+<text x="30" y="723" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.23415;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">target -&gt; +3.5 GB; mc/n_ref 1.00). Byte-identical; set SELPHI_PBWT_SHARE=1 to disable.</tspan></text>
+<text x="30" y="740" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.25827;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">    Window 1/1: PBWT=70.5s interp=17.2s (9283 vars)</tspan></text>
+<text x="30" y="757" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.28238;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Output: imputed.vcf.gz  (1,070,401 variants × 801 samples · 500.4 MB) </tspan><tspan fill="#8b949e">[112.3s | 14293 MB]</tspan></text>
+<text x="30" y="774" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.28366;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Imputation quality: mean DR2 </tspan><tspan fill="#56d4dd" font-weight="700">0.3619</tspan><tspan fill="#c9d1d9">  ·  20.0% of 1,061,118 imputed variants DR2 ≥ 0.8</tspan></text>
+<text x="30" y="791" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.28493;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Evaluating accuracy vs truth...                              </tspan><tspan fill="#8b949e">[112.3s | 14293 MB]</tspan></text>
+<text x="30" y="808" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.28770;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  imputed:  imputed.vcf.gz</tspan></text>
+<text x="30" y="825" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.29047;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  truth:    truth.vcf.gz</tspan></text>
+<text x="30" y="842" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.29323;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  shared:   801 samples</tspan></text>
+<text x="30" y="859" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.29600;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  exclude:  54076 of 1070401 panel sites monomorphic in chr22.srp (54076 new)</tspan></text>
+<text x="30" y="893" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.30153;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#e6edf3" font-weight="700">MAF bin                N variants    Mean R²  Concordance</tspan></text>
+<text x="30" y="910" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.30430;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">------------------------------------------------------------</tspan></text>
+<text x="30" y="927" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.30707;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">0.05-0.1%                  138764     0.2800       0.9988</tspan></text>
+<text x="30" y="944" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.30983;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">0.1-0.2%                   117614     0.3304       0.9975</tspan></text>
+<text x="30" y="961" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.31260;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">0.2-0.5%                   110884     0.4296       0.9952</tspan></text>
+<text x="30" y="978" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.31537;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">0.5-1%                      62388     0.5129       0.9913</tspan></text>
+<text x="30" y="995" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.31813;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">1-2%                        45155     0.5767       0.9853</tspan></text>
+<text x="30" y="1012" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.32090;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">2-5%                        45267     0.6783       0.9755</tspan></text>
+<text x="30" y="1029" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.32367;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">5-10%                       28734     0.7608       0.9598</tspan></text>
+<text x="30" y="1046" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.32643;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">10-20%                      31518     0.7971       0.9361</tspan></text>
+<text x="30" y="1063" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.32920;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">20-50%                      59501     0.8430       0.9167</tspan></text>
+<text x="30" y="1080" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.33197;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">------------------------------------------------------------</tspan></text>
+<text x="30" y="1097" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.33473;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#e6edf3" font-weight="700">OVERALL             </tspan><tspan fill="#c9d1d9">      1016325 </tspan><tspan fill="#56d4dd" font-weight="700">    0.4864</tspan><tspan fill="#c9d1d9">       0.9887</tspan></text>
+<text x="30" y="1131" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.34027;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">Per-sample (n=801):</tspan></text>
+<text x="30" y="1148" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.34304;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  R²:          mean=</tspan><tspan fill="#56d4dd" font-weight="700">0.917528</tspan><tspan fill="#c9d1d9">, min=0.830983, max=0.946986</tspan></text>
+<text x="30" y="1165" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.34580;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Concordance: mean=0.988676</tspan></text>
+<text x="30" y="1199" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.35134;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Imputed:  1070401 variants</tspan></text>
+<text x="30" y="1216" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.35410;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Truth:    1070401 variants</tspan></text>
+<text x="30" y="1233" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.35687;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Matched:  1016325 variants (94.9% of truth)</tspan></text>
+<text x="30" y="1250" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.35964;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Chromosomes: 1 (22)</tspan></text>
+<text x="30" y="1267" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.36240;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Accuracy: imputed.eval.json                                  </tspan><tspan fill="#8b949e">[115.2s | 14293 MB]</tspan></text>
+<text x="30" y="1301" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.36495;0.46230" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">Total: 115s | Peak memory: 14293 MB</tspan></text>
+<text x="30" y="1318" fill="#7ee787" font-weight="700" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.36843;0.46230" dur="43.14s" repeatCount="indefinite"/>$</text>
+<rect x="48" y="1306" width="7.5" height="15" fill="#7ee787" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.36843;0.46230" dur="43.14s" repeatCount="indefinite"/><animate attributeName="fill-opacity" values="1;1;0;0" keyTimes="0;0.5;0.5;1" dur="1s" repeatCount="indefinite"/></rect>
+</g></g></g>
+<g opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.43912;0.70520" dur="43.14s" repeatCount="indefinite"/>
+<text x="890" y="37" text-anchor="end" fill="#6cb6ff" font-family="'Segoe UI', system-ui, -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="700">WGS  →  phase only</text>
+<g clip-path="url(#vp)"><g>
+<animateTransform attributeName="transform" type="translate" calcMode="discrete" values="0,0;0,-17;0,-34;0,-51;0,-68;0,-85;0,-102;0,-119;0,-136;0,-153;0,-170;0,-187;0,-204;0,-221;0,-238;0,-255;0,-272" keyTimes="0;0.56487;0.56614;0.56742;0.57016;0.57016;0.57247;0.57478;0.57785;0.58092;0.58220;0.58494;0.62280;0.62847;0.62975;0.63102;0.63450" dur="43.14s" repeatCount="indefinite"/>
+<clipPath id="c_wgs_0"><rect x="48" y="64" height="17" width="0"><animate attributeName="width" values="0;0;502;896" keyTimes="0;0.45071;0.48603;1" dur="43.14s" repeatCount="indefinite"/></rect></clipPath>
+<text x="30" y="77" fill="#7ee787" font-weight="700">$</text>
+<g clip-path="url(#c_wgs_0)"><text x="48" y="77" fill="#e6edf3">selphi --refpanel chr22.srp --input wgs.vcf.gz --map chr22.map \</text></g>
+<rect y="65" width="7.5" height="15" fill="#7ee787" x="48" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.43912;0.49183" dur="43.14s" repeatCount="indefinite"/><animate attributeName="x" values="48;48;529.6;529.6" keyTimes="0;0.45071;0.48603;1" dur="43.14s" repeatCount="indefinite"/></rect>
+<clipPath id="c_wgs_1"><rect x="48" y="81" height="17" width="0"><animate attributeName="width" values="0;0;332;896" keyTimes="0;0.49183;0.51501;1" dur="43.14s" repeatCount="indefinite"/></rect></clipPath>
+<g clip-path="url(#c_wgs_1)"><text x="48" y="94" fill="#e6edf3">    --out phased --phase-only --threads 16</text></g>
+<rect y="82" width="7.5" height="15" fill="#7ee787" x="48" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.48603;0.52080" dur="43.14s" repeatCount="indefinite"/><animate attributeName="x" values="48;48;364.1;364.1" keyTimes="0;0.49183;0.51501;1" dur="43.14s" repeatCount="indefinite"/></rect>
+<text x="30" y="111" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.52903;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#56d4dd" font-weight="700">[selphi]</tspan><tspan fill="#c9d1d9"> SIMD: </tspan><tspan fill="#7ee787">AVX-512F+DQ</tspan></text>
+<text x="30" y="128" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.53030;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  auto-route: sniff GT=true PL=false GQ=false DP=false call-rate=1.000 (of 108000 GT entries) density=26022/Mb</tspan></text>
+<text x="30" y="145" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.53030;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">(thr 1000) </tspan><tspan fill="#8b949e">[0.0s | 626 MB]</tspan></text>
+<text x="30" y="162" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.53158;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  auto-route: confident hard calls (GT-only, or GQ/DP below WGS density) </tspan><tspan fill="#7ee787">→ genotype engine (no refine)</tspan><tspan fill="#c9d1d9"> </tspan><tspan fill="#8b949e">[0.0s |</tspan></text>
+<text x="30" y="179" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.53158;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#8b949e">626 MB]</tspan></text>
+<text x="30" y="213" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.53520;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  ___ ___ _    ___ _  _ ___</tspan></text>
+<text x="30" y="230" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.53701;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9"> / __| __| |  | _ \ || |_ _|</tspan></text>
+<text x="30" y="247" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.53882;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9"> \__ \ _|| |__|  _/ __ || |</tspan></text>
+<text x="30" y="264" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.54063;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9"> |___/___|____|_| |_||_|___|</tspan></text>
+<text x="30" y="281" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.54244;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">      </tspan><tspan fill="#8b949e">v2.0.0</tspan><tspan fill="#c9d1d9"> 🦀 </tspan><tspan fill="#7ee787">SelfDecode™</tspan></text>
+<text x="30" y="315" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.54606;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  input:    wgs.vcf.gz</tspan></text>
+<text x="30" y="332" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.54787;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  refpanel: chr22.srp</tspan></text>
+<text x="30" y="349" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.54968;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  map:      chr22.map</tspan></text>
+<text x="30" y="366" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.55149;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  output:   phased</tspan></text>
+<text x="30" y="383" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.55330;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  threads:  16</tspan></text>
+<text x="30" y="400" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.55511;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  log:      phased.log</tspan></text>
+<text x="30" y="434" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.55873;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Loaded SRP: 1070401 variants, 4478 haplotypes                </tspan><tspan fill="#8b949e">[0.2s | 626 MB]</tspan></text>
+<text x="30" y="451" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.56487;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Target: 54 samples, 1070401 variants, phased=false           </tspan><tspan fill="#8b949e">[1.3s | 1147 MB]</tspan></text>
+<text x="30" y="468" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.56614;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Variant intersection: 1070399 hash matches, 0 plain matches</tspan></text>
+<text x="30" y="485" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.56742;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Shared markers: 1070399 (100.0% of target)                   </tspan><tspan fill="#8b949e">[1.3s | 1169 MB]</tspan></text>
+<text x="30" y="502" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.57016;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Auto max_candidates: n_ref=4478, chunk_cv=0.817, scale=0.753 → mc=4478 (clamp [2500..1000000]) </tspan><tspan fill="#8b949e">[1.4s | 1193</tspan></text>
+<text x="30" y="519" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.57016;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#8b949e">MB]</tspan></text>
+<text x="30" y="536" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.57247;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Resources: 6.9 GB estimated, 123.1 GB system RAM, 16 threads (mc=4478)</tspan></text>
+<text x="30" y="553" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.57478;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Input is unphased — running phasing pipeline...              </tspan><tspan fill="#8b949e">[1.5s | 1216 MB]</tspan></text>
+<text x="30" y="570" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.57785;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Phasing engine: Diploid (default; 1070399 target variants)</tspan></text>
+<text x="30" y="587" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.58092;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Ref bitmatrix extracted (1070399 target sites × 4478 haps, 599.4 MB) </tspan><tspan fill="#8b949e">[1.8s | 1527 MB]</tspan></text>
+<text x="30" y="604" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.58220;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Using Diploid phasing                                        </tspan><tspan fill="#8b949e">[1.8s | 1527 MB]</tspan></text>
+<text x="30" y="621" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.58494;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Common ref subset (347061 / 1070399 variants, 194.4 MB)      </tspan><tspan fill="#8b949e">[1.9s | 1700 MB]</tspan></text>
+<text x="30" y="638" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.62280;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Phasing complete: 54 samples phased                          </tspan><tspan fill="#8b949e">[64.2s | 5387 MB]</tspan></text>
+<text x="30" y="655" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.62847;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Phase-only VCF: phased.vcf.gz                                </tspan><tspan fill="#8b949e">[65.1s | 5387 MB]</tspan></text>
+<text x="30" y="689" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.63102;0.72837" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">Total: 65s | Peak memory: 5387 MB</tspan></text>
+<text x="30" y="706" fill="#7ee787" font-weight="700" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.63450;0.72837" dur="43.14s" repeatCount="indefinite"/>$</text>
+<rect x="48" y="694" width="7.5" height="15" fill="#7ee787" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.63450;0.72837" dur="43.14s" repeatCount="indefinite"/><animate attributeName="fill-opacity" values="1;1;0;0" keyTimes="0;0.5;0.5;1" dur="1s" repeatCount="indefinite"/></rect>
+</g></g></g>
+<g opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.70520" dur="43.14s" repeatCount="indefinite"/>
+<text x="890" y="37" text-anchor="end" fill="#6cb6ff" font-family="'Segoe UI', system-ui, -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="700">low-coverage reads (BAM)  →  lcWGS</text>
+<g clip-path="url(#vp)"><g>
+<animateTransform attributeName="transform" type="translate" calcMode="discrete" values="0,0;0,-17;0,-34;0,-51;0,-68;0,-85;0,-102;0,-119;0,-136;0,-153;0,-170;0,-187" keyTimes="0;0.83483;0.83927;0.84201;0.87662;0.91123;0.91482;0.91841;0.92328;0.92455;0.92583;0.92931" dur="43.14s" repeatCount="indefinite"/>
+<clipPath id="c_lowcov_0"><rect x="48" y="64" height="17" width="0"><animate attributeName="width" values="0;0;525;896" keyTimes="0;0.71678;0.75376;1" dur="43.14s" repeatCount="indefinite"/></rect></clipPath>
+<text x="30" y="77" fill="#7ee787" font-weight="700">$</text>
+<g clip-path="url(#c_lowcov_0)"><text x="48" y="77" fill="#e6edf3">selphi --refpanel chr22.srp --bam HG002.bam --reference GRCh38.fa \</text></g>
+<rect y="65" width="7.5" height="15" fill="#7ee787" x="48" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.70520;0.75955" dur="43.14s" repeatCount="indefinite"/><animate attributeName="x" values="48;48;552.2;552.2" keyTimes="0;0.71678;0.75376;1" dur="43.14s" repeatCount="indefinite"/></rect>
+<clipPath id="c_lowcov_1"><rect x="48" y="81" height="17" width="0"><animate attributeName="width" values="0;0;355;896" keyTimes="0;0.75955;0.78439;1" dur="43.14s" repeatCount="indefinite"/></rect></clipPath>
+<g clip-path="url(#c_lowcov_1)"><text x="48" y="94" fill="#e6edf3">    --map chr22.map --out lowcov --threads 16</text></g>
+<rect y="82" width="7.5" height="15" fill="#7ee787" x="48" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.75376;0.79018" dur="43.14s" repeatCount="indefinite"/><animate attributeName="x" values="48;48;386.6;386.6" keyTimes="0;0.75955;0.78439;1" dur="43.14s" repeatCount="indefinite"/></rect>
+<text x="30" y="111" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.79841" dur="43.14s" repeatCount="indefinite"/><tspan fill="#56d4dd" font-weight="700">[selphi]</tspan><tspan fill="#c9d1d9"> SIMD: </tspan><tspan fill="#7ee787">AVX-512F+DQ</tspan></text>
+<text x="30" y="128" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.79969" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  auto-route: aligned reads (BAM/CRAM) </tspan><tspan fill="#7ee787">→ lcWGS engine</tspan><tspan fill="#c9d1d9"> </tspan><tspan fill="#8b949e">[0.0s | 42 MB]</tspan></text>
+<text x="30" y="162" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.80297" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  ___ ___ _    ___ _  _ ___</tspan></text>
+<text x="30" y="179" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.80461" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9"> / __| __| |  | _ \ || |_ _|</tspan></text>
+<text x="30" y="196" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.80625" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9"> \__ \ _|| |__|  _/ __ || |</tspan></text>
+<text x="30" y="213" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.80789" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9"> |___/___|____|_| |_||_|___|</tspan></text>
+<text x="30" y="230" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.80953" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">      </tspan><tspan fill="#8b949e">v2.0.0</tspan><tspan fill="#c9d1d9"> 🦀 </tspan><tspan fill="#7ee787">SelfDecode™</tspan></text>
+<text x="30" y="264" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.81282" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  mode:     lcwgs</tspan></text>
+<text x="30" y="281" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.81446" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  input:    HG002.bam</tspan></text>
+<text x="30" y="298" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.81610" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  refpanel: chr22.srp</tspan></text>
+<text x="30" y="315" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.81774" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  map:      chr22.map</tspan></text>
+<text x="30" y="332" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.81938" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  output:   lowcov</tspan></text>
+<text x="30" y="349" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.82102" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  threads:  16</tspan></text>
+<text x="30" y="366" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.82267" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  log:      lowcov.log</tspan></text>
+<text x="30" y="400" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.82595" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  SRP loaded: 964078 variants, 6332 haps                       </tspan><tspan fill="#8b949e">[0.1s | 267 MB]</tspan></text>
+<text x="30" y="417" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.83039" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  lcWGS-BAM: 1 BAM(s), chrom chr22, 964078 panel sites (964078 SNPs, 0 indels)</tspan></text>
+<text x="30" y="434" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.83483" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  lcWGS-BAM: BAQ on (extended, partial-realignment heuristic — bcftools mpileup default); reference window</tspan></text>
+<text x="30" y="451" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.83483" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">50818468 bp</tspan></text>
+<text x="30" y="468" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.83927" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  lcWGS-BAM: HG002: 323880 reads, 9733 triggering sites, 19387 realigned (6.0%), 0 BAQ no-ops </tspan><tspan fill="#8b949e">[1.5s | 429 MB]</tspan></text>
+<text x="30" y="485" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.84201" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  chunked Gibbs: 82.4 cM span → 6 chunks (core 16.0 cM + 0.5 cM buffer each side) </tspan><tspan fill="#8b949e">[1.6s | 503 MB]</tspan></text>
+<text x="30" y="502" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.87662" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  chunk parallelism: 6 live (budget 2.5 GB, ~0.24 GB/chunk)</tspan></text>
+<text x="30" y="519" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.91123" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  lcwgs done: 964078 variants × 1 sample                       </tspan><tspan fill="#8b949e">[105.0s | 6012 MB]</tspan></text>
+<text x="30" y="536" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.91482" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  Imputation quality: mean GP confidence </tspan><tspan fill="#56d4dd" font-weight="700">0.9757</tspan><tspan fill="#c9d1d9">  ·  93.8% of 964,078 calls ≥ 0.9</tspan></text>
+<text x="30" y="553" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.91841" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  wrote imputed VCF: lowcov.vcf.gz                             </tspan><tspan fill="#8b949e">[105.5s | 6012 MB]</tspan></text>
+<text x="30" y="570" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.92328" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">  wrote dosage TSV: lowcov.dose.tsv.gz                         </tspan><tspan fill="#8b949e">[106.1s | 6012 MB]</tspan></text>
+<text x="30" y="604" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.92583" dur="43.14s" repeatCount="indefinite"/><tspan fill="#c9d1d9">Total: 106s | Peak memory: 6012 MB</tspan></text>
+<text x="30" y="621" fill="#7ee787" font-weight="700" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.92931" dur="43.14s" repeatCount="indefinite"/>$</text>
+<rect x="48" y="609" width="7.5" height="15" fill="#7ee787" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.92931" dur="43.14s" repeatCount="indefinite"/><animate attributeName="fill-opacity" values="1;1;0;0" keyTimes="0;0.5;0.5;1" dur="1s" repeatCount="indefinite"/></rect>
+</g></g></g>
+</g>
+<g transform="translate(0,466)">
+<text x="460" y="30" text-anchor="middle" fill="#e6edf3" font-size="18" font-weight="600">Selphi 2 — pipeline</text>
+<rect x="30" y="50" width="195" height="50" rx="8" fill="#0d1117" stroke="#238636" stroke-width="1.5"/>
+<text x="127.5" y="71" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">TARGET</text>
+<text x="127.5" y="88" text-anchor="middle" fill="#c9d1d9" font-size="12.5">VCF / BCF / BAM / CRAM</text>
+<rect x="248" y="50" width="195" height="50" rx="8" fill="#0d1117" stroke="#d29922" stroke-width="1.5"/>
+<text x="345.5" y="71" text-anchor="middle" fill="#d29922" font-size="11" font-weight="600">REFERENCE PANEL</text>
+<text x="345.5" y="88" text-anchor="middle" fill="#c9d1d9" font-size="12.5">SRP (single or multi-chr)</text>
+<rect x="466" y="50" width="195" height="50" rx="8" fill="#0d1117" stroke="#8b949e" stroke-width="1.5"/>
+<text x="563.5" y="71" text-anchor="middle" fill="#8b949e" font-size="11" font-weight="600">GENETIC MAP</text>
+<text x="563.5" y="88" text-anchor="middle" fill="#c9d1d9" font-size="12.5">PLINK format</text>
+<rect x="684" y="50" width="205" height="50" rx="8" fill="#0d1117" stroke="#6e7681" stroke-width="1" stroke-dasharray="4,3"/>
+<text x="786.5" y="71" text-anchor="middle" fill="#6e7681" font-size="11" font-weight="600">OPTIONAL</text>
+<text x="786.5" y="88" text-anchor="middle" fill="#8b949e" font-size="12.5">Pedigree (PED)</text>
+<line x1="128" y1="100" x2="128" y2="130" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
+<line x1="346" y1="100" x2="346" y2="130" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
+<rect x="60" y="132" width="640" height="38" rx="10" fill="url(#sg)" stroke="#8b5cf6" stroke-width="1.5"/>
+<text x="380" y="149" text-anchor="middle" fill="#a78bfa" font-size="12" font-weight="700">Bitmatrix extraction</text>
+<text x="380" y="164" text-anchor="middle" fill="#8b949e" font-size="11">1 bit per allele · shared between phasing and imputation · SIMD-accelerated</text>
+<line x1="380" y1="170" x2="380" y2="196" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
+<rect x="50" y="198" width="820" height="200" rx="10" fill="url(#sg)" stroke="#1f6feb" stroke-width="1.5"/>
+<text x="460" y="220" text-anchor="middle" fill="#58a6ff" font-size="14" font-weight="700">Phasing</text>
+<text x="460" y="237" text-anchor="middle" fill="#8b949e" font-size="11">if the target is unphased — diploid engine by default for all inputs; haploid optional for chip arrays</text>
+<rect x="70" y="250" width="380" height="136" rx="8" fill="#0d1117" stroke="#f97316" stroke-width="1.2"/>
+<text x="260" y="272" text-anchor="middle" fill="#fb923c" font-size="13" font-weight="700">Haploid engine</text>
+<text x="260" y="293" text-anchor="middle" fill="#c9d1d9" font-size="11.5">Coded-step PBWT → 280 composite haplotypes</text>
+<text x="260" y="311" text-anchor="middle" fill="#c9d1d9" font-size="11.5">3-channel HMM + greedy swap (15 iterations)</text>
+<text x="260" y="329" text-anchor="middle" fill="#c9d1d9" font-size="11.5">Adaptive step scale (fine → coarse)</text>
+<text x="260" y="347" text-anchor="middle" fill="#c9d1d9" font-size="11.5">Rare-carrier injection + EM per window</text>
+<text x="260" y="377" text-anchor="middle" fill="#8b949e" font-size="10" font-style="italic">opt-in for chip arrays (--phasing-engine haploid)</text>
+<rect x="470" y="250" width="380" height="136" rx="8" fill="#0d1117" stroke="#3b82f6" stroke-width="1.2"/>
+<text x="660" y="272" text-anchor="middle" fill="#60a5fa" font-size="13" font-weight="700">Diploid engine</text>
+<text x="660" y="293" text-anchor="middle" fill="#c9d1d9" font-size="11.5">Genotype graph + MCMC (15 iterations)</text>
+<text x="660" y="311" text-anchor="middle" fill="#c9d1d9" font-size="11.5">EM Ne estimation during burn-in</text>
+<text x="660" y="329" text-anchor="middle" fill="#c9d1d9" font-size="11.5">Common → rare two-stage (PBWT voting)</text>
+<text x="660" y="347" text-anchor="middle" fill="#c9d1d9" font-size="11.5">IBD2 exclusion + match-length-weighted rare votes</text>
+<text x="660" y="377" text-anchor="middle" fill="#8b949e" font-size="10" font-style="italic">default · all inputs (arrays and WGS)</text>
+<path d="M787 100 L787 186 L895 186 L895 318 L872 318" fill="none" stroke="#6e7681" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arr)"/>
+<text x="905" y="252" fill="#6e7681" font-size="9" transform="rotate(90,905,252)" text-anchor="middle">Mendelian scaffold</text>
+<path d="M 28 100 L 12 100 L 12 548 L 48 548" fill="none" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arr)"/>
+<text x="5" y="324" fill="#58a6ff" font-size="10" font-weight="600" transform="rotate(-90,5,324)" text-anchor="middle">pre-phased input → skip</text>
+<line x1="460" y1="398" x2="460" y2="412" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
+<rect x="140" y="414" width="640" height="28" rx="8" fill="#0d1117" stroke="#238636" stroke-width="1" stroke-dasharray="6,3"/>
+<text x="460" y="432" text-anchor="middle" fill="#7ee787" font-size="11">In-memory handoff: phased haplotypes + shared bitmatrix (no file I/O)</text>
+<line x1="460" y1="442" x2="460" y2="458" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
+<rect x="50" y="460" width="820" height="214" rx="10" fill="url(#sg)" stroke="#ec4899" stroke-width="1.5"/>
+<text x="460" y="482" text-anchor="middle" fill="#f472b6" font-size="14" font-weight="700">Imputation</text>
+<text x="460" y="499" text-anchor="middle" fill="#8b949e" font-size="11">chosen from the input: confident genotypes → genotype engine | low-coverage likelihoods or aligned reads → lcWGS engine</text>
+<rect x="70" y="512" width="380" height="124" rx="8" fill="#0d1117" stroke="#ec4899" stroke-width="1.2"/>
+<text x="260" y="533" text-anchor="middle" fill="#f9a8d4" font-size="13" font-weight="700">Genotype imputation</text>
+<text x="260" y="549" text-anchor="middle" fill="#8b949e" font-size="10">chip / WGS confident hard calls</text>
+<text x="260" y="569" text-anchor="middle" fill="#c9d1d9" font-size="11.5">PBWT candidate selection (whole panel up to 16,000 haps)</text>
+<text x="260" y="587" text-anchor="middle" fill="#c9d1d9" font-size="11.5">Li-Stephens HMM (f32 states, f64 recombination)</text>
+<text x="260" y="605" text-anchor="middle" fill="#c9d1d9" font-size="11.5">Haplotype dedup · Ne = 36.4 × n_ref, MAF-scaled</text>
+<text x="260" y="627" text-anchor="middle" fill="#f472b6" font-size="10" font-style="italic">hard calls in → dosages out</text>
+<rect x="470" y="512" width="380" height="124" rx="8" fill="#0d1117" stroke="#2dd4bf" stroke-width="1.2"/>
+<text x="660" y="533" text-anchor="middle" fill="#5eead4" font-size="13" font-weight="700">Low-coverage WGS imputation</text>
+<text x="660" y="549" text-anchor="middle" fill="#8b949e" font-size="10">low-coverage sequencing (genotype likelihoods)</text>
+<text x="660" y="569" text-anchor="middle" fill="#c9d1d9" font-size="11.5">PL VCF, or BAM / CRAM with native pileup + BAQ</text>
+<text x="660" y="587" text-anchor="middle" fill="#c9d1d9" font-size="11.5">Sparse PBWT ⇄ GL-weighted Li-Stephens (√n-checkpointed)</text>
+<text x="660" y="605" text-anchor="middle" fill="#c9d1d9" font-size="11.5">Founder phasing HMM, re-committed every iteration</text>
+<text x="660" y="627" text-anchor="middle" fill="#2dd4bf" font-size="10" font-style="italic">GLs in → GT:DS:GP out</text>
+<text x="460" y="660" text-anchor="middle" fill="#c9d1d9" font-size="11">Tiled interpolation (1,024 × 4,096, L2-cache) · fused interpolate → encode → stream · DR2 · LD-corrected</text>
+<line x1="460" y1="674" x2="460" y2="688" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
+<rect x="50" y="690" width="820" height="54" rx="10" fill="url(#sg)" stroke="#238636" stroke-width="1.5"/>
+<text x="460" y="710" text-anchor="middle" fill="#7ee787" font-size="13" font-weight="700">Multi-format output (one interpolation pass, identical dosages)</text>
+<rect x="113" y="720" width="120" height="18" rx="4" fill="#238636" opacity="0.2"/>
+<text x="173.0" y="733" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">VCF.gz</text>
+<rect x="248" y="720" width="120" height="18" rx="4" fill="#238636" opacity="0.2"/>
+<text x="308.0" y="733" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">BCF 2.2</text>
+<rect x="383" y="720" width="120" height="18" rx="4" fill="#238636" opacity="0.2"/>
+<text x="443.0" y="733" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">Parquet</text>
+<rect x="518" y="720" width="155" height="18" rx="4" fill="#238636" opacity="0.2"/>
+<text x="595.5" y="733" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">PGEN + dosage</text>
+<rect x="688" y="720" width="120" height="18" rx="4" fill="#238636" opacity="0.2"/>
+<text x="748.0" y="733" text-anchor="middle" fill="#7ee787" font-size="11" font-weight="600">SelfDecode</text>
+<rect x="50" y="756" width="405" height="30" rx="6" fill="#0d1117" stroke="#d29922" stroke-width="1" stroke-dasharray="4,3"/>
+<text x="252" y="775" text-anchor="middle" fill="#d29922" font-size="11">Multi-chromosome: one SRP file, overlapped prefetch</text>
+<rect x="465" y="756" width="405" height="30" rx="6" fill="#0d1117" stroke="#d29922" stroke-width="1" stroke-dasharray="4,3"/>
+<text x="667" y="775" text-anchor="middle" fill="#d29922" font-size="11">Panels: BCF / VCF / BREF3 ↔ SRP, no external converter</text>
+<g>
+<rect x="70" y="250" width="380" height="136" rx="8" fill="#0d1117" opacity="0.72"><animate attributeName="opacity" calcMode="discrete" values="0.72;0" keyTimes="0;0.43912" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="470" y="512" width="380" height="124" rx="8" fill="#0d1117" opacity="0.72"><animate attributeName="opacity" calcMode="discrete" values="0.72;0" keyTimes="0;0.43912" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="70" y="250" width="380" height="136" rx="8" fill="#0d1117" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;0.72;0" keyTimes="0;0.43912;0.70520" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="140" y="414" width="640" height="28" rx="8" fill="#0d1117" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;0.72;0" keyTimes="0;0.43912;0.70520" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="70" y="512" width="380" height="124" rx="8" fill="#0d1117" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;0.72;0" keyTimes="0;0.43912;0.70520" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="470" y="512" width="380" height="124" rx="8" fill="#0d1117" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;0.72;0" keyTimes="0;0.43912;0.70520" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="49" y="197" width="822" height="202" rx="10" fill="#0d1117" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;0.72" keyTimes="0;0.70520" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="140" y="414" width="640" height="28" rx="8" fill="#0d1117" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;0.72" keyTimes="0;0.70520" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="70" y="512" width="380" height="124" rx="8" fill="#0d1117" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;0.72" keyTimes="0;0.70520" dur="43.14s" repeatCount="indefinite"/></rect>
+</g>
+<g>
+<rect x="30" y="50" width="195" height="50" rx="8" fill="none" stroke="#16a34a" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.14737;0.43912" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="248" y="50" width="195" height="50" rx="8" fill="none" stroke="#d29922" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.14610;0.43912" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="60" y="132" width="640" height="38" rx="10" fill="none" stroke="#8b5cf6" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.16044;0.43912" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="470" y="250" width="380" height="136" rx="8" fill="none" stroke="#2563eb" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.16172;0.43912" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="140" y="414" width="640" height="28" rx="8" fill="none" stroke="#16a34a" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.18338;0.43912" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="466" y="50" width="195" height="50" rx="8" fill="none" stroke="#8b949e" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.18592;0.43912" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="70" y="512" width="380" height="124" rx="8" fill="none" stroke="#db2777" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.23415;0.43912" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="50" y="690" width="820" height="54" rx="10" fill="none" stroke="#16a34a" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.28238;0.43912" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="30" y="50" width="195" height="50" rx="8" fill="none" stroke="#16a34a" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.56487;0.70520" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="248" y="50" width="195" height="50" rx="8" fill="none" stroke="#d29922" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.55873;0.70520" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="60" y="132" width="640" height="38" rx="10" fill="none" stroke="#8b5cf6" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.58092;0.70520" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="470" y="250" width="380" height="136" rx="8" fill="none" stroke="#2563eb" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.57785;0.70520" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="30" y="50" width="195" height="50" rx="8" fill="none" stroke="#16a34a" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.79969" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="248" y="50" width="195" height="50" rx="8" fill="none" stroke="#d29922" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.81610" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="466" y="50" width="195" height="50" rx="8" fill="none" stroke="#8b949e" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.81774" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="470" y="512" width="380" height="124" rx="8" fill="none" stroke="#0d9488" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.83483" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="50" y="690" width="820" height="54" rx="10" fill="none" stroke="#16a34a" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.91123" dur="43.14s" repeatCount="indefinite"/></rect>
+</g>
+</g></svg>

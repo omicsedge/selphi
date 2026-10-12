@@ -1,0 +1,2 @@
+selphi --refpanel chr22.srp --bam HG002.bam --reference GRCh38.fa \
+    --map chr22.map --out lowcov --threads 16
