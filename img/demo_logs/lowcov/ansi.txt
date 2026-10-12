@@ -1,0 +1,32 @@
+Script started on 2026-10-12 21:43:49+00:00 [COMMAND="selphi --refpanel chr22.srp --bam HG002.bam --reference GRCh38.fa --map chr22.map --out lowcov --threads 16 " <not executed on terminal>]
+[1;36m[selphi][0m SIMD: [32mAVX-512F+DQ[0m
+  auto-route: aligned reads (BAM/CRAM) [32m→ lcWGS engine[0m [2m[0.0s | 42 MB][0m
+[1;36m
+  ___ ___ _    ___ _  _ ___
+ / __| __| |  | _ \ || |_ _|
+ \__ \ _|| |__|  _/ __ || |
+ |___/___|____|_| |_||_|___|[0m
+      [2mv2.0.0[0m 🦀 [32mSelfDecode™[0m
+
+  mode:     lcwgs
+  input:    HG002.bam
+  refpanel: chr22.srp
+  map:      chr22.map
+  output:   lowcov
+  threads:  16
+  log:      lowcov.log
+
+  SRP loaded: 964078 variants, 6332 haps                       [2m[0.1s | 267 MB][0m
+  lcWGS-BAM: 1 BAM(s), chrom chr22, 964078 panel sites (964078 SNPs, 0 indels)
+  lcWGS-BAM: BAQ on (extended, partial-realignment heuristic — bcftools mpileup default); reference window 50818468 bp
+  lcWGS-BAM: HG002: 323880 reads, 9733 triggering sites, 19387 realigned (6.0%), 0 BAQ no-ops [2m[1.5s | 429 MB][0m
+  chunked Gibbs: 82.4 cM span → 6 chunks (core 16.0 cM + 0.5 cM buffer each side) [2m[1.6s | 503 MB][0m
+  chunk parallelism: 6 live (budget 2.5 GB, ~0.24 GB/chunk)
+  lcwgs done: 964078 variants × 1 sample                       [2m[105.0s | 6012 MB][0m
+  Imputation quality: mean GP confidence [1;36m0.9757[0m  ·  93.8% of 964,078 calls ≥ 0.9
+  wrote imputed VCF: lowcov.vcf.gz                             [2m[105.5s | 6012 MB][0m
+  wrote dosage TSV: lowcov.dose.tsv.gz                         [2m[106.1s | 6012 MB][0m
+
+Total: 106s | Peak memory: 6012 MB
+
+Script done on 2026-10-12 21:45:35+00:00 [COMMAND_EXIT_CODE="0"]

@@ -1,0 +1,71 @@
+Script started on 2026-10-12 21:40:48+00:00 [COMMAND="selphi --refpanel chr22.srp --input chip.vcf.gz --map chr22.map --out imputed --truth truth.vcf.gz --exclude-panel-monomorphic chr22.srp --threads 16 " <not executed on terminal>]
+[1;36m[selphi][0m SIMD: [32mAVX-512F+DQ[0m
+  auto-route: sniff GT=true PL=false GQ=false DP=false call-rate=1.000 (of 1602000 GT entries) density=262/Mb (thr 1000) [2m[0.0s | 106 MB][0m
+  auto-route: confident hard calls (GT-only, or GQ/DP below WGS density) [32m→ genotype engine (no refine)[0m [2m[0.0s | 106 MB][0m
+[1;36m
+  ___ ___ _    ___ _  _ ___
+ / __| __| |  | _ \ || |_ _|
+ \__ \ _|| |__|  _/ __ || |
+ |___/___|____|_| |_||_|___|[0m
+      [2mv2.0.0[0m 🦀 [32mSelfDecode™[0m
+
+  input:    chip.vcf.gz
+  refpanel: chr22.srp
+  map:      chr22.map
+  output:   imputed
+  threads:  16
+  log:      imputed.log
+
+  Loaded SRP: 1070401 variants, 4802 haplotypes                [2m[0.2s | 340 MB][0m
+  Target: 801 samples, 9283 variants, phased=false             [2m[0.2s | 356 MB][0m
+  Variant intersection: 9283 hash matches, 0 plain matches
+  Shared markers: 9283 (100.0% of target)                      [2m[0.2s | 358 MB][0m
+  Auto max_candidates: n_ref=4802, chunk_cv=0.691, scale=0.652 → mc=4802 (clamp [2500..1000000]) [2m[0.2s | 386 MB][0m
+  Resources: 9.4 GB estimated, 123.1 GB system RAM, 16 threads (mc=4802)
+  Input is unphased — running phasing pipeline...              [2m[0.3s | 387 MB][0m
+  Phasing engine: Diploid (default; 9283 target variants)
+  Ref bitmatrix extracted (9283 target sites × 4802 haps, 5.6 MB) [2m[0.4s | 496 MB][0m
+  Using Diploid phasing                                        [2m[0.4s | 496 MB][0m
+  Common ref subset (8928 / 9283 variants, 5.4 MB)             [2m[0.4s | 496 MB][0m
+  Diploid intra-run phase ensemble: 2 members (1× phasing)     [2m[0.4s | 496 MB][0m
+  Phasing complete: 801 samples phased                         [2m[15.2s | 751 MB][0m
+  Diploid intra-run ensemble: averaging 2 members from one phasing chain [2m[15.2s | 751 MB][0m
+  Genetic map loaded + LD correction                           [2m[15.2s | 751 MB][0m
+  formats:  VCF.gz
+  PBWT sort shared across 16 targets (101 groups on 16 threads; auto: 118 GB available, 15.1 MB per in-flight target -> +3.5 GB; mc/n_ref 1.00). Byte-identical; set SELPHI_PBWT_SHARE=1 to disable.
+    Window 1/1: PBWT=70.5s interp=17.2s (9283 vars)
+  Output: imputed.vcf.gz  (1,070,401 variants × 801 samples · 500.4 MB) [2m[112.3s | 14293 MB][0m
+  Imputation quality: mean DR2 [1;36m0.3619[0m  ·  20.0% of 1,061,118 imputed variants DR2 ≥ 0.8
+  Evaluating accuracy vs truth...                              [2m[112.3s | 14293 MB][0m
+  imputed:  imputed.vcf.gz
+  truth:    truth.vcf.gz
+  shared:   801 samples
+  exclude:  54076 of 1070401 panel sites monomorphic in chr22.srp (54076 new)
+
+[1mMAF bin                N variants    Mean R²  Concordance[0m
+------------------------------------------------------------
+0.05-0.1%                  138764     0.2800       0.9988
+0.1-0.2%                   117614     0.3304       0.9975
+0.2-0.5%                   110884     0.4296       0.9952
+0.5-1%                      62388     0.5129       0.9913
+1-2%                        45155     0.5767       0.9853
+2-5%                        45267     0.6783       0.9755
+5-10%                       28734     0.7608       0.9598
+10-20%                      31518     0.7971       0.9361
+20-50%                      59501     0.8430       0.9167
+------------------------------------------------------------
+[1mOVERALL             [0m      1016325 [1;36m    0.4864[0m       0.9887
+
+Per-sample (n=801):
+  R²:          mean=[1;36m0.917528[0m, min=0.830983, max=0.946986
+  Concordance: mean=0.988676
+
+  Imputed:  1070401 variants
+  Truth:    1070401 variants
+  Matched:  1016325 variants (94.9% of truth)
+  Chromosomes: 1 (22)
+  Accuracy: imputed.eval.json                                  [2m[115.2s | 14293 MB][0m
+
+Total: 115s | Peak memory: 14293 MB
+
+Script done on 2026-10-12 21:42:44+00:00 [COMMAND_EXIT_CODE="0"]

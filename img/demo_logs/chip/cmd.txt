@@ -1,0 +1,2 @@
+selphi --refpanel chr22.srp --input chip.vcf.gz --map chr22.map --out imputed \
+    --truth truth.vcf.gz --exclude-panel-monomorphic chr22.srp --threads 16
