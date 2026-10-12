@@ -85,7 +85,7 @@ def lcwgs_svg(t):
     Y = lambda r: y_b - (y_b - y_t) * (r - lo) / (hi - lo)
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 410" font-family="{FONT}">',
            f'<text x="16" y="26" fill="{c["fg"]}" font-size="16" font-weight="700">Low-coverage imputation accuracy across depth</text>',
-           f'<text x="16" y="46" fill="{c["muted"]}" font-size="12">Per-sample R&#178; &#183; GIAB HG002/HG003/HG004, chr22:20-30 Mb &#183; 6,332-haplotype 1000 Genomes panel &#183; sites imputed by all three</text>']
+           f'<text x="16" y="46" fill="{c["muted"]}" font-size="12">Per-sample R&#178; &#183; GIAB HG002-HG004, chr22:20-30 Mb &#183; 6,332-haplotype panel &#183; sites imputed by all three tools</text>']
     for k in range(5):
         r = lo + k * (hi - lo) / 4
         y = Y(r)
@@ -94,7 +94,7 @@ def lcwgs_svg(t):
     for v in COV:
         lab = "0.5" if v == 0.5 else str(v)
         out.append(f'<text x="{X(v):.1f}" y="320" text-anchor="middle" fill="{c["muted"]}" font-size="12">{lab}&#215;</text>')
-    out += [f'<text x="{(x_l + x_r) / 2:.1f}" y="340" text-anchor="middle" fill="{c["muted"]}" font-size="12" font-weight="600">Sequencing coverage</text>',
+    out += [f'<text x="{(x_l + x_r) / 2:.1f}" y="340" text-anchor="middle" fill="{c["muted"]}" font-size="12" font-weight="600">Sequencing coverage (log scale: each step doubles the depth)</text>',
             f'<line x1="{x_l}" y1="{y_t}" x2="{x_l}" y2="{y_b}" stroke="{c["grid"]}" stroke-width="1"/>']
     styles = {"GLIMPSE2": (c["amber"], "square"), "QUILT2": (c["green"], "triangle"), "Selphi 2": (c["blue"], "circle")}
 
