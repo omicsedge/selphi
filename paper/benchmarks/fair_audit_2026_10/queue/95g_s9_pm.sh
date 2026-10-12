@@ -1,5 +1,5 @@
 #!/bin/bash
-# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, c9062d8) with the CSI-seek fix (f5202b5).
+# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, cb4dc9f) with the CSI-seek fix (c76055a).
 # R4a: Table S9 / Figure 3a (genome-wide imputation-only, 20 autosomes excl. 8 and 11). Selphi 2 re-run on the current
 # binary from the identical phased target; Beagle 5.5, IMPUTE5 and Minimac4 outputs (unchanged tools, same phased target,
 # same 2,401-sample panel) re-scored. ALL scored by the same evaluator with the corrected per-site rule.

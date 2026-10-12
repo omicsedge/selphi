@@ -1,5 +1,5 @@
 #!/bin/bash
-# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, c9062d8) with the CSI-seek fix (f5202b5).
+# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, cb4dc9f) with the CSI-seek fix (c76055a).
 # R4b: Table 3 / S1 "unphased" rows (full phase+impute pipeline from the truly unphased chip, chr22 and chr1, 801 samples).
 # Selphi 2 and Beagle 5.5 in the SAME session, same target, Beagle given a bref3 converted from Selphi's SRP, same map,
 # scored by the corrected evaluator; per-sample paired statistics recomputed from these two runs only.

@@ -1,5 +1,5 @@
 #!/bin/bash
-# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, c9062d8) with the CSI-seek fix (f5202b5).
+# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, cb4dc9f) with the CSI-seek fix (c76055a).
 # R5 + R4d: HGDP out-of-panel (Table 4c, Figure 3c, per-variant sentence). Sept Selphi outputs were deleted and the
 # evaluator read only 98.5% of their records on 6 chromosomes; per-variant numbers also need the corrected rule.
 # Re-run Selphi on the current binary (recipe = hgdp_gw.sh: 1KG subset panel, --drop-long-alleles, 5-kb common-SNP array,

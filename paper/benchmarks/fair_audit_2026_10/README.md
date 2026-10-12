@@ -21,7 +21,7 @@ with `setsid nohup bash script.sh > out 2>&1 &`, and read the `RESULT` lines.
 5. **Never redirect a run's stdout to `<out>.log`.** Selphi writes that file itself and the
    redirect overwrites the error message.
 6. **Check that every output was read in full**: records written equals records scored. The
-   CSI-seek defect fixed in f5202b5 dropped 1,041 records from one HGDP region without any error.
+   CSI-seek defect fixed in c76055a dropped 1,041 records from one HGDP region without any error.
 7. **After a re-measurement, grep the whole manuscript and supplement for the old value.**
 8. **The paper states method and result only**: no session dates, earlier builds or drafts.
 
@@ -55,7 +55,7 @@ Scripts numbered 60-94 without the `_pm` suffix are the earlier passes scored wi
 panel-monomorphic exclusion; the `95*` versions supersede them. `queue/runner.sh` ran the queue
 in order, one script at a time.
 
-## Walk cap (`SELPHI_PBWT_WALK_CAP`, commit 54b1da5)
+## Walk cap (`SELPHI_PBWT_WALK_CAP`, commit 641b003)
 
 Automatic K = 200 on panels of 100,000+ haplotypes, off below (byte-identical there). Validation:
 `walk_cap/validate_all_rigs.sh` (1KG chr1, GIAB chr21/chr1, consumer arrays, MESA 5k),
@@ -66,5 +66,5 @@ or above the default on every rig.
 
 ## Gates (exact output checks)
 
-See the gate table in the repository CLAUDE.md. Since 54b1da5 the biobank gate (MESA 100 x TOPMed)
+See the gate table in the repository CLAUDE.md. Since 641b003 the biobank gate (MESA 100 x TOPMed)
 is `267c51f7...`; `SELPHI_PBWT_WALK_CAP=0` reproduces the previous `062b5fe1...`.

@@ -1,5 +1,5 @@
 #!/bin/bash
-# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, c9062d8) with the CSI-seek fix (f5202b5).
+# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, cb4dc9f) with the CSI-seek fix (c76055a).
 # Table 4: mc = 2,500 vs panel-adaptive (132,676) on a 500-sample MESA subset, chr20 x TOPMed.
 # Subset = first 500 samples of the 5k unphased chip target (the original subset is unrecorded).
 # Truth = the 5k truth BCF; the evaluator intersects samples and takes MAF over the shared ones.
