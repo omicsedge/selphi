@@ -49,7 +49,7 @@ def speed_svg(t):
     vmax = max(v for _, v in SPEED)
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 248" font-family="{FONT}">',
            f'<text x="16" y="26" fill="{c["fg"]}" font-size="16" font-weight="700">Whole-genome phasing + imputation &#183; wall time</text>',
-           f'<text x="16" y="46" fill="{c["muted"]}" font-size="12">6 samples vs the 75,552-haplotype reference panel &#183; 22 autosomes &#183; 16 threads &#183; same machine and session</text>']
+           f'<text x="16" y="46" fill="{c["muted"]}" font-size="12">6 samples vs the 75,552-haplotype panel &#183; 22 autosomes &#183; 16 threads &#183; same session, panel files in page cache</text>']
     for i, ((name, sec), colour) in enumerate(zip(SPEED, (c["blue"], c["amber"]))):
         y = 78 + 58 * i
         w = w_max * sec / vmax
@@ -61,7 +61,7 @@ def speed_svg(t):
     speedup = SPEED[1][1] / SPEED[0][1]
     saved = (SPEED[1][1] - SPEED[0][1]) / 60
     out += [f'<text x="16" y="210" fill="{c["green"]}" font-size="13" font-weight="700">Selphi 2 is {speedup:.1f}&#215; faster end-to-end ({saved:.1f} min saved)</text>',
-            f'<text x="16" y="232" fill="{c["muted"]}" font-size="12">Peak memory {SPEED_MEM[0]} for Selphi 2 vs {SPEED_MEM[1]} for Beagle 5.5</text>',
+            f'<text x="16" y="232" fill="{c["muted"]}" font-size="12">Peak memory {SPEED_MEM[0]} vs {SPEED_MEM[1]} &#183; cold first pass (panel read from disk): 26.2 vs 29.9 min</text>',
             '</svg>']
     return "\n".join(out) + "\n"
 
