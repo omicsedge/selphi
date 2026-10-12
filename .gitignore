@@ -21,3 +21,7 @@ HG004*
 
 # Build output
 /target/
+
+# Internal working notes: kept locally, never pushed (the repository is public)
+/docs/engineering/
+/paper/internal_notes/
