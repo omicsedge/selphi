@@ -1160,7 +1160,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         (pr.phased_alleles, em_ne_to_use, pr.ref_bm_full, extra_phased, pr.phase_conf)
     } else {
         if args.phase_only {
-            selphi_info!("WARNING: --phase_only requested but input is already phased. Nothing to do.");
+            selphi_info!("WARNING: --phase-only requested but input is already phased. Nothing to do (pass --force-phasing to re-phase).");
             return;
         }
         // Say it out loud. A target whose GT are pipe-separated skips the phasing

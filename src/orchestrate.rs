@@ -659,10 +659,6 @@ pub fn run_multi_chr(
     // say so once, at the top of the run, rather than letting a whole-genome job
     // quietly differ from the per-chromosome one.
     if !is_phased || config.force_phasing {
-        let intra_n = selphi::config::usize_or("SELPHI_DIPLOID_INTRA_N", 2).max(1);
-        if intra_n > 1 {
-            selphi_info!("  NOTE: the diploid intra-run phase ensemble (SELPHI_DIPLOID_INTRA_N={}) is not applied on the multi-chromosome path; phasing uses the single Viterbi solve. Run per chromosome to get it.", intra_n);
-        }
         if config.phasing_engine == "haploid" {
             selphi_info!("  NOTE: the haploid engine's per-window EM Ne is not forwarded to the imputation HMM on the multi-chromosome path, so --no-em-ne has no effect here.");
         }
