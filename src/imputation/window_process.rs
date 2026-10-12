@@ -396,7 +396,15 @@ fn resolve_share(n_var_w: usize, fl_fwd: usize, n_ref: usize, n_batch: usize, ma
     let avail = crate::log::available_ram_mb().unwrap_or(0.0);
     let threads = hmm_pool_width();
     let cand_fraction = max_candidates.min(n_ref) as f64 / n_ref.max(1) as f64;
-    if b > 1 {
+    // The decision is re-made for every sample batch; report it once per run at
+    // info level and every later batch at debug level.
+    static SHARE_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let first = !SHARE_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed);
+    if b > 1 && !first {
+        crate::selphi_debug!(
+            "  PBWT sort shared across {} targets ({} groups on {} threads)",
+            b, n_batch.div_ceil(b), threads);
+    } else if b > 1 {
         crate::selphi_info!(
             "  PBWT sort shared across {} targets ({} groups on {} threads; auto: {:.0} GB \
              available, {:.1} MB per in-flight target -> +{:.1} GB; mc/n_ref {:.2}). \

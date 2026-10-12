@@ -232,7 +232,7 @@ fn main() {
         // Load SRP reference panel
         let srp = selphi::srp::SrpReader::open(refpanel, 0)
             .unwrap_or_else(|e| { eprintln!("Failed to open SRP: {}", e); std::process::exit(1); });
-        selphi_info!("  SRP loaded: {} variants, {} haps", srp.metadata.n_variants, srp.metadata.n_haps);
+        selphi_step!("SRP loaded: {} variants, {} haps", srp.metadata.n_variants, srp.metadata.n_haps);
 
         // reference-faithful engine (--ls-exact): a faithful reimplementation of GLIMPSE2's
         // phase/ Gibbs caller. PL-VCF input only (BAM-native GL not yet wired for
@@ -303,11 +303,9 @@ fn main() {
             selphi::lcwgs::pipeline::run_lcwgs(input, &srp, map, &params, args.threads)
         }.unwrap_or_else(|e| { eprintln!("lcWGS pipeline failed: {}", e); std::process::exit(1); });
 
-        selphi_info!(
-            "  lcwgs done: {} variants × {} samples in {:.1}s",
-            result.n_variants, result.sample_ids.len(),
-            start.elapsed().as_secs_f32(),
-        );
+        let n_out = result.sample_ids.len();
+        selphi_step!("lcwgs done: {} variants × {} sample{}",
+            result.n_variants, n_out, if n_out == 1 { "" } else { "s" });
 
         // Write imputed VCF.gz with GT:DS:GP.
         let vcf_path = PathBuf::from(format!("{}.vcf.gz",
@@ -316,7 +314,7 @@ fn main() {
             eprintln!("Failed to write {}: {}", vcf_path.display(), e);
             std::process::exit(1);
         }
-        selphi_info!("  wrote imputed VCF: {}", vcf_path.display());
+        selphi_step!("wrote imputed VCF: {}", vcf_path.display());
 
         // Also emit a bgzf dosage TSV (chrom:pos:ref:alt per row) for fast
         // identity-matched evaluation, gated by --parquet-like flag reuse:
@@ -346,7 +344,8 @@ fn main() {
             eprintln!("Failed to write {}: {}", tsv_path.display(), e);
             std::process::exit(1);
         }
-        selphi_info!("  wrote dosage TSV: {}", tsv_path.display());
+        selphi_step!("wrote dosage TSV: {}", tsv_path.display());
+        selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB", start.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
         return;
     }
 

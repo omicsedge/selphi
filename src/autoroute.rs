@@ -458,7 +458,11 @@ pub fn resolve(
     match decision {
         AutoRoute::Lcwgs => {
             if !cli_lcwgs {
-                selphi_step!("auto-route: PL / low GT call-rate (reads or read-likelihood) {}", selphi::log::green("→ lcWGS engine"));
+                if is_reads {
+                    selphi_step!("auto-route: aligned reads (BAM/CRAM) {}", selphi::log::green("→ lcWGS engine"));
+                } else {
+                    selphi_step!("auto-route: PL or low GT call-rate (read likelihoods) {}", selphi::log::green("→ lcWGS engine"));
+                }
                 eff_lcwgs = true;
             }
         }

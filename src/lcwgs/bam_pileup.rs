@@ -303,7 +303,7 @@ pub fn pileup_bams(
     for r in per_sample {
         let (id, blk, rep) = r?;
         if baq_ctx.is_some() {
-            crate::selphi_info!("  lcWGS-BAM: {}: {} reads, {} triggering sites, {} realigned ({:.1}%), {} BAQ no-ops",
+            crate::selphi_step!("lcWGS-BAM: {}: {} reads, {} triggering sites, {} realigned ({:.1}%), {} BAQ no-ops",
                 id, rep.n_reads, rep.n_trigger_sites, rep.n_realigned,
                 100.0 * rep.n_realigned as f64 / rep.n_reads.max(1) as f64, rep.n_baq_noop);
         }
