@@ -79,9 +79,8 @@ def lcwgs_svg(t):
     c = THEMES[t]
     x_l, x_r, y_t, y_b = 120, 548, 78, 298
     lo, hi = 0.990, 0.998
-    import math
-    lx = [math.log2(v) for v in COV]
-    X = lambda v: x_l + (x_r - x_l) * (math.log2(v) - lx[0]) / (lx[-1] - lx[0])
+    # Linear coverage axis: the points sit at their true distances (0.5, 1, 2, 4).
+    X = lambda v: x_l + (x_r - x_l) * (v - COV[0]) / (COV[-1] - COV[0])
     Y = lambda r: y_b - (y_b - y_t) * (r - lo) / (hi - lo)
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 410" font-family="{FONT}">',
            f'<text x="16" y="26" fill="{c["fg"]}" font-size="16" font-weight="700">Low-coverage imputation accuracy across depth</text>',
@@ -94,7 +93,7 @@ def lcwgs_svg(t):
     for v in COV:
         lab = "0.5" if v == 0.5 else str(v)
         out.append(f'<text x="{X(v):.1f}" y="320" text-anchor="middle" fill="{c["muted"]}" font-size="12">{lab}&#215;</text>')
-    out += [f'<text x="{(x_l + x_r) / 2:.1f}" y="340" text-anchor="middle" fill="{c["muted"]}" font-size="12" font-weight="600">Sequencing coverage (log scale: each step doubles the depth)</text>',
+    out += [f'<text x="{(x_l + x_r) / 2:.1f}" y="340" text-anchor="middle" fill="{c["muted"]}" font-size="12" font-weight="600">Sequencing coverage</text>',
             f'<line x1="{x_l}" y1="{y_t}" x2="{x_l}" y2="{y_b}" stroke="{c["grid"]}" stroke-width="1"/>']
     styles = {"GLIMPSE2": (c["amber"], "square"), "QUILT2": (c["green"], "triangle"), "Selphi 2": (c["blue"], "circle")}
 
