@@ -55,7 +55,9 @@ struct SampleBuffer {
     rsid: Vec<Option<String>>,
     ref_allele: Vec<String>,
     alt_allele: Vec<String>,
-    gt: Vec<&'static str>,
+    /// Static text for the 0/1 calls Selphi writes; owned text for a
+    /// passthrough record's input genotype.
+    gt: Vec<std::borrow::Cow<'static, str>>,
     gt1: Vec<Option<i32>>,
     gt2: Vec<Option<i32>>,
     phased: Vec<bool>,
@@ -105,7 +107,7 @@ impl SampleBuffer {
         let rsid_arr: StringArray = self.rsid.iter().map(|s| s.as_deref()).collect();
         let ref_arr: StringArray = self.ref_allele.iter().map(|s| Some(s.as_str())).collect();
         let alt_arr: StringArray = self.alt_allele.iter().map(|s| Some(s.as_str())).collect();
-        let gt_arr: StringArray = self.gt.iter().map(|&s| Some(s)).collect();
+        let gt_arr: StringArray = self.gt.iter().map(|s| Some(s.as_ref())).collect();
         let gt1_arr: Int32Array = self.gt1.iter().copied().collect();
         let gt2_arr: Int32Array = self.gt2.iter().copied().collect();
         let phased_arr = BooleanArray::from_iter(self.phased.iter().map(|&b| Some(b)));
@@ -251,38 +253,70 @@ impl SelfdecodeWriter {
                 continue;
             }
 
-            // Flush if chrom changed
-            if self.current_chrom[s] != chrom {
-                self.flush_sample(s)?;
-                self.current_chrom[s] = chrom.to_string();
-            }
-
-            let buf = &mut self.buffers[s];
-            buf.pos.push(pos);
-            buf.rsid.push(if rsid.starts_with("rs") { Some(rsid.to_string()) } else { None });
-            buf.ref_allele.push(ref_allele.to_string());
-            buf.alt_allele.push(alt_allele.to_string());
-            buf.gt.push(gt_str(g1, g2));
-            buf.gt1.push(Some(g1));
-            buf.gt2.push(Some(g2));
-            buf.phased.push(true); // selphi always produces phased output
             // R4b: a per-sample hard-call (mask[s]) is null-AP like a chip site.
             let sample_is_hardcall = is_chip
                 || hardcall_mask.is_some_and(|m| m[s]);
-            if sample_is_hardcall {
-                buf.ap1.push(None);
-                buf.ap2.push(None);
-            } else {
-                buf.ap1.push(Some(ap1_values[s]));
-                buf.ap2.push(Some(ap2_values[s]));
-            }
-
-            // Flush chunk if buffer full
-            if buf.len() >= CHUNK_SIZE {
-                self.flush_sample(s)?;
-            }
+            let (ap1, ap2) = if sample_is_hardcall { (None, None) }
+                else { (Some(ap1_values[s]), Some(ap2_values[s])) };
+            // Selphi's own calls are always phased.
+            self.push_row(s, chrom, pos, rsid, ref_allele, alt_allele,
+                std::borrow::Cow::Borrowed(gt_str(g1, g2)), Some(g1), Some(g2), true, ap1, ap2)?;
         }
 
+        Ok(())
+    }
+
+    /// Write a passthrough record (a target site absent from the panel; see
+    /// `io::passthrough`) for samples `samples`, as given: GT text with its own
+    /// separator, `gt1`/`gt2` = the alleles as 0/1 (null when missing, or for
+    /// the absent second allele of a haploid call), `phased` from the input, AP
+    /// null. Hom-ref rows follow the same filter as every other row.
+    pub fn write_passthrough(
+        &mut self, chrom: &str, rec: &crate::io::passthrough::PassRecord,
+        samples: std::ops::Range<usize>,
+    ) -> std::io::Result<()> {
+        use crate::io::passthrough::{ABSENT, MISSING};
+        let is_chrm = crate::contig::classify_contig(chrom) == crate::contig::ContigClass::ChrMt;
+        let alt = rec.alt_text();
+        for (s, gs) in samples.enumerate() {
+            let (a0, a1, phased) = rec.alleles(gs);
+            let bit = |a: u8| -> Option<i32> { match a { MISSING | ABSENT => None, a => Some((a > 0) as i32) } };
+            if self.filter_hom_ref && !is_chrm && a0 == 0 && (a1 == 0 || a1 == ABSENT) {
+                continue;
+            }
+            self.push_row(s, chrom, rec.pos as i32, &rec.id, &rec.ref_allele, &alt,
+                std::borrow::Cow::Owned(crate::io::passthrough::gt_text(a0, a1, phased)),
+                bit(a0), bit(a1), phased && a1 != ABSENT, None, None)?;
+        }
+        Ok(())
+    }
+
+    /// Append one row to sample `s`'s buffer (flushing on a contig change and
+    /// when the chunk is full).
+    #[allow(clippy::too_many_arguments)]
+    fn push_row(
+        &mut self, s: usize, chrom: &str, pos: i32, rsid: &str, ref_allele: &str, alt_allele: &str,
+        gt: std::borrow::Cow<'static, str>, gt1: Option<i32>, gt2: Option<i32>, phased: bool,
+        ap1: Option<f32>, ap2: Option<f32>,
+    ) -> std::io::Result<()> {
+        if self.current_chrom[s] != chrom {
+            self.flush_sample(s)?;
+            self.current_chrom[s] = chrom.to_string();
+        }
+        let buf = &mut self.buffers[s];
+        buf.pos.push(pos);
+        buf.rsid.push(if rsid.starts_with("rs") { Some(rsid.to_string()) } else { None });
+        buf.ref_allele.push(ref_allele.to_string());
+        buf.alt_allele.push(alt_allele.to_string());
+        buf.gt.push(gt);
+        buf.gt1.push(gt1);
+        buf.gt2.push(gt2);
+        buf.phased.push(phased);
+        buf.ap1.push(ap1);
+        buf.ap2.push(ap2);
+        if buf.len() >= CHUNK_SIZE {
+            self.flush_sample(s)?;
+        }
         Ok(())
     }
 

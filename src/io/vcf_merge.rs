@@ -210,6 +210,24 @@ fn merge_one_record(
     let ref_a = parts.next().ok_or_else(|| std::io::Error::other("missing REF"))?;
     let rlen = ref_a.len().max(1) as i64;
 
+    // A target site absent from the panel (FORMAT GT, FILTER '.'; see
+    // io::passthrough) is written as given: INFO stays '.', samples concatenate.
+    if first_format == "GT" && chrom_pos_id_ref_alt.rsplit('\t').next() == Some(".") {
+        let mut buf = Vec::with_capacity(first.len() * batch_lines.len());
+        buf.extend_from_slice(chrom_pos_id_ref_alt.as_bytes());
+        buf.extend_from_slice(b"\t.\tGT");
+        for line in batch_lines {
+            let (shared_b, format_b, samples, _) = split_record(line)?;
+            if shared_b != chrom_pos_id_ref_alt || format_b != "GT" {
+                return Err(std::io::Error::other(format!(
+                    "passthrough record mismatch between batches: '{chrom_pos_id_ref_alt}' vs '{shared_b}'")));
+            }
+            for smp in samples { buf.push(b'\t'); buf.extend_from_slice(smp.as_bytes()); }
+        }
+        buf.push(b'\n');
+        return Ok((buf, chrom, pos_0based, rlen));
+    }
+
     // Determine record type from FORMAT.
     let is_imputed = first_format != "GT";
 

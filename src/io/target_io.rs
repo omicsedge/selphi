@@ -677,13 +677,15 @@ pub fn write_phased_vcf(
     phased: &[u8],               // (n_chip, n_haps) row-major, PANEL orientation
     target_markers: &[TargetMarker],
     target_idx: &[usize],        // chip → target marker index
-    _wgs_idx: &[usize],          // chip → WGS variant index (for pos ordering)
+    wgs_idx: &[usize],           // chip → WGS variant index (orders passthrough records)
     sample_names: &[String],
     srp: &SrpReader,
     n_chip: usize,
     n_haps: usize,
     transforms: &[u8],           // chip → allele-match transform (1 = REF/ALT-swapped)
     output_path: &Path,
+    // Target records absent from the panel, written at their position.
+    passthrough: Option<&crate::io::passthrough::Passthrough>,
 ) -> std::io::Result<()> {
     use std::io::{Write, BufWriter};
 
@@ -698,7 +700,22 @@ pub fn write_phased_vcf(
     write_gt_vcf_header(&mut w, "", Some(srp.metadata.contig_field.as_str()), sample_names)?;
 
     let mut line_buf = String::with_capacity(n_samples * 6);
+    // Passthrough records go before the first panel variant past their position.
+    let mut pass_buf: Vec<u8> = Vec::new();
+    let mut next_pass = 0usize;
+    let mut write_pass = |w: &mut dyn Write, upto: usize, next_pass: &mut usize| -> std::io::Result<()> {
+        let Some(pass) = passthrough else { return Ok(()) };
+        let end = pass.anchored_in(0, upto).end;
+        if end > *next_pass {
+            pass_buf.clear();
+            for i in *next_pass..end { pass.append_vcf(i, 0..n_samples, &mut pass_buf); }
+            w.write_all(&pass_buf)?;
+            *next_pass = end;
+        }
+        Ok(())
+    };
     for ci in 0..n_chip {
+        write_pass(&mut w, wgs_idx[ci] + 1, &mut next_pass)?;
         let ti = target_idx[ci];
         let tm = &target_markers[ti];
         let slice = &phased[ci * n_haps..ci * n_haps + n_haps];
@@ -718,6 +735,7 @@ pub fn write_phased_vcf(
         writeln!(w, "{}\t{}\t.\t{}\t{}\t.\tPASS\tAF={:.4};AC={};AN={}\tGT\t{}",
             tm.chrom, tm.pos, tm.ref_allele, tm.alt_allele, af, ac, n_haps, line_buf)?;
     }
+    write_pass(&mut w, usize::MAX, &mut next_pass)?;
 
     w.flush()?;
     let mut bgzf = w.into_inner().map_err(|e| std::io::Error::other(e.to_string()))?;

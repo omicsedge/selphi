@@ -71,6 +71,8 @@ pub fn write_tile_to_parquet(
     schema: &Arc<Schema>,
     alt_probs: &[f32],
     tile_n: usize,
+    // Tile rows to write (a subrange when passthrough records split the tile).
+    rows: std::ops::Range<usize>,
     n_samples: usize,
     n_haps: usize,
     global_start: usize,
@@ -85,23 +87,24 @@ pub fn write_tile_to_parquet(
     site_conf_per_sample: Option<&[f64]>,
     refine_thr: f64,
 ) -> std::io::Result<()> {
-    if tile_n == 0 { return Ok(()); }
+    if rows.is_empty() { return Ok(()); }
+    let cap = rows.len();
 
-    let mut chroms = StringBuilder::with_capacity(tile_n, tile_n * 4);
-    let mut positions = Int64Builder::with_capacity(tile_n);
-    let mut ids = StringBuilder::with_capacity(tile_n, tile_n * 16);
-    let mut refs_b = StringBuilder::with_capacity(tile_n, tile_n * 2);
-    let mut alts_b = StringBuilder::with_capacity(tile_n, tile_n * 2);
-    let mut afs = Float32Builder::with_capacity(tile_n);
-    let mut dr2s = Float32Builder::with_capacity(tile_n);
-    let mut imps = BooleanBuilder::with_capacity(tile_n);
+    let mut chroms = StringBuilder::with_capacity(cap, cap * 4);
+    let mut positions = Int64Builder::with_capacity(cap);
+    let mut ids = StringBuilder::with_capacity(cap, cap * 16);
+    let mut refs_b = StringBuilder::with_capacity(cap, cap * 2);
+    let mut alts_b = StringBuilder::with_capacity(cap, cap * 2);
+    let mut afs = Float32Builder::with_capacity(cap);
+    let mut dr2s = Float32Builder::with_capacity(cap);
+    let mut imps = BooleanBuilder::with_capacity(cap);
 
     // Flat DS buffer: variant-major (row = variant, col = sample)
     // Layout: ds_flat[v * n_samples + s]
-    let mut ds_flat = vec![0.0f32; tile_n * n_samples];
+    let mut ds_flat = vec![0.0f32; cap * n_samples];
     let mut n_rows = 0usize;
 
-    for v in 0..tile_n {
+    for v in rows {
         let wgs_i = global_start + v;
         if wgs_i >= n_ref_variants { break; }
         let local_i = vp_offset + v;
@@ -183,6 +186,64 @@ pub fn write_tile_to_parquet(
     let batch = arrow::record_batch::RecordBatch::try_new(schema.clone(), columns)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
+    writer.write(&batch).map_err(|e| std::io::Error::other(e.to_string()))?;
+    Ok(())
+}
+
+/// Append the biallelic records `recs` of `pass` as one batch, holding samples
+/// `samples`: AF over the called alleles, DR2 null, IMP false, and DS = the ALT
+/// allele count (null for a no-call). Records with more than one ALT, or none,
+/// are skipped (one ALT per row in this format).
+pub fn write_passthrough_rows(
+    writer: &mut ArrowWriter<std::fs::File>,
+    schema: &Arc<Schema>,
+    pass: &crate::io::passthrough::Passthrough,
+    recs: std::ops::Range<usize>,
+    samples: std::ops::Range<usize>,
+) -> std::io::Result<()> {
+    let keep: Vec<usize> = recs.filter(|&i| pass.rec(i).is_biallelic()).collect();
+    if keep.is_empty() { return Ok(()); }
+    let n = keep.len();
+    let mut chroms = StringBuilder::with_capacity(n, n * 4);
+    let mut positions = Int64Builder::with_capacity(n);
+    let mut ids = StringBuilder::with_capacity(n, n * 16);
+    let mut refs_b = StringBuilder::with_capacity(n, n * 2);
+    let mut alts_b = StringBuilder::with_capacity(n, n * 2);
+    let mut afs = Float32Builder::with_capacity(n);
+    let mut dr2s = Float32Builder::with_capacity(n);
+    let mut imps = BooleanBuilder::with_capacity(n);
+    for &i in &keep {
+        let r = pass.rec(i);
+        chroms.append_value(pass.chrom());
+        positions.append_value(r.pos);
+        ids.append_value(&r.id);
+        refs_b.append_value(&r.ref_allele);
+        alts_b.append_value(&r.alts[0]);
+        afs.append_value(r.alt_freq());
+        dr2s.append_null();
+        imps.append_value(false);
+    }
+    let mut columns: Vec<Arc<dyn arrow::array::Array>> = Vec::with_capacity(8 + samples.len());
+    columns.push(Arc::new(chroms.finish()));
+    columns.push(Arc::new(positions.finish()));
+    columns.push(Arc::new(ids.finish()));
+    columns.push(Arc::new(refs_b.finish()));
+    columns.push(Arc::new(alts_b.finish()));
+    columns.push(Arc::new(afs.finish()));
+    columns.push(Arc::new(dr2s.finish()));
+    columns.push(Arc::new(imps.finish()));
+    for s in samples {
+        let mut col = Float32Builder::with_capacity(n);
+        for &i in &keep {
+            match pass.rec(i).alt_count(s) {
+                Some(c) => col.append_value(c as f32),
+                None => col.append_null(),
+            }
+        }
+        columns.push(Arc::new(col.finish()));
+    }
+    let batch = arrow::record_batch::RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     writer.write(&batch).map_err(|e| std::io::Error::other(e.to_string()))?;
     Ok(())
 }

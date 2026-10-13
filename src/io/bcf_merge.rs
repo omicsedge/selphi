@@ -235,8 +235,10 @@ fn n_fmt_of(shared: &[u8]) -> u8 {
 fn shared_filter_start(shared: &[u8]) -> std::io::Result<usize> {
     // Fixed header: 4 + 4 + 4 + 4 + 2 + 2 + 4 = 24 bytes
     let mut off = 24;
-    // Skip 3 typed strings (ID, REF, ALT)
-    for _ in 0..3 {
+    // Skip the typed strings: ID, REF and every ALT (1 + n_allele; 3 for the
+    // biallelic records Selphi writes, more for a multi-allelic passthrough record).
+    let n_allele = u16::from_le_bytes(shared[18..20].try_into().unwrap()) as usize;
+    for _ in 0..1 + n_allele {
         let descriptor = shared[off]; off += 1;
         let mut n = (descriptor >> 4) as usize;
         let _ty = descriptor & 0x0F;
@@ -260,6 +262,32 @@ fn shared_filter_start(shared: &[u8]) -> std::io::Result<usize> {
         off += n; // string bytes
     }
     Ok(off)
+}
+
+/// Merge a passthrough record (GT only, no INFO, FILTER empty): the shared
+/// section of batch 0 with the total sample count, then the GT key and type
+/// descriptor followed by every batch's sample bytes in batch order.
+fn merge_passthrough_record(rec_bufs: &[Vec<u8>], total_samples: usize) -> std::io::Result<Vec<u8>> {
+    let v0 = view(&rec_bufs[0]);
+    let mut out = Vec::with_capacity(8 + v0.l_shared + v0.l_indiv * rec_bufs.len());
+    out.extend_from_slice(&[0u8; 8]);
+    out.extend_from_slice(&v0.shared[0..20]);
+    out.extend_from_slice(&((1u32 << 24) | total_samples as u32).to_le_bytes());
+    out.extend_from_slice(&v0.shared[24..]);
+    let indiv_start = out.len();
+    out.extend_from_slice(&v0.indiv[..3]); // GT key (typed int8) + vector descriptor
+    for r in rec_bufs {
+        let v = view(r);
+        if v.indiv.len() < 3 || v.indiv[..3] != v0.indiv[..3] {
+            return Err(std::io::Error::other("passthrough record GT layout differs between batches"));
+        }
+        out.extend_from_slice(&v.indiv[3..]);
+    }
+    let l_shared = (indiv_start - 8) as u32;
+    let l_indiv = (out.len() - indiv_start) as u32;
+    out[0..4].copy_from_slice(&l_shared.to_le_bytes());
+    out[4..8].copy_from_slice(&l_indiv.to_le_bytes());
+    Ok(out)
 }
 
 /// Merge one record across all batches.
@@ -292,6 +320,11 @@ fn merge_one_record(
 
     let is_chip = n_fmt == 1;
     let filter_off = shared_filter_start(v0.shared)?;
+    // A target site absent from the panel (see io::passthrough): FILTER is the
+    // empty vector and there is no INFO. Written as given, samples concatenated.
+    if is_chip && v0.shared[filter_off] == 0x00 {
+        return merge_passthrough_record(rec_bufs, total_samples);
+    }
     // FILTER for our records: 1B descriptor + 1B value = 2 bytes
     let post_filter_off = filter_off + 2;
     // INFO count is independent of --no-ap (that only drops the AP FORMAT

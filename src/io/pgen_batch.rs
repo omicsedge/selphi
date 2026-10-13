@@ -92,6 +92,16 @@ impl BatchSink for PgenSink<'_> {
         self.bw.pgen.write_variant(&self.hardcalls, &self.dosages)
     }
 
+    fn emit_passthrough(
+        &mut self, pass: &crate::io::passthrough::Passthrough, i: usize, ctx: &WindowCtx,
+    ) -> std::io::Result<()> {
+        let r = pass.rec(i);
+        if !r.is_biallelic() { return Ok(()); }
+        pass.fill_dosage_fields(i, ctx.sample_start..ctx.sample_start + ctx.n_samples_in_batch, &mut self.hardcalls, &mut self.dosages);
+        write_pvar_variant(&mut self.bw.pvar, pass.chrom(), &r.pos.to_string(), &r.id, &r.ref_allele, &r.alts[0])?;
+        self.bw.pgen.write_variant(&self.hardcalls, &self.dosages)
+    }
+
     fn emit_imputed(
         &mut self, wgs_i: usize, local_i: usize,
         alt: &[f32], tile_n: usize, v: usize, ctx: &WindowCtx,
@@ -127,12 +137,12 @@ pub fn write_window_pgen_batched(
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples_total, chip_genotypes, no_ap: _, site_conf, site_conf_per_sample, refine_thr,
         interp_cum_cm,
-        bcf_contig_names: _,
+        bcf_contig_names: _, passthrough,
     } = input;
     let mut sink = PgenSink { bw, hardcalls: Vec::new(), dosages: Vec::new() };
     crate::io::batch_driver::run_window(
         &mut sink, srp.as_ref(), weights, hap_start, hap_end,
         win_chip_start, own_chip_start, own_chip_end, wgs_idx, n_samples_total, chip_genotypes,
-        site_conf, site_conf_per_sample, refine_thr, interp_cum_cm,
+        site_conf, site_conf_per_sample, refine_thr, interp_cum_cm, passthrough,
     )
 }

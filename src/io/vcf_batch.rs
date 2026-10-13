@@ -145,6 +145,13 @@ impl BatchSink for VcfSink<'_> {
         Ok(())
     }
 
+    fn emit_passthrough(
+        &mut self, pass: &crate::io::passthrough::Passthrough, i: usize, ctx: &WindowCtx,
+    ) -> std::io::Result<()> {
+        pass.append_vcf(i, ctx.sample_start..ctx.sample_start + ctx.n_samples_in_batch, &mut self.buf);
+        Ok(())
+    }
+
     fn after_tile(&mut self) -> std::io::Result<()> {
         if self.buf.len() > 4 * 1024 * 1024 {
             self.tx.send(std::mem::take(&mut self.buf)).map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -175,13 +182,13 @@ pub fn write_window_vcf_batched(
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples_total, chip_genotypes, no_ap, site_conf, site_conf_per_sample, refine_thr,
         interp_cum_cm,
-        bcf_contig_names: _,
+        bcf_contig_names: _, passthrough,
     } = input;
     let mut sink = VcfSink { tx, no_ap, buf: Vec::new(), vid_prefixes: Vec::new() };
     crate::io::batch_driver::run_window(
         &mut sink, srp.as_ref(), weights, hap_start, hap_end,
         win_chip_start, own_chip_start, own_chip_end, wgs_idx, n_samples_total, chip_genotypes,
-        site_conf, site_conf_per_sample, refine_thr, interp_cum_cm,
+        site_conf, site_conf_per_sample, refine_thr, interp_cum_cm, passthrough,
     )
 }
 

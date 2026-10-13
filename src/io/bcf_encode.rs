@@ -412,6 +412,54 @@ pub fn encode_chip_record_partial(
     finalize_record(buf, shared_start, indiv_start);
 }
 
+/// Encode a BCF2 record for a target site absent from the reference panel
+/// (see [`crate::io::passthrough`]): every ALT allele, QUAL/FILTER/INFO missing,
+/// and FORMAT GT carrying the input's allele indexes, phasing and ploidy for
+/// samples `samples`.
+pub fn encode_passthrough_record(
+    buf: &mut Vec<u8>,
+    rid: i32,
+    rec: &crate::io::passthrough::PassRecord,
+    samples: std::ops::Range<usize>,
+) {
+    use crate::io::passthrough::{ABSENT, MISSING};
+    let n_samples = samples.len();
+    debug_assert!(n_samples < (1 << 24), "BCF n_samples {} exceeds the 24-bit fmt_sample limit", n_samples);
+    let shared_start = buf.len();
+    buf.extend_from_slice(&[0u8; 8]);
+    buf.extend_from_slice(&rid.to_le_bytes());
+    buf.extend_from_slice(&((rec.pos - 1) as i32).to_le_bytes());
+    buf.extend_from_slice(&(rec.ref_allele.len() as i32).to_le_bytes());
+    buf.extend_from_slice(&QUAL_MISSING.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());                          // n_info
+    buf.extend_from_slice(&((1 + rec.alts.len()) as u16).to_le_bytes()); // n_allele
+    buf.extend_from_slice(&((1u32 << 24) | n_samples as u32).to_le_bytes());
+    encode_typed_string(buf, if rec.id == "." { b"" } else { rec.id.as_bytes() });
+    encode_typed_string(buf, rec.ref_allele.as_bytes());
+    for alt in &rec.alts { encode_typed_string(buf, alt.as_bytes()); }
+    buf.push(0x00); // FILTER missing: empty typed vector
+
+    let indiv_start = buf.len();
+    encode_typed_int8(buf, FMT_GT_IDX as i32);
+    // GT value = (allele + 1) << 1 | phased; 0 = missing allele; vector end marks
+    // the absent second allele of a haploid call. int8 holds allele indexes up to 62.
+    let wide = rec.max_allele() > 62;
+    buf.push(0x20 | if wide { TY_INT16 } else { TY_INT8 });
+    for s in samples {
+        let (a0, a1, phased) = rec.alleles(s);
+        let v0: i32 = if a0 == MISSING { 0 } else { (a0 as i32 + 1) << 1 };
+        let v1: i32 = match a1 {
+            ABSENT => if wide { -32767 } else { -127 },
+            MISSING => phased as i32,
+            a => ((a as i32 + 1) << 1) | phased as i32,
+        };
+        for v in [v0, v1] {
+            if wide { buf.extend_from_slice(&(v as i16).to_le_bytes()) } else { buf.push(v as i8 as u8) }
+        }
+    }
+    finalize_record(buf, shared_start, indiv_start);
+}
+
 /// Encode a BCF2 record for a chip (genotyped) variant.
 pub fn encode_chip_record(
     buf: &mut Vec<u8>,

@@ -773,6 +773,29 @@ struct LoadedTarget {
     n_chip: usize,
 }
 
+/// Target records that match no panel site, anchored for the output writers
+/// (see `selphi::io::passthrough`). `None` under `--drop-unmatched` or when every
+/// target record on this chromosome is a panel site. The output names the contig
+/// as its other lines do: the panel's spelling, or the target's for `--phase-only`.
+fn build_passthrough(
+    args: &Args, target_path: &str, srp: &SrpReader,
+    target_markers: &[selphi::io::target_io::TargetMarker], target_idx: &[usize],
+) -> Option<selphi::io::passthrough::Passthrough> {
+    if args.drop_unmatched { return None; }
+    // Phase-only lines name the contig as the target does; imputed output as the panel does.
+    let out_contig = if args.phase_only {
+        target_idx.first().map(|&t| target_markers[t].chrom.clone())
+    } else { None };
+    let pass = selphi::io::passthrough::for_chromosome(
+        target_path, srp, target_markers, target_idx, out_contig.as_deref(),
+    ).unwrap_or_else(|e| {
+        selphi_error!("Reading the target records absent from the panel ({}): {}", target_path, e);
+        std::process::exit(1);
+    })?;
+    selphi_step!("{}", selphi::io::passthrough::log_summary(&pass));
+    Some(pass)
+}
+
 /// Read the target VCF/BCF (samples, variants, genotypes, phased flag) and
 /// intersect its markers against the reference panel. Pure code-motion out of
 /// `run`: same calls, same timing/logging, same `n_chip == 0` abort. Aborts the
@@ -970,6 +993,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         sample_names, target_markers, target_genotypes, is_phased,
         n_samples, n_haps, wgs_idx, target_idx, allele_transforms, n_chip,
     } = load_and_intersect(args, target_path, &srp);
+    let passthrough = build_passthrough(args, target_path, &srp, &target_markers, &target_idx);
 
     // --refine / no-call input confidence + the re-route threshold. See
     // `build_target_confidence` for the full rationale.
@@ -1112,6 +1136,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
             write_phased_vcf(
                 &pr.phased_alleles, &target_markers, &target_idx, &wgs_idx,
                 &sample_names, &srp, n_chip, n_haps, &allele_transforms, &out_path,
+                passthrough.as_ref(),
             ).expect("Failed to write phased VCF");
             selphi_step!("Phase-only VCF: {}", out_path.display());
             selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB",
@@ -1483,6 +1508,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                     refine_thr,
                     interp_cum_cm: interp_cum_cm.as_deref(),
                                     bcf_contig_names: &formats.bcf_contig_names,
+                    passthrough: passthrough.as_ref(),
                 };
                 // Find this batch's writer by hap_start, asserting its hap_end matches.
                 macro_rules! find_bi {
@@ -1596,6 +1622,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                 site_conf_per_sample: target_site_conf_per_sample.as_deref(),
                 refine_thr,
                 interp_cum_cm: interp_cum_cm.as_deref(),
+                passthrough: passthrough.as_ref(),
             },
             selphi::io::pipeline::WindowWriters {
                 parquet: parquet_writer.as_mut().map(|(w, s)| (w, &*s)),

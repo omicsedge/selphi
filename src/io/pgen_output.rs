@@ -104,8 +104,12 @@ impl PgenWriter {
 
         // 2. 16-bit dosage per sample
         // Scale: 0 = 0.0, 16384 = 1.0, 32768 = 2.0
-        // 65535 = missing (not used for imputed data)
+        // 65535 = missing (only a no-call at a passthrough site; imputed data has none)
         for i in 0..self.n_samples {
+            if dosages[i].is_nan() {
+                self.file.write_all(&u16::MAX.to_le_bytes())?; // missing (passthrough no-call)
+                continue;
+            }
             let d = dosages[i].clamp(0.0, 2.0);
             let d16 = (d * 16384.0).round() as u32;
             let d16 = d16.min(32768) as u16;

@@ -388,6 +388,12 @@ pub struct Args {
     #[arg(long)]
     pub no_ap: bool,
 
+    /// Leave out the target records that match no reference-panel site. By
+    /// default they are written to the output at their position with their input
+    /// genotypes (QUAL/FILTER/INFO '.'), neither phased nor imputed.
+    #[arg(long)]
+    pub drop_unmatched: bool,
+
     /// Write native BCF binary output (faster, smaller, no bcftools needed)
     #[arg(long)]
     pub bcf: bool,

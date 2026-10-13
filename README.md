@@ -46,6 +46,7 @@
   - [Memory-bounded mode (biobank-scale)](#memory-bounded-mode-biobank-scale)
   - [Reference panel preparation](#reference-panel-preparation)
 - [Output formats](#output-formats)
+  - [Target sites absent from the panel](#target-sites-absent-from-the-panel)
   - [Output fields](#output-fields)
 - [Accuracy evaluation](#accuracy-evaluation)
 - [Indexing](#indexing)
@@ -96,7 +97,7 @@ Selphi needs a genetic map in PLINK format (cM positions); Beagle maps work dire
 
 ## Usage
 
-Input is a standard VCF or BCF, phased (`0|1`) or unphased (`0/1`). Phase is detected from the first ten genotypes; pass `--force-phasing` for partially phased input. Multi-allelic records are not split: the first ALT is kept and genotypes are reduced to REF vs any ALT, with a warning (run `bcftools norm -m -any` on target and panel for per-ALT imputation). Only target sites that match a panel site are used; the others are dropped and do not appear in the output (the log reports `Shared markers: N (x% of target)`).
+Input is a standard VCF or BCF, phased (`0|1`) or unphased (`0/1`). Phase is detected from the first ten genotypes; pass `--force-phasing` for partially phased input. Multi-allelic records are not split: the first ALT is kept and genotypes are reduced to REF vs any ALT, with a warning (run `bcftools norm -m -any` on target and panel for per-ALT imputation). Only target sites that match a panel site are used for phasing and imputation (the log reports `Shared markers: N (x% of target)`); the others are still written to the output, as given (see [Target sites absent from the panel](#target-sites-absent-from-the-panel)).
 
 ### Engine selection (`--engine`)
 
@@ -187,7 +188,7 @@ Single- vs multi-chromosome SRP is auto-detected. Chromosomes are processed sequ
 
 ### Low-coverage WGS (`--lcwgs`)
 
-For low-coverage sequencing (uniform 0.5-4× genomes, or capture libraries with a low-pass off-target background), where most sites carry a genotype likelihood rather than a confident call, use the genotype-likelihood-aware engine. Input is a VCF/BCF with the `PL` field (e.g. from `bcftools mpileup | bcftools call`) at the panel's sites. Only input sites whose REF/ALT match the panel exactly are imputed and written; a record without `PL` counts as a flat-likelihood site:
+For low-coverage sequencing (uniform 0.5-4× genomes, or capture libraries with a low-pass off-target background), where most sites carry a genotype likelihood rather than a confident call, use the genotype-likelihood-aware engine. Input is a VCF/BCF with the `PL` field (e.g. from `bcftools mpileup | bcftools call`) at the panel's sites. Only input sites whose REF/ALT match the panel exactly are imputed and written (this engine does not carry the other input records through); a record without `PL` counts as a flat-likelihood site:
 
 ```bash
 selphi --lcwgs \
@@ -234,7 +235,7 @@ Indel panel sites carry no read evidence on the default path, so they are left o
 
 ### Memory-bounded mode (biobank-scale)
 
-For panels where memory is the binding constraint, `--sample-batch-size N` processes target samples in batches of N. Peak memory scales with the batch size, at ~30-40% wall overhead. Already-phased input gives output bit-identical to the non-batched run; on unphased input batching turns off the two-member phase ensemble, so the output matches a non-batched run with `SELPHI_DIPLOID_INTRA_N=1`. Per-batch intermediates go to `$TMPDIR` (default `/tmp`); point it at a volume with room.
+For panels where memory is the binding constraint, `--sample-batch-size N` processes target samples in batches of N. Peak memory scales with the batch size, at ~30-40% wall overhead. Imputed dosages are not bit-identical to the non-batched run (a known, small difference under investigation), and on unphased input batching also turns off the two-member phase ensemble (as `SELPHI_DIPLOID_INTRA_N=1`). Per-batch intermediates go to `$TMPDIR` (default `/tmp`); point it at a volume with room.
 
 ```bash
 selphi \
@@ -317,6 +318,12 @@ selphi --refpanel ref.srp --input input.vcf.gz --map map.map --out result --all-
 ```
 
 Dosages are identical across formats up to each format's precision (VCF `DS` is rounded to three decimals, PGEN stores steps of 1/16384, BCF/Parquet/SelfDecode store 32-bit floats). Hardcalls differ by design: PGEN rounds the summed dosage (the PLINK convention), while VCF/BCF/SelfDecode GT use a per-haplotype argmax; they agree on confident calls and can differ only on borderline per-hap probabilities (chip sites never).
+
+### Target sites absent from the panel
+
+A target record whose `(POS, REF, ALT)` matches no panel site cannot be phased against the panel or imputed, but it is part of the input, so by default Selphi writes it to the output at its position, exactly as given: ID, REF, every ALT, and each sample's GT with its allele indexes, separator (`/` or `|`) and ploidy. QUAL, FILTER and INFO are `.`, which sets these records apart from the panel sites (FILTER `PASS`) and leaves the output header unchanged. The log says how many there were. `--drop-unmatched` leaves them out, as Beagle and most imputation tools do.
+
+This holds for whole-genome runs, `--phase-only` and `--sample-batch-size`. VCF, BCF and SelfDecode carry every such record; Parquet and PGEN, which hold one ALT dosage per row, carry the biallelic ones (DS = the ALT allele count, missing for a no-call). The records are read in a second pass over the target, limited to the run's chromosome through its `.tbi`/`.csi` index when there is one; a matched site is recognised from its position and alleles without decoding its genotypes, so the pass costs little.
 
 ### Output fields
 
@@ -435,6 +442,7 @@ selphi --self-test --refpanel panel.srp --input target.vcf.gz --map chr.map --ou
 | `--reference PATH` | Reference FASTA (required for CRAM input; enables BAQ for BAM input) | |
 | `--chrx-par` / `--build B` | PAR-aware chrX male handling during phasing (male chrX output stays diploid); `B` = `grch38`/`grch37`/`auto` | off / `auto` |
 | `--no-ap` | Omit AP1/AP2 fields from output | off |
+| `--drop-unmatched` | Leave out the target records that match no panel site (by default they are written as given) | off |
 | `--bcf` | Write native BCF output (replaces VCF) | off |
 | `--parquet` | Write Apache Parquet output (additive) | off |
 | `--pgen` | Write PLINK2 PGEN output (additive) | off |
