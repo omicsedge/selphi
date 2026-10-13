@@ -425,21 +425,25 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
             // conditioning PBWT of the sites it matches on. SELPHI_DIPLOID_SCAFFOLD_MAF
             // makes the threshold settable (0 = every called site) to A/B that.
             let scaffold_maf = selphi::config::f32_or("SELPHI_DIPLOID_SCAFFOLD_MAF", 0.001);
-            // Frequency SOURCE. Default "cohort" keeps the shipped behaviour. "panel"
-            // takes the frequency from the reference panel instead, which is what
-            // "common variant" is supposed to mean and what SHAPEIT5 reads from AC/AN
-            // tags: it removes the batch dependence without removing the filter.
+            // Frequency SOURCE (diploid::scaffold): default "union" = every site the
+            // cohort rule keeps plus the panel-common ones it drops (a single user's
+            // homozygous calls); "cohort" and "panel" select one of the two sets.
             // Needs the chip-site panel bitmatrix, which the phase-only path does not
             // build — there the request is reported and ignored rather than silently
             // changing which sites are selected.
-            let scaffold_panel =
-                selphi::config::raw("SELPHI_DIPLOID_SCAFFOLD_SOURCE").as_deref() == Some("panel");
-            let panel_bm = if scaffold_panel { ref_bm_full.as_ref() } else { None };
-            if scaffold_panel && panel_bm.is_none() {
-                selphi_info!("    SELPHI_DIPLOID_SCAFFOLD_SOURCE=panel ignored (no chip-site panel bitmatrix on this path)");
+            let source = selphi::diploid::scaffold::Source::from_env();
+            let panel_bm = if source.needs_panel() { ref_bm_full.as_ref() } else { None };
+            if source.needs_panel() && panel_bm.is_none() {
+                // The phase-only path builds the chip-site panel bitmatrix only under
+                // SELPHI_PHASE_ONLY_RARE_REF_GB; without it only the cohort rule can run.
+                if selphi::diploid::scaffold::Source::is_explicit() {
+                    selphi_info!("    SELPHI_DIPLOID_SCAFFOLD_SOURCE={:?} ignored (no chip-site panel bitmatrix on this path)", source);
+                } else {
+                    selphi_debug!("  phasing scaffold: cohort frequencies only (no chip-site panel bitmatrix on this path)");
+                }
             }
             let scaffold = selphi::diploid::scaffold::select(
-                targ_alleles, n_chip, n_samples, panel_bm, scaffold_maf);
+                targ_alleles, n_chip, n_samples, panel_bm, source, scaffold_maf);
             if scaffold.widened {
                 selphi_step!("No site clears the phasing scaffold threshold (no heterozygous call, e.g. a \
 male chrX): phasing on all {} called sites", scaffold.indices.len());
