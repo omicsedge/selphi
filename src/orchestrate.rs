@@ -389,14 +389,12 @@ fn phase_chr(
             let _target_an = (n_samples * 2) as u32;
             // Threshold is over the TARGET COHORT's frequency, so the scaffold
             // shrinks with the batch; SELPHI_DIPLOID_SCAFFOLD_MAF overrides it and
-            // SELPHI_DIPLOID_SCAFFOLD_SOURCE=panel takes the panel's frequency
-            // instead. Same selection as the single-chr path (diploid::scaffold).
+            // SELPHI_DIPLOID_SCAFFOLD_SOURCE=panel|union reads the panel's frequency
+            // too. Same selection as the single-chr path (diploid::scaffold).
             let scaffold_maf = selphi::config::f32_or("SELPHI_DIPLOID_SCAFFOLD_MAF", 0.001);
-            let scaffold_panel =
-                selphi::config::raw("SELPHI_DIPLOID_SCAFFOLD_SOURCE").as_deref() == Some("panel");
             let scaffold = selphi::diploid::scaffold::select(
-                &targ_alleles, n_chip, n_samples, if scaffold_panel { Some(&ref_bm) } else { None },
-                scaffold_maf);
+                &targ_alleles, n_chip, n_samples, Some(&ref_bm),
+                selphi::diploid::scaffold::Source::from_env(), scaffold_maf);
             if scaffold.widened {
                 selphi_info!("    Phasing: no site clears the scaffold threshold (no heterozygous call, \
 e.g. a male chrX): phasing on all {} called sites", scaffold.indices.len());
