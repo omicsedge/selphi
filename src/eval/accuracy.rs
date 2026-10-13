@@ -413,12 +413,13 @@ pub fn parse_vcf_line(line: &[u8], n_samples: usize, ds_buf: &mut Vec<f32>) -> O
                     }
                 } else if gt.len() == 1 {
                     // Haploid GT (e.g. chrX males): one allele → its biallelic ALT
-                    // count (0/1). Matches the BCF reader's vector_end handling
-                    // (gt_allele_to_dose), so VCF-truth vs BCF-imputed agree on
-                    // haploid sites. Missing "." → 0. No-op on autosomal diploid
-                    // (always len>=3).
-                    let a = if gt[0] == b'.' { 0i32 } else { (gt[0] - b'0') as i32 };
-                    ds_buf.push(a.min(1) as f32);
+                    // count (0/1), as the BCF reader's haploid branch does, so
+                    // VCF and BCF truths agree on haploid sites. No-op on
+                    // autosomal diploid (always len>=3).
+                    // A haploid no-call is unknown, as a diploid one is above.
+                    if gt[0] == b'.' { ds_buf.push(-1.0); } else {
+                        ds_buf.push(((gt[0] - b'0') as i32).min(1) as f32);
+                    }
                 } else {
                     ds_buf.push(0.0);
                 }
@@ -801,7 +802,14 @@ impl VariantReader {
                             // haploid, so only the first becomes the -1.0 sentinel.
                             for_each_sample(si_filter, ns, |si| {
                                 let b = io2 + si * vl * es;
-                                if b + 1 < ge {
+                                if vl == 1 {
+                                    // Haploid record (a male chrX truth): ONE allele per
+                                    // sample, its ALT count 0/1 as in the VCF reader. Read
+                                    // as two bytes it ran past the field and every haploid
+                                    // call became a no-call.
+                                    let missing = b >= ge || ib[b] == 0x80 || (ib[b] >> 1) == 0;
+                                    ds_buf.push(if missing { -1.0 } else { gt_allele_to_dose(ib[b]) as f32 });
+                                } else if b + 1 < ge {
                                     if ib[b] == 0x80 || ib[b + 1] == 0x80 {
                                         ds_buf.push(-1.0);
                                     } else {
