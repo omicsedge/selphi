@@ -20,6 +20,7 @@ pub mod pruning;
 pub mod phase_common;
 pub mod pedigree;
 pub mod phase_rare;
+pub mod scaffold;
 
 /// De-novo PANEL phasing: phase an unphased cohort using the cohort itself
 /// as the conditioning set (no external reference panel, n_ref = 0). Each
