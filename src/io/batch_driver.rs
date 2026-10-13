@@ -60,6 +60,9 @@ pub struct WindowBatchInput<'a> {
     /// the unbatched path in aa6debf. Empty is still accepted and means "single
     /// contig, rid 0", which is what the non-BCF sinks pass.
     pub bcf_contig_names: &'a [String],
+    /// Target records absent from the panel, written at their position
+    /// (`None` under `--drop-unmatched` or when there are none).
+    pub passthrough: Option<&'a crate::io::passthrough::Passthrough>,
 }
 
 /// One batch's sample / haplotype range (haps = 2 × samples).
@@ -192,6 +195,12 @@ pub trait BatchSink {
         alt: &[f32], tile_n: usize, v: usize, ctx: &WindowCtx,
     ) -> std::io::Result<()>;
 
+    /// Emit passthrough record `i` of `pass` (a target site absent from the
+    /// panel) for this batch's samples.
+    fn emit_passthrough(
+        &mut self, pass: &crate::io::passthrough::Passthrough, i: usize, ctx: &WindowCtx,
+    ) -> std::io::Result<()>;
+
     /// Called after each interpolated tile's variants are emitted. Streaming
     /// sinks (VCF/BCF) flush their byte buffer to the channel here.
     fn after_tile(&mut self) -> std::io::Result<()> { Ok(()) }
@@ -226,6 +235,7 @@ pub fn run_window<S: BatchSink>(
     site_conf_per_sample: Option<&[f64]>,
     refine_thr: f64,
     interp_cum_cm: Option<&[f64]>,
+    passthrough: Option<&crate::io::passthrough::Passthrough>,
 ) -> std::io::Result<()> {
     use crate::srp::TILE_ROWS;
 
@@ -295,6 +305,15 @@ pub fn run_window<S: BatchSink>(
     let tile_size = 4000usize;
     let mut next_wgs = own_wgs_start;
 
+    // Passthrough records written immediately before panel variant `$v`.
+    macro_rules! pass_before {
+        ($v:expr) => {{
+            if let Some(pass) = passthrough {
+                for i in pass.before($v) { sink.emit_passthrough(pass, i, &ctx)?; }
+            }
+        }};
+    }
+
     // Emit chip variants in [next_wgs, end). No flush (matches the per-format
     // chip-gap, which only appends; flushing is per-tile / at window end).
     macro_rules! chip_gap {
@@ -302,6 +321,7 @@ pub fn run_window<S: BatchSink>(
             let end_ = $end;
             while next_wgs < end_ {
                 let local_idx = next_wgs - own_wgs_start;
+                pass_before!(next_wgs);
                 if is_chip[local_idx] {
                     sink.emit_chip(next_wgs, local_idx, &ctx)?;
                 }
@@ -320,6 +340,7 @@ pub fn run_window<S: BatchSink>(
                 let wgs_i = gs + v;
                 if wgs_i >= n_ref_variants { break; }
                 let local_i = wgs_i - own_wgs_start;
+                pass_before!(wgs_i);
                 if is_chip[local_i] {
                     sink.emit_chip(wgs_i, local_i, &ctx)?;
                 } else {
@@ -452,6 +473,8 @@ pub fn run_window<S: BatchSink>(
         chip_gap!(own_wgs_end);
     }
 
+    // Passthrough records past the last panel variant follow it.
+    if own_wgs_end == n_ref_variants { pass_before!(n_ref_variants); }
     sink.end_window()?;
     Ok(())
 }

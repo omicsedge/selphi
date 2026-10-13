@@ -91,6 +91,13 @@ impl BatchSink for SdSink<'_> {
             &self.gt1, &self.gt2, &self.ap1, &self.ap2, true, None)
     }
 
+    fn emit_passthrough(
+        &mut self, pass: &crate::io::passthrough::Passthrough, i: usize, ctx: &WindowCtx,
+    ) -> std::io::Result<()> {
+        self.bw.writer.write_passthrough(pass.chrom(), pass.rec(i),
+            ctx.sample_start..ctx.sample_start + ctx.n_samples_in_batch)
+    }
+
     fn emit_imputed(
         &mut self, wgs_i: usize, local_i: usize,
         alt: &[f32], tile_n: usize, v: usize, ctx: &WindowCtx,
@@ -133,12 +140,12 @@ pub fn write_window_sd_batched(
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples_total, chip_genotypes, no_ap: _, site_conf, site_conf_per_sample, refine_thr,
         interp_cum_cm,
-        bcf_contig_names: _,
+        bcf_contig_names: _, passthrough,
     } = input;
     let mut sink = SdSink { bw, gt1: Vec::new(), gt2: Vec::new(), ap1: Vec::new(), ap2: Vec::new(), hc_mask: Vec::new() };
     crate::io::batch_driver::run_window(
         &mut sink, srp.as_ref(), weights, hap_start, hap_end,
         win_chip_start, own_chip_start, own_chip_end, wgs_idx, n_samples_total, chip_genotypes,
-        site_conf, site_conf_per_sample, refine_thr, interp_cum_cm,
+        site_conf, site_conf_per_sample, refine_thr, interp_cum_cm, passthrough,
     )
 }

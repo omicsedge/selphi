@@ -1749,6 +1749,7 @@ dependencies = [
  "noodles-bam",
  "noodles-bcf",
  "noodles-bgzf 0.46.0",
+ "noodles-core 0.18.0",
  "noodles-core 0.20.0",
  "noodles-cram",
  "noodles-fasta",

@@ -133,18 +133,24 @@ pub fn merge_batch_parquets(
         // plus the helper's per-sample dosage output (also feeds the DS columns).
         let mut flat: Vec<(f32, f32)> = Vec::with_capacity(n_samples_total);
         let mut ds_scratch = vec![0f32; n_samples_total];
+        let mut no_call: Vec<bool> = Vec::with_capacity(n_samples_total);
 
         for row in 0..n_rows {
             let is_imp = imp_col.value(row);
             imp_b.append_value(is_imp);
 
             // Gather AP1/AP2 across all batches for this row in global sample order.
+            // A null AP pair is a no-call at a passthrough site (io::passthrough):
+            // it counts as non-ALT and its DS stays null, as unbatched.
             flat.clear();
+            no_call.clear();
             for bi in 0..batches.len() {
                 let arrs = &batch_ap_arrays[bi];
                 let k_in_batch = arrs.len() / 2;
                 for s in 0..k_in_batch {
-                    flat.push((arrs[s * 2].value(row), arrs[s * 2 + 1].value(row)));
+                    let null = arrs[s * 2].is_null(row);
+                    no_call.push(null);
+                    flat.push(if null { (0.0, 0.0) } else { (arrs[s * 2].value(row), arrs[s * 2 + 1].value(row)) });
                 }
             }
             // AC + dosage-R² via the shared helper; ds_scratch[s] = ap1+ap2 (the DS column).
@@ -152,7 +158,7 @@ pub fn merge_batch_parquets(
                 n_samples_total, n_haps_total as usize, |s| flat[s], &mut ds_scratch,
             );
             for s in 0..n_samples_total {
-                ds_builders[s].append_value(ds_scratch[s]);
+                if no_call[s] { ds_builders[s].append_null() } else { ds_builders[s].append_value(ds_scratch[s]) }
             }
             let af = ac as f32 / n_haps_total as f32;
             af_b.append_value(af);

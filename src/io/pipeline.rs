@@ -425,6 +425,8 @@ pub fn finish_vcf_writer(
 fn format_tile_batch(
     alt_probs: &[f32],
     tile_n: usize,
+    // Tile rows to format (a subrange when passthrough records split the tile).
+    rows: std::ops::Range<usize>,
     n_haps: usize,
     n_samples: usize,
     global_start: usize,
@@ -444,7 +446,7 @@ fn format_tile_batch(
     // Validate dimensions
     debug_assert!(alt_probs.len() >= n_haps * tile_n,
         "alt_probs too small: {} < {} * {}", alt_probs.len(), n_haps, tile_n);
-    if tile_n == 0 { return Vec::new(); }
+    if rows.is_empty() { return Vec::new(); }
     // R4b helper: at an input chip site, sample `s` with confidence >= thr keeps
     // its verbatim hard call; everything else uses the panel alt_probs. Always
     // false when site_conf_per_sample is None (refine off) → pre-R4b behavior.
@@ -457,13 +459,14 @@ fn format_tile_batch(
             }
         }
     };
-    let n_chunks = 16.min(tile_n);
-    let chunk_size = tile_n.div_ceil(n_chunks);
+    let n_rows = rows.len();
+    let n_chunks = 16.min(n_rows);
+    let chunk_size = n_rows.div_ceil(n_chunks);
 
     let chunks: Vec<Vec<u8>> = (0..n_chunks).into_par_iter().map(|ci| {
-        let v_start = ci * chunk_size;
-        if v_start >= tile_n { return Vec::new(); }
-        let v_end = ((ci + 1) * chunk_size).min(tile_n);
+        let v_start = rows.start + ci * chunk_size;
+        if v_start >= rows.end { return Vec::new(); }
+        let v_end = (v_start + chunk_size).min(rows.end);
         let n_vars = v_end - v_start;
 
         let mut buf = Vec::with_capacity(n_vars * (n_samples * 16 + 80));
@@ -674,6 +677,8 @@ pub fn setup_bcf_writer(
 fn format_tile_batch_bcf(
     alt_probs: &[f32],
     tile_n: usize,
+    // Tile rows to encode (a subrange when passthrough records split the tile).
+    rows: std::ops::Range<usize>,
     n_haps: usize,
     n_samples: usize,
     global_start: usize,
@@ -691,14 +696,15 @@ fn format_tile_batch_bcf(
 ) -> Vec<u8> {
     use super::bcf_encode;
 
-    if tile_n == 0 { return Vec::new(); }
-    let n_chunks = 16.min(tile_n);
-    let chunk_size = tile_n.div_ceil(n_chunks);
+    if rows.is_empty() { return Vec::new(); }
+    let n_rows = rows.len();
+    let n_chunks = 16.min(n_rows);
+    let chunk_size = n_rows.div_ceil(n_chunks);
 
     let chunks: Vec<Vec<u8>> = (0..n_chunks).into_par_iter().map(|ci| {
-        let v_start = ci * chunk_size;
-        if v_start >= tile_n { return Vec::new(); }
-        let v_end = ((ci + 1) * chunk_size).min(tile_n);
+        let v_start = rows.start + ci * chunk_size;
+        if v_start >= rows.end { return Vec::new(); }
+        let v_end = (v_start + chunk_size).min(rows.end);
 
         // Estimate: ~(14*n_samples + 80) bytes per variant for BCF
         let mut buf = Vec::with_capacity((v_end - v_start) * (n_samples * 14 + 80));
@@ -864,6 +870,9 @@ pub struct WindowInput<'a> {
     /// anchors instead of variant ordinal. `None` (default) keeps the
     /// rank-linear t byte-identical.
     pub interp_cum_cm: Option<&'a [f64]>,
+    /// Target records absent from the panel, written at their position
+    /// (`None` under `--drop-unmatched` or when there are none).
+    pub passthrough: Option<&'a crate::io::passthrough::Passthrough>,
 }
 
 /// Active output sinks. Only the ones requested by `OutputFormats` are
@@ -909,7 +918,7 @@ pub fn write_window_multiformat(
         srp, all_weights, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples, chip_genotypes, no_ap,
         preloaded_chunks, preloaded_stripes, site_conf, site_conf_per_sample, refine_thr,
-        interp_cum_cm,
+        interp_cum_cm, passthrough,
     } = input;
     let WindowWriters { parquet: parquet_writer, pgen: pgen_writer, selfdecode: sd_writer, vcf_tx } = writers;
 
@@ -963,11 +972,55 @@ pub fn write_window_multiformat(
     // Reusable dosage scratch for the format-independent DR2 quality accumulation.
     let mut dr2_scratch = vec![0f32; n_samples];
 
+    // BCF contig index of this window's chromosome, for passthrough records.
+    let pass_rid = var_infos.as_ref().and_then(|v| v.first()).map(|v| v.rid).unwrap_or(0);
+
+    // Macro: write passthrough records `$recs` (indices into `passthrough`) to
+    // every active format. VCF/BCF carry every record; the dosage formats carry
+    // the biallelic ones.
+    macro_rules! emit_pass {
+        ($recs:expr) => {{
+            let recs: std::ops::Range<usize> = $recs;
+            if let Some(pass) = passthrough.filter(|_| !recs.is_empty()) {
+                if formats.vcf {
+                    let mut buf = Vec::with_capacity(recs.len() * (n_samples * 4 + 64));
+                    for i in recs.clone() { pass.append_vcf(i, 0..n_samples, &mut buf); }
+                    vcf_tx.send(buf).expect("VCF send failed");
+                }
+                if formats.bcf {
+                    let mut buf = Vec::with_capacity(recs.len() * (n_samples * 2 + 64));
+                    for i in recs.clone() {
+                        super::bcf_encode::encode_passthrough_record(&mut buf, pass_rid, pass.rec(i), 0..n_samples);
+                    }
+                    vcf_tx.send(buf).expect("VCF send failed");
+                }
+                if let Some((ref mut writer, _)) = pw {
+                    if let Some(ref sa) = schema_arc {
+                        super::parquet_output::write_passthrough_rows(writer, sa, pass, recs.clone(), 0..n_samples)?;
+                    }
+                }
+                if let Some((ref mut pg, ref mut pv)) = pgw {
+                    for i in recs.clone() {
+                        let r = pass.rec(i);
+                        if !r.is_biallelic() { continue; }
+                        pass.fill_dosage_fields(i, 0..n_samples, &mut hardcalls, &mut dosages);
+                        super::pgen_output::write_pvar_variant(pv, pass.chrom(), &r.pos.to_string(), &r.id, &r.ref_allele, &r.alts[0])?;
+                        pg.write_variant(&hardcalls, &dosages)?;
+                    }
+                }
+                if let Some(ref mut sd) = sdw {
+                    for i in recs.clone() { sd.write_passthrough(pass.chrom(), pass.rec(i), 0..n_samples)?; }
+                }
+            }
+        }};
+    }
+
     // Macro: encode chip sites in [next_wgs..end) gap
     macro_rules! emit_chip_gap {
         ($end:expr) => {
             while next_wgs < $end {
                 let local_idx = next_wgs - setup.own_wgs_start;
+                if let Some(pass) = passthrough { emit_pass!(pass.before(next_wgs)); }
                 if setup.is_chip[local_idx] {
                     if formats.vcf {
                         let mut buf = Vec::with_capacity(n_samples * 20);
@@ -993,7 +1046,7 @@ pub fn write_window_multiformat(
                         if let Some(ref sa) = schema_arc {
                             let vp_start = next_wgs - setup.own_wgs_start;
                             super::parquet_output::write_tile_to_parquet(
-                                writer, sa, &[], 1, n_samples, setup.n_haps,
+                                writer, sa, &[], 1, 0..1, n_samples, setup.n_haps,
                                 next_wgs, &setup.vid_prefixes, vp_start, &setup.is_chip,
                                 &setup.chip_local_idx, chip_genotypes, setup.n_ref_variants,
                                 &setup.is_input_chip, setup.site_conf_per_sample.as_deref(), setup.refine_thr)?;
@@ -1024,13 +1077,14 @@ pub fn write_window_multiformat(
         };
     }
 
-    // Macro: encode one interpolated tile to all formats
-    macro_rules! encode_tile {
-        ($alt_probs:expr, $tile_n:expr, $global_start:expr) => {{
+    // Macro: encode rows `$rows` of one interpolated tile to all formats
+    macro_rules! encode_rows {
+        ($alt_probs:expr, $tile_n:expr, $global_start:expr, $rows:expr) => {{
+            let rows: std::ops::Range<usize> = $rows;
             if formats.vcf {
                 let vp_start = $global_start - setup.own_wgs_start;
                 vcf_tx.send(format_tile_batch(
-                    $alt_probs, $tile_n, setup.n_haps, n_samples,
+                    $alt_probs, $tile_n, rows.clone(), setup.n_haps, n_samples,
                     $global_start, setup.n_ref_variants,
                     vp_start, &setup.vid_prefixes, &setup.is_chip, &setup.chip_local_idx,
                     chip_genotypes, &setup.an_str, no_ap,
@@ -1041,7 +1095,7 @@ pub fn write_window_multiformat(
                 let vi = var_infos.as_ref().unwrap();
                 let vi_start = $global_start - setup.own_wgs_start;
                 vcf_tx.send(format_tile_batch_bcf(
-                    $alt_probs, $tile_n, setup.n_haps, n_samples,
+                    $alt_probs, $tile_n, rows.clone(), setup.n_haps, n_samples,
                     $global_start, setup.n_ref_variants,
                     vi_start, vi, &setup.is_chip, &setup.chip_local_idx,
                     chip_genotypes, no_ap,
@@ -1052,14 +1106,14 @@ pub fn write_window_multiformat(
                 if let Some(ref sa) = schema_arc {
                     let vp_start = $global_start - setup.own_wgs_start;
                     super::parquet_output::write_tile_to_parquet(
-                        writer, sa, $alt_probs, $tile_n, n_samples, setup.n_haps,
+                        writer, sa, $alt_probs, $tile_n, rows.clone(), n_samples, setup.n_haps,
                         $global_start, &setup.vid_prefixes, vp_start, &setup.is_chip,
                         &setup.chip_local_idx, chip_genotypes, setup.n_ref_variants,
                         &setup.is_input_chip, setup.site_conf_per_sample.as_deref(), setup.refine_thr)?;
                 }
             }
             if formats.pgen || formats.selfdecode {
-                for v in 0..$tile_n {
+                for v in rows.clone() {
                     let wgs_i = $global_start + v;
                     if wgs_i >= setup.n_ref_variants { break; }
                     let local_i = wgs_i - setup.own_wgs_start;
@@ -1111,6 +1165,30 @@ pub fn write_window_multiformat(
                         { Some(&sd_hc_mask) } else { None };
                         sd.write_variant(chrom, pos, oid, ref_a, alt_a, &sd_gt1, &sd_gt2, &sd_ap1, &sd_ap2, is_chip_var, sd_mask)?;
                     }
+                }
+            }
+        }};
+    }
+
+    // Macro: encode one interpolated tile to all formats. A tile holding the
+    // anchor of a passthrough record is encoded in row segments with the records
+    // written between them; any other tile takes the single-range path.
+    macro_rules! encode_tile {
+        ($alt_probs:expr, $tile_n:expr, $global_start:expr) => {{
+            let tile_end = ($global_start + $tile_n).min(setup.n_ref_variants);
+            match passthrough.map(|p| (p, p.anchored_in($global_start, tile_end))).filter(|(_, r)| !r.is_empty()) {
+                None => encode_rows!($alt_probs, $tile_n, $global_start, 0..$tile_n),
+                Some((pass, recs)) => {
+                    let (mut row, mut i) = (0usize, recs.start);
+                    while i < recs.end {
+                        let a = pass.anchor(i);
+                        let group = pass.before(a);
+                        encode_rows!($alt_probs, $tile_n, $global_start, row..a - $global_start);
+                        emit_pass!(group.clone());
+                        row = a - $global_start;
+                        i = group.end;
+                    }
+                    encode_rows!($alt_probs, $tile_n, $global_start, row..$tile_n);
                 }
             }
             // Format-independent imputation-quality accumulation (mean DR2 over
@@ -1387,6 +1465,10 @@ pub fn write_window_multiformat(
 
     // Trailing chip sites
     emit_chip_gap!(setup.own_wgs_end);
+    // Passthrough records past the last panel variant follow it.
+    if let Some(pass) = passthrough.filter(|_| setup.own_wgs_end == setup.n_ref_variants) {
+        emit_pass!(pass.before(setup.n_ref_variants));
+    }
 
     let total_secs = t0_pipeline.elapsed().as_secs_f64();
     crate::selphi_debug!("  [multiformat] interp+encode={:.2}s", total_secs);

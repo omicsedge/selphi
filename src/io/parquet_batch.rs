@@ -162,6 +162,34 @@ impl BatchSink for ParquetSink<'_> {
         Ok(())
     }
 
+    fn emit_passthrough(
+        &mut self, pass: &crate::io::passthrough::Passthrough, i: usize, ctx: &WindowCtx,
+    ) -> std::io::Result<()> {
+        let r = pass.rec(i);
+        if !r.is_biallelic() { return Ok(()); }
+        self.chroms.append_value(pass.chrom());
+        self.positions.append_value(r.pos);
+        self.ids.append_value(&r.id);
+        self.refs_b.append_value(&r.ref_allele);
+        self.alts_b.append_value(&r.alts[0]);
+        self.imps.append_value(false);
+        for s in 0..ctx.n_samples_in_batch {
+            let gs = ctx.sample_start + s;
+            // Per-hap ALT indicator; a no-call is null in both haps, which the
+            // merger turns into a null DS (the unbatched value).
+            match r.alt_count(gs) {
+                None => { self.ap_builders[s * 2].append_null(); self.ap_builders[s * 2 + 1].append_null(); }
+                Some(_) => {
+                    let (a0, a1, _) = r.alleles(gs);
+                    self.ap_builders[s * 2].append_value((a0 > 0) as u8 as f32);
+                    self.ap_builders[s * 2 + 1].append_value((a1 != crate::io::passthrough::ABSENT && a1 > 0) as u8 as f32);
+                }
+            }
+        }
+        if self.positions.len() >= self.cap { self.flush()?; }
+        Ok(())
+    }
+
     fn emit_imputed(
         &mut self, wgs_i: usize, local_i: usize,
         alt: &[f32], tile_n: usize, v: usize, ctx: &WindowCtx,
@@ -208,7 +236,7 @@ pub fn write_window_parquet_batched(
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples_total, chip_genotypes, no_ap: _, site_conf, site_conf_per_sample, refine_thr,
         interp_cum_cm,
-        bcf_contig_names: _,
+        bcf_contig_names: _, passthrough,
     } = input;
     let mut sink = ParquetSink {
         bw,
@@ -224,6 +252,6 @@ pub fn write_window_parquet_batched(
     crate::io::batch_driver::run_window(
         &mut sink, srp.as_ref(), weights, hap_start, hap_end,
         win_chip_start, own_chip_start, own_chip_end, wgs_idx, n_samples_total, chip_genotypes,
-        site_conf, site_conf_per_sample, refine_thr, interp_cum_cm,
+        site_conf, site_conf_per_sample, refine_thr, interp_cum_cm, passthrough,
     )
 }

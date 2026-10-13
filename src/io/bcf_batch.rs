@@ -174,6 +174,14 @@ impl BatchSink for BcfSink<'_> {
         Ok(())
     }
 
+    fn emit_passthrough(
+        &mut self, pass: &crate::io::passthrough::Passthrough, i: usize, ctx: &WindowCtx,
+    ) -> std::io::Result<()> {
+        let rid = self.var_infos.first().map(|v| v.rid).unwrap_or(0);
+        crate::io::bcf_encode::encode_passthrough_record(&mut self.buf, rid, pass.rec(i), ctx.sample_start..ctx.sample_start + ctx.n_samples_in_batch);
+        Ok(())
+    }
+
     fn emit_imputed(
         &mut self, _wgs_i: usize, local_i: usize,
         alt: &[f32], tile_n: usize, v: usize, ctx: &WindowCtx,
@@ -234,7 +242,7 @@ pub fn write_window_bcf_batched(
     let WindowBatchInput {
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples_total, chip_genotypes, no_ap, site_conf, site_conf_per_sample, refine_thr,
-        bcf_contig_names,
+        bcf_contig_names, passthrough,
         interp_cum_cm,
     } = input;
     // Intermediate always carries AP1/AP2 (see setup_batch_writers); the merger
@@ -245,6 +253,6 @@ pub fn write_window_bcf_batched(
     crate::io::batch_driver::run_window(
         &mut sink, srp.as_ref(), weights, hap_start, hap_end,
         win_chip_start, own_chip_start, own_chip_end, wgs_idx, n_samples_total, chip_genotypes,
-        site_conf, site_conf_per_sample, refine_thr, interp_cum_cm,
+        site_conf, site_conf_per_sample, refine_thr, interp_cum_cm, passthrough,
     )
 }

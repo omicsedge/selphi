@@ -65,6 +65,8 @@ pub struct MultiChrImputeConfig {
     pub chrx_par: bool,
     /// `--phase-ensemble N`: see `resolve_ensemble_n`. 1 = off.
     pub phase_ensemble: usize,
+    /// `--drop-unmatched`: leave out target records absent from the panel.
+    pub drop_unmatched: bool,
     /// `--ped`: pedigree pre-phasing + het locking.
     pub ped: Option<String>,
     /// `--haploids`: explicit haploid sample list (chrX males are auto-detected
@@ -118,6 +120,7 @@ impl MultiChrImputeConfig {
             allele_match: args.allele_match,
             chrx_par: args.chrx_par,
             phase_ensemble: args.phase_ensemble,
+            drop_unmatched: args.drop_unmatched,
             ped: args.ped.clone(),
             haploids: args.haploids.clone(),
             build: args.build,
@@ -699,6 +702,21 @@ pub fn run_multi_chr(
         }
         selphi_info!("    {} ref variants, {} shared markers", n_ref_variants, n_chip);
 
+        // Target records of this chromosome absent from the panel (io::passthrough).
+        let passthrough = if config.drop_unmatched { None } else {
+            let key = chr_name.strip_prefix("chr").unwrap_or(chr_name);
+            let markers = target_by_chr.get(key).or_else(|| target_by_chr.get(chr_name))
+                .map(|(m, _)| m.as_slice()).unwrap_or(&[]);
+            match selphi::io::passthrough::for_chromosome(input_path, &srp, markers, &target_idx, None) {
+                Ok(p) => p,
+                Err(e) => {
+                    selphi_error!("Reading the target records absent from the panel ({}): {}", input_path, e);
+                    std::process::exit(1);
+                }
+            }
+        };
+        if let Some(p) = &passthrough { selphi_info!("    {}", selphi::io::passthrough::log_summary(p)); }
+
         // Pre-phasing passes, identical to the single-chr pipeline: the pedigree
         // scaffold (--ped) and haploid handling. The latter is NOT flag-gated —
         // chrX males are auto-detected — so before 2026-09-04 a whole-genome run
@@ -986,6 +1004,7 @@ pub fn run_multi_chr(
                     site_conf_per_sample: nocall.as_ref().map(|(_, ps)| ps.as_slice()),
                     refine_thr: nocall_thr,
                     interp_cum_cm: interp_cum_cm.as_deref(),
+                    passthrough: passthrough.as_ref(),
                 },
                 selphi::io::pipeline::WindowWriters {
                     // Per-chr parquet/pgen/selfdecode not wired yet in multi-chr mode.
