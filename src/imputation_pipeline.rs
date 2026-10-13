@@ -438,29 +438,17 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
             if scaffold_panel && panel_bm.is_none() {
                 selphi_info!("    SELPHI_DIPLOID_SCAFFOLD_SOURCE=panel ignored (no chip-site panel bitmatrix on this path)");
             }
-            let common_chip_indices: Vec<usize> = (0..n_chip).into_par_iter().filter(|&v| {
-                // Mask the 128 missing sentinel (and count its AN) so MAF is over called
-                // alleles only — a missing GT must not inflate AC by 128.
-                let mut ac = 0u32; let mut an = 0u32;
-                for si in 0..n_samples {
-                    let a0 = targ_alleles[v * n_samples * 2 + si * 2];
-                    let a1 = targ_alleles[v * n_samples * 2 + si * 2 + 1];
-                    if a0 <= 1 { ac += a0 as u32; an += 1; }
-                    if a1 <= 1 { ac += a1 as u32; an += 1; }
-                }
-                // A site with no called target allele carries no phase information
-                // whatever the frequency source says, so it is dropped either way.
-                if an == 0 { return false; }
-                if let Some(bm) = panel_bm {
-                    let pac: u32 = bm.row(v).iter().map(|w| w.count_ones()).sum();
-                    let pn = bm.n_haps as u32;
-                    if pn == 0 { return false; }
-                    let pmac = pac.min(pn - pac);
-                    return (pmac as f32 / pn as f32) >= scaffold_maf;
-                }
-                let mac = ac.min(an - ac);
-                (mac as f32 / an as f32) >= scaffold_maf
-            }).collect();
+            let scaffold = selphi::diploid::scaffold::select(
+                targ_alleles, n_chip, n_samples, panel_bm, scaffold_maf);
+            if scaffold.widened {
+                selphi_step!("No site clears the phasing scaffold threshold (no heterozygous call, e.g. a \
+male chrX): phasing on all {} called sites", scaffold.indices.len());
+            }
+            if scaffold.indices.is_empty() {
+                selphi_error!("No called target genotype on this chromosome: nothing to phase or impute from");
+                std::process::exit(1);
+            }
+            let common_chip_indices = scaffold.indices;
             let common_ref_bm = if let Some(ref full_bm) = ref_bm_full {
                 selphi::diploid::pbwt_neighbor::HaplotypeBitmatrix::from_subset(
                     full_bm, &common_chip_indices)

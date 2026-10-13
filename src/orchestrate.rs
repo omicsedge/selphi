@@ -388,25 +388,23 @@ fn phase_chr(
             // common variants; rare ones are re-imputed/woven by phase_rare.
             let _target_an = (n_samples * 2) as u32;
             // Threshold is over the TARGET COHORT's frequency, so the scaffold
-            // shrinks with the batch (see the single-chr twin in
-            // imputation_pipeline.rs). SELPHI_DIPLOID_SCAFFOLD_MAF overrides it.
+            // shrinks with the batch; SELPHI_DIPLOID_SCAFFOLD_MAF overrides it and
+            // SELPHI_DIPLOID_SCAFFOLD_SOURCE=panel takes the panel's frequency
+            // instead. Same selection as the single-chr path (diploid::scaffold).
             let scaffold_maf = selphi::config::f32_or("SELPHI_DIPLOID_SCAFFOLD_MAF", 0.001);
-            let common_chip_indices: Vec<usize> = (0..n_chip).into_par_iter().filter(|&v| {
-                // Mask the 128 missing sentinel so MAF is over CALLED alleles only.
-                let mut ac = 0u32; let mut an = 0u32;
-                for si in 0..n_samples {
-                    let a0 = targ_alleles[v * n_samples * 2 + si * 2];
-                    let a1 = targ_alleles[v * n_samples * 2 + si * 2 + 1];
-                    if a0 <= 1 { ac += a0 as u32; an += 1; }
-                    if a1 <= 1 { ac += a1 as u32; an += 1; }
-                }
-                if an == 0 { return false; }
-                let mac = ac.min(an - ac);
-                (mac as f32 / an as f32) >= scaffold_maf
-            }).collect();
+            let scaffold_panel =
+                selphi::config::raw("SELPHI_DIPLOID_SCAFFOLD_SOURCE").as_deref() == Some("panel");
+            let scaffold = selphi::diploid::scaffold::select(
+                &targ_alleles, n_chip, n_samples, if scaffold_panel { Some(&ref_bm) } else { None },
+                scaffold_maf);
+            if scaffold.widened {
+                selphi_info!("    Phasing: no site clears the scaffold threshold (no heterozygous call, \
+e.g. a male chrX): phasing on all {} called sites", scaffold.indices.len());
+            }
+            let common_chip_indices = scaffold.indices;
             if common_chip_indices.is_empty() {
-                // No common scaffold for diploid — fall back to haploid.
-                selphi_info!("    Phasing: diploid requested but no common-MAF variants; using haploid");
+                // No called target genotype at all on this chromosome — fall back to haploid.
+                selphi_info!("    Phasing: diploid requested but no called target genotype; using haploid");
                 let (phased, _ri, _conf) = selphi::haploid::phase_genotypes(
                     &targ_alleles, &ref_bm, raw_chip_cm, chip_bps,
                     &ref_bp, &map_bp_raw, &map_cm_raw,

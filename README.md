@@ -148,7 +148,7 @@ No-call genotypes in the target (`./.`, common on genotyping arrays at ~1–2% o
 
 ### Sex chromosomes
 
-- **chrX**: when Selphi phases the target (unphased input, or `--force-phasing`), males are auto-detected (low heterozygosity) and their het calls reset before phasing; already-phased input is used as is. Add `--chrx-par --build grch38` (or `grch37`/`auto`, the default) to be PAR-aware: male hets are kept in PAR1/PAR2 and reset elsewhere. Male chrX genotypes and dosages are still written diploid.
+- **chrX**: when Selphi phases the target (unphased input, or `--force-phasing`), males are auto-detected (low heterozygosity) and their het calls reset before phasing; already-phased input is used as is. Add `--chrx-par --build grch38` (or `grch37`/`auto`, the default) to be PAR-aware: male hets are kept in PAR1/PAR2 and reset elsewhere. Male chrX genotypes and dosages are still written diploid. A male imputed on his own (no heterozygous chrX call at all) is phased on every called site.
 - **chrY / chrMT**: refused, because the Li-Stephens recombination model does not apply to a non-recombining / haploid contig and standard panels omit them. In whole-genome runs they are skipped with a warning. `SELPHI_ALLOW_NONRECOMB=1` forces a run.
 
 ### Panel phasing (de-novo, no reference)
