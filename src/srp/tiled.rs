@@ -260,13 +260,19 @@ impl TiledSrpReader {
                 // same word; write through the raw base pointer instead of materializing
                 // a full-length &mut per worker (overlapping &mut = aliasing UB).
                 let base = bits_ptr as *mut u64;
-                // Per-stripe row(cr) → chip-indices(ci) map, built ONCE per stripe.
-                // Replaces the inner per-nnz `for &(ci,cr) in sites` linear scan
-                // (O(nnz × |sites|), pathological for dense extraction where |sites|
-                // ≈ TILE_ROWS, e.g. --phase-panel / srp→bref3) with an O(1) lookup.
-                // `|=` is order-independent + idempotent → output bit-identical.
-                let mut row_cis: HashMap<usize, Vec<usize>> = HashMap::with_capacity(sites.len());
-                for &(ci, cr) in sites.iter() { row_cis.entry(cr).or_default().push(ci); }
+                // Per stripe: which of its TILE_ROWS rows are wanted (a bitmap tested per
+                // nonzero: one shift and AND, where a HashMap lookup per nonzero cost a
+                // SipHash for every ALT allele in the panel, nearly all misses at array
+                // density), the chip index of each wanted row, and any further chip indices
+                // that map to the same row (duplicate sites; rare). `|=` is
+                // order-independent and idempotent, so the output is bit-identical.
+                let mut want = [0u64; TILE_ROWS / 64];
+                let mut first = [u32::MAX; TILE_ROWS];
+                let mut extra: Vec<(usize, usize)> = Vec::new();
+                for &(ci, cr) in sites.iter() {
+                    want[cr / 64] |= 1u64 << (cr % 64);
+                    if first[cr] == u32::MAX { first[cr] = ci as u32; } else { extra.push((cr, ci)); }
+                }
                 for band in 0..n_tc {
                     let tile = loaded.decompress_tile(*stripe, band);
                     let cb = band * TILE_COLS;
@@ -278,10 +284,10 @@ impl TiledSrpReader {
                         let (lo, hi) = tile.col_range(col);
                         for k in lo..hi {
                             let lr = tile.indices[k] as usize;
-                            if let Some(cis) = row_cis.get(&lr) {
-                                for &ci in cis {
-                                    unsafe { let p = base.add(ci * n_words + wi); *p |= bit; }
-                                }
+                            if (want[lr / 64] >> (lr % 64)) & 1 == 0 { continue; }
+                            unsafe { let p = base.add(first[lr] as usize * n_words + wi); *p |= bit; }
+                            for &(r, ci) in &extra {
+                                if r == lr { unsafe { let p = base.add(ci * n_words + wi); *p |= bit; } }
                             }
                         }
                     }
