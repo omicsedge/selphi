@@ -11,6 +11,10 @@ use super::params::*;
 use super::genotype_graph::*;
 use super::pbwt_neighbor::*;
 use super::ibd2_tracks::*;
+
+/// Up to this many target individuals IBD2 is found by comparing each target with the panel
+/// bit-parallel (targets x sites x panel/32 word operations) instead of sorting everyone.
+const IBD2_DIRECT_MAX_TARGETS: usize = 64;
 use super::hmm_segment::*;
 use super::hmm_segment_f64::SegmentHmmF64;
 use super::sampling;
@@ -232,10 +236,14 @@ pub fn run_phase_common_bm(
         let default_bp: Vec<i64> = (0..n_var).map(|v| v as i64 * 1000).collect();
         let bp = chip_bp.unwrap_or(&default_bp);
         let t0_ibd2 = std::time::Instant::now();
-        let tracks = Ibd2Tracks::detect(
-            |site, hap| hap_bm.get(site, hap),
-            cm, bp, n_var, n_haps_total, 2.5, 1e6, 100,
-        );
+        // Few targets: compare each target with the whole panel bit-parallel (exact, see
+        // detect_targets). Many: one genotype PBWT over everyone, whose cost no longer
+        // grows with the number of targets.
+        let tracks = if n_samples <= IBD2_DIRECT_MAX_TARGETS && !crate::config::is_one("SELPHI_IBD2_PANEL_SORT") {
+            Ibd2Tracks::detect_targets(&hap_bm, n_samples, cm, bp, n_var, n_haps_total, 2.5, 1e6, 100)
+        } else {
+            Ibd2Tracks::detect(|site, hap| hap_bm.get(site, hap), cm, bp, n_var, n_haps_total, 2.5, 1e6, 100)
+        };
         crate::selphi_debug!("  [diploid] IBD2 pairs detected: {} ({:.1}s)",
             tracks.n_pairs(), t0_ibd2.elapsed().as_secs_f64());
         tracks
