@@ -160,7 +160,6 @@ pub fn run_phase_rare(
         let m = 3usize;
         let mut u_arr = vec![0usize; m];
         let mut p_arr = vec![0usize; m];
-        let mut g_arr = vec![0usize; n_ind];
         let mut a_scan: Vec<Vec<usize>> = vec![vec![0; n_ind]; m];
         let mut d_scan: Vec<Vec<usize>> = vec![vec![0; n_ind]; m];
 
@@ -174,7 +173,6 @@ pub fn run_phase_rare(
                 for g in 0..m { if dlookup > p_arr[g] { p_arr[g] = dlookup; } }
                 let g = (phased[sv * n_haps + 2 * alookup] as usize
                        + phased[sv * n_haps + 2 * alookup + 1] as usize).min(m - 1);
-                g_arr[i] = g;
                 a_scan[g][u_arr[g]] = alookup;
                 d_scan[g][u_arr[g]] = p_arr[g];
                 p_arr[g] = 0;
@@ -188,6 +186,11 @@ pub fn run_phase_rare(
                 }
                 offset += u_arr[g];
             }
+            // Genotype of the individual at NEW position i: buckets 0, 1, 2 in merge order.
+            // (SHAPEIT5's scanIBD2 compares G[] filled in the previous site's order at new
+            // positions, which stopped the walk at random and dropped true IBD2 pairs.)
+            let (b1, b2) = (u_arr[0], u_arr[0] + u_arr[1]);
+            let gpos = |pos: usize| if pos < b1 { 0 } else if pos < b2 { 1 } else { 2 };
             for i in 1..n_ind {
                 let ind0 = a_scan[0][i];
                 let ng0 = if l + 1 < n_scaffold {
@@ -196,7 +199,7 @@ pub fn run_phase_rare(
                 } else { -1 };
                 let mut div: i64 = -1;
                 for ip in (0..i).rev() {
-                    if g_arr[ip] != g_arr[i] { break; }
+                    if gpos(ip) != gpos(i) { break; }
                     div = div.max(d_scan[0][ip + 1] as i64);
                     let length_cm = scaffold_cm[l] - scaffold_cm[div as usize];
                     // scaffold_sites holds VARIANT INDICES, so index bp[] to get the

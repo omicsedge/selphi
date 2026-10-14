@@ -129,7 +129,6 @@ impl Ibd2Tracks {
         const M: usize = 3;
         let mut u = [0usize; M];
         let mut p = [0usize; M];
-        let mut g_arr = vec![0usize; n_ind];
         let mut a = vec![vec![0usize; n_ind]; M];
         let mut d = vec![vec![0usize; n_ind]; M];
         for i in 0..n_ind { a[0][i] = i; }
@@ -144,7 +143,6 @@ impl Ibd2Tracks {
                 let h0 = haplotypes(l, 2 * alookup);
                 let h1 = haplotypes(l, 2 * alookup + 1);
                 let geno = h0 as usize + h1 as usize;
-                g_arr[i] = geno;
                 a[geno][u[geno]] = alookup;
                 d[geno][u[geno]] = p[geno];
                 p[geno] = 0;
@@ -155,6 +153,13 @@ impl Ibd2Tracks {
                 for j in 0..u[g] { a[0][offset+j] = a[g][j]; d[0][offset+j] = d[g][j]; }
                 offset += u[g];
             }
+            // Genotype at site l of the individual at NEW position i: the merge put the
+            // genotype-0 bucket first, then 1, then 2. (SHAPEIT5's scanIBD2, which this ports,
+            // compares G[] filled in the PREVIOUS site's order at new positions, so the
+            // same-genotype check read the wrong individuals and stopped the walk at random,
+            // dropping true IBD2 pairs: a pair is recorded once, where its run ends.)
+            let (b1, b2) = (u[0], u[0] + u[1]);
+            let gpos = |pos: usize| if pos < b1 { 0 } else if pos < b2 { 1 } else { 2 };
             for i in 1..n_ind {
                 let ind0 = a[0][i];
                 let ng0 = if l+1 < n_scaffold {
@@ -164,7 +169,7 @@ impl Ibd2Tracks {
                 let mut ip = i;
                 while ip > 0 {
                     ip -= 1;
-                    if g_arr[ip] != g_arr[i] { break; }
+                    if gpos(ip) != gpos(i) { break; }
                     div = div.max(d[0][ip + 1]);
                     let length_cm = scaffold_cm[l] - scaffold_cm[div];
                     let length_bp = (scaffold_bp[l] - scaffold_bp[div]) as f64;
@@ -202,6 +207,111 @@ impl Ibd2Tracks {
     }
 }
 
+impl Ibd2Tracks {
+    /// The tracks `detect` records for every pair that involves a TARGET individual (targets
+    /// are individuals `[0, n_target_ind)`, as the unified bitmatrix lays them out), found
+    /// without sorting the panel. Those are the only tracks ever read: the PBWT sweep stores
+    /// conditioning sets for target haplotypes only and asks `no_ibd2(target_hap, neighbour)`,
+    /// whose pair always lives in `tracks[target]`. Panel-panel tracks were built and never
+    /// read — 3.4 s of a 26 s one-user chr22 run against 75,552 haplotypes.
+    ///
+    /// A recorded track is a maximal run of identical genotypes `[s, e]` between two
+    /// individuals that spans every site or reaches `min_cm`, `min_bp` and `min_sites`,
+    /// widened by 4 cM on each side. Any such run (>= `min_sites` sites) covers a whole
+    /// aligned block of `min_sites / 2` sites, so each target's genotype is compared with all
+    /// individuals 32 at a time (one u64 word holds 32 individuals' haplotype pairs), ANDed
+    /// over each block; an individual equal to the target on a whole block has its run
+    /// extended left and right from that block, once per run. Cost: targets x sites x
+    /// panel/32 word operations, plus the extensions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn detect_targets(
+        bm: &crate::common::HaplotypeBitmatrix,
+        n_target_ind: usize,
+        scaffold_cm: &[f64],
+        scaffold_bp: &[i64],
+        n_scaffold: usize,
+        n_haplotypes: usize,
+        min_cm: f64,
+        min_bp: f64,
+        min_sites: usize,
+    ) -> Self {
+        use rayon::prelude::*;
+        let n_ind = n_haplotypes / 2;
+        let mut tracks = Self::new(n_ind);
+        tracks.cm = scaffold_cm.to_vec();
+        if n_scaffold < 2 || n_ind < 2 { return tracks; }
+        const EVEN: u64 = 0x5555_5555_5555_5555;
+        let nw = bm.n_words();
+        // individuals that exist in each word (the last word may be padded)
+        let valid: Vec<u64> = (0..nw).map(|w| {
+            let lo = w * 32;
+            let n = n_ind.saturating_sub(lo).min(32);
+            if n == 32 { EVEN } else { EVEN & ((1u64 << (2 * n)) - 1) }
+        }).collect();
+        let geno = |l: usize, ind: usize| bm.get(l, 2 * ind) as u8 + bm.get(l, 2 * ind + 1) as u8;
+        let block = (min_sites / 2).max(1).min(n_scaffold);
+        let n_blocks = n_scaffold / block;
+        let expand = |s: usize, e: usize| {
+            let mut from = s;
+            let left_cm = scaffold_cm[s];
+            while from > 0 && (left_cm - scaffold_cm[from]) < 4.0 { from -= 1; }
+            let mut to = e;
+            let right_cm = scaffold_cm[e];
+            while to < n_scaffold - 1 && (scaffold_cm[to] - right_cm) < 4.0 { to += 1; }
+            (from, to)
+        };
+        let per_target: Vec<Vec<Track>> = (0..n_target_ind.min(n_ind)).into_par_iter().map(|t| {
+            let gt: Vec<u8> = (0..n_scaffold).map(|l| geno(l, t)).collect();
+            let mut acc = vec![0u64; nw];
+            // per individual: last site already inside an evaluated run (+1; 0 = none yet)
+            let mut covered: Vec<u32> = vec![0; n_ind];
+            let mut out = Vec::new();
+            for b in 0..n_blocks {
+                let (b0, b1) = (b * block, (b + 1) * block);
+                acc.copy_from_slice(&valid);
+                let mut alive = true;
+                for l in b0..b1 {
+                    let row = bm.row(l);
+                    let mut any = 0u64;
+                    for w in 0..nw {
+                        let (h0, h1) = (row[w] & EVEN, (row[w] >> 1) & EVEN);
+                        let eq = match gt[l] { 0 => !(h0 | h1) & EVEN, 1 => h0 ^ h1, _ => h0 & h1 };
+                        acc[w] &= eq;
+                        any |= acc[w];
+                    }
+                    if any == 0 { alive = false; break; }
+                }
+                if !alive { continue; }
+                // individuals equal to t on the whole block: extend each one's run once
+                for (w, &word) in acc.iter().enumerate() {
+                    let mut bits = word;
+                    while bits != 0 {
+                        let x = w * 32 + (bits.trailing_zeros() / 2) as usize;
+                        bits &= bits - 1;
+                        if x <= t || (covered[x] as usize) > b0 { continue; }
+                        let mut s = b0;
+                        while s > 0 && geno(s - 1, x) == gt[s - 1] { s -= 1; }
+                        let mut e = b1 - 1;
+                        while e + 1 < n_scaffold && geno(e + 1, x) == gt[e + 1] { e += 1; }
+                        covered[x] = (e + 1) as u32;
+                        let ct = e - s + 1;
+                        let len_cm = scaffold_cm[e] - scaffold_cm[s];
+                        let len_bp = (scaffold_bp[e] - scaffold_bp[s]) as f64;
+                        if ct == n_scaffold || (len_cm >= min_cm && len_bp >= min_bp && ct >= min_sites) {
+                            let (from, to) = expand(s, e);
+                            out.push(Track { ind: x, from, to });
+                        }
+                    }
+                }
+            }
+            out
+        }).collect();
+        for (t, tr) in per_target.into_iter().enumerate() { tracks.tracks[t] = tr; }
+        tracks.collapse();
+        tracks
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +336,41 @@ mod tests {
         assert!(tracks.no_ibd2(4, 10, 250));
         // Other pairs: allowed
         assert!(tracks.no_ibd2(4, 6, 150));
+    }
+
+    /// detect_targets gives exactly detect's tracks for every pair involving a target.
+    #[test]
+    fn target_detection_matches_the_panel_sort() {
+        use crate::common::HaplotypeBitmatrix;
+        let (n_ind, n_sites, n_target) = (60usize, 400usize, 3usize);
+        // deterministic pseudo-random genotypes, then planted relatives
+        let mut x = 0x2545F4914F6CDD1Du64;
+        let mut rnd = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        let mut hap = vec![vec![false; 2 * n_ind]; n_sites];
+        for row in hap.iter_mut() { for h in row.iter_mut() { *h = rnd() % 3 == 0; } }
+        // target 0 ~ individual 17 on 50..300; target 1 ~ 30 on 0..400 (whole);
+        // target 2 ~ 41 on 100..180 (too short in bp), target 0 ~ target 2 on 320..399
+        let plant = |hap: &mut Vec<Vec<bool>>, a: usize, b: usize, r: std::ops::Range<usize>| {
+            for l in r { hap[l][2 * b] = hap[l][2 * a + 1]; hap[l][2 * b + 1] = hap[l][2 * a]; }
+        };
+        plant(&mut hap, 0, 17, 50..300);
+        plant(&mut hap, 1, 30, 0..400);
+        plant(&mut hap, 2, 41, 100..180);
+        plant(&mut hap, 0, 2, 320..400);
+        let bm = HaplotypeBitmatrix::from_panel(n_sites, 2 * n_ind, &|l: usize, h: usize| hap[l][h], &vec![true; n_sites]);
+        let cm: Vec<f64> = (0..n_sites).map(|l| l as f64 * 0.05).collect();
+        let bp: Vec<i64> = (0..n_sites).map(|l| l as i64 * 20_000).collect();
+        let full = Ibd2Tracks::detect(|l, h| bm.get(l, h), &cm, &bp, n_sites, 2 * n_ind, 2.5, 1e6, 100);
+        let fast = Ibd2Tracks::detect_targets(&bm, n_target, &cm, &bp, n_sites, 2 * n_ind, 2.5, 1e6, 100);
+        let key = |t: &Track| (t.ind, t.from, t.to);
+        for t in 0..n_target {
+            let a: Vec<_> = full.tracks[t].iter().map(key).collect();
+            let b: Vec<_> = fast.tracks[t].iter().map(key).collect();
+            assert_eq!(a, b, "target {t}");
+        }
+        assert!(!fast.tracks[0].is_empty() && !fast.tracks[1].is_empty());
+        for q in [(0usize, 34usize, 150usize), (1, 60, 10), (2, 82, 130), (0, 4, 350)] {
+            assert_eq!(full.no_ibd2(q.0, q.1, q.2), fast.no_ibd2(q.0, q.1, q.2), "{q:?}");
+        }
     }
 }
