@@ -10,37 +10,56 @@ use crate::selphi_debug;
 /// Map format: space-separated, columns [2]=BP position, [3]=cM.
 /// Lines starting with '#' are comments.
 pub fn load_and_interpolate_genetic_map(map_path: &Path, chip_bps: &[i64]) -> std::io::Result<Vec<f64>> {
-    let content = std::fs::read_to_string(map_path)?;
-
-    // Parse map: (position, cM) pairs
-    let mut map_entries: Vec<(i64, f64)> = Vec::new();
-    for line in content.lines() {
-        if line.starts_with('#') || line.trim().is_empty() { continue; }
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 4 { continue; }
-        // Skip malformed rows (e.g. a non-numeric header) instead of inserting
-        // a silent (0, 0) anchor that would distort cM for early variants.
-        let Ok(bp) = fields[3].parse::<i64>() else { continue };
-        let Ok(cm) = fields[2].parse::<f64>() else { continue };
-        map_entries.push((bp, cm));
-    }
-    map_entries.sort_by_key(|&(bp, _)| bp);
-
-    if map_entries.is_empty() {
+    let (map_bp, map_cm) = load_genetic_map_raw(map_path)?;
+    if map_bp.is_empty() {
         return Ok(vec![0.0; chip_bps.len()]);
     }
-
-    // Linear interpolation for each chip position
-    let map_bp: Vec<i64> = map_entries.iter().map(|&(bp, _)| bp).collect();
-    let map_cm: Vec<f64> = map_entries.iter().map(|&(_, cm)| cm).collect();
-
-    Ok(chip_bps.iter().map(|&bp| {
-        interpolate_cm(&map_bp, &map_cm, bp)
-    }).collect())
+    Ok(chip_bps.iter().map(|&bp| interpolate_cm(&map_bp, &map_cm, bp)).collect())
 }
 
 /// Load raw genetic map as (bp, cM) arrays.
+///
+/// `map_path` may list several files for ONE chromosome, comma-separated: they are joined in
+/// position order, each file's cM continuing from where the previous one ends (`stitch`).
+/// chrX ships as three PLINK maps (PAR1, non-PAR, PAR2), each starting at 0 cM. Given the
+/// non-PAR file alone, PAR1 (2.5 Mb, ~21 cM) was extrapolated at the chromosome's mean rate,
+/// ~3 cM, the HMM copied far too long there, and PAR1 imputation trailed the production
+/// pipeline (one woman: PAR1 SNP R2 0.691 vs 0.754). A single path reads exactly as before.
 pub fn load_genetic_map_raw(map_path: &Path) -> std::io::Result<(Vec<i64>, Vec<f64>)> {
+    let spec = map_path.to_string_lossy();
+    if spec.contains(',') {
+        let parts: Vec<(Vec<i64>, Vec<f64>)> = spec.split(',').map(str::trim).filter(|p| !p.is_empty())
+            .map(|p| load_one_map(Path::new(p))).collect::<std::io::Result<_>>()?;
+        return stitch(parts).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("{}: {}", spec, e)));
+    }
+    load_one_map(map_path)
+}
+
+/// Join per-segment maps of one chromosome (e.g. PAR1, X, PAR2) into one: segments ordered by
+/// their first position, each shifted so its first cM equals the previous segment's last.
+/// Overlapping segments are an error: there is no single right cM where two maps disagree.
+pub fn stitch(mut parts: Vec<(Vec<i64>, Vec<f64>)>) -> Result<(Vec<i64>, Vec<f64>), String> {
+    parts.retain(|(bp, _)| !bp.is_empty());
+    parts.sort_by_key(|(bp, _)| bp[0]);
+    let (mut out_bp, mut out_cm): (Vec<i64>, Vec<f64>) = (Vec::new(), Vec::new());
+    for (bp, cm) in parts {
+        let offset = match (out_bp.last(), out_cm.last()) {
+            (Some(&last_bp), Some(&last_cm)) => {
+                if bp[0] <= last_bp {
+                    return Err(format!("map segments overlap (a segment starts at {} bp, the previous ends at {} bp)", bp[0], last_bp));
+                }
+                last_cm - cm[0]
+            }
+            _ => 0.0,
+        };
+        out_bp.extend_from_slice(&bp);
+        out_cm.extend(cm.iter().map(|&c| c + offset));
+    }
+    Ok((out_bp, out_cm))
+}
+
+fn load_one_map(map_path: &Path) -> std::io::Result<(Vec<i64>, Vec<f64>)> {
     let content = std::fs::read_to_string(map_path)?;
 
     let mut map_bp = Vec::new();
@@ -356,4 +375,24 @@ fn compute_switch_rates_bm(
         }
     }
     rates
+}
+
+#[cfg(test)]
+mod stitch_tests {
+    use super::*;
+
+    #[test]
+    fn segments_join_continuously_in_position_order() {
+        let x = (vec![3_000, 4_000], vec![0.0, 2.0]);
+        let par1 = (vec![100, 2_000], vec![0.0, 20.0]);
+        let par2 = (vec![5_000, 6_000], vec![0.0, 0.5]);
+        let (bp, cm) = stitch(vec![x, par2, par1]).unwrap();
+        assert_eq!(bp, vec![100, 2_000, 3_000, 4_000, 5_000, 6_000]);
+        assert_eq!(cm, vec![0.0, 20.0, 20.0, 22.0, 22.0, 22.5]);
+    }
+
+    #[test]
+    fn overlapping_segments_are_refused() {
+        assert!(stitch(vec![(vec![1, 10], vec![0.0, 1.0]), (vec![5, 20], vec![0.0, 1.0])]).is_err());
+    }
 }
