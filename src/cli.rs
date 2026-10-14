@@ -499,19 +499,21 @@ pub struct Args {
     #[arg(long, hide = true)]
     pub haploids: Option<String>,
 
-    /// chrX PAR-aware male ploidy (opt-in). When set on a chrX run, males are
-    /// treated as DIPLOID inside the pseudo-autosomal regions (PAR1/PAR2) and
-    /// HAPLOID elsewhere: their PAR heterozygous calls are preserved (today they
-    /// are wrongly reset), and male-haploid detection counts only non-PAR sites.
-    /// PAR coordinates are selected by `--build`. Default OFF → byte-identical to
-    /// the historical whole-chromosome treatment. (The haploid GT *output*
-    /// emission for non-PAR males is a separate, follow-up step; with this flag
-    /// the imputation is PAR-correct but male chrX dosages are still written
-    /// diploid.)
-    #[arg(long)]
+    /// Accepted for compatibility: PAR-aware male ploidy on chrX is the default (see
+    /// `--chrx-no-par`).
+    #[arg(long, hide = true)]
     pub chrx_par: bool,
 
-    /// Reference build for chrX PAR coordinates (used with `--chrx-par`):
+    /// Treat a chrX male as haploid over the WHOLE chromosome, PAR included (the behaviour
+    /// before 2026-10-14). By default males are diploid inside the pseudo-autosomal regions
+    /// (PAR1/PAR2) and haploid elsewhere: their PAR heterozygous calls are kept and haploid
+    /// detection counts only non-PAR sites. Resetting the PAR hets threw away true calls:
+    /// one man imputed on his own (GSA array, 201 PAR hets) read chrX SNP R2 0.874 against
+    /// 0.891 PAR-aware. Male chrX genotypes and dosages are written diploid either way.
+    #[arg(long)]
+    pub chrx_no_par: bool,
+
+    /// Reference build for chrX PAR coordinates:
     /// grch37|grch38|auto. `auto` (default) infers from the largest chrX position
     /// (GRCh38 chrX is longer than GRCh37). Aliases hg19→grch37, hg38→grch38.
     #[arg(long, value_enum, default_value = "auto")]

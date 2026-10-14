@@ -1083,7 +1083,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         n_chip, n_samples, n_haps, &allele_transforms,
     );
     crate::prephase::apply_haploid_detection(
-        args.haploids.as_deref(), args.chrx_par, args.build,
+        args.haploids.as_deref(), !args.chrx_no_par, args.build,
         needs_phasing, srp.chromosome(), &mut targ_alleles,
         &sample_names, &target_idx, &target_genotypes,
         n_chip, n_samples, n_haps, &chip_bps,

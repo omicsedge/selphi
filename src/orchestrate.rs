@@ -118,7 +118,7 @@ impl MultiChrImputeConfig {
             all_formats: args.all_formats,
             map_dir,
             allele_match: args.allele_match,
-            chrx_par: args.chrx_par,
+            chrx_par: !args.chrx_no_par,
             phase_ensemble: args.phase_ensemble,
             drop_unmatched: args.drop_unmatched,
             ped: args.ped.clone(),
@@ -503,10 +503,6 @@ pub fn run_multi_chr(
         }
     }
     let n_chr = chromosomes.len();
-    if config.chrx_par {
-        selphi_info!("  NOTE: --chrx-par is single-chromosome-only and has no effect on this multi-chr run \
-            (chrX male-haploid / PAR handling is not yet wired into the multi-chr path).");
-    }
 
     selphi_info!("  refpanel: {} (multi-chr, {} chromosomes)", srp_path.display(), n_chr);
     selphi_info!("  chromosomes: {}", chromosomes.join(", "));
