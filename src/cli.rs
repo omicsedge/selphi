@@ -184,10 +184,11 @@ pub struct Args {
     /// VCF/BCF FORMAT + a record sample) picks the engine:
     ///   - reads, or a PL VCF → lcWGS engine;
     ///   - confident GT with GQ/DP at WGS density → genotype engine + refine;
-    ///   - chip array / GT-only confident → plain genotype engine.
-    /// Tunables: SELPHI_AUTOROUTE_CALLRATE (default 0.5), SELPHI_AUTOROUTE_SAMPLE
-    /// (2000 records), SELPHI_AUTOROUTE_WGS_DENSITY (1000 variants/Mb gate for the
-    /// refine branch), SELPHI_AUTOROUTE_MAXBYTES (256 MiB sniff read cap).
+    ///   - chip array / any other GT input → plain genotype engine.
+    ///
+    /// Tunables: SELPHI_AUTOROUTE_SAMPLE (2000 records), SELPHI_AUTOROUTE_WGS_DENSITY
+    /// (1000 variants/Mb gate for the refine branch), SELPHI_AUTOROUTE_MAXBYTES (256 MiB
+    /// sniff read cap).
     #[arg(long)]
     pub auto_route: bool,
 
@@ -292,13 +293,11 @@ pub struct Args {
     #[arg(long)]
     pub fl_bwd: Option<usize>,
 
-    /// Drop reference-panel variants whose REF or ALT exceeds 255 bytes instead
-    /// of failing the build. The SRP variant index stores allele lengths as a
-    /// u8, so a longer allele cannot be represented; the default is to stop with
-    /// an error rather than quietly change the panel. Set this when the input
-    /// carries a handful of structural-scale indels and you want them excluded,
-    /// the same thing `bcftools view -e 'strlen(REF)>255 || strlen(ALT)>255'`
-    /// does as a pre-pass. The number of dropped records is logged.
+    /// Drop reference-panel variants whose CHROM, REF or ALT exceeds 255 bytes
+    /// while building a panel. By default they are kept (the SRP variant index
+    /// stores such lengths escaped). The same thing
+    /// `bcftools view -e 'strlen(REF)>255 || strlen(ALT)>255'` does as a
+    /// pre-pass; the number of dropped records is logged.
     #[arg(long)]
     pub drop_long_alleles: bool,
 

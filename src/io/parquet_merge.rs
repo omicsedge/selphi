@@ -110,16 +110,19 @@ pub fn merge_batch_parquets(
         let mut ds_builders: Vec<Float32Builder> = (0..n_samples_total)
             .map(|_| Float32Builder::with_capacity(n_rows)).collect();
 
-        // Pre-extract IMP from batch 0 column 5.
-        let imp_col = batches[0].column(5).as_any().downcast_ref::<BooleanArray>()
+        // Pre-extract DOSE (column 5: DR2 is written) and IMP (column 6: site absent
+        // from the input) from batch 0.
+        let dose_col = batches[0].column(5).as_any().downcast_ref::<BooleanArray>()
+            .ok_or_else(|| std::io::Error::other("DOSE column type mismatch"))?;
+        let imp_col = batches[0].column(6).as_any().downcast_ref::<BooleanArray>()
             .ok_or_else(|| std::io::Error::other("IMP column type mismatch"))?;
 
-        // Pre-extract per-batch AP1/AP2 arrays (cols 6.. are alternating ap1/ap2).
+        // Pre-extract per-batch AP1/AP2 arrays (cols 7.. are alternating ap1/ap2).
         let mut batch_ap_arrays: Vec<Vec<&Float32Array>> = Vec::with_capacity(batches.len());
         for b in &batches {
             let n_cols = b.num_columns();
-            let mut arrs = Vec::with_capacity(n_cols - 6);
-            for c in 6..n_cols {
+            let mut arrs = Vec::with_capacity(n_cols - 7);
+            for c in 7..n_cols {
                 let arr = b.column(c).as_any().downcast_ref::<Float32Array>()
                     .ok_or_else(|| std::io::Error::other(format!(
                         "expected Float32 AP column at index {c}"
@@ -136,8 +139,8 @@ pub fn merge_batch_parquets(
         let mut no_call: Vec<bool> = Vec::with_capacity(n_samples_total);
 
         for row in 0..n_rows {
-            let is_imp = imp_col.value(row);
-            imp_b.append_value(is_imp);
+            let is_dose = dose_col.value(row);
+            imp_b.append_value(imp_col.value(row));
 
             // Gather AP1/AP2 across all batches for this row in global sample order.
             // A null AP pair is a no-call at a passthrough site (io::passthrough):
@@ -162,7 +165,7 @@ pub fn merge_batch_parquets(
             }
             let af = ac as f32 / n_haps_total as f32;
             af_b.append_value(af);
-            if is_imp {
+            if is_dose {
                 dr2_b.append_value(dr2_f64 as f32);
             } else {
                 dr2_b.append_null();

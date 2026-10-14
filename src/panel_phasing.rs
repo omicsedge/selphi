@@ -387,6 +387,12 @@ fn ligate_chunk(
 pub fn run(args: &Args, input_path: &str, output_path: &str) {
     let map_path = args.map_path.as_deref()
         .unwrap_or_else(|| { selphi_error!("--map is required for --phase-panel"); std::process::exit(1); });
+    let out = PathBuf::from(output_path);
+    let base = reference_base(&out);
+    let mut outputs = vec![selphi::common::utils::out_path(&out, "vcf.gz")];
+    if args.srp { outputs.push(append_ext(&base, "srp")); }
+    if args.bref3 { outputs.push(append_ext(&base, "bref3")); }
+    selphi::common::utils::refuse_overwrite(&[input_path], &outputs);
 
     let log_path = selphi::common::utils::out_path(Path::new(output_path), "log");
     selphi::log::init(&log_path, args.debug);
@@ -453,24 +459,6 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
     }
     let Cohort { sample_names, markers, geno: cohort_geno, n_var, n_samples, was_phased } = cohort;
 
-    // Fail BEFORE phasing if a native panel was requested and any allele cannot be
-    // stored in it. The SRP record format keeps REF/ALT lengths in a u8, and the
-    // 1000 Genomes chr22 BCF alone carries a 266-bp REF; without this check an
-    // 85-minute whole-chromosome phasing completed, wrote the VCF, and only then
-    // failed on `--srp` with "pre-normalize before building the SRP".
-    if args.srp || args.bref3 {
-        let too_long: Vec<&TargetMarker> = markers.iter()
-            .filter(|m| m.ref_allele.len() > 255 || m.alt_allele.len() > 255 || m.chrom.len() > 255)
-            .collect();
-        if !too_long.is_empty() {
-            let m = too_long[0];
-            selphi_error!("{} variant(s) have a REF/ALT longer than 255 bp (first: {}:{} REF {} bp, ALT {} bp); \
-the --srp/--bref3 panel formats store allele lengths in one byte. Drop them first, e.g. \
-bcftools view -e 'strlen(REF)>255 || max(strlen(ALT))>255', or omit --srp/--bref3 to get the phased VCF only.",
-                too_long.len(), m.chrom, m.pos, m.ref_allele.len(), m.alt_allele.len());
-            std::process::exit(2);
-        }
-    }
     let n_haps = n_samples * 2;
     selphi_step!("Cohort: {} samples, {} variants, input_phased={} (re-phasing from genotypes)",
         n_samples, n_var, was_phased);
@@ -499,8 +487,8 @@ bcftools view -e 'strlen(REF)>255 || max(strlen(ALT))>255', or omit --srp/--bref
     // 2. bp positions.
     let bp: Vec<i64> = markers.iter().map(|m| m.pos).collect();
 
-    // 3. Genetic map.
-    let (map_bp, map_cm) = genmap::load_genetic_map_raw(Path::new(map_path))
+    // 3. Genetic map (the cohort's chromosome only, should the map hold several).
+    let (map_bp, map_cm) = genmap::load_genetic_map_for(Path::new(map_path), markers.first().map(|m| m.chrom.as_str()))
         .unwrap_or_else(|e| { selphi_error!("Cannot read genetic map {}: {}", map_path, e); std::process::exit(1); });
 
     // 4. Resolve engine. Panel phasing has no chip/WGS split — honour the
@@ -587,6 +575,15 @@ bcftools view -e 'strlen(REF)>255 || max(strlen(ALT))>255', or omit --srp/--bref
 /// last dotted component (`panel.chr22` → `panel.srp`), silently dropping the
 /// chromosome tag and colliding across chromosomes; appending keeps it
 /// (`panel.chr22` → `panel.chr22.srp`), matching the emitted `.vcf.gz`.
+/// Clean base name of the reference outputs: a trailing .vcf.gz / .gz / .vcf
+/// stripped, so they are `<base>.srp` / `<base>.bref3`, not `<base>.vcf.srp`.
+fn reference_base(out_path: &Path) -> PathBuf {
+    let mut base = out_path.to_path_buf();
+    if base.extension().is_some_and(|e| e == "gz") { base.set_extension(""); }
+    if base.extension().is_some_and(|e| e == "vcf") { base.set_extension(""); }
+    base
+}
+
 fn append_ext(base: &Path, ext: &str) -> PathBuf {
     let mut s = base.as_os_str().to_os_string();
     s.push(".");
@@ -600,11 +597,7 @@ fn write_reference_panels(
 ) {
     if !(args.srp || args.bref3) { return; }
 
-    // Clean base name: strip a trailing .vcf.gz / .gz / .vcf so the reference
-    // files are `<base>.srp` / `<base>.bref3`, not `<base>.vcf.srp`.
-    let mut base = out_path.to_path_buf();
-    if base.extension().is_some_and(|e| e == "gz") { base.set_extension(""); }
-    if base.extension().is_some_and(|e| e == "vcf") { base.set_extension(""); }
+    let base = reference_base(out_path);
 
     let pvs: Vec<PanelVariant> = markers.iter().map(|m| PanelVariant {
         chrom: &m.chrom, pos: m.pos,
@@ -743,7 +736,7 @@ fn run_streaming(args: &Args, input_path: &str, output_path: &str, map_path: &st
     selphi_step!("Cohort: {} samples, {} variants (streaming, re-phasing)", n_samples, n_var);
 
     // 2. Genetic map + engine.
-    let (map_bp, map_cm) = genmap::load_genetic_map_raw(Path::new(map_path))
+    let (map_bp, map_cm) = genmap::load_genetic_map_for(Path::new(map_path), Some(chrom.as_str()))
         .unwrap_or_else(|e| { selphi_error!("Cannot read genetic map {}: {}", map_path, e); std::process::exit(1); });
     let engine = match args.phasing_engine { PhasingEngine::Haploid => PhasingEngine::Haploid, _ => PhasingEngine::Diploid };
     let n_threads = args.threads.max(1);
@@ -790,9 +783,7 @@ fn run_streaming(args: &Args, input_path: &str, output_path: &str, map_path: &st
     // are scattered into tile stripes as they are emitted, so no re-read and
     // memory bounded to one stripe batch (the whole point of the streaming path).
     let mut srp_writer = if args.srp || args.bref3 {
-        let mut base = out_path.clone();
-        if base.extension().is_some_and(|e| e == "gz") { base.set_extension(""); }
-        if base.extension().is_some_and(|e| e == "vcf") { base.set_extension(""); }
+        let base = reference_base(&out_path);
         let srp_path = append_ext(&base, "srp");
         let pvs: Vec<PanelVariant> = markers.iter().map(|m| PanelVariant {
             chrom: &m.chrom, pos: m.pos, ref_allele: &m.ref_allele,

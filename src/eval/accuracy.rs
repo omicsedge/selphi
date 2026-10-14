@@ -171,12 +171,13 @@ impl SiteAccumulator {
     }
 
     /// Add one variant's per-site metrics.
-    /// Concordance always counted. R² only counted when not NaN AND when the
+    /// Concordance counted for every site with a scored sample. R² only counted when not NaN AND when the
     /// variant falls into one of the declared MAF bins (MAF ≥ 0.0005). This
     /// matches Beagle/IMPUTE5/Minimac4 convention and avoids ultra-rare
     /// singleton noise (MAF < 0.05%) dragging the mean to meaningless values.
     pub fn add(&mut self, maf: f64, r2: f64, concordance: f64) {
-        // Concordance counts for ALL variants (including monomorphic)
+        // Concordance counts for every variant with a scored sample (monomorphic too).
+        if concordance.is_nan() { return; }
         self.total_conc_sum += concordance;
         self.total_n += 1;
 
@@ -236,7 +237,16 @@ pub fn site_r2(ds: &[f32], gt: &[f32], n: usize) -> (f64, f64) {
         count += 1;
     }
 
-    if count < 2 { return (f64::NAN, 0.0); }
+    // No scored sample: neither r² nor concordance exists (a 0 here used to pull a
+    // one-sample run's concordance down by its share of truth no-calls).
+    if count == 0 { return (f64::NAN, f64::NAN); }
+    // One scored sample (a single-sample run): r² is undefined, concordance is not.
+    // It used to be forced to 0, so a one-sample evaluation printed 0.0000 for it.
+    if count == 1 {
+        let i = (0..n).find(|&i| ds[i] >= 0.0 && gt[i] >= 0.0).unwrap();
+        let d_call = if ds[i] > 1.5 { 2 } else if ds[i] > 0.5 { 1 } else { 0 };
+        return (f64::NAN, (d_call == gt[i].round() as i32) as u32 as f64);
+    }
     let nf = count as f64;
     let num = nf * sum_dg - sum_d * sum_g;
     let den_x = nf * sum_d2 - sum_d * sum_d;
@@ -387,7 +397,8 @@ pub fn parse_vcf_line(line: &[u8], n_samples: usize, ds_buf: &mut Vec<f32>) -> O
             // Extract DS subfield
             if let Some(val) = sample_field.split(|&b| b == b':').nth(di) {
                 let s = std::str::from_utf8(val).unwrap_or(".");
-                ds_buf.push(s.parse().unwrap_or(-1.0));
+                // "nan"/"inf" parse as floats: a non-finite DS is missing, as '.' is.
+                ds_buf.push(s.parse::<f32>().ok().filter(|d| d.is_finite()).unwrap_or(-1.0));
             } else {
                 ds_buf.push(-1.0);
             }
@@ -785,9 +796,10 @@ impl VariantReader {
                             ds_buf.clear();
                             for_each_sample(si_filter, ns, |si| {
                                 let off = io2 + si * 4;
-                                if off + 4 <= ib.len() {
-                                    ds_buf.push(f32::from_le_bytes(ib[off..off+4].try_into().unwrap()));
-                                } else { ds_buf.push(-1.0); }
+                                // BCF's missing float (0x7F800001) is a NaN: missing, as a
+                                // non-finite value in the text reader.
+                                let d = if off + 4 <= ib.len() { f32::from_le_bytes(ib[off..off+4].try_into().unwrap()) } else { -1.0 };
+                                ds_buf.push(if d.is_finite() { d } else { -1.0 });
                             });
                             found_ds = true;
                             // io2 not advanced past DS field — break exits the field loop
@@ -1434,9 +1446,12 @@ pub fn print_summary(site_acc: &SiteAccumulator, sample_acc: &SampleAccumulator,
 
     crate::selphi_info!("{}", "-".repeat(60));
     if site_acc.total_n > 0 {
-        let overall_r2 = if site_acc.total_r2_n > 0 { site_acc.total_r2_sum / site_acc.total_r2_n as f64 } else { 0.0 };
         let overall_conc = site_acc.total_conc_sum / site_acc.total_n as f64;
-        crate::selphi_info!("{} {:>12} {} {:>12.4}", crate::log::bold(&format!("{:<20}", "OVERALL")), n_matched, crate::log::cyan(&format!("{:>10.4}", overall_r2)), overall_conc);
+        // No site r² exists with fewer than two samples: say so rather than print 0.
+        let overall_r2 = if site_acc.total_r2_n > 0 {
+            format!("{:>10.4}", site_acc.total_r2_sum / site_acc.total_r2_n as f64)
+        } else { format!("{:>10}", "N/A") };
+        crate::selphi_info!("{} {:>12} {} {:>12.4}", crate::log::bold(&format!("{:<20}", "OVERALL")), n_matched, crate::log::cyan(&overall_r2), overall_conc);
     }
 
     // Per-sample summary
@@ -1586,8 +1601,9 @@ pub fn write_json_summary(
     if site_acc.total_n > 0 {
         let mut overall = serde_json::Map::new();
         overall.insert("n".into(), serde_json::json!(counts.n_matched));
-        let r2 = if site_acc.total_r2_n > 0 { site_acc.total_r2_sum / site_acc.total_r2_n as f64 } else { 0.0 };
-        overall.insert("mean_r2".into(), serde_json::json!((r2 * 1e6).round() / 1e6));
+        // null when no site has two scored samples (a one-sample run): there is no site r².
+        let r2 = (site_acc.total_r2_n > 0).then(|| site_acc.total_r2_sum / site_acc.total_r2_n as f64);
+        overall.insert("mean_r2".into(), serde_json::json!(r2.map(|r| (r * 1e6).round() / 1e6)));
         overall.insert("concordance".into(), serde_json::json!((site_acc.total_conc_sum / site_acc.total_n as f64 * 1e6).round() / 1e6));
         map.insert("overall".into(), serde_json::Value::Object(overall));
     }

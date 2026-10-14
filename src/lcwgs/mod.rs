@@ -112,6 +112,13 @@ pub struct LcwgsParams {
     /// (LCWGS_GIBBS_RESTARTS), marginalising chain stochasticity like the
     /// genotype path's `--phase-ensemble`.
     pub seed: u64,
+    /// chrX: sample names to model as haploid outside the PARs (`--haploids`);
+    /// `None` = detect males from their genotype likelihoods.
+    pub haploids: Option<Vec<String>>,
+    /// chrX: males are diploid in PAR1/PAR2 (`--chrx-no-par` turns this off).
+    pub chrx_par: bool,
+    /// chrX PAR coordinates' build (`--build`); `None` = inferred from the panel.
+    pub build: Option<crate::contig::Build>,
 }
 
 impl LcwgsParams {
@@ -190,6 +197,9 @@ impl Default for LcwgsParams {
             // deterministic for a fixed seed, so a second seed is the only way to
             // measure how much of a per-sample delta is chain reshuffling.
             seed: crate::config::usize_or("LCWGS_SEED", 15_052_011) as u64,
+            haploids: None,
+            chrx_par: true,
+            build: None,
         }
     }
 }

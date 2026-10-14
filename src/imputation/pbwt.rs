@@ -279,6 +279,7 @@ pub(crate) fn split_diag() -> bool {
 }
 
 /// PBWT forward pass using a pre-allocated workspace (zero allocations in hot path).
+#[allow(clippy::too_many_arguments)]
 pub fn pbwt_forward_with_workspace(
     ws: &mut PbwtWorkspace,
     rows: &mut dyn AlleleRows,
@@ -288,8 +289,68 @@ pub fn pbwt_forward_with_workspace(
     min_l: usize,
     fl_fwd: usize,
     target_abs: i32,
+    miss: Option<&[u64]>,
 ) -> FwdResult {
-    pbwt_forward_filtered(ws, rows, n_var, m, n_ref, min_l, fl_fwd, target_abs, &AllRefs)
+    pbwt_forward_filtered(ws, rows, n_var, m, n_ref, min_l, fl_fwd, target_abs, &AllRefs, miss)
+}
+
+/// Bit `i` of a site bitset.
+#[inline]
+fn bit(bits: &[u64], i: usize) -> bool { (bits[i / 64] >> (i % 64)) & 1 == 1 }
+
+/// Cap on the panel haplotypes counted per side by [`follow_match_allele`].
+const FOLLOW_VOTE_CAP: usize = 32;
+
+/// The allele a target with a NO-CALL at the site whose alleles `y` holds should
+/// take in the sort: the majority allele of the panel haplotypes that share its
+/// longest current match (in `a`/`d` order, the prefix up to the previous site),
+/// the nearest of them breaking a tie. A no-call carries no information, so it
+/// must not end the target's matches the way a wrong allele would; following the
+/// longest match keeps those alive. Before this the target took the allele the
+/// phasing had filled in, and a single no-call cost up to +50% genotype errors in
+/// the 20 kb around it. `None` when no panel haplotype is in reach.
+#[inline]
+fn follow_match_allele(a: &[i32], d: &[i32], y: &[u8], p: usize, m: usize, n_ref: usize) -> Option<u8> {
+    let is_panel = |q: usize| (a[q] as usize) < n_ref;
+    // Divergence (match start; smaller = longer) of the nearest panel hap on each side.
+    let mut left: Option<(i32, usize)> = None;
+    let mut dl = 0i32;
+    let mut q = p;
+    while q > 0 {
+        dl = dl.max(d[q]);
+        q -= 1;
+        if is_panel(q) { left = Some((dl, q)); break; }
+    }
+    let mut right: Option<(i32, usize)> = None;
+    let mut dr = 0i32;
+    for q in p + 1..m {
+        dr = dr.max(d[q]);
+        if is_panel(q) { right = Some((dr, q)); break; }
+    }
+    let (best, nearest) = match (left, right) {
+        (Some(l), Some(r)) => if r.0 < l.0 { r } else { l },
+        (Some(l), None) => l,
+        (None, Some(r)) => r,
+        (None, None) => return None,
+    };
+    // Vote over the panel haps whose match with the target is as long as the best.
+    let mut n1 = 0usize;
+    let mut n = 0usize;
+    let (mut dl, mut q, mut k) = (0i32, p, 0usize);
+    while q > 0 && k < FOLLOW_VOTE_CAP {
+        dl = dl.max(d[q]);
+        if dl > best { break; }
+        q -= 1;
+        if is_panel(q) { n += 1; n1 += y[q] as usize; k += 1; }
+    }
+    let (mut dr, mut k) = (0i32, 0usize);
+    for q in p + 1..m {
+        if k >= FOLLOW_VOTE_CAP { break; }
+        dr = dr.max(d[q]);
+        if dr > best { break; }
+        if is_panel(q) { n += 1; n1 += y[q] as usize; k += 1; }
+    }
+    Some(if 2 * n1 > n { 1 } else if 2 * n1 < n { 0 } else { y[nearest] })
 }
 
 /// As `pbwt_forward_with_workspace`, with the scan's match recording restricted
@@ -306,6 +367,10 @@ pub fn pbwt_forward_filtered<F: MatchFilter>(
     fl_fwd: usize,
     target_abs: i32,
     filter: &F,
+    // Sites (bitset over 0..n_var) at which the target is a no-call: there it takes
+    // the allele of its longest matches instead of the one in `rows` (see
+    // follow_match_allele). None = every site called.
+    miss: Option<&[u64]>,
 ) -> FwdResult {
     ws.reset(m);
 
@@ -342,6 +407,10 @@ pub fn pbwt_forward_filtered<F: MatchFilter>(
             let r = rows.row(var + 1);
             for i in 0..m {
                 ws.y[i] = r[ws.a[i] as usize];
+            }
+            if let Some(ms) = miss && bit(ms, var + 1) {
+                let p = ws.a_inv[target_abs as usize] as usize;
+                if let Some(al) = follow_match_allele(&ws.a, &ws.d, &ws.y, p, m, n_ref) { ws.y[p] = al; }
             }
         }
         if let Some(t) = t_sort {
@@ -638,6 +707,8 @@ pub struct SharedTarget<'a> {
     pub target_abs: i32,
     /// `n_ref`-wide candidate bitset; `None` records matches for every reference hap.
     pub keep: Option<&'a [u64]>,
+    /// Sites at which the target is a no-call (see `pbwt_forward_filtered`).
+    pub miss: Option<&'a [u64]>,
 }
 
 /// Forward pass with the SORT SHARED across a batch of targets.
@@ -762,6 +833,14 @@ pub(crate) fn pbwt_forward_shared_impl(
             for i in 0..m {
                 ws.y[i] = r[ws.a[i] as usize];
             }
+            // Each no-call target follows its own longest matches; another target's
+            // override cannot reach it (only panel haps vote).
+            for tg in targets {
+                if let Some(ms) = tg.miss && bit(ms, var + 1) {
+                    let p = ws.a_inv[tg.target_abs as usize] as usize;
+                    if let Some(al) = follow_match_allele(&ws.a, &ws.d, &ws.y, p, m, n_ref) { ws.y[p] = al; }
+                }
+            }
         }
         if let Some(t) = t_sort {
             SPLIT_SORT_NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -794,7 +873,7 @@ pub fn pbwt_forward_single(
     // fallback in window_process, which has no per-thread workspace to reuse.
     let mut ws = PbwtWorkspace::new(m, n_ref);
     let mut rows = DenseRows { alleles, m };
-    pbwt_forward_with_workspace(&mut ws, &mut rows, n_var, m, n_ref, min_l, fl_fwd, target_abs)
+    pbwt_forward_with_workspace(&mut ws, &mut rows, n_var, m, n_ref, min_l, fl_fwd, target_abs, None)
 }
 
 /// Insert a match into the sorted buffer at a specific variant position.
@@ -1012,7 +1091,7 @@ mod tests {
         let mut ws = PbwtWorkspace::new(m, n_ref);
         let mut rows = DenseRows { alleles: &alleles, m };
         let r_ws = pbwt_forward_with_workspace(
-            &mut ws, &mut rows, n_var, m, n_ref, min_l, fl_fwd, target_abs,
+            &mut ws, &mut rows, n_var, m, n_ref, min_l, fl_fwd, target_abs, None,
         );
         let r_single = pbwt_forward_single(
             &alleles, n_var, m, n_ref, min_l, fl_fwd, target_abs,
@@ -1271,7 +1350,7 @@ mod sparse_scan_tests {
             let words = n_ref.div_ceil(64);
             let mask: Vec<u64> = (0..words).map(|_| rnd()).collect();
             let targets: Vec<SharedTarget> = (0..n_tgt).map(|t| SharedTarget {
-                target_abs: (n_ref + t) as i32, keep: if t % 2 == 0 { None } else { Some(&mask[..]) } }).collect();
+                target_abs: (n_ref + t) as i32, keep: if t % 2 == 0 { None } else { Some(&mask[..]) }, miss: None }).collect();
             for &min_l in &[3usize, 6] {
                 let mut ws1 = PbwtWorkspace::new(m, n_ref); let mut ws2 = PbwtWorkspace::new(m, n_ref);
                 let mut r1 = DenseRows { alleles: &alleles, m }; let mut r2 = DenseRows { alleles: &alleles, m };

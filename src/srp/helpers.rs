@@ -19,14 +19,24 @@ pub fn parse_variants_bin(data: &[u8], n: usize) -> std::io::Result<Vec<Variant>
     let trunc = || std::io::Error::new(std::io::ErrorKind::InvalidData,
         "truncated/corrupt variants_bin section (fewer bytes than n_variants requires)");
     let mut out = Vec::with_capacity(n);
-    let mut off = 0;
+    // A section opening with LONG_ALLELE_MARKER uses the escaped lengths (see
+    // push_variant_vbin); one without it is the original all-u8 layout.
+    let long = data.len() >= 8 && data[..8] == LONG_ALLELE_MARKER;
+    let mut off = if long { 8 } else { 0 };
     for _ in 0..n {
         if off + 11 > data.len() { return Err(trunc()); }
         let pos = i64::from_le_bytes(data[off..off+8].try_into().unwrap());
-        let cl = data[off+8] as usize;
-        let rl = data[off+9] as usize;
-        let al = data[off+10] as usize;
+        let (mut cl, mut rl, mut al) = (data[off+8] as usize, data[off+9] as usize, data[off+10] as usize);
         off += 11;
+        if long {
+            for l in [&mut cl, &mut rl, &mut al] {
+                if *l == 255 {
+                    if off + 4 > data.len() { return Err(trunc()); }
+                    *l = u32::from_le_bytes(data[off..off+4].try_into().unwrap()) as usize;
+                    off += 4;
+                }
+            }
+        }
         // Bounds-check the variable-length fields (a mid-record truncation would
         // otherwise panic on the slice) and never silently return fewer than n.
         if off + cl + rl + al > data.len() { return Err(trunc()); }
@@ -66,40 +76,23 @@ pub fn parse_synthetic_id(id: &str) -> Option<(&str, &str, &str, &str)> {
     Some((chrom, pos, ref_a, alt))
 }
 
-/// Validate the byte lengths of one SRP variant record (CHROM/REF/ALT).
-/// Returns an error if any exceeds 255 bytes — the on-disk format encodes the
-/// length as a `u8`, so without this check long alleles were silently truncated
-/// to 255, producing a panel with mangled CHROM/REF/ALT strings (real risk
-/// for biobank panels with large indels). Call before pushing the record.
-pub fn check_record_lens(chrom: &[u8], ref_allele: &[u8], alt_allele: &[u8]) -> std::io::Result<()> {
-    fn check(field: &str, b: &[u8]) -> std::io::Result<()> {
-        if b.len() > 255 {
-            let preview: String = b.iter().take(32)
-                .map(|&c| if c.is_ascii_graphic() { c as char } else { '.' }).collect();
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!(
-                "SRP record {} length {} exceeds the 255-byte u8 limit (preview: '{}...'). \
-                 Pass --drop-long-alleles to exclude such records (the count is logged), \
-                 or pre-filter with `bcftools view -e 'strlen(REF)>255 || strlen(ALT)>255'`.",
-                field, b.len(), preview)));
-        }
-        Ok(())
-    }
-    check("CHROM", chrom)?;
-    check("REF", ref_allele)?;
-    check("ALT", alt_allele)?;
-    Ok(())
-}
+/// First 8 bytes of a variant index that holds escaped (>= 255 B) field lengths: an
+/// impossible position (`i64::MIN`), so an index in the original layout never starts
+/// with it and readers before this format still refuse such a panel instead of
+/// mis-reading it.
+pub const LONG_ALLELE_MARKER: [u8; 8] = i64::MIN.to_le_bytes();
 
 /// Append one variant's binary index entry to `vbin` (the SRP variant index),
 /// the single definition of the on-disk variant-record layout shared by every
 /// SRP writer (build_srp_unified / from_bref3 / from_panel, build_multi_chr_srp,
 /// merge_samples_single_chr).
 ///
-/// Layout: `pos` (i64 LE), then the chrom/ref/alt length bytes (u8 each, capped
-/// at 255), then the chrom, ref and alt bytes themselves (each truncated to 255).
-/// Rejects any field longer than 255 B via [`check_record_lens`] before writing
-/// the length bytes (mirrors the inlined order: pos is appended first, then the
-/// check gates the rest).
+/// Layout: `pos` (i64 LE), then the chrom/ref/alt length bytes, then the chrom, ref
+/// and alt bytes. A length below 255 is its byte; a longer field (a structural
+/// variant's allele) writes 255 and its length as a u32 LE right after the three
+/// length bytes, and the section is then marked by [`finish_vbin`]. Long alleles
+/// used to be dropped at panel build (53,791 variants of the v3 panel, about 70
+/// non-reference calls per person that production imputes).
 #[inline]
 pub fn push_variant_vbin(
     vbin: &mut Vec<u8>,
@@ -108,18 +101,50 @@ pub fn push_variant_vbin(
     ref_allele: &str,
     alt_allele: &str,
 ) -> std::io::Result<()> {
-    let chr_b = chrom.as_bytes();
-    let ref_b = ref_allele.as_bytes();
-    let alt_b = alt_allele.as_bytes();
+    let fields = [chrom.as_bytes(), ref_allele.as_bytes(), alt_allele.as_bytes()];
     vbin.extend_from_slice(&pos.to_le_bytes());
-    check_record_lens(chr_b, ref_b, alt_b)?;
-    vbin.push(chr_b.len().min(255) as u8);
-    vbin.push(ref_b.len().min(255) as u8);
-    vbin.push(alt_b.len().min(255) as u8);
-    vbin.extend_from_slice(&chr_b[..chr_b.len().min(255)]);
-    vbin.extend_from_slice(&ref_b[..ref_b.len().min(255)]);
-    vbin.extend_from_slice(&alt_b[..alt_b.len().min(255)]);
+    for f in fields { vbin.push(f.len().min(255) as u8); }
+    for f in fields {
+        if f.len() >= 255 {
+            let n = u32::try_from(f.len()).map_err(|_| std::io::Error::new(
+                std::io::ErrorKind::InvalidData, "SRP record field longer than 4 GB"))?;
+            vbin.extend_from_slice(&n.to_le_bytes());
+        }
+    }
+    for f in fields { vbin.extend_from_slice(f); }
     Ok(())
+}
+
+/// Mark a finished variant index (built by [`push_variant_vbin`] for `n` variants) as
+/// escaped when any field is 255 B or longer; an index without one stays in the
+/// original layout, byte for byte, so panels without long alleles are unchanged and
+/// stay readable by every earlier build.
+pub fn finish_vbin(vbin: &mut Vec<u8>, n: usize) {
+    if vbin_has_long(vbin, n) { vbin.splice(0..0, LONG_ALLELE_MARKER); }
+}
+
+/// True when the variant index `vbin` (from [`push_variant_vbin`], `n` variants)
+/// holds a field of 255 B or longer, i.e. must be written behind the marker.
+pub fn vbin_has_long(vbin: &[u8], n: usize) -> bool {
+    let mut off = 0usize;
+    let mut any = false;
+    for _ in 0..n {
+        if off + 11 > vbin.len() { break; }
+        let lens = [vbin[off + 8] as usize, vbin[off + 9] as usize, vbin[off + 10] as usize];
+        off += 11;
+        let mut total = 0usize;
+        for l in lens {
+            if l == 255 {
+                any = true;
+                total += u32::from_le_bytes(vbin[off..off + 4].try_into().unwrap()) as usize;
+                off += 4;
+            } else {
+                total += l;
+            }
+        }
+        off += total;
+    }
+    any
 }
 
 #[cfg(test)]
@@ -142,11 +167,26 @@ mod tests {
         assert_eq!(vbin, exp);
     }
 
+    /// Alleles of 255 B and longer round-trip through the escaped layout, the marker is
+    /// added only when one is present, and an index without one is unchanged.
     #[test]
-    fn push_variant_vbin_rejects_oversize_allele() {
-        let long = "A".repeat(256);
+    fn long_alleles_round_trip() {
+        use super::{finish_vbin, parse_variants_bin};
+        let long = "A".repeat(300);
+        let exact = "C".repeat(255);
+        let recs = [(10i64, "22", "G", "GT"), (20, "22", long.as_str(), "A"), (30, "22", "T", exact.as_str()), (40, "22", "A", "C")];
         let mut vbin = Vec::new();
-        assert!(push_variant_vbin(&mut vbin, 1, "22", &long, "T").is_err());
+        for r in &recs { push_variant_vbin(&mut vbin, r.0, r.1, r.2, r.3).unwrap(); }
+        finish_vbin(&mut vbin, recs.len());
+        let v = parse_variants_bin(&vbin, recs.len()).unwrap();
+        for (got, want) in v.iter().zip(&recs) {
+            assert_eq!((got.pos, got.chr.as_str(), got.ref_allele.as_str(), got.alt_allele.as_str()), *want);
+        }
+        let mut short = Vec::new();
+        push_variant_vbin(&mut short, 10, "22", "G", "GT").unwrap();
+        let before = short.clone();
+        finish_vbin(&mut short, 1);
+        assert_eq!(short, before, "no long field: original layout, no marker");
     }
 }
 

@@ -63,6 +63,9 @@ pub struct WindowBatchInput<'a> {
     /// Target records absent from the panel, written at their position
     /// (`None` under `--drop-unmatched` or when there are none).
     pub passthrough: Option<&'a crate::io::passthrough::Passthrough>,
+    /// Input sites uncalled in every sample, dropped from the chip set: written
+    /// as imputed dosage, without IMP (see `pipeline::WindowInput`).
+    pub uncalled_typed: &'a [usize],
 }
 
 /// One batch's sample / haplotype range (haps = 2 × samples).
@@ -149,6 +152,8 @@ pub struct WindowCtx<'a> {
     /// preservation (byte-identical pre-R4b imputed output).
     pub site_conf_per_sample: Option<&'a [f64]>,
     pub refine_thr: f64,
+    /// IMP per window-local variant (see `pipeline::WindowSetup::imp`).
+    pub imp: &'a [bool],
 }
 
 impl WindowCtx<'_> {
@@ -236,6 +241,7 @@ pub fn run_window<S: BatchSink>(
     refine_thr: f64,
     interp_cum_cm: Option<&[f64]>,
     passthrough: Option<&crate::io::passthrough::Passthrough>,
+    uncalled_typed: &[usize],
 ) -> std::io::Result<()> {
     use crate::srp::TILE_ROWS;
 
@@ -278,8 +284,9 @@ pub fn run_window<S: BatchSink>(
     if n_rerouted > 0 && hap_start == 0 {
         // Logged once per window (first batch only) to avoid per-batch/per-format
         // spam; step-level so it surfaces alongside the multiformat path's log.
-        crate::selphi_step!("--refine: re-routed {} low-confidence chip site(s) to imputed output (thr={})", n_rerouted, refine_thr);
+        crate::selphi_step!("{} typed site(s) with a missing or low-confidence call written as imputed dosage for those samples (confidence < {})", n_rerouted, refine_thr);
     }
+    let imp = crate::io::pipeline::imp_flags(&is_input_chip, uncalled_typed, own_wgs_start, own_wgs_end);
 
     let ctx = WindowCtx {
         srp,
@@ -293,6 +300,7 @@ pub fn run_window<S: BatchSink>(
         is_input_chip: &is_input_chip,
         site_conf_per_sample,
         refine_thr,
+        imp: &imp,
     };
     sink.begin_window(&ctx)?;
 

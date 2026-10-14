@@ -182,13 +182,13 @@ pub fn write_window_vcf_batched(
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples_total, chip_genotypes, no_ap, site_conf, site_conf_per_sample, refine_thr,
         interp_cum_cm,
-        bcf_contig_names: _, passthrough,
+        bcf_contig_names: _, passthrough, uncalled_typed,
     } = input;
     let mut sink = VcfSink { tx, no_ap, buf: Vec::new(), vid_prefixes: Vec::new() };
     crate::io::batch_driver::run_window(
         &mut sink, srp.as_ref(), weights, hap_start, hap_end,
         win_chip_start, own_chip_start, own_chip_end, wgs_idx, n_samples_total, chip_genotypes,
-        site_conf, site_conf_per_sample, refine_thr, interp_cum_cm, passthrough,
+        site_conf, site_conf_per_sample, refine_thr, interp_cum_cm, passthrough, uncalled_typed,
     )
 }
 
@@ -265,7 +265,13 @@ fn emit_imputed_line(
     // ap2>0.9995 → 1|1:2" fast paths bit-identically. The merger honours
     // the user's `--no-ap` choice when writing the final merged VCF.
     buf.extend_from_slice(vid_prefix);
-    buf.extend_from_slice(b"\t.\tPASS\t.\tGT:DS:AP1:AP2");
+    // INFO "IMP" marks a site absent from the input (the merger writes the flag);
+    // "." a typed site written as dosage.
+    if !ctx.imp[local_i] {
+        buf.extend_from_slice(b"\t.\tPASS\t.\tGT:DS:AP1:AP2");
+    } else {
+        buf.extend_from_slice(b"\t.\tPASS\tIMP\tGT:DS:AP1:AP2");
+    }
 
     for s in 0..n_samples_in_batch {
         // R4b: a confident sample at a re-routed input chip site emits its

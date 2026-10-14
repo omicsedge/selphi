@@ -15,8 +15,8 @@ use selphi::selphi_step;
 /// paths via the `lcwgs` / `refine` booleans — no engine code changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoRoute {
-    /// Read-likelihood regime (BAM/CRAM reads, or a PL VCF with absent/uncalled
-    /// GT) → the lcWGS GL-aware engine (`--lcwgs`).
+    /// Read-likelihood regime (BAM/CRAM reads, a PL VCF, or a VCF without GT) →
+    /// the lcWGS GL-aware engine (`--lcwgs`).
     Lcwgs,
     /// Confident hard calls WITH a per-site confidence field (GQ/PL/DP) → the
     /// chip/WGS genotype engine WITH `--refine` (soften soft sites toward LD).
@@ -81,15 +81,6 @@ fn sample_target() -> usize {
         .unwrap_or(2000)
 }
 
-/// Call-rate threshold below which a GT-bearing-but-mostly-uncalled file is
-/// treated as the read-likelihood regime. Env-overridable.
-fn callrate_threshold() -> f64 {
-    selphi::config::raw("SELPHI_AUTOROUTE_CALLRATE")
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .filter(|&f| (0.0..=1.0).contains(&f))
-        .unwrap_or(0.5)
-}
-
 /// Minimum site density (variants per megabase) at which a confident GT callset
 /// carrying a GQ/DP confidence field is treated as WGS and routed to refine.
 /// Below it, the callset is a chip array → plain genotype (no refine). A WGS
@@ -121,10 +112,12 @@ fn sniff_max_bytes() -> u64 {
 /// 1. BAM/CRAM input (reads) → `Lcwgs`.
 /// 2. PL present (read-likelihoods) → `Lcwgs` — the GL-aware engine beats the
 ///    genotype engine on WGS at every coverage (GIAB crossover); PL is the signal.
-/// 3. No PL, GT absent or mostly uncalled → `Lcwgs` (sparse read regime).
+/// 3. No PL and no GT → `Lcwgs`. A GT-only file stays on the genotype engine at
+///    any call rate: the lcWGS engine reads only PL, so it would discard every
+///    call (a cohort merged from different arrays has a low call rate).
 /// 4. No PL, confident GT: GQ/DP present AND WGS-scale density → `RefineGenotype`;
 ///    otherwise (chip array, or GT-only) → `PlainGenotype`.
-fn auto_route_decision(is_reads: bool, s: &Sniff, callrate_thr: f64, wgs_density_thr: f64) -> AutoRoute {
+fn auto_route_decision(is_reads: bool, s: &Sniff, wgs_density_thr: f64) -> AutoRoute {
     // 1. Aligned reads are unambiguously the lcWGS regime.
     if is_reads {
         return AutoRoute::Lcwgs;
@@ -142,10 +135,10 @@ fn auto_route_decision(is_reads: bool, s: &Sniff, callrate_thr: f64, wgs_density
     if s.has_pl {
         return AutoRoute::Lcwgs;
     }
-    // 3. No PL. GT absent, or GT present but mostly uncalled → still the read
-    //    regime in practice (e.g. a sparse all-`GT .` file).
-    let low_call = s.call_rate() < callrate_thr;
-    if !s.has_gt || low_call {
+    // 3. No PL and no GT. With GT the genotype engine is the only one that reads
+    //    the calls (the lcWGS engine takes every site without PL as flat), whatever
+    //    the call rate: a 0.4 call rate routed here used to impute from no call.
+    if !s.has_gt {
         return AutoRoute::Lcwgs;
     }
     // 4. Confident hard calls WITHOUT PL (a GT:GQ/DP callset with PL stripped,
@@ -439,7 +432,7 @@ pub fn resolve(
         match input {
             Some(p) => {
                 let s = sniff_variant_file(p);
-                let d = auto_route_decision(false, &s, callrate_threshold(), wgs_density_threshold());
+                let d = auto_route_decision(false, &s, wgs_density_threshold());
                 // Detail line so the chosen branch is auditable from the log.
                 selphi_step!(
                     "auto-route: sniff GT={} PL={} GQ={} DP={} call-rate={:.3} (of {} GT entries) density={:.0}/Mb (thr {:.0})",
@@ -461,7 +454,7 @@ pub fn resolve(
                 if is_reads {
                     selphi_step!("auto-route: aligned reads (BAM/CRAM) {}", selphi::log::green("→ lcWGS engine"));
                 } else {
-                    selphi_step!("auto-route: PL or low GT call-rate (read likelihoods) {}", selphi::log::green("→ lcWGS engine"));
+                    selphi_step!("auto-route: PL (read likelihoods) or no GT {}", selphi::log::green("→ lcWGS engine"));
                 }
                 eff_lcwgs = true;
             }
@@ -502,27 +495,27 @@ mod tests {
     #[test]
     fn reads_route_to_lcwgs() {
         let s = Sniff::default();
-        assert_eq!(auto_route_decision(true, &s, 0.5, WGS_THR), AutoRoute::Lcwgs);
+        assert_eq!(auto_route_decision(true, &s, WGS_THR), AutoRoute::Lcwgs);
     }
 
     #[test]
     fn gt_only_confident_is_plain() {
         // chip array: GT only, all called.
         let s = sniff(true, false, false, false, 1000, 1000);
-        assert_eq!(auto_route_decision(false, &s, 0.5, WGS_THR), AutoRoute::PlainGenotype);
+        assert_eq!(auto_route_decision(false, &s, WGS_THR), AutoRoute::PlainGenotype);
     }
 
     #[test]
     fn gt_with_dp_confident_wgs_density_is_refine() {
         // WGS GT:DP:AD, all called, WGS density → refine.
         let s = sniff(true, false, false, true, 1000, 1000);
-        assert_eq!(auto_route_decision(false, &s, 0.5, WGS_THR), AutoRoute::RefineGenotype);
+        assert_eq!(auto_route_decision(false, &s, WGS_THR), AutoRoute::RefineGenotype);
     }
 
     #[test]
     fn gt_with_gq_confident_wgs_density_is_refine() {
         let s = sniff(true, false, true, false, 1000, 1000);
-        assert_eq!(auto_route_decision(false, &s, 0.5, WGS_THR), AutoRoute::RefineGenotype);
+        assert_eq!(auto_route_decision(false, &s, WGS_THR), AutoRoute::RefineGenotype);
     }
 
     #[test]
@@ -531,10 +524,10 @@ mod tests {
         // below the 1000/Mb gate) → plain genotype, NOT refine. This is the
         // WGS-density gate: refine only fires when we are sure it is WGS.
         let chip = sniff_dens(true, true, 1000, 1000, 100);
-        assert_eq!(auto_route_decision(false, &chip, 0.5, WGS_THR), AutoRoute::PlainGenotype);
+        assert_eq!(auto_route_decision(false, &chip, WGS_THR), AutoRoute::PlainGenotype);
         // The same fields at WGS density → refine.
         let wgs = sniff_dens(true, true, 1000, 1000, 2000);
-        assert_eq!(auto_route_decision(false, &wgs, 0.5, WGS_THR), AutoRoute::RefineGenotype);
+        assert_eq!(auto_route_decision(false, &wgs, WGS_THR), AutoRoute::RefineGenotype);
     }
 
     #[test]
@@ -554,36 +547,31 @@ mod tests {
         // WGS at every coverage (the GIAB crossover finding). This is the case
         // the prior call-rate rule misrouted to genotype+refine.
         let s = sniff(true, true, false, true, 1000, 998);
-        assert_eq!(auto_route_decision(false, &s, 0.5, WGS_THR), AutoRoute::Lcwgs);
+        assert_eq!(auto_route_decision(false, &s, WGS_THR), AutoRoute::Lcwgs);
     }
 
     #[test]
     fn pl_low_callrate_is_lcwgs() {
         // lcWGS PL VCF: GT present but mostly uncalled, PL present.
         let s = sniff(true, true, false, true, 1000, 50);
-        assert_eq!(auto_route_decision(false, &s, 0.5, WGS_THR), AutoRoute::Lcwgs);
+        assert_eq!(auto_route_decision(false, &s, WGS_THR), AutoRoute::Lcwgs);
     }
 
     #[test]
-    fn all_uncalled_gt_only_is_lcwgs() {
-        // bcftools-called head: GT only, every value `.` → read regime.
-        let s = sniff(true, false, false, false, 1000, 0);
-        assert_eq!(auto_route_decision(false, &s, 0.5, WGS_THR), AutoRoute::Lcwgs);
+    fn gt_only_low_callrate_stays_genotype() {
+        // GT only, mostly or wholly uncalled (a cohort merged from different arrays):
+        // the lcWGS engine reads no GT, so the calls go to the genotype engine.
+        for called in [0, 400] {
+            let s = sniff(true, false, false, false, 1000, called);
+            assert_eq!(auto_route_decision(false, &s, WGS_THR), AutoRoute::PlainGenotype);
+        }
     }
 
     #[test]
     fn absent_gt_is_lcwgs() {
         // PL-only file (no GT in FORMAT).
         let s = sniff(false, true, false, false, 0, 0);
-        assert_eq!(auto_route_decision(false, &s, 0.5, WGS_THR), AutoRoute::Lcwgs);
-    }
-
-    #[test]
-    fn callrate_threshold_env_respected() {
-        // 60% called: lcWGS at thr=0.7, genotype+refine at thr=0.5 (WGS density).
-        let s = sniff(true, false, false, true, 1000, 600);
-        assert_eq!(auto_route_decision(false, &s, 0.7, WGS_THR), AutoRoute::Lcwgs);
-        assert_eq!(auto_route_decision(false, &s, 0.5, WGS_THR), AutoRoute::RefineGenotype);
+        assert_eq!(auto_route_decision(false, &s, WGS_THR), AutoRoute::Lcwgs);
     }
 
     #[test]

@@ -204,7 +204,7 @@ pub fn build_multi_chr_srp(
         super::writer::write_section(&mut w, meta_json.to_string().as_bytes())?;
 
         // Variants binary
-        super::writer::write_section(&mut w, &vbin)?;
+        super::writer::write_vbin_section(&mut w, &vbin, n_variants)?;
 
         // IDs
         super::writer::write_section(&mut w, &ids)?;
@@ -510,7 +510,7 @@ pub fn merge_samples_single_chr(
         super::writer::push_variant_index(&mut vbin, &mut ids_buf, &mut orig_buf, i == 0,
             &v.chr, v.pos, &v.ref_allele, &v.alt_allele, &id)?;
     }
-    super::writer::write_section(&mut w, &vbin)?;
+    super::writer::write_vbin_section(&mut w, &vbin, n_variants)?;
 
     // Sample IDs
     super::writer::write_section(&mut w, all_sample_ids.join("\n").as_bytes())?;
@@ -897,7 +897,7 @@ pub fn merge_single_chr_srps(
                 orig_buf.extend_from_slice(reader.original_ids[i].as_bytes());
             }
         }
-        super::writer::write_section(&mut w, &vbin)?;
+        super::writer::write_vbin_section(&mut w, &vbin, n_variants)?;
 
         super::writer::write_section(&mut w, &ids_buf)?;
 

@@ -165,7 +165,7 @@ fn load_chr_data(
     // ROOT-CAUSE FIX (multi-chr): 128 when phasing will run (missing→imputed by the engine),
     // 0 for impute-only (byte-identical). See single-chr extract in imputation_pipeline.rs.
     miss_val: u8,
-) -> Option<(Arc<selphi::srp::SrpReader>, Vec<usize>, Vec<usize>, Vec<u8>, Vec<f64>, Vec<i64>, usize, usize, usize, NoCallConf, Vec<u8>)> {
+) -> Option<(Arc<selphi::srp::SrpReader>, Vec<usize>, Vec<usize>, Vec<u8>, Vec<f64>, Vec<i64>, usize, usize, usize, NoCallConf, Vec<u8>, (Vec<usize>, Vec<usize>))> {
     let chr_view = multi_srp.load_chr_view(chr_name).ok()?;
     let n_ref = chr_view.n_haps();
     let n_ref_variants = chr_view.n_variants();
@@ -176,18 +176,21 @@ fn load_chr_data(
     let (target_markers, target_genotypes) = target_by_chr.get(key)
         .or_else(|| target_by_chr.get(chr_name))?;
 
-    let (wgs_idx, target_idx, targ_alleles, chip_bps, n_chip, nocall, transforms) =
+    let (wgs_idx, target_idx, targ_alleles, chip_bps, n_chip, nocall, transforms, matched_idx) =
         prepare_chr_target(&srp, target_markers, target_genotypes, n_haps, allele_match, miss_val)?;
     let raw_chip_cm = genmap::interpolate_for_chr(multi_map, chr_name, &chip_bps);
 
-    Some((srp, wgs_idx, target_idx, targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip, nocall, transforms))
+    Some((srp, wgs_idx, target_idx, targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip, nocall, transforms, matched_idx))
 }
 
 /// Intersect target markers against a chromosome's reference panel, extract the
 /// target alleles, and collect the chip base-pair positions. Shared verbatim by
 /// the synchronous `load_chr_data` and the background prefetch closure so the
 /// per-chr data preparation cannot drift between them. Returns None when no
-/// markers are shared (n_chip == 0).
+/// markers are shared (n_chip == 0). The last element is every matched target
+/// record, including those dropped as uncalled in every sample (for the
+/// passthrough), and the panel indices of those dropped (written without IMP).
+#[allow(clippy::type_complexity)]
 fn prepare_chr_target(
     srp: &selphi::srp::SrpReader,
     target_markers: &[selphi::io::target_io::TargetMarker],
@@ -195,16 +198,22 @@ fn prepare_chr_target(
     n_haps: usize,
     allele_match: selphi::io::target_io::AlleleMatch,
     miss_val: u8,
-) -> Option<(Vec<usize>, Vec<usize>, Vec<u8>, Vec<i64>, usize, NoCallConf, Vec<u8>)> {
-    let (wgs_idx, target_idx, transforms) = intersect_variants_for_chr(
+) -> Option<(Vec<usize>, Vec<usize>, Vec<u8>, Vec<i64>, usize, NoCallConf, Vec<u8>, (Vec<usize>, Vec<usize>))> {
+    let (mut wgs_idx, mut target_idx, mut transforms) = intersect_variants_for_chr(
         &srp.metadata.chromosome, &srp.variants, &srp.ids, target_markers, allele_match,
     );
+    let matched_idx = target_idx.clone();
+    let uncalled = selphi::io::target_io::drop_uncalled_sites(
+        target_genotypes, &mut wgs_idx, &mut target_idx, &mut transforms);
+    if !uncalled.is_empty() {
+        selphi_info!("    {} shared marker(s) with no call in any sample: imputed as untyped sites", uncalled.len());
+    }
     let n_chip = wgs_idx.len();
     if n_chip == 0 { return None; }
     let targ_alleles = extract_target_alleles(target_genotypes, &target_idx, n_chip, n_haps, &transforms, miss_val);
     let chip_bps: Vec<i64> = wgs_idx.iter().map(|&wi| srp.variants[wi].pos).collect();
     let nocall = build_nocall_conf(target_genotypes, &target_idx, n_chip, n_haps / 2);
-    Some((wgs_idx, target_idx, targ_alleles, chip_bps, n_chip, nocall, transforms))
+    Some((wgs_idx, target_idx, targ_alleles, chip_bps, n_chip, nocall, transforms, (matched_idx, uncalled)))
 }
 
 /// Per-chip-site and per-(site,sample) confidence marking no-call genotypes, the
@@ -267,21 +276,10 @@ fn load_maps(
             for pattern in &candidates {
                 let path = map_dir.join(pattern);
                 if path.exists() {
-                    let (mut bp, mut cm) = genmap::load_genetic_map_raw(&path)?;
                     // chrX: the PLINK GRCh38/37 maps put PAR1 and PAR2 in their own files
-                    // (each from 0 cM). Joined to the non-PAR map they give PAR1 its real
-                    // ~21 cM, which mean-rate extrapolation put at ~3.
-                    if selphi::contig::is_chrx(key) {
-                        let pars: Vec<std::path::PathBuf> = ["par1", "par2"].iter()
-                            .map(|par| map_dir.join(pattern.replacen(&format!("chr{}", key), &format!("chr{}_{}", key, par), 1)))
-                            .filter(|p| p.exists() && p.as_path() != path.as_path()).collect();
-                        if !pars.is_empty() {
-                            let mut parts = vec![(bp, cm)];
-                            for pp in &pars { parts.push(genmap::load_genetic_map_raw(pp)?); }
-                            (bp, cm) = genmap::stitch(parts).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                            selphi_info!("  chr{}: map joined with {} PAR map file(s)", key, pars.len());
-                        }
-                    }
+                    // (each from 0 cM); the loader joins the ones beside the chrX map, which
+                    // gives PAR1 its real ~21 cM instead of the mean-rate ~3.
+                    let (bp, cm) = genmap::load_genetic_map_for(&path, Some(key))?;
                     combined.insert(key.to_string(), (bp, cm));
                     found = true;
                     break;
@@ -292,8 +290,14 @@ fn load_maps(
                 if let Ok(entries) = std::fs::read_dir(map_dir) {
                     for entry in entries.flatten() {
                         let name = entry.file_name().to_string_lossy().to_string();
-                        if name.contains(&format!("chr{}", key)) && name.ends_with(".map") {
-                            let (bp, cm) = genmap::load_genetic_map_raw(&entry.path())?;
+                        // "chr{key}" as a whole token: chr1 must not take chr10.map, nor
+                        // chrX a PAR file.
+                        let tag = format!("chr{}", key);
+                        let whole = name.match_indices(&tag).any(|(i, _)| {
+                            !name[i + tag.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                        });
+                        if whole && name.ends_with(".map") {
+                            let (bp, cm) = genmap::load_genetic_map_for(&entry.path(), Some(key))?;
                             combined.insert(key.to_string(), (bp, cm));
                             found = true;
                             break;
@@ -539,6 +543,27 @@ pub fn run_multi_chr(
     let mc_miss_val: u8 = if !is_phased || config.force_phasing { 128 } else { 0 };
     selphi_info!("  target: {} samples, {} chromosomes, phased={}",
         n_samples, target_by_chr.len(), is_phased);
+    // Target chromosomes the panel lacks (chrY, MT, unplaced contigs): written after the
+    // panel's chromosomes, as given, like an unmatched site on a panel chromosome
+    // (`--drop-unmatched` leaves them out). Target spelling, in a stable order.
+    let mut absent: Vec<(String, String, usize)> = target_by_chr.iter()
+        .filter(|(k, _)| !chromosomes.iter().any(|c| c.strip_prefix("chr").unwrap_or(c) == k.as_str()))
+        .map(|(k, (m, _))| (k.clone(), m.first().map(|x| x.chrom.clone()).unwrap_or_else(|| k.clone()), m.len()))
+        .collect();
+    absent.sort_by_key(|(k, _, _)| {
+        use selphi::contig::ContigClass as C;
+        let class = match selphi::contig::classify_contig(k) { C::Autosome => 0, C::ChrX => 1, C::ChrY => 2, C::ChrMt => 3, C::Other => 4 };
+        (class, k.parse::<u32>().unwrap_or(u32::MAX), k.clone())
+    });
+    if !absent.is_empty() {
+        let list: Vec<String> = absent.iter().map(|(_, c, n)| format!("{c} ({n} records)")).collect();
+        if config.drop_unmatched {
+            selphi_info!("  target chromosome(s) absent from the panel, left out (--drop-unmatched): {}", list.join(", "));
+        } else {
+            selphi_info!("  target chromosome(s) absent from the panel, written as given after the panel's: {}", list.join(", "));
+        }
+    }
+    let absent: Vec<(String, String, usize)> = if config.drop_unmatched { Vec::new() } else { absent };
 
     // 3. Load genetic map (unified file or per-chr directory)
     let multi_map = load_maps(config, &chromosomes, map_path)?;
@@ -629,7 +654,21 @@ pub fn run_multi_chr(
     else { selphi::common::utils::out_path(&out_base, "vcf.gz")
     };
 
-    let all_contig_fields = &multi_srp.global_meta.contig_fields;
+    // Header contigs: the panel's, then the absent target chromosomes' (their own
+    // ##contig lines when the target declares them). A BCF record names its contig
+    // by its index in this list.
+    let mut contig_fields = multi_srp.global_meta.contig_fields.clone();
+    if !absent.is_empty() {
+        let lines = selphi::io::passthrough::target_contig_lines(input_path).unwrap_or_default();
+        let declared = selphi::io::bcf_encode::contig_names_from_header_lines(&contig_fields);
+        for (k, spelling, _) in &absent {
+            // A panel chromosome left out of the run (chrY, MT) already has its line.
+            if declared.iter().any(|d| d == spelling) { continue; }
+            if !contig_fields.is_empty() && !contig_fields.ends_with('\n') { contig_fields.push('\n'); }
+            contig_fields.push_str(&lines.get(k).cloned().unwrap_or_else(|| format!("##contig=<ID={spelling}>")));
+        }
+    }
+    let all_contig_fields = &contig_fields;
     let (vcf_tx, vcf_writer, vcf_bgzip) = if formats.vcf || formats.bcf {
         if formats.bcf {
             selphi::io::pipeline::setup_bcf_writer(
@@ -659,6 +698,7 @@ pub fn run_multi_chr(
         n_chip: usize,
         nocall: NoCallConf,
         transforms: Vec<u8>,
+        matched_idx: (Vec<usize>, Vec<usize>),
     }
 
     // 6. Process each chromosome with prefetch overlap
@@ -689,11 +729,12 @@ pub fn run_multi_chr(
         selphi_info!("  [{}/{}] chr{}", chr_idx + 1, n_chr, chr_name);
 
         // Use prefetched data if available, otherwise load synchronously
-        let (srp, wgs_idx, target_idx, mut targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip, nocall, transforms) =
+        let (srp, wgs_idx, target_idx, mut targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip, nocall, transforms, (matched_idx, uncalled_typed)) =
             if let Some(pre) = prefetch_result.take() {
                 selphi_info!("    (prefetched)");
                 (pre.srp, pre.wgs_idx, pre.target_idx, pre.targ_alleles,
-                 pre.raw_chip_cm, pre.chip_bps, pre.n_ref, pre.n_ref_variants, pre.n_chip, pre.nocall, pre.transforms)
+                 pre.raw_chip_cm, pre.chip_bps, pre.n_ref, pre.n_ref_variants, pre.n_chip, pre.nocall, pre.transforms,
+                 pre.matched_idx)
             } else {
                 // Synchronous load for first chromosome (or if prefetch was skipped)
                 match load_chr_data(&multi_srp, chr_name, &target_by_chr, &multi_map, n_haps, config.allele_match, mc_miss_val) {
@@ -713,7 +754,7 @@ pub fn run_multi_chr(
             let key = chr_name.strip_prefix("chr").unwrap_or(chr_name);
             let markers = target_by_chr.get(key).or_else(|| target_by_chr.get(chr_name))
                 .map(|(m, _)| m.as_slice()).unwrap_or(&[]);
-            match selphi::io::passthrough::for_chromosome(input_path, &srp, markers, &target_idx, None) {
+            match selphi::io::passthrough::for_chromosome(input_path, &srp, markers, &matched_idx, None) {
                 Ok(p) => p,
                 Err(e) => {
                     selphi_error!("Reading the target records absent from the panel ({}): {}", input_path, e);
@@ -747,13 +788,25 @@ pub fn run_multi_chr(
             &sample_names, &target_idx, chr_genotypes,
             n_chip, n_samples, n_haps, &transforms,
         );
-        crate::prephase::apply_haploid_detection(
+        let haploid_resets = crate::prephase::apply_haploid_detection(
             config.haploids.as_deref(), config.chrx_par, config.build,
             needs_phasing, chr_name, &mut targ_alleles,
             &sample_names, &target_idx, chr_genotypes,
             n_chip, n_samples, n_haps, &chip_bps,
             srp.variants.iter().map(|v| v.pos).max().unwrap_or(0),
         );
+        let par_conf = crate::prephase::par_collapsed_conf();
+        let par_calls = if par_conf < 1.0 {
+            crate::prephase::collapsed_par_calls(
+                config.chrx_par, config.build, chr_name, &target_idx, chr_genotypes,
+                n_chip, n_samples, &chip_bps, srp.variants.iter().map(|v| v.pos).max().unwrap_or(0))
+        } else { Vec::new() };
+        let nocall = if haploid_resets.is_empty() && par_calls.is_empty() { nocall } else {
+            let (mut site, mut ps) = match nocall { Some((a, b)) => (Some(a), Some(b)), None => (None, None) };
+            crate::prephase::mark_nocalls(&haploid_resets, n_chip, n_samples, &mut site, &mut ps);
+            crate::prephase::soften_calls(&par_calls, par_conf, n_chip, n_samples, &mut site, &mut ps);
+            site.zip(ps)
+        };
 
         // Phasing (if needed)
         let ensemble_n = if needs_phasing { resolve_ensemble_n(config, n_samples) } else { 1 };
@@ -885,7 +938,7 @@ pub fn run_multi_chr(
                     let srp = Arc::new(chr_view.into_srp_reader());
 
                     let (target_markers, target_genotypes) = next_target.as_ref()?;
-                    let (wgs_idx, target_idx, targ_alleles, chip_bps, n_chip, nocall, transforms) =
+                    let (wgs_idx, target_idx, targ_alleles, chip_bps, n_chip, nocall, transforms, matched_idx) =
                         prepare_chr_target(&srp, target_markers, target_genotypes, n_h, allele_match, mc_mv)?;
                     let (map_bp, map_cm) = next_map?;
                     let raw_chip_cm: Vec<f64> = chip_bps.iter().map(|&bp| {
@@ -894,7 +947,7 @@ pub fn run_multi_chr(
 
                     Some(ChrPrefetchResult {
                         srp, wgs_idx, target_idx, targ_alleles, raw_chip_cm, chip_bps,
-                        n_ref, n_ref_variants, n_chip, nocall, transforms,
+                        n_ref, n_ref_variants, n_chip, nocall, transforms, matched_idx,
                     })
                 }))
             } else {
@@ -1012,6 +1065,7 @@ pub fn run_multi_chr(
                     refine_thr: nocall_thr,
                     interp_cum_cm: interp_cum_cm.as_deref(),
                     passthrough: passthrough.as_ref(),
+                    uncalled_typed: &uncalled_typed,
                 },
                 selphi::io::pipeline::WindowWriters {
                     // Per-chr parquet/pgen/selfdecode not wired yet in multi-chr mode.
@@ -1042,6 +1096,27 @@ pub fn run_multi_chr(
         selphi_info!("    {} {:.1}s ({} windows)\n", selphi::log::green("\u{2713}"), chr_elapsed, windows.len());
     }
 
+    // 6b. Target chromosomes the panel lacks, as given, in header order.
+    if formats.vcf || formats.bcf {
+        let names = selphi::io::bcf_encode::contig_names_from_header_lines(all_contig_fields);
+        for (_, spelling, _) in &absent {
+            let pass = selphi::io::passthrough::whole_contig(input_path, spelling, spelling)
+                .unwrap_or_else(|e| { selphi_error!("Reading target chromosome {} ({}): {}", spelling, input_path, e); std::process::exit(1); });
+            let mut buf = Vec::with_capacity(pass.len() * (n_samples * 4 + 64));
+            if formats.bcf {
+                let rid = names.iter().position(|n| n == spelling).unwrap_or(0) as i32;
+                for i in 0..pass.len() {
+                    selphi::io::bcf_encode::encode_passthrough_record(&mut buf, rid, pass.rec(i), 0..n_samples);
+                }
+            } else {
+                for i in 0..pass.len() { pass.append_vcf(i, 0..n_samples, &mut buf); }
+            }
+            if !buf.is_empty() { vcf_tx.send(buf).expect("VCF send failed"); }
+            n_out_variants_total += pass.len() as u64;
+            selphi_info!("  {}: {} records written as given (not in the panel)", spelling, pass.len());
+        }
+    }
+
     // 7. Finalize output writer
     if formats.vcf || formats.bcf {
         selphi::io::pipeline::finish_vcf_writer(vcf_tx, vcf_writer, vcf_bgzip)
@@ -1054,9 +1129,7 @@ pub fn run_multi_chr(
         out_file.display(), selphi::log::fmt_thousands(n_out_variants_total), n_samples,
         selphi::log::fmt_bytes(out_bytes));
     if dr2_acc.n > 0 {
-        selphi_info!("  Imputation quality: mean DR2 {}  ·  {:.1}% of {} imputed variants DR2 \u{2265} 0.8",
-            selphi::log::cyan(&format!("{:.4}", dr2_acc.mean())),
-            dr2_acc.pct_ge08(), selphi::log::fmt_thousands(dr2_acc.n));
+        selphi_info!("  {}", dr2_acc.summary(n_samples));
     }
 
     // --truth: identical evaluation to the single-chr path (eval_run.rs). The

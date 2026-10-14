@@ -25,6 +25,7 @@ pub fn setup_pgen_batch_writers(
     batch_size: usize,
     tmp_dir: &Path,
     all_sample_names: &[String],
+    max_variants: usize,
 ) -> std::io::Result<Vec<PgenBatchWriter>> {
     if batch_size == 0 || n_haps == 0 {
         return Ok(Vec::new());
@@ -37,7 +38,7 @@ pub fn setup_pgen_batch_writers(
         let batch_names = &all_sample_names[r.sample_start..r.sample_end];
         write_psam(&path, batch_names)?;
         let pvar = write_pvar(&path)?;
-        let pgen = PgenWriter::new(&path, batch_names.len())?;
+        let pgen = PgenWriter::new(&path, batch_names.len(), max_variants)?;
         writers.push(PgenBatchWriter {
             pgen,
             pvar,
@@ -137,12 +138,12 @@ pub fn write_window_pgen_batched(
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples_total, chip_genotypes, no_ap: _, site_conf, site_conf_per_sample, refine_thr,
         interp_cum_cm,
-        bcf_contig_names: _, passthrough,
+        bcf_contig_names: _, passthrough, uncalled_typed,
     } = input;
     let mut sink = PgenSink { bw, hardcalls: Vec::new(), dosages: Vec::new() };
     crate::io::batch_driver::run_window(
         &mut sink, srp.as_ref(), weights, hap_start, hap_end,
         win_chip_start, own_chip_start, own_chip_end, wgs_idx, n_samples_total, chip_genotypes,
-        site_conf, site_conf_per_sample, refine_thr, interp_cum_cm, passthrough,
+        site_conf, site_conf_per_sample, refine_thr, interp_cum_cm, passthrough, uncalled_typed,
     )
 }

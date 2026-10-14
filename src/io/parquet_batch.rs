@@ -1,7 +1,9 @@
 //! Per-batch Parquet writer.
 //!
 //! Intermediate schema differs from the final output:
-//!   CHROM (Utf8), POS (Int64), ID (Utf8), REF (Utf8), ALT (Utf8), IMP (Bool),
+//!   CHROM (Utf8), POS (Int64), ID (Utf8), REF (Utf8), ALT (Utf8),
+//!   DOSE (Bool: the row carries model dosages, so DR2 is written),
+//!   IMP (Bool: the site is absent from the input),
 //!   sample_1_ap1 (Float32), sample_1_ap2 (Float32),
 //!   sample_2_ap1 (Float32), sample_2_ap2 (Float32),
 //!   …
@@ -30,6 +32,7 @@ pub fn build_batch_schema(sample_names: &[String]) -> Schema {
         Field::new("ID", DataType::Utf8, true),
         Field::new("REF", DataType::Utf8, false),
         Field::new("ALT", DataType::Utf8, false),
+        Field::new("DOSE", DataType::Boolean, false),
         Field::new("IMP", DataType::Boolean, false),
     ];
     for name in sample_names {
@@ -96,6 +99,7 @@ struct ParquetSink<'w> {
     ids: StringBuilder,
     refs_b: StringBuilder,
     alts_b: StringBuilder,
+    doses: BooleanBuilder,
     imps: BooleanBuilder,
     // Per-sample AP1/AP2 builders, sample-major: ap1_s0, ap2_s0, ap1_s1, …
     ap_builders: Vec<Float32Builder>,
@@ -105,12 +109,13 @@ impl ParquetSink<'_> {
     /// Flush the buffered rows as one Parquet RecordBatch (no-op if empty).
     fn flush(&mut self) -> std::io::Result<()> {
         if self.positions.len() == 0 { return Ok(()); }
-        let mut cols: Vec<Arc<dyn arrow::array::Array>> = Vec::with_capacity(6 + self.ap_builders.len());
+        let mut cols: Vec<Arc<dyn arrow::array::Array>> = Vec::with_capacity(7 + self.ap_builders.len());
         cols.push(Arc::new(self.chroms.finish()));
         cols.push(Arc::new(self.positions.finish()));
         cols.push(Arc::new(self.ids.finish()));
         cols.push(Arc::new(self.refs_b.finish()));
         cols.push(Arc::new(self.alts_b.finish()));
+        cols.push(Arc::new(self.doses.finish()));
         cols.push(Arc::new(self.imps.finish()));
         for b in self.ap_builders.iter_mut() {
             cols.push(Arc::new(b.finish()));
@@ -133,6 +138,7 @@ impl BatchSink for ParquetSink<'_> {
         self.ids = StringBuilder::with_capacity(cap, cap * 16);
         self.refs_b = StringBuilder::with_capacity(cap, cap * 2);
         self.alts_b = StringBuilder::with_capacity(cap, cap * 2);
+        self.doses = BooleanBuilder::with_capacity(cap);
         self.imps = BooleanBuilder::with_capacity(cap);
         self.ap_builders = (0..ctx.n_samples_in_batch * 2)
             .map(|_| Float32Builder::with_capacity(cap)).collect();
@@ -149,6 +155,7 @@ impl BatchSink for ParquetSink<'_> {
         self.ids.append_value(rsid);
         self.refs_b.append_value(ref_a);
         self.alts_b.append_value(alt_a);
+        self.doses.append_value(false);
         self.imps.append_value(false);
         let ci = ctx.chip_local_idx[local_i];
         for s in 0..ctx.n_samples_in_batch {
@@ -172,6 +179,7 @@ impl BatchSink for ParquetSink<'_> {
         self.ids.append_value(&r.id);
         self.refs_b.append_value(&r.ref_allele);
         self.alts_b.append_value(&r.alts[0]);
+        self.doses.append_value(false);
         self.imps.append_value(false);
         for s in 0..ctx.n_samples_in_batch {
             let gs = ctx.sample_start + s;
@@ -203,7 +211,8 @@ impl BatchSink for ParquetSink<'_> {
         self.ids.append_value(rsid);
         self.refs_b.append_value(ref_a);
         self.alts_b.append_value(alt_a);
-        self.imps.append_value(true);
+        self.doses.append_value(true);
+        self.imps.append_value(ctx.imp[local_i]);
         // R4b: a confident sample at a re-routed input chip site emits its
         // verbatim hard call; soft / pure-imputed → alt_probs.
         let ci = ctx.chip_local_idx[local_i];
@@ -236,7 +245,7 @@ pub fn write_window_parquet_batched(
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples_total, chip_genotypes, no_ap: _, site_conf, site_conf_per_sample, refine_thr,
         interp_cum_cm,
-        bcf_contig_names: _, passthrough,
+        bcf_contig_names: _, passthrough, uncalled_typed,
     } = input;
     let mut sink = ParquetSink {
         bw,
@@ -246,12 +255,13 @@ pub fn write_window_parquet_batched(
         ids: StringBuilder::new(),
         refs_b: StringBuilder::new(),
         alts_b: StringBuilder::new(),
+        doses: BooleanBuilder::new(),
         imps: BooleanBuilder::new(),
         ap_builders: Vec::new(),
     };
     crate::io::batch_driver::run_window(
         &mut sink, srp.as_ref(), weights, hap_start, hap_end,
         win_chip_start, own_chip_start, own_chip_end, wgs_idx, n_samples_total, chip_genotypes,
-        site_conf, site_conf_per_sample, refine_thr, interp_cum_cm, passthrough,
+        site_conf, site_conf_per_sample, refine_thr, interp_cum_cm, passthrough, uncalled_typed,
     )
 }

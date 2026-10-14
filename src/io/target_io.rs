@@ -94,6 +94,11 @@ fn reconcile_ladder(
 ) -> Option<LadderHit> {
     if mode == AlleleMatch::None { return None; }
     if is_palindromic_snp(tgt_ref_lit, tgt_alt_lit) { return None; }
+    // Only a substitution (REF and ALT of equal length) can be the same variant with its
+    // labels swapped. A length-changing pair at one position is an insertion and the
+    // opposite deletion (A>AT vs AT>A), two different variants: swapping them turned a
+    // hom-REF insertion call into a typed 1|1 for the panel deletion.
+    if tgt_ref_lit.len() != tgt_alt_lit.len() { return None; }
     let key = |s: &str| if hash_alleles { crate::srp::blake2b_hex(s) } else { s.to_string() };
 
     // Rung 1 — REF/ALT swap (same strand): panel.ref==key(alt) && panel.alt==key(ref).
@@ -182,15 +187,25 @@ fn read_vcf_raw(path: &str) -> Vec<u8> {
     raw
 }
 
+/// The lines of a VCF text buffer without their terminator, `\n` or `\r\n`: a
+/// Windows-saved VCF otherwise leaves `\r` on the last sample's genotype (read as
+/// a no-call) and on the last sample name. htslib and Beagle strip it too.
+fn text_lines(raw: &[u8]) -> impl Iterator<Item = &[u8]> {
+    raw.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+}
+
 /// Core fields of one VCF data line, borrowed from the line buffer. `gt_region`
 /// is the raw bytes of fields 9+ (per-sample columns), to be handed to
-/// [`parse_gt_region`].
+/// [`parse_gt_raw`].
 struct VcfFields<'a> {
     chrom: &'a str,
     pos: i64,
     id: &'a str,
     ref_allele: &'a str,
+    /// The first ALT allele.
     alt_allele: &'a str,
+    /// The whole ALT column (`A` or `A,C,...`).
+    alts: &'a str,
     /// True if the ALT field carried a comma (more than one ALT allele).
     multiallelic: bool,
     gt_region: &'a [u8],
@@ -226,21 +241,11 @@ fn split_vcf_fields(line: &[u8]) -> Option<VcfFields<'_>> {
         id: std::str::from_utf8(&line[tabs[1] + 1..tabs[2]]).unwrap_or("."),
         ref_allele: std::str::from_utf8(ref_bytes).unwrap_or(""),
         alt_allele: std::str::from_utf8(alt_bytes).unwrap_or(""),
+        alts: std::str::from_utf8(alt_field).unwrap_or(""),
         multiallelic: alt_end < alt_field.len(),
         gt_region: &line[tabs[8] + 1..],
     })
 }
-
-/// Parse the per-sample diploid GT region (VCF fields 9+) into `[a0, a1]`
-/// pairs, biallelic-projected to {0,1}: any ALT allele index (≥1, incl.
-/// multiallelic 2+) folds to 1; REF / missing → 0. A HAPLOID GT (`len < 3`,
-/// e.g. chrX males `"1"`) is read as `[allele, 0]` — matching the binary-BCF
-/// reader (`read_target_bcf`), which reads the real allele — so the call
-/// reaches the downstream chrX-haploid handling (detect_haploid_chrx /
-/// reset_haploid_hets) instead of being silently dropped to `0|0`. Decrements
-/// `*phase_checks` over the leading samples and clears `*is_phased` when a
-/// checked sample uses the unphased `/` separator. (Replaces three byte-
-/// identical copies; the former cohort `bin` and `.min(1)` clamps are equal.)
 
 /// Per-allele sentinel for a MISSING genotype (`.`), distinct from the real
 /// (biallelic-projected) alleles {0,1}. The imputation path folds it back to 0
@@ -249,14 +254,41 @@ fn split_vcf_fields(line: &[u8]) -> Option<VcfFields<'_>> {
 /// value > 1) to skip a missing parent instead of mistaking it for hom-ref.
 pub const GT_MISSING: u8 = 3;
 
-fn parse_gt_region(
+/// Allele index of a missing allele (`.`) in a raw genotype from [`parse_gt_raw`].
+const RAW_MISSING: u8 = u8::MAX;
+
+/// Parse the per-sample GT region (VCF fields 9+) into RAW `[a0, a1]` allele
+/// indexes: 0 = REF, k = the k-th ALT (clamped to 254), [`RAW_MISSING`] for `.`.
+/// The caller projects them onto one ALT ([`project_alt`]) or onto any-ALT
+/// ([`project_any_alt`]).
+///
+/// A HAPLOID call (one allele, no separator: male chrX/Y, MT) is read as the
+/// homozygote `[a, a]`, as Beagle reads it (VcfRecGTParser) and as
+/// `bcftools +fixploidy` writes it. It used to be `[a, 0]`, which turned every
+/// hemizygous ALT call into a heterozygote, defeated the male detection on chrX
+/// and imputed ~80k false hets per male X.
+///
+/// Sets `*unphased_het` when a diploid heterozygote is written with `/`: the run
+/// needs phasing exactly when some sample carries one. (The decision used to
+/// come from the first 10 GT fields of the file, so a file opening with `|`
+/// homozygotes or haploid MT/Y records skipped phasing for the whole run and
+/// wrote every unphased het in text order.)
+fn parse_gt_raw(
     gt_region: &[u8],
     n_samples: usize,
-    is_phased: &mut bool,
-    phase_checks: &mut i32,
+    unphased_het: &mut bool,
 ) -> Vec<[u8; 2]> {
     let mut var_gts = Vec::with_capacity(n_samples);
     let mut field_start = 0;
+    // One allele token -> raw index; '.'/empty/non-numeric -> RAW_MISSING.
+    let allele_of = |s: &[u8]| -> u8 {
+        if s.is_empty() || s == b"." { return RAW_MISSING; }
+        let mut v: u32 = 0;
+        for &c in s {
+            if c.is_ascii_digit() { v = (v * 10 + (c - b'0') as u32).min(254); } else { return RAW_MISSING; }
+        }
+        v as u8
+    };
     for _ in 0..n_samples {
         let field_end = gt_region[field_start..]
             .iter()
@@ -267,38 +299,90 @@ fn parse_gt_region(
         let gt_end = field.iter().position(|&b| b == b':').unwrap_or(field.len());
         let gt = &field[..gt_end];
 
-        if *phase_checks > 0 {
-            if gt.contains(&b'/') { *is_phased = false; }
-            *phase_checks -= 1;
-        }
-
-        // Parse one allele token → {0,1} (any nonzero ALT index → 1, matching the
-        // BCF path's integer projection); '.'/empty → GT_MISSING. A missing allele
-        // stays GT_MISSING (not folded to 0) so the pedigree scaffold can tell a
-        // truly-missing parent from a real hom-ref; the imputation path folds it
-        // back to 0 in extract_target_alleles (byte-identical there).
-        let allele_of = |s: &[u8]| -> u8 {
-            if s.is_empty() || s == b"." { return GT_MISSING; }
-            let mut v: u32 = 0;
-            for &c in s {
-                if c.is_ascii_digit() { v = v * 10 + (c - b'0') as u32; } else { return GT_MISSING; }
-            }
-            v.min(1) as u8
-        };
         // Locate the '/'|'|' separator by scanning — allele indices can be
         // multi-digit at multiallelic sites, so it is not always at byte 1.
-        let (a0, a1) = if gt.is_empty() {
-            (GT_MISSING, GT_MISSING)
+        let pair = if gt.is_empty() {
+            [RAW_MISSING, RAW_MISSING]
         } else if let Some(i) = gt.iter().position(|&b| b == b'/' || b == b'|') {
-            (allele_of(&gt[..i]), allele_of(&gt[i + 1..]))
+            let (a0, a1) = (allele_of(&gt[..i]), allele_of(&gt[i + 1..]));
+            if gt[i] == b'/' && a0 != a1 && a0 != RAW_MISSING && a1 != RAW_MISSING {
+                *unphased_het = true;
+            }
+            [a0, a1]
         } else {
-            (allele_of(gt), 0) // haploid — allele in slot 0 (matches read_target_bcf)
+            let a = allele_of(gt);
+            [a, a] // haploid
         };
-        var_gts.push([a0, a1]);
+        var_gts.push(pair);
 
         field_start = if field_end < gt_region.len() { field_end + 1 } else { gt_region.len() };
     }
     var_gts
+}
+
+/// Project raw genotypes onto ALT `k` in place: 1 where the allele is ALT `k`,
+/// 0 for REF or any other ALT (the `bcftools norm -m-` convention for a split
+/// multi-allelic record), [`GT_MISSING`] where missing.
+fn project_alt(gts: &mut [[u8; 2]], k: u8) {
+    for g in gts.iter_mut() {
+        for a in g.iter_mut() {
+            *a = if *a == RAW_MISSING { GT_MISSING } else { (*a == k) as u8 };
+        }
+    }
+}
+
+/// Project raw genotypes onto REF vs any ALT in place (cohort readers, which keep
+/// the first ALT of a multi-allelic record): ALT index >= 1 -> 1, missing ->
+/// [`GT_MISSING`].
+fn project_any_alt(gts: &mut [[u8; 2]]) {
+    for g in gts.iter_mut() {
+        for a in g.iter_mut() {
+            *a = if *a == RAW_MISSING { GT_MISSING } else { (*a).min(1) };
+        }
+    }
+}
+
+/// One imputation-target record as biallelic markers: the record itself, or one
+/// marker per ALT allele for a multi-allelic record (split as `bcftools norm -m-`
+/// does: the genotype of marker k counts ALT k only). Projecting a `0/2` onto
+/// the first ALT used to write a typed het for an allele the person does not carry.
+#[allow(clippy::too_many_arguments)]
+fn push_target_record(
+    chrom: &str, pos: i64, ref_allele: &str, alts: &[&str], mut raw: Vec<[u8; 2]>,
+    hash_alleles: bool, markers: &mut Vec<TargetMarker>, genotypes: &mut Vec<Vec<[u8; 2]>>,
+) {
+    let mut push = |alt: &str, gts: Vec<[u8; 2]>| {
+        let (ref_hash, alt_hash) = if hash_alleles {
+            (crate::srp::blake2b_hex(ref_allele), crate::srp::blake2b_hex(alt))
+        } else {
+            (ref_allele.to_string(), alt.to_string())
+        };
+        markers.push(TargetMarker {
+            chrom: chrom.to_string(), pos,
+            ref_allele: ref_allele.to_string(), alt_allele: alt.to_string(),
+            ref_hash, alt_hash, id: String::new(),
+        });
+        genotypes.push(gts);
+    };
+    if let [alt] = alts {
+        project_alt(&mut raw, 1);
+        push(alt, raw);
+        return;
+    }
+    for (k, alt) in alts.iter().enumerate() {
+        if alt.is_empty() || *alt == "." { continue; }
+        let mut g = raw.clone();
+        project_alt(&mut g, (k + 1).min(254) as u8);
+        push(alt, g);
+    }
+}
+
+/// How many markers [`push_target_record`] makes of a record with these ALT
+/// alleles: one, or one per real ALT of a multi-allelic record. The `--refine`
+/// confidence readers repeat a record's row this many times so that they stay
+/// parallel to the markers.
+fn n_target_markers<'a>(alts: impl ExactSizeIterator<Item = &'a str>) -> usize {
+    if alts.len() <= 1 { 1 } else { alts.filter(|a| !a.is_empty() && *a != ".").count() }
 }
 
 // ---------------------------------------------------------------------------
@@ -332,12 +416,11 @@ pub fn read_cohort_vcf(
 
     let mut markers = Vec::new();
     let mut genotypes: Vec<Vec<[u8; 2]>> = Vec::new();
-    let mut is_phased = true;
-    let mut phase_checks = 10i32;
+    let mut unphased_het = false;
     let mut sample_names: Vec<String> = Vec::new();
     let mut n_multiallelic = 0usize;
 
-    for line in raw.split(|&b| b == b'\n') {
+    for line in text_lines(&raw) {
         if line.is_empty() || line.starts_with(b"##") { continue; }
         if line.starts_with(b"#CHROM") {
             let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
@@ -351,7 +434,7 @@ pub fn read_cohort_vcf(
         let Some(f) = split_vcf_fields(line) else { continue };
         if f.multiallelic { n_multiallelic += 1; }
         // Panel phasing treats the cohort as biallelic (first ALT kept); the GT
-        // binarisation in parse_gt_region collapses higher ALT indices to 1.
+        // projection (project_any_alt) collapses higher ALT indices to 1.
         markers.push(TargetMarker {
             chrom: f.chrom.to_string(), pos: f.pos,
             ref_allele: f.ref_allele.to_string(), alt_allele: f.alt_allele.to_string(),
@@ -361,7 +444,8 @@ pub fn read_cohort_vcf(
         // loop used to carry its own second fold to hom-REF; because a cohort is
         // very often handed over as .vcf.gz, that made the panel no-call fix inert
         // on the most common input format while it worked on .bcf.
-        let gts = parse_gt_region(f.gt_region, sample_names.len(), &mut is_phased, &mut phase_checks);
+        let mut gts = parse_gt_raw(f.gt_region, sample_names.len(), &mut unphased_het);
+        project_any_alt(&mut gts);
         genotypes.push(gts);
     }
 
@@ -372,7 +456,7 @@ pub fn read_cohort_vcf(
     if n_multiallelic > 0 {
         selphi_info!("  WARNING: {} multi-allelic sites — kept first ALT, genotypes binarised (ref vs any-alt). Split multiallelics beforehand for exact handling.", n_multiallelic);
     }
-    (sample_names, markers, genotypes, is_phased)
+    (sample_names, markers, genotypes, !unphased_het)
 }
 
 /// Stream a phased biallelic **VCF/VCF.gz** cohort straight into a row-major
@@ -384,7 +468,7 @@ pub fn read_cohort_vcf(
 /// each variant's alleles directly, so peak memory is just the panel itself
 /// (the floor `build_srp_from_panel` needs). Genotype/phasing semantics are
 /// identical to [`read_cohort_vcf`] — it reuses the same `split_vcf_fields` /
-/// `parse_gt_region` primitives (first ALT kept, missing → 0). BCF sources use
+/// `parse_gt_raw` primitives (first ALT kept, missing → 0). BCF sources use
 /// the native streaming BCF reader instead. Returns
 /// `(sample_names, markers, phased, n_haps, is_phased)`.
 pub fn read_cohort_phased_vcf_stream(
@@ -404,8 +488,7 @@ pub fn read_cohort_phased_vcf_stream(
     let mut markers: Vec<TargetMarker> = Vec::new();
     let mut phased: Vec<u8> = Vec::new();
     let mut n_haps = 0usize;
-    let mut is_phased = true;
-    let mut phase_checks = 10i32;
+    let mut unphased_het = false;
     let mut n_multiallelic = 0usize;
     let mut line: Vec<u8> = Vec::with_capacity(1 << 16);
 
@@ -415,6 +498,7 @@ pub fn read_cohort_phased_vcf_stream(
             .unwrap_or_else(|e| { selphi_error!("Read error on {}: {}", path, e); std::process::exit(1) });
         if n == 0 { break; }
         if line.last() == Some(&b'\n') { line.pop(); }
+        if line.last() == Some(&b'\r') { line.pop(); }
         if line.is_empty() || line.starts_with(b"##") { continue; }
         if line.starts_with(b"#CHROM") {
             let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
@@ -433,7 +517,8 @@ pub fn read_cohort_phased_vcf_stream(
             ref_hash: String::new(), alt_hash: String::new(), id: f.id.to_string(),
         });
         // Same GT binarisation as read_cohort_vcf; fold the missing sentinel to 0.
-        let gts = parse_gt_region(f.gt_region, sample_names.len(), &mut is_phased, &mut phase_checks);
+        let mut gts = parse_gt_raw(f.gt_region, sample_names.len(), &mut unphased_het);
+        project_any_alt(&mut gts);
         phased.reserve(n_haps);
         for g in &gts {
             phased.push(if g[0] > 1 { 0 } else { g[0] });
@@ -448,15 +533,16 @@ pub fn read_cohort_phased_vcf_stream(
     if n_multiallelic > 0 {
         selphi_info!("  WARNING: {} multi-allelic sites — kept first ALT, genotypes binarised (ref vs any-alt). Split multiallelics beforehand for exact handling.", n_multiallelic);
     }
-    (sample_names, markers, phased, n_haps, is_phased)
+    (sample_names, markers, phased, n_haps, !unphased_het)
 }
 
 // ---------------------------------------------------------------------------
 // read_target_vcf
 // ---------------------------------------------------------------------------
 
-/// First-ALT + per-sample diploid `[a0,a1]` GT extraction from a decoded BCF
-/// record set. Shared binary-BCF target reader: a real BCF is BGZF-wrapped
+/// Per-sample diploid `[a0,a1]` GT extraction from a decoded BCF record set:
+/// imputation targets split multi-allelic records per ALT (as the VCF reader does),
+/// cohorts (`capture_id`) keep the first ALT. Shared binary-BCF target reader: a real BCF is BGZF-wrapped
 /// BINARY (magic `BCF\2\2`), which the VCF byte-scanner below cannot read —
 /// it would find zero markers. Uses the same noodles-bcf decoder + dispatch
 /// pattern as the lcWGS PL reader. `hash_alleles` mirrors [`read_target_vcf`].
@@ -479,74 +565,68 @@ fn read_target_bcf(
 
     let mut markers = Vec::new();
     let mut genotypes: Vec<Vec<[u8; 2]>> = Vec::new();
-    let mut is_phased = true;
-    let mut phase_checks = 10i32;
+    let mut unphased_het = false;
     let mut n_multiallelic = 0usize;
+    // Allele index -> raw code of parse_gt_raw (missing = RAW_MISSING, clamped to 254).
+    let code = |p: Option<usize>| p.map(|p| p.min(254) as u8).unwrap_or(RAW_MISSING);
 
     for result in reader.record_bufs(&header) {
         let rec = match result { Ok(r) => r, Err(_) => continue };
         let pos = match rec.variant_start() { Some(p) => usize::from(p) as i64, None => continue };
         if pos < 1 { continue; }
-        if rec.alternate_bases().as_ref().len() > 1 { n_multiallelic += 1; }
-        let alt_allele = match rec.alternate_bases().as_ref().first() {
-            Some(a) if a != "." && !a.is_empty() => a.clone(),
+        let alts: Vec<&str> = rec.alternate_bases().as_ref().iter().map(|a| a.as_str()).collect();
+        match alts.first() {
+            Some(a) if *a != "." && !a.is_empty() => {}
             _ => continue,
-        };
+        }
+        if alts.len() > 1 { n_multiallelic += 1; }
         let chrom = rec.reference_sequence_name().to_string();
         let ref_allele = rec.reference_bases().to_string();
-        // Hash mode matches each text reader: cohort (capture_id) leaves hashes
-        // empty; the imputation readers hash (when the panel uses hashed allele
-        // ids) or store the plain allele otherwise.
-        let (ref_hash, alt_hash) = if capture_id {
-            (String::new(), String::new())
-        } else if hash_alleles {
-            (crate::srp::blake2b_hex(&ref_allele), crate::srp::blake2b_hex(&alt_allele))
-        } else {
-            (ref_allele.clone(), alt_allele.clone())
-        };
-        let id = if capture_id {
-            rec.ids().as_ref().iter().next().cloned().unwrap_or_else(|| ".".to_string())
-        } else {
-            String::new()
-        };
-        markers.push(TargetMarker { chrom, pos, ref_allele, alt_allele, ref_hash, alt_hash, id });
 
-        let mut var_gts = Vec::with_capacity(sample_names.len());
+        let mut raw = Vec::with_capacity(sample_names.len());
         for sample in rec.samples().values() {
-            let (a0, a1, phased) = match sample.get("GT").flatten() {
+            let pair = match sample.get("GT").flatten() {
                 Some(Value::Genotype(gt)) => {
                     let al = gt.as_ref();
-                    // Biallelic projection: any ALT allele index (>=1, incl. multiallelic
-                    // 2+) folds to 1; missing/REF -> 0. Keeps the whole pipeline on the
-                    // 0/1 bitmatrix domain so chip passthrough never emits a GT allele
-                    // index beyond the single output ALT. No-op on biallelic input.
-                    // A present allele projects to {0,1}; a MISSING allele ('.') → GT_MISSING
-                    // (see parse_gt_region) so the pedigree scaffold can skip a missing parent.
-                    // The haploid slot-1 (al.get(1)==None, i.e. no 2nd allele) stays 0, NOT
-                    // missing. extract_target_alleles folds GT_MISSING back to 0 (imputation
-                    // byte-identical).
-                    let a0 = al.first().and_then(|a| a.position())
-                        .map(|p| (p as u8).min(1)).unwrap_or(GT_MISSING);
-                    let a1 = match al.get(1) {
-                        None => 0,
-                        Some(a) => a.position().map(|p| (p as u8).min(1)).unwrap_or(GT_MISSING),
-                    };
-                    // VCF phasing is carried on the allele separators after the
-                    // first; a diploid is phased iff its 2nd allele is Phased.
-                    let phased = al.get(1).map(|a| a.phasing() == Phasing::Phased).unwrap_or(true);
-                    (a0, a1, phased)
+                    let a0 = al.first().map(|a| code(a.position())).unwrap_or(RAW_MISSING);
+                    match al.get(1) {
+                        // Haploid: the homozygote, as in parse_gt_raw.
+                        None => [a0, a0],
+                        Some(a) => {
+                            let a1 = code(a.position());
+                            if a.phasing() != Phasing::Phased && a0 != a1
+                                && a0 != RAW_MISSING && a1 != RAW_MISSING {
+                                unphased_het = true;
+                            }
+                            [a0, a1]
+                        }
+                    }
                 }
-                _ => (GT_MISSING, GT_MISSING, true),
+                _ => [RAW_MISSING, RAW_MISSING],
             };
-            if phase_checks > 0 { if !phased { is_phased = false; } phase_checks -= 1; }
-            var_gts.push([a0, a1]);
+            raw.push(pair);
         }
-        genotypes.push(var_gts);
+        if capture_id {
+            // Cohort (panel phasing): first ALT, REF vs any ALT, variant ID kept.
+            project_any_alt(&mut raw);
+            let id = rec.ids().as_ref().iter().next().cloned().unwrap_or_else(|| ".".to_string());
+            markers.push(TargetMarker {
+                chrom, pos, ref_allele, alt_allele: alts[0].to_string(),
+                ref_hash: String::new(), alt_hash: String::new(), id,
+            });
+            genotypes.push(raw);
+        } else {
+            push_target_record(&chrom, pos, &ref_allele, &alts, raw, hash_alleles, &mut markers, &mut genotypes);
+        }
     }
     if n_multiallelic > 0 {
-        selphi_info!("  WARNING: {} multi-allelic target site(s) — first ALT kept, genotypes biallelic-projected (REF vs any-ALT). Run `bcftools norm -m -any` on target and panel for per-ALT imputation.", n_multiallelic);
+        if capture_id {
+            selphi_info!("  WARNING: {} multi-allelic sites — kept first ALT, genotypes binarised (ref vs any-alt). Split multiallelics beforehand for exact handling.", n_multiallelic);
+        } else {
+            selphi_info!("  {} multi-allelic target record(s) split into one biallelic marker per ALT (bcftools norm -m- convention)", n_multiallelic);
+        }
     }
-    (sample_names, markers, genotypes, is_phased)
+    (sample_names, markers, genotypes, !unphased_het)
 }
 
 /// Read target VCF/BCF using noodles bgzf + manual text parsing (real binary
@@ -574,13 +654,12 @@ pub fn read_target_vcf(
 
     let mut markers = Vec::new();
     let mut genotypes: Vec<Vec<[u8; 2]>> = Vec::new();
-    let mut is_phased = true;
-    let mut phase_checks = 10i32;
+    let mut unphased_het = false;
     let mut sample_names: Vec<String> = Vec::new();
     let mut n_multiallelic = 0usize;
 
     // Parse from byte buffer — zero per-line allocations
-    for line in raw.split(|&b| b == b'\n') {
+    for line in text_lines(&raw) {
         if line.is_empty() || line.starts_with(b"##") { continue; }
         if line.starts_with(b"#CHROM") {
             let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
@@ -593,18 +672,14 @@ pub fn read_target_vcf(
         }
 
         let Some(f) = split_vcf_fields(line) else { continue };
-        if f.multiallelic { n_multiallelic += 1; }
-        let (ref_hash, alt_hash) = if hash_alleles {
-            (crate::srp::blake2b_hex(f.ref_allele), crate::srp::blake2b_hex(f.alt_allele))
+        let raw_gt = parse_gt_raw(f.gt_region, sample_names.len(), &mut unphased_het);
+        if f.multiallelic {
+            n_multiallelic += 1;
+            let alts: Vec<&str> = f.alts.split(',').collect();
+            push_target_record(f.chrom, f.pos, f.ref_allele, &alts, raw_gt, hash_alleles, &mut markers, &mut genotypes);
         } else {
-            (f.ref_allele.to_string(), f.alt_allele.to_string())
-        };
-        markers.push(TargetMarker {
-            chrom: f.chrom.to_string(), pos: f.pos,
-            ref_allele: f.ref_allele.to_string(), alt_allele: f.alt_allele.to_string(),
-            ref_hash, alt_hash, id: String::new(),
-        });
-        genotypes.push(parse_gt_region(f.gt_region, sample_names.len(), &mut is_phased, &mut phase_checks));
+            push_target_record(f.chrom, f.pos, f.ref_allele, &[f.alt_allele], raw_gt, hash_alleles, &mut markers, &mut genotypes);
+        }
     }
 
     if sample_names.is_empty() {
@@ -612,10 +687,10 @@ pub fn read_target_vcf(
         std::process::exit(1);
     }
     if n_multiallelic > 0 {
-        selphi_info!("  WARNING: {} multi-allelic target site(s) — first ALT kept, genotypes biallelic-projected (REF vs any-ALT). Run `bcftools norm -m -any` on target and panel for per-ALT imputation.", n_multiallelic);
+        selphi_info!("  {} multi-allelic target record(s) split into one biallelic marker per ALT (bcftools norm -m- convention)", n_multiallelic);
     }
 
-    (sample_names, markers, genotypes, is_phased)
+    (sample_names, markers, genotypes, !unphased_het)
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,7 +1086,7 @@ fn vcf_format_bytes(line: &[u8]) -> Option<&[u8]> {
 /// usable GQ/PL/DP yield 1.0 (untouched).
 ///
 /// Returns one f64 per marker (file order, parallel to `read_target_vcf`'s
-/// `markers`). The hard-call path (`read_target_vcf` / `parse_gt_region`) is
+/// `markers`). The hard-call path (`read_target_vcf` / `parse_gt_raw`) is
 /// NOT touched — this is an additive, opt-in pass.
 pub fn extract_target_site_confidence(path: &str) -> Vec<f64> {
     let (gq_lo, gq_hi) = refine_gq_endpoints();
@@ -1027,20 +1102,21 @@ pub fn extract_target_site_confidence(path: &str) -> Vec<f64> {
 
     let mut conf: Vec<f64> = Vec::new();
     let mut n_samples = 0usize;
-    for line in raw.split(|&b| b == b'\n') {
+    for line in text_lines(&raw) {
         if line.is_empty() || line.starts_with(b"##") { continue; }
         if line.starts_with(b"#CHROM") {
             let n_tabs = line.iter().filter(|&&b| b == b'\t').count();
             n_samples = n_tabs.saturating_sub(8); // 9 fixed cols → tabs 1..8 before samples
             continue;
         }
-        // Identical retention rule to read_target_vcf.
+        // Identical retention rule to read_target_vcf, one row per marker it makes.
         let Some(f) = split_vcf_fields(line) else { continue };
         let c = match vcf_format_bytes(line) {
             Some(fmt) => line_min_confidence(fmt, f.gt_region, n_samples, gq_lo, gq_hi),
             None => 1.0,
         };
-        conf.push(c);
+        let k = if f.multiallelic { n_target_markers(f.alts.split(',').collect::<Vec<_>>().into_iter()) } else { 1 };
+        conf.extend(std::iter::repeat_n(c, k));
     }
     conf
 }
@@ -1109,7 +1185,8 @@ fn extract_site_confidence_bcf(path: &str, gq_lo: f64, gq_hi: f64) -> Vec<f64> {
             let c = sample_confidence(gt_missing, gq, pl, dp, gq_lo, gq_hi);
             if c < min_c { min_c = c; }
         }
-        conf.push(if any_field && min_c.is_finite() { min_c } else { 1.0 });
+        let k = n_target_markers(rec.alternate_bases().as_ref().iter().map(|a| a.as_str()));
+        conf.extend(std::iter::repeat_n(if any_field && min_c.is_finite() { min_c } else { 1.0 }, k));
     }
     conf
 }
@@ -1134,7 +1211,7 @@ pub fn extract_target_site_confidence_per_sample(path: &str) -> (Vec<f64>, usize
 
     let mut conf: Vec<f64> = Vec::new();
     let mut n_samples = 0usize;
-    for line in raw.split(|&b| b == b'\n') {
+    for line in text_lines(&raw) {
         if line.is_empty() || line.starts_with(b"##") { continue; }
         if line.starts_with(b"#CHROM") {
             let n_tabs = line.iter().filter(|&&b| b == b'\t').count();
@@ -1142,10 +1219,14 @@ pub fn extract_target_site_confidence_per_sample(path: &str) -> (Vec<f64>, usize
             continue;
         }
         let Some(f) = split_vcf_fields(line) else { continue };
+        let row = conf.len();
         match vcf_format_bytes(line) {
             Some(fmt) => line_per_sample_confidence(fmt, f.gt_region, n_samples, gq_lo, gq_hi, &mut conf),
             None => conf.extend(std::iter::repeat_n(1.0f64, n_samples)),
         }
+        // One row per marker read_target_vcf makes of this record.
+        let k = if f.multiallelic { n_target_markers(f.alts.split(',').collect::<Vec<_>>().into_iter()) } else { 1 };
+        for _ in 1..k { conf.extend_from_within(row..row + n_samples); }
     }
     (conf, n_samples)
 }
@@ -1179,6 +1260,7 @@ fn extract_site_confidence_per_sample_bcf(path: &str, gq_lo: f64, gq_hi: f64) ->
         if !keep { continue; }
 
         let samples = rec.samples();
+        let row = conf.len();
         let mut row_n = 0usize;
         for sample in samples.values() {
             let gq = sample.get("GQ").flatten().and_then(int_val);
@@ -1198,6 +1280,9 @@ fn extract_site_confidence_per_sample_bcf(path: &str, gq_lo: f64, gq_hi: f64) ->
             conf.push(sample_confidence(gt_missing, gq, pl, dp, gq_lo, gq_hi));
             row_n += 1;
         }
+        // One row per marker read_target_bcf makes of this record.
+        let k = n_target_markers(rec.alternate_bases().as_ref().iter().map(|a| a.as_str()));
+        for _ in 1..k { conf.extend_from_within(row..row + row_n); }
         if row_n > n_samples { n_samples = row_n; }
     }
     (conf, n_samples)
@@ -1297,9 +1382,75 @@ pub fn extract_target_alleles(
     out
 }
 
+/// Drop the matched sites at which every sample is a no-call (any allele `.`)
+/// from the chip set of an IMPUTATION run; returns their panel indices (in
+/// `wgs_idx` order), which the writers still treat as input sites (no `IMP`).
+///
+/// Such a site carries no information, so it must give the result an absent
+/// record gives: an untyped panel site, imputed. Kept as a chip site it did
+/// worse than that, because the allele the phasing fills in for the no-call
+/// steers the imputation's PBWT candidate selection (a single user with 300
+/// no-calls at common panel SNPs lost 0.011 per-sample R2 on chr22, 9 of 9
+/// runs; 0.012-0.015 still with the PBWT following panel matches through
+/// no-calls). The passthrough must still see the record as matched, so callers
+/// keep the pre-drop index list for it. When no site is called at all nothing
+/// is dropped: the chromosome is then imputed from no anchors, every typed
+/// record re-routed as a no-call, rather than lost. SELPHI_KEEP_UNCALLED_SITES=1
+/// keeps them (A/B).
+pub fn drop_uncalled_sites(
+    genotypes: &[Vec<[u8; 2]>], wgs_idx: &mut Vec<usize>, target_idx: &mut Vec<usize>,
+    transforms: &mut Vec<u8>,
+) -> Vec<usize> {
+    if crate::config::is_one("SELPHI_KEEP_UNCALLED_SITES") { return Vec::new(); }
+    let called = |ti: usize| genotypes[ti].iter().any(|g| g[0] < GT_MISSING && g[1] < GT_MISSING);
+    let keep: Vec<bool> = target_idx.iter().map(|&ti| called(ti)).collect();
+    if keep.iter().all(|&k| k) || !keep.iter().any(|&k| k) { return Vec::new(); }
+    let dropped: Vec<usize> = wgs_idx.iter().zip(&keep).filter(|&(_, &k)| !k).map(|(&w, _)| w).collect();
+    let mut k = keep.iter();
+    wgs_idx.retain(|_| *k.next().unwrap());
+    let mut k = keep.iter();
+    target_idx.retain(|_| *k.next().unwrap());
+    if !transforms.is_empty() {
+        let mut k = keep.iter();
+        transforms.retain(|_| *k.next().unwrap());
+    }
+    dropped
+}
+
 // ---------------------------------------------------------------------------
 // intersect_variants
 // ---------------------------------------------------------------------------
+
+/// Keeps the FIRST target record that matches each panel variant. Two target
+/// records with one key (a duplicated probe), or a record reconciled onto a
+/// panel variant another record already matched, used to both enter the run
+/// and the last one's call won silently; `bcftools norm -d none` keeps the
+/// first, and so does this. The targets are walked in position order (input
+/// order within a position), so the panel variants taken at the current
+/// position are all it needs to remember.
+#[derive(Default)]
+struct DuplicateGuard {
+    pos: i64,
+    taken: Vec<usize>,
+    n_dropped: usize,
+}
+
+impl DuplicateGuard {
+    /// True when panel variant `rj` (at `pos`) is not yet matched; records it.
+    fn first(&mut self, pos: i64, rj: usize) -> bool {
+        if pos != self.pos { self.pos = pos; self.taken.clear(); }
+        if self.taken.contains(&rj) { self.n_dropped += 1; return false; }
+        self.taken.push(rj);
+        true
+    }
+
+    fn report(&self, chrom: &str) {
+        if self.n_dropped > 0 {
+            selphi_info!("  WARNING [{}]: {} target record(s) matched a panel variant an earlier record already matched; the first record kept",
+                chrom, self.n_dropped);
+        }
+    }
+}
 
 /// Intersect target markers with reference panel variants.
 ///
@@ -1337,6 +1488,7 @@ pub fn intersect_variants(
     let mut n_plain_matches = 0usize;
     let mut n_swap = 0usize;
     let mut n_strand = 0usize;
+    let mut dups = DuplicateGuard::default();
 
     for &ti in &tgt_order {
         let tpos = targets[ti].pos;
@@ -1355,11 +1507,13 @@ pub fn intersect_variants(
                 && srp.variants[rj].ref_allele == targets[ti].ref_allele
                 && srp.variants[rj].alt_allele == targets[ti].alt_allele;
             if hash_match || plain_match {
-                wgs_idx.push(rj);
-                target_idx.push(ti);
-                transforms.push(0);
-                if hash_match { n_hash_matches += 1; } else { n_plain_matches += 1; }
                 matched = true;
+                if dups.first(tpos, rj) {
+                    wgs_idx.push(rj);
+                    target_idx.push(ti);
+                    transforms.push(0);
+                    if hash_match { n_hash_matches += 1; } else { n_plain_matches += 1; }
+                }
                 break;
             }
             rj += 1;
@@ -1371,7 +1525,8 @@ pub fn intersect_variants(
                 &targets[ti].ref_hash, &targets[ti].alt_hash,
                 &targets[ti].ref_allele, &targets[ti].alt_allele,
                 hash_alleles, mode,
-            ) {
+            )
+            && dups.first(tpos, hit.rj) {
                 wgs_idx.push(hit.rj);
                 target_idx.push(ti);
                 transforms.push(hit.transform);
@@ -1386,6 +1541,7 @@ pub fn intersect_variants(
         selphi_info!("  --allele-match: reconciled {} swap, {} strand site(s) (recoded to panel orientation)",
             n_swap, n_strand);
     }
+    dups.report(ref_chrom);
 
     // wgs_idx is monotone EXCEPT at multiallelic-split duplicate positions, where the
     // target's ALT order can differ from the panel's split-record order, producing a
@@ -1442,12 +1598,11 @@ pub fn read_target_vcf_multi_chr(
 
     let mut all_markers: Vec<TargetMarker> = Vec::new();
     let mut all_genotypes: Vec<Vec<[u8; 2]>> = Vec::new();
-    let mut is_phased = true;
-    let mut phase_checks = 10i32;
+    let mut unphased_het = false;
     let mut sample_names: Vec<String> = Vec::new();
     let mut n_multiallelic = 0usize;
 
-    for line in raw.split(|&b| b == b'\n') {
+    for line in text_lines(&raw) {
         if line.is_empty() || line.starts_with(b"##") { continue; }
         if line.starts_with(b"#CHROM") {
             let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
@@ -1460,14 +1615,14 @@ pub fn read_target_vcf_multi_chr(
         }
 
         let Some(f) = split_vcf_fields(line) else { continue };
-        if f.multiallelic { n_multiallelic += 1; }
-        all_markers.push(TargetMarker {
-            chrom: f.chrom.to_string(), pos: f.pos,
-            ref_allele: f.ref_allele.to_string(), alt_allele: f.alt_allele.to_string(),
-            ref_hash: f.ref_allele.to_string(), alt_hash: f.alt_allele.to_string(),
-            id: String::new(),
-        });
-        all_genotypes.push(parse_gt_region(f.gt_region, sample_names.len(), &mut is_phased, &mut phase_checks));
+        let raw_gt = parse_gt_raw(f.gt_region, sample_names.len(), &mut unphased_het);
+        if f.multiallelic {
+            n_multiallelic += 1;
+            let alts: Vec<&str> = f.alts.split(',').collect();
+            push_target_record(f.chrom, f.pos, f.ref_allele, &alts, raw_gt, false, &mut all_markers, &mut all_genotypes);
+        } else {
+            push_target_record(f.chrom, f.pos, f.ref_allele, &[f.alt_allele], raw_gt, false, &mut all_markers, &mut all_genotypes);
+        }
     }
 
     // Partition by chromosome
@@ -1481,10 +1636,10 @@ pub fn read_target_vcf_multi_chr(
     }
 
     if n_multiallelic > 0 {
-        selphi_info!("  WARNING: {} multi-allelic target site(s) — first ALT kept, genotypes biallelic-projected (REF vs any-ALT). Run `bcftools norm -m -any` on target and panel for per-ALT imputation.", n_multiallelic);
+        selphi_info!("  {} multi-allelic target record(s) split into one biallelic marker per ALT (bcftools norm -m- convention)", n_multiallelic);
     }
 
-    (sample_names, by_chr, is_phased)
+    (sample_names, by_chr, !unphased_het)
 }
 
 fn strip_chr_prefix(s: &str) -> &str {
@@ -1538,6 +1693,7 @@ pub fn intersect_variants_for_chr(
     let mut ri = 0usize;
     let mut n_swap = 0usize;
     let mut n_strand = 0usize;
+    let mut dups = DuplicateGuard::default();
 
     for &ti in &tgt_order {
         let tpos = targets_ref[ti].pos;
@@ -1547,10 +1703,12 @@ pub fn intersect_variants_for_chr(
         while rj < ref_variants.len() && ref_variants[rj].pos == tpos {
             if ref_variants[rj].ref_allele == targets_ref[ti].ref_hash
                 && ref_variants[rj].alt_allele == targets_ref[ti].alt_hash {
-                wgs_idx.push(rj);
-                target_idx.push(ti);
-                transforms.push(0);
                 matched = true;
+                if dups.first(tpos, rj) {
+                    wgs_idx.push(rj);
+                    target_idx.push(ti);
+                    transforms.push(0);
+                }
                 break;
             }
             rj += 1;
@@ -1561,7 +1719,8 @@ pub fn intersect_variants_for_chr(
                 &targets_ref[ti].ref_hash, &targets_ref[ti].alt_hash,
                 &targets_ref[ti].ref_allele, &targets_ref[ti].alt_allele,
                 hash_alleles, mode,
-            ) {
+            )
+            && dups.first(tpos, hit.rj) {
                 wgs_idx.push(hit.rj);
                 target_idx.push(ti);
                 transforms.push(hit.transform);
@@ -1572,6 +1731,7 @@ pub fn intersect_variants_for_chr(
         selphi_info!("  --allele-match [{}]: reconciled {} swap, {} strand site(s)",
             ref_chrom, n_swap, n_strand);
     }
+    dups.report(ref_chrom);
 
     // Same monotonicity guarantee as intersect_variants: multiallelic-split duplicate
     // positions can produce a locally descending wgs_idx pair (target ALT order != panel
@@ -1650,6 +1810,73 @@ mod allele_match_tests {
         let panel = [v(100, "A", "T")];
         let hit = reconcile_ladder(&panel, 0, 100, "T", "A", "T", "A", false, AlleleMatch::Full);
         assert!(hit.is_none());
+    }
+
+    #[test]
+    fn indel_mirror_is_not_a_swap() {
+        // Panel deletion AT>A; a target insertion A>AT at the same position is another
+        // variant, not the deletion with its labels swapped.
+        let panel = [v(100, "AT", "A")];
+        assert!(reconcile_ladder(&panel, 0, 100, "A", "AT", "A", "AT", false, AlleleMatch::Full).is_none());
+        // An equal-length substitution still swaps.
+        let panel = [v(100, "AC", "GT")];
+        assert!(reconcile_ladder(&panel, 0, 100, "GT", "AC", "GT", "AC", false, AlleleMatch::Swap).is_some());
+    }
+
+    #[test]
+    fn duplicate_records_keep_the_first() {
+        let mut d = DuplicateGuard::default();
+        assert!(d.first(100, 7));
+        assert!(d.first(100, 8));   // another panel variant at the same position
+        assert!(!d.first(100, 7));  // the same panel variant again
+        assert!(d.first(101, 7));   // a new position starts afresh
+        assert_eq!(d.n_dropped, 1);
+    }
+
+    #[test]
+    fn gt_parsing_haploid_phase_and_split() {
+        let mut unph = false;
+        // haploid ALT, haploid REF, phased het, unphased hom, missing
+        let raw = parse_gt_raw(b"1\t0:5\t0|1\t1/1\t./.", 5, &mut unph);
+        assert_eq!(raw, vec![[1, 1], [0, 0], [0, 1], [1, 1], [RAW_MISSING, RAW_MISSING]]);
+        assert!(!unph, "no het is written with '/'");
+        let raw = parse_gt_raw(b"1/0\t0|0", 2, &mut unph);
+        assert_eq!(raw, vec![[1, 0], [0, 0]]);
+        assert!(unph, "an unphased het asks for phasing");
+        // half-missing is not a het
+        let mut unph2 = false;
+        parse_gt_raw(b"./1", 1, &mut unph2);
+        assert!(!unph2);
+        // multi-allelic split: 0/2 carries ALT 2 only; 1/2 one copy of each
+        let raw = parse_gt_raw(b"0/2\t1|2\t2\t.", 4, &mut unph);
+        let mut a1 = raw.clone(); project_alt(&mut a1, 1);
+        let mut a2 = raw.clone(); project_alt(&mut a2, 2);
+        assert_eq!(a1, vec![[0, 0], [1, 0], [0, 0], [GT_MISSING, GT_MISSING]]);
+        assert_eq!(a2, vec![[0, 1], [0, 1], [1, 1], [GT_MISSING, GT_MISSING]]);
+        let mut any = raw; project_any_alt(&mut any);
+        assert_eq!(any, vec![[0, 1], [1, 1], [1, 1], [GT_MISSING, GT_MISSING]]);
+    }
+
+    #[test]
+    fn crlf_lines_are_trimmed() {
+        let raw = b"#CHROM\tPOS\r\n22\t1\r\n22\t2\n";
+        let lines: Vec<&[u8]> = text_lines(raw).collect();
+        assert_eq!(lines, vec![&b"#CHROM\tPOS"[..], b"22\t1", b"22\t2", b""]);
+    }
+
+    #[test]
+    fn split_markers_and_confidence_rows_agree() {
+        let line = b"22\t100\t.\tC\tT,G\t.\t.\t.\tGT\t0/2";
+        let f = split_vcf_fields(line).unwrap();
+        let mut unph = false;
+        let raw = parse_gt_raw(f.gt_region, 1, &mut unph);
+        let (mut m, mut g) = (Vec::new(), Vec::new());
+        let alts: Vec<&str> = f.alts.split(',').collect();
+        push_target_record(f.chrom, f.pos, f.ref_allele, &alts, raw, false, &mut m, &mut g);
+        assert_eq!(m.iter().map(|x| x.alt_allele.as_str()).collect::<Vec<_>>(), vec!["T", "G"]);
+        assert_eq!(g, vec![vec![[0, 0]], vec![[0, 1]]]);
+        assert_eq!(n_target_markers(alts.into_iter()), m.len());
+        assert_eq!(n_target_markers(["A"].into_iter()), 1);
     }
 
     #[test]

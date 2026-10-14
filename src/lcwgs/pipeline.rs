@@ -56,11 +56,11 @@ pub struct LcwgsOutput {
     pub n_variants: usize,
     /// Sample IDs from target VCF.
     pub sample_ids: Vec<String>,
-    /// Per-shared-variant identity `(chrom, pos, ref, alt)` in dosage-row
-    /// order (shared-panel genomic order). Lets the output/eval match dose
-    /// rows to truth by position — the dose rows are NOT in target-VCF order
-    /// when some target variants don't intersect the panel.
-    pub variants: Vec<(String, i64, String, String)>,
+    /// Panel variant index of each dosage row (shared-panel genomic order): the
+    /// writers read the row's identity from the SRP, so the dose rows match
+    /// truth by panel identity — they are NOT in target-VCF order when some
+    /// target variants don't intersect the panel.
+    pub panel_idx: Vec<usize>,
 }
 
 /// Top-level lcWGS pipeline. Inputs are file paths to keep the surface
@@ -91,7 +91,7 @@ pub fn run_lcwgs(
         let first_ref = &srp.variants[0].ref_allele;
         !srp.ids[0].contains(first_ref)
     };
-    let PlVcfResult { gl3: gl3_input, markers, sample_ids } =
+    let PlVcfResult { gl3: gl3_input, markers, sample_ids, haploid_samples: pl_haploid } =
         parse_pl_vcf(target_vcf, hash_alleles)?;
     memtrace("after parse_pl_vcf (+gl3_input)");
     let n_samples = sample_ids.len();
@@ -139,7 +139,7 @@ pub fn run_lcwgs(
     memtrace("after gl3_shared relayout (gl3_input dropped)");
 
     // --- 5. cM map + chunked Gibbs imputation (shared with the BAM path) ---
-    impute_from_gl3(srp, &wgs_idx, gl3_shared, n_samples, sample_ids, map_path, params)
+    impute_from_gl3(srp, &wgs_idx, gl3_shared, n_samples, sample_ids, &pl_haploid, map_path, params)
 }
 
 /// Shared imputation tail for both lcWGS paths (VCF-PL and BAM): given `gl3` in
@@ -153,20 +153,24 @@ pub fn run_lcwgs(
 fn impute_from_gl3(
     srp: &SrpReader,
     wgs_idx: &[usize],
-    gl3_shared: Vec<f32>,
+    mut gl3_shared: Vec<f32>,
     n_samples: usize,
     sample_ids: Vec<String>,
+    pl_haploid: &[bool],
     map_path: &str,
     params: &LcwgsParams,
 ) -> std::io::Result<LcwgsOutput> {
     let n_shared = wgs_idx.len();
-    let (map_bp, map_cm) = genmap::load_genetic_map_raw(std::path::Path::new(map_path))?;
+    // The coverage proxy of the SPLIT gate and the adaptive GL floor, read from the
+    // likelihoods as given: a man's product-form chrX rows look more confident than
+    // his reads are, which would switch the split off on his chrX alone.
+    let mean_conf = gl_mean_conf(&gl3_shared, n_samples, n_shared);
+    let haploid = haploid_chrx(&mut gl3_shared, srp, wgs_idx, n_samples, &sample_ids, pl_haploid, params);
+    let (map_bp, map_cm) = genmap::load_genetic_map_for(std::path::Path::new(map_path), Some(srp.chromosome()))?;
+    // Beyond the map's ends: the chromosome's mean rate, GLIMPSE2's convention,
+    // which this engine is calibrated and benchmarked against.
     let cm: Vec<f64> = wgs_idx.iter().map(|&wi| {
-        genmap::interpolate_cm_extrapolate(&map_bp, &map_cm, srp.variants[wi].pos)
-    }).collect();
-    let variants: Vec<(String, i64, String, String)> = wgs_idx.iter().map(|&wi| {
-        let v = &srp.variants[wi];
-        (v.chr.clone(), v.pos, v.ref_allele.clone(), v.alt_allele.clone())
+        genmap::interpolate_cm_mean_rate(&map_bp, &map_cm, srp.variants[wi].pos)
     }).collect();
 
     if crate::config::present("LCWGS_RAW_GL") {
@@ -178,7 +182,7 @@ fn impute_from_gl3(
             }
         }
         let gp = vec![1.0f32 / 3.0; n_shared * n_samples * 3];
-        return Ok(LcwgsOutput { dosage: raw, gp, n_variants: n_shared, sample_ids, variants });
+        return Ok(LcwgsOutput { dosage: raw, gp, n_variants: n_shared, sample_ids, panel_idx: wgs_idx.to_vec() });
     }
 
     // Adaptive conditioning depth (chip/WGS auto-max-candidates concept): on a big
@@ -213,16 +217,6 @@ fn impute_from_gl3(
     if crate::config::present("LCWGS_ADAPT_MIN_GL") && !crate::config::present("LCWGS_MIN_GL") {
         let thr: f32 = crate::config::raw("LCWGS_SPLIT_GL_THR").and_then(|x| x.parse().ok()).unwrap_or(0.84);
         let hi: f32 = crate::config::raw("LCWGS_ADAPT_MIN_GL_HI").and_then(|x| x.parse().ok()).unwrap_or(1e-2);
-        let (mut sum, mut cnt) = (0.0f64, 0usize);
-        for v in 0..n_shared {
-            let b = v * n_samples * 3;
-            for s in 0..n_samples {
-                let (g0, g1, g2) = (gl3_shared[b + 3 * s], gl3_shared[b + 3 * s + 1], gl3_shared[b + 3 * s + 2]);
-                let t = g0 + g1 + g2;
-                if t > 0.0 { sum += (g0.max(g1).max(g2) / t) as f64; cnt += 1; }
-            }
-        }
-        let mean_conf = if cnt > 0 { (sum / cnt as f64) as f32 } else { 1.0 };
         if mean_conf >= thr && (hi - eff.min_gl).abs() > f32::EPSILON {
             crate::selphi_info!("  adaptive min_gl: {} → {} (mean_conf={:.3} ≥ {:.2}, high coverage — clamp false-HETs)", eff.min_gl, hi, mean_conf, thr);
             eff.min_gl = hi;
@@ -233,8 +227,148 @@ fn impute_from_gl3(
     }
     let params: &LcwgsParams = if modified { &eff } else { params };
 
-    let (dosage, gp) = run_chunked_gibbs(&gl3_shared, srp, wgs_idx, &cm, n_samples, n_shared, params);
-    Ok(LcwgsOutput { dosage, gp, n_variants: n_shared, sample_ids, variants })
+    let (dosage, mut gp) = run_chunked_gibbs(&gl3_shared, srp, wgs_idx, &cm, n_samples, n_shared, params, mean_conf);
+    if let Some(cells) = &haploid { haploid_gp(cells, &dosage, &mut gp, n_samples); }
+    Ok(LcwgsOutput { dosage, gp, n_variants: n_shared, sample_ids, panel_idx: wgs_idx.to_vec() })
+}
+
+/// The sex test reads panel allele frequencies over up to `SEX_TEST_BLOCKS` blocks of
+/// `SEX_TEST_SITES` consecutive non-PAR sites spread along the chromosome (contiguous
+/// blocks decompress few panel tiles), and needs a log-likelihood margin (natural log)
+/// of `SEX_LLR_MARGIN` to call a sample haploid. One 20k block gave about +-9 at 1x.
+const SEX_TEST_SITES: usize = 20_000;
+/// Fewest non-PAR sites the sex test runs on.
+const SEX_TEST_MIN_SITES: usize = 1_000;
+const SEX_TEST_BLOCKS: usize = 5;
+const SEX_LLR_MARGIN: f64 = 10.0;
+
+/// The `(sample, site)` cells modelled as haploid: chrX males outside the PARs.
+struct HaploidCells { sample: Vec<bool>, site: Vec<bool> }
+
+/// chrX males are haploid outside the pseudo-autosomal regions. The Gibbs sampler
+/// is diploid and draws each haplotype from `(GL[ca], GL[ca+1])` given its
+/// partner's allele `ca`; a man's row is therefore rewritten in product form,
+/// `GL(a,b) ∝ h_a·h_b` with `h = (GL0, GL2)` the read likelihood of his one
+/// allele, which makes that draw `∝ (h0, h1)` whatever the partner carries: each
+/// haplotype becomes an independent draw of the same haploid posterior (reads and
+/// panel), and a read-less row stays exactly flat. Zeroing the heterozygote instead
+/// forces each haplotype to copy its partner, freezing the chain at its start.
+/// The output genotype posteriors of those cells are then haploid (see
+/// [`haploid_gp`]). Without any of it a man's non-PAR X received heterozygous calls
+/// (22% of his non-reference calls on a simulated 1x chrX).
+///
+/// A sample whose `PL` came as haploid pairs (`pl_haploid`, its rows already in
+/// product form) is haploid there as called. Other males come from `--haploids`,
+/// else from a likelihood-ratio test over blocks of
+/// consecutive non-PAR sites: with the panel frequency `p` of each,
+/// a haploid sample's reads have likelihood `(1-p)GL0 + p GL2` and a diploid's
+/// `(1-p)^2 GL0 + 2p(1-p) GL1 + p^2 GL2`; the summed log ratio must favour haploid
+/// by more than `SEX_LLR_MARGIN`. A site seen in one read is neutral; reads of both
+/// alleles at common sites decide it (a man shows them only through read errors).
+fn haploid_chrx(
+    gl3: &mut [f32], srp: &SrpReader, wgs_idx: &[usize], n_samples: usize,
+    sample_ids: &[String], pl_haploid: &[bool], params: &LcwgsParams,
+) -> Option<HaploidCells> {
+    if !crate::contig::is_chrx(srp.chromosome()) || wgs_idx.is_empty() { return None; }
+    let build = params.build.unwrap_or_else(|| {
+        let max_pos = srp.variants.iter().map(|v| v.pos).max().unwrap_or(0);
+        let b = crate::contig::infer_build_from_chrx_maxpos(max_pos);
+        crate::selphi_info!("  chrX PAR: inferred build {:?} from chrX max pos {} (use --build to override)", b, max_pos);
+        b
+    });
+    let non_par: Vec<bool> = wgs_idx.iter()
+        .map(|&wi| !(params.chrx_par && crate::contig::in_chrx_par(srp.variants[wi].pos, build))).collect();
+    let n_v = wgs_idx.len();
+    let called = |s: usize| pl_haploid.get(s).copied().unwrap_or(false);
+    let mut haploid: Vec<bool> = match &params.haploids {
+        Some(names) => sample_ids.iter().map(|s| names.iter().any(|n| n == s)).collect(),
+        None => {
+            let np: Vec<usize> = (0..n_v).filter(|&v| non_par[v]).collect();
+            if np.len() < SEX_TEST_MIN_SITES {
+                crate::selphi_info!("  chrX: sex test skipped ({} non-PAR sites, needs {}): samples are diploid outside the PARs unless called haploid or listed with --haploids",
+                    np.len(), SEX_TEST_MIN_SITES);
+                vec![false; n_samples]
+            } else {
+                let k = SEX_TEST_SITES.min(np.len());
+                let n_blocks = SEX_TEST_BLOCKS.min(np.len() / k).max(1);
+                let n_ref = srp.n_haps().max(1);
+                let mut llr = vec![0.0f64; n_samples];
+                for bi in 0..n_blocks {
+                    // Block starts evenly spaced over the non-PAR sites.
+                    let start = if n_blocks == 1 { (np.len() - k) / 2 } else { bi * (np.len() - k) / (n_blocks - 1) };
+                    let block = &np[start..start + k];
+                    let sites: Vec<usize> = block.iter().map(|&v| wgs_idx[v]).collect();
+                    let bm = srp.extract_ref_alleles_bitmatrix(&sites);
+                    for (r, &v) in block.iter().enumerate() {
+                        let p = (bm.popcount_row(r, n_ref) as f64 / n_ref as f64).clamp(1e-3, 1.0 - 1e-3);
+                        let q = 1.0 - p;
+                        for (s, l) in llr.iter_mut().enumerate() {
+                            let b = v * n_samples * 3 + 3 * s;
+                            let (g0, g1, g2) = (gl3[b] as f64, gl3[b + 1] as f64, gl3[b + 2] as f64);
+                            let hap = q * g0 + p * g2;
+                            let dip = q * q * g0 + 2.0 * p * q * g1 + p * p * g2;
+                            if hap > 0.0 && dip > 0.0 { *l += (hap / dip).ln(); }
+                        }
+                    }
+                }
+                (0..n_samples).map(|s| {
+                    crate::selphi_debug!("  chrX sex test: sample {} log-likelihood ratio haploid/diploid {:.1} ({} sites)",
+                        sample_ids[s], llr[s], n_blocks * k);
+                    llr[s] > SEX_LLR_MARGIN
+                }).collect()
+            }
+        }
+    };
+    let n_called = (0..n_samples).filter(|&s| called(s)).count();
+    for (s, h) in haploid.iter_mut().enumerate() { *h |= called(s); }
+    let n_hap = haploid.iter().filter(|&&h| h).count();
+    if n_hap == 0 { return None; }
+    // h is floored at 1e-12 (after normalising) so its square stays a normal f32:
+    // a zero h0 would make the REF-partner draw (0, 0), i.e. flat, losing the reads.
+    // The sampler's own floor (min_gl) is far above it, so nothing else changes.
+    // A called-haploid sample's rows are already in product form.
+    for v in (0..n_v).filter(|&v| non_par[v]) {
+        for s in (0..n_samples).filter(|&s| haploid[s] && !called(s)) {
+            let b = v * n_samples * 3 + 3 * s;
+            let sum = gl3[b] + gl3[b + 2];
+            let (h0, h1) = if sum > 0.0 { (gl3[b] / sum, gl3[b + 2] / sum) } else { (0.5, 0.5) };
+            let (h0, h1) = (h0.max(1e-12), h1.max(1e-12));
+            let (p0, p1, p2) = (h0 * h0, h0 * h1, h1 * h1);
+            let z = p0 + p1 + p2;
+            gl3[b] = p0 / z;
+            gl3[b + 1] = p1 / z;
+            gl3[b + 2] = p2 / z;
+        }
+    }
+    crate::selphi_info!("  chrX: {} haploid sample(s) ({} called haploid in the input, {} from {}): one allele outside the PARs",
+        n_hap, n_called, n_hap - n_called, if params.haploids.is_some() { "--haploids" } else { "the likelihood-ratio test" });
+    Some(HaploidCells { sample: haploid, site: non_par })
+}
+
+/// Haploid genotype posteriors for the cells of [`haploid_chrx`]: the two
+/// haplotypes are draws of one allele, so `p = DS/2` and GP = `(1-p, 0, p)`.
+fn haploid_gp(cells: &HaploidCells, dosage: &[f32], gp: &mut [f32], n_samples: usize) {
+    for (v, _) in cells.site.iter().enumerate().filter(|&(_, &np)| np) {
+        for s in (0..n_samples).filter(|&s| cells.sample[s]) {
+            let i = v * n_samples + s;
+            let p = (dosage[i] * 0.5).clamp(0.0, 1.0);
+            gp[3 * i] = 1.0 - p;
+            gp[3 * i + 1] = 0.0;
+            gp[3 * i + 2] = p;
+        }
+    }
+}
+
+/// Mean over (site, sample) of the largest normalised genotype likelihood: the
+/// coverage proxy (0.5x ≈ 0.69 … 4x ≈ 0.89) the SPLIT gate and the adaptive GL
+/// floor read. 1 when no row carries likelihood.
+fn gl_mean_conf(gl3: &[f32], n_samples: usize, n_var: usize) -> f32 {
+    let (mut sum, mut cnt) = (0.0f64, 0usize);
+    for row in gl3[..n_var * n_samples * 3].chunks_exact(3) {
+        let t = row[0] + row[1] + row[2];
+        if t > 0.0 { sum += (row[0].max(row[1]).max(row[2]) / t) as f64; cnt += 1; }
+    }
+    if cnt > 0 { (sum / cnt as f64) as f32 } else { 1.0 }
 }
 
 /// lcWGS pipeline starting from BAM(s): compute genotype likelihoods natively
@@ -362,7 +496,7 @@ pub fn run_lcwgs_bam(
     let n_samples = bamgl.sample_ids.len();
 
     // bamgl.gl3 is already in panel-shared order → shared imputation tail.
-    impute_from_gl3(srp, &wgs_idx, bamgl.gl3, n_samples, bamgl.sample_ids, map_path, params)
+    impute_from_gl3(srp, &wgs_idx, bamgl.gl3, n_samples, bamgl.sample_ids, &[], map_path, params)
 }
 
 /// Resolve the two-depth common/rare split for this run (see `process_chunk`).
@@ -379,7 +513,7 @@ pub fn run_lcwgs_bam(
 ///       the 2nd pass. De-noised 3-sample validation: 1× dominates all bins, 2×
 ///       wins 6/7+overall, 4× tie (not engaged).
 /// Band defaults to [0.05,0.10) (`LCWGS_SPLIT_BAND`); deep cap 5000 (`LCWGS_SPLIT_KMAX`).
-fn resolve_split(gl3: &[f32], n_samples: usize, n_var: usize, params: &LcwgsParams) -> Option<(f64, f64, usize)> {
+fn resolve_split(mean_conf: f32, params: &LcwgsParams) -> Option<(f64, f64, usize)> {
     if crate::config::present("LCWGS_NO_SPLIT") { return None; }
     let deep_k = crate::config::raw("LCWGS_SPLIT_KMAX").and_then(|x| x.parse().ok()).unwrap_or(5000usize);
     let parse_band = |s: &str| -> Option<(f64, f64)> {
@@ -398,16 +532,6 @@ fn resolve_split(gl3: &[f32], n_samples: usize, n_var: usize, params: &LcwgsPara
     if params.kpbwt <= default_kmax { return None; }
     // (2) soft-GL (coverage) gate.
     let thr: f32 = crate::config::raw("LCWGS_SPLIT_GL_THR").and_then(|x| x.parse().ok()).unwrap_or(0.84);
-    let (mut sum, mut cnt) = (0.0f64, 0usize);
-    for v in 0..n_var {
-        let b = v * n_samples * 3;
-        for s in 0..n_samples {
-            let (g0, g1, g2) = (gl3[b + 3 * s], gl3[b + 3 * s + 1], gl3[b + 3 * s + 2]);
-            let tot = g0 + g1 + g2;
-            if tot > 0.0 { sum += (g0.max(g1).max(g2) / tot) as f64; cnt += 1; }
-        }
-    }
-    let mean_conf = if cnt > 0 { (sum / cnt as f64) as f32 } else { 1.0 };
     let (lo, hi) = crate::config::raw("LCWGS_SPLIT_BAND").and_then(|s| parse_band(&s)).unwrap_or((0.05, 0.10));
     if mean_conf < thr {
         crate::selphi_info!(
@@ -437,6 +561,7 @@ fn run_chunked_gibbs(
     n_samples: usize,
     n_shared: usize,
     params: &LcwgsParams,
+    mean_conf: f32,
 ) -> (Vec<f32>, Vec<f32>) {
     // GLIMPSE2-style: ~core_cm core + buffer_cm each side. Defaults chosen to
     // match GLIMPSE2_chunk's typical ~few-cM cores. cM span of chr22 ≈ 50.
@@ -462,7 +587,7 @@ fn run_chunked_gibbs(
     // engages only on a BIG panel at LOW coverage (≤~2×) — where it makes Selphi
     // beat GLIMPSE2 on every MAF bin; small/panel-matched panels + high coverage
     // skip it (single pass, byte-identical). Cost when on: ~2× the per-chunk Gibbs.
-    let split_band: Option<(f64, f64, usize)> = resolve_split(gl3_shared, n_samples, n_shared, params);
+    let split_band: Option<(f64, f64, usize)> = resolve_split(mean_conf, params);
 
     // Chromosome-wide conditioning selection (LCWGS_CHRWIDE_PBWT, default OFF):
     // select the conditioning set ONCE over the WHOLE chromosome's common-site
@@ -630,8 +755,11 @@ fn run_chunked_gibbs(
     // peak memory.
     //
     // Few samples (2·n_samples < threads): the per-sample parallelism inside
-    // run_gibbs cannot fill the cores, so chunks run in waves sized by a memory
-    // budget from the panel-only per-chunk estimate (the shipped rule).
+    // run_gibbs cannot fill the cores, so chunks run in waves sized by the memory
+    // budget over the panel-only per-chunk estimate. The budget is the same as
+    // below (half the machine's RAM): a fixed 2.5 GB held a one-sample run on a
+    // 75,552-haplotype panel (5.7 GB per chunk) to one chunk at a time, i.e. one
+    // core of eight for 18 minutes on 15 Mb of chrX.
     //
     // Many samples: chunks used to run strictly one after another, on the
     // assumption that per-sample parallelism alone fills the machine. It does
@@ -646,6 +774,8 @@ fn run_chunked_gibbs(
     // keeps today's sequential behaviour exactly.
     let threads = rayon::current_num_threads().max(1);
     let few_samples = 2 * n_samples < threads;
+    let budget_gb = crate::config::f64_opt("LCWGS_MEM_BUDGET_GB")
+        .unwrap_or_else(|| (crate::log::system_ram_mb() / 1024.0 * 0.5).max(2.5));
     let n_ref = srp.metadata.n_haps;
     let avg_chunk_n = (n_shared / n_chunks).max(1);
     // Panel part of a chunk ≈ ref_bm (chunk_n × ceil(n_ref/64) × 8) × ~1.9
@@ -672,7 +802,6 @@ fn run_chunked_gibbs(
         }
     };
     if few_samples {
-        let budget_gb = crate::config::f64_or("LCWGS_MEM_BUDGET_GB", 2.5);
         let max_live = ((budget_gb / panel_chunk_gb.max(1e-9)).floor() as usize)
             .clamp(1, n_chunks.min(threads));
         crate::selphi_info!(
@@ -680,8 +809,6 @@ fn run_chunked_gibbs(
             max_live, budget_gb, panel_chunk_gb);
         run_waves(0, max_live, &mut merge_chunk)
     } else if n_chunks > 1 {
-        let budget_gb = crate::config::f64_opt("LCWGS_MEM_BUDGET_GB")
-            .unwrap_or_else(|| (crate::log::system_ram_mb() / 1024.0 * 0.5).max(2.5));
         let hwm_before = (crate::log::peak_mem_mb() / 1024.0).max(rss_gb());
         let first = process_chunk(0);
         let hwm_after = crate::log::peak_mem_mb() / 1024.0;

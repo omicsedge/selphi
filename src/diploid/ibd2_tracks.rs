@@ -133,9 +133,14 @@ impl Ibd2Tracks {
         let mut d = vec![vec![0usize; n_ind]; M];
         for i in 0..n_ind { a[0][i] = i; }
 
+        let seed = sentinel_offset();
         for l in 0..n_scaffold {
             u.fill(0);
-            p.fill(l);
+            // The first individual of each genotype bucket differs from its new predecessor
+            // at l, so its match starts at l + 1 (Durbin's algorithm 2). SHAPEIT5's scanIBD2
+            // seeds l, which lets a run claim one site too many on its left whenever that
+            // sentinel is the maximum carried into a later divergence.
+            p.fill(l + seed);
             for i in 0..n_ind {
                 let alookup = if l > 0 { a[0][i] } else { i };
                 let dlookup = if l > 0 { d[0][i] } else { 0 };
@@ -207,13 +212,20 @@ impl Ibd2Tracks {
     }
 }
 
+/// Divergence seed of a genotype bucket's first individual, relative to the site: 1
+/// (Durbin), or 0 under `SELPHI_IBD2_SENTINEL_L=1` (SHAPEIT5's scanIBD2; A/B only).
+pub(crate) fn sentinel_offset() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| if crate::config::is_one("SELPHI_IBD2_SENTINEL_L") { 0 } else { 1 })
+}
+
 impl Ibd2Tracks {
     /// The tracks `detect` records for every pair that involves a TARGET individual (targets
-    /// are individuals `[0, n_target_ind)`, as the unified bitmatrix lays them out), found
-    /// without sorting the panel. Those are the only tracks ever read: the PBWT sweep stores
-    /// conditioning sets for target haplotypes only and asks `no_ibd2(target_hap, neighbour)`,
-    /// whose pair always lives in `tracks[target]`. Panel-panel tracks were built and never
-    /// read — 3.4 s of a 26 s one-user chr22 run against 75,552 haplotypes.
+    /// are individuals `[0, n_target_ind)`, as the unified bitmatrix lays them out) among the
+    /// scanned individuals `[0, n_haplotypes / 2)`, found without a genotype PBWT. Those are
+    /// the only tracks ever read: the PBWT sweep stores conditioning sets for target
+    /// haplotypes only and asks `no_ibd2(target_hap, neighbour)`, whose pair always lives in
+    /// `tracks[target]`. (The phaser scans the targets alone; see phase_common.)
     ///
     /// A recorded track is a maximal run of identical genotypes `[s, e]` between two
     /// individuals that spans every site or reaches `min_cm`, `min_bp` and `min_sites`,
@@ -241,7 +253,8 @@ impl Ibd2Tracks {
         tracks.cm = scaffold_cm.to_vec();
         if n_scaffold < 2 || n_ind < 2 { return tracks; }
         const EVEN: u64 = 0x5555_5555_5555_5555;
-        let nw = bm.n_words();
+        // Only the words holding the scanned individuals [0, n_ind) (32 per word).
+        let nw = n_ind.div_ceil(32).min(bm.n_words());
         // individuals that exist in each word (the last word may be padded)
         let valid: Vec<u64> = (0..nw).map(|w| {
             let lo = w * 32;
@@ -349,13 +362,15 @@ mod tests {
         let mut hap = vec![vec![false; 2 * n_ind]; n_sites];
         for row in hap.iter_mut() { for h in row.iter_mut() { *h = rnd() % 3 == 0; } }
         // target 0 ~ individual 17 on 50..300; target 1 ~ 30 on 0..400 (whole);
-        // target 2 ~ 41 on 100..180 (too short in bp), target 0 ~ target 2 on 320..399
+        // target 2 ~ 41 on 100..180 (too short in bp), target 1 ~ target 2 on 200..320,
+        // target 0 ~ target 2 on 320..399 (too few sites)
         let plant = |hap: &mut Vec<Vec<bool>>, a: usize, b: usize, r: std::ops::Range<usize>| {
             for l in r { hap[l][2 * b] = hap[l][2 * a + 1]; hap[l][2 * b + 1] = hap[l][2 * a]; }
         };
         plant(&mut hap, 0, 17, 50..300);
         plant(&mut hap, 1, 30, 0..400);
         plant(&mut hap, 2, 41, 100..180);
+        plant(&mut hap, 1, 2, 200..400);
         plant(&mut hap, 0, 2, 320..400);
         let bm = HaplotypeBitmatrix::from_panel(n_sites, 2 * n_ind, &|l: usize, h: usize| hap[l][h], &vec![true; n_sites]);
         let cm: Vec<f64> = (0..n_sites).map(|l| l as f64 * 0.05).collect();
@@ -371,6 +386,59 @@ mod tests {
         assert!(!fast.tracks[0].is_empty() && !fast.tracks[1].is_empty());
         for q in [(0usize, 34usize, 150usize), (1, 60, 10), (2, 82, 130), (0, 4, 350)] {
             assert_eq!(full.no_ibd2(q.0, q.1, q.2), fast.no_ibd2(q.0, q.1, q.2), "{q:?}");
+        }
+
+        // Scanning the targets alone (what the phaser does) keeps exactly the target-target
+        // tracks of the full scan, by either method, and bans no panel individual.
+        for only in [
+            Ibd2Tracks::detect(|l, h| bm.get(l, h), &cm, &bp, n_sites, 2 * n_target, 2.5, 1e6, 100),
+            Ibd2Tracks::detect_targets(&bm, n_target, &cm, &bp, n_sites, 2 * n_target, 2.5, 1e6, 100),
+        ] {
+            for t in 0..n_target {
+                let a: Vec<_> = full.tracks[t].iter().filter(|x| x.ind < n_target).map(key).collect();
+                let b: Vec<_> = only.tracks[t].iter().map(key).collect();
+                assert_eq!(a, b, "target {t}");
+            }
+            assert!(!only.tracks[1].is_empty(), "the planted target pair 1~2 is found");
+            assert!(only.no_ibd2(0, 34, 150) && only.no_ibd2(2, 60, 10), "panel relatives stay usable");
+            assert!(!only.no_ibd2(2, 4, 250), "target 1 ~ target 2 stays banned");
+        }
+    }
+
+    /// The two detection methods agree track for track on random cohorts with planted runs
+    /// of every length around the thresholds (a run's left end once depended on which
+    /// method found it: the genotype PBWT's bucket sentinel was one site early).
+    #[test]
+    fn target_detection_agrees_on_random_cohorts() {
+        use crate::common::HaplotypeBitmatrix;
+        for seed in 1..=25u64 {
+            let (n_ind, n_sites, n_target) = (50usize, 300usize, 6usize);
+            let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ seed.wrapping_mul(0xD1B5_4A32_D192_ED03);
+            let mut rnd = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+            let freq = 2 + seed % 4; // ALT on 1 in 2..5 haplotypes
+            let mut hap = vec![vec![false; 2 * n_ind]; n_sites];
+            for row in hap.iter_mut() { for h in row.iter_mut() { *h = rnd() % freq == 0; } }
+            for _ in 0..8 {
+                let a = (rnd() % n_target as u64) as usize;
+                let b = (rnd() % n_ind as u64) as usize;
+                if a == b { continue; }
+                let s0 = (rnd() % n_sites as u64) as usize;
+                let len = 60 + (rnd() % 160) as usize;
+                for l in s0..(s0 + len).min(n_sites) { hap[l][2 * b] = hap[l][2 * a]; hap[l][2 * b + 1] = hap[l][2 * a + 1]; }
+            }
+            let bm = HaplotypeBitmatrix::from_panel(n_sites, 2 * n_ind, &|l: usize, h: usize| hap[l][h], &vec![true; n_sites]);
+            let cm: Vec<f64> = (0..n_sites).map(|l| l as f64 * 0.04).collect();
+            let bp: Vec<i64> = (0..n_sites).map(|l| l as i64 * 15_000).collect();
+            let key = |t: &Track| (t.ind, t.from, t.to);
+            for scan in [2 * n_ind, 2 * n_target] {
+                let full = Ibd2Tracks::detect(|l, h| bm.get(l, h), &cm, &bp, n_sites, scan, 2.5, 1e6, 100);
+                let fast = Ibd2Tracks::detect_targets(&bm, n_target, &cm, &bp, n_sites, scan, 2.5, 1e6, 100);
+                for t in 0..n_target {
+                    let a: Vec<_> = full.tracks[t].iter().map(key).collect();
+                    let b: Vec<_> = fast.tracks[t].iter().map(key).collect();
+                    assert_eq!(a, b, "seed {seed} scan {scan} target {t}");
+                }
+            }
         }
     }
 }

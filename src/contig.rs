@@ -22,11 +22,11 @@
 pub enum ContigClass {
     /// Autosome 1..=22.
     Autosome,
-    /// chrX / X / 23.
+    /// chrX / X / 23, and PLINK's XY / 25 (the pseudo-autosomal part of X).
     ChrX,
     /// chrY / Y / 24.
     ChrY,
-    /// chrMT / chrM / MT / M / 25 / 26.
+    /// chrMT / chrM / MT / M / 26.
     ChrMt,
     /// Anything else (scaffolds, alt contigs, decoys, …).
     Other,
@@ -43,9 +43,10 @@ fn normalize(chrom: &str) -> String {
 /// named like `chrUn_M…` is NOT mistaken for chrMT.
 pub fn classify_contig(chrom: &str) -> ContigClass {
     match normalize(chrom).as_str() {
-        "x" | "23" => ContigClass::ChrX,
+        // PLINK numbers 23 = X, 24 = Y, 25 = XY (the PARs, diploid and recombining), 26 = MT.
+        "x" | "23" | "xy" | "25" => ContigClass::ChrX,
         "y" | "24" => ContigClass::ChrY,
-        "m" | "mt" | "25" | "26" => ContigClass::ChrMt,
+        "m" | "mt" | "26" => ContigClass::ChrMt,
         s => match s.parse::<u32>() {
             Ok(n) if (1..=22).contains(&n) => ContigClass::Autosome,
             _ => ContigClass::Other,
@@ -134,13 +135,13 @@ mod tests {
         for s in ["1", "22", "chr1", "chr22", "CHR7"] {
             assert_eq!(classify_contig(s), ContigClass::Autosome, "{s}");
         }
-        for s in ["X", "x", "chrX", "23", "chr23"] {
+        for s in ["X", "x", "chrX", "23", "chr23", "XY", "25"] {
             assert_eq!(classify_contig(s), ContigClass::ChrX, "{s}");
         }
         for s in ["Y", "chrY", "24"] {
             assert_eq!(classify_contig(s), ContigClass::ChrY, "{s}");
         }
-        for s in ["M", "MT", "chrM", "chrMT", "25", "26"] {
+        for s in ["M", "MT", "chrM", "chrMT", "26"] {
             assert_eq!(classify_contig(s), ContigClass::ChrMt, "{s}");
         }
         for s in ["0", "23x", "chrUn_M", "GL000220", "23_random"] {
@@ -152,7 +153,8 @@ mod tests {
     fn refuses_y_mt_not_autosome_x() {
         assert!(nonrecomb_refusal("chrY").is_some());
         assert!(nonrecomb_refusal("MT").is_some());
-        assert!(nonrecomb_refusal("chr25").is_some());
+        assert!(nonrecomb_refusal("chr26").is_some());
+        assert!(nonrecomb_refusal("25").is_none());
         assert!(nonrecomb_refusal("chr1").is_none());
         assert!(nonrecomb_refusal("chrX").is_none());
         assert!(nonrecomb_refusal("23").is_none());

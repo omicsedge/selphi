@@ -66,11 +66,11 @@ fn sample_backward(
     rng: &mut CppRng,
 ) {
     if graph.n_segments < 2 {
-        // Single segment: just sample from the last transition
+        // One segment: its only transition block is T[0..dc0], read the same way in either
+        // direction, so draw it as the forward sampler does. (This branch used to write
+        // codes[0], a fixed configuration, for half of the draws of such a sample.)
         if graph.n_segments == 1 {
-            let codes = enumerate_diplotypes(graph.diplotypes[0]);
-            let dip_sampled = vec![if codes.is_empty() { 0 } else { codes[0] }];
-            apply_sampled_diplotypes(graph, &dip_sampled, missing_probs);
+            sample_forward(graph, trans_probs, missing_probs, rng);
         }
         return;
     }

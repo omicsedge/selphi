@@ -78,6 +78,15 @@ pub fn resolve_members(n_samples: usize, phase_ensemble: usize, forced_single: b
     if cap > 0 && n_samples > cap { 1 } else { 2 }
 }
 
+/// `SELPHI_ENSEMBLE_CHAINS=K` (K >= 2): build the diploid ensemble from K INDEPENDENT
+/// phasing chains (seeds seed..seed+K-1) instead of thinned samples of one chain.
+/// Experimental (2026-10-14): a single user's chr22 accuracy moves by up to 0.018
+/// per-sample R2 with the seed alone, and members drawn from one chain share its
+/// switch errors. `None` = the intra-run default.
+pub fn independent_chains() -> Option<usize> {
+    crate::config::usize_opt("SELPHI_ENSEMBLE_CHAINS").filter(|&k| k >= 2)
+}
+
 /// Cohort size above which a 2-member ensemble roughly doubles the wall, because
 /// by then the per-target map is the whole runtime. Only used to decide whether
 /// to say so on the log.

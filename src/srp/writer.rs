@@ -82,18 +82,18 @@ pub fn build_srp_from_bref3(
     let mut ids = Vec::new();
     let mut orig_ids = Vec::new();
     let mut first_id = true;
-    // Variants whose CHROM/REF/ALT exceed the 255-byte SRP u8 length cap (large
-    // indels/SVs in biobank panels) are SKIPPED rather than erroring out. Record
-    // their raw stream position so pass 2 drops the SAME variants, keeping the
-    // variant index and genotype tiles aligned. Panels with no such alleles skip
-    // nothing → byte-identical to the prior behavior.
+    // Long alleles (>255 B: large indels/SVs) are stored (escaped lengths, see
+    // helpers::push_variant_vbin). Under --drop-long-alleles they are skipped
+    // instead; their raw stream position is recorded so pass 2 drops the SAME
+    // variants, keeping the variant index and genotype tiles aligned.
+    let drop_long = crate::config::is_one("SELPHI_DROP_LONG_ALLELES");
     let mut skip_long: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut raw_idx = 0usize;
 
     while let Some((chrom, pos_i32, ref_allele, alt_allele, id)) =
         stream.next_variant_meta_only().map_err(SrpWriterError::InvalidInput)?
     {
-        if chrom.len() > 255 || ref_allele.len() > 255 || alt_allele.len() > 255 {
+        if drop_long && (chrom.len() > 255 || ref_allele.len() > 255 || alt_allele.len() > 255) {
             skip_long.insert(raw_idx);
             raw_idx += 1;
             continue;
@@ -111,7 +111,7 @@ pub fn build_srp_from_bref3(
     }
     drop(stream);
     if !skip_long.is_empty() {
-        crate::selphi_info!("  skipped {} variant(s) with CHROM/REF/ALT >255 B (SRP u8 cap)", skip_long.len());
+        crate::selphi_info!("  dropped {} variant(s) with CHROM/REF/ALT >255 B (--drop-long-alleles)", skip_long.len());
     }
     if n_variants == 0 { return Err(SrpWriterError::NoVariants); }
 
@@ -637,7 +637,7 @@ impl StreamingTileWriter {
 
         w.write_all(SRP_SINGLE_CHR_MAGIC)?;
         write_section(&mut w, meta_json.to_string().as_bytes())?;
-        write_section(&mut w, &metadata.vbin)?;
+        write_vbin_section(&mut w, &metadata.vbin, metadata.n_variants)?;
         write_section(&mut w, metadata.sample_names.join("\n").as_bytes())?;
         write_section(&mut w, &metadata.ids)?;
         write_section(&mut w, &metadata.orig_ids)?;
@@ -759,6 +759,19 @@ pub(crate) fn write_section<W: Write>(w: &mut W, data: &[u8]) -> std::io::Result
     w.write_all(&(compressed.len() as u32).to_le_bytes())?;
     w.write_all(&compressed)?;
     Ok(())
+}
+
+/// Write a variant index section, behind [`super::helpers::LONG_ALLELE_MARKER`]
+/// when it holds a field of 255 B or longer (see `helpers::push_variant_vbin`).
+pub(crate) fn write_vbin_section<W: std::io::Write>(w: &mut W, vbin: &[u8], n: usize) -> std::io::Result<()> {
+    if super::helpers::vbin_has_long(vbin, n) {
+        let mut marked = Vec::with_capacity(vbin.len() + 8);
+        marked.extend_from_slice(&super::helpers::LONG_ALLELE_MARKER);
+        marked.extend_from_slice(vbin);
+        write_section(w, &marked)
+    } else {
+        write_section(w, vbin)
+    }
 }
 
 /// Append one variant's three index entries — binary record (`vbin`), synthetic

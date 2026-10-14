@@ -299,9 +299,12 @@ pub fn encode_imputed_record(
     // R4b: per-sample hard-call override at a re-routed chip site. `None` →
     // pre-R4b behavior (byte-identical when refine is off).
     hc: Option<&R4bHardcall>,
+    // The site is absent from the input (IMP flag). False for a typed site written
+    // with the model's dosage because some sample's call was missing or untrusted.
+    imp: bool,
 ) {
     let n_fmt: u8 = if no_ap { 2 } else { 4 }; // GT+DS or GT+DS+AP1+AP2
-    let n_info: u16 = 5; // AF, AC, AN, DR2, IMP
+    let n_info: u16 = if imp { 5 } else { 4 }; // AF, AC, AN, DR2[, IMP]
 
     // Hardcall ALT count + dosage-R² via the shared two-pass helper (the same
     // math the batched merger and the VCF/Parquet writers use), so the
@@ -330,8 +333,10 @@ pub fn encode_imputed_record(
     encode_typed_int(buf, n_haps as i32);
     encode_typed_int8(buf, INFO_DR2_IDX as i32);
     encode_typed_float(buf, dr2);
-    encode_typed_int8(buf, INFO_IMP_IDX as i32);
-    buf.push(0x00); // IMP flag: missing-typed (no value)
+    if imp {
+        encode_typed_int8(buf, INFO_IMP_IDX as i32);
+        buf.push(0x00); // IMP flag: missing-typed (no value)
+    }
 
     let indiv_start = buf.len();
     emit_gt_imputed(buf, alt_probs, tile_n, v, n_samples, hc);
@@ -365,15 +370,22 @@ pub fn encode_imputed_record_partial(
     // batch-local; `sample_offset` (= batch sample_start) maps to global
     // `chip_genotypes` indices. `None` → pre-R4b behavior (byte-identical).
     hc: Option<&R4bHardcall>,
+    // Site absent from the input: the record carries the IMP flag (its only INFO
+    // field) so the merger can tell it from a typed site written as dosage.
+    imp: bool,
 ) {
     let n_fmt: u8 = if no_ap { 2 } else { 4 };
-    let n_info: u16 = 0;
+    let n_info: u16 = imp as u16;
 
     let shared_start = begin_record(
         buf, rid, pos_0based, ref_allele.len() as i32, n_info, n_fmt, n_samples_in_batch,
         id, ref_allele, alt_allele,
     );
-    // No INFO fields (merger recomputes them from concatenated dosages).
+    // No stats (the merger recomputes them from concatenated dosages); IMP only.
+    if imp {
+        encode_typed_int8(buf, INFO_IMP_IDX as i32);
+        buf.push(0x00);
+    }
 
     let indiv_start = buf.len();
     emit_gt_imputed(buf, alt_probs, tile_n, v, n_samples_in_batch, hc);

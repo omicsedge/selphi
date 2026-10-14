@@ -12,8 +12,8 @@ use super::genotype_graph::*;
 use super::pbwt_neighbor::*;
 use super::ibd2_tracks::*;
 
-/// Up to this many target individuals IBD2 is found by comparing each target with the panel
-/// bit-parallel (targets x sites x panel/32 word operations) instead of sorting everyone.
+/// Up to this many target individuals IBD2 is found by comparing each target with the others
+/// bit-parallel (targets x sites x targets/32 word operations) instead of a genotype PBWT.
 const IBD2_DIRECT_MAX_TARGETS: usize = 64;
 use super::hmm_segment::*;
 use super::hmm_segment_f64::SegmentHmmF64;
@@ -231,18 +231,25 @@ pub fn run_phase_common_bm(
     let ne_init = resolve_phase_ne(n_haps_total);
     let mut hmm_params = HmmParams::with_allele_freqs(cm, n_haps_total, ne_init, Some(&allele_counts));
 
-    // IBD2 detection: read from target_haps + ref_bm
+    // IBD2 detection between TARGET individuals only. Two IBD2 targets carry the same
+    // genotypes, so copying each other's estimated phase adds no information and locks in
+    // a shared error: that is what the ban is for (SHAPEIT5 phase_common bans only main
+    // samples). A reference relative is the opposite case, a phased template, and banning
+    // it threw that template away: a target whose own phased copy was in the panel phased
+    // at 10.50% switch error instead of 0 (22:30-32 Mb, 1KG). The scan therefore covers
+    // the target haplotypes [0, 2n) alone. SELPHI_IBD2_BAN_PANEL=1 restores the scan over
+    // targets + panel (for an exact A/B).
     let mut ibd2 = {
         let default_bp: Vec<i64> = (0..n_var).map(|v| v as i64 * 1000).collect();
         let bp = chip_bp.unwrap_or(&default_bp);
         let t0_ibd2 = std::time::Instant::now();
-        // Few targets: compare each target with the whole panel bit-parallel (exact, see
-        // detect_targets). Many: one genotype PBWT over everyone, whose cost no longer
-        // grows with the number of targets.
+        let scan_haps = if crate::config::is_one("SELPHI_IBD2_BAN_PANEL") { n_haps_total } else { 2 * n_samples };
+        // Few targets: compare each target with every other scanned individual bit-parallel
+        // (exact, see detect_targets). Many: one genotype PBWT over them.
         let tracks = if n_samples <= IBD2_DIRECT_MAX_TARGETS && !crate::config::is_one("SELPHI_IBD2_PANEL_SORT") {
-            Ibd2Tracks::detect_targets(&hap_bm, n_samples, cm, bp, n_var, n_haps_total, 2.5, 1e6, 100)
+            Ibd2Tracks::detect_targets(&hap_bm, n_samples, cm, bp, n_var, scan_haps, 2.5, 1e6, 100)
         } else {
-            Ibd2Tracks::detect(|site, hap| hap_bm.get(site, hap), cm, bp, n_var, n_haps_total, 2.5, 1e6, 100)
+            Ibd2Tracks::detect(|site, hap| hap_bm.get(site, hap), cm, bp, n_var, scan_haps, 2.5, 1e6, 100)
         };
         crate::selphi_debug!("  [diploid] IBD2 pairs detected: {} ({:.1}s)",
             tracks.n_pairs(), t0_ibd2.elapsed().as_secs_f64());
@@ -521,7 +528,13 @@ pub fn run_phase_common_bm(
             }
         });
 
-        // Rebuild genotype graphs from bitmatrix
+        // Rebuild genotype graphs from bitmatrix. Each input no-call enters the graph as
+        // the genotype the sweep voted for. SHAPEIT5 keeps it missing and imputes it from
+        // the HMM every iteration; this engine computes no missing probabilities, and
+        // keeping it missing without them (SELPHI_DIPLOID_NOCALL_KEEP_MISSING=1) left
+        // stale haplotype bits at those sites: scaffold switch error -0.012 pp but rare
+        // hets +4 pp at 2% no-calls (801 samples, 22:30-32 Mb, 3/3 seeds), so it is off.
+        let keep_missing = crate::config::is_one("SELPHI_DIPLOID_NOCALL_KEEP_MISSING");
         for si in 0..n_samples {
             let mut geno = vec![0u8; n_var * 2];
             let h0 = si * 2;
@@ -532,7 +545,13 @@ pub fn run_phase_common_bm(
             }
             let flags: Option<Vec<bool>> = locked.map(|l|
                 (0..n_var).map(|v| l[v * n_samples + si]).collect());
-            graphs[si] = build_graph(si, &geno, n_var, flags.as_deref());
+            let nocall = |v: usize| target_geno[v * n_samples * 2 + si * 2] > 1
+                || target_geno[v * n_samples * 2 + si * 2 + 1] > 1;
+            graphs[si] = if keep_missing && (0..n_var).any(nocall) {
+                build_graph_keep_missing(si, &geno, n_var, flags.as_deref(), nocall)
+            } else {
+                build_graph(si, &geno, n_var, flags.as_deref())
+            };
         }
 
         let total_segments: usize = graphs.iter().map(|g| g.n_segments).sum();

@@ -121,6 +121,7 @@ pub fn write_bref3_from_bcf(source_path: &Path, output_path: &Path) -> io::Resul
     let mut total_variants = 0u64;
     let mut total_blocks = 0u64;
     let mut block_index: Vec<(u64, i32)> = Vec::new();
+    let mut n_too_long = 0usize;
 
     for raw_batch in rx_raw {
         // --- Parallel GT extraction ---
@@ -130,6 +131,7 @@ pub fn write_bref3_from_bcf(source_path: &Path, output_path: &Path) -> io::Resul
 
         // --- Sequential SeqCoder with parallel inner loops ---
         for rec in parsed {
+            if !fits_bref3(&rec) { n_too_long += 1; continue; }
             if chrom.is_empty() {
                 let ci = i32::from_le_bytes(raw_batch[0].shared[0..4].try_into().unwrap()) as usize;
                 chrom = if ci < contig_names.len() { contig_names[ci].clone() } else { format!("{}", ci) };
@@ -158,6 +160,7 @@ pub fn write_bref3_from_bcf(source_path: &Path, output_path: &Path) -> io::Resul
     w.flush()?;
 
     reader_handle.join().unwrap()?;
+    warn_too_long(n_too_long);
 
     let size = std::fs::metadata(&bref3_path)?.len();
     crate::selphi_info!("  BREF3: {} variants in {} blocks, {} ({:.1} MB)",
@@ -225,6 +228,7 @@ pub fn write_bref3_from_srp(source_path: &Path, output_path: &Path) -> io::Resul
 
     const CHUNK: usize = 65_536;
     let mut idx = 0;
+    let mut n_too_long = 0usize;
     while idx < n_variants {
         let hi = (idx + CHUNK).min(n_variants);
         let wgs_idx: Vec<usize> = (idx..hi).collect();
@@ -261,6 +265,7 @@ pub fn write_bref3_from_srp(source_path: &Path, output_path: &Path) -> io::Resul
                 major_allele,
                 minor_count,
             };
+            if !fits_bref3(&rec) { n_too_long += 1; continue; }
 
             process_bref3_record(
                 &mut w, rec, &chrom_name, non_maj_threshold, n_haps, max_n_seq, &snv_perms,
@@ -278,6 +283,8 @@ pub fn write_bref3_from_srp(source_path: &Path, output_path: &Path) -> io::Resul
         &hap_to_seq, n_seq, n_haps, &snv_perms, &mut bytes_written, &mut block_index,
         &mut total_variants, &mut total_blocks,
     )?;
+
+    warn_too_long(n_too_long);
 
     // End sentinel + index (mirror write_bref3_from_bcf)
     let chroms: Vec<String> = vec![chrom_name.clone()];
@@ -634,8 +641,21 @@ fn write_u16_c<W: Write>(w: &mut W, v: u16) -> io::Result<u64> { w.write_all(&v.
 
 fn write_utf_c<W: Write>(w: &mut W, s: &str) -> io::Result<u64> {
     let bytes = s.as_bytes();
-    write_u16_c(w, bytes.len() as u16)?; w.write_all(bytes)?;
+    let n = u16::try_from(bytes.len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidData,
+        format!("a {}-byte string exceeds BREF3's 65,535-byte limit", bytes.len())))?;
+    write_u16_c(w, n)?; w.write_all(bytes)?;
     Ok(2 + bytes.len() as u64)
+}
+
+/// BREF3 stores the ID and alleles as Java `writeUTF` strings: 65,535 bytes at most.
+fn fits_bref3(rec: &VariantRec) -> bool {
+    [&rec.id, &rec.ref_allele, &rec.alt_allele].iter().all(|s| s.len() <= u16::MAX as usize)
+}
+
+fn warn_too_long(n: usize) {
+    if n > 0 {
+        crate::selphi_info!("  WARNING: {} variant(s) with an allele or ID over 65,535 bytes left out: BREF3 (Java writeUTF) cannot store them", n);
+    }
 }
 
 fn write_string_array_c<W: Write>(w: &mut W, arr: &[String]) -> io::Result<u64> {

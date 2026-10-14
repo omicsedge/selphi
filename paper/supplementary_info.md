@@ -85,7 +85,7 @@ in-process pileup (no external caller) and is scored on the identical site set a
 compared tools. On the capture libraries GLIMPSE2 read the BAM directly and Selphi 2 is
 reported in three arms: its native pileup with base alignment quality (BAQ; the default and
 the engine's result), likelihoods from `bcftools mpileup | call` (a robustness check; what a
-deployed pipeline produces), and its native pileup without BAQ (ablation, pre-fix). QUILT2 was
+deployed pipeline produces), and its native pileup without BAQ (ablation). QUILT2 was
 not run on the capture libraries. Concordance (S4a-S4d) and dosage R² (S4e-S4f) are
 complementary metrics and are not interchangeable.
 
@@ -383,13 +383,11 @@ Reference: Beagle 5.5, SHAPEIT5 v5.1.1.
 > GLIMPSE2 = `chunk` + `phase` + `ligate`. Single-sample ratio 3.3$\times$ (334 s / 101 s;
 > two repeats each within 0.7 s); six samples in one run 2.3$\times$ (386 s / 170 s); twelve
 > samples 1.5$\times$ (451 s / 307 s). Above seven samples on 16 threads the chunk-level
-> parallelism now sizes its waves from the measured memory of the first chunk instead of
-> running chunks sequentially; before that change the 12-sample run took 534 s, and 375 s before the conditioning-pack sharing. The
+> parallelism sizes its waves from the measured memory of the first chunk. The
 > 20-iteration row uses GLIMPSE2's default iteration count (5 burn-in + 15 main) instead of
 > Selphi 2's default schedule (50/25): in the same six-sample run the non-reference Delta versus
 > GLIMPSE2 is +0.198 pp at 20 iterations versus +0.193 pp at 50/25. GLIMPSE2's six-sample
-> accuracy equals its single-sample accuracy (+0.0025 pp non-reference, n = 6). Earlier
-> capture-library timings taken under CPU contention are not reported. The 2.8$\times$
+> accuracy equals its single-sample accuracy (+0.0025 pp non-reference, n = 6). The 2.8$\times$
 > (~1.8$\times$ downsampled, 4,478-haplotype panel) and 2.6$\times$ (1$\times$,
 > 6,332-haplotype panel) ratios of the downsampled rows keep their own conditions. The 4.9 GB
 > single-sample peak versus 4.2 GB in the downsampled row reflects the 1,070,399-site panel
