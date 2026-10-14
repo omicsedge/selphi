@@ -966,6 +966,7 @@ pub fn run_multi_chr(
                 &mut all_weights, &mut ensemble_members,
                 &selphi::imputation::ensemble::FoldContext {
                     ref_bm: &ref_bm_imp,
+                    targ_bm0: inputs.targ_alleles,
                     chip_cm: &chip_cm,
                     site_conf_per_sample: nocall.as_ref().map(|(_, ps)| ps.as_slice()),
                     n_samples,
