@@ -1563,6 +1563,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                 &mut all_weights, &mut extra_scaffolds,
                 &selphi::imputation::ensemble::FoldContext {
                     ref_bm: &ref_bm_imp,
+                    targ_bm0: inputs.targ_alleles,
                     chip_cm: &chip_cm,
                     site_conf_per_sample: target_site_conf_per_sample.as_deref(),
                     n_samples,

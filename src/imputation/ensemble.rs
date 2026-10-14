@@ -9,6 +9,18 @@
 //! so averaging them marginalizes phase uncertainty in dosage space and the
 //! reference panel is still read and interpolated exactly ONCE.
 //!
+//! Members are ALIGNED to member 0 before they are added. Each member is a full phasing of
+//! the target, and two phasings of one sample can carry the same haplotypes in opposite
+//! order — or switch order part-way along. Adding member k's haplotype h to member 0's
+//! haplotype h then mixed the two haplotypes wherever the order differed: the dosage (their
+//! sum) was unaffected, but each haplotype's allele probability fell to ~0.5 at a
+//! heterozygous site, the per-haplotype GT came out 1|1 or 0|0 for a true het, and the
+//! haplotypes stopped being haplotypes. On six consumer arrays imputed one user at a time
+//! that turned 261 true hets at the report variants of one person into 1|1. `swap_rows`
+//! reads, at every site where both members are heterozygous, whether member k carries
+//! member 0's haplotype 0 alleles on its own haplotype 0, and adds member k's rows to the
+//! haplotype they belong to (`sum_rows_into`: one merge pass, no extra matrix).
+//!
 //! This lives in the library because both impute paths need it. It used to live
 //! in the single-chromosome pipeline only, which is why a whole-genome run
 //! silently got no ensemble at all — not even the default intra-run one — and
@@ -111,6 +123,13 @@ impl Member {
 /// ids arrive out of column order (dedup-group expansion can do that) is sorted
 /// first.
 pub fn sum_csr_into(a: &CsrWeights, b: &CsrWeights) -> CsrWeights {
+    sum_rows_into(a, |_| b)
+}
+
+/// `sum_csr_into` with row `r` of the addend taken from `src(r)`: one merge pass, no
+/// intermediate matrix. The aligned fold reads each row from the member's own haplotype
+/// or from its partner, so a swapped member costs nothing beyond the sum itself.
+fn sum_rows_into<'b>(a: &CsrWeights, src: impl Fn(usize) -> &'b CsrWeights) -> CsrWeights {
     fn sorted_row(csr: &CsrWeights, r: usize, scratch: &mut Vec<(i32, f32)>) -> bool {
         let (s, e) = (csr.indptr[r] as usize, csr.indptr[r + 1] as usize);
         let idx = &csr.indices[s..e];
@@ -123,8 +142,9 @@ pub fn sum_csr_into(a: &CsrWeights, b: &CsrWeights) -> CsrWeights {
     let n_rows = a.n_rows;
     let n_cols = a.n_cols;
     let mut indptr = Vec::with_capacity(n_rows + 1);
-    let mut indices: Vec<i32> = Vec::with_capacity(a.indices.len() + b.indices.len());
-    let mut data: Vec<f32> = Vec::with_capacity(a.data.len() + b.data.len());
+    // the addend's rows are the same size as `a`'s (same window, same panel): 2x reserves both
+    let mut indices: Vec<i32> = Vec::with_capacity(2 * a.indices.len());
+    let mut data: Vec<f32> = Vec::with_capacity(2 * a.data.len());
     indptr.push(0i32);
     let (mut sa, mut sb): (Vec<(i32, f32)>, Vec<(i32, f32)>) = (Vec::new(), Vec::new());
     for r in 0..n_rows {
@@ -136,6 +156,7 @@ pub fn sum_csr_into(a: &CsrWeights, b: &CsrWeights) -> CsrWeights {
             ra = a.indices[s..e].iter().copied().zip(a.data[s..e].iter().copied()).collect();
             &ra
         };
+        let b = src(r);
         let ib: &[(i32, f32)] = if sorted_row(b, r, &mut sb) { &sb } else {
             let (s, e) = (b.indptr[r] as usize, b.indptr[r + 1] as usize);
             rb = b.indices[s..e].iter().copied().zip(b.data[s..e].iter().copied()).collect();
@@ -159,11 +180,47 @@ pub fn sum_csr_into(a: &CsrWeights, b: &CsrWeights) -> CsrWeights {
 /// Everything a member's window re-run needs that is shared with member 0.
 pub struct FoldContext<'a> {
     pub ref_bm: &'a HaplotypeBitmatrix,
+    /// Member 0's phased target (chip sites × target haplotypes): the orientation every
+    /// other member is aligned to.
+    pub targ_bm0: &'a HaplotypeBitmatrix,
     pub chip_cm: &'a [f64],
     pub site_conf_per_sample: Option<&'a [f64]>,
     pub n_samples: usize,
     pub chip_start: usize,
     pub chip_end: usize,
+}
+
+/// Per window row (chip site `chip_start + r`), whether member k's two haplotypes of sample
+/// `s` are in the opposite order to member 0's, written into `swap` (reused across samples).
+/// Read at the sites where both members are heterozygous; between two such sites that
+/// disagree the order changes half-way; before the first and after the last it is the
+/// nearest one's. No shared het: no swap. Returns whether any row is swapped.
+fn swap_rows(m0: &HaplotypeBitmatrix, mk: &HaplotypeBitmatrix, s: usize, chip_start: usize,
+             n_rows: usize, marks: &mut Vec<(u32, bool)>, swap: &mut Vec<bool>) -> bool {
+    let (w, b0, b1) = ((2 * s) / 64, (2 * s) % 64, (2 * s + 1) % 64);
+    marks.clear();
+    for r in 0..n_rows {
+        // both haplotypes of a sample share one u64 word (2s is even)
+        let x = m0.row(chip_start + r)[w];
+        let (a0, a1) = ((x >> b0) & 1, (x >> b1) & 1);
+        if a0 == a1 { continue; }
+        let y = mk.row(chip_start + r)[w];
+        let (c0, c1) = ((y >> b0) & 1, (y >> b1) & 1);
+        if c0 != c1 { marks.push((r as u32, a0 != c0)); }
+    }
+    swap.clear();
+    if !marks.iter().any(|&(_, o)| o) { return false; }
+    swap.resize(n_rows, false);
+    let mut m = 0usize;
+    for (r, o) in swap.iter_mut().enumerate() {
+        while m + 1 < marks.len() && marks[m + 1].0 as usize <= r { m += 1; }
+        let (lo_r, lo_o) = marks[m];
+        *o = if r <= lo_r as usize || m + 1 == marks.len() { lo_o } else {
+            let (hi_r, hi_o) = marks[m + 1];
+            if r <= (lo_r as usize + hi_r as usize) / 2 { lo_o } else { hi_o }
+        };
+    }
+    true
 }
 
 /// Re-run this window's HMM on every extra member's scaffold, fold the weights
@@ -194,11 +251,27 @@ pub fn fold_window(
             chip_end: ctx.chip_end,
         };
         let cand = sc.candidates.as_ref();
+        let targ_k = &sc.targ_bm;
+        let (mut marks, mut swap): (Vec<(u32, bool)>, Vec<bool>) = (Vec::new(), Vec::new());
         let mut accumulate = |bstart: usize, bend: usize, refs: &[&CsrWeights]|
          -> std::io::Result<()> {
-            for (j, h) in (bstart..bend).enumerate() {
-                let csr = &mut all_weights[h][0].1;
-                *csr = sum_csr_into(csr, refs[j]);
+            // Batches hold whole samples: the batch size is even and starts on a sample.
+            debug_assert!(bstart % 2 == 0 && (bend - bstart) % 2 == 0);
+            for j in (0..bend - bstart).step_by(2) {
+                let h = bstart + j;
+                let (own0, own1) = (refs[j], refs[j + 1]);
+                if swap_rows(ctx.targ_bm0, targ_k, h / 2, ctx.chip_start, own0.n_rows, &mut marks, &mut swap) {
+                    let sw = &swap;
+                    let csr = &mut all_weights[h][0].1;
+                    *csr = sum_rows_into(csr, |r| if sw[r] { own1 } else { own0 });
+                    let csr = &mut all_weights[h + 1][0].1;
+                    *csr = sum_rows_into(csr, |r| if sw[r] { own0 } else { own1 });
+                } else {
+                    let csr = &mut all_weights[h][0].1;
+                    *csr = sum_csr_into(csr, own0);
+                    let csr = &mut all_weights[h + 1][0].1;
+                    *csr = sum_csr_into(csr, own1);
+                }
             }
             Ok(())
         };
@@ -210,5 +283,61 @@ pub fn fold_window(
         for (_, csr) in hw.iter_mut() {
             for v in csr.data.iter_mut() { *v *= inv; }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Phased target bitmatrix of one sample (2 haps) from per-site (hap0, hap1) alleles.
+    fn one_sample(gts: &[(u8, u8)]) -> HaplotypeBitmatrix {
+        HaplotypeBitmatrix::from_panel(gts.len(), 2,
+            &|v: usize, h: usize| (if h == 0 { gts[v].0 } else { gts[v].1 }) == 1, &vec![true; gts.len()])
+    }
+
+    /// Diagonal CSR: row r has one weight `v` on column r.
+    fn diag(n: usize, v: f32) -> CsrWeights {
+        CsrWeights { indptr: (0..=n as i32).collect(), indices: (0..n as i32).collect(),
+                     data: vec![v; n], n_rows: n, n_cols: n }
+    }
+
+    #[test]
+    fn same_order_is_not_swapped() {
+        let m0 = one_sample(&[(0, 1), (1, 1), (1, 0), (0, 0)]);
+        let (mut marks, mut swap) = (Vec::new(), Vec::new());
+        assert!(!swap_rows(&m0, &m0, 0, 0, 4, &mut marks, &mut swap));
+    }
+
+    #[test]
+    fn opposite_order_is_swapped_everywhere() {
+        let m0 = one_sample(&[(0, 1), (1, 1), (1, 0), (0, 0)]);
+        let mk = one_sample(&[(1, 0), (1, 1), (0, 1), (0, 0)]);
+        let (mut marks, mut swap) = (Vec::new(), Vec::new());
+        assert!(swap_rows(&m0, &mk, 0, 0, 4, &mut marks, &mut swap));
+        assert_eq!(swap, vec![true; 4]);
+    }
+
+    #[test]
+    fn a_switch_between_two_hets_changes_order_half_way() {
+        // hets at rows 0 and 6; member k agrees at row 0 and is swapped at row 6
+        let m0 = one_sample(&[(0, 1), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 1), (1, 1)]);
+        let mk = one_sample(&[(0, 1), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (1, 0), (1, 1)]);
+        let (mut marks, mut swap) = (Vec::new(), Vec::new());
+        assert!(swap_rows(&m0, &mk, 0, 0, 8, &mut marks, &mut swap));
+        assert_eq!(swap, vec![false, false, false, false, true, true, true, true]);
+    }
+
+    #[test]
+    fn rows_from_the_partner_where_swapped_and_the_sum_is_unchanged() {
+        let a = diag(3, 1.0);
+        let (own, partner) = (diag(3, 2.0), diag(3, 5.0));
+        let swap = [false, true, false];
+        let got = sum_rows_into(&a, |r| if swap[r] { &partner } else { &own });
+        assert_eq!(got.data, vec![3.0, 6.0, 3.0]);
+        // and with nothing swapped it is exactly sum_csr_into
+        let plain = sum_rows_into(&a, |_| &own);
+        assert_eq!(plain.data, sum_csr_into(&a, &own).data);
+        assert_eq!(plain.indices, sum_csr_into(&a, &own).indices);
     }
 }
