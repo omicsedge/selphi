@@ -497,6 +497,36 @@ pub fn build_graph(
     graph
 }
 
+/// [`build_graph`] for a sample whose input no-calls (`missing(v)`) must stay missing
+/// while `genotypes` holds alleles filled in for them: those sites are marked missing
+/// (uniform emission) and carry the filled alleles only as their haplotype bits.
+pub fn build_graph_keep_missing(
+    index: usize,
+    genotypes: &[u8],
+    n_var: usize,
+    phased_flags: Option<&[bool]>,
+    missing: impl Fn(usize) -> bool,
+) -> GenotypeGraph {
+    let mut graph = GenotypeGraph::new(index, n_var);
+    for v in 0..n_var {
+        let a0 = genotypes[v * 2];
+        let a1 = genotypes[v * 2 + 1];
+        if a0 > 1 || a1 > 1 {
+            graph.set_missing(v);
+        } else if missing(v) {
+            graph.set_missing(v);
+            let e = v % 2;
+            if a0 == 1 { var_set_hap0(e, &mut graph.variants[v / 2]); }
+            if a1 == 1 { var_set_hap1(e, &mut graph.variants[v / 2]); }
+        } else {
+            let phased = phased_flags.is_some_and(|f| f[v]);
+            graph.set_variant(v, a0, a1, phased);
+        }
+    }
+    graph.build();
+    graph
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

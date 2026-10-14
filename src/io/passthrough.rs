@@ -87,6 +87,20 @@ impl PassRecord {
     pub fn alt_text(&self) -> String {
         if self.alts.is_empty() { ".".to_string() } else { self.alts.join(",") }
     }
+
+    /// The biallelic record of ALT `k` (1-based) of this record, split as
+    /// `bcftools norm -m-` splits it: allele `k` becomes 1, REF and every other
+    /// ALT 0; missing alleles, haploid calls and phasing are kept.
+    fn split_alt(&self, k: u8) -> PassRecord {
+        let gt = self.gt.iter().map(|&a| match a {
+            MISSING | ABSENT => a,
+            _ => (a == k) as u8,
+        }).collect();
+        PassRecord {
+            pos: self.pos, id: self.id.clone(), ref_allele: self.ref_allele.clone(),
+            alts: vec![self.alts[k as usize - 1].clone()], gt, phased: self.phased.clone(),
+        }
+    }
 }
 
 /// The unmatched records of one chromosome, each anchored to the panel variant
@@ -248,6 +262,13 @@ pub fn collect(path: &str, contig: &str, matched: &HashSet<SiteKey>) -> io::Resu
 }
 
 /// Keep `rec` when it is on the wanted contig and not a matched panel site.
+///
+/// The target readers split a multi-allelic record into one marker per ALT, so
+/// each ALT is matched on its own. A record none of whose ALTs matched is carried
+/// as given; one whose every ALT matched is a panel site; for one in between, the
+/// ALTs the panel lacks are carried as split biallelic records (the
+/// `bcftools norm -m-` form the matched ALTs took), so no allele of the input is
+/// lost and none is written twice.
 fn scan<R: noodles_vcf::variant::Record>(
     rec: &R, header: &noodles_vcf::Header, want: &str,
     matched: &HashSet<SiteKey>, out: &mut Vec<PassRecord>,
@@ -257,14 +278,66 @@ fn scan<R: noodles_vcf::variant::Record>(
     let pos = usize::from(start) as i64;
     let ref_allele: String = rec.reference_bases().iter()
         .map(|b| b.map(char::from)).collect::<io::Result<_>>()?;
-    let first_alt = match rec.alternate_bases().iter().next() {
+    let alt_bases = rec.alternate_bases();
+    let n_alts = alt_bases.len();
+    let mut alts = alt_bases.iter();
+    let first_alt = match alts.next() {
         Some(a) => a?.to_string(),
         None => ".".to_string(),
     };
-    if matched.contains(&(pos, ref_allele, first_alt)) { return Ok(()); }
-    let buf = noodles_vcf::variant::RecordBuf::try_from_variant_record(header, rec)?;
-    out.push(pass_record(&buf, pos));
+    let mut key = (pos, ref_allele, first_alt);
+    let first_matched = matched.contains(&key);
+    if n_alts <= 1 {
+        if first_matched { return Ok(()); }
+        let buf = noodles_vcf::variant::RecordBuf::try_from_variant_record(header, rec)?;
+        out.push(pass_record(&buf, pos));
+        return Ok(());
+    }
+    // Multi-allelic: which ALTs (1-based allele indexes) did the panel match?
+    let mut unmatched: Vec<u8> = Vec::new();
+    if !first_matched { unmatched.push(1); }
+    for (k, a) in alts.enumerate() {
+        key.2 = a?.to_string();
+        if !matched.contains(&key) { unmatched.push((k + 2).min(ABSENT as usize - 1) as u8); }
+    }
+    if unmatched.len() == n_alts {
+        let buf = noodles_vcf::variant::RecordBuf::try_from_variant_record(header, rec)?;
+        out.push(pass_record(&buf, pos));
+    } else if !unmatched.is_empty() {
+        let buf = noodles_vcf::variant::RecordBuf::try_from_variant_record(header, rec)?;
+        let whole = pass_record(&buf, pos);
+        if whole.alts.len() == n_alts { // no `.` ALT shifting the allele indexes
+            for k in unmatched { out.push(whole.split_alt(k)); }
+        }
+    }
     Ok(())
+}
+
+/// The `##contig` header line of each contig the target at `path` declares, keyed
+/// by its name without `chr`, as `##contig=<ID=name[,length=n]>`.
+pub fn target_contig_lines(path: &str) -> io::Result<std::collections::HashMap<String, String>> {
+    let header = if path.ends_with(".bcf") || is_binary_bcf(path) {
+        let mut reader = noodles_bcf::io::reader::Builder::default().build_from_path(path)?;
+        reader.read_header()?
+    } else {
+        let mut reader = noodles_vcf::io::reader::Builder::default().build_from_path(path)?;
+        reader.read_header()?
+    };
+    Ok(header.contigs().iter().map(|(name, map)| {
+        let line = match map.length() {
+            Some(n) => format!("##contig=<ID={name},length={n}>"),
+            None => format!("##contig=<ID={name}>"),
+        };
+        (bare(name).to_string(), line)
+    }).collect())
+}
+
+/// Every record of `contig` in the target at `path`, as given (a whole target
+/// chromosome the panel lacks), anchored before panel variant 0. `out_contig` is
+/// the spelling written.
+pub fn whole_contig(path: &str, contig: &str, out_contig: &str) -> io::Result<Passthrough> {
+    let recs = collect(path, contig, &HashSet::new())?;
+    Ok(Passthrough::new(out_contig, recs, |_| 0, 0))
 }
 
 /// A BGZF file whose decompressed content starts with the BCF magic (a BCF
@@ -391,5 +464,16 @@ mod tests {
         assert!(d[2].is_nan());
         assert_eq!(d[3], 1.0);
         assert!((p.rec(0).alt_freq() - 4.0 / 8.0).abs() < 1e-6); // 1 + 2 + (no-call) + 1
+    }
+
+    #[test]
+    fn a_split_alt_counts_its_own_allele_only() {
+        let r = rec(5, &["C", "T"], &[(0, 2, true), (1, 2, false), (MISSING, 2, false), (2, ABSENT, false)]);
+        let t = r.split_alt(2);
+        assert_eq!(t.alts, vec!["T".to_string()]);
+        let p = Passthrough::new("22", vec![t], |_| 0, 0);
+        let mut buf = Vec::new();
+        p.append_vcf(0, 0..4, &mut buf);
+        assert_eq!(String::from_utf8(buf).unwrap(), "22\t5\t.\tA\tT\t.\t.\t.\tGT\t0|1\t0/1\t./1\t1\n");
     }
 }

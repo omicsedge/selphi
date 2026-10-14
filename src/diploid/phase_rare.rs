@@ -165,7 +165,8 @@ pub fn run_phase_rare(
 
         for l in 0..n_scaffold {
             u_arr.fill(0);
-            p_arr.fill(l);
+            // first of a bucket: match starts at l + 1 (see Ibd2Tracks::detect)
+            p_arr.fill(l + super::ibd2_tracks::sentinel_offset());
             let sv = scaffold_sites[l];
             for i in 0..n_ind {
                 let alookup = if l > 0 { a_scan[0][i] } else { i };
@@ -459,9 +460,13 @@ fn run_pbwt_phase(
             // Fill c_vec for target haps from `phased`, for ref haps from
             // the supplied full-chip reference bitmatrix. Target row stride
             // is `n_target_haps` (phased is n_var × n_target_haps).
+            // A no-call (the >1 sentinel, cleared only after this pass) carries no allele and
+            // does not vote, as in SHAPEIT5 (C = 0 for a missing genotype). Counting it as
+            // ALT put a spurious +1 beside carriers: +1.7 pp singleton switch error at 2%
+            // no-calls, +5.5 pp at 10% (--phase-panel, 801 samples, 22:30-32 Mb).
             let tar_base = rv * n_target_haps;
             for h in 0..n_target_haps {
-                c_vec[h] = if phased[tar_base + h] != 0 { 1 } else { -1 };
+                c_vec[h] = match phased[tar_base + h] { 0 => -1, 1 => 1, _ => 0 };
             }
             if let Some(ref_bm) = full_chip_ref_bm {
                 for h in n_target_haps..n_hap {

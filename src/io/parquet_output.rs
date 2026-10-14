@@ -84,6 +84,7 @@ pub fn write_tile_to_parquet(
     n_ref_variants: usize,
     // R4b: per-(chip-site,sample) hard-call preservation at re-routed sites.
     is_input_chip: &[bool],
+    imp: &[bool],
     site_conf_per_sample: Option<&[f64]>,
     refine_thr: f64,
 ) -> std::io::Result<()> {
@@ -156,7 +157,8 @@ pub fn write_tile_to_parquet(
             );
             afs.append_value(ac as f32 / n_haps as f32);
             dr2s.append_value(dr2_f64 as f32);
-            imps.append_value(true);
+            // IMP: the site is absent from the input (not a typed site written as dosage).
+            imps.append_value(imp[local_i]);
         }
         n_rows += 1;
     }

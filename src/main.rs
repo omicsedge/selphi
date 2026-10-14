@@ -215,6 +215,12 @@ fn main() {
         let map = args.map_path.as_deref()
             .unwrap_or_else(|| { eprintln!("Error: --map is required for --lcwgs"); std::process::exit(1); });
         let output = args.out.as_deref().unwrap_or("lcwgs_imputed");
+        let out_stem = output.strip_suffix(".vcf.gz").or_else(|| output.strip_suffix(".bcf")).unwrap_or(output);
+        let vcf_path = PathBuf::from(format!("{out_stem}.vcf.gz"));
+        let tsv_path = PathBuf::from(format!("{out_stem}.dose.tsv.gz"));
+        let mut inputs: Vec<&str> = bam_paths.iter().map(String::as_str).collect();
+        inputs.push(input);
+        selphi::common::utils::refuse_overwrite(&inputs, &[vcf_path.clone(), tsv_path.clone()]);
 
         let log_path = selphi::common::utils::out_path(std::path::Path::new(output), "log");
         selphi::log::init(&log_path, args.debug);
@@ -264,9 +270,7 @@ fn main() {
                 "  ls-exact done: {} variants × {} samples in {:.1}s",
                 result.n_variants, result.sample_ids.len(), start.elapsed().as_secs_f32(),
             );
-            let vcf_path = PathBuf::from(format!("{}.vcf.gz",
-            output.strip_suffix(".vcf.gz").or_else(|| output.strip_suffix(".bcf")).unwrap_or(output)));
-            if let Err(e) = selphi::lcwgs::output::write_lcwgs_vcf(&result, &vcf_path) {
+            if let Err(e) = selphi::lcwgs::output::write_lcwgs_vcf(&result, &srp, &vcf_path) {
                 eprintln!("Failed to write {}: {}", vcf_path.display(), e);
                 std::process::exit(1);
             }
@@ -275,7 +279,22 @@ fn main() {
         }
 
         // Run lcWGS pipeline (BAM-native GL pileup, or pre-computed PL VCF)
-        let params = selphi::lcwgs::LcwgsParams::default();
+        let haploids = args.haploids.as_deref().map(|h| {
+            let names = std::fs::read_to_string(h).unwrap_or_else(|e| {
+                selphi_error!("Cannot read --haploids {}: {}", h, e); std::process::exit(1);
+            });
+            names.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(String::from).collect()
+        });
+        let params = selphi::lcwgs::LcwgsParams {
+            haploids,
+            chrx_par: !args.chrx_no_par,
+            build: match args.build {
+                crate::cli::BuildArg::Grch37 => Some(selphi::contig::Build::Grch37),
+                crate::cli::BuildArg::Grch38 => Some(selphi::contig::Build::Grch38),
+                crate::cli::BuildArg::Auto => None,
+            },
+            ..Default::default()
+        };
         // Optional --region "chr:start-end" (or "chr") to bound BAM-mode imputation.
         let bam_region: Option<(String, i64, i64)> = args.region.as_deref().map(|r| {
             // Default only on an absent bound; a non-empty unparseable coordinate
@@ -308,39 +327,15 @@ fn main() {
             result.n_variants, n_out, if n_out == 1 { "" } else { "s" });
 
         // Write imputed VCF.gz with GT:DS:GP.
-        let vcf_path = PathBuf::from(format!("{}.vcf.gz",
-            output.strip_suffix(".vcf.gz").or_else(|| output.strip_suffix(".bcf")).unwrap_or(output)));
-        if let Err(e) = selphi::lcwgs::output::write_lcwgs_vcf(&result, &vcf_path) {
+        if let Err(e) = selphi::lcwgs::output::write_lcwgs_vcf(&result, &srp, &vcf_path) {
             eprintln!("Failed to write {}: {}", vcf_path.display(), e);
             std::process::exit(1);
         }
         selphi_step!("wrote imputed VCF: {}", vcf_path.display());
 
-        // Also emit a bgzf dosage TSV (chrom:pos:ref:alt per row) for fast
-        // identity-matched evaluation, gated by --parquet-like flag reuse:
-        // always write it next to the VCF for benchmarking convenience.
-        let tsv_path = PathBuf::from(format!("{}.dose.tsv.gz",
-            output.strip_suffix(".vcf.gz").or_else(|| output.strip_suffix(".bcf")).unwrap_or(output)));
-        let n_var = result.n_variants;
-        let n_samp = result.sample_ids.len();
-        if let Err(e) = (|| -> std::io::Result<()> {
-            use std::io::Write;
-            let file = std::fs::File::create(&tsv_path)?;
-            let mut bgzf = noodles_bgzf::io::Writer::new(file);
-            write!(bgzf, "variant")?;
-            for s in &result.sample_ids { write!(bgzf, "\t{}", s)?; }
-            writeln!(bgzf)?;
-            for v in 0..n_var {
-                let (chrom, pos, r, a) = &result.variants[v];
-                write!(bgzf, "{}:{}:{}:{}", chrom, pos, r, a)?;
-                for s in 0..n_samp {
-                    write!(bgzf, "\t{:.4}", result.dosage[v * n_samp + s])?;
-                }
-                writeln!(bgzf)?;
-            }
-            bgzf.finish()?;
-            Ok(())
-        })() {
+        // Also emit a bgzf dosage TSV (chrom:pos:ref:alt per row) next to the VCF,
+        // for identity-matched evaluation.
+        if let Err(e) = selphi::lcwgs::output::write_dose_tsv(&result, &srp, &tsv_path) {
             eprintln!("Failed to write {}: {}", tsv_path.display(), e);
             std::process::exit(1);
         }
@@ -590,6 +585,11 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
         // export-bref3 path is unchanged.
         let want_decode = (source.ends_with(".bref3") || is_srp_input)
             && (output.ends_with(".vcf.gz") || output.ends_with(".bcf"));
+        let output_bref3 = output.ends_with(".bref3") || is_srp_input;
+        selphi::common::utils::refuse_overwrite(&[source], &[
+            if want_decode { PathBuf::from(output) }
+            else if output_bref3 { selphi::srp::helpers::with_panel_suffix(Path::new(output), "bref3") }
+            else { selphi::srp::helpers::with_panel_suffix(Path::new(output), "srp") }]);
         if want_decode {
             let log_path = selphi::common::utils::out_path(std::path::Path::new(output), "log");
             selphi::log::init(&log_path, args.debug);
@@ -607,8 +607,6 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
                 start_time.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
             return;
         }
-
-        let output_bref3 = output.ends_with(".bref3") || is_srp_input;
 
         let log_path = selphi::common::utils::out_path(std::path::Path::new(output), "log");
         selphi::log::init(&log_path, args.debug);
@@ -735,6 +733,8 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
     }
     let target_path = args.input.as_deref().expect("--input is required");
     let output_path = args.out.as_deref().expect("--out is required");
+    selphi::common::utils::refuse_overwrite(&[target_path], &[
+        selphi::common::utils::out_path(Path::new(output_path), if args.bcf { "bcf" } else { "vcf.gz" })]);
 
     // Auto-detect multi-chr SRP and delegate to native orchestrator
     if let Ok(3) = selphi::srp::multi_chr_reader::detect_srp_version(&args.refpanel) {

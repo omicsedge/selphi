@@ -53,6 +53,10 @@ pub(crate) struct WindowSetup<'a> {
     /// re-routed (soft) site, `is_chip=false` but `is_input_chip=true`, which is
     /// what lets the imputed formatters preserve confident samples' hard calls.
     pub is_input_chip: Vec<bool>,
+    /// IMP per window-local variant: the site is absent from the input. False at
+    /// every input chip site and at the input sites dropped as uncalled in every
+    /// sample (`WindowInput::uncalled_typed`), which are written as dosage.
+    pub imp: Vec<bool>,
     pub chip_local_idx: Vec<usize>,
     pub intervals: Vec<Interval>,
     pub weight_refs: Vec<&'a CsrWeights>,
@@ -131,6 +135,16 @@ pub(crate) fn build_intervals(
     intervals
 }
 
+/// IMP flags of the window `[own_start, own_end)`: absent from the input, i.e.
+/// neither an input chip site nor an input site dropped as uncalled everywhere.
+pub(crate) fn imp_flags(is_input_chip: &[bool], uncalled_typed: &[usize], own_start: usize, own_end: usize) -> Vec<bool> {
+    let mut imp: Vec<bool> = is_input_chip.iter().map(|&t| !t).collect();
+    for &w in uncalled_typed.iter().filter(|&&w| w >= own_start && w < own_end) {
+        imp[w - own_start] = false;
+    }
+    imp
+}
+
 impl<'a> WindowSetup<'a> {
     /// Build per-window context: chip lookup, intervals, variant prefixes, weights.
     pub fn new(
@@ -144,6 +158,7 @@ impl<'a> WindowSetup<'a> {
         site_conf: Option<&[f64]>,
         site_conf_per_sample: Option<&[f64]>,
         refine_thr: f64,
+        uncalled_typed: &[usize],
     ) -> Self {
         let n_haps = n_samples * 2;
         let n_ref_variants = srp.n_variants();
@@ -181,7 +196,7 @@ impl<'a> WindowSetup<'a> {
             }
         }
         if n_rerouted > 0 {
-            crate::selphi_step!("--refine: re-routed {} low-confidence chip site(s) to imputed output (thr={})", n_rerouted, refine_thr);
+            crate::selphi_step!("{} typed site(s) with a missing or low-confidence call written as imputed dosage for those samples (confidence < {})", n_rerouted, refine_thr);
         }
 
         let vid_prefixes: Vec<Vec<u8>> = (own_wgs_start..own_wgs_end).map(|i| {
@@ -210,7 +225,8 @@ impl<'a> WindowSetup<'a> {
 
         WindowSetup {
             own_wgs_start, own_wgs_end, n_haps, n_ref_variants,
-            chunk_size, is_chip, is_input_chip, chip_local_idx, intervals,
+            chunk_size, is_chip, imp: imp_flags(&is_input_chip, uncalled_typed, own_wgs_start, own_wgs_end),
+            is_input_chip, chip_local_idx, intervals,
             weight_refs, vid_prefixes, an_str,
             site_conf_per_sample: site_conf_per_sample.map(|c| c.to_vec()),
             refine_thr, n_samples,
@@ -440,6 +456,7 @@ fn format_tile_batch(
     no_ap: bool,
     // R4b: per-(chip-site,sample) hard-call preservation at re-routed sites.
     is_input_chip: &[bool],
+    imp: &[bool],
     site_conf_per_sample: Option<&[f64]>,
     refine_thr: f64,
 ) -> Vec<u8> {
@@ -517,10 +534,13 @@ fn format_tile_batch(
                 buf.extend_from_slice(an_str);
                 buf.extend_from_slice(b";DR2=");
                 write_f4(&mut buf, dr2);
+                // IMP marks a site absent from the input. A typed site written with the
+                // model's dosage (some sample's call missing or untrusted) is not one.
+                if imp[local_i] { buf.extend_from_slice(b";IMP"); }
                 if no_ap {
-                    buf.extend_from_slice(b";IMP\tGT:DS");
+                    buf.extend_from_slice(b"\tGT:DS");
                 } else {
-                    buf.extend_from_slice(b";IMP\tGT:DS:AP1:AP2");
+                    buf.extend_from_slice(b"\tGT:DS:AP1:AP2");
                 }
 
                 // Pre-computed constant strings for trivial dosages.
@@ -691,6 +711,7 @@ fn format_tile_batch_bcf(
     no_ap: bool,
     // R4b: per-(chip-site,sample) hard-call preservation at re-routed sites.
     is_input_chip: &[bool],
+    imp: &[bool],
     site_conf_per_sample: Option<&[f64]>,
     refine_thr: f64,
 ) -> Vec<u8> {
@@ -748,7 +769,7 @@ fn format_tile_batch_bcf(
                 bcf_encode::encode_imputed_record(
                     &mut buf, vi.rid, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
                     alt_probs, tile_n, v, n_samples, n_haps, no_ap, &mut ds_scratch,
-                    hc.as_ref(),
+                    hc.as_ref(), imp[local_i],
                 );
             }
         }
@@ -873,6 +894,9 @@ pub struct WindowInput<'a> {
     /// Target records absent from the panel, written at their position
     /// (`None` under `--drop-unmatched` or when there are none).
     pub passthrough: Option<&'a crate::io::passthrough::Passthrough>,
+    /// Panel indices of the input sites with no call in any sample, dropped from
+    /// the chip set: written as imputed dosage but, being in the input, without IMP.
+    pub uncalled_typed: &'a [usize],
 }
 
 /// Active output sinks. Only the ones requested by `OutputFormats` are
@@ -885,25 +909,41 @@ pub struct WindowWriters<'a> {
 }
 
 /// Accumulate the dosage-R² of every IMPUTED site in one interpolated tile into
-/// `acc` (the run-level mean-DR2 quality summary). Chip/typed sites are skipped.
+/// `acc` (the run-level mean-DR2 quality summary), with each imputed call's
+/// genotype confidence taken in the same pass. Chip/typed sites are skipped.
 /// Uses the raw panel `alt_probs`; at the rare `--refine` re-routed hard-call
 /// sites that is the model DR2, a negligible approximation for a summary.
+/// Parallel over fixed 64-variant chunks merged in order, so the sums are the
+/// same on every run (it was a serial pass on the writer thread, n_variants ×
+/// n_samples per run).
 fn accumulate_tile_dr2(
     acc: &mut crate::io::dosage_stats::Dr2Summary,
     alt_probs: &[f32], tile_n: usize, global_start: usize,
-    setup: &WindowSetup, n_samples: usize, scratch: &mut [f32],
+    setup: &WindowSetup, n_samples: usize,
 ) {
-    for v in 0..tile_n {
-        if global_start + v >= setup.n_ref_variants { break; }
-        let local_i = global_start - setup.own_wgs_start + v;
-        if setup.is_chip[local_i] { continue; }
-        let (_, dr2) = crate::io::dosage_stats::imputed_ac_dr2(
-            n_samples, setup.n_haps,
-            |s| (alt_probs[(s * 2) * tile_n + v], alt_probs[(s * 2 + 1) * tile_n + v]),
-            scratch,
-        );
-        acc.add(dr2);
-    }
+    use crate::io::dosage_stats::Dr2Summary;
+    let n_rows = tile_n.min(setup.n_ref_variants.saturating_sub(global_start));
+    let parts: Vec<Dr2Summary> = (0..n_rows.div_ceil(64)).into_par_iter().map(|c| {
+        let mut part = Dr2Summary::default();
+        let mut scratch = vec![0f32; n_samples];
+        for v in c * 64..((c + 1) * 64).min(n_rows) {
+            let local_i = global_start - setup.own_wgs_start + v;
+            if setup.is_chip[local_i] { continue; }
+            let calls = std::cell::Cell::new(part);
+            let ap = |s: usize| {
+                let p = (alt_probs[(s * 2) * tile_n + v], alt_probs[(s * 2 + 1) * tile_n + v]);
+                let mut c = calls.get();
+                c.add_call(p.0, p.1);
+                calls.set(c);
+                p
+            };
+            let (_, dr2) = crate::io::dosage_stats::imputed_ac_dr2(n_samples, setup.n_haps, ap, &mut scratch);
+            part = calls.get();
+            part.add(dr2);
+        }
+        part
+    }).collect();
+    for p in parts { acc.merge(&p); }
 }
 
 /// Write one window to all active output formats.
@@ -918,14 +958,14 @@ pub fn write_window_multiformat(
         srp, all_weights, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples, chip_genotypes, no_ap,
         preloaded_chunks, preloaded_stripes, site_conf, site_conf_per_sample, refine_thr,
-        interp_cum_cm, passthrough,
+        interp_cum_cm, passthrough, uncalled_typed,
     } = input;
     let WindowWriters { parquet: parquet_writer, pgen: pgen_writer, selfdecode: sd_writer, vcf_tx } = writers;
 
     let setup = WindowSetup::new(
         srp, all_weights, win_chip_start,
         own_chip_start, own_chip_end, wgs_idx, n_samples,
-        site_conf, site_conf_per_sample, refine_thr,
+        site_conf, site_conf_per_sample, refine_thr, uncalled_typed,
     );
 
     if setup.intervals.is_empty() {
@@ -969,8 +1009,6 @@ pub fn write_window_multiformat(
     let mut sd_ap2 = if formats.selfdecode { vec![0.0f32; n_samples] } else { Vec::new() };
     // R4b: reusable per-sample hard-call mask for the PGEN/SD imputed branch.
     let mut sd_hc_mask = if formats.selfdecode { vec![false; n_samples] } else { Vec::new() };
-    // Reusable dosage scratch for the format-independent DR2 quality accumulation.
-    let mut dr2_scratch = vec![0f32; n_samples];
 
     // BCF contig index of this window's chromosome, for passthrough records.
     let pass_rid = var_infos.as_ref().and_then(|v| v.first()).map(|v| v.rid).unwrap_or(0);
@@ -1049,7 +1087,7 @@ pub fn write_window_multiformat(
                                 writer, sa, &[], 1, 0..1, n_samples, setup.n_haps,
                                 next_wgs, &setup.vid_prefixes, vp_start, &setup.is_chip,
                                 &setup.chip_local_idx, chip_genotypes, setup.n_ref_variants,
-                                &setup.is_input_chip, setup.site_conf_per_sample.as_deref(), setup.refine_thr)?;
+                                &setup.is_input_chip, &setup.imp, setup.site_conf_per_sample.as_deref(), setup.refine_thr)?;
                         }
                     }
                     if formats.pgen || formats.selfdecode {
@@ -1088,7 +1126,7 @@ pub fn write_window_multiformat(
                     $global_start, setup.n_ref_variants,
                     vp_start, &setup.vid_prefixes, &setup.is_chip, &setup.chip_local_idx,
                     chip_genotypes, &setup.an_str, no_ap,
-                    &setup.is_input_chip, setup.site_conf_per_sample.as_deref(), setup.refine_thr,
+                    &setup.is_input_chip, &setup.imp, setup.site_conf_per_sample.as_deref(), setup.refine_thr,
                 )).expect("VCF send failed");
             }
             if formats.bcf {
@@ -1099,7 +1137,7 @@ pub fn write_window_multiformat(
                     $global_start, setup.n_ref_variants,
                     vi_start, vi, &setup.is_chip, &setup.chip_local_idx,
                     chip_genotypes, no_ap,
-                    &setup.is_input_chip, setup.site_conf_per_sample.as_deref(), setup.refine_thr,
+                    &setup.is_input_chip, &setup.imp, setup.site_conf_per_sample.as_deref(), setup.refine_thr,
                 )).expect("VCF send failed");
             }
             if let Some((ref mut writer, _)) = pw {
@@ -1109,7 +1147,7 @@ pub fn write_window_multiformat(
                         writer, sa, $alt_probs, $tile_n, rows.clone(), n_samples, setup.n_haps,
                         $global_start, &setup.vid_prefixes, vp_start, &setup.is_chip,
                         &setup.chip_local_idx, chip_genotypes, setup.n_ref_variants,
-                        &setup.is_input_chip, setup.site_conf_per_sample.as_deref(), setup.refine_thr)?;
+                        &setup.is_input_chip, &setup.imp, setup.site_conf_per_sample.as_deref(), setup.refine_thr)?;
                 }
             }
             if formats.pgen || formats.selfdecode {
@@ -1193,7 +1231,7 @@ pub fn write_window_multiformat(
             }
             // Format-independent imputation-quality accumulation (mean DR2 over
             // imputed sites). Runs once per tile regardless of active formats.
-            accumulate_tile_dr2(dr2_acc, $alt_probs, $tile_n, $global_start, &setup, n_samples, &mut dr2_scratch);
+            accumulate_tile_dr2(dr2_acc, $alt_probs, $tile_n, $global_start, &setup, n_samples);
         }};
     }
 

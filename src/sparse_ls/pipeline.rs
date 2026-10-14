@@ -11,7 +11,7 @@
 //!   * `crate::lcwgs::pl_reader::parse_pl_vcf`  — target VCF/BCF PL → gl3.
 //!   * `crate::io::target_io::intersect_variants` — target ∩ panel sites.
 //!   * `crate::srp::SrpReader::extract_ref_alleles_bitmatrix` — panel → bitmatrix.
-//!   * `crate::genmap::{load_genetic_map_raw, interpolate_cm_extrapolate}` — cM.
+//!   * `crate::genmap::{load_genetic_map_for, interpolate_cm_mean_rate}` — cM.
 //!   * `crate::lcwgs::pipeline::LcwgsOutput` + `crate::lcwgs::output::write_lcwgs_vcf`.
 
 use crate::common::HaplotypeBitmatrix;
@@ -73,7 +73,7 @@ pub fn run_pipeline(
         let first_ref = &srp.variants[0].ref_allele;
         !srp.ids[0].contains(first_ref)
     };
-    let PlVcfResult { gl3: gl3_input, markers, sample_ids } =
+    let PlVcfResult { gl3: gl3_input, markers, sample_ids, .. } =
         parse_pl_vcf(target_vcf, hash_alleles)?;
     let n_samples = sample_ids.len();
     let n_target_variants = markers.len();
@@ -108,17 +108,10 @@ pub fn run_pipeline(
 
     // --- 4. cM map + per-shared-site variant identities + allele counts. ---
     let (map_bp, map_cm) =
-        crate::genmap::load_genetic_map_raw(std::path::Path::new(map_path))?;
+        crate::genmap::load_genetic_map_for(std::path::Path::new(map_path), Some(srp.chromosome()))?;
     let cm: Vec<f64> = wgs_idx
         .iter()
-        .map(|&wi| crate::genmap::interpolate_cm_extrapolate(&map_bp, &map_cm, srp.variants[wi].pos))
-        .collect();
-    let variants: Vec<(String, i64, String, String)> = wgs_idx
-        .iter()
-        .map(|&wi| {
-            let v = &srp.variants[wi];
-            (v.chr.clone(), v.pos, v.ref_allele.clone(), v.alt_allele.clone())
-        })
+        .map(|&wi| crate::genmap::interpolate_cm_mean_rate(&map_bp, &map_cm, srp.variants[wi].pos))
         .collect();
 
     // Build the reference VariantMap: cref/calt by popcount over the ref bitmatrix
@@ -128,12 +121,12 @@ pub fn run_pipeline(
     for s in 0..n_shared {
         let calt = ref_bm.popcount_row(s, n_ref_haps);
         let cref = n_ref_haps as u32 - calt;
-        let (chr, pos, ref_a, alt_a) = &variants[s];
+        let v = &srp.variants[wgs_idx[s]];
         vmap.vars.push(Variant {
-            bp: *pos,
-            id: format!("{}:{}", chr, pos),
-            ref_a: ref_a.clone(),
-            alt_a: alt_a.clone(),
+            bp: v.pos,
+            id: format!("{}:{}", v.chr, v.pos),
+            ref_a: v.ref_allele.clone(),
+            alt_a: v.alt_allele.clone(),
             vtype: 0,
             idx: s as i32,
             cref,
@@ -187,7 +180,7 @@ pub fn run_pipeline(
         }
     }
 
-    Ok(LcwgsOutput { dosage, gp, n_variants: n_shared, sample_ids, variants })
+    Ok(LcwgsOutput { dosage, gp, n_variants: n_shared, sample_ids, panel_idx: wgs_idx })
 }
 
 #[cfg(test)]

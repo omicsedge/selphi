@@ -208,6 +208,8 @@ struct OutputCtx {
 fn setup_output_writers(
     args: &Args, n_samples: usize, sample_names: &[String],
     contig_field: &str, version: &str, out_path: &Path,
+    // Upper bound on the records a PGEN will hold (panel variants + passthrough).
+    max_variants: usize,
 ) -> (OutputCtx, OutputWriters) {
     let no_ap = args.no_ap;
 
@@ -256,7 +258,7 @@ fn setup_output_writers(
         let pgen_file = selphi::common::utils::out_path(out_path, "pgen");
         selphi::io::pgen_output::write_psam(&pgen_file, sample_names).expect("Failed to write .psam");
         let pvar = selphi::io::pgen_output::write_pvar(&pgen_file).expect("Failed to write .pvar");
-        let pg = selphi::io::pgen_output::PgenWriter::new(&pgen_file, n_samples).expect("Failed to create .pgen");
+        let pg = selphi::io::pgen_output::PgenWriter::new(&pgen_file, n_samples, max_variants).expect("Failed to create .pgen");
         Some((pg, pvar))
     } else { None };
     let selfdecode = if formats.selfdecode && !batched {
@@ -317,7 +319,7 @@ fn setup_output_writers(
     }
     if batch_active.pgen {
         batch.pgen = selphi::io::pgen_batch::setup_pgen_batch_writers(
-            n_haps_total, target_batch_size_haps, &batch_tmp_dir, sample_names,
+            n_haps_total, target_batch_size_haps, &batch_tmp_dir, sample_names, max_variants,
         ).expect("Failed to setup PGEN batch writers");
         selphi_info!("  batched: {} batch PGEN writers active", batch.pgen.len());
     }
@@ -385,7 +387,7 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
     } = *inp;
 
     selphi_step!("Input is unphased — running phasing pipeline...");
-    let (map_bp_raw, map_cm_raw) = genmap::load_genetic_map_raw(Path::new(map_path))
+    let (map_bp_raw, map_cm_raw) = genmap::load_genetic_map_for(Path::new(map_path), Some(srp.chromosome()))
         .unwrap_or_else(|e| { selphi_error!("Cannot read genetic map {}: {}", map_path, e); std::process::exit(1); });
     let ref_bp: Vec<i64> = ref_positions.to_vec();
 
@@ -471,10 +473,12 @@ male chrX): phasing on all {} called sites", scaffold.indices.len());
             // back to target-only.
             // Intra-run phase ensemble member count — see ensemble::resolve_members
             // for the cohort-size cap and why it exists.
-            let n_members = selphi::imputation::ensemble::resolve_members(
-                n_samples, args.phase_ensemble,
-                args.sample_batch_size > 0 || args.phase_only,
-            );
+            let n_members = if selphi::imputation::ensemble::independent_chains().is_some() { 1 } else {
+                selphi::imputation::ensemble::resolve_members(
+                    n_samples, args.phase_ensemble,
+                    args.sample_batch_size > 0 || args.phase_only,
+                )
+            };
             if n_members > 1 {
                 selphi_step!("Diploid intra-run phase ensemble: {} members (1× phasing)", n_members);
                 if n_samples > selphi::imputation::ensemble::ENSEMBLE_COSTLY_ABOVE {
@@ -763,6 +767,12 @@ struct LoadedTarget {
     target_idx: Vec<usize>,
     allele_transforms: Vec<u8>,
     n_chip: usize,
+    /// Every target record the panel matched, including the uncalled ones
+    /// dropped from `target_idx` (the passthrough must not re-emit them).
+    matched_idx: Vec<usize>,
+    /// Panel indices of the input sites uncalled in every sample, dropped from
+    /// the chip set (`drop_uncalled_sites`): imputed, but written without IMP.
+    uncalled_typed: Vec<usize>,
 }
 
 /// Target records that match no panel site, anchored for the output writers
@@ -804,12 +814,20 @@ fn load_and_intersect(args: &Args, target_path: &str, srp: &SrpReader) -> Loaded
 
     // 3. Variant intersection (merge-join on sorted positions)
     let t0_isect = std::time::Instant::now();
-    let (wgs_idx, target_idx, allele_transforms) =
+    let (mut wgs_idx, mut target_idx, mut allele_transforms) =
         intersect_variants(srp, &target_markers, args.allele_match);
     selphi_debug!("  Intersect: {:.1}ms", t0_isect.elapsed().as_secs_f64() * 1000.0);
-    let n_chip = wgs_idx.len();
     selphi_step!("Shared markers: {} ({:.1}% of target)",
-        n_chip, n_chip as f64 / target_markers.len() as f64 * 100.0);
+        wgs_idx.len(), wgs_idx.len() as f64 / target_markers.len() as f64 * 100.0);
+    let matched_idx = target_idx.clone();
+    let uncalled_typed = if args.phase_only { Vec::new() } else {
+        selphi::io::target_io::drop_uncalled_sites(
+            &target_genotypes, &mut wgs_idx, &mut target_idx, &mut allele_transforms)
+    };
+    if !uncalled_typed.is_empty() {
+        selphi_step!("{} shared marker(s) with no call in any sample: imputed as untyped sites", uncalled_typed.len());
+    }
+    let n_chip = wgs_idx.len();
 
     if n_chip == 0 {
         selphi_error!("No shared variants between reference and target.");
@@ -818,7 +836,7 @@ fn load_and_intersect(args: &Args, target_path: &str, srp: &SrpReader) -> Loaded
 
     LoadedTarget {
         sample_names, target_markers, target_genotypes, is_phased,
-        n_samples, n_haps, wgs_idx, target_idx, allele_transforms, n_chip,
+        n_samples, n_haps, wgs_idx, target_idx, allele_transforms, n_chip, matched_idx, uncalled_typed,
     }
 }
 
@@ -983,13 +1001,13 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // 2-3. Read the target VCF + intersect against the panel (see `load_and_intersect`).
     let LoadedTarget {
         sample_names, target_markers, target_genotypes, is_phased,
-        n_samples, n_haps, wgs_idx, target_idx, allele_transforms, n_chip,
+        n_samples, n_haps, wgs_idx, target_idx, allele_transforms, n_chip, matched_idx, uncalled_typed,
     } = load_and_intersect(args, target_path, &srp);
-    let passthrough = build_passthrough(args, target_path, &srp, &target_markers, &target_idx);
+    let passthrough = build_passthrough(args, target_path, &srp, &target_markers, &matched_idx);
 
     // --refine / no-call input confidence + the re-route threshold. See
     // `build_target_confidence` for the full rationale.
-    let (target_site_conf, target_site_conf_per_sample, refine_thr) = build_target_confidence(
+    let (mut target_site_conf, mut target_site_conf_per_sample, refine_thr) = build_target_confidence(
         args, target_path, &target_genotypes, &target_idx, n_chip, n_samples,
     );
 
@@ -1037,7 +1055,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
 
     // 6. Genetic map
     let chip_bps: Vec<i64> = wgs_idx.iter().map(|&wi| ref_positions[wi]).collect();
-    let raw_chip_cm = genmap::load_and_interpolate_genetic_map(Path::new(map_path), &chip_bps)
+    let raw_chip_cm = genmap::load_and_interpolate_genetic_map_for(Path::new(map_path), Some(srp.chromosome()), &chip_bps)
         .unwrap_or_else(|e| { selphi_error!("Cannot read genetic map {}: {}", map_path, e); std::process::exit(1); });
     // Refuse a degenerate (zero cM span) map on a recombining contig: an empty/malformed map
     // makes the loader return cM=0 everywhere, collapsing the whole chromosome to one window
@@ -1068,7 +1086,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // (every bin >=, per-sample 0.899739 -> 0.899758); it is also what Beagle,
     // IMPUTE5 and minimac do. SELPHI_INTERP_RANK=1 restores the rank-linear t.
     let interp_cum_cm: Option<Vec<f64>> = if !selphi::config::is_one("SELPHI_INTERP_RANK") {
-        let (map_bp_raw, map_cm_raw) = genmap::load_genetic_map_raw(Path::new(map_path))
+        let (map_bp_raw, map_cm_raw) = genmap::load_genetic_map_for(Path::new(map_path), Some(srp.chromosome()))
             .unwrap_or_else(|e| { selphi_error!("Cannot read genetic map {}: {}", map_path, e); std::process::exit(1); });
         selphi_debug!("Interpolating untyped sites in genetic distance (cM); SELPHI_INTERP_RANK=1 for variant rank");
         Some(genmap::cumulative_cm_floored(&map_bp_raw, &map_cm_raw, &ref_positions))
@@ -1082,13 +1100,23 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         &sample_names, &target_idx, &target_genotypes,
         n_chip, n_samples, n_haps, &allele_transforms,
     );
-    crate::prephase::apply_haploid_detection(
+    let haploid_resets = crate::prephase::apply_haploid_detection(
         args.haploids.as_deref(), !args.chrx_no_par, args.build,
         needs_phasing, srp.chromosome(), &mut targ_alleles,
         &sample_names, &target_idx, &target_genotypes,
         n_chip, n_samples, n_haps, &chip_bps,
         ref_positions.iter().copied().max().unwrap_or(0),
     );
+    crate::prephase::mark_nocalls(&haploid_resets, n_chip, n_samples,
+        &mut target_site_conf, &mut target_site_conf_per_sample);
+    let par_conf = crate::prephase::par_collapsed_conf();
+    if par_conf < 1.0 {
+        let par_calls = crate::prephase::collapsed_par_calls(
+            !args.chrx_no_par, args.build, srp.chromosome(), &target_idx, &target_genotypes,
+            n_chip, n_samples, &chip_bps, ref_positions.iter().copied().max().unwrap_or(0));
+        crate::prephase::soften_calls(&par_calls, par_conf, n_chip, n_samples,
+            &mut target_site_conf, &mut target_site_conf_per_sample);
+    }
 
     // Phase-ensemble: when N>1, phase the target N times with seeds
     // {seed, seed+1, ..., seed+N-1}. Member 0 flows through the primary locals
@@ -1097,7 +1125,9 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // member 0's before interpolation (marginalizing phase uncertainty). N=1
     // (default) is byte-identical to the non-ensemble path.
     let ensemble_n = if needs_phasing && !args.phase_only {
-        args.phase_ensemble.max(1)
+        selphi::imputation::ensemble::independent_chains()
+            .filter(|_| args.sample_batch_size == 0)
+            .unwrap_or(args.phase_ensemble.max(1))
     } else {
         if args.phase_ensemble > 1 && args.phase_only {
             selphi_info!("  Note: --phase-ensemble is ignored with --phase-only (a single phased VCF is emitted).");
@@ -1246,6 +1276,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     let no_ap = args.no_ap;
     let (octx, writers) = setup_output_writers(
         args, n_samples, &sample_names, &srp.metadata.contig_field, version, &out_path,
+        srp.n_variants() + passthrough.as_ref().map_or(0, |p| p.len()),
     );
     let OutputCtx { formats, out_file, target_batch_size_haps, skip_main_writer, batch_active } = octx;
     let BatchActive {
@@ -1501,6 +1532,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                     interp_cum_cm: interp_cum_cm.as_deref(),
                                     bcf_contig_names: &formats.bcf_contig_names,
                     passthrough: passthrough.as_ref(),
+                    uncalled_typed: &uncalled_typed,
                 };
                 // Find this batch's writer by hap_start, asserting its hap_end matches.
                 macro_rules! find_bi {
@@ -1616,6 +1648,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                 refine_thr,
                 interp_cum_cm: interp_cum_cm.as_deref(),
                 passthrough: passthrough.as_ref(),
+                uncalled_typed: &uncalled_typed,
             },
             selphi::io::pipeline::WindowWriters {
                 parquet: parquet_writer.as_mut().map(|(w, s)| (w, &*s)),
@@ -1715,9 +1748,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // Imputation-quality summary — the model's own DR2 (no truth needed). Beagle/
     // Minimac print this on every run; it's the one quality signal users always get.
     if dr2_acc.n > 0 {
-        selphi_info!("  Imputation quality: mean DR2 {}  ·  {:.1}% of {} imputed variants DR2 \u{2265} 0.8",
-            selphi::log::cyan(&format!("{:.4}", dr2_acc.mean())),
-            dr2_acc.pct_ge08(), selphi::log::fmt_thousands(dr2_acc.n));
+        selphi_info!("  {}", dr2_acc.summary(n_samples));
     }
 
     // Post-imputation accuracy evaluation. Runs the same parallel eval that

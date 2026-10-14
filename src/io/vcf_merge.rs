@@ -330,7 +330,8 @@ fn merge_one_record(
     if is_imputed {
         buf.extend_from_slice(b";DR2=");
         write_f4(&mut buf, dr2);
-        buf.extend_from_slice(b";IMP");
+        // The intermediate's INFO is "IMP" for a site absent from the input.
+        if info_field(first) == "IMP" { buf.extend_from_slice(b";IMP"); }
     }
     buf.push(b'\t');
     // FORMAT in final output respects the user's --no-ap choice
@@ -378,8 +379,13 @@ fn merge_one_record(
     Ok((buf, chrom, pos_0based, rlen))
 }
 
+/// The INFO column of a VCF line ("" when the line is too short).
+fn info_field(line: &str) -> &str {
+    line.split('\t').nth(7).unwrap_or("")
+}
+
 /// Split a VCF record line into (shared 7-col prefix, FORMAT, samples-iter, n_samples).
-/// Strips the 8th col (INFO, expected to be ".") from the prefix.
+/// Strips the 8th col (INFO) from the prefix.
 fn split_record(line: &str) -> std::io::Result<(&str, &str, std::str::Split<'_, char>, usize)> {
     // Need byte offset of the 7th tab (end of FILTER), then skip INFO column,
     // then find FORMAT and samples.

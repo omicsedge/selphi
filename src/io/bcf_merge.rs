@@ -328,9 +328,11 @@ fn merge_one_record(
     // FILTER for our records: 1B descriptor + 1B value = 2 bytes
     let post_filter_off = filter_off + 2;
     // INFO count is independent of --no-ap (that only drops the AP FORMAT
-    // fields): chip = AF,AC,AN (3); imputed = AF,AC,AN,DR2,IMP (5). Must match
-    // the non-batched encoder (bcf_encode declares 5) or htslib mis-parses.
-    let new_n_info: u16 = if is_chip { 3 } else { 5 };
+    // fields): chip = AF,AC,AN (3); imputed = AF,AC,AN,DR2 (4) plus IMP (5) for
+    // a site absent from the input, which the intermediate marks with its one
+    // INFO field. Must match the non-batched encoder or htslib mis-parses.
+    let imp = !is_chip && u16::from_le_bytes([v0.shared[16], v0.shared[17]]) > 0;
+    let new_n_info: u16 = if is_chip { 3 } else if imp { 5 } else { 4 };
     // Intermediate imputed records always carry AP1/AP2 (n_fmt==4); the FINAL
     // output drops them when the user asked --no-ap → write GT+DS only. AC/AF/DR2
     // are computed from the intermediate's per-hap AP (correct) regardless.
@@ -377,8 +379,10 @@ fn merge_one_record(
     if let Some(dr2) = dr2_opt {
         encode_info_int8_key(&mut out, INFO_DR2_IDX);
         encode_typed_float(&mut out, dr2);
-        encode_info_int8_key(&mut out, INFO_IMP_IDX);
-        out.push(0x00); // IMP flag: missing-typed (no value)
+        if imp {
+            encode_info_int8_key(&mut out, INFO_IMP_IDX);
+            out.push(0x00); // IMP flag: missing-typed (no value)
+        }
     }
 
     let l_shared = (out.len() - shared_start) as u32;

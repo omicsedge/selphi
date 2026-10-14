@@ -105,10 +105,20 @@ fn fast_parse_i32(bytes: &[u8]) -> i32 {
     if seen { n } else { -1 }
 }
 
-/// Parse a single PL byte-slice like `"0,15,180"` into a [pl00, pl01, pl11].
+/// A haploid call's `PL` pair `[p0, p1]` as the diploid triple of the product form
+/// `L(a,b) ∝ h_a·h_b` (`[2p0, p0+p1, 2p1]`): the per-haplotype draw given the other
+/// haplotype's allele is then `∝ (h0, h1)` whatever that allele, both haplotypes
+/// carry the one allele's evidence, and a flat pair stays flat.
+#[inline]
+fn haploid_pl(p0: i32, p1: i32) -> [i32; 3] {
+    [p0.saturating_mul(2), p0.saturating_add(p1), p1.saturating_mul(2)]
+}
+
+/// Parse a single PL byte-slice: `"0,15,180"` → `([pl00, pl01, pl11], false)`, a
+/// haploid call's `"0,15"` → its product-form triple (see [`haploid_pl`]) and `true`.
 /// Returns `None` for missing/malformed input.
 #[inline]
-fn parse_pl_field(bytes: &[u8]) -> Option<[i32; 3]> {
+fn parse_pl_field(bytes: &[u8]) -> Option<([i32; 3], bool)> {
     if bytes.is_empty() || bytes == b"." {
         return None;
     }
@@ -128,11 +138,13 @@ fn parse_pl_field(bytes: &[u8]) -> Option<[i32; 3]> {
         }
         i += 1;
     }
-    if idx != 2 { return None; }
     let v = fast_parse_i32(&bytes[start..]);
     if v < 0 { return None; }
-    out[2] = v;
-    Some(out)
+    match idx {
+        2 => { out[2] = v; Some((out, false)) }
+        1 => Some((haploid_pl(out[0], v), true)),
+        _ => None,
+    }
 }
 
 /// Find the index of `name` within a colon-separated FORMAT spec
@@ -184,6 +196,9 @@ pub struct PlVcfResult {
     pub markers: Vec<TargetMarker>,
     /// Sample IDs from the VCF #CHROM line.
     pub sample_ids: Vec<String>,
+    /// Per sample: some record carries a haploid (two-value) `PL` for it, i.e. the
+    /// caller declared it haploid there (`bcftools call --ploidy`: a man's chrX).
+    pub haploid_samples: Vec<bool>,
 }
 
 const FLAT_HL: [f32; 2] = [0.5, 0.5];
@@ -217,14 +232,16 @@ fn pl_to_hl_gl3(pl: Option<[i32; 3]>) -> ([f32; 2], [f32; 3], bool) {
 }
 
 /// Extract a `[pl00, pl01, pl11]` triple from a decoded BCF `PL` sample value
-/// (an integer array). Returns `None` if absent, non-integer, short, or any
-/// element is missing.
+/// (an integer array), or a haploid pair's product-form triple (flag `true`, see
+/// [`haploid_pl`]). Returns `None` if absent, non-integer, short, or any element
+/// is missing.
 fn bcf_value_to_pl3(
     v: &noodles_vcf::variant::record_buf::samples::sample::value::Value,
-) -> Option<[i32; 3]> {
+) -> Option<([i32; 3], bool)> {
     use noodles_vcf::variant::record_buf::samples::sample::value::{Array, Value};
     match v {
-        Value::Array(Array::Integer(vals)) if vals.len() >= 3 => Some([vals[0]?, vals[1]?, vals[2]?]),
+        Value::Array(Array::Integer(vals)) if vals.len() >= 3 => Some(([vals[0]?, vals[1]?, vals[2]?], false)),
+        Value::Array(Array::Integer(vals)) if vals.len() == 2 => Some((haploid_pl(vals[0]?, vals[1]?), true)),
         _ => None,
     }
 }
@@ -247,6 +264,7 @@ fn parse_pl_bcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Result<P
     let mut gl3: Vec<f32> = Vec::new();
     let mut n_variants_seen = 0usize;
     let mut n_missing_pl = 0usize;
+    let mut haploid_samples = vec![false; n_samples];
 
     for result in reader.record_bufs(&header) {
         let rec = result?;
@@ -273,7 +291,8 @@ fn parse_pl_bcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Result<P
         for (s, sample) in samples.values().enumerate() {
             if s >= n_samples { break; }
             let pl_opt = sample.get("PL").flatten().and_then(bcf_value_to_pl3);
-            let (_, glp, valid) = pl_to_hl_gl3(pl_opt);
+            if pl_opt.is_some_and(|p| p.1) { haploid_samples[s] = true; }
+            let (_, glp, valid) = pl_to_hl_gl3(pl_opt.map(|p| p.0));
             if !valid { n_missing_pl += 1; }
             gl3[gl_off + 3 * s] = glp[0];
             gl3[gl_off + 3 * s + 1] = glp[1];
@@ -285,7 +304,7 @@ fn parse_pl_bcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Result<P
         "  PL BCF: {} samples, {} variants ({} sample-sites with missing/malformed PL → flat 0.5/0.5)",
         n_samples, n_variants_seen, n_missing_pl,
     );
-    Ok(PlVcfResult { gl3, markers, sample_ids })
+    Ok(PlVcfResult { gl3, markers, sample_ids, haploid_samples })
 }
 
 /// Read a VCF/BCF target with `PL` field → per-hap likelihoods.
@@ -328,6 +347,7 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
 
     let mut n_variants_seen = 0usize;
     let mut n_missing_pl = 0usize;
+    let mut haploid_samples: Vec<bool> = Vec::new();
 
     let bytes = &raw[..];
     let mut cursor = 0usize;
@@ -357,6 +377,7 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
             }
             sample_names = tmp_samples;
             n_samples = sample_names.len();
+            haploid_samples = vec![false; n_samples];
             // Pre-reserve gl3 buffer for n_variants × n_samples × 3 f32.
             // Slight over-reserve is OK; under-reserve would force regrowth.
             gl3.reserve(est_variants.saturating_mul(n_samples * 3));
@@ -426,7 +447,8 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
             let pl_opt = pl_pos
                 .and_then(|p| extract_subfield(field, p))
                 .and_then(parse_pl_field);
-            let (_, glp, valid) = pl_to_hl_gl3(pl_opt);
+            if pl_opt.is_some_and(|p| p.1) { haploid_samples[s] = true; }
+            let (_, glp, valid) = pl_to_hl_gl3(pl_opt.map(|p| p.0));
             if !valid { n_missing_pl += 1; }
             // SAFETY: gl_off + 3*s + 2 < gl_off + n_samples*3, in bounds.
             unsafe {
@@ -451,6 +473,7 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
         gl3,
         markers,
         sample_ids: sample_names,
+        haploid_samples,
     })
 }
 
@@ -496,15 +519,17 @@ mod tests {
 
     #[test]
     fn parse_pl_field_basic() {
-        assert_eq!(parse_pl_field(b"0,15,180").unwrap(), [0, 15, 180]);
-        assert_eq!(parse_pl_field(b"5,0,12").unwrap(), [5, 0, 12]);
+        assert_eq!(parse_pl_field(b"0,15,180").unwrap(), ([0, 15, 180], false));
+        assert_eq!(parse_pl_field(b"5,0,12").unwrap(), ([5, 0, 12], false));
+        // A haploid pair: product form, flagged.
+        assert_eq!(parse_pl_field(b"0,15").unwrap(), ([0, 15, 30], true));
+        assert_eq!(parse_pl_field(b"40,0").unwrap(), ([80, 40, 0], true));
     }
 
     #[test]
     fn parse_pl_field_missing_dot() {
         assert!(parse_pl_field(b".").is_none());
         assert!(parse_pl_field(b"").is_none());
-        assert!(parse_pl_field(b"0,15").is_none());
         assert!(parse_pl_field(b"0,15,").is_none());
         assert!(parse_pl_field(b"a,b,c").is_none());
     }

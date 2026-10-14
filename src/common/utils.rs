@@ -40,6 +40,31 @@ pub fn out_path(base: &std::path::Path, ext: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{s}.{ext}"))
 }
 
+/// True when `output` (which need not exist yet) names the existing file `input`:
+/// an existing output is resolved fully (a symlink to the input counts), a new one
+/// through its directory.
+pub fn same_file(input: &std::path::Path, output: &std::path::Path) -> bool {
+    let Ok(input) = std::fs::canonicalize(input) else { return false };
+    if let Ok(o) = std::fs::canonicalize(output) { return o == input; }
+    let parent = output.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    match (std::fs::canonicalize(parent), output.file_name()) {
+        (Ok(dir), Some(name)) => dir.join(name) == input,
+        _ => false,
+    }
+}
+
+/// Stop the run (exit 2) when a file it is about to write is one of its inputs:
+/// the output would replace the input, or truncate it while it is still being
+/// read (the imputation reads the target a second time while writing).
+pub fn refuse_overwrite(inputs: &[&str], outputs: &[std::path::PathBuf]) {
+    for i in inputs {
+        if let Some(o) = outputs.iter().find(|o| same_file(std::path::Path::new(i), o)) {
+            eprintln!("ERROR: the output {} is the input {}; choose another --out", o.display(), i);
+            std::process::exit(2);
+        }
+    }
+}
+
 #[cfg(test)]
 mod out_path_tests {
     use super::out_path;

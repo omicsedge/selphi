@@ -317,10 +317,13 @@ pub fn build_flat_genotypes(
 /// Reset heterozygous calls to missing in haploid samples.
 /// Identical to SHAPEIT5's mapHaploidsAndResetHets().
 /// For haploid individuals (e.g., chrX males), het calls are biologically impossible
-/// and indicate genotyping error. Setting them to missing allows the HMM to impute
-/// the correct homozygous call.
+/// and indicate genotyping error. Setting them to missing (`miss_val`, the phasing
+/// path's no-call sentinel) lets the HMM impute the correct homozygous call; they
+/// used to be set to REF, a confident hom-REF call written to the output even where
+/// the man carries the ALT.
 ///
-/// Returns the number of het calls reset.
+/// Returns the reset `(site, sample)` pairs, so the caller can treat them as the
+/// no-calls they now are downstream.
 /// `par_site` (optional, len `n_var`, `true` = pseudo-autosomal): when provided,
 /// het calls at PAR sites are PRESERVED (not reset), because a male IS diploid in
 /// PAR and his PAR heterozygotes are real. `None` resets every het (byte-identical
@@ -333,9 +336,12 @@ pub fn reset_haploid_hets(
     n_samples: usize,
     n_haps: usize,
     par_site: Option<&[bool]>,
-) -> usize {
-    let mut n_reset = 0;
-    for &si in haploid_samples {
+    miss_val: u8,
+) -> Vec<(usize, usize)> {
+    let mut reset = Vec::new();
+    let mut samples: Vec<usize> = haploid_samples.iter().copied().collect();
+    samples.sort_unstable();
+    for si in samples {
         let h0 = si * 2;
         let h1 = si * 2 + 1;
         for v in 0..n_var {
@@ -347,14 +353,13 @@ pub fn reset_haploid_hets(
             // folded to (0,0) before the sentinel existed, i.e. not reset). Only a real
             // {0,1} het triggers the reset.
             if g0 <= 1 && g1 <= 1 && g0 != g1 {
-                // Het in haploid → set both alleles to 0 (missing/ref)
-                alleles[v * n_haps + h0] = 0;
-                alleles[v * n_haps + h1] = 0;
-                n_reset += 1;
+                alleles[v * n_haps + h0] = miss_val;
+                alleles[v * n_haps + h1] = miss_val;
+                reset.push((v, si));
             }
         }
     }
-    n_reset
+    reset
 }
 
 #[cfg(test)]
@@ -370,15 +375,15 @@ mod par_tests {
 
         // PAR-aware: only the non-PAR het (site3) is reset; PAR het (site1) kept.
         let mut a = vec![0,0, 0,1, 0,0, 1,0];
-        let n = reset_haploid_hets(&mut a, &geno, &hap, 4, 1, 2, Some(&par));
-        assert_eq!(n, 1);
-        assert_eq!(a, vec![0,0, 0,1, 0,0, 0,0]);
+        let n = reset_haploid_hets(&mut a, &geno, &hap, 4, 1, 2, Some(&par), 128);
+        assert_eq!(n, vec![(3, 0)]);
+        assert_eq!(a, vec![0,0, 0,1, 0,0, 128,128], "the non-PAR het becomes a no-call");
 
         // None → historical behavior: both hets reset.
         let mut a2 = vec![0,0, 0,1, 0,0, 1,0];
-        let n2 = reset_haploid_hets(&mut a2, &geno, &hap, 4, 1, 2, None);
-        assert_eq!(n2, 2);
-        assert_eq!(a2, vec![0,0, 0,0, 0,0, 0,0]);
+        let n2 = reset_haploid_hets(&mut a2, &geno, &hap, 4, 1, 2, None, 128);
+        assert_eq!(n2, vec![(1, 0), (3, 0)]);
+        assert_eq!(a2, vec![0,0, 128,128, 0,0, 128,128]);
     }
 
     #[test]

@@ -236,6 +236,9 @@ struct PbwtCtx<'a> {
     match_length: usize,
     fl_fwd: usize,
     fl_bwd: usize,
+    /// Per target hap: the window sites at which it is a no-call (bitset), or
+    /// None when the window has none (see pbwt::follow_match_allele).
+    miss: &'a [Option<Vec<u64>>],
 }
 
 // ONE allele row of scratch (m bytes), not n_var of them — see pbwt::AlleleRows
@@ -521,11 +524,12 @@ fn full_panel_csc(
         if ws.capacity() < m { *ws = pbwt::PbwtWorkspace::new(m, ctx.n_ref); }
         let (nv, nr, ml, ff) = (ctx.n_var_w, ctx.n_ref, ctx.match_length, ctx.fl_fwd);
         let tgt_abs = (ctx.n_ref + tgt) as i32;
+        let miss = ctx.miss.get(tgt).and_then(|o| o.as_deref());
         match keep {
             None => pbwt::pbwt_forward_filtered(
-                ws, &mut rows, nv, m, nr, ml, ff, tgt_abs, &pbwt::AllRefs),
+                ws, &mut rows, nv, m, nr, ml, ff, tgt_abs, &pbwt::AllRefs, miss),
             Some(k) => pbwt::pbwt_forward_filtered(
-                ws, &mut rows, nv, m, nr, ml, ff, tgt_abs, &pbwt::OnlyCands(k)),
+                ws, &mut rows, nv, m, nr, ml, ff, tgt_abs, &pbwt::OnlyCands(k), miss),
         }
     });
     let bwd = pbwt::backward_filter_single(&fwd, ctx.n_var_w, ctx.n_ref, ctx.fl_fwd, ctx.fl_bwd);
@@ -571,7 +575,7 @@ fn reduced_csc(
         if ws.capacity() < m_red { *ws = pbwt::PbwtWorkspace::new(m_red, n_cand); }
         pbwt::pbwt_forward_with_workspace(
             ws, &mut rows, ctx.n_var_w, m_red, n_cand, ctx.match_length, ctx.fl_fwd,
-            n_cand as i32,
+            n_cand as i32, ctx.miss.get(tgt).and_then(|o| o.as_deref()),
         )
     });
     let bwd = pbwt::backward_filter_single(&fwd, ctx.n_var_w, n_cand, ctx.fl_fwd, ctx.fl_bwd);
@@ -747,12 +751,32 @@ pub fn process_window_hmm(
     };
     let mut all_weights: Vec<Vec<(usize, super::hmm::CsrWeights)>> = Vec::with_capacity(n_haps);
 
+    // No-call sites per target hap (input confidence exactly 0: a no-call, or a call
+    // --refine trusts not at all). The HMM already flattens their emission; the PBWT
+    // must not read the allele the phasing filled in there either.
+    // SELPHI_NOCALL_PBWT_FILL=1 restores reading it (A/B).
+    // Built per sample in one row-major pass over the (site, sample) confidence;
+    // both haplotypes of a sample share the set.
+    let follow = !crate::config::is_one("SELPHI_NOCALL_PBWT_FILL");
+    let miss: Vec<Option<Vec<u64>>> = match conf_w.filter(|_| follow) {
+        None => vec![None; n_haps],
+        Some(cw) => {
+            let mut per_sample: Vec<Option<Vec<u64>>> = vec![None; n_samples];
+            for v in 0..n_var_w {
+                for (s, _) in cw[v * n_samples..(v + 1) * n_samples].iter().enumerate().filter(|&(_, &c)| c == 0.0) {
+                    per_sample[s].get_or_insert_with(|| vec![0u64; n_var_w.div_ceil(64)])[v / 64] |= 1u64 << (v % 64);
+                }
+            }
+            per_sample.into_iter().flat_map(|b| [b.clone(), b]).collect()
+        }
+    };
+
     for batch_start in (0..n_haps).step_by(batch_size) {
         let batch_end = (batch_start + batch_size).min(n_haps);
         let hap_priors_view: &[Option<Vec<(i64, f64)>>] = hap_priors;
         let ctx = PbwtCtx {
             ref_bm, chip_start, n_ref, targ_w, n_haps, n_var_w,
-            match_length, fl_fwd, fl_bwd,
+            match_length, fl_fwd, fl_bwd, miss: &miss,
         };
         // This target's candidate reference haplotypes.
         let cands = |tgt: usize| -> Vec<u32> {
@@ -864,6 +888,7 @@ pub fn process_window_hmm(
                 .map(|(&t, mk)| pbwt::SharedTarget {
                     target_abs: (n_ref + t) as i32,
                     keep: mk.as_deref(),
+                    miss: miss[t].as_deref(),
                 }).collect();
 
             let t_pbwt = std::time::Instant::now();

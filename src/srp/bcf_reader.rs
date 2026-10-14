@@ -173,10 +173,8 @@ fn process_region(
     let mut n_skipped_long = 0usize;
     let drop_long = crate::config::is_one("SELPHI_DROP_LONG_ALLELES");
     let mut chunk_idx = 0usize;
-    // Phase guard state: sample the first diploid calls of the region (the VCF
-    // panel path checks the first <=10 GTs of the first record; this is the same
-    // budget, spread over the region's first records).
-    let mut phase_checks: u32 = 10;
+    // Phase guard: any heterozygote written unphased (the VCF panel path applies
+    // the same rule over the whole file).
     let mut unphased_seen = false;
     let mut sb = Vec::with_capacity(512);
     let mut ib = Vec::with_capacity(ns * 4);
@@ -220,13 +218,11 @@ fn process_region(
         let mut al = Vec::with_capacity(na);
         for _ in 0..na { al.push(rtstr(&sb, &mut o)); }
 
-        // SELPHI_DROP_LONG_ALLELES: skip records whose REF or ALT exceeds the
-        // 255-byte cap the SRP variant index encodes lengths in. Done HERE,
-        // before the genotypes are extracted, so the row is never allocated and
-        // the variant index and the haplotype matrix cannot fall out of step —
-        // the reason this is not a post-hoc filter. Default off: the builder
-        // errors instead, because dropping panel variants silently is worse than
-        // stopping. Reported from a production panel build, 2026-09-13.
+        // SELPHI_DROP_LONG_ALLELES (--drop-long-alleles): skip records whose REF
+        // or ALT exceeds 255 bytes. Done HERE, before the genotypes are extracted,
+        // so the row is never allocated and the variant index and the haplotype
+        // matrix cannot fall out of step. Default off: such records are kept (the
+        // variant index escapes long lengths, see helpers::push_variant_vbin).
         if drop_long && (al[0].len() > 255 || al.get(1).is_some_and(|a| a.len() > 255)) {
             n_skipped_long += 1;
             continue;
@@ -260,16 +256,18 @@ fn process_region(
                     // (end-of-vector, haploid sample in a diploid encoding)
                     // were silently mis-mapped to ALT-63 by the >>1 -1 path
                     // (both yield 63 < 128 → spurious ALT). Skip them.
-                    let b0 = ib[b]; let b1 = ib[b+1];
-                    // A reference panel must be phased: an unphased `0/1` has no
-                    // haplotype assignment, and reading its alleles in byte order
-                    // fabricates a haplotype the HMM then copies from. The VCF
-                    // panel path rejects this; this path never looked at the phase
-                    // bit (low bit of the 2nd allele). Check it on the first
-                    // `PHASE_CHECKS` diploid calls of the region, like the VCF guard.
-                    if phase_checks > 0 && b1 < 0x80 && (b1 >> 1) != 0 {
-                        phase_checks -= 1;
-                        if (b1 & 1) == 0 { unphased_seen = true; }
+                    let b0 = ib[b];
+                    // A haploid call pads its 2nd slot with end-of-vector (0x81):
+                    // read it as the homozygote, as Beagle and bcftools +fixploidy do,
+                    // not as a REF second haplotype (which put a fabricated REF
+                    // haplotype beside every male chrX in the panel).
+                    let b1 = if ib[b + 1] == 0x81 { b0 } else { ib[b + 1] };
+                    // A reference panel must be phased: an unphased heterozygote has
+                    // no haplotype assignment, and reading its alleles in byte order
+                    // fabricates a haplotype the HMM then copies from.
+                    if b0 < 0x80 && b1 < 0x80 && (b0 >> 1) != 0 && (b1 >> 1) != 0
+                        && (b0 >> 1) != (b1 >> 1) && (b1 & 1) == 0 {
+                        unphased_seen = true;
                     }
                     if b0 < 0x80 {
                         let a0 = (b0 >> 1).wrapping_sub(1);
@@ -422,11 +420,10 @@ use super::bcf_types::{read_typed_i32 as rtint, read_typed_str as rtstr};
 // decode the SRP builder uses — but keeps per-sample diploid [a0,a1] in RAM
 // (panel phasing needs the dense matrix + phase, not sparse SRP tiles).
 //
-// GT projection matches read_target_bcf EXACTLY: a present allele projects to
-// {0,1} (min(1), so any ALT incl. multiallelic → 1); a missing allele → 3
-// (== common::GT_MISSING); a haploid 2nd slot (end-of-vector 0x81) → 0; phase
-// is taken from the 2nd allele's separator bit. `is_phased` mirrors the
-// original heuristic: the first ≤10 samples of the first variant (region 0).
+// GT projection matches read_target_bcf's cohort mode EXACTLY: a present allele
+// projects to {0,1} (min(1), so any ALT incl. multiallelic → 1); a missing allele
+// → 3 (== common::GT_MISSING); a haploid call (2nd slot end-of-vector 0x81) → the
+// homozygote. `is_phased` is false when any heterozygote is written unphased.
 //
 // NOTE: assumes int8 diploid GT (vl=2, es=1) — the universal panel encoding,
 // same assumption as `process_region`. Validate byte-identical against
@@ -464,10 +461,13 @@ fn decode_diploid_gt(b0: u8, b1: u8) -> (u8, u8, bool) {
     // builder (process_region), which excludes both.
     // First allele: its phase bit is meaningless in BCF and ignored.
     let a0 = if b0 >= 0x80 { GT_MISSING_DENSE } else { allele(b0) };
-    // Second allele: reserved ⇒ haploid (read_target_bcf: no 2nd allele → REF
-    // slot 0, treated as phased); else decode, phase = low bit.
-    let (a1, phased) = if b1 >= 0x80 { (0u8, true) } else { (allele(b1), (b1 & 1) == 1) };
-    (a0, a1, phased)
+    // Second allele: reserved ⇒ haploid, read as the homozygote [a0, a0] (as
+    // read_target_bcf does); else decode. `phased` is false only for a
+    // heterozygote written unphased (the rule every target reader uses).
+    if b1 >= 0x80 { return (a0, a0, true); }
+    let a1 = allele(b1);
+    let het = b0 < 0x80 && (b0 >> 1) != 0 && (b1 >> 1) != 0 && (b0 >> 1) != (b1 >> 1);
+    (a0, a1, !het || (b1 & 1) == 1)
 }
 
 /// Decode one byte-balanced region into dense markers + genotypes (in RAM).
@@ -482,7 +482,6 @@ fn decode_region_dense(
     let mut variants: Vec<RawVariant> = Vec::new();
     let mut genos: Vec<Vec<[u8; 2]>> = Vec::new();
     let mut region_phased = true;
-    let mut phase_checks: i32 = 10; // mirrors read_target_bcf (first variant, ≤10 samples)
     let mut sb = Vec::with_capacity(512);
     let mut ib = Vec::with_capacity(ns * 4);
     let mut skip = [0u8; 65536];
@@ -538,7 +537,7 @@ fn decode_region_dense(
                     if b + 1 >= ge { break; }
                     let (a0, a1, phased) = decode_diploid_gt(ib[b], ib[b + 1]);
                     var[si] = [a0, a1];
-                    if phase_checks > 0 { if !phased { region_phased = false; } phase_checks -= 1; }
+                    if !phased { region_phased = false; }
                 }
                 break;
             }
@@ -587,9 +586,8 @@ pub fn read_bcf_genotypes_parallel(
         .collect::<io::Result<Vec<_>>>()?;
     parts.sort_by_key(|p| p.0); // genomic order
 
-    // is_phased = region 0's flag (region 0 starts at genomic pos 0, so its
-    // first variant's first ≤10 samples == the original global heuristic).
-    let is_phased = parts.iter().find(|p| p.0 == 0).map(|p| p.3).unwrap_or(true);
+    // Phased unless some region holds a heterozygote written unphased.
+    let is_phased = parts.iter().all(|p| p.3);
     let total: usize = parts.iter().map(|p| p.1.len()).sum();
     let mut variants = Vec::with_capacity(total);
     let mut genos = Vec::with_capacity(total);
