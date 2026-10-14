@@ -69,8 +69,8 @@ pub fn apply_haploid_detection(
     // Superset of the historical literal test (chr-prefix-tolerant / case-insensitive),
     // equal on every label that test matched.
     let is_chrx = selphi::contig::is_chrx(chr);
-    // PAR mask (opt-in `--chrx-par` on a chrX run): males are DIPLOID in PAR1/PAR2.
-    // `None` otherwise → byte-identical to the historical whole-chromosome handling.
+    // PAR mask (default on a chrX run; `--chrx-no-par` turns it off): males are DIPLOID in
+    // PAR1/PAR2. `None` → the whole-chromosome handling used before 2026-10-14.
     let par_site: Option<Vec<bool>> = if chrx_par && is_chrx {
         use selphi::contig::Build;
         let build = match build {
@@ -80,7 +80,7 @@ pub fn apply_haploid_detection(
             // sparse target that lacks distal-X markers.
             BuildArg::Auto => {
                 let b = selphi::contig::infer_build_from_chrx_maxpos(panel_max_pos);
-                selphi_step!("--chrx-par: inferred build {:?} from chrX max pos {} (use --build to override)", b, panel_max_pos);
+                selphi_step!("chrX PAR: inferred build {:?} from chrX max pos {} (use --build to override)", b, panel_max_pos);
                 b
             }
         };

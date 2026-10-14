@@ -148,7 +148,7 @@ No-call genotypes in the target (`./.`, common on genotyping arrays at ~1–2% o
 
 ### Sex chromosomes
 
-- **chrX**: when Selphi phases the target (unphased input, or `--force-phasing`), males are auto-detected (low heterozygosity) and their het calls reset before phasing; already-phased input is used as is. Add `--chrx-par --build grch38` (or `grch37`/`auto`, the default) to be PAR-aware: male hets are kept in PAR1/PAR2 and reset elsewhere. Male chrX genotypes and dosages are still written diploid. A male imputed on his own has no heterozygous chrX call; his calls at sites common in the panel still form the phasing scaffold (every called site when none is).
+- **chrX**: when Selphi phases the target (unphased input, or `--force-phasing`), males are auto-detected (low heterozygosity outside the pseudo-autosomal regions) and treated as diploid inside PAR1/PAR2 and haploid elsewhere: their PAR heterozygous calls are kept, their non-PAR het calls (genotyping errors) are reset before phasing. PAR coordinates follow `--build` (`grch38`, `grch37`, or `auto`, the default, inferred from the panel). `--chrx-no-par` treats males as haploid over the whole chromosome. Male chrX genotypes and dosages are written diploid; already-phased input is used as is. A male imputed on his own has no heterozygous non-PAR call; his calls at sites common in the panel still form the phasing scaffold (every called site when none is).
 - **chrY / chrMT**: refused, because the Li-Stephens recombination model does not apply to a non-recombining / haploid contig and standard panels omit them. In whole-genome runs they are skipped with a warning. `SELPHI_ALLOW_NONRECOMB=1` forces a run.
 
 ### Panel phasing (de-novo, no reference)
@@ -440,7 +440,7 @@ selphi --self-test --refpanel panel.srp --input target.vcf.gz --map chr.map --ou
 | `--lcwgs` | Legacy alias for `--engine lcwgs`; also enables PL/BAM low-coverage input | off |
 | `--bam PATH` / `--bam-list PATH` | Aligned reads for `--lcwgs` (single file, or a list) | |
 | `--reference PATH` | Reference FASTA (required for CRAM input; enables BAQ for BAM input) | |
-| `--chrx-par` / `--build B` | PAR-aware chrX male handling during phasing (male chrX output stays diploid); `B` = `grch38`/`grch37`/`auto` | off / `auto` |
+| `--chrx-no-par` / `--build B` | Treat chrX males as haploid over the whole chromosome instead of diploid in PAR1/PAR2 (male chrX output stays diploid either way); `B` = PAR coordinates, `grch38`/`grch37`/`auto` | off / `auto` |
 | `--no-ap` | Omit AP1/AP2 fields from output | off |
 | `--drop-unmatched` | Leave out the target records that match no panel site (by default they are written as given) | off |
 | `--bcf` | Write native BCF output (replaces VCF) | off |
