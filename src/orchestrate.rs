@@ -267,7 +267,21 @@ fn load_maps(
             for pattern in &candidates {
                 let path = map_dir.join(pattern);
                 if path.exists() {
-                    let (bp, cm) = genmap::load_genetic_map_raw(&path)?;
+                    let (mut bp, mut cm) = genmap::load_genetic_map_raw(&path)?;
+                    // chrX: the PLINK GRCh38/37 maps put PAR1 and PAR2 in their own files
+                    // (each from 0 cM). Joined to the non-PAR map they give PAR1 its real
+                    // ~21 cM, which mean-rate extrapolation put at ~3.
+                    if selphi::contig::is_chrx(key) {
+                        let pars: Vec<std::path::PathBuf> = ["par1", "par2"].iter()
+                            .map(|par| map_dir.join(pattern.replacen(&format!("chr{}", key), &format!("chr{}_{}", key, par), 1)))
+                            .filter(|p| p.exists() && p.as_path() != path.as_path()).collect();
+                        if !pars.is_empty() {
+                            let mut parts = vec![(bp, cm)];
+                            for pp in &pars { parts.push(genmap::load_genetic_map_raw(pp)?); }
+                            (bp, cm) = genmap::stitch(parts).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                            selphi_info!("  chr{}: map joined with {} PAR map file(s)", key, pars.len());
+                        }
+                    }
                     combined.insert(key.to_string(), (bp, cm));
                     found = true;
                     break;
