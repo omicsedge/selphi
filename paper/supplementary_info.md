@@ -11,24 +11,24 @@ output lacks 2 and 21 of them); MAF bins by frequency in the 801 truth genomes.
 
 | Chr | Mode | Bin | Selphi 2 R² | Beagle 5.5 R² | Winner |
 |---|---|---|---:|---:|---|
-| 22 | phased  | OVERALL  | **0.4761** | 0.4633 | Selphi |
+| 22 | phased  | OVERALL  | **0.4760** | 0.4633 | Selphi |
 | 22 | phased  | per-sample mean | **0.9166** | 0.9088 | Selphi |
-| 22 | phased  | 0.05-0.1% | **0.2626** | 0.2583 | Selphi |
-| 22 | phased  | 0.1-0.2% | **0.3156** | 0.3062 | Selphi |
+| 22 | phased  | 0.05-0.1% | **0.2627** | 0.2583 | Selphi |
+| 22 | phased  | 0.1-0.2% | **0.3154** | 0.3062 | Selphi |
 | 22 | phased  | 0.5-1%  | **0.5043** | 0.4847 | Selphi |
 | 22 | phased  | 20-50%  | **0.8424** | 0.8313 | Selphi |
-| 22 | unphased | OVERALL  | **0.4864** | 0.4666 | Selphi |
+| 22 | unphased | OVERALL  | **0.4869** | 0.4666 | Selphi |
 | 22 | unphased | per-sample mean | **0.9175** | 0.9062 | Selphi |
-| 22 | unphased | 0.05-0.1% | **0.2800** | 0.2673 | Selphi |
-| 1 | phased  | OVERALL  | **0.5624** | 0.5510 | Selphi |
+| 22 | unphased | 0.05-0.1% | **0.2803** | 0.2673 | Selphi |
+| 1 | phased  | OVERALL  | **0.5623** | 0.5510 | Selphi |
 | 1 | phased  | per-sample mean | **0.9572** | 0.9529 | Selphi |
-| 1 | phased  | 0.05-0.1% | **0.3405** | 0.3370 | Selphi |
-| 1 | phased  | 0.1-0.2% | **0.3999** | 0.3880 | Selphi |
-| 1 | phased  | 0.5-1%  | **0.6085** | 0.5910 | Selphi |
-| 1 | phased  | 20-50%  | **0.9311** | 0.9249 | Selphi |
+| 1 | phased  | 0.05-0.1% | **0.3404** | 0.3370 | Selphi |
+| 1 | phased  | 0.1-0.2% | **0.3998** | 0.3880 | Selphi |
+| 1 | phased  | 0.5-1%  | **0.6084** | 0.5910 | Selphi |
+| 1 | phased  | 20-50%  | **0.9310** | 0.9249 | Selphi |
 | 1 | unphased | OVERALL  | **0.5755** | 0.5558 | Selphi |
 | 1 | unphased | per-sample mean | **0.9579** | 0.9518 | Selphi |
-| 1 | unphased | 0.05-0.1% | **0.3624** | 0.3466 | Selphi |
+| 1 | unphased | 0.05-0.1% | **0.3621** | 0.3466 | Selphi |
 
 Selphi 2 leads Beagle 5.5 in all nine MAF bins in all four chromosome-by-mode cells.
 
@@ -44,13 +44,13 @@ Table S11b and Table 4b, and the 500-sample candidate-size ablation in Table 4.
 
 | Cohort | `mc` | Metric | Selphi 2 R² | Beagle 5.5 R² | Winner |
 |---|---|---|---:|---:|---|
-| MESA 5K | 132,676 (auto) | OVERALL | **0.6210** | 0.5916 | Selphi |
-| MESA 5K | 132,676 (auto) | per-sample mean | **0.9019** | 0.8842 | Selphi |
-| MESA 5K | 132,676 (auto) | 0.05-0.1% (rarest) | **0.5304** | 0.4956 | Selphi |
-| MESA 5K | 132,676 (auto) | 0.5-1% | **0.6599** | 0.6305 | Selphi |
-| MESA 5K | 132,676 (auto) | 20-50% | **0.6658** | 0.6503 | Selphi |
-| MESA 5K | 2,500 (fixed) | OVERALL | 0.5725 | **0.5916** | reference |
-| MESA 5K | 2,500 (fixed) | per-sample mean | **0.8982** | 0.8842 | Selphi |
+| MESA 5K | 132,676 (auto) | OVERALL | **0.6243** | 0.5916 | Selphi |
+| MESA 5K | 132,676 (auto) | per-sample mean | **0.9026** | 0.8842 | Selphi |
+| MESA 5K | 132,676 (auto) | 0.05-0.1% (rarest) | **0.5348** | 0.4956 | Selphi |
+| MESA 5K | 132,676 (auto) | 0.5-1% | **0.6631** | 0.6305 | Selphi |
+| MESA 5K | 132,676 (auto) | 20-50% | **0.6668** | 0.6503 | Selphi |
+| MESA 5K | 2,500 (fixed) | OVERALL | 0.5756 | **0.5916** | reference |
+| MESA 5K | 2,500 (fixed) | per-sample mean | **0.8989** | 0.8842 | Selphi |
 
 ## Table S3. Leak-free GIAB validation - chip to WGS
 
@@ -58,19 +58,19 @@ Table S11b and Table 4b, and the 500-sample candidate-size ablation in Table 4.
 16 threads, impute-only from the same phased chip input. Beagle 5.5 (03Oct25) received the
 bref3 file the Selphi 2 SRP was built from, so both tools used the same panel content. Both
 were scored by one evaluator on the same sites (69,806 on chr21, 409,391 on chr1; GIAB v4.2.1
-high-confidence, MAF 5-50%). Timings: same session, one job at a time, four runs per tool
-(range; Beagle's first run on each chromosome was cold-cache and is given separately).
+high-confidence, MAF 5-50%). Timings: same session, one job at a time, two runs per tool
+(range), panel files in the page cache.
 
 | Chr | Metric | Selphi 2 | Beagle 5.5 | Winner |
 |---|---|---:|---:|---|
 | 21 | R² | **0.9700** | 0.9633 | Selphi |
 | 21 | concordance | **0.9803** | 0.9783 | Selphi |
-| 21 | wall | **6.6-7.2 s** | 11.4-12.3 s (15.4 s cold) | Selphi |
-| 21 | peak RAM | **3.2 GB** | 7.4-9.5 GB | Selphi |
+| 21 | wall | **5.4-5.5 s** | 11.9-12.0 s | Selphi |
+| 21 | peak RAM | **3.1-3.2 GB** | 7.3-11.9 GB | Selphi |
 | 1 | R² | **0.9771** | 0.9757 | Selphi |
 | 1 | concordance | **0.9864** | 0.9860 | Selphi |
-| 1 | wall | **38.2-41.3 s** | 43.7-45.4 s (95.2 s cold) | Selphi |
-| 1 | peak RAM | **6.5-6.9 GB** | 21-44 GB | Selphi |
+| 1 | wall | **31.2-32.0 s** | 42.9-44.3 s | Selphi |
+| 1 | peak RAM | **6.5-7.2 GB** | 32.3-35.9 GB | Selphi |
 
 ## Table S4. Low-coverage sequencing accuracy (R² and concordance) - vs GLIMPSE2 and QUILT2
 
@@ -118,13 +118,13 @@ third column.
 
 | Sample (Coriell ID) | Untyped sites evaluated | Typed-site concordance % (array route) | Non-ref % array route | Non-ref % GL engine | Delta pp | Het recall % array route | Het recall % GL engine | Delta pp | Het precision % array route | Het precision % GL engine | Delta pp | Overall % array route | Overall % GL engine | Winner |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| HG002 (NA24385) | 723,251 | 99.7115 | 89.8151 | **98.1728** | +8.3577 | 86.6421 | **97.5148** | +10.8727 | 92.4100 | **97.7506** | +5.3406 | 99.2943 | **99.8396** | GL engine |
-| HG003 (NA24149) | 713,863 | 99.6845 | 91.4902 | **98.1048** | +6.6146 | 88.9347 | **97.5117** | +8.5770 | 93.2235 | **97.5468** | +4.3233 | 99.3724 | **99.8267** | GL engine |
-| HG004 (NA24143) | 711,235 | 99.7194 | 90.9280 | **97.8610** | +6.9330 | 87.7955 | **97.3017** | +9.5062 | 91.5668 | **97.2325** | +5.6657 | 99.3416 | **99.8257** | GL engine |
-| HG005 (NA24631) | 700,109 | 99.7016 | 88.6210 | **97.7136** | +9.0926 | 84.2569 | **96.9163** | +12.6594 | 90.8545 | **97.6362** | +6.7817 | 99.2408 | **99.8317** | GL engine |
-| HG006 (NA24694) | 707,197 | 99.5794 | 89.8855 | **98.0764** | +8.1909 | 84.5564 | **97.0916** | +12.5352 | 91.1968 | **97.2386** | +6.0418 | 99.3399 | **99.8447** | GL engine |
-| HG007 (NA24695) | 706,411 | 99.5659 | 89.9302 | **97.3235** | +7.3933 | 86.2981 | **96.3844** | +10.0863 | 91.8841 | **96.9839** | +5.0998 | 99.3065 | **99.7881** | GL engine |
-| Mean | | | 90.1117 | **97.8753** | +7.7637 | 86.4139 | **97.1201** | +10.7061 | 91.8560 | **97.3981** | +5.5421 | 99.3159 | **99.8261** | GL engine (6/6) |
+| HG002 (NA24385) | 723,251 | 99.7115 | 89.8715 | **98.1728** | +8.3013 | 86.7157 | **97.5148** | +10.7991 | 92.4884 | **97.7506** | +5.2622 | 99.2994 | **99.8396** | GL engine |
+| HG003 (NA24149) | 713,863 | 99.6845 | 91.5087 | **98.1048** | +6.5961 | 88.9627 | **97.5117** | +8.5490 | 93.3389 | **97.5468** | +4.2079 | 99.3775 | **99.8267** | GL engine |
+| HG004 (NA24143) | 711,235 | 99.7194 | 91.0000 | **97.8610** | +6.8610 | 87.9113 | **97.3017** | +9.3904 | 91.7003 | **97.2325** | +5.5322 | 99.3497 | **99.8257** | GL engine |
+| HG005 (NA24631) | 700,109 | 99.7016 | 88.6571 | **97.7136** | +9.0565 | 84.3218 | **96.9163** | +12.5945 | 90.8609 | **97.6362** | +6.7753 | 99.2425 | **99.8317** | GL engine |
+| HG006 (NA24694) | 707,197 | 99.5794 | 89.6852 | **98.0764** | +8.3912 | 84.2646 | **97.0916** | +12.8270 | 90.9689 | **97.2386** | +6.2697 | 99.3266 | **99.8447** | GL engine |
+| HG007 (NA24695) | 706,411 | 99.5659 | 89.8170 | **97.3235** | +7.5065 | 86.1647 | **96.3844** | +10.2197 | 91.8203 | **96.9839** | +5.1636 | 99.3004 | **99.7881** | GL engine |
+| Mean | | | 90.0899 | **97.8753** | +7.7854 | 86.3901 | **97.1201** | +10.7300 | 91.8630 | **97.3981** | +5.5352 | 99.3160 | **99.8261** | GL engine (6/6) |
 
 Means by reference-panel MAF stratum for the same comparison. Site counts are per sample on
 Selphi's own list; the rare stratum is larger here than in S4c because the own list carries
@@ -134,9 +134,9 @@ be mixed.
 
 | Panel MAF stratum | Sites per sample (own list) | Non-ref % array route | Non-ref % GL engine | Delta pp | Het recall % array route | Het recall % GL engine | Delta pp | Winner |
 |---|---:|---:|---:|---:|---:|---:|---:|---|
-| MAF >= 5% | 79,011-81,583 | 91.527 | **98.580** | +7.053 | 88.860 | **98.270** | +9.410 | GL engine (6/6) |
-| MAF 0.5-5% | 108,544-112,031 | 84.473 | **95.423** | +10.950 | 75.230 | **93.034** | +17.804 | GL engine (6/6) |
-| MAF < 0.5% | 512,554-529,637 | 69.081 | **86.764** | +17.683 | 53.591 | **79.872** | +26.281 | GL engine (6/6) |
+| MAF >= 5% | 79,011-81,583 | 91.494 | **98.580** | +7.087 | 88.815 | **98.270** | +9.455 | GL engine (6/6) |
+| MAF 0.5-5% | 108,544-112,031 | 84.618 | **95.423** | +10.804 | 75.510 | **93.034** | +17.524 | GL engine (6/6) |
+| MAF < 0.5% | 512,554-529,637 | 69.046 | **86.764** | +17.719 | 53.549 | **79.872** | +26.322 | GL engine (6/6) |
 
 **S4b. Selphi 2 versus GLIMPSE2 on the capture libraries, identical per-sample site lists,
 chromosome 22 (= main-text Table 1b).** Site list = GLIMPSE2's emitted chromosome-22 SNPs
@@ -346,10 +346,10 @@ Reference: Beagle 5.5, SHAPEIT5 v5.1.1.
 
 | Chr | Engine | Selphi 2 SER % | Beagle 5.5 | SHAPEIT5 | vs Beagle | vs SHAPEIT5 |
 |---|---|---:|---:|---:|---|---|
-| 22 | diploid | **2.528** | 2.548 | 2.607 | Selphi | Selphi |
-| 22 | haploid | 2.569 | **2.548** | 2.607 | reference | Selphi |
-| 1 | diploid | 1.879 | **1.865** | 1.929 | reference | Selphi |
-| 1 | haploid | 1.876 | **1.865** | 1.929 | reference | Selphi |
+| 22 | diploid | **2.532** | 2.548 | 2.607 | Selphi | Selphi |
+| 22 | haploid | 2.542 | 2.548 | 2.607 | Selphi | Selphi |
+| 1 | diploid | 1.881 | **1.865** | 1.929 | reference | Selphi |
+| 1 | haploid | 1.872 | **1.865** | 1.929 | reference | Selphi |
 
 ## Table S6. Speed & memory
 
@@ -357,16 +357,16 @@ Reference: Beagle 5.5, SHAPEIT5 v5.1.1.
 
 | Benchmark | Metric | Selphi 2 | Reference | Winner |
 |---|---|---:|---:|---|
-| GIAB chr21, 6s, 75,552-haplotype panel, impute-only | wall | **6.6-7.2 s** | Beagle 5.5: 11.4-12.3 s (15.4 s cold) | Selphi |
-| GIAB chr21, 6s, 75,552-haplotype panel, impute-only | peak RAM | **3.2 GB** | Beagle 5.5: 7.4-9.5 GB | Selphi |
-| GIAB chr1, 6s, 75,552-haplotype panel, impute-only | wall | **38.2-41.3 s** | Beagle 5.5: 43.7-45.4 s (95.2 s cold) | Selphi |
-| GIAB chr1, 6s, 75,552-haplotype panel, impute-only | peak RAM | **6.5-6.9 GB** | Beagle 5.5: 21-44 GB | Selphi |
-| chr22 1KG 801s, chip to WGS | wall (phased / unphased) | **55 s** / 112 s | Beagle 5.5: 62 s / **81 s** | Selphi (phased) / reference (unphased) |
-| chr22 1KG 801s, chip to WGS | peak RAM (phased / unphased) | **9.5** / 13.9 GB | Beagle 5.5: 16.2-21.7 / **12.5 GB** | Selphi (phased) / reference (unphased) |
-| chr1 1KG 801s, chip to WGS | wall (phased / unphased) | 296 s / 602 s | Beagle 5.5: **207 s / 321 s** | reference |
-| chr1 1KG 801s, chip to WGS | peak RAM (phased / unphased) | **15.5** / 21.6 GB | Beagle 5.5: 23.4-25.5 / **16.9 GB** | Selphi (phased) / reference (unphased) |
-| TOPMed MESA 5K chr20 (171K-hap, 17.9M var), full pipeline | wall | **4,381 s** (1.2 h) | Beagle 5.5: 6,728 s | Selphi |
-| TOPMed MESA 5K chr20 | peak RAM | 91.9 GB | Beagle 5.5: **91.0 GB** | tie |
+| GIAB chr21, 6s, 75,552-haplotype panel, impute-only | wall | **5.4-5.5 s** | Beagle 5.5: 11.9-12.0 s | Selphi |
+| GIAB chr21, 6s, 75,552-haplotype panel, impute-only | peak RAM | **3.1-3.2 GB** | Beagle 5.5: 7.3-11.9 GB | Selphi |
+| GIAB chr1, 6s, 75,552-haplotype panel, impute-only | wall | **31.2-32.0 s** | Beagle 5.5: 42.9-44.3 s | Selphi |
+| GIAB chr1, 6s, 75,552-haplotype panel, impute-only | peak RAM | **6.5-7.2 GB** | Beagle 5.5: 32.3-35.9 GB | Selphi |
+| chr22 1KG 801s, chip to WGS | wall (phased / unphased) | 59-60 s / 118 s | Beagle 5.5: **59 s / 81 s** | tie (phased) / reference (unphased) |
+| chr22 1KG 801s, chip to WGS | peak RAM (phased / unphased) | **9.4-9.5 / 13.8 GB** | Beagle 5.5: 18.8-21.2 / 14.4 GB | Selphi |
+| chr1 1KG 801s, chip to WGS | wall (phased / unphased) | 300-302 s / 607 s | Beagle 5.5: **200-211 s / 314 s** | reference |
+| chr1 1KG 801s, chip to WGS | peak RAM (phased / unphased) | **15.4-15.6** / 21.4 GB | Beagle 5.5: 25.0-27.3 / **19.7 GB** | Selphi (phased) / reference (unphased) |
+| TOPMed MESA 5K chr20 (171K-hap, 17.9M var), full pipeline | wall | **4,140 s** (1.15 h) | Beagle 5.5: 6,728 s | Selphi |
+| TOPMed MESA 5K chr20 | peak RAM | **81.7 GB** | Beagle 5.5: 91.0 GB | Selphi |
 | lcWGS whole-chr22, 1 sample @1× (= Fig 4a, downsampled cluster) | wall | **105-109 s** | GLIMPSE2: 278 s (chunk + phase + ligate); QUILT2: 1,701 s | Selphi |
 | lcWGS capture library chr22, 1 sample, native `--bam` + BAQ, BAM in to imputed VCF out (= Fig 4a, capture cluster) | wall | **101 s** | GLIMPSE2: 334 s (chunk + phase + ligate) | Selphi |
 | lcWGS capture library chr22, 1 sample, native `--bam` + BAQ | peak RAM | 4.9 GB | GLIMPSE2: **2.1 GB** | reference |
@@ -406,8 +406,8 @@ imputation and the accuracy gain comes from the imputer.
 
 | Phasing / Imputer | chr22 Beagle | chr22 Selphi | chr1 Beagle | chr1 Selphi |
 |---|---:|---:|---:|---:|
-| Selphi 2  | **0.4690** | **0.4823** | **0.5589** | **0.5720** |
-| Beagle 5.5 | 0.4666 | 0.4796 | 0.5560 | 0.5690 |
+| Selphi 2  | **0.4685** | **0.4820** | **0.5588** | **0.5717** |
+| Beagle 5.5 | 0.4666 | 0.4796 | 0.5560 | 0.5689 |
 | SHAPEIT5  | 0.4665 | 0.4807 | 0.5566 | 0.5701 |
 
 ## Table S8. Reference-panel re-phasing (chr22)
@@ -417,15 +417,16 @@ samples, 1,070,399 sites after removing two records whose alleles exceed the 255
 the panel formats) versus its original published phasing. The same phased target (801
 samples) is imputed against each panel by each tool and scored on the identical 1,016,321
 panel-polymorphic sites (re-phasing does not change allele counts). Re-phasing raises overall
-R² by 0.0019 for Selphi 2 and 0.0034 for Beagle 5.5, and no MAF bin falls for either tool. We
+R² by 0.0009 for Selphi 2 and 0.0026 for Beagle 5.5; every MAF bin rises for Beagle 5.5 and all but
+one (0.1-0.2%, -0.0010) for Selphi 2. We
 nonetheless use the published phasing throughout this work, because it is the phasing the
 comparator tools are conventionally run against; these figures bound what that choice costs
-at 0.002 to 0.003 in overall R².
+at 0.001 to 0.003 in overall R².
 
 | Imputer | original panel | Selphi-rephased panel | Δ overall | rarest-bin Δ (0.05-0.1%) | smallest bin Δ |
 |---|---:|---:|---:|---:|---:|
-| Beagle 5.5 | 0.4633 | 0.4667 | +0.0034 | +0.0040 | +0.0013 (5-10%) |
-| Selphi 2  | 0.4761 | **0.4780** | +0.0019 | +0.0030 | +0.0005 (0.1-0.2%) |
+| Beagle 5.5 | 0.4633 | 0.4659 | +0.0026 | +0.0026 | +0.0005 (0.1-0.2%) |
+| Selphi 2  | 0.4760 | **0.4769** | +0.0009 | +0.0009 | -0.0010 (0.1-0.2%) |
 
 ## Table S9. Genome-wide per-MAF R² underlying Figure 3a (1KG, four-way, imputation-only)
 
@@ -444,16 +445,16 @@ with Beagle 5.5's in the Results.
 
 | MAF | Selphi 2 | Beagle 5.5 | Minimac4 | IMPUTE5 |
 |---|---:|---:|---:|---:|
-| 0.05-0.1% | 0.3479 | 0.3434 | **0.3491** | 0.3440 |
-| 0.1-0.2%  | **0.4206** | 0.4088 | 0.4111 | 0.4052 |
-| 0.2-0.5%  | **0.5238** | 0.5076 | 0.5042 | 0.5002 |
-| 0.5-1%    | **0.6259** | 0.6080 | 0.6012 | 0.5990 |
-| 1-2%      | **0.6920** | 0.6742 | 0.6663 | 0.6654 |
-| 2-5%      | **0.7627** | 0.7460 | 0.7367 | 0.7381 |
-| 5-10%     | **0.8532** | 0.8414 | 0.8323 | 0.8355 |
+| 0.05-0.1% | 0.3478 | 0.3434 | **0.3491** | 0.3440 |
+| 0.1-0.2%  | **0.4205** | 0.4088 | 0.4111 | 0.4052 |
+| 0.2-0.5%  | **0.5237** | 0.5076 | 0.5042 | 0.5002 |
+| 0.5-1%    | **0.6257** | 0.6080 | 0.6012 | 0.5990 |
+| 1-2%      | **0.6919** | 0.6742 | 0.6663 | 0.6654 |
+| 2-5%      | **0.7626** | 0.7460 | 0.7367 | 0.7381 |
+| 5-10%     | **0.8531** | 0.8414 | 0.8323 | 0.8355 |
 | 10-20%    | **0.8968** | 0.8885 | 0.8803 | 0.8840 |
 | 20-50%    | **0.9259** | 0.9196 | 0.9112 | 0.9160 |
-| OVERALL   | **0.5788** | 0.5673 | 0.5648 | 0.5626 |
+| OVERALL   | **0.5787** | 0.5673 | 0.5648 | 0.5626 |
 
 ## Table S10. Component ablation (1KG chromosome 22, 801 held-out samples)
 
@@ -461,17 +462,17 @@ Each component is varied from the Selphi 2 default with phasing and everything e
 fixed (impute-only against the phased target, so the effect is isolated from phasing), scored
 on the 1,016,325 panel-polymorphic sites. The "Default" row equals the chromosome-22
 impute-only result of Table S1. The long-range PBWT scan realised as an 80 cM window is worth
-+0.020 overall R² over a short IMPUTE5-like 8 cM window; because chromosome 22 is shorter than
++0.019 overall R² over a short IMPUTE5-like 8 cM window; because chromosome 22 is shorter than
 80 cM, the 80 cM and whole-chromosome rows coincide by construction. The panel-adaptive
-effective population size is worth +0.009 over a fixed Ne = 20,000. The candidate-set-size
+effective population size is worth +0.010 over a fixed Ne = 20,000. The candidate-set-size
 component is ablated separately in Tables 4 and 4b.
 
 | Configuration | Overall R² | 0.05-0.1% | 0.5-1% | 20-50% |
 |---|---:|---:|---:|---:|
-| Default (80 cM window, panel-adaptive Ne) | **0.4761** | 0.2626 | **0.5043** | **0.8424** |
-| Short 8 cM window (IMPUTE5-like) | 0.4559 | 0.2498 | 0.4779 | 0.8263 |
-| Whole-chromosome window (Selphi 1 mode) | 0.4761 | 0.2626 | 0.5043 | 0.8424 |
-| Fixed Ne = 20,000 (IMPUTE5 default) | 0.4672 | **0.2633** | 0.4897 | 0.8320 |
+| Default (80 cM window, panel-adaptive Ne) | **0.4760** | 0.2627 | **0.5043** | **0.8424** |
+| Short 8 cM window (IMPUTE5-like) | 0.4568 | 0.2504 | 0.4792 | 0.8269 |
+| Whole-chromosome window (Selphi 1 mode) | 0.4760 | 0.2627 | 0.5043 | 0.8424 |
+| Fixed Ne = 20,000 (IMPUTE5 default) | 0.4663 | **0.2631** | 0.4883 | 0.8312 |
 
 ## Table S11. Biobank-scale MESA × TOPMed, per-MAF, five imputers
 
@@ -483,17 +484,17 @@ reduction) and Selphi 1.5.3 at their defaults, impute-only from an external phas
 
 | MAF | Selphi 2 | Beagle 5.5 | Selphi 1.5.3 | IMPUTE5 | Minimac4 |
 |---|---:|---:|---:|---:|---:|
-| 0.05-0.1% | **0.5304** | 0.4956 | 0.3338 | 0.3565 | 0.3495 |
-| 0.1-0.2%  | **0.5748** | 0.5404 | 0.4027 | 0.4080 | 0.3967 |
-| 0.2-0.5%  | **0.6205** | 0.5867 | 0.4753 | 0.4688 | 0.4530 |
-| 0.5-1%    | **0.6599** | 0.6305 | 0.5446 | 0.5342 | 0.5150 |
-| 1-2%      | **0.6750** | 0.6475 | 0.5799 | 0.5694 | 0.5494 |
-| 2-5%      | **0.6648** | 0.6403 | 0.5853 | 0.5753 | 0.5567 |
-| 5-10%     | **0.6822** | 0.6589 | 0.6187 | 0.6084 | 0.5909 |
-| 10-20%    | **0.7362** | 0.7107 | 0.6856 | 0.6720 | 0.6538 |
-| 20-50%    | **0.6658** | 0.6503 | 0.6394 | 0.6249 | 0.6084 |
-| OVERALL   | **0.6210** | 0.5916 | 0.4957 | 0.4947 | 0.4802 |
-| per-sample mean | **0.9019** | 0.8842 | 0.8320 | 0.8158 | 0.8066 |
+| 0.05-0.1% | **0.5348** | 0.4956 | 0.3338 | 0.3565 | 0.3495 |
+| 0.1-0.2%  | **0.5796** | 0.5404 | 0.4027 | 0.4080 | 0.3967 |
+| 0.2-0.5%  | **0.6248** | 0.5867 | 0.4753 | 0.4688 | 0.4530 |
+| 0.5-1%    | **0.6631** | 0.6305 | 0.5446 | 0.5342 | 0.5150 |
+| 1-2%      | **0.6775** | 0.6475 | 0.5799 | 0.5694 | 0.5494 |
+| 2-5%      | **0.6668** | 0.6403 | 0.5853 | 0.5753 | 0.5567 |
+| 5-10%     | **0.6838** | 0.6589 | 0.6187 | 0.6084 | 0.5909 |
+| 10-20%    | **0.7375** | 0.7107 | 0.6856 | 0.6720 | 0.6538 |
+| 20-50%    | **0.6668** | 0.6503 | 0.6394 | 0.6249 | 0.6084 |
+| OVERALL   | **0.6243** | 0.5916 | 0.4957 | 0.4947 | 0.4802 |
+| per-sample mean | **0.9026** | 0.8842 | 0.8320 | 0.8158 | 0.8066 |
 
 ## Table S11b. MESA per-sample R² by self-reported ancestry (source data for Figure 3b)
 
@@ -503,10 +504,10 @@ defaults; both scored on the same panel-polymorphic sites). 3,948 of the 5,000 s
 
 | Group (n) | Selphi 2 | Beagle 5.5 | Δ |
 |---|---:|---:|---:|
-| African-American (924) | **0.8974** | 0.8823 | +0.0151 |
-| Hispanic (859) | **0.9022** | 0.8853 | +0.0169 |
-| White (1,631) | **0.9066** | 0.8908 | +0.0158 |
-| Chinese-American (534) | **0.8989** | 0.8657 | +0.0332 |
+| African-American (924) | **0.8984** | 0.8823 | +0.0161 |
+| Hispanic (859) | **0.9027** | 0.8853 | +0.0173 |
+| White (1,631) | **0.9072** | 0.8908 | +0.0163 |
+| Chinese-American (534) | **0.9002** | 0.8657 | +0.0344 |
 
 ## Table S12. Per-MAF imputation R² versus effective population size (1KG Phase 3 chr22)
 
@@ -519,9 +520,9 @@ choice balances the rare-common tradeoff. Bold marks each column's maximum.
 
 | Ne | 0.05-0.1% (rare) | 0.5-1% | 2-5% | 20-50% (common) | OVERALL |
 |---|---:|---:|---:|---:|---:|
-| 20,000 | 0.2633 | 0.4897 | 0.6610 | 0.8320 | 0.4672 |
-| 50,000 | **0.2650** | 0.4972 | 0.6678 | 0.8369 | 0.4723 |
-| 100,000 | 0.2647 | 0.5020 | 0.6727 | 0.8403 | 0.4753 |
-| 175,000 (formula / auto) | 0.2626 | **0.5043** | 0.6756 | 0.8424 | **0.4761** |
-| 350,000 | 0.2554 | 0.5033 | **0.6768** | **0.8436** | 0.4733 |
-| 700,000 | 0.2421 | 0.4969 | 0.6745 | 0.8430 | 0.4654 |
+| 20,000 | 0.2631 | 0.4883 | 0.6600 | 0.8312 | 0.4663 |
+| 50,000 | **0.2651** | 0.4967 | 0.6675 | 0.8366 | 0.4720 |
+| 100,000 | 0.2649 | 0.5019 | 0.6726 | 0.8402 | 0.4752 |
+| 175,000 (formula / auto) | 0.2627 | **0.5043** | 0.6755 | 0.8424 | **0.4760** |
+| 350,000 | 0.2553 | 0.5032 | **0.6767** | **0.8436** | 0.4732 |
+| 700,000 | 0.2420 | 0.4968 | 0.6744 | 0.8430 | 0.4652 |
