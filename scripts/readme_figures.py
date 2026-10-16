@@ -39,8 +39,8 @@ def esc(s):
 # --------------------------------------------------------------------------
 # Speed chart (Table 5b, warm pass; RESULT CONSUMER WHOLE-GENOME WARM)
 # --------------------------------------------------------------------------
-SPEED = [("Selphi 2", 1098.95), ("Beagle 5.5", 1794.10)]
-SPEED_MEM = ("6.8 GB", "41.9-55.1 GB")
+SPEED = [("Selphi 2", 964.8), ("Beagle 5.5", 1731.0)]
+SPEED_MEM = ("6.9 GB", "56.6 GB")
 
 
 def speed_svg(t):
@@ -61,7 +61,7 @@ def speed_svg(t):
     speedup = SPEED[1][1] / SPEED[0][1]
     saved = (SPEED[1][1] - SPEED[0][1]) / 60
     out += [f'<text x="16" y="210" fill="{c["green"]}" font-size="13" font-weight="700">Selphi 2 is {speedup:.1f}&#215; faster end-to-end ({saved:.1f} min saved)</text>',
-            f'<text x="16" y="232" fill="{c["muted"]}" font-size="12">Peak memory {SPEED_MEM[0]} vs {SPEED_MEM[1]} &#183; cold first pass (panel read from disk): 26.2 vs 29.9 min</text>',
+            f'<text x="16" y="232" fill="{c["muted"]}" font-size="12">Peak memory {SPEED_MEM[0]} vs {SPEED_MEM[1]} (largest chromosome)</text>',
             '</svg>']
     return "\n".join(out) + "\n"
 

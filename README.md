@@ -22,7 +22,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="img/speed_dark.svg"/>
     <source media="(prefers-color-scheme: light)" srcset="img/speed_light.svg"/>
-    <img src="img/speed_dark.svg" alt="Whole-genome phasing + imputation wall time with the panel files in the page cache: Selphi 2 18.3 min vs Beagle 5.5 29.9 min, peak memory 6.8 GB vs 41.9-55.1 GB (6 samples vs the 75,552-haplotype panel, 22 autosomes, 16 threads); cold first pass 26.2 vs 29.9 min" width="720"/>
+    <img src="img/speed_dark.svg" alt="Whole-genome phasing + imputation wall time with the panel files in the page cache: Selphi 2 16.1 min vs Beagle 5.5 28.9 min, peak memory 6.9 GB vs 56.6 GB (6 samples vs the 75,552-haplotype panel, 22 autosomes, 16 threads)" width="720"/>
   </picture>
 </p>
 
