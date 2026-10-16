@@ -398,6 +398,8 @@ fn main() {
             }
         };
 
+        let dosage_options = eval_run::dosage_options_from_args(&args);
+        eval_run::print_dosage_options(&dosage_options);
         let json_path = selphi::common::utils::out_path(std::path::Path::new(output), "json");
         let exclude = selphi::eval::exclude::SiteExclusion::build(
             args.exclude_sites.as_deref().map(Path::new),
@@ -407,9 +409,9 @@ fn main() {
             let raw_path = args.truth_raw.as_deref().map(Path::new);
             if let Some(p) = raw_path { selphi_info!("  raw:      {}", p.display()); }
             selphi_step!("Scoring imputation R² (absent→hom-ref)...");
-            let (comb, snp, indel, counts, site, rawdiag) = selphi::eval::accuracy::evaluate_imputation(
-                imp_path, truth_path, &shared, raw_path, &exclude,
-            ).expect("Evaluation failed");
+            let (comb, snp, indel, counts, site, rawdiag) = eval_run::evaluation_or_exit(selphi::eval::accuracy::evaluate_imputation_with_options(
+                imp_path, truth_path, &shared, raw_path, &exclude, &dosage_options,
+            ));
             let n_excluded = counts.n_imp_variants.saturating_sub(counts.n_matched);
             selphi::eval::accuracy::print_imputation_summary(&comb, &snp, &indel, args.by_type, &counts, n_excluded);
             selphi::eval::accuracy::print_maf_bins(&site);
@@ -422,9 +424,9 @@ fn main() {
                 selphi_info!("  WARNING: --truth-raw is only used on the absent→hom-ref path; \
 pass --homref-absent on to apply it (matched-sites scoring ignores it)");
             }
-            let (site_acc, sample_acc, counts) = selphi::eval::accuracy::evaluate(
-                imp_path, truth_path, &shared, &exclude,
-            ).expect("Evaluation failed");
+            let (site_acc, sample_acc, counts) = eval_run::evaluation_or_exit(selphi::eval::accuracy::evaluate_with_options(
+                imp_path, truth_path, &shared, &exclude, &dosage_options,
+            ));
             selphi::eval::accuracy::print_summary(&site_acc, &sample_acc, &counts);
             selphi::eval::accuracy::write_json_summary(&json_path, &site_acc, &sample_acc, &counts, Some(&shared))
                 .expect("Failed to write JSON summary");

@@ -42,11 +42,7 @@ pub fn setup_parquet_writer(
     output_path: &Path,
     sample_names: &[String],
 ) -> std::io::Result<(ArrowWriter<std::fs::File>, Arc<Schema>)> {
-    let parquet_path = if output_path.extension().is_none_or(|e| e != "parquet") {
-        output_path.with_extension("parquet")
-    } else {
-        output_path.to_path_buf()
-    };
+    let parquet_path = crate::common::utils::out_path(output_path, "parquet");
 
     let schema = Arc::new(build_schema(sample_names));
     let file = std::fs::File::create(&parquet_path)?;

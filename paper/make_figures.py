@@ -71,12 +71,12 @@ ARMS = ["hard", "lcwgs", "glimpse2", "selphi_native", "selphi_isec"]
 # STRATA_KEYS order). Used only when a JSON is missing or unreadable.
 FALLBACK = {
     "hard": {
-        "HG002": {"nonref": 71.4389, "het_recall": 57.8827, "by_af_nonref": (72.601, 65.674, 55.701)},
-        "HG003": {"nonref": 73.3695, "het_recall": 61.6314, "by_af_nonref": (74.23, 69.807, 58.989)},
-        "HG004": {"nonref": 68.2695, "het_recall": 52.5936, "by_af_nonref": (69.989, 54.399, 57.955)},
-        "HG005": {"nonref": 73.372, "het_recall": 58.0941, "by_af_nonref": (74.672, 70.467, 51.326)},
-        "HG006": {"nonref": 74.8632, "het_recall": 55.8584, "by_af_nonref": (76.396, 68.119, 52.375)},
-        "HG007": {"nonref": 75.3753, "het_recall": 61.6517, "by_af_nonref": (77.246, 65.569, 51.581)},
+        "HG002": {"nonref": 89.8151, "het_recall": 86.6421, "by_af_nonref": (91.01, 84.123, 73.186)},
+        "HG003": {"nonref": 91.4902, "het_recall": 88.9347, "by_af_nonref": (92.808, 84.637, 71.84)},
+        "HG004": {"nonref": 90.928, "het_recall": 87.7955, "by_af_nonref": (92.414, 82.986, 74.148)},
+        "HG005": {"nonref": 88.621, "het_recall": 84.2569, "by_af_nonref": (89.897, 86.755, 65.53)},
+        "HG006": {"nonref": 89.8855, "het_recall": 84.5564, "by_af_nonref": (91.447, 82.802, 67.291)},
+        "HG007": {"nonref": 89.9302, "het_recall": 86.2981, "by_af_nonref": (91.586, 85.536, 62.492)},
     },
     "lcwgs": {
         "HG002": {"nonref": 98.1728, "het_recall": 97.5148, "by_af_nonref": (98.777, 95.59, 89.219)},

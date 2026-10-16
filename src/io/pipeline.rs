@@ -95,13 +95,33 @@ impl WindowSetup<'_> {
 }
 
 /// Build interpolation intervals for the owned portion of a window.
+/// `n_weight_rows` is the minimum CSR row count across the window's haplotypes:
+/// an overlap anchor may be outside the owned range but must have copying weights.
 pub(crate) fn build_intervals(
     win_chip_start: usize,
+    n_weight_rows: usize,
     own_chip_start: usize,
     own_chip_end: usize,
     wgs_idx: &[usize],
     own_wgs_start: usize,
     own_wgs_end: usize,
+) -> Vec<Interval> {
+    use std::sync::OnceLock;
+    static CONST_TAIL: OnceLock<bool> = OnceLock::new();
+    let constant_tail = *CONST_TAIL.get_or_init(|| crate::config::is_one("SELPHI_SPLICE_CONST_TAIL"));
+    build_intervals_with_tail(win_chip_start, n_weight_rows, own_chip_start, own_chip_end,
+                              wgs_idx, own_wgs_start, own_wgs_end, constant_tail)
+}
+
+fn build_intervals_with_tail(
+    win_chip_start: usize,
+    n_weight_rows: usize,
+    own_chip_start: usize,
+    own_chip_end: usize,
+    wgs_idx: &[usize],
+    own_wgs_start: usize,
+    own_wgs_end: usize,
+    constant_tail: bool,
 ) -> Vec<Interval> {
     let mut intervals = Vec::new();
     let owned_chips: Vec<usize> = (own_chip_start..own_chip_end).collect();
@@ -127,12 +147,199 @@ pub(crate) fn build_intervals(
     let last_ci = *owned_chips.last().unwrap();
     if wgs_idx[last_ci] < own_wgs_end.saturating_sub(1) {
         let last_local = last_ci - win_chip_start;
+        let right_local = own_chip_end - win_chip_start;
+        // Use the next chip anchor in the overlap when its weight row exists.
+        // At the chromosome end or without overlap, keep constant extrapolation.
+        let weight_e = if !constant_tail && own_chip_end < wgs_idx.len()
+            && right_local < n_weight_rows
+            && wgs_idx[own_chip_end] == own_wgs_end
+        {
+            right_local
+        } else {
+            last_local
+        };
         intervals.push(Interval {
             wgs_start: wgs_idx[last_ci], wgs_end: own_wgs_end,
-            weight_s: last_local, weight_e: last_local,
+            weight_s: last_local, weight_e,
         });
     }
     intervals
+}
+
+#[cfg(test)]
+mod interval_tests {
+    use super::{build_intervals_with_tail, Interval};
+
+    // One reference allele is REF and the other ALT. Keep donor weights fixed
+    // while changing only window ownership, including unequal retained row mass.
+    fn alt_probability(intervals: &[Interval], pos: usize, win_start: usize,
+                       donor_weights: &[[f64; 2]]) -> f64 {
+        let iv = intervals.iter().find(|iv| iv.wgs_start <= pos && pos < iv.wgs_end)
+            .expect("variant must belong to an interpolation interval");
+        let t = (pos - iv.wgs_start) as f64 / (iv.wgs_end - iv.wgs_start) as f64;
+        let a = donor_weights[win_start + iv.weight_s];
+        let b = donor_weights[win_start + iv.weight_e];
+        let reference = (1.0 - t) * a[0] + t * b[0];
+        let alternate = (1.0 - t) * a[1] + t * b[1];
+        alternate / (reference + alternate)
+    }
+
+    #[test]
+    fn overlap_partition_preserves_anchor_dosages() {
+        let anchors = [2, 8, 14, 20, 26];
+        let weights = [[1.0, 0.0], [0.5, 0.5], [0.6, 0.3], [0.1, 0.8], [0.0, 1.0]];
+        let whole = build_intervals_with_tail(0, 5, 0, 5, &anchors, 0, 30, false);
+        let left = build_intervals_with_tail(0, 4, 0, 3, &anchors, 0, 20, false);
+        let right = build_intervals_with_tail(2, 3, 3, 5, &anchors, 20, 30, false);
+        for pos in 0..30 {
+            let expected = alt_probability(&whole, pos, 0, &weights);
+            let observed = if pos < 20 {
+                alt_probability(&left, pos, 0, &weights)
+            } else {
+                alt_probability(&right, pos, 2, &weights)
+            };
+            assert!((observed - expected).abs() < 1e-12, "position {pos}");
+        }
+        assert!((alt_probability(&left, 17, 0, &weights) - 11.0 / 18.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn no_overlap_keeps_tail_inside_available_weight_rows() {
+        let anchors = [2, 8, 14, 20];
+        // A next global marker exists, but no haplotype has its row in this window.
+        let intervals = build_intervals_with_tail(0, 2, 0, 2, &anchors, 0, 14, false);
+        assert!(intervals.iter().all(|iv| iv.weight_s < 2 && iv.weight_e < 2));
+        let weights = [[1.0, 0.0], [0.25, 0.75]];
+        assert_eq!(alt_probability(&intervals, 11, 0, &weights), 0.75);
+    }
+
+    #[test]
+    fn chromosome_edges_keep_constant_extrapolation() {
+        let anchors = [3, 7];
+        let intervals = build_intervals_with_tail(0, 2, 0, 2, &anchors, 0, 12, false);
+        let weights = [[0.8, 0.2], [0.1, 0.9]];
+        assert_eq!(alt_probability(&intervals, 0, 0, &weights), 0.2);
+        assert_eq!(alt_probability(&intervals, 11, 0, &weights), 0.9);
+        assert!(intervals.iter().all(|iv| iv.weight_e < 2));
+    }
+
+    #[test]
+    fn duplicate_wgs_indices_keep_partition_dosages() {
+        let anchors = [2, 8, 8, 14, 20];
+        let weights = [[1.0, 0.0], [0.8, 0.2], [0.2, 0.8], [0.0, 1.0], [0.5, 0.5]];
+        let whole = build_intervals_with_tail(0, 5, 0, 5, &anchors, 0, 24, false);
+        let left = build_intervals_with_tail(0, 3, 0, 2, &anchors, 0, 8, false);
+        let right = build_intervals_with_tail(1, 4, 2, 5, &anchors, 8, 24, false);
+        assert!(whole.iter().chain(&left).chain(&right).all(|iv| iv.wgs_start < iv.wgs_end));
+        for pos in 0..24 {
+            let expected = alt_probability(&whole, pos, 0, &weights);
+            let observed = if pos < 8 {
+                alt_probability(&left, pos, 0, &weights)
+            } else {
+                alt_probability(&right, pos, 1, &weights)
+            };
+            assert!((observed - expected).abs() < 1e-12, "position {pos}");
+        }
+    }
+
+    #[test]
+    fn one_owned_chip_uses_available_overlap_anchor() {
+        let anchors = [2, 8, 14, 20];
+        let intervals = build_intervals_with_tail(1, 2, 1, 2, &anchors, 8, 14, false);
+        let weights = [[0.5, 0.5], [1.0, 0.0], [0.0, 1.0], [0.5, 0.5]];
+        assert_eq!(intervals.len(), 1);
+        assert_eq!(alt_probability(&intervals, 11, 1, &weights), 0.5);
+    }
+
+    #[test]
+    fn actual_sparse_kernel_preserves_cm_dosages_across_ownership_splice() {
+        use super::{cm_t_values, interpolate_tile_preloaded};
+        use crate::imputation::hmm::CsrWeights;
+        use crate::srp::CscChunk;
+
+        let anchors = [2, 8, 14, 20, 26];
+        let whole = build_intervals_with_tail(0, 5, 0, 5, &anchors, 0, 30, false);
+        let left = build_intervals_with_tail(0, 4, 0, 3, &anchors, 0, 20, false);
+        let right = build_intervals_with_tail(2, 3, 3, 5, &anchors, 20, 30, false);
+        let donor_weights: [[f32; 2]; 5] = [
+            [1.0, 0.0], [0.5, 0.5], [0.6, 0.3], [0.1, 0.8], [0.0, 1.0],
+        ];
+        // Nonlinear map and unequal retained row masses exercise the actual
+        // cM interpolation and CSR denominator, not only interval indices.
+        let cm: Vec<f64> = (0..30).map(|i| (i * i + i) as f64 * 0.001).collect();
+        let chunks = vec![Some(CscChunk {
+            indptr: vec![0, 0, 30], indices: (0..30).collect(), n_rows: 30, n_cols: 2,
+        })];
+        let probability = |intervals: &[Interval], pos: usize, start: usize, nrows: usize| {
+            let iv = intervals.iter().find(|iv| iv.wgs_start <= pos && pos < iv.wgs_end).unwrap();
+            let weights = CsrWeights {
+                indptr: (0..=nrows).map(|i| (2 * i) as i32).collect(),
+                indices: (0..nrows).flat_map(|_| [0, 1]).collect(),
+                data: donor_weights[start..start + nrows].iter().flatten().copied().collect(),
+                n_rows: nrows, n_cols: 2,
+            };
+            let t = cm_t_values(&cm, iv.wgs_start, iv.wgs_end, pos - iv.wgs_start, 1)
+                .unwrap_or_else(|| vec![(pos - iv.wgs_start) as f32 / (iv.wgs_end - iv.wgs_start) as f32]);
+            interpolate_tile_preloaded(&chunks, 0, &[&weights], iv.weight_s, iv.weight_e,
+                                       pos, 1, &t, 1, 30)[0]
+        };
+        for pos in 0..30 {
+            let expected = probability(&whole, pos, 0, 5);
+            let observed = if pos < 20 { probability(&left, pos, 0, 4) }
+                           else { probability(&right, pos, 2, 3) };
+            assert_eq!(observed.to_bits(), expected.to_bits(), "position {pos}");
+        }
+    }
+    #[test]
+    fn constant_tail_ab_restores_legacy_interval_topology() {
+        // Independently reproduce the old function's complete interval sequence.
+        let legacy = |win_start: usize, own_start: usize, own_end: usize,
+                      anchors: &[usize], begin: usize, end: usize| {
+            let mut result = Vec::new();
+            if own_start == own_end { return result; }
+            if begin < anchors[own_start] {
+                result.push((begin, anchors[own_start], own_start - win_start, own_start - win_start));
+            }
+            for i in own_start..own_end - 1 {
+                if anchors[i + 1] > anchors[i] {
+                    result.push((anchors[i], anchors[i + 1], i - win_start, i + 1 - win_start));
+                }
+            }
+            let last = own_end - 1;
+            if anchors[last] < end.saturating_sub(1) {
+                result.push((anchors[last], end, last - win_start, last - win_start));
+            }
+            result
+        };
+        for anchors in [vec![2, 8, 14, 20, 26], vec![2, 8, 8, 14, 20]] {
+            for win_start in 0..anchors.len() {
+                for own_start in win_start..anchors.len() {
+                    for own_end in own_start..=anchors.len() {
+                        let begin = if own_start == 0 { 0 } else { anchors[own_start] };
+                        let end = if own_end < anchors.len() { anchors[own_end] } else { 30 };
+                        for n_rows in own_end - win_start..=anchors.len() - win_start {
+                            let got = build_intervals_with_tail(win_start, n_rows, own_start,
+                                own_end, &anchors, begin, end, true);
+                            let got: Vec<_> = got.iter().map(|iv|
+                                (iv.wgs_start, iv.wgs_end, iv.weight_s, iv.weight_e)).collect();
+                            assert_eq!(got, legacy(win_start, own_start, own_end, &anchors, begin, end));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn constant_tail_ab_exercises_the_splice_difference() {
+        let anchors = [2, 8, 14, 20];
+        let weights = [[0.5, 0.5], [1.0, 0.0], [0.0, 1.0], [0.5, 0.5]];
+        let fixed = build_intervals_with_tail(1, 2, 1, 2, &anchors, 8, 14, false);
+        let legacy = build_intervals_with_tail(1, 2, 1, 2, &anchors, 8, 14, true);
+        assert_eq!(alt_probability(&fixed, 11, 1, &weights), 0.5);
+        assert_eq!(alt_probability(&legacy, 11, 1, &weights), 0.0);
+    }
+
 }
 
 /// IMP flags of the window `[own_start, own_end)`: absent from the input, i.e.
@@ -216,10 +423,11 @@ impl<'a> WindowSetup<'a> {
         }).collect();
 
         let weight_refs: Vec<&CsrWeights> = all_weights.iter().map(|w| &w[0].1).collect();
+        let n_weight_rows = weight_refs.iter().map(|w| w.n_rows).min().unwrap_or(0);
         let an_str: Vec<u8> = format!("{}", n_haps).into_bytes();
 
         let intervals = build_intervals(
-            win_chip_start, own_chip_start, own_chip_end,
+            win_chip_start, n_weight_rows, own_chip_start, own_chip_end,
             wgs_idx, own_wgs_start, own_wgs_end,
         );
 
@@ -351,11 +559,7 @@ pub fn setup_vcf_writer(
     output_path: &Path,
     no_ap: bool,
 ) -> std::io::Result<(VcfSender, VcfWriterHandle, VcfBgzipProc)> {
-    let vcf_path = if output_path.extension().is_none_or(|e| e != "gz") {
-        output_path.with_extension("vcf.gz")
-    } else {
-        output_path.to_path_buf()
-    };
+    let vcf_path = crate::common::utils::out_path(output_path, "vcf.gz");
 
     let (bgzf_writer, tx, rx) = build_bgzf_channel(&vcf_path, n_samples)?;
 
@@ -661,11 +865,7 @@ pub fn setup_bcf_writer(
     output_path: &Path,
     no_ap: bool,
 ) -> std::io::Result<(VcfSender, VcfWriterHandle, VcfBgzipProc)> {
-    let bcf_path = if output_path.extension().is_none_or(|e| e != "bcf") {
-        output_path.with_extension("bcf")
-    } else {
-        output_path.to_path_buf()
-    };
+    let bcf_path = crate::common::utils::out_path(output_path, "bcf");
 
     let (bgzf_writer, tx, rx) = build_bgzf_channel(&bcf_path, n_samples)?;
 

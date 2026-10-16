@@ -19,7 +19,7 @@ pub fn merge_batch_sds(batch_paths: &[PathBuf], output_path: &Path) -> std::io::
     if batch_paths.is_empty() {
         return Err(std::io::Error::other("no batch files to merge"));
     }
-    let final_path = output_path.with_extension("selfdecode.zip");
+    let final_path = crate::common::utils::out_path(output_path, "selfdecode.zip");
     let out_file = std::fs::File::create(&final_path)?;
     let mut zw = ZipWriter::new(out_file);
     let options = SimpleFileOptions::default()

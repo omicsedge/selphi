@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
-use super::{CscChunk, Variant, SrpMetadata, parse_raw_chunk, SRP_SINGLE_CHR_MAGIC};
+use super::{CscChunk, Variant, SrpMetadata, parse_raw_chunk};
 
 pub struct SrpReader {
     pub metadata: SrpMetadata,
@@ -27,8 +27,8 @@ impl SrpReader {
 
         let mut magic = [0u8; 8];
         f.read_exact(&mut magic)?;
-        if &magic != SRP_SINGLE_CHR_MAGIC {
-            let hint = if &magic == super::SRP_MULTI_CHR_MAGIC {
+        if !super::is_single_chr_magic(&magic) {
+            let hint = if super::is_multi_chr_magic(&magic) {
                 "Detected multi-chromosome SRP file. Use MultiChrSrpReader for multi-chromosome panels."
             } else if &magic[..2] == b"PK" {
                 "Detected old ZIP-based SRP format."

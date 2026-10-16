@@ -28,6 +28,8 @@ pub struct WindowHmmParams {
     pub fl_bwd: usize,
     pub est_ne: f64,
     pub p_err: f64,
+    /// Adapt the emission floor per haplotype (`PerrAdapt`); false when `--p-err` was given.
+    pub adapt_floor: bool,
     pub max_candidates: usize,
     /// Whether the HMM should compute `hap_posterior` for cross-window passthrough.
     /// Set to false on the final window — the posterior is an `n_ref`-sized f64
@@ -143,7 +145,7 @@ pub fn impute_window(
     inputs: &ImputeWindowInputs,
     params: &WindowHmmParams,
     precomputed_candidates: Option<&Vec<Vec<u32>>>,
-    hap_priors: &mut [Option<Vec<(i64, f64)>>],
+    carry: &mut [HapCarry],
     on_batch_done: Option<BatchDoneCb<'_>>,
 ) -> WindowHmmOutput {
     let n_var_w = inputs.chip_end - inputs.chip_start;
@@ -202,7 +204,7 @@ pub fn impute_window(
         params, inputs.ref_bm, targ_w, cm_w,
         ne_w.as_deref(), conf_w.as_deref(), ns, &coded,
         precomputed_candidates,
-        hap_priors, inputs.chip_start, n_var_w,
+        carry, inputs.chip_start, n_var_w,
         on_batch_done,
     );
     crate::selphi_debug!("  [MEM] impute_window: HMM done: rss={:.0} MB", crate::log::rss_mb());
@@ -239,6 +241,159 @@ struct PbwtCtx<'a> {
     /// Per target hap: the window sites at which it is a no-call (bitset), or
     /// None when the window has none (see pbwt::follow_match_allele).
     miss: &'a [Option<Vec<u64>>],
+    /// Leave a target's no-call sites out of its PBWT (`called_sites`) instead of
+    /// following its longest match through them. `SELPHI_NOCALL_FOLLOW=1` = off.
+    skip: bool,
+}
+
+/// What a target haplotype carries from one imputation window to the next.
+#[derive(Clone, Default)]
+pub struct HapCarry {
+    /// The forward posterior at the previous window's end (sparse, sorted hap ids): this
+    /// window's prior.
+    pub prior: Option<Vec<(i64, f64)>>,
+    /// The emission floor the haplotype was given in its first window (`PerrAdapt`).
+    pub p_err: Option<f64>,
+}
+
+/// Adaptive emission floor. A real array's genotype errors break the target's long
+/// matches at the miscalled sites, and the copying model can only follow the right
+/// haplotype through them by paying the `p_err` emission; the 0.025 default was tuned
+/// on synthetic chips cut from WGS, which have no errors. In a haplotype's first window
+/// the HMM runs at the default and measures its posterior mass outside the match set
+/// (`hmm::unmatched_posterior_mean`); above `lo` the floor rises linearly to `max` at
+/// `hi`, the HMM runs again at that floor, and the haplotype keeps it in later windows.
+/// Calibrated on GIAB chr21 x the 75,552-hap v3 panel with errors injected: the best
+/// floor is 0.025 error-free (mass 0.0004), 0.05 at 0.2% (0.0010), 0.07 at 0.5-1%
+/// (0.0020-0.0035). Error-free targets stay at the default (MESA 100 x TOPMed: 0 of 200
+/// haplotypes raised; GIAB template 0 of 12). On six consumer arrays (GSA) x v3 it raised
+/// per-sample R2 on chr14, chr20 and chr22 for 18 of 18 person-chromosomes (median +0.0005).
+/// Measuring in every window instead (a second pass wherever it rises) moved six users'
+/// chr20 by -0.00003..-0.00009 and chrX by +0.00001..+0.00018, so the first window decides.
+/// `SELPHI_PERR_FIXED=1` restores the fixed floor; `SELPHI_PERR_ADAPT_LO/_HI/_MAX` set the map.
+#[derive(Clone, Copy)]
+struct PerrAdapt { lo: f64, hi: f64, max: f64 }
+
+impl PerrAdapt {
+    fn floor(&self, base: f64, unmatched: f64) -> f64 {
+        if self.max <= base || self.hi <= self.lo { return base; }
+        base + (self.max - base) * ((unmatched - self.lo) / (self.hi - self.lo)).clamp(0.0, 1.0)
+    }
+}
+
+/// Off under `SELPHI_PERR_FIXED=1` and under `SELPHI_PERR_OVERRIDE`, which replaces the
+/// emission p_err outright so a floor cannot move it. `MAX` is capped at 0.5, above which
+/// the emission inverts (as `--p-err` is validated).
+fn perr_adapt() -> Option<PerrAdapt> {
+    static V: std::sync::OnceLock<Option<PerrAdapt>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let off = crate::config::is_one("SELPHI_PERR_FIXED") || crate::config::raw("SELPHI_PERR_OVERRIDE").is_some();
+        (!off).then(|| PerrAdapt {
+            lo: crate::config::f64_opt("SELPHI_PERR_ADAPT_LO").unwrap_or(0.0008),
+            hi: crate::config::f64_opt("SELPHI_PERR_ADAPT_HI").unwrap_or(0.002),
+            max: crate::config::f64_opt("SELPHI_PERR_ADAPT_MAX").unwrap_or(0.07).clamp(0.0, 0.5),
+        })
+    })
+}
+
+/// Record the floor a haplotype was measured to in its first window (`PerrAdapt`).
+fn carry_update(c: &mut HapCarry, r: &super::hmm::HmmResult, base: f64, adapt: bool,
+                stats: &mut (usize, usize, f64, f64)) {
+    if let (true, None, Some(u)) = (adapt, c.p_err, r.unmatched) {
+        c.p_err = Some(r.perr_floor);
+        stats.0 += 1;
+        stats.1 += (r.perr_floor > base) as usize;
+        stats.2 += u;
+        stats.3 += r.perr_floor;
+    }
+}
+
+/// `SELPHI_NOCALL_FOLLOW=1` restores following the longest match through a no-call
+/// (pbwt::follow_match_allele) instead of leaving the site out (A/B).
+fn nocall_skip() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !crate::config::is_one("SELPHI_NOCALL_FOLLOW"))
+}
+
+/// The window sites target `tgt` is CALLED at, when it has a no-call in the window
+/// and the skip is on; None otherwise (all sites used).
+///
+/// A no-call carries no allele. A single-sample run drops a site its only sample
+/// does not call before the PBWT ever sees it; in a cohort the site stays because
+/// other samples call it, and the target used to follow its longest match through
+/// it -- which still counts the site as a matched marker toward `match_length` and
+/// still ends every match whose allele differs from the one followed. One user per
+/// run on the six users' merged chr14 site list (~245 such sites each) lost 0.0009
+/// per-sample R2 to that with identical phasing. Running the target's PBWT over its
+/// called sites only is what the single-sample run does; `expand_csc` puts the
+/// matches back on the window's sites.
+fn called_sites(ctx: &PbwtCtx, tgt: usize) -> Option<Vec<usize>> {
+    if !ctx.skip { return None; }
+    let ms = ctx.miss.get(tgt)?.as_deref()?;
+    let sites: Vec<usize> = (0..ctx.n_var_w).filter(|&v| (ms[v / 64] >> (v % 64)) & 1 == 0).collect();
+    // Fewer than two called sites leaves nothing to match on: keep every site.
+    if sites.len() < 2 { None } else { Some(sites) }
+}
+
+/// Allele rows restricted to `sites` (row `k` = the inner row of `sites[k]`).
+struct SubsetRows<'r> { inner: &'r mut dyn pbwt::AlleleRows, sites: &'r [usize] }
+
+impl pbwt::AlleleRows for SubsetRows<'_> {
+    #[inline]
+    fn row(&mut self, var: usize) -> &[u8] { self.inner.row(self.sites[var]) }
+}
+
+/// Put a target's copying weights, computed over its called `sites` only, back on all
+/// `n_var` window rows: a called row is copied; a row the target does not call is the
+/// cM-linear blend of the called rows either side (the nearest one at a window edge).
+/// Interpolating untyped sites between rows that are themselves a linear blend gives
+/// what interpolating straight across the skipped row gives, so the target's dosages
+/// are the ones a run without that site would write -- a single-sample run, which
+/// drops a site its only sample does not call.
+fn expand_weights(w: super::hmm::CsrWeights, sites: &[usize], cm: &[f64], n_var: usize)
+    -> super::hmm::CsrWeights
+{
+    let row = |r: usize| {
+        let (a, b) = (w.indptr[r] as usize, w.indptr[r + 1] as usize);
+        (&w.indices[a..b], &w.data[a..b])
+    };
+    let mut indptr = Vec::with_capacity(n_var + 1);
+    let mut indices: Vec<i32> = Vec::with_capacity(w.indices.len() + w.indices.len() / 8);
+    let mut data: Vec<f32> = Vec::with_capacity(indices.capacity());
+    let mut pairs: Vec<(i32, f32)> = Vec::new();
+    indptr.push(0i32);
+    let mut k = 0usize; // first called row at or after v
+    for v in 0..n_var {
+        while k < sites.len() && sites[k] < v { k += 1; }
+        if k < sites.len() && sites[k] == v {
+            let (ix, dv) = row(k);
+            indices.extend_from_slice(ix);
+            data.extend_from_slice(dv);
+        } else if k == 0 || k == sites.len() {
+            let (ix, dv) = row(if k == 0 { 0 } else { sites.len() - 1 });
+            indices.extend_from_slice(ix);
+            data.extend_from_slice(dv);
+        } else {
+            let (l, r) = (k - 1, k);
+            let span = cm[sites[r]] - cm[sites[l]];
+            let t = if span > 0.0 { ((cm[v] - cm[sites[l]]) / span).clamp(0.0, 1.0) as f32 } else { 0.5 };
+            pairs.clear();
+            let (ix, dv) = row(l);
+            pairs.extend(ix.iter().zip(dv).map(|(&i, &d)| (i, (1.0 - t) * d)));
+            let (ix, dv) = row(r);
+            pairs.extend(ix.iter().zip(dv).map(|(&i, &d)| (i, t * d)));
+            pairs.sort_unstable_by_key(|&(i, _)| i);
+            let mut j = 0;
+            while j < pairs.len() {
+                let (i, mut d) = pairs[j];
+                j += 1;
+                while j < pairs.len() && pairs[j].0 == i { d += pairs[j].1; j += 1; }
+                if d > 0.0 { indices.push(i); data.push(d); }
+            }
+        }
+        indptr.push(indices.len() as i32);
+    }
+    super::hmm::CsrWeights { indptr, indices, data, n_rows: n_var, n_cols: w.n_cols }
 }
 
 // ONE allele row of scratch (m bytes), not n_var of them — see pbwt::AlleleRows
@@ -511,29 +666,39 @@ fn full_panel_rows<'a>(ctx: &PbwtCtx<'a>, buf: Vec<u8>) -> FullRows<'a> {
 
 fn full_panel_csc(
     ctx: &PbwtCtx, tgt: usize, buf: Vec<u8>, keep: Option<&[u64]>,
-) -> (pbwt::CscMatchMatrix, Vec<u8>) {
+) -> (pbwt::CscMatchMatrix, Vec<u8>, Option<Vec<usize>>) {
     let m = ctx.n_ref + ctx.n_haps;
     let mut rows = full_panel_rows(ctx, buf);
+    let called = called_sites(ctx, tgt);
     thread_local! {
         static WS_FULL: std::cell::RefCell<Option<pbwt::PbwtWorkspace>> =
             const { std::cell::RefCell::new(None) };
     }
+    let nv = called.as_ref().map_or(ctx.n_var_w, |c| c.len());
     let fwd = WS_FULL.with(|cell| {
         let mut ws_opt = cell.borrow_mut();
         let ws = ws_opt.get_or_insert_with(|| pbwt::PbwtWorkspace::new(m, ctx.n_ref));
         if ws.capacity() < m { *ws = pbwt::PbwtWorkspace::new(m, ctx.n_ref); }
-        let (nv, nr, ml, ff) = (ctx.n_var_w, ctx.n_ref, ctx.match_length, ctx.fl_fwd);
+        let (nr, ml, ff) = (ctx.n_ref, ctx.match_length, ctx.fl_fwd);
         let tgt_abs = (ctx.n_ref + tgt) as i32;
-        let miss = ctx.miss.get(tgt).and_then(|o| o.as_deref());
+        // Skipping the no-calls replaces following through them.
+        let miss = if called.is_some() { None } else { ctx.miss.get(tgt).and_then(|o| o.as_deref()) };
+        let mut sub;
+        let rows_dyn: &mut dyn pbwt::AlleleRows = match &called {
+            Some(c) => { sub = SubsetRows { inner: &mut rows, sites: c }; &mut sub }
+            None => &mut rows,
+        };
         match keep {
             None => pbwt::pbwt_forward_filtered(
-                ws, &mut rows, nv, m, nr, ml, ff, tgt_abs, &pbwt::AllRefs, miss),
+                ws, rows_dyn, nv, m, nr, ml, ff, tgt_abs, &pbwt::AllRefs, miss),
             Some(k) => pbwt::pbwt_forward_filtered(
-                ws, &mut rows, nv, m, nr, ml, ff, tgt_abs, &pbwt::OnlyCands(k), miss),
+                ws, rows_dyn, nv, m, nr, ml, ff, tgt_abs, &pbwt::OnlyCands(k), miss),
         }
     });
-    let bwd = pbwt::backward_filter_single(&fwd, ctx.n_var_w, ctx.n_ref, ctx.fl_fwd, ctx.fl_bwd);
-    (pbwt::build_csc_matrix(&bwd, ctx.n_ref, ctx.n_var_w, ctx.fl_bwd), rows.buf)
+    let bwd = pbwt::backward_filter_single(&fwd, nv, ctx.n_ref, ctx.fl_fwd, ctx.fl_bwd);
+    // Over the called sites when `called` is Some (see `expand_weights`).
+    let csc = pbwt::build_csc_matrix(&bwd, ctx.n_ref, nv, ctx.fl_bwd);
+    (csc, rows.buf, called)
 }
 
 /// PBWT over this target's candidate set plus the target itself — the default
@@ -542,7 +707,7 @@ fn full_panel_csc(
 /// indices have been remapped to absolute haplotype IDs.
 fn reduced_csc(
     ctx: &PbwtCtx, tgt: usize, candidates: &[u32], buf: Vec<u8>,
-) -> (pbwt::CscMatchMatrix, Vec<u8>) {
+) -> (pbwt::CscMatchMatrix, Vec<u8>, Option<Vec<usize>>) {
     struct GatherRows<'a> {
         bm: &'a HaplotypeBitmatrix, chip_start: usize, candidates: &'a [u32],
         targ_w: &'a [u8], n_haps: usize, tgt: usize, buf: Vec<u8>,
@@ -569,17 +734,26 @@ fn reduced_csc(
         static WS: std::cell::RefCell<Option<pbwt::PbwtWorkspace>> =
             const { std::cell::RefCell::new(None) };
     }
+    let called = called_sites(ctx, tgt);
+    let nv = called.as_ref().map_or(ctx.n_var_w, |c| c.len());
     let fwd = WS.with(|ws_cell| {
         let mut ws_opt = ws_cell.borrow_mut();
         let ws = ws_opt.get_or_insert_with(|| pbwt::PbwtWorkspace::new(m_red, n_cand));
         if ws.capacity() < m_red { *ws = pbwt::PbwtWorkspace::new(m_red, n_cand); }
+        // Skipping the no-calls replaces following through them.
+        let miss = if called.is_some() { None } else { ctx.miss.get(tgt).and_then(|o| o.as_deref()) };
+        let mut sub;
+        let rows_dyn: &mut dyn pbwt::AlleleRows = match &called {
+            Some(c) => { sub = SubsetRows { inner: &mut rows, sites: c }; &mut sub }
+            None => &mut rows,
+        };
         pbwt::pbwt_forward_with_workspace(
-            ws, &mut rows, ctx.n_var_w, m_red, n_cand, ctx.match_length, ctx.fl_fwd,
-            n_cand as i32, ctx.miss.get(tgt).and_then(|o| o.as_deref()),
+            ws, rows_dyn, nv, m_red, n_cand, ctx.match_length, ctx.fl_fwd, n_cand as i32, miss,
         )
     });
-    let bwd = pbwt::backward_filter_single(&fwd, ctx.n_var_w, n_cand, ctx.fl_fwd, ctx.fl_bwd);
-    let mut csc = pbwt::build_csc_matrix(&bwd, n_cand, ctx.n_var_w, ctx.fl_bwd);
+    let bwd = pbwt::backward_filter_single(&fwd, nv, n_cand, ctx.fl_fwd, ctx.fl_bwd);
+    // Over the called sites when `called` is Some (see `expand_weights`).
+    let mut csc = pbwt::build_csc_matrix(&bwd, n_cand, nv, ctx.fl_bwd);
     // CSC indices are positions in the candidate list — remap to absolute haplotype IDs.
     for idx in &mut csc.indices {
         debug_assert!((*idx as usize) < candidates.len(),
@@ -587,7 +761,7 @@ fn reduced_csc(
         *idx = candidates[*idx as usize] as i32;
     }
     csc.n_rows = ctx.n_ref;
-    (csc, rows.buf)
+    (csc, rows.buf, called)
 }
 
 // ---------------------------------------------------------------------------
@@ -724,7 +898,7 @@ pub fn process_window_hmm(
     n_samples: usize,
     coded: &pbwt::CodedSteps,
     precomputed_candidates: Option<&Vec<Vec<u32>>>,
-    hap_priors: &mut [Option<Vec<(i64, f64)>>],
+    carry: &mut [HapCarry],
     chip_start: usize,
     n_var_w: usize,
     mut on_batch_done: Option<BatchDoneCb<'_>>,
@@ -742,7 +916,7 @@ pub fn process_window_hmm(
 
     // Target-hap batching: when target_batch_size > 0, process target haps
     // in chunks of N rather than all at once. Bit-identical output (same HMM
-    // per target, same hap_priors update order). Memory peak inside HMM
+    // per target, same carry update order). Memory peak inside HMM
     // section becomes ~batch_size × per_target_csr instead of n_haps × per_csr.
     let batch_size = if params.target_batch_size == 0 {
         n_haps
@@ -771,17 +945,24 @@ pub fn process_window_hmm(
         }
     };
 
+    let adapt = if params.adapt_floor { perr_adapt() } else { None };
+    // (haplotypes measured, raised, sum of their unmatched mass, sum of their floors)
+    let mut adapt_stats = (0usize, 0usize, 0.0f64, 0.0f64);
     for batch_start in (0..n_haps).step_by(batch_size) {
         let batch_end = (batch_start + batch_size).min(n_haps);
-        let hap_priors_view: &[Option<Vec<(i64, f64)>>] = hap_priors;
+        let carry_view: &[HapCarry] = carry;
         let ctx = PbwtCtx {
             ref_bm, chip_start, n_ref, targ_w, n_haps, n_var_w,
-            match_length, fl_fwd, fl_bwd, miss: &miss,
+            match_length, fl_fwd, fl_bwd, miss: &miss, skip: nocall_skip(),
         };
-        // This target's candidate reference haplotypes.
+        // This target's candidate reference haplotypes. With the no-call skip, a
+        // target's no-calls are left out of its step codes too (select_candidates_nocall).
         let cands = |tgt: usize| -> Vec<u32> {
             if let Some(pc) = precomputed_candidates {
                 pc[tgt].clone()
+            } else if let Some(ms) = miss[tgt].as_deref().filter(|_| ctx.skip) {
+                pbwt::select_candidates_nocall(coded, n_ref + tgt, n_ref, max_candidates,
+                    ms, ref_bm, chip_start, targ_w, n_haps, tgt)
             } else {
                 pbwt::select_candidates(coded, n_ref + tgt, n_ref, max_candidates)
             }
@@ -789,24 +970,72 @@ pub fn process_window_hmm(
         // CSC -> copying weights. Shared by the per-target and the shared-sort
         // paths so the two cannot drift: the shared path's entire claim is that
         // it reproduces the per-target one byte for byte.
-        let finish = |tgt: usize, csc: &pbwt::CscMatchMatrix| -> (usize, HmmResult) {
-            let prior = hap_priors_view[tgt].as_deref();
+        // `called`: the target skipped its no-calls (`called_sites`); `csc` is then
+        // over those sites, and so is the HMM -- the target's chip rows are the ones it
+        // calls, as in a single-sample run -- with its weights put back on every window
+        // row by `expand_weights`. The panel-allele dedup reads contiguous chip rows, so
+        // it is not used for such a target (it compresses the state space; the model is
+        // the uncompressed one either way).
+        let finish = |tgt: usize, csc: &pbwt::CscMatchMatrix, called: Option<&[usize]>| -> (usize, HmmResult) {
+            let prior = carry_view[tgt].prior.as_deref();
             // R4 per-hap emission confidence: hap `tgt` belongs to sample tgt/2.
             // Extract that sample's column [var * n_samples + tgt/2] for v in
             // 0..n_var_w as a contiguous per-site vector for calculate_weights.
             // None (refine off / all-confident) → scalar emission, unchanged.
             let conf_hap: Option<Vec<f64>> = conf_w.map(|cw| {
                 let s = tgt / 2;
-                (0..n_var_w).map(|v| cw[v * n_samples + s]).collect()
+                match called {
+                    None => (0..n_var_w).map(|v| cw[v * n_samples + s]).collect(),
+                    Some(sites) => sites.iter().map(|&v| cw[v * n_samples + s]).collect(),
+                }
             });
             let t_hmm = std::time::Instant::now();
-            let w = super::hmm::calculate_weights(
-                csc, cm_w, &breaks_w, n_ref,
-                est_ne, p_err,
-                Some(super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start }),
-                n_var_w, None,
-                ne_w, prior, conf_hap.as_deref(), 0.0, params.compute_posterior,
-            );
+            let run = |floor: f64, measure: bool| match called {
+                None => super::hmm::calculate_weights(
+                    csc, cm_w, &breaks_w, n_ref,
+                    est_ne, floor,
+                    Some(super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start }),
+                    n_var_w, None,
+                    ne_w, prior, conf_hap.as_deref(), 0.0, params.compute_posterior, measure,
+                ),
+                Some(sites) => {
+                    let cm_s: Vec<f64> = sites.iter().map(|&v| cm_w[v]).collect();
+                    let ne_s: Option<Vec<f64>> = ne_w.map(|ne| sites.iter().map(|&v| ne[v]).collect());
+                    let n = sites.len();
+                    let mut r = super::hmm::calculate_weights(
+                        csc, &cm_s, &[(0usize, n)], n_ref,
+                        est_ne, floor, None, n, None,
+                        ne_s.as_deref(), prior, conf_hap.as_deref(), 0.0, params.compute_posterior, measure,
+                    );
+                    r.weights = r.weights.into_iter()
+                        .map(|(st, w)| (st, expand_weights(w, sites, cm_w, n_var_w))).collect();
+                    r
+                }
+            };
+            // Adaptive emission: a haplotype's first window measures at the default floor
+            // and runs again at the raised one; later windows reuse it.
+            let w = match (carry_view[tgt].p_err, adapt) {
+                (Some(floor), _) => run(floor, false),
+                (None, None) => run(p_err, false),
+                (None, Some(a)) => {
+                    let mut w0 = run(p_err, true);
+                    match w0.unmatched {
+                        // Too few trusted sites to measure: decide in the next window.
+                        None => w0,
+                        Some(u) => {
+                            let floor = a.floor(p_err, u);
+                            // The floor only bounds the window's match-count estimate from
+                            // below, so the weights change only if it exceeds the p_err used.
+                            if floor > w0.p_err {
+                                drop(w0);
+                                let mut w = run(floor, false);
+                                w.unmatched = Some(u);
+                                w
+                            } else { w0.perr_floor = floor; w0 }
+                        }
+                    }
+                }
+            };
             STAGE_HMM_US.fetch_add(t_hmm.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             (tgt, w)
         };
@@ -842,11 +1071,11 @@ pub fn process_window_hmm(
             let t_pbwt = std::time::Instant::now();
             // Both regimes return a CSC indexed by absolute haplotype ID with
             // n_rows = n_ref, so the HMM call below is shared.
-            let csc = if is_full {
+            let (csc, called) = if is_full {
                 // Mode 2 restricts the scan to this target's candidates; a genuine
                 // shortage of candidates (the original trigger) still scans them all.
                 let filtered = mode == 2 && n_cand >= FULL_PANEL_HMM_THRESHOLD;
-                let (c, b) = if filtered {
+                let (c, b, called) = if filtered {
                     let mask = take_mask(n_ref, &candidates);
                     let r = full_panel_csc(&ctx, tgt, row_buf, Some(&mask));
                     give_mask(mask, &candidates);
@@ -855,22 +1084,22 @@ pub fn process_window_hmm(
                     full_panel_csc(&ctx, tgt, row_buf, None)
                 };
                 row_buf = b;
-                c
+                (c, called)
             } else {
-                let (c, b) = reduced_csc(&ctx, tgt, &candidates, row_buf);
+                let (c, b, called) = reduced_csc(&ctx, tgt, &candidates, row_buf);
                 row_buf = b;
-                c
+                (c, called)
             };
             STAGE_PBWT_US.fetch_add(t_pbwt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 
             // Observation only — `csc` above is what actually reaches the HMM.
             if !is_full && tgt < superset_diag_ntgt() {
-                let (full_csc, _) = full_panel_csc(&ctx, tgt, vec![0u8; m], None);
+                let (full_csc, _, _) = full_panel_csc(&ctx, tgt, vec![0u8; m], None);
                 compare_match_sets(&csc, &full_csc, fl_bwd);
             }
 
             give_row_buf(row_buf);
-            finish(tgt, &csc)
+            finish(tgt, &csc, called.as_deref())
         };
 
         // A group of targets sharing ONE sort. See `pbwt::pbwt_forward_shared`.
@@ -910,7 +1139,7 @@ pub fn process_window_hmm(
             }).collect();
             STAGE_PBWT_US.fetch_add(t_pbwt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 
-            chunk.iter().zip(cscs.iter()).map(|(&t, csc)| finish(t, csc)).collect()
+            chunk.iter().zip(cscs.iter()).map(|(&t, csc)| finish(t, csc, None)).collect()
         };
 
         let share = resolve_share(n_var_w, fl_fwd, n_ref, batch_end - batch_start, max_candidates);
@@ -918,8 +1147,17 @@ pub fn process_window_hmm(
             if share <= 1 {
                 (batch_start..batch_end).into_par_iter().map(&per_target).collect()
             } else {
-                let idxs: Vec<usize> = (batch_start..batch_end).collect();
-                idxs.par_chunks(share).flat_map(|c| shared_chunk(c)).collect()
+                // A target that skips its no-calls has its own site list, so it cannot
+                // join a shared sort; it runs per target (same result as unshared).
+                let (own, shared): (Vec<usize>, Vec<usize>) = (batch_start..batch_end)
+                    .partition(|&t| ctx.skip && miss[t].is_some());
+                let mut out: Vec<(usize, HmmResult)> =
+                    shared.par_chunks(share).flat_map(|c| shared_chunk(c)).collect();
+                if !own.is_empty() {
+                    out.extend(own.into_par_iter().map(&per_target).collect::<Vec<_>>());
+                    out.sort_unstable_by_key(|&(t, _)| t);
+                }
+                out
             }
         };
         let batch_results = match hmm_pool() {
@@ -927,15 +1165,16 @@ pub fn process_window_hmm(
             None => run_batch(),
         };
 
-        // Sequential update of hap_priors. If streaming callback present:
+        // Sequential update of the carry. If streaming callback present:
         //   - Stash batch's CSRs into a local Vec, call callback, drop.
         //   - all_weights stays empty (streaming mode).
         // Otherwise (default): push to all_weights.
         if let Some(ref mut cb) = on_batch_done {
             let mut batch_weights: Vec<Vec<(usize, super::hmm::CsrWeights)>> = Vec::with_capacity(batch_end - batch_start);
             for (tgt, r) in batch_results {
+                carry_update(&mut carry[tgt], &r, p_err, adapt.is_some(), &mut adapt_stats);
                 if let Some(post) = r.hap_posterior {
-                    hap_priors[tgt] = Some(post);
+                    carry[tgt].prior = Some(post);
                 }
                 batch_weights.push(r.weights);
             }
@@ -946,12 +1185,19 @@ pub fn process_window_hmm(
             // batch_weights goes out of scope → CSRs dropped here
         } else {
             for (tgt, r) in batch_results {
+                carry_update(&mut carry[tgt], &r, p_err, adapt.is_some(), &mut adapt_stats);
                 if let Some(post) = r.hap_posterior {
-                    hap_priors[tgt] = Some(post);
+                    carry[tgt].prior = Some(post);
                 }
                 all_weights.push(r.weights);
             }
         }
+    }
+
+    if adapt_stats.0 > 0 {
+        let (n, raised, u, f) = adapt_stats;
+        crate::selphi_step!("Adaptive emission: {} of {} target haplotypes raised p_err above {} (mean {:.4}; unmatched posterior mass {:.5} mean)",
+            raised, n, p_err, f / n as f64, u / n as f64);
     }
 
     // SELPHI_PRUNE_DIAG: drain + print the window's aggregated pruning stats
@@ -1057,5 +1303,23 @@ mod share_tests {
     fn degenerate_inputs_are_off_not_panics() {
         assert_eq!(share_batch_for_budget(116_000.0, 0.0, 16), 1);
         assert_eq!(share_batch_for_budget(116_000.0, MESA_PER_TARGET_MB, 0), 1);
+    }
+}
+
+#[cfg(test)]
+mod perr_adapt_tests {
+    use super::PerrAdapt;
+
+    #[test]
+    fn floor_map() {
+        let a = PerrAdapt { lo: 0.0008, hi: 0.002, max: 0.07 };
+        assert_eq!(a.floor(0.025, 0.0004), 0.025);
+        assert_eq!(a.floor(0.025, 0.0008), 0.025);
+        assert!((a.floor(0.025, 0.0014) - 0.0475).abs() < 1e-12);
+        assert_eq!(a.floor(0.025, 0.002), 0.07);
+        assert_eq!(a.floor(0.025, 0.01), 0.07);
+        // a base at or above the cap, or an empty ramp, leaves the base
+        assert_eq!(a.floor(0.08, 0.01), 0.08);
+        assert_eq!(PerrAdapt { lo: 0.002, hi: 0.002, max: 0.07 }.floor(0.025, 0.01), 0.025);
     }
 }

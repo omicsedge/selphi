@@ -29,7 +29,7 @@ pub fn merge_batch_pgens(
     // 2. Copy PVAR from first batch (all batches have identical variant lines)
     {
         let src = std::fs::File::open(&batch_paths[0].1)?;
-        let dst_path = output_path.with_extension("pvar");
+        let dst_path = crate::common::utils::out_path(output_path, "pvar");
         let mut br = BufReader::new(src);
         let mut bw = BufWriter::new(std::fs::File::create(&dst_path)?);
         std::io::copy(&mut br, &mut bw)?;

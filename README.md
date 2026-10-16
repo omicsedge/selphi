@@ -125,7 +125,7 @@ selphi \
   --phase-only
 ```
 
-Phase-only needs a single-chromosome `.srp` (a multi-chromosome SRP or `--refpanel-dir` is refused). Already-phased input skips phasing, so with `--phase-only` it writes nothing unless you add `--force-phasing`.
+Phase-only needs a single-chromosome `.srp` (a multi-chromosome SRP or `--refpanel-dir` is refused). Already-phased input skips phasing, so with `--phase-only` it writes nothing unless you add `--force-phasing`. Whether the input is phased is decided on the records that match the panel: records absent from the panel are written back as given and never phased, so an unphased heterozygote there (as a phase-only output carries) does not trigger re-phasing. The order in which an unphased call lists its alleles (`1/0` or `0/1`) carries no information and does not affect the result.
 
 ### Allele reconciliation (`--allele-match`)
 
@@ -144,7 +144,7 @@ selphi ... --allele-match full        # none | swap (default) | strand | full
 
 ### Missing genotypes
 
-No-call genotypes in the target (`./.`, common on genotyping arrays at ~1–2% of sites per sample, and at every site of a batch that another sample's array typed) carry no information, and Selphi treats them as absent. A site that no sample called is imputed as an untyped panel site, so a single user's no-call gives exactly the result of leaving the record out. Where only some samples are missing, the phasing fills the no-call from its neighbours, the imputation flattens the emission there, and the imputation's PBWT lets the target follow the allele of its longest current matches instead of the filled-in one, so the no-call ends none of them. The output at such a typed site is the imputed dosage for the samples that are missing it, and their exact call for the others.
+No-call genotypes in the target (`./.`, common on genotyping arrays at ~1–2% of sites per sample, and at every site of a batch that another sample's array typed) carry no information, and Selphi treats them as absent. A site that no sample called is imputed as an untyped panel site, so a single user's no-call gives exactly the result of leaving the record out. Where only some samples are missing, the phasing fills the no-call from its neighbours, while the imputation of each sample that misses the site runs its candidate selection, PBWT and Li-Stephens HMM over the sites that sample called and places its copying weights at the no-call by cM-linear interpolation between its called sites on either side — the dosages it would get if the record were left out for it, so imputing users together gives each of them what imputing them one at a time gives. The output at such a typed site is the imputed dosage for the samples that are missing it, and their exact call for the others.
 
 ### Sex chromosomes
 
@@ -279,6 +279,8 @@ selphi --prepare-reference-from /path/to/bcfs/ --out all_chromosomes --threads 1
 selphi --merge-srps-dir /path/to/srps/ --out all_chromosomes                        # merge per-chr SRPs
 ```
 
+Variants with an allele of 255 bytes or more (structural-variant alleles) are kept: the variant index stores their lengths escaped, and such a panel carries a distinct format signature, so Selphi builds that predate long-allele support refuse it rather than misread it; a panel without long alleles is written exactly as before.
+
 #### Decode a panel back to VCF / BCF
 
 A `.bref3` or `.srp` panel can be decoded straight to phased VCF.gz or BCF — a fast,
@@ -401,6 +403,8 @@ so their carriers would otherwise be scored as hom-ref.
 | R² | per-sample | Pearson correlation squared across all variants for one sample |
 | Concordance | per-sample | Fraction of variants with correct hardcall for one sample |
 
+Dosages are compared in diploid-equivalent units: a haploid call (e.g. a male's non-PAR chrX truth `1`) counts as two copies, so a haploid truth and a diploid-coded imputation of the same man are on one scale. `DS` is read in the sample's own ploidy by default; `--eval-imputed-ds-scale diploid` / `--eval-truth-ds-scale diploid` declare a file whose `DS` is already on the 0–2 scale, and `--eval-imputed-ploidy` / `--eval-truth-ploidy` give the ploidy when a file carries `DS` without `GT`.
+
 Per-sample concordance is reported on the matched-sites path; the hom-ref path reports per-sample R² and per-bin site R² and concordance. MAF bins follow the standard set (0.05-0.1% through 20-50%). The matched-sites path also reconciles indel normalization and REF/ALT swaps; the hom-ref path needs the same representation in both files. For phasing switch-error rate, use `bcftools +trio-switch-rate` with a trio pedigree.
 
 ## Indexing
@@ -456,6 +460,9 @@ selphi --self-test --refpanel panel.srp --input target.vcf.gz --map chr.map --ou
 | `--truth-raw PATH` | Unfiltered truth; a site carried in raw but not in `--truth` is dropped for that sample (not scored as hom-ref) | |
 | `--exclude-sites PATH` | VCF/BCF of sites to exclude from scoring (e.g. the typed/array sites) | |
 | `--exclude-panel-monomorphic SRP` | Also exclude every site monomorphic in this panel (pass the panel the imputation used) | |
+| `--eval-imputed-ds-scale native\|diploid` | Units of the imputed file's `DS`: allele copies in the sample's ploidy, or already 0–2 | `native` |
+| `--eval-truth-ds-scale native\|diploid` | The same for `--truth` / `--truth-raw` | `native` |
+| `--eval-imputed-ploidy N` / `--eval-truth-ploidy N` | Ploidy for calls whose `GT` does not give it (DS-only files) | |
 | `--by-type` | Also break the report into SNP vs indel (combined total always reported) | off |
 | **Indexing** | | |
 | `--index PATH` | Build TBI/CSI index for a VCF.gz or BCF file | |
@@ -478,7 +485,7 @@ selphi --self-test --refpanel panel.srp --input target.vcf.gz --map chr.map --ou
 | **Advanced** | | |
 | `--seed N` | Random seed for chip/WGS phasing and `--phase-panel` (the lcWGS engine uses `LCWGS_SEED`) | 33 |
 | `--est-ne N` | Effective population size (0 = auto) | 0 |
-| `--p-err F` | Emission error probability | 0.025 |
+| `--p-err F` | Fixed emission error floor. Without it the floor starts at 0.025 and is raised per haplotype on arrays with genotyping errors (`SELPHI_PERR_FIXED=1` keeps 0.025) | adaptive |
 | `--match-length N` | Minimum PBWT match length | auto |
 | `--max-candidates N` | Max PBWT candidates per haplotype (0 = auto: the whole panel up to 16,000 haplotypes, above that scaled by panel diversity, at least 2,500) | 0 |
 | `--max-cond-haps N` | Max conditioning haplotypes per diploid phasing window (0 = unlimited, IBS-selected; try 120-200 for faster phasing) | 0 |
@@ -491,8 +498,8 @@ selphi --self-test --refpanel panel.srp --input target.vcf.gz --map chr.map --ou
 A short overview; the Selphi 2 manuscript (in preparation) has the full method, parameters, and benchmarks.
 
 - **Bitmatrix-native.** The reference panel is stored as 1 bit per allele and shared in memory between phasing and imputation (no VCF round-trip), so memory stays low and the pipeline is fully native (no external bioinformatics tools at runtime).
-- **Phasing.** Two engines. By default the **diploid** genotype-graph + MCMC engine (two-stage common-then-rare phasing) is used for **all** inputs, chip and WGS alike; the **haploid** composite-HMM with greedy swap remains available for chip arrays via `--phasing-engine haploid`. The diploid engine's common stage runs on the sites with minor-allele frequency ≥ 0.1% in the run's own samples or in the reference panel, so a sample phased on its own keeps its homozygous calls (`SELPHI_DIPLOID_SCAFFOLD_SOURCE=cohort` uses the run's samples only).
-- **Imputation.** Per target haplotype and window, a coded-step PBWT selects reference candidates and a Li-Stephens HMM (f32 state vectors, f64 recombination probabilities and row sums, streamed backward) produces per-site weights, interpolated to full panel density via cache-friendly tiles fused to output encoding. Untyped sites are placed between their flanking typed anchors in cumulative genetic distance (cM), as Beagle, IMPUTE5 and minimac do (`SELPHI_INTERP_RANK=1` restores variant-rank placement). The effective population size is calibrated to panel size. On panels of 100,000 or more haplotypes the PBWT scan keeps the 200 longest matches per side at each site (`SELPHI_PBWT_WALK_CAP`; `0` turns it off), which halves the wall time on TOPMed with no MAF bin lower; below that size the scan is unchanged.
+- **Phasing.** Two engines. By default the **diploid** genotype-graph + MCMC engine (two-stage common-then-rare phasing) is used for **all** inputs, chip and WGS alike; the **haploid** composite-HMM with greedy swap remains available for chip arrays via `--phasing-engine haploid`. The diploid engine's common stage runs on the sites with minor-allele frequency ≥ 0.1% in the run's own samples or in the reference panel, so a sample phased on its own keeps its homozygous calls (`SELPHI_DIPLOID_SCAFFOLD_SOURCE=cohort` uses the run's samples only). Its conditioning set is built from PBWT neighbours; on reference panels of 20,000 or more haplotypes it takes 16 neighbours per selection point for up to 50 target samples and 8 for larger cohorts (smaller panels keep the cohort-size rule), because the nearest few neighbours in a large panel are mostly copies of one another.
+- **Imputation.** Per target haplotype and window, a coded-step PBWT selects reference candidates and a Li-Stephens HMM (f32 state vectors, f64 recombination probabilities and row sums, streamed backward) produces per-site weights, interpolated to full panel density via cache-friendly tiles fused to output encoding. Untyped sites are placed between their flanking typed anchors in cumulative genetic distance (cM), as Beagle, IMPUTE5 and minimac do (`SELPHI_INTERP_RANK=1` restores variant-rank placement). The effective population size is calibrated to panel size. The emission error floor adapts to the array: in each target haplotype's first window the HMM measures how much posterior weight it has to put on panel haplotypes outside the site's PBWT match set, which a genotyping array's miscalls raise, and above a threshold it runs again with a higher floor (up to 0.07, from the default 0.025) that the haplotype keeps for the chromosome; error-free inputs keep the default. Only fully trusted calls count in that measure (not no-calls or calls entered with reduced confidence); `--p-err` sets a fixed floor instead, as does `SELPHI_PERR_FIXED=1`. On six consumer arrays this raised per-sample R² on 18 of 18 person-chromosomes (median +0.0005). On panels of 100,000 or more haplotypes the PBWT scan keeps the 200 longest matches per side at each site (`SELPHI_PBWT_WALK_CAP`; `0` turns it off), which halves the wall time on TOPMed with no MAF bin lower; below that size the scan is unchanged.
 - **Low-coverage WGS.** The `--lcwgs` engine works directly on genotype likelihoods (GL-weighted Li-Stephens forward-backward with sparse-PBWT selection, and an eight-founder phasing HMM that re-commits phase at every Gibbs iteration), processing the chromosome in cM chunks so the panel is never fully resident.
 - **SRP panel format.** A single binary file holds one or many chromosomes as 2D zstd-compressed sparse tiles (1024 variants × 4096 haplotypes) for L2-cache-friendly streaming. Creation from BCF or BREF3 is fully streaming (under 500 MB for any panel size) and the BCF reader uses parallel CSI-indexed regional reads; a VCF.gz source is loaded into memory first.
 - **Determinism.** Fixed-seed parallelism yields bit-identical results across runs; the same output is produced on AVX-512, AVX2, NEON, and scalar paths (up to f32 reduction-order differences).

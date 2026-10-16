@@ -25,6 +25,17 @@ with `setsid nohup bash script.sh > out 2>&1 &`, and read the `RESULT` lines.
 7. **After a re-measurement, grep the whole manuscript and supplement for the old value.**
 8. **The paper states method and result only**: no session dates, earlier builds or drafts.
 
+## Final numbers: `v8/` (release binary)
+
+Every genotype-engine number in the manuscript (array phasing and imputation, trio phasing, the array-equivalent
+route of Table 1) comes from `v8/run_accuracy.sh` (accuracy; the box may be busy) and `v8/run_timing.sh` (Selphi 2
+and its comparator timed in one session on an idle box), run on the release binary. They follow the recipes of the
+scripts below, item by item; competitor outputs that still exist are re-scored by the same evaluator, and a
+deleted competitor output is reused only where the truth is complete (every site scored in at least two samples,
+so the evaluator's per-site rule cannot move it). `v8/table1_numbers.py` computes Table 1 / S4a with the paired
+bootstrap and Wilcoxon test the paper reports. The likelihood (lcWGS) engine's outputs are byte-identical to the
+earlier runs (capture dose md5 `4bbac947b3d1` for one sample, `6793d942f143` for six), so its tables stand.
+
 ## Which script feeds which paper item (final versions)
 
 | Paper item | Script | Notes |

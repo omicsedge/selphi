@@ -101,8 +101,8 @@ pub struct Member {
     pub candidates: Option<Vec<Vec<u32>>>,
     /// Per-site Ne for this member (None → use the calibrated default).
     pub final_ne_per_site: Option<Vec<f64>>,
-    /// Cross-window HMM forward-state passthrough, private to this member.
-    pub hap_priors: Vec<Option<Vec<(i64, f64)>>>,
+    /// Cross-window HMM state (forward prior, emission floor), private to this member.
+    pub carry: Vec<super::window_process::HapCarry>,
 }
 
 impl Member {
@@ -113,7 +113,7 @@ impl Member {
         final_ne_per_site: Option<Vec<f64>>,
         n_haps: usize,
     ) -> Self {
-        Self { targ_bm, candidates, final_ne_per_site, hap_priors: vec![None; n_haps] }
+        Self { targ_bm, candidates, final_ne_per_site, carry: vec![Default::default(); n_haps] }
     }
 }
 
@@ -284,7 +284,7 @@ pub fn fold_window(
             }
             Ok(())
         };
-        let _ = impute_window(&inputs_m, &params_m, cand, &mut sc.hap_priors, Some(&mut accumulate));
+        let _ = impute_window(&inputs_m, &params_m, cand, &mut sc.carry, Some(&mut accumulate));
         count += 1;
     }
     let inv = 1.0f32 / count as f32;

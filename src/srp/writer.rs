@@ -361,7 +361,6 @@ pub fn build_srp_from_panel(
 // SRP Unified Format (v2): single file with chunks + tiles
 // ============================================================================
 
-use super::SRP_SINGLE_CHR_MAGIC;
 
 /// Build unified SRP file from BCF source.
 /// Produces a SINGLE .srp file containing metadata, variants, chunks, and tiles.
@@ -635,9 +634,10 @@ impl StreamingTileWriter {
         let out = std::fs::File::create(output_path)?;
         let mut w = std::io::BufWriter::with_capacity(4 << 20, out);
 
-        w.write_all(SRP_SINGLE_CHR_MAGIC)?;
+        let long = super::helpers::vbin_has_long(&metadata.vbin, metadata.n_variants);
+        w.write_all(super::single_chr_magic(long))?;
         write_section(&mut w, meta_json.to_string().as_bytes())?;
-        write_vbin_section(&mut w, &metadata.vbin, metadata.n_variants)?;
+        write_vbin_section(&mut w, &metadata.vbin, long)?;
         write_section(&mut w, metadata.sample_names.join("\n").as_bytes())?;
         write_section(&mut w, &metadata.ids)?;
         write_section(&mut w, &metadata.orig_ids)?;
@@ -762,9 +762,10 @@ pub(crate) fn write_section<W: Write>(w: &mut W, data: &[u8]) -> std::io::Result
 }
 
 /// Write a variant index section, behind [`super::helpers::LONG_ALLELE_MARKER`]
-/// when it holds a field of 255 B or longer (see `helpers::push_variant_vbin`).
-pub(crate) fn write_vbin_section<W: std::io::Write>(w: &mut W, vbin: &[u8], n: usize) -> std::io::Result<()> {
-    if super::helpers::vbin_has_long(vbin, n) {
+/// when `long` (the index holds a field of 255 B or longer: `helpers::vbin_has_long`,
+/// computed once by the caller, which also picks the file magic from it).
+pub(crate) fn write_vbin_section<W: std::io::Write>(w: &mut W, vbin: &[u8], long: bool) -> std::io::Result<()> {
+    if long {
         let mut marked = Vec::with_capacity(vbin.len() + 8);
         marked.extend_from_slice(&super::helpers::LONG_ALLELE_MARKER);
         marked.extend_from_slice(vbin);
@@ -852,6 +853,95 @@ mod tests {
         }
         assert_eq!(reader.variants[0].pos, 1000);
         assert_eq!(reader.variants[n_var - 1].pos, 1000 + (n_var as i64 - 1) * 10);
+    }
+
+    /// Build a tiny single-chr panel on `chrom` whose REF alleles have the given
+    /// lengths (ALT "C"); haplotype h carries ALT at variant v when (v + h) is odd.
+    fn tiny_panel(dir: &std::path::Path, name: &str, chrom: &str, ref_lens: &[usize]) -> std::path::PathBuf {
+        let n_haps = 4usize;
+        let n_var = ref_lens.len();
+        let phased: Vec<u8> = (0..n_var * n_haps).map(|i| ((i / n_haps + i % n_haps) % 2) as u8).collect();
+        let chroms = vec![chrom.to_string(); n_var];
+        let refs: Vec<String> = ref_lens.iter().map(|&l| "A".repeat(l)).collect();
+        let alts = vec!["C".to_string(); n_var];
+        let pvs: Vec<PanelVariant> = (0..n_var).map(|v| PanelVariant {
+            chrom: &chroms[v], pos: 1000 + 1000 * v as i64, ref_allele: &refs[v], alt_allele: &alts[v], id: ".",
+        }).collect();
+        let samples: Vec<String> = (0..n_haps / 2).map(|s| format!("S{s}")).collect();
+        let path = dir.join(name);
+        build_srp_from_panel(&phased, &pvs, &samples, n_haps, &path).unwrap();
+        path
+    }
+
+    fn magic_of(path: &std::path::Path) -> [u8; 8] {
+        let mut m = [0u8; 8];
+        std::io::Read::read_exact(&mut std::fs::File::open(path).unwrap(), &mut m).unwrap();
+        m
+    }
+
+    /// A panel whose index holds a field of 255 B or longer gets the sibling magic (so
+    /// every reader that predates the escaped index refuses it); one without keeps the
+    /// original magic. Both are single-chr (sniffer 2) and round-trip exactly.
+    #[test]
+    fn long_allele_panels_carry_the_sibling_magic() {
+        use crate::srp::multi_chr_reader::detect_srp_version;
+        let dir = tempfile::tempdir().unwrap();
+        let short = tiny_panel(dir.path(), "short.srp", "21", &[1, 254, 3]);
+        let long = tiny_panel(dir.path(), "long.srp", "22", &[1, 255, 256, 300, 2]);
+        assert_eq!(&magic_of(&short), crate::srp::SRP_SINGLE_CHR_MAGIC);
+        assert_eq!(&magic_of(&long), crate::srp::SRP_SINGLE_CHR_MAGIC_LONG);
+        assert_eq!(detect_srp_version(&short).unwrap(), 2);
+        assert_eq!(detect_srp_version(&long).unwrap(), 2);
+        let mut r = SrpReader::open(&long, 0).unwrap();
+        r.load_tiled();
+        let lens: Vec<usize> = r.variants.iter().map(|v| v.ref_allele.len()).collect();
+        assert_eq!(lens, vec![1, 255, 256, 300, 2]);
+        let bm = r.extract_ref_alleles_bitmatrix(&(0..5).collect::<Vec<_>>());
+        for v in 0..5 { for h in 0..4 { assert_eq!(bm.get(v, h), (v + h) % 2 == 1); } }
+
+        // Transitional panels (original magic over a marked index) still read the same.
+        let trans = dir.path().join("transitional.srp");
+        let mut bytes = std::fs::read(&long).unwrap();
+        bytes[..8].copy_from_slice(crate::srp::SRP_SINGLE_CHR_MAGIC);
+        std::fs::write(&trans, &bytes).unwrap();
+        let t = SrpReader::open(&trans, 0).unwrap();
+        assert_eq!(t.variants.iter().map(|v| v.ref_allele.len()).collect::<Vec<_>>(), lens);
+
+        // Unknown feature bytes and the incomplete-build placeholder are refused.
+        for bad in [b"SRP\x00\x02\x02\x00\x00", b"SRP\x00\x00\x00\x00\x00"] {
+            let p = dir.path().join("bad.srp");
+            let mut b = bytes.clone();
+            b[..8].copy_from_slice(bad);
+            std::fs::write(&p, &b).unwrap();
+            assert!(SrpReader::open(&p, 0).is_err());
+            assert!(detect_srp_version(&p).is_err());
+        }
+    }
+
+    /// Multi-chr merges OR the capability across chromosomes: one long chromosome
+    /// flags the whole file (sniffer 3 either way); all-short keeps the original magic.
+    #[test]
+    fn multi_chr_merge_flags_any_long_chromosome() {
+        use crate::srp::multi_chr_reader::{detect_srp_version, MultiChrSrpReader};
+        use crate::srp::multi_chr_writer::merge_single_chr_srps;
+        let dir = tempfile::tempdir().unwrap();
+        let a = tiny_panel(dir.path(), "a21.srp", "21", &[1, 2]);
+        let b = tiny_panel(dir.path(), "b22.srp", "22", &[3, 400, 1]);
+        let c = tiny_panel(dir.path(), "c22.srp", "22", &[3, 4, 1]);
+        let mixed = dir.path().join("mixed.srp");
+        merge_single_chr_srps(&[a.clone(), b], &mixed).unwrap();
+        assert_eq!(&magic_of(&mixed), crate::srp::SRP_MULTI_CHR_MAGIC_LONG);
+        assert_eq!(detect_srp_version(&mixed).unwrap(), 3);
+        let m = MultiChrSrpReader::open(&mixed).unwrap();
+        let v22 = m.load_chr_view("22").unwrap();
+        assert_eq!(v22.variants.iter().map(|v| v.ref_allele.len()).collect::<Vec<_>>(), vec![3, 400, 1]);
+        assert_eq!(m.load_chr_view("21").unwrap().variants.len(), 2);
+        assert!(SrpReader::open(&mixed, 0).is_err(), "a multi-chr file is not a single-chr panel");
+
+        let short = dir.path().join("short_multi.srp");
+        merge_single_chr_srps(&[a, c], &short).unwrap();
+        assert_eq!(&magic_of(&short), crate::srp::SRP_MULTI_CHR_MAGIC);
+        assert_eq!(detect_srp_version(&short).unwrap(), 3);
     }
 
     /// Original variant IDs (rsIDs) must survive a panel→SRP→read round-trip

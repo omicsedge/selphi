@@ -34,6 +34,8 @@ pub struct MultiChrImputeConfig {
     /// Target-hap batch size (HAPLOTYPE units = 2 × samples). 0 = off.
     pub target_batch_size: usize,
     pub p_err: f64,
+    /// `--p-err` given: a fixed emission floor (no adaptive floor).
+    pub p_err_fixed: bool,
     pub no_ap: bool,
     pub no_em_ne: bool,
     pub phasing_engine: String,  // "auto", "haploid", "diploid"
@@ -101,7 +103,8 @@ impl MultiChrImputeConfig {
             // sample_batch_size (user-facing): N SAMPLES per batch.
             // Internally stored as N × 2 hap units (diploid).
             target_batch_size: args.sample_batch_size.saturating_mul(2),
-            p_err: args.p_err,
+            p_err: args.p_err.unwrap_or(crate::cli::DEFAULT_P_ERR),
+            p_err_fixed: args.p_err.is_some(),
             no_ap: args.no_ap,
             no_em_ne: args.no_em_ne,
             phasing_engine: format!("{:?}", args.phasing_engine).to_lowercase(),
@@ -768,8 +771,18 @@ pub fn run_multi_chr(
         // scaffold (--ped) and haploid handling. The latter is NOT flag-gated —
         // chrX males are auto-detected — so before 2026-09-04 a whole-genome run
         // left every male chrX het standing.
-        let needs_phasing = !is_phased || config.force_phasing;
-        if !needs_phasing && chr_idx == 0 {
+        // Decided per chromosome on the records matching the panel, as the single-chr
+        // path does (TargetMarker::unphased_het): unmatched records are written as given.
+        let chr_key = chr_name.strip_prefix("chr").unwrap_or(chr_name);
+        let chr_phased = is_phased || target_by_chr.get(chr_key).or_else(|| target_by_chr.get(chr_name.as_str()))
+            .is_some_and(|(m, _)| !target_idx.iter().any(|&ti| m[ti].unphased_het));
+        let needs_phasing = !chr_phased || config.force_phasing;
+        // The alleles were extracted with the phasing-path missing sentinel (128) when
+        // the FILE needed phasing; a chromosome that does not takes the impute-only 0.
+        if !needs_phasing && mc_miss_val == 128 {
+            for a in targ_alleles.iter_mut() { if *a == 128 { *a = 0; } }
+        }
+        if !needs_phasing && (chr_idx == 0 || !is_phased) {
             // Same warning as the single-chr path: a pipe-separated target skips the
             // phasing engine, and nothing else says so.
             selphi_step!("Input is already phased — phasing SKIPPED (pass --force-phasing to re-phase)");
@@ -964,7 +977,7 @@ pub fn run_multi_chr(
         drop(targ_alleles);
 
         // Per-window imputation loop
-        let mut hap_priors: Vec<Option<Vec<(i64, f64)>>> = vec![None; n_haps];
+        let mut carry: Vec<selphi::imputation::window_process::HapCarry> = vec![Default::default(); n_haps];
 
         for (wi, window) in windows.iter().enumerate() {
 
@@ -975,7 +988,7 @@ pub fn run_multi_chr(
             selphi::common::mem::release_freed_memory();
             let hmm_params = selphi::imputation::window_process::WindowHmmParams {
                 n_ref, n_haps, match_length, fl_fwd, fl_bwd,
-                est_ne: est_ne as f64, p_err: config.p_err,
+                est_ne: est_ne as f64, p_err: config.p_err, adapt_floor: !config.p_err_fixed,
                 max_candidates: effective_mc,
                 compute_posterior: wi + 1 < windows.len(),
                 target_batch_size: config.target_batch_size,
@@ -1020,7 +1033,7 @@ pub fn run_multi_chr(
             let hmm_output = {
                 selphi::imputation::window_process::impute_window(
                     &inputs, &hmm_params, precomputed_candidates.as_ref(),
-                    &mut hap_priors,
+                    &mut carry,
                     None, // multi-chr orchestrate.rs doesn't support batched streaming yet
                 )
             };

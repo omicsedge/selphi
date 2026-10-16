@@ -1239,6 +1239,93 @@ pub fn select_candidates(
     select_candidates_weighted(coded, target_hap, n_ref, max_candidates, None, 0)
 }
 
+/// `select_candidates` for a target with NO-CALLS at `miss` (bitset over the window's
+/// sites). A no-call carries no allele, so in a step that holds one the target's code
+/// is unknown and the coded groups cannot be used: its partners there are the panel
+/// haplotypes that agree with it at that step's CALLED sites, read from the bitmatrix
+/// 64 haplotypes at a time (a step with no called site contributes nothing). Steps
+/// without a no-call use the groups exactly as `select_candidates`. This is what a
+/// single-sample run gets for free, where a site no sample calls is dropped before
+/// the steps are coded; in a cohort the site stays (other samples call it) and the
+/// allele the phasing filled in would otherwise decide the target's partners.
+#[allow(clippy::too_many_arguments)]
+pub fn select_candidates_nocall(
+    coded: &CodedSteps,
+    target_hap: usize,
+    n_ref: usize,
+    max_candidates: usize,
+    miss: &[u64],
+    bm: &crate::common::HaplotypeBitmatrix,
+    chip_start: usize,
+    targ: &[u8],     // (n_var, n_haps) row-major window alleles
+    n_haps: usize,
+    tgt: usize,      // target column in `targ`
+) -> Vec<u32> {
+    let n_steps = coded.step_groups.len();
+    if n_steps == 0 { return Vec::new(); }
+    let n_words = n_ref.div_ceil(64);
+    let tail = if n_ref % 64 == 0 { !0u64 } else { (1u64 << (n_ref % 64)) - 1 };
+    let mut mask = vec![0u64; n_words];
+    // Per step: the partner list (borrowed group, or computed from the called sites).
+    let mut computed: Vec<Option<Vec<u32>>> = vec![None; n_steps];
+    let mut empty = vec![false; n_steps];
+    for s in 0..n_steps {
+        let (a, b) = (coded.starts[s], coded.starts[s + 1]);
+        if !(a..b).any(|v| (miss[v / 64] >> (v % 64)) & 1 == 1) { continue; }
+        mask.fill(!0u64);
+        if let Some(l) = mask.last_mut() { *l = tail; }
+        let mut any_called = false;
+        for v in a..b {
+            if (miss[v / 64] >> (v % 64)) & 1 == 1 { continue; }
+            any_called = true;
+            let row = bm.row(chip_start + v);
+            if targ[v * n_haps + tgt] == 1 {
+                for w in 0..n_words { mask[w] &= row[w]; }
+            } else {
+                for w in 0..n_words { mask[w] &= !row[w]; }
+            }
+            if let Some(l) = mask.last_mut() { *l &= tail; }
+        }
+        if !any_called { empty[s] = true; continue; }
+        let mut list = Vec::new();
+        for (w, &word) in mask.iter().enumerate() {
+            let mut x = word;
+            while x != 0 { list.push((w * 64 + x.trailing_zeros() as usize) as u32); x &= x - 1; }
+        }
+        computed[s] = Some(list);
+    }
+    let members = |s: usize| -> &[u32] {
+        if empty[s] { return &[]; }
+        match &computed[s] {
+            Some(l) => l,
+            None => &coded.step_groups[s][coded.hap_group[s][target_hap] as usize],
+        }
+    };
+    thread_local! {
+        static TL_SEEN2: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let mut seen = TL_SEEN2.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    if seen.len() < n_ref { seen.resize(n_ref, false); }
+    let mut candidates = Vec::new();
+    for s in 0..n_steps {
+        for &h in members(s) {
+            if (h as usize) < n_ref && !seen[h as usize] { seen[h as usize] = true; candidates.push(h); }
+        }
+    }
+    for &h in &candidates { seen[h as usize] = false; }
+    TL_SEEN2.with(|c| { *c.borrow_mut() = seen; });
+    if candidates.len() > max_candidates {
+        let mut scores = vec![0u32; n_ref];
+        for s in 0..n_steps {
+            for &h in members(s) { if (h as usize) < n_ref { scores[h as usize] += 1; } }
+        }
+        candidates.sort_unstable_by(|&a, &b| scores[b as usize].cmp(&scores[a as usize]));
+        candidates.truncate(max_candidates);
+    }
+    candidates.sort_unstable();
+    candidates
+}
+
 /// Variant with ancestry-aware rescoring.
 ///
 /// When `ancestry` is `Some`, every raw PBWT match hit is counted as

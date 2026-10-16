@@ -10,7 +10,7 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::{selphi_info, selphi_step};
-use super::{SRP_MULTI_CHR_MAGIC, TILE_ROWS, TILE_COLS, ChrDirectoryEntry};
+use super::{TILE_ROWS, TILE_COLS, ChrDirectoryEntry};
 
 /// Build a multi-chromosome SRP file from a multi-contig BCF/VCF source.
 pub fn build_multi_chr_srp(
@@ -73,8 +73,10 @@ pub fn build_multi_chr_srp(
         "chromosomes": contig_order.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
         "contig_fields": header.contig_field,
     });
-    // Write multi-chr magic
-    w.write_all(SRP_MULTI_CHR_MAGIC)?;
+    // Placeholder magic; the final one (with or without escaped index fields) is
+    // written by write_chr_directory once every chromosome is in.
+    w.write_all(INCOMPLETE_MAGIC)?;
+    let mut any_long = false;
 
     // Write global metadata (exact size)
     super::writer::write_section(&mut w, global_meta_json.to_string().as_bytes())?;
@@ -204,7 +206,9 @@ pub fn build_multi_chr_srp(
         super::writer::write_section(&mut w, meta_json.to_string().as_bytes())?;
 
         // Variants binary
-        super::writer::write_vbin_section(&mut w, &vbin, n_variants)?;
+        let long = super::helpers::vbin_has_long(&vbin, n_variants);
+        any_long |= long;
+        super::writer::write_vbin_section(&mut w, &vbin, long)?;
 
         // IDs
         super::writer::write_section(&mut w, &ids)?;
@@ -278,8 +282,8 @@ pub fn build_multi_chr_srp(
         let _ = std::fs::remove_dir_all(&chr_tmp);
     }
 
-    // Seek back to fill chromosome directory
-    write_chr_directory(&mut w, chr_dir_pos, &chr_entries)?;
+    // Seek back to fill chromosome directory and the final magic
+    write_chr_directory(&mut w, chr_dir_pos, &chr_entries, super::multi_chr_magic(any_long))?;
 
     let file_size = std::fs::metadata(&srp_path)?.len();
     selphi_step!("Multi-chr SRP: {} chromosomes, {:.1} MB → {}",
@@ -340,10 +344,20 @@ fn fill_tile_index<W: Write + Seek>(
 /// write one 32-byte entry per chr (name_len u32 + 12-byte zero-padded name +
 /// data_offset u64 + n_variants u32 + n_tiles u32), then restore the write
 /// cursor to the end. Shared by `build_multi_chr_srp` and `merge_srps_from_dir`.
+/// Placeholder magic a multi-chr writer puts first and replaces only once the file is
+/// complete (in [`write_chr_directory`]), so an interrupted build is refused by every
+/// reader instead of passing for a panel with an empty directory.
+const INCOMPLETE_MAGIC: &[u8; 8] = b"SRP\x00\x00\x00\x00\x00";
+
+/// Fill the chromosome directory, then write the final magic (`magic`), both by
+/// seeking back: the magic goes last, after the directory is flushed, so a failure
+/// part-way leaves the placeholder and the file is refused. The writer is left at the
+/// end of the file.
 fn write_chr_directory<W: Write + Seek>(
     w: &mut W,
     chr_dir_pos: u64,
     chr_entries: &[ChrDirectoryEntry],
+    magic: &[u8; 8],
 ) -> io::Result<()> {
     w.flush()?;
     let end_pos = w.stream_position()?;
@@ -359,8 +373,11 @@ fn write_chr_directory<W: Write + Seek>(
         w.write_all(&entry.n_variants.to_le_bytes())?;
         w.write_all(&entry.n_tiles.to_le_bytes())?;
     }
-    w.seek(SeekFrom::Start(end_pos))?;
     w.flush()?;
+    w.seek(SeekFrom::Start(0))?;
+    w.write_all(magic)?;
+    w.flush()?;
+    w.seek(SeekFrom::Start(end_pos))?;
     Ok(())
 }
 
@@ -371,7 +388,7 @@ pub fn merge_samples_single_chr(
     srp_paths: &[std::path::PathBuf],
     output_path: &Path,
 ) -> io::Result<()> {
-    use super::{SrpReader, Variant, SRP_SINGLE_CHR_MAGIC};
+    use super::{SrpReader, Variant};
     use std::collections::{BTreeMap, HashSet};
 
     if srp_paths.is_empty() {
@@ -475,8 +492,21 @@ pub fn merge_samples_single_chr(
     let out = std::fs::File::create(&srp_path)?;
     let mut w = std::io::BufWriter::with_capacity(4 << 20, out);
 
-    // Magic
-    w.write_all(SRP_SINGLE_CHR_MAGIC)?;
+    // Variants binary
+    let mut vbin = Vec::with_capacity(n_variants * 20);
+    let mut ids_buf = Vec::new();
+    let mut orig_buf = Vec::new();
+    for (i, v) in merged_variants.iter().enumerate() {
+        // Tile-only merge has no original IDs, so the synthetic chrom-pos-ref-alt
+        // ID is written to BOTH the synthetic and original ID streams.
+        let id = format!("{}-{}-{}-{}", v.chr, v.pos, v.ref_allele, v.alt_allele);
+        super::writer::push_variant_index(&mut vbin, &mut ids_buf, &mut orig_buf, i == 0,
+            &v.chr, v.pos, &v.ref_allele, &v.alt_allele, &id)?;
+    }
+    let long = super::helpers::vbin_has_long(&vbin, n_variants);
+
+    // Magic (from the index about to be written)
+    w.write_all(super::single_chr_magic(long))?;
 
     // Metadata JSON
     let contig_field = format!("##contig=<ID={}>", chr);
@@ -499,18 +529,7 @@ pub fn merge_samples_single_chr(
     });
     super::writer::write_section(&mut w, meta_json.to_string().as_bytes())?;
 
-    // Variants binary
-    let mut vbin = Vec::with_capacity(n_variants * 20);
-    let mut ids_buf = Vec::new();
-    let mut orig_buf = Vec::new();
-    for (i, v) in merged_variants.iter().enumerate() {
-        // Tile-only merge has no original IDs, so the synthetic chrom-pos-ref-alt
-        // ID is written to BOTH the synthetic and original ID streams.
-        let id = format!("{}-{}-{}-{}", v.chr, v.pos, v.ref_allele, v.alt_allele);
-        super::writer::push_variant_index(&mut vbin, &mut ids_buf, &mut orig_buf, i == 0,
-            &v.chr, v.pos, &v.ref_allele, &v.alt_allele, &id)?;
-    }
-    super::writer::write_vbin_section(&mut w, &vbin, n_variants)?;
+    super::writer::write_vbin_section(&mut w, &vbin, long)?;
 
     // Sample IDs
     super::writer::write_section(&mut w, all_sample_ids.join("\n").as_bytes())?;
@@ -837,8 +856,9 @@ pub fn merge_single_chr_srps(
         "chromosomes": chromosomes,
         "contig_fields": all_contig_fields,
     });
-    // Write multi-chr magic
-    w.write_all(SRP_MULTI_CHR_MAGIC)?;
+    // Placeholder magic; write_chr_directory writes the final one at the end.
+    w.write_all(INCOMPLETE_MAGIC)?;
+    let mut any_long = false;
 
     // Global metadata (exact size)
     super::writer::write_section(&mut w, global_meta_json.to_string().as_bytes())?;
@@ -897,7 +917,9 @@ pub fn merge_single_chr_srps(
                 orig_buf.extend_from_slice(reader.original_ids[i].as_bytes());
             }
         }
-        super::writer::write_vbin_section(&mut w, &vbin, n_variants)?;
+        let long = super::helpers::vbin_has_long(&vbin, n_variants);
+        any_long |= long;
+        super::writer::write_vbin_section(&mut w, &vbin, long)?;
 
         super::writer::write_section(&mut w, &ids_buf)?;
 
@@ -952,7 +974,7 @@ pub fn merge_single_chr_srps(
     }
 
     // Fill chromosome directory (seek back)
-    write_chr_directory(&mut w, chr_dir_pos, &chr_entries)?;
+    write_chr_directory(&mut w, chr_dir_pos, &chr_entries, super::multi_chr_magic(any_long))?;
 
     let file_size = std::fs::metadata(&srp_path)?.len();
     selphi_step!("Multi-chr SRP: {} chromosomes, {:.1} MB → {}",
