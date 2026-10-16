@@ -591,7 +591,7 @@ fn maybe_precompute_candidates(
             t0.elapsed().as_secs_f64(),
         );
         if args.export_local_ancestry {
-            let tsv_path = PathBuf::from(output_path).with_extension("local_ancestry.tsv");
+            let tsv_path = selphi::common::utils::out_path(Path::new(output_path), "local_ancestry.tsv");
             match la.write_tsv(&tsv_path) {
                 Ok(()) => selphi_info!("  Local ancestry TSV: {}", tsv_path.display()),
                 Err(e) => selphi_error!("Failed to write local ancestry TSV: {}", e),
@@ -693,21 +693,21 @@ fn finalize_batched_outputs(
         let taken = std::mem::take(pgen_batch_writers);
         let batch_paths = selphi::io::pgen_batch::finalize_pgen_batch_writers(taken)
             .expect("Failed to finalize PGEN batch writers");
-        let pgen_out = out_path.with_extension("pgen");
+        let pgen_out = selphi::common::utils::out_path(out_path, "pgen");
         selphi_info!("  Merging {} batch PGENs → {} ...", batch_paths.len(), pgen_out.display());
         let t = Instant::now();
         selphi::io::pgen_merge::merge_batch_pgens(&batch_paths, out_path, sample_names)
             .expect("Batch PGEN merge failed");
         selphi_info!("  Merged in {:.1}s", t.elapsed().as_secs_f64());
         for (p, v) in &batch_paths { let _ = std::fs::remove_file(p); let _ = std::fs::remove_file(v); }
-        for (p, _) in &batch_paths { let _ = std::fs::remove_file(p.with_extension("psam")); }
+        for (p, _) in &batch_paths { let _ = std::fs::remove_file(selphi::common::utils::out_path(p, "psam")); }
     }
     // Parquet (variant-major)
     if !parquet_batch_writers.is_empty() {
         let taken = std::mem::take(parquet_batch_writers);
         let batch_paths = selphi::io::parquet_batch::finalize_parquet_batch_writers(taken)
             .expect("Failed to finalize Parquet batch writers");
-        let parquet_out = out_path.with_extension("parquet");
+        let parquet_out = selphi::common::utils::out_path(out_path, "parquet");
         selphi_info!("  Merging {} batch Parquets → {} ...", batch_paths.len(), parquet_out.display());
         let t = Instant::now();
         selphi::io::parquet_merge::merge_batch_parquets(&batch_paths, &parquet_out, sample_names)
@@ -804,10 +804,10 @@ fn build_passthrough(
 /// process when there are no shared variants (identical to the inline branch).
 fn load_and_intersect(args: &Args, target_path: &str, srp: &SrpReader) -> LoadedTarget {
     // 2. Read target VCF: sample names, variants, genotypes
-    let (sample_names, target_markers, target_genotypes, is_phased) =
+    let (sample_names, target_markers, target_genotypes, file_phased) =
         read_target_vcf(target_path, srp);
     selphi_step!("Target: {} samples, {} variants, phased={}",
-        sample_names.len(), target_markers.len(), is_phased);
+        sample_names.len(), target_markers.len(), file_phased);
 
     let n_samples = sample_names.len();
     let n_haps = n_samples * 2;
@@ -819,6 +819,13 @@ fn load_and_intersect(args: &Args, target_path: &str, srp: &SrpReader) -> Loaded
     selphi_debug!("  Intersect: {:.1}ms", t0_isect.elapsed().as_secs_f64() * 1000.0);
     selphi_step!("Shared markers: {} ({:.1}% of target)",
         wgs_idx.len(), wgs_idx.len() as f64 / target_markers.len() as f64 * 100.0);
+    // Phasing is decided on the records that match the panel: an unmatched record is
+    // written back as given and never phased (TargetMarker::unphased_het).
+    let is_phased = file_phased || !target_idx.iter().any(|&ti| target_markers[ti].unphased_het);
+    if is_phased && !file_phased {
+        selphi_step!("Every panel-matched record is phased: unphased heterozygotes only at {} unmatched record(s), written as given",
+            target_markers.iter().enumerate().filter(|(i, m)| m.unphased_het && !target_idx.contains(i)).count());
+    }
     let matched_idx = target_idx.clone();
     let uncalled_typed = if args.phase_only { Vec::new() } else {
         selphi::io::target_io::drop_uncalled_sites(
@@ -1151,10 +1158,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         let em_ne = em_ne_from_window_ri(&pr.window_ri, args.est_ne, n_chip, n_ref);
 
         if args.phase_only {
-            let out_path = PathBuf::from(output_path);
-            let out_path = if out_path.extension().is_none_or(|e| e != "gz") {
-                out_path.with_extension("vcf.gz")
-            } else { out_path };
+            let out_path = selphi::common::utils::out_path(Path::new(output_path), "vcf.gz");
             write_phased_vcf(
                 &pr.phased_alleles, &target_markers, &target_idx, &wgs_idx,
                 &sample_names, &srp, n_chip, n_haps, &allele_transforms, &out_path,
@@ -1365,7 +1369,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
 
     // 11. Process each window: PBWT → HMM, then overlap VCF write with next window's PBWT.
     // Cross-window HMM state passthrough: forward state from window N → prior for window N+1
-    let mut hap_priors: Vec<Option<Vec<(i64, f64)>>> = vec![None; n_haps];
+    let mut carry: Vec<selphi::imputation::window_process::HapCarry> = vec![Default::default(); n_haps];
     let n_cores = rayon::current_num_threads();
 
     // Run-level imputation-quality accumulator (mean DR2 over imputed sites).
@@ -1387,7 +1391,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
 
         let t0_extract = Instant::now();
         let max_candidates = effective_mc;
-        let p_err = args.p_err;
+        let p_err = args.p_err.unwrap_or(crate::cli::DEFAULT_P_ERR);
         let cpu_extract = selphi::log::cpu_time_secs();
         let extract_secs = t0_extract.elapsed().as_secs_f64();
         let cpu_coded = cpu_extract;
@@ -1474,7 +1478,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         let t0_hmm = Instant::now();
         let hmm_params = selphi::imputation::window_process::WindowHmmParams {
             n_ref, n_haps, match_length, fl_fwd, fl_bwd,
-            est_ne: est_ne as f64, p_err, max_candidates,
+            est_ne: est_ne as f64, p_err, adapt_floor: args.p_err.is_none(), max_candidates,
             compute_posterior: wi + 1 < windows.len(),
             target_batch_size: target_batch_size_haps,
         };
@@ -1572,13 +1576,13 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
             };
             selphi::imputation::window_process::impute_window(
                 &inputs, &hmm_params, precomputed_candidates.as_ref(),
-                &mut hap_priors,
+                &mut carry,
                 Some(&mut cb),
             )
         } else {
             selphi::imputation::window_process::impute_window(
                 &inputs, &hmm_params, precomputed_candidates.as_ref(),
-                &mut hap_priors,
+                &mut carry,
                 None,
             )
         };
@@ -1706,7 +1710,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     drop(sample_names);
     drop(ref_bm_imp);
     drop(precomputed_candidates);
-    drop(hap_priors);
+    drop(carry);
     drop(final_ne_per_site);
 
     // 12. Finalize all active output writers
@@ -1735,9 +1739,9 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     let final_path = out_file.clone();
     {
         let mut paths = vec![format!("{}", final_path.display())];
-        if formats.parquet { paths.push(format!("{}", out_path.with_extension("parquet").display())); }
-        if formats.pgen { paths.push(format!("{}", out_path.with_extension("pgen").display())); }
-        if formats.selfdecode { paths.push(format!("{}", out_path.with_extension("selfdecode.zip").display())); }
+        if formats.parquet { paths.push(format!("{}", selphi::common::utils::out_path(&out_path, "parquet").display())); }
+        if formats.pgen { paths.push(format!("{}", selphi::common::utils::out_path(&out_path, "pgen").display())); }
+        if formats.selfdecode { paths.push(format!("{}", selphi::common::utils::out_path(&out_path, "selfdecode.zip").display())); }
         let total_bytes: u64 = paths.iter()
             .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
             .sum();

@@ -78,8 +78,10 @@ pub fn parse_synthetic_id(id: &str) -> Option<(&str, &str, &str, &str)> {
 
 /// First 8 bytes of a variant index that holds escaped (>= 255 B) field lengths: an
 /// impossible position (`i64::MIN`), so an index in the original layout never starts
-/// with it and readers before this format still refuse such a panel instead of
-/// mis-reading it.
+/// with it and this reader can tell the two layouts apart. Readers built before this
+/// layout do NOT check for it — they take the marker as a position and mis-read the
+/// index without an error — so a panel with long alleles needs a reader that knows the
+/// marker (any build from the commit that introduced it on).
 pub const LONG_ALLELE_MARKER: [u8; 8] = i64::MIN.to_le_bytes();
 
 /// Append one variant's binary index entry to `vbin` (the SRP variant index),

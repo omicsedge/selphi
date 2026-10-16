@@ -7,6 +7,9 @@
 //!     variant index + sample IDs + 2D sparse tiles.
 //!   - Multi-chr (`SRP_MULTI_CHR_MAGIC`, `b"SRP\0\x03.."`, v3): global header +
 //!     per-chromosome directory + per-chr tile sections (auto-detected on read).
+//!   Byte 5 is 1 (`*_MAGIC_LONG`) when a variant index holds a field of 255 B or
+//!   longer (escaped, behind `helpers::LONG_ALLELE_MARKER`), so readers that predate
+//!   that encoding refuse the panel; it is 0 otherwise and the file is unchanged.
 //!
 //! Each tile is a CSC sub-matrix of `TILE_ROWS` (1024) variants × `TILE_COLS`
 //! (4096) haplotypes with u16 row indices, u32 indptr, and a compressed payload;
@@ -40,6 +43,36 @@ pub const SRP_SINGLE_CHR_MAGIC: &[u8; 8] = b"SRP\x00\x02\x00\x00\x00";
 
 /// Magic bytes for multi-chromosome SRP format.
 pub const SRP_MULTI_CHR_MAGIC: &[u8; 8] = b"SRP\x00\x03\x00\x00\x00";
+
+/// Sibling magics of a panel whose variant index (any chromosome's, for a multi-chr
+/// file) holds a field of 255 B or longer, i.e. is written behind
+/// `helpers::LONG_ALLELE_MARKER`. Every reader built before them compares the magic
+/// exactly, so it refuses such a panel instead of mis-reading the escaped index; a
+/// panel without long fields keeps the original magic and stays byte-identical.
+/// Readers accept the original magic with a marked index too (panels built between
+/// the marker and these magics).
+pub const SRP_SINGLE_CHR_MAGIC_LONG: &[u8; 8] = b"SRP\x00\x02\x01\x00\x00";
+pub const SRP_MULTI_CHR_MAGIC_LONG: &[u8; 8] = b"SRP\x00\x03\x01\x00\x00";
+
+/// The single-chr magic for a panel with (`long`) or without escaped index fields.
+pub fn single_chr_magic(long: bool) -> &'static [u8; 8] {
+    if long { SRP_SINGLE_CHR_MAGIC_LONG } else { SRP_SINGLE_CHR_MAGIC }
+}
+
+/// The multi-chr magic for a panel with (`long`) or without escaped index fields.
+pub fn multi_chr_magic(long: bool) -> &'static [u8; 8] {
+    if long { SRP_MULTI_CHR_MAGIC_LONG } else { SRP_MULTI_CHR_MAGIC }
+}
+
+/// One of the two single-chr magics (exactly; no other byte value is accepted).
+pub fn is_single_chr_magic(m: &[u8; 8]) -> bool {
+    m == SRP_SINGLE_CHR_MAGIC || m == SRP_SINGLE_CHR_MAGIC_LONG
+}
+
+/// One of the two multi-chr magics (exactly; no other byte value is accepted).
+pub fn is_multi_chr_magic(m: &[u8; 8]) -> bool {
+    m == SRP_MULTI_CHR_MAGIC || m == SRP_MULTI_CHR_MAGIC_LONG
+}
 
 // ---------------------------------------------------------------------------
 // Multi-chromosome SRP types

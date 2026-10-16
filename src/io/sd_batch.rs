@@ -35,7 +35,7 @@ pub fn setup_sd_batch_writers(
         let writer = SelfdecodeWriter::new_batched(&path, batch_names, filter_hom_ref)?;
         writers.push(SdBatchWriter {
             writer,
-            path: path.with_extension("selfdecode.zip"),
+            path: crate::common::utils::out_path(&path, "selfdecode.zip"),
             hap_start: r.hap_start, hap_end: r.hap_end,
         });
         Ok::<(), std::io::Error>(())

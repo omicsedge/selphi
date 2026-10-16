@@ -191,7 +191,7 @@ impl SelfdecodeWriter {
         filter_hom_ref: bool,
         multi_sample: bool,
     ) -> std::io::Result<Self> {
-        let zip_path = output_path.with_extension("selfdecode.zip");
+        let zip_path = crate::common::utils::out_path(output_path, "selfdecode.zip");
         let file = std::fs::File::create(&zip_path)?;
         let zip = zip::ZipWriter::new(file);
         let buffers: Vec<SampleBuffer> = (0..sample_names.len())

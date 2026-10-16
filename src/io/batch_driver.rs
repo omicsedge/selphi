@@ -304,8 +304,10 @@ pub fn run_window<S: BatchSink>(
     };
     sink.begin_window(&ctx)?;
 
+    let n_weight_rows = weights.iter().map(|w| w.n_rows).min().unwrap_or(0);
     let intervals = crate::io::pipeline::build_intervals(
-        win_chip_start, own_chip_start, own_chip_end, wgs_idx, own_wgs_start, own_wgs_end,
+        win_chip_start, n_weight_rows, own_chip_start, own_chip_end,
+        wgs_idx, own_wgs_start, own_wgs_end,
     );
     if intervals.is_empty() {
         return Ok(());

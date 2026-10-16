@@ -16,6 +16,42 @@ use std::path::Path;
 use selphi::{selphi_info, selphi_step};
 
 use crate::cli::Args;
+use selphi::eval::accuracy::{DsScale, EvaluationOptions, InputDosageOptions};
+
+/// Keep standalone and post-run evaluation on the same explicit dosage units.
+pub fn dosage_options_from_args(args: &Args) -> EvaluationOptions {
+    let scale = |value: &str| match value {
+        "native" => DsScale::Native,
+        "diploid" => DsScale::Diploid,
+        _ => unreachable!("clap validates evaluation dosage scale"),
+    };
+    EvaluationOptions {
+        imputed: InputDosageOptions {
+            ds_scale: scale(&args.eval_imputed_ds_scale),
+            fallback_ploidy: args.eval_imputed_ploidy,
+        },
+        truth: InputDosageOptions {
+            ds_scale: scale(&args.eval_truth_ds_scale),
+            fallback_ploidy: args.eval_truth_ploidy,
+        },
+    }
+}
+
+pub fn print_dosage_options(options: &EvaluationOptions) {
+    selphi_info!("  dosage:   diploid-equivalent R²/concordance; original-copy truth AF");
+    selphi_info!("  DS units: imputed={:?}, truth/raw={:?}", options.imputed, options.truth);
+}
+
+/// Invalid evaluation inputs/options are user errors, not internal panics.
+pub fn evaluation_or_exit<T>(result: std::io::Result<T>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("Evaluation failed: {error}");
+            std::process::exit(2);
+        }
+    }
+}
 
 /// Everything the evaluation reads off `Args`, carried separately so the
 /// orchestrator (which takes a config struct, not `Args`) can hold it too.
@@ -28,6 +64,7 @@ pub struct EvalRequest {
     pub exclude_sites: Option<String>,
     pub exclude_panel_monomorphic: Option<String>,
     pub by_type: bool,
+    pub dosage_options: EvaluationOptions,
 }
 
 impl EvalRequest {
@@ -41,6 +78,7 @@ impl EvalRequest {
             exclude_sites: args.exclude_sites.clone(),
             exclude_panel_monomorphic: args.exclude_panel_monomorphic.clone(),
             by_type: args.by_type,
+            dosage_options: dosage_options_from_args(args),
         })
     }
 }
@@ -63,6 +101,7 @@ pub fn evaluate(req: &EvalRequest, output_path: &str, final_path: &Path) {
     }
 
     selphi_step!("Evaluating accuracy vs truth...");
+    print_dosage_options(&req.dosage_options);
     let (_imp, _truth, shared) = selphi::eval::accuracy::find_shared_samples(final_path, truth_path)
         .expect("Failed to read sample headers");
     selphi_info!("  imputed:  {}", final_path.display());
@@ -88,9 +127,9 @@ pub fn evaluate(req: &EvalRequest, output_path: &str, final_path: &Path) {
     if homref {
         selphi_info!("  homref:   absent→hom-ref (truth is variant-only)");
         let raw_path = req.truth_raw.as_deref().map(Path::new);
-        let (comb, snp, indel, counts, site, rawdiag) = selphi::eval::accuracy::evaluate_imputation(
-            final_path, truth_path, &shared, raw_path, &exclude,
-        ).expect("Evaluation failed");
+        let (comb, snp, indel, counts, site, rawdiag) = evaluation_or_exit(selphi::eval::accuracy::evaluate_imputation_with_options(
+            final_path, truth_path, &shared, raw_path, &exclude, &req.dosage_options,
+        ));
         let n_excluded = counts.n_imp_variants.saturating_sub(counts.n_matched);
         selphi::eval::accuracy::print_imputation_summary(&comb, &snp, &indel, req.by_type, &counts, n_excluded);
         selphi::eval::accuracy::print_maf_bins(&site);
@@ -102,9 +141,9 @@ pub fn evaluate(req: &EvalRequest, output_path: &str, final_path: &Path) {
             selphi_info!("  WARNING: --truth-raw is only used on the absent→hom-ref path; \
 pass --homref-absent on to apply it (matched-sites scoring ignores it)");
         }
-        let (site_acc, sample_acc, counts) = selphi::eval::accuracy::evaluate(
-            final_path, truth_path, &shared, &exclude,
-        ).expect("Evaluation failed");
+        let (site_acc, sample_acc, counts) = evaluation_or_exit(selphi::eval::accuracy::evaluate_with_options(
+            final_path, truth_path, &shared, &exclude, &req.dosage_options,
+        ));
         selphi::eval::accuracy::print_summary(&site_acc, &sample_acc, &counts);
         selphi::eval::accuracy::write_json_summary(&json_path, &site_acc, &sample_acc, &counts, Some(&shared))
             .expect("Failed to write JSON summary");

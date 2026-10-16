@@ -31,11 +31,7 @@ pub fn merge_batch_parquets(
         return Err(std::io::Error::other("no batch files to merge"));
     }
 
-    let final_path = if output_path.extension().is_none_or(|e| e != "parquet") {
-        output_path.with_extension("parquet")
-    } else {
-        output_path.to_path_buf()
-    };
+    let final_path = crate::common::utils::out_path(output_path, "parquet");
 
     let schema = Arc::new(build_final_schema(all_sample_names));
     let file = std::fs::File::create(&final_path)?;

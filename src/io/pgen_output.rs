@@ -22,7 +22,7 @@ use std::path::Path;
 
 /// Write .psam file (sample metadata).
 pub fn write_psam(path: &Path, sample_names: &[String]) -> io::Result<()> {
-    let psam_path = path.with_extension("psam");
+    let psam_path = crate::common::utils::out_path(path, "psam");
     let mut f = BufWriter::new(std::fs::File::create(&psam_path)?);
     writeln!(f, "#IID")?;
     for name in sample_names { writeln!(f, "{}", name)?; }
@@ -32,7 +32,7 @@ pub fn write_psam(path: &Path, sample_names: &[String]) -> io::Result<()> {
 
 /// Write .pvar file header. Returns the writer for appending variant lines.
 pub fn write_pvar(path: &Path) -> io::Result<BufWriter<std::fs::File>> {
-    let pvar_path = path.with_extension("pvar");
+    let pvar_path = crate::common::utils::out_path(path, "pvar");
     let mut f = BufWriter::new(std::fs::File::create(&pvar_path)?);
     writeln!(f, "#CHROM\tPOS\tID\tREF\tALT")?;
     Ok(f)
@@ -89,7 +89,7 @@ pub struct PgenWriter {
 
 impl PgenWriter {
     pub fn new(path: &Path, n_samples: usize, max_variants: usize) -> io::Result<Self> {
-        let pgen_path = path.with_extension("pgen");
+        let pgen_path = crate::common::utils::out_path(path, "pgen");
         let mut file = BufWriter::with_capacity(4 << 20, std::fs::File::create(&pgen_path)?);
         let bytes_per_hardcall = n_samples.div_ceil(4);
         let rec_len = bytes_per_hardcall + 2 * n_samples;

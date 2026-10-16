@@ -339,9 +339,10 @@ pub struct Args {
     #[arg(long, default_value = "0")]
     pub sample_batch_size: usize,
 
-    /// Emission error probability
-    #[arg(long, default_value = "0.025", value_parser = parse_p_err)]
-    pub p_err: f64,
+    /// Emission error floor. Default: 0.025, raised per haplotype on arrays with genotyping
+    /// errors (adaptive, see window_process::PerrAdapt). An explicit value is used as a fixed floor.
+    #[arg(long, value_parser = parse_p_err)]
+    pub p_err: Option<f64>,
 
     /// Disable EM-estimated Ne from phasing (use global Ne for imputation)
     #[arg(long)]
@@ -429,6 +430,29 @@ pub struct Args {
     /// Truth VCF/BCF for accuracy evaluation (used with --evaluate)
     #[arg(long)]
     pub truth: Option<String>,
+
+    /// Evaluation DS units for predictions: native allele copies (scaled by GT
+    /// ploidy) or already diploid-equivalent [0,2]. GT-only calls are always
+    /// normalized. Native DS requires an identifiable GT ploidy or fallback.
+    #[arg(long, default_value = "native", value_parser = ["native", "diploid"])]
+    pub eval_imputed_ds_scale: String,
+
+    /// Evaluation DS units for both --truth and --truth-raw. Use diploid for
+    /// DS already on [0,2]; AF still requires the original truth ploidy.
+    #[arg(long, default_value = "native", value_parser = ["native", "diploid"])]
+    pub eval_truth_ds_scale: String,
+
+    /// Explicit prediction ploidy only where GT does not identify it (e.g.
+    /// DS-only data). Does not override known GT ploidy; use only when this
+    /// value is correct for every otherwise-unknown call in the evaluated data.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub eval_imputed_ploidy: Option<u32>,
+
+    /// Explicit truth/raw ploidy only where GT does not identify it. Required
+    /// for nonzero DS-only truth when original allele frequency is computed.
+    /// Does not override known GT ploidy or turn a no-call into a called GT.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub eval_truth_ploidy: Option<u32>,
 
     /// (--evaluate) Absent-from-truth handling: `auto` (default) decides per truth file —
     /// a variant-only truth (no explicit 0/0) scores absent sites as hom-ref (the standard
@@ -518,6 +542,9 @@ pub struct Args {
     #[arg(long, value_enum, default_value = "auto")]
     pub build: BuildArg,
 }
+
+/// The emission error floor when `--p-err` is not given (the adaptive floor's base).
+pub const DEFAULT_P_ERR: f64 = 0.025;
 
 /// Validate `--p-err`: a mismatch probability above 0.5 inverts the HMM
 /// emission (mismatching haplotypes outweigh matching ones), so only

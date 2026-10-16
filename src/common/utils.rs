@@ -26,18 +26,29 @@ pub fn median(sorted: &[f64]) -> f64 {
 ///   panel.vcf.gz  + "vcf.gz" -> panel.vcf.gz         (idempotent, no doubling)
 ///   panel.vcf     + "srp"    -> panel.srp            (a real extension IS replaced)
 pub fn out_path(base: &std::path::Path, ext: &str) -> std::path::PathBuf {
-    const KNOWN: &[&str] = &["vcf.gz", "vcf", "bcf", "srp", "bref3", "gz"];
-    let s = base.to_string_lossy().to_string();
-    if let Some(stripped) = s.strip_suffix(&format!(".{ext}")) {
-        let _ = stripped;
-        return base.to_path_buf(); // already carries the extension we want
-    }
-    for k in KNOWN {
-        if let Some(stem) = s.strip_suffix(&format!(".{k}")) {
-            return std::path::PathBuf::from(format!("{stem}.{ext}"));
-        }
-    }
-    std::path::PathBuf::from(format!("{s}.{ext}"))
+    const KNOWN: &[&str] = &["vcf.gz", "vcf", "bcf", "srp", "bref3", "pgen", "psam", "pvar",
+                             "parquet", "selfdecode.zip", "gz"];
+    // Only the file name can carry an extension (a dotted parent directory is left
+    // alone), and it is matched as BYTES: every suffix we recognise is ASCII, so a
+    // name that is not UTF-8 is still recognised and never converted lossily.
+    let Some(name) = base.file_name() else {
+        let mut s = base.as_os_str().to_owned();
+        s.push(".");
+        s.push(ext);
+        return std::path::PathBuf::from(s);
+    };
+    let bytes = name.as_encoded_bytes();
+    let has = |k: &str| bytes.len() >= k.len() + 1 && bytes.ends_with(k.as_bytes())
+        && bytes[bytes.len() - k.len() - 1] == b'.';
+    if has(ext) { return base.to_path_buf(); } // already carries the extension we want
+    let stem_len = KNOWN.iter().find(|k| has(k)).map_or(bytes.len(), |k| bytes.len() - k.len() - 1);
+    // SAFETY: `stem_len` is either the whole name or the offset of an ASCII '.', and
+    // splitting an encoded OsStr immediately before an ASCII character is valid.
+    let stem = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&bytes[..stem_len]) };
+    let mut file = stem.to_owned();
+    file.push(".");
+    file.push(ext);
+    base.with_file_name(file)
 }
 
 /// True when `output` (which need not exist yet) names the existing file `input`:
@@ -90,6 +101,7 @@ mod out_path_tests {
     fn idempotent_when_already_correct() {
         assert_eq!(p("out/panel.vcf.gz", "vcf.gz"), "out/panel.vcf.gz");
         assert_eq!(p("out/panel.srp", "srp"), "out/panel.srp");
+        assert_eq!(p("out/.vcf.gz", "vcf.gz"), "out/.vcf.gz"); // hidden, exactly the suffix
     }
 
     #[test]
@@ -97,6 +109,36 @@ mod out_path_tests {
         assert_eq!(p("out/panel.vcf", "srp"), "out/panel.srp");
         assert_eq!(p("out/panel.bcf", "srp"), "out/panel.srp");
         assert_eq!(p("out/panel.srp", "bref3"), "out/panel.bref3");
+        assert_eq!(p("out/r.chr22.pgen", "psam"), "out/r.chr22.psam");
+        assert_eq!(p("out/r.chr22.parquet", "vcf.gz"), "out/r.chr22.vcf.gz");
+    }
+
+    #[test]
+    fn every_writer_keeps_a_dotted_name() {
+        // --out res.chr22 must never become res.<ext>: two chromosomes would share one file.
+        for ext in ["vcf.gz", "bcf", "parquet", "pgen", "psam", "pvar", "selfdecode.zip", "local_ancestry.tsv"] {
+            assert_eq!(p("out/res.chr22", ext), format!("out/res.chr22.{ext}"));
+        }
+        assert_ne!(p("res.chr21", "vcf.gz"), p("res.chr22", "vcf.gz"));
+    }
+
+    #[test]
+    fn dotted_directory_is_not_an_extension() {
+        assert_eq!(p("runs/v1.2/res", "vcf.gz"), "runs/v1.2/res.vcf.gz");
+        assert_eq!(p("runs/x.vcf/res", "pgen"), "runs/x.vcf/res.pgen");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_name_is_appended_losslessly() {
+        use std::os::unix::ffi::OsStrExt;
+        let q = |b: &[u8], e: &str| out_path(Path::new(std::ffi::OsStr::from_bytes(b)), e).as_os_str().as_bytes().to_vec();
+        assert_eq!(q(b"out/r\xff.chr22", "vcf.gz"), b"out/r\xff.chr22.vcf.gz");
+        assert_eq!(q(b"out/r\xff.vcf.gz", "vcf.gz"), b"out/r\xff.vcf.gz");
+        assert_eq!(q(b"out/r\xff.pgen", "pgen"), b"out/r\xff.pgen");
+        assert_eq!(q(b"out/r\xff.pgen", "psam"), b"out/r\xff.psam");
+        assert_eq!(q(b"out/r\xff.vcf.gz", "selfdecode.zip"), b"out/r\xff.selfdecode.zip");
+        assert_eq!(q(b"out/\xfe.d/r.chr1", "bcf"), b"out/\xfe.d/r.chr1.bcf");
     }
 
     #[test]

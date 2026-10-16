@@ -63,7 +63,7 @@ fn cohort_from_srp(input_path: &str) -> Cohort {
         chrom: vv.chr.clone(), pos: vv.pos,
         ref_allele: vv.ref_allele.clone(), alt_allele: vv.alt_allele.clone(),
         ref_hash: String::new(), alt_hash: String::new(),
-        id: srp.original_ids.get(i).cloned().unwrap_or_default(),
+        id: srp.original_ids.get(i).cloned().unwrap_or_default(), unphased_het: false,
     }).collect();
     let sample_names = if srp.sample_ids.len() == n_samples {
         srp.sample_ids.clone()
@@ -90,7 +90,7 @@ fn cohort_from_bref3(input_path: &str) -> Cohort {
         .unwrap_or_else(|e| { selphi_error!("BREF3 read error: {}", e); std::process::exit(1); }) {
         markers.push(TargetMarker {
             chrom, pos: pos as i64, ref_allele: ref_a, alt_allele: alt_a,
-            ref_hash: String::new(), alt_hash: String::new(), id,
+            ref_hash: String::new(), alt_hash: String::new(), id, unphased_het: false,
         });
     }
     drop(s1);
@@ -725,7 +725,7 @@ fn run_streaming(args: &Args, input_path: &str, output_path: &str, map_path: &st
     let markers: Vec<TargetMarker> = raw.iter().map(|v| TargetMarker {
         chrom: hdr.contig_names.get(v.chrom_id as usize).cloned().unwrap_or_else(|| v.chrom_id.to_string()),
         pos: v.pos, ref_allele: v.ref_allele.clone(), alt_allele: v.alt_allele.clone(),
-        ref_hash: String::new(), alt_hash: String::new(), id: v.id.clone(),
+        ref_hash: String::new(), alt_hash: String::new(), id: v.id.clone(), unphased_het: false,
     }).collect();
     let bp: Vec<i64> = markers.iter().map(|m| m.pos).collect();
     {

@@ -11,6 +11,231 @@
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 
+/// Units of a FORMAT/DS value. GT is always decoded in its native ploidy.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum DsScale {
+    /// DS is the expected ALT count in the sample's original ploidy.
+    #[default]
+    Native,
+    /// DS is already on the diploid-equivalent [0, 2] scale.
+    Diploid,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InputDosageOptions {
+    pub ds_scale: DsScale,
+    /// Used only when GT does not identify ploidy; never overrides a known GT ploidy.
+    pub fallback_ploidy: Option<u32>,
+}
+
+/// Scoring uses diploid-equivalent dosages on both sides. Truth AF uses original
+/// allele counts and ploidies. Raw truth, when supplied, uses `truth` options too.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EvaluationOptions {
+    pub imputed: InputDosageOptions,
+    pub truth: InputDosageOptions,
+}
+
+impl InputDosageOptions {
+    fn validate(self) -> io::Result<()> {
+        if self.fallback_ploidy == Some(0) {
+            return Err(invalid_dosage("fallback ploidy must be greater than zero"));
+        }
+        Ok(())
+    }
+}
+
+impl EvaluationOptions {
+    fn validate(&self) -> io::Result<()> {
+        self.imputed.validate()?;
+        self.truth.validate()
+    }
+}
+
+fn invalid_dosage(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct GtCall {
+    alt_count: Option<u32>,
+    ploidy: Option<u32>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct SampleCall {
+    gt: GtCall,
+    // Some(-1) means DS is present but missing: GT must not replace it.
+    ds: Option<f32>,
+}
+
+#[derive(Clone, Default)]
+struct DosageMetadata {
+    native_alt: Vec<f64>,
+    // Zero means unknown, not zero-ploidy.
+    ploidy: Vec<u32>,
+}
+
+impl DosageMetadata {
+    fn clear(&mut self) {
+        self.native_alt.clear();
+        self.ploidy.clear();
+    }
+}
+
+fn parse_gt_text(gt: &[u8]) -> GtCall {
+    // The common case, one-character alleles of a diploid call ("0|1", "1/1", "./."),
+    // without the general split below.
+    if let [a, sep, b] = *gt && (sep == b'|' || sep == b'/') {
+        let allele = |c: u8| match c { b'0' => Some(Some(0u32)), b'1' => Some(Some(1)), b'.' => Some(None), _ => None };
+        if let (Some(x), Some(y)) = (allele(a), allele(b)) {
+            let alt = match (x, y) { (Some(x), Some(y)) => Some(x + y), _ => None };
+            return GtCall { alt_count: alt, ploidy: Some(2) };
+        }
+    }
+    if gt.is_empty() || gt == b"." { return GtCall::default(); }
+    let mut ploidy = 0;
+    let mut alt_count = 0;
+    let mut called = true;
+    for allele in gt.split(|&b| b == b'/' || b == b'|') {
+        ploidy += 1;
+        match allele {
+            b"0" => (),
+            b"1" => alt_count += 1,
+            b"." => called = false,
+            _ => return GtCall::default(), // invalid allele does not identify ploidy
+        }
+    }
+    GtCall { alt_count: called.then_some(alt_count), ploidy: Some(ploidy) }
+}
+
+/// Decode the declared integer width and each sample's own vector end. GT missing
+/// alleles (0/1) and typed missing values are distinct from vector-end padding.
+fn parse_gt_bcf(data: &[u8], tid: u8) -> GtCall {
+    let (width, missing, vector_end) = match tid {
+        1 => (1, i8::MIN as i32, i8::MIN as i32 + 1),
+        2 => (2, i16::MIN as i32, i16::MIN as i32 + 1),
+        3 => (4, i32::MIN, i32::MIN + 1),
+        _ => return GtCall::default(),
+    };
+    let mut ploidy = 0;
+    let mut alt_count = 0;
+    let mut called = true;
+    for bytes in data.chunks_exact(width) {
+        let raw = match width {
+            1 => bytes[0] as i8 as i32,
+            2 => i16::from_le_bytes(bytes.try_into().unwrap()) as i32,
+            _ => i32::from_le_bytes(bytes.try_into().unwrap()),
+        };
+        if raw == vector_end { break; }
+        ploidy += 1;
+        if raw == missing || raw == 0 || raw == 1 {
+            called = false;
+        } else if raw < 2 {
+            return GtCall::default();
+        } else {
+            match (raw >> 1) - 1 {
+                0 => (),
+                1 => alt_count += 1,
+                _ => return GtCall::default(), // invalid allele does not identify ploidy
+            }
+        }
+    }
+    // A lone missing allele represents GT '.', which does not identify ploidy.
+    let known_ploidy = ploidy > 0 && (called || ploidy > 1);
+    GtCall { alt_count: (called && ploidy > 0).then_some(alt_count),
+        ploidy: known_ploidy.then_some(ploidy) }
+}
+
+/// How far a DS may exceed its ploidy and still be read as that ploidy: rounding in
+/// the writer (two-decimal DS) or float noise, never a different scale.
+const DS_ROUNDING_SLACK: f64 = 1e-3;
+
+#[inline]
+fn normalize_call(call: SampleCall, options: InputDosageOptions) -> io::Result<(f32, f64, u32)> {
+    let ploidy = call.gt.ploidy.or(options.fallback_ploidy).unwrap_or(0);
+    if let Some(ds) = call.ds {
+        // DS is authoritative even when missing. Non-finite DS is a no-call.
+        if !ds.is_finite() || ds < 0.0 { return Ok((-1.0, 0.0, ploidy)); }
+        match options.ds_scale {
+            DsScale::Native => {
+                if ploidy == 0 {
+                    return Err(invalid_dosage("native DS has no identifiable GT ploidy; declare a positive fallback ploidy or use diploid DS scale if the file is already normalized"));
+                }
+                if ds as f64 > ploidy as f64 + DS_ROUNDING_SLACK {
+                    return Err(invalid_dosage(format!("native DS {ds} exceeds GT/fallback ploidy {ploidy}; declare the file's DS scale explicitly")));
+                }
+                // A DS rounded to a few decimals (or float noise) may sit a hair above the
+                // ploidy; it is that ploidy, not an error.
+                let ds = ds.min(ploidy as f32);
+                let dosage2 = if ploidy == 2 { ds } else { (2.0 * ds as f64 / ploidy as f64) as f32 };
+                Ok((dosage2, ds as f64, ploidy))
+            }
+            DsScale::Diploid => {
+                if ds as f64 > 2.0 + DS_ROUNDING_SLACK { return Err(invalid_dosage(format!("diploid DS {ds} exceeds 2"))); }
+                let ds = ds.min(2.0);
+                let native_alt = if ploidy == 2 { ds as f64 } else { ds as f64 * ploidy as f64 / 2.0 };
+                Ok((ds, native_alt, ploidy))
+            }
+        }
+    } else if let (Some(alt), Some(p)) = (call.gt.alt_count, call.gt.ploidy) {
+        let dosage2 = if p == 2 { alt as f32 } else { (2.0 * alt as f64 / p as f64) as f32 };
+        Ok((dosage2, alt as f64, p))
+    } else {
+        Ok((-1.0, 0.0, ploidy))
+    }
+}
+
+/// Normalise one sample's call and append it (`i` = its column, for the error text).
+#[inline]
+fn push_normalized(call: SampleCall, i: usize, options: InputDosageOptions,
+    ds_buf: &mut Vec<f32>, metadata: &mut DosageMetadata) -> io::Result<()> {
+    let (dose, native_alt, ploidy) = normalize_call(call, options)
+        .map_err(|e| invalid_dosage(format!("sample column {}: {e}", i + 1)))?;
+    ds_buf.push(dose);
+    metadata.native_alt.push(native_alt);
+    metadata.ploidy.push(ploidy);
+    Ok(())
+}
+
+fn normalize_row(calls: &[SampleCall], indices: Option<&[usize]>, options: InputDosageOptions,
+    ds_buf: &mut Vec<f32>, metadata: &mut DosageMetadata) -> io::Result<()> {
+    ds_buf.clear();
+    metadata.clear();
+    if let Some(indices) = indices {
+        for &i in indices { push_normalized(calls.get(i).copied().unwrap_or_default(), i, options, ds_buf, metadata)?; }
+    } else {
+        for (i, &c) in calls.iter().enumerate() { push_normalized(c, i, options, ds_buf, metadata)?; }
+    }
+    Ok(())
+}
+
+/// AF among called truth samples, in original allele-copy units. A wholly REF
+/// site has AF=0 even if its ploidies are unknown (e.g. absent-from-strong truth).
+/// At a variable site every called sample needs ploidy, including REF samples.
+fn truth_af(dosage2: &[f32], metadata: &DosageMetadata) -> io::Result<f64> {
+    let mut n_called = 0;
+    let mut all_ref = true;
+    let mut alt_sum = 0.0;
+    let mut ploidy_sum = 0u64;
+    let mut unknown_ploidy = false;
+    for (s, &dose) in dosage2.iter().enumerate() {
+        if dose < 0.0 { continue; }
+        n_called += 1;
+        all_ref &= dose == 0.0;
+        alt_sum += metadata.native_alt[s];
+        ploidy_sum += metadata.ploidy[s] as u64;
+        unknown_ploidy |= metadata.ploidy[s] == 0;
+    }
+    if n_called == 0 { return Ok(f64::NAN); }
+    if all_ref { return Ok(0.0); }
+    if unknown_ploidy {
+        return Err(invalid_dosage("truth AF requires GT ploidy or a positive truth fallback ploidy for every called sample at a non-REF site; diploid DS scale alone does not identify original ploidy"));
+    }
+    Ok(alt_sum / ploidy_sum as f64)
+}
+
+
 /// MAF bins matching the paper standard.
 pub const MAF_BINS: &[(f64, f64, &str)] = &[
     (0.0005, 0.001,  "0.05-0.1%"),
@@ -132,6 +357,9 @@ pub struct RawTruthDiag {
     pub scored_sites_matched: u64,
     /// (site, sample) pairs the raw truth rescued from hom-ref scoring.
     pub genotypes_rescued: u64,
+    /// No-calls in raw truth excluded because the strong record is absent.
+    /// These are not carrier rescues and do not increment `genotypes_rescued`.
+    pub genotypes_missing_raw: u64,
     /// Scored sites absent from the filtered truth entirely.
     pub scored_sites_absent_from_strong: u64,
 }
@@ -336,116 +564,74 @@ fn strip_line_endings(line: &[u8]) -> &[u8] {
     &line[..end]
 }
 
-/// `parse_vcf_line` plus the shared-sample reindex the BCF arm applies natively:
-/// parse the full `n_file_samples` row into `full_row`, then gather `indices`
-/// into `ds_buf`. With `indices == None` the row is returned as parsed.
-fn parse_vcf_line_reindexed(
-    line: &[u8], n_file_samples: usize, ds_buf: &mut Vec<f32>,
-    indices: Option<&[usize]>, full_row: &mut Vec<f32>,
-) -> Option<(Vec<u8>, i64, Vec<u8>, Vec<u8>)> {
-    let Some(idx) = indices else { return parse_vcf_line(line, n_file_samples, ds_buf); };
-    let rec = parse_vcf_line(line, n_file_samples, full_row)?;
-    ds_buf.clear();
-    ds_buf.extend(idx.iter().map(|&i| full_row.get(i).copied().unwrap_or(-1.0)));
-    Some(rec)
+type VariantRecord = (Vec<u8>, i64, Vec<u8>, Vec<u8>);
+
+/// Parse a VCF record on the default native scale. The Option API is retained
+/// for callers of this low-level helper; evaluators use the fallible reader so
+/// ambiguous DS units are reported as errors, never mistaken for end-of-file.
+pub fn parse_vcf_line(line: &[u8], n_samples: usize, ds_buf: &mut Vec<f32>) -> Option<VariantRecord> {
+    parse_vcf_record(line, n_samples, None, InputDosageOptions::default(), ds_buf,
+        &mut DosageMetadata::default(), &mut Vec::new(), false).ok().flatten()
 }
 
-/// Parse a VCF/BCF text line to extract dosage for all samples.
-/// Returns (chrom, pos, ref, alt, dosages) where dosages[i] is DS for sample i.
-/// If DS not available, uses GT (0/0→0, 0/1→1, 1/1→2).
-/// Returns None for header lines or multi-allelic.
-pub fn parse_vcf_line(line: &[u8], n_samples: usize, ds_buf: &mut Vec<f32>) -> Option<(Vec<u8>, i64, Vec<u8>, Vec<u8>)> {
-    // Strip trailing newline (\n, \r\n). Without this, `is_empty()` below is
-    // false for blank records whose line_buf contains just "\n", and the
-    // pos/allele slicing would include the trailing byte.
+fn parse_vcf_record(line: &[u8], n_samples: usize, indices: Option<&[usize]>,
+    options: InputDosageOptions, ds_buf: &mut Vec<f32>, metadata: &mut DosageMetadata,
+    calls: &mut Vec<SampleCall>, skip_gt: bool) -> io::Result<Option<VariantRecord>> {
     let line = strip_line_endings(line);
-    if line.is_empty() || line[0] == b'#' { return None; }
-
-    // Find first 9 tabs (fixed VCF columns)
+    if line.is_empty() || line[0] == b'#' { return Ok(None); }
     let mut tabs = [0usize; 9];
     let mut nt = 0;
     for (i, &b) in line.iter().enumerate() {
-        if b == b'\t' { if nt < 9 { tabs[nt] = i; } nt += 1; if nt >= 9 { break; } }
+        if b == b'\t' { tabs[nt] = i; nt += 1; if nt == 9 { break; } }
     }
-    if nt < 9 { return None; }
-
+    if nt < 9 { return Ok(None); }
     let chrom = line[..tabs[0]].to_vec();
-    let pos: i64 = std::str::from_utf8(&line[tabs[0]+1..tabs[1]]).ok()?.parse().ok()?;
+    let pos = std::str::from_utf8(&line[tabs[0]+1..tabs[1]]).ok()
+        .and_then(|s| s.parse::<i64>().ok()).ok_or_else(|| invalid_dosage("invalid VCF position"))?;
     let ref_a = line[tabs[2]+1..tabs[3]].to_vec();
-    let alt_field = &line[tabs[3]+1..tabs[4]];
+    let alt_a = line[tabs[3]+1..tabs[4]].to_vec();
+    if alt_a.contains(&b',') { return Ok(None); }
+    let record = (chrom, pos, ref_a, alt_a);
+    if skip_gt { ds_buf.clear(); metadata.clear(); return Ok(Some(record)); }
 
-    // Skip multi-allelic (contains comma in ALT)
-    if alt_field.contains(&b',') { return None; }
-    let alt_a = alt_field.to_vec();
-
-    // Find DS index in FORMAT field
     let format = &line[tabs[7]+1..tabs[8]];
-    let mut ds_idx: Option<usize> = None;
-    let mut gt_idx: Option<usize> = None;
-    for (fi, field) in format.split(|&b| b == b':').enumerate() {
-        if field == b"DS" { ds_idx = Some(fi); }
-        if field == b"GT" { gt_idx = Some(fi); }
+    let mut ds_idx = None;
+    let mut gt_idx = None;
+    for (i, field) in format.split(|&b| b == b':').enumerate() {
+        if field == b"DS" { ds_idx = Some(i); }
+        if field == b"GT" { gt_idx = Some(i); }
     }
-
-    // Parse sample fields
-    ds_buf.clear();
-    let sample_region = &line[tabs[8]+1..];
-    for sample_field in sample_region.split(|&b| b == b'\t') {
-        if ds_buf.len() >= n_samples { break; }
-
-        if let Some(di) = ds_idx {
-            // Extract DS subfield
-            if let Some(val) = sample_field.split(|&b| b == b':').nth(di) {
-                let s = std::str::from_utf8(val).unwrap_or(".");
-                // "nan"/"inf" parse as floats: a non-finite DS is missing, as '.' is.
-                ds_buf.push(s.parse::<f32>().ok().filter(|d| d.is_finite()).unwrap_or(-1.0));
-            } else {
-                ds_buf.push(-1.0);
+    // Only the fields up to the last of GT/DS are looked at.
+    let n_fields = gt_idx.max(ds_idx).map_or(0, |i| i + 1);
+    let parse_call = |sample: &[u8]| {
+        let mut call = SampleCall { ds: ds_idx.map(|_| -1.0), ..Default::default() };
+        for (i, field) in sample.split(|&b| b == b':').take(n_fields).enumerate() {
+            if gt_idx == Some(i) { call.gt = parse_gt_text(field); }
+            if ds_idx == Some(i) {
+                call.ds = Some(std::str::from_utf8(field).ok().and_then(|s| s.parse::<f32>().ok())
+                    .filter(|v| v.is_finite()).unwrap_or(-1.0));
             }
-        } else if let Some(gi) = gt_idx {
-            // Fall back to GT. A no-call is UNKNOWN, not hom-ref: it is pushed as
-            // the -1.0 missing sentinel every scoring loop in this file already
-            // skips (site_r2, the concordance loop, the per-sample accumulator),
-            // and which the MAF computation already excludes from its denominator
-            // (`if truth_ds[s] >= 0.0`), so an allele frequency is taken over the
-            // called genotypes — which is what it means. Folding it to 0 scored a
-            // perfect imputation as WRONG wherever the truth simply did not know:
-            // on a synthetic set with 20 of 40 truth genotypes no-called and the
-            // imputation exact, OVERALL R2 read 0.2591 and per-sample 0.5000
-            // instead of 1.0.
-            if let Some(gt) = sample_field.split(|&b| b == b':').nth(gi) {
-                if gt.len() >= 3 {
-                    if gt[0] == b'.' || gt[2] == b'.' {
-                        ds_buf.push(-1.0);
-                    } else {
-                    let a0 = (gt[0] - b'0') as i32;
-                    let a1 = (gt[2] - b'0') as i32;
-                    ds_buf.push((a0 + a1) as f32);
-                    }
-                } else if gt.len() == 1 {
-                    // Haploid GT (e.g. chrX males): one allele → its biallelic ALT
-                    // count (0/1), as the BCF reader's haploid branch does, so
-                    // VCF and BCF truths agree on haploid sites. No-op on
-                    // autosomal diploid (always len>=3).
-                    // A haploid no-call is unknown, as a diploid one is above.
-                    if gt[0] == b'.' { ds_buf.push(-1.0); } else {
-                        ds_buf.push(((gt[0] - b'0') as i32).min(1) as f32);
-                    }
-                } else {
-                    ds_buf.push(0.0);
-                }
-            } else {
-                ds_buf.push(0.0);
-            }
-        } else {
-            ds_buf.push(0.0);
         }
+        call
+    };
+    if indices.is_none() {
+        // Every column in file order: normalise as it is read, no call buffer.
+        ds_buf.clear();
+        metadata.clear();
+        let mut n = 0usize;
+        for sample in line[tabs[8]+1..].split(|&b| b == b'\t').take(n_samples) {
+            push_normalized(parse_call(sample), n, options, ds_buf, metadata)?;
+            n += 1;
+        }
+        // Absent/truncated sample columns are missing, never synthetic hom-ref.
+        for i in n..n_samples { push_normalized(SampleCall::default(), i, options, ds_buf, metadata)?; }
+        return Ok(Some(record));
     }
-
-    // Pad if needed
-    while ds_buf.len() < n_samples { ds_buf.push(0.0); }
-
-    Some((chrom, pos, ref_a, alt_a))
+    calls.clear();
+    calls.extend(line[tabs[8]+1..].split(|&b| b == b'\t').take(n_samples).map(parse_call));
+    calls.resize(n_samples, SampleCall::default());
+    normalize_row(calls, indices, options, ds_buf, metadata)?;
+    Ok(Some(record))
 }
 
 /// Content-sniff whether `path` is a binary BCF (BGZF magic "BCF"), so a BCF
@@ -522,8 +708,10 @@ enum VariantReader {
         /// take the leading columns as they come, which is only right when the
         /// file's samples ARE the shared set in that order.
         sample_indices: Option<Vec<usize>>,
-        /// Scratch: the full per-file-sample dosage row before reindexing.
-        full_row: Vec<f32>,
+        /// Scratch: GT/DS calls before shared-sample reindexing.
+        calls: Vec<SampleCall>,
+        metadata: DosageMetadata,
+        options: InputDosageOptions,
     },
     Bcf {
         reader: noodles_bgzf::io::Reader<BufReader<std::fs::File>>,
@@ -538,6 +726,9 @@ enum VariantReader {
         header_end_vpos: u64,
         sb: Vec<u8>,
         ib: Vec<u8>,
+        calls: Vec<SampleCall>,
+        metadata: DosageMetadata,
+        options: InputDosageOptions,
     },
 }
 
@@ -575,6 +766,7 @@ impl VariantReader {
                 ds_key, n_file_samples: ns, sample_indices: None,
                 path: path.to_path_buf(), header_end_vpos,
                 sb: Vec::with_capacity(512), ib: Vec::with_capacity(ns * 4),
+                calls: Vec::new(), metadata: DosageMetadata::default(), options: InputDosageOptions::default(),
             }, samples))
         } else {
             // Read header directly through bgzf's own block buffer so
@@ -617,7 +809,8 @@ impl VariantReader {
             Ok((VariantReader::Vcf {
                 reader, line_buf: Vec::with_capacity(ns * 8), n_file_samples: ns,
                 path: path.to_path_buf(), header_end_vpos,
-                sample_indices: None, full_row: Vec::new(),
+                sample_indices: None, calls: Vec::new(),
+                metadata: DosageMetadata::default(), options: InputDosageOptions::default(),
             }, samples))
         }
     }
@@ -631,6 +824,18 @@ impl VariantReader {
         match self {
             VariantReader::Bcf { sample_indices, .. } => { *sample_indices = Some(indices); }
             VariantReader::Vcf { sample_indices, .. } => { *sample_indices = Some(indices); }
+        }
+    }
+
+    fn set_dosage_options(&mut self, dosage_options: InputDosageOptions) {
+        match self {
+            Self::Vcf { options, .. } | Self::Bcf { options, .. } => *options = dosage_options,
+        }
+    }
+
+    fn metadata(&self) -> &DosageMetadata {
+        match self {
+            Self::Vcf { metadata, .. } | Self::Bcf { metadata, .. } => metadata,
         }
     }
 
@@ -694,192 +899,121 @@ impl VariantReader {
         }
     }
 
-    /// Read next biallelic variant. Returns (chrom, pos, ref, alt) and fills ds_buf with dosages.
-    /// For BCF: if skip_genotypes=true, skips the individual data (fast position scan).
-    fn next_record(&mut self, ds_buf: &mut Vec<f32>) -> Option<(Vec<u8>, i64, Vec<u8>, Vec<u8>)> {
-        self.next_record_inner(ds_buf, false)
+    /// Read one biallelic variant and normalize dosages. Errors include the input
+    /// path; malformed/ambiguous dosage data must not silently terminate a merge.
+    fn next_record(&mut self, ds_buf: &mut Vec<f32>) -> io::Result<Option<VariantRecord>> {
+        self.next_record_inner(ds_buf, false).map_err(|e| {
+            let path = match self { Self::Vcf { path, .. } | Self::Bcf { path, .. } => path };
+            io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+        })
     }
 
-    fn next_record_inner(&mut self, ds_buf: &mut Vec<f32>, skip_gt: bool) -> Option<(Vec<u8>, i64, Vec<u8>, Vec<u8>)> {
+    fn next_record_inner(&mut self, ds_buf: &mut Vec<f32>, skip_gt: bool) -> io::Result<Option<VariantRecord>> {
         match self {
-            VariantReader::Vcf { reader, line_buf, n_file_samples, sample_indices, full_row, .. } => {
+            VariantReader::Vcf { reader, line_buf, n_file_samples, sample_indices, calls, metadata, options, .. } => {
                 loop {
                     line_buf.clear();
-                    if reader.read_until(b'\n', line_buf).ok()? == 0 { return None; }
-                    if let Some(rec) = parse_vcf_line_reindexed(line_buf, *n_file_samples, ds_buf, sample_indices.as_deref(), full_row) {
-                        return Some(rec);
+                    if reader.read_until(b'\n', line_buf)? == 0 { return Ok(None); }
+                    if let Some(rec) = parse_vcf_record(line_buf, *n_file_samples,
+                        sample_indices.as_deref(), *options, ds_buf, metadata, calls, skip_gt)? {
+                        return Ok(Some(rec));
                     }
                 }
             }
-            VariantReader::Bcf { reader, contig_names, gt_key, ds_key, n_file_samples, sample_indices, sb, ib, .. } => {
+            VariantReader::Bcf { reader, contig_names, gt_key, ds_key, n_file_samples,
+                sample_indices, sb, ib, calls, metadata, options, .. } => {
                 let ns = *n_file_samples;
-                let gtk = *gt_key;
-                let dsk = *ds_key;
-                let si_filter = sample_indices.as_deref();
                 loop {
-                    // Read record header
                     let mut lbuf = [0u8; 4];
-                    let mut total = 0;
-                    loop {
-                        match reader.read(&mut lbuf[total..]) {
-                            Ok(0) => { if total == 0 { return None; } return None; }
-                            Ok(n) => { total += n; if total == 4 { break; } }
-                            Err(_) => return None,
-                        }
-                    }
+                    // Distinguish a clean EOF from a truncated record header.
+                    if reader.read(&mut lbuf[..1])? == 0 { return Ok(None); }
+                    reader.read_exact(&mut lbuf[1..])?;
                     let ls = u32::from_le_bytes(lbuf) as usize;
-                    if ls == 0 { return None; }
-                    // BCF SHARED block has a 24-byte fixed header (chrom + pos + rlen +
-                    // qual + n_info + n_allele + n_fmt); a truncated record (ls < 24)
-                    // would panic on the sb[..] slicing below. Mirror the guard in
-                    // srp/bcf_reader.rs and bail cleanly on malformed input.
-                    if ls < 24 { return None; }
+                    if ls < 24 { return Err(invalid_dosage("truncated BCF shared header")); }
                     let mut libuf = [0u8; 4];
-                    reader.read_exact(&mut libuf).ok()?;
+                    reader.read_exact(&mut libuf)?;
                     let li = u32::from_le_bytes(libuf) as usize;
-
-                    sb.resize(ls, 0); reader.read_exact(sb).ok()?;
+                    sb.resize(ls, 0);
+                    reader.read_exact(sb)?;
                     let ci = i32::from_le_bytes(sb[0..4].try_into().unwrap()) as usize;
                     let pos = i32::from_le_bytes(sb[4..8].try_into().unwrap()) as i64 + 1;
                     let na = u16::from_le_bytes(sb[18..20].try_into().unwrap()) as usize;
-
                     if na != 2 || skip_gt {
-                        // Skip individual data without reading
                         let mut rem = li;
                         let mut skip_buf = [0u8; 65536];
-                        while rem > 0 { let c = rem.min(skip_buf.len()); reader.read_exact(&mut skip_buf[..c]).ok()?; rem -= c; }
+                        while rem > 0 {
+                            let c = rem.min(skip_buf.len());
+                            reader.read_exact(&mut skip_buf[..c])?;
+                            rem -= c;
+                        }
                         if na != 2 { continue; }
-                        // skip_gt: return position info without dosages
-                        let chrom = if ci < contig_names.len() { contig_names[ci].as_bytes().to_vec() } else { format!("{}", ci).into_bytes() };
-                        let _nf = (u32::from_le_bytes(sb[20..24].try_into().unwrap()) >> 24) as usize;
-                        let mut o = 24usize;
-                        let _id = rtstr(sb, &mut o);
-                        let mut alleles = Vec::with_capacity(na);
-                        for _ in 0..na { alleles.push(rtstr_bytes(sb, &mut o)); }
-                        ds_buf.clear();
-                        return Some((chrom, pos, alleles.first().cloned().unwrap_or_default(), alleles.get(1).cloned().unwrap_or_default()));
+                    } else {
+                        ib.resize(li, 0);
+                        reader.read_exact(ib)?;
                     }
-
-                    ib.resize(li, 0); reader.read_exact(ib).ok()?;
-
-                    let chrom = if ci < contig_names.len() { contig_names[ci].as_bytes().to_vec() } else { format!("{}", ci).into_bytes() };
-
-                    // Parse alleles from shared data
+                    let chrom = if ci < contig_names.len() { contig_names[ci].as_bytes().to_vec() }
+                        else { format!("{ci}").into_bytes() };
                     let nf = (u32::from_le_bytes(sb[20..24].try_into().unwrap()) >> 24) as usize;
                     let mut o = 24usize;
                     let _id = rtstr(sb, &mut o);
-                    let mut alleles = Vec::with_capacity(na);
-                    for _ in 0..na { alleles.push(rtstr_bytes(sb, &mut o)); }
-                    let ref_a = alleles.first().cloned().unwrap_or_default();
-                    let alt_a = alleles.get(1).cloned().unwrap_or_default();
-
-                    // Parse FORMAT fields — look for DS first, fallback to GT
-                    ds_buf.clear();
-                    let mut io2 = 0usize;
-                    let mut found_ds = false;
-                    let mut found_gt = false;
-
-                    for _ in 0..nf {
-                        if io2 >= ib.len() { break; }
-                        let k = rtint(ib, &mut io2) as u16;
-                        if io2 >= ib.len() { break; }
-                        let tb = ib[io2]; io2 += 1;
-                        let tid = tb & 0x0F;
-                        let vl = { let r = (tb >> 4) as usize; if r == 15 { rtint(ib, &mut io2) as usize } else { r } };
-                        let es = match tid { 1=>1, 2=>2, 3=>4, 5=>4, 7=>1, _=>1 };
-                        let fs = vl * es * ns;
-
-                        if dsk == Some(k) && tid == 5 && vl == 1 {
-                            // DS field: float32 per sample (selective if filter set).
-                            // Clear any hardcalls previously pushed by the GT branch —
-                            // DS is authoritative when present.
-                            ds_buf.clear();
-                            for_each_sample(si_filter, ns, |si| {
-                                let off = io2 + si * 4;
-                                // BCF's missing float (0x7F800001) is a NaN: missing, as a
-                                // non-finite value in the text reader.
-                                let d = if off + 4 <= ib.len() { f32::from_le_bytes(ib[off..off+4].try_into().unwrap()) } else { -1.0 };
-                                ds_buf.push(if d.is_finite() { d } else { -1.0 });
-                            });
-                            found_ds = true;
-                            // io2 not advanced past DS field — break exits the field loop
-                            break;
-                        } else if k == gtk && !found_ds {
-                            // GT field: int8 per sample × ploidy (selective if filter set)
-                            let ge = (io2 + fs).min(ib.len());
-                            // A no-call is UNKNOWN, not hom-ref — see the VCF
-                            // reader above. 0x80 is BCF's missing allele and 0x81
-                            // its vector-end (haploid padding); the first means the
-                            // caller did not know, the second means the record is
-                            // haploid, so only the first becomes the -1.0 sentinel.
-                            for_each_sample(si_filter, ns, |si| {
-                                let b = io2 + si * vl * es;
-                                if vl == 1 {
-                                    // Haploid record (a male chrX truth): ONE allele per
-                                    // sample, its ALT count 0/1 as in the VCF reader. Read
-                                    // as two bytes it ran past the field and every haploid
-                                    // call became a no-call.
-                                    let missing = b >= ge || ib[b] == 0x80 || (ib[b] >> 1) == 0;
-                                    ds_buf.push(if missing { -1.0 } else { gt_allele_to_dose(ib[b]) as f32 });
-                                } else if b + 1 < ge {
-                                    if ib[b] == 0x80 || ib[b + 1] == 0x80 {
-                                        ds_buf.push(-1.0);
-                                    } else {
-                                        let a0c = gt_allele_to_dose(ib[b]);
-                                        let a1c = gt_allele_to_dose(ib[b + 1]);
-                                        ds_buf.push(a0c as f32 + a1c as f32);
-                                    }
-                                } else { ds_buf.push(-1.0); }
-                            });
-                            found_gt = true;
-                            io2 += fs;
-                        } else {
-                            io2 += fs;
-                        }
+                    let ref_a = rtstr_bytes(sb, &mut o);
+                    let alt_a = rtstr_bytes(sb, &mut o);
+                    if skip_gt {
+                        ds_buf.clear(); metadata.clear();
+                        return Ok(Some((chrom, pos, ref_a, alt_a)));
                     }
-
-                    let expected_n = if let Some(f) = si_filter { f.len() } else { ns };
-                    if !found_ds && !found_gt {
-                        ds_buf.clear();
-                        ds_buf.resize(expected_n, -1.0);
-                    }
-                    while ds_buf.len() < expected_n { ds_buf.push(-1.0); }
-
-                    return Some((chrom, pos, ref_a, alt_a));
+                    decode_bcf_calls(ib, nf, ns, *gt_key, *ds_key, sample_indices.as_deref(), calls)?;
+                    normalize_row(calls, None, *options, ds_buf, metadata)?;
+                    return Ok(Some((chrom, pos, ref_a, alt_a)));
                 }
             }
         }
     }
 }
 
-/// Decode one BCF int8 GT allele byte into a biallelic ALT indicator (0 or 1).
-///
-/// BCF GT encoding (int8): each allele byte = `(allele + 1) << 1 | phased`, so
-/// `allele = (raw >> 1) - 1` and the low bit is the phase. A missing allele
-/// (`allele = -1`) is byte `0x00`/`0x01` → `(raw>>1)-1` wraps to 255.
-/// The int8 **missing value** `0x80` (-128) and **end-of-vector** pad `0x81`
-/// (-127, used to pad haploid samples in a diploid-ploidy record, e.g. chrX)
-/// are SENTINELS, not alleles: `(0x80>>1)-1 = 63` would otherwise mis-decode to
-/// ALT. All of {missing allele, 0x80, 0x81} fold to 0 (no ALT contribution);
-/// any present ALT (`allele >= 1`, incl. multiallelic) folds to 1.
-#[inline]
-fn gt_allele_to_dose(raw: u8) -> u8 {
-    if raw == 0x80 || raw == 0x81 { return 0; }
-    let a = (raw >> 1).wrapping_sub(1);
-    if a > 127 { 0 } else { a.min(1) }
-}
-
-/// Invoke `f(sample_index)` for each kept sample, in order: the filtered
-/// positions in `si_filter` when present (selective BCF sample extraction),
-/// otherwise every sample `0..ns`. Folds the byte-identical filter/no-filter
-/// branch pairs in the BCF DS and GT extraction loops into one body.
-#[inline]
-fn for_each_sample(si_filter: Option<&[usize]>, ns: usize, mut f: impl FnMut(usize)) {
-    if let Some(indices) = si_filter {
-        for &si in indices { f(si); }
-    } else {
-        for si in 0..ns { f(si); }
+/// Decode both GT and DS regardless of FORMAT order. GT supplies native ploidy
+/// even when DS is authoritative, so a DS-before-GT record must not stop early.
+fn decode_bcf_calls(ib: &[u8], nf: usize, ns: usize, gt_key: u16, ds_key: Option<u16>,
+    indices: Option<&[usize]>, calls: &mut Vec<SampleCall>) -> io::Result<()> {
+    calls.clear();
+    calls.resize(indices.map_or(ns, |v| v.len()), SampleCall::default());
+    let mut offset = 0;
+    for _ in 0..nf {
+        if offset >= ib.len() { return Err(invalid_dosage("truncated BCF FORMAT key")); }
+        let key = rtint(ib, &mut offset) as u16;
+        let tb = *ib.get(offset).ok_or_else(|| invalid_dosage("truncated BCF FORMAT descriptor"))?;
+        offset += 1;
+        let tid = tb & 15;
+        let vl = if tb >> 4 == 15 {
+            let length = rtint(ib, &mut offset);
+            usize::try_from(length).map_err(|_| invalid_dosage("negative BCF FORMAT length"))?
+        } else { (tb >> 4) as usize };
+        let width = match tid { 0 => 0, 1 | 7 => 1, 2 => 2, 3 | 5 => 4, _ => return Err(invalid_dosage("unsupported BCF FORMAT type")) };
+        let stride = vl.checked_mul(width).ok_or_else(|| invalid_dosage("BCF FORMAT length overflow"))?;
+        let len = stride.checked_mul(ns).ok_or_else(|| invalid_dosage("BCF FORMAT length overflow"))?;
+        let end = offset.checked_add(len).filter(|&e| e <= ib.len())
+            .ok_or_else(|| invalid_dosage("truncated BCF FORMAT payload"))?;
+        if ds_key == Some(key) {
+            if tid != 5 || vl != 1 { return Err(invalid_dosage("biallelic FORMAT/DS must be one float per sample")); }
+            for (i, call) in calls.iter_mut().enumerate() {
+                let si = indices.map_or(i, |v| v[i]);
+                if si >= ns { continue; }
+                let start = offset + si * stride;
+                let ds = f32::from_le_bytes(ib[start..start+4].try_into().unwrap());
+                call.ds = Some(if ds.is_finite() { ds } else { -1.0 });
+            }
+        } else if key == gt_key {
+            if !matches!(tid, 1..=3) { return Err(invalid_dosage("FORMAT/GT must use an integer type")); }
+            for (i, call) in calls.iter_mut().enumerate() {
+                let si = indices.map_or(i, |v| v[i]);
+                if si >= ns { continue; }
+                let start = offset + si * stride;
+                call.gt = parse_gt_bcf(&ib[start..start+stride], tid);
+            }
+        }
+        offset = end;
     }
+    Ok(())
 }
 
 // BCF typed-atom parsers shared with srp::bcf_reader + srp::bref3_writer.
@@ -999,6 +1133,14 @@ fn ensure_seek_index(path: &Path) -> io::Result<()> {
 }
 
 pub fn evaluate_parallel(
+    imputed_path: &Path, truth_path: &Path, shared_samples: &[String], n_threads: usize,
+    exclude: &super::exclude::SiteExclusion,
+) -> io::Result<(SiteAccumulator, SampleAccumulator, EvalCounts)> {
+    evaluate_parallel_with_options(imputed_path, truth_path, shared_samples, n_threads,
+        exclude, &EvaluationOptions::default())
+}
+
+fn evaluate_parallel_with_options(
     imputed_path: &Path,
     truth_path: &Path,
     shared_samples: &[String],
@@ -1010,8 +1152,11 @@ pub fn evaluate_parallel(
     // COMPLETE truth callset — which is what `--homref-absent auto` resolves to,
     // and the default — scored the typed sites in silence.
     exclude: &super::exclude::SiteExclusion,
+    options: &EvaluationOptions,
 ) -> io::Result<(SiteAccumulator, SampleAccumulator, EvalCounts)> {
     use rayon::prelude::*;
+
+    options.validate()?;
 
     let n_samples = shared_samples.len();
     let exclude_ref = exclude;
@@ -1058,6 +1203,8 @@ pub fn evaluate_parallel(
                 let (mut truth_reader, _) = VariantReader::open(&truth_path_buf)?;
                 imp_reader.set_sample_filter(imp_reindex.clone());
                 truth_reader.set_sample_filter(truth_reindex.clone());
+                imp_reader.set_dosage_options(options.imputed);
+                truth_reader.set_dosage_options(options.truth);
 
                 // Seek to region start via CSI/TBI index (O(1) instead of scanning)
                 imp_reader.seek_to_position(region_start)?;
@@ -1077,14 +1224,14 @@ pub fn evaluate_parallel(
 
                 // Read first record in region (skip any before region_start from seek imprecision)
                 let mut imp_rec = loop {
-                    let r = imp_reader.next_record(&mut imp_ds_raw);
+                    let r = imp_reader.next_record(&mut imp_ds_raw)?;
                     match &r {
                         Some(rec) if rec.1 < region_start => continue,
                         _ => break r,
                     }
                 };
                 let mut truth_rec = loop {
-                    let r = truth_reader.next_record(&mut truth_ds_raw);
+                    let r = truth_reader.next_record(&mut truth_ds_raw)?;
                     match &r {
                         Some(rec) if rec.1 < region_start => continue,
                         _ => break r,
@@ -1108,10 +1255,10 @@ pub fn evaluate_parallel(
                     let tk = (norm_contig(&truth.0), truth.1);
                     if ik < tk {
                         if imp.1 < region_end { n_imp += 1; }
-                        imp_rec = imp_reader.next_record(&mut imp_ds_raw);
+                        imp_rec = imp_reader.next_record(&mut imp_ds_raw)?;
                     } else if ik > tk {
                         if truth.1 < region_end { n_truth += 1; }
-                        truth_rec = truth_reader.next_record(&mut truth_ds_raw);
+                        truth_rec = truth_reader.next_record(&mut truth_ds_raw)?;
                     } else if imp.1 < region_end {
                         // Same (contig, position), in-region.
                         n_imp += 1;
@@ -1129,20 +1276,16 @@ pub fn evaluate_parallel(
                             if swapped { for si in 0..n_samples { if imp_ds[si] >= 0.0 { imp_ds[si] = 2.0 - imp_ds[si]; } } }
                             truth_ds[..n_samples].copy_from_slice(&truth_ds_raw[..n_samples]);
 
-                            let mut gt_sum = 0.0f64;
-                            let mut gt_n = 0u32;
-                            for s in 0..n_samples {
-                                if truth_ds[s] >= 0.0 { gt_sum += truth_ds[s] as f64; gt_n += 1; }
-                            }
-                            let maf = if gt_n > 0 { let af = gt_sum / (gt_n as f64 * 2.0); af.min(1.0 - af) } else { 0.0 };
+                            let af = truth_af(&truth_ds, truth_reader.metadata())?;
+                            let maf = af.min(1.0 - af);
                             let (r2, conc) = site_r2(&imp_ds, &truth_ds, n_samples);
                             site_acc.add(maf, r2, conc);
                             sample_acc.add_variant(&imp_ds, &truth_ds);
                             n_matched += 1;
                         }
 
-                        imp_rec = imp_reader.next_record(&mut imp_ds_raw);
-                        truth_rec = truth_reader.next_record(&mut truth_ds_raw);
+                        imp_rec = imp_reader.next_record(&mut imp_ds_raw)?;
+                        truth_rec = truth_reader.next_record(&mut truth_ds_raw)?;
                     } else {
                         // Same position, both past region_end.
                         break;
@@ -1156,12 +1299,12 @@ pub fn evaluate_parallel(
                 while let Some(ref rec) = imp_rec {
                     if rec.1 >= region_end { break; }
                     n_imp += 1;
-                    imp_rec = imp_reader.next_record(&mut imp_ds_raw);
+                    imp_rec = imp_reader.next_record(&mut imp_ds_raw)?;
                 }
                 while let Some(ref rec) = truth_rec {
                     if rec.1 >= region_end { break; }
                     n_truth += 1;
-                    truth_rec = truth_reader.next_record(&mut truth_ds_raw);
+                    truth_rec = truth_reader.next_record(&mut truth_ds_raw)?;
                 }
 
                 Ok((site_acc, sample_acc, EvalCounts { n_matched, n_imp_variants: n_imp, n_truth_variants: n_truth, chromosomes: chr_set.into_iter().collect() }))
@@ -1219,8 +1362,17 @@ pub fn evaluate(
     shared_samples: &[String],
     exclude: &super::exclude::SiteExclusion,
 ) -> io::Result<(SiteAccumulator, SampleAccumulator, EvalCounts)> {
+    evaluate_with_options(imputed_path, truth_path, shared_samples, exclude, &EvaluationOptions::default())
+}
+
+/// Evaluate with declared DS units and optional native-ploidy fallbacks.
+/// Concordance uses the existing diploid-equivalent dosage thresholds.
+pub fn evaluate_with_options(
+    imputed_path: &Path, truth_path: &Path, shared_samples: &[String],
+    exclude: &super::exclude::SiteExclusion, options: &EvaluationOptions,
+) -> io::Result<(SiteAccumulator, SampleAccumulator, EvalCounts)> {
     let n_threads = rayon::current_num_threads().max(1);
-    evaluate_parallel(imputed_path, truth_path, shared_samples, n_threads, exclude)
+    evaluate_parallel_with_options(imputed_path, truth_path, shared_samples, n_threads, exclude, options)
 }
 
 /// FNV-1a hash of REF+ALT bytes (for an alloc-free site key).
@@ -1244,7 +1396,7 @@ pub(crate) fn read_site_keys(path: &Path, out: &mut std::collections::HashSet<(u
     let (mut r, _) = VariantReader::open(path)?;
     let mut b: Vec<f32> = Vec::new();
     let mut n = 0usize;
-    while let Some(rec) = r.next_record_inner(&mut b, true) { out.insert(site_key(&rec.0, rec.1, &rec.2, &rec.3)); n += 1; }
+    while let Some(rec) = r.next_record_inner(&mut b, true)? { out.insert(site_key(&rec.0, rec.1, &rec.2, &rec.3)); n += 1; }
     if n == 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
             "{}: no sites read for exclusion (a sites-only VCF needs at least one sample column)", path.display())));
@@ -1260,16 +1412,26 @@ fn shared_reindex(path: &Path, shared: &[String]) -> io::Result<Vec<usize>> {
     Ok(shared.iter().map(|s| *m.get(s.as_str()).expect("shared sample missing from file")).collect())
 }
 
-/// Load a variant-only VCF/BCF into a (contig,pos,ref/alt)→per-shared-sample-dosage map.
-fn load_dosage_map(path: &Path, shared: &[String])
-    -> io::Result<std::collections::HashMap<(u64, i64, u64), Vec<f32>>> {
+#[derive(Clone)]
+struct DosageRow {
+    dosage2: Vec<f32>,
+    metadata: DosageMetadata,
+}
+
+/// Keep original allele-copy metadata alongside normalized dosages, in shared
+/// sample order. Raw truth uses the same declared options as strong truth.
+fn load_dosage_map(path: &Path, shared: &[String], options: InputDosageOptions)
+    -> io::Result<std::collections::HashMap<(u64, i64, u64), DosageRow>> {
     let ri = shared_reindex(path, shared)?;
     let (mut r, _) = VariantReader::open(path)?;
     r.set_sample_filter(ri);
-    let mut buf: Vec<f32> = Vec::new();
+    r.set_dosage_options(options);
+    let mut buf = Vec::new();
     let mut map = std::collections::HashMap::new();
-    while let Some(rec) = r.next_record(&mut buf) {
-        map.insert(site_key(&rec.0, rec.1, &rec.2, &rec.3), buf.clone());
+    while let Some(rec) = r.next_record(&mut buf)? {
+        map.insert(site_key(&rec.0, rec.1, &rec.2, &rec.3), DosageRow {
+            dosage2: buf.clone(), metadata: r.metadata().clone(),
+        });
     }
     Ok(map)
 }
@@ -1303,9 +1465,7 @@ pub fn truth_has_ref_calls(path: &Path) -> io::Result<bool> {
         }
         return Ok(false);
     }
-    // BCF: the dosage decode folds 0/0 and ./. to the same value, and a het's ref
-    // allele is also an explicit ref byte, so distinguishing a complete callset from
-    // a variant-only one needs the raw per-sample GT — not exposed cheaply here. A BCF
+    // This auto-detection path does not scan BCF genotype metadata. A BCF
     // truth is therefore assumed COMPLETE (the safe legacy matched-only path); pass
     // `--homref-absent on` for the rare variant-only BCF truth. (Variant-only truths
     // are almost always VCF.gz, handled exactly above.)
@@ -1317,33 +1477,47 @@ pub fn truth_has_ref_calls(path: &Path) -> io::Result<bool> {
 ///   * if it is in `exclude` (e.g. the chip/typed sites) → drop the site entirely;
 ///   * per shared sample `s`:
 ///       - if `s` carries the variant in the STRONG truth (dosage ≥ 0.5) → truth = strong dosage;
+///       - explicit strong no-call, or raw no-call with no strong record → skip `s`;
 ///       - else if `s` carries it in the RAW (called-but-quality-filtered) truth → skip `s` here;
 ///       - else → truth = 0 (absent-from-truth ⇒ hom-ref).
 /// Splits SNP vs indel and also accumulates the combined total. Truth/raw/exclude are
 /// loaded as (norm-contig,pos,ref/alt-hash) maps (cheap per-chromosome; streams the imputed file).
 pub fn evaluate_imputation(
+    imputed_path: &Path, strong_path: &Path, shared: &[String], raw_path: Option<&Path>,
+    exclude: &super::exclude::SiteExclusion,
+) -> io::Result<(SampleAccumulator, SampleAccumulator, SampleAccumulator, EvalCounts, SiteAccumulator, RawTruthDiag)> {
+    evaluate_imputation_with_options(imputed_path, strong_path, shared, raw_path,
+        exclude, &EvaluationOptions::default())
+}
+
+/// Homref-absent evaluation with declared DS units. Explicit missing truth calls
+/// are excluded; a wholly absent strong record supplies REF calls with unknown
+/// ploidy, for which AF=0 remains exact. Raw truth shares `options.truth`.
+pub fn evaluate_imputation_with_options(
     imputed_path: &Path,
     strong_path: &Path,
     shared: &[String],
     raw_path: Option<&Path>,
     exclude: &super::exclude::SiteExclusion,
+    options: &EvaluationOptions,
 ) -> io::Result<(SampleAccumulator, SampleAccumulator, SampleAccumulator, EvalCounts, SiteAccumulator, RawTruthDiag)> {
+    options.validate()?;
     let n = shared.len();
-    let strong = load_dosage_map(strong_path, shared)?;
-    let raw = match raw_path { Some(p) => Some(load_dosage_map(p, shared)?), None => None };
+    let strong = load_dosage_map(strong_path, shared, options.truth)?;
+    let raw = match raw_path { Some(p) => Some(load_dosage_map(p, shared, options.truth)?), None => None };
 
     let iri = shared_reindex(imputed_path, shared)?;
     let (mut imp, _) = VariantReader::open(imputed_path)?;
     imp.set_sample_filter(iri);
+    imp.set_dosage_options(options.imputed);
 
     let mut comb = SampleAccumulator::new(n);
     let mut snp = SampleAccumulator::new(n);
     let mut indel = SampleAccumulator::new(n);
     // Per-site MAF-binned R², alongside the per-sample accumulators. MAF is
-    // derived from the truth dosages at each scored site, the same convention
-    // the MAF-binned evaluator path uses, so the resolution floor is one allele
-    // copy in the truth cohort (1/(2·n_truth): 0.48% at 105 samples) — bins
-    // below that are structurally empty and reported as such.
+    // derived from the original truth ALT counts and ploidies at each scored
+    // site. Diploid samples retain the existing 1/(2*n_truth) resolution floor;
+    // mixed-ploidy sites use the actual total allele-copy count.
     let mut site = SiteAccumulator::new();
     let mut diag = RawTruthDiag {
         raw_sites_loaded: raw.as_ref().map(|m| m.len() as u64).unwrap_or(0),
@@ -1357,7 +1531,8 @@ pub fn evaluate_imputation(
     };
     let mut ibuf: Vec<f32> = Vec::new();
     let mut truth_ds = vec![0f32; n];
-    while let Some(rec) = imp.next_record(&mut ibuf) {
+    let mut truth_metadata = DosageMetadata { native_alt: vec![0.0; n], ploidy: vec![0; n] };
+    while let Some(rec) = imp.next_record(&mut ibuf)? {
         counts.n_imp_variants += 1;
         let key = site_key(&rec.0, rec.1, &rec.2, &rec.3);
         if exclude.contains(&key) { continue; }
@@ -1367,23 +1542,37 @@ pub fn evaluate_imputation(
         if sv.is_none() { diag.scored_sites_absent_from_strong += 1; }
         if rv.is_some() { diag.scored_sites_matched += 1; }
         for s in 0..n {
-            if let Some(v) = sv
-                && v[s] >= 0.5 { truth_ds[s] = v[s]; continue; }
-            if rv.map(|v| v[s] >= 0.5).unwrap_or(false) {
-                truth_ds[s] = -1.0; // raw-but-not-strong: quality-filtered ⇒ skip this sample here
+            truth_metadata.native_alt[s] = 0.0;
+            truth_metadata.ploidy[s] = sv.map(|v| v.metadata.ploidy[s]).unwrap_or(0);
+            if let Some(v) = sv {
+                if v.dosage2[s] < 0.0 {
+                    // An explicit no-call remains unknown, including in homref-absent mode.
+                    truth_ds[s] = -1.0;
+                    continue;
+                }
+                if v.dosage2[s] >= 0.5 {
+                    truth_ds[s] = v.dosage2[s];
+                    truth_metadata.native_alt[s] = v.metadata.native_alt[s];
+                    continue;
+                }
+            }
+            if sv.is_none() && rv.map(|v| v.dosage2[s] < 0.0).unwrap_or(false) {
+                // Raw explicitly does not know; an absent strong record cannot
+                // turn that no-call into evidence for REF. A valid strong REF
+                // call, conversely, is not invalidated by a raw no-call.
+                truth_ds[s] = -1.0;
+                diag.genotypes_missing_raw += 1;
+            } else if rv.map(|v| v.dosage2[s] >= 0.5).unwrap_or(false) {
+                truth_ds[s] = -1.0;
                 diag.genotypes_rescued += 1;
             } else {
-                truth_ds[s] = 0.0; // absent from truth ⇒ hom-ref
+                truth_ds[s] = 0.0;
             }
         }
         comb.add_variant(&ibuf, &truth_ds);
         if is_snp { snp.add_variant(&ibuf, &truth_ds); } else { indel.add_variant(&ibuf, &truth_ds); }
-        let mut gt_sum = 0.0f64;
-        let mut gt_n = 0u32;
-        for s in 0..n {
-            if truth_ds[s] >= 0.0 { gt_sum += truth_ds[s] as f64; gt_n += 1; }
-        }
-        let maf = if gt_n > 0 { let af = gt_sum / (gt_n as f64 * 2.0); af.min(1.0 - af) } else { 0.0 };
+        let af = truth_af(&truth_ds, &truth_metadata)?;
+        let maf = af.min(1.0 - af);
         let (r2, conc) = site_r2(&ibuf, &truth_ds, n);
         site.add(maf, r2, conc);
         counts.n_matched += 1;
@@ -1398,6 +1587,10 @@ pub fn print_raw_truth_diag(d: &RawTruthDiag) {
     crate::selphi_info!("\n  --truth-raw: {} raw site(s) loaded; {} scored site(s) matched by key; \
 {} site(s) absent from the filtered truth; {} genotype(s) rescued from hom-ref scoring",
         d.raw_sites_loaded, d.scored_sites_matched, d.scored_sites_absent_from_strong, d.genotypes_rescued);
+    if d.genotypes_missing_raw > 0 {
+        crate::selphi_info!("  --truth-raw: {} raw no-call(s) excluded at sites absent from the filtered truth",
+            d.genotypes_missing_raw);
+    }
     if d.scored_sites_matched == 0 {
         crate::selphi_info!("  --truth-raw: NO scored site matched the raw truth by (contig, pos, REF, ALT) — \
 the raw file does not overlap the scored sites (check it covers this region and shares the panel's allele representation)");
@@ -1458,10 +1651,13 @@ pub fn print_summary(site_acc: &SiteAccumulator, sample_acc: &SampleAccumulator,
     let sample_r2 = sample_acc.compute_r2();
     let sample_conc = sample_acc.compute_concordance();
     if !sample_r2.is_empty() {
-        let mean_r2: f64 = sample_r2.iter().sum::<f64>() / sample_r2.len() as f64;
-        let min_r2 = sample_r2.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max_r2 = sample_r2.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let mean_conc: f64 = sample_conc.iter().sum::<f64>() / sample_conc.len() as f64;
+        let finite: Vec<f64> = sample_r2.iter().copied().filter(|v| v.is_finite()).collect();
+        let mean_r2 = mean_sample_r2(sample_acc).0;
+        let min_r2 = finite.iter().copied().reduce(f64::min).unwrap_or(f64::NAN);
+        let max_r2 = finite.iter().copied().reduce(f64::max).unwrap_or(f64::NAN);
+        let called: Vec<f64> = sample_conc.iter().copied().filter(|v| v.is_finite()).collect();
+        let mean_conc = if called.is_empty() { f64::NAN }
+            else { called.iter().sum::<f64>() / called.len() as f64 };
         crate::selphi_info!("\nPer-sample (n={}):", sample_acc.n_samples);
         crate::selphi_info!("  R²:          mean={}, min={:.6}, max={:.6}", crate::log::cyan(&format!("{:.6}", mean_r2)), min_r2, max_r2);
         crate::selphi_info!("  Concordance: mean={:.6}", mean_conc);
@@ -1488,8 +1684,8 @@ likely cover different chromosomes (check that both span the same contig set; ch
 /// Mean per-sample R² over an accumulator (the imputation-R² headline).
 fn mean_sample_r2(acc: &SampleAccumulator) -> (f64, usize) {
     let r2 = acc.compute_r2();
-    let used: Vec<f64> = (0..acc.n_samples).filter(|&s| acc.n_total[s] >= 2).map(|s| r2[s]).collect();
-    if used.is_empty() { (0.0, 0) } else { (used.iter().sum::<f64>() / used.len() as f64, used.len()) }
+    let used: Vec<f64> = r2.into_iter().filter(|r| r.is_finite()).collect();
+    if used.is_empty() { (f64::NAN, 0) } else { (used.iter().sum::<f64>() / used.len() as f64, used.len()) }
 }
 
 /// Print the standard imputation-R² summary (combined always; SNP/indel when `by_type`).
@@ -1544,6 +1740,9 @@ pub fn write_imputation_json(
         let per: serde_json::Map<String, serde_json::Value> = names.iter().enumerate()
             .map(|(i, nm)| (nm.clone(), serde_json::json!(round6(r2[i])))).collect();
         map.insert("per_sample_combined_r2".into(), serde_json::Value::Object(per));
+        let scored: serde_json::Map<String, serde_json::Value> = names.iter().enumerate()
+            .map(|(i, nm)| (nm.clone(), serde_json::json!(comb.n_total[i]))).collect();
+        map.insert("per_sample_n_scored".into(), serde_json::Value::Object(scored));
     }
     if let Some(d) = raw_diag.filter(|d| d.raw_sites_loaded > 0) {
         let mut m = serde_json::Map::new();
@@ -1551,6 +1750,7 @@ pub fn write_imputation_json(
         m.insert("scored_sites_matched".into(), serde_json::json!(d.scored_sites_matched));
         m.insert("scored_sites_absent_from_strong".into(), serde_json::json!(d.scored_sites_absent_from_strong));
         m.insert("genotypes_rescued".into(), serde_json::json!(d.genotypes_rescued));
+        m.insert("genotypes_missing_raw".into(), serde_json::json!(d.genotypes_missing_raw));
         map.insert("truth_raw_diag".into(), serde_json::Value::Object(m));
     }
     // Per-MAF-bin site R², under `maf_bins` so the top-level keys above stay
@@ -1652,27 +1852,340 @@ pub fn write_json_summary(
     Ok(())
 }
 
+
 #[cfg(test)]
 mod tests {
-    use super::gt_allele_to_dose;
+    use super::*;
+    use std::io::Write;
+
+    fn text_row(format: &str, samples: &[&str], n: usize, indices: Option<&[usize]>,
+        options: InputDosageOptions) -> io::Result<(Vec<f32>, DosageMetadata)> {
+        let line = format!("X\t100\t.\tA\tG\t.\tPASS\t.\t{format}\t{}\n", samples.join("\t"));
+        let mut doses = Vec::new();
+        let mut metadata = DosageMetadata::default();
+        assert!(parse_vcf_record(line.as_bytes(), n, indices, options, &mut doses,
+            &mut metadata, &mut Vec::new(), false)?.is_some());
+        Ok((doses, metadata))
+    }
+
+    fn native() -> InputDosageOptions { InputDosageOptions::default() }
+    fn diploid() -> InputDosageOptions {
+        InputDosageOptions { ds_scale: DsScale::Diploid, fallback_ploidy: None }
+    }
 
     #[test]
-    fn bcf_gt_allele_decode_covers_sentinels() {
-        // Encoding: allele byte = (allele+1)<<1 | phased. Low bit = phase.
-        // REF (allele 0): 0x02 unphased, 0x03 phased -> dose 0.
-        assert_eq!(gt_allele_to_dose(0x02), 0);
-        assert_eq!(gt_allele_to_dose(0x03), 0);
-        // ALT (allele 1): 0x04 unphased, 0x05 phased -> dose 1.
-        assert_eq!(gt_allele_to_dose(0x04), 1);
-        assert_eq!(gt_allele_to_dose(0x05), 1);
-        // Multiallelic ALT (allele 2): 0x06 -> folds to 1 (biallelic indicator).
-        assert_eq!(gt_allele_to_dose(0x06), 1);
-        // Missing allele (allele -1): byte 0x00/0x01 -> dose 0.
-        assert_eq!(gt_allele_to_dose(0x00), 0);
-        assert_eq!(gt_allele_to_dose(0x01), 0);
-        // THE BUG: int8 missing sentinel 0x80 and end-of-vector pad 0x81 must
-        // fold to 0, NOT decode to allele (0x80>>1)-1 = 63 -> 1.
-        assert_eq!(gt_allele_to_dose(0x80), 0);
-        assert_eq!(gt_allele_to_dose(0x81), 0);
+    fn native_gt_normalizes_mixed_ploidy_and_preserves_missingness() {
+        let (d, m) = text_row("GT", &["0", "1", "0/0", "0|1", "1/1", "./1", "./.", ".", "0/1/1"], 9, None, native()).unwrap();
+        assert_eq!(&d[..8], &[0.0, 2.0, 0.0, 1.0, 2.0, -1.0, -1.0, -1.0]);
+        assert_eq!(d[8], 4.0 / 3.0);
+        assert_eq!(m.ploidy, vec![1, 1, 2, 2, 2, 2, 2, 0, 3]);
+        assert_eq!(&m.native_alt[..5], &[0.0, 1.0, 0.0, 1.0, 2.0]);
     }
+
+    #[test]
+    fn absent_vcf_fields_are_missing_and_metadata_reindexes_with_dosage() {
+        let (d, m) = text_row("GT", &["1"], 3, None, native()).unwrap();
+        assert_eq!(d, vec![2.0, -1.0, -1.0]);
+        assert_eq!(m.ploidy, vec![1, 0, 0]);
+        let (d, m) = text_row("GT", &["1", ".", "0/1"], 3, Some(&[2, 0]), native()).unwrap();
+        assert_eq!(d, vec![1.0, 2.0]);
+        assert_eq!(m.ploidy, vec![2, 1]);
+        let (d, _) = text_row("DP:GT", &["9", "9:"], 2, None, native()).unwrap();
+        assert_eq!(d, vec![-1.0, -1.0]);
+        let (d, _) = text_row("DP", &["9"], 1, None, native()).unwrap();
+        assert_eq!(d, vec![-1.0]);
+    }
+
+    #[test]
+    fn ds_is_authoritative_in_both_vcf_format_orders() {
+        let (a, am) = text_row("DS:GT", &["1:1", "0.5:0/1", ".:1/1", "0.25:./."], 4, None, native()).unwrap();
+        let (b, bm) = text_row("GT:DS", &["1:1", "0/1:0.5", "1/1:.", "./.:0.25"], 4, None, native()).unwrap();
+        assert_eq!(a, vec![2.0, 0.5, -1.0, 0.25]);
+        assert_eq!(a, b);
+        assert_eq!(am.native_alt, bm.native_alt);
+        assert_eq!(am.ploidy, vec![1, 2, 2, 2]);
+        assert_eq!(truth_af(&a, &am).unwrap(), 1.75 / 5.0);
+    }
+
+    #[test]
+    fn native_ds_requires_known_ploidy_or_an_explicit_fallback() {
+        assert!(text_row("DS", &["1"], 1, None, native()).is_err());
+        assert!(text_row("GT:DS", &[".:1"], 1, None, native()).is_err());
+        let opts = InputDosageOptions { fallback_ploidy: Some(1), ..native() };
+        let (d, m) = text_row("DS", &["1"], 1, None, opts).unwrap();
+        assert_eq!(d, vec![2.0]);
+        assert_eq!(m.ploidy, vec![1]);
+        let (d, m) = text_row("GT:DS", &["./.:1"], 1, None, opts).unwrap();
+        assert_eq!(d, vec![1.0]);
+        assert_eq!(m.ploidy, vec![2]); // fallback never overrides known GT ploidy
+        assert!(text_row("GT:DS", &["1:2"], 1, None, native()).is_err());
+        assert!(InputDosageOptions { fallback_ploidy: Some(0), ..native() }.validate().is_err());
+    }
+
+    #[test]
+    fn ds_missing_and_nonfinite_do_not_require_ploidy_or_fall_back_to_gt() {
+        let (d, _) = text_row("GT:DS", &["1:.", "1/1:nan", "1/1:inf", ".:."], 4, None, native()).unwrap();
+        assert_eq!(d, vec![-1.0; 4]);
+        // Unknown ploidy in a non-shared sample cannot reject a selected valid sample.
+        let (d, _) = text_row("GT:DS", &[".:1", "0/1:0.75"], 2, Some(&[1]), native()).unwrap();
+        assert_eq!(d, vec![0.75]);
+    }
+
+    #[test]
+    fn diploid_ds_units_do_not_invent_native_ploidy_for_truth_af() {
+        let (d, m) = text_row("DS", &["0", "1"], 2, None, diploid()).unwrap();
+        assert_eq!(d, vec![0.0, 1.0]);
+        assert_eq!(m.ploidy, vec![0, 0]);
+        assert!(truth_af(&d, &m).is_err());
+        let (d, m) = text_row("GT:DS", &[".:0", "0/1:1"], 2, None, diploid()).unwrap();
+        assert!(truth_af(&d, &m).is_err()); // unknown REF P also affects denominator
+        let (d, m) = text_row("DS", &["0", "0"], 2, None, diploid()).unwrap();
+        assert_eq!(truth_af(&d, &m).unwrap(), 0.0);
+        let opts = InputDosageOptions { fallback_ploidy: Some(2), ..diploid() };
+        let (d, m) = text_row("DS", &["0", "1"], 2, None, opts).unwrap();
+        assert_eq!(truth_af(&d, &m).unwrap(), 0.25);
+    }
+
+    #[test]
+    fn truth_ds_disagreement_with_gt_uses_expected_alt_count_consistently() {
+        let (d, m) = text_row("GT:DS", &["0/0:1.25", "1/1:0.25"], 2, None, native()).unwrap();
+        assert_eq!(truth_af(&d, &m).unwrap(), 1.5 / 4.0);
+        let (d, m) = text_row("GT:DS", &["0:1", "0/0:0"], 2, None, diploid()).unwrap();
+        assert_eq!(d, vec![1.0, 0.0]);
+        assert_eq!(truth_af(&d, &m).unwrap(), 0.5 / 3.0);
+    }
+
+    fn integers(tid: u8, values: &[i32]) -> Vec<u8> {
+        values.iter().flat_map(|&v| match tid {
+            1 => vec![v as i8 as u8],
+            2 => (v as i16).to_le_bytes().to_vec(),
+            _ => v.to_le_bytes().to_vec(),
+        }).collect()
+    }
+
+    #[test]
+    fn bcf_gt_int8_int16_int32_vector_ends_and_missing_are_per_sample() {
+        for tid in 1..=3 {
+            let missing = match tid { 1 => i8::MIN as i32, 2 => i16::MIN as i32, _ => i32::MIN };
+            let eov = missing + 1;
+            for (values, alt, p) in [
+                (vec![4, eov], Some(1), Some(1)),
+                (vec![2, 5], Some(1), Some(2)),
+                (vec![5, 5], Some(2), Some(2)),
+                (vec![0, 4], None, Some(2)),
+                (vec![1, 4], None, Some(2)),
+                (vec![missing, 4], None, Some(2)),
+                (vec![0, eov], None, None),
+                (vec![0, 0], None, Some(2)),
+                (vec![eov, eov], None, None),
+            ] {
+                let call = parse_gt_bcf(&integers(tid, &values), tid);
+                assert_eq!((call.alt_count, call.ploidy), (alt, p), "tid={tid} raw={values:?}");
+            }
+        }
+    }
+
+    fn bcf_fields(gt_first: bool, tid: u8) -> Vec<u8> {
+        let end = match tid { 1 => i8::MIN as i32 + 1, 2 => i16::MIN as i32 + 1, _ => i32::MIN + 1 };
+        // key GT=1, stride=2; sample0 haploid, sample1 missing diploid, sample2 diploid REF.
+        let mut gt = vec![0x11, 1, 0x20 | tid];
+        gt.extend(integers(tid, &[4, end, 0, 0, 2, 2]));
+        let mut ds = vec![0x11, 2, 0x15];
+        for d in [1.0f32, f32::NAN, 0.5] { ds.extend(d.to_le_bytes()); }
+        if gt_first { gt.extend(ds); gt } else { ds.extend(gt); ds }
+    }
+
+    #[test]
+    fn bcf_ds_before_gt_and_selective_reindex_preserve_units_and_missing() {
+        for tid in 1..=3 {
+            for gt_first in [false, true] {
+                let mut calls = Vec::new();
+                decode_bcf_calls(&bcf_fields(gt_first, tid), 2, 3, 1, Some(2), Some(&[2, 0, 1]), &mut calls).unwrap();
+                let (mut d, mut m) = (Vec::new(), DosageMetadata::default());
+                normalize_row(&calls, None, native(), &mut d, &mut m).unwrap();
+                assert_eq!(d, vec![0.5, 2.0, -1.0]);
+                assert_eq!(m.ploidy, vec![2, 1, 2]);
+                assert_eq!(m.native_alt, vec![0.5, 1.0, 0.0]);
+            }
+        }
+        let mut truncated = bcf_fields(false, 2);
+        truncated.pop();
+        assert!(decode_bcf_calls(&truncated, 2, 3, 1, Some(2), None, &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn mixed_ploidy_af_and_metrics_use_distinct_units() {
+        let (truth, metadata) = text_row("GT", &["1", "0/0"], 2, None, native()).unwrap();
+        assert_eq!(truth_af(&truth, &metadata).unwrap(), 1.0 / 3.0);
+        let (r2, concordance) = site_r2(&[2.0, 0.0], &truth, 2);
+        assert_eq!((r2, concordance), (1.0, 1.0));
+        let mut bins = SiteAccumulator::new();
+        bins.add(truth_af(&truth, &metadata).unwrap(), r2, concordance);
+        assert_eq!(bins.bin_n[8], 1);
+        let mut sample = SampleAccumulator::new(1);
+        for (gt, pred) in [("1/1", 2.0), ("0/0", 0.0), ("1", 2.0)] {
+            let (d, _) = text_row("GT", &[gt], 1, None, native()).unwrap();
+            sample.add_variant(&[pred], &d);
+        }
+        assert_eq!(sample.compute_r2(), vec![1.0]);
+    }
+
+    #[test]
+    fn ref_alt_swap_applies_after_normalizing_haploid_dosage() {
+        let (mut predicted, _) = text_row("GT", &["1", "0/0"], 2, None, native()).unwrap();
+        let (matched, swapped) = match_alleles(b"G", b"A", b"A", b"G");
+        assert!(matched && swapped);
+        for d in &mut predicted { if *d >= 0.0 { *d = 2.0 - *d; } }
+        assert_eq!(predicted, vec![0.0, 2.0]);
+        assert_eq!(site_r2(&predicted, &[0.0, 2.0], 2), (1.0, 1.0));
+    }
+
+    #[test]
+    fn valid_diploid_dosages_and_accumulation_remain_bit_identical() {
+        let cases = [("0/0", 0.0f32), ("0/1", 0.1234567), ("1/1", 2.0), ("0/1", 0.5), ("0/0", 1.234567)];
+        let mut legacy = SampleAccumulator::new(1);
+        let mut normalized = SampleAccumulator::new(1);
+        for (gt, ds) in cases {
+            let text = format!("{gt}:{ds}");
+            let (d, m) = text_row("GT:DS", &[&text], 1, None, native()).unwrap();
+            assert_eq!(d[0].to_bits(), ds.to_bits());
+            assert_eq!(m.native_alt[0].to_bits(), (ds as f64).to_bits());
+            let gt_count = match gt { "0/0" => 0.0, "0/1" => 1.0, _ => 2.0 };
+            legacy.add_variant(&[ds], &[gt_count]);
+            let (truth, _) = text_row("GT", &[gt], 1, None, native()).unwrap();
+            normalized.add_variant(&d, &truth);
+        }
+        assert_eq!(legacy.sum_ds, normalized.sum_ds);
+        assert_eq!(legacy.sum_gt, normalized.sum_gt);
+        assert_eq!(legacy.sum_ds_gt, normalized.sum_ds_gt);
+        assert_eq!(legacy.n_correct, normalized.n_correct);
+        assert_eq!(legacy.compute_r2()[0].to_bits(), normalized.compute_r2()[0].to_bits());
+    }
+
+    fn fixture(dir: &Path, name: &str, samples: &[&str], rows: &[(&str, &[&str])]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let mut writer = noodles_bgzf::io::Writer::new(std::fs::File::create(&path).unwrap());
+        writeln!(writer, "##fileformat=VCFv4.2\n##contig=<ID=X,length=10000>\n##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n##FORMAT=<ID=DS,Number=1,Type=Float,Description=\"Dosage\">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{}", samples.join("\t")).unwrap();
+        for (i, (format, values)) in rows.iter().enumerate() {
+            writeln!(writer, "X\t{}\t.\tA\tG\t.\tPASS\t.\t{}\t{}", (i + 1) * 100, format, values.join("\t")).unwrap();
+        }
+        writer.try_finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn public_homref_evaluation_preserves_explicit_missing_and_native_af() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples = vec!["A".to_string(), "B".to_string()];
+        let imp = fixture(dir.path(), "imp.vcf.gz", &["B", "A"], &[
+            ("GT:DS", &["0/0:0", "1/1:2"]),
+            ("GT:DS", &["1/1:2", "0/0:0"]),
+            ("GT:DS", &["0/1:1", "1/1:2"]),
+            ("GT:DS", &["0/0:0", "1/1:2"]),
+        ]);
+        let strong = fixture(dir.path(), "strong.vcf.gz", &["A", "B"], &[
+            ("GT", &["1", "0/0"]), ("GT", &["0", "1/1"]), ("GT", &[".", "0/1"]),
+        ]);
+        let raw = fixture(dir.path(), "raw.vcf.gz", &["A", "B"], &[
+            ("GT", &["1", "0/0"]), ("GT", &["0", "1/1"]), ("GT", &["1", "0/1"]), ("GT", &["1", "0/0"]),
+        ]);
+        let (acc, _, _, counts, site, diag) = evaluate_imputation(&imp, &strong, &samples, Some(&raw), &super::super::exclude::SiteExclusion::default()).unwrap();
+        assert_eq!(counts.n_matched, 4);
+        assert_eq!(acc.n_total, vec![2, 4]);
+        assert_eq!(acc.compute_r2(), vec![1.0, 1.0]);
+        assert_eq!(site.bin_n[8], 2);
+        assert_eq!(diag.genotypes_rescued, 1); // explicit strong no-call is not a raw rescue
+        assert_eq!(diag.scored_sites_absent_from_strong, 1);
+    }
+
+    #[test]
+    fn homref_subthreshold_truth_ds_has_zero_alt_in_af() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = vec!["A".to_string(), "B".to_string()];
+        let strong = fixture(dir.path(), "strong.vcf.gz", &["A", "B"], &[("GT:DS", &["0/0:0.2", "0/1:0.65"])]);
+        let imp = fixture(dir.path(), "imp.vcf.gz", &["A", "B"], &[("GT:DS", &["0/0:0", "0/1:0.65"])]);
+        let (_, _, _, _, site, _) = evaluate_imputation(&imp, &strong, &names, None, &super::super::exclude::SiteExclusion::default()).unwrap();
+        assert_eq!(site.bin_n[7], 1); // AF = 0.65 / 4, not (0.2 + 0.65) / 4
+        assert_eq!(site.bin_n[8], 0);
+    }
+
+    #[test]
+    fn reader_reports_unknown_native_ds_instead_of_silently_ending_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture(dir.path(), "unknown.vcf.gz", &["A"], &[("DS", &["1"])]);
+        let (mut reader, _) = VariantReader::open(&path).unwrap();
+        let error = reader.next_record(&mut Vec::new()).unwrap_err().to_string();
+        assert!(error.contains("unknown.vcf.gz") && error.contains("ploidy"));
+        // Exclusion scans do not need DS units or GT metadata.
+        let mut keys = std::collections::HashSet::new();
+        assert_eq!(read_site_keys(&path, &mut keys).unwrap(), 1);
+    }
+
+    #[test]
+    fn all_undefined_and_empty_sample_means_remain_null_in_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = vec!["A".to_string()];
+        let truth = fixture(dir.path(), "empty.vcf.gz", &["A"], &[]);
+        let imp = fixture(dir.path(), "imp.vcf.gz", &["A"], &[("GT", &["0/0"]), ("GT", &["1/1"])]);
+        let (acc, snp, indel, counts, site, diag) = evaluate_imputation(&imp, &truth, &names, None, &super::super::exclude::SiteExclusion::default()).unwrap();
+        assert_eq!(acc.n_total, vec![2]);
+        assert!(mean_sample_r2(&acc).0.is_nan());
+        assert_eq!(mean_sample_r2(&acc).1, 0);
+        assert_eq!(site.total_r2_n, 0);
+        let json_path = dir.path().join("summary.json");
+        write_imputation_json(&json_path, &acc, &snp, &indel, true, &counts, Some(&names), Some(&site), Some(&diag)).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&std::fs::read(json_path).unwrap()).unwrap();
+        assert!(json["combined_mean_r2"].is_null());
+        assert!(json["per_sample_combined_r2"]["A"].is_null());
+        assert_eq!(json["per_sample_n_scored"]["A"], 2);
+        assert_eq!(json["n_samples"], 0);
+        let empty = SampleAccumulator::new(0);
+        assert!(mean_sample_r2(&empty).0.is_nan());
+        assert_eq!(mean_sample_r2(&empty).1, 0);
+    }
+
+    #[test]
+    fn mean_sample_r2_excludes_undefined_samples_with_many_scored_sites() {
+        let mut acc = SampleAccumulator::new(2);
+        acc.add_variant(&[0.0, 0.0], &[0.0, 0.0]);
+        acc.add_variant(&[2.0, 2.0], &[2.0, 0.0]);
+        assert_eq!(mean_sample_r2(&acc), (1.0, 1));
+    }
+
+    #[test]
+    fn invalid_biallelic_gt_has_unknown_ploidy_in_vcf_and_bcf() {
+        for gt in [b"2".as_slice(), b"0/2", b"0//1", b"x"] {
+            let call = parse_gt_text(gt);
+            assert!(call.alt_count.is_none() && call.ploidy.is_none());
+        }
+        for tid in 1..=3 {
+            for values in [&[6][..], &[2, 6][..]] {
+                let call = parse_gt_bcf(&integers(tid, values), tid);
+                assert!(call.alt_count.is_none() && call.ploidy.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn raw_no_call_is_not_homref_unless_strong_has_valid_ref_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = vec!["A".to_string(), "B".to_string()];
+        let strong = fixture(dir.path(), "strong.vcf.gz", &["A", "B"], &[
+            ("GT", &["0/0", "0/0"]), ("GT", &[".", "./."]),
+        ]);
+        let raw = fixture(dir.path(), "raw.vcf.gz", &["A", "B"], &[
+            ("GT:DS", &[".:.", "0/0:."]), ("GT:DS", &["0/0:0", "0/0:0"]),
+            ("GT:DS", &[".:.", "0/0:."]), ("GT:DS", &["0/0:0", "0/0:0"]),
+        ]);
+        let imp = fixture(dir.path(), "imp.vcf.gz", &["A", "B"], &[
+            ("GT", &["0/0", "0/0"]), ("GT", &["0/0", "0/0"]),
+            ("GT", &["0/0", "0/0"]), ("GT", &["0/0", "0/0"]),
+        ]);
+        let (acc, _, _, _, _, diag) = evaluate_imputation(&imp, &strong, &names,
+            Some(&raw), &super::super::exclude::SiteExclusion::default()).unwrap();
+        assert_eq!(acc.n_total, vec![2, 2]); // strong REF at 100 and absent/known raw REF at 400
+        assert_eq!(diag.genotypes_missing_raw, 2); // 300 only; strong missing at 200 excluded separately
+        assert_eq!(diag.genotypes_rescued, 0);
+    }
+
 }

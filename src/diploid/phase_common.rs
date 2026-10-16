@@ -157,6 +157,38 @@ fn wgs_density_threshold() -> f64 {
     crate::config::f64_or("SELPHI_AUTOROUTE_WGS_DENSITY", 1000.0)
 }
 
+/// Reference panels from this many haplotypes up get a deeper conditioning set.
+const LARGE_PANEL_HAPS: usize = 20_000;
+/// Up to this many target samples a large panel uses depth 16, above it 8.
+const FEW_TARGETS: usize = 50;
+
+/// PBWT neighbours taken per target haplotype at each selection point (the
+/// conditioning set is their union over a window).
+///
+/// `auto_pbwt_depth` is a COHORT rule: it shrinks the depth as the number of
+/// individuals grows (9 - log10 N), and N counts the reference too, so one target
+/// against the 75,552-haplotype v3 panel got depth 4 -- the four nearest neighbours,
+/// which on a panel that size are mostly copies of one another. Measured:
+///  - one chip sample at a time, v3 chr22 minus the 162 members of the 54 1000G
+///    trio families, switch error against the parents (mean per trio): depth 4
+///    3.818 %, 16 3.517 % (-0.30 pp, 95% CI [-0.46, -0.14]), 32 3.568 %; Beagle 5.4
+///    3.692 %. Six consumer arrays vs their WGS phased three ways agree (16 best,
+///    8 halfway, 24/32 no better).
+///  - MESA 100 x TOPMed (171,054 haplotypes): overall R2 .6612 -> .6637 (8) /
+///    .6643 (16), every MAF bin up, phasing 21 s -> 23 s (8) / 100 s (16).
+///  - panels of 1000G size (3,400-4,800 haplotypes): 20 single samples, the
+///    801-sample array cohort and the 54 WGS children jointly are flat at 8 or 16
+///    (the WGS trios +0.005-0.007 pp worse), so they keep the cohort rule.
+/// `SELPHI_PHASE_PBWT_DEPTH` pins the depth; `SELPHI_PHASE_DEPTH_OLD=1` restores the
+/// cohort rule everywhere (A/B).
+fn conditioning_depth(n_ref_haps: usize, n_samples: usize, n_individuals: usize) -> usize {
+    if let Some(d) = crate::config::usize_opt("SELPHI_PHASE_PBWT_DEPTH") { return d.max(1); }
+    if n_ref_haps < LARGE_PANEL_HAPS || crate::config::is_one("SELPHI_PHASE_DEPTH_OLD") {
+        return auto_pbwt_depth(n_individuals);
+    }
+    if n_samples <= FEW_TARGETS { 16 } else { 8 }
+}
+
 /// Run phase_common on all samples.
 /// Memory-efficient entry: target_haps (small) + ref bitmatrix (compact).
 /// Builds combined bitmatrices directly without 8GB intermediate flat array.
@@ -197,7 +229,7 @@ pub fn run_phase_common_bm(
     let stages = expand_scheme(&parse_mcmc_scheme(scheme));
     let n_iterations = stages.len();
     let n_individuals = n_haps_total / 2;
-    let depth = auto_pbwt_depth(n_individuals);
+    let depth = conditioning_depth(n_ref, n_samples, n_individuals);
     let modulo = auto_pbwt_modulo(n_individuals);
 
     // Allele counts from bitmatrix popcount (all haplotypes)

@@ -281,7 +281,7 @@ fn parse_pl_bcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Result<P
         } else {
             (ref_allele.clone(), alt_allele.clone())
         };
-        markers.push(TargetMarker { chrom, pos, ref_allele, alt_allele, ref_hash, alt_hash, id: String::new() });
+        markers.push(TargetMarker { chrom, pos, ref_allele, alt_allele, ref_hash, alt_hash, id: String::new(), unphased_het: false });
         n_variants_seen += 1;
 
         let gl_off = gl3.len();
@@ -422,7 +422,7 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
         };
         markers.push(TargetMarker {
             chrom, pos, ref_allele, alt_allele, ref_hash, alt_hash,
-            id: String::new(),
+            id: String::new(), unphased_het: false,
         });
         n_variants_seen += 1;
 

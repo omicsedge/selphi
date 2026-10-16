@@ -42,8 +42,8 @@ pub fn setup_pgen_batch_writers(
         writers.push(PgenBatchWriter {
             pgen,
             pvar,
-            pgen_path: path.with_extension("pgen"),
-            pvar_path: path.with_extension("pvar"),
+            pgen_path: crate::common::utils::out_path(&path, "pgen"),
+            pvar_path: crate::common::utils::out_path(&path, "pvar"),
             hap_start: r.hap_start, hap_end: r.hap_end,
         });
         Ok::<(), std::io::Error>(())
