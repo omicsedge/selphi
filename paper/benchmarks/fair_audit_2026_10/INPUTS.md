@@ -42,7 +42,7 @@ missing input with `aws s3 cp` (or `aws s3 sync`) from the S3 column to the loca
 
 | Input | Local | S3 | Check |
 |---|---|---|---|
-| v3 panel (75,552 haps) SRP + bref3 | `/data/projects/wgs_imputation_benchmark/panel/{srp/chrN_v3.srp,bref3/chrN.v3.bref3}` | `$S3/04_prodarray/panel/` | chr21 2,582,259 variants; no monomorphic sites |
+| v3 panel (75,552 haps) SRP + bref3 | `/data/projects/wgs_imputation_benchmark/panel/{srp/chrN_v3.srp,bref3/chrN.v3.bref3}` | `$S3/04_prodarray/panel/` | chr21 2,582,753 variants (alleles of 255 bp or more included, so the SRPs carry the long-allele signature and need this release to read); no monomorphic sites |
 | Chip cohort (6 people) | `/data/projects/wgs_imputation_benchmark/chip_vcf/cohort.chip.vcf.gz` (also `/data/tmp/prodarray2/`) | `$S3/04_prodarray/chip_vcf/` | |
 | Truth (strong and raw), renamed to the array IDs | `/data/tmp/prodarray2/truth/<p>.{strong,raw}.named.bcf` | `$S3/04_prodarray/truth_strong/`, `$S3/04_prodarray/truth/`, rename with `$S3/10_fair_audit_inputs/prodarray_truth_names/<p>.name` (`bcftools reheader -s`) | 162,741,172 SNP site-sample pairs scored |
 | Maps | `/data/tmp/prodarray2/maps/plink.chrN.GRCh38.map` | `$S3/10_fair_audit_inputs/prodarray_maps/` | |
