@@ -1375,6 +1375,9 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // Run-level imputation-quality accumulator (mean DR2 over imputed sites).
     let mut dr2_acc = selphi::io::dosage_stats::Dr2Summary::default();
 
+    // The output's interpolation coordinate per chip site (ImputeWindowInputs::interp_x).
+    let interp_x: Vec<f64> = wgs_idx.iter()
+        .map(|&wi| interp_cum_cm.as_ref().map_or(wi as f64, |c| c[wi])).collect();
     for (wi, window) in windows.iter().enumerate() {
         let t0_win = Instant::now();
         let cpu0_win = selphi::log::cpu_time_secs();
@@ -1492,6 +1495,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
             n_samples,
             chip_start: window.chip_start,
             chip_end: window.chip_end,
+            interp_x: Some(&interp_x),
         };
         // Streaming callback for batched mode: each batch's CSRs are written
         // immediately to the corresponding batch writer(s) (BCF, VCF, SD,
@@ -1605,6 +1609,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                     n_samples,
                     chip_start: window.chip_start,
                     chip_end: window.chip_end,
+                    interp_x: Some(&interp_x),
                 },
                 &hmm_params,
             );

@@ -197,6 +197,8 @@ pub struct FoldContext<'a> {
     pub n_samples: usize,
     pub chip_start: usize,
     pub chip_end: usize,
+    /// The output's interpolation coordinate per chip site (ImputeWindowInputs::interp_x).
+    pub interp_x: Option<&'a [f64]>,
 }
 
 /// Per window row (chip site `chip_start + r`), whether member k's two haplotypes of sample
@@ -204,11 +206,17 @@ pub struct FoldContext<'a> {
 /// Read at the sites where both members are heterozygous; between two such sites that
 /// disagree the order changes half-way; before the first and after the last it is the
 /// nearest one's. No shared het: no swap. Returns whether any row is swapped.
+///
+/// A row `nocall(r)` is never an anchor: the sample did not call it, the genotype there is
+/// whatever each member's phasing filled in, and a target that skips its no-calls has
+/// weights on that row that are only a blend of its called rows either side.
 fn swap_rows(m0: &HaplotypeBitmatrix, mk: &HaplotypeBitmatrix, s: usize, chip_start: usize,
-             n_rows: usize, marks: &mut Vec<(u32, bool)>, swap: &mut Vec<bool>) -> bool {
+             n_rows: usize, nocall: &dyn Fn(usize) -> bool,
+             marks: &mut Vec<(u32, bool)>, swap: &mut Vec<bool>) -> bool {
     let (w, b0, b1) = ((2 * s) / 64, (2 * s) % 64, (2 * s + 1) % 64);
     marks.clear();
     for r in 0..n_rows {
+        if nocall(r) { continue; }
         // both haplotypes of a sample share one u64 word (2s is even)
         let x = m0.row(chip_start + r)[w];
         let (a0, a1) = ((x >> b0) & 1, (x >> b1) & 1);
@@ -246,6 +254,7 @@ pub fn fold_window(
 ) {
     if members.is_empty() { return; }
     let mut count = 1usize;
+    let skip_nocalls = crate::imputation::window_process::nocall_skip_active();
     let mut params_m = params.clone();
     params_m.target_batch_size = STREAM_CHUNK;
     for sc in members.iter_mut() {
@@ -258,6 +267,7 @@ pub fn fold_window(
             n_samples: ctx.n_samples,
             chip_start: ctx.chip_start,
             chip_end: ctx.chip_end,
+            interp_x: ctx.interp_x,
         };
         let cand = sc.candidates.as_ref();
         let targ_k = &sc.targ_bm;
@@ -269,7 +279,10 @@ pub fn fold_window(
             for j in (0..bend - bstart).step_by(2) {
                 let h = bstart + j;
                 let (own0, own1) = (refs[j], refs[j + 1]);
-                if swap_rows(ctx.targ_bm0, targ_k, h / 2, ctx.chip_start, own0.n_rows, &mut marks, &mut swap) {
+                let s = h / 2;
+                let nocall = |r: usize| skip_nocalls && ctx.site_conf_per_sample
+                    .is_some_and(|c| c[(ctx.chip_start + r) * ctx.n_samples + s] == 0.0);
+                if swap_rows(ctx.targ_bm0, targ_k, s, ctx.chip_start, own0.n_rows, &nocall, &mut marks, &mut swap) {
                     let sw = &swap;
                     let csr = &mut all_weights[h][0].1;
                     *csr = sum_rows_into(csr, |r| if sw[r] { own1 } else { own0 });
@@ -315,7 +328,7 @@ mod tests {
     fn same_order_is_not_swapped() {
         let m0 = one_sample(&[(0, 1), (1, 1), (1, 0), (0, 0)]);
         let (mut marks, mut swap) = (Vec::new(), Vec::new());
-        assert!(!swap_rows(&m0, &m0, 0, 0, 4, &mut marks, &mut swap));
+        assert!(!swap_rows(&m0, &m0, 0, 0, 4, &|_| false, &mut marks, &mut swap));
     }
 
     #[test]
@@ -323,7 +336,7 @@ mod tests {
         let m0 = one_sample(&[(0, 1), (1, 1), (1, 0), (0, 0)]);
         let mk = one_sample(&[(1, 0), (1, 1), (0, 1), (0, 0)]);
         let (mut marks, mut swap) = (Vec::new(), Vec::new());
-        assert!(swap_rows(&m0, &mk, 0, 0, 4, &mut marks, &mut swap));
+        assert!(swap_rows(&m0, &mk, 0, 0, 4, &|_| false, &mut marks, &mut swap));
         assert_eq!(swap, vec![true; 4]);
     }
 
@@ -333,8 +346,21 @@ mod tests {
         let m0 = one_sample(&[(0, 1), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 1), (1, 1)]);
         let mk = one_sample(&[(0, 1), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (1, 0), (1, 1)]);
         let (mut marks, mut swap) = (Vec::new(), Vec::new());
-        assert!(swap_rows(&m0, &mk, 0, 0, 8, &mut marks, &mut swap));
+        assert!(swap_rows(&m0, &mk, 0, 0, 8, &|_| false, &mut marks, &mut swap));
         assert_eq!(swap, vec![false, false, false, false, true, true, true, true]);
+    }
+
+    #[test]
+    fn a_no_call_is_not_an_anchor() {
+        // called hets at rows 0 and 4 agree; at row 2 the sample made no call and the two
+        // members' phasing filled the het in opposite orders
+        let m0 = one_sample(&[(0, 1), (0, 0), (0, 1), (0, 0), (1, 0)]);
+        let mk = one_sample(&[(0, 1), (0, 0), (1, 0), (0, 0), (1, 0)]);
+        let (mut marks, mut swap) = (Vec::new(), Vec::new());
+        assert!(!swap_rows(&m0, &mk, 0, 0, 5, &|r| r == 2, &mut marks, &mut swap));
+        // read as an anchor, the filled het would swap the rows around it
+        assert!(swap_rows(&m0, &mk, 0, 0, 5, &|_| false, &mut marks, &mut swap));
+        assert_eq!(swap, vec![false, false, true, true, false]);
     }
 
     #[test]

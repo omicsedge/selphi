@@ -976,6 +976,9 @@ pub fn run_multi_chr(
             n_chip, n_haps, &targ_alleles, n_haps);
         drop(targ_alleles);
 
+        // The output's interpolation coordinate per chip site (ImputeWindowInputs::interp_x).
+        let interp_x: Vec<f64> = wgs_idx.iter()
+            .map(|&wi| interp_cum_cm.as_ref().map_or(wi as f64, |c| c[wi])).collect();
         // Per-window imputation loop
         let mut carry: Vec<selphi::imputation::window_process::HapCarry> = vec![Default::default(); n_haps];
 
@@ -1029,6 +1032,7 @@ pub fn run_multi_chr(
                 n_samples,
                 chip_start: window.chip_start,
                 chip_end: window.chip_end,
+                interp_x: Some(&interp_x),
             };
             let hmm_output = {
                 selphi::imputation::window_process::impute_window(
@@ -1048,6 +1052,7 @@ pub fn run_multi_chr(
                     n_samples,
                     chip_start: window.chip_start,
                     chip_end: window.chip_end,
+                    interp_x: Some(&interp_x),
                 },
                 &hmm_params,
             );
