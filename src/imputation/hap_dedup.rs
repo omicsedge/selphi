@@ -13,6 +13,49 @@ fn mix(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+/// Exact allele class of every reference haplotype over the chip rows
+/// `[chip_start, chip_start + n_chip)`: the lowest haplotype id with the identical allele
+/// pattern there. It depends on the window alone, so `process_window_hmm` computes it once
+/// per window and every target's dedup groups by it (`deduplicate_haplotypes_bm(..,
+/// Some(classes))`); each target used to fingerprint its ~2,000 present haplotypes over
+/// every window site itself, thousands of times per window. Fingerprints are computed in
+/// parallel over blocks of haplotypes, and every fingerprint bucket is verified bit by bit.
+pub fn allele_classes(ref_bm: &HaplotypeBitmatrix, chip_start: usize, n_chip: usize, n_haps: usize) -> Vec<u32> {
+    use rayon::prelude::*;
+    const BLOCK: usize = 1024; // haplotypes per task, a multiple of 64
+    let blocks: Vec<Vec<u64>> = (0..n_haps.div_ceil(BLOCK)).into_par_iter().map(|b| {
+        let (h0, h1) = (b * BLOCK, ((b + 1) * BLOCK).min(n_haps));
+        let (mut fp, mut word) = (vec![0u64; h1 - h0], vec![0u64; h1 - h0]);
+        for v in 0..n_chip {
+            let row = ref_bm.row(chip_start + v);
+            let sh = v % 64;
+            for h in h0..h1 { word[h - h0] |= ((row[h / 64] >> (h % 64)) & 1) << sh; }
+            if sh == 63 {
+                for i in 0..h1 - h0 { fp[i] = mix(fp[i] ^ word[i]); word[i] = 0; }
+            }
+        }
+        if n_chip % 64 != 0 {
+            for i in 0..h1 - h0 { fp[i] = mix(fp[i] ^ word[i]); }
+        }
+        fp
+    }).collect();
+    let fp: Vec<u64> = blocks.concat();
+    let same = |a: usize, b: usize| (0..n_chip).all(|v| {
+        let r = ref_bm.row(chip_start + v);
+        (r[a / 64] >> (a % 64)) & 1 == (r[b / 64] >> (b % 64)) & 1
+    });
+    let mut reps: HashMap<u64, Vec<u32>> = HashMap::with_capacity(n_haps);
+    let mut class = vec![0u32; n_haps];
+    for h in 0..n_haps {
+        let bucket = reps.entry(fp[h]).or_default();
+        match bucket.iter().find(|&&r| same(r as usize, h)) {
+            Some(&r) => class[h] = r,
+            None => { bucket.push(h as u32); class[h] = h as u32; }
+        }
+    }
+    class
+}
+
 /// Result of deduplication.
 pub struct DedupResult {
     /// Per-site match lists with hap IDs replaced by group representative IDs.
@@ -37,6 +80,9 @@ pub struct DedupResult {
 /// * `n_haps` — number of reference haplotypes
 /// * `hap_prior` — sorted sparse per-haplotype prior; missing entries mean zero
 /// * `exact` — require matching emissions/priors; false restores allele-only grouping
+/// * `classes` — the window's `allele_classes`; None fingerprints and verifies the
+///   present haplotypes here (same groups)
+#[allow(clippy::too_many_arguments)]
 pub fn deduplicate_haplotypes_bm(
     filtered_matches: &[Vec<i64>],
     ref_bm: &HaplotypeBitmatrix,
@@ -45,6 +91,7 @@ pub fn deduplicate_haplotypes_bm(
     n_haps: usize,
     hap_prior: Option<&[(i64, f64)]>,
     exact: bool,
+    classes: Option<&[u32]>,
 ) -> DedupResult {
     let mut hap_present = vec![false; n_haps];
     // One fingerprint per haplotype, not a copy of every (site, hap) match.
@@ -98,9 +145,11 @@ pub fn deduplicate_haplotypes_bm(
     // per-bit `mask & push` cost, minus the Vec growth and minus hashing n_chip
     // bytes per haplotype at the end.
     let present: Vec<usize> = (0..n_haps).filter(|&h| hap_present[h]).collect();
-    let mut fp = vec![0u64; n_haps];
-    let mut word = vec![0u64; n_haps];
-    for v in 0..n_chip {
+    // With the window's exact classes the allele key is the class and no bucket needs
+    // verifying; the fingerprint below is only for a caller without them.
+    let mut fp = if classes.is_none() { vec![0u64; n_haps] } else { Vec::new() };
+    let mut word = if classes.is_none() { vec![0u64; n_haps] } else { Vec::new() };
+    for v in 0..if classes.is_none() { n_chip } else { 0 } {
         let row = ref_bm.row(chip_start + v);
         let sh = v % 64;
         for &hap_id in &present {
@@ -114,7 +163,7 @@ pub fn deduplicate_haplotypes_bm(
             }
         }
     }
-    if n_chip % 64 != 0 {
+    if classes.is_none() && n_chip % 64 != 0 {
         for &hap_id in &present {
             fp[hap_id] = mix(fp[hap_id] ^ word[hap_id]);
         }
@@ -135,9 +184,13 @@ pub fn deduplicate_haplotypes_bm(
     for &hap_id in &present {
         let membership = if exact { match_fp[hap_id] } else { 0 };
         let prior = prior_bits.get(hap_id).copied().unwrap_or(0);
-        let bucket = fp_to_reps.entry((fp[hap_id], membership, prior)).or_default();
+        let allele = classes.map_or_else(|| fp[hap_id], |c| c[hap_id] as u64);
+        let bucket = fp_to_reps.entry((allele, membership, prior)).or_default();
         let mut matched = None;
-        if !bucket.is_empty() {
+        if classes.is_some() {
+            // One representative per bucket: every haplotype in it has the same alleles.
+            matched = bucket.first().copied();
+        } else if !bucket.is_empty() {
             // Only reached on a fingerprint hit: either a genuine duplicate or a
             // 1-in-2^64 collision. Verify, so a collision cannot merge two
             // different haplotypes.
@@ -229,7 +282,7 @@ mod tests {
         // All alleles agree, but only haps 2 and 3 have the same emissions.
         let bm = HaplotypeBitmatrix::from_raw(vec![0; 4], 4, 4);
         let matches = vec![vec![0, 2, 3], vec![1, 2, 3], vec![0, 2, 3], vec![1, 2, 3]];
-        let result = deduplicate_haplotypes_bm(&matches, &bm, 0, 4, 4, None, true);
+        let result = deduplicate_haplotypes_bm(&matches, &bm, 0, 4, 4, None, true, None);
         assert_eq!(result.group_members, vec![Some(vec![0]), Some(vec![1]), Some(vec![2, 3]), None]);
         assert_eq!(result.deduped_matches, vec![vec![0, 2], vec![1, 2], vec![0, 2], vec![1, 2]]);
     }
@@ -239,12 +292,12 @@ mod tests {
         let bm = HaplotypeBitmatrix::from_raw(vec![0; 3], 3, 3);
         let matches = vec![vec![0, 1, 2]; 3];
         let equal_pair = [(0, 0.4), (1, 0.4), (2, 0.2)];
-        let result = deduplicate_haplotypes_bm(&matches, &bm, 0, 3, 3, Some(&equal_pair), true);
+        let result = deduplicate_haplotypes_bm(&matches, &bm, 0, 3, 3, Some(&equal_pair), true, None);
         assert_eq!(result.group_members, vec![Some(vec![0, 1]), None, Some(vec![2])]);
 
         // An omitted hap has prior zero, not the representative's nonzero prior.
         let sparse = [(0, 1.0)];
-        let result = deduplicate_haplotypes_bm(&matches, &bm, 0, 3, 3, Some(&sparse), true);
+        let result = deduplicate_haplotypes_bm(&matches, &bm, 0, 3, 3, Some(&sparse), true, None);
         assert_eq!(result.group_members, vec![Some(vec![0]), Some(vec![1, 2]), None]);
     }
 
@@ -252,7 +305,7 @@ mod tests {
     fn dedup_reads_only_the_requested_chip_window() {
         // Haps 1 and 2 differ outside [1,4), but agree throughout that window.
         let bm = HaplotypeBitmatrix::from_raw(vec![0b010, 0b110, 0, 0b001, 0b100], 5, 3);
-        let result = deduplicate_haplotypes_bm(&vec![vec![0, 1, 2]; 3], &bm, 1, 3, 3, None, true);
+        let result = deduplicate_haplotypes_bm(&vec![vec![0, 1, 2]; 3], &bm, 1, 3, 3, None, true, None);
         assert_eq!(result.group_members, vec![Some(vec![0]), Some(vec![1, 2]), None]);
         assert_eq!(result.group_sizes, vec![1, 2, 1]);
     }
@@ -271,11 +324,45 @@ mod tests {
     }
 
     #[test]
+    fn window_classes_give_the_same_groups() {
+        // Random panels with many duplicate haplotypes, random match lists and priors:
+        // dedup with the window's classes == dedup that fingerprints by itself.
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        for case in 0..60 {
+            let (n_haps, n_sites, chip_start) = (70 + case * 3, 5 + case % 70, case % 4);
+            let n_chip = n_sites - chip_start;
+            // ~12 founder patterns copied around: plenty of exact duplicates
+            let founders: Vec<Vec<bool>> = (0..12).map(|_| (0..n_sites).map(|_| next() % 3 == 0).collect()).collect();
+            let of: Vec<usize> = (0..n_haps).map(|_| (next() % 12) as usize).collect();
+            let bm = HaplotypeBitmatrix::from_panel(n_sites, n_haps, &|v, h| founders[of[h]][v], &vec![true; n_sites]);
+            let matches: Vec<Vec<i64>> = (0..n_chip).map(|_| {
+                let mut m: Vec<i64> = (0..n_haps as i64).filter(|_| next() % 4 != 0).collect();
+                m.dedup(); m
+            }).collect();
+            let mut prior: Vec<(i64, f64)> = Vec::new();
+            for h in 0..n_haps as i64 {
+                let r = next();
+                if r % 3 == 0 { prior.push((h, ((r >> 8) % 4) as f64 * 0.25)); }
+            }
+            let classes = allele_classes(&bm, chip_start, n_chip, n_haps);
+            for exact in [true, false] {
+                for pr in [None, Some(prior.as_slice())] {
+                    let a = deduplicate_haplotypes_bm(&matches, &bm, chip_start, n_chip, n_haps, pr, exact, None);
+                    let b = deduplicate_haplotypes_bm(&matches, &bm, chip_start, n_chip, n_haps, pr, exact, Some(&classes));
+                    assert_eq!((a.deduped_matches, a.group_sizes, a.group_members),
+                               (b.deduped_matches, b.group_sizes, b.group_members), "case {case} exact {exact}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn legacy_dedup_still_groups_by_alleles_only() {
         let bm = HaplotypeBitmatrix::from_raw(vec![0; 2], 2, 3);
         let matches = vec![vec![0, 2], vec![1, 2]];
         let prior = [(0, 0.2), (1, 0.3), (2, 0.5)];
-        let result = deduplicate_haplotypes_bm(&matches, &bm, 0, 2, 3, Some(&prior), false);
+        let result = deduplicate_haplotypes_bm(&matches, &bm, 0, 2, 3, Some(&prior), false, None);
         assert_eq!(result.group_members, vec![Some(vec![0, 1, 2]), None, None]);
         assert_eq!(result.deduped_matches, vec![vec![0], vec![0]]);
     }

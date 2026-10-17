@@ -119,9 +119,9 @@ pub fn process_matches(csc: &CscMatchMatrix, kept_matches: usize) -> Vec<Vec<i64
         .collect();
 
     // 7. Top-K selection per variant
-    let (top_matches, n_per_site) = batch_get_top_matches(
+    let (top_matches, n_per_site) = top_matches_per_site(
         &inv_indptr, &inv_indices, &normed, &threshold,
-        &csr_indptr, n_var, kept_matches, &missing_source,
+        &entry_haps(&csr_indptr, n_entries), n_var, kept_matches, &missing_source,
     );
     // 8. Frequency filter: keep haps appearing > SELPHI_MP_MIN_COUNT times
     // (default 1 = evict single-appearance haps; 0 disables the eviction).
@@ -154,79 +154,14 @@ pub fn process_matches(csc: &CscMatchMatrix, kept_matches: usize) -> Vec<Vec<i64
     }
 
 
-    // 9. Range expansion
-    // Build haplotype → sites mapping
-    let mut all_haps: Vec<i64> = Vec::new();
-    let mut all_sites: Vec<i32> = Vec::new();
-    for (v, fm) in filtered_matches.iter().enumerate() {
-        for &h in fm {
-            all_haps.push(h);
-            all_sites.push(v as i32);
-        }
-    }
-
-    if all_haps.is_empty() {
-        return filtered_matches;
-    }
-
-    // Sort by haplotype to group sites per hap.
-    // MUST be stable sort so that within each hap group, variant indices
-    // remain in ascending order (required for binary search in expansion).
-    let mut order: Vec<usize> = (0..all_haps.len()).collect();
-    order.sort_by_key(|&i| all_haps[i]);
-    let sorted_haps: Vec<i64> = order.iter().map(|&i| all_haps[i]).collect();
-    let sorted_sites: Vec<i32> = order.iter().map(|&i| all_sites[i]).collect();
-
-    // Compute hap_offsets: for each hap, range in sorted arrays
-    let mut hap_offsets = vec![0usize; n_ref + 1];
-    for &h in &sorted_haps {
-        hap_offsets[h as usize + 1] += 1;
-    }
-    for h in 0..n_ref {
-        hap_offsets[h + 1] += hap_offsets[h];
-    }
-
-    // Find unique haplotypes
-    let unique_haps: Vec<usize> = (0..n_ref).filter(|&h| hap_counts[h] > 0).collect();
-
-    // Batch expand
-    let (expand_vars, expand_haps) = batch_expand_matches(
-        &starts, &stops, &csr_indptr,
-        &unique_haps, &sorted_sites, &hap_offsets, n_var,
-    );
-
-
-    // Invert back to per-variant haplotype lists
-    if expand_vars.is_empty() {
-        return filtered_matches;
-    }
-
-    let mut order2: Vec<usize> = (0..expand_vars.len()).collect();
-    order2.sort_unstable_by_key(|&i| expand_vars[i]);
-
-    let mut result = vec![Vec::new(); n_var];
-    let mut boundaries = vec![0usize; n_var + 1];
-    {
-        // searchsorted equivalent — read the bi-th smallest as expand_vars[order2[bi]]
-        // directly (order2 is sorted by expand_vars), avoiding a materialized sorted_vars Vec.
-        let mut bi = 0;
-        for v in 0..=n_var {
-            while bi < order2.len() && (expand_vars[order2[bi]] as usize) < v {
-                bi += 1;
-            }
-            boundaries[v] = bi;
-        }
-    }
-    for v in 0..n_var {
-        let s = boundaries[v];
-        let e = boundaries[v + 1];
-        let mut haps: Vec<i64> = (s..e).map(|i| expand_haps[order2[i]]).collect();
-        haps.sort_unstable();
-        haps.dedup();
-        result[v] = haps;
-    }
-
-    result
+    // 9. Range expansion: each kept haplotype's PBWT matches that overlap a site it was
+    // kept at are spread over every site they cover. Haplotypes are taken in ascending
+    // order and each one's matches in CSR order, so every site's list comes out sorted and
+    // a repeat is always its last entry: the sorted, deduplicated per-site sets, without
+    // the two sorts this used to take (all (hap, site) pairs by hap, then every expanded
+    // (site, hap) pair by site plus a sort+dedup per site) or the arrays they sorted.
+    expand_kept_matches(&filtered_matches, &starts, &stops, &csr_indptr, n_ref, n_var)
+        .unwrap_or(filtered_matches)
 }
 
 // ---------------------------------------------------------------------------
@@ -271,39 +206,37 @@ fn csc_to_csr(csc: &CscMatchMatrix) -> (Vec<i64>, Vec<i32>, Vec<i32>) {
     (indptr, indices, data)
 }
 
-/// Build inverted index: for each variant, which match entries cover it.
+/// Build inverted index: for each variant, which match entries cover it (in entry order).
 fn build_inverted_index(starts: &[i32], stops: &[i32], n_var: usize) -> (Vec<i64>, Vec<i32>) {
     let n_entries = starts.len();
-
-    // Count entries per variant
-    let mut counts = vec![0i32; n_var];
-    for i in 0..n_entries {
+    let range = |i: usize| {
         let s = starts[i] as usize;
         let e = (stops[i] as usize).min(n_var - 1);
-        if s <= e {
-            for v in s..=e {
-                counts[v] += 1;
-            }
-        }
-    }
+        (s <= e).then_some((s, e))
+    };
 
-    // Build indptr
+    // Entries per variant from a difference array: one step per entry instead of one per
+    // covered variant (the fill below is the only walk over the covered ranges).
+    let mut diff = vec![0i64; n_var + 1];
+    for i in 0..n_entries {
+        if let Some((s, e)) = range(i) { diff[s] += 1; diff[e + 1] -= 1; }
+    }
     let mut indptr = vec![0i64; n_var + 1];
+    let mut run = 0i64;
     for v in 0..n_var {
-        indptr[v + 1] = indptr[v] + counts[v] as i64;
+        run += diff[v];
+        indptr[v + 1] = indptr[v] + run;
     }
 
-    // Fill indices
+    // Fill indices: entry order within each variant.
     let total = indptr[n_var] as usize;
     let mut indices = vec![0i32; total];
-    let mut pos = vec![0i64; n_var];
+    let mut cur: Vec<i64> = indptr[..n_var].to_vec();
     for i in 0..n_entries {
-        let s = starts[i] as usize;
-        let e = (stops[i] as usize).min(n_var - 1);
-        if s <= e {
+        if let Some((s, e)) = range(i) {
             for v in s..=e {
-                indices[(indptr[v] + pos[v]) as usize] = i as i32;
-                pos[v] += 1;
+                indices[cur[v] as usize] = i as i32;
+                cur[v] += 1;
             }
         }
     }
@@ -414,16 +347,27 @@ fn get_std(avg_len: &[f64], min_length: f64, max_length: f64) -> Vec<f64> {
     }).collect()
 }
 
+/// The haplotype (CSR row) of every CSR entry.
+fn entry_haps(csr_indptr: &[i64], n_entries: usize) -> Vec<u32> {
+    let mut hap = vec![0u32; n_entries];
+    for h in 0..csr_indptr.len() - 1 {
+        hap[csr_indptr[h] as usize..csr_indptr[h + 1] as usize].fill(h as u32);
+    }
+    hap
+}
+
 /// Top-K match selection per variant.
-fn batch_get_top_matches(
+#[allow(clippy::too_many_arguments)]
+fn top_matches_per_site(
     inv_indptr: &[i64], inv_indices: &[i32],
     normed: &[f64], threshold: &[f64],
-    csr_indptr: &[i64], n_var: usize, kept_matches: usize,
+    entry_hap: &[u32], n_var: usize, kept_matches: usize,
     missing_source: &[i32],
 ) -> (Vec<i64>, Vec<usize>) {
-    let n_csr = csr_indptr.len() - 1;
     let mut result = vec![0i64; n_var * kept_matches];
     let mut n_matches = vec![0usize; n_var];
+    // (entry_idx, score), reused across variants
+    let mut above: Vec<(i32, f64)> = Vec::new();
 
     for v in 0..n_var {
         let src = if missing_source[v] >= 0 { missing_source[v] as usize } else { v };
@@ -434,7 +378,7 @@ fn batch_get_top_matches(
         let thresh = threshold[v];
 
         // Collect above-threshold entries
-        let mut above: Vec<(i32, f64)> = Vec::new(); // (entry_idx, score)
+        above.clear();
         for i in s..e {
             let idx = inv_indices[i] as usize;
             if normed[idx] >= thresh {
@@ -448,19 +392,7 @@ fn batch_get_top_matches(
 
         let n_take = above.len().min(kept_matches);
         for i in 0..n_take {
-            let entry_idx = above[i].0 as usize;
-            // Binary search CSR indptr to find haplotype number
-            let mut lo = 0usize;
-            let mut hi = n_csr;
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                if (csr_indptr[mid + 1] as usize) <= entry_idx {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            result[v * kept_matches + i] = lo as i64;
+            result[v * kept_matches + i] = entry_hap[above[i].0 as usize] as i64;
         }
         n_matches[v] = n_take;
     }
@@ -502,55 +434,447 @@ fn expand_match_range(
     }
 }
 
-/// Expand matches: for each haplotype, expand its PBWT match ranges
-/// to cover all variants in those ranges.
-fn batch_expand_matches(
-    starts: &[i32], stops: &[i32], csr_indptr: &[i64],
-    unique_haps: &[usize], hap_sites: &[i32], hap_offsets: &[usize],
-    n_var: usize,
-) -> (Vec<i32>, Vec<i64>) {
-    // First pass: count total expanded entries
-    let mut total = 0usize;
-    for &hap in unique_haps {
-        let hs = hap_offsets[hap];
-        let he = hap_offsets[hap + 1];
-        if hs >= he { continue; }
-        let ms = csr_indptr[hap] as usize;
-        let me = csr_indptr[hap + 1] as usize;
-        for mi in ms..me {
-            if let Some((start, stop)) =
-                expand_match_range(starts, stops, hap_sites, mi, hs, he, n_var)
-            {
-                total += stop - start + 1;
+/// Range expansion (step 9 of `process_matches`). None when nothing expands (no kept
+/// haplotype, or no match of one overlaps a site it was kept at): the caller keeps the
+/// kept lists as they are.
+fn expand_kept_matches(
+    kept: &[Vec<i64>], starts: &[i32], stops: &[i32], csr_indptr: &[i64],
+    n_ref: usize, n_var: usize,
+) -> Option<Vec<Vec<i64>>> {
+    // Each haplotype's kept sites, ascending: a counting sort of the per-site lists by
+    // haplotype, which keeps every haplotype's sites in site order.
+    let mut hap_offsets = vec![0usize; n_ref + 1];
+    for fm in kept { for &h in fm { hap_offsets[h as usize + 1] += 1; } }
+    for h in 0..n_ref { hap_offsets[h + 1] += hap_offsets[h]; }
+    if hap_offsets[n_ref] == 0 { return None; }
+    let mut hap_sites = vec![0i32; hap_offsets[n_ref]];
+    {
+        let mut cur = hap_offsets.clone();
+        for (v, fm) in kept.iter().enumerate() {
+            for &h in fm {
+                hap_sites[cur[h as usize]] = v as i32;
+                cur[h as usize] += 1;
             }
         }
     }
-
-    // Second pass: fill
-    let mut expand_vars = vec![0i32; total];
-    let mut expand_haps = vec![0i64; total];
-    let mut pos = 0usize;
-
-    for &hap in unique_haps {
-        let hs = hap_offsets[hap];
-        let he = hap_offsets[hap + 1];
-        if hs >= he { continue; }
-        let ms = csr_indptr[hap] as usize;
-        let me = csr_indptr[hap + 1] as usize;
-        for mi in ms..me {
-            if let Some((start, stop)) =
-                expand_match_range(starts, stops, hap_sites, mi, hs, he, n_var)
-            {
-                for vv in start..=stop {
-                    expand_vars[pos] = vv as i32;
-                    expand_haps[pos] = hap as i64;
-                    pos += 1;
+    // Every (haplotype, covered site) of the expansion, haplotypes ascending.
+    let for_each = |f: &mut dyn FnMut(usize, std::ops::RangeInclusive<usize>)| {
+        for hap in 0..n_ref {
+            let (hs, he) = (hap_offsets[hap], hap_offsets[hap + 1]);
+            if hs >= he { continue; }
+            for mi in csr_indptr[hap] as usize..csr_indptr[hap + 1] as usize {
+                if let Some((start, stop)) = expand_match_range(starts, stops, &hap_sites, mi, hs, he, n_var) {
+                    f(hap, start..=stop);
                 }
             }
         }
+    };
+    // Distinct haplotypes per site (a site's repeat of a haplotype is always its last one).
+    let mut last = vec![u32::MAX; n_var];
+    let mut count = vec![0u32; n_var];
+    let mut any = false;
+    for_each(&mut |hap, sites| {
+        any = true;
+        for v in sites {
+            if last[v] != hap as u32 { last[v] = hap as u32; count[v] += 1; }
+        }
+    });
+    if !any { return None; }
+    let mut result: Vec<Vec<i64>> = count.iter().map(|&c| Vec::with_capacity(c as usize)).collect();
+    for_each(&mut |hap, sites| {
+        for v in sites {
+            let r = &mut result[v];
+            if r.last() != Some(&(hap as i64)) { r.push(hap as i64); }
+        }
+    });
+    Some(result)
+}
+
+#[cfg(test)]
+mod reference {
+    //! `process_matches` as it was before the 2026-10-16 rewrite (inverted-index counts by a
+    //! walk over each covered range, a binary search per selected entry, and the two sorts of
+    //! the expansion), verbatim: the current one must reproduce it exactly.
+    use super::{csc_to_csr, compute_normed_scores, compute_var_metrics, get_std, expand_match_range, mp_min_count};
+    use crate::imputation::pbwt::CscMatchMatrix;
+
+    /// Process a PBWT match matrix into per-site haplotype lists.
+    ///
+    /// Processes PBWT match matrix into per-site haplotype lists.
+    ///
+    /// # Arguments
+    /// * `csc` — CSC match matrix from PBWT: (n_ref, n_var), columns=variants
+    /// * `kept_matches` — top-K matches per variant (default 50)
+    ///
+    /// # Returns
+    /// Vec of Vec<i64>, one per variant, containing haplotype IDs.
+    pub fn process_matches(csc: &CscMatchMatrix, kept_matches: usize) -> Vec<Vec<i64>> {
+        let n_ref = csc.n_rows;
+        let n_var = csc.n_cols;
+
+        // 1. Convert CSC to CSR: we need per-haplotype match lists
+        let (csr_indptr, csr_indices, csr_data) = csc_to_csr(csc);
+
+        // 2. Compute starts/stops from CSR
+        // CSR indices = variant positions, data = match lengths
+        // starts[k] = csr_indices[k], stops[k] = csr_indices[k] + csr_data[k] - 1
+        let n_entries = csr_indices.len();
+        let mut starts = Vec::with_capacity(n_entries);
+        let mut stops = Vec::with_capacity(n_entries);
+        for k in 0..n_entries {
+            let s = csr_indices[k];
+            let e = csr_indices[k] + csr_data[k] - 1;
+            starts.push(s);
+            stops.push(e);
+        }
+
+        // 3. Build inverted index: for each variant, which entries cover it
+        let (inv_indptr, inv_indices) = build_inverted_index(&starts, &stops, n_var);
+
+        // 4. Handle missing variants (variants with no PBWT matches)
+        let mut missing_source = vec![-1i32; n_var];
+        let missing: Vec<usize> = (0..n_var)
+            .filter(|&v| inv_indptr[v + 1] == inv_indptr[v])
+            .collect();
+
+        let added_freq = vec![0i32; n_ref];
+
+        if !missing.is_empty() && missing.len() < n_var {
+            // Forward-fill: extend matches past missing variants
+            if missing[0] == 0 {
+                // Find first non-missing variant
+                let mut fwd_start = missing.len();
+                for i in 0..missing.len() - 1 {
+                    if missing[i + 1] - missing[i] > 1 {
+                        fwd_start = i + 1;
+                        break;
+                    }
+                }
+                let source = if fwd_start < missing.len() { missing[fwd_start - 1] + 1 } else { missing[missing.len() - 1] + 1 };
+                for &i in &missing[..fwd_start] {
+                    missing_source[i] = source as i32;
+                }
+                // Forward-fill the rest
+                for &i in &missing[fwd_start..] {
+                    let src = if missing_source[i - 1] >= 0 { missing_source[i - 1] } else { (i - 1) as i32 };
+                    missing_source[i] = src;
+                }
+            } else {
+                for &i in &missing {
+                    let src = if i > 0 && missing_source[i - 1] >= 0 { missing_source[i - 1] } else { (i - 1) as i32 };
+                    missing_source[i] = src;
+                }
+            }
+        }
+
+        // 5. Normalize scores by haplotype frequency
+        let normed = compute_normed_scores(&csr_data, &csr_indptr, n_ref, &added_freq);
+
+        // 6. Compute per-variant metrics and thresholds
+        let (avg_len, sd_normed, max_normed) = compute_var_metrics(
+            &inv_indptr, &inv_indices, &csr_data, &normed, n_var,
+        );
+        let data_min = csr_data.iter().copied().min().unwrap_or(0) as f64;
+        let std_length = get_std(&avg_len, data_min, n_var as f64);
+        let threshold: Vec<f64> = (0..n_var)
+            .map(|v| max_normed[v] - sd_normed[v] * std_length[v])
+            .collect();
+
+        // 7. Top-K selection per variant
+        let (top_matches, n_per_site) = batch_get_top_matches(
+            &inv_indptr, &inv_indices, &normed, &threshold,
+            &csr_indptr, n_var, kept_matches, &missing_source,
+        );
+        // 8. Frequency filter: keep haps appearing > SELPHI_MP_MIN_COUNT times
+        // (default 1 = evict single-appearance haps; 0 disables the eviction).
+        // The per-variant fallback below keeps all top-K when a site would empty.
+        let mut hap_counts = vec![0u32; n_ref];
+        for v in 0..n_var {
+            for i in 0..n_per_site[v] {
+                hap_counts[top_matches[v * kept_matches + i] as usize] += 1;
+            }
+        }
+        let min_count = mp_min_count();
+        let is_kept: Vec<bool> = hap_counts.iter().map(|&c| c > min_count).collect();
+
+        let mut filtered_matches: Vec<Vec<i64>> = Vec::with_capacity(n_var);
+        for v in 0..n_var {
+            let mut kept = Vec::new();
+            for i in 0..n_per_site[v] {
+                let h = top_matches[v * kept_matches + i];
+                if is_kept[h as usize] {
+                    kept.push(h);
+                }
+            }
+            if kept.is_empty() {
+                // Fallback: keep all top matches
+                for i in 0..n_per_site[v] {
+                    kept.push(top_matches[v * kept_matches + i]);
+                }
+            }
+            filtered_matches.push(kept);
+        }
+
+
+        // 9. Range expansion
+        // Build haplotype → sites mapping
+        let mut all_haps: Vec<i64> = Vec::new();
+        let mut all_sites: Vec<i32> = Vec::new();
+        for (v, fm) in filtered_matches.iter().enumerate() {
+            for &h in fm {
+                all_haps.push(h);
+                all_sites.push(v as i32);
+            }
+        }
+
+        if all_haps.is_empty() {
+            return filtered_matches;
+        }
+
+        // Sort by haplotype to group sites per hap.
+        // MUST be stable sort so that within each hap group, variant indices
+        // remain in ascending order (required for binary search in expansion).
+        let mut order: Vec<usize> = (0..all_haps.len()).collect();
+        order.sort_by_key(|&i| all_haps[i]);
+        let sorted_haps: Vec<i64> = order.iter().map(|&i| all_haps[i]).collect();
+        let sorted_sites: Vec<i32> = order.iter().map(|&i| all_sites[i]).collect();
+
+        // Compute hap_offsets: for each hap, range in sorted arrays
+        let mut hap_offsets = vec![0usize; n_ref + 1];
+        for &h in &sorted_haps {
+            hap_offsets[h as usize + 1] += 1;
+        }
+        for h in 0..n_ref {
+            hap_offsets[h + 1] += hap_offsets[h];
+        }
+
+        // Find unique haplotypes
+        let unique_haps: Vec<usize> = (0..n_ref).filter(|&h| hap_counts[h] > 0).collect();
+
+        // Batch expand
+        let (expand_vars, expand_haps) = batch_expand_matches(
+            &starts, &stops, &csr_indptr,
+            &unique_haps, &sorted_sites, &hap_offsets, n_var,
+        );
+
+
+        // Invert back to per-variant haplotype lists
+        if expand_vars.is_empty() {
+            return filtered_matches;
+        }
+
+        let mut order2: Vec<usize> = (0..expand_vars.len()).collect();
+        order2.sort_unstable_by_key(|&i| expand_vars[i]);
+
+        let mut result = vec![Vec::new(); n_var];
+        let mut boundaries = vec![0usize; n_var + 1];
+        {
+            // searchsorted equivalent — read the bi-th smallest as expand_vars[order2[bi]]
+            // directly (order2 is sorted by expand_vars), avoiding a materialized sorted_vars Vec.
+            let mut bi = 0;
+            for v in 0..=n_var {
+                while bi < order2.len() && (expand_vars[order2[bi]] as usize) < v {
+                    bi += 1;
+                }
+                boundaries[v] = bi;
+            }
+        }
+        for v in 0..n_var {
+            let s = boundaries[v];
+            let e = boundaries[v + 1];
+            let mut haps: Vec<i64> = (s..e).map(|i| expand_haps[order2[i]]).collect();
+            haps.sort_unstable();
+            haps.dedup();
+            result[v] = haps;
+        }
+
+        result
     }
 
-    expand_vars.truncate(pos);
-    expand_haps.truncate(pos);
-    (expand_vars, expand_haps)
+    /// Build inverted index: for each variant, which match entries cover it.
+    fn build_inverted_index(starts: &[i32], stops: &[i32], n_var: usize) -> (Vec<i64>, Vec<i32>) {
+        let n_entries = starts.len();
+
+        // Count entries per variant
+        let mut counts = vec![0i32; n_var];
+        for i in 0..n_entries {
+            let s = starts[i] as usize;
+            let e = (stops[i] as usize).min(n_var - 1);
+            if s <= e {
+                for v in s..=e {
+                    counts[v] += 1;
+                }
+            }
+        }
+
+        // Build indptr
+        let mut indptr = vec![0i64; n_var + 1];
+        for v in 0..n_var {
+            indptr[v + 1] = indptr[v] + counts[v] as i64;
+        }
+
+        // Fill indices
+        let total = indptr[n_var] as usize;
+        let mut indices = vec![0i32; total];
+        let mut pos = vec![0i64; n_var];
+        for i in 0..n_entries {
+            let s = starts[i] as usize;
+            let e = (stops[i] as usize).min(n_var - 1);
+            if s <= e {
+                for v in s..=e {
+                    indices[(indptr[v] + pos[v]) as usize] = i as i32;
+                    pos[v] += 1;
+                }
+            }
+        }
+
+        (indptr, indices)
+    }
+
+    /// Top-K match selection per variant.
+    fn batch_get_top_matches(
+        inv_indptr: &[i64], inv_indices: &[i32],
+        normed: &[f64], threshold: &[f64],
+        csr_indptr: &[i64], n_var: usize, kept_matches: usize,
+        missing_source: &[i32],
+    ) -> (Vec<i64>, Vec<usize>) {
+        let n_csr = csr_indptr.len() - 1;
+        let mut result = vec![0i64; n_var * kept_matches];
+        let mut n_matches = vec![0usize; n_var];
+
+        for v in 0..n_var {
+            let src = if missing_source[v] >= 0 { missing_source[v] as usize } else { v };
+            let s = inv_indptr[src] as usize;
+            let e = inv_indptr[src + 1] as usize;
+            if s == e { continue; }
+
+            let thresh = threshold[v];
+
+            // Collect above-threshold entries
+            let mut above: Vec<(i32, f64)> = Vec::new(); // (entry_idx, score)
+            for i in s..e {
+                let idx = inv_indices[i] as usize;
+                if normed[idx] >= thresh {
+                    above.push((inv_indices[i], normed[idx]));
+                }
+            }
+            if above.is_empty() { continue; }
+
+            // Sort by score descending
+            above.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let n_take = above.len().min(kept_matches);
+            for i in 0..n_take {
+                let entry_idx = above[i].0 as usize;
+                // Binary search CSR indptr to find haplotype number
+                let mut lo = 0usize;
+                let mut hi = n_csr;
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    if (csr_indptr[mid + 1] as usize) <= entry_idx {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                result[v * kept_matches + i] = lo as i64;
+            }
+            n_matches[v] = n_take;
+        }
+
+        (result, n_matches)
+    }
+
+    /// Expand matches: for each haplotype, expand its PBWT match ranges
+    /// to cover all variants in those ranges.
+    fn batch_expand_matches(
+        starts: &[i32], stops: &[i32], csr_indptr: &[i64],
+        unique_haps: &[usize], hap_sites: &[i32], hap_offsets: &[usize],
+        n_var: usize,
+    ) -> (Vec<i32>, Vec<i64>) {
+        // First pass: count total expanded entries
+        let mut total = 0usize;
+        for &hap in unique_haps {
+            let hs = hap_offsets[hap];
+            let he = hap_offsets[hap + 1];
+            if hs >= he { continue; }
+            let ms = csr_indptr[hap] as usize;
+            let me = csr_indptr[hap + 1] as usize;
+            for mi in ms..me {
+                if let Some((start, stop)) =
+                    expand_match_range(starts, stops, hap_sites, mi, hs, he, n_var)
+                {
+                    total += stop - start + 1;
+                }
+            }
+        }
+
+        // Second pass: fill
+        let mut expand_vars = vec![0i32; total];
+        let mut expand_haps = vec![0i64; total];
+        let mut pos = 0usize;
+
+        for &hap in unique_haps {
+            let hs = hap_offsets[hap];
+            let he = hap_offsets[hap + 1];
+            if hs >= he { continue; }
+            let ms = csr_indptr[hap] as usize;
+            let me = csr_indptr[hap + 1] as usize;
+            for mi in ms..me {
+                if let Some((start, stop)) =
+                    expand_match_range(starts, stops, hap_sites, mi, hs, he, n_var)
+                {
+                    for vv in start..=stop {
+                        expand_vars[pos] = vv as i32;
+                        expand_haps[pos] = hap as i64;
+                        pos += 1;
+                    }
+                }
+            }
+        }
+
+        expand_vars.truncate(pos);
+        expand_haps.truncate(pos);
+        (expand_vars, expand_haps)
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::process_matches;
+    use crate::imputation::pbwt::CscMatchMatrix;
+
+    /// Random PBWT-like match matrices: columns = match start sites, a few to many matches
+    /// per start, haplotypes drawn from a small panel so they recur across starts and the
+    /// expansion overlaps, lengths mostly within the window (some run past its end).
+    fn random_csc(seed: u64, n_ref: usize, n_var: usize, per_site: u64) -> CscMatchMatrix {
+        let mut x = seed | 1;
+        let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        let (mut indptr, mut indices, mut data) = (vec![0i32], Vec::new(), Vec::new());
+        for v in 0..n_var {
+            let k = next() % (per_site + 1);
+            for _ in 0..k {
+                indices.push((next() % n_ref as u64) as i32);
+                let room = (n_var - v) as u64;
+                data.push(1 + (next() % (room + room / 4 + 1)) as i32);
+            }
+            indptr.push(indices.len() as i32);
+        }
+        CscMatchMatrix { indptr, indices, data, n_rows: n_ref, n_cols: n_var }
+    }
+
+    #[test]
+    fn process_matches_equals_the_reference() {
+        for seed in 0..400u64 {
+            let n_ref = 3 + (seed % 57) as usize;
+            let n_var = 1 + ((seed * 7) % 90) as usize;
+            let per_site = [0, 1, 4, 15, 40][(seed % 5) as usize];
+            let csc = random_csc(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1), n_ref, n_var, per_site);
+            for kept in [3usize, 50] {
+                assert_eq!(process_matches(&csc, kept), super::reference::process_matches(&csc, kept),
+                           "seed {seed} n_ref {n_ref} n_var {n_var} per_site {per_site} kept {kept}");
+            }
+        }
+    }
 }

@@ -1034,16 +1034,9 @@ pub fn run_multi_chr(
                 chip_end: window.chip_end,
                 interp_x: Some(&interp_x),
             };
-            let hmm_output = {
-                selphi::imputation::window_process::impute_window(
-                    &inputs, &hmm_params, precomputed_candidates.as_ref(),
-                    &mut carry,
-                    None, // multi-chr orchestrate.rs doesn't support batched streaming yet
-                )
-            };
-            let mut all_weights = hmm_output.all_weights;
-            selphi::imputation::ensemble::fold_window(
-                &mut all_weights, &mut ensemble_members,
+            let all_weights = selphi::imputation::ensemble::impute_with_members(
+                &inputs, &hmm_params, precomputed_candidates.as_ref(),
+                &mut carry, &mut ensemble_members,
                 &selphi::imputation::ensemble::FoldContext {
                     ref_bm: &ref_bm_imp,
                     targ_bm0: inputs.targ_alleles,
@@ -1054,8 +1047,7 @@ pub fn run_multi_chr(
                     chip_end: window.chip_end,
                     interp_x: Some(&interp_x),
                 },
-                &hmm_params,
-            );
+            ).all_weights;
 
             // Interpolation + output
             let preloaded_stripes = stripe_preload_handle.and_then(|h| h);

@@ -132,22 +132,48 @@ impl Member {
 /// ids arrive out of column order (dedup-group expansion can do that) is sorted
 /// first.
 pub fn sum_csr_into(a: &CsrWeights, b: &CsrWeights) -> CsrWeights {
-    sum_rows_into(a, |_| b)
+    sum_rows_into(a, |_| AddRow::Csr(b))
+}
+
+/// Where row `r` of the addend comes from: a CSR's own row `r`, or the blend
+/// `(1 - t) * l.row(lr) + t * r.row(rr)` (see `blend_row`).
+enum AddRow<'b> {
+    Csr(&'b CsrWeights),
+    Blend(&'b CsrWeights, usize, &'b CsrWeights, usize, f32),
+}
+
+/// Row `r` of `csr` as (column, value) pairs sorted by column, into `out`.
+fn row_pairs(csr: &CsrWeights, r: usize, out: &mut Vec<(i32, f32)>) {
+    let (s, e) = (csr.indptr[r] as usize, csr.indptr[r + 1] as usize);
+    out.clear();
+    out.extend(csr.indices[s..e].iter().copied().zip(csr.data[s..e].iter().copied()));
+    if !out.windows(2).all(|w| w[0].0 < w[1].0) { out.sort_unstable_by_key(|&(c, _)| c); }
+}
+
+/// `(1 - t) * l.row(lr) + t * r.row(rr)`, sorted by column, positive entries only: exactly
+/// the row `window_process::expand_weights` writes for a skipped site between those rows.
+fn blend_row(l: &CsrWeights, lr: usize, r: &CsrWeights, rr: usize, t: f32, out: &mut Vec<(i32, f32)>) {
+    let mut pairs: Vec<(i32, f32)> = Vec::new();
+    let (s, e) = (l.indptr[lr] as usize, l.indptr[lr + 1] as usize);
+    pairs.extend(l.indices[s..e].iter().zip(&l.data[s..e]).map(|(&i, &d)| (i, (1.0 - t) * d)));
+    let (s, e) = (r.indptr[rr] as usize, r.indptr[rr + 1] as usize);
+    pairs.extend(r.indices[s..e].iter().zip(&r.data[s..e]).map(|(&i, &d)| (i, t * d)));
+    pairs.sort_unstable_by_key(|&(i, _)| i);
+    out.clear();
+    let mut j = 0;
+    while j < pairs.len() {
+        let (i, mut d) = pairs[j];
+        j += 1;
+        while j < pairs.len() && pairs[j].0 == i { d += pairs[j].1; j += 1; }
+        if d > 0.0 { out.push((i, d)); }
+    }
 }
 
 /// `sum_csr_into` with row `r` of the addend taken from `src(r)`: one merge pass, no
 /// intermediate matrix. The aligned fold reads each row from the member's own haplotype
-/// or from its partner, so a swapped member costs nothing beyond the sum itself.
-fn sum_rows_into<'b>(a: &CsrWeights, src: impl Fn(usize) -> &'b CsrWeights) -> CsrWeights {
-    fn sorted_row(csr: &CsrWeights, r: usize, scratch: &mut Vec<(i32, f32)>) -> bool {
-        let (s, e) = (csr.indptr[r] as usize, csr.indptr[r + 1] as usize);
-        let idx = &csr.indices[s..e];
-        if idx.windows(2).all(|w| w[0] < w[1]) { return false; }
-        scratch.clear();
-        scratch.extend(idx.iter().copied().zip(csr.data[s..e].iter().copied()));
-        scratch.sort_unstable_by_key(|&(c, _)| c);
-        true
-    }
+/// or from its partner, so a swapped member costs nothing beyond the sum itself. Rows are
+/// read into two reused scratch buffers (it used to collect a fresh Vec per row).
+fn sum_rows_into<'b>(a: &CsrWeights, src: impl Fn(usize) -> AddRow<'b>) -> CsrWeights {
     let n_rows = a.n_rows;
     let n_cols = a.n_cols;
     let mut indptr = Vec::with_capacity(n_rows + 1);
@@ -155,22 +181,13 @@ fn sum_rows_into<'b>(a: &CsrWeights, src: impl Fn(usize) -> &'b CsrWeights) -> C
     let mut indices: Vec<i32> = Vec::with_capacity(2 * a.indices.len());
     let mut data: Vec<f32> = Vec::with_capacity(2 * a.data.len());
     indptr.push(0i32);
-    let (mut sa, mut sb): (Vec<(i32, f32)>, Vec<(i32, f32)>) = (Vec::new(), Vec::new());
+    let (mut ia, mut ib): (Vec<(i32, f32)>, Vec<(i32, f32)>) = (Vec::new(), Vec::new());
     for r in 0..n_rows {
-        // Borrow each row as (col, val) pairs, sorted; usually already sorted.
-        let ra: Vec<(i32, f32)>;
-        let rb: Vec<(i32, f32)>;
-        let ia: &[(i32, f32)] = if sorted_row(a, r, &mut sa) { &sa } else {
-            let (s, e) = (a.indptr[r] as usize, a.indptr[r + 1] as usize);
-            ra = a.indices[s..e].iter().copied().zip(a.data[s..e].iter().copied()).collect();
-            &ra
-        };
-        let b = src(r);
-        let ib: &[(i32, f32)] = if sorted_row(b, r, &mut sb) { &sb } else {
-            let (s, e) = (b.indptr[r] as usize, b.indptr[r + 1] as usize);
-            rb = b.indices[s..e].iter().copied().zip(b.data[s..e].iter().copied()).collect();
-            &rb
-        };
+        row_pairs(a, r, &mut ia);
+        match src(r) {
+            AddRow::Csr(b) => row_pairs(b, r, &mut ib),
+            AddRow::Blend(l, lr, rc, rr, t) => blend_row(l, lr, rc, rr, t, &mut ib),
+        }
         let (mut i, mut k) = (0usize, 0usize);
         while i < ia.len() && k < ib.len() {
             let (ca, va) = ia[i];
@@ -240,6 +257,41 @@ fn swap_rows(m0: &HaplotypeBitmatrix, mk: &HaplotypeBitmatrix, s: usize, chip_st
     true
 }
 
+/// The rows of a member's sample that skipped its no-calls and need an ALIGNED blend:
+/// a skipped row `m` holds `(1 - t) * row(l) + t * row(r)` of each haplotype's own weights
+/// (`window_process::expand_weights`, `l`/`r` the called rows either side), so when the
+/// member's orientation against member 0 changes between `l` and `r` the aligned row is
+/// `(1 - t) * aligned(l) + t * aligned(r)`, not either haplotype's blend. Returned as
+/// (m, l, r, t); a row is taken only when it IS that blend (a target that fell back to
+/// following its matches through the no-calls has real HMM rows there).
+fn mixed_rows(own0: &CsrWeights, own1: &CsrWeights, swap: &[bool], nocall: &dyn Fn(usize) -> bool,
+              x_full: &[f64], chip_start: usize) -> Vec<(usize, usize, usize, f32)> {
+    let n = own0.n_rows;
+    let mut out = Vec::new();
+    let mut prev: Option<usize> = None;
+    let mut m = 0;
+    while m < n {
+        if !nocall(m) { prev = Some(m); m += 1; continue; }
+        let next = (m + 1..n).find(|&q| !nocall(q));
+        if let (Some(l), Some(r)) = (prev, next) && swap[l] != swap[r] {
+            let x = |q: usize| x_full[chip_start + q];
+            for q in m..r {
+                let span = x(r) - x(l);
+                let t = if span > 0.0 { ((x(q) - x(l)) / span).clamp(0.0, 1.0) as f32 } else { 0.5 };
+                let (mut want, mut have) = (Vec::new(), Vec::new());
+                let is_blend = [own0, own1].iter().all(|own| {
+                    blend_row(own, l, own, r, t, &mut want);
+                    row_pairs(own, q, &mut have);
+                    want == have
+                });
+                if is_blend { out.push((q, l, r, t)); }
+            }
+        }
+        m = next.unwrap_or(n);
+    }
+    out
+}
+
 /// Re-run this window's HMM on every extra member's scaffold, fold the weights
 /// into `all_weights`, then divide once by the member count.
 ///
@@ -253,57 +305,124 @@ pub fn fold_window(
     params: &WindowHmmParams,
 ) {
     if members.is_empty() { return; }
-    let mut count = 1usize;
-    let skip_nocalls = crate::imputation::window_process::nocall_skip_active();
     let mut params_m = params.clone();
     params_m.target_batch_size = STREAM_CHUNK;
+    let mut fold = PairFold::new(ctx);
     for sc in members.iter_mut() {
-        let inputs_m = ImputeWindowInputs {
-            ref_bm: ctx.ref_bm,
-            targ_alleles: &sc.targ_bm,
-            chip_cm: ctx.chip_cm,
-            ne_per_site: sc.final_ne_per_site.as_deref(),
-            site_conf_per_sample: ctx.site_conf_per_sample,
-            n_samples: ctx.n_samples,
-            chip_start: ctx.chip_start,
-            chip_end: ctx.chip_end,
-            interp_x: ctx.interp_x,
-        };
+        let inputs_m = member_inputs(&sc.targ_bm, sc.final_ne_per_site.as_deref(), ctx);
         let cand = sc.candidates.as_ref();
         let targ_k = &sc.targ_bm;
-        let (mut marks, mut swap): (Vec<(u32, bool)>, Vec<bool>) = (Vec::new(), Vec::new());
         let mut accumulate = |bstart: usize, bend: usize, refs: &[&CsrWeights]|
          -> std::io::Result<()> {
             // Batches hold whole samples: the batch size is even and starts on a sample.
             debug_assert!(bstart % 2 == 0 && (bend - bstart) % 2 == 0);
             for j in (0..bend - bstart).step_by(2) {
-                let h = bstart + j;
-                let (own0, own1) = (refs[j], refs[j + 1]);
-                let s = h / 2;
-                let nocall = |r: usize| skip_nocalls && ctx.site_conf_per_sample
-                    .is_some_and(|c| c[(ctx.chip_start + r) * ctx.n_samples + s] == 0.0);
-                if swap_rows(ctx.targ_bm0, targ_k, s, ctx.chip_start, own0.n_rows, &nocall, &mut marks, &mut swap) {
-                    let sw = &swap;
-                    let csr = &mut all_weights[h][0].1;
-                    *csr = sum_rows_into(csr, |r| if sw[r] { own1 } else { own0 });
-                    let csr = &mut all_weights[h + 1][0].1;
-                    *csr = sum_rows_into(csr, |r| if sw[r] { own0 } else { own1 });
-                } else {
-                    let csr = &mut all_weights[h][0].1;
-                    *csr = sum_csr_into(csr, own0);
-                    let csr = &mut all_weights[h + 1][0].1;
-                    *csr = sum_csr_into(csr, own1);
-                }
+                fold.add(all_weights, bstart + j, refs[j], refs[j + 1], targ_k);
             }
             Ok(())
         };
         let _ = impute_window(&inputs_m, &params_m, cand, &mut sc.carry, Some(&mut accumulate));
-        count += 1;
     }
+    divide(all_weights, members.len() + 1);
+}
+
+/// Member 0's window HMM, then every extra member's folded into it in member order (the
+/// members stream through `fold_window`, memory-bounded). Running the members of a small
+/// cohort at the same time as member 0 was measured and rejected: one user on chr20 of the
+/// 75,552-haplotype panel ran 10% faster but peaked 668 MB (30%) higher.
+pub fn impute_with_members(
+    inputs: &ImputeWindowInputs,
+    params: &WindowHmmParams,
+    precomputed_candidates: Option<&Vec<Vec<u32>>>,
+    carry: &mut [super::window_process::HapCarry],
+    members: &mut [Member],
+    ctx: &FoldContext,
+) -> super::window_process::WindowHmmOutput {
+    let mut out = impute_window(inputs, params, precomputed_candidates, carry, None);
+    fold_window(&mut out.all_weights, members, ctx, params);
+    out
+}
+
+/// An extra member's window inputs: its own scaffold and Ne, everything else member 0's.
+fn member_inputs<'a>(targ_bm: &'a HaplotypeBitmatrix, ne: Option<&'a [f64]>, ctx: &FoldContext<'a>)
+    -> ImputeWindowInputs<'a>
+{
+    ImputeWindowInputs {
+        ref_bm: ctx.ref_bm,
+        targ_alleles: targ_bm,
+        chip_cm: ctx.chip_cm,
+        ne_per_site: ne,
+        site_conf_per_sample: ctx.site_conf_per_sample,
+        n_samples: ctx.n_samples,
+        chip_start: ctx.chip_start,
+        chip_end: ctx.chip_end,
+        interp_x: ctx.interp_x,
+    }
+}
+
+/// Divide the summed weights by the member count.
+fn divide(all_weights: &mut [Vec<(usize, CsrWeights)>], count: usize) {
     let inv = 1.0f32 / count as f32;
     for hw in all_weights.iter_mut() {
         for (_, csr) in hw.iter_mut() {
             for v in csr.data.iter_mut() { *v *= inv; }
+        }
+    }
+}
+
+/// Adds one member's two haplotype weights of a sample into the running sums, aligned to
+/// member 0's orientation (`swap_rows`, `mixed_rows`), with its scratch reused across samples.
+struct PairFold<'c> {
+    ctx: &'c FoldContext<'c>,
+    skip_nocalls: bool,
+    x_full: &'c [f64],
+    marks: Vec<(u32, bool)>,
+    swap: Vec<bool>,
+    /// `mixed_rows` on (default); `SELPHI_NOCALL_BLEND_ALIGN_OFF=1` takes every row from one
+    /// haplotype by its own orientation, as before 2026-10-17 (A/B).
+    blend_align: bool,
+}
+
+impl<'c> PairFold<'c> {
+    fn new(ctx: &'c FoldContext<'c>) -> Self {
+        Self {
+            ctx,
+            blend_align: !crate::config::is_one("SELPHI_NOCALL_BLEND_ALIGN_OFF"),
+            skip_nocalls: crate::imputation::window_process::nocall_skip_active(),
+            x_full: ctx.interp_x.unwrap_or(ctx.chip_cm),
+            marks: Vec::new(),
+            swap: Vec::new(),
+        }
+    }
+
+    /// Haplotypes `h` (even) and `h + 1` of the member whose scaffold is `targ_k`.
+    fn add(&mut self, all_weights: &mut [Vec<(usize, CsrWeights)>], h: usize,
+           own0: &CsrWeights, own1: &CsrWeights, targ_k: &HaplotypeBitmatrix) {
+        let ctx = self.ctx;
+        let s = h / 2;
+        let skip_nocalls = self.skip_nocalls;
+        let nocall = |r: usize| skip_nocalls && ctx.site_conf_per_sample
+            .is_some_and(|c| c[(ctx.chip_start + r) * ctx.n_samples + s] == 0.0);
+        if swap_rows(ctx.targ_bm0, targ_k, s, ctx.chip_start, own0.n_rows, &nocall, &mut self.marks, &mut self.swap) {
+            let sw = &self.swap;
+            let mixed = if self.blend_align {
+                mixed_rows(own0, own1, sw, &nocall, self.x_full, ctx.chip_start)
+            } else { Vec::new() };
+            let pick = |r: usize, first: bool| -> AddRow {
+                if let Some(&(_, l, rr, t)) = mixed.iter().find(|m| m.0 == r) {
+                    let side = |q: usize| if sw[q] == first { own1 } else { own0 };
+                    AddRow::Blend(side(l), l, side(rr), rr, t)
+                } else if sw[r] == first { AddRow::Csr(own1) } else { AddRow::Csr(own0) }
+            };
+            let csr = &mut all_weights[h][0].1;
+            *csr = sum_rows_into(csr, |r| pick(r, true));
+            let csr = &mut all_weights[h + 1][0].1;
+            *csr = sum_rows_into(csr, |r| pick(r, false));
+        } else {
+            let csr = &mut all_weights[h][0].1;
+            *csr = sum_csr_into(csr, own0);
+            let csr = &mut all_weights[h + 1][0].1;
+            *csr = sum_csr_into(csr, own1);
         }
     }
 }
@@ -363,15 +482,48 @@ mod tests {
         assert_eq!(swap, vec![false, false, true, true, false]);
     }
 
+    /// Two haplotypes' weights over 3 rows, row 1 a skipped no-call blended from rows 0 and 2.
+    fn expanded(row0: (i32, f32), row2: (i32, f32), t: f32) -> CsrWeights {
+        let mut m = vec![row0, row2];
+        let mut mid: Vec<(i32, f32)> = Vec::new();
+        let a = CsrWeights { indptr: vec![0, 1, 2], indices: vec![row0.0, row2.0], data: vec![row0.1, row2.1], n_rows: 2, n_cols: 8 };
+        blend_row(&a, 0, &a, 1, t, &mut mid);
+        m.splice(1..1, mid.iter().copied());
+        let mut indptr = vec![0i32, 1];
+        indptr.push(1 + mid.len() as i32);
+        indptr.push(2 + mid.len() as i32);
+        CsrWeights { indptr, indices: m.iter().map(|p| p.0).collect(), data: m.iter().map(|p| p.1).collect(), n_rows: 3, n_cols: 8 }
+    }
+
+    #[test]
+    fn a_skipped_row_between_differently_oriented_rows_is_blended_aligned() {
+        // Member k agrees with member 0 at row 0 and is swapped at row 2; row 1 was skipped.
+        let x = [0.0, 0.25, 1.0];
+        let own0 = expanded((1, 1.0), (2, 1.0), 0.25);
+        let own1 = expanded((5, 1.0), (6, 1.0), 0.25);
+        let swap = vec![false, false, true];
+        let nocall = |r: usize| r == 1;
+        let mixed = mixed_rows(&own0, &own1, &swap, &nocall, &x, 0);
+        assert_eq!(mixed, vec![(1, 0, 2, 0.25)]);
+        // hap 0 aligned: row 0 from own0, row 2 from own1 -> 0.75 * col 1 + 0.25 * col 6
+        let mut row = Vec::new();
+        blend_row(&own0, 0, &own1, 2, 0.25, &mut row);
+        assert_eq!(row, vec![(1, 0.75), (6, 0.25)]);
+        // a real (non-blend) row is left to the per-row choice
+        let mut real = own0.clone();
+        real.data[1] = 0.5;
+        assert!(mixed_rows(&real, &own1, &swap, &nocall, &x, 0).is_empty());
+    }
+
     #[test]
     fn rows_from_the_partner_where_swapped_and_the_sum_is_unchanged() {
         let a = diag(3, 1.0);
         let (own, partner) = (diag(3, 2.0), diag(3, 5.0));
         let swap = [false, true, false];
-        let got = sum_rows_into(&a, |r| if swap[r] { &partner } else { &own });
+        let got = sum_rows_into(&a, |r| AddRow::Csr(if swap[r] { &partner } else { &own }));
         assert_eq!(got.data, vec![3.0, 6.0, 3.0]);
         // and with nothing swapped it is exactly sum_csr_into
-        let plain = sum_rows_into(&a, |_| &own);
+        let plain = sum_rows_into(&a, |_| AddRow::Csr(&own));
         assert_eq!(plain.data, sum_csr_into(&a, &own).data);
         assert_eq!(plain.indices, sum_csr_into(&a, &own).indices);
     }
