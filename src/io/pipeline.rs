@@ -41,6 +41,8 @@ pub struct OutputFormats {
 
 /// Per-window precomputed data shared across all output formats.
 pub(crate) struct WindowSetup<'a> {
+    /// The panel: VCF prefixes (CHROM..ALT) are formatted from its IDs per row.
+    pub srp: &'a SrpReader,
     pub own_wgs_start: usize,
     pub own_wgs_end: usize,
     pub n_haps: usize,
@@ -60,6 +62,10 @@ pub(crate) struct WindowSetup<'a> {
     pub chip_local_idx: Vec<usize>,
     pub intervals: Vec<Interval>,
     pub weight_refs: Vec<&'a CsrWeights>,
+    /// Per-variant `CHROM\tPOS\tID\tREF\tALT`, built only for the Parquet
+    /// writer (empty otherwise; the VCF writers format it per row, see
+    /// `push_vid_prefix`). A whole-chromosome window held one heap `Vec` per
+    /// panel variant here: ~3M on the v3 panel's chr22, built serially.
     pub vid_prefixes: Vec<Vec<u8>>,
     pub an_str: Vec<u8>,
     /// R4b: per-(chip-site, sample) input confidence, row-major
@@ -67,7 +73,7 @@ pub(crate) struct WindowSetup<'a> {
     /// the same value stored in `chip_local_idx`). `None` when refine is off or
     /// the per-sample matrix is unavailable → `use_hardcall` is always false and
     /// the imputed branch is byte-identical to pre-R4b.
-    pub site_conf_per_sample: Option<Vec<f64>>,
+    pub site_conf_per_sample: Option<&'a [f64]>,
     pub refine_thr: f64,
     pub n_samples: usize,
 }
@@ -83,7 +89,7 @@ impl WindowSetup<'_> {
     #[inline]
     pub fn use_hardcall(&self, local_i: usize, s: usize) -> bool {
         if !self.is_input_chip[local_i] { return false; }
-        match self.site_conf_per_sample.as_ref() {
+        match self.site_conf_per_sample {
             None => false,
             Some(conf) => {
                 let ci = self.chip_local_idx[local_i];
@@ -92,6 +98,29 @@ impl WindowSetup<'_> {
             }
         }
     }
+
+    /// Append panel variant `wgs_i`'s `CHROM\tPOS\tID\tREF\tALT` (nothing when
+    /// its ID does not parse), as `vid_prefixes` holds it.
+    #[inline]
+    pub fn push_vid_prefix(&self, buf: &mut Vec<u8>, wgs_i: usize) {
+        push_vid_prefix(buf, self.srp, wgs_i);
+    }
+}
+
+/// Append `CHROM\tPOS\tID\tREF\tALT` of panel variant `i` to `buf` (nothing
+/// when its ID does not parse). ID is the original ID, or the synthetic one when
+/// there is none.
+#[inline]
+fn push_vid_prefix(buf: &mut Vec<u8>, srp: &SrpReader, i: usize) {
+    let id = &srp.ids[i];
+    // Right-split so chrom may contain '-' (rare assembly contigs).
+    let Some((chrom, pos, ref_a, alt)) = crate::srp::helpers::parse_synthetic_id(id) else { return };
+    let oid = if !srp.original_ids[i].is_empty() { &srp.original_ids[i] } else { id };
+    buf.extend_from_slice(chrom.as_bytes()); buf.push(b'\t');
+    buf.extend_from_slice(pos.as_bytes()); buf.push(b'\t');
+    buf.extend_from_slice(oid.as_bytes()); buf.push(b'\t');
+    buf.extend_from_slice(ref_a.as_bytes()); buf.push(b'\t');
+    buf.extend_from_slice(alt.as_bytes());
 }
 
 /// Build interpolation intervals for the owned portion of a window.
@@ -355,7 +384,7 @@ pub(crate) fn imp_flags(is_input_chip: &[bool], uncalled_typed: &[usize], own_st
 impl<'a> WindowSetup<'a> {
     /// Build per-window context: chip lookup, intervals, variant prefixes, weights.
     pub fn new(
-        srp: &SrpReader,
+        srp: &'a SrpReader,
         all_weights: &'a [Vec<(usize, CsrWeights)>],
         win_chip_start: usize,
         own_chip_start: usize,
@@ -363,9 +392,11 @@ impl<'a> WindowSetup<'a> {
         wgs_idx: &[usize],
         n_samples: usize,
         site_conf: Option<&[f64]>,
-        site_conf_per_sample: Option<&[f64]>,
+        site_conf_per_sample: Option<&'a [f64]>,
         refine_thr: f64,
         uncalled_typed: &[usize],
+        // Build `vid_prefixes` (only the Parquet writer reads it).
+        need_vid_prefixes: bool,
     ) -> Self {
         let n_haps = n_samples * 2;
         let n_ref_variants = srp.n_variants();
@@ -406,21 +437,13 @@ impl<'a> WindowSetup<'a> {
             crate::selphi_step!("{} typed site(s) with a missing or low-confidence call written as imputed dosage for those samples (confidence < {})", n_rerouted, refine_thr);
         }
 
-        let vid_prefixes: Vec<Vec<u8>> = (own_wgs_start..own_wgs_end).map(|i| {
-            let id = &srp.ids[i];
-            // Right-split so chrom may contain '-' (rare assembly contigs).
-            let (chrom, pos, ref_a, alt) = match crate::srp::helpers::parse_synthetic_id(id) {
-                Some(x) => x, None => return Vec::new(),
-            };
-            let oid = if !srp.original_ids[i].is_empty() { &srp.original_ids[i] } else { id };
-            let mut prefix = Vec::with_capacity(40);
-            prefix.extend_from_slice(chrom.as_bytes()); prefix.push(b'\t');
-            prefix.extend_from_slice(pos.as_bytes()); prefix.push(b'\t');
-            prefix.extend_from_slice(oid.as_bytes()); prefix.push(b'\t');
-            prefix.extend_from_slice(ref_a.as_bytes()); prefix.push(b'\t');
-            prefix.extend_from_slice(alt.as_bytes());
-            prefix
-        }).collect();
+        let vid_prefixes: Vec<Vec<u8>> = if need_vid_prefixes {
+            (own_wgs_start..own_wgs_end).into_par_iter().map(|i| {
+                let mut prefix = Vec::with_capacity(40);
+                push_vid_prefix(&mut prefix, srp, i);
+                prefix
+            }).collect()
+        } else { Vec::new() };
 
         let weight_refs: Vec<&CsrWeights> = all_weights.iter().map(|w| &w[0].1).collect();
         let n_weight_rows = weight_refs.iter().map(|w| w.n_rows).min().unwrap_or(0);
@@ -432,11 +455,11 @@ impl<'a> WindowSetup<'a> {
         );
 
         WindowSetup {
-            own_wgs_start, own_wgs_end, n_haps, n_ref_variants,
+            srp, own_wgs_start, own_wgs_end, n_haps, n_ref_variants,
             chunk_size, is_chip, imp: imp_flags(&is_input_chip, uncalled_typed, own_wgs_start, own_wgs_end),
             is_input_chip, chip_local_idx, intervals,
             weight_refs, vid_prefixes, an_str,
-            site_conf_per_sample: site_conf_per_sample.map(|c| c.to_vec()),
+            site_conf_per_sample,
             refine_thr, n_samples,
         }
     }
@@ -483,39 +506,44 @@ lazy_static::lazy_static! {
         v.into_iter().map(|b| &*Box::leak(b.into_boxed_slice())).collect()
     };
 
-    /// Combined "GT1|GT2:DS" byte lookup: [gt1][gt2][ds_idx] → b"0|0:0", etc.
-    static ref GTDS_LUT_B: Vec<Vec<Vec<&'static [u8]>>> = {
-        let mut outer = Vec::with_capacity(2);
+    /// Combined "GT1|GT2:DS" byte lookup, flat: `[(gt1 * 2 + gt2) * 2001 + ds_idx]`
+    /// → b"0|0:0", etc.
+    static ref GTDS_LUT_B: Vec<&'static [u8]> = {
+        let mut v = Vec::with_capacity(4 * 2001);
         for g1 in 0..2u8 {
-            let mut mid = Vec::with_capacity(2);
             for g2 in 0..2u8 {
-                let mut inner = Vec::with_capacity(2001);
                 for ds in 0..=2000 {
                     let s = format!("{}|{}:{}", g1, g2, std::str::from_utf8(FMT_LUT[ds]).unwrap());
-                    inner.push(&*Box::leak(s.into_bytes().into_boxed_slice()));
+                    v.push(&*Box::leak(s.into_bytes().into_boxed_slice()));
                 }
-                mid.push(inner);
             }
-            outer.push(mid);
         }
-        outer
+        v
     };
 
-    /// Combined ":AP1:AP2" byte lookup: [ap1_idx][ap2_idx] → b":0:0", etc.
-    static ref AP_LUT_B: Vec<Vec<&'static [u8]>> = {
-        let mut outer = Vec::with_capacity(101);
+    /// Combined ":AP1:AP2" byte lookup, flat: `[ap1_idx * 101 + ap2_idx]` → b":0:0", etc.
+    static ref AP_LUT_B: Vec<&'static [u8]> = {
+        let mut v = Vec::with_capacity(101 * 101);
         for a1 in 0..=100 {
-            let mut inner = Vec::with_capacity(101);
             for a2 in 0..=100 {
                 let s = format!(":{}:{}", std::str::from_utf8(FMT_LUT_AP[a1]).unwrap(),
                                           std::str::from_utf8(FMT_LUT_AP[a2]).unwrap());
-                inner.push(&*Box::leak(s.into_bytes().into_boxed_slice()));
+                v.push(&*Box::leak(s.into_bytes().into_boxed_slice()));
             }
-            outer.push(inner);
         }
-        outer
+        v
     };
 }
+
+/// Output budget of one formatting task (VCF text or BCF records).
+const FMT_TASK_BYTES: usize = 1 << 20;
+/// Per tile group: its interpolated values, and its estimated formatted output,
+/// each stay within this.
+const GROUP_BYTES: usize = 256 << 20;
+/// Compressed panel stripes per read, and per batch (unless one tile's own
+/// stripes exceed it). The current batch's read and the next one's, in flight,
+/// are the two compressed buffers alive at once.
+const COMP_READ_BYTES: usize = 128 << 20;
 
 /// Streaming interpolation + VCF writing.
 /// Type aliases for the VCF writer components returned by setup_vcf_writer.
@@ -523,23 +551,35 @@ pub type VcfSender = std::sync::mpsc::SyncSender<Vec<u8>>;
 pub type VcfWriterHandle = std::thread::JoinHandle<std::io::Result<()>>;
 pub type VcfBgzipProc = (); // No external process — native bgzf
 
-/// The native multithreaded BGZF writer over a freshly-created output file.
-type BgzfFileWriter = noodles_bgzf::io::multithreaded_writer::MultithreadedWriter<std::fs::File>;
+/// Output file under noodles' writer thread: buffered, because noodles issues
+/// about fourteen small `write_all`s per BGZF frame (header fields, data,
+/// trailer fields), each of which was a syscall on the bare `File`.
+type BufFile = BufWriter<std::fs::File>;
 
-/// Create the output file, the native multithreaded BGZF writer (4 workers,
-/// capped at the sample count), and the adaptive-depth sync channel shared by
-/// the VCF and BCF writers. The caller spawns the writer thread (which differs:
-/// TBI metadata scan vs. CSI drain) and sends the format-specific header.
+/// BGZF compression workers for an output stream. Blocks are cut at fixed
+/// uncompressed sizes and each is deflated on its own, so the compressed bytes
+/// do not depend on this count (checked by `csi::tests::bgzf_bytes_do_not_depend_on_worker_count`);
+/// it was `4.min(n_samples)`, a single compression thread for the one-user runs
+/// production makes, and four for a 100-sample BCF whose deflate then bounded
+/// the whole output stage.
+fn bgzf_worker_count() -> std::num::NonZeroUsize {
+    std::num::NonZeroUsize::new(rayon::current_num_threads().max(1)).unwrap()
+}
+
+/// Create the output file, the native multithreaded BGZF writer over `wrap(file)`
+/// and the adaptive-depth sync channel shared by the VCF and BCF writers. The
+/// caller spawns the writer thread (which differs: streamed TBI vs. CSI drain)
+/// and sends the format-specific header.
 #[inline]
-fn build_bgzf_channel(
+fn build_bgzf_channel<W: Write + Send + 'static>(
     path: &Path,
     n_samples: usize,
-) -> std::io::Result<(BgzfFileWriter, VcfSender, std::sync::mpsc::Receiver<Vec<u8>>)> {
-    let out_file = std::fs::File::create(path)?;
-    let bgzip_threads = 4.min(n_samples.max(1));
+    wrap: impl FnOnce(BufFile) -> W,
+) -> std::io::Result<(noodles_bgzf::io::multithreaded_writer::MultithreadedWriter<W>, VcfSender, std::sync::mpsc::Receiver<Vec<u8>>)> {
+    let out_file = BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
     let bgzf_writer = noodles_bgzf::io::multithreaded_writer::Builder::default()
-        .set_worker_count(std::num::NonZeroUsize::new(bgzip_threads).unwrap())
-        .build_from_writer(out_file);
+        .set_worker_count(bgzf_worker_count())
+        .build_from_writer(wrap(out_file));
 
     // Channel buffer sized adaptively: at biobank scale each VCF tile is ~300 MB
     // of text (5000 samples × 4096 variants). 64 tiles in flight = 19 GB waste.
@@ -547,6 +587,57 @@ fn build_bgzf_channel(
     let channel_depth = if n_samples >= 1000 { 4 } else { 16 };
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(channel_depth);
     Ok((bgzf_writer, tx, rx))
+}
+
+/// Byte offset just past the next `\n` at or after `start`, or `buf.len()`.
+#[inline]
+fn line_end(buf: &[u8], start: usize) -> usize {
+    memchr::memchr(b'\n', &buf[start..]).map(|p| start + p + 1).unwrap_or(buf.len())
+}
+
+/// Index metadata of each VCF line in one channel message, exactly as the writer
+/// thread has always derived it: lines are split per message; a data line needs
+/// at least four tabs and more than five bytes; `##contig` lines extend
+/// `contig_names`.
+struct VcfMetaScan {
+    contig_names: Vec<String>,
+    // Contig resolved once per run of identical chrom bytes, not per record.
+    last_chrom: Vec<u8>,
+    last_ref_id: u32,
+}
+
+impl VcfMetaScan {
+    fn new() -> Self { Self { contig_names: Vec::new(), last_chrom: Vec::new(), last_ref_id: 0 } }
+
+    fn scan(&mut self, buf: &[u8], mut push: impl FnMut(crate::srp::csi::TbiRec)) {
+        let mut start = 0;
+        while start < buf.len() {
+            let end = line_end(buf, start);
+            let line = &buf[start..end];
+            if !line.starts_with(b"#") && line.len() > 5 {
+                let mut tabs = [0usize; 4]; let mut nt = 0;
+                for i in memchr::memchr_iter(b'\t', line).take(4) { tabs[nt] = i; nt += 1; }
+                if nt >= 4 {
+                    let chrom = &line[..tabs[0]];
+                    if chrom != self.last_chrom.as_slice() {
+                        self.last_chrom.clear();
+                        self.last_chrom.extend_from_slice(chrom);
+                        self.last_ref_id = crate::srp::csi::tbi_ref_id(&self.contig_names, chrom);
+                    }
+                    let pos: i64 = std::str::from_utf8(&line[tabs[0]+1..tabs[1]])
+                        .unwrap_or("0").parse().unwrap_or(0) - 1;
+                    let rlen = (tabs[3] - tabs[2] - 1).max(1) as u32;
+                    push(crate::srp::csi::TbiRec { pos, rlen, ref_id: self.last_ref_id });
+                }
+            } else if line.starts_with(b"##contig=<ID=") {
+                let s = b"##contig=<ID=".len();
+                if let Some(e) = line[s..].iter().position(|&b| b == b',' || b == b'>') {
+                    self.contig_names.push(String::from_utf8_lossy(&line[s..s+e]).to_string());
+                }
+            }
+            start = end;
+        }
+    }
 }
 
 /// Setup the VCF writer: native noodles-bgzf (no external bgzip dependency).
@@ -561,61 +652,31 @@ pub fn setup_vcf_writer(
 ) -> std::io::Result<(VcfSender, VcfWriterHandle, VcfBgzipProc)> {
     let vcf_path = crate::common::utils::out_path(output_path, "vcf.gz");
 
-    let (bgzf_writer, tx, rx) = build_bgzf_channel(&vcf_path, n_samples)?;
+    let (block_tx, block_rx) = std::sync::mpsc::channel();
+    let (mut bgzf_writer, tx, rx) = build_bgzf_channel(&vcf_path, n_samples,
+        |f| crate::srp::csi::BgzfBlockTap::new(f, block_tx))?;
 
     let tbi_path = { let mut p = vcf_path.as_os_str().to_owned(); p.push(".tbi"); std::path::PathBuf::from(p) };
-    let vcf_path_clone = vcf_path.clone();
 
     let writer_handle = std::thread::spawn(move || -> std::io::Result<()> {
-        let mut writer = BufWriter::with_capacity(4 << 20, bgzf_writer);
-        // Collect record metadata for post-write index building
-        let mut record_meta: Vec<crate::srp::csi::TbiRec> = Vec::new();
-        let mut contig_names: Vec<String> = Vec::new();
-        // Contig resolved once per run of identical chrom bytes, not per record.
-        let mut last_chrom: Vec<u8> = Vec::new();
-        let mut last_ref_id: u32 = 0;
-
+        // The .tbi is built as the file is written: record metadata from each
+        // message, virtual positions from the block sizes the tap reports. It
+        // used to be built by reading the whole file back, single-threaded,
+        // after the last byte (and the per-record metadata held until then).
+        let mut index = crate::srp::csi::TbiStreamIndexer::new(block_rx);
+        let mut meta = VcfMetaScan::new();
         for buf in rx {
-            // Scan for record metadata while writing
-            let mut start = 0;
-            while start < buf.len() {
-                let end = buf[start..].iter().position(|&b| b == b'\n')
-                    .map(|p| start + p + 1).unwrap_or(buf.len());
-                let line = &buf[start..end];
-                if !line.starts_with(b"#") && line.len() > 5 {
-                    let mut tabs = [0usize; 4]; let mut nt = 0;
-                    for (i, &b) in line.iter().enumerate() {
-                        if b == b'\t' { if nt < 4 { tabs[nt] = i; } nt += 1; if nt >= 4 { break; } }
-                    }
-                    if nt >= 4 {
-                        let chrom = &line[..tabs[0]];
-                        if chrom != last_chrom.as_slice() {
-                            last_chrom.clear();
-                            last_chrom.extend_from_slice(chrom);
-                            last_ref_id = crate::srp::csi::tbi_ref_id(&contig_names, chrom);
-                        }
-                        let pos: i64 = std::str::from_utf8(&line[tabs[0]+1..tabs[1]])
-                            .unwrap_or("0").parse().unwrap_or(0) - 1;
-                        let rlen = (tabs[3] - tabs[2] - 1).max(1) as u32;
-                        record_meta.push(crate::srp::csi::TbiRec { pos, rlen, ref_id: last_ref_id });
-                    }
-                } else if line.starts_with(b"##contig=<ID=") {
-                    let s = b"##contig=<ID=".len();
-                    if let Some(e) = line[s..].iter().position(|&b| b == b',' || b == b'>') {
-                        contig_names.push(String::from_utf8_lossy(&line[s..s+e]).to_string());
-                    }
-                }
-                start = end;
-            }
-            writer.write_all(&buf)?;
+            meta.scan(&buf, |rec| index.push_meta(rec));
+            index.observe(&buf);
+            bgzf_writer.write_all(&buf)?;
+            index.process();
         }
-        writer.flush()?;
-        drop(writer);
-
-        // Fast post-write indexing: re-read with metadata already known
-        // Only need virtual positions — skip all parsing
-        crate::srp::csi::build_tbi_index_with_meta(&vcf_path_clone, &contig_names, &record_meta, &tbi_path)?;
-        Ok(())
+        // Finish explicitly so a failure on the last blocks or the EOF marker is
+        // an error (Drop swallows it), then flush the file buffer the same way.
+        let mut file = bgzf_writer.finish()?.into_inner();
+        file.flush()?;
+        drop(file);
+        index.finish(&meta.contig_names, &tbi_path)
     });
 
     // Write VCF header
@@ -639,188 +700,23 @@ pub fn finish_vcf_writer(
     Ok(())
 }
 
-/// Batch-format a tile of imputed variants using parallel chunked formatting.
-/// Splits the tile into coarse chunks (one per core) to avoid fine-grained
-/// rayon overhead while still parallelizing the memory-bound LUT+copy work.
-fn format_tile_batch(
-    alt_probs: &[f32],
-    tile_n: usize,
-    // Tile rows to format (a subrange when passthrough records split the tile).
-    rows: std::ops::Range<usize>,
-    n_haps: usize,
-    n_samples: usize,
-    global_start: usize,
-    n_ref_variants: usize,
-    vid_prefix_offset: usize,  // offset into vid_prefixes / is_chip / chip_local_idx
-    vid_prefixes: &[Vec<u8>],
-    is_chip: &[bool],
-    chip_local_idx: &[usize],
-    chip_genotypes: &crate::common::HaplotypeBitmatrix,
-    an_str: &[u8],
-    no_ap: bool,
-    // R4b: per-(chip-site,sample) hard-call preservation at re-routed sites.
-    is_input_chip: &[bool],
-    imp: &[bool],
-    site_conf_per_sample: Option<&[f64]>,
-    refine_thr: f64,
-) -> Vec<u8> {
-    // Validate dimensions
-    debug_assert!(alt_probs.len() >= n_haps * tile_n,
-        "alt_probs too small: {} < {} * {}", alt_probs.len(), n_haps, tile_n);
-    if rows.is_empty() { return Vec::new(); }
-    // R4b helper: at an input chip site, sample `s` with confidence >= thr keeps
-    // its verbatim hard call; everything else uses the panel alt_probs. Always
-    // false when site_conf_per_sample is None (refine off) → pre-R4b behavior.
-    let use_hardcall = |local_i: usize, s: usize| -> bool {
-        is_input_chip[local_i] && match site_conf_per_sample {
-            None => false,
-            Some(conf) => {
-                let ci = chip_local_idx[local_i];
-                conf.get(ci * n_samples + s).is_some_and(|&c| c >= refine_thr)
-            }
-        }
-    };
-    let n_rows = rows.len();
-    let n_chunks = 16.min(n_rows);
-    let chunk_size = n_rows.div_ceil(n_chunks);
-
-    let chunks: Vec<Vec<u8>> = (0..n_chunks).into_par_iter().map(|ci| {
-        let v_start = rows.start + ci * chunk_size;
-        if v_start >= rows.end { return Vec::new(); }
-        let v_end = (v_start + chunk_size).min(rows.end);
-        let n_vars = v_end - v_start;
-
-        let mut buf = Vec::with_capacity(n_vars * (n_samples * 16 + 80));
-        // Reused per-chunk dosage scratch for the two-pass DR² helper.
-        let mut ds_scratch = vec![0f32; n_samples];
-
-        for v in v_start..v_end {
-            let wgs_i = global_start + v;
-            if wgs_i >= n_ref_variants { break; }
-            let local_i = vid_prefix_offset + v;
-
-            if is_chip[local_i] {
-                let ci = chip_local_idx[local_i];
-                append_chip_line_bytes(&mut buf, vid_prefix_offset + v, ci,
-                    vid_prefixes, chip_genotypes, n_haps, n_samples, an_str);
-            } else {
-                let ci = chip_local_idx[local_i];
-                // R4b: per-sample (ap1, ap2). A confident sample at an input chip
-                // site contributes its verbatim hard call (0.0/1.0 per hap); every
-                // other sample contributes the panel alt_probs. Used for both the
-                // AC/AF/DR2 stats AND the per-sample FORMAT fields so stats track
-                // the actually-emitted dosages.
-                let sample_ap = |s: usize| -> (f32, f32) {
-                    if use_hardcall(local_i, s) {
-                        (chip_genotypes.get(ci, s * 2) as u8 as f32,
-                         chip_genotypes.get(ci, s * 2 + 1) as u8 as f32)
-                    } else {
-                        (alt_probs[(s * 2) * tile_n + v], alt_probs[(s * 2 + 1) * tile_n + v])
-                    }
-                };
-                // Single pass: compute stats AND format simultaneously.
-                // Write prefix + INFO first (need stats), then samples.
-                // Two-pass DR2 (var(dosage)/var_expected) via the shared helper —
-                // byte-identical f64 accumulation to the former inlined two passes.
-                let (ac, dr2) = crate::io::dosage_stats::imputed_ac_dr2(
-                    n_samples, n_haps,
-                    sample_ap,
-                    &mut ds_scratch,
-                );
-                let af = ac as f64 / n_haps as f64;
-
-                buf.extend_from_slice(&vid_prefixes[vid_prefix_offset + v]);
-                buf.extend_from_slice(b"\t.\tPASS\tAF=");
-                write_f4(&mut buf, af);
-                buf.extend_from_slice(b";AC=");
-                write_u32(&mut buf, ac);
-                buf.extend_from_slice(b";AN=");
-                buf.extend_from_slice(an_str);
-                buf.extend_from_slice(b";DR2=");
-                write_f4(&mut buf, dr2);
-                // IMP marks a site absent from the input. A typed site written with the
-                // model's dosage (some sample's call missing or untrusted) is not one.
-                if imp[local_i] { buf.extend_from_slice(b";IMP"); }
-                if no_ap {
-                    buf.extend_from_slice(b"\tGT:DS");
-                } else {
-                    buf.extend_from_slice(b"\tGT:DS:AP1:AP2");
-                }
-
-                // Pre-computed constant strings for trivial dosages.
-                // Narrowed to match 3-decimal DS precision: the fast path now
-                // only fires for dosages that would round to exactly 0 (or 2)
-                // at 3 decimals, so it preserves ultra-rare probabilities
-                // instead of collapsing them to the hom-ref integer.
-                const HOMREF_GTDS: &[u8] = b"\t0|0:0";
-                const HOMREF_GTDS_AP: &[u8] = b"\t0|0:0:0:0";
-                const HOMALT_GTDS: &[u8] = b"\t1|1:2";
-                const HOMALT_GTDS_AP: &[u8] = b"\t1|1:2:1:1";
-
-                for s in 0..n_samples {
-                    let (ap1, ap2) = sample_ap(s);
-
-                    // Fast path. NOTE the test is per-HAPLOTYPE, not on the summed
-                    // dosage: it fires when BOTH ap are below 0.0005, so a dosage in
-                    // [0.0005, 0.001) — one hap at 0.0004 and the other at 0.0004,
-                    // summing to 0.0008 — takes it and prints 0 where the general
-                    // path would print 0.001. Same at the top end. That is a factor-2
-                    // edge on the deliberate 3-decimal DS quantization, inside the
-                    // already-measured <=0.0001 OVERALL R2 text-rounding envelope, and
-                    // GT/AP/AC/AF/DR2 are unaffected (the stats close upstream). Kept
-                    // as-is; the comment used to claim it tested the sum.
-                    if ap1 < 0.0005 && ap2 < 0.0005 {
-                        buf.extend_from_slice(if no_ap { HOMREF_GTDS } else { HOMREF_GTDS_AP });
-                        continue;
-                    }
-                    if ap1 > 0.9995 && ap2 > 0.9995 {
-                        buf.extend_from_slice(if no_ap { HOMALT_GTDS } else { HOMALT_GTDS_AP });
-                        continue;
-                    }
-
-                    // Standard path: format via lookup tables (DS 3-dec, AP 2-dec)
-                    let ds = ap1 + ap2;
-                    let gt1 = if ap1 > 0.5 { 1usize } else { 0 };
-                    let gt2 = if ap2 > 0.5 { 1usize } else { 0 };
-                    let ds_idx = ((ds * 1000.0).round() as usize).min(2000);
-                    buf.push(b'\t');
-                    buf.extend_from_slice(GTDS_LUT_B[gt1][gt2][ds_idx]);
-                    if !no_ap {
-                        let ap1_idx = ((ap1 * 100.0).round() as usize).min(100);
-                        let ap2_idx = ((ap2 * 100.0).round() as usize).min(100);
-                        buf.extend_from_slice(AP_LUT_B[ap1_idx][ap2_idx]);
-                    }
-                }
-                buf.push(b'\n');
-            }
-        }
-        buf
-    }).collect();
-
-    let total_len: usize = chunks.iter().map(|c| c.len()).sum();
-    let mut buf = Vec::with_capacity(total_len);
-    for chunk in &chunks { buf.extend_from_slice(chunk); }
-    buf
-}
-
 use crate::io::vcf_fmt::{write_f4, write_u32};
 
 /// Append a chip VCF line (no GT:DS/AP — original phased genotypes) to `buf`
-/// without clearing it. `ci` is the chip-local variant index, `vp_idx` the
-/// variant-prefix index. Shared by `format_chip_line_bytes` and the chip branch
-/// of `format_tile_batch` so both emit byte-identical lines.
+/// without clearing it. `ci` is the chip-local variant index, `wgs_i` the panel
+/// variant. Shared by `format_chip_line_bytes` and the chip branch of the row
+/// formatter so both emit byte-identical lines.
 #[inline]
 fn append_chip_line_bytes(
-    buf: &mut Vec<u8>, vp_idx: usize, ci: usize,
-    vid_prefixes: &[Vec<u8>],
-    chip_gt: &crate::common::HaplotypeBitmatrix, n_haps: usize, n_samples: usize, an_str: &[u8],
+    buf: &mut Vec<u8>, setup: &WindowSetup, wgs_i: usize, ci: usize,
+    chip_gt: &crate::common::HaplotypeBitmatrix, n_haps: usize, n_samples: usize,
 ) {
     // Chip hard-call ALT count = popcount of the row over all n_haps (= 2·n_samples)
     // haplotypes. Word-wise popcount instead of a per-bit `get()` sweep; byte-identical.
-    let _ = n_samples;
+    let an_str = &setup.an_str;
     let ac = chip_gt.popcount_row(ci, n_haps);
     let af = ac as f64 / n_haps as f64;
-    buf.extend_from_slice(&vid_prefixes[vp_idx]);
+    setup.push_vid_prefix(buf, wgs_i);
     buf.extend_from_slice(b"\t.\tPASS\tAF=");
     write_f4(buf, af);
     buf.extend_from_slice(b";AC=");
@@ -839,16 +735,14 @@ fn append_chip_line_bytes(
     buf.push(b'\n');
 }
 
-/// Format a chip line into a reusable byte buffer.
+/// Format the chip line of panel variant `wgs_i` into a reusable byte buffer.
 fn format_chip_line_bytes(
-    buf: &mut Vec<u8>, wgs_i: usize, vp_idx: usize,
-    vid_prefixes: &[Vec<u8>],
-    chip_gt: &crate::common::HaplotypeBitmatrix, chip_idx: &[usize],
-    n_haps: usize, n_samples: usize, an_str: &[u8],
+    buf: &mut Vec<u8>, setup: &WindowSetup, wgs_i: usize,
+    chip_gt: &crate::common::HaplotypeBitmatrix, n_samples: usize,
 ) {
     buf.clear();
-    let ci = chip_idx[wgs_i];
-    append_chip_line_bytes(buf, vp_idx, ci, vid_prefixes, chip_gt, n_haps, n_samples, an_str);
+    let ci = setup.chip_local_idx[wgs_i - setup.own_wgs_start];
+    append_chip_line_bytes(buf, setup, wgs_i, ci, chip_gt, setup.n_haps, n_samples);
 }
 
 // ---------------------------------------------------------------------------
@@ -867,17 +761,18 @@ pub fn setup_bcf_writer(
 ) -> std::io::Result<(VcfSender, VcfWriterHandle, VcfBgzipProc)> {
     let bcf_path = crate::common::utils::out_path(output_path, "bcf");
 
-    let (bgzf_writer, tx, rx) = build_bgzf_channel(&bcf_path, n_samples)?;
+    let (mut bgzf_writer, tx, rx) = build_bgzf_channel(&bcf_path, n_samples, |f| f)?;
 
     let bcf_path_clone = bcf_path.clone();
 
     let writer_handle = std::thread::spawn(move || -> std::io::Result<()> {
-        let mut writer = BufWriter::with_capacity(4 << 20, bgzf_writer);
         for buf in rx {
-            writer.write_all(&buf)?;
+            bgzf_writer.write_all(&buf)?;
         }
-        writer.flush()?;
-        drop(writer);
+        // Finish explicitly: Drop would swallow an error on the last blocks.
+        let mut file = bgzf_writer.finish()?;
+        file.flush()?;
+        drop(file);
 
         // Fast post-write CSI indexing with multi-threaded BGZF reader
         crate::srp::csi::build_csi_index(&bcf_path_clone)?;
@@ -891,95 +786,6 @@ pub fn setup_bcf_writer(
     tx.send(header).map_err(|e| std::io::Error::other(e.to_string()))?;
 
     Ok((tx, writer_handle, ()))
-}
-
-/// Batch-format a tile of variants as BCF binary records (parallel).
-fn format_tile_batch_bcf(
-    alt_probs: &[f32],
-    tile_n: usize,
-    // Tile rows to encode (a subrange when passthrough records split the tile).
-    rows: std::ops::Range<usize>,
-    n_haps: usize,
-    n_samples: usize,
-    global_start: usize,
-    n_ref_variants: usize,
-    var_info_offset: usize,
-    var_infos: &[super::bcf_encode::BcfVariantInfo],
-    is_chip: &[bool],
-    chip_local_idx: &[usize],
-    chip_genotypes: &crate::common::HaplotypeBitmatrix,
-    no_ap: bool,
-    // R4b: per-(chip-site,sample) hard-call preservation at re-routed sites.
-    is_input_chip: &[bool],
-    imp: &[bool],
-    site_conf_per_sample: Option<&[f64]>,
-    refine_thr: f64,
-) -> Vec<u8> {
-    use super::bcf_encode;
-
-    if rows.is_empty() { return Vec::new(); }
-    let n_rows = rows.len();
-    let n_chunks = 16.min(n_rows);
-    let chunk_size = n_rows.div_ceil(n_chunks);
-
-    let chunks: Vec<Vec<u8>> = (0..n_chunks).into_par_iter().map(|ci| {
-        let v_start = rows.start + ci * chunk_size;
-        if v_start >= rows.end { return Vec::new(); }
-        let v_end = (v_start + chunk_size).min(rows.end);
-
-        // Estimate: ~(14*n_samples + 80) bytes per variant for BCF
-        let mut buf = Vec::with_capacity((v_end - v_start) * (n_samples * 14 + 80));
-        // Per-chunk reusable dosage scratch for the imputed two-pass DR2 helper
-        // (allocated once per parallel chunk, not per variant).
-        let mut ds_scratch = vec![0f32; n_samples];
-        // R4b: per-chunk reusable per-sample hard-call mask, filled only at a
-        // re-routed input chip site when a per-sample confidence matrix exists.
-        let mut hc_mask = vec![false; n_samples];
-
-        for v in v_start..v_end {
-            let wgs_i = global_start + v;
-            if wgs_i >= n_ref_variants { break; }
-            let local_i = var_info_offset + v;
-            let vi = &var_infos[local_i];
-
-            if is_chip[local_i] {
-                bcf_encode::encode_chip_record(
-                    &mut buf, vi.rid, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
-                    chip_genotypes, chip_local_idx[local_i], n_samples, n_haps,
-                );
-            } else {
-                // R4b: build the per-sample preserve-hard-call mask for this
-                // re-routed input chip site (no-op when refine off / not a chip).
-                let hc = match (is_input_chip[local_i], site_conf_per_sample) {
-                    (true, Some(conf)) => {
-                        let ci = chip_local_idx[local_i];
-                        let base = ci * n_samples;
-                        let mut any = false;
-                        for s in 0..n_samples {
-                            let keep = conf.get(base + s).is_some_and(|&c| c >= refine_thr);
-                            hc_mask[s] = keep;
-                            any |= keep;
-                        }
-                        if any {
-                            Some(bcf_encode::R4bHardcall { chip_genotypes, chip_idx: ci, mask: &hc_mask, sample_offset: 0 })
-                        } else { None }
-                    }
-                    _ => None,
-                };
-                bcf_encode::encode_imputed_record(
-                    &mut buf, vi.rid, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
-                    alt_probs, tile_n, v, n_samples, n_haps, no_ap, &mut ds_scratch,
-                    hc.as_ref(), imp[local_i],
-                );
-            }
-        }
-        buf
-    }).collect();
-
-    let total_len: usize = chunks.iter().map(|c| c.len()).sum();
-    let mut buf = Vec::with_capacity(total_len);
-    for chunk in &chunks { buf.extend_from_slice(chunk); }
-    buf
 }
 
 /// Format a single chip variant as BCF binary.
@@ -1108,46 +914,360 @@ pub struct WindowWriters<'a> {
     pub vcf_tx: &'a std::sync::mpsc::SyncSender<Vec<u8>>,
 }
 
-/// Accumulate the dosage-R² of every IMPUTED site in one interpolated tile into
-/// `acc` (the run-level mean-DR2 quality summary), with each imputed call's
-/// genotype confidence taken in the same pass. Chip/typed sites are skipped.
-/// Uses the raw panel `alt_probs`; at the rare `--refine` re-routed hard-call
-/// sites that is the model DR2, a negligible approximation for a summary.
-/// Parallel over fixed 64-variant chunks merged in order, so the sums are the
-/// same on every run (it was a serial pass on the writer thread, n_variants ×
-/// n_samples per run).
-fn accumulate_tile_dr2(
-    acc: &mut crate::io::dosage_stats::Dr2Summary,
-    alt_probs: &[f32], tile_n: usize, global_start: usize,
-    setup: &WindowSetup, n_samples: usize,
-) {
-    use crate::io::dosage_stats::Dr2Summary;
-    let n_rows = tile_n.min(setup.n_ref_variants.saturating_sub(global_start));
-    let parts: Vec<Dr2Summary> = (0..n_rows.div_ceil(64)).into_par_iter().map(|c| {
-        let mut part = Dr2Summary::default();
-        let mut scratch = vec![0f32; n_samples];
-        for v in c * 64..((c + 1) * 64).min(n_rows) {
-            let local_i = global_start - setup.own_wgs_start + v;
-            if setup.is_chip[local_i] { continue; }
-            let calls = std::cell::Cell::new(part);
-            let ap = |s: usize| {
-                let p = (alt_probs[(s * 2) * tile_n + v], alt_probs[(s * 2 + 1) * tile_n + v]);
-                let mut c = calls.get();
-                c.add_call(p.0, p.1);
-                calls.set(c);
-                p
-            };
-            let (_, dr2) = crate::io::dosage_stats::imputed_ac_dr2(n_samples, setup.n_haps, ap, &mut scratch);
-            part = calls.get();
-            part.add(dr2);
+// ---------------------------------------------------------------------------
+// Row formatters: one tile's rows to VCF text / BCF records, serially. The
+// encode loop runs many of them at once (one task per tile chunk); each line
+// depends only on its own row, so any split of a tile's rows concatenates to
+// the same bytes.
+// ---------------------------------------------------------------------------
+
+/// What the imputed-format row formatters read besides the interpolated values.
+struct RowFmt<'a> {
+    setup: &'a WindowSetup<'a>,
+    chip_genotypes: &'a crate::common::HaplotypeBitmatrix,
+    no_ap: bool,
+    var_infos: Option<&'a [super::bcf_encode::BcfVariantInfo]>,
+}
+
+impl RowFmt<'_> {
+    /// Append the VCF lines of rows `rows` of the tile starting at panel variant
+    /// `gs` (`alt_probs[hap * tile_n + v]`). Byte-identical to the per-chunk body
+    /// of the tile formatter it replaced (`old_format_tile_batch` in
+    /// `encode_equivalence_tests`).
+    fn vcf_rows(&self, buf: &mut Vec<u8>, ds_scratch: &mut [f32], alt_probs: &[f32], tile_n: usize,
+                gs: usize, rows: std::ops::Range<usize>) {
+        let setup = self.setup;
+        let (n_haps, n_samples, no_ap) = (setup.n_haps, setup.n_samples, self.no_ap);
+        let chip_genotypes = self.chip_genotypes;
+        for v in rows {
+            let wgs_i = gs + v;
+            if wgs_i >= setup.n_ref_variants { break; }
+            let local_i = wgs_i - setup.own_wgs_start;
+
+            if setup.is_chip[local_i] {
+                let ci = setup.chip_local_idx[local_i];
+                append_chip_line_bytes(buf, setup, wgs_i, ci, chip_genotypes, n_haps, n_samples);
+            } else {
+                let ci = setup.chip_local_idx[local_i];
+                // R4b: per-sample (ap1, ap2). A confident sample at an input chip
+                // site contributes its verbatim hard call (0.0/1.0 per hap); every
+                // other sample contributes the panel alt_probs. Used for both the
+                // AC/AF/DR2 stats AND the per-sample FORMAT fields so stats track
+                // the actually-emitted dosages.
+                let sample_ap = |s: usize| -> (f32, f32) {
+                    if setup.use_hardcall(local_i, s) {
+                        (chip_genotypes.get(ci, s * 2) as u8 as f32,
+                         chip_genotypes.get(ci, s * 2 + 1) as u8 as f32)
+                    } else {
+                        (alt_probs[(s * 2) * tile_n + v], alt_probs[(s * 2 + 1) * tile_n + v])
+                    }
+                };
+                // Two-pass DR2 (var(dosage)/var_expected) via the shared helper.
+                let (ac, dr2) = crate::io::dosage_stats::imputed_ac_dr2(
+                    n_samples, n_haps, sample_ap, ds_scratch);
+                let af = ac as f64 / n_haps as f64;
+
+                setup.push_vid_prefix(buf, wgs_i);
+                buf.extend_from_slice(b"\t.\tPASS\tAF=");
+                write_f4(buf, af);
+                buf.extend_from_slice(b";AC=");
+                write_u32(buf, ac);
+                buf.extend_from_slice(b";AN=");
+                buf.extend_from_slice(&setup.an_str);
+                buf.extend_from_slice(b";DR2=");
+                write_f4(buf, dr2);
+                // IMP marks a site absent from the input. A typed site written with the
+                // model's dosage (some sample's call missing or untrusted) is not one.
+                if setup.imp[local_i] { buf.extend_from_slice(b";IMP"); }
+                if no_ap {
+                    buf.extend_from_slice(b"\tGT:DS");
+                } else {
+                    buf.extend_from_slice(b"\tGT:DS:AP1:AP2");
+                }
+
+                // Pre-computed constant strings for trivial dosages.
+                // Narrowed to match 3-decimal DS precision: the fast path now
+                // only fires for dosages that would round to exactly 0 (or 2)
+                // at 3 decimals, so it preserves ultra-rare probabilities
+                // instead of collapsing them to the hom-ref integer.
+                const HOMREF_GTDS: &[u8] = b"\t0|0:0";
+                const HOMREF_GTDS_AP: &[u8] = b"\t0|0:0:0:0";
+                const HOMALT_GTDS: &[u8] = b"\t1|1:2";
+                const HOMALT_GTDS_AP: &[u8] = b"\t1|1:2:1:1";
+
+                for s in 0..n_samples {
+                    let (ap1, ap2) = sample_ap(s);
+
+                    // Fast path. NOTE the test is per-HAPLOTYPE, not on the summed
+                    // dosage: it fires when BOTH ap are below 0.0005, so a dosage in
+                    // [0.0005, 0.001) — one hap at 0.0004 and the other at 0.0004,
+                    // summing to 0.0008 — takes it and prints 0 where the general
+                    // path would print 0.001. Same at the top end. That is a factor-2
+                    // edge on the deliberate 3-decimal DS quantization, inside the
+                    // already-measured <=0.0001 OVERALL R2 text-rounding envelope, and
+                    // GT/AP/AC/AF/DR2 are unaffected (the stats close upstream). Kept
+                    // as-is; the comment used to claim it tested the sum.
+                    if ap1 < 0.0005 && ap2 < 0.0005 {
+                        buf.extend_from_slice(if no_ap { HOMREF_GTDS } else { HOMREF_GTDS_AP });
+                        continue;
+                    }
+                    if ap1 > 0.9995 && ap2 > 0.9995 {
+                        buf.extend_from_slice(if no_ap { HOMALT_GTDS } else { HOMALT_GTDS_AP });
+                        continue;
+                    }
+
+                    // Standard path: format via lookup tables (DS 3-dec, AP 2-dec)
+                    let ds = ap1 + ap2;
+                    let gt1 = if ap1 > 0.5 { 1usize } else { 0 };
+                    let gt2 = if ap2 > 0.5 { 1usize } else { 0 };
+                    let ds_idx = ((ds * 1000.0).round() as usize).min(2000);
+                    buf.push(b'\t');
+                    buf.extend_from_slice(GTDS_LUT_B[(gt1 * 2 + gt2) * 2001 + ds_idx]);
+                    if !no_ap {
+                        let ap1_idx = ((ap1 * 100.0).round() as usize).min(100);
+                        let ap2_idx = ((ap2 * 100.0).round() as usize).min(100);
+                        buf.extend_from_slice(AP_LUT_B[ap1_idx * 101 + ap2_idx]);
+                    }
+                }
+                buf.push(b'\n');
+            }
         }
-        part
-    }).collect();
-    for p in parts { acc.merge(&p); }
+    }
+
+    /// Append the BCF records of rows `rows` of the tile starting at `gs`.
+    /// Byte-identical to the per-chunk body of the BCF tile formatter it replaced
+    /// (`old_format_tile_batch_bcf` in `encode_equivalence_tests`).
+    fn bcf_rows(&self, buf: &mut Vec<u8>, ds_scratch: &mut [f32], hc_mask: &mut [bool],
+                alt_probs: &[f32], tile_n: usize, gs: usize, rows: std::ops::Range<usize>) {
+        use super::bcf_encode;
+        let setup = self.setup;
+        let (n_haps, n_samples, no_ap) = (setup.n_haps, setup.n_samples, self.no_ap);
+        let chip_genotypes = self.chip_genotypes;
+        let var_infos = self.var_infos.expect("BCF variant infos");
+        for v in rows {
+            let wgs_i = gs + v;
+            if wgs_i >= setup.n_ref_variants { break; }
+            let local_i = wgs_i - setup.own_wgs_start;
+            let vi = &var_infos[local_i];
+
+            if setup.is_chip[local_i] {
+                bcf_encode::encode_chip_record(
+                    buf, vi.rid, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
+                    chip_genotypes, setup.chip_local_idx[local_i], n_samples, n_haps,
+                );
+            } else {
+                // R4b: the per-sample preserve-hard-call mask for this re-routed
+                // input chip site (no-op when refine off / not a chip).
+                let hc = match (setup.is_input_chip[local_i], setup.site_conf_per_sample) {
+                    (true, Some(conf)) => {
+                        let ci = setup.chip_local_idx[local_i];
+                        let base = ci * n_samples;
+                        let mut any = false;
+                        for s in 0..n_samples {
+                            let keep = conf.get(base + s).is_some_and(|&c| c >= setup.refine_thr);
+                            hc_mask[s] = keep;
+                            any |= keep;
+                        }
+                        if any {
+                            Some(bcf_encode::R4bHardcall { chip_genotypes, chip_idx: ci, mask: &*hc_mask, sample_offset: 0 })
+                        } else { None }
+                    }
+                    _ => None,
+                };
+                bcf_encode::encode_imputed_record(
+                    buf, vi.rid, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
+                    alt_probs, tile_n, v, n_samples, n_haps, no_ap, ds_scratch,
+                    hc.as_ref(), setup.imp[local_i],
+                );
+            }
+        }
+    }
+}
+
+/// One 64-row chunk `c` of a tile's mean-DR² summary contribution: every
+/// IMPUTED row's dosage-R² and each of its calls' genotype confidence, from the
+/// raw panel `alt_probs` (chip/typed rows skipped). The summary merges these
+/// chunks in tile order then chunk order — the f64 sums are the same on every
+/// run and equal those of the per-tile pass this replaced (`old_accumulate_tile_dr2`
+/// in `encode_equivalence_tests`).
+fn dr2_chunk(setup: &WindowSetup, alt_probs: &[f32], tile_n: usize, global_start: usize,
+             c: usize, scratch: &mut [f32]) -> crate::io::dosage_stats::Dr2Summary {
+    use crate::io::dosage_stats::Dr2Summary;
+    let n_samples = setup.n_samples;
+    let n_rows = tile_n.min(setup.n_ref_variants.saturating_sub(global_start));
+    let mut part = Dr2Summary::default();
+    for v in c * 64..((c + 1) * 64).min(n_rows) {
+        let local_i = global_start - setup.own_wgs_start + v;
+        if setup.is_chip[local_i] { continue; }
+        let calls = std::cell::Cell::new(part);
+        let ap = |s: usize| {
+            let p = (alt_probs[(s * 2) * tile_n + v], alt_probs[(s * 2 + 1) * tile_n + v]);
+            let mut c = calls.get();
+            c.add_call(p.0, p.1);
+            calls.set(c);
+            p
+        };
+        let (_, dr2) = crate::io::dosage_stats::imputed_ac_dr2(n_samples, setup.n_haps, ap, scratch);
+        part = calls.get();
+        part.add(dr2);
+    }
+    part
+}
+
+/// Number of 64-row DR² chunks of a tile (see `dr2_chunk`).
+#[inline]
+fn dr2_chunks(setup: &WindowSetup, tile_n: usize, global_start: usize) -> usize {
+    tile_n.min(setup.n_ref_variants.saturating_sub(global_start)).div_ceil(64)
+}
+
+/// Sends the window's output bytes down the writer channel in order, packing
+/// consecutive small buffers into one message of up to `MSG_BYTES`.
+///
+/// The bytes reaching the file are unchanged. For VCF the writer thread also
+/// reads index metadata line by line within each message, so a buffer is only
+/// appended to a message when everything before it ends with `\n` — then the
+/// lines of the packed message are exactly the lines of its parts. A buffer not
+/// ending in `\n` closes its message.
+struct ChannelOut<'a> {
+    tx: &'a std::sync::mpsc::SyncSender<Vec<u8>>,
+    pending: Vec<u8>,
+    /// Text output (VCF): apply the line rule above.
+    lines: bool,
+}
+
+impl<'a> ChannelOut<'a> {
+    const MSG_BYTES: usize = 4 << 20;
+
+    fn new(tx: &'a std::sync::mpsc::SyncSender<Vec<u8>>, lines: bool) -> Self {
+        Self { tx, pending: Vec::new(), lines }
+    }
+
+    #[inline]
+    fn send_now(&self, buf: Vec<u8>) {
+        self.tx.send(buf).expect("VCF send failed");
+    }
+
+    fn flush(&mut self) {
+        if !self.pending.is_empty() {
+            let buf = std::mem::take(&mut self.pending);
+            self.send_now(buf);
+        }
+    }
+
+    fn push(&mut self, buf: Vec<u8>) {
+        if buf.is_empty() { return; }
+        if self.lines && buf.last() != Some(&b'\n') {
+            self.flush();
+            self.send_now(buf);
+            return;
+        }
+        if self.pending.len() + buf.len() > Self::MSG_BYTES { self.flush(); }
+        if self.pending.is_empty() {
+            if buf.len() >= Self::MSG_BYTES / 2 { self.send_now(buf); } else { self.pending = buf; }
+        } else {
+            self.pending.extend_from_slice(&buf);
+        }
+    }
+}
+
+/// A tile's output plan: its row segments (split where passthrough records are
+/// anchored inside it, exactly as the encode loop always split them), the
+/// passthrough records between segments, and its formatting / DR² tasks.
+struct TilePlan {
+    /// Segment boundaries `[0, b1, …, tile_n]`.
+    bounds: Vec<usize>,
+    /// Passthrough records written after segment `i` (one fewer than segments).
+    pass_groups: Vec<std::ops::Range<usize>>,
+    /// Formatting tasks of each segment (indices into the group's task list).
+    seg_tasks: Vec<std::ops::Range<usize>>,
+    dr2_tasks: std::ops::Range<usize>,
+}
+
+/// Work item of a tile group: format rows `rows` of tile `k`, or DR² chunk `c`.
+enum FmtTask {
+    Rows { k: usize, rows: std::ops::Range<usize> },
+    Dr2 { k: usize, c: usize },
+}
+
+enum FmtOut {
+    Bytes { vcf: Vec<u8>, bcf: Vec<u8> },
+    Dr2(crate::io::dosage_stats::Dr2Summary),
+}
+
+/// Plan tile `k` (rows `[gs, gs + tile_n)`), appending its tasks to `tasks`.
+fn plan_tile(
+    k: usize, gs: usize, tile_n: usize, rows_per_task: usize,
+    setup: &WindowSetup, passthrough: Option<&crate::io::passthrough::Passthrough>,
+    want_rows: bool, tasks: &mut Vec<FmtTask>,
+) -> TilePlan {
+    let tile_end = (gs + tile_n).min(setup.n_ref_variants);
+    let mut bounds = vec![0usize];
+    let mut pass_groups = Vec::new();
+    if let Some((pass, recs)) = passthrough.map(|p| (p, p.anchored_in(gs, tile_end))).filter(|(_, r)| !r.is_empty()) {
+        let mut i = recs.start;
+        while i < recs.end {
+            let a = pass.anchor(i);
+            let group = pass.before(a);
+            bounds.push(a - gs);
+            pass_groups.push(group.clone());
+            i = group.end;
+        }
+    }
+    bounds.push(tile_n);
+    let mut seg_tasks = Vec::with_capacity(bounds.len() - 1);
+    for w in bounds.windows(2) {
+        let t0 = tasks.len();
+        if want_rows {
+            let mut r = w[0];
+            while r < w[1] {
+                let e = (r + rows_per_task).min(w[1]);
+                tasks.push(FmtTask::Rows { k, rows: r..e });
+                r = e;
+            }
+        }
+        seg_tasks.push(t0..tasks.len());
+    }
+    let d0 = tasks.len();
+    for c in 0..dr2_chunks(setup, tile_n, gs) { tasks.push(FmtTask::Dr2 { k, c }); }
+    TilePlan { bounds, pass_groups, seg_tasks, dr2_tasks: d0..tasks.len() }
+}
+
+/// Run a group's formatting and DR² tasks in parallel, results in task order.
+/// `tile(k)` gives tile `k`'s `(alt_probs, tile_n, global_start)`.
+fn run_fmt_tasks<'t>(
+    fmt: &RowFmt, vcf: bool, bcf: bool, tasks: &[FmtTask],
+    tile: impl Fn(usize) -> (&'t [f32], usize, usize) + Sync,
+) -> Vec<FmtOut> {
+    let setup = fmt.setup;
+    let n_samples = setup.n_samples;
+    // Per-sample scratch, per task: the formatting itself allocates far more.
+    tasks.par_iter().map(|task| match *task {
+        FmtTask::Rows { k, ref rows } => {
+            let (ap, tile_n, gs) = tile(k);
+            let mut ds_scratch = vec![0f32; n_samples];
+            let mut vcf_buf = Vec::new();
+            let mut bcf_buf = Vec::new();
+            if vcf {
+                vcf_buf.reserve(rows.len() * (n_samples * 16 + 80));
+                fmt.vcf_rows(&mut vcf_buf, &mut ds_scratch, ap, tile_n, gs, rows.clone());
+            }
+            if bcf {
+                let mut hc_mask = vec![false; n_samples];
+                bcf_buf.reserve(rows.len() * (n_samples * 14 + 80));
+                fmt.bcf_rows(&mut bcf_buf, &mut ds_scratch, &mut hc_mask, ap, tile_n, gs, rows.clone());
+            }
+            FmtOut::Bytes { vcf: vcf_buf, bcf: bcf_buf }
+        }
+        FmtTask::Dr2 { k, c } => {
+            let (ap, tile_n, gs) = tile(k);
+            let mut scratch = vec![0f32; n_samples];
+            FmtOut::Dr2(dr2_chunk(setup, ap, tile_n, gs, c, &mut scratch))
+        }
+    }).collect()
 }
 
 /// Write one window to all active output formats.
-/// VCF/BCF bytes are sent directly to `writers.vcf_tx` as produced — no accumulation.
+/// VCF/BCF bytes are sent to `writers.vcf_tx` as produced, in output order.
 pub fn write_window_multiformat(
     formats: &OutputFormats,
     input: WindowInput<'_>,
@@ -1162,10 +1282,12 @@ pub fn write_window_multiformat(
     } = input;
     let WindowWriters { parquet: parquet_writer, pgen: pgen_writer, selfdecode: sd_writer, vcf_tx } = writers;
 
+    let t0_setup = std::time::Instant::now();
     let setup = WindowSetup::new(
         srp, all_weights, win_chip_start,
         own_chip_start, own_chip_end, wgs_idx, n_samples,
         site_conf, site_conf_per_sample, refine_thr, uncalled_typed,
+        parquet_writer.is_some(),
     );
 
     if setup.intervals.is_empty() {
@@ -1190,10 +1312,11 @@ pub fn write_window_multiformat(
         for cid in fc..=lc { let _ = srp.load_chunk(cid); }
     }
 
-    // ---- FUSED INTERPOLATE + ENCODE: per-batch for tiled, per-interval for CSC ----
-    // Tiles are interpolated, encoded to all formats, then dropped immediately.
-    // Never holds more than one batch of tiles in memory.
+    // ---- FUSED INTERPOLATE + ENCODE ----
+    // Tiles are interpolated, formatted and DR²-summarised in parallel a group
+    // at a time, then their output is written in order; nothing outlives its group.
     let t0_pipeline = std::time::Instant::now();
+    crate::selphi_debug!("  [multiformat] window setup={:.2}s", t0_setup.elapsed().as_secs_f64());
     let mut next_wgs = setup.own_wgs_start;
 
     let mut pw = parquet_writer;
@@ -1213,6 +1336,13 @@ pub fn write_window_multiformat(
     // BCF contig index of this window's chromosome, for passthrough records.
     let pass_rid = var_infos.as_ref().and_then(|v| v.first()).map(|v| v.rid).unwrap_or(0);
 
+    let mut out = ChannelOut::new(vcf_tx, formats.vcf);
+    let fmt = RowFmt { setup: &setup, chip_genotypes, no_ap, var_infos: var_infos.as_deref() };
+    let want_rows = formats.vcf || formats.bcf;
+    // Rows per formatting task: about FMT_TASK_BYTES of output each.
+    let row_bytes = 80 + n_samples * if formats.bcf && !formats.vcf { 14 } else { 16 };
+    let rows_per_task = (FMT_TASK_BYTES / row_bytes).max(16);
+
     // Macro: write passthrough records `$recs` (indices into `passthrough`) to
     // every active format. VCF/BCF carry every record; the dosage formats carry
     // the biallelic ones.
@@ -1223,14 +1353,14 @@ pub fn write_window_multiformat(
                 if formats.vcf {
                     let mut buf = Vec::with_capacity(recs.len() * (n_samples * 4 + 64));
                     for i in recs.clone() { pass.append_vcf(i, 0..n_samples, &mut buf); }
-                    vcf_tx.send(buf).expect("VCF send failed");
+                    out.push(buf);
                 }
                 if formats.bcf {
                     let mut buf = Vec::with_capacity(recs.len() * (n_samples * 2 + 64));
                     for i in recs.clone() {
                         super::bcf_encode::encode_passthrough_record(&mut buf, pass_rid, pass.rec(i), 0..n_samples);
                     }
-                    vcf_tx.send(buf).expect("VCF send failed");
+                    out.push(buf);
                 }
                 if let Some((ref mut writer, _)) = pw {
                     if let Some(ref sa) = schema_arc {
@@ -1262,16 +1392,15 @@ pub fn write_window_multiformat(
                 if setup.is_chip[local_idx] {
                     if formats.vcf {
                         let mut buf = Vec::with_capacity(n_samples * 20);
-                        format_chip_line_bytes(&mut buf, local_idx, local_idx, &setup.vid_prefixes,
-                            chip_genotypes, &setup.chip_local_idx, setup.n_haps, n_samples, &setup.an_str);
-                        vcf_tx.send(buf).expect("VCF send failed");
+                        format_chip_line_bytes(&mut buf, &setup, next_wgs, chip_genotypes, n_samples);
+                        out.push(buf);
                     }
                     if formats.bcf {
                         let vi = var_infos.as_ref().unwrap();
                         let mut buf = Vec::with_capacity(n_samples * 16);
                         format_chip_bcf(&mut buf, local_idx, local_idx, vi, chip_genotypes,
                             &setup.chip_local_idx, setup.n_haps, n_samples);
-                        vcf_tx.send(buf).expect("VCF send failed");
+                        out.push(buf);
                     }
                     // Parquet gets the same variant the other four formats get here.
                     // This arm was missing, so a chip site that falls outside every
@@ -1287,7 +1416,7 @@ pub fn write_window_multiformat(
                                 writer, sa, &[], 1, 0..1, n_samples, setup.n_haps,
                                 next_wgs, &setup.vid_prefixes, vp_start, &setup.is_chip,
                                 &setup.chip_local_idx, chip_genotypes, setup.n_ref_variants,
-                                &setup.is_input_chip, &setup.imp, setup.site_conf_per_sample.as_deref(), setup.refine_thr)?;
+                                &setup.is_input_chip, &setup.imp, setup.site_conf_per_sample, setup.refine_thr)?;
                         }
                     }
                     if formats.pgen || formats.selfdecode {
@@ -1315,31 +1444,11 @@ pub fn write_window_multiformat(
         };
     }
 
-    // Macro: encode rows `$rows` of one interpolated tile to all formats
-    macro_rules! encode_rows {
+    // Macro: write rows `$rows` of one interpolated tile to the formats encoded
+    // serially (Parquet, PGEN, SelfDecode); VCF/BCF come pre-formatted.
+    macro_rules! serial_rows {
         ($alt_probs:expr, $tile_n:expr, $global_start:expr, $rows:expr) => {{
             let rows: std::ops::Range<usize> = $rows;
-            if formats.vcf {
-                let vp_start = $global_start - setup.own_wgs_start;
-                vcf_tx.send(format_tile_batch(
-                    $alt_probs, $tile_n, rows.clone(), setup.n_haps, n_samples,
-                    $global_start, setup.n_ref_variants,
-                    vp_start, &setup.vid_prefixes, &setup.is_chip, &setup.chip_local_idx,
-                    chip_genotypes, &setup.an_str, no_ap,
-                    &setup.is_input_chip, &setup.imp, setup.site_conf_per_sample.as_deref(), setup.refine_thr,
-                )).expect("VCF send failed");
-            }
-            if formats.bcf {
-                let vi = var_infos.as_ref().unwrap();
-                let vi_start = $global_start - setup.own_wgs_start;
-                vcf_tx.send(format_tile_batch_bcf(
-                    $alt_probs, $tile_n, rows.clone(), setup.n_haps, n_samples,
-                    $global_start, setup.n_ref_variants,
-                    vi_start, vi, &setup.is_chip, &setup.chip_local_idx,
-                    chip_genotypes, no_ap,
-                    &setup.is_input_chip, &setup.imp, setup.site_conf_per_sample.as_deref(), setup.refine_thr,
-                )).expect("VCF send failed");
-            }
             if let Some((ref mut writer, _)) = pw {
                 if let Some(ref sa) = schema_arc {
                     let vp_start = $global_start - setup.own_wgs_start;
@@ -1347,7 +1456,7 @@ pub fn write_window_multiformat(
                         writer, sa, $alt_probs, $tile_n, rows.clone(), n_samples, setup.n_haps,
                         $global_start, &setup.vid_prefixes, vp_start, &setup.is_chip,
                         &setup.chip_local_idx, chip_genotypes, setup.n_ref_variants,
-                        &setup.is_input_chip, &setup.imp, setup.site_conf_per_sample.as_deref(), setup.refine_thr)?;
+                        &setup.is_input_chip, &setup.imp, setup.site_conf_per_sample, setup.refine_thr)?;
                 }
             }
             if formats.pgen || formats.selfdecode {
@@ -1408,30 +1517,33 @@ pub fn write_window_multiformat(
         }};
     }
 
-    // Macro: encode one interpolated tile to all formats. A tile holding the
-    // anchor of a passthrough record is encoded in row segments with the records
-    // written between them; any other tile takes the single-range path.
-    macro_rules! encode_tile {
-        ($alt_probs:expr, $tile_n:expr, $global_start:expr) => {{
-            let tile_end = ($global_start + $tile_n).min(setup.n_ref_variants);
-            match passthrough.map(|p| (p, p.anchored_in($global_start, tile_end))).filter(|(_, r)| !r.is_empty()) {
-                None => encode_rows!($alt_probs, $tile_n, $global_start, 0..$tile_n),
-                Some((pass, recs)) => {
-                    let (mut row, mut i) = (0usize, recs.start);
-                    while i < recs.end {
-                        let a = pass.anchor(i);
-                        let group = pass.before(a);
-                        encode_rows!($alt_probs, $tile_n, $global_start, row..a - $global_start);
-                        emit_pass!(group.clone());
-                        row = a - $global_start;
-                        i = group.end;
+    // Macro: write one planned, formatted tile in output order: each row segment
+    // (VCF, BCF, then the serial formats), the passthrough records between
+    // segments, then the tile's DR² chunks into the run summary.
+    macro_rules! emit_tile {
+        ($plan:expr, $results:expr, $alt_probs:expr, $tile_n:expr, $global_start:expr) => {{
+            let plan: &TilePlan = $plan;
+            let results: &mut [FmtOut] = $results;
+            let n_seg = plan.bounds.len() - 1;
+            for seg in 0..n_seg {
+                if formats.vcf {
+                    for ti in plan.seg_tasks[seg].clone() {
+                        if let FmtOut::Bytes { vcf, .. } = &mut results[ti] { out.push(std::mem::take(vcf)); }
                     }
-                    encode_rows!($alt_probs, $tile_n, $global_start, row..$tile_n);
                 }
+                if formats.bcf {
+                    for ti in plan.seg_tasks[seg].clone() {
+                        if let FmtOut::Bytes { bcf, .. } = &mut results[ti] { out.push(std::mem::take(bcf)); }
+                    }
+                }
+                serial_rows!($alt_probs, $tile_n, $global_start, plan.bounds[seg]..plan.bounds[seg + 1]);
+                if seg + 1 < n_seg { emit_pass!(plan.pass_groups[seg].clone()); }
             }
             // Format-independent imputation-quality accumulation (mean DR2 over
-            // imputed sites). Runs once per tile regardless of active formats.
-            accumulate_tile_dr2(dr2_acc, $alt_probs, $tile_n, $global_start, &setup, n_samples);
+            // imputed sites), once per tile regardless of active formats.
+            for ti in plan.dr2_tasks.clone() {
+                if let FmtOut::Dr2(p) = &results[ti] { dr2_acc.merge(p); }
+            }
         }};
     }
 
@@ -1445,14 +1557,36 @@ pub fn write_window_multiformat(
         let n_tile_cols = tiled.n_tile_cols;
         let n_tiled_variants = tiled.n_variants();
         use crate::srp::TILE_ROWS;
+        // Reused tile decoders for this stage, dropped with it (also on `?`).
+        let decoders = crate::srp::tiled::TileDecoderScope::pool();
 
         let window_last_stripe = if setup.own_wgs_end > 0 { (setup.own_wgs_end - 1) / TILE_ROWS } else { 0 };
         let window_first_stripe = if !setup.intervals.is_empty() { setup.intervals[0].wgs_start / TILE_ROWS } else { 0 };
 
-        let stripe_comp = tiled.stripe_compressed_bytes(window_first_stripe);
-        let comp_mem_cap: usize = 500 * 1024 * 1024;
-        let stripe_preload_batch = (comp_mem_cap / stripe_comp.max(1)).max(10)
-            .min(window_last_stripe - window_first_stripe + 1);
+        // Compressed bytes of the window's stripes, as prefix sums: `comp_bytes(a, b)`
+        // is stripes a..=b. Batches and reads are sized from these. (Reads were
+        // sized as 500 MB over the window's FIRST stripe, which on the
+        // 75,552-haplotype panel's chr22 read 741 MB at once, with the next
+        // 694 MB read alongside it.)
+        let comp_prefix: Vec<usize> = std::iter::once(0usize)
+            .chain((window_first_stripe..=window_last_stripe).scan(0usize, |acc, s| {
+                *acc += tiled.stripe_compressed_bytes(s);
+                Some(*acc)
+            }))
+            .collect();
+        let comp_bytes = |a: usize, b: usize| comp_prefix[b + 1 - window_first_stripe] - comp_prefix[a - window_first_stripe];
+        // Stripes to read from `fs`: at least `min_n`, then more while the read
+        // stays within COMP_READ_BYTES (so small stripes are read many at once),
+        // but never more stripes than the previous scheme read past a batch
+        // (500 MB over the window's first stripe, at least 10).
+        let prev_read_stripes = (500 * 1024 * 1024 / tiled.stripe_compressed_bytes(window_first_stripe).max(1)).max(10);
+        let preload_n = |fs: usize, min_n: usize| -> usize {
+            let max_n = window_last_stripe - fs + 1;
+            let ext_n = prev_read_stripes.max(min_n).min(max_n);
+            let mut n = min_n.min(max_n);
+            while n < ext_n && comp_bytes(fs, fs + n) <= COMP_READ_BYTES { n += 1; }
+            n
+        };
 
         // Partition the window's TILES — not its intervals — into memory-bounded
         // batches. A tile is interpolated from the stripes that cover it and from
@@ -1464,6 +1598,11 @@ pub fn write_window_multiformat(
         // held 5.6 GB of decompressed stripes, 1.5 GB of compressed preload and
         // n_haps × 4 MB of result tiles at once. It was the run's memory peak —
         // and 8 MB per SAMPLE of the per-sample slope — on a 100-sample run.
+        // (A batch's interpolated values and decompressed stripes are no longer
+        // held at once — see the tile groups below — but the cap still budgets
+        // them. A batch is now also cut at COMP_READ_BYTES of compressed stripes:
+        // it is the unit of reading. Batching does not touch the output, which is
+        // per tile.)
         let decomp_tile_bytes: usize = 500 * 1024;
         let bytes_per_stripe = n_tile_cols * decomp_tile_bytes;
         let result_bytes_per_stripe = setup.n_haps * TILE_ROWS * 4;
@@ -1493,7 +1632,7 @@ pub fn write_window_multiformat(
             for (i, d) in all_descs.iter().enumerate() {
                 let (dfs, dls) = desc_stripes(d);
                 if i == bs { fs = dfs; }
-                if dls - fs + 1 > max_stripes_per_batch && i > bs {
+                if (dls - fs + 1 > max_stripes_per_batch || comp_bytes(fs, dls) > COMP_READ_BYTES) && i > bs {
                     let (_, pls) = desc_stripes(&all_descs[i - 1]);
                     v.push((bs, i, fs, pls));
                     bs = i;
@@ -1507,8 +1646,32 @@ pub fn write_window_multiformat(
             v
         };
 
+        // Tile groups: consecutive tiles whose interpolated values fit in
+        // GROUP_BYTES and whose formatted output is estimated to as well. The
+        // values live in `arena`, allocated once per window and reused by every
+        // group (it was one fresh `Vec` per tile, all of a batch's held at once:
+        // 856 MB on the 100-sample chr22 rig, 1.86 GB at 801 samples, page-faulted
+        // in anew for every batch).
+        let row_out_bytes = if want_rows { row_bytes } else { 0 };
+        let mut arena: Vec<f32> = Vec::new();
+        // Wall time per phase, for the --debug summary.
+        let (mut t_dec, mut t_interp, mut t_fmt, mut t_emit, mut t_io) = (0f64, 0f64, 0f64, 0f64, 0f64);
+        // Decompressed stripes a group may span (at least one tile's worth).
+        let group_stripes = (GROUP_BYTES / bytes_per_stripe.max(1)).max(8);
+
         let mut stripe_loaded: Option<crate::srp::tiled::PreloadedStripes> = preloaded_stripes;
         let mut next_io_handle: Option<std::thread::JoinHandle<std::io::Result<crate::srp::tiled::PreloadedStripes>>> = None;
+        // Compressed-read buffers are allocated on this thread and recycled: a
+        // buffer the background reader allocated and this thread freed lingered
+        // in the allocator (`TiledSrpReader::preload_stripes_into`). A spent
+        // buffer is kept for the next read when its size fits (within 1.5x).
+        let mut spare_buf: Option<Vec<u8>> = None;
+        let take_buf = |spare: &mut Option<Vec<u8>>, need: usize| -> Vec<u8> {
+            match spare.take() {
+                Some(b) if b.capacity() >= need && b.capacity() <= need + need / 2 => b,
+                _ => Vec::with_capacity(need),
+            }
+        };
 
         // Intervals are visited in order for chip-gap emission. Those that own no
         // tile (zero length) are flushed when the next interval's first tile is
@@ -1518,6 +1681,7 @@ pub fn write_window_multiformat(
         for (bi, &(d0, d1, b_first_stripe, b_last_stripe)) in batches.iter().enumerate() {
             let b_n_stripes = b_last_stripe - b_first_stripe + 1;
 
+            let tp = std::time::Instant::now();
             // Load compressed stripe data
             let loaded_ok = stripe_loaded.as_ref().is_some_and(|l|
                 l.contains_stripe(b_first_stripe) && l.contains_stripe(b_last_stripe));
@@ -1525,19 +1689,24 @@ pub fn write_window_multiformat(
                 if let Some(handle) = next_io_handle.take() {
                     match handle.join().expect("stripe I/O panicked") {
                         Ok(loaded) if loaded.contains_stripe(b_first_stripe) && loaded.contains_stripe(b_last_stripe) => {
-                            stripe_loaded = Some(loaded);
+                            if let Some(old) = stripe_loaded.replace(loaded) { spare_buf = Some(old.buf); }
                         }
                         _ => {
-                            let n = b_n_stripes.max(stripe_preload_batch).min(window_last_stripe - b_first_stripe + 1);
-                            stripe_loaded = Some(tiled.preload_stripes(b_first_stripe, n)?);
+                            if let Some(old) = stripe_loaded.take() { spare_buf = Some(old.buf); }
+                            let n = preload_n(b_first_stripe, b_n_stripes);
+                            let buf = take_buf(&mut spare_buf, tiled.stripes_read_len(b_first_stripe, n));
+                            stripe_loaded = Some(tiled.preload_stripes_into(b_first_stripe, n, buf)?);
                         }
                     }
                 } else {
-                    let n = b_n_stripes.max(stripe_preload_batch).min(window_last_stripe - b_first_stripe + 1);
-                    stripe_loaded = Some(tiled.preload_stripes(b_first_stripe, n)?);
+                    if let Some(old) = stripe_loaded.take() { spare_buf = Some(old.buf); }
+                    let n = preload_n(b_first_stripe, b_n_stripes);
+                    let buf = take_buf(&mut spare_buf, tiled.stripes_read_len(b_first_stripe, n));
+                    stripe_loaded = Some(tiled.preload_stripes_into(b_first_stripe, n, buf)?);
                 }
             }
             let loaded = stripe_loaded.as_ref().unwrap();
+            t_io += tp.elapsed().as_secs_f64();
 
             // Background I/O for next batch
             if bi + 1 < batches.len() {
@@ -1547,64 +1716,141 @@ pub fn write_window_multiformat(
                     let tiled_path = tiled.file_path().to_path_buf();
                     let n_v = n_tiled_variants;
                     let n_h = tiled.n_haps();
-                    let n_load = next_ns.max(stripe_preload_batch).min(window_last_stripe - next_fs + 1);
+                    let n_load = preload_n(next_fs, next_ns);
                     let fs = next_fs;
+                    let buf = take_buf(&mut spare_buf, tiled.stripes_read_len(fs, n_load));
                     next_io_handle = Some(std::thread::spawn(move || {
                         let t = crate::srp::tiled::TiledSrpReader::open(&tiled_path, n_v, n_h)?;
-                        t.preload_stripes(fs, n_load)
+                        t.preload_stripes_into(fs, n_load, buf)
                     }));
                 }
             }
 
-            crate::selphi_debug!("  [MEM] interp batch {}/{}: {} stripes, cap {} stripes/batch, stripe buf {} MB, all_tiles will be {} MB: rss={:.0} MB",
+            crate::selphi_debug!("  [MEM] interp batch {}/{}: {} stripes, cap {} stripes/batch, stripe buf {} MB (waited {:.2}s): rss={:.0} MB",
                 bi + 1, batches.len(), b_n_stripes, max_stripes_per_batch,
-                loaded.buf.len() / 1_000_000,
-                (b_n_stripes * TILE_ROWS * setup.n_haps * 4) / 1_000_000,
+                loaded.buf.len() / 1_000_000, tp.elapsed().as_secs_f64(),
                 crate::log::rss_mb());
-            // Decompress stripes
-            let stripe_tiles: Vec<Vec<crate::srp::SparseTile>> = (0..b_n_stripes)
-                .into_par_iter()
-                .map(|si| {
-                    let s = b_first_stripe + si;
-                    (0..n_tile_cols).map(|band| loaded.decompress_tile(s, band)).collect()
-                })
-                .collect();
+            // Stripes are decompressed as the groups reach them and dropped once
+            // behind: `stripe_tiles[i]` is stripe `dec_lo + i`. (The whole batch
+            // was decompressed up front — on the 75,552-haplotype panel 220
+            // stripes × 19 bands at once.)
+            let mut stripe_tiles: Vec<Vec<crate::srp::SparseTile>> = Vec::new();
+            let mut dec_lo = b_first_stripe;
 
-            // Parallel interpolation of this batch's tiles
             let batch_descs = &all_descs[d0..d1];
-            let all_tiles: Vec<Vec<f32>> = batch_descs.par_iter().map(|desc| {
-                // Interval anchors sit at variant indices `gs - ts` and `iv_end`.
-                let t: Vec<f32> = interp_cum_cm
-                    .and_then(|cum| cm_t_values(cum, desc.gs - desc.ts, desc.iv_end, desc.ts, desc.tile_n))
-                    .unwrap_or_else(|| (0..desc.tile_n).map(|v| (desc.ts + v) as f32 / desc.full_range).collect());
-                interpolate_tile_batch(
-                    &stripe_tiles, b_first_stripe, n_tiled_variants, n_tile_cols,
-                    &setup.weight_refs, desc.ws, desc.we,
-                    desc.gs, desc.tile_n, &t, setup.n_haps)
-            }).collect();
-            drop(stripe_tiles); // free decompressed stripes
-            crate::selphi_debug!("  [MEM] interp batch {}/{}: tiles interpolated: rss={:.0} MB", bi + 1, batches.len(), crate::log::rss_mb());
+            let mut g0 = 0usize;
+            while g0 < batch_descs.len() {
+                // Next group: at least one tile, then as many as fit the budgets
+                // for interpolated values, formatted output and decompressed stripes.
+                let g_first_stripe = desc_stripes(&batch_descs[g0]).0;
+                let (mut g1, mut floats, mut text) = (g0, 0usize, 0usize);
+                while g1 < batch_descs.len() {
+                    let d = &batch_descs[g1];
+                    let (f, t) = (setup.n_haps * d.tile_n, d.tile_n * row_out_bytes);
+                    let span = desc_stripes(d).1 + 1 - g_first_stripe;
+                    if g1 > g0 && ((floats + f) * 4 > GROUP_BYTES || text + t > GROUP_BYTES
+                        || span > group_stripes) { break; }
+                    floats += f;
+                    text += t;
+                    g1 += 1;
+                }
+                let group = &batch_descs[g0..g1];
+                let g_last_stripe = desc_stripes(&group[group.len() - 1]).1;
+                if arena.len() < floats { arena.resize(floats, 0.0); }
 
-            // Encode this batch's tiles immediately, then drop all_tiles
-            for (k, desc) in batch_descs.iter().enumerate() {
-                if desc.ts == 0 {
-                    while iv_cursor < desc.iv {
-                        let iv = &setup.intervals[iv_cursor];
-                        emit_chip_gap!(iv.wgs_start);
-                        next_wgs = iv.wgs_end;
-                        iv_cursor += 1;
+                // 0. Stripes for this group: retire those behind it, decompress the
+                // new ones (every tile of them in parallel).
+                let tp = std::time::Instant::now();
+                let behind = (g_first_stripe - dec_lo).min(stripe_tiles.len());
+                stripe_tiles.drain(..behind);
+                dec_lo += behind;
+                if stripe_tiles.is_empty() { dec_lo = g_first_stripe; }
+                let new_from = dec_lo + stripe_tiles.len();
+                if new_from <= g_last_stripe {
+                    let flat: Vec<crate::srp::SparseTile> = (new_from * n_tile_cols..(g_last_stripe + 1) * n_tile_cols)
+                        .into_par_iter()
+                        .map(|t| loaded.decompress_tile(t / n_tile_cols, t % n_tile_cols))
+                        .collect();
+                    let mut it = flat.into_iter();
+                    for _ in new_from..=g_last_stripe {
+                        stripe_tiles.push(it.by_ref().take(n_tile_cols).collect());
                     }
-                    emit_chip_gap!(setup.intervals[desc.iv].wgs_start);
                 }
-                encode_tile!(&all_tiles[k], desc.tile_n, desc.gs);
-                if desc.last {
-                    next_wgs = desc.iv_end;
-                    iv_cursor = desc.iv + 1;
+
+                t_dec += tp.elapsed().as_secs_f64();
+                let tp = std::time::Instant::now();
+                // 1. Interpolate the group's tiles into their arena slices.
+                let mut offsets = Vec::with_capacity(group.len() + 1);
+                offsets.push(0usize);
+                for d in group { offsets.push(offsets.last().unwrap() + setup.n_haps * d.tile_n); }
+                {
+                    let mut slices: Vec<&mut [f32]> = Vec::with_capacity(group.len());
+                    let mut rest = &mut arena[..floats];
+                    for d in group {
+                        let (a, b) = rest.split_at_mut(setup.n_haps * d.tile_n);
+                        slices.push(a);
+                        rest = b;
+                    }
+                    group.par_iter().zip(slices.into_par_iter()).for_each(|(desc, out_slice)| {
+                        // Interval anchors sit at variant indices `gs - ts` and `iv_end`.
+                        let t: Vec<f32> = interp_cum_cm
+                            .and_then(|cum| cm_t_values(cum, desc.gs - desc.ts, desc.iv_end, desc.ts, desc.tile_n))
+                            .unwrap_or_else(|| (0..desc.tile_n).map(|v| (desc.ts + v) as f32 / desc.full_range).collect());
+                        out_slice.fill(0.0);
+                        interpolate_tile_into(
+                            out_slice, &stripe_tiles, dec_lo, n_tiled_variants, n_tile_cols,
+                            &setup.weight_refs, desc.ws, desc.we,
+                            desc.gs, desc.tile_n, &t, setup.n_haps);
+                    });
                 }
+                let arena_ro: &[f32] = &arena;
+                let tile_of = |k: usize| {
+                    let d = &group[k];
+                    (&arena_ro[offsets[k]..offsets[k + 1]], d.tile_n, d.gs)
+                };
+
+                t_interp += tp.elapsed().as_secs_f64();
+                let tp = std::time::Instant::now();
+                // 2. Plan and run the group's formatting and DR² tasks.
+                let mut tasks: Vec<FmtTask> = Vec::new();
+                let plans: Vec<TilePlan> = group.iter().enumerate()
+                    .map(|(k, d)| plan_tile(k, d.gs, d.tile_n, rows_per_task, &setup, passthrough, want_rows, &mut tasks))
+                    .collect();
+                let mut results = run_fmt_tasks(&fmt, formats.vcf, formats.bcf, &tasks, tile_of);
+
+                t_fmt += tp.elapsed().as_secs_f64();
+                let tp = std::time::Instant::now();
+                // 3. Write the group in order.
+                for (k, desc) in group.iter().enumerate() {
+                    if desc.ts == 0 {
+                        while iv_cursor < desc.iv {
+                            let iv = &setup.intervals[iv_cursor];
+                            emit_chip_gap!(iv.wgs_start);
+                            next_wgs = iv.wgs_end;
+                            iv_cursor += 1;
+                        }
+                        emit_chip_gap!(setup.intervals[desc.iv].wgs_start);
+                    }
+                    let (ap, tile_n, gs) = tile_of(k);
+                    emit_tile!(&plans[k], &mut results, ap, tile_n, gs);
+                    if desc.last {
+                        next_wgs = desc.iv_end;
+                        iv_cursor = desc.iv + 1;
+                    }
+                }
+                t_emit += tp.elapsed().as_secs_f64();
+                g0 = g1;
             }
-            // all_tiles dropped here — batch memory freed
+            crate::selphi_debug!("  [MEM] interp batch {}/{}: before freeing {} decompressed stripes: rss={:.0} MB",
+                bi + 1, batches.len(), stripe_tiles.len(), crate::log::rss_mb());
+            drop(stripe_tiles); // free decompressed stripes
             crate::selphi_debug!("  [MEM] interp batch {}/{}: encoded+sent: rss={:.0} MB", bi + 1, batches.len(), crate::log::rss_mb());
         }
+        drop(arena);
+        drop(spare_buf);
+        drop(decoders);
+        crate::selphi_debug!("  [multiformat] stripe I/O wait={:.2}s decompress={:.2}s interpolate={:.2}s format={:.2}s write={:.2}s",
+            t_io, t_dec, t_interp, t_fmt, t_emit);
         // Trailing intervals that own no tile.
         while iv_cursor < setup.intervals.len() {
             let iv = &setup.intervals[iv_cursor];
@@ -1693,7 +1939,10 @@ pub fn write_window_multiformat(
                     &chunk_cache, window_first_chunk, &setup.weight_refs,
                     interval.weight_s, interval.weight_e,
                     gs, tn, &t_vals, setup.n_haps, setup.chunk_size);
-                encode_tile!(&alt_probs, tn, gs);
+                let mut tasks: Vec<FmtTask> = Vec::new();
+                let plan = plan_tile(0, gs, tn, rows_per_task, &setup, passthrough, want_rows, &mut tasks);
+                let mut results = run_fmt_tasks(&fmt, formats.vcf, formats.bcf, &tasks, |_| (&alt_probs[..], tn, gs));
+                emit_tile!(&plan, &mut results, &alt_probs[..], tn, gs);
                 // alt_probs dropped here
                 ts += tn;
             }
@@ -1707,6 +1956,7 @@ pub fn write_window_multiformat(
     if let Some(pass) = passthrough.filter(|_| setup.own_wgs_end == setup.n_ref_variants) {
         emit_pass!(pass.before(setup.n_ref_variants));
     }
+    out.flush();
 
     let total_secs = t0_pipeline.elapsed().as_secs_f64();
     crate::selphi_debug!("  [multiformat] interp+encode={:.2}s", total_secs);
@@ -1934,8 +2184,51 @@ pub fn interpolate_tile_batch(
     t: &[f32],
     n_haps: usize,
 ) -> Vec<f32> {
-    use crate::srp::TILE_ROWS;
     let mut alt_probs = vec![0.0f32; n_haps * tile_n];
+    interpolate_tile_rows(&mut alt_probs, stripe_tiles, base_stripe, n_variants, n_tile_cols,
+        weights, chip_s, chip_e, global_start, tile_n, t, n_haps, true);
+    alt_probs
+}
+
+/// `interpolate_tile_batch` into a caller-provided, ZEROED `alt_probs`
+/// (`n_haps * tile_n`, hap-major), for one task of a tile group: haplotype rows
+/// are split across threads only when the tile is big enough to pay for it.
+/// Rows are independent, so either way each is the same arithmetic, bit for bit.
+pub(crate) fn interpolate_tile_into(
+    alt_probs: &mut [f32],
+    stripe_tiles: &[Vec<crate::srp::SparseTile>],
+    base_stripe: usize,
+    n_variants: usize,
+    n_tile_cols: usize,
+    weights: &[&CsrWeights],
+    chip_s: usize, chip_e: usize,
+    global_start: usize,
+    tile_n: usize,
+    t: &[f32],
+    n_haps: usize,
+) {
+    interpolate_tile_rows(alt_probs, stripe_tiles, base_stripe, n_variants, n_tile_cols,
+        weights, chip_s, chip_e, global_start, tile_n, t, n_haps, n_haps * tile_n >= PAR_TILE_VALUES);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn interpolate_tile_rows(
+    alt_probs: &mut [f32],
+    stripe_tiles: &[Vec<crate::srp::SparseTile>],
+    base_stripe: usize,
+    n_variants: usize,
+    n_tile_cols: usize,
+    weights: &[&CsrWeights],
+    chip_s: usize, chip_e: usize,
+    global_start: usize,
+    tile_n: usize,
+    t: &[f32],
+    n_haps: usize,
+    parallel: bool,
+) {
+    use crate::srp::TILE_ROWS;
+    debug_assert!(alt_probs.len() >= n_haps * tile_n);
+    let alt_probs = &mut alt_probs[..n_haps * tile_n];
     let global_end = global_start + tile_n;
     let first_stripe = global_start / TILE_ROWS;
     let last_stripe = (global_end - 1) / TILE_ROWS;
@@ -1959,11 +2252,8 @@ pub fn interpolate_tile_batch(
         })
         .collect();
 
-    // Single rayon dispatch: scatter all stripes + divide per haplotype.
-    alt_probs.par_chunks_mut(tile_n)
-        .take(n_haps)
-        .enumerate()
-        .for_each(|(h, hap_out)| {
+    // Scatter all stripes + divide, per haplotype.
+    let hap_row = |(h, hap_out): (usize, &mut [f32])| {
             let w = weights[h];
             let s1 = w.indptr[chip_s] as usize;
             let e1 = w.indptr[chip_s + 1] as usize;
@@ -1990,10 +2280,17 @@ pub fn interpolate_tile_batch(
                 let den = ss + t[v] * ds;
                 if den != 0.0 { hap_out[v] /= den; }
             }
-        });
-
-    alt_probs
+    };
+    if parallel {
+        alt_probs.par_chunks_mut(tile_n).enumerate().for_each(hap_row);
+    } else {
+        alt_probs.chunks_mut(tile_n).enumerate().for_each(hap_row);
+    }
 }
+
+/// Interpolated values above which one tile's haplotype rows are split across
+/// threads (below, the tile is one task of its group).
+const PAR_TILE_VALUES: usize = 1 << 16;
 
 /// Fused scatter from tiled format: merge start/end weight ranges, scatter from tiles.
 #[inline(always)]
@@ -2071,3 +2368,846 @@ fn scatter_col_tiled(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Equivalence of the rewritten encode path with the code it replaced. The
+// `old_*` items below are verbatim copies of the previous implementation
+// (renamed; `old_write_f4` is the previous `{:.4}` formatter).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod encode_equivalence_tests {
+    use super::*;
+    use crate::common::HaplotypeBitmatrix;
+    use crate::io::vcf_fmt::write_u32;
+
+    fn old_write_f4(buf: &mut Vec<u8>, v: f64) {
+        use std::io::Write;
+        write!(buf, "{:.4}", v).unwrap();
+    }
+
+    lazy_static::lazy_static! {
+    /// Combined "GT1|GT2:DS" byte lookup: [gt1][gt2][ds_idx] → b"0|0:0", etc.
+    static ref OLD_GTDS_LUT_B: Vec<Vec<Vec<&'static [u8]>>> = {
+        let mut outer = Vec::with_capacity(2);
+        for g1 in 0..2u8 {
+            let mut mid = Vec::with_capacity(2);
+            for g2 in 0..2u8 {
+                let mut inner = Vec::with_capacity(2001);
+                for ds in 0..=2000 {
+                    let s = format!("{}|{}:{}", g1, g2, std::str::from_utf8(FMT_LUT[ds]).unwrap());
+                    inner.push(&*Box::leak(s.into_bytes().into_boxed_slice()));
+                }
+                mid.push(inner);
+            }
+            outer.push(mid);
+        }
+        outer
+    };
+
+    /// Combined ":AP1:AP2" byte lookup: [ap1_idx][ap2_idx] → b":0:0", etc.
+    static ref OLD_AP_LUT_B: Vec<Vec<&'static [u8]>> = {
+        let mut outer = Vec::with_capacity(101);
+        for a1 in 0..=100 {
+            let mut inner = Vec::with_capacity(101);
+            for a2 in 0..=100 {
+                let s = format!(":{}:{}", std::str::from_utf8(FMT_LUT_AP[a1]).unwrap(),
+                                          std::str::from_utf8(FMT_LUT_AP[a2]).unwrap());
+                inner.push(&*Box::leak(s.into_bytes().into_boxed_slice()));
+            }
+            outer.push(inner);
+        }
+        outer
+    };
+    }
+
+    /// Batch-format a tile of imputed variants using parallel chunked formatting.
+    /// Splits the tile into coarse chunks (one per core) to avoid fine-grained
+    /// rayon overhead while still parallelizing the memory-bound LUT+copy work.
+    fn old_format_tile_batch(
+        alt_probs: &[f32],
+        tile_n: usize,
+        // Tile rows to format (a subrange when passthrough records split the tile).
+        rows: std::ops::Range<usize>,
+        n_haps: usize,
+        n_samples: usize,
+        global_start: usize,
+        n_ref_variants: usize,
+        vid_prefix_offset: usize,  // offset into vid_prefixes / is_chip / chip_local_idx
+        vid_prefixes: &[Vec<u8>],
+        is_chip: &[bool],
+        chip_local_idx: &[usize],
+        chip_genotypes: &crate::common::HaplotypeBitmatrix,
+        an_str: &[u8],
+        no_ap: bool,
+        // R4b: per-(chip-site,sample) hard-call preservation at re-routed sites.
+        is_input_chip: &[bool],
+        imp: &[bool],
+        site_conf_per_sample: Option<&[f64]>,
+        refine_thr: f64,
+    ) -> Vec<u8> {
+        // Validate dimensions
+        debug_assert!(alt_probs.len() >= n_haps * tile_n,
+            "alt_probs too small: {} < {} * {}", alt_probs.len(), n_haps, tile_n);
+        if rows.is_empty() { return Vec::new(); }
+        // R4b helper: at an input chip site, sample `s` with confidence >= thr keeps
+        // its verbatim hard call; everything else uses the panel alt_probs. Always
+        // false when site_conf_per_sample is None (refine off) → pre-R4b behavior.
+        let use_hardcall = |local_i: usize, s: usize| -> bool {
+            is_input_chip[local_i] && match site_conf_per_sample {
+                None => false,
+                Some(conf) => {
+                    let ci = chip_local_idx[local_i];
+                    conf.get(ci * n_samples + s).is_some_and(|&c| c >= refine_thr)
+                }
+            }
+        };
+        let n_rows = rows.len();
+        let n_chunks = 16.min(n_rows);
+        let chunk_size = n_rows.div_ceil(n_chunks);
+
+        let chunks: Vec<Vec<u8>> = (0..n_chunks).into_par_iter().map(|ci| {
+            let v_start = rows.start + ci * chunk_size;
+            if v_start >= rows.end { return Vec::new(); }
+            let v_end = (v_start + chunk_size).min(rows.end);
+            let n_vars = v_end - v_start;
+
+            let mut buf = Vec::with_capacity(n_vars * (n_samples * 16 + 80));
+            // Reused per-chunk dosage scratch for the two-pass DR² helper.
+            let mut ds_scratch = vec![0f32; n_samples];
+
+            for v in v_start..v_end {
+                let wgs_i = global_start + v;
+                if wgs_i >= n_ref_variants { break; }
+                let local_i = vid_prefix_offset + v;
+
+                if is_chip[local_i] {
+                    let ci = chip_local_idx[local_i];
+                    old_append_chip_line_bytes(&mut buf, vid_prefix_offset + v, ci,
+                        vid_prefixes, chip_genotypes, n_haps, n_samples, an_str);
+                } else {
+                    let ci = chip_local_idx[local_i];
+                    // R4b: per-sample (ap1, ap2). A confident sample at an input chip
+                    // site contributes its verbatim hard call (0.0/1.0 per hap); every
+                    // other sample contributes the panel alt_probs. Used for both the
+                    // AC/AF/DR2 stats AND the per-sample FORMAT fields so stats track
+                    // the actually-emitted dosages.
+                    let sample_ap = |s: usize| -> (f32, f32) {
+                        if use_hardcall(local_i, s) {
+                            (chip_genotypes.get(ci, s * 2) as u8 as f32,
+                             chip_genotypes.get(ci, s * 2 + 1) as u8 as f32)
+                        } else {
+                            (alt_probs[(s * 2) * tile_n + v], alt_probs[(s * 2 + 1) * tile_n + v])
+                        }
+                    };
+                    // Single pass: compute stats AND format simultaneously.
+                    // Write prefix + INFO first (need stats), then samples.
+                    // Two-pass DR2 (var(dosage)/var_expected) via the shared helper —
+                    // byte-identical f64 accumulation to the former inlined two passes.
+                    let (ac, dr2) = crate::io::dosage_stats::imputed_ac_dr2(
+                        n_samples, n_haps,
+                        sample_ap,
+                        &mut ds_scratch,
+                    );
+                    let af = ac as f64 / n_haps as f64;
+
+                    buf.extend_from_slice(&vid_prefixes[vid_prefix_offset + v]);
+                    buf.extend_from_slice(b"\t.\tPASS\tAF=");
+                    old_write_f4(&mut buf, af);
+                    buf.extend_from_slice(b";AC=");
+                    write_u32(&mut buf, ac);
+                    buf.extend_from_slice(b";AN=");
+                    buf.extend_from_slice(an_str);
+                    buf.extend_from_slice(b";DR2=");
+                    old_write_f4(&mut buf, dr2);
+                    // IMP marks a site absent from the input. A typed site written with the
+                    // model's dosage (some sample's call missing or untrusted) is not one.
+                    if imp[local_i] { buf.extend_from_slice(b";IMP"); }
+                    if no_ap {
+                        buf.extend_from_slice(b"\tGT:DS");
+                    } else {
+                        buf.extend_from_slice(b"\tGT:DS:AP1:AP2");
+                    }
+
+                    // Pre-computed constant strings for trivial dosages.
+                    // Narrowed to match 3-decimal DS precision: the fast path now
+                    // only fires for dosages that would round to exactly 0 (or 2)
+                    // at 3 decimals, so it preserves ultra-rare probabilities
+                    // instead of collapsing them to the hom-ref integer.
+                    const HOMREF_GTDS: &[u8] = b"\t0|0:0";
+                    const HOMREF_GTDS_AP: &[u8] = b"\t0|0:0:0:0";
+                    const HOMALT_GTDS: &[u8] = b"\t1|1:2";
+                    const HOMALT_GTDS_AP: &[u8] = b"\t1|1:2:1:1";
+
+                    for s in 0..n_samples {
+                        let (ap1, ap2) = sample_ap(s);
+
+                        // Fast path. NOTE the test is per-HAPLOTYPE, not on the summed
+                        // dosage: it fires when BOTH ap are below 0.0005, so a dosage in
+                        // [0.0005, 0.001) — one hap at 0.0004 and the other at 0.0004,
+                        // summing to 0.0008 — takes it and prints 0 where the general
+                        // path would print 0.001. Same at the top end. That is a factor-2
+                        // edge on the deliberate 3-decimal DS quantization, inside the
+                        // already-measured <=0.0001 OVERALL R2 text-rounding envelope, and
+                        // GT/AP/AC/AF/DR2 are unaffected (the stats close upstream). Kept
+                        // as-is; the comment used to claim it tested the sum.
+                        if ap1 < 0.0005 && ap2 < 0.0005 {
+                            buf.extend_from_slice(if no_ap { HOMREF_GTDS } else { HOMREF_GTDS_AP });
+                            continue;
+                        }
+                        if ap1 > 0.9995 && ap2 > 0.9995 {
+                            buf.extend_from_slice(if no_ap { HOMALT_GTDS } else { HOMALT_GTDS_AP });
+                            continue;
+                        }
+
+                        // Standard path: format via lookup tables (DS 3-dec, AP 2-dec)
+                        let ds = ap1 + ap2;
+                        let gt1 = if ap1 > 0.5 { 1usize } else { 0 };
+                        let gt2 = if ap2 > 0.5 { 1usize } else { 0 };
+                        let ds_idx = ((ds * 1000.0).round() as usize).min(2000);
+                        buf.push(b'\t');
+                        buf.extend_from_slice(OLD_GTDS_LUT_B[gt1][gt2][ds_idx]);
+                        if !no_ap {
+                            let ap1_idx = ((ap1 * 100.0).round() as usize).min(100);
+                            let ap2_idx = ((ap2 * 100.0).round() as usize).min(100);
+                            buf.extend_from_slice(OLD_AP_LUT_B[ap1_idx][ap2_idx]);
+                        }
+                    }
+                    buf.push(b'\n');
+                }
+            }
+            buf
+        }).collect();
+
+        let total_len: usize = chunks.iter().map(|c| c.len()).sum();
+        let mut buf = Vec::with_capacity(total_len);
+        for chunk in &chunks { buf.extend_from_slice(chunk); }
+        buf
+    }
+
+    /// Append a chip VCF line (no GT:DS/AP — original phased genotypes) to `buf`
+    /// without clearing it. `ci` is the chip-local variant index, `vp_idx` the
+    /// variant-prefix index. Shared by `format_chip_line_bytes` and the chip branch
+    /// of `format_tile_batch` so both emit byte-identical lines.
+    #[inline]
+    fn old_append_chip_line_bytes(
+        buf: &mut Vec<u8>, vp_idx: usize, ci: usize,
+        vid_prefixes: &[Vec<u8>],
+        chip_gt: &crate::common::HaplotypeBitmatrix, n_haps: usize, n_samples: usize, an_str: &[u8],
+    ) {
+        // Chip hard-call ALT count = popcount of the row over all n_haps (= 2·n_samples)
+        // haplotypes. Word-wise popcount instead of a per-bit `get()` sweep; byte-identical.
+        let _ = n_samples;
+        let ac = chip_gt.popcount_row(ci, n_haps);
+        let af = ac as f64 / n_haps as f64;
+        buf.extend_from_slice(&vid_prefixes[vp_idx]);
+        buf.extend_from_slice(b"\t.\tPASS\tAF=");
+        old_write_f4(buf, af);
+        buf.extend_from_slice(b";AC=");
+        write_u32(buf, ac);
+        buf.extend_from_slice(b";AN=");
+        buf.extend_from_slice(an_str);
+        buf.extend_from_slice(b"\tGT");
+        for s in 0..n_samples {
+            let a0 = chip_gt.get(ci, s * 2) as u8;
+            let a1 = chip_gt.get(ci, s * 2 + 1) as u8;
+            buf.push(b'\t');
+            buf.push(b'0' + a0);
+            buf.push(b'|');
+            buf.push(b'0' + a1);
+        }
+        buf.push(b'\n');
+    }
+
+    /// Batch-format a tile of variants as BCF binary records (parallel).
+    fn old_format_tile_batch_bcf(
+        alt_probs: &[f32],
+        tile_n: usize,
+        // Tile rows to encode (a subrange when passthrough records split the tile).
+        rows: std::ops::Range<usize>,
+        n_haps: usize,
+        n_samples: usize,
+        global_start: usize,
+        n_ref_variants: usize,
+        var_info_offset: usize,
+        var_infos: &[crate::io::bcf_encode::BcfVariantInfo],
+        is_chip: &[bool],
+        chip_local_idx: &[usize],
+        chip_genotypes: &crate::common::HaplotypeBitmatrix,
+        no_ap: bool,
+        // R4b: per-(chip-site,sample) hard-call preservation at re-routed sites.
+        is_input_chip: &[bool],
+        imp: &[bool],
+        site_conf_per_sample: Option<&[f64]>,
+        refine_thr: f64,
+    ) -> Vec<u8> {
+        use crate::io::bcf_encode;
+
+        if rows.is_empty() { return Vec::new(); }
+        let n_rows = rows.len();
+        let n_chunks = 16.min(n_rows);
+        let chunk_size = n_rows.div_ceil(n_chunks);
+
+        let chunks: Vec<Vec<u8>> = (0..n_chunks).into_par_iter().map(|ci| {
+            let v_start = rows.start + ci * chunk_size;
+            if v_start >= rows.end { return Vec::new(); }
+            let v_end = (v_start + chunk_size).min(rows.end);
+
+            // Estimate: ~(14*n_samples + 80) bytes per variant for BCF
+            let mut buf = Vec::with_capacity((v_end - v_start) * (n_samples * 14 + 80));
+            // Per-chunk reusable dosage scratch for the imputed two-pass DR2 helper
+            // (allocated once per parallel chunk, not per variant).
+            let mut ds_scratch = vec![0f32; n_samples];
+            // R4b: per-chunk reusable per-sample hard-call mask, filled only at a
+            // re-routed input chip site when a per-sample confidence matrix exists.
+            let mut hc_mask = vec![false; n_samples];
+
+            for v in v_start..v_end {
+                let wgs_i = global_start + v;
+                if wgs_i >= n_ref_variants { break; }
+                let local_i = var_info_offset + v;
+                let vi = &var_infos[local_i];
+
+                if is_chip[local_i] {
+                    bcf_encode::encode_chip_record(
+                        &mut buf, vi.rid, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
+                        chip_genotypes, chip_local_idx[local_i], n_samples, n_haps,
+                    );
+                } else {
+                    // R4b: build the per-sample preserve-hard-call mask for this
+                    // re-routed input chip site (no-op when refine off / not a chip).
+                    let hc = match (is_input_chip[local_i], site_conf_per_sample) {
+                        (true, Some(conf)) => {
+                            let ci = chip_local_idx[local_i];
+                            let base = ci * n_samples;
+                            let mut any = false;
+                            for s in 0..n_samples {
+                                let keep = conf.get(base + s).is_some_and(|&c| c >= refine_thr);
+                                hc_mask[s] = keep;
+                                any |= keep;
+                            }
+                            if any {
+                                Some(bcf_encode::R4bHardcall { chip_genotypes, chip_idx: ci, mask: &hc_mask, sample_offset: 0 })
+                            } else { None }
+                        }
+                        _ => None,
+                    };
+                    bcf_encode::encode_imputed_record(
+                        &mut buf, vi.rid, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
+                        alt_probs, tile_n, v, n_samples, n_haps, no_ap, &mut ds_scratch,
+                        hc.as_ref(), imp[local_i],
+                    );
+                }
+            }
+            buf
+        }).collect();
+
+        let total_len: usize = chunks.iter().map(|c| c.len()).sum();
+        let mut buf = Vec::with_capacity(total_len);
+        for chunk in &chunks { buf.extend_from_slice(chunk); }
+        buf
+    }
+
+    /// Accumulate the dosage-R² of every IMPUTED site in one interpolated tile into
+    /// `acc` (the run-level mean-DR2 quality summary), with each imputed call's
+    /// genotype confidence taken in the same pass. Chip/typed sites are skipped.
+    /// Uses the raw panel `alt_probs`; at the rare `--refine` re-routed hard-call
+    /// sites that is the model DR2, a negligible approximation for a summary.
+    /// Parallel over fixed 64-variant chunks merged in order, so the sums are the
+    /// same on every run (it was a serial pass on the writer thread, n_variants ×
+    /// n_samples per run).
+    fn old_accumulate_tile_dr2(
+        acc: &mut crate::io::dosage_stats::Dr2Summary,
+        alt_probs: &[f32], tile_n: usize, global_start: usize,
+        setup: &WindowSetup, n_samples: usize,
+    ) {
+        use crate::io::dosage_stats::Dr2Summary;
+        let n_rows = tile_n.min(setup.n_ref_variants.saturating_sub(global_start));
+        let parts: Vec<Dr2Summary> = (0..n_rows.div_ceil(64)).into_par_iter().map(|c| {
+            let mut part = Dr2Summary::default();
+            let mut scratch = vec![0f32; n_samples];
+            for v in c * 64..((c + 1) * 64).min(n_rows) {
+                let local_i = global_start - setup.own_wgs_start + v;
+                if setup.is_chip[local_i] { continue; }
+                let calls = std::cell::Cell::new(part);
+                let ap = |s: usize| {
+                    let p = (alt_probs[(s * 2) * tile_n + v], alt_probs[(s * 2 + 1) * tile_n + v]);
+                    let mut c = calls.get();
+                    c.add_call(p.0, p.1);
+                    calls.set(c);
+                    p
+                };
+                let (_, dr2) = crate::io::dosage_stats::imputed_ac_dr2(n_samples, setup.n_haps, ap, &mut scratch);
+                part = calls.get();
+                part.add(dr2);
+            }
+            part
+        }).collect();
+        for p in parts { acc.merge(&p); }
+    }
+
+    /// Batch-parallel tiled kernel: Vec-indexed stripe cache, single par_chunks_mut dispatch.
+    /// stripe_tiles[i] = decompressed tiles for stripe (base_stripe + i).
+    /// Fuses scatter + division into one rayon dispatch per tile_desc.
+    pub fn old_interpolate_tile_batch(
+        stripe_tiles: &[Vec<crate::srp::SparseTile>],
+        base_stripe: usize,
+        n_variants: usize,
+        n_tile_cols: usize,
+        weights: &[&CsrWeights],
+        chip_s: usize, chip_e: usize,
+        global_start: usize,
+        tile_n: usize,
+        t: &[f32],
+        n_haps: usize,
+    ) -> Vec<f32> {
+        use crate::srp::TILE_ROWS;
+        let mut alt_probs = vec![0.0f32; n_haps * tile_n];
+        let global_end = global_start + tile_n;
+        let first_stripe = global_start / TILE_ROWS;
+        let last_stripe = (global_end - 1) / TILE_ROWS;
+
+        // Pre-collect stripe overlap info + tile refs outside rayon (O(1) Vec access, no HashMap)
+        #[allow(clippy::upper_case_acronyms)]
+        struct SOV<'a> { tiles: &'a [crate::srp::SparseTile], lr_start: usize, lr_end: usize, out_off: usize, ov_n: usize }
+        let sovs: Vec<SOV> = (first_stripe..=last_stripe)
+            .filter_map(|stripe| {
+                let ss = stripe * TILE_ROWS;
+                let se = (ss + TILE_ROWS).min(n_variants);
+                let os = global_start.max(ss);
+                let oe = global_end.min(se);
+                if os >= oe { return None; }
+                let ov_n = oe - os;
+                Some(SOV {
+                    tiles: &stripe_tiles[stripe - base_stripe],
+                    lr_start: os - ss, lr_end: os - ss + ov_n,
+                    out_off: os - global_start, ov_n,
+                })
+            })
+            .collect();
+
+        // Single rayon dispatch: scatter all stripes + divide per haplotype.
+        alt_probs.par_chunks_mut(tile_n)
+            .take(n_haps)
+            .enumerate()
+            .for_each(|(h, hap_out)| {
+                let w = weights[h];
+                let s1 = w.indptr[chip_s] as usize;
+                let e1 = w.indptr[chip_s + 1] as usize;
+                let s2 = w.indptr[chip_e] as usize;
+                let e2 = w.indptr[chip_e + 1] as usize;
+                let mut ss: f32 = 0.0;
+                for j in s1..e1 { ss += w.data[j]; }
+                let mut es: f32 = 0.0;
+                for j in s2..e2 { es += w.data[j]; }
+                let ds = es - ss;
+                if ss == 0.0 && ds == 0.0 { return; }
+
+                for sov in &sovs {
+                    old_scatter_fused_tiled(
+                        w, s1, e1, s2, e2,
+                        sov.tiles, n_tile_cols,
+                        sov.lr_start, sov.lr_end,
+                        &t[sov.out_off..sov.out_off + sov.ov_n],
+                        &mut hap_out[sov.out_off..sov.out_off + sov.ov_n],
+                    );
+                }
+
+                for v in 0..tile_n {
+                    let den = ss + t[v] * ds;
+                    if den != 0.0 { hap_out[v] /= den; }
+                }
+            });
+
+        alt_probs
+    }
+
+    /// Fused scatter from tiled format: merge start/end weight ranges, scatter from tiles.
+    #[inline(always)]
+    fn old_scatter_fused_tiled(
+        w: &CsrWeights,
+        s1: usize, e1: usize,
+        s2: usize, e2: usize,
+        tiles: &[crate::srp::SparseTile],
+        n_tile_cols: usize,
+        row_start: usize, row_end: usize,
+        t: &[f32],
+        accum: &mut [f32],
+    ) {
+        let mut i = s1;
+        let mut j = s2;
+
+        while i < e1 && j < e2 {
+            let ci = w.indices[i] as usize;
+            let cj = w.indices[j] as usize;
+
+            if ci < cj {
+                let ws = w.data[i];
+                old_scatter_col_tiled(tiles, ci, n_tile_cols, row_start, row_end, t, accum, ws, -ws);
+                i += 1;
+            } else if ci > cj {
+                let we = w.data[j];
+                old_scatter_col_tiled(tiles, cj, n_tile_cols, row_start, row_end, t, accum, 0.0, we);
+                j += 1;
+            } else {
+                let ws = w.data[i];
+                let we = w.data[j];
+                old_scatter_col_tiled(tiles, ci, n_tile_cols, row_start, row_end, t, accum, ws, we - ws);
+                i += 1;
+                j += 1;
+            }
+        }
+        while i < e1 {
+            let ws = w.data[i];
+            old_scatter_col_tiled(tiles, w.indices[i] as usize, n_tile_cols, row_start, row_end, t, accum, ws, -ws);
+            i += 1;
+        }
+        while j < e2 {
+            let we = w.data[j];
+            old_scatter_col_tiled(tiles, w.indices[j] as usize, n_tile_cols, row_start, row_end, t, accum, 0.0, we);
+            j += 1;
+        }
+    }
+
+    /// Scatter from a single column in the tiled format.
+    /// Maps global column to (band, local_col), then reads from the tile's u16 indices.
+    #[inline(always)]
+    fn old_scatter_col_tiled(
+        tiles: &[crate::srp::SparseTile],
+        global_col: usize,
+        _n_tile_cols: usize,
+        row_start: usize, row_end: usize,
+        t: &[f32],
+        accum: &mut [f32],
+        base: f32, slope: f32,
+    ) {
+        use crate::srp::TILE_COLS;
+        let band = global_col / TILE_COLS;
+        let local_col = global_col % TILE_COLS;
+        let tile = &tiles[band];
+        if local_col >= tile.n_cols as usize { return; }
+
+        let (lo, hi) = tile.col_range(local_col);
+        let row_slice = &tile.indices[lo..hi];
+        let start = row_slice.partition_point(|&r| (r as usize) < row_start);
+        for k in start..row_slice.len() {
+            let r = row_slice[k] as usize;
+            if r >= row_end { break; }
+            let v = r - row_start;
+            accum[v] += base + t[v] * slope;
+        }
+    }
+
+    struct Xs(u64);
+    impl Xs {
+        fn next(&mut self) -> u64 { self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17; self.0 }
+        fn below(&mut self, n: u64) -> u64 { self.next() % n }
+        fn unit(&mut self) -> f32 { (self.next() >> 40) as f32 / (1u64 << 24) as f32 }
+    }
+
+    /// A window over a synthetic panel: chip flags, R4b confidences, chip calls.
+    struct Scenario {
+        srp: SrpReader,
+        n_samples: usize,
+        own_start: usize,
+        own_end: usize,
+        is_chip: Vec<bool>,
+        is_input_chip: Vec<bool>,
+        imp: Vec<bool>,
+        chip_local_idx: Vec<usize>,
+        chip_gt: HaplotypeBitmatrix,
+        conf: Option<Vec<f64>>,
+        thr: f64,
+    }
+
+    fn scenario(r: &mut Xs) -> Scenario {
+        let n_ref = 400 + r.below(300) as usize;
+        let mut ids = Vec::with_capacity(n_ref);
+        let mut oids = Vec::with_capacity(n_ref);
+        let alleles = ["A", "C", "G", "T", "AT", "GCC", "TTTTTTTTTTTTTTTTTTTTTT"];
+        for i in 0..n_ref {
+            let chrom = match r.below(40) { 0 => "HLA-DRB1*01:01", 1 => "chr22", _ => "22" };
+            let id = if r.below(150) == 0 { "unparsable".to_string() } else {
+                format!("{chrom}-{}-{}-{}", 16_000_000 + i * 37, alleles[r.below(7) as usize], alleles[r.below(7) as usize])
+            };
+            ids.push(id);
+            oids.push(if r.below(3) == 0 { format!("rs{}", r.below(1 << 30)) } else { String::new() });
+        }
+        let n_samples = [1usize, 2, 3, 7, 13][r.below(5) as usize];
+        let n_haps = 2 * n_samples;
+        let own_start = r.below(40) as usize;
+        let own_end = if r.below(3) == 0 { n_ref } else { n_ref - r.below(40) as usize };
+        let len = own_end - own_start;
+        let n_chip = 1 + len / 3;
+        let mut is_chip = vec![false; len];
+        let mut is_input_chip = vec![false; len];
+        let mut chip_local_idx = vec![0usize; len];
+        for l in 0..len {
+            if r.below(10) < 3 {
+                is_input_chip[l] = true;
+                is_chip[l] = r.below(4) != 0;
+                chip_local_idx[l] = r.below(n_chip as u64) as usize;
+            }
+        }
+        let imp: Vec<bool> = (0..len).map(|l| !is_input_chip[l] && r.below(20) != 0).collect();
+        let words = n_haps.div_ceil(64);
+        let bits: Vec<u64> = (0..n_chip * words).map(|_| r.next()).collect();
+        let chip_gt = HaplotypeBitmatrix::from_raw(bits, n_chip, n_haps);
+        let conf = match r.below(3) {
+            0 => None,
+            // Sometimes shorter than n_chip * n_samples: `get` must miss.
+            _ => Some((0..n_chip * n_samples - r.below(3) as usize).map(|_| r.unit() as f64).collect()),
+        };
+        Scenario {
+            srp: SrpReader::with_ids_for_tests(ids, oids), n_samples, own_start, own_end,
+            is_chip, is_input_chip, imp, chip_local_idx, chip_gt, conf, thr: 0.5,
+        }
+    }
+
+    fn setup_of(sc: &Scenario) -> WindowSetup<'_> {
+        WindowSetup {
+            srp: &sc.srp, own_wgs_start: sc.own_start, own_wgs_end: sc.own_end,
+            n_haps: 2 * sc.n_samples, n_ref_variants: sc.srp.ids.len(), chunk_size: 1024,
+            is_chip: sc.is_chip.clone(), is_input_chip: sc.is_input_chip.clone(), imp: sc.imp.clone(),
+            chip_local_idx: sc.chip_local_idx.clone(), intervals: Vec::new(), weight_refs: Vec::new(),
+            vid_prefixes: Vec::new(), an_str: format!("{}", 2 * sc.n_samples).into_bytes(),
+            site_conf_per_sample: sc.conf.as_deref(), refine_thr: sc.thr, n_samples: sc.n_samples,
+        }
+    }
+
+    /// The previous `WindowSetup::new` prefix table.
+    fn old_vid_prefixes(srp: &SrpReader, own_wgs_start: usize, own_wgs_end: usize) -> Vec<Vec<u8>> {
+        let vid_prefixes: Vec<Vec<u8>> = (own_wgs_start..own_wgs_end).map(|i| {
+            let id = &srp.ids[i];
+            // Right-split so chrom may contain '-' (rare assembly contigs).
+            let (chrom, pos, ref_a, alt) = match crate::srp::helpers::parse_synthetic_id(id) {
+                Some(x) => x, None => return Vec::new(),
+            };
+            let oid = if !srp.original_ids[i].is_empty() { &srp.original_ids[i] } else { id };
+            let mut prefix = Vec::with_capacity(40);
+            prefix.extend_from_slice(chrom.as_bytes()); prefix.push(b'\t');
+            prefix.extend_from_slice(pos.as_bytes()); prefix.push(b'\t');
+            prefix.extend_from_slice(oid.as_bytes()); prefix.push(b'\t');
+            prefix.extend_from_slice(ref_a.as_bytes()); prefix.push(b'\t');
+            prefix.extend_from_slice(alt.as_bytes());
+            prefix
+        }).collect();
+        vid_prefixes
+    }
+
+    fn alt_probs(r: &mut Xs, n: usize) -> Vec<f32> {
+        let special = [0.0f32, 1.0, 0.5, 0.0004, 0.0005, 0.00049, 0.9995, 0.9996, 0.99951, 0.4995, 0.005, 0.995, 0.25];
+        (0..n).map(|_| if r.below(3) == 0 { special[r.below(special.len() as u64) as usize] } else { r.unit() }).collect()
+    }
+
+    /// A tile inside the window (sometimes reaching past the panel's last
+    /// variant, which every formatter must stop at).
+    fn tile(r: &mut Xs, sc: &Scenario) -> (usize, usize) {
+        let gs = sc.own_start + r.below((sc.own_end - sc.own_start) as u64) as usize;
+        let past_end = sc.own_end == sc.srp.ids.len() && r.below(3) == 0;
+        let max_n = if past_end { sc.srp.ids.len() + 5 - gs } else { sc.own_end - gs };
+        (gs, 1 + r.below(max_n as u64) as usize)
+    }
+
+    fn random_split(r: &mut Xs, rows: std::ops::Range<usize>) -> Vec<std::ops::Range<usize>> {
+        let mut out = Vec::new();
+        let mut s = rows.start;
+        while s < rows.end {
+            let e = (s + 1 + r.below(40) as usize).min(rows.end);
+            out.push(s..e);
+            s = e;
+        }
+        out
+    }
+
+    #[test]
+    fn vcf_rows_match_format_tile_batch() {
+        let mut r = Xs(0xC0FFEE);
+        for _ in 0..300 {
+            let sc = scenario(&mut r);
+            let setup = setup_of(&sc);
+            let vidp = old_vid_prefixes(&sc.srp, sc.own_start, sc.own_end);
+            for no_ap in [false, true] {
+                let fmt = RowFmt { setup: &setup, chip_genotypes: &sc.chip_gt, no_ap, var_infos: None };
+                for _ in 0..4 {
+                    let (gs, tile_n) = tile(&mut r, &sc);
+                    let ap = alt_probs(&mut r, setup.n_haps * tile_n);
+                    let a = r.below(tile_n as u64 + 1) as usize;
+                    let b = a + r.below((tile_n - a) as u64 + 1) as usize;
+                    let old = old_format_tile_batch(&ap, tile_n, a..b, setup.n_haps, sc.n_samples, gs,
+                        setup.n_ref_variants, gs - sc.own_start, &vidp, &sc.is_chip, &sc.chip_local_idx,
+                        &sc.chip_gt, &setup.an_str, no_ap, &sc.is_input_chip, &sc.imp, sc.conf.as_deref(), sc.thr);
+                    let mut new = Vec::new();
+                    let mut scratch = vec![0f32; sc.n_samples];
+                    for part in random_split(&mut r, a..b) {
+                        fmt.vcf_rows(&mut new, &mut scratch, &ap, tile_n, gs, part);
+                    }
+                    assert_eq!(String::from_utf8_lossy(&new), String::from_utf8_lossy(&old));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chip_gap_line_matches() {
+        let mut r = Xs(99);
+        for _ in 0..200 {
+            let sc = scenario(&mut r);
+            let setup = setup_of(&sc);
+            let vidp = old_vid_prefixes(&sc.srp, sc.own_start, sc.own_end);
+            for local in (0..sc.own_end - sc.own_start).filter(|&l| sc.is_chip[l]).take(5) {
+                let mut old = Vec::new();
+                old_append_chip_line_bytes(&mut old, local, sc.chip_local_idx[local], &vidp, &sc.chip_gt,
+                    setup.n_haps, sc.n_samples, &setup.an_str);
+                let mut new = vec![b'x'];
+                format_chip_line_bytes(&mut new, &setup, sc.own_start + local, &sc.chip_gt, sc.n_samples);
+                assert_eq!(new, old);
+            }
+        }
+    }
+
+    #[test]
+    fn bcf_rows_match_format_tile_batch_bcf() {
+        let mut r = Xs(0xBCF);
+        for _ in 0..200 {
+            let sc = scenario(&mut r);
+            let setup = setup_of(&sc);
+            let contigs = vec!["22".to_string(), "chr22".to_string()];
+            let vi = super::super::bcf_encode::parse_variant_infos(&sc.srp.ids, &sc.srp.original_ids,
+                sc.own_start, sc.own_end, &contigs);
+            for no_ap in [false, true] {
+                let fmt = RowFmt { setup: &setup, chip_genotypes: &sc.chip_gt, no_ap, var_infos: Some(&vi) };
+                for _ in 0..3 {
+                    let (gs, tile_n) = tile(&mut r, &sc);
+                    let ap = alt_probs(&mut r, setup.n_haps * tile_n);
+                    let old = old_format_tile_batch_bcf(&ap, tile_n, 0..tile_n, setup.n_haps, sc.n_samples, gs,
+                        setup.n_ref_variants, gs - sc.own_start, &vi, &sc.is_chip, &sc.chip_local_idx,
+                        &sc.chip_gt, no_ap, &sc.is_input_chip, &sc.imp, sc.conf.as_deref(), sc.thr);
+                    let mut new = Vec::new();
+                    let mut scratch = vec![0f32; sc.n_samples];
+                    let mut mask = vec![false; sc.n_samples];
+                    for part in random_split(&mut r, 0..tile_n) {
+                        fmt.bcf_rows(&mut new, &mut scratch, &mut mask, &ap, tile_n, gs, part);
+                    }
+                    assert_eq!(new, old);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dr2_chunks_merge_to_the_same_summary() {
+        let mut r = Xs(0xD2);
+        for _ in 0..100 {
+            let sc = scenario(&mut r);
+            let setup = setup_of(&sc);
+            let (mut old, mut new) = (crate::io::dosage_stats::Dr2Summary::default(), crate::io::dosage_stats::Dr2Summary::default());
+            for _ in 0..6 {
+                let (gs, tile_n) = tile(&mut r, &sc);
+                let ap = alt_probs(&mut r, setup.n_haps * tile_n);
+                old_accumulate_tile_dr2(&mut old, &ap, tile_n, gs, &setup, sc.n_samples);
+                let mut scratch = vec![0f32; sc.n_samples];
+                for c in 0..dr2_chunks(&setup, tile_n, gs) {
+                    new.merge(&dr2_chunk(&setup, &ap, tile_n, gs, c, &mut scratch));
+                }
+            }
+            assert_eq!((old.sum.to_bits(), old.n, old.n_ge08), (new.sum.to_bits(), new.n, new.n_ge08));
+            assert_eq!((old.conf_sum.to_bits(), old.conf_n, old.conf_ge09), (new.conf_sum.to_bits(), new.conf_n, new.conf_ge09));
+        }
+    }
+
+    /// Packing buffers into messages leaves the byte stream, and the lines the
+    /// VCF writer reads message by message, unchanged.
+    #[test]
+    fn channel_packing_keeps_bytes_and_lines() {
+        fn lines(msgs: &[Vec<u8>]) -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            for m in msgs {
+                let mut s = 0;
+                while s < m.len() { let e = line_end(m, s); out.push(m[s..e].to_vec()); s = e; }
+            }
+            out
+        }
+        let mut r = Xs(0x5EED);
+        for case in 0..120 {
+            let mut bufs: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..r.below(120) {
+                // Mostly small buffers; now and then one past half a message.
+                let len = match r.below(25) { 0 => 0, 1 => (1 << 21) + r.below(3 << 20) as usize, _ => r.below(5000) as usize };
+                let fill = b'a' + r.below(26) as u8;
+                let mut b: Vec<u8> = vec![fill; len];
+                for _ in 0..len / 30 { let i = r.below(len as u64) as usize; b[i] = b'\n'; }
+                if !b.is_empty() && r.below(8) != 0 { *b.last_mut().unwrap() = b'\n'; }
+                bufs.push(b);
+            }
+            for lines_mode in [true, false] {
+                let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(100_000);
+                let mut out = ChannelOut::new(&tx, lines_mode);
+                for b in &bufs { out.push(b.clone()); }
+                out.flush();
+                drop(out);
+                drop(tx);
+                let msgs: Vec<Vec<u8>> = rx.iter().collect();
+                assert_eq!(msgs.concat(), bufs.concat(), "case {case}");
+                assert!(msgs.iter().all(|m| !m.is_empty()));
+                if lines_mode { assert_eq!(lines(&msgs), lines(&bufs), "case {case}"); }
+            }
+        }
+    }
+
+    fn random_tile(r: &mut Xs, n_rows: usize, n_cols: usize, density: u64) -> crate::srp::SparseTile {
+        let mut indptr = vec![0u32];
+        let mut indices = Vec::new();
+        for _ in 0..n_cols {
+            for row in 0..n_rows { if r.below(1000) < density { indices.push(row as u16); } }
+            indptr.push(indices.len() as u32);
+        }
+        crate::srp::SparseTile { indptr, indices, n_rows: n_rows as u16, n_cols: n_cols as u16 }
+    }
+
+    #[test]
+    fn interpolate_tile_into_matches_interpolate_tile_batch() {
+        use crate::srp::{TILE_ROWS, TILE_COLS};
+        let mut r = Xs(0x1A7E);
+        for case in 0..40 {
+            let n_ref_haps = if case % 4 == 0 { TILE_COLS + 70 } else { 50 + r.below(400) as usize };
+            let n_tile_cols = n_ref_haps.div_ceil(TILE_COLS);
+            let n_variants = 3 * TILE_ROWS + r.below(TILE_ROWS as u64) as usize;
+            let n_stripes = n_variants.div_ceil(TILE_ROWS);
+            let base = r.below(2) as usize;
+            let stripe_tiles: Vec<Vec<crate::srp::SparseTile>> = (base..n_stripes).map(|s| {
+                let rows = TILE_ROWS.min(n_variants - s * TILE_ROWS);
+                (0..n_tile_cols).map(|b| random_tile(&mut r, rows, TILE_COLS.min(n_ref_haps - b * TILE_COLS), 30)).collect()
+            }).collect();
+            let n_haps = [2usize, 6, 40, 120][r.below(4) as usize];
+            let n_anchor = 8;
+            let weights: Vec<CsrWeights> = (0..n_haps).map(|h| {
+                let mut indptr = vec![0i32];
+                let mut indices = Vec::new();
+                let mut data = Vec::new();
+                for a in 0..n_anchor {
+                    // Some haplotypes have an all-zero anchor pair (early return).
+                    if !(h % 7 == 3 && a < 2) {
+                        let mut c = r.below(20) as usize;
+                        while c < n_ref_haps { indices.push(c as i32); data.push(r.unit() + 0.01); c += 1 + r.below(60) as usize; }
+                    }
+                    indptr.push(indices.len() as i32);
+                }
+                CsrWeights { indptr, indices, data, n_rows: n_anchor, n_cols: n_ref_haps }
+            }).collect();
+            let wref: Vec<&CsrWeights> = weights.iter().collect();
+            for _ in 0..5 {
+                let gs = base * TILE_ROWS + r.below(((n_stripes - base) * TILE_ROWS - 1).min(n_variants - base * TILE_ROWS - 1) as u64) as usize;
+                let tile_n = 1 + r.below(4000.min(n_variants - gs) as u64) as usize;
+                let (cs, ce) = (r.below(2) as usize, 2 + r.below(6) as usize);
+                let t: Vec<f32> = (0..tile_n).map(|v| v as f32 / tile_n as f32).collect();
+                let old = old_interpolate_tile_batch(&stripe_tiles, base, n_variants, n_tile_cols, &wref, cs, ce, gs, tile_n, &t, n_haps);
+                let new = interpolate_tile_batch(&stripe_tiles, base, n_variants, n_tile_cols, &wref, cs, ce, gs, tile_n, &t, n_haps);
+                let mut into = vec![0f32; n_haps * tile_n + 17];
+                interpolate_tile_into(&mut into, &stripe_tiles, base, n_variants, n_tile_cols, &wref, cs, ce, gs, tile_n, &t, n_haps);
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&new), bits(&old), "case {case}");
+                assert_eq!(bits(&into[..n_haps * tile_n]), bits(&old), "case {case}");
+                assert!(into[n_haps * tile_n..].iter().all(|&x| x == 0.0));
+            }
+        }
+    }
+}

@@ -193,4 +193,17 @@ impl SrpReader {
         tiled.extract_bitmatrix(self.metadata.n_haps, wgs_idx)
     }
 
+    /// A panel of variant IDs only (no genotypes), for output-formatting tests.
+    #[cfg(test)]
+    pub(crate) fn with_ids_for_tests(ids: Vec<String>, original_ids: Vec<String>) -> Self {
+        let n = ids.len();
+        SrpReader {
+            metadata: SrpMetadata {
+                chromosome: String::new(), n_variants: n, n_haps: 0, n_chunks: 0, chunk_size: 1024,
+                min_position: 0, max_position: 0, chunk_cv: 0.0, contig_field: String::new(),
+            },
+            variants: Vec::new(), sample_ids: Vec::new(), ids, original_ids,
+            tiled: None, mmap: None, chunk_index: Vec::new(),
+        }
+    }
 }

@@ -846,6 +846,63 @@ pub fn tbi_ref_id(contig_names: &[String], chrom: &[u8]) -> u32 {
     contig_names.iter().rposition(|c| c.as_bytes() == chrom).unwrap_or(0) as u32
 }
 
+/// Per-reference TBI bins, record counts and linear index, filled one record at a
+/// time from its `(vpos, vpos_end)` pair. Shared by the post-hoc builder
+/// (`build_tbi_index_with_meta`) and the streaming one (`TbiStreamIndexer`), so
+/// both serialize the same structure byte for byte.
+#[derive(Default)]
+struct TbiAccum {
+    ref_bins: std::collections::BTreeMap<usize, std::collections::BTreeMap<u32, Vec<(u64, u64)>>>,
+    ref_n_mapped: std::collections::BTreeMap<usize, u64>,
+    ref_linear: std::collections::BTreeMap<usize, Vec<u64>>,
+}
+
+impl TbiAccum {
+    #[inline]
+    fn add(&mut self, rec: TbiRec, vpos: u64, vpos_end: u64) {
+        let TbiRec { pos, rlen, ref_id } = rec;
+        let (rlen, ref_id) = (rlen as i64, ref_id as usize);
+        let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, TBI_DEPTH);
+        let bins = self.ref_bins.entry(ref_id).or_default();
+        let chunks = bins.entry(bin_id).or_insert_with(|| vec![(vpos, vpos_end)]);
+        if let Some(last) = chunks.last_mut() {
+            if vpos <= last.1 + (1 << 16) { last.1 = vpos_end; }
+            else { chunks.push((vpos, vpos_end)); }
+        }
+        *self.ref_n_mapped.entry(ref_id).or_insert(0) += 1;
+        let lin_idx = (pos >> DEFAULT_MIN_SHIFT) as usize;
+        let lin = self.ref_linear.entry(ref_id).or_default();
+        if lin_idx >= lin.len() { lin.resize(lin_idx + 1, 0); }
+        if lin[lin_idx] == 0 || vpos < lin[lin_idx] { lin[lin_idx] = vpos; }
+    }
+
+    fn write(&self, contig_names: &[String], tbi_path: &Path) -> io::Result<()> {
+        let n_ref = contig_names.len();
+        let mut out = Vec::with_capacity(64 * 1024);
+        write_tbi_header(&mut out, n_ref as i32, contig_names);
+
+        for ref_id in 0..n_ref {
+            if let Some(bins) = self.ref_bins.get(&ref_id) {
+                let n_mapped = self.ref_n_mapped.get(&ref_id).copied().unwrap_or(0);
+                out.extend_from_slice(&((bins.len() as i32 + 1).to_le_bytes()));
+                for (&bid, chunks) in bins {
+                    write_tbi_bin(&mut out, bid, chunks);
+                }
+                write_tbi_pseudo_bin(&mut out, n_mapped);
+                write_tbi_linear(&mut out, self.ref_linear.get(&ref_id));
+            } else {
+                out.extend_from_slice(&0i32.to_le_bytes());
+                out.extend_from_slice(&0i32.to_le_bytes());
+            }
+        }
+
+        let tbi_file = std::fs::File::create(tbi_path)?;
+        let mut w = noodles_bgzf::io::Writer::new(tbi_file);
+        w.write_all(&out)?; w.try_finish()?;
+        Ok(())
+    }
+}
+
 /// Fast TBI index building with pre-collected metadata.
 /// Only scans for virtual positions (skip parsing — metadata already known).
 pub fn build_tbi_index_with_meta(
@@ -854,7 +911,6 @@ pub fn build_tbi_index_with_meta(
     record_meta: &[TbiRec],
     tbi_path: &Path,
 ) -> io::Result<()> {
-    use std::collections::BTreeMap;
     use std::io::{BufRead, BufReader};
 
     // See `build_tbi_index` above: multi-threaded bgzf + user buffer breaks
@@ -863,11 +919,7 @@ pub fn build_tbi_index_with_meta(
     let f = std::fs::File::open(vcf_gz_path)?;
     let mut bgzf = noodles_bgzf::io::Reader::new(BufReader::with_capacity(4 << 20, f));
 
-    struct BinDataM { _loffset: u64, chunks: Vec<(u64, u64)> }
-    let mut ref_bins: BTreeMap<usize, BTreeMap<u32, BinDataM>> = BTreeMap::new();
-    let mut ref_n_mapped: BTreeMap<usize, u64> = BTreeMap::new();
-    let mut ref_linear: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
-
+    let mut acc = TbiAccum::default();
     let mut line_buf: Vec<u8> = Vec::with_capacity(65536);
     let mut rec_idx = 0usize;
 
@@ -882,7 +934,7 @@ pub fn build_tbi_index_with_meta(
                 Err(e) => return Err(e),
             };
             if buf.is_empty() { break; }
-            if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+            if let Some(nl) = memchr::memchr(b'\n', buf) {
                 line_buf.extend_from_slice(&buf[..nl]);
                 bgzf.consume(nl + 1);
                 break;
@@ -898,48 +950,240 @@ pub fn build_tbi_index_with_meta(
         let vpos_end: u64 = u64::from(bgzf.virtual_position());
 
         if rec_idx >= record_meta.len() { break; }
-        let TbiRec { pos, rlen, ref_id } = record_meta[rec_idx];
-        let (rlen, ref_id) = (rlen as i64, ref_id as usize);
+        acc.add(record_meta[rec_idx], vpos, vpos_end);
         rec_idx += 1;
-
-        let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, TBI_DEPTH);
-        let bins = ref_bins.entry(ref_id).or_default();
-        let bin = bins.entry(bin_id).or_insert_with(|| BinDataM { _loffset: vpos, chunks: vec![(vpos, vpos_end)] });
-        if let Some(last) = bin.chunks.last_mut() {
-            if vpos <= last.1 + (1 << 16) { last.1 = vpos_end; }
-            else { bin.chunks.push((vpos, vpos_end)); }
-        }
-        *ref_n_mapped.entry(ref_id).or_insert(0) += 1;
-        let lin_idx = (pos >> DEFAULT_MIN_SHIFT) as usize;
-        let lin = ref_linear.entry(ref_id).or_default();
-        if lin_idx >= lin.len() { lin.resize(lin_idx + 1, 0); }
-        if lin[lin_idx] == 0 || vpos < lin[lin_idx] { lin[lin_idx] = vpos; }
     }
 
-    // Write TBI
-    let n_ref = contig_names.len();
-    let mut out = Vec::with_capacity(64 * 1024);
-    write_tbi_header(&mut out, n_ref as i32, contig_names);
+    acc.write(contig_names, tbi_path)
+}
 
-    for ref_id in 0..n_ref {
-        if let Some(bins) = ref_bins.get(&ref_id) {
-            let n_mapped = ref_n_mapped.get(&ref_id).copied().unwrap_or(0);
-            out.extend_from_slice(&((bins.len() as i32 + 1).to_le_bytes()));
-            for (&bid, bd) in bins {
-                write_tbi_bin(&mut out, bid, &bd.chunks);
+// ---------------------------------------------------------------------------
+// Streaming TBI: index a VCF.gz while it is being written
+// ---------------------------------------------------------------------------
+
+/// Write adapter placed under noodles' BGZF writer: it forwards every byte to
+/// `inner` and, parsing the frame headers and trailers as they go by, reports
+/// each finished block's `(compressed size, uncompressed size)` in file order.
+/// With those, the virtual position of any uncompressed offset is known without
+/// reading the file back (`TbiStreamIndexer`).
+pub struct BgzfBlockTap<W> {
+    inner: W,
+    tx: std::sync::mpsc::Sender<(u64, u64)>,
+    hdr: [u8; 18],
+    hdr_len: usize,
+    /// Total size of the block being read (BSIZE + 1), 0 while in its header.
+    bsize: usize,
+    /// Bytes of the current block seen so far (header included).
+    pos: usize,
+    isize_le: [u8; 4],
+}
+
+impl<W> BgzfBlockTap<W> {
+    pub fn new(inner: W, tx: std::sync::mpsc::Sender<(u64, u64)>) -> Self {
+        Self { inner, tx, hdr: [0; 18], hdr_len: 0, bsize: 0, pos: 0, isize_le: [0; 4] }
+    }
+
+    pub fn into_inner(self) -> W { self.inner }
+
+    fn observe(&mut self, mut data: &[u8]) -> io::Result<()> {
+        while !data.is_empty() {
+            if self.bsize == 0 {
+                let take = (18 - self.hdr_len).min(data.len());
+                self.hdr[self.hdr_len..self.hdr_len + take].copy_from_slice(&data[..take]);
+                self.hdr_len += take;
+                data = &data[take..];
+                if self.hdr_len == 18 {
+                    let h = &self.hdr;
+                    // gzip magic, DEFLATE, FEXTRA, XLEN=6, one "BC" subfield of length 2.
+                    if h[0] != 0x1f || h[1] != 0x8b || h[2] != 8 || h[3] & 4 == 0
+                        || h[10] != 6 || h[11] != 0 || h[12] != b'B' || h[13] != b'C'
+                        || h[14] != 2 || h[15] != 0
+                    {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData,
+                            "BGZF block tap: unexpected frame header"));
+                    }
+                    let bsize = u16::from_le_bytes([h[16], h[17]]) as usize + 1;
+                    if bsize < 26 {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData,
+                            "BGZF block tap: block shorter than its header and trailer"));
+                    }
+                    self.bsize = bsize;
+                    self.pos = 18;
+                }
+            } else {
+                let take = (self.bsize - self.pos).min(data.len());
+                // Keep the bytes that fall in the 4-byte ISIZE field at the block end.
+                let isize_start = self.bsize - 4;
+                let (a, b) = (self.pos.max(isize_start), (self.pos + take).max(isize_start));
+                if b > a {
+                    self.isize_le[a - isize_start..b - isize_start]
+                        .copy_from_slice(&data[a - self.pos..b - self.pos]);
+                }
+                self.pos += take;
+                data = &data[take..];
+                if self.pos == self.bsize {
+                    let ulen = u32::from_le_bytes(self.isize_le) as u64;
+                    // The indexer may already be gone on an error path; the bytes
+                    // themselves are written either way.
+                    let _ = self.tx.send((self.bsize as u64, ulen));
+                    self.bsize = 0;
+                    self.hdr_len = 0;
+                    self.pos = 0;
+                }
             }
-            write_tbi_pseudo_bin(&mut out, n_mapped);
-            write_tbi_linear(&mut out, ref_linear.get(&ref_id));
-        } else {
-            out.extend_from_slice(&0i32.to_le_bytes());
-            out.extend_from_slice(&0i32.to_le_bytes());
+        }
+        Ok(())
+    }
+}
+
+impl<W: io::Write> io::Write for BgzfBlockTap<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.observe(&buf[..n])?;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> { self.inner.flush() }
+}
+
+/// Builds the `.tbi` of a VCF.gz while it is written, giving exactly the index
+/// `build_tbi_index_with_meta` builds by reading the finished file back.
+///
+/// That builder pairs, in order, every data line of the decompressed stream (a
+/// line not starting with `#`; the scan stops at the first empty line) with the
+/// next metadata record, taking the reader's virtual position before and after
+/// the line. Here the same lines are found in the uncompressed bytes as they are
+/// sent (`observe`), the metadata records are pushed separately (`push_meta`), and
+/// the virtual positions come from the block sizes reported by `BgzfBlockTap`:
+/// for an uncompressed offset `u > 0`, take the block holding byte `u - 1`; the
+/// position is `(block start, u - its first byte)`, or `(next block start, 0)`
+/// when `u` is that block's end — what noodles' reader reports after consuming
+/// up to `u` (offset 0 is `(0, 0)`). A final line without a newline ends where
+/// the reader stops looking for one: past every remaining frame (the EOF
+/// marker), at the end of the file. Pending lines wait only for the blocks still
+/// being compressed, so nothing per record outlives the pipeline's in-flight data.
+pub struct TbiStreamIndexer {
+    acc: TbiAccum,
+    rx: std::sync::mpsc::Receiver<(u64, u64)>,
+    /// Known blocks not yet retired: (compressed start, uncompressed start,
+    /// compressed size, uncompressed size).
+    blocks: std::collections::VecDeque<(u64, u64, u64, u64)>,
+    next_cstart: u64,
+    next_ustart: u64,
+    /// Uncompressed bytes observed so far.
+    total: u64,
+    line_start: u64,
+    /// First byte of the current, not yet terminated line.
+    line_first: Option<u8>,
+    /// An empty line was seen: the reader-side scan stops there, so no later
+    /// line is indexed (lines before it still are).
+    closed: bool,
+    /// Complete data lines awaiting their virtual positions: [start, end).
+    lines: std::collections::VecDeque<(u64, u64)>,
+    metas: std::collections::VecDeque<TbiRec>,
+    /// Every block is known (`finish`): a line ending at `EOF_END` can be placed.
+    at_eof: bool,
+}
+
+/// End offset recorded for a final line with no newline: see `TbiStreamIndexer`.
+const EOF_END: u64 = u64::MAX;
+
+impl TbiStreamIndexer {
+    pub fn new(rx: std::sync::mpsc::Receiver<(u64, u64)>) -> Self {
+        Self {
+            acc: TbiAccum::default(), rx,
+            blocks: Default::default(), next_cstart: 0, next_ustart: 0,
+            total: 0, line_start: 0, line_first: None, closed: false,
+            lines: Default::default(), metas: Default::default(), at_eof: false,
         }
     }
 
-    let tbi_file = std::fs::File::create(tbi_path)?;
-    let mut w = noodles_bgzf::io::Writer::new(tbi_file);
-    w.write_all(&out)?; w.try_finish()?;
-    Ok(())
+    /// The next metadata record, in the order the data lines are written.
+    #[inline]
+    pub fn push_meta(&mut self, rec: TbiRec) {
+        if !(self.closed && self.lines.is_empty()) { self.metas.push_back(rec); }
+    }
+
+    #[inline]
+    fn end_line(&mut self, end: u64) {
+        if self.closed { return; }
+        match self.line_first {
+            // `line_buf.is_empty()` in the reader: the scan ends here.
+            None => self.closed = true,
+            Some(b'#') => {}
+            Some(_) => self.lines.push_back((self.line_start, end)),
+        }
+    }
+
+    /// Feed the next uncompressed bytes of the stream, in write order.
+    pub fn observe(&mut self, buf: &[u8]) {
+        if self.closed { self.total += buf.len() as u64; return; }
+        let base = self.total;
+        let mut s = 0usize;
+        for nl in memchr::memchr_iter(b'\n', buf) {
+            if self.line_first.is_none() && s < nl { self.line_first = Some(buf[s]); }
+            let end = base + nl as u64 + 1;
+            self.end_line(end);
+            self.line_start = end;
+            self.line_first = None;
+            s = nl + 1;
+        }
+        if self.line_first.is_none() && s < buf.len() { self.line_first = Some(buf[s]); }
+        self.total = base + buf.len() as u64;
+    }
+
+    /// Virtual position after consuming the first `u` uncompressed bytes.
+    /// Queries must be non-decreasing; blocks wholly before byte `u - 1` retire.
+    #[inline]
+    fn vpos(&mut self, u: u64) -> u64 {
+        if u == 0 { return 0; }
+        let last = u - 1;
+        while let Some(&(_, us, _, ul)) = self.blocks.front() {
+            if us + ul <= last { self.blocks.pop_front(); } else { break; }
+        }
+        let (cs, us, csz, ul) = *self.blocks.front().expect("TBI stream: block not yet known");
+        debug_assert!(us <= last && last < us + ul);
+        if u < us + ul { (cs << 16) | (u - us) } else { (cs + csz) << 16 }
+    }
+
+    /// Take in the blocks compressed so far and index every line they cover.
+    pub fn process(&mut self) {
+        while let Ok((csize, ulen)) = self.rx.try_recv() {
+            self.blocks.push_back((self.next_cstart, self.next_ustart, csize, ulen));
+            self.next_cstart += csize;
+            self.next_ustart += ulen;
+        }
+        while let Some(&(ls, le)) = self.lines.front() {
+            if if le == EOF_END { !self.at_eof } else { le > self.next_ustart } { break; }
+            let Some(&rec) = self.metas.front() else { break };
+            let vs = self.vpos(ls);
+            // Unterminated at EOF: the reader read on through the remaining frames
+            // looking for the newline and stands at the end of the file.
+            let ve = if le == EOF_END { self.next_cstart << 16 } else { self.vpos(le) };
+            self.acc.add(rec, vs, ve);
+            self.lines.pop_front();
+            self.metas.pop_front();
+        }
+        if self.closed && self.lines.is_empty() { self.metas.clear(); }
+    }
+
+    /// Call after the BGZF writer is finished (every block reported): index the
+    /// rest and write `tbi_path`.
+    pub fn finish(mut self, contig_names: &[String], tbi_path: &Path) -> io::Result<()> {
+        // A final line without a newline is still a line to the reader.
+        if self.line_start < self.total {
+            self.end_line(EOF_END);
+        }
+        self.at_eof = true;
+        self.process();
+        // Lines left over ran out of metadata, where the reader stops too — unless
+        // their bytes never reached a block, which would be a caller error.
+        if self.total > self.next_ustart || self.lines.back().is_some_and(|&(_, le)| le != EOF_END && le > self.next_ustart) {
+            return Err(io::Error::other(format!(
+                "TBI stream: {} uncompressed bytes written but only {} reached the file's blocks",
+                self.total, self.next_ustart)));
+        }
+        self.acc.write(contig_names, tbi_path)
+    }
 }
 
 #[cfg(test)]
@@ -1071,5 +1315,387 @@ mod tests {
         let (cps, first, _) = scan_ref_bins(&d, &mut off, 2, min_shift, depth);
         assert_eq!(cps, vec![((start + (1 << 14)) as i64, VirtualPosition::from(leaf_vp))]);
         assert_eq!(u64::from(first), leaf_vp);
+    }
+
+    // ---- Streaming TBI vs. the reader-based builder (verbatim copy below) ----
+
+    /// Fast TBI index building with pre-collected metadata.
+    /// Only scans for virtual positions (skip parsing — metadata already known).
+    fn old_build_tbi_index_with_meta(
+        vcf_gz_path: &Path,
+        contig_names: &[String],
+        record_meta: &[TbiRec],
+        tbi_path: &Path,
+    ) -> io::Result<()> {
+        use std::collections::BTreeMap;
+        use std::io::{BufRead, BufReader};
+
+        // See `build_tbi_index` above: multi-threaded bgzf + user buffer breaks
+        // `virtual_position()` tracking; reading via the single-threaded bgzf's
+        // own block buffer (`fill_buf` / `consume`) keeps vpos precise.
+        let f = std::fs::File::open(vcf_gz_path)?;
+        let mut bgzf = noodles_bgzf::io::Reader::new(BufReader::with_capacity(4 << 20, f));
+
+        struct BinDataM { _loffset: u64, chunks: Vec<(u64, u64)> }
+        let mut ref_bins: BTreeMap<usize, BTreeMap<u32, BinDataM>> = BTreeMap::new();
+        let mut ref_n_mapped: BTreeMap<usize, u64> = BTreeMap::new();
+        let mut ref_linear: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
+
+        let mut line_buf: Vec<u8> = Vec::with_capacity(65536);
+        let mut rec_idx = 0usize;
+
+        loop {
+            let vpos: u64 = u64::from(bgzf.virtual_position());
+
+            line_buf.clear();
+            loop {
+                let buf = match bgzf.fill_buf() {
+                    Ok(b) => b,
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                };
+                if buf.is_empty() { break; }
+                if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                    line_buf.extend_from_slice(&buf[..nl]);
+                    bgzf.consume(nl + 1);
+                    break;
+                } else {
+                    let len = buf.len();
+                    line_buf.extend_from_slice(buf);
+                    bgzf.consume(len);
+                }
+            }
+            if line_buf.is_empty() { break; }
+            if line_buf.starts_with(b"#") { continue; }
+
+            let vpos_end: u64 = u64::from(bgzf.virtual_position());
+
+            if rec_idx >= record_meta.len() { break; }
+            let TbiRec { pos, rlen, ref_id } = record_meta[rec_idx];
+            let (rlen, ref_id) = (rlen as i64, ref_id as usize);
+            rec_idx += 1;
+
+            let bin_id = reg2bin(pos, pos + rlen, DEFAULT_MIN_SHIFT, TBI_DEPTH);
+            let bins = ref_bins.entry(ref_id).or_default();
+            let bin = bins.entry(bin_id).or_insert_with(|| BinDataM { _loffset: vpos, chunks: vec![(vpos, vpos_end)] });
+            if let Some(last) = bin.chunks.last_mut() {
+                if vpos <= last.1 + (1 << 16) { last.1 = vpos_end; }
+                else { bin.chunks.push((vpos, vpos_end)); }
+            }
+            *ref_n_mapped.entry(ref_id).or_insert(0) += 1;
+            let lin_idx = (pos >> DEFAULT_MIN_SHIFT) as usize;
+            let lin = ref_linear.entry(ref_id).or_default();
+            if lin_idx >= lin.len() { lin.resize(lin_idx + 1, 0); }
+            if lin[lin_idx] == 0 || vpos < lin[lin_idx] { lin[lin_idx] = vpos; }
+        }
+
+        // Write TBI
+        let n_ref = contig_names.len();
+        let mut out = Vec::with_capacity(64 * 1024);
+        write_tbi_header(&mut out, n_ref as i32, contig_names);
+
+        for ref_id in 0..n_ref {
+            if let Some(bins) = ref_bins.get(&ref_id) {
+                let n_mapped = ref_n_mapped.get(&ref_id).copied().unwrap_or(0);
+                out.extend_from_slice(&((bins.len() as i32 + 1).to_le_bytes()));
+                for (&bid, bd) in bins {
+                    write_tbi_bin(&mut out, bid, &bd.chunks);
+                }
+                write_tbi_pseudo_bin(&mut out, n_mapped);
+                write_tbi_linear(&mut out, ref_linear.get(&ref_id));
+            } else {
+                out.extend_from_slice(&0i32.to_le_bytes());
+                out.extend_from_slice(&0i32.to_le_bytes());
+            }
+        }
+
+        let tbi_file = std::fs::File::create(tbi_path)?;
+        let mut w = noodles_bgzf::io::Writer::new(tbi_file);
+        w.write_all(&out)?; w.try_finish()?;
+        Ok(())
+    }
+
+    struct Xs(u64);
+    impl Xs {
+        fn next(&mut self) -> u64 { self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17; self.0 }
+        fn below(&mut self, n: u64) -> u64 { self.next() % n }
+    }
+
+    /// Write `msgs` through noodles' multithreaded BGZF writer over a block tap
+    /// (as the VCF writer thread does), streaming the index; return the file
+    /// bytes and the streamed .tbi bytes.
+    fn stream_write(dir: &Path, tag: &str, msgs: &[Vec<u8>], metas: &[TbiRec], contigs: &[String],
+                    workers: usize) -> (Vec<u8>, Vec<u8>) {
+        let vcf = dir.join(format!("{tag}.vcf.gz"));
+        let tbi = dir.join(format!("{tag}.vcf.gz.tbi"));
+        let (btx, brx) = std::sync::mpsc::channel();
+        let tap = BgzfBlockTap::new(std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&vcf).unwrap()), btx);
+        let mut w = noodles_bgzf::io::multithreaded_writer::Builder::default()
+            .set_worker_count(std::num::NonZeroUsize::new(workers).unwrap())
+            .build_from_writer(tap);
+        let mut ix = TbiStreamIndexer::new(brx);
+        let mut mi = 0usize;
+        for m in msgs {
+            // Metadata arrives with the message holding its line, before or after
+            // the bytes; interleave both ways.
+            let n_lines = memchr::memchr_iter(b'\n', m).count();
+            for _ in 0..n_lines / 2 { if mi < metas.len() { ix.push_meta(metas[mi]); mi += 1; } }
+            ix.observe(m);
+            w.write_all(m).unwrap();
+            for _ in n_lines / 2..n_lines { if mi < metas.len() { ix.push_meta(metas[mi]); mi += 1; } }
+            ix.process();
+        }
+        while mi < metas.len() { ix.push_meta(metas[mi]); mi += 1; }
+        let mut f = w.finish().unwrap().into_inner();
+        f.flush().unwrap();
+        drop(f);
+        ix.finish(contigs, &tbi).unwrap();
+        (std::fs::read(&vcf).unwrap(), std::fs::read(&tbi).unwrap())
+    }
+
+    fn reader_tbi(dir: &Path, tag: &str, metas: &[TbiRec], contigs: &[String]) -> Vec<u8> {
+        let vcf = dir.join(format!("{tag}.vcf.gz"));
+        let tbi = dir.join(format!("{tag}.old.tbi"));
+        old_build_tbi_index_with_meta(&vcf, contigs, metas, &tbi).unwrap();
+        std::fs::read(&tbi).unwrap()
+    }
+
+    /// Lines of random length; some end exactly on a 65,495-byte BGZF block cut
+    /// (the multithreaded writer's block size), some straddle one, a few cover
+    /// several blocks; messages split anywhere, including mid-line.
+    fn synthetic_stream(seed: u64, n: usize, quirks: bool) -> (Vec<Vec<u8>>, Vec<TbiRec>) {
+        const BLOCK: usize = 65495;
+        let mut r = Xs(seed);
+        let mut stream: Vec<u8> = b"##fileformat=VCFv4.2\n##contig=<ID=22>\n##contig=<ID=X,length=9>\n#CHROM\tPOS\tID\tREF\tALT\n".to_vec();
+        let mut metas = Vec::new();
+        let mut pos = 10_000i64;
+        for i in 0..n {
+            pos += r.below(40_000) as i64;
+            let ref_cap = if r.below(10) == 0 { 300 } else { 3 };
+            let ref_len = 1 + r.below(ref_cap) as usize;
+            let chrom: &[u8] = if i > n / 2 { b"X" } else { b"22" };
+            let mut line = Vec::new();
+            line.extend_from_slice(chrom); line.push(b'\t');
+            line.extend_from_slice((pos + 1).to_string().as_bytes()); line.extend_from_slice(b"\t.\t");
+            line.extend(std::iter::repeat_n(b'A', ref_len)); line.extend_from_slice(b"\tG\t");
+            let pad = match r.below(50) {
+                0 => 70_000 + r.below(140_000) as usize,         // spans blocks
+                1 | 2 | 3 => {                                    // ends exactly on a cut
+                    let to_cut = (BLOCK - (stream.len() + line.len() + 1) % BLOCK) % BLOCK;
+                    if to_cut < 1000 { to_cut } else { r.below(200) as usize }
+                }
+                _ => r.below(400) as usize,
+            };
+            line.extend((0..pad).map(|k| b"0123456789:|\t"[k % 13]));
+            line.push(b'\n');
+            stream.extend_from_slice(&line);
+            metas.push(TbiRec { pos, rlen: ref_len as u32, ref_id: if i > n / 2 { 1 } else { 0 } });
+            if quirks && i == n / 3 { stream.extend_from_slice(b"#interleaved header-like line\n"); }
+        }
+        if quirks {
+            // A data line with no metadata of its own: pairing shifts, as in the reader.
+            stream.extend_from_slice(b"22\t5\n");
+            // A final line without a newline.
+            stream.extend_from_slice(b"X\t99999999\t.\tC\tT\t.\tPASS");
+            metas.push(TbiRec { pos: 99_999_998, rlen: 1, ref_id: 1 });
+        }
+        let mut msgs = Vec::new();
+        let mut s = 0;
+        while s < stream.len() {
+            let len = match r.below(4) { 0 => 1 + r.below(64), 1 => 1 + r.below(100_000), _ => 1 + r.below(3_000_000) } as usize;
+            let e = (s + len).min(stream.len());
+            msgs.push(stream[s..e].to_vec());
+            s = e;
+        }
+        (msgs, metas)
+    }
+
+    #[test]
+    fn streamed_tbi_matches_reader_built_tbi() {
+        let dir = tempfile::tempdir().unwrap();
+        let contigs = vec!["22".to_string(), "X".to_string()];
+        let mut hits_cut = 0;
+        for seed in 1..=12u64 {
+            let (msgs, metas) = synthetic_stream(seed.wrapping_mul(0x9e3779b97f4a7c15), 3000, seed % 3 == 0);
+            let stream: Vec<u8> = msgs.concat();
+            hits_cut += (1..=stream.len() / 65495).filter(|k| stream[k * 65495 - 1] == b'\n').count();
+            let tag = format!("s{seed}");
+            let (gz, tbi) = stream_write(dir.path(), &tag, &msgs, &metas, &contigs, 1 + (seed as usize % 5));
+            assert_eq!(tbi, reader_tbi(dir.path(), &tag, &metas, &contigs), "seed {seed}");
+            // The data round-trips.
+            let mut back = Vec::new();
+            noodles_bgzf::io::Reader::new(&gz[..]).read_to_end(&mut back).unwrap();
+            assert_eq!(back, stream);
+        }
+        assert!(hits_cut > 0, "no line ended on a block cut; the boundary case went untested");
+    }
+
+    #[test]
+    fn streamed_tbi_stops_at_an_empty_line_like_the_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let contigs = vec!["22".to_string(), "X".to_string()];
+        let (mut msgs, mut metas) = synthetic_stream(77, 1500, false);
+        let (more, more_metas) = synthetic_stream(78, 400, false);
+        msgs.push(b"\n".to_vec()); // an empty line: the reader's scan ends here
+        msgs.extend(more);
+        metas.extend(more_metas);
+        let (_, tbi) = stream_write(dir.path(), "e", &msgs, &metas, &contigs, 3);
+        assert_eq!(tbi, reader_tbi(dir.path(), "e", &metas, &contigs));
+        // And with fewer metadata records than lines (the reader stops early).
+        let (msgs, metas) = synthetic_stream(79, 800, false);
+        let short = &metas[..500];
+        let (_, tbi) = stream_write(dir.path(), "m", &msgs, short, &contigs, 2);
+        assert_eq!(tbi, reader_tbi(dir.path(), "m", short, &contigs));
+    }
+
+    /// BGZF blocks are cut at fixed uncompressed sizes and deflated one by one, so
+    /// the compressed file does not depend on the number of compression workers.
+    #[test]
+    fn bgzf_bytes_do_not_depend_on_worker_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let contigs = vec!["22".to_string(), "X".to_string()];
+        let (msgs, metas) = synthetic_stream(5, 4000, true);
+        let (gz1, tbi1) = stream_write(dir.path(), "w1", &msgs, &metas, &contigs, 1);
+        for w in [2, 4, 16] {
+            let (gzw, tbiw) = stream_write(dir.path(), &format!("w{w}"), &msgs, &metas, &contigs, w);
+            assert_eq!(gzw, gz1, "{w} workers");
+            assert_eq!(tbiw, tbi1, "{w} workers");
+        }
+        // And it equals the old writer stack: a 4 MB BufWriter over the
+        // multithreaded writer over an unbuffered File, finished by Drop.
+        let old = dir.path().join("old.vcf.gz");
+        {
+            let bg = noodles_bgzf::io::multithreaded_writer::Builder::default()
+                .set_worker_count(std::num::NonZeroUsize::new(4).unwrap())
+                .build_from_writer(std::fs::File::create(&old).unwrap());
+            let mut w = std::io::BufWriter::with_capacity(4 << 20, bg);
+            for m in &msgs { w.write_all(m).unwrap(); }
+            w.flush().unwrap();
+        }
+        assert_eq!(std::fs::read(&old).unwrap(), gz1);
+    }
+
+    /// A final record without a newline, whose metadata really is its own: the
+    /// reader ends it at the end of the file (past the EOF marker). Ending on a
+    /// block cut, inside a block, and across one.
+    #[test]
+    fn unterminated_final_record_ends_at_the_end_of_the_file() {
+        const BLOCK: usize = 65495;
+        let dir = tempfile::tempdir().unwrap();
+        let contigs = vec!["22".to_string(), "X".to_string()];
+        for (case, tail_len) in [0usize, 1, 10, 5000, 2 * BLOCK + 17].into_iter().enumerate() {
+            for cut in [false, true] {
+                let mut stream: Vec<u8> = b"##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\n".to_vec();
+                let mut metas = Vec::new();
+                for i in 0..2000i64 {
+                    stream.extend_from_slice(format!("22\t{}\t.\tA\tG\t.\tPASS\t.\tGT\t0|1\n", 100 + 37 * i).as_bytes());
+                    metas.push(TbiRec { pos: 99 + 37 * i, rlen: 1, ref_id: 0 });
+                }
+                let mut last = b"X\t1\t.\tACG\tC\t.\tPASS\t.\tGT\t0|1".to_vec();
+                last.extend(std::iter::repeat_n(b'\t', tail_len));
+                if cut {
+                    // Make the record end exactly on a block cut.
+                    let pad = (BLOCK - (stream.len() + last.len()) % BLOCK) % BLOCK;
+                    last.extend(std::iter::repeat_n(b'0', pad));
+                }
+                stream.extend_from_slice(&last);
+                metas.push(TbiRec { pos: 0, rlen: 3, ref_id: 1 });
+                let msgs: Vec<Vec<u8>> = stream.chunks(40_000).map(|c| c.to_vec()).collect();
+                let tag = format!("u{case}{cut}");
+                let (_, tbi) = stream_write(dir.path(), &tag, &msgs, &metas, &contigs, 3);
+                assert_eq!(tbi, reader_tbi(dir.path(), &tag, &metas, &contigs), "tail {tail_len} cut {cut}");
+            }
+        }
+    }
+
+    /// The previous VCF writer thread's metadata scan, verbatim (its loop over
+    /// the channel messages, without the write).
+    fn old_scan_meta(msgs: &[Vec<u8>]) -> (Vec<String>, Vec<TbiRec>) {
+        let mut record_meta: Vec<crate::srp::csi::TbiRec> = Vec::new();
+        let mut contig_names: Vec<String> = Vec::new();
+        let mut last_chrom: Vec<u8> = Vec::new();
+        let mut last_ref_id: u32 = 0;
+            for buf in msgs {
+                // Scan for record metadata while writing
+                let mut start = 0;
+                while start < buf.len() {
+                    let end = buf[start..].iter().position(|&b| b == b'\n')
+                        .map(|p| start + p + 1).unwrap_or(buf.len());
+                    let line = &buf[start..end];
+                    if !line.starts_with(b"#") && line.len() > 5 {
+                        let mut tabs = [0usize; 4]; let mut nt = 0;
+                        for (i, &b) in line.iter().enumerate() {
+                            if b == b'\t' { if nt < 4 { tabs[nt] = i; } nt += 1; if nt >= 4 { break; } }
+                        }
+                        if nt >= 4 {
+                            let chrom = &line[..tabs[0]];
+                            if chrom != last_chrom.as_slice() {
+                                last_chrom.clear();
+                                last_chrom.extend_from_slice(chrom);
+                                last_ref_id = crate::srp::csi::tbi_ref_id(&contig_names, chrom);
+                            }
+                            let pos: i64 = std::str::from_utf8(&line[tabs[0]+1..tabs[1]])
+                                .unwrap_or("0").parse().unwrap_or(0) - 1;
+                            let rlen = (tabs[3] - tabs[2] - 1).max(1) as u32;
+                            record_meta.push(crate::srp::csi::TbiRec { pos, rlen, ref_id: last_ref_id });
+                        }
+                    } else if line.starts_with(b"##contig=<ID=") {
+                        let s = b"##contig=<ID=".len();
+                        if let Some(e) = line[s..].iter().position(|&b| b == b',' || b == b'>') {
+                            contig_names.push(String::from_utf8_lossy(&line[s..s+e]).to_string());
+                        }
+                    }
+                    start = end;
+                }
+        }
+        (contig_names, record_meta)
+    }
+
+    /// The whole VCF writer (`setup_vcf_writer`) against the previous one: same
+    /// .vcf.gz bytes, and the .tbi the previous writer built by reading the file
+    /// back with the metadata its thread scanned — here with a final record sent
+    /// without a newline.
+    #[test]
+    fn vcf_writer_matches_the_previous_writer_with_an_unterminated_last_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let names: Vec<String> = (0..3).map(|i| format!("S{i}")).collect();
+        let contig = "##contig=<ID=22,length=50818468>";
+        let mut header = Vec::new();
+        crate::io::vcf_fmt::write_imputation_vcf_header(&mut header, &names, contig, "test", false, "").unwrap();
+        let mut msgs: Vec<Vec<u8>> = vec![header];
+        let mut r = Xs(0x7E57);
+        let mut pos = 16_000_000u64;
+        for _ in 0..300 {
+            let mut m = Vec::new();
+            for _ in 0..r.below(400) {
+                pos += 1 + r.below(300);
+                m.extend_from_slice(format!("22\t{pos}\trs{pos}\tA\tG\t.\tPASS\tAF=0.5;AC=3;AN=6;DR2=0.9\tGT:DS\t0|1:1\t1|1:2\t0|0:0.012\n").as_bytes());
+            }
+            msgs.push(m);
+        }
+        msgs.push(b"22\t50000000\t.\tA\tC\t.\tPASS\t.\tGT\t0|1\t0|0\t1|1".to_vec());
+        let out = dir.path().join("w");
+        let (tx, handle, bg) = crate::io::pipeline::setup_vcf_writer(3, &names, contig, "test", &out, false).unwrap();
+        for m in &msgs[1..] { tx.send(m.clone()).unwrap(); }
+        crate::io::pipeline::finish_vcf_writer(tx, handle, bg).unwrap();
+        let vcf = dir.path().join("w.vcf.gz");
+        // The previous writer stack, for the bytes.
+        let old_vcf = dir.path().join("old.vcf.gz");
+        {
+            let bg = noodles_bgzf::io::multithreaded_writer::Builder::default()
+                .set_worker_count(std::num::NonZeroUsize::new(3).unwrap())
+                .build_from_writer(std::fs::File::create(&old_vcf).unwrap());
+            let mut w = std::io::BufWriter::with_capacity(4 << 20, bg);
+            for m in &msgs { w.write_all(m).unwrap(); }
+            w.flush().unwrap();
+        }
+        assert_eq!(std::fs::read(&vcf).unwrap(), std::fs::read(&old_vcf).unwrap());
+        let (contigs, metas) = old_scan_meta(&msgs);
+        // Every data record, the unterminated last one included, has its own.
+        assert_eq!(metas.len(), msgs[1..].iter().map(|m| memchr::memchr_iter(b'\n', m).count()).sum::<usize>() + 1,
+            "the last record must carry its own metadata");
+        let old_tbi = dir.path().join("old.tbi");
+        old_build_tbi_index_with_meta(&vcf, &contigs, &metas, &old_tbi).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("w.vcf.gz.tbi")).unwrap(), std::fs::read(&old_tbi).unwrap());
     }
 }
