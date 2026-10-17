@@ -117,6 +117,9 @@ struct WindowJob {
 /// debug counters.
 struct WindowOut {
     trans: Option<Vec<f64>>,
+    /// P(ALT | configuration) per missing locus of the window (empty if none or
+    /// not run); see `SegmentHmm::impute_missing`.
+    miss: Vec<f32>,
     underflow: bool,
     bad: bool,
     needs_f64: bool,
@@ -126,6 +129,22 @@ struct WindowOut {
 
 /// Random haplotypes added when a window's conditioning set has fewer than two.
 const N_RANDOM_HAPS: usize = 100;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: phase this thread's runs with no-calls observed (the legacy oracle's mode).
+    pub(crate) static NOCALL_OBSERVED_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `SELPHI_DIPLOID_NOCALL_OBSERVED=1`: input no-calls enter the rebuilt genotype
+/// graphs as the initialisation sweep's voted genotype (observed, never imputed)
+/// and the output keeps the post-phasing k-NN vote at them — the behaviour before
+/// 2026-10-17. Default: they stay missing and the segment HMM imputes them.
+pub(crate) fn nocall_observed() -> bool {
+    #[cfg(test)]
+    if NOCALL_OBSERVED_TEST.with(|c| c.get()) { return true; }
+    crate::config::is_one("SELPHI_DIPLOID_NOCALL_OBSERVED")
+}
 
 /// Tests only: f64 retries deferred out of a parallel window batch.
 #[cfg(test)]
@@ -143,9 +162,10 @@ const WINDOW_PAR_BUDGET: usize = 16 << 20;
 /// bytes window `(w_first, w_last)` holds while its f32 HMM runs (`.0`: the
 /// conditioning set at up to twice its length in capacity, the per-segment
 /// forward store, the state vectors, the compact conditioning bitmatrix and its
-/// index vectors, the transition block and missing-probability output) and on
-/// what stays alive after it finishes until it is written (`.1`: transition
-/// block + conditioning set).
+/// index vectors, the transition block, the forward states kept for missing
+/// loci and the missing-probability output) and on what stays alive
+/// after it finishes until it is written (`.1`: transition block,
+/// missing-probability output and conditioning set).
 fn window_bound(cond: &CondCtx, w_first: usize, w_last: usize) -> (usize, usize) {
     let graph = cond.graph;
     let w_l0 = graph.segment_start(w_first);
@@ -157,12 +177,14 @@ fn window_bound(cond: &CondCtx, w_first: usize, w_last: usize) -> (usize, usize)
     for s in w_first..w_last {
         n_trans += graph.count_diplotypes(s) * graph.count_diplotypes(s + 1);
     }
+    let mis = graph.missing_in(w_l0, w_l1);
     let cond_set = 2 * k * 8;
-    let alpha = segs * (k * HAP_NUMBER * 4 + HAP_NUMBER * 4 + 4 + 2 * 8);
+    let alpha = segs * (k * HAP_NUMBER * 4 + HAP_NUMBER * 4 + 4 + 2 * 8)
+        + super::hmm_segment::missing_store_bound(mis, k);
     let state = (k * HAP_NUMBER + 8) * 4 + k * 4;
     let bitmatrix = loci * k.div_ceil(64) * 8 + k * (8 + 4);
-    let outputs = n_trans * 8 + graph.n_missing * HAP_NUMBER * 4;
-    (cond_set + alpha + state + bitmatrix + outputs, n_trans * 8 + cond_set)
+    let outputs = n_trans * 8 + mis * HAP_NUMBER * 4;
+    (cond_set + alpha + state + bitmatrix + outputs, outputs + cond_set)
 }
 
 /// Consecutive window ranges `[start, end)` that run together, from each
@@ -374,8 +396,8 @@ impl WindowHmmCtx<'_> {
         let hap_bm_hmm_ref = self.hap_bm;
         let (w_first, w_last, w_l0, w_l1) = (job.w_first, job.w_last, job.w_l0, job.w_l1);
         let cond_set = &job.cond_set;
-        let mut out = WindowOut { trans: None, underflow: false, bad: false, needs_f64: false,
-                                  fwd_ns: 0, bwd_ns: 0 };
+        let mut out = WindowOut { trans: None, miss: Vec::new(), underflow: false, bad: false,
+                                  needs_f64: false, fwd_ns: 0, bwd_ns: 0 };
 
         // Build compact bitmatrix for conditioning haps — window range only.
         // Extract conditioning haplotype subset for this window, transposed.
@@ -425,31 +447,33 @@ impl WindowHmmCtx<'_> {
         // f64 fallback (taken on f32 forward underflow OR a non-finite f32
         // backward result); None when the f64 HMM also underflows, which skips
         // the window. Shared by both fallback sites below so they cannot drift.
-        let run_hmm64_fallback = |out: &mut WindowOut| -> Option<Vec<f64>> {
-            if defer_f64 { out.needs_f64 = true; None } else { self.run_f64(job) }
+        let run_hmm64_fallback = |out: &mut WindowOut| {
+            if defer_f64 { out.needs_f64 = true; } else { self.run_f64(job, out); }
         };
 
         let t_bwd = std::time::Instant::now();
-        out.trans = if hmm_reuse.has_underflow() {
+        if hmm_reuse.has_underflow() {
             out.underflow = true;
-            run_hmm64_fallback(&mut out)
+            run_hmm64_fallback(&mut out);
         } else {
-            let (t, _) = hmm_reuse.backward_rare_direct(graph, cond_bm, k_words, locus_offset, &hmm_params.trans,
+            let (t, miss) = hmm_reuse.backward_rare_direct(graph, cond_bm, k_words, locus_offset, &hmm_params.trans,
                 w_first, w_last, &hmm_params.rare_allele, hmm_params);
             let has_bad = t.iter().any(|&v| v.is_nan() || v.is_infinite());
             if has_bad {
                 out.bad = true;
-                run_hmm64_fallback(&mut out)
+                run_hmm64_fallback(&mut out);
             } else {
-                Some(t)
+                out.trans = Some(t);
+                out.miss = miss;
             }
-        };
+        }
         out.bwd_ns = t_bwd.elapsed().as_nanos();
         out
     }
 
-    /// The f64 HMM over one window; None when it underflows too.
-    fn run_f64(&self, job: &WindowJob) -> Option<Vec<f64>> {
+    /// The f64 HMM over one window into `out.trans` / `out.miss`; `out.trans`
+    /// stays None when it underflows too.
+    fn run_f64(&self, job: &WindowJob, out: &mut WindowOut) {
         let graph = self.graph;
         let hmm_params = self.hmm_params;
         let hap_bm_hmm_ref = self.hap_bm;
@@ -459,11 +483,22 @@ impl WindowHmmCtx<'_> {
         let mut hmm64 = SegmentHmmF64::new(cond_set.len());
         hmm64.forward_rare(graph, cond_set, &hap_fn, &hmm_params.trans,
             w_first, w_last, &hmm_params.rare_allele, hmm_params);
-        if hmm64.has_underflow() { return None; }
-        let (t, _) = hmm64.backward_rare(graph, cond_set, &hap_fn, &hmm_params.trans,
+        if hmm64.has_underflow() { return; }
+        let (t, miss) = hmm64.backward_rare(graph, cond_set, &hap_fn, &hmm_params.trans,
             w_first, w_last, &hmm_params.rare_allele, hmm_params);
-        Some(t)
+        out.trans = Some(t);
+        out.miss = miss;
     }
+}
+
+/// Copies a window's missing-locus probabilities into the sample's vector at the
+/// window's first missing ordinal. Windows are written in order, so a segment
+/// two windows share keeps the later window's values, as SHAPEIT5's sequential
+/// windows leave it.
+fn write_missing(all_missing: &mut [f32], mis_idx: &[u32], w_first: usize, miss: &[f32]) {
+    if miss.is_empty() { return; }
+    let o = mis_idx[w_first] as usize * HAP_NUMBER;
+    all_missing[o..o + miss.len()].copy_from_slice(miss);
 }
 
 /// Explicit phasing Ne, if the run asks for one. `SELPHI_PHASE_NE` pins an
@@ -1234,13 +1269,13 @@ pub fn run_phase_common_bm(
         pbwt_init_sweep(&mut hap_bm, &pbwt_idx.chunk_assignments, &pbwt_idx.chunk_starts,
             n_var, n_samples, n_haps_total, target_geno, locked, mis_vote);
 
-        // Rebuild genotype graphs from bitmatrix. Each input no-call enters the graph as
-        // the genotype the sweep voted for. SHAPEIT5 keeps it missing and imputes it from
-        // the HMM every iteration; this engine computes no missing probabilities, and
-        // keeping it missing without them (SELPHI_DIPLOID_NOCALL_KEEP_MISSING=1) left
-        // stale haplotype bits at those sites: scaffold switch error -0.012 pp but rare
-        // hets +4 pp at 2% no-calls (801 samples, 22:30-32 Mb, 3/3 seeds), so it is off.
-        let keep_missing = crate::config::is_one("SELPHI_DIPLOID_NOCALL_KEEP_MISSING");
+        // Rebuild genotype graphs from bitmatrix. Each input no-call stays MISSING (no
+        // emission), with the sweep's vote only as its starting haplotype alleles, and
+        // the segment HMM imputes it every iteration as SHAPEIT5 does (IMPUTE in the
+        // backward, a draw per iteration, the Main-iteration average in the solve).
+        // `SELPHI_DIPLOID_NOCALL_OBSERVED=1` restores entering it as the voted
+        // genotype, which the HMM then treated as observed.
+        let keep_missing = !nocall_observed();
         for si in 0..n_samples {
             let mut geno = vec![0u8; n_var * 2];
             let h0 = si * 2;
@@ -1253,8 +1288,9 @@ pub fn run_phase_common_bm(
                 (0..n_var).map(|v| l[v * n_samples + si]).collect());
             let nocall = |v: usize| target_geno[v * n_samples * 2 + si * 2] > 1
                 || target_geno[v * n_samples * 2 + si * 2 + 1] > 1;
+            let haploid = |v: usize| target_geno[v * n_samples * 2 + si * 2] == HAPLOID_MISSING;
             graphs[si] = if keep_missing && (0..n_var).any(nocall) {
-                build_graph_keep_missing(si, &geno, n_var, flags.as_deref(), nocall)
+                build_graph_keep_missing(si, &geno, n_var, flags.as_deref(), nocall, haploid)
             } else {
                 build_graph(si, &geno, n_var, flags.as_deref())
             };
@@ -1420,7 +1456,9 @@ fn _run_iterations(
             // 2b. HMM forward+backward per window
 
             let mut all_trans = vec![1.0f64; graph.n_transitions.max(1)];
-            let all_missing = vec![0.0f32; graph.n_missing * HAP_NUMBER];
+            // NaN = not imputed this iteration (no window ran over the locus).
+            let mut all_missing = vec![f32::NAN; graph.n_missing * HAP_NUMBER];
+            let mis_idx = graph.missing_offsets();
             let mut k_per_window: Vec<usize> = Vec::new();
             let mut banned = Vec::new();
             let mut o_iter = 0usize; // per-sample iteration counter
@@ -1484,6 +1522,7 @@ fn _run_iterations(
                             bwd_ns += out.bwd_ns;
                             if let Some(w_trans) = &out.trans {
                                 writer.apply(graph_ro, &mut all_trans, job.w_first, w_trans);
+                                write_missing(&mut all_missing, &mis_idx, job.w_first, &out.miss);
                             }
                         }
                         continue;
@@ -1502,7 +1541,7 @@ fn _run_iterations(
                             #[cfg(test)]
                             DEFERRED_F64_RUNS.fetch_add(1, Ordering::Relaxed);
                             let t_f64 = std::time::Instant::now();
-                            out.trans = hmm_ctx.run_f64(job);
+                            hmm_ctx.run_f64(job, &mut out);
                             out.bwd_ns += t_f64.elapsed().as_nanos();
                         }
                         n_underflow += out.underflow as usize;
@@ -1511,6 +1550,7 @@ fn _run_iterations(
                         bwd_ns += out.bwd_ns;
                         if let Some(w_trans) = &out.trans {
                             writer.apply(graph_ro, &mut all_trans, job.w_first, w_trans);
+                            write_missing(&mut all_missing, &mis_idx, job.w_first, &out.miss);
                         }
                     }
                 }
@@ -1532,6 +1572,7 @@ fn _run_iterations(
                     bwd_ns += out.bwd_ns;
                     if let Some(w_trans) = &out.trans {
                         writer.apply(graph_ro, &mut all_trans, w_first, w_trans);
+                        write_missing(&mut all_missing, &mis_idx, w_first, &out.miss);
                     }
                 }
             }
@@ -2029,13 +2070,13 @@ fn run_phase_common_bm_legacy(
             }
         });
 
-        // Rebuild genotype graphs from bitmatrix. Each input no-call enters the graph as
-        // the genotype the sweep voted for. SHAPEIT5 keeps it missing and imputes it from
-        // the HMM every iteration; this engine computes no missing probabilities, and
-        // keeping it missing without them (SELPHI_DIPLOID_NOCALL_KEEP_MISSING=1) left
-        // stale haplotype bits at those sites: scaffold switch error -0.012 pp but rare
-        // hets +4 pp at 2% no-calls (801 samples, 22:30-32 Mb, 3/3 seeds), so it is off.
-        let keep_missing = crate::config::is_one("SELPHI_DIPLOID_NOCALL_KEEP_MISSING");
+        // Rebuild genotype graphs from bitmatrix. Each input no-call stays MISSING (no
+        // emission), with the sweep's vote only as its starting haplotype alleles, and
+        // the segment HMM imputes it every iteration as SHAPEIT5 does (IMPUTE in the
+        // backward, a draw per iteration, the Main-iteration average in the solve).
+        // `SELPHI_DIPLOID_NOCALL_OBSERVED=1` restores entering it as the voted
+        // genotype, which the HMM then treated as observed.
+        let keep_missing = !nocall_observed();
         for si in 0..n_samples {
             let mut geno = vec![0u8; n_var * 2];
             let h0 = si * 2;
@@ -2048,8 +2089,9 @@ fn run_phase_common_bm_legacy(
                 (0..n_var).map(|v| l[v * n_samples + si]).collect());
             let nocall = |v: usize| target_geno[v * n_samples * 2 + si * 2] > 1
                 || target_geno[v * n_samples * 2 + si * 2 + 1] > 1;
+            let haploid = |v: usize| target_geno[v * n_samples * 2 + si * 2] == HAPLOID_MISSING;
             graphs[si] = if keep_missing && (0..n_var).any(nocall) {
-                build_graph_keep_missing(si, &geno, n_var, flags.as_deref(), nocall)
+                build_graph_keep_missing(si, &geno, n_var, flags.as_deref(), nocall, haploid)
             } else {
                 build_graph(si, &geno, n_var, flags.as_deref())
             };
@@ -2649,6 +2691,15 @@ mod phase_common_parity_tests {
         bm: HaplotypeBitmatrix,
     }
 
+    /// Observed-mode phasing on this thread until dropped.
+    struct ObservedForTest;
+    impl ObservedForTest {
+        fn on() -> Self { NOCALL_OBSERVED_TEST.with(|c| c.set(true)); ObservedForTest }
+    }
+    impl Drop for ObservedForTest {
+        fn drop(&mut self) { NOCALL_OBSERVED_TEST.with(|c| c.set(false)); }
+    }
+
     /// Graphs + unified bitmatrix exactly as `_diploid_run` builds them.
     fn build(target_geno: &[u8], panel: &[u8], n_var: usize, n_samples: usize, n_ref: usize,
              locked: Option<&[bool]>) -> Case {
@@ -2679,6 +2730,9 @@ mod phase_common_parity_tests {
     #[allow(clippy::too_many_arguments)]
     fn parity_case(seed: u64, n_samples: usize, n_ref: usize, n_var: usize, cm_step: f64,
                    nocall_rate: f64, max_cond_haps: usize, with_lock: bool) {
+        // The oracle predates the SHAPEIT5 missing-genotype imputation: compare in
+        // the mode it models (no-calls observed as the sweep's vote).
+        let _observed = ObservedForTest::on();
         let mut rng = TestRng::new(seed);
         let n_tgt = 2 * n_samples;
         let panel = mosaic_panel(&mut rng, n_var, n_tgt + n_ref);
@@ -2728,6 +2782,7 @@ mod phase_common_parity_tests {
     /// 1/1002 < 0.001). Old vs new must agree whatever fallbacks it causes;
     /// returns the deferred f64 retries seen.
     fn rare_head_case(seed: u64) -> usize {
+        let _observed = ObservedForTest::on();
         let mut rng = TestRng::new(seed);
         let (n_samples, n_ref, n_var) = (1usize, 1000usize, 700usize);
         let n_tgt = 2;
@@ -2807,5 +2862,66 @@ mod phase_common_parity_tests {
         parity_case(23, 2, 150, 600, 0.05, 0.0, 40, false);
         parity_case(24, 4, 100, 600, 0.05, 0.01, 0, true);
         parity_case(25, 30, 0, 500, 0.06, 0.02, 0, false);
+    }
+
+    /// Default mode: input no-calls stay missing in the graphs and the segment HMM
+    /// imputes them (SHAPEIT5 IMPUTE). Deterministic, every no-call locus imputed
+    /// by the stored Main iterations, and the solved alleles at no-calls agree with
+    /// the true genotypes at least as often as the observed-vote mode's. Covers the
+    /// parallel-window path (a few samples) and the serial one (a cohort).
+    #[test]
+    fn nocalls_are_imputed_by_the_segment_hmm() {
+        for &(seed, n_samples, n_ref) in &[(31u64, 2usize, 200usize), (32, 30, 60), (33, 1, 300)] {
+            let mut rng = TestRng::new(seed);
+            let (n_var, n_tgt) = (700usize, 2 * n_samples);
+            let panel = mosaic_panel(&mut rng, n_var, n_tgt + n_ref);
+            let mut target_geno = vec![0u8; n_var * n_tgt];
+            let mut truth = vec![0u8; n_var * n_samples];
+            for v in 0..n_var {
+                for si in 0..n_samples {
+                    let (mut g0, mut g1) = (panel[(2 * si) * n_var + v], panel[(2 * si + 1) * n_var + v]);
+                    truth[v * n_samples + si] = g0 + g1;
+                    if rng.chance(0.5) { std::mem::swap(&mut g0, &mut g1); }
+                    if rng.chance(0.04) { g0 = 128; g1 = 128; }
+                    target_geno[v * n_tgt + 2 * si] = g0;
+                    target_geno[v * n_tgt + 2 * si + 1] = g1;
+                }
+            }
+            let cm: Vec<f64> = (0..n_var).map(|i| i as f64 * 0.05).collect();
+            let bp: Vec<i64> = (0..n_var).map(|i| 1_000_000 + i as i64 * 3_000).collect();
+            let run = |observed: bool| {
+                NOCALL_OBSERVED_TEST.with(|c| c.set(observed));
+                let Case { mut graphs, bm } = build(&target_geno, &panel, n_var, n_samples, n_ref, None);
+                run_phase_common_bm(&mut graphs, bm, &cm, n_var, n_samples, n_ref, 5 + seed as i64, 4,
+                    "5b,1p,1b,1p,1b,1p,5m", Some(&bp), &target_geno, 0, None, None);
+                NOCALL_OBSERVED_TEST.with(|c| c.set(false));
+                graphs
+            };
+            let concordance = |graphs: &[GenotypeGraph]| {
+                let (mut ok, mut n) = (0usize, 0usize);
+                for (si, g) in graphs.iter().enumerate() {
+                    let (h0, h1) = g.extract_haplotypes();
+                    for v in 0..n_var {
+                        if target_geno[v * n_tgt + 2 * si] > 1 {
+                            n += 1;
+                            ok += (h0[v] + h1[v] == truth[v * n_samples + si]) as usize;
+                        }
+                    }
+                }
+                ok as f64 / n as f64
+            };
+            let a = run(false);
+            let b = run(false);
+            for (ga, gb) in a.iter().zip(&b) {
+                assert_eq!(ga.variants, gb.variants, "seed {seed}: not deterministic");
+                assert!(ga.n_missing > 0, "seed {seed}: no-calls must stay missing");
+                assert!(ga.prob_missing_n.iter().all(|&c| c > 0), "seed {seed}: a no-call never imputed");
+            }
+            let obs = run(true);
+            assert!(obs.iter().all(|g| g.n_missing == 0));
+            let (ck, co) = (concordance(&a), concordance(&obs));
+            eprintln!("seed {seed}, {n_samples} samples: no-call concordance imputed {ck:.4} vs observed vote {co:.4}");
+            assert!(ck > 0.85 && ck + 0.02 >= co, "seed {seed}: imputed {ck:.4} vs observed {co:.4}");
+        }
     }
 }

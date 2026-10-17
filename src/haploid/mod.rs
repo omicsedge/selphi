@@ -399,16 +399,18 @@ fn phase_genotypes_inner(
         // For each low-MAF variant (target MAF < 1%), store ref haplotype indices
         // that carry the alt allele. Used for IBS post-processing each iteration.
         let low_maf_carriers: Vec<(usize, Vec<u32>)> = {
-            let target_an = (n_samples * 2) as f32;
             let mut result = Vec::new();
             for m in 0..w_size {
-                let mut ac = 0u32;
+                // Over called alleles only: a missing allele (> 1) is no count.
+                let (mut ac, mut an) = (0u32, 0u32);
                 for si in 0..n_samples {
-                    ac += target_geno[(ws + m) * n_samples * 2 + si * 2] as u32;
-                    ac += target_geno[(ws + m) * n_samples * 2 + si * 2 + 1] as u32;
+                    for a in [target_geno[(ws + m) * n_samples * 2 + si * 2],
+                              target_geno[(ws + m) * n_samples * 2 + si * 2 + 1]] {
+                        if a <= 1 { ac += a as u32; an += 1; }
+                    }
                 }
-                let mac = ac.min((n_samples * 2) as u32 - ac);
-                let maf = mac as f32 / target_an;
+                let mac = ac.min(an - ac);
+                let maf = if an > 0 { mac as f32 / an as f32 } else { 0.0 };
                 if maf > 0.0 && maf < 0.01 {
                     let m_byte = m >> 3;
                     let m_bit = m & 7;

@@ -301,6 +301,16 @@ fn _diploid_run(
     let nocall_ref = crate::config::is_one("SELPHI_DIPLOID_NOCALL_REF");
     let nocall_k = crate::config::usize_or("SELPHI_HAPLOID_NOCALL_K", 50);
     let any_nocall = !nocall_ref && target_geno[..n_var * n_haps].iter().any(|&g| g > 1);
+    // Common-variant no-calls phase_common imputed itself (kept missing in its
+    // graphs and imputed by the segment HMM) keep that allele: the vote fills only
+    // the no-calls the scaffold still holds as missing — the rare ones, and any
+    // common one no Main iteration imputed (put back to missing below). 2%
+    // no-calls, genotype concordance at them: 801 samples --phase-panel 0.9903 ->
+    // 0.9971, 54 trio children 0.9916 -> 0.9967.
+    let hmm_fill = any_nocall && !phase_common::nocall_observed();
+    let unimputed: Vec<Vec<usize>> = if hmm_fill {
+        graphs.iter().map(|g| g.unimputed_missing()).collect()
+    } else { Vec::new() };
 
     // Build one full phased scaffold from a common-variant phase source:
     //   init from target genotypes → overwrite common variants with this source →
@@ -333,8 +343,18 @@ fn _diploid_run(
         phased
     };
     let finish_scaffold = |phased: &mut Vec<u8>| {
+        // A common no-call no Main iteration imputed goes back to missing for the
+        // vote (after phase_rare, which reads scaffold sites as called alleles).
+        for (si, cis) in unimputed.iter().enumerate() {
+            for &ci in cis {
+                let v = common_indices[ci];
+                phased[v * n_haps + si * 2] = target_geno[v * n_samples * 2 + si * 2];
+                phased[v * n_haps + si * 2 + 1] = target_geno[v * n_samples * 2 + si * 2 + 1];
+            }
+        }
         if any_nocall {
-            fill_missing_local_vote(phased, n_var, n_haps, full_chip_ref_bm, n_ref, target_geno, nocall_k);
+            fill_missing_local_vote(phased, n_var, n_haps, full_chip_ref_bm, n_ref, target_geno,
+                hmm_fill, nocall_k);
         }
         for g in phased.iter_mut() { if *g > 1 { *g = 0; } }
     };
@@ -403,6 +423,8 @@ pub(crate) fn ensemble_main_iters(n_members: usize, n_main_iters: usize) -> Vec<
 ///
 /// `phased` is `n_var * n_targ` (row-major, target haps only). Missing neighbours
 /// (other not-yet-voted no-calls) carry allele `-1` and are skipped in the tally.
+/// With `imputed_kept`, a no-call the scaffold already holds an allele for (one
+/// the phasing imputed) is read as called; only those still missing are voted.
 fn fill_missing_local_vote(
     phased: &mut [u8],
     n_var: usize,
@@ -410,11 +432,12 @@ fn fill_missing_local_vote(
     ref_bm: Option<&pbwt_neighbor::HaplotypeBitmatrix>,
     n_ref: usize,
     target_geno: &[u8],
+    imputed_kept: bool,
     k: usize,
 ) {
     let n_haps = n_targ + n_ref;
     if n_haps == 0 { return; }
-    let nocall = |i: usize| target_geno[i] > 1;
+    let mut miss = vec![false; n_targ];
     let nw = n_haps.div_ceil(64);
     let mut a: Vec<i32> = (0..n_haps as i32).collect();
     let mut b: Vec<i32> = vec![0; n_haps];
@@ -432,7 +455,10 @@ fn fill_missing_local_vote(
     for step in 0..n_var {
         let m = n_var - 1 - step;
         let row = m * n_targ;
-        let has_missing = (0..n_targ).any(|h| nocall(row + h));
+        for h in 0..n_targ {
+            miss[h] = target_geno[row + h] > 1 && (!imputed_kept || phased[row + h] > 1);
+        }
+        let has_missing = miss.iter().any(|&x| x);
         // Advance the prefix using the PREVIOUS marker's alleles (the suffix m+1..),
         // so `a` is now sorted by the suffix to the right of m.
         if have_prev {
@@ -442,17 +468,32 @@ fn fill_missing_local_vote(
         }
         // This marker's target alleles (no-call -> -1).
         for h in 0..n_targ {
-            t_al[h] = if nocall(row + h) { -1 } else { (phased[row + h] > 0) as i8 };
+            t_al[h] = if miss[h] { -1 } else { (phased[row + h] > 0) as i8 };
         }
         let ref_row: Option<&[u64]> = ref_bm.map(|rb| rb.row(m));
         let allele = |t_al: &[i8], hp: usize| -> i32 {
             if hp < n_targ { t_al[hp] as i32 }
             else { ref_row.map_or(0, |r| ((r[(hp - n_targ) >> 6] >> ((hp - n_targ) & 63)) & 1) as i32) }
         };
-        // Vote at this marker's no-calls, using the suffix-sorted prefix.
+        // Vote at this marker's no-calls, using the suffix-sorted prefix. With
+        // `imputed_kept`, a haploid genotype (both alleles HAPLOID_MISSING) is voted
+        // once over both haplotypes' neighbours and takes that allele on both.
         if has_missing {
             for h in 0..n_targ {
-                if !nocall(row + h) { continue; }
+                if !miss[h] { continue; }
+                if imputed_kept && h % 2 == 0 && h + 1 < n_targ && miss[h + 1]
+                    && target_geno[row + h] == genotype_graph::HAPLOID_MISSING
+                {
+                    let (a0, b0) = vote_tally(&a, &t_al, &allele, tpos[h] as i32, n_haps, k);
+                    let (a1, b1) = vote_tally(&a, &t_al, &allele, tpos[h + 1] as i32, n_haps, k);
+                    let bit = if b0 + b1 > a0 + a1 { 1u8 } else { 0u8 };
+                    phased[row + h] = bit;
+                    phased[row + h + 1] = bit;
+                    t_al[h] = bit as i8;
+                    t_al[h + 1] = bit as i8;
+                    miss[h + 1] = false;
+                    continue;
+                }
                 let p = tpos[h] as i32;
                 let (mut n0, mut n1) = (0i32, 0i32);
                 let mut off = 1i32;
@@ -488,6 +529,25 @@ fn fill_missing_local_vote(
         }
         have_prev = true;
     }
+}
+
+/// Allele tally `(n0, n1)` of the `k` nearest PBWT neighbours of prefix position
+/// `p` (alternating sides, missing neighbours skipped), as the no-call vote counts.
+fn vote_tally(a: &[i32], t_al: &[i8], allele: &impl Fn(&[i8], usize) -> i32,
+              p: i32, n_haps: usize, k: usize) -> (i32, i32) {
+    let (mut n0, mut n1) = (0i32, 0i32);
+    let mut off = 1i32;
+    let nh = n_haps as i32;
+    while (n0 + n1) < k as i32 && off < nh {
+        for q in [p - off, p + off] {
+            if q >= 0 && q < nh {
+                let v = allele(t_al, a[q as usize] as usize);
+                if v == 0 { n0 += 1; } else if v > 0 { n1 += 1; }
+            }
+        }
+        off += 1;
+    }
+    (n0, n1)
 }
 
 /// Verbatim pre-optimisation no-call fill (per-marker allele array over every
@@ -612,9 +672,44 @@ mod tests {
         let mut old = phased.clone();
         fill_missing_local_vote_legacy(&mut old, n_var, n_targ, rb, n_ref, &nocall_mask, k);
         let mut new = phased.clone();
-        fill_missing_local_vote(&mut new, n_var, n_targ, rb, n_ref, &target_geno, k);
+        fill_missing_local_vote(&mut new, n_var, n_targ, rb, n_ref, &target_geno, false, k);
         assert_eq!(old, new, "fill differs (seed {seed}, var {n_var}, targ {n_targ}, ref {n_ref}, with_ref {with_ref}, rate {nocall_rate}, k {k})");
         n_nocall
+    }
+
+    /// With `imputed_kept`: a no-call the scaffold already holds an allele for
+    /// keeps it, the rest are voted, and a haploid genotype gets one allele on
+    /// both haplotypes.
+    #[test]
+    fn fill_keeps_imputed_alleles_and_votes_haploids_jointly() {
+        use genotype_graph::HAPLOID_MISSING;
+        let mut rng = TestRng::new(5);
+        let (n_var, n_targ, n_ref) = (200usize, 8usize, 60usize);
+        let panel = mosaic_panel(&mut rng, n_var, n_targ + n_ref);
+        let mut phased = vec![0u8; n_var * n_targ];
+        let mut target_geno = vec![0u8; n_var * n_targ];
+        for v in 0..n_var {
+            for h in 0..n_targ {
+                target_geno[v * n_targ + h] = panel[h * n_var + v];
+                phased[v * n_targ + h] = panel[h * n_var + v];
+            }
+            if v % 7 == 0 { // sample 0: missing, imputed by the phasing (kept)
+                target_geno[v * n_targ] = 128; target_geno[v * n_targ + 1] = 128;
+                phased[v * n_targ] = 1; phased[v * n_targ + 1] = 0;
+            }
+            if v % 5 == 0 { // sample 1: haploid missing, not imputed
+                for h in [2, 3] { target_geno[v * n_targ + h] = HAPLOID_MISSING; phased[v * n_targ + h] = HAPLOID_MISSING; }
+            }
+        }
+        let ref_panel: Vec<u8> = (0..n_ref).flat_map(|r| panel[(n_targ + r) * n_var..(n_targ + r + 1) * n_var].to_vec()).collect();
+        let rb = panel_bm(&ref_panel, n_var, n_ref);
+        fill_missing_local_vote(&mut phased, n_var, n_targ, Some(&rb), n_ref, &target_geno, true, 9);
+        for v in 0..n_var {
+            if v % 7 == 0 { assert_eq!((phased[v * n_targ], phased[v * n_targ + 1]), (1, 0), "kept, var {v}"); }
+            if v % 5 == 0 {
+                assert!(phased[v * n_targ + 2] <= 1 && phased[v * n_targ + 2] == phased[v * n_targ + 3], "haploid, var {v}");
+            }
+        }
     }
 
     #[test]

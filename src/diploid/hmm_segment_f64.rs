@@ -100,8 +100,30 @@ pub struct SegmentHmmF64 {
     alpha_locus: Vec<usize>,
     /// Segment's last locus; see the f32 twin.
     alpha_locus_seg_end: Vec<usize>,
+    /// Per segment of the window: index of its first ambiguous site.
+    seg_amb0: Vec<usize>,
+    /// Forward states at missing loci of one segment; see the f32 twin.
+    mis_alpha: Vec<f64>,
+    mis_alpha_sum: Vec<[f64; HAP_NUMBER]>,
+    spare_prob: Vec<f64>,
+    spare_sum_k: Vec<f64>,
     h_probs: [f64; HAP_NUMBER * HAP_NUMBER],
     sum_h_probs: f64,
+}
+
+/// Read-only inputs of one window's f64 forward; see the f32 twin's `FwdIn`.
+struct FwdIn64<'a> {
+    graph: &'a GenotypeGraph,
+    trans: &'a [f32],
+    rare_allele: &'a [i8],
+    hmm_params: &'a super::params::HmmParams,
+    dispatch_first: bool,
+}
+
+/// Where the f64 forward stands; see the f32 twin's `FwdCursor`.
+struct Cursor64 {
+    prev_abs: usize,
+    abs_ambiguous: usize,
 }
 
 impl SegmentHmmF64 {
@@ -117,8 +139,34 @@ impl SegmentHmmF64 {
             alpha_sum_sum_store: Vec::new(),
             alpha_locus: Vec::new(),
             alpha_locus_seg_end: Vec::new(),
+            seg_amb0: Vec::new(),
+            mis_alpha: Vec::new(),
+            mis_alpha_sum: Vec::new(),
+            spare_prob: Vec::new(),
+            spare_sum_k: Vec::new(),
             h_probs: [0.0; HAP_NUMBER * HAP_NUMBER],
             sum_h_probs: 0.0,
+        }
+    }
+
+    /// SHAPEIT5's IMPUTE at a missing locus in replay slot `m`; see the f32 twin.
+    fn impute_missing(&self, m: usize, cond_alleles: &[bool], out: &mut [f32]) {
+        let n = self.n_cond * HAP_NUMBER;
+        let alpha = &self.mis_alpha[m * n..(m + 1) * n];
+        let asum = &self.mis_alpha_sum[m];
+        let mut inv = [0.0f64; HAP_NUMBER];
+        for h in 0..HAP_NUMBER { inv[h] = 1.0 / asum[h]; }
+        let mut acc = [[0.0f64; HAP_NUMBER]; 2];
+        for k in 0..self.n_cond {
+            let ah = cond_alleles[k] as usize;
+            let base = k * HAP_NUMBER;
+            for h in 0..HAP_NUMBER {
+                acc[ah][h] += (alpha[base + h] * inv[h]) * self.prob[base + h];
+            }
+        }
+        for h in 0..HAP_NUMBER {
+            let tot = acc[0][h] + acc[1][h];
+            out[h] = if tot > 0.0 && tot.is_finite() { (acc[1][h] / tot) as f32 } else { f32::NAN };
         }
     }
 
@@ -424,6 +472,12 @@ impl SegmentHmmF64 {
         self.alpha_sum_sum_store = vec![0.0; n_segs];
         self.alpha_locus = vec![0; n_segs];
         self.alpha_locus_seg_end = vec![0; n_segs];
+        self.seg_amb0.clear();
+        // Window head state: zeros (what a replay of the first segment starts from).
+        self.prob.fill(0.0);
+        self.prob_sum_k.fill(0.0);
+        self.prob_sum_h = [0.0; HAP_NUMBER];
+        self.prob_sum_t = 0.0;
 
         let mut abs_locus = graph.segment_start(seg_first);
         let mut abs_ambiguous = 0usize;
@@ -436,79 +490,141 @@ impl SegmentHmmF64 {
             }
         }
 
-        let mut prev_abs = abs_locus;
         let mut ca = vec![false; n_cond];
-        let dispatch_first = rare_dispatch_position_first();
+        let f = FwdIn64 { graph, trans, rare_allele, hmm_params, dispatch_first: rare_dispatch_position_first() };
+        let mut cur = Cursor64 { prev_abs: abs_locus, abs_ambiguous };
         let dispatch_diag = rare_dispatch_diag();
         for seg in seg_first..=seg_last {
+            self.seg_amb0.push(cur.abs_ambiguous);
             for vrel in 0..graph.lengths[seg] as usize {
                 let vi = abs_locus;
-                let byte = graph.variants[vi/2]; let e = vi%2;
-                let first_seg = seg == seg_first;
-                let first_in = vrel == 0;
                 for (k, &h) in cond_haps.iter().enumerate() { ca[k] = haplotypes(vi, h); }
-
-                if var_is_hom(e, byte) {
-                    let ta = var_get_hap0(e, byte);
-                    let rare = if vi < rare_allele.len() { rare_allele[vi] } else { -1 };
-                    if dispatch_first {
-                        // Position-first order (see hmm_segment.rs forward_impl_direct).
-                        if first_seg && first_in {
-                            self.init_hom(ta, &ca); prev_abs = vi;
-                        } else if first_in {
-                            let (nt, yt) = self.transition_params_f64(vi, prev_abs, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
-                            self.collapse_hom(ta, &ca, nt, yt); prev_abs = vi;
-                        } else if !(rare >= 0 && (ta as i8) != rare) {
-                            let (nt, yt) = self.transition_params_f64(vi, prev_abs, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
-                            self.run_hom(ta, &ca, nt, yt); prev_abs = vi;
-                        }
-                    } else if rare >= 0 && (ta as i8) != rare {
-                        // skip (on a head locus this shadows INIT/COLLAPSE)
-                        if dispatch_diag && first_in {
-                            let c = if first_seg { &DIAG_SKIP_WINDOW_HEAD } else { &DIAG_SKIP_SEG_HEAD };
-                            c.fetch_add(1, Ordering::Relaxed);
-                        }
-                    } else if first_seg && first_in {
-                        self.init_hom(ta, &ca); prev_abs = vi;
-                    } else if first_in {
-                        let (nt, yt) = self.transition_params_f64(vi, prev_abs, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
-                        self.collapse_hom(ta, &ca, nt, yt); prev_abs = vi;
-                    } else {
-                        let (nt, yt) = self.transition_params_f64(vi, prev_abs, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
-                        self.run_hom(ta, &ca, nt, yt); prev_abs = vi;
-                    }
-                } else if var_is_het(e, byte) || var_is_sca(e, byte) {
-                    let ac = graph.ambiguous[abs_ambiguous];
-                    if first_seg && first_in { self.init_amb(ac, &ca); }
-                    else if first_in {
-                        let (nt, yt) = self.transition_params_f64(vi, prev_abs, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
-                        self.sum_k(); self.collapse_amb(ac, &ca, nt, yt);
-                    } else {
-                        let (nt, yt) = self.transition_params_f64(vi, prev_abs, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
-                        self.run_amb(ac, &ca, nt, yt);
-                    }
-                    abs_ambiguous += 1; prev_abs = vi;
-                } else if var_is_mis(e, byte) {
-                    if first_seg && first_in { self.init_mis(); }
-                    else if first_in {
-                        let (nt, yt) = self.transition_params_f64(vi, prev_abs, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
-                        self.sum_k(); self.collapse_mis(nt, yt);
-                    } else {
-                        let (nt, yt) = self.transition_params_f64(vi, prev_abs, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
-                        self.run_mis(nt, yt);
-                    }
-                    prev_abs = vi;
-                }
+                self.forward_locus(&f, &ca, vi, seg == seg_first, vrel == 0, &mut cur, dispatch_diag);
                 abs_locus += 1;
             }
             self.sum_k();
             // Same as the f32 twin: label the Alpha with the locus that last updated
             // the state, not the segment's last locus. See hmm_segment.rs.
-            self.save_alpha(seg - seg_first, prev_abs, abs_locus - 1);
+            self.save_alpha(seg - seg_first, cur.prev_abs, abs_locus - 1);
             if alpha_diag::diag() {
-                alpha_diag::record_label(prev_abs, abs_locus - 1, &hmm_params.cm_f32);
+                alpha_diag::record_label(cur.prev_abs, abs_locus - 1, &hmm_params.cm_f32);
             }
         }
+    }
+
+    /// One locus of the forward; shared with `replay_missing` (see the f32 twin).
+    #[allow(clippy::too_many_arguments)]
+    fn forward_locus(&mut self, f: &FwdIn64<'_>, ca: &[bool], vi: usize, first_seg: bool, first_in: bool,
+                     cur: &mut Cursor64, diag: bool) {
+        let graph = f.graph;
+        let hmm_params = f.hmm_params;
+        let trans = f.trans;
+        let byte = graph.variants[vi/2]; let e = vi%2;
+        let prev_abs = &mut cur.prev_abs;
+        if var_is_hom(e, byte) {
+            let ta = var_get_hap0(e, byte);
+            let rare = if vi < f.rare_allele.len() { f.rare_allele[vi] } else { -1 };
+            if f.dispatch_first {
+                // Position-first order (see hmm_segment.rs forward_impl_direct).
+                if first_seg && first_in {
+                    self.init_hom(ta, ca); *prev_abs = vi;
+                } else if first_in {
+                    let (nt, yt) = self.transition_params_f64(vi, *prev_abs, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+                    self.collapse_hom(ta, ca, nt, yt); *prev_abs = vi;
+                } else if !(rare >= 0 && (ta as i8) != rare) {
+                    let (nt, yt) = self.transition_params_f64(vi, *prev_abs, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+                    self.run_hom(ta, ca, nt, yt); *prev_abs = vi;
+                }
+            } else if rare >= 0 && (ta as i8) != rare {
+                // skip (on a head locus this shadows INIT/COLLAPSE)
+                if diag && first_in {
+                    let c = if first_seg { &DIAG_SKIP_WINDOW_HEAD } else { &DIAG_SKIP_SEG_HEAD };
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+            } else if first_seg && first_in {
+                self.init_hom(ta, ca); *prev_abs = vi;
+            } else if first_in {
+                let (nt, yt) = self.transition_params_f64(vi, *prev_abs, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+                self.collapse_hom(ta, ca, nt, yt); *prev_abs = vi;
+            } else {
+                let (nt, yt) = self.transition_params_f64(vi, *prev_abs, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+                self.run_hom(ta, ca, nt, yt); *prev_abs = vi;
+            }
+        } else if var_is_het(e, byte) || var_is_sca(e, byte) {
+            let ac = graph.ambiguous[cur.abs_ambiguous];
+            if first_seg && first_in { self.init_amb(ac, ca); }
+            else if first_in {
+                let (nt, yt) = self.transition_params_f64(vi, *prev_abs, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+                self.sum_k(); self.collapse_amb(ac, ca, nt, yt);
+            } else {
+                let (nt, yt) = self.transition_params_f64(vi, *prev_abs, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+                self.run_amb(ac, ca, nt, yt);
+            }
+            cur.abs_ambiguous += 1; cur.prev_abs = vi;
+        } else if var_is_mis(e, byte) {
+            if first_seg && first_in { self.init_mis(); }
+            else if first_in {
+                let (nt, yt) = self.transition_params_f64(vi, *prev_abs, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+                self.sum_k(); self.collapse_mis(nt, yt);
+            } else {
+                let (nt, yt) = self.transition_params_f64(vi, *prev_abs, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+                self.run_mis(nt, yt);
+            }
+            *prev_abs = vi;
+        }
+    }
+
+    /// The forward states at missing loci `lo..=hi` (ordinals from the start) of
+    /// segment `seg`, replayed up to locus `upto`; see the f32 twin. The f64
+    /// forward starts from a fresh state vector (zeros), which is where a replay
+    /// of the window's first segment starts too.
+    #[allow(clippy::too_many_arguments)]
+    fn replay_missing<F>(&mut self, f: &FwdIn64<'_>, cond_haps: &[usize], haplotypes: &F,
+                         seg_first: usize, seg: usize, upto: usize, lo: usize, hi: usize)
+    where F: Fn(usize, usize) -> bool {
+        let graph = f.graph;
+        let n = self.n_cond * HAP_NUMBER;
+        std::mem::swap(&mut self.prob, &mut self.spare_prob);
+        std::mem::swap(&mut self.prob_sum_k, &mut self.spare_sum_k);
+        let (bwd_sum_h, bwd_sum_t) = (self.prob_sum_h, self.prob_sum_t);
+        self.prob.resize(n, 0.0);
+        self.prob_sum_k.resize(self.n_cond, 0.0);
+        let rel = seg - seg_first;
+        let start = graph.segment_start(seg);
+        let mut cur = if rel == 0 {
+            self.prob.fill(0.0);
+            self.prob_sum_k.fill(0.0);
+            self.prob_sum_h = [0.0; HAP_NUMBER];
+            self.prob_sum_t = 0.0;
+            Cursor64 { prev_abs: start, abs_ambiguous: self.seg_amb0[0] }
+        } else {
+            self.prob.copy_from_slice(&self.alpha_store[rel - 1]);
+            self.prob_sum_h = self.alpha_sum_store[rel - 1];
+            self.prob_sum_t = self.alpha_sum_sum_store[rel - 1];
+            self.sum_k();
+            Cursor64 { prev_abs: self.alpha_locus[rel - 1], abs_ambiguous: self.seg_amb0[rel] }
+        };
+        let n_keep = hi + 1 - lo;
+        super::hmm_segment::grow_exact(&mut self.mis_alpha, n_keep * n, 0.0);
+        super::hmm_segment::grow_exact(&mut self.mis_alpha_sum, n_keep, [0.0; HAP_NUMBER]);
+        let mut ca = vec![false; self.n_cond];
+        let mut ord = 0usize;
+        for vi in start..=upto {
+            for (k, &h) in cond_haps.iter().enumerate() { ca[k] = haplotypes(vi, h); }
+            self.forward_locus(f, &ca, vi, rel == 0, vi == start, &mut cur, false);
+            if var_is_mis(vi % 2, graph.variants[vi / 2]) {
+                if ord >= lo && ord <= hi {
+                    let slot = ord - lo;
+                    self.mis_alpha[slot * n..(slot + 1) * n].copy_from_slice(&self.prob[..n]);
+                    self.mis_alpha_sum[slot] = self.prob_sum_h;
+                }
+                ord += 1;
+            }
+        }
+        std::mem::swap(&mut self.prob, &mut self.spare_prob);
+        std::mem::swap(&mut self.prob_sum_k, &mut self.spare_sum_k);
+        self.prob_sum_h = bwd_sum_h;
+        self.prob_sum_t = bwd_sum_t;
     }
 
     // -- BACKWARD --
@@ -529,9 +645,12 @@ impl SegmentHmmF64 {
         let n_trans = dc0 + n_boundary;
 
         let mut transition_probs = vec![1.0f64; n_trans.max(1)];
-        let missing_probs = vec![0.0f32; graph.n_missing * HAP_NUMBER];
 
         let locus_last = graph.segment_start(seg_last) + graph.lengths[seg_last] as usize - 1;
+        let mut mis_w = graph.missing_in(graph.segment_start(seg_first), locus_last);
+        let mut missing_probs = vec![f32::NAN; mis_w * HAP_NUMBER];
+        let f = FwdIn64 { graph, trans, rare_allele, hmm_params, dispatch_first: rare_dispatch_position_first() };
+        let (mut seg_mis_next, mut replay_lo) = (0usize, 0usize);
         let _abs_locus = locus_last;
         let mut abs_ambiguous = 0usize;
         for s in 0..=seg_last {
@@ -558,8 +677,12 @@ impl SegmentHmmF64 {
             let byte = graph.variants[vi/2]; let e = vi%2;
             let is_hom = var_is_hom(e, byte);
             let is_amb = var_is_het(e, byte) || var_is_sca(e, byte);
-            let _is_mis = var_is_mis(e, byte);
+            let is_mis = var_is_mis(e, byte);
             let is_first_in_seg = curr_seg_locus == graph.lengths[curr_seg] as usize - 1;
+            if mis_w > 0 && is_first_in_seg {
+                seg_mis_next = graph.missing_in(graph.segment_start(curr_seg), vi);
+                replay_lo = seg_mis_next;
+            }
 
             for (k, &h) in cond_haps.iter().enumerate() { ca[k] = haplotypes(vi, h); }
 
@@ -601,6 +724,17 @@ impl SegmentHmmF64 {
                 } else if is_hom { self.run_hom(var_get_hap0(e, byte), &ca, nt, yt); }
                 else if is_amb { self.run_amb(graph.ambiguous[abs_ambiguous], &ca, nt, yt); }
                 else { self.run_mis(nt, yt); }
+            }
+            if is_mis {
+                mis_w -= 1;
+                seg_mis_next -= 1;
+                let j = seg_mis_next;
+                if j < replay_lo {
+                    replay_lo = j + 1 - (j + 1).min(super::hmm_segment::replay_slots(n_cond * HAP_NUMBER, 8));
+                    self.replay_missing(&f, cond_haps, haplotypes, seg_first, curr_seg, vi, replay_lo, j);
+                }
+                self.impute_missing(j - replay_lo, &ca,
+                    &mut missing_probs[mis_w * HAP_NUMBER..(mis_w + 1) * HAP_NUMBER]);
             }
 
             let is_within_seg = !is_first_in_seg;

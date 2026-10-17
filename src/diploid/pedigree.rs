@@ -314,6 +314,30 @@ pub fn build_flat_genotypes(
     flat
 }
 
+/// Marks every missing genotype (> 1) of a haploid sample outside the PARs with
+/// [`HAPLOID_MISSING`](super::genotype_graph::HAPLOID_MISSING), so the diploid
+/// engine imputes one allele for both of his haplotypes there (SHAPEIT5's
+/// haploid branch). `alleles` is `n_var × n_haps`; returns the genotypes marked.
+pub fn mark_haploid_missing(
+    alleles: &mut [u8], n_var: usize, n_haps: usize,
+    haploid_samples: &HashSet<usize>, par_site: Option<&[bool]>,
+) -> usize {
+    use super::genotype_graph::HAPLOID_MISSING;
+    let mut n = 0usize;
+    for &si in haploid_samples {
+        for v in 0..n_var {
+            if par_site.is_some_and(|p| p.get(v).copied().unwrap_or(false)) { continue; }
+            let i = v * n_haps + si * 2;
+            if alleles[i] > 1 || alleles[i + 1] > 1 {
+                alleles[i] = HAPLOID_MISSING;
+                alleles[i + 1] = HAPLOID_MISSING;
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 /// Reset heterozygous calls to missing in haploid samples.
 /// Identical to SHAPEIT5's mapHaploidsAndResetHets().
 /// For haploid individuals (e.g., chrX males), het calls are biologically impossible
@@ -365,6 +389,21 @@ pub fn reset_haploid_hets(
 #[cfg(test)]
 mod par_tests {
     use super::*;
+
+    #[test]
+    fn haploid_missing_is_marked_outside_par_only() {
+        use crate::diploid::genotype_graph::HAPLOID_MISSING;
+        // 4 sites x 2 samples; sample 1 haploid; site 0 PAR.
+        let mut al = vec![0u8, 1, 128, 128,   0, 0, 128, 0,   128, 128, 1, 1,   0, 0, 3, 3];
+        let par = [true, false, false, false];
+        let hap: HashSet<usize> = [1usize].into_iter().collect();
+        let n = mark_haploid_missing(&mut al, 4, 4, &hap, Some(&par));
+        assert_eq!(n, 2);
+        assert_eq!(&al[2..4], &[128, 128]); // PAR: untouched
+        assert_eq!(&al[6..8], &[HAPLOID_MISSING, HAPLOID_MISSING]); // half-missing -> both
+        assert_eq!(&al[8..10], &[128, 128]); // sample 0 not haploid
+        assert_eq!(&al[14..16], &[HAPLOID_MISSING, HAPLOID_MISSING]);
+    }
 
     #[test]
     fn reset_preserves_par_hets() {

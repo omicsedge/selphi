@@ -407,6 +407,73 @@ fn trans_hap_accumulate_legacy(
     h_probs
 }
 
+/// Bytes of forward states at missing loci one segment HMM may keep: the
+/// forward keeps all of a window's when they fit (SHAPEIT5 keeps them whatever
+/// the size — on dense input as much memory again as the per-segment store);
+/// otherwise each replay keeps as many as fit (`replay_slots`), and a segment
+/// with more missing loci is replayed again for each further batch.
+const MIS_REPLAY_BYTES: usize = 8 << 20;
+
+/// Upper bound on the bytes a segment HMM holds for the IMPUTE of a window with
+/// `n_mis` missing loci and `k` conditioning haplotypes: the window-wide store
+/// when it fits in [`MIS_REPLAY_BYTES`], otherwise one replay's states plus the
+/// backward state set aside during a replay.
+pub(crate) fn missing_store_bound(n_mis: usize, k: usize) -> usize {
+    if n_mis == 0 { return 0; }
+    // Any conditioning-set size up to `k`: the window store is taken only when it
+    // fits in MIS_REPLAY_BYTES, and a replay keeps at most as many states as fit
+    // there (at least 16, or the debug cap) — never more than the window has.
+    let per = k * HAP_NUMBER * 4 + HAP_NUMBER * 4;
+    let cap = replay_cap_knob();
+    let replay = if cap > 0 { cap * per } else { (16 * per).max(MIS_REPLAY_BYTES) };
+    (n_mis * per).min(replay.max(MIS_REPLAY_BYTES)) + (k * HAP_NUMBER + k) * 4
+}
+
+/// `SELPHI_DIPLOID_MIS_REPLAY_CAP` (0 = unset), read once.
+fn replay_cap_knob() -> usize {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| crate::config::usize_or("SELPHI_DIPLOID_MIS_REPLAY_CAP", 0))
+}
+
+/// Grows `v` to `len` with an exact allocation (no amortised doubling), so the
+/// buffers kept for missing loci stay within [`missing_store_bound`].
+pub(super) fn grow_exact<T: Clone>(v: &mut Vec<T>, len: usize, fill: T) {
+    if v.len() < len {
+        v.reserve_exact(len - v.len());
+        v.resize(len, fill);
+    }
+}
+
+/// Missing loci whose forward states one replay keeps: as many states
+/// (`n_states` floats plus the `HAP_NUMBER` per-config sums) as fit in
+/// [`MIS_REPLAY_BYTES`], at least 16.
+pub(super) fn replay_slots(n_states: usize, bytes_per_float: usize) -> usize {
+    let cap = replay_cap_knob();
+    if cap > 0 { return cap; }
+    (MIS_REPLAY_BYTES / ((n_states + HAP_NUMBER) * bytes_per_float)).max(16)
+}
+
+/// Read-only inputs of one window's forward pass, shared by the pass and its
+/// per-segment replays.
+struct FwdIn<'a> {
+    graph: &'a GenotypeGraph,
+    bm_ptr: *const u64,
+    k_words: usize,
+    locus_offset: usize,
+    trans: &'a [f32],
+    rare_allele: &'a [i8],
+    hmm_params: &'a super::params::HmmParams,
+    dispatch_first: bool,
+}
+
+/// Where the forward stands: the locus that last updated the state and the
+/// index of the next ambiguous site.
+struct FwdCursor {
+    prev_abs_locus: usize,
+    abs_ambiguous: usize,
+}
+
 /// Segment HMM state for one sample in one window.
 pub struct SegmentHmm {
     /// prob[k * HAP_NUMBER + h]: P(cond hap k, internal hap h)
@@ -434,6 +501,26 @@ pub struct SegmentHmm {
     /// `compute_trans_hap` can serve the A/B knob and the diagnostic without a
     /// rebuild — see `alpha_diag`.
     alpha_locus_seg_end: Vec<usize>,
+    /// Per segment of the window: index of its first ambiguous site.
+    seg_amb0: Vec<usize>,
+    /// Forward states at missing loci (SHAPEIT5's AlphaMissing),
+    /// `n_cond * HAP_NUMBER` each, and their per-config sums: every missing
+    /// locus of the window when they fit in [`MIS_REPLAY_BYTES`] (`mis_stored`,
+    /// kept by the forward), otherwise those of one segment at a time,
+    /// recomputed by `replay_missing`.
+    mis_alpha: Vec<f32>,
+    mis_alpha_sum: Vec<[f32; HAP_NUMBER]>,
+    mis_stored: bool,
+    /// Tests: replay even when the window's states would fit.
+    #[cfg(test)]
+    force_replay: bool,
+    /// The backward's state while a replay runs.
+    spare_prob: AlignedF32,
+    spare_sum_k: Vec<f32>,
+    #[cfg(test)]
+    fwd_trace: Vec<(usize, Vec<u32>)>,
+    #[cfg(test)]
+    replay_trace: Vec<(usize, Vec<u32>)>,
 
     // Transition buffers
     h_probs: [f32; HAP_NUMBER * HAP_NUMBER],
@@ -456,6 +543,18 @@ impl SegmentHmm {
             alpha_sum_sum_store: Vec::new(),
             alpha_locus: Vec::new(),
             alpha_locus_seg_end: Vec::new(),
+            seg_amb0: Vec::new(),
+            mis_alpha: Vec::new(),
+            mis_alpha_sum: Vec::new(),
+            mis_stored: false,
+            #[cfg(test)]
+            force_replay: false,
+            spare_prob: AlignedF32::new(0),
+            spare_sum_k: Vec::new(),
+            #[cfg(test)]
+            fwd_trace: Vec::new(),
+            #[cfg(test)]
+            replay_trace: Vec::new(),
             h_probs: [0.0; HAP_NUMBER * HAP_NUMBER],
             sum_h_probs: 0.0,
         }
@@ -469,6 +568,33 @@ impl SegmentHmm {
         { self.path }
         #[cfg(not(test))]
         { seg_path() }
+    }
+
+    /// SHAPEIT5's IMPUTE at a missing locus whose forward state is in replay
+    /// slot `m`, called in the backward right after the locus's update: the posterior over (k, h) is the
+    /// stored forward state times the backward one, and `out[h]` is the share of
+    /// it on conditioning haplotypes carrying the ALT allele (`bm_row`), i.e.
+    /// P(ALT | internal haplotype h). NaN when the posterior has no finite mass,
+    /// which the sampler reads as "keep the current allele". Plain scalar
+    /// arithmetic (no fused operations), so every platform rounds alike.
+    fn impute_missing(&self, m: usize, bm_row: *const u64, out: &mut [f32]) {
+        let n = self.n_cond * HAP_NUMBER;
+        let alpha = &self.mis_alpha[m * n..(m + 1) * n];
+        let asum = &self.mis_alpha_sum[m];
+        let mut inv = [0.0f32; HAP_NUMBER];
+        for h in 0..HAP_NUMBER { inv[h] = divss(1.0, asum[h]); }
+        let mut acc = [[0.0f32; HAP_NUMBER]; 2];
+        for k in 0..self.n_cond {
+            let ah = unsafe { Self::bm_bit(bm_row, k) } as usize;
+            let base = k * HAP_NUMBER;
+            for h in 0..HAP_NUMBER {
+                acc[ah][h] += (alpha[base + h] * inv[h]) * self.prob[base + h];
+            }
+        }
+        for h in 0..HAP_NUMBER {
+            let tot = acc[0][h] + acc[1][h];
+            out[h] = if tot > 0.0 && tot.is_finite() { divss(acc[1][h], tot) } else { f32::NAN };
+        }
     }
 
     /// Resize for a new conditioning set size, reusing existing allocation when possible.
@@ -1368,6 +1494,25 @@ impl SegmentHmm {
         self.alpha_locus.resize(n_window_segs, 0usize);
         self.alpha_locus_seg_end.clear();
         self.alpha_locus_seg_end.resize(n_window_segs, 0usize);
+        self.seg_amb0.clear();
+        // The window head's state (what a skipped head locus leaves standing, and
+        // what `replay_missing` restarts the first segment from) is all zeros.
+        self.prob.fill(0.0);
+        self.prob_sum_k.fill(0.0);
+        self.prob_sum_h = [0.0; HAP_NUMBER];
+        self.prob_sum_t = 0.0;
+        #[cfg(test)]
+        self.fwd_trace.clear();
+        let n_mis_w = graph.missing_in(graph.segment_start(seg_first),
+            graph.segment_start(seg_last) + graph.lengths[seg_last] as usize - 1);
+        self.mis_stored = n_mis_w > 0 && n_mis_w * (prob_size * 4 + HAP_NUMBER * 4) <= MIS_REPLAY_BYTES;
+        #[cfg(test)]
+        { self.mis_stored &= !self.force_replay; }
+        if self.mis_stored {
+            grow_exact(&mut self.mis_alpha, n_mis_w * prob_size, 0.0);
+            grow_exact(&mut self.mis_alpha_sum, n_mis_w, [0.0; HAP_NUMBER]);
+        }
+        let mut mis_ord = 0usize;
 
         let mut abs_locus = graph.segment_start(seg_first);
         let mut abs_ambiguous = 0usize;
@@ -1381,91 +1526,28 @@ impl SegmentHmm {
             }
         }
 
-        let mut prev_abs_locus = abs_locus;
-        let bm_ptr = cond_bm.as_ptr();
-        let dispatch_first = rare_dispatch_position_first();
+        let f = FwdIn {
+            graph, bm_ptr: cond_bm.as_ptr(), k_words, locus_offset, trans, rare_allele, hmm_params,
+            dispatch_first: rare_dispatch_position_first(),
+        };
+        let mut cur = FwdCursor { prev_abs_locus: abs_locus, abs_ambiguous };
         let dispatch_diag = rare_dispatch_diag();
 
         for seg in seg_first..=seg_last {
             let seg_len = graph.lengths[seg] as usize;
-            let is_first_seg = seg == seg_first;
-
+            self.seg_amb0.push(cur.abs_ambiguous);
             for vrel in 0..seg_len {
-                let vi = abs_locus;
-                let byte = graph.variants[vi / 2];
-                let e = vi % 2;
-                let is_first_in_seg = vrel == 0;
-
-                // Pointer to this variant's compact bitmatrix row (window-relative indexing)
-                let bm_row = unsafe { bm_ptr.add((vi - locus_offset) * k_words) };
-
-                if var_is_hom(e, byte) {
-                    let target_allele = var_get_hap0(e, byte);
-                    let rare = if vi < rare_allele.len() { rare_allele[vi] } else { -1 };
-                    let skip_rare = rare >= 0 && (target_allele as i8) != rare;
-                    if dispatch_first {
-                        // Position-first order (SHAPEIT5 forward(), and the backward
-                        // below): INIT/COLLAPSE unconditional, skip only in the RUN
-                        // position, where prev_abs_locus stays stale like backward's.
-                        if is_first_seg && is_first_in_seg {
-                            self.init_hom_bm(target_allele, bm_row);
-                            prev_abs_locus = vi;
-                        } else if is_first_in_seg {
-                            let (nt, yt) = self.transition_params_full(vi, prev_abs_locus, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
-                            self.collapse_hom_bm(target_allele, bm_row, nt, yt);
-                            prev_abs_locus = vi;
-                        } else if !skip_rare {
-                            let (nt, yt) = self.transition_params_full(vi, prev_abs_locus, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
-                            self.run_hom_bm(target_allele, bm_row, nt, yt);
-                            prev_abs_locus = vi;
-                        }
-                    } else if skip_rare {
-                        // Skip-first: a skip on a head locus shadows INIT/COLLAPSE
-                        // (at a window head the state vector stays zeroed).
-                        if dispatch_diag && is_first_in_seg {
-                            let c = if is_first_seg { &DIAG_SKIP_WINDOW_HEAD } else { &DIAG_SKIP_SEG_HEAD };
-                            c.fetch_add(1, Ordering::Relaxed);
-                        }
-                    } else if is_first_seg && is_first_in_seg {
-                        self.init_hom_bm(target_allele, bm_row);
-                        prev_abs_locus = vi;
-                    } else if is_first_in_seg {
-                        let (nt, yt) = self.transition_params_full(vi, prev_abs_locus, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
-                        self.collapse_hom_bm(target_allele, bm_row, nt, yt);
-                        prev_abs_locus = vi;
-                    } else {
-                        let (nt, yt) = self.transition_params_full(vi, prev_abs_locus, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
-                        self.run_hom_bm(target_allele, bm_row, nt, yt);
-                        prev_abs_locus = vi;
+                self.forward_locus(&f, abs_locus, seg == seg_first, vrel == 0, &mut cur, dispatch_diag);
+                if n_mis_w > 0 && var_is_mis(abs_locus % 2, graph.variants[abs_locus / 2]) {
+                    #[cfg(test)]
+                    self.fwd_trace.push((abs_locus, self.prob[..prob_size].iter().map(|x| x.to_bits()).collect()));
+                    if self.mis_stored {
+                        self.mis_alpha[mis_ord * prob_size..(mis_ord + 1) * prob_size]
+                            .copy_from_slice(&self.prob[..prob_size]);
+                        self.mis_alpha_sum[mis_ord] = self.prob_sum_h;
                     }
-                } else if var_is_het(e, byte) || var_is_sca(e, byte) {
-                    let amb_code = graph.ambiguous[abs_ambiguous];
-                    if is_first_seg && is_first_in_seg {
-                        self.init_amb_bm(amb_code, bm_row);
-                    } else if is_first_in_seg {
-                        let (nt, yt) = self.transition_params_full(vi, prev_abs_locus, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
-                        self.sum_k();
-                        self.collapse_amb_bm(amb_code, bm_row, nt, yt);
-                    } else {
-                        let (nt, yt) = self.transition_params_full(vi, prev_abs_locus, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
-                        self.run_amb_bm(amb_code, bm_row, nt, yt);
-                    }
-                    abs_ambiguous += 1;
-                    prev_abs_locus = vi;
-                } else if var_is_mis(e, byte) {
-                    if is_first_seg && is_first_in_seg {
-                        self.init_mis();
-                    } else if is_first_in_seg {
-                        let (nt, yt) = self.transition_params_full(vi, prev_abs_locus, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
-                        self.sum_k();
-                        self.collapse_mis(nt, yt);
-                    } else {
-                        let (nt, yt) = self.transition_params_full(vi, prev_abs_locus, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
-                        self.run_mis(nt, yt);
-                    }
-                    prev_abs_locus = vi;
+                    mis_ord += 1;
                 }
-
                 abs_locus += 1;
             }
 
@@ -1483,14 +1565,155 @@ impl SegmentHmm {
             // so this is byte-identical on any run whose rare path is inert.
             // Both labels are stored: `alpha_diag` serves the A/B knob and the
             // magnitude counters off the pair without a rebuild.
-            self.save_alpha(seg - seg_first, prev_abs_locus, abs_locus - 1);
+            self.save_alpha(seg - seg_first, cur.prev_abs_locus, abs_locus - 1);
             if alpha_diag::diag() {
-                alpha_diag::record_label(prev_abs_locus, abs_locus - 1, &hmm_params.cm_f32);
+                alpha_diag::record_label(cur.prev_abs_locus, abs_locus - 1, &hmm_params.cm_f32);
             }
             if seg < seg_last {
                 self.compute_h_probs();
             }
         }
+    }
+
+    /// One locus of the forward pass: the state update its type and position
+    /// call for (INIT at the window head, COLLAPSE at a segment head, RUN
+    /// otherwise; a rare-hom skip leaves the state as it is). Shared by the
+    /// forward and its per-segment replays (`replay_missing`), so both compute
+    /// the same bits. `diag` counts shadowed skips (the forward only).
+    #[inline(always)]
+    fn forward_locus(&mut self, f: &FwdIn<'_>, vi: usize, is_first_seg: bool, is_first_in_seg: bool,
+                     cur: &mut FwdCursor, diag: bool) {
+        let graph = f.graph;
+        let hmm_params = f.hmm_params;
+        let trans = f.trans;
+        let byte = graph.variants[vi / 2];
+        let e = vi % 2;
+        // Pointer to this variant's compact bitmatrix row (window-relative indexing)
+        let bm_row = unsafe { f.bm_ptr.add((vi - f.locus_offset) * f.k_words) };
+        let prev_abs_locus = &mut cur.prev_abs_locus;
+
+        if var_is_hom(e, byte) {
+            let target_allele = var_get_hap0(e, byte);
+            let rare = if vi < f.rare_allele.len() { f.rare_allele[vi] } else { -1 };
+            let skip_rare = rare >= 0 && (target_allele as i8) != rare;
+            if f.dispatch_first {
+                // Position-first order (SHAPEIT5 forward(), and the backward
+                // below): INIT/COLLAPSE unconditional, skip only in the RUN
+                // position, where prev_abs_locus stays stale like backward's.
+                if is_first_seg && is_first_in_seg {
+                    self.init_hom_bm(target_allele, bm_row);
+                    *prev_abs_locus = vi;
+                } else if is_first_in_seg {
+                    let (nt, yt) = self.transition_params_full(vi, *prev_abs_locus, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+                    self.collapse_hom_bm(target_allele, bm_row, nt, yt);
+                    *prev_abs_locus = vi;
+                } else if !skip_rare {
+                    let (nt, yt) = self.transition_params_full(vi, *prev_abs_locus, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+                    self.run_hom_bm(target_allele, bm_row, nt, yt);
+                    *prev_abs_locus = vi;
+                }
+            } else if skip_rare {
+                // Skip-first: a skip on a head locus shadows INIT/COLLAPSE
+                // (at a window head the state vector stays zeroed).
+                if diag && is_first_in_seg {
+                    let c = if is_first_seg { &DIAG_SKIP_WINDOW_HEAD } else { &DIAG_SKIP_SEG_HEAD };
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+            } else if is_first_seg && is_first_in_seg {
+                self.init_hom_bm(target_allele, bm_row);
+                *prev_abs_locus = vi;
+            } else if is_first_in_seg {
+                let (nt, yt) = self.transition_params_full(vi, *prev_abs_locus, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+                self.collapse_hom_bm(target_allele, bm_row, nt, yt);
+                *prev_abs_locus = vi;
+            } else {
+                let (nt, yt) = self.transition_params_full(vi, *prev_abs_locus, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+                self.run_hom_bm(target_allele, bm_row, nt, yt);
+                *prev_abs_locus = vi;
+            }
+        } else if var_is_het(e, byte) || var_is_sca(e, byte) {
+            let amb_code = graph.ambiguous[cur.abs_ambiguous];
+            if is_first_seg && is_first_in_seg {
+                self.init_amb_bm(amb_code, bm_row);
+            } else if is_first_in_seg {
+                let (nt, yt) = self.transition_params_full(vi, *prev_abs_locus, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+                self.sum_k();
+                self.collapse_amb_bm(amb_code, bm_row, nt, yt);
+            } else {
+                let (nt, yt) = self.transition_params_full(vi, *prev_abs_locus, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+                self.run_amb_bm(amb_code, bm_row, nt, yt);
+            }
+            cur.abs_ambiguous += 1;
+            cur.prev_abs_locus = vi;
+        } else if var_is_mis(e, byte) {
+            if is_first_seg && is_first_in_seg {
+                self.init_mis();
+            } else if is_first_in_seg {
+                let (nt, yt) = self.transition_params_full(vi, *prev_abs_locus, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+                self.sum_k();
+                self.collapse_mis(nt, yt);
+            } else {
+                let (nt, yt) = self.transition_params_full(vi, *prev_abs_locus, trans, &hmm_params.cm_f32, hmm_params.ne, hmm_params.n_haps);
+                self.run_mis(nt, yt);
+            }
+            *prev_abs_locus = vi;
+        }
+    }
+
+    /// The forward state at missing loci of segment `seg`, for the backward's
+    /// IMPUTE: re-runs the forward over the segment from its starting state (the
+    /// stored end of the previous segment, or the zeroed window head) up to locus
+    /// `upto`, keeping the states at the segment's missing loci with ordinals
+    /// `lo..=hi` (counted from the segment's start) in `mis_alpha`. Same kernels
+    /// from the same state, hence the same bits the forward had there — SHAPEIT5
+    /// stores every missing locus's state for the whole window instead, as much
+    /// memory again as the per-segment store on dense input. The backward's own
+    /// state is set aside meanwhile and put back.
+    fn replay_missing(&mut self, f: &FwdIn<'_>, seg_first: usize, seg: usize, upto: usize,
+                      lo: usize, hi: usize) {
+        let graph = f.graph;
+        let n = self.n_cond * HAP_NUMBER;
+        std::mem::swap(&mut self.prob, &mut self.spare_prob);
+        std::mem::swap(&mut self.prob_sum_k, &mut self.spare_sum_k);
+        let (bwd_sum_h, bwd_sum_t) = (self.prob_sum_h, self.prob_sum_t);
+        self.prob.resize(n);
+        self.prob_sum_k.resize(self.n_cond, 0.0);
+        let rel = seg - seg_first;
+        let start = graph.segment_start(seg);
+        let mut cur = if rel == 0 {
+            self.prob.fill(0.0);
+            self.prob_sum_k.fill(0.0);
+            self.prob_sum_h = [0.0; HAP_NUMBER];
+            self.prob_sum_t = 0.0;
+            FwdCursor { prev_abs_locus: start, abs_ambiguous: self.seg_amb0[0] }
+        } else {
+            self.prob[..n].copy_from_slice(&self.alpha_store[rel - 1]);
+            self.prob_sum_h = self.alpha_sum_store[rel - 1];
+            self.prob_sum_t = self.alpha_sum_sum_store[rel - 1];
+            self.sum_k();
+            FwdCursor { prev_abs_locus: self.alpha_locus[rel - 1], abs_ambiguous: self.seg_amb0[rel] }
+        };
+        let n_keep = hi + 1 - lo;
+        grow_exact(&mut self.mis_alpha, n_keep * n, 0.0);
+        grow_exact(&mut self.mis_alpha_sum, n_keep, [0.0; HAP_NUMBER]);
+        let mut ord = 0usize;
+        for vi in start..=upto {
+            self.forward_locus(f, vi, rel == 0, vi == start, &mut cur, false);
+            if var_is_mis(vi % 2, graph.variants[vi / 2]) {
+                if ord >= lo && ord <= hi {
+                    let slot = ord - lo;
+                    self.mis_alpha[slot * n..(slot + 1) * n].copy_from_slice(&self.prob[..n]);
+                    self.mis_alpha_sum[slot] = self.prob_sum_h;
+                    #[cfg(test)]
+                    self.replay_trace.push((vi, self.prob[..n].iter().map(|x| x.to_bits()).collect()));
+                }
+                ord += 1;
+            }
+        }
+        std::mem::swap(&mut self.prob, &mut self.spare_prob);
+        std::mem::swap(&mut self.prob_sum_k, &mut self.spare_sum_k);
+        self.prob_sum_h = bwd_sum_h;
+        self.prob_sum_t = bwd_sum_t;
     }
 
     /// Backward pass: compute transition probabilities between segments.
@@ -1499,7 +1722,9 @@ impl SegmentHmm {
     /// computes TRANS_HAP (Alpha × Beta) and TRANS_DIP_MULT to produce the
     /// final diplotype transition probabilities.
     ///
-    /// Returns: (transition_probs, missing_probs)
+    /// Returns: (transition_probs, missing_probs), the latter `HAP_NUMBER` values
+    /// per missing locus of the WINDOW in locus order (see [`Self::impute_missing`]);
+    /// empty when the window is not run (fewer than two segments, no conditioning).
     /// Backward pass with pre-extracted conditioning alleles in compact bitmatrix.
     pub fn backward_rare_direct(
         &mut self,
@@ -1527,10 +1752,15 @@ impl SegmentHmm {
         // while a uniform one degrades to an honest coin flip. The two twins
         // disagreed (0.0 here, 1.0 there) and only one can be right.
         let mut transition_probs = vec![1.0f64; n_trans];
-        let missing_probs = vec![0.0f32; graph.n_missing * HAP_NUMBER];
-        if n_window_segs < 2 || n_cond == 0 {
+        // A one-segment window has no boundary to compute: its transition block is
+        // uniform. It still runs the backward when it holds missing loci, for their
+        // IMPUTE alone.
+        let single = n_window_segs < 2;
+        let has_mis = graph.n_missing > 0 && graph.missing_in(graph.segment_start(seg_first),
+            graph.segment_start(seg_last) + graph.lengths[seg_last] as usize - 1) > 0;
+        if n_cond == 0 || (single && !has_mis) {
             transition_probs.fill(1.0 / n_trans.max(1) as f64);
-            return (transition_probs, missing_probs);
+            return (transition_probs, Vec::new());
         }
         let _n = n_cond * HAP_NUMBER;
         self.prob.fill(0.0);
@@ -1548,6 +1778,18 @@ impl SegmentHmm {
         }
         let locus_last = graph.segment_start(seg_last) + graph.lengths[seg_last] as usize - 1;
         let locus_first = graph.segment_start(seg_first);
+        let mut mis_w = graph.missing_in(locus_first, locus_last);
+        let mut missing_probs = vec![f32::NAN; mis_w * HAP_NUMBER];
+        let f = FwdIn {
+            graph, bm_ptr: cond_bm.as_ptr(), k_words, locus_offset, trans, rare_allele, hmm_params,
+            dispatch_first: rare_dispatch_position_first(),
+        };
+        // Missing loci of the current segment: the ordinal (from the segment's
+        // start) of the next one going right to left, and the lowest ordinal
+        // whose forward state the replay buffer holds.
+        let (mut seg_mis_next, mut replay_lo) = (0usize, 0usize);
+        #[cfg(test)]
+        self.replay_trace.clear();
         let _abs_locus = locus_last;
         let mut abs_ambiguous = abs_ambiguous_end;
         let mut prev_abs_locus = locus_last;
@@ -1569,6 +1811,11 @@ impl SegmentHmm {
 
             // Pointer to this variant's compact bitmatrix row (window-relative indexing)
             let bm_row = unsafe { bm_ptr.add((vi - locus_offset) * k_words) };
+            if mis_w > 0 && !self.mis_stored && curr_seg_locus == graph.lengths[curr_seg] as usize - 1 {
+                let s0 = graph.segment_start(curr_seg);
+                seg_mis_next = graph.missing_in(s0, vi);
+                replay_lo = seg_mis_next;
+            }
 
             let (nt, yt) = if first_locus {
                 (1.0f32, 0.0f32)
@@ -1612,6 +1859,20 @@ impl SegmentHmm {
                 else if is_amb { self.run_amb_bm(graph.ambiguous[abs_ambiguous], bm_row, nt, yt); }
                 else { self.run_mis(nt, yt); }
             }
+            if is_mis {
+                mis_w -= 1;
+                let slot = if self.mis_stored { mis_w } else {
+                    seg_mis_next -= 1;
+                    let j = seg_mis_next;
+                    if j < replay_lo {
+                        replay_lo = j + 1 - (j + 1).min(replay_slots(n_cond * HAP_NUMBER, 4));
+                        self.replay_missing(&f, seg_first, curr_seg, vi, replay_lo, j);
+                    }
+                    j - replay_lo
+                };
+                self.impute_missing(slot, bm_row,
+                    &mut missing_probs[mis_w * HAP_NUMBER..(mis_w + 1) * HAP_NUMBER]);
+            }
             let is_within_seg = !is_first_in_seg;
             let rare_skipped = is_within_seg && is_hom && {
                 let r = if vi < rare_allele.len() { rare_allele[vi] } else { -1 };
@@ -1625,6 +1886,11 @@ impl SegmentHmm {
             } else {
                 curr_seg_locus = curr_seg_locus.saturating_sub(1);
             }
+        }
+
+        if single {
+            transition_probs.fill(1.0 / n_trans.max(1) as f64);
+            return (transition_probs, missing_probs);
         }
 
         // SET_FIRST_TRANS
@@ -2131,9 +2397,10 @@ mod seg_kernel_tests {
                     let uf = hmm.has_underflow();
                     let alpha: Vec<Vec<u32>> = hmm.alpha_store.iter()
                         .map(|a| a.iter().map(|x| x.to_bits()).collect()).collect();
-                    let (t, _) = hmm.backward_rare_direct(&graph, &cond_bm, kw, l0, &params.trans,
+                    let (t, miss) = hmm.backward_rare_direct(&graph, &cond_bm, kw, l0, &params.trans,
                         s, e, &params.rare_allele, &params);
-                    (uf, alpha, t.iter().map(|x| x.to_bits()).collect::<Vec<u64>>())
+                    (uf, alpha, t.iter().map(|x| x.to_bits()).collect::<Vec<u64>>(),
+                     miss.iter().map(|x| x.to_bits()).collect::<Vec<u32>>())
                 };
                 let want = run(paths[0]);
                 for &path in &paths[1..] {
@@ -2153,5 +2420,153 @@ mod seg_kernel_tests {
         eprintln!("window digest {digest:#018x} over {n_windows} windows");
         assert_eq!(digest, GOLDEN_WINDOWS, "window results differ from the x86_64 AVX-512 record");
     }
-}
 
+    /// SHAPEIT5's IMPUTE: the missing-locus probabilities are P(ALT) under the
+    /// posterior, so they are 1 (0) where every conditioning haplotype carries
+    /// ALT (REF), the f32 and f64 HMMs agree on them, and each window returns
+    /// one value per configuration per missing locus it covers.
+    #[test]
+    fn missing_loci_are_imputed_from_the_posterior() {
+        use super::super::hmm_segment_f64::SegmentHmmF64;
+        let mut rng = TestRng::new(4242);
+        let (mut n_checked, mut max_d) = (0usize, 0.0f32);
+        for case in 0..20 {
+            let n_var = 300 + rng.below(200);
+            let mut geno = vec![0u8; n_var * 2];
+            for v in 0..n_var {
+                geno[2 * v] = rng.chance(0.4) as u8;
+                geno[2 * v + 1] = rng.chance(0.4) as u8;
+                if rng.chance(0.05) { geno[2 * v] = 128; geno[2 * v + 1] = 128; }
+            }
+            let graph = build_graph(0, &geno, n_var, None);
+            if graph.n_segments < 4 || graph.n_missing == 0 { continue; }
+            let cm: Vec<f64> = (0..n_var).map(|i| i as f64 * 0.01).collect();
+            let params = super::super::params::HmmParams::new(&cm, 1000, 15000.0);
+            let (s, e) = (0usize, graph.n_segments - 1);
+            let (l0, l1) = (0usize, n_var - 1);
+            let k = [8usize, 37, 65][case % 3];
+            let kw = k.div_ceil(64);
+            let mask = if k % 64 == 0 { !0u64 } else { (1u64 << (k % 64)) - 1 };
+            // Missing rows alternate between all-ALT and all-REF conditioning
+            // haplotypes; other rows are random.
+            let mis: Vec<usize> = (l0..=l1).filter(|&v| var_is_mis(v % 2, graph.variants[v / 2])).collect();
+            let mut cond_bm: Vec<u64> = (0..n_var * kw).map(|_| rng.next()).collect();
+            for (i, &v) in mis.iter().enumerate() {
+                for w in 0..kw {
+                    let full = if w + 1 == kw { mask } else { !0u64 };
+                    cond_bm[v * kw + w] = if i % 2 == 0 { full } else { 0 };
+                }
+            }
+            let mut hmm = SegmentHmm::new(k);
+            hmm.resize_for(k);
+            hmm.forward_rare_direct(&graph, &cond_bm, kw, l0, &params.trans, s, e, &params.rare_allele, &params);
+            assert!(!hmm.has_underflow());
+            let (_, m32) = hmm.backward_rare_direct(&graph, &cond_bm, kw, l0, &params.trans, s, e,
+                &params.rare_allele, &params);
+            assert_eq!(m32.len(), mis.len() * HAP_NUMBER);
+            for (i, p) in m32.chunks(HAP_NUMBER).enumerate() {
+                let want = if i % 2 == 0 { 1.0 } else { 0.0 };
+                assert!(p.iter().all(|&x| x == want), "case {case} missing {i}: {p:?}");
+            }
+            // Random rows everywhere: f32 against f64.
+            let cond_bm: Vec<u64> = (0..n_var * kw).map(|_| rng.next()).collect();
+            hmm.resize_for(k);
+            hmm.forward_rare_direct(&graph, &cond_bm, kw, l0, &params.trans, s, e, &params.rare_allele, &params);
+            let (_, m32) = hmm.backward_rare_direct(&graph, &cond_bm, kw, l0, &params.trans, s, e,
+                &params.rare_allele, &params);
+            let haps: Vec<usize> = (0..k).collect();
+            let bit = |v: usize, h: usize| (cond_bm[v * kw + h / 64] >> (h % 64)) & 1 == 1;
+            let mut h64 = SegmentHmmF64::new(k);
+            h64.forward_rare(&graph, &haps, &bit, &params.trans, s, e, &params.rare_allele, &params);
+            let (_, m64) = h64.backward_rare(&graph, &haps, &bit, &params.trans, s, e, &params.rare_allele, &params);
+            assert_eq!(m32.len(), m64.len());
+            for (a, b) in m32.iter().zip(&m64) {
+                assert!((0.0..=1.0).contains(a), "{a}");
+                max_d = max_d.max((a - b).abs());
+            }
+            n_checked += mis.len();
+        }
+        assert!(n_checked > 100, "{n_checked}");
+        assert!(max_d < 1e-3, "f32 and f64 imputation differ by {max_d}");
+    }
+
+    /// The backward's per-segment replays reproduce the forward's state at every
+    /// missing locus bit for bit, each locus exactly once, also on segments with
+    /// more missing loci than one replay keeps (`replay_slots`; 16 with k = 8192).
+    #[test]
+    fn replayed_missing_states_equal_the_forward() {
+        let mut rng = TestRng::new(77);
+        let (mut n_loci, mut n_long, mut n_stored) = (0usize, 0usize, 0usize);
+        for case in 0..30 {
+            let n_var = 400 + rng.below(400);
+            let (p_het, p_mis) = if case % 3 == 0 { (0.02, 0.4) } else { (0.3, 0.05) };
+            let mut geno = vec![0u8; n_var * 2];
+            for v in 0..n_var {
+                let het = rng.chance(p_het);
+                geno[2 * v] = het as u8;
+                geno[2 * v + 1] = if het { 0 } else { geno[2 * v] };
+                if !het && rng.chance(0.3) { geno[2 * v] = 1; geno[2 * v + 1] = 1; }
+                if rng.chance(p_mis) { geno[2 * v] = 128; geno[2 * v + 1] = 128; }
+            }
+            let graph = build_graph(0, &geno, n_var, None);
+            if graph.n_segments < 3 || graph.n_missing == 0 { continue; }
+            let cm: Vec<f64> = (0..n_var).map(|i| i as f64 * 0.005).collect();
+            let params = super::super::params::HmmParams::new(&cm, 1000, 15000.0);
+            let (s, e) = (rng.below(graph.n_segments / 2), graph.n_segments - 1);
+            let l0 = graph.segment_start(s);
+            let k = [3usize, 8, 64, 8192][case % 4];
+            let kw = k.div_ceil(64);
+            let cond_bm: Vec<u64> = (0..(n_var - l0) * kw).map(|_| rng.next()).collect();
+            let mut hmm = SegmentHmm::new(k);
+            hmm.force_replay = true;
+            hmm.resize_for(k);
+            hmm.forward_rare_direct(&graph, &cond_bm, kw, l0, &params.trans, s, e, &params.rare_allele, &params);
+            if hmm.has_underflow() { continue; }
+            let want = hmm.fwd_trace.clone();
+            let (_, m_replay) = hmm.backward_rare_direct(&graph, &cond_bm, kw, l0, &params.trans, s, e, &params.rare_allele, &params);
+            let mut got = hmm.replay_trace.clone();
+            got.sort_by_key(|x| x.0);
+            assert_eq!(got.len(), want.len(), "case {case}: every missing locus replayed once");
+            assert!(got == want, "case {case}: replayed state differs from the forward");
+            // The window-wide store (when it fits) imputes the same bits.
+            hmm.force_replay = false;
+            hmm.resize_for(k);
+            hmm.forward_rare_direct(&graph, &cond_bm, kw, l0, &params.trans, s, e, &params.rare_allele, &params);
+            let (_, m_store) = hmm.backward_rare_direct(&graph, &cond_bm, kw, l0, &params.trans, s, e, &params.rare_allele, &params);
+            assert_eq!(m_store.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                       m_replay.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), "case {case}: store vs replay");
+            n_stored += hmm.mis_stored as usize;
+            n_loci += want.len();
+            n_long += (s..=e).filter(|&g| {
+                let a = graph.segment_start(g);
+                graph.missing_in(a, a + graph.lengths[g] as usize - 1) > replay_slots(k * HAP_NUMBER, 4)
+            }).count();
+        }
+        assert!(n_loci > 500 && n_long > 0 && n_stored > 0, "{n_loci} loci, {n_long} long segments, {n_stored} stored");
+    }
+
+    /// A one-segment window still imputes its missing loci (its transition block
+    /// stays uniform, as without them).
+    #[test]
+    fn one_segment_window_imputes_its_missing_loci() {
+        let n_var = 60usize;
+        let mut geno = vec![0u8; n_var * 2];
+        for v in 0..n_var { if v % 3 == 0 { geno[2 * v] = 1; geno[2 * v + 1] = 1; } }
+        for &v in &[0usize, 17, 59] { geno[2 * v] = 128; geno[2 * v + 1] = 128; }
+        geno[2 * 30] = 0; geno[2 * 30 + 1] = 1; // one het: one segment
+        let graph = build_graph(0, &geno, n_var, None);
+        assert_eq!((graph.n_segments, graph.n_missing), (1, 3));
+        let cm: Vec<f64> = (0..n_var).map(|i| i as f64 * 0.01).collect();
+        let params = super::super::params::HmmParams::new(&cm, 1000, 15000.0);
+        let k = 10usize;
+        // Every conditioning haplotype carries ALT at the missing loci.
+        let cond_bm: Vec<u64> = (0..n_var).map(|v| if v == 0 || v == 17 || v == 59 { (1u64 << k) - 1 } else { 0x155 }).collect();
+        let mut hmm = SegmentHmm::new(k);
+        hmm.resize_for(k);
+        hmm.forward_rare_direct(&graph, &cond_bm, 1, 0, &params.trans, 0, 0, &params.rare_allele, &params);
+        let (t, m) = hmm.backward_rare_direct(&graph, &cond_bm, 1, 0, &params.trans, 0, 0, &params.rare_allele, &params);
+        assert_eq!(m.len(), 3 * HAP_NUMBER);
+        assert!(m.iter().all(|&p| p == 1.0), "{m:?}");
+        assert!(t.iter().all(|&p| p == t[0]), "uniform transitions: {t:?}");
+    }
+}

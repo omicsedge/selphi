@@ -107,6 +107,10 @@ pub fn apply_haploid_detection(
         targ_alleles, &flat_geno, &haploid_samples, n_chip, n_samples, n_haps, par_ref, 128,
     );
     let n_reset = reset.len();
+    // Every missing genotype of a haploid sample outside the PARs (input no-calls
+    // and the hets just reset) takes the haploid sentinel, so the diploid engine
+    // imputes one allele for both of his haplotypes there (SHAPEIT5's haploid branch).
+    selphi::diploid::pedigree::mark_haploid_missing(targ_alleles, n_chip, n_haps, &haploid_samples, par_ref);
     let detect_method = if haploids_path.is_some() { "from file" } else { "auto-detected" };
     let n_par = par_ref.map_or(0, |p| p.iter().filter(|&&x| x).count());
     if n_par > 0 {

@@ -55,21 +55,24 @@ fn main() {
         return;
     }
 
-    // Probe & report the SIMD path picked for the diploid HMM hot loop. The
-    // baseline is `x86-64-v3` (AVX2/FMA/BMI2 — Haswell+ 2013); AVX-512F+DQ is
-    // a runtime upgrade. Setting `SELPHI_FORCE_SCALAR=1` forces the scalar
-    // path on AVX-512 hosts (used for parity testing).
+    // Probe & report the SIMD path the HMM kernels take. The baseline is
+    // `x86-64-v3` (AVX2/FMA/BMI2 — Haswell+ 2013); AVX-512F+DQ is a runtime
+    // upgrade. `SELPHI_FORCE_SCALAR=1` / `SELPHI_FORCE_AVX2=1` force the scalar /
+    // AVX2 kernels (parity testing; phasing output is identical on every path).
     #[cfg(target_arch = "x86_64")]
     if !selphi::config::is_one("SELPHI_QUIET_SIMD") {
         let forced_scalar = selphi::config::is_one("SELPHI_FORCE_SCALAR");
+        let forced_avx2 = selphi::config::is_one("SELPHI_FORCE_AVX2");
         let has_avx512 = std::arch::is_x86_feature_detected!("avx512f")
             && std::arch::is_x86_feature_detected!("avx512dq");
         let path = if forced_scalar {
             "scalar (SELPHI_FORCE_SCALAR=1)"
+        } else if has_avx512 && forced_avx2 {
+            "AVX2 (SELPHI_FORCE_AVX2=1)"
         } else if has_avx512 {
             "AVX-512F+DQ"
         } else {
-            "AVX2 (scalar fallback for diploid HMM)"
+            "AVX2"
         };
         eprintln!("{} SIMD: {}", selphi::log::cyan("[selphi]"), selphi::log::green(path));
     }

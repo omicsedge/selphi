@@ -173,6 +173,59 @@ fn parse_region(reg: &str) -> (String, i64, i64) {
     }
 }
 
+/// chrX for the diploid engine: men (`--haploids`, else — with `detect`, on the
+/// whole cohort — < 1% heterozygous calls over > 100 called sites outside the PARs)
+/// are haploid outside the PARs, as the imputation path treats them: their
+/// heterozygous calls there (genotyping errors) and their no-calls are imputed as
+/// one allele on both haplotypes. `build` locates the PARs (`None`:
+/// `--chrx-no-par`, haploid on the whole chromosome). A no-op off chrX and for the
+/// haploid engine.
+#[allow(clippy::too_many_arguments)]
+fn mark_chrx_haploids(
+    engine: PhasingEngine, args: &Args, chrom: &str, sample_names: &[String],
+    geno: &mut [u8], bp: &[i64], n_var: usize, n_samples: usize,
+    build: Option<selphi::contig::Build>, detect: bool,
+) {
+    if engine == PhasingEngine::Haploid || !selphi::contig::is_chrx(chrom) { return; }
+    let n_haps = n_samples * 2;
+    let par: Option<Vec<bool>> = build.map(|b| bp.iter().map(|&p| selphi::contig::in_chrx_par(p, b)).collect());
+    let par_ref = par.as_deref();
+    use selphi::diploid::pedigree as ped;
+    let (haploids, how) = match args.haploids.as_deref() {
+        Some(path) => (ped::parse_haploids(Path::new(path), sample_names).unwrap_or_else(|e| {
+            selphi_error!("Cannot read --haploids {}: {}", path, e); std::process::exit(1);
+        }), "from file"),
+        None if detect => (ped::detect_haploid_chrx(geno, n_var, n_samples, n_haps, par_ref), "auto-detected"),
+        None => return,
+    };
+    if haploids.is_empty() { return; }
+    // Hets outside the PARs are errors for a haploid sample: missing, then marked.
+    let mut n_het = 0usize;
+    for &si in &haploids {
+        for v in 0..n_var {
+            if par_ref.is_some_and(|p| p[v]) { continue; }
+            let i = v * n_haps + si * 2;
+            if geno[i] <= 1 && geno[i + 1] <= 1 && geno[i] != geno[i + 1] {
+                geno[i] = 128; geno[i + 1] = 128; n_het += 1;
+            }
+        }
+    }
+    let n_mis = ped::mark_haploid_missing(geno, n_var, n_haps, &haploids, par_ref);
+    selphi_step!("chrX: {} haploid samples ({}), outside the PARs {} het calls reset, {} genotypes imputed as haploid",
+        haploids.len(), how, n_het, n_mis);
+}
+
+/// The build that locates the chrX PARs for panel phasing: `--build`, else
+/// inferred from the largest position; `None` under `--chrx-no-par`.
+fn chrx_build(args: &Args, max_pos: i64) -> Option<selphi::contig::Build> {
+    if args.chrx_no_par { return None; }
+    Some(match args.build {
+        crate::cli::BuildArg::Grch37 => selphi::contig::Build::Grch37,
+        crate::cli::BuildArg::Grch38 => selphi::contig::Build::Grch38,
+        crate::cli::BuildArg::Auto => selphi::contig::infer_build_from_chrx_maxpos(max_pos),
+    })
+}
+
 /// Phase one cohort block (single chunk or whole panel) with the chosen
 /// engine, n_ref=0 self-phasing, on `n_threads` threads. Returns phased
 /// (n_var × n_haps).
@@ -457,7 +510,7 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
         cohort.markers = new_markers;
         cohort.n_var = keep.len();
     }
-    let Cohort { sample_names, markers, geno: cohort_geno, n_var, n_samples, was_phased } = cohort;
+    let Cohort { sample_names, markers, geno: mut cohort_geno, n_var, n_samples, was_phased } = cohort;
 
     let n_haps = n_samples * 2;
     selphi_step!("Cohort: {} samples, {} variants, input_phased={} (re-phasing from genotypes)",
@@ -498,6 +551,11 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
         PhasingEngine::Haploid => PhasingEngine::Haploid,
         _ => PhasingEngine::Diploid,
     };
+    // chrX: men are haploid outside the PARs (diploid engine).
+    if let Some(m0) = markers.first() {
+        let build = chrx_build(args, bp.iter().copied().max().unwrap_or(0));
+        mark_chrx_haploids(engine, args, &m0.chrom, &sample_names, &mut cohort_geno, &bp, n_var, n_samples, build, true);
+    }
 
     // 5. Decide single-shot vs auto-chunked, ENGINE-AWARE. The two engines
     //    have very different per-variant footprints on dense WGS (measured on
@@ -739,6 +797,12 @@ fn run_streaming(args: &Args, input_path: &str, output_path: &str, map_path: &st
     let (map_bp, map_cm) = genmap::load_genetic_map_for(Path::new(map_path), Some(chrom.as_str()))
         .unwrap_or_else(|e| { selphi_error!("Cannot read genetic map {}: {}", map_path, e); std::process::exit(1); });
     let engine = match args.phasing_engine { PhasingEngine::Haploid => PhasingEngine::Haploid, _ => PhasingEngine::Diploid };
+    let chrx_build_all = chrx_build(args, bp.iter().copied().max().unwrap_or(0));
+    // A chunk is too short to tell men by heterozygosity: streamed, chrX takes men
+    // from --haploids only.
+    if engine == PhasingEngine::Diploid && selphi::contig::is_chrx(&chrom) && args.haploids.is_none() {
+        selphi_info!("  NOTE: chrX is streamed chunk by chunk: men are phased as haploid outside the PARs only with --haploids.");
+    }
     let n_threads = args.threads.max(1);
 
     // 3. Chunk sizing — same per_var_bytes as run(); NO 2×array reservation
@@ -816,6 +880,7 @@ fn run_streaming(args: &Args, input_path: &str, output_path: &str, map_path: &st
                 chunk_geno[vi * n_haps + si * 2 + 1] = a1;
             }
         }
+        mark_chrx_haploids(engine, args, &chrom, &sample_names, &mut chunk_geno, &bp[cs..ce], cn, n_samples, chrx_build_all, false);
         let cphased = phase_cohort(engine, args, n_threads, &chunk_geno, &bp[cs..ce], &map_bp, &map_cm, cn, n_samples);
         drop(chunk_geno);
 

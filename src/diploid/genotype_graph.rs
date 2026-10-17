@@ -22,6 +22,10 @@ pub const VAR_MIS: u8 = 1; // Missing
 pub const VAR_HET: u8 = 2; // Heterozygous
 pub const VAR_SCA: u8 = 3; // Scaffold (pre-phased het)
 
+/// Target-allele sentinel for a missing genotype of a haploid sample (a man's
+/// chrX outside the PARs); any value above 1 is missing, 128 the diploid one.
+pub const HAPLOID_MISSING: u8 = 129;
+
 /// Extract variant type for entry `e` (0 or 1) from packed byte `v`.
 #[inline(always)]
 pub fn var_get_type(e: usize, v: u8) -> u8 {
@@ -171,9 +175,14 @@ pub struct GenotypeGraph {
     pub prob_mask: Vec<bool>,
     pub prob_stored: Vec<f32>,
     pub prob_missing: Vec<f32>,
+    /// Per missing locus: the Main iterations whose HMM imputed it (summed into
+    /// `prob_missing`). A window both of whose HMMs underflow imputes nothing.
+    pub prob_missing_n: Vec<u16>,
+    /// Per missing locus: haploid there (a man's chrX outside the PARs; empty when
+    /// the sample has none), so one allele is imputed for both haplotypes.
+    pub mis_haploid: Vec<bool>,
     /// Number of stored transition probabilities.
     pub n_stored_probs: usize,
-    // (n_storage_events counter removed: was write-only.)
 }
 
 impl GenotypeGraph {
@@ -194,8 +203,48 @@ impl GenotypeGraph {
             prob_mask: Vec::new(),
             prob_stored: Vec::new(),
             prob_missing: Vec::new(),
+            prob_missing_n: Vec::new(),
+            mis_haploid: Vec::new(),
             n_stored_probs: 0,
         }
+    }
+
+    /// Missing loci in `[l0, l1]`.
+    pub fn missing_in(&self, l0: usize, l1: usize) -> usize {
+        if self.n_missing == 0 || l0 > l1 { return 0; }
+        (l0..=l1).filter(|&v| var_is_mis(v % 2, self.variants[v / 2])).count()
+    }
+
+    /// Missing loci no stored Main iteration imputed (both HMM passes failed over
+    /// every window holding them): their alleles are still the starting ones.
+    pub fn unimputed_missing(&self) -> Vec<usize> {
+        if self.n_missing == 0 || self.prob_missing_n.len() != self.n_missing { return Vec::new(); }
+        let mut out = Vec::new();
+        let mut m = 0usize;
+        for v in 0..self.n_variants {
+            if var_is_mis(v % 2, self.variants[v / 2]) {
+                if self.prob_missing_n[m] == 0 { out.push(v); }
+                m += 1;
+            }
+        }
+        out
+    }
+
+    /// Per segment, the ordinal of its first missing locus (SHAPEIT5's `mis_idx`);
+    /// one extra entry holds `n_missing`. Empty when the graph has none.
+    pub fn missing_offsets(&self) -> Vec<u32> {
+        if self.n_missing == 0 { return Vec::new(); }
+        let mut out = Vec::with_capacity(self.n_segments + 1);
+        let (mut m, mut v) = (0u32, 0usize);
+        for s in 0..self.n_segments {
+            out.push(m);
+            for vi in v..v + self.lengths[s] as usize {
+                m += var_is_mis(vi % 2, self.variants[vi / 2]) as u32;
+            }
+            v += self.lengths[s] as usize;
+        }
+        out.push(m);
+        out
     }
 
     /// Set variant type and alleles from diploid genotype (a0, a1).
@@ -500,12 +549,14 @@ pub fn build_graph(
 /// [`build_graph`] for a sample whose input no-calls (`missing(v)`) must stay missing
 /// while `genotypes` holds alleles filled in for them: those sites are marked missing
 /// (uniform emission) and carry the filled alleles only as their haplotype bits.
+/// `haploid(v)`: the sample is haploid at missing site `v` (`mis_haploid`).
 pub fn build_graph_keep_missing(
     index: usize,
     genotypes: &[u8],
     n_var: usize,
     phased_flags: Option<&[bool]>,
     missing: impl Fn(usize) -> bool,
+    haploid: impl Fn(usize) -> bool,
 ) -> GenotypeGraph {
     let mut graph = GenotypeGraph::new(index, n_var);
     for v in 0..n_var {
@@ -524,6 +575,10 @@ pub fn build_graph_keep_missing(
         }
     }
     graph.build();
+    if (0..n_var).any(|v| var_is_mis(v % 2, graph.variants[v / 2]) && haploid(v)) {
+        graph.mis_haploid = (0..n_var).filter(|&v| var_is_mis(v % 2, graph.variants[v / 2]))
+            .map(&haploid).collect();
+    }
     graph
 }
 
