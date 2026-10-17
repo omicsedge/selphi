@@ -9,6 +9,35 @@
 //!
 //! Inner loops use explicit AVX2 intrinsics for bit-identical results.
 //!
+//! ## Every kernel path gives the same bits
+//!
+//! The six state-update kernels (`run_hom_bm`, `run_amb_bm`, `run_mis`,
+//! `collapse_hom_bm`, `collapse_amb_bm`, `collapse_mis`) and the TRANS_HAP
+//! accumulation each have an x86 path (AVX-512 for `run_hom_bm` on AVX-512
+//! hosts, AVX2+FMA otherwise — the x86-64-v3 baseline), a NEON path and a
+//! portable scalar path ([`SegPath`]). The x86 AVX-512 host's arithmetic is the
+//! canonical one and the other paths reproduce it exactly:
+//!
+//! - `prob · nt + tfreq` is ONE fused multiply-add everywhere (`_mm256_fmadd_ps`
+//!   / `_mm512_fmadd_ps`, `vfmaq_f32`, `f32::mul_add` — all correctly rounded);
+//!   every other product and sum is a separate, individually rounded operation
+//!   (Rust never contracts `a * b + c` on its own);
+//! - each per-haplotype sum `prob_sum_h[h]` accumulates over `k` in the canonical
+//!   lanes: `run_hom_bm` keeps even and odd `k` apart (the two halves of the
+//!   AVX-512 register, the odd-`n_cond` tail on the even side) and adds
+//!   `even + odd` at the end; the other kernels accumulate `k` in order;
+//! - `prob_sum_t` is the left-to-right sum `h = 0..7` of `prob_sum_h`.
+//!
+//! The identity covers finite values in the default floating-point environment
+//! (round to nearest even, which this program never changes). A NaN's sign and
+//! payload are the hardware's own (x86 makes the negative default NaN, aarch64 the
+//! positive one); no NaN reaches an output, since `has_underflow` and the
+//! transition-vector check send a window that produced one to the f64 HMM.
+//!
+//! `SELPHI_FORCE_AVX2=1` selects the AVX2 path on an AVX-512 host and
+//! `SELPHI_FORCE_SCALAR=1` the scalar path on any host; `seg_kernel_tests`
+//! checks every path this host can run (the NEON one under qemu) bit for bit.
+//!
 //! Reference: diploid/phase_common/src/models/haplotype_segment_single.h
 
 #[cfg(target_arch = "x86_64")]
@@ -95,19 +124,23 @@ unsafe impl Sync for AlignedF32 {}
 
 /// Scalar f32 division via inline asm — prevents FMA fusion for determinism.
 /// Prevents LLVM from fusing into FMA (which changes rounding) without
-/// the memory round-trip overhead of std::hint::black_box.
+/// the memory round-trip overhead of std::hint::black_box. (IEEE division:
+/// the same quotient as `a / b` on every architecture.)
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn divss(a: f32, b: f32) -> f32 { unsafe {
+fn divss(a: f32, b: f32) -> f32 {
     let r: f32;
-    std::arch::asm!(
-        "divss {a}, {b}",
-        a = inout(xmm_reg) a => r,
-        b = in(xmm_reg) b,
-        options(pure, nomem, nostack),
-    );
+    // SAFETY: a register-only SSE division (SSE is baseline on x86_64).
+    unsafe {
+        std::arch::asm!(
+            "divss {a}, {b}",
+            a = inout(xmm_reg) a => r,
+            b = in(xmm_reg) b,
+            options(pure, nomem, nostack),
+        );
+    }
     r
-}}
+}
 
 #[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
@@ -115,32 +148,64 @@ fn divss(a: f32, b: f32) -> f32 {
     a / b
 }
 
-/// Runtime AVX-512 capability check, cached after first call.
-///
-/// `SELPHI_FORCE_SCALAR=1` forces the scalar path even on AVX-512 hosts —
-/// used to validate scalar/SIMD parity on a single machine without spinning
-/// up non-AVX-512 hardware. The env var is read exactly once.
-///
-/// Requires both AVX-512F (base) and AVX-512DQ (`_mm512_extractf32x8_ps` /
-/// `_mm512_insertf32x8`). DQ has been on every server-class Intel since
-/// Skylake-X (2017) but not on Knights Landing/Mill.
-#[cfg(target_arch = "x86_64")]
-fn use_avx512() -> bool {
-    use std::sync::OnceLock;
-    static USE: OnceLock<bool> = OnceLock::new();
-    *USE.get_or_init(|| {
-        if crate::config::is_one("SELPHI_FORCE_SCALAR") {
-            return false;
-        }
-        is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512dq")
-    })
+/// `prob_sum_t` from `prob_sum_h`: the canonical left-to-right sum.
+#[inline(always)]
+fn sum8_seq(s: &[f32; HAP_NUMBER]) -> f32 {
+    s[0] + s[1] + s[2] + s[3] + s[4] + s[5] + s[6] + s[7]
 }
 
-// NEON helper: horizontal sum of two float32x4_t (8 floats total)
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn neon_hsum8(lo: float32x4_t, hi: float32x4_t) -> f32 {
-    unsafe { vaddvq_f32(vaddq_f32(lo, hi)) }
+/// Kernel path of the segment HMM. All paths give the same bits (see the
+/// module doc); the choice only changes speed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SegPath {
+    /// x86_64 with AVX-512F+DQ: `run_hom_bm` two conditioning haplotypes per
+    /// 512-bit register, the other kernels AVX2+FMA.
+    #[cfg(target_arch = "x86_64")]
+    Avx512,
+    /// x86_64 AVX2+FMA (the x86-64-v3 build baseline).
+    #[cfg(target_arch = "x86_64")]
+    Avx2,
+    /// aarch64 NEON.
+    #[cfg(target_arch = "aarch64")]
+    Neon,
+    /// Portable scalar (`f32::mul_add` for the fused step).
+    Scalar,
+}
+
+/// Runtime kernel-path choice, cached after first call.
+///
+/// `SELPHI_FORCE_SCALAR=1` forces the portable scalar path and
+/// `SELPHI_FORCE_AVX2=1` the AVX2 path (what a non-AVX-512 x86 host runs) —
+/// used to validate parity on a single machine. The env vars are read once.
+///
+/// AVX-512 requires both AVX-512F (base) and AVX-512DQ
+/// (`_mm512_extractf32x8_ps` / `_mm512_insertf32x8`). DQ has been on every
+/// server-class Intel since Skylake-X (2017) but not on Knights Landing/Mill.
+pub(crate) fn seg_path() -> SegPath {
+    use std::sync::OnceLock;
+    static PATH: OnceLock<SegPath> = OnceLock::new();
+    *PATH.get_or_init(|| {
+        if crate::config::is_one("SELPHI_FORCE_SCALAR") {
+            return SegPath::Scalar;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !crate::config::is_one("SELPHI_FORCE_AVX2")
+                && is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512dq")
+            {
+                return SegPath::Avx512;
+            }
+            SegPath::Avx2
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            SegPath::Neon
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            SegPath::Scalar
+        }
+    })
 }
 
 /// `SELPHI_DIPLOID_RARE_DISPATCH=1`: dispatch both forward passes position-first
@@ -189,8 +254,13 @@ pub(crate) static DIAG_SKIP_SEG_HEAD: AtomicU64 = AtomicU64::new(0);
 /// multiply and add (no FMA), so every result is bit-identical — while each
 /// `beta` row is loaded once instead of eight times and the eight h1 rows
 /// accumulate as independent dependency chains instead of one after another.
+///
+/// Every path (AVX2 on x86 whatever `path` says there, NEON, scalar) does the
+/// same separate multiply then add per accumulator in `k` order: bit-identical.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn trans_hap_accumulate(
+    path: SegPath,
     alpha: &[f32], beta: &[f32], n_cond: usize,
     alpha_sum: &[f32; HAP_NUMBER], alpha_sum_sum: f32, fact1: f32, yt: f32,
 ) -> [f32; HAP_NUMBER * HAP_NUMBER] {
@@ -199,55 +269,77 @@ fn trans_hap_accumulate(
     for h1 in 0..HAP_NUMBER {
         fact2[h1] = (alpha_sum[h1] / alpha_sum_sum.max(1e-30)) * yt / n_cond as f32;
     }
+    match path {
+        // SAFETY: lengths asserted above; AVX2 is in the x86-64-v3 baseline.
+        #[cfg(target_arch = "x86_64")]
+        SegPath::Avx512 | SegPath::Avx2 => unsafe { trans_hap_avx2(alpha, beta, n_cond, &fact2, fact1) },
+        // SAFETY: lengths asserted above; NEON is baseline on aarch64.
+        #[cfg(target_arch = "aarch64")]
+        SegPath::Neon => unsafe { trans_hap_neon(alpha, beta, n_cond, &fact2, fact1) },
+        SegPath::Scalar => trans_hap_scalar(alpha, beta, n_cond, &fact2, fact1),
+    }
+}
+
+/// [`trans_hap_accumulate`], AVX2. SAFETY: `alpha`, `beta` hold `n_cond * 8`.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn trans_hap_avx2(alpha: &[f32], beta: &[f32], n_cond: usize,
+                         fact2: &[f32; HAP_NUMBER], fact1: f32) -> [f32; HAP_NUMBER * HAP_NUMBER] { unsafe {
     let mut out = [0.0f32; HAP_NUMBER * HAP_NUMBER];
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: lengths asserted above; AVX2 is in the x86-64-v3 baseline.
-    unsafe {
-        let mut acc = [_mm256_setzero_ps(); HAP_NUMBER];
-        for k in 0..n_cond {
-            let base = k * HAP_NUMBER;
-            let beta_k = _mm256_loadu_ps(beta.as_ptr().add(base));
-            for h1 in 0..HAP_NUMBER {
-                let alpha_val = *alpha.get_unchecked(base + h1) * fact1 + fact2[h1];
-                // Separate mul+add, NOT FMA (different rounding)
-                acc[h1] = _mm256_add_ps(acc[h1], _mm256_mul_ps(_mm256_set1_ps(alpha_val), beta_k));
-            }
-        }
+    let mut acc = [_mm256_setzero_ps(); HAP_NUMBER];
+    for k in 0..n_cond {
+        let base = k * HAP_NUMBER;
+        let beta_k = _mm256_loadu_ps(beta.as_ptr().add(base));
         for h1 in 0..HAP_NUMBER {
-            _mm256_storeu_ps(out.as_mut_ptr().add(h1 * HAP_NUMBER), acc[h1]);
+            let alpha_val = *alpha.get_unchecked(base + h1) * fact1 + fact2[h1];
+            // Separate mul+add, NOT FMA (different rounding)
+            acc[h1] = _mm256_add_ps(acc[h1], _mm256_mul_ps(_mm256_set1_ps(alpha_val), beta_k));
         }
     }
-    #[cfg(target_arch = "aarch64")]
-    // SAFETY: lengths asserted above; NEON is baseline on aarch64.
-    unsafe {
-        let mut acc_lo = [vdupq_n_f32(0.0); HAP_NUMBER];
-        let mut acc_hi = [vdupq_n_f32(0.0); HAP_NUMBER];
-        for k in 0..n_cond {
-            let base = k * HAP_NUMBER;
-            let beta_lo = vld1q_f32(beta.as_ptr().add(base));
-            let beta_hi = vld1q_f32(beta.as_ptr().add(base + 4));
-            for h1 in 0..HAP_NUMBER {
-                let alpha_val = *alpha.get_unchecked(base + h1) * fact1 + fact2[h1];
-                let a = vdupq_n_f32(alpha_val);
-                // Separate mul+add, NOT FMA (different rounding)
-                acc_lo[h1] = vaddq_f32(acc_lo[h1], vmulq_f32(a, beta_lo));
-                acc_hi[h1] = vaddq_f32(acc_hi[h1], vmulq_f32(a, beta_hi));
-            }
-        }
+    for h1 in 0..HAP_NUMBER {
+        _mm256_storeu_ps(out.as_mut_ptr().add(h1 * HAP_NUMBER), acc[h1]);
+    }
+    out
+}}
+
+/// [`trans_hap_accumulate`], NEON. SAFETY: `alpha`, `beta` hold `n_cond * 8`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn trans_hap_neon(alpha: &[f32], beta: &[f32], n_cond: usize,
+                         fact2: &[f32; HAP_NUMBER], fact1: f32) -> [f32; HAP_NUMBER * HAP_NUMBER] { unsafe {
+    let mut out = [0.0f32; HAP_NUMBER * HAP_NUMBER];
+    let mut acc_lo = [vdupq_n_f32(0.0); HAP_NUMBER];
+    let mut acc_hi = [vdupq_n_f32(0.0); HAP_NUMBER];
+    for k in 0..n_cond {
+        let base = k * HAP_NUMBER;
+        let beta_lo = vld1q_f32(beta.as_ptr().add(base));
+        let beta_hi = vld1q_f32(beta.as_ptr().add(base + 4));
         for h1 in 0..HAP_NUMBER {
-            vst1q_f32(out.as_mut_ptr().add(h1 * HAP_NUMBER), acc_lo[h1]);
-            vst1q_f32(out.as_mut_ptr().add(h1 * HAP_NUMBER + 4), acc_hi[h1]);
+            let alpha_val = *alpha.get_unchecked(base + h1) * fact1 + fact2[h1];
+            let a = vdupq_n_f32(alpha_val);
+            // Separate mul+add, NOT FMA (different rounding)
+            acc_lo[h1] = vaddq_f32(acc_lo[h1], vmulq_f32(a, beta_lo));
+            acc_hi[h1] = vaddq_f32(acc_hi[h1], vmulq_f32(a, beta_hi));
         }
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        for k in 0..n_cond {
-            let base = k * HAP_NUMBER;
-            for h1 in 0..HAP_NUMBER {
-                let alpha_val = alpha[base + h1] * fact1 + fact2[h1];
-                for h2 in 0..HAP_NUMBER {
-                    out[h1 * HAP_NUMBER + h2] += alpha_val * beta[base + h2];
-                }
+    for h1 in 0..HAP_NUMBER {
+        vst1q_f32(out.as_mut_ptr().add(h1 * HAP_NUMBER), acc_lo[h1]);
+        vst1q_f32(out.as_mut_ptr().add(h1 * HAP_NUMBER + 4), acc_hi[h1]);
+    }
+    out
+}}
+
+/// [`trans_hap_accumulate`], portable scalar.
+#[inline(always)]
+fn trans_hap_scalar(alpha: &[f32], beta: &[f32], n_cond: usize,
+                    fact2: &[f32; HAP_NUMBER], fact1: f32) -> [f32; HAP_NUMBER * HAP_NUMBER] {
+    let mut out = [0.0f32; HAP_NUMBER * HAP_NUMBER];
+    for k in 0..n_cond {
+        let base = k * HAP_NUMBER;
+        for h1 in 0..HAP_NUMBER {
+            let alpha_val = alpha[base + h1] * fact1 + fact2[h1];
+            for h2 in 0..HAP_NUMBER {
+                out[h1 * HAP_NUMBER + h2] += alpha_val * beta[base + h2];
             }
         }
     }
@@ -328,6 +420,9 @@ pub struct SegmentHmm {
     pub prob_sum_t: f32,
     /// Number of conditioning haplotypes
     pub n_cond: usize,
+    /// Kernel path a test pins on this instance; production reads [`seg_path`].
+    #[cfg(test)]
+    pub(crate) path: SegPath,
 
     // Saved Alpha arrays per segment (for transition prob computation)
     pub alpha_store: Vec<Vec<f32>>,       // per-segment: full prob[k*HAP+h] snapshot
@@ -354,6 +449,8 @@ impl SegmentHmm {
             prob_sum_k: vec![0.0; n_cond],
             prob_sum_t: 0.0,
             n_cond,
+            #[cfg(test)]
+            path: seg_path(),
             alpha_store: Vec::new(),
             alpha_sum_store: Vec::new(),
             alpha_sum_sum_store: Vec::new(),
@@ -362,6 +459,16 @@ impl SegmentHmm {
             h_probs: [0.0; HAP_NUMBER * HAP_NUMBER],
             sum_h_probs: 0.0,
         }
+    }
+
+    /// The kernel path: the process-wide cached choice ([`seg_path`]), or the one
+    /// a test pinned on this instance.
+    #[inline(always)]
+    fn path(&self) -> SegPath {
+        #[cfg(test)]
+        { self.path }
+        #[cfg(not(test))]
+        { seg_path() }
     }
 
     /// Resize for a new conditioning set size, reusing existing allocation when possible.
@@ -403,77 +510,88 @@ impl SegmentHmm {
     // -----------------------------------------------------------------------
 
     /// Run at a missing site: transition only, uniform emission.
-    /// AVX2 intrinsics.
     fn run_mis(&mut self, nt: f32, yt: f32) {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            let _nt = _mm256_set1_ps(divss(nt, self.prob_sum_t));
-            let _factor = _mm256_set1_ps(divss(yt, self.n_cond as f32 * self.prob_sum_t));
-            let mut _tfreq = _mm256_loadu_ps(self.prob_sum_h.as_ptr());
-            _tfreq = _mm256_mul_ps(_tfreq, _factor);
-            let mut _sum = _mm256_setzero_ps();
-
-            let prob = &mut self.prob;
-            for k in 0..self.n_cond {
-                let base = k * HAP_NUMBER;
-                let mut _prob = _mm256_load_ps(prob[base..].as_ptr());
-                _prob = _mm256_fmadd_ps(_prob, _nt, _tfreq);
-                _sum = _mm256_add_ps(_sum, _prob);
-                _mm256_store_ps(prob[base..].as_mut_ptr(), _prob);
-            }
-
-            _mm256_storeu_ps(self.prob_sum_h.as_mut_ptr(), _sum);
-            self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
-                            + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
+        match self.path() {
+            #[cfg(target_arch = "x86_64")]
+            SegPath::Avx512 | SegPath::Avx2 => unsafe { self.run_mis_avx2(nt, yt) },
+            #[cfg(target_arch = "aarch64")]
+            SegPath::Neon => unsafe { self.run_mis_neon(nt, yt) },
+            SegPath::Scalar => self.run_mis_scalar(nt, yt),
         }
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            let _nt = vdupq_n_f32(divss(nt, self.prob_sum_t));
-            let _factor = vdupq_n_f32(divss(yt, self.n_cond as f32 * self.prob_sum_t));
-            let mut _tfreq_lo = vld1q_f32(self.prob_sum_h.as_ptr());
-            let mut _tfreq_hi = vld1q_f32(self.prob_sum_h.as_ptr().add(4));
-            _tfreq_lo = vmulq_f32(_tfreq_lo, _factor);
-            _tfreq_hi = vmulq_f32(_tfreq_hi, _factor);
-            let mut _sum_lo = vdupq_n_f32(0.0);
-            let mut _sum_hi = vdupq_n_f32(0.0);
+    }
 
-            let prob = &mut self.prob;
-            for k in 0..self.n_cond {
-                let base = k * HAP_NUMBER;
-                let ptr = prob[base..].as_mut_ptr();
-                let mut _prob_lo = vld1q_f32(ptr);
-                let mut _prob_hi = vld1q_f32(ptr.add(4));
-                _prob_lo = vfmaq_f32(_tfreq_lo, _prob_lo, _nt);
-                _prob_hi = vfmaq_f32(_tfreq_hi, _prob_hi, _nt);
-                _sum_lo = vaddq_f32(_sum_lo, _prob_lo);
-                _sum_hi = vaddq_f32(_sum_hi, _prob_hi);
-                vst1q_f32(ptr, _prob_lo);
-                vst1q_f32(ptr.add(4), _prob_hi);
-            }
+    /// [`Self::run_mis`], AVX2 intrinsics (x86-64-v3 baseline).
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn run_mis_avx2(&mut self, nt: f32, yt: f32) { unsafe {
+        let _nt = _mm256_set1_ps(divss(nt, self.prob_sum_t));
+        let _factor = _mm256_set1_ps(divss(yt, self.n_cond as f32 * self.prob_sum_t));
+        let mut _tfreq = _mm256_loadu_ps(self.prob_sum_h.as_ptr());
+        _tfreq = _mm256_mul_ps(_tfreq, _factor);
+        let mut _sum = _mm256_setzero_ps();
 
-            vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
-            vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
-            self.prob_sum_t = neon_hsum8(_sum_lo, _sum_hi);
+        let prob = &mut self.prob;
+        for k in 0..self.n_cond {
+            let base = k * HAP_NUMBER;
+            let mut _prob = _mm256_load_ps(prob[base..].as_ptr());
+            _prob = _mm256_fmadd_ps(_prob, _nt, _tfreq);
+            _sum = _mm256_add_ps(_sum, _prob);
+            _mm256_store_ps(prob[base..].as_mut_ptr(), _prob);
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
-            let nt_div = divss(nt, self.prob_sum_t);
-            let factor = divss(yt, self.n_cond as f32 * self.prob_sum_t);
-            let mut tfreq = [0.0f32; HAP_NUMBER];
-            for h in 0..HAP_NUMBER { tfreq[h] = self.prob_sum_h[h] * factor; }
-            let mut sum = [0.0f32; HAP_NUMBER];
-            for k in 0..self.n_cond {
-                let base = k * HAP_NUMBER;
-                for h in 0..HAP_NUMBER {
-                    let p = self.prob[base + h] * nt_div + tfreq[h];
-                    self.prob[base + h] = p;
-                    sum[h] += p;
-                }
+
+        _mm256_storeu_ps(self.prob_sum_h.as_mut_ptr(), _sum);
+        self.prob_sum_t = sum8_seq(&self.prob_sum_h);
+    }}
+
+    /// [`Self::run_mis`], NEON.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn run_mis_neon(&mut self, nt: f32, yt: f32) { unsafe {
+        let _nt = vdupq_n_f32(divss(nt, self.prob_sum_t));
+        let _factor = vdupq_n_f32(divss(yt, self.n_cond as f32 * self.prob_sum_t));
+        let mut _tfreq_lo = vld1q_f32(self.prob_sum_h.as_ptr());
+        let mut _tfreq_hi = vld1q_f32(self.prob_sum_h.as_ptr().add(4));
+        _tfreq_lo = vmulq_f32(_tfreq_lo, _factor);
+        _tfreq_hi = vmulq_f32(_tfreq_hi, _factor);
+        let mut _sum_lo = vdupq_n_f32(0.0);
+        let mut _sum_hi = vdupq_n_f32(0.0);
+
+        let prob = &mut self.prob;
+        for k in 0..self.n_cond {
+            let base = k * HAP_NUMBER;
+            let ptr = prob[base..].as_mut_ptr();
+            let mut _prob_lo = vld1q_f32(ptr);
+            let mut _prob_hi = vld1q_f32(ptr.add(4));
+            _prob_lo = vfmaq_f32(_tfreq_lo, _prob_lo, _nt);
+            _prob_hi = vfmaq_f32(_tfreq_hi, _prob_hi, _nt);
+            _sum_lo = vaddq_f32(_sum_lo, _prob_lo);
+            _sum_hi = vaddq_f32(_sum_hi, _prob_hi);
+            vst1q_f32(ptr, _prob_lo);
+            vst1q_f32(ptr.add(4), _prob_hi);
+        }
+
+        vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
+        vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
+        self.prob_sum_t = sum8_seq(&self.prob_sum_h);
+    }}
+
+    /// [`Self::run_mis`], portable scalar.
+    fn run_mis_scalar(&mut self, nt: f32, yt: f32) {
+        let nt_div = divss(nt, self.prob_sum_t);
+        let factor = divss(yt, self.n_cond as f32 * self.prob_sum_t);
+        let mut tfreq = [0.0f32; HAP_NUMBER];
+        for h in 0..HAP_NUMBER { tfreq[h] = self.prob_sum_h[h] * factor; }
+        let mut sum = [0.0f32; HAP_NUMBER];
+        let n = self.n_cond * HAP_NUMBER;
+        for row in self.prob[..n].chunks_exact_mut(HAP_NUMBER) {
+            for h in 0..HAP_NUMBER {
+                let p = row[h].mul_add(nt_div, tfreq[h]);
+                row[h] = p;
+                sum[h] += p;
             }
-            self.prob_sum_h = sum;
-            self.prob_sum_t = sum[0] + sum[1] + sum[2] + sum[3]
-                            + sum[4] + sum[5] + sum[6] + sum[7];
         }
+        self.prob_sum_h = sum;
+        self.prob_sum_t = sum8_seq(&sum);
     }
 
     // -----------------------------------------------------------------------
@@ -494,65 +612,76 @@ impl SegmentHmm {
         }
     }
 
-    /// AVX2 COLLAPSE at missing site boundary.
+    /// COLLAPSE at missing site boundary.
     fn collapse_mis(&mut self, nt: f32, yt: f32) {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            let _tfreq = _mm256_set1_ps(divss(yt, self.n_cond as f32));
-            let _nt = _mm256_set1_ps(divss(nt, self.prob_sum_t));
-            let mut _sum = _mm256_setzero_ps();
-
-            for k in 0..self.n_cond {
-                let base = k * HAP_NUMBER;
-                let mut _prob = _mm256_set1_ps(self.prob_sum_k[k]);
-                _prob = _mm256_fmadd_ps(_prob, _nt, _tfreq);
-                _sum = _mm256_add_ps(_sum, _prob);
-                _mm256_store_ps(self.prob[base..].as_mut_ptr(), _prob);
-            }
-
-            _mm256_storeu_ps(self.prob_sum_h.as_mut_ptr(), _sum);
-            self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
-                            + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
+        match self.path() {
+            #[cfg(target_arch = "x86_64")]
+            SegPath::Avx512 | SegPath::Avx2 => unsafe { self.collapse_mis_avx2(nt, yt) },
+            #[cfg(target_arch = "aarch64")]
+            SegPath::Neon => unsafe { self.collapse_mis_neon(nt, yt) },
+            SegPath::Scalar => self.collapse_mis_scalar(nt, yt),
         }
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            let _tfreq = vdupq_n_f32(divss(yt, self.n_cond as f32));
-            let _nt = vdupq_n_f32(divss(nt, self.prob_sum_t));
-            let mut _sum_lo = vdupq_n_f32(0.0);
-            let mut _sum_hi = vdupq_n_f32(0.0);
+    }
 
-            for k in 0..self.n_cond {
-                let base = k * HAP_NUMBER;
-                let _pk = vdupq_n_f32(self.prob_sum_k[k]);
-                let _prob = vfmaq_f32(_tfreq, _pk, _nt);
-                _sum_lo = vaddq_f32(_sum_lo, _prob);
-                _sum_hi = vaddq_f32(_sum_hi, _prob);
-                let ptr = self.prob[base..].as_mut_ptr();
-                vst1q_f32(ptr, _prob);
-                vst1q_f32(ptr.add(4), _prob);
-            }
+    /// [`Self::collapse_mis`], AVX2 intrinsics.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn collapse_mis_avx2(&mut self, nt: f32, yt: f32) { unsafe {
+        let _tfreq = _mm256_set1_ps(divss(yt, self.n_cond as f32));
+        let _nt = _mm256_set1_ps(divss(nt, self.prob_sum_t));
+        let mut _sum = _mm256_setzero_ps();
 
-            vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
-            vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
-            self.prob_sum_t = neon_hsum8(_sum_lo, _sum_hi);
+        for k in 0..self.n_cond {
+            let base = k * HAP_NUMBER;
+            let mut _prob = _mm256_set1_ps(self.prob_sum_k[k]);
+            _prob = _mm256_fmadd_ps(_prob, _nt, _tfreq);
+            _sum = _mm256_add_ps(_sum, _prob);
+            _mm256_store_ps(self.prob[base..].as_mut_ptr(), _prob);
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
-            let tfreq_val = divss(yt, self.n_cond as f32);
-            let nt_div = divss(nt, self.prob_sum_t);
-            let mut sum = [0.0f32; HAP_NUMBER];
-            for k in 0..self.n_cond {
-                let base = k * HAP_NUMBER;
-                let p = self.prob_sum_k[k] * nt_div + tfreq_val;
-                for h in 0..HAP_NUMBER {
-                    self.prob[base + h] = p;
-                    sum[h] += p;
-                }
-            }
-            self.prob_sum_h = sum;
-            self.prob_sum_t = sum[0] + sum[1] + sum[2] + sum[3]
-                            + sum[4] + sum[5] + sum[6] + sum[7];
+
+        _mm256_storeu_ps(self.prob_sum_h.as_mut_ptr(), _sum);
+        self.prob_sum_t = sum8_seq(&self.prob_sum_h);
+    }}
+
+    /// [`Self::collapse_mis`], NEON.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn collapse_mis_neon(&mut self, nt: f32, yt: f32) { unsafe {
+        let _tfreq = vdupq_n_f32(divss(yt, self.n_cond as f32));
+        let _nt = vdupq_n_f32(divss(nt, self.prob_sum_t));
+        let mut _sum_lo = vdupq_n_f32(0.0);
+        let mut _sum_hi = vdupq_n_f32(0.0);
+
+        for k in 0..self.n_cond {
+            let base = k * HAP_NUMBER;
+            let _pk = vdupq_n_f32(self.prob_sum_k[k]);
+            let _prob = vfmaq_f32(_tfreq, _pk, _nt);
+            _sum_lo = vaddq_f32(_sum_lo, _prob);
+            _sum_hi = vaddq_f32(_sum_hi, _prob);
+            let ptr = self.prob[base..].as_mut_ptr();
+            vst1q_f32(ptr, _prob);
+            vst1q_f32(ptr.add(4), _prob);
         }
+
+        vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
+        vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
+        self.prob_sum_t = sum8_seq(&self.prob_sum_h);
+    }}
+
+    /// [`Self::collapse_mis`], portable scalar.
+    fn collapse_mis_scalar(&mut self, nt: f32, yt: f32) {
+        let tfreq_val = divss(yt, self.n_cond as f32);
+        let nt_div = divss(nt, self.prob_sum_t);
+        // One value per haplotype k: the eight lane sums are equal (one accumulator).
+        let mut sum = 0.0f32;
+        let n = self.n_cond * HAP_NUMBER;
+        for (row, &pk) in self.prob[..n].as_chunks_mut::<HAP_NUMBER>().0.iter_mut().zip(&self.prob_sum_k[..self.n_cond]) {
+            let p = pk.mul_add(nt_div, tfreq_val);
+            row.fill(p);
+            sum += p;
+        }
+        self.prob_sum_h = [sum; HAP_NUMBER];
+        self.prob_sum_t = sum8_seq(&self.prob_sum_h);
     }
 
     // -----------------------------------------------------------------------
@@ -595,33 +724,30 @@ impl SegmentHmm {
         self.prob_sum_t = self.prob_sum_h.iter().sum();
     }
 
-    /// HOM transition step. Dispatches to AVX-512 / NEON / scalar based on
-    /// runtime CPU detection (cached). Set `SELPHI_FORCE_SCALAR=1` to bypass
-    /// the SIMD path on x86_64 for parity testing.
+    /// HOM transition step. Dispatches to AVX-512 / AVX2 / NEON / scalar on
+    /// [`Self::path`] (runtime CPU detection, cached; `SELPHI_FORCE_AVX2=1` /
+    /// `SELPHI_FORCE_SCALAR=1` pick the AVX2 / scalar path for parity testing).
+    ///
+    /// Canonical arithmetic (the AVX-512 kernel): per state
+    /// `fma(prob, nt_div, prob_sum_h[h]·yt_div) · emit`; `prob_sum_h[h]` is
+    /// `even[h] + odd[h]`, where `even` sums the even conditioning haplotypes
+    /// `k` in order (the low half of the register, which also takes the odd
+    /// `n_cond`'s last `k`) and `odd` the odd ones.
     fn run_hom_bm(&mut self, target_allele: bool, bm_row: *const u64, nt: f32, yt: f32) -> bool {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if use_avx512() {
-                unsafe { self.run_hom_bm_avx512(target_allele, bm_row, nt, yt); }
-            } else {
-                unsafe { self.run_hom_bm_scalar_x86(target_allele, bm_row, nt, yt); }
-            }
-            true
+        match self.path() {
+            #[cfg(target_arch = "x86_64")]
+            SegPath::Avx512 => unsafe { self.run_hom_bm_avx512(target_allele, bm_row, nt, yt) },
+            #[cfg(target_arch = "x86_64")]
+            SegPath::Avx2 => unsafe { self.run_hom_bm_avx2(target_allele, bm_row, nt, yt) },
+            #[cfg(target_arch = "aarch64")]
+            SegPath::Neon => unsafe { self.run_hom_bm_neon(target_allele, bm_row, nt, yt) },
+            SegPath::Scalar => self.run_hom_bm_scalar(target_allele, bm_row, nt, yt),
         }
-        #[cfg(target_arch = "aarch64")]
-        {
-            unsafe { self.run_hom_bm_neon(target_allele, bm_row, nt, yt); }
-            return true;
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
-            self.run_hom_bm_scalar(target_allele, bm_row, nt, yt);
-            true
-        }
+        true
     }
 
-    /// AVX-512F+DQ implementation. Caller must verify CPU support via
-    /// `use_avx512()` before calling.
+    /// AVX-512F+DQ implementation. Caller must verify CPU support
+    /// (`seg_path() == SegPath::Avx512`) before calling.
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512f,avx512dq")]
     unsafe fn run_hom_bm_avx512(&mut self, target_allele: bool, bm_row: *const u64, nt: f32, yt: f32) { unsafe {
@@ -688,34 +814,51 @@ impl SegmentHmm {
                         + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
     }}
 
-    /// x86_64 fallback. Used when AVX-512 absent (older Intel, all AMD pre-Zen4,
-    /// or `SELPHI_FORCE_SCALAR=1`). Pure scalar — relies on the compiler's
-    /// AVX2 auto-vectorization from the v3 baseline. Bit-equivalent to the
-    /// scalar fallback on non-x86 archs.
+    /// x86_64 AVX2+FMA path: used when AVX-512 is absent (older Intel, AMD
+    /// pre-Zen4) or `SELPHI_FORCE_AVX2=1`. The AVX-512 kernel's arithmetic on
+    /// 256-bit registers: an even-`k` and an odd-`k` accumulator, the odd
+    /// `n_cond`'s last `k` on the even one, `even + odd` at the end.
     #[cfg(target_arch = "x86_64")]
-    unsafe fn run_hom_bm_scalar_x86(&mut self, target_allele: bool, bm_row: *const u64, nt: f32, yt: f32) { unsafe {
+    #[inline(always)]
+    unsafe fn run_hom_bm_avx2(&mut self, target_allele: bool, bm_row: *const u64, nt: f32, yt: f32) { unsafe {
         let nt_div = divss(nt, self.prob_sum_t);
         let yt_div = divss(yt, self.n_cond as f32 * self.prob_sum_t);
         let emit_match: [f32; 2] = if target_allele { [MISMATCH, 1.0] } else { [1.0, MISMATCH] };
-        let mut tfreq = [0.0f32; HAP_NUMBER];
-        for h in 0..HAP_NUMBER { tfreq[h] = self.prob_sum_h[h] * yt_div; }
-        let mut sum = [0.0f32; HAP_NUMBER];
-        for k in 0..self.n_cond {
-            let ah = Self::bm_bit(bm_row, k) as usize;
-            let emit = emit_match[ah];
-            let base = k * HAP_NUMBER;
-            for h in 0..HAP_NUMBER {
-                let p = (self.prob[base + h] * nt_div + tfreq[h]) * emit;
-                self.prob[base + h] = p;
-                sum[h] += p;
-            }
+        let _nt = _mm256_set1_ps(nt_div);
+        let _tfreq = _mm256_mul_ps(_mm256_loadu_ps(self.prob_sum_h.as_ptr()), _mm256_set1_ps(yt_div));
+        let mut _sum_even = _mm256_setzero_ps();
+        let mut _sum_odd = _mm256_setzero_ps();
+
+        let n_cond = self.n_cond;
+        let prob = self.prob.as_mut_ptr();
+        for kp in 0..n_cond / 2 {
+            let k0 = kp * 2;
+            let e0 = emit_match[Self::bm_bit(bm_row, k0) as usize];
+            let e1 = emit_match[Self::bm_bit(bm_row, k0 + 1) as usize];
+            let p0 = prob.add(k0 * HAP_NUMBER);
+            let p1 = p0.add(HAP_NUMBER);
+            let _prob0 = _mm256_mul_ps(_mm256_fmadd_ps(_mm256_load_ps(p0), _nt, _tfreq), _mm256_set1_ps(e0));
+            let _prob1 = _mm256_mul_ps(_mm256_fmadd_ps(_mm256_load_ps(p1), _nt, _tfreq), _mm256_set1_ps(e1));
+            _sum_even = _mm256_add_ps(_sum_even, _prob0);
+            _sum_odd = _mm256_add_ps(_sum_odd, _prob1);
+            _mm256_store_ps(p0, _prob0);
+            _mm256_store_ps(p1, _prob1);
         }
-        self.prob_sum_h = sum;
-        self.prob_sum_t = sum[0] + sum[1] + sum[2] + sum[3]
-                        + sum[4] + sum[5] + sum[6] + sum[7];
+        if n_cond & 1 != 0 {
+            let k = n_cond - 1;
+            let e = emit_match[Self::bm_bit(bm_row, k) as usize];
+            let p = prob.add(k * HAP_NUMBER);
+            let _prob = _mm256_mul_ps(_mm256_fmadd_ps(_mm256_load_ps(p), _nt, _tfreq), _mm256_set1_ps(e));
+            _sum_even = _mm256_add_ps(_sum_even, _prob);
+            _mm256_store_ps(p, _prob);
+        }
+
+        _mm256_storeu_ps(self.prob_sum_h.as_mut_ptr(), _mm256_add_ps(_sum_even, _sum_odd));
+        self.prob_sum_t = sum8_seq(&self.prob_sum_h);
     }}
 
-    /// aarch64 NEON implementation.
+    /// aarch64 NEON implementation: even-`k` and odd-`k` accumulators (two
+    /// float32x4 each), as the AVX-512 kernel.
     #[cfg(target_arch = "aarch64")]
     #[target_feature(enable = "neon")]
     unsafe fn run_hom_bm_neon(&mut self, target_allele: bool, bm_row: *const u64, nt: f32, yt: f32) { unsafe {
@@ -724,25 +867,174 @@ impl SegmentHmm {
         let emit_match: [f32; 2] = if target_allele { [MISMATCH, 1.0] } else { [1.0, MISMATCH] };
         let _nt = vdupq_n_f32(nt_div);
         let _factor = vdupq_n_f32(yt_div);
+        let _tfreq_lo = vmulq_f32(vld1q_f32(self.prob_sum_h.as_ptr()), _factor);
+        let _tfreq_hi = vmulq_f32(vld1q_f32(self.prob_sum_h.as_ptr().add(4)), _factor);
+        // Even-k / odd-k accumulators, low and high four haplotype states.
+        let mut _even_lo = vdupq_n_f32(0.0);
+        let mut _even_hi = vdupq_n_f32(0.0);
+        let mut _odd_lo = vdupq_n_f32(0.0);
+        let mut _odd_hi = vdupq_n_f32(0.0);
+
+        // One conditioning haplotype: update its 8 states in place, return them.
+        let step = |ptr: *mut f32, k: usize| -> (float32x4_t, float32x4_t) {
+            let _emit = vdupq_n_f32(emit_match[Self::bm_bit(bm_row, k) as usize]);
+            let _prob_lo = vmulq_f32(vfmaq_f32(_tfreq_lo, vld1q_f32(ptr), _nt), _emit);
+            let _prob_hi = vmulq_f32(vfmaq_f32(_tfreq_hi, vld1q_f32(ptr.add(4)), _nt), _emit);
+            vst1q_f32(ptr, _prob_lo);
+            vst1q_f32(ptr.add(4), _prob_hi);
+            (_prob_lo, _prob_hi)
+        };
+        let n_cond = self.n_cond;
+        let prob = self.prob.as_mut_ptr();
+        for kp in 0..n_cond / 2 {
+            let k0 = kp * 2;
+            let (lo0, hi0) = step(prob.add(k0 * HAP_NUMBER), k0);
+            let (lo1, hi1) = step(prob.add((k0 + 1) * HAP_NUMBER), k0 + 1);
+            _even_lo = vaddq_f32(_even_lo, lo0);
+            _even_hi = vaddq_f32(_even_hi, hi0);
+            _odd_lo = vaddq_f32(_odd_lo, lo1);
+            _odd_hi = vaddq_f32(_odd_hi, hi1);
+        }
+        if n_cond & 1 != 0 {
+            let (lo, hi) = step(prob.add((n_cond - 1) * HAP_NUMBER), n_cond - 1);
+            _even_lo = vaddq_f32(_even_lo, lo);
+            _even_hi = vaddq_f32(_even_hi, hi);
+        }
+
+        vst1q_f32(self.prob_sum_h.as_mut_ptr(), vaddq_f32(_even_lo, _odd_lo));
+        vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), vaddq_f32(_even_hi, _odd_hi));
+        self.prob_sum_t = sum8_seq(&self.prob_sum_h);
+    }}
+
+    /// Portable scalar implementation (any architecture; `SELPHI_FORCE_SCALAR=1`).
+    /// `f32::mul_add` is the correctly rounded fused multiply-add the SIMD
+    /// kernels use; even/odd `k` accumulators as the AVX-512 kernel.
+    fn run_hom_bm_scalar(&mut self, target_allele: bool, bm_row: *const u64, nt: f32, yt: f32) {
+        let nt_div = divss(nt, self.prob_sum_t);
+        let yt_div = divss(yt, self.n_cond as f32 * self.prob_sum_t);
+        let emit_match: [f32; 2] = if target_allele { [MISMATCH, 1.0] } else { [1.0, MISMATCH] };
+        let mut tfreq = [0.0f32; HAP_NUMBER];
+        for h in 0..HAP_NUMBER { tfreq[h] = self.prob_sum_h[h] * yt_div; }
+        let mut sum_even = [0.0f32; HAP_NUMBER];
+        let mut sum_odd = [0.0f32; HAP_NUMBER];
+        let n_cond = self.n_cond;
+        let n_pair_states = n_cond / 2 * 2 * HAP_NUMBER;
+        let (pairs, tail) = self.prob[..n_cond * HAP_NUMBER].split_at_mut(n_pair_states);
+        for (kp, pair) in pairs.chunks_exact_mut(2 * HAP_NUMBER).enumerate() {
+            // SAFETY: `bm_row` holds a bit for every conditioning haplotype.
+            let e0 = emit_match[unsafe { Self::bm_bit(bm_row, 2 * kp) } as usize];
+            let e1 = emit_match[unsafe { Self::bm_bit(bm_row, 2 * kp + 1) } as usize];
+            for h in 0..HAP_NUMBER {
+                let p = pair[h].mul_add(nt_div, tfreq[h]) * e0;
+                pair[h] = p;
+                sum_even[h] += p;
+            }
+            for h in 0..HAP_NUMBER {
+                let p = pair[HAP_NUMBER + h].mul_add(nt_div, tfreq[h]) * e1;
+                pair[HAP_NUMBER + h] = p;
+                sum_odd[h] += p;
+            }
+        }
+        if n_cond & 1 != 0 {
+            // SAFETY: as above.
+            let e = emit_match[unsafe { Self::bm_bit(bm_row, n_cond - 1) } as usize];
+            for h in 0..HAP_NUMBER {
+                let p = tail[h].mul_add(nt_div, tfreq[h]) * e;
+                tail[h] = p;
+                sum_even[h] += p;
+            }
+        }
+        let mut sum = [0.0f32; HAP_NUMBER];
+        for h in 0..HAP_NUMBER { sum[h] = sum_even[h] + sum_odd[h]; }
+        self.prob_sum_h = sum;
+        self.prob_sum_t = sum8_seq(&sum);
+    }
+
+    /// Emission vectors of an ambiguous (het / scaffold) site: `g0[h]` when the
+    /// conditioning haplotype carries the REF allele, `g1[h]` when ALT.
+    #[inline(always)]
+    fn amb_emissions(amb_code: u8) -> ([f32; HAP_NUMBER], [f32; HAP_NUMBER]) {
+        let mut g0 = [0.0f32; HAP_NUMBER];
+        let mut g1 = [0.0f32; HAP_NUMBER];
+        for h in 0..HAP_NUMBER {
+            if hap_get(amb_code, h) {
+                g0[h] = MISMATCH; g1[h] = 1.0;
+            } else {
+                g0[h] = 1.0; g1[h] = MISMATCH;
+            }
+        }
+        (g0, g1)
+    }
+
+    fn run_amb_bm(&mut self, amb_code: u8, bm_row: *const u64, nt: f32, yt: f32) {
+        let (g0, g1) = Self::amb_emissions(amb_code);
+        match self.path() {
+            #[cfg(target_arch = "x86_64")]
+            SegPath::Avx512 | SegPath::Avx2 => unsafe { self.run_amb_bm_avx2(&g0, &g1, bm_row, nt, yt) },
+            #[cfg(target_arch = "aarch64")]
+            SegPath::Neon => unsafe { self.run_amb_bm_neon(&g0, &g1, bm_row, nt, yt) },
+            SegPath::Scalar => self.run_amb_bm_scalar(&g0, &g1, bm_row, nt, yt),
+        }
+    }
+
+    /// [`Self::run_amb_bm`], AVX2 intrinsics.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn run_amb_bm_avx2(&mut self, g0: &[f32; HAP_NUMBER], g1: &[f32; HAP_NUMBER],
+                              bm_row: *const u64, nt: f32, yt: f32) { unsafe {
+        let _nt = _mm256_set1_ps(divss(nt, self.prob_sum_t));
+        let _factor = _mm256_set1_ps(divss(yt, self.n_cond as f32 * self.prob_sum_t));
+        let mut _tfreq = _mm256_loadu_ps(self.prob_sum_h.as_ptr());
+        _tfreq = _mm256_mul_ps(_tfreq, _factor);
+        // Branchless emission: _emit[ah] pattern
+        let _emit = [_mm256_loadu_ps(g0.as_ptr()), _mm256_loadu_ps(g1.as_ptr())];
+        let mut _sum = _mm256_setzero_ps();
+
+        let prob = &mut self.prob;
+        for k in 0..self.n_cond {
+            let ah = Self::bm_bit(bm_row, k) as usize;
+            let base = k * HAP_NUMBER;
+            let mut _prob = _mm256_load_ps(prob[base..].as_ptr());
+            _prob = _mm256_fmadd_ps(_prob, _nt, _tfreq);
+            _prob = _mm256_mul_ps(_prob, _emit[ah]);
+            _sum = _mm256_add_ps(_sum, _prob);
+            _mm256_store_ps(prob[base..].as_mut_ptr(), _prob);
+        }
+
+        _mm256_storeu_ps(self.prob_sum_h.as_mut_ptr(), _sum);
+        self.prob_sum_t = sum8_seq(&self.prob_sum_h);
+    }}
+
+    /// [`Self::run_amb_bm`], NEON.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn run_amb_bm_neon(&mut self, g0: &[f32; HAP_NUMBER], g1: &[f32; HAP_NUMBER],
+                              bm_row: *const u64, nt: f32, yt: f32) { unsafe {
+        let _nt = vdupq_n_f32(divss(nt, self.prob_sum_t));
+        let _factor = vdupq_n_f32(divss(yt, self.n_cond as f32 * self.prob_sum_t));
         let mut _tfreq_lo = vld1q_f32(self.prob_sum_h.as_ptr());
         let mut _tfreq_hi = vld1q_f32(self.prob_sum_h.as_ptr().add(4));
         _tfreq_lo = vmulq_f32(_tfreq_lo, _factor);
         _tfreq_hi = vmulq_f32(_tfreq_hi, _factor);
+        let _emit = [
+            (vld1q_f32(g0.as_ptr()), vld1q_f32(g0.as_ptr().add(4))),
+            (vld1q_f32(g1.as_ptr()), vld1q_f32(g1.as_ptr().add(4))),
+        ];
         let mut _sum_lo = vdupq_n_f32(0.0);
         let mut _sum_hi = vdupq_n_f32(0.0);
 
         let prob = &mut self.prob;
         for k in 0..self.n_cond {
             let ah = Self::bm_bit(bm_row, k) as usize;
-            let _emit = vdupq_n_f32(emit_match[ah]);
+            let (_g_lo, _g_hi) = _emit[ah];
             let base = k * HAP_NUMBER;
             let ptr = prob[base..].as_mut_ptr();
             let mut _prob_lo = vld1q_f32(ptr);
             let mut _prob_hi = vld1q_f32(ptr.add(4));
             _prob_lo = vfmaq_f32(_tfreq_lo, _prob_lo, _nt);
             _prob_hi = vfmaq_f32(_tfreq_hi, _prob_hi, _nt);
-            _prob_lo = vmulq_f32(_prob_lo, _emit);
-            _prob_hi = vmulq_f32(_prob_hi, _emit);
+            _prob_lo = vmulq_f32(_prob_lo, _g_lo);
+            _prob_hi = vmulq_f32(_prob_hi, _g_hi);
             _sum_lo = vaddq_f32(_sum_lo, _prob_lo);
             _sum_hi = vaddq_f32(_sum_hi, _prob_hi);
             vst1q_f32(ptr, _prob_lo);
@@ -751,286 +1043,212 @@ impl SegmentHmm {
 
         vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
         vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
-        self.prob_sum_t = neon_hsum8(_sum_lo, _sum_hi);
+        self.prob_sum_t = sum8_seq(&self.prob_sum_h);
     }}
 
-    /// Portable scalar fallback (non-x86, non-aarch64 builds).
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    fn run_hom_bm_scalar(&mut self, target_allele: bool, bm_row: *const u64, nt: f32, yt: f32) {
+    /// [`Self::run_amb_bm`], portable scalar.
+    fn run_amb_bm_scalar(&mut self, g0: &[f32; HAP_NUMBER], g1: &[f32; HAP_NUMBER],
+                         bm_row: *const u64, nt: f32, yt: f32) {
         let nt_div = divss(nt, self.prob_sum_t);
-        let yt_div = divss(yt, self.n_cond as f32 * self.prob_sum_t);
-        let emit_match: [f32; 2] = if target_allele { [MISMATCH, 1.0] } else { [1.0, MISMATCH] };
+        let factor = divss(yt, self.n_cond as f32 * self.prob_sum_t);
         let mut tfreq = [0.0f32; HAP_NUMBER];
-        for h in 0..HAP_NUMBER { tfreq[h] = self.prob_sum_h[h] * yt_div; }
+        for h in 0..HAP_NUMBER { tfreq[h] = self.prob_sum_h[h] * factor; }
+        let emit = [*g0, *g1];
         let mut sum = [0.0f32; HAP_NUMBER];
-        for k in 0..self.n_cond {
-            let ah = unsafe { Self::bm_bit(bm_row, k) } as usize;
-            let emit = emit_match[ah];
-            let base = k * HAP_NUMBER;
+        let n = self.n_cond * HAP_NUMBER;
+        for (k, row) in self.prob[..n].as_chunks_mut::<HAP_NUMBER>().0.iter_mut().enumerate() {
+            // SAFETY: `bm_row` holds a bit for every conditioning haplotype.
+            let g = &emit[unsafe { Self::bm_bit(bm_row, k) } as usize];
             for h in 0..HAP_NUMBER {
-                let p = (self.prob[base + h] * nt_div + tfreq[h]) * emit;
-                self.prob[base + h] = p;
+                let p = row[h].mul_add(nt_div, tfreq[h]) * g[h];
+                row[h] = p;
                 sum[h] += p;
             }
         }
         self.prob_sum_h = sum;
-        self.prob_sum_t = sum[0] + sum[1] + sum[2] + sum[3]
-                        + sum[4] + sum[5] + sum[6] + sum[7];
-    }
-
-    fn run_amb_bm(&mut self, amb_code: u8, bm_row: *const u64, nt: f32, yt: f32) {
-        let mut g0 = [0.0f32; HAP_NUMBER];
-        let mut g1 = [0.0f32; HAP_NUMBER];
-        for h in 0..HAP_NUMBER {
-            if hap_get(amb_code, h) {
-                g0[h] = MISMATCH; g1[h] = 1.0;
-            } else {
-                g0[h] = 1.0; g1[h] = MISMATCH;
-            }
-        }
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            let _nt = _mm256_set1_ps(divss(nt, self.prob_sum_t));
-            let _factor = _mm256_set1_ps(divss(yt, self.n_cond as f32 * self.prob_sum_t));
-            let mut _tfreq = _mm256_loadu_ps(self.prob_sum_h.as_ptr());
-            _tfreq = _mm256_mul_ps(_tfreq, _factor);
-            // Branchless emission: _emit[ah] pattern
-            let _emit = [_mm256_loadu_ps(g0.as_ptr()), _mm256_loadu_ps(g1.as_ptr())];
-            let mut _sum = _mm256_setzero_ps();
-
-            let prob = &mut self.prob;
-            for k in 0..self.n_cond {
-                let ah = Self::bm_bit(bm_row, k) as usize;
-                let base = k * HAP_NUMBER;
-                let mut _prob = _mm256_load_ps(prob[base..].as_ptr());
-                _prob = _mm256_fmadd_ps(_prob, _nt, _tfreq);
-                _prob = _mm256_mul_ps(_prob, _emit[ah]);
-                _sum = _mm256_add_ps(_sum, _prob);
-                _mm256_store_ps(prob[base..].as_mut_ptr(), _prob);
-            }
-
-            _mm256_storeu_ps(self.prob_sum_h.as_mut_ptr(), _sum);
-            self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
-                            + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
-        }
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            let _nt = vdupq_n_f32(divss(nt, self.prob_sum_t));
-            let _factor = vdupq_n_f32(divss(yt, self.n_cond as f32 * self.prob_sum_t));
-            let mut _tfreq_lo = vld1q_f32(self.prob_sum_h.as_ptr());
-            let mut _tfreq_hi = vld1q_f32(self.prob_sum_h.as_ptr().add(4));
-            _tfreq_lo = vmulq_f32(_tfreq_lo, _factor);
-            _tfreq_hi = vmulq_f32(_tfreq_hi, _factor);
-            let _emit = [
-                (vld1q_f32(g0.as_ptr()), vld1q_f32(g0.as_ptr().add(4))),
-                (vld1q_f32(g1.as_ptr()), vld1q_f32(g1.as_ptr().add(4))),
-            ];
-            let mut _sum_lo = vdupq_n_f32(0.0);
-            let mut _sum_hi = vdupq_n_f32(0.0);
-
-            let prob = &mut self.prob;
-            for k in 0..self.n_cond {
-                let ah = Self::bm_bit(bm_row, k) as usize;
-                let (_g_lo, _g_hi) = _emit[ah];
-                let base = k * HAP_NUMBER;
-                let ptr = prob[base..].as_mut_ptr();
-                let mut _prob_lo = vld1q_f32(ptr);
-                let mut _prob_hi = vld1q_f32(ptr.add(4));
-                _prob_lo = vfmaq_f32(_tfreq_lo, _prob_lo, _nt);
-                _prob_hi = vfmaq_f32(_tfreq_hi, _prob_hi, _nt);
-                _prob_lo = vmulq_f32(_prob_lo, _g_lo);
-                _prob_hi = vmulq_f32(_prob_hi, _g_hi);
-                _sum_lo = vaddq_f32(_sum_lo, _prob_lo);
-                _sum_hi = vaddq_f32(_sum_hi, _prob_hi);
-                vst1q_f32(ptr, _prob_lo);
-                vst1q_f32(ptr.add(4), _prob_hi);
-            }
-
-            vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
-            vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
-            self.prob_sum_t = neon_hsum8(_sum_lo, _sum_hi);
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
-            let nt_div = divss(nt, self.prob_sum_t);
-            let factor = divss(yt, self.n_cond as f32 * self.prob_sum_t);
-            let mut tfreq = [0.0f32; HAP_NUMBER];
-            for h in 0..HAP_NUMBER { tfreq[h] = self.prob_sum_h[h] * factor; }
-            let emit = [&g0, &g1];
-            let mut sum = [0.0f32; HAP_NUMBER];
-            for k in 0..self.n_cond {
-                let ah = unsafe { Self::bm_bit(bm_row, k) } as usize;
-                let g = emit[ah];
-                let base = k * HAP_NUMBER;
-                for h in 0..HAP_NUMBER {
-                    let p = (self.prob[base + h] * nt_div + tfreq[h]) * g[h];
-                    self.prob[base + h] = p;
-                    sum[h] += p;
-                }
-            }
-            self.prob_sum_h = sum;
-            self.prob_sum_t = sum[0] + sum[1] + sum[2] + sum[3]
-                            + sum[4] + sum[5] + sum[6] + sum[7];
-        }
+        self.prob_sum_t = sum8_seq(&sum);
     }
 
     fn collapse_hom_bm(&mut self, target_allele: bool, bm_row: *const u64, nt: f32, yt: f32) {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            let _tfreq = _mm256_set1_ps(divss(yt, self.n_cond as f32));
-            let _nt = _mm256_set1_ps(divss(nt, self.prob_sum_t));
-            let _mismatch = _mm256_set1_ps(MISMATCH);
-            let _one = _mm256_set1_ps(1.0);
-            let _emit = if target_allele {
-                [_mismatch, _one]
-            } else {
-                [_one, _mismatch]
-            };
-            let mut _sum = _mm256_setzero_ps();
-
-            for k in 0..self.n_cond {
-                let ah = Self::bm_bit(bm_row, k) as usize;
-                let base = k * HAP_NUMBER;
-                let mut _prob = _mm256_set1_ps(self.prob_sum_k[k]);
-                _prob = _mm256_fmadd_ps(_prob, _nt, _tfreq);
-                _prob = _mm256_mul_ps(_prob, _emit[ah]);
-                _sum = _mm256_add_ps(_sum, _prob);
-                _mm256_store_ps(self.prob[base..].as_mut_ptr(), _prob);
-            }
-
-            _mm256_storeu_ps(self.prob_sum_h.as_mut_ptr(), _sum);
-            self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
-                            + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
-        }
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            let _tfreq = vdupq_n_f32(divss(yt, self.n_cond as f32));
-            let _nt = vdupq_n_f32(divss(nt, self.prob_sum_t));
-            let emit_match: [f32; 2] = if target_allele { [MISMATCH, 1.0] } else { [1.0, MISMATCH] };
-            let mut _sum_lo = vdupq_n_f32(0.0);
-            let mut _sum_hi = vdupq_n_f32(0.0);
-
-            for k in 0..self.n_cond {
-                let ah = Self::bm_bit(bm_row, k) as usize;
-                let _emit = vdupq_n_f32(emit_match[ah]);
-                let base = k * HAP_NUMBER;
-                let _pk = vdupq_n_f32(self.prob_sum_k[k]);
-                let _base_p = vfmaq_f32(_tfreq, _pk, _nt);
-                let _prob = vmulq_f32(_base_p, _emit);
-                _sum_lo = vaddq_f32(_sum_lo, _prob);
-                _sum_hi = vaddq_f32(_sum_hi, _prob);
-                let ptr = self.prob[base..].as_mut_ptr();
-                vst1q_f32(ptr, _prob);
-                vst1q_f32(ptr.add(4), _prob);
-            }
-
-            vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
-            vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
-            self.prob_sum_t = neon_hsum8(_sum_lo, _sum_hi);
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
-            let tfreq_val = divss(yt, self.n_cond as f32);
-            let nt_div = divss(nt, self.prob_sum_t);
-            let emit_match: [f32; 2] = if target_allele { [MISMATCH, 1.0] } else { [1.0, MISMATCH] };
-            let mut sum = [0.0f32; HAP_NUMBER];
-            for k in 0..self.n_cond {
-                let ah = unsafe { Self::bm_bit(bm_row, k) } as usize;
-                let base = k * HAP_NUMBER;
-                let p = (self.prob_sum_k[k] * nt_div + tfreq_val) * emit_match[ah];
-                for h in 0..HAP_NUMBER {
-                    self.prob[base + h] = p;
-                    sum[h] += p;
-                }
-            }
-            self.prob_sum_h = sum;
-            self.prob_sum_t = sum[0] + sum[1] + sum[2] + sum[3]
-                            + sum[4] + sum[5] + sum[6] + sum[7];
+        match self.path() {
+            #[cfg(target_arch = "x86_64")]
+            SegPath::Avx512 | SegPath::Avx2 => unsafe { self.collapse_hom_bm_avx2(target_allele, bm_row, nt, yt) },
+            #[cfg(target_arch = "aarch64")]
+            SegPath::Neon => unsafe { self.collapse_hom_bm_neon(target_allele, bm_row, nt, yt) },
+            SegPath::Scalar => self.collapse_hom_bm_scalar(target_allele, bm_row, nt, yt),
         }
     }
 
-    fn collapse_amb_bm(&mut self, amb_code: u8, bm_row: *const u64, nt: f32, yt: f32) {
-        let mut g0 = [0.0f32; HAP_NUMBER];
-        let mut g1 = [0.0f32; HAP_NUMBER];
-        for h in 0..HAP_NUMBER {
-            if hap_get(amb_code, h) {
-                g0[h] = MISMATCH; g1[h] = 1.0;
-            } else {
-                g0[h] = 1.0; g1[h] = MISMATCH;
-            }
+    /// [`Self::collapse_hom_bm`], AVX2 intrinsics.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn collapse_hom_bm_avx2(&mut self, target_allele: bool, bm_row: *const u64, nt: f32, yt: f32) { unsafe {
+        let _tfreq = _mm256_set1_ps(divss(yt, self.n_cond as f32));
+        let _nt = _mm256_set1_ps(divss(nt, self.prob_sum_t));
+        let _mismatch = _mm256_set1_ps(MISMATCH);
+        let _one = _mm256_set1_ps(1.0);
+        let _emit = if target_allele {
+            [_mismatch, _one]
+        } else {
+            [_one, _mismatch]
+        };
+        let mut _sum = _mm256_setzero_ps();
+
+        for k in 0..self.n_cond {
+            let ah = Self::bm_bit(bm_row, k) as usize;
+            let base = k * HAP_NUMBER;
+            let mut _prob = _mm256_set1_ps(self.prob_sum_k[k]);
+            _prob = _mm256_fmadd_ps(_prob, _nt, _tfreq);
+            _prob = _mm256_mul_ps(_prob, _emit[ah]);
+            _sum = _mm256_add_ps(_sum, _prob);
+            _mm256_store_ps(self.prob[base..].as_mut_ptr(), _prob);
         }
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            let _tfreq = _mm256_set1_ps(divss(yt, self.n_cond as f32));
-            let _nt = _mm256_set1_ps(divss(nt, self.prob_sum_t));
-            let _emit = [_mm256_loadu_ps(g0.as_ptr()), _mm256_loadu_ps(g1.as_ptr())];
-            let mut _sum = _mm256_setzero_ps();
 
-            for k in 0..self.n_cond {
-                let ah = Self::bm_bit(bm_row, k) as usize;
-                let base = k * HAP_NUMBER;
-                let mut _prob = _mm256_set1_ps(self.prob_sum_k[k]);
-                _prob = _mm256_fmadd_ps(_prob, _nt, _tfreq);
-                _prob = _mm256_mul_ps(_prob, _emit[ah]);
-                _sum = _mm256_add_ps(_sum, _prob);
-                _mm256_store_ps(self.prob[base..].as_mut_ptr(), _prob);
-            }
+        _mm256_storeu_ps(self.prob_sum_h.as_mut_ptr(), _sum);
+        self.prob_sum_t = sum8_seq(&self.prob_sum_h);
+    }}
 
-            _mm256_storeu_ps(self.prob_sum_h.as_mut_ptr(), _sum);
-            self.prob_sum_t = self.prob_sum_h[0] + self.prob_sum_h[1] + self.prob_sum_h[2] + self.prob_sum_h[3]
-                            + self.prob_sum_h[4] + self.prob_sum_h[5] + self.prob_sum_h[6] + self.prob_sum_h[7];
+    /// [`Self::collapse_hom_bm`], NEON.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn collapse_hom_bm_neon(&mut self, target_allele: bool, bm_row: *const u64, nt: f32, yt: f32) { unsafe {
+        let _tfreq = vdupq_n_f32(divss(yt, self.n_cond as f32));
+        let _nt = vdupq_n_f32(divss(nt, self.prob_sum_t));
+        let emit_match: [f32; 2] = if target_allele { [MISMATCH, 1.0] } else { [1.0, MISMATCH] };
+        let mut _sum_lo = vdupq_n_f32(0.0);
+        let mut _sum_hi = vdupq_n_f32(0.0);
+
+        for k in 0..self.n_cond {
+            let ah = Self::bm_bit(bm_row, k) as usize;
+            let _emit = vdupq_n_f32(emit_match[ah]);
+            let base = k * HAP_NUMBER;
+            let _pk = vdupq_n_f32(self.prob_sum_k[k]);
+            let _base_p = vfmaq_f32(_tfreq, _pk, _nt);
+            let _prob = vmulq_f32(_base_p, _emit);
+            _sum_lo = vaddq_f32(_sum_lo, _prob);
+            _sum_hi = vaddq_f32(_sum_hi, _prob);
+            let ptr = self.prob[base..].as_mut_ptr();
+            vst1q_f32(ptr, _prob);
+            vst1q_f32(ptr.add(4), _prob);
         }
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            let _tfreq = vdupq_n_f32(divss(yt, self.n_cond as f32));
-            let _nt = vdupq_n_f32(divss(nt, self.prob_sum_t));
-            let _emit = [
-                (vld1q_f32(g0.as_ptr()), vld1q_f32(g0.as_ptr().add(4))),
-                (vld1q_f32(g1.as_ptr()), vld1q_f32(g1.as_ptr().add(4))),
-            ];
-            let mut _sum_lo = vdupq_n_f32(0.0);
-            let mut _sum_hi = vdupq_n_f32(0.0);
 
-            for k in 0..self.n_cond {
-                let ah = Self::bm_bit(bm_row, k) as usize;
-                let (_g_lo, _g_hi) = _emit[ah];
-                let base = k * HAP_NUMBER;
-                let _pk = vdupq_n_f32(self.prob_sum_k[k]);
-                let _base_p = vfmaq_f32(_tfreq, _pk, _nt);
-                let _prob_lo = vmulq_f32(_base_p, _g_lo);
-                let _prob_hi = vmulq_f32(_base_p, _g_hi);
-                _sum_lo = vaddq_f32(_sum_lo, _prob_lo);
-                _sum_hi = vaddq_f32(_sum_hi, _prob_hi);
-                let ptr = self.prob[base..].as_mut_ptr();
-                vst1q_f32(ptr, _prob_lo);
-                vst1q_f32(ptr.add(4), _prob_hi);
-            }
+        vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
+        vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
+        self.prob_sum_t = sum8_seq(&self.prob_sum_h);
+    }}
 
-            vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
-            vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
-            self.prob_sum_t = neon_hsum8(_sum_lo, _sum_hi);
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    /// [`Self::collapse_hom_bm`], portable scalar.
+    fn collapse_hom_bm_scalar(&mut self, target_allele: bool, bm_row: *const u64, nt: f32, yt: f32) {
+        let tfreq_val = divss(yt, self.n_cond as f32);
+        let nt_div = divss(nt, self.prob_sum_t);
+        let emit_match: [f32; 2] = if target_allele { [MISMATCH, 1.0] } else { [1.0, MISMATCH] };
+        // Every state of haplotype k gets the same value, so the eight lane
+        // sums see the same additions in the same order: one accumulator.
+        let mut sum = 0.0f32;
+        let n = self.n_cond * HAP_NUMBER;
+        for (k, (row, &pk)) in self.prob[..n].as_chunks_mut::<HAP_NUMBER>().0.iter_mut()
+            .zip(&self.prob_sum_k[..self.n_cond]).enumerate()
         {
-            let tfreq_val = divss(yt, self.n_cond as f32);
-            let nt_div = divss(nt, self.prob_sum_t);
-            let emit = [&g0, &g1];
-            let mut sum = [0.0f32; HAP_NUMBER];
-            for k in 0..self.n_cond {
-                let ah = unsafe { Self::bm_bit(bm_row, k) } as usize;
-                let g = emit[ah];
-                let base = k * HAP_NUMBER;
-                let base_p = self.prob_sum_k[k] * nt_div + tfreq_val;
-                for h in 0..HAP_NUMBER {
-                    let p = base_p * g[h];
-                    self.prob[base + h] = p;
-                    sum[h] += p;
-                }
-            }
-            self.prob_sum_h = sum;
-            self.prob_sum_t = sum[0] + sum[1] + sum[2] + sum[3]
-                            + sum[4] + sum[5] + sum[6] + sum[7];
+            // SAFETY: `bm_row` holds a bit for every conditioning haplotype.
+            let p = pk.mul_add(nt_div, tfreq_val) * emit_match[unsafe { Self::bm_bit(bm_row, k) } as usize];
+            row.fill(p);
+            sum += p;
         }
+        self.prob_sum_h = [sum; HAP_NUMBER];
+        self.prob_sum_t = sum8_seq(&self.prob_sum_h);
+    }
+
+    fn collapse_amb_bm(&mut self, amb_code: u8, bm_row: *const u64, nt: f32, yt: f32) {
+        let (g0, g1) = Self::amb_emissions(amb_code);
+        match self.path() {
+            #[cfg(target_arch = "x86_64")]
+            SegPath::Avx512 | SegPath::Avx2 => unsafe { self.collapse_amb_bm_avx2(&g0, &g1, bm_row, nt, yt) },
+            #[cfg(target_arch = "aarch64")]
+            SegPath::Neon => unsafe { self.collapse_amb_bm_neon(&g0, &g1, bm_row, nt, yt) },
+            SegPath::Scalar => self.collapse_amb_bm_scalar(&g0, &g1, bm_row, nt, yt),
+        }
+    }
+
+    /// [`Self::collapse_amb_bm`], AVX2 intrinsics.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn collapse_amb_bm_avx2(&mut self, g0: &[f32; HAP_NUMBER], g1: &[f32; HAP_NUMBER],
+                                   bm_row: *const u64, nt: f32, yt: f32) { unsafe {
+        let _tfreq = _mm256_set1_ps(divss(yt, self.n_cond as f32));
+        let _nt = _mm256_set1_ps(divss(nt, self.prob_sum_t));
+        let _emit = [_mm256_loadu_ps(g0.as_ptr()), _mm256_loadu_ps(g1.as_ptr())];
+        let mut _sum = _mm256_setzero_ps();
+
+        for k in 0..self.n_cond {
+            let ah = Self::bm_bit(bm_row, k) as usize;
+            let base = k * HAP_NUMBER;
+            let mut _prob = _mm256_set1_ps(self.prob_sum_k[k]);
+            _prob = _mm256_fmadd_ps(_prob, _nt, _tfreq);
+            _prob = _mm256_mul_ps(_prob, _emit[ah]);
+            _sum = _mm256_add_ps(_sum, _prob);
+            _mm256_store_ps(self.prob[base..].as_mut_ptr(), _prob);
+        }
+
+        _mm256_storeu_ps(self.prob_sum_h.as_mut_ptr(), _sum);
+        self.prob_sum_t = sum8_seq(&self.prob_sum_h);
+    }}
+
+    /// [`Self::collapse_amb_bm`], NEON.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn collapse_amb_bm_neon(&mut self, g0: &[f32; HAP_NUMBER], g1: &[f32; HAP_NUMBER],
+                                   bm_row: *const u64, nt: f32, yt: f32) { unsafe {
+        let _tfreq = vdupq_n_f32(divss(yt, self.n_cond as f32));
+        let _nt = vdupq_n_f32(divss(nt, self.prob_sum_t));
+        let _emit = [
+            (vld1q_f32(g0.as_ptr()), vld1q_f32(g0.as_ptr().add(4))),
+            (vld1q_f32(g1.as_ptr()), vld1q_f32(g1.as_ptr().add(4))),
+        ];
+        let mut _sum_lo = vdupq_n_f32(0.0);
+        let mut _sum_hi = vdupq_n_f32(0.0);
+
+        for k in 0..self.n_cond {
+            let ah = Self::bm_bit(bm_row, k) as usize;
+            let (_g_lo, _g_hi) = _emit[ah];
+            let base = k * HAP_NUMBER;
+            let _pk = vdupq_n_f32(self.prob_sum_k[k]);
+            let _base_p = vfmaq_f32(_tfreq, _pk, _nt);
+            let _prob_lo = vmulq_f32(_base_p, _g_lo);
+            let _prob_hi = vmulq_f32(_base_p, _g_hi);
+            _sum_lo = vaddq_f32(_sum_lo, _prob_lo);
+            _sum_hi = vaddq_f32(_sum_hi, _prob_hi);
+            let ptr = self.prob[base..].as_mut_ptr();
+            vst1q_f32(ptr, _prob_lo);
+            vst1q_f32(ptr.add(4), _prob_hi);
+        }
+
+        vst1q_f32(self.prob_sum_h.as_mut_ptr(), _sum_lo);
+        vst1q_f32(self.prob_sum_h.as_mut_ptr().add(4), _sum_hi);
+        self.prob_sum_t = sum8_seq(&self.prob_sum_h);
+    }}
+
+    /// [`Self::collapse_amb_bm`], portable scalar.
+    fn collapse_amb_bm_scalar(&mut self, g0: &[f32; HAP_NUMBER], g1: &[f32; HAP_NUMBER],
+                              bm_row: *const u64, nt: f32, yt: f32) {
+        let tfreq_val = divss(yt, self.n_cond as f32);
+        let nt_div = divss(nt, self.prob_sum_t);
+        let emit = [*g0, *g1];
+        let mut sum = [0.0f32; HAP_NUMBER];
+        let n = self.n_cond * HAP_NUMBER;
+        for (k, (row, &pk)) in self.prob[..n].as_chunks_mut::<HAP_NUMBER>().0.iter_mut()
+            .zip(&self.prob_sum_k[..self.n_cond]).enumerate()
+        {
+            // SAFETY: `bm_row` holds a bit for every conditioning haplotype.
+            let g = &emit[unsafe { Self::bm_bit(bm_row, k) } as usize];
+            let base_p = pk.mul_add(nt_div, tfreq_val);
+            for h in 0..HAP_NUMBER {
+                let p = base_p * g[h];
+                row[h] = p;
+                sum[h] += p;
+            }
+        }
+        self.prob_sum_h = sum;
+        self.prob_sum_t = sum8_seq(&sum);
     }
 
     // -----------------------------------------------------------------------
@@ -1489,7 +1707,7 @@ impl SegmentHmm {
 
         let fact1 = nt / alpha_sum_sum.max(1e-30);
 
-        self.h_probs = trans_hap_accumulate(alpha_full, &self.prob, n_cond, &alpha_sum,
+        self.h_probs = trans_hap_accumulate(self.path(), alpha_full, &self.prob, n_cond, &alpha_sum,
             alpha_sum_sum, fact1, yt);
         for h1 in 0..HAP_NUMBER {
             // Compute row sum first, then add to running total
@@ -1593,7 +1811,7 @@ impl SegmentHmm {
             let dist_cm = (cm_f32[locus] - cm_f32[prev_locus]).abs();
             let dist = if (dist_cm as f64) <= 1e-7 { 1e-7 } else { dist_cm as f64 };
             let exponent_f32 = (dist * (-0.04 * ne / n_haps as f64)) as f32;
-            let t = -exponent_f32.exp_m1();
+            let t = -super::detmath::expm1f(exponent_f32);
             let t = t.clamp(0.0, 1.0);
             (1.0 - t, t)
         }
@@ -1676,9 +1894,11 @@ mod trans_hap_tests {
         assert!(n_windows > 20);
     }
 
-    /// The k-outer TRANS_HAP accumulation is bit-identical to the h1-outer one.
+    /// The k-outer TRANS_HAP accumulation is bit-identical to the h1-outer one,
+    /// on every kernel path this host runs.
     #[test]
     fn trans_hap_matches_legacy() {
+        let paths = host_seg_paths();
         let mut rng = TestRng::new(17);
         for _ in 0..500 {
             let n_cond = 1 + rng.below(700);
@@ -1688,9 +1908,250 @@ mod trans_hap_tests {
             for a in asum.iter_mut() { *a = rand_f32(&mut rng); }
             let (ss, f1, yt) = (rand_f32(&mut rng), rand_f32(&mut rng), rand_f32(&mut rng));
             let old = trans_hap_accumulate_legacy(&alpha, &prob, n_cond, &asum, ss, f1, yt);
-            let new = trans_hap_accumulate(&alpha, &prob, n_cond, &asum, ss, f1, yt);
-            for i in 0..64 { assert_eq!(old[i].to_bits(), new[i].to_bits(), "entry {i}, n_cond {n_cond}"); }
+            for &path in &paths {
+                let new = trans_hap_accumulate(path, &alpha, &prob, n_cond, &asum, ss, f1, yt);
+                for i in 0..64 {
+                    assert_eq!(old[i].to_bits(), new[i].to_bits(), "entry {i}, n_cond {n_cond}, {path:?}");
+                }
+            }
         }
+    }
+}
+
+/// Every kernel path this host can run (the NEON one on aarch64, e.g. under
+/// qemu via the cross test), canonical one first.
+#[cfg(test)]
+fn host_seg_paths() -> Vec<SegPath> {
+    #[allow(unused_mut)]
+    let mut v = Vec::new();
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512dq") {
+            v.push(SegPath::Avx512);
+        } else {
+            eprintln!("no AVX-512F+DQ on this host: the AVX-512 path is not checked");
+        }
+        v.push(SegPath::Avx2);
+    }
+    #[cfg(target_arch = "aarch64")]
+    v.push(SegPath::Neon);
+    v.push(SegPath::Scalar);
+    v
+}
+
+/// Every kernel path gives the same bits: each state-update kernel on random
+/// states, and whole forward + backward passes on random genotype graphs.
+#[cfg(test)]
+mod seg_kernel_tests {
+    use super::*;
+    use crate::diploid::pbwt_neighbor::tests::TestRng;
+
+    /// Positive values over a wide dynamic range (and some zeros), so lane
+    /// order, association and fusion all show up in the low bits.
+    /// Exact operations only (no libm), so the inputs — and the golden digests
+    /// below — are the same on every architecture.
+    fn rand_pos(rng: &mut TestRng) -> f32 {
+        const P10: [f32; 12] = [1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, 1e1, 1e2, 1e3];
+        match rng.below(16) {
+            0 => 0.0,
+            1 => (rng.next() >> 40) as f32 * 1e-38,
+            _ => (1 + (rng.next() >> 40)) as f32 / (1u64 << 24) as f32 * P10[rng.below(12)],
+        }
+    }
+
+    /// FNV-1a over 32-bit words.
+    fn fnv(h: &mut u64, words: impl IntoIterator<Item = u32>) {
+        for w in words {
+            for b in w.to_le_bytes() { *h ^= b as u64; *h = h.wrapping_mul(0x0000_0100_0000_01b3); }
+        }
+    }
+    const FNV0: u64 = 0xcbf2_9ce4_8422_2325;
+
+    /// Digests of the canonical results, recorded on x86_64 AVX-512. The same
+    /// test run on aarch64 (NEON, under qemu) asserts the same numbers, i.e.
+    /// NEON == AVX-512 directly, not only NEON == scalar.
+    const GOLDEN_KERNELS: u64 = 0x3475_1dac_4849_b575;
+    const GOLDEN_WINDOWS: u64 = 0x02a1_5a3b_4f12_a500;
+
+    struct Case {
+        n_cond: usize,
+        prob: Vec<f32>,
+        sum_h: [f32; HAP_NUMBER],
+        sum_t: f32,
+        sum_k: Vec<f32>,
+        bm: Vec<u64>,
+        nt: f32,
+        yt: f32,
+        allele: bool,
+        amb: u8,
+    }
+
+    fn rand_case(rng: &mut TestRng, n_cond: usize) -> Case {
+        let mut sum_h = [0.0f32; HAP_NUMBER];
+        for s in sum_h.iter_mut() { *s = rand_pos(rng); }
+        let t = match rng.below(4) { 0 => 0.0, 1 => 1.0, _ => (rng.next() >> 40) as f32 / (1u64 << 24) as f32 };
+        let density = [0.0, 0.05, 0.5, 0.95, 1.0][rng.below(5)];
+        let bm = (0..n_cond.div_ceil(64)).map(|_| (0..64).fold(0u64, |w, b| w | ((rng.chance(density) as u64) << b))).collect();
+        Case {
+            n_cond,
+            prob: (0..n_cond * HAP_NUMBER).map(|_| rand_pos(rng)).collect(),
+            sum_h,
+            sum_t: rand_pos(rng).max(1e-20),
+            sum_k: (0..n_cond).map(|_| rand_pos(rng)).collect(),
+            bm,
+            nt: 1.0 - t,
+            yt: t,
+            allele: rng.chance(0.5),
+            amb: (rng.next() & 0xFF) as u8,
+        }
+    }
+
+    fn hmm_from(c: &Case, path: SegPath) -> SegmentHmm {
+        let mut h = SegmentHmm::new(c.n_cond);
+        h.path = path;
+        h.prob.copy_from_slice(&c.prob);
+        h.prob_sum_h = c.sum_h;
+        h.prob_sum_t = c.sum_t;
+        h.prob_sum_k.copy_from_slice(&c.sum_k);
+        h
+    }
+
+    type Snapshot = (Vec<u32>, Vec<u32>, u32);
+    fn snapshot(h: &SegmentHmm) -> Snapshot {
+        (h.prob.iter().map(|x| x.to_bits()).collect(),
+         h.prob_sum_h.iter().map(|x| x.to_bits()).collect(),
+         h.prob_sum_t.to_bits())
+    }
+
+    const KERNELS: [&str; 6] = ["run_hom_bm", "run_amb_bm", "run_mis", "collapse_hom_bm", "collapse_amb_bm", "collapse_mis"];
+
+    fn apply(h: &mut SegmentHmm, c: &Case, kernel: usize) {
+        let bm = c.bm.as_ptr();
+        match kernel {
+            0 => { h.run_hom_bm(c.allele, bm, c.nt, c.yt); }
+            1 => h.run_amb_bm(c.amb, bm, c.nt, c.yt),
+            2 => h.run_mis(c.nt, c.yt),
+            3 => h.collapse_hom_bm(c.allele, bm, c.nt, c.yt),
+            4 => h.collapse_amb_bm(c.amb, bm, c.nt, c.yt),
+            _ => h.collapse_mis(c.nt, c.yt),
+        }
+    }
+
+    /// The pre-2026-10-17 x86 fallback of `run_hom_bm` (separate multiply and
+    /// add, one sequential sum): what `SELPHI_FORCE_SCALAR=1` and non-AVX-512
+    /// hosts used to compute. Kept to show the parity test can see the
+    /// difference it guards against.
+    fn run_hom_legacy_scalar(c: &Case) -> u32 {
+        let nt_div = divss(c.nt, c.sum_t);
+        let yt_div = divss(c.yt, c.n_cond as f32 * c.sum_t);
+        let emit_match: [f32; 2] = if c.allele { [MISMATCH, 1.0] } else { [1.0, MISMATCH] };
+        let mut sum = [0.0f32; HAP_NUMBER];
+        for k in 0..c.n_cond {
+            let emit = emit_match[((c.bm[k >> 6] >> (k & 63)) & 1) as usize];
+            for h in 0..HAP_NUMBER {
+                sum[h] += (c.prob[k * HAP_NUMBER + h] * nt_div + c.sum_h[h] * yt_div) * emit;
+            }
+        }
+        sum8_seq(&sum).to_bits()
+    }
+
+    #[test]
+    fn kernels_bit_identical_across_paths() {
+        let paths = host_seg_paths();
+        let mut rng = TestRng::new(4242);
+        let mut legacy_differs = 0usize;
+        let mut digest = FNV0;
+        for case in 0..3000 {
+            let n_cond = match case % 4 {
+                0 => 1 + rng.below(8),
+                1 => 2 * (1 + rng.below(200)),
+                2 => 2 * rng.below(200) + 1,
+                _ => 1 + rng.below(700),
+            };
+            let c = rand_case(&mut rng, n_cond);
+            for (kernel, name) in KERNELS.iter().enumerate() {
+                let mut want: Option<(SegPath, Snapshot)> = None;
+                for &path in &paths {
+                    let mut h = hmm_from(&c, path);
+                    apply(&mut h, &c, kernel);
+                    let got = snapshot(&h);
+                    match &want {
+                        None => {
+                            if kernel == 0 && run_hom_legacy_scalar(&c) != got.2 { legacy_differs += 1; }
+                            fnv(&mut digest, got.0.iter().chain(&got.1).copied().chain([got.2]));
+                            want = Some((path, got));
+                        }
+                        Some((p0, w)) => assert!(got == *w,
+                            "{name}: {path:?} differs from {p0:?} (case {case}, n_cond {n_cond})"),
+                    }
+                }
+            }
+        }
+        // The old fallback arithmetic is distinguishable on these inputs.
+        assert!(legacy_differs > 100, "legacy run_hom_bm differed in only {legacy_differs} cases");
+        eprintln!("kernel digest {digest:#018x}");
+        assert_eq!(digest, GOLDEN_KERNELS, "kernel results differ from the x86_64 AVX-512 record");
+    }
+
+    /// Whole windows: forward (alpha stores, underflow flag) and backward
+    /// (transition probabilities) agree bit for bit across paths.
+    #[test]
+    fn forward_backward_bit_identical_across_paths() {
+        let paths = host_seg_paths();
+        let mut rng = TestRng::new(99);
+        let mut n_windows = 0usize;
+        let mut digest = FNV0;
+        for _case in 0..25 {
+            let n_var = 300 + rng.below(300);
+            let mut geno = vec![0u8; n_var * 2];
+            for v in 0..n_var {
+                geno[2 * v] = rng.chance(0.4) as u8;
+                geno[2 * v + 1] = rng.chance(0.4) as u8;
+                if rng.chance(0.03) { geno[2 * v] = 128; geno[2 * v + 1] = 128; }
+            }
+            let graph = build_graph(0, &geno, n_var, None);
+            if graph.n_segments < 4 { continue; }
+            let cm: Vec<f64> = (0..n_var).map(|i| i as f64 * 0.01).collect();
+            let params = super::super::params::HmmParams::new(&cm, 1000, 15000.0);
+            let n_seg = graph.n_segments;
+            let mut s = 0usize;
+            while s < n_seg - 1 {
+                let e = (s + 2 + rng.below(n_seg / 3 + 1)).min(n_seg - 1);
+                let k = [1usize, 2, 7, 8, 37, 64, 65, 200, 301][rng.below(9)];
+                let l0 = graph.segment_start(s);
+                let l1 = graph.segment_start(e) + graph.lengths[e] as usize - 1;
+                let kw = k.div_ceil(64);
+                let cond_bm: Vec<u64> = (0..(l1 - l0 + 1) * kw).map(|_| rng.next()).collect();
+                let run = |path: SegPath| {
+                    let mut hmm = SegmentHmm::new(k);
+                    hmm.path = path;
+                    hmm.resize_for(k);
+                    hmm.forward_rare_direct(&graph, &cond_bm, kw, l0, &params.trans, s, e,
+                        &params.rare_allele, &params);
+                    let uf = hmm.has_underflow();
+                    let alpha: Vec<Vec<u32>> = hmm.alpha_store.iter()
+                        .map(|a| a.iter().map(|x| x.to_bits()).collect()).collect();
+                    let (t, _) = hmm.backward_rare_direct(&graph, &cond_bm, kw, l0, &params.trans,
+                        s, e, &params.rare_allele, &params);
+                    (uf, alpha, t.iter().map(|x| x.to_bits()).collect::<Vec<u64>>())
+                };
+                let want = run(paths[0]);
+                for &path in &paths[1..] {
+                    assert!(run(path) == want, "window ({s}, {e}), k {k}: {path:?} differs from {:?}", paths[0]);
+                }
+                fnv(&mut digest, [want.0 as u32]);
+                for a in &want.1 { fnv(&mut digest, a.iter().copied()); }
+                fnv(&mut digest, want.2.iter().flat_map(|&x| [x as u32, (x >> 32) as u32]));
+                n_windows += 1;
+                s = e;
+            }
+        }
+        assert!(n_windows > 20);
+        // Cross-architecture as well: the transition probabilities pass through
+        // libm's expm1f (HmmParams), so a mismatch here on another platform
+        // with every per-path assert passing points at libm, not the kernels.
+        eprintln!("window digest {digest:#018x} over {n_windows} windows");
+        assert_eq!(digest, GOLDEN_WINDOWS, "window results differ from the x86_64 AVX-512 record");
     }
 }
 

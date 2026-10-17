@@ -8,6 +8,7 @@
 //! a single fast pass by phase_rare using the common-variant scaffold.
 
 pub mod params;
+pub mod detmath;
 pub mod cpp_rng;
 pub mod genotype_graph;
 pub mod pbwt_neighbor;

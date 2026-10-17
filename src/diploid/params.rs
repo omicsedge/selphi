@@ -67,8 +67,8 @@ impl HmmParams {
             let dist = if (dist_f32 as f64) <= 1e-7 { 1e-7 } else { dist_f32 as f64 };
             // Exponent computed in f64 (0.04 promotes), truncated to f32 for expm1f
             let exponent_f32 = (dist * coeff) as f32;
-            // -1.0f * expm1f(exponent_f32)
-            let t = -exponent_f32.exp_m1();
+            // -1.0f * expm1f(exponent_f32) — the platform-independent expm1f
+            let t = -super::detmath::expm1f(exponent_f32);
             trans.push(t.clamp(0.0, 1.0));
         }
 
@@ -114,7 +114,7 @@ impl HmmParams {
             let dist_f32 = if i + 1 < self.cm_f32.len() { self.cm_f32[i + 1] - self.cm_f32[i] } else { 0.0 };
             let dist = if (dist_f32 as f64) <= 1e-7 { 1e-7 } else { dist_f32 as f64 };
             let exponent_f32 = (dist * coeff) as f32;
-            self.trans[i] = (-exponent_f32.exp_m1()).clamp(0.0, 1.0);
+            self.trans[i] = (-super::detmath::expm1f(exponent_f32)).clamp(0.0, 1.0);
         }
     }
 }
