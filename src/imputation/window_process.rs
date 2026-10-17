@@ -76,6 +76,12 @@ pub struct ImputeWindowInputs<'a> {
     pub n_samples: usize,
     pub chip_start: usize,
     pub chip_end: usize,
+    /// Per chip site (full length), the coordinate the OUTPUT interpolates untyped
+    /// sites in: cumulative cM on the panel's floored map, or the panel variant index
+    /// under `SELPHI_INTERP_RANK=1`. A target that skips its no-calls has its weights
+    /// put back on those rows in this coordinate (`expand_weights`), so the result is
+    /// the interpolation straight across the skipped row. None: the HMM's `chip_cm`.
+    pub interp_x: Option<&'a [f64]>,
 }
 
 /// Per-stage CPU microseconds inside the per-target map, summed over all worker
@@ -200,8 +206,9 @@ pub fn impute_window(
 
     crate::selphi_debug!("  [MEM] impute_window: coded steps built ({} steps): rss={:.0} MB",
         coded.starts.len().saturating_sub(1), crate::log::rss_mb());
+    let x_w = inputs.interp_x.map(|x| &x[inputs.chip_start..inputs.chip_end]);
     let out = process_window_hmm(
-        params, inputs.ref_bm, targ_w, cm_w,
+        params, inputs.ref_bm, targ_w, cm_w, x_w,
         ne_w.as_deref(), conf_w.as_deref(), ns, &coded,
         precomputed_candidates,
         carry, inputs.chip_start, n_var_w,
@@ -315,6 +322,13 @@ fn nocall_skip() -> bool {
     *V.get_or_init(|| !crate::config::is_one("SELPHI_NOCALL_FOLLOW"))
 }
 
+/// Whether a target leaves its no-call sites out of its PBWT and HMM: the skip is on and
+/// the no-calls are known to the PBWT at all (`SELPHI_NOCALL_PBWT_FILL=1` reads the filled
+/// allele instead).
+pub(crate) fn nocall_skip_active() -> bool {
+    nocall_skip() && !crate::config::is_one("SELPHI_NOCALL_PBWT_FILL")
+}
+
 /// The window sites target `tgt` is CALLED at, when it has a no-call in the window
 /// and the skip is on; None otherwise (all sites used).
 ///
@@ -331,8 +345,28 @@ fn called_sites(ctx: &PbwtCtx, tgt: usize) -> Option<Vec<usize>> {
     if !ctx.skip { return None; }
     let ms = ctx.miss.get(tgt)?.as_deref()?;
     let sites: Vec<usize> = (0..ctx.n_var_w).filter(|&v| (ms[v / 64] >> (v % 64)) & 1 == 0).collect();
-    // Fewer than two called sites leaves nothing to match on: keep every site.
-    if sites.len() < 2 { None } else { Some(sites) }
+    // No more called sites than `match_length`: no PBWT match can span them, so every row
+    // would come out without a state, and empty weights interpolate to hom-REF at every
+    // untyped site. Such a target follows its matches through the no-calls instead (and
+    // so does one whose skipped PBWT finds no match at all: `skip_or_follow`).
+    if sites.len() <= ctx.match_length { None } else { Some(sites) }
+}
+
+/// Run a per-target PBWT over the target's called sites when it skips its no-calls, and
+/// over every site, following matches through the no-calls, when it does not -- or when
+/// the called-site PBWT found no match anywhere (a CSC without a single entry gives the
+/// HMM no state, which the output would write as hom-REF).
+fn skip_or_follow(
+    ctx: &PbwtCtx, tgt: usize, buf: Vec<u8>,
+    mut pbwt: impl FnMut(Option<&[usize]>, Vec<u8>) -> (pbwt::CscMatchMatrix, Vec<u8>),
+) -> (pbwt::CscMatchMatrix, Vec<u8>, Option<Vec<usize>>) {
+    let called = called_sites(ctx, tgt);
+    let (csc, buf) = pbwt(called.as_deref(), buf);
+    if called.is_some() && csc.indices.is_empty() {
+        let (csc, buf) = pbwt(None, buf);
+        return (csc, buf, None);
+    }
+    (csc, buf, called)
 }
 
 /// Allele rows restricted to `sites` (row `k` = the inner row of `sites[k]`).
@@ -345,12 +379,15 @@ impl pbwt::AlleleRows for SubsetRows<'_> {
 
 /// Put a target's copying weights, computed over its called `sites` only, back on all
 /// `n_var` window rows: a called row is copied; a row the target does not call is the
-/// cM-linear blend of the called rows either side (the nearest one at a window edge).
+/// blend of the called rows either side, linear in `x` (the nearest one at a window
+/// edge). `x` must be the coordinate the output interpolates in (cM on the panel's
+/// map, or variant rank), not the HMM's LD-corrected map: only then does blending
+/// compose with the output's own interpolation.
 /// Interpolating untyped sites between rows that are themselves a linear blend gives
 /// what interpolating straight across the skipped row gives, so the target's dosages
 /// are the ones a run without that site would write -- a single-sample run, which
 /// drops a site its only sample does not call.
-fn expand_weights(w: super::hmm::CsrWeights, sites: &[usize], cm: &[f64], n_var: usize)
+fn expand_weights(w: super::hmm::CsrWeights, sites: &[usize], x: &[f64], n_var: usize)
     -> super::hmm::CsrWeights
 {
     let row = |r: usize| {
@@ -375,8 +412,8 @@ fn expand_weights(w: super::hmm::CsrWeights, sites: &[usize], cm: &[f64], n_var:
             data.extend_from_slice(dv);
         } else {
             let (l, r) = (k - 1, k);
-            let span = cm[sites[r]] - cm[sites[l]];
-            let t = if span > 0.0 { ((cm[v] - cm[sites[l]]) / span).clamp(0.0, 1.0) as f32 } else { 0.5 };
+            let span = x[sites[r]] - x[sites[l]];
+            let t = if span > 0.0 { ((x[v] - x[sites[l]]) / span).clamp(0.0, 1.0) as f32 } else { 0.5 };
             pairs.clear();
             let (ix, dv) = row(l);
             pairs.extend(ix.iter().zip(dv).map(|(&i, &d)| (i, (1.0 - t) * d)));
@@ -667,14 +704,19 @@ fn full_panel_rows<'a>(ctx: &PbwtCtx<'a>, buf: Vec<u8>) -> FullRows<'a> {
 fn full_panel_csc(
     ctx: &PbwtCtx, tgt: usize, buf: Vec<u8>, keep: Option<&[u64]>,
 ) -> (pbwt::CscMatchMatrix, Vec<u8>, Option<Vec<usize>>) {
+    skip_or_follow(ctx, tgt, buf, |called, buf| full_panel_csc_over(ctx, tgt, buf, keep, called))
+}
+
+fn full_panel_csc_over(
+    ctx: &PbwtCtx, tgt: usize, buf: Vec<u8>, keep: Option<&[u64]>, called: Option<&[usize]>,
+) -> (pbwt::CscMatchMatrix, Vec<u8>) {
     let m = ctx.n_ref + ctx.n_haps;
     let mut rows = full_panel_rows(ctx, buf);
-    let called = called_sites(ctx, tgt);
     thread_local! {
         static WS_FULL: std::cell::RefCell<Option<pbwt::PbwtWorkspace>> =
             const { std::cell::RefCell::new(None) };
     }
-    let nv = called.as_ref().map_or(ctx.n_var_w, |c| c.len());
+    let nv = called.map_or(ctx.n_var_w, |c| c.len());
     let fwd = WS_FULL.with(|cell| {
         let mut ws_opt = cell.borrow_mut();
         let ws = ws_opt.get_or_insert_with(|| pbwt::PbwtWorkspace::new(m, ctx.n_ref));
@@ -684,7 +726,7 @@ fn full_panel_csc(
         // Skipping the no-calls replaces following through them.
         let miss = if called.is_some() { None } else { ctx.miss.get(tgt).and_then(|o| o.as_deref()) };
         let mut sub;
-        let rows_dyn: &mut dyn pbwt::AlleleRows = match &called {
+        let rows_dyn: &mut dyn pbwt::AlleleRows = match called {
             Some(c) => { sub = SubsetRows { inner: &mut rows, sites: c }; &mut sub }
             None => &mut rows,
         };
@@ -698,7 +740,7 @@ fn full_panel_csc(
     let bwd = pbwt::backward_filter_single(&fwd, nv, ctx.n_ref, ctx.fl_fwd, ctx.fl_bwd);
     // Over the called sites when `called` is Some (see `expand_weights`).
     let csc = pbwt::build_csc_matrix(&bwd, ctx.n_ref, nv, ctx.fl_bwd);
-    (csc, rows.buf, called)
+    (csc, rows.buf)
 }
 
 /// PBWT over this target's candidate set plus the target itself — the default
@@ -708,6 +750,12 @@ fn full_panel_csc(
 fn reduced_csc(
     ctx: &PbwtCtx, tgt: usize, candidates: &[u32], buf: Vec<u8>,
 ) -> (pbwt::CscMatchMatrix, Vec<u8>, Option<Vec<usize>>) {
+    skip_or_follow(ctx, tgt, buf, |called, buf| reduced_csc_over(ctx, tgt, candidates, buf, called))
+}
+
+fn reduced_csc_over(
+    ctx: &PbwtCtx, tgt: usize, candidates: &[u32], buf: Vec<u8>, called: Option<&[usize]>,
+) -> (pbwt::CscMatchMatrix, Vec<u8>) {
     struct GatherRows<'a> {
         bm: &'a HaplotypeBitmatrix, chip_start: usize, candidates: &'a [u32],
         targ_w: &'a [u8], n_haps: usize, tgt: usize, buf: Vec<u8>,
@@ -734,8 +782,7 @@ fn reduced_csc(
         static WS: std::cell::RefCell<Option<pbwt::PbwtWorkspace>> =
             const { std::cell::RefCell::new(None) };
     }
-    let called = called_sites(ctx, tgt);
-    let nv = called.as_ref().map_or(ctx.n_var_w, |c| c.len());
+    let nv = called.map_or(ctx.n_var_w, |c| c.len());
     let fwd = WS.with(|ws_cell| {
         let mut ws_opt = ws_cell.borrow_mut();
         let ws = ws_opt.get_or_insert_with(|| pbwt::PbwtWorkspace::new(m_red, n_cand));
@@ -743,7 +790,7 @@ fn reduced_csc(
         // Skipping the no-calls replaces following through them.
         let miss = if called.is_some() { None } else { ctx.miss.get(tgt).and_then(|o| o.as_deref()) };
         let mut sub;
-        let rows_dyn: &mut dyn pbwt::AlleleRows = match &called {
+        let rows_dyn: &mut dyn pbwt::AlleleRows = match called {
             Some(c) => { sub = SubsetRows { inner: &mut rows, sites: c }; &mut sub }
             None => &mut rows,
         };
@@ -761,7 +808,7 @@ fn reduced_csc(
         *idx = candidates[*idx as usize] as i32;
     }
     csc.n_rows = ctx.n_ref;
-    (csc, rows.buf, called)
+    (csc, rows.buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -890,6 +937,8 @@ pub fn process_window_hmm(
     ref_bm: &HaplotypeBitmatrix,
     targ_w: &[u8],
     cm_w: &[f64],
+    // The output's interpolation coordinate of each window row (ImputeWindowInputs::interp_x).
+    interp_x_w: Option<&[f64]>,
     ne_w: Option<&[f64]>,
     // R4: per-(window-site, sample) confidence, row-major [var * n_samples +
     // sample]. Each target hap `tgt` extracts sample `tgt/2`'s column and feeds
@@ -956,15 +1005,16 @@ pub fn process_window_hmm(
             match_length, fl_fwd, fl_bwd, miss: &miss, skip: nocall_skip(),
         };
         // This target's candidate reference haplotypes. With the no-call skip, a
-        // target's no-calls are left out of its step codes too (select_candidates_nocall).
+        // target's no-calls are left out of its step codes too (select_candidates_nocall),
+        // also under --precompute-candidates: the chromosome-wide set was coded on the
+        // alleles the phasing filled in at those no-calls, so it can keep only the donors
+        // that carry the filled allele.
         let cands = |tgt: usize| -> Vec<u32> {
-            if let Some(pc) = precomputed_candidates {
-                pc[tgt].clone()
-            } else if let Some(ms) = miss[tgt].as_deref().filter(|_| ctx.skip) {
-                pbwt::select_candidates_nocall(coded, n_ref + tgt, n_ref, max_candidates,
-                    ms, ref_bm, chip_start, targ_w, n_haps, tgt)
-            } else {
-                pbwt::select_candidates(coded, n_ref + tgt, n_ref, max_candidates)
+            match (miss[tgt].as_deref().filter(|_| ctx.skip), precomputed_candidates) {
+                (Some(ms), _) => pbwt::select_candidates_nocall(coded, n_ref + tgt, n_ref,
+                    max_candidates, ms, ref_bm, chip_start, targ_w, n_haps, tgt),
+                (None, Some(pc)) => pc[tgt].clone(),
+                (None, None) => pbwt::select_candidates(coded, n_ref + tgt, n_ref, max_candidates),
             }
         };
         // CSC -> copying weights. Shared by the per-target and the shared-sort
@@ -1007,8 +1057,9 @@ pub fn process_window_hmm(
                         est_ne, floor, None, n, None,
                         ne_s.as_deref(), prior, conf_hap.as_deref(), 0.0, params.compute_posterior, measure,
                     );
+                    let x = interp_x_w.unwrap_or(cm_w);
                     r.weights = r.weights.into_iter()
-                        .map(|(st, w)| (st, expand_weights(w, sites, cm_w, n_var_w))).collect();
+                        .map(|(st, w)| (st, expand_weights(w, sites, x, n_var_w))).collect();
                     r
                 }
             };
@@ -1303,6 +1354,22 @@ mod share_tests {
     fn degenerate_inputs_are_off_not_panics() {
         assert_eq!(share_batch_for_budget(116_000.0, 0.0, 16), 1);
         assert_eq!(share_batch_for_budget(116_000.0, MESA_PER_TARGET_MB, 0), 1);
+    }
+}
+
+#[cfg(test)]
+mod expand_tests {
+    use super::expand_weights;
+    use crate::imputation::hmm::CsrWeights;
+
+    #[test]
+    fn a_skipped_row_is_blended_in_the_given_coordinate() {
+        // called rows 0 and 2 (one donor each); row 1 skipped, at 0.1 of the way in x
+        let w = CsrWeights { indptr: vec![0, 1, 2], indices: vec![0, 1], data: vec![1.0, 1.0], n_rows: 2, n_cols: 2 };
+        let e = expand_weights(w, &[0, 2], &[0.0, 0.1, 1.0], 3);
+        assert_eq!(e.indptr, vec![0, 1, 3, 4]);
+        assert_eq!(e.indices, vec![0, 0, 1, 1]);
+        assert_eq!(e.data, vec![1.0, 0.9, 0.1, 1.0]);
     }
 }
 

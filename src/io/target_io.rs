@@ -279,15 +279,16 @@ const RAW_MISSING: u8 = u8::MAX;
 /// result must not depend on how a file happens to list them (a file derived from phased
 /// data keeps the true phase in that order, and the phasing would start from it).
 ///
-/// Sets `*unphased_het` when a diploid heterozygote is written with `/`: the run
-/// needs phasing exactly when some sample carries one. (The decision used to
+/// Pushes onto `unphased` the index of every sample whose diploid heterozygote is written
+/// with `/`: the run needs phasing exactly when some sample carries one at a panel site.
+/// The caller clears it per record. (The decision used to
 /// come from the first 10 GT fields of the file, so a file opening with `|`
 /// homozygotes or haploid MT/Y records skipped phasing for the whole run and
 /// wrote every unphased het in text order.)
 fn parse_gt_raw(
     gt_region: &[u8],
     n_samples: usize,
-    unphased_het: &mut bool,
+    unphased: &mut Vec<u32>,
 ) -> Vec<[u8; 2]> {
     let mut var_gts = Vec::with_capacity(n_samples);
     let mut field_start = 0;
@@ -301,7 +302,7 @@ fn parse_gt_raw(
         }
         v as u8
     };
-    for _ in 0..n_samples {
+    for s in 0..n_samples {
         let field_end = gt_region[field_start..]
             .iter()
             .position(|&b| b == b'\t')
@@ -318,7 +319,7 @@ fn parse_gt_raw(
         } else if let Some(i) = gt.iter().position(|&b| b == b'/' || b == b'|') {
             let (a0, a1) = (allele_of(&gt[..i]), allele_of(&gt[i + 1..]));
             if gt[i] == b'/' && a0 != a1 && a0 != RAW_MISSING && a1 != RAW_MISSING {
-                *unphased_het = true;
+                unphased.push(s as u32);
                 if keep_order { [a0, a1] } else { [a0.min(a1), a0.max(a1)] }
             } else {
                 [a0, a1]
@@ -367,13 +368,21 @@ fn project_any_alt(gts: &mut [[u8; 2]]) {
 /// marker per ALT allele for a multi-allelic record (split as `bcftools norm -m-`
 /// does: the genotype of marker k counts ALT k only). Projecting a `0/2` onto
 /// the first ALT used to write a typed het for an allele the person does not carry.
+///
+/// `unphased` lists the samples whose call in the record is an unphased het. A marker
+/// asks for phasing only if one of them is still heterozygous after the projection: an
+/// unphased `0/2` makes the `A>C` marker of `A>C,G` a `0/0`, which needs no phasing.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn push_target_record(
     chrom: &str, pos: i64, ref_allele: &str, alts: &[&str], mut raw: Vec<[u8; 2]>,
-    hash_alleles: bool, unphased_het: bool, markers: &mut Vec<TargetMarker>, genotypes: &mut Vec<Vec<[u8; 2]>>,
+    hash_alleles: bool, unphased: &[u32], markers: &mut Vec<TargetMarker>, genotypes: &mut Vec<Vec<[u8; 2]>>,
 ) {
     let mut push = |alt: &str, gts: Vec<[u8; 2]>| {
+        let unphased_het = unphased.iter().any(|&s| {
+            let [a, b] = gts[s as usize];
+            a != b && a != GT_MISSING && b != GT_MISSING
+        });
         let (ref_hash, alt_hash) = if hash_alleles {
             (crate::srp::blake2b_hex(ref_allele), crate::srp::blake2b_hex(alt))
         } else {
@@ -439,6 +448,7 @@ pub fn read_cohort_vcf(
     let mut markers = Vec::new();
     let mut genotypes: Vec<Vec<[u8; 2]>> = Vec::new();
     let mut unphased_het = false;
+    let mut unph: Vec<u32> = Vec::new();
     let mut sample_names: Vec<String> = Vec::new();
     let mut n_multiallelic = 0usize;
 
@@ -466,7 +476,9 @@ pub fn read_cohort_vcf(
         // loop used to carry its own second fold to hom-REF; because a cohort is
         // very often handed over as .vcf.gz, that made the panel no-call fix inert
         // on the most common input format while it worked on .bcf.
-        let mut gts = parse_gt_raw(f.gt_region, sample_names.len(), &mut unphased_het);
+        unph.clear();
+        let mut gts = parse_gt_raw(f.gt_region, sample_names.len(), &mut unph);
+        unphased_het |= !unph.is_empty();
         project_any_alt(&mut gts);
         genotypes.push(gts);
     }
@@ -511,6 +523,7 @@ pub fn read_cohort_phased_vcf_stream(
     let mut phased: Vec<u8> = Vec::new();
     let mut n_haps = 0usize;
     let mut unphased_het = false;
+    let mut unph: Vec<u32> = Vec::new();
     let mut n_multiallelic = 0usize;
     let mut line: Vec<u8> = Vec::with_capacity(1 << 16);
 
@@ -539,7 +552,9 @@ pub fn read_cohort_phased_vcf_stream(
             ref_hash: String::new(), alt_hash: String::new(), id: f.id.to_string(), unphased_het: false,
         });
         // Same GT binarisation as read_cohort_vcf; fold the missing sentinel to 0.
-        let mut gts = parse_gt_raw(f.gt_region, sample_names.len(), &mut unphased_het);
+        unph.clear();
+        let mut gts = parse_gt_raw(f.gt_region, sample_names.len(), &mut unph);
+        unphased_het |= !unph.is_empty();
         project_any_alt(&mut gts);
         phased.reserve(n_haps);
         for g in &gts {
@@ -588,6 +603,7 @@ fn read_target_bcf(
     let mut markers = Vec::new();
     let mut genotypes: Vec<Vec<[u8; 2]>> = Vec::new();
     let mut unphased_het = false;
+    let mut unph: Vec<u32> = Vec::new();
     let mut n_multiallelic = 0usize;
     // Allele index -> raw code of parse_gt_raw (missing = RAW_MISSING, clamped to 254).
     let code = |p: Option<usize>| p.map(|p| p.min(254) as u8).unwrap_or(RAW_MISSING);
@@ -606,8 +622,8 @@ fn read_target_bcf(
         let ref_allele = rec.reference_bases().to_string();
 
         let mut raw = Vec::with_capacity(sample_names.len());
-        let mut rec_unph = false;
-        for sample in rec.samples().values() {
+        unph.clear();
+        for (si, sample) in rec.samples().values().enumerate() {
             let pair = match sample.get("GT").flatten() {
                 Some(Value::Genotype(gt)) => {
                     let al = gt.as_ref();
@@ -620,7 +636,7 @@ fn read_target_bcf(
                             if a.phasing() != Phasing::Phased && a0 != a1
                                 && a0 != RAW_MISSING && a1 != RAW_MISSING {
                                 // Unphased het: allele-index order, as in parse_gt_raw.
-                                rec_unph = true;
+                                unph.push(si as u32);
                                 if unphased_input_order() { [a0, a1] } else { [a0.min(a1), a0.max(a1)] }
                             } else {
                                 [a0, a1]
@@ -632,7 +648,7 @@ fn read_target_bcf(
             };
             raw.push(pair);
         }
-        unphased_het |= rec_unph;
+        unphased_het |= !unph.is_empty();
         if capture_id {
             // Cohort (panel phasing): first ALT, REF vs any ALT, variant ID kept.
             project_any_alt(&mut raw);
@@ -643,7 +659,7 @@ fn read_target_bcf(
             });
             genotypes.push(raw);
         } else {
-            push_target_record(&chrom, pos, &ref_allele, &alts, raw, hash_alleles, rec_unph, &mut markers, &mut genotypes);
+            push_target_record(&chrom, pos, &ref_allele, &alts, raw, hash_alleles, &unph, &mut markers, &mut genotypes);
         }
     }
     if n_multiallelic > 0 {
@@ -682,6 +698,7 @@ pub fn read_target_vcf(
     let mut markers = Vec::new();
     let mut genotypes: Vec<Vec<[u8; 2]>> = Vec::new();
     let mut unphased_het = false;
+    let mut unph: Vec<u32> = Vec::new();
     let mut sample_names: Vec<String> = Vec::new();
     let mut n_multiallelic = 0usize;
 
@@ -699,15 +716,15 @@ pub fn read_target_vcf(
         }
 
         let Some(f) = split_vcf_fields(line) else { continue };
-        let mut rec_unph = false;
-        let raw_gt = parse_gt_raw(f.gt_region, sample_names.len(), &mut rec_unph);
-        unphased_het |= rec_unph;
+        unph.clear();
+        let raw_gt = parse_gt_raw(f.gt_region, sample_names.len(), &mut unph);
+        unphased_het |= !unph.is_empty();
         if f.multiallelic {
             n_multiallelic += 1;
             let alts: Vec<&str> = f.alts.split(',').collect();
-            push_target_record(f.chrom, f.pos, f.ref_allele, &alts, raw_gt, hash_alleles, rec_unph, &mut markers, &mut genotypes);
+            push_target_record(f.chrom, f.pos, f.ref_allele, &alts, raw_gt, hash_alleles, &unph, &mut markers, &mut genotypes);
         } else {
-            push_target_record(f.chrom, f.pos, f.ref_allele, &[f.alt_allele], raw_gt, hash_alleles, rec_unph, &mut markers, &mut genotypes);
+            push_target_record(f.chrom, f.pos, f.ref_allele, &[f.alt_allele], raw_gt, hash_alleles, &unph, &mut markers, &mut genotypes);
         }
     }
 
@@ -1628,6 +1645,7 @@ pub fn read_target_vcf_multi_chr(
     let mut all_markers: Vec<TargetMarker> = Vec::new();
     let mut all_genotypes: Vec<Vec<[u8; 2]>> = Vec::new();
     let mut unphased_het = false;
+    let mut unph: Vec<u32> = Vec::new();
     let mut sample_names: Vec<String> = Vec::new();
     let mut n_multiallelic = 0usize;
 
@@ -1644,15 +1662,15 @@ pub fn read_target_vcf_multi_chr(
         }
 
         let Some(f) = split_vcf_fields(line) else { continue };
-        let mut rec_unph = false;
-        let raw_gt = parse_gt_raw(f.gt_region, sample_names.len(), &mut rec_unph);
-        unphased_het |= rec_unph;
+        unph.clear();
+        let raw_gt = parse_gt_raw(f.gt_region, sample_names.len(), &mut unph);
+        unphased_het |= !unph.is_empty();
         if f.multiallelic {
             n_multiallelic += 1;
             let alts: Vec<&str> = f.alts.split(',').collect();
-            push_target_record(f.chrom, f.pos, f.ref_allele, &alts, raw_gt, false, rec_unph, &mut all_markers, &mut all_genotypes);
+            push_target_record(f.chrom, f.pos, f.ref_allele, &alts, raw_gt, false, &unph, &mut all_markers, &mut all_genotypes);
         } else {
-            push_target_record(f.chrom, f.pos, f.ref_allele, &[f.alt_allele], raw_gt, false, rec_unph, &mut all_markers, &mut all_genotypes);
+            push_target_record(f.chrom, f.pos, f.ref_allele, &[f.alt_allele], raw_gt, false, &unph, &mut all_markers, &mut all_genotypes);
         }
     }
 
@@ -1867,22 +1885,22 @@ mod allele_match_tests {
 
     #[test]
     fn gt_parsing_haploid_phase_and_split() {
-        let mut unph = false;
+        let mut unph: Vec<u32> = Vec::new();
         // haploid ALT, haploid REF, phased het, unphased hom, missing
         let raw = parse_gt_raw(b"1\t0:5\t0|1\t1/1\t./.", 5, &mut unph);
         assert_eq!(raw, vec![[1, 1], [0, 0], [0, 1], [1, 1], [RAW_MISSING, RAW_MISSING]]);
-        assert!(!unph, "no het is written with '/'");
+        assert!(unph.is_empty(), "no het is written with '/'");
         let raw = parse_gt_raw(b"1/0\t0|0", 2, &mut unph);
         assert_eq!(raw, vec![[0, 1], [0, 0]], "an unphased het is stored in allele order");
-        assert!(unph, "an unphased het asks for phasing");
+        assert_eq!(unph, vec![0], "an unphased het asks for phasing, and names its sample");
         // The listed order of an unphased het never reaches the result; a phased one keeps it.
-        let mut u = false;
+        let mut u = Vec::new();
         assert_eq!(parse_gt_raw(b"0/1\t1/0\t2/1\t1/2\t1|0\t2|1", 6, &mut u),
                    vec![[0, 1], [0, 1], [1, 2], [1, 2], [1, 0], [2, 1]]);
         // half-missing is not a het
-        let mut unph2 = false;
+        let mut unph2 = Vec::new();
         parse_gt_raw(b"./1", 1, &mut unph2);
-        assert!(!unph2);
+        assert!(unph2.is_empty());
         // multi-allelic split: 0/2 carries ALT 2 only; 1/2 one copy of each
         let raw = parse_gt_raw(b"0/2\t1|2\t2\t.", 4, &mut unph);
         let mut a1 = raw.clone(); project_alt(&mut a1, 1);
@@ -1904,11 +1922,13 @@ mod allele_match_tests {
     fn split_markers_and_confidence_rows_agree() {
         let line = b"22\t100\t.\tC\tT,G\t.\t.\t.\tGT\t0/2";
         let f = split_vcf_fields(line).unwrap();
-        let mut unph = false;
+        let mut unph = Vec::new();
         let raw = parse_gt_raw(f.gt_region, 1, &mut unph);
         let (mut m, mut g) = (Vec::new(), Vec::new());
         let alts: Vec<&str> = f.alts.split(',').collect();
-        push_target_record(f.chrom, f.pos, f.ref_allele, &alts, raw, false, unph, &mut m, &mut g);
+        push_target_record(f.chrom, f.pos, f.ref_allele, &alts, raw, false, &unph, &mut m, &mut g);
+        // the unphased 0/2 is a 0/0 on the C>T marker: only C>G asks for phasing
+        assert_eq!(m.iter().map(|x| x.unphased_het).collect::<Vec<_>>(), vec![false, true]);
         assert_eq!(m.iter().map(|x| x.alt_allele.as_str()).collect::<Vec<_>>(), vec!["T", "G"]);
         assert_eq!(g, vec![vec![[0, 0]], vec![[0, 1]]]);
         assert_eq!(n_target_markers(alts.into_iter()), m.len());
