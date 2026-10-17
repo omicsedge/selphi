@@ -213,6 +213,7 @@ fn _diploid_run(
     let n_haps = n_samples * 2;
     let n_common = common_indices.len();
     let CommonPrep { target_geno_common, cm_common, cm_full, bp_common } = prep;
+    let t_run = std::time::Instant::now();
 
     crate::selphi_debug!("  [diploid] Building genotype graphs for {} samples ({} common variants)...",
         n_samples, n_common);
@@ -255,6 +256,7 @@ fn _diploid_run(
         n_common, &target_haps_tmp, n_haps, &common_ref_bm, n_ref, None);
     drop(target_haps_tmp);
     drop(common_ref_bm);
+    crate::selphi_debug!("  [diploid] graphs + unified bitmatrix: {:.0}ms rss={:.0}MB hwm={:.0}MB", t_run.elapsed().as_secs_f64() * 1e3, crate::log::rss_mb(), crate::log::peak_mem_mb());
 
     // Intra-run phase ensemble: produce `n_members` phased scaffolds from ONE
     // phasing chain. Slot 0 is the Viterbi solve (byte-identical to the single-run
@@ -272,7 +274,12 @@ fn _diploid_run(
     } else {
         format!("5b,1p,1b,1p,1b,1p,{}m", n_main)
     };
-    let mut main_samples: Vec<Vec<(Vec<u8>, Vec<u8>)>> = Vec::new();
+    // Slots 1..n_members are thinned Main samples spread evenly over the Main
+    // iterations; only those iterations are kept (the rest were never read).
+    let n_main_iters = params::expand_scheme(&params::parse_mcmc_scheme(&scheme)).iter()
+        .filter(|st| matches!(st, params::Stage::Main)).count();
+    let keep_main = ensemble_main_iters(n_members, n_main_iters);
+    let mut main_capture = phase_common::MainCapture::new(keep_main.clone());
     // Run phase_common on COMMON variants only (bitmatrix-native)
     phase_common::run_phase_common_bm(
         &mut graphs, unified_bm, &cm_common,
@@ -281,26 +288,18 @@ fn _diploid_run(
         Some(&bp_common),
         &target_geno_common,
         max_cond_haps,
-        if n_members > 1 { Some(&mut main_samples) } else { None },
+        if n_members > 1 { Some(&mut main_capture) } else { None },
         locked_common,
     );
+    let t_scaffolds = std::time::Instant::now();
+    crate::selphi_debug!("  [diploid] through phase_common: {:.0}ms rss={:.0}MB hwm={:.0}MB", t_run.elapsed().as_secs_f64() * 1e3, crate::log::rss_mb(), crate::log::peak_mem_mb());
 
-    // No-call mask from the ORIGINAL target genotypes (the 128 sentinel) — the same
-    // for every scaffold, so compute it once. See the no-call scaffold fill below.
+    // No-calls are the ORIGINAL target genotypes carrying the missing sentinel
+    // (> 1), read straight from `target_geno` (row-major n_var x n_haps, the same
+    // layout as the scaffold), so no n_var x n_haps mask is materialised.
     let nocall_ref = crate::config::is_one("SELPHI_DIPLOID_NOCALL_REF");
     let nocall_k = crate::config::usize_or("SELPHI_HAPLOID_NOCALL_K", 50);
-    let (nocall_mask, any_nocall) = if nocall_ref {
-        (Vec::new(), false)
-    } else {
-        let mut m = vec![false; n_var * n_haps];
-        let mut any = false;
-        for v in 0..n_var {
-            for h in 0..n_haps {
-                if target_geno[v * n_haps + h] > 1 { m[v * n_haps + h] = true; any = true; }
-            }
-        }
-        (m, any)
-    };
+    let any_nocall = !nocall_ref && target_geno[..n_var * n_haps].iter().any(|&g| g > 1);
 
     // Build one full phased scaffold from a common-variant phase source:
     //   init from target genotypes → overwrite common variants with this source →
@@ -308,6 +307,10 @@ fn _diploid_run(
     //   (instead of clamping to REF, which biases the imputer's PBWT selection) →
     //   clamp any residual missing sentinel. Used identically for the solve (slot 0)
     //   and every Main sample, so the default (slot 0 only) is byte-identical.
+    // Split in two: everything up to phase_rare (serial across members, so its
+    // transient buffers are never held twice), then the no-call fill + clamp,
+    // which only reads shared inputs and the member's own scaffold and so runs
+    // for all members in parallel.
     let build_scaffold = |common_src: &[(Vec<u8>, Vec<u8>)]| -> Vec<u8> {
         let mut phased = vec![0u8; n_var * n_haps];
         for v in 0..n_var {
@@ -326,25 +329,48 @@ fn _diploid_run(
             &mut phased, full_chip_ref_bm, target_geno, &cm_full, chip_bp,
             n_var, n_samples, n_ref, 1, 15000.0, common_indices,
         );
-        if !nocall_ref && any_nocall {
-            fill_missing_local_vote(&mut phased, n_var, n_haps, full_chip_ref_bm, n_ref, &nocall_mask, nocall_k);
+        phased
+    };
+    let finish_scaffold = |phased: &mut Vec<u8>| {
+        if any_nocall {
+            fill_missing_local_vote(phased, n_var, n_haps, full_chip_ref_bm, n_ref, target_geno, nocall_k);
         }
         for g in phased.iter_mut() { if *g > 1 { *g = 0; } }
-        phased
     };
 
     // Slot 0: the Viterbi solve held in the graphs (the committed default phase).
     let final_src: Vec<(Vec<u8>, Vec<u8>)> = graphs.iter().map(|g| g.extract_haplotypes()).collect();
     let mut scaffolds: Vec<Vec<u8>> = Vec::with_capacity(n_members);
     scaffolds.push(build_scaffold(&final_src));
+    drop(final_src);
 
-    // Slots 1..n_members: thinned Main samples, spread evenly across the captured set.
-    let n_extra = (n_members - 1).min(main_samples.len());
-    for j in 0..n_extra {
-        let idx = if n_extra == 1 { main_samples.len() - 1 }
-                  else { j * (main_samples.len() - 1) / (n_extra - 1) };
-        scaffolds.push(build_scaffold(&main_samples[idx]));
+    // Slots 1..n_members: thinned Main samples, spread evenly across the Main
+    // iterations (`keep_main`, in slot order).
+    if n_members > 1 {
+        for &it in &keep_main {
+            scaffolds.push(build_scaffold(main_capture.get(it)));
+        }
     }
+    drop(main_capture);
+    // Fill the members' no-calls concurrently, but never with more scratch than
+    // the former one-member-at-a-time fill held at the same point. That fill's
+    // workspace was `a`, `alleles`, `inv` and the per-marker partition buffer
+    // (four i32 per haplotype), and alongside it the former code still held the
+    // no-call mask, every captured Main iteration and `final_src` — memory this
+    // version has already released. One fill here needs two i32 per haplotype
+    // plus the packed key and the target-only arrays.
+    let n_tot = n_haps + n_ref;
+    let fill_new = 8 * n_tot + n_tot.div_ceil(64) * 8 + 5 * n_haps;
+    let fill_old = 16 * n_tot;
+    let released = if nocall_ref { 0 } else { n_var * n_haps }
+        + if n_members > 1 { n_main_iters * n_haps * n_common } else { 0 }
+        + n_haps * n_common;
+    let fill_workers = ((fill_old + released) / fill_new.max(1)).clamp(1, scaffolds.len().max(1));
+    for group in scaffolds.chunks_mut(fill_workers) {
+        group.par_iter_mut().for_each(finish_scaffold);
+    }
+    crate::selphi_debug!("  [diploid] scaffolds (rare phasing + no-call fill): {:.0}ms rss={:.0}MB hwm={:.0}MB",
+        t_scaffolds.elapsed().as_secs_f64() * 1e3, crate::log::rss_mb(), crate::log::peak_mem_mb());
 
     // EM-estimated Ne not returned as window_ri for now (diploid uses different HMM structure)
     let window_ri = vec![];
@@ -353,6 +379,16 @@ fn _diploid_run(
         scaffolds.len(), if scaffolds.len() == 1 { "" } else { "s" });
 
     (scaffolds, window_ri)
+}
+
+/// Ordinals (among the Main iterations, 0-based) of the MCMC samples used as
+/// ensemble slots 1..n_members, in slot order: `n_members - 1` of them (at most
+/// one per Main iteration) spread evenly, the last one alone when one is asked.
+pub(crate) fn ensemble_main_iters(n_members: usize, n_main_iters: usize) -> Vec<usize> {
+    let n_extra = n_members.saturating_sub(1).min(n_main_iters);
+    (0..n_extra).map(|j| {
+        if n_extra == 1 { n_main_iters - 1 } else { j * (n_main_iters - 1) / (n_extra - 1) }
+    }).collect()
 }
 
 /// Fill no-call sites in the diploid phased scaffold with a local copying
@@ -367,6 +403,97 @@ fn _diploid_run(
 /// `phased` is `n_var * n_targ` (row-major, target haps only). Missing neighbours
 /// (other not-yet-voted no-calls) carry allele `-1` and are skipped in the tally.
 fn fill_missing_local_vote(
+    phased: &mut [u8],
+    n_var: usize,
+    n_targ: usize,
+    ref_bm: Option<&pbwt_neighbor::HaplotypeBitmatrix>,
+    n_ref: usize,
+    target_geno: &[u8],
+    k: usize,
+) {
+    let n_haps = n_targ + n_ref;
+    if n_haps == 0 { return; }
+    let nocall = |i: usize| target_geno[i] > 1;
+    let nw = n_haps.div_ceil(64);
+    let mut a: Vec<i32> = (0..n_haps as i32).collect();
+    let mut b: Vec<i32> = vec![0; n_haps];
+    // Allele bits of the previous marker (m+1), one per haplotype: what the next
+    // prefix update partitions by (a no-call, allele -1, counts as 0).
+    let mut key: Vec<u64> = vec![0; nw];
+    // Target alleles at the current marker: -1 = no-call not yet voted.
+    let mut t_al: Vec<i8> = vec![0; n_targ];
+    // Prefix position of each target haplotype (tracked at no-call markers).
+    let mut tpos: Vec<u32> = vec![0; n_targ];
+    let ref_off = n_targ >> 6;
+    let ref_sh = (n_targ & 63) as u32;
+    let mut have_prev = false;
+
+    for step in 0..n_var {
+        let m = n_var - 1 - step;
+        let row = m * n_targ;
+        let has_missing = (0..n_targ).any(|h| nocall(row + h));
+        // Advance the prefix using the PREVIOUS marker's alleles (the suffix m+1..),
+        // so `a` is now sorted by the suffix to the right of m.
+        if have_prev {
+            pbwt_neighbor::prefix_split(&key, &mut a, &mut b, &mut tpos, has_missing);
+        } else if has_missing {
+            for (h, t) in tpos.iter_mut().enumerate() { *t = h as u32; }
+        }
+        // This marker's target alleles (no-call -> -1).
+        for h in 0..n_targ {
+            t_al[h] = if nocall(row + h) { -1 } else { (phased[row + h] > 0) as i8 };
+        }
+        let ref_row: Option<&[u64]> = ref_bm.map(|rb| rb.row(m));
+        let allele = |t_al: &[i8], hp: usize| -> i32 {
+            if hp < n_targ { t_al[hp] as i32 }
+            else { ref_row.map_or(0, |r| ((r[(hp - n_targ) >> 6] >> ((hp - n_targ) & 63)) & 1) as i32) }
+        };
+        // Vote at this marker's no-calls, using the suffix-sorted prefix.
+        if has_missing {
+            for h in 0..n_targ {
+                if !nocall(row + h) { continue; }
+                let p = tpos[h] as i32;
+                let (mut n0, mut n1) = (0i32, 0i32);
+                let mut off = 1i32;
+                let nh = n_haps as i32;
+                while (n0 + n1) < k as i32 && off < nh {
+                    for q in [p - off, p + off] {
+                        if q >= 0 && q < nh {
+                            let v = allele(&t_al, a[q as usize] as usize);
+                            if v == 0 { n0 += 1; } else if v > 0 { n1 += 1; }
+                        }
+                    }
+                    off += 1;
+                }
+                let bit = if n1 > n0 { 1u8 } else { 0u8 };
+                phased[row + h] = bit;
+                t_al[h] = bit as i8; // the voted value feeds the next prefix update
+            }
+        }
+        // Key for the next step: this marker's alleles after the votes.
+        key.fill(0);
+        for h in 0..n_targ {
+            if t_al[h] > 0 { key[h >> 6] |= 1u64 << (h & 63); }
+        }
+        if let Some(r) = ref_row {
+            // reference haplotype j sits at n_targ + j; bits past n_ref land past
+            // n_haps (never read) or past the row (dropped).
+            for (w, &word) in r.iter().enumerate() {
+                if word == 0 { continue; }
+                let d = ref_off + w;
+                if d < nw { key[d] |= word << ref_sh; }
+                if ref_sh > 0 && d + 1 < nw { key[d + 1] |= word >> (64 - ref_sh); }
+            }
+        }
+        have_prev = true;
+    }
+}
+
+/// Verbatim pre-optimisation no-call fill (per-marker allele array over every
+/// haplotype, allocating two-pass prefix update, full inverse at every no-call
+/// marker), kept only as the oracle for the parity test.
+#[cfg(test)]
+fn fill_missing_local_vote_legacy(
     phased: &mut [u8],
     n_var: usize,
     n_targ: usize,
@@ -424,5 +551,86 @@ fn fill_missing_local_vote(
             }
         }
         have_prev = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diploid::pbwt_neighbor::tests::{TestRng, mosaic_panel, panel_bm};
+
+    /// The slot -> Main-iteration map equals the former selection over a capture
+    /// of every Main iteration (`main_samples.len()` = number of Main iterations).
+    #[test]
+    fn ensemble_main_iters_matches_former_selection() {
+        for n_members in 1..12usize {
+            for m in 1..12usize {
+                let n_extra = (n_members - 1).min(m);
+                let former: Vec<usize> = (0..n_extra).map(|j| {
+                    if n_extra == 1 { m - 1 } else { j * (m - 1) / (n_extra - 1) }
+                }).collect();
+                assert_eq!(ensemble_main_iters(n_members, m), former, "members {n_members}, main {m}");
+            }
+        }
+        assert!(ensemble_main_iters(2, 0).is_empty());
+    }
+
+    /// Random scaffold + no-call pattern (+ optional reference panel): the new
+    /// fill writes exactly what the legacy fill writes.
+    fn fill_case(seed: u64, n_var: usize, n_targ: usize, n_ref: usize, with_ref: bool,
+                 nocall_rate: f64, k: usize) -> usize {
+        let mut rng = TestRng::new(seed);
+        let n_tot = n_targ + n_ref;
+        // haplotype structure shared between targets and reference
+        let panel = mosaic_panel(&mut rng, n_var, n_tot.max(1));
+        let mut phased = vec![0u8; n_var * n_targ];
+        let mut target_geno = vec![0u8; n_var * n_targ];
+        let mut n_nocall = 0usize;
+        for v in 0..n_var {
+            // some markers with no no-call at all, some dense
+            let rate = if rng.chance(0.3) { 0.0 } else { nocall_rate };
+            for h in 0..n_targ {
+                let al = panel[h * n_var + v];
+                if rng.chance(rate) {
+                    target_geno[v * n_targ + h] = 128;
+                    // whatever the scaffold holds there (sentinel or an overwritten bit)
+                    phased[v * n_targ + h] = match rng.below(3) { 0 => 128, 1 => 0, _ => 1 };
+                    n_nocall += 1;
+                } else {
+                    target_geno[v * n_targ + h] = al;
+                    phased[v * n_targ + h] = al;
+                }
+            }
+        }
+        let ref_panel: Vec<u8> = (0..n_ref).flat_map(|r| {
+            panel[(n_targ + r) * n_var..(n_targ + r + 1) * n_var].to_vec()
+        }).collect();
+        let ref_bm = if n_ref > 0 { panel_bm(&ref_panel, n_var, n_ref) } else { pbwt_neighbor::HaplotypeBitmatrix::empty() };
+        let rb = if with_ref { Some(&ref_bm) } else { None };
+        let nocall_mask: Vec<bool> = target_geno.iter().map(|&g| g > 1).collect();
+        let mut old = phased.clone();
+        fill_missing_local_vote_legacy(&mut old, n_var, n_targ, rb, n_ref, &nocall_mask, k);
+        let mut new = phased.clone();
+        fill_missing_local_vote(&mut new, n_var, n_targ, rb, n_ref, &target_geno, k);
+        assert_eq!(old, new, "fill differs (seed {seed}, var {n_var}, targ {n_targ}, ref {n_ref}, with_ref {with_ref}, rate {nocall_rate}, k {k})");
+        n_nocall
+    }
+
+    #[test]
+    fn fill_missing_matches_legacy() {
+        let mut n_nocall = 0usize;
+        for seed in 0..4u64 {
+            for &(n_var, n_targ, n_ref, with_ref) in &[
+                (300usize, 2usize, 130usize, true), (200, 6, 10, true), (150, 64, 70, true),
+                (120, 70, 0, false), (100, 4, 50, false), (1, 3, 9, true), (2, 2, 1, true),
+            ] {
+                for &rate in &[0.0f64, 0.05, 0.5, 1.0] {
+                    for &k in &[1usize, 3, 50] {
+                        n_nocall += fill_case(seed, n_var, n_targ, n_ref, with_ref, rate, k);
+                    }
+                }
+            }
+        }
+        assert!(n_nocall > 0);
     }
 }

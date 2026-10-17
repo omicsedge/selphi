@@ -180,6 +180,141 @@ pub(crate) fn rare_dispatch_diag() -> bool {
 pub(crate) static DIAG_SKIP_WINDOW_HEAD: AtomicU64 = AtomicU64::new(0);
 pub(crate) static DIAG_SKIP_SEG_HEAD: AtomicU64 = AtomicU64::new(0);
 
+/// TRANS_HAP accumulation:
+/// `H[h1*8+h2] = sum_k (alpha[k*8+h1] * fact1 + fact2[h1]) * beta[k*8+h2]` with
+/// `fact2[h1] = (alpha_sum[h1] / max(alpha_sum_sum, 1e-30)) * yt / n_cond`.
+///
+/// k-outer loop order: each of the 64 accumulators receives exactly the adds the
+/// former h1-outer loop gave it, in the same k order, with the same separate
+/// multiply and add (no FMA), so every result is bit-identical — while each
+/// `beta` row is loaded once instead of eight times and the eight h1 rows
+/// accumulate as independent dependency chains instead of one after another.
+#[inline]
+fn trans_hap_accumulate(
+    alpha: &[f32], beta: &[f32], n_cond: usize,
+    alpha_sum: &[f32; HAP_NUMBER], alpha_sum_sum: f32, fact1: f32, yt: f32,
+) -> [f32; HAP_NUMBER * HAP_NUMBER] {
+    assert!(alpha.len() >= n_cond * HAP_NUMBER && beta.len() >= n_cond * HAP_NUMBER);
+    let mut fact2 = [0.0f32; HAP_NUMBER];
+    for h1 in 0..HAP_NUMBER {
+        fact2[h1] = (alpha_sum[h1] / alpha_sum_sum.max(1e-30)) * yt / n_cond as f32;
+    }
+    let mut out = [0.0f32; HAP_NUMBER * HAP_NUMBER];
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: lengths asserted above; AVX2 is in the x86-64-v3 baseline.
+    unsafe {
+        let mut acc = [_mm256_setzero_ps(); HAP_NUMBER];
+        for k in 0..n_cond {
+            let base = k * HAP_NUMBER;
+            let beta_k = _mm256_loadu_ps(beta.as_ptr().add(base));
+            for h1 in 0..HAP_NUMBER {
+                let alpha_val = *alpha.get_unchecked(base + h1) * fact1 + fact2[h1];
+                // Separate mul+add, NOT FMA (different rounding)
+                acc[h1] = _mm256_add_ps(acc[h1], _mm256_mul_ps(_mm256_set1_ps(alpha_val), beta_k));
+            }
+        }
+        for h1 in 0..HAP_NUMBER {
+            _mm256_storeu_ps(out.as_mut_ptr().add(h1 * HAP_NUMBER), acc[h1]);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: lengths asserted above; NEON is baseline on aarch64.
+    unsafe {
+        let mut acc_lo = [vdupq_n_f32(0.0); HAP_NUMBER];
+        let mut acc_hi = [vdupq_n_f32(0.0); HAP_NUMBER];
+        for k in 0..n_cond {
+            let base = k * HAP_NUMBER;
+            let beta_lo = vld1q_f32(beta.as_ptr().add(base));
+            let beta_hi = vld1q_f32(beta.as_ptr().add(base + 4));
+            for h1 in 0..HAP_NUMBER {
+                let alpha_val = *alpha.get_unchecked(base + h1) * fact1 + fact2[h1];
+                let a = vdupq_n_f32(alpha_val);
+                // Separate mul+add, NOT FMA (different rounding)
+                acc_lo[h1] = vaddq_f32(acc_lo[h1], vmulq_f32(a, beta_lo));
+                acc_hi[h1] = vaddq_f32(acc_hi[h1], vmulq_f32(a, beta_hi));
+            }
+        }
+        for h1 in 0..HAP_NUMBER {
+            vst1q_f32(out.as_mut_ptr().add(h1 * HAP_NUMBER), acc_lo[h1]);
+            vst1q_f32(out.as_mut_ptr().add(h1 * HAP_NUMBER + 4), acc_hi[h1]);
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        for k in 0..n_cond {
+            let base = k * HAP_NUMBER;
+            for h1 in 0..HAP_NUMBER {
+                let alpha_val = alpha[base + h1] * fact1 + fact2[h1];
+                for h2 in 0..HAP_NUMBER {
+                    out[h1 * HAP_NUMBER + h2] += alpha_val * beta[base + h2];
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Verbatim pre-reorder TRANS_HAP loops (h1-outer), kept as the parity oracle.
+#[cfg(test)]
+fn trans_hap_accumulate_legacy(
+    alpha_full: &[f32], prob: &[f32], n_cond: usize,
+    alpha_sum: &[f32; HAP_NUMBER], alpha_sum_sum: f32, fact1: f32, yt: f32,
+) -> [f32; HAP_NUMBER * HAP_NUMBER] {
+    let mut h_probs = [0.0f32; HAP_NUMBER * HAP_NUMBER];
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        for h1 in 0..HAP_NUMBER {
+            let fact2 = (alpha_sum[h1] / alpha_sum_sum.max(1e-30)) * yt / n_cond as f32;
+            let mut _sum = _mm256_setzero_ps();
+            for k in 0..n_cond {
+                let base = k * HAP_NUMBER;
+                let alpha_val = alpha_full[base + h1] * fact1 + fact2;
+                let _alpha = _mm256_set1_ps(alpha_val);
+                let _beta = _mm256_loadu_ps(prob[base..].as_ptr());
+                _sum = _mm256_add_ps(_sum, _mm256_mul_ps(_alpha, _beta));
+            }
+            _mm256_storeu_ps(h_probs[h1 * HAP_NUMBER..].as_mut_ptr(), _sum);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        for h1 in 0..HAP_NUMBER {
+            let fact2 = (alpha_sum[h1] / alpha_sum_sum.max(1e-30)) * yt / n_cond as f32;
+            let mut _sum_lo = vdupq_n_f32(0.0);
+            let mut _sum_hi = vdupq_n_f32(0.0);
+            for k in 0..n_cond {
+                let base = k * HAP_NUMBER;
+                let alpha_val = alpha_full[base + h1] * fact1 + fact2;
+                let _alpha = vdupq_n_f32(alpha_val);
+                let _beta_lo = vld1q_f32(prob[base..].as_ptr());
+                let _beta_hi = vld1q_f32(prob[base..].as_ptr().add(4));
+                _sum_lo = vaddq_f32(_sum_lo, vmulq_f32(_alpha, _beta_lo));
+                _sum_hi = vaddq_f32(_sum_hi, vmulq_f32(_alpha, _beta_hi));
+            }
+            vst1q_f32(h_probs[h1 * HAP_NUMBER..].as_mut_ptr(), _sum_lo);
+            vst1q_f32(h_probs[h1 * HAP_NUMBER..].as_mut_ptr().add(4), _sum_hi);
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        for h1 in 0..HAP_NUMBER {
+            let fact2 = (alpha_sum[h1] / alpha_sum_sum.max(1e-30)) * yt / n_cond as f32;
+            let mut row_sum = [0.0f32; HAP_NUMBER];
+            for k in 0..n_cond {
+                let base = k * HAP_NUMBER;
+                let alpha_val = alpha_full[base + h1] * fact1 + fact2;
+                for h2 in 0..HAP_NUMBER {
+                    row_sum[h2] += alpha_val * prob[base + h2];
+                }
+            }
+            for h2 in 0..HAP_NUMBER {
+                h_probs[h1 * HAP_NUMBER + h2] = row_sum[h2];
+            }
+        }
+    }
+    h_probs
+}
+
 /// Segment HMM state for one sample in one window.
 pub struct SegmentHmm {
     /// prob[k * HAP_NUMBER + h]: P(cond hap k, internal hap h)
@@ -995,12 +1130,17 @@ impl SegmentHmm {
         let n_cond = self.n_cond;
         let n_window_segs = seg_last - seg_first + 1;
         let prob_size = n_cond * HAP_NUMBER;
-        // Reuse alpha storage across windows (resize instead of re-allocate)
+        // Reuse alpha storage across windows (resize instead of re-allocate).
+        // Every slot 0..n_window_segs is overwritten by save_alpha below (one
+        // per segment of the window) before the backward pass reads it, so a
+        // slot that already has the right length is not zero-filled again.
         self.alpha_store.resize(n_window_segs, Vec::new());
         self.alpha_store.truncate(n_window_segs);
         for s in 0..n_window_segs {
-            self.alpha_store[s].clear();
-            self.alpha_store[s].resize(prob_size, 0.0f32);
+            if self.alpha_store[s].len() != prob_size {
+                self.alpha_store[s].clear();
+                self.alpha_store[s].resize(prob_size, 0.0f32);
+            }
         }
         self.alpha_sum_store.clear();
         self.alpha_sum_store.resize(n_window_segs, [0.0f32; HAP_NUMBER]);
@@ -1349,67 +1489,12 @@ impl SegmentHmm {
 
         let fact1 = nt / alpha_sum_sum.max(1e-30);
 
-        // AVX2 TRANS_HAP inner loop
-        self.h_probs = [0.0; HAP_NUMBER * HAP_NUMBER];
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            for h1 in 0..HAP_NUMBER {
-                let fact2 = (alpha_sum[h1] / alpha_sum_sum.max(1e-30)) * yt / n_cond as f32;
-                let mut _sum = _mm256_setzero_ps();
-                for k in 0..n_cond {
-                    let base = k * HAP_NUMBER;
-                    let alpha_val = alpha_full[base + h1] * fact1 + fact2;
-                    let _alpha = _mm256_set1_ps(alpha_val);
-                    let _beta = _mm256_loadu_ps(self.prob[base..].as_ptr());
-                    // Separate mul+add, NOT FMA (different rounding)
-                    _sum = _mm256_add_ps(_sum, _mm256_mul_ps(_alpha, _beta));
-                }
-                _mm256_storeu_ps(self.h_probs[h1 * HAP_NUMBER..].as_mut_ptr(), _sum);
-                // Compute row sum first, then add to running total
-                // (different from adding each element to running total one-by-one)
-                sum_h += self.h_probs[h1*HAP_NUMBER]+self.h_probs[h1*HAP_NUMBER+1]+self.h_probs[h1*HAP_NUMBER+2]+self.h_probs[h1*HAP_NUMBER+3]+self.h_probs[h1*HAP_NUMBER+4]+self.h_probs[h1*HAP_NUMBER+5]+self.h_probs[h1*HAP_NUMBER+6]+self.h_probs[h1*HAP_NUMBER+7];
-            }
-        }
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            for h1 in 0..HAP_NUMBER {
-                let fact2 = (alpha_sum[h1] / alpha_sum_sum.max(1e-30)) * yt / n_cond as f32;
-                let mut _sum_lo = vdupq_n_f32(0.0);
-                let mut _sum_hi = vdupq_n_f32(0.0);
-                for k in 0..n_cond {
-                    let base = k * HAP_NUMBER;
-                    let alpha_val = alpha_full[base + h1] * fact1 + fact2;
-                    let _alpha = vdupq_n_f32(alpha_val);
-                    let _beta_lo = vld1q_f32(self.prob[base..].as_ptr());
-                    let _beta_hi = vld1q_f32(self.prob[base..].as_ptr().add(4));
-                    // Separate mul+add, NOT FMA (different rounding)
-                    _sum_lo = vaddq_f32(_sum_lo, vmulq_f32(_alpha, _beta_lo));
-                    _sum_hi = vaddq_f32(_sum_hi, vmulq_f32(_alpha, _beta_hi));
-                }
-                vst1q_f32(self.h_probs[h1 * HAP_NUMBER..].as_mut_ptr(), _sum_lo);
-                vst1q_f32(self.h_probs[h1 * HAP_NUMBER..].as_mut_ptr().add(4), _sum_hi);
-                // Compute row sum first, then add to running total
-                sum_h += self.h_probs[h1*HAP_NUMBER]+self.h_probs[h1*HAP_NUMBER+1]+self.h_probs[h1*HAP_NUMBER+2]+self.h_probs[h1*HAP_NUMBER+3]+self.h_probs[h1*HAP_NUMBER+4]+self.h_probs[h1*HAP_NUMBER+5]+self.h_probs[h1*HAP_NUMBER+6]+self.h_probs[h1*HAP_NUMBER+7];
-            }
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
-            for h1 in 0..HAP_NUMBER {
-                let fact2 = (alpha_sum[h1] / alpha_sum_sum.max(1e-30)) * yt / n_cond as f32;
-                let mut row_sum = [0.0f32; HAP_NUMBER];
-                for k in 0..n_cond {
-                    let base = k * HAP_NUMBER;
-                    let alpha_val = alpha_full[base + h1] * fact1 + fact2;
-                    for h2 in 0..HAP_NUMBER {
-                        row_sum[h2] += alpha_val * self.prob[base + h2];
-                    }
-                }
-                for h2 in 0..HAP_NUMBER {
-                    self.h_probs[h1 * HAP_NUMBER + h2] = row_sum[h2];
-                }
-                sum_h += row_sum[0] + row_sum[1] + row_sum[2] + row_sum[3]
-                       + row_sum[4] + row_sum[5] + row_sum[6] + row_sum[7];
-            }
+        self.h_probs = trans_hap_accumulate(alpha_full, &self.prob, n_cond, &alpha_sum,
+            alpha_sum_sum, fact1, yt);
+        for h1 in 0..HAP_NUMBER {
+            // Compute row sum first, then add to running total
+            // (different from adding each element to running total one-by-one)
+            sum_h += self.h_probs[h1*HAP_NUMBER]+self.h_probs[h1*HAP_NUMBER+1]+self.h_probs[h1*HAP_NUMBER+2]+self.h_probs[h1*HAP_NUMBER+3]+self.h_probs[h1*HAP_NUMBER+4]+self.h_probs[h1*HAP_NUMBER+5]+self.h_probs[h1*HAP_NUMBER+6]+self.h_probs[h1*HAP_NUMBER+7];
         }
 
         // Do NOT normalize h_probs in-place.
@@ -1522,6 +1607,90 @@ impl SegmentHmm {
         // all-zero WITHOUT a NaN for the downstream guard to catch, and the sampler
         // then picked the last diplotype of every affected segment deterministically.
         !(self.prob_sum_t >= 1e-30)
+    }
+}
+
+#[cfg(test)]
+mod trans_hap_tests {
+    use super::*;
+    use crate::diploid::pbwt_neighbor::tests::TestRng;
+
+    fn rand_f32(rng: &mut TestRng) -> f32 {
+        // wide dynamic range incl. zero and subnormal-adjacent values
+        match rng.below(10) {
+            0 => 0.0,
+            1 => (rng.next() >> 40) as f32 * 1e-38,
+            _ => (rng.next() >> 40) as f32 / (1u64 << 24) as f32 * 10f32.powi(rng.below(16) as i32 - 8),
+        }
+    }
+
+    /// A SegmentHmm reused across windows (alpha slots of unchanged size are no
+    /// longer zero-filled, so they hold the previous window's values until
+    /// save_alpha overwrites them) gives exactly what a fresh one gives.
+    #[test]
+    fn reused_hmm_matches_fresh() {
+        let mut rng = TestRng::new(9);
+        let mut n_windows = 0usize;
+        for _case in 0..30 {
+            let n_var = 300 + rng.below(300);
+            let mut geno = vec![0u8; n_var * 2];
+            for v in 0..n_var {
+                geno[2 * v] = rng.chance(0.4) as u8;
+                geno[2 * v + 1] = rng.chance(0.4) as u8;
+                if rng.chance(0.02) { geno[2 * v] = 128; geno[2 * v + 1] = 128; }
+            }
+            let graph = build_graph(0, &geno, n_var, None);
+            if graph.n_segments < 4 { continue; }
+            let cm: Vec<f64> = (0..n_var).map(|i| i as f64 * 0.01).collect();
+            let params = super::super::params::HmmParams::new(&cm, 1000, 15000.0);
+            let n_seg = graph.n_segments;
+            let mut windows = Vec::new();
+            let mut s = 0usize;
+            while s < n_seg - 1 {
+                let e = (s + 2 + rng.below(n_seg / 3 + 1)).min(n_seg - 1);
+                windows.push((s, e));
+                s = e;
+            }
+            let mut reused = SegmentHmm::new(1);
+            for &(wf, wl) in &windows {
+                let k = [8usize, 8, 37, 64, 65][rng.below(5)]; // repeats hit the no-refill branch
+                let l0 = graph.segment_start(wf);
+                let l1 = graph.segment_start(wl) + graph.lengths[wl] as usize - 1;
+                let kw = k.div_ceil(64);
+                let cond_bm: Vec<u64> = (0..(l1 - l0 + 1) * kw).map(|_| rng.next()).collect();
+                let run = |hmm: &mut SegmentHmm| {
+                    hmm.resize_for(k);
+                    hmm.forward_rare_direct(&graph, &cond_bm, kw, l0, &params.trans, wf, wl,
+                        &params.rare_allele, &params);
+                    let uf = hmm.has_underflow();
+                    let (t, _) = hmm.backward_rare_direct(&graph, &cond_bm, kw, l0, &params.trans,
+                        wf, wl, &params.rare_allele, &params);
+                    (uf, t.iter().map(|x| x.to_bits()).collect::<Vec<u64>>())
+                };
+                let got = run(&mut reused);
+                let want = run(&mut SegmentHmm::new(1));
+                assert_eq!(got, want, "window ({wf}, {wl}), k {k}");
+                n_windows += 1;
+            }
+        }
+        assert!(n_windows > 20);
+    }
+
+    /// The k-outer TRANS_HAP accumulation is bit-identical to the h1-outer one.
+    #[test]
+    fn trans_hap_matches_legacy() {
+        let mut rng = TestRng::new(17);
+        for _ in 0..500 {
+            let n_cond = 1 + rng.below(700);
+            let alpha: Vec<f32> = (0..n_cond * HAP_NUMBER).map(|_| rand_f32(&mut rng)).collect();
+            let prob: Vec<f32> = (0..n_cond * HAP_NUMBER).map(|_| rand_f32(&mut rng)).collect();
+            let mut asum = [0.0f32; HAP_NUMBER];
+            for a in asum.iter_mut() { *a = rand_f32(&mut rng); }
+            let (ss, f1, yt) = (rand_f32(&mut rng), rand_f32(&mut rng), rand_f32(&mut rng));
+            let old = trans_hap_accumulate_legacy(&alpha, &prob, n_cond, &asum, ss, f1, yt);
+            let new = trans_hap_accumulate(&alpha, &prob, n_cond, &asum, ss, f1, yt);
+            for i in 0..64 { assert_eq!(old[i].to_bits(), new[i].to_bits(), "entry {i}, n_cond {n_cond}"); }
+        }
     }
 }
 

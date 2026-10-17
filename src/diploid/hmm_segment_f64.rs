@@ -11,6 +11,83 @@ use super::hmm_segment::{rare_dispatch_position_first, rare_dispatch_diag,
 
 const MISMATCH: f64 = (ED / EE) as f64;
 
+/// f64 TRANS_HAP accumulation, k-outer: every one of the 64 sums receives the
+/// same terms in the same k order as the former (h1, h2)-outer loops, so the
+/// result is bit-identical; `prob` is now read once per k instead of 64 times.
+fn trans_hap_accumulate_f64(
+    alpha_full: &[f64], prob: &[f64], n_cond: usize,
+    alpha_sum: &[f64; HAP_NUMBER], alpha_sum_sum: f64, fact1: f64, yt: f64,
+) -> [f64; HAP_NUMBER * HAP_NUMBER] {
+    let mut fact2 = [0.0f64; HAP_NUMBER];
+    for h1 in 0..HAP_NUMBER {
+        fact2[h1] = (alpha_sum[h1] / alpha_sum_sum.max(1e-300)) * yt / n_cond as f64;
+    }
+    let mut s = [0.0f64; HAP_NUMBER * HAP_NUMBER];
+    for k in 0..n_cond {
+        let a = &alpha_full[k * HAP_NUMBER..(k + 1) * HAP_NUMBER];
+        let b = &prob[k * HAP_NUMBER..(k + 1) * HAP_NUMBER];
+        for h1 in 0..HAP_NUMBER {
+            let alpha_val = a[h1] * fact1 + fact2[h1];
+            for h2 in 0..HAP_NUMBER {
+                s[h1 * HAP_NUMBER + h2] += alpha_val * b[h2];
+            }
+        }
+    }
+    s
+}
+
+/// Verbatim pre-reorder f64 TRANS_HAP loops, kept as the parity oracle.
+#[cfg(test)]
+fn trans_hap_accumulate_f64_legacy(
+    alpha_full: &[f64], prob: &[f64], n_cond: usize,
+    alpha_sum: &[f64; HAP_NUMBER], alpha_sum_sum: f64, fact1: f64, yt: f64,
+) -> [f64; HAP_NUMBER * HAP_NUMBER] {
+    let mut h_probs = [0.0f64; HAP_NUMBER * HAP_NUMBER];
+    for h1 in 0..HAP_NUMBER {
+        let fact2 = (alpha_sum[h1] / alpha_sum_sum.max(1e-300)) * yt / n_cond as f64;
+        for h2 in 0..HAP_NUMBER {
+            let mut s = 0.0f64;
+            for k in 0..n_cond {
+                let alpha_val = alpha_full[k*HAP_NUMBER+h1] * fact1 + fact2;
+                s += alpha_val * prob[k*HAP_NUMBER+h2];
+            }
+            h_probs[h1*HAP_NUMBER+h2] = s;
+        }
+    }
+    h_probs
+}
+
+#[cfg(test)]
+mod trans_hap_tests {
+    use super::*;
+    use crate::diploid::pbwt_neighbor::tests::TestRng;
+
+    fn rand_f64(rng: &mut TestRng) -> f64 {
+        // wide dynamic range incl. tiny / zero values
+        match rng.below(10) {
+            0 => 0.0,
+            1 => (rng.next() >> 11) as f64 * 1e-300,
+            _ => (rng.next() >> 11) as f64 / (1u64 << 53) as f64 * 10f64.powi(rng.below(20) as i32 - 10),
+        }
+    }
+
+    #[test]
+    fn f64_trans_hap_matches_legacy() {
+        let mut rng = TestRng::new(5);
+        for _ in 0..300 {
+            let n_cond = 1 + rng.below(300);
+            let alpha: Vec<f64> = (0..n_cond * HAP_NUMBER).map(|_| rand_f64(&mut rng)).collect();
+            let prob: Vec<f64> = (0..n_cond * HAP_NUMBER).map(|_| rand_f64(&mut rng)).collect();
+            let mut asum = [0.0f64; HAP_NUMBER];
+            for a in asum.iter_mut() { *a = rand_f64(&mut rng); }
+            let (ss, f1, yt) = (rand_f64(&mut rng), rand_f64(&mut rng), rand_f64(&mut rng));
+            let old = trans_hap_accumulate_f64_legacy(&alpha, &prob, n_cond, &asum, ss, f1, yt);
+            let new = trans_hap_accumulate_f64(&alpha, &prob, n_cond, &asum, ss, f1, yt);
+            for i in 0..64 { assert_eq!(old[i].to_bits(), new[i].to_bits(), "entry {i}, n_cond {n_cond}"); }
+        }
+    }
+}
+
 pub struct SegmentHmmF64 {
     pub prob: Vec<f64>,
     pub prob_sum_h: [f64; HAP_NUMBER],
@@ -291,17 +368,9 @@ impl SegmentHmmF64 {
         }
         let fact1 = nt / alpha_sum_sum.max(1e-300);
 
-        self.h_probs = [0.0; HAP_NUMBER * HAP_NUMBER];
+        self.h_probs = trans_hap_accumulate_f64(alpha_full, &self.prob, n_cond, &alpha_sum,
+            alpha_sum_sum, fact1, yt);
         for h1 in 0..HAP_NUMBER {
-            let fact2 = (alpha_sum[h1] / alpha_sum_sum.max(1e-300)) * yt / n_cond as f64;
-            for h2 in 0..HAP_NUMBER {
-                let mut s = 0.0f64;
-                for k in 0..n_cond {
-                    let alpha_val = alpha_full[k*HAP_NUMBER+h1] * fact1 + fact2;
-                    s += alpha_val * self.prob[k*HAP_NUMBER+h2];
-                }
-                self.h_probs[h1*HAP_NUMBER+h2] = s;
-            }
             sum_h += self.h_probs[h1*HAP_NUMBER]+self.h_probs[h1*HAP_NUMBER+1]+self.h_probs[h1*HAP_NUMBER+2]+self.h_probs[h1*HAP_NUMBER+3]+self.h_probs[h1*HAP_NUMBER+4]+self.h_probs[h1*HAP_NUMBER+5]+self.h_probs[h1*HAP_NUMBER+6]+self.h_probs[h1*HAP_NUMBER+7];
         }
         self.sum_h_probs = sum_h;
