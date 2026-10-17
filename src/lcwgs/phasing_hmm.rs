@@ -209,6 +209,14 @@ pub struct PhasingHmm {
     /// at the head of `rephase`, cleared at its end; never outlives the call.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     base_pack: *const crate::lcwgs::hmm::BasePack,
+    /// Gather plans of the CURRENT `rephase` call's conditioning set, built at
+    /// its head (SIMD paths only): `plan_full` over `cond_haps`, `plan_tail`
+    /// over `cond_haps[b..]` when a usable base pack is set. `pack_condbits`
+    /// packs a site through them (see `crate::lcwgs::hmm::build_gather_plan`).
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    plan_full: Vec<crate::lcwgs::hmm::GatherWord>,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    plan_tail: Vec<crate::lcwgs::hmm::GatherWord>,
 }
 
 /// Generate the AVX2 (8-wide) phasing kernels from their per-kernel parts.
@@ -419,7 +427,15 @@ impl PhasingHmm {
             simd: SimdMode::Scalar,
             condbits: Vec::new(),
             base_pack: std::ptr::null(),
+            plan_full: Vec::new(),
+            plan_tail: Vec::new(),
         }
+    }
+
+    /// Shape of the last `rephase` call, for the `LCWGS_TIMING` report:
+    /// `(phased sites, segments, flat hets, states)`.
+    pub fn last_shape(&self) -> (usize, usize, usize, usize) {
+        (self.var_typ.len(), self.n_segs, self.n_miss, self.n_states)
     }
 
     // ===================================================================
@@ -453,10 +469,57 @@ impl PhasingHmm {
     /// absolute site into `self.condbits` (bit `k` == `hvar(k)`). Refreshed by
     /// every SIMD emission/hom kernel because the allele depends on
     /// `curr_abs_locus`, which advances each forward/backward step. Bits
-    /// `[n_states, 64·w64)` are left 0 (never read — loops cover `[0, n_states)`).
+    /// `[n_states, 64·w64)` are 0 (never read — loops cover `[0, n_states)`).
+    ///
+    /// Gathers through the extract plans built at the head of `rephase`
+    /// (`plan_full` over `cond_haps`, `plan_tail` over `cond_haps[b..]`), so it
+    /// writes every one of the `w64` words and needs no zeroing first.
     #[cfg(target_arch = "x86_64")]
     #[inline]
     fn pack_condbits(&mut self, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32]) {
+        use crate::lcwgs::hmm::gather_row;
+        let nstates = self.n_states;
+        debug_assert_eq!(cond_haps.len(), nstates);
+        let w64 = nstates.div_ceil(64);
+        if self.condbits.len() < w64 {
+            self.condbits.resize(w64, 0u64);
+        }
+        if w64 == 0 { return; }
+        let abs = self.curr_abs_locus as usize;
+        let rp = ref_bm.row(abs).as_ptr();
+        let dst = self.condbits.as_mut_ptr();
+        // Shared-prefix fast path: copy the base words for this site (states
+        // `[0, b)`, whose ids equal `cond_haps[..b]` by the caller's contract),
+        // then gather only the tail. Identical bits to the full gather below.
+        if !self.base_pack.is_null() {
+            // SAFETY: set by `rephase` from a reference that outlives the call.
+            let bp = unsafe { &*self.base_pack };
+            if bp.b > 0 && bp.b <= nstates {
+                let r = bp.row_of_abs.get(abs).copied().unwrap_or(u32::MAX);
+                if r != u32::MAX {
+                    let src = &bp.words[r as usize * bp.wb..(r as usize + 1) * bp.wb];
+                    let nfull = bp.b / 64;
+                    let pos = (bp.b % 64) as u32;
+                    let acc = if pos > 0 { src[nfull] } else { 0 };
+                    // SAFETY: condbits holds ≥ w64 words; the plan's ids are < n_haps.
+                    let n = unsafe {
+                        std::ptr::copy_nonoverlapping(src.as_ptr(), dst, nfull);
+                        gather_row(rp, &self.plan_tail, dst, nfull, acc, pos)
+                    };
+                    debug_assert_eq!(n, w64);
+                    return;
+                }
+            }
+        }
+        // SAFETY: as above.
+        let n = unsafe { gather_row(rp, &self.plan_full, dst, 0, 0, 0) };
+        debug_assert_eq!(n, w64);
+    }
+
+    /// The pre-plan `pack_condbits` (per-state gather), kept verbatim as the
+    /// reference for the plan-based version's parity test.
+    #[cfg(all(test, target_arch = "x86_64"))]
+    fn pack_condbits_reference(&mut self, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32]) {
         let nstates = self.n_states;
         let w64 = nstates.div_ceil(64);
         if self.condbits.len() < w64 {
@@ -464,12 +527,8 @@ impl PhasingHmm {
         }
         let abs = self.curr_abs_locus as usize;
         for w in 0..w64 { self.condbits[w] = 0; }
-        // Shared-prefix fast path: copy the base words for this site (states
-        // `[0, b)`, whose ids equal `cond_haps[..b]` by the caller's contract),
-        // then gather only the tail. Identical bits to the full gather below.
         let mut kstart = 0usize;
         if !self.base_pack.is_null() {
-            // SAFETY: set by `rephase` from a reference that outlives the call.
             let bp = unsafe { &*self.base_pack };
             if bp.b > 0 && bp.b <= nstates {
                 let r = bp.row_of_abs.get(abs).copied().unwrap_or(u32::MAX);
@@ -485,6 +544,23 @@ impl PhasingHmm {
         for k in kstart..nstates {
             if ref_bm.get(abs, cond_haps[k] as usize) {
                 self.condbits[k >> 6] |= 1u64 << (k & 63);
+            }
+        }
+    }
+
+    /// Build the per-call gather plans `pack_condbits` reads (SIMD paths only):
+    /// `plan_full` over all of `cond_haps`, `plan_tail` over the states after
+    /// the base prefix when the base pack is usable. O(K) once per `rephase`.
+    #[cfg(target_arch = "x86_64")]
+    fn build_condbit_plans(&mut self, cond_haps: &[u32]) {
+        use crate::lcwgs::hmm::build_gather_plan;
+        build_gather_plan(cond_haps, &mut self.plan_full);
+        self.plan_tail.clear();
+        if !self.base_pack.is_null() {
+            // SAFETY: set by `rephase` from a reference that outlives the call.
+            let bp = unsafe { &*self.base_pack };
+            if bp.b > 0 && bp.b <= cond_haps.len() {
+                build_gather_plan(&cond_haps[bp.b..], &mut self.plan_tail);
             }
         }
     }
@@ -908,6 +984,22 @@ impl PhasingHmm {
     /// the stored backward `imputeProb` to get the per-lane P(allele==1) at this
     /// FLAT_HET, clamped to [0,1] into imputeProbOf1s[miss*8 + lane].
     fn impute_flat_het(&mut self, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32]) {
+        #[cfg(target_arch = "x86_64")]
+        match self.simd {
+            SimdMode::Avx512 | SimdMode::Avx2 => {
+                self.pack_condbits(ref_bm, cond_haps);
+                // SAFETY: gated by runtime feature detection in resolve_simd_mode
+                // (every AVX-512 host here has AVX2).
+                unsafe { self.impute_flat_het_avx2() };
+                return;
+            }
+            SimdMode::Scalar => {}
+        }
+        self.impute_flat_het_scalar(ref_bm, cond_haps);
+    }
+
+    /// IMPUTE_FLAT_HET scalar reference (also the `SELPHI_FORCE_SCALAR` path).
+    fn impute_flat_het_scalar(&mut self, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32]) {
         let states_haps = self.n_states * HAP_NUMBER;
         let miss = self.curr_missing_locus as usize;
         let mut scale_r = [0.0f32; HAP_NUMBER];
@@ -939,6 +1031,56 @@ impl PhasingHmm {
             self.impute_prob_of_1s[miss * HAP_NUMBER + lane] = clamped;
         }
     }
+
+    /// IMPUTE_FLAT_HET, AVX2: the 8 founder lanes of one state `k` are one
+    /// `__m256`, and states are visited in order 0..K, so every lane performs the
+    /// scalar path's exact operation sequence — `p1 = ip*scale_r`, `p2 =
+    /// prob*scale_l`, `prod = p1*p2` (three roundings, no FMA), then
+    /// `sums_a += prod` for the state's allele `a` in state order. The "add to
+    /// one accumulator" choice is a blend of `s` and `s + prod` (an exact
+    /// select, not an add of zero). Alleles come from `condbits`, which the
+    /// caller packed for this site (bit k == `hvar(k)`). Bit-identical to
+    /// [`Self::impute_flat_het_scalar`].
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn impute_flat_het_avx2(&mut self) { unsafe {
+        use core::arch::x86_64::*;
+        let states_haps = self.n_states * HAP_NUMBER;
+        let miss = self.curr_missing_locus as usize;
+        let mut scale_r = [0.0f32; HAP_NUMBER];
+        let mut scale_l = [0.0f32; HAP_NUMBER];
+        for lane in 0..HAP_NUMBER {
+            scale_r[lane] = 1.0 / self.impute_prob_sum[miss * HAP_NUMBER + lane];
+            scale_l[lane] = 1.0 / self.prob_sum_h[lane];
+        }
+        let srv = _mm256_loadu_ps(scale_r.as_ptr());
+        let slv = _mm256_loadu_ps(scale_l.as_ptr());
+        let ip = self.impute_prob[miss * states_haps..(miss + 1) * states_haps].as_ptr();
+        let pp = self.prob[..states_haps].as_ptr();
+        let cb = self.condbits.as_ptr();
+        let mut s0 = _mm256_setzero_ps();
+        let mut s1 = _mm256_setzero_ps();
+        for k in 0..self.n_states {
+            let base = k * HAP_NUMBER;
+            let p1 = _mm256_mul_ps(_mm256_loadu_ps(ip.add(base)), srv);
+            let p2 = _mm256_mul_ps(_mm256_loadu_ps(pp.add(base)), slv);
+            let prod = _mm256_mul_ps(p1, p2);
+            // All-ones lanes when state k carries ALT.
+            let alt = ((*cb.add(k >> 6) >> (k & 63)) & 1) as i32;
+            let m = _mm256_castsi256_ps(_mm256_set1_epi32(-alt));
+            s1 = _mm256_blendv_ps(s1, _mm256_add_ps(s1, prod), m);
+            s0 = _mm256_blendv_ps(_mm256_add_ps(s0, prod), s0, m);
+        }
+        let mut sums0 = [0.0f32; HAP_NUMBER];
+        let mut sums1 = [0.0f32; HAP_NUMBER];
+        _mm256_storeu_ps(sums0.as_mut_ptr(), s0);
+        _mm256_storeu_ps(sums1.as_mut_ptr(), s1);
+        for lane in 0..HAP_NUMBER {
+            let norm = sums1[lane] / (sums0[lane] + sums1[lane]);
+            let clamped = norm.clamp(0.0, 1.0);
+            self.impute_prob_of_1s[miss * HAP_NUMBER + lane] = clamped;
+        }
+    }}
 
     // ════════════════════════════════════════════════════════════════════════
     //  SIMD KERNELS — AVX2 (8-wide: one k per __m256) + AVX-512 (16-wide: two k
@@ -1544,15 +1686,19 @@ impl PhasingHmm {
         self.prob_sum_k.resize(k, 0.0);
         // prob_sum_h is fixed [f32; 8].
 
+        // The two K-wide snapshot buffers (one K×8 block per segment and per flat
+        // het) are NOT zero-filled: `backward` writes every block before anything
+        // reads it and sets their lengths only once all of them are written (see
+        // the checks there). Only capacity is reserved here.
         self.phasing_prob.clear();
-        self.phasing_prob.resize(self.n_segs * k * HAP_NUMBER, 0.0);
+        self.phasing_prob.reserve(self.n_segs * k * HAP_NUMBER);
         self.phasing_prob_sum.clear();
         self.phasing_prob_sum.resize(self.n_segs * HAP_NUMBER, 0.0);
         self.phasing_prob_sum_sum.clear();
         self.phasing_prob_sum_sum.resize(self.n_segs, 0.0);
 
         self.impute_prob.clear();
-        self.impute_prob.resize(self.n_miss * k * HAP_NUMBER, 0.0);
+        self.impute_prob.reserve(self.n_miss * k * HAP_NUMBER);
         self.impute_prob_sum.clear();
         self.impute_prob_sum.resize(self.n_miss * HAP_NUMBER, 0.0);
         self.impute_prob_sum_sum.clear();
@@ -1668,6 +1814,16 @@ impl PhasingHmm {
         self.curr_segment_locus = *self.segments.last().unwrap() - 1;
         self.curr_missing_locus = self.n_miss as i32 - 1;
 
+        // `phasing_prob` / `impute_prob` arrive empty with reserved capacity (see
+        // `reallocate`). Each segment's block is written once, at its locus 0, and
+        // each flat het's once; the indices visited must fall strictly from
+        // n_segs / n_miss, so with the full count every block of [0, n) is
+        // written exactly once before the lengths are set below. The checks are
+        // a few compares per segment and make the uninitialized reserve sound.
+        let states_haps = self.n_states * HAP_NUMBER;
+        let (mut last_seg, mut n_seg_written) = (self.n_segs, 0usize);
+        let (mut last_miss, mut n_miss_written) = (self.n_miss, 0usize);
+
         let mut idx = n_var - 1;
         while idx >= 0 {
             self.curr_idx_locus = idx;
@@ -1720,10 +1876,16 @@ impl PhasingHmm {
             // LEFT boundary: snapshot the segment's backward state.
             if self.curr_segment_locus == 0 {
                 self.sumk();
-                let states_haps = self.n_states * HAP_NUMBER;
+                assert!(seg < last_seg, "phasing segment snapshot out of order");
+                last_seg = seg;
+                n_seg_written += 1;
                 let dst = seg * states_haps;
-                self.phasing_prob[dst..dst + states_haps]
-                    .copy_from_slice(&self.prob[..states_haps]);
+                // SAFETY: seg < n_segs, so the block lies in the capacity reserved
+                // by `reallocate`; `prob` holds ≥ states_haps initialized floats.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.prob.as_ptr(), self.phasing_prob.as_mut_ptr().add(dst), states_haps);
+                }
                 let hdst = seg * HAP_NUMBER;
                 self.phasing_prob_sum[hdst..hdst + HAP_NUMBER]
                     .copy_from_slice(&self.prob_sum_h);
@@ -1733,10 +1895,15 @@ impl PhasingHmm {
             // STORE PROBS FOR PHASING RARE HETS.
             if typ == VAR_FLAT_HET {
                 let miss = self.curr_missing_locus as usize;
-                let states_haps = self.n_states * HAP_NUMBER;
+                assert!(miss < last_miss, "flat-het snapshot out of order");
+                last_miss = miss;
+                n_miss_written += 1;
                 let dst = miss * states_haps;
-                self.impute_prob[dst..dst + states_haps]
-                    .copy_from_slice(&self.prob[..states_haps]);
+                // SAFETY: miss < n_miss, so the block lies in the reserved capacity.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.prob.as_ptr(), self.impute_prob.as_mut_ptr().add(dst), states_haps);
+                }
                 let hdst = miss * HAP_NUMBER;
                 self.impute_prob_sum[hdst..hdst + HAP_NUMBER]
                     .copy_from_slice(&self.prob_sum_h);
@@ -1752,6 +1919,15 @@ impl PhasingHmm {
             }
 
             idx -= 1;
+        }
+        // Every block written exactly once (strictly falling indices, full count).
+        assert!(n_seg_written == self.n_segs && n_miss_written == self.n_miss,
+            "phasing backward left snapshot blocks unwritten");
+        // SAFETY: all n_segs (n_miss) blocks of states_haps floats were written
+        // above, within the capacity reserved by `reallocate`.
+        unsafe {
+            self.phasing_prob.set_len(self.n_segs * states_haps);
+            self.impute_prob.set_len(self.n_miss * states_haps);
         }
     }
 
@@ -1805,6 +1981,10 @@ impl PhasingHmm {
             self.shuffle_monomorphic_hets(h0, h1, mono_sites, rng_u01);
             self.base_pack = std::ptr::null();
             return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if self.simd != SimdMode::Scalar {
+            self.build_condbit_plans(cond_haps);
         }
         self.backward(ref_bm, cond_haps, cm, mism);
 
@@ -2033,5 +2213,110 @@ mod tests {
         // H0 is rewritten; H1 keeps its incoming value. We only assert it ran
         // (no panic) and h0[4] is a valid bool — covered by reaching here.
         let _ = (h0[4], h1[4]);
+    }
+
+    /// The AVX2 `impute_flat_het` reproduces the scalar one bit for bit (every
+    /// lane's `impute_prob_of_1s`, compared as bits) on random forward/backward
+    /// states — including zeros, denormals and all-zero lanes (0/0) — for K on
+    /// and off multiples of 8/64, with and without a base pack.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn impute_flat_het_avx2_matches_scalar() {
+        use crate::lcwgs::hmm::{reference_pack as rp, BasePack};
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) { return; }
+        let mut rng = rp::Xs(0x3C6E_F372_FE94_F82B);
+        let n_haps = 700usize;
+        let n_sites = 12usize;
+        let bm = rp::random_panel(&mut rng, n_sites, n_haps, 50);
+        let val = |rng: &mut rp::Xs| -> f32 {
+            match rng.below(10) {
+                0 => 0.0,
+                1 => f32::from_bits(1 + rng.below(1000) as u32), // denormal
+                2 => 1e-30 * (rng.below(1000) as f32 + 1.0),
+                _ => (rng.below(1_000_000) as f32 + 1.0) / 1e6,
+            }
+        };
+        for &k in &[1usize, 7, 8, 63, 64, 65, 300, 699] {
+            let mut cond: Vec<u32> = (0..n_haps as u32).collect();
+            for i in (1..cond.len()).rev() { let j = rng.below(i as u64 + 1) as usize; cond.swap(i, j); }
+            cond.truncate(k);
+            let b = k / 2;
+            let mut base = BasePack::new();
+            base.build(&bm, &cond[..b], &(0..n_sites).collect::<Vec<_>>(), n_sites);
+            for use_base in [false, true] {
+                for trial in 0..20 {
+                    let n_miss = 3usize;
+                    let params = LsParams::default();
+                    let mut a = PhasingHmm::new(&params);
+                    a.n_states = k;
+                    a.n_miss = n_miss;
+                    a.base_pack = if use_base { &base as *const _ } else { std::ptr::null() };
+                    a.prob = (0..k * HAP_NUMBER).map(|_| val(&mut rng)).collect();
+                    if trial % 5 == 0 { for x in a.prob.iter_mut().skip(3).step_by(HAP_NUMBER) { *x = 0.0; } }
+                    a.impute_prob = (0..n_miss * k * HAP_NUMBER).map(|_| val(&mut rng)).collect();
+                    a.impute_prob_sum = (0..n_miss * HAP_NUMBER).map(|_| val(&mut rng) + 1e-3).collect();
+                    for h in 0..HAP_NUMBER { a.prob_sum_h[h] = val(&mut rng) + 1e-3; }
+                    a.impute_prob_of_1s = vec![0.0; n_miss * HAP_NUMBER];
+                    a.curr_missing_locus = rng.below(n_miss as u64) as i32;
+                    a.curr_abs_locus = rng.below(n_sites as u64) as i32;
+                    a.simd = SimdMode::Avx2;
+                    a.build_condbit_plans(&cond);
+                    let mut s = PhasingHmm::new(&params);
+                    s.n_states = k; s.n_miss = n_miss;
+                    s.prob = a.prob.clone(); s.impute_prob = a.impute_prob.clone();
+                    s.impute_prob_sum = a.impute_prob_sum.clone(); s.prob_sum_h = a.prob_sum_h;
+                    s.impute_prob_of_1s = vec![0.0; n_miss * HAP_NUMBER];
+                    s.curr_missing_locus = a.curr_missing_locus; s.curr_abs_locus = a.curr_abs_locus;
+                    s.simd = SimdMode::Scalar;
+                    a.impute_flat_het(&bm, &cond);
+                    s.impute_flat_het(&bm, &cond);
+                    let ab: Vec<u32> = a.impute_prob_of_1s.iter().map(|x| x.to_bits()).collect();
+                    let sb: Vec<u32> = s.impute_prob_of_1s.iter().map(|x| x.to_bits()).collect();
+                    assert_eq!(ab, sb, "k={k} base={use_base} trial={trial}");
+                }
+            }
+        }
+    }
+
+    /// The plan-based `pack_condbits` writes the same `w64` words as the
+    /// verbatim per-state gather at every site, with and without a base pack
+    /// (aligned/unaligned/whole/empty prefix, sites absent from the base), for
+    /// every conditioning shape, starting from stale `condbits` content.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn plan_pack_condbits_matches_reference() {
+        use crate::lcwgs::hmm::{reference_pack as rp, BasePack};
+        let mut rng = rp::Xs(0x5851_F42D_4C95_7F2D);
+        for &(n_sites, n_haps) in &[(30usize, 64usize), (40, 130), (25, 4796), (20, 7)] {
+            let bm = rp::random_panel(&mut rng, n_sites, n_haps, 50);
+            for c in rp::cond_shapes(&mut rng, n_haps) {
+                let k = c.len();
+                let union: Vec<usize> = (0..n_sites).filter(|_| rng.below(5) != 0).collect();
+                let mut bs: Vec<Option<usize>> = vec![None, Some(0), Some(k)];
+                for b in [1usize, 64, 65, k / 3] { if b <= k { bs.push(Some(b)); } }
+                for b in bs {
+                    let mut base = BasePack::new();
+                    if let Some(b) = b { base.build(&bm, &c[..b], &union, n_sites); }
+                    let params = LsParams::default();
+                    let mut new = PhasingHmm::new(&params);
+                    let mut old = PhasingHmm::new(&params);
+                    for h in [&mut new, &mut old] {
+                        h.n_states = k;
+                        h.base_pack = if b.is_some() { &base as *const _ } else { std::ptr::null() };
+                        h.condbits = vec![0xA5A5_A5A5_A5A5_A5A5u64; k.div_ceil(64) + 2];
+                    }
+                    new.build_condbit_plans(&c);
+                    let w64 = k.div_ceil(64);
+                    for abs in 0..n_sites {
+                        new.curr_abs_locus = abs as i32;
+                        old.curr_abs_locus = abs as i32;
+                        new.pack_condbits(&bm, &c);
+                        old.pack_condbits_reference(&bm, &c);
+                        assert_eq!(new.condbits[..w64], old.condbits[..w64],
+                            "n_haps={n_haps} k={k} b={b:?} abs={abs}");
+                    }
+                }
+            }
+        }
     }
 }

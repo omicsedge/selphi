@@ -303,6 +303,26 @@ pub struct TargetHaplotypeSet {
 
     // pack3 decode lookup.
     p3decode: [i32; 128],
+
+    // ---- lazy occ/V (see `read_full_pbwt_av`) ----
+    /// When set, the full-PBWT V vector is not materialized per common column:
+    /// only the three entries per target hap that `select_common_pd_fg` reads
+    /// (at `pbwt_index`, `f_k`, `g_k`) are computed during the column decode.
+    /// Same integers; chosen in `allocate_pbwt` when the targets are few
+    /// relative to the panel ([`lazy_v_pays`]).
+    pub(crate) v_lazy: bool,
+    /// Queries of the current column, `(index into V, answer slot)`, sorted.
+    v_queries: Vec<(i32, u32)>,
+    /// `v_answers[3*htr + j]` = V at `pbwt_index[htr]` / `f_k[htr]` / `g_k[htr]`.
+    v_answers: Vec<i32>,
+}
+
+/// Whether computing the full-PBWT V entries on demand beats filling the whole
+/// `n_ref + 1` vector per common column: three sorted queries per target hap
+/// against `n_ref` stores. Both give the same integers.
+#[inline]
+pub(crate) fn lazy_v_pays(n_ref: usize, n_tar_haps: usize) -> bool {
+    24 * n_tar_haps <= n_ref
 }
 
 impl TargetHaplotypeSet {
@@ -369,6 +389,9 @@ impl TargetHaplotypeSet {
             counter_sel_gf: 0,
             counter_rare_restarts: 0,
             p3decode: build_p3decode(),
+            v_lazy: false,
+            v_queries: Vec::new(),
+            v_answers: Vec::new(),
         }
     }
 
@@ -547,7 +570,7 @@ impl TargetHaplotypeSet {
 
         self.pbwt_array_a = (0..n_ref as i32).collect(); // iota
         self.pbwt_array_b = vec![0i32; n_ref];
-        self.pbwt_array_v = vec![0i32; n_ref + 1];
+        self.set_v_lazy(lazy_v_pays(n_ref, self.n_tar_haps));
         self.pbwt_index = vec![0i32; self.n_tar_haps];
         self.f_k = vec![0i32; self.n_tar_haps];
         self.g_k = vec![n_ref as i32; self.n_tar_haps];
@@ -747,10 +770,31 @@ impl TargetHaplotypeSet {
     // read_full_pbwt_av
     // =======================================================================
 
+    /// Choose lazy or eager V (see [`Self::read_full_pbwt_a_lazy_v`]) and size
+    /// only the scratch that mode reads: the `3·n_tar_haps` query/answer pair
+    /// (lazy) or the full `n_ref + 1` V vector (eager); the other is released.
+    /// Needs `pbwt_array_a` sized to the panel (`allocate_pbwt`).
+    pub(crate) fn set_v_lazy(&mut self, lazy: bool) {
+        self.v_lazy = lazy;
+        if lazy {
+            self.pbwt_array_v = Vec::new();
+            self.v_queries = Vec::with_capacity(3 * self.n_tar_haps);
+            self.v_answers = vec![0i32; 3 * self.n_tar_haps];
+        } else {
+            self.pbwt_array_v = vec![0i32; self.pbwt_array_a.len() + 1];
+            self.v_queries = Vec::new();
+            self.v_answers = Vec::new();
+        }
+    }
+
     /// Decode one column of the FULL compressed PBWT from `y[py..]`, producing
     /// the next PPA (`pbwt_array_a`) and the occ/V vector. `ref_rac_l` = #ref
     /// haps carrying ref allele at the column (the split point for the 0/1 occ).
     fn read_full_pbwt_av(&mut self, y: &[u8], py: &mut usize, ref_rac_l: i32) {
+        if self.v_lazy {
+            self.read_full_pbwt_a_lazy_v(y, py, ref_rac_l);
+            return;
+        }
         let mut u = 0i32; // occ[0] cursor (ref/0 side)
         let mut v = ref_rac_l; // occ[1] cursor (alt/1 side) — starts at ref count
         let mut m = 0usize;
@@ -790,6 +834,65 @@ impl TargetHaplotypeSet {
                 v += n as i32;
             }
         }
+        std::mem::swap(&mut self.pbwt_array_a, &mut self.pbwt_array_b);
+    }
+
+    /// [`Self::read_full_pbwt_av`] without materializing V. V[i] is the number
+    /// of 1-symbols among the column's first `i` PPA positions (the eager fill
+    /// writes exactly that: a z=1 run starting at `m` with `v - ref_rac_l` ones
+    /// before it sets V[m+1+j] = v - ref_rac_l + 1 + j, a z=0 run sets
+    /// v - ref_rac_l). `select_common_pd_fg` reads V only at each target hap's
+    /// `pbwt_index`, `f_k`, `g_k`, which are fixed before this column is decoded,
+    /// so those indices are sorted once and answered as the runs go by: an index
+    /// `i` in `(m, mm]` takes its run's value, index 0 takes 0. The PPA update
+    /// is unchanged.
+    fn read_full_pbwt_a_lazy_v(&mut self, y: &[u8], py: &mut usize, ref_rac_l: i32) {
+        self.v_queries.clear();
+        for htr in 0..self.n_tar_haps {
+            let slot = 3 * htr as u32;
+            self.v_queries.push((self.pbwt_index[htr], slot));
+            self.v_queries.push((self.f_k[htr], slot + 1));
+            self.v_queries.push((self.g_k[htr], slot + 2));
+        }
+        self.v_queries.sort_unstable();
+        let nq = self.v_queries.len();
+        let mut qi = 0usize;
+        // V[0] = 0.
+        while qi < nq && self.v_queries[qi].0 <= 0 {
+            debug_assert_eq!(self.v_queries[qi].0, 0, "V index out of range");
+            self.v_answers[self.v_queries[qi].1 as usize] = 0;
+            qi += 1;
+        }
+
+        let mut u = 0i32; // occ[0] cursor (ref/0 side)
+        let mut v = ref_rac_l; // occ[1] cursor (alt/1 side) — starts at ref count
+        let mut m = 0usize;
+        let size_a = self.pbwt_array_a.len(); // n_ref_haps
+        while m < size_a {
+            let z_byte = y[*py];
+            *py += 1;
+            let n = self.p3decode[(z_byte & 0x7f) as usize] as usize; // run length
+            let mm = m + n;
+            let z = z_byte >> 7;
+
+            let dst = if z == 0 { u } else { v } as usize;
+            self.pbwt_array_b[dst..dst + n].copy_from_slice(&self.pbwt_array_a[m..mm]);
+
+            // Answer the queries whose index falls in (m, mm].
+            let ones = v - ref_rac_l;
+            while qi < nq && self.v_queries[qi].0 as usize <= mm {
+                let (i, slot) = self.v_queries[qi];
+                self.v_answers[slot as usize] = if z != 0 { ones + (i - m as i32) } else { ones };
+                qi += 1;
+            }
+            m = mm;
+            if z == 0 {
+                u += n as i32;
+            } else {
+                v += n as i32;
+            }
+        }
+        debug_assert_eq!(qi, nq, "V index past the column");
         std::mem::swap(&mut self.pbwt_array_a, &mut self.pbwt_array_b);
     }
 
@@ -878,12 +981,18 @@ impl TargetHaplotypeSet {
             // Map cursor + match bounds through the column. `idx` is computed
             // once and never reassigned (unlike f_dash/g_dash, which the
             // collapse/reset branch overwrites).
-            let idx = a * (ref_rac_l + self.pbwt_array_v[pidx as usize])
-                + na * (pidx - self.pbwt_array_v[pidx as usize]);
-            let mut f_dash = a * (ref_rac_l + self.pbwt_array_v[fk as usize])
-                + na * (fk - self.pbwt_array_v[fk as usize]);
-            let mut g_dash = a * (ref_rac_l + self.pbwt_array_v[gk as usize])
-                + na * (gk - self.pbwt_array_v[gk as usize]);
+            let (v_p, v_f, v_g) = if self.v_lazy {
+                (self.v_answers[3 * htr], self.v_answers[3 * htr + 1], self.v_answers[3 * htr + 2])
+            } else {
+                (
+                    self.pbwt_array_v[pidx as usize],
+                    self.pbwt_array_v[fk as usize],
+                    self.pbwt_array_v[gk as usize],
+                )
+            };
+            let idx = a * (ref_rac_l + v_p) + na * (pidx - v_p);
+            let mut f_dash = a * (ref_rac_l + v_f) + na * (fk - v_f);
+            let mut g_dash = a * (ref_rac_l + v_g) + na * (gk - v_g);
 
             if g_dash <= f_dash {
                 // match interval collapsed -> emit (maybe) and reset.
@@ -1556,5 +1665,116 @@ mod tests {
         let mut rng = SimpleRng::new(1);
         let picks = rng.sample_indices(3, 10);
         assert_eq!(picks, vec![0, 1, 2]);
+    }
+
+    /// `allocate_pbwt` sizes only the V scratch of the mode it picks — the full
+    /// `n_ref + 1` vector when the targets are many relative to the panel
+    /// (eager), the `3·n_tar_haps` query/answer pair otherwise (lazy), never
+    /// both — and switching modes swaps them.
+    #[test]
+    fn v_scratch_allocated_for_the_chosen_mode_only() {
+        use crate::common::HaplotypeBitmatrix;
+        use crate::sparse_ls::ref_haplotype_set::RefHaplotypeSet;
+        use crate::sparse_ls::variant::Variant;
+        let n_ref = 300usize;
+        let panel = HaplotypeBitmatrix::from_panel(2, n_ref, &|s: usize, h: usize| (h + s) % 2 == 0, &[true, true]);
+        let mut vmap = VariantMap::new();
+        for s in 0..2 {
+            vmap.vars.push(Variant { bp: s as i64, id: String::new(), ref_a: String::new(), alt_a: String::new(),
+                vtype: 0, idx: s as i32, cref: (n_ref / 2) as u32, calt: (n_ref / 2) as u32, cm: s as f64, lq: false });
+        }
+        let mut rh = RefHaplotypeSet::new();
+        rh.build_from_panel(&panel, &vmap);
+        for n_samples in [1usize, 6, 7, 100] {
+            let mut t = TargetHaplotypeSet::new(&rh, n_samples, vec![2; n_samples]);
+            t.allocate_pbwt(&rh, 4, 0.1, &vmap, 10, 10);
+            let nt = t.n_tar_haps;
+            let check = |t: &TargetHaplotypeSet| {
+                if t.v_lazy {
+                    assert_eq!(t.pbwt_array_v.capacity(), 0, "lazy mode keeps no V vector");
+                    assert_eq!((t.v_queries.capacity(), t.v_answers.len()), (3 * nt, 3 * nt));
+                } else {
+                    assert_eq!(t.pbwt_array_v.len(), n_ref + 1);
+                    assert_eq!((t.v_queries.capacity(), t.v_answers.capacity()), (0, 0), "eager mode keeps no query scratch");
+                }
+            };
+            assert_eq!(t.v_lazy, lazy_v_pays(n_ref, nt), "n_samples={n_samples}");
+            check(&t);
+            let flipped = !t.v_lazy;
+            t.set_v_lazy(flipped);
+            check(&t);
+        }
+    }
+
+    /// The lazy-V column decode produces the same next PPA as the eager one and
+    /// answers every query with the eager V entry, on random columns (runs of
+    /// every pack3 length class, all-0 / all-1 columns) and random cursors
+    /// including the column ends 0 and n_ref.
+    #[test]
+    fn lazy_v_decode_matches_eager_fill() {
+        use crate::common::HaplotypeBitmatrix;
+        use crate::lcwgs::hmm::reference_pack::Xs;
+        use crate::sparse_ls::ref_haplotype_set::{pack3, RefHaplotypeSet};
+        use crate::sparse_ls::variant::Variant;
+        let mut rng = Xs(0x6A09_E667_F3BC_C908);
+        for &n_ref in &[1usize, 2, 7, 64, 300, 4796] {
+            // A one-site panel just to construct the target set.
+            let panel = HaplotypeBitmatrix::from_panel(1, n_ref, &|_s: usize, h: usize| h % 2 == 0, &[true]);
+            let mut vmap = VariantMap::new();
+            vmap.vars.push(Variant { bp: 0, id: String::new(), ref_a: String::new(), alt_a: String::new(),
+                vtype: 0, idx: 0, cref: 0, calt: 0, cm: 0.0, lq: false });
+            let mut rh = RefHaplotypeSet::new();
+            rh.build_from_panel(&panel, &vmap);
+            for n_samples in [1usize, 3, 40] {
+                let mut t = TargetHaplotypeSet::new(&rh, n_samples, vec![2; n_samples]);
+                let nt = t.n_tar_haps;
+                t.pbwt_array_b = vec![0; n_ref];
+                t.pbwt_array_v = vec![0; n_ref + 1];
+                t.v_answers = vec![0; 3 * nt];
+                for _ in 0..40 {
+                    let mut perm: Vec<i32> = (0..n_ref as i32).collect();
+                    for i in (1..n_ref).rev() { let j = rng.below(i as u64 + 1) as usize; perm.swap(i, j); }
+                    // Column symbols in PPA order: runs of random lengths, or constant.
+                    let mode = rng.below(4);
+                    let mut col = Vec::with_capacity(n_ref);
+                    let mut sym = rng.below(2) as u8;
+                    while col.len() < n_ref {
+                        let len = match mode { 0 => n_ref, 1 => 1 + rng.below(3) as usize, _ => 1 + rng.below(3000) as usize };
+                        for _ in 0..len.min(n_ref - col.len()) { col.push(sym); }
+                        sym ^= 1;
+                    }
+                    let ref_rac_l = col.iter().filter(|&&c| c == 0).count() as i32;
+                    let mut y = Vec::new();
+                    pack3(&col, n_ref, &mut y);
+                    let cur = |rng: &mut Xs| -> i32 {
+                        match rng.below(6) { 0 => 0, 1 => n_ref as i32, _ => rng.below(n_ref as u64 + 1) as i32 }
+                    };
+                    t.pbwt_index = (0..nt).map(|_| cur(&mut rng)).collect();
+                    t.f_k = (0..nt).map(|_| cur(&mut rng)).collect();
+                    t.g_k = (0..nt).map(|_| cur(&mut rng)).collect();
+
+                    // Eager.
+                    t.v_lazy = false;
+                    t.pbwt_array_a = perm.clone();
+                    let mut py = 0usize;
+                    t.read_full_pbwt_av(&y, &mut py, ref_rac_l);
+                    assert_eq!(py, y.len());
+                    let a_eager = t.pbwt_array_a.clone();
+                    let v_eager = t.pbwt_array_v.clone();
+                    // Lazy.
+                    t.v_lazy = true;
+                    t.pbwt_array_a = perm.clone();
+                    let mut py = 0usize;
+                    t.read_full_pbwt_av(&y, &mut py, ref_rac_l);
+                    assert_eq!(py, y.len());
+                    assert_eq!(t.pbwt_array_a, a_eager, "PPA n_ref={n_ref}");
+                    for htr in 0..nt {
+                        assert_eq!(t.v_answers[3 * htr], v_eager[t.pbwt_index[htr] as usize], "V[pidx] n_ref={n_ref}");
+                        assert_eq!(t.v_answers[3 * htr + 1], v_eager[t.f_k[htr] as usize], "V[f_k] n_ref={n_ref}");
+                        assert_eq!(t.v_answers[3 * htr + 2], v_eager[t.g_k[htr] as usize], "V[g_k] n_ref={n_ref}");
+                    }
+                }
+            }
+        }
     }
 }
