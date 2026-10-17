@@ -322,6 +322,13 @@ fn nocall_skip() -> bool {
     *V.get_or_init(|| !crate::config::is_one("SELPHI_NOCALL_FOLLOW"))
 }
 
+/// `SELPHI_NOCALL_DEDUP_OFF=1`: a target that skips its no-calls runs its HMM without the
+/// state dedup, as before the dedup grouped by window allele classes (A/B).
+fn nocall_dedup_off() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::config::is_one("SELPHI_NOCALL_DEDUP_OFF"))
+}
+
 /// Whether a target leaves its no-call sites out of its PBWT and HMM: the skip is on and
 /// the no-calls are known to the PBWT at all (`SELPHI_NOCALL_PBWT_FILL=1` reads the filled
 /// allele instead).
@@ -994,6 +1001,9 @@ pub fn process_window_hmm(
         }
     };
 
+    // Every reference haplotype's exact allele class over this window, for the HMM dedup:
+    // window-only, so computed once here rather than by every target.
+    let classes = super::hap_dedup::allele_classes(ref_bm, chip_start, n_var_w, n_ref);
     let adapt = if params.adapt_floor { perr_adapt() } else { None };
     // (haplotypes measured, raised, sum of their unmatched mass, sum of their floors)
     let mut adapt_stats = (0usize, 0usize, 0.0f64, 0.0f64);
@@ -1023,9 +1033,11 @@ pub fn process_window_hmm(
         // `called`: the target skipped its no-calls (`called_sites`); `csc` is then
         // over those sites, and so is the HMM -- the target's chip rows are the ones it
         // calls, as in a single-sample run -- with its weights put back on every window
-        // row by `expand_weights`. The panel-allele dedup reads contiguous chip rows, so
-        // it is not used for such a target (it compresses the state space; the model is
-        // the uncompressed one either way).
+        // row by `expand_weights`. Its dedup groups by the window's allele classes like every
+        // other target's: haplotypes identical over all window sites are identical over the
+        // ones it calls, so the groups are exact for its HMM (possibly fewer merges than its
+        // sites alone would allow; the model is the uncompressed one either way).
+        // `SELPHI_NOCALL_DEDUP_OFF=1`: no dedup for such a target (the previous behaviour).
         let finish = |tgt: usize, csc: &pbwt::CscMatchMatrix, called: Option<&[usize]>| -> (usize, HmmResult) {
             let prior = carry_view[tgt].prior.as_deref();
             // R4 per-hap emission confidence: hap `tgt` belongs to sample tgt/2.
@@ -1040,28 +1052,33 @@ pub fn process_window_hmm(
                 }
             });
             let t_hmm = std::time::Instant::now();
-            let run = |floor: f64, measure: bool| match called {
-                None => super::hmm::calculate_weights(
-                    csc, cm_w, &breaks_w, n_ref,
-                    est_ne, floor,
-                    Some(super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start }),
-                    n_var_w, None,
-                    ne_w, prior, conf_hap.as_deref(), 0.0, params.compute_posterior, measure,
-                ),
+            // Everything up to the emission floor once (`hmm::prepare_weights`); the adaptive
+            // floor's second run below starts from it.
+            let (prep, breaks) = match called {
+                None => (super::hmm::prepare_weights(
+                    csc, cm_w, n_ref, est_ne,
+                    Some(super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start, classes: Some(&classes) }),
+                    n_var_w, ne_w, prior,
+                ), breaks_w.clone()),
                 Some(sites) => {
                     let cm_s: Vec<f64> = sites.iter().map(|&v| cm_w[v]).collect();
                     let ne_s: Option<Vec<f64>> = ne_w.map(|ne| sites.iter().map(|&v| ne[v]).collect());
                     let n = sites.len();
-                    let mut r = super::hmm::calculate_weights(
-                        csc, &cm_s, &[(0usize, n)], n_ref,
-                        est_ne, floor, None, n, None,
-                        ne_s.as_deref(), prior, conf_hap.as_deref(), 0.0, params.compute_posterior, measure,
-                    );
+                    let src = (!nocall_dedup_off()).then_some(
+                        super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start, classes: Some(&classes) });
+                    (super::hmm::prepare_weights(csc, &cm_s, n_ref, est_ne, src, n, ne_s.as_deref(), prior),
+                     vec![(0usize, n)])
+                }
+            };
+            let run = |floor: f64, measure: bool| {
+                let mut r = super::hmm::run_weights(
+                    &prep, &breaks, floor, None, conf_hap.as_deref(), params.compute_posterior, measure);
+                if let Some(sites) = called {
                     let x = interp_x_w.unwrap_or(cm_w);
                     r.weights = r.weights.into_iter()
                         .map(|(st, w)| (st, expand_weights(w, sites, x, n_var_w))).collect();
-                    r
                 }
+                r
             };
             // Adaptive emission: a haplotype's first window measures at the default floor
             // and runs again at the raised one; later windows reuse it.

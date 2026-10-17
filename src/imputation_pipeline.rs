@@ -1584,23 +1584,14 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                 Some(&mut cb),
             )
         } else {
-            selphi::imputation::window_process::impute_window(
+            // Member 0 plus the phase-ensemble's extra members (each re-runs this window's
+            // HMM on its own phased scaffold; the per-hap Li-Stephens weights are averaged
+            // with member 0's). Interpolation below is linear in the weights, so the
+            // averaged weights produce the exact mean imputed dosage over all members — the
+            // panel is read and interpolated only ONCE. (Excluded under batched streaming.)
+            selphi::imputation::ensemble::impute_with_members(
                 &inputs, &hmm_params, precomputed_candidates.as_ref(),
-                &mut carry,
-                None,
-            )
-        };
-        let mut all_weights = hmm_output.all_weights;
-        selphi_debug!("  [MEM] win{} after HMM (member 0): rss={:.0} MB peak={:.0} MB", wi + 1, selphi::log::rss_mb(), selphi::log::peak_mem_mb());
-
-        // Phase-ensemble: re-run this window's HMM on each extra member's phased
-        // scaffold and average the per-hap Li-Stephens weights with member 0's.
-        // Interpolation below is linear in the weights, so the averaged weights
-        // produce the exact mean imputed dosage over all members — the panel is
-        // read and interpolated only ONCE. (Excluded under batched streaming.)
-        if !extra_scaffolds.is_empty() {
-            selphi::imputation::ensemble::fold_window(
-                &mut all_weights, &mut extra_scaffolds,
+                &mut carry, &mut extra_scaffolds,
                 &selphi::imputation::ensemble::FoldContext {
                     ref_bm: &ref_bm_imp,
                     targ_bm0: inputs.targ_alleles,
@@ -1611,9 +1602,10 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                     chip_end: window.chip_end,
                     interp_x: Some(&interp_x),
                 },
-                &hmm_params,
-            );
-        }
+            )
+        };
+        let all_weights = hmm_output.all_weights;
+        selphi_debug!("  [MEM] win{} after HMM (member 0): rss={:.0} MB peak={:.0} MB", wi + 1, selphi::log::rss_mb(), selphi::log::peak_mem_mb());
 
         let hmm_secs = t0_hmm.elapsed().as_secs_f64();
         let cpu_hmm = selphi::log::cpu_time_secs();

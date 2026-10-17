@@ -374,9 +374,7 @@ pub fn pbwt_forward_filtered<F: MatchFilter>(
 ) -> FwdResult {
     ws.reset(m);
 
-    let mut haps = vec![0i32; n_var * fl_fwd];
-    let mut lens = vec![0i32; n_var * fl_fwd];
-    let mut counts = vec![0i32; n_var];
+    let mut lists = MatchLists::new(n_var, fl_fwd);
 
     // Initial y
     ws.y[..m].copy_from_slice(&rows.row(0)[..m]);
@@ -390,9 +388,10 @@ pub fn pbwt_forward_filtered<F: MatchFilter>(
         if var >= min_l {
             let PbwtWorkspace { a, a_inv, d, y, ht, .. } = &mut *ws;
             scan_steps += scan_site(
-                a, a_inv, d, y, m, n_ref, var, n_var, fl_fwd, min_l, is_last,
-                target_abs, filter, &mut haps, &mut lens, &mut counts, ht,
+                a, a_inv, d, y, m, n_ref, var, min_l, is_last,
+                target_abs, filter, &mut lists, ht,
             );
+            lists.flush(ht);
         }
 
         let t_sort = if let Some(t) = t_scan {
@@ -419,7 +418,7 @@ pub fn pbwt_forward_filtered<F: MatchFilter>(
     }
     if diag { SPLIT_SCAN_STEPS.fetch_add(scan_steps, std::sync::atomic::Ordering::Relaxed); }
 
-    FwdResult { haps, lens, counts }
+    lists.into_fwd()
 }
 
 /// The neighbour scan at ONE site for ONE target: walk left and right from the
@@ -434,15 +433,15 @@ pub fn pbwt_forward_filtered<F: MatchFilter>(
 /// the sort shareable. Everything it writes (`haps`, `lens`, `counts`, `ht`) is
 /// per-target.
 ///
-/// Note `insert_match` is called with `dmin`, not `var`: a match is recorded at
+/// Note `MatchLists::insert` is called with `dmin`, not `var`: a match is recorded at
 /// the site where it STARTED, not at the site the scan is standing on.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn scan_site<F: MatchFilter>(
     a: &[i32], a_inv: &[i32], d: &[i32], y: &[u8], m: usize,
-    n_ref: usize, var: usize, n_var: usize, fl_fwd: usize, min_l: usize,
+    n_ref: usize, var: usize, min_l: usize,
     is_last: bool, target_abs: i32, filter: &F,
-    haps: &mut [i32], lens: &mut [i32], counts: &mut [i32], ht: &mut [i64],
+    lists: &mut MatchLists, ht: &mut [i64],
 ) -> u64 {
     let threshold = (var - min_l) as i32;
     let ib = a_inv[target_abs as usize] as usize;
@@ -464,7 +463,7 @@ fn scan_site<F: MatchFilter>(
                 && (y[ib] != y[pos as usize] || is_last) {
                 let mut length = var as i32 - dmin;
                 if is_last && y[ib] == y[pos as usize] { length += 1; }
-                insert_match(haps, lens, counts, ht, n_var, fl_fwd, dmin as usize, hap_at_pos, length);
+                lists.insert(ht, dmin as usize, hap_at_pos, length);
                 rec += 1;
                 if cap > 0 && rec >= cap { break; }
             }
@@ -486,7 +485,7 @@ fn scan_site<F: MatchFilter>(
                 && (y[pos] != y[ib] || is_last) {
                 let mut length = var as i32 - dmin;
                 if is_last && y[ib] == y[pos] { length += 1; }
-                insert_match(haps, lens, counts, ht, n_var, fl_fwd, dmin as usize, hap_at_pos, length);
+                lists.insert(ht, dmin as usize, hap_at_pos, length);
                 rec += 1;
                 if cap > 0 && rec >= cap { break; }
             }
@@ -507,7 +506,7 @@ fn scan_site<F: MatchFilter>(
 /// divergence between two recorded positions is a range maximum instead of a walk.
 /// The recorded positions are then visited in the SAME order as `scan_site` (left
 /// side outward, then right side outward) with the SAME `dmin`, so the sequence of
-/// `insert_match` calls — and therefore the output — is byte-identical.
+/// `MatchLists::insert` calls — and therefore the output — is byte-identical.
 pub(crate) struct SparseSite {
     minority: u8,
     pos: Vec<u32>,
@@ -605,9 +604,9 @@ impl SparseSite {
 fn scan_site_sparse<F: MatchFilter>(
     sp: &SparseSite,
     a: &[i32], a_inv: &[i32], d: &[i32], m: usize,
-    n_ref: usize, var: usize, n_var: usize, fl_fwd: usize, min_l: usize,
+    n_ref: usize, var: usize, min_l: usize,
     target_abs: i32, filter: &F,
-    haps: &mut [i32], lens: &mut [i32], counts: &mut [i32], ht: &mut [i64],
+    lists: &mut MatchLists, ht: &mut [i64],
 ) -> u64 {
     let threshold = (var - min_l) as i32;
     let ib = a_inv[target_abs as usize] as usize;
@@ -636,7 +635,7 @@ fn scan_site_sparse<F: MatchFilter>(
             let hap_at_pos = a[pos];
             if hap_at_pos < n_ref as i32 && filter.keep(hap_at_pos) {
                 let length = var as i32 - dmin;
-                insert_match(haps, lens, counts, ht, n_var, fl_fwd, dmin as usize, hap_at_pos, length);
+                lists.insert(ht, dmin as usize, hap_at_pos, length);
                 rec += 1;
                 if cap > 0 && rec >= cap { break; }
             }
@@ -658,7 +657,7 @@ fn scan_site_sparse<F: MatchFilter>(
             let hap_at_pos = a[pos];
             if hap_at_pos < n_ref as i32 && filter.keep(hap_at_pos) {
                 let length = var as i32 - dmin;
-                insert_match(haps, lens, counts, ht, n_var, fl_fwd, dmin as usize, hap_at_pos, length);
+                lists.insert(ht, dmin as usize, hap_at_pos, length);
                 rec += 1;
                 if cap > 0 && rec >= cap { break; }
             }
@@ -761,11 +760,7 @@ pub(crate) fn pbwt_forward_shared_impl(
 ) -> Vec<FwdResult> {
     ws.reset(m);
     let n_t = targets.len();
-    let mut out: Vec<FwdResult> = (0..n_t).map(|_| FwdResult {
-        haps: vec![0i32; n_var * fl_fwd],
-        lens: vec![0i32; n_var * fl_fwd],
-        counts: vec![0i32; n_var],
-    }).collect();
+    let mut out: Vec<MatchLists> = (0..n_t).map(|_| MatchLists::new(n_var, fl_fwd)).collect();
     while hts.len() < n_t { hts.push(Vec::new()); }
     for h in hts[..n_t].iter_mut() {
         if h.len() < n_ref { h.resize(n_ref, 0); }
@@ -803,22 +798,23 @@ pub(crate) fn pbwt_forward_shared_impl(
                 let ht = &mut hts[t];
                 if use_sparse && y[a_inv[tg.target_abs as usize] as usize] != sp.minority {
                     scan_steps += match tg.keep {
-                        None => scan_site_sparse(&sp, a, a_inv, d, m, n_ref, var, n_var, fl_fwd, min_l,
-                            tg.target_abs, &AllRefs, &mut o.haps, &mut o.lens, &mut o.counts, ht),
-                        Some(k) => scan_site_sparse(&sp, a, a_inv, d, m, n_ref, var, n_var, fl_fwd, min_l,
-                            tg.target_abs, &OnlyCands(k), &mut o.haps, &mut o.lens, &mut o.counts, ht),
+                        None => scan_site_sparse(&sp, a, a_inv, d, m, n_ref, var, min_l,
+                            tg.target_abs, &AllRefs, o, ht),
+                        Some(k) => scan_site_sparse(&sp, a, a_inv, d, m, n_ref, var, min_l,
+                            tg.target_abs, &OnlyCands(k), o, ht),
                     };
                     continue;
                 }
                 scan_steps += match tg.keep {
                     None => scan_site(
-                        a, a_inv, d, y, m, n_ref, var, n_var, fl_fwd, min_l, is_last,
-                        tg.target_abs, &AllRefs, &mut o.haps, &mut o.lens, &mut o.counts, ht),
+                        a, a_inv, d, y, m, n_ref, var, min_l, is_last,
+                        tg.target_abs, &AllRefs, o, ht),
                     Some(k) => scan_site(
-                        a, a_inv, d, y, m, n_ref, var, n_var, fl_fwd, min_l, is_last,
-                        tg.target_abs, &OnlyCands(k), &mut o.haps, &mut o.lens, &mut o.counts, ht),
+                        a, a_inv, d, y, m, n_ref, var, min_l, is_last,
+                        tg.target_abs, &OnlyCands(k), o, ht),
                 };
             }
+            for (o, ht) in out.iter_mut().zip(hts.iter_mut()) { o.flush(ht); }
         }
         let t_sort = if let Some(t) = t_scan {
             let now = std::time::Instant::now();
@@ -848,7 +844,7 @@ pub(crate) fn pbwt_forward_shared_impl(
     }
     if diag { SPLIT_SCAN_STEPS.fetch_add(scan_steps, std::sync::atomic::Ordering::Relaxed); }
 
-    out
+    out.into_iter().map(MatchLists::into_fwd).collect()
 }
 
 /// PBWT forward pass with match finding for a single target haplotype.
@@ -876,55 +872,225 @@ pub fn pbwt_forward_single(
     pbwt_forward_with_workspace(&mut ws, &mut rows, n_var, m, n_ref, min_l, fl_fwd, target_abs, None)
 }
 
-/// Insert a match into the sorted buffer at a specific variant position.
-/// Keeps top `fl` matches by length descending, tie-break by cumulative total descending.
-/// Uses copy_within (memmove) for the shift instead of element-by-element.
-#[inline]
-fn insert_match(
-    haps: &mut [i32],   // flat (n_var, fl)
-    lens: &mut [i32],   // flat (n_var, fl)
-    counts: &mut [i32], // (n_var,)
-    ht: &mut [i64],     // haplotype totals (n_ref,)
-    n_var: usize,
+/// The top-`fl` matches at every site while a pass inserts into them.
+///
+/// Each site keeps its matches longest first, ties broken by the haplotype totals at the
+/// time of insertion and then by arrival (later first): the order the longest-first array
+/// this replaced produced by scanning from its end past the shorter matches, then past the
+/// equal ones with total <= the new one's, and shifting the rest with `copy_within`.
+///
+/// Insertions are DEFERRED to `flush`, which a pass calls once per site it scans (forward)
+/// or per list it rebuilds (backward). Within one such batch every haplotype is inserted at
+/// most once -- the walk visits each sort position once -- so the totals that order equal
+/// lengths do not move while the batch is inserted, and the batch's matches are all longer
+/// than the ones already in their list (a list holds the matches that start at one site, and
+/// a later site makes them longer). Under those two conditions the one-at-a-time result is
+/// exactly the top `fl` of (list, batch) under (length, total, arrival): `flush` sorts the
+/// batch once and appends it, where the one-at-a-time insert scanned a block of equal-length
+/// matches (28 on average on 1000 Genomes) and shifted 46 entries per match. A batch that
+/// does not meet both conditions is replayed one at a time (`insert_now`), so the result is
+/// the same in every case.
+///
+/// Lists are STORED shortest first in a ring of `fl` slots (`heads[var]` = the shortest), so
+/// appending a batch and dropping the shortest of a full list are both cheap. `into_fwd` /
+/// `into_bwd` write them out longest first.
+#[derive(Clone)]
+pub(crate) struct MatchLists {
     fl: usize,
-    var: usize,
-    ref_hap: i32,
-    length: i32,
-) {
-    let _ = n_var;
-    ht[ref_hap as usize] += length as i64;
+    haps: Vec<i32>,
+    lens: Vec<i32>,
+    counts: Vec<i32>,
+    heads: Vec<u32>,
+    /// Insertions since the last `flush`.
+    pending: Vec<Pending>,
+    /// Duplicate-haplotype check for a batch: `seen[h] == stamp` once `h` is in it.
+    seen: Vec<u32>,
+    stamp: u32,
+}
 
-    let n = counts[var] as usize;
-    let base = var * fl;
-    let h = &mut haps[base..base + fl];
-    let l = &mut lens[base..base + fl];
+/// One deferred insertion: `total` is the haplotype's running total right after it.
+#[derive(Clone, Copy)]
+struct Pending { bucket: u32, length: i32, total: i64, seq: u32, hap: i32 }
 
-    if n >= fl && length < l[fl - 1] {
-        return;
+impl MatchLists {
+    pub(crate) fn new(n_var: usize, fl: usize) -> Self {
+        Self { fl, haps: vec![0i32; n_var * fl], lens: vec![0i32; n_var * fl],
+               counts: vec![0i32; n_var], heads: vec![0u32; n_var],
+               pending: Vec::new(), seen: Vec::new(), stamp: 0 }
     }
 
-    let total = ht[ref_hap as usize];
-    let new_n = (n + 1).min(fl);
-
-    // Find insertion position: after entries with (l > length) or (l == length && ht > total)
-    let mut j = n as isize - 1;
-    while j >= 0 && l[j as usize] < length { j -= 1; }
-    while j >= 0 && l[j as usize] == length && ht[h[j as usize] as usize] <= total { j -= 1; }
-    let insert_pos = (j + 1) as usize;
-
-    if insert_pos >= new_n {
-        counts[var] = new_n as i32;
-        return;
+    /// Insert a match at site `var` (applied by the next `flush`).
+    #[inline]
+    pub(crate) fn insert(&mut self, ht: &mut [i64], var: usize, ref_hap: i32, length: i32) {
+        ht[ref_hap as usize] += length as i64;
+        let seq = self.pending.len() as u32;
+        self.pending.push(Pending { bucket: var as u32, length, total: ht[ref_hap as usize], seq, hap: ref_hap });
     }
 
-    // Shift elements right by 1 using copy_within (memmove)
-    if insert_pos + 1 < new_n {
-        l.copy_within(insert_pos..new_n - 1, insert_pos + 1);
-        h.copy_within(insert_pos..new_n - 1, insert_pos + 1);
+    /// Apply the insertions made since the last flush (see the type's doc).
+    pub(crate) fn flush(&mut self, ht: &mut [i64]) {
+        if self.pending.is_empty() { return; }
+        let mut pend = std::mem::take(&mut self.pending);
+        if self.batchable(&mut pend) {
+            let mut a = 0;
+            while a < pend.len() {
+                let b = a + pend[a..].iter().take_while(|p| p.bucket == pend[a].bucket).count();
+                self.append_sorted(&pend[a..b]);
+                a = b;
+            }
+        } else {
+            // One at a time, from the totals as they were before the batch.
+            pend.sort_unstable_by_key(|p| p.seq);
+            for p in &pend { ht[p.hap as usize] -= p.length as i64; }
+            for p in &pend { self.insert_now(ht, p.bucket as usize, p.hap, p.length); }
+        }
+        pend.clear();
+        self.pending = pend;
     }
-    l[insert_pos] = length;
-    h[insert_pos] = ref_hap;
-    counts[var] = new_n as i32;
+
+    /// Sorts the batch by (list, length, total, arrival) and tells whether it can be applied
+    /// as a whole: no haplotype twice, and every match longer than its list's longest.
+    fn batchable(&mut self, pend: &mut [Pending]) -> bool {
+        self.stamp = self.stamp.wrapping_add(1);
+        if self.stamp == 0 { self.seen.fill(0); self.stamp = 1; }
+        for p in pend.iter() {
+            let h = p.hap as usize;
+            if h >= self.seen.len() { self.seen.resize(h + 1, 0); }
+            if self.seen[h] == self.stamp { return false; }
+            self.seen[h] = self.stamp;
+        }
+        pend.sort_unstable_by_key(|p| (p.bucket, p.length, p.total, p.seq));
+        let mut a = 0;
+        while a < pend.len() {
+            let var = pend[a].bucket as usize;
+            let n = self.counts[var] as usize;
+            if n > 0 && self.lens[self.slot(var * self.fl, self.heads[var] as usize, n - 1)] >= pend[a].length {
+                return false;
+            }
+            a += pend[a..].iter().take_while(|p| p.bucket as usize == var).count();
+        }
+        true
+    }
+
+    /// Put one list's batch, sorted ascending, above its current (shorter) matches and keep
+    /// the top `fl`.
+    fn append_sorted(&mut self, grp: &[Pending]) {
+        let fl = self.fl;
+        let var = grp[0].bucket as usize;
+        let base = var * fl;
+        let (mut head, mut n) = (self.heads[var] as usize, self.counts[var] as usize);
+        let mut grp = grp;
+        if n + grp.len() > fl {
+            let d = n + grp.len() - fl;
+            if d <= n {
+                head = (head + d) % fl;
+                n -= d;
+            } else {
+                grp = &grp[d - n..];
+                head = 0;
+                n = 0;
+            }
+        }
+        for (k, p) in grp.iter().enumerate() {
+            let at = self.slot(base, head, n + k);
+            self.lens[at] = p.length;
+            self.haps[at] = p.hap;
+        }
+        self.heads[var] = head as u32;
+        self.counts[var] = (n + grp.len()) as i32;
+    }
+
+    /// Slot of the `a`-th shortest match of the list whose ring starts at `base + head`.
+    #[inline(always)]
+    fn slot(&self, base: usize, head: usize, a: usize) -> usize {
+        let p = head + a;
+        base + if p >= self.fl { p - self.fl } else { p }
+    }
+
+    /// Insert a match at site `var` now. Keeps the top `fl` matches by length, descending; a
+    /// tie goes after the equal-length matches whose haplotype total exceeds its own, found
+    /// from the shortest end. The longest-first array this replaced did exactly that: scan
+    /// from its end past the shorter matches, then past the equal ones with total <= its own.
+    fn insert_now(&mut self, ht: &mut [i64], var: usize, ref_hap: i32, length: i32) {
+        ht[ref_hap as usize] += length as i64;
+        let fl = self.fl;
+        let n = self.counts[var] as usize;
+        let base = var * fl;
+        let head = self.heads[var] as usize;
+
+        if n >= fl && length < self.lens[self.slot(base, head, 0)] {
+            return;
+        }
+        let total = ht[ref_hap as usize];
+
+        // Matches shorter than `length` (binary search: the ring is in ascending length),
+        // then past the equal ones whose total does not exceed this one's.
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.lens[self.slot(base, head, mid)] < length { lo = mid + 1; } else { hi = mid; }
+        }
+        let mut i = lo;
+        while i < n {
+            let k = self.slot(base, head, i);
+            if self.lens[k] != length || ht[self.haps[k] as usize] > total { break; }
+            i += 1;
+        }
+
+        // The new match goes to position `i` of the ascending list (shifting `i..n` up), or,
+        // when the list is full, the shortest is dropped first and it goes to `i - 1`; `i == 0`
+        // on a full list makes it the shortest, which is not kept.
+        let (head, at, n_after) = if n < fl {
+            (head, i, n + 1)
+        } else {
+            if i == 0 { return; }
+            let h = if head + 1 == fl { 0 } else { head + 1 };
+            self.heads[var] = h as u32;
+            (h, i - 1, fl)
+        };
+        let mut k = n_after - 1;
+        while k > at {
+            let (dst, src) = (self.slot(base, head, k), self.slot(base, head, k - 1));
+            self.lens[dst] = self.lens[src];
+            self.haps[dst] = self.haps[src];
+            k -= 1;
+        }
+        let p = self.slot(base, head, at);
+        self.lens[p] = length;
+        self.haps[p] = ref_hap;
+        self.counts[var] = n_after as i32;
+    }
+
+    /// Every site's list longest first at the start of its `fl` slots, the rest zero.
+    fn into_longest_first(mut self) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+        debug_assert!(self.pending.is_empty(), "MatchLists read before flush");
+        let fl = self.fl;
+        let (mut th, mut tl) = (vec![0i32; fl], vec![0i32; fl]);
+        for var in 0..self.counts.len() {
+            let n = self.counts[var] as usize;
+            let (base, head) = (var * fl, self.heads[var] as usize);
+            for j in 0..n {
+                let k = self.slot(base, head, n - 1 - j);
+                th[j] = self.haps[k];
+                tl[j] = self.lens[k];
+            }
+            self.haps[base..base + n].copy_from_slice(&th[..n]);
+            self.lens[base..base + n].copy_from_slice(&tl[..n]);
+            self.haps[base + n..base + fl].fill(0);
+            self.lens[base + n..base + fl].fill(0);
+        }
+        (self.haps, self.lens, self.counts)
+    }
+
+    pub(crate) fn into_fwd(self) -> FwdResult {
+        let (haps, lens, counts) = self.into_longest_first();
+        FwdResult { haps, lens, counts }
+    }
+
+    fn into_bwd(self) -> BwdResult {
+        let (haps, lens, counts) = self.into_longest_first();
+        BwdResult { haps, lens, counts }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -950,9 +1116,7 @@ pub fn backward_filter_single(
     fl_fwd: usize,
     fl_bwd: usize,
 ) -> BwdResult {
-    let mut haps = vec![0i32; n_var * fl_bwd];
-    let mut lens = vec![0i32; n_var * fl_bwd];
-    let mut counts = vec![0i32; n_var];
+    let mut lists = MatchLists::new(n_var, fl_bwd);
     let mut ht = vec![0i64; n_ref];
 
     for var in (0..n_var).rev() {
@@ -960,17 +1124,12 @@ pub fn backward_filter_single(
         let fwd_base = var * fl_fwd;
         // Process in reverse order (j from n-1 to 0) for correct match merging
         for j in (0..n).rev() {
-            let ref_hap = fwd.haps[fwd_base + j];
-            let length = fwd.lens[fwd_base + j];
-            insert_match(
-                &mut haps, &mut lens, &mut counts,
-                &mut ht, n_var, fl_bwd,
-                var, ref_hap, length,
-            );
+            lists.insert(&mut ht, var, fwd.haps[fwd_base + j], fwd.lens[fwd_base + j]);
         }
+        lists.flush(&mut ht);
     }
 
-    BwdResult { haps, lens, counts }
+    lists.into_bwd()
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,27 +1201,93 @@ mod tests {
 
     #[test]
     fn test_insert_match_basic() {
-        let fl = 3;
-        let n_var = 2;
-        let mut haps = vec![0i32; n_var * fl];
-        let mut lens = vec![0i32; n_var * fl];
-        let mut counts = vec![0i32; n_var];
+        let mut lists = MatchLists::new(2, 3);
         let mut ht = vec![0i64; 10];
 
         // Insert 4 matches at var 0 (only 3 kept)
-        insert_match(&mut haps, &mut lens, &mut counts, &mut ht, n_var, fl, 0, 5, 10);
-        insert_match(&mut haps, &mut lens, &mut counts, &mut ht, n_var, fl, 0, 3, 20);
-        insert_match(&mut haps, &mut lens, &mut counts, &mut ht, n_var, fl, 0, 7, 5);
-        insert_match(&mut haps, &mut lens, &mut counts, &mut ht, n_var, fl, 0, 1, 15);
+        lists.insert(&mut ht, 0, 5, 10);
+        lists.insert(&mut ht, 0, 3, 20);
+        lists.insert(&mut ht, 0, 7, 5);
+        lists.insert(&mut ht, 0, 1, 15);
+        lists.flush(&mut ht);
+        let r = lists.into_fwd();
 
-        assert_eq!(counts[0], 3);
+        assert_eq!(r.counts[0], 3);
         // Top 3 by length: 20, 15, 10
-        assert_eq!(lens[0], 20);
-        assert_eq!(lens[1], 15);
-        assert_eq!(lens[2], 10);
-        assert_eq!(haps[0], 3);
-        assert_eq!(haps[1], 1);
-        assert_eq!(haps[2], 5);
+        assert_eq!(&r.lens[..3], &[20, 15, 10]);
+        assert_eq!(&r.haps[..3], &[3, 1, 5]);
+    }
+
+    /// The longest-first array insert that `MatchLists::insert` replaced, verbatim: the
+    /// reference it must reproduce exactly.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_match_linear(haps: &mut [i32], lens: &mut [i32], counts: &mut [i32], ht: &mut [i64],
+                           fl: usize, var: usize, ref_hap: i32, length: i32) {
+        ht[ref_hap as usize] += length as i64;
+        let n = counts[var] as usize;
+        let base = var * fl;
+        let h = &mut haps[base..base + fl];
+        let l = &mut lens[base..base + fl];
+        if n >= fl && length < l[fl - 1] { return; }
+        let total = ht[ref_hap as usize];
+        let new_n = (n + 1).min(fl);
+        let mut j = n as isize - 1;
+        while j >= 0 && l[j as usize] < length { j -= 1; }
+        while j >= 0 && l[j as usize] == length && ht[h[j as usize] as usize] <= total { j -= 1; }
+        let insert_pos = (j + 1) as usize;
+        if insert_pos >= new_n { counts[var] = new_n as i32; return; }
+        if insert_pos + 1 < new_n {
+            l.copy_within(insert_pos..new_n - 1, insert_pos + 1);
+            h.copy_within(insert_pos..new_n - 1, insert_pos + 1);
+        }
+        l[insert_pos] = length;
+        h[insert_pos] = ref_hap;
+        counts[var] = new_n as i32;
+    }
+
+    /// Drive `MatchLists` (batched per site) and the verbatim old insert (one at a time)
+    /// with the same sequence and compare after every batch. `realistic`: as in a PBWT pass,
+    /// a batch holds each haplotype at most once and its matches end at the batch's site, so
+    /// they are longer than everything already in their list (the batched path). Otherwise
+    /// haplotypes repeat and lengths are arbitrary (the one-at-a-time replay).
+    fn drive(realistic: bool, seed: u64, fl: usize) {
+        let (n_var, n_ref) = (6usize, 30usize);
+        let mut a = MatchLists::new(n_var, fl);
+        let mut ht_a = vec![0i64; n_ref];
+        let mut b = (vec![0i32; n_var * fl], vec![0i32; n_var * fl], vec![0i32; n_var], vec![0i64; n_ref]);
+        let mut x: u64 = seed | 1;
+        let mut next = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        for site in 0..400usize {
+            let k = (next() % 25) as usize;
+            let mut haps: Vec<i32> = (0..n_ref as i32).collect();
+            for i in 0..haps.len() { let r = (next() as usize) % (i + 1); haps.swap(i, r); }
+            for e in 0..k {
+                let (hap, var, length) = if realistic {
+                    // start `var` <= site, length = site - start (+1 at random, like is_last)
+                    let var = (next() % n_var as u64) as usize;
+                    (haps[e], var, (site + 1 - var.min(site)) as i32 + (next() % 2) as i32 * (site % 97 == 96) as i32)
+                } else {
+                    ((next() % n_ref as u64) as i32, (next() % n_var as u64) as usize, 1 + (next() % 5) as i32)
+                };
+                a.insert(&mut ht_a, var, hap, length);
+                insert_match_linear(&mut b.0, &mut b.1, &mut b.2, &mut b.3, fl, var, hap, length);
+            }
+            a.flush(&mut ht_a);
+            assert_eq!(ht_a, b.3, "totals diverged at site {site}");
+            let r = a.clone().into_fwd();
+            assert_eq!((&r.haps, &r.lens, &r.counts), (&b.0, &b.1, &b.2),
+                       "realistic {realistic} fl {fl} diverged at site {site}");
+        }
+    }
+
+    #[test]
+    fn match_lists_equal_the_linear_scan() {
+        for seed in 0..40u64 {
+            for fl in [1usize, 3, 8, 40] {
+                drive(true, seed * 7919 + fl as u64, fl);
+                drive(false, seed * 104_729 + fl as u64, fl);
+            }
+        }
     }
 
     /// The workspace-reusing forward pass and the single-shot forward pass must

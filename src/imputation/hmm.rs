@@ -184,11 +184,27 @@ impl CsrWeights {
 /// `SELPHI_NO_P10_FILTER=1` disables only the eviction (p_err unchanged);
 /// `SELPHI_PERR_OVERRIDE` replaces only p_err (filter unchanged) — together
 /// they let each effect be A/B'd on its own.
+/// The window's emission error rate before the floor is applied: `resolve(min_perr)` is
+/// what `filter_matches_fast` returned for floor `min_perr` before the floor became a
+/// parameter of `run_weights` alone.
+#[derive(Clone, Copy)]
+enum PerrBase { Override(f64), NoMatch, Saturated(f64), Raw(f64) }
+
+impl PerrBase {
+    fn resolve(self, min_perr: f64) -> f64 {
+        match self {
+            PerrBase::Override(v) => v,
+            PerrBase::NoMatch => min_perr.max(0.0001),
+            PerrBase::Saturated(raw) => { perr_saturation_warn(raw, min_perr); min_perr.max(0.0001) }
+            PerrBase::Raw(raw) => raw.max(0.0001).max(min_perr),
+        }
+    }
+}
+
 fn filter_matches_fast(
     ordered_matches: &[Vec<i64>],
     n_ref_haps: usize,
-    min_perr: f64,
-) -> (Vec<Vec<i64>>, f64) {
+) -> (Vec<Vec<i64>>, PerrBase) {
     let no_filter = no_p10_filter();
     let p_err_override = perr_override();
 
@@ -202,7 +218,7 @@ fn filter_matches_fast(
 
     let mut nonzero_counts: Vec<u32> = counts.iter().copied().filter(|&c| c > 0).collect();
     if nonzero_counts.is_empty() {
-        let p_err = p_err_override.unwrap_or_else(|| min_perr.max(0.0001));
+        let p_err = p_err_override.map_or(PerrBase::NoMatch, PerrBase::Override);
         return (ordered_matches.to_vec(), p_err);
     }
 
@@ -226,14 +242,11 @@ fn filter_matches_fast(
     // no information about match quality, so a saturated window falls back to
     // the same floor the heuristic targets on large panels.
     let raw_perr = cutoff as f64 / n_sites as f64;
-    let p_err = p_err_override.unwrap_or_else(|| {
-        if raw_perr > 0.5 {
-            perr_saturation_warn(raw_perr, min_perr);
-            min_perr.max(0.0001)
-        } else {
-            raw_perr.max(0.0001).max(min_perr)
-        }
-    });
+    let p_err = match p_err_override {
+        Some(v) => PerrBase::Override(v),
+        None if raw_perr > 0.5 => PerrBase::Saturated(raw_perr),
+        None => PerrBase::Raw(raw_perr),
+    };
 
     if no_filter {
         return (ordered_matches.to_vec(), p_err);
@@ -355,24 +368,25 @@ fn compute_precomb(
 fn build_dense_matches(
     matches: &[Vec<i64>],
 ) -> (Vec<Vec<u32>>, Vec<usize>, Vec<i64>, usize) {
-    // Unique hap IDs, ASCENDING — a sort+dedup Vec replaces the BTreeSet, and a
-    // binary_search replaces the HashMap reverse-map. `state_to_hap` stays ascending
-    // (== the old BTreeSet iteration order), so each hap's state index is identical →
-    // bit-identical downstream; just one fewer tree + hashmap alloc/lookup per HMM call.
-    let mut state_to_hap: Vec<i64> = matches.iter().flatten().copied().collect();
-    state_to_hap.sort_unstable();
-    state_to_hap.dedup();
+    // Unique hap IDs, ASCENDING, and each one's state index. A mark array over the hap IDs
+    // and a lookup table replace collecting and sorting every match (~500k per call) and a
+    // binary search per match: the same ascending `state_to_hap` (== the old sort+dedup,
+    // and the BTreeSet before it), so the same state indices and a bit-identical HMM.
+    let max_id = matches.iter().flatten().copied().max().unwrap_or(-1);
+    let mut index = vec![u32::MAX; (max_id + 1).max(0) as usize];
+    for &h in matches.iter().flatten() { index[h as usize] = 0; }
+    let mut state_to_hap: Vec<i64> = Vec::new();
+    for (h, slot) in index.iter_mut().enumerate() {
+        if *slot == 0 { *slot = state_to_hap.len() as u32; state_to_hap.push(h as i64); }
+    }
     let n_states = state_to_hap.len();
 
-    // Build dense_matches (hap_id → state index via binary_search on the sorted vec).
     let mut dense_matches = Vec::with_capacity(matches.len());
     let mut n_matches = Vec::with_capacity(matches.len());
     for site in matches {
         // u32, not usize: a state index is < n_states, and this is the one
         // per-target match structure that stays resident through the whole HMM.
-        let dm: Vec<u32> = site.iter()
-            .map(|&h| state_to_hap.binary_search(&h).expect("hap in state_to_hap") as u32)
-            .collect();
+        let dm: Vec<u32> = site.iter().map(|&h| index[h as usize]).collect();
         n_matches.push(dm.len());
         dense_matches.push(dm);
     }
@@ -389,30 +403,44 @@ fn prune_row(
     row_sum: f64,
     prune_threshold: f64,
     group_sizes: Option<&[f32]>,
-) {
+) -> f64 {
+    let pruned_sum = pruned_mass(row, row_sum, prune_threshold, group_sizes);
+    prune_apply(row, row_sum, prune_threshold, group_sizes, pruned_sum);
+    pruned_sum
+}
+
+/// `prune_row`'s first pass: the mass of the states that survive (0 when pruning is off).
+#[inline]
+fn pruned_mass(row: &[f32], row_sum: f64, prune_threshold: f64, group_sizes: Option<&[f32]>) -> f64 {
+    let mut pruned_sum = 0.0f64;
     if prune_threshold > 0.0 && row_sum > 0.0 {
         let thresh = (prune_threshold * row_sum) as f32;
         if let Some(gs) = group_sizes {
-            let mut pruned_sum = 0.0f64;
             for (j, &v) in row.iter().enumerate() {
                 if v >= thresh * gs[j] { pruned_sum += v as f64; }
             }
-            if pruned_sum > 0.0 {
-                let rescale = (row_sum / pruned_sum) as f32;
-                for (j, v) in row.iter_mut().enumerate() {
-                    if *v < thresh * gs[j] { *v = 0.0; } else { *v *= rescale; }
-                }
-            }
         } else {
-            let mut pruned_sum = 0.0f64;
             for &v in row.iter() {
                 if v >= thresh { pruned_sum += v as f64; }
             }
-            if pruned_sum > 0.0 {
-                let rescale = (row_sum / pruned_sum) as f32;
-                for v in row.iter_mut() {
-                    if *v < thresh { *v = 0.0; } else { *v *= rescale; }
-                }
+        }
+    }
+    pruned_sum
+}
+
+/// `prune_row`'s second pass, given the surviving mass the first pass found.
+#[inline]
+fn prune_apply(row: &mut [f32], row_sum: f64, prune_threshold: f64, group_sizes: Option<&[f32]>, pruned_sum: f64) {
+    if prune_threshold > 0.0 && row_sum > 0.0 && pruned_sum > 0.0 {
+        let thresh = (prune_threshold * row_sum) as f32;
+        let rescale = (row_sum / pruned_sum) as f32;
+        if let Some(gs) = group_sizes {
+            for (j, v) in row.iter_mut().enumerate() {
+                if *v < thresh * gs[j] { *v = 0.0; } else { *v *= rescale; }
+            }
+        } else {
+            for v in row.iter_mut() {
+                if *v < thresh { *v = 0.0; } else { *v *= rescale; }
             }
         }
     }
@@ -438,7 +466,8 @@ struct LsHmmModel<'a> {
     p_err: f64,
     // Both passes hold SUMMED group mass: alpha_G = g*alpha_h and beta_G = g*beta_h.
     // Members must have identical emissions and incoming per-haplotype priors.
-    group_sizes: Option<&'a [f64]>,
+    // The f32 of each group size (the dense loops' `p_rec * g`; was converted per element).
+    group_sizes: Option<&'a [f32]>,
     // None for no dedup or SELPHI_HMM_DEDUP_OLD: retain original ungrouped loops.
     group_mass: Option<GroupMass<'a>>,
     emission_ratios: Option<&'a [Vec<f64>]>,
@@ -464,7 +493,27 @@ fn forward_row(
     cur: &mut [f32],
     last_sum: f64,
     prune_threshold: f64,
-) -> f64 {
+) -> (f64, f64) {
+    forward_step(model, chip_idx, prev, cur, last_sum);
+
+    // Row sum (f64 accumulation for stability)
+    let mut row_sum = 0.0f64;
+    for &v in cur.iter() { row_sum += v as f64; }
+
+    // State pruning for large panels
+    let pruned_sum = prune_row(cur, row_sum, prune_threshold, model.group_mass.map(|gm| gm.sizes));
+    (row_sum, pruned_sum)
+}
+
+/// `forward_row` before its row sum and pruning: transition and emission only.
+#[inline]
+fn forward_step(
+    model: &LsHmmModel,
+    chip_idx: usize,
+    prev: &[f32],
+    cur: &mut [f32],
+    last_sum: f64,
+) {
     let &LsHmmModel {
         dense_matches,
         n_matches,
@@ -473,9 +522,9 @@ fn forward_row(
         n_states,
         p_err,
         group_sizes,
-        group_mass,
         emission_ratios,
         site_perr,
+        ..
     } = model;
     let p_no_err = 1.0 - p_err;
     let nh = n_haps[chip_idx] as f32;
@@ -492,7 +541,7 @@ fn forward_row(
     // Dense pass: auto-vectorizes to AVX2 (8 × f32)
     if let Some(gs) = group_sizes {
         for j in 0..n_states {
-            let val = scale * prev[j] + p_rec * gs[j] as f32;
+            let val = scale * prev[j] + p_rec * gs[j];
             cur[j] = p_err_f * val;
         }
     } else {
@@ -519,14 +568,6 @@ fn forward_row(
             cur[j] *= ratio;
         }
     }
-
-    // Row sum (f64 accumulation for stability)
-    let mut row_sum = 0.0f64;
-    for j in 0..n_states { row_sum += cur[j] as f64; }
-
-    // State pruning for large panels
-    prune_row(cur, row_sum, prune_threshold, group_mass.map(|gm| gm.sizes));
-    row_sum
 }
 
 /// The forward pass, stored at √n checkpoints instead of in full.
@@ -539,11 +580,12 @@ fn forward_row(
 /// solved the same problem the same way (`lcwgs/hmm.rs`, documented bit-identical
 /// and faster from the cache win); this is that pattern.
 ///
-/// Row `c*stride` is stored for every checkpoint `c`, together with the pre-prune
-/// sum the row after it scales by. The backward walks blocks right to left and
-/// `recompute_block` regenerates a block's rows from its checkpoint with the very
-/// same `forward_row`, so every value the backward reads is the value the forward
-/// computed. Peak forward memory: (n_chk + stride) × n_states ≈ 2√n_rows ×
+/// Row `c*stride` is stored for every checkpoint `c`, and every row's pre-prune sum
+/// (and surviving mass, when pruning is on). The backward walks blocks right to left
+/// and `recompute_block` regenerates a block's rows from its checkpoint with the very
+/// same `forward_step` and `prune_apply`, so every value the backward reads is the
+/// value the forward computed; the stored sums spare it the serial f64 summation the
+/// forward already did once (16 bytes a row, ~3% of a 1000 Genomes run's CPU). Peak forward memory: (n_chk + stride) × n_states ≈ 2√n_rows ×
 /// n_states, e.g. ~16 MB where the full matrix was ~850 MB.
 ///
 /// `last_row` is the block's final row as the backward and the cross-window
@@ -557,8 +599,10 @@ struct FwdCheckpoints {
     n_states: usize,
     /// n_chk × n_states: row c*stride.
     rows: Vec<f32>,
-    /// n_chk: pre-prune sum carried INTO row c*stride+1.
-    sums: Vec<f64>,
+    /// n_rows: row r's pre-prune sum (row 0: the sum carried into row 1).
+    row_sums: Vec<f64>,
+    /// n_rows: row r's surviving mass after pruning (0 when nothing was pruned).
+    pruned: Vec<f64>,
     /// Row n_rows-1 exactly as the backward consumes it.
     last_row: Vec<f32>,
 }
@@ -577,10 +621,13 @@ impl FwdCheckpoints {
         let ns = self.n_states;
         let (lo, hi) = self.block_range(b);
         blk[..ns].copy_from_slice(&self.rows[b * ns..(b + 1) * ns]);
-        let mut ls = self.sums[b];
+        let gs = model.group_mass.map(|gm| gm.sizes);
         for i in 1..(hi - lo) {
+            let r = lo + i;
             let (left, right) = blk.split_at_mut(i * ns);
-            ls = forward_row(model, start + lo + i - 1, &left[(i - 1) * ns..i * ns], &mut right[..ns], ls, prune_threshold);
+            let cur = &mut right[..ns];
+            forward_step(model, start + r - 1, &left[(i - 1) * ns..i * ns], cur, self.row_sums[r - 1]);
+            prune_apply(cur, self.row_sums[r], prune_threshold, gs, self.pruned[r]);
         }
         if hi == self.n_rows {
             blk[(hi - 1 - lo) * ns..(hi - lo) * ns].copy_from_slice(&self.last_row);
@@ -619,7 +666,8 @@ fn compute_forward(
 
     let mut chk = TL_FWD_BUF.with(|buf| tl_take(buf, n_chk * n_states));
     if chk.len() < n_chk * n_states { chk = vec![0.0f32; n_chk * n_states]; }
-    let mut sums = vec![0.0f64; n_chk];
+    let mut row_sums = vec![0.0f64; n_rows];
+    let mut pruned = vec![0.0f64; n_rows];
     let mut prev = vec![0.0f32; n_states];
     let mut cur = vec![0.0f32; n_states];
 
@@ -638,14 +686,15 @@ fn compute_forward(
     }
     let mut last_sum = if init_alpha.is_some() { init_last_sum } else { 1.0 };
     chk[..n_states].copy_from_slice(&prev);
-    sums[0] = last_sum;
+    row_sums[0] = last_sum;
 
     let diag = prune_diag();
     let (mut diag_surv, mut diag_rows) = (0u64, 0u64);
 
     // Forward iterations — f32 for 2× cache + 2× SIMD width.
     for row in 1..n_rows {
-        last_sum = forward_row(model, start + row - 1, &prev, &mut cur, last_sum, prune_threshold);
+        let (rs, ps) = forward_row(model, start + row - 1, &prev, &mut cur, last_sum, prune_threshold);
+        (last_sum, row_sums[row], pruned[row]) = (rs, rs, ps);
         if diag {
             diag_surv += cur.iter().filter(|&&v| v > 0.0).count() as u64;
             diag_rows += 1;
@@ -653,7 +702,6 @@ fn compute_forward(
         if row % stride == 0 {
             let c = row / stride;
             chk[c * n_states..(c + 1) * n_states].copy_from_slice(&cur);
-            sums[c] = last_sum;
         }
         std::mem::swap(&mut prev, &mut cur);
     }
@@ -706,7 +754,7 @@ fn compute_forward(
     let last_alpha: Vec<f64> = pre_boundary_alpha.unwrap_or_else(|| {
         prev.iter().map(|&v| v as f64).collect()
     });
-    let cp = FwdCheckpoints { stride, n_rows, n_states, rows: chk, sums, last_row: prev };
+    let cp = FwdCheckpoints { stride, n_rows, n_states, rows: chk, row_sums, pruned, last_row: prev };
     (cp, last_alpha, last_sum)
 }
 
@@ -805,8 +853,10 @@ fn emit_row(
     threshold: f32,
     indices: &mut Vec<i32>,
     data: &mut Vec<f32>,
+    // `w`'s sum when the caller computed it while building the row (`combine_row_sum`).
+    known_sum: Option<f64>,
 ) {
-    let mut row_sum: f64 = w.iter().map(|&v| v as f64).sum();
+    let mut row_sum: f64 = known_sum.unwrap_or_else(|| w.iter().map(|&v| v as f64).sum());
 
     if row_sum == 0.0 {
         let chip_idx = start + row;
@@ -833,6 +883,52 @@ fn emit_row(
     if row_sum == 0.0 { row_sum = 1.0; }
     let inv_sum = (1.0 / row_sum) as f32;
 
+    let mut push = |j: usize, v: f32| {
+        let hap_id = state_to_hap[j];
+        if let Some(gm) = group_members {
+            if let Some(Some(members)) = gm.get(hap_id as usize) {
+                let share = v / members.len() as f32;
+                for &m in members {
+                    indices.push(m as i32);
+                    data.push(share);
+                }
+            } else {
+                indices.push(hap_id as i32);
+                data.push(v);
+            }
+        } else {
+            indices.push(hap_id as i32);
+            data.push(v);
+        }
+    };
+
+    // The threshold below discards mass WITHOUT renormalising, so each row's
+    // surviving sum is 1 - (truncated mass) and differs from row to row.
+    // Interpolation divides by `(1-t)*Sum_w(start) + t*Sum_w(end)`, so a row that
+    // lost more mass is slightly down-weighted against its neighbour; and summing
+    // CSRs across phase-ensemble members is a mass-weighted, not arithmetic, mean
+    // of the member dosages. `SELPHI_HMM_RENORM=1` restores Sum = 1 per row and
+    // makes both exact. Measured R2-neutral on chr22 801s (OVERALL 0.4776
+    // unchanged, per-sample 0.915204 -> 0.915205), so it stays opt-in and the
+    // default output is byte-identical.
+    if !hmm_renorm() {
+        // One pass: scale, threshold and keep. `w` is scratch the caller rebuilds before
+        // its next use, so it is not written back (it used to be scaled and zeroed in
+        // place, then scanned again).
+        if let Some(gs) = group_sizes {
+            for (j, &x) in w.iter().enumerate() {
+                let v = x * inv_sum;
+                if !(v < threshold * gs[j]) && v > 0.0 { push(j, v); }
+            }
+        } else {
+            for (j, &x) in w.iter().enumerate() {
+                let v = x * inv_sum;
+                if !(v < threshold) && v > 0.0 { push(j, v); }
+            }
+        }
+        return;
+    }
+
     if let Some(gs) = group_sizes {
         for (j, v) in w.iter_mut().enumerate() {
             *v *= inv_sum;
@@ -844,43 +940,13 @@ fn emit_row(
             if *v < threshold { *v = 0.0; }
         }
     }
-
-    // The threshold above discards mass WITHOUT renormalising, so each row's
-    // surviving sum is 1 - (truncated mass) and differs from row to row.
-    // Interpolation divides by `(1-t)*Sum_w(start) + t*Sum_w(end)`, so a row that
-    // lost more mass is slightly down-weighted against its neighbour; and summing
-    // CSRs across phase-ensemble members is a mass-weighted, not arithmetic, mean
-    // of the member dosages. `SELPHI_HMM_RENORM=1` restores Sum = 1 per row and
-    // makes both exact. Measured R2-neutral on chr22 801s (OVERALL 0.4776
-    // unchanged, per-sample 0.915204 -> 0.915205), so it stays opt-in and the
-    // default output is byte-identical.
-    if hmm_renorm() {
-        let kept: f64 = w.iter().map(|&v| v as f64).sum();
-        if kept > 0.0 {
-            let re = (1.0 / kept) as f32;
-            for v in w.iter_mut() { *v *= re; }
-        }
+    let kept: f64 = w.iter().map(|&v| v as f64).sum();
+    if kept > 0.0 {
+        let re = (1.0 / kept) as f32;
+        for v in w.iter_mut() { *v *= re; }
     }
-
     for (j, &v) in w.iter().enumerate() {
-        if v > 0.0 {
-            let hap_id = state_to_hap[j];
-            if let Some(gm) = group_members {
-                if let Some(Some(members)) = gm.get(hap_id as usize) {
-                    let share = v / members.len() as f32;
-                    for &m in members {
-                        indices.push(m as i32);
-                        data.push(share);
-                    }
-                } else {
-                    indices.push(hap_id as i32);
-                    data.push(v);
-                }
-            } else {
-                indices.push(hap_id as i32);
-                data.push(v);
-            }
-        }
+        if v > 0.0 { push(j, v); }
     }
 }
 
@@ -893,6 +959,41 @@ fn combine_row(fwd: &[f32], bwd: &[f32], out: &mut [f32], inverse_sizes: Option<
     } else {
         for j in 0..out.len() { out[j] = fwd[j] * bwd[j]; }
     }
+}
+
+/// `combine_row` that also returns the combined row's f64 sum, accumulated in index order
+/// exactly as `emit_row` would accumulate it.
+#[inline]
+fn combine_row_sum(fwd: &[f32], bwd: &[f32], out: &mut [f32], inverse_sizes: Option<&[f32]>) -> f64 {
+    let mut s = 0.0f64;
+    if let Some(inv) = inverse_sizes {
+        for j in 0..out.len() { out[j] = fwd[j] * bwd[j] * inv[j]; s += out[j] as f64; }
+    } else {
+        for j in 0..out.len() { out[j] = fwd[j] * bwd[j]; s += out[j] as f64; }
+    }
+    s
+}
+
+/// `combine_row_sum` that also returns `bwd`'s own f64 sum: the backward row sum and the
+/// combined row sum are two independent serial chains, each kept in index order, run in
+/// one loop so the core overlaps their latencies (they were two passes of their own).
+#[inline]
+fn combine_row_sums(fwd: &[f32], bwd: &[f32], out: &mut [f32], inverse_sizes: Option<&[f32]>) -> (f64, f64) {
+    let (mut sb, mut sw) = (0.0f64, 0.0f64);
+    if let Some(inv) = inverse_sizes {
+        for j in 0..out.len() {
+            sb += bwd[j] as f64;
+            out[j] = fwd[j] * bwd[j] * inv[j];
+            sw += out[j] as f64;
+        }
+    } else {
+        for j in 0..out.len() {
+            sb += bwd[j] as f64;
+            out[j] = fwd[j] * bwd[j];
+            sw += out[j] as f64;
+        }
+    }
+    (sb, sw)
 }
 
 /// Streaming backward pass + online combination with the forward matrix.
@@ -995,18 +1096,23 @@ fn streaming_backward_combine(
 
             if row == n_rows - 1 {
                 // Last row: no backward step, combine with the initial beta.
-                combine_row(frow, &next_bwd, &mut w_row, inverse_sizes);
                 if fix.holds(row) {
+                    combine_row(frow, &next_bwd, &mut w_row, inverse_sizes);
                     held.push((row, w_row.clone()));
                 } else {
+                    let w_sum = combine_row_sum(frow, &next_bwd, &mut w_row, inverse_sizes);
                     s_rows.push((row, s_idx.len()));
                     emit_row(&mut w_row, row, start, dense_matches, n_matches, n_haps,
-                             state_to_hap, group_members, mass_sizes, csr_threshold, &mut s_idx, &mut s_dat);
+                             state_to_hap, group_members, mass_sizes, csr_threshold, &mut s_idx, &mut s_dat,
+                             Some(w_sum));
                 }
                 continue;
             }
 
             let chip_idx = start + row;
+            // Without pruning the backward row's sum is not needed before the row is
+            // combined, so it is accumulated in the combine pass (`combine_row_sums`).
+            let mut bwd_sum_pending = false;
             if chip_idx >= r_precomb.len() {
                 cur_bwd.copy_from_slice(&next_bwd);
             } else {
@@ -1023,7 +1129,7 @@ fn streaming_backward_combine(
                 // Dense pass: auto-vectorizes to AVX2 (8 × f32)
                 if let Some(gs) = group_sizes {
                     for j in 0..n_states {
-                        let val = scale * next_bwd[j] + p_rec * gs[j] as f32;
+                        let val = scale * next_bwd[j] + p_rec * gs[j];
                         cur_bwd[j] = p_err_f * val;
                     }
                 } else {
@@ -1036,7 +1142,7 @@ fn streaming_backward_combine(
                 // Sparse override
                 for k in 0..nm {
                     let j = dense_matches[chip_idx][k] as usize;
-                    let shift_j = if let Some(gs) = group_sizes { p_rec * gs[j] as f32 } else { p_rec };
+                    let shift_j = if let Some(gs) = group_sizes { p_rec * gs[j] } else { p_rec };
                     let val = scale * next_bwd[j] + shift_j;
                     cur_bwd[j] = if use_weighted {
                         p_err_f * val * emission_ratios.unwrap()[chip_idx][k] as f32
@@ -1045,25 +1151,42 @@ fn streaming_backward_combine(
                     };
                 }
 
-                // Row sum (f64 for stability)
-                let mut row_sum = 0.0f64;
-                for j in 0..n_states { row_sum += cur_bwd[j] as f64; }
-                last_sum = row_sum;
+                if prune_threshold > 0.0 || diag {
+                    // Row sum (f64 for stability)
+                    let mut row_sum = 0.0f64;
+                    for j in 0..n_states { row_sum += cur_bwd[j] as f64; }
+                    last_sum = row_sum;
 
-                prune_row(&mut cur_bwd, last_sum, prune_threshold, mass_sizes);
-                if diag {
-                    diag_surv += cur_bwd.iter().filter(|&&v| v > 0.0).count() as u64;
-                    diag_rows += 1;
+                    prune_row(&mut cur_bwd, last_sum, prune_threshold, mass_sizes);
+                    if diag {
+                        diag_surv += cur_bwd.iter().filter(|&&v| v > 0.0).count() as u64;
+                        diag_rows += 1;
+                    }
+                } else {
+                    bwd_sum_pending = true;
                 }
             }
 
-            combine_row(frow, &cur_bwd, &mut w_row, inverse_sizes);
             if fix.holds(row) {
+                if bwd_sum_pending {
+                    let (sb, _) = combine_row_sums(frow, &cur_bwd, &mut w_row, inverse_sizes);
+                    last_sum = sb;
+                } else {
+                    combine_row(frow, &cur_bwd, &mut w_row, inverse_sizes);
+                }
                 held.push((row, w_row.clone()));
             } else {
+                let w_sum = if bwd_sum_pending {
+                    let (sb, sw) = combine_row_sums(frow, &cur_bwd, &mut w_row, inverse_sizes);
+                    last_sum = sb;
+                    sw
+                } else {
+                    combine_row_sum(frow, &cur_bwd, &mut w_row, inverse_sizes)
+                };
                 s_rows.push((row, s_idx.len()));
                 emit_row(&mut w_row, row, start, dense_matches, n_matches, n_haps,
-                         state_to_hap, group_members, mass_sizes, csr_threshold, &mut s_idx, &mut s_dat);
+                         state_to_hap, group_members, mass_sizes, csr_threshold, &mut s_idx, &mut s_dat,
+                         Some(w_sum));
             }
 
             std::mem::swap(&mut cur_bwd, &mut next_bwd);
@@ -1106,7 +1229,7 @@ fn streaming_backward_combine(
     for (row, raw) in held.iter_mut() {
         h_rows.push((*row, h_idx.len()));
         emit_row(raw, *row, start, dense_matches, n_matches, n_haps,
-                 state_to_hap, group_members, mass_sizes, csr_threshold, &mut h_idx, &mut h_dat);
+                 state_to_hap, group_members, mass_sizes, csr_threshold, &mut h_idx, &mut h_dat, None);
     }
 
     // Assemble the ascending CSR. Streamed rows are in descending order, so walk
@@ -1239,9 +1362,42 @@ fn unmatched_posterior_mean(
 /// demand from the haplotype bitmatrix (no dense `n_chip × n_ref` byte buffer,
 /// which at biobank scale would be hundreds of MB).
 pub enum RefAlleleSource<'a> {
-    Bitmatrix { bm: &'a crate::common::HaplotypeBitmatrix, chip_start: usize },
+    /// `classes`: the window's `hap_dedup::allele_classes` (None: dedup fingerprints itself).
+    Bitmatrix { bm: &'a crate::common::HaplotypeBitmatrix, chip_start: usize, classes: Option<&'a [u32]> },
 }
 
+/// Everything `calculate_weights` derives from the match matrix before the emission floor
+/// enters: the processed and filtered matches, the dedup groups, the dense match lists,
+/// the recombination probabilities and the thresholds. The adaptive emission floor runs a
+/// haplotype's first window twice, at the base floor and at the raised one (`window_process`),
+/// and only `run_weights` depends on the floor, so the second run starts from here.
+pub struct HmmPrep<'a> {
+    dense_matches: Vec<Vec<u32>>,
+    n_matches: Vec<usize>,
+    state_to_hap: Vec<i64>,
+    n_states: usize,
+    dedup_result: Option<DedupResult>,
+    group_sizes_f64: Option<Vec<f64>>,
+    group_sizes_f32: Option<Vec<f32>>,
+    group_mass_f32: Option<(Vec<f32>, Vec<f32>)>,
+    n_haps_per_site: Vec<f64>,
+    f_precomb: Vec<f64>,
+    r_precomb: Vec<f64>,
+    threshold_states: f64,
+    csr_threshold: f32,
+    prune_threshold: f64,
+    exact_dedup: bool,
+    use_hap_prior: bool,
+    hap_prior: Option<&'a [(i64, f64)]>,
+    perr: PerrBase,
+    n_ref_haps: usize,
+    n_sites: usize,
+    log_n: usize,
+    debug_line: Option<String>,
+}
+
+/// `prepare_weights` then `run_weights`: the HMM imputation weights of one target haplotype.
+#[allow(clippy::too_many_arguments)]
 pub fn calculate_weights(
     match_matrix: &CscMatchMatrix,
     distances_cm: &[f64],
@@ -1264,12 +1420,29 @@ pub fn calculate_weights(
     // Measure `unmatched_posterior_mean` into the result (the adaptive emission's estimate).
     measure_unmatched: bool,
 ) -> HmmResult {
+    let prep = prepare_weights(match_matrix, distances_cm, n_ref_haps, est_ne, ref_alleles, n_chip,
+                               ne_per_site, hap_prior);
+    run_weights(&prep, output_breaks, min_perr, site_emission_ratios, c, compute_posterior, measure_unmatched)
+}
+
+/// The floor-independent part of `calculate_weights` (see `HmmPrep`).
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_weights<'a>(
+    match_matrix: &CscMatchMatrix,
+    distances_cm: &[f64],
+    n_ref_haps: usize,
+    est_ne: f64,
+    ref_alleles: Option<RefAlleleSource<'_>>,
+    n_chip: usize,
+    ne_per_site: Option<&[f64]>,
+    hap_prior: Option<&'a [(i64, f64)]>,
+) -> HmmPrep<'a> {
     // 1. Process matches: CSC → scored top-K → freq filter → range expansion
     let expanded = match_processing::process_matches(match_matrix, 50);
     let _exp_total: usize = expanded.iter().map(|v| v.len()).sum();
 
     // 2. Filter by frequency (keep haps above 10th percentile)
-    let (mut filtered, p_err) = filter_matches_fast(&expanded, n_ref_haps, min_perr);
+    let (mut filtered, perr) = filter_matches_fast(&expanded, n_ref_haps);
     let _filt_total: usize = filtered.iter().map(|v| v.len()).sum();
     // `expanded` is dead from here on, but without this it would live to the end
     // of the function — through the whole forward-backward. It is a full per-site
@@ -1288,9 +1461,9 @@ pub fn calculate_weights(
     let use_hap_prior = !crate::config::is_one("SELPHI_HMM_NO_XWIN_PRIOR");
     let hap_prior = if use_hap_prior { hap_prior } else { None };
     let mut dedup_result: Option<DedupResult> = ref_alleles.map(|src| {
-        let RefAlleleSource::Bitmatrix { bm, chip_start } = src;
+        let RefAlleleSource::Bitmatrix { bm, chip_start, classes } = src;
         hap_dedup::deduplicate_haplotypes_bm(
-            &filtered, bm, chip_start, n_chip, n_ref_haps, hap_prior, exact_dedup,
+            &filtered, bm, chip_start, n_chip, n_ref_haps, hap_prior, exact_dedup, classes,
         )
     });
 
@@ -1312,13 +1485,13 @@ pub fn calculate_weights(
     use std::sync::atomic::{AtomicUsize, Ordering};
     static LOGGED_COUNT: AtomicUsize = AtomicUsize::new(0);
     let log_n = LOGGED_COUNT.fetch_add(1, Ordering::Relaxed);
-    if log_n < 3 {
+    let debug_line = (log_n < 3).then(|| {
         let hmm_total: usize = dense_matches.iter().map(|v| v.len()).sum();
         let csc_nnz = match_matrix.indices.len();
         let data_mean: f64 = if csc_nnz > 0 { match_matrix.data.iter().map(|&d| d as f64).sum::<f64>() / csc_nnz as f64 } else { 0.0 };
-        selphi_debug!("  [HMM-DEBUG] hap{}: csc_nnz={} data_mean={:.1} | expanded={} filtered={} extended={} hmm_input={} n_states={} p_err={:.6}",
-            log_n, csc_nnz, data_mean, _exp_total, _filt_total, _ext_total, hmm_total, n_states, p_err);
-    }
+        format!("  [HMM-DEBUG] hap{}: csc_nnz={} data_mean={:.1} | expanded={} filtered={} extended={} hmm_input={} n_states={}",
+            log_n, csc_nnz, data_mean, _exp_total, _filt_total, _ext_total, hmm_total, n_states)
+    });
 
     // 6. Compute nHaps per site (accounting for group sizes)
     let group_sizes_f64: Option<Vec<f64>> = dedup_result.as_ref().map(|dr| {
@@ -1339,9 +1512,6 @@ pub fn calculate_weights(
     } else {
         None
     };
-    let group_mass = group_mass_f32.as_ref().map(|(sizes, inverse_sizes)| GroupMass {
-        sizes, inverse_sizes,
-    });
 
     // Divisor of the per-site recombination shift. It sums the dedup group sizes
     // over the haplotypes MATCHED at this site, while the shift is then added over
@@ -1389,6 +1559,37 @@ pub fn calculate_weights(
         0.0
     };
 
+    HmmPrep {
+        group_sizes_f32: group_sizes_f64.as_ref().map(|gs| gs.iter().map(|&g| g as f32).collect()),
+        dense_matches, n_matches, state_to_hap, n_states, dedup_result, group_sizes_f64, group_mass_f32,
+        n_haps_per_site, f_precomb, r_precomb, threshold_states, csr_threshold, prune_threshold,
+        exact_dedup, use_hap_prior, hap_prior, perr, n_ref_haps, n_sites: distances_cm.len(), log_n, debug_line,
+    }
+}
+
+/// The floor-dependent part of `calculate_weights`: emission, forward-backward and weights,
+/// at emission floor `min_perr`.
+pub fn run_weights(
+    prep: &HmmPrep,
+    output_breaks: &[(usize, usize)],
+    min_perr: f64,
+    site_emission_ratios: Option<&[f64]>,
+    c: Option<&[f64]>,
+    compute_posterior: bool,
+    measure_unmatched: bool,
+) -> HmmResult {
+    let HmmPrep {
+        ref dense_matches, ref n_matches, ref state_to_hap, n_states, ref dedup_result, ref group_sizes_f64,
+        ref group_sizes_f32,
+        ref group_mass_f32, ref n_haps_per_site, ref f_precomb, ref r_precomb, threshold_states, csr_threshold,
+        prune_threshold, exact_dedup, use_hap_prior, hap_prior, perr, n_ref_haps, n_sites, log_n, ref debug_line,
+    } = *prep;
+    let p_err = perr.resolve(min_perr);
+    if let Some(line) = debug_line { selphi_debug!("{} p_err={:.6}", line, p_err); }
+    let group_mass = group_mass_f32.as_ref().map(|(sizes, inverse_sizes)| GroupMass {
+        sizes, inverse_sizes,
+    });
+    use std::sync::atomic::Ordering;
     // Build emission ratios in dense format if provided
     let dense_emission_ratios: Option<Vec<Vec<f64>>> = site_emission_ratios.map(|ser| {
         let p_no_err = 1.0 - p_err;
@@ -1415,8 +1616,8 @@ pub fn calculate_weights(
     let const_c_env: Option<f64> = crate::config::raw("SELPHI_REFINE_CONST_C")
         .and_then(|s| s.parse::<f64>().ok());
     let site_perr: Option<Vec<f64>> = if let Some(cv) = c {
-        debug_assert_eq!(cv.len(), distances_cm.len(),
-            "site confidence length {} != n_sites {}", cv.len(), distances_cm.len());
+        debug_assert_eq!(cv.len(), n_sites,
+            "site confidence length {} != n_sites {}", cv.len(), n_sites);
         // Collapse to None when every site is fully confident → byte-identical.
         if cv.iter().any(|&c| c < 1.0) {
             // p_err.min(0.5): keep min ≤ max even if SELPHI_PERR_OVERRIDE pushes
@@ -1429,7 +1630,7 @@ pub fn calculate_weights(
         }
     } else if let Some(c) = const_c_env.filter(|&c| c < 1.0) {
         let eps = ((1.0 - c) * 0.5 + c * p_err).clamp(p_err.min(0.5), 0.5);
-        Some(vec![eps; distances_cm.len()])
+        Some(vec![eps; n_sites])
     } else {
         None
     };
@@ -1441,7 +1642,7 @@ pub fn calculate_weights(
         selphi_debug!("  [FWD-DBG] f_precomb[0..5]={:?}", &f_precomb[..5.min(f_precomb.len())]);
         selphi_debug!("  [FWD-DBG] dense_matches[0] len={} first={:?}",
             dense_matches[0].len(), &dense_matches[0][..3.min(dense_matches[0].len())]);
-        if let Some(ref gs) = group_sizes_f64 {
+        if let Some(gs) = group_sizes_f64 {
             selphi_debug!("  [FWD-DBG] group_sizes[0..5]={:?}", &gs[..5.min(gs.len())]);
         }
     }
@@ -1485,7 +1686,7 @@ pub fn calculate_weights(
             precomb: &f_precomb,
             n_states,
             p_err,
-            group_sizes: group_sizes_f64.as_deref(),
+            group_sizes: group_sizes_f32.as_deref(),
             group_mass,
             emission_ratios: dense_emission_ratios.as_deref(),
             site_perr: site_perr.as_deref(),
@@ -1511,7 +1712,7 @@ pub fn calculate_weights(
             // Iterate over blocks, dump rows matching check_rows (global indexing)
             let dump_model = LsHmmModel {
                 dense_matches: &dense_matches, n_matches: &n_matches, n_haps: &n_haps_per_site,
-                precomb: &f_precomb, n_states, p_err, group_sizes: group_sizes_f64.as_deref(), group_mass,
+                precomb: &f_precomb, n_states, p_err, group_sizes: group_sizes_f32.as_deref(), group_mass,
                 emission_ratios: dense_emission_ratios.as_deref(), site_perr: site_perr.as_deref(),
             };
             for (bi, &(bstart, bstop)) in output_breaks.iter().enumerate() {
@@ -1558,7 +1759,7 @@ pub fn calculate_weights(
             precomb: &f_precomb,
             n_states,
             p_err,
-            group_sizes: group_sizes_f64.as_deref(),
+            group_sizes: group_sizes_f32.as_deref(),
             group_mass,
             emission_ratios: dense_emission_ratios.as_deref(),
             site_perr: site_perr.as_deref(),
@@ -1570,7 +1771,7 @@ pub fn calculate_weights(
             precomb: &r_precomb,
             n_states,
             p_err,
-            group_sizes: group_sizes_f64.as_deref(),
+            group_sizes: group_sizes_f32.as_deref(),
             group_mass,
             emission_ratios: dense_emission_ratios.as_deref(),
             site_perr: site_perr.as_deref(),
@@ -1686,6 +1887,7 @@ pub fn calculate_weights(
     HmmResult { weights: results, hap_posterior, perr_floor: min_perr, p_err, unmatched }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1737,7 +1939,7 @@ mod tests {
             source, csc.n_cols, None, None, None, None, 0.0, true, false,
         );
         let plain = run(None);
-        let grouped = run(Some(RefAlleleSource::Bitmatrix { bm: &bm, chip_start: 0 }));
+        let grouped = run(Some(RefAlleleSource::Bitmatrix { bm: &bm, chip_start: 0, classes: None }));
         assert_same_weights(&plain.weights[0].1, &grouped.weights[0].1);
         // The old public path returned [0, .5, .5]: it squared multiplicity,
         // then pruned the singleton using the compressed state's threshold.
@@ -1762,7 +1964,7 @@ mod tests {
                     None, None, prior, None, 0.0, true, false,
                 );
                 let plain = run(None);
-                let grouped = run(Some(RefAlleleSource::Bitmatrix { bm: &bm, chip_start: 3 }));
+                let grouped = run(Some(RefAlleleSource::Bitmatrix { bm: &bm, chip_start: 3, classes: None }));
                 assert_eq!(plain.weights.len(), grouped.weights.len());
                 for ((start_a, a), (start_b, b)) in plain.weights.iter().zip(&grouped.weights) {
                     assert_eq!(start_a, start_b);
@@ -1812,10 +2014,10 @@ mod tests {
         let bm = crate::common::HaplotypeBitmatrix::from_raw(bits, n_sites, n_haps);
         {
             let expanded = match_processing::process_matches(&csc, 50);
-            let (mut filtered, _) = filter_matches_fast(&expanded, n_haps, 0.025);
+            let (mut filtered, _) = filter_matches_fast(&expanded, n_haps);
             extend_high_coverage_haps(&mut filtered, n_haps, 0.95);
             let grouped = hap_dedup::deduplicate_haplotypes_bm(
-                &filtered, &bm, 0, n_sites, n_haps, None, true,
+                &filtered, &bm, 0, n_sites, n_haps, None, true, None,
             );
             assert_eq!(build_dense_matches(&filtered).3, 5001);
             assert_eq!(build_dense_matches(&grouped.deduped_matches).3, 5000);
@@ -1826,7 +2028,7 @@ mod tests {
             source, n_sites, None, None, None, None, 0.0, false, false,
         );
         let plain = run(None);
-        let grouped = run(Some(RefAlleleSource::Bitmatrix { bm: &bm, chip_start: 0 }));
+        let grouped = run(Some(RefAlleleSource::Bitmatrix { bm: &bm, chip_start: 0, classes: None }));
         assert!(plain.weights[0].1.nnz() > 0);
         assert_same_weights(&plain.weights[0].1, &grouped.weights[0].1);
     }
@@ -1849,9 +2051,9 @@ mod tests {
         for (mut plain, mut grouped) in [([0.0; 3], [0.0; 2]), ([0.2, 0.2, 0.6], [0.4, 0.6])] {
             let (mut ia, mut da, mut ib, mut db) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             emit_row(&mut plain, 1, 0, &[vec![0, 1, 2]], &[3], &[3.0], &[0, 1, 2],
-                     None, None, 0.25, &mut ia, &mut da);
+                     None, None, 0.25, &mut ia, &mut da, None);
             emit_row(&mut grouped, 1, 0, &[vec![0, 1]], &[2], &[3.0], &[0, 2],
-                     Some(&members), Some(&[2.0, 1.0]), 0.25, &mut ib, &mut db);
+                     Some(&members), Some(&[2.0, 1.0]), 0.25, &mut ib, &mut db, None);
             assert_eq!(ia, ib);
             assert_eq!(da, db);
         }
@@ -1891,14 +2093,13 @@ mod tests {
         }).collect();
         let site_perr: Vec<f64> = (0..n_sites)
             .map(|i| p_err + (0.5 - p_err) * (i % 7) as f64 / 7.0).collect();
-        let group_sizes: Vec<f64> = sizes.iter().map(|&size| size as f64).collect();
         let group_sizes_f32: Vec<f32> = sizes.iter().map(|&size| size as f32).collect();
         let inverse_sizes: Vec<f32> = group_sizes_f32.iter().map(|&size| 1.0f32 / size).collect();
         let n_states = if grouped { sizes.len() } else { n_haps };
         let model = LsHmmModel {
             dense_matches: &matches, n_matches: &n_matches, n_haps: &n_haps_per_site,
             precomb: &precomb, n_states, p_err,
-            group_sizes: if grouped { Some(&group_sizes) } else { None },
+            group_sizes: if grouped { Some(&group_sizes_f32) } else { None },
             group_mass: grouped.then_some(GroupMass { sizes: &group_sizes_f32, inverse_sizes: &inverse_sizes }),
             emission_ratios: (emission_mode == 1).then_some(emission_ratios.as_slice()),
             site_perr: (emission_mode == 2).then_some(site_perr.as_slice()),
@@ -1956,7 +2157,8 @@ mod tests {
             vec![0, 2, 3],
             vec![1, 2, 3],
         ];
-        let (filtered, perr) = filter_matches_fast(&matches, 4, 0.05);
+        let (filtered, perr) = filter_matches_fast(&matches, 4);
+        let perr = perr.resolve(0.05);
         // All haps have high frequency, so all should be kept
         assert_eq!(filtered.len(), 5);
         assert!(perr >= 0.05);
@@ -1973,7 +2175,8 @@ mod tests {
         let n_haps = 8;
         let all: Vec<i64> = (0..n_haps as i64).collect();
         let matches = vec![all; n_sites];
-        let (filtered, perr) = filter_matches_fast(&matches, n_haps, 0.025);
+        let (filtered, perr) = filter_matches_fast(&matches, n_haps);
+        let perr = perr.resolve(0.025);
         assert_eq!(filtered.len(), n_sites);
         assert!(perr <= 0.5, "saturated p_err must not exceed 0.5, got {perr}");
         assert!((perr - 0.025).abs() < 1e-12, "expected the --p-err floor, got {perr}");
@@ -1994,7 +2197,8 @@ mod tests {
             vec![0, 1],
             vec![0, 2],
         ];
-        let (_, perr) = filter_matches_fast(&matches, 4, 0.025);
+        let (_, perr) = filter_matches_fast(&matches, 4);
+        let perr = perr.resolve(0.025);
         assert!((perr - 0.25).abs() < 1e-12, "unsaturated p_err must be raw cutoff/n_sites, got {perr}");
     }
 
@@ -2019,8 +2223,14 @@ mod tests {
         let (dm, nm, s2h, ns) = build_dense_matches(&matches);
         assert_eq!(ns, 4); // 4 unique haps: 5, 10, 15, 20
         assert_eq!(nm, vec![3, 2, 3]);
-        assert_eq!(s2h.len(), 4);
-        assert_eq!(dm.len(), 3);
+        assert_eq!(s2h, vec![5, 10, 15, 20]);
+        assert_eq!(dm, vec![vec![0, 1, 2], vec![0, 3], vec![1, 2, 3]]);
+        // a site's order is kept; no match at all gives no state
+        let (dm, _, s2h, ns) = build_dense_matches(&[vec![15i64, 0, 5], vec![]]);
+        assert_eq!((s2h, ns), (vec![0, 5, 15], 3));
+        assert_eq!(dm, vec![vec![2, 0, 1], vec![]]);
+        let (dm, nm, s2h, ns) = build_dense_matches(&[vec![], vec![]]);
+        assert_eq!((dm, nm, s2h, ns), (vec![vec![], vec![]], vec![0, 0], vec![], 0));
     }
 
     #[test]
