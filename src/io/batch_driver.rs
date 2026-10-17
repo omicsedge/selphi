@@ -365,6 +365,10 @@ pub fn run_window<S: BatchSink>(
         let tiled = srp.tiled.as_ref().unwrap();
         let n_tile_cols = tiled.n_tile_cols;
         let n_tiled_variants = tiled.n_variants();
+        // Tiles are decoded on this thread below: reuse a decoder for this
+        // window and drop it with the window (also on an early `?` return), so
+        // it is not held into the next HMM batch.
+        let _decoders = crate::srp::tiled::TileDecoderScope::this_thread();
         let window_last_stripe = if own_wgs_end > 0 { (own_wgs_end - 1) / TILE_ROWS } else { 0 };
         let decomp_tile_bytes: usize = 500 * 1024;
         let bytes_per_stripe = n_tile_cols * decomp_tile_bytes;

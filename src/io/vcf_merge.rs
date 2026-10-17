@@ -31,12 +31,15 @@ pub fn merge_batch_vcfs(
         return Err(std::io::Error::other("no batch files to merge"));
     }
 
-    let out_file = std::fs::File::create(output_path)?;
-    let bgzip_threads = 4.min(all_sample_names.len().max(1));
-    let bgzf_writer = multithreaded_writer::Builder::default()
-        .set_worker_count(std::num::NonZeroUsize::new(bgzip_threads).unwrap())
-        .build_from_writer(out_file);
-    let mut writer = BufWriter::with_capacity(4 << 20, bgzf_writer);
+    // Compression workers do not change the bytes (fixed-size blocks deflated
+    // independently); the file buffer saves noodles' per-frame small writes;
+    // the tap reports block sizes so the .tbi is built as the file is written.
+    let out_file = BufWriter::with_capacity(1 << 20, std::fs::File::create(output_path)?);
+    let (block_tx, block_rx) = std::sync::mpsc::channel();
+    let mut writer = multithreaded_writer::Builder::default()
+        .set_worker_count(std::num::NonZeroUsize::new(rayon::current_num_threads().max(1)).unwrap())
+        .build_from_writer(crate::srp::csi::BgzfBlockTap::new(out_file, block_tx));
+    let mut index = crate::srp::csi::TbiStreamIndexer::new(block_rx);
 
     // Open batch readers and skip headers. We need each batch's per-sample
     // count to size the line-merge buffer.
@@ -59,11 +62,13 @@ pub fn merge_batch_vcfs(
     }
 
     // Write the merged VCF header (shared with the non-batched + per-batch writers).
+    let mut header = Vec::with_capacity(4096);
     crate::io::vcf_fmt::write_imputation_vcf_header(
-        &mut writer, all_sample_names, contig_field, version, no_ap, "")?;
+        &mut header, all_sample_names, contig_field, version, no_ap, "")?;
+    index.observe(&header);
+    writer.write_all(&header)?;
 
-    // Index metadata accumulated during merge for TBI building.
-    let mut record_meta: Vec<crate::srp::csi::TbiRec> = Vec::new();
+    // Contigs of the TBI (the merged records carry their metadata).
     let mut contig_names: Vec<String> = Vec::new();
     if let Some(name) = parse_contig_id(contig_field) {
         contig_names.push(name);
@@ -120,12 +125,14 @@ pub fn merge_batch_vcfs(
         }).collect::<std::io::Result<Vec<_>>>()?;
 
         for (buf, chrom, pos, rlen) in merged {
-            writer.write_all(&buf)?;
-            record_meta.push(crate::srp::csi::TbiRec {
+            index.push_meta(crate::srp::csi::TbiRec {
                 pos, rlen: rlen as u32,
                 ref_id: crate::srp::csi::tbi_ref_id(&contig_names, chrom.as_bytes()),
             });
+            index.observe(&buf);
+            writer.write_all(&buf)?;
         }
+        index.process();
 
         if any_eof { break; }
     }
@@ -147,16 +154,17 @@ pub fn merge_batch_vcfs(
         }
     }
 
-    writer.flush()?;
-    drop(writer);
-
-    // Build .tbi index from the accumulated record metadata.
+    // Finish explicitly so an error on the last blocks or the EOF marker is
+    // reported (Drop swallows it), then write the streamed .tbi.
+    let mut file = writer.finish()?.into_inner();
+    file.flush()?;
+    drop(file);
     let tbi_path = {
         let mut p = output_path.as_os_str().to_owned();
         p.push(".tbi");
         std::path::PathBuf::from(p)
     };
-    crate::srp::csi::build_tbi_index_with_meta(output_path, &contig_names, &record_meta, &tbi_path)?;
+    index.finish(&contig_names, &tbi_path)?;
     Ok(())
 }
 

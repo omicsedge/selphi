@@ -187,27 +187,89 @@ fn normalize_call(call: SampleCall, options: InputDosageOptions) -> io::Result<(
 }
 
 /// Normalise one sample's call and append it (`i` = its column, for the error text).
+/// `keep_meta` false leaves `metadata` alone: a reader whose metadata is never
+/// read (the imputed side of an evaluation) skips two pushes per sample.
 #[inline]
 fn push_normalized(call: SampleCall, i: usize, options: InputDosageOptions,
-    ds_buf: &mut Vec<f32>, metadata: &mut DosageMetadata) -> io::Result<()> {
+    ds_buf: &mut Vec<f32>, metadata: &mut DosageMetadata, keep_meta: bool) -> io::Result<()> {
     let (dose, native_alt, ploidy) = normalize_call(call, options)
         .map_err(|e| invalid_dosage(format!("sample column {}: {e}", i + 1)))?;
     ds_buf.push(dose);
-    metadata.native_alt.push(native_alt);
-    metadata.ploidy.push(ploidy);
+    if keep_meta {
+        metadata.native_alt.push(native_alt);
+        metadata.ploidy.push(ploidy);
+    }
     Ok(())
 }
 
+#[cfg(test)]
 fn normalize_row(calls: &[SampleCall], indices: Option<&[usize]>, options: InputDosageOptions,
     ds_buf: &mut Vec<f32>, metadata: &mut DosageMetadata) -> io::Result<()> {
+    normalize_row_m(calls, indices, options, ds_buf, metadata, true)
+}
+
+fn normalize_row_m(calls: &[SampleCall], indices: Option<&[usize]>, options: InputDosageOptions,
+    ds_buf: &mut Vec<f32>, metadata: &mut DosageMetadata, keep_meta: bool) -> io::Result<()> {
     ds_buf.clear();
     metadata.clear();
     if let Some(indices) = indices {
-        for &i in indices { push_normalized(calls.get(i).copied().unwrap_or_default(), i, options, ds_buf, metadata)?; }
+        for &i in indices { push_normalized(calls.get(i).copied().unwrap_or_default(), i, options, ds_buf, metadata, keep_meta)?; }
     } else {
-        for (i, &c) in calls.iter().enumerate() { push_normalized(c, i, options, ds_buf, metadata)?; }
+        for (i, &c) in calls.iter().enumerate() { push_normalized(c, i, options, ds_buf, metadata, keep_meta)?; }
     }
     Ok(())
+}
+
+/// A reader's shared-sample selection: file column of each shared sample, in
+/// shared order, plus which columns that leaves to parse.
+struct ColFilter {
+    indices: Vec<usize>,
+    /// `needed[c]`: column `c` (< n_file_samples) is selected.
+    needed: Vec<bool>,
+    /// One past the last selected column below n_file_samples.
+    scan_end: usize,
+}
+
+impl ColFilter {
+    fn new(indices: Vec<usize>, n_file_samples: usize) -> Self {
+        let mut needed = vec![false; n_file_samples];
+        let mut scan_end = 0;
+        for &i in &indices {
+            if i < n_file_samples { needed[i] = true; scan_end = scan_end.max(i + 1); }
+        }
+        Self { indices, needed, scan_end }
+    }
+}
+
+/// `str::parse::<f32>` of a FORMAT/DS field, exactly, with a fast path for plain
+/// decimals of at most seven digits (`123`, `0.5`, `1.234`): their digits are an
+/// integer below 2^24 and their scale 10^k (k <= 7) is exact in f32, so one
+/// correctly rounded division gives the correctly rounded value, as the parser
+/// does. Anything else (sign, exponent, `.5`, `nan`, longer digit strings) goes
+/// to the parser.
+#[inline]
+fn parse_ds_f32(field: &[u8]) -> Option<f32> {
+    const POW10: [f32; 8] = [1.0, 10.0, 100.0, 1e3, 1e4, 1e5, 1e6, 1e7];
+    let n = field.len();
+    if (1..=8).contains(&n) && field[0].is_ascii_digit() {
+        let mut v: u32 = 0;
+        let mut digits = 0usize;
+        let mut frac: Option<usize> = None;
+        let mut ok = true;
+        for &b in field {
+            if b.is_ascii_digit() {
+                v = v * 10 + (b - b'0') as u32;
+                digits += 1;
+                if let Some(k) = frac.as_mut() { *k += 1; }
+            } else if b == b'.' && frac.is_none() {
+                frac = Some(0);
+            } else { ok = false; break; }
+        }
+        if ok && digits <= 7 && frac != Some(0) {
+            return Some(v as f32 / POW10[frac.unwrap_or(0)]);
+        }
+    }
+    std::str::from_utf8(field).ok().and_then(|s| s.parse::<f32>().ok())
 }
 
 /// AF among called truth samples, in original allele-copy units. A wholly REF
@@ -577,6 +639,17 @@ pub fn parse_vcf_line(line: &[u8], n_samples: usize, ds_buf: &mut Vec<f32>) -> O
 fn parse_vcf_record(line: &[u8], n_samples: usize, indices: Option<&[usize]>,
     options: InputDosageOptions, ds_buf: &mut Vec<f32>, metadata: &mut DosageMetadata,
     calls: &mut Vec<SampleCall>, skip_gt: bool) -> io::Result<Option<VariantRecord>> {
+    let filter = indices.map(|ix| ColFilter::new(ix.to_vec(), n_samples));
+    parse_vcf_record_with(line, n_samples, filter.as_ref(), options, ds_buf, metadata, true, calls, skip_gt)
+}
+
+/// `parse_vcf_record` with the reader's cached sample selection: only the
+/// selected columns are split out and parsed (a call is parsed infallibly; only
+/// the selected ones are normalised, so skipping the rest changes nothing).
+#[allow(clippy::too_many_arguments)]
+fn parse_vcf_record_with(line: &[u8], n_samples: usize, filter: Option<&ColFilter>,
+    options: InputDosageOptions, ds_buf: &mut Vec<f32>, metadata: &mut DosageMetadata,
+    keep_meta: bool, calls: &mut Vec<SampleCall>, skip_gt: bool) -> io::Result<Option<VariantRecord>> {
     let line = strip_line_endings(line);
     if line.is_empty() || line[0] == b'#' { return Ok(None); }
     let mut tabs = [0usize; 9];
@@ -608,29 +681,37 @@ fn parse_vcf_record(line: &[u8], n_samples: usize, indices: Option<&[usize]>,
         for (i, field) in sample.split(|&b| b == b':').take(n_fields).enumerate() {
             if gt_idx == Some(i) { call.gt = parse_gt_text(field); }
             if ds_idx == Some(i) {
-                call.ds = Some(std::str::from_utf8(field).ok().and_then(|s| s.parse::<f32>().ok())
-                    .filter(|v| v.is_finite()).unwrap_or(-1.0));
+                call.ds = Some(parse_ds_f32(field).filter(|v| v.is_finite()).unwrap_or(-1.0));
             }
         }
         call
     };
-    if indices.is_none() {
+    let Some(filter) = filter else {
         // Every column in file order: normalise as it is read, no call buffer.
         ds_buf.clear();
         metadata.clear();
         let mut n = 0usize;
         for sample in line[tabs[8]+1..].split(|&b| b == b'\t').take(n_samples) {
-            push_normalized(parse_call(sample), n, options, ds_buf, metadata)?;
+            push_normalized(parse_call(sample), n, options, ds_buf, metadata, keep_meta)?;
             n += 1;
         }
         // Absent/truncated sample columns are missing, never synthetic hom-ref.
-        for i in n..n_samples { push_normalized(SampleCall::default(), i, options, ds_buf, metadata)?; }
+        for i in n..n_samples { push_normalized(SampleCall::default(), i, options, ds_buf, metadata, keep_meta)?; }
         return Ok(Some(record));
-    }
+    };
+    // Columns as `split('\t').take(n_samples)` yields them, up to the last
+    // selected one; unselected and absent columns stay missing.
     calls.clear();
-    calls.extend(line[tabs[8]+1..].split(|&b| b == b'\t').take(n_samples).map(parse_call));
     calls.resize(n_samples, SampleCall::default());
-    normalize_row(calls, indices, options, ds_buf, metadata)?;
+    let samples = &line[tabs[8]+1..];
+    let mut start = 0usize;
+    for c in 0..filter.scan_end.min(n_samples) {
+        let end = memchr::memchr(b'\t', &samples[start..]).map_or(samples.len(), |p| start + p);
+        if filter.needed[c] { calls[c] = parse_call(&samples[start..end]); }
+        if end >= samples.len() { break; }
+        start = end + 1;
+    }
+    normalize_row_m(calls, Some(&filter.indices), options, ds_buf, metadata, keep_meta)?;
     Ok(Some(record))
 }
 
@@ -707,10 +788,11 @@ enum VariantReader {
         /// File-column index of each shared sample, in shared order. `None` =
         /// take the leading columns as they come, which is only right when the
         /// file's samples ARE the shared set in that order.
-        sample_indices: Option<Vec<usize>>,
+        sample_indices: Option<ColFilter>,
         /// Scratch: GT/DS calls before shared-sample reindexing.
         calls: Vec<SampleCall>,
         metadata: DosageMetadata,
+        keep_metadata: bool,
         options: InputDosageOptions,
     },
     Bcf {
@@ -728,6 +810,7 @@ enum VariantReader {
         ib: Vec<u8>,
         calls: Vec<SampleCall>,
         metadata: DosageMetadata,
+        keep_metadata: bool,
         options: InputDosageOptions,
     },
 }
@@ -766,7 +849,8 @@ impl VariantReader {
                 ds_key, n_file_samples: ns, sample_indices: None,
                 path: path.to_path_buf(), header_end_vpos,
                 sb: Vec::with_capacity(512), ib: Vec::with_capacity(ns * 4),
-                calls: Vec::new(), metadata: DosageMetadata::default(), options: InputDosageOptions::default(),
+                calls: Vec::new(), metadata: DosageMetadata::default(), keep_metadata: true,
+                options: InputDosageOptions::default(),
             }, samples))
         } else {
             // Read header directly through bgzf's own block buffer so
@@ -810,7 +894,8 @@ impl VariantReader {
                 reader, line_buf: Vec::with_capacity(ns * 8), n_file_samples: ns,
                 path: path.to_path_buf(), header_end_vpos,
                 sample_indices: None, calls: Vec::new(),
-                metadata: DosageMetadata::default(), options: InputDosageOptions::default(),
+                metadata: DosageMetadata::default(), keep_metadata: true,
+                options: InputDosageOptions::default(),
             }, samples))
         }
     }
@@ -820,10 +905,25 @@ impl VariantReader {
     /// used to drop the request silently, so whenever a VCF.gz side's samples
     /// were not the leading columns in shared order, file column i was scored
     /// against file column i of the other side.
+    ///
+    /// The identity selection (every column, in file order) is stored as no
+    /// selection: both paths then produce the same values and errors.
     fn set_sample_filter(&mut self, indices: Vec<usize>) {
+        let identity = |n: usize| indices.len() == n && indices.iter().enumerate().all(|(i, &x)| i == x);
         match self {
-            VariantReader::Bcf { sample_indices, .. } => { *sample_indices = Some(indices); }
-            VariantReader::Vcf { sample_indices, .. } => { *sample_indices = Some(indices); }
+            VariantReader::Bcf { sample_indices, n_file_samples, .. } => {
+                *sample_indices = (!identity(*n_file_samples)).then_some(indices);
+            }
+            VariantReader::Vcf { sample_indices, n_file_samples, .. } => {
+                *sample_indices = (!identity(*n_file_samples)).then(|| ColFilter::new(indices, *n_file_samples));
+            }
+        }
+    }
+
+    /// `false`: `metadata()` is never read for this reader, so do not fill it.
+    fn set_keep_metadata(&mut self, keep: bool) {
+        match self {
+            Self::Vcf { keep_metadata, .. } | Self::Bcf { keep_metadata, .. } => *keep_metadata = keep,
         }
     }
 
@@ -910,18 +1010,18 @@ impl VariantReader {
 
     fn next_record_inner(&mut self, ds_buf: &mut Vec<f32>, skip_gt: bool) -> io::Result<Option<VariantRecord>> {
         match self {
-            VariantReader::Vcf { reader, line_buf, n_file_samples, sample_indices, calls, metadata, options, .. } => {
+            VariantReader::Vcf { reader, line_buf, n_file_samples, sample_indices, calls, metadata, keep_metadata, options, .. } => {
                 loop {
                     line_buf.clear();
                     if reader.read_until(b'\n', line_buf)? == 0 { return Ok(None); }
-                    if let Some(rec) = parse_vcf_record(line_buf, *n_file_samples,
-                        sample_indices.as_deref(), *options, ds_buf, metadata, calls, skip_gt)? {
+                    if let Some(rec) = parse_vcf_record_with(line_buf, *n_file_samples,
+                        sample_indices.as_ref(), *options, ds_buf, metadata, *keep_metadata, calls, skip_gt)? {
                         return Ok(Some(rec));
                     }
                 }
             }
             VariantReader::Bcf { reader, contig_names, gt_key, ds_key, n_file_samples,
-                sample_indices, sb, ib, calls, metadata, options, .. } => {
+                sample_indices, sb, ib, calls, metadata, keep_metadata, options, .. } => {
                 let ns = *n_file_samples;
                 loop {
                     let mut lbuf = [0u8; 4];
@@ -963,7 +1063,7 @@ impl VariantReader {
                         return Ok(Some((chrom, pos, ref_a, alt_a)));
                     }
                     decode_bcf_calls(ib, nf, ns, *gt_key, *ds_key, sample_indices.as_deref(), calls)?;
-                    normalize_row(calls, None, *options, ds_buf, metadata)?;
+                    normalize_row_m(calls, None, *options, ds_buf, metadata, *keep_metadata)?;
                     return Ok(Some((chrom, pos, ref_a, alt_a)));
                 }
             }
@@ -1203,6 +1303,8 @@ fn evaluate_parallel_with_options(
                 let (mut truth_reader, _) = VariantReader::open(&truth_path_buf)?;
                 imp_reader.set_sample_filter(imp_reindex.clone());
                 truth_reader.set_sample_filter(truth_reindex.clone());
+                // Only the truth side's metadata (AF) is read below.
+                imp_reader.set_keep_metadata(false);
                 imp_reader.set_dosage_options(options.imputed);
                 truth_reader.set_dosage_options(options.truth);
 
@@ -1271,7 +1373,8 @@ fn evaluate_parallel_with_options(
                         let excluded = !exclude_ref.is_empty()
                             && exclude_ref.contains(&site_key(&imp.0, imp.1, &imp.2, &imp.3));
                         if matched && !excluded {
-                            chr_set.insert(String::from_utf8_lossy(&imp.0).to_string());
+                            let chrom = String::from_utf8_lossy(&imp.0);
+                            if !chr_set.contains(chrom.as_ref()) { chr_set.insert(chrom.into_owned()); }
                             imp_ds[..n_samples].copy_from_slice(&imp_ds_raw[..n_samples]);
                             if swapped { for si in 0..n_samples { if imp_ds[si] >= 0.0 { imp_ds[si] = 2.0 - imp_ds[si]; } } }
                             truth_ds[..n_samples].copy_from_slice(&truth_ds_raw[..n_samples]);
@@ -1510,6 +1613,8 @@ pub fn evaluate_imputation_with_options(
     let (mut imp, _) = VariantReader::open(imputed_path)?;
     imp.set_sample_filter(iri);
     imp.set_dosage_options(options.imputed);
+    // Only the strong truth's metadata (AF) is read below.
+    imp.set_keep_metadata(false);
 
     let mut comb = SampleAccumulator::new(n);
     let mut snp = SampleAccumulator::new(n);
@@ -2188,4 +2293,194 @@ mod tests {
         assert_eq!(diag.genotypes_rescued, 0);
     }
 
+
+    // ---- Fast evaluator paths vs. verbatim copies of the previous code ----
+
+    /// Normalise one sample's call and append it (`i` = its column, for the error text).
+    #[inline]
+    fn old_push_normalized(call: SampleCall, i: usize, options: InputDosageOptions,
+        ds_buf: &mut Vec<f32>, metadata: &mut DosageMetadata) -> io::Result<()> {
+        let (dose, native_alt, ploidy) = normalize_call(call, options)
+            .map_err(|e| invalid_dosage(format!("sample column {}: {e}", i + 1)))?;
+        ds_buf.push(dose);
+        metadata.native_alt.push(native_alt);
+        metadata.ploidy.push(ploidy);
+        Ok(())
+    }
+
+    fn old_normalize_row(calls: &[SampleCall], indices: Option<&[usize]>, options: InputDosageOptions,
+        ds_buf: &mut Vec<f32>, metadata: &mut DosageMetadata) -> io::Result<()> {
+        ds_buf.clear();
+        metadata.clear();
+        if let Some(indices) = indices {
+            for &i in indices { old_push_normalized(calls.get(i).copied().unwrap_or_default(), i, options, ds_buf, metadata)?; }
+        } else {
+            for (i, &c) in calls.iter().enumerate() { old_push_normalized(c, i, options, ds_buf, metadata)?; }
+        }
+        Ok(())
+    }
+
+    fn old_parse_vcf_record(line: &[u8], n_samples: usize, indices: Option<&[usize]>,
+        options: InputDosageOptions, ds_buf: &mut Vec<f32>, metadata: &mut DosageMetadata,
+        calls: &mut Vec<SampleCall>, skip_gt: bool) -> io::Result<Option<VariantRecord>> {
+        let line = strip_line_endings(line);
+        if line.is_empty() || line[0] == b'#' { return Ok(None); }
+        let mut tabs = [0usize; 9];
+        let mut nt = 0;
+        for (i, &b) in line.iter().enumerate() {
+            if b == b'\t' { tabs[nt] = i; nt += 1; if nt == 9 { break; } }
+        }
+        if nt < 9 { return Ok(None); }
+        let chrom = line[..tabs[0]].to_vec();
+        let pos = std::str::from_utf8(&line[tabs[0]+1..tabs[1]]).ok()
+            .and_then(|s| s.parse::<i64>().ok()).ok_or_else(|| invalid_dosage("invalid VCF position"))?;
+        let ref_a = line[tabs[2]+1..tabs[3]].to_vec();
+        let alt_a = line[tabs[3]+1..tabs[4]].to_vec();
+        if alt_a.contains(&b',') { return Ok(None); }
+        let record = (chrom, pos, ref_a, alt_a);
+        if skip_gt { ds_buf.clear(); metadata.clear(); return Ok(Some(record)); }
+
+        let format = &line[tabs[7]+1..tabs[8]];
+        let mut ds_idx = None;
+        let mut gt_idx = None;
+        for (i, field) in format.split(|&b| b == b':').enumerate() {
+            if field == b"DS" { ds_idx = Some(i); }
+            if field == b"GT" { gt_idx = Some(i); }
+        }
+        // Only the fields up to the last of GT/DS are looked at.
+        let n_fields = gt_idx.max(ds_idx).map_or(0, |i| i + 1);
+        let parse_call = |sample: &[u8]| {
+            let mut call = SampleCall { ds: ds_idx.map(|_| -1.0), ..Default::default() };
+            for (i, field) in sample.split(|&b| b == b':').take(n_fields).enumerate() {
+                if gt_idx == Some(i) { call.gt = parse_gt_text(field); }
+                if ds_idx == Some(i) {
+                    call.ds = Some(std::str::from_utf8(field).ok().and_then(|s| s.parse::<f32>().ok())
+                        .filter(|v| v.is_finite()).unwrap_or(-1.0));
+                }
+            }
+            call
+        };
+        if indices.is_none() {
+            // Every column in file order: normalise as it is read, no call buffer.
+            ds_buf.clear();
+            metadata.clear();
+            let mut n = 0usize;
+            for sample in line[tabs[8]+1..].split(|&b| b == b'\t').take(n_samples) {
+                old_push_normalized(parse_call(sample), n, options, ds_buf, metadata)?;
+                n += 1;
+            }
+            // Absent/truncated sample columns are missing, never synthetic hom-ref.
+            for i in n..n_samples { old_push_normalized(SampleCall::default(), i, options, ds_buf, metadata)?; }
+            return Ok(Some(record));
+        }
+        calls.clear();
+        calls.extend(line[tabs[8]+1..].split(|&b| b == b'\t').take(n_samples).map(parse_call));
+        calls.resize(n_samples, SampleCall::default());
+        old_normalize_row(calls, indices, options, ds_buf, metadata)?;
+        Ok(Some(record))
+    }
+
+    struct Xs(u64);
+    impl Xs {
+        fn next(&mut self) -> u64 { self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17; self.0 }
+        fn below(&mut self, n: u64) -> u64 { self.next() % n }
+    }
+
+    #[test]
+    fn ds_fast_parse_is_str_parse() {
+        let same = |t: &str| {
+            let new = parse_ds_f32(t.as_bytes());
+            let old = t.parse::<f32>().ok();
+            assert_eq!(new.map(f32::to_bits), old.map(f32::to_bits), "{t:?}");
+        };
+        // Every writer dosage and AP: up to three decimals in [0, 2], as written
+        // (trailing zeros trimmed) and zero-padded.
+        for k in 0..=2000u32 {
+            same(&format!("{}", k as f64 / 1000.0));
+            same(&format!("{:.3}", k as f64 / 1000.0));
+            same(&format!("{}.{:03}", k / 1000, k % 1000));
+        }
+        // Random plain decimals of 1-9 digits, every decimal-point position.
+        let mut r = Xs(0x9E3779B97F4A7C15);
+        for _ in 0..1_000_000 {
+            let nd = 1 + r.below(9) as usize;
+            let digits: String = (0..nd).map(|_| char::from(b'0' + r.below(10) as u8)).collect();
+            same(&digits);
+            let dot = r.below(nd as u64 + 1) as usize;
+            same(&format!("{}.{}", &digits[..dot], &digits[dot..]));
+        }
+        for t in ["", ".", "5.", ".5", "-0", "-1.5", "+1", "1e3", "1E-3", "nan", "NaN", "inf", "-inf",
+                  "1.2.3", "0x1", " 1", "1 ", "00000000", "9999999", "99999999", "16777217", "0.0000001",
+                  "1677721.7", "8388609", "0.1234567", "12345678", "1.", "0..1", "\u{e9}"] {
+            same(t);
+        }
+    }
+
+    fn random_sample(r: &mut Xs, fields: &[&str]) -> String {
+        let gts = ["0/0", "0|1", "1/1", "1|0", "./.", ".", "0", "1", "./1", "0/1/1", "2/1", ""];
+        let dss = ["0", "0.5", "1", "1.999", "2", "2.0005", "2.5", ".", "nan", "-1", "0.1234567", "1e-3", "", "x", "1.0001"];
+        fields.iter().map(|f| match *f {
+            "GT" => gts[r.below(gts.len() as u64) as usize].to_string(),
+            "DS" => dss[r.below(dss.len() as u64) as usize].to_string(),
+            _ => "7".to_string(),
+        }).collect::<Vec<_>>().join(":")
+    }
+
+    #[test]
+    fn filtered_vcf_parse_matches_previous_reader() {
+        let formats: [&[&str]; 5] = [&["GT"], &["GT", "DS"], &["DS", "GT"], &["AP", "DS"], &["GT", "AP", "DS", "XX"]];
+        let mut r = Xs(12345);
+        let mut n_err = 0;
+        for case in 0..20_000 {
+            let fmt = formats[r.below(5) as usize];
+            let n = 1 + r.below(12) as usize;
+            // Sometimes fewer or more columns than the header declares.
+            let n_cols = match r.below(6) { 0 => r.below(n as u64) as usize, 1 => n + 1 + r.below(3) as usize, _ => n };
+            let samples: Vec<String> = (0..n_cols).map(|_| random_sample(&mut r, fmt)).collect();
+            let line = format!("22\t{}\trs1\tA\tG\t.\tPASS\t.\t{}\t{}\n", 100 + case, fmt.join(":"), samples.join("\t"));
+            let options = match r.below(3) {
+                0 => InputDosageOptions::default(),
+                1 => InputDosageOptions { ds_scale: DsScale::Diploid, fallback_ploidy: None },
+                _ => InputDosageOptions { ds_scale: DsScale::Native, fallback_ploidy: Some(2) },
+            };
+            let indices: Option<Vec<usize>> = match r.below(4) {
+                0 => None,
+                1 => Some((0..n).collect()),
+                2 => Some((0..1 + r.below(n as u64) as usize).map(|_| r.below(n as u64 + 2) as usize).collect()),
+                _ => { let mut v: Vec<usize> = (0..n).collect(); v.reverse(); v.truncate(1 + r.below(n as u64) as usize); Some(v) }
+            };
+            let (mut d0, mut m0) = (vec![9.0f32], DosageMetadata { native_alt: vec![7.0], ploidy: vec![7] });
+            let old = old_parse_vcf_record(line.as_bytes(), n, indices.as_deref(), options, &mut d0, &mut m0, &mut Vec::new(), false);
+            for keep in [true, false] {
+                let filter = indices.as_ref().map(|ix| ColFilter::new(ix.clone(), n));
+                let (mut d1, mut m1) = (vec![9.0f32], DosageMetadata { native_alt: vec![7.0], ploidy: vec![7] });
+                let new = parse_vcf_record_with(line.as_bytes(), n, filter.as_ref(), options, &mut d1, &mut m1, keep, &mut Vec::new(), false);
+                match (&old, &new) {
+                    (Ok(a), Ok(b)) => {
+                        assert_eq!(a, b);
+                        assert_eq!(d0.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), d1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "{line}");
+                        if keep {
+                            assert_eq!(m0.ploidy, m1.ploidy);
+                            assert_eq!(m0.native_alt.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), m1.native_alt.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+                        } else {
+                            assert!(m1.ploidy.is_empty() && m1.native_alt.is_empty());
+                        }
+                    }
+                    (Err(a), Err(b)) => { assert_eq!(a.to_string(), b.to_string()); n_err += 1; }
+                    _ => panic!("old {old:?} new {new:?} on {line}"),
+                }
+            }
+            // The identity selection may be stored as no selection.
+            if indices.as_ref().is_some_and(|ix| ix.len() == n && ix.iter().enumerate().all(|(i, &x)| i == x)) {
+                let (mut d2, mut m2) = (Vec::new(), DosageMetadata::default());
+                let none = parse_vcf_record_with(line.as_bytes(), n, None, options, &mut d2, &mut m2, true, &mut Vec::new(), false);
+                match (&old, &none) {
+                    (Ok(a), Ok(b)) => { assert_eq!(a, b); assert_eq!(d0, d2); assert_eq!(m0.ploidy, m2.ploidy); }
+                    (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
+                    _ => panic!("identity: old {old:?} new {none:?} on {line}"),
+                }
+            }
+        }
+        assert!(n_err > 100, "error paths barely exercised ({n_err})");
+    }
 }
