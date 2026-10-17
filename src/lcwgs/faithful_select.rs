@@ -515,4 +515,48 @@ mod tests {
             }
         }
     }
+
+    /// Selection with the lazily computed PBWT V entries is identical to the
+    /// eager V fill over many iterations: same conditioning sets, same PBWT
+    /// layers and cursors (random panel with common and rare sites, random
+    /// GLs and resampled haplotypes, several sample counts).
+    #[test]
+    fn lazy_v_selection_matches_eager() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        let mut rng = rp::Xs(0xBB67_AE85_84CA_A73B);
+        for &(n_var, n_haps, n_samples) in &[(400usize, 300usize, 1usize), (300, 500, 3), (250, 130, 2)] {
+            let ref_bm = rp::random_typed_panel(&mut rng, n_var, n_haps);
+            let cm: Vec<f64> = (0..n_var).map(|v| v as f64 * 0.004).collect();
+            let mut gl3 = vec![1.0f32 / 3.0; n_var * n_samples * 3];
+            for g in gl3.chunks_mut(3) {
+                if rng.below(3) == 0 {
+                    let a = (rng.below(1000) + 1) as f32;
+                    let b = (rng.below(1000) + 1) as f32;
+                    let c = (rng.below(1000) + 1) as f32;
+                    let s = a + b + c;
+                    g.copy_from_slice(&[a / s, b / s, c / s]);
+                }
+            }
+            let params = LcwgsParams { kpbwt: 40, pbwt_modulo_cm: 0.02, ..Default::default() };
+            let mut eager = FaithfulSelector::build(&ref_bm, &cm, &gl3, n_samples, &params, 7);
+            let mut lazy = FaithfulSelector::build(&ref_bm, &cm, &gl3, n_samples, &params, 7);
+            eager.tar.set_v_lazy(false);
+            lazy.tar.set_v_lazy(true);
+            for it in 0..8 {
+                let hap_alleles: Vec<u8> = (0..n_var * 2 * n_samples).map(|_| rng.below(2) as u8).collect();
+                let ce = eager.select(&hap_alleles);
+                let cl = lazy.select(&hap_alleles);
+                assert_eq!(ce, cl, "cond sets differ at iteration {it}");
+                assert!(ce.iter().all(|c| !c.is_empty()), "selection produced an empty set");
+                if it > 0 {
+                    assert!(eager.tar.pbwt_states.iter().flatten().any(|l| !l.is_empty()), "PBWT path not exercised");
+                }
+                assert_eq!(eager.tar.pbwt_states, lazy.tar.pbwt_states, "layers differ at iteration {it}");
+                assert_eq!(eager.tar.pbwt_index, lazy.tar.pbwt_index);
+                assert_eq!(eager.tar.f_k, lazy.tar.f_k);
+                assert_eq!(eager.tar.g_k, lazy.tar.g_k);
+                assert_eq!(eager.tar.pbwt_array_a, lazy.tar.pbwt_array_a);
+            }
+        }
+    }
 }

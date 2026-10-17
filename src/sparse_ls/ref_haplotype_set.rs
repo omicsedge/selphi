@@ -150,6 +150,31 @@ pub fn pack3(uncompressed_y: &[u8], n_chars: usize, compressed_y: &mut Vec<u8>) 
     }
 }
 
+/// Call `f(h)` for every haplotype `h < n_haps` whose allele in the panel row
+/// `row` (`HaplotypeBitmatrix::row`, bit `h % 64` of word `h / 64`) equals
+/// `allele`, in ascending `h`. The word-level form of
+/// `for h in 0..n_haps { if bm.get(site, h) == allele { f(h) } }`: each word is
+/// XORed with the allele mask, its padding past `n_haps` is masked off, and its
+/// set bits are walked with `trailing_zeros` — same calls, same order.
+#[inline]
+pub(crate) fn for_each_hap_with_allele(row: &[u64], n_haps: usize, allele: bool, mut f: impl FnMut(u32)) {
+    let flip = if allele { 0 } else { u64::MAX };
+    let nfull = n_haps / 64;
+    let rem = n_haps % 64;
+    let nw = nfull + (rem > 0) as usize;
+    for (w, &word) in row[..nw].iter().enumerate() {
+        let mut x = word ^ flip;
+        if w == nfull {
+            x &= (1u64 << rem) - 1; // reached only when rem > 0
+        }
+        let base = (w * 64) as u32;
+        while x != 0 {
+            f(base + x.trailing_zeros());
+            x &= x - 1;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ref_haplotype_set
 // ---------------------------------------------------------------------------
@@ -311,16 +336,16 @@ impl RefHaplotypeSet {
         // alleles are read on demand from `ref_bm` via `common2tot` (the redundant
         // common-site bitmatrix is not stored). `common2tot` is already populated
         // in PASS 1, so nothing else changes.
+        debug_assert!(self.n_ref_haps <= panel.n_words() * 64);
         for i_site in 0..n_sites {
             if !self.flag_common[i_site] {
-                // rare: if (a != major) ShapRef[hap].push(i_site)
+                // rare: if (a != major) ShapRef[hap].push(i_site) — a word-level
+                // scan for allele `!major`, ascending hap (same pushes, same order).
                 let major = self.major_alleles[i_site];
-                for hap in 0..self.n_ref_haps {
-                    let a = panel.get(i_site, hap);
-                    if a != major {
-                        self.shap_ref[hap].push(i_site as i32);
-                    }
-                }
+                let shap_ref = &mut self.shap_ref;
+                for_each_hap_with_allele(panel.row(i_site), self.n_ref_haps, !major, |hap| {
+                    shap_ref[hap as usize].push(i_site as i32);
+                });
             }
         }
         // ShapRef[hap] is naturally ascending in i_site (we iterate sites in
@@ -792,5 +817,66 @@ mod tests {
         rh.build_sparse_pbwt(&vmap, &panel);
         assert!(!rh.ypacked.is_empty());
         assert_eq!(rh.a_small_idx.len(), rh.n_com_sites_hq + 1);
+    }
+
+    /// `for_each_hap_with_allele` visits exactly the haps a per-hap `get` loop
+    /// selects, in the same order, for both alleles, widths on and off a word
+    /// boundary, and random row padding past `n_haps`.
+    #[test]
+    fn word_scan_matches_per_hap_get() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        let mut rng = rp::Xs(0x2545_F491_4F6C_DD1D);
+        for &(n_sites, n_haps) in &[(50usize, 1usize), (50, 63), (50, 64), (50, 65), (40, 4796), (30, 200)] {
+            for density in [0u64, 2, 50, 98, 100] {
+                let bm = rp::random_panel(&mut rng, n_sites, n_haps, density);
+                for v in 0..n_sites {
+                    for allele in [false, true] {
+                        let mut got = Vec::new();
+                        for_each_hap_with_allele(bm.row(v), n_haps, allele, |h| got.push(h));
+                        let want: Vec<u32> = (0..n_haps as u32).filter(|&h| bm.get(v, h as usize) == allele).collect();
+                        assert_eq!(got, want, "n_haps={n_haps} density={density} v={v} allele={allele}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// `build_from_panel`'s word-level ShapRef pass fills the same per-hap lists
+    /// as the verbatim per-hap loop it replaced.
+    #[test]
+    fn shap_ref_word_scan_matches_reference() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        use crate::sparse_ls::variant::Variant;
+        let mut rng = rp::Xs(0x9E37_79B9_7F4A_7C15);
+        for &(n_sites, n_haps) in &[(300usize, 4796usize), (400, 130), (200, 64), (200, 9)] {
+            let panel = rp::random_typed_panel(&mut rng, n_sites, n_haps);
+            let mut vmap = VariantMap::new();
+            for s in 0..n_sites {
+                let calt = panel.popcount_row(s, n_haps);
+                vmap.vars.push(Variant {
+                    bp: s as i64, id: String::new(), ref_a: String::new(), alt_a: String::new(),
+                    vtype: 0, idx: s as i32, cref: n_haps as u32 - calt, calt, cm: s as f64, lq: false,
+                });
+            }
+            for maf in [0.001f64, 0.01, 0.2] {
+                let mut rh = RefHaplotypeSet::new();
+                rh.sparse_maf = maf;
+                rh.build_from_panel(&panel, &vmap);
+                // Verbatim pre-word-scan PASS 2 over the same classification.
+                let mut want: Vec<Vec<i32>> = vec![Vec::new(); n_haps];
+                for i_site in 0..n_sites {
+                    if !rh.flag_common[i_site] {
+                        let major = rh.major_alleles[i_site];
+                        for hap in 0..rh.n_ref_haps {
+                            let a = panel.get(i_site, hap);
+                            if a != major {
+                                want[hap].push(i_site as i32);
+                            }
+                        }
+                    }
+                }
+                assert_eq!(rh.shap_ref, want, "n_haps={n_haps} maf={maf}");
+            }
+        }
     }
 }

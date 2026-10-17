@@ -798,6 +798,9 @@ fn run_chunked_gibbs(
             let end = (start + max_live).min(n_chunks);
             let wave: Vec<_> = (start..end).into_par_iter().map(&process_chunk).collect();
             for result in wave { merge(result); }
+            // The wave's chunk buffers were freed by threads that may now idle;
+            // hand their pages back before the next wave (memory only).
+            crate::common::mem::release_freed_memory();
             start = end;
         }
     };
@@ -824,6 +827,7 @@ fn run_chunked_gibbs(
             "  chunk parallelism: calibrated on chunk 1 → {:.2} GB/chunk ({}); {} live for the remaining {} (budget {:.1} GB)",
             per_chunk_gb, if measured_gb > 0.05 { "measured" } else { "estimated" }, max_live, n_chunks - 1, budget_gb);
         merge_chunk(first);
+        crate::common::mem::release_freed_memory(); // chunk 1's pages, before the waves
         run_waves(1, max_live, &mut merge_chunk)
     } else {
         merge_chunk(process_chunk(0));

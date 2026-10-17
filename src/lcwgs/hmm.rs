@@ -114,13 +114,15 @@ pub struct BasePack {
     pub wb: usize,
     /// Absolute site → row (`u32::MAX` = site not packed).
     pub row_of_abs: Vec<u32>,
+    /// Gather plan of the base states (scratch reused across builds).
+    plan: Vec<GatherWord>,
 }
 impl Default for BasePack {
     fn default() -> Self { Self::new() }
 }
 impl BasePack {
     pub const fn new() -> Self {
-        BasePack { words: Vec::new(), b: 0, wb: 0, row_of_abs: Vec::new() }
+        BasePack { words: Vec::new(), b: 0, wb: 0, row_of_abs: Vec::new(), plan: Vec::new() }
     }
     /// Pack the alleles of `base` (the shared conditioning prefix) at the
     /// absolute sites `sites_abs` (ascending). `n_sites_total` sizes the
@@ -130,36 +132,183 @@ impl BasePack {
         let t0 = if timing { Some(std::time::Instant::now()) } else { None };
         self.b = base.len();
         self.wb = self.b.div_ceil(64);
-        self.words.clear();
-        self.words.resize(sites_abs.len() * self.wb, 0u64);
         self.row_of_abs.clear();
         self.row_of_abs.resize(n_sites_total, u32::MAX);
         for (r, &a) in sites_abs.iter().enumerate() {
             self.row_of_abs[a] = r as u32;
-            if self.b == 0 { continue; }
-            let rp = ref_bm.row(a).as_ptr();
-            let out = &mut self.words[r * self.wb..(r + 1) * self.wb];
-            let mut widx = 0usize;
-            let mut word = 0u64;
-            let mut bitpos = 0u32;
-            for &h in base {
-                let h = h as usize;
-                // SAFETY: h < n_haps by construction, so h>>6 indexes a valid word of the row.
-                let bit = unsafe { (*rp.add(h >> 6) >> (h & 63)) & 1 };
-                word |= bit << bitpos;
-                bitpos += 1;
-                if bitpos == 64 { out[widx] = word; widx += 1; word = 0; bitpos = 0; }
-            }
-            if bitpos > 0 { out[widx] = word; }
         }
+        // Every word of every row is written below (a row of `b` bits is exactly
+        // `wb` words, the last one zero-padded), so the buffer is not zero-filled.
+        let total = sites_abs.len() * self.wb;
+        self.words.clear();
+        self.words.reserve(total);
+        if self.b > 0 {
+            build_gather_plan(base, &mut self.plan);
+            let wp = self.words.as_mut_ptr();
+            for (r, &a) in sites_abs.iter().enumerate() {
+                let rp = ref_bm.row(a).as_ptr();
+                // SAFETY: every base id is < n_haps, so each run's word lies in row
+                // `a`; row r's `wb` words lie inside the capacity reserved above.
+                let n = unsafe { gather_row(rp, &self.plan, wp.add(r * self.wb), 0, 0, 0) };
+                debug_assert_eq!(n, self.wb);
+            }
+        }
+        // SAFETY: all `total` words were written above (`wb == 0` when `b == 0`).
+        unsafe { self.words.set_len(total); }
         if let Some(t) = t0 { PROF_PACK_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
     }
 }
 
+/// One step of a gather plan (see [`build_gather_plan`]): `cnt` (1..=64)
+/// consecutive conditioning states whose panel haplotypes all sit in panel-row
+/// word `w`, in strictly increasing bit order; `mask` has their bits set.
+/// Extracting `mask` from the word (PEXT) yields their alleles in state order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GatherWord {
+    mask: u64,
+    w: u32,
+    cnt: u32,
+}
+
+/// Split a state list `ids` (panel haplotype ids, in STATE order) into maximal
+/// groups of consecutive states that fall in one 64-bit panel-row word with
+/// strictly increasing bit positions.
+///
+/// Packing a row is then one bit-extract + append per group instead of one bit
+/// gather per state. The faithful selection's base is index-sorted (see
+/// `faithful_select::flatten_pbwt`), so it becomes one group per panel word it
+/// touches (~K/64 + holes' worth); the appended rare-carrier tail is short
+/// ascending lists and groups less well. State order is preserved group by
+/// group, so the bits produced are exactly those of the per-state gather.
+pub(crate) fn build_gather_plan(ids: &[u32], plan: &mut Vec<GatherWord>) {
+    plan.clear();
+    let mut it = ids.iter();
+    let Some(&h0) = it.next() else { return };
+    let mut cur = GatherWord { mask: 1u64 << (h0 & 63), w: h0 >> 6, cnt: 1 };
+    let mut last_bit = h0 & 63;
+    for &h in it {
+        let (w, b) = (h >> 6, h & 63);
+        if w == cur.w && b > last_bit {
+            cur.mask |= 1u64 << b;
+            cur.cnt += 1;
+        } else {
+            plan.push(cur);
+            cur = GatherWord { mask: 1u64 << b, w, cnt: 1 };
+        }
+        last_bit = b;
+    }
+    plan.push(cur);
+}
+
+/// Portable parallel bit extract (`_pext_u64` semantics): the bits of `x` at
+/// the set positions of `m`, packed to the low end in ascending position
+/// order. Walks `m`'s runs of ones (one shift/mask per run), so an index-sorted
+/// set with few holes costs a few steps per word.
+#[inline(always)]
+pub(crate) fn pext_sw(x: u64, mut m: u64) -> u64 {
+    let mut out = 0u64;
+    let mut k = 0u32;
+    while m != 0 {
+        let s = m.trailing_zeros();
+        let run = (!(m >> s)).trailing_zeros(); // 1..=64-s
+        let low = u64::MAX >> (64 - run);
+        out |= ((x >> s) & low) << k; // k + run <= 64, and k < 64 while m != 0
+        k += run;
+        m &= !(low << s);
+    }
+    out
+}
+
+/// Whether to extract with BMI2 `PEXT`: the CPU has BMI2, the instruction is
+/// fast on it (AMD before Zen 3 and Hygon microcode it at tens to hundreds of
+/// cycles), and `SELPHI_FORCE_SCALAR` is not set. Cached.
+#[cfg(target_arch = "x86_64")]
+fn use_pext() -> bool {
+    use std::sync::OnceLock;
+    static USE: OnceLock<bool> = OnceLock::new();
+    *USE.get_or_init(|| {
+        if crate::config::is_one("SELPHI_FORCE_SCALAR") || !is_x86_feature_detected!("bmi2") {
+            return false;
+        }
+        // CPUID leaves 0 (vendor) and 1 (family) exist on every x86-64 CPU.
+        let (l0, l1) = (core::arch::x86_64::__cpuid(0), core::arch::x86_64::__cpuid(1));
+        let mut vendor = [0u8; 12];
+        vendor[..4].copy_from_slice(&l0.ebx.to_le_bytes());
+        vendor[4..8].copy_from_slice(&l0.edx.to_le_bytes());
+        vendor[8..].copy_from_slice(&l0.ecx.to_le_bytes());
+        let base_family = (l1.eax >> 8) & 0xF;
+        let family = if base_family == 0xF { base_family + ((l1.eax >> 20) & 0xFF) } else { base_family };
+        let slow = (&vendor == b"AuthenticAMD" || &vendor == b"HygonGenuine") && family < 0x19;
+        !slow
+    })
+}
+
+/// Append the bits a gather plan selects from panel row `rp` to a packed row
+/// at `out`, starting at word `widx` with `pos` (< 64) pending low bits in
+/// `acc` (all bits of `acc` at or above `pos` must be 0). Writes every word up
+/// to and including the final partial one (zero-padded) and returns the word
+/// count reached. `ext` is the bit extract (hardware or portable PEXT).
+#[inline(always)]
+unsafe fn gather_row_with(
+    rp: *const u64, plan: &[GatherWord], out: *mut u64,
+    mut widx: usize, mut acc: u64, mut pos: u32,
+    ext: impl Fn(u64, u64) -> u64,
+) -> usize { unsafe {
+    for g in plan {
+        let x = ext(*rp.add(g.w as usize), g.mask);
+        acc |= x << pos;
+        let np = pos + g.cnt;
+        if np >= 64 {
+            out.add(widx).write(acc);
+            widx += 1;
+            // The bits of x that did not fit (none when pos == 0).
+            acc = (x >> 1) >> (63 - pos);
+            pos = np - 64;
+        } else {
+            pos = np;
+        }
+    }
+    if pos > 0 {
+        out.add(widx).write(acc);
+        widx += 1;
+    }
+    widx
+}}
+
+/// [`gather_row_with`] using the BMI2 `PEXT` instruction.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+unsafe fn gather_row_bmi2(rp: *const u64, plan: &[GatherWord], out: *mut u64, widx: usize, acc: u64, pos: u32) -> usize { unsafe {
+    gather_row_with(rp, plan, out, widx, acc, pos, |x, m| core::arch::x86_64::_pext_u64(x, m))
+}}
+
+/// [`gather_row_with`] using the portable [`pext_sw`].
+#[inline]
+pub(crate) unsafe fn gather_row_portable(rp: *const u64, plan: &[GatherWord], out: *mut u64, widx: usize, acc: u64, pos: u32) -> usize { unsafe {
+    gather_row_with(rp, plan, out, widx, acc, pos, pext_sw)
+}}
+
+/// Append the plan's bits of panel row `rp` to the packed row at `out` (see
+/// [`gather_row_with`]), with BMI2 `PEXT` when [`use_pext`] allows, else the
+/// portable extract — the same bits either way.
+///
+/// # Safety
+/// Every plan word must be readable at `rp`, and `out` must be writable for
+/// the words written (`widx + ceil((pos + Σcnt) / 64)` in total).
+#[inline]
+pub(crate) unsafe fn gather_row(rp: *const u64, plan: &[GatherWord], out: *mut u64, widx: usize, acc: u64, pos: u32) -> usize { unsafe {
+    #[cfg(target_arch = "x86_64")]
+    if use_pext() {
+        return gather_row_bmi2(rp, plan, out, widx, acc, pos);
+    }
+    gather_row_portable(rp, plan, out, widx, acc, pos)
+}}
+
 /// Pack one haplotype's conditioning alleles, 1 bit per state, one row per site
 /// of its (possibly compacted) axis: `out[v * w64 + w]`, `w64 = ceil(K/64)`,
 /// bit `k` of row `v` = `ref_bm.get(site(v), cond[k])` with `site(v) =
-/// poly_sites[v]` (or `v`). Branchless word-at-a-time gather.
+/// poly_sites[v]` (or `v`). Word-at-a-time gather through a per-panel-word
+/// extract plan ([`build_gather_plan`], [`gather_row`]).
 ///
 /// With `base = Some(bp)`, `cond[..bp.b]` MUST equal the base states `bp` was
 /// built from (the caller's shared prefix): rows whose site is in the base pack
@@ -178,39 +327,50 @@ pub fn pack_cond_rows(
     let t0 = if timing { Some(std::time::Instant::now()) } else { None };
     let k = cond.len();
     let w64 = k.div_ceil(64);
+    // Every word of every row is written below, so `out` is not zero-filled.
+    let total = n_var * w64;
     out.clear();
-    out.resize(n_var * w64, 0u64);
+    out.reserve(total);
     let base = base.filter(|bp| bp.b > 0 && bp.b <= k);
-    for v in 0..n_var {
-        let a = poly_sites.map_or(v, |ps| ps[v]);
-        let rp = ref_bm.row(a).as_ptr();
-        let row = &mut out[v * w64..(v + 1) * w64];
-        let mut widx = 0usize;
-        let mut word = 0u64;
-        let mut bitpos = 0u32;
-        let mut kstart = 0usize;
-        if let Some(bp) = base {
-            let r = bp.row_of_abs.get(a).copied().unwrap_or(u32::MAX);
-            if r != u32::MAX {
-                let src = &bp.words[r as usize * bp.wb..(r as usize + 1) * bp.wb];
-                let nfull = bp.b / 64;
-                row[..nfull].copy_from_slice(&src[..nfull]);
-                widx = nfull;
-                bitpos = (bp.b % 64) as u32;
-                word = if bitpos > 0 { src[nfull] } else { 0 };
-                kstart = bp.b;
-            }
+    if w64 > 0 {
+        let mut tail_plan: Vec<GatherWord> = Vec::new();
+        if let Some(bp) = base { build_gather_plan(&cond[bp.b..], &mut tail_plan); }
+        // Plan of the whole set, built only if some row is absent from the base.
+        let mut full_plan: Option<Vec<GatherWord>> = None;
+        let op = out.as_mut_ptr();
+        for v in 0..n_var {
+            let a = poly_sites.map_or(v, |ps| ps[v]);
+            let rp = ref_bm.row(a).as_ptr();
+            // SAFETY: row v's w64 words lie inside the capacity reserved above.
+            let dst = unsafe { op.add(v * w64) };
+            let r = base.map_or(u32::MAX, |bp| bp.row_of_abs.get(a).copied().unwrap_or(u32::MAX));
+            let n = match base {
+                Some(bp) if r != u32::MAX => {
+                    let src = &bp.words[r as usize * bp.wb..(r as usize + 1) * bp.wb];
+                    let nfull = bp.b / 64;
+                    let pos = (bp.b % 64) as u32;
+                    let acc = if pos > 0 { src[nfull] } else { 0 };
+                    // SAFETY: nfull ≤ w64 words copied into row v; ids < n_haps.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src.as_ptr(), dst, nfull);
+                        gather_row(rp, &tail_plan, dst, nfull, acc, pos)
+                    }
+                }
+                _ => {
+                    let plan = full_plan.get_or_insert_with(|| {
+                        let mut p = Vec::new();
+                        build_gather_plan(cond, &mut p);
+                        p
+                    });
+                    // SAFETY: ids < n_haps; row v's w64 words are reserved.
+                    unsafe { gather_row(rp, plan, dst, 0, 0, 0) }
+                }
+            };
+            debug_assert_eq!(n, w64);
         }
-        for &h in &cond[kstart..] {
-            let h = h as usize;
-            // SAFETY: h < n_haps by construction, so h>>6 indexes a valid word of the row.
-            let bit = unsafe { (*rp.add(h >> 6) >> (h & 63)) & 1 };
-            word |= bit << bitpos;
-            bitpos += 1;
-            if bitpos == 64 { row[widx] = word; widx += 1; word = 0; bitpos = 0; }
-        }
-        if bitpos > 0 { row[widx] = word; }
     }
+    // SAFETY: all `total` words were written above (none when w64 == 0).
+    unsafe { out.set_len(total); }
     if let Some(t) = t0 { PROF_PACK_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
 }
 
@@ -1767,9 +1927,286 @@ pub fn run_forward_backward_scaffold(
     HmmOutput { dosage }
 }
 
+/// The per-state-gather packers the plan-based ones replaced, kept verbatim as
+/// the reference for the parity tests.
+#[cfg(test)]
+pub(crate) mod reference_pack {
+    use super::*;
+
+    /// Verbatim pre-plan `BasePack::build` body; returns `(words, b, wb, row_of_abs)`.
+    pub(crate) fn base_pack_build(ref_bm: &HaplotypeBitmatrix, base: &[u32], sites_abs: &[usize], n_sites_total: usize) -> (Vec<u64>, usize, usize, Vec<u32>) {
+        let b = base.len();
+        let wb = b.div_ceil(64);
+        let mut words: Vec<u64> = Vec::new();
+        words.resize(sites_abs.len() * wb, 0u64);
+        let mut row_of_abs: Vec<u32> = Vec::new();
+        row_of_abs.resize(n_sites_total, u32::MAX);
+        for (r, &a) in sites_abs.iter().enumerate() {
+            row_of_abs[a] = r as u32;
+            if b == 0 { continue; }
+            let rp = ref_bm.row(a).as_ptr();
+            let out = &mut words[r * wb..(r + 1) * wb];
+            let mut widx = 0usize;
+            let mut word = 0u64;
+            let mut bitpos = 0u32;
+            for &h in base {
+                let h = h as usize;
+                let bit = unsafe { (*rp.add(h >> 6) >> (h & 63)) & 1 };
+                word |= bit << bitpos;
+                bitpos += 1;
+                if bitpos == 64 { out[widx] = word; widx += 1; word = 0; bitpos = 0; }
+            }
+            if bitpos > 0 { out[widx] = word; }
+        }
+        (words, b, wb, row_of_abs)
+    }
+
+    /// Verbatim pre-plan `pack_cond_rows`.
+    pub(crate) fn pack_cond_rows(
+        ref_bm: &HaplotypeBitmatrix,
+        cond: &[u32],
+        poly_sites: Option<&[usize]>,
+        n_var: usize,
+        base: Option<&BasePack>,
+        out: &mut Vec<u64>,
+    ) {
+        let k = cond.len();
+        let w64 = k.div_ceil(64);
+        out.clear();
+        out.resize(n_var * w64, 0u64);
+        let base = base.filter(|bp| bp.b > 0 && bp.b <= k);
+        for v in 0..n_var {
+            let a = poly_sites.map_or(v, |ps| ps[v]);
+            let rp = ref_bm.row(a).as_ptr();
+            let row = &mut out[v * w64..(v + 1) * w64];
+            let mut widx = 0usize;
+            let mut word = 0u64;
+            let mut bitpos = 0u32;
+            let mut kstart = 0usize;
+            if let Some(bp) = base {
+                let r = bp.row_of_abs.get(a).copied().unwrap_or(u32::MAX);
+                if r != u32::MAX {
+                    let src = &bp.words[r as usize * bp.wb..(r as usize + 1) * bp.wb];
+                    let nfull = bp.b / 64;
+                    row[..nfull].copy_from_slice(&src[..nfull]);
+                    widx = nfull;
+                    bitpos = (bp.b % 64) as u32;
+                    word = if bitpos > 0 { src[nfull] } else { 0 };
+                    kstart = bp.b;
+                }
+            }
+            for &h in &cond[kstart..] {
+                let h = h as usize;
+                let bit = unsafe { (*rp.add(h >> 6) >> (h & 63)) & 1 };
+                word |= bit << bitpos;
+                bitpos += 1;
+                if bitpos == 64 { row[widx] = word; widx += 1; word = 0; bitpos = 0; }
+            }
+            if bitpos > 0 { row[widx] = word; }
+        }
+    }
+
+    /// xorshift64 test stream.
+    pub(crate) struct Xs(pub u64);
+    impl Xs {
+        pub(crate) fn next(&mut self) -> u64 { let x = &mut self.0; *x ^= *x << 13; *x ^= *x >> 7; *x ^= *x << 17; *x }
+        pub(crate) fn below(&mut self, n: u64) -> u64 { self.next() % n }
+    }
+
+    /// A random panel whose row padding bits (past `n_haps`) are random too, so a
+    /// packer that read past a state's own bit would be caught.
+    pub(crate) fn random_panel(rng: &mut Xs, n_sites: usize, n_haps: usize, density_pct: u64) -> HaplotypeBitmatrix {
+        let nw = n_haps.div_ceil(64);
+        let mut bits = vec![0u64; n_sites * nw];
+        for w in bits.iter_mut() {
+            let mut x = 0u64;
+            for b in 0..64 { if rng.below(100) < density_pct { x |= 1 << b; } }
+            *w = x;
+        }
+        HaplotypeBitmatrix::from_raw(bits, n_sites, n_haps)
+    }
+
+    /// A random panel with the site classes the lcWGS structures distinguish:
+    /// rare ALT (a few ALT carriers), rare REF (a few REF carriers), common,
+    /// monomorphic REF and ALT. Row padding past `n_haps` is random.
+    pub(crate) fn random_typed_panel(rng: &mut Xs, n_sites: usize, n_haps: usize) -> HaplotypeBitmatrix {
+        let nw = n_haps.div_ceil(64);
+        let mut bits = vec![0u64; n_sites * nw];
+        for v in 0..n_sites {
+            let row = &mut bits[v * nw..(v + 1) * nw];
+            for w in row.iter_mut() { *w = rng.next(); } // padding stays random
+            let kind = rng.below(5);
+            for h in 0..n_haps {
+                let a = match kind {
+                    0 => rng.below(n_haps as u64) < 3,  // rare ALT
+                    1 => rng.below(n_haps as u64) >= 3, // rare REF
+                    2 => rng.below(2) == 1,             // common
+                    3 => false,                         // monomorphic REF
+                    _ => true,                          // monomorphic ALT
+                };
+                let (w, b) = (h / 64, h % 64);
+                if a { row[w] |= 1 << b; } else { row[w] &= !(1 << b); }
+            }
+        }
+        HaplotypeBitmatrix::from_raw(bits, n_sites, n_haps)
+    }
+
+    /// Conditioning-set shapes the selection produces and the plan must handle:
+    /// a contiguous block, an index-sorted set with holes (the faithful base),
+    /// such a base plus an unsorted rare-carrier tail, a fully shuffled set, one
+    /// with duplicates, and degenerate sizes.
+    pub(crate) fn cond_shapes(rng: &mut Xs, n_haps: usize) -> Vec<Vec<u32>> {
+        let n = n_haps as u32;
+        let mut out: Vec<Vec<u32>> = Vec::new();
+        out.push(Vec::new());
+        out.push(vec![rng.below(n as u64) as u32]);
+        out.push((0..n.min(2000)).collect());
+        out.push((0..n.min(64)).collect());
+        out.push((5..n.min(133)).collect());
+        out.push(vec![n - 1]);
+        for hole_pct in [1u64, 5, 30, 70] {
+            let sorted: Vec<u32> = (0..n).filter(|_| rng.below(100) >= hole_pct).collect();
+            let kcap = (rng.below(n as u64) as usize).max(1);
+            let mut base: Vec<u32> = sorted.into_iter().take(kcap).collect();
+            out.push(base.clone());
+            // + an unsorted tail of ids not in the base, in short ascending groups.
+            let mut tail: Vec<u32> = Vec::new();
+            for _ in 0..rng.below(40) {
+                let start = rng.below(n as u64) as u32;
+                let len = 1 + rng.below(6) as u32;
+                for h in start..(start + len).min(n) {
+                    if !base.contains(&h) && !tail.contains(&h) { tail.push(h); }
+                }
+            }
+            base.extend(tail);
+            out.push(base);
+        }
+        let mut shuffled: Vec<u32> = (0..n).collect();
+        for i in (1..shuffled.len()).rev() { let j = rng.below(i as u64 + 1) as usize; shuffled.swap(i, j); }
+        shuffled.truncate((rng.below(n as u64) as usize).max(1));
+        out.push(shuffled);
+        let dups: Vec<u32> = (0..300).map(|_| rng.below(n as u64) as u32).collect();
+        out.push(dups);
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The run-plan `BasePack::build` and `pack_cond_rows` reproduce the verbatim
+    /// per-state gathers word for word (incl. the zero padding past K, which the
+    /// new code writes instead of pre-zeroing) on randomized panels — widths that
+    /// are and are not multiples of 64, random padding bits — and every
+    /// conditioning shape the selection produces, with and without a base pack,
+    /// on compacted and full site axes, including sites absent from the base.
+    #[test]
+    fn plan_pack_matches_reference_gather() {
+        use reference_pack as rp;
+        let mut rng = rp::Xs(0xD1B5_4A32_D192_ED03);
+        for &(n_sites, n_haps) in &[(40usize, 64usize), (50, 65), (60, 700), (30, 4796), (25, 128), (20, 3)] {
+            for density in [3u64, 50, 97] {
+                let bm = rp::random_panel(&mut rng, n_sites, n_haps, density);
+                let shapes = rp::cond_shapes(&mut rng, n_haps);
+                for c in &shapes {
+                    let k = c.len();
+                    // Base prefix lengths: none, word-aligned, unaligned, all.
+                    let mut bs: Vec<usize> = vec![0, k];
+                    for b in [1usize, 63, 64, 65, 128, k / 2, k.saturating_sub(1)] { if b <= k { bs.push(b); } }
+                    let poly: Vec<usize> = (0..n_sites).filter(|_| rng.below(3) != 0).collect();
+                    // Union deliberately misses a few poly sites (fallback rows).
+                    let union: Vec<usize> = (0..n_sites).filter(|v| poly.contains(v) && rng.below(10) != 0 || rng.below(4) == 0).collect();
+                    for &b in &bs {
+                        let mut base = BasePack::new();
+                        base.build(&bm, &c[..b], &union, n_sites);
+                        let (w_ref, b_ref, wb_ref, roa_ref) = rp::base_pack_build(&bm, &c[..b], &union, n_sites);
+                        assert_eq!(base.words, w_ref, "base words n_haps={n_haps} k={k} b={b}");
+                        assert_eq!((base.b, base.wb), (b_ref, wb_ref));
+                        assert_eq!(base.row_of_abs, roa_ref);
+                        for ps in [Some(poly.as_slice()), None] {
+                            let n = ps.map_or(n_sites, |p| p.len());
+                            for bo in [None, Some(&base)] {
+                                let mut got = vec![0xDEAD_BEEFu64; 7]; // stale content must not leak
+                                pack_cond_rows(&bm, c, ps, n, bo, &mut got);
+                                let mut want = Vec::new();
+                                rp::pack_cond_rows(&bm, c, ps, n, bo, &mut want);
+                                assert_eq!(got, want, "pack n_haps={n_haps} k={k} b={b} axis={} base={}",
+                                    ps.map_or("full", |_| "poly"), bo.is_some());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `pext_sw` equals the BMI2 instruction (when the CPU has it) and a
+    /// bit-by-bit reference on random words and masks of every density,
+    /// including the empty and full masks and single runs at the word ends.
+    #[test]
+    fn pext_sw_matches_reference() {
+        let mut rng = reference_pack::Xs(0x8F1B_BCDC_BFA5_3E0B);
+        let reference = |x: u64, m: u64| -> u64 {
+            let mut out = 0u64;
+            let mut k = 0;
+            for b in 0..64 { if (m >> b) & 1 == 1 { out |= ((x >> b) & 1) << k; k += 1; } }
+            out
+        };
+        let mut cases: Vec<(u64, u64)> = vec![(rng.next(), 0), (rng.next(), u64::MAX), (u64::MAX, 1 << 63), (u64::MAX, 1), (rng.next(), u64::MAX << 1), (rng.next(), u64::MAX >> 1)];
+        for _ in 0..200_000 {
+            let x = rng.next();
+            let m = match rng.below(4) { 0 => rng.next(), 1 => rng.next() & rng.next() & rng.next(), 2 => !(rng.next() & rng.next() & rng.next()), _ => { let s = rng.below(64); let l = 1 + rng.below(64 - s); (u64::MAX >> (64 - l)) << s } };
+            cases.push((x, m));
+        }
+        #[cfg(target_arch = "x86_64")]
+        let hw = is_x86_feature_detected!("bmi2");
+        for (x, m) in cases {
+            assert_eq!(pext_sw(x, m), reference(x, m), "x={x:#x} m={m:#x}");
+            #[cfg(target_arch = "x86_64")]
+            if hw { assert_eq!(unsafe { core::arch::x86_64::_pext_u64(x, m) }, reference(x, m)); }
+        }
+    }
+
+    /// `gather_row` (both the dispatched and the portable extract) appends a
+    /// plan's bits at every pending offset, for random multi-word plans whose
+    /// groups have every size from 1 to 64 bits, against a bit-by-bit reference.
+    #[test]
+    fn gather_row_matches_bitwise_reference() {
+        let mut rng = reference_pack::Xs(0x1234_5678_9ABC_DEF1);
+        let row: Vec<u64> = (0..8).map(|_| rng.next()).collect();
+        for trial in 0..20_000 {
+            // Random ids in state order: ascending within random words, random word order.
+            let mut ids: Vec<u32> = Vec::new();
+            for _ in 0..(1 + rng.below(6)) {
+                let w = rng.below(8) as u32;
+                let m = match rng.below(3) { 0 => rng.next(), 1 => u64::MAX, _ => 1u64 << rng.below(64) };
+                for b in 0..64u32 { if (m >> b) & 1 == 1 { ids.push(w * 64 + b); } }
+            }
+            let mut plan = Vec::new();
+            build_gather_plan(&ids, &mut plan);
+            let pos = if trial % 4 == 0 { 0 } else { rng.below(64) as u32 };
+            let pre = if pos == 0 { 0 } else { rng.next() & (u64::MAX >> (64 - pos)) };
+            let n_out = (pos as usize + ids.len()).div_ceil(64);
+            let mut want = vec![0u64; n_out + 1];
+            want[0] = pre;
+            for (j, &h) in ids.iter().enumerate() {
+                let bit = (row[(h / 64) as usize] >> (h % 64)) & 1;
+                let o = pos as usize + j;
+                want[o / 64] |= bit << (o % 64);
+            }
+            for portable in [false, true] {
+                let mut out = vec![0x5555_5555_5555_5555u64; n_out + 1];
+                let n = unsafe {
+                    if portable { gather_row_portable(row.as_ptr(), &plan, out.as_mut_ptr(), 0, pre, pos) }
+                    else { gather_row(row.as_ptr(), &plan, out.as_mut_ptr(), 0, pre, pos) }
+                };
+                assert_eq!(n, n_out, "trial {trial}");
+                assert_eq!(out[..n_out], want[..n_out], "trial {trial} portable={portable}");
+                assert_eq!(out[n_out], 0x5555_5555_5555_5555, "wrote past the row");
+            }
+        }
+    }
 
     /// The shared-prefix assembly must reproduce the direct pack bit for bit,
     /// for every prefix length (word-aligned or not), on a compacted or full
