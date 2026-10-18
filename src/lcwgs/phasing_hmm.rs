@@ -202,6 +202,10 @@ pub struct PhasingHmm {
     /// used by the SIMD emission/hom kernels. `[n_states, 64·w64)` left 0.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))] // read only by x86 SIMD kernels
     condbits: Vec<u64>,
+    /// Current SIMD row: either borrowed directly from a complete base pack or
+    /// assembled in `condbits`. Valid only during the current kernel/rephase.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    condrow: *const u64,
     /// Optional shared-prefix pack for the CURRENT `rephase` call (null when
     /// none): the caller packed the leading `b` conditioning states once per
     /// sample (see [`crate::lcwgs::hmm::BasePack`]); `pack_condbits` copies
@@ -426,6 +430,7 @@ impl PhasingHmm {
             n_states: 0,
             simd: SimdMode::Scalar,
             condbits: Vec::new(),
+            condrow: std::ptr::null(),
             base_pack: std::ptr::null(),
             plan_full: Vec::new(),
             plan_tail: Vec::new(),
@@ -481,9 +486,20 @@ impl PhasingHmm {
         let nstates = self.n_states;
         debug_assert_eq!(cond_haps.len(), nstates);
         let w64 = nstates.div_ceil(64);
+        if !self.base_pack.is_null() {
+            // SAFETY: the caller's pack outlives rephase. Complete rows have
+            // exactly the same state order as the old per-kernel assembly.
+            let bp = unsafe { &*self.base_pack };
+            let r = bp.row_of_abs.get(self.curr_abs_locus as usize).copied().unwrap_or(u32::MAX);
+            if bp.b == nstates && r != u32::MAX {
+                self.condrow = bp.words[r as usize * bp.wb..][..w64].as_ptr();
+                return;
+            }
+        }
         if self.condbits.len() < w64 {
             self.condbits.resize(w64, 0u64);
         }
+        self.condrow = self.condbits.as_ptr();
         if w64 == 0 { return; }
         let abs = self.curr_abs_locus as usize;
         let rp = ref_bm.row(abs).as_ptr();
@@ -500,7 +516,7 @@ impl PhasingHmm {
                     let src = &bp.words[r as usize * bp.wb..(r as usize + 1) * bp.wb];
                     let nfull = bp.b / 64;
                     let pos = (bp.b % 64) as u32;
-                    let acc = if pos > 0 { src[nfull] } else { 0 };
+                    let acc = if pos > 0 { src[nfull] & ((1u64 << pos) - 1) } else { 0 };
                     // SAFETY: condbits holds ≥ w64 words; the plan's ids are < n_haps.
                     let n = unsafe {
                         std::ptr::copy_nonoverlapping(src.as_ptr(), dst, nfull);
@@ -1057,7 +1073,7 @@ impl PhasingHmm {
         let slv = _mm256_loadu_ps(scale_l.as_ptr());
         let ip = self.impute_prob[miss * states_haps..(miss + 1) * states_haps].as_ptr();
         let pp = self.prob[..states_haps].as_ptr();
-        let cb = self.condbits.as_ptr();
+        let cb = self.condrow;
         let mut s0 = _mm256_setzero_ps();
         let mut s1 = _mm256_setzero_ps();
         for k in 0..self.n_states {
@@ -1094,7 +1110,7 @@ impl PhasingHmm {
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     fn cond_bit(&self, k: usize) -> bool {
-        unsafe { (*self.condbits.as_ptr().add(k / 64) >> (k % 64)) & 1 != 0 }
+        unsafe { (*self.condrow.add(k / 64) >> (k % 64)) & 1 != 0 }
     }
 
     /// Horizontal sum of an `__m256` (8 × f32). Same tree as imputation_hmm.
@@ -1314,7 +1330,7 @@ impl PhasingHmm {
     ) -> core::arch::x86_64::__m512 { unsafe {
         use core::arch::x86_64::*;
         // low half (k) uses bit 0..8 of mask, high half (k+1) uses bit 8..16.
-        let bits = (*self.condbits.as_ptr().add(k / 64) >> (k % 64)) & 0b11;
+        let bits = (*self.condrow.add(k / 64) >> (k % 64)) & 0b11;
         let m: u16 = match bits {
             0b00 => 0x0000,
             0b01 => 0x00FF, // k alt
@@ -1482,7 +1498,7 @@ impl PhasingHmm {
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512f")]
     unsafe fn hom_mask_pair(&self, k: usize, ag: bool) -> u16 { unsafe {
-        let bits = (*self.condbits.as_ptr().add(k / 64) >> (k % 64)) & 0b11;
+        let bits = (*self.condrow.add(k / 64) >> (k % 64)) & 0b11;
         let a0 = (bits & 1) != 0;
         let a1 = (bits & 2) != 0;
         let mut m: u16 = 0;
@@ -1980,6 +1996,7 @@ impl PhasingHmm {
             // No polymorphic het/hom sites in scope: still shuffle hets at monos.
             self.shuffle_monomorphic_hets(h0, h1, mono_sites, rng_u01);
             self.base_pack = std::ptr::null();
+            self.condrow = std::ptr::null();
             return;
         }
         #[cfg(target_arch = "x86_64")]
@@ -2057,6 +2074,7 @@ impl PhasingHmm {
         // Shuffle het at monomorphic sites.
         self.shuffle_monomorphic_hets(h0, h1, mono_sites, rng_u01);
         self.base_pack = std::ptr::null();
+        self.condrow = std::ptr::null();
     }
 
     /// Het-at-monomorphic shuffle: for each mono site where
@@ -2119,6 +2137,41 @@ fn rng_sample(probs: &[f32; HAP_NUMBER], sum: f32, rng_u01: &mut impl FnMut() ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_pack_rephase_matches_row_assembly() {
+        use crate::lcwgs::hmm::{reference_pack as rp, BasePack};
+        let mut rng = rp::Xs(0xBF58_476D_1CE4_E5B9);
+        let (n, nh) = (137, 700);
+        let bm = rp::random_panel(&mut rng, n, nh, 50);
+        let cm: Vec<f64> = (0..n).map(|v| v as f64 * 0.017).collect();
+        let params = LsParams::default();
+        for k in [1, 7, 8, 63, 64, 65, 129, 699] {
+            let cond: Vec<u32> = (0..k).map(|i| ((i * 137) % nh) as u32).collect();
+            for compact in [false, true] {
+                let poly: Vec<i32> = (0..n).filter(|_| !compact || rng.below(4) != 0).map(|v| v as i32).collect();
+                let mono: Vec<i32> = (0..n as i32).filter(|v| !poly.contains(v)).collect();
+                let sites: Vec<usize> = poly.iter().map(|&v| v as usize).collect();
+                let mut base = BasePack::new();
+                base.build(&bm, &cond, &sites, n);
+                let h0: Vec<bool> = (0..n).map(|_| rng.below(2) == 0).collect();
+                let h1: Vec<bool> = (0..n).map(|_| rng.below(2) == 0).collect();
+                let flat: Vec<bool> = (0..n).map(|_| rng.below(3) == 0).collect();
+                let lq: Vec<bool> = (0..n).map(|_| rng.below(7) == 0).collect();
+                let run = |pack| {
+                    let mut hmm = PhasingHmm::new(&params);
+                    let (mut a, mut b) = (h0.clone(), h1.clone());
+                    let mut draws = rp::Xs(2347);
+                    let mut count = 0;
+                    hmm.rephase(&mut a, &mut b, &flat, &cond, &bm, &cm, &params,
+                        &poly, &mono, &lq, &mut || { count += 1; draws.below(1 << 24) as f32 / (1 << 24) as f32 }, pack);
+                    let bits = |xs: &[f32]| xs.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                    (a, b, count, bits(&hmm.phasing_prob), bits(&hmm.impute_prob), bits(&hmm.impute_prob_of_1s))
+                };
+                assert_eq!(run(None), run(Some(&base)), "k={k} compact={compact}");
+            }
+        }
+    }
 
     /// EMIT0/EMIT1 must match the literal emission table.
     #[test]
@@ -2312,7 +2365,8 @@ mod tests {
                         old.curr_abs_locus = abs as i32;
                         new.pack_condbits(&bm, &c);
                         old.pack_condbits_reference(&bm, &c);
-                        assert_eq!(new.condbits[..w64], old.condbits[..w64],
+                        let row = unsafe { std::slice::from_raw_parts(new.condrow, w64) };
+                        assert_eq!(row, &old.condbits[..w64],
                             "n_haps={n_haps} k={k} b={b:?} abs={abs}");
                     }
                 }

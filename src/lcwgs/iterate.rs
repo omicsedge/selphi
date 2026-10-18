@@ -867,21 +867,20 @@ pub fn run_gibbs(
                     }
                     base.build(ref_bm, &c0[..b], &un, n_var);
                 }
-                let base_opt: Option<&BasePack> = if share && b > 0 { Some(&*base) } else { None };
                 // Pack one hap's full conditioning set over its FB axis (prefix
                 // copied from `base`, tail gathered). Returns false when nothing
                 // is to be packed (no sharing, or an empty poly axis).
-                let pack_for = |c: &[u32], sp: Option<&PolySplit>, hp: &mut Vec<u64>| -> bool {
+                let pack_for = |c: &[u32], sp: Option<&PolySplit>, base: &BasePack, hp: &mut Vec<u64>| -> bool {
                     if !share { return false; }
                     let (ps, n) = match sp {
                         Some(x) => (Some(x.poly.as_slice()), x.poly.len()),
                         None => (None, n_var),
                     };
                     if n == 0 { return false; }
-                    pack_cond_rows(ref_bm, c, ps, n, base_opt, hp);
+                    pack_cond_rows(ref_bm, c, ps, n, if b > 0 { Some(base) } else { None }, hp);
                     true
                 };
-                let packed0 = pack_for(c0, split0.as_ref(), &mut hp);
+                let packed0 = pack_for(c0, split0.as_ref(), &base, &mut hp);
                 let (d0, mut samp0) = run_one_hap(
                     h0i, s, it, seed,
                     |v| prev_alleles[v * n_target_haps + h1i] as usize,
@@ -890,7 +889,16 @@ pub fn run_gibbs(
                     split0.as_ref().map(|x| (x, ic_all, ps_mono_alt.as_slice())),
                     full_axis_rmult.as_deref(),
                     if packed0 { Some(hp.as_slice()) } else { None });
-                let packed1 = pack_for(c1, split1.as_ref(), &mut hp);
+                // Keep FB0's complete pack in place of the prefix pack, never
+                // beside it. Its allocation must fit the old retained allocation
+                // so the phaser's large snapshots do not gain another live pack.
+                // Rich conditioning keeps the original prefix/row-assembly path.
+                let phase_pack = fuse_phase && !rich_cond && packed0 && b > 0
+                    && hp.capacity() <= base.words.capacity();
+                if phase_pack {
+                    base.adopt_hap_pack(&mut hp, c0.len(), split0.as_ref().map(|sp| sp.poly.as_slice()));
+                }
+                let packed1 = pack_for(c1, split1.as_ref(), &base, &mut hp);
                 let (d1, mut samp1) = run_one_hap(
                     h1i, s, it, seed,
                     |v| if gs { samp0[v] as usize } else { prev_alleles[v * n_target_haps + h0i] as usize },
@@ -901,11 +909,10 @@ pub fn run_gibbs(
                     if packed1 { Some(hp.as_slice()) } else { None });
 
                 if fuse_phase {
-                    // h1's full pack is dead from here (the phaser reads only the
-                    // base pack), and the phaser's segment/flat-het scratch is the
-                    // chunk's memory peak: hand the pack back before it rather than
-                    // keep it beside that scratch. Re-allocated next iteration.
+                    // FB1's pack is dead. Only the retained base storage (now
+                    // FB0's complete rows when they fit) lives beside snapshots.
                     *hp = Vec::new();
+                    if phase_pack { base.b = c0.len(); }
                     let tp = if timing { Some(std::time::Instant::now()) } else { None };
                     let mut h0: Vec<bool> = samp0.iter().map(|&a| a == 1).collect();
                     let mut h1: Vec<bool> = samp1.iter().map(|&a| a == 1).collect();
@@ -957,7 +964,11 @@ pub fn run_gibbs(
                     };
                     // The phaser's conditioning set starts with c0 in both modes, so the
                     // sample's prefix pack applies to it as well.
-                    let phase_base = base_opt.filter(|bp| cond_haps.len() >= bp.b && cond_haps[..bp.b] == c0[..bp.b]);
+                    let phase_base = if share && b > 0 { Some(&*base) } else { None };
+                    // A rich union removes duplicates; retain the original
+                    // prefix validation before borrowing its conditioning rows.
+                    let phase_base = phase_base.filter(|bp| cond_haps.len() >= bp.b
+                        && cond_haps[..bp.b] == c0[..bp.b]);
                     let mut hmm = crate::lcwgs::phasing_hmm::PhasingHmm::new(&g2p);
                     hmm.rephase(&mut h0, &mut h1, flat, cond_haps, ref_bm, cm, &g2p,
                                 poly_ref, mono_ref, &lq, &mut rng_u01, phase_base);

@@ -109,7 +109,7 @@ pub struct BasePack {
     pub words: Vec<u64>,
     /// Number of shared-prefix states packed.
     pub b: usize,
-    /// Words per row, `ceil(b / 64)`.
+    /// Words per row (may include states beyond the shared prefix `b`).
     pub wb: usize,
     /// Absolute site → row (`u32::MAX` = site not packed).
     pub row_of_abs: Vec<u32>,
@@ -122,6 +122,20 @@ impl Default for BasePack {
 impl BasePack {
     pub const fn new() -> Self {
         BasePack { words: Vec::new(), b: 0, wb: 0, row_of_abs: Vec::new(), plan: Vec::new() }
+    }
+    /// Replace the prefix storage with FB0's complete pack, recycling the old
+    /// storage for FB1. Its first `b` states remain a valid shared prefix, even
+    /// when the complete row has a different stride. Missing FB1 sites gather
+    /// directly. The caller checks the retained pack fits the old memory budget.
+    pub fn adopt_hap_pack(&mut self, words: &mut Vec<u64>, k: usize, sites: Option<&[usize]>) {
+        std::mem::swap(&mut self.words, words);
+        self.wb = k.div_ceil(64);
+        self.row_of_abs.fill(u32::MAX);
+        if let Some(sites) = sites {
+            for (r, &a) in sites.iter().enumerate() { self.row_of_abs[a] = r as u32; }
+        } else {
+            for (a, r) in self.row_of_abs.iter_mut().enumerate() { *r = a as u32; }
+        }
     }
     /// Pack the alleles of `base` (the shared conditioning prefix) at the
     /// absolute sites `sites_abs` (ascending). `n_sites_total` sizes the
@@ -348,7 +362,8 @@ pub fn pack_cond_rows(
                     let src = &bp.words[r as usize * bp.wb..(r as usize + 1) * bp.wb];
                     let nfull = bp.b / 64;
                     let pos = (bp.b % 64) as u32;
-                    let acc = if pos > 0 { src[nfull] } else { 0 };
+                    // A complete FB0 row may contain non-prefix bits here.
+                    let acc = if pos > 0 { src[nfull] & ((1u64 << pos) - 1) } else { 0 };
                     // SAFETY: nfull ≤ w64 words copied into row v; ids < n_haps.
                     unsafe {
                         std::ptr::copy_nonoverlapping(src.as_ptr(), dst, nfull);
@@ -2253,6 +2268,41 @@ mod tests {
                 let mut shared = Vec::new();
                 pack_cond_rows(&bm, c, ps, n, Some(&base), &mut shared);
                 assert_eq!(direct, shared, "prefix b={} axis={} k={}", b, ps.map_or("full", |_| "poly"), c.len());
+            }
+        }
+    }
+
+    #[test]
+    fn adopted_fb0_pack_preserves_fb1_prefix_and_axes() {
+        use reference_pack as rp;
+        let mut rng = rp::Xs(0x7F4A_7C15_3C6E_F372);
+        let (n, nh) = (113, 700);
+        let bm = rp::random_panel(&mut rng, n, nh, 50);
+        let p0: Vec<usize> = (0..n).filter(|_| rng.below(3) != 0).collect();
+        let p1: Vec<usize> = (0..n).filter(|_| rng.below(3) != 0).collect();
+        for b in [1, 7, 63, 64, 65, 127, 128, 200] {
+            let c0: Vec<u32> = (0..260).collect();
+            let mut c1 = c0[..b].to_vec();
+            c1.extend(300..431);
+            for axis in [None, Some(p0.as_slice())] {
+                let mut base = BasePack::new();
+                base.build(&bm, &c0[..b], &(0..n).collect::<Vec<_>>(), n);
+                let old_ptr = base.words.as_ptr();
+                let mut hp = Vec::new();
+                pack_cond_rows(&bm, &c0, axis, axis.map_or(n, |p| p.len()), Some(&base), &mut hp);
+                let complete = hp.clone();
+                let complete_ptr = hp.as_ptr();
+                base.adopt_hap_pack(&mut hp, c0.len(), axis);
+                assert_eq!(base.words.as_ptr(), complete_ptr);
+                assert_eq!(hp.as_ptr(), old_ptr);
+                for fb1_axis in [None, Some(p1.as_slice())] {
+                    let m = fb1_axis.map_or(n, |p| p.len());
+                    let mut expected = Vec::new();
+                    rp::pack_cond_rows(&bm, &c1, fb1_axis, m, None, &mut expected);
+                    pack_cond_rows(&bm, &c1, fb1_axis, m, Some(&base), &mut hp);
+                    assert_eq!(hp, expected, "prefix {b}, axis {axis:?}");
+                }
+                assert_eq!(base.words, complete, "FB1 must not overwrite FB0");
             }
         }
     }
