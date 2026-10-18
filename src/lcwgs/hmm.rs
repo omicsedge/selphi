@@ -2156,7 +2156,6 @@ pub(crate) mod reference_pack {
 mod tests {
     use super::*;
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn worker_cache_allowance_bounds_retained_capacity() {
         TL_ALPHA.with(|c| c.borrow_mut().resize(CACHE_BUFFER_BYTES / 4 + 1, 0.0));
@@ -2167,6 +2166,7 @@ mod tests {
         assert_eq!(CACHE_BYTES_PER_WORKER, 8 * CACHE_BUFFER_BYTES);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn rolling_swap_matches_copy_for_each_simd_backend() {
         use reference_pack as rp;

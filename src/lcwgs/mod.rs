@@ -62,6 +62,7 @@ pub mod errmod;
 pub mod indel_realign;
 pub mod iterate;
 mod membership;
+mod memory;
 pub mod dmm;
 pub mod pipeline;
 pub mod output;

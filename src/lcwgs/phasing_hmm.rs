@@ -1654,13 +1654,35 @@ impl PhasingHmm {
     //                          REALLOCATE
     // ===================================================================
 
+    /// Count the snapshot payload without allocating K-wide storage. Three
+    /// peaked heterozygotes fit in each segment; the next opens a new segment.
+    pub(crate) fn snapshot_bytes(
+        h0: &[bool], h1: &[bool], flat: &[bool], poly_sites: &[i32], lq: &[bool], k: usize,
+    ) -> usize {
+        let (mut peak_hets, mut flat_hets, mut sites) = (0usize, 0usize, 0usize);
+        for &v in poly_sites {
+            let v = v as usize;
+            if !flat[v] && !lq[v] {
+                sites += 1;
+                peak_hets += usize::from(h0[v] != h1[v]);
+            } else if h0[v] != h1[v] {
+                sites += 1;
+                flat_hets += 1;
+            }
+        }
+        if sites == 0 { return 0; }
+        let segments = 1 + peak_hets.saturating_sub(1) / 3;
+        (segments + flat_hets).checked_mul(k).and_then(|n| n.checked_mul(HAP_NUMBER * 4))
+            .expect("phaser snapshot size overflow")
+    }
+
     /// reallocate. Builds VAR_TYP/ALT/ABS/REL from the current H0/H1 + flat over
     /// the polymorphic sites, computes the 4-het segmentation, and sizes all
     /// scratch arrays.
     ///
     /// `poly_sites[l]` = absolute site index of the l-th polymorphic site.
     /// `lq[abs]` = the per-site low-quality flag (true => not HQ => emission-skipped).
-    fn reallocate(
+    fn classify(
         &mut self,
         h0: &[bool],
         h1: &[bool],
@@ -1726,6 +1748,9 @@ impl PhasingHmm {
         self.dip_sampled.clear();
         self.dip_sampled.resize(self.n_segs, -1);
 
+    }
+
+    fn allocate_snapshots(&mut self) {
         // ---- REALLOCATE MEMORY ----
         let k = self.n_states;
         self.prob.resize(k * HAP_NUMBER, 0.0);
@@ -2007,8 +2032,9 @@ impl PhasingHmm {
         self.simd = resolve_simd_mode();
 
         // reallocate + backward.
-        self.reallocate(h0, h1, flat, poly_sites, lq);
+        self.classify(h0, h1, flat, poly_sites, lq);
         if self.var_typ.is_empty() {
+            self.impute_prob_of_1s.clear();
             // No polymorphic het/hom sites in scope: still shuffle hets at monos.
             self.release_snapshots();
             self.shuffle_monomorphic_hets(h0, h1, mono_sites, rng_u01);
@@ -2016,6 +2042,7 @@ impl PhasingHmm {
             self.condrow = std::ptr::null();
             return;
         }
+        self.allocate_snapshots();
         #[cfg(target_arch = "x86_64")]
         if self.simd != SimdMode::Scalar {
             self.build_condbit_plans(cond_haps);
@@ -2157,6 +2184,30 @@ fn rng_sample(probs: &[f32; HAP_NUMBER], sum: f32, rng_u01: &mut impl FnMut() ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counted_snapshots_match_classified_allocation() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        let mut rng = rp::Xs(0x6831_5567_0974_1771);
+        for n in [0, 1, 3, 4, 7, 97, 183] {
+            for k in [1, 65, 137] {
+                let h0: Vec<_> = (0..n).map(|_| rng.below(2) == 0).collect();
+                let h1: Vec<_> = (0..n).map(|_| rng.below(2) == 0).collect();
+                let flat: Vec<_> = (0..n).map(|_| rng.below(3) == 0).collect();
+                let lq: Vec<_> = (0..n).map(|_| rng.below(5) == 0).collect();
+                let poly: Vec<_> = (0..n as i32).collect();
+                let bytes = PhasingHmm::snapshot_bytes(&h0, &h1, &flat, &poly, &lq, k);
+                let mut hmm = PhasingHmm::new(&LsParams::default());
+                hmm.n_states = k;
+                hmm.classify(&h0, &h1, &flat, &poly, &lq);
+                assert_eq!(hmm.phasing_prob.capacity() + hmm.impute_prob.capacity(), 0);
+                if !hmm.var_typ.is_empty() {
+                    hmm.allocate_snapshots();
+                    assert_eq!(bytes, (hmm.phasing_prob.capacity() + hmm.impute_prob.capacity()) * 4);
+                } else { assert_eq!(bytes, 0); }
+            }
+        }
+    }
 
     #[test]
     fn reused_small_scratch_matches_fresh_phaser() {
