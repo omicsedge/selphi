@@ -34,3 +34,11 @@ HG004*
 /examples/manifest.tsv
 /examples/presign_panel.sh
 /examples/panel_urls.txt
+
+# Manuscript: kept local only until submission (private history: /data/projects/selphi_paper_private.git)
+/paper/*.md
+/paper/*.docx
+/paper/*.py
+/paper/*.sh
+/paper/figure1_pipeline.*
+/paper/figures/
