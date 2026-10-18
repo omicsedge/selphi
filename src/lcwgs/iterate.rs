@@ -240,10 +240,10 @@ fn run_one_hap<F: Fn(usize) -> usize>(
         // Polymorphic = every common site + every rare site carried by ≥1 of this
         // hap's conditioning haps; the rest are monomorphic-in-cond (every cond hap
         // agrees → uniform emission across all K states → the copying posterior is
-        // independent of the FB weights). Run the FB over the compacted poly axis
-        // (transitions span the skipped sites' cM gaps — exact, since T(d1+d2)=
-        // T(d2)∘T(d1) for r=1-exp(scale·Δcm)), then scatter poly doses back and
-        // direct-impute the mono sites in closed form.
+        // independent of the FB weights). Run the FB over the compacted poly axis;
+        // each transition spans the skipped sites' cM gap, with the multiplier
+        // and probability clamp applied once at its destination. Then scatter
+        // poly doses back and direct-impute the mono sites in closed form.
         let poly_sites: &[usize] = &split.poly;
         let mut hl_poly: Vec<f32> = Vec::with_capacity(poly_sites.len() * 2);
         let mut cm_poly: Vec<f64> = Vec::with_capacity(poly_sites.len());

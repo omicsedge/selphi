@@ -579,10 +579,21 @@ fn precompute_emit(hl: &[f32], n_var: usize, ee: f32, ed: f32, out: &mut Vec<f32
     }
 }
 
+/// GLIMPSE2's per-boundary switch floor. Keep copying states reachable across
+/// flat map intervals so alpha and beta cannot lose overlap and return 0.5.
+const MIN_SWITCH: f64 = 1e-7;
+
+/// Switch probability `1 - exp(-rate)` for a non-negative rate, clamped to
+/// `[MIN_SWITCH, 1 - MIN_SWITCH]`.
+#[inline]
+fn switch_prob(rate: f64) -> f32 {
+    (-(-rate).exp_m1()).clamp(MIN_SWITCH, 1.0 - MIN_SWITCH) as f32
+}
+
 /// Precompute the per-boundary recombination probability `p_rec[v]` (transition
 /// from site `v-1` to `v`) into `out`; `out[0]` is left 0 (unused). `scale` is
 /// [`recomb_scale`]; `recomb_mult` an optional per-site rate multiplier folded
-/// inside the exp. Shared verbatim by the scalar and AVX-512 paths.
+/// inside the exp. Shared verbatim by the scalar and SIMD paths.
 #[inline]
 fn precompute_prec(cm: &[f64], n_var: usize, scale: f64, recomb_mult: Option<&[f32]>, out: &mut Vec<f32>) {
     out.clear();
@@ -590,7 +601,7 @@ fn precompute_prec(cm: &[f64], n_var: usize, scale: f64, recomb_mult: Option<&[f
     for v in 1..n_var {
         let d = (cm[v] - cm[v - 1]).max(0.0);
         let m = recomb_mult.map_or(1.0, |rm| rm[v] as f64);
-        out[v] = (1.0 - (-d * scale * m).exp()) as f32;
+        out[v] = switch_prob(d * scale * m);
     }
 }
 
@@ -656,8 +667,8 @@ pub fn run_forward_backward(
     // sites (uniform emission across all K states → posterior independent of the
     // copying weights) are direct-imputed in closed form by the CALLER and scattered
     // back alongside the returned poly-site dosages. `None` ⇒ byte-identical to the
-    // full-axis path. (`ps.len()` must equal `cm.len()`.) See the U²=U transition
-    // identity: dropping a uniform-emission site and spanning its cM gap is exact.
+    // full-axis path. (`ps.len()` must equal `cm.len()`.) The U²=U transition
+    // identity composes the spanned cM gap before the per-boundary clamp.
     poly_sites: Option<&[usize]>,
     // Pre-packed conditioning bitmatrix for THIS haplotype (`n_var × ceil(K/64)`
     // words, see [`pack_cond_rows`]), built by the caller so the two haplotypes
@@ -1790,7 +1801,7 @@ pub fn run_forward_backward_scaffold(
     let mut p_rec = vec![0.0f32; n_s];
     for j in 1..n_s {
         let d = (cm[common_idx[j]] - cm[common_idx[j - 1]]).max(0.0);
-        p_rec[j] = (1.0 - (-d * scale).exp()) as f32;
+        p_rec[j] = switch_prob(d * scale);
     }
 
     // Forward over scaffold; alpha[j*k + state].
@@ -1843,26 +1854,26 @@ pub fn run_forward_backward_scaffold(
         }
         if gsum > 0.0 { let inv = 1.0 / gsum; for st in 0..k { gamma[off + st] *= inv; } }
     }
-    let mut beta_sum = 1.0f32; // beta initialized uniform sums to 1
     for j in (0..n_s - 1).rev() {
         let pr = p_rec[j + 1];
-        let fact1 = pr * inv_k;
-        let fact2 = (1.0 - pr) / beta_sum.max(f32::MIN_POSITIVE);
         let e0 = emit_s[2 * (j + 1)];
         let e1 = emit_s[2 * (j + 1) + 1];
         let next_site = common_idx[j + 1];
-        let mut new_sum = 0.0f32;
+        // Emit at j+1 before transitioning back to j. Gamma at j must use
+        // the backward message after that transition, excluding emission j.
+        let mut beta_sum = 0.0f32;
         for (st, &h) in cond_haps.iter().enumerate() {
             let a = ref_bm.get(next_site, h as usize);
             let e = if a { e1 } else { e0 };
-            let b = (beta[st] * fact2 + fact1) * e;
-            beta[st] = b;
-            new_sum += b;
+            beta[st] *= e;
+            beta_sum += beta[st];
         }
-        beta_sum = new_sum;
+        let fact1 = pr * inv_k;
+        let fact2 = (1.0 - pr) / beta_sum.max(f32::MIN_POSITIVE);
         let off = j * k;
         let mut gsum = 0.0f32;
         for st in 0..k {
+            beta[st] = beta[st] * fact2 + fact1;
             let g = alpha[off + st] * beta[st];
             gamma[off + st] = g;
             gsum += g;
@@ -2294,6 +2305,93 @@ mod tests {
         let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None, None);
         assert!(out.dosage[0] > 0.95,
             "strong ALT HL should give dose ≈ 1, got {}", out.dosage[0]);
+    }
+
+    /// A flat map must still allow a change of copying haplotype. Without a
+    /// transition floor, alpha and beta lose all overlap and return 0.5.
+    /// Run in separate processes with and without SELPHI_FORCE_SCALAR=1;
+    /// dispatch is cached. K=18 also exercises SIMD lanes and scalar tails.
+    #[test]
+    fn flat_map_copy_switch_follows_likelihoods() {
+        let n_var = 400;
+        for k in [18, 2] {
+            let bm = HaplotypeBitmatrix::from_panel(
+                n_var, k, &|_v, h| h % 2 == 1, &vec![true; n_var]);
+            let cond: Vec<u32> = (0..k as u32).collect();
+            let hl: Vec<f32> = (0..n_var).flat_map(|v| {
+                if v < n_var / 2 { [0.999, 0.001] } else { [0.001, 0.999] }
+            }).collect();
+            let cm = vec![106.119872; n_var];
+            let params = LcwgsParams { epsilon: 1e-12, ..LcwgsParams::default() };
+            let out = run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None, None);
+            assert_copy_switch(&out.dosage, n_var / 2);
+        }
+    }
+
+    fn assert_copy_switch(dosage: &[f32], split: usize) {
+        let fallbacks = dosage.iter().filter(|&&d| d == 0.5).count();
+        assert_eq!(fallbacks, 0, "{fallbacks}/{} sites returned the fallback", dosage.len());
+        for (v, &d) in dosage.iter().enumerate() {
+            assert!((0.0..=1.0).contains(&d), "site {v}: dose={d}");
+            assert!(if v < split { d < 0.01 } else { d > 0.99 },
+                "site {v}: dose={d} disagrees with the likelihood");
+        }
+    }
+
+    /// Compacted transitions span skipped mono sites, including on decreasing
+    /// maps. Apply the band multiplier before clamping the probability.
+    #[test]
+    fn flat_map_compacted_copy_switch_follows_likelihoods() {
+        let n_var = 400;
+        let k = 18;
+        let bm = HaplotypeBitmatrix::from_panel(
+            n_var, k, &|v, h| v % 2 == 0 && h % 2 == 1, &vec![true; n_var]);
+        let cond: Vec<u32> = (0..k as u32).collect();
+        let poly: Vec<usize> = (0..n_var).step_by(2).collect();
+        let hl: Vec<f32> = poly.iter().flat_map(|&v| {
+            if v < n_var / 2 { [0.999, 0.001] } else { [0.001, 0.999] }
+        }).collect();
+        let mult: Vec<f32> = poly.iter().map(|&v| if v % 4 == 0 { 1.0 } else { 25.0 }).collect();
+        let params = LcwgsParams { epsilon: 1e-12, ..LcwgsParams::default() };
+        for step in [0.0, -0.001] {
+            let cm: Vec<f64> = poly.iter().map(|&v| 106.119872 + step * v as f64).collect();
+            let out = run_forward_backward(
+                &hl, &cond, &bm, &cm, &params, Some(&mult), Some(&poly), None);
+            assert_copy_switch(&out.dosage, poly.len() / 2);
+        }
+    }
+
+    #[test]
+    fn flat_map_scaffold_copy_switch_follows_likelihoods() {
+        let n_var = 400;
+        let bm = HaplotypeBitmatrix::from_panel(
+            n_var, 2, &|_v, h| h == 1, &vec![true; n_var]);
+        let hl: Vec<f32> = (0..n_var).flat_map(|v| {
+            if v < n_var / 2 { [0.999, 0.001] } else { [0.001, 0.999] }
+        }).collect();
+        let common: Vec<usize> = (0..n_var).collect();
+        let params = LcwgsParams { epsilon: 1e-12, ..LcwgsParams::default() };
+        for step in [0.0, -0.001] {
+            let cm: Vec<f64> = (0..n_var).map(|v| 106.119872 + step * v as f64).collect();
+            let out = run_forward_backward_scaffold(&hl, &common, &[0, 1], &bm, &cm, &params);
+            assert_copy_switch(&out.dosage, n_var / 2);
+            let full = run_forward_backward(&hl, &[0, 1], &bm, &cm, &params, None, None, None);
+            for (a, b) in out.dosage.iter().zip(&full.dosage) {
+                assert!((a - b).abs() < 1e-6, "scaffold={a}, full={b}");
+            }
+        }
+    }
+
+    #[test]
+    fn switch_probability_bounds() {
+        let mut p = Vec::new();
+        let cm = [1.0, 1.0, 0.0, 1e-20, 1.0, 2.0];
+        let mult = [1.0, 25.0, 1.0, 1.0, 0.0, 1e30];
+        precompute_prec(&cm, cm.len(), 0.04, Some(&mult), &mut p);
+        assert_eq!(p[0], 0.0); // unused initial boundary
+        for &pr in &p[1..5] { assert_eq!(pr, MIN_SWITCH as f32); }
+        assert_eq!(p[5], (1.0 - MIN_SWITCH) as f32);
+        assert!(p[1..].iter().all(|&pr| pr > 0.0 && pr < 1.0 && 1.0 - pr > 0.0));
     }
 
     /// Band-mode recombination math: the band multiplier `r = max(n_ref,Ne)/n_ref`
