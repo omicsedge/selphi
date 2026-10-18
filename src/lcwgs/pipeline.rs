@@ -546,6 +546,63 @@ fn resolve_split(mean_conf: f32, params: &LcwgsParams) -> Option<(f64, f64, usiz
     }
 }
 
+/// A chunk's resident inputs/outputs and one active sample task's scratch.
+/// Keep these separate: each task runs FB0, FB1 and phasing sequentially, and
+/// at most `threads` such tasks execute across all live chunks.
+#[derive(Clone, Copy)]
+struct ChunkMemory { fixed: f64, task: f64 }
+
+fn estimate_chunk_memory(n_sites: usize, n_ref: usize, n_samples: usize, k: usize) -> ChunkMemory {
+    let sites = n_sites as f64;
+    // Existing panel/PBWT factor, plus GLs, cached HLs, accumulators, sampled
+    // haplotypes and completed sample results (including allocator headroom).
+    let fixed = sites * (n_ref.div_ceil(64) as f64 * 8.0 * 1.9 + n_samples as f64 * 96.0);
+    // The previous scheduler's calibrated 5 KB/site/sample term at K=3000,
+    // scaled for other conditioning depths. This includes the active phaser
+    // snapshots; small scratch/metadata still has a floor at low K.
+    let task = sites * (5000.0 * k as f64 / 3000.0).max(256.0);
+    ChunkMemory { fixed, task }
+}
+
+fn wave_memory(chunks: &[ChunkMemory], n_samples: usize, threads: usize) -> f64 {
+    let fixed: f64 = chunks.iter().map(|m| m.fixed).sum();
+    let largest_task = chunks.iter().map(|m| m.task).fold(0.0, f64::max);
+    let active = chunks.len().saturating_mul(n_samples).min(threads.max(1));
+    fixed + largest_task * active as f64
+}
+
+fn wave_len(chunks: &[ChunkMemory], n_samples: usize, threads: usize, budget: f64) -> usize {
+    if chunks.is_empty() { return 0; }
+    if budget.is_nan() || budget <= 0.0 { return 1; }
+    let limit = chunks.len().min(threads.max(1));
+    let mut live = 1; // a single oversized chunk must still be able to progress
+    for n in 2..=limit {
+        if wave_memory(&chunks[..n], n_samples, threads) > budget { break; }
+        live = n;
+    }
+    live
+}
+
+fn run_chunk_waves<T: Send>(
+    chunks: &[ChunkMemory], n_samples: usize, threads: usize, budget: f64,
+    process: impl Fn(usize) -> T + Sync, mut merge: impl FnMut(T),
+) {
+    use rayon::prelude::*;
+    let mut start = 0;
+    while start < chunks.len() {
+        let live = wave_len(&chunks[start..], n_samples, threads, budget);
+        let end = start + live;
+        crate::selphi_info!(
+            "  chunk parallelism: {} live, up to {} sample tasks (budget {:.1} GB, estimated {:.2} GB)",
+            live, live.saturating_mul(n_samples).min(threads), budget / 1e9,
+            wave_memory(&chunks[start..end], n_samples, threads) / 1e9);
+        let wave: Vec<_> = (start..end).into_par_iter().map(&process).collect();
+        for result in wave { merge(result); }
+        crate::common::mem::release_freed_memory();
+        start = end;
+    }
+}
+
 /// Chunk the chromosome by cM and run the Gibbs per chunk with its own
 /// conditioning set. Each chunk has a core region (whose dosage is kept) and
 /// a buffer region on each side (computed but discarded — absorbs edge
@@ -750,37 +807,26 @@ fn run_chunked_gibbs(
         Some((core_start, core_end, buf_start, out))
     };
 
-    // Chunk scheduling. Chunks are fully independent and deterministic, so any
-    // schedule is BIT-IDENTICAL to sequential; what differs is wall time and
-    // peak memory.
-    //
-    // Few samples (2·n_samples < threads): the per-sample parallelism inside
-    // run_gibbs cannot fill the cores, so chunks run in waves sized by the memory
-    // budget over the panel-only per-chunk estimate. The budget is the same as
-    // below (half the machine's RAM): a fixed 2.5 GB held a one-sample run on a
-    // 75,552-haplotype panel (5.7 GB per chunk) to one chunk at a time, i.e. one
-    // core of eight for 18 minutes on 15 Mb of chrX.
-    //
-    // Many samples: chunks used to run strictly one after another, on the
-    // assumption that per-sample parallelism alone fills the machine. It does
-    // not: every iteration has serial sections (selection, write-back) and the
-    // per-sample loops leave cores idle at their tails, so a 12-sample chr22 run
-    // took 44 s/sample against 34 s/sample at 6 samples (16 threads). Per-chunk
-    // memory in this regime is dominated by per-sample state and is not well
-    // predicted by the panel-only estimate, so it is MEASURED: chunk 0 runs
-    // alone while the process high-water mark is watched, and the remaining
-    // chunks run in waves sized to a budget (default half the machine's RAM;
-    // `LCWGS_MEM_BUDGET_GB` overrides). A machine too small for two chunks
-    // keeps today's sequential behaviour exactly.
+    // Independent chunks start in memory-budgeted waves immediately, including
+    // the first wave. Use actual buffered site counts (not an unbuffered
+    // average) and the same estimate for every sample count.
     let threads = rayon::current_num_threads().max(1);
-    let few_samples = 2 * n_samples < threads;
     let budget_gb = crate::config::f64_opt("LCWGS_MEM_BUDGET_GB")
         .unwrap_or_else(|| (crate::log::system_ram_mb() / 1024.0 * 0.5).max(2.5));
     let n_ref = srp.metadata.n_haps;
-    let avg_chunk_n = (n_shared / n_chunks).max(1);
-    // Panel part of a chunk ≈ ref_bm (chunk_n × ceil(n_ref/64) × 8) × ~1.9
-    // (RefHapSet + PBWT scratch + HMM + allocator overhead; calibrated to RSS).
-    let panel_chunk_gb = (avg_chunk_n * n_ref.div_ceil(64) * 8) as f64 / 1e9 * 1.9;
+    let cap = |k: usize| if k == 0 { n_ref } else { k.min(n_ref) };
+    let mut k = if crate::config::present("LCWGS_NO_RARE_CARRIER") {
+        cap(params.kpbwt).max(1000.min(n_ref))
+    } else {
+        cap(crate::config::usize_opt("LCWGS_KMAX").unwrap_or(3000))
+    };
+    if let Some((_, _, deep_k)) = split_band { k = k.max(cap(deep_k)); }
+    if crate::config::present("LCWGS_LS_RICH_COND") { k = k.saturating_mul(2).min(n_ref); }
+    let chunk_memory: Vec<_> = (0..n_chunks).map(|c| {
+        let sites = super::chunk_ranges::chunk_ranges(cm, c, n_chunks, core_cm, buffer_cm)
+            .map_or(0, |(_, buffer)| buffer.len());
+        estimate_chunk_memory(sites, n_ref, n_samples, k)
+    }).collect();
     // Merge and release completed outputs after each wave. Retaining earlier
     // waves defeats the live-chunk memory budget, especially with many samples.
     let mut merge_chunk = |result: Option<(usize, usize, usize, super::iterate::GibbsOutput)>| {
@@ -791,47 +837,8 @@ fn run_chunked_gibbs(
             gp[dst.start * 3 .. dst.end * 3].copy_from_slice(&out.gp[src.start * 3 .. src.end * 3]);
         }
     };
-    let run_waves = |first: usize, max_live: usize, merge: &mut dyn FnMut(Option<(usize, usize, usize, super::iterate::GibbsOutput)>)| {
-        use rayon::prelude::*;
-        let mut start = first;
-        while start < n_chunks {
-            let end = (start + max_live).min(n_chunks);
-            let wave: Vec<_> = (start..end).into_par_iter().map(&process_chunk).collect();
-            for result in wave { merge(result); }
-            // The wave's chunk buffers were freed by threads that may now idle;
-            // hand their pages back before the next wave (memory only).
-            crate::common::mem::release_freed_memory();
-            start = end;
-        }
-    };
-    if few_samples {
-        let max_live = ((budget_gb / panel_chunk_gb.max(1e-9)).floor() as usize)
-            .clamp(1, n_chunks.min(threads));
-        crate::selphi_info!(
-            "  chunk parallelism: {} live (budget {:.1} GB, ~{:.2} GB/chunk)",
-            max_live, budget_gb, panel_chunk_gb);
-        run_waves(0, max_live, &mut merge_chunk)
-    } else if n_chunks > 1 {
-        let hwm_before = (crate::log::peak_mem_mb() / 1024.0).max(rss_gb());
-        let first = process_chunk(0);
-        let hwm_after = crate::log::peak_mem_mb() / 1024.0;
-        let measured_gb = hwm_after - hwm_before;
-        // Fallback when the high-water mark did not move (an earlier stage
-        // peaked higher): panel part + a per-sample term calibrated on a
-        // 12-sample chr22 run (~5 KB per sample per site at peak).
-        let est_gb = panel_chunk_gb + 5.0e-6 * n_samples as f64 * avg_chunk_n as f64;
-        let per_chunk_gb = if measured_gb > 0.05 { measured_gb } else { est_gb };
-        let max_live = ((budget_gb / per_chunk_gb.max(1e-9)).floor() as usize)
-            .clamp(1, (n_chunks - 1).min(threads));
-        crate::selphi_info!(
-            "  chunk parallelism: calibrated on chunk 1 → {:.2} GB/chunk ({}); {} live for the remaining {} (budget {:.1} GB)",
-            per_chunk_gb, if measured_gb > 0.05 { "measured" } else { "estimated" }, max_live, n_chunks - 1, budget_gb);
-        merge_chunk(first);
-        crate::common::mem::release_freed_memory(); // chunk 1's pages, before the waves
-        run_waves(1, max_live, &mut merge_chunk)
-    } else {
-        merge_chunk(process_chunk(0));
-    };
+    run_chunk_waves(&chunk_memory, n_samples, threads, budget_gb * 1e9,
+        process_chunk, &mut merge_chunk);
 
     (dosage, gp)
 }
@@ -841,6 +848,65 @@ fn run_chunked_gibbs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wave_budget_counts_sample_tasks_and_buffered_sites() {
+        let chunks = vec![estimate_chunk_memory(100_000, 4796, 12, 3000); 5];
+        let one = chunks[0];
+        assert_eq!(wave_memory(&chunks[..1], 12, 16), one.fixed + 12.0 * one.task);
+        assert_eq!(wave_memory(&chunks[..2], 12, 16), 2.0 * one.fixed + 16.0 * one.task);
+        assert_eq!(wave_len(&chunks, 12, 16, 64e9), 5);
+        assert_eq!(wave_len(&chunks, 12, 16, wave_memory(&chunks[..1], 12, 16)), 1);
+        assert!(estimate_chunk_memory(120_000, 4796, 12, 3000).fixed > one.fixed);
+        assert!(estimate_chunk_memory(100_000, 4796, 12, 6000).task > one.task);
+        assert_eq!(wave_len(&[], 12, 16, 1e9), 0);
+        for ns in [1, 6, 12, 32] {
+            for threads in [1, 4, 16] {
+                for budget in [0.0, 1e8, 1e9, 8e9, 32e9] {
+                    let live = wave_len(&chunks, ns, threads, budget);
+                    assert!((1..=chunks.len().min(threads)).contains(&live));
+                    if live > 1 { assert!(wave_memory(&chunks[..live], ns, threads) <= budget); }
+                    if live < chunks.len().min(threads) {
+                        assert!(wave_memory(&chunks[..live + 1], ns, threads) > budget);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_waves_match_sequential_dosage_and_gp_bits() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        let mut rng = rp::Xs(0x1F83_D9AB_FB41_BD6B);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(16).build().unwrap();
+        for ns in [1, 6, 12] {
+            let mut params = LcwgsParams::default();
+            params.n_iterations = 4;
+            params.n_main_iterations = 2;
+            params.kpbwt = 17;
+            let inputs: Vec<_> = (0..4).map(|c| {
+                let n = 17 + c * 7;
+                let bm = rp::random_typed_panel(&mut rng, n, 40);
+                let cm: Vec<f64> = (0..n).map(|v| v as f64 * 0.05).collect();
+                let gl: Vec<f32> = (0..n * ns * 3).map(|_| (rng.below(1000) + 1) as f32 / 1000.0).collect();
+                (bm, cm, gl)
+            }).collect();
+            let memory: Vec<_> = inputs.iter().map(|(_, cm, _)| estimate_chunk_memory(cm.len(), 40, ns, 40)).collect();
+            let process = |c: usize| {
+                let (bm, cm, gl) = &inputs[c];
+                let out = super::super::iterate::run_gibbs(gl, bm, cm, ns, &params, None, None);
+                (out.dosage.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                 out.gp.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+            };
+            let serial: Vec<_> = pool.install(|| (0..inputs.len()).map(&process).collect());
+            for budget in [0.0, 1e12] {
+                let mut got = Vec::new();
+                pool.install(|| run_chunk_waves(&memory, ns, 16, budget, &process, |out| got.push(out)));
+                assert_eq!(got, serial, "samples={ns} budget={budget}");
+            }
+        }
+    }
+
     use crate::common::HaplotypeBitmatrix;
 
     #[test]
