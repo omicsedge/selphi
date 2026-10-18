@@ -107,7 +107,7 @@ pub(crate) static STAGE_HMM_US: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// | 4                  | 23.59 GB | 20:31 |
 ///
 /// which fits `14.8 GB + 1.78 GB x threads` to within 6%. Byte-identical at every
-/// value (md5 0ecc944588ec0764e8db444cb883bc4e throughout): each target's weights
+/// value: each target's weights
 /// are independent of every other's, and `collect()` restores target order
 /// whatever the pool.
 ///
@@ -544,7 +544,7 @@ fn auto_share_batch(n_var_w: usize, fl_fwd: usize, n_ref: usize, n_batch: usize,
 /// * Candidate fraction. The shared SCAN walks the full panel's neighbours (each
 ///   target filtering through its bitset), so it costs about `n_ref / mc` of the
 ///   per-target scan -- the 1.29x the split diag measured at mc/n_ref = 0.78. At 0.36
-///   (the 75,552-hap production panel, mc 27,541) the shared scan alone is roughly
+///   (the 75,552-hap reference panel, mc 27,541) the shared scan alone is roughly
 ///   the whole per-target forward, so sharing loses at every B and every cohort size.
 ///   Measured wins are at 0.78 (TOPMed, +1.16x at B=16) and 1.0 (1KG panels).
 /// * One round. `ceil(n / B)` equal groups are work-stolen over `threads` workers, so
@@ -552,7 +552,7 @@ fn auto_share_batch(n_var_w: usize, fl_fwd: usize, n_ref: usize, n_batch: usize,
 ///   `B = ceil(n / threads)` is the largest group that still fills the pool in ONE
 ///   round. The RAM-only gate picked 16 for 12 target haplotypes on 16 threads -- one
 ///   serial 75k-hap sort while 15 threads idled, PBWT 3.0 s -> 37.0 s on a
-///   consumer-array chromosome (2026-09-14). Flooring `n / threads` was wrong the other
+///   consumer-array chromosome. Flooring `n / threads` fails the other
 ///   way: 200 haps / 16 = 12 -> 17 groups -> a second round on a single thread, where
 ///   13 gives 16 groups.
 ///
@@ -1355,7 +1355,7 @@ mod share_tests {
     #[test]
     fn low_candidate_fraction_never_shares() {
         use super::pick_share_groups as pick;
-        // The 75,552-hap production panel at mc 27,541 (0.36): the shared scan walks
+        // The 75,552-hap reference panel at mc 27,541 (0.36): the shared scan walks
         // ~2.7x the haplotypes the per-target one does. Off at every cohort size.
         assert_eq!(pick(16, 16, 12, 27_541, 75_552), 1);
         assert_eq!(pick(16, 16, 1602, 27_541, 75_552), 1);

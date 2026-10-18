@@ -93,8 +93,8 @@ pub const LONG_ALLELE_MARKER: [u8; 8] = i64::MIN.to_le_bytes();
 /// and alt bytes. A length below 255 is its byte; a longer field (a structural
 /// variant's allele) writes 255 and its length as a u32 LE right after the three
 /// length bytes, and the section is then marked by [`finish_vbin`]. Long alleles
-/// used to be dropped at panel build (53,791 variants of the v3 panel, about 70
-/// non-reference calls per person that production imputes).
+/// account for 53,791 variants of the v3 panel and about 70 non-reference
+/// calls per individual; preserving them avoids losing those imputation targets.
 #[inline]
 pub fn push_variant_vbin(
     vbin: &mut Vec<u8>,
@@ -195,9 +195,9 @@ mod tests {
 /// Resolve the on-disk path of a panel file the user named with `--out`.
 ///
 /// `Path::with_extension` treats everything after the last dot as an extension,
-/// so `--out panel.chr22` used to come back as `panel.srp` — the chromosome tag
-/// silently dropped, which on a per-chromosome rebuild overwrites one file with
-/// the next (reported by the NYU-AD collaborator, 2026-09-20). A `--out` value
+/// so applying it to `--out panel.chr22` produces `panel.srp`, silently dropping
+/// the chromosome tag and making per-chromosome rebuilds overwrite one file
+/// with the next. A `--out` value
 /// is a NAME, not a stem: keep it whole and append the panel suffix unless it
 /// is already there. `ext` is `"srp"` or `"bref3"`.
 pub fn with_panel_suffix(path: &std::path::Path, ext: &str) -> std::path::PathBuf {

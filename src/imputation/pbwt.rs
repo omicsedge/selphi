@@ -170,10 +170,9 @@ impl PbwtWorkspace {
 ///
 /// The PBWT forward reads exactly one row at a time — site 0 up front, then
 /// site `var+1` after each step — so nothing in the algorithm needs the whole
-/// `n_var × m` byte matrix to exist. It did anyway, until 2026-09-05: every
-/// target built its own `reduced` array of `n_window_sites × n_candidates`
-/// BYTES, one byte per allele, and kept it in a thread-local sized to the
-/// largest target the thread had seen. `n_candidates` is the PBWT input set
+/// `n_var × m` byte matrix to exist. A per-target `reduced` array of
+/// `n_window_sites × n_candidates` BYTES, one byte per allele, would retain
+/// memory proportional to the largest target seen by each thread. `n_candidates` is the PBWT input set
 /// (up to `--max-candidates`, 132,676 on the auto setting against TOPMed), not
 /// the ~1,500 states left after match filtering, so on MESA 100 × TOPMed chr20
 /// that was 11,980 × ~132k = 1.59 GB PER THREAD — the entire thread-scaled part

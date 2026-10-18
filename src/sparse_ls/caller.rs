@@ -95,8 +95,8 @@ use rayon::prelude::*;
 // is empty, and `compactSelection`'s list-merge is a no-op. The empty `&[]` stub
 // is therefore EXACT for the whole-panel and Kpbwt-based selection paths we run.
 //
-// TODO: support `list_states` + `read_list_states` for the `--state-list`
-// external-conditioning feature (unused by --ls-exact).
+// `list_states` + `read_list_states` for the `--state-list` external-conditioning
+// feature are unsupported here and unused by --ls-exact.
 impl TargetSelectionView for TargetHaplotypeSet {
     #[inline]
     fn tar_ind2hapid(&self, ind: usize) -> i32 {
@@ -164,7 +164,7 @@ impl Worker {
         params: &LsParams,
     ) -> Self {
         // The conditioning-set constructor only classifies sites (no HvarRef read),
-        // but it takes a `RefPanelView`, so feed it the production wrapper.
+        // but it takes a `RefPanelView`, so feed it the panel wrapper.
         let rp = crate::sparse_ls::conditioning_set::RefPanelWithBm { hs: ref_hs, ref_bm };
         Worker {
             hlc: vec![0.0f32; 2 * n_tot],
@@ -425,7 +425,7 @@ fn phase_individual_one(
     let ploidy = g.ploidy;
 
     // COND[w]->select(ind, current_stage). The RefPanelView is the
-    // production wrapper bundling ref_hs + ref_bm (HvarRef served from ref_bm).
+    // panel wrapper bundling ref_hs + ref_bm (HvarRef served from ref_bm).
     let rp = crate::sparse_ls::conditioning_set::RefPanelWithBm { hs: ref_hs, ref_bm };
     w.cond.select(ind, stage, &rp, tar, vmap);
 

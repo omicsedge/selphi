@@ -1,7 +1,7 @@
 //! Faithful GLIMPSE2 compressed-sparse-PBWT conditioning for the hybrid lcWGS
 //! engine. **DEFAULT ON** (opt out with `LCWGS_NO_FAITHFUL_SELECT=1`; the legacy
 //! `LCWGS_FAITHFUL_SELECT` force-on is a no-op now that it is the default). It is
-//! the production selection at big-panel scale (UPDATE 52). FOOTGUN: this module —
+//! the selection at big-panel scale. This module —
 //! and thus the DEFAULT `--lcwgs` engine — depends on `crate::sparse_ls`
 //! (ref_haplotype_set / haplotype_set / rng), so `src/sparse_ls/` is NOT dead
 //! weight: deleting it breaks the default lcWGS path, not just `--ls-exact`.
@@ -291,7 +291,7 @@ impl FaithfulSelector {
     /// union per sample → both haps of the sample get that union (capped kpbwt).
     ///
     /// The cap ORDER is the whole question when the union exceeds `kpbwt`, which
-    /// it did in every selection call measured (2026-09-17, `LCWGS_SEL_DIAG`): with
+    /// it did in every selection call measured (`LCWGS_SEL_DIAG`): with
     /// the default 0.002-cM storage sites on 16-cM chunks the pre-cap union is
     /// 5,708-6,332 of the 6,332 1kGP haplotypes (median 6,295) and 3,956-4,796 of
     /// 4,796 on the capture-panel rig, so the index-sorted truncate reduces the

@@ -185,7 +185,7 @@ impl LowFreqPbwtPhaseIbs {
 // Per-step allele coding builder. Each "coded step" is the allele index at
 // that step for each hap; here we use a representative marker per step (the
 // step's center marker) and assume biallelic. Multi-allelic panels would
-// need richer coding — left as TODO since SNV panels dominate.
+// need richer coding; this representation supports biallelic panels.
 // ---------------------------------------------------------------------------
 
 /// Encode each step as a per-hap integer code by packing the bits of the

@@ -47,9 +47,8 @@ pub struct BamGl {
     pub sample_ids: Vec<String>,
 }
 
-/// Read-filtering thresholds. These are OURS and are deliberately stricter than
-/// either reference — the earlier claim that they match GLIMPSE2 or bcftools
-/// mpileup was wrong on every threshold. GLIMPSE2 defaults to mapq 10 and baseq 10
+/// Read-filtering thresholds, deliberately stricter than the references.
+/// GLIMPSE2 defaults to mapq 10 and baseq 10
 /// (`GLIMPSE2/phase/src/caller/caller_parameters.cpp:81-82`); bcftools mpileup's
 /// documented defaults are looser still. We use 20/20 and a 250-read depth cap.
 /// The paper's low-coverage results were all measured at these values, so treat a
@@ -99,11 +98,11 @@ pub struct PileupParams {
     /// higher-quality mate and zero on the other, disagreeing bases keep 0.8x on the
     /// higher-quality mate and zero the other -- and only THEN do the base-quality
     /// filter and caps run, so a zeroed mate is dropped and two agreeing Q15 bases
-    /// survive as one Q30. The per-site `OverlapState` merge it replaces got three
-    /// cases wrong (2026-09-17 audit): interleaved pairs at one site were counted
-    /// twice (it remembered only the LAST fragment), agreeing sub-threshold bases
-    /// were dropped before they could be summed, and a disagreement reduced to Q19
-    /// was kept against the Q20 filter. `LCWGS_OVERLAP_HTSLIB` (A/B until measured).
+    /// survive as one Q30. The per-site `OverlapState` merge differs in three
+    /// cases: interleaved pairs at one site are counted twice (it remembers only
+    /// the LAST fragment), agreeing sub-threshold bases are dropped before they
+    /// can be summed, and a disagreement reduced to Q19 is kept against the Q20
+    /// filter. `LCWGS_OVERLAP_HTSLIB` selects this alternative for A/B comparisons.
     pub overlap_htslib: bool,
 }
 impl Default for PileupParams {
@@ -1346,7 +1345,7 @@ fn finalize_gl_errmod(
     // less than 10^-25.5 while this path, uncapped, can put it at 10^-90 on a deep
     // on-target column. `LCWGS_NATIVE_PL_QUANT` reproduces the PL representation
     // here, to measure whether that difference is the residual native-vs-bcftools
-    // gap (2026-09-17 A/B).
+    // gap (A/B).
     let quant = crate::config::is_one("LCWGS_NATIVE_PL_QUANT");
     for v in 0..n_var {
         if !is_snp[v] || bases[v].is_empty() { continue; }
@@ -1432,8 +1431,8 @@ mod tests {
 
 #[cfg(test)]
 mod overlap_oracle_tests {
-    //! The twelve cases of Codex's independent htslib/pysam oracle
-    //! (`/data/tmp/codex_pileup_audit_20260917/overlap_oracle.{py,json}`, pysam 0.23.3 /
+    //! Twelve cases from an independent htslib/pysam oracle
+    //! (pysam 0.23.3 /
     //! samtools 1.21, BAQ off, min base quality 1): mate `a` = forward, start 101, 20M,
     //! MAPQ 25, all-A; mate `b` = reverse, start 103, MAPQ 60. Which mate keeps the
     //! reconciled base is decided by `Wang(X31(qname)) & 1`: `read3` keeps `a`, `read0..2`

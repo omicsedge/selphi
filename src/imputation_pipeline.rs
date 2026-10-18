@@ -85,7 +85,7 @@ pub(crate) fn auto_calibrate_pbwt_params(
     // fallen below this many markers, so it sets both how much evidence a match
     // needs and how long the walk is.
     //
-    // MEASURED 2026-09-11 on a nested panel-size ladder cut from one source
+    // Measured on a nested panel-size ladder cut from one source
     // (chr22, 801 targets with WGS truth, leak-free at every rung), taking the
     // largest value whose nine MAF bins are ALL at or above the old default:
     //
@@ -107,7 +107,7 @@ pub(crate) fn auto_calibrate_pbwt_params(
     // returned 5 on every panel below ~9,800 haplotypes — the floor did all the
     // work — and above that let the chip-density cap hold a 171k-haplotype panel
     // at 7 where 10 measures better in five of six bins. `n_chip` is gone: it was
-    // the binding term on exactly one rig and it was wrong there.
+    // the binding term on exactly one benchmark, where it reduces accuracy.
     //
     // The floor of 5 survives untouched and it is NOT cosmetic: at 750
     // haplotypes, 7 regresses eight of nine bins and 10 regresses all nine. That
@@ -721,11 +721,10 @@ fn finalize_batched_outputs(
 /// MAF-adaptive Ne per site: rare variants benefit from lower Ne
 /// (concentrated HMM, locks onto IBD haps), common from slightly higher Ne
 /// (smoother transitions). Narrow ramp only — a wider CV-aware ramp was
-/// tested 2026-05-22 on MESA chr20 × TOPMed mc=150K and REGRESSED OVERALL
+/// measured on MESA chr20 × TOPMed mc=150K and reduces OVERALL
 /// by -0.005, because Ne is a chain (transition) parameter, not a per-site
 /// parameter — high Ne at any common site causes HMM hap-switching that
-/// pollutes the trajectory through nearby rare sites. See
-/// project_ne_sweep_2026_05_22.md for full numbers.
+/// pollutes the trajectory through nearby rare sites.
 ///
 /// Returns `None` if `--no-em-ne` is off and EM Ne from phasing is present
 /// (caller will use that instead).
@@ -1088,8 +1087,8 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // flanking anchors (Beagle/IMPUTE5/minimac semantics) instead of variant
     // ordinal. Built once per chromosome; the knob is read once here (never in
     // the per-tile loops). None (default) keeps the rank-linear t byte-identical.
-    // Default since 2026-09-05. Measured a uniform win on chr22-801 (every MAF bin
-    // up, none down, 2026-08-10) and never-regress on MESA 100 x TOPMed chr20
+    // Default. Measured a uniform win on chr22-801 (every MAF bin
+    // up, none down) and never-regress on MESA 100 x TOPMed chr20
     // (every bin >=, per-sample 0.899739 -> 0.899758); it is also what Beagle,
     // IMPUTE5 and minimac do. SELPHI_INTERP_RANK=1 restores the rank-linear t.
     let interp_cum_cm: Option<Vec<f64>> = if !selphi::config::is_one("SELPHI_INTERP_RANK") {
@@ -1177,7 +1176,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         // independent phasing run, so they execute in PARALLEL: a single phasing
         // of few samples leaves CPU cores idle (one sample = 2 haplotypes worth
         // of internal parallelism), so running the members concurrently fills
-        // the cores — the speedup is largest for the single-sample production
+        // the cores — the speedup is largest for the single-sample
         // case. Determinism is preserved: each member's seed is fixed and its
         // phasing is bit-deterministic (thread-count-independent), and
         // `par_iter().collect()` yields results in member order, so the

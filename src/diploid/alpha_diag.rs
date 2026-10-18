@@ -1,23 +1,23 @@
 //! Instrumentation for the Alpha locus label, and the A/B switch that restores
-//! the pre-2026-09-03 label.
+//! the segment-end label.
 //!
 //! `forward()` saves one Alpha per segment and labels it with a locus;
 //! `compute_trans_hap` then bridges that label to the backward pass's previous
 //! locus to get the recombination term `yt` across the segment boundary. The
-//! label used to be the segment's LAST locus, which is wrong whenever a rare-hom
-//! skip left the state standing at an earlier one: the bridge comes out too
-//! short, `yt` too small, and the phase too sticky. The fix labels it with the
+//! segment's LAST locus is an incorrect label whenever a rare-hom
+//! skip leaves the state standing at an earlier one: the bridge comes out too
+//! short, `yt` too small, and the phase too sticky. The default labels it with the
 //! locus that last UPDATED the state (`prev_abs_locus`).
 //!
 //! Both labels are stored, so this module can answer two questions on any real
 //! run without a rebuild:
 //!
-//! * **How often does the fix bite?** `SELPHI_DIPLOID_ALPHA_DIAG=1` counts the
+//! * **Label differences.** `SELPHI_DIPLOID_ALPHA_DIAG=1` counts the
 //!   segments whose two labels differ, and the size of the gap in loci and in cM
 //!   — plus, at the boundary where it is actually consumed, the ratio between the
-//!   `yt` the fix computes and the `yt` the old label computed.
-//! * **What is it worth?** `SELPHI_DIPLOID_ALPHA_SEG_END=1` makes
-//!   `compute_trans_hap` read the old label, restoring the pre-fix behaviour
+//!   `yt` from the updated-state label and the `yt` from the segment-end label.
+//! * **Accuracy comparison.** `SELPHI_DIPLOID_ALPHA_SEG_END=1` makes
+//!   `compute_trans_hap` read the segment-end label, reproducing that labelling
 //!   exactly, so a paired run measures the accuracy delta directly.
 //!
 //! Both knobs are read once. With the diag off this module costs one cached bool
@@ -34,9 +34,8 @@ const YT_SCALE: f64 = 1.0e9;
 const RATIO_SCALE: f64 = 1.0e6;
 
 /// `SELPHI_DIPLOID_ALPHA_SEG_END=1`: label the Alpha with the segment's last
-/// locus (pre-2026-09-03) instead of the last locus that updated the state.
-/// Byte-identical to the old binary on any run, and to the new one on any run
-/// whose rare path is inert.
+/// locus instead of the last locus that updated the state.
+/// The two labelling modes are byte-identical on any run whose rare path is inert.
 pub fn label_seg_end() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| crate::config::is_one("SELPHI_DIPLOID_ALPHA_SEG_END"))

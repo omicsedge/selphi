@@ -49,24 +49,20 @@ const STREAM_CHUNK: usize = 256;
 /// 801 samples across two chromosomes.
 ///
 /// `SELPHI_ENSEMBLE_MAX_SAMPLES` caps it: above that cohort size the default
-/// drops to a single member. It is **0 (no cap) by default**, deliberately. I
-/// built it to default to 1,000 and the very next measurement undermined that:
-/// the unbatched 5,000-sample run with 2 members scored OVERALL 0.6209 against
-/// 0.6148 for July's single-member run — which is a confounded comparison (that
-/// run was batched, on an older evaluator, with rank interpolation) but is the
-/// only evidence there is, and it points the wrong way for capping. The clean
-/// control, same binary and evaluator with one member, has not been run. Until
-/// it has, the default keeps the accuracy and the run says out loud what the
-/// ensemble is costing.
+/// drops to a single member. It is **0 (no cap) by default**, deliberately.
+/// A cap of 1,000 is not supported by the available accuracy comparison:
+/// the unbatched 5,000-sample run with 2 members scores OVERALL 0.6209 against
+/// 0.6148 for a single-member run. This comparison is confounded by batching,
+/// evaluator version, and rank interpolation. A controlled comparison using
+/// the same binary and evaluator with one member is unavailable. The default
+/// retains the ensemble, and the run reports its cost.
 ///
 /// An explicit `SELPHI_DIPLOID_INTRA_N` or `--phase-ensemble` overrides the cap
 /// either way — asking for members is taken at face value.
 ///
-/// Note what the cap replaced: until 2026-09-06 the only gate was
-/// `--sample-batch-size`, which forces 1 because streaming output cannot hold N
-/// weight sets. At biobank scale you HAD to batch, so you got 1 by accident.
-/// Once the memory work of 2026-09-05/06 made an unbatched 5,000-sample run fit,
-/// that implicit gate stopped firing.
+/// `--sample-batch-size` forces 1 because streaming output cannot hold N
+/// weight sets. An unbatched 5,000-sample run can fit in memory and retains
+/// the ensemble unless the explicit cohort-size cap applies.
 /// `phase_ensemble`: `--phase-ensemble N`; > 1 is an explicit request and wins.
 /// `forced_single`: true under `--sample-batch-size` or `--phase-only` — 1, no choice.
 pub fn resolve_members(n_samples: usize, phase_ensemble: usize, forced_single: bool) -> usize {
@@ -80,7 +76,7 @@ pub fn resolve_members(n_samples: usize, phase_ensemble: usize, forced_single: b
 
 /// `SELPHI_ENSEMBLE_CHAINS=K` (K >= 2): build the diploid ensemble from K INDEPENDENT
 /// phasing chains (seeds seed..seed+K-1) instead of thinned samples of one chain.
-/// Experimental (2026-10-14): a single user's chr22 accuracy moves by up to 0.018
+/// Experimental: a single user's chr22 accuracy moves by up to 0.018
 /// per-sample R2 with the seed alone, and members drawn from one chain share its
 /// switch errors. `None` = the intra-run default.
 pub fn independent_chains() -> Option<usize> {
@@ -121,12 +117,11 @@ impl Member {
 /// the 1/n divide. Members are accumulated one at a time (peak holds 2
 /// weight-sets, not N) and divided once at the end.
 ///
-/// Rows are merged as two sorted runs. The previous version built a HashMap per
-/// row and sorted its contents, for every row of every target of every window —
-/// and since 2026-09-04 this runs by default on both pipelines. Output is
-/// bit-identical: a column present in one row only keeps its value exactly
-/// (the old `0.0 + v` was exact too), a column in both gets `a + b` in that
-/// order, and the result is ordered by column just as the old sort left it.
+/// Rows are merged as two sorted runs on both pipelines, avoiding a HashMap
+/// and a sort for every row of every target of every window. The output is
+/// bit-identical to a HashMap-and-sort merge: a column present in one row only
+/// keeps its value exactly (`0.0 + v` is exact too), a column in both gets
+/// `a + b` in that order, and the result is ordered by column.
 /// Hap ids are unique within a row (states are distinct haplotypes and dedup
 /// groups are disjoint), which is what makes the merge equivalent; a row whose
 /// ids arrive out of column order (dedup-group expansion can do that) is sorted
@@ -379,7 +374,7 @@ struct PairFold<'c> {
     marks: Vec<(u32, bool)>,
     swap: Vec<bool>,
     /// `mixed_rows` on (default); `SELPHI_NOCALL_BLEND_ALIGN_OFF=1` takes every row from one
-    /// haplotype by its own orientation, as before 2026-10-17 (A/B).
+    /// haplotype by its own orientation (A/B).
     blend_align: bool,
 }
 

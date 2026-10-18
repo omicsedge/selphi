@@ -51,13 +51,13 @@ pub fn imputed_ac_dr2(
     (ac, dr2)
 }
 
-/// `SELPHI_DR2_DIPLOID=1`: the estimator used before 2026-10-14 (A/B only).
+/// `SELPHI_DR2_DIPLOID=1`: the diploid-dosage estimator (A/B only).
 fn dr2_diploid() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| crate::config::is_one("SELPHI_DR2_DIPLOID"))
 }
 
-/// The pre-2026-10-14 DR2: variance of the DIPLOID dosage across samples over
+/// The diploid-dosage DR2: variance of the DIPLOID dosage across samples over
 /// 2p(1-p) (0 at every site of a one-sample run). Kept for A/B.
 fn imputed_ac_dr2_diploid(
     n_samples: usize, n_haps: usize, ap: impl Fn(usize) -> (f32, f32), ds_out: &mut [f32],

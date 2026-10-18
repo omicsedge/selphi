@@ -344,11 +344,11 @@ fn compute_estimate_mb(
 
     // Per-thread (= per in-flight target) working set of the PBWT + HMM stage.
     //
-    // Until 2026-09-05 this was `window_chip_vars * max_candidates * 12` and it
-    // was RIGHT: each target held an n_window_sites x n_candidates BYTE allele
-    // matrix for the PBWT (n_candidates saturates at max_candidates), plus two
-    // dense n_sites x n_states f32 HMM matrices — 1.75 GB/thread predicted,
-    // 1.78 measured on MESA 100 x TOPMed chr20. All three are gone: the PBWT
+    // Full dense storage costs `window_chip_vars * max_candidates * 12`:
+    // an n_window_sites x n_candidates BYTE allele matrix for the PBWT
+    // (n_candidates saturates at max_candidates), plus two dense
+    // n_sites x n_states f32 HMM matrices — 1.75 GB/thread predicted,
+    // 1.78 measured on MESA 100 x TOPMed chr20. To avoid these matrices, the PBWT
     // gathers one allele row per site (pbwt::AlleleRows), the forward is
     // sqrt(n)-checkpointed and the weights stream to CSR. What is left per
     // thread is one allele row (m bytes), the PBWT workspace (five m-wide i32
@@ -393,9 +393,9 @@ fn compute_estimate_mb(
     let hap_posterior_mb = (in_flight_haps as f64 * states_est * 16.0) / 1e6;
     let tile_cols = n_ref.div_ceil(4096);
     // Stripes per interpolation batch. Mirrors io/pipeline.rs exactly: a 2 GiB
-    // cap over (decompressed stripes + result tiles), applied per TILE since
-    // 2026-09-06 so no single chip gap can exceed it (the chr20 centromere against
-    // TOPMed used to make one 993-stripe batch out of a 96-stripe cap).
+    // cap over (decompressed stripes + result tiles), applied per TILE so no
+    // single chip gap can exceed it (the chr20 centromere against TOPMed spans
+    // 993 stripes, exceeding a 96-stripe cap when batched as one interval).
     let decomp_tile_bytes = 500usize * 1024;
     let bytes_per_stripe = tile_cols * decomp_tile_bytes;
     let result_bytes_per_stripe = in_flight_haps * 1024 * 4;

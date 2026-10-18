@@ -336,7 +336,7 @@ fn parse_gt_raw(
 }
 
 /// `SELPHI_UNPHASED_INPUT_ORDER=1` keeps an unphased het's alleles in the order the file
-/// lists them (the behaviour before 2026-10-15), for A/B comparisons.
+/// lists them, for A/B comparisons.
 fn unphased_input_order() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| crate::config::is_one("SELPHI_UNPHASED_INPUT_ORDER"))
@@ -428,9 +428,9 @@ fn n_target_markers<'a>(alts: impl ExactSizeIterator<Item = &'a str>) -> usize {
 pub fn read_cohort_vcf(
     path: &str,
 ) -> (Vec<String>, Vec<TargetMarker>, Vec<Vec<[u8; 2]>>, bool) {
-    // The GT_MISSING sentinel is passed THROUGH to the panel phaser. Until 2026-09-02
-    // this function folded it to 0, so every no-call in a cohort being phased as a
-    // reference panel entered the engine as hom-REF and left it as a confidently
+    // The GT_MISSING sentinel is passed THROUGH to the panel phaser. Folding it
+    // to 0 makes every no-call in a cohort being phased as a reference panel
+    // enter the engine as hom-REF and leave it as a confidently
     // phased REF allele: no missing flag, no neighbour vote, and a systematic REF
     // bias at exactly the rare sites where a carrier's call is most likely to be
     // absent. The diploid engine marks >1 as missing, votes an allele for it in

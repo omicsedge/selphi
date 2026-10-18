@@ -487,7 +487,7 @@ pub struct SegmentHmm {
     pub prob_sum_t: f32,
     /// Number of conditioning haplotypes
     pub n_cond: usize,
-    /// Kernel path a test pins on this instance; production reads [`seg_path`].
+    /// Kernel path a test pins on this instance; normal execution reads [`seg_path`].
     #[cfg(test)]
     pub(crate) path: SegPath,
 
@@ -1953,7 +1953,7 @@ impl SegmentHmm {
         };
         let locus_updated = self.alpha_locus.get(seg_rel - 1).copied().unwrap_or(0);
         let locus_seg_end = self.alpha_locus_seg_end.get(seg_rel - 1).copied().unwrap_or(locus_updated);
-        // SELPHI_DIPLOID_ALPHA_SEG_END=1 restores the pre-2026-09-03 label.
+        // SELPHI_DIPLOID_ALPHA_SEG_END=1 uses the segment-end label.
         let alpha_locus = if alpha_diag::label_seg_end() { locus_seg_end } else { locus_updated };
 
         // yt = getForwardTransProb(AlphaLocus[seg-1], prev_abs_locus)
@@ -2303,9 +2303,9 @@ mod seg_kernel_tests {
         }
     }
 
-    /// The pre-2026-10-17 x86 fallback of `run_hom_bm` (separate multiply and
+    /// An alternative x86 fallback of `run_hom_bm` (separate multiply and
     /// add, one sequential sum): what `SELPHI_FORCE_SCALAR=1` and non-AVX-512
-    /// hosts used to compute. Kept to show the parity test can see the
+    /// hosts can compute with that reduction order. Kept to show the parity test can see the
     /// difference it guards against.
     fn run_hom_legacy_scalar(c: &Case) -> u32 {
         let nt_div = divss(c.nt, c.sum_t);

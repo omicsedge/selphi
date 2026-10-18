@@ -24,7 +24,7 @@
 //! both haps share the marginal); subsequent iterations use the per-hap
 //! dosage from the previous HMM round.
 //!
-//! # Performance (per feedback_ultra_optimized)
+//! # Performance
 //!
 //! - Reuses `crate::haploid::stage2::pbwt_ibs::PbwtDivUpdater` (no
 //!   duplication of PBWT primitive).
@@ -33,8 +33,7 @@
 //! - `prefix[]` and `div[]` allocated once at outer level.
 //! - Only PBWT updates run on storage sites (1 per 0.1 cM, ≈ 700-1500 on
 //!   chr22 vs 246K stage-1 marker steps for the Beagle stage-2 port).
-//! - Single-threaded for now; per-storage-site parallelism is a follow-up
-//!   if needed at biobank scale.
+//! - Storage-site selection is single-threaded.
 
 use crate::common::HaplotypeBitmatrix;
 use crate::haploid::stage2::pbwt_ibs::PbwtDivUpdater;

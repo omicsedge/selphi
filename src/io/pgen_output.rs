@@ -64,7 +64,7 @@ fn header_len(n_var: usize, len_bytes: usize) -> u64 {
 /// writes), every record of vrtype 0x40: 2-bit hardcalls then an unconditional
 /// 16-bit dosage per sample, so every record has the same length.
 ///
-/// Mode 0x03 (fixed-width dosage), written until 2026-10-14, is a format plink2
+/// Mode 0x03 (fixed-width dosage), is a format plink2
 /// reads single-threaded but does not validate and failed to read with threads
 /// (`Failed to unpack variant #N`, at a varying N, on files whose every record
 /// decodes correctly by hand).

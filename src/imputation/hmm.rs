@@ -98,7 +98,7 @@ fn perr_em_diag() -> bool {
 }
 
 /// Cached `SELPHI_PRUNE_DIAG` flag: gates the surviving-state / CSR-nnz
-/// counters so the production row loops carry only a local-bool branch.
+/// counters so the row loops carry only a local-bool branch.
 fn prune_diag() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
@@ -572,13 +572,11 @@ fn forward_step(
 
 /// The forward pass, stored at √n checkpoints instead of in full.
 ///
-/// Until 2026-09-04 the chip/WGS HMM kept every forward row of a block resident
-/// (`n_rows × n_states` f32) so the streaming backward could multiply against
-/// it. That matrix, together with the dense weights matrix of the same size, was
-/// the whole per-thread memory peak: 1.77 GB for the largest target on MESA ×
-/// TOPMed chr20 against a measured 1.78 GB/thread. The lcWGS engine had already
-/// solved the same problem the same way (`lcwgs/hmm.rs`, documented bit-identical
-/// and faster from the cache win); this is that pattern.
+/// Keeping every forward row resident (`n_rows × n_states` f32) for the
+/// streaming backward, together with a dense weights matrix of the same size,
+/// costs 1.77 GB for the largest target on MESA × TOPMed chr20, accounting for
+/// a measured 1.78 GB/thread peak. Checkpointing avoids that allocation and
+/// improves cache locality; `lcwgs/hmm.rs` uses the same bit-identical pattern.
 ///
 /// Row `c*stride` is stored for every checkpoint `c`, and every row's pre-prune sum
 /// (and surviving mass, when pruning is on). The backward walks blocks right to left
@@ -999,12 +997,11 @@ fn combine_row_sums(fwd: &[f32], bwd: &[f32], out: &mut [f32], inverse_sizes: Op
 /// Streaming backward pass + online combination with the forward matrix.
 ///
 /// The backward is computed one row at a time and multiplied with the stored
-/// forward row immediately, and — since 2026-09-04 — each combined row is
-/// normalised and converted to its sparse form on the spot. Before that the
-/// combined rows were written into a second dense `n_rows × n_states` f32 matrix
-/// the size of `fwd`, held until the whole pass had finished, then normalised
-/// and converted in a separate sweep. Together with `fwd` that matrix was the
-/// entire per-thread memory peak of the chip/WGS path: 2 × n_rows × n_states ×
+/// forward row immediately; each combined row is normalised and converted to
+/// its sparse form on the spot. Holding combined rows in a second dense
+/// `n_rows × n_states` f32 matrix the size of `fwd` until a separate conversion
+/// sweep doubles the dense storage. Together those matrices account for the
+/// per-thread memory peak of the chip/WGS path: 2 × n_rows × n_states ×
 /// 4 B, 1.77 GB for the largest target on MESA × TOPMed chr20 against a measured
 /// 1.78 GB/thread. Only the six rows the boundary fixups touch are still held
 /// dense (see `FixupPlan`); everything else exists as one row of scratch.
@@ -1523,8 +1520,7 @@ pub fn prepare_weights<'a>(
     // the default: the shipped auto-Ne (36.4 * n_ref, floor 100,000) was swept on
     // top of this kernel, so the inflation is already absorbed into that constant
     // and changing one without re-sweeping the other makes the copying model tens of
-    // times stickier than anything validated. Measured effect: see the A/B in
-    // project_unswept_subsystems_2026_09_03.
+    // times stickier than the validated parameterization.
     let total_state_mass: f64 = match group_sizes_f64 {
         Some(ref gs) => gs.iter().sum(),
         None => n_states as f64,

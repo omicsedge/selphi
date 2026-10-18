@@ -478,9 +478,8 @@ fn phase_genotypes_inner(
         // Adaptive burnin: if the burnin swap rate drops below 1% the remaining
         // burnin iterations are skipped and we advance straight to the first
         // phasing iteration. Opt-in via SELPHI_HAPLOID_BURNIN_EARLYSTOP=1
-        // (gated: changes the iteration schedule, so kept off by default until
-        // validated on trio SER — see feedback_r2_never_regress). The audit
-        // flags this as the likely remaining cause of the ~0.01 pp trio-SER gap
+        // (changes the iteration schedule; its effect on trio SER is unvalidated).
+        // The schedule is a possible source of the ~0.01 pp trio-SER gap
         // vs Beagle.
         let burnin_earlystop = crate::config::is_one("SELPHI_HAPLOID_BURNIN_EARLYSTOP");
         let mut it = 0usize;
@@ -506,7 +505,7 @@ fn phase_genotypes_inner(
             // Microtest / A-B: force a single sequential PBWT (no multi-batch buffer
             // warm-up approximation). SELPHI_HAPLOID_SINGLE_BATCH=1 forces ALL
             // windows/iters single-batch (debug only) — used both for the win0/iter0
-            // a[]/d[] dump AND to A/B whether the production multi-batch buffer
+            // a[]/d[] dump AND to A/B whether the multi-batch buffer
             // warm-up degrades the IBS selection vs a clean single pass.
             let it_nb = if crate::config::is_one("SELPHI_HAPLOID_SINGLE_BATCH") { 1 } else { it_nb };
 

@@ -401,7 +401,7 @@ impl SegmentHmmF64 {
         } else { [1.0/HAP_NUMBER as f64; HAP_NUMBER] };
         let locus_updated = self.alpha_locus.get(seg_rel-1).copied().unwrap_or(0);
         let locus_seg_end = self.alpha_locus_seg_end.get(seg_rel-1).copied().unwrap_or(locus_updated);
-        // SELPHI_DIPLOID_ALPHA_SEG_END=1 restores the pre-2026-09-03 label.
+        // SELPHI_DIPLOID_ALPHA_SEG_END=1 uses the segment-end label.
         let alpha_locus = if alpha_diag::label_seg_end() { locus_seg_end } else { locus_updated };
 
         let (nt, yt) = self.transition_params_f64(

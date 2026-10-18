@@ -1191,8 +1191,8 @@ mod tests {
     use super::*;
 
     // Byte-pin every shared serialization atom against a hand-written layout.
-    // Combined with the empirical .csi/.tbi md5 gate on the live builders (which
-    // call these same helpers), this covers the index serialization end-to-end.
+    // The .csi/.tbi builders call these same helpers, so the layout checks
+    // cover the shared index serialization.
 
     #[test]
     fn write_chunks_layout() {

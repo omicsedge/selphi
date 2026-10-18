@@ -472,9 +472,8 @@ mod par_tests {
     #[test]
     fn pedigree_marks_the_locked_hets() {
         // Every het the scaffold resolves must be reported in the lock mask, so the
-        // diploid engine can carry it as VAR_SCA instead of re-sampling it. Before
-        // 2026-09-02 no lock mask existed and the resolved phase was silently
-        // re-derived by the MCMC.
+        // diploid engine can carry it as VAR_SCA instead of re-sampling it.
+        // Without the mask, the MCMC re-derives the resolved phase.
         let (n_var, n_samples, n_haps) = (2usize, 3usize, 6usize);
         // var 0: child het, father hom-ref, mother het  -> resolvable
         // var 1: child het, both parents het            -> unsolved

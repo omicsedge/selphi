@@ -527,8 +527,8 @@ pub struct Args {
     #[arg(long, hide = true)]
     pub chrx_par: bool,
 
-    /// Treat a chrX male as haploid over the WHOLE chromosome, PAR included (the behaviour
-    /// before 2026-10-14). By default males are diploid inside the pseudo-autosomal regions
+    /// Treat a chrX male as haploid over the WHOLE chromosome, PAR included.
+    /// By default males are diploid inside the pseudo-autosomal regions
     /// (PAR1/PAR2) and haploid elsewhere: their PAR heterozygous calls are kept and haploid
     /// detection counts only non-PAR sites. Resetting the PAR hets threw away true calls:
     /// one man imputed on his own (GSA array, 201 PAR hets) read chrX SNP R2 0.874 against

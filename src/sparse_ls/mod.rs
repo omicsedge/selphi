@@ -26,8 +26,7 @@ pub mod pipeline;
 // NB: `params` (LsParams) and `phasing_hmm` were MOVED into `crate::lcwgs`
 // (`lcwgs::ls_params` / `lcwgs::phasing_hmm`); the `--ls-exact` engine imports
 // them back. FOOTGUN: this module is NOT fully removable with `--ls-exact` —
-// the DEFAULT `--lcwgs` engine's faithful selection (`lcwgs::faithful_select`, default-ON
-// since UPDATE 52) depends on the KEEP-set `ref_haplotype_set` / `haplotype_set` / `rng`.
+// the DEFAULT `--lcwgs` engine's faithful selection (`lcwgs::faithful_select`, default-ON) depends on the KEEP-set `ref_haplotype_set` / `haplotype_set` / `rng`.
 // Only the exact-engine-specific modules (`caller`, `conditioning_set`, `genotype`,
 // `imputation_hmm`, `pipeline`) are removable when `--ls-exact` is retired; the
 // KEEP-set must first be relocated into `crate::lcwgs` or the default path breaks.

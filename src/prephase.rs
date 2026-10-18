@@ -70,7 +70,7 @@ pub fn apply_haploid_detection(
     // equal on every label that test matched.
     let is_chrx = selphi::contig::is_chrx(chr);
     // PAR mask (default on a chrX run; `--chrx-no-par` turns it off): males are DIPLOID in
-    // PAR1/PAR2. `None` → the whole-chromosome handling used before 2026-10-14.
+    // PAR1/PAR2. `None` → whole-chromosome haploid handling.
     let par_site: Option<Vec<bool>> = if chrx_par && is_chrx {
         use selphi::contig::Build;
         let build = match build {

@@ -138,8 +138,8 @@ thread_local! {
 
 /// `SELPHI_DIPLOID_NOCALL_OBSERVED=1`: input no-calls enter the rebuilt genotype
 /// graphs as the initialisation sweep's voted genotype (observed, never imputed)
-/// and the output keeps the post-phasing k-NN vote at them — the behaviour before
-/// 2026-10-17. Default: they stay missing and the segment HMM imputes them.
+/// and the output keeps the post-phasing k-NN vote at them. By default they
+/// stay missing and the segment HMM imputes them.
 pub(crate) fn nocall_observed() -> bool {
     #[cfg(test)]
     if NOCALL_OBSERVED_TEST.with(|c| c.get()) { return true; }
@@ -533,10 +533,9 @@ fn resolve_phase_ne(n_haps_total: usize) -> f64 {
 /// WGS-density target it costs switch error: 54 1KG trio children × 2,239-sample
 /// panel, chr22 mean per-trio SER 2.539–2.554% with the scaled ceiling against
 /// 2.527–2.528% with the flat 1e6, two seeds each and the same sign in both
-/// (2026-09-15) — enough to hand the chromosome to Beagle 5.5 (2.548%). So the
-/// scaled ceiling applies below `SELPHI_AUTOROUTE_WGS_DENSITY` sites/Mb (1000,
+/// (Beagle 5.5: 2.548%). The scaled ceiling applies below `SELPHI_AUTOROUTE_WGS_DENSITY` sites/Mb (1000,
 /// the line the engine router already draws between a chip and a WGS callset)
-/// and WGS-density input keeps the flat 1e6 it had before 2026-08-14.
+/// and WGS-density input keeps the flat 1e6 ceiling.
 /// `SELPHI_PHASE_NE_CAP_WGS=1` forces the scaled ceiling on WGS density (A/B).
 /// Density is that of the scaffold actually phased here: ~270 sites/Mb for a
 /// GSA chip, ~20,000 for the trio WGS, so the cut is not a close call.
@@ -1209,7 +1208,7 @@ pub fn run_phase_common_bm(
     // (36.4*n_ref) already does. Either knob also disables the EM update, which
     // would otherwise overwrite the requested value on the first burn-in pass.
     // Opt out of voting an allele for no-calls in the PBWT initialisation sweep
-    // (restores the pre-2026-09-02 behaviour, where a no-call entered the sweep,
+    // (a no-call then enters the sweep,
     // the graph rebuild and the MCMC as hom-REF). Read once, outside the sweep.
     let mis_vote = !crate::config::is_one("SELPHI_SWEEP_NO_MIS_VOTE");
     let ne_init = resolve_phase_ne(n_haps_total);
@@ -1437,7 +1436,7 @@ fn _run_iterations(
         // Shared immutable borrows for the parallel closure
         let hap_bm_hmm_ref: &HaplotypeBitmatrix = hap_bm;
         let ibs_cap = max_cond_haps;
-        // Fewer samples than threads (a production single-user run has one): the
+        // Fewer samples than threads (a single-sample run has one): the
         // per-sample loop cannot fill the pool, so each sample's windows run their
         // HMMs in parallel. Output is identical either way.
         let n_pool_threads = rayon::current_num_threads();
@@ -1650,7 +1649,7 @@ fn _run_iterations(
         // REGRESSED OVERALL R² 0.6148 → 0.6120 (worse on every MAF bin), and
         // on 1KG it cost only +0.0003. A large diverse panel needs more
         // haplotype switching (finer mosaic) than SHAPEIT5's population-scale
-        // Ne=15000 assumes. Keep it. See project_phasing_engine_mesa5k.
+        // Ne=15000 assumes.
         if stage == Stage::Burnin && em_ne_enabled {
             let mut total_switches = 0u64;
             let mut total_sites = 0u64;
@@ -1767,7 +1766,7 @@ fn run_phase_common_bm_legacy(
     // (36.4*n_ref) already does. Either knob also disables the EM update, which
     // would otherwise overwrite the requested value on the first burn-in pass.
     // Opt out of voting an allele for no-calls in the PBWT initialisation sweep
-    // (restores the pre-2026-09-02 behaviour, where a no-call entered the sweep,
+    // (a no-call then enters the sweep,
     // the graph rebuild and the MCMC as hom-REF). Read once, outside the sweep.
     let mis_vote = !crate::config::is_one("SELPHI_SWEEP_NO_MIS_VOTE");
     let ne_init = resolve_phase_ne(n_haps_total);
@@ -2524,7 +2523,7 @@ fn _run_iterations_legacy(
         // REGRESSED OVERALL R² 0.6148 → 0.6120 (worse on every MAF bin), and
         // on 1KG it cost only +0.0003. A large diverse panel needs more
         // haplotype switching (finer mosaic) than SHAPEIT5's population-scale
-        // Ne=15000 assumes. Keep it. See project_phasing_engine_mesa5k.
+        // Ne=15000 assumes.
         if stage == Stage::Burnin && em_ne_enabled {
             let mut total_switches = 0u64;
             let mut total_sites = 0u64;
@@ -2589,8 +2588,8 @@ mod phase_ne_ceiling_tests {
 
     #[test]
     fn scaled_ceiling_is_for_arrays_only() {
-        // The trio rig: 4,586 haplotypes, ~20,000 scaffold sites/Mb -> flat 1e6, as
-        // before 2026-08-14 (the scaled 355k cost 0.012-0.026 pp SER there).
+        // The trio rig: 4,586 haplotypes, ~20,000 scaffold sites/Mb -> flat 1e6
+        // (the scaled 355k costs 0.012-0.026 pp SER there).
         assert_eq!(phase_ne_ceiling(4_586, Some(20_000.0)), 1_000_000.0);
         // A GSA chip on the same panel (~270 sites/Mb) keeps the scaled ceiling.
         assert_eq!(phase_ne_ceiling(4_586, Some(270.0)), 77.5 * 4_586.0);
@@ -2776,7 +2775,7 @@ mod phase_common_parity_tests {
         }
     }
 
-    /// Codex's f64-fallback trigger, on the window-batched path (one sample): at a
+    /// An f64-fallback trigger, on the window-batched path (one sample): at a
     /// window head and at many further sites the target is 0/0 while exactly one of
     /// 1,000 reference haplotypes carries the ALT (rare in the combined panel,
     /// 1/1002 < 0.001). Old vs new must agree whatever fallbacks it causes;

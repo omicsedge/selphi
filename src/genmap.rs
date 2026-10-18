@@ -27,9 +27,9 @@ pub fn load_and_interpolate_genetic_map_for(map_path: &Path, contig: Option<&str
 /// `map_path` may list several files for ONE chromosome, comma-separated: they are joined in
 /// position order, each file's cM continuing from where the previous one ends (`stitch`).
 /// chrX ships as three PLINK maps (PAR1, non-PAR, PAR2), each starting at 0 cM. Given the
-/// non-PAR file alone, PAR1 (2.5 Mb, ~21 cM) was extrapolated at the chromosome's mean rate,
-/// ~3 cM, the HMM copied far too long there, and PAR1 imputation trailed the production
-/// pipeline (one woman: PAR1 SNP R2 0.691 vs 0.754). A single path reads exactly as before.
+/// non-PAR file alone, PAR1 (2.5 Mb, ~21 cM) is extrapolated at the chromosome's mean rate,
+/// ~3 cM, making HMM copying tracts too long. Using all three maps improves PAR1
+/// imputation (one individual: PAR1 SNP R2 0.691 vs 0.754). A single path reads normally.
 pub fn load_genetic_map_raw(map_path: &Path) -> std::io::Result<(Vec<i64>, Vec<f64>)> {
     load_genetic_map_for(map_path, None)
 }
@@ -316,7 +316,7 @@ enum Edge {
 
 /// The edge model of the genotype engine: the chromosome's mean rate in phasing and
 /// imputation. A/B only: `SELPHI_MAP_EDGE_OLD=1` restores imputation's clamp at the
-/// map's ends (before 2026-10-14); `SELPHI_MAP_EDGE_END=1` uses Beagle's rate over
+/// map's ends; `SELPHI_MAP_EDGE_END=1` uses Beagle's rate over
 /// the map's last (first) 5 cM in both, which measured worse for phasing (54 trios,
 /// five seeds: +0.007 pp switch error, 5 of 5 seeds).
 fn edge_model(imputation: bool) -> Edge {

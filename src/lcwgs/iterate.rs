@@ -20,7 +20,7 @@
 //! selection picks a cleaner conditioning set, etc. GLIMPSE2 converges in
 //! ~20 rounds; we run more (50) for the rare-bin convergence gain above.
 //!
-//! # Performance (per feedback_ultra_optimized)
+//! # Performance
 //!
 //! - Per-sample loop is `rayon::par_iter` over `0..n_samples`. Each
 //!   sample's Gibbs is independent — embarrassingly parallel.
@@ -346,7 +346,7 @@ struct GibbsConfig {
     /// H0/H1 with a segment-level diplotype-commitment (DMM, GLIMPSE2
     /// rephaseHaplotypes analogue) before write-back, so a segment-coherent
     /// low-noise phase feeds the next iteration. Implies `gs_main`. DEFAULT ON
-    /// (2026-06-04, validated chr22 + chr1); opt out with `LCWGS_NO_DMM=1`.
+    /// (validated chr22 + chr1); opt out with `LCWGS_NO_DMM=1`.
     dmm: bool,
     /// EXPERIMENT (`LCWGS_DMM_GL`): GL-aware DMM emission — weight the segment
     /// copy-match by per-site read confidence (peakedness of the genotype GL),
@@ -364,7 +364,7 @@ struct GibbsConfig {
     /// Viterbi can commit a het rare-carrier segment onto the true carrier (which
     /// then reinforces over main iters). This does NOT touch the global HMM
     /// conditioning set (adding carriers there is measured-negative: RC_ALL /
-    /// match-ext / flank all regress). Validated 2026-06-04 (r12 + full-chr22 +
+    /// match-ext / flank all regress). Validated (r12 + full-chr22 +
     /// chr1: every MAF bin up, zero regression, neutral wall/mem). Requires `dmm`.
     dmm_rc: bool,
     /// Max local rare carriers injected per sample into the DMM phasing set
@@ -375,12 +375,12 @@ struct GibbsConfig {
     /// GLIMPSE2's unconditional per-iteration joint re-projection (caller_algorithm.cpp:
     /// 61-71). Selphi gates both to `is_main`, leaving the ~25-iter burn-in as pure
     /// parallel-Jacobi where the two haps can drain into the same allele (the verified
-    /// 2026-06-06 het→hom soft-GL collapse). Running the joint step every iter mitigates
+    /// het→hom soft-GL collapse). Running the joint step every iter mitigates
     /// it: an individual at 1× +0.0045 (gain in common bins), at a small −0.0004 on the
     /// canonical r12 multi-sample benchmark (a real-vs-simulated tradeoff). Dose/GP are
     /// still accumulated MAIN-only. Byte-identical when off.
     burnin_diploid: bool,
-    /// DEFAULT-ON (2026-06-06): replace the heuristic DMM re-phase with the FAITHFUL
+    /// DEFAULT-ON: replace the heuristic DMM re-phase with the FAITHFUL
     /// GLIMPSE2-model phasing HMM (crate::lcwgs::phasing_hmm) run EVERY iteration
     /// (GLIMPSE2 schedule). Validated clean win in every regime, NO tradeoff: canonical
     /// r12 (54s) OVERALL 0.9403→0.9511 beating GLIMPSE2 0.9429 on EVERY bin; full-chr22
@@ -395,7 +395,7 @@ struct GibbsConfig {
     /// downstream (rare-carrier augmentation, HMM, GLIMPSE2/DMM rephase) is
     /// UNCHANGED. **DEFAULT ON** (opt out `LCWGS_NO_FAITHFUL_SELECT=1` → the
     /// heuristic selection). The heuristic storage-site selection picks poor
-    /// neighbours when choosing K of a LARGE panel: on the 75552-hap production
+    /// neighbours when choosing K of a LARGE panel: on the 75552-hap reference
     /// panel (HG002 1×, chr22) it scores OVERALL 0.9196 vs the faithful selection's
     /// 0.9688 (+0.049, ~80% of the gap to GLIMPSE2 0.9806; the residual ~0.011 is
     /// the imputation HMM — for full parity use `--ls-exact` 0.9800). On the
@@ -439,7 +439,7 @@ struct GibbsConfig {
 impl GibbsConfig {
     fn from_env() -> Self {
         use crate::config::usize_opt as envu;
-        // DMM segment phase-commitment is DEFAULT-ON (2026-06-04). Validated on
+        // DMM segment phase-commitment is DEFAULT-ON. Validated on
         // chr22 AND an independent chr1:30-45Mb A/B: every MAF bin improved, zero
         // regression, biggest gains in the rare bins, GLIMPSE2 OVERALL gap halved
         // (chr1 0.9330→0.9361, 0.5-1% 0.9004→0.9062), at ~+8% wall / neutral memory.
@@ -455,7 +455,7 @@ impl GibbsConfig {
             || !crate::config::present("LCWGS_NO_DMM");
         let gs_main = dmm || crate::config::present("LCWGS_GS_MAIN");
         // Rare-carrier-aware DMM is DEFAULT-ON when the DMM is on (validated
-        // 2026-06-04 on r12 + full-chr22 + chr1: every MAF bin up, zero regression,
+        // on r12 + full-chr22 + chr1: every MAF bin up, zero regression,
         // neutral wall/mem). It extends the DMM segment-commitment set, so it is a
         // no-op when the DMM is off (LCWGS_NO_DMM). Opt out with LCWGS_NO_DMM_RC=1;
         // LCWGS_DMM_RC forces it (and the DMM) on.
@@ -467,7 +467,7 @@ impl GibbsConfig {
             k_max: match envu("LCWGS_KMAX") {
                 Some(0) => None,    // explicit opt-out
                 Some(k) => Some(k),
-                None => Some(3000), // default ceiling (retuned 2026-05-31)
+                None => Some(3000), // default ceiling
             },
             rare_carrier_max: envu("LCWGS_RARE_CARRIER_MAX").unwrap_or(64),
             timing: crate::config::present("LCWGS_TIMING"),
@@ -483,7 +483,7 @@ impl GibbsConfig {
             phase_main_every: envu("LCWGS_PHASE_MAIN_EVERY").filter(|&n| n >= 1).unwrap_or(1),
             rich_cond: crate::config::present("LCWGS_LS_RICH_COND"),
             flat_exact: crate::config::present("LCWGS_LS_FLAT_EXACT"),
-            // DEFAULT ON (2026-06-10): R²-safe poly/mono skip (phaser + imputation FB).
+            // DEFAULT ON: R²-safe poly/mono skip (phaser + imputation FB).
             // Opt out with LCWGS_NO_POLY_SKIP=1 (reverts to the dense all-sites kernels).
             poly_skip: !crate::config::present("LCWGS_NO_POLY_SKIP"),
         }

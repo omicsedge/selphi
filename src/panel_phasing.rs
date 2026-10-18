@@ -237,8 +237,7 @@ fn phase_cohort(
     let (phased, _r) = match engine {
         PhasingEngine::Haploid => {
             // The haploid engine has no missing-genotype state: fold the >1
-            // sentinel to REF here, exactly as the loaders did for both engines
-            // before 2026-09-02, so this opt-in path stays byte-identical.
+            // sentinel to REF here, preserving this opt-in path's allele encoding.
             let folded: Vec<u8> = geno.iter().map(|&a| if a > 1 { 0 } else { a }).collect();
             selphi::haploid::phase_panel(
                 &folded, bp, map_bp, map_cm, n_var, n_samples,

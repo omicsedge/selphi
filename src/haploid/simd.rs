@@ -736,7 +736,7 @@ mod simd_parity_tests {
                 let (sx, sy) = (bwd_update_scalar(&mut x, &mr, el, ns), simd_bwd(&mut y, &mr, el, ns));
                 assert_eq!((sx.to_bits(), bits(&x)), (sy.to_bits(), bits(&y)), "bwd_update case {case} ns {ns}");
                 fnv(&mut digest, bits(&y).into_iter().chain([sy.to_bits()]));
-                // The pre-2026-10-17 scalar kernel summed left to right: the
+                // An alternative scalar kernel sums left to right: the
                 // test inputs must be able to tell that order from the canonical one.
                 if x.iter().fold(0.0f32, |a, &b| a + b).to_bits() != sx.to_bits() { sequential_differs += 1; }
                 let (mut x, mut y) = (v0.clone(), v0.clone());

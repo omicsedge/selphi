@@ -806,7 +806,7 @@ mod tests {
         SparseTile::from_bytes(&tile_bytes(1024, vec![0, 2, 2, 5], vec![7, 9, 3, 8, 4]));
     }
 
-    /// Through extraction too (Codex's case): extract row 0 of a tile holding
+    /// Extraction boundary case: extract row 0 of a tile holding
     /// row 1024 of a 1024-row stripe.
     #[test]
     #[should_panic(expected = "corrupt tile")]
@@ -882,8 +882,8 @@ mod tests {
 
     #[test]
     fn extraction_reads_stay_within_the_previous_memory() {
-        // Codex's case: 800 stripes of 128 KiB, one wanted row each. The previous
-        // scheme read 400 at a time: 50 MiB.
+        // 800 stripes of 128 KiB, one wanted row each. Reading 400 at a time
+        // requires 50 MiB.
         let stripes: Vec<usize> = (0..800).collect();
         let p = check_plan(&stripes, &vec![128 << 10; 800], 400, 64 << 20);
         assert_eq!(p.bound, 50 << 20);

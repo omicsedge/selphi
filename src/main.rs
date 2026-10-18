@@ -458,7 +458,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
         let out = args.out.as_deref().unwrap_or("imputed");
 
         // std::env::temp_dir() honours TMPDIR (macOS → /var/folders/…) and falls
-        // back to /tmp on Linux; a hardcoded /data/tmp does not exist off the dev box.
+        // back to /tmp on Linux, keeping temporary storage portable.
         let temp_srp = std::env::temp_dir()
             .join(format!("selphi_refpanel_dir_{}.srp", std::process::id()));
         selphi_step!("Merging per-chr SRPs from {} → {}", panel_dir, temp_srp.display());

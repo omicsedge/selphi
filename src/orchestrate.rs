@@ -77,8 +77,7 @@ pub struct MultiChrImputeConfig {
     /// `--build`: only read when `--chrx-par` is set on a chrX run.
     pub build: crate::cli::BuildArg,
     /// `--truth`: post-run accuracy evaluation. `None` when the flag is absent.
-    /// Before 2026-09-03 this path had no truth handling at all, so a
-    /// whole-genome benchmark run with `--truth` imputed and exited silently.
+    /// Whole-genome runs evaluate accuracy after imputation when truth is supplied.
     pub eval: Option<crate::eval_run::EvalRequest>,
 }
 
@@ -328,9 +327,8 @@ fn load_maps(
 /// unless `--phase-ensemble N` asks for more, and forced to 1 under sample
 /// batching, whose streaming output cannot hold N weight-sets.
 ///
-/// Until 2026-09-04 this path had no ensemble at all — not even the default
-/// intra-run one — so a whole-genome run was systematically worse than the same
-/// chromosomes imputed one at a time, for no reason the user could see.
+/// Using the same ensemble policy keeps whole-genome runs consistent with
+/// processing the chromosomes one at a time.
 fn resolve_ensemble_n(config: &MultiChrImputeConfig, n_samples: usize) -> usize {
     selphi::imputation::ensemble::resolve_members(
         n_samples, config.phase_ensemble, config.target_batch_size > 0,
@@ -574,7 +572,7 @@ pub fn run_multi_chr(
 
     // SELPHI_INTERP_CM: read once here (never in the per-tile loops); the
     // per-chr cumulative-cM array is built inside the chromosome loop.
-    // Default since 2026-09-05 (see the single-chr twin); SELPHI_INTERP_RANK=1 opts out.
+    // Default (see the single-chr twin); SELPHI_INTERP_RANK=1 opts out.
     let interp_cm_enabled = !selphi::config::is_one("SELPHI_INTERP_RANK");
     if interp_cm_enabled {
         selphi_debug!("Interpolating untyped sites in genetic distance (cM); SELPHI_INTERP_RANK=1 for variant rank");
@@ -769,8 +767,8 @@ pub fn run_multi_chr(
 
         // Pre-phasing passes, identical to the single-chr pipeline: the pedigree
         // scaffold (--ped) and haploid handling. The latter is NOT flag-gated —
-        // chrX males are auto-detected — so before 2026-09-04 a whole-genome run
-        // left every male chrX het standing.
+        // chrX males are auto-detected so whole-genome runs apply the same
+        // haploid genotype handling as single-chromosome runs.
         // Decided per chromosome on the records matching the panel, as the single-chr
         // path does (TargetMarker::unphased_het): unmatched records are written as given.
         let chr_key = chr_name.strip_prefix("chr").unwrap_or(chr_name);

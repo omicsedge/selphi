@@ -1303,8 +1303,7 @@ pub(crate) mod tests {
         let ac = vec![(n_sweep / 3) as u32; n_sites];
         let miss = vec![0u32; n_sites];
         let eval: Vec<bool> = (0..n_sites).map(|_| rng.chance(0.9)).collect();
-        // IBD2 tracks between target individuals (the production scan covers
-        // targets only); same-individual neighbours are always skipped.
+        // IBD2 tracks between target individuals (the scan covers targets only); same-individual neighbours are always skipped.
         let n_tind = n_target / 2;
         let mut ibd2 = crate::diploid::ibd2_tracks::Ibd2Tracks::new(n_tind.max(1));
         if n_tind >= 2 {

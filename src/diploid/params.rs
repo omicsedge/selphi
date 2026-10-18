@@ -8,7 +8,7 @@
 //! at 3.1/cM until the 1e6 cap binds from ~12.9k haplotypes upward, above which the
 //! rate decays as 1/n_haps as it always did. WGS-density targets (>=
 //! `SELPHI_AUTOROUTE_WGS_DENSITY` scaffold sites/Mb) keep the flat 1e6: the scaled
-//! ceiling cost 0.012-0.026 pp trio switch error there (2026-09-15). `SELPHI_PHASE_NE` /
+//! ceiling cost 0.012-0.026 pp trio switch error there. `SELPHI_PHASE_NE` /
 //! `SELPHI_PHASE_NE_PER_HAP` pin Ne outright. ed=0.0001, ee=0.9999.
 //! Transition probabilities precomputed from genetic distances.
 

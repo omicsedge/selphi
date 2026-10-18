@@ -492,7 +492,7 @@ fn expand_kept_matches(
 
 #[cfg(test)]
 mod reference {
-    //! `process_matches` as it was before the 2026-10-16 rewrite (inverted-index counts by a
+    //! Reference implementation of `process_matches` (inverted-index counts by a
     //! walk over each covered range, a binary search per selected entry, and the two sorts of
     //! the expansion), verbatim: the current one must reproduce it exactly.
     use super::{csc_to_csr, compute_normed_scores, compute_var_metrics, get_std, expand_match_range, mp_min_count};

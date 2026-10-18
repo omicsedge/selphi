@@ -1,6 +1,6 @@
 //! GLIMPSE2 phasing/imputation constants + parameter defaults
 //! (caller_parameters.cpp, conditioning_set.cpp). Values per the port blueprint;
-//! any marked TODO are re-confirmed against the C++ when their module is built.
+//! the constants below define the parameterization used by these modules.
 
 /// Number of founder lanes in the phasing HMM (`HAP_NUMBER`). Fixed at 8.
 pub const HAP_NUMBER: usize = 8;
@@ -53,7 +53,7 @@ impl LsParams {
     /// which is false in every normal run — so GLIMPSE2's shipped rate is
     /// `/n_ref` for BOTH its HMMs, and on a 4,478-haplotype panel with the
     /// default Ne = 100,000 ours is ~22x stickier.
-    /// A/B'd 2026-09-03 on the Table-6 rig (GIAB 1.8x chr22, 4,478-hap panel,
+    /// A/B comparison on the Table-6 benchmark (GIAB 1.8x chr22, 4,478-hap panel,
     /// six samples, paired): switching this to `/n_ref` moved variant-only R2 by
     /// +0.0003 (t = +1.44, 4/6) and the pooled ultra-rare bin by +0.0014 —
     /// within noise, so the deviation stays. Note `LCWGS_RECOMB_DENOM` (hmm.rs)

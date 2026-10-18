@@ -46,13 +46,12 @@
 //!   dosage[v] = prob_obs[1] / (prob_obs[0] + prob_obs[1])
 //!   ```
 //!
-//! # Performance notes (per `feedback_ultra_optimized`)
+//! # Performance notes
 //!
 //! - Thread-local Alpha/Beta scratch buffers (no per-call alloc).
 //! - f32 throughout (matches GLIMPSE2).
 //! - Precomputed `p_rec` and `emit` arrays before fwd-bwd (one-shot).
-//! - Scalar implementation in this commit; AVX-512/AVX2/NEON dispatch
-//!   added in a follow-up.
+//! - Scalar and AVX-512/AVX2/NEON dispatch paths.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -425,7 +424,7 @@ fn use_neon_lcwgs() -> bool {
 }
 
 /// Cached `LCWGS_TIMING` flag (gates the micro-profiling Instant calls so the
-/// production path has zero timing overhead).
+/// default path has zero timing overhead).
 fn hmm_timing() -> bool {
     use std::sync::OnceLock;
     static T: OnceLock<bool> = OnceLock::new();
@@ -442,7 +441,7 @@ fn lcwgs_loo() -> bool {
     *V.get_or_init(|| !crate::config::present("LCWGS_NO_EMIT_LOO"))
 }
 
-/// GL-adaptive emission (re-test on real soft-PL multi-coverage harness, 2026-06-08).
+/// GL-adaptive emission for soft-PL inputs across coverage levels.
 /// When `LCWGS_ADAPT_EMIT` is set, soften each per-hap likelihood toward flat
 /// (0.5/0.5) by a confidence weight `w = |h0-h1|^pow` BEFORE the HMM, so
 /// low-confidence (soft real-data, low-DP) reads lean on LD/copying while sharp
@@ -450,9 +449,9 @@ fn lcwgs_loo() -> bool {
 /// >1 = more aggressive softening of the moderate band, <1 = gentler). Returns
 /// > None (no-op → byte-identical) when unset. Applied once in
 /// > [`run_forward_backward`] so it flows through every SIMD path and the backward
-/// > fold-in consistently. Prior arc: a per-site-epsilon variant was a tradeoff on
-/// > an older HEAD (real +0.004-0.006 / sim −0.0028, UPDATE 33) before the joint
-/// > phaser became default; re-tested here on real soft GL where it helped.
+/// > fold-in consistently. A per-site-epsilon variant without the default joint
+/// > phaser trades real-data gains of +0.004-0.006 for a simulated-data change
+/// > of −0.0028. Softening improves the measured real soft-GL inputs.
 fn adapt_emit_pow() -> Option<f32> {
     use std::sync::OnceLock;
     static V: OnceLock<Option<f32>> = OnceLock::new();
@@ -750,7 +749,7 @@ pub fn run_forward_backward(
     let n_chk = n_var.div_ceil(chk_stride);
     // Scalar (non-AVX-512 fallback) path: local scratch is fine — this path runs
     // only on non-AVX-512 hosts / SELPHI_FORCE_SCALAR, where per-call alloc is not
-    // perf-critical. The production AVX-512 path uses thread-local scratch.
+    // perf-critical. The AVX-512 path uses thread-local scratch.
     let mut blk = vec![0.0f32; chk_stride * k]; // one recomputed forward block
     let mut fcol = vec![0.0f32; 2 * k];          // rolling forward prev/curr
 
@@ -1469,12 +1468,10 @@ unsafe fn run_fb_avx2(
 //
 // VALIDATION STATUS: compile-validated on aarch64 (intrinsics type-check via
 // `cargo check --target aarch64-unknown-linux-gnu`), but NOT runtime-validated
-// on ARM hardware (this is an x86 host). Like the AVX2/AVX-512 paths it is NOT
-// bit-identical to scalar (different f32 reduction width/order); it is expected
-// to be R²-EQUIVALENT. Before trusting it in production on Apple Silicon / AWS
-// Graviton, run the lcWGS R²-equivalence gate on real ARM (SELPHI_FORCE_SCALAR
-// vs NEON, mid+r12) exactly as AVX2 was gated on x86. The scalar fallback
-// (SELPHI_FORCE_SCALAR=1) is the safety net until that run happens.
+// on ARM hardware. Like the AVX2/AVX-512 paths it is NOT bit-identical to scalar
+// (different f32 reduction width/order); R²-equivalence is expected but not
+// established on ARM. Runtime validation compares SELPHI_FORCE_SCALAR vs NEON
+// on mid+r12 inputs. SELPHI_FORCE_SCALAR=1 selects the scalar fallback.
 // ===========================================================================
 
 /// `uint32x4_t` lane mask of 4 condbits (state offset `j`, within one 64-bit

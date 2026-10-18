@@ -559,9 +559,8 @@ type BufFile = BufWriter<std::fs::File>;
 /// BGZF compression workers for an output stream. Blocks are cut at fixed
 /// uncompressed sizes and each is deflated on its own, so the compressed bytes
 /// do not depend on this count (checked by `csi::tests::bgzf_bytes_do_not_depend_on_worker_count`);
-/// it was `4.min(n_samples)`, a single compression thread for the one-user runs
-/// production makes, and four for a 100-sample BCF whose deflate then bounded
-/// the whole output stage.
+/// `4.min(n_samples)` limits a single-sample run to one compression thread
+/// and a 100-sample BCF to four, making deflate the output-stage bottleneck.
 fn bgzf_worker_count() -> std::num::NonZeroUsize {
     std::num::NonZeroUsize::new(rayon::current_num_threads().max(1)).unwrap()
 }
@@ -1591,8 +1590,8 @@ pub fn write_window_multiformat(
         // Partition the window's TILES — not its intervals — into memory-bounded
         // batches. A tile is interpolated from the stripes that cover it and from
         // its interval's two anchor weight rows, nothing else, so a batch boundary
-        // inside an interval is exact. Batching by interval, as this did until
-        // 2026-09-06, let one interval become one batch however long it was: the
+        // inside an interval is exact. Batching by interval lets one interval
+        // become one batch regardless of its length: the
         // chip gap spanning the chr20 centromere against TOPMed is ~1M panel
         // variants = 993 stripes against a 96-stripe cap, and that single batch
         // held 5.6 GB of decompressed stripes, 1.5 GB of compressed preload and

@@ -10,18 +10,16 @@ pub fn median(sorted: &[f64]) -> f64 {
 
 /// Derive an output filename from a user-supplied `--out` base.
 ///
-/// `Path::with_extension` is the wrong tool here and was used throughout: it
-/// REPLACES whatever follows the last dot, so `--out panel.chr15` silently
-/// became `panel.vcf.gz` and `panel.srp`, dropping the chromosome tag. A user
-/// running one chromosome per directory then got "No such file or directory"
-/// from the next step, or worse, 22 chromosomes colliding on one filename.
-/// Reported from a production run, 2026-09-13.
+/// `Path::with_extension` REPLACES whatever follows the last dot, so applying it
+/// to `--out panel.chr15` produces `panel.vcf.gz` and `panel.srp`, dropping the
+/// chromosome tag. Preserving the tag prevents missing-file errors in downstream
+/// steps and prevents 22 chromosome outputs from colliding on one filename.
 ///
 /// The rule: a trailing dotted segment is an EXTENSION only if it is one of
 /// ours. Anything else is part of the name.
 ///
-///   panel.chr15   + "vcf.gz" -> panel.chr15.vcf.gz   (was panel.vcf.gz)
-///   panel.chr15   + "log"    -> panel.chr15.log      (was panel.log)
+///   panel.chr15   + "vcf.gz" -> panel.chr15.vcf.gz
+///   panel.chr15   + "log"    -> panel.chr15.log
 ///   panel         + "srp"    -> panel.srp
 ///   panel.vcf.gz  + "vcf.gz" -> panel.vcf.gz         (idempotent, no doubling)
 ///   panel.vcf     + "srp"    -> panel.srp            (a real extension IS replaced)

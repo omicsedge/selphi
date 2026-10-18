@@ -38,7 +38,7 @@
 //! - [`pipeline`] — orchestrator: SRP load → PL parse → PBWT → iterate
 //!   HMM → write outputs
 //!
-//! # Coverage regimes (per the deep-research synthesis, 2026-05-30)
+//! # Coverage regimes
 //!
 //! | Coverage | Use case            | Approach                |
 //! | -------- | ------------------- | ----------------------- |
@@ -65,7 +65,7 @@ pub mod dmm;
 pub mod pipeline;
 pub mod output;
 // Faithful GLIMPSE2 8-founder phasing HMM + its params — the per-iteration phaser
-// run by the production engine (default-on). Moved here from `crate::sparse_ls` so
+// run by the lcWGS engine (default-on). Shared with `crate::sparse_ls` so
 // `--lcwgs` is self-contained; the `--ls-exact` engine imports them back.
 pub mod ls_params;
 pub mod phasing_hmm;
@@ -158,7 +158,7 @@ impl Default for LcwgsParams {
         // Env overrides for tuning sweeps (LCWGS_<PARAM>) — via the central config accessors.
         use crate::config::{usize_or as envu, f32_or as envf};
         Self {
-            // Defaults retuned 2026-05-30 (selection-quality session). The key
+            // Selection parameters. The key
             // change vs the old d40/0.01cM/iter15 (full chr22 R² 0.893): run the
             // PBWT at fine 0.002 cM storage (low depth 16 is enough) AND run more
             // Gibbs iterations (25). On chr22 1x, FAIR per-variant R² vs GLIMPSE2
@@ -173,7 +173,7 @@ impl Default for LcwgsParams {
             kpbwt: envu("LCWGS_KPBWT", 2000),
             pbwt_modulo_cm: envf("LCWGS_PBWT_MODULO_CM", 0.002),
             pbwt_depth: envu("LCWGS_PBWT_DEPTH", 16),
-            // Retuned 2026-06-01 (accuracy session). Raised to 50/25 from 20/8:
+            // The 50/25 schedule improves on 20/8:
             // the diffuse-dose rare carriers need more Gibbs iterations to
             // converge/commit. The OVERALL gain from iter20→iter50 is broad-
             // spectrum, ALL MAF bins up, no regression — validated on the

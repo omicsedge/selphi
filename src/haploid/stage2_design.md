@@ -282,6 +282,5 @@ The 0.011-0.021 pp gap on trio SER is small in absolute terms but it leaves
 on the table Selphi haploid's "Beagle stage-1 port + opts" claim. The full
 Beagle 5.x equivalent (stage 1 + stage 2) is what Beagle ships as default,
 and Selphi's claim of being "Beagle-compatible plus better" requires that we
-include the same stages. Without stage-2 the audit memo from 2026-05-26
-saying "stage-2 immaterial on chip" is true but irrelevant for WGS input
-where stage-2 is precisely what closes the gap.
+include the same stages. Stage-2 has little effect on chip arrays, but closes
+the gap on WGS input.

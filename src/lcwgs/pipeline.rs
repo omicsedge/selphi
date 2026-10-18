@@ -17,9 +17,9 @@
 //! 7. Write VCF/BCF with GT (argmax from dose) + DS (dosage) + GP
 //! ```
 //!
-//! TODO post-MVP:
-//! - Streaming output (current MVP holds dosages in memory)
-//! - Phased GT output (currently emits unphased from dose argmax)
+//! Output behavior:
+//! - Dosages are held in memory before output.
+//! - GT is unphased and is derived from the dose argmax.
 
 use crate::genmap;
 use crate::io::target_io::intersect_variants;

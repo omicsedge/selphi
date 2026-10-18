@@ -100,9 +100,9 @@ pub trait RefPanelView {
 }
 
 /// Convenience blanket: a `(HaplotypeBitmatrix, …)`-backed concrete impl is the
-/// expected production shape, but to keep this module self-contained we expose a
+/// expected runtime shape, but to keep this module self-contained we expose a
 /// thin in-memory implementor (`InMemoryRefPanel`) for unit tests / Stage-3
-/// replay. Production wiring impls `RefPanelView` on the real `RefHapSet`
+/// replay. Runtime wiring impls `RefPanelView` on the real `RefHapSet`
 /// instead.
 pub struct InMemoryRefPanel<'a> {
     pub n_ref_haps: usize,
@@ -138,13 +138,13 @@ impl RefPanelView for InMemoryRefPanel<'_> {
     }
 }
 
-/// Production `RefPanelView`: bundles the `RefHaplotypeSet` with the
+/// `RefPanelView`: bundles the `RefHaplotypeSet` with the
 /// all-sites `ref_bm` panel (a [`HaplotypeBitmatrix`]). `RefHaplotypeSet` no
 /// longer stores the redundant common-site `HvarRef` bitmatrix, so `hvar_ref`
 /// is served from `ref_bm` via `common2tot` (the common-site index → absolute
 /// site index map). All other methods delegate to the `RefHaplotypeSet`.
 ///
-/// This is the production wiring: `cs.select(ind, stage, &RefPanelWithBm{hs, ref_bm}, tar, &map)`.
+/// This is the runtime wiring: `cs.select(ind, stage, &RefPanelWithBm{hs, ref_bm}, tar, &map)`.
 pub struct RefPanelWithBm<'a> {
     pub hs: &'a crate::sparse_ls::ref_haplotype_set::RefHaplotypeSet,
     pub ref_bm: &'a HaplotypeBitmatrix,
@@ -274,7 +274,7 @@ impl ConditioningSet {
     ///
     /// `n_tot_sites = map_g.len()`, `n_com_sites = common2tot.len()`.
     /// `lq_flag[l]` — NB by VALUE this stores "is HQ" (SNP && pos != prev_pos).
-    /// The downstream HMM treats `lq_flag` as "emission-skipped", so production
+    /// The downstream HMM treats `lq_flag` as "emission-skipped", so the
     /// `VariantMap.lq` must be populated with the matching per-variant value.
     ///
     /// `use_list` toggles the `nrho` denominator: with `use_list` it is

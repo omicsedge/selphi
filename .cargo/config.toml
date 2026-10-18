@@ -1,4 +1,4 @@
-# Portable production baseline (per target — `[build]` rustflags would leak
+# Portable baseline (per target — `[build]` rustflags would leak
 # `x86-64-v3` to aarch64 builds and fail).
 #
 # x86-64-v3 = Haswell (2013): AVX, AVX2, FMA, BMI1, BMI2, F16C, LZCNT, MOVBE,
