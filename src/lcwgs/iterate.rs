@@ -373,7 +373,7 @@ struct GibbsConfig {
     /// EXPERIMENT (`LCWGS_BURNIN_DIPLOID`, default off): run the Gauss-Seidel sweep +
     /// genotype-preserving DMM re-phase during BURN-IN too, not only MAIN, mirroring
     /// GLIMPSE2's unconditional per-iteration joint re-projection (caller_algorithm.cpp:
-    /// 61-71). Selphi gates both to `is_main`, leaving the ~25-iter burn-in as pure
+    /// 61-71). Selphi gates both to `is_main`, leaving the burn-in iterations (five by default) as
     /// parallel-Jacobi where the two haps can drain into the same allele (the verified
     /// het→hom soft-GL collapse). Running the joint step every iter mitigates
     /// it: an individual at 1× +0.0045 (gain in common bins), at a small −0.0004 on the

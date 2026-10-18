@@ -15,10 +15,10 @@ say(){ echo "[$(date -Is)] $*"; }
 SAMPLES="NA24143 NA24149 NA24385 NA24631 NA24694 NA24695"
 printf '%s\n' $(for s in $SAMPLES; do echo ${s}_chr22.bam; done) > $D/bams.txt
 
-say "Selphi n=1 (NA24143) with LCWGS_TIMING"
-LCWGS_TIMING=1 /usr/bin/time -v $S2 --lcwgs --bam NA24143_chr22.bam --reference $REF --refpanel s2_chr22_noleak.srp --map $MAP --out $D/sel_n1 --threads 16 > $D/sel_n1.log 2>&1
-say "Selphi n=6 --bam-list, default iterations (50/25), LCWGS_TIMING"
-LCWGS_TIMING=1 /usr/bin/time -v $S2 --lcwgs --bam-list $D/bams.txt --reference $REF --refpanel s2_chr22_noleak.srp --map $MAP --out $D/sel_n6 --threads 16 > $D/sel_n6.log 2>&1
+say "Selphi n=1 (NA24143) with LCWGS_TIMING, 50/25 iterations"
+LCWGS_N_ITER=50 LCWGS_N_MAIN=25 LCWGS_TIMING=1 /usr/bin/time -v $S2 --lcwgs --bam NA24143_chr22.bam --reference $REF --refpanel s2_chr22_noleak.srp --map $MAP --out $D/sel_n1 --threads 16 > $D/sel_n1.log 2>&1
+say "Selphi n=6 --bam-list, 50/25 iterations (the default when this record was made), LCWGS_TIMING"
+LCWGS_N_ITER=50 LCWGS_N_MAIN=25 LCWGS_TIMING=1 /usr/bin/time -v $S2 --lcwgs --bam-list $D/bams.txt --reference $REF --refpanel s2_chr22_noleak.srp --map $MAP --out $D/sel_n6 --threads 16 > $D/sel_n6.log 2>&1
 say "Selphi n=6, GLIMPSE2 iteration count (20 = 5 burn-in + 15 main)"
 LCWGS_N_ITER=20 LCWGS_N_MAIN=15 LCWGS_TIMING=1 /usr/bin/time -v $S2 --lcwgs --bam-list $D/bams.txt --reference $REF --refpanel s2_chr22_noleak.srp --map $MAP --out $D/sel_n6_it20 --threads 16 > $D/sel_n6_it20.log 2>&1
 say "GLIMPSE2 n=6 --bam-list, 16 chunks + ligate"
