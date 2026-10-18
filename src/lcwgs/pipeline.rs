@@ -693,13 +693,13 @@ fn run_chunked_gibbs(
 
         let chunk_n = buf_end - buf_start;
         // Slice gl3 + cm for the buffer window
-        let chunk_gl3: Vec<f32> = gl3_shared[buf_start * n_samples * 3 .. buf_end * n_samples * 3].to_vec();
-        let chunk_cm: Vec<f64> = cm[buf_start..buf_end].to_vec();
+        let chunk_gl3 = &gl3_shared[buf_start * n_samples * 3 .. buf_end * n_samples * 3];
+        let chunk_cm = &cm[buf_start..buf_end];
         // Extract the chunk's reference bitmatrix DIRECTLY from the SRP for the
         // buffer window's panel variants. This is the same path the standalone
         // pipeline uses, and keeps peak memory at K × chunk_size (the full-
         // chromosome ref bitmatrix is never materialized).
-        let chunk_wgs: Vec<usize> = wgs_idx[buf_start..buf_end].to_vec();
+        let chunk_wgs = &wgs_idx[buf_start..buf_end];
         let chunk_bm = srp.extract_ref_alleles_bitmatrix(&chunk_wgs);
 
         let mut out = run_gibbs_ensemble(&chunk_gl3, &chunk_bm, &chunk_cm, n_samples, params, None, chrwide_cond.as_ref());

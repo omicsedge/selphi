@@ -32,20 +32,10 @@
 //!   the inner rayon loop.
 
 use rayon::prelude::*;
-use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use crate::lcwgs::hmm::{pack_cond_rows, BasePack};
 
-thread_local! {
-    /// Shared-prefix conditioning pack of the sample being processed on this thread.
-    static TL_BASE: RefCell<BasePack> = const { RefCell::new(BasePack::new()) };
-    /// One haplotype's full conditioning pack (reused for h0 then h1).
-    static TL_HAPPACK: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
-    /// Union of the two haplotypes' site axes (rows of the base pack).
-    static TL_UNION: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
-}
-/// Per-worker small buffers only. The K-wide phaser snapshots are released
-/// after each sample, before this worker can become idle at an iteration barrier.
+/// Call-owned scratch is released before a sample task becomes idle.
 #[derive(Default)]
 struct SampleScratch {
     split0: PolySplit,
@@ -59,14 +49,6 @@ struct SampleScratch {
 
 #[derive(Default)]
 struct HapScratch { hl: Vec<f32>, cm: Vec<f64>, rmult: Vec<f32> }
-
-thread_local! {
-    static TL_SAMPLE: RefCell<SampleScratch> = RefCell::new(SampleScratch::default());
-    static TL_HL: RefCell<HapScratch> = RefCell::new(HapScratch::default());
-    // lcWGS always uses default emission errors; rephase sets Ne per call.
-    static TL_PHASE: RefCell<crate::lcwgs::phasing_hmm::PhasingHmm> = RefCell::new(
-        crate::lcwgs::phasing_hmm::PhasingHmm::new(&crate::lcwgs::ls_params::LsParams::default()));
-}
 
 /// Time spent in the fused per-sample re-phasing, SUMMED over threads
 /// (`LCWGS_TIMING` only) — the phase now runs inside the parallel per-sample
@@ -204,15 +186,6 @@ fn conditional_hl(a: f32, b: f32, mg: f32) -> [f32; 2] {
     } else { [0.5, 0.5] }
 }
 
-fn precompute_partner_hl(gl3: &[f32], n_samples: usize, n_var: usize, mg: f32) -> Vec<Vec<[[f32; 2]; 2]>> {
-    (0..n_samples).into_par_iter().map(|s| {
-        (0..n_var).map(|v| {
-            let g = &gl3[(v * n_samples + s) * 3..][..3];
-            [conditional_hl(g[0], g[1], mg), conditional_hl(g[1], g[2], mg)]
-        }).collect()
-    }).collect()
-}
-
 /// One target haplotype's HMM pass: build the conditional per-site emission
 /// likelihood (each site's HL conditioned on the partner hap's allele at that
 /// site, via `partner_at`), run the GL-weighted forward-backward over `cond`,
@@ -223,7 +196,7 @@ fn run_one_hap<F: Fn(usize) -> usize>(
     h: usize, it: usize, seed: u64,
     partner_at: F,
     cond: &[u32],
-    partner_hl: &[[[f32; 2]; 2]], ref_bm: &HaplotypeBitmatrix, cm: &[f64], params: &LcwgsParams,
+    gl3: &[f32], n_samples: usize, ref_bm: &HaplotypeBitmatrix, cm: &[f64], params: &LcwgsParams,
     use_scaffold: bool, common_idx: &[usize],
     n_var: usize,
     // POLY/MONO SKIP (LCWGS_POLY_SKIP). `Some((split, is_common))` ⇒ run the
@@ -246,10 +219,13 @@ fn run_one_hap<F: Fn(usize) -> usize>(
     // haplotypes of a sample share their prefix pack. None ⇒ the kernel packs.
     prepack: Option<&[u64]>,
 ) -> (Vec<f32>, Vec<u8>) {
-    let hl_at = |v: usize| partner_hl[v][partner_at(v)];
-    let dose = TL_HL.with(|cell| {
-        let mut scratch = cell.borrow_mut();
-        let HapScratch { hl, cm: cm_poly, rmult } = &mut *scratch;
+    let hl_at = |v: usize| {
+        let g = (v * n_samples + h / 2) * 3 + partner_at(v);
+        conditional_hl(gl3[g], gl3[g + 1], params.min_gl)
+    };
+    let dose = {
+        let mut scratch = HapScratch::default();
+        let HapScratch { hl, cm: cm_poly, rmult } = &mut scratch;
         hl.clear(); cm_poly.clear(); rmult.clear();
         if cond.is_empty() {
             // No conditioning haplotype at all: the copying model has nothing to copy
@@ -329,7 +305,7 @@ fn run_one_hap<F: Fn(usize) -> usize>(
             hl.extend((0..n_var).flat_map(hl_at));
             run_forward_backward(hl, cond, ref_bm, cm, params, full_axis_rmult, None, prepack).dosage
         }
-    });
+    };
     // Sample a fresh allele per site from the posterior dose (deterministic
     // splitmix64 stream keyed by seed/iteration/hap/variant → reproducible).
     let mut sampled = vec![0u8; n_var];
@@ -666,10 +642,6 @@ pub fn run_gibbs(
         (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let mut max_k = 0usize;
 
-    // Each site has only two possible partner-conditioned emission pairs.
-    // Preserve the original arithmetic and clamp order, once per chunk/sample.
-    let partner_hl = precompute_partner_hl(gl3, n_samples, n_var, params.min_gl);
-
     // Loop-invariant phasing-HMM inputs (constant across all iterations): poly =
     // every site, no monomorphic, no low-qual. Built once (only when the faithful
     // phaser is active) instead of reallocating n_var-length Vecs every iteration.
@@ -869,9 +841,9 @@ pub fn run_gibbs(
         // the task is parallel over samples in both the GS and Jacobi sweeps.
         let t0 = if timing { Some(std::time::Instant::now()) } else { None };
         let ic_all: &[bool] = poly_skip_arg.map_or(&[], |(ic, _)| ic);
-        let per_sample: Vec<[(usize, Vec<f32>, Vec<u8>); 2]> = (0..n_samples).into_par_iter().map(|s| TL_SAMPLE.with(|cell| {
-            let mut scratch = cell.borrow_mut();
-            let SampleScratch { split0: buf0, split1: buf1, h0, h1, ps, ms, cond_union } = &mut *scratch;
+        let per_sample: Vec<[(usize, Vec<f32>, Vec<u8>); 2]> = (0..n_samples).into_par_iter().map(|s| {
+            let mut scratch = SampleScratch::default();
+            let SampleScratch { split0: buf0, split1: buf1, h0, h1, ps, ms, cond_union } = &mut scratch;
             let (h0i, h1i) = (2 * s, 2 * s + 1);
             let (c0, c1): (&[u32], &[u32]) = (&cond_per_hap[h0i], &cond_per_hap[h1i]);
             // Packing applies to the (compacted or full-axis) FB only: the scaffold
@@ -882,10 +854,10 @@ pub fn run_gibbs(
             let split1 = poly_skip_arg.filter(|_| share).map(|(ic, sr)| { poly_split_into(c1, ic, sr, n_var, buf1); &*buf1 });
             if let Some(t) = ts { SPLIT_NS.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed); }
             let b = if share { c0.iter().zip(c1.iter()).take_while(|(x, y)| x == y).count() } else { 0 };
-            TL_BASE.with(|cb| TL_HAPPACK.with(|ch| TL_UNION.with(|cu| {
-                let mut base = cb.borrow_mut();
-                let mut hp = ch.borrow_mut();
-                let mut un = cu.borrow_mut();
+            {
+                let mut base = BasePack::new();
+                let mut hp = Vec::new();
+                let mut un = Vec::new();
                 if share && b > 0 {
                     un.clear();
                     match (&split0, &split1) {
@@ -911,35 +883,24 @@ pub fn run_gibbs(
                 let (d0, mut samp0) = run_one_hap(
                     h0i, it, seed,
                     |v| prev_alleles[v * n_target_haps + h1i] as usize,
-                    c0, &partner_hl[s], ref_bm, cm, params,
+                    c0, gl3, n_samples, ref_bm, cm, params,
                     use_scaffold, &common_idx, n_var,
                     split0.map(|x| (x, ic_all, ps_mono_alt.as_slice())),
                     full_axis_rmult.as_deref(),
                     if packed0 { Some(hp.as_slice()) } else { None });
-                // Keep FB0's complete pack in place of the prefix pack, never
-                // beside it. Its allocation must fit the old retained allocation
-                // so the phaser's large snapshots do not gain another live pack.
-                // Rich conditioning keeps the original prefix/row-assembly path.
-                let phase_pack = fuse_phase && !rich_cond && packed0 && b > 0
-                    && hp.capacity() <= base.words.capacity();
-                if phase_pack {
-                    base.adopt_hap_pack(&mut hp, c0.len(), split0.map(|sp| sp.poly.as_slice()));
-                }
                 let packed1 = pack_for(c1, split1, &base, &mut hp);
                 let (d1, mut samp1) = run_one_hap(
                     h1i, it, seed,
                     |v| if gs { samp0[v] as usize } else { prev_alleles[v * n_target_haps + h0i] as usize },
-                    c1, &partner_hl[s], ref_bm, cm, params,
+                    c1, gl3, n_samples, ref_bm, cm, params,
                     use_scaffold, &common_idx, n_var,
                     split1.map(|x| (x, ic_all, ps_mono_alt.as_slice())),
                     full_axis_rmult.as_deref(),
                     if packed1 { Some(hp.as_slice()) } else { None });
 
                 if fuse_phase {
-                    // FB1's pack is dead. Only the retained base storage (now
-                    // FB0's complete rows when they fit) lives beside snapshots.
-                    *hp = Vec::new();
-                    if phase_pack { base.b = c0.len(); }
+                    // The full haplotype pack is dead before the K-wide snapshots.
+                    drop(hp);
                     let tp = if timing { Some(std::time::Instant::now()) } else { None };
                     h0.clear(); h0.extend(samp0.iter().map(|&a| a == 1));
                     h1.clear(); h1.extend(samp1.iter().map(|&a| a == 1));
@@ -986,13 +947,13 @@ pub fn run_gibbs(
                     };
                     // The phaser's conditioning set starts with c0 in both modes, so the
                     // sample's prefix pack applies to it as well.
-                    let phase_base = if share && b > 0 { Some(&*base) } else { None };
+                    let phase_base = if share && b > 0 { Some(&base) } else { None };
                     // A rich union removes duplicates; retain the original
                     // prefix validation before borrowing its conditioning rows.
                     let phase_base = phase_base.filter(|bp| cond_haps.len() >= bp.b
                         && cond_haps[..bp.b] == c0[..bp.b]);
-                    TL_PHASE.with(|phase| {
-                        let mut hmm = phase.borrow_mut();
+                    {
+                        let mut hmm = crate::lcwgs::phasing_hmm::PhasingHmm::new(&g2p);
                         hmm.rephase(h0, h1, flat, cond_haps, ref_bm, cm, &g2p,
                                     poly_ref, mono_ref, &lq, &mut rng_u01, phase_base);
                         for v in 0..n_var { samp0[v] = h0[v] as u8; samp1[v] = h1[v] as u8; }
@@ -1005,12 +966,11 @@ pub fn run_gibbs(
                             phase_shape[3].fetch_add(nm as u64, AtomicOrdering::Relaxed);
                             phase_shape[4].fetch_max(((ns + nm) * k * 8 * 4) as u64, AtomicOrdering::Relaxed);
                         }
-                        hmm.release_snapshots();
-                    });
+                    }
                 }
                 [(h0i, d0, samp0), (h1i, d1, samp1)]
-            })))
-        })).collect();
+            }
+        }).collect();
         let results: Vec<(usize, Vec<f32>, Vec<u8>)> = per_sample.into_iter().flatten().collect();
         if let Some(t) = t0 { t_hmm += t.elapsed().as_secs_f64(); }
         if timing { t_phase += PHASE_NS.swap(0, AtomicOrdering::Relaxed) as f64 / 1e9; }
@@ -1455,7 +1415,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cached_partner_likelihoods_match_original_hap_pass() {
+    fn compact_partner_likelihoods_match_original_hap_pass() {
         use crate::lcwgs::hmm::reference_pack as rp;
         let mut rng = rp::Xs(0xA54F_F53A_5F1D_36F1);
         let (nh, ns) = (137, 3);
@@ -1471,7 +1431,6 @@ mod tests {
             for mg in [0.0, 0.001, 0.01, 0.5] {
                 let mut params = LcwgsParams::default();
                 params.min_gl = mg;
-                let table = precompute_partner_hl(&gl3, ns, n, mg);
                 for s in 0..ns {
                     let partner: Vec<usize> = (0..n).map(|_| rng.below(2) as usize).collect();
                     for k in [0, 1, 7, 63, 64, 65, 137] {
@@ -1482,7 +1441,7 @@ mod tests {
                             let old = run_one_hap_reference(2 * s, s, 4, 123, |v| partner[v], &cond,
                                 &gl3, &bm, &cm, &params, mode == 2, &common, n, ns, poly, None, None);
                             let new = run_one_hap(2 * s, 4, 123, |v| partner[v], &cond,
-                                &table[s], &bm, &cm, &params, mode == 2, &common, n, poly, None, None);
+                                &gl3, ns, &bm, &cm, &params, mode == 2, &common, n, poly, None, None);
                             assert_eq!(new.0.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                                 old.0.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                                 "n={n} k={k} sample={s} mode={mode} floor={mg}");

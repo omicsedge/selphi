@@ -1737,14 +1737,14 @@ impl PhasingHmm {
         // reads it and sets their lengths only once all of them are written (see
         // the checks there). Only capacity is reserved here.
         self.phasing_prob.clear();
-        self.phasing_prob.reserve(self.n_segs * k * HAP_NUMBER);
+        self.phasing_prob.reserve_exact(self.n_segs * k * HAP_NUMBER);
         self.phasing_prob_sum.clear();
         self.phasing_prob_sum.resize(self.n_segs * HAP_NUMBER, 0.0);
         self.phasing_prob_sum_sum.clear();
         self.phasing_prob_sum_sum.resize(self.n_segs, 0.0);
 
         self.impute_prob.clear();
-        self.impute_prob.reserve(self.n_miss * k * HAP_NUMBER);
+        self.impute_prob.reserve_exact(self.n_miss * k * HAP_NUMBER);
         self.impute_prob_sum.clear();
         self.impute_prob_sum.resize(self.n_miss * HAP_NUMBER, 0.0);
         self.impute_prob_sum_sum.clear();
@@ -2010,6 +2010,7 @@ impl PhasingHmm {
         self.reallocate(h0, h1, flat, poly_sites, lq);
         if self.var_typ.is_empty() {
             // No polymorphic het/hom sites in scope: still shuffle hets at monos.
+            self.release_snapshots();
             self.shuffle_monomorphic_hets(h0, h1, mono_sites, rng_u01);
             self.base_pack = std::ptr::null();
             self.condrow = std::ptr::null();
@@ -2034,6 +2035,8 @@ impl PhasingHmm {
 
         // forward (fills dip_sampled[seg+1] + imputeProbOf1s).
         self.forward(ref_bm, cond_haps, cm, mism, rng_u01);
+        // Relayout uses sampled diplotypes and allele marginals, not K-wide states.
+        self.release_snapshots();
 
         // Re-lay H0/H1 at PEAK_HET and FLAT_HET sites.
         self.curr_segment_index = 0;
@@ -2181,7 +2184,6 @@ mod tests {
                 (a, b, count, bits(&hmm.phasing_prob), bits(&hmm.impute_prob), bits(&hmm.impute_prob_of_1s))
             };
             assert_eq!(run(&mut reused), run(&mut fresh), "n={n} k={k}");
-            reused.release_snapshots();
             assert_eq!(reused.phasing_prob.capacity(), 0);
             assert_eq!(reused.impute_prob.capacity(), 0);
         }

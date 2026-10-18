@@ -4,6 +4,14 @@
 
 use std::cell::RefCell;
 
+pub(crate) const CACHE_BYTES_PER_WORKER: usize = 64 * 1024;
+
+pub(crate) fn trim_vec<T>(v: &mut Vec<T>, limit: usize) {
+    if v.capacity().saturating_mul(std::mem::size_of::<T>()) > limit {
+        *v = Vec::new();
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Membership {
     words: Vec<u64>,
@@ -11,7 +19,10 @@ pub(crate) struct Membership {
 
 impl Membership {
     fn reset(&mut self, n: usize) {
-        self.words.resize(n.div_ceil(64), 0);
+        let need = n.div_ceil(64);
+        self.words.clear();
+        self.words.reserve_exact(need);
+        self.words.resize(need, 0);
         self.words.fill(0);
     }
 
@@ -46,9 +57,13 @@ thread_local! {
 
 pub(crate) fn with_membership<R>(n: usize, f: impl FnOnce(&mut Membership) -> R) -> R {
     MEMBERSHIP.with(|scratch| {
-        let mut bits = scratch.borrow_mut();
+        // Move ownership out before calling code that could reenter this worker.
+        let mut bits = std::mem::take(&mut *scratch.borrow_mut());
         bits.reset(n);
-        f(&mut bits)
+        let result = f(&mut bits);
+        trim_vec(&mut bits.words, CACHE_BYTES_PER_WORKER);
+        *scratch.borrow_mut() = bits;
+        result
     })
 }
 
@@ -78,6 +93,16 @@ pub(crate) fn ordered_or_sorted_union(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_membership_does_not_remain_on_idle_worker() {
+        with_membership(CACHE_BYTES_PER_WORKER * 16, |bits| {
+            bits.insert(CACHE_BYTES_PER_WORKER * 16 - 1);
+        });
+        MEMBERSHIP.with(|c| assert_eq!(c.borrow().words.capacity(), 0));
+        with_membership(65, |bits| { assert!(!bits.contains(64)); bits.insert(64); });
+        MEMBERSHIP.with(|c| assert!(c.borrow().words.capacity() * 8 <= CACHE_BYTES_PER_WORKER));
+    }
 
     #[test]
     fn unions_match_old_dedup_and_truncation() {

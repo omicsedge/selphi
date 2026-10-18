@@ -90,6 +90,21 @@ thread_local! {
     static TL_CONDBITS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Each of the eight worker caches retains at most this many bytes. Larger
+/// working buffers are returned after the kernel, including on unwinding.
+pub(crate) const CACHE_BUFFER_BYTES: usize = 1024 * 1024;
+pub(crate) const CACHE_BYTES_PER_WORKER: usize = 8 * CACHE_BUFFER_BYTES;
+
+struct TrimCaches;
+impl Drop for TrimCaches {
+    fn drop(&mut self) {
+        for key in [&TL_ALPHA, &TL_BETA, &TL_ALPHA_SUM, &TL_EMIT, &TL_PREC, &TL_BLK, &TL_FCOL] {
+            key.with(|c| super::membership::trim_vec(&mut c.borrow_mut(), CACHE_BUFFER_BYTES));
+        }
+        TL_CONDBITS.with(|c| super::membership::trim_vec(&mut c.borrow_mut(), CACHE_BUFFER_BYTES));
+    }
+}
+
 /// Conditioning-bitmatrix pack shared by the two haplotypes of one sample and
 /// by its phasing pass.
 ///
@@ -127,6 +142,7 @@ impl BasePack {
     /// storage for FB1. Its first `b` states remain a valid shared prefix, even
     /// when the complete row has a different stride. Missing FB1 sites gather
     /// directly. The caller checks the retained pack fits the old memory budget.
+    #[cfg(test)]
     pub fn adopt_hap_pack(&mut self, words: &mut Vec<u64>, k: usize, sites: Option<&[usize]>) {
         std::mem::swap(&mut self.words, words);
         self.wb = k.div_ceil(64);
@@ -154,7 +170,7 @@ impl BasePack {
         // `wb` words, the last one zero-padded), so the buffer is not zero-filled.
         let total = sites_abs.len() * self.wb;
         self.words.clear();
-        self.words.reserve(total);
+        self.words.reserve_exact(total);
         if self.b > 0 {
             build_gather_plan(base, &mut self.plan);
             let wp = self.words.as_mut_ptr();
@@ -343,7 +359,7 @@ pub fn pack_cond_rows(
     // Every word of every row is written below, so `out` is not zero-filled.
     let total = n_var * w64;
     out.clear();
-    out.reserve(total);
+    out.reserve_exact(total);
     let base = base.filter(|bp| bp.b > 0 && bp.b <= k);
     if w64 > 0 {
         let mut tail_plan: Vec<GatherWord> = Vec::new();
@@ -691,6 +707,7 @@ pub fn run_forward_backward(
     // themselves; the scalar path always reads the panel directly.
     prepack: Option<&[u64]>,
 ) -> HmmOutput {
+    let _trim = TrimCaches;
     let n_var = cm.len();
     let k = cond_haps.len();
     assert_eq!(hl.len(), n_var * 2, "hl must be n_var * 2 f32");
@@ -789,9 +806,9 @@ pub fn run_forward_backward(
         // Size scratch WITHOUT zero-fill (every used element written before read).
         let need_chk = n_chk * k;
         let (lchk, ls, lb) = (chk.len(), alpha_sum.len(), beta.len());
-        if lchk < need_chk { chk.reserve(need_chk - lchk); }
-        if ls < n_var { alpha_sum.reserve(n_var - ls); }
-        if lb < k { beta.reserve(k - lb); }
+        if lchk < need_chk { chk.reserve_exact(need_chk - lchk); }
+        if ls < n_var { alpha_sum.reserve_exact(n_var - ls); }
+        if lb < k { beta.reserve_exact(k - lb); }
         // SAFETY: capacities reserved above; f32 is Copy/no-Drop; every element is
         // written before read (forward fills all sums + checkpoints; beta init
         // fills all k; recompute fills each block before the backward reads it).
@@ -936,7 +953,7 @@ fn tl_scratch_ptr(cell: &'static std::thread::LocalKey<RefCell<Vec<f32>>>, need:
     cell.with(|c| {
         let mut b = c.borrow_mut();
         let len = b.len();
-        if len < need { b.reserve(need - len); }
+        if len < need { b.reserve_exact(need - len); }
         // SAFETY: capacity reserved; f32 is Copy/no-Drop; written before read.
         unsafe { b.set_len(need); }
         b.as_mut_ptr()
@@ -1143,9 +1160,9 @@ unsafe fn run_fb_avx512(
         let n_chk = n_var.div_ceil(chk_stride);
         let need_chk = n_chk * k;
         let (la, ls, lb) = (alpha.len(), alpha_sum.len(), beta.len());
-        if la < need_chk { alpha.reserve(need_chk - la); }
-        if ls < n_var { alpha_sum.reserve(n_var - ls); }
-        if lb < k { beta.reserve(k - lb); }
+        if la < need_chk { alpha.reserve_exact(need_chk - la); }
+        if ls < n_var { alpha_sum.reserve_exact(n_var - ls); }
+        if lb < k { beta.reserve_exact(k - lb); }
         alpha.set_len(need_chk); alpha_sum.set_len(n_var); beta.set_len(k);
         let chkp = alpha.as_mut_ptr();  // checkpoint columns: n_chk × k
         let bp = beta.as_mut_ptr();
@@ -1360,9 +1377,9 @@ unsafe fn run_fb_avx2(
         let n_chk = n_var.div_ceil(chk_stride);
         let need_chk = n_chk * k;
         let (la, ls, lb) = (alpha.len(), alpha_sum.len(), beta.len());
-        if la < need_chk { alpha.reserve(need_chk - la); }
-        if ls < n_var { alpha_sum.reserve(n_var - ls); }
-        if lb < k { beta.reserve(k - lb); }
+        if la < need_chk { alpha.reserve_exact(need_chk - la); }
+        if ls < n_var { alpha_sum.reserve_exact(n_var - ls); }
+        if lb < k { beta.reserve_exact(k - lb); }
         alpha.set_len(need_chk); alpha_sum.set_len(n_var); beta.set_len(k);
         let chkp = alpha.as_mut_ptr();
         let bp = beta.as_mut_ptr();
@@ -1625,9 +1642,9 @@ unsafe fn run_fb_neon(
         let n_chk = n_var.div_ceil(chk_stride);
         let need_chk = n_chk * k;
         let (la, ls, lb) = (alpha.len(), alpha_sum.len(), beta.len());
-        if la < need_chk { alpha.reserve(need_chk - la); }
-        if ls < n_var { alpha_sum.reserve(n_var - ls); }
-        if lb < k { beta.reserve(k - lb); }
+        if la < need_chk { alpha.reserve_exact(need_chk - la); }
+        if ls < n_var { alpha_sum.reserve_exact(n_var - ls); }
+        if lb < k { beta.reserve_exact(k - lb); }
         alpha.set_len(need_chk); alpha_sum.set_len(n_var); beta.set_len(k);
         let chkp = alpha.as_mut_ptr();
         let bp = beta.as_mut_ptr();
@@ -2140,6 +2157,16 @@ mod tests {
     use super::*;
 
     #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn worker_cache_allowance_bounds_retained_capacity() {
+        TL_ALPHA.with(|c| c.borrow_mut().resize(CACHE_BUFFER_BYTES / 4 + 1, 0.0));
+        TL_CONDBITS.with(|c| c.borrow_mut().resize(CACHE_BUFFER_BYTES / 8 + 1, 0));
+        drop(TrimCaches);
+        TL_ALPHA.with(|c| assert_eq!(c.borrow().capacity(), 0));
+        TL_CONDBITS.with(|c| assert_eq!(c.borrow().capacity(), 0));
+        assert_eq!(CACHE_BYTES_PER_WORKER, 8 * CACHE_BUFFER_BYTES);
+    }
+
     #[test]
     fn rolling_swap_matches_copy_for_each_simd_backend() {
         use reference_pack as rp;
