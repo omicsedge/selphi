@@ -6,11 +6,11 @@
 //!     selected haps, producing per-hap dosages
 //!  3. Re-derive MAP genotypes from the new dosages
 //!
-//! Default schedule: 50 iterations total (`LCWGS_N_ITER`), with the last 25
-//! ("main", `LCWGS_N_MAIN`) averaged into the final output. The first 25
+//! Default schedule: 30 iterations total (`LCWGS_N_ITER`), with the last 25
+//! ("main", `LCWGS_N_MAIN`) averaged into the final output. The first 5
 //! ("burn-in") refine the conditioning set without contributing to the saved
-//! dosages. (Raised from GLIMPSE2's 20/15 to 50/25 — a measured broad-spectrum
-//! +0.0017 OVERALL / +0.0026 on the 0.5-1% rare bin; convergence plateaus ~50.)
+//! dosages. Averaging over 25 main iterations matters for rare carriers; a
+//! longer burn-in (50/25) was slower and no more accurate on real-depth data.
 //!
 //! # Why iterate
 //!

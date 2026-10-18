@@ -34,7 +34,7 @@
 //! - [`pbwt_select`] — sparse PBWT haplotype selection from MAP genotypes
 //!   (argmax-from-GL) at common sites only, default `Kpbwt = 2000`
 //! - [`iterate`] — Gibbs alternating haploid imputation and phasing
-//!   (default 50 iterations, last 25 "main"), refining the conditioning set each round
+//!   (default 30 iterations, last 25 "main"), refining the conditioning set each round
 //! - [`pipeline`] — orchestrator: SRP load → PL parse → PBWT → iterate
 //!   HMM → write outputs
 //!
@@ -173,16 +173,19 @@ impl Default for LcwgsParams {
             kpbwt: envu("LCWGS_KPBWT", 2000),
             pbwt_modulo_cm: envf("LCWGS_PBWT_MODULO_CM", 0.002),
             pbwt_depth: envu("LCWGS_PBWT_DEPTH", 16),
-            // The 50/25 schedule improves on 20/8:
-            // the diffuse-dose rare carriers need more Gibbs iterations to
-            // converge/commit. The OVERALL gain from iter20→iter50 is broad-
-            // spectrum, ALL MAF bins up, no regression — validated on the
-            // canonical full-chr22 326K benchmark (iter50 + core4): OVERALL
-            // 0.9051→0.9068 (+0.0017), 0.5-1% +0.0026, and now BEATS GLIMPSE2 on
-            // the 5-10% bin (0.9326 vs 0.9319). Convergence plateaus at ~50
-            // (iter80 == iter50). Cost ~2.5× wall. Restore the fast 20/8 with
-            // LCWGS_N_ITER=20 LCWGS_N_MAIN=8 (the earlier speed-tuned default).
-            n_iterations: envu("LCWGS_N_ITER", 50),
+            // Schedule 30/25: 5 burn-in iterations, then 25 main iterations whose
+            // posteriors are averaged. Averaging over 25 main iterations is what
+            // the rare carriers need (20/8 lost accuracy at every frequency); a
+            // long burn-in does not help. Against 50/25 (25 burn-in), paired over
+            // three seeds: six ~1.8x GIAB genomes (whole chr22) ultra-rare R2
+            // +0.0013 and 0.1-0.5% +0.0009 (all seeds), common bins +0.0001;
+            // six capture libraries equal within seed noise in non-reference
+            // concordance, heterozygote recall and precision; 0.5x/2x downsampled
+            // ultra-rare +0.0015/+0.0022; the only consistent loss is -0.0001 in
+            // the 10-50% bin at 1x. Wall time -39% on the real-depth benchmarks,
+            // memory unchanged. LCWGS_N_ITER=50 restores the previous schedule;
+            // 20/15 (GLIMPSE2's) loses 0.0005 on truth-variant R2 at ~1.8x.
+            n_iterations: envu("LCWGS_N_ITER", 30),
             n_main_iterations: envu("LCWGS_N_MAIN", 25),
             ne: envf("LCWGS_NE", 100_000.0),
             rare_maf: 0.001,
