@@ -25,3 +25,9 @@ HG004*
 # Internal working notes: kept locally, never pushed (the repository is public)
 /docs/engineering/
 /paper/internal_notes/
+
+# Local run bundles and panel-distribution helpers (contain internal bucket names / large data)
+/examples/*.tar.gz
+/examples/manifest.tsv
+/examples/presign_panel.sh
+/examples/panel_urls.txt
