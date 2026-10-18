@@ -60,20 +60,15 @@ struct PolySplit { poly: Vec<usize>, mono: Vec<usize> }
 
 /// GLIMPSE2 `conditioning_set::compactSelection` analogue for one conditioning set.
 fn poly_split(cond: &[u32], is_common: &[bool], shap_ref: &[Vec<u32>], n_var: usize) -> PolySplit {
-    let mut carried: Vec<u32> = Vec::new();
-    for &c in cond { carried.extend_from_slice(&shap_ref[c as usize]); }
-    carried.sort_unstable();
-    carried.dedup();
-    let mut poly = Vec::with_capacity(n_var);
-    let mut mono = Vec::new();
-    let mut ci = 0usize;
-    for v in 0..n_var {
-        let v32 = v as u32;
-        while ci < carried.len() && carried[ci] < v32 { ci += 1; }
-        let carried_v = ci < carried.len() && carried[ci] == v32;
-        if is_common[v] || carried_v { poly.push(v); } else { mono.push(v); }
-    }
-    PolySplit { poly, mono }
+    super::membership::with_membership(n_var, |carried| {
+        for &c in cond { for &v in &shap_ref[c as usize] { carried.insert(v as usize); } }
+        let mut poly = Vec::with_capacity(n_var);
+        let mut mono = Vec::new();
+        for v in 0..n_var {
+            if is_common[v] || carried.contains(v) { poly.push(v); } else { mono.push(v); }
+        }
+        PolySplit { poly, mono }
+    })
 }
 
 /// The phaser's per-individual poly/mono lists: `poly` = every common site and
@@ -85,24 +80,16 @@ fn phaser_split(
     cond_haps: &[u32], is_common: &[bool], shap_ref: &[Vec<u32>],
     h0: &[bool], h1: &[bool], n_var: usize,
 ) -> (Vec<i32>, Vec<i32>) {
-    let mut carried: Vec<u32> = Vec::new();
-    for &h in cond_haps { carried.extend_from_slice(&shap_ref[h as usize]); }
-    carried.sort_unstable();
-    carried.dedup();
-    let mut ps_v: Vec<i32> = Vec::new();
-    let mut ms_v: Vec<i32> = Vec::new();
-    let mut ci = 0usize;
-    for v in 0..n_var {
-        let v32 = v as u32;
-        while ci < carried.len() && carried[ci] < v32 { ci += 1; }
-        let carried_v = ci < carried.len() && carried[ci] == v32;
-        if is_common[v] || carried_v {
-            ps_v.push(v as i32);
-        } else if h0[v] != h1[v] {
-            ms_v.push(v as i32);
+    super::membership::with_membership(n_var, |carried| {
+        for &c in cond_haps { for &v in &shap_ref[c as usize] { carried.insert(v as usize); } }
+        let mut ps_v = Vec::new();
+        let mut ms_v = Vec::new();
+        for v in 0..n_var {
+            if is_common[v] || carried.contains(v) { ps_v.push(v as i32); }
+            else if h0[v] != h1[v] { ms_v.push(v as i32); }
         }
-    }
-    (ps_v, ms_v)
+        (ps_v, ms_v)
+    })
 }
 
 /// [`phaser_split`] from the conditioning set's [`poly_split`] (same
@@ -764,26 +751,15 @@ pub fn run_gibbs(
             // sampled alleles, and the carriers are appended in `rare_sites` order,
             // so the result is byte-identical to the former serial site-major loop
             // (which was O(n_rare × n_haps) on one core, every iteration).
-            let mut aug = base_cond.clone();
-            let hap_alleles_ro: &[u8] = &hap_alleles;
-            let rare_sites_ro = &rare_sites;
-            aug.par_iter_mut().enumerate().for_each(|(h, c)| {
-                for (v, minor_allele, carriers) in rare_sites_ro.iter() {
-                    // Augment a target hap currently sampled as this site's MINOR
-                    // (rare) allele with that allele's panel carriers.
-                    if hap_alleles_ro[v * n_target_haps + h] == *minor_allele { c.extend_from_slice(carriers); }
-                }
-                if let Some(kmax) = k_max {
-                    // Priority-preserving dedup + cap: base (IBD-ranked) stays ahead of
-                    // appended carriers; truncate drops only the lowest-priority overflow.
-                    let mut seen = std::collections::HashSet::with_capacity(c.len());
-                    c.retain(|&x| seen.insert(x));
-                    c.truncate(kmax);
-                } else {
-                    c.sort_unstable();
-                    c.dedup();
-                }
-            });
+            let aug = base_cond.par_iter().enumerate().map(|(h, base)| {
+                let carriers = rare_sites.iter()
+                    .filter(|(v, minor, _)| hap_alleles[v * n_target_haps + h] == *minor)
+                    .flat_map(|(_, _, carriers)| carriers.iter().copied());
+                // With a cap, take the first K distinct IDs in base/carrier
+                // order. Without one, preserve the old ascending union order.
+                super::membership::ordered_or_sorted_union(
+                    base.iter().copied().chain(carriers), ref_bm.n_haps, k_max)
+            }).collect();
             Some(aug)
         } else { None };
         let cond_per_hap: &Vec<Vec<u32>> = cond_storage.as_ref().unwrap_or(base_cond);
@@ -921,12 +897,8 @@ pub fn run_gibbs(
                     let flat: &[bool] = &flat_all[s];
                     let cond_union: Vec<u32>;
                     let cond_haps: &[u32] = if rich_cond {
-                        let mut seen = std::collections::HashSet::new();
-                        let mut u: Vec<u32> = Vec::with_capacity(c0.len() + c1.len());
-                        for &c in c0.iter().chain(c1.iter()) {
-                            if seen.insert(c) { u.push(c); }
-                        }
-                        cond_union = u;
+                        cond_union = super::membership::ordered_or_sorted_union(
+                            c0.iter().chain(c1.iter()).copied(), ref_bm.n_haps, Some(usize::MAX));
                         &cond_union
                     } else {
                         c0
@@ -1428,6 +1400,32 @@ fn init_hap_alleles(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bitmap_splits_match_sorted_carriers() {
+        use crate::lcwgs::hmm::reference_pack::Xs;
+        let mut rng = Xs(0x6A09_E667_F3BC_C909);
+        for n in [0, 1, 63, 64, 65, 401] {
+            let nh = 137;
+            let ic: Vec<bool> = (0..n).map(|_| rng.below(4) == 0).collect();
+            let sr: Vec<Vec<u32>> = (0..nh).map(|_| (0..n).filter(|_| rng.below(5) == 0).map(|v| v as u32).collect()).collect();
+            for _ in 0..40 {
+                let cond: Vec<u32> = (0..rng.below(100)).map(|_| rng.below(nh as u64) as u32).collect();
+                let h0: Vec<bool> = (0..n).map(|_| rng.below(2) == 0).collect();
+                let h1: Vec<bool> = (0..n).map(|_| rng.below(2) == 0).collect();
+                let mut carried: Vec<u32> = cond.iter().flat_map(|&h| sr[h as usize].iter().copied()).collect();
+                carried.sort_unstable();
+                carried.dedup();
+                let (poly, mono): (Vec<_>, Vec<_>) = (0..n).partition(|&v| ic[v] || carried.binary_search(&(v as u32)).is_ok());
+                let got = poly_split(&cond, &ic, &sr, n);
+                assert_eq!(got.poly, poly);
+                assert_eq!(got.mono, mono);
+                let expected = (poly.iter().map(|&v| v as i32).collect::<Vec<_>>(),
+                    mono.iter().filter(|&&v| h0[v] != h1[v]).map(|&v| v as i32).collect::<Vec<_>>());
+                assert_eq!(phaser_split(&cond, &ic, &sr, &h0, &h1, n), expected);
+            }
+        }
+    }
     use crate::common::HaplotypeBitmatrix;
 
     /// Smoke test: small synthetic panel, Gibbs runs to completion and

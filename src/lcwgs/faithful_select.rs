@@ -83,6 +83,14 @@ fn prob_to_phred(p: f32) -> u8 {
     q.clamp(0.0, 255.0) as u8
 }
 
+/// The default cap keeps the lowest haplotype IDs, regardless of PBWT rank.
+fn index_union(layers: &[Vec<i32>], n_ref: usize, cap: usize) -> Vec<u32> {
+    super::membership::with_membership(n_ref, |seen| {
+        for layer in layers { for &h in layer { seen.insert(h as usize); } }
+        seen.indices().take(if cap == 0 { usize::MAX } else { cap }).map(|h| h as u32).collect()
+    })
+}
+
 impl FaithfulSelector {
     /// Build the faithful selector for one chunk from the hybrid's `ref_bm`, `cm`,
     /// and `gl3`. The `RefHaplotypeSet` + sparse PBWT are built here (once).
@@ -351,16 +359,7 @@ impl FaithfulSelector {
                 CapOrder::Index => {
                     // Union across all depth layers, dedup, ascending, truncate —
                     // quality-blind: keeps the LOWEST haplotype indices.
-                    let mut u: Vec<u32> = Vec::new();
-                    for layer in &self.tar.pbwt_states[s] {
-                        u.extend(layer.iter().map(|&x| x as u32));
-                    }
-                    u.sort_unstable();
-                    u.dedup();
-                    if self.kpbwt > 0 && u.len() > self.kpbwt {
-                        u.truncate(self.kpbwt);
-                    }
-                    u
+                    index_union(&self.tar.pbwt_states[s], self.ref_hs.n_ref_haps, self.kpbwt)
                 }
             };
             if diag {
@@ -450,6 +449,26 @@ fn build_views<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bitmap_index_union_matches_sorted_truncation() {
+        use crate::lcwgs::hmm::reference_pack::Xs;
+        let mut rng = Xs(0x510E_527F_ADE6_82D1);
+        for n in [1, 63, 64, 65, 4796] {
+            for _ in 0..40 {
+                let layers: Vec<Vec<i32>> = (0..rng.below(20)).map(|_| {
+                    (0..rng.below(200)).map(|_| rng.below(n as u64) as i32).collect()
+                }).collect();
+                for cap in [0, 1, 17, n, n + 1] {
+                    let mut expected: Vec<u32> = layers.iter().flatten().map(|&h| h as u32).collect();
+                    expected.sort_unstable();
+                    expected.dedup();
+                    if cap > 0 { expected.truncate(cap); }
+                    assert_eq!(index_union(&layers, n, cap), expected);
+                }
+            }
+        }
+    }
 
     #[test]
     fn prob_to_phred_endpoints() {
