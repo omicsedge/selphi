@@ -1,14 +1,15 @@
 #!/bin/bash
-# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, cb4dc9f) with the CSI-seek fix (c76055a).
-# R5 + R4d: HGDP out-of-panel (Table 4c, Figure 3c, per-variant sentence). Sept Selphi outputs were deleted and the
-# evaluator read only 98.5% of their records on 6 chromosomes; per-variant numbers also need the corrected rule.
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
+# Score only panel-polymorphic sites (--exclude-panel-monomorphic) with complete CSI-region record retrieval.
+# R5 + R4d: HGDP out-of-panel (Table 4c, Figure 3c, per-variant sentence). Full-record retrieval matters:
+# reading only 98.5% of records on 6 chromosomes changes the per-variant comparison. Check written and scored counts.
 # Re-run Selphi on the current binary (recipe = hgdp_gw.sh: 1KG subset panel, --drop-long-alleles, 5-kb common-SNP array,
-# 925 HGDP targets unphased), reuse Beagle's cached arm (same filtered panel, same target; S3 03_hgdp/gw/out), and score
+# 925 HGDP targets unphased), reuse Beagle's cached arm (same filtered panel, same target; configured S3 prefix), and score
 # BOTH per chromosome with the corrected evaluator. Record written vs read counts for every file. One chromosome at a time.
 set -uo pipefail
-R=/data/projects/.claude_home/gt/selphi/mayor/rig; S=$R/target/release/selphi; HG=/data/tmp/hgdp
-W=/data/tmp/fair_audit/hgdp_pm; mkdir -p $W/out $W/maps $W/cache $W/ev; cd $W
-GNOMAD=s3://gnomad-public-us-east-1/resources/hgdp_1kg/phased_haplotypes_v2; S3=s3://adriano-sandbox/selphi2/data/03_hgdp/gw/out
+R=${R:-$(git rev-parse --show-toplevel)}; S=$R/target/release/selphi; HG=$DATA_ROOT/work/hgdp
+W=$DATA_ROOT/work/comparison/hgdp_pm; mkdir -p $W/out $W/maps $W/cache $W/ev; cd $W
+GNOMAD=s3://gnomad-public-us-east-1/resources/hgdp_1kg/phased_haplotypes_v2; S3=${S3:?Set S3 to your HGDP comparator output prefix}
 for c in 22 21 20 19 18 17 16 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1; do
   [ -s ev/selphi_chr$c.json ] && [ -s ev/beagle_chr$c.json ] && continue
   bcf=chr$c.bcf
@@ -29,8 +30,9 @@ for c in 22 21 20 19 18 17 16 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1; do
   [ "$(bcftools index -n out/selphi_chr$c.bcf 2>/dev/null)" = "$(grep -oP 'Imputed:\s+\K[0-9]+(?= variants)' ev/selphi_chr$c.log)" ] && rm -f out/selphi_chr$c.bcf* || echo "RESULT HGDP chr$c READ GAP — Selphi BCF kept for diagnosis"
 done
 python3 - <<'PY'
+import os
 import json,numpy as np
-W="/data/tmp/fair_audit/hgdp_pm"; HG="/data/tmp/hgdp"
+W=os.path.expandvars("$DATA_ROOT/work/comparison/hgdp_pm"); HG=os.path.expandvars("$DATA_ROOT/work/hgdp")
 regs={r:set(open(f"{HG}/region_{r}.txt").read().split()) for r in "OCE MID CSA AFR EAS EUR AMR".split()}
 bins=["0.05-0.1%","0.1-0.2%","0.2-0.5%","0.5-1%","1-2%","2-5%","5-10%","10-20%","20-50%"]
 def ps(j):

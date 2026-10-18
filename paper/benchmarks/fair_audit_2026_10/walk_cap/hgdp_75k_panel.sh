@@ -1,10 +1,11 @@
 #!/bin/bash
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
 # Walk cap on the 75,552-hap v3 panel, accuracy on a LARGE out-of-panel cohort: 925 HGDP individuals (not in UKB or 1KG),
 # chr22, masked to the Table 4c common-SNP array (1KGP AF 1-99% SNPs, one per 5 kb), scored against their own genotypes.
 set -uo pipefail
-R=/data/projects/.claude_home/gt/selphi/mayor/rig; S=$R/target/release/selphi; HG=/data/tmp/hgdp; W=/data/tmp/member2/hgdp75k; cd $W
+R=${R:-$(git rev-parse --show-toplevel)}; S=$R/target/release/selphi; HG=$DATA_ROOT/work/hgdp; W=$DATA_ROOT/work/walk_cap/hgdp75k; cd $W
 GN=s3://gnomad-public-us-east-1/resources/hgdp_1kg/phased_haplotypes_v2; c=22; bcf=chr$c.bcf
-B=/data/projects/wgs_imputation_benchmark; P=$B/panel/srp/chr${c}_v3.srp
+B=$DATA_ROOT/inputs/array; P=$B/panel/srp/chr${c}_v3.srp
 [ -s $bcf ] || { aws s3 cp --no-sign-request $GN/hgdp1kgp_chr${c}.filtered.SNV_INDEL.phased.shapeit5.bcf $bcf >/dev/null && aws s3 cp --no-sign-request $GN/hgdp1kgp_chr${c}.filtered.SNV_INDEL.phased.shapeit5.bcf.csi $bcf.csi >/dev/null; }
 bcftools view -S $HG/ref_1kgp.txt -m2 -M2 --force-samples $bcf -Ou 2>/dev/null | bcftools +fill-tags -- -t AF 2>/dev/null | bcftools view -v snps -i 'INFO/AF>=0.01 && INFO/AF<=0.99' -Ou 2>/dev/null \
   | bcftools query -f '%CHROM\t%POS\n' | awk 'BEGIN{last=-1e9}{if($2-last>=5000){print $1"\t"$2; last=$2}}' > array_sites.txt

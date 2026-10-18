@@ -1,9 +1,10 @@
 #!/bin/bash
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
 # Same-session re-run of Table 7 rows "chr22/chr1 1KG 801s (impute-only, phased input)": Selphi 2 vs Beagle 5.5,
 # same phased target, Beagle given a bref3 converted from the SAME SRP, same map, one job at a time, 2 reps.
 set -uo pipefail
-R=/data/projects/.claude_home/gt/selphi/mayor/rig; S=$R/target/release/selphi
-JAR=/data/projects/selphi_impr/tests/data/software/beagle.03Oct25.f35702.jar; F=/data/tmp/giab_t7_fair
+R=${R:-$(git rev-parse --show-toplevel)}; S=$R/target/release/selphi
+JAR=$DATA_ROOT/inputs/software/beagle.03Oct25.f35702.jar; F=$DATA_ROOT/work/giab_t7_fair
 until grep -q FAIRDONE $F/run.out; do sleep 20; done
 tm() { awk '/Elapsed \(wall/{w=$8} /Maximum resident/{m=$6/1048576} END{printf "%s / %.1f GB", w, m}' "$1"; }
 for C in 22 1; do

@@ -1,13 +1,14 @@
 #!/bin/bash
-# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, cb4dc9f) with the CSI-seek fix (c76055a).
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
+# Score only panel-polymorphic sites (--exclude-panel-monomorphic) with complete CSI-region record retrieval.
 # R4c: MESA x TOPMed chr20 tables (Results, Table 4b, S2 headline, S11 four imputers, S11b/Figure 3b) re-scored with the
-# corrected per-site rule. Selphi outputs kept from the Sept runs (auto = headline default, mc2500 = ablation);
-# competitors' cached outputs: Beagle 5.5 (June, same panel/target), IMPUTE5, Minimac4, Selphi 1.5.3 (selphi_impr).
+# per-site rule. Saved Selphi outputs (auto = headline default, mc2500 = ablation);
+# competitors' cached outputs: Beagle 5.5 (same panel/target), IMPUTE5, Minimac4, Selphi 1.5.3.
 # Every tool scored by the SAME evaluator on the SAME truth; per-ancestry by subsetting samples.
 set -uo pipefail
-R=/data/projects/.claude_home/gt/selphi/mayor/rig; cd $R; S=$R/target/release/selphi; O=/data/tmp/fair_audit/mesa_pm; mkdir -p $O
-W=/data/tmp/pbwt_share_2026_09_06/mesa_t4b; TR=data/truth/chr20_mesa_5k_truth.bcf.gz; T=/data/projects/selphi_impr/tests/results/topmed
-declare -A F=([selphi_auto]=$W/auto.bcf [selphi_mc2500]=$W/mc2500.bcf [beagle55]=/data/tmp/selphi_scratch/overnight/bgl_mesa5k.vcf.gz
+R=${R:-$(git rev-parse --show-toplevel)}; cd $R; S=$R/target/release/selphi; O=$DATA_ROOT/work/comparison/mesa_pm; mkdir -p $O
+W=$DATA_ROOT/work/benchmarks/mesa_t4b; TR=data/truth/chr20_mesa_5k_truth.bcf.gz; T=$DATA_ROOT/work/comparators/topmed
+declare -A F=([selphi_auto]=$W/auto.bcf [selphi_mc2500]=$W/mc2500.bcf [beagle55]=$DATA_ROOT/work/comparators/bgl_mesa5k.vcf.gz
   [impute5]=$T/impute5/MESA_chr20_hg38_GSA_masked_imputed_impute5_5k.bcf.gz [minimac4]=$T/minimac4/MESA_chr20_hg38_GSA_masked_imputed_minimac_5k.bcf.gz
   [selphi153]=$T/selphi_1.5.3/MESA_chr20_hg38_GSA_masked_selphi_imputed_5k.bcf.gz)
 for t in selphi_auto selphi_mc2500 beagle55 impute5 minimac4 selphi153; do

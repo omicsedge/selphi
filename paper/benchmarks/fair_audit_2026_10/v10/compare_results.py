@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """v10 paper re-run RESULT lines against the same labels in earlier runs (v9, then v8 'paper_final'): every
 number that went DOWN is flagged. usage: compare_results.py"""
+import os
 import re
-logs = {"v10": ["/data/tmp/paper_v10/busy.log", "/data/tmp/paper_v10/idle.log"],
-        "v9": ["/data/tmp/paper_v9/busy.log", "/data/tmp/paper_v9/idle.log"],
-        "v8": ["/data/tmp/paper_final/busy.log", "/data/tmp/paper_final/idle.log"]}
+logs = {"v10": [os.path.expandvars("$DATA_ROOT/work/paper_v10/busy.log"), os.path.expandvars("$DATA_ROOT/work/paper_v10/idle.log")],
+        "v9": [os.path.expandvars("$DATA_ROOT/work/paper_v9/busy.log"), os.path.expandvars("$DATA_ROOT/work/paper_v9/idle.log")],
+        "v8": [os.path.expandvars("$DATA_ROOT/work/paper_final/busy.log"), os.path.expandvars("$DATA_ROOT/work/paper_final/idle.log")]}
 num = re.compile(r"(?:(\S+?)[: ])?(-?\d+\.\d+)")
 def load(files):
     out = {}

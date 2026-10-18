@@ -1,9 +1,10 @@
 #!/bin/bash
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
 # Genome-wide 1KG FULL PIPELINE (20 autosomes, 801 truly unphased targets), panel-polymorphic sites, CSI-fixed binary.
-# Selphi re-run (its Sept outputs were deleted); Beagle 5.5's Sept outputs (same targets/panel/bref3-from-SRP) re-scored.
+# Run Selphi and re-score saved Beagle 5.5 outputs (same targets/panel/bref3-from-SRP).
 set -uo pipefail
-R=/data/projects/.claude_home/gt/selphi/mayor/rig; cd $R; S=$R/target/release/selphi
-G=/data/tmp/pbwt_share_2026_09_06/gw; O=/data/tmp/fair_audit/gwfp
+R=${R:-$(git rev-parse --show-toplevel)}; cd $R; S=$R/target/release/selphi
+G=$DATA_ROOT/work/benchmarks/gw; O=$DATA_ROOT/work/comparison/gwfp
 for C in 1 2 3 4 5 6 7 9 10 12 13 14 15 16 17 18 19 20 21 22; do
   P=data/reference/srp/chr${C}_v2.srp; TR=data/truth/chr${C}_801s_truth.vcf.gz
   /usr/bin/time -v $S --refpanel $P --input $G/unph/chr${C}.vcf.gz --map data/maps/beagle/chr${C}.map --truth $TR \
@@ -13,8 +14,9 @@ for C in 1 2 3 4 5 6 7 9 10 12 13 14 15 16 17 18 19 20 21 22; do
   echo "CHR $C selphi $(awk '/Elapsed \(wall/{print $8}' $O/selphi_chr$C.time) $(python3 -c "import json;a=json.load(open('$O/selphi_chr$C.eval.json'));b=json.load(open('$O/beagle_chr$C.json'));print(round(a['overall']['mean_r2'],4),a['overall']['n'],'beagle',round(b['overall']['mean_r2'],4),b['overall']['n'])")"
 done
 python3 - <<'PY'
+import os
 import json,numpy as np
-O="/data/tmp/fair_audit/gwfp"; C=[1,2,3,4,5,6,7,9,10,12,13,14,15,16,17,18,19,20,21,22]
+O=os.path.expandvars("$DATA_ROOT/work/comparison/gwfp"); C=[1,2,3,4,5,6,7,9,10,12,13,14,15,16,17,18,19,20,21,22]
 bins=["0.05-0.1%","0.1-0.2%","0.2-0.5%","0.5-1%","1-2%","2-5%","5-10%","10-20%","20-50%"]
 def agg(f):
     acc={b:[0,0] for b in bins+['overall']}; ps={}

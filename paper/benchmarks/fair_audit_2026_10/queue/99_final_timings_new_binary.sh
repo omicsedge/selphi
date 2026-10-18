@@ -1,18 +1,19 @@
 #!/bin/bash
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
 # Final same-session timings with the SHIPPED binary (sparse scan on): MESA 5k x TOPMed Selphi vs Beagle (one after the
 # other, warm), and Selphi-only re-times of the rows Beagle did not change. Outputs discarded.
 set -uo pipefail
-R=/data/projects/.claude_home/gt/selphi/mayor/rig; cd $R; S=$R/target/release/selphi; J=/data/projects/selphi_impr/tests/data/software/beagle.03Oct25.f35702.jar
-O=/data/tmp/fair_audit/final_timing; mkdir -p $O
+R=${R:-$(git rev-parse --show-toplevel)}; cd $R; S=$R/target/release/selphi; J=$DATA_ROOT/inputs/software/beagle.03Oct25.f35702.jar
+O=$DATA_ROOT/work/comparison/final_timing; mkdir -p $O
 sec(){ awk '/Elapsed \(wall/{n=split($8,a,":"); s=(n==3)?a[1]*3600+a[2]*60+a[3]:a[1]*60+a[2]} END{print s}' "$1"; }
 mem(){ awk '/Maximum resident/{printf "%.1f", $6/1048576}' "$1"; }
 TG=data/target_unphased/chr20_mesa_5k_chip_unphased.vcf.gz
 cat data/reference/srp/chr20_topmed.srp data/reference/chr20_topmed.bref3 > /dev/null
 /usr/bin/time -v $S --refpanel data/reference/srp/chr20_topmed.srp --input $TG --map data/maps/beagle/chr20.map --out $O/mesa_selphi --threads 16 --bcf > $O/mesa_selphi.log 2> $O/mesa_selphi.time
-echo "RESULT FINAL MESA selphi(sparse) $(sec $O/mesa_selphi.time)s $(mem $O/mesa_selphi.time)GB md5 $(md5sum < $O/mesa_selphi.bcf | cut -c1-12) vs speed-run $(md5sum < /data/tmp/fair_audit/speed/mesa_selphi.bcf | cut -c1-12)"
+echo "RESULT FINAL MESA selphi(sparse) $(sec $O/mesa_selphi.time)s $(mem $O/mesa_selphi.time)GB md5 $(md5sum < $O/mesa_selphi.bcf | cut -c1-12) vs speed-run $(md5sum < $DATA_ROOT/work/comparison/speed/mesa_selphi.bcf | cut -c1-12)"
 rm -f $O/mesa_selphi.bcf*
-# MESA Beagle NOT re-run (owner, 2026-10-08): Beagle is unchanged and its 5k run is in the same-machine warm speed session
-# (/data/tmp/fair_audit/speed: 6,728 s, 91.0 GB). Compare the new Selphi time against that and against Selphi pre-sparse 10,767 s.
+# MESA Beagle NOT re-run: Beagle is unchanged and its 5k run is in the same-machine warm speed session
+# ($DATA_ROOT/work/comparison/speed: 6,728 s, 91.0 GB). Compare the new Selphi time against that and against Selphi pre-sparse 10,767 s.
 echo "RESULT FINAL MESA beagle (not re-run) 6728s 91.0GB from fair_audit/speed"
 # 1KG 801s impute-only chr22/chr1 (Table 7): both tools again with the shipped binary, warm, same session
 for c in 22 1; do SRP=data/reference/srp/chr${c}_v2.srp; T=data/target/chr${c}_801s_chip_unphased.vcf.gz; M=data/maps/beagle/chr$c.map

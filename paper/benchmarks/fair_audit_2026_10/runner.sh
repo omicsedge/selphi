@@ -1,8 +1,9 @@
 #!/bin/bash
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
 # Sequential runner: waits for the timing chain, then runs queue/[0-9]*.sh in order, one at a time; marks .done;
 # keeps polling for new scripts until queue/STOP exists. Each script prints RESULT lines; log -> NAME.out.
-Q=/data/tmp/fair_audit/queue
-until grep -q SPEEDDONE /data/tmp/fair_audit/speed/run.out 2>/dev/null; do sleep 30; done
+Q=$DATA_ROOT/work/comparison/queue
+until grep -q SPEEDDONE $DATA_ROOT/work/comparison/speed/run.out 2>/dev/null; do sleep 30; done
 while true; do
   next=$(ls $Q/[0-9]*.sh 2>/dev/null | while read f; do [ -e $f.done ] || echo $f; done | sort | head -1)
   if [ -z "$next" ]; then [ -e $Q/STOP ] && break; sleep 30; continue; fi

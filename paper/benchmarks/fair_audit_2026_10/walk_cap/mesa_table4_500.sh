@@ -1,11 +1,12 @@
 #!/bin/bash
-# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, cb4dc9f) with the CSI-seek fix (c76055a).
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
+# Score only panel-polymorphic sites (--exclude-panel-monomorphic) with complete CSI-region record retrieval.
 # Table 4: mc = 2,500 vs panel-adaptive (132,676) on a 500-sample MESA subset, chr20 x TOPMed.
 # Subset = first 500 samples of the 5k unphased chip target (the original subset is unrecorded).
 # Truth = the 5k truth BCF; the evaluator intersects samples and takes MAF over the shared ones.
 set -uo pipefail
-R=/data/projects/.claude_home/gt/selphi/mayor/rig; cd $R; S=$R/target/release/selphi
-W=/data/tmp/member2/mesa_new/t4_500; mkdir -p $W
+R=${R:-$(git rev-parse --show-toplevel)}; cd $R; S=$R/target/release/selphi
+W=$DATA_ROOT/work/walk_cap/mesa_new/t4_500; mkdir -p $W
 [ -s $W/t500.vcf.gz ] || { bcftools query -l data/target_unphased/chr20_mesa_5k_chip_unphased.vcf.gz | head -500 > $W/s500.txt
   bcftools view -S $W/s500.txt -Oz -o $W/t500.vcf.gz data/target_unphased/chr20_mesa_5k_chip_unphased.vcf.gz && tabix -f $W/t500.vcf.gz; }
 for arm in auto mc2500; do

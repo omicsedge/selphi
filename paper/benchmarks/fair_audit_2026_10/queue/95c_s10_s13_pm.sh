@@ -1,11 +1,12 @@
 #!/bin/bash
-# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, cb4dc9f) with the CSI-seek fix (c76055a).
-# R7b: Tables S10 (component ablation), S13 (Ne sweep) and S8 (re-phasing the panel) were produced by a pre-2026-09-11
-# binary (default 0.4776 vs the current 0.4782 of Table S1). Re-run all on the current binary, chr22, 801 samples,
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
+# Score only panel-polymorphic sites (--exclude-panel-monomorphic) with complete CSI-region record retrieval.
+# R7b: Tables S10 (component ablation), S13 (Ne sweep) and S8 (re-phasing the panel) use one binary:
+# baseline accuracy differs by version (0.4776 vs 0.4782 in Table S1). Run all on chr22, 801 samples,
 # impute-only on the phased target, same panel, scored by the same evaluator. S8 also re-runs Beagle on both panels.
 set -uo pipefail
-R=/data/projects/.claude_home/gt/selphi/mayor/rig; cd $R; S=$R/target/release/selphi; O=/data/tmp/fair_audit/supp_pm; mkdir -p $O
-J=/data/projects/selphi_impr/tests/data/software/beagle.03Oct25.f35702.jar
+R=${R:-$(git rev-parse --show-toplevel)}; cd $R; S=$R/target/release/selphi; O=$DATA_ROOT/work/comparison/supp_pm; mkdir -p $O
+J=$DATA_ROOT/inputs/software/beagle.03Oct25.f35702.jar
 M=data/maps/beagle/chr22.map; T=data/target/chr22_801s_chip_unphased.vcf.gz; TR=data/truth/chr22_801s_truth.vcf.gz; P=data/reference/srp/chr22_v2.srp
 row(){ python3 -c "
 import json;j=json.load(open('$1'))

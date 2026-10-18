@@ -1,11 +1,13 @@
 #!/bin/bash
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
+REPO_ROOT=${R:-$(git rev-parse --show-toplevel)}
 # R3: capture-library timing, SAME SESSION, current binary, one job at a time.
 # Selphi 2 native pileup (BAQ on) vs GLIMPSE2 v2.0.0 timed END TO END = GLIMPSE2_chunk + all phase chunks + ligate.
 # n=1 (HG004, 2 reps each), n=6 (bams.txt), n=12 (bams12.txt, six real + six relabelled copies), Selphi n=6 at 20 iterations.
 set -uo pipefail
-P=/data/projects/check_new_ngs_data/pilot; cd $P; D=/data/tmp/fair_audit/capture_timing; mkdir -p $D
-S=/data/projects/.claude_home/gt/selphi/mayor/rig/target/release/selphi; G2=/home/ubuntu/gt/selphi/mayor/rig/_archive/reference_code/GLIMPSE2
-REF=/data/pgx/ref/GRCh38_full_analysis_set_plus_decoy_hla.fa; MAP=/data/projects/selphi_impr/tests/data/genetic_maps/plink.chr22.GRCh38.map; GMAP=/data/tmp/lcwgs_sweep/glimpse.gmap
+P=$DATA_ROOT/work/capture; cd $P; D=$DATA_ROOT/work/comparison/capture_timing; mkdir -p $D
+S=$REPO_ROOT/target/release/selphi; G2=$REPO_ROOT/_archive/reference_code/GLIMPSE2
+REF=$DATA_ROOT/inputs/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa; MAP=$DATA_ROOT/inputs/genetic_maps/plink.chr22.GRCh38.map; GMAP=$DATA_ROOT/work/lcwgs_sweep/glimpse.gmap
 sec(){ awk '/Elapsed \(wall/{n=split($8,a,":"); s=(n==3)?a[1]*3600+a[2]*60+a[3]:a[1]*60+a[2]} END{printf "%.1f", s}' "$1"; }
 mem(){ awk '/Maximum resident/{printf "%.1f", $6/1048576}' "$1"; }
 cat panel22_g2.bcf s2_chr22_noleak.srp > /dev/null

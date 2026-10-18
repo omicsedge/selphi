@@ -1,13 +1,14 @@
 #!/bin/bash
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
 # R2: coverage sweep (Table 2b, Figure 4a). (a) SAME-SESSION whole-chr22 timing, HG002 1x, 16 threads:
 # Selphi 2 exactly as scored (--reference -> BAQ on, current binary) vs GLIMPSE2 (GLIMPSE2_chunk + phase chunks + ligate)
 # vs QUILT2 (tiled, as before). (b) accuracy parity: the competitors imputed chr22:19-31 Mb only, so Selphi is re-run
 # on the same 19-31 Mb window for 3 samples x 4 depths and re-scored on the three-tool intersection.
 set -uo pipefail
-T=/data/tmp/lcwgs_sweep; cd $T; O=/data/tmp/fair_audit/sweep; mkdir -p $O
-R=/data/projects/.claude_home/gt/selphi/mayor/rig; S=$R/target/release/selphi
-G2=$R/_archive/reference_code/GLIMPSE2; QD=$R/_archive/reference_code/QUILT; export R_LIBS_USER=/data/tmp/Rlib
-REF=/data/pgx/ref/GRCh38_full_analysis_set_plus_decoy_hla.fa; MAP=/data/tmp/hgdp/chr22.chr.map; bam=$T/HG002_1x.bam
+T=$DATA_ROOT/work/lcwgs_sweep; cd $T; O=$DATA_ROOT/work/comparison/sweep; mkdir -p $O
+R=${R:-$(git rev-parse --show-toplevel)}; S=$R/target/release/selphi
+G2=$R/_archive/reference_code/GLIMPSE2; QD=$R/_archive/reference_code/QUILT; export R_LIBS_USER=$DATA_ROOT/work/Rlib
+REF=$DATA_ROOT/inputs/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa; MAP=$DATA_ROOT/work/hgdp/chr22.chr.map; bam=$T/HG002_1x.bam
 sec(){ awk '/Elapsed \(wall/{n=split($8,a,":"); s=(n==3)?a[1]*3600+a[2]*60+a[3]:a[1]*60+a[2]} END{printf "%.1f", s}' "$1"; }
 mem(){ awk '/Maximum resident/{printf "%.1f", $6/1048576}' "$1"; }
 cat panel.srp panel_poly.bcf > /dev/null
@@ -35,7 +36,7 @@ for cov in 0.5x 1x 2x 4x; do for s in HG002 HG003 HG004; do
   $S --lcwgs --refpanel panel.srp --bam ${s}_${cov}.bam --reference $REF --map $MAP --region chr22:19000000-31000000 --out $O/reg_${s}_${cov} --threads 16 > $O/reg_${s}_${cov}.log 2>&1 || echo "RESULT REG $s $cov FAILED"
   bcftools index -t -f $O/reg_${s}_${cov}.vcf.gz 2>/dev/null
 done
-python3 $(dirname $(readlink -f $0))/../helpers/shared.py $cov "{\"selphi_reg\":\"$O/reg_%s_${cov}.vcf.gz\",\"selphi_whole\":\"/data/tmp/pbwt_share_2026_09_06/rare05/%s_${cov}_$( [ $cov = 0.5x ] && echo def || echo defkeep ).vcf.gz\",\"glimpse2\":\"$T/out/glimpse_%s_${cov}.bcf\",\"quilt2\":\"$T/out/quilt_%s_${cov}.vcf.gz\"}" > $O/shared_$cov.json 2> $O/shared_$cov.err
+python3 $(dirname $(readlink -f $0))/../helpers/shared.py $cov "{\"selphi_reg\":\"$O/reg_%s_${cov}.vcf.gz\",\"selphi_whole\":\"$DATA_ROOT/work/benchmarks/rare05/%s_${cov}_$( [ $cov = 0.5x ] && echo def || echo defkeep ).vcf.gz\",\"glimpse2\":\"$T/out/glimpse_%s_${cov}.bcf\",\"quilt2\":\"$T/out/quilt_%s_${cov}.vcf.gz\"}" > $O/shared_$cov.json 2> $O/shared_$cov.err
 python3 - $O/shared_$cov.json $cov <<'PY'
 import json,sys,statistics as st; j=json.load(open(sys.argv[1])); T=('selphi_reg','selphi_whole','glimpse2','quilt2')
 ov={t:st.mean(r[t]['persample_r2'] for r in j['rows']) for t in T}; ur={t:j['pooled_bins'][t]['0-0.5']['r2'] for t in T}

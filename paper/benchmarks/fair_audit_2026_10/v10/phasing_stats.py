@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Table 6 / 6b / 6c statistics for the v10 re-run: per-trio SER pairs (Selphi v10 vs the kept Beagle 5.5 / SHAPEIT5
 runs), Table 6c paired per-sample gains for the re-run Selphi rows. Bootstrap 20,000 resamples, seed 1."""
+import os
 import json, numpy as np
-V="/data/tmp/paper_v10"; K="/data/tmp/pbwt_share_2026_09_06/table6"; B6="/data/tmp/fair_audit/table6b"
+V=os.path.expandvars("$DATA_ROOT/work/paper_v10"); K=os.path.expandvars("$DATA_ROOT/work/benchmarks/table6"); B6=os.path.expandvars("$DATA_ROOT/work/comparison/table6b")
 def ser(path):
     d={}
     for l in open(path):

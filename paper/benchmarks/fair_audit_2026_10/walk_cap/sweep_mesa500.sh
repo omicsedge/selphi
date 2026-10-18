@@ -1,8 +1,9 @@
 #!/bin/bash
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
 # Walk-cap A/B on MESA 500 x TOPMed chr20, full pipeline, panel-polymorphic scoring; one job at a time.
 set -uo pipefail
-R=/data/projects/.claude_home/gt/selphi/mayor/rig; cd $R; S=$R/target/release/selphi; O=/data/tmp/member2/cap
-P=data/reference/srp/chr20_topmed.srp; T=/data/tmp/fair_audit/table4_500_pm/t500.vcf.gz
+R=${R:-$(git rev-parse --show-toplevel)}; cd $R; S=$R/target/release/selphi; O=$DATA_ROOT/work/walk_cap/cap
+P=data/reference/srp/chr20_topmed.srp; T=$DATA_ROOT/work/comparison/table4_500_pm/t500.vcf.gz
 row(){ python3 -c "
 import json;j=json.load(open('$1'))
 b=['0.1-0.2%','0.2-0.5%','0.5-1%','1-2%','2-5%','5-10%','10-20%','20-50%']

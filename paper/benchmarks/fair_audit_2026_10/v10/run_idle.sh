@@ -1,10 +1,11 @@
 #!/bin/bash
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
 # Paper re-runs that TIME something (same-session Selphi vs competitor), plus MESA 5k (~92 GB):
 # run on an idle box, one job at a time, after run_busy.sh. Binary $S. Recipes: re-run plan of
-# 2026-10-13 (items A, E, H, I, J, K) and queue/99 (Table 7 impute-only rows).
+# accuracy recipes (items A, E, H, I, J, K) and queue/99 (Table 7 impute-only rows).
 set -uo pipefail
-R=/data/projects/.claude_home/gt/selphi/mayor/rig; U=/data/tmp/paper_v10; S=${S:-$U/selphi-v10}
-J=/data/projects/selphi_impr/tests/data/software/beagle.03Oct25.f35702.jar; cd $R
+R=${R:-$(git rev-parse --show-toplevel)}; U=$DATA_ROOT/work/paper_v10; S=${S:-$U/selphi-v10}
+J=$DATA_ROOT/inputs/software/beagle.03Oct25.f35702.jar; cd $R
 L=$U/idle.log; log() { echo "$(date '+%m-%d %H:%M') $*" | tee -a $L; }
 sec(){ awk '/Elapsed \(wall/{n=split($8,a,":"); s=(n==3)?a[1]*3600+a[2]*60+a[3]:a[1]*60+a[2]} END{printf "%.1f", s}' "$1"; }
 mem(){ awk '/Maximum resident/{printf "%.1f", $6/1048576}' "$1"; }
@@ -52,7 +53,7 @@ for c in 22 1; do [ -f $O/t6_s5r$c.time ] && continue; wait_idle; log "I table6 
   rm -f $O/s5*$c.bcf*
   log "RESULT T6 chr$c diploid $(sec $O/t6_diploid$c.time)s $(mem $O/t6_diploid$c.time)GB | haploid $(sec $O/t6_haploid$c.time)s | beagle $(sec $O/t6_beagle$c.time)s $(mem $O/t6_beagle$c.time)GB | shapeit5 $(echo "$(sec $O/t6_s5c$c.time) + $(sec $O/t6_s5r$c.time)" | bc)s"
   # 6b: Selphi with the parents (--ped), children scored
-  PEDIN=/data/tmp/pbwt_share_2026_09_06/table6/chr$c/trio162_wgs_unph.bcf
+  PEDIN=$DATA_ROOT/work/benchmarks/table6/chr$c/trio162_wgs_unph.bcf
   if [ -f $PEDIN ]; then
     /usr/bin/time -v $S --refpanel $SRP --input $PEDIN --map $M --phase-only --phasing-engine diploid --ped $T6/trios.ped --out $O/ped$c --threads 16 > $O/ped$c.stdout 2> $O/ped$c.time
     bcftools view -S $T6/children.txt -Oz -o $O/ped${c}_kids.vcf.gz $O/ped$c.vcf.gz; ser $O/ped${c}_kids.vcf.gz ped$c $c | tee -a $L
@@ -61,7 +62,7 @@ for c in 22 1; do [ -f $O/t6_s5r$c.time ] && continue; wait_idle; log "I table6 
 done
 
 # J. Table 6c, Selphi rows (pedigree-aware phasing then imputation of the children's chip sites).
-O=$U/table6c; C6=/data/tmp/fair_audit/table6c_pm; T=data/trio_benchmark; mkdir -p $O
+O=$U/table6c; C6=$DATA_ROOT/work/comparison/table6c_pm; T=data/trio_benchmark; mkdir -p $O
 for C in 22 1; do [ -f $O/ev_sel_ped$C.json ] && continue; wait_idle; log "J table6c chr$C"
   MAP=data/maps/beagle/chr$C.map; SRP=$T/ref_panel_no_trios_chr$C.srp; [ $C = 1 ] && SRP=$T/ref_panel_no_trios_chr1_v2.srp
   bcftools merge $T/children_wgs_unphased_chr$C.vcf.gz $T/fathers_wgs_chr$C.vcf.gz $T/mothers_wgs_chr$C.vcf.gz 2>/dev/null | bcftools view -T $C6/chip$C.txt 2>/dev/null | bcftools +setGT -- -t a -n u 2>/dev/null | bcftools view -Oz -o $O/fam$C.vcf.gz && bcftools index -f -t $O/fam$C.vcf.gz
@@ -75,8 +76,8 @@ for C in 22 1; do [ -f $O/ev_sel_ped$C.json ] && continue; wait_idle; log "J tab
 done
 
 # H. Table 5b / Fig 4b-c / README speed chart: consumer arrays whole genome, warm, Selphi and Beagle alternating.
-O=$U/table5b; B=/data/projects/wgs_imputation_benchmark; mkdir -p $O
-if ! grep -q "RESULT CONSUMER" $O/run.out 2>/dev/null && ! grep -q "REBUILD2 DONE" /data/tmp/srp_long/rebuild2.out 2>/dev/null; then
+O=$U/table5b; B=$DATA_ROOT/inputs/array; mkdir -p $O
+if ! grep -q "RESULT CONSUMER" $O/run.out 2>/dev/null && ! grep -q "REBUILD2 DONE" $DATA_ROOT/work/srp_long/rebuild2.out 2>/dev/null; then
   log "H table5b DEFERRED: the v3 panels are not final yet (re-run this script after rebuild2.sh)"
 elif ! grep -q "RESULT CONSUMER" $O/run.out 2>/dev/null; then wait_idle; log "H table5b"
   ss=0; bs=0; sm=0; bm=0
@@ -107,7 +108,7 @@ for c in 22 1; do [ -f $O/kg_b${c}_2.time ] && continue; wait_idle; log "T7 kg c
 done
 
 # K. Whole-genome demo (multi-chr path): default and one ensemble member.
-O=$U/wgdemo; W=/data/tmp/pbwt_share_2026_09_06/wgdemo; mkdir -p $O
+O=$U/wgdemo; W=$DATA_ROOT/work/benchmarks/wgdemo; mkdir -p $O
 if [ ! -f $O/wg50_n1.time ]; then wait_idle; log "K wgdemo"
   /usr/bin/time -v $S --refpanel $W/all_chrs.srp --input $W/wg50.vcf.gz --map-dir $R/data/maps/beagle/ --out $O/wg50 --threads 16 > $O/wg50.stdout 2> $O/wg50.time
   log "RESULT WGDEMO default $(sec $O/wg50.time)s $(mem $O/wg50.time)GB records $(bcftools index -n $O/wg50.vcf.gz 2>/dev/null || bcftools view -H $O/wg50.vcf.gz | wc -l)"; rm -f $O/wg50.vcf.gz*
@@ -116,9 +117,9 @@ if [ ! -f $O/wg50_n1.time ]; then wait_idle; log "K wgdemo"
 fi
 
 # GIAB impute-only timings (Table 7 / S6): Selphi and Beagle 5.5 (bref3 the SRP was built from), same session, 2 reps.
-O=$U/giab_time; G=/data/tmp/pbwt_share_2026_09_06/giab_t7; F=/data/tmp/giab_t7_fair; mkdir -p $O
+O=$U/giab_time; G=$DATA_ROOT/work/benchmarks/giab_t7; F=$DATA_ROOT/work/giab_t7_fair; mkdir -p $O
 for C in 21 1; do [ -f $O/beagle${C}_2.time ] && continue; wait_idle; log "GIAB timing chr$C"
-  map=/data/tmp/prodarray2/maps/plink.chr${C}.GRCh38.map; b3=/data/projects/wgs_imputation_benchmark/panel/bref3/chr${C}.v3.bref3
+  map=$DATA_ROOT/inputs/array_validation/maps/plink.chr${C}.GRCh38.map; b3=$DATA_ROOT/inputs/array/panel/bref3/chr${C}.v3.bref3
   cat $F/chr${C}_v3.srp $b3 > /dev/null
   for rep in 1 2; do
     /usr/bin/time -v $S --refpanel $F/chr${C}_v3.srp --input $G/chr$C/chipT_phased.vcf.gz --map $map --out $O/selphi$C --threads 16 > /dev/null 2> $O/selphi${C}_$rep.time; rm -f $O/selphi$C.vcf.gz*
@@ -128,7 +129,7 @@ for C in 21 1; do [ -f $O/beagle${C}_2.time ] && continue; wait_idle; log "GIAB 
 done
 
 # E. MESA 5k (Table 4b, S2, S11, S11b, Fig 3b; Table 7 MESA row): auto then mc2500, one 16 GB BCF on disk at a time.
-O=$U/mesa5k; G=/data/tmp/pbwt_share_2026_09_06/mesa_t4b; P=data/reference/srp/chr20_topmed.srp; TR=data/truth/chr20_mesa_5k_truth.bcf.gz
+O=$U/mesa5k; G=$DATA_ROOT/work/benchmarks/mesa_t4b; P=data/reference/srp/chr20_topmed.srp; TR=data/truth/chr20_mesa_5k_truth.bcf.gz
 GR="African-American Hispanic White Chinese-American"; mkdir -p $O
 for g in $GR; do [ -f $O/truth_$g.bcf ] || { bcftools view -S $G/g_$g.txt --force-samples $TR -Ob -o $O/truth_$g.bcf --threads 8 && bcftools index -f $O/truth_$g.bcf; }; done
 for arm in auto mc2500; do [ -f $O/selphi_${arm}_Chinese-American.json ] && continue

@@ -1,13 +1,14 @@
 #!/bin/bash
-# R1: Table 2 (~1.8x GIAB HG002-HG007). Before: HG002-4 on panel_poly2 (850,313) for both tools, HG005-7 Selphi on
-# panel_nt_snps (929,834) vs GLIMPSE2 on panel_nt_g2poly (861,018), June binaries, BAQ off. Now: ONE panel for all six
-# samples and both tools = panel_nt_g2poly.bcf (Selphi gets an SRP built from that exact BCF), current binary with
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
+# R1: Table 2 (~1.8x GIAB HG002-HG007). Use panel_nt_g2poly (861,018 sites) for all six samples and both tools;
+# panel_poly2 (850,313 sites) and panel_nt_snps (929,834 sites) have different content and cannot be mixed across arms.
+# Selphi gets an SRP built from that exact BCF and runs with
 # --reference (BAQ on, the shipped configuration), GLIMPSE2 re-run for HG002-4 on that panel with the same chunks as HG005-7.
 # Then a same-session single-sample timing (HG002): Selphi vs GLIMPSE2 end to end (chunk + phase + ligate).
 set -uo pipefail
-R=/data/projects/.claude_home/gt/selphi/mayor/rig; S=$R/target/release/selphi; G2=$R/_archive/reference_code/GLIMPSE2
-T=/data/tmp/lcwgs_sweep/t6; E3=/data/tmp/exp3; O=/data/tmp/fair_audit/table2; mkdir -p $O
-REF=/data/pgx/ref/GRCh38_full_analysis_set_plus_decoy_hla.fa; MAP=/data/tmp/hgdp/chr22.chr.map; GMAP=/data/tmp/lcwgs_sweep/glimpse.gmap
+R=${R:-$(git rev-parse --show-toplevel)}; S=$R/target/release/selphi; G2=$R/_archive/reference_code/GLIMPSE2
+T=$DATA_ROOT/work/lcwgs_sweep/t6; E3=$DATA_ROOT/work/exp3; O=$DATA_ROOT/work/comparison/table2; mkdir -p $O
+REF=$DATA_ROOT/inputs/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa; MAP=$DATA_ROOT/work/hgdp/chr22.chr.map; GMAP=$DATA_ROOT/work/lcwgs_sweep/glimpse.gmap
 GP=$T/panel_nt_g2poly.bcf; CH=$T/chunks_nt.txt
 sec(){ awk '/Elapsed \(wall/{n=split($8,a,":"); s=(n==3)?a[1]*3600+a[2]*60+a[3]:a[1]*60+a[2]} END{printf "%.1f", s}' "$1"; }
 mem(){ awk '/Maximum resident/{printf "%.1f", $6/1048576}' "$1"; }
@@ -27,8 +28,9 @@ done
 for s in HG005 HG006 HG007; do ln -sf $T/glm_$s.bcf $O/glm_$s.bcf; ln -sf $T/glm_$s.bcf.csi $O/glm_$s.bcf.csi; done
 grep -h -E 'GLIMPSE2_phase|reference' $T/glm_HG005_*.log 2>/dev/null | head -0
 python3 - <<'PY'
+import os
 import subprocess, numpy as np, json
-T="/data/tmp/lcwgs_sweep/t6"; GI="/data/tmp/giab_lcwgs"; E3="/data/tmp/exp3"; O="/data/tmp/fair_audit/table2"
+T=os.path.expandvars("$DATA_ROOT/work/lcwgs_sweep/t6"); GI=os.path.expandvars("$DATA_ROOT/work/giab_lcwgs"); E3=os.path.expandvars("$DATA_ROOT/work/exp3"); O=os.path.expandvars("$DATA_ROOT/work/comparison/table2")
 SAMP={"HG002":(f"{GI}/HG002_chr22_truth.vcf.gz",f"{GI}/HG002_hiconf_chr22.bed"),"HG003":(f"{GI}/HG003_truth22.vcf.gz",f"{GI}/HG003_hiconf_chr22.bed"),
  "HG004":(f"{GI}/HG004_truth22.vcf.gz",f"{GI}/HG004_hiconf_chr22.bed"),"HG005":(f"{E3}/HG005_chr22_truth.vcf.gz",f"{E3}/HG005_hiconf_chr22.bed"),
  "HG006":(f"{E3}/HG006_chr22_truth.vcf.gz",f"{E3}/HG006_hiconf_chr22.bed"),"HG007":(f"{E3}/HG007_chr22_truth.vcf.gz",f"{E3}/HG007_hiconf_chr22.bed")}

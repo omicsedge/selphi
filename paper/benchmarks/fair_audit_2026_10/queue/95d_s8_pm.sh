@@ -1,10 +1,11 @@
 #!/bin/bash
-# 95d (owner 2026-10-08): Table S8 on panel-polymorphic sites. Reuses the two panels 65 built (orig.srp from the
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
+# 95d: Table S8 on panel-polymorphic sites. Reuses the two panels 65 built (orig.srp from the
 # filtered published panel; rephased.srp from --phase-panel); re-phasing does not change allele counts, so both arms
 # exclude the same sites (those monomorphic in orig.srp).
 set -uo pipefail
-R=/data/projects/.claude_home/gt/selphi/mayor/rig; cd $R; S=$R/target/release/selphi; P=/data/tmp/fair_audit/supp; O=/data/tmp/fair_audit/supp_pm; mkdir -p $O
-J=/data/projects/selphi_impr/tests/data/software/beagle.03Oct25.f35702.jar
+R=${R:-$(git rev-parse --show-toplevel)}; cd $R; S=$R/target/release/selphi; P=$DATA_ROOT/work/comparison/supp; O=$DATA_ROOT/work/comparison/supp_pm; mkdir -p $O
+J=$DATA_ROOT/inputs/software/beagle.03Oct25.f35702.jar
 M=data/maps/beagle/chr22.map; T=data/target/chr22_801s_chip_unphased.vcf.gz; TR=data/truth/chr22_801s_truth.vcf.gz; X="--exclude-panel-monomorphic $P/orig.srp"
 row(){ [ -s "$1" ] || { echo "RESULT $2 MISSING $1"; return; }; python3 -c "
 import json;j=json.load(open('$1'))

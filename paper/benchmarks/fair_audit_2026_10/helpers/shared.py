@@ -1,8 +1,9 @@
 """Shared-site comparison of Selphi (current binary, default) vs GLIMPSE2 vs QUILT2 on the Table 2b rig
 (chr22:20-30 Mb, GIAB hiconf, 6332-hap panel). Sites = intersection of all tools' emitted sites in BED+region.
 Per-sample R2 (all shared sites), per-panel-MAF-bin pooled r2, rare-carrier recall (truth carrier, DS<0.5)."""
+import os
 import subprocess, sys, json, numpy as np
-GI="/data/tmp/giab_lcwgs"; RS,RE=20000000,30000000; T="/data/tmp/lcwgs_sweep"
+GI=os.path.expandvars("$DATA_ROOT/work/giab_lcwgs"); RS,RE=20000000,30000000; T=os.path.expandvars("$DATA_ROOT/work/lcwgs_sweep")
 TR={"HG002":f"{GI}/HG002_chr22_truth.vcf.gz","HG003":f"{GI}/HG003_truth22.vcf.gz","HG004":f"{GI}/HG004_truth22.vcf.gz"}
 af={}
 for l in open(f"{T}/panel_af.tsv"):

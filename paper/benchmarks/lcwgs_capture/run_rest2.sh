@@ -1,5 +1,6 @@
 #!/bin/bash
-cd /data/projects/check_new_ngs_data/pilot
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
+cd $DATA_ROOT/work/capture
 bash run_bam_arm.sh 20 2>&1
 for N in 10 1; do
   echo "########## CHR $N START $(date -Is)"

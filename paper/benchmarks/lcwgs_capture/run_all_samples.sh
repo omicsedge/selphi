@@ -1,16 +1,18 @@
 #!/bin/bash
-# Tutti i campioni rimanenti: hard-call vs lcwgs, chr22, vs truth GIAB per-campione.
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
+REPO_ROOT=${R:-$(git rev-parse --show-toplevel)}
+# All remaining samples: hard-call vs lcWGS, chr22, against per-sample GIAB truth.
 set -uo pipefail
-P=/data/projects/check_new_ngs_data/pilot
-REF=/data/pgx/ref/GRCh38_full_analysis_set_plus_decoy_hla.fa
-BWA=/data/pgx/env/bin/bwa
-MAP22=/data/projects/selphi_impr/tests/data/genetic_maps/plink.chr22.GRCh38.map
-S2BIN=/home/ubuntu/gt/selphi/mayor/rig/dist/selphi-linux-x86_64
+P=$DATA_ROOT/work/capture
+REF=$DATA_ROOT/inputs/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa
+BWA=$DATA_ROOT/tools/alignment/bin/bwa
+MAP22=$DATA_ROOT/inputs/genetic_maps/plink.chr22.GRCh38.map
+S2BIN=$REPO_ROOT/dist/selphi-linux-x86_64
 SRP=s2_chr22_noleak.srp
-BUCKET=<delivery-bucket>
-PFX=260811_example-data_standard-hyb
-GL=/data/tmp/giab_lcwgs
-E3=/data/tmp/exp3
+BUCKET=${BUCKET:?Set BUCKET}
+PFX=${PFX:?Set PFX}
+GL=$DATA_ROOT/work/giab_lcwgs
+E3=$DATA_ROOT/work/exp3
 cd "$P"
 say() { echo "[$(date -Is)] $*"; }
 
@@ -23,28 +25,28 @@ export AWS_ACCESS_KEY_ID="<REDACTED>"
 export AWS_SECRET_ACCESS_KEY="<REDACTED>"
 export AWS_SESSION_TOKEN="<REDACTED>"
 
-say "=== FASE 1: download di tutti i campioni ==="
+say "=== PHASE 1: download all samples ==="
 for S in "${SAMPLES[@]}"; do
   for R in R1 R2; do
     if [ ! -f "${S}_${R}.fastq.gz" ] && [ ! -f ".done_${S}_align" ]; then
       say "download ${S}_${R}"
-      aws s3 cp "s3://$BUCKET/$PFX/${S}_${R}.fastq.gz" . --no-progress || say "ERRORE download ${S}_${R}"
+      aws s3 cp "s3://$BUCKET/$PFX/${S}_${R}.fastq.gz" . --no-progress || say "ERROR download ${S}_${R}"
     fi
   done
 done
 
 awk '$1=="chr22"' gsa_sites_chr.tsv > gsa_sites_chr22.tsv
 
-say "=== FASE 2: processing per campione ==="
+say "=== PHASE 2: per-sample processing ==="
 for S in "${SAMPLES[@]}"; do
   G=${GIAB[$S]}
   say "--- $S ($G) ---"
 
   if [ ! -f ".done_${S}_align" ]; then
     if [ ! -f "${S}_R1.fastq.gz" ] || [ ! -f "${S}_R2.fastq.gz" ]; then
-      say "$S: FASTQ mancanti, salto campione"; continue
+      say "$S: FASTQ files missing, skipping sample"; continue
     fi
-    say "$S: allineamento"
+    say "$S: alignment"
     $BWA mem -K 100000000 -Y -t 12 -R "@RG\tID:${S}.MGI\tSM:${S}\tPL:DNBSEQ" \
       "$REF" ${S}_R1.fastq.gz ${S}_R2.fastq.gz 2> ${S}_bwa.log \
     | samtools fixmate -u -m - - \
@@ -64,7 +66,7 @@ for S in "${SAMPLES[@]}"; do
   fi
 
   if [ ! -f ".done_${S}_call" ]; then
-    say "$S: chiamata ai siti GSA"
+    say "$S: calling at GSA sites"
     bcftools mpileup -f "$REF" -R gsa_regions_chr.bed \
         -a FORMAT/AD,FORMAT/DP -q 20 -Q 20 -d 500 --threads 4 -Ou ${S}.bam 2> ${S}_mpileup.log \
     | bcftools call -m -A -C alleles -T gsa_alleles_chr.tsv.gz --threads 4 -Ou 2> ${S}_call.log \
@@ -74,7 +76,7 @@ for S in "${SAMPLES[@]}"; do
   fi
 
   if [ ! -f ".done_${S}_typed" ]; then
-    say "$S: concordanza tipizzati chr22 vs truth $G"
+    say "$S: chr22 typed-site concordance vs truth $G"
     bcftools norm -m -both -f "$REF" "${TRUTHV[$S]}" 2>/dev/null \
       | bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[%GT]\n' \
       | awk 'length($3)==1 && length($4)==1' > ${S}_truth22.tsv
@@ -83,24 +85,24 @@ for S in "${SAMPLES[@]}"; do
       --sites gsa_sites_chr22.tsv --calls ${S}_calls22.tsv --truth ${S}_truth22.tsv \
       --bed "${TRUTHB[$S]}" --out ${S}_conc_typed.json > /dev/null 2>&1 \
       && say "$S typed: $(python3 -c "import json;d=json.load(open('${S}_conc_typed.json'));print('overall',d['overall_concordance_pct'],'nonref',d['nonref_concordance_pct'],'callrate',d['call_rate_pct'])")" \
-      || say "$S typed: FALLITO"
+      || say "$S typed: FAILED"
     touch ".done_${S}_typed"
   fi
 
   if [ ! -f ".done_${S}_impute" ]; then
-    say "$S: imputazione hard-call + lcwgs"
+    say "$S: imputation hard-call + lcwgs"
     bcftools view -r chr22 -e 'GT="mis"' ${S}_chip_chr.vcf.gz \
       | bcftools annotate --rename-chrs rename_to_nochr.txt -x INFO,^FORMAT/GT -Oz -o ${S}_target22.vcf.gz
     bcftools index -f -t ${S}_target22.vcf.gz
     "$S2BIN" --refpanel $SRP --input ${S}_target22.vcf.gz --map "$MAP22" \
-        --out ${S}_imp_hard --threads 16 > ${S}_s2hard.log 2>&1 || say "$S hard: FALLITO"
+        --out ${S}_imp_hard --threads 16 > ${S}_s2hard.log 2>&1 || say "$S hard: FAILED"
     bcftools mpileup -f "$REF" -r chr22 -T panel22_regions_chr.bed -I -E -a FORMAT/DP \
         -q 20 -Q 20 --threads 4 -Ou ${S}.bam 2> ${S}_mpileup_gl.log \
       | bcftools annotate --rename-chrs rename_to_nochr.txt -Ou \
       | bcftools call -Aim -C alleles -T panel22_alleles.tsv.gz --threads 4 -Oz -o ${S}_gl22.vcf.gz 2> ${S}_call_gl.log
     bcftools index -f -t ${S}_gl22.vcf.gz
     "$S2BIN" --lcwgs --refpanel $SRP --input ${S}_gl22.vcf.gz --map "$MAP22" \
-        --out ${S}_imp_lcwgs --threads 16 > ${S}_s2lcwgs.log 2>&1 || say "$S lcwgs: FALLITO"
+        --out ${S}_imp_lcwgs --threads 16 > ${S}_s2lcwgs.log 2>&1 || say "$S lcwgs: FAILED"
     touch ".done_${S}_impute"
   fi
 
@@ -116,14 +118,14 @@ for S in "${SAMPLES[@]}"; do
           --bed "${TRUTHB[$S]}" --exclude typed_chr22.txt --af af22.tsv \
           --out ${S}_conc_${V}.json > /dev/null 2>&1 \
           && say "$S $V: $(python3 -c "import json;d=json.load(open('${S}_conc_${V}.json'));c=d['by_af'].get('common_maf>=5%',{});print('common_nonref',c.get('nonref_pct'),'common_het',c.get('het_recall_pct'),'overall',d['overall_concordance_pct'])")" \
-          || say "$S $V: eval FALLITA"
+          || say "$S $V: eval FAILED"
       fi
     done
     touch ".done_${S}_eval"
   fi
 done
 
-say "=== FASE 3: tabella riassuntiva ==="
+say "=== PHASE 3: summary table ==="
 python3 - <<'EOF'
 import json, os
 rows = []
@@ -150,4 +152,4 @@ print(f"{'MEDIA':10} {'':6} {'':>6} {m(agg['t']):>9} {m(agg['h']):>19} {m(agg['l
 json.dump({s: {"typed": load(ft), "hard": load(fh), "lcwgs": load(fl)} for s,g,ft,fh,fl in samples},
           open("summary_all_samples.json","w"), indent=1)
 EOF
-say "=== TUTTI I CAMPIONI COMPLETATI ==="
+say "=== ALL SAMPLES COMPLETE ==="

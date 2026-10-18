@@ -1,13 +1,15 @@
 #!/bin/bash
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
+REPO_ROOT=${R:-$(git rev-parse --show-toplevel)}
 # Multi-sample timing: 6 GIAB BAMs chr22 in ONE run, Selphi (--bam-list, BAQ) vs GLIMPSE2 (--bam-list), 16 threads,
 # on a QUIET machine (waits for the chr1 pipeline and the decide6 batch). Also Selphi at GLIMPSE2's iteration count.
-set -uo pipefail; cd /data/projects/check_new_ngs_data/pilot
+set -uo pipefail; cd $DATA_ROOT/work/capture
 while ! grep -q RESTDONE rest.out 2>/dev/null || ! grep -q DECIDE6DONE dbg_arm/decide6.out 2>/dev/null; do sleep 60; done
 sleep 30
-S2=/data/projects/.claude_home/gt/selphi/mayor/rig/target/release/selphi
-G2=/home/ubuntu/gt/selphi/mayor/rig/_archive/reference_code/GLIMPSE2
-REF=/data/pgx/ref/GRCh38_full_analysis_set_plus_decoy_hla.fa; MAP=/data/projects/selphi_impr/tests/data/genetic_maps/plink.chr22.GRCh38.map
-GMAP=/data/tmp/lcwgs_sweep/glimpse.gmap; CH=/data/tmp/lcwgs_sweep/t6/chunks_nt.txt
+S2=$REPO_ROOT/target/release/selphi
+G2=$REPO_ROOT/_archive/reference_code/GLIMPSE2
+REF=$DATA_ROOT/inputs/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa; MAP=$DATA_ROOT/inputs/genetic_maps/plink.chr22.GRCh38.map
+GMAP=$DATA_ROOT/work/lcwgs_sweep/glimpse.gmap; CH=$DATA_ROOT/work/lcwgs_sweep/t6/chunks_nt.txt
 D=dbg_arm/ms; mkdir -p $D
 say(){ echo "[$(date -Is)] $*"; }
 SAMPLES="NA24143 NA24149 NA24385 NA24631 NA24694 NA24695"
@@ -29,7 +31,7 @@ echo "G2_N6_WALL_S $(( $(date +%s)-T0 ))" | tee -a $D/timing.txt
 for f in sel_n1 sel_n6 sel_n6_it20; do echo "$f $(grep -E 'Elapsed|Maximum resident' $D/$f.log | tr '\n' ' ')" >> $D/timing.txt; done
 grep -h 'Maximum resident' $D/g2_*.log | sort -k6 -n | tail -1 | sed 's/^/G2 max chunk RSS: /' >> $D/timing.txt
 # score per sample on GLIMPSE2's own site list (same as the single-sample arms)
-GL=/data/tmp/giab_lcwgs; E3=/data/tmp/exp3
+GL=$DATA_ROOT/work/giab_lcwgs; E3=$DATA_ROOT/work/exp3
 declare -A BED=( [NA24385]=$GL/HG002_hiconf_chr22.bed [NA24149]=$GL/HG003_hiconf_chr22.bed [NA24143]=$GL/HG004_hiconf_chr22.bed [NA24631]=$E3/HG005_hiconf_chr22.bed [NA24694]=$E3/HG006_hiconf_chr22.bed [NA24695]=$E3/HG007_hiconf_chr22.bed )
 for run in sel_n6 sel_n6_it20 g2_n6; do
   case $run in g2_n6) F=$D/g2_n6.bcf;; *) F=$D/$run.vcf.gz;; esac

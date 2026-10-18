@@ -1,14 +1,15 @@
 #!/bin/bash
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
 # R7a: Table 6b. The May "+pedigree" cells for Beagle and SHAPEIT5 have no surviving files, and Beagle 5.5 has NO pedigree
 # option (its argument list has none). Re-run all three tools on the same 162-person cohort (54 children + both parents,
 # unphased WGS genotypes) against the same no-trios panel: Selphi 2 diploid with --ped; SHAPEIT5 phase_common+phase_rare
 # with --pedigree; Beagle 5.5 co-phasing the parents in the cohort (no pedigree input exists). SER on the 54 children only,
 # exactly as Table 6 (bcftools +trio-switch-rate vs parental genotypes).
 set -uo pipefail
-R=/data/projects/.claude_home/gt/selphi/mayor/rig; cd $R; S=$R/target/release/selphi; T=data/trio_benchmark
-J=/data/projects/selphi_impr/tests/data/software/beagle.03Oct25.f35702.jar
+R=${R:-$(git rev-parse --show-toplevel)}; cd $R; S=$R/target/release/selphi; T=data/trio_benchmark
+J=$DATA_ROOT/inputs/software/beagle.03Oct25.f35702.jar
 PC=_archive/reference_code/shapeit5/phase_common/bin/phase_common; PR=_archive/reference_code/shapeit5/phase_rare/bin/phase_rare
-O=/data/tmp/fair_audit/table6b; mkdir -p $O; declare -A LEN=([22]=50818468 [1]=248956422)
+O=$DATA_ROOT/work/comparison/table6b; mkdir -p $O; declare -A LEN=([22]=50818468 [1]=248956422)
 awk '{print $2, $3, $4}' $T/trios.ped > $O/s5.ped
 tm() { awk '/Elapsed \(wall/{w=$8} /Maximum resident/{m=$6/1048576} END{printf "%s / %.1f GB", w, m}' "$1"; }
 ser() { local phased=$1 tag=$2 C=$3

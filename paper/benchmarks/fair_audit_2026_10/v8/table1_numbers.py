@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Table 1 / S4a numbers: array route (v8 re-run, /data/tmp/paper_final/table1) vs GL engine (unchanged lcWGS
+"""Table 1 / S4a numbers: array route (v8 re-run, $DATA_ROOT/work/paper_final/table1) vs GL engine (unchanged lcWGS
 outputs, figures/data/chr22/*_conc_lcwgs.json). Paired bootstrap 95% CI (20,000 resamples, seed 1) + exact Wilcoxon."""
+import os
+from pathlib import Path
 import json, numpy as np
 from scipy.stats import wilcoxon
 S=[("HG002","NA24385"),("HG003","NA24149"),("HG004","NA24143"),("HG005","NA24631"),("HG006","NA24694"),("HG007","NA24695")]
-A='/data/tmp/paper_final/table1'; G='/data/projects/.claude_home/gt/selphi/mayor/rig/paper/figures/data/chr22'
+A=os.path.expandvars('$DATA_ROOT/work/paper_final/table1'); G=str(Path(os.environ.get("R", Path(__file__).resolve().parents[4])) / "paper/figures/data/chr22")
 K=['nonref_concordance_pct','het_recall_pct','het_precision_pct','overall_concordance_pct']
 a={hg:json.load(open(f'{A}/{na}_conc_hard.json')) for hg,na in S}
 g={hg:json.load(open(f'{G}/{na}_conc_lcwgs.json')) for hg,na in S}

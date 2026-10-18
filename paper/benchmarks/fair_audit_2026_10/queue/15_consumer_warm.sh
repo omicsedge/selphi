@@ -1,9 +1,10 @@
 #!/bin/bash
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
 # Consumer-array whole genome, SECOND pass with BOTH panels pre-read into the page cache before each chromosome
 # (the first same-session pass in speed/run.sh ran cold for both tools). Same inputs, alternating tools, 16 threads.
 set -uo pipefail
-R=/data/projects/.claude_home/gt/selphi/mayor/rig; S=$R/target/release/selphi; J=/data/projects/selphi_impr/tests/data/software/beagle.03Oct25.f35702.jar
-B=/data/projects/wgs_imputation_benchmark; O=/data/tmp/fair_audit/speed_warm; mkdir -p $O; cd $O
+R=${R:-$(git rev-parse --show-toplevel)}; S=$R/target/release/selphi; J=$DATA_ROOT/inputs/software/beagle.03Oct25.f35702.jar
+B=$DATA_ROOT/inputs/array; O=$DATA_ROOT/work/comparison/speed_warm; mkdir -p $O; cd $O
 sec(){ awk '/Elapsed \(wall/{n=split($8,a,":"); s=(n==3)?a[1]*3600+a[2]*60+a[3]:a[1]*60+a[2]} END{print s}' "$1"; }
 mem(){ awk '/Maximum resident/{printf "%.1f", $6/1048576}' "$1"; }
 ss=0; bs=0; sm=0; bm=0

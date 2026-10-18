@@ -1,12 +1,14 @@
 #!/bin/bash
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
+REPO_ROOT=${R:-$(git rev-parse --show-toplevel)}
 # Selphi lcWGS with NATIVE pileup (--bam --reference: BAQ on, indel panel sites excluded), scored on the same GLIMPSE2 site list.
 # Outputs *_selphi_native (the old *_selphi_bam files = pre-BAQ ablation, kept). Usage: run_bam_arm.sh <chr N | 22>
 set -uo pipefail
-N=${1:?}; P=/data/projects/check_new_ngs_data/pilot; cd "$P"
-S2=/data/projects/.claude_home/gt/selphi/mayor/rig/target/release/selphi
-PMAP=/data/projects/selphi_impr/tests/data/genetic_maps/plink.chr${N}.GRCh38.map
-REF=/data/pgx/ref/GRCh38_full_analysis_set_plus_decoy_hla.fa
-GL=/data/tmp/giab_lcwgs; E3=/data/tmp/exp3
+N=${1:?}; P=$DATA_ROOT/work/capture; cd "$P"
+S2=$REPO_ROOT/target/release/selphi
+PMAP=$DATA_ROOT/inputs/genetic_maps/plink.chr${N}.GRCh38.map
+REF=$DATA_ROOT/inputs/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa
+GL=$DATA_ROOT/work/giab_lcwgs; E3=$DATA_ROOT/work/exp3
 say(){ echo "[$(date -Is)] chr$N bam-arm: $*"; }
 declare -A BED22=( [NA24385]=$GL/HG002_hiconf_chr22.bed [NA24149]=$GL/HG003_hiconf_chr22.bed [NA24143]=$GL/HG004_hiconf_chr22.bed \
                    [NA24631]=$E3/HG005_hiconf_chr22.bed [NA24694]=$E3/HG006_hiconf_chr22.bed [NA24695]=$E3/HG007_hiconf_chr22.bed )
@@ -17,15 +19,15 @@ for S in NA24143 NA24149 NA24385 NA24631 NA24694 NA24695; do
   else
     D=chr$N; SRP=$D/s2.srp; BAM=$D/${S}.bam; OUT=$D/${S}_selphi_native; SITES=$D/sites_${S}.tsv; TRUTH=$D/${S}_truth.tsv; BED=$D/${S}_hiconf.bed; EXCL=$D/typed.txt; AF=$D/af.tsv; CONC=$D/${S}_conc_selphi_native.json
   fi
-  [ -s "$SITES" ] || { say "$S: site list assente ($SITES) — GLIMPSE2 non ancora finito, salto"; continue; }
+  [ -s "$SITES" ] || { say "$S: site list missing ($SITES) — GLIMPSE2 not finished yet, skipping"; continue; }
   if [ ! -s ${OUT}.vcf.gz ]; then
     say "$S: selphi --lcwgs --bam"
-    /usr/bin/time -v $S2 --lcwgs --bam $BAM --reference $REF --refpanel $SRP --map "$PMAP" --out $OUT --threads 16 > ${OUT}.log 2>&1 || { say "$S FALLITO"; continue; }
+    /usr/bin/time -v $S2 --lcwgs --bam $BAM --reference $REF --refpanel $SRP --map "$PMAP" --out $OUT --threads 16 > ${OUT}.log 2>&1 || { say "$S FAILED"; continue; }
   fi
   bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[%GT]\n' ${OUT}.vcf.gz 2>/dev/null \
     | awk 'length($3)==1 && length($4)==1 {c=$1; sub(/^chr/,"",c); print "chr"c"\t"$2"\t"$3"\t"$4"\t"$5}' > ${OUT}.tsv
   python3 concordance.py --label "${S}_chr${N}_selphi_native" --sites $SITES --calls ${OUT}.tsv --truth $TRUTH --bed "$BED" \
-    --exclude $EXCL --af $AF --out $CONC > /dev/null 2>&1 || say "$S conc FALLITA"
+    --exclude $EXCL --af $AF --out $CONC > /dev/null 2>&1 || say "$S conc FAILED"
   say "$S done"
 done
 echo "BAMARM${N}DONE"

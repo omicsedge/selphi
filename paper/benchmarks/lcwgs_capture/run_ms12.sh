@@ -1,11 +1,13 @@
 #!/bin/bash
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
+REPO_ROOT=${R:-$(git rev-parse --show-toplevel)}
 # n=12 timing regime (2*n >= 16 threads → sequential chunks): 6 real + 6 reheadered duplicates. Timing only.
-set -uo pipefail; cd /data/projects/check_new_ngs_data/pilot
+set -uo pipefail; cd $DATA_ROOT/work/capture
 while ! grep -q MSDONE dbg_arm/ms.out 2>/dev/null; do sleep 60; done; sleep 20
-S2=/data/projects/.claude_home/gt/selphi/mayor/rig/target/release/selphi
-G2=/home/ubuntu/gt/selphi/mayor/rig/_archive/reference_code/GLIMPSE2
-REF=/data/pgx/ref/GRCh38_full_analysis_set_plus_decoy_hla.fa; MAP=/data/projects/selphi_impr/tests/data/genetic_maps/plink.chr22.GRCh38.map
-GMAP=/data/tmp/lcwgs_sweep/glimpse.gmap; CH=/data/tmp/lcwgs_sweep/t6/chunks_nt.txt
+S2=$REPO_ROOT/target/release/selphi
+G2=$REPO_ROOT/_archive/reference_code/GLIMPSE2
+REF=$DATA_ROOT/inputs/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa; MAP=$DATA_ROOT/inputs/genetic_maps/plink.chr22.GRCh38.map
+GMAP=$DATA_ROOT/work/lcwgs_sweep/glimpse.gmap; CH=$DATA_ROOT/work/lcwgs_sweep/t6/chunks_nt.txt
 D=dbg_arm/ms; say(){ echo "[$(date -Is)] $*"; }
 { for s in NA24143 NA24149 NA24385 NA24631 NA24694 NA24695; do echo ${s}_chr22.bam; echo $D/${s}_dup_chr22.bam; done; } > $D/bams12.txt
 say "Selphi n=12 --bam-list, default iterations, LCWGS_TIMING"

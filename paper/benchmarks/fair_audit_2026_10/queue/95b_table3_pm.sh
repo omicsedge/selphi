@@ -1,11 +1,12 @@
 #!/bin/bash
-# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, cb4dc9f) with the CSI-seek fix (c76055a).
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
+# Score only panel-polymorphic sites (--exclude-panel-monomorphic) with complete CSI-region record retrieval.
 # R4b: Table 3 / S1 "unphased" rows (full phase+impute pipeline from the truly unphased chip, chr22 and chr1, 801 samples).
 # Selphi 2 and Beagle 5.5 in the SAME session, same target, Beagle given a bref3 converted from Selphi's SRP, same map,
 # scored by the corrected evaluator; per-sample paired statistics recomputed from these two runs only.
 set -uo pipefail
-R=/data/projects/.claude_home/gt/selphi/mayor/rig; cd $R; S=$R/target/release/selphi; O=/data/tmp/fair_audit/table3_pm; mkdir -p $O
-J=/data/projects/selphi_impr/tests/data/software/beagle.03Oct25.f35702.jar
+R=${R:-$(git rev-parse --show-toplevel)}; cd $R; S=$R/target/release/selphi; O=$DATA_ROOT/work/comparison/table3_pm; mkdir -p $O
+J=$DATA_ROOT/inputs/software/beagle.03Oct25.f35702.jar
 sec(){ awk '/Elapsed \(wall/{n=split($8,a,":"); s=(n==3)?a[1]*3600+a[2]*60+a[3]:a[1]*60+a[2]} END{printf "%.1f", s}' "$1"; }
 for c in 22 1; do
   TR=data/truth/chr${c}_801s_truth.vcf.gz; IN=data/target/chr${c}_801s_chip_truly_unphased.vcf.gz; SRP=data/reference/srp/chr${c}_v2.srp; MAP=data/maps/beagle/chr$c.map

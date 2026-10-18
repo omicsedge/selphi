@@ -1,12 +1,13 @@
 #!/bin/bash
-# R7d: Table S7 (phaser x imputer matrix; June source dir deleted, June binary). 1KG 801 held-out array targets (truly
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
+# R7d: Table S7 (phaser x imputer matrix). 1KG 801 held-out array targets (truly
 # unphased), panel = 1KG 2,401 samples (same BCF for SHAPEIT5; SRP built from it for Selphi; bref3 from that SRP for
 # Beagle). Phasers: Selphi 2 --phase-only (default diploid), Beagle 5.5 impute=false, SHAPEIT5 phase_common. Imputers:
 # Selphi 2 and Beagle 5.5, each fed every phasing. Same evaluator, same truth.
 set -uo pipefail
-R=/data/projects/.claude_home/gt/selphi/mayor/rig; cd $R; S=$R/target/release/selphi; O=/data/tmp/fair_audit/s7; mkdir -p $O
-J=/data/projects/selphi_impr/tests/data/software/beagle.03Oct25.f35702.jar; PC=_archive/reference_code/shapeit5/phase_common/bin/phase_common
-declare -A BCF=([22]=data/reference/bcf/chr22.bcf [1]=/data/projects/selphi_impr/tests/data/reference/bcf/1kg/reference_panel.30x.hg38_chr1_2401s.bcf)
+R=${R:-$(git rev-parse --show-toplevel)}; cd $R; S=$R/target/release/selphi; O=$DATA_ROOT/work/comparison/s7; mkdir -p $O
+J=$DATA_ROOT/inputs/software/beagle.03Oct25.f35702.jar; PC=_archive/reference_code/shapeit5/phase_common/bin/phase_common
+declare -A BCF=([22]=data/reference/bcf/chr22.bcf [1]=$DATA_ROOT/inputs/reference/bcf/1kg/reference_panel.30x.hg38_chr1_2401s.bcf)
 for C in 22 1; do
   MAP=data/maps/beagle/chr$C.map; GMAP=_archive/old_data/tests/data/genetic_maps/shapeit5_impute5/chr$C.b38.gmap.gz
   SRP=data/reference/srp/chr${C}_v2.srp; IN=data/target/chr${C}_801s_chip_truly_unphased.vcf.gz; TR=data/truth/chr${C}_801s_truth.vcf.gz

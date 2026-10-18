@@ -1,10 +1,11 @@
 #!/bin/bash
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
 # Speed-only test of the walk cap on the 75,552-hap v3 panel with a LARGE cohort (801 1KG chr22 phased targets;
 # they are in the panel, so this measures time only). Waits for the MESA runs; one job at a time; 2 reps each.
 set -uo pipefail
-until grep -q NEWMESADONE /data/tmp/member2/mesa_new/run.out 2>/dev/null; do sleep 60; done
-R=/data/projects/.claude_home/gt/selphi/mayor/rig; cd $R; S=$R/target/release/selphi; O=/data/tmp/member2/v3speed
-B=/data/projects/wgs_imputation_benchmark
+until grep -q NEWMESADONE $DATA_ROOT/work/walk_cap/mesa_new/run.out 2>/dev/null; do sleep 60; done
+R=${R:-$(git rev-parse --show-toplevel)}; cd $R; S=$R/target/release/selphi; O=$DATA_ROOT/work/walk_cap/v3speed
+B=$DATA_ROOT/inputs/array
 # v3 panel uses plain contig names ("22"); 1KG target uses "22" too? normalise to the panel's naming
 T=data/target/chr22_801s_chip_unphased.vcf.gz
 cat $B/panel/srp/chr22_v3.srp > /dev/null

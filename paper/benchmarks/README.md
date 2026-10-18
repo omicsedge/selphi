@@ -9,6 +9,7 @@ they do not identify a hosted dataset. Export `S3` separately when a runner uses
 layout. `R` (or `REPO` in manifests) denotes the repository root; shell runners
 default `R` to `git rev-parse --show-toplevel` and accept an exported override.
 Run them from a repository checkout, or supply `R` explicitly.
+`REPO_ROOT` in capture scripts is the same root, derived from `R`.
 
 The example layout uses `inputs/` for datasets, `tools/` for external programs,
 and `work/` for intermediates and results. Provision controlled-access inputs

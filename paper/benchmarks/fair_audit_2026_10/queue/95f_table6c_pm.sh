@@ -1,13 +1,14 @@
 #!/bin/bash
-# 95 (owner 2026-10-08): same as the source step, scored only on sites POLYMORPHIC in the panel (--exclude-panel-monomorphic, cb4dc9f) with the CSI-seek fix (c76055a).
-# R7c: Table 6c (does the pedigree improve downstream imputation against an independent truth?). The June source dir was
-# deleted and its Beagle arm passed `ped=`, which Beagle 5.5 does not accept. Re-run: 54 children + parents masked to GSA
+: "${DATA_ROOT:?Set DATA_ROOT as described in paper/benchmarks/README.md}"
+# Score only panel-polymorphic sites (--exclude-panel-monomorphic) with complete CSI-region record retrieval.
+# R7c: Table 6c measures pedigree effects on downstream imputation against independent truth.
+# Beagle 5.5 does not accept `ped=`. Use 54 children + parents masked to GSA
 # sites; phase WITHOUT pedigree (children alone) and WITH pedigree (Selphi --ped, SHAPEIT5 --pedigree; Beagle has no
 # pedigree input, so its arm co-phases the parents in the cohort and is labelled as such); impute the 54 children with ONE
 # fixed imputer (Selphi 2, impute-only); score imputed (non-chip) sites against each child's own WGS.
 set -uo pipefail
-R=/data/projects/.claude_home/gt/selphi/mayor/rig; cd $R; S=$R/target/release/selphi; T=data/trio_benchmark; O=/data/tmp/fair_audit/table6c_pm; mkdir -p $O
-J=/data/projects/selphi_impr/tests/data/software/beagle.03Oct25.f35702.jar; PC=_archive/reference_code/shapeit5/phase_common/bin/phase_common
+R=${R:-$(git rev-parse --show-toplevel)}; cd $R; S=$R/target/release/selphi; T=data/trio_benchmark; O=$DATA_ROOT/work/comparison/table6c_pm; mkdir -p $O
+J=$DATA_ROOT/inputs/software/beagle.03Oct25.f35702.jar; PC=_archive/reference_code/shapeit5/phase_common/bin/phase_common
 awk '{print $2, $3, $4}' $T/trios.ped > $O/s5.ped
 for C in 22 1; do
   MAP=data/maps/beagle/chr$C.map; GMAP=_archive/old_data/tests/data/genetic_maps/shapeit5_impute5/chr$C.b38.gmap.gz
