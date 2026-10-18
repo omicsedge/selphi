@@ -1337,6 +1337,59 @@ fn finalize_gl_errmod(
     is_snp: &[bool],
     em: &crate::lcwgs::errmod::ErrMod,
 ) -> Vec<f32> {
+    finalize_gl_errmod_with_quant(bases, ref_base, alt_base, is_snp, em,
+        crate::config::is_one("LCWGS_NATIVE_PL_QUANT"))
+}
+
+fn finalize_gl_errmod_with_quant(
+    bases: &mut [Vec<u16>], ref_base: &[u8], alt_base: &[u8], is_snp: &[bool],
+    em: &crate::lcwgs::errmod::ErrMod, quant: bool,
+) -> Vec<f32> {
+    let n_var = bases.len();
+    let mut out = vec![1.0f32 / 3.0; n_var * 3];
+    // `bcftools call` writes the same errmod phreds as INTEGER PLs, min-normalised
+    // and capped at 255 (bam2bcf.c), so the PL path sees a wrong genotype at no
+    // less than 10^-25.5 while this path, uncapped, can put it at 10^-90 on a deep
+    // on-target column. `LCWGS_NATIVE_PL_QUANT` reproduces the PL representation
+    // here, to measure whether that difference is the residual native-vs-bcftools
+    // gap (A/B).
+    out.par_chunks_mut(3).zip(bases.par_iter_mut()).enumerate().for_each(|(v, (dst, calls))| {
+        if !is_snp[v] || calls.is_empty() { return; }
+        let r = ascii_to_base4(ref_base[v]);
+        let a = ascii_to_base4(alt_base[v]);
+        if r > 3 || a > 3 { return; }
+        let mut q = [0.0f32; 25];
+        em.cal(calls, 5, &mut q);
+        let (mut q0, mut q1, mut q2) = (q[r * 5 + r] as f64, q[r * 5 + a] as f64, q[a * 5 + a] as f64);
+        if quant {
+            let qmin = q0.min(q1).min(q2);
+            q0 = ((q0 - qmin).round()).min(255.0);
+            q1 = ((q1 - qmin).round()).min(255.0);
+            q2 = ((q2 - qmin).round()).min(255.0);
+        }
+        // phred → likelihood (lower phred = more likely); normalise.
+        let l0 = 10f64.powf(-q0 / 10.0);
+        let l1 = 10f64.powf(-q1 / 10.0);
+        let l2 = 10f64.powf(-q2 / 10.0);
+        let s = l0 + l1 + l2;
+        if s > 0.0 {
+            dst[0] = (l0 / s) as f32;
+            dst[1] = (l1 / s) as f32;
+            dst[2] = (l2 / s) as f32;
+        }
+    });
+    out
+}
+
+#[cfg(test)]
+fn finalize_gl_errmod_reference(
+    bases: &mut [Vec<u16>],
+    ref_base: &[u8],
+    alt_base: &[u8],
+    is_snp: &[bool],
+    em: &crate::lcwgs::errmod::ErrMod,
+    quant: bool,
+) -> Vec<f32> {
     let n_var = bases.len();
     let mut out = vec![1.0f32 / 3.0; n_var * 3];
     let mut q = [0.0f32; 25];
@@ -1346,7 +1399,6 @@ fn finalize_gl_errmod(
     // on-target column. `LCWGS_NATIVE_PL_QUANT` reproduces the PL representation
     // here, to measure whether that difference is the residual native-vs-bcftools
     // gap (A/B).
-    let quant = crate::config::is_one("LCWGS_NATIVE_PL_QUANT");
     for v in 0..n_var {
         if !is_snp[v] || bases[v].is_empty() { continue; }
         let r = ascii_to_base4(ref_base[v]);
@@ -1390,6 +1442,33 @@ fn accumulate(ll: &mut [f64; 3], b: u8, rb: u8, ab: u8, q: usize, lut: &PhredLut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_errmod_matches_serial_gl_bits_and_base_order() {
+        use crate::lcwgs::hmm::reference_pack::Xs;
+        let mut rng = Xs(0x1F83_D9AB_FB41_BD6B);
+        let n = 521;
+        let bases: Vec<Vec<u16>> = (0..n).map(|v| {
+            (0..v % 271).map(|_| ((rng.below(60) as u16 + 4) << 5)
+                | ((rng.below(2) as u16) << 4) | rng.below(5) as u16).collect()
+        }).collect();
+        let rb: Vec<_> = (0..n).map(|v| b"ACGTN"[v % 5]).collect();
+        let ab: Vec<_> = (0..n).map(|v| b"ACGTN"[(v + 1) % 5]).collect();
+        let snp: Vec<_> = (0..n).map(|v| v % 7 != 0).collect();
+        let em = crate::lcwgs::errmod::ErrMod::new();
+        for quant in [false, true] {
+            let mut reference_bases = bases.clone();
+            let want = finalize_gl_errmod_reference(&mut reference_bases, &rb, &ab, &snp, &em, quant);
+            for threads in [1, 2, 4] {
+                let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+                let mut calls = bases.clone();
+                let got = pool.install(|| finalize_gl_errmod_with_quant(&mut calls, &rb, &ab, &snp, &em, quant));
+                assert_eq!(got.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    want.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+                assert_eq!(calls, reference_bases);
+            }
+        }
+    }
 
     #[test]
     fn phred_lut_basic() {

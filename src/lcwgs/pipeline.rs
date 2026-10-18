@@ -806,7 +806,10 @@ fn run_chunked_gibbs(
             gp[dst.start * 3 .. dst.end * 3].copy_from_slice(&out.gp[src.start * 3 .. src.end * 3]);
         }
     };
-    super::memory::run_chunks(&chunk_memory, &memory, threads, process_chunk, merge_chunk);
+    // Keep enough samples runnable to fill the pool while leaving room for
+    // row tasks and optional second-haplotype work inside each active chunk.
+    let runnable_chunks = threads.div_ceil(n_samples.max(1)).max(1);
+    super::memory::run_chunks(&chunk_memory, &memory, runnable_chunks, process_chunk, merge_chunk);
 
     (dosage, gp)
 }
@@ -847,20 +850,27 @@ mod tests {
                 (bm, cm, gl)
             }).collect();
             let costs: Vec<_> = inputs.iter().map(|(_, cm, _)| chunk_state_bytes(cm.len(), 40, ns)).collect();
-            let memory = super::super::memory::MemoryBudget::new(64 * 1024 * 1024, 1024);
-            let process = |c: usize, bounded: bool| {
+            let process = |c: usize, memory: Option<&super::super::memory::MemoryBudget>| {
                 let (bm, cm, gl) = &inputs[c];
-                let out = super::super::iterate::run_gibbs_ensemble_with_memory(gl, bm, cm, ns, &params, None, None, bounded.then_some(&memory));
+                let out = super::super::iterate::run_gibbs_ensemble_with_memory(gl, bm, cm, ns, &params, None, None, memory);
                 (out.dosage.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                  out.gp.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
             };
-            let serial: Vec<_> = pool.install(|| (0..inputs.len()).map(|c| process(c, false)).collect());
-            for live in [1, 3] {
-                let mut got = vec![None; inputs.len()];
-                super::super::memory::run_chunks(&costs, &memory, live,
-                    |c| process(c, true), |c, out| got[c] = Some(out));
-                assert_eq!(got.into_iter().map(Option::unwrap).collect::<Vec<_>>(), serial,
-                    "samples={ns} live={live}");
+            let serial: Vec<_> = pool.install(|| (0..inputs.len()).map(|c| process(c, None)).collect());
+            for parallel in [false, true] {
+                let mut memory = super::super::memory::MemoryBudget::new(64 * 1024 * 1024, 1024);
+                memory.set_parallel_fb(parallel);
+                for live in [1, 3] {
+                    let mut got = vec![None; inputs.len()];
+                    super::super::memory::run_chunks(&costs, &memory, live,
+                        |c| process(c, Some(&memory)), |c, out| got[c] = Some(out));
+                    assert_eq!(got.into_iter().map(Option::unwrap).collect::<Vec<_>>(), serial,
+                        "samples={ns} live={live} parallel={parallel}");
+                }
+                if parallel && rayon::current_num_threads() > 1 {
+                    assert_eq!(memory.parallel_fb_grants(),
+                        (params.n_iterations - params.n_main_iterations) * ns * inputs.len() * 2);
+                } else { assert_eq!(memory.parallel_fb_grants(), 0); }
             }
         }
     }

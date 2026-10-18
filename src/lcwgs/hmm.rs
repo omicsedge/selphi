@@ -54,6 +54,7 @@
 //! - Scalar and AVX-512/AVX2/NEON dispatch paths.
 
 use std::cell::RefCell;
+use rayon::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::LcwgsParams;
@@ -103,6 +104,14 @@ impl Drop for TrimCaches {
         }
         TL_CONDBITS.with(|c| super::membership::trim_vec(&mut c.borrow_mut(), CACHE_BUFFER_BYTES));
     }
+}
+
+/// Active packs fit their charged axis even when nested row work leaves
+/// another pack in the worker cache before the caller resumes.
+fn take_pack_scratch(words: usize) -> Vec<u64> {
+    let mut pack = TL_CONDBITS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    super::membership::trim_vec(&mut pack, words * std::mem::size_of::<u64>());
+    pack
 }
 
 /// Conditioning-bitmatrix pack shared by the two haplotypes of one sample and
@@ -173,13 +182,19 @@ impl BasePack {
         self.words.reserve_exact(total);
         if self.b > 0 {
             build_gather_plan(base, &mut self.plan);
-            let wp = self.words.as_mut_ptr();
-            for (r, &a) in sites_abs.iter().enumerate() {
-                let rp = ref_bm.row(a).as_ptr();
-                // SAFETY: every base id is < n_haps, so each run's word lies in row
-                // `a`; row r's `wb` words lie inside the capacity reserved above.
-                let n = unsafe { gather_row(rp, &self.plan, wp.add(r * self.wb), 0, 0, 0) };
-                debug_assert_eq!(n, self.wb);
+            let plan = &self.plan;
+            let wb = self.wb;
+            let pack = |(r, dst): (usize, &mut [std::mem::MaybeUninit<u64>])| {
+                let rp = ref_bm.row(sites_abs[r]).as_ptr();
+                // Each task owns one disjoint row of reserved, uninitialized words.
+                let n = unsafe { gather_row(rp, plan, dst.as_mut_ptr().cast(), 0, 0, 0) };
+                debug_assert_eq!(n, wb);
+            };
+            let rows = &mut self.words.spare_capacity_mut()[..total];
+            if sites_abs.len() >= 512 {
+                rows.par_chunks_mut(wb).enumerate().with_min_len(128).for_each(pack);
+            } else {
+                rows.chunks_mut(wb).enumerate().for_each(pack);
             }
         }
         // SAFETY: all `total` words were written above (`wb == 0` when `b == 0`).
@@ -364,39 +379,40 @@ pub fn pack_cond_rows(
     if w64 > 0 {
         let mut tail_plan: Vec<GatherWord> = Vec::new();
         if let Some(bp) = base { build_gather_plan(&cond[bp.b..], &mut tail_plan); }
-        // Plan of the whole set, built only if some row is absent from the base.
-        let mut full_plan: Option<Vec<GatherWord>> = None;
-        let op = out.as_mut_ptr();
-        for v in 0..n_var {
+        // Plans are immutable before any row task starts. Missing rows gather
+        // the whole set; present rows copy the prefix in its original state order.
+        let missing = base.is_none_or(|bp| (0..n_var).any(|v| {
+            let a = poly_sites.map_or(v, |ps| ps[v]);
+            bp.row_of_abs.get(a).copied().unwrap_or(u32::MAX) == u32::MAX
+        }));
+        let mut full_plan = Vec::new();
+        if missing { build_gather_plan(cond, &mut full_plan); }
+        let pack = |(v, row): (usize, &mut [std::mem::MaybeUninit<u64>])| {
             let a = poly_sites.map_or(v, |ps| ps[v]);
             let rp = ref_bm.row(a).as_ptr();
-            // SAFETY: row v's w64 words lie inside the capacity reserved above.
-            let dst = unsafe { op.add(v * w64) };
+            let dst = row.as_mut_ptr().cast::<u64>();
             let r = base.map_or(u32::MAX, |bp| bp.row_of_abs.get(a).copied().unwrap_or(u32::MAX));
             let n = match base {
                 Some(bp) if r != u32::MAX => {
                     let src = &bp.words[r as usize * bp.wb..(r as usize + 1) * bp.wb];
                     let nfull = bp.b / 64;
                     let pos = (bp.b % 64) as u32;
-                    // A complete FB0 row may contain non-prefix bits here.
                     let acc = if pos > 0 { src[nfull] & ((1u64 << pos) - 1) } else { 0 };
-                    // SAFETY: nfull ≤ w64 words copied into row v; ids < n_haps.
+                    // The prefix and gathered tail initialize this task's entire row.
                     unsafe {
                         std::ptr::copy_nonoverlapping(src.as_ptr(), dst, nfull);
                         gather_row(rp, &tail_plan, dst, nfull, acc, pos)
                     }
                 }
-                _ => {
-                    let plan = full_plan.get_or_insert_with(|| {
-                        let mut p = Vec::new();
-                        build_gather_plan(cond, &mut p);
-                        p
-                    });
-                    // SAFETY: ids < n_haps; row v's w64 words are reserved.
-                    unsafe { gather_row(rp, plan, dst, 0, 0, 0) }
-                }
+                _ => unsafe { gather_row(rp, &full_plan, dst, 0, 0, 0) },
             };
             debug_assert_eq!(n, w64);
+        };
+        let rows = &mut out.spare_capacity_mut()[..total];
+        if n_var >= 512 {
+            rows.par_chunks_mut(w64).enumerate().with_min_len(128).for_each(pack);
+        } else {
+            rows.chunks_mut(w64).enumerate().for_each(pack);
         }
     }
     // SAFETY: all `total` words were written above (none when w64 == 0).
@@ -1126,13 +1142,20 @@ unsafe fn run_fb_avx512(
 
     let mut dosage = vec![0.0f32; n_var];
 
-    TL_ALPHA.with(|ca| TL_ALPHA_SUM.with(|cs| TL_BETA.with(|cb| TL_EMIT.with(|ce| TL_PREC.with(|cp| TL_CONDBITS.with(|cc| {
+    let mut owned_pack = if prepack.is_none() { take_pack_scratch(n_var * w64) } else { Vec::new() };
+    let packed = match prepack {
+        Some(p) => p,
+        None => {
+            pack_cond_rows(ref_bm, cond_haps, poly_sites, n_var, None, &mut owned_pack);
+            owned_pack.as_slice()
+        }
+    };
+    TL_ALPHA.with(|ca| TL_ALPHA_SUM.with(|cs| TL_BETA.with(|cb| TL_EMIT.with(|ce| TL_PREC.with(|cp| {
         let mut alpha = ca.borrow_mut();
         let mut alpha_sum = cs.borrow_mut();
         let mut beta = cb.borrow_mut();
         let mut emit = ce.borrow_mut();
         let mut p_rec = cp.borrow_mut();
-        let mut condbits = cc.borrow_mut();
 
         // emission per (variant, allele)
         precompute_emit(hl, n_var, ee, ed, &mut emit);
@@ -1141,13 +1164,11 @@ unsafe fn run_fb_avx512(
         precompute_prec(cm, n_var, scale, recomb_mult, &mut p_rec);
         // Bit-packed conditioning alleles (1 bit/state): the caller's pre-built
         // pack when it has one (shared-prefix assembly across a sample's two
-        // haplotypes), else packed here into thread-local scratch. Both routes
-        // produce identical words (see `pack_cond_rows`).
+        // haplotypes), else built before borrowing the kernel scratch. Both
+        // routes produce identical words (see `pack_cond_rows`).
         let timing = hmm_timing();
-        let cbp: *const u64 = match prepack {
-            Some(p) => { debug_assert!(p.len() >= n_var * w64); p.as_ptr() }
-            None => { pack_cond_rows(ref_bm, cond_haps, poly_sites, n_var, None, &mut condbits); condbits.as_ptr() }
-        };
+        debug_assert!(packed.len() >= n_var * w64);
+        let cbp = packed.as_ptr();
         let t_fb = if timing { Some(std::time::Instant::now()) } else { None };
 
         // --- Checkpointed forward + block-recompute backward (memory/cache win) ---
@@ -1314,7 +1335,8 @@ unsafe fn run_fb_avx512(
         if let Some(t) = t_fb {
             PROF_FB_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
-    }))))));
+    })))));
+    if prepack.is_none() { TL_CONDBITS.with(|c| *c.borrow_mut() = owned_pack); }
 
     HmmOutput { dosage }
 }}
@@ -1350,26 +1372,31 @@ unsafe fn run_fb_avx2(
 
     let mut dosage = vec![0.0f32; n_var];
 
-    TL_ALPHA.with(|ca| TL_ALPHA_SUM.with(|cs| TL_BETA.with(|cb| TL_EMIT.with(|ce| TL_PREC.with(|cp| TL_CONDBITS.with(|cc| {
+    let mut owned_pack = if prepack.is_none() { take_pack_scratch(n_var * w64) } else { Vec::new() };
+    let packed = match prepack {
+        Some(p) => p,
+        None => {
+            pack_cond_rows(ref_bm, cond_haps, poly_sites, n_var, None, &mut owned_pack);
+            owned_pack.as_slice()
+        }
+    };
+    TL_ALPHA.with(|ca| TL_ALPHA_SUM.with(|cs| TL_BETA.with(|cb| TL_EMIT.with(|ce| TL_PREC.with(|cp| {
         let mut alpha = ca.borrow_mut();
         let mut alpha_sum = cs.borrow_mut();
         let mut beta = cb.borrow_mut();
         let mut emit = ce.borrow_mut();
         let mut p_rec = cp.borrow_mut();
-        let mut condbits = cc.borrow_mut();
 
         precompute_emit(hl, n_var, ee, ed, &mut emit);
         let scale = recomb_scale(params.ne, k, ref_bm.n_haps);
         precompute_prec(cm, n_var, scale, recomb_mult, &mut p_rec);
         // Bit-packed conditioning alleles (1 bit/state): the caller's pre-built
         // pack when it has one (shared-prefix assembly across a sample's two
-        // haplotypes), else packed here into thread-local scratch. Both routes
-        // produce identical words (see `pack_cond_rows`).
+        // haplotypes), else built before borrowing the kernel scratch. Both
+        // routes produce identical words (see `pack_cond_rows`).
         let timing = hmm_timing();
-        let cbp: *const u64 = match prepack {
-            Some(p) => { debug_assert!(p.len() >= n_var * w64); p.as_ptr() }
-            None => { pack_cond_rows(ref_bm, cond_haps, poly_sites, n_var, None, &mut condbits); condbits.as_ptr() }
-        };
+        debug_assert!(packed.len() >= n_var * w64);
+        let cbp = packed.as_ptr();
         let t_fb = if timing { Some(std::time::Instant::now()) } else { None };
 
         // Checkpointed forward + block-recompute backward (see run_fb_avx512).
@@ -1521,7 +1548,8 @@ unsafe fn run_fb_avx2(
             }
         }
         if let Some(t) = t_fb { PROF_FB_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
-    }))))));
+    })))));
+    if prepack.is_none() { TL_CONDBITS.with(|c| *c.borrow_mut() = owned_pack); }
 
     HmmOutput { dosage }
 }}
@@ -1615,26 +1643,31 @@ unsafe fn run_fb_neon(
 
     let mut dosage = vec![0.0f32; n_var];
 
-    TL_ALPHA.with(|ca| TL_ALPHA_SUM.with(|cs| TL_BETA.with(|cb| TL_EMIT.with(|ce| TL_PREC.with(|cp| TL_CONDBITS.with(|cc| {
+    let mut owned_pack = if prepack.is_none() { take_pack_scratch(n_var * w64) } else { Vec::new() };
+    let packed = match prepack {
+        Some(p) => p,
+        None => {
+            pack_cond_rows(ref_bm, cond_haps, poly_sites, n_var, None, &mut owned_pack);
+            owned_pack.as_slice()
+        }
+    };
+    TL_ALPHA.with(|ca| TL_ALPHA_SUM.with(|cs| TL_BETA.with(|cb| TL_EMIT.with(|ce| TL_PREC.with(|cp| {
         let mut alpha = ca.borrow_mut();
         let mut alpha_sum = cs.borrow_mut();
         let mut beta = cb.borrow_mut();
         let mut emit = ce.borrow_mut();
         let mut p_rec = cp.borrow_mut();
-        let mut condbits = cc.borrow_mut();
 
         precompute_emit(hl, n_var, ee, ed, &mut emit);
         let scale = recomb_scale(params.ne, k, ref_bm.n_haps);
         precompute_prec(cm, n_var, scale, recomb_mult, &mut p_rec);
         // Bit-packed conditioning alleles (1 bit/state): the caller's pre-built
         // pack when it has one (shared-prefix assembly across a sample's two
-        // haplotypes), else packed here into thread-local scratch. Both routes
-        // produce identical words (see `pack_cond_rows`).
+        // haplotypes), else built before borrowing the kernel scratch. Both
+        // routes produce identical words (see `pack_cond_rows`).
         let timing = hmm_timing();
-        let cbp: *const u64 = match prepack {
-            Some(p) => { debug_assert!(p.len() >= n_var * w64); p.as_ptr() }
-            None => { pack_cond_rows(ref_bm, cond_haps, poly_sites, n_var, None, &mut condbits); condbits.as_ptr() }
-        };
+        debug_assert!(packed.len() >= n_var * w64);
+        let cbp = packed.as_ptr();
         let t_fb = if timing { Some(std::time::Instant::now()) } else { None };
 
         // Checkpointed forward + block-recompute backward (see run_fb_avx512).
@@ -1786,7 +1819,8 @@ unsafe fn run_fb_neon(
             }
         }
         if let Some(t) = t_fb { PROF_FB_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
-    }))))));
+    })))));
+    if prepack.is_none() { TL_CONDBITS.with(|c| *c.borrow_mut() = owned_pack); }
 
     HmmOutput { dosage }
 }}
@@ -2196,6 +2230,65 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn active_pack_does_not_keep_an_oversized_idle_allocation() {
+        TL_CONDBITS.with(|c| c.borrow_mut().resize(CACHE_BUFFER_BYTES / 8, 0));
+        let pack = take_pack_scratch(16);
+        assert!(pack.capacity() <= 16);
+        TL_CONDBITS.with(|c| assert_eq!(c.borrow().capacity(), 0));
+    }
+
+    #[test]
+    fn nested_packing_does_not_borrow_live_hmm_scratch() {
+        use reference_pack as rp;
+        let mut rng = rp::Xs(0xBE54_66CF_34E9_0C6C);
+        let n = 1025;
+        let bm = rp::random_panel(&mut rng, n, 73, 50);
+        let cm: Vec<_> = (0..n).map(|v| v as f64 * 0.003).collect();
+        let cond: Vec<_> = (0..65).collect();
+        let hl: Vec<_> = (0..n * 2).map(|_| (rng.below(1000) + 1) as f32 / 1000.0).collect();
+        let params = LcwgsParams::default();
+        let run = || run_forward_backward(&hl, &cond, &bm, &cm, &params, None, None, None)
+            .dosage.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+        let want = run();
+        for threads in [1, 2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            pool.scope_fifo(|scope| {
+                for _ in 0..12 {
+                    scope.spawn_fifo(|_| assert_eq!(run(), want));
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn parallel_rows_match_bitwise_gather_on_disjoint_destinations() {
+        use reference_pack as rp;
+        let mut rng = rp::Xs(0x510E_527F_82AA_9163);
+        let (n, nh) = (2053, 193);
+        let bm = rp::random_panel(&mut rng, n, nh, 50);
+        let sites: Vec<_> = (0..n).filter(|v| v % 3 != 0).collect();
+        let cond: Vec<u32> = (0..137).map(|h| (h * 37 % nh) as u32).collect();
+        for threads in [1, 2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            pool.install(|| {
+                for b in [0, 1, 63, 64, 65, 128, 137] {
+                    let mut base = BasePack::new();
+                    base.build(&bm, &cond[..b], &sites, n);
+                    assert_eq!(base.words, rp::base_pack_build(&bm, &cond[..b], &sites, n).0);
+                    let mut got = Vec::new();
+                    for axis in [None, Some(sites.as_slice())] {
+                        let count = axis.map_or(n, <[usize]>::len);
+                        pack_cond_rows(&bm, &cond, axis, count, Some(&base), &mut got);
+                        let mut want = Vec::new();
+                        rp::pack_cond_rows(&bm, &cond, axis, count, None, &mut want);
+                        assert_eq!(got, want);
+                    }
+                }
+            });
+        }
+    }
 
     /// The run-plan `BasePack::build` and `pack_cond_rows` reproduce the verbatim
     /// per-state gathers word for word (incl. the zero padding past K, which the

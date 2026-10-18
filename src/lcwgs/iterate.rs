@@ -869,7 +869,6 @@ fn run_gibbs_with_memory(
             let b = if share { c0.iter().zip(c1.iter()).take_while(|(x, y)| x == y).count() } else { 0 };
             let fb = || {
                 let mut base = BasePack::new();
-                let mut hp = Vec::new();
                 let mut un = Vec::new();
                 if share && b > 0 {
                     un.clear();
@@ -892,26 +891,44 @@ fn run_gibbs_with_memory(
                     pack_cond_rows(ref_bm, c, ps, n, if b > 0 { Some(base) } else { None }, hp);
                     true
                 };
-                let packed0 = pack_for(c0, split0, &base, &mut hp);
-                let (d0, samp0) = run_one_hap(
-                    h0i, it, seed,
-                    |v| prev_alleles[v * n_target_haps + h1i] as usize,
-                    c0, gl3, n_samples, ref_bm, cm, params,
-                    use_scaffold, &common_idx, n_var,
-                    split0.map(|x| (x, ic_all, ps_mono_alt.as_slice())),
-                    full_axis_rmult.as_deref(),
-                    if packed0 { Some(hp.as_slice()) } else { None });
-                let packed1 = pack_for(c1, split1, &base, &mut hp);
-                let (d1, samp1) = run_one_hap(
-                    h1i, it, seed,
-                    |v| if gs { samp0[v] as usize } else { prev_alleles[v * n_target_haps + h0i] as usize },
-                    c1, gl3, n_samples, ref_bm, cm, params,
-                    use_scaffold, &common_idx, n_var,
-                    split1.map(|x| (x, ic_all, ps_mono_alt.as_slice())),
-                    full_axis_rmult.as_deref(),
-                    if packed1 { Some(hp.as_slice()) } else { None });
-
-                ((d0, samp0), (d1, samp1))
+                let fb0 = || {
+                    let mut hp = Vec::new();
+                    let packed = pack_for(c0, split0, &base, &mut hp);
+                    run_one_hap(
+                        h0i, it, seed,
+                        |v| prev_alleles[v * n_target_haps + h1i] as usize,
+                        c0, gl3, n_samples, ref_bm, cm, params,
+                        use_scaffold, &common_idx, n_var,
+                        split0.map(|x| (x, ic_all, ps_mono_alt.as_slice())),
+                        full_axis_rmult.as_deref(),
+                        if packed { Some(hp.as_slice()) } else { None })
+                };
+                let fb1 = |fresh: Option<&[u8]>| {
+                    let mut hp = Vec::new();
+                    let packed = pack_for(c1, split1, &base, &mut hp);
+                    run_one_hap(
+                        h1i, it, seed,
+                        |v| fresh.map_or(prev_alleles[v * n_target_haps + h0i], |a| a[v]) as usize,
+                        c1, gl3, n_samples, ref_bm, cm, params,
+                        use_scaffold, &common_idx, n_var,
+                        split1.map(|x| (x, ic_all, ps_mono_alt.as_slice())),
+                        full_axis_rmult.as_deref(),
+                        if packed { Some(hp.as_slice()) } else { None })
+                };
+                let extra = if !is_main && !gs && rayon::current_num_threads() > 1 {
+                    memory.and_then(|m| m.try_parallel_fb(super::memory::fb_bytes(n_var, c1.len())))
+                } else { None };
+                if let Some(_permit) = extra {
+                    rayon::join(fb0, || {
+                        let out = fb1(None);
+                        super::memory::collect_local();
+                        out
+                    })
+                } else {
+                    let first = fb0();
+                    let second = fb1(gs.then_some(first.1.as_slice()));
+                    (first, second)
+                }
             };
             // Packs and FB scratch are released before waiting for phaser memory.
             let ((d0, mut samp0), (d1, mut samp1)) = match memory {

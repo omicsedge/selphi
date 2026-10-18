@@ -12,6 +12,10 @@ pub(crate) struct MemoryBudget {
     shared: usize,
     usage: Mutex<Usage>,
     changed: Condvar,
+    #[cfg(test)]
+    allow_parallel_fb: bool,
+    #[cfg(test)]
+    parallel_fb_grants: std::sync::atomic::AtomicUsize,
 }
 
 pub(crate) struct Permit<'a> { budget: &'a MemoryBudget, bytes: usize, fixed: bool }
@@ -20,7 +24,12 @@ impl MemoryBudget {
     pub fn new(limit: usize, shared: usize) -> Self {
         assert!(limit > shared, "lcWGS memory budget must exceed shared process storage");
         Self { limit, fixed_limit: shared + (limit - shared) / 2, shared,
-            usage: Mutex::new(Usage { fixed: shared, ..Usage::default() }), changed: Condvar::new() }
+            usage: Mutex::new(Usage { fixed: shared, ..Usage::default() }), changed: Condvar::new(),
+            #[cfg(test)]
+            allow_parallel_fb: true,
+            #[cfg(test)]
+            parallel_fb_grants: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 
     pub fn work_limit(&self) -> usize { self.limit - self.fixed_limit }
@@ -42,6 +51,25 @@ impl MemoryBudget {
         used.work += bytes;
         used.peak = used.peak.max(used.fixed + used.work);
         Some(Permit { budget: self, bytes, fixed: false })
+    }
+
+    /// Optional parallel work never waits on a worker. A denied request uses
+    /// the sequential computation under the existing primary permit.
+    pub fn try_parallel_fb(&self, bytes: usize) -> Option<Permit<'_>> {
+        #[cfg(test)]
+        if !self.allow_parallel_fb { return None; }
+        let permit = self.try_work(bytes)?;
+        #[cfg(test)]
+        self.parallel_fb_grants.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(permit)
+    }
+
+    #[cfg(test)]
+    pub fn set_parallel_fb(&mut self, enabled: bool) { self.allow_parallel_fb = enabled; }
+
+    #[cfg(test)]
+    pub fn parallel_fb_grants(&self) -> usize {
+        self.parallel_fb_grants.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn work(&self, bytes: usize) -> Permit<'_> {
@@ -73,7 +101,7 @@ impl Drop for Permit<'_> {
 }
 
 /// Return pages on the allocating worker before its allowance can be reused.
-fn collect_local() {
+pub(crate) fn collect_local() {
     #[cfg(feature = "mimalloc")]
     unsafe { libmimalloc_sys::mi_collect(true); }
 }
