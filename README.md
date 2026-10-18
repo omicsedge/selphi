@@ -510,6 +510,8 @@ If you use Selphi in your research, please cite:
 
 ```
 Selphi, a tool for improving genotype imputation accuracy
+Adriano De Marino, Abdallah Amr Mahmoud, Sandra Bohn, Jon Lerga-Jaso, Biljana Novković,
+Charlie Manson, Salvatore Loguercio, Andrew Terpolovsky, Mykyta Matushyn, Ali Torkamani, Puya G. Yazdi
 Scientific Reports 16, 28051 (2026); doi: https://doi.org/10.1038/s41598-026-58420-2
 ```
 
