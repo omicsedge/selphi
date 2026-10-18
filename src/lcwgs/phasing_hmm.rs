@@ -146,6 +146,10 @@ pub struct PhasingHmm {
     var_alt: Vec<bool>, // VAR_ALT: a0 at the site
     var_abs: Vec<i32>,  // VAR_ABS: absolute site index
     var_rel: Vec<i32>,  // VAR_REL: relative polymorphic-site index (kept for parity)
+    /// Boundary i joins var_abs[i-1] to var_abs[i]; both end sentinels are 0.
+    transitions: Vec<f32>,
+    #[cfg(test)]
+    uncached_transitions: bool,
 
     // ---- SEGMENTATION ----
     segments: Vec<i32>,
@@ -397,6 +401,9 @@ impl PhasingHmm {
             var_alt: Vec::new(),
             var_abs: Vec::new(),
             var_rel: Vec::new(),
+            transitions: Vec::new(),
+            #[cfg(test)]
+            uncached_transitions: false,
             segments: Vec::new(),
             n_segs: 0,
             n_miss: 0,
@@ -456,6 +463,25 @@ impl PhasingHmm {
         let t = -((self.nrho * dcm).exp_m1());
         let one_l = 1.0 - 1e-7;
         t.clamp(1e-7, one_l) as f32
+    }
+
+    fn prepare_transitions(&mut self, cm: &[f64]) {
+        self.transitions.clear();
+        self.transitions.push(0.0);
+        for i in 1..self.var_abs.len() {
+            self.transitions.push(self.get_transition(cm, self.var_abs[i - 1], self.var_abs[i]));
+        }
+        self.transitions.push(0.0);
+    }
+
+    #[inline]
+    fn transition_at(&self, boundary: usize, _cm: &[f64]) -> f32 {
+        #[cfg(test)]
+        if self.uncached_transitions {
+            return if boundary == 0 || boundary == self.var_abs.len() { 0.0 }
+                else { self.get_transition(_cm, self.var_abs[boundary - 1], self.var_abs[boundary]) };
+        }
+        self.transitions[boundary]
     }
 
     // ===================================================================
@@ -934,11 +960,7 @@ impl PhasingHmm {
     fn trans_hap(&mut self, cm: &[f64]) -> bool {
         self.sum_hprobs = 0.0;
         // yt/nt at the right neighbor (curr_idx_locus -> curr_idx_locus+1).
-        self.yt = self.get_transition(
-            cm,
-            self.var_abs[self.curr_idx_locus as usize],
-            self.var_abs[self.curr_idx_locus as usize + 1],
-        );
+        self.yt = self.transition_at(self.curr_idx_locus as usize + 1, cm);
         self.nt = 1.0 - self.yt;
         #[cfg(target_arch = "x86_64")]
         match self.simd {
@@ -1747,14 +1769,7 @@ impl PhasingHmm {
             self.curr_abs_locus = self.var_abs[idx as usize];
             self.curr_rel_locus = self.var_rel[idx as usize];
 
-            self.yt = 0.0;
-            if idx != 0 {
-                self.yt = self.get_transition(
-                    cm,
-                    self.var_abs[idx as usize - 1],
-                    self.var_abs[idx as usize],
-                );
-            }
+            self.yt = self.transition_at(idx as usize, cm);
             self.nt = 1.0 - self.yt;
 
             let typ = self.var_typ[idx as usize];
@@ -1846,14 +1861,7 @@ impl PhasingHmm {
             self.curr_abs_locus = self.var_abs[idx as usize];
             self.curr_rel_locus = self.var_rel[idx as usize];
 
-            self.yt = 0.0;
-            if idx < (n_var - 1) {
-                self.yt = self.get_transition(
-                    cm,
-                    self.var_abs[idx as usize],
-                    self.var_abs[idx as usize + 1],
-                );
-            }
+            self.yt = self.transition_at(idx as usize + 1, cm);
             self.nt = 1.0 - self.yt;
 
             let typ = self.var_typ[idx as usize];
@@ -2003,6 +2011,7 @@ impl PhasingHmm {
         if self.simd != SimdMode::Scalar {
             self.build_condbit_plans(cond_haps);
         }
+        self.prepare_transitions(cm);
         self.backward(ref_bm, cond_haps, cm, mism);
 
         // Seed dip_sampled[0] from the segment-0 backward marginals.
@@ -2158,8 +2167,9 @@ mod tests {
                 let h1: Vec<bool> = (0..n).map(|_| rng.below(2) == 0).collect();
                 let flat: Vec<bool> = (0..n).map(|_| rng.below(3) == 0).collect();
                 let lq: Vec<bool> = (0..n).map(|_| rng.below(7) == 0).collect();
-                let run = |pack| {
+                let run = |pack: Option<&BasePack>| {
                     let mut hmm = PhasingHmm::new(&params);
+                    hmm.uncached_transitions = pack.is_none();
                     let (mut a, mut b) = (h0.clone(), h1.clone());
                     let mut draws = rp::Xs(2347);
                     let mut count = 0;

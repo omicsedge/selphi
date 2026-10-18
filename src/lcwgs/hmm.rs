@@ -1059,6 +1059,24 @@ unsafe fn fwd_col_avx2(
     s
 }}
 
+#[cfg(test)]
+thread_local! {
+    static COPY_FORWARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Advance two disjoint K-float columns without moving their contents.
+/// Safety: both pointers address initialized, disjoint buffers of at least K
+/// floats (also required by the test-only reference copy).
+#[inline(always)]
+unsafe fn roll_forward(prev: &mut *mut f32, curr: &mut *mut f32, _k: usize) {
+    #[cfg(test)]
+    if COPY_FORWARD.with(|flag| flag.get()) {
+        unsafe { std::ptr::copy_nonoverlapping(*curr, *prev, _k); }
+        return;
+    }
+    std::mem::swap(prev, curr);
+}
+
 /// AVX-512 implementation of [`run_forward_backward`]. Numerically equivalent
 /// (to f32 reduction-order) to the scalar path; validated against
 /// `SELPHI_FORCE_SCALAR=1`. Conditioning alleles are materialized bit-packed
@@ -1163,17 +1181,18 @@ unsafe fn run_fb_avx512(
             alpha_sum[0] = s0;
             std::ptr::copy_nonoverlapping(fcolp, chkp, k); // checkpoint 0 = alpha[0]
         }
+        let (mut prev, mut curr) = (fcolp, fcolp.add(k));
         for v in 1..n_var {
-            // prev = fcol[0..k], curr = fcol[k..2k] (disjoint).
+            // Disjoint rolling columns; swapping retains every computed bit.
             let s = fwd_col_avx512(
-                fcolp, fcolp.add(k), v, emit[2 * v], emit[2 * v + 1],
+                prev, curr, v, emit[2 * v], emit[2 * v + 1],
                 p_rec[v], alpha_sum[v - 1], cbp, inv_k, k, kmain, w64);
             alpha_sum[v] = s;
             if v % chk_stride == 0 {
                 let c = v / chk_stride;
-                std::ptr::copy_nonoverlapping(fcolp.add(k), chkp.add(c * k), k);
+                std::ptr::copy_nonoverlapping(curr, chkp.add(c * k), k);
             }
-            std::ptr::copy_nonoverlapping(fcolp.add(k), fcolp, k); // roll curr → prev
+            roll_forward(&mut prev, &mut curr, k);
         }
 
         // --- Backward: blocks in reverse; recompute each block's forward columns
@@ -1376,16 +1395,17 @@ unsafe fn run_fb_avx2(
             alpha_sum[0] = s0;
             std::ptr::copy_nonoverlapping(fcolp, chkp, k);
         }
+        let (mut prev, mut curr) = (fcolp, fcolp.add(k));
         for v in 1..n_var {
             let s = fwd_col_avx2(
-                fcolp, fcolp.add(k), v, emit[2 * v], emit[2 * v + 1],
+                prev, curr, v, emit[2 * v], emit[2 * v + 1],
                 p_rec[v], alpha_sum[v - 1], cbp, inv_k, k, kmain8, w64);
             alpha_sum[v] = s;
             if v % chk_stride == 0 {
                 let c = v / chk_stride;
-                std::ptr::copy_nonoverlapping(fcolp.add(k), chkp.add(c * k), k);
+                std::ptr::copy_nonoverlapping(curr, chkp.add(c * k), k);
             }
-            std::ptr::copy_nonoverlapping(fcolp.add(k), fcolp, k);
+            roll_forward(&mut prev, &mut curr, k);
         }
 
         // Backward: blocks in reverse, recompute then backward kernel.
@@ -1640,16 +1660,17 @@ unsafe fn run_fb_neon(
             alpha_sum[0] = s0;
             std::ptr::copy_nonoverlapping(fcolp, chkp, k);
         }
+        let (mut prev, mut curr) = (fcolp, fcolp.add(k));
         for v in 1..n_var {
             let s = fwd_col_neon(
-                fcolp, fcolp.add(k), v, emit[2 * v], emit[2 * v + 1],
+                prev, curr, v, emit[2 * v], emit[2 * v + 1],
                 p_rec[v], alpha_sum[v - 1], cbp, inv_k, k, kmain4, w64);
             alpha_sum[v] = s;
             if v % chk_stride == 0 {
                 let c = v / chk_stride;
-                std::ptr::copy_nonoverlapping(fcolp.add(k), chkp.add(c * k), k);
+                std::ptr::copy_nonoverlapping(curr, chkp.add(c * k), k);
             }
-            std::ptr::copy_nonoverlapping(fcolp.add(k), fcolp, k);
+            roll_forward(&mut prev, &mut curr, k);
         }
 
         // Backward: blocks in reverse, recompute then backward kernel.
@@ -2117,6 +2138,37 @@ pub(crate) mod reference_pack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn rolling_swap_matches_copy_for_each_simd_backend() {
+        use reference_pack as rp;
+        let mut rng = rp::Xs(0x9B05_688C_2B3E_6C1F);
+        type Kernel = unsafe fn(&[f32], &[u32], &HaplotypeBitmatrix, &[f64], &LcwgsParams,
+            Option<&[f32]>, Option<&[usize]>, Option<&[u64]>) -> HmmOutput;
+        let mut kernels: Vec<Kernel> = Vec::new();
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") { kernels.push(run_fb_avx2); }
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512dq") { kernels.push(run_fb_avx512); }
+        let params = LcwgsParams::default();
+        for n in [1, 2, 3, 15, 16, 17, 99] {
+            let bm = rp::random_panel(&mut rng, n * 2, 300, 50);
+            let poly: Vec<usize> = (0..n).map(|v| v * 2).collect();
+            let cm: Vec<f64> = (0..n).map(|v| (v / 2) as f64 * 0.007).collect();
+            let hl: Vec<f32> = (0..n * 2).map(|_| rng.below(1_000_000) as f32 / 1e6).collect();
+            for k in [1, 7, 8, 15, 16, 17, 63, 64, 65, 299] {
+                let cond: Vec<u32> = (0..k).map(|h| (h * 137 % 300) as u32).collect();
+                for kernel in &kernels {
+                    COPY_FORWARD.with(|flag| flag.set(true));
+                    let old = unsafe { kernel(&hl, &cond, &bm, &cm, &params, None, Some(&poly), None) };
+                    COPY_FORWARD.with(|flag| flag.set(false));
+                    let new = unsafe { kernel(&hl, &cond, &bm, &cm, &params, None, Some(&poly), None) };
+                    assert_eq!(new.dosage.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                        old.dosage.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), "n={n} k={k}");
+                }
+            }
+        }
+    }
+
 
     /// The run-plan `BasePack::build` and `pack_cond_rows` reproduce the verbatim
     /// per-state gathers word for word (incl. the zero padding past K, which the
