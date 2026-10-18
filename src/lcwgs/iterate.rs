@@ -34,6 +34,7 @@
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use crate::lcwgs::hmm::BasePack;
+use super::memory::SampleExecution;
 
 /// Call-owned scratch is released before a sample task becomes idle.
 #[derive(Default)]
@@ -527,7 +528,7 @@ pub fn run_gibbs(
     k_max_override: Option<usize>,
     precomputed_cond: Option<&Vec<Vec<u32>>>,
 ) -> GibbsOutput {
-    run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, None)
+    run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, SampleExecution::Unbudgeted)
 }
 
 fn run_gibbs_with_memory(
@@ -538,8 +539,9 @@ fn run_gibbs_with_memory(
     params: &LcwgsParams,
     k_max_override: Option<usize>,
     precomputed_cond: Option<&Vec<Vec<u32>>>,
-    memory: Option<&super::memory::MemoryBudget>,
+    execution: SampleExecution<'_>,
 ) -> GibbsOutput {
+    let memory = execution.permits();
     let n_var = cm.len();
     let n_target_haps = n_samples * 2;
     assert_eq!(gl3.len(), n_var * n_samples * 3);
@@ -848,7 +850,8 @@ fn run_gibbs_with_memory(
         // is a random gather that costs more than the FB it feeds (~1.8×), so the
         // shared prefix is packed ONCE per sample over the union of the two haps'
         // site axes, each hap's pack is assembled from those words plus its own
-        // tail. Phasing builds a separately charged pack after FB releases its storage. The
+        // tail. Whole-sample tasks also reuse the prefix during phasing; admitted
+        // tasks release it before waiting for a separately charged phaser. The
         // packed words — and therefore every result — are identical to packing
         // each hap in full (see `pack_cond_rows`). Samples are independent, so
         // the task is parallel over samples in both the GS and Jacobi sweeps.
@@ -868,7 +871,9 @@ fn run_gibbs_with_memory(
             if let Some(t) = ts { SPLIT_NS.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed); }
             let b = if share { c0.iter().zip(c1.iter()).take_while(|(x, y)| x == y).count() } else { 0 };
             let fb = || {
-                let parallel_rows = memory.is_none_or(|m| m.parallel_rows());
+                // Whole-sample tasks are leaves: nested row work would suspend
+                // their packs while the worker steals another sample.
+                let parallel_rows = memory.is_some_and(|m| m.parallel_rows());
                 let mut base = BasePack::new();
                 let mut un = Vec::new();
                 if share && b > 0 {
@@ -918,7 +923,7 @@ fn run_gibbs_with_memory(
                 let extra = if !is_main && !gs && rayon::current_num_threads() > 1 {
                     memory.and_then(|m| m.try_parallel_fb(super::memory::fb_bytes(n_var, c1.len())))
                 } else { None };
-                if let Some(_permit) = extra {
+                let results = if let Some(_permit) = extra {
                     rayon::join(|| fb0(&mut Vec::new()), || {
                         let out = fb1(None, &mut Vec::new());
                         super::memory::collect_local();
@@ -929,10 +934,12 @@ fn run_gibbs_with_memory(
                     let first = fb0(&mut hp);
                     let second = fb1(gs.then_some(first.1.as_slice()), &mut hp);
                     (first, second)
-                }
+                };
+                (results, if memory.is_none() { Some(base) } else { None })
             };
-            // Packs and FB scratch are released before waiting for phaser memory.
-            let ((d0, mut samp0), (d1, mut samp1)) = match memory {
+            // Only the admitted path waits for phaser memory. Whole-sample
+            // tasks keep the shared prefix, but release the full FB pack here.
+            let (((d0, mut samp0), (d1, mut samp1)), retained_base) = match memory {
                 Some(m) => m.run(super::memory::fb_bytes(n_var, c0.len().max(c1.len())), fb),
                 None => fb(),
             };
@@ -981,15 +988,22 @@ fn run_gibbs_with_memory(
                     } else {
                         (&poly_sites, &mono_sites)
                     };
-                    let snapshots = crate::lcwgs::phasing_hmm::PhasingHmm::snapshot_bytes(
-                        h0, h1, flat, poly_ref, &lq, cond_haps.len());
+                    let phase_bytes = memory.map(|_| {
+                        let snapshots = crate::lcwgs::phasing_hmm::PhasingHmm::snapshot_bytes(
+                            h0, h1, flat, poly_ref, &lq, cond_haps.len());
+                        super::memory::phase_bytes(n_var, cond_haps.len(), snapshots)
+                    });
                     let mut phase = || {
-                        // A complete pack is call-owned and charged alongside snapshots.
                         let mut base = BasePack::new();
-                        let sites: Vec<usize> = poly_ref.iter().map(|&v| v as usize).collect();
-                        base.build_rows(ref_bm, cond_haps, &sites, n_var,
-                            memory.is_none_or(|m| m.parallel_rows()));
-                        let phase_base = (!cond_haps.is_empty()).then_some(&base);
+                        let phase_base = if let Some(m) = memory {
+                            // A complete pack is charged alongside snapshots.
+                            let sites: Vec<usize> = poly_ref.iter().map(|&v| v as usize).collect();
+                            base.build_rows(ref_bm, cond_haps, &sites, n_var, m.parallel_rows());
+                            (!cond_haps.is_empty()).then_some(&base)
+                        } else {
+                            retained_base.as_ref().filter(|bp| bp.b > 0
+                                && cond_haps.len() >= bp.b && cond_haps[..bp.b] == c0[..bp.b])
+                        };
                         let mut hmm = crate::lcwgs::phasing_hmm::PhasingHmm::new(&g2p);
                         hmm.rephase(h0, h1, flat, cond_haps, ref_bm, cm, &g2p,
                                     poly_ref, mono_ref, &lq, &mut rng_u01, phase_base);
@@ -1005,7 +1019,7 @@ fn run_gibbs_with_memory(
                         }
                     };
                     match memory {
-                        Some(m) => m.run(super::memory::phase_bytes(n_var, cond_haps.len(), snapshots), phase),
+                        Some(m) => m.run(phase_bytes.unwrap(), phase),
                         None => phase(),
                     }
             }
@@ -1014,7 +1028,11 @@ fn run_gibbs_with_memory(
         let per_sample: Vec<_> = if memory.is_some() {
             super::memory::map_samples(n_samples, rayon::current_num_threads(), sample_task)
         } else {
-            (0..n_samples).into_par_iter().map(sample_task).collect()
+            (0..n_samples).into_par_iter().map(|s| {
+                let result = super::hmm::with_serial_packing(|| sample_task(s));
+                execution.finish_sample();
+                result
+            }).collect()
         };
         let results: Vec<(usize, Vec<f32>, Vec<u8>)> = per_sample.into_iter().flatten().collect();
         if let Some(t) = t0 { t_hmm += t.elapsed().as_secs_f64(); }
@@ -1248,10 +1266,10 @@ pub(crate) fn run_gibbs_ensemble_with_memory(
     params: &LcwgsParams,
     k_max_override: Option<usize>,
     precomputed_cond: Option<&Vec<Vec<u32>>>,
-    memory: Option<&super::memory::MemoryBudget>,
+    execution: SampleExecution<'_>,
 ) -> GibbsOutput {
     let n_restarts = crate::config::usize_or("LCWGS_GIBBS_RESTARTS", 1).max(1);
-    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, memory)
+    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, execution)
 }
 
 /// Inner ensemble with an explicit restart count (the env-read entry point
@@ -1269,7 +1287,7 @@ pub(crate) fn run_gibbs_ensemble_n(
     precomputed_cond: Option<&Vec<Vec<u32>>>,
     n_restarts: usize,
 ) -> GibbsOutput {
-    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, None)
+    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, SampleExecution::Unbudgeted)
 }
 
 fn run_gibbs_ensemble_inner(
@@ -1281,11 +1299,11 @@ fn run_gibbs_ensemble_inner(
     k_max_override: Option<usize>,
     precomputed_cond: Option<&Vec<Vec<u32>>>,
     n_restarts: usize,
-    memory: Option<&super::memory::MemoryBudget>,
+    execution: SampleExecution<'_>,
 ) -> GibbsOutput {
     let n_restarts = n_restarts.max(1);
     if n_restarts == 1 {
-        return run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, memory);
+        return run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, execution);
     }
     let base = params.seed_or_default();
     let mut acc_d: Vec<f64> = Vec::new();
@@ -1293,7 +1311,7 @@ fn run_gibbs_ensemble_inner(
     for i in 0..n_restarts {
         let mut p = params.clone();
         p.seed = base.wrapping_add(i as u64);
-        let out = run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, &p, k_max_override, precomputed_cond, memory);
+        let out = run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, &p, k_max_override, precomputed_cond, execution);
         if acc_d.is_empty() {
             acc_d = vec![0.0f64; out.dosage.len()];
             acc_g = vec![0.0f64; out.gp.len()];

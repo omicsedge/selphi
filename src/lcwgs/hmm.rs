@@ -53,7 +53,7 @@
 //! - Precomputed `p_rec` and `emit` arrays before fwd-bwd (one-shot).
 //! - Scalar and AVX-512/AVX2/NEON dispatch paths.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -74,6 +74,7 @@ pub fn take_hmm_profile() -> (u64, u64) {
 
 // Thread-local scratch buffers (reused across haps to amortize alloc).
 thread_local! {
+    static PARALLEL_PACKING: Cell<bool> = const { Cell::new(true) };
     static TL_ALPHA: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     static TL_BETA:  RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     static TL_ALPHA_SUM: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
@@ -89,6 +90,17 @@ thread_local! {
     // the extra traffic stays tiny — a contiguous f32 materialization (32×) was
     // measured SLOWER than the scattered gather (memory-bandwidth bound).
     static TL_CONDBITS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A whole-sample Rayon job must not suspend large scratch to steal another
+/// sample during fallback packing (including the scaffold/no-prefix paths).
+pub(crate) fn with_serial_packing<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) { PARALLEL_PACKING.with(|flag| flag.set(self.0)); }
+    }
+    let _restore = Restore(PARALLEL_PACKING.with(|flag| flag.replace(false)));
+    f()
 }
 
 /// Each of the eight worker caches retains at most this many bytes. Larger
@@ -195,7 +207,7 @@ impl BasePack {
                 debug_assert_eq!(n, wb);
             };
             let rows = &mut self.words.spare_capacity_mut()[..total];
-            if parallel && sites_abs.len() >= 512 {
+            if parallel && PARALLEL_PACKING.with(Cell::get) && sites_abs.len() >= 512 {
                 rows.par_chunks_mut(wb).enumerate().with_min_len(128).for_each(pack);
             } else {
                 rows.chunks_mut(wb).enumerate().for_each(pack);
@@ -420,7 +432,7 @@ pub(crate) fn pack_cond_rows_with_parallelism(
             debug_assert_eq!(n, w64);
         };
         let rows = &mut out.spare_capacity_mut()[..total];
-        if parallel && n_var >= 512 {
+        if parallel && PARALLEL_PACKING.with(Cell::get) && n_var >= 512 {
             rows.par_chunks_mut(w64).enumerate().with_min_len(128).for_each(pack);
         } else {
             rows.chunks_mut(w64).enumerate().for_each(pack);
@@ -2200,6 +2212,19 @@ pub(crate) mod reference_pack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serial_sample_packing_restores_nested_policy_on_unwind() {
+        assert!(PARALLEL_PACKING.with(Cell::get));
+        let err = std::panic::catch_unwind(|| with_serial_packing(|| {
+            assert!(!PARALLEL_PACKING.with(Cell::get));
+            with_serial_packing(|| assert!(!PARALLEL_PACKING.with(Cell::get)));
+            assert!(!PARALLEL_PACKING.with(Cell::get));
+            panic!("release packing policy");
+        }));
+        assert!(err.is_err());
+        assert!(PARALLEL_PACKING.with(Cell::get));
+    }
 
     #[test]
     fn worker_cache_allowance_bounds_retained_capacity() {

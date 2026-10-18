@@ -1,7 +1,77 @@
-//! Byte admission for chunk state and temporary sample work. Coordinators wait
-//! outside Rayon; workers only execute work that already owns a permit.
+//! Byte admission for nested single-sample work and pressure-based reclamation
+//! for whole-sample Rayon waves. Blocking permit waits stay outside Rayon.
 
 use std::sync::{Condvar, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Whole samples stay on Rayon when there is enough independent sample work.
+/// The single-sample path retains byte admission and optional nested work.
+#[derive(Clone, Copy, Default)]
+pub(crate) enum SampleExecution<'a> {
+    #[default]
+    Unbudgeted,
+    Admitted(&'a MemoryBudget),
+    Waves(&'a WaveReclaimer),
+}
+
+impl<'a> SampleExecution<'a> {
+    pub fn permits(self) -> Option<&'a MemoryBudget> {
+        match self { Self::Admitted(memory) => Some(memory), _ => None }
+    }
+
+    pub fn finish_sample(self) {
+        if let Self::Waves(reclaimer) = self { reclaimer.finish_sample(); }
+    }
+}
+
+/// Release allocator residency only under pressure, after all of a sample's
+/// large scratch has died on its allocating worker. This is an RSS trigger,
+/// not a hard process limit: concurrent live allocations cannot be collected.
+/// Leave a quarter of the target for work already running on other workers.
+pub(crate) struct WaveReclaimer {
+    threshold: usize,
+    samples: AtomicUsize,
+    collections: AtomicUsize,
+}
+
+impl WaveReclaimer {
+    pub fn new(target: usize) -> Self {
+        Self { threshold: target - target / 4,
+            samples: AtomicUsize::new(0), collections: AtomicUsize::new(0) }
+    }
+
+    fn collect_if_needed(&self, rss: Option<usize>, collect: impl FnOnce()) {
+        self.samples.fetch_add(1, Ordering::Relaxed);
+        if rss.is_some_and(|rss| rss >= self.threshold) {
+            collect();
+            self.collections.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn finish_sample(&self) {
+        self.collect_if_needed(resident_bytes(), collect_local);
+    }
+
+    pub fn counts(&self) -> (usize, usize) {
+        (self.samples.load(Ordering::Relaxed), self.collections.load(Ordering::Relaxed))
+    }
+}
+
+/// Read only this process. A peak-RSS fallback would keep collection enabled
+/// forever after one peak, so platforms without a current reading return None.
+fn resident_bytes() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let pages = statm.split_whitespace().nth(1)?.parse::<usize>().ok()?;
+        // SAFETY: sysconf has no pointer arguments or side effects here.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_size <= 0 { return None; }
+        pages.checked_mul(page_size as usize)
+    }
+    #[cfg(not(target_os = "linux"))]
+    { None }
+}
 
 #[derive(Default)]
 struct Usage { fixed: usize, work: usize, work_jobs: usize, waiting: usize, peak: usize }
@@ -207,6 +277,18 @@ pub(crate) fn phase_bytes(sites: usize, k: usize, snapshots: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wave_collection_follows_current_pressure_without_sticking_at_a_past_peak() {
+        let reclaimer = WaveReclaimer::new(400);
+        let calls = AtomicUsize::new(0);
+        for rss in [None, Some(299), Some(300), Some(450), Some(200)] {
+            reclaimer.collect_if_needed(rss, || { calls.fetch_add(1, Ordering::Relaxed); });
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(reclaimer.counts(), (5, 2));
+        assert!(SampleExecution::Waves(&reclaimer).permits().is_none());
+    }
+
     #[test]
     fn permits_charge_idle_state_and_release_on_unwind() {
         let b = MemoryBudget::new(1000, 100);

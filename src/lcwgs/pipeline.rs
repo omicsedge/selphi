@@ -44,6 +44,7 @@ fn memtrace(label: &str) {
 }
 use super::pl_reader::{parse_pl_vcf, PlVcfResult};
 use super::LcwgsParams;
+use super::memory::{SampleExecution, WaveReclaimer};
 
 /// Per (variant, sample) imputation output for downstream writers.
 pub struct LcwgsOutput {
@@ -553,11 +554,68 @@ fn chunk_state_bytes(sites: usize, n_ref: usize, samples: usize) -> usize {
         .saturating_add(n_ref * 128)
 }
 
+/// A chunk's resident inputs/outputs and one active sample task's scratch.
+/// Keep these separate: each task runs FB0, FB1 and phasing sequentially, and
+/// at most `threads` such tasks execute across all live chunks.
+#[derive(Clone, Copy)]
+struct ChunkMemory { fixed: f64, task: f64 }
+
+fn estimate_chunk_memory(n_sites: usize, n_ref: usize, n_samples: usize, k: usize) -> ChunkMemory {
+    let sites = n_sites as f64;
+    // Existing panel/PBWT factor, plus GLs, cached HLs, accumulators, sampled
+    // haplotypes and completed sample results (including allocator headroom).
+    let fixed = sites * (n_ref.div_ceil(64) as f64 * 8.0 * 1.9 + n_samples as f64 * 96.0);
+    // The previous scheduler's calibrated 5 KB/site/sample term at K=3000,
+    // scaled for other conditioning depths. This includes the active phaser
+    // snapshots; small scratch/metadata still has a floor at low K.
+    let task = sites * (5000.0 * k as f64 / 3000.0).max(256.0);
+    ChunkMemory { fixed, task }
+}
+
+fn wave_memory(chunks: &[ChunkMemory], n_samples: usize, threads: usize) -> f64 {
+    let fixed: f64 = chunks.iter().map(|m| m.fixed).sum();
+    let largest_task = chunks.iter().map(|m| m.task).fold(0.0, f64::max);
+    let active = chunks.len().saturating_mul(n_samples).min(threads.max(1));
+    fixed + largest_task * active as f64
+}
+
+fn wave_len(chunks: &[ChunkMemory], n_samples: usize, threads: usize, budget: f64) -> usize {
+    if chunks.is_empty() { return 0; }
+    if budget.is_nan() || budget <= 0.0 { return 1; }
+    let limit = chunks.len().min(threads.max(1));
+    let mut live = 1; // a single oversized chunk must still be able to progress
+    for n in 2..=limit {
+        if wave_memory(&chunks[..n], n_samples, threads) > budget { break; }
+        live = n;
+    }
+    live
+}
+
+fn run_chunk_waves<T: Send>(
+    chunks: &[ChunkMemory], n_samples: usize, threads: usize, budget: f64,
+    process: impl Fn(usize) -> T + Sync, mut merge: impl FnMut(usize, T),
+) {
+    use rayon::prelude::*;
+    let mut start = 0;
+    while start < chunks.len() {
+        let live = wave_len(&chunks[start..], n_samples, threads, budget);
+        let end = start + live;
+        crate::selphi_info!(
+            "  chunk parallelism: {} live, up to {} sample tasks (budget {:.1} GB, estimated {:.2} GB)",
+            live, live.saturating_mul(n_samples).min(threads), budget / 1e9,
+            wave_memory(&chunks[start..end], n_samples, threads) / 1e9);
+        let wave: Vec<_> = (start..end).into_par_iter().map(&process).collect();
+        for (c, result) in (start..end).zip(wave) { merge(c, result); }
+        crate::common::mem::release_freed_memory();
+        start = end;
+    }
+}
+
 /// Reconstruct the previous scheduler's live-chunk envelope from the same
 /// input dimensions. Its fallback used 5 KB/site/sample and a 1.9 panel factor.
-/// Charge only the sample slots that can execute. Multiple samples use the
-/// full working envelope so waiting phasers do not starve the pool. Keep the
-/// smaller single-sample allowance, where nested work already fills the pool.
+/// Charge only the sample slots that can execute. Whole-sample waves use 80%
+/// of the working envelope as their RSS target for allocator reclamation.
+/// The single-sample byte allowance retains its nested-work headroom.
 /// The host allowance only limits the previous live-chunk count.
 fn baseline_memory_budget(
     sites: usize, n_ref: usize, samples: usize, chunks: usize, threads: usize,
@@ -570,7 +628,7 @@ fn baseline_memory_budget(
     let limit = if few { chunks } else { chunks.saturating_sub(1).max(1) }.min(threads).max(1);
     let live = ((host_allowance as f64 / per_chunk.max(1.0)) as usize).clamp(1, limit);
     let active = live.saturating_mul(samples).min(threads);
-    let fraction = if samples <= 1 { 0.65 } else { 1.0 };
+    let fraction = if samples <= 1 { 0.65 } else { 0.8 };
     shared.saturating_add(((panel * live as f64 + 5000.0 * average * active as f64) * fraction) as usize)
 }
 
@@ -652,20 +710,34 @@ fn run_chunked_gibbs(
 
     let threads = rayon::current_num_threads().max(1);
     let cache_bytes = threads * (super::hmm::CACHE_BYTES_PER_WORKER + super::membership::CACHE_BYTES_PER_WORKER);
-    let coordinator_bytes = threads.min(n_chunks) * threads.min(n_samples)
-        * (super::membership::CACHE_BYTES_PER_WORKER + 64 * 1024);
+    let coordinator_bytes = if n_samples <= 1 {
+        threads.min(n_chunks) * (super::membership::CACHE_BYTES_PER_WORKER + 64 * 1024)
+    } else { 0 };
     let shared = (rss_gb() * 1_073_741_824.0) as usize + cache_bytes + coordinator_bytes
         + n_shared * n_samples * 16 + 64 * 1024 * 1024;
     let host_allowance = ((crate::log::system_ram_mb() / 1024.0 * 0.5).max(2.5) * 1e9) as usize;
     let default_budget = baseline_memory_budget(n_shared, srp.metadata.n_haps, n_samples,
         n_chunks, threads, shared, host_allowance);
-    let limit = crate::config::f64_opt("LCWGS_MEM_BUDGET_GB").map_or(default_budget, |gb| {
+    let explicit_budget = crate::config::f64_opt("LCWGS_MEM_BUDGET_GB").map(|gb| {
         assert!(gb.is_finite() && gb > 0.0, "LCWGS_MEM_BUDGET_GB must be positive and finite");
         (gb * 1e9) as usize
     });
-    let memory = super::memory::MemoryBudget::new(limit, shared);
-    crate::selphi_info!("  lcWGS process memory allowance: {:.2} GB (shared/cache {:.2} GB)",
-        limit as f64 / 1e9, shared as f64 / 1e9);
+    let limit = explicit_budget.unwrap_or(default_budget);
+    assert!(limit > shared, "lcWGS memory budget must exceed shared process storage");
+    let memory = (n_samples <= 1).then(|| super::memory::MemoryBudget::new(limit, shared));
+    let reclaimer = WaveReclaimer::new(limit);
+    let execution = match &memory {
+        Some(memory) => {
+            crate::selphi_info!("  lcWGS process memory allowance: {:.2} GB (shared/cache {:.2} GB)",
+                limit as f64 / 1e9, shared as f64 / 1e9);
+            SampleExecution::Admitted(memory)
+        }
+        None => {
+            crate::selphi_info!("  lcWGS sample waves: RSS target {:.2} GB, reclaim above {:.2} GB (shared/cache {:.2} GB)",
+                limit as f64 / 1e9, limit as f64 * 0.75 / 1e9, shared as f64 / 1e9);
+            SampleExecution::Waves(&reclaimer)
+        }
+    };
 
     // Per-chunk work as a closure so chunks can run in PARALLEL when the sample
     // count is too small to fill the cores (single/few-sample: the sample/hap
@@ -690,12 +762,12 @@ fn run_chunked_gibbs(
         let chunk_wgs = &wgs_idx[buf_start..buf_end];
         let chunk_bm = srp.extract_ref_alleles_bitmatrix(&chunk_wgs);
 
-        let mut out = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, None, chrwide_cond.as_ref(), Some(&memory));
+        let mut out = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, None, chrwide_cond.as_ref(), execution);
         // Two-depth split: run the deep pass and overlay its dose/GP onto the band
         // sites (panel MAF ∈ [lo,hi)), routing by PANEL allele frequency only (known
         // a-priori; no truth). Byte-identical when `split_band` is None.
         if let Some((lo, hi, deep_k)) = split_band {
-            let out_deep = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, Some(deep_k), chrwide_cond.as_ref(), Some(&memory));
+            let out_deep = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, Some(deep_k), chrwide_cond.as_ref(), execution);
             let n_ref = chunk_bm.n_haps;
             for lv in 0..chunk_bm.n_sites {
                 let ac = chunk_bm.popcount_row(lv, n_ref) as f64;
@@ -795,11 +867,6 @@ fn run_chunked_gibbs(
         Some((core_start, core_end, buf_start, out))
     };
 
-    let chunk_memory: Vec<_> = (0..n_chunks).map(|c| {
-        let sites = super::chunk_ranges::chunk_ranges(cm, c, n_chunks, core_cm, buffer_cm)
-            .map_or(0, |(_, buffer)| buffer.len());
-        chunk_state_bytes(sites, srp.metadata.n_haps, n_samples)
-    }).collect();
     let merge_chunk = |_c: usize, result: Option<(usize, usize, usize, super::iterate::GibbsOutput)>| {
         if let Some((core_start, core_end, buf_start, out)) = result {
             let dst = core_start * n_samples .. core_end * n_samples;
@@ -808,10 +875,34 @@ fn run_chunked_gibbs(
             gp[dst.start * 3 .. dst.end * 3].copy_from_slice(&out.gp[src.start * 3 .. src.end * 3]);
         }
     };
-    // Admit by resident bytes, retaining only a worker-count bound on native
-    // chunk coordinators. Sample counts do not predict runnable work across
-    // selection, permit waits and iteration barriers.
-    super::memory::run_chunks(&chunk_memory, &memory, threads, process_chunk, merge_chunk);
+    let n_ref = srp.metadata.n_haps;
+    let chunk_sites: Vec<_> = (0..n_chunks).map(|c| {
+        super::chunk_ranges::chunk_ranges(cm, c, n_chunks, core_cm, buffer_cm)
+            .map_or(0, |(_, buffer)| buffer.len())
+    }).collect();
+    if let Some(memory) = &memory {
+        let costs: Vec<_> = chunk_sites.iter().map(|&sites| chunk_state_bytes(sites, n_ref, n_samples)).collect();
+        super::memory::run_chunks(&costs, memory, threads, process_chunk, merge_chunk);
+    } else {
+        let cap = |k: usize| if k == 0 { n_ref } else { k.min(n_ref) };
+        let mut k = if crate::config::present("LCWGS_NO_RARE_CARRIER") {
+            cap(params.kpbwt).max(1000.min(n_ref))
+        } else {
+            cap(crate::config::usize_opt("LCWGS_KMAX").unwrap_or(3000))
+        };
+        if let Some((_, _, deep_k)) = split_band { k = k.max(cap(deep_k)); }
+        if crate::config::present("LCWGS_LS_RICH_COND") { k = k.saturating_mul(2).min(n_ref); }
+        let costs: Vec<_> = chunk_sites.iter().map(|&sites| estimate_chunk_memory(sites, n_ref, n_samples, k)).collect();
+        // Keep the original wave admission/order by default. Its task estimate
+        // is deliberately larger than observed RSS; applying the reclamation
+        // target to that estimate would needlessly remove runnable chunks.
+        // An explicit process budget also constrains wave admission.
+        let wave_budget = explicit_budget.map_or(host_allowance, |bytes| bytes - shared);
+        run_chunk_waves(&costs, n_samples, threads, wave_budget as f64, process_chunk, merge_chunk);
+        let (samples, collections) = reclaimer.counts();
+        crate::selphi_info!("  lcWGS sample waves: {} completed sample tasks, {} pressure collections",
+            samples, collections);
+    }
 
     (dosage, gp)
 }
@@ -821,6 +912,31 @@ fn run_chunked_gibbs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wave_budget_counts_sample_tasks_and_buffered_sites() {
+        let chunks = vec![estimate_chunk_memory(100_000, 4796, 12, 3000); 5];
+        let one = chunks[0];
+        assert_eq!(wave_memory(&chunks[..1], 12, 16), one.fixed + 12.0 * one.task);
+        assert_eq!(wave_memory(&chunks[..2], 12, 16), 2.0 * one.fixed + 16.0 * one.task);
+        assert_eq!(wave_len(&chunks, 12, 16, 64e9), 5);
+        assert_eq!(wave_len(&chunks, 12, 16, wave_memory(&chunks[..1], 12, 16)), 1);
+        assert!(estimate_chunk_memory(120_000, 4796, 12, 3000).fixed > one.fixed);
+        assert!(estimate_chunk_memory(100_000, 4796, 12, 6000).task > one.task);
+        assert_eq!(wave_len(&[], 12, 16, 1e9), 0);
+        for ns in [1, 6, 12, 32] {
+            for threads in [1, 4, 16] {
+                for budget in [0.0, 1e8, 1e9, 8e9, 32e9] {
+                    let live = wave_len(&chunks, ns, threads, budget);
+                    assert!((1..=chunks.len().min(threads)).contains(&live));
+                    if live > 1 { assert!(wave_memory(&chunks[..live], ns, threads) <= budget); }
+                    if live < chunks.len().min(threads) {
+                        assert!(wave_memory(&chunks[..live + 1], ns, threads) > budget);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn budget_follows_previous_concurrency_and_input_size() {
@@ -842,7 +958,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_schedule_matches_sequential_dosage_and_gp_bits() {
+    fn wave_and_admitted_schedules_match_sequential_dosage_and_gp_bits() {
         use crate::lcwgs::hmm::reference_pack as rp;
         let mut rng = rp::Xs(0x1F83_D9AB_FB41_BD6B);
         let pool = rayon::ThreadPoolBuilder::new().num_threads(16).build().unwrap();
@@ -859,20 +975,30 @@ mod tests {
                 (bm, cm, gl)
             }).collect();
             let costs: Vec<_> = inputs.iter().map(|(_, cm, _)| chunk_state_bytes(cm.len(), 40, ns)).collect();
-            let process = |c: usize, memory: Option<&super::super::memory::MemoryBudget>| {
+            let process = |c: usize, execution: SampleExecution<'_>| {
                 let (bm, cm, gl) = &inputs[c];
-                let out = super::super::iterate::run_gibbs_ensemble_with_memory(gl, bm, cm, ns, &params, None, None, memory);
+                let out = super::super::iterate::run_gibbs_ensemble_with_memory(gl, bm, cm, ns, &params, None, None, execution);
                 (out.dosage.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                  out.gp.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
             };
-            let serial: Vec<_> = pool.install(|| (0..inputs.len()).map(|c| process(c, None)).collect());
+            let serial: Vec<_> = pool.install(|| (0..inputs.len()).map(|c| process(c, SampleExecution::Unbudgeted)).collect());
+            let waves: Vec<_> = inputs.iter().map(|(_, cm, _)| estimate_chunk_memory(cm.len(), 40, ns, 40)).collect();
+            for budget in [1.0, f64::INFINITY] {
+                let reclaimer = WaveReclaimer::new(usize::MAX);
+                let mut got = vec![None; inputs.len()];
+                pool.install(|| run_chunk_waves(&waves, ns, 16, budget,
+                    |c| process(c, SampleExecution::Waves(&reclaimer)), |c, out| got[c] = Some(out)));
+                assert_eq!(got.into_iter().map(Option::unwrap).collect::<Vec<_>>(), serial,
+                    "samples={ns} wave budget={budget}");
+                assert_eq!(reclaimer.counts(), (params.n_iterations * ns * inputs.len(), 0));
+            }
             for parallel in [false, true] {
                 let mut memory = super::super::memory::MemoryBudget::new(64 * 1024 * 1024, 1024);
                 memory.set_parallel_fb(parallel);
                 for live in [1, 16] {
                     let mut got = vec![None; inputs.len()];
                     super::super::memory::run_chunks(&costs, &memory, live,
-                        |c| process(c, Some(&memory)), |c, out| got[c] = Some(out));
+                        |c| process(c, SampleExecution::Admitted(&memory)), |c, out| got[c] = Some(out));
                     assert_eq!(got.into_iter().map(Option::unwrap).collect::<Vec<_>>(), serial,
                         "samples={ns} live={live} parallel={parallel}");
                 }
