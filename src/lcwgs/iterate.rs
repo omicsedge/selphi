@@ -33,7 +33,7 @@
 
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use crate::lcwgs::hmm::{pack_cond_rows, BasePack};
+use crate::lcwgs::hmm::BasePack;
 
 /// Call-owned scratch is released before a sample task becomes idle.
 #[derive(Default)]
@@ -868,6 +868,7 @@ fn run_gibbs_with_memory(
             if let Some(t) = ts { SPLIT_NS.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed); }
             let b = if share { c0.iter().zip(c1.iter()).take_while(|(x, y)| x == y).count() } else { 0 };
             let fb = || {
+                let parallel_rows = memory.is_none_or(|m| m.parallel_rows());
                 let mut base = BasePack::new();
                 let mut un = Vec::new();
                 if share && b > 0 {
@@ -876,7 +877,7 @@ fn run_gibbs_with_memory(
                         (Some(a), Some(z)) => merge_sorted(&a.poly, &z.poly, &mut un),
                         _ => un.extend(0..n_var),
                     }
-                    base.build(ref_bm, &c0[..b], &un, n_var);
+                    base.build_rows(ref_bm, &c0[..b], &un, n_var, parallel_rows);
                 }
                 // Pack one hap's full conditioning set over its FB axis (prefix
                 // copied from `base`, tail gathered). Returns false when nothing
@@ -888,12 +889,12 @@ fn run_gibbs_with_memory(
                         None => (None, n_var),
                     };
                     if n == 0 { return false; }
-                    pack_cond_rows(ref_bm, c, ps, n, if b > 0 { Some(base) } else { None }, hp);
+                    super::hmm::pack_cond_rows_with_parallelism(
+                        ref_bm, c, ps, n, if b > 0 { Some(base) } else { None }, hp, parallel_rows);
                     true
                 };
-                let fb0 = || {
-                    let mut hp = Vec::new();
-                    let packed = pack_for(c0, split0, &base, &mut hp);
+                let fb0 = |hp: &mut Vec<u64>| {
+                    let packed = pack_for(c0, split0, &base, hp);
                     run_one_hap(
                         h0i, it, seed,
                         |v| prev_alleles[v * n_target_haps + h1i] as usize,
@@ -903,9 +904,8 @@ fn run_gibbs_with_memory(
                         full_axis_rmult.as_deref(),
                         if packed { Some(hp.as_slice()) } else { None })
                 };
-                let fb1 = |fresh: Option<&[u8]>| {
-                    let mut hp = Vec::new();
-                    let packed = pack_for(c1, split1, &base, &mut hp);
+                let fb1 = |fresh: Option<&[u8]>, hp: &mut Vec<u64>| {
+                    let packed = pack_for(c1, split1, &base, hp);
                     run_one_hap(
                         h1i, it, seed,
                         |v| fresh.map_or(prev_alleles[v * n_target_haps + h0i], |a| a[v]) as usize,
@@ -919,14 +919,15 @@ fn run_gibbs_with_memory(
                     memory.and_then(|m| m.try_parallel_fb(super::memory::fb_bytes(n_var, c1.len())))
                 } else { None };
                 if let Some(_permit) = extra {
-                    rayon::join(fb0, || {
-                        let out = fb1(None);
+                    rayon::join(|| fb0(&mut Vec::new()), || {
+                        let out = fb1(None, &mut Vec::new());
                         super::memory::collect_local();
                         out
                     })
                 } else {
-                    let first = fb0();
-                    let second = fb1(gs.then_some(first.1.as_slice()));
+                    let mut hp = Vec::new();
+                    let first = fb0(&mut hp);
+                    let second = fb1(gs.then_some(first.1.as_slice()), &mut hp);
                     (first, second)
                 }
             };
@@ -986,7 +987,8 @@ fn run_gibbs_with_memory(
                         // A complete pack is call-owned and charged alongside snapshots.
                         let mut base = BasePack::new();
                         let sites: Vec<usize> = poly_ref.iter().map(|&v| v as usize).collect();
-                        base.build(ref_bm, cond_haps, &sites, n_var);
+                        base.build_rows(ref_bm, cond_haps, &sites, n_var,
+                            memory.is_none_or(|m| m.parallel_rows()));
                         let phase_base = (!cond_haps.is_empty()).then_some(&base);
                         let mut hmm = crate::lcwgs::phasing_hmm::PhasingHmm::new(&g2p);
                         hmm.rephase(h0, h1, flat, cond_haps, ref_bm, cm, &g2p,

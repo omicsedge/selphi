@@ -4,7 +4,7 @@
 use std::sync::{Condvar, Mutex};
 
 #[derive(Default)]
-struct Usage { fixed: usize, work: usize, peak: usize }
+struct Usage { fixed: usize, work: usize, work_jobs: usize, waiting: usize, peak: usize }
 
 pub(crate) struct MemoryBudget {
     limit: usize,
@@ -45,12 +45,27 @@ impl MemoryBudget {
         Some(Permit { budget: self, bytes, fixed: true })
     }
 
-    pub fn try_work(&self, bytes: usize) -> Option<Permit<'_>> {
+    #[cfg(test)]
+    fn try_work(&self, bytes: usize) -> Option<Permit<'_>> {
         let mut used = self.usage.lock().unwrap();
+        self.admit_work(&mut used, bytes)
+    }
+
+    fn admit_work(&self, used: &mut Usage, bytes: usize) -> Option<Permit<'_>> {
         if bytes > self.limit.saturating_sub(used.fixed + used.work) { return None; }
         used.work += bytes;
+        used.work_jobs += 1;
         used.peak = used.peak.max(used.fixed + used.work);
         Some(Permit { budget: self, bytes, fixed: false })
+    }
+
+    /// Prefer whole sample jobs when they already fill the pool. A nested join
+    /// can suspend its parent's packs and permit while executing another job;
+    /// with a full queue this adds storage and delays the iteration barrier.
+    /// Rows need no extra bytes, so memory waiters alone must not disable them.
+    pub fn parallel_rows(&self) -> bool {
+        let used = self.usage.lock().unwrap();
+        used.work_jobs < rayon::current_num_threads()
     }
 
     /// Optional parallel work never waits on a worker. A denied request uses
@@ -58,7 +73,9 @@ impl MemoryBudget {
     pub fn try_parallel_fb(&self, bytes: usize) -> Option<Permit<'_>> {
         #[cfg(test)]
         if !self.allow_parallel_fb { return None; }
-        let permit = self.try_work(bytes)?;
+        let mut used = self.usage.lock().unwrap();
+        if used.waiting != 0 || used.work_jobs >= rayon::current_num_threads() { return None; }
+        let permit = self.admit_work(&mut used, bytes)?;
         #[cfg(test)]
         self.parallel_fb_grants.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Some(permit)
@@ -76,14 +93,13 @@ impl MemoryBudget {
         assert!(rayon::current_thread_index().is_none(), "memory admission must run outside Rayon");
         assert!(bytes <= self.work_limit(),
             "one lcWGS sample exceeds the work allowance; increase LCWGS_MEM_BUDGET_GB");
-        if let Some(permit) = self.try_work(bytes) { return permit; }
         let mut used = self.usage.lock().unwrap();
+        used.waiting += 1;
         while bytes > self.limit.saturating_sub(used.fixed + used.work) {
             used = self.changed.wait(used).unwrap();
         }
-        used.work += bytes;
-        used.peak = used.peak.max(used.fixed + used.work);
-        Permit { budget: self, bytes, fixed: false }
+        used.waiting -= 1;
+        self.admit_work(&mut used, bytes).unwrap()
     }
 
     pub fn run<R: Send>(&self, bytes: usize, f: impl FnOnce() -> R + Send) -> R {
@@ -95,7 +111,10 @@ impl MemoryBudget {
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
         let mut used = self.budget.usage.lock().unwrap();
-        if self.fixed { used.fixed -= self.bytes; } else { used.work -= self.bytes; }
+        if self.fixed { used.fixed -= self.bytes; } else {
+            used.work -= self.bytes;
+            used.work_jobs -= 1;
+        }
         self.budget.changed.notify_all();
     }
 }
@@ -215,6 +234,41 @@ mod tests {
         drop(a);
         assert!(b.try_chunk(350).is_some());
         drop(z);
+        assert!(b.usage.lock().unwrap().peak <= 1000);
+    }
+
+    #[test]
+    fn nested_work_yields_to_full_pool_and_waiting_samples() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        pool.install(|| {
+            let b = MemoryBudget::new(1000, 0);
+            let primary = b.try_work(200).unwrap();
+            assert!(b.parallel_rows());
+            let extra = b.try_parallel_fb(200).unwrap();
+            assert!(!b.parallel_rows());
+            assert!(b.try_parallel_fb(1).is_none());
+            drop(extra);
+            b.usage.lock().unwrap().waiting = 1;
+            assert!(b.parallel_rows());
+            assert!(b.try_parallel_fb(1).is_none());
+            b.usage.lock().unwrap().waiting = 0;
+            assert!(b.try_parallel_fb(801).is_none());
+            assert!(b.parallel_rows());
+            drop(primary);
+            assert_eq!(b.usage.lock().unwrap().work_jobs, 0);
+        });
+    }
+
+    #[test]
+    fn byte_admission_keeps_more_than_three_chunks_runnable() {
+        let b = MemoryBudget::new(1000, 0);
+        let chunks: Vec<_> = (0..6).map(|_| b.try_chunk(80).unwrap()).collect();
+        assert!(b.try_chunk(80).is_none());
+        let work = b.try_work(500).unwrap();
+        assert!(b.try_work(21).is_none());
+        drop(work);
+        drop(chunks);
+        assert_eq!(b.usage.lock().unwrap().fixed, 0);
         assert!(b.usage.lock().unwrap().peak <= 1000);
     }
 

@@ -166,6 +166,10 @@ impl BasePack {
     /// absolute sites `sites_abs` (ascending). `n_sites_total` sizes the
     /// site → row map. Counted in the pack profile like the per-haplotype pack.
     pub fn build(&mut self, ref_bm: &HaplotypeBitmatrix, base: &[u32], sites_abs: &[usize], n_sites_total: usize) {
+        self.build_rows(ref_bm, base, sites_abs, n_sites_total, true);
+    }
+
+    pub(crate) fn build_rows(&mut self, ref_bm: &HaplotypeBitmatrix, base: &[u32], sites_abs: &[usize], n_sites_total: usize, parallel: bool) {
         let timing = hmm_timing();
         let t0 = if timing { Some(std::time::Instant::now()) } else { None };
         self.b = base.len();
@@ -191,7 +195,7 @@ impl BasePack {
                 debug_assert_eq!(n, wb);
             };
             let rows = &mut self.words.spare_capacity_mut()[..total];
-            if sites_abs.len() >= 512 {
+            if parallel && sites_abs.len() >= 512 {
                 rows.par_chunks_mut(wb).enumerate().with_min_len(128).for_each(pack);
             } else {
                 rows.chunks_mut(wb).enumerate().for_each(pack);
@@ -367,6 +371,13 @@ pub fn pack_cond_rows(
     base: Option<&BasePack>,
     out: &mut Vec<u64>,
 ) {
+    pack_cond_rows_with_parallelism(ref_bm, cond, poly_sites, n_var, base, out, true);
+}
+
+pub(crate) fn pack_cond_rows_with_parallelism(
+    ref_bm: &HaplotypeBitmatrix, cond: &[u32], poly_sites: Option<&[usize]>,
+    n_var: usize, base: Option<&BasePack>, out: &mut Vec<u64>, parallel: bool,
+) {
     let timing = hmm_timing();
     let t0 = if timing { Some(std::time::Instant::now()) } else { None };
     let k = cond.len();
@@ -409,7 +420,7 @@ pub fn pack_cond_rows(
             debug_assert_eq!(n, w64);
         };
         let rows = &mut out.spare_capacity_mut()[..total];
-        if n_var >= 512 {
+        if parallel && n_var >= 512 {
             rows.par_chunks_mut(w64).enumerate().with_min_len(128).for_each(pack);
         } else {
             rows.chunks_mut(w64).enumerate().for_each(pack);
@@ -2272,21 +2283,21 @@ mod tests {
         let cond: Vec<u32> = (0..137).map(|h| (h * 37 % nh) as u32).collect();
         for threads in [1, 2, 4] {
             let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
-            pool.install(|| {
+            for parallel in [false, true] { pool.install(|| {
                 for b in [0, 1, 63, 64, 65, 128, 137] {
                     let mut base = BasePack::new();
-                    base.build(&bm, &cond[..b], &sites, n);
+                    base.build_rows(&bm, &cond[..b], &sites, n, parallel);
                     assert_eq!(base.words, rp::base_pack_build(&bm, &cond[..b], &sites, n).0);
                     let mut got = Vec::new();
                     for axis in [None, Some(sites.as_slice())] {
                         let count = axis.map_or(n, <[usize]>::len);
-                        pack_cond_rows(&bm, &cond, axis, count, Some(&base), &mut got);
+                        pack_cond_rows_with_parallelism(&bm, &cond, axis, count, Some(&base), &mut got, parallel);
                         let mut want = Vec::new();
                         rp::pack_cond_rows(&bm, &cond, axis, count, None, &mut want);
                         assert_eq!(got, want);
                     }
                 }
-            });
+            }); }
         }
     }
 

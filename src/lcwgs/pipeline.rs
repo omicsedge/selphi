@@ -555,9 +555,10 @@ fn chunk_state_bytes(sites: usize, n_ref: usize, samples: usize) -> usize {
 
 /// Reconstruct the previous scheduler's live-chunk envelope from the same
 /// input dimensions. Its fallback used 5 KB/site/sample and a 1.9 panel factor.
-/// Charge only the sample slots that can execute, and keep 35% headroom for
-/// allocation history and unmodelled process storage instead of spending half
-/// of host RAM. The host allowance only limits the previous live-chunk count.
+/// Charge only the sample slots that can execute. Multiple samples use the
+/// full working envelope so waiting phasers do not starve the pool. Keep the
+/// smaller single-sample allowance, where nested work already fills the pool.
+/// The host allowance only limits the previous live-chunk count.
 fn baseline_memory_budget(
     sites: usize, n_ref: usize, samples: usize, chunks: usize, threads: usize,
     shared: usize, host_allowance: usize,
@@ -569,7 +570,8 @@ fn baseline_memory_budget(
     let limit = if few { chunks } else { chunks.saturating_sub(1).max(1) }.min(threads).max(1);
     let live = ((host_allowance as f64 / per_chunk.max(1.0)) as usize).clamp(1, limit);
     let active = live.saturating_mul(samples).min(threads);
-    shared.saturating_add(((panel * live as f64 + 5000.0 * average * active as f64) * 0.65) as usize)
+    let fraction = if samples <= 1 { 0.65 } else { 1.0 };
+    shared.saturating_add(((panel * live as f64 + 5000.0 * average * active as f64) * fraction) as usize)
 }
 
 /// Chunk the chromosome by cM and run the Gibbs per chunk with its own
@@ -806,10 +808,10 @@ fn run_chunked_gibbs(
             gp[dst.start * 3 .. dst.end * 3].copy_from_slice(&out.gp[src.start * 3 .. src.end * 3]);
         }
     };
-    // Keep enough samples runnable to fill the pool while leaving room for
-    // row tasks and optional second-haplotype work inside each active chunk.
-    let runnable_chunks = threads.div_ceil(n_samples.max(1)).max(1);
-    super::memory::run_chunks(&chunk_memory, &memory, runnable_chunks, process_chunk, merge_chunk);
+    // Admit by resident bytes, retaining only a worker-count bound on native
+    // chunk coordinators. Sample counts do not predict runnable work across
+    // selection, permit waits and iteration barriers.
+    super::memory::run_chunks(&chunk_memory, &memory, threads, process_chunk, merge_chunk);
 
     (dosage, gp)
 }
@@ -823,11 +825,18 @@ mod tests {
     #[test]
     fn budget_follows_previous_concurrency_and_input_size() {
         let budget = |n, sites| baseline_memory_budget(sites, 4796, n, 6, 16, 800_000_000, 61_600_000_000);
-        for (n, gib) in [(1, 4.3), (6, 11.8), (12, 13.4)] {
+        for n in [1, 6, 12] {
             let b = budget(n, 929_834);
-            assert!((b as f64) < gib * 1_073_741_824.0);
             assert!(budget(n, 400_000) < b);
+            // The allowance is an allocation estimate, not a measured RSS cap.
+            let memory = super::super::memory::MemoryBudget::new(b, 800_000_000);
+            let sites = 929_834 / 6;
+            let chunks: Vec<_> = (0..6).map(|_| memory.try_chunk(chunk_state_bytes(sites, 4796, n)).unwrap()).collect();
+            assert!(memory.work_limit() >= super::super::memory::fb_bytes(sites, 3000));
+            drop(chunks);
         }
+        let single_envelope = 6.0 * (929_834 / 6) as f64 * (600.0 * 1.9 + 5000.0);
+        assert_eq!(budget(1, 929_834), 800_000_000 + (single_envelope * 0.65) as usize);
         assert!(budget(1, 929_834) < budget(6, 929_834));
         assert!(chunk_state_bytes(200, 4796, 12) > chunk_state_bytes(100, 4796, 12));
     }
@@ -843,7 +852,7 @@ mod tests {
             params.n_main_iterations = 2;
             params.kpbwt = 17;
             let inputs: Vec<_> = (0..4).map(|c| {
-                let n = 17 + c * 7;
+                let n = if c == 0 { 521 } else { 17 + c * 7 };
                 let bm = rp::random_typed_panel(&mut rng, n, 40);
                 let cm: Vec<f64> = (0..n).map(|v| v as f64 * 0.05).collect();
                 let gl: Vec<f32> = (0..n * ns * 3).map(|_| (rng.below(1000) + 1) as f32 / 1000.0).collect();
@@ -860,7 +869,7 @@ mod tests {
             for parallel in [false, true] {
                 let mut memory = super::super::memory::MemoryBudget::new(64 * 1024 * 1024, 1024);
                 memory.set_parallel_fb(parallel);
-                for live in [1, 3] {
+                for live in [1, 16] {
                     let mut got = vec![None; inputs.len()];
                     super::super::memory::run_chunks(&costs, &memory, live,
                         |c| process(c, Some(&memory)), |c, out| got[c] = Some(out));
@@ -868,7 +877,8 @@ mod tests {
                         "samples={ns} live={live} parallel={parallel}");
                 }
                 if parallel && rayon::current_num_threads() > 1 {
-                    assert_eq!(memory.parallel_fb_grants(),
+                    assert!(memory.parallel_fb_grants() > 0);
+                    assert!(memory.parallel_fb_grants() <=
                         (params.n_iterations - params.n_main_iterations) * ns * inputs.len() * 2);
                 } else { assert_eq!(memory.parallel_fb_grants(), 0); }
             }
