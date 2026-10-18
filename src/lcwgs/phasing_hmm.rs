@@ -444,6 +444,13 @@ impl PhasingHmm {
         }
     }
 
+    /// Reuse metadata and O(K)/O(sites) scratch, but return the two large
+    /// O(K * (segments + flat hets)) snapshots before the worker becomes idle.
+    pub(crate) fn release_snapshots(&mut self) {
+        self.phasing_prob = Vec::new();
+        self.impute_prob = Vec::new();
+    }
+
     /// Shape of the last `rephase` call, for the `LCWGS_TIMING` report:
     /// `(phased sites, segments, flat hets, states)`.
     pub fn last_shape(&self) -> (usize, usize, usize, usize) {
@@ -1716,7 +1723,8 @@ impl PhasingHmm {
         }
         self.segments.push(nv);
         self.n_segs = self.segments.len();
-        self.dip_sampled = vec![-1; self.n_segs];
+        self.dip_sampled.clear();
+        self.dip_sampled.resize(self.n_segs, -1);
 
         // ---- REALLOCATE MEMORY ----
         let k = self.n_states;
@@ -2146,6 +2154,39 @@ fn rng_sample(probs: &[f32; HAP_NUMBER], sum: f32, rng_u01: &mut impl FnMut() ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reused_small_scratch_matches_fresh_phaser() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        let mut rng = rp::Xs(0xBB67_AE85_84CA_A73B);
+        let params = LsParams::default();
+        let mut reused = PhasingHmm::new(&params);
+        for (n, k) in [(71, 65), (3, 1), (130, 129), (1, 64), (89, 7), (0, 8), (33, 63)] {
+            let bm = rp::random_panel(&mut rng, n, 137, 50);
+            let cm: Vec<f64> = (0..n).map(|v| v as f64 * 0.019).collect();
+            let cond: Vec<u32> = (0..k as u32).collect();
+            let h0: Vec<bool> = (0..n).map(|_| rng.below(2) == 0).collect();
+            let h1: Vec<bool> = (0..n).map(|_| rng.below(2) == 0).collect();
+            let flat: Vec<bool> = (0..n).map(|_| rng.below(3) == 0).collect();
+            let lq = vec![false; n];
+            let poly: Vec<i32> = (0..n as i32).collect();
+            let mut fresh = PhasingHmm::new(&params);
+            let run = |hmm: &mut PhasingHmm| {
+                let (mut a, mut b) = (h0.clone(), h1.clone());
+                let mut draws = rp::Xs(4913);
+                let mut count = 0;
+                hmm.rephase(&mut a, &mut b, &flat, &cond, &bm, &cm, &params,
+                    &poly, &[], &lq, &mut || { count += 1; draws.below(1 << 24) as f32 / (1 << 24) as f32 }, None);
+                let bits = |xs: &[f32]| xs.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                (a, b, count, bits(&hmm.phasing_prob), bits(&hmm.impute_prob), bits(&hmm.impute_prob_of_1s))
+            };
+            assert_eq!(run(&mut reused), run(&mut fresh), "n={n} k={k}");
+            reused.release_snapshots();
+            assert_eq!(reused.phasing_prob.capacity(), 0);
+            assert_eq!(reused.impute_prob.capacity(), 0);
+        }
+    }
+
 
     #[test]
     fn complete_pack_rephase_matches_row_assembly() {
