@@ -376,7 +376,7 @@ struct GibbsConfig {
     /// 61-71). Selphi gates both to `is_main`, leaving the ~25-iter burn-in as pure
     /// parallel-Jacobi where the two haps can drain into the same allele (the verified
     /// 2026-06-06 het→hom soft-GL collapse). Running the joint step every iter mitigates
-    /// it: real adriano 1× +0.0045 (gain in common bins), at a small −0.0004 on the
+    /// it: an individual at 1× +0.0045 (gain in common bins), at a small −0.0004 on the
     /// canonical r12 multi-sample benchmark (a real-vs-simulated tradeoff). Dose/GP are
     /// still accumulated MAIN-only. Byte-identical when off.
     burnin_diploid: bool,
@@ -384,7 +384,7 @@ struct GibbsConfig {
     /// GLIMPSE2-model phasing HMM (crate::lcwgs::phasing_hmm) run EVERY iteration
     /// (GLIMPSE2 schedule). Validated clean win in every regime, NO tradeoff: canonical
     /// r12 (54s) OVERALL 0.9403→0.9511 beating GLIMPSE2 0.9429 on EVERY bin; full-chr22
-    /// 0.9119→0.9255 (vs GLIMPSE2 0.9155, every bin incl rare 0.5-1%); adriano real
+    /// 0.9119→0.9255 (vs GLIMPSE2 0.9155, every bin incl rare 0.5-1%); an individual
     /// 0.843→0.8675; sim-solo 0.9756→0.9775. Cost: phasing-every-iter is ~2× wall on
     /// multi-sample (single-sample is still 4× faster than GLIMPSE2). Opt out with
     /// `LCWGS_NO_FOUNDER_PHASE=1` → reverts to the (faster) heuristic DMM sweep.

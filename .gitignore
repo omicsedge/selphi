@@ -26,7 +26,10 @@ HG004*
 /docs/engineering/
 /paper/internal_notes/
 
-# Local run bundles and panel-distribution helpers (contain internal bucket names / large data)
+# Local benchmark inputs and individual-specific runners
+/paper/benchmarks/private/
+
+# Local run bundles and panel-distribution helpers (internal bucket names, large data)
 /examples/*.tar.gz
 /examples/manifest.tsv
 /examples/presign_panel.sh

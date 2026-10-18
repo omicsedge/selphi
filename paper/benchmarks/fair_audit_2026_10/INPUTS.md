@@ -40,20 +40,19 @@ missing input with `aws s3 cp` (or `aws s3 sync`) from the S3 column to the loca
 
 ## Consumer arrays (Tables 5, 5b, Figure 4b/c)
 
-| Input | Local | S3 | Check |
-|---|---|---|---|
-| v3 panel (75,552 haps) SRP + bref3 | `/data/projects/wgs_imputation_benchmark/panel/{srp/chrN_v3.srp,bref3/chrN.v3.bref3}` | `$S3/04_prodarray/panel/` | chr21 2,582,753 variants (alleles of 255 bp or more included, so the SRPs carry the long-allele signature and need this release to read); no monomorphic sites |
-| Chip cohort (6 people) | `/data/projects/wgs_imputation_benchmark/chip_vcf/cohort.chip.vcf.gz` (also `/data/tmp/prodarray2/`) | `$S3/04_prodarray/chip_vcf/` | |
-| Truth (strong and raw), renamed to the array IDs | `/data/tmp/prodarray2/truth/<p>.{strong,raw}.named.bcf` | `$S3/04_prodarray/truth_strong/`, `$S3/04_prodarray/truth/`, rename with `$S3/10_fair_audit_inputs/prodarray_truth_names/<p>.name` (`bcftools reheader -s`) | 162,741,172 SNP site-sample pairs scored |
-| Maps | `/data/tmp/prodarray2/maps/plink.chrN.GRCh38.map` | `$S3/10_fair_audit_inputs/prodarray_maps/` | |
-| Beagle 5.5, Selphi 1.5.3, Beagle-phased inputs | `/data/projects/wgs_imputation_benchmark/out/`, `work/phased153/` | `$S3/04_prodarray/` | |
+Use an array VCF and an independently generated high-coverage WGS truth VCF/BCF
+per individual, with matching anonymous sample IDs and genome build. See the
+[generic procedure](../README.md#consumer-array-procedure) for commands.
+The comparison uses the same reference panel and genetic maps for every tool.
+The 75,552-haplotype panel has 2,582,753 chr21 variants, including alleles of
+255 bp or more (requiring the SRP long-allele signature), and no monomorphic sites.
 
 ## GIAB array validation (Table 7, S3)
 
 | Input | Local | S3 | Check |
 |---|---|---|---|
 | Chip targets and truth, chr21/chr1 | `/data/tmp/pbwt_share_2026_09_06/giab_t7/chrN/{chipT_phased,truth}.vcf.gz` | `$S3/10_fair_audit_inputs/giab_array_targets/` | 69,806 / 409,391 scored sites |
-| Panel | v3 panel above | | |
+| Panel | 75,552-haplotype panel described above | | |
 
 ## Trios (Tables 6, 6b, 6c, S5)
 
