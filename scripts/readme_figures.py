@@ -39,8 +39,8 @@ def esc(s):
 # --------------------------------------------------------------------------
 # Speed chart (Table 5b, warm pass; RESULT CONSUMER WHOLE-GENOME WARM)
 # --------------------------------------------------------------------------
-SPEED = [("Selphi 2", 964.8), ("Beagle 5.5", 1731.0)]
-SPEED_MEM = ("6.9 GB", "56.6 GB")
+SPEED = [("Selphi 2", 510.5), ("Beagle 5.5", 1743.9)]
+SPEED_MEM = ("5.8 GB", "45.3 GB")
 
 
 def speed_svg(t):
