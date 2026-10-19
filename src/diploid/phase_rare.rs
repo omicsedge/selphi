@@ -91,6 +91,9 @@ pub fn run_phase_rare(
     _rare_mac_threshold: usize,
     _ne: f64,
     scaffold_from_common: &[usize], // variant indices phased by phase_common
+    // Phasing replicas (`diploid::replicas`): the samples are `replicas` copies of
+    // `n_samples / replicas` originals, replica-major; 1 = none.
+    replicas: usize,
 ) {
     let n_haps = n_samples * 2;
     let use_ref = full_chip_ref_bm.is_some();
@@ -220,6 +223,15 @@ pub fn run_phase_rare(
                         }
                     } else { break; }
                 }
+            }
+        }
+        // Copies of one sample (phasing replicas) never vote for each other. They are IBD2
+        // over the scaffold and the scan finds them so; this makes it unconditional (a copy
+        // whose imputed no-calls differ from another's could otherwise break the run).
+        if replicas > 1 {
+            let n_orig = n_ind / replicas;
+            for i in 0..n_ind {
+                for j in (i + n_orig..n_ind).step_by(n_orig.max(1)) { ibd2_global[i].push(j); }
             }
         }
         for pairs in &mut ibd2_global { pairs.sort_unstable(); pairs.dedup(); }

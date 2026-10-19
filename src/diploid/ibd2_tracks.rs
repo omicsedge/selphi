@@ -102,6 +102,26 @@ impl Ibd2Tracks {
         }
     }
 
+    /// Ban every pair of phasing replicas (`diploid::replicas`) from each other over the
+    /// whole scaffold `[0, n_var)`: copy `r` of original sample `s` is individual
+    /// `r * n_orig + s`. Copies carry identical genotypes, so the detection already
+    /// records exactly this track for each pair (a run over every site); the ban makes
+    /// that a guarantee rather than a consequence of the detection's thresholds, and is a
+    /// no-op on top of it.
+    pub fn ban_replicas(&mut self, n_orig: usize, k: usize, n_var: usize) {
+        if k < 2 || n_var == 0 { return; }
+        for s in 0..n_orig {
+            for r1 in 0..k {
+                let lo = r1 * n_orig + s;
+                if lo >= self.n_samples { continue; }
+                for r2 in r1 + 1..k {
+                    self.tracks[lo].push(Track { ind: r2 * n_orig + s, from: 0, to: n_var - 1 });
+                }
+            }
+        }
+        self.collapse();
+    }
+
     /// Number of IBD2 tracks.
     pub fn n_pairs(&self) -> usize {
         self.tracks.iter().map(|t| t.len()).sum()
@@ -402,6 +422,55 @@ mod tests {
             assert!(!only.tracks[1].is_empty(), "the planted target pair 1~2 is found");
             assert!(only.no_ibd2(0, 34, 150) && only.no_ibd2(2, 60, 10), "panel relatives stay usable");
             assert!(!only.no_ibd2(2, 4, 250), "target 1 ~ target 2 stays banned");
+        }
+    }
+
+    /// Identical copies of a sample (phasing replicas) are found IBD2 over every site by
+    /// both detection methods, so the explicit replica ban adds nothing to what was
+    /// detected; on a scaffold too short to detect anything the ban alone holds, and it
+    /// never bans a copy of one sample from another sample.
+    #[test]
+    fn replicas_are_detected_whole_and_the_ban_is_a_no_op() {
+        use crate::common::HaplotypeBitmatrix;
+        let (n_orig, k, n_ref, n_sites) = (3usize, 3usize, 40usize, 260usize);
+        let n_tgt_ind = n_orig * k;
+        let mut x = 0x51AF_D7ED_558C_CD1Du64;
+        let mut rnd = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        // originals' genotypes, then copy r of sample s = individual r * n_orig + s
+        let orig: Vec<Vec<(bool, bool)>> = (0..n_orig).map(|_| (0..n_sites).map(|_| (rnd() % 3 == 0, rnd() % 4 == 0)).collect()).collect();
+        let refs: Vec<Vec<bool>> = (0..2 * n_ref).map(|_| (0..n_sites).map(|_| rnd() % 3 == 0).collect()).collect();
+        let hap = |l: usize, h: usize| -> bool {
+            let ind = h / 2;
+            if ind < n_tgt_ind { let g = orig[ind % n_orig][l]; if h % 2 == 0 { g.0 } else { g.1 } }
+            else { refs[h - 2 * n_tgt_ind][l] }
+        };
+        let bm = HaplotypeBitmatrix::from_panel(n_sites, 2 * (n_tgt_ind + n_ref), &hap, &vec![true; n_sites]);
+        let cm: Vec<f64> = (0..n_sites).map(|l| l as f64 * 0.05).collect();
+        let bp: Vec<i64> = (0..n_sites).map(|l| l as i64 * 20_000).collect();
+        let key = |t: &Track| (t.ind, t.from, t.to);
+        let scan = 2 * n_tgt_ind;
+        for detected in [
+            Ibd2Tracks::detect(|l, h| bm.get(l, h), &cm, &bp, n_sites, scan, 2.5, 1e6, 100),
+            Ibd2Tracks::detect_targets(&bm, n_tgt_ind, &cm, &bp, n_sites, scan, 2.5, 1e6, 100),
+        ] {
+            assert_eq!(detected.n_pairs(), n_orig * k * (k - 1) / 2);
+            let before: Vec<Vec<_>> = detected.tracks.iter().map(|t| t.iter().map(key).collect()).collect();
+            let mut banned = detected;
+            banned.ban_replicas(n_orig, k, n_sites);
+            let after: Vec<Vec<_>> = banned.tracks.iter().map(|t| t.iter().map(key).collect()).collect();
+            assert_eq!(before, after, "the ban must add nothing to a detected copy");
+            for (lo, tr) in before.iter().enumerate() {
+                assert!(tr.iter().all(|&(ind, from, to)| ind % n_orig == lo % n_orig && from == 0 && to == n_sites - 1));
+            }
+        }
+        // two sites: nothing detected, the ban alone keeps the copies apart
+        let mut short = Ibd2Tracks::new(n_tgt_ind);
+        short.ban_replicas(n_orig, k, 2);
+        for a in 0..n_tgt_ind {
+            for b in 0..n_tgt_ind + n_ref {
+                let copies = b < n_tgt_ind && a % n_orig == b % n_orig;
+                for l in 0..2 { assert_eq!(short.no_ibd2(2 * a, 2 * b + 1, l), !copies, "{a} {b} {l}"); }
+            }
         }
     }
 

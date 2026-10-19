@@ -64,6 +64,9 @@ pub struct MultiChrImputeConfig {
     pub chrx_par: bool,
     /// `--phase-ensemble N`: see `resolve_ensemble_n`. 1 = off.
     pub phase_ensemble: usize,
+    /// Phasing replicas (`SELPHI_DIPLOID_REPLICAS`, `diploid::replicas`): automatic or
+    /// explicit; decided per chromosome (whether it is phased, and how) by `replica_plan`.
+    pub replicas: selphi::diploid::replicas::Setting,
     /// `--drop-unmatched`: leave out target records absent from the panel.
     pub drop_unmatched: bool,
     /// `--ped`: pedigree pre-phasing + het locking.
@@ -85,6 +88,14 @@ impl MultiChrImputeConfig {
     /// construction sites collapse to one call each (no field-drift risk).
     pub fn from_args(args: &crate::cli::Args, map_dir: Option<String>) -> Self {
         warn_unsupported(args);
+        // Phasing replicas: decided per chromosome (`replica_plan`); an explicit request
+        // the whole run refuses (--sample-batch-size; this path has no --phase-only and no
+        // independent chains) is said once, here.
+        let replicas = selphi::diploid::replicas::Setting::from_env();
+        let refused = selphi::diploid::replicas::Plan::new(replicas, selphi::diploid::replicas::Run {
+            n_samples: 1, phasing: true, chain_only: true, batched: args.sample_batch_size > 0, ..Default::default()
+        }, 1);
+        if let Some(note) = refused.note() { selphi_info!("  Note: {}", note); }
         Self {
             threads: args.threads,
             seed: args.seed,
@@ -116,6 +127,7 @@ impl MultiChrImputeConfig {
             allele_match: args.allele_match,
             chrx_par: !args.chrx_no_par,
             phase_ensemble: args.phase_ensemble,
+            replicas,
             drop_unmatched: args.drop_unmatched,
             ped: args.ped.clone(),
             haploids: args.haploids.clone(),
@@ -377,6 +389,8 @@ fn phase_chr(
     n_ref: usize,
     n_members: usize,
     ped_locked: Option<&[bool]>,
+    // Phasing replicas (`diploid::replicas`): copies per sample, 1 = off.
+    replicas: usize,
     config: &MultiChrImputeConfig,
 ) -> (Vec<u8>, Vec<Vec<u8>>, Option<selphi::common::HaplotypeBitmatrix>, bool) {
     if !needs_phasing {
@@ -428,16 +442,20 @@ e.g. a male chrX): phasing on all {} called sites", scaffold.indices.len());
     // Intra-run phase ensemble: `n_members` thinned Main-MCMC samples
     // out of ONE chain (1x phasing cost). Member 0 is the Viterbi
     // solve; the rest are folded into the per-window weights before
-    // interpolation by imputation::ensemble.
+    // interpolation by imputation::ensemble. With phasing replicas every
+    // copy contributes its `n_members` (copy 0's solve first).
     let mut scaffolds = selphi::diploid::diploid_phase_bm_prefiltered(
         &targ_alleles, common_ref_bm, &common_chip_indices, Some(&ref_bm),
         raw_chip_cm, chip_bps, &ref_bp, &map_bp_raw, &map_cm_raw,
         n_chip, n_samples, n_ref,
         config.seed, config.threads, config.max_cond_haps, n_members,
-        ped_locked,
+        ped_locked, replicas,
     );
     let member0 = scaffolds.remove(0);
-    if scaffolds.len() + 1 > 1 {
+    if replicas > 1 {
+        selphi_info!("    Phase ensemble: {} members ({} co-phased replicas x {} from each chain)",
+            scaffolds.len() + 1, replicas, n_members);
+    } else if scaffolds.len() + 1 > 1 {
         selphi_info!("    Phase ensemble: {} members from one phasing chain",
             scaffolds.len() + 1);
     }
@@ -686,6 +704,8 @@ pub fn run_multi_chr(
     let mut dr2_acc = selphi::io::dosage_stats::Dr2Summary::default();
     let mut n_out_variants_total: u64 = 0;
 
+    // The replicas' "on" line is said once, for the first chromosome that uses them.
+    let mut replicas_said = false;
     for (chr_idx, chr_name) in chromosomes.iter().enumerate() {
         let chr_start = Instant::now();
         selphi_info!("  [{}/{}] chr{}", chr_idx + 1, n_chr, chr_name);
@@ -798,10 +818,23 @@ pub fn run_multi_chr(
         // chain may need one member fewer than the run imputes (--trust-input-phase).
         let ensemble_n = if needs_phasing { resolve_ensemble_n(config, n_samples) } else { 1 };
         let n_chain = config.input_phase.chain_members(ensemble_n, given_used);
+        // Phasing replicas, as the single-chr path decides them: by default for a run of
+        // few samples whose chromosome is phased with no given phase in its ensemble.
+        let replica_plan = selphi::diploid::replicas::Plan::new(config.replicas, selphi::diploid::replicas::Run {
+            n_samples, phasing: needs_phasing, chain_only: needs_phasing && !given_used,
+            batched: config.target_batch_size > 0, ..Default::default()
+        }, selphi::diploid::replicas::max_samples());
+        if !replicas_said && let Some(line) = replica_plan.on_line(n_samples) {
+            selphi_step!("{}", line);
+            replicas_said = true;
+        }
+        // The members the chromosome ends up with: the chain's, K times over with replicas,
+        // plus a given phase's own slot (--trust-input-phase, InputPhase::chain_members).
+        let n_members_run = replica_plan.k * n_chain + (ensemble_n - n_chain);
         let (targ_alleles, extra_phased, ref_bm_from_phasing, phased) = phase_chr(
             needs_phasing, &multi_map, chr_name, &srp, &wgs_idx, &raw_chip_cm,
             &chip_bps, targ_alleles, n_chip, n_samples, n_ref, n_chain,
-            ped_locked.as_deref(), config,
+            ped_locked.as_deref(), replica_plan.k, config,
         );
         let (targ_alleles, extra_phased) = if given_used && phased {
             let given = selphi::imputation::input_phase::given_alleles(
@@ -810,7 +843,7 @@ pub fn run_multi_chr(
             chain.push(targ_alleles);
             chain.extend(extra_phased);
             let (members, choice) = selphi::imputation::input_phase::apply(
-                chain, given, config.input_phase, ensemble_n, n_chip, n_haps);
+                chain, given, config.input_phase, n_members_run, n_chip, n_haps);
             selphi_info!("    {}", choice.summary(config.input_phase));
             for (s, d) in choice.disagreement.iter().enumerate() {
                 selphi_debug!("      input phase {}: {} of {} het pairs disagree -> {}", sample_names[s], d.switches, d.pairs,
@@ -903,16 +936,16 @@ pub fn run_multi_chr(
         // scaffold, candidate set and cross-window prior state; their per-window
         // Li-Stephens weights are folded into member 0's before interpolation, so
         // the panel is still read and interpolated exactly once.
+        // Phasing replicas' members are stacked into one member (one window HMM call for all).
         let mut ensemble_members: Vec<selphi::imputation::ensemble::Member> =
-            extra_phased.into_iter().map(|pa| {
-                let cand = precompute_candidates_for(
-                    precompute_on, &ref_bm_imp, &pa, &chip_cm, n_chip, n_ref, n_haps, effective_mc,
-                );
-                let tb = selphi::common::HaplotypeBitmatrix::from_byte_slice_all(
-                    n_chip, n_haps, &pa, n_haps);
-                selphi::imputation::ensemble::Member::new(
-                    tb, cand, final_ne_per_site.clone(), n_haps)
-            }).collect();
+            selphi::imputation::ensemble::build_members(
+                extra_phased, replica_plan.k > 1, n_chip, n_haps, n_samples,
+                nocall.as_ref().map(|(_, ps)| ps.as_slice()),
+                || final_ne_per_site.clone(),
+                |pa| precompute_candidates_for(
+                    precompute_on, &ref_bm_imp, pa, &chip_cm, n_chip, n_ref, n_haps, effective_mc,
+                ),
+            );
 
         // Spawn prefetch for NEXT chromosome (background I/O thread)
         let prefetch_handle: Option<std::thread::JoinHandle<Option<ChrPrefetchResult>>> =

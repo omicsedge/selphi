@@ -21,6 +21,7 @@ pub mod phase_common;
 pub mod pedigree;
 pub mod phase_rare;
 pub mod scaffold;
+pub mod replicas;
 
 /// De-novo PANEL phasing: phase an unphased cohort using the cohort itself
 /// as the conditioning set (no external reference panel, n_ref = 0). Each
@@ -100,7 +101,7 @@ pub fn diploid_phase_panel(
         cohort_geno, empty_ref, &common_indices, None,
         CommonPrep { target_geno_common, cm_common, cm_full, bp_common },
         bp, n_var, n_samples, /* n_ref = */ 0, seed, n_threads, max_cond_haps, 1,
-        None,
+        None, 1,
     );
     scaffolds.remove(0)
 }
@@ -123,6 +124,44 @@ pub fn diploid_phase_bm_prefiltered(
     // VAR_SCA (pre-phased) in the genotype graph, so the segment HMM carries
     // them as one orientation per segment instead of re-sampling each one.
     ped_locked: Option<&[bool]>,
+    // Phasing replicas (`replicas`, `SELPHI_DIPLOID_REPLICAS`): every sample is phased
+    // as `replicas` copies in one cohort, banned from conditioning on each other, and
+    // the result is `replicas * n_members` scaffolds of the ORIGINAL samples — copy 0's
+    // members first (slot 0 = copy 0's Viterbi solve), then copy 1's, and so on.
+    // 1 = off: the phasing below is the unreplicated one, byte-identical.
+    replicas: usize,
+) -> Vec<Vec<u8>> {
+    let k = replicas.max(1);
+    if k > 1 {
+        // The copies' genotypes and lock mask (replica-major: copy r of sample s is
+        // sample r * n_samples + s), phased as one cohort of n_samples * k.
+        let rep_geno = replicas::replicate_rows(&target_geno[..n_var * n_samples * 2], n_var, n_samples * 2, k);
+        let rep_lock = ped_locked.map(|l| replicas::replicate_rows(&l[..n_var * n_samples], n_var, n_samples, k));
+        let scaffolds = diploid_phase_core(
+            &rep_geno, common_ref_bm, common_chip_indices, full_chip_ref_bm,
+            chip_bp, map_bp, map_cm, n_var, n_samples * k, n_ref, seed, n_threads,
+            max_cond_haps, n_members, rep_lock.as_deref(), k,
+        );
+        return replicas::split_members(scaffolds, n_var, n_samples * 2, k);
+    }
+    diploid_phase_core(
+        target_geno, common_ref_bm, common_chip_indices, full_chip_ref_bm,
+        chip_bp, map_bp, map_cm, n_var, n_samples, n_ref, seed, n_threads,
+        max_cond_haps, n_members, ped_locked, 1,
+    )
+}
+
+/// `diploid_phase_bm_prefiltered` on a cohort of `n_samples` that may be `replicas`
+/// copies of `n_samples / replicas` originals (replica-major).
+#[allow(clippy::too_many_arguments)]
+fn diploid_phase_core(
+    target_geno: &[u8],
+    common_ref_bm: pbwt_neighbor::HaplotypeBitmatrix,
+    common_chip_indices: &[usize],
+    full_chip_ref_bm: Option<&pbwt_neighbor::HaplotypeBitmatrix>,
+    chip_bp: &[i64], map_bp: &[i64], map_cm: &[f64],
+    n_var: usize, n_samples: usize, n_ref: usize, seed: i64, n_threads: usize,
+    max_cond_haps: usize, n_members: usize, ped_locked: Option<&[bool]>, replicas: usize,
 ) -> Vec<Vec<u8>> {
     let seed = if seed == 33 { 15052011 } else { seed };
     let n_haps = n_samples * 2;
@@ -179,7 +218,7 @@ pub fn diploid_phase_bm_prefiltered(
         target_geno, common_ref_bm, common_chip_indices, full_chip_ref_bm,
         CommonPrep { target_geno_common, cm_common, cm_full: chip_cm_full, bp_common },
         chip_bp, n_var, n_samples, n_ref, seed, n_threads, max_cond_haps, n_members,
-        locked_common.as_deref(),
+        locked_common.as_deref(), replicas,
     )
 }
 
@@ -207,6 +246,9 @@ fn _diploid_run(
     // (n_common × n_samples) `--ped` lock mask, already restricted to the
     // common-variant subset. None on every path without a pedigree.
     locked_common: Option<&[bool]>,
+    // The samples are `replicas` copies of `n_samples / replicas` originals
+    // (replica-major), banned from conditioning on each other. 1 = no replicas.
+    replicas: usize,
 ) -> Vec<Vec<u8>> {
     use rayon::prelude::*;
     let seed = if seed == 33 { 15052011 } else { seed };
@@ -289,7 +331,7 @@ fn _diploid_run(
         &target_geno_common,
         max_cond_haps,
         if n_members > 1 { Some(&mut main_capture) } else { None },
-        locked_common,
+        locked_common, replicas,
     );
     let t_scaffolds = std::time::Instant::now();
     crate::selphi_debug!("  [diploid] through phase_common: {:.0}ms rss={:.0}MB hwm={:.0}MB", t_run.elapsed().as_secs_f64() * 1e3, crate::log::rss_mb(), crate::log::peak_mem_mb());
@@ -337,7 +379,7 @@ fn _diploid_run(
         }
         phase_rare::run_phase_rare(
             &mut phased, full_chip_ref_bm, target_geno, &cm_full, chip_bp,
-            n_var, n_samples, n_ref, 1, 15000.0, common_indices,
+            n_var, n_samples, n_ref, 1, 15000.0, common_indices, replicas,
         );
         phased
     };
@@ -706,6 +748,71 @@ mod tests {
             if v % 7 == 0 { assert_eq!((phased[v * n_targ], phased[v * n_targ + 1]), (1, 0), "kept, var {v}"); }
             if v % 5 == 0 {
                 assert!(phased[v * n_targ + 2] <= 1 && phased[v * n_targ + 2] == phased[v * n_targ + 3], "haploid, var {v}");
+            }
+        }
+    }
+
+    /// Phasing replicas through `diploid_phase_bm_prefiltered(.., replicas = k)` are exactly
+    /// the phasing of the cohort with every sample column repeated k times (what the
+    /// measured emulation ran), regrouped per copy; every member keeps the input genotype at
+    /// each called site, and the copies do not all come out the same.
+    #[test]
+    fn replicas_equal_the_repeated_column_cohort() {
+        // (seed, samples, panel, copies, no-call rate, sample 1 haploid: homozygous calls
+        // with its no-calls as the haploid sentinel, as a chrX male enters phasing)
+        for &(seed, n_samples, n_ref, k, nocall, haploid) in &[
+            (3u64, 1usize, 220usize, 3usize, 0.0f64, false), (4, 2, 160, 2, 0.02, false),
+            (5, 1, 120, 3, 0.03, false), (6, 3, 150, 3, 0.03, true),
+        ] {
+            let mut rng = TestRng::new(seed);
+            let (n_var, n_tgt) = (500usize, 2 * n_samples);
+            let panel = mosaic_panel(&mut rng, n_var, n_tgt + n_ref);
+            let mut target_geno = vec![0u8; n_var * n_tgt];
+            for v in 0..n_var {
+                for si in 0..n_samples {
+                    let (mut g0, mut g1) = (panel[(2 * si) * n_var + v], panel[(2 * si + 1) * n_var + v]);
+                    // private mutations: hets the panel does not resolve, so the copies' chains can differ
+                    if rng.chance(0.06) { g0 ^= 1; }
+                    if rng.chance(0.5) { std::mem::swap(&mut g0, &mut g1); }
+                    if haploid && si == 1 { g1 = g0; }
+                    if rng.chance(nocall) {
+                        let m = if haploid && si == 1 { genotype_graph::HAPLOID_MISSING } else { 128 };
+                        g0 = m; g1 = m;
+                    }
+                    target_geno[v * n_tgt + 2 * si] = g0;
+                    target_geno[v * n_tgt + 2 * si + 1] = g1;
+                }
+            }
+            let ref_panel: Vec<u8> = (0..n_ref).flat_map(|r| panel[(n_tgt + r) * n_var..(n_tgt + r + 1) * n_var].to_vec()).collect();
+            let full = panel_bm(&ref_panel, n_var, n_ref);
+            let bp: Vec<i64> = (0..n_var).map(|i| 1_000_000 + i as i64 * 3_000).collect();
+            let (map_bp, map_cm) = (vec![bp[0], bp[n_var - 1]], vec![0.0, (n_var - 1) as f64 * 0.05]);
+            let common = scaffold::select(&target_geno, n_var, n_samples, Some(&full), scaffold::Source::Union, 0.001, None).indices;
+            let phase = |geno: &[u8], n: usize, reps: usize| diploid_phase_bm_prefiltered(
+                geno, pbwt_neighbor::HaplotypeBitmatrix::from_subset(&full, &common), &common, Some(&full),
+                &[], &bp, &[], &map_bp, &map_cm, n_var, n, n_ref, 11 + seed as i64, 4, 0, 2, None, reps);
+            let got = phase(&target_geno, n_samples, k);
+            let repeated = replicas::replicate_rows(&target_geno, n_var, n_tgt, k);
+            let want = replicas::split_members(phase(&repeated, n_samples * k, 1), n_var, n_tgt, k);
+            let tag = format!("seed {seed}, samples {n_samples}, k {k}, haploid {haploid}");
+            assert_eq!(got.len(), 2 * k, "{tag}");
+            assert_eq!(got, want, "{tag}: replicas differ from the repeated-column cohort");
+            for (m, sc) in got.iter().enumerate() {
+                for v in 0..n_var {
+                    for si in 0..n_samples {
+                        let (g0, g1) = (target_geno[v * n_tgt + 2 * si], target_geno[v * n_tgt + 2 * si + 1]);
+                        if g0 > 1 { continue; }
+                        let (a0, a1) = (sc[v * n_tgt + 2 * si], sc[v * n_tgt + 2 * si + 1]);
+                        assert_eq!(a0 + a1, g0 + g1, "{tag}: member {m} changed a called genotype at {v}");
+                    }
+                }
+            }
+            assert!(got.iter().skip(1).any(|sc| *sc != got[0]), "{tag}: every member is copy 0's solve");
+            if haploid {
+                // the haploid sample stays homozygous in every member, its no-calls included
+                for (m, sc) in got.iter().enumerate() {
+                    assert!((0..n_var).all(|v| sc[v * n_tgt + 2] == sc[v * n_tgt + 3]), "{tag}: member {m} made the haploid sample heterozygous");
+                }
             }
         }
     }

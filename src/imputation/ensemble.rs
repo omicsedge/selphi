@@ -90,6 +90,14 @@ pub const ENSEMBLE_COSTLY_ABOVE: usize = 1000;
 
 /// One extra ensemble member's imputation inputs, all derived from a single
 /// phased scaffold. Member 0 uses the run's primary locals; extras live here.
+///
+/// A member can also hold several phased scaffolds of the cohort side by side
+/// (`n_blocks`, see [`Member::stacked`]): its window HMM then runs once over all of
+/// them, and block `b`'s sample `s` (sample `b * n_samples + s` of `targ_bm`) is folded
+/// into original sample `s`, exactly as if each block were a member of its own. That is
+/// how the phasing replicas' members are imputed: one window call for all of them
+/// instead of one per member, whose fixed per-call cost (coding the whole panel's steps
+/// over the window) dominated a one-user run.
 pub struct Member {
     /// Phased target as a haplotype bitmatrix (the imputation HMM scaffold).
     pub targ_bm: HaplotypeBitmatrix,
@@ -99,6 +107,11 @@ pub struct Member {
     pub final_ne_per_site: Option<Vec<f64>>,
     /// Cross-window HMM state (forward prior, emission floor), private to this member.
     pub carry: Vec<super::window_process::HapCarry>,
+    /// Cohort scaffolds held side by side (1 = an ordinary member).
+    pub n_blocks: usize,
+    /// The run's (chip site × sample) input confidence repeated for every block, when the
+    /// run has one and `n_blocks > 1` (an ordinary member reads the run's own).
+    pub site_conf_per_sample: Option<Vec<f64>>,
 }
 
 impl Member {
@@ -109,8 +122,59 @@ impl Member {
         final_ne_per_site: Option<Vec<f64>>,
         n_haps: usize,
     ) -> Self {
-        Self { targ_bm, candidates, final_ne_per_site, carry: vec![Default::default(); n_haps] }
+        Self { targ_bm, candidates, final_ne_per_site, carry: vec![Default::default(); n_haps],
+               n_blocks: 1, site_conf_per_sample: None }
     }
+
+    /// One member holding every scaffold of `scaffolds` (each n_chip × n_haps, row-major,
+    /// the cohort's haplotypes) side by side. `candidates` are the blocks' per-haplotype
+    /// candidates concatenated in block order; `site_conf_per_sample` is the run's
+    /// (n_chip × n_samples) confidence, repeated here for every block.
+    pub fn stacked(
+        scaffolds: &[Vec<u8>], n_chip: usize, n_haps: usize, n_samples: usize,
+        candidates: Option<Vec<Vec<u32>>>,
+        final_ne_per_site: Option<Vec<f64>>,
+        site_conf_per_sample: Option<&[f64]>,
+    ) -> Self {
+        let b = scaffolds.len().max(1);
+        let width = b * n_haps;
+        let mut stacked = Vec::with_capacity(n_chip * width);
+        for v in 0..n_chip {
+            for sc in scaffolds { stacked.extend_from_slice(&sc[v * n_haps..(v + 1) * n_haps]); }
+        }
+        let targ_bm = HaplotypeBitmatrix::from_byte_slice_all(n_chip, width, &stacked, width);
+        let conf = site_conf_per_sample.map(|c|
+            crate::diploid::replicas::replicate_rows(&c[..n_chip * n_samples], n_chip, n_samples, b));
+        Self { targ_bm, candidates, final_ne_per_site, carry: vec![Default::default(); width],
+               n_blocks: b, site_conf_per_sample: conf }
+    }
+}
+
+/// The extra members' imputation inputs from their phased scaffolds (each n_chip × n_haps):
+/// one ordinary member per scaffold, or, with `stack`, a single [`Member::stacked`] holding
+/// all of them (the phasing-replica path). `final_ne` gives each member's per-site Ne and
+/// `candidates` a scaffold's precomputed candidates; both pipelines build their members here.
+#[allow(clippy::too_many_arguments)]
+pub fn build_members(
+    scaffolds: Vec<Vec<u8>>, stack: bool,
+    n_chip: usize, n_haps: usize, n_samples: usize,
+    site_conf_per_sample: Option<&[f64]>,
+    final_ne: impl Fn() -> Option<Vec<f64>>,
+    candidates: impl Fn(&[u8]) -> Option<Vec<Vec<u32>>>,
+) -> Vec<Member> {
+    if !stack || scaffolds.len() < 2 {
+        return scaffolds.into_iter().map(|pa| {
+            let cand = candidates(&pa);
+            let tb = HaplotypeBitmatrix::from_byte_slice_all(n_chip, n_haps, &pa, n_haps);
+            Member::new(tb, cand, final_ne(), n_haps)
+        }).collect();
+    }
+    // Candidates are per target haplotype, so the stack's are the blocks' in block order.
+    let per_block: Vec<Option<Vec<Vec<u32>>>> = scaffolds.iter().map(|pa| candidates(pa)).collect();
+    let cand = if per_block.iter().all(|c| c.is_some()) {
+        Some(per_block.into_iter().flatten().flatten().collect())
+    } else { None };
+    vec![Member::stacked(&scaffolds, n_chip, n_haps, n_samples, cand, final_ne(), site_conf_per_sample)]
 }
 
 /// Sum CSR `b` into `a` (column union, per-row f32 add in member order), WITHOUT
@@ -222,10 +286,14 @@ pub struct FoldContext<'a> {
 /// A row `nocall(r)` is never an anchor: the sample did not call it, the genotype there is
 /// whatever each member's phasing filled in, and a target that skips its no-calls has
 /// weights on that row that are only a blend of its called rows either side.
-fn swap_rows(m0: &HaplotypeBitmatrix, mk: &HaplotypeBitmatrix, s: usize, chip_start: usize,
+/// `sk` is the sample's index in `mk` (`s` for an ordinary member; block `b`'s copy of
+/// it, `b * n_samples + s`, in a stacked one).
+#[allow(clippy::too_many_arguments)]
+fn swap_rows(m0: &HaplotypeBitmatrix, s: usize, mk: &HaplotypeBitmatrix, sk: usize, chip_start: usize,
              n_rows: usize, nocall: &dyn Fn(usize) -> bool,
              marks: &mut Vec<(u32, bool)>, swap: &mut Vec<bool>) -> bool {
     let (w, b0, b1) = ((2 * s) / 64, (2 * s) % 64, (2 * s + 1) % 64);
+    let (wk, k0, k1) = ((2 * sk) / 64, (2 * sk) % 64, (2 * sk + 1) % 64);
     marks.clear();
     for r in 0..n_rows {
         if nocall(r) { continue; }
@@ -233,8 +301,8 @@ fn swap_rows(m0: &HaplotypeBitmatrix, mk: &HaplotypeBitmatrix, s: usize, chip_st
         let x = m0.row(chip_start + r)[w];
         let (a0, a1) = ((x >> b0) & 1, (x >> b1) & 1);
         if a0 == a1 { continue; }
-        let y = mk.row(chip_start + r)[w];
-        let (c0, c1) = ((y >> b0) & 1, (y >> b1) & 1);
+        let y = mk.row(chip_start + r)[wk];
+        let (c0, c1) = ((y >> k0) & 1, (y >> k1) & 1);
         if c0 != c1 { marks.push((r as u32, a0 != c0)); }
     }
     swap.clear();
@@ -300,25 +368,34 @@ pub fn fold_window(
     params: &WindowHmmParams,
 ) {
     if members.is_empty() { return; }
+    let n_haps = params.n_haps;
     let mut params_m = params.clone();
     params_m.target_batch_size = STREAM_CHUNK;
     let mut fold = PairFold::new(ctx);
+    let mut count = 1usize;
     for sc in members.iter_mut() {
-        let inputs_m = member_inputs(&sc.targ_bm, sc.final_ne_per_site.as_deref(), ctx);
-        let cand = sc.candidates.as_ref();
-        let targ_k = &sc.targ_bm;
+        let Member { targ_bm, candidates, final_ne_per_site, carry, n_blocks, site_conf_per_sample } = sc;
+        let inputs_m = member_inputs(targ_bm, final_ne_per_site.as_deref(),
+            site_conf_per_sample.as_deref(), *n_blocks, ctx);
+        params_m.n_haps = n_haps * *n_blocks;
+        let cand = candidates.as_ref();
+        let targ_k: &HaplotypeBitmatrix = targ_bm;
         let mut accumulate = |bstart: usize, bend: usize, refs: &[&CsrWeights]|
          -> std::io::Result<()> {
             // Batches hold whole samples: the batch size is even and starts on a sample.
+            // Haplotype `hk` of a stacked member is block `hk / n_haps`'s copy of `hk % n_haps`;
+            // batches arrive in order, so each haplotype's blocks are added in block order.
             debug_assert!(bstart % 2 == 0 && (bend - bstart) % 2 == 0);
             for j in (0..bend - bstart).step_by(2) {
-                fold.add(all_weights, bstart + j, refs[j], refs[j + 1], targ_k);
+                let hk = bstart + j;
+                fold.add(all_weights, hk % n_haps, hk / 2, refs[j], refs[j + 1], targ_k);
             }
             Ok(())
         };
-        let _ = impute_window(&inputs_m, &params_m, cand, &mut sc.carry, Some(&mut accumulate));
+        let _ = impute_window(&inputs_m, &params_m, cand, carry, Some(&mut accumulate));
+        count += *n_blocks;
     }
-    divide(all_weights, members.len() + 1);
+    divide(all_weights, count);
 }
 
 /// Member 0's window HMM, then every extra member's folded into it in member order (the
@@ -338,8 +415,10 @@ pub fn impute_with_members(
     out
 }
 
-/// An extra member's window inputs: its own scaffold and Ne, everything else member 0's.
-fn member_inputs<'a>(targ_bm: &'a HaplotypeBitmatrix, ne: Option<&'a [f64]>, ctx: &FoldContext<'a>)
+/// An extra member's window inputs: its own scaffold and Ne, everything else member 0's
+/// (a stacked member's confidence is the run's repeated per block, `n_blocks` cohorts wide).
+fn member_inputs<'a>(targ_bm: &'a HaplotypeBitmatrix, ne: Option<&'a [f64]>,
+                     stacked_conf: Option<&'a [f64]>, n_blocks: usize, ctx: &FoldContext<'a>)
     -> ImputeWindowInputs<'a>
 {
     ImputeWindowInputs {
@@ -347,8 +426,8 @@ fn member_inputs<'a>(targ_bm: &'a HaplotypeBitmatrix, ne: Option<&'a [f64]>, ctx
         targ_alleles: targ_bm,
         chip_cm: ctx.chip_cm,
         ne_per_site: ne,
-        site_conf_per_sample: ctx.site_conf_per_sample,
-        n_samples: ctx.n_samples,
+        site_conf_per_sample: if n_blocks > 1 { stacked_conf } else { ctx.site_conf_per_sample },
+        n_samples: ctx.n_samples * n_blocks,
         chip_start: ctx.chip_start,
         chip_end: ctx.chip_end,
         interp_x: ctx.interp_x,
@@ -390,15 +469,16 @@ impl<'c> PairFold<'c> {
         }
     }
 
-    /// Haplotypes `h` (even) and `h + 1` of the member whose scaffold is `targ_k`.
-    fn add(&mut self, all_weights: &mut [Vec<(usize, CsrWeights)>], h: usize,
+    /// Haplotypes `h` (even) and `h + 1` of member 0, from sample `sk` of the member whose
+    /// scaffold is `targ_k` (`sk = h / 2` unless the member is stacked).
+    fn add(&mut self, all_weights: &mut [Vec<(usize, CsrWeights)>], h: usize, sk: usize,
            own0: &CsrWeights, own1: &CsrWeights, targ_k: &HaplotypeBitmatrix) {
         let ctx = self.ctx;
         let s = h / 2;
         let skip_nocalls = self.skip_nocalls;
         let nocall = |r: usize| skip_nocalls && ctx.site_conf_per_sample
             .is_some_and(|c| c[(ctx.chip_start + r) * ctx.n_samples + s] == 0.0);
-        if swap_rows(ctx.targ_bm0, targ_k, s, ctx.chip_start, own0.n_rows, &nocall, &mut self.marks, &mut self.swap) {
+        if swap_rows(ctx.targ_bm0, s, targ_k, sk, ctx.chip_start, own0.n_rows, &nocall, &mut self.marks, &mut self.swap) {
             let sw = &self.swap;
             let mixed = if self.blend_align {
                 mixed_rows(own0, own1, sw, &nocall, self.x_full, ctx.chip_start)
@@ -438,11 +518,60 @@ mod tests {
                      data: vec![v; n], n_rows: n, n_cols: n }
     }
 
+    /// A stacked member holds each scaffold as a block of columns (block b's haplotype h at
+    /// column b * n_haps + h), the run's confidence repeated per block and the blocks'
+    /// candidates in block order; without stacking every scaffold is its own member.
+    #[test]
+    fn stacked_member_lays_blocks_side_by_side() {
+        let (n_chip, n_haps, n_samples) = (3usize, 4usize, 2usize);
+        // scaffold b: allele of (site v, hap h) = (v + h + b) % 2
+        let sc: Vec<Vec<u8>> = (0..3).map(|b| (0..n_chip * n_haps).map(|i| ((i / n_haps + i % n_haps + b) % 2) as u8).collect()).collect();
+        let conf: Vec<f64> = (0..n_chip * n_samples).map(|i| i as f64).collect();
+        let cand = |pa: &[u8]| Some(vec![vec![pa[0] as u32]; n_haps]);
+        let one = build_members(sc.clone(), false, n_chip, n_haps, n_samples, Some(&conf), || None, cand);
+        assert_eq!(one.len(), 3);
+        assert!(one.iter().all(|m| m.n_blocks == 1 && m.site_conf_per_sample.is_none() && m.carry.len() == n_haps));
+        let st = build_members(sc.clone(), true, n_chip, n_haps, n_samples, Some(&conf), || None, cand);
+        assert_eq!(st.len(), 1);
+        let m = &st[0];
+        assert_eq!((m.n_blocks, m.carry.len(), m.targ_bm.n_haps), (3, 3 * n_haps, 3 * n_haps));
+        for b in 0..3 {
+            for v in 0..n_chip {
+                for h in 0..n_haps {
+                    assert_eq!(m.targ_bm.get(v, b * n_haps + h) as u8, sc[b][v * n_haps + h], "block {b} site {v} hap {h}");
+                }
+            }
+        }
+        let c = m.site_conf_per_sample.as_ref().unwrap();
+        for v in 0..n_chip {
+            for b in 0..3 { assert_eq!(&c[(v * 3 + b) * n_samples..(v * 3 + b + 1) * n_samples], &conf[v * n_samples..(v + 1) * n_samples]); }
+        }
+        let cs = m.candidates.as_ref().unwrap();
+        assert_eq!(cs.len(), 3 * n_haps);
+        for b in 0..3 { assert!(cs[b * n_haps..(b + 1) * n_haps].iter().all(|x| x == &vec![sc[b][0] as u32])); }
+        // one scaffold is never stacked
+        assert_eq!(build_members(vec![sc[0].clone()], true, n_chip, n_haps, n_samples, None, || None, |_| None)[0].n_blocks, 1);
+    }
+
+    /// The orientation of a stacked member's block is read at its own sample.
+    #[test]
+    fn a_stacked_block_is_aligned_by_its_own_sample() {
+        let m0 = one_sample(&[(0, 1), (1, 0)]);
+        // two samples' worth of haplotypes: sample 0 = same order, sample 1 = swapped
+        let gts = [(0u8, 1u8, 1u8, 0u8), (1, 0, 0, 1)];
+        let mk = HaplotypeBitmatrix::from_panel(2, 4, &|v: usize, h: usize| {
+            let g = gts[v]; [g.0, g.1, g.2, g.3][h] == 1 }, &[true, true]);
+        let (mut marks, mut swap) = (Vec::new(), Vec::new());
+        assert!(!swap_rows(&m0, 0, &mk, 0, 0, 2, &|_| false, &mut marks, &mut swap));
+        assert!(swap_rows(&m0, 0, &mk, 1, 0, 2, &|_| false, &mut marks, &mut swap));
+        assert_eq!(swap, vec![true, true]);
+    }
+
     #[test]
     fn same_order_is_not_swapped() {
         let m0 = one_sample(&[(0, 1), (1, 1), (1, 0), (0, 0)]);
         let (mut marks, mut swap) = (Vec::new(), Vec::new());
-        assert!(!swap_rows(&m0, &m0, 0, 0, 4, &|_| false, &mut marks, &mut swap));
+        assert!(!swap_rows(&m0, 0, &m0, 0, 0, 4, &|_| false, &mut marks, &mut swap));
     }
 
     #[test]
@@ -450,7 +579,7 @@ mod tests {
         let m0 = one_sample(&[(0, 1), (1, 1), (1, 0), (0, 0)]);
         let mk = one_sample(&[(1, 0), (1, 1), (0, 1), (0, 0)]);
         let (mut marks, mut swap) = (Vec::new(), Vec::new());
-        assert!(swap_rows(&m0, &mk, 0, 0, 4, &|_| false, &mut marks, &mut swap));
+        assert!(swap_rows(&m0, 0, &mk, 0, 0, 4, &|_| false, &mut marks, &mut swap));
         assert_eq!(swap, vec![true; 4]);
     }
 
@@ -460,7 +589,7 @@ mod tests {
         let m0 = one_sample(&[(0, 1), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 1), (1, 1)]);
         let mk = one_sample(&[(0, 1), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (1, 0), (1, 1)]);
         let (mut marks, mut swap) = (Vec::new(), Vec::new());
-        assert!(swap_rows(&m0, &mk, 0, 0, 8, &|_| false, &mut marks, &mut swap));
+        assert!(swap_rows(&m0, 0, &mk, 0, 0, 8, &|_| false, &mut marks, &mut swap));
         assert_eq!(swap, vec![false, false, false, false, true, true, true, true]);
     }
 
@@ -471,9 +600,9 @@ mod tests {
         let m0 = one_sample(&[(0, 1), (0, 0), (0, 1), (0, 0), (1, 0)]);
         let mk = one_sample(&[(0, 1), (0, 0), (1, 0), (0, 0), (1, 0)]);
         let (mut marks, mut swap) = (Vec::new(), Vec::new());
-        assert!(!swap_rows(&m0, &mk, 0, 0, 5, &|r| r == 2, &mut marks, &mut swap));
+        assert!(!swap_rows(&m0, 0, &mk, 0, 0, 5, &|r| r == 2, &mut marks, &mut swap));
         // read as an anchor, the filled het would swap the rows around it
-        assert!(swap_rows(&m0, &mk, 0, 0, 5, &|_| false, &mut marks, &mut swap));
+        assert!(swap_rows(&m0, 0, &mk, 0, 0, 5, &|_| false, &mut marks, &mut swap));
         assert_eq!(swap, vec![false, false, true, true, false]);
     }
 

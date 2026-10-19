@@ -330,8 +330,11 @@ struct PhasingInputs<'a> {
     /// path overrides it per ensemble member (`args.seed + i`).
     seed: i64,
     /// Members this chain produces (its Viterbi solve plus `n_members - 1` thinned Main
-    /// MCMC samples), resolved by the caller.
+    /// MCMC samples), resolved by the caller. Per copy when `replicas > 1`.
     n_members: usize,
+    /// Phasing replicas per sample (`diploid::replicas`); 1 = off. The copies' members
+    /// come back in `extra_scaffolds` after member 0 (copy 0's Viterbi solve).
+    replicas: usize,
 }
 
 /// Phasing pipeline result. `ref_bm_full` is `None` only for phase-only
@@ -353,7 +356,7 @@ struct PhasingResult {
 fn run_phasing(inp: &PhasingInputs) -> PhasingResult {
     let PhasingInputs {
         args, srp, map_path, targ_alleles, raw_chip_cm, chip_bps,
-        ref_positions, wgs_idx, n_chip, n_samples, n_ref, ped_locked, seed, n_members,
+        ref_positions, wgs_idx, n_chip, n_samples, n_ref, ped_locked, seed, n_members, replicas,
     } = *inp;
 
     let (map_bp_raw, map_cm_raw) = genmap::load_genetic_map_for(Path::new(map_path), Some(srp.chromosome()))
@@ -454,7 +457,10 @@ male chrX): phasing on all {} called sites", scaffold.indices.len());
         // back to target-only.
         // Intra-run phase ensemble member count: resolved by the caller (see
         // ensemble::resolve_members for the cohort-size cap and why it exists).
-        if n_members > 1 {
+        if replicas > 1 {
+            selphi_step!("Diploid phasing of {} copies of each sample, {} member(s) each: {} ensemble members (1× phasing of {} samples)",
+                replicas, n_members, replicas * n_members, replicas * n_samples);
+        } else if n_members > 1 {
             selphi_step!("Diploid intra-run phase ensemble: {} members (1× phasing)", n_members);
             if n_samples > selphi::imputation::ensemble::ENSEMBLE_COSTLY_ABOVE {
                 // The ensemble runs the imputation HMM once per member. At this
@@ -472,7 +478,7 @@ male chrX): phasing on all {} called sites", scaffold.indices.len());
             &ref_bp, &map_bp_raw, &map_cm_raw,
             n_chip, n_samples, n_ref,
             seed, args.threads, args.max_cond_haps, n_members,
-            ped_locked,
+            ped_locked, replicas,
         );
         let phased0 = dp.remove(0);
         (phased0, dp)  // remaining scaffolds = intra-run extra members
@@ -1103,6 +1109,20 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
             }
         }
     }
+    // Phasing replicas (diploid::replicas): on by default for a run of few samples with no
+    // given phase in its ensemble (an unphased input, or a phased one under --force-phasing);
+    // SELPHI_DIPLOID_REPLICAS=K forces K copies, =1 turns them off.
+    let replica_plan = selphi::diploid::replicas::Plan::from_env(selphi::diploid::replicas::Run {
+        n_samples, phasing: needs_phasing, chain_only: needs_phasing && !given_used,
+        phase_only: args.phase_only, batched: args.sample_batch_size > 0,
+        independent_chains: selphi::imputation::ensemble::independent_chains().is_some(),
+    });
+    if needs_phasing && let Some(note) = replica_plan.note() { selphi_info!("  Note: {}", note); }
+    if let Some(line) = replica_plan.on_line(n_samples) { selphi_step!("{}", line); }
+    // The members the run ends up with: the chain's, K times over with replicas (the
+    // independent chains are never replicated), plus a given phase's own slot
+    // (--trust-input-phase, see input_phase::InputPhase::chain_members).
+    let n_members_run = replica_plan.k * intra_chain + (indep_chain - 1) + (n_members - n_chain);
 
     let (targ_alleles, ref_bm_from_phasing, extra_phased) = if needs_phasing {
         let mut pr = run_phasing(&PhasingInputs {
@@ -1110,7 +1130,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
             targ_alleles: &targ_alleles, raw_chip_cm: &raw_chip_cm, chip_bps: &chip_bps,
             ref_positions: &ref_positions, wgs_idx: &wgs_idx,
             n_chip, n_samples, n_ref, ped_locked: ped_locked.as_deref(), seed: args.seed,
-            n_members: intra_chain,
+            n_members: intra_chain, replicas: replica_plan.k,
         });
 
         if args.phase_only {
@@ -1139,7 +1159,12 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
             // captured from the SAME phasing chain (≈1× phasing cost, vs N
             // independent phasings).
             let intra = std::mem::take(&mut pr.extra_scaffolds);
-            selphi_step!("Diploid intra-run ensemble: averaging {} members from one phasing chain", intra.len() + 1);
+            if replica_plan.k > 1 {
+                selphi_step!("Diploid intra-run ensemble: averaging {} members from {} co-phased replicas",
+                    intra.len() + 1, replica_plan.k);
+            } else {
+                selphi_step!("Diploid intra-run ensemble: averaging {} members from one phasing chain", intra.len() + 1);
+            }
             intra
         } else if let Some(unph) = unphased_for_ensemble.as_ref() {
             selphi_step!("Phase-ensemble: phasing {} extra members in parallel (seeds {}..{})",
@@ -1151,7 +1176,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
                     targ_alleles: unph, raw_chip_cm: &raw_chip_cm, chip_bps: &chip_bps,
                     ref_positions: &ref_positions, wgs_idx: &wgs_idx,
                     n_chip, n_samples, n_ref, ped_locked: ped_locked.as_deref(), seed: m_seed,
-                    n_members: 1,
+                    n_members: 1, replicas: 1,
                 }).phased_alleles
             }).collect()
         } else {
@@ -1168,7 +1193,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
             chain.push(pr.phased_alleles);
             chain.extend(extra_phased);
             let (members, choice) = selphi::imputation::input_phase::apply(
-                chain, given, input_phase, n_members, n_chip, n_haps);
+                chain, given, input_phase, n_members_run, n_chip, n_haps);
             selphi_step!("{}", choice.summary(input_phase));
             for (s, d) in choice.disagreement.iter().enumerate() {
                 selphi_debug!("  input phase {}: {} of {} het pairs disagree -> {}", sample_names[s], d.switches, d.pairs,
@@ -1310,16 +1335,17 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
 
     // Phase ensemble: build the extra members' imputation scaffolds (candidates,
     // Ne, per-member cross-window prior state). Empty with a single member.
-    let mut extra_scaffolds: Vec<selphi::imputation::ensemble::Member> = extra_phased.into_iter().map(|pa| {
-        let final_ne = Some(compute_maf_adaptive_ne(&ref_bm_imp, est_ne, n_chip, n_ref));
-        let cand = maybe_precompute_candidates(
-            args, output_path, &ref_bm_imp, &pa, &chip_cm,
+    // Phasing replicas' members are stacked into one member (one window HMM call for all).
+    let mut extra_scaffolds: Vec<selphi::imputation::ensemble::Member> = selphi::imputation::ensemble::build_members(
+        extra_phased, replica_plan.k > 1, n_chip, n_haps, n_samples,
+        target_site_conf_per_sample.as_deref(),
+        || Some(compute_maf_adaptive_ne(&ref_bm_imp, est_ne, n_chip, n_ref)),
+        |pa| maybe_precompute_candidates(
+            args, output_path, &ref_bm_imp, pa, &chip_cm,
             panel_anc.as_deref(), target_anc.as_deref(), ancestry_active,
             needs_phasing, effective_mc, n_chip, n_ref, n_haps,
-        );
-        let tb = selphi::common::HaplotypeBitmatrix::from_byte_slice_all(n_chip, n_haps, &pa, n_haps);
-        selphi::imputation::ensemble::Member::new(tb, cand, final_ne, n_haps)
-    }).collect();
+        ),
+    );
     if !extra_scaffolds.is_empty() && batched_any_active {
         selphi_error!("--phase-ensemble N>1 is not supported with --sample-batch-size (batched streaming output); run without sample batching.");
         std::process::exit(1);

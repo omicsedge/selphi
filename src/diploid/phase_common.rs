@@ -221,6 +221,9 @@ struct CondCtx<'a> {
     ordering: &'a [usize],
     si: usize,
     n_samples: usize,
+    /// Originals behind the targets: a target is a phasing replica of every target
+    /// with the same index modulo `n_orig` (`n_samples` without replicas: itself only).
+    n_orig: usize,
     n_haps_total: usize,
     ibs_cap: usize,
     single_window: bool,
@@ -289,11 +292,12 @@ impl CondCtx<'_> {
             }
         }
 
-        // K<2 fallback — add N_RANDOM_HAPS from Ordering
+        // K<2 fallback — add N_RANDOM_HAPS from Ordering (never the query itself, nor
+        // a phasing replica of it: without replicas the two tests are the same one)
         if cond_set.len() < 2 {
             for _ in 0..N_RANDOM_HAPS {
                 let random_hap = self.ordering[*o_iter];
-                if random_hap / 2 != query_ind {
+                if !super::replicas::same_original(random_hap / 2, query_ind, self.n_orig, self.n_samples) {
                     cond_set.push(random_hap);
                 }
                 *o_iter = if *o_iter + 1 == self.n_haps_total { 0 } else { *o_iter + 1 };
@@ -1165,6 +1169,10 @@ pub fn run_phase_common_bm(
     // segment HMM treats them as one fixed orientation per segment (SHAPEIT5's
     // scaffold semantics) instead of re-sampling each of them.
     locked: Option<&[bool]>,
+    // Phasing replicas (`diploid::replicas`): the targets are `replicas` copies of
+    // `n_samples / replicas` originals, replica-major, none of which may condition on
+    // another copy of itself. 1 = no replicas.
+    replicas: usize,
 ) {
     let t_setup = std::time::Instant::now();
     // SELPHI_DIPLOID_DISPATCH_DIAG: per-run counters (see hmm_segment.rs).
@@ -1236,6 +1244,14 @@ pub fn run_phase_common_bm(
         };
         crate::selphi_debug!("  [diploid] IBD2 pairs detected: {} ({:.1}s)",
             tracks.n_pairs(), t0_ibd2.elapsed().as_secs_f64());
+        let mut tracks = tracks;
+        if replicas > 1 {
+            // Copies of one sample are IBD2 everywhere and the detection finds them so;
+            // the ban makes it unconditional (a no-op on top of what was detected).
+            tracks.ban_replicas(n_samples / replicas, replicas, n_var);
+            crate::selphi_debug!("  [diploid] replicas: {} copies of {} samples banned from each other ({} IBD2 tracks)",
+                replicas, n_samples / replicas, tracks.n_pairs());
+        }
         tracks
     };
     let cm_f64: Vec<f64> = cm.to_vec();
@@ -1320,7 +1336,7 @@ pub fn run_phase_common_bm(
         &mut pbwt_idx, &mut ibd2, &cm_f64, &mut hmm_params, &allele_counts,
         &stages, &ordering, &mut o_iterator, &mut rng,
         n_var, n_samples, n_ref, n_haps_total, target_geno, chip_bp,
-        max_cond_haps, main_samples,
+        max_cond_haps, main_samples, n_samples / replicas.max(1),
     );
 
     crate::selphi_debug!("  [diploid] phase_common complete");
@@ -1347,6 +1363,8 @@ fn _run_iterations(
     _chip_bp: Option<&[i64]>,
     max_cond_haps: usize,
     mut main_samples: Option<&mut MainCapture>,
+    // Originals behind the `n_samples` targets (`n_samples` without replicas).
+    n_orig: usize,
 ) {
     let _n_haps = n_samples * 2;
     let n_iterations = stages.len();
@@ -1476,7 +1494,7 @@ fn _run_iterations(
             let graph_ro: &GenotypeGraph = graph;
             let cond_ctx = CondCtx {
                 graph: graph_ro, pbwt_idx: pbwt_ro, hap_bm: hap_bm_hmm_ref, ordering,
-                si, n_samples, n_haps_total, ibs_cap, single_window,
+                si, n_samples, n_orig, n_haps_total, ibs_cap, single_window,
             };
             let hmm_ctx = WindowHmmCtx { graph: graph_ro, hap_bm: hap_bm_hmm_ref, hmm_params: hmm_params_ro };
             let mut writer = TransWriter::new(graph_ro);
@@ -2760,7 +2778,7 @@ mod phase_common_parity_tests {
         let keep = crate::diploid::ensemble_main_iters(3, 5);
         let mut cap = MainCapture::new(keep.clone());
         run_phase_common_bm(&mut g_new, bm_new, &cm, n_var, n_samples, n_ref, pc_seed, 4,
-            scheme, Some(&bp), &target_geno, max_cond_haps, Some(&mut cap), locked.as_deref());
+            scheme, Some(&bp), &target_geno, max_cond_haps, Some(&mut cap), locked.as_deref(), 1);
 
         let tag = format!("seed {seed}, samples {n_samples}, refs {n_ref}, vars {n_var}, nocall {nocall_rate}, cap {max_cond_haps}, lock {with_lock}");
         assert_eq!(main_old.len(), 5, "{tag}");
@@ -2809,7 +2827,7 @@ mod phase_common_parity_tests {
         let Case { graphs: mut g_new, bm: bm_new } = build(&target_geno, &panel, n_var, n_samples, n_ref, None);
         let mut cap = MainCapture::new(crate::diploid::ensemble_main_iters(2, 5));
         run_phase_common_bm(&mut g_new, bm_new, &cm, n_var, n_samples, n_ref, 77, 4,
-            scheme, Some(&bp), &target_geno, 0, Some(&mut cap), None);
+            scheme, Some(&bp), &target_geno, 0, Some(&mut cap), None, 1);
         assert_eq!(g_old[0].variants, g_new[0].variants, "variants, seed {seed}");
         assert_eq!(g_old[0].diplotypes, g_new[0].diplotypes, "diplotypes, seed {seed}");
         assert_eq!(&main_old[4][..], cap.get(4), "ensemble sample, seed {seed}");
@@ -2892,7 +2910,7 @@ mod phase_common_parity_tests {
                 NOCALL_OBSERVED_TEST.with(|c| c.set(observed));
                 let Case { mut graphs, bm } = build(&target_geno, &panel, n_var, n_samples, n_ref, None);
                 run_phase_common_bm(&mut graphs, bm, &cm, n_var, n_samples, n_ref, 5 + seed as i64, 4,
-                    "5b,1p,1b,1p,1b,1p,5m", Some(&bp), &target_geno, 0, None, None);
+                    "5b,1p,1b,1p,1b,1p,5m", Some(&bp), &target_geno, 0, None, None, 1);
                 NOCALL_OBSERVED_TEST.with(|c| c.set(false));
                 graphs
             };
