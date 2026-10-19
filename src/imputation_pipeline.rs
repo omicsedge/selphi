@@ -1073,6 +1073,11 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // Keep the unphased target for the extra ensemble members (phasing consumes
     // a phased copy into `targ_alleles`).
     let unphased_for_ensemble = if ensemble_n > 1 { Some(targ_alleles.clone()) } else { None };
+    // SELPHI_ENSEMBLE_INPUT_PHASE=1 (experimental): when a phased input is re-phased (--force-phasing),
+    // its own phase joins the ensemble as one more member, so the dosages average the given phase with
+    // the chain's. Its no-calls (128) take member 0's imputed allele once phasing has run.
+    let input_phase_member = if is_phased && args.force_phasing && !args.phase_only
+        && selphi::config::is_one("SELPHI_ENSEMBLE_INPUT_PHASE") { Some(targ_alleles.clone()) } else { None };
     if ensemble_n > 1 {
         selphi_step!("Phase-ensemble: {} members (seeds {}..{})", ensemble_n, args.seed, args.seed + ensemble_n as i64 - 1);
     }
@@ -1128,6 +1133,14 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         } else {
             Vec::new()
         };
+        let mut extra_phased = extra_phased;
+        if let Some(mut given) = input_phase_member {
+            for (a, &p) in given.iter_mut().zip(pr.phased_alleles.iter()) {
+                if *a == 128 { *a = p; }
+            }
+            selphi_step!("Input phase kept as ensemble member {} (SELPHI_ENSEMBLE_INPUT_PHASE)", extra_phased.len() + 2);
+            extra_phased.push(given);
+        }
         (pr.phased_alleles, pr.ref_bm_full, extra_phased)
     } else {
         if args.phase_only {
