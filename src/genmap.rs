@@ -258,26 +258,32 @@ fn strip_chr(s: &str) -> &str {
     s.strip_prefix("chr").unwrap_or(s)
 }
 
-/// Cumulative genetic position per variant, with Beagle's floored construction
-/// (ImpData.cumPos): `cum[0] = 0`, `cum[j] = cum[j-1] + max(|cm[j]-cm[j-1]|, 1e-7)`.
+/// Cumulative genetic position of `positions`, a running sum of the map
+/// distances between consecutive variants in which every step counts at least
+/// [`MIN_STEP_CM`]: `cum[0] = 0`, `cum[j] = cum[j-1] + max(|cm[j]-cm[j-1]|, MIN_STEP_CM)`.
 ///
-/// The strictly positive per-step floor keeps every inter-variant span nonzero,
-/// so a flat (or empty) map region degrades to uniform rank spacing and any
-/// anchor-to-anchor denominator built from `cum` is nonzero by construction.
-/// Used by the SELPHI_INTERP_CM interpolation (io/pipeline.rs, io/batch_driver.rs).
+/// The interpolation places an untyped variant between its two typed anchors by
+/// its share of their cumulative distance, so that distance must never be 0. On a
+/// stretch where the map is flat, or where there is no map at all, every step is
+/// the floor and the share falls back to the variant's rank between the anchors.
+/// The floor is far below any real inter-variant distance, so elsewhere it does
+/// not move a position measurably. Used by the SELPHI_INTERP_CM interpolation
+/// (io/pipeline.rs, io/batch_driver.rs).
 pub fn cumulative_cm_floored(map_bp: &[i64], map_cm: &[f64], positions: &[i64]) -> Vec<f64> {
     use rayon::prelude::*;
-    const MIN_CM_DIST: f64 = 1e-7;
     if positions.is_empty() { return Vec::new(); }
     let gen_pos: Vec<f64> = positions.par_iter()
         .map(|&bp| interpolate_cm(map_bp, map_cm, bp))
         .collect();
     let mut cum = vec![0.0f64; positions.len()];
     for j in 1..gen_pos.len() {
-        cum[j] = cum[j - 1] + (gen_pos[j] - gen_pos[j - 1]).abs().max(MIN_CM_DIST);
+        cum[j] = cum[j - 1] + (gen_pos[j] - gen_pos[j - 1]).abs().max(MIN_STEP_CM);
     }
     cum
 }
+
+/// Smallest step of [`cumulative_cm_floored`], in cM.
+const MIN_STEP_CM: f64 = 1e-7;
 
 /// Linear interpolation of a single BP position (imputation). Outside the map's
 /// range the position is extrapolated at the chromosome's mean rate, the model every
@@ -310,14 +316,14 @@ enum Edge {
     Clamp,
     /// The whole chromosome's mean rate.
     MeanRate,
-    /// The rate over the map's last (first) 5 cM, as Beagle's PlinkGenMap.genPos.
+    /// The rate over the map's last (first) 5 cM, the rule Beagle 5 applies.
     EndRate,
 }
 
 /// The edge model of the genotype engine: the chromosome's mean rate in phasing and
 /// imputation. A/B only: `SELPHI_MAP_EDGE_OLD=1` restores imputation's clamp at the
-/// map's ends; `SELPHI_MAP_EDGE_END=1` uses Beagle's rate over
-/// the map's last (first) 5 cM in both, which measured worse for phasing (54 trios,
+/// map's ends; `SELPHI_MAP_EDGE_END=1` uses the rate over the map's last
+/// (first) 5 cM in both, as Beagle 5 does, which measured worse for phasing (54 trios,
 /// five seeds: +0.007 pp switch error, 5 of 5 seeds).
 fn edge_model(imputation: bool) -> Edge {
     static V: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
@@ -325,7 +331,7 @@ fn edge_model(imputation: bool) -> Edge {
     if end { Edge::EndRate } else if old && imputation { Edge::Clamp } else { Edge::MeanRate }
 }
 
-/// cM span of the map end used for the end rate (Beagle's minEndCmDist).
+/// cM span of the map end used for the end rate.
 const END_RATE_CM: f64 = 5.0;
 
 fn interpolate_cm_impl(map_bp: &[i64], map_cm: &[f64], bp: i64, edge: Edge) -> f64 {
@@ -575,7 +581,7 @@ mod contig_map_tests {
 mod edge_tests {
     use super::*;
 
-    /// Beyond the map: the end rate (Beagle's, the A/B) follows the map's last (first)
+    /// Beyond the map: the end rate (the A/B) follows the map's last (first)
     /// 5 cM; the default follows the chromosome's mean rate in phasing and imputation.
     #[test]
     fn end_rate_extrapolation() {

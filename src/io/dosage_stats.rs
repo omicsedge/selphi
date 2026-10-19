@@ -10,14 +10,18 @@
 /// `s in 0..n_samples`. Records each sample's dosage `ap1 + ap2` into `ds_out[s]`
 /// and counts hardcall ALT alleles (`ap > 0.5` per haplotype). Returns `(ac, dr2)`.
 ///
-/// DR2 is Beagle's estimator (ImputedRecBuilder.r2), computed over HAPLOTYPES:
-/// with `p` the per-haplotype ALT probabilities and `n` the number of haplotypes,
-/// `DR2 = (Σp² − (Σp)²/n) / (Σp − (Σp)²/n)`, the variance of the posterior means over
-/// the variance they would have if every haplotype were called with certainty; 0
-/// when `Σp = 0` or the numerator is not positive. It is defined for one sample (a
-/// confident heterozygote gives 1). The diploid-dosage variance across samples used
-/// before was 0 at every site of a single-sample run, whatever the evidence.
-/// Accumulated in f64 in ascending-sample order.
+/// DR2 is the estimated squared correlation between the imputed and the true
+/// allele dose (Browning & Browning 2009, Am J Hum Genet 84:210-223), taken over
+/// HAPLOTYPES. If haplotype `h`'s true allele is 1 with probability `p_h`, the
+/// squared correlation between the doses `p` and the truth is
+/// `Cov(p, x)^2 / (Var(p) Var(x)) = Var(p) / (p̄(1 - p̄))`: the variance of the
+/// posterior means over the variance they would have if every haplotype were
+/// called with certainty. With `n` haplotypes, `S1 = Σp` and `S2 = Σp²`, that is
+/// `(S2 - S1²/n) / (S1 - S1²/n)`, set to 0 when `S1 = 0` or either term is not
+/// positive. It is defined for one sample (a confident heterozygote gives 1). The
+/// diploid-dosage variance across samples used before was 0 at every site of a
+/// single-sample run, whatever the evidence. Accumulated in f64 in
+/// ascending-sample order.
 ///
 /// AF is deliberately NOT returned: callers divide `ac` in their own precision
 /// (f32 for the Parquet `AF` column, f64 for the VCF `INFO/AF`).
@@ -32,22 +36,22 @@ pub fn imputed_ac_dr2(
 ) -> (u32, f64) {
     if dr2_diploid() { return imputed_ac_dr2_diploid(n_samples, n_haps, ap, ds_out); }
     let mut ac = 0u32;
-    let mut sum = 0.0f64;
-    let mut sum2 = 0.0f64;
+    let (mut s1, mut s2) = (0.0f64, 0.0f64);
     for s in 0..n_samples {
         let (ap1, ap2) = ap(s);
         if ap1 > 0.5 { ac += 1; }
         if ap2 > 0.5 { ac += 1; }
         ds_out[s] = ap1 + ap2;
         let (p1, p2) = (ap1 as f64, ap2 as f64);
-        sum += p1 + p2;
-        sum2 += p1 * p1 + p2 * p2;
+        s1 += p1 + p2;
+        s2 += p1 * p1 + p2 * p2;
     }
-    if sum <= 0.0 || n_haps == 0 { return (ac, 0.0); }
-    let mean_term = sum * sum / n_haps as f64;
-    let num = sum2 - mean_term;
-    let den = sum - mean_term;
-    let dr2 = if num <= 0.0 || den <= 0.0 { 0.0 } else { (num / den).clamp(0.0, 1.0) };
+    if s1 <= 0.0 || n_haps == 0 { return (ac, 0.0); }
+    // n Var(p) over n p̄(1 - p̄); both share the term S1²/n.
+    let s1_sq_over_n = s1 * s1 / n_haps as f64;
+    let n_var = s2 - s1_sq_over_n;
+    let n_certain_var = s1 - s1_sq_over_n;
+    let dr2 = if n_var <= 0.0 || n_certain_var <= 0.0 { 0.0 } else { (n_var / n_certain_var).clamp(0.0, 1.0) };
     (ac, dr2)
 }
 
@@ -150,15 +154,15 @@ impl Dr2Summary {
 mod tests {
     use super::imputed_ac_dr2;
 
-    // Beagle's ImputedRecBuilder.r2 for one allele, in f64.
-    fn beagle(aps: &[(f32, f32)]) -> f64 {
-        let n = (aps.len() * 2) as f64;
-        let (mut sum, mut sum2) = (0.0f64, 0.0f64);
-        for &(a, b) in aps { for p in [a as f64, b as f64] { sum += p; sum2 += p * p; } }
-        if sum == 0.0 { return 0.0; }
-        let mt = sum * sum / n;
-        let num = sum2 - mt;
-        if num <= 0.0 { 0.0 } else { num / (sum - mt) }
+    /// The estimator from its definition, in two passes: the population variance
+    /// of the haplotype ALT probabilities over `p̄(1 - p̄)`, 0 when either is 0.
+    fn variance_ratio(aps: &[(f32, f32)]) -> f64 {
+        let p: Vec<f64> = aps.iter().flat_map(|&(a, b)| [a as f64, b as f64]).collect();
+        let n = p.len() as f64;
+        let mean = p.iter().sum::<f64>() / n;
+        let var = p.iter().map(|&x| (x - mean) * (x - mean)).sum::<f64>() / n;
+        let certain = mean * (1.0 - mean);
+        if var <= 0.0 || certain <= 0.0 { 0.0 } else { (var / certain).min(1.0) }
     }
 
     /// Perfectly imputed haplotypes give DR2 = 1 at any sample count, ONE included;
@@ -171,7 +175,7 @@ mod tests {
         let aps: Vec<(f32, f32)> = (0..100).map(|i| if i < 49 { (0.0, 0.0) } else if i < 91 { (1.0, 0.0) } else { (1.0, 1.0) }).collect();
         let (_, dr2) = imputed_ac_dr2(aps.len(), 200, |s| aps[s], &mut ds);
         assert!((dr2 - 1.0).abs() < 1e-12);
-        // monomorphic in the posterior: 0, as Beagle reports
+        // no variation in the posterior: 0
         assert_eq!(imputed_ac_dr2(1, 2, |_| (0.0, 0.0), &mut ds).1, 0.0);
         assert_eq!(imputed_ac_dr2(1, 2, |_| (1.0, 1.0), &mut ds).1, 0.0);
         // pure uncertainty: 0
@@ -179,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_beagle_estimator() {
+    fn matches_the_variance_ratio() {
         let cases: Vec<Vec<(f32, f32)>> = vec![
             vec![(0.0, 0.0), (1.0, 1.0), (0.5, 0.5)],
             vec![(0.9, 0.1), (0.3, 0.7), (0.51, 0.49), (0.0, 1.0)],
@@ -189,7 +193,7 @@ mod tests {
         for aps in &cases {
             let mut ds = vec![0f32; aps.len()];
             let (_, dr2) = imputed_ac_dr2(aps.len(), aps.len() * 2, |s| aps[s], &mut ds);
-            assert!((dr2 - beagle(aps).clamp(0.0, 1.0)).abs() < 1e-12, "{aps:?}");
+            assert!((dr2 - variance_ratio(aps)).abs() < 1e-9, "{aps:?}: {dr2} vs {}", variance_ratio(aps));
             for (s, &(a, b)) in aps.iter().enumerate() { assert_eq!(ds[s], a + b); }
         }
     }
