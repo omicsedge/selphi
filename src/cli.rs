@@ -6,17 +6,6 @@
 use clap::Parser;
 pub use selphi::io::target_io::AlleleMatch;
 
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
-pub enum PhasingEngine {
-    /// Default: diploid for all inputs (matches/exceeds haploid on SNPs at every
-    /// density, wins phasing switch-error, ~2.5x faster)
-    Auto,
-    /// Haploid phasing (15-iteration coded-step PBWT + composite HMM)
-    Haploid,
-    /// Diploid phasing (genotype graph + diplotype segment HMM)
-    Diploid,
-}
-
 /// Imputation engine/mode selection (`--engine`). The unified, discoverable
 /// front door for the otherwise-orthogonal `--lcwgs` / `--refine` booleans.
 /// Default is `auto`: Selphi sniffs the target input and picks the engine
@@ -98,8 +87,8 @@ pub struct Args {
 
     /// De-novo PANEL phasing: phase an unphased cohort (--input VCF/BCF, SRP, or
     /// BREF3) using the cohort itself as the conditioning set (no --refpanel needed).
-    /// Two-stage diploid (phase_common → phase_rare) by default, or haploid
-    /// via --phasing-engine haploid. Output is a phased panel VCF.gz.
+    /// Two-stage diploid phasing (phase_common → phase_rare). Output is a phased
+    /// panel VCF.gz.
     #[arg(long)]
     pub phase_panel: bool,
 
@@ -266,14 +255,14 @@ pub struct Args {
     #[arg(long, default_value = "33")]
     pub seed: i64,
 
-    /// Phasing ensemble size (default 1). When N>1, phasing is run N times with
-    /// seeds {seed, seed+1, ..., seed+N-1} and the per-haplotype Li-Stephens
-    /// copying weights are AVERAGED before interpolation, marginalizing
-    /// phase uncertainty. The reference panel is read once and the output is
-    /// encoded once (interpolation is linear in the weights, so the averaged
-    /// weights yield the exact mean imputed dosage). Recovers most of the
-    /// internal-phasing accuracy gap on sparse chip panels. N=1 is byte-identical
-    /// to the non-ensemble path. Cost ≈ N× phasing + N× HMM, 1× panel I/O + interp.
+    /// Phase ensemble size: N > 1 imputes from N members of the one phasing chain
+    /// (its final solve plus N-1 thinned main-iteration MCMC samples) and AVERAGES
+    /// their per-haplotype Li-Stephens copying weights before interpolation,
+    /// marginalizing phase uncertainty. The reference panel is read once and the
+    /// output encoded once (interpolation is linear in the weights, so the averaged
+    /// weights give the exact mean imputed dosage). Cost ≈ 1× phasing + N× HMM.
+    /// The default (1) leaves the member count at its default of 2
+    /// (SELPHI_DIPLOID_INTRA_N); --sample-batch-size and --phase-only use one member.
     #[arg(long, default_value = "1")]
     pub phase_ensemble: usize,
 
@@ -344,10 +333,6 @@ pub struct Args {
     #[arg(long, value_parser = parse_p_err)]
     pub p_err: Option<f64>,
 
-    /// Disable EM-estimated Ne from phasing (use global Ne for imputation)
-    #[arg(long)]
-    pub no_em_ne: bool,
-
     /// Use chromosome-level precomputed PBWT candidates instead of the
     /// per-window default. Off by default — per-window selection avoids
     /// a truncation bias against segment-specific haps on admixed targets
@@ -364,25 +349,10 @@ pub struct Args {
     #[arg(long)]
     pub vcf: bool,
 
-    /// Phasing engine: auto (default), haploid, or diploid.
-    /// Auto selects the diploid engine for all inputs (chip and WGS); use
-    /// --phasing-engine haploid to force the haploid composite-HMM engine.
-    #[arg(long, value_enum, default_value = "auto")]
-    pub phasing_engine: PhasingEngine,
-
     /// Max conditioning haplotypes per window in diploid phasing (0 = unlimited).
     /// Lower values = faster but less accurate. Try 120-200 for speed, 0 for best accuracy.
     #[arg(long, default_value = "0")]
     pub max_cond_haps: usize,
-
-
-    /// Alias for --phasing-engine=diploid (deprecated)
-    #[arg(long, hide = true)]
-    pub wgs_phasing: bool,
-
-    /// Max phasing windows to process (0 = all, for benchmarking)
-    #[arg(long, default_value = "0")]
-    pub max_windows: usize,
 
     /// Omit AP1/AP2 fields from output (faster, smaller files)
     #[arg(long)]

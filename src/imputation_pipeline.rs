@@ -16,38 +16,12 @@ use rayon::prelude::*;
 use selphi::{selphi_info, selphi_debug, selphi_step, selphi_error};
 use selphi::srp::SrpReader;
 use selphi::genmap;
-use selphi::haploid;
 use selphi::io::target_io::{read_target_vcf, write_phased_vcf, extract_target_alleles, intersect_variants,
     extract_target_site_confidence, align_confidence_to_chip,
     extract_target_site_confidence_per_sample, align_confidence_to_chip_per_sample};
 use selphi::imputation::windows::compute_imputation_windows;
 
-use crate::cli::{Args, PhasingEngine};
-
-/// Resolved phasing engine for an imputation run. `Auto` from the CLI is
-/// resolved once into `Haploid` or `Diploid` based on input variant density.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ResolvedEngine { Haploid, Diploid }
-
-/// Resolve the phasing engine from CLI args. `--wgs-phasing` forces `Diploid`;
-/// otherwise `--phasing-engine` is honoured, with `Auto` (the default) choosing
-/// `Diploid` for ALL inputs — the diploid engine matches or exceeds the haploid
-/// engine on SNPs at every density tested (chip arrays and WGS), wins phasing
-/// switch-error, and runs ~2.5x faster. `--phasing-engine haploid` selects the
-/// haploid composite-HMM engine explicitly.
-fn resolve_phasing_engine(args: &Args, n_chip: usize) -> ResolvedEngine {
-    if args.wgs_phasing {
-        return ResolvedEngine::Diploid;
-    }
-    match args.phasing_engine {
-        PhasingEngine::Diploid => ResolvedEngine::Diploid,
-        PhasingEngine::Haploid => ResolvedEngine::Haploid,
-        PhasingEngine::Auto => {
-            selphi_info!("  Phasing engine: Diploid (default; {} target variants)", n_chip);
-            ResolvedEngine::Diploid
-        }
-    }
-}
+use crate::cli::Args;
 
 /// PBWT / HMM auto-calibrated parameters derived from the reference panel
 /// dimensions plus any explicit CLI overrides.
@@ -336,7 +310,7 @@ fn setup_output_writers(
     )
 }
 
-/// Inputs to `run_phasing_engines`. Mostly slices borrowed from the
+/// Inputs to `run_phasing`. Mostly slices borrowed from the
 /// surrounding pipeline; bundled in a struct so the helper signature
 /// stays under the `too_many_arguments` clippy threshold.
 struct PhasingInputs<'a> {
@@ -363,24 +337,17 @@ struct PhasingInputs<'a> {
 /// imputation HMM downstream.
 struct PhasingResult {
     phased_alleles: Vec<u8>,
-    window_ri: Vec<(f32, usize, usize)>,
     ref_bm_full: Option<selphi::common::HaplotypeBitmatrix>,
-    engine: ResolvedEngine,
-    /// Diploid intra-run phase ensemble: extra phased scaffolds (the thinned Main
-    /// MCMC samples from the SAME phasing chain). Empty unless the diploid intra
-    /// ensemble is active. These become ensemble members in the weight averaging,
-    /// giving an ensemble at ~1x phasing cost (vs N independent phasings).
+    /// Intra-run phase ensemble: extra phased scaffolds (the thinned Main MCMC
+    /// samples from the SAME phasing chain). Empty unless the intra-run ensemble
+    /// is active. These become ensemble members in the weight averaging, giving
+    /// an ensemble at ~1x phasing cost (vs N independent phasings).
     extra_scaffolds: Vec<Vec<u8>>,
-    /// Soft-phase (SELPHI_HAPLOID_SOFT_PHASE): per-(chip-site, sample) phase
-    /// confidence ∈ [0,1], row-major `[site * n_samples + sample]`, used as the
-    /// imputation emission confidence `c`. None unless soft-phase + haploid.
-    phase_conf: Option<Vec<f32>>,
 }
 
-/// Run the resolved phasing engine (haploid or diploid). Extracts the full
-/// reference bitmatrix (shared with downstream imputation) and dispatches to
-/// the appropriate engine, subsetting to common-MAF variants for diploid.
-fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
+/// Run the diploid phasing engine. Extracts the full reference bitmatrix
+/// (shared with downstream imputation) and phases on the common-MAF scaffold.
+fn run_phasing(inp: &PhasingInputs) -> PhasingResult {
     let PhasingInputs {
         args, srp, map_path, targ_alleles, raw_chip_cm, chip_bps,
         ref_positions, wgs_idx, n_chip, n_samples, n_ref, ped_locked, seed,
@@ -391,8 +358,6 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
         .unwrap_or_else(|e| { selphi_error!("Cannot read genetic map {}: {}", map_path, e); std::process::exit(1); });
     let ref_bp: Vec<i64> = ref_positions.to_vec();
 
-    let engine = resolve_phasing_engine(args, n_chip);
-
     // Full ref bitmatrix is shared between phasing and imputation. Phase-only
     // diploid does not need it for phase_common (the common-MAF subset is enough),
     // but phase_rare weaves it into its PBWT context, and without it rare-variant
@@ -400,7 +365,7 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
     // integrated run produces, silently. So build it here too when it fits
     // SELPHI_PHASE_ONLY_RARE_REF_GB (a chr22 array × 1KG is 5.6 MB; a WGS target ×
     // TOPMed would be ~21 GB, which is why it is budgeted rather than unconditional).
-    let want_full = !args.phase_only || engine != ResolvedEngine::Diploid || {
+    let want_full = !args.phase_only || {
         let bytes = n_chip * n_ref.div_ceil(64) * 8;
         let budget = (selphi::config::f64_or("SELPHI_PHASE_ONLY_RARE_REF_GB", 2.0) * 1e9) as usize;
         if bytes > budget {
@@ -416,136 +381,93 @@ fn run_phasing_engines(inp: &PhasingInputs) -> PhasingResult {
         Some(bm)
     } else { None };
 
-    let (phased, window_ri, phase_conf, extra_scaffolds) = match engine {
-        ResolvedEngine::Diploid => {
-            selphi_step!("Using Diploid phasing");
-            // Common-MAF chip subset (MAF >= 0.001 on target). Diploid runs
-            // on common variants only; rare ones are re-imputed by the HMM.
-            // The frequency is the TARGET COHORT's, so the scaffold shrinks with
-            // the batch: at one sample AN is 2 and only heterozygous sites clear
-            // the threshold (1802 of 9283 on chr22 GSA), which starves the
-            // conditioning PBWT of the sites it matches on. SELPHI_DIPLOID_SCAFFOLD_MAF
-            // makes the threshold settable (0 = every called site) to A/B that.
-            let scaffold_maf = selphi::config::f32_or("SELPHI_DIPLOID_SCAFFOLD_MAF", 0.001);
-            // Frequency SOURCE (diploid::scaffold): default "union" = every site the
-            // cohort rule keeps plus the panel-common ones it drops (a single user's
-            // homozygous calls); "cohort" and "panel" select one of the two sets.
-            // Needs the chip-site panel bitmatrix, which the phase-only path does not
-            // build — there the request is reported and ignored rather than silently
-            // changing which sites are selected.
-            let source = selphi::diploid::scaffold::Source::from_env();
-            let panel_bm = if source.needs_panel() { ref_bm_full.as_ref() } else { None };
-            if source.needs_panel() && panel_bm.is_none() {
-                // The phase-only path builds the chip-site panel bitmatrix only under
-                // SELPHI_PHASE_ONLY_RARE_REF_GB; without it only the cohort rule can run.
-                if selphi::diploid::scaffold::Source::is_explicit() {
-                    selphi_info!("    SELPHI_DIPLOID_SCAFFOLD_SOURCE={:?} ignored (no chip-site panel bitmatrix on this path)", source);
-                } else {
-                    selphi_debug!("  phasing scaffold: cohort frequencies only (no chip-site panel bitmatrix on this path)");
-                }
-            }
-            let scaffold = selphi::diploid::scaffold::select(
-                targ_alleles, n_chip, n_samples, panel_bm, source, scaffold_maf);
-            if scaffold.widened {
-                selphi_step!("No site clears the phasing scaffold threshold (no heterozygous call, e.g. a \
-male chrX): phasing on all {} called sites", scaffold.indices.len());
-            }
-            if scaffold.indices.is_empty() {
-                selphi_error!("No called target genotype on this chromosome: nothing to phase or impute from");
-                std::process::exit(1);
-            }
-            let common_chip_indices = scaffold.indices;
-            let common_ref_bm = if let Some(ref full_bm) = ref_bm_full {
-                selphi::diploid::pbwt_neighbor::HaplotypeBitmatrix::from_subset(
-                    full_bm, &common_chip_indices)
+    let (phased, extra_scaffolds) = {
+        selphi_step!("Using Diploid phasing");
+        // Common-MAF chip subset (MAF >= 0.001 on target). Diploid runs
+        // on common variants only; rare ones are re-imputed by the HMM.
+        // The frequency is the TARGET COHORT's, so the scaffold shrinks with
+        // the batch: at one sample AN is 2 and only heterozygous sites clear
+        // the threshold (1802 of 9283 on chr22 GSA), which starves the
+        // conditioning PBWT of the sites it matches on. SELPHI_DIPLOID_SCAFFOLD_MAF
+        // makes the threshold settable (0 = every called site) to A/B that.
+        let scaffold_maf = selphi::config::f32_or("SELPHI_DIPLOID_SCAFFOLD_MAF", 0.001);
+        // Frequency SOURCE (diploid::scaffold): default "union" = every site the
+        // cohort rule keeps plus the panel-common ones it drops (a single user's
+        // homozygous calls); "cohort" and "panel" select one of the two sets.
+        // Needs the chip-site panel bitmatrix, which the phase-only path does not
+        // build — there the request is reported and ignored rather than silently
+        // changing which sites are selected.
+        let source = selphi::diploid::scaffold::Source::from_env();
+        let panel_bm = if source.needs_panel() { ref_bm_full.as_ref() } else { None };
+        if source.needs_panel() && panel_bm.is_none() {
+            // The phase-only path builds the chip-site panel bitmatrix only under
+            // SELPHI_PHASE_ONLY_RARE_REF_GB; without it only the cohort rule can run.
+            if selphi::diploid::scaffold::Source::is_explicit() {
+                selphi_info!("    SELPHI_DIPLOID_SCAFFOLD_SOURCE={:?} ignored (no chip-site panel bitmatrix on this path)", source);
             } else {
-                // Phase-only path: extract just the common subset from SRP.
-                let common_wgs: Vec<usize> = common_chip_indices.iter().map(|&ci| wgs_idx[ci]).collect();
-                srp.extract_ref_alleles_bitmatrix(&common_wgs)
-            };
-            selphi_step!("Common ref subset ({} / {} variants, {:.1} MB)",
-                common_chip_indices.len(), n_chip,
-                (common_ref_bm.n_words() * common_chip_indices.len() * 8) as f64 / 1e6);
-            // Pass the full-chip ref bitmatrix (if available) so phase_rare
-            // can weave the reference panel into its PBWT context. In the
-            // phase-only diploid path `ref_bm_full` is `None` (we only
-            // extract the common subset to save RAM); phase_rare falls
-            // back to target-only.
-            // Intra-run phase ensemble member count — see ensemble::resolve_members
-            // for the cohort-size cap and why it exists.
-            let n_members = if selphi::imputation::ensemble::independent_chains().is_some() { 1 } else {
-                selphi::imputation::ensemble::resolve_members(
-                    n_samples, args.phase_ensemble,
-                    args.sample_batch_size > 0 || args.phase_only,
-                )
-            };
-            if n_members > 1 {
-                selphi_step!("Diploid intra-run phase ensemble: {} members (1× phasing)", n_members);
-                if n_samples > selphi::imputation::ensemble::ENSEMBLE_COSTLY_ABOVE {
-                    // The ensemble runs the imputation HMM once per member. At this
-                    // cohort size that map is essentially the whole wall, so N members
-                    // means ~N x the run. Say it rather than let it be discovered.
-                    selphi_info!("           at {} samples each member costs a full HMM pass \
-(~{}x wall); SELPHI_ENSEMBLE_MAX_SAMPLES=1000 caps it at one member",
-                        n_samples, n_members);
-                }
+                selphi_debug!("  phasing scaffold: cohort frequencies only (no chip-site panel bitmatrix on this path)");
             }
-            let (mut dp, dr) = selphi::diploid::diploid_phase_bm_prefiltered(
-                targ_alleles, common_ref_bm, &common_chip_indices,
-                ref_bm_full.as_ref(),
-                raw_chip_cm, chip_bps,
-                &ref_bp, &map_bp_raw, &map_cm_raw,
-                n_chip, n_samples, n_ref,
-                seed, args.threads, args.max_cond_haps, n_members,
-                ped_locked,
-            );
-            let phased0 = dp.remove(0);
-            (phased0, dr, None, dp)  // remaining scaffolds = intra-run extra members
         }
-        ResolvedEngine::Haploid => {
-            selphi_step!("Using haploid phasing engine");
-            let ref_bm = ref_bm_full.as_ref().unwrap();
-            let (p, w, c) = haploid::phase_genotypes(
-                targ_alleles, ref_bm,
-                raw_chip_cm, chip_bps,
-                &ref_bp, &map_bp_raw, &map_cm_raw,
-                n_chip, n_samples, n_ref,
-                seed, args.threads, args.max_windows,
-            );
-            (p, w, c, Vec::new())
+        let scaffold = selphi::diploid::scaffold::select(
+            targ_alleles, n_chip, n_samples, panel_bm, source, scaffold_maf);
+        if scaffold.widened {
+            selphi_step!("No site clears the phasing scaffold threshold (no heterozygous call, e.g. a \
+male chrX): phasing on all {} called sites", scaffold.indices.len());
         }
+        if scaffold.indices.is_empty() {
+            selphi_error!("No called target genotype on this chromosome: nothing to phase or impute from");
+            std::process::exit(1);
+        }
+        let common_chip_indices = scaffold.indices;
+        let common_ref_bm = if let Some(ref full_bm) = ref_bm_full {
+            selphi::diploid::pbwt_neighbor::HaplotypeBitmatrix::from_subset(
+                full_bm, &common_chip_indices)
+        } else {
+            // Phase-only path: extract just the common subset from SRP.
+            let common_wgs: Vec<usize> = common_chip_indices.iter().map(|&ci| wgs_idx[ci]).collect();
+            srp.extract_ref_alleles_bitmatrix(&common_wgs)
+        };
+        selphi_step!("Common ref subset ({} / {} variants, {:.1} MB)",
+            common_chip_indices.len(), n_chip,
+            (common_ref_bm.n_words() * common_chip_indices.len() * 8) as f64 / 1e6);
+        // Pass the full-chip ref bitmatrix (if available) so phase_rare
+        // can weave the reference panel into its PBWT context. In the
+        // phase-only diploid path `ref_bm_full` is `None` (we only
+        // extract the common subset to save RAM); phase_rare falls
+        // back to target-only.
+        // Intra-run phase ensemble member count — see ensemble::resolve_members
+        // for the cohort-size cap and why it exists.
+        let n_members = if selphi::imputation::ensemble::independent_chains().is_some() { 1 } else {
+            selphi::imputation::ensemble::resolve_members(
+                n_samples, args.phase_ensemble,
+                args.sample_batch_size > 0 || args.phase_only,
+            )
+        };
+        if n_members > 1 {
+            selphi_step!("Diploid intra-run phase ensemble: {} members (1× phasing)", n_members);
+            if n_samples > selphi::imputation::ensemble::ENSEMBLE_COSTLY_ABOVE {
+                // The ensemble runs the imputation HMM once per member. At this
+                // cohort size that map is essentially the whole wall, so N members
+                // means ~N x the run. Say it rather than let it be discovered.
+                selphi_info!("           at {} samples each member costs a full HMM pass \
+(~{}x wall); SELPHI_ENSEMBLE_MAX_SAMPLES=1000 caps it at one member",
+                    n_samples, n_members);
+            }
+        }
+        let mut dp = selphi::diploid::diploid_phase_bm_prefiltered(
+            targ_alleles, common_ref_bm, &common_chip_indices,
+            ref_bm_full.as_ref(),
+            raw_chip_cm, chip_bps,
+            &ref_bp, &map_bp_raw, &map_cm_raw,
+            n_chip, n_samples, n_ref,
+            seed, args.threads, args.max_cond_haps, n_members,
+            ped_locked,
+        );
+        let phased0 = dp.remove(0);
+        (phased0, dp)  // remaining scaffolds = intra-run extra members
     };
-    // The diploid engine estimates Ne inside its MCMC and returns no EM windows.
-    if window_ri.is_empty() {
-        selphi_step!("Phasing complete: {} samples phased", n_samples);
-    } else {
-        selphi_step!("Phasing complete: {} samples phased, {} EM windows",
-            n_samples, window_ri.len());
-    }
-    PhasingResult { phased_alleles: phased, window_ri, ref_bm_full, engine, phase_conf, extra_scaffolds }
-}
-
-/// Convert per-window recombIntensity (`ri`) from phasing into a per-site
-/// effective population size for the imputation HMM.
-///
-/// Phasing EM: `ri = 0.04 * Ne / nHaps_total` (ref + target)
-/// Imputation HMM: `coeff = -0.04 * Ne / n_ref` (ref only)
-/// To preserve the same recomb intensity in the imputation HMM:
-/// `Ne_imp = ri * n_ref / 0.04`.
-fn em_ne_from_window_ri(
-    window_ri: &[(f32, usize, usize)], default_ne_hint: i64,
-    n_chip: usize, n_ref: usize,
-) -> Vec<f64> {
-    let default_ne = if default_ne_hint > 0 { default_ne_hint as f64 } else { 175_000.0 };
-    let mut em_ne = vec![default_ne; n_chip];
-    for (ri, ows, owe) in window_ri {
-        let ne_w = *ri as f64 * n_ref as f64 / 0.04;
-        for i in *ows..*owe {
-            em_ne[i] = ne_w;
-        }
-        selphi_debug!("  EM window [{}-{}): Ne={:.0} (ri={:.6})", ows, owe, ne_w, ri);
-    }
-    em_ne
+    selphi_step!("Phasing complete: {} samples phased", n_samples);
+    PhasingResult { phased_alleles: phased, ref_bm_full, extra_scaffolds }
 }
 
 /// Build the full-chromosome PBWT candidate list once per target haplotype
@@ -725,17 +647,10 @@ fn finalize_batched_outputs(
 /// by -0.005, because Ne is a chain (transition) parameter, not a per-site
 /// parameter — high Ne at any common site causes HMM hap-switching that
 /// pollutes the trajectory through nearby rare sites.
-///
-/// Returns `None` if `--no-em-ne` is off and EM Ne from phasing is present
-/// (caller will use that instead).
 fn compute_maf_adaptive_ne(
-    args: &Args, em_ne_per_site: &Option<Vec<f64>>,
     ref_bm_imp: &selphi::common::HaplotypeBitmatrix,
     est_ne: i64, n_chip: usize, n_ref: usize,
-) -> Option<Vec<f64>> {
-    if em_ne_per_site.is_some() && !args.no_em_ne {
-        return None;
-    }
+) -> Vec<f64> {
     let ne_low = est_ne as f64 * 0.85;   // for rare (MAF < 0.5%)
     let ne_high = est_ne as f64 * 1.2;   // for common (MAF > 2%)
     let mut ne_maf = vec![ne_low; n_chip];
@@ -750,7 +665,7 @@ fn compute_maf_adaptive_ne(
     let n_common = ne_maf.iter().filter(|&&n| n > ne_high - 1.0).count();
     selphi_debug!("  MAF-adaptive Ne: {:.0}(rare)→{:.0}(common), {} rare / {} common / {} transition",
         ne_low, ne_high, n_rare, n_common, n_chip - n_rare - n_common);
-    Some(ne_maf)
+    ne_maf
 }
 
 /// Target load + panel intersection result. Bundles the values the original
@@ -908,7 +823,7 @@ fn build_target_confidence(
 
     // No-call re-route (default ON; opt out SELPHI_NO_NOCALL_REROUTE=1): a MISSING target genotype
     // has zero genotype confidence, so it is re-routed to the LS-imputed dosage instead of the
-    // scaffold value — which the diploid clamps to REF and the haploid fills with a neighbour vote
+    // scaffold value — which the phasing used to clamp to REF
     // (≈70% of missing carriers were emitted as hom-REF). Derived directly from the GT_MISSING
     // sentinel in target_genotypes (independent of --refine and of GQ/PL/DP, which the
     // per-site confidence does not detect for a GT-only chip). Byte-identical when there are no
@@ -1052,9 +967,8 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // 5. Extract target alleles at chip sites (before ref — needed for MAF filter).
     // ROOT-CAUSE FIX: on the PHASING path, encode missing as 128 so the phasing IMPUTES it
     // (Beagle does) instead of conditioning on a false hom-REF — the cause of the ~0.007 phase
-    // gap vs Beagle (+0.0036 R² on haploid, beats Beagle-full). BOTH engines: haploid's
-    // phase_subwindow decodes 128→-1 and imputes; diploid's build_graph marks 128 sites missing
-    // (set_missing → run_mis HMM imputes). After phasing the imputed alleles replace these.
+    // gap vs Beagle. The diploid engine's build_graph marks 128 sites missing (set_missing →
+    // run_mis HMM imputes). After phasing the imputed alleles replace these.
     // The MAF-filter AC sums below MASK 128. Impute-only (no phasing) stays 0 → byte-identical.
     let miss_val_extract: u8 = if needs_phasing_estimate { 128 } else { 0 };
     let targ_alleles = extract_target_alleles(&target_genotypes, &target_idx, n_chip, n_haps, &allele_transforms, miss_val_extract);
@@ -1124,12 +1038,13 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
             &mut target_site_conf, &mut target_site_conf_per_sample);
     }
 
-    // Phase-ensemble: when N>1, phase the target N times with seeds
-    // {seed, seed+1, ..., seed+N-1}. Member 0 flows through the primary locals
-    // below; members 1.. are carried in `extra_phased` and turned into extra
-    // `ImpScaffold`s, whose per-window Li-Stephens weights are averaged with
-    // member 0's before interpolation (marginalizing phase uncertainty). N=1
-    // (default) is byte-identical to the non-ensemble path.
+    // Phase ensemble: member 0 flows through the primary locals below; members
+    // 1.. are carried in `extra_phased` and turned into extra `ImpScaffold`s,
+    // whose per-window Li-Stephens weights are averaged with member 0's before
+    // interpolation (marginalizing phase uncertainty). The members normally come
+    // from the one phasing chain (`pr.extra_scaffolds`); `ensemble_n` > 1 without
+    // them (SELPHI_ENSEMBLE_CHAINS, or one member forced by batching) phases the
+    // target again with seeds {seed+1, ..., seed+N-1}.
     let ensemble_n = if needs_phasing && !args.phase_only {
         selphi::imputation::ensemble::independent_chains()
             .filter(|_| args.sample_batch_size == 0)
@@ -1147,14 +1062,13 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         selphi_step!("Phase-ensemble: {} members (seeds {}..{})", ensemble_n, args.seed, args.seed + ensemble_n as i64 - 1);
     }
 
-    let (targ_alleles, em_ne_per_site, ref_bm_from_phasing, extra_phased, phase_conf_imp) = if needs_phasing {
-        let mut pr = run_phasing_engines(&PhasingInputs {
+    let (targ_alleles, ref_bm_from_phasing, extra_phased) = if needs_phasing {
+        let mut pr = run_phasing(&PhasingInputs {
             args, srp: &srp, map_path,
             targ_alleles: &targ_alleles, raw_chip_cm: &raw_chip_cm, chip_bps: &chip_bps,
             ref_positions: &ref_positions, wgs_idx: &wgs_idx,
             n_chip, n_samples, n_ref, ped_locked: ped_locked.as_deref(), seed: args.seed,
         });
-        let em_ne = em_ne_from_window_ri(&pr.window_ri, args.est_ne, n_chip, n_ref);
 
         if args.phase_only {
             let out_path = selphi::common::utils::out_path(Path::new(output_path), "vcf.gz");
@@ -1168,12 +1082,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
                 start_time.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
             return;
         }
-        // Diploid phasing already feeds its own Ne back through the HMM; for
-        // haploid we forward the per-site EM Ne unless --no-em-ne disables it.
-        let em_ne_to_use = if args.no_em_ne || pr.engine == ResolvedEngine::Diploid { None } else { Some(em_ne) };
-
-        // Extra ensemble members (seeds seed+1 .. seed+N-1). Each member is an
-        // independent phasing run, so they execute in PARALLEL: a single phasing
+        // Independent extra members (seeds seed+1 .. seed+N-1) execute in PARALLEL: a single phasing
         // of few samples leaves CPU cores idle (one sample = 2 haplotypes worth
         // of internal parallelism), so running the members concurrently fills
         // the cores — the speedup is largest for the single-sample
@@ -1182,32 +1091,29 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         // `par_iter().collect()` yields results in member order, so the
         // downstream weight averaging sums in a fixed order. Bit-identical to the
         // serial loop.
-        let extra_phased: Vec<(Vec<u8>, Option<Vec<f64>>)> = if pr.engine == ResolvedEngine::Diploid && !pr.extra_scaffolds.is_empty() {
-            // Diploid intra-run ensemble: the extra members are thinned Main MCMC
-            // samples captured from the SAME phasing chain (≈1× phasing cost, vs N
-            // independent phasings). em_ne is unused for the diploid engine.
+        let extra_phased: Vec<Vec<u8>> = if !pr.extra_scaffolds.is_empty() {
+            // Intra-run ensemble: the extra members are thinned Main MCMC samples
+            // captured from the SAME phasing chain (≈1× phasing cost, vs N
+            // independent phasings).
             let intra = std::mem::take(&mut pr.extra_scaffolds);
             selphi_step!("Diploid intra-run ensemble: averaging {} members from one phasing chain", intra.len() + 1);
-            intra.into_iter().map(|sc| (sc, None)).collect()
+            intra
         } else if let Some(unph) = unphased_for_ensemble.as_ref() {
             selphi_step!("Phase-ensemble: phasing {} extra members in parallel (seeds {}..{})",
                 ensemble_n - 1, args.seed + 1, args.seed + ensemble_n as i64 - 1);
             (1..ensemble_n).into_par_iter().map(|i| {
                 let m_seed = args.seed + i as i64;
-                let pri = run_phasing_engines(&PhasingInputs {
+                run_phasing(&PhasingInputs {
                     args, srp: &srp, map_path,
                     targ_alleles: unph, raw_chip_cm: &raw_chip_cm, chip_bps: &chip_bps,
                     ref_positions: &ref_positions, wgs_idx: &wgs_idx,
                     n_chip, n_samples, n_ref, ped_locked: ped_locked.as_deref(), seed: m_seed,
-                });
-                let emi = em_ne_from_window_ri(&pri.window_ri, args.est_ne, n_chip, n_ref);
-                let emi_use = if args.no_em_ne || pri.engine == ResolvedEngine::Diploid { None } else { Some(emi) };
-                (pri.phased_alleles, emi_use)
+                }).phased_alleles
             }).collect()
         } else {
             Vec::new()
         };
-        (pr.phased_alleles, em_ne_to_use, pr.ref_bm_full, extra_phased, pr.phase_conf)
+        (pr.phased_alleles, pr.ref_bm_full, extra_phased)
     } else {
         if args.phase_only {
             selphi_info!("WARNING: --phase-only requested but input is already phased. Nothing to do (pass --force-phasing to re-phase).");
@@ -1219,21 +1125,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         // — pipes, despite the name — came to be used as the byte-identity gate for
         // PHASING changes it could not possibly exercise.
         selphi_step!("Input is already phased — phasing SKIPPED (pass --force-phasing to re-phase)");
-        (targ_alleles, None, None, Vec::new(), None)
-    };
-
-    // Soft-phase: fold the phasing per-(site,sample) confidence into the
-    // imputation emission confidence. Combine with any --refine confidence by
-    // element-wise MIN (a site soft for EITHER reason is softened). Layout
-    // matches `target_site_conf_per_sample`: row-major [site * n_samples + sample].
-    let target_site_conf_per_sample: Option<Vec<f64>> = match (target_site_conf_per_sample, phase_conf_imp) {
-        (Some(mut refine_c), Some(pc)) => {
-            for (r, &p) in refine_c.iter_mut().zip(pc.iter()) { *r = r.min(p as f64); }
-            Some(refine_c)
-        }
-        (Some(refine_c), None) => Some(refine_c),
-        (None, Some(pc)) => Some(pc.iter().map(|&p| p as f64).collect()),
-        (None, None) => None,
+        (targ_alleles, None, Vec::new())
     };
 
     // 6c. LD correction using shared bitmatrix (no re-extraction from SRP).
@@ -1300,10 +1192,8 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         },
     } = writers;
 
-    // Prefer EM Ne from phasing if available; otherwise fall back to a narrow
-    // MAF-adaptive ramp. See `compute_maf_adaptive_ne` for the rationale.
-    let maf_ne_per_site = compute_maf_adaptive_ne(args, &em_ne_per_site, &ref_bm_imp, est_ne, n_chip, n_ref);
-    let final_ne_per_site: Option<Vec<f64>> = em_ne_per_site.or(maf_ne_per_site);
+    // A narrow MAF-adaptive Ne ramp; see `compute_maf_adaptive_ne` for the rationale.
+    let final_ne_per_site: Option<Vec<f64>> = Some(compute_maf_adaptive_ne(&ref_bm_imp, est_ne, n_chip, n_ref));
 
     // (effective_mc was resolved early, before the memory estimator, so the
     // estimate reflects the actual mc rather than the floor.)
@@ -1348,11 +1238,10 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         n_chip, n_haps, &targ_alleles, n_haps);
     drop(targ_alleles);
 
-    // Phase-ensemble: build the extra members' imputation scaffolds (candidates,
-    // EM-Ne, per-member cross-window prior state). Empty unless --phase-ensemble>1.
-    let mut extra_scaffolds: Vec<selphi::imputation::ensemble::Member> = extra_phased.into_iter().map(|(pa, emi)| {
-        let maf_ne = compute_maf_adaptive_ne(args, &emi, &ref_bm_imp, est_ne, n_chip, n_ref);
-        let final_ne = emi.or(maf_ne);
+    // Phase ensemble: build the extra members' imputation scaffolds (candidates,
+    // Ne, per-member cross-window prior state). Empty with a single member.
+    let mut extra_scaffolds: Vec<selphi::imputation::ensemble::Member> = extra_phased.into_iter().map(|pa| {
+        let final_ne = Some(compute_maf_adaptive_ne(&ref_bm_imp, est_ne, n_chip, n_ref));
         let cand = maybe_precompute_candidates(
             args, output_path, &ref_bm_imp, &pa, &chip_cm,
             panel_anc.as_deref(), target_anc.as_deref(), ancestry_active,

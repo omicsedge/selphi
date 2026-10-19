@@ -433,9 +433,8 @@ pub fn read_cohort_vcf(
     // enter the engine as hom-REF and leave it as a confidently
     // phased REF allele: no missing flag, no neighbour vote, and a systematic REF
     // bias at exactly the rare sites where a carrier's call is most likely to be
-    // absent. The diploid engine marks >1 as missing, votes an allele for it in
-    // the PBWT sweep and fills it from its nearest neighbours before output; the
-    // haploid engine still expects {0,1} and folds in `phase_cohort`.
+    // absent. The phasing engine marks >1 as missing, imputes it in the segment
+    // HMM and fills what remains from its nearest neighbours before output.
     // Real binary BCF → noodles decoder (captures the variant ID for panel output).
     if path.ends_with(".bcf") {
         return read_target_bcf(path, false, true);
@@ -1403,9 +1402,9 @@ pub fn extract_target_alleles(
     // ROOT-CAUSE FIX: the long-standing default folds a MISSING target GT to 0 = hom-REF,
     // which corrupts the phasing (it conditions on a false REF call) — the isolated cause of
     // the ~0.007 phase gap vs Beagle, which IMPUTES missing during phasing. `missing_val=128`
-    // (the haploid missing sentinel) makes the phasing impute it instead. Callers pass 128
-    // ONLY on the haploid+phasing path (after phasing the imputed alleles replace these);
-    // 0 everywhere else (diploid / refine / impute-only) → byte-identical.
+    // (the phasing-path missing sentinel) makes the phasing impute it instead. Callers pass
+    // 128 ONLY on the phasing path (after phasing the imputed alleles replace these);
+    // 0 everywhere else (refine / impute-only) → byte-identical.
     missing_val: u8,
 ) -> Vec<u8> {
     let n_samples = n_haps / 2;

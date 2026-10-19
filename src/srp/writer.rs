@@ -333,7 +333,7 @@ impl SrpPanelWriter {
 /// Build a native tiled SRP directly from an in-memory phased panel.
 ///
 /// `phased` is `n_var × n_haps` row-major allele bytes (0 = ref, ≥1 = alt) —
-/// the layout produced by the phasing engines. `variants` carries one entry
+/// the layout produced by the phasing engine. `variants` carries one entry
 /// per row in the same order. Thin materialized-slice wrapper over
 /// [`SrpPanelWriter`]: a freshly phased cohort held in memory is written as a
 /// live `.srp` without converting through BCF.

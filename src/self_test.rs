@@ -164,7 +164,7 @@ pub fn run(config: &SelfTestConfig) -> u32 {
     // 1. Phase-only. Force phasing so the test produces a VCF even when the
     // smoke-test input happens to already be phased.
     let out = format!("{}_phase", out_base);
-    test!("phase-only (haploid)",
+    test!("phase-only",
         "--refpanel", refpanel, "--input", input, "--map", map, "--out", &out, &t,
         "--phase-only", "--force-phasing");
 

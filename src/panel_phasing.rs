@@ -2,8 +2,8 @@
 //!
 //! Phases an unphased cohort using the cohort itself as the conditioning set
 //! (no external reference panel). Two-stage like SHAPEIT5: phase_common then
-//! phase_rare on the common scaffold — both already inside the diploid /
-//! haploid engines. Entry for `--phase-panel`.
+//! phase_rare on the common scaffold, both inside the diploid engine. Entry for
+//! `--phase-panel`.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -16,7 +16,7 @@ use selphi::srp::writer::{build_srp_from_panel, PanelVariant, SrpPanelWriter};
 use selphi::srp::bref3_writer::write_bref3_from_srp;
 use selphi::srp::bref3::open_bref3_stream;
 
-use crate::cli::{Args, PhasingEngine};
+use crate::cli::Args;
 
 /// Cohort read from any supported input: sample names, per-variant markers,
 /// flat genotypes (n_var × n_haps), and the boolean "input was phased".
@@ -178,15 +178,14 @@ fn parse_region(reg: &str) -> (String, i64, i64) {
 /// are haploid outside the PARs, as the imputation path treats them: their
 /// heterozygous calls there (genotyping errors) and their no-calls are imputed as
 /// one allele on both haplotypes. `build` locates the PARs (`None`:
-/// `--chrx-no-par`, haploid on the whole chromosome). A no-op off chrX and for the
-/// haploid engine.
+/// `--chrx-no-par`, haploid on the whole chromosome). A no-op off chrX.
 #[allow(clippy::too_many_arguments)]
 fn mark_chrx_haploids(
-    engine: PhasingEngine, args: &Args, chrom: &str, sample_names: &[String],
+    args: &Args, chrom: &str, sample_names: &[String],
     geno: &mut [u8], bp: &[i64], n_var: usize, n_samples: usize,
     build: Option<selphi::contig::Build>, detect: bool,
 ) {
-    if engine == PhasingEngine::Haploid || !selphi::contig::is_chrx(chrom) { return; }
+    if !selphi::contig::is_chrx(chrom) { return; }
     let n_haps = n_samples * 2;
     let par: Option<Vec<bool>> = build.map(|b| bp.iter().map(|&p| selphi::contig::in_chrx_par(p, b)).collect());
     let par_ref = par.as_deref();
@@ -226,28 +225,26 @@ fn chrx_build(args: &Args, max_pos: i64) -> Option<selphi::contig::Build> {
     })
 }
 
-/// Phase one cohort block (single chunk or whole panel) with the chosen
+/// Fraction of system RAM given to the phasing chunks' working memory.
+const PANEL_BUDGET_FRAC: f64 = 0.55;
+
+/// Phasing working memory per variant of a chunk: the engine is bounded by its
+/// common-only 4 cM windows, ~25 KB/var on 1KG chr22 at 16 threads (n_haps × 4 × 1.5).
+fn panel_per_var_bytes(n_haps: usize) -> f64 {
+    n_haps as f64 * 4.0 * 1.5
+}
+
+/// Phase one cohort block (single chunk or whole panel) with the diploid
 /// engine, n_ref=0 self-phasing, on `n_threads` threads. Returns phased
 /// (n_var × n_haps).
 fn phase_cohort(
-    engine: PhasingEngine, args: &Args, n_threads: usize,
+    args: &Args, n_threads: usize,
     geno: &[u8], bp: &[i64], map_bp: &[i64], map_cm: &[f64],
     n_var: usize, n_samples: usize,
 ) -> Vec<u8> {
-    let (phased, _r) = match engine {
-        PhasingEngine::Haploid => {
-            // The haploid engine has no missing-genotype state: fold the >1
-            // sentinel to REF here, preserving this opt-in path's allele encoding.
-            let folded: Vec<u8> = geno.iter().map(|&a| if a > 1 { 0 } else { a }).collect();
-            selphi::haploid::phase_panel(
-                &folded, bp, map_bp, map_cm, n_var, n_samples,
-                args.seed, n_threads, args.max_windows)
-        }
-        _ => selphi::diploid::diploid_phase_panel(
-            geno, bp, map_bp, map_cm, n_var, n_samples,
-            args.seed, n_threads, args.max_cond_haps),
-    };
-    phased
+    selphi::diploid::diploid_phase_panel(
+        geno, bp, map_bp, map_cm, n_var, n_samples,
+        args.seed, n_threads, args.max_cond_haps)
 }
 
 /// Auto-chunked panel phasing with ligation. Splits [0,n_var) into chunks of
@@ -258,7 +255,7 @@ fn phase_cohort(
 /// vote). This is the SHAPEIT5 chunk+ligate strategy in a single command.
 #[allow(clippy::too_many_arguments)]
 fn phase_panel_chunked(
-    engine: PhasingEngine, args: &Args,
+    args: &Args,
     cohort_geno: &[u8], bp: &[i64], map_bp: &[i64], map_cm: &[f64],
     n_var: usize, n_samples: usize,
     per_var_bytes: f64, work_budget_gb: f64, n_threads: usize,
@@ -314,10 +311,8 @@ fn phase_panel_chunked(
         if e == n_var { break; }
         s += step;
     }
-    selphi_step!("Auto-chunking: {} chunks of ≤{} variants (overlap {}), {} engine, {}-way parallel × {} threads",
-        chunks.len(), chunk_vars, overlap,
-        if engine == PhasingEngine::Haploid { "haploid" } else { "diploid" },
-        n_parallel, threads_per);
+    selphi_step!("Auto-chunking: {} chunks of ≤{} variants (overlap {}), {}-way parallel × {} threads",
+        chunks.len(), chunk_vars, overlap, n_parallel, threads_per);
 
     // Phase chunks (memory-bounded parallelism), then ligate sequentially.
     // Each chunk is phased inside its own rayon pool of `threads_per` threads
@@ -331,11 +326,11 @@ fn phase_panel_chunked(
     if n_parallel <= 1 {
         // Sequential: phase one chunk, ligate it, drop it. Keeps peak memory
         // at cohort_geno + global + ONE chunk working set — the lean path for
-        // the memory-heavy haploid-on-biobank case.
+        // a biobank-scale cohort.
         for (ci, &(cs, ce)) in chunks.iter().enumerate() {
             let cn = ce - cs;
             let t0 = std::time::Instant::now();
-            let cphased = phase_cohort(engine, args, threads_per,
+            let cphased = phase_cohort(args, threads_per,
                 &cohort_geno[cs * n_haps..ce * n_haps], &bp[cs..ce],
                 map_bp, map_cm, cn, n_samples);
             selphi_step!("  chunk {}/{} [{}..{}) phased in {:.0}s [{:.0} MB]",
@@ -362,7 +357,7 @@ fn phase_panel_chunked(
                         let cn = ce - cs;
                         let t0 = std::time::Instant::now();
                         let r = pool.install(|| phase_cohort(
-                            engine, args, threads_per,
+                            args, threads_per,
                             &cohort_geno[cs * n_haps..ce * n_haps], &bp[cs..ce],
                             map_bp, map_cm, cn, n_samples));
                         selphi_step!("  chunk {}/{} [{}..{}) phased in {:.0}s [{:.0} MB]",
@@ -543,52 +538,28 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
     let (map_bp, map_cm) = genmap::load_genetic_map_for(Path::new(map_path), markers.first().map(|m| m.chrom.as_str()))
         .unwrap_or_else(|e| { selphi_error!("Cannot read genetic map {}: {}", map_path, e); std::process::exit(1); });
 
-    // 4. Resolve engine. Panel phasing has no chip/WGS split — honour the
-    //    explicit choice; default (auto) → diploid (the SHAPEIT5-style engine
-    //    built for panel construction).
-    let engine = match args.phasing_engine {
-        PhasingEngine::Haploid => PhasingEngine::Haploid,
-        _ => PhasingEngine::Diploid,
-    };
-    // chrX: men are haploid outside the PARs (diploid engine).
+    // 4. chrX: men are haploid outside the PARs.
     if let Some(m0) = markers.first() {
         let build = chrx_build(args, bp.iter().copied().max().unwrap_or(0));
-        mark_chrx_haploids(engine, args, &m0.chrom, &sample_names, &mut cohort_geno, &bp, n_var, n_samples, build, true);
+        mark_chrx_haploids(args, &m0.chrom, &sample_names, &mut cohort_geno, &bp, n_var, n_samples, build, true);
     }
 
-    // 5. Decide single-shot vs auto-chunked, ENGINE-AWARE. The two engines
-    //    have very different per-variant footprints on dense WGS (measured on
-    //    1KG chr22, 2401 samples × 1.07M variants): diploid ~27 GB (bounded
-    //    4cM windows), haploid ~118 GB (40cM windows hold ~all variants, the
-    //    fwd/bwd scratch × N_MOSAIC × threads explodes). Per-chunk working
-    //    memory ≈ chunk_vars × per_var_bytes(engine); choose chunk_vars so a
-    //    chunk fits a safe budget, then ligate. The full output array
-    //    (n_var × n_haps) is held once for writing regardless.
+    // 5. Decide single-shot vs auto-chunked. On dense WGS (1KG chr22, 2401
+    //    samples × 1.07M variants) the engine's working set is ~27 GB (bounded
+    //    4cM windows). Per-chunk working memory ≈ chunk_vars × per_var_bytes;
+    //    choose chunk_vars so a chunk fits a safe budget, then ligate. The full
+    //    output array (n_var × n_haps) is held once for writing regardless.
     let sys_gb = selphi::log::system_ram_mb() / 1024.0;
     let n_threads = args.threads.max(1);
     // Budget for ONE chunk's working memory; leave room for the output array
-    // (held once) + overhead. Haploid gets a tighter fraction — it has the
-    // larger, less-predictable footprint and OOM forces an instance reset.
-    let budget_frac = if matches!(engine, PhasingEngine::Haploid) { 0.50 } else { 0.55 };
+    // (held once) + overhead.
+    let budget_frac = PANEL_BUDGET_FRAC;
     // Reserve TWO full output arrays: the input cohort_geno (held throughout)
     // and the phased output, both n_var × n_haps bytes. What's left is the
     // budget for the per-chunk working set(s).
     let array_gb = n_var as f64 * n_haps as f64 / 1e9;
     let budget_gb = (budget_frac * sys_gb - 2.0 * array_gb).max(4.0);
-    // per_var_bytes calibrated to MEASURED working-set peaks on 1KG chr22 at
-    // 16 threads, across TWO cohort sizes so it scales with n_haps (a fixed
-    // constant over-chunks small cohorts — e.g. 54 children needlessly split
-    // into 10 chunks):
-    //   - 54 samples (108 haps):  ~37 KB/var
-    //   - 2401 samples (4802 haps): ~420 KB/var
-    // Linear fit ≈ 85 B/var per hap (× threads/16 for the per-thread HMM
-    // scratch) + 30 KB/var fixed (composites, w_hap_bits, output stride).
-    // Diploid is bounded by common-only 4cM windows: ~25 KB/var (n_haps×4×1.5).
-    let per_var_bytes = match engine {
-        PhasingEngine::Haploid =>
-            85.0 * n_haps as f64 * (n_threads as f64 / 16.0).max(0.25) + 30_000.0,
-        _ => n_haps as f64 * 4.0 * 1.5,
-    };
+    let per_var_bytes = panel_per_var_bytes(n_haps);
     let max_chunk_vars = if args.chunk_vars > 0 {
         args.chunk_vars // explicit override (testing / manual control)
     } else {
@@ -596,13 +567,12 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
     };
     let phased: Vec<u8> = if args.chunk_vars == 0 && n_var <= max_chunk_vars {
         // Single-shot: fits the budget.
-        selphi_step!("Phasing {} engine, single-shot ({} variants, budget {:.0} GB/chunk)",
-            if engine == PhasingEngine::Haploid { "haploid" } else { "diploid" }, n_var, budget_gb);
-        phase_cohort(engine, args, n_threads, &cohort_geno, &bp, &map_bp, &map_cm, n_var, n_samples)
+        selphi_step!("Phasing single-shot ({} variants, budget {:.0} GB/chunk)", n_var, budget_gb);
+        phase_cohort(args, n_threads, &cohort_geno, &bp, &map_bp, &map_cm, n_var, n_samples)
     } else {
         // Auto-chunked + ligated, with memory-bounded parallelism across chunks.
         phase_panel_chunked(
-            engine, args, &cohort_geno, &bp, &map_bp, &map_cm,
+            args, &cohort_geno, &bp, &map_bp, &map_cm,
             n_var, n_samples, per_var_bytes, budget_gb, n_threads, args.chunk_vars,
         )
     };
@@ -792,14 +762,13 @@ fn run_streaming(args: &Args, input_path: &str, output_path: &str, map_path: &st
     }
     selphi_step!("Cohort: {} samples, {} variants (streaming, re-phasing)", n_samples, n_var);
 
-    // 2. Genetic map + engine.
+    // 2. Genetic map.
     let (map_bp, map_cm) = genmap::load_genetic_map_for(Path::new(map_path), Some(chrom.as_str()))
         .unwrap_or_else(|e| { selphi_error!("Cannot read genetic map {}: {}", map_path, e); std::process::exit(1); });
-    let engine = match args.phasing_engine { PhasingEngine::Haploid => PhasingEngine::Haploid, _ => PhasingEngine::Diploid };
     let chrx_build_all = chrx_build(args, bp.iter().copied().max().unwrap_or(0));
     // A chunk is too short to tell men by heterozygosity: streamed, chrX takes men
     // from --haploids only.
-    if engine == PhasingEngine::Diploid && selphi::contig::is_chrx(&chrom) && args.haploids.is_none() {
+    if selphi::contig::is_chrx(&chrom) && args.haploids.is_none() {
         selphi_info!("  NOTE: chrX is streamed chunk by chunk: men are phased as haploid outside the PARs only with --haploids.");
     }
     let n_threads = args.threads.max(1);
@@ -807,12 +776,8 @@ fn run_streaming(args: &Args, input_path: &str, output_path: &str, map_path: &st
     // 3. Chunk sizing — same per_var_bytes as run(); NO 2×array reservation
     //    (streaming holds no full arrays), so the whole budget funds chunks.
     let sys_gb = selphi::log::system_ram_mb() / 1024.0;
-    let budget_frac = if matches!(engine, PhasingEngine::Haploid) { 0.50 } else { 0.55 };
-    let budget_gb = (budget_frac * sys_gb).max(4.0);
-    let per_var_bytes = match engine {
-        PhasingEngine::Haploid => 85.0 * n_haps as f64 * (n_threads as f64 / 16.0).max(0.25) + 30_000.0,
-        _ => n_haps as f64 * 4.0 * 1.5,
-    };
+    let budget_gb = (PANEL_BUDGET_FRAC * sys_gb).max(4.0);
+    let per_var_bytes = panel_per_var_bytes(n_haps);
     let chunk_vars = if args.chunk_vars > 0 { args.chunk_vars }
         else { ((budget_gb * 1e9 / per_var_bytes) as usize).max(20_000) }.min(n_var);
     let overlap = (chunk_vars / 20).clamp(2_000, 30_000).min(chunk_vars / 2);
@@ -832,9 +797,8 @@ fn run_streaming(args: &Args, input_path: &str, output_path: &str, map_path: &st
         if e >= n_var { break; }
         s = snap((s + step).min(n_var));
     }
-    selphi_step!("STREAMING: {} chunks of ≤{} vars (overlap {}), {} engine, {} threads, budget {:.0} GB",
-        chunks.len(), chunk_vars, overlap,
-        if engine == PhasingEngine::Haploid { "haploid" } else { "diploid" }, n_threads, budget_gb);
+    selphi_step!("STREAMING: {} chunks of ≤{} vars (overlap {}), {} threads, budget {:.0} GB",
+        chunks.len(), chunk_vars, overlap, n_threads, budget_gb);
 
     // 4. Output VCF.gz (incremental) + streaming chunk loop.
     let out_path = PathBuf::from(output_path);
@@ -869,9 +833,8 @@ fn run_streaming(args: &Args, input_path: &str, output_path: &str, map_path: &st
             selphi_error!("chunk {} alignment: read {} variants, expected {} ([{}..{}) pos {}..{}) — boundary split?",
                 ci, rv.len(), cn, cs, ce, bp[cs], bp[ce - 1]); std::process::exit(1);
         }
-        // Flatten to (cn × n_haps). The missing sentinel (>1) is kept: the diploid
-        // engine treats it as a no-call (see read_cohort_vcf); phase_cohort folds
-        // it only for the haploid engine.
+        // Flatten to (cn × n_haps). The missing sentinel (>1) is kept: the phasing
+        // engine treats it as a no-call (see read_cohort_vcf).
         let mut chunk_geno = vec![0u8; cn * n_haps];
         for (vi, g) in geno.iter().enumerate() {
             for (si, &[a0, a1]) in g.iter().enumerate() {
@@ -879,8 +842,8 @@ fn run_streaming(args: &Args, input_path: &str, output_path: &str, map_path: &st
                 chunk_geno[vi * n_haps + si * 2 + 1] = a1;
             }
         }
-        mark_chrx_haploids(engine, args, &chrom, &sample_names, &mut chunk_geno, &bp[cs..ce], cn, n_samples, chrx_build_all, false);
-        let cphased = phase_cohort(engine, args, n_threads, &chunk_geno, &bp[cs..ce], &map_bp, &map_cm, cn, n_samples);
+        mark_chrx_haploids(args, &chrom, &sample_names, &mut chunk_geno, &bp[cs..ce], cn, n_samples, chrx_build_all, false);
+        let cphased = phase_cohort(args, n_threads, &chunk_geno, &bp[cs..ce], &map_bp, &map_cm, cn, n_samples);
         drop(chunk_geno);
 
         let (finalized, emit_start) = if ci == 0 {

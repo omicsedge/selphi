@@ -418,9 +418,9 @@ fn compute_estimate_mb(
         + hap_posterior_mb + stripe_decomp_mb + interp_mb + vcf_mb + bgzf_mb
         + thread_local_mb + overhead_mb;
     if needs_phasing {
-        // Phasing-only extras. Sized for one phasing window (the haploid /
-        // diploid engines operate on similar window scales as the imputation
-        // HMM — reuse the same `window_chip_vars` derivation).
+        // Phasing-only extras. Sized for one phasing window (the phasing
+        // engine operates on similar window scales as the imputation HMM —
+        // reuse the same `window_chip_vars` derivation).
         let n_total_haps = n_ref + n_haps;
         let hap_bits_mb = (n_total_haps as f64 * window_chip_vars as f64 / 8.0) / 1e6;
         let n_steps = (window_chip_vars / 10).max(1);

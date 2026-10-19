@@ -18,10 +18,7 @@ pub mod contig;
 pub mod srp;
 pub mod genmap;
 
-// Haploid phasing engine
-pub mod haploid;
-
-// Diploid phasing engine
+// Phasing engine (genotype graph + diplotype segment HMM)
 pub mod diploid;
 
 // Imputation engine

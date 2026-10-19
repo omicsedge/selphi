@@ -1,6 +1,5 @@
-//! Diploid phasing: genotype graph + segment HMM + phase_rare.
-//!
-//! Activated by `--wgs-phasing`. Optimized for WGS data with rare variants.
+//! Diploid phasing: genotype graph + segment HMM + phase_rare. Selphi's phasing
+//! engine for every input (chip arrays, WGS, `--phase-panel`).
 //! Two-stage: phase_common (iterative MCMC) → phase_rare (scaffold interpolation).
 //!
 //! Key optimization: phase_common operates only on COMMON variants (MAF ≥ 0.001),
@@ -40,7 +39,7 @@ pub fn diploid_phase_panel(
     bp: &[i64], map_bp: &[i64], map_cm: &[f64],
     n_var: usize, n_samples: usize, seed: i64, n_threads: usize,
     max_cond_haps: usize,
-) -> (Vec<u8>, Vec<(f32, usize, usize)>) {
+) -> Vec<u8> {
     let seed = if seed == 33 { 15052011 } else { seed };
     let n_haps = n_samples * 2;
 
@@ -71,7 +70,7 @@ pub fn diploid_phase_panel(
         n_common, n_var, n_samples * 2, n_missing_alleles);
     if common_indices.is_empty() {
         crate::selphi_info!("  WARNING: no common variants — returning input unphased");
-        return (cohort_geno.to_vec(), vec![]);
+        return cohort_geno.to_vec();
     }
 
     // cM positions (full + common subset), baseline at first common variant.
@@ -97,13 +96,13 @@ pub fn diploid_phase_panel(
     let _ = n_haps; // documented; used inside _diploid_run
 
     // De-novo panel phasing returns a single phased scaffold (no intra-run ensemble).
-    let (mut scaffolds, window_ri) = _diploid_run(
+    let mut scaffolds = _diploid_run(
         cohort_geno, empty_ref, &common_indices, None,
         CommonPrep { target_geno_common, cm_common, cm_full, bp_common },
         bp, n_var, n_samples, /* n_ref = */ 0, seed, n_threads, max_cond_haps, 1,
         None,
     );
-    (scaffolds.remove(0), window_ri)
+    scaffolds.remove(0)
 }
 
 /// Diploid phasing with pre-filtered common_ref_bm (no full ref_bm ever allocated).
@@ -124,7 +123,7 @@ pub fn diploid_phase_bm_prefiltered(
     // VAR_SCA (pre-phased) in the genotype graph, so the segment HMM carries
     // them as one orientation per segment instead of re-sampling each one.
     ped_locked: Option<&[bool]>,
-) -> (Vec<Vec<u8>>, Vec<(f32, usize, usize)>) {
+) -> Vec<Vec<u8>> {
     let seed = if seed == 33 { 15052011 } else { seed };
     let n_haps = n_samples * 2;
     let _n_haps_total = n_ref + n_haps;
@@ -208,7 +207,7 @@ fn _diploid_run(
     // (n_common × n_samples) `--ped` lock mask, already restricted to the
     // common-variant subset. None on every path without a pedigree.
     locked_common: Option<&[bool]>,
-) -> (Vec<Vec<u8>>, Vec<(f32, usize, usize)>) {
+) -> Vec<Vec<u8>> {
     use rayon::prelude::*;
     let seed = if seed == 33 { 15052011 } else { seed };
     let n_haps = n_samples * 2;
@@ -299,7 +298,7 @@ fn _diploid_run(
     // (> 1), read straight from `target_geno` (row-major n_var x n_haps, the same
     // layout as the scaffold), so no n_var x n_haps mask is materialised.
     let nocall_ref = crate::config::is_one("SELPHI_DIPLOID_NOCALL_REF");
-    let nocall_k = crate::config::usize_or("SELPHI_HAPLOID_NOCALL_K", 50);
+    let nocall_k = crate::config::usize_or("SELPHI_DIPLOID_NOCALL_K", 50);
     let any_nocall = !nocall_ref && target_geno[..n_var * n_haps].iter().any(|&g| g > 1);
     // Common-variant no-calls phase_common imputed itself (kept missing in its
     // graphs and imputed by the segment HMM) keep that allele: the vote fills only
@@ -393,13 +392,10 @@ fn _diploid_run(
     crate::selphi_debug!("  [diploid] scaffolds (rare phasing + no-call fill): {:.0}ms rss={:.0}MB hwm={:.0}MB",
         t_scaffolds.elapsed().as_secs_f64() * 1e3, crate::log::rss_mb(), crate::log::peak_mem_mb());
 
-    // EM-estimated Ne not returned as window_ri for now (diploid uses different HMM structure)
-    let window_ri = vec![];
-
     crate::selphi_debug!("  Phasing complete ({} ensemble member{})",
         scaffolds.len(), if scaffolds.len() == 1 { "" } else { "s" });
 
-    (scaffolds, window_ri)
+    scaffolds
 }
 
 /// Ordinals (among the Main iterations, 0-based) of the MCMC samples used as
@@ -418,8 +414,7 @@ pub(crate) fn ensemble_main_iters(n_members: usize, n_main_iters: usize) -> Vec<
 /// PBWT built over the target phased haplotypes plus the full-chip reference
 /// panel. Sweeps markers right-to-left so the PBWT prefix at marker `m` is
 /// sorted by the suffix `(m+1..]` — the standard reverse-PBWT match context.
-/// Mirrors the haploid no-call vote (`phase_subwindow`) so both engines hand the
-/// imputer a real local-haplotype scaffold at no-calls.
+/// The imputer then sees a real local-haplotype scaffold at no-calls.
 ///
 /// `phased` is `n_var * n_targ` (row-major, target haps only). Missing neighbours
 /// (other not-yet-voted no-calls) carry allele `-1` and are skipped in the tally.
@@ -575,7 +570,10 @@ fn fill_missing_local_vote_legacy(
         // Advance the prefix using the PREVIOUS marker's alleles (the suffix m+1..),
         // so `a` is now sorted by the suffix to the right of m.
         if have_prev {
-            crate::haploid::pbwt::pbwt_update_prefix(&mut a, &alleles, n_haps);
+            // Stable partition of the prefix by the previous marker's allele
+            // (no-call or REF first, ALT after).
+            let (zero, one): (Vec<i32>, Vec<i32>) = a.iter().partition(|&&h| alleles[h as usize] <= 0);
+            a = [zero, one].concat();
         }
         // Lay down this marker's alleles: target haps (no-call -> -1), then ref haps.
         for h in 0..n_targ {

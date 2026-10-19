@@ -37,11 +37,6 @@ pub struct MultiChrImputeConfig {
     /// `--p-err` given: a fixed emission floor (no adaptive floor).
     pub p_err_fixed: bool,
     pub no_ap: bool,
-    pub no_em_ne: bool,
-    pub phasing_engine: String,  // "auto", "haploid", "diploid"
-    /// `--wgs-phasing` (deprecated alias): forces the diploid engine regardless
-    /// of `phasing_engine`. Mirrors single-chr resolve_phasing_engine.
-    pub wgs_phasing: bool,
     pub force_phasing: bool,
     /// `--max-cond-haps`: cap on conditioning haps for diploid phasing (0 = unlimited).
     pub max_cond_haps: usize,
@@ -105,9 +100,6 @@ impl MultiChrImputeConfig {
             p_err: args.p_err.unwrap_or(crate::cli::DEFAULT_P_ERR),
             p_err_fixed: args.p_err.is_some(),
             no_ap: args.no_ap,
-            no_em_ne: args.no_em_ne,
-            phasing_engine: format!("{:?}", args.phasing_engine).to_lowercase(),
-            wgs_phasing: args.wgs_phasing,
             force_phasing: args.force_phasing,
             max_cond_haps: args.max_cond_haps,
             fl_fwd: args.fl_fwd,
@@ -147,7 +139,6 @@ fn warn_unsupported(args: &crate::cli::Args) {
     if args.export_local_ancestry { dropped.push("--export-local-ancestry"); }
     if args.panel_ancestry.is_some() { dropped.push("--panel-ancestry"); }
     if args.target_ancestry.is_some() { dropped.push("--target-ancestry"); }
-    if args.max_windows > 0 { dropped.push("--max-windows"); }
     if dropped.is_empty() { return; }
     selphi_info!("  WARNING: the multi-chromosome path does not implement the following, \
 and they are being IGNORED — run per chromosome to use them:");
@@ -359,14 +350,15 @@ fn precompute_candidates_for(
     }).collect())
 }
 
-/// Phase one chromosome's target (when phasing is needed) and return the
-/// possibly-rephased target alleles, the EM-Ne-per-site vector (always None on
-/// this path) and the phasing-side reference bitmatrix (Some when phasing ran,
-/// so the caller can reuse it for imputation). Pure code motion of the per-chr
-/// phasing block of `run_multi_chr`: the engine selection, the common-MAF
-/// subset computation, every `phase_genotypes`/`diploid_phase_bm_prefiltered`
-/// call, every argument and every log line are identical to the inline block.
+/// Phase one chromosome's target (when phasing is needed) with the diploid
+/// engine and return the phased target alleles, the extra intra-run ensemble
+/// members, and the phasing-side reference bitmatrix (Some when phasing ran, so
+/// the caller can reuse it for imputation). Diploid phasing is per-chr
+/// self-contained (no cross-chr state), so this equals the single-chr engine on
+/// each chr; it mirrors `run_phasing` (imputation_pipeline.rs).
 /// When `needs_phasing` is false the input `targ_alleles` are returned unchanged.
+/// A chromosome with no called target genotype has nothing to phase: its alleles
+/// are returned unphased, see [`unphased_passthrough`].
 #[allow(clippy::too_many_arguments)]
 fn phase_chr(
     needs_phasing: bool,
@@ -383,109 +375,74 @@ fn phase_chr(
     n_members: usize,
     ped_locked: Option<&[bool]>,
     config: &MultiChrImputeConfig,
-) -> (Vec<u8>, Vec<Vec<u8>>, Option<Vec<f64>>, Option<selphi::common::HaplotypeBitmatrix>) {
-    if needs_phasing {
-        let (map_bp_raw, map_cm_raw) = multi_map.get(
-            chr_name.strip_prefix("chr").unwrap_or(chr_name)
-        ).cloned().unwrap_or_else(|| {
-            multi_map.get(chr_name).cloned().unwrap_or_default()
-        });
-        let ref_bp: Vec<i64> = srp.variants.iter().map(|v| v.pos).collect();
-
-        // Extract bitmatrix for phasing
-        let ref_bm = srp.extract_ref_alleles_bitmatrix(wgs_idx);
-
-        // Engine selection: auto (the default) → diploid for ALL inputs, or
-        // user override. Diploid phasing is per-chr self-contained (no cross-chr
-        // state), so it is equivalent to running the single-chr diploid engine on
-        // each chr; we mirror run_phasing_engines (imputation_pipeline.rs) exactly.
-        let use_diploid = config.wgs_phasing
-            || config.phasing_engine == "diploid"
-            || config.phasing_engine == "auto";
-        let phased = if use_diploid {
-            // Common-MAF chip subset (MAF >= 0.001 on target). Diploid phases
-            // common variants; rare ones are re-imputed/woven by phase_rare.
-            let _target_an = (n_samples * 2) as u32;
-            // Threshold is over the TARGET COHORT's frequency, so the scaffold
-            // shrinks with the batch; SELPHI_DIPLOID_SCAFFOLD_MAF overrides it and
-            // SELPHI_DIPLOID_SCAFFOLD_SOURCE=panel|union reads the panel's frequency
-            // too. Same selection as the single-chr path (diploid::scaffold).
-            let scaffold_maf = selphi::config::f32_or("SELPHI_DIPLOID_SCAFFOLD_MAF", 0.001);
-            let scaffold = selphi::diploid::scaffold::select(
-                &targ_alleles, n_chip, n_samples, Some(&ref_bm),
-                selphi::diploid::scaffold::Source::from_env(), scaffold_maf);
-            if scaffold.widened {
-                selphi_info!("    Phasing: no site clears the scaffold threshold (no heterozygous call, \
-e.g. a male chrX): phasing on all {} called sites", scaffold.indices.len());
-            }
-            let common_chip_indices = scaffold.indices;
-            if common_chip_indices.is_empty() {
-                // No called target genotype at all on this chromosome — fall back to haploid.
-                selphi_info!("    Phasing: diploid requested but no called target genotype; using haploid");
-                let (phased, _ri, _conf) = selphi::haploid::phase_genotypes(
-                    &targ_alleles, &ref_bm, raw_chip_cm, chip_bps,
-                    &ref_bp, &map_bp_raw, &map_cm_raw,
-                    n_chip, n_samples, n_ref, config.seed, config.threads, 0,
-                );
-                (phased, Vec::new())
-            } else {
-                selphi_info!("    Phasing: diploid engine ({} / {} common-MAF variants)",
-                    common_chip_indices.len(), n_chip);
-                let common_ref_bm =
-                    selphi::diploid::pbwt_neighbor::HaplotypeBitmatrix::from_subset(
-                        &ref_bm, &common_chip_indices);
-                // Intra-run phase ensemble: `n_members` thinned Main-MCMC samples
-                // out of ONE chain (1x phasing cost). Member 0 is the Viterbi
-                // solve; the rest are folded into the per-window weights before
-                // interpolation by imputation::ensemble.
-                let (mut scaffolds, _ri) = selphi::diploid::diploid_phase_bm_prefiltered(
-                    &targ_alleles, common_ref_bm, &common_chip_indices, Some(&ref_bm),
-                    raw_chip_cm, chip_bps, &ref_bp, &map_bp_raw, &map_cm_raw,
-                    n_chip, n_samples, n_ref,
-                    config.seed, config.threads, config.max_cond_haps, n_members,
-                    ped_locked,
-                );
-                let member0 = scaffolds.remove(0);
-                if scaffolds.len() + 1 > 1 {
-                    selphi_info!("    Phase ensemble: {} members from one phasing chain",
-                        scaffolds.len() + 1);
-                }
-                (member0, scaffolds)
-            }
-        } else {
-            selphi_info!("    Phasing: haploid engine");
-            let (phased, _switch_info, _conf) = selphi::haploid::phase_genotypes(
-                &targ_alleles, &ref_bm, raw_chip_cm, chip_bps,
-                &ref_bp, &map_bp_raw, &map_cm_raw,
-                n_chip, n_samples, n_ref,
-                config.seed, config.threads, 0,
-            );
-            // The haploid engine's greedy swap converges to one solution rather
-            // than sampling a posterior, so it has no intra-run members: an
-            // ensemble here means N INDEPENDENT phasings, seeds {seed..seed+N-1},
-            // which is what --phase-ensemble asks for and what the single-chr
-            // pipeline does for this engine. Only run when explicitly requested.
-            let extras: Vec<Vec<u8>> = if config.phase_ensemble > 1 {
-                selphi_info!("    Phase ensemble: {} independent haploid phasings (seeds {}..{})",
-                    config.phase_ensemble, config.seed, config.seed + config.phase_ensemble as i64 - 1);
-                (1..config.phase_ensemble).into_par_iter().map(|i| {
-                    let (pa, _si, _c) = selphi::haploid::phase_genotypes(
-                        &targ_alleles, &ref_bm, raw_chip_cm, chip_bps,
-                        &ref_bp, &map_bp_raw, &map_cm_raw,
-                        n_chip, n_samples, n_ref,
-                        config.seed + i as i64, config.threads, 0,
-                    );
-                    pa
-                }).collect()
-            } else {
-                Vec::new()
-            };
-            (phased, extras)
-        };
-        (phased.0, phased.1, None::<Vec<f64>>, Some(ref_bm))
-    } else {
-        (targ_alleles, Vec::new(), None::<Vec<f64>>, None::<selphi::common::HaplotypeBitmatrix>)
+) -> (Vec<u8>, Vec<Vec<u8>>, Option<selphi::common::HaplotypeBitmatrix>) {
+    if !needs_phasing {
+        return (targ_alleles, Vec::new(), None);
     }
+    let (map_bp_raw, map_cm_raw) = multi_map.get(
+        chr_name.strip_prefix("chr").unwrap_or(chr_name)
+    ).cloned().unwrap_or_else(|| {
+        multi_map.get(chr_name).cloned().unwrap_or_default()
+    });
+    let ref_bp: Vec<i64> = srp.variants.iter().map(|v| v.pos).collect();
+
+    // Extract bitmatrix for phasing
+    let ref_bm = srp.extract_ref_alleles_bitmatrix(wgs_idx);
+
+    // Common-MAF chip subset (MAF >= 0.001 on target). Diploid phases
+    // common variants; rare ones are re-imputed/woven by phase_rare.
+    // Threshold is over the TARGET COHORT's frequency, so the scaffold
+    // shrinks with the batch; SELPHI_DIPLOID_SCAFFOLD_MAF overrides it and
+    // SELPHI_DIPLOID_SCAFFOLD_SOURCE=panel|union reads the panel's frequency
+    // too. Same selection as the single-chr path (diploid::scaffold).
+    let scaffold_maf = selphi::config::f32_or("SELPHI_DIPLOID_SCAFFOLD_MAF", 0.001);
+    let scaffold = selphi::diploid::scaffold::select(
+        &targ_alleles, n_chip, n_samples, Some(&ref_bm),
+        selphi::diploid::scaffold::Source::from_env(), scaffold_maf);
+    if scaffold.widened {
+        selphi_info!("    Phasing: no site clears the scaffold threshold (no heterozygous call, \
+e.g. a male chrX): phasing on all {} called sites", scaffold.indices.len());
+    }
+    let common_chip_indices = scaffold.indices;
+    if common_chip_indices.is_empty() {
+        selphi_info!("    Phasing: no called target genotype on this chromosome; nothing to phase, its genotypes are imputed as they are");
+        return (unphased_passthrough(targ_alleles), Vec::new(), Some(ref_bm));
+    }
+    selphi_info!("    Phasing: diploid engine ({} / {} common-MAF variants)",
+        common_chip_indices.len(), n_chip);
+    let common_ref_bm =
+        selphi::diploid::pbwt_neighbor::HaplotypeBitmatrix::from_subset(
+            &ref_bm, &common_chip_indices);
+    // Intra-run phase ensemble: `n_members` thinned Main-MCMC samples
+    // out of ONE chain (1x phasing cost). Member 0 is the Viterbi
+    // solve; the rest are folded into the per-window weights before
+    // interpolation by imputation::ensemble.
+    let mut scaffolds = selphi::diploid::diploid_phase_bm_prefiltered(
+        &targ_alleles, common_ref_bm, &common_chip_indices, Some(&ref_bm),
+        raw_chip_cm, chip_bps, &ref_bp, &map_bp_raw, &map_cm_raw,
+        n_chip, n_samples, n_ref,
+        config.seed, config.threads, config.max_cond_haps, n_members,
+        ped_locked,
+    );
+    let member0 = scaffolds.remove(0);
+    if scaffolds.len() + 1 > 1 {
+        selphi_info!("    Phase ensemble: {} members from one phasing chain",
+            scaffolds.len() + 1);
+    }
+    (member0, scaffolds, Some(ref_bm))
+}
+
+/// The target alleles of a chromosome that phasing leaves alone because no
+/// target genotype on it is called. They enter imputation in its unphased
+/// encoding, the one a chromosome that skips phasing gets: a missing allele
+/// (any value above 1, the phasing-path sentinels) reads as 0, and the no-calls
+/// stay marked in the per-site confidence the caller built, so imputation fills
+/// them.
+fn unphased_passthrough(mut targ_alleles: Vec<u8>) -> Vec<u8> {
+    for a in targ_alleles.iter_mut() {
+        if *a > 1 { *a = 0; }
+    }
+    targ_alleles
 }
 
 /// Run multi-chromosome imputation from a unified multi-chr SRP file.
@@ -705,15 +662,6 @@ pub fn run_multi_chr(
     // 6. Process each chromosome with prefetch overlap
     let mut prefetch_result: Option<ChrPrefetchResult> = None;
 
-    // Two single-chr mechanisms this path does not carry. They were silent no-ops;
-    // say so once, at the top of the run, rather than letting a whole-genome job
-    // quietly differ from the per-chromosome one.
-    if !is_phased || config.force_phasing {
-        if config.phasing_engine == "haploid" {
-            selphi_info!("  NOTE: the haploid engine's per-window EM Ne is not forwarded to the imputation HMM on the multi-chromosome path, so --no-em-ne has no effect here.");
-        }
-    }
-
     // Re-route threshold, read once. Same source and default as the single-chr path
     // (imputation_pipeline::build_target_confidence) so the two agree on which chip
     // sites are emitted as imputed dosage rather than as verbatim hard calls.
@@ -821,7 +769,7 @@ pub fn run_multi_chr(
 
         // Phasing (if needed)
         let ensemble_n = if needs_phasing { resolve_ensemble_n(config, n_samples) } else { 1 };
-        let (targ_alleles, extra_phased, em_ne_per_site, ref_bm_from_phasing) = phase_chr(
+        let (targ_alleles, extra_phased, ref_bm_from_phasing) = phase_chr(
             needs_phasing, &multi_map, chr_name, &srp, &wgs_idx, &raw_chip_cm,
             &chip_bps, targ_alleles, n_chip, n_samples, n_ref, ensemble_n,
             ped_locked.as_deref(), config,
@@ -867,7 +815,7 @@ pub fn run_multi_chr(
         // MAF-adaptive Ne
         let ne_low = est_ne as f64 * 0.85;
         let ne_high = est_ne as f64 * 1.2;
-        let final_ne_per_site: Option<Vec<f64>> = if em_ne_per_site.is_none() || config.no_em_ne {
+        let final_ne_per_site: Option<Vec<f64>> = {
             let mut ne_maf = vec![ne_low; n_chip];
             for ci in 0..n_chip {
                 let ac: u32 = ref_bm_imp.popcount_row(ci, n_ref);
@@ -877,8 +825,6 @@ pub fn run_multi_chr(
                 ne_maf[ci] = ne_low + t * (ne_high - ne_low);
             }
             Some(ne_maf)
-        } else {
-            em_ne_per_site
         };
 
         // Resolve adaptive max_candidates per-chr (matches imputation_pipeline.rs).
@@ -1153,4 +1099,31 @@ pub fn run_multi_chr(
         total, n_chr, mem, out_file.display());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unphased_passthrough;
+    use selphi::common::HaplotypeBitmatrix;
+    use selphi::diploid::scaffold;
+
+    /// A chromosome whose target has no called genotype (here 128, the phasing-path
+    /// missing sentinel, and 129, a haploid sample's) gives an empty phasing scaffold
+    /// even after widening, so `phase_chr` returns it unphased; the pass-through
+    /// gives imputation the encoding a chromosome that skips phasing gets.
+    #[test]
+    fn no_called_genotype_is_passed_through_unphased() {
+        let (n_chip, n_samples, n_ref) = (6, 2, 4);
+        let mut targ = vec![128u8; n_chip * n_samples * 2];
+        targ[0] = 129;
+        targ[1] = 129;
+        let ref_alleles: Vec<u8> = (0..n_chip * n_ref).map(|i| (i % 3 == 0) as u8).collect();
+        let panel = HaplotypeBitmatrix::from_byte_slice_all(n_chip, n_ref, &ref_alleles, n_ref);
+        for source in [scaffold::Source::Union, scaffold::Source::Cohort, scaffold::Source::Panel] {
+            let sc = scaffold::select(&targ, n_chip, n_samples, Some(&panel), source, 0.001);
+            assert!(sc.indices.is_empty(), "scaffold {:?} from a target with no call", sc.indices);
+        }
+        assert_eq!(unphased_passthrough(targ), vec![0u8; n_chip * n_samples * 2]);
+        assert_eq!(unphased_passthrough(vec![0, 1, 128, 1, 0, 129]), vec![0, 1, 0, 1, 0, 0]);
+    }
 }
