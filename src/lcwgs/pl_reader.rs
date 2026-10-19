@@ -320,11 +320,13 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
     let is_gz = path.ends_with(".gz");
     let file = std::fs::File::open(path)?;
 
-    // Decompress entire VCF (Selphi convention; bgzf streaming uses
-    // multi-threaded reads internally on noodles).
+    // Decompress the entire VCF, its BGZF blocks inflated on decoder threads
+    // (the same bytes as a sequential inflate).
     let mut raw: Vec<u8> = Vec::new();
     if is_gz {
-        let mut bgzf = noodles_bgzf::io::Reader::new(std::io::BufReader::new(file));
+        let workers = std::num::NonZero::new(rayon::current_num_threads().clamp(1, 4))
+            .unwrap_or(std::num::NonZero::<usize>::MIN);
+        let mut bgzf = noodles_bgzf::io::MultithreadedReader::with_worker_count(workers, file);
         bgzf.read_to_end(&mut raw)?;
     } else {
         let mut reader = std::io::BufReader::new(file);
@@ -334,22 +336,73 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
     if raw.starts_with(b"BCF\x02\x02") {
         return parse_pl_bcf(path, hash_alleles_against_srp);
     }
+    let parsed = parse_pl_text(&raw, hash_alleles_against_srp);
+    drop(raw);
+    let PlText { sample_names, body } = parsed;
+    let Body { markers, gl3, n_variants_seen, n_missing_pl, haploid_samples } = body;
 
-    // Pre-scan: count non-header newlines for capacity reservation
-    let est_variants: usize = raw.iter().filter(|&&b| b == b'\n').count();
-    // Subtract estimated header lines (typically <500 in modern VCFs)
-    let est_variants = est_variants.saturating_sub(500);
+    if sample_names.is_empty() {
+        return Err(std::io::Error::other(format!("No samples in PL VCF {path}")));
+    }
+    selphi_info!(
+        "  PL VCF: {} samples, {} variants ({} sample-sites with missing/malformed PL → flat 0.5/0.5)",
+        sample_names.len(), n_variants_seen, n_missing_pl,
+    );
 
+    Ok(PlVcfResult {
+        gl3,
+        markers,
+        sample_ids: sample_names,
+        haploid_samples,
+    })
+}
+
+/// The records of a run of VCF lines.
+struct Body {
+    markers: Vec<TargetMarker>,
+    gl3: Vec<f32>, // 3 genotype probs per (sample, variant)
+    n_variants_seen: usize,
+    n_missing_pl: usize,
+    haploid_samples: Vec<bool>,
+}
+
+impl Body {
+    fn new(n_samples: usize, est_variants: usize) -> Self {
+        Body {
+            markers: Vec::with_capacity(est_variants),
+            gl3: Vec::with_capacity(est_variants.saturating_mul(n_samples * 3)),
+            n_variants_seen: 0,
+            n_missing_pl: 0,
+            haploid_samples: vec![false; n_samples],
+        }
+    }
+
+    /// Append `other`'s records after this body's.
+    fn append(&mut self, other: Body) {
+        self.markers.extend(other.markers);
+        self.gl3.extend_from_slice(&other.gl3);
+        self.n_variants_seen += other.n_variants_seen;
+        self.n_missing_pl += other.n_missing_pl;
+        for (a, b) in self.haploid_samples.iter_mut().zip(other.haploid_samples) { *a |= b; }
+    }
+}
+
+struct PlText {
+    sample_names: Vec<String>,
+    body: Body,
+}
+
+/// Single-sample text after the `#CHROM` line is parsed in this many bytes per
+/// parallel piece (pieces end at line boundaries).
+const PIECE_BYTES: usize = 4 << 20;
+
+/// The decompressed VCF text → samples and records. A single sample's record
+/// lines are parsed in parallel pieces, concatenated in file order (each line
+/// is parsed on its own, so the records are those of the sequential scan).
+fn parse_pl_text(bytes: &[u8], hash_alleles_against_srp: bool) -> PlText {
+    let within = rayon::current_num_threads() > 1;
     let mut sample_names: Vec<String> = Vec::new();
-    let mut n_samples = 0usize;
-    let mut markers: Vec<TargetMarker> = Vec::with_capacity(est_variants);
-    let mut gl3: Vec<f32> = Vec::new(); // 3 genotype probs per (sample, variant)
-
-    let mut n_variants_seen = 0usize;
-    let mut n_missing_pl = 0usize;
-    let mut haploid_samples: Vec<bool> = Vec::new();
-
-    let bytes = &raw[..];
+    let mut body = Body::new(0, 0);
     let mut cursor = 0usize;
     while cursor < bytes.len() {
         // Find newline (no String alloc)
@@ -376,110 +429,163 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool) -> std::io::Resu
                 tmp_samples.push(std::str::from_utf8(&line[start..]).unwrap_or("").to_string());
             }
             sample_names = tmp_samples;
-            n_samples = sample_names.len();
-            haploid_samples = vec![false; n_samples];
-            // Pre-reserve gl3 buffer for n_variants × n_samples × 3 f32.
-            // Slight over-reserve is OK; under-reserve would force regrowth.
-            gl3.reserve(est_variants.saturating_mul(n_samples * 3));
+            let n_samples = sample_names.len();
+            let rest = &bytes[cursor.min(bytes.len())..];
+            // Pre-scan: count newlines for capacity reservation.
+            let est_variants = rest.iter().filter(|&&b| b == b'\n').count();
+            let mut fresh = Body::new(n_samples, est_variants);
+            fresh.markers.extend(std::mem::take(&mut body.markers));
+            fresh.gl3.extend_from_slice(&body.gl3);
+            fresh.n_variants_seen = body.n_variants_seen;
+            fresh.n_missing_pl = body.n_missing_pl;
+            body = fresh;
+            // A later #CHROM line resets the samples: only then parse serially.
+            if within && n_samples == 1 && !rest.windows(7).any(|w| w == b"\n#CHROM") && !rest.starts_with(b"#CHROM") {
+                use rayon::prelude::*;
+                let mut pieces: Vec<&[u8]> = Vec::new();
+                let mut at = 0usize;
+                while at < rest.len() {
+                    let mut end = (at + PIECE_BYTES).min(rest.len());
+                    while end < rest.len() && rest[end - 1] != b'\n' { end += 1; }
+                    pieces.push(&rest[at..end]);
+                    at = end;
+                }
+                let parts: Vec<Body> = pieces.par_iter().map(|piece| {
+                    let mut part = Body::new(n_samples, 0);
+                    for line in piece.split(|&b| b == b'\n') {
+                        parse_record_line(line, n_samples, hash_alleles_against_srp, &mut part);
+                    }
+                    part
+                }).collect();
+                for part in parts { body.append(part); }
+                return PlText { sample_names, body };
+            }
             continue;
         }
-        if n_samples == 0 { continue; } // shouldn't happen but be defensive
+        if sample_names.is_empty() { continue; } // shouldn't happen but be defensive
+        parse_record_line(line, sample_names.len(), hash_alleles_against_srp, &mut body);
+    }
+    PlText { sample_names, body }
+}
 
-        // First 9 tab positions
-        let mut tabs = [0usize; 9];
-        let mut n_tabs = 0usize;
-        for (i, &b) in line.iter().enumerate() {
-            if b == b'\t' {
-                if n_tabs < 9 { tabs[n_tabs] = i; }
-                n_tabs += 1;
-                if n_tabs >= 9 { break; }
-            }
-        }
-        if n_tabs < 9 { continue; }
-
-        // CHROM/POS/REF/ALT
-        let chrom_bytes = &line[..tabs[0]];
-        let pos = crate::io::target_io::fast_parse_i64(&line[tabs[0]+1..tabs[1]]);
-        if pos < 1 { continue; }
-        let ref_bytes = &line[tabs[2]+1..tabs[3]];
-        let alt_field = &line[tabs[3]+1..tabs[4]];
-        let alt_end = alt_field.iter().position(|&b| b == b',').unwrap_or(alt_field.len());
-        let alt_bytes = &alt_field[..alt_end];
-        if alt_bytes == b"." || alt_bytes.is_empty() { continue; }
-
-        // FORMAT subfield index for PL
-        let format_bytes = &line[tabs[7]+1..tabs[8]];
-        let pl_pos = find_format_subfield(format_bytes, b"PL");
-
-        // Allocate marker (one String triple per variant — unavoidable)
-        let ref_allele = std::str::from_utf8(ref_bytes).unwrap_or("").to_string();
-        let alt_allele = std::str::from_utf8(alt_bytes).unwrap_or("").to_string();
-        let chrom = std::str::from_utf8(chrom_bytes).unwrap_or("").to_string();
-        let (ref_hash, alt_hash) = if hash_alleles_against_srp {
-            (crate::srp::blake2b_hex(&ref_allele), crate::srp::blake2b_hex(&alt_allele))
-        } else {
-            (ref_allele.clone(), alt_allele.clone())
-        };
-        markers.push(TargetMarker {
-            chrom, pos, ref_allele, alt_allele, ref_hash, alt_hash,
-            id: String::new(), unphased_het: false,
-        });
-        n_variants_seen += 1;
-
-        // Allocate gl3 row in-place (no temp Vec)
-        let gl_off = gl3.len();
-        // Flat default for the 3-way GL is uniform (1/3 each).
-        gl3.resize(gl_off + n_samples * 3, 1.0 / 3.0);
-
-        // Per-sample PL extraction (byte slice walk)
-        let gt_region = &line[tabs[8]+1..];
-        let mut field_start = 0usize;
-        let n = gt_region.len();
-        for s in 0..n_samples {
-            // Find next tab
-            let mut field_end = field_start;
-            while field_end < n && gt_region[field_end] != b'\t' { field_end += 1; }
-            let field = &gt_region[field_start..field_end];
-
-            // (h0, h1) = pre-marginalized per-hap likelihood;
-            // (g0, g1, g2) = normalized 3-way genotype likelihood. Shared with
-            // the BCF path via pl_to_hl_gl3 so both produce identical GLs.
-            let pl_opt = pl_pos
-                .and_then(|p| extract_subfield(field, p))
-                .and_then(parse_pl_field);
-            if pl_opt.is_some_and(|p| p.1) { haploid_samples[s] = true; }
-            let (_, glp, valid) = pl_to_hl_gl3(pl_opt.map(|p| p.0));
-            if !valid { n_missing_pl += 1; }
-            // SAFETY: gl_off + 3*s + 2 < gl_off + n_samples*3, in bounds.
-            unsafe {
-                *gl3.get_unchecked_mut(gl_off + 3 * s)     = glp[0];
-                *gl3.get_unchecked_mut(gl_off + 3 * s + 1) = glp[1];
-                *gl3.get_unchecked_mut(gl_off + 3 * s + 2) = glp[2];
-            }
-
-            field_start = if field_end < n { field_end + 1 } else { n };
+/// One VCF line after `#CHROM` (header and empty lines are skipped) → a record
+/// appended to `out`.
+fn parse_record_line(line: &[u8], n_samples: usize, hash_alleles_against_srp: bool, out: &mut Body) {
+    if line.is_empty() || line.starts_with(b"##") || n_samples == 0 { return; }
+    // First 9 tab positions
+    let mut tabs = [0usize; 9];
+    let mut n_tabs = 0usize;
+    for (i, &b) in line.iter().enumerate() {
+        if b == b'\t' {
+            if n_tabs < 9 { tabs[n_tabs] = i; }
+            n_tabs += 1;
+            if n_tabs >= 9 { break; }
         }
     }
+    if n_tabs < 9 { return; }
 
-    if sample_names.is_empty() {
-        return Err(std::io::Error::other(format!("No samples in PL VCF {path}")));
+    // CHROM/POS/REF/ALT
+    let chrom_bytes = &line[..tabs[0]];
+    let pos = crate::io::target_io::fast_parse_i64(&line[tabs[0]+1..tabs[1]]);
+    if pos < 1 { return; }
+    let ref_bytes = &line[tabs[2]+1..tabs[3]];
+    let alt_field = &line[tabs[3]+1..tabs[4]];
+    let alt_end = alt_field.iter().position(|&b| b == b',').unwrap_or(alt_field.len());
+    let alt_bytes = &alt_field[..alt_end];
+    if alt_bytes == b"." || alt_bytes.is_empty() { return; }
+
+    // FORMAT subfield index for PL
+    let format_bytes = &line[tabs[7]+1..tabs[8]];
+    let pl_pos = find_format_subfield(format_bytes, b"PL");
+
+    // Allocate marker (one String triple per variant — unavoidable)
+    let ref_allele = std::str::from_utf8(ref_bytes).unwrap_or("").to_string();
+    let alt_allele = std::str::from_utf8(alt_bytes).unwrap_or("").to_string();
+    let chrom = std::str::from_utf8(chrom_bytes).unwrap_or("").to_string();
+    let (ref_hash, alt_hash) = if hash_alleles_against_srp {
+        (crate::srp::blake2b_hex(&ref_allele), crate::srp::blake2b_hex(&alt_allele))
+    } else {
+        (ref_allele.clone(), alt_allele.clone())
+    };
+    out.markers.push(TargetMarker {
+        chrom, pos, ref_allele, alt_allele, ref_hash, alt_hash,
+        id: String::new(), unphased_het: false,
+    });
+    out.n_variants_seen += 1;
+
+    // Allocate gl3 row in-place (no temp Vec)
+    let gl3 = &mut out.gl3;
+    let gl_off = gl3.len();
+    // Flat default for the 3-way GL is uniform (1/3 each).
+    gl3.resize(gl_off + n_samples * 3, 1.0 / 3.0);
+
+    // Per-sample PL extraction (byte slice walk)
+    let gt_region = &line[tabs[8]+1..];
+    let mut field_start = 0usize;
+    let n = gt_region.len();
+    for s in 0..n_samples {
+        // Find next tab
+        let mut field_end = field_start;
+        while field_end < n && gt_region[field_end] != b'\t' { field_end += 1; }
+        let field = &gt_region[field_start..field_end];
+
+        // (h0, h1) = pre-marginalized per-hap likelihood;
+        // (g0, g1, g2) = normalized 3-way genotype likelihood. Shared with
+        // the BCF path via pl_to_hl_gl3 so both produce identical GLs.
+        let pl_opt = pl_pos
+            .and_then(|p| extract_subfield(field, p))
+            .and_then(parse_pl_field);
+        if pl_opt.is_some_and(|p| p.1) { out.haploid_samples[s] = true; }
+        let (_, glp, valid) = pl_to_hl_gl3(pl_opt.map(|p| p.0));
+        if !valid { out.n_missing_pl += 1; }
+        // SAFETY: gl_off + 3*s + 2 < gl_off + n_samples*3, in bounds.
+        unsafe {
+            *gl3.get_unchecked_mut(gl_off + 3 * s)     = glp[0];
+            *gl3.get_unchecked_mut(gl_off + 3 * s + 1) = glp[1];
+            *gl3.get_unchecked_mut(gl_off + 3 * s + 2) = glp[2];
+        }
+
+        field_start = if field_end < n { field_end + 1 } else { n };
     }
-    selphi_info!(
-        "  PL VCF: {} samples, {} variants ({} sample-sites with missing/malformed PL → flat 0.5/0.5)",
-        n_samples, n_variants_seen, n_missing_pl,
-    );
-
-    Ok(PlVcfResult {
-        gl3,
-        markers,
-        sample_ids: sample_names,
-        haploid_samples,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A single-sample text parsed in parallel pieces gives the serial
+    /// parse's records, likelihood bits, counts and haploid flags.
+    #[test]
+    fn parallel_single_sample_text_matches_serial() {
+        use crate::lcwgs::hmm::reference_pack::Xs;
+        let mut rng = Xs(0x243F_6A88_85A3_08D3);
+        let mut text = String::from("##fileformat=VCFv4.2\n##contig=<ID=22>\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n");
+        let mut pos = 10_000u64;
+        while text.len() < 9 << 20 {
+            pos += 1 + rng.below(40);
+            let alt = ["C", "G", "T", ".", "A,C"][rng.below(5) as usize];
+            let (fmt, val) = match rng.below(7) {
+                0 => ("GT:PL", "0/0:.".to_string()),
+                1 => ("GT", "0/0".to_string()),
+                2 => ("GT:DP:PL", format!("0/1:3:{},{}", rng.below(60), rng.below(60))),
+                3 => ("PL", "x,y,z".to_string()),
+                _ => ("GT:PL", format!("0/1:{},{},{}", rng.below(90), rng.below(90), rng.below(90))),
+            };
+            text.push_str(&format!("22\t{pos}\t.\tA\t{alt}\t.\tPASS\t.\t{fmt}\t{val}\n"));
+            if rng.below(5000) == 0 { text.push_str("##late header line\n"); }
+        }
+        text.push_str("22\t99999999\t.\tA\tG\t.\tPASS\t.\tPL\t0,10,20");
+        let run = |threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            let t = pool.install(|| parse_pl_text(text.as_bytes(), false));
+            let marks: Vec<_> = t.body.markers.iter().map(|m| (m.chrom.clone(), m.pos, m.ref_allele.clone(), m.alt_allele.clone())).collect();
+            (t.sample_names, marks, t.body.gl3.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+             t.body.n_variants_seen, t.body.n_missing_pl, t.body.haploid_samples)
+        };
+        let want = run(1);
+        assert!(want.1.len() > 100_000);
+        assert_eq!(run(4), want);
+    }
 
     #[test]
     fn flat_pl_gives_flat_hl() {
