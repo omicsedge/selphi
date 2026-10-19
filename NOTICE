@@ -11,7 +11,7 @@ SHAPEIT5 (src/diploid/)
   MIT License
 
 HTSlib and BCFtools (src/lcwgs/baq.rs, src/lcwgs/errmod.rs)
-  Copyright (C) 2012-2023 Genome Research Ltd. and contributors
+  Copyright (C) 2012-2025 Genome Research Ltd.
   MIT/Expat License
 
 fdlibm, via the GNU C Library (src/diploid/detmath.rs)
