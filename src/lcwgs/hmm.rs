@@ -60,6 +60,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::LcwgsParams;
 use crate::common::HaplotypeBitmatrix;
 
+pub(crate) mod two_pass;
+
 // Gated micro-profiling (LCWGS_TIMING): nanoseconds spent building the bit-packed
 // conditioning (`condbits`, the random-gather pack) vs the rest of the HMM
 // (forward + backward arithmetic). Summed across all parallel HMM calls; read +
@@ -728,6 +730,23 @@ pub fn run_forward_backward(
     cm: &[f64],
     params: &LcwgsParams,
     recomb_mult: Option<&[f32]>,
+    poly_sites: Option<&[usize]>,
+    prepack: Option<&[u64]>,
+) -> HmmOutput {
+    run_forward_backward_with(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack, false)
+}
+
+/// [`run_forward_backward`], optionally as two cooperating passes (see
+/// [`two_pass`]) when `two_pass` is set and the call is large enough. The
+/// dosages are identical either way.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_forward_backward_with(
+    hl: &[f32],
+    cond_haps: &[u32],
+    ref_bm: &HaplotypeBitmatrix,
+    cm: &[f64],
+    params: &LcwgsParams,
+    recomb_mult: Option<&[f32]>,
     // POLY/MONO SKIP (LCWGS_POLY_SKIP). When `Some(ps)`, the caller has already
     // COMPACTED `hl` (len n_poly*2) and `cm` (len n_poly) to the polymorphic-in-
     // conditioning-set sites; `ps[c]` maps a compacted index `c ∈ 0..n_poly` to its
@@ -745,6 +764,7 @@ pub fn run_forward_backward(
     // of a sample can share their prefix. `None` ⇒ the SIMD kernels pack it
     // themselves; the scalar path always reads the panel directly.
     prepack: Option<&[u64]>,
+    two_pass: bool,
 ) -> HmmOutput {
     let _trim = TrimCaches;
     let n_var = cm.len();
@@ -771,6 +791,27 @@ pub fn run_forward_backward(
     } else {
         hl
     };
+
+    // Two cooperating passes, each path with its own sequential arithmetic.
+    // NEON keeps its sequential kernel.
+    if two_pass && n_var >= two_pass::MIN_SITES && k >= 16 && rayon::current_num_threads() > 1 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if use_avx512_lcwgs() {
+                return unsafe { two_pass::run::<two_pass::Avx512>(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack) };
+            }
+            if use_avx2_lcwgs() {
+                return unsafe { two_pass::run::<two_pass::Avx2>(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack) };
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        let scalar = !use_neon_lcwgs();
+        #[cfg(not(target_arch = "aarch64"))]
+        let scalar = true;
+        if scalar {
+            return unsafe { two_pass::run::<two_pass::Scalar>(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack) };
+        }
+    }
 
     // AVX-512 fast path (bit-packed conditioning, vectorized fwd/bwd). Falls
     // back to the scalar path below on non-AVX-512 hosts or SELPHI_FORCE_SCALAR=1.

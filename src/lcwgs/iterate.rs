@@ -148,7 +148,9 @@ fn merge_sorted(a: &[usize], b: &[usize], out: &mut Vec<usize>) {
 
 use super::pbwt_select::select_conditioning_haps;
 use crate::sparse_ls::ref_haplotype_set::for_each_hap_with_allele;
-use super::hmm::{run_forward_backward, run_forward_backward_scaffold};
+use super::hmm::{run_forward_backward_with, run_forward_backward_scaffold};
+#[cfg(test)]
+use super::hmm::run_forward_backward;
 use super::LcwgsParams;
 use crate::common::HaplotypeBitmatrix;
 
@@ -219,6 +221,9 @@ fn run_one_hap<F: Fn(usize) -> usize>(
     // site axis the FB will run on (`split.poly` or the full axis), so the two
     // haplotypes of a sample share their prefix pack. None ⇒ the kernel packs.
     prepack: Option<&[u64]>,
+    // Offer the forward-backward's second pass to another worker (identical
+    // dosages; see `hmm::two_pass`).
+    two_pass: bool,
 ) -> (Vec<f32>, Vec<u8>) {
     let hl_at = |v: usize| {
         let g = (v * n_samples + h / 2) * 3 + partner_at(v);
@@ -274,9 +279,9 @@ fn run_one_hap<F: Fn(usize) -> usize>(
             }
             let mut dose = vec![0.0f32; n_var];
             if !poly_sites.is_empty() {
-                let dp = run_forward_backward(
+                let dp = run_forward_backward_with(
                     hl, cond, ref_bm, cm_poly, params,
-                    band_r.map(|_| rmult.as_slice()), Some(poly_sites), prepack,
+                    band_r.map(|_| rmult.as_slice()), Some(poly_sites), prepack, two_pass,
                 ).dosage;
                 for (i, &v) in poly_sites.iter().enumerate() { dose[v] = dp[i]; }
             }
@@ -304,7 +309,7 @@ fn run_one_hap<F: Fn(usize) -> usize>(
             // precomputed once by the caller; `None` for the default `max`/`nref` modes
             // ⇒ uniform rate ⇒ byte-identical to the pre-band full-axis path.
             hl.extend((0..n_var).flat_map(hl_at));
-            run_forward_backward(hl, cond, ref_bm, cm, params, full_axis_rmult, None, prepack).dosage
+            run_forward_backward_with(hl, cond, ref_bm, cm, params, full_axis_rmult, None, prepack, two_pass).dosage
         }
     };
     // Sample a fresh allele per site from the posterior dose (deterministic
@@ -857,6 +862,10 @@ fn run_gibbs_with_memory(
         // the task is parallel over samples in both the GS and Jacobi sweeps.
         let t0 = if timing { Some(std::time::Instant::now()) } else { None };
         let ic_all: &[bool] = poly_skip_arg.map_or(&[], |(ic, _)| ic);
+        // A single admitted sample leaves workers idle between its chunks:
+        // its forward-backward and phasing passes are split in two there.
+        let two_pass = memory.is_some();
+        let two_pass_bytes = |k: usize| if two_pass { super::hmm::two_pass::extra_bytes(n_var, k) } else { 0 };
         let sample_task = |s: usize| {
             let mut scratch = SampleScratch::default();
             let SampleScratch { split0: buf0, split1: buf1, h0, h1, ps, ms, cond_union } = &mut scratch;
@@ -907,7 +916,7 @@ fn run_gibbs_with_memory(
                         use_scaffold, &common_idx, n_var,
                         split0.map(|x| (x, ic_all, ps_mono_alt.as_slice())),
                         full_axis_rmult.as_deref(),
-                        if packed { Some(hp.as_slice()) } else { None })
+                        if packed { Some(hp.as_slice()) } else { None }, two_pass)
                 };
                 let fb1 = |fresh: Option<&[u8]>, hp: &mut Vec<u64>| {
                     let packed = pack_for(c1, split1, &base, hp);
@@ -918,10 +927,11 @@ fn run_gibbs_with_memory(
                         use_scaffold, &common_idx, n_var,
                         split1.map(|x| (x, ic_all, ps_mono_alt.as_slice())),
                         full_axis_rmult.as_deref(),
-                        if packed { Some(hp.as_slice()) } else { None })
+                        if packed { Some(hp.as_slice()) } else { None }, two_pass)
                 };
                 let extra = if !is_main && !gs && rayon::current_num_threads() > 1 {
-                    memory.and_then(|m| m.try_parallel_fb(super::memory::fb_bytes(n_var, c1.len())))
+                    memory.and_then(|m| m.try_parallel_fb(super::memory::fb_bytes(n_var, c1.len())
+                        + two_pass_bytes(c1.len())))
                 } else { None };
                 let results = if let Some(_permit) = extra {
                     rayon::join(|| fb0(&mut Vec::new()), || {
@@ -940,7 +950,8 @@ fn run_gibbs_with_memory(
             // Only the admitted path waits for phaser memory. Whole-sample
             // tasks keep the shared prefix, but release the full FB pack here.
             let (((d0, mut samp0), (d1, mut samp1)), retained_base) = match memory {
-                Some(m) => m.run(super::memory::fb_bytes(n_var, c0.len().max(c1.len())), fb),
+                Some(m) => m.run(super::memory::fb_bytes(n_var, c0.len().max(c1.len()))
+                    + two_pass_bytes(c0.len().max(c1.len())), fb),
                 None => fb(),
             };
             if fuse_phase {
@@ -992,6 +1003,7 @@ fn run_gibbs_with_memory(
                         let snapshots = crate::lcwgs::phasing_hmm::PhasingHmm::snapshot_bytes(
                             h0, h1, flat, poly_ref, &lq, cond_haps.len());
                         super::memory::phase_bytes(n_var, cond_haps.len(), snapshots)
+                            + super::memory::two_pass_phase_bytes(poly_ref.len(), cond_haps.len())
                     });
                     let mut phase = || {
                         let mut base = BasePack::new();
@@ -1005,6 +1017,7 @@ fn run_gibbs_with_memory(
                                 && cond_haps.len() >= bp.b && cond_haps[..bp.b] == c0[..bp.b])
                         };
                         let mut hmm = crate::lcwgs::phasing_hmm::PhasingHmm::new(&g2p);
+                        hmm.set_two_pass(two_pass);
                         hmm.rephase(h0, h1, flat, cond_haps, ref_bm, cm, &g2p,
                                     poly_ref, mono_ref, &lq, &mut rng_u01, phase_base);
                         for v in 0..n_var { samp0[v] = h0[v] as u8; samp1[v] = h1[v] as u8; }
@@ -1532,7 +1545,7 @@ mod tests {
                             let old = run_one_hap_reference(2 * s, s, 4, 123, |v| partner[v], &cond,
                                 &gl3, &bm, &cm, &params, mode == 2, &common, n, ns, poly, None, None);
                             let new = run_one_hap(2 * s, 4, 123, |v| partner[v], &cond,
-                                &gl3, ns, &bm, &cm, &params, mode == 2, &common, n, poly, None, None);
+                                &gl3, ns, &bm, &cm, &params, mode == 2, &common, n, poly, None, None, false);
                             assert_eq!(new.0.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                                 old.0.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                                 "n={n} k={k} sample={s} mode={mode} floor={mg}");

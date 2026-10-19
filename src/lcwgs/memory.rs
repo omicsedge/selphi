@@ -268,6 +268,13 @@ pub(crate) fn fb_bytes(sites: usize, k: usize) -> usize {
         + (checkpoints + stride + 4) * k * 4)
 }
 
+/// The second phaser of a two-pass rephase: its K x 8 state and copies of the
+/// per-site typing, plus the per-boundary HProbs and the forward sums stored at
+/// meeting points.
+pub(crate) fn two_pass_phase_bytes(sites: usize, k: usize) -> usize {
+    sites * 160 + k * 64 + 4096
+}
+
 /// The K-wide snapshot size is counted from the actual sampled alleles before
 /// allocation. Other phaser metadata and its pack have bounded site/K axes.
 pub(crate) fn phase_bytes(sites: usize, k: usize, snapshots: usize) -> usize {

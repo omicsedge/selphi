@@ -225,6 +225,13 @@ pub struct PhasingHmm {
     plan_full: Vec<crate::lcwgs::hmm::GatherWord>,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     plan_tail: Vec<crate::lcwgs::hmm::GatherWord>,
+    /// Run the backward and forward passes of `rephase` as two concurrent
+    /// Rayon tasks (see [`Self::two_pass_states`]). Off by default.
+    two_pass: bool,
+    /// Test hook: 0 joins the two passes, 1 runs the backward first, 2 the
+    /// forward first, both on the calling thread.
+    #[cfg(test)]
+    two_pass_order: u8,
 }
 
 /// Generate the AVX2 (8-wide) phasing kernels from their per-kernel parts.
@@ -441,8 +448,16 @@ impl PhasingHmm {
             base_pack: std::ptr::null(),
             plan_full: Vec::new(),
             plan_tail: Vec::new(),
+            two_pass: false,
+            #[cfg(test)]
+            two_pass_order: 0,
         }
     }
+
+    /// Let `rephase` run its backward and forward passes concurrently. The
+    /// result is identical either way; this only decides whether the forward
+    /// pass is offered to another Rayon worker.
+    pub(crate) fn set_two_pass(&mut self, on: bool) { self.two_pass = on; }
 
     /// Reuse metadata and O(K)/O(sites) scratch, but return the two large
     /// O(K * (segments + flat hets)) snapshots before the worker becomes idle.
@@ -987,23 +1002,15 @@ impl PhasingHmm {
     /// TRANS_HAP scalar reference (the HProbs accumulation; transition already set).
     fn trans_hap_scalar(&mut self) {
         let states_haps = self.n_states * HAP_NUMBER;
-        let fact2 = self.nt / self.prob_sum_t;
         let seg_base = (self.curr_segment_index as usize + 1) * states_haps;
-        for h1 in 0..HAP_NUMBER {
-            let fact1 = (self.prob_sum_h[h1] / self.prob_sum_t) * self.yt / self.n_states as f32;
-            let mut sum = [0.0f32; HAP_NUMBER];
-            for k in 0..self.n_states {
-                let base = k * HAP_NUMBER;
-                let prob0 = self.prob[base + h1] * fact2 + fact1;
-                let pbase = seg_base + base;
-                for h2 in 0..HAP_NUMBER {
-                    sum[h2] += prob0 * self.phasing_prob[pbase + h2];
-                }
-            }
-            let j = h1 * HAP_NUMBER;
-            self.hprobs[j..j + HAP_NUMBER].copy_from_slice(&sum);
-            self.sum_hprobs += hadd(&sum);
-        }
+        let fwd = TransInput { prob: self.prob.as_ptr(), sum_h: self.prob_sum_h, sum_t: self.prob_sum_t };
+        // SAFETY: `prob` holds K x 8 floats and the block of the next segment
+        // lies inside `phasing_prob` (written by the backward pass).
+        let (hprobs, sum) = unsafe {
+            trans_hap_scalar_raw(self.n_states, self.yt, self.nt, &fwd, self.phasing_prob.as_ptr().add(seg_base))
+        };
+        self.hprobs = hprobs;
+        self.sum_hprobs = sum;
     }
 
     /// SAMPLE_DIP. Returns true on numerical failure;
@@ -1029,39 +1036,61 @@ impl PhasingHmm {
     /// the stored backward `imputeProb` to get the per-lane P(allele==1) at this
     /// FLAT_HET, clamped to [0,1] into imputeProbOf1s[miss*8 + lane].
     fn impute_flat_het(&mut self, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32]) {
+        let miss = self.curr_missing_locus as usize;
+        let states_haps = self.n_states * HAP_NUMBER;
+        let mut bwd_sum = [0.0f32; HAP_NUMBER];
+        bwd_sum.copy_from_slice(&self.impute_prob_sum[miss * HAP_NUMBER..(miss + 1) * HAP_NUMBER]);
+        let bwd = self.impute_prob[miss * states_haps..(miss + 1) * states_haps].as_ptr();
+        let fwd = self.prob.as_ptr();
+        let fwd_sum = self.prob_sum_h;
+        // SAFETY: both blocks hold K x 8 floats for the duration of the call.
+        let of1s = unsafe { self.impute_flat_het_from(ref_bm, cond_haps, bwd, &bwd_sum, fwd, &fwd_sum) };
+        self.impute_prob_of_1s[miss * HAP_NUMBER..(miss + 1) * HAP_NUMBER].copy_from_slice(&of1s);
+    }
+
+    /// The allele-1 probabilities of IMPUTE_FLAT_HET from an explicit backward
+    /// state (`bwd`, lane sums `bwd_sum`) and forward state (`fwd`, `fwd_sum`)
+    /// at the current site. Either pass may own the live state; the arithmetic
+    /// is that of the stored-snapshot form.
+    ///
+    /// # Safety
+    /// `bwd` and `fwd` must each address K x 8 readable floats.
+    unsafe fn impute_flat_het_from(
+        &mut self, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32],
+        bwd: *const f32, bwd_sum: &[f32; HAP_NUMBER], fwd: *const f32, fwd_sum: &[f32; HAP_NUMBER],
+    ) -> [f32; HAP_NUMBER] { unsafe {
         #[cfg(target_arch = "x86_64")]
         match self.simd {
             SimdMode::Avx512 | SimdMode::Avx2 => {
                 self.pack_condbits(ref_bm, cond_haps);
                 // SAFETY: gated by runtime feature detection in resolve_simd_mode
                 // (every AVX-512 host here has AVX2).
-                unsafe { self.impute_flat_het_avx2() };
-                return;
+                return self.impute_flat_het_avx2(bwd, bwd_sum, fwd, fwd_sum);
             }
             SimdMode::Scalar => {}
         }
-        self.impute_flat_het_scalar(ref_bm, cond_haps);
-    }
+        self.impute_flat_het_scalar(ref_bm, cond_haps, bwd, bwd_sum, fwd, fwd_sum)
+    }}
 
     /// IMPUTE_FLAT_HET scalar reference (also the `SELPHI_FORCE_SCALAR` path).
-    fn impute_flat_het_scalar(&mut self, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32]) {
-        let states_haps = self.n_states * HAP_NUMBER;
-        let miss = self.curr_missing_locus as usize;
+    unsafe fn impute_flat_het_scalar(
+        &self, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32],
+        bwd: *const f32, bwd_sum: &[f32; HAP_NUMBER], fwd: *const f32, fwd_sum: &[f32; HAP_NUMBER],
+    ) -> [f32; HAP_NUMBER] { unsafe {
         let mut scale_r = [0.0f32; HAP_NUMBER];
         let mut scale_l = [0.0f32; HAP_NUMBER];
         for lane in 0..HAP_NUMBER {
-            scale_r[lane] = 1.0 / self.impute_prob_sum[miss * HAP_NUMBER + lane];
-            scale_l[lane] = 1.0 / self.prob_sum_h[lane];
+            scale_r[lane] = 1.0 / bwd_sum[lane];
+            scale_l[lane] = 1.0 / fwd_sum[lane];
         }
         let mut sums0 = [0.0f32; HAP_NUMBER];
         let mut sums1 = [0.0f32; HAP_NUMBER];
-        let ip_base = miss * states_haps;
         for k in 0..self.n_states {
             let ah = self.hvar(ref_bm, cond_haps, k);
             let base = k * HAP_NUMBER;
             for lane in 0..HAP_NUMBER {
-                let p1 = self.impute_prob[ip_base + base + lane] * scale_r[lane];
-                let p2 = self.prob[base + lane] * scale_l[lane];
+                let p1 = *bwd.add(base + lane) * scale_r[lane];
+                let p2 = *fwd.add(base + lane) * scale_l[lane];
                 let prod = p1 * p2;
                 if ah {
                     sums1[lane] += prod;
@@ -1070,12 +1099,13 @@ impl PhasingHmm {
                 }
             }
         }
+        let mut out = [0.0f32; HAP_NUMBER];
         for lane in 0..HAP_NUMBER {
             let norm = sums1[lane] / (sums0[lane] + sums1[lane]);
-            let clamped = norm.clamp(0.0, 1.0);
-            self.impute_prob_of_1s[miss * HAP_NUMBER + lane] = clamped;
+            out[lane] = norm.clamp(0.0, 1.0);
         }
-    }
+        out
+    }}
 
     /// IMPUTE_FLAT_HET, AVX2: the 8 founder lanes of one state `k` are one
     /// `__m256`, and states are visited in order 0..K, so every lane performs the
@@ -1088,20 +1118,20 @@ impl PhasingHmm {
     /// [`Self::impute_flat_het_scalar`].
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
-    unsafe fn impute_flat_het_avx2(&mut self) { unsafe {
+    unsafe fn impute_flat_het_avx2(
+        &self, bwd: *const f32, bwd_sum: &[f32; HAP_NUMBER], fwd: *const f32, fwd_sum: &[f32; HAP_NUMBER],
+    ) -> [f32; HAP_NUMBER] { unsafe {
         use core::arch::x86_64::*;
-        let states_haps = self.n_states * HAP_NUMBER;
-        let miss = self.curr_missing_locus as usize;
         let mut scale_r = [0.0f32; HAP_NUMBER];
         let mut scale_l = [0.0f32; HAP_NUMBER];
         for lane in 0..HAP_NUMBER {
-            scale_r[lane] = 1.0 / self.impute_prob_sum[miss * HAP_NUMBER + lane];
-            scale_l[lane] = 1.0 / self.prob_sum_h[lane];
+            scale_r[lane] = 1.0 / bwd_sum[lane];
+            scale_l[lane] = 1.0 / fwd_sum[lane];
         }
         let srv = _mm256_loadu_ps(scale_r.as_ptr());
         let slv = _mm256_loadu_ps(scale_l.as_ptr());
-        let ip = self.impute_prob[miss * states_haps..(miss + 1) * states_haps].as_ptr();
-        let pp = self.prob[..states_haps].as_ptr();
+        let ip = bwd;
+        let pp = fwd;
         let cb = self.condrow;
         let mut s0 = _mm256_setzero_ps();
         let mut s1 = _mm256_setzero_ps();
@@ -1120,11 +1150,12 @@ impl PhasingHmm {
         let mut sums1 = [0.0f32; HAP_NUMBER];
         _mm256_storeu_ps(sums0.as_mut_ptr(), s0);
         _mm256_storeu_ps(sums1.as_mut_ptr(), s1);
+        let mut out = [0.0f32; HAP_NUMBER];
         for lane in 0..HAP_NUMBER {
             let norm = sums1[lane] / (sums0[lane] + sums1[lane]);
-            let clamped = norm.clamp(0.0, 1.0);
-            self.impute_prob_of_1s[miss * HAP_NUMBER + lane] = clamped;
+            out[lane] = norm.clamp(0.0, 1.0);
         }
+        out
     }}
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1297,30 +1328,45 @@ impl PhasingHmm {
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,fma")]
     unsafe fn trans_hap_avx2(&mut self) { unsafe {
-        use core::arch::x86_64::*;
         let states_haps = self.n_states * HAP_NUMBER;
-        let fact2 = self.nt / self.prob_sum_t;
-        let f2v = _mm256_set1_ps(fact2);
         let seg_base = (self.curr_segment_index as usize + 1) * states_haps;
-        let pp = self.phasing_prob.as_ptr();
-        let probp = self.prob.as_ptr();
-        self.sum_hprobs = 0.0;
+        let fwd = TransInput { prob: self.prob.as_ptr(), sum_h: self.prob_sum_h, sum_t: self.prob_sum_t };
+        let (hprobs, sum) = Self::trans_hap_avx2_raw(
+            self.n_states, self.yt, self.nt, &fwd, self.phasing_prob.as_ptr().add(seg_base));
+        self.hprobs = hprobs;
+        self.sum_hprobs = sum;
+    }}
+
+    /// TRANS_HAP AVX2 from an explicit forward state and backward block (both
+    /// K x 8 floats): the arithmetic of [`Self::trans_hap_avx2`].
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn trans_hap_avx2_raw(
+        n_states: usize, yt: f32, nt: f32, fwd: &TransInput, bwd: *const f32,
+    ) -> ([f32; HAP_NUMBER * HAP_NUMBER], f32) { unsafe {
+        use core::arch::x86_64::*;
+        let fact2 = nt / fwd.sum_t;
+        let f2v = _mm256_set1_ps(fact2);
+        let probp = fwd.prob;
+        let mut hprobs = [0.0f32; HAP_NUMBER * HAP_NUMBER];
+        let mut sum_hprobs = 0.0f32;
         for h1 in 0..HAP_NUMBER {
-            let fact1 = (self.prob_sum_h[h1] / self.prob_sum_t) * self.yt / self.n_states as f32;
+            let fact1 = (fwd.sum_h[h1] / fwd.sum_t) * yt / n_states as f32;
             let f1v = _mm256_set1_ps(fact1);
             let mut sumv = _mm256_setzero_ps();
-            for k in 0..self.n_states {
+            for k in 0..n_states {
                 let base = k * HAP_NUMBER;
                 // prob0 = prob[base+h1]*fact2 + fact1 (scalar, broadcast).
                 let prob0 = *probp.add(base + h1);
                 let p0v = _mm256_fmadd_ps(_mm256_set1_ps(prob0), f2v, f1v);
-                let ppv = _mm256_loadu_ps(pp.add(seg_base + base));
+                let ppv = _mm256_loadu_ps(bwd.add(base));
                 sumv = _mm256_fmadd_ps(p0v, ppv, sumv); // sum += prob0 * phasingProb
             }
             let j = h1 * HAP_NUMBER;
-            _mm256_storeu_ps(self.hprobs.as_mut_ptr().add(j), sumv);
-            self.sum_hprobs += Self::hsum256(sumv);
+            _mm256_storeu_ps(hprobs.as_mut_ptr().add(j), sumv);
+            sum_hprobs += Self::hsum256(sumv);
         }
+        (hprobs, sum_hprobs)
     }}
 
     // ---- AVX-512 (16-wide: two k per vector) ------------------------------
@@ -1989,6 +2035,380 @@ impl PhasingHmm {
     }
 
     // ===================================================================
+    //                 CONCURRENT BACKWARD AND FORWARD PASSES
+    // ===================================================================
+
+    /// A second phaser that runs the forward pass while `self` runs the
+    /// backward: the same variant typing, segmentation, transitions, gather
+    /// plans and conditioning pack, with its own K x 8 state.
+    fn forward_party(&self) -> PhasingHmm {
+        PhasingHmm {
+            var_typ: self.var_typ.clone(),
+            var_alt: self.var_alt.clone(),
+            var_abs: self.var_abs.clone(),
+            var_rel: self.var_rel.clone(),
+            transitions: self.transitions.clone(),
+            #[cfg(test)]
+            uncached_transitions: self.uncached_transitions,
+            segments: self.segments.clone(),
+            n_segs: self.n_segs,
+            n_miss: self.n_miss,
+            curr_idx_locus: 0,
+            curr_abs_locus: 0,
+            curr_rel_locus: 0,
+            curr_segment_index: 0,
+            curr_segment_locus: 0,
+            curr_missing_locus: 0,
+            prob_sum_t: 0.0,
+            prob: vec![0.0; self.n_states * HAP_NUMBER],
+            prob_sum_k: vec![0.0; self.n_states],
+            prob_sum_h: [0.0; HAP_NUMBER],
+            phasing_prob: Vec::new(),
+            phasing_prob_sum: Vec::new(),
+            phasing_prob_sum_sum: Vec::new(),
+            impute_prob: Vec::new(),
+            impute_prob_sum: Vec::new(),
+            impute_prob_sum_sum: Vec::new(),
+            impute_prob_of_1s: Vec::new(),
+            dip_sampled: Vec::new(),
+            dprobs: [0.0; HAP_NUMBER],
+            emit0: self.emit0,
+            emit1: self.emit1,
+            hprobs: [0.0; HAP_NUMBER * HAP_NUMBER],
+            sum_hprobs: 0.0,
+            sum_dprobs: 0.0,
+            nt: 0.0,
+            yt: 0.0,
+            nrho: self.nrho,
+            n_states: self.n_states,
+            simd: self.simd,
+            condbits: Vec::new(),
+            condrow: std::ptr::null(),
+            base_pack: self.base_pack,
+            plan_full: self.plan_full.clone(),
+            plan_tail: self.plan_tail.clone(),
+            two_pass: false,
+            #[cfg(test)]
+            two_pass_order: 0,
+        }
+    }
+
+    /// TRANS_HAP from an explicit forward state and backward block, through
+    /// the same kernel `trans_hap` dispatches to.
+    ///
+    /// # Safety
+    /// `fwd.prob` and `bwd` must each address K x 8 readable floats.
+    unsafe fn trans_hap_from(&self, yt: f32, fwd: &TransInput, bwd: *const f32) -> ([f32; HAP_NUMBER * HAP_NUMBER], f32) { unsafe {
+        let nt = 1.0 - yt;
+        #[cfg(target_arch = "x86_64")]
+        match self.simd {
+            // SAFETY: gated by runtime feature detection in resolve_simd_mode.
+            SimdMode::Avx512 | SimdMode::Avx2 => return Self::trans_hap_avx2_raw(self.n_states, yt, nt, fwd, bwd),
+            SimdMode::Scalar => {}
+        }
+        trans_hap_scalar_raw(self.n_states, yt, nt, fwd, bwd)
+    }}
+
+    /// The backward and forward passes of `rephase` as two concurrent tasks.
+    ///
+    /// The forward recursion never reads the sampled diplotypes: it needs the
+    /// backward pass only for TRANS_HAP at each segment boundary and for
+    /// IMPUTE_FLAT_HET at each flat het, both pure functions of one forward
+    /// and one backward state. Each such meeting point owns one snapshot block
+    /// (the block the backward pass would have stored). The pass that reaches it
+    /// first stores its state there; the second computes the meeting from its
+    /// live state and the stored one, with the arithmetic of the sequential
+    /// form. The diplotype draws, which do depend on order, are made afterwards
+    /// from the stored HProbs in segment order, so the random stream and every
+    /// value are those of `backward` followed by `forward`. The snapshot
+    /// storage is the sequential one, and one pass run after the other costs
+    /// what the sequential passes cost.
+    ///
+    /// Fills `phasing_prob_sum`, `phasing_prob_sum_sum`, `impute_prob_sum`,
+    /// `impute_prob_sum_sum` and `impute_prob_of_1s` as `backward` + `forward`
+    /// do, and returns the HProbs and their sum per segment boundary
+    /// (`HP_STRIDE` floats each).
+    fn two_pass_states(&mut self, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32], cm: &[f64], mism: f32) -> Vec<f32> {
+        let sh = self.n_states * HAP_NUMBER;
+        let n_bound = self.n_segs.saturating_sub(1);
+        let mut fwd = self.forward_party();
+        // The meeting blocks leave `self`, so both passes reach them only
+        // through the raw pointers of `TwoPass`.
+        let mut pp = std::mem::take(&mut self.phasing_prob);
+        let mut ip = std::mem::take(&mut self.impute_prob);
+        let mut ip_sum = std::mem::take(&mut self.impute_prob_sum);
+        let mut of1s = std::mem::take(&mut self.impute_prob_of_1s);
+        debug_assert!(pp.capacity() >= self.n_segs * sh && ip.capacity() >= self.n_miss * sh);
+        let mut seg_fsum = vec![0.0f32; self.n_segs * (HAP_NUMBER + 1)];
+        let mut miss_fsum = vec![0.0f32; self.n_miss * HAP_NUMBER];
+        let mut hp = vec![0.0f32; n_bound * HP_STRIDE];
+        let tp = TwoPass {
+            sh,
+            pp: pp.as_mut_ptr(),
+            ip: ip.as_mut_ptr(),
+            ip_sum: ip_sum.as_mut_ptr(),
+            of1s: of1s.as_mut_ptr(),
+            seg_fsum: seg_fsum.as_mut_ptr(),
+            miss_fsum: miss_fsum.as_mut_ptr(),
+            hp: hp.as_mut_ptr(),
+            seg: (0..self.n_segs).map(|_| Meeting::new()).collect(),
+            miss: (0..self.n_miss).map(|_| Meeting::new()).collect(),
+        };
+        #[cfg(test)]
+        if self.two_pass_order != 0 {
+            if self.two_pass_order == 1 {
+                self.backward_two_pass(ref_bm, cond_haps, cm, mism, &tp);
+                fwd.forward_two_pass(ref_bm, cond_haps, cm, mism, &tp);
+            } else {
+                fwd.forward_two_pass(ref_bm, cond_haps, cm, mism, &tp);
+                self.backward_two_pass(ref_bm, cond_haps, cm, mism, &tp);
+            }
+        }
+        #[cfg(test)]
+        let join = self.two_pass_order == 0;
+        #[cfg(not(test))]
+        let join = true;
+        if join {
+            let (b, f) = (SendPtr(self as *mut Self), SendPtr(&mut fwd as *mut Self));
+            let tp = &tp;
+            // SAFETY: the two phasers are distinct objects; the passes share
+            // only `tp`, whose blocks are handed over by the meeting protocol.
+            rayon::join(
+                move || unsafe { (*b.get()).backward_two_pass(ref_bm, cond_haps, cm, mism, tp) },
+                move || unsafe { (*f.get()).forward_two_pass(ref_bm, cond_haps, cm, mism, tp) },
+            );
+        }
+        self.phasing_prob = pp;
+        self.impute_prob = ip;
+        self.impute_prob_sum = ip_sum;
+        self.impute_prob_of_1s = of1s;
+        hp
+    }
+
+    /// `backward` with the meeting protocol of [`Self::two_pass_states`].
+    fn backward_two_pass(&mut self, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32], cm: &[f64], mism: f32, tp: &TwoPass) {
+        let n_var = self.var_typ.len() as i32;
+        self.curr_segment_index = self.n_segs as i32 - 1;
+        self.curr_segment_locus = *self.segments.last().unwrap() - 1;
+        self.curr_missing_locus = self.n_miss as i32 - 1;
+        let sh = tp.sh;
+
+        let mut idx = n_var - 1;
+        while idx >= 0 {
+            self.curr_idx_locus = idx;
+            self.curr_abs_locus = self.var_abs[idx as usize];
+            self.curr_rel_locus = self.var_rel[idx as usize];
+
+            self.yt = self.transition_at(idx as usize + 1, cm);
+            self.nt = 1.0 - self.yt;
+
+            let typ = self.var_typ[idx as usize];
+            let seg = self.curr_segment_index as usize;
+            let seg_last_locus = self.segments[seg] - 1;
+            if typ >= VAR_PEAK_HET {
+                let c = typ as usize;
+                if idx == (n_var - 1) {
+                    self.init_peak_het(c, ref_bm, cond_haps);
+                } else if self.curr_segment_locus != seg_last_locus {
+                    self.run_peak_het(c, ref_bm, cond_haps);
+                } else {
+                    self.collapse_peak_het(c, ref_bm, cond_haps);
+                }
+            } else if typ == VAR_PEAK_HOM {
+                let ag = self.var_alt[idx as usize];
+                if idx == (n_var - 1) {
+                    self.init_peak_hom(ag, ref_bm, cond_haps, mism);
+                } else if self.curr_segment_locus != seg_last_locus {
+                    self.run_peak_hom(ag, ref_bm, cond_haps, mism);
+                } else {
+                    self.collapse_peak_hom(ag, ref_bm, cond_haps, mism);
+                }
+            } else if typ == VAR_FLAT_HET {
+                if idx == (n_var - 1) {
+                    self.init_flat_het();
+                } else if self.curr_segment_locus != seg_last_locus {
+                    self.run_flat_het();
+                } else {
+                    self.collapse_flat_het();
+                }
+            } else {
+                unreachable!("Unknown variant type in phasing backward pass");
+            }
+
+            // LEFT boundary: the backward state of this segment meets the
+            // forward state at the end of the previous one.
+            if self.curr_segment_locus == 0 {
+                self.sumk();
+                let hdst = seg * HAP_NUMBER;
+                self.phasing_prob_sum[hdst..hdst + HAP_NUMBER].copy_from_slice(&self.prob_sum_h);
+                self.phasing_prob_sum_sum[seg] = self.prob_sum_t;
+                if seg > 0 {
+                    // SAFETY: block `seg` lies in the reserved snapshot storage;
+                    // the meeting protocol gives it one writer and one reader.
+                    unsafe {
+                        let blk = tp.pp.add(seg * sh);
+                        if tp.seg[seg].claim() {
+                            std::ptr::copy_nonoverlapping(self.prob.as_ptr(), blk, sh);
+                            tp.seg[seg].publish(Meeting::BWD);
+                        } else {
+                            tp.seg[seg].wait(Meeting::FWD);
+                            let fs = tp.seg_fsum.add(seg * (HAP_NUMBER + 1));
+                            let mut sum_h = [0.0f32; HAP_NUMBER];
+                            sum_h.copy_from_slice(std::slice::from_raw_parts(fs, HAP_NUMBER));
+                            let f = TransInput { prob: blk, sum_h, sum_t: *fs.add(HAP_NUMBER) };
+                            // The forward pass's right neighbour of its last locus
+                            // is this pass's current locus.
+                            let yt = self.transition_at(idx as usize, cm);
+                            let (h, sum) = self.trans_hap_from(yt, &f, self.prob.as_ptr());
+                            tp.store_boundary(seg - 1, &h, sum);
+                        }
+                    }
+                }
+            }
+
+            if typ == VAR_FLAT_HET {
+                let miss = self.curr_missing_locus as usize;
+                // SAFETY: as above, for the flat-het block `miss`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(self.prob_sum_h.as_ptr(), tp.ip_sum.add(miss * HAP_NUMBER), HAP_NUMBER);
+                    self.impute_prob_sum_sum[miss] = self.prob_sum_t;
+                    let blk = tp.ip.add(miss * sh);
+                    if tp.miss[miss].claim() {
+                        std::ptr::copy_nonoverlapping(self.prob.as_ptr(), blk, sh);
+                        tp.miss[miss].publish(Meeting::BWD);
+                    } else {
+                        tp.miss[miss].wait(Meeting::FWD);
+                        let mut fsum = [0.0f32; HAP_NUMBER];
+                        fsum.copy_from_slice(std::slice::from_raw_parts(tp.miss_fsum.add(miss * HAP_NUMBER), HAP_NUMBER));
+                        let bsum = self.prob_sum_h;
+                        let out = self.impute_flat_het_from(ref_bm, cond_haps, self.prob.as_ptr(), &bsum, blk, &fsum);
+                        std::ptr::copy_nonoverlapping(out.as_ptr(), tp.of1s.add(miss * HAP_NUMBER), HAP_NUMBER);
+                    }
+                }
+                self.curr_missing_locus -= 1;
+            }
+
+            self.curr_segment_locus -= 1;
+            if self.curr_segment_locus < 0 && self.curr_segment_index > 0 {
+                self.curr_segment_index -= 1;
+                self.curr_segment_locus =
+                    self.segments[self.curr_segment_index as usize] - 1;
+            }
+
+            idx -= 1;
+        }
+    }
+
+    /// `forward` with the meeting protocol of [`Self::two_pass_states`] and
+    /// without the diplotype draws.
+    fn forward_two_pass(&mut self, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32], cm: &[f64], mism: f32, tp: &TwoPass) {
+        self.curr_segment_index = 0;
+        self.curr_segment_locus = 0;
+        self.curr_missing_locus = 0;
+        let sh = tp.sh;
+
+        let n_var = self.var_typ.len() as i32;
+        let mut idx = 0i32;
+        while idx < n_var {
+            self.curr_idx_locus = idx;
+            self.curr_abs_locus = self.var_abs[idx as usize];
+            self.curr_rel_locus = self.var_rel[idx as usize];
+
+            self.yt = self.transition_at(idx as usize, cm);
+            self.nt = 1.0 - self.yt;
+
+            let typ = self.var_typ[idx as usize];
+            let seg = self.curr_segment_index as usize;
+            if typ >= VAR_PEAK_HET {
+                let c = typ as usize;
+                if idx == 0 {
+                    self.init_peak_het(c, ref_bm, cond_haps);
+                } else if self.curr_segment_locus != 0 {
+                    self.run_peak_het(c, ref_bm, cond_haps);
+                } else {
+                    self.collapse_peak_het(c, ref_bm, cond_haps);
+                }
+            } else if typ == VAR_PEAK_HOM {
+                let ag = self.var_alt[idx as usize];
+                if idx == 0 {
+                    self.init_peak_hom(ag, ref_bm, cond_haps, mism);
+                } else if self.curr_segment_locus != 0 {
+                    self.run_peak_hom(ag, ref_bm, cond_haps, mism);
+                } else {
+                    self.collapse_peak_hom(ag, ref_bm, cond_haps, mism);
+                }
+            } else if typ == VAR_FLAT_HET {
+                if idx == 0 {
+                    self.init_flat_het();
+                } else if self.curr_segment_locus != 0 {
+                    self.run_flat_het();
+                } else {
+                    self.collapse_flat_het();
+                }
+            } else {
+                unreachable!("Unknown variant type in phasing forward pass");
+            }
+
+            let last_of_segment = self.curr_segment_locus == (self.segments[seg] - 1);
+            if last_of_segment {
+                self.sumk();
+            }
+
+            // Segment boundary: meet the backward state of the next segment.
+            if last_of_segment && idx != (n_var - 1) {
+                let blk_i = seg + 1;
+                // SAFETY: block `seg + 1` lies in the reserved snapshot storage;
+                // the meeting protocol gives it one writer and one reader.
+                unsafe {
+                    let blk = tp.pp.add(blk_i * sh);
+                    if tp.seg[blk_i].claim() {
+                        std::ptr::copy_nonoverlapping(self.prob.as_ptr(), blk, sh);
+                        let fs = tp.seg_fsum.add(blk_i * (HAP_NUMBER + 1));
+                        std::ptr::copy_nonoverlapping(self.prob_sum_h.as_ptr(), fs, HAP_NUMBER);
+                        *fs.add(HAP_NUMBER) = self.prob_sum_t;
+                        tp.seg[blk_i].publish(Meeting::FWD);
+                    } else {
+                        tp.seg[blk_i].wait(Meeting::BWD);
+                        let f = TransInput { prob: self.prob.as_ptr(), sum_h: self.prob_sum_h, sum_t: self.prob_sum_t };
+                        let yt = self.transition_at(idx as usize + 1, cm);
+                        let (h, sum) = self.trans_hap_from(yt, &f, blk);
+                        tp.store_boundary(seg, &h, sum);
+                    }
+                }
+            }
+
+            if typ == VAR_FLAT_HET {
+                let miss = self.curr_missing_locus as usize;
+                // SAFETY: as above, for the flat-het block `miss`.
+                unsafe {
+                    let blk = tp.ip.add(miss * sh);
+                    if tp.miss[miss].claim() {
+                        std::ptr::copy_nonoverlapping(self.prob.as_ptr(), blk, sh);
+                        std::ptr::copy_nonoverlapping(self.prob_sum_h.as_ptr(), tp.miss_fsum.add(miss * HAP_NUMBER), HAP_NUMBER);
+                        tp.miss[miss].publish(Meeting::FWD);
+                    } else {
+                        tp.miss[miss].wait(Meeting::BWD);
+                        let mut bsum = [0.0f32; HAP_NUMBER];
+                        bsum.copy_from_slice(std::slice::from_raw_parts(tp.ip_sum.add(miss * HAP_NUMBER), HAP_NUMBER));
+                        let fsum = self.prob_sum_h;
+                        let out = self.impute_flat_het_from(ref_bm, cond_haps, blk, &bsum, self.prob.as_ptr(), &fsum);
+                        std::ptr::copy_nonoverlapping(out.as_ptr(), tp.of1s.add(miss * HAP_NUMBER), HAP_NUMBER);
+                    }
+                }
+                self.curr_missing_locus += 1;
+            }
+
+            self.curr_segment_locus += 1;
+            if self.curr_segment_locus >= self.segments[self.curr_segment_index as usize] {
+                self.curr_segment_index += 1;
+                self.curr_segment_locus = 0;
+            }
+
+            idx += 1;
+        }
+    }
+
+    // ===================================================================
     //                          REPHASE (public entry)
     // ===================================================================
 
@@ -2048,7 +2468,18 @@ impl PhasingHmm {
             self.build_condbit_plans(cond_haps);
         }
         self.prepare_transitions(cm);
-        self.backward(ref_bm, cond_haps, cm, mism);
+        #[cfg(test)]
+        let ordered = self.two_pass_order != 0;
+        #[cfg(not(test))]
+        let ordered = false;
+        let concurrent = self.two_pass && (ordered || (self.var_typ.len() >= TWO_PASS_MIN_SITES
+            && rayon::current_num_threads() > 1));
+        let boundaries = if concurrent {
+            Some(self.two_pass_states(ref_bm, cond_haps, cm, mism))
+        } else {
+            self.backward(ref_bm, cond_haps, cm, mism);
+            None
+        };
 
         // Seed dip_sampled[0] from the segment-0 backward marginals.
         self.sum_dprobs = 0.0;
@@ -2060,8 +2491,20 @@ impl PhasingHmm {
         }
         self.dip_sampled[0] = rng_sample(&self.dprobs, self.sum_dprobs, rng_u01) as i32;
 
-        // forward (fills dip_sampled[seg+1] + imputeProbOf1s).
-        self.forward(ref_bm, cond_haps, cm, mism, rng_u01);
+        match boundaries {
+            // The forward pass's draws, in its order: one per segment boundary.
+            Some(hp) => for (seg, b) in hp.chunks_exact(HP_STRIDE).enumerate() {
+                self.curr_segment_index = seg as i32;
+                self.hprobs.copy_from_slice(&b[..HAP_NUMBER * HAP_NUMBER]);
+                self.sum_hprobs = b[HAP_NUMBER * HAP_NUMBER];
+                let ret1 = self.sum_hprobs.is_nan() || self.sum_hprobs.is_infinite() || self.sum_hprobs < F32_TINY;
+                debug_assert!(!ret1, "TRANS_HAP numerical failure");
+                let ret2 = self.sample_dip(rng_u01);
+                debug_assert!(!ret2, "SAMPLE_DIP numerical failure");
+            },
+            // forward (fills dip_sampled[seg+1] + imputeProbOf1s).
+            None => self.forward(ref_bm, cond_haps, cm, mism, rng_u01),
+        }
         // Relayout uses sampled diplotypes and allele marginals, not K-wide states.
         self.release_snapshots();
 
@@ -2143,6 +2586,110 @@ impl PhasingHmm {
         }
     }
 }
+
+/// Phaser calls with fewer typed sites run their passes one after the other.
+const TWO_PASS_MIN_SITES: usize = 2048;
+/// Floats stored per segment boundary by the concurrent passes: HProbs + sum.
+const HP_STRIDE: usize = HAP_NUMBER * HAP_NUMBER + 1;
+
+/// One meeting point of the concurrent passes: the first pass to arrive
+/// claims the block and stores its state; the other waits for it.
+struct Meeting(std::sync::atomic::AtomicU8);
+impl Meeting {
+    const EMPTY: u8 = 0;
+    const WRITING: u8 = 1;
+    const BWD: u8 = 2;
+    const FWD: u8 = 3;
+    fn new() -> Self { Meeting(std::sync::atomic::AtomicU8::new(Self::EMPTY)) }
+    fn claim(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.0.compare_exchange(Self::EMPTY, Self::WRITING, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+    fn publish(&self, state: u8) { self.0.store(state, std::sync::atomic::Ordering::Release); }
+    /// The other pass claimed first and is copying one block: wait for it.
+    fn wait(&self, state: u8) {
+        let mut spins = 0u32;
+        loop {
+            let s = self.0.load(std::sync::atomic::Ordering::Acquire);
+            if s == state { return; }
+            debug_assert_eq!(s, Self::WRITING, "meeting block in an unexpected state");
+            spins += 1;
+            if spins < 1 << 10 { std::hint::spin_loop(); } else { std::thread::yield_now(); }
+        }
+    }
+}
+
+/// Storage the two concurrent passes share (see `PhasingHmm::two_pass_states`).
+struct TwoPass {
+    sh: usize,
+    /// Segment blocks (`n_segs` x K x 8): block `s + 1` meets boundary `s`.
+    pp: *mut f32,
+    /// Flat-het blocks (`n_miss` x K x 8).
+    ip: *mut f32,
+    /// Backward lane sums at each flat het, written before its block is published.
+    ip_sum: *mut f32,
+    of1s: *mut f32,
+    /// Forward lane sums and total stored with a segment block (8 + 1 per block).
+    seg_fsum: *mut f32,
+    /// Forward lane sums stored with a flat-het block.
+    miss_fsum: *mut f32,
+    /// HProbs and sum per boundary (`HP_STRIDE` floats each).
+    hp: *mut f32,
+    seg: Box<[Meeting]>,
+    miss: Box<[Meeting]>,
+}
+// SAFETY: every block is written by exactly one pass and read by the other
+// only after the Release/Acquire hand-over of its `Meeting`.
+unsafe impl Sync for TwoPass {}
+impl TwoPass {
+    /// # Safety
+    /// Boundary `b` is stored once, by the pass that computed it.
+    unsafe fn store_boundary(&self, b: usize, h: &[f32; HAP_NUMBER * HAP_NUMBER], sum: f32) { unsafe {
+        let dst = self.hp.add(b * HP_STRIDE);
+        std::ptr::copy_nonoverlapping(h.as_ptr(), dst, HAP_NUMBER * HAP_NUMBER);
+        *dst.add(HAP_NUMBER * HAP_NUMBER) = sum;
+    }}
+}
+
+/// Hands a phaser to the other Rayon task of `two_pass_states`.
+struct SendPtr(*mut PhasingHmm);
+// SAFETY: each pointer is dereferenced by one task only, and outlives the join.
+unsafe impl Send for SendPtr {}
+impl SendPtr {
+    fn get(&self) -> *mut PhasingHmm { self.0 }
+}
+
+/// A forward state as TRANS_HAP reads it: the K x 8 `prob` block and its lane
+/// sums and total.
+struct TransInput { prob: *const f32, sum_h: [f32; HAP_NUMBER], sum_t: f32 }
+
+/// TRANS_HAP scalar arithmetic from an explicit forward state and backward
+/// block (K x 8 floats each), returning `(HProbs, sum)`.
+///
+/// # Safety
+/// `fwd.prob` and `bwd` must each address K x 8 readable floats.
+unsafe fn trans_hap_scalar_raw(
+    n_states: usize, yt: f32, nt: f32, fwd: &TransInput, bwd: *const f32,
+) -> ([f32; HAP_NUMBER * HAP_NUMBER], f32) { unsafe {
+    let fact2 = nt / fwd.sum_t;
+    let mut hprobs = [0.0f32; HAP_NUMBER * HAP_NUMBER];
+    let mut sum_hprobs = 0.0f32;
+    for h1 in 0..HAP_NUMBER {
+        let fact1 = (fwd.sum_h[h1] / fwd.sum_t) * yt / n_states as f32;
+        let mut sum = [0.0f32; HAP_NUMBER];
+        for k in 0..n_states {
+            let base = k * HAP_NUMBER;
+            let prob0 = *fwd.prob.add(base + h1) * fact2 + fact1;
+            for h2 in 0..HAP_NUMBER {
+                sum[h2] += prob0 * *bwd.add(base + h2);
+            }
+        }
+        let j = h1 * HAP_NUMBER;
+        hprobs[j..j + HAP_NUMBER].copy_from_slice(&sum);
+        sum_hprobs += hadd(&sum);
+    }
+    (hprobs, sum_hprobs)
+}}
 
 /// Horizontal add of 8 f32 lanes. The SIMD paths use an AVX2 reduction tree
 /// (low128+high128, movehdup, movehl); this scalar left-to-right sum differs
@@ -2273,6 +2820,54 @@ mod tests {
                     (a, b, count, bits(&hmm.phasing_prob), bits(&hmm.impute_prob), bits(&hmm.impute_prob_of_1s))
                 };
                 assert_eq!(run(None), run(Some(&base)), "k={k} compact={compact}");
+            }
+        }
+    }
+
+    /// The concurrent backward/forward passes give the sequential result bit
+    /// for bit: phase, random draws and flat-het allele probabilities, whether
+    /// the passes run together or either one entirely first.
+    #[test]
+    fn two_pass_rephase_matches_sequential() {
+        use crate::lcwgs::hmm::{reference_pack as rp, BasePack};
+        let mut rng = rp::Xs(0x2545_F491_4F6C_DD1D);
+        let params = LsParams::default();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        for &(n, nh, k, flat_one_in) in &[(2600usize, 300usize, 65usize, 3u64), (3000, 520, 129, 2), (2100, 80, 7, 9), (2400, 700, 1, 4)] {
+            let bm = rp::random_panel(&mut rng, n, nh, 50);
+            let cm: Vec<f64> = (0..n).map(|v| v as f64 * 0.0007).collect();
+            let cond: Vec<u32> = (0..k).map(|i| ((i * 37) % nh) as u32).collect();
+            for compact in [false, true] {
+                let poly: Vec<i32> = (0..n).filter(|_| !compact || rng.below(5) != 0).map(|v| v as i32).collect();
+                let mono: Vec<i32> = (0..n as i32).filter(|v| !poly.contains(v)).collect();
+                let sites: Vec<usize> = poly.iter().map(|&v| v as usize).collect();
+                let mut base = BasePack::new();
+                base.build(&bm, &cond[..k / 2], &sites, n);
+                let h0: Vec<bool> = (0..n).map(|_| rng.below(2) == 0).collect();
+                let h1: Vec<bool> = (0..n).map(|_| rng.below(2) == 0).collect();
+                let flat: Vec<bool> = (0..n).map(|_| rng.below(flat_one_in) == 0).collect();
+                let lq: Vec<bool> = (0..n).map(|_| rng.below(11) == 0).collect();
+                let run = |two_pass: bool, order: u8, pack: Option<&BasePack>| pool.install(|| {
+                    let mut hmm = PhasingHmm::new(&params);
+                    hmm.set_two_pass(two_pass);
+                    hmm.two_pass_order = order;
+                    let (mut a, mut b) = (h0.clone(), h1.clone());
+                    let mut draws = rp::Xs(77_003);
+                    let mut count = 0;
+                    hmm.rephase(&mut a, &mut b, &flat, &cond, &bm, &cm, &params,
+                        &poly, &mono, &lq, &mut || { count += 1; draws.below(1 << 24) as f32 / (1 << 24) as f32 }, pack);
+                    let bits = |xs: &[f32]| xs.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                    (a, b, count, bits(&hmm.impute_prob_of_1s), hmm.dip_sampled.clone())
+                });
+                for pack in [None, Some(&base)] {
+                    let want = run(false, 0, pack);
+                    for order in [1u8, 2] {
+                        assert_eq!(run(true, order, pack), want, "n={n} k={k} compact={compact} order={order}");
+                    }
+                    for rep in 0..6 {
+                        assert_eq!(run(true, 0, pack), want, "n={n} k={k} compact={compact} rep={rep}");
+                    }
+                }
             }
         }
     }
