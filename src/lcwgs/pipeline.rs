@@ -139,7 +139,7 @@ pub fn run_lcwgs(
     memtrace("after gl3_shared relayout (gl3_input dropped)");
 
     // --- 5. cM map + chunked Gibbs imputation (shared with the BAM path) ---
-    impute_from_gl3(srp, &wgs_idx, gl3_shared, n_samples, sample_ids, &pl_haploid, map_path, params)
+    impute_from_gl3(srp, &wgs_idx, gl3_shared, n_samples, sample_ids, &pl_haploid, map_path, params, None)
 }
 
 /// Shared imputation tail for both lcWGS paths (VCF-PL and BAM): given `gl3` in
@@ -150,6 +150,7 @@ pub fn run_lcwgs(
 /// bounds memory: the reference bitmatrix is extracted from the SRP per chunk,
 /// never the whole chromosome at once. `LCWGS_RAW_GL` returns the un-imputed
 /// GL-implied dosage (`E[ALT]=g1+2·g2`) for diagnostics.
+#[allow(clippy::too_many_arguments)]
 fn impute_from_gl3(
     srp: &SrpReader,
     wgs_idx: &[usize],
@@ -159,6 +160,7 @@ fn impute_from_gl3(
     pl_haploid: &[bool],
     map_path: &str,
     params: &LcwgsParams,
+    prepared: Option<Prepared>,
 ) -> std::io::Result<LcwgsOutput> {
     let n_shared = wgs_idx.len();
     // The coverage proxy of the SPLIT gate and the adaptive GL floor, read from the
@@ -166,12 +168,10 @@ fn impute_from_gl3(
     // his reads are, which would switch the split off on his chrX alone.
     let mean_conf = gl_mean_conf(&gl3_shared, n_samples, n_shared);
     let haploid = haploid_chrx(&mut gl3_shared, srp, wgs_idx, n_samples, &sample_ids, pl_haploid, params);
-    let (map_bp, map_cm) = genmap::load_genetic_map_for(std::path::Path::new(map_path), Some(srp.chromosome()))?;
-    // Beyond the map's ends: the chromosome's mean rate, GLIMPSE2's convention,
-    // which this engine is calibrated and benchmarked against.
-    let cm: Vec<f64> = wgs_idx.iter().map(|&wi| {
-        genmap::interpolate_cm_mean_rate(&map_bp, &map_cm, srp.variants[wi].pos)
-    }).collect();
+    let (cm, prepared_chunks) = match prepared {
+        Some(p) => (p.cm, Some(p.chunks)),
+        None => (site_cm(srp, wgs_idx, map_path)?, None),
+    };
 
     if crate::config::present("LCWGS_RAW_GL") {
         let mut raw = vec![0.0f32; n_shared * n_samples];
@@ -227,10 +227,81 @@ fn impute_from_gl3(
     }
     let params: &LcwgsParams = if modified { &eff } else { params };
 
-    let (dosage, mut gp) = run_chunked_gibbs(&gl3_shared, srp, wgs_idx, &cm, n_samples, n_shared, params, mean_conf);
+    let (dosage, mut gp) = run_chunked_gibbs(&gl3_shared, srp, wgs_idx, &cm, n_samples, n_shared, params, mean_conf,
+        prepared_chunks.as_deref());
     if let Some(cells) = &haploid { haploid_gp(cells, &dosage, &mut gp, n_samples); }
     Ok(LcwgsOutput { dosage, gp, n_variants: n_shared, sample_ids, panel_idx: wgs_idx.to_vec() })
 }
+
+/// Genetic position of every shared site. Beyond the map's ends: the
+/// chromosome's mean rate, GLIMPSE2's convention, which this engine is
+/// calibrated and benchmarked against.
+fn site_cm(srp: &SrpReader, wgs_idx: &[usize], map_path: &str) -> std::io::Result<Vec<f64>> {
+    let (map_bp, map_cm) = genmap::load_genetic_map_for(std::path::Path::new(map_path), Some(srp.chromosome()))?;
+    Ok(wgs_idx.iter().map(|&wi| {
+        genmap::interpolate_cm_mean_rate(&map_bp, &map_cm, srp.variants[wi].pos)
+    }).collect())
+}
+
+/// A chunk's panel-side state, built while a single sample's reads are piled
+/// up: its reference bitmatrix and the selection's panel side. Both are
+/// functions of the panel, the map and `rare_maf` alone.
+struct ChunkPrep {
+    bm: crate::common::HaplotypeBitmatrix,
+    panel: Option<super::iterate::PanelSide>,
+}
+
+/// Site positions and the chunks prepared ahead (by chunk index; `None` for a
+/// chunk built when it starts).
+struct Prepared {
+    cm: Vec<f64>,
+    chunks: Vec<std::sync::Mutex<Option<ChunkPrep>>>,
+}
+
+/// Build, in parallel, the panel side of the chunks a single sample's run will
+/// start first: as many of the largest chunks as fit nine tenths of the state
+/// allowance the scheduler will grant (estimated before the pileup, with the
+/// likelihoods and a pileup allowance counted as shared).
+fn prepare_chunks(srp: &SrpReader, wgs_idx: &[usize], map_path: &str, params: &LcwgsParams) -> std::io::Result<Prepared> {
+    use rayon::prelude::*;
+    let cm = site_cm(srp, wgs_idx, map_path)?;
+    let n_shared = wgs_idx.len();
+    let n_ref = srp.metadata.n_haps;
+    let (core_cm, buffer_cm) = (params.chunk_core_cm(), params.chunk_buffer_cm());
+    let n_chunks = if n_shared == 0 { 0 } else { (((cm[n_shared - 1] - cm[0]) / core_cm).ceil() as usize).max(1) };
+    let ranges: Vec<_> = (0..n_chunks).map(|c| super::chunk_ranges::chunk_ranges(&cm, c, n_chunks, core_cm, buffer_cm)).collect();
+    let threads = rayon::current_num_threads().max(1);
+    let shared = (rss_gb() * 1_073_741_824.0) as usize
+        + threads * (super::hmm::CACHE_BYTES_PER_WORKER + super::membership::CACHE_BYTES_PER_WORKER)
+        + threads.min(n_chunks) * (super::membership::CACHE_BYTES_PER_WORKER + 64 * 1024)
+        + n_shared * (16 + 12) + 64 * 1024 * 1024 + PILEUP_ALLOWANCE;
+    let host_allowance = ((crate::log::system_ram_mb() / 1024.0 * 0.5).max(2.5) * 1e9) as usize;
+    let limit = crate::config::f64_opt("LCWGS_MEM_BUDGET_GB").map(|gb| (gb * 1e9) as usize)
+        .unwrap_or_else(|| baseline_memory_budget(n_shared, n_ref, 1, n_chunks, threads, shared, host_allowance));
+    let allowance = limit.saturating_sub(shared) / 2 * 9 / 10;
+    let costs: Vec<usize> = ranges.iter().map(|r| r.as_ref().map_or(0, |(_, b)| chunk_state_bytes(b.len(), n_ref, 1))).collect();
+    let mut order: Vec<usize> = (0..n_chunks).filter(|&c| ranges[c].is_some()).collect();
+    order.sort_by_key(|&c| std::cmp::Reverse(costs[c]));
+    let (mut used, mut picked) = (0usize, Vec::new());
+    for c in order {
+        if used + costs[c] > allowance { break; }
+        used += costs[c];
+        picked.push(c);
+    }
+    let selector = !crate::config::present("LCWGS_NO_FAITHFUL_SELECT") && !crate::config::present("LCWGS_CHRWIDE_PBWT");
+    let built: Vec<(usize, ChunkPrep)> = picked.par_iter().map(|&c| {
+        let (_, buffer) = ranges[c].clone().unwrap();
+        let bm = srp.extract_ref_alleles_bitmatrix(&wgs_idx[buffer.clone()]);
+        let panel = selector.then(|| std::sync::Arc::new(super::faithful_select::FaithfulPanel::build(&bm, &cm[buffer], params)));
+        (c, ChunkPrep { bm, panel })
+    }).collect();
+    let chunks: Vec<_> = (0..n_chunks).map(|_| std::sync::Mutex::new(None)).collect();
+    for (c, prep) in built { *chunks[c].lock().unwrap() = Some(prep); }
+    Ok(Prepared { cm, chunks })
+}
+
+/// Memory the pileup may still hold when the chunks start.
+const PILEUP_ALLOWANCE: usize = 256 * 1024 * 1024;
 
 /// The sex test reads panel allele frequencies over up to `SEX_TEST_BLOCKS` blocks of
 /// `SEX_TEST_SITES` consecutive non-PAR sites spread along the chromosome (contiguous
@@ -492,11 +563,20 @@ pub fn run_lcwgs_bam(
 
     let pp = super::bam_pileup::PileupParams::default();
     let region_bounds = region.map(|(_, s, e)| (s, e));
-    let bamgl = super::bam_pileup::pileup_bams(bam_paths, &chrom, &pos, &ref_base, &alt_base, &is_snp, region_bounds, reference, indel_model.as_ref(), pp)?;
+    let pileup = || super::bam_pileup::pileup_bams(bam_paths, &chrom, &pos, &ref_base, &alt_base, &is_snp, region_bounds, reference, indel_model.as_ref(), pp);
+    // A single sample's chunks start together once its reads are piled up:
+    // build their panel side meanwhile.
+    let ahead = bam_paths.len() == 1 && rayon::current_num_threads() > 1 && !crate::config::present("LCWGS_RAW_GL");
+    let (bamgl, prepared) = if ahead {
+        let (gl, prep) = rayon::join(pileup, || prepare_chunks(srp, &wgs_idx, map_path, params));
+        (gl?, Some(prep?))
+    } else {
+        (pileup()?, None)
+    };
     let n_samples = bamgl.sample_ids.len();
 
     // bamgl.gl3 is already in panel-shared order → shared imputation tail.
-    impute_from_gl3(srp, &wgs_idx, bamgl.gl3, n_samples, bamgl.sample_ids, &[], map_path, params)
+    impute_from_gl3(srp, &wgs_idx, bamgl.gl3, n_samples, bamgl.sample_ids, &[], map_path, params, prepared)
 }
 
 /// Resolve the two-depth common/rare split for this run (see `process_chunk`).
@@ -642,6 +722,7 @@ fn baseline_memory_budget(
 ///
 /// Returns (dosage, gp) per (variant, sample) in shared-panel order.
 /// `gp` is 3 genotype posteriors per variant×sample.
+#[allow(clippy::too_many_arguments)]
 fn run_chunked_gibbs(
     gl3_shared: &[f32],
     srp: &SrpReader,
@@ -651,6 +732,7 @@ fn run_chunked_gibbs(
     n_shared: usize,
     params: &LcwgsParams,
     mean_conf: f32,
+    prepared: Option<&[std::sync::Mutex<Option<ChunkPrep>>]>,
 ) -> (Vec<f32>, Vec<f32>) {
     // GLIMPSE2-style: ~core_cm core + buffer_cm each side. Defaults chosen to
     // match GLIMPSE2_chunk's typical ~few-cM cores. cM span of chr22 ≈ 50.
@@ -763,14 +845,18 @@ fn run_chunked_gibbs(
         // pipeline uses, and keeps peak memory at K × chunk_size (the full-
         // chromosome ref bitmatrix is never materialized).
         let chunk_wgs = &wgs_idx[buf_start..buf_end];
-        let chunk_bm = srp.extract_ref_alleles_bitmatrix(&chunk_wgs);
+        let prep = prepared.and_then(|p| p.get(c)).and_then(|m| m.lock().unwrap().take());
+        let (chunk_bm, panel) = match prep {
+            Some(ChunkPrep { bm, panel }) => (bm, panel),
+            None => (srp.extract_ref_alleles_bitmatrix(chunk_wgs), None),
+        };
 
-        let mut out = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, None, chrwide_cond.as_ref(), execution);
+        let mut out = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, None, chrwide_cond.as_ref(), execution, panel.as_ref());
         // Two-depth split: run the deep pass and overlay its dose/GP onto the band
         // sites (panel MAF ∈ [lo,hi)), routing by PANEL allele frequency only (known
         // a-priori; no truth). Byte-identical when `split_band` is None.
         if let Some((lo, hi, deep_k)) = split_band {
-            let out_deep = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, Some(deep_k), chrwide_cond.as_ref(), execution);
+            let out_deep = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, Some(deep_k), chrwide_cond.as_ref(), execution, panel.as_ref());
             let n_ref = chunk_bm.n_haps;
             for lv in 0..chunk_bm.n_sites {
                 let ac = chunk_bm.popcount_row(lv, n_ref) as f64;
@@ -980,7 +1066,7 @@ mod tests {
             let costs: Vec<_> = inputs.iter().map(|(_, cm, _)| chunk_state_bytes(cm.len(), 40, ns)).collect();
             let process = |c: usize, execution: SampleExecution<'_>| {
                 let (bm, cm, gl) = &inputs[c];
-                let out = super::super::iterate::run_gibbs_ensemble_with_memory(gl, bm, cm, ns, &params, None, None, execution);
+                let out = super::super::iterate::run_gibbs_ensemble_with_memory(gl, bm, cm, ns, &params, None, None, execution, None);
                 (out.dosage.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                  out.gp.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
             };

@@ -41,11 +41,55 @@ use crate::sparse_ls::unphred;
 use crate::sparse_ls::variant::{Variant, VariantMap};
 use super::LcwgsParams;
 
+/// The panel side of faithful selection for one chunk: the reference
+/// haplotype set and its compressed sparse PBWT. A function of the chunk's
+/// panel, map and `rare_maf` alone, so it can be built before the reads are
+/// piled up and shared by the chunk's Gibbs runs.
+pub struct FaithfulPanel {
+    ref_hs: RefHaplotypeSet,
+    vmap: VariantMap,
+}
+
+impl FaithfulPanel {
+    pub fn build(ref_bm: &HaplotypeBitmatrix, cm: &[f64], params: &LcwgsParams) -> Self {
+        let n_var = cm.len();
+        let n_ref = ref_bm.n_haps;
+
+        // --- VariantMap (only cref/calt/cm/lq are read by selection). ---
+        let mut vmap = VariantMap::new();
+        vmap.vars.reserve(n_var);
+        for v in 0..n_var {
+            let calt = ref_bm.popcount_row(v, n_ref);
+            let cref = n_ref as u32 - calt;
+            vmap.vars.push(Variant {
+                bp: v as i64,         // placeholder (selection doesn't read bp)
+                id: String::new(),    // placeholder
+                ref_a: String::new(), // placeholder
+                alt_a: String::new(), // placeholder
+                vtype: 0,
+                idx: v as i32,
+                cref,
+                calt,
+                cm: cm[v],
+                lq: false,
+            });
+        }
+
+        // --- RefHaplotypeSet + compressed sparse PBWT (built once). ---
+        // sparse_maf default 0.001 (== LcwgsParams.rare_maf default) drives the
+        // common/rare split exactly as GLIMPSE2 does.
+        let mut ref_hs = RefHaplotypeSet::new();
+        ref_hs.sparse_maf = params.rare_maf as f64;
+        ref_hs.build_from_panel(ref_bm, &vmap);
+        ref_hs.build_sparse_pbwt(&vmap, ref_bm);
+        FaithfulPanel { ref_hs, vmap }
+    }
+}
+
 /// Persistent state for faithful selection across the Gibbs iterations of one
 /// `run_gibbs` (one chunk). Built ONCE before the loop, driven each iteration.
 pub struct FaithfulSelector {
-    ref_hs: RefHaplotypeSet,
-    vmap: VariantMap,
+    panel: std::sync::Arc<FaithfulPanel>,
     tar: TargetHaplotypeSet,
     /// Shared MT19937 for the selection draws: the per-group stored checkpoints +
     /// random PBWT start positions in `match_haps`, and the `std::sample` top-up
@@ -112,36 +156,23 @@ impl FaithfulSelector {
         params: &LcwgsParams,
         seed: u64,
     ) -> Self {
-        let n_var = cm.len();
+        let panel = std::sync::Arc::new(FaithfulPanel::build(ref_bm, cm, params));
+        Self::with_panel(panel, ref_bm, gl3, n_samples, params, seed)
+    }
+
+    /// [`Self::build`] from a panel side built beforehand from the same
+    /// `ref_bm`, map and `rare_maf`.
+    pub fn with_panel(
+        panel: std::sync::Arc<FaithfulPanel>,
+        ref_bm: &HaplotypeBitmatrix,
+        gl3: &[f32],
+        n_samples: usize,
+        params: &LcwgsParams,
+        seed: u64,
+    ) -> Self {
+        let n_var = panel.vmap.vars.len();
         let n_ref = ref_bm.n_haps;
-
-        // --- VariantMap (only cref/calt/cm/lq are read by selection). ---
-        let mut vmap = VariantMap::new();
-        vmap.vars.reserve(n_var);
-        for v in 0..n_var {
-            let calt = ref_bm.popcount_row(v, n_ref);
-            let cref = n_ref as u32 - calt;
-            vmap.vars.push(Variant {
-                bp: v as i64,         // placeholder (selection doesn't read bp)
-                id: String::new(),    // placeholder
-                ref_a: String::new(), // placeholder
-                alt_a: String::new(), // placeholder
-                vtype: 0,
-                idx: v as i32,
-                cref,
-                calt,
-                cm: cm[v],
-                lq: false,
-            });
-        }
-
-        // --- RefHaplotypeSet + compressed sparse PBWT (built once). ---
-        // sparse_maf default 0.001 (== LcwgsParams.rare_maf default) drives the
-        // common/rare split exactly as GLIMPSE2 does.
-        let mut ref_hs = RefHaplotypeSet::new();
-        ref_hs.sparse_maf = params.rare_maf as f64;
-        ref_hs.build_from_panel(ref_bm, &vmap);
-        ref_hs.build_sparse_pbwt(&vmap, ref_bm);
+        let (ref_hs, vmap) = (&panel.ref_hs, &panel.vmap);
 
         // --- Selection params mapped from LcwgsParams. ---
         // kpbwt MUST be clamped below n_ref. This comment claimed the clamp
@@ -177,12 +208,12 @@ impl FaithfulSelector {
 
         // --- Target side + PBWT scratch (all diploid; lcWGS is diploid). ---
         let tar_ploidy = vec![2i32; n_samples];
-        let mut tar = TargetHaplotypeSet::new(&ref_hs, n_samples, tar_ploidy);
+        let mut tar = TargetHaplotypeSet::new(ref_hs, n_samples, tar_ploidy);
         tar.allocate_pbwt(
-            &ref_hs,
+            ref_hs,
             params.pbwt_depth as i32,
             params.pbwt_modulo_cm,
-            &vmap,
+            vmap,
             ls_params.kinit as i32,
             ls_params.kpbwt as i32,
         );
@@ -213,8 +244,7 @@ impl FaithfulSelector {
         let shared_rng = Mt19937Rng::new(seed32);
 
         FaithfulSelector {
-            ref_hs,
-            vmap,
+            panel,
             tar,
             shared_rng,
             unphred_table: *unphred::table(),
@@ -271,10 +301,10 @@ impl FaithfulSelector {
                 // `self.tar` stays independently borrowable.
                 let views = build_views(self.n_samples, &self.gl_bytes, &self.flat, &self.h0, &self.h1);
                 self.tar
-                    .init_rare_tar(&self.ref_hs, &views, &self.vmap, &self.unphred_table);
+                    .init_rare_tar(&self.panel.ref_hs, &views, &self.panel.vmap, &self.unphred_table);
             }
             self.tar
-                .perform_selection_rare_init_gl(&self.ref_hs, &self.vmap, &mut self.shared_rng);
+                .perform_selection_rare_init_gl(&self.panel.ref_hs, &self.panel.vmap, &mut self.shared_rng);
             self.init_done = true;
             return self.flatten_init();
         }
@@ -282,24 +312,24 @@ impl FaithfulSelector {
         // Iterate stage: refresh target haps, transpose rare, compressed-PBWT match.
         {
             let views = build_views(self.n_samples, &self.gl_bytes, &self.flat, &self.h0, &self.h1);
-            self.tar.update_haplotypes(&self.ref_hs, &views);
+            self.tar.update_haplotypes(&self.panel.ref_hs, &views);
         }
-        self.tar.transpose_rare_tar(&self.ref_hs);
+        self.tar.transpose_rare_tar(&self.panel.ref_hs);
         match (&self.plan, self.segmented) {
             (None, true) => {
                 #[cfg(test)]
                 let mut plan = self.segment_commons.map_or_else(SegmentPlan::new, SegmentPlan::with_segment_commons);
                 #[cfg(not(test))]
                 let mut plan = SegmentPlan::new();
-                self.tar.match_haps_recording(&self.ref_hs, &self.vmap, &mut self.shared_rng, &mut plan);
+                self.tar.match_haps_recording(&self.panel.ref_hs, &self.panel.vmap, &mut self.shared_rng, &mut plan);
                 self.plan = Some(plan);
             }
             (Some(plan), true) if plan.is_parallel() => {
-                self.tar.match_haps_segmented(&self.ref_hs, &self.vmap, plan, &mut self.shared_rng);
+                self.tar.match_haps_segmented(&self.panel.ref_hs, &self.panel.vmap, plan, &mut self.shared_rng);
             }
             _ => self.tar.match_haps_from_compressed_pbwt_small(
-                &self.ref_hs,
-                &self.vmap,
+                &self.panel.ref_hs,
+                &self.panel.vmap,
                 /*main_iteration=*/ false,
                 &mut self.shared_rng,
             ),
@@ -386,7 +416,7 @@ impl FaithfulSelector {
                 CapOrder::Index => {
                     // Union across all depth layers, dedup, ascending, truncate —
                     // quality-blind: keeps the LOWEST haplotype indices.
-                    index_union(&self.tar.pbwt_states[s], self.ref_hs.n_ref_haps, self.kpbwt)
+                    index_union(&self.tar.pbwt_states[s], self.panel.ref_hs.n_ref_haps, self.kpbwt)
                 }
             };
             if diag {

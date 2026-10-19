@@ -533,9 +533,14 @@ pub fn run_gibbs(
     k_max_override: Option<usize>,
     precomputed_cond: Option<&Vec<Vec<u32>>>,
 ) -> GibbsOutput {
-    run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, SampleExecution::Unbudgeted)
+    run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, SampleExecution::Unbudgeted, None)
 }
 
+/// The selection's panel side built ahead of a chunk's Gibbs runs (see
+/// [`super::faithful_select::FaithfulPanel`]).
+pub(crate) type PanelSide = std::sync::Arc<super::faithful_select::FaithfulPanel>;
+
+#[allow(clippy::too_many_arguments)]
 fn run_gibbs_with_memory(
     gl3: &[f32],
     ref_bm: &HaplotypeBitmatrix,
@@ -545,6 +550,7 @@ fn run_gibbs_with_memory(
     k_max_override: Option<usize>,
     precomputed_cond: Option<&Vec<Vec<u32>>>,
     execution: SampleExecution<'_>,
+    panel: Option<&PanelSide>,
 ) -> GibbsOutput {
     let memory = execution.permits();
     let n_var = cm.len();
@@ -609,9 +615,10 @@ fn run_gibbs_with_memory(
     // default OFF). Built ONCE per chunk from the same ref_bm + cm + gl3 the
     // hybrid uses; drives the GLIMPSE2 per-individual selection each refresh.
     let mut faithful: Option<super::faithful_select::FaithfulSelector> = if cfg.faithful_select && precomputed_cond.is_none() {
-        let mut f = super::faithful_select::FaithfulSelector::build(
-            ref_bm, cm, gl3, n_samples, params, seed,
-        );
+        let mut f = match panel {
+            Some(p) => super::faithful_select::FaithfulSelector::with_panel(p.clone(), ref_bm, gl3, n_samples, params, seed),
+            None => super::faithful_select::FaithfulSelector::build(ref_bm, cm, gl3, n_samples, params, seed),
+        };
         // A single admitted sample decodes the panel half of its sweeps on
         // idle workers (same selection).
         f.set_segmented(memory.is_some());
@@ -1275,6 +1282,7 @@ pub fn run_gibbs_ensemble(
     run_gibbs_ensemble_n(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_gibbs_ensemble_with_memory(
     gl3: &[f32],
     ref_bm: &HaplotypeBitmatrix,
@@ -1284,9 +1292,10 @@ pub(crate) fn run_gibbs_ensemble_with_memory(
     k_max_override: Option<usize>,
     precomputed_cond: Option<&Vec<Vec<u32>>>,
     execution: SampleExecution<'_>,
+    panel: Option<&PanelSide>,
 ) -> GibbsOutput {
     let n_restarts = crate::config::usize_or("LCWGS_GIBBS_RESTARTS", 1).max(1);
-    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, execution)
+    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, execution, panel)
 }
 
 /// Inner ensemble with an explicit restart count (the env-read entry point
@@ -1304,9 +1313,10 @@ pub(crate) fn run_gibbs_ensemble_n(
     precomputed_cond: Option<&Vec<Vec<u32>>>,
     n_restarts: usize,
 ) -> GibbsOutput {
-    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, SampleExecution::Unbudgeted)
+    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, SampleExecution::Unbudgeted, None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_gibbs_ensemble_inner(
     gl3: &[f32],
     ref_bm: &HaplotypeBitmatrix,
@@ -1317,10 +1327,11 @@ fn run_gibbs_ensemble_inner(
     precomputed_cond: Option<&Vec<Vec<u32>>>,
     n_restarts: usize,
     execution: SampleExecution<'_>,
+    panel: Option<&PanelSide>,
 ) -> GibbsOutput {
     let n_restarts = n_restarts.max(1);
     if n_restarts == 1 {
-        return run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, execution);
+        return run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, execution, panel);
     }
     let base = params.seed_or_default();
     let mut acc_d: Vec<f64> = Vec::new();
@@ -1328,7 +1339,7 @@ fn run_gibbs_ensemble_inner(
     for i in 0..n_restarts {
         let mut p = params.clone();
         p.seed = base.wrapping_add(i as u64);
-        let out = run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, &p, k_max_override, precomputed_cond, execution);
+        let out = run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, &p, k_max_override, precomputed_cond, execution, panel);
         if acc_d.is_empty() {
             acc_d = vec![0.0f64; out.dosage.len()];
             acc_g = vec![0.0f64; out.gp.len()];
