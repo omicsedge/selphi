@@ -501,11 +501,14 @@ impl Shared<'_> {
         self.pending.fetch_sub(1, Ordering::AcqRel);
         if !self.claim(b) { return; }
         let k = self.ctx.k;
-        let mut buf = self.scratch.lock().unwrap().pop()
-            .unwrap_or_else(|| (sized(Vec::new(), k), sized(Vec::new(), self.stride * k)));
+        // Scratch from the calling thread's pool goes back to it; scratch this
+        // worker allocates is freed here, by its allocator.
+        let pooled = self.scratch.lock().unwrap().pop();
+        let from_pool = pooled.is_some();
+        let mut buf = pooled.unwrap_or_else(|| (sized(Vec::new(), k), sized(Vec::new(), self.stride * k)));
         let mut beta_sum = self.load_slot(b, buf.0.as_mut_ptr());
         self.process_block::<A>(b, buf.0.as_mut_ptr(), &mut beta_sum, buf.1.as_mut_ptr());
-        self.scratch.lock().unwrap().push(buf);
+        if from_pool { self.scratch.lock().unwrap().push(buf); }
         #[cfg(test)]
         TASK_BLOCKS.fetch_add(1, Ordering::Relaxed);
     }}

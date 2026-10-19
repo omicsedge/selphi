@@ -25,7 +25,7 @@ use std::sync::{Condvar, Mutex};
 /// Common columns per segment.
 const SEGMENT_COMMONS: usize = 128;
 /// Segments decoded ahead of the target sweep.
-const LOOKAHEAD: usize = 4;
+const LOOKAHEAD: usize = 3;
 /// Decoder threads per sweep.
 const DECODERS: usize = 3;
 
@@ -87,7 +87,7 @@ impl SegmentPlan {
     /// `sites` sites over `n_ref` haplotypes (at most one boundary array per
     /// `SEGMENT_COMMONS` sites; each segment at most two arrays per site).
     pub fn bytes(sites: usize, n_ref: usize) -> usize {
-        let in_flight = LOOKAHEAD + DECODERS + 1;
+        let in_flight = LOOKAHEAD + 1;
         let arrays = sites / SEGMENT_COMMONS + 1 + in_flight * 2 * SEGMENT_COMMONS;
         let id = if narrow(n_ref) { 2 } else { 4 };
         arrays * n_ref * id + in_flight * SEGMENT_COMMONS * (n_ref / 8 + 64)
@@ -416,7 +416,9 @@ impl TargetHaplotypeSet {
         let n_seg = plan.starts.len();
         let p3 = self.p3decode;
         let nw = words(n_ref);
-        let spare = (0..(LOOKAHEAD + DECODERS + 1).min(n_seg)).map(|_| Decoded::for_plan(plan, n_ref)).collect();
+        // At most LOOKAHEAD + 1 segments are alive: the one being swept and those
+        // decoded or decoding ahead of it.
+        let spare = (0..(LOOKAHEAD + 1).min(n_seg)).map(|_| Decoded::for_plan(plan, n_ref)).collect();
         let queue = Mutex::new(Queue::<H> { next: 0, pos: 0, ready: (0..n_seg).map(|_| None).collect(), spare });
         let (decoded, advanced) = (Condvar::new(), Condvar::new());
 
