@@ -23,7 +23,8 @@
 //! interleaving, including the one where the second task runs only after the
 //! first has finished (then F processes every block and B finds nothing to do).
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use super::*;
 
@@ -442,11 +443,28 @@ struct Shared<'a> {
     /// Sites `[0, fwd_done)` have their alpha sums and checkpoints.
     fwd_done: AtomicUsize,
     claimed: Box<[AtomicBool]>,
+    /// Blocks not yet claimed.
+    unclaimed: AtomicUsize,
+    /// The block's slot is stored (always set for the top block, which
+    /// initialises beta itself).
     ready: Box<[AtomicBool]>,
+    /// Alpha-ready and slot-ready events per block: the second spawns a task.
+    arrivals: Box<[AtomicU8]>,
+    /// Block tasks spawned and not yet started.
+    pending: AtomicUsize,
+    /// Beta and block scratch of block tasks.
+    scratch: Mutex<Vec<(Vec<f32>, Vec<f32>)>>,
     loo: bool,
     ee: f32,
     ed: f32,
 }
+
+#[cfg(test)]
+static TASK_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Block tasks waiting to start above which the backward pass processes the
+/// blocks the forward pass has passed itself (no worker is taking tasks).
+const SPAWN_BACKLOG: usize = 2;
 
 // SAFETY: F writes `chk`/`asum` before the Release store of `fwd_done` that
 // readers Acquire; slots are written before their `ready` Release store;
@@ -460,8 +478,47 @@ impl Shared<'_> {
     }
 
     fn claim(&self, b: usize) -> bool {
-        self.claimed[b].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
+        let ok = self.claimed[b].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok();
+        if ok { self.unclaimed.fetch_sub(1, Ordering::AcqRel); }
+        ok
     }
+
+    fn is_claimed(&self, b: usize) -> bool { self.claimed[b].load(Ordering::Acquire) }
+
+    /// One of block `b`'s two readiness events (alpha / slot): the second
+    /// spawns a task that processes it from its slot unless taken by then.
+    fn arrive<'s, A: Kernels>(&'s self, b: usize, scope: &rayon::Scope<'s>) {
+        if self.arrivals[b].fetch_add(1, Ordering::AcqRel) == 1 && !self.is_claimed(b) {
+            self.pending.fetch_add(1, Ordering::AcqRel);
+            // SAFETY: the task reads the shared storage under the same claim
+            // protocol as the passes; the scope outlives it.
+            scope.spawn(move |_| unsafe { self.block_task::<A>(b) });
+        }
+    }
+
+    /// A block task: block `b` from its slot.
+    unsafe fn block_task<A: Kernels>(&self, b: usize) { unsafe {
+        self.pending.fetch_sub(1, Ordering::AcqRel);
+        if !self.claim(b) { return; }
+        let k = self.ctx.k;
+        let mut buf = self.scratch.lock().unwrap().pop()
+            .unwrap_or_else(|| (sized(Vec::new(), k), sized(Vec::new(), self.stride * k)));
+        let mut beta_sum = self.load_slot(b, buf.0.as_mut_ptr());
+        self.process_block::<A>(b, buf.0.as_mut_ptr(), &mut beta_sum, buf.1.as_mut_ptr());
+        self.scratch.lock().unwrap().push(buf);
+        #[cfg(test)]
+        TASK_BLOCKS.fetch_add(1, Ordering::Relaxed);
+    }}
+
+    /// Copy block `b`'s entering beta into `bp` and return its sum (nothing
+    /// for the top block, which initialises beta).
+    unsafe fn load_slot(&self, b: usize, bp: *mut f32) -> f32 { unsafe {
+        if b + 1 == self.n_chk { return 0.0; }
+        let k = self.ctx.k;
+        let slot = self.slots.add(b * (k + 1));
+        std::ptr::copy_nonoverlapping(slot, bp, k);
+        *slot.add(k)
+    }}
 
     fn alpha_ready(&self, hi: usize) -> bool { self.fwd_done.load(Ordering::Acquire) >= hi }
 
@@ -515,8 +572,10 @@ impl Shared<'_> {
         }
     }}
 
-    /// F: the forward recursion, then blocks from the top until one is taken.
-    unsafe fn forward_pass<A: Kernels>(&self, fcol: *mut f32, bp: *mut f32, blk: *mut f32) { unsafe {
+    /// F: the forward recursion (each finished block is alpha-ready), then
+    /// unclaimed blocks from the top, with its own rolled beta while they are
+    /// contiguous, else from their slots, until it meets a block with neither.
+    unsafe fn forward_pass<'s, A: Kernels>(&'s self, scope: &rayon::Scope<'s>, fcol: *mut f32, bp: *mut f32, blk: *mut f32) { unsafe {
         let c = &self.ctx;
         let k = c.k;
         let n_var = self.n_var;
@@ -524,7 +583,10 @@ impl Shared<'_> {
         let s0 = A::first(c, *self.emit, *self.emit.add(1), fcol);
         *self.asum = s0;
         std::ptr::copy_nonoverlapping(fcol, self.chk, k);
-        if stride == 1 || n_var == 1 { self.fwd_done.store(1, Ordering::Release); }
+        if stride == 1 || n_var == 1 {
+            self.fwd_done.store(1, Ordering::Release);
+            self.arrive::<A>(0, scope);
+        }
         let (mut prev, mut curr) = (fcol, fcol.add(k));
         for v in 1..n_var {
             let s = A::column(c, prev, curr, v,
@@ -536,51 +598,52 @@ impl Shared<'_> {
             std::mem::swap(&mut prev, &mut curr);
             if (v + 1) % stride == 0 || v + 1 == n_var {
                 self.fwd_done.store(v + 1, Ordering::Release);
+                self.arrive::<A>(v / stride, scope);
             }
         }
+        let top = self.n_chk - 1;
         let mut beta_sum = 0.0f32;
+        let mut rolled = false;
         for b in (0..self.n_chk).rev() {
-            if !self.claim(b) { break; }
+            if self.is_claimed(b) { rolled = false; continue; }
+            let from_slot = b != top && !rolled;
+            if from_slot && !self.ready[b].load(Ordering::Acquire) { break; }
+            if !self.claim(b) { rolled = false; continue; }
+            if from_slot { beta_sum = self.load_slot(b, bp); }
             self.process_block::<A>(b, bp, &mut beta_sum, blk);
+            rolled = true;
         }
     }}
 
-    /// B: roll beta from the top ahead of the forward pass, process blocks the
-    /// forward pass has passed, then help with the rolled-through blocks.
-    unsafe fn backward_pass<A: Kernels>(&self, bp: *mut f32, blk: *mut f32) { unsafe {
+    /// B: roll beta down from the top, leaving each unclaimed block's entering
+    /// state in its slot (slot-ready). Once a block the forward pass has passed
+    /// is reached while spawned tasks wait for workers, process it here from the
+    /// rolled beta instead. Stops when every block is claimed.
+    unsafe fn backward_pass<'s, A: Kernels>(&'s self, scope: &rayon::Scope<'s>, bp: *mut f32, blk: *mut f32) { unsafe {
         let k = self.ctx.k;
+        let top = self.n_chk - 1;
         let mut beta_sum = 0.0f32;
         for b in (0..self.n_chk).rev() {
+            if self.unclaimed.load(Ordering::Acquire) == 0 { return; }
             let (_, hi) = self.bounds(b);
-            if self.alpha_ready(hi) {
-                if !self.claim(b) { break; }
-                self.process_block::<A>(b, bp, &mut beta_sum, blk);
+            if self.alpha_ready(hi) && self.pending.load(Ordering::Acquire) >= SPAWN_BACKLOG {
+                if self.claim(b) {
+                    self.process_block::<A>(b, bp, &mut beta_sum, blk);
+                } else {
+                    self.roll_block::<A>(b, bp, &mut beta_sum);
+                }
                 continue;
             }
-            // The forward pass has not reached this block: keep the beta that
-            // enters it, then roll through.
-            let slot = self.slots.add(b * (k + 1));
-            std::ptr::copy_nonoverlapping(bp, slot, k);
-            *slot.add(k) = beta_sum;
-            self.ready[b].store(true, Ordering::Release);
-            self.roll_block::<A>(b, bp, &mut beta_sum);
-        }
-        // Slotted blocks from below, until the forward pass's top-down run.
-        for b in 0..self.n_chk {
-            if !self.ready[b].load(Ordering::Acquire) { continue; }
-            let (_, hi) = self.bounds(b);
-            // Only reached when this pass rolled through every block before the
-            // forward one reached them: wait for the forward pass.
-            let mut spins = 0u32;
-            while !self.alpha_ready(hi) {
-                spins += 1;
-                if spins < 1 << 10 { std::hint::spin_loop(); } else { std::thread::sleep(std::time::Duration::from_micros(20)); }
+            if !self.is_claimed(b) {
+                if b != top {
+                    let slot = self.slots.add(b * (k + 1));
+                    std::ptr::copy_nonoverlapping(bp, slot, k);
+                    *slot.add(k) = beta_sum;
+                }
+                self.ready[b].store(true, Ordering::Release);
+                self.arrive::<A>(b, scope);
             }
-            if !self.claim(b) { break; }
-            let slot = self.slots.add(b * (k + 1));
-            std::ptr::copy_nonoverlapping(slot, bp, k);
-            let mut bs = *slot.add(k);
-            self.process_block::<A>(b, bp, &mut bs, blk);
+            self.roll_block::<A>(b, bp, &mut beta_sum);
         }
     }}
 }
@@ -669,7 +732,12 @@ pub(super) unsafe fn run<A: Kernels>(
         slots: slots.as_mut_ptr(),
         fwd_done: AtomicUsize::new(0),
         claimed: (0..n_chk).map(|_| AtomicBool::new(false)).collect(),
+        unclaimed: AtomicUsize::new(n_chk),
         ready: (0..n_chk).map(|_| AtomicBool::new(false)).collect(),
+        arrivals: (0..n_chk).map(|_| AtomicU8::new(0)).collect(),
+        pending: AtomicUsize::new(0),
+        // Two block tasks' scratch from this thread; more tasks allocate their own.
+        scratch: Mutex::new((0..2).map(|_| (sized(Vec::new(), k), sized(Vec::new(), stride * k))).collect()),
         loo: lcwgs_loo(),
         ee, ed,
     };
@@ -677,11 +745,12 @@ pub(super) unsafe fn run<A: Kernels>(
         let (fp, bp, blkp) = (fcol.as_mut_ptr() as usize, beta.as_mut_ptr() as usize, blk.as_mut_ptr() as usize);
         let (bbp, bblkp) = (b_beta.as_mut_ptr() as usize, b_blk.as_mut_ptr() as usize);
         let sh = &sh;
-        rayon::join(
-            move || sh.forward_pass::<A>(fp as *mut f32, bp as *mut f32, blkp as *mut f32),
-            move || sh.backward_pass::<A>(bbp as *mut f32, bblkp as *mut f32),
-        );
+        rayon::scope(move |scope| {
+            scope.spawn(move |scope| sh.backward_pass::<A>(scope, bbp as *mut f32, bblkp as *mut f32));
+            sh.forward_pass::<A>(scope, fp as *mut f32, bp as *mut f32, blkp as *mut f32);
+        });
     }
+    debug_assert_eq!(sh.unclaimed.load(Ordering::Acquire), 0);
     drop(sh);
     if let Some(t) = t_fb { PROF_FB_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
 
@@ -697,11 +766,11 @@ pub(super) unsafe fn run<A: Kernels>(
 }}
 
 /// Bytes a two-pass call holds beyond the sequential kernel: the backward
-/// pass's beta and block, and the slots.
+/// pass's beta and block, the slots, and two block tasks' scratch.
 pub(crate) fn extra_bytes(sites: usize, k: usize) -> usize {
     let stride = ((sites as f64).sqrt().ceil() as usize).max(1);
     let n_chk = sites.div_ceil(stride);
-    (stride * k + k + n_chk * (k + 1) + 64) * 4
+    (3 * (stride * k + k) + n_chk * (k + 1) + 64) * 4
 }
 
 #[cfg(test)]
@@ -759,10 +828,14 @@ mod tests {
                                 .dosage.iter().map(|x| x.to_bits()).collect();
                             for pool in &pools {
                                 for rep in 0..3 {
+                                    let before = TASK_BLOCKS.load(Ordering::Relaxed);
                                     let got: Vec<u32> = pool.install(|| run_any(&hl, &cond, &bm, &ccm, &params, rm, ps, pre))
                                         .iter().map(|x| x.to_bits()).collect();
                                     assert_eq!(got, want, "sites={n} k={k} compact={compact} threads={} rep={rep}",
                                         pool.current_num_threads());
+                                    if pool.current_num_threads() == 1 {
+                                        assert_eq!(TASK_BLOCKS.load(Ordering::Relaxed), before);
+                                    }
                                 }
                             }
                         }
@@ -770,5 +843,6 @@ mod tests {
                 }
             }
         }
+        assert!(TASK_BLOCKS.load(Ordering::Relaxed) > 0, "block tasks were never exercised");
     }
 }
