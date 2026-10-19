@@ -1850,9 +1850,8 @@ unsafe fn run_fb_neon(
 
 /// GLIMPSE2-style scaffold HMM: run forward-backward ONLY on the common
 /// (scaffold) sites, then impute ALL sites (common + rare) by interpolating
-/// the per-state posterior between flanking scaffold sites. This is the same
-/// design as the Beagle stage-2 port (`haploid::stage2`), adapted to
-/// GL-weighted emissions.
+/// the per-state posterior between flanking scaffold sites, with GL-weighted
+/// emissions.
 ///
 /// Why this helps rare variants: the PBWT/HMM scaffold stays on well-typed
 /// common sites (clean conditioning, no dilution from flat-GL rare sites),

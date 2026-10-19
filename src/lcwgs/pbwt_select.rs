@@ -26,17 +26,63 @@
 //!
 //! # Performance
 //!
-//! - Reuses `crate::haploid::stage2::pbwt_ibs::PbwtDivUpdater` (no
-//!   duplication of PBWT primitive).
+//! - One in-place biallelic PBWT step per storage site
+//!   ([`pbwt_sort_step`], Durbin's prefix and divergence update).
 //! - Per-storage-site `rec[]` and per-hap `neighbor_counts[]` reused as
 //!   `&mut Vec` scratch — no allocation in the inner loop.
 //! - `prefix[]` and `div[]` allocated once at outer level.
 //! - Only PBWT updates run on storage sites (1 per 0.1 cM, ≈ 700-1500 on
-//!   chr22 vs 246K stage-1 marker steps for the Beagle stage-2 port).
+//!   chr22).
 //! - Storage-site selection is single-threaded.
 
 use crate::common::HaplotypeBitmatrix;
-use crate::haploid::stage2::pbwt_ibs::PbwtDivUpdater;
+
+/// One biallelic site of the positional Burrows-Wheeler transform with
+/// divergence (Durbin 2014, Algorithm 2), in place.
+///
+/// On entry `prefix` holds the haplotypes sorted by their reversed prefixes up
+/// to the previous site and `div[i]` is the first site of the match between
+/// `prefix[i - 1]` and `prefix[i]`; every `div[i]` is at most `site`. On return
+/// both describe the sort through `site`: the haplotypes with allele 0 come
+/// first, each allele class keeps its previous relative order, and the head of
+/// each class, which matches nothing before it at `site`, gets `site + 1`.
+/// `allele[h]` is haplotype `h`'s allele at `site`; `ones` and `ones_div` are
+/// scratch for the allele-1 class.
+fn pbwt_sort_step(
+    allele: &[u8], site: i32, prefix: &mut [i32], div: &mut [i32],
+    ones: &mut Vec<i32>, ones_div: &mut Vec<i32>,
+) {
+    let n = prefix.len();
+    assert_eq!(allele.len(), n);
+    assert_eq!(div.len(), n);
+    ones.clear();
+    ones_div.clear();
+    // Start of the match with the class's previous member: the largest
+    // divergence seen since that member was placed.
+    let mut zero_from = site + 1;
+    let mut one_from = site + 1;
+    let mut n_zero = 0usize;
+    for i in 0..n {
+        let hap = prefix[i];
+        zero_from = zero_from.max(div[i]);
+        one_from = one_from.max(div[i]);
+        let a = allele[hap as usize];
+        assert!(a < 2, "pbwt_sort_step: allele {a} at site {site} is not biallelic");
+        if a == 0 {
+            // n_zero <= i, so this slot has already been read.
+            prefix[n_zero] = hap;
+            div[n_zero] = zero_from;
+            n_zero += 1;
+            zero_from = 0;
+        } else {
+            ones.push(hap);
+            ones_div.push(one_from);
+            one_from = 0;
+        }
+    }
+    prefix[n_zero..].copy_from_slice(ones);
+    div[n_zero..].copy_from_slice(ones_div);
+}
 
 /// Pick storage sites along the chromosome at the target cM spacing.
 /// Returns variant indices (into the 0..n_var panel) at roughly
@@ -121,11 +167,12 @@ pub fn select_conditioning_haps(
     }
 
     // PBWT state arrays — allocated once
-    let mut pbwt = PbwtDivUpdater::new(n_haps_total);
     let mut prefix: Vec<i32> = (0..n_haps_total as i32).collect();
     let mut div: Vec<i32> = vec![0i32; n_haps_total];
     let mut inv: Vec<i32> = vec![0i32; n_haps_total];
-    let mut rec: Vec<i32> = vec![0i32; n_haps_total];
+    let mut rec: Vec<u8> = vec![0u8; n_haps_total];
+    let mut ones: Vec<i32> = Vec::with_capacity(n_haps_total);
+    let mut ones_div: Vec<i32> = Vec::with_capacity(n_haps_total);
     let mut out: Vec<Vec<u32>> = Vec::with_capacity(n_target_haps);
 
     // PHASE 1.5 ALGORITHM (sum of IBS match lengths, not counts).
@@ -155,15 +202,13 @@ pub fn select_conditioning_haps(
         // Build per-hap rec[] for this storage site:
         // - Target haps: their MAP allele
         // - Ref haps: their actual panel allele
-        for h in 0..n_target_haps {
-            rec[h] = target_hard_calls[v * n_target_haps + h] as i32;
-        }
+        rec[..n_target_haps]
+            .copy_from_slice(&target_hard_calls[v * n_target_haps..(v + 1) * n_target_haps]);
         for rh in 0..n_ref_haps {
-            rec[n_target_haps + rh] = if ref_bm.get(v, rh) { 1 } else { 0 };
+            rec[n_target_haps + rh] = ref_bm.get(v, rh) as u8;
         }
 
-        // PBWT forward update (biallelic ⇒ n_alleles=2)
-        pbwt.fwd_update(&rec, 2, storage_idx as i32, &mut prefix, &mut div);
+        pbwt_sort_step(&rec, storage_idx as i32, &mut prefix, &mut div, &mut ones, &mut ones_div);
 
         // Build inv-permutation: inv[hap] = its current PBWT position
         for (i, &p) in prefix.iter().enumerate() {
@@ -242,6 +287,48 @@ pub fn select_conditioning_haps(
 mod tests {
     use super::*;
     use crate::common::HaplotypeBitmatrix;
+
+    /// `pbwt_sort_step` against the definitions it maintains, on haplotypes
+    /// copied from a few founders with mutations so that long matches occur:
+    /// after site `s`, `prefix` is the stable sort by reversed prefix
+    /// `(s, s-1, .., 0)`, `div[0] == s + 1`, and `div[i]` is `s + 1` minus the
+    /// length of the common suffix of `prefix[i - 1]` and `prefix[i]`.
+    #[test]
+    fn pbwt_sort_step_matches_definition() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state };
+        for _ in 0..200 {
+            let n = 1 + (next() % 60) as usize;
+            let n_sites = 1 + (next() % 80) as usize;
+            let n_founders = 1 + (next() % 4) as usize;
+            let founders: Vec<Vec<u8>> = (0..n_founders)
+                .map(|_| (0..n_sites).map(|_| (next() & 1) as u8).collect()).collect();
+            let haps: Vec<Vec<u8>> = (0..n).map(|_| {
+                let f = &founders[(next() % n_founders as u64) as usize];
+                f.iter().map(|&a| if next() % 100 < 3 { 1 - a } else { a }).collect()
+            }).collect();
+            let mut prefix: Vec<i32> = (0..n as i32).collect();
+            let mut div = vec![0i32; n];
+            let (mut ones, mut ones_div) = (Vec::new(), Vec::new());
+            let mut rec = vec![0u8; n];
+            for s in 0..n_sites {
+                for h in 0..n { rec[h] = haps[h][s]; }
+                pbwt_sort_step(&rec, s as i32, &mut prefix, &mut div, &mut ones, &mut ones_div);
+
+                let mut want: Vec<usize> = (0..n).collect();
+                want.sort_by(|&x, &y| (0..=s).rev().map(|t| haps[x][t].cmp(&haps[y][t]))
+                    .find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal));
+                let got: Vec<usize> = prefix.iter().map(|&h| h as usize).collect();
+                assert_eq!(got, want, "prefix after site {s}");
+                assert_eq!(div[0], s as i32 + 1, "head divergence after site {s}");
+                for i in 1..n {
+                    let (x, y) = (got[i - 1], got[i]);
+                    let common = (0..=s).rev().take_while(|&t| haps[x][t] == haps[y][t]).count();
+                    assert_eq!(div[i], (s + 1 - common) as i32, "div[{i}] after site {s}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn storage_sites_at_modulo() {

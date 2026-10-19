@@ -104,8 +104,6 @@ static KNOBS: &[Knob] = &[
     Knob { name: "SELPHI_REFINE_GQ_LO", group: "imputation", kind: Kind::Value, default_repr: "10", user_facing: false, doc: "Lower endpoint of the GQ→input-confidence ramp used by --refine (GQ <= LO → confidence 0). parse::<f64>().unwrap_or(REFINE_GQ_LO const=10.0); no range filter." },
     Knob { name: "LCWGS_NO_EMIT_LOO", group: "phasing-haploid", kind: Kind::Bool, default_repr: "true", user_facing: false, doc: "Leave-one-out forward emission in the lcWGS FB posterior (GLIMPSE2 schedule) is default ON; setting the var DISABLES it. is_err(); cached. NOTE: group is misleading — this is an lcWGS HMM knob (rea..." },
     Knob { name: "SELPHI_HAPLOID_BURNIN_EARLYSTOP", group: "phasing-haploid", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "Enable Beagle adaptive burnin early-stop (skip remaining burnin iters when swap rate <1%); changes the iteration schedule. Exact-match '1' (.ok().as_deref()==Some('1')). Default false (kept off unt..." },
-    Knob { name: "SELPHI_HAPLOID_STAGE2", group: "phasing-haploid", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "Enable Beagle 5.x stage-2 rare-variant phasing in the haploid engine. Exact-match '1' (.ok().as_deref()==Some('1')). Default false." },
-    Knob { name: "STAGE2_COIN_FLIP_TIES", group: "phasing-haploid", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "On stage-2 swap-probability ties, restore Beagle-exact random coin-flip instead of trusting stage-1 phase. Exact-match '1'. Default false (ties default to trusting stage-1, no coin-flip)." },
     Knob { name: "LCWGS_MAX_DEPTH", group: "io", kind: Kind::Value, default_repr: "250", user_facing: true, doc: "Maximum pileup depth per site in native BAM/CRAM pileup. u32 envu.unwrap_or(250)." },
     Knob { name: "LCWGS_MIN_BQ", group: "io", kind: Kind::Value, default_repr: "20", user_facing: true, doc: "Minimum base quality for native BAM/CRAM pileup GL generation. u32 envu.unwrap_or(20), cast u8." },
     Knob { name: "LCWGS_MIN_MAPQ", group: "io", kind: Kind::Value, default_repr: "20", user_facing: true, doc: "Minimum read mapping quality for native BAM/CRAM pileup GL generation. u32 envu.unwrap_or(20), cast u8." },
@@ -213,7 +211,6 @@ static KNOBS: &[Knob] = &[
     Knob { name: "SELPHI_REFINE_TEST_SOFT_FRAC", group: "debug", kind: Kind::Value, default_repr: "", user_facing: false, doc: "TEST-ONLY: force a fraction of chip sites to be treated as soft (refine-eligible) to exercise the refine path. parse::<f64>() in (0,1]; no-op/unset by default (imputation_pipeline.rs:842)." },
     Knob { name: "SELPHI_FORCE_AVX2", group: "debug", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "Force the AVX2 kernels on an AVX-512 host: diploid segment HMM and PBWT sweep, lcWGS forward-backward and phasing HMM (the haploid engine takes its scalar path). Phasing output is identical on every path; lcWGS agrees to f32 reduction order. Exact-match: only '1' enables. Checked after SELPHI_FORCE_SCALAR." },
     Knob { name: "SELPHI_FORCE_SCALAR", group: "debug", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "Force the scalar code path, disabling all SIMD (AVX-512/AVX2/NEON), for cross-uarch / SIMD parity. Exact-match: only the literal value '1' enables (.ok().as_deref()==Some('1')). PROCESS-WIDE single..." },
-    Knob { name: "SELPHI_HAPLOID_STAGE2_DEBUG", group: "debug", kind: Kind::Value, default_repr: "", user_facing: false, doc: "Haploid stage-2 debug-mode selector: 'swaps' (per-sample swap stats, baum.rs:90) or 'noswap' (write input alleles unchanged, baum.rs:113). Compared to string literals at two sites; only these two m..." },
     Knob { name: "SELPHI_QUIET_SIMD", group: "debug", kind: Kind::Bool, default_repr: "false", user_facing: false, doc: "Suppress the startup '[selphi] SIMD: <path>' diagnostic line. x86_64-only (cfg-gated). Exact-match: only '1' suppresses (.ok().as_deref()!=Some('1'))." },
     // (SELPHI_FORCE_SCALAR / SELPHI_FORCE_AVX2 also gate the diploid-segment HMM (hmm_segment::seg_path) —
     //  the SAME global vars, not separate knobs, so they are NOT listed twice.)
@@ -352,7 +349,7 @@ mod tests {
     use super::KNOBS;
     use std::collections::HashSet;
 
-    /// Every env var Selphi actually reads (LCWGS_/SELPHI_/STAGE2_ prefix, via
+    /// Every env var Selphi actually reads (LCWGS_/SELPHI_ prefix, via
     /// `std::env::var` / `envu` / `envf` / `envs`) MUST be in the KNOBS registry — so
     /// `--dump-config` / `--config` stay complete and the registry can't silently drift
     /// when a new knob is added without registering it. Scans src/ at test time.
@@ -376,7 +373,7 @@ mod tests {
                         let name: String = txt[start..].chars()
                             .take_while(|c| *c == '_' || c.is_ascii_uppercase() || c.is_ascii_digit())
                             .collect();
-                        if name.starts_with("LCWGS_") || name.starts_with("SELPHI_") || name.starts_with("STAGE2_") {
+                        if name.starts_with("LCWGS_") || name.starts_with("SELPHI_") {
                             found.insert(name);
                         }
                         from = start;
