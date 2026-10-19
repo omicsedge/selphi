@@ -69,6 +69,10 @@ pub struct SegmentPlan {
     starts: Vec<SegmentStart>,
     commons: usize,
     segment_commons: usize,
+    /// Largest segment: big arrays, common columns, sites.
+    max_big: usize,
+    max_commons: usize,
+    max_sites: usize,
 }
 
 impl SegmentPlan {
@@ -76,7 +80,7 @@ impl SegmentPlan {
 
     /// A plan whose segments hold `n` common columns.
     pub fn with_segment_commons(n: usize) -> Self {
-        SegmentPlan { starts: Vec::new(), commons: 0, segment_commons: n.max(1) }
+        SegmentPlan { starts: Vec::new(), commons: 0, segment_commons: n.max(1), max_big: 0, max_commons: 0, max_sites: 0 }
     }
 
     /// Bytes a plan and its decoded segments in flight hold for a chunk of
@@ -117,16 +121,21 @@ impl SegmentPlan {
         for s in 0..self.starts.len() {
             let end = self.starts.get(s + 1).map_or(n_tot, |x| x.k);
             let (mut last_k, mut l_hq, mut n_big) = (self.starts[s].k as i64 - 1, self.starts[s].l_hq, 0usize);
+            let mut commons = 0usize;
             for k in self.starts[s].k..end {
                 if !m.vars[k].lq && rhs.flag_common(k) {
                     let prev_common = last_k >= 0 && rhs.flag_common(last_k as usize);
                     if !rhs.a_small_idx(l_hq).is_empty() && !prev_common { n_big += 1; }
                     n_big += 1;
+                    commons += 1;
                     l_hq += 1;
                 }
                 last_k = k as i64;
             }
             self.starts[s].n_big = n_big;
+            self.max_big = self.max_big.max(n_big);
+            self.max_commons = self.max_commons.max(commons);
+            self.max_sites = self.max_sites.max(end - self.starts[s].k);
         }
     }
 }
@@ -189,6 +198,19 @@ fn set_bits(bits: &mut [u64], lo: usize, hi: usize) {
 
 impl<H> Decoded<H> {
     fn new() -> Self { Decoded { big: Vec::new(), bits: Vec::new(), ones: Vec::new(), small_v: Vec::new(), items: Vec::new() } }
+
+    /// Storage for the plan's largest segment, so that decoder threads write
+    /// into memory the calling thread allocated (and frees).
+    fn for_plan(plan: &SegmentPlan, n_ref: usize) -> Self {
+        let nw = words(n_ref);
+        Decoded {
+            big: Vec::with_capacity(plan.max_big * n_ref),
+            bits: Vec::with_capacity(plan.max_commons * nw),
+            ones: Vec::with_capacity(plan.max_commons * nw),
+            small_v: Vec::new(),
+            items: Vec::with_capacity(plan.max_sites),
+        }
+    }
 }
 
 /// Decode segment `s` into `out` (whose storage is reused): the panel half of
@@ -394,7 +416,8 @@ impl TargetHaplotypeSet {
         let n_seg = plan.starts.len();
         let p3 = self.p3decode;
         let nw = words(n_ref);
-        let queue = Mutex::new(Queue::<H> { next: 0, pos: 0, ready: (0..n_seg).map(|_| None).collect(), spare: Vec::new() });
+        let spare = (0..(LOOKAHEAD + DECODERS + 1).min(n_seg)).map(|_| Decoded::for_plan(plan, n_ref)).collect();
+        let queue = Mutex::new(Queue::<H> { next: 0, pos: 0, ready: (0..n_seg).map(|_| None).collect(), spare });
         let (decoded, advanced) = (Condvar::new(), Condvar::new());
 
         std::thread::scope(|scope| {
