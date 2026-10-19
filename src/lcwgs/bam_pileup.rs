@@ -292,9 +292,12 @@ pub fn pileup_bams(
 
     // Per-sample pileup in parallel (BAM/CRAM are independent). Each produces its
     // own [n_var*3] normalised GL block; assembled into the interleaved gl3 after.
+    // A single sample has the workers to itself: its BGZF blocks inflate on
+    // decoder threads and its BAQ realignments run in parallel batches.
+    let within = n_samples == 1 && rayon::current_num_threads() > 1;
     let per_sample: Vec<io::Result<(String, Vec<f32>, PileupReport)>> = bam_paths
         .par_iter()
-        .map(|path| pileup_one(path, chrom, &sites, region, reference, indel_model, &params, &lut, em.as_ref(), baq_ctx.as_ref()))
+        .map(|path| pileup_one(path, chrom, &sites, region, reference, indel_model, &params, &lut, em.as_ref(), baq_ctx.as_ref(), within))
         .collect();
 
     let mut sample_ids = Vec::with_capacity(n_samples);
@@ -392,9 +395,10 @@ fn pileup_one(
     lut: &PhredLut,
     em: Option<&crate::lcwgs::errmod::ErrMod>,
     baq: Option<&BaqCtx>,
+    within: bool,
 ) -> io::Result<(String, Vec<f32>, PileupReport)> {
     if path.to_ascii_lowercase().ends_with(".cram") {
-        return pileup_one_cram(path, chrom, sites, region, reference, indel_model, params, lut, em, baq);
+        return pileup_one_cram(path, chrom, sites, region, reference, indel_model, params, lut, em, baq, within);
     }
     let mut reader = bam::io::reader::Builder.build_from_path(path)?;
     let header = reader.read_header()?;
@@ -414,9 +418,6 @@ fn pileup_one(
     let mut cigar_buf: Vec<(Kind, usize)> = Vec::with_capacity(16);
     let mut seq_buf: Vec<u8> = Vec::with_capacity(256);
     let mut source = |sink: &mut dyn FnMut(&ReadView)| -> io::Result<()> {
-        // A fresh reader per replay: the BGZF stream is not rewindable.
-        let mut reader = bam::io::reader::Builder.build_from_path(path)?;
-        let header = reader.read_header()?;
         let mut record = bam::Record::default();
         let mut emit = |record: &bam::Record, sink: &mut dyn FnMut(&ReadView)| {
             match record.reference_sequence_id() {
@@ -450,12 +451,27 @@ fn pileup_one(
             sink(&ReadView { start, flags: record.flags().bits(), mapq, cigar: &cigar_buf, seq: &seq_buf, qual, qhash, name, mpos, isize, mate_other_tid });
         };
         if let (Some((rs, re)), Some(index)) = (region_query, index.as_ref()) {
+            // A fresh reader per replay: the BGZF stream is not rewindable.
+            let mut reader = bam::io::reader::Builder.build_from_path(path)?;
+            let header = reader.read_header()?;
             let reg = build_region(contig_name.clone(), rs, re)?;
             let mut q = reader.query(&header, index, &reg)?;
             while q.read_record(&mut record)? != 0 {
                 emit(&record, sink);
             }
+        } else if within {
+            // The same decompressed stream, its blocks inflated on decoder threads.
+            let workers = std::num::NonZero::new(rayon::current_num_threads().clamp(1, BGZF_DECODERS))
+                .unwrap_or(std::num::NonZero::<usize>::MIN);
+            let inner = noodles_bgzf::io::MultithreadedReader::with_worker_count(workers, std::fs::File::open(path)?);
+            let mut reader = bam::io::Reader::from(inner);
+            reader.read_header()?;
+            while reader.read_record(&mut record)? != 0 {
+                emit(&record, sink);
+            }
         } else {
+            let mut reader = bam::io::reader::Builder.build_from_path(path)?;
+            reader.read_header()?;
             while reader.read_record(&mut record)? != 0 {
                 emit(&record, sink);
             }
@@ -463,9 +479,12 @@ fn pileup_one(
         Ok(())
     };
 
-    let (gl, rep) = pileup_core(&mut source, sites, params, lut, em, indel_model, baq)?;
+    let (gl, rep) = pileup_core(&mut source, sites, params, lut, em, indel_model, baq, within)?;
     Ok((sample_id, gl, rep))
 }
+
+/// Decoder threads inflating one BAM's BGZF blocks for a single-sample pileup.
+const BGZF_DECODERS: usize = 4;
 
 /// Pileup a single CRAM → per-site normalised 3-way GL (`[n_var*3]`).
 ///
@@ -487,6 +506,7 @@ fn pileup_one_cram(
     lut: &PhredLut,
     em: Option<&crate::lcwgs::errmod::ErrMod>,
     baq: Option<&BaqCtx>,
+    within: bool,
 ) -> io::Result<(String, Vec<f32>, PileupReport)> {
     let ref_path = reference.ok_or_else(|| io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -570,12 +590,13 @@ fn pileup_one_cram(
         Ok(())
     };
 
-    let (gl, rep) = pileup_core(&mut source, sites, params, lut, em, indel_model, baq)?;
+    let (gl, rep) = pileup_core(&mut source, sites, params, lut, em, indel_model, baq, within)?;
     Ok((sample_id, gl, rep))
 }
 
 /// Format-agnostic pileup of one sample: read filtering, the optional BAQ
 /// statistics pass, then the GL-accumulating pass, then GL finalisation.
+#[allow(clippy::too_many_arguments)]
 fn pileup_core(
     source: &mut RecordSource,
     sites: &SiteCtx,
@@ -584,6 +605,7 @@ fn pileup_core(
     em: Option<&crate::lcwgs::errmod::ErrMod>,
     indel_model: Option<&IndelModel>,
     baq: Option<&BaqCtx>,
+    within: bool,
 ) -> io::Result<(Vec<f32>, PileupReport)> {
     let n_var = sites.pos.len();
     let mut report = PileupReport::default();
@@ -633,7 +655,22 @@ fn pileup_core(
         report: &mut report,
         pending: Vec::new(),
     };
-    source(&mut |r: &ReadView| { if accept(r) { st.on_read(r); } })?;
+    if within && baq.is_some() && !params.overlap_htslib {
+        // Realign each batch's selected reads in parallel (a pure function of the
+        // read and the reference), then pile the batch up in arrival order.
+        let mut batch: Vec<OwnedRead> = Vec::with_capacity(BAQ_BATCH);
+        source(&mut |r: &ReadView| {
+            if !accept(r) { return; }
+            batch.push(OwnedRead::from_view(r));
+            if batch.len() == BAQ_BATCH {
+                st.on_batch(&batch);
+                batch.clear();
+            }
+        })?;
+        st.on_batch(&batch);
+    } else {
+        source(&mut |r: &ReadView| { if accept(r) { st.on_read(r); } })?;
+    }
     st.finish();
     let PassState { mut bases, ll, depth, .. } = st;
 
@@ -702,6 +739,33 @@ struct PendingRead {
     realign: bool,
     /// Column that triggered the selection (for `baq_streaming`).
     trigger_v: usize,
+}
+
+/// Reads per parallel BAQ batch of a single-sample pileup.
+const BAQ_BATCH: usize = 4096;
+
+/// A read of a parallel BAQ batch: the `ReadView` fields the scoring pass reads.
+struct OwnedRead {
+    start: i64,
+    flags: u16,
+    mapq: u8,
+    cigar: Vec<(Kind, usize)>,
+    seq: Vec<u8>,
+    qual: Vec<u8>,
+    qhash: u64,
+}
+
+impl OwnedRead {
+    fn from_view(r: &ReadView) -> Self {
+        OwnedRead { start: r.start, flags: r.flags, mapq: r.mapq, cigar: r.cigar.to_vec(),
+            seq: r.seq.to_vec(), qual: r.qual.to_vec(), qhash: r.qhash }
+    }
+
+    /// Mate fields are not read without htslib mate reconciliation.
+    fn view(&self) -> ReadView<'_> {
+        ReadView { start: self.start, flags: self.flags, mapq: self.mapq, cigar: &self.cigar, seq: &self.seq,
+            qual: &self.qual, qhash: self.qhash, name: &[], mpos: -1, isize: 0, mate_other_tid: false }
+    }
 }
 
 /// Reference span of a CIGAR (M/=/X/D/N).
@@ -918,6 +982,81 @@ impl PassState<'_> {
                     p.start, &p.cigar, base_at, qual_at,
                     model, self.lut, &mut self.iscratch, &mut self.ll, &mut self.depth,
                     self.params.max_depth, self.params.min_bq, p.qhash, &mut self.ov.last_frag,
+                );
+            }
+        }
+    }
+
+    /// The BAQ decision `on_read` makes for a read and, when it realigns, the
+    /// qualities it scores with: `(selected, realigned qualities or None for a
+    /// no-op)`. Reads only the read, the column statistics and the reference.
+    fn baq_outcome(&self, r: &ReadView, bsc: &mut BaqScratch) -> (bool, Option<Vec<u8>>) {
+        let (Some(b), Some((stats, trig))) = (self.baq, self.baq_sel) else { return (false, None) };
+        let mut decision: Option<bool> = None;
+        let mut trigger_v: usize = 0;
+        for_each_covered_site(r.start, self.last_pos, r.cigar, self.sites.pos, |v, _| {
+            if decision.is_none() && trig[v] {
+                decision = Some(baq::read_passes_realign_rule(r.qual.len(), r.cigar, stats.nt[v], stats.has_clip[v], b.partial));
+                trigger_v = v;
+            }
+        });
+        if decision != Some(true) { return (false, None); }
+        let mut eq = Vec::new();
+        if !baq::baq_effective_quals(r.start - 1, r.cigar, r.seq, r.qual, b.ref_seq, b.ref_off, bsc, &mut eq) {
+            return (true, None);
+        }
+        if self.params.baq_streaming {
+            if let Some(qi) = query_index_at(r.start, r.cigar, self.sites.pos[trigger_v]) {
+                let qi = qi.min(eq.len());
+                eq[..qi].copy_from_slice(&r.qual[..qi]);
+            }
+        }
+        (true, Some(eq))
+    }
+
+    /// `on_read` for each read of `batch` in order, with the BAQ outcomes
+    /// computed in parallel beforehand (path without htslib mate reconciliation).
+    fn on_batch(&mut self, batch: &[OwnedRead]) {
+        if batch.is_empty() { return; }
+        let outcomes: Vec<(bool, Option<Vec<u8>>)> = {
+            let this = &*self;
+            batch.par_iter().with_min_len(64)
+                .map_init(BaqScratch::new, |bsc, r| this.baq_outcome(&r.view(), bsc))
+                .collect()
+        };
+        for (r, (selected, eq)) in batch.iter().zip(outcomes) {
+            let r = r.view();
+            self.report.n_reads += 1;
+            let realigned = eq.is_some();
+            if selected {
+                if realigned { self.report.n_realigned += 1; } else { self.report.n_baq_noop += 1; }
+            }
+            let quals: &[u8] = eq.as_deref().unwrap_or(r.qual);
+            self.score_view(&r, quals);
+        }
+    }
+
+    /// The scoring tail of `on_read` for a read with its final qualities.
+    fn score_view(&mut self, r: &ReadView, quals: &[u8]) {
+        let base_at = |qi: usize| r.seq.get(qi).copied().unwrap_or(b'N');
+        let qual_at = |qi: usize| quals.get(qi).copied().unwrap_or(0);
+        if self.em.is_some() {
+            walk_record_em(
+                r.start, self.last_pos, r.cigar, base_at, qual_at,
+                quals.len(), r.mapq, r.flags & 0x10 != 0,
+                self.sites.pos, self.sites.is_snp, self.params, &mut self.bases, &mut self.depth, r.qhash, &mut self.ov,
+            );
+        } else {
+            walk_record(
+                r.start, self.last_pos, r.cigar, base_at, qual_at,
+                self.sites.pos, self.sites.ref_base, self.sites.alt_base, self.sites.is_snp, self.params, self.lut,
+                &mut self.ll, &mut self.depth, r.qhash, &mut self.ov,
+            );
+            if let Some(model) = self.indel_model {
+                super::indel_realign::score_read(
+                    r.start, r.cigar, base_at, qual_at,
+                    model, self.lut, &mut self.iscratch, &mut self.ll, &mut self.depth,
+                    self.params.max_depth, self.params.min_bq, r.qhash, &mut self.ov.last_frag,
                 );
             }
         }
@@ -1442,6 +1581,79 @@ fn accumulate(ll: &mut [f64; 3], b: u8, rb: u8, ab: u8, q: usize, lut: &PhredLut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The single-sample pass (parallel BAQ batches) gives the sequential
+    /// pass's likelihoods and counts bit for bit: realigned and no-op reads,
+    /// both selection rules, streaming qualities, both GL models, batch edges.
+    #[test]
+    fn batched_baq_pass_matches_sequential_pass() {
+        use crate::lcwgs::hmm::reference_pack::Xs;
+        let mut rng = Xs(0x2F1C_77A3_9B5D_0E41);
+        let ref_len = 60_000usize;
+        let refseq: Vec<u8> = (0..ref_len).map(|_| b"ACGT"[rng.below(4) as usize]).collect();
+        let pos: Vec<i64> = (1..ref_len as i64 - 1).step_by(7).collect();
+        let ref_base: Vec<u8> = pos.iter().map(|&p| refseq[(p - 1) as usize]).collect();
+        let alt_base: Vec<u8> = ref_base.iter().map(|&b| if b == b'A' { b'G' } else { b'A' }).collect();
+        let is_snp: Vec<bool> = (0..pos.len()).map(|i| i % 11 != 0).collect();
+        struct R { start: i64, flags: u16, mapq: u8, cigar: Vec<(Kind, usize)>, seq: Vec<u8>, qual: Vec<u8>, qhash: u64 }
+        let mut reads: Vec<R> = Vec::new();
+        let mut start = 1i64;
+        while reads.len() < 9_500 {
+            start += rng.below(6) as i64;
+            if start as usize + 400 >= ref_len { break; }
+            let len = 90 + rng.below(61) as usize;
+            let mut cigar = Vec::new();
+            let (mut q, mut r) = (0usize, start as usize - 1);
+            let mut seq = Vec::new();
+            if rng.below(6) == 0 { let c = 1 + rng.below(8) as usize; cigar.push((Kind::SoftClip, c)); seq.extend((0..c).map(|_| b"ACGT"[rng.below(4) as usize])); q += c; }
+            while q < len {
+                let m = (10 + rng.below(60) as usize).min(len - q);
+                cigar.push((Kind::Match, m));
+                for i in 0..m {
+                    let b = refseq[r + i];
+                    seq.push(if rng.below(40) == 0 { b"ACGTN"[rng.below(5) as usize] } else { b });
+                }
+                q += m; r += m;
+                if q < len && rng.below(5) == 0 {
+                    if rng.below(2) == 0 {
+                        let l = (1 + rng.below(4) as usize).min(len - q);
+                        cigar.push((Kind::Insertion, l));
+                        seq.extend((0..l).map(|_| b"ACGT"[rng.below(4) as usize])); q += l;
+                    } else {
+                        let l = 1 + rng.below(4) as usize;
+                        cigar.push((Kind::Deletion, l)); r += l;
+                    }
+                }
+            }
+            let qual: Vec<u8> = (0..seq.len()).map(|_| 2 + rng.below(40) as u8).collect();
+            let flags = match rng.below(10) { 0 => 0x1, 1 => 0x400, 2 => 0x10, _ => 0x3 | if rng.below(2) == 0 { 0x10 } else { 0 } };
+            let mapq = [0u8, 15, 30, 60][rng.below(4) as usize];
+            reads.push(R { start, flags, mapq, cigar, seq, qual, qhash: rng.next() >> (rng.below(3) * 20) });
+        }
+        let sites = SiteCtx { pos: &pos, ref_base: &ref_base, alt_base: &alt_base, is_snp: &is_snp };
+        let lut = PhredLut::new();
+        let em = crate::lcwgs::errmod::ErrMod::new();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        for (partial, streaming, use_em) in [(true, false, true), (false, false, true), (true, true, true), (true, false, false)] {
+            let params = PileupParams { min_mapq: 10, min_bq: 13, max_depth: 40, count_orphans: false, naive_gl: !use_em,
+                baq: true, full_baq: !partial, baq_streaming: streaming, keep_supplementary: false, overlap_htslib: false };
+            let baq_ctx = BaqCtx { ref_seq: &refseq, ref_off: 0, partial };
+            let run = |within: bool| pool.install(|| {
+                let mut source = |sink: &mut dyn FnMut(&ReadView)| -> io::Result<()> {
+                    for r in &reads {
+                        sink(&ReadView { start: r.start, flags: r.flags, mapq: r.mapq, cigar: &r.cigar, seq: &r.seq,
+                            qual: &r.qual, qhash: r.qhash, name: &[], mpos: -1, isize: 0, mate_other_tid: false });
+                    }
+                    Ok(())
+                };
+                let (gl, rep) = pileup_core(&mut source, &sites, &params, &lut, use_em.then_some(&em), None, Some(&baq_ctx), within).unwrap();
+                (gl.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), rep.n_reads, rep.n_realigned, rep.n_baq_noop, rep.n_trigger_sites)
+            });
+            let want = run(false);
+            assert!(want.2 > 0, "fixture must realign reads");
+            assert_eq!(run(true), want, "partial={partial} streaming={streaming} em={use_em}");
+        }
+    }
 
     #[test]
     fn parallel_errmod_matches_serial_gl_bits_and_base_order() {
