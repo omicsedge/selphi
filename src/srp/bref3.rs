@@ -9,28 +9,31 @@ pub(crate) const MAGIC_NUMBER_V3: i32 = 2055763188;
 pub(crate) const SEQ_CODED: u8 = 0;
 pub(crate) const ALLELE_CODED: u8 = 1;
 
-/// SNV permutation table: all 24 permutations of [A, C, G, T] in lexicographic order.
-fn snv_perms() -> Vec<Vec<String>> {
-    let bases: Vec<String> = vec!["A".into(), "C".into(), "G".into(), "T".into()];
-    let mut perms = Vec::with_capacity(24);
-    permute(&[], &bases, &mut perms);
-    perms
-}
+/// The orderings of the four bases, in lexicographic order. A BREF3 record for
+/// an SNV stores no allele strings: its allele code holds `n_alleles - 1` in the
+/// low two bits and, in the high six, the index into this table of an ordering
+/// whose first `n_alleles` bases are its alleles, REF first. Shared by the
+/// reader and the writer.
+pub(crate) const SNV_ORDERS: [[u8; 4]; 24] = [
+    *b"ACGT", *b"ACTG", *b"AGCT", *b"AGTC", *b"ATCG", *b"ATGC",
+    *b"CAGT", *b"CATG", *b"CGAT", *b"CGTA", *b"CTAG", *b"CTGA",
+    *b"GACT", *b"GATC", *b"GCAT", *b"GCTA", *b"GTAC", *b"GTCA",
+    *b"TACG", *b"TAGC", *b"TCAG", *b"TCGA", *b"TGAC", *b"TGCA",
+];
 
-fn permute(start: &[String], end: &[String], out: &mut Vec<Vec<String>>) {
-    if end.is_empty() {
-        out.push(start.to_vec());
-    } else {
-        for j in 0..end.len() {
-            let mut new_start = start.to_vec();
-            new_start.push(end[j].clone());
-            let mut new_end = Vec::with_capacity(end.len() - 1);
-            new_end.extend_from_slice(&end[..j]);
-            new_end.extend_from_slice(&end[j+1..]);
-            permute(&new_start, &new_end, out);
-        }
+/// Alleles of an SNV record from its allele code: the first `n_alleles` bases of
+/// its ordering in [`SNV_ORDERS`].
+fn snv_alleles(allele_code: i8) -> Result<(&'static [u8], usize), String> {
+    let n_alleles = 1 + (allele_code as u8 & 0b11) as usize;
+    let order = (allele_code as u8 >> 2) as usize;
+    match SNV_ORDERS.get(order) {
+        Some(bases) => Ok((&bases[..n_alleles], n_alleles)),
+        None => Err(format!("BREF3 SNV allele code {allele_code} names ordering {order} (of {})",
+            SNV_ORDERS.len())),
     }
 }
+
+fn base_string(b: u8) -> String { (b as char).to_string() }
 
 /// A variant record from bref3.
 pub struct Bref3Variant {
@@ -96,7 +99,6 @@ fn read_string_array<R: Read>(r: &mut R) -> Result<Vec<String>, String> {
 /// all variants into memory. Keeps only the current block's hap_to_seq mapping.
 pub struct Bref3StreamReader<R: Read> {
     reader: R,
-    snv_perms: Vec<Vec<String>>,
     pub sample_ids: Vec<String>,
     pub n_haps: usize,
     // Current block state
@@ -110,8 +112,6 @@ pub struct Bref3StreamReader<R: Read> {
 impl<R: Read> Bref3StreamReader<R> {
     /// Open a BREF3 stream and read the header. Does NOT read any variant data.
     pub fn new(mut reader: R) -> Result<Self, String> {
-        let snv_perms = snv_perms();
-
         let magic = read_i32(&mut reader)?;
         if magic != MAGIC_NUMBER_V3 {
             return Err(format!("Invalid bref3 magic number: {} (expected {})", magic, MAGIC_NUMBER_V3));
@@ -122,7 +122,7 @@ impl<R: Read> Bref3StreamReader<R> {
         let n_haps = sample_ids.len() * 2;
 
         Ok(Self {
-            reader, snv_perms, sample_ids, n_haps,
+            reader, sample_ids, n_haps,
             block_chrom: String::new(),
             block_n_seq: 0,
             block_hap_to_seq: Vec::new(),
@@ -168,12 +168,7 @@ impl<R: Read> Bref3StreamReader<R> {
             let _end = read_i32(&mut self.reader)?;
             str_alleles
         } else {
-            let n_alleles = 1 + (allele_code & 0b11) as usize;
-            let perm_index = (allele_code as u8 >> 2) as usize;
-            if perm_index >= self.snv_perms.len() {
-                return Err(format!("BREF3 SNV allele_code out of range: perm_index={} >= snv_perms.len()={}", perm_index, self.snv_perms.len()));
-            }
-            self.snv_perms[perm_index][..n_alleles].to_vec()
+            snv_alleles(allele_code)?.0.iter().map(|&b| base_string(b)).collect()
         };
 
         let ref_allele = alleles.first().cloned().unwrap_or_default();
@@ -276,14 +271,9 @@ impl<R: Read> Bref3StreamReader<R> {
             let n = str_alleles.len();
             (r, a, n)
         } else {
-            let n_alleles = 1 + (allele_code & 0b11) as usize;
-            let perm_index = (allele_code as u8 >> 2) as usize;
-            if perm_index >= self.snv_perms.len() {
-                return Err(format!("BREF3 SNV allele_code out of range: perm_index={} >= snv_perms.len()={}", perm_index, self.snv_perms.len()));
-            }
-            let p = &self.snv_perms[perm_index];
-            let r = p[0].clone();
-            let a = if n_alleles > 1 { p[1].clone() } else { String::new() };
+            let (bases, n_alleles) = snv_alleles(allele_code)?;
+            let r = base_string(bases[0]);
+            let a = bases.get(1).map_or_else(String::new, |&b| base_string(b));
             (r, a, n_alleles)
         };
 
@@ -325,4 +315,30 @@ pub fn open_bref3_stream(path: &Path) -> Result<Bref3StreamReader<BufReader<std:
         .map_err(|e| format!("Cannot open bref3 file: {}", e))?;
     let reader = BufReader::with_capacity(1 << 20, file);
     Bref3StreamReader::new(reader)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snv_orders_are_the_lexicographic_permutations_of_acgt() {
+        for o in &SNV_ORDERS {
+            let mut sorted = *o;
+            sorted.sort_unstable();
+            assert_eq!(&sorted, b"ACGT", "{:?} is not an ordering of the four bases", o);
+        }
+        for w in SNV_ORDERS.windows(2) {
+            assert!(w[0] < w[1], "{:?} does not precede {:?}", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn snv_allele_code_reads_count_and_ordering() {
+        // Ordering 9 is CGTA; two alleles C,G (code 9 << 2 | 1), four C,G,T,A.
+        assert_eq!(snv_alleles((9 << 2 | 1) as i8).unwrap(), (&b"CG"[..], 2));
+        assert_eq!(snv_alleles((9 << 2 | 3) as i8).unwrap(), (&b"CGTA"[..], 4));
+        assert_eq!(snv_alleles((23 << 2) as i8).unwrap(), (&b"T"[..], 1));
+        assert!(snv_alleles((24 << 2 | 1) as i8).is_err());
+    }
 }

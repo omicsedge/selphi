@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use rayon::prelude::*;
 
-use super::bref3::{MAGIC_NUMBER_V3, SEQ_CODED, ALLELE_CODED};
+use super::bref3::{MAGIC_NUMBER_V3, SEQ_CODED, ALLELE_CODED, SNV_ORDERS};
 const BATCH_SIZE: usize = 2048;
 
 fn default_max_n_seq(n_samples: usize) -> u16 {
@@ -50,7 +50,6 @@ pub fn write_bref3_from_bcf(source_path: &Path, output_path: &Path) -> io::Resul
     crate::selphi_info!("  BREF3: {} samples, {} haps, maxNSeq={}, nonMajThreshold={}",
         n_samples, n_haps, max_n_seq, non_maj_threshold);
 
-    let snv_perms = snv_perms();
 
     // --- Reader thread: multi-threaded BGZF → raw BCF records ---
     let source = source_path.to_path_buf();
@@ -138,7 +137,7 @@ pub fn write_bref3_from_bcf(source_path: &Path, output_path: &Path) -> io::Resul
             }
 
             process_bref3_record(
-                &mut w, rec, &chrom, non_maj_threshold, n_haps, max_n_seq, &snv_perms,
+                &mut w, rec, &chrom, non_maj_threshold, n_haps, max_n_seq,
                 &mut block_recs, &mut block_encodings, &mut hap_to_seq, &mut n_seq,
                 &mut seq_cnt, &mut bytes_written, &mut block_index,
                 &mut total_variants, &mut total_blocks,
@@ -149,7 +148,7 @@ pub fn write_bref3_from_bcf(source_path: &Path, output_path: &Path) -> io::Resul
     // Flush remaining
     flush_final_bref3_block(
         &mut w, &chrom, &block_recs, &block_encodings,
-        &hap_to_seq, n_seq, n_haps, &snv_perms, &mut bytes_written, &mut block_index,
+        &hap_to_seq, n_seq, n_haps, &mut bytes_written, &mut block_index,
         &mut total_variants, &mut total_blocks,
     )?;
 
@@ -193,7 +192,6 @@ pub fn write_bref3_from_srp(source_path: &Path, output_path: &Path) -> io::Resul
     crate::selphi_info!("  BREF3: {} samples, {} haps, {} variants, maxNSeq={}, nonMajThreshold={}",
         n_samples, n_haps, n_variants, max_n_seq, non_maj_threshold);
 
-    let snv_perms = snv_perms();
     let chrom_name = reader.chromosome().to_string();
 
     // BREF3 headers want one ID per sample. SRP `sample_ids` may be stored
@@ -268,7 +266,7 @@ pub fn write_bref3_from_srp(source_path: &Path, output_path: &Path) -> io::Resul
             if !fits_bref3(&rec) { n_too_long += 1; continue; }
 
             process_bref3_record(
-                &mut w, rec, &chrom_name, non_maj_threshold, n_haps, max_n_seq, &snv_perms,
+                &mut w, rec, &chrom_name, non_maj_threshold, n_haps, max_n_seq,
                 &mut block_recs, &mut block_encodings, &mut hap_to_seq, &mut n_seq,
                 &mut seq_cnt, &mut bytes_written, &mut block_index,
                 &mut total_variants, &mut total_blocks,
@@ -280,7 +278,7 @@ pub fn write_bref3_from_srp(source_path: &Path, output_path: &Path) -> io::Resul
 
     flush_final_bref3_block(
         &mut w, &chrom_name, &block_recs, &block_encodings,
-        &hap_to_seq, n_seq, n_haps, &snv_perms, &mut bytes_written, &mut block_index,
+        &hap_to_seq, n_seq, n_haps, &mut bytes_written, &mut block_index,
         &mut total_variants, &mut total_blocks,
     )?;
 
@@ -457,7 +455,6 @@ fn process_bref3_record<W: Write>(
     non_maj_threshold: usize,
     n_haps: usize,
     max_n_seq: u16,
-    snv_perms: &[Vec<String>],
     block_recs: &mut Vec<VariantRec>,
     block_encodings: &mut Vec<RecEncoding>,
     hap_to_seq: &mut [u16],
@@ -479,7 +476,7 @@ fn process_bref3_record<W: Write>(
             if !block_recs.is_empty() {
                 *bytes_written += write_bref3_block(
                     w, chrom, block_recs, block_encodings,
-                    hap_to_seq, *n_seq, n_haps, snv_perms, *bytes_written, block_index,
+                    hap_to_seq, *n_seq, n_haps, *bytes_written, block_index,
                 )?;
                 *total_variants += block_recs.len() as u64;
                 *total_blocks += 1;
@@ -515,7 +512,6 @@ fn flush_final_bref3_block<W: Write>(
     hap_to_seq: &[u16],
     n_seq: u16,
     n_haps: usize,
-    snv_perms: &[Vec<String>],
     bytes_written: &mut u64,
     block_index: &mut Vec<(u64, i32)>,
     total_variants: &mut u64,
@@ -524,7 +520,7 @@ fn flush_final_bref3_block<W: Write>(
     if !block_recs.is_empty() {
         *bytes_written += write_bref3_block(
             w, chrom, block_recs, block_encodings,
-            hap_to_seq, n_seq, n_haps, snv_perms, *bytes_written, block_index,
+            hap_to_seq, n_seq, n_haps, *bytes_written, block_index,
         )?;
         *total_variants += block_recs.len() as u64;
         *total_blocks += 1;
@@ -534,7 +530,7 @@ fn flush_final_bref3_block<W: Write>(
 
 fn write_bref3_block<W: Write>(
     w: &mut W, chrom: &str, recs: &[VariantRec], encodings: &[RecEncoding],
-    hap_to_seq: &[u16], n_seq: u16, n_haps: usize, snv_perms: &[Vec<String>],
+    hap_to_seq: &[u16], n_seq: u16, n_haps: usize,
     offset: u64, index: &mut Vec<(u64, i32)>,
 ) -> io::Result<u64> {
     let block_n = recs.len();
@@ -563,7 +559,7 @@ fn write_bref3_block<W: Write>(
             w.write_all(&[1u8])?; written += 1;
             written += write_utf_c(w, &rec.id)?;
         }
-        if let Some(code) = encode_snv_allele_code(&rec.ref_allele, &rec.alt_allele, snv_perms) {
+        if let Some(code) = encode_snv_allele_code(&rec.ref_allele, &rec.alt_allele) {
             w.write_all(&[code as u8])?; written += 1;
         } else {
             w.write_all(&[0xFF])?; written += 1;
@@ -600,39 +596,13 @@ fn write_bref3_block<W: Write>(
 // --- BCF parsing helpers (shared with bcf_reader + eval::accuracy) ---
 use super::bcf_types::{read_typed_i32 as rtint, read_typed_str as rtstr};
 
-fn snv_perms() -> Vec<Vec<String>> {
-    let bases: Vec<String> = vec!["A".into(), "C".into(), "G".into(), "T".into()];
-    let mut perms = Vec::with_capacity(24);
-    permute(&[], &bases, &mut perms);
-    perms
-}
-
-fn permute(start: &[String], end: &[String], out: &mut Vec<Vec<String>>) {
-    if end.is_empty() {
-        out.push(start.to_vec());
-    } else {
-        for j in 0..end.len() {
-            let mut new_start = start.to_vec();
-            new_start.push(end[j].clone());
-            let mut new_end = Vec::with_capacity(end.len() - 1);
-            new_end.extend_from_slice(&end[..j]);
-            new_end.extend_from_slice(&end[j+1..]);
-            permute(&new_start, &new_end, out);
-        }
-    }
-}
-
-fn encode_snv_allele_code(ref_a: &str, alt_a: &str, perms: &[Vec<String>]) -> Option<i8> {
-    if ref_a.len() != 1 || alt_a.len() != 1 { return None; }
-    let bases = ["A", "C", "G", "T"];
-    if !bases.contains(&ref_a) || !bases.contains(&alt_a) { return None; }
-    let n_alleles = 2u8;
-    for (pi, perm) in perms.iter().enumerate() {
-        if perm[0] == ref_a && perm[1] == alt_a {
-            return Some(((pi as u8) << 2 | (n_alleles - 1)) as i8);
-        }
-    }
-    None
+/// Allele code of a biallelic SNV: the first ordering in [`SNV_ORDERS`] that
+/// starts with REF then ALT, in the high six bits, and `n_alleles - 1 = 1` in the
+/// low two. `None` when either allele is not a single base.
+fn encode_snv_allele_code(ref_a: &str, alt_a: &str) -> Option<i8> {
+    let (&[r], &[a]) = (ref_a.as_bytes(), alt_a.as_bytes()) else { return None };
+    let order = SNV_ORDERS.iter().position(|o| o[0] == r && o[1] == a)?;
+    Some(((order as u8) << 2 | 1) as i8)
 }
 
 fn write_i32_c<W: Write>(w: &mut W, v: i32) -> io::Result<u64> { w.write_all(&v.to_be_bytes())?; Ok(4) }
@@ -703,4 +673,30 @@ fn write_bref3_trailer<W: Write>(
     n += write_i64_c(w, -999_999_999_999_999)?;
     n += write_i64_c(w, index_start as i64)?;
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snv_allele_code_round_trips_every_base_pair() {
+        let bases = ["A", "C", "G", "T"];
+        for (ri, r) in bases.iter().enumerate() {
+            for (ai, a) in bases.iter().enumerate() {
+                let code = encode_snv_allele_code(r, a);
+                if ri == ai { assert_eq!(code, None); continue; }
+                let code = code.unwrap() as u8;
+                assert_eq!(code & 0b11, 1, "{r}>{a}: two alleles");
+                // The first ordering starting REF, ALT: 6 per first base, 2 per second.
+                let rank = if ai > ri { ai - 1 } else { ai };
+                assert_eq!((code >> 2) as usize, 6 * ri + 2 * rank, "{r}>{a}");
+                let o = SNV_ORDERS[(code >> 2) as usize];
+                assert_eq!((o[0], o[1]), (r.as_bytes()[0], a.as_bytes()[0]));
+            }
+        }
+        for (r, a) in [("AC", "A"), ("A", "AC"), ("N", "A"), ("a", "c"), ("", "A")] {
+            assert_eq!(encode_snv_allele_code(r, a), None, "{r}>{a}");
+        }
+    }
 }
