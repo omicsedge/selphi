@@ -59,8 +59,7 @@ BOX = {
     "map":       ((466, 50, 195, 50, 8), "hl_grey"),
     "bitmatrix": ((60, 132, 640, 38, 10), "hl_purple"),
     "phasing":   ((49, 197, 822, 202, 10), "hl_blue"),
-    "haploid":   ((70, 250, 380, 136, 8), "hl_blue"),
-    "diploid":   ((470, 250, 380, 136, 8), "hl_blue"),
+    "diploid":   ((70, 250, 780, 136, 8), "hl_blue"),
     "handoff":   ((140, 414, 640, 28, 8), "hl_green"),
     "genotype":  ((70, 512, 380, 124, 8), "hl_pink"),
     "lcwgs":     ((470, 512, 380, 124, 8), "hl_teal"),
@@ -73,12 +72,12 @@ SCENARIOS = [
      [(r"Target: ", "input"), (r"Loaded SRP", "reference"), (r"Ref bitmatrix extracted", "bitmatrix"),
       (r"Using Diploid phasing", "diploid"), (r"Phasing complete:", "handoff"),
       (r"Genetic map loaded", "map"), (r"PBWT sort|Window \d", "genotype"), (r"Output: ", "output")],
-     ["haploid", "lcwgs"]),
+     ["lcwgs"]),
     ("wgs", "WGS  →  phase only",
      [(r"Target: ", "input"), (r"Loaded SRP", "reference"), (r"Genetic map|map loaded", "map"),
       (r"[Bb]itmatrix|Common ref subset", "bitmatrix"), (r"Diploid", "diploid"),
       (r"[Pp]hased output|Output: |Writing", "output")],
-     ["haploid", "handoff", "genotype", "lcwgs"]),
+     ["handoff", "genotype", "lcwgs"]),
     ("lowcov", "low-coverage reads (BAM)  →  lcWGS",
      [(r"auto-route", "input"), (r"SRP|panel", "reference"), (r"[Mm]ap", "map"),
       (r"pileup|BAQ|Gibbs|chunk", "lcwgs"), (r"lowcov\.vcf\.gz|Output|done", "output")],
@@ -347,19 +346,14 @@ def arch(A):
 
     R(50, 198, 820, 200, 10, A["blue_s"], fill="url(#sg)")
     T(460, 220, "Phasing", A["blue"], 14, "700")
-    T(460, 237, "if the target is unphased — diploid engine by default for all inputs; haploid optional for chip arrays", A["muted"], 11)
-    R(70, 250, 380, 136, 8, A["orange_s"], 1.2)
-    T(260, 272, "Haploid engine", A["orange"], 13, "700")
-    for i, s in enumerate(["Coded-step PBWT → 280 composite haplotypes", "3-channel HMM + greedy swap (15 iterations)",
-                           "Adaptive step scale (fine → coarse)", "Rare-carrier injection + EM per window"]):
-        T(260, 293 + 18 * i, s, A["text"])
-    T(260, 377, "opt-in for chip arrays (--phasing-engine haploid)", A["muted"], 10, italic=True)
-    R(470, 250, 380, 136, 8, A["dblue_s"], 1.2)
-    T(660, 272, "Diploid engine", A["dblue"], 13, "700")
-    for i, s in enumerate(["Genotype graph + MCMC (15 iterations)", "EM Ne estimation during burn-in",
-                           "Common → rare two-stage (PBWT voting)", "IBD2 exclusion + match-length-weighted rare votes"]):
-        T(660, 293 + 18 * i, s, A["text"])
-    T(660, 377, "default · all inputs (arrays and WGS)", A["muted"], 10, italic=True)
+    T(460, 237, "if the target is unphased — one engine for every input", A["muted"], 11)
+    R(70, 250, 780, 136, 8, A["dblue_s"], 1.2)
+    T(460, 272, "Diploid engine", A["dblue"], 13, "700")
+    for i, s in enumerate(["Genotype graph + segment HMM", "MCMC (15 iterations)"]):
+        T(265, 302 + 22 * i, s, A["text"])
+    for i, s in enumerate(["Common → rare two-stage (PBWT voting)", "IBD2 exclusion + match-length-weighted rare votes"]):
+        T(655, 302 + 22 * i, s, A["text"])
+    T(460, 377, "arrays, WGS and de-novo panels (--phase-panel)", A["muted"], 10, italic=True)
     o.append(f'<path d="M787 100 L787 186 L895 186 L895 318 L872 318" fill="none" stroke="{A["opt"]}" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arr)"/>')
     o.append(f'<text x="905" y="252" fill="{A["opt"]}" font-size="9" transform="rotate(90,905,252)" text-anchor="middle">Mendelian scaffold</text>')
     o.append(f'<path d="M 28 100 L 12 100 L 12 548 L 48 548" fill="none" stroke="{A["blue"]}" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arr)"/>')

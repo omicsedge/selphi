@@ -196,21 +196,14 @@
 <line x1="380" y1="170" x2="380" y2="196" stroke="#57606a" stroke-width="1.2" marker-end="url(#arr)"/>
 <rect x="50" y="198" width="820" height="200" rx="10" fill="url(#sg)" stroke="#0969da" stroke-width="1.5"/>
 <text x="460" y="220" text-anchor="middle" fill="#0969da" font-size="14" font-weight="700">Phasing</text>
-<text x="460" y="237" text-anchor="middle" fill="#57606a" font-size="11">if the target is unphased — diploid engine by default for all inputs; haploid optional for chip arrays</text>
-<rect x="70" y="250" width="380" height="136" rx="8" fill="#ffffff" stroke="#d9730d" stroke-width="1.2"/>
-<text x="260" y="272" text-anchor="middle" fill="#bc4c00" font-size="13" font-weight="700">Haploid engine</text>
-<text x="260" y="293" text-anchor="middle" fill="#1f2328" font-size="11.5">Coded-step PBWT → 280 composite haplotypes</text>
-<text x="260" y="311" text-anchor="middle" fill="#1f2328" font-size="11.5">3-channel HMM + greedy swap (15 iterations)</text>
-<text x="260" y="329" text-anchor="middle" fill="#1f2328" font-size="11.5">Adaptive step scale (fine → coarse)</text>
-<text x="260" y="347" text-anchor="middle" fill="#1f2328" font-size="11.5">Rare-carrier injection + EM per window</text>
-<text x="260" y="377" text-anchor="middle" fill="#57606a" font-size="10" font-style="italic">opt-in for chip arrays (--phasing-engine haploid)</text>
-<rect x="470" y="250" width="380" height="136" rx="8" fill="#ffffff" stroke="#0969da" stroke-width="1.2"/>
-<text x="660" y="272" text-anchor="middle" fill="#0969da" font-size="13" font-weight="700">Diploid engine</text>
-<text x="660" y="293" text-anchor="middle" fill="#1f2328" font-size="11.5">Genotype graph + MCMC (15 iterations)</text>
-<text x="660" y="311" text-anchor="middle" fill="#1f2328" font-size="11.5">EM Ne estimation during burn-in</text>
-<text x="660" y="329" text-anchor="middle" fill="#1f2328" font-size="11.5">Common → rare two-stage (PBWT voting)</text>
-<text x="660" y="347" text-anchor="middle" fill="#1f2328" font-size="11.5">IBD2 exclusion + match-length-weighted rare votes</text>
-<text x="660" y="377" text-anchor="middle" fill="#57606a" font-size="10" font-style="italic">default · all inputs (arrays and WGS)</text>
+<text x="460" y="237" text-anchor="middle" fill="#57606a" font-size="11">if the target is unphased — one engine for every input</text>
+<rect x="70" y="250" width="780" height="136" rx="8" fill="#ffffff" stroke="#0969da" stroke-width="1.2"/>
+<text x="460" y="272" text-anchor="middle" fill="#0969da" font-size="13" font-weight="700">Diploid engine</text>
+<text x="265" y="302" text-anchor="middle" fill="#1f2328" font-size="11.5">Genotype graph + segment HMM</text>
+<text x="265" y="324" text-anchor="middle" fill="#1f2328" font-size="11.5">MCMC (15 iterations)</text>
+<text x="655" y="302" text-anchor="middle" fill="#1f2328" font-size="11.5">Common → rare two-stage (PBWT voting)</text>
+<text x="655" y="324" text-anchor="middle" fill="#1f2328" font-size="11.5">IBD2 exclusion + match-length-weighted rare votes</text>
+<text x="460" y="377" text-anchor="middle" fill="#57606a" font-size="10" font-style="italic">arrays, WGS and de-novo panels (--phase-panel)</text>
 <path d="M787 100 L787 186 L895 186 L895 318 L872 318" fill="none" stroke="#8c959f" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arr)"/>
 <text x="905" y="252" fill="#8c959f" font-size="9" transform="rotate(90,905,252)" text-anchor="middle">Mendelian scaffold</text>
 <path d="M 28 100 L 12 100 L 12 548 L 48 548" fill="none" stroke="#0969da" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arr)"/>
@@ -255,9 +248,7 @@
 <rect x="465" y="756" width="405" height="30" rx="6" fill="#ffffff" stroke="#9a6700" stroke-width="1" stroke-dasharray="4,3"/>
 <text x="667" y="775" text-anchor="middle" fill="#9a6700" font-size="11">Panels: BCF / VCF / BREF3 ↔ SRP, no external converter</text>
 <g>
-<rect x="70" y="250" width="380" height="136" rx="8" fill="#ffffff" opacity="0.75"><animate attributeName="opacity" calcMode="discrete" values="0.75;0" keyTimes="0;0.43912" dur="43.14s" repeatCount="indefinite"/></rect>
 <rect x="470" y="512" width="380" height="124" rx="8" fill="#ffffff" opacity="0.75"><animate attributeName="opacity" calcMode="discrete" values="0.75;0" keyTimes="0;0.43912" dur="43.14s" repeatCount="indefinite"/></rect>
-<rect x="70" y="250" width="380" height="136" rx="8" fill="#ffffff" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;0.75;0" keyTimes="0;0.43912;0.70520" dur="43.14s" repeatCount="indefinite"/></rect>
 <rect x="140" y="414" width="640" height="28" rx="8" fill="#ffffff" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;0.75;0" keyTimes="0;0.43912;0.70520" dur="43.14s" repeatCount="indefinite"/></rect>
 <rect x="70" y="512" width="380" height="124" rx="8" fill="#ffffff" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;0.75;0" keyTimes="0;0.43912;0.70520" dur="43.14s" repeatCount="indefinite"/></rect>
 <rect x="470" y="512" width="380" height="124" rx="8" fill="#ffffff" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;0.75;0" keyTimes="0;0.43912;0.70520" dur="43.14s" repeatCount="indefinite"/></rect>
@@ -269,7 +260,7 @@
 <rect x="30" y="50" width="195" height="50" rx="8" fill="none" stroke="#1a7f37" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.14737;0.43912" dur="43.14s" repeatCount="indefinite"/></rect>
 <rect x="248" y="50" width="195" height="50" rx="8" fill="none" stroke="#9a6700" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.14610;0.43912" dur="43.14s" repeatCount="indefinite"/></rect>
 <rect x="60" y="132" width="640" height="38" rx="10" fill="none" stroke="#8250df" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.16044;0.43912" dur="43.14s" repeatCount="indefinite"/></rect>
-<rect x="470" y="250" width="380" height="136" rx="8" fill="none" stroke="#0969da" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.16172;0.43912" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="70" y="250" width="780" height="136" rx="8" fill="none" stroke="#0969da" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.16172;0.43912" dur="43.14s" repeatCount="indefinite"/></rect>
 <rect x="140" y="414" width="640" height="28" rx="8" fill="none" stroke="#1a7f37" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.18338;0.43912" dur="43.14s" repeatCount="indefinite"/></rect>
 <rect x="466" y="50" width="195" height="50" rx="8" fill="none" stroke="#57606a" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.18592;0.43912" dur="43.14s" repeatCount="indefinite"/></rect>
 <rect x="70" y="512" width="380" height="124" rx="8" fill="none" stroke="#bf3989" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.23415;0.43912" dur="43.14s" repeatCount="indefinite"/></rect>
@@ -277,7 +268,7 @@
 <rect x="30" y="50" width="195" height="50" rx="8" fill="none" stroke="#1a7f37" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.56487;0.70520" dur="43.14s" repeatCount="indefinite"/></rect>
 <rect x="248" y="50" width="195" height="50" rx="8" fill="none" stroke="#9a6700" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.55873;0.70520" dur="43.14s" repeatCount="indefinite"/></rect>
 <rect x="60" y="132" width="640" height="38" rx="10" fill="none" stroke="#8250df" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.58092;0.70520" dur="43.14s" repeatCount="indefinite"/></rect>
-<rect x="470" y="250" width="380" height="136" rx="8" fill="none" stroke="#0969da" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.57785;0.70520" dur="43.14s" repeatCount="indefinite"/></rect>
+<rect x="70" y="250" width="780" height="136" rx="8" fill="none" stroke="#0969da" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.57785;0.70520" dur="43.14s" repeatCount="indefinite"/></rect>
 <rect x="30" y="50" width="195" height="50" rx="8" fill="none" stroke="#1a7f37" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.79969" dur="43.14s" repeatCount="indefinite"/></rect>
 <rect x="248" y="50" width="195" height="50" rx="8" fill="none" stroke="#9a6700" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.81610" dur="43.14s" repeatCount="indefinite"/></rect>
 <rect x="466" y="50" width="195" height="50" rx="8" fill="none" stroke="#57606a" stroke-width="3" opacity="0"><animate attributeName="opacity" calcMode="discrete" values="0;1" keyTimes="0;0.81774" dur="43.14s" repeatCount="indefinite"/></rect>
