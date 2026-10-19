@@ -398,7 +398,12 @@ fn run_phasing(inp: &PhasingInputs) -> PhasingResult {
         // build — there the request is reported and ignored rather than silently
         // changing which sites are selected.
         let source = selphi::diploid::scaffold::Source::from_env();
-        let panel_bm = if source.needs_panel() { ref_bm_full.as_ref() } else { None };
+        // Private-het routing (SELPHI_DIPLOID_PRIVATE_RARE=1): sites whose minor allele
+        // no panel haplotype carries and the cohort carries once go to phase_rare. It
+        // reads the same chip-site panel bitmatrix, and phase_rare needs that matrix to
+        // vote with the panel, so where it is not built the routing is off too.
+        let private_on = selphi::diploid::scaffold::PrivateRare::enabled();
+        let panel_bm = if source.needs_panel() || private_on { ref_bm_full.as_ref() } else { None };
         if source.needs_panel() && panel_bm.is_none() {
             // The phase-only path builds the chip-site panel bitmatrix only under
             // SELPHI_PHASE_ONLY_RARE_REF_GB; without it only the cohort rule can run.
@@ -408,8 +413,18 @@ fn run_phasing(inp: &PhasingInputs) -> PhasingResult {
                 selphi_debug!("  phasing scaffold: cohort frequencies only (no chip-site panel bitmatrix on this path)");
             }
         }
+        if private_on && panel_bm.is_none() {
+            selphi_info!("    SELPHI_DIPLOID_PRIVATE_RARE ignored: no chip-site panel bitmatrix on this path \
+(phase-only above SELPHI_PHASE_ONLY_RARE_REF_GB, where phase_rare runs without the panel)");
+        }
+        let private = private_on.then_some(selphi::diploid::scaffold::PrivateRare { chip_bp: chip_bps });
         let scaffold = selphi::diploid::scaffold::select(
-            targ_alleles, n_chip, n_samples, panel_bm, source, scaffold_maf);
+            targ_alleles, n_chip, n_samples, panel_bm, source, scaffold_maf, private);
+        if private_on && panel_bm.is_some() {
+            selphi_step!("Private-het routing: {} panel-absent singleton sites left to phase_rare \
+({} kept in the scaffold: position shared with another record)",
+                scaffold.n_private, scaffold.n_private_shared_pos);
+        }
         if scaffold.widened {
             selphi_step!("No site clears the phasing scaffold threshold (no heterozygous call, e.g. a \
 male chrX): phasing on all {} called sites", scaffold.indices.len());

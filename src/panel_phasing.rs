@@ -466,6 +466,11 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
         selphi_info!("  NOTE: --phase-panel ignores {} (output = phased VCF + optional --srp/--bref3).",
             ignored.join(", "));
     }
+    if selphi::diploid::scaffold::PrivateRare::enabled() {
+        // The rule reads reference-panel allele counts; a de-novo panel has none.
+        selphi_info!("  NOTE: SELPHI_DIPLOID_PRIVATE_RARE ignored: --phase-panel has no reference panel \
+(the scaffold is the cohort's own MAF >= 0.001 sites)");
+    }
 
     // Streaming fast-path: for a large indexed-BCF cohort, phase chunk-by-chunk
     // with bounded memory (the in-RAM path below holds the full n_var×n_haps

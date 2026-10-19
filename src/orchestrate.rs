@@ -396,9 +396,18 @@ fn phase_chr(
     // SELPHI_DIPLOID_SCAFFOLD_SOURCE=panel|union reads the panel's frequency
     // too. Same selection as the single-chr path (diploid::scaffold).
     let scaffold_maf = selphi::config::f32_or("SELPHI_DIPLOID_SCAFFOLD_MAF", 0.001);
+    // SELPHI_DIPLOID_PRIVATE_RARE=1: panel-absent singleton hets go to phase_rare
+    // (diploid::scaffold module docs); this path always holds the chip-site matrix.
+    let private_on = selphi::diploid::scaffold::PrivateRare::enabled();
     let scaffold = selphi::diploid::scaffold::select(
         &targ_alleles, n_chip, n_samples, Some(&ref_bm),
-        selphi::diploid::scaffold::Source::from_env(), scaffold_maf);
+        selphi::diploid::scaffold::Source::from_env(), scaffold_maf,
+        private_on.then_some(selphi::diploid::scaffold::PrivateRare { chip_bp: chip_bps }));
+    if private_on {
+        selphi_info!("    Private-het routing: {} panel-absent singleton sites left to phase_rare \
+({} kept in the scaffold: position shared with another record)",
+            scaffold.n_private, scaffold.n_private_shared_pos);
+    }
     if scaffold.widened {
         selphi_info!("    Phasing: no site clears the scaffold threshold (no heterozygous call, \
 e.g. a male chrX): phasing on all {} called sites", scaffold.indices.len());
@@ -1120,7 +1129,11 @@ mod tests {
         let ref_alleles: Vec<u8> = (0..n_chip * n_ref).map(|i| (i % 3 == 0) as u8).collect();
         let panel = HaplotypeBitmatrix::from_byte_slice_all(n_chip, n_ref, &ref_alleles, n_ref);
         for source in [scaffold::Source::Union, scaffold::Source::Cohort, scaffold::Source::Panel] {
-            let sc = scaffold::select(&targ, n_chip, n_samples, Some(&panel), source, 0.001);
+            let sc = scaffold::select(&targ, n_chip, n_samples, Some(&panel), source, 0.001, None);
+            assert!(sc.indices.is_empty(), "scaffold {:?} from a target with no call", sc.indices);
+            let bp: Vec<i64> = (0..n_chip as i64).collect();
+            let sc = scaffold::select(&targ, n_chip, n_samples, Some(&panel), source, 0.001,
+                Some(scaffold::PrivateRare { chip_bp: &bp }));
             assert!(sc.indices.is_empty(), "scaffold {:?} from a target with no call", sc.indices);
         }
         assert_eq!(unphased_passthrough(targ), vec![0u8; n_chip * n_samples * 2]);
