@@ -33,7 +33,7 @@
 //! a standalone `Genotype` store.
 
 use crate::common::HaplotypeBitmatrix;
-use crate::sparse_ls::haplotype_set::{GenotypeView, TargetHaplotypeSet};
+use crate::sparse_ls::haplotype_set::{GenotypeView, SegmentPlan, TargetHaplotypeSet};
 use crate::lcwgs::ls_params::LsParams;
 use crate::sparse_ls::ref_haplotype_set::RefHaplotypeSet;
 use crate::sparse_ls::rng::Mt19937Rng;
@@ -66,6 +66,12 @@ pub struct FaithfulSelector {
     h1: Vec<Vec<bool>>,
     /// Whether the INIT-stage selection has already run (first call == INIT).
     init_done: bool,
+    /// Decode the panel half of each sweep on worker tasks (see
+    /// [`SegmentPlan`]); the plan is recorded by the first sweep.
+    segmented: bool,
+    plan: Option<SegmentPlan>,
+    #[cfg(test)]
+    segment_commons: Option<usize>,
 }
 
 /// Convert a normalized 3-way genotype probability `p` (∈[0,1]) to a PHRED byte
@@ -220,8 +226,16 @@ impl FaithfulSelector {
             h0: vec![vec![false; n_var]; n_samples],
             h1: vec![vec![false; n_var]; n_samples],
             init_done: false,
+            segmented: false,
+            plan: None,
+            #[cfg(test)]
+            segment_commons: None,
         }
     }
+
+    /// Split each later selection sweep between panel-decode tasks and the
+    /// calling thread (same selection).
+    pub fn set_segmented(&mut self, on: bool) { self.segmented = on; }
 
     /// Refresh the per-sample H0/H1 hard calls from the hybrid's current sampled
     /// `hap_alleles` (layout `hap_alleles[v*n_target_haps + h]`, h0=2s, h1=2s+1).
@@ -271,12 +285,25 @@ impl FaithfulSelector {
             self.tar.update_haplotypes(&self.ref_hs, &views);
         }
         self.tar.transpose_rare_tar(&self.ref_hs);
-        self.tar.match_haps_from_compressed_pbwt_small(
-            &self.ref_hs,
-            &self.vmap,
-            /*main_iteration=*/ false,
-            &mut self.shared_rng,
-        );
+        match (&self.plan, self.segmented) {
+            (None, true) => {
+                #[cfg(test)]
+                let mut plan = self.segment_commons.map_or_else(SegmentPlan::new, SegmentPlan::with_segment_commons);
+                #[cfg(not(test))]
+                let mut plan = SegmentPlan::new();
+                self.tar.match_haps_recording(&self.ref_hs, &self.vmap, &mut self.shared_rng, &mut plan);
+                self.plan = Some(plan);
+            }
+            (Some(plan), true) if plan.is_parallel() => {
+                self.tar.match_haps_segmented(&self.ref_hs, &self.vmap, plan, &mut self.shared_rng);
+            }
+            _ => self.tar.match_haps_from_compressed_pbwt_small(
+                &self.ref_hs,
+                &self.vmap,
+                /*main_iteration=*/ false,
+                &mut self.shared_rng,
+            ),
+        }
         self.flatten_pbwt()
     }
 
@@ -449,6 +476,48 @@ fn build_views<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Segmented sweeps (panel decode on worker tasks) select exactly what the
+    /// sequential sweep selects, iteration after iteration, for one and
+    /// several samples and segment sizes down to one common column.
+    #[test]
+    fn segmented_selection_matches_sequential() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        let mut rng = rp::Xs(0x6A09_E667_F3BC_C908);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        for &(n_var, n_haps, n_samples) in &[(1800usize, 3000usize, 1usize), (900, 2500, 3), (600, 1200, 1), (260, 70_000, 1)] {
+            let bm = rp::random_typed_panel(&mut rng, n_var, n_haps);
+            let cm: Vec<f64> = (0..n_var).map(|v| v as f64 * 0.0011).collect();
+            let gl3: Vec<f32> = (0..n_var * n_samples).flat_map(|_| match rng.below(3) {
+                0 => [1.0 / 3.0; 3],
+                1 => [0.9, 0.09, 0.01],
+                _ => [0.05, 0.9, 0.05],
+            }).collect();
+            let mut params = LcwgsParams::default();
+            params.kpbwt = 300;
+            let segs: &[Option<usize>] = if n_haps > 65_536 { &[Some(9)] } else { &[None, Some(1), Some(7), Some(64)] };
+            for &seg in segs {
+                let make = |segmented: bool| {
+                    let mut f = FaithfulSelector::build(&bm, &cm, &gl3, n_samples, &params, 99);
+                    f.set_segmented(segmented);
+                    f.segment_commons = seg;
+                    f
+                };
+                let (mut want, mut got) = (make(false), make(true));
+                for it in 0..5 {
+                    let haps: Vec<u8> = (0..n_var * 2 * n_samples).map(|_| (rng.below(4) == 0) as u8).collect();
+                    let a = want.select(&haps);
+                    let b = pool.install(|| got.select(&haps));
+                    assert_eq!(a, b, "n_var={n_var} samples={n_samples} seg={seg:?} it={it}");
+                    assert!(a.iter().all(|c| !c.is_empty()));
+                    assert_eq!((want.tar.counter_gf, want.tar.counter_sel_gf, want.tar.counter_rare_restarts),
+                        (got.tar.counter_gf, got.tar.counter_sel_gf, got.tar.counter_rare_restarts));
+                }
+                assert!(got.plan.as_ref().is_some_and(|p| p.is_parallel()));
+                assert!(want.tar.counter_gf > 0 && want.tar.counter_rare_restarts > 0);
+            }
+        }
+    }
 
     #[test]
     fn bitmap_index_union_matches_sorted_truncation() {

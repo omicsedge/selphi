@@ -609,9 +609,13 @@ fn run_gibbs_with_memory(
     // default OFF). Built ONCE per chunk from the same ref_bm + cm + gl3 the
     // hybrid uses; drives the GLIMPSE2 per-individual selection each refresh.
     let mut faithful: Option<super::faithful_select::FaithfulSelector> = if cfg.faithful_select && precomputed_cond.is_none() {
-        Some(super::faithful_select::FaithfulSelector::build(
+        let mut f = super::faithful_select::FaithfulSelector::build(
             ref_bm, cm, gl3, n_samples, params, seed,
-        ))
+        );
+        // A single admitted sample decodes the panel half of its sweeps on
+        // idle workers (same selection).
+        f.set_segmented(memory.is_some());
+        Some(f)
     } else {
         None
     };

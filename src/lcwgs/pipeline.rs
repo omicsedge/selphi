@@ -547,11 +547,14 @@ fn resolve_split(mean_conf: f32, params: &LcwgsParams) -> Option<(f64, f64, usiz
 }
 
 /// Resident chunk state, selection structures, accumulators and completed
-/// sample results. GLs, map coordinates and panel indices are borrowed.
+/// sample results. GLs, map coordinates and panel indices are borrowed. The
+/// single-sample path also keeps the selection's segment plan and decoded
+/// segments.
 fn chunk_state_bytes(sites: usize, n_ref: usize, samples: usize) -> usize {
     let panel = n_ref.div_ceil(64) * 8;
     sites.saturating_mul(panel * 2 + 256 + samples * 128)
         .saturating_add(n_ref * 128)
+        .saturating_add(if samples <= 1 { crate::sparse_ls::haplotype_set::SegmentPlan::bytes(sites, n_ref) } else { 0 })
 }
 
 /// A chunk's resident inputs/outputs and one active sample task's scratch.

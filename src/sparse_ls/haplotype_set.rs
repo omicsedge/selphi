@@ -40,6 +40,9 @@
 use crate::sparse_ls::bitmatrix::BitMatrix;
 use crate::sparse_ls::variant::VariantMap;
 
+mod segmented;
+pub use segmented::SegmentPlan;
+
 // ---------------------------------------------------------------------------
 // RNG injection
 // ---------------------------------------------------------------------------
@@ -665,6 +668,29 @@ impl TargetHaplotypeSet {
         _main_iteration: bool,
         rng: &mut G,
     ) {
+        self.match_haps_impl(rhs, m, rng, None);
+    }
+
+    /// [`Self::match_haps_from_compressed_pbwt_small`], recording the segment
+    /// boundaries later sweeps decode in parallel (see [`SegmentPlan`]).
+    pub fn match_haps_recording<R: RefHapSet, G: Rng>(
+        &mut self,
+        rhs: &R,
+        m: &VariantMap,
+        rng: &mut G,
+        plan: &mut SegmentPlan,
+    ) {
+        self.match_haps_impl(rhs, m, rng, Some(&mut *plan));
+        plan.finish(rhs, m);
+    }
+
+    fn match_haps_impl<R: RefHapSet, G: Rng>(
+        &mut self,
+        rhs: &R,
+        m: &VariantMap,
+        rng: &mut G,
+        mut plan: Option<&mut SegmentPlan>,
+    ) {
         let n_ref = rhs.n_ref_haps();
         let n_tot = rhs.n_tot_sites();
 
@@ -727,6 +753,9 @@ impl TargetHaplotypeSet {
         let mut l_all = 0usize;
 
         for k in 0..n_tot {
+            if let Some(plan) = plan.as_deref_mut() {
+                plan.visit(rhs, m, k, l_hq, py, &self.pbwt_array_a);
+            }
             if m.vars[k].lq {
                 // LQ: skip but still advance the common counter.
                 l_all += rhs.flag_common(k) as usize;
@@ -1311,11 +1340,28 @@ impl TargetHaplotypeSet {
         k0: i32,
         a: u8,
     ) {
+        // `select_k_from` takes the array by reference; the field is moved out
+        // for the call (the two arrays have the same length).
+        let arr = std::mem::take(if use_b { &mut self.pbwt_array_b } else { &mut self.pbwt_array_a });
+        self.select_k_from(&arr, k, htr, ref_rac_l, k0, a);
+        *(if use_b { &mut self.pbwt_array_b } else { &mut self.pbwt_array_a }) = arr;
+    }
+
+    /// `select_k` harvesting from the prefix array `pbwt_array` (`n_ref` long).
+    fn select_k_from<T: Copy + Into<i32>>(
+        &mut self,
+        pbwt_array: &[T],
+        k: i32,
+        htr: usize,
+        ref_rac_l: i32,
+        k0: i32,
+        a: u8,
+    ) {
         let _ = k; // k only feeds match-length stats; harvesting does not read it.
                    // Kept in the signature for parity.
         let sample = self.tar_hapid2ind[htr] as usize;
         let pbwt_idx = self.pbwt_index[htr];
-        let n_ref = self.pbwt_array_a.len() as i32;
+        let n_ref = pbwt_array.len() as i32;
 
         let d_up = self.pbwt_index[htr] - self.f_k[htr];
         let d_down = self.g_k[htr] - self.pbwt_index[htr];
@@ -1341,17 +1387,12 @@ impl TargetHaplotypeSet {
         let mut od = 0i32;
         let mut ou = 0i32;
         let mut o = 0i32;
-        let pbwt_array: &[i32] = if use_b {
-            &self.pbwt_array_b
-        } else {
-            &self.pbwt_array_a
-        };
         while o < max_hh {
             // DOWN side: idx = pbwt_idx + od.
             if od < nh_down {
                 let idx = pbwt_idx + od;
                 if idx < n_ref && ((idx >= ref_rac_l) == a_bool) {
-                    self.pbwt_states[sample][o as usize].push(pbwt_array[idx as usize]);
+                    self.pbwt_states[sample][o as usize].push(pbwt_array[idx as usize].into());
                     od += 1;
                 }
             }
@@ -1359,7 +1400,7 @@ impl TargetHaplotypeSet {
             if ou < nh_up {
                 let idx = pbwt_idx - (ou + 1);
                 if idx >= 0 && ((idx >= ref_rac_l) == a_bool) {
-                    self.pbwt_states[sample][o as usize].push(pbwt_array[idx as usize]);
+                    self.pbwt_states[sample][o as usize].push(pbwt_array[idx as usize].into());
                     ou += 1;
                 }
             }
