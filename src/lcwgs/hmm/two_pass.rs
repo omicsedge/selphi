@@ -547,40 +547,40 @@ impl Shared<'_> {
 
     /// B: roll beta from the top ahead of the forward pass, process blocks the
     /// forward pass has passed, then help with the rolled-through blocks.
-    unsafe fn backward_pass<A: Kernels>(&self) { unsafe {
+    unsafe fn backward_pass<A: Kernels>(&self, bp: *mut f32, blk: *mut f32) { unsafe {
         let k = self.ctx.k;
-        let mut bp = vec![0.0f32; k];
-        let mut blk = vec![0.0f32; self.stride * k];
         let mut beta_sum = 0.0f32;
         for b in (0..self.n_chk).rev() {
             let (_, hi) = self.bounds(b);
             if self.alpha_ready(hi) {
                 if !self.claim(b) { break; }
-                self.process_block::<A>(b, bp.as_mut_ptr(), &mut beta_sum, blk.as_mut_ptr());
+                self.process_block::<A>(b, bp, &mut beta_sum, blk);
                 continue;
             }
             // The forward pass has not reached this block: keep the beta that
             // enters it, then roll through.
             let slot = self.slots.add(b * (k + 1));
-            std::ptr::copy_nonoverlapping(bp.as_ptr(), slot, k);
+            std::ptr::copy_nonoverlapping(bp, slot, k);
             *slot.add(k) = beta_sum;
             self.ready[b].store(true, Ordering::Release);
-            self.roll_block::<A>(b, bp.as_mut_ptr(), &mut beta_sum);
+            self.roll_block::<A>(b, bp, &mut beta_sum);
         }
         // Slotted blocks from below, until the forward pass's top-down run.
         for b in 0..self.n_chk {
             if !self.ready[b].load(Ordering::Acquire) { continue; }
             let (_, hi) = self.bounds(b);
+            // Only reached when this pass rolled through every block before the
+            // forward one reached them: wait for the forward pass.
             let mut spins = 0u32;
             while !self.alpha_ready(hi) {
                 spins += 1;
-                if spins < 1 << 10 { std::hint::spin_loop(); } else { std::thread::yield_now(); }
+                if spins < 1 << 10 { std::hint::spin_loop(); } else { std::thread::sleep(std::time::Duration::from_micros(20)); }
             }
             if !self.claim(b) { break; }
             let slot = self.slots.add(b * (k + 1));
-            std::ptr::copy_nonoverlapping(slot, bp.as_mut_ptr(), k);
+            std::ptr::copy_nonoverlapping(slot, bp, k);
             let mut bs = *slot.add(k);
-            self.process_block::<A>(b, bp.as_mut_ptr(), &mut bs, blk.as_mut_ptr());
+            self.process_block::<A>(b, bp, &mut bs, blk);
         }
     }}
 }
@@ -650,6 +650,9 @@ pub(super) unsafe fn run<A: Kernels>(
     let mut blk = sized(take_tl(&TL_BLK), stride * k);
     let mut fcol = sized(take_tl(&TL_FCOL), 2 * k);
     let mut slots: Vec<f32> = Vec::with_capacity(n_chk * (k + 1));
+    // The backward pass's beta and block, allocated (and freed) here.
+    let mut b_beta = sized(Vec::new(), k);
+    let mut b_blk = sized(Vec::new(), stride * k);
     let mut dosage = vec![0.0f32; n_var];
 
     let timing = hmm_timing();
@@ -672,10 +675,11 @@ pub(super) unsafe fn run<A: Kernels>(
     };
     {
         let (fp, bp, blkp) = (fcol.as_mut_ptr() as usize, beta.as_mut_ptr() as usize, blk.as_mut_ptr() as usize);
+        let (bbp, bblkp) = (b_beta.as_mut_ptr() as usize, b_blk.as_mut_ptr() as usize);
         let sh = &sh;
         rayon::join(
             move || sh.forward_pass::<A>(fp as *mut f32, bp as *mut f32, blkp as *mut f32),
-            move || sh.backward_pass::<A>(),
+            move || sh.backward_pass::<A>(bbp as *mut f32, bblkp as *mut f32),
         );
     }
     drop(sh);

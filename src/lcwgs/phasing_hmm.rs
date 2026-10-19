@@ -2082,7 +2082,8 @@ impl PhasingHmm {
             nrho: self.nrho,
             n_states: self.n_states,
             simd: self.simd,
-            condbits: Vec::new(),
+            // Sized here so the forward pass's worker allocates nothing.
+            condbits: vec![0u64; self.n_states.div_ceil(64)],
             condrow: std::ptr::null(),
             base_pack: self.base_pack,
             plan_full: self.plan_full.clone(),
