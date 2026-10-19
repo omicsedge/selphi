@@ -8,6 +8,70 @@ use crate::selphi_debug;
     if r<sz&&k[r]<k[c]{c=r}
     if k[c]<k[p]{k.swap(p,c);x.swap(p,c);p=c}else{break}}}
 
+/// Bounds on a cluster's switch probability. On a flat stretch of the genetic
+/// map every marker gap is floored at about 1e-8 cM (`window::enforce_gen_pos`),
+/// so the per-marker switch probabilities fall below the f32 resolution of
+/// `1 - p`; an f32 product over the cluster then gives a switch probability of
+/// exactly 0 and the copying state can never change inside the window.
+const SWITCH_PROB_MIN: f64 = 1e-7;
+const SWITCH_PROB_MAX: f64 = 1.0 - 1e-7;
+
+/// Likelihood ratio given to a phase decision whose rejected orientation has
+/// probability 0; also the largest ratio reported.
+const MAX_PHASE_RATIO: f64 = 1e6;
+
+/// `SELPHI_HAPLOID_FLATMAP_OLD=1` restores the unbounded f32 cluster switch
+/// probability and the f32 phase products, for an A/B.
+fn flatmap_old() -> bool {
+    use std::sync::OnceLock;
+    static OLD: OnceLock<bool> = OnceLock::new();
+    *OLD.get_or_init(|| crate::config::is_one("SELPHI_HAPLOID_FLATMAP_OLD"))
+}
+
+/// Probability of at least one switch between a cluster and the one before it,
+/// `1 - prod(1 - p)` over the cluster's per-marker switch probabilities
+/// `p_recomb`, formed in f64 and bounded to [`SWITCH_PROB_MIN`, `SWITCH_PROB_MAX`].
+/// `old` keeps the unbounded f32 product, in which `1 - p` rounds to 1 for any
+/// `p` below about 3e-8.
+pub(crate) fn cluster_switch_prob(p_recomb: &[f32], old: bool) -> f32 {
+    if old {
+        let mut no_switch = 1.0f32;
+        for &p in p_recomb { no_switch *= 1.0 - p; }
+        return 1.0 - no_switch;
+    }
+    let mut no_switch = 1.0f64;
+    for &p in p_recomb { no_switch *= 1.0 - p as f64; }
+    (1.0 - no_switch).clamp(SWITCH_PROB_MIN, SWITCH_PROB_MAX) as f32
+}
+
+/// Orientation decision at a heterozygote from the four haplotype-pair
+/// posteriors: `p11 * p22` supports keeping the current orientation and
+/// `p12 * p21` swapping it. Returns whether the swap wins and the likelihood
+/// ratio of the chosen orientation over the other (at least 1).
+///
+/// The products are formed in f64, where products of f32 posteriors cannot
+/// underflow. When both are 0 (or not finite) the heterozygote carries no phase
+/// information: it keeps its orientation with ratio 1 and is not locked. A zero
+/// rejected orientation gives [`MAX_PHASE_RATIO`], which also caps the ratio.
+/// `old` keeps the f32 products, where two underflowed products gave the
+/// ratio 1e6 and locked the heterozygote unswapped.
+pub(crate) fn phase_decision(p11: f32, p12: f32, p21: f32, p22: f32, old: bool) -> (bool, f32) {
+    if old {
+        let (keep, swap) = (p11 * p22, p12 * p21);
+        let ratio = if keep >= swap { if swap > 0.0 { keep / swap } else { 1e6 } }
+            else if keep > 0.0 { swap / keep } else { 1e6 };
+        return (keep < swap, ratio);
+    }
+    let keep = p11 as f64 * p22 as f64;
+    let swap = p12 as f64 * p21 as f64;
+    if !(keep.is_finite() && swap.is_finite()) || (keep <= 0.0 && swap <= 0.0) {
+        return (false, 1.0);
+    }
+    let (hi, lo) = if keep >= swap { (keep, swap) } else { (swap, keep) };
+    let ratio = if lo > 0.0 { (hi / lo).min(MAX_PHASE_RATIO) } else { MAX_PHASE_RATIO };
+    (keep < swap, ratio as f32)
+}
+
 /// Copy haplotype h from haplotype-major bitmatrix to marker-major comp slot sl, markers [from, to).
 #[inline(always)]
 fn copy_hap_to_comp(hbm:&[u8],hbs:usize,h:usize,sl:usize,from:usize,to:usize,comp:&mut[u8],cbs:usize) {
@@ -362,16 +426,14 @@ pub fn phase_one(hbm:&[u8],hbs:usize,ibs:&[i32],hmask:&[u8],cm:&[f64],cst:&[i32]
 
     if dbg{crate::haploid::debug::dump_mismatch(dbg_it,dbg_wi,si,&pw.mm,nc,ns)}
 
-    // Per-cluster recombination probability. p_recomb[m] (the -expm1 transcendental) is
-    // precomputed once per phasing iteration by the caller (loop-invariant across samples);
-    // only the per-cluster product is local. Byte-identical to the former per-call recompute
-    // (p_recomb[0]==0 matches the old m==0 → dm=0 → p=0 branch).
+    // Per-cluster switch probability from the per-marker p_recomb[m] (the -expm1
+    // transcendental), which the caller precomputes once per phasing iteration
+    // (loop-invariant across samples). The first cluster has no predecessor: pr[0] = 0.
     let ri=recomb_intensity; // still used by the debug dump below
+    let old_flat = flatmap_old();
     pw.pr.clear(); pw.pr.resize(nc, 0.0f32);
-    for c in 1..nc{let mut pnr=1.0f32;
-        for m in pw.csa[c]as usize..pw.cea[c]as usize{
-            let p=p_recomb[m];pnr*=1.0-p}
-        pw.pr[c]=1.0-pnr}
+    for c in 1..nc{
+        pw.pr[c]=cluster_switch_prob(&p_recomb[pw.csa[c]as usize..pw.cea[c]as usize],old_flat)}
 
     if dbg{crate::haploid::debug::dump_recomb(dbg_it,dbg_wi,si,&pw.pr,nc,ri*nh as f32/0.04f32,pm)}
 
@@ -446,24 +508,27 @@ pub fn phase_one(hbm:&[u8],hbs:usize,ibs:&[i32],hmask:&[u8],cm:&[f64],cst:&[i32]
             // Masked hets compute posterior but don't affect swap chain
             let b1=&pw.bh1[h2*ns..(h2+1)*ns];let b2=&pw.bh2[h2*ns..(h2+1)*ns];
             let(p11,p12,p21,p22)=unsafe{crate::haploid::simd::dot4(&pw.fwd[ns..2*ns],&pw.fwd[2*ns..3*ns],b1,b2,ns)};
-            let(mut pns_m,mut pss_m)=(p11*p22,p12*p21);
-            if sh3{std::mem::swap(&mut pns_m,&mut pss_m)}
-            if dbg{dbg_posts.push((h2,c,pns_m as f64,pss_m as f64,pss_m as f64,pns_m as f64))}
+            if dbg{let(mut pns_m,mut pss_m)=(p11*p22,p12*p21);
+                if sh3{std::mem::swap(&mut pns_m,&mut pss_m)}
+                dbg_posts.push((h2,c,pns_m as f64,pss_m as f64,pss_m as f64,pns_m as f64))}
             // Determine local swap for this masked het (independent of swap chain)
-            // swap_a will be set AFTER cumulative XOR to encode local decision
-            pw.conf_a[h2]=if pns_m>=pss_m{if pss_m>0.0{pns_m/pss_m}else{1e6}}else{if pns_m>0.0{pss_m/pns_m}else{1e6}};
+            // swap_a will be set AFTER cumulative XOR to encode local decision.
+            // Under a swapped chain the two pairings exchange roles.
+            let(wants_swap,conf)=if sh3{phase_decision(p12,p11,p22,p21,old_flat)}
+                else{phase_decision(p11,p12,p21,p22,old_flat)};
+            pw.conf_a[h2]=conf;
             if pw.conf_a[h2]>=lrt{pw.lck_a[h2]=1}
-            // Mark masked hets that want local swap (pss > pns) for post-processing
-            if pss_m>pns_m{pw.swap_a[h2]=2}  // sentinel: 2 = "masked wants swap"
+            // Mark masked hets that want local swap for post-processing
+            if wants_swap{pw.swap_a[h2]=2}  // sentinel: 2 = "masked wants swap"
             // NO sh3 modification, NO channel reset (masked hets don't affect swap chain)
         } else if!pw.hl2[h2]{
             // Standard phaseHet: full 4-way posterior (f32)
             let b1=&pw.bh1[h2*ns..(h2+1)*ns];let b2=&pw.bh2[h2*ns..(h2+1)*ns];
             let(p11,p12,p21,p22)=unsafe{crate::haploid::simd::dot4(&pw.fwd[ns..2*ns],&pw.fwd[2*ns..3*ns],b1,b2,ns)};
             if dbg{dbg_posts.push((h2,c,p11 as f64,p12 as f64,p21 as f64,p22 as f64))}
-            let(num,den)=(p11*p22,p12*p21);let ls=sh3;sh3=num<den;
+            let(swap,conf)=phase_decision(p11,p12,p21,p22,old_flat);let ls=sh3;sh3=swap;
             if sh3!=ls{pw.swap_a[h2]=1}
-            pw.conf_a[h2]=if num>=den{if den>0.0{num/den}else{1e6}}else{if num>0.0{den/num}else{1e6}};
+            pw.conf_a[h2]=conf;
             if pw.conf_a[h2]>=lrt{pw.lck_a[h2]=1}
             pw.fwd.copy_within(0..ns, ns);pw.fwd.copy_within(0..ns, 2*ns);
             fs[1]=fs[0];fs[2]=fs[0]}}  // close else-if + if-hv>=0
@@ -527,4 +592,118 @@ pub fn phase_one(hbm:&[u8],hbs:usize,ibs:&[i32],hmask:&[u8],cm:&[f64],cst:&[i32]
     // Return workspace to thread-local for reuse
     TL_PW.with(|w| { let mut ws = w.borrow_mut(); std::mem::swap(&mut *ws, &mut pw); });
     PhaseResult { n_swap: nsw, n_own: nown, n_lock: nlk, swap_ranges, locks, het_conf }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Per-marker switch probability across a gap at the 1e-8 cM floor of a flat map.
+    const FLAT_GAP_P: f32 = 1e-8;
+
+    fn one_minus_no_switch(p: &[f32]) -> f64 {
+        -p.iter().map(|&x| (-(x as f64)).ln_1p()).sum::<f64>().exp_m1()
+    }
+
+    #[test]
+    fn flat_map_cluster_switch_prob_is_bounded() {
+        for n in [1usize, 10, 1000] {
+            let p = vec![FLAT_GAP_P; n];
+            assert_eq!(cluster_switch_prob(&p, true), 0.0, "f32 product over {n} flat gaps");
+            let pr = cluster_switch_prob(&p, false);
+            let want = one_minus_no_switch(&p).max(SWITCH_PROB_MIN);
+            assert!(((pr as f64) - want).abs() <= 1e-6 * want, "{n} flat gaps: {pr} vs {want}");
+        }
+        // Enough flat gaps to clear the floor: the f64 product keeps their sum.
+        let p = vec![FLAT_GAP_P; 100_000];
+        let want = one_minus_no_switch(&p);
+        assert!(want > 10.0 * SWITCH_PROB_MIN);
+        assert_eq!(cluster_switch_prob(&p, true), 0.0);
+        let pr = cluster_switch_prob(&p, false) as f64;
+        assert!((pr - want).abs() <= 1e-6 * want, "{pr} vs {want}");
+        // An ordinary cluster is unchanged to f32 rounding.
+        let p = [1e-3f32, 2e-3, 5e-4];
+        let (old, new) = (cluster_switch_prob(&p, true), cluster_switch_prob(&p, false));
+        assert!((old - new).abs() <= 1e-5 * old, "{old} vs {new}");
+        // A certain switch stays below 1, so the copying state keeps its weight.
+        assert_eq!(cluster_switch_prob(&[1.0], true), 1.0);
+        let top = cluster_switch_prob(&[1.0], false);
+        assert!(top < 1.0 && top as f64 >= SWITCH_PROB_MAX - 1e-7);
+    }
+
+    #[test]
+    fn underflowed_phase_products_are_not_locked() {
+        // Posteriors whose f32 products underflow to 0 in both orientations.
+        let (p11, p12, p21, p22) = (2e-25f32, 1e-25, 1e-25, 2e-25);
+        assert_eq!(p11 * p22, 0.0);
+        assert_eq!(p12 * p21, 0.0);
+        assert_eq!(phase_decision(p11, p12, p21, p22, true), (false, 1e6));
+        let (swap, ratio) = phase_decision(p11, p12, p21, p22, false);
+        assert!(!swap);
+        assert!((ratio - 4.0).abs() < 1e-4, "{ratio}");
+        let (swap, ratio) = phase_decision(p12, p11, p22, p21, false);
+        assert!(swap);
+        assert!((ratio - 4.0).abs() < 1e-4, "{ratio}");
+        // No information at all: no swap, ratio 1.
+        assert_eq!(phase_decision(0.0, 0.0, 0.0, 0.0, true), (false, 1e6));
+        assert_eq!(phase_decision(0.0, 0.0, 0.0, 0.0, false), (false, 1.0));
+        // A zero rejected orientation is decisive; ratios are capped.
+        assert_eq!(phase_decision(0.5, 0.0, 0.5, 0.5, false), (false, MAX_PHASE_RATIO as f32));
+        assert_eq!(phase_decision(1.0, 1e-20, 1e-20, 1.0, false), (false, MAX_PHASE_RATIO as f32));
+        // Ordinary posteriors: same decision and ratio as the f32 form.
+        let (a, b) = (phase_decision(0.4, 0.1, 0.2, 0.3, true), phase_decision(0.4, 0.1, 0.2, 0.3, false));
+        assert_eq!(a.0, b.0);
+        assert!((a.1 - b.1).abs() <= 1e-6 * a.1, "{a:?} vs {b:?}");
+    }
+
+    /// One sample (haplotypes 0 and 1, alleles 0 and 1 at every heterozygote,
+    /// 0 elsewhere) phased against four reference haplotypes over a window whose
+    /// genetic map is flat. The sample copies references 2 and 3 before marker
+    /// 50 and references 4 and 5 after it; each pair carries the other allele at
+    /// every homozygous marker on its far side, so nothing copies across marker
+    /// 50 without a switch. With a switch probability of 0 every phase product at
+    /// the heterozygote on marker 50 underflows, and it used to be locked with the
+    /// ratio 1e6; with switches allowed its decision rests on the data and stays
+    /// far below the lock threshold, and the phase, already right, is kept.
+    #[test]
+    fn flat_map_window_does_not_lock_underflowed_het() {
+        const N_MARKERS: usize = 100;
+        const SPLIT: usize = 50;
+        const N_HAPS: usize = 6;
+        let hbs = (N_MARKERS + 7) / 8;
+        let mut hbm = vec![0u8; N_HAPS * hbs];
+        let mut set = |h: usize, m: usize| hbm[h * hbs + (m >> 3)] |= 1 << (m & 7);
+        let is_het = |m: usize| m % 5 == 0 && m > 0;
+        for m in 0..N_MARKERS {
+            if is_het(m) {
+                for h in [1, 3, 5] { set(h, m); }
+            } else if m < SPLIT {
+                set(4, m); set(5, m);
+            } else {
+                set(2, m); set(3, m);
+            }
+        }
+        let hmask: Vec<u8> = (0..N_MARKERS).map(|m| is_het(m) as u8).collect();
+        let cm: Vec<f64> = (0..N_MARKERS).map(|m| m as f64 * 1e-8).collect();
+        let mut p_recomb = vec![FLAT_GAP_P; N_MARKERS];
+        p_recomb[0] = 0.0;
+        // Two IBS steps: the upstream pair, then the downstream pair.
+        let ibs = [2, 3, 4, 5];
+        let cst = [0, SPLIT as i32];
+        let locked = vec![0u8; N_MARKERS];
+        let lrt = 1e5f32;
+        let r = phase_one(&hbm, hbs, &ibs, &hmask, &cm, &cst,
+            SPLIT, 1000, &locked, &[], 0, N_MARKERS, 2, 1,
+            2, 0, 0, N_MARKERS, N_HAPS, N_MARKERS, 280,
+            lrt, 1.0, 1e-5, N_HAPS,
+            &[],
+            &p_recomb,
+            1, 1,
+            true);
+        let conf = r.het_conf.iter().find(|&&(m, _)| m == SPLIT).map(|&(_, c)| c)
+            .expect("the heterozygote at the split is decided");
+        assert!(conf < 1e3, "heterozygote at the split: ratio {conf}, expected an uninformed decision");
+        assert!(!r.locks.contains(&(SPLIT, 0)), "heterozygote at the split locked (ratio {conf})");
+        assert_eq!(r.n_swap, 0, "swaps {:?}", r.swap_ranges);
+    }
 }
