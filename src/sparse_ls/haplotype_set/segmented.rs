@@ -69,10 +69,11 @@ pub struct SegmentPlan {
     starts: Vec<SegmentStart>,
     commons: usize,
     segment_commons: usize,
-    /// Largest segment: big arrays, common columns, sites.
+    /// Largest segment: big arrays, common columns, sites, small V entries.
     max_big: usize,
     max_commons: usize,
     max_sites: usize,
+    max_small_v: usize,
 }
 
 impl SegmentPlan {
@@ -80,7 +81,7 @@ impl SegmentPlan {
 
     /// A plan whose segments hold `n` common columns.
     pub fn with_segment_commons(n: usize) -> Self {
-        SegmentPlan { starts: Vec::new(), commons: 0, segment_commons: n.max(1), max_big: 0, max_commons: 0, max_sites: 0 }
+        SegmentPlan { starts: Vec::new(), commons: 0, segment_commons: n.max(1), max_big: 0, max_commons: 0, max_sites: 0, max_small_v: 0 }
     }
 
     /// Bytes a plan and its decoded segments in flight hold for a chunk of
@@ -121,7 +122,7 @@ impl SegmentPlan {
         for s in 0..self.starts.len() {
             let end = self.starts.get(s + 1).map_or(n_tot, |x| x.k);
             let (mut last_k, mut l_hq, mut n_big) = (self.starts[s].k as i64 - 1, self.starts[s].l_hq, 0usize);
-            let mut commons = 0usize;
+            let (mut commons, mut small_v) = (0usize, 0usize);
             for k in self.starts[s].k..end {
                 if !m.vars[k].lq && rhs.flag_common(k) {
                     let prev_common = last_k >= 0 && rhs.flag_common(last_k as usize);
@@ -129,9 +130,12 @@ impl SegmentPlan {
                     n_big += 1;
                     commons += 1;
                     l_hq += 1;
+                } else if !m.vars[k].lq {
+                    small_v += rhs.a_small_idx(l_hq).len() + 1;
                 }
                 last_k = k as i64;
             }
+            self.max_small_v = self.max_small_v.max(small_v);
             self.starts[s].n_big = n_big;
             self.max_big = self.max_big.max(n_big);
             self.max_commons = self.max_commons.max(commons);
@@ -164,6 +168,10 @@ struct Decoded<H> {
     ones: Vec<u32>,
     small_v: Vec<i32>,
     items: Vec<Item>,
+    /// Decoder scratch: splice mask and the rare-run sub-array.
+    keep: Vec<bool>,
+    small_a: Vec<i32>,
+    small_b: Vec<i32>,
 }
 
 impl<H: Hap> Decoded<H> {
@@ -197,7 +205,10 @@ fn set_bits(bits: &mut [u64], lo: usize, hi: usize) {
 }
 
 impl<H> Decoded<H> {
-    fn new() -> Self { Decoded { big: Vec::new(), bits: Vec::new(), ones: Vec::new(), small_v: Vec::new(), items: Vec::new() } }
+    fn new() -> Self {
+        Decoded { big: Vec::new(), bits: Vec::new(), ones: Vec::new(), small_v: Vec::new(), items: Vec::new(),
+            keep: Vec::new(), small_a: Vec::new(), small_b: Vec::new() }
+    }
 
     /// Storage for the plan's largest segment, so that decoder threads write
     /// into memory the calling thread allocated (and frees).
@@ -207,8 +218,11 @@ impl<H> Decoded<H> {
             big: Vec::with_capacity(plan.max_big * n_ref),
             bits: Vec::with_capacity(plan.max_commons * nw),
             ones: Vec::with_capacity(plan.max_commons * nw),
-            small_v: Vec::new(),
+            small_v: Vec::with_capacity(plan.max_small_v),
             items: Vec::with_capacity(plan.max_sites),
+            keep: Vec::with_capacity(n_ref),
+            small_a: Vec::with_capacity(n_ref),
+            small_b: Vec::with_capacity(n_ref),
         }
     }
 }
@@ -233,8 +247,11 @@ fn decode<R: RefHapSet, H: Hap>(rhs: &R, m: &VariantMap, plan: &SegmentPlan, p3d
     let mut l_hq = st.l_hq;
     let mut last_k = st.k as i64 - 1;
     let mut nb = 0usize; // big arrays written
-    let (mut small_a, mut small_b): (Vec<i32>, Vec<i32>) = (Vec::new(), Vec::new());
-    let mut keep: Vec<bool> = Vec::new();
+    let mut small_a = std::mem::take(&mut out.small_a);
+    let mut small_b = std::mem::take(&mut out.small_b);
+    let mut keep = std::mem::take(&mut out.keep);
+    small_a.clear();
+    small_b.clear();
     for k in st.k..end {
         if m.vars[k].lq { last_k = k as i64; continue; }
         if rhs.flag_common(k) {
@@ -337,6 +354,7 @@ fn decode<R: RefHapSet, H: Hap>(rhs: &R, m: &VariantMap, plan: &SegmentPlan, p3d
         last_k = k as i64;
     }
     debug_assert_eq!(nb, st.n_big);
+    (out.small_a, out.small_b, out.keep) = (small_a, small_b, keep);
 }
 
 /// Hand-over between the decode threads and the target sweep.
