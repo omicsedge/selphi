@@ -466,6 +466,10 @@ static TASK_BLOCKS: AtomicUsize = AtomicUsize::new(0);
 /// blocks the forward pass has passed itself (no worker is taking tasks).
 const SPAWN_BACKLOG: usize = 2;
 
+/// Block tasks of one call that can run at once (their scratch is allocated
+/// by the calling thread).
+const TASK_SCRATCH: usize = 3;
+
 // SAFETY: F writes `chk`/`asum` before the Release store of `fwd_done` that
 // readers Acquire; slots are written before their `ready` Release store;
 // `dosage` rows of a block are written only by the pass that claimed it.
@@ -496,21 +500,32 @@ impl Shared<'_> {
         }
     }
 
-    /// A block task: block `b` from its slot.
+    /// A block task: block `b` from its slot, in scratch of the calling
+    /// thread's pool. With the pool in use the block is left to the passes
+    /// (and, last, to the calling thread), so tasks never allocate.
     unsafe fn block_task<A: Kernels>(&self, b: usize) { unsafe {
         self.pending.fetch_sub(1, Ordering::AcqRel);
-        if !self.claim(b) { return; }
-        let k = self.ctx.k;
-        // Scratch from the calling thread's pool goes back to it; scratch this
-        // worker allocates is freed here, by its allocator.
-        let pooled = self.scratch.lock().unwrap().pop();
-        let from_pool = pooled.is_some();
-        let mut buf = pooled.unwrap_or_else(|| (sized(Vec::new(), k), sized(Vec::new(), self.stride * k)));
-        let mut beta_sum = self.load_slot(b, buf.0.as_mut_ptr());
-        self.process_block::<A>(b, buf.0.as_mut_ptr(), &mut beta_sum, buf.1.as_mut_ptr());
-        if from_pool { self.scratch.lock().unwrap().push(buf); }
-        #[cfg(test)]
-        TASK_BLOCKS.fetch_add(1, Ordering::Relaxed);
+        let Some(mut buf) = self.scratch.lock().unwrap().pop() else { return };
+        if self.claim(b) {
+            let mut beta_sum = self.load_slot(b, buf.0.as_mut_ptr());
+            self.process_block::<A>(b, buf.0.as_mut_ptr(), &mut beta_sum, buf.1.as_mut_ptr());
+            #[cfg(test)]
+            TASK_BLOCKS.fetch_add(1, Ordering::Relaxed);
+        }
+        self.scratch.lock().unwrap().push(buf);
+    }}
+
+    /// Whether every pooled task scratch is in use.
+    fn pool_busy(&self) -> bool { self.scratch.lock().unwrap().is_empty() }
+
+    /// Unclaimed blocks from their slots, top first (the calling thread, after
+    /// every pass and task has finished).
+    unsafe fn finish_blocks<A: Kernels>(&self, bp: *mut f32, blk: *mut f32) { unsafe {
+        for b in (0..self.n_chk).rev() {
+            if !self.claim(b) { continue; }
+            let mut beta_sum = self.load_slot(b, bp);
+            self.process_block::<A>(b, bp, &mut beta_sum, blk);
+        }
     }}
 
     /// Copy block `b`'s entering beta into `bp` and return its sum (nothing
@@ -620,8 +635,10 @@ impl Shared<'_> {
 
     /// B: roll beta down from the top, leaving each unclaimed block's entering
     /// state in its slot (slot-ready). Once a block the forward pass has passed
-    /// is reached while spawned tasks wait for workers, process it here from the
-    /// rolled beta instead. Stops when every block is claimed.
+    /// is reached while spawned tasks wait for workers or the task scratch is all
+    /// in use, process it here from the rolled beta instead. Then take slotted
+    /// blocks the forward pass has passed from below. Stops when every block is
+    /// claimed.
     unsafe fn backward_pass<'s, A: Kernels>(&'s self, scope: &rayon::Scope<'s>, bp: *mut f32, blk: *mut f32) { unsafe {
         let k = self.ctx.k;
         let top = self.n_chk - 1;
@@ -629,7 +646,7 @@ impl Shared<'_> {
         for b in (0..self.n_chk).rev() {
             if self.unclaimed.load(Ordering::Acquire) == 0 { return; }
             let (_, hi) = self.bounds(b);
-            if self.alpha_ready(hi) && self.pending.load(Ordering::Acquire) >= SPAWN_BACKLOG {
+            if self.alpha_ready(hi) && (self.pending.load(Ordering::Acquire) >= SPAWN_BACKLOG || self.pool_busy()) {
                 if self.claim(b) {
                     self.process_block::<A>(b, bp, &mut beta_sum, blk);
                 } else {
@@ -647,6 +664,16 @@ impl Shared<'_> {
                 self.arrive::<A>(b, scope);
             }
             self.roll_block::<A>(b, bp, &mut beta_sum);
+        }
+        // Slotted blocks the forward pass has passed, from below, until one is
+        // taken or not yet passed.
+        for b in 0..self.n_chk {
+            if self.unclaimed.load(Ordering::Acquire) == 0 { return; }
+            let (_, hi) = self.bounds(b);
+            if !self.alpha_ready(hi) { return; }
+            if !self.ready[b].load(Ordering::Acquire) || !self.claim(b) { continue; }
+            let mut bs = self.load_slot(b, bp);
+            self.process_block::<A>(b, bp, &mut bs, blk);
         }
     }}
 }
@@ -739,8 +766,8 @@ pub(super) unsafe fn run<A: Kernels>(
         ready: (0..n_chk).map(|_| AtomicBool::new(false)).collect(),
         arrivals: (0..n_chk).map(|_| AtomicU8::new(0)).collect(),
         pending: AtomicUsize::new(0),
-        // Two block tasks' scratch from this thread; more tasks allocate their own.
-        scratch: Mutex::new((0..2).map(|_| (sized(Vec::new(), k), sized(Vec::new(), stride * k))).collect()),
+        // Scratch of at most TASK_SCRATCH concurrent block tasks, from this thread.
+        scratch: Mutex::new((0..TASK_SCRATCH).map(|_| (sized(Vec::new(), k), sized(Vec::new(), stride * k))).collect()),
         loo: lcwgs_loo(),
         ee, ed,
     };
@@ -752,6 +779,7 @@ pub(super) unsafe fn run<A: Kernels>(
             scope.spawn(move |scope| sh.backward_pass::<A>(scope, bbp as *mut f32, bblkp as *mut f32));
             sh.forward_pass::<A>(scope, fp as *mut f32, bp as *mut f32, blkp as *mut f32);
         });
+        sh.finish_blocks::<A>(bp as *mut f32, blkp as *mut f32);
     }
     debug_assert_eq!(sh.unclaimed.load(Ordering::Acquire), 0);
     drop(sh);
@@ -769,11 +797,11 @@ pub(super) unsafe fn run<A: Kernels>(
 }}
 
 /// Bytes a two-pass call holds beyond the sequential kernel: the backward
-/// pass's beta and block, the slots, and two block tasks' scratch.
+/// pass's beta and block, the slots, and the block tasks' scratch.
 pub(crate) fn extra_bytes(sites: usize, k: usize) -> usize {
     let stride = ((sites as f64).sqrt().ceil() as usize).max(1);
     let n_chk = sites.div_ceil(stride);
-    (3 * (stride * k + k) + n_chk * (k + 1) + 64) * 4
+    ((1 + TASK_SCRATCH) * (stride * k + k) + n_chk * (k + 1) + 64) * 4
 }
 
 #[cfg(test)]
