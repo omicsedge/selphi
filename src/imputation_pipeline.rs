@@ -352,6 +352,9 @@ struct PhasingResult {
     /// is active. These become ensemble members in the weight averaging, giving
     /// an ensemble at ~1x phasing cost (vs N independent phasings).
     extra_scaffolds: Vec<Vec<u8>>,
+    /// `SELPHI_DIPLOID_PQ=1`: FORMAT/PQ of `phased_alleles` (n_chip x n_samples,
+    /// `diploid::PQ_NONE` where undefined), written by the phase-only VCF.
+    phase_quality: Option<Vec<u8>>,
 }
 
 /// Run the diploid phasing engine. Extracts the full reference bitmatrix
@@ -392,7 +395,7 @@ fn run_phasing(inp: &PhasingInputs) -> PhasingResult {
         Some(bm)
     } else { None };
 
-    let (phased, extra_scaffolds) = {
+    let (phased, extra_scaffolds, phase_quality) = {
         selphi_step!("Using Diploid phasing");
         // Common-MAF chip subset (MAF >= 0.001 on target). Diploid runs
         // on common variants only; rare ones are re-imputed by the HMM.
@@ -501,7 +504,7 @@ male chrX): phasing on all {} called sites", scaffold.indices.len());
                     n_samples, n_members);
             }
         }
-        let mut dp = selphi::diploid::diploid_phase_bm_prefiltered(
+        let dp = selphi::diploid::diploid_phase_bm_prefiltered(
             targ_alleles, common_ref_bm, &common_chip_indices,
             rare_ref,
             raw_chip_cm, chip_bps,
@@ -510,11 +513,15 @@ male chrX): phasing on all {} called sites", scaffold.indices.len());
             seed, args.threads, args.max_cond_haps, n_members,
             ped_locked, replicas,
         );
-        let phased0 = dp.remove(0);
-        (phased0, dp)  // remaining scaffolds = intra-run extra members
+        let mut scaffolds = dp.scaffolds;
+        let phased0 = scaffolds.remove(0);
+        if dp.pq.is_some() && !args.phase_only {
+            selphi_info!("  SELPHI_DIPLOID_PQ: FORMAT/PQ is written by --phase-only only; the imputed output carries none");
+        }
+        (phased0, scaffolds, dp.pq)  // remaining scaffolds = intra-run extra members
     };
     selphi_step!("Phasing complete: {} samples phased", n_samples);
-    PhasingResult { phased_alleles: phased, ref_bm_full, extra_scaffolds }
+    PhasingResult { phased_alleles: phased, ref_bm_full, extra_scaffolds, phase_quality }
 }
 
 /// Build the full-chromosome PBWT candidate list once per target haplotype
@@ -1209,7 +1216,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
             write_phased_vcf(
                 &pr.phased_alleles, &target_markers, &target_idx, &wgs_idx,
                 &sample_names, &srp, n_chip, n_haps, &allele_transforms, &out_path,
-                passthrough.as_ref(),
+                passthrough.as_ref(), pr.phase_quality.as_deref(),
             ).expect("Failed to write phased VCF");
             selphi_step!("Phase-only VCF: {}", out_path.display());
             selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB",

@@ -465,6 +465,8 @@ e.g. a male chrX): phasing on all {} called sites", scaffold.indices.len());
     // solve; the rest are folded into the per-window weights before
     // interpolation by imputation::ensemble. With phasing replicas every
     // copy contributes its `n_members` (copy 0's solve first).
+    // The multi-chromosome path writes imputed output only (no --phase-only), so
+    // a phase quality computed under SELPHI_DIPLOID_PQ has nowhere to go here.
     let mut scaffolds = selphi::diploid::diploid_phase_bm_prefiltered(
         &targ_alleles, common_ref_bm, &common_chip_indices,
         selphi::diploid::phase_rare::RareRef::Full(&ref_bm),
@@ -472,7 +474,7 @@ e.g. a male chrX): phasing on all {} called sites", scaffold.indices.len());
         n_chip, n_samples, n_ref,
         config.seed, config.threads, config.max_cond_haps, n_members,
         ped_locked, replicas,
-    );
+    ).scaffolds;
     let member0 = scaffolds.remove(0);
     if replicas > 1 {
         selphi_info!("    Phase ensemble: {} members ({} co-phased replicas x {} from each chain)",

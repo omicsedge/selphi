@@ -97,13 +97,31 @@ pub fn diploid_phase_panel(
     let _ = n_haps; // documented; used inside _diploid_run
 
     // De-novo panel phasing returns a single phased scaffold (no intra-run ensemble).
-    let mut scaffolds = _diploid_run(
+    // The panel VCF carries GT only, so no phase quality is asked for.
+    let mut out = _diploid_run(
         cohort_geno, empty_ref, &common_indices, phase_rare::RareRef::None,
         CommonPrep { target_geno_common, cm_common, cm_full, bp_common },
         bp, n_var, n_samples, /* n_ref = */ 0, seed, n_threads, max_cond_haps, 1,
-        None, 1,
+        None, 1, false,
     );
-    scaffolds.remove(0)
+    out.scaffolds.remove(0)
+}
+
+/// FORMAT/PQ value of a genotype that has none (not a heterozygote the segment
+/// HMM phased, or the first one of its sample).
+pub const PQ_NONE: u8 = u8::MAX;
+
+/// The diploid engine's output.
+pub struct DiploidPhased {
+    /// Phased scaffolds (n_var x n_haps, row-major): slot 0 the solve, slots 1..
+    /// the intra-run ensemble's thinned Main MCMC samples.
+    pub scaffolds: Vec<Vec<u8>>,
+    /// Under `SELPHI_DIPLOID_PQ=1`, the phase quality of slot 0 (n_var x
+    /// n_samples, row-major): at each heterozygote the segment HMM phased, the
+    /// phred-scaled posterior probability that its phase relative to the previous
+    /// such heterozygote of the sample is wrong (`sampling::phase_quality`);
+    /// `PQ_NONE` elsewhere. None when the knob is off.
+    pub pq: Option<Vec<u8>>,
 }
 
 /// Diploid phasing with pre-filtered common_ref_bm (no full ref_bm ever allocated).
@@ -136,19 +154,23 @@ pub fn diploid_phase_bm_prefiltered(
     // members first (slot 0 = copy 0's Viterbi solve), then copy 1's, and so on.
     // 1 = off: the phasing below is the unreplicated one, byte-identical.
     replicas: usize,
-) -> Vec<Vec<u8>> {
+) -> DiploidPhased {
     let k = replicas.max(1);
     if k > 1 {
         // The copies' genotypes and lock mask (replica-major: copy r of sample s is
         // sample r * n_samples + s), phased as one cohort of n_samples * k.
         let rep_geno = replicas::replicate_rows(&target_geno[..n_var * n_samples * 2], n_var, n_samples * 2, k);
         let rep_lock = ped_locked.map(|l| replicas::replicate_rows(&l[..n_var * n_samples], n_var, n_samples, k));
-        let scaffolds = diploid_phase_core(
+        let out = diploid_phase_core(
             &rep_geno, common_ref_bm, common_chip_indices, rare_ref,
             chip_bp, map_bp, map_cm, n_var, n_samples * k, n_ref, seed, n_threads,
             max_cond_haps, n_members, rep_lock.as_deref(), k,
         );
-        return replicas::split_members(scaffolds, n_var, n_samples * 2, k);
+        // The output GT is copy 0's solve, so the phase quality is copy 0's
+        // (replica-major: its samples are the first n_samples of each row).
+        let pq = out.pq.map(|q| q.chunks_exact(n_samples * k)
+            .flat_map(|row| row[..n_samples].iter().copied()).collect());
+        return DiploidPhased { scaffolds: replicas::split_members(out.scaffolds, n_var, n_samples * 2, k), pq };
     }
     diploid_phase_core(
         target_geno, common_ref_bm, common_chip_indices, rare_ref,
@@ -168,7 +190,7 @@ fn diploid_phase_core(
     chip_bp: &[i64], map_bp: &[i64], map_cm: &[f64],
     n_var: usize, n_samples: usize, n_ref: usize, seed: i64, n_threads: usize,
     max_cond_haps: usize, n_members: usize, ped_locked: Option<&[bool]>, replicas: usize,
-) -> Vec<Vec<u8>> {
+) -> DiploidPhased {
     let seed = if seed == 33 { 15052011 } else { seed };
     let n_haps = n_samples * 2;
     let _n_haps_total = n_ref + n_haps;
@@ -224,7 +246,7 @@ fn diploid_phase_core(
         target_geno, common_ref_bm, common_chip_indices, rare_ref,
         CommonPrep { target_geno_common, cm_common, cm_full: chip_cm_full, bp_common },
         chip_bp, n_var, n_samples, n_ref, seed, n_threads, max_cond_haps, n_members,
-        locked_common.as_deref(), replicas,
+        locked_common.as_deref(), replicas, sampling::pq_enabled(),
     )
 }
 
@@ -255,7 +277,9 @@ fn _diploid_run(
     // The samples are `replicas` copies of `n_samples / replicas` originals
     // (replica-major), banned from conditioning on each other. 1 = no replicas.
     replicas: usize,
-) -> Vec<Vec<u8>> {
+    // Compute the solve's phase quality (`DiploidPhased::pq`).
+    want_pq: bool,
+) -> DiploidPhased {
     use rayon::prelude::*;
     let seed = if seed == 33 { 15052011 } else { seed };
     let n_haps = n_samples * 2;
@@ -431,7 +455,19 @@ fn _diploid_run(
         phased.par_iter_mut().for_each(|g| if *g > 1 { *g = 0; });
     };
 
-    // Slot 0: the Viterbi solve held in the graphs (the committed default phase).
+    // Phase quality of the solve (slot 0), from the posteriors the graphs stored.
+    // Scaffold sites keep the solve's phase through build_scaffold (phase_rare
+    // writes only the others), so it describes the output as written.
+    let pq = want_pq.then(|| {
+        let per_sample: Vec<Vec<(usize, u8)>> = graphs.par_iter().map(sampling::phase_quality).collect();
+        let mut pq = vec![PQ_NONE; n_var * n_samples];
+        for (si, q) in per_sample.iter().enumerate() {
+            for &(ci, v) in q { pq[common_indices[ci] * n_samples + si] = v; }
+        }
+        pq
+    });
+
+    // Slot 0: the solve held in the graphs (the committed default phase).
     let final_src: Vec<(Vec<u8>, Vec<u8>)> = graphs.iter().map(|g| g.extract_haplotypes()).collect();
     let mut scaffolds: Vec<Vec<u8>> = Vec::with_capacity(n_members);
     scaffolds.push(build_scaffold(&final_src, &mut rare_scaffold_bm));
@@ -469,7 +505,7 @@ fn _diploid_run(
     crate::selphi_debug!("  Phasing complete ({} ensemble member{})",
         scaffolds.len(), if scaffolds.len() == 1 { "" } else { "s" });
 
-    scaffolds
+    DiploidPhased { scaffolds, pq }
 }
 
 /// Ordinals (among the Main iterations, 0-based) of the MCMC samples used as

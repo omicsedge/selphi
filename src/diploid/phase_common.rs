@@ -1733,9 +1733,18 @@ fn _run_iterations(
             crate::log::rss_mb(), crate::log::peak_mem_mb());
     }
 
-    // Viterbi solve
+    // Final solve: the Viterbi path; under SELPHI_DIPLOID_SOLVE=pairwise each
+    // consecutive-het relation is then re-decided by its posterior majority.
+    let mode = sampling::solve_mode();
+    let (mut changed, mut unmatched) = (0usize, 0usize);
     for graph in graphs.iter_mut() {
-        sampling::solve(graph);
+        let st = sampling::solve_with(graph, mode);
+        changed += st.relations_changed;
+        unmatched += st.segments_unmatched;
+    }
+    if mode == sampling::SolveMode::Pairwise {
+        crate::selphi_debug!("  [diploid] pairwise solve: {} het relations decided against the Viterbi path, \
+{} segments written allele by allele", changed, unmatched);
     }
 
     if rare_dispatch_diag() {
