@@ -1347,45 +1347,6 @@ pub fn run_phase_common_bm(
     hap_bm
 }
 
-/// Run `run(si, graphs[si])` for every sample on the rayon pool, costliest first
-/// (`cost`, highest first; ties by index): each worker takes the next sample not
-/// yet started (longest-processing-time scheduling). A sample's work reads only
-/// shared, read-only state and its own pre-drawn RNG seed, so the order changes
-/// the makespan, never a result; results come back in sample order. Each
-/// sample's wall replaces its `cost` for the next call. Under a plain
-/// `par_iter_mut` the slowest samples could start last: 54 WGS children (chr1,
-/// per-sample 5-10 s) on 16 threads spent 12-15% longer in the sample phase
-/// than its summed CPU over the threads.
-fn run_samples_costliest_first<R: Send>(
-    graphs: &mut [GenotypeGraph], cost: &mut [f64],
-    run: impl Fn(usize, &mut GenotypeGraph) -> R + Sync,
-) -> Vec<R> {
-    use std::sync::Mutex;
-    let n = graphs.len();
-    assert_eq!(cost.len(), n);
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&x, &y| cost[y].total_cmp(&cost[x]).then(x.cmp(&y)));
-    let slots: Vec<Mutex<Option<&mut GenotypeGraph>>> =
-        graphs.iter_mut().map(|g| Mutex::new(Some(g))).collect();
-    let out: Vec<Mutex<Option<(R, f64)>>> = (0..n).map(|_| Mutex::new(None)).collect();
-    let next = AtomicUsize::new(0);
-    let n_workers = rayon::current_num_threads().min(n).max(1);
-    (0..n_workers).into_par_iter().for_each(|_| loop {
-        let k = next.fetch_add(1, Ordering::Relaxed);
-        if k >= n { break; }
-        let si = order[k];
-        let graph = slots[si].lock().unwrap().take().expect("each sample runs once");
-        let t = std::time::Instant::now();
-        let r = run(si, graph);
-        *out[si].lock().unwrap() = Some((r, t.elapsed().as_secs_f64()));
-    });
-    out.into_iter().enumerate().map(|(si, m)| {
-        let (r, secs) = m.into_inner().unwrap().expect("every sample ran");
-        cost[si] = secs;
-        r
-    }).collect()
-}
-
 fn _run_iterations(
     graphs: &mut [GenotypeGraph],
     hap_bm: &mut HaplotypeBitmatrix,     // unified: used for both PBWT and HMM
@@ -1425,10 +1386,6 @@ fn _run_iterations(
         n_haps_total);
 
     let mut main_ord = 0usize; // ordinal of the current Main iteration
-    // Per-sample cost for the scheduling order (`run_samples_costliest_first`):
-    // the diplotype-graph transition count before the first iteration, then each
-    // sample's measured wall in the previous one.
-    let mut sample_cost: Vec<f64> = graphs.iter().map(|g| g.n_transitions as f64).collect();
     for (it, &stage) in stages.iter().enumerate() {
         let t0 = std::time::Instant::now();
         let stage_name = match stage {
@@ -1510,7 +1467,11 @@ fn _run_iterations(
         let window_parallel = n_samples < n_pool_threads;
         let pbwt_ro: &PbwtNeighborIndex = pbwt_idx;
         let hmm_params_ro: &HmmParams = hmm_params;
-        let run_sample = |si: usize, graph: &mut GenotypeGraph| -> Vec<(usize, usize, usize, usize)> {
+        // Samples in rayon's own order. A costliest-first work queue measured ~1% less
+        // wall on 54 WGS children (chr1) but raised peak memory: the largest samples'
+        // buffers were all in flight at once and stayed in their threads' heaps.
+        let per_sample_banned: Vec<Vec<(usize, usize, usize, usize)>> =
+            graphs.par_iter_mut().enumerate().map(|(si, graph)| {
             if graph.n_segments == 0 { return vec![]; }
             let mut sample_rng = CppRng::new(sample_seeds[si]);
 
@@ -1671,8 +1632,7 @@ fn _run_iterations(
             }
             n_seg_total.fetch_add(graph.n_segments, Ordering::Relaxed);
             banned
-        };
-        let per_sample_banned = run_samples_costliest_first(graphs, &mut sample_cost, run_sample);
+        }).collect();
 
         let samples_ms = t_samples.elapsed().as_millis();
         let new_banned_pairs: Vec<(usize, usize, usize, usize)> =
@@ -1713,6 +1673,12 @@ fn _run_iterations(
         }
         if is_main { main_ord += 1; }
         let update_ms = t_samples.elapsed().as_millis() - samples_ms;
+        // The iteration's per-sample buffers were freed on the workers that ran
+        // them, and mimalloc keeps such pages in each thread's heap into the next
+        // iteration. Return them (a few ms; memory only, never output;
+        // SELPHI_NO_MI_COLLECT=1 disables it). chr1, 54 WGS children, 3 runs each:
+        // peak 11.61-11.88 GiB before, 11.01-11.31 GiB with it.
+        crate::common::mem::release_freed_memory();
 
         // EM-Ne online update during burnin. Diverges from SHAPEIT5 (which
         // uses a fixed Ne) and the formula is admittedly crude — it uses
