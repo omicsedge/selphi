@@ -139,15 +139,36 @@ pub fn target_only_scaffold(n_scaffold: usize, n_haps: usize) -> super::pbwt_nei
 ///
 /// The two sweeps are independent and run concurrently: the backward one reads
 /// `phased` only at its rare sites, at the non-carrier haplotypes (every carrier
-/// starts unphased), which the forward results never touch. Each sweep is the
-/// branch-free radix split shared with phase_common (`pbwt_split_i32`); the
-/// backward one runs it on complemented divergences (`n_scaffold - 1 - d`), which
-/// turns its running minimum into the split's running maximum exactly. Target
-/// prefix positions are recomputed only at a rare site that follows a scaffold
-/// update. Output is identical to the former serial implementation (kept as the
-/// test oracle `legacy::run_phase_rare`).
+/// starts unphased), which the forward results never touch. Each sweep is also
+/// cut into pieces run concurrently, each starting from the exact state a single
+/// sweep has there (`RareSweep::state_at`: a short warm-up whose own divergences
+/// prove it). A step is the branch-free radix split shared with phase_common
+/// (`pbwt_split_i32`); the backward sweep runs it on complemented divergences
+/// (`n_scaffold - 1 - d`), which turns its running minimum into the split's
+/// running maximum exactly. Target prefix positions are recomputed only at a
+/// rare site that follows a scaffold update. Output is identical to the former
+/// serial implementation (kept as the test oracle `legacy::run_phase_rare`).
 #[allow(clippy::too_many_arguments)]
 pub fn run_phase_rare(
+    phased: &mut [u8],
+    scaffold_bm: &mut super::pbwt_neighbor::HaplotypeBitmatrix,
+    rare_ref: RareRef<'_>,
+    target_geno: &[u8],
+    cm: &[f64],
+    bp: &[i64],
+    n_var: usize,
+    n_samples: usize,
+    n_ref: usize,
+    scaffold_from_common: &[usize],
+    replicas: usize,
+) {
+    run_phase_rare_with(phased, scaffold_bm, rare_ref, target_geno, cm, bp, n_var, n_samples, n_ref,
+        scaffold_from_common, replicas, None);
+}
+
+/// [`run_phase_rare`] with an explicit sweep plan (`None` = the production one).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_phase_rare_with(
     phased: &mut [u8],        // (n_var × n_haps_target) — will be updated with rare phases
     scaffold_bm: &mut super::pbwt_neighbor::HaplotypeBitmatrix,
     rare_ref: RareRef<'_>,
@@ -161,7 +182,8 @@ pub fn run_phase_rare(
     // Phasing replicas (`diploid::replicas`): the samples are `replicas` copies of
     // `n_samples / replicas` originals, replica-major; 1 = none.
     replicas: usize,
-) {
+    plan: Option<SweepPlan>,
+) -> SweepStats {
     use rayon::prelude::*;
     let n_haps = n_samples * 2;
     let use_ref = rare_ref.is_some();
@@ -173,7 +195,7 @@ pub fn run_phase_rare(
     let rare_sites = rare_sites(target_geno, n_var, n_samples, scaffold_sites);
     if rare_sites.is_empty() {
         crate::selphi_debug!("  [diploid] phase_rare: no rare het variants");
-        return;
+        return SweepStats::default();
     }
     let mut var_type = vec![0u8; n_var]; // 0=skip, 1=scaffold, 2=rare
     for &v in scaffold_sites { var_type[v] = 1; }
@@ -234,6 +256,7 @@ pub fn run_phase_rare(
     });
     let zero_row = vec![0u64; scaffold_bm.n_words()];
 
+    let stats;
     {
         let sweep = RareSweep {
             variant_order: &variant_order,
@@ -251,9 +274,12 @@ pub fn run_phase_rare(
             ibd2_global: &ibd2_global,
         };
         let t_sweeps = std::time::Instant::now();
-        rayon::join(|| sweep.run(true, &mut phase_fwd), || sweep.run(false, &mut phase_bwd));
-        crate::selphi_debug!("  [diploid] phase_rare sweeps (forward || backward, {} haplotypes): {:.1}s",
-            n_haps_total, t_sweeps.elapsed().as_secs_f64());
+        let plan = plan.unwrap_or_else(|| SweepPlan::auto(n_scaffold));
+        stats = sweep.run_all(plan, &mut phase_fwd, &mut phase_bwd);
+        crate::selphi_debug!("  [diploid] phase_rare sweeps ({} haplotypes, {} pieces, {} tied groups ordered \
+from further back, {} from the start, warm-ups {:.1}% of the steps): {:.1}s",
+            n_haps_total, stats.pieces, stats.retries, stats.from_start,
+            100.0 * stats.warmup_steps as f64 / (2 * n_scaffold).max(1) as f64, t_sweeps.elapsed().as_secs_f64());
     }
 
     // ======================== MERGE FORWARD + BACKWARD ========================
@@ -291,6 +317,7 @@ pub fn run_phase_rare(
 
     crate::selphi_debug!("  [diploid] phase_rare complete: {} rare hets phased ({:.1}s)",
         n_phased, t_rare.elapsed().as_secs_f64());
+    stats
 
     // MAC<=1 hets keep the forward/backward vote. A post-hoc override used to
     // reassign every one of them from the length of the haplotype's own allele
@@ -389,6 +416,74 @@ fn scan_ibd2(phased: &[u8], scaffold_sites: &[usize], scaffold_cm: &[f64], bp: &
     ibd2_global
 }
 
+/// How the two sweeps are cut into concurrently run pieces (see [`RareSweep::run_all`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SweepPlan {
+    /// Pieces per direction (1 = each direction in one piece from its true start).
+    pub n_chunks: usize,
+    /// First warm-up length, in variant-order positions; grows 4x per failed check.
+    pub warmup: usize,
+}
+
+impl SweepPlan {
+    /// Production plan: about two pieces per pool thread and direction once the
+    /// scaffold is long enough for the warm-ups to be a small fraction of a piece.
+    fn auto(n_scaffold: usize) -> Self {
+        let threads = rayon::current_num_threads().max(1);
+        let n_chunks = (n_scaffold / 40_000).clamp(1, 2 * threads);
+        SweepPlan { n_chunks, warmup: 0 }
+    }
+}
+
+/// Counters of one `run_all` (debug output and tests).
+#[derive(Default, Debug)]
+pub(crate) struct SweepStats {
+    pub pieces: usize,
+    /// Groups of haplotypes identical over a warm-up, ordered from further back.
+    pub retries: usize,
+    /// Pieces or groups whose order had to come from the true start of the sweep.
+    pub from_start: usize,
+    /// Full-panel scaffold steps spent on warm-ups (beyond the sweep itself).
+    pub warmup_steps: usize,
+}
+
+/// Maximal runs `[s, e)` (`e - s >= 2`) of prefix positions whose consecutive
+/// pairs never differed in a warm-up window (divergence below its first time).
+fn tied_runs(c: &[i32], t_first: i32) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i < c.len() {
+        if c[i] < t_first {
+            let s = i - 1;
+            let mut e = i + 1;
+            while e < c.len() && c[e] < t_first { e += 1; }
+            out.push((s, e));
+            i = e;
+        } else { i += 1; }
+    }
+    out
+}
+
+/// Scalar PBWT split of a small haplotype set, the semantics of `pbwt_split_i32`.
+fn split_small(row: &[u64], a: &mut [i32], c: &mut [i32], b: &mut Vec<i32>, d: &mut Vec<i32>, t: i32) {
+    b.clear();
+    d.clear();
+    let (mut p, mut q, mut u) = (t, t, 0usize);
+    for h in 0..a.len() {
+        let (a_h, c_h) = (a[h], c[h]);
+        p = p.max(c_h);
+        q = q.max(c_h);
+        let hap = a_h as usize;
+        if (row[hap >> 6] >> (hap & 63)) & 1 == 0 {
+            a[u] = a_h; c[u] = p; p = 0; u += 1;
+        } else {
+            b.push(a_h); d.push(q); q = 0;
+        }
+    }
+    a[u..].copy_from_slice(b);
+    c[u..].copy_from_slice(d);
+}
+
 /// Everything one direction of the rare-site sweep reads (shared by both).
 struct RareSweep<'a> {
     variant_order: &'a [VariantTag],
@@ -409,12 +504,253 @@ struct RareSweep<'a> {
     ibd2_global: &'a [Vec<usize>], // IBD2 pairs per target individual (target only)
 }
 
+/// PBWT state of one direction: prefix order and divergence, plus split scratch.
+///
+/// Divergences are kept in the direction's own TIME, `t = vs` forward and
+/// `t = n_scaffold - 1 - vs` backward, so both directions are the same running
+/// maximum (the backward one used to be a running minimum over `vs`; the map is
+/// a bijection, so every value is the same). In time, the divergence of the
+/// adjacent pair `(a[i-1], a[i])` is the last time the two haplotypes differed
+/// at a scaffold site (0 when they never did); `c[0]` is never read and never
+/// enters another value (every bucket's first entry takes the current time).
+struct DirState { a: Vec<i32>, c: Vec<i32>, b: Vec<i32>, d: Vec<i32> }
+
 impl RareSweep<'_> {
-    /// One direction of the PBWT sweep (forward or backward), phasing the rare
-    /// hets into `phase_results`.
-    fn run(&self, forward: bool, phase_results: &mut [Vec<CFlip>]) {
+    fn n_tags(&self) -> usize { self.variant_order.len() }
+
+    /// Tag at position `k` of the direction's sequence.
+    #[inline]
+    fn tag(&self, forward: bool, k: usize) -> &VariantTag {
+        &self.variant_order[if forward { k } else { self.n_tags() - 1 - k }]
+    }
+
+    #[inline]
+    fn time(&self, forward: bool, vs: usize) -> i32 {
+        if forward { vs as i32 } else { (self.scaffold_eval.len() - 1 - vs) as i32 }
+    }
+
+    #[inline]
+    fn step(&self, st: &mut DirState, forward: bool, vs: usize) {
+        let row: &[u64] = if self.scaffold_eval[vs] { self.scaffold_bm.row(vs) } else { self.zero_row };
+        super::pbwt_neighbor::pbwt_split_i32(row, &mut st.a, &mut st.c, &mut st.b, &mut st.d,
+            self.time(forward, vs));
+    }
+
+    /// The sweep's true initial state: a shuffled order (the same draws as ever,
+    /// a usize range per step) and divergence 0.
+    fn initial_state(&self, forward: bool) -> DirState {
+        let n_hap = self.n_hap;
+        let mut a_init: Vec<usize> = (0..n_hap).collect();
+        let mut rng = SmallRng::seed_from_u64(if forward { 12345 } else { 54321 });
+        for i in (1..n_hap).rev() {
+            let j = rng.gen_range(0..=i);
+            a_init.swap(i, j);
+        }
+        DirState {
+            a: a_init.iter().map(|&h| h as i32).collect(),
+            c: vec![0; n_hap], b: vec![0; n_hap], d: vec![0; n_hap],
+        }
+    }
+
+    /// First scaffold time among positions `[k_lo, k_hi)`, if any.
+    fn first_time(&self, forward: bool, k_lo: usize, k_hi: usize) -> Option<i32> {
+        (k_lo..k_hi).map(|k| self.tag(forward, k)).find(|t| t.scaffold_idx >= 0)
+            .map(|t| self.time(forward, t.scaffold_idx as usize))
+    }
+
+    /// The exact state just before position `k0` of the direction's sequence.
+    ///
+    /// The PBWT order after a run of sites is the haplotypes sorted by their
+    /// alleles at those sites, most recent first, ties left in the order they had
+    /// before the run (stable splits). So a warm-up over the last `w0` positions
+    /// from an ARBITRARY start (identity order, every divergence = the window's
+    /// first time - 1) already orders every pair that differs somewhere in the
+    /// window as the full sweep does, with that pair's true divergence (its last
+    /// difference lies in the window). The pairs that do not differ there keep the
+    /// start value, which is how they are found: each run of them is a group of
+    /// haplotypes identical over the window, contiguous in the order, whose true
+    /// internal order and divergences are those just before the window. Those come
+    /// from [`Self::resolve`] (the same argument one window further back, for the
+    /// group members alone), and the divergence between a group's edge and its
+    /// outside neighbour is the same whichever member sits at the edge.
+    fn state_at(&self, forward: bool, k0: usize, w0: usize, first_scaffold: usize,
+                stats: &mut SweepStats) -> DirState {
+        let kw = k0.saturating_sub(w0);
+        if kw <= first_scaffold {
+            // No scaffold site before the window: replay from the true start.
+            stats.from_start += 1;
+            let mut st = self.initial_state(forward);
+            for k in 0..k0 {
+                let t = self.tag(forward, k);
+                if t.scaffold_idx >= 0 { self.step(&mut st, forward, t.scaffold_idx as usize); stats.warmup_steps += 1; }
+            }
+            return st;
+        }
+        // kw > first_scaffold: a scaffold site lies before the window, so a time in
+        // it (times increase along the sequence) is >= 1 and t_first - 1 >= 0.
+        let Some(t_first) = self.first_time(forward, kw, k0) else {
+            return self.state_at(forward, k0, w0.saturating_mul(4), first_scaffold, stats);
+        };
+        let n_hap = self.n_hap;
+        let mut st = DirState {
+            a: (0..n_hap as i32).collect(), c: vec![t_first - 1; n_hap],
+            b: vec![0; n_hap], d: vec![0; n_hap],
+        };
+        for k in kw..k0 {
+            let t = self.tag(forward, k);
+            if t.scaffold_idx >= 0 { self.step(&mut st, forward, t.scaffold_idx as usize); stats.warmup_steps += 1; }
+        }
+        let runs = tied_runs(&st.c, t_first);
+        if !runs.is_empty() {
+            let groups: Vec<Vec<i32>> = runs.iter().map(|&(s, e)| st.a[s..e].to_vec()).collect();
+            let init_pos = self.initial_positions(forward);
+            let solved = self.resolve(forward, groups, kw, w0.saturating_mul(4), first_scaffold, &init_pos, stats);
+            for (&(s, e), (ord, c)) in runs.iter().zip(solved) {
+                st.a[s..e].copy_from_slice(&ord);
+                st.c[s + 1..e].copy_from_slice(&c[1..]);
+            }
+        }
+        st
+    }
+
+    /// Position of each haplotype in the true initial (shuffled) order.
+    fn initial_positions(&self, forward: bool) -> Vec<u32> {
+        let st = self.initial_state(forward);
+        let mut pos = vec![0u32; self.n_hap];
+        for (i, &h) in st.a.iter().enumerate() { pos[h as usize] = i as u32; }
+        pos
+    }
+
+    /// For each group (haplotypes identical over every scaffold site from position
+    /// `k_end` on, up to where it was found), its true order just before `k_end` and
+    /// the true divergence of each consecutive pair (`c[0]` unused). One pass over
+    /// the `w` positions before `k_end` with a small PBWT per group, then the same
+    /// for whatever is still tied there, 4x further back, down to the true start
+    /// (where the order is the initial one and divergences start at 0).
+    #[allow(clippy::too_many_arguments)]
+    fn resolve(&self, forward: bool, groups: Vec<Vec<i32>>, k_end: usize, w: usize,
+               first_scaffold: usize, init_pos: &[u32], stats: &mut SweepStats) -> Vec<(Vec<i32>, Vec<i32>)> {
+        if groups.is_empty() { return Vec::new(); }
+        stats.retries += groups.len();
+        let kw = k_end.saturating_sub(w);
+        let from_start = kw <= first_scaffold;
+        let (k_lo, t_first) = if from_start { (0, 0) } else {
+            match self.first_time(forward, kw, k_end) {
+                Some(t) => (kw, t),
+                None => return self.resolve(forward, groups, k_end, w.saturating_mul(4),
+                                            first_scaffold, init_pos, stats),
+            }
+        };
+        let mut res: Vec<(Vec<i32>, Vec<i32>)> = groups.into_iter().map(|mut g| {
+            let n = g.len();
+            if from_start { g.sort_by_key(|&h| init_pos[h as usize]); (g, vec![0; n]) }
+            else { (g, vec![t_first - 1; n]) }
+        }).collect();
+        let mut b: Vec<i32> = Vec::new();
+        let mut d: Vec<i32> = Vec::new();
+        for k in k_lo..k_end {
+            let tag = self.tag(forward, k);
+            if tag.scaffold_idx < 0 { continue; }
+            let vs = tag.scaffold_idx as usize;
+            let row: &[u64] = if self.scaffold_eval[vs] { self.scaffold_bm.row(vs) } else { self.zero_row };
+            let t = self.time(forward, vs);
+            for (ord, c) in res.iter_mut() { split_small(row, ord, c, &mut b, &mut d, t); }
+        }
+        if from_start {
+            stats.from_start += res.len();
+            return res;
+        }
+        let mut sub: Vec<Vec<i32>> = Vec::new();
+        let mut at: Vec<(usize, usize, usize)> = Vec::new();
+        for (gi, (ord, c)) in res.iter().enumerate() {
+            for (s, e) in tied_runs(c, t_first) { sub.push(ord[s..e].to_vec()); at.push((gi, s, e)); }
+        }
+        let solved = self.resolve(forward, sub, kw, w.saturating_mul(4), first_scaffold, init_pos, stats);
+        for ((gi, s, e), (o2, c2)) in at.into_iter().zip(solved) {
+            res[gi].0[s..e].copy_from_slice(&o2);
+            res[gi].1[s + 1..e].copy_from_slice(&c2[1..]);
+        }
+        res
+    }
+
+    /// Both directions over every rare site, in `plan.n_chunks` pieces per
+    /// direction run concurrently. A piece is a range of variant-order positions;
+    /// its rare sites are a contiguous range of rare indices, so each piece owns
+    /// its slice of the results. Each piece starts from [`state_at`], which is the
+    /// state a single sweep would have there, so the votes are the same.
+    fn run_all(&self, plan: SweepPlan, phase_fwd: &mut [Vec<CFlip>], phase_bwd: &mut [Vec<CFlip>]) -> SweepStats {
+        use rayon::prelude::*;
         let n_scaffold = self.scaffold_eval.len();
-        if n_scaffold == 0 { return; }
+        let n_tags = self.n_tags();
+        let mut stats = SweepStats::default();
+        if n_scaffold == 0 || n_tags == 0 { return stats; }
+        // Times must increase along the sequence for the warm-up argument (they do
+        // for a sorted scaffold); otherwise one piece per direction from the start.
+        let mut last = -1i64;
+        let monotone = self.variant_order.iter().filter(|t| t.scaffold_idx >= 0)
+            .all(|t| { let ok = t.scaffold_idx as i64 > last; last = t.scaffold_idx as i64; ok });
+        let n_chunks = if monotone { plan.n_chunks.clamp(1, n_scaffold) } else { 1 };
+        // Cut at equal scaffold counts: forward-position bounds P_0 = 0 < ... < P_K = n_tags.
+        let mut bounds = vec![0usize];
+        let per = n_scaffold.div_ceil(n_chunks);
+        let mut seen = 0usize;
+        for (k, t) in self.variant_order.iter().enumerate() {
+            if t.scaffold_idx >= 0 {
+                if seen > 0 && seen % per == 0 && bounds.len() < n_chunks { bounds.push(k); }
+                seen += 1;
+            }
+        }
+        bounds.push(n_tags);
+        let n_pieces = bounds.len() - 1;
+        // Rare index range of each piece: rare tags before each bound.
+        let mut rare_before = Vec::with_capacity(bounds.len());
+        {
+            let mut r = 0usize; let mut k = 0usize;
+            for &p in &bounds {
+                while k < p { if self.variant_order[k].rare_idx >= 0 { r += 1; } k += 1; }
+                rare_before.push(r);
+            }
+        }
+        let first_sc_fwd = self.variant_order.iter().position(|t| t.scaffold_idx >= 0).unwrap_or(n_tags);
+        let first_sc_bwd = self.variant_order.iter().rev().position(|t| t.scaffold_idx >= 0).unwrap_or(n_tags);
+        // Each piece's slice of the results (contiguous rare-index ranges).
+        fn pieces<'r>(res: &'r mut [Vec<CFlip>], rare_before: &[usize]) -> Vec<&'r mut [Vec<CFlip>]> {
+            let mut out = Vec::with_capacity(rare_before.len() - 1);
+            let mut rest = res;
+            for w in rare_before.windows(2) {
+                let (piece, tail) = std::mem::take(&mut rest).split_at_mut(w[1] - w[0]);
+                out.push(piece);
+                rest = tail;
+            }
+            out
+        }
+        let mut tasks: Vec<(bool, usize, &mut [Vec<CFlip>])> = Vec::with_capacity(2 * n_pieces);
+        for (j, s) in pieces(phase_fwd, &rare_before).into_iter().enumerate() { tasks.push((true, j, s)); }
+        for (j, s) in pieces(phase_bwd, &rare_before).into_iter().enumerate() { tasks.push((false, j, s)); }
+        let all: Vec<SweepStats> = tasks.into_par_iter().map(|(forward, j, res)| {
+            let mut st_stats = SweepStats { pieces: 1, ..Default::default() };
+            // Forward piece j = positions [P_j, P_{j+1}); backward piece j = the same
+            // positions in reverse, i.e. backward positions [n - P_{j+1}, n - P_j).
+            let (k0, k1) = if forward { (bounds[j], bounds[j + 1]) }
+                           else { (n_tags - bounds[j + 1], n_tags - bounds[j]) };
+            let w0 = if plan.warmup > 0 { plan.warmup } else { ((k1 - k0) / 8).max(4096) };
+            let first = if forward { first_sc_fwd } else { first_sc_bwd };
+            let mut st = if k0 == 0 { self.initial_state(forward) }
+                         else { self.state_at(forward, k0, w0, first, &mut st_stats) };
+            self.sweep(forward, k0, k1, &mut st, res, rare_before[j]);
+            st_stats
+        }).collect();
+        for s in all {
+            stats.pieces += s.pieces; stats.retries += s.retries;
+            stats.from_start += s.from_start; stats.warmup_steps += s.warmup_steps;
+        }
+        stats
+    }
+
+    /// Positions `[k0, k1)` of one direction from state `st`, phasing the rare hets
+    /// met there into `phase_results` (rare index `ri` at `ri - ri_base`).
+    fn sweep(&self, forward: bool, k0: usize, k1: usize, st: &mut DirState,
+             phase_results: &mut [Vec<CFlip>], ri_base: usize) {
         let n_hap = self.n_hap;
         let n_target_haps = self.n_target;
         let rare_sites = self.rare_sites;
@@ -422,25 +758,9 @@ impl RareSweep<'_> {
         let scaffold_cm = self.scaffold_cm;
         let ibd2_global = self.ibd2_global;
         let phased = self.phased;
-
-        // Shuffled initial order (the same draws as ever: usize range per step).
-        let mut a_init: Vec<usize> = (0..n_hap).collect();
-        {
-            let mut rng = SmallRng::seed_from_u64(if forward { 12345 } else { 54321 });
-            for i in (1..n_hap).rev() {
-                let j = rng.gen_range(0..=i);
-                a_init.swap(i, j);
-            }
-        }
-        let mut a_arr: Vec<i32> = a_init.iter().map(|&h| h as i32).collect();
-        drop(a_init);
-        // Divergence: forward holds the scaffold index a match starts at (initial
-        // 0); backward holds `top - index` of the index it ends at (initial
-        // n_scaffold - 1, i.e. 0), so both directions are a running maximum.
-        let top = (n_scaffold - 1) as i32;
-        let mut c_arr: Vec<i32> = vec![0; n_hap];
-        let mut b_arr: Vec<i32> = vec![0; n_hap];
-        let mut d_arr: Vec<i32> = vec![0; n_hap];
+        // Divergence back in scaffold indices: forward the index a match starts at,
+        // backward the index it ends at.
+        let top = (self.scaffold_eval.len() - 1) as i32;
         let div_at = |c: &[i32], x: usize| -> usize {
             (if forward { c[x] } else { top - c[x] }) as usize
         };
@@ -453,22 +773,20 @@ impl RareSweep<'_> {
         let mut unphased_indices: Vec<usize> = Vec::with_capacity(n_target_haps);
         let mut next_unphased: Vec<usize> = Vec::with_capacity(n_target_haps);
 
-        let n_tags = self.variant_order.len();
-        for k in 0..n_tags {
-            let tag = &self.variant_order[if forward { k } else { n_tags - 1 - k }];
+        for k in k0..k1 {
+            let tag = *self.tag(forward, k);
             if tag.scaffold_idx >= 0 {
-                let vs = tag.scaffold_idx as usize;
-                let row: &[u64] = if self.scaffold_eval[vs] { self.scaffold_bm.row(vs) } else { self.zero_row };
-                let site = if forward { vs as i32 } else { top - vs as i32 };
-                super::pbwt_neighbor::pbwt_split_i32(row, &mut a_arr, &mut c_arr, &mut b_arr, &mut d_arr, site);
+                self.step(st, forward, tag.scaffold_idx as usize);
                 pos_fresh = false;
             } else if tag.rare_idx >= 0 {
                 let ri = tag.rare_idx as usize;
                 if rare_het_samples[ri].is_empty() { continue; }
+                let phase_results = &mut phase_results[ri - ri_base];
+                let a_arr = &st.a;
+                let c_arr = &st.c;
 
                 let rv = rare_sites[ri];
                 let vr_cm = self.cm[rv] as f32;
-
                 // Target votes from `phased`, reference votes from the panel row.
                 // A no-call (the >1 sentinel, cleared only after this pass) carries no allele and
                 // does not vote, as in SHAPEIT5 (C = 0 for a missing genotype). Counting it as
@@ -557,11 +875,11 @@ impl RareSweep<'_> {
                         if v > thresh {
                             t_vec[h0] = 1;
                             t_vec[h1] = -1;
-                            phase_results[ri][hi] = CFlip::new(2, v, 1);
+                            phase_results[hi] = CFlip::new(2, v, 1);
                         } else if v < -thresh {
                             t_vec[h0] = -1;
                             t_vec[h1] = 1;
-                            phase_results[ri][hi] = CFlip::new(1, v, 1);
+                            phase_results[hi] = CFlip::new(1, v, 1);
                         } else {
                             next_unphased.push(hi);
                         }
@@ -621,11 +939,11 @@ impl RareSweep<'_> {
                     if v > 0.0 {
                         t_vec[h0] = 1;
                         t_vec[h1] = -1;
-                        phase_results[ri][hi] = CFlip::new(2, v, 2);
+                        phase_results[hi] = CFlip::new(2, v, 2);
                     } else {
                         t_vec[h0] = -1;
                         t_vec[h1] = 1;
-                        phase_results[ri][hi] = CFlip::new(1, v, 2);
+                        phase_results[hi] = CFlip::new(1, v, 2);
                     }
                 }
             }
@@ -1223,6 +1541,15 @@ mod tests {
     }
 
     fn rig(seed: u64, n_var: usize, n_samples: usize, n_ref: usize, nocalls: bool) -> Rig {
+        rig_dup(seed, n_var, n_samples, n_ref, nocalls, true, false)
+    }
+
+    /// `twins`: target individual 1 is a copy of individual 0 (an IBD2 pair).
+    /// `dup`: two panel haplotypes identical over the whole chromosome. Either
+    /// leaves two haplotypes no warm-up can tell apart, so every piece rebuilds its
+    /// state from the start.
+    fn rig_dup(seed: u64, n_var: usize, n_samples: usize, n_ref: usize, nocalls: bool,
+               twins: bool, dup: bool) -> Rig {
         let mut rng = SmallRng::seed_from_u64(seed);
         let n_haps = n_samples * 2;
         // Panel haplotypes: a few founders copied with mutations, so PBWT
@@ -1235,7 +1562,8 @@ mod tests {
             (0..n_var).map(|v| if rare_site[v] { (rng.gen_bool(0.01)) as u8 }
                 else if rng.gen_bool(0.03) { 1 - founders[f][v] } else { founders[f][v] }).collect()
         };
-        let panel_haps: Vec<Vec<u8>> = (0..n_ref).map(|_| hap(&mut rng)).collect();
+        let mut panel_haps: Vec<Vec<u8>> = (0..n_ref).map(|_| hap(&mut rng)).collect();
+        if dup && n_ref >= 2 { panel_haps[1] = panel_haps[0].clone(); }
         let mut tgt: Vec<Vec<u8>> = (0..n_haps).map(|_| hap(&mut rng)).collect();
         // Target-private singletons at rare sites.
         for v in 0..n_var {
@@ -1245,7 +1573,7 @@ mod tests {
             }
         }
         // Individual 1 = individual 0 (IBD2) when there are at least two.
-        if n_samples >= 2 { tgt[2] = tgt[0].clone(); tgt[3] = tgt[1].clone(); }
+        if twins && n_samples >= 2 { tgt[2] = tgt[0].clone(); tgt[3] = tgt[1].clone(); }
         let mut target_geno = vec![0u8; n_var * n_haps];
         for v in 0..n_var {
             for h in 0..n_haps { target_geno[v * n_haps + h] = tgt[h][v]; }
@@ -1293,7 +1621,9 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum Arm { Full, Rows, NoneWide, NoneCompact }
 
-    fn run_new(r: &Rig, arm: Arm) -> Vec<u8> {
+    fn run_new(r: &Rig, arm: Arm) -> Vec<u8> { run_new_plan(r, arm, None).0 }
+
+    fn run_new_plan(r: &Rig, arm: Arm, plan: Option<SweepPlan>) -> (Vec<u8>, SweepStats) {
         let n_haps = r.n_samples * 2;
         let mut phased = r.phased0.clone();
         let n_scaffold = r.scaffold.len();
@@ -1317,9 +1647,9 @@ mod tests {
                 RareRef::None),
             Arm::NoneCompact => (target_only_scaffold(n_scaffold, n_haps), RareRef::None),
         };
-        run_phase_rare(&mut phased, &mut sbm, rare_ref, &r.target_geno, &r.cm, &r.bp,
-            r.n_var, r.n_samples, r.n_ref, &r.scaffold, r.replicas);
-        phased
+        let stats = run_phase_rare_with(&mut phased, &mut sbm, rare_ref, &r.target_geno, &r.cm, &r.bp,
+            r.n_var, r.n_samples, r.n_ref, &r.scaffold, r.replicas, plan);
+        (phased, stats)
     }
 
     fn run_old(r: &Rig, with_ref: bool) -> Vec<u8> {
@@ -1389,7 +1719,48 @@ mod tests {
             assert_eq!(run_new(&r, Arm::NoneCompact), run_old(&r, false), "seed {} target-only", seed);
             assert_eq!(run_new(&r, Arm::Full), run_old(&r, true), "seed {} panel", seed);
             assert_eq!(run_new(&r, Arm::Rows), run_old(&r, true), "seed {} panel rows", seed);
+            // the replicas in pieces too (copies differ only where their scaffold phase does)
+            let plan = SweepPlan { n_chunks: 9, warmup: 20 };
+            assert_eq!(run_new_plan(&r, Arm::Full, Some(plan)).0, run_old(&r, true), "seed {} panel, pieces", seed);
         }
+    }
+
+    /// The sweeps cut into pieces, with warm-ups short enough to fail their check
+    /// and grow, and with duplicated haplotypes that force a rebuild from the
+    /// start: the same output as one serial sweep per direction.
+    #[test]
+    fn pieces_match_legacy() {
+        let plans = [
+            SweepPlan { n_chunks: 7, warmup: 2 },
+            SweepPlan { n_chunks: 40, warmup: 1 },
+            SweepPlan { n_chunks: 3, warmup: 50 },
+            SweepPlan { n_chunks: 1000, warmup: 5 },
+            SweepPlan { n_chunks: 3, warmup: 400 },
+        ];
+        let (mut retries, mut from_start, mut clean) = (0usize, 0usize, 0usize);
+        for &(seed, n_var, n_samples, n_ref, nocalls, dup) in &[
+            (11u64, 900usize, 6usize, 70usize, false, false), (12, 1500, 20, 130, true, false),
+            (13, 800, 9, 40, true, true), (14, 1100, 30, 0, false, false), (15, 1300, 3, 300, false, true),
+        ] {
+            let r = rig_dup(seed, n_var, n_samples, n_ref, nocalls, dup, dup);
+            let old_none = run_old(&r, false);
+            let old_ref = (n_ref > 0).then(|| run_old(&r, true));
+            for &plan in &plans {
+                let (got, st) = run_new_plan(&r, Arm::NoneCompact, Some(plan));
+                assert_eq!(got, old_none, "seed {} target-only {:?}", seed, plan);
+                retries += st.retries; from_start += st.from_start;
+                if st.retries == 0 && st.pieces > 2 { clean += 1; }
+                if let Some(old_ref) = &old_ref {
+                    for arm in [Arm::Full, Arm::Rows] {
+                        let (got, st) = run_new_plan(&r, arm, Some(plan));
+                        assert_eq!(&got, old_ref, "seed {} panel {:?} {:?}", seed, arm, plan);
+                        retries += st.retries; from_start += st.from_start;
+                    }
+                }
+            }
+        }
+        assert!(retries > 10 && from_start > 10, "paths not exercised: {} retries, {} from start", retries, from_start);
+        assert!(clean > 0, "no plan passed its warm-up checks first time");
     }
 
     #[test]
