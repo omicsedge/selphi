@@ -228,6 +228,9 @@ pub struct PhasingHmm {
     /// Run the backward and forward passes of `rephase` as two concurrent
     /// Rayon tasks (see [`Self::two_pass_states`]). Off by default.
     two_pass: bool,
+    /// Resident size above which the sequential forward pass returns the
+    /// snapshots it has read before the call ends (None: never).
+    release_above: Option<usize>,
     /// Test hook: 0 joins the two passes, 1 runs the backward first, 2 the
     /// forward first, both on the calling thread.
     #[cfg(test)]
@@ -449,6 +452,7 @@ impl PhasingHmm {
             plan_full: Vec::new(),
             plan_tail: Vec::new(),
             two_pass: false,
+            release_above: None,
             #[cfg(test)]
             two_pass_order: 0,
         }
@@ -458,6 +462,11 @@ impl PhasingHmm {
     /// result is identical either way; this only decides whether the forward
     /// pass is offered to another Rayon worker.
     pub(crate) fn set_two_pass(&mut self, on: bool) { self.two_pass = on; }
+
+    /// Let the sequential forward pass return the snapshots it has read while
+    /// the process is resident above `bytes` (None: keep them to the end, so a
+    /// later call reuses the pages).
+    pub(crate) fn set_release_above(&mut self, bytes: Option<usize>) { self.release_above = bytes; }
 
     /// Reuse metadata and O(K)/O(sites) scratch, but return the two large
     /// O(K * (segments + flat hets)) snapshots before the worker becomes idle.
@@ -1840,6 +1849,12 @@ impl PhasingHmm {
         self.curr_segment_index = 0;
         self.curr_segment_locus = 0;
         self.curr_missing_locus = 0;
+        // Each backward snapshot is read once, here, in ascending order: under
+        // memory pressure, hand the read ones back.
+        let sh = self.n_states * HAP_NUMBER;
+        let gate = self.release_above;
+        let mut seg_free = ReleaseRun::gated(self.phasing_prob.as_mut_ptr(), sh, gate);
+        let mut miss_free = ReleaseRun::gated(self.impute_prob.as_mut_ptr(), sh, gate);
 
         let n_var = self.var_typ.len() as i32;
         let mut idx = 0i32;
@@ -1892,6 +1907,8 @@ impl PhasingHmm {
             if last_of_segment && idx != (n_var - 1) {
                 let ret1 = self.trans_hap(cm);
                 debug_assert!(!ret1, "TRANS_HAP numerical failure");
+                // SAFETY: the next segment's snapshot is not read again.
+                unsafe { seg_free.consumed(seg + 1); }
                 let ret2 = self.sample_dip(rng_u01);
                 debug_assert!(!ret2, "SAMPLE_DIP numerical failure");
             }
@@ -1899,6 +1916,8 @@ impl PhasingHmm {
             // PHASE RARE HETS.
             if typ == VAR_FLAT_HET {
                 self.impute_flat_het(ref_bm, cond_haps);
+                // SAFETY: this flat het's snapshot is not read again.
+                unsafe { miss_free.consumed(self.curr_missing_locus as usize); }
                 self.curr_missing_locus += 1;
             }
 
@@ -2089,6 +2108,7 @@ impl PhasingHmm {
             plan_full: self.plan_full.clone(),
             plan_tail: self.plan_tail.clone(),
             two_pass: false,
+            release_above: None,
             #[cfg(test)]
             two_pass_order: 0,
         }
@@ -2663,13 +2683,16 @@ impl TwoPass {
 /// blocks in order, the forward ascending and the backward descending). Each
 /// block is read exactly once, so the passes' storage shrinks as they consume
 /// it instead of staying resident until the call ends.
-struct ReleaseRun { base: *mut f32, sh: usize, lo: usize, hi: usize }
+struct ReleaseRun { base: *mut f32, sh: usize, lo: usize, hi: usize, gate: Option<usize> }
 
 /// Consumed blocks per release (a few MB): few page-table updates per call.
 const RELEASE_BLOCKS: usize = 64;
 
 impl ReleaseRun {
-    fn new(base: *mut f32, sh: usize) -> Self { ReleaseRun { base, sh, lo: 0, hi: 0 } }
+    fn new(base: *mut f32, sh: usize) -> Self { Self::gated(base, sh, Some(0)) }
+
+    /// Releases only while the process is resident above `gate` (None: never).
+    fn gated(base: *mut f32, sh: usize, gate: Option<usize>) -> Self { ReleaseRun { base, sh, lo: 0, hi: 0, gate } }
 
     /// Block `j` has been consumed by this pass.
     ///
@@ -2688,7 +2711,12 @@ impl ReleaseRun {
     }}
 
     unsafe fn flush(&mut self) { unsafe {
-        if self.hi > self.lo {
+        let due = match self.gate {
+            None => false,
+            Some(0) => true,
+            Some(t) => crate::lcwgs::memory::resident_bytes().is_some_and(|rss| rss >= t),
+        };
+        if self.hi > self.lo && due {
             release_pages(self.base.add(self.lo * self.sh), (self.hi - self.lo) * self.sh);
         }
         (self.lo, self.hi) = (0, 0);

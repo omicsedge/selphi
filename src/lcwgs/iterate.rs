@@ -1029,6 +1029,7 @@ fn run_gibbs_with_memory(
                         };
                         let mut hmm = crate::lcwgs::phasing_hmm::PhasingHmm::new(&g2p);
                         hmm.set_two_pass(two_pass);
+                        hmm.set_release_above(execution.release_above());
                         hmm.rephase(h0, h1, flat, cond_haps, ref_bm, cm, &g2p,
                                     poly_ref, mono_ref, &lq, &mut rng_u01, phase_base);
                         for v in 0..n_var { samp0[v] = h0[v] as u8; samp1[v] = h1[v] as u8; }

@@ -22,6 +22,13 @@ impl<'a> SampleExecution<'a> {
     pub fn finish_sample(self) {
         if let Self::Waves(reclaimer) = self { reclaimer.finish_sample(); }
     }
+
+    /// Resident size above which a whole-sample wave's phasing returns the
+    /// snapshots it has consumed before its call ends: the reclaimer's
+    /// threshold. Other executions keep them until the call ends.
+    pub fn release_above(self) -> Option<usize> {
+        match self { Self::Waves(reclaimer) => Some(reclaimer.threshold), _ => None }
+    }
 }
 
 /// Release allocator residency only under pressure, after all of a sample's
@@ -59,7 +66,7 @@ impl WaveReclaimer {
 
 /// Read only this process. A peak-RSS fallback would keep collection enabled
 /// forever after one peak, so platforms without a current reading return None.
-fn resident_bytes() -> Option<usize> {
+pub(crate) fn resident_bytes() -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
         let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
