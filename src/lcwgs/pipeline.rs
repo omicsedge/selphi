@@ -93,6 +93,8 @@ pub fn run_lcwgs(
     };
     let PlVcfResult { gl3: gl3_input, markers, sample_ids, haploid_samples: pl_haploid } =
         parse_pl_vcf(target_vcf, hash_alleles)?;
+    // A single sample's records were parsed on many workers.
+    if sample_ids.len() == 1 { crate::common::mem::release_freed_memory(); }
     memtrace("after parse_pl_vcf (+gl3_input)");
     let n_samples = sample_ids.len();
     let n_target_variants = markers.len();
@@ -569,6 +571,9 @@ pub fn run_lcwgs_bam(
     let ahead = bam_paths.len() == 1 && rayon::current_num_threads() > 1 && !crate::config::present("LCWGS_RAW_GL");
     let (bamgl, prepared) = if ahead {
         let (gl, prep) = rayon::join(pileup, || prepare_chunks(srp, &wgs_idx, map_path, params));
+        // The pileup's and the builds' scratch was freed on many workers: hand
+        // its pages back before the chunks allocate.
+        crate::common::mem::release_freed_memory();
         (gl?, Some(prep?))
     } else {
         (pileup()?, None)
