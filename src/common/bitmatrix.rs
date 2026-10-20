@@ -203,6 +203,27 @@ impl HaplotypeBitmatrix {
         });
     }
 
+    /// Overwrite haplotypes `[0, n_low)` of every site with `bit(site, hap)`,
+    /// leaving haplotypes `>= n_low` as they are. Parallel over sites; the same
+    /// bits as `update_hap_all_from_vec` once per haplotype.
+    pub fn overwrite_low_bits_with<F>(&mut self, n_low: usize, bit: F)
+    where F: Fn(usize, usize) -> bool + Sync {
+        assert!(n_low <= self.n_haps);
+        let n_words = self.n_words;
+        if n_words == 0 || n_low == 0 { return; }
+        let n_low_words = n_low.div_ceil(64);
+        self.bits.par_chunks_mut(n_words).enumerate().for_each(|(site, row)| {
+            for (w, slot) in row[..n_low_words].iter_mut().enumerate() {
+                let h0 = w * 64;
+                let h1 = (h0 + 64).min(n_low);
+                let mut word = 0u64;
+                for h in h0..h1 { word |= (bit(site, h) as u64) << (h - h0); }
+                let low = if h1 - h0 == 64 { u64::MAX } else { (1u64 << (h1 - h0)) - 1 };
+                *slot = (*slot & !low) | word;
+            }
+        });
+    }
+
     /// Update a single haplotype across ALL sites from a contiguous allele vec.
     /// alleles[site] = 0 or 1 (u8), contiguous layout (L2-friendly).
     pub fn update_hap_all_from_vec(&mut self, hap: usize, alleles: &[u8]) {

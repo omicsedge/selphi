@@ -1347,6 +1347,45 @@ pub fn run_phase_common_bm(
     hap_bm
 }
 
+/// Run `run(si, graphs[si])` for every sample on the rayon pool, costliest first
+/// (`cost`, highest first; ties by index): each worker takes the next sample not
+/// yet started (longest-processing-time scheduling). A sample's work reads only
+/// shared, read-only state and its own pre-drawn RNG seed, so the order changes
+/// the makespan, never a result; results come back in sample order. Each
+/// sample's wall replaces its `cost` for the next call. Under a plain
+/// `par_iter_mut` the slowest samples could start last: 54 WGS children (chr1,
+/// per-sample 5-10 s) on 16 threads spent 12-15% longer in the sample phase
+/// than its summed CPU over the threads.
+fn run_samples_costliest_first<R: Send>(
+    graphs: &mut [GenotypeGraph], cost: &mut [f64],
+    run: impl Fn(usize, &mut GenotypeGraph) -> R + Sync,
+) -> Vec<R> {
+    use std::sync::Mutex;
+    let n = graphs.len();
+    assert_eq!(cost.len(), n);
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&x, &y| cost[y].total_cmp(&cost[x]).then(x.cmp(&y)));
+    let slots: Vec<Mutex<Option<&mut GenotypeGraph>>> =
+        graphs.iter_mut().map(|g| Mutex::new(Some(g))).collect();
+    let out: Vec<Mutex<Option<(R, f64)>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    let n_workers = rayon::current_num_threads().min(n).max(1);
+    (0..n_workers).into_par_iter().for_each(|_| loop {
+        let k = next.fetch_add(1, Ordering::Relaxed);
+        if k >= n { break; }
+        let si = order[k];
+        let graph = slots[si].lock().unwrap().take().expect("each sample runs once");
+        let t = std::time::Instant::now();
+        let r = run(si, graph);
+        *out[si].lock().unwrap() = Some((r, t.elapsed().as_secs_f64()));
+    });
+    out.into_iter().enumerate().map(|(si, m)| {
+        let (r, secs) = m.into_inner().unwrap().expect("every sample ran");
+        cost[si] = secs;
+        r
+    }).collect()
+}
+
 fn _run_iterations(
     graphs: &mut [GenotypeGraph],
     hap_bm: &mut HaplotypeBitmatrix,     // unified: used for both PBWT and HMM
@@ -1386,6 +1425,10 @@ fn _run_iterations(
         n_haps_total);
 
     let mut main_ord = 0usize; // ordinal of the current Main iteration
+    // Per-sample cost for the scheduling order (`run_samples_costliest_first`):
+    // the diplotype-graph transition count before the first iteration, then each
+    // sample's measured wall in the previous one.
+    let mut sample_cost: Vec<f64> = graphs.iter().map(|g| g.n_transitions as f64).collect();
     for (it, &stage) in stages.iter().enumerate() {
         let t0 = std::time::Instant::now();
         let stage_name = match stage {
@@ -1449,6 +1492,7 @@ fn _run_iterations(
         // 2. Parallel per-sample: window→HMM→sample
         // Pre-seed per-sample RNGs for deterministic parallelism.
         let n_seg_total = AtomicUsize::new(0);
+        let t_samples = std::time::Instant::now();
 
         // Pre-seed per-sample RNGs from master (deterministic order)
         let sample_seeds: Vec<u32> = (0..n_samples).map(|_| {
@@ -1466,8 +1510,7 @@ fn _run_iterations(
         let window_parallel = n_samples < n_pool_threads;
         let pbwt_ro: &PbwtNeighborIndex = pbwt_idx;
         let hmm_params_ro: &HmmParams = hmm_params;
-        let per_sample_banned: Vec<Vec<(usize, usize, usize, usize)>> =
-            graphs.par_iter_mut().enumerate().map(|(si, graph)| {
+        let run_sample = |si: usize, graph: &mut GenotypeGraph| -> Vec<(usize, usize, usize, usize)> {
             if graph.n_segments == 0 { return vec![]; }
             let mut sample_rng = CppRng::new(sample_seeds[si]);
 
@@ -1628,8 +1671,10 @@ fn _run_iterations(
             }
             n_seg_total.fetch_add(graph.n_segments, Ordering::Relaxed);
             banned
-        }).collect();
+        };
+        let per_sample_banned = run_samples_costliest_first(graphs, &mut sample_cost, run_sample);
 
+        let samples_ms = t_samples.elapsed().as_millis();
         let new_banned_pairs: Vec<(usize, usize, usize, usize)> =
             per_sample_banned.into_iter().flatten().collect();
 
@@ -1649,18 +1694,25 @@ fn _run_iterations(
         // final Viterbi solve) — these are free posterior phase samples.
         let is_main = matches!(stage, Stage::Main);
         let capturing = is_main && main_samples.as_deref().is_some_and(|mc| mc.wants(main_ord));
-        let mut this_main: Vec<(Vec<u8>, Vec<u8>)> =
-            if capturing { Vec::with_capacity(n_samples) } else { Vec::new() };
-        for (si, graph) in graphs.iter().enumerate() {
-            let (h0, h1) = graph.extract_haplotypes();
-            // Single unified bitmatrix: update all sites (used for both PBWT and HMM)
-            hap_bm.update_hap_all_from_vec(si * 2, &h0);
-            hap_bm.update_hap_all_from_vec(si * 2 + 1, &h1);
-            if capturing { this_main.push((h0, h1)); }
+        // Single unified bitmatrix: every target bit of every site, written row by
+        // row in parallel straight from the graphs (each sample's haplotypes are its
+        // graph's variant bits, which `extract_haplotypes` reads too). Was one serial
+        // column pass per haplotype over the n_var x n_haps_total matrix: ~3 s of a
+        // 28-s chr1 iteration at 100% CPU (54 WGS children, 3.0 M scaffold sites).
+        {
+            let graphs_ro: &[GenotypeGraph] = graphs;
+            hap_bm.overwrite_low_bits_with(2 * n_samples, |v, h| {
+                let byte = graphs_ro[h >> 1].variants[v / 2];
+                if h & 1 == 0 { var_get_hap0(v % 2, byte) } else { var_get_hap1(v % 2, byte) }
+            });
         }
-        if capturing
-            && let Some(ms) = main_samples.as_deref_mut() { ms.kept.push((main_ord, this_main)); }
+        if capturing {
+            let this_main: Vec<(Vec<u8>, Vec<u8>)> =
+                graphs.par_iter().map(|g| g.extract_haplotypes()).collect();
+            if let Some(ms) = main_samples.as_deref_mut() { ms.kept.push((main_ord, this_main)); }
+        }
         if is_main { main_ord += 1; }
+        let update_ms = t_samples.elapsed().as_millis() - samples_ms;
 
         // EM-Ne online update during burnin. Diverges from SHAPEIT5 (which
         // uses a fixed Ne) and the formula is admittedly crude — it uses
@@ -1698,9 +1750,10 @@ fn _run_iterations(
         }
 
         let total_ms = t0.elapsed().as_millis();
-        crate::selphi_debug!("    Iter {}/{} ({}): {} segs [pbwt={}ms total={}ms] rss={:.0}MB hwm={:.0}MB",
+        crate::selphi_debug!("    Iter {}/{} ({}): {} segs [pbwt={}ms samples={}ms update={}ms total={}ms] rss={:.0}MB hwm={:.0}MB",
             it + 1, n_iterations, stage_name,
-            n_seg_total.load(Ordering::Relaxed), pbwt_ms, total_ms, crate::log::rss_mb(), crate::log::peak_mem_mb());
+            n_seg_total.load(Ordering::Relaxed), pbwt_ms, samples_ms, update_ms, total_ms,
+            crate::log::rss_mb(), crate::log::peak_mem_mb());
     }
 
     // Viterbi solve
