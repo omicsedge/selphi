@@ -370,9 +370,12 @@ fn run_phasing(inp: &PhasingInputs) -> PhasingResult {
     // integrated run produces, silently. So build it here too when it fits
     // SELPHI_PHASE_ONLY_RARE_REF_GB (a chr22 array × 1KG is 5.6 MB; a WGS target ×
     // TOPMed would be ~21 GB, which is why it is budgeted rather than unconditional).
+    // Default 4 GB, so a whole WGS chromosome 1 against a 1000 Genomes-size panel
+    // (3.2 GB) gets it: with the private-het routing it enables, 54 trio children's
+    // chr1 switch error goes 1.88% -> 1.69% (lower for every child, three seeds).
     let want_full = !args.phase_only || {
         let bytes = n_chip * n_ref.div_ceil(64) * 8;
-        let budget = (selphi::config::f64_or("SELPHI_PHASE_ONLY_RARE_REF_GB", 2.0) * 1e9) as usize;
+        let budget = (selphi::config::f64_or("SELPHI_PHASE_ONLY_RARE_REF_GB", 4.0) * 1e9) as usize;
         if bytes > budget {
             selphi_step!("Phase-only diploid: full-chip ref bitmatrix skipped ({:.1} GB > {:.1} GB budget) — phase_rare runs target-only",
                 bytes as f64 / 1e9, budget as f64 / 1e9);
