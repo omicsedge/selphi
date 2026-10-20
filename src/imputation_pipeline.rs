@@ -1145,6 +1145,8 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
     // The members the run ends up with: the chain's, K times over with replicas (the
     // independent chains are never replicated), plus a given phase's own slot
     // (--trust-input-phase, see input_phase::InputPhase::chain_members).
+    // The cohort default sets the members each copy contributes (two copies of one member).
+    let intra_chain = replica_plan.members.unwrap_or(intra_chain);
     let n_members_run = replica_plan.k * intra_chain + (indep_chain - 1) + (n_members - n_chain);
 
     let (targ_alleles, ref_bm_from_phasing, extra_phased) = if needs_phasing {

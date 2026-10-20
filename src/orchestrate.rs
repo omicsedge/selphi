@@ -825,13 +825,22 @@ pub fn run_multi_chr(
             n_samples, phasing: needs_phasing, chain_only: needs_phasing && !given_used,
             batched: config.target_batch_size > 0, ..Default::default()
         }, selphi::diploid::replicas::max_samples());
+        let replica_plan = if config.replicas == selphi::diploid::replicas::Setting::Auto {
+            selphi::diploid::replicas::Plan::with_cohort_max(config.replicas, selphi::diploid::replicas::Run {
+                n_samples, phasing: needs_phasing, chain_only: needs_phasing && !given_used,
+                batched: config.target_batch_size > 0, ..Default::default()
+            }, selphi::diploid::replicas::max_samples(), selphi::diploid::replicas::cohort_max())
+        } else { replica_plan };
         if !replicas_said && let Some(line) = replica_plan.on_line(n_samples) {
             selphi_step!("{}", line);
             replicas_said = true;
         }
         // The members the chromosome ends up with: the chain's, K times over with replicas,
         // plus a given phase's own slot (--trust-input-phase, InputPhase::chain_members).
-        let n_members_run = replica_plan.k * n_chain + (ensemble_n - n_chain);
+        let given_slot = ensemble_n - n_chain;
+        // The cohort default sets the members each copy contributes (two copies of one member).
+        let n_chain = replica_plan.members.unwrap_or(n_chain);
+        let n_members_run = replica_plan.k * n_chain + given_slot;
         let (targ_alleles, extra_phased, ref_bm_from_phasing, phased) = phase_chr(
             needs_phasing, &multi_map, chr_name, &srp, &wgs_idx, &raw_chip_cm,
             &chip_bps, targ_alleles, n_chip, n_samples, n_ref, n_chain,

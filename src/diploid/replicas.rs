@@ -46,6 +46,23 @@ pub const AUTO_K: usize = 3;
 /// pays (+28% CPU) and a cohort should not.
 pub const DEFAULT_MAX_SAMPLES: usize = 8;
 
+/// Copies per sample, and chain members per copy, when the knob is unset and the run is a
+/// cohort (more than `max_samples` samples, at most `SELPHI_DIPLOID_REPLICAS_COHORT_MAX`): two
+/// copies of one member each keep the ensemble at two members, so the imputation HMM costs what
+/// it did, while the second member comes from an independent copy instead of a thinned sample of
+/// the same chain. 801 1000 Genomes array targets: chr22 0.4869 -> 0.4899 (two seeds), chr1
+/// 0.5755 -> 0.5782, every MAF bin up; MESA 100 x TOPMed chr20 +0.0023 / +0.0056 (two seeds);
+/// CPU +7..+21%, peak memory within 0.2 GB.
+pub const COHORT_K: usize = 2;
+pub const COHORT_MEMBERS: usize = 1;
+/// Largest cohort the two-copy default is measured on (`SELPHI_DIPLOID_REPLICAS_COHORT_MAX`).
+pub const DEFAULT_COHORT_MAX: usize = 1000;
+
+/// `SELPHI_DIPLOID_REPLICAS_COHORT_MAX` (default [`DEFAULT_COHORT_MAX`]).
+pub fn cohort_max() -> usize {
+    crate::config::usize_or("SELPHI_DIPLOID_REPLICAS_COHORT_MAX", DEFAULT_COHORT_MAX)
+}
+
 /// How the run was asked to use replicas.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Setting {
@@ -88,6 +105,9 @@ pub struct Run {
 pub struct Plan {
     /// Copies per sample phased together (1 = off).
     pub k: usize,
+    /// Chain members each copy contributes, when the plan sets it (the cohort default);
+    /// `None` keeps the run's own count (`SELPHI_DIPLOID_INTRA_N`, default 2).
+    pub members: Option<usize>,
     pub setting: Setting,
     /// An explicit request this run cannot use; the reason is in [`Plan::note`].
     pub refused: Option<Refusal>,
@@ -110,7 +130,12 @@ pub enum Refusal {
 impl Plan {
     /// The decision for `run` under `setting` (see the module docs).
     pub fn new(setting: Setting, run: Run, max_samples: usize) -> Self {
-        let off = |refused| Self { k: 1, setting, refused, max_samples };
+        Self::with_cohort_max(setting, run, max_samples, DEFAULT_COHORT_MAX)
+    }
+
+    /// [`Plan::new`] with an explicit cohort cap.
+    pub fn with_cohort_max(setting: Setting, run: Run, max_samples: usize, cohort_max: usize) -> Self {
+        let off = |refused| Self { k: 1, members: None, setting, refused, max_samples };
         let refusal = if run.phase_only { Some(Refusal::PhaseOnly) }
             else if run.batched { Some(Refusal::Batched) }
             else if run.independent_chains { Some(Refusal::IndependentChains) }
@@ -118,17 +143,20 @@ impl Plan {
         match setting {
             Setting::Explicit(k) if k < 2 => off(None),
             Setting::Explicit(_) if refusal.is_some() => off(refusal),
-            Setting::Explicit(k) => if run.phasing { Self { k, setting, refused: None, max_samples } } else { off(None) },
+            Setting::Explicit(k) => if run.phasing { Self { k, members: None, setting, refused: None, max_samples } } else { off(None) },
             Setting::Auto => {
-                let on = run.phasing && run.chain_only && refusal.is_none()
-                    && run.n_samples > 0 && run.n_samples <= max_samples;
-                if on { Self { k: AUTO_K, setting, refused: None, max_samples } } else { off(None) }
+                let eligible = run.phasing && run.chain_only && refusal.is_none() && run.n_samples > 0;
+                if eligible && run.n_samples <= max_samples {
+                    Self { k: AUTO_K, members: None, setting, refused: None, max_samples }
+                } else if eligible && run.n_samples <= cohort_max {
+                    Self { k: COHORT_K, members: Some(COHORT_MEMBERS), setting, refused: None, max_samples }
+                } else { off(None) }
             }
         }
     }
 
     /// From the environment (`SELPHI_DIPLOID_REPLICAS`, `SELPHI_DIPLOID_REPLICAS_MAX_SAMPLES`).
-    pub fn from_env(run: Run) -> Self { Self::new(Setting::from_env(), run, max_samples()) }
+    pub fn from_env(run: Run) -> Self { Self::with_cohort_max(Setting::from_env(), run, max_samples(), cohort_max()) }
 
     /// The line to log when an explicit request is not applied.
     pub fn note(&self) -> Option<String> {
@@ -147,6 +175,8 @@ so no ensemble members)",
     pub fn on_line(&self, n_samples: usize) -> Option<String> {
         if self.k < 2 { return None; }
         let why = match self.setting {
+            Setting::Auto if self.members.is_some() => format!("default for an unphased cohort above {} samples: two copies \
+of one member each (SELPHI_DIPLOID_REPLICAS_COHORT_MAX caps it); SELPHI_DIPLOID_REPLICAS=1 turns it off", self.max_samples),
             Setting::Auto => format!("default for an unphased run of <= {} samples (SELPHI_DIPLOID_REPLICAS_MAX_SAMPLES); \
 SELPHI_DIPLOID_REPLICAS=1 turns it off", self.max_samples),
             Setting::Explicit(k) => format!("SELPHI_DIPLOID_REPLICAS={k}"),
@@ -245,7 +275,10 @@ mod tests {
         let auto = |r: Run| Plan::new(Setting::Auto, r, 8);
         assert_eq!(auto(run(1, true, true)).k, 3);
         assert_eq!(auto(run(8, true, true)).k, 3);
-        assert_eq!(auto(run(9, true, true)).k, 1, "above the sample cap");
+        assert_eq!((auto(run(9, true, true)).k, auto(run(9, true, true)).members), (2, Some(1)), "a cohort: two copies of one member");
+        assert_eq!(auto(run(1000, true, true)).k, 2);
+        assert_eq!(auto(run(1001, true, true)).k, 1, "above the cohort cap");
+        assert_eq!(auto(run(3, true, true)).members, None);
         assert_eq!(Plan::new(Setting::Auto, run(9, true, true), 12).k, 3, "the cap is a knob");
         assert_eq!(auto(run(1, true, false)).k, 1, "a phased input's own phase keeps its members");
         assert_eq!(auto(run(1, false, false)).k, 1, "nothing is phased (--keep-input-phase, phased input)");
@@ -256,7 +289,8 @@ mod tests {
             assert_eq!((p.k, p.refused, p.note()), (1, None, None), "auto stays off quietly: {r:?}");
         }
         assert!(auto(run(1, true, true)).on_line(1).unwrap().contains("default for an unphased run of <= 8 samples"));
-        assert_eq!(auto(run(9, true, true)).on_line(9), None);
+        assert!(auto(run(9, true, true)).on_line(9).unwrap().contains("two copies of one member"));
+        assert_eq!(auto(run(1001, true, true)).on_line(1001), None);
     }
 
     #[test]
