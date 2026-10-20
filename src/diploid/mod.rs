@@ -98,7 +98,7 @@ pub fn diploid_phase_panel(
 
     // De-novo panel phasing returns a single phased scaffold (no intra-run ensemble).
     let mut scaffolds = _diploid_run(
-        cohort_geno, empty_ref, &common_indices, None,
+        cohort_geno, empty_ref, &common_indices, phase_rare::RareRef::None,
         CommonPrep { target_geno_common, cm_common, cm_full, bp_common },
         bp, n_var, n_samples, /* n_ref = */ 0, seed, n_threads, max_cond_haps, 1,
         None, 1,
@@ -109,11 +109,17 @@ pub fn diploid_phase_panel(
 /// Diploid phasing with pre-filtered common_ref_bm (no full ref_bm ever allocated).
 /// common_indices: chip-space indices of MAF-filtered common variants.
 /// common_ref_bm: bitmatrix of ref haps at common variants only.
+/// rare_ref: the panel phase_rare weaves in outside the scaffold (`Full` = the
+/// chip-site matrix, which the no-call fill also reads; `Rows` = only the panel at
+/// `phase_rare::rare_sites`, valid only for a target without no-calls; `None` =
+/// target haplotypes only). At the scaffold sites phase_rare reads the panel from
+/// `common_ref_bm`, which must therefore be the chip-site panel at
+/// `common_chip_indices` whenever `rare_ref` is not `None`.
 pub fn diploid_phase_bm_prefiltered(
     target_geno: &[u8],
     common_ref_bm: pbwt_neighbor::HaplotypeBitmatrix,
     common_chip_indices: &[usize],
-    full_chip_ref_bm: Option<&pbwt_neighbor::HaplotypeBitmatrix>,
+    rare_ref: phase_rare::RareRef<'_>,
     _chip_cm: &[f64], chip_bp: &[i64], _ref_bp: &[i64], map_bp: &[i64], map_cm: &[f64],
     n_var: usize, n_samples: usize, n_ref: usize, seed: i64, n_threads: usize,
     max_cond_haps: usize,
@@ -138,14 +144,14 @@ pub fn diploid_phase_bm_prefiltered(
         let rep_geno = replicas::replicate_rows(&target_geno[..n_var * n_samples * 2], n_var, n_samples * 2, k);
         let rep_lock = ped_locked.map(|l| replicas::replicate_rows(&l[..n_var * n_samples], n_var, n_samples, k));
         let scaffolds = diploid_phase_core(
-            &rep_geno, common_ref_bm, common_chip_indices, full_chip_ref_bm,
+            &rep_geno, common_ref_bm, common_chip_indices, rare_ref,
             chip_bp, map_bp, map_cm, n_var, n_samples * k, n_ref, seed, n_threads,
             max_cond_haps, n_members, rep_lock.as_deref(), k,
         );
         return replicas::split_members(scaffolds, n_var, n_samples * 2, k);
     }
     diploid_phase_core(
-        target_geno, common_ref_bm, common_chip_indices, full_chip_ref_bm,
+        target_geno, common_ref_bm, common_chip_indices, rare_ref,
         chip_bp, map_bp, map_cm, n_var, n_samples, n_ref, seed, n_threads,
         max_cond_haps, n_members, ped_locked, 1,
     )
@@ -158,7 +164,7 @@ fn diploid_phase_core(
     target_geno: &[u8],
     common_ref_bm: pbwt_neighbor::HaplotypeBitmatrix,
     common_chip_indices: &[usize],
-    full_chip_ref_bm: Option<&pbwt_neighbor::HaplotypeBitmatrix>,
+    rare_ref: phase_rare::RareRef<'_>,
     chip_bp: &[i64], map_bp: &[i64], map_cm: &[f64],
     n_var: usize, n_samples: usize, n_ref: usize, seed: i64, n_threads: usize,
     max_cond_haps: usize, n_members: usize, ped_locked: Option<&[bool]>, replicas: usize,
@@ -215,7 +221,7 @@ fn diploid_phase_core(
     });
 
     _diploid_run(
-        target_geno, common_ref_bm, common_chip_indices, full_chip_ref_bm,
+        target_geno, common_ref_bm, common_chip_indices, rare_ref,
         CommonPrep { target_geno_common, cm_common, cm_full: chip_cm_full, bp_common },
         chip_bp, n_var, n_samples, n_ref, seed, n_threads, max_cond_haps, n_members,
         locked_common.as_deref(), replicas,
@@ -234,7 +240,7 @@ fn _diploid_run(
     target_geno: &[u8],
     common_ref_bm: pbwt_neighbor::HaplotypeBitmatrix,
     common_indices: &[usize],
-    full_chip_ref_bm: Option<&pbwt_neighbor::HaplotypeBitmatrix>,
+    rare_ref: phase_rare::RareRef<'_>,
     prep: CommonPrep,
     chip_bp: &[i64],
     n_var: usize, n_samples: usize, n_ref: usize, seed: i64, n_threads: usize,
@@ -322,8 +328,10 @@ fn _diploid_run(
         .filter(|st| matches!(st, params::Stage::Main)).count();
     let keep_main = ensemble_main_iters(n_members, n_main_iters);
     let mut main_capture = phase_common::MainCapture::new(keep_main.clone());
-    // Run phase_common on COMMON variants only (bitmatrix-native)
-    phase_common::run_phase_common_bm(
+    // Run phase_common on COMMON variants only (bitmatrix-native). The unified
+    // matrix comes back: with a panel, its reference bits are the scaffold rows
+    // phase_rare's PBWT reads (no second n_common x n_haps_total copy).
+    let unified_bm = phase_common::run_phase_common_bm(
         &mut graphs, unified_bm, &cm_common,
         n_common, n_samples, n_ref, seed, n_threads,
         &scheme,
@@ -335,6 +343,17 @@ fn _diploid_run(
     );
     let t_scaffolds = std::time::Instant::now();
     crate::selphi_debug!("  [diploid] through phase_common: {:.0}ms rss={:.0}MB hwm={:.0}MB", t_run.elapsed().as_secs_f64() * 1e3, crate::log::rss_mb(), crate::log::peak_mem_mb());
+    // phase_rare's scaffold rows: the unified matrix when its PBWT includes the
+    // panel (or there is none); otherwise target bits alone (the panel columns of
+    // the unified matrix are not read, so they are not held).
+    let mut rare_scaffold_bm = if rare_ref.is_some() || n_ref == 0 {
+        assert_eq!(unified_bm.n_haps, n_haps + n_ref);
+        unified_bm
+    } else {
+        drop(unified_bm);
+        phase_rare::target_only_scaffold(n_common, n_haps)
+    };
+    let full_chip_ref_bm = match rare_ref { phase_rare::RareRef::Full(bm) => Some(bm), _ => None };
 
     // No-calls are the ORIGINAL target genotypes carrying the missing sentinel
     // (> 1), read straight from `target_geno` (row-major n_var x n_haps, the same
@@ -348,6 +367,10 @@ fn _diploid_run(
     // common one no Main iteration imputed (put back to missing below). 2%
     // no-calls, genotype concordance at them: 801 samples --phase-panel 0.9903 ->
     // 0.9971, 54 trio children 0.9916 -> 0.9967.
+    // The no-call fill votes with the panel at every chip site, which only the full
+    // chip-site matrix holds; a caller passing `Rows` has checked there is no no-call.
+    assert!(!any_nocall || !matches!(rare_ref, phase_rare::RareRef::Rows(_)),
+        "diploid: RareRef::Rows passed for a target with no-calls (the no-call fill needs the full panel)");
     let hmm_fill = any_nocall && !phase_common::nocall_observed();
     let unimputed: Vec<Vec<usize>> = if hmm_fill {
         graphs.iter().map(|g| g.unimputed_missing()).collect()
@@ -363,23 +386,31 @@ fn _diploid_run(
     // transient buffers are never held twice), then the no-call fill + clamp,
     // which only reads shared inputs and the member's own scaffold and so runs
     // for all members in parallel.
-    let build_scaffold = |common_src: &[(Vec<u8>, Vec<u8>)]| -> Vec<u8> {
+    // Scaffold ordinal of each chip site (u32::MAX = not in the scaffold); with a
+    // repeated index the later ordinal wins, as the former sequential scatter did.
+    let mut scaffold_pos = vec![u32::MAX; n_var];
+    for (ci, &v) in common_indices.iter().enumerate() { scaffold_pos[v] = ci as u32; }
+    let build_scaffold = |common_src: &[(Vec<u8>, Vec<u8>)],
+                          rare_scaffold_bm: &mut pbwt_neighbor::HaplotypeBitmatrix| -> Vec<u8> {
+        // Row v: the target genotypes (same n_var x n_haps layout), overwritten at a
+        // scaffold site by this source's common-variant haplotypes.
         let mut phased = vec![0u8; n_var * n_haps];
-        for v in 0..n_var {
-            for si in 0..n_samples {
-                phased[v * n_haps + si * 2] = target_geno[v * n_samples * 2 + si * 2];
-                phased[v * n_haps + si * 2 + 1] = target_geno[v * n_samples * 2 + si * 2 + 1];
-            }
-        }
-        for (si, (h0, h1)) in common_src.iter().enumerate() {
-            for (ci, &v) in common_indices.iter().enumerate() {
-                phased[v * n_haps + si * 2] = h0[ci];
-                phased[v * n_haps + si * 2 + 1] = h1[ci];
-            }
+        if n_haps > 0 {
+            phased.par_chunks_mut(n_haps).enumerate().for_each(|(v, row)| {
+                row.copy_from_slice(&target_geno[v * n_haps..(v + 1) * n_haps]);
+                let ci = scaffold_pos[v];
+                if ci != u32::MAX {
+                    let ci = ci as usize;
+                    for (si, (h0, h1)) in common_src.iter().enumerate() {
+                        row[si * 2] = h0[ci];
+                        row[si * 2 + 1] = h1[ci];
+                    }
+                }
+            });
         }
         phase_rare::run_phase_rare(
-            &mut phased, full_chip_ref_bm, target_geno, &cm_full, chip_bp,
-            n_var, n_samples, n_ref, 1, 15000.0, common_indices, replicas,
+            &mut phased, rare_scaffold_bm, rare_ref, target_geno, &cm_full, chip_bp,
+            n_var, n_samples, n_ref, common_indices, replicas,
         );
         phased
     };
@@ -397,23 +428,24 @@ fn _diploid_run(
             fill_missing_local_vote(phased, n_var, n_haps, full_chip_ref_bm, n_ref, target_geno,
                 hmm_fill, nocall_k);
         }
-        for g in phased.iter_mut() { if *g > 1 { *g = 0; } }
+        phased.par_iter_mut().for_each(|g| if *g > 1 { *g = 0; });
     };
 
     // Slot 0: the Viterbi solve held in the graphs (the committed default phase).
     let final_src: Vec<(Vec<u8>, Vec<u8>)> = graphs.iter().map(|g| g.extract_haplotypes()).collect();
     let mut scaffolds: Vec<Vec<u8>> = Vec::with_capacity(n_members);
-    scaffolds.push(build_scaffold(&final_src));
+    scaffolds.push(build_scaffold(&final_src, &mut rare_scaffold_bm));
     drop(final_src);
 
     // Slots 1..n_members: thinned Main samples, spread evenly across the Main
     // iterations (`keep_main`, in slot order).
     if n_members > 1 {
         for &it in &keep_main {
-            scaffolds.push(build_scaffold(main_capture.get(it)));
+            scaffolds.push(build_scaffold(main_capture.get(it), &mut rare_scaffold_bm));
         }
     }
     drop(main_capture);
+    drop(rare_scaffold_bm);
     // Fill the members' no-calls concurrently, but never with more scratch than
     // the former one-member-at-a-time fill held at the same point. That fill's
     // workspace was `a`, `alleles`, `inv` and the per-marker partition buffer
@@ -789,7 +821,7 @@ mod tests {
             let (map_bp, map_cm) = (vec![bp[0], bp[n_var - 1]], vec![0.0, (n_var - 1) as f64 * 0.05]);
             let common = scaffold::select(&target_geno, n_var, n_samples, Some(&full), scaffold::Source::Union, 0.001, None).indices;
             let phase = |geno: &[u8], n: usize, reps: usize| diploid_phase_bm_prefiltered(
-                geno, pbwt_neighbor::HaplotypeBitmatrix::from_subset(&full, &common), &common, Some(&full),
+                geno, pbwt_neighbor::HaplotypeBitmatrix::from_subset(&full, &common), &common, phase_rare::RareRef::Full(&full),
                 &[], &bp, &[], &map_bp, &map_cm, n_var, n, n_ref, 11 + seed as i64, 4, 0, 2, None, reps);
             let got = phase(&target_geno, n_samples, k);
             let repeated = replicas::replicate_rows(&target_geno, n_var, n_tgt, k);

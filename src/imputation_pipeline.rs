@@ -379,7 +379,7 @@ fn run_phasing(inp: &PhasingInputs) -> PhasingResult {
             false
         } else { true }
     };
-    let ref_bm_full = if want_full {
+    let mut ref_bm_full = if want_full {
         let bm = srp.extract_ref_alleles_bitmatrix(wgs_idx);
         selphi_step!("Ref bitmatrix extracted ({} target sites × {} haps, {:.1} MB)",
             n_chip, n_ref, (bm.n_words() * n_chip * 8) as f64 / 1e6);
@@ -450,11 +450,31 @@ male chrX): phasing on all {} called sites", scaffold.indices.len());
         selphi_step!("Common ref subset ({} / {} variants, {:.1} MB)",
             common_chip_indices.len(), n_chip,
             (common_ref_bm.n_words() * common_chip_indices.len() * 8) as f64 / 1e6);
-        // Pass the full-chip ref bitmatrix (if available) so phase_rare
-        // can weave the reference panel into its PBWT context. In the
-        // phase-only diploid path `ref_bm_full` is `None` (we only
-        // extract the common subset to save RAM); phase_rare falls
-        // back to target-only.
+        // phase_rare weaves the reference panel into its PBWT when the chip-site
+        // matrix was built (otherwise it runs target-only). At the scaffold sites it
+        // reads the panel from `common_ref_bm` (carried through phase_common), so
+        // past this point the full matrix is needed only at phase_rare's own sites,
+        // by the no-call fill, and by imputation. On --phase-only with no no-call,
+        // keep the panel at the rare sites alone and release the full matrix before
+        // phase_common: the votes are identical and the run never holds the matrix
+        // and the MCMC at once.
+        let rare_rows = match ref_bm_full.as_ref() {
+            Some(full) if args.phase_only && !targ_alleles.iter().any(|&g| g > 1) => {
+                let sites = selphi::diploid::phase_rare::rare_sites(
+                    targ_alleles, n_chip, n_samples, &common_chip_indices);
+                let rows = selphi::diploid::pbwt_neighbor::HaplotypeBitmatrix::from_subset(full, &sites);
+                selphi_step!("Phase-only: panel kept at the {} rare sites ({:.1} MB), chip-site matrix released",
+                    sites.len(), (rows.n_words() * sites.len() * 8) as f64 / 1e6);
+                Some(rows)
+            }
+            _ => None,
+        };
+        if rare_rows.is_some() { ref_bm_full = None; }
+        let rare_ref = match (rare_rows.as_ref(), ref_bm_full.as_ref()) {
+            (Some(rows), _) => selphi::diploid::phase_rare::RareRef::Rows(rows),
+            (None, Some(full)) => selphi::diploid::phase_rare::RareRef::Full(full),
+            (None, None) => selphi::diploid::phase_rare::RareRef::None,
+        };
         // Intra-run phase ensemble member count: resolved by the caller (see
         // ensemble::resolve_members for the cohort-size cap and why it exists).
         if replicas > 1 {
@@ -473,7 +493,7 @@ male chrX): phasing on all {} called sites", scaffold.indices.len());
         }
         let mut dp = selphi::diploid::diploid_phase_bm_prefiltered(
             targ_alleles, common_ref_bm, &common_chip_indices,
-            ref_bm_full.as_ref(),
+            rare_ref,
             raw_chip_cm, chip_bps,
             &ref_bp, &map_bp_raw, &map_cm_raw,
             n_chip, n_samples, n_ref,

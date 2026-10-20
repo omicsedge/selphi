@@ -445,7 +445,8 @@ e.g. a male chrX): phasing on all {} called sites", scaffold.indices.len());
     // interpolation by imputation::ensemble. With phasing replicas every
     // copy contributes its `n_members` (copy 0's solve first).
     let mut scaffolds = selphi::diploid::diploid_phase_bm_prefiltered(
-        &targ_alleles, common_ref_bm, &common_chip_indices, Some(&ref_bm),
+        &targ_alleles, common_ref_bm, &common_chip_indices,
+        selphi::diploid::phase_rare::RareRef::Full(&ref_bm),
         raw_chip_cm, chip_bps, &ref_bp, &map_bp_raw, &map_cm_raw,
         n_chip, n_samples, n_ref,
         config.seed, config.threads, config.max_cond_haps, n_members,

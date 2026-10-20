@@ -177,6 +177,32 @@ impl HaplotypeBitmatrix {
         Self { bits, n_sites, n_haps, n_words }
     }
 
+    /// Overwrite haplotypes `[0, n_low)` of every site from bytes (`src(site)`, at
+    /// least `n_low` of them; nonzero = 1), leaving haplotypes `>= n_low` as they
+    /// are. Parallel over sites.
+    pub fn overwrite_low_bits<'s, F>(&mut self, n_low: usize, src: F)
+    where F: Fn(usize) -> &'s [u8] + Sync {
+        assert!(n_low <= self.n_haps);
+        let n_words = self.n_words;
+        if n_words == 0 || n_low == 0 { return; }
+        let full = n_low / 64;
+        let rem = n_low % 64;
+        self.bits.par_chunks_mut(n_words).enumerate().for_each(|(site, row)| {
+            let bytes = &src(site)[..n_low];
+            for (w, chunk) in bytes.chunks_exact(64).enumerate() {
+                let mut word = 0u64;
+                for (i, &b) in chunk.iter().enumerate() { word |= ((b != 0) as u64) << i; }
+                row[w] = word;
+            }
+            if rem > 0 {
+                let mut word = 0u64;
+                for (i, &b) in bytes[full * 64..].iter().enumerate() { word |= ((b != 0) as u64) << i; }
+                let low = (1u64 << rem) - 1;
+                row[full] = (row[full] & !low) | word;
+            }
+        });
+    }
+
     /// Update a single haplotype across ALL sites from a contiguous allele vec.
     /// alleles[site] = 0 or 1 (u8), contiguous layout (L2-friendly).
     pub fn update_hap_all_from_vec(&mut self, hap: usize, alleles: &[u8]) {

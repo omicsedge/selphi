@@ -1147,6 +1147,8 @@ impl MainCapture {
 /// Memory-efficient entry: target_haps (small) + ref bitmatrix (compact).
 /// Builds combined bitmatrices directly without 8GB intermediate flat array.
 /// Bitmatrix-native entry: takes unified bitmatrix directly (no byte arrays).
+/// Returns it: its target bits hold the last iteration's sample, its panel bits
+/// (haplotypes `n_haps..`) are untouched, which is what `phase_rare` reads.
 pub fn run_phase_common_bm(
     graphs: &mut [GenotypeGraph],
     mut hap_bm: HaplotypeBitmatrix,
@@ -1173,7 +1175,7 @@ pub fn run_phase_common_bm(
     // `n_samples / replicas` originals, replica-major, none of which may condition on
     // another copy of itself. 1 = no replicas.
     replicas: usize,
-) {
+) -> HaplotypeBitmatrix {
     let t_setup = std::time::Instant::now();
     // SELPHI_DIPLOID_DISPATCH_DIAG: per-run counters (see hmm_segment.rs).
     if rare_dispatch_diag() {
@@ -1340,6 +1342,9 @@ pub fn run_phase_common_bm(
     );
 
     crate::selphi_debug!("  [diploid] phase_common complete");
+    // Handed back for phase_rare: only target bits [0, n_haps) were ever written,
+    // so bits [n_haps, n_haps_total) are still the panel at the scaffold sites.
+    hap_bm
 }
 
 fn _run_iterations(

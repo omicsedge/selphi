@@ -334,6 +334,24 @@ pub(crate) fn pbwt_split_i32_tracked(
     u
 }
 
+/// Untracked [`pbwt_split_i32_tracked`]: one PBWT radix split of prefix `a` and
+/// divergence `c` (running maximum, restarted at 0 in each bucket, new buckets
+/// starting at `site`) by the bits of `row`. Used by `phase_rare`'s sweeps.
+/// Returns the size of the 0-allele bucket.
+pub(crate) fn pbwt_split_i32(
+    row: &[u64], a: &mut [i32], c: &mut [i32], b: &mut [i32], d: &mut [i32], site: i32,
+) -> usize {
+    let n_hap = a.len();
+    assert!(c.len() == n_hap && b.len() >= n_hap && d.len() >= n_hap);
+    assert!(row.len() * 64 >= n_hap && site >= 0);
+    // SAFETY: lengths checked above; `a` is a permutation of 0..n_hap so every
+    // bit index is inside `row`; no tracking (null `tpos`, n_track 0).
+    unsafe {
+        pbwt_split::<i32, false>(row.as_ptr(), n_hap, a.as_mut_ptr(), c.as_mut_ptr(),
+            b.as_mut_ptr(), d.as_mut_ptr(), site, 0, std::ptr::null_mut())
+    }
+}
+
 /// Prefix-only PBWT step (no divergence): stably partition `a` by the bits of
 /// `key`, 0-bit entries first, in one branch-free pass (0-bucket in place,
 /// 1-bucket via `b`, appended). With `track`, the new position of every
