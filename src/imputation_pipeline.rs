@@ -402,7 +402,7 @@ fn run_phasing(inp: &PhasingInputs) -> PhasingResult {
         // no panel haplotype carries and the cohort carries once go to phase_rare. It
         // reads the same chip-site panel bitmatrix, and phase_rare needs that matrix to
         // vote with the panel, so where it is not built the routing is off too.
-        let private_on = selphi::diploid::scaffold::PrivateRare::enabled();
+        let private_on = selphi::diploid::scaffold::PrivateRare::enabled_for(chip_bps);
         let panel_bm = if source.needs_panel() || private_on { ref_bm_full.as_ref() } else { None };
         if source.needs_panel() && panel_bm.is_none() {
             // The phase-only path builds the chip-site panel bitmatrix only under

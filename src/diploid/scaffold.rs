@@ -91,8 +91,24 @@ pub struct PrivateRare<'a> {
 }
 
 impl PrivateRare<'_> {
-    /// `SELPHI_DIPLOID_PRIVATE_RARE=1`.
-    pub fn enabled() -> bool { crate::config::is_one("SELPHI_DIPLOID_PRIVATE_RARE") }
+    /// `SELPHI_DIPLOID_PRIVATE_RARE`: `1` on, `0` off; unset (the default) = on when the chip sites are at
+    /// WGS density (sites per Mb >= `SELPHI_AUTOROUTE_WGS_DENSITY`, the autoroute line), off on arrays, whose
+    /// handful of panel-absent sites only perturbs the chain (MESA x TOPMed: 2 of 15,365 sites, seed-level noise).
+    pub fn enabled_for(chip_bp: &[i64]) -> bool {
+        match crate::config::raw("SELPHI_DIPLOID_PRIVATE_RARE").as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => at_wgs_density(chip_bp),
+        }
+    }
+}
+
+/// Whether `bp` (ascending positions of the chip sites) is at least as dense as the autoroute WGS line.
+fn at_wgs_density(bp: &[i64]) -> bool {
+    if bp.len() < 2 { return false; }
+    let span = bp[bp.len() - 1] - bp[0];
+    if span <= 0 { return false; }
+    bp.len() as f64 * 1.0e6 / span as f64 >= crate::config::f64_or("SELPHI_AUTOROUTE_WGS_DENSITY", 1000.0)
 }
 
 /// The selected scaffold.
@@ -324,4 +340,14 @@ mod tests {
         assert_eq!(u.n_private, 1);
         assert!(!u.widened);
     }
+    #[test]
+    fn private_rare_default_follows_wgs_density() {
+        // 3 sites over 2 Mb = 1.5/Mb (array) vs 3,001 sites over 1 Mb (WGS); explicit 0/1 handled by enabled_for.
+        assert!(!super::at_wgs_density(&[1_000_000, 2_000_000, 3_000_000]));
+        let wgs: Vec<i64> = (0..3001).map(|i| 1_000_000 + i as i64 * 333).collect();
+        assert!(super::at_wgs_density(&wgs));
+        assert!(!super::at_wgs_density(&[5]));
+        assert!(!super::at_wgs_density(&[5, 5]));
+    }
+
 }

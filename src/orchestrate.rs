@@ -398,7 +398,7 @@ fn phase_chr(
     let scaffold_maf = selphi::config::f32_or("SELPHI_DIPLOID_SCAFFOLD_MAF", 0.001);
     // SELPHI_DIPLOID_PRIVATE_RARE=1: panel-absent singleton hets go to phase_rare
     // (diploid::scaffold module docs); this path always holds the chip-site matrix.
-    let private_on = selphi::diploid::scaffold::PrivateRare::enabled();
+    let private_on = selphi::diploid::scaffold::PrivateRare::enabled_for(chip_bps);
     let scaffold = selphi::diploid::scaffold::select(
         &targ_alleles, n_chip, n_samples, Some(&ref_bm),
         selphi::diploid::scaffold::Source::from_env(), scaffold_maf,
