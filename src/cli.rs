@@ -105,9 +105,32 @@ pub struct Args {
     #[arg(long)]
     pub region: Option<String>,
 
-    /// Force phasing even if input is already phased (re-phase for better accuracy)
+    /// Re-phase an already phased input and IGNORE its phase: the ensemble members are the
+    /// re-phasing chain's alone. (By default a phased input is re-phased and each sample's
+    /// own phase is kept as ensemble member 0 when it agrees with the chain's; see
+    /// --keep-input-phase and --trust-input-phase.) With --phase-only it is what makes a
+    /// phased input be phased at all.
     #[arg(long, alias = "force-unphased")]
     pub force_phasing: bool,
+
+    /// Phased input: impute on the phase given, without phasing. By default a phased
+    /// input is re-phased and, per sample, its own phase is kept as ensemble member 0
+    /// (the chain's Viterbi solve as member 1) when at most SELPHI_INPUT_PHASE_GATE
+    /// (0.05) of its consecutive heterozygous pairs disagree with the chain's phase;
+    /// otherwise the sample gets the chain's members, as under --force-phasing. Imputing
+    /// on a given phase as it is scored below re-phasing on every rig measured (801 chip
+    /// samples, chr22: a Beagle-phased input .4796 OVERALL R2 imputed as given, .4866
+    /// re-phased), so this is for runs that must impute on one fixed phase
+    /// (equal-phasing comparisons) or skip the phasing time. No effect on unphased input.
+    #[arg(long, conflicts_with_all = ["trust_input_phase", "force_phasing"])]
+    pub keep_input_phase: bool,
+
+    /// Phased input: re-phase, and keep every sample's own phase as ensemble member 0
+    /// whatever its disagreement with the chain's (no gate). For a phase known to be
+    /// good; a bad one costs accuracy (Beagle + 10% extra switches: .4655 against .4866
+    /// for the chain alone, 801 chip samples, chr22). No effect on unphased input.
+    #[arg(long, conflicts_with = "force_phasing")]
+    pub trust_input_phase: bool,
 
     /// Low-coverage WGS mode. Input VCF/BCF must have a PL FORMAT field
     /// (Phred-scaled genotype likelihoods, typically produced by
@@ -513,6 +536,15 @@ pub struct Args {
     pub build: BuildArg,
 }
 
+impl Args {
+    /// How a phased input's own phase is used (`--keep-input-phase`,
+    /// `--trust-input-phase`, `--force-phasing`, or the gated default).
+    pub fn input_phase(&self) -> selphi::imputation::input_phase::InputPhase {
+        selphi::imputation::input_phase::InputPhase::resolve(
+            self.keep_input_phase, self.trust_input_phase, self.force_phasing)
+    }
+}
+
 /// The emission error floor when `--p-err` is not given (the adaptive floor's base).
 pub const DEFAULT_P_ERR: f64 = 0.025;
 
@@ -537,4 +569,25 @@ pub enum BuildArg {
     Grch37,
     #[value(alias = "hg38")]
     Grch38,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+    use selphi::imputation::input_phase::InputPhase;
+
+    #[test]
+    fn input_phase_flags_resolve_and_conflict() {
+        let p = |a: &[&str]| Args::try_parse_from(std::iter::once("selphi").chain(a.iter().copied()));
+        assert_eq!(p(&["--keep-input-phase"]).unwrap().input_phase(), InputPhase::Keep);
+        assert_eq!(p(&["--trust-input-phase"]).unwrap().input_phase(), InputPhase::Trust);
+        assert_eq!(p(&["--force-phasing"]).unwrap().input_phase(), InputPhase::Ignore);
+        assert!(matches!(p(&[]).unwrap().input_phase(), InputPhase::Gate(_)));
+        for bad in [["--keep-input-phase", "--trust-input-phase"], ["--keep-input-phase", "--force-phasing"],
+                    ["--trust-input-phase", "--force-phasing"]] {
+            let e = p(&bad).unwrap_err();
+            assert_eq!(e.kind(), clap::error::ErrorKind::ArgumentConflict, "{bad:?}");
+        }
+    }
 }

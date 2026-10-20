@@ -329,6 +329,9 @@ struct PhasingInputs<'a> {
     /// Phasing RNG seed for this run. Normally `args.seed`; the phase-ensemble
     /// path overrides it per ensemble member (`args.seed + i`).
     seed: i64,
+    /// Members this chain produces (its Viterbi solve plus `n_members - 1` thinned Main
+    /// MCMC samples), resolved by the caller.
+    n_members: usize,
 }
 
 /// Phasing pipeline result. `ref_bm_full` is `None` only for phase-only
@@ -350,10 +353,9 @@ struct PhasingResult {
 fn run_phasing(inp: &PhasingInputs) -> PhasingResult {
     let PhasingInputs {
         args, srp, map_path, targ_alleles, raw_chip_cm, chip_bps,
-        ref_positions, wgs_idx, n_chip, n_samples, n_ref, ped_locked, seed,
+        ref_positions, wgs_idx, n_chip, n_samples, n_ref, ped_locked, seed, n_members,
     } = *inp;
 
-    selphi_step!("Input is unphased — running phasing pipeline...");
     let (map_bp_raw, map_cm_raw) = genmap::load_genetic_map_for(Path::new(map_path), Some(srp.chromosome()))
         .unwrap_or_else(|e| { selphi_error!("Cannot read genetic map {}: {}", map_path, e); std::process::exit(1); });
     let ref_bp: Vec<i64> = ref_positions.to_vec();
@@ -450,14 +452,8 @@ male chrX): phasing on all {} called sites", scaffold.indices.len());
         // phase-only diploid path `ref_bm_full` is `None` (we only
         // extract the common subset to save RAM); phase_rare falls
         // back to target-only.
-        // Intra-run phase ensemble member count — see ensemble::resolve_members
-        // for the cohort-size cap and why it exists.
-        let n_members = if selphi::imputation::ensemble::independent_chains().is_some() { 1 } else {
-            selphi::imputation::ensemble::resolve_members(
-                n_samples, args.phase_ensemble,
-                args.sample_batch_size > 0 || args.phase_only,
-            )
-        };
+        // Intra-run phase ensemble member count: resolved by the caller (see
+        // ensemble::resolve_members for the cohort-size cap and why it exists).
         if n_members > 1 {
             selphi_step!("Diploid intra-run phase ensemble: {} members (1× phasing)", n_members);
             if n_samples > selphi::imputation::ensemble::ENSEMBLE_COSTLY_ABOVE {
@@ -973,10 +969,18 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // heavy allocation. Otherwise we wrap the heavy work in a sub-pool
     // sized to the safe thread count (rayon's global pool was already
     // initialised to args.threads in main.rs).
-    let needs_phasing_estimate = !is_phased || args.force_phasing;
+    // A phased input is re-phased unless --keep-input-phase (imputation::input_phase);
+    // --phase-only phases one only under --force-phasing, as it always has.
+    let input_phase = args.input_phase();
+    let rephase_phased = if args.phase_only { args.force_phasing } else {
+        input_phase.rephases(selphi::imputation::input_phase::any_heterozygote(&target_genotypes, &target_idx))
+    };
+    let needs_phasing = !is_phased || rephase_phased;
+    // The given phase can become an ensemble member only when a phased input is imputed.
+    let given_used = is_phased && needs_phasing && !args.phase_only && input_phase.uses_given();
     let _effective_threads = selphi::log::estimate_and_warn_with_mc(
         n_chip, n_ref, srp.n_variants(), n_samples, args.threads, effective_mc,
-        target_batch_size_haps_estimate, needs_phasing_estimate,
+        target_batch_size_haps_estimate, needs_phasing,
     );
 
     // 5. Extract target alleles at chip sites (before ref — needed for MAF filter).
@@ -985,7 +989,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // gap vs Beagle. The diploid engine's build_graph marks 128 sites missing (set_missing →
     // run_mis HMM imputes). After phasing the imputed alleles replace these.
     // The MAF-filter AC sums below MASK 128. Impute-only (no phasing) stays 0 → byte-identical.
-    let miss_val_extract: u8 = if needs_phasing_estimate { 128 } else { 0 };
+    let miss_val_extract: u8 = if needs_phasing { 128 } else { 0 };
     let targ_alleles = extract_target_alleles(&target_genotypes, &target_idx, n_chip, n_haps, &allele_transforms, miss_val_extract);
 
     // 6. Genetic map
@@ -1027,8 +1031,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         Some(genmap::cumulative_cm_floored(&map_bp_raw, &map_cm_raw, &ref_positions))
     } else { None };
 
-    // 6b. Phase if input is unphased (in-memory fusion — no VCF round-trip)
-    let needs_phasing = !is_phased || args.force_phasing;
+    // 6b. Phase (in-memory fusion — no VCF round-trip)
     let mut targ_alleles = targ_alleles;
     let ped_locked = crate::prephase::apply_pedigree_prephase(
         args.ped.as_deref(), needs_phasing, &mut targ_alleles,
@@ -1070,19 +1073,35 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         }
         1
     };
-    // Keep the unphased target for the extra ensemble members (phasing consumes
+    // Members of the one phasing chain (Viterbi solve + thinned Main samples); see
+    // ensemble::resolve_members for the cohort-size cap and why it exists.
+    let intra_n = if !needs_phasing || selphi::imputation::ensemble::independent_chains().is_some() { 1 } else {
+        selphi::imputation::ensemble::resolve_members(
+            n_samples, args.phase_ensemble, args.sample_batch_size > 0 || args.phase_only)
+    };
+    // The run imputes from `n_members`; with a phased input's own phase in it
+    // (imputation::input_phase) the chain may need one fewer (--trust-input-phase).
+    let n_members = if intra_n > 1 { intra_n } else { ensemble_n };
+    let n_chain = input_phase.chain_members(n_members, given_used);
+    let (intra_chain, indep_chain) = if intra_n > 1 { (n_chain, 1) } else { (1, n_chain) };
+    // Keep the unphased target for the extra independent chains (phasing consumes
     // a phased copy into `targ_alleles`).
-    let unphased_for_ensemble = if ensemble_n > 1 { Some(targ_alleles.clone()) } else { None };
-    // SELPHI_ENSEMBLE_INPUT_PHASE (experimental): when a phased input is re-phased (--force-phasing),
-    // its own phase joins the ensemble, so the dosages average the given phase with the chain's. Its
-    // no-calls (128) take the chain's imputed allele once phasing has run. `1` appends it after the
-    // chain's members; `2` makes it member 0, so the output haplotypes follow the given phase.
-    let input_phase_mode = selphi::config::raw("SELPHI_ENSEMBLE_INPUT_PHASE");
-    let input_phase_first = input_phase_mode.as_deref() == Some("2");
-    let input_phase_member = if is_phased && args.force_phasing && !args.phase_only
-        && matches!(input_phase_mode.as_deref(), Some("1") | Some("2")) { Some(targ_alleles.clone()) } else { None };
+    let unphased_for_ensemble = if indep_chain > 1 { Some(targ_alleles.clone()) } else { None };
     if ensemble_n > 1 {
         selphi_step!("Phase-ensemble: {} members (seeds {}..{})", ensemble_n, args.seed, args.seed + ensemble_n as i64 - 1);
+    }
+    if needs_phasing {
+        if !is_phased {
+            selphi_step!("Input is unphased — running phasing pipeline...");
+        } else {
+            match input_phase {
+                _ if !given_used => selphi_step!("Input is phased — re-phasing it, its phase not used (--force-phasing)"),
+                selphi::imputation::input_phase::InputPhase::Trust => selphi_step!(
+                    "Input is phased — re-phasing it; every sample keeps its given phase as ensemble member 0 (--trust-input-phase)"),
+                _ => selphi_step!("Input is phased — re-phasing it; a sample keeps its given phase as ensemble member 0 \
+when it agrees with the re-phased one (--keep-input-phase imputes on the given phase, --force-phasing ignores it)"),
+            }
+        }
     }
 
     let (targ_alleles, ref_bm_from_phasing, extra_phased) = if needs_phasing {
@@ -1091,6 +1110,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
             targ_alleles: &targ_alleles, raw_chip_cm: &raw_chip_cm, chip_bps: &chip_bps,
             ref_positions: &ref_positions, wgs_idx: &wgs_idx,
             n_chip, n_samples, n_ref, ped_locked: ped_locked.as_deref(), seed: args.seed,
+            n_members: intra_chain,
         });
 
         if args.phase_only {
@@ -1123,34 +1143,43 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
             intra
         } else if let Some(unph) = unphased_for_ensemble.as_ref() {
             selphi_step!("Phase-ensemble: phasing {} extra members in parallel (seeds {}..{})",
-                ensemble_n - 1, args.seed + 1, args.seed + ensemble_n as i64 - 1);
-            (1..ensemble_n).into_par_iter().map(|i| {
+                indep_chain - 1, args.seed + 1, args.seed + indep_chain as i64 - 1);
+            (1..indep_chain).into_par_iter().map(|i| {
                 let m_seed = args.seed + i as i64;
                 run_phasing(&PhasingInputs {
                     args, srp: &srp, map_path,
                     targ_alleles: unph, raw_chip_cm: &raw_chip_cm, chip_bps: &chip_bps,
                     ref_positions: &ref_positions, wgs_idx: &wgs_idx,
                     n_chip, n_samples, n_ref, ped_locked: ped_locked.as_deref(), seed: m_seed,
+                    n_members: 1,
                 }).phased_alleles
             }).collect()
         } else {
             Vec::new()
         };
-        let mut extra_phased = extra_phased;
-        if let Some(mut given) = input_phase_member {
-            for (a, &p) in given.iter_mut().zip(pr.phased_alleles.iter()) {
-                if *a == 128 { *a = p; }
+        drop(unphased_for_ensemble);
+        if given_used {
+            // The phasing input is no longer needed; the given phase is rebuilt from the
+            // target genotypes (never held through the phasing peak).
+            drop(targ_alleles);
+            let given = selphi::imputation::input_phase::given_alleles(
+                &target_genotypes, &target_idx, n_chip, n_haps, &allele_transforms, &haploid_resets);
+            let mut chain = Vec::with_capacity(extra_phased.len() + 1);
+            chain.push(pr.phased_alleles);
+            chain.extend(extra_phased);
+            let (members, choice) = selphi::imputation::input_phase::apply(
+                chain, given, input_phase, n_members, n_chip, n_haps);
+            selphi_step!("{}", choice.summary(input_phase));
+            for (s, d) in choice.disagreement.iter().enumerate() {
+                selphi_debug!("  input phase {}: {} of {} het pairs disagree -> {}", sample_names[s], d.switches, d.pairs,
+                    if choice.kept[s] { "kept" } else { "re-phased only" });
             }
-            if input_phase_first {
-                selphi_step!("Input phase kept as ensemble member 1 of {} (SELPHI_ENSEMBLE_INPUT_PHASE=2)", extra_phased.len() + 2);
-                let chain = std::mem::replace(&mut pr.phased_alleles, given);
-                extra_phased.insert(0, chain);
-            } else {
-                selphi_step!("Input phase kept as ensemble member {} (SELPHI_ENSEMBLE_INPUT_PHASE)", extra_phased.len() + 2);
-                extra_phased.push(given);
-            }
+            let mut members = members.into_iter();
+            let m0 = members.next().expect("at least one member");
+            (m0, pr.ref_bm_full, members.collect())
+        } else {
+            (pr.phased_alleles, pr.ref_bm_full, extra_phased)
         }
-        (pr.phased_alleles, pr.ref_bm_full, extra_phased)
     } else {
         if args.phase_only {
             selphi_info!("WARNING: --phase-only requested but input is already phased. Nothing to do (pass --force-phasing to re-phase).");
@@ -1161,7 +1190,11 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         // target line. That silence is how data/target/chr22_801s_chip_unphased.vcf.gz
         // — pipes, despite the name — came to be used as the byte-identity gate for
         // PHASING changes it could not possibly exercise.
-        selphi_step!("Input is already phased — phasing SKIPPED (pass --force-phasing to re-phase)");
+        if input_phase == selphi::imputation::input_phase::InputPhase::Keep {
+            selphi_step!("Input is already phased — phasing SKIPPED (--keep-input-phase)");
+        } else {
+            selphi_step!("Input has no heterozygous call at the panel sites — nothing to phase, phasing SKIPPED");
+        }
         (targ_alleles, None, Vec::new())
     };
 

@@ -37,7 +37,9 @@ pub struct MultiChrImputeConfig {
     /// `--p-err` given: a fixed emission floor (no adaptive floor).
     pub p_err_fixed: bool,
     pub no_ap: bool,
-    pub force_phasing: bool,
+    /// How a phased input's own phase is used (`--keep-input-phase`, `--trust-input-phase`,
+    /// `--force-phasing`, or the gated default); see `imputation::input_phase`.
+    pub input_phase: selphi::imputation::input_phase::InputPhase,
     /// `--max-cond-haps`: cap on conditioning haps for diploid phasing (0 = unlimited).
     pub max_cond_haps: usize,
     /// User-set PBWT flank sizes (`--fl-fwd`/`--fl-bwd`). `None` = auto-derive from
@@ -100,7 +102,7 @@ impl MultiChrImputeConfig {
             p_err: args.p_err.unwrap_or(crate::cli::DEFAULT_P_ERR),
             p_err_fixed: args.p_err.is_some(),
             no_ap: args.no_ap,
-            force_phasing: args.force_phasing,
+            input_phase: args.input_phase(),
             max_cond_haps: args.max_cond_haps,
             fl_fwd: args.fl_fwd,
             fl_bwd: args.fl_bwd,
@@ -358,7 +360,8 @@ fn precompute_candidates_for(
 /// each chr; it mirrors `run_phasing` (imputation_pipeline.rs).
 /// When `needs_phasing` is false the input `targ_alleles` are returned unchanged.
 /// A chromosome with no called target genotype has nothing to phase: its alleles
-/// are returned unphased, see [`unphased_passthrough`].
+/// are returned unphased, see [`unphased_passthrough`]. The last value says whether
+/// the phasing engine ran.
 #[allow(clippy::too_many_arguments)]
 fn phase_chr(
     needs_phasing: bool,
@@ -375,9 +378,9 @@ fn phase_chr(
     n_members: usize,
     ped_locked: Option<&[bool]>,
     config: &MultiChrImputeConfig,
-) -> (Vec<u8>, Vec<Vec<u8>>, Option<selphi::common::HaplotypeBitmatrix>) {
+) -> (Vec<u8>, Vec<Vec<u8>>, Option<selphi::common::HaplotypeBitmatrix>, bool) {
     if !needs_phasing {
-        return (targ_alleles, Vec::new(), None);
+        return (targ_alleles, Vec::new(), None, false);
     }
     let (map_bp_raw, map_cm_raw) = multi_map.get(
         chr_name.strip_prefix("chr").unwrap_or(chr_name)
@@ -415,7 +418,7 @@ e.g. a male chrX): phasing on all {} called sites", scaffold.indices.len());
     let common_chip_indices = scaffold.indices;
     if common_chip_indices.is_empty() {
         selphi_info!("    Phasing: no called target genotype on this chromosome; nothing to phase, its genotypes are imputed as they are");
-        return (unphased_passthrough(targ_alleles), Vec::new(), Some(ref_bm));
+        return (unphased_passthrough(targ_alleles), Vec::new(), Some(ref_bm), false);
     }
     selphi_info!("    Phasing: diploid engine ({} / {} common-MAF variants)",
         common_chip_indices.len(), n_chip);
@@ -438,7 +441,7 @@ e.g. a male chrX): phasing on all {} called sites", scaffold.indices.len());
         selphi_info!("    Phase ensemble: {} members from one phasing chain",
             scaffolds.len() + 1);
     }
-    (member0, scaffolds, Some(ref_bm))
+    (member0, scaffolds, Some(ref_bm), true)
 }
 
 /// The target alleles of a chromosome that phasing leaves alone because no
@@ -507,7 +510,8 @@ pub fn run_multi_chr(
     let n_haps = n_samples * 2;
     // ROOT-CAUSE FIX (multi-chr): encode missing as 128 when phasing will run so the engine
     // IMPUTES it instead of conditioning on a false hom-REF; 0 for impute-only (byte-identical).
-    let mc_miss_val: u8 = if !is_phased || config.force_phasing { 128 } else { 0 };
+    // (A chromosome that turns out not to be phased takes the impute-only 0 below.)
+    let mc_miss_val: u8 = if !is_phased || config.input_phase.rephases(true) { 128 } else { 0 };
     selphi_info!("  target: {} samples, {} chromosomes, phased={}",
         n_samples, target_by_chr.len(), is_phased);
     // Target chromosomes the panel lacks (chrY, MT, unplaced contigs): written after the
@@ -731,26 +735,40 @@ pub fn run_multi_chr(
         let chr_key = chr_name.strip_prefix("chr").unwrap_or(chr_name);
         let chr_phased = is_phased || target_by_chr.get(chr_key).or_else(|| target_by_chr.get(chr_name.as_str()))
             .is_some_and(|(m, _)| !target_idx.iter().any(|&ti| m[ti].unphased_het));
-        let needs_phasing = !chr_phased || config.force_phasing;
+        // A phased chromosome is re-phased unless --keep-input-phase; its own phase can
+        // then become ensemble member 0 per sample (imputation::input_phase).
+        let chr_genotypes: &[Vec<[u8; 2]>] = {
+            let key = chr_name.strip_prefix("chr").unwrap_or(chr_name);
+            target_by_chr.get(key).or_else(|| target_by_chr.get(chr_name))
+                .map(|(_, g)| g.as_slice()).unwrap_or(&[])
+        };
+        let needs_phasing = !chr_phased || config.input_phase.rephases(
+            selphi::imputation::input_phase::any_heterozygote(chr_genotypes, &target_idx));
+        let given_used = chr_phased && needs_phasing && config.input_phase.uses_given();
         // The alleles were extracted with the phasing-path missing sentinel (128) when
         // the FILE needed phasing; a chromosome that does not takes the impute-only 0.
         if !needs_phasing && mc_miss_val == 128 {
             for a in targ_alleles.iter_mut() { if *a == 128 { *a = 0; } }
         }
-        if !needs_phasing && (chr_idx == 0 || !is_phased) {
+        if !needs_phasing {
             // Same warning as the single-chr path: a pipe-separated target skips the
             // phasing engine, and nothing else says so.
-            selphi_step!("Input is already phased — phasing SKIPPED (pass --force-phasing to re-phase)");
+            if config.input_phase == selphi::imputation::input_phase::InputPhase::Keep {
+                if chr_idx == 0 || !is_phased {
+                    selphi_step!("Input is already phased — phasing SKIPPED (--keep-input-phase)");
+                }
+            } else {
+                selphi_step!("No heterozygous call at the panel sites — nothing to phase, phasing SKIPPED");
+            }
         }
-        // Borrowed, never cloned: the per-chr genotype matrix is the largest
-        // per-chromosome object the target reader holds, and copying it here would
-        // add its whole size to the peak for the sake of two read-only passes.
-        let empty_geno: Vec<Vec<[u8; 2]>> = Vec::new();
-        let chr_genotypes: &[Vec<[u8; 2]>] = {
-            let key = chr_name.strip_prefix("chr").unwrap_or(chr_name);
-            target_by_chr.get(key).or_else(|| target_by_chr.get(chr_name))
-                .map(|(_, g)| g.as_slice()).unwrap_or(&empty_geno)
-        };
+        if chr_phased && needs_phasing && (chr_idx == 0 || !is_phased) {
+            selphi_step!("{}", if given_used {
+                "Input is phased — re-phasing it; a sample's given phase can stay as ensemble member 0 (see the per-chromosome line)"
+            } else { "Input is phased — re-phasing it, its phase not used (--force-phasing)" });
+        }
+        // `chr_genotypes` (above) is borrowed, never cloned: the per-chr genotype matrix is
+        // the largest per-chromosome object the target reader holds, and copying it would
+        // add its whole size to the peak for the sake of a few read-only passes.
         let ped_locked = crate::prephase::apply_pedigree_prephase(
             config.ped.as_deref(), needs_phasing, &mut targ_alleles,
             &sample_names, &target_idx, chr_genotypes,
@@ -776,13 +794,32 @@ pub fn run_multi_chr(
             site.zip(ps)
         };
 
-        // Phasing (if needed)
+        // Phasing (if needed). With a phased chromosome's own phase in the ensemble the
+        // chain may need one member fewer than the run imputes (--trust-input-phase).
         let ensemble_n = if needs_phasing { resolve_ensemble_n(config, n_samples) } else { 1 };
-        let (targ_alleles, extra_phased, ref_bm_from_phasing) = phase_chr(
+        let n_chain = config.input_phase.chain_members(ensemble_n, given_used);
+        let (targ_alleles, extra_phased, ref_bm_from_phasing, phased) = phase_chr(
             needs_phasing, &multi_map, chr_name, &srp, &wgs_idx, &raw_chip_cm,
-            &chip_bps, targ_alleles, n_chip, n_samples, n_ref, ensemble_n,
+            &chip_bps, targ_alleles, n_chip, n_samples, n_ref, n_chain,
             ped_locked.as_deref(), config,
         );
+        let (targ_alleles, extra_phased) = if given_used && phased {
+            let given = selphi::imputation::input_phase::given_alleles(
+                chr_genotypes, &target_idx, n_chip, n_haps, &transforms, &haploid_resets);
+            let mut chain = Vec::with_capacity(extra_phased.len() + 1);
+            chain.push(targ_alleles);
+            chain.extend(extra_phased);
+            let (members, choice) = selphi::imputation::input_phase::apply(
+                chain, given, config.input_phase, ensemble_n, n_chip, n_haps);
+            selphi_info!("    {}", choice.summary(config.input_phase));
+            for (s, d) in choice.disagreement.iter().enumerate() {
+                selphi_debug!("      input phase {}: {} of {} het pairs disagree -> {}", sample_names[s], d.switches, d.pairs,
+                    if choice.kept[s] { "kept" } else { "re-phased only" });
+            }
+            let mut members = members.into_iter();
+            let m0 = members.next().expect("at least one member");
+            (m0, members.collect::<Vec<_>>())
+        } else { (targ_alleles, extra_phased) };
 
         // Ref bitmatrix for imputation
         let ref_bm_imp: selphi::common::HaplotypeBitmatrix = ref_bm_from_phasing.unwrap_or_else(|| {

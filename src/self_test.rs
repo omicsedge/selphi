@@ -194,11 +194,16 @@ pub fn run(config: &SelfTestConfig) -> u32 {
         "--refpanel", refpanel, "--input", input, "--map", map, "--out", &out, &t, "--selfdecode");
 
     // 7. Pre-phased input — reuse the phase-only output (produced above with
-    // --force-phasing, so it exists regardless of input phase state).
+    // --force-phasing, so it exists regardless of input phase state). By default it
+    // is re-phased with its own phase kept per sample as an ensemble member; with
+    // --keep-input-phase it is imputed on the given phase, without phasing.
     let phased_vcf = format!("{}_phase.vcf.gz", out_base);
     let out = format!("{}_prephased", out_base);
     test!("pre-phased input",
         "--refpanel", refpanel, "--input", &phased_vcf, "--map", map, "--out", &out, &t);
+    let out = format!("{}_prephased_keep", out_base);
+    test!("pre-phased input, --keep-input-phase",
+        "--refpanel", refpanel, "--input", &phased_vcf, "--map", map, "--out", &out, &t, "--keep-input-phase");
 
     // 8. Evaluate (requires --truth)
     if let Some(truth_path) = truth {

@@ -36,6 +36,7 @@
 - [Usage](#usage)
   - [Engine selection (--engine)](#engine-selection---engine)
   - [Full pipeline (phase + impute)](#full-pipeline-phase--impute)
+  - [Phased input](#phased-input)
   - [Phase-only](#phase-only)
   - [Allele reconciliation (--allele-match)](#allele-reconciliation---allele-match)
   - [Missing genotypes](#missing-genotypes)
@@ -97,7 +98,7 @@ Selphi needs a genetic map in PLINK format (cM positions); Beagle maps work dire
 
 ## Usage
 
-Input is a standard VCF or BCF, phased (`0|1`) or unphased (`0/1`). Selphi phases the input when any sample has a heterozygous call written with `/` (homozygous and haploid calls carry no phase and do not count); `--force-phasing` re-phases an already phased input. A haploid call (a male's chrX `1`, chrY, MT) is read as the homozygote, as Beagle and `bcftools +fixploidy` do. Windows line endings are accepted. A multi-allelic record is split into one biallelic marker per ALT (the `bcftools norm -m-` convention: each counts its own ALT allele); ALTs the panel lacks are written to the output as split records. When two records match the same panel variant (duplicated probes), the first is kept and the count is logged. A REF/ALT-swapped record is matched to the panel only for substitutions: an insertion and the opposite deletion at one position are different variants. Only target sites that match a panel site are used for phasing and imputation (the log reports `Shared markers: N (x% of target)`); the others are still written to the output, as given (see [Target sites absent from the panel](#target-sites-absent-from-the-panel)).
+Input is a standard VCF or BCF, phased (`0|1`) or unphased (`0/1`). Selphi phases the input when any sample has a heterozygous call written with `/` (homozygous and haploid calls carry no phase and do not count). An already phased input is phased again too, and its own phase is kept where it agrees with the new one (see [Phased input](#phased-input)). A haploid call (a male's chrX `1`, chrY, MT) is read as the homozygote, as Beagle and `bcftools +fixploidy` do. Windows line endings are accepted. A multi-allelic record is split into one biallelic marker per ALT (the `bcftools norm -m-` convention: each counts its own ALT allele); ALTs the panel lacks are written to the output as split records. When two records match the same panel variant (duplicated probes), the first is kept and the count is logged. A REF/ALT-swapped record is matched to the panel only for substitutions: an insertion and the opposite deletion at one position are different variants. Only target sites that match a panel site are used for phasing and imputation (the log reports `Shared markers: N (x% of target)`); the others are still written to the output, as given (see [Target sites absent from the panel](#target-sites-absent-from-the-panel)).
 
 ### Engine selection (`--engine`)
 
@@ -114,6 +115,16 @@ selphi \
   --threads 16
 ```
 
+### Phased input
+
+Imputing on the phase an input arrives with scores below re-phasing it: on 801 1000 Genomes array samples (chromosome 22, 1000 Genomes panel) a Beagle-phased input gives OVERALL R² 0.4796 imputed on its phase and 0.4866 re-phased, and the re-phased result does not depend on the input phase. Keeping a good given phase as one phase-ensemble member, with the re-phased solution as the other, scores higher still (0.4896 Beagle-phased, 0.4898 SHAPEIT5-phased; chromosome 1 +0.0089 over the given phase, 801 of 801 samples up), whereas a poor one lowers the result (Beagle's phase with 10% extra switches: 0.4655; a random phase: 0.4051). So, by default, a phased input is re-phased and each sample is judged on its own: its given phase stays as ensemble member 0 when at most 5% of its consecutive heterozygous pairs at the panel sites have a different relative phase in the new solution (`SELPHI_INPUT_PHASE_GATE`, default 0.05; Beagle or SHAPEIT5 phase against Selphi's: 4.0%, 95th percentile 6.3%; another Selphi seed: 3.0%); otherwise the sample gets the two members an unphased input gets. A sample with fewer than 50 such pairs keeps its phase. The log reports how many samples kept their phase and the median disagreement. A kept sample's output genotypes keep the orientation of its input heterozygotes, and its no-calls are filled as an unphased input's are.
+
+- `--keep-input-phase`: impute on the given phase, without phasing (faster; for comparisons that must share one phase).
+- `--trust-input-phase`: keep the given phase for every sample, whatever its disagreement.
+- `--force-phasing`: re-phase and do not use the given phase.
+
+An input with no heterozygous call at the panel sites (a man's chromosome X imputed on its own) has no phase to keep or re-estimate and is not phased, unless `--force-phasing`. With `--sample-batch-size` there is one member: a sample that keeps its phase is imputed on it (as with `--keep-input-phase`), one that does not on the re-phased solution.
+
 ### Phase-only
 
 ```bash
@@ -125,7 +136,7 @@ selphi \
   --phase-only
 ```
 
-Phase-only needs a single-chromosome `.srp` (a multi-chromosome SRP or `--refpanel-dir` is refused). Already-phased input skips phasing, so with `--phase-only` it writes nothing unless you add `--force-phasing`. Whether the input is phased is decided on the records that match the panel: records absent from the panel are written back as given and never phased, so an unphased heterozygote there (as a phase-only output carries) does not trigger re-phasing. The order in which an unphased call lists its alleles (`1/0` or `0/1`) carries no information and does not affect the result.
+Phase-only needs a single-chromosome `.srp` (a multi-chromosome SRP or `--refpanel-dir` is refused). With `--phase-only` an already phased input is left as it is (nothing is written) unless you add `--force-phasing`. Whether the input is phased is decided on the records that match the panel: records absent from the panel are written back as given and never phased, so an unphased heterozygote there (as a phase-only output carries) does not trigger re-phasing. The order in which an unphased call lists its alleles (`1/0` or `0/1`) carries no information and does not affect the result.
 
 ### Allele reconciliation (`--allele-match`)
 
@@ -148,7 +159,7 @@ No-call genotypes in the target (`./.`, common on genotyping arrays at ~1–2% o
 
 ### Sex chromosomes
 
-- **chrX**: when Selphi phases the target (unphased input, or `--force-phasing`), males are auto-detected (low heterozygosity outside the pseudo-autosomal regions) and treated as diploid inside PAR1/PAR2 and haploid elsewhere: their PAR heterozygous calls are kept, their non-PAR het calls (genotyping errors) are reset before phasing. PAR coordinates follow `--build` (`grch38`, `grch37`, or `auto`, the default, inferred from the panel). `--chrx-no-par` treats males as haploid over the whole chromosome. Male chrX genotypes and dosages are written diploid; already-phased input is used as is. Give chrX its whole genetic map: the PLINK GRCh38/37 maps put PAR1 and PAR2 in their own files. With `--map plink.chrX.GRCh38.map` the `plink.chrX_par1`/`_par2` files beside it are joined automatically (the log says so), as they are under `--map-dir`; `--map a,b,c` joins any list of files in position order, each continuing the previous one's cM. Without the PAR files, PAR1's ~21 cM would be extrapolated from the end of the non-PAR map and imputation there suffers. Some arrays report a man's whole chrX, PARs included, as single letters, which normalisation turns into homozygous calls although about half of them are heterozygous: a male with no heterozygous call among at least 50 called PAR sites has those calls entered with low confidence (`SELPHI_PAR_COLLAPSED_CONF`, default 0.1), so the copying model leans on the panel there while the calls themselves are written as given (PAR1 imputed SNP R² 0.60-0.65 → 0.68-0.72 on three such men; a man with real PAR heterozygotes is never selected). A male imputed on his own has no heterozygous non-PAR call; his calls at sites common in the panel still form the phasing scaffold (every called site when none is).
+- **chrX**: when Selphi phases the target (unless `--keep-input-phase` on a phased input), males are auto-detected (low heterozygosity outside the pseudo-autosomal regions) and treated as diploid inside PAR1/PAR2 and haploid elsewhere: their PAR heterozygous calls are kept, their non-PAR het calls (genotyping errors) are reset before phasing. PAR coordinates follow `--build` (`grch38`, `grch37`, or `auto`, the default, inferred from the panel). `--chrx-no-par` treats males as haploid over the whole chromosome. Male chrX genotypes and dosages are written diploid; a phased input imputed with `--keep-input-phase` is used as is. Give chrX its whole genetic map: the PLINK GRCh38/37 maps put PAR1 and PAR2 in their own files. With `--map plink.chrX.GRCh38.map` the `plink.chrX_par1`/`_par2` files beside it are joined automatically (the log says so), as they are under `--map-dir`; `--map a,b,c` joins any list of files in position order, each continuing the previous one's cM. Without the PAR files, PAR1's ~21 cM would be extrapolated from the end of the non-PAR map and imputation there suffers. Some arrays report a man's whole chrX, PARs included, as single letters, which normalisation turns into homozygous calls although about half of them are heterozygous: a male with no heterozygous call among at least 50 called PAR sites has those calls entered with low confidence (`SELPHI_PAR_COLLAPSED_CONF`, default 0.1), so the copying model leans on the panel there while the calls themselves are written as given (PAR1 imputed SNP R² 0.60-0.65 → 0.68-0.72 on three such men; a man with real PAR heterozygotes is never selected). A male imputed on his own has no heterozygous non-PAR call; his calls at sites common in the panel still form the phasing scaffold (every called site when none is).
 - **chrY / chrMT**: refused, because the Li-Stephens recombination model does not apply to a non-recombining / haploid contig and standard panels omit them. In whole-genome runs they are skipped with a warning. `SELPHI_ALLOW_NONRECOMB=1` forces a run.
 
 ### Panel phasing (de-novo, no reference)
@@ -235,7 +246,7 @@ Indel panel sites carry no read evidence on the default path, so they are left o
 
 ### Memory-bounded mode (biobank-scale)
 
-For panels where memory is the binding constraint, `--sample-batch-size N` processes target samples in batches of N. Peak memory scales with the batch size, at ~30-40% wall overhead. On phased input the output equals the non-batched run; on unphased input batching turns off the two-member phase ensemble (as `SELPHI_DIPLOID_INTRA_N=1`), so dosages differ slightly from a non-batched run. Per-batch intermediates go to `$TMPDIR` (default `/tmp`); point it at a volume with room.
+For panels where memory is the binding constraint, `--sample-batch-size N` processes target samples in batches of N. Peak memory scales with the batch size, at ~30-40% wall overhead. Batching turns off the two-member phase ensemble (as `SELPHI_DIPLOID_INTRA_N=1`), so dosages differ slightly from a non-batched run; with `--keep-input-phase` a phased input's output equals the non-batched run's. Per-batch intermediates go to `$TMPDIR` (default `/tmp`); point it at a volume with room.
 
 ```bash
 selphi \
@@ -419,7 +430,7 @@ selphi --index-stats output.bcf   # format, size, samples/variants, fields, per-
 
 ## Self-test
 
-Verify the code paths after building (phase-only, every output format, pre-phased input, index readability, and evaluation when `--truth` is given). It runs seven full passes, so point it at a small single-chromosome panel:
+Verify the code paths after building (phase-only, every output format, pre-phased input with and without `--keep-input-phase`, index readability, and evaluation when `--truth` is given). It runs eight full passes, so point it at a small single-chromosome panel:
 
 ```bash
 selphi --self-test --refpanel panel.srp --input target.vcf.gz --map chr.map --out test_prefix --truth truth.vcf.gz
@@ -438,7 +449,9 @@ selphi --self-test --refpanel panel.srp --input target.vcf.gz --map chr.map --ou
 | `--truth PATH` | Truth VCF/BCF; auto-runs post-hoc evaluation after chip/WGS imputation (single-chr and multi-chr alike; the lcWGS engine does not, score its output with `--evaluate`) | |
 | `--engine ENGINE` | Imputation engine: `auto` (default, sniffs the target), `lcwgs`, `genotype`, or `refine` | `auto` |
 | `--phase-only` | Output phased haplotypes only (skip imputation) | off |
-| `--force-phasing` | Re-phase even if input is already phased | off |
+| `--force-phasing` | Re-phase a phased input and do not use its phase (see [Phased input](#phased-input)) | off |
+| `--keep-input-phase` | Impute a phased input on its own phase, without phasing | off |
+| `--trust-input-phase` | Re-phase a phased input and keep every sample's own phase as ensemble member 0 (no agreement check) | off |
 | `--allele-match MODE` | Target/panel allele reconciliation: `none`, `swap`, `strand`, `full` | `swap` |
 | `--lcwgs` | Legacy alias for `--engine lcwgs`; also enables PL/BAM low-coverage input | off |
 | `--bam PATH` / `--bam-list PATH` | Aligned reads for `--lcwgs` (single file, or a list) | |
@@ -490,7 +503,7 @@ selphi --self-test --refpanel panel.srp --input target.vcf.gz --map chr.map --ou
 | `--max-cond-haps N` | Max conditioning haplotypes per diploid phasing window (0 = unlimited, IBS-selected; try 120-200 for faster phasing) | 0 |
 | `--window-cm F` | Imputation window size in cM | 80 |
 | `--overlap-cm F` | Window overlap in cM | 2 |
-| `--sample-batch-size N` | Memory-bounded mode: process target samples in batches of N (0 = off); all formats. Turns the phase ensemble off on unphased input | 0 |
+| `--sample-batch-size N` | Memory-bounded mode: process target samples in batches of N (0 = off); all formats. Turns the phase ensemble off | 0 |
 
 ## How it works
 

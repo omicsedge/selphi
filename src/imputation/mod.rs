@@ -7,6 +7,7 @@ pub mod match_processing;
 pub mod windows;
 pub mod window_process;
 pub mod ensemble;
+pub mod input_phase;
 pub mod ancestry;
 
 /// Minimum value for `max_candidates`. Floors the auto-resolution formula on
