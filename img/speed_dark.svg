@@ -1,14 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 248" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
 <text x="16" y="26" fill="#e6edf3" font-size="16" font-weight="700">Whole-genome phasing + imputation &#183; wall time</text>
-<text x="16" y="46" fill="#8b949e" font-size="12">6 samples vs the 75,552-haplotype panel &#183; 22 autosomes &#183; 16 threads &#183; same session, panel files in page cache</text>
+<text x="16" y="46" fill="#8b949e" font-size="12">6 samples vs the 75,552-haplotype panel &#183; 22 autosomes &#183; 16 threads &#183; idle host, panel files in page cache</text>
 <text x="120" y="101" text-anchor="end" fill="#c9d1d9" font-size="13" font-weight="600">Selphi 2</text>
-<rect x="132" y="78" width="137.6" height="38" rx="5" fill="#58a6ff"/>
-<text x="279.6" y="102" fill="#e6edf3" font-size="14" font-weight="700">8.5 min</text>
-<text x="279.6" y="88" fill="#8b949e" font-size="10">8:30 (mm:ss)</text>
+<rect x="132" y="78" width="227.8" height="38" rx="5" fill="#58a6ff"/>
+<text x="369.8" y="102" fill="#e6edf3" font-size="14" font-weight="700">14.1 min</text>
+<text x="369.8" y="88" fill="#8b949e" font-size="10">14:05 (mm:ss)</text>
 <text x="120" y="159" text-anchor="end" fill="#c9d1d9" font-size="13" font-weight="600">Beagle 5.5</text>
 <rect x="132" y="136" width="470.0" height="38" rx="5" fill="#d29922"/>
 <text x="612.0" y="160" fill="#e6edf3" font-size="14" font-weight="700">29.1 min</text>
 <text x="612.0" y="146" fill="#8b949e" font-size="10">29:04 (mm:ss)</text>
-<text x="16" y="210" fill="#3fb950" font-size="13" font-weight="700">Selphi 2 is 3.4&#215; faster end-to-end (20.6 min saved)</text>
-<text x="16" y="232" fill="#8b949e" font-size="12">Peak memory 5.8 GB vs 45.3 GB (largest chromosome)</text>
+<text x="16" y="210" fill="#3fb950" font-size="13" font-weight="700">Selphi 2 is 2.1&#215; faster end-to-end (15.0 min saved)</text>
+<text x="16" y="232" fill="#8b949e" font-size="12">Peak memory 6.2 GB vs 45.3 GB (largest chromosome)</text>
 </svg>

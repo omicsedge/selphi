@@ -39,8 +39,8 @@ def esc(s):
 # --------------------------------------------------------------------------
 # Speed chart (Table 5b, warm pass; RESULT CONSUMER WHOLE-GENOME WARM)
 # --------------------------------------------------------------------------
-SPEED = [("Selphi 2", 510.5), ("Beagle 5.5", 1743.9)]
-SPEED_MEM = ("5.8 GB", "45.3 GB")
+SPEED = [("Selphi 2", 845.2), ("Beagle 5.5", 1743.9)]
+SPEED_MEM = ("6.2 GB", "45.3 GB")
 
 
 def speed_svg(t):
@@ -49,7 +49,7 @@ def speed_svg(t):
     vmax = max(v for _, v in SPEED)
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 248" font-family="{FONT}">',
            f'<text x="16" y="26" fill="{c["fg"]}" font-size="16" font-weight="700">Whole-genome phasing + imputation &#183; wall time</text>',
-           f'<text x="16" y="46" fill="{c["muted"]}" font-size="12">6 samples vs the 75,552-haplotype panel &#183; 22 autosomes &#183; 16 threads &#183; same session, panel files in page cache</text>']
+           f'<text x="16" y="46" fill="{c["muted"]}" font-size="12">6 samples vs the 75,552-haplotype panel &#183; 22 autosomes &#183; 16 threads &#183; idle host, panel files in page cache</text>']
     for i, ((name, sec), colour) in enumerate(zip(SPEED, (c["blue"], c["amber"]))):
         y = 78 + 58 * i
         w = w_max * sec / vmax
