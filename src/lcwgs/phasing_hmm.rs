@@ -2193,6 +2193,7 @@ impl PhasingHmm {
         self.curr_segment_locus = *self.segments.last().unwrap() - 1;
         self.curr_missing_locus = self.n_miss as i32 - 1;
         let sh = tp.sh;
+        let (mut seg_free, mut miss_free) = (ReleaseRun::new(tp.pp, sh), ReleaseRun::new(tp.ip, sh));
 
         let mut idx = n_var - 1;
         while idx >= 0 {
@@ -2262,6 +2263,7 @@ impl PhasingHmm {
                             let yt = self.transition_at(idx as usize, cm);
                             let (h, sum) = self.trans_hap_from(yt, &f, self.prob.as_ptr());
                             tp.store_boundary(seg - 1, &h, sum);
+                            seg_free.consumed(seg);
                         }
                     }
                 }
@@ -2284,6 +2286,7 @@ impl PhasingHmm {
                         let bsum = self.prob_sum_h;
                         let out = self.impute_flat_het_from(ref_bm, cond_haps, self.prob.as_ptr(), &bsum, blk, &fsum);
                         std::ptr::copy_nonoverlapping(out.as_ptr(), tp.of1s.add(miss * HAP_NUMBER), HAP_NUMBER);
+                        miss_free.consumed(miss);
                     }
                 }
                 self.curr_missing_locus -= 1;
@@ -2307,6 +2310,7 @@ impl PhasingHmm {
         self.curr_segment_locus = 0;
         self.curr_missing_locus = 0;
         let sh = tp.sh;
+        let (mut seg_free, mut miss_free) = (ReleaseRun::new(tp.pp, sh), ReleaseRun::new(tp.ip, sh));
 
         let n_var = self.var_typ.len() as i32;
         let mut idx = 0i32;
@@ -2374,6 +2378,7 @@ impl PhasingHmm {
                         let yt = self.transition_at(idx as usize + 1, cm);
                         let (h, sum) = self.trans_hap_from(yt, &f, blk);
                         tp.store_boundary(seg, &h, sum);
+                        seg_free.consumed(blk_i);
                     }
                 }
             }
@@ -2394,6 +2399,7 @@ impl PhasingHmm {
                         let fsum = self.prob_sum_h;
                         let out = self.impute_flat_het_from(ref_bm, cond_haps, blk, &bsum, self.prob.as_ptr(), &fsum);
                         std::ptr::copy_nonoverlapping(out.as_ptr(), tp.of1s.add(miss * HAP_NUMBER), HAP_NUMBER);
+                        miss_free.consumed(miss);
                     }
                 }
                 self.curr_missing_locus += 1;
@@ -2650,6 +2656,69 @@ impl TwoPass {
         std::ptr::copy_nonoverlapping(h.as_ptr(), dst, HAP_NUMBER * HAP_NUMBER);
         *dst.add(HAP_NUMBER * HAP_NUMBER) = sum;
     }}
+}
+
+/// Meeting blocks of one array that one pass has consumed, handed back to
+/// the system in runs of `RELEASE_BLOCKS` adjacent blocks (a pass consumes its
+/// blocks in order, the forward ascending and the backward descending). Each
+/// block is read exactly once, so the passes' storage shrinks as they consume
+/// it instead of staying resident until the call ends.
+struct ReleaseRun { base: *mut f32, sh: usize, lo: usize, hi: usize }
+
+/// Consumed blocks per release (a few MB): few page-table updates per call.
+const RELEASE_BLOCKS: usize = 64;
+
+impl ReleaseRun {
+    fn new(base: *mut f32, sh: usize) -> Self { ReleaseRun { base, sh, lo: 0, hi: 0 } }
+
+    /// Block `j` has been consumed by this pass.
+    ///
+    /// # Safety
+    /// No one reads block `j` again.
+    unsafe fn consumed(&mut self, j: usize) { unsafe {
+        if self.hi > self.lo && j == self.hi {
+            self.hi += 1;
+        } else if self.hi > self.lo && j + 1 == self.lo {
+            self.lo -= 1;
+        } else {
+            self.flush();
+            (self.lo, self.hi) = (j, j + 1);
+        }
+        if self.hi - self.lo >= RELEASE_BLOCKS { self.flush(); }
+    }}
+
+    unsafe fn flush(&mut self) { unsafe {
+        if self.hi > self.lo {
+            release_pages(self.base.add(self.lo * self.sh), (self.hi - self.lo) * self.sh);
+        }
+        (self.lo, self.hi) = (0, 0);
+    }}
+}
+
+impl Drop for ReleaseRun {
+    fn drop(&mut self) {
+        // SAFETY: the run holds only consumed blocks.
+        unsafe { self.flush(); }
+    }
+}
+
+/// Return the whole pages inside `len` consumed floats at `ptr` to the system.
+///
+/// # Safety
+/// `ptr..ptr + len` must lie inside one live allocation that is never read
+/// again.
+unsafe fn release_pages(ptr: *mut f32, len: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        const PAGE: usize = 4096;
+        let start = (ptr as usize).div_ceil(PAGE) * PAGE;
+        let end = (ptr as usize + len * std::mem::size_of::<f32>()) / PAGE * PAGE;
+        if end > start {
+            libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_DONTNEED);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (ptr, len);
 }
 
 /// Hands a phaser to the other Rayon task of `two_pass_states`.
