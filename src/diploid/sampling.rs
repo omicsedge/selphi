@@ -177,22 +177,30 @@ pub fn solve(graph: &mut GenotypeGraph) {
 }
 
 /// How the final solve decides the output phase (`SELPHI_DIPLOID_SOLVE`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum SolveMode {
     /// The joint maximum-probability path (SHAPEIT5; the default).
     Viterbi,
-    /// Each consecutive-heterozygote relation by its own posterior majority
-    /// ([`pair_cis`]), which minimises the expected number of switch errors.
-    Pairwise,
+    /// The Viterbi path with each consecutive-heterozygote relation overridden
+    /// where the posterior probability that the Viterbi relation is wrong
+    /// ([`pair_cis`]) exceeds `override_above`. At 1/2 that is the posterior
+    /// majority of every relation, the decoder that minimises the expected
+    /// number of switch errors between consecutive heterozygotes.
+    Pairwise { override_above: f64 },
 }
 
-/// `SELPHI_DIPLOID_SOLVE`: `pairwise` decodes the output phase pair by pair;
-/// anything else (default `viterbi`) keeps the Viterbi path. OnceLock-cached.
+/// `SELPHI_DIPLOID_SOLVE`: `pairwise` decodes the output phase pair by pair,
+/// overriding a Viterbi relation whose posterior probability of being wrong
+/// exceeds `SELPHI_DIPLOID_PAIRWISE_OVERRIDE` (default 0.5, clamped to
+/// [0.5, 1]); anything else (default `viterbi`) keeps the Viterbi path.
+/// OnceLock-cached.
 pub fn solve_mode() -> SolveMode {
     use std::sync::OnceLock;
     static MODE: OnceLock<SolveMode> = OnceLock::new();
     *MODE.get_or_init(|| match crate::config::raw("SELPHI_DIPLOID_SOLVE").as_deref() {
-        Some("pairwise") => SolveMode::Pairwise,
+        Some("pairwise") => SolveMode::Pairwise {
+            override_above: crate::config::f64_or("SELPHI_DIPLOID_PAIRWISE_OVERRIDE", 0.5).clamp(0.5, 1.0),
+        },
         None | Some("viterbi") => SolveMode::Viterbi,
         Some(other) => {
             crate::selphi_info!("  SELPHI_DIPLOID_SOLVE={other:?} not recognised (viterbi|pairwise): using viterbi");
@@ -221,14 +229,14 @@ pub struct PairwiseStats {
 }
 
 /// The final solve: the Viterbi path, then (`SolveMode::Pairwise`) every
-/// consecutive-heterozygote relation re-decided by its posterior majority.
+/// consecutive-heterozygote relation re-decided by its posterior.
 pub fn solve_with(graph: &mut GenotypeGraph, mode: SolveMode) -> PairwiseStats {
     if graph.n_segments == 0 { return PairwiseStats::default(); }
     let dip = viterbi_codes(graph);
     apply_sampled_diplotypes(graph, &dip, Missing::Stored);
-    if mode == SolveMode::Viterbi { return PairwiseStats::default(); }
+    let SolveMode::Pairwise { override_above } = mode else { return PairwiseStats::default() };
     let p_cis = pair_cis(graph);
-    decode_pairwise(graph, &dip, &p_cis)
+    decode_pairwise(graph, &dip, &p_cis, override_above)
 }
 
 /// Variant index and segment of every ambiguous site (HET or SCA), in the order
@@ -399,13 +407,14 @@ pub fn phase_quality(graph: &GenotypeGraph) -> Vec<(usize, u8)> {
 }
 
 /// Re-decide each consecutive-ambiguous-site relation of a Viterbi-solved graph
-/// by its posterior majority (P(cis) > 1/2 cis, < 1/2 trans; a tie or an
-/// undefined pair keeps the Viterbi relation), the first site keeping the
-/// Viterbi orientation. Each segment then takes the diplotype carrying the
+/// by its posterior: the Viterbi relation is reversed where the posterior
+/// probability that it is wrong exceeds `override_above` (>= 1/2; at 1/2 the
+/// posterior majority, a tie or an undefined pair keeping the Viterbi
+/// relation), the first site keeping the Viterbi orientation. Each segment then takes the diplotype carrying the
 /// decoded alleles (the Viterbi one when it does), so its missing loci follow
 /// that configuration as the solve's own; a segment none of whose diplotypes
 /// carries them gets the alleles written directly.
-fn decode_pairwise(graph: &mut GenotypeGraph, vit: &[u8], p_cis: &[f64]) -> PairwiseStats {
+fn decode_pairwise(graph: &mut GenotypeGraph, vit: &[u8], p_cis: &[f64], override_above: f64) -> PairwiseStats {
     let sites = ambiguous_sites(graph);
     if sites.len() < 2 { return PairwiseStats::default(); }
     let hap0 = |g: &GenotypeGraph, v: usize| var_get_hap0(v % 2, g.variants[v / 2]);
@@ -415,7 +424,8 @@ fn decode_pairwise(graph: &mut GenotypeGraph, vit: &[u8], p_cis: &[f64]) -> Pair
     for k in 1..sites.len() {
         let cis_vit = cur[k] == cur[k - 1];
         let p = p_cis.get(k).copied().unwrap_or(f64::NAN);
-        let cis = if p > 0.5 { true } else if p < 0.5 { false } else { cis_vit };
+        let p_vit_wrong = if cis_vit { 1.0 - p } else { p };
+        let cis = if p_vit_wrong > override_above { !cis_vit } else { cis_vit };
         if cis != cis_vit { stats.relations_changed += 1; }
         want[k] = if cis { want[k - 1] } else { !want[k - 1] };
     }
@@ -790,13 +800,29 @@ mod pairwise_tests {
         let mut r = three_het_graph();
         solve(&mut r);
         assert_eq!(v.variants, r.variants, "the Viterbi mode is the plain solve");
-        let st = solve_with(&mut g, SolveMode::Pairwise);
+        let st = solve_with(&mut g, SolveMode::Pairwise { override_above: 0.5 });
         assert_eq!(st, PairwiseStats { relations_changed: 1, segments_unmatched: 0 });
         // First het keeps the Viterbi orientation, then trans, trans: h = 5.
         assert_eq!(hap0(&g), vec![true, false, true]);
         let h1: Vec<bool> = (0..3).map(|i| var_get_hap1(i % 2, g.variants[i / 2])).collect();
         assert_eq!(h1, vec![false, true, false]);
         assert_eq!(phase_quality(&g), vec![(1, 5), (2, 5)]);
+    }
+
+    /// The Viterbi relation (cis) at het 2 is wrong with posterior .65: an
+    /// override threshold below that reverses it, one above keeps the path.
+    #[test]
+    fn pairwise_override_threshold_keeps_weakly_contested_relations() {
+        let mut g = three_het_graph();
+        let st = solve_with(&mut g, SolveMode::Pairwise { override_above: 0.6 });
+        assert_eq!(st.relations_changed, 1);
+        assert_eq!(hap0(&g), vec![true, false, true]);
+        let mut h = three_het_graph();
+        let st = solve_with(&mut h, SolveMode::Pairwise { override_above: 0.7 });
+        assert_eq!(st, PairwiseStats::default());
+        let mut r = three_het_graph();
+        solve(&mut r);
+        assert_eq!(h.variants, r.variants);
     }
 
     /// Hets 0-2 in segment 0, het 3 alone in segment 1: the pair (2, 3) reads the
@@ -830,7 +856,7 @@ mod pairwise_tests {
         let mut pw = boundary_graph();
         solve(&mut g);
         assert_eq!(phase_quality(&g).last(), Some(&(3, 7))); // trans, P(wrong) .2
-        solve_with(&mut pw, SolveMode::Pairwise);
+        solve_with(&mut pw, SolveMode::Pairwise { override_above: 0.5 });
         let h = hap0(&pw);
         assert_ne!(h[2], h[3]);
     }
@@ -882,7 +908,7 @@ mod pairwise_tests {
         assert!(phase_quality(&g).is_empty());
         let mut r = hets(5);
         solve(&mut r);
-        assert_eq!(solve_with(&mut g, SolveMode::Pairwise).relations_changed, 0);
+        assert_eq!(solve_with(&mut g, SolveMode::Pairwise { override_above: 0.5 }).relations_changed, 0);
         assert_eq!(g.variants, r.variants);
     }
 }

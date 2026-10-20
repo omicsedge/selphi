@@ -163,6 +163,8 @@ selphi \
 
 Phase-only needs a single-chromosome `.srp` (a multi-chromosome SRP or `--refpanel-dir` is refused). With `--phase-only` an already phased input is left as it is (nothing is written) unless you add `--force-phasing`. Whether the input is phased is decided on the records that match the panel: records absent from the panel are written back as given and never phased, so an unphased heterozygote there (as a phase-only output carries) does not trigger re-phasing. The order in which an unphased call lists its alleles (`1/0` or `0/1`) carries no information and does not affect the result.
 
+With `SELPHI_DIPLOID_PQ=1` (experimental) the phase-only VCF also carries `FORMAT/PQ` at each heterozygote the segment HMM phased: the phred-scaled posterior probability (an integer, capped at 60) that its phase relative to the previous heterozygote of the sample is wrong, read from the posteriors the MCMC already stores. It ranks pairs well (54 trio children: AUC 0.96 on array sites, 0.95 at WGS density; the lowest tenth of PQ values holds 88% of array switch errors) and is calibrated below PQ 7, but overstates confidence above it (PQ 13-19 means about 8% errors, not 3%), so read it as a ranking more than as an exact probability.
+
 ### Allele reconciliation (`--allele-match`)
 
 Target sites are matched to the panel, and by default REF/ALT-swapped sites are reconciled (a chip that labels REF/ALT opposite the panel would otherwise silently lose those markers). Choose the level:

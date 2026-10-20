@@ -1742,9 +1742,9 @@ fn _run_iterations(
         changed += st.relations_changed;
         unmatched += st.segments_unmatched;
     }
-    if mode == sampling::SolveMode::Pairwise {
-        crate::selphi_debug!("  [diploid] pairwise solve: {} het relations decided against the Viterbi path, \
-{} segments written allele by allele", changed, unmatched);
+    if let sampling::SolveMode::Pairwise { override_above } = mode {
+        crate::selphi_debug!("  [diploid] pairwise solve (override above {}): {} het relations decided against \
+the Viterbi path, {} segments written allele by allele", override_above, changed, unmatched);
     }
 
     if rare_dispatch_diag() {
