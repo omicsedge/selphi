@@ -14,10 +14,10 @@ def boot(x):
     rng=np.random.default_rng(1); x=np.array(x); bs=[rng.choice(x,len(x)).mean() for _ in range(20000)]
     return x.mean(), np.percentile(bs,2.5), np.percentile(bs,97.5)
 for c in ["22","1"]:
-    s=ser(f"{V}/table6/dip{c}.ser.txt"); s7=ser(f"{V}/table6/dip{c}_s777.ser.txt"); h=ser(f"{V}/table6/hap{c}.ser.txt")
+    s=ser(f"{V}/table6/dip{c}.ser.txt"); s7=ser(f"{V}/table6/dip{c}_s777.ser.txt")
     b=ser(f"{K}/chr{c}/beagle.ser.txt"); sh=ser(f"{K}/chr{c}/shapeit5.ser.txt"); p=ser(f"{V}/table6/ped{c}.ser.txt")
-    print(f"chr{c} mean SER: dip {np.mean(list(s.values())):.4f} dip_s777 {np.mean(list(s7.values())):.4f} hap {np.mean(list(h.values())):.4f} beagle {np.mean(list(b.values())):.4f} shapeit5 {np.mean(list(sh.values())):.4f} ped {np.mean(list(p.values())):.4f} (n {len(s)})")
-    for name,o in (("beagle",b),("shapeit5",sh),("haploid",h)):
+    print(f"chr{c} mean SER: dip {np.mean(list(s.values())):.4f} dip_s777 {np.mean(list(s7.values())):.4f} beagle {np.mean(list(b.values())):.4f} shapeit5 {np.mean(list(sh.values())):.4f} ped {np.mean(list(p.values())):.4f} (n {len(s)})")
+    for name,o in (("beagle",b),("shapeit5",sh)):
         k=sorted(set(s)&set(o)); d=[s[t]-o[t] for t in k]; m,lo,hi=boot(d)
         print(f"  dip - {name}: {m:+.4f} pp [{lo:+.4f}, {hi:+.4f}] lower in {sum(x<0 for x in d)}/{len(d)}")
 for c in ["22","1"]:

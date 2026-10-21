@@ -24,7 +24,7 @@ for C in 22 1; do
   bcftools merge $T/children_wgs_unphased_chr$C.vcf.gz $T/fathers_wgs_chr$C.vcf.gz $T/mothers_wgs_chr$C.vcf.gz 2>/dev/null \
     | bcftools +setGT -- -t a -n u 2>/dev/null | bcftools view -Oz -o $O/fam_chr$C.vcf.gz && bcftools index -f -t $O/fam_chr$C.vcf.gz
   echo "COHORT chr$C samples $(bcftools query -l $O/fam_chr$C.vcf.gz | wc -l) records $(bcftools index -n $O/fam_chr$C.vcf.gz)"
-  /usr/bin/time -v $S --refpanel $SRP --input $O/fam_chr$C.vcf.gz --map $MAP --phase-only --phasing-engine diploid --ped $T/trios.ped --out $O/selphi_ped_$C --threads 16 > $O/selphi_ped_$C.log 2> $O/selphi_ped_$C.time
+  /usr/bin/time -v $S --refpanel $SRP --input $O/fam_chr$C.vcf.gz --map $MAP --phase-only --ped $T/trios.ped --out $O/selphi_ped_$C --threads 16 > $O/selphi_ped_$C.log 2> $O/selphi_ped_$C.time
   ser $O/selphi_ped_$C.vcf.gz selphi_diploid_ped $C; echo "  time $(tm $O/selphi_ped_$C.time)"
   /usr/bin/time -v java -Xmx64g -jar $J gt=$O/fam_chr$C.vcf.gz ref=$T/ref_panel_no_trios_chr$C.bref3 map=$MAP out=$O/beagle_fam_$C impute=false nthreads=16 > $O/beagle_fam_$C.log 2> $O/beagle_fam_$C.time
   tabix -f -p vcf $O/beagle_fam_$C.vcf.gz; ser $O/beagle_fam_$C.vcf.gz beagle_parents_cophased $C; echo "  time $(tm $O/beagle_fam_$C.time)"

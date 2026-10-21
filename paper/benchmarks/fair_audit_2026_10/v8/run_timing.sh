@@ -41,12 +41,10 @@ ser(){ bcftools index -f -t $1; bcftools merge -Oz -o $O/$2.m.vcf.gz $1 $T6/fath
 for c in 22 1; do [ -f $O/t6_s5r$c.time ] && continue; wait_idle; log "I table6 chr$c"
   IN=$T6/children_wgs_unphased_chr$c.vcf.gz; M=data/maps/beagle/chr$c.map; G=_archive/old_data/tests/data/genetic_maps/shapeit5_impute5/chr$c.b38.gmap.gz
   SRP=$T6/ref_panel_no_trios_chr$c.srp; [ $c = 1 ] && SRP=$T6/ref_panel_no_trios_chr1_v2.srp
-  /usr/bin/time -v $S --refpanel $SRP --input $IN --map $M --phase-only --phasing-engine diploid --out $O/dip$c --threads 16 > $O/dip$c.stdout 2> $O/t6_diploid$c.time
+  /usr/bin/time -v $S --refpanel $SRP --input $IN --map $M --phase-only --out $O/dip$c --threads 16 > $O/dip$c.stdout 2> $O/t6_diploid$c.time
   ser $O/dip$c.vcf.gz dip$c $c | tee -a $L; rm -f $O/dip$c.vcf.gz*
-  $S --refpanel $SRP --input $IN --map $M --phase-only --phasing-engine diploid --seed 777 --out $O/dip${c}_s777 --threads 16 > $O/dip${c}_s777.stdout 2>&1
+  $S --refpanel $SRP --input $IN --map $M --phase-only --seed 777 --out $O/dip${c}_s777 --threads 16 > $O/dip${c}_s777.stdout 2>&1
   ser $O/dip${c}_s777.vcf.gz dip${c}_s777 $c | tee -a $L; rm -f $O/dip${c}_s777.vcf.gz*
-  /usr/bin/time -v $S --refpanel $SRP --input $IN --map $M --phase-only --phasing-engine haploid --out $O/hap$c --threads 16 > $O/hap$c.stdout 2> $O/t6_haploid$c.time
-  ser $O/hap$c.vcf.gz hap$c $c | tee -a $L; rm -f $O/hap$c.vcf.gz*
   /usr/bin/time -v java -Xmx64g -jar $J gt=$IN ref=$T6/ref_panel_no_trios_chr$c.bref3 map=$M out=$O/t6_beagle$c impute=false nthreads=16 > /dev/null 2> $O/t6_beagle$c.time; rm -f $O/t6_beagle$c.vcf.gz*
   /usr/bin/time -v $PC --input $IN --reference $T6/ref_panel_no_trios_chr$c.bcf --map $G --region $c --thread 16 --filter-maf 0.001 --output $O/s5c$c.bcf > /dev/null 2> $O/t6_s5c$c.time && bcftools index -f $O/s5c$c.bcf
   /usr/bin/time -v $PR --input $IN --input-region $c:1-${LEN[$c]} --scaffold $O/s5c$c.bcf --scaffold-region $c:1-${LEN[$c]} --map $G --thread 16 --output $O/s5r$c.bcf > /dev/null 2> $O/t6_s5r$c.time
@@ -55,7 +53,7 @@ for c in 22 1; do [ -f $O/t6_s5r$c.time ] && continue; wait_idle; log "I table6 
   # 6b: Selphi with the parents (--ped), children scored
   PEDIN=$DATA_ROOT/work/benchmarks/table6/chr$c/trio162_wgs_unph.bcf
   if [ -f $PEDIN ]; then
-    /usr/bin/time -v $S --refpanel $SRP --input $PEDIN --map $M --phase-only --phasing-engine diploid --ped $T6/trios.ped --out $O/ped$c --threads 16 > $O/ped$c.stdout 2> $O/ped$c.time
+    /usr/bin/time -v $S --refpanel $SRP --input $PEDIN --map $M --phase-only --ped $T6/trios.ped --out $O/ped$c --threads 16 > $O/ped$c.stdout 2> $O/ped$c.time
     bcftools view -S $T6/children.txt -Oz -o $O/ped${c}_kids.vcf.gz $O/ped$c.vcf.gz; ser $O/ped${c}_kids.vcf.gz ped$c $c | tee -a $L
     rm -f $O/ped$c.vcf.gz* $O/ped${c}_kids.vcf.gz*
   else log "6b chr$c: no 162-sample input at $PEDIN"; fi

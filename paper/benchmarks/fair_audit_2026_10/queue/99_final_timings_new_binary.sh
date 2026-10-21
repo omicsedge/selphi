@@ -29,11 +29,11 @@ T6=data/trio_benchmark; PC=_archive/reference_code/shapeit5/phase_common/bin/pha
 declare -A LEN=([22]=50818468 [1]=248956422)
 for c in 22 1; do IN=$T6/children_wgs_unphased_chr$c.vcf.gz; M=data/maps/beagle/chr$c.map; G=_archive/old_data/tests/data/genetic_maps/shapeit5_impute5/chr$c.b38.gmap.gz
   SRP=$T6/ref_panel_no_trios_chr$c.srp; [ $c = 1 ] && SRP=$T6/ref_panel_no_trios_chr1_v2.srp
-  for eng in diploid haploid; do /usr/bin/time -v $S --refpanel $SRP --input $IN --map $M --phase-only --phasing-engine $eng --out $O/t6_$eng$c --threads 16 > /dev/null 2> $O/t6_$eng$c.time; rm -f $O/t6_$eng$c.vcf.gz*; done
+  for eng in diploid; do /usr/bin/time -v $S --refpanel $SRP --input $IN --map $M --phase-only --out $O/t6_$eng$c --threads 16 > /dev/null 2> $O/t6_$eng$c.time; rm -f $O/t6_$eng$c.vcf.gz*; done
   /usr/bin/time -v java -Xmx64g -jar $J gt=$IN ref=$T6/ref_panel_no_trios_chr$c.bref3 map=$M out=$O/t6_beagle$c impute=false nthreads=16 > /dev/null 2> $O/t6_beagle$c.time; rm -f $O/t6_beagle$c.vcf.gz*
   /usr/bin/time -v $PC --input $IN --reference $T6/ref_panel_no_trios_chr$c.bcf --map $G --region $c --thread 16 --filter-maf 0.001 --output $O/s5c$c.bcf > /dev/null 2> $O/t6_s5c$c.time && bcftools index -f $O/s5c$c.bcf
   /usr/bin/time -v $PR --input $IN --input-region $c:1-${LEN[$c]} --scaffold $O/s5c$c.bcf --scaffold-region $c:1-${LEN[$c]} --map $G --thread 16 --output $O/s5r$c.bcf > /dev/null 2> $O/t6_s5r$c.time
-  echo "RESULT FINAL T6 chr$c diploid $(sec $O/t6_diploid$c.time)s $(mem $O/t6_diploid$c.time)GB | haploid $(sec $O/t6_haploid$c.time)s $(mem $O/t6_haploid$c.time)GB | beagle $(sec $O/t6_beagle$c.time)s $(mem $O/t6_beagle$c.time)GB | shapeit5 $(echo "$(sec $O/t6_s5c$c.time) + $(sec $O/t6_s5r$c.time)" | bc)s $(mem $O/t6_s5c$c.time)/$(mem $O/t6_s5r$c.time)GB"
+  echo "RESULT FINAL T6 chr$c diploid $(sec $O/t6_diploid$c.time)s $(mem $O/t6_diploid$c.time)GB | beagle $(sec $O/t6_beagle$c.time)s $(mem $O/t6_beagle$c.time)GB | shapeit5 $(echo "$(sec $O/t6_s5c$c.time) + $(sec $O/t6_s5r$c.time)" | bc)s $(mem $O/t6_s5c$c.time)/$(mem $O/t6_s5r$c.time)GB"
   rm -f $O/s5*$c.bcf*
 done
 echo FINALDONE
