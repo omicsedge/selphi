@@ -116,7 +116,7 @@ def lcwgs_svg(t):
                 marker(kind, 424, y, col),
                 f'<text x="443" y="{y + 4}" fill="{c["fg"]}" font-size="12" font-weight="600">{name}</text>']
     out += [f'<text x="16" y="374" fill="{c["green"]}" font-size="13" font-weight="700">Selphi 2 has the highest per-sample R&#178; at every coverage</text>',
-            f'<text x="16" y="396" fill="{c["muted"]}" font-size="12">One sample, whole chr22 at 1&#215;: 107 s for Selphi 2 vs 278 s for GLIMPSE2 (2.6&#215;) and 1,701 s for QUILT2 (16&#215;)</text>',
+            f'<text x="16" y="396" fill="{c["muted"]}" font-size="12">One sample, whole chr22 at ~1.8&#215;, 16 threads: 32.5-34.6 s for Selphi 2, 31.5 s for GLIMPSE2, 128.3 s for QUILT2</text>',
             '</svg>']
     return "\n".join(out) + "\n"
 

@@ -30,5 +30,5 @@
 <polygon points="424.0,269.3 419.3,278.2 428.7,278.2" fill="#1a7f37"/>
 <text x="443" y="278" fill="#1f2328" font-size="12" font-weight="600">QUILT2</text>
 <text x="16" y="374" fill="#1a7f37" font-size="13" font-weight="700">Selphi 2 has the highest per-sample R&#178; at every coverage</text>
-<text x="16" y="396" fill="#57606a" font-size="12">One sample, whole chr22 at 1&#215;: 107 s for Selphi 2 vs 278 s for GLIMPSE2 (2.6&#215;) and 1,701 s for QUILT2 (16&#215;)</text>
+<text x="16" y="396" fill="#57606a" font-size="12">One sample, whole chr22 at ~1.8&#215;, 16 threads: 32.5-34.6 s for Selphi 2, 31.5 s for GLIMPSE2, 128.3 s for QUILT2</text>
 </svg>
