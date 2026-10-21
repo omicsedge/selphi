@@ -346,18 +346,18 @@ def arch(A):
 
     R(50, 198, 820, 200, 10, A["blue_s"], fill="url(#sg)")
     T(460, 220, "Phasing", A["blue"], 14, "700")
-    T(460, 237, "if the target is unphased — one engine for every input", A["muted"], 11)
+    T(460, 237, "unphased input, and phased input by default (--keep-input-phase keeps the given phase)", A["muted"], 11)
     R(70, 250, 780, 136, 8, A["dblue_s"], 1.2)
     T(460, 272, "Diploid engine", A["dblue"], 13, "700")
-    for i, s in enumerate(["Genotype graph + segment HMM", "MCMC (15 iterations)"]):
+    for i, s in enumerate(["Genotype graph + segment HMM", "MCMC (15 iterations)", "Each sample phased as 2-3 copies (<= 1,000 samples)"]):
         T(265, 302 + 22 * i, s, A["text"])
-    for i, s in enumerate(["Common → rare two-stage (PBWT voting)", "IBD2 exclusion + match-length-weighted rare votes"]):
+    for i, s in enumerate(["Common → rare two-stage (PBWT voting)", "IBD2 exclusion + match-length-weighted rare votes", "Panel-absent rare hets → rare vote (WGS)"]):
         T(655, 302 + 22 * i, s, A["text"])
     T(460, 377, "arrays, WGS and de-novo panels (--phase-panel)", A["muted"], 10, italic=True)
     o.append(f'<path d="M787 100 L787 186 L895 186 L895 318 L872 318" fill="none" stroke="{A["opt"]}" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arr)"/>')
     o.append(f'<text x="905" y="252" fill="{A["opt"]}" font-size="9" transform="rotate(90,905,252)" text-anchor="middle">Mendelian scaffold</text>')
     o.append(f'<path d="M 28 100 L 12 100 L 12 548 L 48 548" fill="none" stroke="{A["blue"]}" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arr)"/>')
-    o.append(f'<text x="5" y="324" fill="{A["blue"]}" font-size="10" font-weight="600" transform="rotate(-90,5,324)" text-anchor="middle">pre-phased input → skip</text>')
+    o.append(f'<text x="5" y="324" fill="{A["blue"]}" font-size="10" font-weight="600" transform="rotate(-90,5,324)" text-anchor="middle">--keep-input-phase → skip</text>')
     L(460, 398, 460, 412)
     R(140, 414, 640, 28, 8, A["green_s"], 1, dash="6,3")
     T(460, 432, "In-memory handoff: phased haplotypes + shared bitmatrix (no file I/O)", A["green"], 11)

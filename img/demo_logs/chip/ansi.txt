@@ -1,7 +1,7 @@
-Script started on 2026-10-12 21:40:48+00:00 [COMMAND="selphi --refpanel chr22.srp --input chip.vcf.gz --map chr22.map --out imputed --truth truth.vcf.gz --exclude-panel-monomorphic chr22.srp --threads 16 " <not executed on terminal>]
+Script started on 2026-10-21 16:44:20+00:00 [COMMAND="selphi --refpanel chr22.srp --input chip.vcf.gz --map chr22.map --out imputed --truth truth.vcf.gz --exclude-panel-monomorphic chr22.srp --threads 16 " <not executed on terminal>]
 [1;36m[selphi][0m SIMD: [32mAVX-512F+DQ[0m
-  auto-route: sniff GT=true PL=false GQ=false DP=false call-rate=1.000 (of 1602000 GT entries) density=262/Mb (thr 1000) [2m[0.0s | 106 MB][0m
-  auto-route: confident hard calls (GT-only, or GQ/DP below WGS density) [32m→ genotype engine (no refine)[0m [2m[0.0s | 106 MB][0m
+  auto-route: sniff GT=true PL=false GQ=false DP=false call-rate=1.000 (of 1602000 GT entries) density=262/Mb (thr 1000) [2m[0.0s | 107 MB][0m
+  auto-route: confident hard calls (GT-only, or GQ/DP below WGS density) [32m→ genotype engine (no refine)[0m [2m[0.0s | 107 MB][0m
 [1;36m
   ___ ___ _    ___ _  _ ___
  / __| __| |  | _ \ || |_ _|
@@ -17,26 +17,30 @@ Script started on 2026-10-12 21:40:48+00:00 [COMMAND="selphi --refpanel chr22.sr
   log:      imputed.log
 
   Loaded SRP: 1070401 variants, 4802 haplotypes                [2m[0.2s | 340 MB][0m
-  Target: 801 samples, 9283 variants, phased=false             [2m[0.2s | 356 MB][0m
+  Target: 801 samples, 9283 variants, phased=false             [2m[0.3s | 356 MB][0m
   Variant intersection: 9283 hash matches, 0 plain matches
-  Shared markers: 9283 (100.0% of target)                      [2m[0.2s | 358 MB][0m
-  Auto max_candidates: n_ref=4802, chunk_cv=0.691, scale=0.652 → mc=4802 (clamp [2500..1000000]) [2m[0.2s | 386 MB][0m
+  Shared markers: 9283 (100.0% of target)                      [2m[0.3s | 359 MB][0m
+  Auto max_candidates: n_ref=4802, chunk_cv=0.691, scale=0.652 → mc=4802 (clamp [2500..1000000]) [2m[0.3s | 387 MB][0m
   Resources: 9.4 GB estimated, 123.1 GB system RAM, 16 threads (mc=4802)
-  Input is unphased — running phasing pipeline...              [2m[0.3s | 387 MB][0m
-  Phasing engine: Diploid (default; 9283 target variants)
-  Ref bitmatrix extracted (9283 target sites × 4802 haps, 5.6 MB) [2m[0.4s | 496 MB][0m
-  Using Diploid phasing                                        [2m[0.4s | 496 MB][0m
-  Common ref subset (8928 / 9283 variants, 5.4 MB)             [2m[0.4s | 496 MB][0m
-  Diploid intra-run phase ensemble: 2 members (1× phasing)     [2m[0.4s | 496 MB][0m
-  Phasing complete: 801 samples phased                         [2m[15.2s | 751 MB][0m
-  Diploid intra-run ensemble: averaging 2 members from one phasing chain [2m[15.2s | 751 MB][0m
-  Genetic map loaded + LD correction                           [2m[15.2s | 751 MB][0m
+  Input is unphased — running phasing pipeline...              [2m[0.3s | 398 MB][0m
+  Phasing replicas on: each of the 801 sample(s) phased as 2 copies banned from each other, dosages averaged over all copies' members (default for an unphased cohort above 8 samples: two copies of one member each (SELPHI_DIPLOID_REPLICAS_COHORT_MAX caps it); SELPHI_DIPLOID_REPLICAS=1 turns it off) [2m[0.3s | 398 MB][0m
+  Ref bitmatrix extracted (9283 target sites × 4802 haps, 5.6 MB) [2m[0.4s | 484 MB][0m
+  Using Diploid phasing                                        [2m[0.4s | 484 MB][0m
+  Common ref subset (9037 / 9283 variants, 5.5 MB)             [2m[0.4s | 484 MB][0m
+  Diploid phasing of 2 copies of each sample, 1 member(s) each: 2 ensemble members (1× phasing of 1602 samples) [2m[0.4s | 484 MB][0m
+  Phasing complete: 801 samples phased                         [2m[25.2s | 814 MB][0m
+  Diploid intra-run ensemble: averaging 2 members from 2 co-phased replicas [2m[25.2s | 814 MB][0m
+  Genetic map loaded + LD correction                           [2m[25.2s | 814 MB][0m
   formats:  VCF.gz
-  PBWT sort shared across 16 targets (101 groups on 16 threads; auto: 118 GB available, 15.1 MB per in-flight target -> +3.5 GB; mc/n_ref 1.00). Byte-identical; set SELPHI_PBWT_SHARE=1 to disable.
-    Window 1/1: PBWT=70.5s interp=17.2s (9283 vars)
-  Output: imputed.vcf.gz  (1,070,401 variants × 801 samples · 500.4 MB) [2m[112.3s | 14293 MB][0m
-  Imputation quality: mean DR2 [1;36m0.3619[0m  ·  20.0% of 1,061,118 imputed variants DR2 ≥ 0.8
-  Evaluating accuracy vs truth...                              [2m[112.3s | 14293 MB][0m
+  PBWT sort shared across 16 targets (101 groups on 16 threads; auto: 117 GB available, 15.1 MB per in-flight target -> +3.5 GB; mc/n_ref 1.00). Byte-identical; set SELPHI_PBWT_SHARE=1 to disable.
+  Adaptive emission: 276 of 1602 target haplotypes raised p_err above 0.025 (mean 0.0264; unmatched posterior mass 0.00059 mean) [2m[45.2s | 9534 MB][0m
+  Adaptive emission: 262 of 1602 target haplotypes raised p_err above 0.025 (mean 0.0264; unmatched posterior mass 0.00058 mean) [2m[68.7s | 14135 MB][0m
+    Window 1/1: PBWT=43.5s interp=7.8s (9283 vars)
+  Output: imputed.vcf.gz  (1,070,401 variants × 801 samples · 474.3 MB) [2m[76.6s | 14135 MB][0m
+  Imputation quality: mean DR2 0.3525 · 18.5% of 1,061,118 imputed variants DR2 ≥ 0.8 · mean genotype confidence 0.9905 · 97.2% of calls ≥ 0.9
+  Evaluating accuracy vs truth...                              [2m[76.6s | 14135 MB][0m
+  dosage:   diploid-equivalent R²/concordance; original-copy truth AF
+  DS units: imputed=InputDosageOptions { ds_scale: Native, fallback_ploidy: None }, truth/raw=InputDosageOptions { ds_scale: Native, fallback_ploidy: None }
   imputed:  imputed.vcf.gz
   truth:    truth.vcf.gz
   shared:   801 samples
@@ -44,28 +48,28 @@ Script started on 2026-10-12 21:40:48+00:00 [COMMAND="selphi --refpanel chr22.sr
 
 [1mMAF bin                N variants    Mean R²  Concordance[0m
 ------------------------------------------------------------
-0.05-0.1%                  138764     0.2800       0.9988
-0.1-0.2%                   117614     0.3304       0.9975
-0.2-0.5%                   110884     0.4296       0.9952
-0.5-1%                      62388     0.5129       0.9913
-1-2%                        45155     0.5767       0.9853
-2-5%                        45267     0.6783       0.9755
-5-10%                       28734     0.7608       0.9598
-10-20%                      31518     0.7971       0.9361
-20-50%                      59501     0.8430       0.9167
+0.05-0.1%                  138764     0.2832       0.9988
+0.1-0.2%                   117614     0.3361       0.9975
+0.2-0.5%                   110884     0.4344       0.9953
+0.5-1%                      62388     0.5166       0.9914
+1-2%                        45155     0.5796       0.9854
+2-5%                        45267     0.6804       0.9757
+5-10%                       28734     0.7627       0.9599
+10-20%                      31518     0.7986       0.9365
+20-50%                      59501     0.8437       0.9171
 ------------------------------------------------------------
-[1mOVERALL             [0m      1016325 [1;36m    0.4864[0m       0.9887
+[1mOVERALL             [0m      1016325 [1;36m    0.4899[0m       0.9887
 
 Per-sample (n=801):
-  R²:          mean=[1;36m0.917528[0m, min=0.830983, max=0.946986
-  Concordance: mean=0.988676
+  R²:          mean=[1;36m0.917958[0m, min=0.827915, max=0.947224
+  Concordance: mean=0.988741
 
   Imputed:  1070401 variants
   Truth:    1070401 variants
   Matched:  1016325 variants (94.9% of truth)
   Chromosomes: 1 (22)
-  Accuracy: imputed.eval.json                                  [2m[115.2s | 14293 MB][0m
+  Accuracy: imputed.eval.json                                  [2m[79.6s | 14135 MB][0m
 
-Total: 115s | Peak memory: 14293 MB
+Total: 80s | Peak memory: 14135 MB
 
-Script done on 2026-10-12 21:42:44+00:00 [COMMAND_EXIT_CODE="0"]
+Script done on 2026-10-21 16:45:40+00:00 [COMMAND_EXIT_CODE="0"]

@@ -1,4 +1,4 @@
-Script started on 2026-10-12 21:42:44+00:00 [COMMAND="selphi --refpanel chr22.srp --input wgs.vcf.gz --map chr22.map --out phased --phase-only --threads 16 " <not executed on terminal>]
+Script started on 2026-10-21 16:45:40+00:00 [COMMAND="selphi --refpanel chr22.srp --input wgs.vcf.gz --map chr22.map --out phased --phase-only --threads 16 " <not executed on terminal>]
 [1;36m[selphi][0m SIMD: [32mAVX-512F+DQ[0m
   auto-route: sniff GT=true PL=false GQ=false DP=false call-rate=1.000 (of 108000 GT entries) density=26022/Mb (thr 1000) [2m[0.0s | 626 MB][0m
   auto-route: confident hard calls (GT-only, or GQ/DP below WGS density) [32m→ genotype engine (no refine)[0m [2m[0.0s | 626 MB][0m
@@ -17,19 +17,21 @@ Script started on 2026-10-12 21:42:44+00:00 [COMMAND="selphi --refpanel chr22.sr
   log:      phased.log
 
   Loaded SRP: 1070401 variants, 4478 haplotypes                [2m[0.2s | 626 MB][0m
-  Target: 54 samples, 1070401 variants, phased=false           [2m[1.3s | 1147 MB][0m
+  Target: 54 samples, 1070401 variants, phased=false           [2m[1.6s | 1132 MB][0m
   Variant intersection: 1070399 hash matches, 0 plain matches
-  Shared markers: 1070399 (100.0% of target)                   [2m[1.3s | 1169 MB][0m
-  Auto max_candidates: n_ref=4478, chunk_cv=0.817, scale=0.753 → mc=4478 (clamp [2500..1000000]) [2m[1.4s | 1193 MB][0m
+  Shared markers: 1070399 (100.0% of target)                   [2m[1.6s | 1132 MB][0m
+  Target sites absent from the panel: 2 written as given       [2m[2.7s | 1132 MB][0m
+  Auto max_candidates: n_ref=4478, chunk_cv=0.817, scale=0.753 → mc=4478 (clamp [2500..1000000]) [2m[2.9s | 1214 MB][0m
   Resources: 6.9 GB estimated, 123.1 GB system RAM, 16 threads (mc=4478)
-  Input is unphased — running phasing pipeline...              [2m[1.5s | 1216 MB][0m
-  Phasing engine: Diploid (default; 1070399 target variants)
-  Ref bitmatrix extracted (1070399 target sites × 4478 haps, 599.4 MB) [2m[1.8s | 1527 MB][0m
-  Using Diploid phasing                                        [2m[1.8s | 1527 MB][0m
-  Common ref subset (347061 / 1070399 variants, 194.4 MB)      [2m[1.9s | 1700 MB][0m
-  Phasing complete: 54 samples phased                          [2m[64.2s | 5387 MB][0m
-  Phase-only VCF: phased.vcf.gz                                [2m[65.1s | 5387 MB][0m
+  Input is unphased — running phasing pipeline...              [2m[3.0s | 1246 MB][0m
+  Ref bitmatrix extracted (1070399 target sites × 4478 haps, 599.4 MB) [2m[3.2s | 1495 MB][0m
+  Using Diploid phasing                                        [2m[3.2s | 1495 MB][0m
+  Private-het routing: 16787 panel-absent singleton sites left to phase_rare (686 kept in the scaffold: position shared with another record) [2m[3.2s | 1495 MB][0m
+  Common ref subset (560653 / 1070399 variants, 314.0 MB)      [2m[3.4s | 1782 MB][0m
+  Phase-only: panel kept at the 16787 rare sites (9.4 MB), chip-site matrix released [2m[3.4s | 1782 MB][0m
+  Phasing complete: 54 samples phased                          [2m[77.0s | 5995 MB][0m
+  Phase-only VCF: phased.vcf.gz                                [2m[77.8s | 5995 MB][0m
 
-Total: 65s | Peak memory: 5387 MB
+Total: 78s | Peak memory: 5995 MB
 
-Script done on 2026-10-12 21:43:49+00:00 [COMMAND_EXIT_CODE="0"]
+Script done on 2026-10-21 16:46:58+00:00 [COMMAND_EXIT_CODE="0"]
