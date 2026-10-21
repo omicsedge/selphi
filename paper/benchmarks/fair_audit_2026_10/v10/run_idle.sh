@@ -49,7 +49,7 @@ for c in 22 1; do [ -f $O/t6_s5r$c.time ] && continue; wait_idle; log "I table6 
   /usr/bin/time -v $PC --input $IN --reference $T6/ref_panel_no_trios_chr$c.bcf --map $G --region $c --thread 16 --filter-maf 0.001 --output $O/s5c$c.bcf > /dev/null 2> $O/t6_s5c$c.time && bcftools index -f $O/s5c$c.bcf
   /usr/bin/time -v $PR --input $IN --input-region $c:1-${LEN[$c]} --scaffold $O/s5c$c.bcf --scaffold-region $c:1-${LEN[$c]} --map $G --thread 16 --output $O/s5r$c.bcf > /dev/null 2> $O/t6_s5r$c.time
   rm -f $O/s5*$c.bcf*
-  log "RESULT T6 chr$c diploid $(sec $O/t6_diploid$c.time)s $(mem $O/t6_diploid$c.time)GB | haploid $(sec $O/t6_haploid$c.time)s | beagle $(sec $O/t6_beagle$c.time)s $(mem $O/t6_beagle$c.time)GB | shapeit5 $(echo "$(sec $O/t6_s5c$c.time) + $(sec $O/t6_s5r$c.time)" | bc)s"
+  log "RESULT T6 chr$c diploid $(sec $O/t6_diploid$c.time)s $(mem $O/t6_diploid$c.time)GB| beagle $(sec $O/t6_beagle$c.time)s $(mem $O/t6_beagle$c.time)GB | shapeit5 $(echo "$(sec $O/t6_s5c$c.time) + $(sec $O/t6_s5r$c.time)" | bc)s"
   # 6b: Selphi with the parents (--ped), children scored
   PEDIN=$DATA_ROOT/work/benchmarks/table6/chr$c/trio162_wgs_unph.bcf
   if [ -f $PEDIN ]; then
