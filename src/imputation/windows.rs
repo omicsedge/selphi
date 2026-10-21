@@ -24,20 +24,43 @@ pub struct ImputationWindow {
 /// PBWT match length, 10).
 const MIN_WINDOW_MARKERS: usize = 16;
 
+/// Most typed markers one window may hold (`SELPHI_WINDOW_MAX_MARKERS`, 0 = no cap). A window's
+/// weights are held for every typed marker of every target haplotype until it is interpolated,
+/// so at WGS density an 80-cM window (855,000 markers on chromosome 22) took 46-51 GB for one
+/// sample. Array windows hold 10,000-60,000 markers and an overlap of a few hundred, so the cap
+/// never binds on them.
+pub const DEFAULT_WINDOW_MAX_MARKERS: usize = 100_000;
+
+/// The window marker cap in effect (see [`DEFAULT_WINDOW_MAX_MARKERS`]).
+pub fn window_max_markers() -> usize {
+    crate::config::raw("SELPHI_WINDOW_MAX_MARKERS")
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_WINDOW_MAX_MARKERS)
+}
+
 /// Compute overlapping imputation windows from LD-corrected cM coordinates.
+///
+/// `max_markers` (0 = none) caps the markers of a window and, at an eighth of it, of its
+/// overlap with the next one; a window that reaches it ends early, so its span in cM is
+/// whatever that many markers cover.
 pub fn compute_imputation_windows(
-    chip_cm: &[f64], window_cm: f64, overlap_cm: f64,
+    chip_cm: &[f64], window_cm: f64, overlap_cm: f64, max_markers: usize,
 ) -> Vec<ImputationWindow> {
     let n_var = chip_cm.len();
     if n_var == 0 { return vec![]; }
+    // Below MIN_WINDOW_MARKERS a cap would leave windows too short to carry a PBWT match.
+    let max_markers = if max_markers == 0 { usize::MAX } else { max_markers.max(8 * MIN_WINDOW_MARKERS) };
 
     let total_cm = chip_cm[n_var - 1] - chip_cm[0];
-    if window_cm <= 0.0 || total_cm <= window_cm {
+    if (window_cm <= 0.0 || total_cm <= window_cm) && n_var <= max_markers {
         return vec![ImputationWindow {
             chip_start: 0, chip_end: n_var,
             own_chip_start: 0, own_chip_end: n_var,
         }];
     }
+    // No cM limit (`--window-cm 0`, or a chromosome shorter than one window) with more
+    // markers than the cap: windows are cut by markers alone.
+    let window_cm = if window_cm <= 0.0 || total_cm <= window_cm { f64::INFINITY } else { window_cm };
 
     // overlap_cm must be < window_cm: otherwise the stride is ≤ 0, windows stop
     // advancing, the owned regions never reach the last marker (silent variant loss),
@@ -51,7 +74,6 @@ pub fn compute_imputation_windows(
     } else {
         overlap_cm
     };
-
     let stride_cm = window_cm - overlap_cm;
 
     // Build raw windows: (ws, we, overlap_start_idx)
@@ -75,6 +97,7 @@ pub fn compute_imputation_windows(
                 break;
             }
         }
+        we = we.min(ws.saturating_add(max_markers));
         if let Some(&(_, prev_we, _)) = raw.last() { we = we.max(prev_we); }
         let we = we.max(ws + 1);
 
@@ -88,7 +111,7 @@ pub fn compute_imputation_windows(
                     break;
                 }
             }
-            os
+            os.max(we - (max_markers / 8).min(we))
         } else {
             we
         };
@@ -178,10 +201,12 @@ mod tiling_tests {
             }
             let window = [0.5, 2.0, 5.0, 10.0][case % 4];
             let overlap = window * [0.1, 0.25, 0.5, 0.9][(case / 4) % 4];
-            let w = compute_imputation_windows(&cm, window, overlap);
-            assert_tiles(&w, n);
-            // Every window reaches a marker the previous one lacks.
-            for x in w.windows(2) { assert!(x[1].chip_end > x[0].chip_end, "{:?}", x); }
+            for cap in [0, 128 + (rnd() % 200) as usize] {
+                let w = compute_imputation_windows(&cm, window, overlap, cap);
+                assert_tiles(&w, n);
+                // Every window reaches a marker the previous one lacks.
+                for x in w.windows(2) { assert!(x[1].chip_end > x[0].chip_end, "{:?}", x); }
+            }
         }
     }
 
@@ -190,24 +215,45 @@ mod tiling_tests {
     #[test]
     fn gap_wider_than_window() {
         let cm: Vec<f64> = (0..100).map(|i| i as f64 * 0.01).chain((0..100).map(|i| 100.0 + i as f64 * 0.01)).collect();
-        let w = compute_imputation_windows(&cm, 80.0, 2.0);
+        let w = compute_imputation_windows(&cm, 80.0, 2.0, 0);
         assert_tiles(&w, 200);
         assert_eq!(w.len(), 2, "{w:?}");
         assert_eq!((w[0].chip_start, w[0].chip_end, w[0].own_chip_end), (0, 100, 100));
         assert_eq!((w[1].chip_start, w[1].own_chip_start), (100, 100));
         let cm: Vec<f64> = (0..60).map(|i| i as f64 * 0.1).chain((0..60).map(|i| 14.0 + i as f64 * 0.1)).collect();
-        let w = compute_imputation_windows(&cm, 5.0, 1.0);
+        let w = compute_imputation_windows(&cm, 5.0, 1.0, 0);
         assert_tiles(&w, 120);
         assert!(w.iter().all(|x| x.chip_end - x.chip_start >= 10), "{w:?}");
         // One marker after a gap at the chromosome's end joins the window before it.
         let cm: Vec<f64> = (0..50).map(|i| i as f64 * 0.1).chain([8.4]).collect();
-        let w = compute_imputation_windows(&cm, 5.0, 1.0);
+        let w = compute_imputation_windows(&cm, 5.0, 1.0, 0);
         assert_tiles(&w, 51);
         assert!(w.iter().all(|x| x.chip_end - x.chip_start >= MIN_WINDOW_MARKERS), "{w:?}");
         // ... and a few markers before a gap at its start join the window after it.
         let cm: Vec<f64> = (0..3).map(|i| i as f64 * 0.1).chain((0..60).map(|i| 10.0 + i as f64 * 0.1)).collect();
-        let w = compute_imputation_windows(&cm, 5.0, 1.0);
+        let w = compute_imputation_windows(&cm, 5.0, 1.0, 0);
         assert_tiles(&w, 63);
         assert!(w.iter().all(|x| x.chip_end - x.chip_start >= MIN_WINDOW_MARKERS), "{w:?}");
+    }
+
+    /// WGS density: the marker cap bounds every window and its overlap, the owned regions
+    /// still tile, and a cap the windows never reach changes nothing.
+    #[test]
+    fn marker_cap_bounds_windows() {
+        let cm: Vec<f64> = (0..10_000).map(|i| i as f64 * 0.007).collect(); // 70 cM
+        for (window, cap) in [(80.0, 1000), (80.0, 2500), (5.0, 1000), (0.0, 1000)] {
+            let w = compute_imputation_windows(&cm, window, 2.0, cap);
+            assert_tiles(&w, cm.len());
+            assert!(w.len() > 1, "{w:?}");
+            assert!(w.iter().all(|x| x.chip_end - x.chip_start <= cap), "{w:?}");
+            for x in w.windows(2) {
+                assert!(x[1].chip_end > x[0].chip_end && x[0].chip_end - x[1].chip_start <= cap / 8, "{x:?}");
+            }
+        }
+        for (window, overlap) in [(80.0, 2.0), (5.0, 1.0), (10.0, 2.0)] {
+            let a = compute_imputation_windows(&cm, window, overlap, 0);
+            let b = compute_imputation_windows(&cm, window, overlap, 100_000);
+            assert_eq!(format!("{a:?}"), format!("{b:?}"));
+        }
     }
 }

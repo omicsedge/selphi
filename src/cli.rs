@@ -176,14 +176,14 @@ pub struct Args {
     pub engine: Option<Engine>,
 
     /// Hybrid GL-aware refinement of the chip/WGS imputation HMM. When set,
-    /// Selphi reads a per-chip-site input confidence c[v] ∈ [0,1] from the
-    /// target VCF (GQ, else PL, else DP) and softens the Li-Stephens emission
-    /// at low-confidence sites toward flat (lean on LD) instead of trusting the
-    /// hard call. MVP: for multi-sample input, c is the MINIMUM confidence
-    /// across samples at each site (a site is "soft" if ANY sample is soft);
-    /// a per-haplotype version is a later step. Default OFF → bit-identical to
-    /// the shipped hard-call path. The hard calls still flow to the bitmatrix
-    /// unchanged; only the HMM emission weighting is affected.
+    /// Selphi reads an input confidence c ∈ [0,1] per site and sample from the
+    /// target VCF (GQ, else PL, else DP) and softens each haplotype's
+    /// Li-Stephens emission at its own sample's low-confidence calls toward flat
+    /// (lean on LD) instead of trusting the hard call; a call below
+    /// SELPHI_REFINE_THR is written as the imputed dosage, every other call as
+    /// given. Default OFF → bit-identical to the hard-call path. With PL in the
+    /// input the low-coverage engine (what `--engine auto` picks) is more
+    /// accurate at every coverage measured (HG002 chromosome 22 at 4x, 10x, 30x).
     ///
     /// LEGACY alias for `--engine refine`. Still honoured; `--engine` wins if
     /// both are given.

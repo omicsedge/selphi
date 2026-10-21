@@ -899,7 +899,8 @@ pub fn run_multi_chr(
             );
 
         // Compute imputation windows
-        let windows = compute_imputation_windows(&chip_cm, config.window_cm, config.overlap_cm);
+        let windows = compute_imputation_windows(&chip_cm, config.window_cm, config.overlap_cm,
+            selphi::imputation::windows::window_max_markers());
 
         // MAF-adaptive Ne
         let ne_low = est_ne as f64 * 0.85;

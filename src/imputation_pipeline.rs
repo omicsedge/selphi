@@ -1277,7 +1277,8 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
         match_length, fl_fwd, fl_bwd, est_ne);
 
     // 8. Compute imputation windows
-    let windows = compute_imputation_windows(&chip_cm, args.window_cm, args.overlap_cm);
+    let windows = compute_imputation_windows(&chip_cm, args.window_cm, args.overlap_cm,
+        selphi::imputation::windows::window_max_markers());
     selphi_debug!("  Windows: {} ({}cM, {}cM overlap)", windows.len(), args.window_cm, args.overlap_cm);
     for (wi, w) in windows.iter().enumerate() {
         let cm_span = chip_cm[w.chip_end - 1] - chip_cm[w.chip_start];

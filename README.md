@@ -283,6 +283,8 @@ selphi \
 
 Supported for all output formats, which can be combined (e.g. `--bcf --parquet --pgen --sample-batch-size 100`); each format has its own per-batch writer and native sample-merger.
 
+A WGS-density genotype input (hundreds of thousands of called sites per chromosome) is imputed in windows of at most 100,000 typed sites (`SELPHI_WINDOW_MAX_MARKERS`), because a window's copying weights are held for every typed site until it is interpolated. One 30× sample on chromosome 22 (918,000 called sites, 4,478-haplotype panel) peaks at 6.7 GB in these windows, against 51 GB in 80-cM windows, with the same R².
+
 ### Reference panel preparation
 
 Create an SRP reference panel from VCF, BCF, or BREF3 (source format auto-detected). The `.srp` is written next to the source by default (`panel.bcf` → `panel.srp`).
@@ -528,6 +530,7 @@ selphi --self-test --refpanel panel.srp --input target.vcf.gz --map chr.map --ou
 | `SELPHI_DIPLOID_REPLICAS_COHORT_MAX=N` (environment) | Largest run the automatic two-copy replicas apply to | 1000 |
 | `--window-cm F` | Imputation window size in cM | 80 |
 | `--overlap-cm F` | Window overlap in cM | 2 |
+| `SELPHI_WINDOW_MAX_MARKERS=N` (environment) | Most typed sites in one imputation window (its overlap with the next: an eighth of that); 0 = cM windows only. The arrays benchmarked here (10,000-60,000 typed sites per window) never reach it; a WGS-density input does | 100000 |
 | `--sample-batch-size N` | Memory-bounded mode: process target samples in batches of N (0 = off); all formats. Turns the phase ensemble off | 0 |
 
 ## How it works
