@@ -28,8 +28,30 @@
 
 > Methodology, parameters, and full benchmark tables (accuracy, phasing switch-error, speed/memory, and comparisons to Beagle, IMPUTE5, Minimac4, SHAPEIT5, GLIMPSE2 and QUILT2) are in the Selphi 2 manuscript (in preparation). This README is a usage reference.
 
+## Quick start
+
+```bash
+# 1. Build (Rust 1.89+)
+git clone -b new_version/selphi2_cluster https://github.com/omicsedge/selphi.git && cd selphi
+cargo build --release                       # binary: target/release/selphi
+
+# 2. Convert the reference panel once: VCF.gz, BCF or BREF3 -> panel.chr22.srp next to the source
+selphi --prepare-reference-from panel.chr22.bcf --threads 16
+
+# 3a. Array or WGS genotypes (VCF/BCF, phased or unphased)
+selphi --refpanel panel.chr22.srp --input sample.vcf.gz --map plink.chr22.GRCh38.map \
+  --out imputed --threads 16
+
+# 3b. Low-coverage sequencing, straight from aligned reads (a PL VCF works too, via --input)
+selphi --bam sample.bam --reference GRCh38.fa --refpanel panel.chr22.srp \
+  --map plink.chr22.GRCh38.map --out imputed --threads 16
+```
+
+No other flag is needed. Selphi reads the input and picks the engine (array, WGS or low-coverage reads), phases the samples and sets the phasing from the size of the run, and the log says what it chose. The result is `imputed.vcf.gz` with its `.tbi`. Add `--bcf`, `--parquet`, `--pgen` or `--selfdecode` for other formats, `--phase-only` to phase without imputing, and see [Whole-genome imputation](#whole-genome-imputation) to run every chromosome in one command. A genetic map in PLINK format is required ([Genetic maps](#genetic-maps)).
+
 ## Contents
 
+- [Quick start](#quick-start)
 - [Installation](#installation)
   - [Distribution binaries](#distribution-binaries)
   - [Genetic maps](#genetic-maps)
