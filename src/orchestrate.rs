@@ -741,6 +741,7 @@ pub fn run_multi_chr(
     let mut replicas_said = false;
     // Panel-matched records seen, and whether any carried a called genotype (after the fill).
     let (mut n_matched_total, mut called_any) = (0usize, false);
+    let mut called_samples = vec![false; n_samples];
     for (chr_idx, chr_name) in chromosomes.iter().enumerate() {
         let chr_start = Instant::now();
         selphi_info!("  [{}/{}] chr{}", chr_idx + 1, n_chr, chr_name);
@@ -769,6 +770,7 @@ pub fn run_multi_chr(
             if let Some((_, g)) = target_by_chr.get(key).or_else(|| target_by_chr.get(chr_name.as_str())) {
                 n_matched_total += matched_idx.len();
                 called_any |= selphi::io::target_io::any_called(g, &target_idx);
+                if n_samples > 1 { selphi::io::target_io::mark_called_samples(g, &matched_idx, &mut called_samples); }
             }
         }
         selphi_info!("    {} ref variants, {} shared markers", n_ref_variants, n_chip);
@@ -1210,6 +1212,7 @@ pub fn run_multi_chr(
     if n_matched_total > 0 && !called_any {
         selphi::io::target_io::refuse_uncalled(n_matched_total);
     }
+    if n_samples > 1 { selphi::io::target_io::log_uncalled_samples(&sample_names, &called_samples); }
 
     // 7. Finalize output writer
     if formats.vcf || formats.bcf {

@@ -147,6 +147,43 @@ fn parse_pl_field(bytes: &[u8]) -> Option<([i32; 3], bool)> {
     }
 }
 
+/// `GL` (log10 likelihoods) as `PL`: `round(-10·GL)` relative to the best, as `PL` is, so `GL`
+/// written from `PL` (`bcftools +tag2tag --PL-to-GL`) reads back as that `PL` and an
+/// unnormalised one stays inside the Phred table (a haploid pair's product form doubles it).
+/// `None` for a missing or non-finite value.
+pub fn gl_to_pl(gl: &[f64]) -> Option<Vec<i32>> {
+    if gl.is_empty() || gl.iter().any(|g| !g.is_finite()) { return None; }
+    let mut p: Vec<i64> = gl.iter().map(|g| (-10.0 * g).round() as i64).collect();
+    let lo = *p.iter().min()?;
+    for x in &mut p { *x -= lo; }
+    if p.iter().any(|&x| x < 0) { return None; }
+    Some(p.into_iter().map(|x| x.min(i64::from(i32::MAX)) as i32).collect())
+}
+
+/// A text `GL` subfield as `PL` (see [`gl_to_pl`]).
+fn parse_gl_text(bytes: &[u8]) -> Option<Vec<i32>> {
+    if bytes.is_empty() || bytes == b"." { return None; }
+    let v: Option<Vec<f64>> = bytes.split(|&b| b == b',').map(|x| std::str::from_utf8(x).ok()?.trim().parse::<f64>().ok()).collect();
+    gl_to_pl(&v?)
+}
+
+/// A whole `PL` list as [`parse_pl_field`] reads one: three values diploid, two haploid.
+fn pl_list_field(v: &[i32]) -> Option<([i32; 3], bool)> {
+    match v { [a, b, c] => Some(([*a, *b, *c], false)), [a, b] => Some((haploid_pl(*a, *b), true)), _ => None }
+}
+
+/// A BCF sample's `PL`, else its `GL` read as `PL`.
+fn bcf_sample_pl(sample: &noodles_vcf::variant::record_buf::samples::Sample<'_>) -> Option<Vec<i32>> {
+    use noodles_vcf::variant::record_buf::samples::sample::value::{Array, Value};
+    // A PL with a missing value falls back to GL, as the text reader does.
+    if let Some(Value::Array(Array::Integer(v))) = sample.get("PL").flatten()
+        && let Some(pl) = v.iter().copied().collect::<Option<Vec<i32>>>() { return Some(pl); }
+    match sample.get("GL").flatten() {
+        Some(Value::Array(Array::Float(v))) => gl_to_pl(&v.iter().map(|x| x.map(f64::from)).collect::<Option<Vec<f64>>>()?),
+        _ => None,
+    }
+}
+
 /// Find the index of `name` within a colon-separated FORMAT spec
 /// (`b"GT:DP:PL"` → 2 for `b"PL"`). None if absent.
 #[inline]
@@ -325,7 +362,7 @@ fn bcf_value_to_pl3(
 fn parse_pl_bcf(path: &str, hash_alleles_against_srp: bool, keep: Option<&BlockSites>) -> std::io::Result<PlVcfResult> {
     use noodles_bcf as bcf;
     use noodles_vcf::variant::record_buf::info::field::Value as Iv;
-    use noodles_vcf::variant::record_buf::samples::sample::value::{Array, Value};
+    use noodles_vcf::variant::record_buf::samples::sample::value::Value;
     let mut reader = bcf::io::reader::Builder::default().build_from_path(path)?;
     let header = reader.read_header()?;
     let sample_ids: Vec<String> = header.sample_names().iter().cloned().collect();
@@ -346,9 +383,7 @@ fn parse_pl_bcf(path: &str, hash_alleles_against_srp: bool, keep: Option<&BlockS
             let end = match rec.info().get("END") { Some(Some(Iv::Integer(e))) => Some(i64::from(*e)), _ => None };
             let samples = rec.samples();
             let fields: Vec<SampleFields> = samples.values().take(n_samples).map(|sample| SampleFields {
-                pl: match sample.get("PL").flatten() {
-                    Some(Value::Array(Array::Integer(v))) => v.iter().copied().collect::<Option<Vec<i32>>>(),
-                    _ => None },
+                pl: bcf_sample_pl(&sample),
                 gt: match sample.get("GT").flatten() {
                     Some(Value::Genotype(g)) => Some(g.as_ref().iter().map(|a| a.position().map(|p| p as u32)).collect()),
                     _ => None },
@@ -377,7 +412,8 @@ fn parse_pl_bcf(path: &str, hash_alleles_against_srp: bool, keep: Option<&BlockS
         let samples = rec.samples();
         for (s, sample) in samples.values().enumerate() {
             if s >= n_samples { break; }
-            let pl_opt = sample.get("PL").flatten().and_then(bcf_value_to_pl3);
+            let pl_opt = sample.get("PL").flatten().and_then(bcf_value_to_pl3)
+                .or_else(|| bcf_sample_pl(&sample).as_deref().and_then(pl_list_field));
             if here && pl_opt.is_some_and(|p| p.1) { body.haploid_samples[s] = true; }
             let (_, glp, valid) = pl_to_hl_gl3(pl_opt.map(|p| p.0));
             if !valid { body.n_missing_pl += 1; }
@@ -653,9 +689,11 @@ fn parse_record_line(line: &[u8], n_samples: usize, hash_alleles_against_srp: bo
         let format_bytes = &line[tabs[7]+1..tabs[8]];
         let (pl_i, gt_i, dp_i) = (find_format_subfield(format_bytes, b"PL"), find_format_subfield(format_bytes, b"GT"),
             find_format_subfield(format_bytes, b"DP"));
+        let gl_i = find_format_subfield(format_bytes, b"GL");
         let fields: Vec<SampleFields> = line[tabs[8]+1..].split(|&b| b == b'\t').take(n_samples).map(|field| SampleFields {
             pl: pl_i.and_then(|i| extract_subfield(field, i)).filter(|p| *p != b".")
-                .and_then(|p| p.split(|&b| b == b',').map(|x| { let v = fast_parse_i32(x); (v >= 0).then_some(v) }).collect()),
+                .and_then(|p| p.split(|&b| b == b',').map(|x| { let v = fast_parse_i32(x); (v >= 0).then_some(v) }).collect())
+                .or_else(|| gl_i.and_then(|i| extract_subfield(field, i)).and_then(parse_gl_text)),
             gt: gt_i.and_then(|i| extract_subfield(field, i)).map(|g| g.split(|&b| b == b'/' || b == b'|')
                 .map(|a| std::str::from_utf8(a).ok()?.parse::<u32>().ok()).collect()),
             dp: dp_i.and_then(|i| extract_subfield(field, i)).map(fast_parse_i32).filter(|&d| d >= 0),
@@ -670,6 +708,8 @@ fn parse_record_line(line: &[u8], n_samples: usize, hash_alleles_against_srp: bo
     // FORMAT subfield index for PL
     let format_bytes = &line[tabs[7]+1..tabs[8]];
     let pl_pos = find_format_subfield(format_bytes, b"PL");
+    // Where PL is absent or missing, GL read as PL.
+    let gl_pos = find_format_subfield(format_bytes, b"GL");
 
     // Allocate marker (one String triple per variant — unavoidable)
     let ref_allele = std::str::from_utf8(ref_bytes).unwrap_or("").to_string();
@@ -706,9 +746,8 @@ fn parse_record_line(line: &[u8], n_samples: usize, hash_alleles_against_srp: bo
         // (h0, h1) = pre-marginalized per-hap likelihood;
         // (g0, g1, g2) = normalized 3-way genotype likelihood. Shared with
         // the BCF path via pl_to_hl_gl3 so both produce identical GLs.
-        let pl_opt = pl_pos
-            .and_then(|p| extract_subfield(field, p))
-            .and_then(parse_pl_field);
+        let pl_opt = pl_pos.and_then(|p| extract_subfield(field, p)).and_then(parse_pl_field)
+            .or_else(|| gl_pos.and_then(|p| extract_subfield(field, p)).and_then(parse_gl_text).as_deref().and_then(pl_list_field));
         if here && pl_opt.is_some_and(|p| p.1) { out.haploid_samples[s] = true; }
         let (_, glp, valid) = pl_to_hl_gl3(pl_opt.map(|p| p.0));
         if !valid { out.n_missing_pl += 1; }
@@ -811,6 +850,22 @@ chrM\t200\t.\tA\tG,T\t50\t.\t.\tGT:PL\t1:90,0,99\n";
         let keep = BlockSites { contig: "X", positions: &positions };
         assert_eq!(parse_pl_text(text.as_bytes(), false, Some(&keep)).body.haploid_samples, vec![false]);
         assert_eq!(parse_pl_text(text.as_bytes(), false, None).body.haploid_samples, vec![true]);
+    }
+
+    #[test]
+    fn gl_reads_as_the_pl_it_was_written_from() {
+        assert_eq!(gl_to_pl(&[-0.0, -1.5, -25.5]), Some(vec![0, 15, 255]));
+        assert_eq!(gl_to_pl(&[-30.0, -40.0, -31.2]), Some(vec![0, 100, 12]));
+        assert_eq!(gl_to_pl(&[-3.0, -4.0, -5.0]), Some(vec![0, 10, 20]), "relative to the best");
+        assert_eq!(gl_to_pl(&[-13.0, -14.0]), Some(vec![0, 10]), "an unnormalised haploid pair keeps its difference");
+        assert_eq!(gl_to_pl(&[0.0, f64::NAN]), None);
+        let pl = "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n22\t100\t.\tA\tG\t.\t.\t.\tGT:PL\t0/1:30,0,255\n\
+22\t101\t.\tA\tC,T\t.\t.\t.\tGT:PL\t1/2:90,30,60,40,0,70\n";
+        let gl = "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n22\t100\t.\tA\tG\t.\t.\t.\tGT:GL\t0/1:-3,-0,-25.5\n\
+22\t101\t.\tA\tC,T\t.\t.\t.\tGT:GL\t1/2:-9,-3,-6,-4,0,-7\n";
+        let a = parse_pl_text(pl.as_bytes(), false, None).body.gl3;
+        let b = parse_pl_text(gl.as_bytes(), false, None).body.gl3;
+        assert_eq!(a.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), b.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
     }
 
     #[test]

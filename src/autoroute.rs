@@ -324,13 +324,14 @@ fn sniff_vcf_text(raw: &[u8]) -> Sniff {
         let Some((format, samples_region)) = format_and_samples(line) else { continue };
         record_into_sniff(&mut s, format, samples_region);
         if let Some(alt) = line.split(|&b| b == b'\t').nth(4).and_then(|a| std::str::from_utf8(a).ok())
-            && let Some(k) = first_real_alt(alt.split(','))
-            && let Some(pi) = format.split(|&b| b == b':').position(|sub| sub == b"PL") {
+            && let Some(k) = first_real_alt(alt.split(',')) {
             let n_alleles = alt.split(',').count() + 1;
+            let keys: Vec<&[u8]> = format.split(|&b| b == b':').collect();
+            let (pi, gi) = (keys.iter().position(|k| *k == b"PL"), keys.iter().position(|k| *k == b"GL"));
             for field in samples_region.split(|&b| b == b'\t') {
-                let pl = field.split(|&b| b == b':').nth(pi).unwrap_or(b"");
-                let v: Vec<i64> = pl.split(|&b| b == b',').map(|x| std::str::from_utf8(x).ok()
-                    .and_then(|x| x.trim().parse().ok()).unwrap_or(-1)).collect();
+                let pl: Option<Vec<i64>> = pi.and_then(|pi| field.split(|&b| b == b':').nth(pi)).and_then(|p| p.split(|&b| b == b',')
+                    .map(|x| std::str::from_utf8(x).ok()?.trim().parse::<i64>().ok().filter(|&v| v >= 0)).collect());
+                let Some(v) = pl.or_else(|| gi.and_then(|gi| gl_field_as_pl(field, gi))) else { continue };
                 tally_var_pl(&mut s, &v, n_alleles, k);
             }
         }
@@ -386,7 +387,8 @@ fn format_and_samples(line: &[u8]) -> Option<(&[u8], &[u8])> {
 /// field presence and tally GT call-rate across samples.
 fn record_into_sniff(s: &mut Sniff, format: &[u8], samples_region: &[u8]) {
     if format_has(format, b"GT") { s.has_gt = true; }
-    if format_has(format, b"PL") { s.has_pl = true; }
+    // GL is read as PL (`pl_reader::gl_to_pl`) when a record has no PL.
+    if format_has(format, b"PL") || format_has(format, b"GL") { s.has_pl = true; }
     if format_has(format, b"GQ") { s.has_gq = true; }
     if format_has(format, b"DP") { s.has_dp = true; }
 
@@ -409,22 +411,25 @@ fn record_into_sniff(s: &mut Sniff, format: &[u8], samples_region: &[u8]) {
             out.push(v);
         }
     }
-    if let Some(pi) = format.split(|&b| b == b':').position(|sub| sub == b"PL") {
+    let pi = format.split(|&b| b == b':').position(|sub| sub == b"PL");
+    let gi = format.split(|&b| b == b':').position(|sub| sub == b"GL");
+    if pi.is_some() || gi.is_some() {
         for field in samples_region.split(|&b| b == b'\t') {
-            let pl = field.split(|&b| b == b':').nth(pi).unwrap_or(b"");
-            let v: Vec<i64> = pl.split(|&b| b == b',')
-                .filter_map(|x| std::str::from_utf8(x).ok()?.trim().parse().ok()).collect();
+            // A PL with any value missing falls back to GL, as the lcWGS readers do.
+            let pl: Option<Vec<i64>> = pi.and_then(|pi| field.split(|&b| b == b':').nth(pi)).and_then(|p| p.split(|&b| b == b',')
+                .map(|x| std::str::from_utf8(x).ok()?.trim().parse::<i64>().ok().filter(|&v| v >= 0)).collect());
+            let v = pl.or_else(|| gi.and_then(|gi| gl_field_as_pl(field, gi))).unwrap_or_default();
             tally_pl(s, &v);
         }
     }
 }
 
-/// Count one sample's PL of a variant record for [`Sniff::pl_var_n`]: its first ALT that is no
-/// placeholder (`k`, 1-based) out of `n_alleles`, the diploid genotypes 0/0, 0/k, k/k.
+/// Count one sample's PL of a variant record for [`Sniff::pl_var_n`] (a record with an ALT `k`
+/// that is no placeholder, out of `n_alleles`): settled when its two best genotypes, over the
+/// whole diploid PL, are `SURE_PL` apart (a 0/2 against 1/2 near-tie is not).
 fn tally_var_pl(s: &mut Sniff, pl: &[i64], n_alleles: usize, k: usize) {
-    if pl.len() != n_alleles * (n_alleles + 1) / 2 || pl.iter().any(|&p| p < 0) { return; }
-    let h = k * (k + 1) / 2;
-    let mut v = [pl[0], pl[h], pl[h + k]];
+    if k == 0 || pl.len() != n_alleles * (n_alleles + 1) / 2 || pl.iter().any(|&p| p < 0) { return; }
+    let mut v = pl.to_vec();
     v.sort_unstable();
     s.pl_var_n += 1;
     if v[1] - v[0] >= SURE_PL { s.pl_var_sure += 1; }
@@ -433,6 +438,13 @@ fn tally_var_pl(s: &mut Sniff, pl: &[i64], n_alleles: usize, k: usize) {
 /// The 1-based index of a record's first ALT that is neither `.` nor a placeholder.
 fn first_real_alt<'a>(alts: impl Iterator<Item = &'a str>) -> Option<usize> {
     alts.enumerate().find(|(_, a)| *a != "." && !a.is_empty() && !selphi::io::target_io::is_ref_symbolic(a)).map(|(i, _)| i + 1)
+}
+
+/// A text sample's `GL` subfield (FORMAT index `gi`) read as `PL`, as the lcWGS reader reads it.
+fn gl_field_as_pl(field: &[u8], gi: usize) -> Option<Vec<i64>> {
+    let gl = field.split(|&b| b == b':').nth(gi)?;
+    let v: Option<Vec<f64>> = gl.split(|&b| b == b',').map(|x| std::str::from_utf8(x).ok()?.trim().parse::<f64>().ok()).collect();
+    Some(selphi::lcwgs::pl_reader::gl_to_pl(&v?)?.into_iter().map(i64::from).collect())
 }
 
 /// Count one sample's PL in the sniff: diploid biallelic triples only.
@@ -490,7 +502,7 @@ fn sniff_bcf(path: &str) -> std::io::Result<Sniff> {
         // dependency of this crate.)
         for sample in samples.values() {
             if sample.get("GT").is_some() { s.has_gt = true; }
-            if sample.get("PL").is_some() { s.has_pl = true; }
+            if sample.get("PL").is_some() || sample.get("GL").is_some() { s.has_pl = true; }
             if sample.get("GQ").is_some() { s.has_gq = true; }
             if sample.get("DP").is_some() { s.has_dp = true; }
             // GT call-rate: a call is real iff its first allele position is Some.
@@ -502,8 +514,19 @@ fn sniff_bcf(path: &str) -> std::io::Result<Sniff> {
                     if al.iter().all(|a| a.position() == Some(0)) { s.gt_homref += 1; }
                 }
             }
-            if let Some(Some(Value::Array(noodles_vcf::variant::record_buf::samples::sample::value::Array::Integer(pl)))) = sample.get("PL") {
-                let v: Vec<i64> = pl.iter().map(|x| x.map_or(-1, i64::from)).collect();
+            use noodles_vcf::variant::record_buf::samples::sample::value::Array as A;
+            // A missing PL falls back to GL, as the lcWGS reader does.
+            let pl: Option<Vec<i64>> = match sample.get("PL") {
+                Some(Some(Value::Array(A::Integer(pl)))) => Some(pl.iter().map(|x| x.map_or(-1, i64::from)).collect())
+                    .filter(|v: &Vec<i64>| v.iter().all(|&x| x >= 0)),
+                _ => None,
+            };
+            let v = pl.or_else(|| match sample.get("GL") {
+                Some(Some(Value::Array(A::Float(gl)))) => gl.iter().map(|x| x.map(f64::from)).collect::<Option<Vec<f64>>>()
+                    .and_then(|g| selphi::lcwgs::pl_reader::gl_to_pl(&g)).map(|p| p.into_iter().map(i64::from).collect()),
+                _ => None,
+            });
+            if let Some(v) = v {
                 if v.iter().all(|&x| x >= 0) { tally_pl(&mut s, &v); }
                 if let Some(k) = var_k { tally_var_pl(&mut s, &v, n_alleles, k); }
             }
@@ -547,7 +570,7 @@ fn format_keys_anywhere(path: &str) -> (bool, bool) {
         for rec in reader.record_bufs(&header).flatten() {
             if let Some(sample) = rec.samples().values().next() {
                 gt |= sample.get("GT").is_some();
-                pl |= sample.get("PL").is_some();
+                pl |= sample.get("PL").is_some() || sample.get("GL").is_some();
             }
             if gt && pl { break; }
         }
@@ -560,7 +583,7 @@ fn format_keys_anywhere(path: &str) -> (bool, bool) {
     for line in reader.lines().map_while(Result::ok).filter(|l| !l.starts_with('#')) {
         if let Some(fmt) = line.split('\t').nth(8) {
             gt |= fmt.split(':').any(|k| k == "GT");
-            pl |= fmt.split(':').any(|k| k == "PL");
+            pl |= fmt.split(':').any(|k| k == "PL" || k == "GL");
         }
         if gt && pl { break; }
     }

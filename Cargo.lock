@@ -1753,6 +1753,7 @@ dependencies = [
  "noodles-core 0.18.0",
  "noodles-core 0.20.0",
  "noodles-cram",
+ "noodles-csi 0.56.0",
  "noodles-fasta",
  "noodles-sam",
  "noodles-vcf",

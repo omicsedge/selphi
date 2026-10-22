@@ -100,8 +100,11 @@ fn main() {
     // below (eval, merge-srps, prepare-reference, phasing, imputation) share this
     // pool; they used to re-init locally, which silently no-op'd after the first
     // caller and made `--threads` ineffective for later branches.
+    // Workers get 16 MiB of stack: noodles' CRAM decoder needs more than the 2 MiB default
+    // (a samtools 1.22 CRAM of NA24143 chr22 overflowed it; 4 MiB is enough).
     rayon::ThreadPoolBuilder::new()
         .num_threads(args.threads)
+        .stack_size(16 << 20)
         .build_global()
         .ok();
 

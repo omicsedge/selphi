@@ -140,20 +140,23 @@ pub fn run_lcwgs(
     let mut gl3_shared = vec![1.0f32 / 3.0; n_shared * n_samples * 3];
     for (shared_i, &t_idx) in target_idx.iter().enumerate() {
         let dst_off = shared_i * n_samples * 3;
-        if t_idx == usize::MAX {
-            // unlisted: per sample, the first covering block informative for it, else flat
-            if let Some(l) = in_block[shared_i] {
-                for smp in 0..n_samples {
-                    let gl = block_lists[l as usize].iter().map(|&b| &blocks.gl3[(b * n_samples + smp) * 3..(b * n_samples + smp) * 3 + 3])
-                        .find(|g| !(g[0] == g[1] && g[1] == g[2]));
-                    if let Some(g) = gl { gl3_shared[dst_off + 3 * smp..dst_off + 3 * smp + 3].copy_from_slice(g); }
-                }
-            }
-            continue;
+        if t_idx != usize::MAX {
+            let src_off = t_idx * n_samples * 3;
+            gl3_shared[dst_off .. dst_off + n_samples * 3]
+                .copy_from_slice(&gl3_input[src_off .. src_off + n_samples * 3]);
         }
-        let src_off = t_idx * n_samples * 3;
-        gl3_shared[dst_off .. dst_off + n_samples * 3]
-            .copy_from_slice(&gl3_input[src_off .. src_off + n_samples * 3]);
+        // A sample still flat here (unlisted, or listed without PL) takes the first covering
+        // block informative for it.
+        if let Some(l) = in_block[shared_i] {
+            let flat = |g: &[f32]| g[0] == g[1] && g[1] == g[2];
+            for smp in 0..n_samples {
+                let d = dst_off + 3 * smp;
+                if !flat(&gl3_shared[d..d + 3]) { continue; }
+                let gl = block_lists[l as usize].iter().map(|&b| &blocks.gl3[(b * n_samples + smp) * 3..(b * n_samples + smp) * 3 + 3])
+                    .find(|g| !flat(g));
+                if let Some(g) = gl { gl3_shared[d..d + 3].copy_from_slice(g); }
+            }
+        }
     }
     drop(gl3_input);
     drop(blocks);
@@ -192,31 +195,33 @@ fn pad_unlisted_snps(srp: &SrpReader, wgs_idx: Vec<usize>, target_idx: Vec<usize
         .map_or_else(|| srp.variants[i].ref_allele.len() == 1 && srp.variants[i].alt_allele.len() == 1,
             |p| p.3.len() == 1 && p.4.len() == 1);
     let added: Vec<usize> = (lo..=hi.min(srp.variants.len().saturating_sub(1))).filter(|&i| !listed.contains(&i) && is_snp(i)).collect();
-    if added.is_empty() { let n = none(&wgs_idx); return (wgs_idx, target_idx, n); }
-    // The blocks covering each added site (in position order), in start order: a file's blocks do
-    // not overlap, so this is one block or none; overlapping ones (a concatenation) are all kept,
-    // and each sample takes the first informative for it (`block_gl`).
-    let mut cover: Vec<Option<u32>> = Vec::with_capacity(added.len());
+    if added.is_empty() && order.is_empty() { let n = none(&wgs_idx); return (wgs_idx, target_idx, n); }
+    let n_added = added.len();
+    let mut rows: Vec<(usize, usize)> = wgs_idx.into_iter().zip(target_idx).collect();
+    rows.extend(added.into_iter().map(|i| (i, usize::MAX)));
+    rows.sort_by_key(|r| r.0);
+    // The blocks covering each row (in position order), in start order: a file's blocks do not
+    // overlap, so this is one block or none; overlapping ones (a concatenation) are all kept. Each
+    // sample takes the first informative for it where its own likelihoods are flat: every sample at
+    // an unlisted SNP, and one without PL at a listed site.
+    let mut cover: Vec<Option<u32>> = Vec::with_capacity(rows.len());
     let mut active: Vec<usize> = Vec::new();
     let mut next = 0usize;
-    for &i in &added {
+    for &(i, _) in &rows {
         let pos = srp.variants[i].pos;
         while next < order.len() && blocks.start[order[next]] <= pos { active.push(order[next]); next += 1; }
         active.retain(|&b| blocks.end[b] >= pos);
         if active.is_empty() { cover.push(None); continue; }
-        cover.push(Some(lists.len() as u32));
-        lists.push(active.clone());
+        if lists.last() != Some(&active) { lists.push(active.clone()); }
+        cover.push(Some(lists.len() as u32 - 1));
     }
-    let in_blocks = cover.iter().filter(|c| c.is_some()).count();
-    selphi_info!("  {} panel SNP site(s) inside the file's span that it does not list: {} take the likelihoods of the reference block \
-        that covers them, {} enter flat", added.len(), in_blocks, added.len() - in_blocks);
-    let mut rows: Vec<(usize, usize, Option<u32>)> = wgs_idx.into_iter().zip(target_idx).map(|(w, t)| (w, t, None)).collect();
-    rows.extend(added.into_iter().zip(cover).map(|(i, c)| (i, usize::MAX, c)));
-    rows.sort_by_key(|r| r.0);
-    let mut w = Vec::with_capacity(rows.len());
-    let mut t = Vec::with_capacity(rows.len());
-    let mut b = Vec::with_capacity(rows.len());
-    for (x, y, z) in rows { w.push(x); t.push(y); b.push(z); }
+    if n_added > 0 {
+        let in_blocks = rows.iter().zip(&cover).filter(|(r, c)| r.1 == usize::MAX && c.is_some()).count();
+        selphi_info!("  {} panel SNP site(s) inside the file's span that it does not list: {} take the likelihoods of the reference block \
+            that covers them, {} enter flat", n_added, in_blocks, n_added - in_blocks);
+    }
+    let (w, t): (Vec<usize>, Vec<usize>) = rows.into_iter().unzip();
+    let b = cover;
     (w, t, b)
 }
 

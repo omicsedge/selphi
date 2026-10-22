@@ -23,6 +23,8 @@ noodles-bgzf = "0.46"
 noodles-bcf = "0.78"
 noodles-vcf = "0.81"
 noodles-bam = "0.90"
+# The .bai index's per-reference record counts (whether a BAM holds other chromosomes).
+noodles-csi = "0.56"
 noodles-sam = "0.85"
 noodles-core = "0.20"
 # The VCF/BCF readers are built on noodles-core 0.18: their indexed queries take its Region.

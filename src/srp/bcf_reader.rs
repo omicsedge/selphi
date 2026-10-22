@@ -22,6 +22,20 @@ pub struct BcfHeader {
     pub contig_field: String,
     pub gt_key_id: u16,
     pub n_samples: usize,
+    /// The header declares `##FORMAT=<ID=GT,...>` (else `gt_key_id` is a default, not GT's).
+    pub has_gt: bool,
+}
+
+/// The header of a BCF whose genotypes are read: without a GT line the key would default to
+/// FORMAT id 0 (often PL or DP), read as genotypes. Readers of other fields (a DS-only file
+/// scored by the evaluator) use [`read_header_only`].
+fn read_genotype_header(path: &Path) -> io::Result<BcfHeader> {
+    let header = read_header_only(path)?;
+    if header.n_samples > 0 && !header.has_gt {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+            "{}: the BCF header declares no ##FORMAT=<ID=GT,...>: its samples carry no genotypes to read", path.display())));
+    }
+    Ok(header)
 }
 
 /// Thread result: file paths only, no data in RAM.
@@ -122,7 +136,7 @@ pub fn read_bcf_parallel(
     chunk_size: usize,
     tmp_dir: &Path,
 ) -> io::Result<(BcfHeader, Vec<RegionResult>)> {
-    let header = read_header_only(path)?;
+    let header = read_genotype_header(path)?;
 
     // CSI required
     let csi_path = { let mut p = path.as_os_str().to_owned(); p.push(".csi"); PathBuf::from(p) };
@@ -230,6 +244,7 @@ fn process_region(
 
         // GT
         let mut io2 = 0usize;
+        let mut gt_found = ns == 0;
         for _ in 0..nf {
             if io2 >= ib.len() { break; }
             let k = rtint(&ib, &mut io2) as u16;
@@ -278,9 +293,15 @@ fn process_region(
                         if a1 > 0 && a1 < 128 { cols[si*2+1].push(row as i32); }
                     }
                 }
+                gt_found = true;
                 break;
             }
             io2 += fs;
+        }
+        // A record without GT would enter the panel as every haplotype REF.
+        if !gt_found {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                "the panel record at position {} carries no GT: a reference panel needs every haplotype's allele", rec_pos)));
         }
 
         // Write metadata to file (not RAM)
@@ -338,7 +359,7 @@ pub fn read_bcf_parallel_for_contig(
     tmp_dir: &Path,
     contig_csi: &super::csi::ContigCsiIndex,
 ) -> io::Result<(BcfHeader, Vec<RegionResult>)> {
-    let header = read_header_only(path)?;
+    let header = read_genotype_header(path)?;
     let nh = header.n_samples * 2;
 
     let cps = &contig_csi.checkpoints;
@@ -397,7 +418,8 @@ fn parse_header(buf: &[u8]) -> io::Result<BcfHeader> {
             let f: Vec<&str> = l.split('\t').collect(); if f.len() > 9 { sn = f[9..].iter().map(|s| s.to_string()).collect(); }
         }
     }
-    Ok(BcfHeader { n_samples: sn.len(), sample_names: sn, contig_names: cn, contig_field: cf, gt_key_id: gk })
+    let has_gt = t.lines().any(|l| l.starts_with("##FORMAT=<ID=GT,"));
+    Ok(BcfHeader { n_samples: sn.len(), sample_names: sn, contig_names: cn, contig_field: cf, gt_key_id: gk, has_gt })
 }
 
 fn ru32<R: Read>(r: &mut R) -> io::Result<u32> { let mut b=[0u8;4]; r.read_exact(&mut b)?; Ok(u32::from_le_bytes(b)) }
@@ -510,8 +532,9 @@ fn decode_region_dense(
         let mut al = Vec::with_capacity(na);
         for _ in 0..na { al.push(rtstr(&sb, &mut o)); }
 
-        // Locate the GT FORMAT field and decode dense [a0,a1] per sample.
-        let mut var = vec![[0u8, 0u8]; ns];
+        // Locate the GT FORMAT field and decode dense [a0,a1] per sample; a record without
+        // one leaves every sample missing, not REF.
+        let mut var = vec![[GT_MISSING_DENSE, GT_MISSING_DENSE]; ns];
         let mut io2 = 0usize;
         for _ in 0..nf {
             if io2 >= ib.len() { break; }
@@ -560,7 +583,7 @@ fn decode_region_dense(
 pub fn read_bcf_genotypes_parallel(
     path: &Path,
 ) -> io::Result<(BcfHeader, Vec<RawVariant>, Vec<Vec<[u8; 2]>>, bool)> {
-    let header = read_header_only(path)?;
+    let header = read_genotype_header(path)?;
     let csi_path = { let mut p = path.as_os_str().to_owned(); p.push(".csi"); PathBuf::from(p) };
     let csi = super::csi::parse_csi(&csi_path).map_err(|e|
         io::Error::new(io::ErrorKind::NotFound,
@@ -699,7 +722,7 @@ fn seek_vp_for_pos(
 pub fn read_bcf_genotypes_range(
     path: &Path, pos_lo: i64, pos_hi: i64,
 ) -> io::Result<(BcfHeader, Vec<RawVariant>, Vec<Vec<[u8; 2]>>)> {
-    let header = read_header_only(path)?;
+    let header = read_genotype_header(path)?;
     let csi_path = { let mut p = path.as_os_str().to_owned(); p.push(".csi"); PathBuf::from(p) };
     let csi = super::csi::parse_csi(&csi_path).map_err(|e|
         io::Error::new(io::ErrorKind::NotFound, format!("CSI error: {}", e)))?;

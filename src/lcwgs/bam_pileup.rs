@@ -410,10 +410,20 @@ fn pileup_one(
         return Ok((sample_id, vec![1.0f32 / 3.0; sites.pos.len() * 3], PileupReport::default()));
     };
     // Region mode with a .bai index → fetch only the region's reads (avoids
-    // reading the whole file). Otherwise stream all records (zero-alloc reuse).
+    // reading the whole file). Without a region, a BAM whose index puts most of its
+    // reads on other chromosomes (a whole-genome BAM for a one-chromosome run) is
+    // queried for this chromosome alone: the same reads in the same order. Otherwise
+    // stream all records (zero-alloc reuse; its BGZF blocks inflate on decoder threads).
     let bai_path = format!("{path}.bai");
-    let region_query = region.filter(|_| std::path::Path::new(&bai_path).exists());
-    let index = match region_query { Some(_) => Some(bam::bai::fs::read(&bai_path)?), None => None };
+    let index = if std::path::Path::new(&bai_path).exists() { Some(bam::bai::fs::read(&bai_path)?) } else { None };
+    let region_query = match region {
+        Some(r) => index.as_ref().map(|_| r),
+        None => index.as_ref().filter(|ix| mostly_elsewhere(ix, target_rid))
+            .and_then(|_| header.reference_sequences().get_index(target_rid).map(|(_, rs)| (1, usize::from(rs.length()) as i64))),
+    };
+    if region.is_none() && region_query.is_some() {
+        crate::selphi_info!("  lcWGS-BAM: {}: reading {} through its index (the BAM holds other chromosomes)", path, String::from_utf8_lossy(&contig_name));
+    }
 
     let mut cigar_buf: Vec<(Kind, usize)> = Vec::with_capacity(16);
     let mut seq_buf: Vec<u8> = Vec::with_capacity(256);
@@ -483,6 +493,17 @@ fn pileup_one(
     Ok((sample_id, gl, rep))
 }
 
+/// Whether a `.bai` index counts fewer than half of the mapped reads on `target_rid` (no
+/// per-reference counts: false, the file is streamed).
+fn mostly_elsewhere(index: &bam::bai::Index, target_rid: usize) -> bool {
+    use noodles_csi::binning_index::ReferenceSequence as _;
+    let counts: Option<Vec<u64>> = index.reference_sequences().iter().map(|r| r.metadata().map(|m| m.mapped_record_count())).collect();
+    let Some(counts) = counts else { return false };
+    let total: u64 = counts.iter().sum();
+    let here = counts.get(target_rid).copied().unwrap_or(0);
+    total > 0 && 2 * here < total
+}
+
 /// Decoder threads inflating one BAM's BGZF blocks for a single-sample pileup.
 const BGZF_DECODERS: usize = 4;
 
@@ -526,9 +547,23 @@ fn pileup_one_cram(
     let Some((target_rid, contig_name)) = resolve_contig(&header, chrom) else {
         return Ok((sample_id, vec![1.0f32 / 3.0; sites.pos.len() * 3], PileupReport::default()));
     };
-    // Region mode with a .crai index → decode only the region. Else stream all.
+    // Region mode with a .crai index → decode only the region. Without a region, a CRAM whose
+    // index puts most of its containers on other chromosomes is read for this chromosome alone
+    // (as the BAM path does). Else stream all.
     let crai_path = format!("{path}.crai");
-    let region_query = region.filter(|_| std::path::Path::new(&crai_path).exists());
+    let region_query = match region {
+        Some(r) => std::path::Path::new(&crai_path).exists().then_some(r),
+        None if std::path::Path::new(&crai_path).exists() => {
+            let crai = cram::crai::fs::read(&crai_path)?;
+            let here = crai.iter().filter(|r| r.reference_sequence_id() == Some(target_rid)).count();
+            let len = { let (_, h) = open()?; h.reference_sequences().get_index(target_rid).map(|(_, rs)| usize::from(rs.length()) as i64) };
+            (2 * here < crai.len()).then_some(()).and(len).map(|l| {
+                crate::selphi_info!("  lcWGS-CRAM: {}: reading {} through its index (the CRAM holds other chromosomes)", path, String::from_utf8_lossy(&contig_name));
+                (1, l)
+            })
+        }
+        None => None,
+    };
     let index: Option<cram::crai::Index> = match region_query {
         Some((rs, re)) => {
             // noodles' CRAM Query decodes EVERY container of the reference sequence
@@ -536,6 +571,9 @@ fn pileup_one_cram(
             // early-stop). Pre-filter the crai to the containers whose ref span
             // overlaps [rs,re] so only those are seeked + decoded — O(region), not
             // O(chromosome). The per-read interval filter inside Query still applies.
+            // One entry per CONTAINER: the index has one per slice, and the query decodes the whole
+            // container for each, so a container of several slices would replay its reads.
+            let mut seen = std::collections::HashSet::new();
             Some(cram::crai::fs::read(&crai_path)?
                 .into_iter()
                 .filter(|r| {
@@ -545,6 +583,7 @@ fn pileup_one_cram(
                         astart <= re && aend >= rs
                     }
                 })
+                .filter(|r| seen.insert(r.offset()))
                 .collect())
         }
         None => None,

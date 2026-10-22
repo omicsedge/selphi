@@ -123,6 +123,18 @@ fn load_one_map(map_path: &Path, contig: Option<&str>) -> std::io::Result<(Vec<i
     }
     let several = rows.first().is_some_and(|f| rows.iter().any(|r| map_chrom(r.0) != map_chrom(f.0)));
     let want = contig.map(map_chrom);
+    // A one-chromosome map labelled with another chromosome (chr21's map for a chr22 run) would be
+    // read as this chromosome's. Labels that name no chromosome (`.`, `0`) are not checked; chrX
+    // reads its PAR (XY) rows.
+    if !several && let (Some(w), Some(f)) = (want.as_deref(), rows.first()) {
+        let got = map_chrom(f.0);
+        let names_one = got.parse::<u32>().is_ok_and(|n| (1..=22).contains(&n)) || matches!(got.as_str(), "X" | "Y" | "XY" | "MT");
+        if names_one && got != w && !(w == "X" && got == "XY") {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!(
+                "{} is the genetic map of chromosome {}, but the run is on chromosome {}: give that chromosome's map",
+                map_path.display(), got, w)));
+        }
+    }
     if several && want.is_none() {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!(
             "{} holds several chromosomes; give the map of the run's chromosome (or --map-dir)",
@@ -538,6 +550,22 @@ mod stitch_tests {
 #[cfg(test)]
 mod contig_map_tests {
     use super::*;
+
+    #[test]
+    fn a_map_labelled_with_another_chromosome_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("chr21.map");
+        std::fs::write(&p, "21 . 0.0 1000\n21 . 1.0 2000\n").unwrap();
+        assert!(load_genetic_map_for(&p, Some("chr22")).is_err());
+        assert!(load_genetic_map_for(&p, Some("chr21")).is_ok());
+        assert!(load_genetic_map_for(&p, None).is_ok());
+        let q = dir.path().join("nolabel.map");
+        std::fs::write(&q, ". . 0.0 1000\n. . 1.0 2000\n").unwrap();
+        assert!(load_genetic_map_for(&q, Some("22")).is_ok(), "a label naming no chromosome is not checked");
+        let x = dir.path().join("par.map");
+        std::fs::write(&x, "25 . 0.0 1000\n25 . 1.0 2000\n").unwrap();
+        assert!(load_genetic_map_for(&x, Some("chrX")).is_ok(), "PAR rows on a chrX run");
+    }
 
     fn write(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
         let p = dir.join(name);

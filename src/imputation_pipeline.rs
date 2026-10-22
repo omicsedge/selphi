@@ -807,6 +807,11 @@ fn load_and_intersect(args: &Args, target_path: &str, srp: &SrpReader) -> Loaded
     if !target_idx.is_empty() && !selphi::io::target_io::any_called(&target_genotypes, &target_idx) {
         selphi::io::target_io::refuse_uncalled(matched_idx.len());
     }
+    if n_samples > 1 {
+        let mut called = vec![false; n_samples];
+        selphi::io::target_io::mark_called_samples(&target_genotypes, &matched_idx, &mut called);
+        selphi::io::target_io::log_uncalled_samples(&sample_names, &called);
+    }
     let uncalled_typed = if args.phase_only { Vec::new() } else {
         selphi::io::target_io::drop_uncalled_sites(
             &target_genotypes, &mut wgs_idx, &mut target_idx, &mut allele_transforms)

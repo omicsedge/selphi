@@ -1064,8 +1064,9 @@ fn line_min_confidence(
 ) -> f64 {
     let gq_i = format_field_index(format_bytes, b"GQ");
     let pl_i = format_field_index(format_bytes, b"PL");
+    let gl_i = format_field_index(format_bytes, b"GL");
     let dp_i = format_field_index(format_bytes, b"DP");
-    if gq_i.is_none() && pl_i.is_none() && dp_i.is_none() {
+    if gq_i.is_none() && pl_i.is_none() && gl_i.is_none() && dp_i.is_none() {
         return 1.0;
     }
     let gt_i = gt_position(format_bytes);
@@ -1078,7 +1079,8 @@ fn line_min_confidence(
             .unwrap_or(gt_region.len());
         let field = &gt_region[field_start..field_end];
         let gq = gq_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
-        let pl = pl_i.and_then(|i| nth_subfield(field, i)).and_then(parse_pl_gap);
+        let pl = pl_i.and_then(|i| nth_subfield(field, i)).and_then(parse_pl_gap)
+            .or_else(|| gl_i.and_then(|i| nth_subfield(field, i)).and_then(parse_gl_gap));
         let dp = dp_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
         // GT is subfield 0; a '.' allele = a missing call → confidence 0 (re-route to imputed).
         let gt_missing = gt_i.and_then(|i| nth_subfield(field, i)).map(|g| g.contains(&b'.')).unwrap_or(true);
@@ -1100,8 +1102,9 @@ fn line_per_sample_confidence(
 ) {
     let gq_i = format_field_index(format_bytes, b"GQ");
     let pl_i = format_field_index(format_bytes, b"PL");
+    let gl_i = format_field_index(format_bytes, b"GL");
     let dp_i = format_field_index(format_bytes, b"DP");
-    if gq_i.is_none() && pl_i.is_none() && dp_i.is_none() {
+    if gq_i.is_none() && pl_i.is_none() && gl_i.is_none() && dp_i.is_none() {
         out.extend(std::iter::repeat_n(1.0f64, n_samples));
         return;
     }
@@ -1114,7 +1117,8 @@ fn line_per_sample_confidence(
             .unwrap_or(gt_region.len());
         let field = &gt_region[field_start..field_end];
         let gq = gq_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
-        let pl = pl_i.and_then(|i| nth_subfield(field, i)).and_then(parse_pl_gap);
+        let pl = pl_i.and_then(|i| nth_subfield(field, i)).and_then(parse_pl_gap)
+            .or_else(|| gl_i.and_then(|i| nth_subfield(field, i)).and_then(parse_gl_gap));
         let dp = dp_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
         let gt_missing = gt_i.and_then(|i| nth_subfield(field, i)).map(|g| g.contains(&b'.')).unwrap_or(true);
         out.push(sample_confidence(gt_missing, gq, pl, dp, gq_lo, gq_hi));
@@ -1191,6 +1195,30 @@ pub fn extract_target_site_confidence(path: &str) -> Vec<f64> {
 
 /// BCF path for [`extract_target_site_confidence`]. Walks records in the same
 /// order + with the same retention rule as `read_target_bcf`.
+/// A FORMAT GL subfield read as PL (`lcwgs::pl_reader::gl_to_pl`) → [`parse_pl_gap`]'s gap.
+#[inline]
+fn parse_gl_gap(bytes: &[u8]) -> Option<i32> {
+    if bytes.is_empty() || bytes == b"." { return None; }
+    let gl: Option<Vec<f64>> = bytes.split(|&c| c == b',').map(|x| std::str::from_utf8(x).ok()?.trim().parse::<f64>().ok()).collect();
+    let mut p = crate::lcwgs::pl_reader::gl_to_pl(&gl?)?;
+    if p.len() < 2 { return None; }
+    p.sort_unstable();
+    Some(p[1] - p[0])
+}
+
+/// Decoded BCF `GL` sample value (float array) → [`parse_gl_gap`]'s gap.
+fn bcf_value_to_gl_gap(
+    v: &noodles_vcf::variant::record_buf::samples::sample::value::Value,
+) -> Option<i32> {
+    use noodles_vcf::variant::record_buf::samples::sample::value::{Array, Value};
+    let Value::Array(Array::Float(vals)) = v else { return None };
+    let gl: Vec<f64> = vals.iter().map(|x| x.map(f64::from)).collect::<Option<Vec<f64>>>()?;
+    let mut p = crate::lcwgs::pl_reader::gl_to_pl(&gl)?;
+    if p.len() < 2 { return None; }
+    p.sort_unstable();
+    Some(p[1] - p[0])
+}
+
 /// Decoded BCF `PL` sample value (integer array) → the gap between its two
 /// smallest values, as [`parse_pl_gap`] reads the text. `None` if absent,
 /// non-integer, fewer than two values, or any value missing.
@@ -1242,10 +1270,8 @@ fn extract_site_confidence_bcf(path: &str, gq_lo: f64, gq_hi: f64) -> Vec<f64> {
             let gq = sample.get("GQ").flatten().and_then(int_val);
             let dp = sample.get("DP").flatten().and_then(int_val);
             // The gap of the two best genotypes of the whole PL, if present.
-            let pl: Option<i32> = match sample.get("PL").flatten() {
-                Some(v) => bcf_value_to_pl_gap(v),
-                _ => None,
-            };
+            let pl: Option<i32> = sample.get("PL").flatten().and_then(bcf_value_to_pl_gap)
+                .or_else(|| sample.get("GL").flatten().and_then(bcf_value_to_gl_gap));
             if gq.is_some() || pl.is_some() || dp.is_some() { any_field = true; }
             // A no-call GT (any allele '.') → confidence 0 (re-route to imputed), never trusted REF.
             let gt_missing = match sample.get("GT").flatten() {
@@ -1340,10 +1366,8 @@ fn extract_site_confidence_per_sample_bcf(path: &str, gq_lo: f64, gq_hi: f64) ->
         for sample in samples.values() {
             let gq = sample.get("GQ").flatten().and_then(int_val);
             let dp = sample.get("DP").flatten().and_then(int_val);
-            let pl: Option<i32> = match sample.get("PL").flatten() {
-                Some(v) => bcf_value_to_pl_gap(v),
-                _ => None,
-            };
+            let pl: Option<i32> = sample.get("PL").flatten().and_then(bcf_value_to_pl_gap)
+                .or_else(|| sample.get("GL").flatten().and_then(bcf_value_to_gl_gap));
             let gt_missing = match sample.get("GT").flatten() {
                 Some(Value::Genotype(gt)) => {
                     let al = gt.as_ref();
@@ -1476,6 +1500,24 @@ pub fn extract_target_alleles(
 /// Whether any sample carries a called genotype at any of the records `target_idx` names.
 pub fn any_called(genotypes: &[Vec<[u8; 2]>], target_idx: &[usize]) -> bool {
     target_idx.iter().any(|&ti| genotypes[ti].iter().any(|g| g[0] < GT_MISSING && g[1] < GT_MISSING))
+}
+
+/// Mark in `called` (one flag per sample) the samples with a called genotype at any of `target_idx`.
+pub fn mark_called_samples(genotypes: &[Vec<[u8; 2]>], target_idx: &[usize], called: &mut [bool]) {
+    for &ti in target_idx {
+        for (c, g) in called.iter_mut().zip(&genotypes[ti]) { *c |= g[0] < GT_MISSING && g[1] < GT_MISSING; }
+        if called.iter().all(|&c| c) { return; }
+    }
+}
+
+/// Name the samples of a cohort with no called genotype at any panel-matched record: they are
+/// imputed from the panel alone.
+pub fn log_uncalled_samples(names: &[String], called: &[bool]) {
+    let none: Vec<&str> = names.iter().zip(called).filter(|(_, c)| !**c).map(|(n, _)| n.as_str()).collect();
+    if none.is_empty() || none.len() == names.len() { return; }
+    crate::selphi_step!("{}", crate::log::yellow(&format!(
+        "{} of {} sample(s) have no called genotype at any record matching the panel: imputed from the panel alone: {}",
+        none.len(), names.len(), none.iter().take(10).copied().collect::<Vec<_>>().join(", "))));
 }
 
 /// Stop a run whose target records carry no called genotype at all: a file without GT
