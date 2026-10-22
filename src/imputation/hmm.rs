@@ -171,6 +171,29 @@ pub struct CsrWeights {
 
 impl CsrWeights {
     pub fn nnz(&self) -> usize { self.data.len() }
+
+    /// The rows `keep` marks (window rows, all of this CSR's), every other row left empty.
+    /// Unchanged when every row is kept.
+    pub fn keep_rows(self, keep: &[bool]) -> CsrWeights {
+        if keep.iter().take(self.n_rows).all(|&k| k) { return self; }
+        // Sized exactly, as the CSR it replaces was: every haplotype's weights are held until
+        // the window is written, so grown (up to twice too large) buffers would cost memory.
+        let kept = |r: usize| keep.get(r).copied().unwrap_or(true);
+        let nnz: usize = (0..self.n_rows).filter(|&r| kept(r))
+            .map(|r| (self.indptr[r + 1] - self.indptr[r]) as usize).sum();
+        let mut indptr = Vec::with_capacity(self.n_rows + 1);
+        let (mut indices, mut data) = (Vec::with_capacity(nnz), Vec::with_capacity(nnz));
+        indptr.push(0i32);
+        for r in 0..self.n_rows {
+            if kept(r) {
+                let (a, b) = (self.indptr[r] as usize, self.indptr[r + 1] as usize);
+                indices.extend_from_slice(&self.indices[a..b]);
+                data.extend_from_slice(&self.data[a..b]);
+            }
+            indptr.push(indices.len() as i32);
+        }
+        CsrWeights { indptr, indices, data, n_rows: self.n_rows, n_cols: self.n_cols }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,6 +1047,9 @@ fn streaming_backward_combine(
     is_last_block: bool,
     last_sum_out: &mut f64,
     beta_out: &mut Option<Vec<f64>>,
+    // Rows of this block whose weights are read (`io::pipeline::needed_weight_rows`); the
+    // others come out empty, their forward rows not recomputed. None: every row.
+    keep: Option<&[bool]>,
 ) -> CsrWeights {
     let &LsHmmModel {
         dense_matches,
@@ -1084,16 +1110,22 @@ fn streaming_backward_combine(
     let mut blk = TL_BLK_BUF.with(|buf| tl_take(buf, stride * n_states));
     if blk.len() < stride * n_states { blk = vec![0.0f32; stride * n_states]; }
 
+    // A row nothing reads (and no fixup holds): the backward still steps through it.
+    let skip = |row: usize| keep.is_some_and(|k| !k[row]) && !fix.holds(row);
     for b in (0..cp.n_chk()).rev() {
         let (lo, hi) = cp.block_range(b);
-        cp.recompute_block(fwd_model, start, b, &mut blk, prune_threshold);
+        if (lo..hi).any(|row| !skip(row)) {
+            cp.recompute_block(fwd_model, start, b, &mut blk, prune_threshold);
+        }
 
         for row in (lo..hi).rev() {
             let frow = &blk[(row - lo) * n_states..(row - lo + 1) * n_states];
 
             if row == n_rows - 1 {
                 // Last row: no backward step, combine with the initial beta.
-                if fix.holds(row) {
+                if skip(row) {
+                    s_rows.push((row, s_idx.len()));
+                } else if fix.holds(row) {
                     combine_row(frow, &next_bwd, &mut w_row, inverse_sizes);
                     held.push((row, w_row.clone()));
                 } else {
@@ -1164,7 +1196,11 @@ fn streaming_backward_combine(
                 }
             }
 
-            if fix.holds(row) {
+            if skip(row) {
+                // The backward row's own sum, in the order `combine_row_sums` keeps it.
+                if bwd_sum_pending { last_sum = cur_bwd.iter().map(|&v| v as f64).sum(); }
+                s_rows.push((row, s_idx.len()));
+            } else if fix.holds(row) {
                 if bwd_sum_pending {
                     let (sb, _) = combine_row_sums(frow, &cur_bwd, &mut w_row, inverse_sizes);
                     last_sum = sb;
@@ -1419,7 +1455,7 @@ pub fn calculate_weights(
 ) -> HmmResult {
     let prep = prepare_weights(match_matrix, distances_cm, n_ref_haps, est_ne, ref_alleles, n_chip,
                                ne_per_site, hap_prior);
-    run_weights(&prep, output_breaks, min_perr, site_emission_ratios, c, compute_posterior, measure_unmatched)
+    run_weights(&prep, output_breaks, min_perr, site_emission_ratios, c, compute_posterior, measure_unmatched, None)
 }
 
 /// The floor-independent part of `calculate_weights` (see `HmmPrep`).
@@ -1573,7 +1609,11 @@ pub fn run_weights(
     c: Option<&[f64]>,
     compute_posterior: bool,
     measure_unmatched: bool,
+    // Window rows whose weights are read (`io::pipeline::needed_weight_rows`); the rest come out
+    // empty. Ignored while the adaptive floor measures (it reads every row).
+    keep: Option<&[bool]>,
 ) -> HmmResult {
+    let keep = keep.filter(|_| !(measure_unmatched || perr_em_diag()));
     let HmmPrep {
         ref dense_matches, ref n_matches, ref state_to_hap, n_states, ref dedup_result, ref group_sizes_f64,
         ref group_sizes_f32,
@@ -1779,6 +1819,7 @@ pub fn run_weights(
             n_hid, &state_to_hap, gm_ref,
             start == 0, is_last_block,
             &mut last_sum_bwd, &mut beta,
+            keep.map(|k| &k[start..stop]),
         );
 
         // Dump pre-normalization combined weights (fwd*bwd) from CSR for hap0
@@ -2122,7 +2163,7 @@ mod tests {
         streaming_backward_combine(
             &cp, &model, &model, 0, n_sites, true, None, 1.0, prune,
             1.0 / (n_haps as f32 + 1.0), n_haps, &state_to_hap,
-            if grouped { Some(&members) } else { None }, true, true, &mut last_sum, &mut beta,
+            if grouped { Some(&members) } else { None }, true, true, &mut last_sum, &mut beta, None,
         )
     }
 

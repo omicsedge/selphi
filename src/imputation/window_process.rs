@@ -82,6 +82,9 @@ pub struct ImputeWindowInputs<'a> {
     /// put back on those rows in this coordinate (`expand_weights`), so the result is
     /// the interpolation straight across the skipped row. None: the HMM's `chip_cm`.
     pub interp_x: Option<&'a [f64]>,
+    /// Per window row, whether the output or the member fold reads its weights
+    /// (`io::pipeline::needed_weight_rows`); the rest are left empty. None: every row.
+    pub keep_rows: Option<&'a [bool]>,
 }
 
 /// Per-stage CPU microseconds inside the per-target map, summed over all worker
@@ -211,7 +214,7 @@ pub fn impute_window(
         params, inputs.ref_bm, targ_w, cm_w, x_w,
         ne_w.as_deref(), conf_w.as_deref(), ns, &coded,
         precomputed_candidates,
-        carry, inputs.chip_start, n_var_w,
+        carry, inputs.chip_start, n_var_w, inputs.keep_rows,
         on_batch_done,
     );
     crate::selphi_debug!("  [MEM] impute_window: HMM done: rss={:.0} MB", crate::log::rss_mb());
@@ -1015,6 +1018,8 @@ pub fn process_window_hmm(
     carry: &mut [HapCarry],
     chip_start: usize,
     n_var_w: usize,
+    // Window rows whose weights are read (ImputeWindowInputs::keep_rows).
+    keep_rows: Option<&[bool]>,
     mut on_batch_done: Option<BatchDoneCb<'_>>,
 ) -> WindowHmmOutput {
     let n_ref = params.n_ref;
@@ -1097,7 +1102,11 @@ pub fn process_window_hmm(
         // sites alone would allow; the model is the uncompressed one either way).
         // `SELPHI_NOCALL_DEDUP_OFF=1`: no dedup for such a target (the previous behaviour).
         let finish = |tgt: usize, csc: &pbwt::CscMatchMatrix, called: Option<&[usize]>| -> (usize, HmmResult) {
-            if is_uniform(csc) { return (tgt, uniform_weights(n_ref, n_var_w, carry_view[tgt].p_err.unwrap_or(p_err))); }
+            if is_uniform(csc) {
+                let mut r = uniform_weights(n_ref, n_var_w, carry_view[tgt].p_err.unwrap_or(p_err));
+                if let Some(k) = keep_rows { r.weights = r.weights.into_iter().map(|(st, w)| (st, w.keep_rows(k))).collect(); }
+                return (tgt, r);
+            }
             let prior = carry_view[tgt].prior.as_deref();
             // R4 per-hap emission confidence: hap `tgt` belongs to sample tgt/2.
             // Extract that sample's column [var * n_samples + tgt/2] for v in
@@ -1129,13 +1138,20 @@ pub fn process_window_hmm(
                      vec![(0usize, n)])
                 }
             };
+            // Rows nothing reads are left empty: inside the HMM for a target over every window row
+            // (`run_weights` ignores the mask while it measures the floor), after the expansion
+            // for one over its called sites.
             let run = |floor: f64, measure: bool| {
                 let mut r = super::hmm::run_weights(
-                    &prep, &breaks, floor, None, conf_hap.as_deref(), params.compute_posterior, measure);
+                    &prep, &breaks, floor, None, conf_hap.as_deref(), params.compute_posterior, measure,
+                    if called.is_none() { keep_rows } else { None });
                 if let Some(sites) = called {
                     let x = interp_x_w.unwrap_or(cm_w);
                     r.weights = r.weights.into_iter()
                         .map(|(st, w)| (st, expand_weights(w, sites, x, n_var_w))).collect();
+                }
+                if let Some(k) = keep_rows.filter(|_| called.is_some() || measure) {
+                    r.weights = r.weights.into_iter().map(|(st, w)| (st, w.keep_rows(k))).collect();
                 }
                 r
             };

@@ -1534,6 +1534,11 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
             compute_posterior: wi + 1 < windows.len(),
             target_batch_size: target_batch_size_haps,
         };
+        // The window rows whose weights the output (or the member fold) reads.
+        let keep_rows = selphi::io::pipeline::weight_rows_mask(
+            window.chip_start, window.chip_end, window.own_chip_start, window.own_chip_end,
+            &wgs_idx, srp.n_variants(), target_site_conf.as_deref(), target_site_conf_per_sample.as_deref(),
+            refine_thr, n_samples);
         let inputs = selphi::imputation::window_process::ImputeWindowInputs {
             ref_bm: &ref_bm_imp,
             targ_alleles: &targ_bm,
@@ -1545,6 +1550,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
             chip_start: window.chip_start,
             chip_end: window.chip_end,
             interp_x: Some(&interp_x),
+            keep_rows: keep_rows.as_deref(),
         };
         // Streaming callback for batched mode: each batch's CSRs are written
         // immediately to the corresponding batch writer(s) (BCF, VCF, SD,
@@ -1651,6 +1657,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
                     chip_start: window.chip_start,
                     chip_end: window.chip_end,
                     interp_x: Some(&interp_x),
+                    keep_rows: keep_rows.as_deref(),
                 },
             )
         };

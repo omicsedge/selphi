@@ -275,6 +275,8 @@ pub struct FoldContext<'a> {
     pub chip_end: usize,
     /// The output's interpolation coordinate per chip site (ImputeWindowInputs::interp_x).
     pub interp_x: Option<&'a [f64]>,
+    /// Window rows whose weights are read (ImputeWindowInputs::keep_rows), for every member.
+    pub keep_rows: Option<&'a [bool]>,
 }
 
 /// Per window row (chip site `chip_start + r`), whether member k's two haplotypes of sample
@@ -431,6 +433,7 @@ fn member_inputs<'a>(targ_bm: &'a HaplotypeBitmatrix, ne: Option<&'a [f64]>,
         chip_start: ctx.chip_start,
         chip_end: ctx.chip_end,
         interp_x: ctx.interp_x,
+        keep_rows: ctx.keep_rows,
     }
 }
 

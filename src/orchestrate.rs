@@ -1105,6 +1105,11 @@ pub fn run_multi_chr(
 
             // Shared per-window pipeline (extracted: window sub-arrays, coded steps,
             // candidate selection, Li-Stephens HMM for all target haplotypes).
+            // The window rows whose weights the output (or the member fold) reads.
+            let keep_rows = selphi::io::pipeline::weight_rows_mask(
+                window.chip_start, window.chip_end, window.own_chip_start, window.own_chip_end,
+                &wgs_idx, srp.n_variants(), nocall.as_ref().map(|(site, _)| site.as_slice()),
+                nocall.as_ref().map(|(_, ps)| ps.as_slice()), nocall_thr, n_samples);
             let inputs = selphi::imputation::window_process::ImputeWindowInputs {
                 ref_bm: &ref_bm_imp,
                 targ_alleles: &targ_bm,
@@ -1122,6 +1127,7 @@ pub fn run_multi_chr(
                 chip_start: window.chip_start,
                 chip_end: window.chip_end,
                 interp_x: Some(&interp_x),
+                keep_rows: keep_rows.as_deref(),
             };
             let all_weights = selphi::imputation::ensemble::impute_with_members(
                 &inputs, &hmm_params, precomputed_candidates.as_ref(),
@@ -1135,6 +1141,7 @@ pub fn run_multi_chr(
                     chip_start: window.chip_start,
                     chip_end: window.chip_end,
                     interp_x: Some(&interp_x),
+                    keep_rows: keep_rows.as_deref(),
                 },
             ).all_weights;
 

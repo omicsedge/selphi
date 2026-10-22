@@ -123,6 +123,104 @@ fn push_vid_prefix(buf: &mut Vec<u8>, srp: &SrpReader, i: usize) {
     buf.extend_from_slice(alt.as_bytes());
 }
 
+/// Per window row (chip site `win_chip_start + r`, `r < win_chip_end - win_chip_start`), whether
+/// any part of the run reads that row's copying weights: the output interpolates only inside
+/// intervals that hold a site written as the model's dosage (an untyped panel site, or a typed
+/// site re-routed for some sample: [`WindowSetup::new`]'s `is_chip` is false there), from the
+/// interval's two anchor rows (an interval of verbatim sites alone is computed and discarded); and
+/// the member fold aligns a sample's run of no-calls (confidence 0) by blending the called rows
+/// either side (`ensemble::mixed_rows`). Every other row may be left empty: the output is
+/// unchanged. Rows outside the owned range are read only as an interval's tail anchor.
+#[allow(clippy::too_many_arguments)]
+pub fn needed_weight_rows(
+    win_chip_start: usize, win_chip_end: usize, own_chip_start: usize, own_chip_end: usize,
+    wgs_idx: &[usize], n_ref_variants: usize,
+    site_conf: Option<&[f64]>, site_conf_per_sample: Option<&[f64]>, refine_thr: f64, n_samples: usize,
+) -> Vec<bool> {
+    let n_rows = win_chip_end - win_chip_start;
+    let mut need = vec![false; n_rows];
+    let own_wgs_start = if own_chip_start == 0 { 0 } else { wgs_idx[own_chip_start] };
+    let own_wgs_end = if own_chip_end >= wgs_idx.len() { n_ref_variants } else { wgs_idx[own_chip_end] };
+    let (is_chip, _, _, _) = verbatim_sites(wgs_idx, own_wgs_start, own_wgs_end, n_ref_variants, site_conf, refine_thr);
+    for iv in build_intervals(win_chip_start, n_rows, own_chip_start, own_chip_end, wgs_idx, own_wgs_start, own_wgs_end, &is_chip) {
+        let modelled = (iv.wgs_start..iv.wgs_end)
+            .any(|p| p < own_wgs_start || p >= own_wgs_end || !is_chip[p - own_wgs_start]);
+        if modelled {
+            if iv.weight_s < n_rows { need[iv.weight_s] = true; }
+            if iv.weight_e < n_rows { need[iv.weight_e] = true; }
+        }
+    }
+    if let Some(conf) = site_conf_per_sample {
+        for s in 0..n_samples {
+            let nocall = |r: usize| conf[(win_chip_start + r) * n_samples + s] == 0.0;
+            let mut prev: Option<usize> = None;
+            let mut r = 0;
+            while r < n_rows {
+                if !nocall(r) { prev = Some(r); r += 1; continue; }
+                let next = (r + 1..n_rows).find(|&q| !nocall(q));
+                if let Some(l) = prev { need[l] = true; }
+                if let Some(q) = next { need[q] = true; }
+                r = next.unwrap_or(n_rows);
+            }
+        }
+    }
+    need
+}
+
+/// [`needed_weight_rows`], or None unless most rows go unread. An array window reads almost every
+/// row (an untyped site lies between almost any two typed ones: 98 of 9,283 rows unread on the
+/// 1000 Genomes chr22 targets), and pruning 1% of the rows would only copy each haplotype's weights.
+#[allow(clippy::too_many_arguments)]
+pub fn weight_rows_mask(
+    win_chip_start: usize, win_chip_end: usize, own_chip_start: usize, own_chip_end: usize,
+    wgs_idx: &[usize], n_ref_variants: usize,
+    site_conf: Option<&[f64]>, site_conf_per_sample: Option<&[f64]>, refine_thr: f64, n_samples: usize,
+) -> Option<Vec<bool>> {
+    if crate::config::is_one("SELPHI_ALL_WEIGHT_ROWS") { return None; }
+    let need = needed_weight_rows(win_chip_start, win_chip_end, own_chip_start, own_chip_end, wgs_idx,
+        n_ref_variants, site_conf, site_conf_per_sample, refine_thr, n_samples);
+    let n_need = need.iter().filter(|&&k| k).count();
+    if 2 * n_need > need.len() { return None; }
+    crate::selphi_debug!("  weight rows read: {} of {} ({} left empty)", n_need, need.len(), need.len() - n_need);
+    Some(need)
+}
+
+/// Over the owned panel range `own_wgs_start..own_wgs_end`: which sites are written verbatim from
+/// the input (`is_chip`: a typed site whose call is confident for every sample), which are typed
+/// at all, each typed site's chip index, and how many typed sites were re-routed to the model.
+///
+/// R3: under --refine, a low-confidence chip site is re-routed to the imputed output branch (its
+/// OWN call becomes the HMM/panel dosage). We realize this by leaving is_chip=false for soft
+/// sites: every output format selects verbatim-vs-imputed on is_chip alone (paired with
+/// chip_local_idx, which we still populate), and the interpolation anchors come from the chip
+/// RANGE (build_intervals) not is_chip — so a soft row's alt_probs already holds its refined HMM
+/// dosage. chip_local_idx is kept set for all chip rows so any future consumer still resolves
+/// the index.
+pub(crate) fn verbatim_sites(
+    wgs_idx: &[usize], own_wgs_start: usize, own_wgs_end: usize, n_ref_variants: usize,
+    site_conf: Option<&[f64]>, refine_thr: f64,
+) -> (Vec<bool>, Vec<bool>, Vec<usize>, usize) {
+    let window_len = own_wgs_end - own_wgs_start;
+    let mut is_chip = vec![false; window_len];
+    // R4b: true for ALL input chip sites (not flipped by softness).
+    let mut is_input_chip = vec![false; window_len];
+    let mut chip_local_idx = vec![0usize; window_len];
+    let mut n_rerouted = 0usize;
+    for (ci, &wi) in wgs_idx.iter().enumerate() {
+        if wi >= own_wgs_start && wi < own_wgs_end && wi < n_ref_variants {
+            chip_local_idx[wi - own_wgs_start] = ci;
+            is_input_chip[wi - own_wgs_start] = true;
+            let soft = site_conf.is_some_and(|c| c.get(ci).is_some_and(|&x| x < refine_thr));
+            if soft {
+                n_rerouted += 1; // is_chip stays false → falls into imputed branch
+            } else {
+                is_chip[wi - own_wgs_start] = true;
+            }
+        }
+    }
+    (is_chip, is_input_chip, chip_local_idx, n_rerouted)
+}
+
 /// Build interpolation intervals for the owned portion of a window.
 /// `n_weight_rows` is the minimum CSR row count across the window's haplotypes:
 /// an overlap anchor may be outside the owned range but must have copying weights.
@@ -428,33 +526,8 @@ impl<'a> WindowSetup<'a> {
         let own_wgs_start = if own_chip_start == 0 { 0 } else { wgs_idx[own_chip_start] };
         let own_wgs_end = if own_chip_end >= n_chip_total { n_ref_variants } else { wgs_idx[own_chip_end] };
 
-        let window_len = own_wgs_end - own_wgs_start;
-        let mut is_chip = vec![false; window_len];
-        // R4b: true for ALL input chip sites (not flipped by softness).
-        let mut is_input_chip = vec![false; window_len];
-        let mut chip_local_idx = vec![0usize; window_len];
-        // R3: under --refine, a low-confidence chip site is re-routed to the
-        // imputed output branch (its OWN call becomes the HMM/panel dosage). We
-        // realize this by leaving is_chip=false for soft sites: every output
-        // format selects verbatim-vs-imputed on is_chip alone (paired with
-        // chip_local_idx, which we still populate), and the interpolation anchors
-        // come from the chip RANGE (build_intervals) not is_chip — so a soft row's
-        // alt_probs already holds its refined HMM dosage. chip_local_idx is kept
-        // set for all chip rows so any future consumer still resolves the index.
-        let mut n_rerouted = 0usize;
-        for ci in 0..n_chip_total {
-            let wi = wgs_idx[ci];
-            if wi >= own_wgs_start && wi < own_wgs_end && wi < n_ref_variants {
-                chip_local_idx[wi - own_wgs_start] = ci;
-                is_input_chip[wi - own_wgs_start] = true;
-                let soft = site_conf.is_some_and(|c| c.get(ci).is_some_and(|&x| x < refine_thr));
-                if soft {
-                    n_rerouted += 1; // is_chip stays false → falls into imputed branch
-                } else {
-                    is_chip[wi - own_wgs_start] = true;
-                }
-            }
-        }
+        let (is_chip, is_input_chip, chip_local_idx, n_rerouted) =
+            verbatim_sites(wgs_idx, own_wgs_start, own_wgs_end, n_ref_variants, site_conf, refine_thr);
         if n_rerouted > 0 {
             crate::selphi_step!("{} typed site(s) with a missing or low-confidence call written as imputed dosage for those samples (confidence < {})", n_rerouted, refine_thr);
         }

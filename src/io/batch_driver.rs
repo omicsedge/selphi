@@ -261,29 +261,10 @@ pub fn run_window<S: BatchSink>(
     let chunk_size = srp.chunk_size();
     let own_wgs_start = if own_chip_start == 0 { 0 } else { wgs_idx[own_chip_start] };
     let own_wgs_end = if own_chip_end >= n_chip_total { n_ref_variants } else { wgs_idx[own_chip_end] };
-    let window_len = own_wgs_end - own_wgs_start;
 
-    let mut is_chip = vec![false; window_len];
-    // R4b: true for ALL input chip sites (not flipped by softness).
-    let mut is_input_chip = vec![false; window_len];
-    let mut chip_local_idx = vec![0usize; window_len];
-    // R3: see WindowSetup::new in pipeline.rs. A low-confidence chip site keeps
-    // is_chip=false so it falls into the imputed branch (its OWN call becomes the
-    // HMM/panel dosage). chip_local_idx is kept set for every chip row.
-    let mut n_rerouted = 0usize;
-    for ci in 0..n_chip_total {
-        let wi = wgs_idx[ci];
-        if wi >= own_wgs_start && wi < own_wgs_end && wi < n_ref_variants {
-            chip_local_idx[wi - own_wgs_start] = ci;
-            is_input_chip[wi - own_wgs_start] = true;
-            let soft = site_conf.is_some_and(|c| c.get(ci).is_some_and(|&x| x < refine_thr));
-            if soft {
-                n_rerouted += 1;
-            } else {
-                is_chip[wi - own_wgs_start] = true;
-            }
-        }
-    }
+    // R3: see WindowSetup::new in pipeline.rs (the same `verbatim_sites`).
+    let (is_chip, is_input_chip, chip_local_idx, n_rerouted) =
+        crate::io::pipeline::verbatim_sites(wgs_idx, own_wgs_start, own_wgs_end, n_ref_variants, site_conf, refine_thr);
     if n_rerouted > 0 && hap_start == 0 {
         // Logged once per window (first batch only) to avoid per-batch/per-format
         // spam; step-level so it surfaces alongside the multiformat path's log.

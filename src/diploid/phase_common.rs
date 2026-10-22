@@ -154,9 +154,20 @@ static DEFERRED_F64_RUNS: AtomicUsize = AtomicUsize::new(0);
 static PARALLEL_WINDOW_BATCHES: AtomicUsize = AtomicUsize::new(0);
 
 /// Most extra memory a batch of windows run in parallel may hold beyond what
-/// running them one at a time holds (16 MB, split across the samples phased at
-/// once). Windows that do not fit run one at a time, exactly as before.
-const WINDOW_PAR_BUDGET: usize = 16 << 20;
+/// running them one at a time holds, split across the samples phased at once.
+/// Windows that do not fit run one at a time; the output is identical at any
+/// budget. A sixteenth of the RAM free at the first call, within 16-512 MB
+/// (`SELPHI_PHASE_WINDOW_BUDGET_MB` sets it): a fixed 16 MB, split over the three
+/// copies of one sample, held a 30x genome to one window at a time per copy
+/// (~23 MB a window), so phase_common ran on about three threads.
+fn window_par_budget() -> usize {
+    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        if let Some(mb) = crate::config::usize_opt("SELPHI_PHASE_WINDOW_BUDGET_MB") { return mb << 20; }
+        let free_mb = crate::log::available_ram_mb().unwrap_or(0.0);
+        ((free_mb / 16.0).clamp(16.0, 512.0) as usize) << 20
+    })
+}
 
 /// Upper bounds, known before the window's conditioning set is built, on the
 /// bytes window `(w_first, w_last)` holds while its f32 HMM runs (`.0`: the
@@ -1523,7 +1534,7 @@ fn _run_iterations(
                 let bounds: Vec<(usize, usize)> = windows.iter()
                     .map(|&(w_first, w_last)| window_bound(&cond_ctx, w_first, w_last)).collect();
                 let batches = plan_window_batches(&bounds, n_pool_threads,
-                    WINDOW_PAR_BUDGET / n_samples.max(1));
+                    window_par_budget() / n_samples.max(1));
                 for &(b0, b1) in &batches {
                     let mut jobs: Vec<WindowJob> = Vec::with_capacity(b1 - b0);
                     for &(w_first, w_last) in &windows[b0..b1] {
