@@ -138,12 +138,12 @@ pub fn write_window_pgen_batched(
         srp, weights, hap_start, hap_end, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples_total, chip_genotypes, no_ap: _, site_conf, site_conf_per_sample, refine_thr,
         interp_cum_cm,
-        bcf_contig_names: _, passthrough, uncalled_typed,
+        bcf_contig_names: _, passthrough, uncalled_typed, filled_typed,
     } = input;
     let mut sink = PgenSink { bw, hardcalls: Vec::new(), dosages: Vec::new() };
     crate::io::batch_driver::run_window(
         &mut sink, srp.as_ref(), weights, hap_start, hap_end,
         win_chip_start, own_chip_start, own_chip_end, wgs_idx, n_samples_total, chip_genotypes,
-        site_conf, site_conf_per_sample, refine_thr, interp_cum_cm, passthrough, uncalled_typed,
+        site_conf, site_conf_per_sample, refine_thr, interp_cum_cm, passthrough, uncalled_typed, filled_typed,
     )
 }

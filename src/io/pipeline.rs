@@ -126,6 +126,9 @@ fn push_vid_prefix(buf: &mut Vec<u8>, srp: &SrpReader, i: usize) {
 /// Build interpolation intervals for the owned portion of a window.
 /// `n_weight_rows` is the minimum CSR row count across the window's haplotypes:
 /// an overlap anchor may be outside the owned range but must have copying weights.
+/// `is_chip` is the window's verbatim mask: an owned typed site written as the model's
+/// dosage (a re-routed call, a site read as reference) must lie in an interval, since only
+/// verbatim sites are written between intervals.
 pub(crate) fn build_intervals(
     win_chip_start: usize,
     n_weight_rows: usize,
@@ -134,12 +137,24 @@ pub(crate) fn build_intervals(
     wgs_idx: &[usize],
     own_wgs_start: usize,
     own_wgs_end: usize,
+    is_chip: &[bool],
 ) -> Vec<Interval> {
     use std::sync::OnceLock;
     static CONST_TAIL: OnceLock<bool> = OnceLock::new();
     let constant_tail = *CONST_TAIL.get_or_init(|| crate::config::is_one("SELPHI_SPLICE_CONST_TAIL"));
-    build_intervals_with_tail(win_chip_start, n_weight_rows, own_chip_start, own_chip_end,
-                              wgs_idx, own_wgs_start, own_wgs_end, constant_tail)
+    let mut intervals = build_intervals_with_tail(win_chip_start, n_weight_rows, own_chip_start, own_chip_end,
+                              wgs_idx, own_wgs_start, own_wgs_end, constant_tail);
+    // The last owned anchor gets no tail interval when the next panel site starts the next
+    // window; written by the model, it was then left out of the output.
+    if own_chip_end > own_chip_start {
+        let last = wgs_idx[own_chip_end - 1];
+        let covered = intervals.last().is_some_and(|iv| iv.wgs_start <= last && last < iv.wgs_end);
+        if !covered && last >= own_wgs_start && last < own_wgs_end && !is_chip[last - own_wgs_start] {
+            let local = own_chip_end - 1 - win_chip_start;
+            intervals.push(Interval { wgs_start: last, wgs_end: last + 1, weight_s: local, weight_e: local });
+        }
+    }
+    intervals
 }
 
 fn build_intervals_with_tail(
@@ -372,11 +387,17 @@ mod interval_tests {
 }
 
 /// IMP flags of the window `[own_start, own_end)`: absent from the input, i.e.
-/// neither an input chip site nor an input site dropped as uncalled everywhere.
-pub(crate) fn imp_flags(is_input_chip: &[bool], uncalled_typed: &[usize], own_start: usize, own_end: usize) -> Vec<bool> {
+/// neither an input chip site nor an input site dropped as uncalled everywhere, or
+/// a site the input left out that was read as reference (`filled_typed`): written
+/// as its 0/0 call, but inferred, not observed.
+pub(crate) fn imp_flags(is_input_chip: &[bool], uncalled_typed: &[usize], filled_typed: &[usize], own_start: usize, own_end: usize) -> Vec<bool> {
     let mut imp: Vec<bool> = is_input_chip.iter().map(|&t| !t).collect();
     for &w in uncalled_typed.iter().filter(|&&w| w >= own_start && w < own_end) {
         imp[w - own_start] = false;
+    }
+    let first = filled_typed.partition_point(|&w| w < own_start);
+    for &w in filled_typed[first..].iter().take_while(|&&w| w < own_end) {
+        imp[w - own_start] = true;
     }
     imp
 }
@@ -395,6 +416,7 @@ impl<'a> WindowSetup<'a> {
         site_conf_per_sample: Option<&'a [f64]>,
         refine_thr: f64,
         uncalled_typed: &[usize],
+        filled_typed: &[usize],
         // Build `vid_prefixes` (only the Parquet writer reads it).
         need_vid_prefixes: bool,
     ) -> Self {
@@ -451,12 +473,12 @@ impl<'a> WindowSetup<'a> {
 
         let intervals = build_intervals(
             win_chip_start, n_weight_rows, own_chip_start, own_chip_end,
-            wgs_idx, own_wgs_start, own_wgs_end,
+            wgs_idx, own_wgs_start, own_wgs_end, &is_chip,
         );
 
         WindowSetup {
             srp, own_wgs_start, own_wgs_end, n_haps, n_ref_variants,
-            chunk_size, is_chip, imp: imp_flags(&is_input_chip, uncalled_typed, own_wgs_start, own_wgs_end),
+            chunk_size, is_chip, imp: imp_flags(&is_input_chip, uncalled_typed, filled_typed, own_wgs_start, own_wgs_end),
             is_input_chip, chip_local_idx, intervals,
             weight_refs, vid_prefixes, an_str,
             site_conf_per_sample,
@@ -722,6 +744,7 @@ fn append_chip_line_bytes(
     write_u32(buf, ac);
     buf.extend_from_slice(b";AN=");
     buf.extend_from_slice(an_str);
+    if setup.imp[wgs_i - setup.own_wgs_start] { buf.extend_from_slice(b";IMP"); }
     buf.extend_from_slice(b"\tGT");
     for s in 0..n_samples {
         let a0 = chip_gt.get(ci, s * 2) as u8;
@@ -799,11 +822,12 @@ fn format_chip_bcf(
     chip_idx: &[usize],
     n_haps: usize,
     n_samples: usize,
+    imp: bool,
 ) {
     let vi = &var_infos[vi_idx];
     super::bcf_encode::encode_chip_record(
         buf, vi.rid, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
-        chip_gt, chip_idx[wgs_i], n_samples, n_haps,
+        chip_gt, chip_idx[wgs_i], n_samples, n_haps, imp,
     );
 }
 
@@ -902,6 +926,11 @@ pub struct WindowInput<'a> {
     /// Panel indices of the input sites with no call in any sample, dropped from
     /// the chip set: written as imputed dosage but, being in the input, without IMP.
     pub uncalled_typed: &'a [usize],
+    /// Panel indices (ascending) of the sites the input left out that were read as
+    /// reference (`io::variant_only`): written as their 0/0 call, flagged IMP (VCF,
+    /// BCF, Parquet; the per-batch writers of `--sample-batch-size` carry no IMP on
+    /// typed sites).
+    pub filled_typed: &'a [usize],
 }
 
 /// Active output sinks. Only the ones requested by `OutputFormats` are
@@ -1052,7 +1081,7 @@ impl RowFmt<'_> {
             if setup.is_chip[local_i] {
                 bcf_encode::encode_chip_record(
                     buf, vi.rid, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
-                    chip_genotypes, setup.chip_local_idx[local_i], n_samples, n_haps,
+                    chip_genotypes, setup.chip_local_idx[local_i], n_samples, n_haps, setup.imp[local_i],
                 );
             } else {
                 // R4b: the per-sample preserve-hard-call mask for this re-routed
@@ -1277,7 +1306,7 @@ pub fn write_window_multiformat(
         srp, all_weights, win_chip_start, own_chip_start, own_chip_end,
         wgs_idx, n_samples, chip_genotypes, no_ap,
         preloaded_chunks, preloaded_stripes, site_conf, site_conf_per_sample, refine_thr,
-        interp_cum_cm, passthrough, uncalled_typed,
+        interp_cum_cm, passthrough, uncalled_typed, filled_typed,
     } = input;
     let WindowWriters { parquet: parquet_writer, pgen: pgen_writer, selfdecode: sd_writer, vcf_tx } = writers;
 
@@ -1285,7 +1314,7 @@ pub fn write_window_multiformat(
     let setup = WindowSetup::new(
         srp, all_weights, win_chip_start,
         own_chip_start, own_chip_end, wgs_idx, n_samples,
-        site_conf, site_conf_per_sample, refine_thr, uncalled_typed,
+        site_conf, site_conf_per_sample, refine_thr, uncalled_typed, filled_typed,
         parquet_writer.is_some(),
     );
 
@@ -1398,7 +1427,7 @@ pub fn write_window_multiformat(
                         let vi = var_infos.as_ref().unwrap();
                         let mut buf = Vec::with_capacity(n_samples * 16);
                         format_chip_bcf(&mut buf, local_idx, local_idx, vi, chip_genotypes,
-                            &setup.chip_local_idx, setup.n_haps, n_samples);
+                            &setup.chip_local_idx, setup.n_haps, n_samples, setup.imp[local_idx]);
                         out.push(buf);
                     }
                     // Parquet gets the same variant the other four formats get here.
@@ -2668,7 +2697,7 @@ mod encode_equivalence_tests {
                 if is_chip[local_i] {
                     bcf_encode::encode_chip_record(
                         &mut buf, vi.rid, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
-                        chip_genotypes, chip_local_idx[local_i], n_samples, n_haps,
+                        chip_genotypes, chip_local_idx[local_i], n_samples, n_haps, false,
                     );
                 } else {
                     // R4b: build the per-sample preserve-hard-call mask for this

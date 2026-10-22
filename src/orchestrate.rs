@@ -176,7 +176,7 @@ fn load_chr_data(
     // 0 for impute-only (byte-identical). See single-chr extract in imputation_pipeline.rs.
     miss_val: u8,
     fill: Option<&selphi::io::variant_only::FillPlan>,
-) -> Option<(Arc<selphi::srp::SrpReader>, Vec<usize>, Vec<usize>, Vec<u8>, Vec<f64>, Vec<i64>, usize, usize, usize, NoCallConf, Vec<u8>, (Vec<usize>, Vec<usize>))> {
+) -> Option<(Arc<selphi::srp::SrpReader>, Vec<usize>, Vec<usize>, Vec<u8>, Vec<f64>, Vec<i64>, usize, usize, usize, NoCallConf, Vec<u8>, (Vec<usize>, Vec<usize>, Vec<usize>))> {
     let chr_view = multi_srp.load_chr_view(chr_name).ok()?;
     let n_ref = chr_view.n_haps();
     let n_ref_variants = chr_view.n_variants();
@@ -210,17 +210,19 @@ fn prepare_chr_target(
     allele_match: selphi::io::target_io::AlleleMatch,
     miss_val: u8,
     fill: Option<&selphi::io::variant_only::FillPlan>,
-) -> Option<(Vec<usize>, Vec<usize>, Vec<u8>, Vec<i64>, usize, NoCallConf, Vec<u8>, (Vec<usize>, Vec<usize>))> {
+) -> Option<(Vec<usize>, Vec<usize>, Vec<u8>, Vec<i64>, usize, NoCallConf, Vec<u8>, (Vec<usize>, Vec<usize>, Vec<usize>))> {
     let (mut wgs_idx, mut target_idx, mut transforms) = intersect_variants_for_chr(
         &srp.metadata.chromosome, &srp.variants, &srp.ids, target_markers, allele_match,
     );
     let matched_idx = target_idx.clone();
     // With a fill plan the last row is the shared 0/0 row the added sites point at (see `run`).
+    let mut filled = Vec::new();
     if let Some(plan) = fill {
         let row = target_markers.len() - 1;
         let sites = plan.sites(srp, &target_markers[..row], wgs_idx.len());
         if !sites.is_empty() {
             selphi::io::variant_only::merge(&sites, row, &mut wgs_idx, &mut target_idx, &mut transforms);
+            filled = sites;
         }
     }
     let uncalled = selphi::io::target_io::drop_uncalled_sites(
@@ -233,7 +235,7 @@ fn prepare_chr_target(
     let targ_alleles = extract_target_alleles(target_genotypes, &target_idx, n_chip, n_haps, &transforms, miss_val);
     let chip_bps: Vec<i64> = wgs_idx.iter().map(|&wi| srp.variants[wi].pos).collect();
     let nocall = build_nocall_conf(target_genotypes, &target_idx, n_chip, n_haps / 2);
-    Some((wgs_idx, target_idx, targ_alleles, chip_bps, n_chip, nocall, transforms, (matched_idx, uncalled)))
+    Some((wgs_idx, target_idx, targ_alleles, chip_bps, n_chip, nocall, transforms, (matched_idx, uncalled, filled)))
 }
 
 /// Per-chip-site and per-(site,sample) confidence marking no-call genotypes, the
@@ -712,7 +714,7 @@ pub fn run_multi_chr(
         n_chip: usize,
         nocall: NoCallConf,
         transforms: Vec<u8>,
-        matched_idx: (Vec<usize>, Vec<usize>),
+        matched_idx: (Vec<usize>, Vec<usize>, Vec<usize>),
     }
 
     // 6. Process each chromosome with prefetch overlap
@@ -736,7 +738,7 @@ pub fn run_multi_chr(
         selphi_info!("  [{}/{}] chr{}", chr_idx + 1, n_chr, chr_name);
 
         // Use prefetched data if available, otherwise load synchronously
-        let (srp, wgs_idx, target_idx, mut targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip, nocall, transforms, (matched_idx, uncalled_typed)) =
+        let (srp, wgs_idx, target_idx, mut targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip, nocall, transforms, (matched_idx, uncalled_typed, filled_typed)) =
             if let Some(pre) = prefetch_result.take() {
                 selphi_info!("    (prefetched)");
                 (pre.srp, pre.wgs_idx, pre.target_idx, pre.targ_alleles,
@@ -1135,6 +1137,7 @@ pub fn run_multi_chr(
                     interp_cum_cm: interp_cum_cm.as_deref(),
                     passthrough: passthrough.as_ref(),
                     uncalled_typed: &uncalled_typed,
+                    filled_typed: &filled_typed,
                 },
                 selphi::io::pipeline::WindowWriters {
                     // Per-chr parquet/pgen/selfdecode not wired yet in multi-chr mode.

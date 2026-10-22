@@ -727,6 +727,8 @@ struct LoadedTarget {
     /// Panel indices of the input sites uncalled in every sample, dropped from
     /// the chip set (`drop_uncalled_sites`): imputed, but written without IMP.
     uncalled_typed: Vec<usize>,
+    /// Panel indices of the sites read as reference (`variant_only`): written IMP.
+    filled_typed: Vec<usize>,
 }
 
 /// Target records that match no panel site, anchored for the output writers
@@ -781,6 +783,7 @@ fn load_and_intersect(args: &Args, target_path: &str, srp: &SrpReader) -> Loaded
             target_markers.iter().enumerate().filter(|(i, m)| m.unphased_het && !target_idx.contains(i)).count());
     }
     let matched_idx = target_idx.clone();
+    let mut filled_typed = Vec::new();
     // Panel sites a variant-only input leaves out, read as reference where its caller looked.
     if !args.phase_only
         && let Some(plan) = selphi::io::variant_only::FillPlan::new(args.callable.as_deref(),
@@ -791,6 +794,7 @@ fn load_and_intersect(args: &Args, target_path: &str, srp: &SrpReader) -> Loaded
             target_markers.push(m);
             target_genotypes.push(g);
             selphi::io::variant_only::merge(&sites, target_markers.len() - 1, &mut wgs_idx, &mut target_idx, &mut allele_transforms);
+            filled_typed = sites;
         }
     }
     let uncalled_typed = if args.phase_only { Vec::new() } else {
@@ -809,7 +813,7 @@ fn load_and_intersect(args: &Args, target_path: &str, srp: &SrpReader) -> Loaded
 
     LoadedTarget {
         sample_names, target_markers, target_genotypes, is_phased,
-        n_samples, n_haps, wgs_idx, target_idx, allele_transforms, n_chip, matched_idx, uncalled_typed,
+        n_samples, n_haps, wgs_idx, target_idx, allele_transforms, n_chip, matched_idx, uncalled_typed, filled_typed,
     }
 }
 
@@ -974,7 +978,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // 2-3. Read the target VCF + intersect against the panel (see `load_and_intersect`).
     let LoadedTarget {
         sample_names, target_markers, target_genotypes, is_phased,
-        n_samples, n_haps, wgs_idx, target_idx, allele_transforms, n_chip, matched_idx, uncalled_typed,
+        n_samples, n_haps, wgs_idx, target_idx, allele_transforms, n_chip, matched_idx, uncalled_typed, filled_typed,
     } = load_and_intersect(args, target_path, &srp);
     let passthrough = build_passthrough(args, target_path, &srp, &target_markers, &matched_idx);
 
@@ -1563,6 +1567,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
                                     bcf_contig_names: &formats.bcf_contig_names,
                     passthrough: passthrough.as_ref(),
                     uncalled_typed: &uncalled_typed,
+                    filled_typed: &filled_typed,
                 };
                 // Find this batch's writer by hap_start, asserting its hap_end matches.
                 macro_rules! find_bi {
@@ -1672,6 +1677,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
                 interp_cum_cm: interp_cum_cm.as_deref(),
                 passthrough: passthrough.as_ref(),
                 uncalled_typed: &uncalled_typed,
+                filled_typed: &filled_typed,
             },
             selphi::io::pipeline::WindowWriters {
                 parquet: parquet_writer.as_mut().map(|(w, s)| (w, &*s)),

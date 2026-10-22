@@ -130,7 +130,8 @@ pub fn write_tile_to_parquet(
             }
             afs.append_value(ac as f32 / n_haps as f32);
             dr2s.append_null();
-            imps.append_value(false);
+            // A typed site is in the input, unless it was read as reference (`io::variant_only`).
+            imps.append_value(imp.get(local_i).copied().unwrap_or(false));
         } else {
             // R4b: a confident sample at a re-routed input chip site contributes
             // its verbatim hard call; every other sample uses the panel alt_probs.

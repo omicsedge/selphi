@@ -484,8 +484,10 @@ pub fn encode_chip_record(
     chip_idx: usize,
     n_samples: usize,
     n_haps: usize,
+    imp: bool,
 ) {
-    let n_info: u16 = 3; // AF, AC, AN (no DR2, no IMP)
+    // AF, AC, AN, and IMP for a site read as reference rather than called (no DR2).
+    let n_info: u16 = if imp { 4 } else { 3 };
     let n_fmt: u8 = 1;   // GT only
 
     // Chip hard-call ALT count = popcount of the row over all n_haps (= 2·n_samples)
@@ -505,6 +507,10 @@ pub fn encode_chip_record(
     encode_typed_int(buf, ac as i32);
     encode_typed_int8(buf, INFO_AN_IDX as i32);
     encode_typed_int(buf, n_haps as i32);
+    if imp {
+        encode_typed_int8(buf, INFO_IMP_IDX as i32);
+        buf.push(0x00); // flag: missing-typed (no value)
+    }
 
     let indiv_start = buf.len();
     emit_gt_chip(buf, chip_genotypes, chip_idx, n_haps, 0, n_samples);

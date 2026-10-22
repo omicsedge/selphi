@@ -66,6 +66,8 @@ pub struct WindowBatchInput<'a> {
     /// Input sites uncalled in every sample, dropped from the chip set: written
     /// as imputed dosage, without IMP (see `pipeline::WindowInput`).
     pub uncalled_typed: &'a [usize],
+    /// See `WindowInput::filled_typed`.
+    pub filled_typed: &'a [usize],
 }
 
 /// One batch's sample / haplotype range (haps = 2 × samples).
@@ -242,6 +244,7 @@ pub fn run_window<S: BatchSink>(
     interp_cum_cm: Option<&[f64]>,
     passthrough: Option<&crate::io::passthrough::Passthrough>,
     uncalled_typed: &[usize],
+    filled_typed: &[usize],
 ) -> std::io::Result<()> {
     use crate::srp::TILE_ROWS;
 
@@ -286,7 +289,7 @@ pub fn run_window<S: BatchSink>(
         // spam; step-level so it surfaces alongside the multiformat path's log.
         crate::selphi_step!("{} typed site(s) with a missing or low-confidence call written as imputed dosage for those samples (confidence < {})", n_rerouted, refine_thr);
     }
-    let imp = crate::io::pipeline::imp_flags(&is_input_chip, uncalled_typed, own_wgs_start, own_wgs_end);
+    let imp = crate::io::pipeline::imp_flags(&is_input_chip, uncalled_typed, filled_typed, own_wgs_start, own_wgs_end);
 
     let ctx = WindowCtx {
         srp,
@@ -307,7 +310,7 @@ pub fn run_window<S: BatchSink>(
     let n_weight_rows = weights.iter().map(|w| w.n_rows).min().unwrap_or(0);
     let intervals = crate::io::pipeline::build_intervals(
         win_chip_start, n_weight_rows, own_chip_start, own_chip_end,
-        wgs_idx, own_wgs_start, own_wgs_end,
+        wgs_idx, own_wgs_start, own_wgs_end, &is_chip,
     );
     if intervals.is_empty() {
         return Ok(());
