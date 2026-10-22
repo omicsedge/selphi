@@ -733,6 +733,8 @@ pub fn run_multi_chr(
 
     // The replicas' "on" line is said once, for the first chromosome that uses them.
     let mut replicas_said = false;
+    // Panel-matched records seen, and whether any carried a called genotype (after the fill).
+    let (mut n_matched_total, mut called_any) = (0usize, false);
     for (chr_idx, chr_name) in chromosomes.iter().enumerate() {
         let chr_start = Instant::now();
         selphi_info!("  [{}/{}] chr{}", chr_idx + 1, n_chr, chr_name);
@@ -755,6 +757,13 @@ pub fn run_multi_chr(
         if n_chip == 0 || n_ref_variants == 0 {
             selphi_info!("    Skipped (0 shared markers)");
             continue;
+        }
+        {
+            let key = chr_name.strip_prefix("chr").unwrap_or(chr_name);
+            if let Some((_, g)) = target_by_chr.get(key).or_else(|| target_by_chr.get(chr_name.as_str())) {
+                n_matched_total += matched_idx.len();
+                called_any |= selphi::io::target_io::any_called(g, &target_idx);
+            }
         }
         selphi_info!("    {} ref variants, {} shared markers", n_ref_variants, n_chip);
 
@@ -1187,6 +1196,12 @@ pub fn run_multi_chr(
             n_out_variants_total += pass.len() as u64;
             selphi_info!("  {}: {} records written as given (not in the panel)", spelling, pass.len());
         }
+    }
+
+    // No called genotype at any panel-matched record of any chromosome (a file without GT):
+    // what was written holds no information from the input.
+    if n_matched_total > 0 && !called_any {
+        selphi::io::target_io::refuse_uncalled(n_matched_total);
     }
 
     // 7. Finalize output writer

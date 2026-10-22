@@ -193,6 +193,13 @@ fn impute_from_gl3(
     // his reads are, which would switch the split off on his chrX alone.
     let mean_conf = gl_mean_conf(&gl3_shared, n_samples, n_shared);
     let haploid = haploid_chrx(&mut gl3_shared, srp, wgs_idx, n_samples, &sample_ids, pl_haploid, params);
+    // Nothing but flat likelihoods (a GT-only, GP or DS file forced onto this engine, a BAM with
+    // no read on this chromosome) would be imputed from the panel alone.
+    if !gl3_shared.chunks_exact(3).any(|g| g[0] != g[1] || g[1] != g[2]) {
+        return Err(std::io::Error::other(
+            "no site carries a usable likelihood (no PL, or no read on this chromosome): nothing to impute from \
+             (GT input goes to the genotype engine)"));
+    }
     let (cm, prepared_chunks) = match prepared {
         Some(p) => (p.cm, Some(p.chunks)),
         None => (site_cm(srp, wgs_idx, map_path)?, None),

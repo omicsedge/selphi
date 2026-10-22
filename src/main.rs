@@ -203,12 +203,18 @@ fn main() {
             std::fs::read_to_string(list)
                 .unwrap_or_else(|e| { eprintln!("Error reading --bam-list {}: {}", list, e); std::process::exit(1); })
                 .lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
+        } else if let Some(p) = args.input.as_deref().filter(|p| {
+            let p = p.to_ascii_lowercase();
+            p.ends_with(".bam") || p.ends_with(".cram")
+        }) {
+            // `--input reads.bam` means `--bam reads.bam` (auto-route already reads it as reads).
+            vec![p.to_string()]
         } else {
             Vec::new()
         };
         let bam_mode = !bam_paths.is_empty();
         let input = if bam_mode {
-            args.bam.as_deref().or(args.bam_list.as_deref()).unwrap_or("")
+            args.bam.as_deref().or(args.bam_list.as_deref()).or(args.input.as_deref()).unwrap_or("")
         } else {
             args.input.as_deref()
                 .unwrap_or_else(|| { eprintln!("Error: --input (PL VCF) or --bam/--bam-list is required for --lcwgs"); std::process::exit(1); })

@@ -103,9 +103,12 @@ pub fn call_counts<'a>(markers: impl Iterator<Item = (&'a TargetMarker, &'a Vec<
     (homref, alt)
 }
 
-/// True when the counts of [`call_counts`] mark a variant-only single-sample input.
+/// True when the counts of [`call_counts`] mark a variant-only single-sample input. A few
+/// reference calls are tolerated (0.5% of the ALT calls): DRAGEN's targeted callers write 0/0
+/// records into an otherwise variant-only VCF (109 against 72,460 records on chromosome 22),
+/// while a complete callset or an array holds as many reference calls as ALT ones or more.
 pub fn is_variant_only(n_samples: usize, homref: usize, alt: usize) -> bool {
-    n_samples == 1 && homref == 0 && alt >= MIN_ALT_CALLS
+    n_samples == 1 && alt >= MIN_ALT_CALLS && homref * 200 <= alt
 }
 
 /// The regions where an absent panel site of this contig is read as reference: the `--callable`
@@ -270,7 +273,15 @@ pub fn log_added(chrom: &str, n: usize, callable: bool) {
 /// all-sites file) or a symbolic one (`<DEL>`, `<NON_REF>`, `*`), whose spans the target readers do
 /// not keep.
 #[derive(Default)]
-pub struct HeadScan { pub dp: Option<f64>, pub gq: Option<f64>, pub no_alt: usize, pub symbolic: usize }
+pub struct HeadScan { pub dp: Option<f64>, pub gq: Option<f64>, pub no_alt: usize, pub symbolic: usize, pub records: usize }
+
+/// A BGZF-wrapped BCF, whatever the file is called (`.bcf.gz` included).
+fn is_bcf(path: &str) -> bool {
+    use std::io::Read;
+    let Ok(f) = std::fs::File::open(path) else { return false };
+    let mut magic = [0u8; 5];
+    noodles_bgzf::io::Reader::new(f).read_exact(&mut magic).is_ok() && &magic == b"BCF\x02\x02"
+}
 
 pub fn scan_head(path: &str, max: usize) -> HeadScan {
     use std::io::BufRead;
@@ -286,11 +297,12 @@ pub fn scan_head(path: &str, max: usize) -> HeadScan {
         if alts.is_empty() || alts.iter().all(|a| *a == "." || a.is_empty()) { out.no_alt += 1; }
         else if alts.iter().any(|a| a.starts_with('<') || *a == "*" || a.contains('[') || a.contains(']')) { out.symbolic += 1; }
     };
-    if path.ends_with(".bcf") {
+    if path.ends_with(".bcf") || is_bcf(path) {
         use noodles_vcf::variant::record_buf::samples::sample::Value;
         let Ok(mut reader) = noodles_bcf::io::reader::Builder::default().build_from_path(path) else { return out };
         let Ok(header) = reader.read_header() else { return out };
         for rec in reader.record_bufs(&header).take(max).flatten() {
+            out.records += 1;
             let alts: Vec<String> = rec.alternate_bases().as_ref().to_vec();
             tally_alts(&mut alts.iter().map(String::as_str), &mut out);
             let samples = rec.samples();
@@ -307,6 +319,7 @@ pub fn scan_head(path: &str, max: usize) -> HeadScan {
         for line in reader.lines().map_while(Result::ok).filter(|l| !l.starts_with('#')).take(max) {
             let f: Vec<&str> = line.splitn(11, '\t').collect();
             if f.len() < 5 { continue; }
+            out.records += 1;
             tally_alts(&mut f[4].split(','), &mut out);
             if f.len() < 10 { continue; }
             let keys: Vec<&str> = f[8].split(':').collect();
@@ -323,16 +336,37 @@ pub fn scan_head(path: &str, max: usize) -> HeadScan {
     out
 }
 
-/// Fewest median read depth at which a variant-only genome's omissions are read as reference: at
-/// 4x and 10x a caller leaves out 25% and 4% of the true ALT sites (HG002 chr22, median DP 4 / 10 /
-/// 31 at 4x / 10x / 30x), which a fill would write as 0/0 (1,273 such calls at 10x). Without DP
-/// the depth is unknown and nothing is filled (GQ does not separate them: median 21 / 71 / 99).
+/// Whether a variant-only genome is deep enough for its omissions to be read as reference. A
+/// caller at 4x leaves out 25% of the true ALT sites (HG002 chr22, median DP 4), which a fill
+/// would write as 0/0; at 10x (median DP 10) filling still raises R2 (0.9738 -> 0.9765) and
+/// lowers the errors (2,083 -> 1,435). Without DP, the median GQ decides (GQ scales differ by
+/// caller: DRAGEN 30x 46 over chromosome 22, 29 over its first 20,000 records; bcftools 30x / 10x
+/// / 4x 99 / 71 / 21, those files carrying DP); with neither, the file is taken as the
+/// standard-depth genome a GT-only deliverable is.
+/// [`depth_ok`] without its log lines (auto-route predicts the fill with it).
+pub fn depth_quiet(head: &HeadScan) -> bool {
+    let min_dp = crate::config::f64_opt("SELPHI_VARIANT_ONLY_MIN_DP").unwrap_or(8.0);
+    let min_gq = crate::config::f64_opt("SELPHI_VARIANT_ONLY_MIN_GQ").unwrap_or(20.0);
+    match (head.dp, head.gq) { (Some(dp), _) => dp >= min_dp, (None, Some(gq)) => gq >= min_gq, (None, None) => true }
+}
+
 pub fn depth_ok(head: &HeadScan) -> bool {
-    let min_dp = crate::config::f64_opt("SELPHI_VARIANT_ONLY_MIN_DP").unwrap_or(20.0);
-    let why = match head.dp {
-        Some(dp) if dp >= min_dp => return true,
-        Some(dp) => format!("median depth {dp:.0} is below {min_dp:.0}, and a caller at that depth misses ALT calls"),
-        None => "it carries no FORMAT/DP to tell its depth".to_string(),
+    let min_dp = crate::config::f64_opt("SELPHI_VARIANT_ONLY_MIN_DP").unwrap_or(8.0);
+    let min_gq = crate::config::f64_opt("SELPHI_VARIANT_ONLY_MIN_GQ").unwrap_or(20.0);
+    if head.records == 0 {
+        crate::selphi_step!("{}", crate::log::yellow(
+            "Variant-only input: its records could not be read for their depth; the panel sites it leaves out are imputed"));
+        return false;
+    }
+    let why = match (head.dp, head.gq) {
+        (Some(dp), _) if dp >= min_dp => return true,
+        (Some(dp), _) => format!("median depth {dp:.0} is below {min_dp:.0}, and a caller at that depth misses ALT calls"),
+        (None, Some(gq)) if gq >= min_gq => return true,
+        (None, Some(gq)) => format!("no FORMAT/DP, and median GQ {gq:.0} is below {min_gq:.0}"),
+        (None, None) => {
+            crate::selphi_step!("Variant-only input without FORMAT/DP or GQ: taken as a standard-depth genome");
+            return true;
+        }
     };
     crate::selphi_step!("{}", crate::log::yellow(&format!(
         "Variant-only input: the panel sites it leaves out are imputed, not read as reference ({why}); \
@@ -358,7 +392,7 @@ pub fn detect<'a>(markers: impl Iterator<Item = (&'a TargetMarker, &'a Vec<[u8; 
     let (homref, alt) = call_counts(markers);
     let v = is_variant_only(n_samples, homref, alt);
     if v {
-        crate::selphi_step!("Variant-only input: {} ALT calls and no reference homozygote", alt);
+        crate::selphi_step!("Variant-only input: {} ALT calls and {} reference call(s)", alt, homref);
     }
     v
 }
@@ -382,11 +416,16 @@ mod tests {
         let mut g = het.clone();
         g[5] = vec![[0, 0]];
         let (h, a) = call_counts(ms.iter().zip(g.iter()));
-        assert!(!is_variant_only(1, h, a));
+        assert!(is_variant_only(1, h, a), "one targeted 0/0 among 1,199 ALT calls is tolerated");
+        for row in g.iter_mut().skip(100).take(10) { *row = vec![[0, 0]]; }
+        let (h, a) = call_counts(ms.iter().zip(g.iter()));
+        assert!(!is_variant_only(1, h, a), "eleven are not");
         // a 0/0 made by splitting a multi-allelic record does not count
         let mut ms2 = ms.clone();
         ms2[6] = marker(ms2[5].pos, "A", "T");
-        let (h, a) = call_counts(ms2.iter().zip(g.iter()));
+        let mut g2 = het.clone();
+        g2[5] = vec![[0, 0]];
+        let (h, a) = call_counts(ms2.iter().zip(g2.iter()));
         assert_eq!(h, 0);
         assert!(is_variant_only(1, h, a));
         let (h, a) = call_counts(ms[..500].iter().zip(het[..500].iter()));

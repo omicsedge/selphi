@@ -797,6 +797,11 @@ fn load_and_intersect(args: &Args, target_path: &str, srp: &SrpReader) -> Loaded
             filled_typed = sites;
         }
     }
+    // After the fill, which supplies reference calls of its own: no called genotype at any
+    // panel-matched record leaves nothing to impute from.
+    if !target_idx.is_empty() && !selphi::io::target_io::any_called(&target_genotypes, &target_idx) {
+        selphi::io::target_io::refuse_uncalled(matched_idx.len());
+    }
     let uncalled_typed = if args.phase_only { Vec::new() } else {
         selphi::io::target_io::drop_uncalled_sites(
             &target_genotypes, &mut wgs_idx, &mut target_idx, &mut allele_transforms)

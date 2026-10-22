@@ -66,10 +66,11 @@ struct Sniff {
     pl_n: u64,
     pl_sure: u64,
     /// Called reference homozygotes among the sampled GT, the most samples a record carried,
-    /// and the first sample's FORMAT/DP values (whether a variant-only fill will apply).
+    /// and the first sample's FORMAT/DP and GQ values (whether a variant-only fill will apply).
     gt_homref: u64,
     n_samples: usize,
     dp: Vec<u32>,
+    gq: Vec<u32>,
 }
 
 /// Phred gap between the best and second-best genotype of a settled call.
@@ -157,9 +158,9 @@ fn auto_route_decision(is_reads: bool, s: &Sniff, wgs_density_thr: f64) -> AutoR
     if s.has_pl {
         return AutoRoute::Lcwgs;
     }
-    // 3. No PL and no GT. With GT the genotype engine is the only one that reads
-    //    the calls (the lcWGS engine takes every site without PL as flat), whatever
-    //    the call rate: a 0.4 call rate routed here used to impute from no call.
+    // 3. No GT among the sampled records (resolve() has read every record's FORMAT when the
+    //    sample showed neither GT nor PL): the lcWGS engine, which stops when no site carries a
+    //    usable likelihood (a GP/DS/GL-only file).
     if !s.has_gt {
         return AutoRoute::Lcwgs;
     }
@@ -196,7 +197,11 @@ fn input_is_reads(input: Option<&str>, bam: Option<&str>, bam_list: Option<&str>
 fn sniff_variant_file(path: &str) -> Sniff {
     // Real binary BCF (by extension or by BGZF-wrapped `BCF\2\2` magic) →
     // noodles decoder; everything else is VCF text.
-    if path.ends_with(".bcf") {
+    let mut magic = [0u8; 5];
+    let bgzf_bcf = std::fs::File::open(path)
+        .and_then(|f| std::io::Read::read_exact(&mut noodles_bgzf::io::Reader::new(f), &mut magic)).is_ok()
+        && &magic == b"BCF\x02\x02";
+    if path.ends_with(".bcf") || bgzf_bcf {
         return sniff_bcf(path).unwrap_or_default();
     }
     let raw = match read_decompressed(path) {
@@ -375,10 +380,12 @@ fn record_into_sniff(s: &mut Sniff, format: &[u8], samples_region: &[u8]) {
         }
         s.n_samples = s.n_samples.max(n);
     }
-    if let Some(di) = format.split(|&b| b == b':').position(|sub| sub == b"DP")
-        && let Some(first) = samples_region.split(|&b| b == b'\t').next()
-        && let Some(v) = first.split(|&b| b == b':').nth(di).and_then(|x| std::str::from_utf8(x).ok()?.parse::<u32>().ok()) {
-        s.dp.push(v);
+    for (key, out) in [(&b"DP"[..], &mut s.dp), (&b"GQ"[..], &mut s.gq)] {
+        if let Some(di) = format.split(|&b| b == b':').position(|sub| sub == key)
+            && let Some(first) = samples_region.split(|&b| b == b'\t').next()
+            && let Some(v) = first.split(|&b| b == b':').nth(di).and_then(|x| std::str::from_utf8(x).ok()?.parse::<u32>().ok()) {
+            out.push(v);
+        }
     }
     if let Some(pi) = format.split(|&b| b == b':').position(|sub| sub == b"PL") {
         for field in samples_region.split(|&b| b == b'\t') {
@@ -431,8 +438,10 @@ fn sniff_bcf(path: &str) -> std::io::Result<Sniff> {
             }
         let samples = rec.samples();
         s.n_samples = s.n_samples.max(samples.values().count());
-        if let Some(sample) = samples.values().next()
-            && let Some(Some(Value::Integer(dp))) = sample.get("DP") && *dp >= 0 { s.dp.push(*dp as u32); }
+        if let Some(sample) = samples.values().next() {
+            if let Some(Some(Value::Integer(dp))) = sample.get("DP") && *dp >= 0 { s.dp.push(*dp as u32); }
+            if let Some(Some(Value::Integer(gq))) = sample.get("GQ") && *gq >= 0 { s.gq.push(*gq as u32); }
+        }
         // Field presence: a key is present if a sample carries that subfield.
         // (Mirrors extract_site_confidence_bcf's per-sample `.get()` probing —
         // avoids naming the indexmap `Keys` inner type, which is not a direct
@@ -481,6 +490,40 @@ fn panel_sites_in_span(refpanel: &str, s: &Sniff) -> Option<u64> {
     Some((b - a) as u64)
 }
 
+/// Whether any record's FORMAT lists GT, and whether any lists PL (the whole file, streamed).
+fn format_keys_anywhere(path: &str) -> (bool, bool) {
+    use std::io::BufRead;
+    let (mut gt, mut pl) = (false, false);
+    let mut magic = [0u8; 5];
+    let bcf = path.ends_with(".bcf") || std::fs::File::open(path)
+        .and_then(|f| std::io::Read::read_exact(&mut noodles_bgzf::io::Reader::new(f), &mut magic)).is_ok()
+        && &magic == b"BCF\x02\x02";
+    if bcf {
+        let Ok(mut reader) = noodles_bcf::io::reader::Builder::default().build_from_path(path) else { return (false, false) };
+        let Ok(header) = reader.read_header() else { return (false, false) };
+        for rec in reader.record_bufs(&header).flatten() {
+            if let Some(sample) = rec.samples().values().next() {
+                gt |= sample.get("GT").is_some();
+                pl |= sample.get("PL").is_some();
+            }
+            if gt && pl { break; }
+        }
+        return (gt, pl);
+    }
+    let Ok(file) = std::fs::File::open(path) else { return (false, false) };
+    let reader: Box<dyn BufRead> = if path.ends_with(".gz") || path.ends_with(".bgz") {
+        Box::new(std::io::BufReader::new(noodles_bgzf::io::Reader::new(file)))
+    } else { Box::new(std::io::BufReader::new(file)) };
+    for line in reader.lines().map_while(Result::ok).filter(|l| !l.starts_with('#')) {
+        if let Some(fmt) = line.split('\t').nth(8) {
+            gt |= fmt.split(':').any(|k| k == "GT");
+            pl |= fmt.split(':').any(|k| k == "PL");
+        }
+        if gt && pl { break; }
+    }
+    (gt, pl)
+}
+
 /// True for a multi-chromosome SRP (the lcWGS engine reads single-chromosome panels only).
 fn multi_chr_panel(refpanel: &str) -> bool {
     let mut magic = [0u8; 8];
@@ -492,14 +535,16 @@ fn multi_chr_panel(refpanel: &str) -> bool {
 /// `--callable`, or for one sample at sequencing density and depth (see `selphi::io::variant_only`).
 fn fill_applies(s: &Sniff, callable: bool) -> bool {
     if callable { return true; }
-    let mut dp = s.dp.clone();
-    dp.sort_unstable();
-    let deep = !dp.is_empty() && f64::from(dp[dp.len() / 2])
-        >= selphi::config::f64_opt("SELPHI_VARIANT_ONLY_MIN_DP").unwrap_or(20.0);
+    let median = |v: &[u32]| -> Option<f64> {
+        let mut v = v.to_vec();
+        v.sort_unstable();
+        (!v.is_empty()).then(|| f64::from(v[v.len() / 2]))
+    };
+    let head = selphi::io::variant_only::HeadScan { dp: median(&s.dp), gq: median(&s.gq), no_alt: 0, symbolic: 0, records: s.gt_total as usize };
     // Called ALT genotypes, not no-calls: a file of `./.` with PL carries its evidence in the PL.
     let alt_calls = s.gt_called.saturating_sub(s.gt_homref);
-    s.n_samples == 1 && s.gt_homref == 0 && alt_calls >= 200 && 20 * s.gt_called >= 19 * s.gt_total
-        && s.density_per_mb() >= selphi::io::variant_only::min_density() && deep
+    s.n_samples == 1 && 200 * s.gt_homref <= alt_calls && alt_calls >= 200 && 20 * s.gt_called >= 19 * s.gt_total
+        && s.density_per_mb() >= selphi::io::variant_only::min_density() && selphi::io::variant_only::depth_quiet(&head)
 }
 
 /// At least 80% of the sampled likelihoods settle their call.
@@ -540,6 +585,10 @@ pub fn resolve(
         match input {
             Some(p) => {
                 let s = sniff_variant_file(p);
+                // Neither key among the sampled records: read every record's FORMAT, so that a file
+                // whose first records carry neither is routed by what it holds later.
+                let mut s = s;
+                if !s.has_gt && !s.has_pl { (s.has_gt, s.has_pl) = format_keys_anywhere(p); }
                 let mut d = auto_route_decision(false, &s, wgs_density_threshold());
                 // Detail line so the chosen branch is auditable from the log.
                 selphi_step!(
@@ -631,6 +680,14 @@ mod tests {
     fn sniff_dens(has_gq: bool, has_dp: bool, total: u64, called: u64, per_mb: u64) -> Sniff {
         Sniff { has_gt: true, has_pl: false, has_gq, has_dp, gt_total: total, gt_called: called,
                 dens_n: per_mb, dens_span: 1_000_000, ..Sniff::default() }
+    }
+
+    #[test]
+    fn neither_gt_nor_pl_goes_to_the_likelihood_engine() {
+        // After resolve() has read every FORMAT: a GP/DS/GL-only file goes to the lcWGS engine,
+        // which stops when no site carries a usable likelihood.
+        let s = sniff(false, false, true, true, 0, 0);
+        assert_eq!(auto_route_decision(false, &s, WGS_THR), AutoRoute::Lcwgs);
     }
 
     #[test]

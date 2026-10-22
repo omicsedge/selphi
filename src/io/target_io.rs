@@ -215,6 +215,16 @@ struct VcfFields<'a> {
     /// True if the ALT field carried a comma (more than one ALT allele).
     multiallelic: bool,
     gt_region: &'a [u8],
+    /// Position of GT among the record's FORMAT subfields (`None`: no GT). The VCF
+    /// specification puts it first; a file that does not is read by the key.
+    gt_index: Option<usize>,
+}
+
+/// Position of `GT` in a FORMAT spec, `Some(0)` without a scan when it leads.
+#[inline]
+fn gt_position(format: &[u8]) -> Option<usize> {
+    if format.starts_with(b"GT") && (format.len() == 2 || format[2] == b':') { return Some(0); }
+    format.split(|&b| b == b':').position(|k| k == b"GT")
 }
 
 /// Split a VCF data line into [`VcfFields`]. Returns `None` for lines that all
@@ -250,6 +260,7 @@ fn split_vcf_fields(line: &[u8]) -> Option<VcfFields<'_>> {
         alts: std::str::from_utf8(alt_field).unwrap_or(""),
         multiallelic: alt_end < alt_field.len(),
         gt_region: &line[tabs[8] + 1..],
+        gt_index: gt_position(&line[tabs[7] + 1..tabs[8]]),
     })
 }
 
@@ -288,6 +299,7 @@ const RAW_MISSING: u8 = u8::MAX;
 fn parse_gt_raw(
     gt_region: &[u8],
     n_samples: usize,
+    gt_index: Option<usize>,
     unphased: &mut Vec<u32>,
 ) -> Vec<[u8; 2]> {
     let mut var_gts = Vec::with_capacity(n_samples);
@@ -309,8 +321,11 @@ fn parse_gt_raw(
             .map(|p| field_start + p)
             .unwrap_or(gt_region.len());
         let field = &gt_region[field_start..field_end];
-        let gt_end = field.iter().position(|&b| b == b':').unwrap_or(field.len());
-        let gt = &field[..gt_end];
+        let gt = match gt_index {
+            Some(0) => &field[..field.iter().position(|&b| b == b':').unwrap_or(field.len())],
+            Some(k) => nth_subfield(field, k).unwrap_or(b""),
+            None => b"",
+        };
 
         // Locate the '/'|'|' separator by scanning — allele indices can be
         // multi-digit at multiallelic sites, so it is not always at byte 1.
@@ -476,7 +491,7 @@ pub fn read_cohort_vcf(
         // very often handed over as .vcf.gz, that made the panel no-call fix inert
         // on the most common input format while it worked on .bcf.
         unph.clear();
-        let mut gts = parse_gt_raw(f.gt_region, sample_names.len(), &mut unph);
+        let mut gts = parse_gt_raw(f.gt_region, sample_names.len(), f.gt_index, &mut unph);
         unphased_het |= !unph.is_empty();
         project_any_alt(&mut gts);
         genotypes.push(gts);
@@ -552,7 +567,7 @@ pub fn read_cohort_phased_vcf_stream(
         });
         // Same GT binarisation as read_cohort_vcf; fold the missing sentinel to 0.
         unph.clear();
-        let mut gts = parse_gt_raw(f.gt_region, sample_names.len(), &mut unph);
+        let mut gts = parse_gt_raw(f.gt_region, sample_names.len(), f.gt_index, &mut unph);
         unphased_het |= !unph.is_empty();
         project_any_alt(&mut gts);
         phased.reserve(n_haps);
@@ -716,7 +731,7 @@ pub fn read_target_vcf(
 
         let Some(f) = split_vcf_fields(line) else { continue };
         unph.clear();
-        let raw_gt = parse_gt_raw(f.gt_region, sample_names.len(), &mut unph);
+        let raw_gt = parse_gt_raw(f.gt_region, sample_names.len(), f.gt_index, &mut unph);
         unphased_het |= !unph.is_empty();
         if f.multiallelic {
             n_multiallelic += 1;
@@ -1047,6 +1062,7 @@ fn line_min_confidence(
     if gq_i.is_none() && pl_i.is_none() && dp_i.is_none() {
         return 1.0;
     }
+    let gt_i = gt_position(format_bytes);
     let mut min_c = f64::INFINITY;
     let mut field_start = 0usize;
     for _ in 0..n_samples {
@@ -1059,7 +1075,7 @@ fn line_min_confidence(
         let pl = pl_i.and_then(|i| nth_subfield(field, i)).and_then(parse_pl_triple);
         let dp = dp_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
         // GT is subfield 0; a '.' allele = a missing call → confidence 0 (re-route to imputed).
-        let gt_missing = nth_subfield(field, 0).map(|g| g.contains(&b'.')).unwrap_or(true);
+        let gt_missing = gt_i.and_then(|i| nth_subfield(field, i)).map(|g| g.contains(&b'.')).unwrap_or(true);
         let c = sample_confidence(gt_missing, gq, pl, dp, gq_lo, gq_hi);
         if c < min_c { min_c = c; }
         field_start = if field_end < gt_region.len() { field_end + 1 } else { gt_region.len() };
@@ -1083,6 +1099,7 @@ fn line_per_sample_confidence(
         out.extend(std::iter::repeat_n(1.0f64, n_samples));
         return;
     }
+    let gt_i = gt_position(format_bytes);
     let mut field_start = 0usize;
     for _ in 0..n_samples {
         let field_end = gt_region[field_start..]
@@ -1093,7 +1110,7 @@ fn line_per_sample_confidence(
         let gq = gq_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
         let pl = pl_i.and_then(|i| nth_subfield(field, i)).and_then(parse_pl_triple);
         let dp = dp_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
-        let gt_missing = nth_subfield(field, 0).map(|g| g.contains(&b'.')).unwrap_or(true);
+        let gt_missing = gt_i.and_then(|i| nth_subfield(field, i)).map(|g| g.contains(&b'.')).unwrap_or(true);
         out.push(sample_confidence(gt_missing, gq, pl, dp, gq_lo, gq_hi));
         field_start = if field_end < gt_region.len() { field_end + 1 } else { gt_region.len() };
     }
@@ -1442,6 +1459,19 @@ pub fn extract_target_alleles(
 /// is dropped: the chromosome is then imputed from no anchors, every typed
 /// record re-routed as a no-call, rather than lost. SELPHI_KEEP_UNCALLED_SITES=1
 /// keeps them (A/B).
+/// Whether any sample carries a called genotype at any of the records `target_idx` names.
+pub fn any_called(genotypes: &[Vec<[u8; 2]>], target_idx: &[usize]) -> bool {
+    target_idx.iter().any(|&ti| genotypes[ti].iter().any(|g| g[0] < GT_MISSING && g[1] < GT_MISSING))
+}
+
+/// Stop a run whose target records carry no called genotype at all: a file without GT
+/// (GP, DS or GL only) would otherwise be imputed from the panel alone.
+pub fn refuse_uncalled(n_records: usize) -> ! {
+    crate::selphi_error!("None of the {} target records matching the panel carries a called genotype \
+        (a file without GT, e.g. GP/DS/GL only, has nothing to read: write GT; a file with PL runs with --engine lcwgs)", n_records);
+    std::process::exit(1);
+}
+
 pub fn drop_uncalled_sites(
     genotypes: &[Vec<[u8; 2]>], wgs_idx: &mut Vec<usize>, target_idx: &mut Vec<usize>,
     transforms: &mut Vec<u8>,
@@ -1662,7 +1692,7 @@ pub fn read_target_vcf_multi_chr(
 
         let Some(f) = split_vcf_fields(line) else { continue };
         unph.clear();
-        let raw_gt = parse_gt_raw(f.gt_region, sample_names.len(), &mut unph);
+        let raw_gt = parse_gt_raw(f.gt_region, sample_names.len(), f.gt_index, &mut unph);
         unphased_het |= !unph.is_empty();
         if f.multiallelic {
             n_multiallelic += 1;
@@ -1886,22 +1916,22 @@ mod allele_match_tests {
     fn gt_parsing_haploid_phase_and_split() {
         let mut unph: Vec<u32> = Vec::new();
         // haploid ALT, haploid REF, phased het, unphased hom, missing
-        let raw = parse_gt_raw(b"1\t0:5\t0|1\t1/1\t./.", 5, &mut unph);
+        let raw = parse_gt_raw(b"1\t0:5\t0|1\t1/1\t./.", 5, Some(0), &mut unph);
         assert_eq!(raw, vec![[1, 1], [0, 0], [0, 1], [1, 1], [RAW_MISSING, RAW_MISSING]]);
         assert!(unph.is_empty(), "no het is written with '/'");
-        let raw = parse_gt_raw(b"1/0\t0|0", 2, &mut unph);
+        let raw = parse_gt_raw(b"1/0\t0|0", 2, Some(0), &mut unph);
         assert_eq!(raw, vec![[0, 1], [0, 0]], "an unphased het is stored in allele order");
         assert_eq!(unph, vec![0], "an unphased het asks for phasing, and names its sample");
         // The listed order of an unphased het never reaches the result; a phased one keeps it.
         let mut u = Vec::new();
-        assert_eq!(parse_gt_raw(b"0/1\t1/0\t2/1\t1/2\t1|0\t2|1", 6, &mut u),
+        assert_eq!(parse_gt_raw(b"0/1\t1/0\t2/1\t1/2\t1|0\t2|1", 6, Some(0), &mut u),
                    vec![[0, 1], [0, 1], [1, 2], [1, 2], [1, 0], [2, 1]]);
         // half-missing is not a het
         let mut unph2 = Vec::new();
-        parse_gt_raw(b"./1", 1, &mut unph2);
+        parse_gt_raw(b"./1", 1, Some(0), &mut unph2);
         assert!(unph2.is_empty());
         // multi-allelic split: 0/2 carries ALT 2 only; 1/2 one copy of each
-        let raw = parse_gt_raw(b"0/2\t1|2\t2\t.", 4, &mut unph);
+        let raw = parse_gt_raw(b"0/2\t1|2\t2\t.", 4, Some(0), &mut unph);
         let mut a1 = raw.clone(); project_alt(&mut a1, 1);
         let mut a2 = raw.clone(); project_alt(&mut a2, 2);
         assert_eq!(a1, vec![[0, 0], [1, 0], [0, 0], [GT_MISSING, GT_MISSING]]);
@@ -1918,11 +1948,26 @@ mod allele_match_tests {
     }
 
     #[test]
+    fn gt_is_read_by_its_format_position() {
+        let line = b"22\t100\t.\tC\tT\t.\t.\t.\tGQ:DP:GT\t50:30:0/1\t20:9:1|1\t3:1:./.";
+        let f = split_vcf_fields(line).unwrap();
+        assert_eq!(f.gt_index, Some(2));
+        let mut unph = Vec::new();
+        let raw = parse_gt_raw(f.gt_region, 3, f.gt_index, &mut unph);
+        assert_eq!(raw, vec![[0, 1], [1, 1], [RAW_MISSING, RAW_MISSING]]);
+        let none = split_vcf_fields(b"22\t100\t.\tC\tT\t.\t.\t.\tGP\t0.9,0.1,0").unwrap();
+        assert_eq!(none.gt_index, None);
+        assert_eq!(parse_gt_raw(none.gt_region, 1, none.gt_index, &mut unph), vec![[RAW_MISSING, RAW_MISSING]]);
+        assert_eq!(gt_position(b"GT"), Some(0));
+        assert_eq!(gt_position(b"GTX:GT"), Some(1));
+    }
+
+    #[test]
     fn split_markers_and_confidence_rows_agree() {
         let line = b"22\t100\t.\tC\tT,G\t.\t.\t.\tGT\t0/2";
         let f = split_vcf_fields(line).unwrap();
         let mut unph = Vec::new();
-        let raw = parse_gt_raw(f.gt_region, 1, &mut unph);
+        let raw = parse_gt_raw(f.gt_region, 1, f.gt_index, &mut unph);
         let (mut m, mut g) = (Vec::new(), Vec::new());
         let alts: Vec<&str> = f.alts.split(',').collect();
         push_target_record(f.chrom, f.pos, f.ref_allele, &alts, raw, false, &unph, &mut m, &mut g);
