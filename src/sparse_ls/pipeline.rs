@@ -74,7 +74,7 @@ pub fn run_pipeline(
         !srp.ids[0].contains(first_ref)
     };
     let PlVcfResult { gl3: gl3_input, markers, sample_ids, .. } =
-        parse_pl_vcf(target_vcf, hash_alleles)?;
+        parse_pl_vcf(target_vcf, hash_alleles, None)?;
     let n_samples = sample_ids.len();
     let n_target_variants = markers.len();
     let n_ref_haps = srp.metadata.n_haps;

@@ -573,7 +573,13 @@ pub fn run_multi_chr(
     // per chromosome in `prepare_chr_target`; each chromosome gets the one 0/0 row they point at.
     let fill = selphi::io::variant_only::FillPlan::new(config.callable.as_deref(),
         target_by_chr.values().flat_map(|(m, g)| m.iter().zip(g.iter())), n_samples, input_path).map(Arc::new);
-    if fill.is_some() {
+    if let Some(f) = &fill {
+        // A panel chromosome the file writes only reference records for.
+        for c in f.speaks_contigs() {
+            if !target_by_chr.contains_key(c) && chromosomes.iter().any(|p| p.strip_prefix("chr").unwrap_or(p) == c) {
+                target_by_chr.insert(c.to_string(), (Vec::new(), Vec::new()));
+            }
+        }
         for (m, g) in target_by_chr.values_mut() {
             let (sm, sg) = selphi::io::variant_only::sentinel(n_samples);
             m.push(sm);
@@ -772,7 +778,8 @@ pub fn run_multi_chr(
             let key = chr_name.strip_prefix("chr").unwrap_or(chr_name);
             let markers = target_by_chr.get(key).or_else(|| target_by_chr.get(chr_name))
                 .map(|(m, _)| m.as_slice()).unwrap_or(&[]);
-            match selphi::io::passthrough::for_chromosome(input_path, &srp, markers, &matched_idx, None) {
+            let all_sites = fill.as_ref().is_some_and(|f| f.reads_all_sites(chr_name));
+            match selphi::io::passthrough::for_chromosome(input_path, &srp, markers, &matched_idx, None, all_sites) {
                 Ok(p) => p,
                 Err(e) => {
                     selphi_error!("Reading the target records absent from the panel ({}): {}", input_path, e);

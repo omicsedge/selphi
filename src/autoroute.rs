@@ -71,6 +71,15 @@ struct Sniff {
     n_samples: usize,
     dp: Vec<u32>,
     gq: Vec<u32>,
+    /// Sampled records that make reference calls of their own: a gVCF reference-block allele
+    /// (`<NON_REF>`, `<*>`, `<X>`) among their ALTs, or ALT `.` (bcftools `--gvcf` blocks, all-sites
+    /// records).
+    ref_blocks: u64,
+    /// Sampled likelihoods of variant records only (a record's first real ALT, out of the whole
+    /// PL of a multi-allelic or `X,<NON_REF>` record), and those its reads settle: whether a gVCF's
+    /// variant calls, not its blocks, are confident.
+    pl_var_n: u64,
+    pl_var_sure: u64,
 }
 
 /// Phred gap between the best and second-best genotype of a settled call.
@@ -309,9 +318,22 @@ fn sniff_vcf_text(raw: &[u8]) -> Sniff {
         if taken >= want { break; }
         taken += 1;
 
+        if line.split(|&b| b == b'\t').nth(4).is_some_and(|alt| alt == b"." || alt.split(|&b| b == b',')
+            .any(|a| std::str::from_utf8(a).is_ok_and(selphi::io::target_io::is_ref_symbolic))) { s.ref_blocks += 1; }
         // Locate FORMAT (col 9, after the 8th tab) and the per-sample region.
         let Some((format, samples_region)) = format_and_samples(line) else { continue };
         record_into_sniff(&mut s, format, samples_region);
+        if let Some(alt) = line.split(|&b| b == b'\t').nth(4).and_then(|a| std::str::from_utf8(a).ok())
+            && let Some(k) = first_real_alt(alt.split(','))
+            && let Some(pi) = format.split(|&b| b == b':').position(|sub| sub == b"PL") {
+            let n_alleles = alt.split(',').count() + 1;
+            for field in samples_region.split(|&b| b == b'\t') {
+                let pl = field.split(|&b| b == b':').nth(pi).unwrap_or(b"");
+                let v: Vec<i64> = pl.split(|&b| b == b',').map(|x| std::str::from_utf8(x).ok()
+                    .and_then(|x| x.trim().parse().ok()).unwrap_or(-1)).collect();
+                tally_var_pl(&mut s, &v, n_alleles, k);
+            }
+        }
     }
     s
 }
@@ -397,6 +419,22 @@ fn record_into_sniff(s: &mut Sniff, format: &[u8], samples_region: &[u8]) {
     }
 }
 
+/// Count one sample's PL of a variant record for [`Sniff::pl_var_n`]: its first ALT that is no
+/// placeholder (`k`, 1-based) out of `n_alleles`, the diploid genotypes 0/0, 0/k, k/k.
+fn tally_var_pl(s: &mut Sniff, pl: &[i64], n_alleles: usize, k: usize) {
+    if pl.len() != n_alleles * (n_alleles + 1) / 2 || pl.iter().any(|&p| p < 0) { return; }
+    let h = k * (k + 1) / 2;
+    let mut v = [pl[0], pl[h], pl[h + k]];
+    v.sort_unstable();
+    s.pl_var_n += 1;
+    if v[1] - v[0] >= SURE_PL { s.pl_var_sure += 1; }
+}
+
+/// The 1-based index of a record's first ALT that is neither `.` nor a placeholder.
+fn first_real_alt<'a>(alts: impl Iterator<Item = &'a str>) -> Option<usize> {
+    alts.enumerate().find(|(_, a)| *a != "." && !a.is_empty() && !selphi::io::target_io::is_ref_symbolic(a)).map(|(i, _)| i + 1)
+}
+
 /// Count one sample's PL in the sniff: diploid biallelic triples only.
 fn tally_pl(s: &mut Sniff, pl: &[i64]) {
     if pl.len() != 3 { return; }
@@ -436,6 +474,10 @@ fn sniff_bcf(path: &str) -> std::io::Result<Sniff> {
                 dmin = dmin.min(p);
                 dmax = dmax.max(p);
             }
+        let alts = rec.alternate_bases().as_ref();
+        if alts.is_empty() || alts.iter().any(|a| selphi::io::target_io::is_ref_symbolic(a)) { s.ref_blocks += 1; }
+        let var_k = first_real_alt(alts.iter().map(String::as_str));
+        let n_alleles = alts.len() + 1;
         let samples = rec.samples();
         s.n_samples = s.n_samples.max(samples.values().count());
         if let Some(sample) = samples.values().next() {
@@ -463,6 +505,7 @@ fn sniff_bcf(path: &str) -> std::io::Result<Sniff> {
             if let Some(Some(Value::Array(noodles_vcf::variant::record_buf::samples::sample::value::Array::Integer(pl)))) = sample.get("PL") {
                 let v: Vec<i64> = pl.iter().map(|x| x.map_or(-1, i64::from)).collect();
                 if v.iter().all(|&x| x >= 0) { tally_pl(&mut s, &v); }
+                if let Some(k) = var_k { tally_var_pl(&mut s, &v, n_alleles, k); }
             }
         }
     }
@@ -547,8 +590,9 @@ fn fill_applies(s: &Sniff, callable: bool) -> bool {
         && s.density_per_mb() >= selphi::io::variant_only::min_density() && selphi::io::variant_only::depth_quiet(&head)
 }
 
-/// At least 80% of the sampled likelihoods settle their call.
-fn settled(s: &Sniff) -> bool { s.pl_n > 0 && 5 * s.pl_sure >= 4 * s.pl_n }
+/// At least 80% of `n` sampled likelihoods settle their call (`sure`), or 95% on a
+/// multi-chromosome panel, whose genotype path writes calls as given (no refine).
+fn settles(n: u64, sure: u64, multi: bool) -> bool { n > 0 && if multi { 20 * sure >= 19 * n } else { 5 * sure >= 4 * n } }
 
 /// A likelihood file listing under half the panel's sites in its span.
 fn sparse(listed: u64, panel: u64) -> bool { panel > 0 && 2 * listed < panel }
@@ -592,20 +636,28 @@ pub fn resolve(
                 let mut d = auto_route_decision(false, &s, wgs_density_threshold());
                 // Detail line so the chosen branch is auditable from the log.
                 selphi_step!(
-                    "auto-route: sniff GT={} PL={} GQ={} DP={} call-rate={:.3} (of {} GT entries) density={:.0}/Mb (thr {:.0})",
+                    "auto-route: sniff GT={} PL={} GQ={} DP={} call-rate={:.3} (of {} GT entries) density={:.0}/Mb (thr {:.0}) settled PL {}/{} (variant records {}/{}, blocks {})",
                     s.has_gt, s.has_pl, s.has_gq, s.has_dp, s.call_rate(), s.gt_total,
-                    s.density_per_mb(), wgs_density_threshold(),
+                    s.density_per_mb(), wgs_density_threshold(), s.pl_sure, s.pl_n, s.pl_var_sure, s.pl_var_n, s.ref_blocks,
                 );
+                // A gVCF or all-sites file stays here: the likelihood engine gives the panel SNPs inside its
+                // reference blocks their likelihoods (pl_reader::RefBlocks; HG002 chr22 bcftools --gvcf, panel
+                // sites, R2 0.9975 / 0.9959 at 30x / 10x, against 0.9972 / 0.9910 for the genotype engine
+                // reading the blocks as reference calls; an HG003 exome gVCF 0.8997 against 0.8433, the
+                // difference off target, 0.897 against 0.838), sparse or not. Its settled share is that of its
+                // variant records.
+                let multi = refpanel.is_some_and(multi_chr_panel);
+                let (pl_n, pl_sure) = if s.ref_blocks > 0 { (s.pl_var_n, s.pl_var_sure) } else { (s.pl_n, s.pl_sure) };
                 // The panel is opened only for settled likelihoods: low-pass files stay as they were.
                 // A sparse file goes to the genotype engine where that engine is better: it carries
                 // reference calls (an exome at the panel's sites: R² 0.813 against 0.793 outside the
                 // targets, common sites), or its omissions will be read as reference. A variant-only
                 // exome without --callable stays here (in/out of target 0.924 / 0.781 against 0.918 / 0.778).
-                if d == AutoRoute::Lcwgs && s.has_gt && settled(&s)
+                if d == AutoRoute::Lcwgs && s.has_gt && s.ref_blocks == 0 && settles(pl_n, pl_sure, multi)
                     && let Some(panel) = refpanel.and_then(|rp| panel_sites_in_span(rp, &s))
                     && sparse(s.dens_n, panel) {
                     selphi_step!("auto-route: the PL file lists {} of the panel's {} sites in its span, {:.0}% of its calls settled by the reads",
-                        s.dens_n, panel, 100.0 * s.pl_sure as f64 / s.pl_n as f64);
+                        s.dens_n, panel, 100.0 * pl_sure as f64 / pl_n as f64);
                     if s.gt_homref > 0 || fill_applies(&s, callable) {
                         d = AutoRoute::SparseLikelihoods;
                     } else {
@@ -615,10 +667,9 @@ pub fn resolve(
                 // The lcWGS engine reads one chromosome's panel; nearly settled calls go to the genotype
                 // engine on a multi-chromosome panel (30x HG002 chr22: 0.9973 there against 0.9978), whose
                 // multi-chromosome path writes calls as given (no refine), hence 95% rather than 80%.
-                if d == AutoRoute::Lcwgs && s.has_gt && s.pl_n > 0 && 20 * s.pl_sure >= 19 * s.pl_n
-                    && refpanel.is_some_and(multi_chr_panel) {
+                if d == AutoRoute::Lcwgs && s.has_gt && multi && settles(pl_n, pl_sure, true) {
                     selphi_step!("auto-route: a multi-chromosome panel, which the lcWGS engine does not read; \
-                        its calls are written as given ({:.1}% settled by the reads)", 100.0 * s.pl_sure as f64 / s.pl_n as f64);
+                        its calls are written as given ({:.1}% settled by the reads)", 100.0 * pl_sure as f64 / pl_n as f64);
                     d = AutoRoute::SparseLikelihoods;
                 }
                 // --phase-only phases called genotypes.
@@ -693,11 +744,14 @@ mod tests {
     #[test]
     fn sparse_settled_likelihoods_leave_the_likelihood_engine() {
         let mut s = sniff(true, true, false, true, 100, 100);
-        assert!(!settled(&s));
+        assert!(!settles(s.pl_n, s.pl_sure, false));
         (s.pl_n, s.pl_sure) = (100, 79);
-        assert!(!settled(&s));
+        assert!(!settles(s.pl_n, s.pl_sure, false));
         s.pl_sure = 80;
-        assert!(settled(&s));
+        assert!(settles(s.pl_n, s.pl_sure, false));
+        assert!(!settles(s.pl_n, s.pl_sure, true), "a multi-chromosome panel needs 95%");
+        s.pl_sure = 95;
+        assert!(settles(s.pl_n, s.pl_sure, true));
         // an exome at the panel's sites lists ~4% of them; a likelihood file made at them all, ~100%
         assert!(sparse(35_796, 861_896));
         assert!(!sparse(917_859, 929_781));
@@ -707,6 +761,24 @@ mod tests {
         tally_pl(&mut pl, &[0, 3, 30]);
         tally_pl(&mut pl, &[0, 3, 30, 4, 40, 50]);
         assert_eq!((pl.pl_n, pl.pl_sure), (2, 1));
+    }
+
+    #[test]
+    fn gvcf_blocks_are_counted_by_the_sniff() {
+        let raw = b"##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n\
+chr22\t100\t.\tA\t<NON_REF>\t.\t.\tEND=199\tGT:GQ:PL\t0/0:30:0,30,300\n\
+chr22\t200\t.\tA\tG,<NON_REF>\t50\t.\t.\tGT:GQ:PL\t0/1:50:50,0,60,90,80,200\n\
+chr22\t300\t.\tA\tG\t50\t.\t.\tGT:GQ:PL\t0/1:50:50,0,60\n";
+        let s = sniff_vcf_text(raw);
+        assert_eq!(s.ref_blocks, 2);
+        assert!(s.has_gt && s.has_pl);
+        // The block's triple is no variant call; G of `G,<NON_REF>` is read out of its six values.
+        assert_eq!((s.pl_var_n, s.pl_var_sure), (2, 2));
+        assert_eq!(s.pl_n, 2, "the block and the plain record: the six-value PL is not a triple");
+        let plain = sniff_vcf_text(b"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\nchr22\t300\t.\tA\tG,*\t50\t.\t.\tGT\t1/2\n");
+        assert_eq!(plain.ref_blocks, 0, "a spanning deletion is no reference block");
+        let bcftools = sniff_vcf_text(b"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\nchr22\t1\t.\tA\t.\t.\t.\tEND=240;MIN_DP=26\tGT:DP\t0/0:26\n");
+        assert_eq!(bcftools.ref_blocks, 1);
     }
 
     const WGS_THR: f64 = 1000.0;

@@ -224,6 +224,15 @@ fn main() {
             std::process::exit(1);
         }
         let refpanel = args.refpanel.as_str();
+        // Before --map: a multi-chromosome run (--map-dir) reaches here with a multi-chromosome panel.
+        let mut magic = [0u8; 8];
+        if std::fs::File::open(refpanel).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic)).is_ok()
+            && selphi::srp::is_multi_chr_magic(&magic) {
+            eprintln!("Error: the lcWGS engine (read likelihoods: PL or aligned reads) reads one chromosome's panel: give --refpanel a \
+                single-chromosome SRP and --map that chromosome's map (one run per chromosome, each with --prepare-reference-from \
+                on that chromosome's BCF)");
+            std::process::exit(2);
+        }
         let map = args.map_path.as_deref()
             .unwrap_or_else(|| { eprintln!("Error: --map is required for --lcwgs"); std::process::exit(1); });
         let output = args.out.as_deref().unwrap_or("lcwgs_imputed");
@@ -249,13 +258,6 @@ fn main() {
 
         if args.phase_only {
             selphi_error!("--phase-only phases called genotypes: aligned reads and files without GT are imputed by the lcWGS engine (drop --phase-only)");
-            std::process::exit(2);
-        }
-        let mut magic = [0u8; 8];
-        if std::fs::File::open(refpanel).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic)).is_ok()
-            && selphi::srp::is_multi_chr_magic(&magic) {
-            selphi_error!("The lcWGS engine reads one chromosome's panel: give --refpanel a single-chromosome SRP \
-                (one run per chromosome, each with --prepare-reference-from on that chromosome's BCF)");
             std::process::exit(2);
         }
         // Load SRP reference panel

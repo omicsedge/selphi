@@ -20,6 +20,7 @@
 //! dosage per row, so they carry the biallelic records and skip the others;
 //! the run log says how many.
 
+use crate::io::target_io::is_ref_symbolic;
 use std::collections::HashSet;
 use std::io;
 use std::ops::Range;
@@ -92,8 +93,11 @@ impl PassRecord {
     /// `bcftools norm -m-` splits it: allele `k` becomes 1, REF and every other
     /// ALT 0; missing alleles, haploid calls and phasing are kept.
     fn split_alt(&self, k: u8) -> PassRecord {
+        // A call of a gVCF `<NON_REF>` placeholder is unknown, not REF.
+        let placeholder = |a: u8| a >= 1 && self.alts.get(a as usize - 1).is_some_and(|x| is_ref_symbolic(x));
         let gt = self.gt.iter().map(|&a| match a {
             MISSING | ABSENT => a,
+            _ if placeholder(a) => MISSING,
             _ => (a == k) as u8,
         }).collect();
         PassRecord {
@@ -230,8 +234,10 @@ fn bare(c: &str) -> &str {
 /// only that contig through the `.tbi`/`.csi` index when there is one, otherwise
 /// scans the file. Matched records are recognised from their lazily-read
 /// position and alleles without decoding their samples, so the pass costs
-/// little when nearly every record is a panel site.
-pub fn collect(path: &str, contig: &str, matched: &HashSet<SiteKey>) -> io::Result<Vec<PassRecord>> {
+/// little when nearly every record is a panel site. With `all_sites`, ALT `.` records whose every
+/// call is REF or missing are left out: they are an all-sites file's reference calls, which the
+/// run read as such (`variant_only::FillPlan`), not records of its to write back.
+pub fn collect(path: &str, contig: &str, matched: &HashSet<SiteKey>, all_sites: bool) -> io::Result<Vec<PassRecord>> {
     let want = bare(contig);
     let region = noodles_core_vcf::Region::new(contig, ..);
     let mut out = Vec::new();
@@ -239,24 +245,24 @@ pub fn collect(path: &str, contig: &str, matched: &HashSet<SiteKey>) -> io::Resu
         if let Ok(mut reader) = noodles_bcf::io::indexed_reader::Builder::default().build_from_path(path) {
             let header = reader.read_header()?;
             if let Ok(query) = reader.query(&header, &region) {
-                for rec in query { scan(&rec?, &header, want, matched, &mut out)?; }
+                for rec in query { scan(&rec?, &header, want, matched, all_sites, &mut out)?; }
                 return Ok(out);
             }
         }
         let mut reader = noodles_bcf::io::reader::Builder::default().build_from_path(path)?;
         let header = reader.read_header()?;
-        for rec in reader.records() { scan(&rec?, &header, want, matched, &mut out)?; }
+        for rec in reader.records() { scan(&rec?, &header, want, matched, all_sites, &mut out)?; }
     } else {
         if let Ok(mut reader) = noodles_vcf::io::indexed_reader::Builder::default().build_from_path(path) {
             let header = reader.read_header()?;
             if let Ok(query) = reader.query(&header, &region) {
-                for rec in query { scan(&rec?, &header, want, matched, &mut out)?; }
+                for rec in query { scan(&rec?, &header, want, matched, all_sites, &mut out)?; }
                 return Ok(out);
             }
         }
         let mut reader = noodles_vcf::io::reader::Builder::default().build_from_path(path)?;
         let header = reader.read_header()?;
-        for rec in reader.records() { scan(&rec?, &header, want, matched, &mut out)?; }
+        for rec in reader.records() { scan(&rec?, &header, want, matched, all_sites, &mut out)?; }
     }
     Ok(out)
 }
@@ -271,7 +277,7 @@ pub fn collect(path: &str, contig: &str, matched: &HashSet<SiteKey>) -> io::Resu
 /// lost and none is written twice.
 fn scan<R: noodles_vcf::variant::Record>(
     rec: &R, header: &noodles_vcf::Header, want: &str,
-    matched: &HashSet<SiteKey>, out: &mut Vec<PassRecord>,
+    matched: &HashSet<SiteKey>, all_sites: bool, out: &mut Vec<PassRecord>,
 ) -> io::Result<()> {
     if bare(rec.reference_sequence_name(header)?) != want { return Ok(()); }
     let Some(start) = rec.variant_start().transpose()? else { return Ok(()) };
@@ -280,25 +286,29 @@ fn scan<R: noodles_vcf::variant::Record>(
         .map(|b| b.map(char::from)).collect::<io::Result<_>>()?;
     let alt_bases = rec.alternate_bases();
     let n_alts = alt_bases.len();
-    let mut alts = alt_bases.iter();
-    let first_alt = match alts.next() {
-        Some(a) => a?.to_string(),
-        None => ".".to_string(),
-    };
+    let alts: Vec<String> = alt_bases.iter().map(|a| a.map(|a| a.to_string())).collect::<io::Result<_>>()?;
+    let first_alt = alts.first().cloned().unwrap_or_else(|| ".".to_string());
     let mut key = (pos, ref_allele, first_alt);
     let first_matched = matched.contains(&key);
     if n_alts <= 1 {
-        if first_matched { return Ok(()); }
+        // A gVCF reference block is no record of the input's to write back.
+        if first_matched || alts.first().is_some_and(|a| is_ref_symbolic(a)) { return Ok(()); }
         let buf = noodles_vcf::variant::RecordBuf::try_from_variant_record(header, rec)?;
-        out.push(pass_record(&buf, pos));
+        let r = pass_record(&buf, pos);
+        // Nor is an ALT `.` block (`bcftools call --gvcf` writes its blocks so, with an END).
+        use noodles_vcf::variant::record_buf::info::field::Value;
+        let block = r.alts.is_empty()
+            && matches!(buf.info().get("END"), Some(Some(Value::Integer(e))) if i64::from(*e) >= pos);
+        if !block && !(all_sites && r.alts.is_empty() && r.max_allele() == 0) { out.push(r); }
         return Ok(());
     }
-    // Multi-allelic: which ALTs (1-based allele indexes) did the panel match?
+    // Multi-allelic: which ALTs (1-based allele indexes) did the panel match? A gVCF's
+    // `<NON_REF>` placeholder is never one to carry.
     let mut unmatched: Vec<u8> = Vec::new();
-    if !first_matched { unmatched.push(1); }
-    for (k, a) in alts.enumerate() {
-        key.2 = a?.to_string();
-        if !matched.contains(&key) { unmatched.push((k + 2).min(ABSENT as usize - 1) as u8); }
+    if !first_matched && !is_ref_symbolic(&alts[0]) { unmatched.push(1); }
+    for (k, a) in alts.iter().enumerate().skip(1) {
+        key.2 = a.clone();
+        if !matched.contains(&key) && !is_ref_symbolic(a) { unmatched.push((k + 1).min(ABSENT as usize - 1) as u8); }
     }
     if unmatched.len() == n_alts {
         let buf = noodles_vcf::variant::RecordBuf::try_from_variant_record(header, rec)?;
@@ -336,7 +346,7 @@ pub fn target_contig_lines(path: &str) -> io::Result<std::collections::HashMap<S
 /// chromosome the panel lacks), anchored before panel variant 0. `out_contig` is
 /// the spelling written.
 pub fn whole_contig(path: &str, contig: &str, out_contig: &str) -> io::Result<Passthrough> {
-    let recs = collect(path, contig, &HashSet::new())?;
+    let recs = collect(path, contig, &HashSet::new(), false)?;
     Ok(Passthrough::new(out_contig, recs, |_| 0, 0))
 }
 
@@ -390,10 +400,11 @@ pub fn for_chromosome(
     markers: &[crate::io::target_io::TargetMarker],
     target_idx: &[usize],
     out_contig: Option<&str>,
+    all_sites: bool,
 ) -> io::Result<Option<Passthrough>> {
     let Some(first) = target_idx.first().and_then(|&t| markers.get(t)) else { return Ok(None) };
     let matched = matched_keys(target_idx.iter().map(|&t| &markers[t]));
-    let recs = collect(target_path, &first.chrom, &matched)?;
+    let recs = collect(target_path, &first.chrom, &matched, all_sites)?;
     if recs.is_empty() { return Ok(None); }
     let contig = match out_contig {
         Some(c) => c.to_string(),

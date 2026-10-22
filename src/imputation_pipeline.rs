@@ -729,6 +729,9 @@ struct LoadedTarget {
     uncalled_typed: Vec<usize>,
     /// Panel indices of the sites read as reference (`variant_only`): written IMP.
     filled_typed: Vec<usize>,
+    /// The input's ALT `.` records on this contig are all-sites reference calls, left out of
+    /// the passthrough.
+    all_sites: bool,
 }
 
 /// Target records that match no panel site, anchored for the output writers
@@ -737,7 +740,7 @@ struct LoadedTarget {
 /// as its other lines do: the panel's spelling, or the target's for `--phase-only`.
 fn build_passthrough(
     args: &Args, target_path: &str, srp: &SrpReader,
-    target_markers: &[selphi::io::target_io::TargetMarker], target_idx: &[usize],
+    target_markers: &[selphi::io::target_io::TargetMarker], target_idx: &[usize], all_sites: bool,
 ) -> Option<selphi::io::passthrough::Passthrough> {
     if args.drop_unmatched { return None; }
     // Phase-only lines name the contig as the target does; imputed output as the panel does.
@@ -745,7 +748,7 @@ fn build_passthrough(
         target_idx.first().map(|&t| target_markers[t].chrom.clone())
     } else { None };
     let pass = selphi::io::passthrough::for_chromosome(
-        target_path, srp, target_markers, target_idx, out_contig.as_deref(),
+        target_path, srp, target_markers, target_idx, out_contig.as_deref(), all_sites,
     ).unwrap_or_else(|e| {
         selphi_error!("Reading the target records absent from the panel ({}): {}", target_path, e);
         std::process::exit(1);
@@ -784,10 +787,12 @@ fn load_and_intersect(args: &Args, target_path: &str, srp: &SrpReader) -> Loaded
     }
     let matched_idx = target_idx.clone();
     let mut filled_typed = Vec::new();
+    let mut all_sites = false;
     // Panel sites a variant-only input leaves out, read as reference where its caller looked.
     if !args.phase_only
         && let Some(plan) = selphi::io::variant_only::FillPlan::new(args.callable.as_deref(),
             target_markers.iter().zip(target_genotypes.iter()), n_samples, target_path) {
+        all_sites = plan.reads_all_sites(srp.chromosome());
         let sites = plan.sites(srp, &target_markers, wgs_idx.len());
         if !sites.is_empty() {
             let (m, g) = selphi::io::variant_only::sentinel(n_samples);
@@ -819,6 +824,7 @@ fn load_and_intersect(args: &Args, target_path: &str, srp: &SrpReader) -> Loaded
     LoadedTarget {
         sample_names, target_markers, target_genotypes, is_phased,
         n_samples, n_haps, wgs_idx, target_idx, allele_transforms, n_chip, matched_idx, uncalled_typed, filled_typed,
+        all_sites,
     }
 }
 
@@ -984,8 +990,9 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     let LoadedTarget {
         sample_names, target_markers, target_genotypes, is_phased,
         n_samples, n_haps, wgs_idx, target_idx, allele_transforms, n_chip, matched_idx, uncalled_typed, filled_typed,
+        all_sites,
     } = load_and_intersect(args, target_path, &srp);
-    let passthrough = build_passthrough(args, target_path, &srp, &target_markers, &matched_idx);
+    let passthrough = build_passthrough(args, target_path, &srp, &target_markers, &matched_idx, all_sites);
 
     // --refine / no-call input confidence + the re-route threshold. See
     // `build_target_confidence` for the full rationale.

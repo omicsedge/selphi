@@ -389,10 +389,26 @@ fn project_any_alt(gts: &mut [[u8; 2]]) {
 /// unphased `0/2` makes the `A>C` marker of `A>C,G` a `0/0`, which needs no phasing.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
+/// A gVCF's reference allele placeholder (`<NON_REF>`, `<*>`, `<X>`): "any other allele",
+/// never a variant. A record whose only ALT is one is a reference block.
+pub fn is_ref_symbolic(alt: &str) -> bool {
+    matches!(alt, "<NON_REF>" | "<*>" | "<X>")
+}
+
 fn push_target_record(
     chrom: &str, pos: i64, ref_allele: &str, alts: &[&str], mut raw: Vec<[u8; 2]>,
     hash_alleles: bool, unphased: &[u32], markers: &mut Vec<TargetMarker>, genotypes: &mut Vec<Vec<[u8; 2]>>,
 ) {
+    // A gVCF reference placeholder makes no marker, and a call of it is unknown, not REF.
+    if alts.iter().any(|a| is_ref_symbolic(a)) {
+        for g in raw.iter_mut() {
+            for a in g.iter_mut() {
+                if *a != 0 && *a != RAW_MISSING && alts.get(*a as usize - 1).is_some_and(|x| is_ref_symbolic(x)) {
+                    *a = RAW_MISSING;
+                }
+            }
+        }
+    }
     let mut push = |alt: &str, gts: Vec<[u8; 2]>| {
         let unphased_het = unphased.iter().any(|&s| {
             let [a, b] = gts[s as usize];
@@ -411,12 +427,13 @@ fn push_target_record(
         genotypes.push(gts);
     };
     if let [alt] = alts {
+        if is_ref_symbolic(alt) { return; }
         project_alt(&mut raw, 1);
         push(alt, raw);
         return;
     }
     for (k, alt) in alts.iter().enumerate() {
-        if alt.is_empty() || *alt == "." { continue; }
+        if alt.is_empty() || *alt == "." || is_ref_symbolic(alt) { continue; }
         let mut g = raw.clone();
         project_alt(&mut g, (k + 1).min(254) as u8);
         push(alt, g);
@@ -427,8 +444,9 @@ fn push_target_record(
 /// alleles: one, or one per real ALT of a multi-allelic record. The `--refine`
 /// confidence readers repeat a record's row this many times so that they stay
 /// parallel to the markers.
-fn n_target_markers<'a>(alts: impl ExactSizeIterator<Item = &'a str>) -> usize {
-    if alts.len() <= 1 { 1 } else { alts.filter(|a| !a.is_empty() && *a != ".").count() }
+fn n_target_markers<'a>(mut alts: impl ExactSizeIterator<Item = &'a str>) -> usize {
+    if alts.len() <= 1 { return alts.next().is_none_or(|a| !is_ref_symbolic(a)) as usize; }
+    alts.filter(|a| !a.is_empty() && *a != "." && !is_ref_symbolic(a)).count()
 }
 
 // ---------------------------------------------------------------------------
@@ -953,13 +971,14 @@ fn ramp(x: f64, lo: f64, hi: f64) -> f64 {
 
 /// Map one sample's FORMAT subfields to a confidence in [0,1].
 /// Priority: GQ (and/or DP → min), else PL-derived GQ-equiv, else DP, else 1.0.
-/// `gq`/`dp` are the integer values (or None if absent/missing); `pl` is the
-/// parsed diploid PL triple (or None). Returns 1.0 when nothing usable is
-/// present (the site is treated as a fully trusted hard call → untouched HMM).
+/// `gq`/`dp` are the integer values (or None if absent/missing); `pl_gap` is the
+/// gap between the two best genotypes of the whole `PL` (or None). Returns 1.0
+/// when nothing usable is present (the site is treated as a fully trusted hard
+/// call → untouched HMM).
 #[inline]
 fn sample_confidence(
     gt_missing: bool,
-    gq: Option<i64>, pl: Option<[i32; 3]>, dp: Option<i64>,
+    gq: Option<i64>, pl_gap: Option<i32>, dp: Option<i64>,
     gq_lo: f64, gq_hi: f64,
 ) -> f64 {
     // A MISSING genotype call has zero genotype confidence regardless of GQ/PL/DP — it must be
@@ -969,11 +988,7 @@ fn sample_confidence(
     // GQ-equivalent: real GQ if present, else (2nd-smallest PL − smallest PL).
     let gq_eq: Option<f64> = match gq {
         Some(g) => Some(g as f64),
-        None => pl.map(|p| {
-            let mut s = p;
-            s.sort_unstable();
-            (s[1] - s[0]) as f64
-        }),
+        None => pl_gap.map(f64::from),
     };
     let dp_conf: Option<f64> = dp.map(|d| ramp(d as f64, REFINE_DP_LO, REFINE_DP_HI));
     match (gq_eq, dp_conf) {
@@ -1023,30 +1038,21 @@ fn parse_int_subfield(bytes: &[u8]) -> Option<i64> {
     if v < 0 { None } else { Some(v) }
 }
 
-/// Parse a `pl00,pl01,pl11` triple from a FORMAT PL subfield. None if missing /
-/// not exactly three comma-separated non-negative ints.
+/// The gap between the two smallest values of a FORMAT PL subfield (the GQ the
+/// likelihoods imply), over every genotype: a biallelic triple, a haploid pair,
+/// or a multi-allelic record's whole list (`A C,<NON_REF>`: six). None if missing,
+/// malformed, or fewer than two values.
 #[inline]
-fn parse_pl_triple(bytes: &[u8]) -> Option<[i32; 3]> {
+fn parse_pl_gap(bytes: &[u8]) -> Option<i32> {
     if bytes.is_empty() || bytes == b"." { return None; }
-    let mut out = [0i32; 3];
-    let mut idx = 0usize;
-    let mut start = 0usize;
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b',' {
-            if idx >= 3 { return None; }
-            let s = &bytes[start..i];
-            let v = fast_parse_i64(s);
-            if v < 0 { return None; }
-            out[idx] = v as i32;
-            idx += 1;
-            start = i + 1;
-        }
+    let (mut a, mut b, mut n) = (i64::MAX, i64::MAX, 0usize);
+    for x in bytes.split(|&c| c == b',') {
+        let v = fast_parse_i64(x);
+        if v < 0 { return None; }
+        if v < a { b = a; a = v; } else if v < b { b = v; }
+        n += 1;
     }
-    if idx != 2 { return None; }
-    let v = fast_parse_i64(&bytes[start..]);
-    if v < 0 { return None; }
-    out[2] = v as i32;
-    Some(out)
+    (n >= 2).then(|| (b - a) as i32)
 }
 
 /// Compute the per-marker confidence for one VCF data line's per-sample region.
@@ -1072,7 +1078,7 @@ fn line_min_confidence(
             .unwrap_or(gt_region.len());
         let field = &gt_region[field_start..field_end];
         let gq = gq_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
-        let pl = pl_i.and_then(|i| nth_subfield(field, i)).and_then(parse_pl_triple);
+        let pl = pl_i.and_then(|i| nth_subfield(field, i)).and_then(parse_pl_gap);
         let dp = dp_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
         // GT is subfield 0; a '.' allele = a missing call → confidence 0 (re-route to imputed).
         let gt_missing = gt_i.and_then(|i| nth_subfield(field, i)).map(|g| g.contains(&b'.')).unwrap_or(true);
@@ -1108,7 +1114,7 @@ fn line_per_sample_confidence(
             .unwrap_or(gt_region.len());
         let field = &gt_region[field_start..field_end];
         let gq = gq_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
-        let pl = pl_i.and_then(|i| nth_subfield(field, i)).and_then(parse_pl_triple);
+        let pl = pl_i.and_then(|i| nth_subfield(field, i)).and_then(parse_pl_gap);
         let dp = dp_i.and_then(|i| nth_subfield(field, i)).and_then(parse_int_subfield);
         let gt_missing = gt_i.and_then(|i| nth_subfield(field, i)).map(|g| g.contains(&b'.')).unwrap_or(true);
         out.push(sample_confidence(gt_missing, gq, pl, dp, gq_lo, gq_hi));
@@ -1177,7 +1183,7 @@ pub fn extract_target_site_confidence(path: &str) -> Vec<f64> {
             Some(fmt) => line_min_confidence(fmt, f.gt_region, n_samples, gq_lo, gq_hi),
             None => 1.0,
         };
-        let k = if f.multiallelic { n_target_markers(f.alts.split(',').collect::<Vec<_>>().into_iter()) } else { 1 };
+        let k = n_target_markers(f.alts.split(',').collect::<Vec<_>>().into_iter());
         conf.extend(std::iter::repeat_n(c, k));
     }
     conf
@@ -1185,14 +1191,20 @@ pub fn extract_target_site_confidence(path: &str) -> Vec<f64> {
 
 /// BCF path for [`extract_target_site_confidence`]. Walks records in the same
 /// order + with the same retention rule as `read_target_bcf`.
-/// Decoded BCF `PL` sample value (integer array) → `[pl00, pl01, pl11]`.
-/// `None` if absent / non-integer / fewer than three present elements.
-fn bcf_value_to_pl3(
+/// Decoded BCF `PL` sample value (integer array) → the gap between its two
+/// smallest values, as [`parse_pl_gap`] reads the text. `None` if absent,
+/// non-integer, fewer than two values, or any value missing.
+fn bcf_value_to_pl_gap(
     v: &noodles_vcf::variant::record_buf::samples::sample::value::Value,
-) -> Option<[i32; 3]> {
+) -> Option<i32> {
     use noodles_vcf::variant::record_buf::samples::sample::value::{Array, Value};
     match v {
-        Value::Array(Array::Integer(vals)) if vals.len() >= 3 => Some([vals[0]?, vals[1]?, vals[2]?]),
+        Value::Array(Array::Integer(vals)) if vals.len() >= 2 => {
+            let mut v: Vec<i32> = vals.iter().copied().collect::<Option<Vec<i32>>>()?;
+            if v.iter().any(|&x| x < 0) { return None; }
+            v.sort_unstable();
+            Some(v[1] - v[0])
+        }
         _ => None,
     }
 }
@@ -1229,9 +1241,9 @@ fn extract_site_confidence_bcf(path: &str, gq_lo: f64, gq_hi: f64) -> Vec<f64> {
         for sample in samples.values() {
             let gq = sample.get("GQ").flatten().and_then(int_val);
             let dp = sample.get("DP").flatten().and_then(int_val);
-            // PL triple (first three values) if present.
-            let pl: Option<[i32; 3]> = match sample.get("PL").flatten() {
-                Some(v) => bcf_value_to_pl3(v),
+            // The gap of the two best genotypes of the whole PL, if present.
+            let pl: Option<i32> = match sample.get("PL").flatten() {
+                Some(v) => bcf_value_to_pl_gap(v),
                 _ => None,
             };
             if gq.is_some() || pl.is_some() || dp.is_some() { any_field = true; }
@@ -1287,7 +1299,8 @@ pub fn extract_target_site_confidence_per_sample(path: &str) -> (Vec<f64>, usize
             None => conf.extend(std::iter::repeat_n(1.0f64, n_samples)),
         }
         // One row per marker read_target_vcf makes of this record.
-        let k = if f.multiallelic { n_target_markers(f.alts.split(',').collect::<Vec<_>>().into_iter()) } else { 1 };
+        let k = n_target_markers(f.alts.split(',').collect::<Vec<_>>().into_iter());
+        if k == 0 { conf.truncate(row); } // a reference block makes no marker
         for _ in 1..k { conf.extend_from_within(row..row + n_samples); }
     }
     (conf, n_samples)
@@ -1327,8 +1340,8 @@ fn extract_site_confidence_per_sample_bcf(path: &str, gq_lo: f64, gq_hi: f64) ->
         for sample in samples.values() {
             let gq = sample.get("GQ").flatten().and_then(int_val);
             let dp = sample.get("DP").flatten().and_then(int_val);
-            let pl: Option<[i32; 3]> = match sample.get("PL").flatten() {
-                Some(v) => bcf_value_to_pl3(v),
+            let pl: Option<i32> = match sample.get("PL").flatten() {
+                Some(v) => bcf_value_to_pl_gap(v),
                 _ => None,
             };
             let gt_missing = match sample.get("GT").flatten() {
@@ -1344,6 +1357,7 @@ fn extract_site_confidence_per_sample_bcf(path: &str, gq_lo: f64, gq_hi: f64) ->
         }
         // One row per marker read_target_bcf makes of this record.
         let k = n_target_markers(rec.alternate_bases().as_ref().iter().map(|a| a.as_str()));
+        if k == 0 { conf.truncate(row); } // a reference block makes no marker
         for _ in 1..k { conf.extend_from_within(row..row + row_n); }
         if row_n > n_samples { n_samples = row_n; }
     }
@@ -1977,6 +1991,20 @@ mod allele_match_tests {
         assert_eq!(g, vec![vec![[0, 0]], vec![[0, 1]]]);
         assert_eq!(n_target_markers(alts.into_iter()), m.len());
         assert_eq!(n_target_markers(["A"].into_iter()), 1);
+        assert_eq!(n_target_markers(["<NON_REF>"].into_iter()), 0);
+        assert_eq!(n_target_markers(["T", "<NON_REF>"].into_iter()), 1);
+        for (line, n) in [(&b"22\t100\t.\tC\t<NON_REF>\t.\t.\tEND=150\tGT\t0/0"[..], 0usize),
+                          (&b"22\t200\t.\tC\tT,<NON_REF>\t.\t.\t.\tGT\t0/2"[..], 1)] {
+            let f = split_vcf_fields(line).unwrap();
+            let mut unph = Vec::new();
+            let raw = parse_gt_raw(f.gt_region, 1, f.gt_index, &mut unph);
+            let alts: Vec<&str> = f.alts.split(',').collect();
+            let (mut m, mut g) = (Vec::new(), Vec::new());
+            push_target_record(f.chrom, f.pos, f.ref_allele, &alts, raw, false, &unph, &mut m, &mut g);
+            assert_eq!(m.len(), n);
+            assert_eq!(n_target_markers(alts.into_iter()), n);
+            if n == 1 { assert_eq!(g[0][0], [0, GT_MISSING], "a call of <NON_REF> is unknown, not REF"); }
+        }
     }
 
     #[test]

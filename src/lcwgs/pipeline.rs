@@ -42,7 +42,7 @@ fn memtrace(label: &str) {
         crate::selphi_info!("  [memtrace] {:<40} {:.1} GB RSS", label, rss_gb());
     }
 }
-use super::pl_reader::{parse_pl_vcf, PlVcfResult};
+use super::pl_reader::{parse_pl_vcf, BlockSites, PlVcfResult, RefBlocks};
 use super::LcwgsParams;
 use super::memory::{SampleExecution, WaveReclaimer};
 
@@ -91,8 +91,11 @@ pub fn run_lcwgs(
         let first_ref = &srp.variants[0].ref_allele;
         !srp.ids[0].contains(first_ref)
     };
-    let PlVcfResult { gl3: gl3_input, markers, sample_ids, haploid_samples: pl_haploid } =
-        parse_pl_vcf(target_vcf, hash_alleles)?;
+    let positions: Vec<i64> = srp.variants.iter().map(|v| v.pos).collect();
+    let keep = BlockSites { contig: srp.chromosome(), positions: &positions };
+    let PlVcfResult { gl3: gl3_input, markers, sample_ids, haploid_samples: pl_haploid, blocks } =
+        parse_pl_vcf(target_vcf, hash_alleles, Some(&keep))?;
+    drop(positions);
     // A single sample's records were parsed on many workers.
     if sample_ids.len() == 1 { crate::common::mem::release_freed_memory(); }
     memtrace("after parse_pl_vcf (+gl3_input)");
@@ -120,11 +123,13 @@ pub fn run_lcwgs(
     let n_shared = wgs_idx.len();
     selphi_info!("  shared variants: {} / {} ({:.1}% of target)",
         n_shared, n_target_variants, 100.0 * n_shared as f64 / n_target_variants.max(1) as f64);
-    if n_shared == 0 {
+    // A file of reference blocks alone still speaks for the panel SNPs inside them.
+    if n_shared == 0 && blocks.start.is_empty() {
         return Err(std::io::Error::other(
             "No shared variants between target VCF and reference panel"));
     }
-    let (wgs_idx, target_idx) = pad_unlisted_snps(srp, wgs_idx, target_idx);
+    let mut block_lists: Vec<Vec<usize>> = Vec::new();
+    let (wgs_idx, target_idx, in_block) = pad_unlisted_snps(srp, wgs_idx, target_idx, &blocks, &mut block_lists);
     let n_shared = wgs_idx.len();
 
     // --- 3. (ref bitmatrix is now extracted per-chunk from SRP — see step 6) ---
@@ -134,13 +139,24 @@ pub fn run_lcwgs(
     // panel-shared variant order. 3 genotype probs per (sample, variant).
     let mut gl3_shared = vec![1.0f32 / 3.0; n_shared * n_samples * 3];
     for (shared_i, &t_idx) in target_idx.iter().enumerate() {
-        if t_idx == usize::MAX { continue; } // unlisted: flat
-        let src_off = t_idx * n_samples * 3;
         let dst_off = shared_i * n_samples * 3;
+        if t_idx == usize::MAX {
+            // unlisted: per sample, the first covering block informative for it, else flat
+            if let Some(l) = in_block[shared_i] {
+                for smp in 0..n_samples {
+                    let gl = block_lists[l as usize].iter().map(|&b| &blocks.gl3[(b * n_samples + smp) * 3..(b * n_samples + smp) * 3 + 3])
+                        .find(|g| !(g[0] == g[1] && g[1] == g[2]));
+                    if let Some(g) = gl { gl3_shared[dst_off + 3 * smp..dst_off + 3 * smp + 3].copy_from_slice(g); }
+                }
+            }
+            continue;
+        }
+        let src_off = t_idx * n_samples * 3;
         gl3_shared[dst_off .. dst_off + n_samples * 3]
             .copy_from_slice(&gl3_input[src_off .. src_off + n_samples * 3]);
     }
     drop(gl3_input);
+    drop(blocks);
     memtrace("after gl3_shared relayout (gl3_input dropped)");
 
     // --- 5. cM map + chunked Gibbs imputation (shared with the BAM path) ---
@@ -150,21 +166,58 @@ pub fn run_lcwgs(
 /// Panel SNP sites between the first and last site a PL file lists that the file leaves out
 /// enter with flat likelihoods (`usize::MAX` in `target_idx`), as `bcftools call -i` writes them
 /// and as the BAM route treats a site no read covers: without them a file made without `-i`
-/// was imputed at its own sites only. A file that lists every one is returned unchanged.
-fn pad_unlisted_snps(srp: &SrpReader, wgs_idx: Vec<usize>, target_idx: Vec<usize>) -> (Vec<usize>, Vec<usize>) {
-    let (Some(&first), Some(&last)) = (wgs_idx.iter().min(), wgs_idx.iter().max()) else { return (wgs_idx, target_idx) };
+/// was imputed at its own sites only. One inside a reference block the file writes (a gVCF)
+/// takes that block's likelihoods instead (the third vector: the block of each row), and the
+/// blocks widen the span. A file that lists every one is returned unchanged.
+fn pad_unlisted_snps(srp: &SrpReader, wgs_idx: Vec<usize>, target_idx: Vec<usize>, blocks: &RefBlocks, lists: &mut Vec<Vec<usize>>)
+    -> (Vec<usize>, Vec<usize>, Vec<Option<u32>>) {
+    let none = |w: &Vec<usize>| vec![None; w.len()];
+    // Blocks sorted by start (a file's records are; a concatenation may not be).
+    let mut order: Vec<usize> = (0..blocks.start.len()).collect();
+    order.sort_by_key(|&b| blocks.start[b]);
+    let block_span = match (order.first(), order.iter().map(|&b| blocks.end[b]).max()) {
+        (Some(&b0), Some(end)) => Some((srp.variants.partition_point(|v| v.pos < blocks.start[b0]),
+            srp.variants.partition_point(|v| v.pos <= end).saturating_sub(1))),
+        _ => None,
+    };
+    let listed_span = wgs_idx.iter().min().zip(wgs_idx.iter().max()).map(|(&a, &b)| (a, b));
+    let (lo, hi) = match (listed_span, block_span) {
+        (Some((a, b)), Some((c, d))) => (a.min(c), b.max(d)),
+        (Some(x), None) | (None, Some(x)) => x,
+        (None, None) => { let n = none(&wgs_idx); return (wgs_idx, target_idx, n) }
+    };
     let listed: std::collections::HashSet<usize> = wgs_idx.iter().copied().collect();
     // Literal alleles: a hashed panel stores hashes in `variants`.
     let is_snp = |i: usize| crate::io::pipeline::parse_variant_parts(srp, i)
         .map_or_else(|| srp.variants[i].ref_allele.len() == 1 && srp.variants[i].alt_allele.len() == 1,
             |p| p.3.len() == 1 && p.4.len() == 1);
-    let added: Vec<usize> = (first..=last).filter(|&i| !listed.contains(&i) && is_snp(i)).collect();
-    if added.is_empty() { return (wgs_idx, target_idx); }
-    selphi_info!("  {} panel SNP site(s) inside the file's span that it does not list: imputed from flat likelihoods", added.len());
-    let mut rows: Vec<(usize, usize)> = wgs_idx.into_iter().zip(target_idx).collect();
-    rows.extend(added.into_iter().map(|i| (i, usize::MAX)));
+    let added: Vec<usize> = (lo..=hi.min(srp.variants.len().saturating_sub(1))).filter(|&i| !listed.contains(&i) && is_snp(i)).collect();
+    if added.is_empty() { let n = none(&wgs_idx); return (wgs_idx, target_idx, n); }
+    // The blocks covering each added site (in position order), in start order: a file's blocks do
+    // not overlap, so this is one block or none; overlapping ones (a concatenation) are all kept,
+    // and each sample takes the first informative for it (`block_gl`).
+    let mut cover: Vec<Option<u32>> = Vec::with_capacity(added.len());
+    let mut active: Vec<usize> = Vec::new();
+    let mut next = 0usize;
+    for &i in &added {
+        let pos = srp.variants[i].pos;
+        while next < order.len() && blocks.start[order[next]] <= pos { active.push(order[next]); next += 1; }
+        active.retain(|&b| blocks.end[b] >= pos);
+        if active.is_empty() { cover.push(None); continue; }
+        cover.push(Some(lists.len() as u32));
+        lists.push(active.clone());
+    }
+    let in_blocks = cover.iter().filter(|c| c.is_some()).count();
+    selphi_info!("  {} panel SNP site(s) inside the file's span that it does not list: {} take the likelihoods of the reference block \
+        that covers them, {} enter flat", added.len(), in_blocks, added.len() - in_blocks);
+    let mut rows: Vec<(usize, usize, Option<u32>)> = wgs_idx.into_iter().zip(target_idx).map(|(w, t)| (w, t, None)).collect();
+    rows.extend(added.into_iter().zip(cover).map(|(i, c)| (i, usize::MAX, c)));
     rows.sort_by_key(|r| r.0);
-    rows.into_iter().unzip()
+    let mut w = Vec::with_capacity(rows.len());
+    let mut t = Vec::with_capacity(rows.len());
+    let mut b = Vec::with_capacity(rows.len());
+    for (x, y, z) in rows { w.push(x); t.push(y); b.push(z); }
+    (w, t, b)
 }
 
 /// Shared imputation tail for both lcWGS paths (VCF-PL and BAM): given `gl3` in
@@ -199,6 +252,16 @@ fn impute_from_gl3(
         return Err(std::io::Error::other(
             "no site carries a usable likelihood (no PL, or no read on this chromosome): nothing to impute from \
              (GT input goes to the genotype engine)"));
+    }
+    // A sample with only flat likelihoods is imputed from the panel alone: say which.
+    if n_samples > 1 {
+        let flat: Vec<&str> = (0..n_samples).filter(|&smp| gl3_shared.chunks_exact(3 * n_samples)
+            .all(|row| { let g = &row[3 * smp..3 * smp + 3]; g[0] == g[1] && g[1] == g[2] }))
+            .map(|smp| sample_ids[smp].as_str()).collect();
+        if !flat.is_empty() {
+            crate::selphi_step!("{}", crate::log::yellow(&format!("{} of {} sample(s) carry no usable likelihood on this chromosome (no PL, or no read): imputed from the panel alone: {}",
+                flat.len(), n_samples, flat.iter().take(10).copied().collect::<Vec<_>>().join(", "))));
+        }
     }
     let (cm, prepared_chunks) = match prepared {
         Some(p) => (p.cm, Some(p.chunks)),
@@ -609,7 +672,6 @@ pub fn run_lcwgs_bam(
         (pileup()?, None)
     };
     let n_samples = bamgl.sample_ids.len();
-
     // bamgl.gl3 is already in panel-shared order → shared imputation tail.
     impute_from_gl3(srp, &wgs_idx, bamgl.gl3, n_samples, bamgl.sample_ids, &[], map_path, params, prepared)
 }
