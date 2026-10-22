@@ -257,6 +257,23 @@ pub fn interpolate_for_chr(
     }
 }
 
+/// The genetic map file of chromosome `key` (without `chr`) in `dir`: `chr{key}.map`, `{key}.map`,
+/// `plink.chr{key}.GRCh38.map` or `.GRCh37.map`, else any `.map` naming `chr{key}` as a whole token
+/// (chr1 never takes chr10.map, nor chrX a PAR file).
+pub fn find_map_in_dir(dir: &Path, key: &str) -> Option<std::path::PathBuf> {
+    let candidates = [format!("chr{}.map", key), format!("{}.map", key),
+        format!("plink.chr{}.GRCh38.map", key), format!("plink.chr{}.GRCh37.map", key)];
+    if let Some(p) = candidates.iter().map(|c| dir.join(c)).find(|p| p.exists()) { return Some(p); }
+    let tag = format!("chr{}", key);
+    let mut names: Vec<std::path::PathBuf> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).collect();
+    names.sort();
+    names.into_iter().find(|p| {
+        let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        name.ends_with(".map") && name.match_indices(&tag).any(|(i, _)|
+            !name[i + tag.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))
+    })
+}
+
 /// A chromosome label in one spelling for comparing map rows with the run's contig:
 /// no `chr`, upper case, PLINK numbers 23/24/25/26 as X/Y/XY/MT.
 fn map_chrom(s: &str) -> String {

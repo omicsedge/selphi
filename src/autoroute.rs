@@ -687,14 +687,6 @@ pub fn resolve(
                         selphi_step!("auto-route: a variant-only likelihood file without --callable: its unlisted sites are imputed from flat likelihoods");
                     }
                 }
-                // The lcWGS engine reads one chromosome's panel; nearly settled calls go to the genotype
-                // engine on a multi-chromosome panel (30x HG002 chr22: 0.9973 there against 0.9978), whose
-                // multi-chromosome path writes calls as given (no refine), hence 95% rather than 80%.
-                if d == AutoRoute::Lcwgs && s.has_gt && multi && settles(pl_n, pl_sure, true) {
-                    selphi_step!("auto-route: a multi-chromosome panel, which the lcWGS engine does not read; \
-                        its calls are written as given ({:.1}% settled by the reads)", 100.0 * pl_sure as f64 / pl_n as f64);
-                    d = AutoRoute::SparseLikelihoods;
-                }
                 // --phase-only phases called genotypes.
                 if phase_only && s.has_gt && d == AutoRoute::Lcwgs { d = AutoRoute::SparseLikelihoods; }
                 d

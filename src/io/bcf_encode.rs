@@ -567,6 +567,16 @@ pub fn parse_variant_infos(ids: &[String], original_ids: &[String], start: usize
 
 /// Parse the `##contig=<ID=...>` names out of the header text the writer emits,
 /// in header order — the order BCF `rid` indexes.
+/// `##contig` lines with each ID once (its first line): a panel merged from per-chromosome BCFs
+/// that each declared every contig repeats them, and a repeated ID makes index ids ambiguous.
+pub fn dedup_contig_lines(contig_field: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    contig_field.lines().filter(|l| match l.strip_prefix("##contig=<ID=").and_then(|s| s.find([',', '>']).map(|e| &s[..e])) {
+        Some(id) => seen.insert(id.to_string()),
+        None => true,
+    }).collect::<Vec<_>>().join("\n")
+}
+
 pub fn contig_names_from_header_lines(contig_field: &str) -> Vec<String> {
     contig_field.lines().filter_map(|l| {
         let s = l.strip_prefix("##contig=<ID=")?;

@@ -20,6 +20,24 @@ pub struct SrpReader {
 }
 
 impl SrpReader {
+    /// A single-chromosome SRP's metadata alone (its header section): the chromosome and its
+    /// `##contig` line, without the variant index or tiles.
+    pub fn read_metadata<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<SrpMetadata> {
+        let mut f = File::open(path.as_ref())?;
+        let mut magic = [0u8; 8];
+        f.read_exact(&mut magic)?;
+        if !super::is_single_chr_magic(&magic) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                format!("{} is not a single-chromosome SRP", path.as_ref().display())));
+        }
+        let hdr_comp = super::helpers::read_section(&mut f)?;
+        let hdr_raw = zstd::decode_all(Cursor::new(&hdr_comp))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let hdr: JsonValue = serde_json::from_slice(&hdr_raw)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(SrpMetadata::from_json(&hdr))
+    }
+
     pub fn open<P: AsRef<std::path::Path>>(path: P, _cache_size: usize) -> std::io::Result<Self> {
         use std::io::Seek;
         let filepath = path.as_ref().to_string_lossy().to_string();

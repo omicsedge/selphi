@@ -222,22 +222,27 @@ fn main() {
             args.input.as_deref()
                 .unwrap_or_else(|| { eprintln!("Error: --input (PL VCF) or --bam/--bam-list is required for --lcwgs"); std::process::exit(1); })
         };
-        if args.refpanel.is_empty() {
-            eprintln!("Error: --refpanel is required for --lcwgs");
-            std::process::exit(1);
-        }
-        let refpanel = args.refpanel.as_str();
-        // Before --map: a multi-chromosome run (--map-dir) reaches here with a multi-chromosome panel.
+        // A multi-chromosome panel, or a directory of per-chromosome ones (--refpanel-dir), runs
+        // each chromosome the input covers (lcwgs::multi), with one map file holding them all
+        // (--map) or a directory of maps (--map-dir).
+        let panel_files: Option<Vec<PathBuf>> = match (args.refpanel.is_empty(), args.refpanel_dir.as_deref()) {
+            (false, _) => None,
+            (true, Some(dir)) => Some(selphi::lcwgs::multi::srp_files(Path::new(dir))
+                .unwrap_or_else(|e| { eprintln!("Error: --refpanel-dir {}: {}", dir, e); std::process::exit(1); })),
+            (true, None) => { eprintln!("Error: --refpanel (or --refpanel-dir) is required for --lcwgs"); std::process::exit(1); }
+        };
+        let refpanel_owned = args.refpanel_dir.clone().filter(|_| panel_files.is_some()).unwrap_or_else(|| args.refpanel.clone());
+        let refpanel = refpanel_owned.as_str();
         let mut magic = [0u8; 8];
-        if std::fs::File::open(refpanel).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic)).is_ok()
-            && selphi::srp::is_multi_chr_magic(&magic) {
-            eprintln!("Error: the lcWGS engine (read likelihoods: PL or aligned reads) reads one chromosome's panel: give --refpanel a \
-                single-chromosome SRP and --map that chromosome's map (one run per chromosome, each with --prepare-reference-from \
-                on that chromosome's BCF)");
-            std::process::exit(2);
-        }
-        let map = args.map_path.as_deref()
-            .unwrap_or_else(|| { eprintln!("Error: --map is required for --lcwgs"); std::process::exit(1); });
+        let multi_panel = panel_files.is_some()
+            || (std::fs::File::open(refpanel).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic)).is_ok()
+                && selphi::srp::is_multi_chr_magic(&magic));
+        let map_owned: String = match (args.map_path.as_deref(), args.map_dir.as_deref()) {
+            (Some(m), _) => m.to_string(),
+            (None, Some(d)) if multi_panel => d.to_string(),
+            _ => { eprintln!("Error: --map is required for --lcwgs (or --map-dir with a multi-chromosome panel)"); std::process::exit(1); }
+        };
+        let map = map_owned.as_str();
         let output = args.out.as_deref().unwrap_or("lcwgs_imputed");
         let out_stem = output.strip_suffix(".vcf.gz").or_else(|| output.strip_suffix(".bcf")).unwrap_or(output);
         let vcf_path = PathBuf::from(format!("{out_stem}.vcf.gz"));
@@ -263,9 +268,98 @@ fn main() {
             selphi_error!("--phase-only phases called genotypes: aligned reads and files without GT are imputed by the lcWGS engine (drop --phase-only)");
             std::process::exit(2);
         }
+        // Run lcWGS pipeline (BAM-native GL pileup, or pre-computed PL VCF)
+        let haploids = args.haploids.as_deref().map(|h| {
+            let names = std::fs::read_to_string(h).unwrap_or_else(|e| {
+                selphi_error!("Cannot read --haploids {}: {}", h, e); std::process::exit(1);
+            });
+            names.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(String::from).collect()
+        });
+        let params = selphi::lcwgs::LcwgsParams {
+            haploids,
+            chrx_par: !args.chrx_no_par,
+            build: match args.build {
+                crate::cli::BuildArg::Grch37 => Some(selphi::contig::Build::Grch37),
+                crate::cli::BuildArg::Grch38 => Some(selphi::contig::Build::Grch38),
+                crate::cli::BuildArg::Auto => None,
+            },
+            ..Default::default()
+        };
+        // Optional --region "chr:start-end" (or "chr") to bound BAM-mode imputation.
+        let bam_region: Option<(String, i64, i64)> = args.region.as_deref().map(|r| {
+            // Default only on an absent bound; a non-empty unparseable coordinate
+            // is a hard error, not a silent widen to the whole chromosome.
+            let parse = |t: &str, default: i64| -> i64 {
+                let t = t.replace(',', "");
+                if t.is_empty() { return default; }
+                t.parse::<i64>().unwrap_or_else(|_| {
+                    selphi_error!("--region: malformed coordinate '{}' in '{}'", t, r);
+                    std::process::exit(1);
+                })
+            };
+            match r.split_once(':') {
+                Some((c, range)) => {
+                    let (s, e) = range.split_once('-').unwrap_or((range, range));
+                    (c.to_string(), parse(s, 1), parse(e, i64::MAX))
+                }
+                None => (r.to_string(), 1, i64::MAX),
+            }
+        });
+        if multi_panel && bam_region.is_none() {
+            if args.ls_exact {
+                eprintln!("Error: --ls-exact reads one chromosome's panel: give a single-chromosome SRP");
+                std::process::exit(1);
+            }
+            let maps = match args.map_path.as_deref() {
+                Some(m) => selphi::lcwgs::multi::Maps::File(m),
+                None => selphi::lcwgs::multi::Maps::Dir(Path::new(map)),
+            };
+            let inp = if bam_mode {
+                selphi::lcwgs::multi::Input::Bam { paths: &bam_paths, reference: args.reference.as_deref() }
+            } else { selphi::lcwgs::multi::Input::Pl(input) };
+            let panels = match &panel_files {
+                Some(f) => selphi::lcwgs::multi::Panels::Files(f.clone()),
+                None => selphi::lcwgs::multi::Panels::Multi(refpanel.to_string()),
+            };
+            selphi::lcwgs::multi::run(panels, inp, maps, &params, args.threads, &vcf_path, &tsv_path)
+                .unwrap_or_else(|e| { eprintln!("lcWGS pipeline failed: {}", e); std::process::exit(1); });
+            selphi_step!("wrote imputed VCF: {}", vcf_path.display());
+            selphi_step!("wrote dosage TSV: {}", tsv_path.display());
+            selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB", start.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
+            return;
+        }
+        // A --region on a multi-chromosome panel runs that chromosome's view, with its map.
+        let region_map: Option<String> = (multi_panel && args.map_path.is_none()).then(|| {
+            let chr = bam_region.as_ref().map(|r| r.0.clone()).unwrap_or_default();
+            selphi::genmap::find_map_in_dir(Path::new(map), chr.strip_prefix("chr").unwrap_or(&chr))
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| { eprintln!("Error: no map for {} in {}", chr, map); std::process::exit(1); })
+        });
+        let map = region_map.as_deref().unwrap_or(map);
         // Load SRP reference panel
-        let srp = selphi::srp::SrpReader::open(refpanel, 0)
-            .unwrap_or_else(|e| { eprintln!("Failed to open SRP: {}", e); std::process::exit(1); });
+        let srp = if let Some(files) = &panel_files {
+            // --refpanel-dir with --region: the file of that chromosome.
+            let chr = bam_region.as_ref().map(|r| r.0.clone()).unwrap_or_default();
+            let bare = |c: &str| c.strip_prefix("chr").unwrap_or(c).to_string();
+            let listed = selphi::lcwgs::multi::file_chromosomes(files)
+                .unwrap_or_else(|e| { eprintln!("Error: --refpanel-dir: {}", e); std::process::exit(1); });
+            let f = listed.iter().find(|(m, _)| bare(&m.chromosome) == bare(&chr)).map(|(_, f)| f.clone())
+                .unwrap_or_else(|| { eprintln!("Error: --region names {}, which no panel in --refpanel-dir holds", chr); std::process::exit(1); });
+            selphi::srp::SrpReader::open(f, 0)
+                .unwrap_or_else(|e| { eprintln!("Failed to open SRP: {}", e); std::process::exit(1); })
+        } else if multi_panel {
+            let chr = bam_region.as_ref().map(|r| r.0.clone()).unwrap_or_default();
+            let reader = selphi::srp::multi_chr_reader::MultiChrSrpReader::open(refpanel)
+                .unwrap_or_else(|e| { eprintln!("Failed to open SRP: {}", e); std::process::exit(1); });
+            let name = reader.chromosomes().into_iter().find(|c| c.strip_prefix("chr").unwrap_or(c) == chr.strip_prefix("chr").unwrap_or(&chr))
+                .map(str::to_string)
+                .unwrap_or_else(|| { eprintln!("Error: --region names {}, which the panel lacks", chr); std::process::exit(1); });
+            reader.load_chr_view(&name).map(|v| v.into_srp_reader())
+                .unwrap_or_else(|e| { eprintln!("Failed to open SRP: {}", e); std::process::exit(1); })
+        } else {
+            selphi::srp::SrpReader::open(refpanel, 0)
+                .unwrap_or_else(|e| { eprintln!("Failed to open SRP: {}", e); std::process::exit(1); })
+        };
         selphi_step!("SRP loaded: {} variants, {} haps", srp.metadata.n_variants, srp.metadata.n_haps);
 
         // reference-faithful engine (--ls-exact): a faithful reimplementation of GLIMPSE2's
@@ -306,43 +400,6 @@ fn main() {
             return;
         }
 
-        // Run lcWGS pipeline (BAM-native GL pileup, or pre-computed PL VCF)
-        let haploids = args.haploids.as_deref().map(|h| {
-            let names = std::fs::read_to_string(h).unwrap_or_else(|e| {
-                selphi_error!("Cannot read --haploids {}: {}", h, e); std::process::exit(1);
-            });
-            names.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(String::from).collect()
-        });
-        let params = selphi::lcwgs::LcwgsParams {
-            haploids,
-            chrx_par: !args.chrx_no_par,
-            build: match args.build {
-                crate::cli::BuildArg::Grch37 => Some(selphi::contig::Build::Grch37),
-                crate::cli::BuildArg::Grch38 => Some(selphi::contig::Build::Grch38),
-                crate::cli::BuildArg::Auto => None,
-            },
-            ..Default::default()
-        };
-        // Optional --region "chr:start-end" (or "chr") to bound BAM-mode imputation.
-        let bam_region: Option<(String, i64, i64)> = args.region.as_deref().map(|r| {
-            // Default only on an absent bound; a non-empty unparseable coordinate
-            // is a hard error, not a silent widen to the whole chromosome.
-            let parse = |t: &str, default: i64| -> i64 {
-                let t = t.replace(',', "");
-                if t.is_empty() { return default; }
-                t.parse::<i64>().unwrap_or_else(|_| {
-                    selphi_error!("--region: malformed coordinate '{}' in '{}'", t, r);
-                    std::process::exit(1);
-                })
-            };
-            match r.split_once(':') {
-                Some((c, range)) => {
-                    let (s, e) = range.split_once('-').unwrap_or((range, range));
-                    (c.to_string(), parse(s, 1), parse(e, i64::MAX))
-                }
-                None => (r.to_string(), 1, i64::MAX),
-            }
-        });
         let result = if bam_mode {
             let reg = bam_region.as_ref().map(|(c, s, e)| (c.as_str(), *s, *e));
             selphi::lcwgs::pipeline::run_lcwgs_bam(&bam_paths, &srp, map, &params, reg, args.reference.as_deref(), args.threads)

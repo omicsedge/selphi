@@ -171,31 +171,98 @@ pub(crate) fn fast_parse_i64(bytes: &[u8]) -> i64 {
 // is dispatched to read_target_bcf by each reader before these are called.
 // ---------------------------------------------------------------------------
 
-/// Read a VCF path fully into a decompressed byte buffer (BGZF `.gz` or plain
-/// text). Exits the process on I/O / decompression error. Does NOT handle
-/// binary BCF — the caller dispatches that first (and re-checks the `BCF\2\2`
-/// magic on the returned buffer for a mis-named `.vcf.gz`).
-fn read_vcf_raw(path: &str) -> Vec<u8> {
-    use std::io::Read;
-    let is_gz = path.ends_with(".gz");
-    let file = std::fs::File::open(path)
-        .unwrap_or_else(|e| { selphi_error!("Cannot open {}: {}", path, e); std::process::exit(1) });
-    let mut raw = Vec::new();
-    if is_gz {
-        let mut bgzf = noodles_bgzf::io::Reader::new(std::io::BufReader::new(file));
-        bgzf.read_to_end(&mut raw)
-            .unwrap_or_else(|e| { selphi_error!("BGZF decompress failed for {}: {}", path, e); std::process::exit(1) });
-    } else {
-        let mut reader = std::io::BufReader::new(file);
-        reader.read_to_end(&mut raw)
-            .unwrap_or_else(|e| { selphi_error!("Failed to read VCF {}: {}", path, e); std::process::exit(1) });
-    }
-    raw
+/// The lines of a VCF text file (BGZF or plain) read in pieces, so memory holds one piece and
+/// not the decompressed file (a whole-genome gVCF is tens of GB of text). Each line comes
+/// without its terminator, as [`text_lines`] gives a buffer's: the same lines in the same order.
+pub(crate) struct VcfLines {
+    reader: Box<dyn std::io::Read>,
+    buf: Vec<u8>,
+    start: usize,
+    eof: bool,
+    done: bool,
+    piece: usize,
 }
+
+/// Decompressed bytes read per refill.
+const LINE_PIECE: usize = 8 << 20;
+/// Bytes asked of the reader at a time (see `next_line`).
+const READ_CAP: usize = 32 << 10;
+
+impl VcfLines {
+    pub(crate) fn open(path: &str) -> Self { Self::open_with(path, LINE_PIECE) }
+
+    fn open_with(path: &str, piece: usize) -> Self {
+        let file = std::fs::File::open(path)
+            .unwrap_or_else(|e| { selphi_error!("Cannot open {}: {}", path, e); std::process::exit(1) });
+        let reader: Box<dyn std::io::Read> = if path.ends_with(".gz") {
+            Box::new(noodles_bgzf::io::Reader::new(std::io::BufReader::new(file)))
+        } else { Box::new(std::io::BufReader::new(file)) };
+        VcfLines { reader, buf: Vec::with_capacity(piece), start: 0, eof: false, done: false, piece }
+    }
+
+    /// Whether the stream is a BGZF-wrapped binary BCF (magic `BCF\2\2`), read through this
+    /// reader so a FIFO or stdin loses nothing to the probe.
+    pub(crate) fn is_bcf(&mut self) -> bool {
+        use std::io::Read;
+        while !self.eof && self.buf.len() - self.start < 5 {
+            let have = self.buf.len();
+            self.buf.resize(have + READ_CAP, 0);
+            let n = loop {
+                match self.reader.read(&mut self.buf[have..]) {
+                    Ok(n) => break n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => { selphi_error!("Reading the VCF failed: {}", e); std::process::exit(1) }
+                }
+            };
+            self.buf.truncate(have + n);
+            if n == 0 { self.eof = true; }
+        }
+        self.buf[self.start..].starts_with(b"BCF\x02\x02")
+    }
+
+    /// The next line, or `None` after the last (the piece after the final `\n`, empty when the
+    /// file ends with one, is the last line, as `split` gives it).
+    pub(crate) fn next_line(&mut self) -> Option<&[u8]> {
+        use std::io::Read;
+        loop {
+            if let Some(i) = self.buf[self.start..].iter().position(|&b| b == b'\n') {
+                let (s, e) = (self.start, self.start + i);
+                self.start = e + 1;
+                let line = &self.buf[s..e];
+                return Some(line.strip_suffix(b"\r").unwrap_or(line));
+            }
+            if self.eof {
+                if self.done { return None; }
+                self.done = true;
+                let line = &self.buf[self.start..];
+                return Some(line.strip_suffix(b"\r").unwrap_or(line));
+            }
+            self.buf.drain(..self.start);
+            self.start = 0;
+            let have = self.buf.len();
+            self.buf.resize(have + self.piece, 0);
+            let mut got = 0usize;
+            while got < self.piece {
+                // Reads under 64 KiB: noodles-bgzf 0.46 answers a larger read at the physical end of
+                // a file without an EOF block with a length it did not fill.
+                let end = (have + got + READ_CAP).min(have + self.piece);
+                match self.reader.read(&mut self.buf[have + got..end]) {
+                    Ok(0) => { self.eof = true; break; }
+                    Ok(n) => got += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => { selphi_error!("Reading the VCF failed: {}", e); std::process::exit(1) }
+                }
+            }
+            self.buf.truncate(have + got);
+        }
+    }
+}
+
 
 /// The lines of a VCF text buffer without their terminator, `\n` or `\r\n`: a
 /// Windows-saved VCF otherwise leaves `\r` on the last sample's genotype (read as
 /// a no-call) and on the last sample name. htslib and Beagle strip it too.
+#[cfg(test)]
 fn text_lines(raw: &[u8]) -> impl Iterator<Item = &[u8]> {
     raw.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l))
 }
@@ -472,8 +539,8 @@ pub fn read_cohort_vcf(
     if path.ends_with(".bcf") {
         return read_target_bcf(path, false, true);
     }
-    let raw = read_vcf_raw(path);
-    if raw.starts_with(b"BCF\x02\x02") {
+    let mut lines = VcfLines::open(path);
+    if lines.is_bcf() {
         return read_target_bcf(path, false, true);
     }
 
@@ -484,7 +551,7 @@ pub fn read_cohort_vcf(
     let mut sample_names: Vec<String> = Vec::new();
     let mut n_multiallelic = 0usize;
 
-    for line in text_lines(&raw) {
+    while let Some(line) = lines.next_line() {
         if line.is_empty() || line.starts_with(b"##") { continue; }
         if line.starts_with(b"#CHROM") {
             let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
@@ -721,9 +788,9 @@ pub fn read_target_vcf(
         return read_target_bcf(path, hash_alleles, false);
     }
 
-    let raw = read_vcf_raw(path);
     // Content-sniff: a BGZF-wrapped binary BCF (magic "BCF\2\2") misnamed .vcf.gz.
-    if raw.starts_with(b"BCF\x02\x02") {
+    let mut lines = VcfLines::open(path);
+    if lines.is_bcf() {
         return read_target_bcf(path, hash_alleles, false);
     }
 
@@ -735,7 +802,7 @@ pub fn read_target_vcf(
     let mut n_multiallelic = 0usize;
 
     // Parse from byte buffer — zero per-line allocations
-    for line in text_lines(&raw) {
+    while let Some(line) = lines.next_line() {
         if line.is_empty() || line.starts_with(b"##") { continue; }
         if line.starts_with(b"#CHROM") {
             let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
@@ -1167,14 +1234,14 @@ pub fn extract_target_site_confidence(path: &str) -> Vec<f64> {
     if path.ends_with(".bcf") {
         return extract_site_confidence_bcf(path, gq_lo, gq_hi);
     }
-    let raw = read_vcf_raw(path);
-    if raw.starts_with(b"BCF\x02\x02") {
+    let mut lines = VcfLines::open(path);
+    if lines.is_bcf() {
         return extract_site_confidence_bcf(path, gq_lo, gq_hi);
     }
 
     let mut conf: Vec<f64> = Vec::new();
     let mut n_samples = 0usize;
-    for line in text_lines(&raw) {
+    while let Some(line) = lines.next_line() {
         if line.is_empty() || line.starts_with(b"##") { continue; }
         if line.starts_with(b"#CHROM") {
             let n_tabs = line.iter().filter(|&&b| b == b'\t').count();
@@ -1304,14 +1371,14 @@ pub fn extract_target_site_confidence_per_sample(path: &str) -> (Vec<f64>, usize
     if path.ends_with(".bcf") {
         return extract_site_confidence_per_sample_bcf(path, gq_lo, gq_hi);
     }
-    let raw = read_vcf_raw(path);
-    if raw.starts_with(b"BCF\x02\x02") {
+    let mut lines = VcfLines::open(path);
+    if lines.is_bcf() {
         return extract_site_confidence_per_sample_bcf(path, gq_lo, gq_hi);
     }
 
     let mut conf: Vec<f64> = Vec::new();
     let mut n_samples = 0usize;
-    for line in text_lines(&raw) {
+    while let Some(line) = lines.next_line() {
         if line.is_empty() || line.starts_with(b"##") { continue; }
         if line.starts_with(b"#CHROM") {
             let n_tabs = line.iter().filter(|&&b| b == b'\t').count();
@@ -1721,8 +1788,8 @@ pub fn read_target_vcf_multi_chr(
         let (s, m, g, p) = read_target_bcf(path, false, false);
         return partition(s, m, g, p);
     }
-    let raw = read_vcf_raw(path);
-    if raw.starts_with(b"BCF\x02\x02") {
+    let mut lines = VcfLines::open(path);
+    if lines.is_bcf() {
         let (s, m, g, p) = read_target_bcf(path, false, false);
         return partition(s, m, g, p);
     }
@@ -1734,7 +1801,7 @@ pub fn read_target_vcf_multi_chr(
     let mut sample_names: Vec<String> = Vec::new();
     let mut n_multiallelic = 0usize;
 
-    for line in text_lines(&raw) {
+    while let Some(line) = lines.next_line() {
         if line.is_empty() || line.starts_with(b"##") { continue; }
         if line.starts_with(b"#CHROM") {
             let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
@@ -1994,6 +2061,35 @@ mod allele_match_tests {
         assert_eq!(a2, vec![[0, 1], [0, 1], [1, 1], [GT_MISSING, GT_MISSING]]);
         let mut any = raw; project_any_alt(&mut any);
         assert_eq!(any, vec![[0, 1], [1, 1], [1, 1], [GT_MISSING, GT_MISSING]]);
+    }
+
+    #[test]
+    fn streamed_lines_are_the_buffers_lines() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let long = "x".repeat(100);
+        for text in [format!("##a\r\n#CHROM\tPOS\n22\t1\r\n{long}\n\n22\t2"), format!("a\nb\n{long}\r\n")] {
+            let want: Vec<Vec<u8>> = text_lines(text.as_bytes()).map(<[u8]>::to_vec).collect();
+            let plain = dir.path().join("t.vcf");
+            std::fs::write(&plain, &text).unwrap();
+            let gz = dir.path().join("t.vcf.gz");
+            let mut w = noodles_bgzf::io::Writer::new(std::fs::File::create(&gz).unwrap());
+            w.write_all(text.as_bytes()).unwrap();
+            w.finish().unwrap();
+            // The same file without its 28-byte BGZF EOF block.
+            let noeof = dir.path().join("t2.vcf.gz");
+            let bytes = std::fs::read(&gz).unwrap();
+            std::fs::write(&noeof, &bytes[..bytes.len() - 28]).unwrap();
+            for path in [&plain, &gz, &noeof] {
+                for piece in [1usize, 3, 7, 64, 1 << 20] {
+                    let mut l = VcfLines::open_with(path.to_str().unwrap(), piece);
+                    assert!(!l.is_bcf(), "the probe reads through the stream and keeps what it read");
+                    let mut got = Vec::new();
+                    while let Some(x) = l.next_line() { got.push(x.to_vec()); }
+                    assert_eq!(got, want, "piece {piece} {}", path.display());
+                }
+            }
+        }
     }
 
     #[test]

@@ -324,65 +324,99 @@ pub fn write_lcwgs_vcf(out: &LcwgsOutput, srp: &SrpReader, output_path: &std::pa
 /// [`write_lcwgs_vcf`] with an explicit formatting-pool budget (tests force
 /// tiny blocks and serial rows; the bytes do not depend on it).
 fn write_lcwgs_vcf_budget(out: &LcwgsOutput, srp: &SrpReader, output_path: &std::path::Path, pool_budget: usize) -> std::io::Result<()> {
-    let n_samples = out.sample_ids.len();
-    let n_var = out.n_variants;
-    let mut w = bgzf_writer(output_path, PAR_BUFWRITER)?;
+    let lines = contig_lines_for(srp, out)?;
+    let mut w = LcwgsVcfWriter::create_budget(output_path, &out.sample_ids, &lines, pool_budget)?;
+    w.append(out, srp)?;
+    w.finish()
+}
 
-    // The panel's `##contig` line, as the genotype path writes it.
-    let contig_lines = match srp.metadata.contig_field.trim_end() {
-        "" => format!("##contig=<ID={}>", if n_var > 0 { identity(srp, out, 0)?.0 } else { srp.chromosome() }),
+/// The `##contig` line(s) of a one-chromosome output: the panel's, as the genotype path writes it.
+pub fn contig_lines_for(srp: &SrpReader, out: &LcwgsOutput) -> std::io::Result<String> {
+    Ok(match srp.metadata.contig_field.trim_end() {
+        "" => format!("##contig=<ID={}>", if out.n_variants > 0 { identity(srp, out, 0)?.0 } else { srp.chromosome() }),
         c => c.to_string(),
-    };
-    let contig_names = crate::io::bcf_encode::contig_names_from_header_lines(&contig_lines);
+    })
+}
 
-    writeln!(w, "##fileformat=VCFv4.2")?;
-    writeln!(w, "##source=Selphi_v{}_lcWGS SelfDecode\u{2122}", env!("CARGO_PKG_VERSION"))?;
-    writeln!(w, "##FILTER=<ID=PASS,Description=\"All filters passed\">")?;
-    writeln!(w, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT allele frequency\">")?;
-    writeln!(w, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">")?;
-    writeln!(w, "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"Estimated ALT dose [0,2]\">")?;
-    writeln!(w, "##FORMAT=<ID=GP,Number=G,Type=Float,Description=\"Estimated genotype posteriors\">")?;
-    writeln!(w, "{contig_lines}")?;
-    write!(w, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
-    for s in &out.sample_ids { write!(w, "\t{}", s)?; }
-    writeln!(w)?;
+/// An lcWGS VCF.gz (GT:DS:GP) written one chromosome's result at a time, then indexed.
+pub struct LcwgsVcfWriter {
+    w: BufWriter<noodles_bgzf::io::multithreaded_writer::MultithreadedWriter<std::fs::File>>,
+    path: std::path::PathBuf,
+    contig_names: Vec<String>,
+    record_meta: Vec<crate::srp::csi::TbiRec>,
+    pool_budget: usize,
+    conf_sum: f64,
+    n_conf_ge09: u64,
+    n_calls: u64,
+}
 
-    // Records formatted in parallel within the serial writer's buffer budget and
-    // written in row order: the bytes of the one-line-at-a-time loop. Index
-    // entries go straight into their row's slot.
-    let mut record_meta = vec![crate::srp::csi::TbiRec { pos: 0, rlen: 0, ref_id: 0 }; n_var];
-    write_rows_parallel(
-        &mut w, n_var, pool_budget, &mut record_meta,
-        |v| vcf_row_bound(srp, out, v),
-        |v, line: &mut Vec<u8>, cc: &mut ChromCache| vcf_row(out, srp, &contig_names, v, line, cc),
-    )?;
-
-    // Per-call quality: GP confidence = the max genotype posterior. Works for
-    // ANY sample count (unlike DR2, which needs variance across samples and is
-    // degenerate for the common single-sample lcWGS run). Summed in (v, s) order.
-    let mut conf_sum = 0.0f64;
-    let mut n_conf_ge09 = 0u64;
-    let mut n_calls = 0u64;
-    for g in out.gp[..n_var * n_samples * 3].chunks_exact(3) {
-        let conf = call(g[0], g[1], g[2]).1;
-        conf_sum += conf as f64;
-        n_calls += 1;
-        if conf >= 0.9 { n_conf_ge09 += 1; }
+impl LcwgsVcfWriter {
+    /// Create the file and write its header (`contig_lines`: every chromosome it will hold).
+    pub fn create(path: &std::path::Path, sample_ids: &[String], contig_lines: &str) -> std::io::Result<Self> {
+        Self::create_budget(path, sample_ids, contig_lines, WRITER_BUF - PAR_BUFWRITER)
     }
 
-    w.flush()?;
-    drop(w);
-    let tbi_path = { let mut p = output_path.as_os_str().to_owned(); p.push(".tbi"); std::path::PathBuf::from(p) };
-    crate::srp::csi::build_tbi_index_with_meta(output_path, &contig_names, &record_meta, &tbi_path)?;
-
-    // Imputation-quality summary (per-call GP confidence; no truth needed).
-    if n_calls > 0 {
-        let mean_conf = conf_sum / n_calls as f64;
-        let pct = 100.0 * n_conf_ge09 as f64 / n_calls as f64;
-        crate::selphi_info!("  Imputation quality: mean GP confidence {}  ·  {:.1}% of {} calls \u{2265} 0.9",
-            crate::log::cyan(&format!("{:.4}", mean_conf)), pct, crate::log::fmt_thousands(n_calls));
+    fn create_budget(path: &std::path::Path, sample_ids: &[String], contig_lines: &str, pool_budget: usize) -> std::io::Result<Self> {
+        let mut w = bgzf_writer(path, PAR_BUFWRITER)?;
+        let contig_names = crate::io::bcf_encode::contig_names_from_header_lines(contig_lines);
+        writeln!(w, "##fileformat=VCFv4.2")?;
+        writeln!(w, "##source=Selphi_v{}_lcWGS SelfDecode\u{2122}", env!("CARGO_PKG_VERSION"))?;
+        writeln!(w, "##FILTER=<ID=PASS,Description=\"All filters passed\">")?;
+        writeln!(w, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT allele frequency\">")?;
+        writeln!(w, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">")?;
+        writeln!(w, "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"Estimated ALT dose [0,2]\">")?;
+        writeln!(w, "##FORMAT=<ID=GP,Number=G,Type=Float,Description=\"Estimated genotype posteriors\">")?;
+        writeln!(w, "{contig_lines}")?;
+        write!(w, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
+        for s in sample_ids { write!(w, "\t{}", s)?; }
+        writeln!(w)?;
+        Ok(LcwgsVcfWriter { w, path: path.to_path_buf(), contig_names, record_meta: Vec::new(), pool_budget,
+            conf_sum: 0.0, n_conf_ge09: 0, n_calls: 0 })
     }
-    Ok(())
+
+    /// Append one chromosome's records.
+    pub fn append(&mut self, out: &LcwgsOutput, srp: &SrpReader) -> std::io::Result<()> {
+        let n_samples = out.sample_ids.len();
+        let n_var = out.n_variants;
+        // Records formatted in parallel within the serial writer's buffer budget and
+        // written in row order: the bytes of the one-line-at-a-time loop. Index
+        // entries go straight into their row's slot.
+        let at = self.record_meta.len();
+        self.record_meta.resize(at + n_var, crate::srp::csi::TbiRec { pos: 0, rlen: 0, ref_id: 0 });
+        let contig_names = &self.contig_names;
+        write_rows_parallel(
+            &mut self.w, n_var, self.pool_budget, &mut self.record_meta[at..],
+            |v| vcf_row_bound(srp, out, v),
+            |v, line: &mut Vec<u8>, cc: &mut ChromCache| vcf_row(out, srp, contig_names, v, line, cc),
+        )?;
+        // Per-call quality: GP confidence = the max genotype posterior. Works for
+        // ANY sample count (unlike DR2, which needs variance across samples and is
+        // degenerate for the common single-sample lcWGS run). Summed in (v, s) order.
+        for g in out.gp[..n_var * n_samples * 3].chunks_exact(3) {
+            let conf = call(g[0], g[1], g[2]).1;
+            self.conf_sum += conf as f64;
+            self.n_calls += 1;
+            if conf >= 0.9 { self.n_conf_ge09 += 1; }
+        }
+        Ok(())
+    }
+
+    /// Flush, index, and log the imputation-quality summary.
+    pub fn finish(mut self) -> std::io::Result<()> {
+        self.w.flush()?;
+        drop(self.w);
+        let output_path = &self.path;
+        let tbi_path = { let mut p = output_path.as_os_str().to_owned(); p.push(".tbi"); std::path::PathBuf::from(p) };
+        crate::srp::csi::build_tbi_index_with_meta(output_path, &self.contig_names, &self.record_meta, &tbi_path)?;
+        // Imputation-quality summary (per-call GP confidence; no truth needed).
+        if self.n_calls > 0 {
+            let mean_conf = self.conf_sum / self.n_calls as f64;
+            let pct = 100.0 * self.n_conf_ge09 as f64 / self.n_calls as f64;
+            crate::selphi_info!("  Imputation quality: mean GP confidence {}  ·  {:.1}% of {} calls \u{2265} 0.9",
+                crate::log::cyan(&format!("{:.4}", mean_conf)), pct, crate::log::fmt_thousands(self.n_calls));
+        }
+        Ok(())
+    }
 }
 
 /// Write the dosages as a bgzipped TSV (`variant` = `chrom:pos:ref:alt`, then one
@@ -394,19 +428,42 @@ pub fn write_dose_tsv(out: &LcwgsOutput, srp: &SrpReader, path: &std::path::Path
 
 /// [`write_dose_tsv`] with an explicit formatting-pool budget.
 fn write_dose_tsv_budget(out: &LcwgsOutput, srp: &SrpReader, path: &std::path::Path, pool_budget: usize) -> std::io::Result<()> {
-    let mut w = bgzf_writer(path, PAR_BUFWRITER)?;
-    write!(w, "variant")?;
-    for s in &out.sample_ids { write!(w, "\t{}", s)?; }
-    writeln!(w)?;
-    // Parallel row blocks within the writer budget, written in order (see
-    // `write_lcwgs_vcf`). No side output: a zero-sized slice.
-    let mut none = vec![(); out.n_variants];
-    write_rows_parallel(
-        &mut w, out.n_variants, pool_budget, &mut none,
-        |v| tsv_row_bound(srp, out, v),
-        |v, line: &mut Vec<u8>, _: &mut ()| tsv_row(out, srp, v, line),
-    )?;
-    w.flush()
+    let mut w = DoseTsvWriter::create_budget(path, &out.sample_ids, pool_budget)?;
+    w.append(out, srp)?;
+    w.finish()
+}
+
+/// The dosage TSV written one chromosome's result at a time.
+pub struct DoseTsvWriter {
+    w: BufWriter<noodles_bgzf::io::multithreaded_writer::MultithreadedWriter<std::fs::File>>,
+    pool_budget: usize,
+}
+
+impl DoseTsvWriter {
+    pub fn create(path: &std::path::Path, sample_ids: &[String]) -> std::io::Result<Self> {
+        Self::create_budget(path, sample_ids, WRITER_BUF - PAR_BUFWRITER)
+    }
+
+    fn create_budget(path: &std::path::Path, sample_ids: &[String], pool_budget: usize) -> std::io::Result<Self> {
+        let mut w = bgzf_writer(path, PAR_BUFWRITER)?;
+        write!(w, "variant")?;
+        for s in sample_ids { write!(w, "\t{}", s)?; }
+        writeln!(w)?;
+        Ok(DoseTsvWriter { w, pool_budget })
+    }
+
+    pub fn append(&mut self, out: &LcwgsOutput, srp: &SrpReader) -> std::io::Result<()> {
+        // Parallel row blocks within the writer budget, written in order (see
+        // `write_lcwgs_vcf`). No side output: a zero-sized slice.
+        let mut none = vec![(); out.n_variants];
+        write_rows_parallel(
+            &mut self.w, out.n_variants, self.pool_budget, &mut none,
+            |v| tsv_row_bound(srp, out, v),
+            |v, line: &mut Vec<u8>, _: &mut ()| tsv_row(out, srp, v, line),
+        )
+    }
+
+    pub fn finish(mut self) -> std::io::Result<()> { self.w.flush() }
 }
 
 #[cfg(test)]

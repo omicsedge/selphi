@@ -376,6 +376,8 @@ fn parse_pl_bcf(path: &str, hash_alleles_against_srp: bool, keep: Option<&BlockS
         let rec = result?;
         let pos = match rec.variant_start() { Some(p) => usize::from(p) as i64, None => continue };
         if pos < 1 { continue; }
+        // A record on another contig than the run's matches no panel site: not kept.
+        if keep.is_some() && !on_contig(rec.reference_sequence_name().as_bytes(), keep) { continue; }
         let alts = rec.alternate_bases().as_ref();
         // Several ALTs, a placeholder or none: the slow path, shared with the text reader.
         if alts.len() != 1 || alts[0] == "." || alts[0].is_empty() || is_placeholder(alts[0].as_bytes()) {
@@ -492,6 +494,36 @@ fn blocks_note(b: &RefBlocks) -> String {
     if b.start.is_empty() { String::new() } else { format!("; {} reference block(s) over panel positions", b.start.len()) }
 }
 
+/// The contigs (without `chr`) a VCF/BCF holds records on, from one pass over its records.
+pub fn covered_contigs(path: &str) -> std::io::Result<std::collections::HashSet<String>> {
+    let bare = |n: &[u8]| { let s = String::from_utf8_lossy(n).into_owned(); s.strip_prefix("chr").map(str::to_string).unwrap_or(s) };
+    let mut out = std::collections::HashSet::new();
+    let mut lines = crate::io::target_io::VcfLines::open(path);
+    if path.ends_with(".bcf") || lines.is_bcf() {
+        drop(lines);
+        let mut reader = noodles_bcf::io::reader::Builder::default().build_from_path(path)?;
+        let header = reader.read_header()?;
+        // Record contig ids index the header's string map (its IDX=), as the decoder reads them.
+        let contigs = header.string_maps().contigs();
+        let mut last = usize::MAX;
+        for rec in reader.records() {
+            let rec = rec?;
+            if let Ok(i) = rec.reference_sequence_id() && i != last {
+                last = i;
+                if let Some(n) = contigs.get_index(i) { out.insert(bare(n.as_bytes())); }
+            }
+        }
+        return Ok(out);
+    }
+    let mut last: Vec<u8> = Vec::new();
+    while let Some(line) = lines.next_line() {
+        if line.is_empty() || line[0] == b'#' { continue; }
+        let chrom = line.split(|&b| b == b'\t').next().unwrap_or(b"");
+        if chrom != last.as_slice() { last = chrom.to_vec(); out.insert(bare(chrom)); }
+    }
+    Ok(out)
+}
+
 /// Read a VCF/BCF target with `PL` field → per-hap likelihoods.
 ///
 /// Pure-Rust: bgzf-decompress, scan, byte-slice parsing.
@@ -505,25 +537,44 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool, keep: Option<&Bl
     let is_gz = path.ends_with(".gz");
     let file = std::fs::File::open(path)?;
 
-    // Decompress the entire VCF, its BGZF blocks inflated on decoder threads
-    // (the same bytes as a sequential inflate).
-    let mut raw: Vec<u8> = Vec::new();
-    if is_gz {
+    // The VCF in pieces cut at line ends (its BGZF blocks inflated on decoder threads), each
+    // parsed as it comes: memory holds one piece, not the decompressed file.
+    let mut reader: Box<dyn Read> = if is_gz {
         let workers = std::num::NonZero::new(rayon::current_num_threads().clamp(1, 4))
             .unwrap_or(std::num::NonZero::<usize>::MIN);
-        let mut bgzf = noodles_bgzf::io::MultithreadedReader::with_worker_count(workers, file);
-        bgzf.read_to_end(&mut raw)?;
+        Box::new(noodles_bgzf::io::MultithreadedReader::with_worker_count(workers, file))
     } else {
-        let mut reader = std::io::BufReader::new(file);
-        reader.read_to_end(&mut raw)?;
+        Box::new(std::io::BufReader::new(file))
+    };
+    let mut parser = PlTextParser::new(hash_alleles_against_srp, keep);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut first = true;
+    loop {
+        let have = buf.len();
+        buf.resize(have + STREAM_PIECE, 0);
+        let mut got = 0usize;
+        while got < STREAM_PIECE {
+            // Reads under 64 KiB, as target_io::VcfLines reads (a BGZF file without its EOF block).
+            let end = (have + got + (32 << 10)).min(have + STREAM_PIECE);
+            match reader.read(&mut buf[have + got..end]) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        buf.truncate(have + got);
+        // Content-sniff: a BGZF-wrapped binary BCF (magic "BCF\2\2") misnamed .vcf.gz.
+        if first && buf.starts_with(b"BCF\x02\x02") {
+            return parse_pl_bcf(path, hash_alleles_against_srp, keep);
+        }
+        first = false;
+        if got == 0 { parser.feed(&buf); break; }
+        let Some(cut) = buf.iter().rposition(|&b| b == b'\n') else { continue };
+        parser.feed(&buf[..=cut]);
+        buf.drain(..=cut);
     }
-    // Content-sniff: a BGZF-wrapped binary BCF (magic "BCF\2\2") misnamed .vcf.gz.
-    if raw.starts_with(b"BCF\x02\x02") {
-        return parse_pl_bcf(path, hash_alleles_against_srp, keep);
-    }
-    let parsed = parse_pl_text(&raw, hash_alleles_against_srp, keep);
-    drop(raw);
-    let PlText { sample_names, body } = parsed;
+    let PlText { sample_names, body } = parser.finish();
     let Body { markers, gl3, n_variants_seen, n_missing_pl, haploid_samples, blocks } = body;
 
     if sample_names.is_empty() {
@@ -585,77 +636,113 @@ struct PlText {
 /// parallel piece (pieces end at line boundaries).
 const PIECE_BYTES: usize = 4 << 20;
 
-/// The decompressed VCF text → samples and records. A single sample's record
-/// lines are parsed in parallel pieces, concatenated in file order (each line
-/// is parsed on its own, so the records are those of the sequential scan).
-fn parse_pl_text(bytes: &[u8], hash_alleles_against_srp: bool, keep: Option<&BlockSites>) -> PlText {
-    let within = rayon::current_num_threads() > 1;
-    let mut sample_names: Vec<String> = Vec::new();
-    let mut body = Body::new(0, 0);
-    let mut cursor = 0usize;
-    while cursor < bytes.len() {
-        // Find newline (no String alloc)
-        let line_start = cursor;
-        while cursor < bytes.len() && bytes[cursor] != b'\n' { cursor += 1; }
-        let line = &bytes[line_start..cursor];
-        cursor += 1;
-        if line.is_empty() || line.starts_with(b"##") { continue; }
+/// Decompressed text read per piece by [`parse_pl_vcf`].
+const STREAM_PIECE: usize = 64 << 20;
 
-        if line.starts_with(b"#CHROM") {
-            let mut col = 0usize;
-            let mut start = 0usize;
-            let mut tmp_samples: Vec<String> = Vec::new();
-            for (i, &b) in line.iter().enumerate() {
-                if b == b'\t' {
-                    if col >= 9 {
-                        tmp_samples.push(std::str::from_utf8(&line[start..i]).unwrap_or("").to_string());
-                    }
-                    col += 1;
-                    start = i + 1;
-                }
-            }
-            if col >= 9 {
-                tmp_samples.push(std::str::from_utf8(&line[start..]).unwrap_or("").to_string());
-            }
-            sample_names = tmp_samples;
-            let n_samples = sample_names.len();
-            let rest = &bytes[cursor.min(bytes.len())..];
-            // Pre-scan: count newlines for capacity reservation.
-            let est_variants = rest.iter().filter(|&&b| b == b'\n').count();
-            let mut fresh = Body::new(n_samples, est_variants);
-            fresh.markers.extend(std::mem::take(&mut body.markers));
-            fresh.gl3.extend_from_slice(&body.gl3);
-            fresh.n_variants_seen = body.n_variants_seen;
-            fresh.n_missing_pl = body.n_missing_pl;
-            fresh.blocks = std::mem::take(&mut body.blocks);
-            body = fresh;
-            // A later #CHROM line resets the samples: only then parse serially.
-            if within && n_samples == 1 && !rest.windows(7).any(|w| w == b"\n#CHROM") && !rest.starts_with(b"#CHROM") {
-                use rayon::prelude::*;
-                let mut pieces: Vec<&[u8]> = Vec::new();
-                let mut at = 0usize;
-                while at < rest.len() {
-                    let mut end = (at + PIECE_BYTES).min(rest.len());
-                    while end < rest.len() && rest[end - 1] != b'\n' { end += 1; }
-                    pieces.push(&rest[at..end]);
-                    at = end;
-                }
-                let parts: Vec<Body> = pieces.par_iter().map(|piece| {
-                    let mut part = Body::new(n_samples, 0);
-                    for line in piece.split(|&b| b == b'\n') {
-                        parse_record_line(line, n_samples, hash_alleles_against_srp, &mut part, keep);
-                    }
-                    part
-                }).collect();
-                for part in parts { body.append(part); }
-                return PlText { sample_names, body };
-            }
-            continue;
-        }
-        if sample_names.is_empty() { continue; } // shouldn't happen but be defensive
-        parse_record_line(line, sample_names.len(), hash_alleles_against_srp, &mut body, keep);
+/// The decompressed VCF text → samples and records, in one piece ([`PlTextParser`]).
+#[cfg(test)]
+fn parse_pl_text(bytes: &[u8], hash_alleles_against_srp: bool, keep: Option<&BlockSites>) -> PlText {
+    let mut parser = PlTextParser::new(hash_alleles_against_srp, keep);
+    parser.feed(bytes);
+    parser.finish()
+}
+
+/// VCF text fed in pieces that end at line ends → samples and records. A single sample's record
+/// lines are parsed in parallel pieces, concatenated in file order (each line is parsed on its
+/// own, so the records are those of the sequential scan whatever the pieces).
+struct PlTextParser<'a> {
+    sample_names: Vec<String>,
+    body: Body,
+    hash: bool,
+    keep: Option<&'a BlockSites<'a>>,
+}
+
+impl<'a> PlTextParser<'a> {
+    fn new(hash: bool, keep: Option<&'a BlockSites<'a>>) -> Self {
+        PlTextParser { sample_names: Vec::new(), body: Body::new(0, 0), hash, keep }
     }
-    PlText { sample_names, body }
+
+    fn finish(self) -> PlText { PlText { sample_names: self.sample_names, body: self.body } }
+
+    /// Parse `bytes`, whole lines (the last may lack its `\n` at the file's end).
+    fn feed(&mut self, bytes: &[u8]) {
+        let within = rayon::current_num_threads() > 1;
+        // A later #CHROM line resets the samples: only then parse serially.
+        let parallel_ok = |rest: &[u8], n: usize| within && n == 1 && !rest.windows(7).any(|w| w == b"\n#CHROM") && !rest.starts_with(b"#CHROM");
+        if !self.sample_names.is_empty() && parallel_ok(bytes, self.sample_names.len()) {
+            self.parallel(bytes);
+            return;
+        }
+        let mut cursor = 0usize;
+        while cursor < bytes.len() {
+            // Find newline (no String alloc)
+            let line_start = cursor;
+            while cursor < bytes.len() && bytes[cursor] != b'\n' { cursor += 1; }
+            let line = &bytes[line_start..cursor];
+            cursor += 1;
+            if line.is_empty() || line.starts_with(b"##") { continue; }
+
+            if line.starts_with(b"#CHROM") {
+                let mut col = 0usize;
+                let mut start = 0usize;
+                let mut tmp_samples: Vec<String> = Vec::new();
+                for (i, &b) in line.iter().enumerate() {
+                    if b == b'\t' {
+                        if col >= 9 {
+                            tmp_samples.push(std::str::from_utf8(&line[start..i]).unwrap_or("").to_string());
+                        }
+                        col += 1;
+                        start = i + 1;
+                    }
+                }
+                if col >= 9 {
+                    tmp_samples.push(std::str::from_utf8(&line[start..]).unwrap_or("").to_string());
+                }
+                self.sample_names = tmp_samples;
+                let n_samples = self.sample_names.len();
+                let rest = &bytes[cursor.min(bytes.len())..];
+                // Pre-scan: count newlines for capacity reservation.
+                let est_variants = rest.iter().filter(|&&b| b == b'\n').count();
+                let mut fresh = Body::new(n_samples, est_variants);
+                fresh.markers.extend(std::mem::take(&mut self.body.markers));
+                fresh.gl3.extend_from_slice(&self.body.gl3);
+                fresh.n_variants_seen = self.body.n_variants_seen;
+                fresh.n_missing_pl = self.body.n_missing_pl;
+                fresh.blocks = std::mem::take(&mut self.body.blocks);
+                self.body = fresh;
+                if parallel_ok(rest, n_samples) {
+                    self.parallel(rest);
+                    return;
+                }
+                continue;
+            }
+            if self.sample_names.is_empty() { continue; } // shouldn't happen but be defensive
+            parse_record_line(line, self.sample_names.len(), self.hash, &mut self.body, self.keep);
+        }
+    }
+
+    /// Record lines of one sample, parsed in parallel pieces of [`PIECE_BYTES`] and appended in order.
+    fn parallel(&mut self, rest: &[u8]) {
+        use rayon::prelude::*;
+        let n_samples = self.sample_names.len();
+        let (hash, keep) = (self.hash, self.keep);
+        let mut pieces: Vec<&[u8]> = Vec::new();
+        let mut at = 0usize;
+        while at < rest.len() {
+            let mut end = (at + PIECE_BYTES).min(rest.len());
+            while end < rest.len() && rest[end - 1] != b'\n' { end += 1; }
+            pieces.push(&rest[at..end]);
+            at = end;
+        }
+        let parts: Vec<Body> = pieces.par_iter().map(|piece| {
+            let mut part = Body::new(n_samples, 0);
+            for line in piece.split(|&b| b == b'\n') {
+                parse_record_line(line, n_samples, hash, &mut part, keep);
+            }
+            part
+        }).collect();
+        for part in parts { self.body.append(part); }
+    }
 }
 
 /// One VCF line after `#CHROM` (header and empty lines are skipped) → a record
@@ -676,6 +763,8 @@ fn parse_record_line(line: &[u8], n_samples: usize, hash_alleles_against_srp: bo
 
     // CHROM/POS/REF/ALT
     let chrom_bytes = &line[..tabs[0]];
+    // A record on another contig than the run's matches no panel site: not kept.
+    if keep.is_some() && !on_contig(chrom_bytes, keep) { return; }
     let pos = crate::io::target_io::fast_parse_i64(&line[tabs[0]+1..tabs[1]]);
     if pos < 1 { return; }
     let ref_bytes = &line[tabs[2]+1..tabs[3]];
@@ -798,6 +887,20 @@ mod tests {
         let want = run(1);
         assert!(want.1.len() > 100_000);
         assert_eq!(run(4), want);
+        // Fed in pieces cut at line ends, as parse_pl_vcf streams a file: the same records.
+        let bytes = text.as_bytes();
+        let mut parser = PlTextParser::new(false, None);
+        let mut at = 0usize;
+        while at < bytes.len() {
+            let mut end = (at + 777_777).min(bytes.len());
+            while end < bytes.len() && bytes[end - 1] != b'\n' { end += 1; }
+            parser.feed(&bytes[at..end]);
+            at = end;
+        }
+        let t = parser.finish();
+        let marks: Vec<_> = t.body.markers.iter().map(|m| (m.chrom.clone(), m.pos, m.ref_allele.clone(), m.alt_allele.clone())).collect();
+        assert_eq!((t.sample_names, marks, t.body.gl3.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            t.body.n_variants_seen, t.body.n_missing_pl, t.body.haploid_samples), want);
     }
 
     #[test]

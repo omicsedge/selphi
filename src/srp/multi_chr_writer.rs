@@ -728,7 +728,7 @@ pub fn build_multi_chr_srp_from_dir(
 }
 
 /// Strip IDX=N from a ##contig= line to avoid duplicate IDX conflicts in multi-chr headers.
-fn strip_idx_from_contig(line: &str) -> String {
+pub fn strip_idx_from_contig(line: &str) -> String {
     if !line.starts_with("##contig=") { return line.to_string(); }
     // Remove ",IDX=N" or "IDX=N," patterns
     let mut result = line.to_string();

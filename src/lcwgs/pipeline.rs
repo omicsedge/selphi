@@ -125,8 +125,7 @@ pub fn run_lcwgs(
         n_shared, n_target_variants, 100.0 * n_shared as f64 / n_target_variants.max(1) as f64);
     // A file of reference blocks alone still speaks for the panel SNPs inside them.
     if n_shared == 0 && blocks.start.is_empty() {
-        return Err(std::io::Error::other(
-            "No shared variants between target VCF and reference panel"));
+        return Err(no_data("No shared variants between target VCF and reference panel"));
     }
     let mut block_lists: Vec<Vec<usize>> = Vec::new();
     let (wgs_idx, target_idx, in_block) = pad_unlisted_snps(srp, wgs_idx, target_idx, &blocks, &mut block_lists);
@@ -165,6 +164,22 @@ pub fn run_lcwgs(
     // --- 5. cM map + chunked Gibbs imputation (shared with the BAM path) ---
     impute_from_gl3(srp, &wgs_idx, gl3_shared, n_samples, sample_ids, &pl_haploid, map_path, params, None)
 }
+
+/// A chromosome with nothing to impute from: no input record matches the panel, or no site
+/// carries a usable likelihood. A multi-chromosome run goes on to the next chromosome.
+#[derive(Debug)]
+pub struct NoData(pub String);
+
+impl std::fmt::Display for NoData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+
+impl std::error::Error for NoData {}
+
+fn no_data(msg: &str) -> std::io::Error { std::io::Error::other(NoData(msg.to_string())) }
+
+/// Whether `e` is a [`NoData`] outcome.
+pub fn is_no_data(e: &std::io::Error) -> bool { e.get_ref().is_some_and(|x| x.is::<NoData>()) }
 
 /// Panel SNP sites between the first and last site a PL file lists that the file leaves out
 /// enter with flat likelihoods (`usize::MAX` in `target_idx`), as `bcftools call -i` writes them
@@ -254,8 +269,7 @@ fn impute_from_gl3(
     // Nothing but flat likelihoods (a GT-only, GP or DS file forced onto this engine, a BAM with
     // no read on this chromosome) would be imputed from the panel alone.
     if !gl3_shared.chunks_exact(3).any(|g| g[0] != g[1] || g[1] != g[2]) {
-        return Err(std::io::Error::other(
-            "no site carries a usable likelihood (no PL, or no read on this chromosome): nothing to impute from \
+        return Err(no_data("no site carries a usable likelihood (no PL, or no read on this chromosome): nothing to impute from \
              (GT input goes to the genotype engine)"));
     }
     // A sample with only flat likelihoods is imputed from the panel alone: say which.
@@ -561,6 +575,11 @@ pub fn run_lcwgs_bam(
     if let Some(msg) = crate::contig::nonrecomb_refusal(srp.chromosome()) {
         crate::selphi_error!("{}", msg);
         std::process::exit(2);
+    }
+    // No file holds reads on this chromosome: nothing to pile up (and no reference window to load).
+    let chrom_bare = srp.chromosome().strip_prefix("chr").unwrap_or(srp.chromosome());
+    if region.is_none() && !super::bam_pileup::covered_contigs(bam_paths)?.contains(chrom_bare) {
+        return Err(no_data(&format!("no BAM/CRAM holds reads on {}", srp.chromosome())));
     }
     // Panel variant indices to impute (region subset, else all). Chromosome
     // match is `chr`-prefix tolerant (panel `1`/`22` ↔ region `chr1`/`chr22`),

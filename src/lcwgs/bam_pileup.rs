@@ -158,6 +158,41 @@ fn resolve_contig(header: &Header, chrom: &str) -> Option<(usize, Vec<u8>)> {
     }
 }
 
+/// The contigs (without `chr`) the alignment files hold reads on: from a `.bai`'s per-reference
+/// mapped counts or a `.crai`'s entries, else every contig the header declares.
+pub fn covered_contigs(paths: &[String]) -> io::Result<std::collections::HashSet<String>> {
+    use noodles_csi::binning_index::ReferenceSequence as _;
+    let bare = |n: &[u8]| { let s = String::from_utf8_lossy(n).into_owned(); s.strip_prefix("chr").map(str::to_string).unwrap_or(s) };
+    let mut out = std::collections::HashSet::new();
+    for path in paths {
+        if path.to_ascii_lowercase().ends_with(".cram") {
+            let mut reader = cram::io::reader::Builder::default().build_from_path(path)?;
+            let header = reader.read_header()?;
+            let names: Vec<Vec<u8>> = header.reference_sequences().keys().map(|k| k.to_vec()).collect();
+            let crai_path = format!("{path}.crai");
+            if std::path::Path::new(&crai_path).exists() {
+                for r in cram::crai::fs::read(&crai_path)? {
+                    if let Some(n) = r.reference_sequence_id().and_then(|i| names.get(i)) { out.insert(bare(n)); }
+                }
+            } else { out.extend(names.iter().map(|n| bare(n))); }
+        } else {
+            let mut reader = bam::io::reader::Builder.build_from_path(path)?;
+            let header = reader.read_header()?;
+            let names: Vec<Vec<u8>> = header.reference_sequences().keys().map(|k| k.to_vec()).collect();
+            let bai_path = format!("{path}.bai");
+            if std::path::Path::new(&bai_path).exists() {
+                // Mapped counts when the index has them, else any indexed bin.
+                let index = bam::bai::fs::read(&bai_path)?;
+                for (k, r) in names.iter().zip(index.reference_sequences()) {
+                    let reads = r.metadata().map_or(!r.bins().is_empty(), |m| m.mapped_record_count() > 0);
+                    if reads { out.insert(bare(k)); }
+                }
+            } else { out.extend(names.iter().map(|n| bare(n))); }
+        }
+    }
+    Ok(out)
+}
+
 /// Sample id for a pileup output column: first `@RG SM` in the header, else the
 /// alignment file's stem. Shared by the BAM and CRAM paths.
 fn read_group_sample_id(header: &Header, path: &str) -> String {
@@ -173,6 +208,12 @@ fn read_group_sample_id(header: &Header, path: &str) -> String {
 
 /// 1-based inclusive `[rs, re]` → a noodles `Region` on `name`, for an indexed
 /// BAM/CRAM query. Shared by the BAM and CRAM region paths.
+/// A region end at most the contig's length: `--region chr22` asks for 1..i64::MAX, which no
+/// index query accepts.
+fn clamp_end(header: &Header, rid: usize, re: i64) -> i64 {
+    header.reference_sequences().get_index(rid).map_or(re, |(_, rs)| re.min(usize::from(rs.length()) as i64))
+}
+
 fn build_region(name: Vec<u8>, rs: i64, re: i64) -> io::Result<Region> {
     let start = Position::try_from(rs.max(1) as usize)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -229,7 +270,8 @@ pub fn load_reference_window(reference: &str, chrom: &str, region: Option<(i64, 
         format!("reference FASTA has no contig matching '{chrom}' (tried with/without 'chr')")))?;
     const MARGIN: i64 = 2000;
     let (lo, hi) = match region {
-        Some((rs, re)) => ((rs - MARGIN).max(1), (re + MARGIN).min(len as i64).max(1)),
+        // Saturating: `--region chr22` ends at i64::MAX, which wrapped to a one-base window.
+        Some((rs, re)) => (rs.saturating_sub(MARGIN).max(1), re.saturating_add(MARGIN).min(len as i64).max(1)),
         None => (1, len as i64),
     };
     let inval = |e: std::num::TryFromIntError| io::Error::new(io::ErrorKind::InvalidInput, e);
@@ -418,7 +460,7 @@ fn pileup_one(
     let index = if std::path::Path::new(&bai_path).exists() { Some(bam::bai::fs::read(&bai_path)?) } else { None };
     let region_query = match region {
         Some(r) => index.as_ref().map(|_| r),
-        None => index.as_ref().filter(|ix| mostly_elsewhere(ix, target_rid))
+        None => index.as_ref().filter(|ix| mostly_elsewhere(ix, target_rid, std::fs::metadata(path).map_or(0, |m| m.len())))
             .and_then(|_| header.reference_sequences().get_index(target_rid).map(|(_, rs)| (1, usize::from(rs.length()) as i64))),
     };
     if region.is_none() && region_query.is_some() {
@@ -464,7 +506,7 @@ fn pileup_one(
             // A fresh reader per replay: the BGZF stream is not rewindable.
             let mut reader = bam::io::reader::Builder.build_from_path(path)?;
             let header = reader.read_header()?;
-            let reg = build_region(contig_name.clone(), rs, re)?;
+            let reg = build_region(contig_name.clone(), rs, clamp_end(&header, target_rid, re))?;
             let mut q = reader.query(&header, index, &reg)?;
             while q.read_record(&mut record)? != 0 {
                 emit(&record, sink);
@@ -493,15 +535,21 @@ fn pileup_one(
     Ok((sample_id, gl, rep))
 }
 
-/// Whether a `.bai` index counts fewer than half of the mapped reads on `target_rid` (no
-/// per-reference counts: false, the file is streamed).
-fn mostly_elsewhere(index: &bam::bai::Index, target_rid: usize) -> bool {
+/// Whether `target_rid`'s reads take under half of the BAM: by the `.bai`'s per-reference mapped
+/// counts, else (an index without them) by the compressed span of its chunks against the file.
+fn mostly_elsewhere(index: &bam::bai::Index, target_rid: usize, file_len: u64) -> bool {
     use noodles_csi::binning_index::ReferenceSequence as _;
-    let counts: Option<Vec<u64>> = index.reference_sequences().iter().map(|r| r.metadata().map(|m| m.mapped_record_count())).collect();
-    let Some(counts) = counts else { return false };
-    let total: u64 = counts.iter().sum();
-    let here = counts.get(target_rid).copied().unwrap_or(0);
-    total > 0 && 2 * here < total
+    let refs = index.reference_sequences();
+    let counts: Option<Vec<u64>> = refs.iter().map(|r| r.metadata().map(|m| m.mapped_record_count())).collect();
+    if let Some(counts) = counts {
+        let total: u64 = counts.iter().sum();
+        let here = counts.get(target_rid).copied().unwrap_or(0);
+        return total > 0 && 2 * here < total;
+    }
+    let Some(r) = refs.get(target_rid) else { return false };
+    let chunks = r.bins().values().flat_map(|b| b.chunks().iter());
+    let (lo, hi) = chunks.fold((u64::MAX, 0u64), |(lo, hi), c| (lo.min(c.start().compressed()), hi.max(c.end().compressed())));
+    lo < hi && 2 * (hi - lo) < file_len
 }
 
 /// Decoder threads inflating one BAM's BGZF blocks for a single-sample pileup.
@@ -617,7 +665,7 @@ fn pileup_one_cram(
             sink(&ReadView { start, flags: record.flags().bits(), mapq, cigar: &cigar_buf, seq: &seq_buf, qual, qhash, name, mpos, isize, mate_other_tid });
         };
         if let (Some((rs, re)), Some(index)) = (region_query, index.as_ref()) {
-            let reg = build_region(contig_name.clone(), rs, re)?;
+            let reg = build_region(contig_name.clone(), rs, clamp_end(&header, target_rid, re))?;
             for result in reader.query(&header, index, &reg)? {
                 emit(&result?, sink);
             }

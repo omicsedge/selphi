@@ -66,6 +66,7 @@ mod memory;
 pub mod dmm;
 pub mod pipeline;
 pub mod output;
+pub mod multi;
 // Faithful GLIMPSE2 8-founder phasing HMM + its params — the per-iteration phaser
 // run by the lcWGS engine (default-on). Shared with `crate::sparse_ls` so
 // `--lcwgs` is self-contained; the `--ls-exact` engine imports them back.

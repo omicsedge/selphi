@@ -663,7 +663,7 @@ pub fn run_multi_chr(
         // The multi-chr header lists EVERY chromosome's contig; each record must
         // carry its own index into that list (it used to write 0 for all of them).
         bcf_contig_names: if config.bcf {
-            selphi::io::bcf_encode::contig_names_from_header_lines(&multi_srp.global_meta.contig_fields)
+            selphi::io::bcf_encode::contig_names_from_header_lines(&selphi::io::bcf_encode::dedup_contig_lines(&multi_srp.global_meta.contig_fields))
         } else { Vec::new() },
     };
 
@@ -679,7 +679,9 @@ pub fn run_multi_chr(
     // Header contigs: the panel's, then the absent target chromosomes' (their own
     // ##contig lines when the target declares them). A BCF record names its contig
     // by its index in this list.
-    let mut contig_fields = multi_srp.global_meta.contig_fields.clone();
+    // Each contig once: a panel merged from per-chromosome BCFs that each declared every contig
+    // repeats them, and a repeated ID makes the index's reference ids ambiguous.
+    let mut contig_fields = selphi::io::bcf_encode::dedup_contig_lines(&multi_srp.global_meta.contig_fields);
     if !absent.is_empty() {
         let lines = selphi::io::passthrough::target_contig_lines(input_path).unwrap_or_default();
         let declared = selphi::io::bcf_encode::contig_names_from_header_lines(&contig_fields);
