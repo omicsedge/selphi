@@ -20,5 +20,6 @@ pub mod pgen_output;
 pub mod selfdecode_output;
 pub mod target_io;
 pub mod passthrough;
+pub mod variant_only;
 
 pub mod indexing;

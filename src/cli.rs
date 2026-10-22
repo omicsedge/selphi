@@ -387,6 +387,15 @@ pub struct Args {
     #[arg(long)]
     pub drop_unmatched: bool,
 
+    /// Regions the input's caller covered (BED, plain or bgzipped). A panel site
+    /// inside them that the input does not list is read as homozygous reference
+    /// for every sample instead of being imputed: give an exome's capture targets,
+    /// or the callable regions of a genome, with a variant-only VCF. Without it a
+    /// single-sample variant-only input at sequencing density is read that way
+    /// along the span of its records (SELPHI_VARIANT_ONLY_FILL=0 turns that off).
+    #[arg(long, value_name = "BED")]
+    pub callable: Option<String>,
+
     /// Write native BCF binary output (faster, smaller, no bcftools needed)
     #[arg(long)]
     pub bcf: bool,

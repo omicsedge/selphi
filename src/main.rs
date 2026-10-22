@@ -148,6 +148,9 @@ fn main() {
                         args.bam.as_deref(),
                         args.bam_list.as_deref(),
                         args.reference.as_deref(),
+                        (!args.refpanel.is_empty()).then_some(args.refpanel.as_str()),
+                        args.callable.is_some(),
+                        args.phase_only,
                     );
                     args.lcwgs = eff_lcwgs;
                     args.refine = eff_refine;
@@ -238,6 +241,17 @@ fn main() {
 
         let start = std::time::Instant::now();
 
+        if args.phase_only {
+            selphi_error!("--phase-only phases called genotypes: aligned reads and files without GT are imputed by the lcWGS engine (drop --phase-only)");
+            std::process::exit(2);
+        }
+        let mut magic = [0u8; 8];
+        if std::fs::File::open(refpanel).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic)).is_ok()
+            && selphi::srp::is_multi_chr_magic(&magic) {
+            selphi_error!("The lcWGS engine reads one chromosome's panel: give --refpanel a single-chromosome SRP \
+                (one run per chromosome, each with --prepare-reference-from on that chromosome's BCF)");
+            std::process::exit(2);
+        }
         // Load SRP reference panel
         let srp = selphi::srp::SrpReader::open(refpanel, 0)
             .unwrap_or_else(|e| { eprintln!("Failed to open SRP: {}", e); std::process::exit(1); });

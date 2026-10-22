@@ -81,7 +81,7 @@ pub(crate) fn resident_bytes() -> Option<usize> {
 }
 
 #[derive(Default)]
-struct Usage { fixed: usize, work: usize, work_jobs: usize, waiting: usize, peak: usize }
+struct Usage { fixed: usize, work: usize, work_jobs: usize, waiting: usize, alone_waiting: usize, peak: usize }
 
 pub(crate) struct MemoryBudget {
     limit: usize,
@@ -89,6 +89,11 @@ pub(crate) struct MemoryBudget {
     shared: usize,
     usage: Mutex<Usage>,
     changed: Condvar,
+    /// An explicit LCWGS_MEM_BUDGET_GB is a hard limit: a chunk or task above its half stops the
+    /// run. The default allowance is sized from the average chunk, so there such an item runs
+    /// alone instead (see [`MemoryBudget::lenient`]).
+    strict: bool,
+    oversized: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     allow_parallel_fb: bool,
     #[cfg(test)]
@@ -102,6 +107,7 @@ impl MemoryBudget {
         assert!(limit > shared, "lcWGS memory budget must exceed shared process storage");
         Self { limit, fixed_limit: shared + (limit - shared) / 2, shared,
             usage: Mutex::new(Usage { fixed: shared, ..Usage::default() }), changed: Condvar::new(),
+            strict: true, oversized: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             allow_parallel_fb: true,
             #[cfg(test)]
@@ -109,13 +115,30 @@ impl MemoryBudget {
         }
     }
 
+    /// The default allowance. Calls clustered in a few chunks (an exome, a variant-only file) put
+    /// most sites in one chunk, whose state or phasing work can exceed its half of an allowance
+    /// sized from the average chunk: such a chunk is admitted only when no other chunk is live,
+    /// and such work only when no other work runs, so the run goes on above the allowance.
+    pub fn lenient(mut self) -> Self { self.strict = false; self }
+
     pub fn work_limit(&self) -> usize { self.limit - self.fixed_limit }
 
+    fn note_oversized(&self, what: &str, bytes: usize) {
+        if !self.oversized.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::selphi_info!("  lcWGS: one {} needs {:.2} GB, above its share of the allowance; it runs alone",
+                what, bytes as f64 / 1e9);
+        }
+    }
+
     pub fn try_chunk(&self, bytes: usize) -> Option<Permit<'_>> {
-        assert!(bytes <= self.fixed_limit - self.shared,
+        let oversized = bytes > self.fixed_limit - self.shared;
+        assert!(!oversized || !self.strict,
             "one lcWGS chunk exceeds the state allowance; increase LCWGS_MEM_BUDGET_GB");
         let mut used = self.usage.lock().unwrap();
-        if used.fixed + bytes > self.fixed_limit
+        if oversized {
+            if used.fixed != self.shared || used.work != 0 { return None; }
+            self.note_oversized("chunk", bytes);
+        } else if used.fixed + bytes > self.fixed_limit
             || bytes > self.limit.saturating_sub(used.fixed + used.work) { return None; }
         used.fixed += bytes;
         used.peak = used.peak.max(used.fixed + used.work);
@@ -130,10 +153,14 @@ impl MemoryBudget {
 
     fn admit_work(&self, used: &mut Usage, bytes: usize) -> Option<Permit<'_>> {
         if bytes > self.limit.saturating_sub(used.fixed + used.work) { return None; }
+        Some(self.charge_work(used, bytes))
+    }
+
+    fn charge_work(&self, used: &mut Usage, bytes: usize) -> Permit<'_> {
         used.work += bytes;
         used.work_jobs += 1;
         used.peak = used.peak.max(used.fixed + used.work);
-        Some(Permit { budget: self, bytes, fixed: false })
+        Permit { budget: self, bytes, fixed: false }
     }
 
     /// Prefer whole sample jobs when they already fill the pool. A nested join
@@ -168,11 +195,22 @@ impl MemoryBudget {
 
     fn work(&self, bytes: usize) -> Permit<'_> {
         assert!(rayon::current_thread_index().is_none(), "memory admission must run outside Rayon");
-        assert!(bytes <= self.work_limit(),
+        assert!(!self.strict || bytes <= self.work_limit(),
             "one lcWGS sample exceeds the work allowance; increase LCWGS_MEM_BUDGET_GB");
         let mut used = self.usage.lock().unwrap();
         used.waiting += 1;
-        while bytes > self.limit.saturating_sub(used.fixed + used.work) {
+        // Lenient only: work that cannot fit beside the live chunks even alone waits for the other
+        // work to finish, and later requests wait behind it so that it is not starved.
+        let alone = !self.strict && bytes > self.limit.saturating_sub(used.fixed);
+        if alone {
+            used.alone_waiting += 1;
+            while used.work != 0 { used = self.changed.wait(used).unwrap(); }
+            used.alone_waiting -= 1;
+            used.waiting -= 1;
+            self.note_oversized("task", bytes);
+            return self.charge_work(&mut used, bytes);
+        }
+        while used.alone_waiting != 0 || bytes > self.limit.saturating_sub(used.fixed + used.work) {
             used = self.changed.wait(used).unwrap();
         }
         used.waiting -= 1;
@@ -366,6 +404,22 @@ mod tests {
         drop(chunks);
         assert_eq!(b.usage.lock().unwrap().fixed, 0);
         assert!(b.usage.lock().unwrap().peak <= 1000);
+    }
+
+    #[test]
+    fn lenient_budget_runs_an_oversized_chunk_and_its_work_alone() {
+        let b = MemoryBudget::new(1000, 100).lenient();
+        let big = b.try_chunk(600).unwrap();
+        assert!(b.try_chunk(10).is_none());
+        let w = b.work(900);
+        assert!(b.try_work(1).is_none());
+        drop(w);
+        drop(big);
+        let small = b.try_chunk(100).unwrap();
+        assert!(b.try_chunk(600).is_none());
+        drop(small);
+        assert_eq!(b.usage.lock().unwrap().fixed, 100);
+        assert_eq!(b.usage.lock().unwrap().work, 0);
     }
 
     #[test]

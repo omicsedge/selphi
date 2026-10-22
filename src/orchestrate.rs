@@ -69,6 +69,8 @@ pub struct MultiChrImputeConfig {
     pub replicas: selphi::diploid::replicas::Setting,
     /// `--drop-unmatched`: leave out target records absent from the panel.
     pub drop_unmatched: bool,
+    /// `--callable`: regions where a panel site the input does not list is reference.
+    pub callable: Option<String>,
     /// `--ped`: pedigree pre-phasing + het locking.
     pub ped: Option<String>,
     /// `--haploids`: explicit haploid sample list (chrX males are auto-detected
@@ -129,6 +131,7 @@ impl MultiChrImputeConfig {
             phase_ensemble: args.phase_ensemble,
             replicas,
             drop_unmatched: args.drop_unmatched,
+            callable: args.callable.clone(),
             ped: args.ped.clone(),
             haploids: args.haploids.clone(),
             build: args.build,
@@ -172,6 +175,7 @@ fn load_chr_data(
     // ROOT-CAUSE FIX (multi-chr): 128 when phasing will run (missing→imputed by the engine),
     // 0 for impute-only (byte-identical). See single-chr extract in imputation_pipeline.rs.
     miss_val: u8,
+    fill: Option<&selphi::io::variant_only::FillPlan>,
 ) -> Option<(Arc<selphi::srp::SrpReader>, Vec<usize>, Vec<usize>, Vec<u8>, Vec<f64>, Vec<i64>, usize, usize, usize, NoCallConf, Vec<u8>, (Vec<usize>, Vec<usize>))> {
     let chr_view = multi_srp.load_chr_view(chr_name).ok()?;
     let n_ref = chr_view.n_haps();
@@ -184,7 +188,7 @@ fn load_chr_data(
         .or_else(|| target_by_chr.get(chr_name))?;
 
     let (wgs_idx, target_idx, targ_alleles, chip_bps, n_chip, nocall, transforms, matched_idx) =
-        prepare_chr_target(&srp, target_markers, target_genotypes, n_haps, allele_match, miss_val)?;
+        prepare_chr_target(&srp, target_markers, target_genotypes, n_haps, allele_match, miss_val, fill)?;
     let raw_chip_cm = genmap::interpolate_for_chr(multi_map, chr_name, &chip_bps);
 
     Some((srp, wgs_idx, target_idx, targ_alleles, raw_chip_cm, chip_bps, n_ref, n_ref_variants, n_chip, nocall, transforms, matched_idx))
@@ -205,11 +209,20 @@ fn prepare_chr_target(
     n_haps: usize,
     allele_match: selphi::io::target_io::AlleleMatch,
     miss_val: u8,
+    fill: Option<&selphi::io::variant_only::FillPlan>,
 ) -> Option<(Vec<usize>, Vec<usize>, Vec<u8>, Vec<i64>, usize, NoCallConf, Vec<u8>, (Vec<usize>, Vec<usize>))> {
     let (mut wgs_idx, mut target_idx, mut transforms) = intersect_variants_for_chr(
         &srp.metadata.chromosome, &srp.variants, &srp.ids, target_markers, allele_match,
     );
     let matched_idx = target_idx.clone();
+    // With a fill plan the last row is the shared 0/0 row the added sites point at (see `run`).
+    if let Some(plan) = fill {
+        let row = target_markers.len() - 1;
+        let sites = plan.sites(srp, &target_markers[..row], wgs_idx.len());
+        if !sites.is_empty() {
+            selphi::io::variant_only::merge(&sites, row, &mut wgs_idx, &mut target_idx, &mut transforms);
+        }
+    }
     let uncalled = selphi::io::target_io::drop_uncalled_sites(
         target_genotypes, &mut wgs_idx, &mut target_idx, &mut transforms);
     if !uncalled.is_empty() {
@@ -524,7 +537,7 @@ pub fn run_multi_chr(
 
     // 2. Read target VCF once, partition by chromosome
     selphi_step!("Reading target VCF (all chromosomes)...");
-    let (sample_names, target_by_chr, is_phased) = read_target_vcf_multi_chr(input_path);
+    let (sample_names, mut target_by_chr, is_phased) = read_target_vcf_multi_chr(input_path);
     let n_samples = sample_names.len();
     let n_haps = n_samples * 2;
     // ROOT-CAUSE FIX (multi-chr): encode missing as 128 when phasing will run so the engine
@@ -554,6 +567,17 @@ pub fn run_multi_chr(
         }
     }
     let absent: Vec<(String, String, usize)> = if config.drop_unmatched { Vec::new() } else { absent };
+    // Panel sites a variant-only input leaves out are read as reference (`selphi::io::variant_only`),
+    // per chromosome in `prepare_chr_target`; each chromosome gets the one 0/0 row they point at.
+    let fill = selphi::io::variant_only::FillPlan::new(config.callable.as_deref(),
+        target_by_chr.values().flat_map(|(m, g)| m.iter().zip(g.iter())), n_samples, input_path).map(Arc::new);
+    if fill.is_some() {
+        for (m, g) in target_by_chr.values_mut() {
+            let (sm, sg) = selphi::io::variant_only::sentinel(n_samples);
+            m.push(sm);
+            g.push(sg);
+        }
+    }
 
     // 3. Load genetic map (unified file or per-chr directory)
     let multi_map = load_maps(config, &chromosomes, map_path)?;
@@ -720,7 +744,7 @@ pub fn run_multi_chr(
                  pre.matched_idx)
             } else {
                 // Synchronous load for first chromosome (or if prefetch was skipped)
-                match load_chr_data(&multi_srp, chr_name, &target_by_chr, &multi_map, n_haps, config.allele_match, mc_miss_val) {
+                match load_chr_data(&multi_srp, chr_name, &target_by_chr, &multi_map, n_haps, config.allele_match, mc_miss_val, fill.as_deref()) {
                     Some(d) => d,
                     None => { selphi_info!("    Skipped"); continue; }
                 }
@@ -975,6 +999,7 @@ pub fn run_multi_chr(
                 let n_h = n_haps;
                 let allele_match = config.allele_match;
                 let mc_mv = mc_miss_val;
+                let fill_next = fill.clone();
                 Some(std::thread::spawn(move || {
                     // Open a fresh MultiChrSrpReader (separate file handle)
                     let reader = MultiChrSrpReader::open(&srp_path_clone).ok()?;
@@ -986,7 +1011,7 @@ pub fn run_multi_chr(
 
                     let (target_markers, target_genotypes) = next_target.as_ref()?;
                     let (wgs_idx, target_idx, targ_alleles, chip_bps, n_chip, nocall, transforms, matched_idx) =
-                        prepare_chr_target(&srp, target_markers, target_genotypes, n_h, allele_match, mc_mv)?;
+                        prepare_chr_target(&srp, target_markers, target_genotypes, n_h, allele_match, mc_mv, fill_next.as_deref())?;
                     let (map_bp, map_cm) = next_map?;
                     let raw_chip_cm: Vec<f64> = chip_bps.iter().map(|&bp| {
                         genmap::interpolate_cm(&map_bp, &map_cm, bp)

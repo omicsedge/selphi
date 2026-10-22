@@ -758,7 +758,7 @@ fn build_passthrough(
 /// process when there are no shared variants (identical to the inline branch).
 fn load_and_intersect(args: &Args, target_path: &str, srp: &SrpReader) -> LoadedTarget {
     // 2. Read target VCF: sample names, variants, genotypes
-    let (sample_names, target_markers, target_genotypes, file_phased) =
+    let (sample_names, mut target_markers, mut target_genotypes, file_phased) =
         read_target_vcf(target_path, srp);
     selphi_step!("Target: {} samples, {} variants, phased={}",
         sample_names.len(), target_markers.len(), file_phased);
@@ -781,6 +781,18 @@ fn load_and_intersect(args: &Args, target_path: &str, srp: &SrpReader) -> Loaded
             target_markers.iter().enumerate().filter(|(i, m)| m.unphased_het && !target_idx.contains(i)).count());
     }
     let matched_idx = target_idx.clone();
+    // Panel sites a variant-only input leaves out, read as reference where its caller looked.
+    if !args.phase_only
+        && let Some(plan) = selphi::io::variant_only::FillPlan::new(args.callable.as_deref(),
+            target_markers.iter().zip(target_genotypes.iter()), n_samples, target_path) {
+        let sites = plan.sites(srp, &target_markers, wgs_idx.len());
+        if !sites.is_empty() {
+            let (m, g) = selphi::io::variant_only::sentinel(n_samples);
+            target_markers.push(m);
+            target_genotypes.push(g);
+            selphi::io::variant_only::merge(&sites, target_markers.len() - 1, &mut wgs_idx, &mut target_idx, &mut allele_transforms);
+        }
+    }
     let uncalled_typed = if args.phase_only { Vec::new() } else {
         selphi::io::target_io::drop_uncalled_sites(
             &target_genotypes, &mut wgs_idx, &mut target_idx, &mut allele_transforms)

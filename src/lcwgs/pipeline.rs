@@ -124,6 +124,8 @@ pub fn run_lcwgs(
         return Err(std::io::Error::other(
             "No shared variants between target VCF and reference panel"));
     }
+    let (wgs_idx, target_idx) = pad_unlisted_snps(srp, wgs_idx, target_idx);
+    let n_shared = wgs_idx.len();
 
     // --- 3. (ref bitmatrix is now extracted per-chunk from SRP — see step 6) ---
 
@@ -132,6 +134,7 @@ pub fn run_lcwgs(
     // panel-shared variant order. 3 genotype probs per (sample, variant).
     let mut gl3_shared = vec![1.0f32 / 3.0; n_shared * n_samples * 3];
     for (shared_i, &t_idx) in target_idx.iter().enumerate() {
+        if t_idx == usize::MAX { continue; } // unlisted: flat
         let src_off = t_idx * n_samples * 3;
         let dst_off = shared_i * n_samples * 3;
         gl3_shared[dst_off .. dst_off + n_samples * 3]
@@ -142,6 +145,26 @@ pub fn run_lcwgs(
 
     // --- 5. cM map + chunked Gibbs imputation (shared with the BAM path) ---
     impute_from_gl3(srp, &wgs_idx, gl3_shared, n_samples, sample_ids, &pl_haploid, map_path, params, None)
+}
+
+/// Panel SNP sites between the first and last site a PL file lists that the file leaves out
+/// enter with flat likelihoods (`usize::MAX` in `target_idx`), as `bcftools call -i` writes them
+/// and as the BAM route treats a site no read covers: without them a file made without `-i`
+/// was imputed at its own sites only. A file that lists every one is returned unchanged.
+fn pad_unlisted_snps(srp: &SrpReader, wgs_idx: Vec<usize>, target_idx: Vec<usize>) -> (Vec<usize>, Vec<usize>) {
+    let (Some(&first), Some(&last)) = (wgs_idx.iter().min(), wgs_idx.iter().max()) else { return (wgs_idx, target_idx) };
+    let listed: std::collections::HashSet<usize> = wgs_idx.iter().copied().collect();
+    // Literal alleles: a hashed panel stores hashes in `variants`.
+    let is_snp = |i: usize| crate::io::pipeline::parse_variant_parts(srp, i)
+        .map_or_else(|| srp.variants[i].ref_allele.len() == 1 && srp.variants[i].alt_allele.len() == 1,
+            |p| p.3.len() == 1 && p.4.len() == 1);
+    let added: Vec<usize> = (first..=last).filter(|&i| !listed.contains(&i) && is_snp(i)).collect();
+    if added.is_empty() { return (wgs_idx, target_idx); }
+    selphi_info!("  {} panel SNP site(s) inside the file's span that it does not list: imputed from flat likelihoods", added.len());
+    let mut rows: Vec<(usize, usize)> = wgs_idx.into_iter().zip(target_idx).collect();
+    rows.extend(added.into_iter().map(|i| (i, usize::MAX)));
+    rows.sort_by_key(|r| r.0);
+    rows.into_iter().unzip()
 }
 
 /// Shared imputation tail for both lcWGS paths (VCF-PL and BAM): given `gl3` in
@@ -814,7 +837,10 @@ fn run_chunked_gibbs(
     });
     let limit = explicit_budget.unwrap_or(default_budget);
     assert!(limit > shared, "lcWGS memory budget must exceed shared process storage");
-    let memory = (n_samples <= 1).then(|| super::memory::MemoryBudget::new(limit, shared));
+    let memory = (n_samples <= 1).then(|| {
+        let budget = super::memory::MemoryBudget::new(limit, shared);
+        if explicit_budget.is_some() { budget } else { budget.lenient() }
+    });
     let reclaimer = WaveReclaimer::new(limit);
     let execution = match &memory {
         Some(memory) => {

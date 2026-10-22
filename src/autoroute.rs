@@ -25,6 +25,12 @@ pub enum AutoRoute {
     /// → the plain chip/WGS genotype engine, no refinement (byte-identical to
     /// the shipped hard-call path).
     PlainGenotype,
+    /// A PL file that lists under half the panel's sites in its span, with calls the reads
+    /// settle (an exome, a targeted panel, a variant-only file) → the genotype engine, reading
+    /// the PL as call confidence. The likelihood engine imputes only the sites a PL file lists;
+    /// on an HG003 exome (chromosome 22) the genotype engine also beat it, padded with flat
+    /// likelihoods, outside the capture targets (R² 0.812 against 0.792).
+    SparseLikelihoods,
 }
 
 /// What the record sample observed about the target. Field presence is the
@@ -32,7 +38,7 @@ pub enum AutoRoute {
 /// record carries it in FORMAT) — bcftools VCFs legitimately vary FORMAT per
 /// record (e.g. sites with no read coverage emit a bare `GT .`), so a strict
 /// first-record FORMAT check would misclassify.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct Sniff {
     /// FORMAT carried a `GT` subfield on at least one sampled record.
     has_gt: bool,
@@ -51,7 +57,23 @@ struct Sniff {
     dens_n: u64,
     /// Position span (max−min, in bp) across those `dens_n` records.
     dens_span: u64,
+    /// That chromosome and the span's ends, to count the panel sites it covers.
+    dens_chrom: Option<String>,
+    dens_min: u64,
+    dens_max: u64,
+    /// Sampled diploid PL triples, and those whose second-best genotype is at least
+    /// `SURE_PL` below the best (a call the reads settle).
+    pl_n: u64,
+    pl_sure: u64,
+    /// Called reference homozygotes among the sampled GT, the most samples a record carried,
+    /// and the first sample's FORMAT/DP values (whether a variant-only fill will apply).
+    gt_homref: u64,
+    n_samples: usize,
+    dp: Vec<u32>,
 }
+
+/// Phred gap between the best and second-best genotype of a settled call.
+const SURE_PL: i64 = 20;
 
 impl Sniff {
     /// Fraction of inspected GT entries that were actually called. `1.0` when no
@@ -267,6 +289,8 @@ fn sniff_vcf_text(raw: &[u8]) -> Sniff {
     }
     if n_records == 0 { return s; }
     s.dens_span = if dmax >= dmin && dmin != u64::MAX { dmax - dmin } else { 0 };
+    s.dens_chrom = first_chrom.map(|c| String::from_utf8_lossy(c).into_owned());
+    (s.dens_min, s.dens_max) = (dmin, dmax);
     let stride = (n_records / want).max(1);
 
     let mut data_idx = 0usize;
@@ -340,13 +364,39 @@ fn record_into_sniff(s: &mut Sniff, format: &[u8], samples_region: &[u8]) {
     if format_has(format, b"DP") { s.has_dp = true; }
 
     if let Some(gi) = gt_index(format) {
+        let mut n = 0usize;
         for field in samples_region.split(|&b| b == b'\t') {
             if field.is_empty() { continue; }
+            n += 1;
             let gt = field.split(|&b| b == b':').nth(gi).unwrap_or(b"");
             s.gt_total += 1;
             if gt_is_called(gt) { s.gt_called += 1; }
+            if gt_is_called(gt) && gt.iter().all(|&b| b == b'0' || b == b'/' || b == b'|') { s.gt_homref += 1; }
+        }
+        s.n_samples = s.n_samples.max(n);
+    }
+    if let Some(di) = format.split(|&b| b == b':').position(|sub| sub == b"DP")
+        && let Some(first) = samples_region.split(|&b| b == b'\t').next()
+        && let Some(v) = first.split(|&b| b == b':').nth(di).and_then(|x| std::str::from_utf8(x).ok()?.parse::<u32>().ok()) {
+        s.dp.push(v);
+    }
+    if let Some(pi) = format.split(|&b| b == b':').position(|sub| sub == b"PL") {
+        for field in samples_region.split(|&b| b == b'\t') {
+            let pl = field.split(|&b| b == b':').nth(pi).unwrap_or(b"");
+            let v: Vec<i64> = pl.split(|&b| b == b',')
+                .filter_map(|x| std::str::from_utf8(x).ok()?.trim().parse().ok()).collect();
+            tally_pl(s, &v);
         }
     }
+}
+
+/// Count one sample's PL in the sniff: diploid biallelic triples only.
+fn tally_pl(s: &mut Sniff, pl: &[i64]) {
+    if pl.len() != 3 { return; }
+    let mut v = [pl[0], pl[1], pl[2]];
+    v.sort_unstable();
+    s.pl_n += 1;
+    if v[1] - v[0] >= SURE_PL { s.pl_sure += 1; }
 }
 
 /// Sniff a binary BCF via the noodles record reader (same decoder the rest of
@@ -380,6 +430,9 @@ fn sniff_bcf(path: &str) -> std::io::Result<Sniff> {
                 dmax = dmax.max(p);
             }
         let samples = rec.samples();
+        s.n_samples = s.n_samples.max(samples.values().count());
+        if let Some(sample) = samples.values().next()
+            && let Some(Some(Value::Integer(dp))) = sample.get("DP") && *dp >= 0 { s.dp.push(*dp as u32); }
         // Field presence: a key is present if a sample carries that subfield.
         // (Mirrors extract_site_confidence_bcf's per-sample `.get()` probing —
         // avoids naming the indexmap `Keys` inner type, which is not a direct
@@ -395,13 +448,65 @@ fn sniff_bcf(path: &str) -> std::io::Result<Sniff> {
                 let al = gt.as_ref();
                 if al.first().and_then(|a| a.position()).is_some() {
                     s.gt_called += 1;
+                    if al.iter().all(|a| a.position() == Some(0)) { s.gt_homref += 1; }
                 }
+            }
+            if let Some(Some(Value::Array(noodles_vcf::variant::record_buf::samples::sample::value::Array::Integer(pl)))) = sample.get("PL") {
+                let v: Vec<i64> = pl.iter().map(|x| x.map_or(-1, i64::from)).collect();
+                if v.iter().all(|&x| x >= 0) { tally_pl(&mut s, &v); }
             }
         }
     }
     s.dens_span = if dmax >= dmin && dmin != u64::MAX { dmax - dmin } else { 0 };
+    s.dens_chrom = first_chrom;
+    (s.dens_min, s.dens_max) = (dmin, dmax);
     Ok(s)
 }
+
+/// Panel sites on the sniffed chromosome inside the sniffed span, from a single-chromosome SRP
+/// (`None` for a multi-chromosome panel, another chromosome, or a panel that cannot be read).
+fn panel_sites_in_span(refpanel: &str, s: &Sniff) -> Option<u64> {
+    let chrom = s.dens_chrom.as_deref()?;
+    if s.dens_n < 2 || s.dens_max <= s.dens_min { return None; }
+    let strip = |c: &str| c.strip_prefix("chr").unwrap_or(c).to_string();
+    let srp = if multi_chr_panel(refpanel) {
+        let reader = selphi::srp::multi_chr_reader::MultiChrSrpReader::open(refpanel).ok()?;
+        let name = reader.chromosomes().into_iter().find(|c| strip(c) == strip(chrom))?.to_string();
+        reader.load_chr_view(&name).ok()?.into_srp_reader()
+    } else { selphi::srp::SrpReader::open(refpanel, 0).ok()? };
+    if strip(srp.chromosome()) != strip(chrom) { return None; }
+    let (lo, hi) = (s.dens_min as i64, s.dens_max as i64);
+    let a = srp.variants.partition_point(|v| v.pos < lo);
+    let b = srp.variants.partition_point(|v| v.pos <= hi);
+    Some((b - a) as u64)
+}
+
+/// True for a multi-chromosome SRP (the lcWGS engine reads single-chromosome panels only).
+fn multi_chr_panel(refpanel: &str) -> bool {
+    let mut magic = [0u8; 8];
+    std::fs::File::open(refpanel).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic)).is_ok()
+        && selphi::srp::is_multi_chr_magic(&magic)
+}
+
+/// Whether the genotype engine will read a variant-only file's omissions as reference: with
+/// `--callable`, or for one sample at sequencing density and depth (see `selphi::io::variant_only`).
+fn fill_applies(s: &Sniff, callable: bool) -> bool {
+    if callable { return true; }
+    let mut dp = s.dp.clone();
+    dp.sort_unstable();
+    let deep = !dp.is_empty() && f64::from(dp[dp.len() / 2])
+        >= selphi::config::f64_opt("SELPHI_VARIANT_ONLY_MIN_DP").unwrap_or(20.0);
+    // Called ALT genotypes, not no-calls: a file of `./.` with PL carries its evidence in the PL.
+    let alt_calls = s.gt_called.saturating_sub(s.gt_homref);
+    s.n_samples == 1 && s.gt_homref == 0 && alt_calls >= 200 && 20 * s.gt_called >= 19 * s.gt_total
+        && s.density_per_mb() >= selphi::io::variant_only::min_density() && deep
+}
+
+/// At least 80% of the sampled likelihoods settle their call.
+fn settled(s: &Sniff) -> bool { s.pl_n > 0 && 5 * s.pl_sure >= 4 * s.pl_n }
+
+/// A likelihood file listing under half the panel's sites in its span.
+fn sparse(listed: u64, panel: u64) -> bool { panel > 0 && 2 * listed < panel }
 
 /// Run auto-route: sniff the target and return the resolved `(lcwgs, refine)`
 /// effective booleans, having logged the decision. Only the flag(s) the user
@@ -416,6 +521,9 @@ pub fn resolve(
     bam: Option<&str>,
     bam_list: Option<&str>,
     reference: Option<&str>,
+    refpanel: Option<&str>,
+    callable: bool,
+    phase_only: bool,
 ) -> (bool, bool) {
     // If the user pinned BOTH mode flags explicitly there is nothing to fill.
     // (We still log so the run record shows auto-route was a no-op.)
@@ -432,13 +540,40 @@ pub fn resolve(
         match input {
             Some(p) => {
                 let s = sniff_variant_file(p);
-                let d = auto_route_decision(false, &s, wgs_density_threshold());
+                let mut d = auto_route_decision(false, &s, wgs_density_threshold());
                 // Detail line so the chosen branch is auditable from the log.
                 selphi_step!(
                     "auto-route: sniff GT={} PL={} GQ={} DP={} call-rate={:.3} (of {} GT entries) density={:.0}/Mb (thr {:.0})",
                     s.has_gt, s.has_pl, s.has_gq, s.has_dp, s.call_rate(), s.gt_total,
                     s.density_per_mb(), wgs_density_threshold(),
                 );
+                // The panel is opened only for settled likelihoods: low-pass files stay as they were.
+                // A sparse file goes to the genotype engine where that engine is better: it carries
+                // reference calls (an exome at the panel's sites: R² 0.813 against 0.793 outside the
+                // targets, common sites), or its omissions will be read as reference. A variant-only
+                // exome without --callable stays here (in/out of target 0.924 / 0.781 against 0.918 / 0.778).
+                if d == AutoRoute::Lcwgs && s.has_gt && settled(&s)
+                    && let Some(panel) = refpanel.and_then(|rp| panel_sites_in_span(rp, &s))
+                    && sparse(s.dens_n, panel) {
+                    selphi_step!("auto-route: the PL file lists {} of the panel's {} sites in its span, {:.0}% of its calls settled by the reads",
+                        s.dens_n, panel, 100.0 * s.pl_sure as f64 / s.pl_n as f64);
+                    if s.gt_homref > 0 || fill_applies(&s, callable) {
+                        d = AutoRoute::SparseLikelihoods;
+                    } else {
+                        selphi_step!("auto-route: a variant-only likelihood file without --callable: its unlisted sites are imputed from flat likelihoods");
+                    }
+                }
+                // The lcWGS engine reads one chromosome's panel; nearly settled calls go to the genotype
+                // engine on a multi-chromosome panel (30x HG002 chr22: 0.9973 there against 0.9978), whose
+                // multi-chromosome path writes calls as given (no refine), hence 95% rather than 80%.
+                if d == AutoRoute::Lcwgs && s.has_gt && s.pl_n > 0 && 20 * s.pl_sure >= 19 * s.pl_n
+                    && refpanel.is_some_and(multi_chr_panel) {
+                    selphi_step!("auto-route: a multi-chromosome panel, which the lcWGS engine does not read; \
+                        its calls are written as given ({:.1}% settled by the reads)", 100.0 * s.pl_sure as f64 / s.pl_n as f64);
+                    d = AutoRoute::SparseLikelihoods;
+                }
+                // --phase-only phases called genotypes.
+                if phase_only && s.has_gt && d == AutoRoute::Lcwgs { d = AutoRoute::SparseLikelihoods; }
                 d
             }
             // No input to sniff — leave flags as the user gave them.
@@ -468,6 +603,14 @@ pub fn resolve(
         AutoRoute::PlainGenotype => {
             selphi_step!("auto-route: confident hard calls (GT-only, or GQ/DP below WGS density) {}", selphi::log::green("→ genotype engine (no refine)"));
         }
+        AutoRoute::SparseLikelihoods => {
+            if !cli_lcwgs {
+                selphi_step!("auto-route: called genotypes with likelihoods {}",
+                    selphi::log::green("→ genotype engine + call confidence from PL"));
+                eff_lcwgs = false;
+                if !cli_refine { eff_refine = true; }
+            }
+        }
     }
     (eff_lcwgs, eff_refine)
 }
@@ -481,13 +624,32 @@ mod tests {
     // cases build their own Sniff via `sniff_dens`.
     fn sniff(has_gt: bool, has_pl: bool, has_gq: bool, has_dp: bool, total: u64, called: u64) -> Sniff {
         Sniff { has_gt, has_pl, has_gq, has_dp, gt_total: total, gt_called: called,
-                dens_n: 2000, dens_span: 1_000_000 }
+                dens_n: 2000, dens_span: 1_000_000, ..Sniff::default() }
     }
 
     // Explicit density (records over a 1 Mb span → `dens_n` per Mb).
     fn sniff_dens(has_gq: bool, has_dp: bool, total: u64, called: u64, per_mb: u64) -> Sniff {
         Sniff { has_gt: true, has_pl: false, has_gq, has_dp, gt_total: total, gt_called: called,
-                dens_n: per_mb, dens_span: 1_000_000 }
+                dens_n: per_mb, dens_span: 1_000_000, ..Sniff::default() }
+    }
+
+    #[test]
+    fn sparse_settled_likelihoods_leave_the_likelihood_engine() {
+        let mut s = sniff(true, true, false, true, 100, 100);
+        assert!(!settled(&s));
+        (s.pl_n, s.pl_sure) = (100, 79);
+        assert!(!settled(&s));
+        s.pl_sure = 80;
+        assert!(settled(&s));
+        // an exome at the panel's sites lists ~4% of them; a likelihood file made at them all, ~100%
+        assert!(sparse(35_796, 861_896));
+        assert!(!sparse(917_859, 929_781));
+        assert!(!sparse(10, 0));
+        let mut pl = Sniff::default();
+        tally_pl(&mut pl, &[0, 25, 255]);
+        tally_pl(&mut pl, &[0, 3, 30]);
+        tally_pl(&mut pl, &[0, 3, 30, 4, 40, 50]);
+        assert_eq!((pl.pl_n, pl.pl_sure), (2, 1));
     }
 
     const WGS_THR: f64 = 1000.0;
