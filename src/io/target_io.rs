@@ -194,7 +194,7 @@ impl VcfLines {
     fn open_with(path: &str, piece: usize) -> Self {
         let file = std::fs::File::open(path)
             .unwrap_or_else(|e| { selphi_error!("Cannot open {}: {}", path, e); std::process::exit(1) });
-        let reader: Box<dyn std::io::Read> = if path.ends_with(".gz") {
+        let reader: Box<dyn std::io::Read> = if path.ends_with(".gz") || path.ends_with(".bgz") {
             Box::new(noodles_bgzf::io::Reader::new(std::io::BufReader::new(file)))
         } else { Box::new(std::io::BufReader::new(file)) };
         VcfLines { reader, buf: Vec::with_capacity(piece), start: 0, eof: false, done: false, piece }

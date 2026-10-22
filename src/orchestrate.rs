@@ -572,7 +572,7 @@ pub fn run_multi_chr(
     // Panel sites a variant-only input leaves out are read as reference (`selphi::io::variant_only`),
     // per chromosome in `prepare_chr_target`; each chromosome gets the one 0/0 row they point at.
     let fill = selphi::io::variant_only::FillPlan::new(config.callable.as_deref(),
-        target_by_chr.values().flat_map(|(m, g)| m.iter().zip(g.iter())), n_samples, input_path).map(Arc::new);
+        target_by_chr.values().flat_map(|(m, g)| m.iter().zip(g.iter())), n_samples, input_path, None).map(Arc::new);
     if let Some(f) = &fill {
         // A panel chromosome the file writes only reference records for.
         for c in f.speaks_contigs() {

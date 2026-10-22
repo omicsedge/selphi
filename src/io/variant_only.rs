@@ -296,7 +296,19 @@ fn span_kind(alts: &[&str]) -> SpanKind {
 }
 
 /// The scan behind [`RefSpans`]; with more than one sample it records `occupied` only.
-pub fn scan_ref_spans(path: &str, n_samples: usize) -> RefSpans {
+pub fn scan_ref_spans(path: &str, n_samples: usize, contig: Option<&str>) -> RefSpans {
+    // A one-chromosome run keeps spans for its own contig only; of the others it counts what the
+    // variant-only test reads genome-wide (their density and ALT `.` reference calls), as the
+    // marker counts it is compared with are.
+    let wanted = |c: &str| contig.is_none_or(|w| strip_chr(c) == strip_chr(w));
+    #[derive(Default)]
+    struct Lite { n: usize, lo: i64, hi: i64, n_no_alt_ref: usize }
+    let mut others: HashMap<String, Lite> = HashMap::new();
+    let mut lite = |chrom: &str, pos: i64, no_alt_ref: bool| {
+        let c = others.entry(strip_chr(chrom).to_string()).or_insert_with(|| Lite { lo: i64::MAX, ..Default::default() });
+        c.n += 1; c.lo = c.lo.min(pos); c.hi = c.hi.max(pos);
+        if no_alt_ref { c.n_no_alt_ref += 1; }
+    };
     #[derive(Default)]
     struct Contig { n: usize, lo: i64, hi: i64, called: Vec<(i64, i64)>, no_alt_called: Vec<(i64, i64)>,
         occupied: Vec<(i64, i64)>, no_alt_occupied: Vec<(i64, i64)>, ref_sample: Vec<(i64, u8)>, n_no_alt_ref: usize,
@@ -339,6 +351,15 @@ pub fn scan_ref_spans(path: &str, n_samples: usize) -> RefSpans {
                 let alts: Vec<&str> = rec.alternate_bases().as_ref().iter().map(String::as_str).collect();
                 let kind = span_kind(&alts);
                 let Some(pos) = rec.variant_start().map(|p| usize::from(p) as i64) else { continue };
+                if !wanted(rec.reference_sequence_name()) {
+                    // An ALT `.` 0/0 record without an END (a block has one) on another contig.
+                    let no_alt_ref = kind == SpanKind::NoAlt
+                        && !matches!(rec.info().get("END"), Some(Some(Iv::Integer(e))) if i64::from(*e) >= pos)
+                        && rec.samples().values().next().is_some_and(|s| matches!(s.get("GT"),
+                            Some(Some(Value::Genotype(g))) if !g.as_ref().is_empty() && g.as_ref().iter().all(|a| a.position() == Some(0))));
+                    lite(rec.reference_sequence_name(), pos, no_alt_ref);
+                    continue;
+                }
                 let ref_bases = rec.reference_bases();
                 let ref_base = ref_bases.as_bytes().first().copied().unwrap_or(b'N').to_ascii_uppercase();
                 use noodles_vcf::variant::record_buf::info::field::value::Array as Ia;
@@ -364,14 +385,23 @@ pub fn scan_ref_spans(path: &str, n_samples: usize) -> RefSpans {
                 take(rec.reference_sequence_name(), pos, ref_base, ref_bases.len() as i64, int("END"), int("SVLEN"), kind, fields);
             }
         }
-    } else if let Ok(file) = std::fs::File::open(path) {
-        use std::io::BufRead;
-        let reader: Box<dyn BufRead> = if path.ends_with(".gz") || path.ends_with(".bgz") {
-            Box::new(std::io::BufReader::new(noodles_bgzf::io::Reader::new(file)))
-        } else { Box::new(std::io::BufReader::new(file)) };
-        for line in reader.lines().map_while(Result::ok) {
-            if line.starts_with('#') { continue; }
-            let line = line.trim_end_matches('\r');
+    } else if std::path::Path::new(path).exists() {
+        // Lines streamed without a String each (a whole-genome gVCF has 165 million).
+        let mut lines = crate::io::target_io::VcfLines::open(path);
+        while let Some(raw) = lines.next_line() {
+            if raw.first() == Some(&b'#') { continue; }
+            let Ok(line) = std::str::from_utf8(raw) else { continue };
+            if let Some(t) = line.find('\t') && !wanted(&line[..t]) {
+                // Another contig: its density, and whether this is an ALT `.` 0/0 call without END.
+                let f: Vec<&str> = line.splitn(11, '\t').collect();
+                let Some(pos) = f.get(1).and_then(|p| p.parse::<i64>().ok()) else { continue };
+                let no_alt_ref = f.get(4).is_some_and(|a| *a == ".") && f.len() >= 10
+                    && !f[7].split(';').any(|kv| kv.strip_prefix("END=").and_then(|v| v.parse::<i64>().ok()).is_some_and(|e| e >= pos))
+                    && f[8].split(':').position(|k| k == "GT").and_then(|i| f[9].split(':').nth(i))
+                        .is_some_and(|g| { let a: Vec<&str> = g.split(['/', '|']).collect(); !a.is_empty() && a.iter().all(|x| *x == "0") });
+                lite(f[0], pos, no_alt_ref);
+                continue;
+            }
             let f: Vec<&str> = line.splitn(11, '\t').collect();
             if f.len() < 5 { continue; }
             let Ok(pos) = f[1].parse::<i64>() else { continue };
@@ -397,6 +427,10 @@ pub fn scan_ref_spans(path: &str, n_samples: usize) -> RefSpans {
         }
     }
     let mut out = RefSpans::default();
+    for (_, c) in others {
+        let dense = c.hi > c.lo && c.n as f64 / ((c.hi - c.lo) as f64 / 1e6) >= ALL_SITES_PER_MB;
+        if !dense { out.n_sparse_ref += c.n_no_alt_ref; }
+    }
     for (key, mut c) in by {
         let dense = c.hi > c.lo && c.n as f64 / ((c.hi - c.lo) as f64 / 1e6) >= ALL_SITES_PER_MB;
         if dense && !(c.no_alt_called.is_empty() && c.no_alt_occupied.is_empty()) { out.all_sites.insert(key.clone()); }
@@ -429,7 +463,7 @@ impl FillPlan {
     /// variant-only file deep enough to trust its omissions.
     pub fn new<'a>(
         callable: Option<&str>, markers: impl Iterator<Item = (&'a TargetMarker, &'a Vec<[u8; 2]>)> + Clone,
-        n_samples: usize, target_path: &str,
+        n_samples: usize, target_path: &str, contig: Option<&str>,
     ) -> Option<Self> {
         let callable = load_callable(callable);
         let auto = auto_fill();
@@ -442,7 +476,7 @@ impl FillPlan {
         // Every record, streamed: reference blocks and all-sites calls are evidence of their own
         // (their quality, not the file's depth, decides); no-calls and structural variants
         // anywhere in the file keep their span from being read as reference.
-        let mut spans = scan_ref_spans(target_path, n_samples);
+        let mut spans = scan_ref_spans(target_path, n_samples, contig);
         if !auto { spans.all_sites.clear(); spans.speaks.clear(); }
         if !spans.speaks.is_empty() {
             crate::selphi_step!("The input's own reference calls (gVCF blocks or all-sites records of quality >= 20): {} interval(s) on {} of the {} contig(s) it writes them for",
@@ -714,12 +748,12 @@ mod tests {
             "chr22\t1001\t.\tA\t.\t.\t.\tEND=1001;MIN_DP=26\tGT:DP\t0/0:26",     // one-base block
             "chr22\t1100\t.\tA\t<DEL>,<DUP>\t.\t.\tSVLEN=-20,300\tGT\t1/2",     // longest ALT span
         ].join("\n") + "\n";
-        let spans = scan_ref_spans(&write_vcf(dir.path(), "g.vcf", &body), 1);
+        let spans = scan_ref_spans(&write_vcf(dir.path(), "g.vcf", &body), 1, None);
         assert_eq!(spans.called["22"], vec![(100, 299), (501, 600), (801, 1001)]);
         assert_eq!(spans.occupied["22"], vec![(301, 500), (601, 651), (700, 800), (1100, 1400)]);
         assert!(spans.all_sites.is_empty() && spans.speaks.contains("22"));
         // Another sample's file: nothing is a call of the one sample, every block is occupied.
-        let multi = scan_ref_spans(&write_vcf(dir.path(), "g2.vcf", &body), 2);
+        let multi = scan_ref_spans(&write_vcf(dir.path(), "g2.vcf", &body), 2, None);
         assert!(multi.called.is_empty() && multi.speaks.is_empty());
         assert_eq!(multi.occupied["22"].first(), Some(&(100, 299)));
     }
@@ -733,17 +767,21 @@ mod tests {
             let gt = if p == 5_000 { "./.:0" } else { "0/0:35" };
             body += &format!("22\t{p}\t.\tA\t.\t.\t.\t.\tGT:GQ\t{gt}\n");
         }
-        let dense = scan_ref_spans(&write_vcf(dir.path(), "d.vcf", &body), 1);
+        let dense = scan_ref_spans(&write_vcf(dir.path(), "d.vcf", &body), 1, Some("chr22"));
         assert_eq!(dense.called["22"], vec![(1_000, 4_999), (5_001, 10_999)]);
         assert_eq!(dense.occupied["22"], vec![(5_000, 5_000)]);
         assert!(dense.all_sites("chr22") && dense.speaks.contains("22") && dense.n_sparse_ref == 0);
         // One every 10 kb (an array's monomorphic sites): reference calls of a file that is not
         // variant-only, and positions it speaks for.
         let body: String = (0..200).map(|i| format!("22\t{}\t.\tA\t.\t.\t.\t.\tGT:GQ\t0/0:35\n", 1_000 + i * 10_000)).collect();
-        let sparse = scan_ref_spans(&write_vcf(dir.path(), "s.vcf", &body), 1);
+        let sparse = scan_ref_spans(&write_vcf(dir.path(), "s.vcf", &body), 1, None);
         assert!(sparse.called.is_empty() && !sparse.all_sites("22") && sparse.speaks.is_empty());
         assert_eq!(sparse.n_sparse_ref, 200);
         assert_eq!(sparse.occupied["22"].len(), 200);
+        // Another contig's run still counts them (the variant-only test is genome-wide), keeping no spans.
+        let other = scan_ref_spans(&write_vcf(dir.path(), "s.vcf", &body), 1, Some("chr21"));
+        assert_eq!(other.n_sparse_ref, 200);
+        assert!(other.occupied.is_empty() && other.called.is_empty());
     }
 
     #[test]

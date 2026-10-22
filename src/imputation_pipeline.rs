@@ -791,7 +791,7 @@ fn load_and_intersect(args: &Args, target_path: &str, srp: &SrpReader) -> Loaded
     // Panel sites a variant-only input leaves out, read as reference where its caller looked.
     if !args.phase_only
         && let Some(plan) = selphi::io::variant_only::FillPlan::new(args.callable.as_deref(),
-            target_markers.iter().zip(target_genotypes.iter()), n_samples, target_path) {
+            target_markers.iter().zip(target_genotypes.iter()), n_samples, target_path, Some(srp.chromosome())) {
         all_sites = plan.reads_all_sites(srp.chromosome());
         let sites = plan.sites(srp, &target_markers, wgs_idx.len());
         if !sites.is_empty() {
