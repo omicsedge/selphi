@@ -313,6 +313,14 @@ pub struct Args {
     #[arg(long)]
     pub drop_long_alleles: bool,
 
+    /// What a target record its caller filtered (FILTER set and not PASS) means. `auto` (the
+    /// default): its calls are no-calls (the record keeps its place and is imputed; the
+    /// variant-only fill never reads it as reference; written back as no-calls when the panel
+    /// lacks the site), its likelihoods (lcWGS) are read as given. `missing`: its likelihoods are
+    /// flat too. `keep`: everything as given (as Beagle, GLIMPSE2 and SHAPEIT5 read it).
+    #[arg(long, value_parser = ["auto", "keep", "missing"])]
+    pub input_filter: Option<String>,
+
     /// Maximum candidates retained from per-window PBWT top-K selection.
     /// 0 = AUTO: scaled by panel size and panel diversity. Set explicitly to
     /// override the auto value.

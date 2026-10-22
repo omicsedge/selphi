@@ -234,12 +234,30 @@ pub fn detect_haploid_chrx(
     n_haps: usize,
     par_site: Option<&[bool]>,
 ) -> HashSet<usize> {
+    detect_haploid_chrx_with(alleles, n_var, n_samples, n_haps, par_site, &[])
+}
+
+/// Largest heterozygous share of a variant-only sample's own chrX calls (outside the PARs) that
+/// still reads as one X. Such a file lists ALT calls alone, so the rate over every call a genotyped
+/// sample is held to (1%) is a rate over its ALT calls here, which a diploid-calling pipeline on a
+/// man's X puts at a few percent: HG002 30x, DeepVariant 0.040, bcftools 0.094; HG001 (a woman)
+/// 0.59 (DeepVariant) and 0.57 (DRAGEN).
+pub const VARIANT_ONLY_HAPLOID_MAX_HET: f64 = 0.25;
+
+/// [`detect_haploid_chrx`] over the sites `skip` leaves (the PARs, and the sites a variant-only
+/// fill added as reference calls, which are no call of the sample's), with the samples in
+/// `variant_only` (whose own calls are ALT calls alone) held to [`VARIANT_ONLY_HAPLOID_MAX_HET`].
+/// An empty `variant_only` is every sample genotyped.
+pub fn detect_haploid_chrx_with(
+    alleles: &[u8], n_var: usize, n_samples: usize, n_haps: usize,
+    skip: Option<&[bool]>, variant_only: &[bool],
+) -> HashSet<usize> {
     let mut haploids = HashSet::new();
     for si in 0..n_samples {
         let mut n_het = 0u32;
         let mut n_total = 0u32;
         for v in 0..n_var {
-            if par_site.is_some_and(|p| p.get(v).copied().unwrap_or(false)) { continue; }
+            if skip.is_some_and(|p| p.get(v).copied().unwrap_or(false)) { continue; }
             let a0 = alleles[v * n_haps + si * 2];
             let a1 = alleles[v * n_haps + si * 2 + 1];
             // Count het ONLY among sites where both alleles are real (≤1). A half-missing
@@ -250,7 +268,8 @@ pub fn detect_haploid_chrx(
                 if a0 != a1 { n_het += 1; }
             }
         }
-        if n_total > 100 && (n_het as f64 / n_total as f64) < 0.01 {
+        let max_het = if variant_only.get(si).copied().unwrap_or(false) { VARIANT_ONLY_HAPLOID_MAX_HET } else { 0.01 };
+        if n_total > 100 && (n_het as f64 / n_total as f64) < max_het {
             haploids.insert(si);
         }
     }
@@ -439,6 +458,27 @@ mod par_tests {
         // None: 10/200 = 5% het (> 1%) → NOT detected (PAR hets inflate the rate).
         let h0 = detect_haploid_chrx(&alleles, n_var, 1, 2, None);
         assert!(!h0.contains(&0));
+    }
+
+    /// A variant-only man (ALT calls alone, 5% of them heterozygous) is one X; a woman's 55% is
+    /// not; sites a fill added are no evidence either way.
+    #[test]
+    fn variant_only_samples_use_their_alt_calls() {
+        let n_var = 1000usize;
+        let mut alleles = vec![1u8; n_var * 4];
+        for v in 0..50 { alleles[v * 4] = 0; }          // man: 50 of 1000 heterozygous
+        for v in 0..550 { alleles[v * 4 + 2] = 0; }     // woman: 550 of 1000
+        assert!(detect_haploid_chrx(&alleles, n_var, 2, 4, None).is_empty());
+        let h = detect_haploid_chrx_with(&alleles, n_var, 2, 4, None, &[true, true]);
+        assert!(h.contains(&0) && !h.contains(&1));
+        // 9,000 added 0/0 rows would put the woman at 5.5% of every call, under 25%; skipped,
+        // they leave her at 55%.
+        let mut more = alleles.clone();
+        more.extend(std::iter::repeat_n(0u8, 9000 * 4));
+        let skip: Vec<bool> = (0..10_000).map(|v| v >= n_var).collect();
+        let h = detect_haploid_chrx_with(&more, 10_000, 2, 4, Some(&skip), &[true, true]);
+        assert!(h.contains(&0) && !h.contains(&1));
+        assert!(detect_haploid_chrx_with(&more, 10_000, 2, 4, None, &[true, true]).contains(&1));
     }
 
     #[test]

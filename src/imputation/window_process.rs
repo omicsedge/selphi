@@ -365,15 +365,73 @@ fn called_sites(ctx: &PbwtCtx, tgt: usize) -> Option<Vec<usize>> {
 /// HMM no state, which the output would write as hom-REF).
 fn skip_or_follow(
     ctx: &PbwtCtx, tgt: usize, buf: Vec<u8>,
-    mut pbwt: impl FnMut(Option<&[usize]>, Vec<u8>) -> (pbwt::CscMatchMatrix, Vec<u8>),
+    mut pbwt: impl FnMut(Option<&[usize]>, Vec<u8>, usize) -> (pbwt::CscMatchMatrix, Vec<u8>),
 ) -> (pbwt::CscMatchMatrix, Vec<u8>, Option<Vec<usize>>) {
     let called = called_sites(ctx, tgt);
-    let (csc, buf) = pbwt(called.as_deref(), buf);
-    if called.is_some() && csc.indices.is_empty() {
-        let (csc, buf) = pbwt(None, buf);
-        return (csc, buf, None);
+    let (csc, buf) = pbwt(called.as_deref(), buf, ctx.match_length);
+    if !csc.indices.is_empty() { return (csc, buf, called); }
+    let (csc, buf) = if called.is_some() { pbwt(None, buf, ctx.match_length) } else { (csc, buf) };
+    if !csc.indices.is_empty() { return (csc, buf, None); }
+    // Still no match anywhere: a window with few typed sites (a handful of markers on a
+    // chromosome). Matches halved in length until one is found, then every panel haplotype as
+    // a state: empty weights would write hom-REF at every untyped site as if it were certain.
+    let mut buf = buf;
+    let mut ml = ctx.match_length.min(ctx.n_var_w.saturating_sub(1)).max(1);
+    if ml == ctx.match_length { ml /= 2; }
+    while ml >= 1 {
+        let (csc, b) = pbwt(None, buf, ml);
+        buf = b;
+        if !csc.indices.is_empty() {
+            note_short_window(ctx.n_var_w, Some(ml));
+            return (csc, buf, None);
+        }
+        ml /= 2;
     }
-    (csc, buf, called)
+    note_short_window(ctx.n_var_w, None);
+    (uniform_csc(ctx.n_ref, ctx.n_var_w), buf, None)
+}
+
+/// Match length of [`uniform_csc`]'s one entry: negative, which no real match is.
+const UNIFORM_MARK: i32 = i32::MIN;
+
+/// The marker for a target no PBWT match exists for at any length: one entry of match length
+/// [`UNIFORM_MARK`]. [`uniform_weights`] then gives it every panel haplotype at equal weight,
+/// without the HMM, whose top-K would keep only the first haplotypes of a uniform set.
+fn uniform_csc(n_ref: usize, n_var: usize) -> pbwt::CscMatchMatrix {
+    let mut csc = pbwt::CscMatchMatrix::empty(n_ref, n_var);
+    csc.indices = vec![0];
+    csc.data = vec![UNIFORM_MARK];
+    for p in csc.indptr.iter_mut().skip(1) { *p = 1; }
+    csc
+}
+
+/// Whether `csc` is [`uniform_csc`]'s marker.
+fn is_uniform(csc: &pbwt::CscMatchMatrix) -> bool { csc.data.first() == Some(&UNIFORM_MARK) }
+
+/// Copying weights of a target with no match: every one of the `n_ref` panel haplotypes, weight
+/// `1 / n_ref`, at each of `n_var` sites (its dosages are the panel's allele frequencies). Its
+/// posterior is empty, which clears the haplotype's prior for the next window.
+fn uniform_weights(n_ref: usize, n_var: usize, p_err: f64) -> HmmResult {
+    let w = 1.0 / n_ref.max(1) as f32;
+    let weights = CsrWeights {
+        indptr: (0..=n_var).map(|v| (v * n_ref) as i32).collect(),
+        indices: (0..n_var).flat_map(|_| 0..n_ref as i32).collect(),
+        data: vec![w; n_ref * n_var],
+        n_rows: n_var, n_cols: n_ref,
+    };
+    HmmResult { weights: vec![(0, weights)], hap_posterior: Some(Vec::new()), perr_floor: p_err, p_err, unmatched: None }
+}
+
+/// Log, once per run, a window too short for a PBWT match of the run's length.
+fn note_short_window(n_var: usize, shorter: Option<usize>) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SAID.swap(true, std::sync::atomic::Ordering::Relaxed) { return; }
+    match shorter {
+        Some(ml) => crate::selphi_step!("{}", crate::log::yellow(&format!(
+            "A window holds {n_var} typed site(s) and a target no PBWT match of the run's length: matches of {ml} used there"))),
+        None => crate::selphi_step!("{}", crate::log::yellow(&format!(
+            "A window holds {n_var} typed site(s) and no PBWT match: every panel haplotype is a state there (its dosages are close to the panel's frequencies)"))),
+    }
 }
 
 /// Allele rows restricted to `sites` (row `k` = the inner row of `sites[k]`).
@@ -711,11 +769,11 @@ fn full_panel_rows<'a>(ctx: &PbwtCtx<'a>, buf: Vec<u8>) -> FullRows<'a> {
 fn full_panel_csc(
     ctx: &PbwtCtx, tgt: usize, buf: Vec<u8>, keep: Option<&[u64]>,
 ) -> (pbwt::CscMatchMatrix, Vec<u8>, Option<Vec<usize>>) {
-    skip_or_follow(ctx, tgt, buf, |called, buf| full_panel_csc_over(ctx, tgt, buf, keep, called))
+    skip_or_follow(ctx, tgt, buf, |called, buf, ml| full_panel_csc_over(ctx, tgt, buf, keep, called, ml))
 }
 
 fn full_panel_csc_over(
-    ctx: &PbwtCtx, tgt: usize, buf: Vec<u8>, keep: Option<&[u64]>, called: Option<&[usize]>,
+    ctx: &PbwtCtx, tgt: usize, buf: Vec<u8>, keep: Option<&[u64]>, called: Option<&[usize]>, ml: usize,
 ) -> (pbwt::CscMatchMatrix, Vec<u8>) {
     let m = ctx.n_ref + ctx.n_haps;
     let mut rows = full_panel_rows(ctx, buf);
@@ -728,7 +786,7 @@ fn full_panel_csc_over(
         let mut ws_opt = cell.borrow_mut();
         let ws = ws_opt.get_or_insert_with(|| pbwt::PbwtWorkspace::new(m, ctx.n_ref));
         if ws.capacity() < m { *ws = pbwt::PbwtWorkspace::new(m, ctx.n_ref); }
-        let (nr, ml, ff) = (ctx.n_ref, ctx.match_length, ctx.fl_fwd);
+        let (nr, ff) = (ctx.n_ref, ctx.fl_fwd);
         let tgt_abs = (ctx.n_ref + tgt) as i32;
         // Skipping the no-calls replaces following through them.
         let miss = if called.is_some() { None } else { ctx.miss.get(tgt).and_then(|o| o.as_deref()) };
@@ -757,11 +815,11 @@ fn full_panel_csc_over(
 fn reduced_csc(
     ctx: &PbwtCtx, tgt: usize, candidates: &[u32], buf: Vec<u8>,
 ) -> (pbwt::CscMatchMatrix, Vec<u8>, Option<Vec<usize>>) {
-    skip_or_follow(ctx, tgt, buf, |called, buf| reduced_csc_over(ctx, tgt, candidates, buf, called))
+    skip_or_follow(ctx, tgt, buf, |called, buf, ml| reduced_csc_over(ctx, tgt, candidates, buf, called, ml))
 }
 
 fn reduced_csc_over(
-    ctx: &PbwtCtx, tgt: usize, candidates: &[u32], buf: Vec<u8>, called: Option<&[usize]>,
+    ctx: &PbwtCtx, tgt: usize, candidates: &[u32], buf: Vec<u8>, called: Option<&[usize]>, ml: usize,
 ) -> (pbwt::CscMatchMatrix, Vec<u8>) {
     struct GatherRows<'a> {
         bm: &'a HaplotypeBitmatrix, chip_start: usize, candidates: &'a [u32],
@@ -802,7 +860,7 @@ fn reduced_csc_over(
             None => &mut rows,
         };
         pbwt::pbwt_forward_with_workspace(
-            ws, rows_dyn, nv, m_red, n_cand, ctx.match_length, ctx.fl_fwd, n_cand as i32, miss,
+            ws, rows_dyn, nv, m_red, n_cand, ml, ctx.fl_fwd, n_cand as i32, miss,
         )
     });
     let bwd = pbwt::backward_filter_single(&fwd, nv, n_cand, ctx.fl_fwd, ctx.fl_bwd);
@@ -1039,6 +1097,7 @@ pub fn process_window_hmm(
         // sites alone would allow; the model is the uncompressed one either way).
         // `SELPHI_NOCALL_DEDUP_OFF=1`: no dedup for such a target (the previous behaviour).
         let finish = |tgt: usize, csc: &pbwt::CscMatchMatrix, called: Option<&[usize]>| -> (usize, HmmResult) {
+            if is_uniform(csc) { return (tgt, uniform_weights(n_ref, n_var_w, carry_view[tgt].p_err.unwrap_or(p_err))); }
             let prior = carry_view[tgt].prior.as_deref();
             // R4 per-hap emission confidence: hap `tgt` belongs to sample tgt/2.
             // Extract that sample's column [var * n_samples + tgt/2] for v in
@@ -1207,7 +1266,10 @@ pub fn process_window_hmm(
             }).collect();
             STAGE_PBWT_US.fetch_add(t_pbwt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 
-            chunk.iter().zip(cscs.iter()).map(|(&t, csc)| finish(t, csc, None)).collect()
+            // A target the shared sort found no match for takes its own path, whose shorter
+            // matches (`skip_or_follow`) give it states; the result is the unshared one.
+            chunk.iter().zip(cscs.iter())
+                .map(|(&t, csc)| if csc.indices.is_empty() { per_target(t) } else { finish(t, csc, None) }).collect()
         };
 
         let share = resolve_share(n_var_w, fl_fwd, n_ref, batch_end - batch_start, max_candidates);
@@ -1241,8 +1303,9 @@ pub fn process_window_hmm(
             let mut batch_weights: Vec<Vec<(usize, super::hmm::CsrWeights)>> = Vec::with_capacity(batch_end - batch_start);
             for (tgt, r) in batch_results {
                 carry_update(&mut carry[tgt], &r, p_err, adapt.is_some(), &mut adapt_stats);
+                // An empty posterior (`uniform_weights`) says nothing about the next window.
                 if let Some(post) = r.hap_posterior {
-                    carry[tgt].prior = Some(post);
+                    carry[tgt].prior = (!post.is_empty()).then_some(post);
                 }
                 batch_weights.push(r.weights);
             }
@@ -1254,8 +1317,9 @@ pub fn process_window_hmm(
         } else {
             for (tgt, r) in batch_results {
                 carry_update(&mut carry[tgt], &r, p_err, adapt.is_some(), &mut adapt_stats);
+                // An empty posterior (`uniform_weights`) says nothing about the next window.
                 if let Some(post) = r.hap_posterior {
-                    carry[tgt].prior = Some(post);
+                    carry[tgt].prior = (!post.is_empty()).then_some(post);
                 }
                 all_weights.push(r.weights);
             }
@@ -1387,6 +1451,26 @@ mod expand_tests {
         assert_eq!(e.indptr, vec![0, 1, 3, 4]);
         assert_eq!(e.indices, vec![0, 0, 1, 1]);
         assert_eq!(e.data, vec![1.0, 0.9, 0.1, 1.0]);
+    }
+}
+
+#[cfg(test)]
+mod short_window_tests {
+    use super::{is_uniform, uniform_csc, uniform_weights};
+
+    /// The marker is recognised (no real match has length 0), and the weights put every panel
+    /// haplotype at 1/n_ref on every row.
+    #[test]
+    fn uniform_states_cover_the_panel() {
+        let c = uniform_csc(3, 2);
+        assert!(is_uniform(&c) && (c.n_rows, c.n_cols) == (3, 2) && c.indptr == vec![0, 1, 1]);
+        let mut real = crate::imputation::pbwt::CscMatchMatrix::empty(3, 2);
+        real.indices = vec![1]; real.data = vec![0]; real.indptr = vec![0, 1, 1];
+        assert!(!is_uniform(&real) && !is_uniform(&crate::imputation::pbwt::CscMatchMatrix::empty(3, 2)));
+        let w = &uniform_weights(4, 2, 0.025).weights[0].1;
+        assert_eq!(w.indptr, vec![0, 4, 8]);
+        assert_eq!(w.indices, vec![0, 1, 2, 3, 0, 1, 2, 3]);
+        assert!(w.data.iter().all(|&x| x == 0.25) && (w.n_rows, w.n_cols) == (2, 4));
     }
 }
 

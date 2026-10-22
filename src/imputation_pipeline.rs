@@ -1100,12 +1100,18 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         &sample_names, &target_idx, &target_genotypes,
         n_chip, n_samples, n_haps, &allele_transforms,
     );
+    let filled_mask = selphi::io::variant_only::filled_mask(&wgs_idx, &filled_typed);
+    // Split multi-allelic parts, for the chrX sex test's variant-only count.
+    let split_mask = if selphi::contig::is_chrx(srp.chromosome()) {
+        selphi::io::variant_only::split_rows(&target_markers, &target_idx)
+    } else { Vec::new() };
     let haploid_resets = crate::prephase::apply_haploid_detection(
         args.haploids.as_deref(), !args.chrx_no_par, args.build,
         needs_phasing, srp.chromosome(), &mut targ_alleles,
         &sample_names, &target_idx, &target_genotypes,
         n_chip, n_samples, n_haps, &chip_bps,
         ref_positions.iter().copied().max().unwrap_or(0),
+        &filled_mask, &split_mask,
     );
     crate::prephase::mark_nocalls(&haploid_resets, n_chip, n_samples,
         &mut target_site_conf, &mut target_site_conf_per_sample);
@@ -1113,7 +1119,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     if par_conf < 1.0 {
         let par_calls = crate::prephase::collapsed_par_calls(
             !args.chrx_no_par, args.build, srp.chromosome(), &target_idx, &target_genotypes,
-            n_chip, n_samples, &chip_bps, ref_positions.iter().copied().max().unwrap_or(0));
+            n_chip, n_samples, &chip_bps, ref_positions.iter().copied().max().unwrap_or(0), &filled_mask, &split_mask);
         crate::prephase::soften_calls(&par_calls, par_conf, n_chip, n_samples,
             &mut target_site_conf, &mut target_site_conf_per_sample);
     }

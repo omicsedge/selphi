@@ -54,6 +54,10 @@ pub fn apply_pedigree_prephase(
 /// user-supplied `--haploids` list) and reset their heterozygous calls to
 /// missing so the HMM can re-impute the correct homozygous genotype.
 /// No-op when the target is already phased, or off chrX with no explicit list.
+/// `filled` (per chip site, empty without a fill) marks the panel sites a
+/// variant-only input's omissions were read as reference at: no call of the
+/// sample's, so no part of the het rate. `split` (per chip site, may be empty)
+/// marks the parts of split multi-allelic records (`variant_only::split_rows`).
 #[allow(clippy::too_many_arguments)]
 pub fn apply_haploid_detection(
     haploids_path: Option<&str>, chrx_par: bool, build: BuildArg,
@@ -64,6 +68,8 @@ pub fn apply_haploid_detection(
     n_chip: usize, n_samples: usize, n_haps: usize,
     chip_bps: &[i64],
     panel_max_pos: i64,
+    filled: &[bool],
+    split: &[bool],
 ) -> Vec<(usize, usize)> {
     if !needs_phasing { return Vec::new(); }
     // Superset of the historical literal test (chr-prefix-tolerant / case-insensitive),
@@ -93,7 +99,9 @@ pub fn apply_haploid_detection(
         selphi::diploid::pedigree::parse_haploids(Path::new(hap_path), sample_names)
             .unwrap_or_else(|e| { selphi_error!("Cannot read haploids file: {}", e); std::process::exit(1); })
     } else if is_chrx {
-        selphi::diploid::pedigree::detect_haploid_chrx(targ_alleles, n_chip, n_samples, n_haps, par_ref)
+        let skip = skip_mask(par_ref, filled, n_chip);
+        let variant_only = fill_variant_only(target_idx, target_genotypes, n_samples, skip.as_deref(), filled, split);
+        selphi::diploid::pedigree::detect_haploid_chrx_with(targ_alleles, n_chip, n_samples, n_haps, skip.as_deref(), &variant_only)
     } else {
         return Vec::new();
     };
@@ -121,6 +129,46 @@ pub fn apply_haploid_detection(
             detect_method, haploid_samples.len(), n_reset);
     }
     reset
+}
+
+/// The chip sites a chrX sex test leaves out: the PARs and the sites a fill added (`None` when
+/// neither applies, the historical whole-chromosome count).
+fn skip_mask(par: Option<&[bool]>, filled: &[bool], n_chip: usize) -> Option<Vec<bool>> {
+    if filled.is_empty() { return par.map(<[bool]>::to_vec); }
+    Some((0..n_chip).map(|c| par.is_some_and(|p| p[c]) || filled[c]).collect())
+}
+
+/// [`variant_only_samples`] when the run read a variant-only input's omissions as reference
+/// (`filled` not empty), else none: without a fill a man's chrX was judged over his ALT calls at
+/// 1% before, and holding him to 25% instead (one X) moved HG002 30x chrX (1kGP panel) by
+/// -0.0012 (DeepVariant) and +0.0029 (bcftools); with the fill his own calls are all the test sees.
+fn fill_variant_only(
+    target_idx: &[usize], target_genotypes: &[Vec<[u8; 2]>], n_samples: usize, skip: Option<&[bool]>,
+    filled: &[bool], split: &[bool],
+) -> Vec<bool> {
+    if filled.is_empty() { return Vec::new(); }
+    variant_only_samples(target_idx, target_genotypes, n_samples, skip, split)
+}
+
+/// Per sample, whether its own calls at the sites `skip` leaves are ALT calls alone (a variant-only
+/// file: `variant_only::is_variant_only` on that sample). As in `variant_only::call_counts`, the
+/// parts of a split multi-allelic record (`split`, `variant_only::split_rows`) are left out: they
+/// write 0/0 for the ALTs a sample does not carry.
+fn variant_only_samples(
+    target_idx: &[usize], target_genotypes: &[Vec<[u8; 2]>], n_samples: usize, skip: Option<&[bool]>,
+    split: &[bool],
+) -> Vec<bool> {
+    let called = |g: [u8; 2]| g[0] < selphi::io::target_io::GT_MISSING && g[1] < selphi::io::target_io::GT_MISSING;
+    (0..n_samples).map(|s| {
+        let (mut homref, mut alt) = (0usize, 0usize);
+        for (c, &ti) in target_idx.iter().enumerate() {
+            if skip.is_some_and(|k| k[c]) || split.get(c).copied().unwrap_or(false) { continue; }
+            let g = target_genotypes[ti][s];
+            if !called(g) { continue; }
+            if g == [0, 0] { homref += 1 } else { alt += 1 }
+        }
+        selphi::io::variant_only::is_variant_only(1, homref, alt)
+    }).collect()
 }
 
 /// Mark `(chip site, sample)` pairs as no-calls in the re-route confidence: the
@@ -161,6 +209,7 @@ pub fn collapsed_par_calls(
     chrx_par: bool, build: BuildArg, chr: &str,
     target_idx: &[usize], target_genotypes: &[Vec<[u8; 2]>],
     n_chip: usize, n_samples: usize, chip_bps: &[i64], panel_max_pos: i64,
+    filled: &[bool], split: &[bool],
 ) -> Vec<(usize, usize)> {
     if !chrx_par || !selphi::contig::is_chrx(chr) { return Vec::new(); }
     use selphi::contig::Build;
@@ -171,17 +220,24 @@ pub fn collapsed_par_calls(
     };
     let par: Vec<bool> = chip_bps.iter().map(|&p| selphi::contig::in_chrx_par(p, build)).collect();
     let called = |g: [u8; 2]| g[0] < selphi::io::target_io::GT_MISSING && g[1] < selphi::io::target_io::GT_MISSING;
+    let is_filled = |c: usize| filled.get(c).copied().unwrap_or(false);
+    let skip = skip_mask(Some(&par), filled, n_chip);
+    let variant_only = fill_variant_only(target_idx, target_genotypes, n_samples, skip.as_deref(), filled, split);
     let mut out = Vec::new();
     for s in 0..n_samples {
         let (mut par_n, mut par_het, mut x_n, mut x_het) = (0usize, 0usize, 0usize, 0usize);
         for c in 0..n_chip {
+            if is_filled(c) { continue; }
             let g = target_genotypes[target_idx[c]][s];
             if !called(g) { continue; }
             let het = g[0] != g[1];
             if par[c] { par_n += 1; par_het += het as usize; } else { x_n += 1; x_het += het as usize; }
         }
-        let male = x_n > 100 && (x_het as f64) < 0.01 * x_n as f64;
+        let max_het = if variant_only.get(s).copied().unwrap_or(false) { selphi::diploid::pedigree::VARIANT_ONLY_HAPLOID_MAX_HET } else { 0.01 };
+        let male = x_n > 100 && (x_het as f64) < max_het * x_n as f64;
         if male && par_het == 0 && par_n >= PAR_COLLAPSED_MIN_SITES {
+            // His filled PAR sites too: an omission there says only that his one written allele
+            // is the reference.
             out.extend((0..n_chip).filter(|&c| par[c] && called(target_genotypes[target_idx[c]][s])).map(|c| (c, s)));
         }
     }
@@ -238,10 +294,10 @@ mod tests {
             if c % 4 == 0 { [0, 1] } else { hom(c) },                 // woman
         ]).collect();
         let idx: Vec<usize> = (0..n).collect();
-        let got = collapsed_par_calls(true, BuildArg::Grch38, "chrX", &idx, &samples, n, 3, &bps, 156_000_000);
+        let got = collapsed_par_calls(true, BuildArg::Grch38, "chrX", &idx, &samples, n, 3, &bps, 156_000_000, &[], &[]);
         assert_eq!(got.len(), 60);
         assert!(got.iter().all(|&(c, s)| s == 0 && c < 60));
-        assert!(collapsed_par_calls(false, BuildArg::Grch38, "chrX", &idx, &samples, n, 3, &bps, 156_000_000).is_empty());
-        assert!(collapsed_par_calls(true, BuildArg::Grch38, "chr22", &idx, &samples, n, 3, &bps, 156_000_000).is_empty());
+        assert!(collapsed_par_calls(false, BuildArg::Grch38, "chrX", &idx, &samples, n, 3, &bps, 156_000_000, &[], &[]).is_empty());
+        assert!(collapsed_par_calls(true, BuildArg::Grch38, "chr22", &idx, &samples, n, 3, &bps, 156_000_000, &[], &[]).is_empty());
     }
 }

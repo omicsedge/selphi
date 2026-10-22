@@ -48,6 +48,10 @@ fn main() {
     if args.drop_long_alleles {
         unsafe { std::env::set_var("SELPHI_DROP_LONG_ALLELES", "1"); }
     }
+    // --input-filter is a CLI flag over SELPHI_INPUT_FILTER (read by io::target_io and every reader).
+    if let Some(f) = args.input_filter.as_deref() {
+        unsafe { std::env::set_var("SELPHI_INPUT_FILTER", f); }
+    }
 
     // --dump-config: print the full effective configuration (after --config + env) and exit.
     if args.dump_config {

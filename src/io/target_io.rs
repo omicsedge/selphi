@@ -285,7 +285,49 @@ struct VcfFields<'a> {
     /// Position of GT among the record's FORMAT subfields (`None`: no GT). The VCF
     /// specification puts it first; a file that does not is read by the key.
     gt_index: Option<usize>,
+    /// The caller filtered the record: FILTER is set and is not PASS ([`input_filter_missing`]).
+    failed: bool,
 }
+
+/// `--input-filter` (`SELPHI_INPUT_FILTER`): whether a target record its caller filtered (FILTER
+/// set and not PASS) has its CALLS read as missing. They are under `auto` (the default) and
+/// `missing`: the record keeps its position, the no-call path imputes it, and the variant-only fill
+/// never writes the position as reference. DeepVariant 30x chr22, whose RefCall records are 0/0
+/// and ./. calls: HG001 per-sample R2 0.98983 -> 0.99637, false ALT 1,075 -> 484; DRAGEN HG001
+/// 0.99811 -> 0.99871, false ALT 346 -> 297. `keep` reads them as given (as Beagle, GLIMPSE2 and
+/// SHAPEIT5 do). Likelihoods are [`likelihoods_filter_missing`]'s.
+pub fn input_filter_missing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::config::raw("SELPHI_INPUT_FILTER").is_some_and(|v| v.trim().eq_ignore_ascii_case("keep")))
+}
+
+/// Whether a filtered record's LIKELIHOODS (the lcWGS readers) are flat: only under `missing`. The
+/// lcWGS engine weighs a likelihood by its own values; flattening a filtered record's measured
+/// within noise there (DRAGEN HG001 chr22: 0.98995 -> 0.98980), so `auto` keeps them.
+pub fn likelihoods_filter_missing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::config::raw("SELPHI_INPUT_FILTER").is_some_and(|v| v.trim().eq_ignore_ascii_case("missing")))
+}
+
+/// Every call of a filtered record read as missing (unless `--input-filter keep`).
+fn as_missing(raw: &mut [[u8; 2]], unph: &mut Vec<u32>) {
+    for g in raw.iter_mut() { *g = [RAW_MISSING, RAW_MISSING]; }
+    unph.clear();
+}
+
+/// One log line for the records read as missing for their FILTER.
+fn log_filtered(n: usize) {
+    if n > 0 {
+        selphi_info!("  {} filtered target record(s) (FILTER not PASS) read as no-calls (--input-filter keep reads them as given)", n);
+    }
+}
+
+/// A text FILTER column that marks a filtered record (set, and not PASS).
+#[inline]
+pub fn filter_failed(filter: &[u8]) -> bool { !(filter.is_empty() || filter == b"." || filter == b"PASS") }
+
+/// A record's filters that mark it filtered (any set, other than PASS alone).
+pub fn filters_failed<'a>(mut ids: impl Iterator<Item = &'a str>) -> bool { ids.any(|f| f != "PASS" && f != ".") }
 
 /// Position of `GT` in a FORMAT spec, `Some(0)` without a scan when it leads.
 #[inline]
@@ -328,6 +370,7 @@ fn split_vcf_fields(line: &[u8]) -> Option<VcfFields<'_>> {
         multiallelic: alt_end < alt_field.len(),
         gt_region: &line[tabs[8] + 1..],
         gt_index: gt_position(&line[tabs[7] + 1..tabs[8]]),
+        failed: filter_failed(&line[tabs[5] + 1..tabs[6]]),
     })
 }
 
@@ -706,6 +749,7 @@ fn read_target_bcf(
     let mut n_multiallelic = 0usize;
     // Allele index -> raw code of parse_gt_raw (missing = RAW_MISSING, clamped to 254).
     let code = |p: Option<usize>| p.map(|p| p.min(254) as u8).unwrap_or(RAW_MISSING);
+    let (filter_missing, mut n_filtered) = (input_filter_missing(), 0usize);
 
     for result in reader.record_bufs(&header) {
         let rec = match result { Ok(r) => r, Err(_) => continue };
@@ -747,6 +791,10 @@ fn read_target_bcf(
             };
             raw.push(pair);
         }
+        if !capture_id && filter_missing && filters_failed(rec.filters().as_ref().iter().map(String::as_str)) {
+            as_missing(&mut raw, &mut unph);
+            n_filtered += 1;
+        }
         unphased_het |= !unph.is_empty();
         if capture_id {
             // Cohort (panel phasing): first ALT, REF vs any ALT, variant ID kept.
@@ -761,6 +809,7 @@ fn read_target_bcf(
             push_target_record(&chrom, pos, &ref_allele, &alts, raw, hash_alleles, &unph, &mut markers, &mut genotypes);
         }
     }
+    log_filtered(n_filtered);
     if n_multiallelic > 0 {
         if capture_id {
             selphi_info!("  WARNING: {} multi-allelic sites — kept first ALT, genotypes binarised (ref vs any-alt). Split multiallelics beforehand for exact handling.", n_multiallelic);
@@ -800,6 +849,7 @@ pub fn read_target_vcf(
     let mut unph: Vec<u32> = Vec::new();
     let mut sample_names: Vec<String> = Vec::new();
     let mut n_multiallelic = 0usize;
+    let (filter_missing, mut n_filtered) = (input_filter_missing(), 0usize);
 
     // Parse from byte buffer — zero per-line allocations
     while let Some(line) = lines.next_line() {
@@ -816,7 +866,8 @@ pub fn read_target_vcf(
 
         let Some(f) = split_vcf_fields(line) else { continue };
         unph.clear();
-        let raw_gt = parse_gt_raw(f.gt_region, sample_names.len(), f.gt_index, &mut unph);
+        let mut raw_gt = parse_gt_raw(f.gt_region, sample_names.len(), f.gt_index, &mut unph);
+        if f.failed && filter_missing { as_missing(&mut raw_gt, &mut unph); n_filtered += 1; }
         unphased_het |= !unph.is_empty();
         if f.multiallelic {
             n_multiallelic += 1;
@@ -834,6 +885,7 @@ pub fn read_target_vcf(
     if n_multiallelic > 0 {
         selphi_info!("  {} multi-allelic target record(s) split into one biallelic marker per ALT (bcftools norm -m- convention)", n_multiallelic);
     }
+    log_filtered(n_filtered);
 
     (sample_names, markers, genotypes, !unphased_het)
 }
@@ -1251,6 +1303,8 @@ pub fn extract_target_site_confidence(path: &str) -> Vec<f64> {
         // Identical retention rule to read_target_vcf, one row per marker it makes.
         let Some(f) = split_vcf_fields(line) else { continue };
         let c = match vcf_format_bytes(line) {
+            // A filtered record's calls are read as missing (`input_filter_missing`): no confidence.
+            _ if f.failed && input_filter_missing() => 0.0,
             Some(fmt) => line_min_confidence(fmt, f.gt_region, n_samples, gq_lo, gq_hi),
             None => 1.0,
         };
@@ -1353,7 +1407,8 @@ fn extract_site_confidence_bcf(path: &str, gq_lo: f64, gq_hi: f64) -> Vec<f64> {
             if c < min_c { min_c = c; }
         }
         let k = n_target_markers(rec.alternate_bases().as_ref().iter().map(|a| a.as_str()));
-        conf.extend(std::iter::repeat_n(if any_field && min_c.is_finite() { min_c } else { 1.0 }, k));
+        let failed = input_filter_missing() && filters_failed(rec.filters().as_ref().iter().map(String::as_str));
+        conf.extend(std::iter::repeat_n(if failed { 0.0 } else if any_field && min_c.is_finite() { min_c } else { 1.0 }, k));
     }
     conf
 }
@@ -1388,6 +1443,7 @@ pub fn extract_target_site_confidence_per_sample(path: &str) -> (Vec<f64>, usize
         let Some(f) = split_vcf_fields(line) else { continue };
         let row = conf.len();
         match vcf_format_bytes(line) {
+            _ if f.failed && input_filter_missing() => conf.extend(std::iter::repeat_n(0.0f64, n_samples)),
             Some(fmt) => line_per_sample_confidence(fmt, f.gt_region, n_samples, gq_lo, gq_hi, &mut conf),
             None => conf.extend(std::iter::repeat_n(1.0f64, n_samples)),
         }
@@ -1445,6 +1501,9 @@ fn extract_site_confidence_per_sample_bcf(path: &str, gq_lo: f64, gq_hi: f64) ->
             };
             conf.push(sample_confidence(gt_missing, gq, pl, dp, gq_lo, gq_hi));
             row_n += 1;
+        }
+        if input_filter_missing() && filters_failed(rec.filters().as_ref().iter().map(String::as_str)) {
+            for c in &mut conf[row..] { *c = 0.0; }
         }
         // One row per marker read_target_bcf makes of this record.
         let k = n_target_markers(rec.alternate_bases().as_ref().iter().map(|a| a.as_str()));
@@ -1800,6 +1859,7 @@ pub fn read_target_vcf_multi_chr(
     let mut unph: Vec<u32> = Vec::new();
     let mut sample_names: Vec<String> = Vec::new();
     let mut n_multiallelic = 0usize;
+    let (filter_missing, mut n_filtered) = (input_filter_missing(), 0usize);
 
     while let Some(line) = lines.next_line() {
         if line.is_empty() || line.starts_with(b"##") { continue; }
@@ -1815,7 +1875,8 @@ pub fn read_target_vcf_multi_chr(
 
         let Some(f) = split_vcf_fields(line) else { continue };
         unph.clear();
-        let raw_gt = parse_gt_raw(f.gt_region, sample_names.len(), f.gt_index, &mut unph);
+        let mut raw_gt = parse_gt_raw(f.gt_region, sample_names.len(), f.gt_index, &mut unph);
+        if f.failed && filter_missing { as_missing(&mut raw_gt, &mut unph); n_filtered += 1; }
         unphased_het |= !unph.is_empty();
         if f.multiallelic {
             n_multiallelic += 1;
@@ -1825,6 +1886,7 @@ pub fn read_target_vcf_multi_chr(
             push_target_record(f.chrom, f.pos, f.ref_allele, &[f.alt_allele], raw_gt, false, &unph, &mut all_markers, &mut all_genotypes);
         }
     }
+    log_filtered(n_filtered);
 
     // Partition by chromosome
     let mut by_chr: std::collections::BTreeMap<String, (Vec<TargetMarker>, Vec<Vec<[u8; 2]>>)> =

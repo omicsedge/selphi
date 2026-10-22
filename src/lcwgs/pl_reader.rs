@@ -384,13 +384,15 @@ fn parse_pl_bcf(path: &str, hash_alleles_against_srp: bool, keep: Option<&BlockS
             let alts: Vec<&[u8]> = alts.iter().filter(|a| a.as_str() != "." && !a.is_empty()).map(|a| a.as_bytes()).collect();
             let end = match rec.info().get("END") { Some(Some(Iv::Integer(e))) => Some(i64::from(*e)), _ => None };
             let samples = rec.samples();
-            let fields: Vec<SampleFields> = samples.values().take(n_samples).map(|sample| SampleFields {
+            let filtered = crate::io::target_io::likelihoods_filter_missing()
+                && crate::io::target_io::filters_failed(rec.filters().as_ref().iter().map(String::as_str));
+            let fields: Vec<SampleFields> = samples.values().take(n_samples).map(|sample| if filtered { SampleFields::default() } else { SampleFields {
                 pl: bcf_sample_pl(&sample),
                 gt: match sample.get("GT").flatten() {
                     Some(Value::Genotype(g)) => Some(g.as_ref().iter().map(|a| a.position().map(|p| p as u32)).collect()),
                     _ => None },
                 dp: match sample.get("DP").flatten() { Some(Value::Integer(d)) => Some(*d), _ => None },
-            }).collect();
+            } }).collect();
             let r = SlowRecord { chrom: rec.reference_sequence_name().as_bytes(), pos, ref_bytes: rec.reference_bases().as_bytes(), alts, end };
             slow_record(&r, &fields, n_samples, hash_alleles_against_srp, on_contig(r.chrom, keep), &mut body);
             if let Some(k) = keep { keep_block(&r, &fields, n_samples, k, &mut body); }
@@ -412,10 +414,15 @@ fn parse_pl_bcf(path: &str, hash_alleles_against_srp: bool, keep: Option<&BlockS
         body.gl3.resize(gl_off + n_samples * 3, 1.0 / 3.0);
 
         let samples = rec.samples();
+        // Under --input-filter missing a filtered record keeps its site with flat likelihoods.
+        let bcf_filtered = crate::io::target_io::likelihoods_filter_missing()
+            && crate::io::target_io::filters_failed(rec.filters().as_ref().iter().map(String::as_str));
         for (s, sample) in samples.values().enumerate() {
             if s >= n_samples { break; }
-            let pl_opt = sample.get("PL").flatten().and_then(bcf_value_to_pl3)
-                .or_else(|| bcf_sample_pl(&sample).as_deref().and_then(pl_list_field));
+            let pl_opt = if bcf_filtered { None } else {
+                sample.get("PL").flatten().and_then(bcf_value_to_pl3)
+                    .or_else(|| bcf_sample_pl(&sample).as_deref().and_then(pl_list_field))
+            };
             if here && pl_opt.is_some_and(|p| p.1) { body.haploid_samples[s] = true; }
             let (_, glp, valid) = pl_to_hl_gl3(pl_opt.map(|p| p.0));
             if !valid { body.n_missing_pl += 1; }
@@ -779,14 +786,16 @@ fn parse_record_line(line: &[u8], n_samples: usize, hash_alleles_against_srp: bo
         let (pl_i, gt_i, dp_i) = (find_format_subfield(format_bytes, b"PL"), find_format_subfield(format_bytes, b"GT"),
             find_format_subfield(format_bytes, b"DP"));
         let gl_i = find_format_subfield(format_bytes, b"GL");
-        let fields: Vec<SampleFields> = line[tabs[8]+1..].split(|&b| b == b'\t').take(n_samples).map(|field| SampleFields {
+        // Under --input-filter missing a filtered record keeps its sites with flat likelihoods.
+        let filtered = crate::io::target_io::likelihoods_filter_missing() && crate::io::target_io::filter_failed(&line[tabs[5]+1..tabs[6]]);
+        let fields: Vec<SampleFields> = line[tabs[8]+1..].split(|&b| b == b'\t').take(n_samples).map(|field| if filtered { SampleFields::default() } else { SampleFields {
             pl: pl_i.and_then(|i| extract_subfield(field, i)).filter(|p| *p != b".")
                 .and_then(|p| p.split(|&b| b == b',').map(|x| { let v = fast_parse_i32(x); (v >= 0).then_some(v) }).collect())
                 .or_else(|| gl_i.and_then(|i| extract_subfield(field, i)).and_then(parse_gl_text)),
             gt: gt_i.and_then(|i| extract_subfield(field, i)).map(|g| g.split(|&b| b == b'/' || b == b'|')
                 .map(|a| std::str::from_utf8(a).ok()?.parse::<u32>().ok()).collect()),
             dp: dp_i.and_then(|i| extract_subfield(field, i)).map(fast_parse_i32).filter(|&d| d >= 0),
-        }).collect();
+        } }).collect();
         let r = SlowRecord { chrom: &line[..tabs[0]], pos, ref_bytes: &line[tabs[2]+1..tabs[3]], alts, end };
         slow_record(&r, &fields, n_samples, hash_alleles_against_srp, on_contig(r.chrom, keep), out);
         if let Some(k) = keep { keep_block(&r, &fields, n_samples, k, out); }
@@ -796,9 +805,11 @@ fn parse_record_line(line: &[u8], n_samples: usize, hash_alleles_against_srp: bo
 
     // FORMAT subfield index for PL
     let format_bytes = &line[tabs[7]+1..tabs[8]];
-    let pl_pos = find_format_subfield(format_bytes, b"PL");
+    // Under --input-filter missing a filtered record keeps its site with flat likelihoods.
+    let filtered = crate::io::target_io::likelihoods_filter_missing() && crate::io::target_io::filter_failed(&line[tabs[5]+1..tabs[6]]);
+    let pl_pos = find_format_subfield(format_bytes, b"PL").filter(|_| !filtered);
     // Where PL is absent or missing, GL read as PL.
-    let gl_pos = find_format_subfield(format_bytes, b"GL");
+    let gl_pos = find_format_subfield(format_bytes, b"GL").filter(|_| !filtered);
 
     // Allocate marker (one String triple per variant — unavoidable)
     let ref_allele = std::str::from_utf8(ref_bytes).unwrap_or("").to_string();

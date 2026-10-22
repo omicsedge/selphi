@@ -138,6 +138,10 @@ fn regions(contig: &str, markers: &[&TargetMarker], callable: Option<&Callable>,
     Some(out)
 }
 
+/// Whether chromosome X's omissions are read as reference too (`SELPHI_VARIANT_ONLY_CHRX`, default
+/// on; 0 = off). The sex test leaves the added sites out (`prephase::apply_haploid_detection`).
+fn chrx_fill() -> bool { crate::config::raw("SELPHI_VARIANT_ONLY_CHRX").as_deref() != Some("0") }
+
 /// Panel indices of this contig's sites to add as 0/0 calls (empty when none apply).
 pub fn reference_sites(
     srp: &SrpReader, markers: &[TargetMarker], callable: Option<&Callable>, variant_only: bool,
@@ -145,7 +149,7 @@ pub fn reference_sites(
 ) -> Vec<usize> {
     let key = strip_chr(srp.chromosome());
     let contig = srp.chromosome();
-    if crate::contig::is_chrx(contig) || crate::contig::nonrecomb_refusal(contig).is_some() { return Vec::new(); }
+    if (crate::contig::is_chrx(contig) && !chrx_fill()) || crate::contig::nonrecomb_refusal(contig).is_some() { return Vec::new(); }
     let here: Vec<&TargetMarker> = markers.iter().filter(|m| strip_chr(&m.chrom) == strip_chr(contig)).collect();
     // On a contig where the file writes reference records (gVCF blocks, all-sites records), its
     // good-quality reference calls are the regions (within --callable), once their REF bases
@@ -204,6 +208,22 @@ pub fn sentinel(n_samples: usize) -> (TargetMarker, Vec<[u8; 2]>) {
     (TargetMarker { chrom: String::new(), pos: 0, ref_allele: String::new(), alt_allele: String::new(),
         ref_hash: String::new(), alt_hash: String::new(), id: String::new(), unphased_het: false },
      vec![[0, 0]; n_samples])
+}
+
+/// Per chip site (`wgs_idx`, panel order), whether it is one of the added `sites`; empty when
+/// none was added.
+pub fn filled_mask(wgs_idx: &[usize], sites: &[usize]) -> Vec<bool> {
+    if sites.is_empty() { return Vec::new(); }
+    wgs_idx.iter().map(|w| sites.binary_search(w).is_ok()).collect()
+}
+
+/// Per chip site (`target_idx` into `markers`), whether its target record's position holds other
+/// records too: a split multi-allelic record, whichever of its parts matched the panel. Such a
+/// part writes 0/0 for the ALTs a sample does not carry, so [`call_counts`] leaves it out.
+pub fn split_rows(markers: &[TargetMarker], target_idx: &[usize]) -> Vec<bool> {
+    let mut per_pos: HashMap<(&str, i64), u32> = HashMap::new();
+    for m in markers { *per_pos.entry((strip_chr(&m.chrom), m.pos)).or_default() += 1; }
+    target_idx.iter().map(|&ti| per_pos[&(strip_chr(&markers[ti].chrom), markers[ti].pos)] > 1).collect()
 }
 
 /// Merge `sites` (panel indices), all pointing at target row `row`, into the panel-ordered
@@ -267,6 +287,11 @@ fn merge_sorted(mut v: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
 
 /// One record's sample fields, as the scanner needs them.
 struct RefCallFields { gt: Option<Vec<Option<u32>>>, gq: Option<f64>, rgq: Option<f64>, pl: Option<Vec<f64>>, dp: Option<f64> }
+
+impl RefCallFields {
+    /// A no-call (a filtered record, unless `--input-filter keep`).
+    fn no_call() -> Self { RefCallFields { gt: Some(vec![None]), gq: None, rgq: None, pl: None, dp: None } }
+}
 
 /// `Some(true)` for a reference call, `Some(false)` for a no-call or a low-quality one, `None`
 /// when the genotype carries an ALT.
@@ -353,7 +378,10 @@ pub fn scan_ref_spans(path: &str, n_samples: usize, contig: Option<&str>) -> Ref
                 let Some(pos) = rec.variant_start().map(|p| usize::from(p) as i64) else { continue };
                 if !wanted(rec.reference_sequence_name()) {
                     // An ALT `.` 0/0 record without an END (a block has one) on another contig.
+                    // (A filtered one is a no-call, unless --input-filter keep.)
                     let no_alt_ref = kind == SpanKind::NoAlt
+                        && !(crate::io::target_io::input_filter_missing()
+                            && crate::io::target_io::filters_failed(rec.filters().as_ref().iter().map(String::as_str)))
                         && !matches!(rec.info().get("END"), Some(Some(Iv::Integer(e))) if i64::from(*e) >= pos)
                         && rec.samples().values().next().is_some_and(|s| matches!(s.get("GT"),
                             Some(Some(Value::Genotype(g))) if !g.as_ref().is_empty() && g.as_ref().iter().all(|a| a.position() == Some(0))));
@@ -382,7 +410,10 @@ pub fn scan_ref_spans(path: &str, n_samples: usize, contig: Option<&str>) -> Ref
                             Some(Some(Value::Array(Array::Integer(v)))) => Some(v.iter().flatten().map(|&p| f64::from(p)).collect()), _ => None }),
                     }
                 });
-                take(rec.reference_sequence_name(), pos, ref_base, ref_bases.len() as i64, int("END"), int("SVLEN"), kind, fields);
+                let filtered = crate::io::target_io::input_filter_missing()
+                    && crate::io::target_io::filters_failed(rec.filters().as_ref().iter().map(String::as_str));
+                take(rec.reference_sequence_name(), pos, ref_base, ref_bases.len() as i64, int("END"), int("SVLEN"), kind,
+                    if filtered { fields.map(|_| RefCallFields::no_call()) } else { fields });
             }
         }
     } else if std::path::Path::new(path).exists() {
@@ -396,6 +427,7 @@ pub fn scan_ref_spans(path: &str, n_samples: usize, contig: Option<&str>) -> Ref
                 let f: Vec<&str> = line.splitn(11, '\t').collect();
                 let Some(pos) = f.get(1).and_then(|p| p.parse::<i64>().ok()) else { continue };
                 let no_alt_ref = f.get(4).is_some_and(|a| *a == ".") && f.len() >= 10
+                    && !(crate::io::target_io::input_filter_missing() && crate::io::target_io::filter_failed(f[6].as_bytes()))
                     && !f[7].split(';').any(|kv| kv.strip_prefix("END=").and_then(|v| v.parse::<i64>().ok()).is_some_and(|e| e >= pos))
                     && f[8].split(':').position(|k| k == "GT").and_then(|i| f[9].split(':').nth(i))
                         .is_some_and(|g| { let a: Vec<&str> = g.split(['/', '|']).collect(); !a.is_empty() && a.iter().all(|x| *x == "0") });
@@ -423,7 +455,10 @@ pub fn scan_ref_spans(path: &str, n_samples: usize, contig: Option<&str>) -> Ref
                     pl: get("PL").map(|p| p.split(',').filter_map(|x| x.parse::<f64>().ok()).collect()),
                 }
             });
-            take(f[0], pos, ref_base, f[3].len() as i64, info_int("END"), info_int("SVLEN"), kind, fields);
+            // A filtered block is a no-call (unless --input-filter keep): its span is occupied.
+            let filtered = crate::io::target_io::input_filter_missing() && f.get(6).is_some_and(|x| crate::io::target_io::filter_failed(x.as_bytes()));
+            take(f[0], pos, ref_base, f[3].len() as i64, info_int("END"), info_int("SVLEN"), kind,
+                if filtered { fields.map(|_| RefCallFields::no_call()) } else { fields });
         }
     }
     let mut out = RefSpans::default();
@@ -595,6 +630,9 @@ pub fn scan_head(path: &str, max: usize) -> HeadScan {
         Some(v[v.len() / 2])
     };
     let (mut dp, mut gq) = (Vec::new(), Vec::new());
+    // Filtered records' depths, used only when the head holds no other (a file whose first
+    // records are all filtered still has its depth judged).
+    let (mut dp_f, mut gq_f): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
     let mut out = HeadScan::default();
     let tally_alts = |alts: &mut dyn Iterator<Item = &str>, out: &mut HeadScan| {
         let alts: Vec<&str> = alts.collect();
@@ -609,9 +647,13 @@ pub fn scan_head(path: &str, max: usize) -> HeadScan {
             out.records += 1;
             let alts: Vec<String> = rec.alternate_bases().as_ref().to_vec();
             tally_alts(&mut alts.iter().map(String::as_str), &mut out);
+            // A filtered record's depth is none of the calls' (unless --input-filter keep).
+            let filtered = crate::io::target_io::input_filter_missing()
+                && crate::io::target_io::filters_failed(rec.filters().as_ref().iter().map(String::as_str));
             let samples = rec.samples();
             let Some(sample) = samples.values().next() else { continue };
-            for (key, vals) in [("DP", &mut dp), ("GQ", &mut gq)] {
+            let (d, g) = if filtered { (&mut dp_f, &mut gq_f) } else { (&mut dp, &mut gq) };
+            for (key, vals) in [("DP", d), ("GQ", g)] {
                 if let Some(Some(Value::Integer(x))) = sample.get(key) { vals.push(f64::from(*x)); }
             }
         }
@@ -626,15 +668,18 @@ pub fn scan_head(path: &str, max: usize) -> HeadScan {
             out.records += 1;
             tally_alts(&mut f[4].split(','), &mut out);
             if f.len() < 10 { continue; }
+            let filtered = crate::io::target_io::input_filter_missing() && crate::io::target_io::filter_failed(f[6].as_bytes());
             let keys: Vec<&str> = f[8].split(':').collect();
             let vals: Vec<&str> = f[9].split(':').collect();
-            for (key, v) in [("DP", &mut dp), ("GQ", &mut gq)] {
+            let (d, g) = if filtered { (&mut dp_f, &mut gq_f) } else { (&mut dp, &mut gq) };
+            for (key, v) in [("DP", d), ("GQ", g)] {
                 if let Some(x) = keys.iter().position(|k| *k == key).and_then(|i| vals.get(i)).and_then(|v| v.parse::<f64>().ok()) {
                     v.push(x);
                 }
             }
         }
     }
+    let (dp, gq) = if dp.is_empty() && gq.is_empty() { (dp_f, gq_f) } else { (dp, gq) };
     out.dp = median(dp);
     out.gq = median(gq);
     out
@@ -697,6 +742,14 @@ mod tests {
     fn marker(pos: i64, r: &str, a: &str) -> TargetMarker {
         TargetMarker { chrom: "chr22".into(), pos, ref_allele: r.into(), alt_allele: a.into(),
             ref_hash: r.into(), alt_hash: a.into(), id: String::new(), unphased_het: false }
+    }
+
+    /// Both parts of a split record are marked, also when only one of them is a chip site.
+    #[test]
+    fn split_rows_marks_shared_positions() {
+        let ms = vec![marker(100, "A", "C"), marker(100, "A", "G"), marker(200, "T", "C"), marker(300, "G", "A")];
+        assert_eq!(split_rows(&ms, &[1, 2, 3]), vec![true, false, false]);
+        assert_eq!(split_rows(&ms, &[0, 1]), vec![true, true]);
     }
 
     #[test]

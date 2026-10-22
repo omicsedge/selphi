@@ -387,6 +387,12 @@ fn pass_record(rec: &noodles_vcf::variant::RecordBuf, pos: i64) -> PassRecord {
             _ => { gt.push(MISSING); gt.push(ABSENT); phased.push(false); }
         }
     }
+    // A filtered record (unless --input-filter keep) is written as the no-calls the run used,
+    // ploidy and phasing kept.
+    if crate::io::target_io::input_filter_missing()
+        && crate::io::target_io::filters_failed(rec.filters().as_ref().iter().map(String::as_str)) {
+        for a in gt.iter_mut() { if *a != ABSENT { *a = MISSING; } }
+    }
     PassRecord { pos, id, ref_allele, alts, gt, phased }
 }
 

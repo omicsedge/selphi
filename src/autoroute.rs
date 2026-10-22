@@ -71,6 +71,9 @@ struct Sniff {
     n_samples: usize,
     dp: Vec<u32>,
     gq: Vec<u32>,
+    /// Filtered records' DP and GQ, read only when no other record carries either.
+    dp_filtered: Vec<u32>,
+    gq_filtered: Vec<u32>,
     /// Sampled records that make reference calls of their own: a gVCF reference-block allele
     /// (`<NON_REF>`, `<*>`, `<X>`) among their ALTs, or ALT `.` (bcftools `--gvcf` blocks, all-sites
     /// records).
@@ -322,8 +325,11 @@ fn sniff_vcf_text(raw: &[u8]) -> Sniff {
             .any(|a| std::str::from_utf8(a).is_ok_and(selphi::io::target_io::is_ref_symbolic))) { s.ref_blocks += 1; }
         // Locate FORMAT (col 9, after the 8th tab) and the per-sample region.
         let Some((format, samples_region)) = format_and_samples(line) else { continue };
-        record_into_sniff(&mut s, format, samples_region);
-        if let Some(alt) = line.split(|&b| b == b'\t').nth(4).and_then(|a| std::str::from_utf8(a).ok())
+        // A filtered record's calls are no-calls (unless --input-filter keep), here as in the readers.
+        let filtered = selphi::io::target_io::input_filter_missing()
+            && line.split(|&b| b == b'\t').nth(6).is_some_and(selphi::io::target_io::filter_failed);
+        record_into_sniff(&mut s, format, samples_region, filtered);
+        if !filtered && let Some(alt) = line.split(|&b| b == b'\t').nth(4).and_then(|a| std::str::from_utf8(a).ok())
             && let Some(k) = first_real_alt(alt.split(',')) {
             let n_alleles = alt.split(',').count() + 1;
             let keys: Vec<&[u8]> = format.split(|&b| b == b':').collect();
@@ -385,7 +391,7 @@ fn format_and_samples(line: &[u8]) -> Option<(&[u8], &[u8])> {
 
 /// Fold one record (FORMAT + per-sample region) into the sniff tally: note
 /// field presence and tally GT call-rate across samples.
-fn record_into_sniff(s: &mut Sniff, format: &[u8], samples_region: &[u8]) {
+fn record_into_sniff(s: &mut Sniff, format: &[u8], samples_region: &[u8], filtered: bool) {
     if format_has(format, b"GT") { s.has_gt = true; }
     // GL is read as PL (`pl_reader::gl_to_pl`) when a record has no PL.
     if format_has(format, b"PL") || format_has(format, b"GL") { s.has_pl = true; }
@@ -398,19 +404,24 @@ fn record_into_sniff(s: &mut Sniff, format: &[u8], samples_region: &[u8]) {
             if field.is_empty() { continue; }
             n += 1;
             let gt = field.split(|&b| b == b':').nth(gi).unwrap_or(b"");
+            // A filtered record's calls are neither calls nor no-calls of the file's: the readers
+            // keep its span out of the fill, as they do any record's (`fill_applies` counts calls).
+            if filtered { continue; }
             s.gt_total += 1;
             if gt_is_called(gt) { s.gt_called += 1; }
             if gt_is_called(gt) && gt.iter().all(|&b| b == b'0' || b == b'/' || b == b'|') { s.gt_homref += 1; }
         }
         s.n_samples = s.n_samples.max(n);
     }
-    for (key, out) in [(&b"DP"[..], &mut s.dp), (&b"GQ"[..], &mut s.gq)] {
+    let (dp, gq) = if filtered { (&mut s.dp_filtered, &mut s.gq_filtered) } else { (&mut s.dp, &mut s.gq) };
+    for (key, out) in [(&b"DP"[..], dp), (&b"GQ"[..], gq)] {
         if let Some(di) = format.split(|&b| b == b':').position(|sub| sub == key)
             && let Some(first) = samples_region.split(|&b| b == b'\t').next()
             && let Some(v) = first.split(|&b| b == b':').nth(di).and_then(|x| std::str::from_utf8(x).ok()?.parse::<u32>().ok()) {
             out.push(v);
         }
     }
+    if filtered { return; }
     let pi = format.split(|&b| b == b':').position(|sub| sub == b"PL");
     let gi = format.split(|&b| b == b':').position(|sub| sub == b"GL");
     if pi.is_some() || gi.is_some() {
@@ -492,9 +503,13 @@ fn sniff_bcf(path: &str) -> std::io::Result<Sniff> {
         let n_alleles = alts.len() + 1;
         let samples = rec.samples();
         s.n_samples = s.n_samples.max(samples.values().count());
+        let filtered = selphi::io::target_io::input_filter_missing()
+            && selphi::io::target_io::filters_failed(rec.filters().as_ref().iter().map(String::as_str));
+        // A filtered record's depth is none of the calls' (as in the text sniff).
         if let Some(sample) = samples.values().next() {
-            if let Some(Some(Value::Integer(dp))) = sample.get("DP") && *dp >= 0 { s.dp.push(*dp as u32); }
-            if let Some(Some(Value::Integer(gq))) = sample.get("GQ") && *gq >= 0 { s.gq.push(*gq as u32); }
+            let (dp_v, gq_v) = if filtered { (&mut s.dp_filtered, &mut s.gq_filtered) } else { (&mut s.dp, &mut s.gq) };
+            if let Some(Some(Value::Integer(dp))) = sample.get("DP") && *dp >= 0 { dp_v.push(*dp as u32); }
+            if let Some(Some(Value::Integer(gq))) = sample.get("GQ") && *gq >= 0 { gq_v.push(*gq as u32); }
         }
         // Field presence: a key is present if a sample carries that subfield.
         // (Mirrors extract_site_confidence_bcf's per-sample `.get()` probing —
@@ -505,6 +520,8 @@ fn sniff_bcf(path: &str) -> std::io::Result<Sniff> {
             if sample.get("PL").is_some() || sample.get("GL").is_some() { s.has_pl = true; }
             if sample.get("GQ").is_some() { s.has_gq = true; }
             if sample.get("DP").is_some() { s.has_dp = true; }
+            // A filtered record (unless --input-filter keep): its calls are no-calls.
+            if filtered { continue; }
             // GT call-rate: a call is real iff its first allele position is Some.
             if let Some(Some(Value::Genotype(gt))) = sample.get("GT") {
                 s.gt_total += 1;
@@ -606,7 +623,9 @@ fn fill_applies(s: &Sniff, callable: bool) -> bool {
         v.sort_unstable();
         (!v.is_empty()).then(|| f64::from(v[v.len() / 2]))
     };
-    let head = selphi::io::variant_only::HeadScan { dp: median(&s.dp), gq: median(&s.gq), no_alt: 0, symbolic: 0, records: s.gt_total as usize };
+    // As `variant_only::scan_head`: filtered records' depths when no other record has one.
+    let (dp, gq) = if s.dp.is_empty() && s.gq.is_empty() { (&s.dp_filtered, &s.gq_filtered) } else { (&s.dp, &s.gq) };
+    let head = selphi::io::variant_only::HeadScan { dp: median(dp), gq: median(gq), no_alt: 0, symbolic: 0, records: s.gt_total as usize };
     // Called ALT genotypes, not no-calls: a file of `./.` with PL carries its evidence in the PL.
     let alt_calls = s.gt_called.saturating_sub(s.gt_homref);
     s.n_samples == 1 && 200 * s.gt_homref <= alt_calls && alt_calls >= 200 && 20 * s.gt_called >= 19 * s.gt_total
