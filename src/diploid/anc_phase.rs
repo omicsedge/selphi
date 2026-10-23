@@ -75,6 +75,17 @@ fn table_group(pop: &str, superpop: &str) -> Option<u8> {
     GROUPS.iter().position(|&g| g == superpop).map(|g| g as u8)
 }
 
+/// Whether the run's chip sites are dense enough to be a sequenced genome
+/// (`SELPHI_AUTOROUTE_WGS_DENSITY` sites/Mb, as the private-het routing reads it):
+/// the check is calibrated on array-density windows (60 sites ~ a few hundred kb),
+/// so at sequencing density it does not run.
+pub fn too_dense(chip_bp: &[i64]) -> bool {
+    if chip_bp.len() < 2 { return false; }
+    let span_mb = (chip_bp[chip_bp.len() - 1] - chip_bp[0]).max(1) as f64 / 1e6;
+    let thr = crate::config::f64_or("SELPHI_AUTOROUTE_WGS_DENSITY", 1000.0);
+    chip_bp.len() as f64 / span_mb >= thr
+}
+
 /// Per panel sample, its trusted group.
 pub fn trusted_groups(sample_ids: &[String]) -> Vec<Option<u8>> {
     let mut map = std::collections::HashMap::new();
@@ -122,7 +133,12 @@ impl Panel {
     /// no labelled sample.
     pub fn prepare(ref_bm: &HaplotypeBitmatrix, sample_ids: &[String]) -> Option<Panel> {
         let n_sites = ref_bm.n_sites;
-        assert_eq!(ref_bm.n_haps, sample_ids.len() * 2, "anc_phase: panel haplotypes vs sample IDs");
+        if ref_bm.n_haps != sample_ids.len() * 2 {
+            // e.g. a panel carrying one ID per haplotype: no sample to look up
+            crate::selphi_info!("  SELPHI_ANC_POST: {} panel haplotypes for {} sample IDs (not two per sample); no check",
+                ref_bm.n_haps, sample_ids.len());
+            return None;
+        }
         let trusted = trusted_groups(sample_ids);
         let mut by_group: Vec<Vec<usize>> = vec![Vec::new(); G];
         for (s, g) in trusted.iter().enumerate() {
@@ -273,7 +289,8 @@ pub fn decide(panel: &Panel, a0: &[u8], a1: &[u8], pq: &[u8]) -> Decision {
         for q in 0..NS {
             let (mut best, mut arg) = (f64::NEG_INFINITY, 0usize);
             for p in 0..NS {
-                let x = v[p] + anc(p, q) + if p % 2 == q % 2 { lk } else { lf };
+                // V + (ancestry + flip): the prototype's evaluation order, which decides ties
+                let x = v[p] + (anc(p, q) + if p % 2 == q % 2 { lk } else { lf });
                 if x > best { best = x; arg = p; }
             }
             nv[q] = best + emis(w, q);
@@ -360,7 +377,7 @@ pub fn decide(panel: &Panel, a0: &[u8], a1: &[u8], pq: &[u8]) -> Decision {
 /// Run the corrector on every sample of a phased scaffold (`n_sites x n_haps`,
 /// row-major, targets 2s / 2s+1), swapping alleles under `Mode::Apply`. `pq` is
 /// the solve's phase quality (`n_sites x n_samples`); PQ entries of a changed
-/// relation (the first heterozygote after each cut) become `PQ_NONE`. Returns the
+/// relation (the first segment-HMM heterozygote at or after each cut) become `PQ_NONE`. Returns the
 /// number of samples corrected.
 pub fn correct_scaffold(panel: &Panel, phased: &mut [u8], pq: &mut [u8], n_samples: usize, apply: bool) -> usize {
     use rayon::prelude::*;
@@ -384,9 +401,10 @@ pub fn correct_scaffold(panel: &Panel, phased: &mut [u8], pq: &mut [u8], n_sampl
         if !apply { continue; }
         for &(a, b) in &d.flips {
             for v in a..b { phased.swap(v * n_haps + 2 * s, v * n_haps + 2 * s + 1); }
-            // the relation of each cut's first heterozygote to the previous one changed
+            // PQ relates each segment-HMM heterozygote to the previous one; the first such
+            // heterozygote at or after each cut now has the other relation
             for cut in [a, b] {
-                if let Some(v) = (cut..n).find(|&v| phased[v * n_haps + 2 * s] != phased[v * n_haps + 2 * s + 1]) {
+                if let Some(v) = (cut..n).find(|&v| pq[v * n_samples + s] != super::PQ_NONE) {
                     pq[v * n_samples + s] = super::PQ_NONE;
                 }
             }

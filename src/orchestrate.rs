@@ -481,7 +481,9 @@ e.g. a male chrX): phasing on all {} called sites", scaffold.indices.len());
     // Ancestry-aware long-range correction of the solve (diploid::anc_phase), before
     // the members are aligned to it; its PQ is computed for it alone.
     let anc = selphi::diploid::anc_phase::mode();
-    if anc != selphi::diploid::anc_phase::Mode::Off && let Some(mut pq) = dp.pq {
+    if anc != selphi::diploid::anc_phase::Mode::Off && selphi::diploid::anc_phase::too_dense(chip_bps) {
+        selphi_info!("    SELPHI_ANC_POST: sequencing-density input; the ancestry phase check covers array density only");
+    } else if anc != selphi::diploid::anc_phase::Mode::Off && let Some(mut pq) = dp.pq {
         match selphi::diploid::anc_phase::Panel::prepare(&ref_bm, &srp.sample_ids) {
             Some(panel) => {
                 let n = selphi::diploid::anc_phase::correct_scaffold(&panel, &mut member0, &mut pq, n_samples,

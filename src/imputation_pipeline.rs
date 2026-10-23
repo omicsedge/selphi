@@ -398,7 +398,11 @@ fn run_phasing(inp: &PhasingInputs) -> PhasingResult {
     // Labelled panel templates for the ancestry phase check, packed before the
     // phase-only path releases the chip-site matrix.
     let anc = selphi::diploid::anc_phase::mode();
-    let anc_panel = if anc == selphi::diploid::anc_phase::Mode::Off { None } else {
+    let anc_panel = if anc == selphi::diploid::anc_phase::Mode::Off { None }
+        else if selphi::diploid::anc_phase::too_dense(chip_bps) {
+            selphi_info!("  SELPHI_ANC_POST: sequencing-density input; the ancestry phase check covers array density only");
+            None
+        } else {
         match ref_bm_full.as_ref() {
             Some(full) => {
                 let p = selphi::diploid::anc_phase::Panel::prepare(full, &srp.sample_ids);
