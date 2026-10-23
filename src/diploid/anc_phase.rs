@@ -49,7 +49,13 @@ const PAIR_FRAC: f64 = 0.5;
 const PQ_W: f64 = 3.0;
 const PQ_PRIOR: f64 = 0.3;
 const PQ_FLOOR: f64 = 0.0005;
+/// Default of `SELPHI_ANC_LR_MIN`.
 const LR_MIN: f64 = 0.2;
+fn lr_min() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| crate::config::f64_or("SELPHI_ANC_LR_MIN", LR_MIN))
+}
 /// Seed of the balanced choice of labelled samples.
 const SUBSET_SEED: u64 = 20261023;
 
@@ -369,7 +375,7 @@ fn viterbi(e: &[[[f64; G]; 2]], exp_err: &[f64], out: &mut Decision) -> Option<V
     let (top, cnt) = counts.iter().fold(counts[0], |b, &c| if c.1 > b.1 { c } else { b });
     out.pair = top;
     out.pair_frac = cnt as f64 / w_n as f64;
-    (top.0 != top.1 && out.pair_frac >= PAIR_FRAC && out.lr_per_window >= LR_MIN).then_some(path)
+    (top.0 != top.1 && out.pair_frac >= PAIR_FRAC && out.lr_per_window >= lr_min()).then_some(path)
 }
 
 /// Decide the correction of one sample at array density: `a0`/`a1` its two
