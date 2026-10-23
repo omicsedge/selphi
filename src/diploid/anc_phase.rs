@@ -18,8 +18,9 @@
 //! prior from the solve's phase quality (`sampling::phase_quality`) gives each
 //! window an orientation. The path is applied only when it reads a two-continent
 //! person: one pair of different groups over at least `PAIR_FRAC` of the windows,
-//! and a likelihood at least `LR_MIN` per window above the best path that gives
-//! both haplotypes one group. Each orientation change is placed at the
+//! a likelihood at least `LR_MIN` per window above the best path that gives both
+//! haplotypes one group, and at most `CHANGE_RATE_MAX` group changes per window
+//! (an F1 holds its two groups; an old admixture trades them between haplotypes). Each orientation change is placed at the
 //! heterozygote, within the two windows it separates, that maximises the
 //! allele-frequency split of the two groups plus `PQ_W` times the log probability
 //! of a phase error there; changes never cross. The first segment keeps the
@@ -49,8 +50,22 @@ const PAIR_FRAC: f64 = 0.5;
 const PQ_W: f64 = 3.0;
 const PQ_PRIOR: f64 = 0.3;
 const PQ_FLOOR: f64 = 0.0005;
-/// Default of `SELPHI_ANC_LR_MIN`.
-const LR_MIN: f64 = 0.2;
+/// Default of `SELPHI_ANC_LR_MIN`. 0.4: every single-population false positive seen
+/// (GIH, PJL, CLM; HGDP Central/South Asian, Middle Eastern, Native American and
+/// Oceanian people read as two-continent) sat below it, as did 18% of the EUR x SAS
+/// F1s; AFR/EAS/EUR pairs read >= 0.78.
+const LR_MIN: f64 = 0.4;
+/// Default of `SELPHI_ANC_CHANGE_RATE_MAX`: group changes of the two haplotypes per
+/// window along the path. An F1's two haplotypes hold their groups (0-4 changes on
+/// chr22's ~150 windows); an old admixture trades them between the haplotypes, which
+/// the orientation model would "correct" into switch errors (40-generation mosaics:
+/// up to 21 changes).
+const CHANGE_RATE_MAX: f64 = 0.04;
+fn change_rate_max() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| crate::config::f64_or("SELPHI_ANC_CHANGE_RATE_MAX", CHANGE_RATE_MAX))
+}
 fn lr_min() -> f64 {
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
@@ -292,6 +307,9 @@ pub struct Decision {
     pub pair: (u8, u8),
     pub pair_frac: f64,
     pub lr_per_window: f64,
+    /// Changes of group of either haplotype along the path (an F1 holds its two
+    /// groups; an old admixture changes them often).
+    pub anc_changes: usize,
     pub applied: bool,
 }
 
@@ -372,10 +390,16 @@ fn viterbi(e: &[[[f64; G]; 2]], exp_err: &[f64], out: &mut Decision) -> Option<V
         let key = (ga.min(gb), ga.max(gb));
         match counts.iter_mut().find(|(k, _)| *k == key) { Some(c) => c.1 += 1, None => counts.push((key, 1)) }
     }
+    // groups of the corrected haplotypes A and B (the orientation is the correction itself)
+    out.anc_changes = path.windows(2).map(|w| {
+        let (p, q) = (w[0] / 2, w[1] / 2);
+        (p / G != q / G) as usize + (p % G != q % G) as usize
+    }).sum();
     let (top, cnt) = counts.iter().fold(counts[0], |b, &c| if c.1 > b.1 { c } else { b });
     out.pair = top;
     out.pair_frac = cnt as f64 / w_n as f64;
-    (top.0 != top.1 && out.pair_frac >= PAIR_FRAC && out.lr_per_window >= lr_min()).then_some(path)
+    (top.0 != top.1 && out.pair_frac >= PAIR_FRAC && out.lr_per_window >= lr_min()
+        && out.anc_changes as f64 <= change_rate_max() * w_n as f64).then_some(path)
 }
 
 /// Decide the correction of one sample at array density: `a0`/`a1` its two
@@ -602,8 +626,8 @@ pub fn correct_scaffold(check: &Checker, phased: &mut [u8], pq: &mut [u8], n_sit
     let mut n_done = 0;
     for (s, d) in decisions.iter().enumerate() {
         let span: usize = d.flips.iter().map(|&(a, b)| b - a).sum();
-        crate::selphi_info!("    Ancestry phase check, sample {}: pair {}/{} over {:.0}% of windows, LR {:.3}/window -> {}{}",
-            s, GROUPS[d.pair.0 as usize], GROUPS[d.pair.1 as usize], 100.0 * d.pair_frac, d.lr_per_window,
+        crate::selphi_info!("    Ancestry phase check, sample {}: pair {}/{} over {:.0}% of windows, LR {:.3}/window, {} group changes -> {}{}",
+            s, GROUPS[d.pair.0 as usize], GROUPS[d.pair.1 as usize], 100.0 * d.pair_frac, d.lr_per_window, d.anc_changes,
             if d.applied { format!("{} inverted segment(s), {} sites", d.flips.len(), span) } else { "unchanged".to_string() },
             if d.applied && !apply { " (report only)" } else { "" });
         if !d.applied || d.flips.is_empty() { continue; }
