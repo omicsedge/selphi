@@ -111,7 +111,74 @@ fn rank(id: &str) -> u64 {
     z ^ (z >> 31)
 }
 
-/// The labelled panel haplotypes at the chip sites, ready for every sample of the run.
+/// Template-major allele bits of panel haplotypes `haps` at chip sites `sites`
+/// (`words = sites.len().div_ceil(64)` u64 per haplotype).
+pub type Fetch<'a> = dyn Fn(&[usize], &[usize]) -> Vec<u64> + 'a;
+
+/// The chosen templates: panel haplotype indices, their groups, samples per group.
+pub struct Templates { pub haps: Vec<usize>, pub group: Vec<u8>, pub n_per_group: usize }
+
+/// Choose the templates: the labelled panel samples (both haplotypes), the same
+/// number in each group, chosen by `rank`; `SELPHI_ANC_TEMPLATES` = a file of sample
+/// IDs pins the choice. None when a group has no labelled sample or the panel does
+/// not carry two haplotypes per sample ID.
+pub fn choose_templates(sample_ids: &[String], n_ref_haps: usize) -> Option<Templates> {
+    if n_ref_haps != sample_ids.len() * 2 {
+        // e.g. a panel carrying one ID per haplotype: no sample to look up
+        crate::selphi_info!("  SELPHI_ANC_POST: {} panel haplotypes for {} sample IDs (not two per sample); no check",
+            n_ref_haps, sample_ids.len());
+        return None;
+    }
+    let trusted = trusted_groups(sample_ids);
+    let mut by_group: Vec<Vec<usize>> = vec![Vec::new(); G];
+    for (s, g) in trusted.iter().enumerate() {
+        if let Some(g) = g { by_group[*g as usize].push(s); }
+    }
+    let n_min = by_group.iter().map(Vec::len).min().unwrap_or(0);
+    if n_min == 0 { return None; }
+    let pinned: Option<std::collections::HashSet<String>> = crate::config::raw("SELPHI_ANC_TEMPLATES").map(|p| {
+        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("SELPHI_ANC_TEMPLATES {p}: {e}"))
+            .lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
+    });
+    let (mut haps, mut group) = (Vec::new(), Vec::new());
+    for (g, samples) in by_group.iter_mut().enumerate() {
+        match &pinned {
+            Some(set) => samples.retain(|&s| set.contains(&sample_ids[s])),
+            None => {
+                samples.sort_by_key(|&s| (rank(&sample_ids[s]), s));
+                samples.truncate(n_min);
+            }
+        }
+        samples.sort_unstable();
+        for &s in samples.iter() { for h in 0..2 { haps.push(2 * s + h); group.push(g as u8); } }
+    }
+    let n_per_group = by_group.iter().map(Vec::len).min().unwrap_or(0);
+    if n_per_group == 0 { return None; }
+    Some(Templates { haps, group, n_per_group })
+}
+
+/// Per site and group, ln(1 - F) and ln F with F = (alt count + 0.5) / (n + 1)
+/// over the group's templates, from template-major bits over `n_sites` sites.
+fn log_freqs(bits: &[u64], group: &[u8], n_sites: usize) -> Vec<[[f64; 2]; G]> {
+    let words = n_sites.div_ceil(64);
+    let mut n_g = [0usize; G];
+    for &g in group { n_g[g as usize] += 1; }
+    let mut lf = vec![[[0.0f64; 2]; G]; n_sites];
+    for (v, l) in lf.iter_mut().enumerate() {
+        let mut alt = [0usize; G];
+        for (t, &g) in group.iter().enumerate() {
+            if (bits[t * words + v / 64] >> (v % 64)) & 1 == 1 { alt[g as usize] += 1; }
+        }
+        for g in 0..G {
+            let f = (alt[g] as f64 + 0.5) / (n_g[g] as f64 + 1.0);
+            l[g] = [(1.0 - f).ln(), f.ln()];
+        }
+    }
+    lf
+}
+
+/// The labelled panel haplotypes at the sites the check reads, ready for every
+/// sample of the run.
 pub struct Panel {
     n_sites: usize,
     words: usize,
@@ -119,79 +186,23 @@ pub struct Panel {
     /// `bits[t * words ..]`.
     bits: Vec<u64>,
     group: Vec<u8>,
-    /// Per site and group, ln(1 - F) and ln F with F = (alt count + 0.5) / (n + 1)
-    /// over the group's templates.
     lf: Vec<[[f64; 2]; G]>,
     pub n_per_group: usize,
 }
 
 impl Panel {
-    /// Choose the templates (all four groups present, the same number of samples in
-    /// each, chosen by `rank`; `SELPHI_ANC_TEMPLATES` = a file of sample IDs pins the
-    /// choice) and pack their alleles. `ref_bm` holds the panel at the run's chip
-    /// sites, two haplotypes per sample in `sample_ids` order. None when a group has
-    /// no labelled sample.
+    fn from_bits(t: &Templates, n_sites: usize, bits: Vec<u64>) -> Panel {
+        let lf = log_freqs(&bits, &t.group, n_sites);
+        Panel { n_sites, words: n_sites.div_ceil(64), bits, group: t.group.clone(), lf, n_per_group: t.n_per_group }
+    }
+
+    /// The panel at every chip site of an array-density run; `ref_bm` holds the
+    /// panel there, two haplotypes per sample in `sample_ids` order.
     pub fn prepare(ref_bm: &HaplotypeBitmatrix, sample_ids: &[String]) -> Option<Panel> {
-        let n_sites = ref_bm.n_sites;
-        if ref_bm.n_haps != sample_ids.len() * 2 {
-            // e.g. a panel carrying one ID per haplotype: no sample to look up
-            crate::selphi_info!("  SELPHI_ANC_POST: {} panel haplotypes for {} sample IDs (not two per sample); no check",
-                ref_bm.n_haps, sample_ids.len());
-            return None;
-        }
-        let trusted = trusted_groups(sample_ids);
-        let mut by_group: Vec<Vec<usize>> = vec![Vec::new(); G];
-        for (s, g) in trusted.iter().enumerate() {
-            if let Some(g) = g { by_group[*g as usize].push(s); }
-        }
-        let n_min = by_group.iter().map(Vec::len).min().unwrap_or(0);
-        if n_min == 0 { return None; }
-        let pinned: Option<std::collections::HashSet<String>> = crate::config::raw("SELPHI_ANC_TEMPLATES").map(|p| {
-            std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("SELPHI_ANC_TEMPLATES {p}: {e}"))
-                .lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
-        });
-        let mut chosen: Vec<(usize, u8)> = Vec::new();
-        for (g, samples) in by_group.iter_mut().enumerate() {
-            match &pinned {
-                Some(set) => samples.retain(|&s| set.contains(&sample_ids[s])),
-                None => {
-                    samples.sort_by_key(|&s| (rank(&sample_ids[s]), s));
-                    samples.truncate(n_min);
-                }
-            }
-            samples.sort_unstable();
-            chosen.extend(samples.iter().map(|&s| (s, g as u8)));
-        }
-        let n_per_group = by_group.iter().map(Vec::len).min().unwrap_or(0);
-        if n_per_group == 0 { return None; }
-        let words = n_sites.div_ceil(64);
-        let n_t = chosen.len() * 2;
-        let mut bits = vec![0u64; n_t * words];
-        let mut group = Vec::with_capacity(n_t);
-        for (i, &(s, g)) in chosen.iter().enumerate() {
-            for h in 0..2 {
-                let t = 2 * i + h;
-                group.push(g);
-                let row = &mut bits[t * words..(t + 1) * words];
-                for v in 0..n_sites {
-                    if ref_bm.get(v, 2 * s + h) { row[v / 64] |= 1u64 << (v % 64); }
-                }
-            }
-        }
-        let mut n_g = [0usize; G];
-        for &g in &group { n_g[g as usize] += 1; }
-        let mut lf = vec![[[0.0f64; 2]; G]; n_sites];
-        for (v, l) in lf.iter_mut().enumerate() {
-            let mut alt = [0usize; G];
-            for t in 0..n_t {
-                if (bits[t * words + v / 64] >> (v % 64)) & 1 == 1 { alt[group[t] as usize] += 1; }
-            }
-            for g in 0..G {
-                let f = (alt[g] as f64 + 0.5) / (n_g[g] as f64 + 1.0);
-                l[g] = [(1.0 - f).ln(), f.ln()];
-            }
-        }
-        Some(Panel { n_sites, words, bits, group, lf, n_per_group })
+        let t = choose_templates(sample_ids, ref_bm.n_haps)?;
+        let sites: Vec<usize> = (0..ref_bm.n_sites).collect();
+        let bits = fetch_full(ref_bm)(&sites, &t.haps);
+        Some(Panel::from_bits(&t, ref_bm.n_sites, bits))
     }
 
     /// Mismatches of template `t` against `hap` (bits) over sites `s..e`.
@@ -206,6 +217,54 @@ impl Panel {
             n += m.count_ones();
         }
         n
+    }
+
+    /// Emissions over the panel's sites for one target haplotype pair (alleles at
+    /// those sites): E[w][h][g] = -(mean of the K smallest mismatch counts).
+    fn emissions(&self, a0: &[u8], a1: &[u8], bounds: &[(usize, usize)]) -> Vec<[[f64; G]; 2]> {
+        let hb: [Vec<u64>; 2] = [a0, a1].map(|a| {
+            let mut b = vec![0u64; self.words];
+            for (v, &x) in a.iter().enumerate() { if x == 1 { b[v / 64] |= 1u64 << (v % 64); } }
+            b
+        });
+        let n_t = self.group.len();
+        let mut e = vec![[[0.0f64; G]; 2]; bounds.len()];
+        let mut hist = vec![[0u32; 2 * WIN + 1]; G];
+        for (w, &(s, en)) in bounds.iter().enumerate() {
+            for h in 0..2 {
+                for x in hist.iter_mut() { x.fill(0); }
+                for t in 0..n_t {
+                    let m = self.mismatches(t, &hb[h], s, en) as usize;
+                    hist[self.group[t] as usize][m.min(2 * WIN)] += 1;
+                }
+                for g in 0..G {
+                    let (mut need, mut sum) = (K, 0u64);
+                    for (m, &c) in hist[g].iter().enumerate() {
+                        if need == 0 { break; }
+                        let take = (c as usize).min(need);
+                        sum += (take * m) as u64;
+                        need -= take;
+                    }
+                    e[w][h][g] = -(sum as f64 / (K - need) as f64);
+                }
+            }
+        }
+        e
+    }
+}
+
+/// Template bits from a chip-site panel matrix already in memory.
+pub fn fetch_full(ref_bm: &HaplotypeBitmatrix) -> impl Fn(&[usize], &[usize]) -> Vec<u64> + '_ {
+    move |sites: &[usize], haps: &[usize]| {
+        let words = sites.len().div_ceil(64);
+        let mut bits = vec![0u64; haps.len() * words];
+        for (t, &h) in haps.iter().enumerate() {
+            let row = &mut bits[t * words..(t + 1) * words];
+            for (i, &v) in sites.iter().enumerate() {
+                if ref_bm.get(v, h) { row[i / 64] |= 1u64 << (i % 64); }
+            }
+        }
+        bits
     }
 }
 
@@ -225,55 +284,28 @@ pub struct Decision {
 #[inline]
 fn st(ga: usize, gb: usize, o: usize) -> usize { (ga * G + gb) * 2 + o }
 
-/// Decide the correction of one sample: `a0`/`a1` its two haplotypes' alleles at the
-/// chip sites (0/1), `pq` the solve's phase quality per site (`super::PQ_NONE` =
-/// none).
-pub fn decide(panel: &Panel, a0: &[u8], a1: &[u8], pq: &[u8]) -> Decision {
-    let n = panel.n_sites;
-    let mut out = Decision::default();
-    if n < 2 * WIN { return out; }
+fn windows(n: usize) -> Vec<(usize, usize)> {
     let w_n = n / WIN;
-    let bounds: Vec<(usize, usize)> = (0..w_n).map(|w| (w * WIN, if w + 1 < w_n { (w + 1) * WIN } else { n })).collect();
-    let hb: [Vec<u64>; 2] = [a0, a1].map(|a| {
-        let mut b = vec![0u64; panel.words];
-        for (v, &x) in a.iter().enumerate() { if x == 1 { b[v / 64] |= 1u64 << (v % 64); } }
-        b
-    });
-    // Emission: E[w][h][g] = -(mean of the K smallest mismatch counts).
-    let n_t = panel.group.len();
-    let mut e = vec![[[0.0f64; G]; 2]; w_n];
-    let mut hist = vec![[0u32; 2 * WIN + 1]; G];
-    for (w, &(s, en)) in bounds.iter().enumerate() {
-        for h in 0..2 {
-            for x in hist.iter_mut() { x.fill(0); }
-            for t in 0..n_t {
-                let m = panel.mismatches(t, &hb[h], s, en) as usize;
-                hist[panel.group[t] as usize][m.min(2 * WIN)] += 1;
-            }
-            for g in 0..G {
-                let (mut need, mut sum) = (K, 0u64);
-                for (m, &c) in hist[g].iter().enumerate() {
-                    if need == 0 { break; }
-                    let take = (c as usize).min(need);
-                    sum += (take * m) as u64;
-                    need -= take;
-                }
-                e[w][h][g] = -(sum as f64 / (K - need) as f64);
-            }
-        }
-    }
+    (0..w_n).map(|w| (w * WIN, if w + 1 < w_n { (w + 1) * WIN } else { n })).collect()
+}
+
+/// P(phase error) at a heterozygote from its PQ (`PQ_NONE` reads as 99, then floored).
+#[inline]
+fn p_err(q: u8) -> f64 {
+    let q = if q == super::PQ_NONE { 99.0 } else { q as f64 };
+    10f64.powf(-q / 10.0).max(PQ_FLOOR)
+}
+
+/// The Viterbi path over (ga, gb, o) and the two gates. `exp_err[w]` = the expected
+/// phase errors of window w (the flip prior at boundary w averages w-1 and w).
+/// Fills `out.pair`, `pair_frac`, `lr_per_window`; returns the path when both gates
+/// pass.
+fn viterbi(e: &[[[f64; G]; 2]], exp_err: &[f64], out: &mut Decision) -> Option<Vec<usize>> {
+    let w_n = e.len();
     let emis = |w: usize, s: usize| -> f64 {
         let (ga, gb, o) = (s / 2 / G, s / 2 % G, s % 2);
         e[w][o][ga] + e[w][1 - o][gb]
     };
-    // Flip prior per window boundary from the expected phase errors.
-    let het: Vec<bool> = (0..n).map(|v| a0[v] != a1[v]).collect();
-    let p_err = |v: usize| -> f64 {
-        let q = if pq[v] == super::PQ_NONE { 99.0 } else { pq[v] as f64 };
-        10f64.powf(-q / 10.0).max(PQ_FLOOR)
-    };
-    let pe: Vec<f64> = (0..n).map(|v| if het[v] { p_err(v) } else { 0.0 }).collect();
-    let exp_err: Vec<f64> = bounds.iter().map(|&(s, en)| pe[s..en].iter().sum::<f64>() + if en < n { pe[en] } else { 0.0 }).collect();
     let (lra, lka) = ((RHO_ANC / (G - 1) as f64).ln(), (1.0 - RHO_ANC).ln());
     let anc = |p: usize, q: usize| -> f64 {
         (if p / 2 / G == q / 2 / G { lka } else { lra }) + (if p / 2 % G == q / 2 % G { lka } else { lra })
@@ -329,7 +361,23 @@ pub fn decide(panel: &Panel, a0: &[u8], a1: &[u8], pq: &[u8]) -> Decision {
     let (top, cnt) = counts.iter().fold(counts[0], |b, &c| if c.1 > b.1 { c } else { b });
     out.pair = top;
     out.pair_frac = cnt as f64 / w_n as f64;
-    if top.0 == top.1 || out.pair_frac < PAIR_FRAC || out.lr_per_window < LR_MIN { return out; }
+    (top.0 != top.1 && out.pair_frac >= PAIR_FRAC && out.lr_per_window >= LR_MIN).then_some(path)
+}
+
+/// Decide the correction of one sample at array density: `a0`/`a1` its two
+/// haplotypes' alleles at the chip sites (0/1, the panel's sites), `pq` the solve's
+/// phase quality per site (`super::PQ_NONE` = none).
+pub fn decide(panel: &Panel, a0: &[u8], a1: &[u8], pq: &[u8]) -> Decision {
+    let n = panel.n_sites;
+    let mut out = Decision::default();
+    if n < 2 * WIN { return out; }
+    let bounds = windows(n);
+    let w_n = bounds.len();
+    let e = panel.emissions(a0, a1, &bounds);
+    let het: Vec<bool> = (0..n).map(|v| a0[v] != a1[v]).collect();
+    let pe: Vec<f64> = (0..n).map(|v| if het[v] { p_err(pq[v]) } else { 0.0 }).collect();
+    let exp_err: Vec<f64> = bounds.iter().map(|&(s, en)| pe[s..en].iter().sum::<f64>() + if en < n { pe[en] } else { 0.0 }).collect();
+    let Some(path) = viterbi(&e, &exp_err, &mut out) else { return out };
     // Orientation per site, each change placed by the frequency split + PQ.
     let orient: Vec<usize> = path.iter().map(|s| s % 2).collect();
     let mut site_o = vec![0u8; n];
@@ -352,7 +400,7 @@ pub fn decide(panel: &Panel, a0: &[u8], a1: &[u8], pq: &[u8]) -> Decision {
         for j in 0..e1 - s0 - 1 {
             let v = s0 + j + 1;
             if !het[v] || v <= last_cut { continue; }
-            let key = c1[j] + (tot2 - c2[j]) + PQ_W * p_err(v).ln();
+            let key = c1[j] + (tot2 - c2[j]) + PQ_W * p_err(pq[v]).ln();
             if best.is_none_or(|(_, b)| key > b) { best = Some((j, key)); }
         }
         let Some((j, _)) = best else { continue };
@@ -360,13 +408,148 @@ pub fn decide(panel: &Panel, a0: &[u8], a1: &[u8], pq: &[u8]) -> Decision {
         site_o[s0 + j + 1..e1].fill(o2 as u8);
         last_cut = s0 + j + 1;
     }
-    let first = site_o[0];
+    out.flips = ranges(&site_o);
+    out.applied = true;
+    out
+}
+
+/// Ranges [a, b) where `o` differs from `o[0]`.
+fn ranges(o: &[u8]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let first = o[0];
     let mut start: Option<usize> = None;
-    for vv in 0..=n {
-        let flip = vv < n && (site_o[vv] ^ first) == 1;
+    for v in 0..=o.len() {
+        let flip = v < o.len() && (o[v] ^ first) == 1;
         match (flip, start) {
-            (true, None) => start = Some(vv),
-            (false, Some(s)) => { out.flips.push((s, vv)); start = None; }
+            (true, None) => start = Some(v),
+            (false, Some(s)) => { out.push((s, v)); start = None; }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Sequencing density: the check reads ancestry at markers chosen from the panel
+/// (one common SNP per `MARKER_BIN_BP`: the first site of each `GRID_BP` bin whose
+/// template minor-allele frequency is at least `MARKER_MAF`), and places each change
+/// at the heterozygote, among ALL heterozygotes of the two windows, with the best
+/// frequency split + PQ term (group frequencies read for those sites only).
+const GRID_BP: i64 = 1_000;
+const MARKER_BIN_BP: i64 = 5_000;
+const MARKER_MAF: f64 = 0.05;
+
+/// A sequencing-density check: the templates, the markers and the panel at them.
+pub struct DensePanel { pub t: Templates, pub markers: Vec<usize>, pub panel: Panel }
+
+impl DensePanel {
+    pub fn prepare(sample_ids: &[String], n_ref_haps: usize, chip_bp: &[i64], fetch: &Fetch) -> Option<DensePanel> {
+        let t = choose_templates(sample_ids, n_ref_haps)?;
+        let mut grid = Vec::new();
+        let mut last_bin = i64::MIN;
+        for (v, &bp) in chip_bp.iter().enumerate() {
+            let b = bp.div_euclid(GRID_BP);
+            if b != last_bin { grid.push(v); last_bin = b; }
+        }
+        let bits = fetch(&grid, &t.haps);
+        let words = grid.len().div_ceil(64);
+        let n_t = t.haps.len();
+        let mut markers = Vec::new();
+        let mut keep = Vec::new();
+        let mut last_mb = i64::MIN;
+        for (i, &v) in grid.iter().enumerate() {
+            let mb = chip_bp[v].div_euclid(MARKER_BIN_BP);
+            if mb == last_mb { continue; }
+            let alt = (0..n_t).filter(|&tt| (bits[tt * words + i / 64] >> (i % 64)) & 1 == 1).count();
+            let f = alt as f64 / n_t as f64;
+            if f.min(1.0 - f) >= MARKER_MAF { markers.push(v); keep.push(i); last_mb = mb; }
+        }
+        let mw = markers.len().div_ceil(64);
+        let mut mbits = vec![0u64; n_t * mw];
+        for tt in 0..n_t {
+            for (j, &i) in keep.iter().enumerate() {
+                if (bits[tt * words + i / 64] >> (i % 64)) & 1 == 1 { mbits[tt * mw + j / 64] |= 1u64 << (j % 64); }
+            }
+        }
+        let panel = Panel::from_bits(&t, markers.len(), mbits);
+        Some(DensePanel { t, markers, panel })
+    }
+}
+
+/// Decide the correction of one sample at sequencing density: `a0`/`a1`/`pq` at
+/// every chip site. Flips are chip-site ranges.
+pub fn decide_dense(dp: &DensePanel, a0: &[u8], a1: &[u8], pq: &[u8], fetch: &Fetch) -> Decision {
+    let mut out = Decision::default();
+    let mk = &dp.markers;
+    let n_m = mk.len();
+    if n_m < 2 * WIN { return out; }
+    let bounds = windows(n_m);
+    let w_n = bounds.len();
+    let m0: Vec<u8> = mk.iter().map(|&v| a0[v]).collect();
+    let m1: Vec<u8> = mk.iter().map(|&v| a1[v]).collect();
+    let e = dp.panel.emissions(&m0, &m1, &bounds);
+    // every heterozygote, its site and P(phase error vs the previous one)
+    let hets: Vec<usize> = (0..a0.len()).filter(|&v| a0[v] != a1[v]).collect();
+    let hpe: Vec<f64> = hets.iter().map(|&v| p_err(pq[v])).collect();
+    let mut cum = vec![0.0f64; hets.len() + 1];
+    for (i, &x) in hpe.iter().enumerate() { cum[i + 1] = cum[i] + x; }
+    // number of heterozygotes at sites <= `site`
+    let upto = |site: usize| hets.partition_point(|&h| h <= site);
+    // window w's expected errors: heterozygotes after the previous window's last marker
+    // (from the first marker for w = 0) up to the next window's first marker (the
+    // last marker for the last window)
+    let mut exp_err: Vec<f64> = bounds.iter().map(|&(s, en)| {
+        let lo = if s == 0 { hets.partition_point(|&h| h < mk[0]) } else { upto(mk[s - 1]) };
+        let hi = upto(if en >= n_m { mk[n_m - 1] } else { mk[en] });
+        cum[hi] - cum[lo]
+    }).collect();
+    // scale by the window's marker share of heterozygotes: at sequencing density most
+    // of the summed error mass is short-range and never flips a window's orientation
+    for (w, &(s, en)) in bounds.iter().enumerate() {
+        let n_all = upto(mk[en - 1]) - hets.partition_point(|&h| h < mk[s]);
+        let n_mk = (s..en).filter(|&i| m0[i] != m1[i]).count();
+        exp_err[w] *= (n_mk as f64 / n_all.max(1) as f64).min(1.0);
+    }
+    let Some(path) = viterbi(&e, &exp_err, &mut out) else { return out };
+    let orient: Vec<usize> = path.iter().map(|s| s % 2).collect();
+    // orientation per heterozygote; each change at the best het of its two windows
+    let mut het_o = vec![orient[0] as u8; hets.len()];
+    let mut last_h = 0usize;
+    for w in 1..w_n {
+        if orient[w] == orient[w - 1] { continue; }
+        let lo = hets.partition_point(|&h| h < mk[bounds[w - 1].0]).max(last_h);
+        let hi = upto(mk[bounds[w].1 - 1]);
+        if hi < lo + 2 { continue; }
+        let (ga, gb) = (path[w] / 2 / G, path[w] / 2 % G);
+        let (o1, o2) = (orient[w - 1], orient[w]);
+        let sites = &hets[lo..hi];
+        let lf = log_freqs(&fetch(sites, &dp.t.haps), &dp.t.group, sites.len());
+        let ll = |i: usize, o: usize| {
+            let v = sites[i];
+            let (x, y) = if o == 0 { (a0[v], a1[v]) } else { (a1[v], a0[v]) };
+            lf[i][ga][x as usize] + lf[i][gb][y as usize]
+        };
+        let n = hi - lo;
+        let (mut c1, mut c2) = (vec![0.0f64; n], vec![0.0f64; n]);
+        let (mut x1, mut x2) = (0.0, 0.0);
+        for i in 0..n { x1 += ll(i, o1); x2 += ll(i, o2); c1[i] = x1; c2[i] = x2; }
+        let mut best: Option<(usize, f64)> = None;
+        for j in 1..n {
+            let key = c1[j - 1] + (c2[n - 1] - c2[j - 1]) + PQ_W * hpe[lo + j].ln();
+            if best.is_none_or(|(_, b)| key > b) { best = Some((j, key)); }
+        }
+        let Some((j, _)) = best else { continue };
+        het_o[lo + j..].fill(o2 as u8);
+        last_h = lo + j;
+    }
+    if het_o.is_empty() { return out; }
+    // het orientations -> chip-site ranges (a range runs from its first het to the next change)
+    let first = het_o[0];
+    let mut start: Option<usize> = None;
+    for i in 0..=het_o.len() {
+        let flip = i < het_o.len() && (het_o[i] ^ first) == 1;
+        match (flip, start) {
+            (true, None) => start = Some(hets[i]),
+            (false, Some(s)) => { out.flips.push((s, if i < hets.len() { hets[i] } else { a0.len() })); start = None; }
             _ => {}
         }
     }
@@ -374,21 +557,31 @@ pub fn decide(panel: &Panel, a0: &[u8], a1: &[u8], pq: &[u8]) -> Decision {
     out
 }
 
+/// Which check a run uses.
+pub enum Checker<'a> { Array(&'a Panel), Dense(&'a DensePanel, &'a Fetch<'a>) }
+
 /// Run the corrector on every sample of a phased scaffold (`n_sites x n_haps`,
 /// row-major, targets 2s / 2s+1), swapping alleles under `Mode::Apply`. `pq` is
 /// the solve's phase quality (`n_sites x n_samples`); PQ entries of a changed
-/// relation (the first segment-HMM heterozygote at or after each cut) become `PQ_NONE`. Returns the
-/// number of samples corrected.
-pub fn correct_scaffold(panel: &Panel, phased: &mut [u8], pq: &mut [u8], n_samples: usize, apply: bool) -> usize {
-    use rayon::prelude::*;
-    let n = panel.n_sites;
+/// relation (the first segment-HMM heterozygote at or after each cut) become
+/// `PQ_NONE`. Returns the number of samples corrected.
+pub fn correct_scaffold(check: &Checker, phased: &mut [u8], pq: &mut [u8], n_sites: usize, n_samples: usize, apply: bool) -> usize {
+    let n = n_sites;
     let n_haps = n_samples * 2;
-    let decisions: Vec<Decision> = (0..n_samples).into_par_iter().map(|s| {
-        let a0: Vec<u8> = (0..n).map(|v| phased[v * n_haps + 2 * s]).collect();
-        let a1: Vec<u8> = (0..n).map(|v| phased[v * n_haps + 2 * s + 1]).collect();
-        let q: Vec<u8> = (0..n).map(|v| pq[v * n_samples + s]).collect();
-        decide(panel, &a0, &a1, &q)
-    }).collect();
+    let (ph, qq): (&[u8], &[u8]) = (phased, pq);
+    let sample = move |s: usize| -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        ((0..n).map(|v| ph[v * n_haps + 2 * s]).collect(),
+         (0..n).map(|v| ph[v * n_haps + 2 * s + 1]).collect(),
+         (0..n).map(|v| qq[v * n_samples + s]).collect())
+    };
+    let decisions: Vec<Decision> = match check {
+        Checker::Array(p) => {
+            use rayon::prelude::*;
+            (0..n_samples).into_par_iter().map(|s| { let (a0, a1, q) = sample(s); decide(p, &a0, &a1, &q) }).collect()
+        }
+        // the dense check reads the panel at each junction through `fetch`: one sample at a time
+        Checker::Dense(d, f) => (0..n_samples).map(|s| { let (a0, a1, q) = sample(s); decide_dense(d, &a0, &a1, &q, *f) }).collect(),
+    };
     let mut n_done = 0;
     for (s, d) in decisions.iter().enumerate() {
         let span: usize = d.flips.iter().map(|&(a, b)| b - a).sum();

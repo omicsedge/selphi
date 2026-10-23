@@ -398,11 +398,25 @@ fn run_phasing(inp: &PhasingInputs) -> PhasingResult {
     // Labelled panel templates for the ancestry phase check, packed before the
     // phase-only path releases the chip-site matrix.
     let anc = selphi::diploid::anc_phase::mode();
-    let anc_panel = if anc == selphi::diploid::anc_phase::Mode::Off { None }
-        else if selphi::diploid::anc_phase::too_dense(chip_bps) {
-            selphi_info!("  SELPHI_ANC_POST: sequencing-density input; the ancestry phase check covers array density only");
-            None
-        } else {
+    let anc_dense = anc != selphi::diploid::anc_phase::Mode::Off && selphi::diploid::anc_phase::too_dense(chip_bps);
+    // At sequencing density the check reads the panel from the SRP at its markers and
+    // at each junction (the chip-site matrix may not exist on this path).
+    let anc_fetch = |sites: &[usize], haps: &[usize]| -> Vec<u64> {
+        let wgs: Vec<usize> = sites.iter().map(|&v| wgs_idx[v]).collect();
+        let bm = srp.extract_ref_alleles_bitmatrix(&wgs);
+        selphi::diploid::anc_phase::fetch_full(&bm)(&(0..sites.len()).collect::<Vec<_>>(), haps)
+    };
+    let anc_dense_panel = if anc_dense {
+        let t0 = Instant::now();
+        let d = selphi::diploid::anc_phase::DensePanel::prepare(&srp.sample_ids, n_ref, chip_bps, &anc_fetch);
+        match &d {
+            Some(d) => selphi_step!("Ancestry phase check, sequencing density: {} markers ({} labelled panel samples per group) [{:.1}s]",
+                d.markers.len(), d.t.n_per_group, t0.elapsed().as_secs_f64()),
+            None => selphi_info!("  SELPHI_ANC_POST: the panel lacks a labelled 1000 Genomes sample in some group; no check"),
+        }
+        d
+    } else { None };
+    let anc_panel = if anc == selphi::diploid::anc_phase::Mode::Off || anc_dense { None } else {
         match ref_bm_full.as_ref() {
             Some(full) => {
                 let p = selphi::diploid::anc_phase::Panel::prepare(full, &srp.sample_ids);
@@ -537,11 +551,16 @@ male chrX): phasing on all {} called sites", scaffold.indices.len());
         let mut pq = dp.pq;
         // Ancestry-aware long-range correction of the solve (diploid::anc_phase), before
         // the members are stacked and aligned to it.
-        if let (Some(panel), Some(q)) = (anc_panel.as_ref(), pq.as_mut()) {
-            let n = selphi::diploid::anc_phase::correct_scaffold(panel, &mut phased0, q, n_samples,
+        let checker = match (anc_panel.as_ref(), anc_dense_panel.as_ref()) {
+            (Some(p), _) => Some((selphi::diploid::anc_phase::Checker::Array(p), p.n_per_group)),
+            (None, Some(d)) => Some((selphi::diploid::anc_phase::Checker::Dense(d, &anc_fetch), d.t.n_per_group)),
+            _ => None,
+        };
+        if let (Some((check, n_pg)), Some(q)) = (checker, pq.as_mut()) {
+            let n = selphi::diploid::anc_phase::correct_scaffold(&check, &mut phased0, q, n_chip, n_samples,
                 anc == selphi::diploid::anc_phase::Mode::Apply);
             selphi_step!("Ancestry phase check ({} labelled panel samples per group): {} of {} sample(s) {}",
-                panel.n_per_group, n, n_samples,
+                n_pg, n, n_samples,
                 if anc == selphi::diploid::anc_phase::Mode::Apply { "corrected" } else { "would be corrected (report)" });
         }
         if !selphi::diploid::sampling::pq_enabled() { pq = None; }

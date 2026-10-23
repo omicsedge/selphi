@@ -481,15 +481,24 @@ e.g. a male chrX): phasing on all {} called sites", scaffold.indices.len());
     // Ancestry-aware long-range correction of the solve (diploid::anc_phase), before
     // the members are aligned to it; its PQ is computed for it alone.
     let anc = selphi::diploid::anc_phase::mode();
-    if anc != selphi::diploid::anc_phase::Mode::Off && selphi::diploid::anc_phase::too_dense(chip_bps) {
-        selphi_info!("    SELPHI_ANC_POST: sequencing-density input; the ancestry phase check covers array density only");
-    } else if anc != selphi::diploid::anc_phase::Mode::Off && let Some(mut pq) = dp.pq {
-        match selphi::diploid::anc_phase::Panel::prepare(&ref_bm, &srp.sample_ids) {
-            Some(panel) => {
-                let n = selphi::diploid::anc_phase::correct_scaffold(&panel, &mut member0, &mut pq, n_samples,
+    if anc != selphi::diploid::anc_phase::Mode::Off && let Some(mut pq) = dp.pq {
+        let dense = selphi::diploid::anc_phase::too_dense(chip_bps);
+        let fetch = selphi::diploid::anc_phase::fetch_full(&ref_bm);
+        let dense_panel = if dense {
+            selphi::diploid::anc_phase::DensePanel::prepare(&srp.sample_ids, n_ref, chip_bps, &fetch)
+        } else { None };
+        let array_panel = if dense { None } else { selphi::diploid::anc_phase::Panel::prepare(&ref_bm, &srp.sample_ids) };
+        let checker = match (array_panel.as_ref(), dense_panel.as_ref()) {
+            (Some(p), _) => Some((selphi::diploid::anc_phase::Checker::Array(p), p.n_per_group)),
+            (None, Some(d)) => Some((selphi::diploid::anc_phase::Checker::Dense(d, &fetch), d.t.n_per_group)),
+            _ => None,
+        };
+        match checker {
+            Some((check, n_pg)) => {
+                let n = selphi::diploid::anc_phase::correct_scaffold(&check, &mut member0, &mut pq, n_chip, n_samples,
                     anc == selphi::diploid::anc_phase::Mode::Apply);
                 selphi_info!("    Ancestry phase check ({} labelled panel samples per group): {} of {} sample(s) {}",
-                    panel.n_per_group, n, n_samples,
+                    n_pg, n, n_samples,
                     if anc == selphi::diploid::anc_phase::Mode::Apply { "corrected" } else { "would be corrected (report)" });
             }
             None => selphi_info!("    SELPHI_ANC_POST: the panel lacks a labelled 1000 Genomes sample in some group; no check"),
