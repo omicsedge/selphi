@@ -401,10 +401,9 @@ fn run_phasing(inp: &PhasingInputs) -> PhasingResult {
     let anc_dense = anc != selphi::diploid::anc_phase::Mode::Off && selphi::diploid::anc_phase::too_dense(chip_bps);
     // At sequencing density the check reads the panel from the SRP at its markers and
     // at each junction (the chip-site matrix may not exist on this path).
-    let anc_fetch = |sites: &[usize], haps: &[usize]| -> Vec<u64> {
+    let anc_fetch = |sites: &[usize]| -> selphi::common::HaplotypeBitmatrix {
         let wgs: Vec<usize> = sites.iter().map(|&v| wgs_idx[v]).collect();
-        let bm = srp.extract_ref_alleles_bitmatrix(&wgs);
-        selphi::diploid::anc_phase::fetch_full(&bm)(&(0..sites.len()).collect::<Vec<_>>(), haps)
+        srp.extract_ref_alleles_bitmatrix(&wgs)
     };
     let anc_dense_panel = if anc_dense {
         let t0 = Instant::now();

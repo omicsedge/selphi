@@ -111,9 +111,23 @@ fn rank(id: &str) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Template-major allele bits of panel haplotypes `haps` at chip sites `sites`
-/// (`words = sites.len().div_ceil(64)` u64 per haplotype).
-pub type Fetch<'a> = dyn Fn(&[usize], &[usize]) -> Vec<u64> + 'a;
+/// The panel (every haplotype) at chip sites `sites`, site-major.
+pub type Fetch<'a> = dyn Fn(&[usize]) -> HaplotypeBitmatrix + 'a;
+
+/// Template-major allele bits (`words = n_sites.div_ceil(64)` u64 per haplotype) of
+/// panel haplotypes `haps` from a site-major panel matrix.
+fn template_bits(bm: &HaplotypeBitmatrix, haps: &[usize]) -> Vec<u64> {
+    let n = bm.n_sites;
+    let words = n.div_ceil(64);
+    let mut bits = vec![0u64; haps.len() * words];
+    for v in 0..n {
+        let row = bm.row(v);
+        for (t, &h) in haps.iter().enumerate() {
+            if (row[h / 64] >> (h % 64)) & 1 == 1 { bits[t * words + v / 64] |= 1u64 << (v % 64); }
+        }
+    }
+    bits
+}
 
 /// The chosen templates: panel haplotype indices, their groups, samples per group.
 pub struct Templates { pub haps: Vec<usize>, pub group: Vec<u8>, pub n_per_group: usize }
@@ -200,8 +214,7 @@ impl Panel {
     /// panel there, two haplotypes per sample in `sample_ids` order.
     pub fn prepare(ref_bm: &HaplotypeBitmatrix, sample_ids: &[String]) -> Option<Panel> {
         let t = choose_templates(sample_ids, ref_bm.n_haps)?;
-        let sites: Vec<usize> = (0..ref_bm.n_sites).collect();
-        let bits = fetch_full(ref_bm)(&sites, &t.haps);
+        let bits = template_bits(ref_bm, &t.haps);
         Some(Panel::from_bits(&t, ref_bm.n_sites, bits))
     }
 
@@ -253,18 +266,13 @@ impl Panel {
     }
 }
 
-/// Template bits from a chip-site panel matrix already in memory.
-pub fn fetch_full(ref_bm: &HaplotypeBitmatrix) -> impl Fn(&[usize], &[usize]) -> Vec<u64> + '_ {
-    move |sites: &[usize], haps: &[usize]| {
-        let words = sites.len().div_ceil(64);
-        let mut bits = vec![0u64; haps.len() * words];
-        for (t, &h) in haps.iter().enumerate() {
-            let row = &mut bits[t * words..(t + 1) * words];
-            for (i, &v) in sites.iter().enumerate() {
-                if ref_bm.get(v, h) { row[i / 64] |= 1u64 << (i % 64); }
-            }
-        }
-        bits
+/// The panel rows at `sites` from a chip-site panel matrix already in memory.
+pub fn fetch_full(ref_bm: &HaplotypeBitmatrix) -> impl Fn(&[usize]) -> HaplotypeBitmatrix + '_ {
+    move |sites: &[usize]| {
+        let nw = ref_bm.n_words();
+        let mut bits = Vec::with_capacity(sites.len() * nw);
+        for &v in sites { bits.extend_from_slice(ref_bm.row(v)); }
+        HaplotypeBitmatrix::from_raw(bits, sites.len(), ref_bm.n_haps)
     }
 }
 
@@ -430,11 +438,12 @@ fn ranges(o: &[u8]) -> Vec<(usize, usize)> {
 }
 
 /// Sequencing density: the check reads ancestry at markers chosen from the panel
-/// (one common SNP per `MARKER_BIN_BP`: the first site of each `GRID_BP` bin whose
-/// template minor-allele frequency is at least `MARKER_MAF`), and places each change
-/// at the heterozygote, among ALL heterozygotes of the two windows, with the best
-/// frequency split + PQ term (group frequencies read for those sites only).
-const GRID_BP: i64 = 1_000;
+/// (per `MARKER_BIN_BP` bin of the chip sites, the first whose template minor-allele
+/// frequency is at least `MARKER_MAF`; the panel is read once in `SCAN_CHUNK`-site
+/// pieces to find them), and places each change at the heterozygote, among ALL
+/// heterozygotes of the two windows, with the best frequency split + PQ term (group
+/// frequencies read for those sites only).
+const SCAN_CHUNK: usize = 16_384;
 const MARKER_BIN_BP: i64 = 5_000;
 const MARKER_MAF: f64 = 0.05;
 
@@ -444,31 +453,33 @@ pub struct DensePanel { pub t: Templates, pub markers: Vec<usize>, pub panel: Pa
 impl DensePanel {
     pub fn prepare(sample_ids: &[String], n_ref_haps: usize, chip_bp: &[i64], fetch: &Fetch) -> Option<DensePanel> {
         let t = choose_templates(sample_ids, n_ref_haps)?;
-        let mut grid = Vec::new();
-        let mut last_bin = i64::MIN;
-        for (v, &bp) in chip_bp.iter().enumerate() {
-            let b = bp.div_euclid(GRID_BP);
-            if b != last_bin { grid.push(v); last_bin = b; }
-        }
-        let bits = fetch(&grid, &t.haps);
-        let words = grid.len().div_ceil(64);
         let n_t = t.haps.len();
+        let mut mask = vec![0u64; n_ref_haps.div_ceil(64)];
+        for &h in &t.haps { mask[h / 64] |= 1u64 << (h % 64); }
         let mut markers = Vec::new();
-        let mut keep = Vec::new();
-        let mut last_mb = i64::MIN;
-        for (i, &v) in grid.iter().enumerate() {
-            let mb = chip_bp[v].div_euclid(MARKER_BIN_BP);
-            if mb == last_mb { continue; }
-            let alt = (0..n_t).filter(|&tt| (bits[tt * words + i / 64] >> (i % 64)) & 1 == 1).count();
-            let f = alt as f64 / n_t as f64;
-            if f.min(1.0 - f) >= MARKER_MAF { markers.push(v); keep.push(i); last_mb = mb; }
+        let mut cols: Vec<Vec<bool>> = Vec::new();   // per marker, the templates' alleles
+        let mut last_bin = i64::MIN;
+        let all: Vec<usize> = (0..chip_bp.len()).collect();
+        for chunk in all.chunks(SCAN_CHUNK) {
+            // skip a chunk whose every site lies in a bin that already has its marker
+            if chip_bp[*chunk.last().unwrap()].div_euclid(MARKER_BIN_BP) == last_bin { continue; }
+            let bm = fetch(chunk);
+            for (i, &v) in chunk.iter().enumerate() {
+                let b = chip_bp[v].div_euclid(MARKER_BIN_BP);
+                if b == last_bin { continue; }
+                let row = bm.row(i);
+                let alt: u32 = row.iter().zip(&mask).map(|(x, m)| (x & m).count_ones()).sum();
+                let f = alt as f64 / n_t as f64;
+                if f.min(1.0 - f) < MARKER_MAF { continue; }
+                markers.push(v);
+                cols.push(t.haps.iter().map(|&h| (row[h / 64] >> (h % 64)) & 1 == 1).collect());
+                last_bin = b;
+            }
         }
         let mw = markers.len().div_ceil(64);
         let mut mbits = vec![0u64; n_t * mw];
-        for tt in 0..n_t {
-            for (j, &i) in keep.iter().enumerate() {
-                if (bits[tt * words + i / 64] >> (i % 64)) & 1 == 1 { mbits[tt * mw + j / 64] |= 1u64 << (j % 64); }
-            }
+        for (j, c) in cols.iter().enumerate() {
+            for (tt, &a) in c.iter().enumerate() { if a { mbits[tt * mw + j / 64] |= 1u64 << (j % 64); } }
         }
         let panel = Panel::from_bits(&t, markers.len(), mbits);
         Some(DensePanel { t, markers, panel })
@@ -522,7 +533,7 @@ pub fn decide_dense(dp: &DensePanel, a0: &[u8], a1: &[u8], pq: &[u8], fetch: &Fe
         let (ga, gb) = (path[w] / 2 / G, path[w] / 2 % G);
         let (o1, o2) = (orient[w - 1], orient[w]);
         let sites = &hets[lo..hi];
-        let lf = log_freqs(&fetch(sites, &dp.t.haps), &dp.t.group, sites.len());
+        let lf = log_freqs(&template_bits(&fetch(sites), &dp.t.haps), &dp.t.group, sites.len());
         let ll = |i: usize, o: usize| {
             let v = sites[i];
             let (x, y) = if o == 0 { (a0[v], a1[v]) } else { (a1[v], a0[v]) };
