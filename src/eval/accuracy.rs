@@ -939,9 +939,9 @@ impl VariantReader {
         }
     }
 
-    /// Seek to a genomic position using CSI index. BCF only.
+    /// Seek to a genomic position with the file's seek index (CSI for BCF, TBI for VCF).
     /// pos is 1-based VCF position.
-    fn seek_to_position(&mut self, pos: i64) -> io::Result<()> {
+    fn seek_to_position(&mut self, pos: i64, index: &SeekIndex) -> io::Result<()> {
         match self {
             VariantReader::Bcf { reader, path, header_end_vpos, .. } => {
                 // Always re-open on seek (matches the VCF path). Seeking an
@@ -960,10 +960,9 @@ impl VariantReader {
                     *reader = open_fresh(vp, path)?;
                     return Ok(());
                 }
-                let csi_path = { let mut p = path.as_os_str().to_owned(); p.push(".csi"); std::path::PathBuf::from(p) };
-                if csi_path.exists() {
-                    let csi = crate::srp::csi::parse_csi(&csi_path)?;
-                    let vp = crate::srp::csi::seek_for_position(&csi, pos - 1); // CSI uses 0-based
+                if let SeekIndex::Csi(csi) = index {
+                    let csi = csi.as_ref().map_err(|(kind, msg)| io::Error::new(*kind, msg.clone()))?;
+                    let vp = crate::srp::csi::seek_for_position(csi, pos - 1); // CSI uses 0-based
                     *reader = open_fresh(vp, path)?;
                     Ok(())
                 } else {
@@ -984,12 +983,10 @@ impl VariantReader {
                     *reader = BufReader::new(bgzf);
                     return Ok(());
                 }
-                let tbi_path = { let mut p = path.as_os_str().to_owned(); p.push(".tbi"); std::path::PathBuf::from(p) };
-                if !tbi_path.exists() { return Ok(()); }
-                let tbi = match crate::srp::csi::parse_tbi(&tbi_path) { Ok(t) => t, Err(_) => return Ok(()) };
+                let SeekIndex::Tbi(Some(tbi)) = index else { return Ok(()) };
                 // Pick the first contig with non-empty linear index (typical single-chr eval).
                 let contig_idx = tbi.linear.iter().position(|lin| !lin.is_empty()).unwrap_or(0);
-                let vp = crate::srp::csi::tbi_seek(&tbi, contig_idx, pos - 1);
+                let vp = crate::srp::csi::tbi_seek(tbi, contig_idx, pos - 1);
                 let f = std::fs::File::open(path)?;
                 let mut bgzf = noodles_bgzf::io::Reader::new(BufReader::with_capacity(4 << 20, f));
                 bgzf.seek(vp)?;
@@ -1125,51 +1122,39 @@ fn rtstr(buf: &[u8], o: &mut usize) -> String {
 }
 
 /// Load 16 kb checkpoint positions (0-based) from the file's seek index.
-/// Returns None if no index is present next to the file.
-fn load_checkpoint_positions(path: &Path) -> Option<Vec<i64>> {
-    let s = path.to_string_lossy();
-    if sniff_bcf(path) || s.ends_with(".bcf") || s.ends_with(".bcf.gz") {
-        let csi_path = {
-            let mut p = path.as_os_str().to_owned();
-            p.push(".csi");
-            std::path::PathBuf::from(p)
-        };
-        if !csi_path.exists() { return None; }
-        let csi = crate::srp::csi::parse_csi(&csi_path).ok()?;
-        let mut positions: Vec<i64> = csi.checkpoints.iter().map(|&(pos, _)| pos).collect();
-        positions.sort();
-        positions.dedup();
-        if positions.is_empty() { return None; }
-        Some(positions)
-    } else if s.ends_with(".vcf.gz") {
-        let tbi_path = {
-            let mut p = path.as_os_str().to_owned();
-            p.push(".tbi");
-            std::path::PathBuf::from(p)
-        };
-        if !tbi_path.exists() { return None; }
-        let tbi = crate::srp::csi::parse_tbi(&tbi_path).ok()?;
-        // TBI linear index: one vpos per 16 kbp interval. Non-zero entries
-        // mark intervals with records. Use the contig that actually has data.
-        let linear = tbi.linear.iter().find(|l| !l.is_empty())?;
-        let positions: Vec<i64> = linear.iter().enumerate()
-            .filter(|&(_, &v)| v != 0)
-            .map(|(i, _)| (i as i64) * 16384)
-            .collect();
-        if positions.is_empty() { return None; }
-        Some(positions)
-    } else {
-        None
+/// Returns None if the file has no usable index.
+fn load_checkpoint_positions(path: &Path, index: &SeekIndex) -> Option<Vec<i64>> {
+    match index {
+        SeekIndex::Csi(csi) => {
+            let csi = csi.as_ref().ok()?;
+            let mut positions: Vec<i64> = csi.checkpoints.iter().map(|&(pos, _)| pos).collect();
+            positions.sort();
+            positions.dedup();
+            if positions.is_empty() { return None; }
+            Some(positions)
+        }
+        SeekIndex::Tbi(Some(tbi)) if path.to_string_lossy().ends_with(".vcf.gz") => {
+            // TBI linear index: one vpos per 16 kbp interval. Non-zero entries
+            // mark intervals with records. Use the contig that actually has data.
+            let linear = tbi.linear.iter().find(|l| !l.is_empty())?;
+            let positions: Vec<i64> = linear.iter().enumerate()
+                .filter(|&(_, &v)| v != 0)
+                .map(|(i, _)| (i as i64) * 16384)
+                .collect();
+            if positions.is_empty() { return None; }
+            Some(positions)
+        }
+        _ => None,
     }
 }
 
 /// Build parallel evaluation regions. Prefers variant-balanced split
 /// (equal number of 16 kb checkpoints per region) using the imputed file's
 /// seek index; falls back to equal-bp split when no index is available.
-fn build_eval_regions(imputed_path: &Path, n_regions: usize) -> Vec<(i64, i64)> {
+fn build_eval_regions(imputed_path: &Path, index: &SeekIndex, n_regions: usize) -> Vec<(i64, i64)> {
     let n_regions = n_regions.max(1);
 
-    if let Some(cp) = load_checkpoint_positions(imputed_path) {
+    if let Some(cp) = load_checkpoint_positions(imputed_path, index) {
         // Spread checkpoints across regions. Each region covers `stride`
         // consecutive checkpoints, giving approximately equal record count
         // since each 16 kb checkpoint represents a similar number of records
@@ -1206,32 +1191,52 @@ fn build_eval_regions(imputed_path: &Path, n_regions: usize) -> Vec<(i64, i64)> 
         .collect()
 }
 
-/// Parallel evaluation: split by genomic region, one thread per region.
-/// Each thread opens its own file handles and evaluates its portion independently.
-/// Make sure a seek-enabling index exists for a VCF.gz or BCF file, so the
-/// parallel evaluator can skip to its assigned region via pread instead of
-/// decompressing the whole file in every thread. No-op when an index already
-/// exists next to the file.
-fn ensure_seek_index(path: &Path) -> io::Result<()> {
-    let s = path.to_string_lossy();
-    let is_bcf = sniff_bcf(path) || s.ends_with(".bcf") || s.ends_with(".bcf.gz");
-    if is_bcf {
-        let csi = { let mut p = path.as_os_str().to_owned(); p.push(".csi"); std::path::PathBuf::from(p) };
-        if !csi.exists() {
-            crate::selphi_info!("  Building CSI index for parallel eval: {}", path.display());
-            crate::srp::csi::build_csi_index(path).map_err(|e|
-                io::Error::other(format!("CSI build failed: {}", e)))?;
-        }
-    } else if s.ends_with(".vcf.gz") {
-        let tbi = { let mut p = path.as_os_str().to_owned(); p.push(".tbi"); std::path::PathBuf::from(p) };
-        if !tbi.exists() {
-            crate::selphi_info!("  Building TBI index for parallel eval: {}", path.display());
-            crate::srp::csi::build_tbi_index(path)?;
-        }
-    }
-    Ok(())
+/// The seek index the parallel evaluator uses for one input, resolved once per
+/// evaluation. It lets every region thread skip to its region instead of
+/// decompressing the whole file. Read from the index next to the file when there is
+/// one; otherwise built IN MEMORY by scanning the file, so an evaluation never writes
+/// next to its inputs (a read-only folder, a sealed bundle). The in-memory index is
+/// the one the file would hold (`csi::build_*_index_data`), so the regions and seeks
+/// are the same either way.
+enum SeekIndex {
+    /// BCF. `Err` is why an existing .csi could not be parsed: a seek past the
+    /// start fails with it and the regions fall back to equal-bp splits.
+    Csi(Result<crate::srp::csi::CsiIndex, (io::ErrorKind, String)>),
+    /// Text VCF. `None`: no usable .tbi; a seek leaves the reader at the first record.
+    Tbi(Option<crate::srp::csi::TbiIndex>),
 }
 
+impl SeekIndex {
+    fn resolve(path: &Path) -> io::Result<Self> {
+        let s = path.to_string_lossy();
+        let is_bcf = sniff_bcf(path) || s.ends_with(".bcf") || s.ends_with(".bcf.gz");
+        if is_bcf {
+            let csi = { let mut p = path.as_os_str().to_owned(); p.push(".csi"); std::path::PathBuf::from(p) };
+            let parsed = if csi.exists() {
+                crate::srp::csi::parse_csi(&csi)
+            } else {
+                crate::selphi_info!("  Building CSI index in memory for parallel eval: {}", path.display());
+                let data = crate::srp::csi::build_csi_index_data(path).map_err(|e|
+                    io::Error::other(format!("CSI build failed: {}", e)))?;
+                crate::srp::csi::parse_csi_data(data)
+            };
+            return Ok(SeekIndex::Csi(parsed.map_err(|e| (e.kind(), e.to_string()))));
+        }
+        let tbi = { let mut p = path.as_os_str().to_owned(); p.push(".tbi"); std::path::PathBuf::from(p) };
+        if tbi.exists() {
+            Ok(SeekIndex::Tbi(crate::srp::csi::parse_tbi(&tbi).ok()))
+        } else if s.ends_with(".vcf.gz") {
+            crate::selphi_info!("  Building TBI index in memory for parallel eval: {}", path.display());
+            let data = crate::srp::csi::build_tbi_index_data(path)?;
+            Ok(SeekIndex::Tbi(crate::srp::csi::parse_tbi_data(&data).ok()))
+        } else {
+            Ok(SeekIndex::Tbi(None))
+        }
+    }
+}
+
+/// Parallel evaluation: split by genomic region, one thread per region.
+/// Each thread opens its own file handles and evaluates its portion independently.
 pub fn evaluate_parallel(
     imputed_path: &Path, truth_path: &Path, shared_samples: &[String], n_threads: usize,
     exclude: &super::exclude::SiteExclusion,
@@ -1261,11 +1266,11 @@ fn evaluate_parallel_with_options(
     let n_samples = shared_samples.len();
     let exclude_ref = exclude;
 
-    // Ensure parallel-seek indexes exist so each thread can pread-seek its
-    // region instead of re-scanning from BOF. Without this, 16 threads each
-    // decompress the whole 10+ GB file → pathologically slow.
-    ensure_seek_index(imputed_path)?;
-    ensure_seek_index(truth_path)?;
+    // Seek indexes, so each thread can pread-seek its region instead of
+    // re-scanning from BOF. Without them, 16 threads each decompress the whole
+    // 10+ GB file → pathologically slow. Built in memory when a file has none.
+    let imp_index = SeekIndex::resolve(imputed_path)?;
+    let truth_index = SeekIndex::resolve(truth_path)?;
 
     // Get sample info
     let (_, imp_samples) = VariantReader::open(imputed_path)?;
@@ -1288,7 +1293,7 @@ fn evaluate_parallel_with_options(
     // equal number of checkpoints → roughly equal record count. Falls back to
     // equal-bp splitting if no index is available.
     let n_regions = n_threads * 4;
-    let regions = build_eval_regions(imputed_path, n_regions);
+    let regions = build_eval_regions(imputed_path, &imp_index, n_regions);
 
     let imp_path = imputed_path.to_path_buf();
     let truth_path_buf = truth_path.to_path_buf();
@@ -1309,8 +1314,8 @@ fn evaluate_parallel_with_options(
                 truth_reader.set_dosage_options(options.truth);
 
                 // Seek to region start via CSI/TBI index (O(1) instead of scanning)
-                imp_reader.seek_to_position(region_start)?;
-                truth_reader.seek_to_position(region_start)?;
+                imp_reader.seek_to_position(region_start, &imp_index)?;
+                truth_reader.seek_to_position(region_start, &truth_index)?;
 
                 let mut site_acc = SiteAccumulator::new();
                 let mut sample_acc = SampleAccumulator::new(n_samples);
@@ -2482,5 +2487,52 @@ mod tests {
             }
         }
         assert!(n_err > 100, "error paths barely exercised ({n_err})");
+    }
+
+    /// A VCF.gz of `n` biallelic records 1 kb apart (so the TBI has many 16 kb windows).
+    fn spread_fixture(dir: &Path, name: &str, samples: &[&str], n: usize, salt: usize) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let mut writer = noodles_bgzf::io::Writer::new(std::fs::File::create(&path).unwrap());
+        writeln!(writer, "##fileformat=VCFv4.2\n##contig=<ID=X,length=10000000>\n##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n##FORMAT=<ID=DS,Number=1,Type=Float,Description=\"Dosage\">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{}", samples.join("\t")).unwrap();
+        for i in 0..n {
+            let calls: Vec<String> = (0..samples.len()).map(|s| {
+                let k = (i * 7 + s * 3 + salt) % 5;
+                let gt = ["0/0", "0/1", "1/1", "0/1", "0/0"][k];
+                format!("{gt}:{:.2}", [0.1, 0.9, 1.8, 1.2, 0.0][(k + salt) % 5])
+            }).collect();
+            writeln!(writer, "X\t{}\t.\tA\tG\t.\tPASS\t.\tGT:DS\t{}", 1000 + i * 1000, calls.join("\t")).unwrap();
+        }
+        writer.try_finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn evaluation_without_index_files_writes_nothing_and_scores_as_with_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["A", "B", "C", "D"];
+        let shared: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        let imp = spread_fixture(dir.path(), "imp.vcf.gz", &names, 600, 1);
+        let truth = spread_fixture(dir.path(), "truth.vcf.gz", &names, 600, 0);
+        let listing = || { let mut v: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect(); v.sort(); v };
+        let before = listing();
+        let opts = EvaluationOptions::default();
+        let none = super::super::exclude::SiteExclusion::default();
+        let (s0, p0, c0) = evaluate_parallel_with_options(&imp, &truth, &shared, 4, &none, &opts).unwrap();
+        assert_eq!(before, listing(), "evaluation wrote next to its inputs");
+        // The in-memory index is the one the file holds: same regions, same scores.
+        crate::srp::csi::build_tbi_index(&imp).unwrap();
+        crate::srp::csi::build_tbi_index(&truth).unwrap();
+        let (s1, p1, c1) = evaluate_parallel_with_options(&imp, &truth, &shared, 4, &none, &opts).unwrap();
+        assert_eq!((c0.n_matched, c0.n_imp_variants, c0.n_truth_variants), (600, 600, 600));
+        assert_eq!((c0.n_matched, c0.n_imp_variants, c0.n_truth_variants), (c1.n_matched, c1.n_imp_variants, c1.n_truth_variants));
+        assert_eq!(s0.total_r2_sum.to_bits(), s1.total_r2_sum.to_bits());
+        assert_eq!(s0.bin_n, s1.bin_n);
+        assert_eq!(p0.sum_ds_gt, p1.sum_ds_gt);
+        let tbi = |p: &Path| SeekIndex::resolve(p).ok().and_then(|i| match i { SeekIndex::Tbi(t) => t, _ => None });
+        let file_index = tbi(&imp).unwrap();
+        let data = crate::srp::csi::build_tbi_index_data(&imp).unwrap();
+        let mem_index = crate::srp::csi::parse_tbi_data(&data).unwrap();
+        assert_eq!(file_index.linear, mem_index.linear);
+        assert!(file_index.linear[0].len() > 16, "fixture should span many TBI windows");
     }
 }

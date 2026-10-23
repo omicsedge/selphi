@@ -22,15 +22,22 @@ pub struct CsiIndex {
     pub ref_seq_id: usize,
 }
 
+/// Read a BGZF-compressed index file and return its decompressed bytes.
+fn read_index_file(path: &Path) -> io::Result<Vec<u8>> {
+    let raw = std::fs::read(path)?;
+    let mut bgzf = noodles_bgzf::io::Reader::new(&raw[..]);
+    let mut dec = Vec::new();
+    bgzf.read_to_end(&mut dec)?;
+    Ok(dec)
+}
+
 /// Decompress CSI file and parse header. Returns (data, min_shift, depth, n_ref, offset_after_header).
 fn decompress_csi_header(path: &Path) -> io::Result<(Vec<u8>, i32, i32, usize, usize)> {
-    let raw = std::fs::read(path)?;
-    let data = {
-        let mut bgzf = noodles_bgzf::io::Reader::new(&raw[..]);
-        let mut dec = Vec::new();
-        bgzf.read_to_end(&mut dec)?;
-        dec
-    };
+    csi_header(read_index_file(path)?)
+}
+
+/// Parse the header of decompressed CSI bytes. Returns (data, min_shift, depth, n_ref, offset_after_header).
+fn csi_header(data: Vec<u8>) -> io::Result<(Vec<u8>, i32, i32, usize, usize)> {
     if data.len() < 16 || &data[..4] != b"CSI\x01" {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "not a CSI index"));
     }
@@ -148,7 +155,13 @@ fn scan_ref_bins(
 /// Parse a .csi index file. Scans all reference sequences and selects the one
 /// with the most mapped records (highest n_mapped from pseudo-bin).
 pub fn parse_csi(path: &Path) -> io::Result<CsiIndex> {
-    let (data, min_shift, depth, n_ref, mut off) = decompress_csi_header(path)?;
+    parse_csi_data(read_index_file(path)?)
+}
+
+/// [`parse_csi`] of an index already in memory: the decompressed bytes of a .csi file,
+/// as [`build_csi_index_data`] returns them.
+pub fn parse_csi_data(data: Vec<u8>) -> io::Result<CsiIndex> {
+    let (data, min_shift, depth, n_ref, mut off) = csi_header(data)?;
 
     // Scan all reference sequences, pick the one with the most data
     let mut best_ref: usize = 0;
@@ -307,13 +320,12 @@ pub struct TbiIndex {
 
 /// Parse a .tbi index file.
 pub fn parse_tbi(path: &Path) -> io::Result<TbiIndex> {
-    let raw = std::fs::read(path)?;
-    let data = {
-        let mut bgzf = noodles_bgzf::io::Reader::new(&raw[..]);
-        let mut dec = Vec::new();
-        bgzf.read_to_end(&mut dec)?;
-        dec
-    };
+    parse_tbi_data(&read_index_file(path)?)
+}
+
+/// [`parse_tbi`] of an index already in memory: the decompressed bytes of a .tbi file,
+/// as [`build_tbi_index_data`] returns them.
+pub fn parse_tbi_data(data: &[u8]) -> io::Result<TbiIndex> {
     if data.len() < 36 || &data[..4] != b"TBI\x01" {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "not a TBI index"));
     }
@@ -521,10 +533,23 @@ fn write_tbi_linear(out: &mut Vec<u8>, lin: Option<&Vec<u64>>) {
 /// Build a CSI index for a BCF file by scanning all records.
 /// Writes the .csi file next to the BCF.
 pub fn build_csi_index(bcf_path: &Path) -> io::Result<()> {
+    let csi_path = { let mut p = bcf_path.as_os_str().to_owned(); p.push(".csi"); std::path::PathBuf::from(p) };
+    let out = build_csi_index_data(bcf_path)?;
+
+    // BGZF-compress and write
+    let csi_file = std::fs::File::create(&csi_path)?;
+    let mut bgzf_writer = noodles_bgzf::io::Writer::new(csi_file);
+    bgzf_writer.write_all(&out)?;
+    bgzf_writer.try_finish()?;
+
+    Ok(())
+}
+
+/// The CSI index [`build_csi_index`] writes, as its decompressed bytes, without writing
+/// anything ([`parse_csi_data`] reads them).
+pub fn build_csi_index_data(bcf_path: &Path) -> io::Result<Vec<u8>> {
     use std::collections::BTreeMap;
     use std::io::BufReader;
-
-    let csi_path = { let mut p = bcf_path.as_os_str().to_owned(); p.push(".csi"); std::path::PathBuf::from(p) };
 
     let f = std::fs::File::open(bcf_path)?;
     let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -644,13 +669,7 @@ pub fn build_csi_index(bcf_path: &Path) -> io::Result<()> {
         }
     }
 
-    // BGZF-compress and write
-    let csi_file = std::fs::File::create(&csi_path)?;
-    let mut bgzf_writer = noodles_bgzf::io::Writer::new(csi_file);
-    bgzf_writer.write_all(&out)?;
-    bgzf_writer.try_finish()?;
-
-    Ok(())
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -660,10 +679,23 @@ pub fn build_csi_index(bcf_path: &Path) -> io::Result<()> {
 /// Build a TBI (tabix) index for a VCF.gz file by scanning all records.
 /// Writes the .tbi file next to the VCF.gz.
 pub fn build_tbi_index(vcf_gz_path: &Path) -> io::Result<()> {
+    let tbi_path = { let mut p = vcf_gz_path.as_os_str().to_owned(); p.push(".tbi"); std::path::PathBuf::from(p) };
+    let out = build_tbi_index_data(vcf_gz_path)?;
+
+    // BGZF-compress and write
+    let tbi_file = std::fs::File::create(&tbi_path)?;
+    let mut bgzf_writer = noodles_bgzf::io::Writer::new(tbi_file);
+    bgzf_writer.write_all(&out)?;
+    bgzf_writer.try_finish()?;
+
+    Ok(())
+}
+
+/// The TBI index [`build_tbi_index`] writes, as its decompressed bytes, without writing
+/// anything ([`parse_tbi_data`] reads them).
+pub fn build_tbi_index_data(vcf_gz_path: &Path) -> io::Result<Vec<u8>> {
     use std::collections::BTreeMap;
     use std::io::{BufRead, BufReader};
-
-    let tbi_path = { let mut p = vcf_gz_path.as_os_str().to_owned(); p.push(".tbi"); std::path::PathBuf::from(p) };
 
     let f = std::fs::File::open(vcf_gz_path)?;
     // NB: we read through `noodles_bgzf::io::Reader` directly (single-threaded
@@ -816,13 +848,7 @@ pub fn build_tbi_index(vcf_gz_path: &Path) -> io::Result<()> {
         }
     }
 
-    // BGZF-compress and write
-    let tbi_file = std::fs::File::create(&tbi_path)?;
-    let mut bgzf_writer = noodles_bgzf::io::Writer::new(tbi_file);
-    bgzf_writer.write_all(&out)?;
-    bgzf_writer.try_finish()?;
-
-    Ok(())
+    Ok(out)
 }
 
 /// One record's index metadata, resolved at collection time: 16 bytes, no heap.
