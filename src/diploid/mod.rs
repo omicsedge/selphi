@@ -464,6 +464,19 @@ fn _diploid_run(
         for (si, q) in per_sample.iter().enumerate() {
             for &(ci, v) in q { pq[common_indices[ci] * n_samples + si] = v; }
         }
+        // Under SELPHI_DIPLOID_NOCALL_OBSERVED a no-call entered the graph as a
+        // voted genotype that finish_scaffold may later re-vote: neither it nor the
+        // next heterozygote (whose PQ is relative to it) describes the output.
+        if phase_common::nocall_observed() {
+            for si in 0..n_samples {
+                let mut taint = false;
+                for &v in common_indices.iter() {
+                    let i = v * n_samples + si;
+                    if target_geno[v * n_samples * 2 + si * 2] > 1 { pq[i] = PQ_NONE; taint = true; }
+                    else if taint && pq[i] != PQ_NONE { pq[i] = PQ_NONE; taint = false; }
+                }
+            }
+        }
         pq
     });
 
@@ -858,7 +871,7 @@ mod tests {
             let common = scaffold::select(&target_geno, n_var, n_samples, Some(&full), scaffold::Source::Union, 0.001, None).indices;
             let phase = |geno: &[u8], n: usize, reps: usize| diploid_phase_bm_prefiltered(
                 geno, pbwt_neighbor::HaplotypeBitmatrix::from_subset(&full, &common), &common, phase_rare::RareRef::Full(&full),
-                &[], &bp, &[], &map_bp, &map_cm, n_var, n, n_ref, 11 + seed as i64, 4, 0, 2, None, reps);
+                &[], &bp, &[], &map_bp, &map_cm, n_var, n, n_ref, 11 + seed as i64, 4, 0, 2, None, reps).scaffolds;
             let got = phase(&target_geno, n_samples, k);
             let repeated = replicas::replicate_rows(&target_geno, n_var, n_tgt, k);
             let want = replicas::split_members(phase(&repeated, n_samples * k, 1), n_var, n_tgt, k);
