@@ -466,16 +466,33 @@ e.g. a male chrX): phasing on all {} called sites", scaffold.indices.len());
     // interpolation by imputation::ensemble. With phasing replicas every
     // copy contributes its `n_members` (copy 0's solve first).
     // The multi-chromosome path writes imputed output only (no --phase-only), so
-    // a phase quality computed under SELPHI_DIPLOID_PQ has nowhere to go here.
-    let mut scaffolds = selphi::diploid::diploid_phase_bm_prefiltered(
+    // a phase quality computed under SELPHI_DIPLOID_PQ has nowhere to go here
+    // except the ancestry phase check.
+    let dp = selphi::diploid::diploid_phase_bm_prefiltered(
         &targ_alleles, common_ref_bm, &common_chip_indices,
         selphi::diploid::phase_rare::RareRef::Full(&ref_bm),
         raw_chip_cm, chip_bps, &ref_bp, &map_bp_raw, &map_cm_raw,
         n_chip, n_samples, n_ref,
         config.seed, config.threads, config.max_cond_haps, n_members,
         ped_locked, replicas,
-    ).scaffolds;
-    let member0 = scaffolds.remove(0);
+    );
+    let mut scaffolds = dp.scaffolds;
+    let mut member0 = scaffolds.remove(0);
+    // Ancestry-aware long-range correction of the solve (diploid::anc_phase), before
+    // the members are aligned to it; its PQ is computed for it alone.
+    let anc = selphi::diploid::anc_phase::mode();
+    if anc != selphi::diploid::anc_phase::Mode::Off && let Some(mut pq) = dp.pq {
+        match selphi::diploid::anc_phase::Panel::prepare(&ref_bm, &srp.sample_ids) {
+            Some(panel) => {
+                let n = selphi::diploid::anc_phase::correct_scaffold(&panel, &mut member0, &mut pq, n_samples,
+                    anc == selphi::diploid::anc_phase::Mode::Apply);
+                selphi_info!("    Ancestry phase check ({} labelled panel samples per group): {} of {} sample(s) {}",
+                    panel.n_per_group, n, n_samples,
+                    if anc == selphi::diploid::anc_phase::Mode::Apply { "corrected" } else { "would be corrected (report)" });
+            }
+            None => selphi_info!("    SELPHI_ANC_POST: the panel lacks a labelled 1000 Genomes sample in some group; no check"),
+        }
+    }
     if replicas > 1 {
         selphi_info!("    Phase ensemble: {} members ({} co-phased replicas x {} from each chain)",
             scaffolds.len() + 1, replicas, n_members);
