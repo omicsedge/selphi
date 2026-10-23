@@ -277,6 +277,9 @@ pub struct FoldContext<'a> {
     pub interp_x: Option<&'a [f64]>,
     /// Window rows whose weights are read (ImputeWindowInputs::keep_rows), for every member.
     pub keep_rows: Option<&'a [bool]>,
+    /// Window rows every target skips (ImputeWindowInputs::hmm_skip): blended rows, aligned as
+    /// a no-call's are.
+    pub hmm_skip: Option<&'a [bool]>,
 }
 
 /// Per window row (chip site `chip_start + r`), whether member k's two haplotypes of sample
@@ -434,6 +437,7 @@ fn member_inputs<'a>(targ_bm: &'a HaplotypeBitmatrix, ne: Option<&'a [f64]>,
         chip_end: ctx.chip_end,
         interp_x: ctx.interp_x,
         keep_rows: ctx.keep_rows,
+        hmm_skip: ctx.hmm_skip,
     }
 }
 
@@ -479,8 +483,9 @@ impl<'c> PairFold<'c> {
         let ctx = self.ctx;
         let s = h / 2;
         let skip_nocalls = self.skip_nocalls;
-        let nocall = |r: usize| skip_nocalls && ctx.site_conf_per_sample
-            .is_some_and(|c| c[(ctx.chip_start + r) * ctx.n_samples + s] == 0.0);
+        let nocall = |r: usize| skip_nocalls && (ctx.site_conf_per_sample
+            .is_some_and(|c| c[(ctx.chip_start + r) * ctx.n_samples + s] == 0.0)
+            || ctx.hmm_skip.is_some_and(|k| k[r]));
         if swap_rows(ctx.targ_bm0, s, targ_k, sk, ctx.chip_start, own0.n_rows, &nocall, &mut self.marks, &mut self.swap) {
             let sw = &self.swap;
             let mixed = if self.blend_align {

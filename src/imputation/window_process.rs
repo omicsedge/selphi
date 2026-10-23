@@ -85,6 +85,11 @@ pub struct ImputeWindowInputs<'a> {
     /// Per window row, whether the output or the member fold reads its weights
     /// (`io::pipeline::needed_weight_rows`); the rest are left empty. None: every row.
     pub keep_rows: Option<&'a [bool]>,
+    /// Per window row, whether every target leaves it out of its PBWT and HMM as it does a
+    /// no-call (`io::pipeline::window_masks`: sites a variant-only fill read as reference at low
+    /// panel frequency whose weights nothing reads). Its weights are put back by
+    /// `expand_weights`; the site is still written as given. None: every row in.
+    pub hmm_skip: Option<&'a [bool]>,
 }
 
 /// Per-stage CPU microseconds inside the per-target map, summed over all worker
@@ -215,6 +220,7 @@ pub fn impute_window(
         ne_w.as_deref(), conf_w.as_deref(), ns, &coded,
         precomputed_candidates,
         carry, inputs.chip_start, n_var_w, inputs.keep_rows,
+        inputs.hmm_skip,
         on_batch_done,
     );
     crate::selphi_debug!("  [MEM] impute_window: HMM done: rss={:.0} MB", crate::log::rss_mb());
@@ -1020,6 +1026,8 @@ pub fn process_window_hmm(
     n_var_w: usize,
     // Window rows whose weights are read (ImputeWindowInputs::keep_rows).
     keep_rows: Option<&[bool]>,
+    // Window rows every target leaves out of its PBWT and HMM (ImputeWindowInputs::hmm_skip).
+    hmm_skip: Option<&[bool]>,
     mut on_batch_done: Option<BatchDoneCb<'_>>,
 ) -> WindowHmmOutput {
     let n_ref = params.n_ref;
@@ -1061,6 +1069,19 @@ pub fn process_window_hmm(
                 }
             }
             per_sample.into_iter().flat_map(|b| [b.clone(), b]).collect()
+        }
+    };
+    // Rows every target skips (low-frequency sites read as reference by a fill) join each
+    // target's no-calls, so its PBWT and HMM run over the rest.
+    let miss: Vec<Option<Vec<u64>>> = match hmm_skip.filter(|k| follow && k.iter().any(|&x| x)) {
+        None => miss,
+        Some(k) => {
+            let mut bits = vec![0u64; n_var_w.div_ceil(64)];
+            for (v, _) in k.iter().enumerate().filter(|&(_, &x)| x) { bits[v / 64] |= 1u64 << (v % 64); }
+            miss.into_iter().map(|m| Some(match m {
+                Some(mut b) => { for (w, x) in b.iter_mut().zip(&bits) { *w |= x; } b }
+                None => bits.clone(),
+            })).collect()
         }
     };
 

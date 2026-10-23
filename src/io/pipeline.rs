@@ -136,6 +136,8 @@ pub fn needed_weight_rows(
     win_chip_start: usize, win_chip_end: usize, own_chip_start: usize, own_chip_end: usize,
     wgs_idx: &[usize], n_ref_variants: usize,
     site_conf: Option<&[f64]>, site_conf_per_sample: Option<&[f64]>, refine_thr: f64, n_samples: usize,
+    // Window rows every target leaves out of its HMM (window-relative).
+    skip_w: Option<&[bool]>,
 ) -> Vec<bool> {
     let n_rows = win_chip_end - win_chip_start;
     let mut need = vec![false; n_rows];
@@ -150,9 +152,12 @@ pub fn needed_weight_rows(
             if iv.weight_e < n_rows { need[iv.weight_e] = true; }
         }
     }
-    if let Some(conf) = site_conf_per_sample {
-        for s in 0..n_samples {
-            let nocall = |r: usize| conf[(win_chip_start + r) * n_samples + s] == 0.0;
+    // Rows every target skips (`hmm_skip`) are blended like a no-call's, so the same neighbours.
+    let skipped = |r: usize| skip_w.is_some_and(|k| k[r]);
+    if site_conf_per_sample.is_some() || (0..n_rows).any(skipped) {
+        for s in 0..n_samples.max(1) {
+            let nocall = |r: usize| skipped(r)
+                || site_conf_per_sample.is_some_and(|conf| conf[(win_chip_start + r) * n_samples + s] == 0.0);
             let mut prev: Option<usize> = None;
             let mut r = 0;
             while r < n_rows {
@@ -167,22 +172,38 @@ pub fn needed_weight_rows(
     need
 }
 
-/// [`needed_weight_rows`], or None unless most rows go unread. An array window reads almost every
-/// row (an untyped site lies between almost any two typed ones: 98 of 9,283 rows unread on the
-/// 1000 Genomes chr22 targets), and pruning 1% of the rows would only copy each haplotype's weights.
+/// A window's two masks, both window-relative: the rows whose weights are read (the
+/// [`needed_weight_rows`] mask, None unless most rows go unread: an array window reads almost
+/// every row, 98 of 9,283 unread on the 1000 Genomes chr22 targets, and pruning 1% would only
+/// copy each haplotype's weights), and the rows every target leaves out of its PBWT and HMM.
+/// A candidate row (`hmm_skip`, full length: a site a fill read as reference at low panel
+/// frequency) is left out only where nothing reads its weights, so the anchors of the sites
+/// the model writes keep their own emission (`SELPHI_FILL_HMM_ANCHORS=0` leaves every candidate
+/// out); the rows either side of each run left out are then read, as a no-call's are.
 #[allow(clippy::too_many_arguments)]
-pub fn weight_rows_mask(
+pub fn window_masks(
     win_chip_start: usize, win_chip_end: usize, own_chip_start: usize, own_chip_end: usize,
     wgs_idx: &[usize], n_ref_variants: usize,
     site_conf: Option<&[f64]>, site_conf_per_sample: Option<&[f64]>, refine_thr: f64, n_samples: usize,
-) -> Option<Vec<bool>> {
-    if crate::config::is_one("SELPHI_ALL_WEIGHT_ROWS") { return None; }
-    let need = needed_weight_rows(win_chip_start, win_chip_end, own_chip_start, own_chip_end, wgs_idx,
-        n_ref_variants, site_conf, site_conf_per_sample, refine_thr, n_samples);
+    hmm_skip: Option<&[bool]>,
+) -> (Option<Vec<bool>>, Option<Vec<bool>>) {
+    let all_rows = crate::config::is_one("SELPHI_ALL_WEIGHT_ROWS");
+    let need0 = needed_weight_rows(win_chip_start, win_chip_end, own_chip_start, own_chip_end, wgs_idx,
+        n_ref_variants, site_conf, site_conf_per_sample, refine_thr, n_samples, None);
+    let skip_w: Option<Vec<bool>> = hmm_skip.map(|k| {
+        let anchors = !crate::config::raw("SELPHI_FILL_HMM_ANCHORS").is_some_and(|v| v == "0");
+        k[win_chip_start..win_chip_end].iter().zip(&need0).map(|(&c, &n)| c && !(anchors && n)).collect::<Vec<bool>>()
+    }).filter(|w| w.iter().any(|&x| x));
+    let need = if skip_w.is_some() {
+        needed_weight_rows(win_chip_start, win_chip_end, own_chip_start, own_chip_end, wgs_idx,
+            n_ref_variants, site_conf, site_conf_per_sample, refine_thr, n_samples, skip_w.as_deref())
+    } else { need0 };
     let n_need = need.iter().filter(|&&k| k).count();
-    if 2 * n_need > need.len() { return None; }
-    crate::selphi_debug!("  weight rows read: {} of {} ({} left empty)", n_need, need.len(), need.len() - n_need);
-    Some(need)
+    let keep = (!all_rows && 2 * n_need <= need.len()).then(|| {
+        crate::selphi_debug!("  weight rows read: {} of {} ({} left empty)", n_need, need.len(), need.len() - n_need);
+        need
+    });
+    (keep, skip_w)
 }
 
 /// Over the owned panel range `own_wgs_start..own_wgs_end`: which sites are written verbatim from

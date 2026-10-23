@@ -147,6 +147,28 @@ pub fn select(
     Scaffold { indices, widened: false, n_private, n_private_shared_pos }
 }
 
+/// Leave the sites a variant-only fill read as reference (`filled`, per chip site; empty without
+/// a fill) out of the scaffold when the input's own calls are a genome's (`chip_bp`, the chip
+/// sites' positions: at least `variant_only::min_density` per Mb, the density the automatic fill
+/// asks of a variant-only file; a genome's chrX calls are 690-950 per Mb). They are homozygous, so they carry no phase, and `phase_rare` works only at
+/// heterozygous sites, so they are 0|0 either way; in the scaffold they made `phase_common` run over
+/// every panel site of a genome (HG002 30x chrX: phasing 200 -> 23 s, per-sample R2 0.969408 ->
+/// 0.969388; chr22, three seeds: +0.000001 and +0.000002). A sparse input keeps them: an exome's
+/// few heterozygotes are phased better with its reference calls in the scaffold (HG003 chr22 with
+/// --callable: 0.8134 with them, 0.8077 without). `SELPHI_FILL_PHASE=1` keeps them always.
+/// Returns how many were left out (none when that would empty the scaffold).
+pub fn drop_filled(scaffold: &mut Scaffold, filled: &[bool], chip_bp: &[i64]) -> usize {
+    if filled.is_empty() || crate::config::is_one("SELPHI_FILL_PHASE") { return 0; }
+    let own: Vec<i64> = chip_bp.iter().zip(filled).filter(|&(_, &f)| !f).map(|(&p, _)| p).collect();
+    let span = own.last().zip(own.first()).map_or(0, |(l, f)| l - f);
+    if span <= 0 || (own.len() as f64 * 1.0e6 / span as f64) < crate::io::variant_only::min_density() { return 0; }
+    let before = scaffold.indices.len();
+    let kept: Vec<usize> = scaffold.indices.iter().copied().filter(|&c| !filled.get(c).copied().unwrap_or(false)).collect();
+    if kept.is_empty() { return 0; }
+    scaffold.indices = kept;
+    before - scaffold.indices.len()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Verdict {
     /// Not in the scaffold under the source rule.
@@ -222,6 +244,28 @@ mod tests {
 
     /// One sample, three sites: (0/0), (1/1), (0/1).
     fn one_sample(gts: &[[u8; 2]]) -> Vec<u8> { gts.iter().flat_map(|g| g.iter().copied()).collect() }
+
+    /// Filled sites leave a genome's scaffold, never an exome's (own calls too sparse), and never
+    /// empty it.
+    #[test]
+    fn filled_sites_leave_a_genome_scaffold_only() {
+        let sc = |idx: Vec<usize>| Scaffold { indices: idx, widened: false, n_private: 0, n_private_shared_pos: 0 };
+        // 1,000 own calls over 1 Mb (1,000 per Mb) and 1,000 filled sites between them.
+        let bp: Vec<i64> = (0..2000).map(|i| 1_000_000 + i as i64 * 500).collect();
+        let filled: Vec<bool> = (0..2000).map(|i| i % 2 == 1).collect();
+        let mut s = sc((0..2000).collect());
+        assert_eq!(drop_filled(&mut s, &filled, &bp), 1000);
+        assert!(s.indices.iter().all(|&c| c % 2 == 0));
+        // The same calls spread over 20 Mb (50 per Mb, an exome): kept.
+        let sparse: Vec<i64> = (0..2000).map(|i| 1_000_000 + i as i64 * 10_000).collect();
+        let mut s = sc((0..2000).collect());
+        assert_eq!(drop_filled(&mut s, &filled, &sparse), 0);
+        assert_eq!(s.indices.len(), 2000);
+        // A scaffold of filled sites alone is not emptied; no fill, nothing to do.
+        let mut s = sc(vec![1, 3]);
+        assert_eq!(drop_filled(&mut s, &filled, &bp), 0);
+        assert_eq!(drop_filled(&mut sc(vec![0, 1]), &[], &bp), 0);
+    }
 
     #[test]
     fn one_sample_keeps_exactly_the_hets() {

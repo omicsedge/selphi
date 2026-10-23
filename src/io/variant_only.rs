@@ -217,6 +217,30 @@ pub fn filled_mask(wgs_idx: &[usize], sites: &[usize]) -> Vec<bool> {
     wgs_idx.iter().map(|w| sites.binary_search(w).is_ok()).collect()
 }
 
+/// Panel minor-allele frequency below which a site a fill read as reference is left out of the
+/// imputation PBWT and HMM (`SELPHI_FILL_HMM_MAF`; 0 keeps every filled site in). Such a 0/0 matches
+/// nearly every panel haplotype and is written as given anyway, while the HMM's work grows with
+/// every site in it.
+pub fn fill_hmm_maf() -> f64 {
+    crate::config::f64_opt("SELPHI_FILL_HMM_MAF").unwrap_or(0.0).clamp(0.0, 0.5)
+}
+
+/// Per chip site, whether it is a filled site (`filled`, [`filled_mask`]) whose panel minor-allele
+/// frequency (`alt_count` of `n_ref` haplotypes) is below [`fill_hmm_maf`]; None when none is.
+pub fn hmm_skip(filled: &[bool], alt_count: impl Fn(usize) -> u32, n_ref: usize) -> Option<Vec<bool>> {
+    let thr = fill_hmm_maf();
+    if thr <= 0.0 || filled.is_empty() || n_ref == 0 { return None; }
+    let skip: Vec<bool> = filled.iter().enumerate().map(|(c, &f)| f && {
+        let af = alt_count(c) as f64 / n_ref as f64;
+        af.min(1.0 - af) < thr
+    }).collect();
+    let n = skip.iter().filter(|&&x| x).count();
+    if n == 0 { return None; }
+    crate::selphi_step!("{} of the {} site(s) read as reference have panel MAF < {}: left out of the imputation HMM (written as 0/0)",
+        n, filled.iter().filter(|&&x| x).count(), thr);
+    Some(skip)
+}
+
 /// Per chip site (`target_idx` into `markers`), whether its target record's position holds other
 /// records too: a split multi-allelic record, whichever of its parts matched the panel. Such a
 /// part writes 0/0 for the ALTs a sample does not carry, so [`call_counts`] leaves it out.

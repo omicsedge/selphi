@@ -407,6 +407,8 @@ fn phase_chr(
     // Phasing replicas (`diploid::replicas`): copies per sample, 1 = off.
     replicas: usize,
     config: &MultiChrImputeConfig,
+    // Per chip site, a site a variant-only fill added (left out of the scaffold).
+    filled: &[bool],
 ) -> (Vec<u8>, Vec<Vec<u8>>, Option<selphi::common::HaplotypeBitmatrix>, bool) {
     if !needs_phasing {
         return (targ_alleles, Vec::new(), None, false);
@@ -431,10 +433,14 @@ fn phase_chr(
     // SELPHI_DIPLOID_PRIVATE_RARE=1: panel-absent singleton hets go to phase_rare
     // (diploid::scaffold module docs); this path always holds the chip-site matrix.
     let private_on = selphi::diploid::scaffold::PrivateRare::enabled_for(chip_bps);
-    let scaffold = selphi::diploid::scaffold::select(
+    let mut scaffold = selphi::diploid::scaffold::select(
         &targ_alleles, n_chip, n_samples, Some(&ref_bm),
         selphi::diploid::scaffold::Source::from_env(), scaffold_maf,
         private_on.then_some(selphi::diploid::scaffold::PrivateRare { chip_bp: chip_bps }));
+    let n_dropped = selphi::diploid::scaffold::drop_filled(&mut scaffold, filled, chip_bps);
+    if n_dropped > 0 {
+        selphi_info!("    {} site(s) read as reference left out of the phasing scaffold (homozygous: no phase to decide)", n_dropped);
+    }
     if private_on {
         selphi_info!("    Private-het routing: {} panel-absent singleton sites left to phase_rare \
 ({} kept in the scaffold: position shared with another record)",
@@ -898,7 +904,7 @@ pub fn run_multi_chr(
         let (targ_alleles, extra_phased, ref_bm_from_phasing, phased) = phase_chr(
             needs_phasing, &multi_map, chr_name, &srp, &wgs_idx, &raw_chip_cm,
             &chip_bps, targ_alleles, n_chip, n_samples, n_ref, n_chain,
-            ped_locked.as_deref(), replica_plan.k, config,
+            ped_locked.as_deref(), replica_plan.k, config, &filled_mask,
         );
         let (targ_alleles, extra_phased) = if given_used && phased {
             let given = selphi::imputation::input_phase::given_alleles(
@@ -955,6 +961,8 @@ pub fn run_multi_chr(
         // Compute imputation windows
         let windows = compute_imputation_windows(&chip_cm, config.window_cm, config.overlap_cm,
             selphi::imputation::windows::window_max_markers());
+        // Sites a fill read as reference at low panel frequency: out of the imputation HMM.
+        let hmm_skip = selphi::io::variant_only::hmm_skip(&filled_mask, |c| ref_bm_imp.popcount_row(c, n_ref), n_ref);
 
         // MAF-adaptive Ne
         let ne_low = est_ne as f64 * 0.85;
@@ -1106,10 +1114,10 @@ pub fn run_multi_chr(
             // Shared per-window pipeline (extracted: window sub-arrays, coded steps,
             // candidate selection, Li-Stephens HMM for all target haplotypes).
             // The window rows whose weights the output (or the member fold) reads.
-            let keep_rows = selphi::io::pipeline::weight_rows_mask(
+            let (keep_rows, skip_w) = selphi::io::pipeline::window_masks(
                 window.chip_start, window.chip_end, window.own_chip_start, window.own_chip_end,
                 &wgs_idx, srp.n_variants(), nocall.as_ref().map(|(site, _)| site.as_slice()),
-                nocall.as_ref().map(|(_, ps)| ps.as_slice()), nocall_thr, n_samples);
+                nocall.as_ref().map(|(_, ps)| ps.as_slice()), nocall_thr, n_samples, hmm_skip.as_deref());
             let inputs = selphi::imputation::window_process::ImputeWindowInputs {
                 ref_bm: &ref_bm_imp,
                 targ_alleles: &targ_bm,
@@ -1128,6 +1136,7 @@ pub fn run_multi_chr(
                 chip_end: window.chip_end,
                 interp_x: Some(&interp_x),
                 keep_rows: keep_rows.as_deref(),
+                hmm_skip: skip_w.as_deref(),
             };
             let all_weights = selphi::imputation::ensemble::impute_with_members(
                 &inputs, &hmm_params, precomputed_candidates.as_ref(),
@@ -1142,6 +1151,7 @@ pub fn run_multi_chr(
                     chip_end: window.chip_end,
                     interp_x: Some(&interp_x),
                     keep_rows: keep_rows.as_deref(),
+                    hmm_skip: skip_w.as_deref(),
                 },
             ).all_weights;
 

@@ -335,6 +335,9 @@ struct PhasingInputs<'a> {
     /// Phasing replicas per sample (`diploid::replicas`); 1 = off. The copies' members
     /// come back in `extra_scaffolds` after member 0 (copy 0's Viterbi solve).
     replicas: usize,
+    /// Per chip site, whether a variant-only fill added it (`variant_only::filled_mask`; empty
+    /// without one): left out of the phasing scaffold (`scaffold::drop_filled`).
+    filled: &'a [bool],
 }
 
 /// Phasing pipeline result. `ref_bm_full` is `None` only for phase-only
@@ -356,7 +359,7 @@ struct PhasingResult {
 fn run_phasing(inp: &PhasingInputs) -> PhasingResult {
     let PhasingInputs {
         args, srp, map_path, targ_alleles, raw_chip_cm, chip_bps,
-        ref_positions, wgs_idx, n_chip, n_samples, n_ref, ped_locked, seed, n_members, replicas,
+        ref_positions, wgs_idx, n_chip, n_samples, n_ref, ped_locked, seed, n_members, replicas, filled,
     } = *inp;
 
     let (map_bp_raw, map_cm_raw) = genmap::load_genetic_map_for(Path::new(map_path), Some(srp.chromosome()))
@@ -426,8 +429,12 @@ fn run_phasing(inp: &PhasingInputs) -> PhasingResult {
 (phase-only above SELPHI_PHASE_ONLY_RARE_REF_GB, where phase_rare runs without the panel)");
         }
         let private = private_on.then_some(selphi::diploid::scaffold::PrivateRare { chip_bp: chip_bps });
-        let scaffold = selphi::diploid::scaffold::select(
+        let mut scaffold = selphi::diploid::scaffold::select(
             targ_alleles, n_chip, n_samples, panel_bm, source, scaffold_maf, private);
+        let n_dropped = selphi::diploid::scaffold::drop_filled(&mut scaffold, filled, chip_bps);
+        if n_dropped > 0 {
+            selphi_step!("{} site(s) read as reference left out of the phasing scaffold (homozygous: no phase to decide)", n_dropped);
+        }
         if private_on && panel_bm.is_some() {
             selphi_step!("Private-het routing: {} panel-absent singleton sites left to phase_rare \
 ({} kept in the scaffold: position shared with another record)",
@@ -1194,7 +1201,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
             targ_alleles: &targ_alleles, raw_chip_cm: &raw_chip_cm, chip_bps: &chip_bps,
             ref_positions: &ref_positions, wgs_idx: &wgs_idx,
             n_chip, n_samples, n_ref, ped_locked: ped_locked.as_deref(), seed: args.seed,
-            n_members: intra_chain, replicas: replica_plan.k,
+            n_members: intra_chain, replicas: replica_plan.k, filled: &filled_mask,
         });
 
         if args.phase_only {
@@ -1240,7 +1247,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
                     targ_alleles: unph, raw_chip_cm: &raw_chip_cm, chip_bps: &chip_bps,
                     ref_positions: &ref_positions, wgs_idx: &wgs_idx,
                     n_chip, n_samples, n_ref, ped_locked: ped_locked.as_deref(), seed: m_seed,
-                    n_members: 1, replicas: 1,
+                    n_members: 1, replicas: 1, filled: &filled_mask,
                 }).phased_alleles
             }).collect()
         } else {
@@ -1318,6 +1325,8 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
     // 8. Compute imputation windows
     let windows = compute_imputation_windows(&chip_cm, args.window_cm, args.overlap_cm,
         selphi::imputation::windows::window_max_markers());
+    // Sites a fill read as reference at low panel frequency: out of the imputation HMM.
+    let hmm_skip = selphi::io::variant_only::hmm_skip(&filled_mask, |c| ref_bm_imp.popcount_row(c, n_ref), n_ref);
     selphi_debug!("  Windows: {} ({}cM, {}cM overlap)", windows.len(), args.window_cm, args.overlap_cm);
     for (wi, w) in windows.iter().enumerate() {
         let cm_span = chip_cm[w.chip_end - 1] - chip_cm[w.chip_start];
@@ -1535,10 +1544,10 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
             target_batch_size: target_batch_size_haps,
         };
         // The window rows whose weights the output (or the member fold) reads.
-        let keep_rows = selphi::io::pipeline::weight_rows_mask(
+        let (keep_rows, skip_w) = selphi::io::pipeline::window_masks(
             window.chip_start, window.chip_end, window.own_chip_start, window.own_chip_end,
             &wgs_idx, srp.n_variants(), target_site_conf.as_deref(), target_site_conf_per_sample.as_deref(),
-            refine_thr, n_samples);
+            refine_thr, n_samples, hmm_skip.as_deref());
         let inputs = selphi::imputation::window_process::ImputeWindowInputs {
             ref_bm: &ref_bm_imp,
             targ_alleles: &targ_bm,
@@ -1551,6 +1560,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
             chip_end: window.chip_end,
             interp_x: Some(&interp_x),
             keep_rows: keep_rows.as_deref(),
+            hmm_skip: skip_w.as_deref(),
         };
         // Streaming callback for batched mode: each batch's CSRs are written
         // immediately to the corresponding batch writer(s) (BCF, VCF, SD,
@@ -1658,6 +1668,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
                     chip_end: window.chip_end,
                     interp_x: Some(&interp_x),
                     keep_rows: keep_rows.as_deref(),
+                    hmm_skip: skip_w.as_deref(),
                 },
             )
         };
