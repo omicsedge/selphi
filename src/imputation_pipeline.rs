@@ -395,6 +395,21 @@ fn run_phasing(inp: &PhasingInputs) -> PhasingResult {
         Some(bm)
     } else { None };
 
+    // Labelled panel templates for the ancestry phase check, packed before the
+    // phase-only path releases the chip-site matrix.
+    let anc = selphi::diploid::anc_phase::mode();
+    let anc_panel = if anc == selphi::diploid::anc_phase::Mode::Off { None } else {
+        match ref_bm_full.as_ref() {
+            Some(full) => {
+                let p = selphi::diploid::anc_phase::Panel::prepare(full, &srp.sample_ids);
+                if p.is_none() {
+                    selphi_info!("  SELPHI_ANC_POST: the panel lacks a labelled 1000 Genomes sample in some group; no check");
+                }
+                p
+            }
+            None => { selphi_info!("  SELPHI_ANC_POST: no chip-site panel matrix on this path; no check"); None }
+        }
+    };
     let (phased, extra_scaffolds, phase_quality) = {
         selphi_step!("Using Diploid phasing");
         // Common-MAF chip subset (MAF >= 0.001 on target). Diploid runs
@@ -514,11 +529,22 @@ male chrX): phasing on all {} called sites", scaffold.indices.len());
             ped_locked, replicas,
         );
         let mut scaffolds = dp.scaffolds;
-        let phased0 = scaffolds.remove(0);
-        if dp.pq.is_some() && !args.phase_only {
+        let mut phased0 = scaffolds.remove(0);
+        let mut pq = dp.pq;
+        // Ancestry-aware long-range correction of the solve (diploid::anc_phase), before
+        // the members are stacked and aligned to it.
+        if let (Some(panel), Some(q)) = (anc_panel.as_ref(), pq.as_mut()) {
+            let n = selphi::diploid::anc_phase::correct_scaffold(panel, &mut phased0, q, n_samples,
+                anc == selphi::diploid::anc_phase::Mode::Apply);
+            selphi_step!("Ancestry phase check ({} labelled panel samples per group): {} of {} sample(s) {}",
+                panel.n_per_group, n, n_samples,
+                if anc == selphi::diploid::anc_phase::Mode::Apply { "corrected" } else { "would be corrected (report)" });
+        }
+        if !selphi::diploid::sampling::pq_enabled() { pq = None; }
+        if pq.is_some() && !args.phase_only {
             selphi_info!("  SELPHI_DIPLOID_PQ: FORMAT/PQ is written by --phase-only only; the imputed output carries none");
         }
-        (phased0, scaffolds, dp.pq)  // remaining scaffolds = intra-run extra members
+        (phased0, scaffolds, pq)  // remaining scaffolds = intra-run extra members
     };
     selphi_step!("Phasing complete: {} samples phased", n_samples);
     PhasingResult { phased_alleles: phased, ref_bm_full, extra_scaffolds, phase_quality }

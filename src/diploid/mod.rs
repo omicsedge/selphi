@@ -22,6 +22,7 @@ pub mod pedigree;
 pub mod phase_rare;
 pub mod scaffold;
 pub mod replicas;
+pub mod anc_phase;
 
 /// De-novo PANEL phasing: phase an unphased cohort using the cohort itself
 /// as the conditioning set (no external reference panel, n_ref = 0). Each
@@ -246,7 +247,7 @@ fn diploid_phase_core(
         target_geno, common_ref_bm, common_chip_indices, rare_ref,
         CommonPrep { target_geno_common, cm_common, cm_full: chip_cm_full, bp_common },
         chip_bp, n_var, n_samples, n_ref, seed, n_threads, max_cond_haps, n_members,
-        locked_common.as_deref(), replicas, sampling::pq_enabled(),
+        locked_common.as_deref(), replicas, sampling::pq_enabled() || anc_phase::mode() != anc_phase::Mode::Off,
     )
 }
 
