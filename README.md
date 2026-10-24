@@ -411,7 +411,9 @@ Use `--no-ap` to omit AP1/AP2 (smaller, faster output). Genotyped (chip) sites t
 
 ## Accuracy evaluation
 
-Built-in imputation accuracy evaluation against WGS truth genotypes: per-site and per-sample R², concordance, and MAF-binned metrics. The matched-sites path streams both files; the hom-ref path holds the truth in memory.
+Built-in imputation accuracy evaluation against WGS truth genotypes: per-site and per-sample R², concordance, and MAF-binned metrics. The matched-sites path streams both files, in parallel by region through each file's `.csi`/`.tbi` index (built in memory when a file has none; nothing is written next to the inputs); the hom-ref path holds the truth in memory.
+
+On the matched-sites report the OVERALL row's three numbers cover different sites: N counts every matched site, the mean R² is over the sites in the MAF bins only (MAF ≥ 0.05%, R² defined), the concordance over the sites with a scored sample; the line under the row gives the last two counts.
 
 ```bash
 # Inline: add --truth to evaluate automatically after imputation (writes result.eval.json)

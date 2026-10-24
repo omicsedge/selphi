@@ -411,7 +411,7 @@ impl SampleAccumulator {
 /// legitimate outcome (the filtered truth already holds every carrier at the
 /// scored sites), but it is indistinguishable from a key-matching failure
 /// unless the intermediate counts are reported — so report them.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RawTruthDiag {
     /// Records loaded from the raw truth file.
     pub raw_sites_loaded: u64,
@@ -1206,12 +1206,38 @@ enum SeekIndex {
     Tbi(Option<crate::srp::csi::TbiIndex>),
 }
 
+/// What the matched-sites evaluator does with an input that has no seek index
+/// (`.csi` for a BCF, `.tbi` for a VCF) next to it. It never writes one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IndexPolicy {
+    /// Build the index in memory, the one the file would hold (the command line).
+    #[default]
+    BuildInMemory,
+    /// Fail, naming the input: for a host whose inputs are always indexed.
+    RequireExisting,
+}
+
 impl SeekIndex {
-    fn resolve(path: &Path) -> io::Result<Self> {
+    fn resolve(path: &Path, policy: IndexPolicy) -> io::Result<Self> {
         let s = path.to_string_lossy();
         let is_bcf = sniff_bcf(path) || s.ends_with(".bcf") || s.ends_with(".bcf.gz");
+        let index_path = |ext: &str| { let mut p = path.as_os_str().to_owned(); p.push(ext); std::path::PathBuf::from(p) };
+        if policy == IndexPolicy::RequireExisting {
+            let ext = if is_bcf { ".csi" } else { ".tbi" };
+            let idx = index_path(ext);
+            if !idx.exists() {
+                return Err(io::Error::new(io::ErrorKind::NotFound, format!(
+                    "{}: no {} index next to it (the evaluation requires an existing index)", path.display(), ext)));
+            }
+            let bad = |e: io::Error| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", idx.display()));
+            return Ok(if is_bcf {
+                SeekIndex::Csi(Ok(crate::srp::csi::parse_csi(&idx).map_err(bad)?))
+            } else {
+                SeekIndex::Tbi(Some(crate::srp::csi::parse_tbi(&idx).map_err(bad)?))
+            });
+        }
         if is_bcf {
-            let csi = { let mut p = path.as_os_str().to_owned(); p.push(".csi"); std::path::PathBuf::from(p) };
+            let csi = index_path(".csi");
             let parsed = if csi.exists() {
                 crate::srp::csi::parse_csi(&csi)
             } else {
@@ -1222,7 +1248,7 @@ impl SeekIndex {
             };
             return Ok(SeekIndex::Csi(parsed.map_err(|e| (e.kind(), e.to_string()))));
         }
-        let tbi = { let mut p = path.as_os_str().to_owned(); p.push(".tbi"); std::path::PathBuf::from(p) };
+        let tbi = index_path(".tbi");
         if tbi.exists() {
             Ok(SeekIndex::Tbi(crate::srp::csi::parse_tbi(&tbi).ok()))
         } else if s.ends_with(".vcf.gz") {
@@ -1242,7 +1268,7 @@ pub fn evaluate_parallel(
     exclude: &super::exclude::SiteExclusion,
 ) -> io::Result<(SiteAccumulator, SampleAccumulator, EvalCounts)> {
     evaluate_parallel_with_options(imputed_path, truth_path, shared_samples, n_threads,
-        exclude, &EvaluationOptions::default())
+        exclude, &EvaluationOptions::default(), IndexPolicy::BuildInMemory)
 }
 
 fn evaluate_parallel_with_options(
@@ -1258,6 +1284,7 @@ fn evaluate_parallel_with_options(
     // and the default — scored the typed sites in silence.
     exclude: &super::exclude::SiteExclusion,
     options: &EvaluationOptions,
+    index_policy: IndexPolicy,
 ) -> io::Result<(SiteAccumulator, SampleAccumulator, EvalCounts)> {
     use rayon::prelude::*;
 
@@ -1269,8 +1296,8 @@ fn evaluate_parallel_with_options(
     // Seek indexes, so each thread can pread-seek its region instead of
     // re-scanning from BOF. Without them, 16 threads each decompress the whole
     // 10+ GB file → pathologically slow. Built in memory when a file has none.
-    let imp_index = SeekIndex::resolve(imputed_path)?;
-    let truth_index = SeekIndex::resolve(truth_path)?;
+    let imp_index = SeekIndex::resolve(imputed_path, index_policy)?;
+    let truth_index = SeekIndex::resolve(truth_path, index_policy)?;
 
     // Get sample info
     let (_, imp_samples) = VariantReader::open(imputed_path)?;
@@ -1475,12 +1502,22 @@ pub fn evaluate(
 
 /// Evaluate with declared DS units and optional native-ploidy fallbacks.
 /// Concordance uses the existing diploid-equivalent dosage thresholds.
+/// An input without a seek index gets one built in memory.
 pub fn evaluate_with_options(
     imputed_path: &Path, truth_path: &Path, shared_samples: &[String],
     exclude: &super::exclude::SiteExclusion, options: &EvaluationOptions,
 ) -> io::Result<(SiteAccumulator, SampleAccumulator, EvalCounts)> {
+    evaluate_with_index_policy(imputed_path, truth_path, shared_samples, exclude, options, IndexPolicy::BuildInMemory)
+}
+
+/// [`evaluate_with_options`] with the choice of what an input without a seek
+/// index gets ([`IndexPolicy`]).
+pub fn evaluate_with_index_policy(
+    imputed_path: &Path, truth_path: &Path, shared_samples: &[String],
+    exclude: &super::exclude::SiteExclusion, options: &EvaluationOptions, index_policy: IndexPolicy,
+) -> io::Result<(SiteAccumulator, SampleAccumulator, EvalCounts)> {
     let n_threads = rayon::current_num_threads().max(1);
-    evaluate_parallel_with_options(imputed_path, truth_path, shared_samples, n_threads, exclude, options)
+    evaluate_parallel_with_options(imputed_path, truth_path, shared_samples, n_threads, exclude, options, index_policy)
 }
 
 /// FNV-1a hash of REF+ALT bytes (for an alloc-free site key).
@@ -1878,6 +1915,11 @@ pub fn print_summary(site_acc: &SiteAccumulator, sample_acc: &SampleAccumulator,
             format!("{:>10.4}", site_acc.total_r2_sum / site_acc.total_r2_n as f64)
         } else { format!("{:>10}", "N/A") };
         crate::selphi_info!("{} {:>12} {} {:>12.4}", crate::log::bold(&format!("{:<20}", "OVERALL")), n_matched, crate::log::cyan(&overall_r2), overall_conc);
+        // The row's N counts every matched site; its R² is the mean over the sites in the
+        // MAF bins only (MAF >= 0.05%, R² defined), its concordance over the sites with a
+        // scored sample. Say over how many.
+        crate::selphi_info!("  (OVERALL mean R² over {} site(s) in the MAF bins; concordance over {} site(s) with a scored sample)",
+            site_acc.total_r2_n, site_acc.total_n);
     }
 
     // Per-sample summary
@@ -1945,71 +1987,329 @@ pub fn print_imputation_summary(
     crate::selphi_info!("  Scored:   {} sites  ({} excluded)", counts.n_matched, n_excluded);
 }
 
+// ---------------------------------------------------------------------------
+// Finished metrics: what the report prints and the JSON holds, as values.
+// ---------------------------------------------------------------------------
+
+/// Which scoring an evaluation ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvalMode {
+    /// The sites both files hold ([`evaluate_with_options`]; a complete truth callset).
+    MatchedSites,
+    /// Every imputed site, a site absent from the truth scored as hom-ref
+    /// ([`evaluate_imputation_with_options`]; `--homref-absent on`).
+    HomrefAbsent,
+}
+
+/// One MAF bin's site metrics: the sites with a defined R² whose truth MAF lies in
+/// `[maf_lo, maf_hi)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MafBinSummary {
+    pub label: &'static str,
+    pub maf_lo: f64,
+    pub maf_hi: f64,
+    pub n_sites: u64,
+    /// Mean site R² (`None`: empty bin).
+    pub mean_r2: Option<f64>,
+    /// Mean site concordance over the same sites (`None`: empty bin).
+    pub concordance: Option<f64>,
+}
+
+/// The OVERALL row. Its three numbers are over three site sets: `n_sites` counts
+/// every scored site, `mean_r2` averages over the sites in the MAF bins only
+/// (`n_r2_sites`: MAF >= 0.05% and R² defined), `concordance` over the sites with
+/// a scored sample (`n_concordance_sites`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OverallSummary {
+    pub n_sites: u64,
+    /// `None` when no site has a defined R² (e.g. a one-sample run).
+    pub mean_r2: Option<f64>,
+    pub n_r2_sites: u64,
+    /// `None` when no site has a scored sample.
+    pub concordance: Option<f64>,
+    pub n_concordance_sites: u64,
+}
+
+/// One sample's metrics over every site it was scored at.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SampleSummary {
+    /// The sample's name, when the caller gave the names.
+    pub sample: Option<String>,
+    /// `None`: undefined (fewer than two scored genotypes, or no variance).
+    pub r2: Option<f64>,
+    pub concordance: Option<f64>,
+    pub n_correct: u64,
+    pub n_scored: u64,
+}
+
+/// Per-sample R² of one class of sites on the hom-ref path.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClassSummary {
+    pub n_sites: u64,
+    /// Mean of the defined per-sample R² (`None`: none defined).
+    pub mean_r2: Option<f64>,
+    /// The samples that mean is over.
+    pub n_samples: usize,
+}
+
+/// Every finished metric of one evaluation, as the report prints it and the JSON
+/// summary writes it (rounded there to 6 decimals; full precision here). Built by
+/// [`summarize_matched`] or [`summarize_imputation`] from the accumulators.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvalSummary {
+    pub mode: EvalMode,
+    pub n_imp_variants: u64,
+    pub n_truth_variants: u64,
+    /// Sites scored: matched sites, or (hom-ref path) imputed sites not excluded.
+    pub n_matched: u64,
+    /// Chromosomes scored (matched-sites path).
+    pub chromosomes: Vec<String>,
+    /// Samples scored (shared by the two files).
+    pub n_samples: usize,
+    /// The nine MAF bins ([`MAF_BINS`]); empty on a hom-ref evaluation run without
+    /// site metrics.
+    pub maf_bins: Vec<MafBinSummary>,
+    pub overall: OverallSummary,
+    /// Mean of the defined per-sample R² (all scored sites).
+    pub per_sample_mean_r2: Option<f64>,
+    /// Number of samples with a defined R² (what `per_sample_mean_r2` is over).
+    pub per_sample_n_defined: usize,
+    pub per_sample: Vec<SampleSummary>,
+    /// The per-sample rows carry names (the caller passed the sample names).
+    pub named_samples: bool,
+    /// Hom-ref path: per-sample R² over all scored sites, the SNPs, the indels.
+    pub combined: Option<ClassSummary>,
+    pub snp: Option<ClassSummary>,
+    pub indel: Option<ClassSummary>,
+    /// Hom-ref path: what `--truth-raw` did.
+    pub raw_truth: Option<RawTruthDiag>,
+}
+
+/// `None` for NaN (undefined).
+fn defined(x: f64) -> Option<f64> { (!x.is_nan()).then_some(x) }
+
+fn bin_summaries(site: &SiteAccumulator) -> Vec<MafBinSummary> {
+    MAF_BINS.iter().enumerate().map(|(bi, &(lo, hi, label))| {
+        let n = site.bin_n[bi];
+        MafBinSummary {
+            label, maf_lo: lo, maf_hi: hi, n_sites: n,
+            mean_r2: (n > 0).then(|| site.bin_r2_sum[bi] / n as f64),
+            concordance: (n > 0).then(|| site.bin_conc_sum[bi] / n as f64),
+        }
+    }).collect()
+}
+
+fn overall_summary(site: Option<&SiteAccumulator>, n_sites: u64) -> OverallSummary {
+    let (r2_sum, r2_n, conc_sum, conc_n) = site.map_or((0.0, 0, 0.0, 0),
+        |s| (s.total_r2_sum, s.total_r2_n, s.total_conc_sum, s.total_n));
+    OverallSummary {
+        n_sites,
+        mean_r2: (r2_n > 0).then(|| r2_sum / r2_n as f64),
+        n_r2_sites: r2_n,
+        concordance: (conc_n > 0).then(|| conc_sum / conc_n as f64),
+        n_concordance_sites: conc_n,
+    }
+}
+
+fn sample_summaries(acc: &SampleAccumulator, names: Option<&[String]>) -> Vec<SampleSummary> {
+    let r2 = acc.compute_r2();
+    let conc = acc.compute_concordance();
+    (0..acc.n_samples).map(|s| SampleSummary {
+        sample: names.map(|n| n[s].clone()),
+        r2: defined(r2[s]),
+        concordance: defined(conc[s]),
+        n_correct: acc.n_correct[s],
+        n_scored: acc.n_total[s],
+    }).collect()
+}
+
+fn class_summary(acc: &SampleAccumulator) -> ClassSummary {
+    let (r2, n) = mean_sample_r2(acc);
+    ClassSummary { n_sites: acc.n_variants, mean_r2: defined(r2), n_samples: n }
+}
+
+/// The finished metrics of a matched-sites evaluation ([`evaluate_with_options`]).
+pub fn summarize_matched(site_acc: &SiteAccumulator, sample_acc: &SampleAccumulator, counts: &EvalCounts,
+    sample_names: Option<&[String]>) -> EvalSummary {
+    let (mean, n_def) = mean_sample_r2(sample_acc);
+    EvalSummary {
+        mode: EvalMode::MatchedSites,
+        n_imp_variants: counts.n_imp_variants,
+        n_truth_variants: counts.n_truth_variants,
+        n_matched: counts.n_matched,
+        chromosomes: counts.chromosomes.clone(),
+        n_samples: sample_acc.n_samples,
+        maf_bins: bin_summaries(site_acc),
+        overall: overall_summary(Some(site_acc), counts.n_matched),
+        per_sample_mean_r2: defined(mean),
+        per_sample_n_defined: n_def,
+        per_sample: sample_summaries(sample_acc, sample_names),
+        named_samples: sample_names.is_some(),
+        combined: None, snp: None, indel: None, raw_truth: None,
+    }
+}
+
+/// The finished metrics of a hom-ref evaluation ([`evaluate_imputation_with_options`]).
+pub fn summarize_imputation(
+    comb: &SampleAccumulator, snp: &SampleAccumulator, indel: &SampleAccumulator, counts: &EvalCounts,
+    sample_names: Option<&[String]>, site: Option<&SiteAccumulator>, raw_diag: Option<&RawTruthDiag>,
+) -> EvalSummary {
+    let combined = class_summary(comb);
+    EvalSummary {
+        mode: EvalMode::HomrefAbsent,
+        n_imp_variants: counts.n_imp_variants,
+        n_truth_variants: counts.n_truth_variants,
+        n_matched: counts.n_matched,
+        chromosomes: counts.chromosomes.clone(),
+        n_samples: comb.n_samples,
+        maf_bins: site.map(bin_summaries).unwrap_or_default(),
+        overall: overall_summary(site, counts.n_matched),
+        per_sample_mean_r2: combined.mean_r2,
+        per_sample_n_defined: combined.n_samples,
+        per_sample: sample_summaries(comb, sample_names),
+        named_samples: sample_names.is_some(),
+        combined: Some(combined),
+        snp: Some(class_summary(snp)),
+        indel: Some(class_summary(indel)),
+        raw_truth: raw_diag.copied(),
+    }
+}
+
+/// 6-decimal JSON number; `null` for an undefined value.
+fn json6(x: Option<f64>) -> serde_json::Value {
+    serde_json::json!(x.map(|x| (x * 1e6).round() / 1e6))
+}
+
+impl EvalSummary {
+    /// The JSON [`write_json_summary`] writes (matched-sites layout).
+    pub fn matched_json(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        for b in &self.maf_bins {
+            let mut bin = serde_json::Map::new();
+            bin.insert("n".into(), serde_json::json!(b.n_sites));
+            if b.n_sites > 0 {
+                bin.insert("mean_r2".into(), json6(b.mean_r2));
+                bin.insert("concordance".into(), json6(b.concordance));
+            }
+            map.insert(b.label.to_string(), serde_json::Value::Object(bin));
+        }
+        if self.overall.n_concordance_sites > 0 {
+            let mut overall = serde_json::Map::new();
+            overall.insert("n".into(), serde_json::json!(self.overall.n_sites));
+            // null when no site has two scored samples (a one-sample run): there is no site r².
+            overall.insert("mean_r2".into(), json6(self.overall.mean_r2));
+            overall.insert("concordance".into(), json6(self.overall.concordance));
+            map.insert("overall".into(), serde_json::Value::Object(overall));
+        }
+        map.insert("n_imp_variants".into(), serde_json::json!(self.n_imp_variants));
+        map.insert("n_truth_variants".into(), serde_json::json!(self.n_truth_variants));
+        map.insert("n_matched".into(), serde_json::json!(self.n_matched));
+        map.insert("n_samples".into(), serde_json::json!(self.n_samples));
+        if !self.per_sample.is_empty() {
+            // Average over the samples that HAVE a value; a NaN means undefined.
+            map.insert("per_sample_mean_r2".into(), json6(self.per_sample_mean_r2));
+            let per_sample: Vec<serde_json::Value> = self.per_sample.iter().map(|s| {
+                let mut obj = serde_json::Map::new();
+                if let Some(name) = &s.sample { obj.insert("sample".into(), serde_json::json!(name)); }
+                // NaN is not representable in JSON: null, so a consumer sees "undefined"
+                // rather than a zero it would average in.
+                obj.insert("r2".into(), json6(s.r2));
+                obj.insert("concordance".into(), json6(s.concordance));
+                obj.insert("n_correct".into(), serde_json::json!(s.n_correct));
+                obj.insert("n_total".into(), serde_json::json!(s.n_scored));
+                serde_json::Value::Object(obj)
+            }).collect();
+            map.insert("per_sample".into(), serde_json::json!(per_sample));
+        }
+        serde_json::Value::Object(map)
+    }
+
+    /// The JSON [`write_imputation_json`] writes (hom-ref layout; SNP/indel keys
+    /// with `by_type`).
+    pub fn imputation_json(&self, by_type: bool) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        let none = ClassSummary { n_sites: 0, mean_r2: None, n_samples: 0 };
+        let comb = self.combined.as_ref().unwrap_or(&none);
+        map.insert("combined_mean_r2".into(), json6(comb.mean_r2));
+        map.insert("n_samples".into(), serde_json::json!(comb.n_samples));
+        map.insert("n_sites_scored".into(), serde_json::json!(self.n_matched));
+        map.insert("n_imputed_sites".into(), serde_json::json!(self.n_imp_variants));
+        map.insert("n_truth_strong_sites".into(), serde_json::json!(self.n_truth_variants));
+        if by_type {
+            let snp = self.snp.as_ref().unwrap_or(&none);
+            let indel = self.indel.as_ref().unwrap_or(&none);
+            map.insert("snp_mean_r2".into(), json6(snp.mean_r2));
+            map.insert("snp_n_sites".into(), serde_json::json!(snp.n_sites));
+            map.insert("indel_mean_r2".into(), json6(indel.mean_r2));
+            map.insert("indel_n_sites".into(), serde_json::json!(indel.n_sites));
+        }
+        if self.named_samples {
+            let named = || self.per_sample.iter().filter_map(|s| s.sample.clone().map(|n| (n, s)));
+            let per: serde_json::Map<String, serde_json::Value> = named().map(|(n, s)| (n, json6(s.r2))).collect();
+            map.insert("per_sample_combined_r2".into(), serde_json::Value::Object(per));
+            let scored: serde_json::Map<String, serde_json::Value> = named()
+                .map(|(n, s)| (n, serde_json::json!(s.n_scored))).collect();
+            map.insert("per_sample_n_scored".into(), serde_json::Value::Object(scored));
+        }
+        if let Some(d) = self.raw_truth.filter(|d| d.raw_sites_loaded > 0) {
+            let mut m = serde_json::Map::new();
+            m.insert("raw_sites_loaded".into(), serde_json::json!(d.raw_sites_loaded));
+            m.insert("scored_sites_matched".into(), serde_json::json!(d.scored_sites_matched));
+            m.insert("scored_sites_absent_from_strong".into(), serde_json::json!(d.scored_sites_absent_from_strong));
+            m.insert("genotypes_rescued".into(), serde_json::json!(d.genotypes_rescued));
+            m.insert("genotypes_missing_raw".into(), serde_json::json!(d.genotypes_missing_raw));
+            map.insert("truth_raw_diag".into(), serde_json::Value::Object(m));
+        }
+        // Per-MAF-bin site R², under `maf_bins` so the top-level keys above stay
+        // exactly as they were for anything already parsing this file.
+        if !self.maf_bins.is_empty() {
+            let mut bins = serde_json::Map::new();
+            for b in &self.maf_bins {
+                let mut bin = serde_json::Map::new();
+                bin.insert("n".into(), serde_json::json!(b.n_sites));
+                if b.n_sites > 0 {
+                    bin.insert("mean_r2".into(), json6(b.mean_r2));
+                    bin.insert("concordance".into(), json6(b.concordance));
+                }
+                bins.insert(b.label.to_string(), serde_json::Value::Object(bin));
+            }
+            map.insert("maf_bins".into(), serde_json::Value::Object(bins));
+            if self.overall.n_r2_sites > 0 {
+                map.insert("overall_site_r2".into(), json6(self.overall.mean_r2));
+                map.insert("overall_site_r2_n".into(), serde_json::json!(self.overall.n_r2_sites));
+            }
+        }
+        serde_json::Value::Object(map)
+    }
+}
+
+impl EvalSummary {
+    /// Write the JSON summary the command line writes for this evaluation:
+    /// [`EvalSummary::matched_json`], or [`EvalSummary::imputation_json`] (SNP/indel
+    /// keys with `by_type`).
+    pub fn write_json(&self, path: &Path, by_type: bool) -> io::Result<()> {
+        match self.mode {
+            EvalMode::MatchedSites => write_json_value(path, &self.matched_json()),
+            EvalMode::HomrefAbsent => write_json_value(path, &self.imputation_json(by_type)),
+        }
+    }
+}
+
+fn write_json_value(path: &Path, value: &serde_json::Value) -> io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
+    Ok(())
+}
+
 /// Write the imputation-R² summary to JSON.
 pub fn write_imputation_json(
     path: &Path, comb: &SampleAccumulator, snp: &SampleAccumulator, indel: &SampleAccumulator,
     by_type: bool, counts: &EvalCounts, sample_names: Option<&[String]>,
     site: Option<&SiteAccumulator>, raw_diag: Option<&RawTruthDiag>,
 ) -> io::Result<()> {
-    use std::io::Write;
-    let round6 = |x: f64| (x * 1e6).round() / 1e6;
-    let mut map = serde_json::Map::new();
-    let (rc, nc) = mean_sample_r2(comb);
-    map.insert("combined_mean_r2".into(), serde_json::json!(round6(rc)));
-    map.insert("n_samples".into(), serde_json::json!(nc));
-    map.insert("n_sites_scored".into(), serde_json::json!(counts.n_matched));
-    map.insert("n_imputed_sites".into(), serde_json::json!(counts.n_imp_variants));
-    map.insert("n_truth_strong_sites".into(), serde_json::json!(counts.n_truth_variants));
-    if by_type {
-        let (rs, _) = mean_sample_r2(snp);
-        let (ri, _) = mean_sample_r2(indel);
-        map.insert("snp_mean_r2".into(), serde_json::json!(round6(rs)));
-        map.insert("snp_n_sites".into(), serde_json::json!(snp.n_variants));
-        map.insert("indel_mean_r2".into(), serde_json::json!(round6(ri)));
-        map.insert("indel_n_sites".into(), serde_json::json!(indel.n_variants));
-    }
-    if let Some(names) = sample_names {
-        let r2 = comb.compute_r2();
-        let per: serde_json::Map<String, serde_json::Value> = names.iter().enumerate()
-            .map(|(i, nm)| (nm.clone(), serde_json::json!(round6(r2[i])))).collect();
-        map.insert("per_sample_combined_r2".into(), serde_json::Value::Object(per));
-        let scored: serde_json::Map<String, serde_json::Value> = names.iter().enumerate()
-            .map(|(i, nm)| (nm.clone(), serde_json::json!(comb.n_total[i]))).collect();
-        map.insert("per_sample_n_scored".into(), serde_json::Value::Object(scored));
-    }
-    if let Some(d) = raw_diag.filter(|d| d.raw_sites_loaded > 0) {
-        let mut m = serde_json::Map::new();
-        m.insert("raw_sites_loaded".into(), serde_json::json!(d.raw_sites_loaded));
-        m.insert("scored_sites_matched".into(), serde_json::json!(d.scored_sites_matched));
-        m.insert("scored_sites_absent_from_strong".into(), serde_json::json!(d.scored_sites_absent_from_strong));
-        m.insert("genotypes_rescued".into(), serde_json::json!(d.genotypes_rescued));
-        m.insert("genotypes_missing_raw".into(), serde_json::json!(d.genotypes_missing_raw));
-        map.insert("truth_raw_diag".into(), serde_json::Value::Object(m));
-    }
-    // Per-MAF-bin site R², under `maf_bins` so the top-level keys above stay
-    // exactly as they were for anything already parsing this file.
-    if let Some(sa) = site {
-        let mut bins = serde_json::Map::new();
-        for (bi, &(_, _, label)) in MAF_BINS.iter().enumerate() {
-            let n = sa.bin_n[bi];
-            let mut bin = serde_json::Map::new();
-            bin.insert("n".into(), serde_json::json!(n));
-            if n > 0 {
-                bin.insert("mean_r2".into(), serde_json::json!(round6(sa.bin_r2_sum[bi] / n as f64)));
-                bin.insert("concordance".into(), serde_json::json!(round6(sa.bin_conc_sum[bi] / n as f64)));
-            }
-            bins.insert(label.to_string(), serde_json::Value::Object(bin));
-        }
-        map.insert("maf_bins".into(), serde_json::Value::Object(bins));
-        if sa.total_r2_n > 0 {
-            map.insert("overall_site_r2".into(),
-                serde_json::json!(round6(sa.total_r2_sum / sa.total_r2_n as f64)));
-            map.insert("overall_site_r2_n".into(), serde_json::json!(sa.total_r2_n));
-        }
-    }
-    let mut f = std::fs::File::create(path)?;
-    f.write_all(serde_json::to_string_pretty(&serde_json::Value::Object(map))?.as_bytes())?;
-    Ok(())
+    let summary = summarize_imputation(comb, snp, indel, counts, sample_names, site, raw_diag);
+    write_json_value(path, &summary.imputation_json(by_type))
 }
 
 /// Write JSON summary to file.
@@ -2017,75 +2317,9 @@ pub fn write_json_summary(
     path: &Path, site_acc: &SiteAccumulator, sample_acc: &SampleAccumulator, counts: &EvalCounts,
     sample_names: Option<&[String]>,
 ) -> io::Result<()> {
-    use std::io::Write;
-    let mut map = serde_json::Map::new();
-
-    for (bi, &(_, _, label)) in MAF_BINS.iter().enumerate() {
-        let n = site_acc.bin_n[bi];
-        let mut bin = serde_json::Map::new();
-        bin.insert("n".into(), serde_json::json!(n));
-        if n > 0 {
-            bin.insert("mean_r2".into(), serde_json::json!((site_acc.bin_r2_sum[bi] / n as f64 * 1e6).round() / 1e6));
-            bin.insert("concordance".into(), serde_json::json!((site_acc.bin_conc_sum[bi] / n as f64 * 1e6).round() / 1e6));
-        }
-        map.insert(label.to_string(), serde_json::Value::Object(bin));
-    }
-
-    if site_acc.total_n > 0 {
-        let mut overall = serde_json::Map::new();
-        overall.insert("n".into(), serde_json::json!(counts.n_matched));
-        // null when no site has two scored samples (a one-sample run): there is no site r².
-        let r2 = (site_acc.total_r2_n > 0).then(|| site_acc.total_r2_sum / site_acc.total_r2_n as f64);
-        overall.insert("mean_r2".into(), serde_json::json!(r2.map(|r| (r * 1e6).round() / 1e6)));
-        overall.insert("concordance".into(), serde_json::json!((site_acc.total_conc_sum / site_acc.total_n as f64 * 1e6).round() / 1e6));
-        map.insert("overall".into(), serde_json::Value::Object(overall));
-    }
-
-    map.insert("n_imp_variants".into(), serde_json::json!(counts.n_imp_variants));
-    map.insert("n_truth_variants".into(), serde_json::json!(counts.n_truth_variants));
-    map.insert("n_matched".into(), serde_json::json!(counts.n_matched));
-    map.insert("n_samples".into(), serde_json::json!(sample_acc.n_samples));
-
-    let sample_r2 = sample_acc.compute_r2();
-    let sample_conc = sample_acc.compute_concordance();
-    if !sample_r2.is_empty() {
-        // Average over the samples that HAVE a value; a NaN means undefined.
-        let n_def = sample_r2.iter().filter(|v| v.is_finite()).count();
-        let mean: f64 = if n_def > 0 {
-            sample_r2.iter().filter(|v| v.is_finite()).sum::<f64>() / n_def as f64
-        } else { f64::NAN };
-        map.insert("per_sample_mean_r2".into(), serde_json::json!((mean * 1e6).round() / 1e6));
-
-        // Per-sample detail array
-        let per_sample: Vec<serde_json::Value> = (0..sample_acc.n_samples).map(|s| {
-            let mut obj = serde_json::Map::new();
-            if let Some(names) = sample_names {
-                obj.insert("sample".into(), serde_json::json!(names[s]));
-            }
-            // NaN is not representable in JSON: emit null so a consumer sees
-            // "undefined" rather than a zero it would average in.
-            let r2j = if sample_r2[s].is_finite() {
-                serde_json::json!((sample_r2[s] * 1e6).round() / 1e6)
-            } else { serde_json::Value::Null };
-            let cj = if sample_conc[s].is_finite() {
-                serde_json::json!((sample_conc[s] * 1e6).round() / 1e6)
-            } else { serde_json::Value::Null };
-            obj.insert("r2".into(), r2j);
-            obj.insert("concordance".into(), cj);
-            obj.insert("n_correct".into(), serde_json::json!(sample_acc.n_correct[s]));
-            obj.insert("n_total".into(), serde_json::json!(sample_acc.n_total[s]));
-            serde_json::Value::Object(obj)
-        }).collect();
-        map.insert("per_sample".into(), serde_json::json!(per_sample));
-    }
-
-    let json = serde_json::Value::Object(map);
-    let mut f = std::fs::File::create(path)?;
-    f.write_all(serde_json::to_string_pretty(&json)?.as_bytes())?;
-    Ok(())
+    let summary = summarize_matched(site_acc, sample_acc, counts, sample_names);
+    write_json_value(path, &summary.matched_json())
 }
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2640,18 +2874,27 @@ mod tests {
         let before = listing();
         let opts = EvaluationOptions::default();
         let none = super::super::exclude::SiteExclusion::default();
-        let (s0, p0, c0) = evaluate_parallel_with_options(&imp, &truth, &shared, 4, &none, &opts).unwrap();
+        // A host that requires indexes gets an error instead.
+        let required = evaluate_with_index_policy(&imp, &truth, &shared, &none, &opts, IndexPolicy::RequireExisting);
+        assert!(required.is_err_and(|e| e.kind() == io::ErrorKind::NotFound && e.to_string().contains("imp.vcf.gz")));
+        let (s0, p0, c0) = evaluate_parallel_with_options(&imp, &truth, &shared, 4, &none, &opts, IndexPolicy::BuildInMemory).unwrap();
         assert_eq!(before, listing(), "evaluation wrote next to its inputs");
         // The in-memory index is the one the file holds: same regions, same scores.
         crate::srp::csi::build_tbi_index(&imp).unwrap();
         crate::srp::csi::build_tbi_index(&truth).unwrap();
-        let (s1, p1, c1) = evaluate_parallel_with_options(&imp, &truth, &shared, 4, &none, &opts).unwrap();
+        let (s1, p1, c1) = evaluate_parallel_with_options(&imp, &truth, &shared, 4, &none, &opts, IndexPolicy::BuildInMemory).unwrap();
+        // Same thread count (the regions follow it), so the same summation order.
+        let (s2, _, c2) = evaluate_with_index_policy(&imp, &truth, &shared, &none, &opts, IndexPolicy::RequireExisting).unwrap();
+        let (s3, _, c3) = evaluate_with_options(&imp, &truth, &shared, &none, &opts).unwrap();
+        assert_eq!((s2.total_r2_sum.to_bits(), c2.n_matched), (s3.total_r2_sum.to_bits(), c3.n_matched));
+
         assert_eq!((c0.n_matched, c0.n_imp_variants, c0.n_truth_variants), (600, 600, 600));
         assert_eq!((c0.n_matched, c0.n_imp_variants, c0.n_truth_variants), (c1.n_matched, c1.n_imp_variants, c1.n_truth_variants));
         assert_eq!(s0.total_r2_sum.to_bits(), s1.total_r2_sum.to_bits());
         assert_eq!(s0.bin_n, s1.bin_n);
         assert_eq!(p0.sum_ds_gt, p1.sum_ds_gt);
-        let tbi = |p: &Path| SeekIndex::resolve(p).ok().and_then(|i| match i { SeekIndex::Tbi(t) => t, _ => None });
+        let tbi = |p: &Path| SeekIndex::resolve(p, IndexPolicy::BuildInMemory).ok().and_then(|i| match i { SeekIndex::Tbi(t) => t, _ => None });
+
         let file_index = tbi(&imp).unwrap();
         let data = crate::srp::csi::build_tbi_index_data(&imp).unwrap();
         let mem_index = crate::srp::csi::parse_tbi_data(&data).unwrap();
@@ -2783,5 +3026,215 @@ mod tests {
                 assert_eq!(bcf_record_has_ref_call(&ib, 1, ns, 1).unwrap(), want, "tid {tid} {values:?}");
             }
         }
+    }
+
+    /// Write the imputation-R² summary to JSON.
+    fn old_write_imputation_json(
+        path: &Path, comb: &SampleAccumulator, snp: &SampleAccumulator, indel: &SampleAccumulator,
+        by_type: bool, counts: &EvalCounts, sample_names: Option<&[String]>,
+        site: Option<&SiteAccumulator>, raw_diag: Option<&RawTruthDiag>,
+    ) -> io::Result<()> {
+        use std::io::Write;
+        let round6 = |x: f64| (x * 1e6).round() / 1e6;
+        let mut map = serde_json::Map::new();
+        let (rc, nc) = mean_sample_r2(comb);
+        map.insert("combined_mean_r2".into(), serde_json::json!(round6(rc)));
+        map.insert("n_samples".into(), serde_json::json!(nc));
+        map.insert("n_sites_scored".into(), serde_json::json!(counts.n_matched));
+        map.insert("n_imputed_sites".into(), serde_json::json!(counts.n_imp_variants));
+        map.insert("n_truth_strong_sites".into(), serde_json::json!(counts.n_truth_variants));
+        if by_type {
+            let (rs, _) = mean_sample_r2(snp);
+            let (ri, _) = mean_sample_r2(indel);
+            map.insert("snp_mean_r2".into(), serde_json::json!(round6(rs)));
+            map.insert("snp_n_sites".into(), serde_json::json!(snp.n_variants));
+            map.insert("indel_mean_r2".into(), serde_json::json!(round6(ri)));
+            map.insert("indel_n_sites".into(), serde_json::json!(indel.n_variants));
+        }
+        if let Some(names) = sample_names {
+            let r2 = comb.compute_r2();
+            let per: serde_json::Map<String, serde_json::Value> = names.iter().enumerate()
+                .map(|(i, nm)| (nm.clone(), serde_json::json!(round6(r2[i])))).collect();
+            map.insert("per_sample_combined_r2".into(), serde_json::Value::Object(per));
+            let scored: serde_json::Map<String, serde_json::Value> = names.iter().enumerate()
+                .map(|(i, nm)| (nm.clone(), serde_json::json!(comb.n_total[i]))).collect();
+            map.insert("per_sample_n_scored".into(), serde_json::Value::Object(scored));
+        }
+        if let Some(d) = raw_diag.filter(|d| d.raw_sites_loaded > 0) {
+            let mut m = serde_json::Map::new();
+            m.insert("raw_sites_loaded".into(), serde_json::json!(d.raw_sites_loaded));
+            m.insert("scored_sites_matched".into(), serde_json::json!(d.scored_sites_matched));
+            m.insert("scored_sites_absent_from_strong".into(), serde_json::json!(d.scored_sites_absent_from_strong));
+            m.insert("genotypes_rescued".into(), serde_json::json!(d.genotypes_rescued));
+            m.insert("genotypes_missing_raw".into(), serde_json::json!(d.genotypes_missing_raw));
+            map.insert("truth_raw_diag".into(), serde_json::Value::Object(m));
+        }
+        // Per-MAF-bin site R², under `maf_bins` so the top-level keys above stay
+        // exactly as they were for anything already parsing this file.
+        if let Some(sa) = site {
+            let mut bins = serde_json::Map::new();
+            for (bi, &(_, _, label)) in MAF_BINS.iter().enumerate() {
+                let n = sa.bin_n[bi];
+                let mut bin = serde_json::Map::new();
+                bin.insert("n".into(), serde_json::json!(n));
+                if n > 0 {
+                    bin.insert("mean_r2".into(), serde_json::json!(round6(sa.bin_r2_sum[bi] / n as f64)));
+                    bin.insert("concordance".into(), serde_json::json!(round6(sa.bin_conc_sum[bi] / n as f64)));
+                }
+                bins.insert(label.to_string(), serde_json::Value::Object(bin));
+            }
+            map.insert("maf_bins".into(), serde_json::Value::Object(bins));
+            if sa.total_r2_n > 0 {
+                map.insert("overall_site_r2".into(),
+                    serde_json::json!(round6(sa.total_r2_sum / sa.total_r2_n as f64)));
+                map.insert("overall_site_r2_n".into(), serde_json::json!(sa.total_r2_n));
+            }
+        }
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(serde_json::to_string_pretty(&serde_json::Value::Object(map))?.as_bytes())?;
+        Ok(())
+    }
+    
+    /// Write JSON summary to file.
+    fn old_write_json_summary(
+        path: &Path, site_acc: &SiteAccumulator, sample_acc: &SampleAccumulator, counts: &EvalCounts,
+        sample_names: Option<&[String]>,
+    ) -> io::Result<()> {
+        use std::io::Write;
+        let mut map = serde_json::Map::new();
+    
+        for (bi, &(_, _, label)) in MAF_BINS.iter().enumerate() {
+            let n = site_acc.bin_n[bi];
+            let mut bin = serde_json::Map::new();
+            bin.insert("n".into(), serde_json::json!(n));
+            if n > 0 {
+                bin.insert("mean_r2".into(), serde_json::json!((site_acc.bin_r2_sum[bi] / n as f64 * 1e6).round() / 1e6));
+                bin.insert("concordance".into(), serde_json::json!((site_acc.bin_conc_sum[bi] / n as f64 * 1e6).round() / 1e6));
+            }
+            map.insert(label.to_string(), serde_json::Value::Object(bin));
+        }
+    
+        if site_acc.total_n > 0 {
+            let mut overall = serde_json::Map::new();
+            overall.insert("n".into(), serde_json::json!(counts.n_matched));
+            // null when no site has two scored samples (a one-sample run): there is no site r².
+            let r2 = (site_acc.total_r2_n > 0).then(|| site_acc.total_r2_sum / site_acc.total_r2_n as f64);
+            overall.insert("mean_r2".into(), serde_json::json!(r2.map(|r| (r * 1e6).round() / 1e6)));
+            overall.insert("concordance".into(), serde_json::json!((site_acc.total_conc_sum / site_acc.total_n as f64 * 1e6).round() / 1e6));
+            map.insert("overall".into(), serde_json::Value::Object(overall));
+        }
+    
+        map.insert("n_imp_variants".into(), serde_json::json!(counts.n_imp_variants));
+        map.insert("n_truth_variants".into(), serde_json::json!(counts.n_truth_variants));
+        map.insert("n_matched".into(), serde_json::json!(counts.n_matched));
+        map.insert("n_samples".into(), serde_json::json!(sample_acc.n_samples));
+    
+        let sample_r2 = sample_acc.compute_r2();
+        let sample_conc = sample_acc.compute_concordance();
+        if !sample_r2.is_empty() {
+            // Average over the samples that HAVE a value; a NaN means undefined.
+            let n_def = sample_r2.iter().filter(|v| v.is_finite()).count();
+            let mean: f64 = if n_def > 0 {
+                sample_r2.iter().filter(|v| v.is_finite()).sum::<f64>() / n_def as f64
+            } else { f64::NAN };
+            map.insert("per_sample_mean_r2".into(), serde_json::json!((mean * 1e6).round() / 1e6));
+    
+            // Per-sample detail array
+            let per_sample: Vec<serde_json::Value> = (0..sample_acc.n_samples).map(|s| {
+                let mut obj = serde_json::Map::new();
+                if let Some(names) = sample_names {
+                    obj.insert("sample".into(), serde_json::json!(names[s]));
+                }
+                // NaN is not representable in JSON: emit null so a consumer sees
+                // "undefined" rather than a zero it would average in.
+                let r2j = if sample_r2[s].is_finite() {
+                    serde_json::json!((sample_r2[s] * 1e6).round() / 1e6)
+                } else { serde_json::Value::Null };
+                let cj = if sample_conc[s].is_finite() {
+                    serde_json::json!((sample_conc[s] * 1e6).round() / 1e6)
+                } else { serde_json::Value::Null };
+                obj.insert("r2".into(), r2j);
+                obj.insert("concordance".into(), cj);
+                obj.insert("n_correct".into(), serde_json::json!(sample_acc.n_correct[s]));
+                obj.insert("n_total".into(), serde_json::json!(sample_acc.n_total[s]));
+                serde_json::Value::Object(obj)
+            }).collect();
+            map.insert("per_sample".into(), serde_json::json!(per_sample));
+        }
+    
+        let json = serde_json::Value::Object(map);
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(serde_json::to_string_pretty(&json)?.as_bytes())?;
+        Ok(())
+    }
+
+
+    #[test]
+    fn json_summaries_from_eval_summary_are_byte_identical_to_the_old_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("old.json"), dir.path().join("new.json"));
+        let same = |what: &str| {
+            let (x, y) = (std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+            assert_eq!(String::from_utf8_lossy(&x), String::from_utf8_lossy(&y), "{what}");
+        };
+        let mut r = Xs(0x5eed_1234_abcd);
+        let mafs = [0.0001, 0.0007, 0.0015, 0.003, 0.007, 0.015, 0.03, 0.07, 0.15, 0.3];
+        let mut n_null = 0;
+        for case in 0..400 {
+            let n = r.below(6) as usize;
+            let n_sites = r.below(60) as usize;
+            let mut site = SiteAccumulator::new();
+            let (mut comb, mut snp, mut indel) = (SampleAccumulator::new(n), SampleAccumulator::new(n), SampleAccumulator::new(n));
+            for _ in 0..n_sites {
+                let ds: Vec<f32> = (0..n).map(|_| match r.below(8) { 0 => -1.0, k => (k as f32 - 1.0) * 0.33 }).collect();
+                let gt: Vec<f32> = (0..n).map(|_| match r.below(5) { 0 => -1.0, 1 | 2 => 0.0, 3 => 1.0, _ => 2.0 }).collect();
+                let (r2, conc) = site_r2(&ds, &gt, n);
+                site.add(mafs[r.below(10) as usize], r2, conc);
+                comb.add_variant(&ds, &gt);
+                if r.below(2) == 0 { snp.add_variant(&ds, &gt) } else { indel.add_variant(&ds, &gt) }
+            }
+            let counts = EvalCounts {
+                n_matched: n_sites as u64, n_imp_variants: n_sites as u64 + r.below(9),
+                n_truth_variants: n_sites as u64 + r.below(9), chromosomes: vec!["22".to_string()],
+            };
+            // Names may repeat (a JSON object keeps the last).
+            let names: Vec<String> = (0..n).map(|i| format!("S{}", i % 4)).collect();
+            let diag = RawTruthDiag {
+                raw_sites_loaded: r.below(3), scored_sites_matched: r.below(5), genotypes_rescued: r.below(5),
+                genotypes_missing_raw: r.below(3), scored_sites_absent_from_strong: r.below(4),
+            };
+            for nm in [None, Some(names.as_slice())] {
+                old_write_json_summary(&a, &site, &comb, &counts, nm).unwrap();
+                write_json_summary(&b, &site, &comb, &counts, nm).unwrap();
+                same(&format!("matched case {case}"));
+                for by_type in [false, true] {
+                    for st in [None, Some(&site)] {
+                        for dg in [None, Some(&diag)] {
+                            old_write_imputation_json(&a, &comb, &snp, &indel, by_type, &counts, nm, st, dg).unwrap();
+                            write_imputation_json(&b, &comb, &snp, &indel, by_type, &counts, nm, st, dg).unwrap();
+                            same(&format!("hom-ref case {case}"));
+                        }
+                    }
+                }
+            }
+            n_null += std::fs::read_to_string(&b).unwrap().matches("null").count();
+        }
+        assert!(n_null > 50, "undefined values barely exercised ({n_null})");
+    }
+
+    #[test]
+    fn summary_overall_says_which_sites_each_number_is_over() {
+        let mut site = SiteAccumulator::new();
+        site.add(0.3, 0.5, 1.0);
+        site.add(0.0001, 0.9, 0.5); // below the bins: concordance only
+        site.add(0.2, f64::NAN, 0.0); // undefined R²: concordance only
+        let acc = SampleAccumulator::new(0);
+        let counts = EvalCounts { n_matched: 4, n_imp_variants: 4, n_truth_variants: 4, chromosomes: vec![] };
+        let s = summarize_matched(&site, &acc, &counts, None);
+        assert_eq!(s.overall, OverallSummary { n_sites: 4, mean_r2: Some(0.5), n_r2_sites: 1,
+            concordance: Some(0.5), n_concordance_sites: 3 });
+        assert_eq!(s.maf_bins.len(), MAF_BINS.len());
+        assert_eq!(s.maf_bins[8].n_sites, 1);
+        assert_eq!(s.per_sample_mean_r2, None);
     }
 }
