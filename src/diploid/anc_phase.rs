@@ -17,7 +17,7 @@
 //! haplotype B, orientation) with an ancestry-change cost and a per-window flip
 //! prior from the solve's phase quality (`sampling::phase_quality`) gives each
 //! window an orientation. The path is applied only when it reads a two-continent
-//! person: one pair of different groups over at least `PAIR_FRAC` of the windows,
+//! person: one pair of different groups over at least `PAIR_FRAC` (70%) of the windows,
 //! a likelihood at least `LR_MIN` per window above the best path that gives both
 //! haplotypes one group, and at most `CHANGE_RATE_MAX` group changes per window
 //! (an F1 holds its two groups; an old admixture trades them between haplotypes). Each orientation change is placed at the
@@ -46,7 +46,16 @@ const NS: usize = G * G * 2;
 const WIN: usize = 60;
 const K: usize = 5;
 const RHO_ANC: f64 = 0.02;
-const PAIR_FRAC: f64 = 0.5;
+/// Default of `SELPHI_ANC_PAIR_FRAC`. 0.7: the 120 held-out two-continent children held
+/// their pair over 88-100% of the windows; a Mexican-American trio child read as
+/// EUR/SAS over 51% (an old Native American-European admixture, no reference group)
+/// and lost 0.01 pp switch error to the correction at 0.5.
+const PAIR_FRAC: f64 = 0.7;
+fn pair_frac_min() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| crate::config::f64_or("SELPHI_ANC_PAIR_FRAC", PAIR_FRAC))
+}
 const PQ_W: f64 = 3.0;
 const PQ_PRIOR: f64 = 0.3;
 const PQ_FLOOR: f64 = 0.0005;
@@ -425,7 +434,7 @@ fn viterbi(e: &[[[f64; G]; 2]], exp_err: &[f64], out: &mut Decision) -> Option<V
     let (top, cnt) = counts.iter().fold(counts[0], |b, &c| if c.1 > b.1 { c } else { b });
     out.pair = top;
     out.pair_frac = cnt as f64 / w_n as f64;
-    (top.0 != top.1 && out.pair_frac >= PAIR_FRAC && out.lr_per_window >= lr_min()
+    (top.0 != top.1 && out.pair_frac >= pair_frac_min() && out.lr_per_window >= lr_min()
         && out.anc_changes as f64 <= change_rate_max() * w_n as f64).then_some(path)
 }
 
