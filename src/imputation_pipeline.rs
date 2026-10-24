@@ -405,16 +405,10 @@ fn run_phasing(inp: &PhasingInputs) -> PhasingResult {
         let wgs: Vec<usize> = sites.iter().map(|&v| wgs_idx[v]).collect();
         srp.extract_ref_alleles_bitmatrix(&wgs)
     };
-    let anc_dense_panel = if anc_dense {
-        let t0 = Instant::now();
-        let d = selphi::diploid::anc_phase::DensePanel::prepare(&srp.sample_ids, n_ref, chip_bps, &anc_fetch);
-        match &d {
-            Some(d) => selphi_step!("Ancestry phase check, sequencing density: {} markers ({} labelled panel samples per group) [{:.1}s]",
-                d.markers.len(), d.t.n_per_group, t0.elapsed().as_secs_f64()),
-            None => selphi_info!("  SELPHI_ANC_POST: the panel lacks a labelled 1000 Genomes sample in some group; no check"),
-        }
-        d
-    } else { None };
+    // At sequencing density the markers are chosen among the scaffold rows once the
+    // scaffold matrix exists (below); its group frequencies at the junctions come from
+    // `anc_fetch`.
+    let mut anc_dense_panel: Option<selphi::diploid::anc_phase::DensePanel> = None;
     let anc_panel = if anc == selphi::diploid::anc_phase::Mode::Off || anc_dense { None } else {
         match ref_bm_full.as_ref() {
             Some(full) => {
@@ -495,6 +489,15 @@ male chrX): phasing on all {} called sites", scaffold.indices.len());
         selphi_step!("Common ref subset ({} / {} variants, {:.1} MB)",
             common_chip_indices.len(), n_chip,
             (common_ref_bm.n_words() * common_chip_indices.len() * 8) as f64 / 1e6);
+        if anc_dense {
+            let d = selphi::diploid::anc_phase::DensePanel::prepare(&srp.sample_ids, n_ref, chip_bps, &common_ref_bm, &common_chip_indices);
+            match &d {
+                Some(d) => selphi_step!("Ancestry phase check, sequencing density: {} markers among the scaffold sites ({} labelled panel samples per group)",
+                    d.markers.len(), d.t.n_per_group),
+                None => selphi_info!("  SELPHI_ANC_POST: the panel lacks a labelled 1000 Genomes sample in some group; no check"),
+            }
+            anc_dense_panel = d;
+        }
         // phase_rare weaves the reference panel into its PBWT when the chip-site
         // matrix was built (otherwise it runs target-only). At the scaffold sites it
         // reads the panel from `common_ref_bm` (carried through phase_common), so

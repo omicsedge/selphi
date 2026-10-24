@@ -485,7 +485,7 @@ e.g. a male chrX): phasing on all {} called sites", scaffold.indices.len());
         let dense = selphi::diploid::anc_phase::too_dense(chip_bps);
         let fetch = selphi::diploid::anc_phase::fetch_full(&ref_bm);
         let dense_panel = if dense {
-            selphi::diploid::anc_phase::DensePanel::prepare(&srp.sample_ids, n_ref, chip_bps, &fetch)
+            selphi::diploid::anc_phase::DensePanel::prepare(&srp.sample_ids, n_ref, chip_bps, &ref_bm, &(0..n_chip).collect::<Vec<_>>())
         } else { None };
         let array_panel = if dense { None } else { selphi::diploid::anc_phase::Panel::prepare(&ref_bm, &srp.sample_ids) };
         let checker = match (array_panel.as_ref(), dense_panel.as_ref()) {
