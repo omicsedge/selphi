@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Read as _, Cursor};
+use std::io::{self, Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value as JsonValue;
@@ -14,8 +14,10 @@ use serde_json::Value as JsonValue;
 use super::{
     GlobalSrpMetadata, ChrDirectoryEntry,
     SrpMetadata, Variant,
+    helpers::{read_section, decode_zstd_capped, decode_strings, MAX_SECTION_BYTES, MAX_INDEX_BYTES},
     tiled::{TiledSrpReader, TileEntryPub},
 };
+
 
 // ---------------------------------------------------------------------------
 // ChrSrpView — per-chromosome view of a multi-chr SRP
@@ -75,9 +77,8 @@ impl MultiChrSrpReader {
         }
 
         // Global metadata (zstd-compressed JSON)
-        let meta_comp = super::helpers::read_section(&mut f)?;
-        let meta_raw = zstd::decode_all(Cursor::new(&meta_comp))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let meta_comp = read_section(&mut f, &filepath, "global header")?;
+        let meta_raw = decode_zstd_capped(&meta_comp, MAX_SECTION_BYTES, "global header")?;
         let meta_json: JsonValue = serde_json::from_slice(&meta_raw)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -109,6 +110,13 @@ impl MultiChrSrpReader {
         let mut buf4 = [0u8; 4];
         f.read_exact(&mut buf4)?;
         let n_chr = u32::from_le_bytes(buf4) as usize;
+        // 32 bytes per entry must be left in the file before anything is sized by the count.
+        let remaining = f.metadata()?.len().saturating_sub(f.stream_position()?);
+        if n_chr as u64 * 32 > remaining {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                "corrupt SRP {}: chromosome directory of {} entries exceeds the {} bytes left in the file; regenerate the panel",
+                filepath.display(), n_chr, remaining)));
+        }
 
         let mut chr_directory = Vec::with_capacity(n_chr);
         let mut chr_map = HashMap::with_capacity(n_chr);
@@ -141,9 +149,8 @@ impl MultiChrSrpReader {
         }
 
         // Shared sample IDs
-        let sample_comp = super::helpers::read_section(&mut f)?;
-        let sample_raw = zstd::decode_all(Cursor::new(&sample_comp))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let sample_comp = read_section(&mut f, &filepath, "sample IDs")?;
+        let sample_raw = decode_zstd_capped(&sample_comp, MAX_SECTION_BYTES, "sample IDs")?;
         let sample_ids: Vec<String> = String::from_utf8_lossy(&sample_raw)
             .split('\n')
             .map(|s| s.to_string())
@@ -184,26 +191,25 @@ impl MultiChrSrpReader {
         f.seek(io::SeekFrom::Start(entry.data_offset))?;
 
         // Per-chr metadata (zstd JSON)
-        let meta_comp = super::helpers::read_section(&mut f)?;
-        let meta_raw = zstd::decode_all(Cursor::new(&meta_comp))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let meta_comp = read_section(&mut f, &self.path, "chromosome header")?;
+        let meta_raw = decode_zstd_capped(&meta_comp, MAX_SECTION_BYTES, "chromosome header")?;
         let meta_json: JsonValue = serde_json::from_slice(&meta_raw)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let mut metadata = SrpMetadata::from_json(&meta_json);
+        let mut metadata = SrpMetadata::from_json(&meta_json,
+            &format!("{} (chromosome {chr_name})", self.path.display()))?;
 
         // Variants
-        let vcomp = super::helpers::read_section(&mut f)?;
-        let vraw = zstd::decode_all(Cursor::new(&vcomp))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let vcomp = read_section(&mut f, &self.path, "variant index")?;
+        let vraw = decode_zstd_capped(&vcomp, MAX_INDEX_BYTES, "variant index")?;
         let variants = super::helpers::parse_variants_bin(&vraw, entry.n_variants as usize)?;
 
         // IDs
-        let ids = super::helpers::decode_strings(&super::helpers::read_section(&mut f)?, true)?;
+        let ids = decode_strings(&read_section(&mut f, &self.path, "variant IDs")?, true, MAX_INDEX_BYTES, "variant IDs")?;
 
         // Original IDs — must NOT filter empties (per-variant, "" for no-rsID),
         // else the length stops matching n_variants and every rsID is lost to
         // the synthetic-ID fallback below (matches the single-chr reader fix).
-        let orig = super::helpers::decode_strings(&super::helpers::read_section(&mut f)?, false)?;
+        let orig = decode_strings(&read_section(&mut f, &self.path, "original IDs")?, false, MAX_INDEX_BYTES, "original IDs")?;
         let original_ids = if orig.len() == entry.n_variants as usize { orig } else { ids.clone() };
 
         // Tile index
@@ -232,6 +238,7 @@ impl MultiChrSrpReader {
                 comp_size: u32::from_le_bytes(tidx[b+8..b+12].try_into().unwrap()),
             }
         }).collect();
+        super::tiled::check_tile_index(tile_entries.iter().map(|e| (e.offset, e.comp_size)), file_len, &self.path)?;
 
         // Populate chunk_cv on-the-fly when not stored in metadata. Shared
         // helper with single-chr reader; see `srp::chunk_cv_from_tiles`.

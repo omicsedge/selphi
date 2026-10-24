@@ -285,19 +285,30 @@ pub struct SrpMetadata {
 }
 
 impl SrpMetadata {
-    pub(crate) fn from_json(v: &JsonValue) -> Self {
-        let obj = v.as_object().expect("metadata must be a JSON object");
-        Self {
-            chromosome: obj.get("chromosome").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            n_variants: obj.get("n_variants").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-            n_haps: obj.get("n_haps").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-            n_chunks: obj.get("n_chunks").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-            chunk_size: obj.get("chunk_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+    /// The metadata of a decoded SRP header. `source` names it in errors (the file).
+    /// `chromosome` (a string) and `n_variants`, `n_haps`, `n_chunks`, `chunk_size`
+    /// (unsigned integers) are required: every writer puts them in, and a header
+    /// without them used to read as a panel of 0 variants on chromosome "".
+    /// `min_position`, `max_position`, `chunk_cv` and `contig_field` are optional.
+    pub(crate) fn from_json(v: &JsonValue, source: &str) -> std::io::Result<Self> {
+        let bad = |what: String| std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("corrupt SRP header of {source}: {what}; regenerate the panel"));
+        let obj = v.as_object().ok_or_else(|| bad("not a JSON object".to_string()))?;
+        let req_str = |key: &str| obj.get(key).and_then(|v| v.as_str()).map(str::to_string)
+            .ok_or_else(|| bad(format!("missing or non-string required key '{key}'")));
+        let req_u64 = |key: &str| obj.get(key).and_then(|v| v.as_u64()).map(|n| n as usize)
+            .ok_or_else(|| bad(format!("missing or non-integer required key '{key}'")));
+        Ok(Self {
+            chromosome: req_str("chromosome")?,
+            n_variants: req_u64("n_variants")?,
+            n_haps: req_u64("n_haps")?,
+            n_chunks: req_u64("n_chunks")?,
+            chunk_size: req_u64("chunk_size")?,
             min_position: obj.get("min_position").and_then(|v| v.as_i64()).unwrap_or(0),
             max_position: obj.get("max_position").and_then(|v| v.as_i64()).unwrap_or(0),
             chunk_cv: obj.get("chunk_cv").and_then(|v| v.as_f64()).unwrap_or(0.0),
             contig_field: obj.get("contig_field").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        }
+        })
     }
 
 }
@@ -323,10 +334,32 @@ pub fn chunk_cv_from_tiles(tile_entries: &[tiled::TileEntryPub]) -> f64 {
     var.sqrt() / mean
 }
 
+/// Decompress a chunk frame no further than its own 12-byte header says it holds:
+/// the header's (rows, cols, nnz) give the exact payload size, so the decoder stops
+/// at that size plus one byte (a longer frame fails the length check below exactly as
+/// it did) and a frame with a corrupt header is not decoded past the header (the
+/// checks below report it). Panics as `zstd::decode_all` did on a broken frame.
+fn decode_chunk_frame(compressed: &[u8]) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(Cursor::new(compressed))
+        .expect("zstd decompression failed");
+    let mut buf = Vec::with_capacity(12);
+    (&mut decoder).take(12).read_to_end(&mut buf).expect("zstd decompression failed");
+    if buf.len() < 12 { return buf; }
+    let count = |i: usize| i32::from_le_bytes(buf[i..i + 4].try_into().unwrap());
+    let (cols, nnz) = (count(4), count(8));
+    if count(0) < 0 || cols < 0 || nnz < 0 { return buf; }
+    let Some(payload) = (cols as usize + 1).checked_mul(4)
+        .and_then(|b| b.checked_add((nnz as usize).checked_mul(4)?)) else { return buf };
+    // Grown as it is read, as `decode_all` grew it: a corrupt header claiming gigabytes
+    // must not reserve them.
+    decoder.take(payload as u64 + 1).read_to_end(&mut buf).expect("zstd decompression failed");
+    buf
+}
+
 /// Parse a raw binary chunk after zstd decompression.
 pub(crate) fn parse_raw_chunk(compressed: &[u8]) -> CscChunk {
-    let decompressed = zstd::decode_all(Cursor::new(compressed))
-        .expect("zstd decompression failed");
+    let decompressed = decode_chunk_frame(compressed);
     let buf = &decompressed;
 
     assert!(buf.len() >= 12, "chunk too small for header");
@@ -422,5 +455,65 @@ mod tests {
         assert!(!chunk.get(0, 1));
         assert!(chunk.get(1, 1));
         assert!(!chunk.get(2, 1));
+    }
+
+    #[test]
+    fn metadata_requires_an_object_with_the_five_keys() {
+        let full = serde_json::json!({"chromosome": "22", "n_variants": 10, "n_haps": 4, "n_chunks": 1, "chunk_size": 10, "min_position": 5});
+        let m = SrpMetadata::from_json(&full, "p.srp").unwrap();
+        assert_eq!((m.chromosome.as_str(), m.n_variants, m.n_haps, m.n_chunks, m.chunk_size), ("22", 10, 4, 1, 10));
+        assert_eq!((m.min_position, m.max_position, m.chunk_cv, m.contig_field.as_str()), (5, 0, 0.0, ""));
+        let e = SrpMetadata::from_json(&serde_json::json!([1, 2]), "p.srp").unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("p.srp") && e.to_string().contains("not a JSON object"), "{e}");
+        for key in ["chromosome", "n_variants", "n_haps", "n_chunks", "chunk_size"] {
+            let mut v = full.clone();
+            v.as_object_mut().unwrap().remove(key);
+            let e = SrpMetadata::from_json(&v, "p.srp").unwrap_err();
+            assert!(e.to_string().contains(&format!("'{key}'")), "{key}: {e}");
+            let wrong = if key == "chromosome" { serde_json::json!(7) } else { serde_json::json!("x") };
+            let mut v = full.clone();
+            v.as_object_mut().unwrap().insert(key.to_string(), wrong);
+            assert!(SrpMetadata::from_json(&v, "p.srp").unwrap_err().to_string().contains(&format!("'{key}'")), "{key}");
+        }
+    }
+
+    fn chunk_frame(rows: i32, cols: i32, nnz: i32, indptr: &[i32], indices: &[i32], trailing: &[u8]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        for v in [rows, cols, nnz] { raw.extend_from_slice(&v.to_le_bytes()); }
+        for v in indptr { raw.extend_from_slice(&v.to_le_bytes()); }
+        for v in indices { raw.extend_from_slice(&v.to_le_bytes()); }
+        raw.extend_from_slice(trailing);
+        zstd::encode_all(Cursor::new(&raw), 3).unwrap()
+    }
+
+    #[test]
+    fn chunk_decode_stops_at_the_header_bound_and_keeps_the_old_tolerance() {
+        // Bytes after the payload were tolerated, and still are.
+        let c = chunk_frame(3, 2, 3, &[0, 2, 3], &[0, 2, 1], &[9u8; 100]);
+        let chunk = parse_raw_chunk(&c);
+        assert_eq!((chunk.n_rows, chunk.n_cols, chunk.nnz()), (3, 2, 3));
+        assert!(chunk.get(0, 0) && chunk.get(2, 0) && chunk.get(1, 1) && !chunk.get(1, 0));
+        // The decoder reads the header, the payload and one byte more, no further.
+        let full = zstd::decode_all(Cursor::new(&c)).unwrap();
+        assert_eq!(decode_chunk_frame(&c), full[..12 + 3 * 4 + 3 * 4 + 1].to_vec());
+        // A frame shorter than its header claims is read whole (the check below reports it).
+        let short = chunk_frame(3, 2, 3, &[0, 2, 3], &[0], &[]);
+        assert_eq!(decode_chunk_frame(&short), zstd::decode_all(Cursor::new(&short)).unwrap());
+    }
+
+    #[test]
+    #[should_panic(expected = "chunk truncated")]
+    fn chunk_claiming_more_than_its_frame_holds_fails_as_before() {
+        // 2^30 non-zeros claimed by a frame holding three: nothing of that size is allocated.
+        let c = chunk_frame(3, 2, 1 << 30, &[0, 2, 3], &[0, 2, 1], &[]);
+        let _ = parse_raw_chunk(&c);
+    }
+
+    #[test]
+    #[should_panic(expected = "negative count")]
+    fn chunk_with_a_negative_count_fails_as_before() {
+        let c = chunk_frame(3, -2, 3, &[0, 2, 3], &[0, 2, 1], &[]);
+        let _ = parse_raw_chunk(&c);
     }
 }

@@ -292,6 +292,25 @@ pub struct TiledSrpReader {
     pub n_tile_cols: usize,
 }
 
+/// Refuse a tile index read from a file whose entries run past the file or run
+/// backwards (`offset`, `comp_size` pairs in tile order). The stripe reads size
+/// their buffer by `offset + comp_size` differences between entries, so a corrupt
+/// index used to ask for a wrapped length; every writer lays the tiles out in
+/// index order, so a valid index passes.
+pub fn check_tile_index(entries: impl Iterator<Item = (u64, u32)>, file_len: u64, path: &Path) -> io::Result<()> {
+    let mut prev = 0u64;
+    for (i, (offset, comp_size)) in entries.enumerate() {
+        let end = offset.checked_add(comp_size as u64).filter(|&e| e <= file_len);
+        if end.is_none() || offset < prev {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                "corrupt SRP {}: tile {i} at offset {offset} (+{comp_size} bytes) lies outside the {file_len}-byte \
+                 file or before the tile before it; regenerate the panel", path.display())));
+        }
+        prev = offset;
+    }
+    Ok(())
+}
+
 impl TiledSrpReader {
     /// Open tiled SRP: reads only magic + tile_index (~9 MB for TOPMed).
     /// Skips header entirely — n_variants/n_haps come from the SRP reader.
@@ -337,6 +356,7 @@ impl TiledSrpReader {
                 comp_size: u32::from_le_bytes(idx_data[base+8..base+12].try_into().unwrap()),
             }
         }).collect();
+        check_tile_index(tile_index.iter().map(|e| (e.offset, e.comp_size)), file_len, path)?;
 
         Ok(Self {
             file_path: path.to_path_buf(),
@@ -962,5 +982,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tile_index_outside_the_file_or_running_backwards_is_refused() {
+        let p = std::path::Path::new("x.srp");
+        assert!(check_tile_index([(0u64, 10u32), (10, 5), (15, 0), (15, 85)].into_iter(), 100, p).is_ok());
+        assert!(check_tile_index(std::iter::empty(), 0, p).is_ok());
+        let past_end = check_tile_index([(0u64, 10u32), (10, 91)].into_iter(), 100, p).unwrap_err();
+        assert_eq!(past_end.kind(), std::io::ErrorKind::InvalidData);
+        assert!(past_end.to_string().contains("x.srp") && past_end.to_string().contains("tile 1"), "{past_end}");
+        let backwards = check_tile_index([(50u64, 10u32), (40, 10)].into_iter(), 100, p).unwrap_err();
+        assert!(backwards.to_string().contains("tile 1"), "{backwards}");
+        let wrapped = check_tile_index([(u64::MAX, 1u32)].into_iter(), 100, p).unwrap_err();
+        assert!(wrapped.to_string().contains("tile 0"), "{wrapped}");
     }
 }

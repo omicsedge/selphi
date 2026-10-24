@@ -1,17 +1,60 @@
 //! Shared helpers for SRP readers (single-chr and multi-chr).
 
 use std::fs::File;
-use std::io::{self, Read as _, Cursor};
+use std::io::{self, Read as _, Seek as _, Cursor};
+use std::path::Path;
 use super::Variant;
 
-/// Read a length-prefixed section from a file: [4B len] [len bytes data].
-pub fn read_section(f: &mut File) -> io::Result<Vec<u8>> {
+/// Most bytes a header, sample-ID or contig section may decompress to (1 GiB).
+pub const MAX_SECTION_BYTES: usize = 1 << 30;
+/// Most bytes a per-variant section (the variant index, the IDs) may decompress to
+/// (8 GiB; TOPMed chr20's 17.9M IDs decompress to ~0.4 GB).
+pub const MAX_INDEX_BYTES: usize = 8 << 30;
+
+fn corrupt(path: &Path, what: &str, detail: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData,
+        format!("corrupt SRP {}: {what} section {detail}; regenerate the panel", path.display()))
+}
+
+/// Read a length-prefixed section from a file: [4B len] [len bytes data]. `path` and
+/// `what` (the file and the section) name the error when the length exceeds the bytes
+/// left in the file: a short or garbage file (a magic followed by `ff ff ff ff`) used to
+/// ask for 4 GiB before the read failed.
+pub fn read_section(f: &mut File, path: &Path, what: &str) -> io::Result<Vec<u8>> {
     let mut b = [0u8; 4];
     f.read_exact(&mut b)?;
     let len = u32::from_le_bytes(b) as usize;
+    let remaining = f.metadata()?.len().saturating_sub(f.stream_position()?);
+    if len as u64 > remaining {
+        return Err(corrupt(path, what, format!(
+            "length {len} exceeds the {remaining} bytes left in the file (truncated, or not an SRP)")));
+    }
     let mut data = vec![0u8; len];
     f.read_exact(&mut data)?;
     Ok(data)
+}
+
+/// Decompress one zstd section, refusing a result above `cap` bytes before it is
+/// allocated: by the frame's content size when the frame declares one, else by
+/// stopping the decoder at `cap + 1` bytes (a section written by `write_section`
+/// declares no size). The bytes are exactly `zstd::decode_all`'s.
+pub fn decode_zstd_capped(compressed: &[u8], cap: usize, what: &str) -> io::Result<Vec<u8>> {
+    let too_big = |n: u64| io::Error::new(io::ErrorKind::InvalidData, format!(
+        "corrupt SRP: {what} section decompresses to {n} bytes, over its {cap}-byte limit; regenerate the panel"));
+    let declared = match zstd::zstd_safe::get_frame_content_size(compressed) {
+        Ok(Some(n)) if n > cap as u64 => return Err(too_big(n)),
+        Ok(Some(n)) => Some(n as usize),
+        Ok(None) => None,
+        Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("corrupt SRP: {what} section is not a zstd frame; regenerate the panel"))),
+    };
+    let mut out = Vec::with_capacity(declared.unwrap_or(0));
+    let decoder = zstd::stream::read::Decoder::with_buffer(Cursor::new(compressed)).map_err(|e|
+        io::Error::new(io::ErrorKind::InvalidData, format!("{what}: {e}")))?;
+    decoder.take(cap as u64 + 1).read_to_end(&mut out).map_err(|e|
+        io::Error::new(io::ErrorKind::InvalidData, format!("{what}: {e}")))?;
+    if out.len() > cap { return Err(too_big(out.len() as u64)); }
+    Ok(out)
 }
 
 /// Parse binary variant records: [8B pos][1B chr_len][1B ref_len][1B alt_len][chr][ref][alt] per variant.
@@ -51,8 +94,9 @@ pub fn parse_variants_bin(data: &[u8], n: usize) -> std::io::Result<Vec<Variant>
 /// Decompress and split newline-delimited strings. Propagates zstd errors
 /// (was `unwrap_or_default()` — a corrupt section would silently produce an
 /// empty list and downstream code would emit "" sample IDs / variant IDs).
-pub fn decode_strings(compressed: &[u8], filter_empty: bool) -> std::io::Result<Vec<String>> {
-    let raw = zstd::decode_all(Cursor::new(compressed)).map_err(|e| std::io::Error::new(
+/// `cap`: the most bytes the section may decompress to ([`decode_zstd_capped`]).
+pub fn decode_strings(compressed: &[u8], filter_empty: bool, cap: usize, what: &str) -> std::io::Result<Vec<String>> {
+    let raw = decode_zstd_capped(compressed, cap, what).map_err(|e| std::io::Error::new(
         std::io::ErrorKind::InvalidData,
         format!("decode_strings: zstd decompress failed (corrupt SRP section): {}", e)))?;
     let s = String::from_utf8_lossy(&raw);
@@ -228,5 +272,49 @@ mod panel_suffix_tests {
     fn a_bare_name_gets_the_suffix() {
         assert_eq!(with_panel_suffix(Path::new("panel"), "srp").to_str().unwrap(), "panel.srp");
         assert_eq!(with_panel_suffix(Path::new("out/panel_v3"), "srp").to_str().unwrap(), "out/panel_v3.srp");
+    }
+}
+
+#[cfg(test)]
+mod capped_tests {
+    use std::io::Write as _;
+    use super::{decode_zstd_capped, read_section};
+
+    #[test]
+    fn capped_decode_matches_decode_all_and_refuses_oversized_frames() {
+        let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        // A streamed frame declares no content size (what `write_section` writes); a
+        // single-shot frame declares it, so it is refused before any decoding.
+        let streamed = zstd::encode_all(std::io::Cursor::new(&data), 3).unwrap();
+        let bulk = zstd::bulk::compress(&data, 3).unwrap();
+        assert!(matches!(zstd::zstd_safe::get_frame_content_size(&streamed), Ok(None)));
+        assert!(matches!(zstd::zstd_safe::get_frame_content_size(&bulk), Ok(Some(n)) if n == data.len() as u64));
+        for c in [&streamed, &bulk] {
+            assert_eq!(decode_zstd_capped(c, data.len(), "t").unwrap(), zstd::decode_all(std::io::Cursor::new(c)).unwrap());
+            let e = decode_zstd_capped(c, data.len() - 1, "sample IDs").unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+            assert!(e.to_string().contains("sample IDs") && e.to_string().contains("limit"), "{e}");
+        }
+        // Not a zstd frame at all (the raw contig section is read but never decoded).
+        assert!(decode_zstd_capped(b"##contig=<ID=22>", 1 << 20, "x").is_err());
+        // A truncated frame fails as decode_all did.
+        assert!(decode_zstd_capped(&streamed[..streamed.len() / 2], 1 << 20, "x").is_err());
+    }
+
+    #[test]
+    fn section_length_past_the_file_end_is_refused_before_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short.srp");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(crate::srp::SRP_SINGLE_CHR_MAGIC).unwrap();
+        f.write_all(&[0xff, 0xff, 0xff, 0xff]).unwrap();
+        drop(f);
+        let mut f = std::fs::File::open(&path).unwrap();
+        let mut magic = [0u8; 8];
+        std::io::Read::read_exact(&mut f, &mut magic).unwrap();
+        let e = read_section(&mut f, &path, "header").unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        let msg = e.to_string();
+        assert!(msg.contains("short.srp") && msg.contains("header section") && msg.contains("4294967295"), "{msg}");
     }
 }
