@@ -137,7 +137,7 @@ fn cohort_from_bref3(input_path: &str) -> Cohort {
 /// Read an (un)phased cohort from a VCF.gz via `read_cohort_vcf`, packing the
 /// per-sample diploid genotypes into the flat n_var × n_haps array.
 fn cohort_from_vcf(input_path: &str) -> Cohort {
-    let (sample_names, markers, genotypes, was_phased) = read_cohort_vcf(input_path);
+    let (sample_names, markers, genotypes, was_phased) = read_cohort_vcf(input_path).unwrap_or_else(|e| crate::exit_on_io(&e, || selphi_error!("{}", e)));
     let n_var = markers.len();
     let n_samples = sample_names.len();
     let n_haps = n_samples * 2;
@@ -439,7 +439,7 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
     let mut outputs = vec![selphi::common::utils::out_path(&out, "vcf.gz")];
     if args.srp { outputs.push(append_ext(&base, "srp")); }
     if args.bref3 { outputs.push(append_ext(&base, "bref3")); }
-    selphi::common::utils::refuse_overwrite(&[input_path], &outputs);
+    selphi::common::utils::refuse_overwrite(&[input_path], &outputs).unwrap_or_else(|f| crate::exit_with(&f));
 
     let log_path = selphi::common::utils::out_path(Path::new(output_path), "log");
     selphi::log::init(&log_path, args.debug);

@@ -62,16 +62,17 @@ pub fn same_file(input: &std::path::Path, output: &std::path::Path) -> bool {
     }
 }
 
-/// Stop the run (exit 2) when a file it is about to write is one of its inputs:
+/// Refuse the run (exit status 2) when a file it is about to write is one of its inputs:
 /// the output would replace the input, or truncate it while it is still being
 /// read (the imputation reads the target a second time while writing).
-pub fn refuse_overwrite(inputs: &[&str], outputs: &[std::path::PathBuf]) {
+pub fn refuse_overwrite(inputs: &[&str], outputs: &[std::path::PathBuf]) -> Result<(), crate::Fatal> {
     for i in inputs {
         if let Some(o) = outputs.iter().find(|o| same_file(std::path::Path::new(i), o)) {
-            eprintln!("ERROR: the output {} is the input {}; choose another --out", o.display(), i);
-            std::process::exit(2);
+            return Err(crate::Fatal::stderr(2,
+                format!("ERROR: the output {} is the input {}; choose another --out", o.display(), i)));
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]

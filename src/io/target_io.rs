@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use crate::srp::SrpReader;
-use crate::{selphi_error, selphi_info};
+use crate::selphi_info;
 
 // ---------------------------------------------------------------------------
 // TargetMarker
@@ -189,20 +189,20 @@ const LINE_PIECE: usize = 8 << 20;
 const READ_CAP: usize = 32 << 10;
 
 impl VcfLines {
-    pub(crate) fn open(path: &str) -> Self { Self::open_with(path, LINE_PIECE) }
+    pub(crate) fn open(path: &str) -> std::io::Result<Self> { Self::open_with(path, LINE_PIECE) }
 
-    fn open_with(path: &str, piece: usize) -> Self {
+    fn open_with(path: &str, piece: usize) -> std::io::Result<Self> {
         let file = std::fs::File::open(path)
-            .unwrap_or_else(|e| { selphi_error!("Cannot open {}: {}", path, e); std::process::exit(1) });
+            .map_err(|e| crate::Fatal::error(1, format!("Cannot open {}: {}", path, e)))?;
         let reader: Box<dyn std::io::Read> = if path.ends_with(".gz") || path.ends_with(".bgz") {
             Box::new(noodles_bgzf::io::Reader::new(std::io::BufReader::new(file)))
         } else { Box::new(std::io::BufReader::new(file)) };
-        VcfLines { reader, buf: Vec::with_capacity(piece), start: 0, eof: false, done: false, piece }
+        Ok(VcfLines { reader, buf: Vec::with_capacity(piece), start: 0, eof: false, done: false, piece })
     }
 
     /// Whether the stream is a BGZF-wrapped binary BCF (magic `BCF\2\2`), read through this
     /// reader so a FIFO or stdin loses nothing to the probe.
-    pub(crate) fn is_bcf(&mut self) -> bool {
+    pub(crate) fn is_bcf(&mut self) -> std::io::Result<bool> {
         use std::io::Read;
         while !self.eof && self.buf.len() - self.start < 5 {
             let have = self.buf.len();
@@ -211,31 +211,31 @@ impl VcfLines {
                 match self.reader.read(&mut self.buf[have..]) {
                     Ok(n) => break n,
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(e) => { selphi_error!("Reading the VCF failed: {}", e); std::process::exit(1) }
+                    Err(e) => { return Err(crate::Fatal::error(1, format!("Reading the VCF failed: {}", e)).into());}
                 }
             };
             self.buf.truncate(have + n);
             if n == 0 { self.eof = true; }
         }
-        self.buf[self.start..].starts_with(b"BCF\x02\x02")
+        Ok(self.buf[self.start..].starts_with(b"BCF\x02\x02"))
     }
 
     /// The next line, or `None` after the last (the piece after the final `\n`, empty when the
     /// file ends with one, is the last line, as `split` gives it).
-    pub(crate) fn next_line(&mut self) -> Option<&[u8]> {
+    pub(crate) fn next_line(&mut self) -> std::io::Result<Option<&[u8]>> {
         use std::io::Read;
         loop {
             if let Some(i) = self.buf[self.start..].iter().position(|&b| b == b'\n') {
                 let (s, e) = (self.start, self.start + i);
                 self.start = e + 1;
                 let line = &self.buf[s..e];
-                return Some(line.strip_suffix(b"\r").unwrap_or(line));
+                return Ok(Some(line.strip_suffix(b"\r").unwrap_or(line)));
             }
             if self.eof {
-                if self.done { return None; }
+                if self.done { return Ok(None); }
                 self.done = true;
                 let line = &self.buf[self.start..];
-                return Some(line.strip_suffix(b"\r").unwrap_or(line));
+                return Ok(Some(line.strip_suffix(b"\r").unwrap_or(line)));
             }
             self.buf.drain(..self.start);
             self.start = 0;
@@ -250,7 +250,7 @@ impl VcfLines {
                     Ok(0) => { self.eof = true; break; }
                     Ok(n) => got += n,
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(e) => { selphi_error!("Reading the VCF failed: {}", e); std::process::exit(1) }
+                    Err(e) => { return Err(crate::Fatal::error(1, format!("Reading the VCF failed: {}", e)).into());}
                 }
             }
             self.buf.truncate(have + got);
@@ -570,7 +570,7 @@ fn n_target_markers<'a>(mut alts: impl ExactSizeIterator<Item = &'a str>) -> usi
 /// the returned markers are left empty (not needed for panel output).
 pub fn read_cohort_vcf(
     path: &str,
-) -> (Vec<String>, Vec<TargetMarker>, Vec<Vec<[u8; 2]>>, bool) {
+) -> std::io::Result<(Vec<String>, Vec<TargetMarker>, Vec<Vec<[u8; 2]>>, bool)> {
     // The GT_MISSING sentinel is passed THROUGH to the panel phaser. Folding it
     // to 0 makes every no-call in a cohort being phased as a reference panel
     // enter the engine as hom-REF and leave it as a confidently
@@ -582,8 +582,8 @@ pub fn read_cohort_vcf(
     if path.ends_with(".bcf") {
         return read_target_bcf(path, false, true);
     }
-    let mut lines = VcfLines::open(path);
-    if lines.is_bcf() {
+    let mut lines = VcfLines::open(path)?;
+    if lines.is_bcf()? {
         return read_target_bcf(path, false, true);
     }
 
@@ -594,7 +594,7 @@ pub fn read_cohort_vcf(
     let mut sample_names: Vec<String> = Vec::new();
     let mut n_multiallelic = 0usize;
 
-    while let Some(line) = lines.next_line() {
+    while let Some(line) = lines.next_line()? {
         if line.is_empty() || line.starts_with(b"##") { continue; }
         if line.starts_with(b"#CHROM") {
             let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
@@ -626,13 +626,12 @@ pub fn read_cohort_vcf(
     }
 
     if sample_names.is_empty() {
-        selphi_error!("No samples found in {}", path);
-        std::process::exit(1);
+        return Err(crate::Fatal::error(1, format!("No samples found in {}", path)).into());
     }
     if n_multiallelic > 0 {
         selphi_info!("  WARNING: {} multi-allelic sites — kept first ALT, genotypes binarised (ref vs any-alt). Split multiallelics beforehand for exact handling.", n_multiallelic);
     }
-    (sample_names, markers, genotypes, !unphased_het)
+    Ok((sample_names, markers, genotypes, !unphased_het))
 }
 
 /// Stream a phased biallelic **VCF/VCF.gz** cohort straight into a row-major
@@ -649,10 +648,10 @@ pub fn read_cohort_vcf(
 /// `(sample_names, markers, phased, n_haps, is_phased)`.
 pub fn read_cohort_phased_vcf_stream(
     path: &str,
-) -> (Vec<String>, Vec<TargetMarker>, Vec<u8>, usize, bool) {
+) -> std::io::Result<(Vec<String>, Vec<TargetMarker>, Vec<u8>, usize, bool)> {
     use std::io::{BufRead, BufReader};
     let file = std::fs::File::open(path)
-        .unwrap_or_else(|e| { selphi_error!("Cannot open {}: {}", path, e); std::process::exit(1) });
+        .map_err(|e| crate::Fatal::error(1, format!("Cannot open {}: {}", path, e)))?;
     let mut reader: Box<dyn BufRead> = if path.ends_with(".gz") {
         Box::new(BufReader::with_capacity(1 << 20,
             noodles_bgzf::io::Reader::new(BufReader::new(file))))
@@ -672,7 +671,7 @@ pub fn read_cohort_phased_vcf_stream(
     loop {
         line.clear();
         let n = reader.read_until(b'\n', &mut line)
-            .unwrap_or_else(|e| { selphi_error!("Read error on {}: {}", path, e); std::process::exit(1) });
+            .map_err(|e| crate::Fatal::error(1, format!("Read error on {}: {}", path, e)))?;
         if n == 0 { break; }
         if line.last() == Some(&b'\n') { line.pop(); }
         if line.last() == Some(&b'\r') { line.pop(); }
@@ -706,13 +705,12 @@ pub fn read_cohort_phased_vcf_stream(
     }
 
     if sample_names.is_empty() {
-        selphi_error!("No samples found in {}", path);
-        std::process::exit(1);
+        return Err(crate::Fatal::error(1, format!("No samples found in {}", path)).into());
     }
     if n_multiallelic > 0 {
         selphi_info!("  WARNING: {} multi-allelic sites — kept first ALT, genotypes binarised (ref vs any-alt). Split multiallelics beforehand for exact handling.", n_multiallelic);
     }
-    (sample_names, markers, phased, n_haps, !unphased_het)
+    Ok((sample_names, markers, phased, n_haps, !unphased_het))
 }
 
 // ---------------------------------------------------------------------------
@@ -727,19 +725,18 @@ pub fn read_cohort_phased_vcf_stream(
 /// pattern as the lcWGS PL reader. `hash_alleles` mirrors [`read_target_vcf`].
 fn read_target_bcf(
     path: &str, hash_alleles: bool, capture_id: bool,
-) -> (Vec<String>, Vec<TargetMarker>, Vec<Vec<[u8; 2]>>, bool) {
+) -> std::io::Result<(Vec<String>, Vec<TargetMarker>, Vec<Vec<[u8; 2]>>, bool)> {
     use noodles_bcf as bcf;
     use noodles_vcf::variant::record_buf::samples::sample::Value;
     use noodles_vcf::variant::record::samples::series::value::genotype::Phasing;
 
     let mut reader = bcf::io::reader::Builder::default().build_from_path(path)
-        .unwrap_or_else(|e| { selphi_error!("Cannot open BCF {}: {}", path, e); std::process::exit(1) });
+        .map_err(|e| crate::Fatal::error(1, format!("Cannot open BCF {}: {}", path, e)))?;
     let header = reader.read_header()
-        .unwrap_or_else(|e| { selphi_error!("Cannot read BCF header {}: {}", path, e); std::process::exit(1) });
+        .map_err(|e| crate::Fatal::error(1, format!("Cannot read BCF header {}: {}", path, e)))?;
     let sample_names: Vec<String> = header.sample_names().iter().cloned().collect();
     if sample_names.is_empty() {
-        selphi_error!("No samples found in {}", path);
-        std::process::exit(1);
+        return Err(crate::Fatal::error(1, format!("No samples found in {}", path)).into());
     }
 
     let mut markers = Vec::new();
@@ -817,7 +814,7 @@ fn read_target_bcf(
             selphi_info!("  {} multi-allelic target record(s) split into one biallelic marker per ALT (bcftools norm -m- convention)", n_multiallelic);
         }
     }
-    (sample_names, markers, genotypes, !unphased_het)
+    Ok((sample_names, markers, genotypes, !unphased_het))
 }
 
 /// Read target VCF/BCF using noodles bgzf + manual text parsing (real binary
@@ -825,7 +822,7 @@ fn read_target_bcf(
 /// Pure Rust — no bcftools dependency.
 pub fn read_target_vcf(
     path: &str, srp: &SrpReader,
-) -> (Vec<String>, Vec<TargetMarker>, Vec<Vec<[u8; 2]>>, bool) {
+) -> std::io::Result<(Vec<String>, Vec<TargetMarker>, Vec<Vec<[u8; 2]>>, bool)> {
     let hash_alleles = !srp.ids.is_empty() && {
         let first_ref = &srp.variants[0].ref_allele;
         !srp.ids[0].contains(first_ref)
@@ -838,8 +835,8 @@ pub fn read_target_vcf(
     }
 
     // Content-sniff: a BGZF-wrapped binary BCF (magic "BCF\2\2") misnamed .vcf.gz.
-    let mut lines = VcfLines::open(path);
-    if lines.is_bcf() {
+    let mut lines = VcfLines::open(path)?;
+    if lines.is_bcf()? {
         return read_target_bcf(path, hash_alleles, false);
     }
 
@@ -852,7 +849,7 @@ pub fn read_target_vcf(
     let (filter_missing, mut n_filtered) = (input_filter_missing(), 0usize);
 
     // Parse from byte buffer — zero per-line allocations
-    while let Some(line) = lines.next_line() {
+    while let Some(line) = lines.next_line()? {
         if line.is_empty() || line.starts_with(b"##") { continue; }
         if line.starts_with(b"#CHROM") {
             let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
@@ -879,15 +876,14 @@ pub fn read_target_vcf(
     }
 
     if sample_names.is_empty() {
-        selphi_error!("No samples found in {}", path);
-        std::process::exit(1);
+        return Err(crate::Fatal::error(1, format!("No samples found in {}", path)).into());
     }
     if n_multiallelic > 0 {
         selphi_info!("  {} multi-allelic target record(s) split into one biallelic marker per ALT (bcftools norm -m- convention)", n_multiallelic);
     }
     log_filtered(n_filtered);
 
-    (sample_names, markers, genotypes, !unphased_het)
+    Ok((sample_names, markers, genotypes, !unphased_het))
 }
 
 // ---------------------------------------------------------------------------
@@ -1279,21 +1275,21 @@ fn vcf_format_bytes(line: &[u8]) -> Option<&[u8]> {
 /// Returns one f64 per marker (file order, parallel to `read_target_vcf`'s
 /// `markers`). The hard-call path (`read_target_vcf` / `parse_gt_raw`) is
 /// NOT touched — this is an additive, opt-in pass.
-pub fn extract_target_site_confidence(path: &str) -> Vec<f64> {
+pub fn extract_target_site_confidence(path: &str) -> std::io::Result<Vec<f64>> {
     let (gq_lo, gq_hi) = refine_gq_endpoints();
 
     // Real (binary) BCF → noodles decoder; mirror read_target_vcf's dispatch.
     if path.ends_with(".bcf") {
-        return extract_site_confidence_bcf(path, gq_lo, gq_hi);
+        return Ok(extract_site_confidence_bcf(path, gq_lo, gq_hi));
     }
-    let mut lines = VcfLines::open(path);
-    if lines.is_bcf() {
-        return extract_site_confidence_bcf(path, gq_lo, gq_hi);
+    let mut lines = VcfLines::open(path)?;
+    if lines.is_bcf()? {
+        return Ok(extract_site_confidence_bcf(path, gq_lo, gq_hi));
     }
 
     let mut conf: Vec<f64> = Vec::new();
     let mut n_samples = 0usize;
-    while let Some(line) = lines.next_line() {
+    while let Some(line) = lines.next_line()? {
         if line.is_empty() || line.starts_with(b"##") { continue; }
         if line.starts_with(b"#CHROM") {
             let n_tabs = line.iter().filter(|&&b| b == b'\t').count();
@@ -1311,7 +1307,7 @@ pub fn extract_target_site_confidence(path: &str) -> Vec<f64> {
         let k = n_target_markers(f.alts.split(',').collect::<Vec<_>>().into_iter());
         conf.extend(std::iter::repeat_n(c, k));
     }
-    conf
+    Ok(conf)
 }
 
 /// BCF path for [`extract_target_site_confidence`]. Walks records in the same
@@ -1420,20 +1416,20 @@ fn extract_site_confidence_bcf(path: &str, gq_lo: f64, gq_hi: f64) -> Vec<f64> {
 /// but keeps every sample's value instead of collapsing to the min. The caller
 /// re-indexes into chip-site order via [`align_confidence_to_chip_per_sample`].
 /// The hard-call path is untouched (additive, opt-in under `--refine`).
-pub fn extract_target_site_confidence_per_sample(path: &str) -> (Vec<f64>, usize) {
+pub fn extract_target_site_confidence_per_sample(path: &str) -> std::io::Result<(Vec<f64>, usize)> {
     let (gq_lo, gq_hi) = refine_gq_endpoints();
 
     if path.ends_with(".bcf") {
-        return extract_site_confidence_per_sample_bcf(path, gq_lo, gq_hi);
+        return Ok(extract_site_confidence_per_sample_bcf(path, gq_lo, gq_hi));
     }
-    let mut lines = VcfLines::open(path);
-    if lines.is_bcf() {
-        return extract_site_confidence_per_sample_bcf(path, gq_lo, gq_hi);
+    let mut lines = VcfLines::open(path)?;
+    if lines.is_bcf()? {
+        return Ok(extract_site_confidence_per_sample_bcf(path, gq_lo, gq_hi));
     }
 
     let mut conf: Vec<f64> = Vec::new();
     let mut n_samples = 0usize;
-    while let Some(line) = lines.next_line() {
+    while let Some(line) = lines.next_line()? {
         if line.is_empty() || line.starts_with(b"##") { continue; }
         if line.starts_with(b"#CHROM") {
             let n_tabs = line.iter().filter(|&&b| b == b'\t').count();
@@ -1452,7 +1448,7 @@ pub fn extract_target_site_confidence_per_sample(path: &str) -> (Vec<f64>, usize
         if k == 0 { conf.truncate(row); } // a reference block makes no marker
         for _ in 1..k { conf.extend_from_within(row..row + n_samples); }
     }
-    (conf, n_samples)
+    Ok((conf, n_samples))
 }
 
 /// BCF path for [`extract_target_site_confidence_per_sample`]. Same record
@@ -1647,11 +1643,11 @@ pub fn log_uncalled_samples(names: &[String], called: &[bool]) {
 }
 
 /// Stop a run whose target records carry no called genotype at all: a file without GT
-/// (GP, DS or GL only) would otherwise be imputed from the panel alone.
-pub fn refuse_uncalled(n_records: usize) -> ! {
-    crate::selphi_error!("None of the {} target records matching the panel carries a called genotype \
-        (a file without GT, e.g. GP/DS/GL only, has nothing to read: write GT; a file with PL runs with --engine lcwgs)", n_records);
-    std::process::exit(1);
+/// (GP, DS or GL only) would otherwise be imputed from the panel alone. Reports the
+/// refusal and returns it for the caller to return.
+pub fn refuse_uncalled(n_records: usize) -> crate::Fatal {
+    crate::Fatal::error(1, format!("None of the {} target records matching the panel carries a called genotype \
+        (a file without GT, e.g. GP/DS/GL only, has nothing to read: write GT; a file with PL runs with --engine lcwgs)", n_records))
 }
 
 pub fn drop_uncalled_sites(
@@ -1827,7 +1823,7 @@ pub fn intersect_variants(
 /// Returns (sample_names, per_chr_data, is_phased).
 pub fn read_target_vcf_multi_chr(
     path: &str,
-) -> (Vec<String>, std::collections::BTreeMap<String, (Vec<TargetMarker>, Vec<Vec<[u8; 2]>>)>, bool) {
+) -> std::io::Result<(Vec<String>, std::collections::BTreeMap<String, (Vec<TargetMarker>, Vec<Vec<[u8; 2]>>)>, bool)> {
     type ByChr = std::collections::BTreeMap<String, (Vec<TargetMarker>, Vec<Vec<[u8; 2]>>)>;
     // Real binary BCF → noodles decoder, then partition by chromosome.
     let partition = |samples: Vec<String>, markers: Vec<TargetMarker>, gts: Vec<Vec<[u8; 2]>>, phased: bool| {
@@ -1844,13 +1840,13 @@ pub fn read_target_vcf_multi_chr(
         (samples, by_chr, phased)
     };
     if path.ends_with(".bcf") {
-        let (s, m, g, p) = read_target_bcf(path, false, false);
-        return partition(s, m, g, p);
+        let (s, m, g, p) = read_target_bcf(path, false, false)?;
+        return Ok(partition(s, m, g, p));
     }
-    let mut lines = VcfLines::open(path);
-    if lines.is_bcf() {
-        let (s, m, g, p) = read_target_bcf(path, false, false);
-        return partition(s, m, g, p);
+    let mut lines = VcfLines::open(path)?;
+    if lines.is_bcf()? {
+        let (s, m, g, p) = read_target_bcf(path, false, false)?;
+        return Ok(partition(s, m, g, p));
     }
 
     let mut all_markers: Vec<TargetMarker> = Vec::new();
@@ -1861,7 +1857,7 @@ pub fn read_target_vcf_multi_chr(
     let mut n_multiallelic = 0usize;
     let (filter_missing, mut n_filtered) = (input_filter_missing(), 0usize);
 
-    while let Some(line) = lines.next_line() {
+    while let Some(line) = lines.next_line()? {
         if line.is_empty() || line.starts_with(b"##") { continue; }
         if line.starts_with(b"#CHROM") {
             let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
@@ -1902,7 +1898,7 @@ pub fn read_target_vcf_multi_chr(
         selphi_info!("  {} multi-allelic target record(s) split into one biallelic marker per ALT (bcftools norm -m- convention)", n_multiallelic);
     }
 
-    (sample_names, by_chr, !unphased_het)
+    Ok((sample_names, by_chr, !unphased_het))
 }
 
 fn strip_chr_prefix(s: &str) -> &str {
@@ -2144,10 +2140,10 @@ mod allele_match_tests {
             std::fs::write(&noeof, &bytes[..bytes.len() - 28]).unwrap();
             for path in [&plain, &gz, &noeof] {
                 for piece in [1usize, 3, 7, 64, 1 << 20] {
-                    let mut l = VcfLines::open_with(path.to_str().unwrap(), piece);
-                    assert!(!l.is_bcf(), "the probe reads through the stream and keeps what it read");
+                    let mut l = VcfLines::open_with(path.to_str().unwrap(), piece).unwrap();
+                    assert!(!l.is_bcf().unwrap(), "the probe reads through the stream and keeps what it read");
                     let mut got = Vec::new();
-                    while let Some(x) = l.next_line() { got.push(x.to_vec()); }
+                    while let Some(x) = l.next_line().unwrap() { got.push(x.to_vec()); }
                     assert_eq!(got, want, "piece {piece} {}", path.display());
                 }
             }

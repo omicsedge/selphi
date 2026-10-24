@@ -83,8 +83,7 @@ pub fn run_lcwgs(
 ) -> std::io::Result<LcwgsOutput> {
     memtrace("entry (after SRP load)");
     if let Some(msg) = crate::contig::nonrecomb_refusal(srp.chromosome()) {
-        crate::selphi_error!("{}", msg);
-        std::process::exit(2);
+        return Err(crate::Fatal::error(2, msg).into());
     }
     // --- 1. Parse target VCF with PL ---
     let hash_alleles = !srp.ids.is_empty() && {
@@ -573,8 +572,7 @@ pub fn run_lcwgs_bam(
     _n_threads: usize,
 ) -> std::io::Result<LcwgsOutput> {
     if let Some(msg) = crate::contig::nonrecomb_refusal(srp.chromosome()) {
-        crate::selphi_error!("{}", msg);
-        std::process::exit(2);
+        return Err(crate::Fatal::error(2, msg).into());
     }
     // No file holds reads on this chromosome: nothing to pile up (and no reference window to load).
     let chrom_bare = srp.chromosome().strip_prefix("chr").unwrap_or(srp.chromosome());

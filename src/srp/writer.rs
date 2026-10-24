@@ -39,6 +39,13 @@ impl From<std::io::Error> for SrpWriterError {
     fn from(e: std::io::Error) -> Self { Self::Io(e) }
 }
 
+impl SrpWriterError {
+    /// The [`crate::Fatal`] this error carries (a reader that reported and refused).
+    pub fn fatal(&self) -> Option<&crate::Fatal> {
+        match self { Self::Io(e) => crate::Fatal::of(e), _ => None }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Panel variant view
 // ---------------------------------------------------------------------------
@@ -406,7 +413,7 @@ pub fn build_srp_any(
         return build_srp_unified(source, output_path, threads, chunk_size_override);
     }
     let (sample_names, markers, phased, n_haps, is_phased) =
-        crate::io::target_io::read_cohort_phased_vcf_stream(s.as_ref());
+        crate::io::target_io::read_cohort_phased_vcf_stream(s.as_ref())?;
     if markers.is_empty() {
         return Err(SrpWriterError::NoVariants);
     }

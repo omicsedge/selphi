@@ -771,7 +771,7 @@ fn build_passthrough(
 fn load_and_intersect(args: &Args, target_path: &str, srp: &SrpReader) -> LoadedTarget {
     // 2. Read target VCF: sample names, variants, genotypes
     let (sample_names, mut target_markers, mut target_genotypes, file_phased) =
-        read_target_vcf(target_path, srp);
+        read_target_vcf(target_path, srp).unwrap_or_else(|e| crate::exit_on_io(&e, || selphi_error!("{}", e)));
     selphi_step!("Target: {} samples, {} variants, phased={}",
         sample_names.len(), target_markers.len(), file_phased);
 
@@ -798,7 +798,7 @@ fn load_and_intersect(args: &Args, target_path: &str, srp: &SrpReader) -> Loaded
     // Panel sites a variant-only input leaves out, read as reference where its caller looked.
     if !args.phase_only
         && let Some(plan) = selphi::io::variant_only::FillPlan::new(args.callable.as_deref(),
-            target_markers.iter().zip(target_genotypes.iter()), n_samples, target_path, Some(srp.chromosome())) {
+            target_markers.iter().zip(target_genotypes.iter()), n_samples, target_path, Some(srp.chromosome())).unwrap_or_else(|e| crate::exit_on_io(&e, || selphi_error!("{}", e))) {
         all_sites = plan.reads_all_sites(srp.chromosome());
         let sites = plan.sites(srp, &target_markers, wgs_idx.len());
         if !sites.is_empty() {
@@ -812,7 +812,7 @@ fn load_and_intersect(args: &Args, target_path: &str, srp: &SrpReader) -> Loaded
     // After the fill, which supplies reference calls of its own: no called genotype at any
     // panel-matched record leaves nothing to impute from.
     if !target_idx.is_empty() && !selphi::io::target_io::any_called(&target_genotypes, &target_idx) {
-        selphi::io::target_io::refuse_uncalled(matched_idx.len());
+        crate::exit_with(&selphi::io::target_io::refuse_uncalled(matched_idx.len()));
     }
     if n_samples > 1 {
         let mut called = vec![false; n_samples];
@@ -869,9 +869,9 @@ fn build_target_confidence(
     // refine cohorts (chip-density n_chip, modest n_samples); for very large
     // multi-sample refine runs this is n_chip*n_samples*8 bytes.
     let (refine_site_conf, refine_site_conf_per_sample): (Option<Vec<f64>>, Option<Vec<f64>>) = if args.refine {
-        let marker_conf = extract_target_site_confidence(target_path);
+        let marker_conf = extract_target_site_confidence(target_path).unwrap_or_else(|e| crate::exit_on_io(&e, || selphi_error!("{}", e)));
         let mut aligned = align_confidence_to_chip(&marker_conf, target_idx, n_chip);
-        let (marker_conf_ps, ps_n) = extract_target_site_confidence_per_sample(target_path);
+        let (marker_conf_ps, ps_n) = extract_target_site_confidence_per_sample(target_path).unwrap_or_else(|e| crate::exit_on_io(&e, || selphi_error!("{}", e)));
         let mut aligned_ps = align_confidence_to_chip_per_sample(&marker_conf_ps, ps_n, target_idx, n_chip);
         // R3 TEST-ONLY hook: synthesize confidence = 0.0 for the first ⌊f·n_chip⌋
         // chip sites so the low-confidence → imputed re-route fires on a chip

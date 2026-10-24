@@ -253,7 +253,7 @@ fn main() {
         let tsv_path = PathBuf::from(format!("{out_stem}.dose.tsv.gz"));
         let mut inputs: Vec<&str> = bam_paths.iter().map(String::as_str).collect();
         inputs.push(input);
-        selphi::common::utils::refuse_overwrite(&inputs, &[vcf_path.clone(), tsv_path.clone()]);
+        selphi::common::utils::refuse_overwrite(&inputs, &[vcf_path.clone(), tsv_path.clone()]).unwrap_or_else(|f| exit_with(&f));
 
         let log_path = selphi::common::utils::out_path(std::path::Path::new(output), "log");
         selphi::log::init(&log_path, args.debug);
@@ -326,7 +326,7 @@ fn main() {
                 None => selphi::lcwgs::multi::Panels::Multi(refpanel.to_string()),
             };
             selphi::lcwgs::multi::run(panels, inp, maps, &params, args.threads, &vcf_path, &tsv_path)
-                .unwrap_or_else(|e| { eprintln!("lcWGS pipeline failed: {}", e); std::process::exit(1); });
+                .unwrap_or_else(|e| exit_on_io(&e, || eprintln!("lcWGS pipeline failed: {}", e)));
             selphi_step!("wrote imputed VCF: {}", vcf_path.display());
             selphi_step!("wrote dosage TSV: {}", tsv_path.display());
             selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB", start.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
@@ -389,8 +389,8 @@ fn main() {
             let result = selphi::sparse_ls::pipeline::run_pipeline(
                 input, &srp, map, &g2params, args.seed as u64,
             ).unwrap_or_else(|e| {
-                eprintln!("ls-exact pipeline failed: {}", e);
-                std::process::exit(1);
+                if let Some(f) = selphi::Fatal::of(&e) { exit_with(f) }
+                eprintln!("ls-exact pipeline failed: {}", e); std::process::exit(1);
             });
             selphi_info!(
                 "  ls-exact done: {} variants × {} samples in {:.1}s",
@@ -409,7 +409,7 @@ fn main() {
             selphi::lcwgs::pipeline::run_lcwgs_bam(&bam_paths, &srp, map, &params, reg, args.reference.as_deref(), args.threads)
         } else {
             selphi::lcwgs::pipeline::run_lcwgs(input, &srp, map, &params, args.threads)
-        }.unwrap_or_else(|e| { eprintln!("lcWGS pipeline failed: {}", e); std::process::exit(1); });
+        }.unwrap_or_else(|e| exit_on_io(&e, || eprintln!("lcWGS pipeline failed: {}", e)));
 
         let n_out = result.sample_ids.len();
         selphi_step!("lcwgs done: {} variants × {} sample{}",
@@ -562,8 +562,8 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
         );
         let _ = std::fs::remove_file(&temp_srp);
         result.unwrap_or_else(|e| {
-            selphi_error!("Multi-chr error: {}", e);
-            std::process::exit(1);
+            if let Some(f) = selphi::Fatal::of(&e) { exit_with(f) }
+            selphi_error!("Multi-chr error: {}", e); std::process::exit(1);
         });
         return;
     }
@@ -653,7 +653,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
 
             selphi::srp::multi_chr_writer::build_multi_chr_srp_from_dir(
                 Path::new(source), Path::new(output), args.threads, args.chunk_size)
-                .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
+                .unwrap_or_else(|e| exit_on_io(&e, || selphi_error!("{}", e)));
 
             let total = start_time.elapsed().as_secs_f64();
             let mem = selphi::log::peak_mem_mb();
@@ -680,7 +680,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
         selphi::common::utils::refuse_overwrite(&[source], &[
             if want_decode { PathBuf::from(output) }
             else if output_bref3 { selphi::srp::helpers::with_panel_suffix(Path::new(output), "bref3") }
-            else { selphi::srp::helpers::with_panel_suffix(Path::new(output), "srp") }]);
+            else { selphi::srp::helpers::with_panel_suffix(Path::new(output), "srp") }]).unwrap_or_else(|f| exit_with(&f));
         if want_decode {
             let log_path = selphi::common::utils::out_path(std::path::Path::new(output), "log");
             selphi::log::init(&log_path, args.debug);
@@ -735,7 +735,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
                 let tmp_srp = std::env::temp_dir()
                     .join(format!("selphi_bref3_interim_{}.srp", std::process::id()));
                 selphi::srp::writer::build_srp_any(Path::new(source), &tmp_srp, args.threads, args.chunk_size)
-                    .unwrap_or_else(|e| { selphi_error!("BREF3 write failed (SRP stage): {}", e); std::process::exit(1); });
+                    .unwrap_or_else(|e| { if let Some(f) = e.fatal() { exit_with(f) } selphi_error!("BREF3 write failed (SRP stage): {}", e); std::process::exit(1); });
                 selphi::srp::bref3_writer::write_bref3_from_srp(&tmp_srp, Path::new(output))
                     .unwrap_or_else(|e| { selphi_error!("BREF3 write failed: {}", e); std::process::exit(1); });
                 let _ = std::fs::remove_file(&tmp_srp);
@@ -756,7 +756,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
 
             selphi_step!("Reading VCF panel (streaming)...");
             let (sample_names, markers, phased, n_haps, is_phased) =
-                selphi::io::target_io::read_cohort_phased_vcf_stream(source);
+                selphi::io::target_io::read_cohort_phased_vcf_stream(source).unwrap_or_else(|e| exit_on_io(&e, || selphi_error!("{}", e)));
             if markers.is_empty() {
                 selphi_error!("no biallelic variants read from {}", source);
                 std::process::exit(1);
@@ -825,7 +825,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
     let target_path = args.input.as_deref().expect("--input is required");
     let output_path = args.out.as_deref().expect("--out is required");
     selphi::common::utils::refuse_overwrite(&[target_path], &[
-        selphi::common::utils::out_path(Path::new(output_path), if args.bcf { "bcf" } else { "vcf.gz" })]);
+        selphi::common::utils::out_path(Path::new(output_path), if args.bcf { "bcf" } else { "vcf.gz" })]).unwrap_or_else(|f| exit_with(&f));
 
     // Auto-detect multi-chr SRP and delegate to native orchestrator
     if let Ok(3) = selphi::srp::multi_chr_reader::detect_srp_version(&args.refpanel) {
@@ -861,7 +861,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
         let config = orchestrate::MultiChrImputeConfig::from_args(&args, args.map_dir.clone());
         orchestrate::run_multi_chr(
             Path::new(&args.refpanel), target_path, Path::new(map_path), output_path, &config,
-        ).unwrap_or_else(|e| { selphi_error!("Multi-chr error: {}", e); std::process::exit(1); });
+        ).unwrap_or_else(|e| exit_on_io(&e, || selphi_error!("Multi-chr error: {}", e)));
         return;
     }
 
@@ -869,3 +869,16 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
     imputation_pipeline::run(&args, target_path, output_path);
 }
 
+/// A library call ended the run with a [`selphi::Fatal`]: its message was reported
+/// where it was raised, so only the exit status is left.
+fn exit_with(f: &selphi::Fatal) -> ! {
+    std::process::exit(f.code())
+}
+
+/// An `io::Error` out of a library call: the [`selphi::Fatal`] it carries ends the
+/// run as already reported; any other error is printed by `report`, then exit 1.
+fn exit_on_io(e: &std::io::Error, report: impl FnOnce()) -> ! {
+    if let Some(f) = selphi::Fatal::of(e) { exit_with(f) }
+    report();
+    std::process::exit(1)
+}

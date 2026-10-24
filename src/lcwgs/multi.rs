@@ -131,6 +131,8 @@ pub fn run(
                 skipped.push(format!("{chr} (no data)"));
                 continue;
             }
+            // Already reported: passed on as it is, for the caller's exit status.
+            Err(e) if crate::Fatal::of(&e).is_some() => return Err(e),
             Err(e) => return Err(std::io::Error::new(e.kind(), format!("chromosome {chr}: {e}"))),
         };
         if writers.is_none() {

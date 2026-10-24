@@ -545,7 +545,7 @@ pub fn run_multi_chr(
 
     // 2. Read target VCF once, partition by chromosome
     selphi_step!("Reading target VCF (all chromosomes)...");
-    let (sample_names, mut target_by_chr, is_phased) = read_target_vcf_multi_chr(input_path);
+    let (sample_names, mut target_by_chr, is_phased) = read_target_vcf_multi_chr(input_path)?;
     let n_samples = sample_names.len();
     let n_haps = n_samples * 2;
     // ROOT-CAUSE FIX (multi-chr): encode missing as 128 when phasing will run so the engine
@@ -578,7 +578,7 @@ pub fn run_multi_chr(
     // Panel sites a variant-only input leaves out are read as reference (`selphi::io::variant_only`),
     // per chromosome in `prepare_chr_target`; each chromosome gets the one 0/0 row they point at.
     let fill = selphi::io::variant_only::FillPlan::new(config.callable.as_deref(),
-        target_by_chr.values().flat_map(|(m, g)| m.iter().zip(g.iter())), n_samples, input_path, None).map(Arc::new);
+        target_by_chr.values().flat_map(|(m, g)| m.iter().zip(g.iter())), n_samples, input_path, None)?.map(Arc::new);
     if let Some(f) = &fill {
         // A panel chromosome the file writes only reference records for.
         for c in f.speaks_contigs() {
@@ -1237,7 +1237,7 @@ pub fn run_multi_chr(
     // No called genotype at any panel-matched record of any chromosome (a file without GT):
     // what was written holds no information from the input.
     if n_matched_total > 0 && !called_any {
-        selphi::io::target_io::refuse_uncalled(n_matched_total);
+        return Err(selphi::io::target_io::refuse_uncalled(n_matched_total).into());
     }
     if n_samples > 1 { selphi::io::target_io::log_uncalled_samples(&sample_names, &called_samples); }
 

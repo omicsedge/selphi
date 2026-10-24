@@ -8,15 +8,15 @@ use selphi::srp::SrpReader;
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let srp = SrpReader::open(&a[1], 0).expect("open srp");
-    let (sv, mv, gv, pv) = read_target_vcf(&a[2], &srp);
-    let (sb, mb, gb, pb) = read_target_vcf(&a[3], &srp);
+    let (sv, mv, gv, pv) = read_target_vcf(&a[2], &srp).expect("read target VCF");
+    let (sb, mb, gb, pb) = read_target_vcf(&a[3], &srp).expect("read target BCF");
 
     // Cross-reader GT-parse consistency: read_cohort_vcf + read_target_vcf_multi_chr
     // share split_vcf_fields + parse_gt_region with read_target_vcf, so on the same
     // VCF their (sample_names, genotypes-in-order, is_phased) must match exactly
     // (markers differ only in hash/id, which we don't compare here).
-    let (sc, _mc, gc, pc) = read_cohort_vcf(&a[2]);
-    let (sm, by_chr, pm) = read_target_vcf_multi_chr(&a[2]);
+    let (sc, _mc, gc, pc) = read_cohort_vcf(&a[2]).expect("read cohort");
+    let (sm, by_chr, pm) = read_target_vcf_multi_chr(&a[2]).expect("read multi-chr");
     let gm: Vec<_> = by_chr.values().flat_map(|(_, g)| g.iter().cloned()).collect();
     let cohort_ok = sc == sv && gc == gv && pc == pv;
     let multichr_ok = sm == sv && gm == gv && pm == pv;

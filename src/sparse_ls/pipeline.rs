@@ -64,8 +64,7 @@ pub fn run_pipeline(
     // Refuse chrY/chrMT (non-recombining) like the other imputation engines — this
     // path is reached before the run_lcwgs guard. Override: SELPHI_ALLOW_NONRECOMB=1.
     if let Some(msg) = crate::contig::nonrecomb_refusal(srp.chromosome()) {
-        crate::selphi_error!("{}", msg);
-        std::process::exit(2);
+        return Err(crate::Fatal::error(2, msg).into());
     }
 
     // --- 1. Parse the target VCF/BCF (PL → gl3), matching run_lcwgs's setup. ---

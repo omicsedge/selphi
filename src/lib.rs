@@ -12,6 +12,10 @@ pub mod log;
 // Central config registry + typed env accessors (single point of env-var access)
 pub mod config;
 
+// The error that ends a run (library code returns it; the binary exits with its code)
+pub mod error;
+pub use error::Fatal;
+
 // Common data structures
 pub mod common;
 pub mod contig;

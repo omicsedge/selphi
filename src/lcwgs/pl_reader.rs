@@ -505,8 +505,8 @@ fn blocks_note(b: &RefBlocks) -> String {
 pub fn covered_contigs(path: &str) -> std::io::Result<std::collections::HashSet<String>> {
     let bare = |n: &[u8]| { let s = String::from_utf8_lossy(n).into_owned(); s.strip_prefix("chr").map(str::to_string).unwrap_or(s) };
     let mut out = std::collections::HashSet::new();
-    let mut lines = crate::io::target_io::VcfLines::open(path);
-    if path.ends_with(".bcf") || lines.is_bcf() {
+    let mut lines = crate::io::target_io::VcfLines::open(path)?;
+    if path.ends_with(".bcf") || lines.is_bcf()? {
         drop(lines);
         let mut reader = noodles_bcf::io::reader::Builder::default().build_from_path(path)?;
         let header = reader.read_header()?;
@@ -523,7 +523,7 @@ pub fn covered_contigs(path: &str) -> std::io::Result<std::collections::HashSet<
         return Ok(out);
     }
     let mut last: Vec<u8> = Vec::new();
-    while let Some(line) = lines.next_line() {
+    while let Some(line) = lines.next_line()? {
         if line.is_empty() || line[0] == b'#' { continue; }
         let chrom = line.split(|&b| b == b'\t').next().unwrap_or(b"");
         if chrom != last.as_slice() { last = chrom.to_vec(); out.insert(bare(chrom)); }
