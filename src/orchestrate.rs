@@ -1167,6 +1167,7 @@ pub fn run_multi_chr(
                 interp_x: Some(&interp_x),
                 keep_rows: keep_rows.as_deref(),
                 hmm_skip: skip_w.as_deref(),
+                cand_ancestry: None,
             };
             let all_weights = selphi::imputation::ensemble::impute_with_members(
                 &inputs, &hmm_params, precomputed_candidates.as_ref(),
@@ -1182,6 +1183,7 @@ pub fn run_multi_chr(
                     interp_x: Some(&interp_x),
                     keep_rows: keep_rows.as_deref(),
                     hmm_skip: skip_w.as_deref(),
+                    cand_ancestry: None,
                 },
             ).all_weights;
 

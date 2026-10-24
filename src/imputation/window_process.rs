@@ -59,6 +59,20 @@ pub struct WindowHmmOutput {
 /// Inputs for `impute_window`: whole-chromosome buffers plus window bounds.
 /// Keeping this as a struct avoids a 9-argument function signature that was
 /// duplicated between the single-chr and multi-chr pipelines.
+/// Ancestry prior on the per-window candidate ranking (`--panel-ancestry` + `--local-ancestry`):
+/// each window reads every target haplotype's local super-population off its own PBWT coded steps
+/// (`ancestry::infer_local_ancestry`) and ranks the candidates by match count times
+/// `1 - strength + strength * p(local population = candidate's)`. It changes which candidates
+/// survive the `max_candidates` cut, and nothing when they all fit.
+#[derive(Clone, Copy)]
+pub struct CandidateAncestry<'a> {
+    /// Per panel haplotype: super-population index, or `ancestry::POP_UNKNOWN`.
+    pub panel_hap_pop: &'a [u8],
+    pub strength: f32,
+    /// Moving-average half-width over coded steps (`--local-ancestry-smooth`).
+    pub smooth: usize,
+}
+
 pub struct ImputeWindowInputs<'a> {
     pub ref_bm: &'a HaplotypeBitmatrix,
     pub targ_alleles: &'a HaplotypeBitmatrix, // (n_chip sites × n_haps) full target, bit-packed
@@ -90,6 +104,9 @@ pub struct ImputeWindowInputs<'a> {
     /// panel frequency whose weights nothing reads). Its weights are put back by
     /// `expand_weights`; the site is still written as given. None: every row in.
     pub hmm_skip: Option<&'a [bool]>,
+    /// Ancestry prior on the candidate ranking; None: match count only. Ignored when the
+    /// candidates were precomputed for the chromosome (`--precompute-candidates`).
+    pub cand_ancestry: Option<CandidateAncestry<'a>>,
 }
 
 /// Per-stage CPU microseconds inside the per-target map, summed over all worker
@@ -188,6 +205,18 @@ pub fn impute_window(
         targ_w, params.n_haps, cm_w, 0.05,
     );
 
+    let local_anc = inputs.cand_ancestry.filter(|_| precomputed_candidates.is_none()).map(|ca| {
+        let mut la = super::ancestry::infer_local_ancestry(&coded, params.n_ref, params.n_haps, ca.panel_hap_pop);
+        super::ancestry::smooth_local_ancestry(&mut la, ca.smooth);
+        la
+    });
+    let anc_ctx = inputs.cand_ancestry.zip(local_anc.as_ref()).map(|(ca, la)| super::ancestry::AncestryContext {
+        panel_hap_pop: ca.panel_hap_pop,
+        target_hap_probs: &[],
+        local: Some(la),
+        strength: ca.strength,
+    });
+
     let ne_w: Option<Vec<f64>> = inputs.ne_per_site.map(|ne| {
         ne[inputs.chip_start..inputs.chip_end].to_vec()
     });
@@ -218,7 +247,7 @@ pub fn impute_window(
     let out = process_window_hmm(
         params, inputs.ref_bm, targ_w, cm_w, x_w,
         ne_w.as_deref(), conf_w.as_deref(), ns, &coded,
-        precomputed_candidates,
+        precomputed_candidates, anc_ctx.as_ref(),
         carry, inputs.chip_start, n_var_w, inputs.keep_rows,
         inputs.hmm_skip,
         on_batch_done,
@@ -1021,6 +1050,8 @@ pub fn process_window_hmm(
     n_samples: usize,
     coded: &pbwt::CodedSteps,
     precomputed_candidates: Option<&Vec<Vec<u32>>>,
+    // Ancestry prior on the candidate ranking, over this window's coded steps.
+    ancestry: Option<&super::ancestry::AncestryContext<'_>>,
     carry: &mut [HapCarry],
     chip_start: usize,
     n_var_w: usize,
@@ -1108,7 +1139,7 @@ pub fn process_window_hmm(
                 (Some(ms), _) => pbwt::select_candidates_nocall(coded, n_ref + tgt, n_ref,
                     max_candidates, ms, ref_bm, chip_start, targ_w, n_haps, tgt),
                 (None, Some(pc)) => pc[tgt].clone(),
-                (None, None) => pbwt::select_candidates(coded, n_ref + tgt, n_ref, max_candidates),
+                (None, None) => pbwt::select_candidates_weighted(coded, n_ref + tgt, n_ref, max_candidates, ancestry, tgt),
             }
         };
         // CSC -> copying weights. Shared by the per-target and the shared-sort

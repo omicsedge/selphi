@@ -1454,6 +1454,20 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
         needs_phasing, effective_mc, n_chip, n_ref, n_haps,
     );
 
+    // Ancestry prior on the per-window candidate ranking (`--panel-ancestry` + `--local-ancestry`):
+    // each window infers the targets' local ancestry from its own coded steps. Under
+    // `--precompute-candidates` the chromosome-level selection above applies it instead.
+    let cand_ancestry = match (args.local_ancestry, panel_anc.as_deref()) {
+        (true, Some(pa)) => Some(selphi::imputation::window_process::CandidateAncestry {
+            panel_hap_pop: pa, strength: args.ancestry_strength, smooth: args.local_ancestry_smooth,
+        }),
+        _ => None,
+    };
+    if cand_ancestry.is_some() && precomputed_candidates.is_none() {
+        selphi_step!("Ancestry prior on the per-window candidate ranking (strength {:.2}, smooth r={})",
+            args.ancestry_strength, args.local_ancestry_smooth);
+    }
+
     // ref_bm_imp stays alive for per-window imputation extraction.
     // ref_bm_imp stays alive for per-window imputation (bitmatrix extraction + candidate selection).
 
@@ -1619,6 +1633,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
             interp_x: Some(&interp_x),
             keep_rows: keep_rows.as_deref(),
             hmm_skip: skip_w.as_deref(),
+            cand_ancestry,
         };
         // Streaming callback for batched mode: each batch's CSRs are written
         // immediately to the corresponding batch writer(s) (BCF, VCF, SD,
@@ -1727,6 +1742,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
                     interp_x: Some(&interp_x),
                     keep_rows: keep_rows.as_deref(),
                     hmm_skip: skip_w.as_deref(),
+                    cand_ancestry,
                 },
             )
         };

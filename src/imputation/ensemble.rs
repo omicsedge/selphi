@@ -280,6 +280,8 @@ pub struct FoldContext<'a> {
     /// Window rows every target skips (ImputeWindowInputs::hmm_skip): blended rows, aligned as
     /// a no-call's are.
     pub hmm_skip: Option<&'a [bool]>,
+    /// Ancestry prior on the candidate ranking (ImputeWindowInputs::cand_ancestry), for every member.
+    pub cand_ancestry: Option<super::window_process::CandidateAncestry<'a>>,
 }
 
 /// Per window row (chip site `chip_start + r`), whether member k's two haplotypes of sample
@@ -438,6 +440,7 @@ fn member_inputs<'a>(targ_bm: &'a HaplotypeBitmatrix, ne: Option<&'a [f64]>,
         interp_x: ctx.interp_x,
         keep_rows: ctx.keep_rows,
         hmm_skip: ctx.hmm_skip,
+        cand_ancestry: ctx.cand_ancestry,
     }
 }
 
