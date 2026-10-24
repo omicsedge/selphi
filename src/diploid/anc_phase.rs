@@ -1,4 +1,4 @@
-//! Ancestry-aware long-range phase correction (`SELPHI_ANC_POST=off|report|apply`).
+//! Ancestry-aware long-range phase correction (`SELPHI_ANC_POST=apply|report|off`, default apply).
 //!
 //! One person phased alone against a large panel carries long-range orientation
 //! errors: stretches of megabases where the two haplotypes are swapped against the
@@ -77,14 +77,14 @@ const SUBSET_SEED: u64 = 20261023;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode { Off, Report, Apply }
 
-/// `SELPHI_ANC_POST`: off (default) | report (decide and log, change nothing) | apply.
+/// `SELPHI_ANC_POST`: apply (default) | report (decide and log, change nothing) | off.
 pub fn mode() -> Mode {
     use std::sync::OnceLock;
     static M: OnceLock<Mode> = OnceLock::new();
     *M.get_or_init(|| match crate::config::raw("SELPHI_ANC_POST").as_deref().map(str::trim) {
-        None | Some("") | Some("off") | Some("0") => Mode::Off,
+        None | Some("") | Some("apply") | Some("1") => Mode::Apply,
         Some("report") => Mode::Report,
-        Some("apply") | Some("1") => Mode::Apply,
+        Some("off") | Some("0") => Mode::Off,
         Some(other) => panic!("SELPHI_ANC_POST must be off, report or apply, got {other:?}"),
     })
 }
