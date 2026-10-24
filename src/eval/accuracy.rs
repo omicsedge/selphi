@@ -56,7 +56,7 @@ fn invalid_dosage(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct GtCall {
     alt_count: Option<u32>,
     ploidy: Option<u32>,
@@ -93,6 +93,16 @@ fn parse_gt_text(gt: &[u8]) -> GtCall {
             return GtCall { alt_count: alt, ploidy: Some(2) };
         }
     }
+    parse_gt_text_general(gt)
+}
+
+/// `parse_gt_text` for a call the fast path did not take: any ploidy, missing alleles,
+/// and (VCF 4.4) one leading phasing indicator (`|0|1`, `/0`), which is skipped. Kept
+/// out of the hot record parser, which sees three-byte diploid calls.
+#[cold]
+#[inline(never)]
+fn parse_gt_text_general(gt: &[u8]) -> GtCall {
+    let gt = match gt { [b'/' | b'|', rest @ ..] => rest, _ => gt };
     if gt.is_empty() || gt == b"." { return GtCall::default(); }
     let mut ploidy = 0;
     let mut alt_count = 0;
@@ -1601,11 +1611,13 @@ impl TruthRefScan {
 }
 
 /// A text GT is a reference call when it is called and every allele is 0: `0/0`,
-/// `0|0`, haploid `0` (a male's chrX), `0/0/0`. A partly missing call (`./0`), an
-/// empty allele and any ALT allele are not: exactly the calls `parse_gt_text` reads
-/// as zero ALT copies. (Its own check, so the evaluator's per-sample parsers keep
-/// their one call site and are inlined there as before.)
+/// `0|0`, haploid `0` (a male's chrX), `0/0/0`, and the same behind one leading
+/// phasing indicator (`|0|0`, VCF 4.4). A partly missing call (`./0`), an empty
+/// allele and any ALT allele are not: exactly the calls `parse_gt_text` reads as
+/// zero ALT copies. (Its own check, so the evaluator's per-sample parsers keep their
+/// one call site and are inlined there as before.)
 fn text_gt_is_ref(gt: &[u8]) -> bool {
+    let gt = match gt { [b'/' | b'|', rest @ ..] => rest, _ => gt };
     !gt.is_empty() && gt.split(|&b| b == b'/' || b == b'|').all(|allele| allele == b"0")
 }
 
@@ -2030,13 +2042,15 @@ pub struct OverallSummary {
     pub n_concordance_sites: u64,
 }
 
-/// One sample's metrics over every site it was scored at.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SampleSummary {
+/// One sample's metrics over every site it was scored at ([`EvalSummary::sample`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SampleSummary<'a> {
     /// The sample's name, when the caller gave the names.
-    pub sample: Option<String>,
+    pub sample: Option<&'a str>,
     /// `None`: undefined (fewer than two scored genotypes, or no variance).
     pub r2: Option<f64>,
+    /// Hardcall concordance; the matched-sites path only (`None` on the hom-ref
+    /// path, which does not compute it).
     pub concordance: Option<f64>,
     pub n_correct: u64,
     pub n_scored: u64,
@@ -2054,18 +2068,22 @@ pub struct ClassSummary {
 
 /// Every finished metric of one evaluation, as the report prints it and the JSON
 /// summary writes it (rounded there to 6 decimals; full precision here). Built by
-/// [`summarize_matched`] or [`summarize_imputation`] from the accumulators.
+/// [`summarize_matched`] or [`summarize_imputation`] from the accumulators, each
+/// quantity computed once and only the ones the JSON writes; the names and counts
+/// are borrowed from the caller's.
 #[derive(Clone, Debug, PartialEq)]
-pub struct EvalSummary {
+pub struct EvalSummary<'a> {
     pub mode: EvalMode,
     pub n_imp_variants: u64,
     pub n_truth_variants: u64,
     /// Sites scored: matched sites, or (hom-ref path) imputed sites not excluded.
     pub n_matched: u64,
     /// Chromosomes scored (matched-sites path).
-    pub chromosomes: Vec<String>,
+    pub chromosomes: &'a [String],
     /// Samples scored (shared by the two files).
     pub n_samples: usize,
+    /// Their names, when the caller gave them (in sample order).
+    pub sample_names: Option<&'a [String]>,
     /// The nine MAF bins ([`MAF_BINS`]); empty on a hom-ref evaluation run without
     /// site metrics.
     pub maf_bins: Vec<MafBinSummary>,
@@ -2074,11 +2092,15 @@ pub struct EvalSummary {
     pub per_sample_mean_r2: Option<f64>,
     /// Number of samples with a defined R² (what `per_sample_mean_r2` is over).
     pub per_sample_n_defined: usize,
-    pub per_sample: Vec<SampleSummary>,
-    /// The per-sample rows carry names (the caller passed the sample names).
-    pub named_samples: bool,
-    /// Hom-ref path: per-sample R² over all scored sites, the SNPs, the indels.
-    pub combined: Option<ClassSummary>,
+    /// Per-sample R² over all scored sites, in sample order (NaN: undefined).
+    pub sample_r2: Vec<f64>,
+    /// Per-sample hardcall concordance (NaN: undefined); the matched-sites path
+    /// only, empty on the hom-ref path.
+    pub sample_concordance: Vec<f64>,
+    /// Per-sample correct hardcalls and scored genotypes (the accumulator's counts).
+    pub sample_n_correct: &'a [u64],
+    pub sample_n_scored: &'a [u64],
+    /// Hom-ref path with `by_type`: per-sample R² over the SNPs and over the indels.
     pub snp: Option<ClassSummary>,
     pub indel: Option<ClassSummary>,
     /// Hom-ref path: what `--truth-raw` did.
@@ -2087,6 +2109,12 @@ pub struct EvalSummary {
 
 /// `None` for NaN (undefined).
 fn defined(x: f64) -> Option<f64> { (!x.is_nan()).then_some(x) }
+
+/// Mean of the defined values and their number (`mean_sample_r2`'s arithmetic).
+fn mean_defined(values: &[f64]) -> (Option<f64>, usize) {
+    let n = values.iter().filter(|v| v.is_finite()).count();
+    (n > 0).then(|| values.iter().filter(|v| v.is_finite()).sum::<f64>() / n as f64).map_or((None, 0), |m| (Some(m), n))
+}
 
 fn bin_summaries(site: &SiteAccumulator) -> Vec<MafBinSummary> {
     MAF_BINS.iter().enumerate().map(|(bi, &(lo, hi, label))| {
@@ -2111,66 +2139,64 @@ fn overall_summary(site: Option<&SiteAccumulator>, n_sites: u64) -> OverallSumma
     }
 }
 
-fn sample_summaries(acc: &SampleAccumulator, names: Option<&[String]>) -> Vec<SampleSummary> {
-    let r2 = acc.compute_r2();
-    let conc = acc.compute_concordance();
-    (0..acc.n_samples).map(|s| SampleSummary {
-        sample: names.map(|n| n[s].clone()),
-        r2: defined(r2[s]),
-        concordance: defined(conc[s]),
-        n_correct: acc.n_correct[s],
-        n_scored: acc.n_total[s],
-    }).collect()
-}
-
 fn class_summary(acc: &SampleAccumulator) -> ClassSummary {
     let (r2, n) = mean_sample_r2(acc);
     ClassSummary { n_sites: acc.n_variants, mean_r2: defined(r2), n_samples: n }
 }
 
-/// The finished metrics of a matched-sites evaluation ([`evaluate_with_options`]).
-pub fn summarize_matched(site_acc: &SiteAccumulator, sample_acc: &SampleAccumulator, counts: &EvalCounts,
-    sample_names: Option<&[String]>) -> EvalSummary {
-    let (mean, n_def) = mean_sample_r2(sample_acc);
+/// The finished metrics of a matched-sites evaluation ([`evaluate_with_options`]):
+/// one per-sample R² pass and one concordance pass, as the JSON needs.
+pub fn summarize_matched<'a>(site_acc: &SiteAccumulator, sample_acc: &'a SampleAccumulator, counts: &'a EvalCounts,
+    sample_names: Option<&'a [String]>) -> EvalSummary<'a> {
+    let sample_r2 = sample_acc.compute_r2();
+    let (per_sample_mean_r2, per_sample_n_defined) = mean_defined(&sample_r2);
     EvalSummary {
         mode: EvalMode::MatchedSites,
         n_imp_variants: counts.n_imp_variants,
         n_truth_variants: counts.n_truth_variants,
         n_matched: counts.n_matched,
-        chromosomes: counts.chromosomes.clone(),
+        chromosomes: &counts.chromosomes,
         n_samples: sample_acc.n_samples,
+        sample_names,
         maf_bins: bin_summaries(site_acc),
         overall: overall_summary(Some(site_acc), counts.n_matched),
-        per_sample_mean_r2: defined(mean),
-        per_sample_n_defined: n_def,
-        per_sample: sample_summaries(sample_acc, sample_names),
-        named_samples: sample_names.is_some(),
-        combined: None, snp: None, indel: None, raw_truth: None,
+        per_sample_mean_r2,
+        per_sample_n_defined,
+        sample_r2,
+        sample_concordance: sample_acc.compute_concordance(),
+        sample_n_correct: &sample_acc.n_correct,
+        sample_n_scored: &sample_acc.n_total,
+        snp: None, indel: None, raw_truth: None,
     }
 }
 
-/// The finished metrics of a hom-ref evaluation ([`evaluate_imputation_with_options`]).
-pub fn summarize_imputation(
-    comb: &SampleAccumulator, snp: &SampleAccumulator, indel: &SampleAccumulator, counts: &EvalCounts,
-    sample_names: Option<&[String]>, site: Option<&SiteAccumulator>, raw_diag: Option<&RawTruthDiag>,
-) -> EvalSummary {
-    let combined = class_summary(comb);
+/// The finished metrics of a hom-ref evaluation ([`evaluate_imputation_with_options`]):
+/// one per-sample R² pass over all sites; the SNP and indel means only with `by_type`.
+pub fn summarize_imputation<'a>(
+    comb: &'a SampleAccumulator, snp: &SampleAccumulator, indel: &SampleAccumulator, by_type: bool,
+    counts: &'a EvalCounts, sample_names: Option<&'a [String]>, site: Option<&SiteAccumulator>,
+    raw_diag: Option<&RawTruthDiag>,
+) -> EvalSummary<'a> {
+    let sample_r2 = comb.compute_r2();
+    let (per_sample_mean_r2, per_sample_n_defined) = mean_defined(&sample_r2);
     EvalSummary {
         mode: EvalMode::HomrefAbsent,
         n_imp_variants: counts.n_imp_variants,
         n_truth_variants: counts.n_truth_variants,
         n_matched: counts.n_matched,
-        chromosomes: counts.chromosomes.clone(),
+        chromosomes: &counts.chromosomes,
         n_samples: comb.n_samples,
+        sample_names,
         maf_bins: site.map(bin_summaries).unwrap_or_default(),
         overall: overall_summary(site, counts.n_matched),
-        per_sample_mean_r2: combined.mean_r2,
-        per_sample_n_defined: combined.n_samples,
-        per_sample: sample_summaries(comb, sample_names),
-        named_samples: sample_names.is_some(),
-        combined: Some(combined),
-        snp: Some(class_summary(snp)),
-        indel: Some(class_summary(indel)),
+        per_sample_mean_r2,
+        per_sample_n_defined,
+        sample_r2,
+        sample_concordance: Vec::new(),
+        sample_n_correct: &comb.n_correct,
+        sample_n_scored: &comb.n_total,
+        snp: by_type.then(|| class_summary(snp)),
+        indel: by_type.then(|| class_summary(indel)),
         raw_truth: raw_diag.copied(),
     }
 }
@@ -2180,7 +2206,23 @@ fn json6(x: Option<f64>) -> serde_json::Value {
     serde_json::json!(x.map(|x| (x * 1e6).round() / 1e6))
 }
 
-impl EvalSummary {
+impl<'a> EvalSummary<'a> {
+    /// Sample `i`'s metrics.
+    pub fn sample(&self, i: usize) -> SampleSummary<'a> {
+        SampleSummary {
+            sample: self.sample_names.map(|n| n[i].as_str()),
+            r2: defined(self.sample_r2[i]),
+            concordance: self.sample_concordance.get(i).copied().and_then(defined),
+            n_correct: self.sample_n_correct[i],
+            n_scored: self.sample_n_scored[i],
+        }
+    }
+
+    /// Every sample's metrics, in sample order.
+    pub fn samples(&self) -> impl Iterator<Item = SampleSummary<'a>> + '_ {
+        (0..self.n_samples).map(|i| self.sample(i))
+    }
+
     /// The JSON [`write_json_summary`] writes (matched-sites layout).
     pub fn matched_json(&self) -> serde_json::Value {
         let mut map = serde_json::Map::new();
@@ -2205,18 +2247,18 @@ impl EvalSummary {
         map.insert("n_truth_variants".into(), serde_json::json!(self.n_truth_variants));
         map.insert("n_matched".into(), serde_json::json!(self.n_matched));
         map.insert("n_samples".into(), serde_json::json!(self.n_samples));
-        if !self.per_sample.is_empty() {
+        if !self.sample_r2.is_empty() {
             // Average over the samples that HAVE a value; a NaN means undefined.
             map.insert("per_sample_mean_r2".into(), json6(self.per_sample_mean_r2));
-            let per_sample: Vec<serde_json::Value> = self.per_sample.iter().map(|s| {
+            let per_sample: Vec<serde_json::Value> = (0..self.n_samples).map(|s| {
                 let mut obj = serde_json::Map::new();
-                if let Some(name) = &s.sample { obj.insert("sample".into(), serde_json::json!(name)); }
+                if let Some(names) = self.sample_names { obj.insert("sample".into(), serde_json::json!(names[s])); }
                 // NaN is not representable in JSON: null, so a consumer sees "undefined"
                 // rather than a zero it would average in.
-                obj.insert("r2".into(), json6(s.r2));
-                obj.insert("concordance".into(), json6(s.concordance));
-                obj.insert("n_correct".into(), serde_json::json!(s.n_correct));
-                obj.insert("n_total".into(), serde_json::json!(s.n_scored));
+                obj.insert("r2".into(), json6(defined(self.sample_r2[s])));
+                obj.insert("concordance".into(), json6(defined(self.sample_concordance[s])));
+                obj.insert("n_correct".into(), serde_json::json!(self.sample_n_correct[s]));
+                obj.insert("n_total".into(), serde_json::json!(self.sample_n_scored[s]));
                 serde_json::Value::Object(obj)
             }).collect();
             map.insert("per_sample".into(), serde_json::json!(per_sample));
@@ -2224,31 +2266,27 @@ impl EvalSummary {
         serde_json::Value::Object(map)
     }
 
-    /// The JSON [`write_imputation_json`] writes (hom-ref layout; SNP/indel keys
-    /// with `by_type`).
-    pub fn imputation_json(&self, by_type: bool) -> serde_json::Value {
+    /// The JSON [`write_imputation_json`] writes (hom-ref layout; the SNP/indel keys
+    /// when the summary was built with `by_type`).
+    pub fn imputation_json(&self) -> serde_json::Value {
         let mut map = serde_json::Map::new();
-        let none = ClassSummary { n_sites: 0, mean_r2: None, n_samples: 0 };
-        let comb = self.combined.as_ref().unwrap_or(&none);
-        map.insert("combined_mean_r2".into(), json6(comb.mean_r2));
-        map.insert("n_samples".into(), serde_json::json!(comb.n_samples));
+        map.insert("combined_mean_r2".into(), json6(self.per_sample_mean_r2));
+        map.insert("n_samples".into(), serde_json::json!(self.per_sample_n_defined));
         map.insert("n_sites_scored".into(), serde_json::json!(self.n_matched));
         map.insert("n_imputed_sites".into(), serde_json::json!(self.n_imp_variants));
         map.insert("n_truth_strong_sites".into(), serde_json::json!(self.n_truth_variants));
-        if by_type {
-            let snp = self.snp.as_ref().unwrap_or(&none);
-            let indel = self.indel.as_ref().unwrap_or(&none);
+        if let (Some(snp), Some(indel)) = (&self.snp, &self.indel) {
             map.insert("snp_mean_r2".into(), json6(snp.mean_r2));
             map.insert("snp_n_sites".into(), serde_json::json!(snp.n_sites));
             map.insert("indel_mean_r2".into(), json6(indel.mean_r2));
             map.insert("indel_n_sites".into(), serde_json::json!(indel.n_sites));
         }
-        if self.named_samples {
-            let named = || self.per_sample.iter().filter_map(|s| s.sample.clone().map(|n| (n, s)));
-            let per: serde_json::Map<String, serde_json::Value> = named().map(|(n, s)| (n, json6(s.r2))).collect();
+        if let Some(names) = self.sample_names {
+            let per: serde_json::Map<String, serde_json::Value> = names.iter().enumerate()
+                .map(|(i, nm)| (nm.clone(), json6(defined(self.sample_r2[i])))).collect();
             map.insert("per_sample_combined_r2".into(), serde_json::Value::Object(per));
-            let scored: serde_json::Map<String, serde_json::Value> = named()
-                .map(|(n, s)| (n, serde_json::json!(s.n_scored))).collect();
+            let scored: serde_json::Map<String, serde_json::Value> = names.iter().enumerate()
+                .map(|(i, nm)| (nm.clone(), serde_json::json!(self.sample_n_scored[i]))).collect();
             map.insert("per_sample_n_scored".into(), serde_json::Value::Object(scored));
         }
         if let Some(d) = self.raw_truth.filter(|d| d.raw_sites_loaded > 0) {
@@ -2281,16 +2319,13 @@ impl EvalSummary {
         }
         serde_json::Value::Object(map)
     }
-}
 
-impl EvalSummary {
     /// Write the JSON summary the command line writes for this evaluation:
-    /// [`EvalSummary::matched_json`], or [`EvalSummary::imputation_json`] (SNP/indel
-    /// keys with `by_type`).
-    pub fn write_json(&self, path: &Path, by_type: bool) -> io::Result<()> {
+    /// [`EvalSummary::matched_json`] or [`EvalSummary::imputation_json`].
+    pub fn write_json(&self, path: &Path) -> io::Result<()> {
         match self.mode {
             EvalMode::MatchedSites => write_json_value(path, &self.matched_json()),
-            EvalMode::HomrefAbsent => write_json_value(path, &self.imputation_json(by_type)),
+            EvalMode::HomrefAbsent => write_json_value(path, &self.imputation_json()),
         }
     }
 }
@@ -2308,8 +2343,7 @@ pub fn write_imputation_json(
     by_type: bool, counts: &EvalCounts, sample_names: Option<&[String]>,
     site: Option<&SiteAccumulator>, raw_diag: Option<&RawTruthDiag>,
 ) -> io::Result<()> {
-    let summary = summarize_imputation(comb, snp, indel, counts, sample_names, site, raw_diag);
-    write_json_value(path, &summary.imputation_json(by_type))
+    summarize_imputation(comb, snp, indel, by_type, counts, sample_names, site, raw_diag).write_json(path)
 }
 
 /// Write JSON summary to file.
@@ -2317,9 +2351,9 @@ pub fn write_json_summary(
     path: &Path, site_acc: &SiteAccumulator, sample_acc: &SampleAccumulator, counts: &EvalCounts,
     sample_names: Option<&[String]>,
 ) -> io::Result<()> {
-    let summary = summarize_matched(site_acc, sample_acc, counts, sample_names);
-    write_json_value(path, &summary.matched_json())
+    summarize_matched(site_acc, sample_acc, counts, sample_names).write_json(path)
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2975,6 +3009,10 @@ mod tests {
         assert_eq!(scan(&p).first_ref_record, Some(1));
         let p = gt_fixture(dir.path(), "d.vcf.gz", &[("G", "DP:GT", &["3:0|0"])]);
         assert_eq!(scan(&p).first_ref_record, Some(1));
+        // A truth whose calls open with their phasing indicator (VCF 4.4) is complete.
+        let p = gt_fixture(dir.path(), "lead.vcf.gz", &[("G", "GT", &["|0|1", "/1/1"]), ("G", "GT", &["|1|1", "/0/0"])]);
+        assert_eq!(scan(&p), TruthRefScan { records_scanned: 2, first_ref_record: Some(2) });
+        assert!(truth_has_ref_calls(&p).unwrap());
         // The scan reads at most TRUTH_SCAN_RECORDS records.
         let mut rows: Vec<(&str, &str, &[&str])> = vec![("G", "GT", &["0/1"]); TRUTH_SCAN_RECORDS];
         rows.push(("G", "GT", &["0/0"]));
@@ -3001,14 +3039,35 @@ mod tests {
     fn scan_ref_checks_agree_with_the_evaluator_parsers() {
         let mut r = Xs(0x0ddba11);
         let atoms: [&[u8]; 8] = [b"0", b"1", b".", b"2", b"", b"00", b"x", b"10"];
-        for _ in 0..20_000 {
+        let mut n_leading_ref = 0;
+        for _ in 0..40_000 {
             let n = 1 + r.below(4) as usize;
             let mut gt: Vec<u8> = Vec::new();
+            // One leading phasing indicator (VCF 4.4) a quarter of the time, two (invalid) rarely.
+            for _ in 0..match r.below(16) { 0..=3 => 1, 4 => 2, _ => 0 } {
+                gt.push(if r.below(2) == 0 { b'/' } else { b'|' });
+            }
             for i in 0..n {
                 if i > 0 { gt.push(if r.below(2) == 0 { b'/' } else { b'|' }); }
                 gt.extend_from_slice(atoms[r.below(8) as usize]);
             }
-            assert_eq!(text_gt_is_ref(&gt), parse_gt_text(&gt).alt_count == Some(0), "{}", String::from_utf8_lossy(&gt));
+            let is_ref = text_gt_is_ref(&gt);
+            assert_eq!(is_ref, parse_gt_text(&gt).alt_count == Some(0), "{}", String::from_utf8_lossy(&gt));
+            if is_ref && matches!(gt[0], b'/' | b'|') { n_leading_ref += 1; }
+        }
+        assert!(n_leading_ref > 300, "leading-indicator reference calls barely exercised ({n_leading_ref})");
+        // The forms VCF 4.4 allows, and the ones nothing allows.
+        for gt in [b"/0/0".as_slice(), b"|0|0", b"|0", b"/0", b"|0/0/0"] {
+            assert!(text_gt_is_ref(gt), "{}", String::from_utf8_lossy(gt));
+            let call = parse_gt_text(gt);
+            assert_eq!(call.alt_count, Some(0), "{}", String::from_utf8_lossy(gt));
+            assert_eq!(call.ploidy, Some(gt.iter().filter(|&&b| b == b'0').count() as u32));
+        }
+        assert_eq!(parse_gt_text(b"|0|1"), GtCall { alt_count: Some(1), ploidy: Some(2) });
+        assert_eq!(parse_gt_text(b"/1"), GtCall { alt_count: Some(1), ploidy: Some(1) });
+        for gt in [b"//0/0".as_slice(), b"/", b"|", b"||0", b"/./0"] {
+            assert!(!text_gt_is_ref(gt), "{}", String::from_utf8_lossy(gt));
+            assert_ne!(parse_gt_text(gt).alt_count, Some(0), "{}", String::from_utf8_lossy(gt));
         }
         for tid in [1u8, 2, 3] {
             let (missing, vector_end) = match tid { 1 => (i8::MIN as i32, i8::MIN as i32 + 1), 2 => (i16::MIN as i32, i16::MIN as i32 + 1), _ => (i32::MIN, i32::MIN + 1) };
