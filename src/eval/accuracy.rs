@@ -1544,40 +1544,163 @@ fn load_dosage_map(path: &Path, shared: &[String], options: InputDosageOptions)
     Ok(map)
 }
 
-/// Returns true if the truth VCF/BCF contains an EXPLICIT homozygous-reference call
-/// (GT 0/0 or 0|0) in its first `sample_limit` data records — i.e. it is a COMPLETE
-/// callset rather than variant-only. Used to auto-decide `--homref-absent`: a complete
-/// truth needs no absent→hom-ref (evaluate matched sites only, the legacy behaviour);
-/// a variant-only truth does. Reads the raw GT (not the folded dosage, which can't tell
-/// 0/0 from ./.). VCF.gz: text scan. BCF: parse GT via the BCF reader.
-pub fn truth_has_ref_calls(path: &Path) -> io::Result<bool> {
+/// Data records [`scan_truth_ref_calls`] reads at most.
+pub const TRUTH_SCAN_RECORDS: usize = 4000;
+
+/// What the first records of a truth file say about its completeness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TruthRefScan {
+    /// Data records read (at most [`TRUTH_SCAN_RECORDS`]; the scan stops at the
+    /// first record holding a reference call).
+    pub records_scanned: usize,
+    /// 1-based number of the first record with a sample whose every GT allele is
+    /// the reference allele, if one was read.
+    pub first_ref_record: Option<usize>,
+}
+
+impl TruthRefScan {
+    /// A reference call was read: the truth is a complete callset.
+    pub fn is_complete(&self) -> bool { self.first_ref_record.is_some() }
+}
+
+/// A text GT is a reference call when it is called and every allele is 0: `0/0`,
+/// `0|0`, haploid `0` (a male's chrX), `0/0/0`. A partly missing call (`./0`), an
+/// empty allele and any ALT allele are not: exactly the calls `parse_gt_text` reads
+/// as zero ALT copies. (Its own check, so the evaluator's per-sample parsers keep
+/// their one call site and are inlined there as before.)
+fn text_gt_is_ref(gt: &[u8]) -> bool {
+    !gt.is_empty() && gt.split(|&b| b == b'/' || b == b'|').all(|allele| allele == b"0")
+}
+
+/// Whether one BCF record's FORMAT/GT holds a reference call (every allele of a
+/// sample 0: encoded 2, or 3 when phased; at least one allele before the vector
+/// end): exactly the calls `parse_gt_bcf` reads as zero ALT copies. Walks the
+/// FORMAT fields as `decode_bcf_calls` does, with its checks.
+fn bcf_record_has_ref_call(ib: &[u8], nf: usize, ns: usize, gt_key: u16) -> io::Result<bool> {
+    let mut offset = 0;
+    for _ in 0..nf {
+        if offset >= ib.len() { return Err(invalid_dosage("truncated BCF FORMAT key")); }
+        let key = rtint(ib, &mut offset) as u16;
+        let tb = *ib.get(offset).ok_or_else(|| invalid_dosage("truncated BCF FORMAT descriptor"))?;
+        offset += 1;
+        let tid = tb & 15;
+        let vl = if tb >> 4 == 15 {
+            let length = rtint(ib, &mut offset);
+            usize::try_from(length).map_err(|_| invalid_dosage("negative BCF FORMAT length"))?
+        } else { (tb >> 4) as usize };
+        let width = match tid { 0 => 0, 1 | 7 => 1, 2 => 2, 3 | 5 => 4, _ => return Err(invalid_dosage("unsupported BCF FORMAT type")) };
+        let stride = vl.checked_mul(width).ok_or_else(|| invalid_dosage("BCF FORMAT length overflow"))?;
+        let len = stride.checked_mul(ns).ok_or_else(|| invalid_dosage("BCF FORMAT length overflow"))?;
+        let end = offset.checked_add(len).filter(|&e| e <= ib.len())
+            .ok_or_else(|| invalid_dosage("truncated BCF FORMAT payload"))?;
+        if key == gt_key {
+            if !matches!(tid, 1..=3) { return Err(invalid_dosage("FORMAT/GT must use an integer type")); }
+            let vector_end = match tid { 1 => i8::MIN as i32 + 1, 2 => i16::MIN as i32 + 1, _ => i32::MIN + 1 };
+            let is_ref = |data: &[u8]| {
+                let mut n = 0;
+                for bytes in data.chunks_exact(width) {
+                    let raw = match width {
+                        1 => bytes[0] as i8 as i32,
+                        2 => i16::from_le_bytes(bytes.try_into().unwrap()) as i32,
+                        _ => i32::from_le_bytes(bytes.try_into().unwrap()),
+                    };
+                    if raw == vector_end { break; }
+                    if raw != 2 && raw != 3 { return false; }
+                    n += 1;
+                }
+                n > 0
+            };
+            return Ok((0..ns).any(|s| is_ref(&ib[offset + s * stride..offset + (s + 1) * stride])));
+        }
+        offset = end;
+    }
+    Ok(false)
+}
+
+/// Read the GT of every sample in the first [`TRUTH_SCAN_RECORDS`] data records of a
+/// truth VCF/BCF (multi-allelic records included) and stop at the first reference
+/// call. Genotypes are parsed, not matched as text (the GT subfield of every sample
+/// column of a VCF, the decoded FORMAT/GT of a BCF).
+pub fn scan_truth_ref_calls(path: &Path) -> io::Result<TruthRefScan> {
     let s = path.to_string_lossy();
     let is_bcf = sniff_bcf(path) || s.ends_with(".bcf") || s.ends_with(".bcf.gz");
-    let mut seen = 0usize;
+    let mut scan = TruthRefScan { records_scanned: 0, first_ref_record: None };
     if !is_bcf {
         let f = std::fs::File::open(path)?;
-        let bgzf = noodles_bgzf::io::Reader::new(BufReader::new(f));
-        let reader = BufReader::new(bgzf);
-        for line in reader.lines() {
-            let line = line?;
-            if line.starts_with('#') { continue; }
-            // scan sample columns for an explicit ref genotype
-            if line.contains("\t0/0") || line.contains("\t0|0")
-                || line.contains(":0/0") || line.contains(":0|0")
-                || line.contains("0/0:") || line.contains("0|0:")
-                || line.ends_with("0/0") || line.ends_with("0|0") {
-                return Ok(true);
+        let mut reader = BufReader::new(noodles_bgzf::io::Reader::new(BufReader::new(f)));
+        let mut line: Vec<u8> = Vec::new();
+        while scan.records_scanned < TRUTH_SCAN_RECORDS {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 { break; }
+            let rec = line.strip_suffix(b"\n").unwrap_or(&line);
+            let rec = rec.strip_suffix(b"\r").unwrap_or(rec);
+            if rec.is_empty() || rec[0] == b'#' { continue; }
+            scan.records_scanned += 1;
+            let mut cols = rec.split(|&b| b == b'\t');
+            let Some(format) = cols.nth(8) else { continue };
+            let Some(gt_idx) = format.split(|&b| b == b':').position(|f| f == b"GT") else { continue };
+            if cols.any(|sample| sample.split(|&b| b == b':').nth(gt_idx).is_some_and(text_gt_is_ref)) {
+                scan.first_ref_record = Some(scan.records_scanned);
+                break;
             }
-            seen += 1;
-            if seen >= 4000 { break; }
         }
-        return Ok(false);
+        return Ok(scan);
     }
-    // This auto-detection path does not scan BCF genotype metadata. A BCF
-    // truth is therefore assumed COMPLETE (the safe legacy matched-only path); pass
-    // `--homref-absent on` for the rare variant-only BCF truth. (Variant-only truths
-    // are almost always VCF.gz, handled exactly above.)
-    Ok(true)
+    let hdr = crate::srp::bcf_reader::read_header_only(path)?;
+    if !hdr.has_gt || hdr.n_samples == 0 { return Ok(scan); }
+    let f = std::fs::File::open(path)?;
+    let mut bgzf = noodles_bgzf::io::Reader::new(BufReader::new(f));
+    let mut magic = [0u8; 5];
+    bgzf.read_exact(&mut magic)?;
+    let mut word = [0u8; 4];
+    bgzf.read_exact(&mut word)?;
+    let mut hdr_bytes = vec![0u8; u32::from_le_bytes(word) as usize];
+    bgzf.read_exact(&mut hdr_bytes)?;
+    let (mut sb, mut ib) = (Vec::new(), Vec::new());
+    while scan.records_scanned < TRUTH_SCAN_RECORDS {
+        // Distinguish a clean EOF from a truncated record header.
+        if bgzf.read(&mut word[..1])? == 0 { break; }
+        bgzf.read_exact(&mut word[1..])?;
+        let ls = u32::from_le_bytes(word) as usize;
+        if ls < 24 { return Err(invalid_dosage("truncated BCF shared header")); }
+        bgzf.read_exact(&mut word)?;
+        let li = u32::from_le_bytes(word) as usize;
+        sb.resize(ls, 0);
+        bgzf.read_exact(&mut sb)?;
+        ib.resize(li, 0);
+        bgzf.read_exact(&mut ib)?;
+        scan.records_scanned += 1;
+        let n_fmt_sample = u32::from_le_bytes(sb[20..24].try_into().unwrap());
+        let (nf, ns) = ((n_fmt_sample >> 24) as usize, (n_fmt_sample & 0xff_ffff) as usize);
+        if bcf_record_has_ref_call(&ib, nf, ns, hdr.gt_key_id)? {
+
+            scan.first_ref_record = Some(scan.records_scanned);
+            break;
+        }
+    }
+    Ok(scan)
+}
+
+/// Returns true if the truth VCF/BCF holds an explicit reference call (every GT
+/// allele 0, any ploidy) in its first [`TRUTH_SCAN_RECORDS`] data records, i.e. it is a
+/// COMPLETE callset rather than variant-only. Used to auto-decide `--homref-absent`:
+/// a complete truth needs no absent→hom-ref (evaluate matched sites only, the legacy
+/// behaviour); a variant-only truth does. Reads the raw GT (not the folded dosage,
+/// which can't tell 0/0 from ./.), see [`scan_truth_ref_calls`]. Logs what it read.
+pub fn truth_has_ref_calls(path: &Path) -> io::Result<bool> {
+    match scan_truth_ref_calls(path) {
+        Ok(scan) => {
+            match scan.first_ref_record {
+                Some(k) => crate::selphi_info!("  GT scan:  reference call (all alleles 0) in data record {} → complete callset", k),
+                None => crate::selphi_info!("  GT scan:  no reference call in the first {} data record(s) → variant-only", scan.records_scanned),
+            }
+            Ok(scan.is_complete())
+        }
+        Err(e) => {
+            crate::selphi_info!("  GT scan:  could not read the truth's genotypes ({}) → treated as a complete callset", e);
+            Err(e)
+        }
+    }
 }
 
 /// Standard imputation-R² evaluation (the field convention; reproduces the benchmark
@@ -2534,5 +2657,131 @@ mod tests {
         let mem_index = crate::srp::csi::parse_tbi_data(&data).unwrap();
         assert_eq!(file_index.linear, mem_index.linear);
         assert!(file_index.linear[0].len() > 16, "fixture should span many TBI windows");
+    }
+
+    /// A text truth whose records carry the given ALT and per-sample FORMAT columns.
+    fn gt_fixture(dir: &Path, name: &str, rows: &[(&str, &str, &[&str])]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let n = rows.first().map_or(1, |r| r.2.len());
+        let samples: Vec<String> = (0..n).map(|i| format!("S{i}")).collect();
+        let mut writer = noodles_bgzf::io::Writer::new(std::fs::File::create(&path).unwrap());
+        writeln!(writer, "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{}", samples.join("\t")).unwrap();
+        for (i, (alt, format, values)) in rows.iter().enumerate() {
+            writeln!(writer, "X\t{}\t.\tA\t{alt}\t.\tPASS\tNOTE=0/0\t{format}\t{}", i + 1, values.join("\t")).unwrap();
+        }
+        writer.try_finish().unwrap();
+        path
+    }
+
+    /// A minimal BCF 2.2: one contig, FORMAT/GT only, int8 GT of the given ploidy
+    /// (each sample's alleles, `None` = missing; shorter calls are vector-end padded).
+    fn gt_bcf(dir: &Path, name: &str, ploidy: usize, rows: &[&[&[Option<u8>]]]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let n = rows.first().map_or(1, |r| r.len());
+        let samples: Vec<String> = (0..n).map(|i| format!("S{i}")).collect();
+        let text = format!("##fileformat=VCFv4.2\n##FILTER=<ID=PASS,Description=\"All filters passed\",IDX=0>\n\
+            ##contig=<ID=X,length=1000000,IDX=0>\n##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\",IDX=1>\n\
+            #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{}\n\0", samples.join("\t"));
+        let mut out: Vec<u8> = b"BCF\x02\x02".to_vec();
+        out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        out.extend_from_slice(text.as_bytes());
+        for (i, calls) in rows.iter().enumerate() {
+            let mut shared = Vec::new();
+            shared.extend_from_slice(&0i32.to_le_bytes()); // CHROM
+            shared.extend_from_slice(&(i as i32).to_le_bytes()); // POS, 0-based
+            shared.extend_from_slice(&1i32.to_le_bytes()); // rlen
+            shared.extend_from_slice(&f32::from_bits(0x7F80_0001).to_le_bytes()); // QUAL missing
+            shared.extend_from_slice(&(2u32 << 16).to_le_bytes()); // 2 alleles, 0 INFO
+            shared.extend_from_slice(&((1u32 << 24) | calls.len() as u32).to_le_bytes()); // 1 FORMAT
+            shared.extend_from_slice(&[0x17, b'.', 0x17, b'A', 0x17, b'G', 0x11, 0x00]); // ID, REF, ALT, PASS
+            let mut indiv = vec![0x11, 0x01, ((ploidy as u8) << 4) | 1]; // key GT, int8 x ploidy
+            for call in calls.iter() {
+                for k in 0..ploidy {
+                    indiv.push(match call.get(k) {
+                        Some(Some(a)) => (a + 1) << 1,
+                        Some(None) => 0,
+                        None => 0x81, // vector end
+                    });
+                }
+            }
+            out.extend_from_slice(&(shared.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(indiv.len() as u32).to_le_bytes());
+            out.extend_from_slice(&shared);
+            out.extend_from_slice(&indiv);
+        }
+        let mut writer = noodles_bgzf::io::Writer::new(std::fs::File::create(&path).unwrap());
+        writer.write_all(&out).unwrap();
+        writer.try_finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn truth_completeness_reads_genotypes_not_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let scan = |p: &Path| scan_truth_ref_calls(p).unwrap();
+        // "0/0" outside GT (INFO, another FORMAT field), partly missing or ALT calls: not REF.
+        let p = gt_fixture(dir.path(), "v.vcf.gz", &[
+            ("G", "XX:GT", &["0/0:0/1", "0|0:1|1"]), ("G", "GT", &["./0", "0/1"]), ("G,T", "GT", &["0/2", "2|0"]),
+            ("G", "GT", &["1", "./."]),
+        ]);
+        assert_eq!(scan(&p), TruthRefScan { records_scanned: 4, first_ref_record: None });
+        // Haploid 0 (a male's chrX) and a polyploid all-0 call are REF calls.
+        let p = gt_fixture(dir.path(), "h.vcf.gz", &[("G", "GT", &["1", "1"]), ("G", "GT:DP", &["1:3", "0:7"])]);
+        assert_eq!(scan(&p), TruthRefScan { records_scanned: 2, first_ref_record: Some(2) });
+        let p = gt_fixture(dir.path(), "p.vcf.gz", &[("G,T", "GT", &["0/0/0"])]);
+        assert_eq!(scan(&p).first_ref_record, Some(1));
+        let p = gt_fixture(dir.path(), "d.vcf.gz", &[("G", "DP:GT", &["3:0|0"])]);
+        assert_eq!(scan(&p).first_ref_record, Some(1));
+        // The scan reads at most TRUTH_SCAN_RECORDS records.
+        let mut rows: Vec<(&str, &str, &[&str])> = vec![("G", "GT", &["0/1"]); TRUTH_SCAN_RECORDS];
+        rows.push(("G", "GT", &["0/0"]));
+        let p = gt_fixture(dir.path(), "late.vcf.gz", &rows);
+        assert_eq!(scan(&p), TruthRefScan { records_scanned: TRUTH_SCAN_RECORDS, first_ref_record: None });
+        assert!(!truth_has_ref_calls(&p).unwrap());
+
+        // BCF: decoded genotypes, not an assumption.
+        let (r, a) = (Some(0u8), Some(1u8));
+        let p = gt_bcf(dir.path(), "v.bcf", 2, &[&[&[r, a], &[a, a]], &[&[None, r], &[a]]]);
+        assert_eq!(scan(&p), TruthRefScan { records_scanned: 2, first_ref_record: None });
+        let p = gt_bcf(dir.path(), "c.bcf", 2, &[&[&[r, a], &[a, a]], &[&[a, a], &[r, r]]]);
+        assert_eq!(scan(&p), TruthRefScan { records_scanned: 2, first_ref_record: Some(2) });
+        assert!(truth_has_ref_calls(&p).unwrap());
+        let p = gt_bcf(dir.path(), "x.bcf", 2, &[&[&[a], &[a, a]], &[&[a, a], &[r]]]);
+        assert_eq!(scan(&p).first_ref_record, Some(2)); // haploid 0, vector-end padded
+        let p = gt_bcf(dir.path(), "h.bcf", 1, &[&[&[a]], &[&[r]]]);
+        assert_eq!(scan(&p).first_ref_record, Some(2));
+    }
+
+    /// The completeness scan's own GT checks read a call as REF exactly when the
+    /// evaluator's parsers find zero ALT copies in it.
+    #[test]
+    fn scan_ref_checks_agree_with_the_evaluator_parsers() {
+        let mut r = Xs(0x0ddba11);
+        let atoms: [&[u8]; 8] = [b"0", b"1", b".", b"2", b"", b"00", b"x", b"10"];
+        for _ in 0..20_000 {
+            let n = 1 + r.below(4) as usize;
+            let mut gt: Vec<u8> = Vec::new();
+            for i in 0..n {
+                if i > 0 { gt.push(if r.below(2) == 0 { b'/' } else { b'|' }); }
+                gt.extend_from_slice(atoms[r.below(8) as usize]);
+            }
+            assert_eq!(text_gt_is_ref(&gt), parse_gt_text(&gt).alt_count == Some(0), "{}", String::from_utf8_lossy(&gt));
+        }
+        for tid in [1u8, 2, 3] {
+            let (missing, vector_end) = match tid { 1 => (i8::MIN as i32, i8::MIN as i32 + 1), 2 => (i16::MIN as i32, i16::MIN as i32 + 1), _ => (i32::MIN, i32::MIN + 1) };
+            for _ in 0..5_000 {
+                let ploidy = 1 + r.below(3) as usize;
+                let ns = 1 + r.below(3) as usize;
+                let values: Vec<i32> = (0..ploidy * ns).map(|_| match r.below(9) {
+                    0 => missing, 1 => vector_end, 2 => 0, 3 => 1, 4 => -5, 5 | 6 => 2, 7 => 3, _ => 4 + r.below(4) as i32,
+                }).collect();
+                let mut ib = vec![0x11, 0x01, ((ploidy as u8) << 4) | tid];
+                ib.extend_from_slice(&integers(tid, &values));
+                let mut calls = Vec::new();
+                decode_bcf_calls(&ib, 1, ns, 1, None, None, &mut calls).unwrap();
+                let want = calls.iter().any(|c| c.gt.alt_count == Some(0));
+                assert_eq!(bcf_record_has_ref_call(&ib, 1, ns, 1).unwrap(), want, "tid {tid} {values:?}");
+            }
+        }
     }
 }

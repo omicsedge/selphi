@@ -445,10 +445,10 @@ Bin MAF comes from the truth genotypes of the scored samples, so the finest reso
 allele copy among them — `1/(2·n_scored)`, e.g. 0.48% with 105 scored samples, below which the bins
 are structurally empty.
 
-By default `--homref-absent auto` inspects a VCF.gz truth (a BCF truth is treated as complete; pass
-`--homref-absent on` for a variant-only BCF): a complete callset (explicit `0/0`) scores
+By default `--homref-absent auto` reads the genotypes of the truth's first 4,000 records (VCF or
+BCF): a complete callset (a reference call, every allele `0`: `0/0`, `0|0`, a haploid `0`) scores
 matched sites only (legacy), while a variant-only truth scores absent sites as hom-ref (the standard
-imputation-R² convention). Contig names are matched tolerant to the `chr` prefix (so `22` ≡ `chr22`),
+imputation-R² convention); the log says which it found. Contig names are matched tolerant to the `chr` prefix (so `22` ≡ `chr22`),
 and only samples shared between the imputed and truth files are scored. On the hom-ref path sites are
 keyed by contig, position and alleles, so one whole-genome truth scores a multi-chromosome run in a
 single pass; the matched-sites path merges one contig at a time, so score per chromosome there. `--truth-raw` takes the
