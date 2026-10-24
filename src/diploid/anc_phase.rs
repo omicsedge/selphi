@@ -98,8 +98,9 @@ fn table_group(pop: &str, superpop: &str) -> Option<u8> {
 
 /// Whether the run's chip sites are dense enough to be a sequenced genome
 /// (`SELPHI_AUTOROUTE_WGS_DENSITY` sites/Mb, as the private-het routing reads it):
-/// the check is calibrated on array-density windows (60 sites ~ a few hundred kb),
-/// so at sequencing density it does not run.
+/// the array check scores 60 consecutive sites per window (a few hundred kb on an
+/// array), so at sequencing density the check runs in its marker mode instead
+/// (`DensePanel`, `decide_dense`).
 pub fn too_dense(chip_bp: &[i64]) -> bool {
     if chip_bp.len() < 2 { return false; }
     let span_mb = (chip_bp[chip_bp.len() - 1] - chip_bp[0]).max(1) as f64 / 1e6;
@@ -467,7 +468,13 @@ fn ranges(o: &[u8]) -> Vec<(usize, usize)> {
     out
 }
 
-/// Sequencing density: the check reads ancestry at markers chosen from the panel
+/// Sequencing density: the check reads ancestry at markers chosen from the panel.
+/// Its junction scores use the templates' allele frequencies with the same
+/// pseudo-count as the array mode (the research prototype read raw frequencies of
+/// every labelled sample there); this mode is validated on its own measurements,
+/// not by parity with the prototype.
+///
+/// The check reads ancestry at markers chosen from the panel
 /// (per `MARKER_BIN_BP` bin of the chip sites, the first whose template minor-allele
 /// frequency is at least `MARKER_MAF`; the panel is read once in `SCAN_CHUNK`-site
 /// pieces to find them), and places each change at the heterozygote, among ALL
@@ -633,16 +640,19 @@ pub fn correct_scaffold(check: &Checker, phased: &mut [u8], pq: &mut [u8], n_sit
         if !d.applied || d.flips.is_empty() { continue; }
         n_done += 1;
         if !apply { continue; }
+        // PQ relates each segment-HMM heterozygote to the previous one: the first such
+        // heterozygote at or after each cut now has the other relation. Found on the PQ
+        // as it stands before any is cleared, so one cut never shadows the next.
+        let mut stale: Vec<usize> = Vec::new();
         for &(a, b) in &d.flips {
-            for v in a..b { phased.swap(v * n_haps + 2 * s, v * n_haps + 2 * s + 1); }
-            // PQ relates each segment-HMM heterozygote to the previous one; the first such
-            // heterozygote at or after each cut now has the other relation
             for cut in [a, b] {
-                if let Some(v) = (cut..n).find(|&v| pq[v * n_samples + s] != super::PQ_NONE) {
-                    pq[v * n_samples + s] = super::PQ_NONE;
-                }
+                if let Some(v) = (cut..n).find(|&v| pq[v * n_samples + s] != super::PQ_NONE) { stale.push(v); }
             }
         }
+        for &(a, b) in &d.flips {
+            for v in a..b { phased.swap(v * n_haps + 2 * s, v * n_haps + 2 * s + 1); }
+        }
+        for v in stale { pq[v * n_samples + s] = super::PQ_NONE; }
     }
     n_done
 }
