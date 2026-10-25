@@ -36,6 +36,7 @@ use noodles_bgzf::io::{Reader as BgzfReader, multithreaded_writer};
 use crate::io::bcf_encode::{
     BCF_MAGIC,
     INFO_IMP_IDX, INFO_AF_IDX, INFO_AN_IDX, INFO_AC_IDX, INFO_DR2_IDX,
+    FMT_DS_IDX, FMT_AP1_IDX, FMT_AP2_IDX, unit_prob,
 };
 
 const TY_INT8: u8 = 1;
@@ -428,12 +429,31 @@ fn merge_one_record(
             batch_indiv_offs[b] += 3;
         }
 
+        // Imputed DS/AP1/AP2 are written clamped, exactly as the non-batched encoder does
+        // (`bcf_encode::unit_prob`), from the intermediates' raw per-hap values in `aps`.
+        let key = header[1];
+        let clamp_field = !is_chip && ty == TY_FLOAT && n_per_sample == 1
+            && (key == FMT_DS_IDX || key == FMT_AP1_IDX || key == FMT_AP2_IDX);
         // Concat data bytes from each batch (in batch order = sample order).
+        let mut s_glob = 0usize;
         for (b, &k) in batch_sample_counts.iter().enumerate() {
             let data_len = k * bytes_per_sample;
             let bi = view(&rec_bufs[b]).indiv;
-            out.extend_from_slice(&bi[batch_indiv_offs[b]..batch_indiv_offs[b] + data_len]);
+            if clamp_field {
+                for s in 0..k {
+                    let raw = f32::from_le_bytes(bi[batch_indiv_offs[b] + 4 * s..batch_indiv_offs[b] + 4 * s + 4].try_into().unwrap());
+                    let (a1, a2) = (aps.0[s_glob + s], aps.1[s_glob + s]);
+                    let x = if key == FMT_AP1_IDX { unit_prob(a1) }
+                        else if key == FMT_AP2_IDX { unit_prob(a2) }
+                        else if n_fmt == 4 { unit_prob(a1) + unit_prob(a2) }
+                        else if raw > 2.0 { 2.0 } else if raw < 0.0 { 0.0 } else { raw };
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            } else {
+                out.extend_from_slice(&bi[batch_indiv_offs[b]..batch_indiv_offs[b] + data_len]);
+            }
             batch_indiv_offs[b] += data_len;
+            s_glob += k;
         }
     }
     if add_gp {

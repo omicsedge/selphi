@@ -76,7 +76,7 @@ pub fn write_bcf_header(
         writeln!(header_text, "##FORMAT=<ID=GP,Number=G,Type=Float,Description=\"{}\",IDX={}>",
             crate::io::vcf_fmt::GP_DESCRIPTION, FMT_GP_IDX).unwrap();
     }
-    writeln!(header_text, "{}", contig_field).unwrap();
+    writeln!(header_text, "{}", contig_lines_with_idx(contig_field)).unwrap();
     write!(header_text, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT").unwrap();
     for name in sample_names { write!(header_text, "\t{}", name).unwrap(); }
     writeln!(header_text).unwrap();
@@ -221,6 +221,18 @@ fn r4b_ap(alt_probs: &[f32], tile_n: usize, v: usize, s: usize, hc: Option<&R4bH
     (alt_probs[(s * 2) * tile_n + v], alt_probs[(s * 2 + 1) * tile_n + v])
 }
 
+/// A haplotype ALT probability as written to BCF FORMAT DS/AP1/AP2: clamped to [0, 1]. The
+/// interpolated f32 values can exceed 1 by a few ulps (up to 1.0000019 measured), so the raw
+/// DS reached 2.0000019 and plink2 refused every such BCF ("invalid DS field"); the VCF text
+/// writer already caps DS at 2 and prints AP at three decimals, PGEN clamps. A NaN stays NaN.
+/// INFO AC/AF/DR2 are still computed from the unclamped values, as in the VCF. Only the FINAL
+/// record is clamped: `--sample-batch-size` intermediates keep the raw values (the merger
+/// recomputes INFO from them) and `bcf_merge` clamps when it writes the merged record.
+#[inline]
+pub(crate) fn unit_prob(x: f32) -> f32 {
+    if x > 1.0 { 1.0 } else if x < 0.0 { 0.0 } else { x }
+}
+
 /// Emit the imputed GT FORMAT field: 2 int8 alleles/sample, hardcalled from the
 /// per-hap ALT probabilities at the 0.5 threshold (hap 1 unphased, hap 2 phased).
 #[inline]
@@ -239,31 +251,32 @@ fn emit_gt_imputed(buf: &mut Vec<u8>, alt_probs: &[f32], tile_n: usize, v: usize
 
 /// Emit the imputed DS FORMAT field: one float32 dosage (`ap1 + ap2`) per sample.
 #[inline]
-fn emit_ds_imputed(buf: &mut Vec<u8>, alt_probs: &[f32], tile_n: usize, v: usize, n_samples: usize, hc: Option<&R4bHardcall>) {
+fn emit_ds_imputed(buf: &mut Vec<u8>, alt_probs: &[f32], tile_n: usize, v: usize, n_samples: usize, hc: Option<&R4bHardcall>, clamp: bool) {
     encode_typed_int8(buf, FMT_DS_IDX as i32);
     buf.push(0x10 | TY_FLOAT); // n=1, type=float
     for s in 0..n_samples {
         let (ap1, ap2) = r4b_ap(alt_probs, tile_n, v, s, hc);
-        buf.extend_from_slice(&(ap1 + ap2).to_le_bytes());
+        let d = if clamp { unit_prob(ap1) + unit_prob(ap2) } else { ap1 + ap2 };
+        buf.extend_from_slice(&d.to_le_bytes());
     }
 }
 
 /// Emit the imputed AP1 + AP2 FORMAT fields: per-hap ALT dose float32s.
 #[inline]
-fn emit_ap_imputed(buf: &mut Vec<u8>, alt_probs: &[f32], tile_n: usize, v: usize, n_samples: usize, hc: Option<&R4bHardcall>) {
+fn emit_ap_imputed(buf: &mut Vec<u8>, alt_probs: &[f32], tile_n: usize, v: usize, n_samples: usize, hc: Option<&R4bHardcall>, clamp: bool) {
     // AP1: key=AP1_IDX, type=float32, n_per_sample=1
     encode_typed_int8(buf, FMT_AP1_IDX as i32);
     buf.push(0x10 | TY_FLOAT);
     for s in 0..n_samples {
         let (ap1, _) = r4b_ap(alt_probs, tile_n, v, s, hc);
-        buf.extend_from_slice(&ap1.to_le_bytes());
+        buf.extend_from_slice(&(if clamp { unit_prob(ap1) } else { ap1 }).to_le_bytes());
     }
     // AP2: key=AP2_IDX, type=float32, n_per_sample=1
     encode_typed_int8(buf, FMT_AP2_IDX as i32);
     buf.push(0x10 | TY_FLOAT);
     for s in 0..n_samples {
         let (_, ap2) = r4b_ap(alt_probs, tile_n, v, s, hc);
-        buf.extend_from_slice(&ap2.to_le_bytes());
+        buf.extend_from_slice(&(if clamp { unit_prob(ap2) } else { ap2 }).to_le_bytes());
     }
 }
 
@@ -353,9 +366,9 @@ pub fn encode_imputed_record(
 
     let indiv_start = buf.len();
     emit_gt_imputed(buf, alt_probs, tile_n, v, n_samples, hc);
-    emit_ds_imputed(buf, alt_probs, tile_n, v, n_samples, hc);
+    emit_ds_imputed(buf, alt_probs, tile_n, v, n_samples, hc, true);
     if !no_ap {
-        emit_ap_imputed(buf, alt_probs, tile_n, v, n_samples, hc);
+        emit_ap_imputed(buf, alt_probs, tile_n, v, n_samples, hc, true);
     }
     if gp {
         emit_gp(buf, (0..n_samples).map(|s| r4b_ap(alt_probs, tile_n, v, s, hc)));
@@ -417,9 +430,9 @@ pub fn encode_imputed_record_partial(
 
     let indiv_start = buf.len();
     emit_gt_imputed(buf, alt_probs, tile_n, v, n_samples_in_batch, hc);
-    emit_ds_imputed(buf, alt_probs, tile_n, v, n_samples_in_batch, hc);
+    emit_ds_imputed(buf, alt_probs, tile_n, v, n_samples_in_batch, hc, false);
     if !no_ap {
-        emit_ap_imputed(buf, alt_probs, tile_n, v, n_samples_in_batch, hc);
+        emit_ap_imputed(buf, alt_probs, tile_n, v, n_samples_in_batch, hc, false);
     }
     finalize_record(buf, shared_start, indiv_start);
 }
@@ -605,10 +618,54 @@ pub fn dedup_contig_lines(contig_field: &str) -> String {
     }).collect::<Vec<_>>().join("\n")
 }
 
+/// The `##contig` lines of a BCF header, each carrying `IDX=k` in header order (the BCF `rid`
+/// every record is written with, see `contig_names_from_header_lines`). htslib and plink2 require
+/// IDX on every dictionary line once any line has it, and FILTER/INFO/FORMAT always do here; a
+/// multi-chromosome header assembled from per-chromosome lines had none (plink2: "Some
+/// contig/FILTER/INFO/FORMAT line(s) ... have IDX keys, and others don't"). An existing IDX is
+/// replaced, so a single-chromosome line `##contig=<ID=22,IDX=0>` is written unchanged.
+pub fn contig_lines_with_idx(contig_field: &str) -> String {
+    let mut k = 0usize;
+    contig_field.lines().map(|l| {
+        let Some(body) = l.strip_prefix("##contig=<").and_then(|b| b.strip_suffix('>')) else { return l.to_string() };
+        let kept: Vec<&str> = body.split(',').filter(|f| !(f.starts_with("IDX=") && f[4..].bytes().all(|c| c.is_ascii_digit()) && f.len() > 4)).collect();
+        let line = format!("##contig=<{},IDX={}>", kept.join(","), k);
+        k += 1;
+        line
+    }).collect::<Vec<_>>().join("\n")
+}
+
 pub fn contig_names_from_header_lines(contig_field: &str) -> Vec<String> {
     contig_field.lines().filter_map(|l| {
         let s = l.strip_prefix("##contig=<ID=")?;
         let e = s.find(|c| c == ',' || c == '>')?;
         Some(s[..e].to_string())
     }).collect()
+}
+
+#[cfg(test)]
+mod contig_idx_tests {
+    use super::{contig_lines_with_idx, unit_prob};
+    #[test]
+    fn bcf_probabilities_are_clamped() {
+        assert_eq!(unit_prob(1.000_001_9), 1.0);
+        assert_eq!(unit_prob(-1e-7), 0.0);
+        assert_eq!(unit_prob(0.25), 0.25);
+        assert!(unit_prob(f32::NAN).is_nan());
+        assert!((unit_prob(1.000_001_9) + unit_prob(1.000_001_9)) <= 2.0);
+    }
+    #[test]
+    fn contig_lines_get_idx_in_header_order() {
+        // single-chromosome panel line already carrying IDX=0: unchanged
+        assert_eq!(contig_lines_with_idx("##contig=<ID=22,IDX=0>"), "##contig=<ID=22,IDX=0>");
+        assert_eq!(contig_lines_with_idx("##contig=<ID=22,length=50818468,IDX=0>"), "##contig=<ID=22,length=50818468,IDX=0>");
+        // multi-chromosome lines without IDX get 0, 1, ...
+        assert_eq!(contig_lines_with_idx("##contig=<ID=21>\n##contig=<ID=22,length=50818468>"),
+                   "##contig=<ID=21,IDX=0>\n##contig=<ID=22,length=50818468,IDX=1>");
+        // per-chromosome lines each declaring IDX=0 are renumbered
+        assert_eq!(contig_lines_with_idx("##contig=<ID=21,IDX=0>\n##contig=<ID=22,IDX=0>"),
+                   "##contig=<ID=21,IDX=0>\n##contig=<ID=22,IDX=1>");
+        // a field merely starting with IDX that is not IDX=<digits> is kept
+        assert_eq!(contig_lines_with_idx("##contig=<ID=X,IDXNOTE=a>"), "##contig=<ID=X,IDXNOTE=a,IDX=0>");
+    }
 }
