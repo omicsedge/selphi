@@ -11,6 +11,7 @@
 //! arena with offsets. Readers hand out `&str` borrowed from the arenas; nothing is
 //! copied on access. The on-disk format is unchanged.
 
+use std::collections::HashMap;
 use std::ops::Index;
 
 /// End offsets into an arena: u32 while the arena is below 4 GiB, u64 once it grows past
@@ -102,11 +103,12 @@ impl StrColumn {
     /// The pieces of `text` between `'\n'`s, exactly as `text.split('\n')` gives them
     /// (a trailing separator ends with an empty piece; `""` is one empty piece), without
     /// the empty ones when `filter_empty`. The separators are squeezed out of `text` in
-    /// place, so the column costs the text's own allocation plus its offsets.
+    /// place, so the column costs the text's own allocation plus its offsets, and offsets
+    /// are reserved for the kept pieces only: a run of blank separators reserves nothing
+    /// (one ID followed by 64 MiB of them reserved 256 MiB of offsets before).
     pub fn split_lines(text: String, filter_empty: bool) -> Self {
         let mut bytes = text.into_bytes();
-        let n_pieces = memchr::memchr_iter(b'\n', &bytes).count() + 1;
-        let mut ends = Ends::with_capacity(n_pieces + 1);
+        let mut ends = Ends::with_capacity(Self::kept_pieces(&bytes, filter_empty) + 1);
         let (mut r, mut w) = (0usize, 0usize);
         loop {
             let sep = memchr::memchr(b'\n', &bytes[r..]).map(|k| r + k);
@@ -129,6 +131,17 @@ impl StrColumn {
         // every offset is a character boundary.
         let text = String::from_utf8(bytes).expect("removing '\\n' keeps UTF-8 valid");
         StrColumn { text, ends }
+    }
+
+    /// How many pieces [`split_lines`](Self::split_lines) keeps from `bytes`: every
+    /// `'\n'`-separated piece, or only the non-empty ones when `filter_empty`.
+    fn kept_pieces(bytes: &[u8], filter_empty: bool) -> usize {
+        let (mut kept, mut start) = (0usize, 0usize);
+        for sep in memchr::memchr_iter(b'\n', bytes) {
+            kept += usize::from(!filter_empty || sep > start);
+            start = sep + 1;
+        }
+        kept + usize::from(!filter_empty || bytes.len() > start)
     }
 
     #[inline]
@@ -215,6 +228,11 @@ pub struct VariantIndex {
     chroms: Vec<String>,
     /// Per variant, its name in `chroms`; empty while every variant carries `chroms[0]`.
     chrom_of: Vec<u32>,
+    /// While the index is built: each name in `chroms` to its number, so a name that is
+    /// not the previous variant's is found in constant time (searching `chroms` was
+    /// quadratic in the number of contigs: 100,000 took 12 s to parse). Cleared by
+    /// `shrink_to_fit`, and rebuilt by `push` if a name has to be looked up after that.
+    chrom_ids: HashMap<String, u32>,
 }
 
 impl VariantIndex {
@@ -227,6 +245,7 @@ impl VariantIndex {
             alleles: StrColumn::with_capacity(2 * n, allele_bytes),
             chroms: Vec::new(),
             chrom_of: Vec::new(),
+            chrom_ids: HashMap::new(),
         }
     }
 
@@ -237,10 +256,7 @@ impl VariantIndex {
         let prev = if n == 0 { None } else if self.chrom_of.is_empty() { Some(0) } else { Some(self.chrom_of[n - 1] as usize) };
         let ci = match prev {
             Some(p) if self.chroms[p] == chr => p,
-            _ => match self.chroms.iter().position(|c| c == chr) {
-                Some(ci) => ci,
-                None => { self.chroms.push(chr.to_string()); self.chroms.len() - 1 }
-            },
+            _ => self.chrom_id(chr),
         };
         if !self.chrom_of.is_empty() || ci != 0 {
             if self.chrom_of.is_empty() { self.chrom_of = vec![0; n]; }
@@ -249,6 +265,18 @@ impl VariantIndex {
         self.pos.push(pos);
         self.alleles.push(ref_allele);
         self.alleles.push(alt_allele);
+    }
+
+    /// The number of chromosome name `chr`, added after the others if it is new.
+    fn chrom_id(&mut self, chr: &str) -> usize {
+        if self.chrom_ids.len() != self.chroms.len() {
+            self.chrom_ids = self.chroms.iter().enumerate().map(|(i, c)| (c.clone(), i as u32)).collect();
+        }
+        if let Some(&ci) = self.chrom_ids.get(chr) { return ci as usize; }
+        let ci = u32::try_from(self.chroms.len()).expect("more than 2^32 chromosome names");
+        self.chroms.push(chr.to_string());
+        self.chrom_ids.insert(chr.to_string(), ci);
+        ci as usize
     }
 
     #[inline]
@@ -300,17 +328,21 @@ impl VariantIndex {
     /// The distinct chromosome names, in order of first appearance.
     pub fn chromosomes(&self) -> &[String] { &self.chroms }
 
+    /// Release spare capacity and the name lookup used while building.
     pub fn shrink_to_fit(&mut self) {
         self.pos.shrink_to_fit();
         self.alleles.shrink_to_fit();
         self.chroms.shrink_to_fit();
         self.chrom_of.shrink_to_fit();
+        self.chrom_ids = HashMap::new();
     }
 
     /// Bytes this index holds on the heap.
     pub fn heap_bytes(&self) -> usize {
         self.pos.capacity() * 8 + self.alleles.heap_bytes()
             + self.chroms.iter().map(|c| c.capacity() + 24).sum::<usize>() + self.chrom_of.capacity() * 4
+            + self.chrom_ids.keys().map(|c| c.capacity()).sum::<usize>()
+            + self.chrom_ids.capacity() * (std::mem::size_of::<String>() + 4)
     }
 }
 
@@ -337,6 +369,7 @@ mod tests {
         for text in ["", "\n", "a", "a\n", "\na", "a\n\nb", "rs1\nrs2\n\nrs4\n", "\n\n\n", "x-1-A-C\ny-2-ÄÖ-Ü\n"] {
             for filter in [false, true] {
                 let want: Vec<&str> = text.split('\n').filter(|s| !filter || !s.is_empty()).collect();
+                assert_eq!(StrColumn::kept_pieces(text.as_bytes(), filter), want.len(), "{text:?} filter={filter}");
                 let col = StrColumn::split_lines(text.to_string(), filter);
                 assert_eq!(col.len(), want.len(), "{text:?} filter={filter}");
                 assert_eq!(col.iter().collect::<Vec<_>>(), want, "{text:?} filter={filter}");
@@ -348,6 +381,18 @@ mod tests {
                 assert_eq!(col, want.iter().collect::<StrColumn>());
             }
         }
+    }
+
+    /// A filtered ID column of one ID among a million blank separators: offsets are
+    /// reserved for the one kept entry, not for every separator.
+    #[test]
+    fn blank_separators_reserve_no_offsets() {
+        let text = format!("\n\n{}rs1{}", "\n".repeat(1 << 19), "\n".repeat(1 << 19));
+        assert_eq!(StrColumn::kept_pieces(text.as_bytes(), true), 1);
+        assert_eq!(StrColumn::kept_pieces(text.as_bytes(), false), (1 << 20) + 3);
+        let col = StrColumn::split_lines(text, true);
+        assert_eq!((col.len(), &col[0]), (1, "rs1"));
+        assert_eq!(col.heap_bytes(), 3 + 2 * 4);
     }
 
     #[test]
@@ -419,6 +464,37 @@ mod tests {
         assert!(v.chrom_of.is_empty());
         assert_eq!(v.chr(n - 1), "20");
         assert!(v.heap_bytes() <= n * (8 + 2 + 2 * 4) + 64, "{} bytes for {n} SNPs", v.heap_bytes());
+    }
+
+    /// An index of 100,000 contigs, each returned to once after the next one opens, parses
+    /// in time linear in its size (searching the names linearly took 12 s for 100,000
+    /// contigs of one variant each); names keep their first-appearance numbers, and a
+    /// push after `shrink_to_fit` (which drops the lookup) finds old and new names.
+    #[test]
+    fn many_contigs_intern_in_linear_time() {
+        let n = 100_000usize;
+        let name = |i: usize| format!("contig_{i:06}");
+        let mut want: Vec<(String, i64)> = Vec::with_capacity(2 * n);
+        for i in 0..n {
+            want.push((name(i), 2 * i as i64));
+            if i > 0 { want.push((name(i - 1), 2 * i as i64 + 1)); }
+        }
+        let mut vbin = Vec::new();
+        for (c, p) in &want { crate::srp::helpers::push_variant_vbin(&mut vbin, *p, c, "A", "C").unwrap(); }
+        crate::srp::helpers::finish_vbin(&mut vbin, want.len());
+        let t = std::time::Instant::now();
+        let mut v = crate::srp::helpers::parse_variants_bin(&vbin, want.len()).unwrap();
+        let secs = t.elapsed().as_secs_f64();
+        assert!(secs < 5.0, "{n} contigs took {secs:.2} s to parse");
+        assert_eq!(v.chromosomes().len(), n);
+        assert!(v.chromosomes().iter().enumerate().all(|(i, c)| *c == name(i)), "first-appearance order");
+        for (i, (c, p)) in want.iter().enumerate() { assert_eq!((v.chr(i), v.pos(i)), (c.as_str(), *p), "variant {i}"); }
+        assert!(v.chrom_ids.is_empty(), "parse_variants_bin shrinks: no lookup kept");
+        v.push(&name(7), -1, "G", "T");
+        v.push("contig_new", -2, "G", "T");
+        let m = want.len();
+        assert_eq!((v.chr(m), v.chr(m + 1), v.chromosomes().len()), (name(7).as_str(), "contig_new", n + 1));
+        assert_eq!(v.chromosomes()[n], "contig_new");
     }
 
     #[test]

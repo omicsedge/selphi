@@ -334,13 +334,15 @@ fn compute_estimate_mb(
     let ref_bm_mb = (n_chip * n_ref_words * 8) as f64 / 1e6;
     let targ_mb = (n_chip * n_haps) as f64 / 1e6;
     let preload_mb = 500.0;
-    // The loaded panel's variant table: one `Variant` (chr/ref/alt Strings + pos)
-    // plus ids per reference variant, resident for the whole run. Never had a
-    // term here, which is why the estimate sat ~4.5 GB under the measurement on
-    // TOPMed once everything else had been fixed: RSS is 4,317 MB right after
-    // "Loaded SRP: 17,900,635 variants" = ~241 B/variant (340 MB / 1.07M on 1KG
-    // chr22 = ~318 B, the difference being fixed reader overhead). 241 is used.
-    let srp_table_mb = (n_ref_variants as f64 * 241.0) / 1e6;
+    // The loaded panel's variant table, resident for the whole run: the compact
+    // index (srp::index: positions, one REF/ALT arena with offsets, each chromosome
+    // name once) plus the variant-ID and original-ID columns (an arena + offsets
+    // each). RSS right after "Loaded SRP: 17,900,635 variants" on TOPMed chr20 is
+    // 1,396 MiB = ~82 B/variant (v3 chr20 450 MiB / 4.63M = ~102 B, 1KG chr22
+    // 180 MiB / 1.07M = ~176 B, the difference being fixed reader overhead). 82 is
+    // used. The per-variant String layout it replaced was 4,455 MiB on that load
+    // (this term charged 241 B then).
+    let srp_table_mb = (n_ref_variants as f64 * 82.0) / 1e6;
 
     // Per-thread (= per in-flight target) working set of the PBWT + HMM stage.
     //
