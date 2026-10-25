@@ -10,5 +10,5 @@
 <text x="612.0" y="160" fill="#1f2328" font-size="14" font-weight="700">29.1 min</text>
 <text x="612.0" y="146" fill="#57606a" font-size="10">29:04 (mm:ss)</text>
 <text x="16" y="210" fill="#1a7f37" font-size="13" font-weight="700">Selphi 2 is 2.1&#215; faster end-to-end (15.0 min saved)</text>
-<text x="16" y="232" fill="#57606a" font-size="12">Peak memory 6.2 GB vs 45.3 GB (largest chromosome)</text>
+<text x="16" y="232" fill="#57606a" font-size="12">Peak memory 5.1 GB vs 45.3 GB (largest chromosome)</text>
 </svg>
