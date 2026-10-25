@@ -1437,8 +1437,8 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
     let ancestry_active = panel_anc.is_some() && target_anc.is_some();
     if ancestry_active {
         selphi_step!("Ancestry-aware PBWT active (strength={:.2})", args.ancestry_strength);
-    } else if panel_anc.is_some() || target_anc.is_some() {
-        selphi_info!("  Note: both --panel-ancestry and --target-ancestry are required to activate ancestry reweighting; running baseline.");
+    } else if (panel_anc.is_some() || target_anc.is_some()) && !(args.local_ancestry && panel_anc.is_some()) {
+        selphi_info!("  Note: --panel-ancestry needs --local-ancestry (or --target-ancestry with --precompute-candidates) to reweight candidates; running baseline.");
     }
 
     // Per-window candidate selection is the default. Each window picks its
@@ -1466,6 +1466,9 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
     if cand_ancestry.is_some() && precomputed_candidates.is_none() {
         selphi_step!("Ancestry prior on the per-window candidate ranking (strength {:.2}, smooth r={})",
             args.ancestry_strength, args.local_ancestry_smooth);
+        if args.export_local_ancestry {
+            selphi_info!("  Note: --export-local-ancestry writes the chromosome-level estimate of --precompute-candidates; the per-window estimates are not exported.");
+        }
     }
 
     // ref_bm_imp stays alive for per-window imputation extraction.

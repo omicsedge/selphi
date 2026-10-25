@@ -240,12 +240,18 @@ pub struct Args {
     /// selphi computes per-target-hap × per-PBWT-step ancestry probabilities
     /// directly from the coded-steps match structure already being built for
     /// PBWT candidate selection. Requires --panel-ancestry (panel hap labels).
-    /// Orthogonal to --target-ancestry: set one or the other.
+    /// Orthogonal to --target-ancestry: set one or the other. Each imputation window
+    /// infers it from its own coded steps (with --precompute-candidates: once per
+    /// chromosome). It changes only which candidates survive the --max-candidates cut,
+    /// so it does nothing on panels small enough for every candidate to fit (1000 Genomes).
+    /// Measured on the 75,552-haplotype panel: +0.002 R2 for admixed people, slight
+    /// losses on rare variants for some single-population groups — hence opt-in.
     #[arg(long)]
     pub local_ancestry: bool,
 
     /// Export inferred local ancestry to a TSV next to --out. Only active
-    /// when --local-ancestry is set. Format: `hap_idx\tstep\tstart_chip_var\tAFR\tEUR\tEAS\tSAS\tAMR`.
+    /// with --local-ancestry and --precompute-candidates (the chromosome-level estimate).
+    /// Format: `hap_idx\tstep\tstart_chip_var\tAFR\tEUR\tEAS\tSAS\tAMR`.
     #[arg(long)]
     pub export_local_ancestry: bool,
 
