@@ -462,6 +462,7 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
     if args.pgen { ignored.push("--pgen"); }
     if args.selfdecode { ignored.push("--selfdecode"); }
     if args.all_formats { ignored.push("--all-formats"); }
+    if args.gp { ignored.push("--gp"); }
     if !ignored.is_empty() {
         selphi_info!("  NOTE: --phase-panel ignores {} (output = phased VCF + optional --srp/--bref3).",
             ignored.join(", "));

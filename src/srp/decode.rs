@@ -199,10 +199,11 @@ fn format_bcf(out: &mut Vec<u8>, s: &SiteRec, n_samples: usize) {
 
 // ------------------------------- headers ------------------------------------
 
-fn vcf_header(sample_ids: &[String], contigs: &[Contig]) -> Vec<u8> {
+fn vcf_header(sample_ids: &[String], contigs: &[Contig], extra_header: &[String]) -> Vec<u8> {
     let mut h = String::with_capacity(256 + sample_ids.len() * 12);
     h.push_str("##fileformat=VCFv4.2\n");
     h.push_str(&format!("##source=Selphi {} decode\n", env!("CARGO_PKG_VERSION")));
+    for l in extra_header { h.push_str(l); h.push('\n'); }
     h.push_str("##FILTER=<ID=PASS,Description=\"All filters passed\">\n");
     for (name, len) in contigs {
         match len {
@@ -217,10 +218,11 @@ fn vcf_header(sample_ids: &[String], contigs: &[Contig]) -> Vec<u8> {
     h.into_bytes()
 }
 
-fn bcf_header(sample_ids: &[String], contigs: &[Contig]) -> Vec<u8> {
+fn bcf_header(sample_ids: &[String], contigs: &[Contig], extra_header: &[String]) -> Vec<u8> {
     let mut t = String::with_capacity(256 + sample_ids.len() * 12);
     t.push_str("##fileformat=VCFv4.2\n");
     t.push_str(&format!("##source=Selphi {} decode\n", env!("CARGO_PKG_VERSION")));
+    for l in extra_header { t.push_str(l); t.push('\n'); }
     t.push_str(&format!("##FILTER=<ID=PASS,Description=\"All filters passed\",IDX={}>\n", FILTER_PASS_IDX));
     t.push_str(&format!("##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\",IDX={}>\n", FMT_GT_IDX));
     for (i, (name, len)) in contigs.iter().enumerate() {
@@ -253,6 +255,7 @@ fn run_pipeline(
     sample_ids: &[String],
     contigs: &[Contig],
     threads: usize,
+    extra_header: &[String],
     mut produce: impl FnMut() -> Result<Option<Vec<SiteRec>>, String>,
 ) -> Result<u64, String> {
     let n_samples = sample_ids.len();
@@ -267,8 +270,8 @@ fn run_pipeline(
     let mut w = BufWriter::with_capacity(8 << 20, bgzf);
 
     let header = match fmt {
-        OutFmt::VcfGz => vcf_header(sample_ids, contigs),
-        OutFmt::Bcf => bcf_header(sample_ids, contigs),
+        OutFmt::VcfGz => vcf_header(sample_ids, contigs, extra_header),
+        OutFmt::Bcf => bcf_header(sample_ids, contigs, extra_header),
     };
     w.write_all(&header).map_err(|e| e.to_string())?;
 
@@ -304,16 +307,17 @@ fn run_pipeline(
 // --------------------------------- drivers -----------------------------------
 
 /// Public entry: decode a BREF3 or SRP panel to VCF.gz / BCF. Output format is
-/// chosen by `output`'s extension (`.bcf` → BCF, else BGZF VCF).
-pub fn decode_panel(source: &Path, output: &Path, threads: usize) -> Result<(), String> {
+/// chosen by `output`'s extension (`.bcf` → BCF, else BGZF VCF). `extra_header`
+/// (`--header-line`) follows `##source` in the header.
+pub fn decode_panel(source: &Path, output: &Path, threads: usize, extra_header: &[String]) -> Result<(), String> {
     let t0 = Instant::now();
     let fmt = if output.extension().is_some_and(|e| e == "bcf") { OutFmt::Bcf } else { OutFmt::VcfGz };
     let src = source.to_string_lossy();
 
     let (nvar, n_samples, n_haps) = if src.ends_with(".bref3") {
-        decode_bref3(source, output, fmt, threads)?
+        decode_bref3(source, output, fmt, threads, extra_header)?
     } else if src.ends_with(".srp") {
-        decode_srp(source, output, fmt, threads)?
+        decode_srp(source, output, fmt, threads, extra_header)?
     } else {
         return Err(format!("decode_panel: unsupported source {} (want .bref3 or .srp)", src));
     };
@@ -331,7 +335,7 @@ pub fn decode_panel(source: &Path, output: &Path, threads: usize) -> Result<(), 
 /// Variants per formatting batch. Bounds peak memory at ~`BATCH × n_haps` bytes.
 const BATCH: usize = 1024;
 
-fn decode_bref3(source: &Path, output: &Path, fmt: OutFmt, threads: usize) -> Result<(u64, usize, usize), String> {
+fn decode_bref3(source: &Path, output: &Path, fmt: OutFmt, threads: usize, extra_header: &[String]) -> Result<(u64, usize, usize), String> {
     // Pass 1 (meta-only, no allele decode): collect the contig order so the
     // header lists every CHROM a record will reference.
     let mut contigs: Vec<Contig> = Vec::new();
@@ -392,12 +396,12 @@ fn decode_bref3(source: &Path, output: &Path, fmt: OutFmt, threads: usize) -> Re
         }
     };
 
-    let nvar = run_pipeline(output, fmt, &sample_ids, &contigs, threads, produce)?;
+    let nvar = run_pipeline(output, fmt, &sample_ids, &contigs, threads, extra_header, produce)?;
     decoder.join().map_err(|_| "BREF3 decoder thread panicked".to_string())?;
     Ok((nvar, n_samples, n_haps))
 }
 
-fn decode_srp(source: &Path, output: &Path, fmt: OutFmt, threads: usize) -> Result<(u64, usize, usize), String> {
+fn decode_srp(source: &Path, output: &Path, fmt: OutFmt, threads: usize, extra_header: &[String]) -> Result<(u64, usize, usize), String> {
     let mut reader = SrpReader::open(source, 0).map_err(|e| e.to_string())?;
     reader.load_tiled();
     let n_haps = reader.n_haps();
@@ -443,7 +447,7 @@ fn decode_srp(source: &Path, output: &Path, fmt: OutFmt, threads: usize) -> Resu
         Ok(Some(batch))
     };
 
-    let nvar = run_pipeline(output, fmt, &sample_ids, &contigs, threads, produce)?;
+    let nvar = run_pipeline(output, fmt, &sample_ids, &contigs, threads, extra_header, produce)?;
     Ok((nvar, n_samples, n_haps))
 }
 

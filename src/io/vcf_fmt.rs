@@ -5,7 +5,7 @@
 //! per-batch writer (`vcf_batch`), and the sample-merger (`vcf_merge`). This is
 //! the single shared copy; every caller emits byte-identical output. The
 //! `--header-line` check and writer and the `--gp` arithmetic live here too, for
-//! every result writer (imputation, phase-only, panel phasing, lcWGS).
+//! every result writer (imputation, phase-only, panel phasing, lcWGS, panel decode).
 
 use std::io::Write;
 
@@ -16,9 +16,13 @@ use std::io::Write;
 const RESERVED_HEADER_KEYS: [&str; 5] = ["fileformat", "INFO", "FORMAT", "FILTER", "contig"];
 
 /// Check one `--header-line` value: a single `##key=value` line, `key` not one of
-/// the lines Selphi writes itself ([`RESERVED_HEADER_KEYS`]). Returns the value
-/// unchanged (clap value parser). A `##` line without `key=` is dropped by htslib
-/// with an error, so it is refused here instead.
+/// the lines Selphi writes itself ([`RESERVED_HEADER_KEYS`]), and not a second
+/// `##source` naming Selphi (every result header already has Selphi's own, and a
+/// copy would repeat or contradict it; another program's `##source=...` is kept).
+/// A value that opens with `<` must be a structured value htslib reads back
+/// exactly as written ([`structured_fields`]). Returns the value unchanged (clap
+/// value parser). A `##` line without `key=` is dropped by htslib with an error,
+/// so it is refused here instead.
 pub fn parse_header_line(s: &str) -> Result<String, String> {
     if s.contains(['\n', '\r']) {
         return Err("a header line must be a single line (no newline or carriage return)".into());
@@ -26,14 +30,123 @@ pub fn parse_header_line(s: &str) -> Result<String, String> {
     let Some(body) = s.strip_prefix("##") else {
         return Err(format!("a header line must start with \"##\" (got \"{s}\")"));
     };
-    let key = match body.split_once('=') {
-        Some((k, _)) if !k.is_empty() && !k.contains(char::is_whitespace) => k,
+    let (key, value) = match body.split_once('=') {
+        Some((k, v)) if !k.is_empty() && !k.contains(char::is_whitespace) => (k, v),
         _ => return Err(format!("a header line must have the form ##key=value (got \"{s}\")")),
     };
     if let Some(r) = RESERVED_HEADER_KEYS.iter().find(|r| r.eq_ignore_ascii_case(key)) {
         return Err(format!("##{r} lines are written by Selphi itself and cannot be added (got \"{s}\")"));
     }
+    if key.eq_ignore_ascii_case("source") && value.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("selphi")) {
+        return Err(format!("Selphi writes its own ##source line; a second one naming Selphi cannot be added (got \"{s}\")"));
+    }
+    if value.starts_with('<') {
+        structured_fields(value).map_err(|e| format!("{e} (got \"{s}\")"))?;
+    }
     Ok(s.to_string())
+}
+
+/// The `(key, value as written)` fields of a structured header value
+/// `<key=value,key=value,...>`, or why htslib (bcftools, pysam, cyvcf2) would not
+/// read it back unchanged and without a warning. The grammar is htslib's own
+/// (`bcf_hdr_parse_line`) minus the input it repairs or rewrites: each key is
+/// `[A-Za-z_][0-9A-Za-z_.]*` directly followed by `=`; a value is `"..."` (`\`
+/// escapes the next character), `[...]`, or unquoted text up to the next `,` or
+/// the closing `>` (nested `<...>` allowed); no space at the start or end of a
+/// value (htslib drops it), no `IDX` key (htslib owns it), nothing after the
+/// closing `>`. An unclosed `<` or quote would read back with "Incomplete header
+/// line" warnings and an altered line, and a missing `]` makes htslib refuse the
+/// whole header.
+fn structured_fields(v: &str) -> Result<Vec<(&str, &str)>, String> {
+    let b = v.as_bytes();
+    let n = b.len();
+    let at = |i: usize, what: &str| Err(format!("malformed structured value at position {} of the value: {what}", i + 1));
+    let mut fields = Vec::new();
+    let mut i = 1; // past '<'
+    loop {
+        let k0 = i;
+        if i < n && (b[i].is_ascii_alphabetic() || b[i] == b'_') {
+            i += 1;
+            while i < n && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'.') { i += 1; }
+        }
+        if i == k0 { return at(i, "expected a key ([A-Za-z_][0-9A-Za-z_.]*)"); }
+        if i >= n || b[i] != b'=' { return at(i, "expected '=' right after the key"); }
+        let key = &v[k0..i];
+        if key == "IDX" { return at(k0, "IDX is reserved for the BCF dictionary"); }
+        i += 1;
+        let v0 = i;
+        match b.get(i) {
+            Some(&q @ (b'"' | b'[')) => {
+                let close = if q == b'"' { b'"' } else { b']' };
+                i += 1;
+                loop {
+                    match b.get(i) {
+                        None => return at(v0, if q == b'"' { "unterminated quoted value" } else { "missing ']'" }),
+                        Some(b'\\') => i += 2,
+                        Some(&c) if c == close => break,
+                        Some(_) => i += 1,
+                    }
+                }
+                if q == b'"' && i - 1 > v0 && b[i - 1] == b' ' { return at(i - 1, "a quoted value cannot end with a space"); }
+                i += 1; // past the closing quote / bracket
+            }
+            _ => {
+                let mut depth = 1usize;
+                while i < n {
+                    match b[i] {
+                        b'<' => depth += 1,
+                        b'>' => { depth -= 1; if depth == 0 { break; } }
+                        b',' if depth == 1 => break,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if i > v0 && (b[v0] == b' ' || b[i - 1] == b' ') {
+                    return at(v0, "a value cannot start or end with a space");
+                }
+            }
+        }
+        fields.push((key, &v[v0..i]));
+        match b.get(i) {
+            Some(b',') => i += 1,
+            Some(b'>') if i + 1 == n => return Ok(fields),
+            Some(b'>') => return at(i + 1, "text after the closing '>'"),
+            None => return at(i, "missing the closing '>'"),
+            Some(_) => return at(i, "expected ',' or '>' after the value"),
+        }
+    }
+}
+
+/// Check the `--header-line` values together (each was checked alone by
+/// [`parse_header_line`]): htslib keeps the first of two equal `##key=value`
+/// lines, and of two structured lines with the same key and `ID`, and drops the
+/// other without a word, so a value given twice is refused instead.
+pub fn check_header_lines(lines: &[String]) -> Result<(), String> {
+    // The text htslib compares: `##key=<ID=id>` for a structured line with an ID,
+    // the whole line otherwise.
+    let identity = |l: &str| -> String {
+        if let Some((key, value)) = l.get(2..).and_then(|b| b.split_once('='))
+            && value.starts_with('<')
+            && let Ok(fields) = structured_fields(value)
+            && let Some((_, id)) = fields.iter().find(|(k, _)| *k == "ID")
+        {
+            return format!("##{key}=<ID={id}>");
+        }
+        l.to_string()
+    };
+    let mut seen: Vec<(String, &str)> = Vec::with_capacity(lines.len());
+    for l in lines {
+        let id = identity(l);
+        if let Some((_, first)) = seen.iter().find(|(s, _)| *s == id) {
+            return Err(if *first == l.as_str() {
+                format!("\"{l}\" is given twice")
+            } else {
+                format!("\"{l}\" has the key and ID of \"{first}\"; VCF readers keep only the first")
+            });
+        }
+        seen.push((id, l));
+    }
+    Ok(())
 }
 
 /// Write the `--header-line` lines in the order given (each one checked by
@@ -245,9 +358,17 @@ pub(crate) fn push_gp(buf: &mut Vec<u8>, ap1: f32, ap2: f32) {
 /// are the record's raw f32 values there): `[(1-a)(1-b), a(1-b)+(1-a)b, ab]`
 /// evaluated in f64 from the f32 AP1/AP2 and rounded once to f32, so the sum is 1
 /// and `GP[1] + 2 GP[2]` the stored DS (`a + b` in f32) to f32 precision.
+///
+/// `a` and `b` are first clamped to [0, 1] (a NaN reads 0, as in the text writer):
+/// the interpolated AP can exceed 1 by f32 rounding (up to 1.0000019 on chr22),
+/// and the unclamped products gave GP values below 0 and above 1, which readers
+/// such as plink2 refuse. With the clamp every value lies in [0, 1] (never -0.0)
+/// and `GP[1] + 2 GP[2]` is within that excess (about 2e-6) of the stored DS.
 #[inline]
 pub(crate) fn gp_f32(ap1: f32, ap2: f32) -> [f32; 3] {
-    let (a, b) = (ap1 as f64, ap2 as f64);
+    // `x > 0` is false for NaN, -0.0 and negatives: all of them read +0.
+    let unit = |x: f32| if x > 0.0 { (x as f64).min(1.0) } else { 0.0 };
+    let (a, b) = (unit(ap1), unit(ap2));
     [((1.0 - a) * (1.0 - b)) as f32, (a * (1.0 - b) + (1.0 - a) * b) as f32, (a * b) as f32]
 }
 
@@ -258,15 +379,43 @@ mod header_gp_tests {
     #[test]
     fn header_line_validation() {
         for ok in ["##imputation_panel=v3.reference.bcf", "##a=", "##note=two words\tand a tab",
-                   "##source=other", "##fileformatX=1", "##INFOs=1", "##imputation=<ID=x,Panel=v3>"] {
+                   "##source=other", "##source=DRAGEN_SNV", "##sources=Selphi", "##fileformatX=1", "##INFOs=1",
+                   "##imputation=<ID=x,Panel=v3>", "##a=<ID=x>", "##a=<ID=>", "##a=<_k.1=v w,B=\"q, \\\"x\\\" >\">",
+                   "##a=<ID=x,Description=\"\">", "##a=<ID=x,L=[1,2,3]>", "##a=<ID=x,N=<y,z>>", "##a=<ID=a\"b>",
+                   "##a=<ID=x,D=\" lead\">", "##a=<ID=x,D=\"\\\\\">", "##PEDIGREE=<Name_0=G0-ID,Name_1=G1-ID>",
+                   "##a=b<c", "##a= <x", "##a=<ID=x;A=1>"] {
             assert_eq!(parse_header_line(ok).as_deref(), Ok(ok), "{ok}");
         }
         for bad in ["imputation_panel=v3", "#imputation_panel=v3", "##", "##no_equals", "##=value",
                     "##key with space=1", "##a=1\n##b=2", "##a=1\r", "##a=1\n",
                     "##fileformat=VCFv4.3", "##FILEFORMAT=VCFv4.2", "##INFO=<ID=X,Number=1,Type=Integer,Description=\"x\">",
-                    "##FORMAT=<ID=GP>", "##FILTER=<ID=q10>", "##contig=<ID=22>", "##Contig=<ID=22>", ""] {
+                    "##FORMAT=<ID=GP>", "##FILTER=<ID=q10>", "##contig=<ID=22>", "##Contig=<ID=22>", "",
+                    // Selphi's own ##source (any version or writer).
+                    "##source=Selphi_v2.0.0 SelfDecode\u{2122}", "##source=selphi", "##Source=Selphi 2.0.0 decode",
+                    // Structured values htslib warns about, rewrites or refuses (the reviewers' first).
+                    "##k=<ID=x", "##k2=<ID=y,Description=\"unterminated>", "##imputation_panel=<broken",
+                    "##k=<>", "##k=<ID=x,>", "##k=<ID = x>", "##k=<ID =x>", "##k=<ID= x>", "##k=<ID=x >",
+                    "##k=<ID=x, A=1>", "##k=< ID=x>", "##k=<ID=x>junk", "##k=<ID=x> ", "##k=<ID=x>>",
+                    "##k=<ID=\"a\"b>", "##k=<ID=[abc>", "##k=<ID=x,L=[1,2>", "##k=<IDX=1>", "##k=<ID=x,IDX=0>",
+                    "##k=<ID=<a>", "##k=<ID=\"x \">", "##k=<ID=\"a\\\">", "##k=<1D=x>", "##k=<ID=x,=y>"] {
             assert!(parse_header_line(bad).is_err(), "{bad:?} accepted");
         }
+        assert_eq!(structured_fields("<ID=x,D=\"a,b\",L=[1,2],N=<p,q>,E=>"),
+            Ok(vec![("ID", "x"), ("D", "\"a,b\""), ("L", "[1,2]"), ("N", "<p,q>"), ("E", "")]));
+    }
+
+    #[test]
+    fn header_lines_given_twice_are_refused() {
+        let v = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(check_header_lines(&[]).is_ok());
+        assert!(check_header_lines(&v(&["##a=1", "##a=2", "##b=1", "##k=<ID=x>", "##k=<ID=y>", "##j=<ID=x>",
+                                         "##k=<A=1>", "##k=<A=2>"])).is_ok());
+        for dup in [&["##a=1", "##b=2", "##a=1"][..], &["##k=<ID=x,A=1>", "##k=<A=2,ID=x>"],
+                    &["##k=<ID=\"x\">", "##k=<ID=\"x\",D=\"y\">"], &["##k=<A=1>", "##k=<A=1>"]] {
+            assert!(check_header_lines(&v(dup)).is_err(), "{dup:?} accepted");
+        }
+        // Same ID text, quoted vs bare: htslib keeps both (its key includes the quotes).
+        assert!(check_header_lines(&v(&["##k=<ID=x>", "##k=<ID=\"x\">"])).is_ok());
     }
 
     #[test]
@@ -315,7 +464,7 @@ mod header_gp_tests {
             assert!(e <= 0.0015 + 1e-6, "a={a} b={b} k={k} {g:?} exact {exact:?}");
         }
         let f = gp_f32(a, b);
-        assert!(f.iter().all(|v| (0.0..=1.0).contains(v)), "a={a} b={b} {f:?}");
+        assert!(f.iter().all(|v| v.is_sign_positive() && *v <= 1.0), "a={a} b={b} {f:?}");
         assert!((f.iter().map(|&v| v as f64).sum::<f64>() - 1.0).abs() < 3e-7, "a={a} b={b} {f:?}");
         assert!((f[1] as f64 + 2.0 * f[2] as f64 - (a + b) as f64).abs() < 3e-7, "a={a} b={b} {f:?}");
     }
@@ -351,5 +500,35 @@ mod header_gp_tests {
         let mut b = Vec::new();
         push_gp(&mut b, 0.2, 0.7);
         assert_eq!(b, b":0.24,0.62,0.14");
+    }
+
+    /// The interpolated AP can exceed 1 by f32 rounding (1.0000019 on chr22 u3):
+    /// GP stays in [0, 1] (no -0.0), sums to 1, and GP[1] + 2 GP[2] stays within
+    /// the excess of the stored DS; the text GP is exact as before.
+    #[test]
+    fn gp_of_ap_outside_unit_interval() {
+        let one_up = f32::from_bits(1.0f32.to_bits() + 1);
+        let over = [one_up, 1.0000019, 1.000002, f32::from_bits(1.0f32.to_bits() + 40)];
+        let under = [-0.0f32, -1e-7, -f32::MIN_POSITIVE, f32::NAN];
+        let inside = [0.0f32, 1e-7, 0.0004999, 0.3, 0.5, 0.9995001, 1.0 - 1e-7, 1.0];
+        let all: Vec<f32> = over.iter().chain(&under).chain(&inside).copied().collect();
+        for &a in &all {
+            for &b in &all {
+                let f = gp_f32(a, b);
+                assert!(f.iter().all(|v| v.is_sign_positive() && *v <= 1.0), "a={a} b={b} {f:?}");
+                assert!((f.iter().map(|&v| v as f64).sum::<f64>() - 1.0).abs() < 3e-7, "a={a} b={b} {f:?}");
+                if a.is_nan() || b.is_nan() { continue; }
+                let ds = (a + b) as f64;
+                assert!((f[1] as f64 + 2.0 * f[2] as f64 - ds).abs() < 1e-5, "a={a} b={b} {f:?}");
+                let g = gp_thousandths(a, b);
+                assert_eq!(g[0] + g[1] + g[2], 1000, "a={a} b={b} {g:?}");
+                assert_eq!(g[1] + 2 * g[2], printed_ds_thousandths(a, b), "a={a} b={b} {g:?}");
+            }
+        }
+        // The reviewer's record (22:15513405, AP1 = AP2 printed as 1): was -0, -1.19e-7, 1.0000001.
+        assert_eq!(gp_f32(1.0000001, 1.0), [0.0, 0.0, 1.0]);
+        assert_eq!(gp_f32(one_up, one_up).map(f32::to_bits), [0.0f32, 0.0, 1.0].map(f32::to_bits));
+        assert_eq!(gp_f32(-0.0, 0.25).map(f32::to_bits), [0.75f32, 0.25, 0.0].map(f32::to_bits));
+        assert_eq!(gp_f32(1.0000019, 0.5), [0.0, 0.5, 0.5]);
     }
 }

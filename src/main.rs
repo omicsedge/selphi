@@ -31,6 +31,12 @@ use cli::Args;
 
 fn main() {
     let mut args = Args::parse();
+    // Each --header-line was checked alone by its value parser; together they must
+    // not repeat one another (VCF readers would drop the repeat without a word).
+    if let Err(e) = selphi::io::vcf_fmt::check_header_lines(&args.header_line) {
+        eprintln!("ERROR: --header-line: {e}");
+        std::process::exit(2);
+    }
 
     // --config: load a selphi.toml into the process environment BEFORE any engine env
     // read. Sets only knobs not already in the environment, so an explicit env var still
@@ -695,7 +701,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
             selphi_info!("  output:   {}", output);
             selphi_info!("  threads:  {}\n", args.threads);
             let start_time = Instant::now();
-            selphi::srp::decode::decode_panel(Path::new(source), Path::new(output), args.threads)
+            selphi::srp::decode::decode_panel(Path::new(source), Path::new(output), args.threads, &args.header_line)
                 .unwrap_or_else(|e| { selphi_error!("decode failed: {}", e); std::process::exit(1); });
             selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB",
                 start_time.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());

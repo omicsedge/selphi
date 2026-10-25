@@ -1038,6 +1038,9 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     if args.debug { selphi_info!("  debug:    enabled"); }
     selphi_info!("  log:      {}", log_path.display());
     selphi_info!("");
+    if args.phase_only && args.gp {
+        selphi_info!("  Note: --gp has no effect with --phase-only (the phased VCF carries GT only)");
+    }
 
     let start_time = Instant::now();
 

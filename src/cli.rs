@@ -399,9 +399,13 @@ pub struct Args {
     /// records of the VCF/BCF output, computed from AP1/AP2 taken as independent:
     /// [(1-AP1)(1-AP2), AP1(1-AP2)+(1-AP1)AP2, AP1·AP2]. In VCF text it is written
     /// at DS's three decimals, rounded so GP sums to 1 and DS = GP[1] + 2·GP[2]
-    /// exactly. Off by default (it enlarges the VCF); typed sites written as their
-    /// input call carry GT only, as before. Parquet, PGEN and SelfDecode output are
-    /// unchanged, and the lcWGS engine always writes its own GP.
+    /// exactly; BCF stores float32 values. Off by default (it enlarges the VCF);
+    /// typed sites written as their input call carry GT only, as before. A man's
+    /// chrX is written diploid outside the PARs too (GT, DS, AP1/AP2), so his GP
+    /// there has three values and GP[1] is the chance that his two haplotypes
+    /// differ, not of a heterozygote. Parquet, PGEN and SelfDecode output are
+    /// unchanged, the lcWGS engine always writes its own GP, and --phase-only and
+    /// --phase-panel (GT only) ignore it.
     #[arg(long)]
     pub gp: bool,
 
@@ -409,8 +413,10 @@ pub struct Args {
     /// lines follow ##source once each, in the order given), e.g. to tag the output
     /// for a downstream loader that recognises the reference panel by a header line:
     /// --header-line '##imputation_panel=v3.reference.bcf'. Each must be one
-    /// ##key=value line; ##fileformat, ##INFO, ##FORMAT, ##FILTER and ##contig are
-    /// refused (Selphi writes those itself).
+    /// ##key=value line. Refused before the run starts: ##fileformat, ##INFO,
+    /// ##FORMAT, ##FILTER and ##contig (Selphi writes those itself), a ##source
+    /// naming Selphi, a structured value (<key=value,...>) that VCF readers would
+    /// not read back exactly as written, and a line given twice.
     #[arg(long = "header-line", value_name = "TEXT", value_parser = selphi::io::vcf_fmt::parse_header_line)]
     pub header_line: Vec<String>,
 
