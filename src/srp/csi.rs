@@ -1687,7 +1687,7 @@ mod tests {
         let names: Vec<String> = (0..3).map(|i| format!("S{i}")).collect();
         let contig = "##contig=<ID=22,length=50818468>";
         let mut header = Vec::new();
-        crate::io::vcf_fmt::write_imputation_vcf_header(&mut header, &names, contig, "test", false, "").unwrap();
+        crate::io::vcf_fmt::write_imputation_vcf_header(&mut header, &names, contig, "test", false, false, &[], "").unwrap();
         let mut msgs: Vec<Vec<u8>> = vec![header];
         let mut r = Xs(0x7E57);
         let mut pos = 16_000_000u64;
@@ -1701,7 +1701,7 @@ mod tests {
         }
         msgs.push(b"22\t50000000\t.\tA\tC\t.\tPASS\t.\tGT\t0|1\t0|0\t1|1".to_vec());
         let out = dir.path().join("w");
-        let (tx, handle, bg) = crate::io::pipeline::setup_vcf_writer(3, &names, contig, "test", &out, false).unwrap();
+        let (tx, handle, bg) = crate::io::pipeline::setup_vcf_writer(3, &names, contig, "test", &out, false, false, &[]).unwrap();
         for m in &msgs[1..] { tx.send(m.clone()).unwrap(); }
         crate::io::pipeline::finish_vcf_writer(tx, handle, bg).unwrap();
         let vcf = dir.path().join("w.vcf.gz");

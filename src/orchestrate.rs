@@ -37,6 +37,10 @@ pub struct MultiChrImputeConfig {
     /// `--p-err` given: a fixed emission floor (no adaptive floor).
     pub p_err_fixed: bool,
     pub no_ap: bool,
+    /// `--gp`: FORMAT/GP on the imputed VCF/BCF records.
+    pub gp: bool,
+    /// `--header-line`: lines added to the output header after ##source.
+    pub header_lines: Vec<String>,
     /// How a phased input's own phase is used (`--keep-input-phase`, `--trust-input-phase`,
     /// `--force-phasing`, or the gated default); see `imputation::input_phase`.
     pub input_phase: selphi::imputation::input_phase::InputPhase,
@@ -115,6 +119,8 @@ impl MultiChrImputeConfig {
             p_err: args.p_err.unwrap_or(crate::cli::DEFAULT_P_ERR),
             p_err_fixed: args.p_err.is_some(),
             no_ap: args.no_ap,
+            gp: args.gp,
+            header_lines: args.header_line.clone(),
             input_phase: args.input_phase(),
             max_cond_haps: args.max_cond_haps,
             fl_fwd: args.fl_fwd,
@@ -732,11 +738,11 @@ pub fn run_multi_chr(
     let (vcf_tx, vcf_writer, vcf_bgzip) = if formats.vcf || formats.bcf {
         if formats.bcf {
             selphi::io::pipeline::setup_bcf_writer(
-                n_samples, &sample_names, all_contig_fields, version, &out_file, config.no_ap,
+                n_samples, &sample_names, all_contig_fields, version, &out_file, config.no_ap, config.gp, &config.header_lines,
             ).expect("Failed to setup BCF writer")
         } else {
             selphi::io::pipeline::setup_vcf_writer(
-                n_samples, &sample_names, all_contig_fields, version, &out_file, config.no_ap,
+                n_samples, &sample_names, all_contig_fields, version, &out_file, config.no_ap, config.gp, &config.header_lines,
             ).expect("Failed to setup VCF writer")
         }
     } else {
@@ -1203,6 +1209,7 @@ pub fn run_multi_chr(
                     n_samples,
                     chip_genotypes: &targ_bm,
                     no_ap: config.no_ap,
+                    gp: config.gp,
                     preloaded_chunks: None,
                     preloaded_stripes,
                     // --refine is not wired here (no GQ/PL/DP from the multi-chr

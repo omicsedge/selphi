@@ -265,6 +265,9 @@ fn main() {
         selphi_info!("  output:   {}", output);
         selphi_info!("  threads:  {}", args.threads);
         selphi_info!("  log:      {}\n", log_path.display());
+        if args.gp {
+            selphi_info!("  Note: --gp has no effect on the lcWGS engine, whose VCF always carries its own GP");
+        }
 
         let start = std::time::Instant::now();
 
@@ -325,7 +328,7 @@ fn main() {
                 Some(f) => selphi::lcwgs::multi::Panels::Files(f.clone()),
                 None => selphi::lcwgs::multi::Panels::Multi(refpanel.to_string()),
             };
-            selphi::lcwgs::multi::run(panels, inp, maps, &params, args.threads, &vcf_path, &tsv_path)
+            selphi::lcwgs::multi::run(panels, inp, maps, &params, args.threads, &vcf_path, &tsv_path, &args.header_line)
                 .unwrap_or_else(|e| exit_on_io(&e, || eprintln!("lcWGS pipeline failed: {}", e)));
             selphi_step!("wrote imputed VCF: {}", vcf_path.display());
             selphi_step!("wrote dosage TSV: {}", tsv_path.display());
@@ -396,7 +399,7 @@ fn main() {
                 "  ls-exact done: {} variants × {} samples in {:.1}s",
                 result.n_variants, result.sample_ids.len(), start.elapsed().as_secs_f32(),
             );
-            if let Err(e) = selphi::lcwgs::output::write_lcwgs_vcf(&result, &srp, &vcf_path) {
+            if let Err(e) = selphi::lcwgs::output::write_lcwgs_vcf(&result, &srp, &vcf_path, &args.header_line) {
                 eprintln!("Failed to write {}: {}", vcf_path.display(), e);
                 std::process::exit(1);
             }
@@ -416,7 +419,7 @@ fn main() {
             result.n_variants, n_out, if n_out == 1 { "" } else { "s" });
 
         // Write imputed VCF.gz with GT:DS:GP.
-        if let Err(e) = selphi::lcwgs::output::write_lcwgs_vcf(&result, &srp, &vcf_path) {
+        if let Err(e) = selphi::lcwgs::output::write_lcwgs_vcf(&result, &srp, &vcf_path, &args.header_line) {
             eprintln!("Failed to write {}: {}", vcf_path.display(), e);
             std::process::exit(1);
         }

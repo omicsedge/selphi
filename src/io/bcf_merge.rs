@@ -16,7 +16,8 @@
 //!   - AP1, AP2: same as DS (when !no_ap)
 //!
 //! n_fmt distinguishes record types: 1=chip (GT only), 2=imputed no-AP (GT+DS),
-//! 4=imputed full (GT+DS+AP1+AP2).
+//! 4=imputed full (GT+DS+AP1+AP2). The intermediates never carry GP: with `--gp`
+//! the merged imputed record gets a GP field computed from their AP1/AP2.
 //!
 //! ## Output BCF (merged):
 //!
@@ -45,7 +46,9 @@ const TY_FLOAT: u8 = 5;
 ///
 /// All batch files MUST have the same variants in the same order. Sample
 /// columns are concatenated in batch order (batch_0's samples first).
-/// Final BCF header lists ALL samples in input order.
+/// Final BCF header lists ALL samples in input order. `gp` adds FORMAT/GP to the
+/// imputed records and `extra_header` holds the `--header-line` lines.
+#[allow(clippy::too_many_arguments)]
 pub fn merge_batch_bcfs(
     batch_paths: &[PathBuf],
     output_path: &Path,
@@ -53,6 +56,8 @@ pub fn merge_batch_bcfs(
     contig_field: &str,
     version: &str,
     no_ap: bool,
+    gp: bool,
+    extra_header: &[String],
 ) -> std::io::Result<()> {
     if batch_paths.is_empty() {
         return Err(std::io::Error::other("no batch files to merge"));
@@ -69,7 +74,7 @@ pub fn merge_batch_bcfs(
     // 2. Write merged header (all samples).
     let mut header_buf = Vec::with_capacity(8192);
     crate::io::bcf_encode::write_bcf_header(
-        &mut header_buf, all_sample_names.len(), all_sample_names, contig_field, version, no_ap,
+        &mut header_buf, all_sample_names.len(), all_sample_names, contig_field, version, no_ap, gp, extra_header,
     );
     writer.write_all(&header_buf)?;
 
@@ -129,7 +134,7 @@ pub fn merge_batch_bcfs(
 
         // Parallel merge: each record in chunk merged independently.
         let merged: Vec<Vec<u8>> = chunk[..chunk_n].par_iter()
-            .map(|rec_bufs| merge_one_record(rec_bufs, &batch_sample_counts, total_samples, no_ap))
+            .map(|rec_bufs| merge_one_record(rec_bufs, &batch_sample_counts, total_samples, no_ap, gp))
             .collect::<std::io::Result<Vec<_>>>()?;
 
         // Write in record order.
@@ -303,6 +308,7 @@ fn merge_one_record(
     batch_sample_counts: &[usize],
     total_samples: usize,
     no_ap: bool,
+    gp: bool,
 ) -> std::io::Result<Vec<u8>> {
     let v0 = view(&rec_bufs[0]);
     let n_fmt = n_fmt_of(v0.shared);
@@ -337,6 +343,11 @@ fn merge_one_record(
     // output drops them when the user asked --no-ap → write GT+DS only. AC/AF/DR2
     // are computed from the intermediate's per-hap AP (correct) regardless.
     let out_n_fmt: u8 = if !is_chip && no_ap { 2 } else { n_fmt };
+    // --gp: one more field after those, written from the intermediates' AP1/AP2.
+    let add_gp = gp && !is_chip;
+    if add_gp && n_fmt != 4 {
+        return Err(std::io::Error::other(format!("GP needs AP1/AP2 in the batch intermediate (n_fmt {n_fmt})")));
+    }
 
     // ----- Build merged SHARED -----
     let mut out = Vec::with_capacity(8 + v0.l_shared * 2 + v0.l_indiv * rec_bufs.len());
@@ -352,7 +363,7 @@ fn merge_one_record(
     out.extend_from_slice(&v0.shared[0..16]);                       // chrom, pos, rlen, qual
     out.extend_from_slice(&new_n_info.to_le_bytes());                // updated n_info (offset 16..18)
     out.extend_from_slice(&v0.shared[18..20]);                       // n_allele (unchanged)
-    let fmt_sample_new = (out_n_fmt as u32) << 24 | (total_samples as u32);
+    let fmt_sample_new = ((out_n_fmt + add_gp as u8) as u32) << 24 | (total_samples as u32);
     out.extend_from_slice(&fmt_sample_new.to_le_bytes());            // updated fmt_sample (offset 20..24)
 
     // ID, REF, ALT, FILTER (verbatim from batch_0)
@@ -361,11 +372,12 @@ fn merge_one_record(
     // ----- Recompute INFO from concatenated DS dosages -----
     // For imputed: read DS from each batch (INDIV field 2 = DS), concat, compute AF/AC/DR2.
     // For chip: AC/AF from GT field.
+    let mut aps: (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
     let (ac, af, dr2_opt, an) = if is_chip {
         let (ac, af, an) = compute_chip_stats_from_gt(rec_bufs, batch_sample_counts)?;
         (ac, af, None, an)
     } else {
-        let (ac, af, dr2, an) = compute_imp_stats_from_ds(rec_bufs, batch_sample_counts, n_fmt)?;
+        let (ac, af, dr2, an) = compute_imp_stats_from_ds(rec_bufs, batch_sample_counts, n_fmt, &mut aps)?;
         (ac, af, Some(dr2), an)
     };
 
@@ -424,6 +436,10 @@ fn merge_one_record(
             batch_indiv_offs[b] += data_len;
         }
     }
+    if add_gp {
+        // The same encoder (and f32 AP values) as the non-batched record.
+        crate::io::bcf_encode::emit_gp(&mut out, aps.0.iter().copied().zip(aps.1.iter().copied()));
+    }
     let l_indiv = (out.len() - indiv_start) as u32;
 
     // Patch l_shared, l_indiv.
@@ -434,11 +450,12 @@ fn merge_one_record(
 
 /// Recompute AC/AF/DR2 for an imputed record by reading DS dosages across batches.
 ///
-/// Returns (ac, af, dr2, an).
+/// Returns (ac, af, dr2, an); the per-sample (AP1, AP2) it read are left in `aps`.
 fn compute_imp_stats_from_ds(
     rec_bufs: &[Vec<u8>],
     batch_sample_counts: &[usize],
     n_fmt: u8,
+    aps: &mut (Vec<f32>, Vec<f32>),
 ) -> std::io::Result<(u32, f32, f32, u32)> {
     // Locate DS field (2nd INDIV field, after GT) in each batch.
     let mut all_ap1: Vec<f32> = Vec::new();
@@ -495,6 +512,7 @@ fn compute_imp_stats_from_ds(
     );
     let af = ac as f32 / n_haps as f32;
     let dr2 = dr2_f64 as f32;
+    *aps = (all_ap1, all_ap2);
 
     Ok((ac, af, dr2, n_haps))
 }

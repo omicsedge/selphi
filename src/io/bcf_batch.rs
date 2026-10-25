@@ -43,11 +43,12 @@ pub fn setup_batch_writers(
     contig_field: &str,
     version: &str,
     no_ap: bool,
+    extra_header: &[String],
 ) -> std::io::Result<Vec<BatchWriter>> {
     // The per-batch INTERMEDIATE always stores AP1/AP2 regardless of --no-ap: the
     // merger needs the per-hap ALT probs to count AC correctly (AC = #{hap: AP>0.5};
     // it cannot be recovered from DS alone). The final merged BCF drops AP per the
-    // user's --no-ap (handled in merge_one_record).
+    // user's --no-ap (handled in merge_one_record), and adds --gp's GP from them.
     let _ = no_ap;
     let no_ap = false;
     if batch_size == 0 || n_haps == 0 {
@@ -71,7 +72,7 @@ pub fn setup_batch_writers(
         let path = tmp_dir.join(format!("selphi_batch_{:04}.bcf", r.batch_idx));
         let samples_slice = &all_sample_names[r.sample_start..r.sample_end];
         let (tx, handle) = setup_one_batch_writer(
-            &path, samples_slice, contig_field, version, no_ap, bgzip_per_batch,
+            &path, samples_slice, contig_field, version, no_ap, extra_header, bgzip_per_batch,
         )?;
         writers.push(BatchWriter { tx, handle, path, hap_start: r.hap_start, hap_end: r.hap_end });
         Ok::<(), std::io::Error>(())
@@ -87,6 +88,7 @@ fn setup_one_batch_writer(
     contig_field: &str,
     version: &str,
     no_ap: bool,
+    extra_header: &[String],
     bgzip_threads: usize,
 ) -> std::io::Result<(VcfSender, VcfWriterHandle)> {
     let out_file = std::fs::File::create(path)?;
@@ -109,7 +111,7 @@ fn setup_one_batch_writer(
     // BCF header (with this batch's K sample names)
     let mut header = Vec::with_capacity(8192);
     crate::io::bcf_encode::write_bcf_header(
-        &mut header, sample_names.len(), sample_names, contig_field, version, no_ap,
+        &mut header, sample_names.len(), sample_names, contig_field, version, no_ap, false, extra_header,
     );
     tx.send(header).map_err(|e| std::io::Error::other(e.to_string()))?;
     Ok((tx, handle))

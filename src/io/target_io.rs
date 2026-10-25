@@ -894,18 +894,20 @@ pub fn read_target_vcf(
 // ---------------------------------------------------------------------------
 
 /// Write the GT-only VCF header: fileformat, source (with `source_suffix`
-/// appended after the SelfDecode tag), FILTER=PASS, AF/AN/AC INFO, GT FORMAT
-/// (and PQ FORMAT when `pq`), an optional contig line, and the
-/// `#CHROM ... FORMAT <samples...>` column row.
+/// appended after the SelfDecode tag), the `--header-line` lines, FILTER=PASS,
+/// AF/AN/AC INFO, GT FORMAT (and PQ FORMAT when `pq`), an optional contig line,
+/// and the `#CHROM ... FORMAT <samples...>` column row.
 fn write_gt_vcf_header<W: std::io::Write>(
     w: &mut W,
     source_suffix: &str,
     contig: Option<&str>,
     sample_names: &[String],
     pq: bool,
+    extra_header: &[String],
 ) -> std::io::Result<()> {
     writeln!(w, "##fileformat=VCFv4.2")?;
     writeln!(w, "##source=Selphi_v{} SelfDecode\u{2122}{}", env!("CARGO_PKG_VERSION"), source_suffix)?;
+    crate::io::vcf_fmt::write_extra_header_lines(w, extra_header)?;
     writeln!(w, "##FILTER=<ID=PASS,Description=\"All filters passed\">")?;
     writeln!(w, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">")?;
     writeln!(w, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele Number\">")?;
@@ -982,6 +984,8 @@ pub fn write_phased_vcf(
     // SELPHI_DIPLOID_PQ: per (chip site, sample) phase quality, `diploid::PQ_NONE`
     // where undefined. Adds the PQ FORMAT field; None writes GT alone.
     pq: Option<&[u8]>,
+    // `--header-line` lines, written after ##source.
+    extra_header: &[String],
 ) -> std::io::Result<()> {
     use std::io::{Write, BufWriter};
 
@@ -993,7 +997,7 @@ pub fn write_phased_vcf(
         .build_from_writer(file);
     let mut w = BufWriter::with_capacity(4 << 20, bgzf);
 
-    write_gt_vcf_header(&mut w, "", Some(srp.metadata.contig_field.as_str()), sample_names, pq.is_some())?;
+    write_gt_vcf_header(&mut w, "", Some(srp.metadata.contig_field.as_str()), sample_names, pq.is_some(), extra_header)?;
 
     let mut line_buf = String::with_capacity(n_samples * 6);
     // Passthrough records go before the first panel variant past their position.
@@ -1060,6 +1064,7 @@ pub fn write_panel_vcf(
     n_var: usize,
     n_haps: usize,
     output_path: &Path,
+    extra_header: &[String],
 ) -> std::io::Result<()> {
     use std::io::{Write, BufWriter};
     let n_samples = n_haps / 2;
@@ -1071,7 +1076,7 @@ pub fn write_panel_vcf(
     let mut w = BufWriter::with_capacity(4 << 20, bgzf);
 
     let contig = markers.first().map(|m0| format!("##contig=<ID={}>", m0.chrom));
-    write_gt_vcf_header(&mut w, " (panel-phasing)", contig.as_deref(), sample_names, false)?;
+    write_gt_vcf_header(&mut w, " (panel-phasing)", contig.as_deref(), sample_names, false, extra_header)?;
 
     let mut line_buf = String::with_capacity(n_samples * 4);
     for v in 0..n_var {
@@ -2268,7 +2273,7 @@ pub struct PanelVcfWriter {
 impl PanelVcfWriter {
     /// Create the writer and emit the header (contig taken from `chrom`).
     pub fn create(
-        output_path: &Path, sample_names: &[String], chrom: &str, n_haps: usize,
+        output_path: &Path, sample_names: &[String], chrom: &str, n_haps: usize, extra_header: &[String],
     ) -> std::io::Result<Self> {
         use std::io::BufWriter;
         let file = std::fs::File::create(output_path)?;
@@ -2277,7 +2282,7 @@ impl PanelVcfWriter {
             .build_from_writer(file);
         let mut w = BufWriter::with_capacity(4 << 20, bgzf);
         let contig = format!("##contig=<ID={}>", chrom);
-        write_gt_vcf_header(&mut w, " (panel-phasing)", Some(&contig), sample_names, false)?;
+        write_gt_vcf_header(&mut w, " (panel-phasing)", Some(&contig), sample_names, false, extra_header)?;
         Ok(Self { w, n_samples: n_haps / 2, n_haps, line_buf: String::with_capacity(n_haps * 2), path: output_path.to_path_buf() })
     }
 

@@ -395,6 +395,25 @@ pub struct Args {
     #[arg(long)]
     pub no_ap: bool,
 
+    /// Add FORMAT/GP (genotype probabilities, three per sample) to the imputed
+    /// records of the VCF/BCF output, computed from AP1/AP2 taken as independent:
+    /// [(1-AP1)(1-AP2), AP1(1-AP2)+(1-AP1)AP2, AP1·AP2]. In VCF text it is written
+    /// at DS's three decimals, rounded so GP sums to 1 and DS = GP[1] + 2·GP[2]
+    /// exactly. Off by default (it enlarges the VCF); typed sites written as their
+    /// input call carry GT only, as before. Parquet, PGEN and SelfDecode output are
+    /// unchanged, and the lcWGS engine always writes its own GP.
+    #[arg(long)]
+    pub gp: bool,
+
+    /// Add a line to the header of every VCF/BCF result written (repeatable; the
+    /// lines follow ##source once each, in the order given), e.g. to tag the output
+    /// for a downstream loader that recognises the reference panel by a header line:
+    /// --header-line '##imputation_panel=v3.reference.bcf'. Each must be one
+    /// ##key=value line; ##fileformat, ##INFO, ##FORMAT, ##FILTER and ##contig are
+    /// refused (Selphi writes those itself).
+    #[arg(long = "header-line", value_name = "TEXT", value_parser = selphi::io::vcf_fmt::parse_header_line)]
+    pub header_line: Vec<String>,
+
     /// Leave out the target records that match no reference-panel site. By
     /// default they are written to the output at their position with their input
     /// genotypes (QUAL/FILTER/INFO '.'), neither phased nor imputed.

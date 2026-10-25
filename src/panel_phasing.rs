@@ -586,7 +586,7 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
     // 7. Output phased VCF.gz (always — the canonical genotype output).
     let out_path = PathBuf::from(output_path);
     let out_vcf = selphi::common::utils::out_path(&out_path, "vcf.gz");
-    write_panel_vcf(&phased, &markers, &sample_names, n_var, n_haps, &out_vcf)
+    write_panel_vcf(&phased, &markers, &sample_names, n_var, n_haps, &out_vcf, &args.header_line)
         .unwrap_or_else(|e| { selphi_error!("Failed to write phased panel VCF: {}", e); std::process::exit(1); });
     selphi_step!("Phased panel VCF: {}", out_vcf.display());
 
@@ -808,7 +808,7 @@ fn run_streaming(args: &Args, input_path: &str, output_path: &str, map_path: &st
     // 4. Output VCF.gz (incremental) + streaming chunk loop.
     let out_path = PathBuf::from(output_path);
     let out_vcf = selphi::common::utils::out_path(&out_path, "vcf.gz");
-    let mut writer = PanelVcfWriter::create(&out_vcf, &sample_names, &chrom, n_haps)
+    let mut writer = PanelVcfWriter::create(&out_vcf, &sample_names, &chrom, n_haps, &args.header_line)
         .unwrap_or_else(|e| { selphi_error!("Cannot create {}: {}", out_vcf.display(), e); std::process::exit(1); });
 
     // Native SRP built incrementally alongside the VCF — the same finalized rows

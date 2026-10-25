@@ -18,7 +18,10 @@ use noodles_bgzf::io::{Reader as BgzfReader, multithreaded_writer};
 use crate::io::vcf_fmt::{write_f4, write_u32};
 
 /// Merge N per-batch VCF.gz files into a single merged VCF.gz at `output_path`.
-/// Also builds the .tbi index alongside.
+/// Also builds the .tbi index alongside. `gp` adds FORMAT/GP to the imputed
+/// records (from the intermediates' AP1/AP2, as the non-batched writer does) and
+/// `extra_header` holds the `--header-line` lines.
+#[allow(clippy::too_many_arguments)]
 pub fn merge_batch_vcfs(
     batch_paths: &[PathBuf],
     output_path: &Path,
@@ -26,6 +29,8 @@ pub fn merge_batch_vcfs(
     contig_field: &str,
     version: &str,
     no_ap: bool,
+    gp: bool,
+    extra_header: &[String],
 ) -> std::io::Result<()> {
     if batch_paths.is_empty() {
         return Err(std::io::Error::other("no batch files to merge"));
@@ -64,7 +69,7 @@ pub fn merge_batch_vcfs(
     // Write the merged VCF header (shared with the non-batched + per-batch writers).
     let mut header = Vec::with_capacity(4096);
     crate::io::vcf_fmt::write_imputation_vcf_header(
-        &mut header, all_sample_names, contig_field, version, no_ap, "")?;
+        &mut header, all_sample_names, contig_field, version, no_ap, gp, extra_header, "")?;
     index.observe(&header);
     writer.write_all(&header)?;
 
@@ -121,7 +126,7 @@ pub fn merge_batch_vcfs(
         let merged: Vec<(Vec<u8>, String, i64, i64)> = (0..chunk_lines).into_par_iter().map(|i| {
             let mut batch_lines: Vec<&str> = Vec::with_capacity(n_batches);
             for bi in 0..n_batches { batch_lines.push(&chunk_per_batch[bi][i]); }
-            merge_one_record(&batch_lines, no_ap)
+            merge_one_record(&batch_lines, no_ap, gp)
         }).collect::<std::io::Result<Vec<_>>>()?;
 
         for (buf, chrom, pos, rlen) in merged {
@@ -198,6 +203,7 @@ fn parse_contig_id(contig_field: &str) -> Option<String> {
 fn merge_one_record(
     batch_lines: &[&str],
     no_ap: bool,
+    gp: bool,
 ) -> std::io::Result<(Vec<u8>, String, i64, i64)> {
     if batch_lines.is_empty() {
         return Err(std::io::Error::other("merge_one_record: empty batches"));
@@ -342,13 +348,14 @@ fn merge_one_record(
         if info_field(first) == "IMP" { buf.extend_from_slice(b";IMP"); }
     }
     buf.push(b'\t');
-    // FORMAT in final output respects the user's --no-ap choice
+    // FORMAT in final output respects the user's --no-ap and --gp choices
     if is_imputed {
         if no_ap {
             buf.extend_from_slice(b"GT:DS");
         } else {
             buf.extend_from_slice(b"GT:DS:AP1:AP2");
         }
+        if gp { buf.extend_from_slice(b":GP"); }
     } else {
         buf.extend_from_slice(b"GT");
     }
@@ -361,14 +368,14 @@ fn merge_one_record(
             let gtb = &all_sample_gt_b[bi];
             let ap1 = &all_sample_ap1[bi];
             let ap2 = &all_sample_ap2[bi];
-            if no_ap {
-                for s in 0..gta.len() {
+            for s in 0..gta.len() {
+                if no_ap {
                     write_sample_gt_ds(&mut buf, gta[s], gtb[s], ap1[s], ap2[s]);
-                }
-            } else {
-                for s in 0..gta.len() {
+                } else {
                     write_sample_gt_ds_ap(&mut buf, gta[s], gtb[s], ap1[s], ap2[s]);
                 }
+                // GP from the same f32 AP1/AP2 the non-batched writer formats.
+                if gp { crate::io::vcf_fmt::push_gp(&mut buf, ap1[s], ap2[s]); }
             }
         }
     } else {
@@ -555,6 +562,8 @@ mod tests {
             "##contig=<ID=22>",
             "test",
             false,
+            false,
+            &[],
         );
         assert!(res.is_err(), "expected Err from mismatched batch records, got Ok");
         let msg = res.unwrap_err().to_string();
@@ -574,8 +583,37 @@ mod tests {
         write_bgzf_vcf(&b1, "S1", "22\t100\t.\tA\tG\t.\tPASS\t.\tGT:DS:AP1:AP2\t1|1:2:1:1");
         let out = dir.path().join("ok.vcf.gz");
         let names = vec!["S0".to_string(), "S1".to_string()];
-        let res = merge_batch_vcfs(&[b0, b1], &out, &names, "##contig=<ID=22>", "test", false);
+        let res = merge_batch_vcfs(&[b0, b1], &out, &names, "##contig=<ID=22>", "test", false, false, &[]);
         assert!(res.is_ok(), "expected Ok, got {res:?}");
         assert!(out.exists());
+    }
+
+    /// `--gp` and `--header-line` on the merged output: each header line once,
+    /// right after ##source, and GP after the other fields of every imputed sample.
+    #[test]
+    fn merge_writes_gp_and_header_lines() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let b0 = dir.path().join("g0.vcf.gz");
+        let b1 = dir.path().join("g1.vcf.gz");
+        write_bgzf_vcf(&b0, "S0", "22\t100\t.\tA\tG\t.\tPASS\t.\tGT:DS:AP1:AP2\t0|1:0.9:0.2:0.7");
+        write_bgzf_vcf(&b1, "S1", "22\t100\t.\tA\tG\t.\tPASS\t.\tGT:DS:AP1:AP2\t1|1:2:1:1");
+        let names = vec!["S0".to_string(), "S1".to_string()];
+        let extra = vec!["##imputation_panel=v3.reference.bcf".to_string(), "##b=2".to_string()];
+        for no_ap in [false, true] {
+            let out = dir.path().join(format!("gp{no_ap}.vcf.gz"));
+            merge_batch_vcfs(&[b0.clone(), b1.clone()], &out, &names, "##contig=<ID=22>", "test", no_ap, true, &extra).unwrap();
+            let mut text = String::new();
+            BgzfReader::new(std::fs::File::open(&out).unwrap()).read_to_string(&mut text).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            assert!(lines[1].starts_with("##source="));
+            assert_eq!(&lines[2..4], &extra[..]);
+            assert_eq!(text.matches("##imputation_panel=v3.reference.bcf\n").count(), 1);
+            assert!(text.contains("##FORMAT=<ID=GP,Number=G,Type=Float"));
+            let rec = lines.last().unwrap();
+            let want = if no_ap { "GT:DS:GP\t0|1:0.9:0.24,0.62,0.14\t1|1:2:0,0,1" }
+                       else { "GT:DS:AP1:AP2:GP\t0|1:0.9:0.2:0.7:0.24,0.62,0.14\t1|1:2:1:1:0,0,1" };
+            assert!(rec.ends_with(want), "{rec}");
+        }
     }
 }

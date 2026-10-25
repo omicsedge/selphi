@@ -39,6 +39,7 @@ pub fn setup_vcf_batch_writers(
     contig_field: &str,
     version: &str,
     no_ap: bool,
+    extra_header: &[String],
 ) -> std::io::Result<Vec<VcfBatchWriter>> {
     if batch_size == 0 || n_haps == 0 {
         return Ok(Vec::new());
@@ -55,7 +56,7 @@ pub fn setup_vcf_batch_writers(
         let path = tmp_dir.join(format!("selphi_batch_{:04}.vcf.gz", r.batch_idx));
         let samples_slice = &all_sample_names[r.sample_start..r.sample_end];
         let (tx, handle) = setup_one_vcf_writer(
-            &path, samples_slice, contig_field, version, no_ap, bgzip_per_batch,
+            &path, samples_slice, contig_field, version, no_ap, extra_header, bgzip_per_batch,
         )?;
         writers.push(VcfBatchWriter { tx, handle, path, hap_start: r.hap_start, hap_end: r.hap_end });
         Ok::<(), std::io::Error>(())
@@ -70,6 +71,7 @@ fn setup_one_vcf_writer(
     contig_field: &str,
     version: &str,
     no_ap: bool,
+    extra_header: &[String],
     bgzip_threads: usize,
 ) -> std::io::Result<(VcfSender, VcfWriterHandle)> {
     let out_file = std::fs::File::create(path)?;
@@ -87,10 +89,11 @@ fn setup_one_vcf_writer(
         Ok(())
     });
 
-    // Header: same as the main VCF writer but with this batch's K sample columns.
+    // Header: same as the main VCF writer but with this batch's K sample columns
+    // (never GP: the merger writes it from the full-precision AP1/AP2 here).
     let mut header = Vec::with_capacity(4096);
     crate::io::vcf_fmt::write_imputation_vcf_header(
-        &mut header, sample_names, contig_field, version, no_ap, " (batch)")?;
+        &mut header, sample_names, contig_field, version, no_ap, false, extra_header, " (batch)")?;
     tx.send(header).map_err(|e| std::io::Error::other(e.to_string()))?;
     Ok((tx, handle))
 }

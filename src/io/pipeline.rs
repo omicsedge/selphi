@@ -764,6 +764,8 @@ pub fn setup_vcf_writer(
     version: &str,
     output_path: &Path,
     no_ap: bool,
+    gp: bool,
+    extra_header: &[String],
 ) -> std::io::Result<(VcfSender, VcfWriterHandle, VcfBgzipProc)> {
     let vcf_path = crate::common::utils::out_path(output_path, "vcf.gz");
 
@@ -797,7 +799,7 @@ pub fn setup_vcf_writer(
     // Write VCF header
     let mut header = Vec::with_capacity(4096);
     crate::io::vcf_fmt::write_imputation_vcf_header(
-        &mut header, sample_names, contig_field, version, no_ap, "")?;
+        &mut header, sample_names, contig_field, version, no_ap, gp, extra_header, "")?;
     tx.send(header).map_err(|e| std::io::Error::other(e.to_string()))?;
 
     Ok((tx, writer_handle, ()))
@@ -874,6 +876,8 @@ pub fn setup_bcf_writer(
     version: &str,
     output_path: &Path,
     no_ap: bool,
+    gp: bool,
+    extra_header: &[String],
 ) -> std::io::Result<(VcfSender, VcfWriterHandle, VcfBgzipProc)> {
     let bcf_path = crate::common::utils::out_path(output_path, "bcf");
 
@@ -898,7 +902,7 @@ pub fn setup_bcf_writer(
 
     // Write BCF header
     let mut header = Vec::with_capacity(8192);
-    super::bcf_encode::write_bcf_header(&mut header, n_samples, sample_names, contig_field, version, no_ap);
+    super::bcf_encode::write_bcf_header(&mut header, n_samples, sample_names, contig_field, version, no_ap, gp, extra_header);
     tx.send(header).map_err(|e| std::io::Error::other(e.to_string()))?;
 
     Ok((tx, writer_handle, ()))
@@ -994,6 +998,8 @@ pub struct WindowInput<'a> {
     pub n_samples: usize,
     pub chip_genotypes: &'a crate::common::HaplotypeBitmatrix,
     pub no_ap: bool,
+    /// `--gp`: FORMAT/GP on imputed VCF/BCF records (the other formats are unchanged).
+    pub gp: bool,
     pub preloaded_chunks: Option<Vec<Option<crate::srp::CscChunk>>>,
     pub preloaded_stripes: Option<crate::srp::tiled::PreloadedStripes>,
     /// R3 --refine: per-chip-site input confidence (chip-site order). `None`
@@ -1048,6 +1054,7 @@ struct RowFmt<'a> {
     setup: &'a WindowSetup<'a>,
     chip_genotypes: &'a crate::common::HaplotypeBitmatrix,
     no_ap: bool,
+    gp: bool,
     var_infos: Option<&'a [super::bcf_encode::BcfVariantInfo]>,
 }
 
@@ -1059,7 +1066,7 @@ impl RowFmt<'_> {
     fn vcf_rows(&self, buf: &mut Vec<u8>, ds_scratch: &mut [f32], alt_probs: &[f32], tile_n: usize,
                 gs: usize, rows: std::ops::Range<usize>) {
         let setup = self.setup;
-        let (n_haps, n_samples, no_ap) = (setup.n_haps, setup.n_samples, self.no_ap);
+        let (n_haps, n_samples, no_ap, gp) = (setup.n_haps, setup.n_samples, self.no_ap, self.gp);
         let chip_genotypes = self.chip_genotypes;
         for v in rows {
             let wgs_i = gs + v;
@@ -1106,6 +1113,7 @@ impl RowFmt<'_> {
                 } else {
                     buf.extend_from_slice(b"\tGT:DS:AP1:AP2");
                 }
+                if gp { buf.extend_from_slice(b":GP"); }
 
                 // Pre-computed constant strings for trivial dosages.
                 // Narrowed to match 3-decimal DS precision: the fast path now
@@ -1129,12 +1137,16 @@ impl RowFmt<'_> {
                     // already-measured <=0.0001 OVERALL R2 text-rounding envelope, and
                     // GT/AP/AC/AF/DR2 are unaffected (the stats close upstream). Kept
                     // as-is; the comment used to claim it tested the sum.
+                    // GP (`--gp`) is derived from the DS this writes, fast paths
+                    // included (vcf_fmt::gp_thousandths), so it ends every column.
                     if ap1 < 0.0005 && ap2 < 0.0005 {
                         buf.extend_from_slice(if no_ap { HOMREF_GTDS } else { HOMREF_GTDS_AP });
+                        if gp { crate::io::vcf_fmt::push_gp(buf, ap1, ap2); }
                         continue;
                     }
                     if ap1 > 0.9995 && ap2 > 0.9995 {
                         buf.extend_from_slice(if no_ap { HOMALT_GTDS } else { HOMALT_GTDS_AP });
+                        if gp { crate::io::vcf_fmt::push_gp(buf, ap1, ap2); }
                         continue;
                     }
 
@@ -1150,6 +1162,7 @@ impl RowFmt<'_> {
                         let ap2_idx = ((ap2 * 100.0).round() as usize).min(100);
                         buf.extend_from_slice(AP_LUT_B[ap1_idx * 101 + ap2_idx]);
                     }
+                    if gp { crate::io::vcf_fmt::push_gp(buf, ap1, ap2); }
                 }
                 buf.push(b'\n');
             }
@@ -1163,7 +1176,7 @@ impl RowFmt<'_> {
                 alt_probs: &[f32], tile_n: usize, gs: usize, rows: std::ops::Range<usize>) {
         use super::bcf_encode;
         let setup = self.setup;
-        let (n_haps, n_samples, no_ap) = (setup.n_haps, setup.n_samples, self.no_ap);
+        let (n_haps, n_samples, no_ap, gp) = (setup.n_haps, setup.n_samples, self.no_ap, self.gp);
         let chip_genotypes = self.chip_genotypes;
         let var_infos = self.var_infos.expect("BCF variant infos");
         for v in rows {
@@ -1198,7 +1211,7 @@ impl RowFmt<'_> {
                 };
                 bcf_encode::encode_imputed_record(
                     buf, vi.rid, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
-                    alt_probs, tile_n, v, n_samples, n_haps, no_ap, ds_scratch,
+                    alt_probs, tile_n, v, n_samples, n_haps, no_ap, gp, ds_scratch,
                     hc.as_ref(), setup.imp[local_i],
                 );
             }
@@ -1398,7 +1411,7 @@ pub fn write_window_multiformat(
 ) -> std::io::Result<()> {
     let WindowInput {
         srp, all_weights, win_chip_start, own_chip_start, own_chip_end,
-        wgs_idx, n_samples, chip_genotypes, no_ap,
+        wgs_idx, n_samples, chip_genotypes, no_ap, gp,
         preloaded_chunks, preloaded_stripes, site_conf, site_conf_per_sample, refine_thr,
         interp_cum_cm, passthrough, uncalled_typed, filled_typed,
     } = input;
@@ -1459,10 +1472,13 @@ pub fn write_window_multiformat(
     let pass_rid = var_infos.as_ref().and_then(|v| v.first()).map(|v| v.rid).unwrap_or(0);
 
     let mut out = ChannelOut::new(vcf_tx, formats.vcf);
-    let fmt = RowFmt { setup: &setup, chip_genotypes, no_ap, var_infos: var_infos.as_deref() };
+    let fmt = RowFmt { setup: &setup, chip_genotypes, no_ap, gp, var_infos: var_infos.as_deref() };
     let want_rows = formats.vcf || formats.bcf;
-    // Rows per formatting task: about FMT_TASK_BYTES of output each.
-    let row_bytes = 80 + n_samples * if formats.bcf && !formats.vcf { 14 } else { 16 };
+    // Rows per formatting task: about FMT_TASK_BYTES of output each (GP adds up to
+    // 18 bytes a sample to a VCF line, 12 to a BCF record).
+    let bcf_only = formats.bcf && !formats.vcf;
+    let gp_bytes = if !gp { 0 } else if bcf_only { 12 } else { 18 };
+    let row_bytes = 80 + n_samples * ((if bcf_only { 14 } else { 16 }) + gp_bytes);
     let rows_per_task = (FMT_TASK_BYTES / row_bytes).max(16);
 
     // Macro: write passthrough records `$recs` (indices into `passthrough`) to
@@ -2814,7 +2830,7 @@ mod encode_equivalence_tests {
                     };
                     bcf_encode::encode_imputed_record(
                         &mut buf, vi.rid, vi.pos_0based, &vi.id, &vi.ref_allele, &vi.alt_allele,
-                        alt_probs, tile_n, v, n_samples, n_haps, no_ap, &mut ds_scratch,
+                        alt_probs, tile_n, v, n_samples, n_haps, no_ap, false, &mut ds_scratch,
                         hc.as_ref(), imp[local_i],
                     );
                 }
@@ -3148,7 +3164,7 @@ mod encode_equivalence_tests {
             let setup = setup_of(&sc);
             let vidp = old_vid_prefixes(&sc.srp, sc.own_start, sc.own_end);
             for no_ap in [false, true] {
-                let fmt = RowFmt { setup: &setup, chip_genotypes: &sc.chip_gt, no_ap, var_infos: None };
+                let fmt = RowFmt { setup: &setup, chip_genotypes: &sc.chip_gt, no_ap, gp: false, var_infos: None };
                 for _ in 0..4 {
                     let (gs, tile_n) = tile(&mut r, &sc);
                     let ap = alt_probs(&mut r, setup.n_haps * tile_n);
@@ -3196,7 +3212,7 @@ mod encode_equivalence_tests {
             let vi = super::super::bcf_encode::parse_variant_infos(&sc.srp.ids, &sc.srp.original_ids,
                 sc.own_start, sc.own_end, &contigs);
             for no_ap in [false, true] {
-                let fmt = RowFmt { setup: &setup, chip_genotypes: &sc.chip_gt, no_ap, var_infos: Some(&vi) };
+                let fmt = RowFmt { setup: &setup, chip_genotypes: &sc.chip_gt, no_ap, gp: false, var_infos: Some(&vi) };
                 for _ in 0..3 {
                     let (gs, tile_n) = tile(&mut r, &sc);
                     let ap = alt_probs(&mut r, setup.n_haps * tile_n);
@@ -3213,6 +3229,123 @@ mod encode_equivalence_tests {
                 }
             }
         }
+    }
+
+    /// Thousandths of a printed DS/GP value.
+    fn milli(s: &str) -> usize {
+        let v: f64 = s.parse().unwrap();
+        let k = (v * 1000.0).round();
+        assert!((v * 1000.0 - k).abs() < 1e-6, "{s} is not in thousandths");
+        k as usize
+    }
+
+    /// `--gp` appends `:GP` to the FORMAT and to every sample column of an imputed
+    /// line and changes nothing else; the written GP sums to 1 and gives back the
+    /// written DS exactly (`DS = GP[1] + 2 GP[2]`).
+    #[test]
+    fn vcf_rows_gp_appends_exact_gp() {
+        let mut r = Xs(0x6770);
+        let mut n_cols = 0usize;
+        for _ in 0..150 {
+            let sc = scenario(&mut r);
+            let setup = setup_of(&sc);
+            for no_ap in [false, true] {
+                let plain = RowFmt { setup: &setup, chip_genotypes: &sc.chip_gt, no_ap, gp: false, var_infos: None };
+                let with = RowFmt { setup: &setup, chip_genotypes: &sc.chip_gt, no_ap, gp: true, var_infos: None };
+                let (gs, tile_n) = tile(&mut r, &sc);
+                let ap = alt_probs(&mut r, setup.n_haps * tile_n);
+                let mut scratch = vec![0f32; sc.n_samples];
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                plain.vcf_rows(&mut a, &mut scratch, &ap, tile_n, gs, 0..tile_n);
+                with.vcf_rows(&mut b, &mut scratch, &ap, tile_n, gs, 0..tile_n);
+                let (a, b) = (String::from_utf8(a).unwrap(), String::from_utf8(b).unwrap());
+                assert_eq!(a.lines().count(), b.lines().count());
+                for (la, lb) in a.lines().zip(b.lines()) {
+                    let (fa, fb): (Vec<&str>, Vec<&str>) = (la.split('\t').collect(), lb.split('\t').collect());
+                    // FORMAT follows PASS and INFO (an unparsable panel ID leaves the prefix empty).
+                    let k = fa.iter().position(|f| *f == "PASS").unwrap() + 2;
+                    assert_eq!(fa[..k], fb[..k]);
+                    if fa[k] == "GT" { assert_eq!(la, lb); continue; }
+                    assert_eq!(format!("{}:GP", fa[k]), fb[k]);
+                    assert_eq!(fa.len(), fb.len());
+                    for (ca, cb) in fa[k + 1..].iter().zip(&fb[k + 1..]) {
+                        let (head, gp) = cb.rsplit_once(':').unwrap();
+                        assert_eq!(*ca, head);
+                        let g: Vec<usize> = gp.split(',').map(milli).collect();
+                        assert_eq!(g.len(), 3);
+                        assert_eq!(g[0] + g[1] + g[2], 1000, "{cb}");
+                        assert_eq!(milli(ca.split(':').nth(1).unwrap()), g[1] + 2 * g[2], "{cb}");
+                        n_cols += 1;
+                    }
+                }
+            }
+        }
+        assert!(n_cols > 10_000, "{n_cols}");
+    }
+
+    /// `--gp` on a BCF record: FORMAT count + 1 and a GP block (3 float32 a sample)
+    /// after the others, nothing else changed; GP sums to 1 and gives back DS.
+    #[test]
+    fn bcf_rows_gp_appends_gp_block() {
+        let rec = |buf: &[u8], at: usize| -> (usize, usize, usize) {
+            let ls = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap()) as usize;
+            let li = u32::from_le_bytes(buf[at + 4..at + 8].try_into().unwrap()) as usize;
+            (ls, li, at + 8 + ls + li)
+        };
+        let f32_at = |b: &[u8], o: usize| f32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let mut r = Xs(0xB6C);
+        let mut n_gp = 0usize;
+        for _ in 0..100 {
+            let sc = scenario(&mut r);
+            let setup = setup_of(&sc);
+            let contigs = vec!["22".to_string()];
+            let vi = super::super::bcf_encode::parse_variant_infos(&sc.srp.ids, &sc.srp.original_ids,
+                sc.own_start, sc.own_end, &contigs);
+            for no_ap in [false, true] {
+                let plain = RowFmt { setup: &setup, chip_genotypes: &sc.chip_gt, no_ap, gp: false, var_infos: Some(&vi) };
+                let with = RowFmt { setup: &setup, chip_genotypes: &sc.chip_gt, no_ap, gp: true, var_infos: Some(&vi) };
+                let (gs, tile_n) = tile(&mut r, &sc);
+                let ap = alt_probs(&mut r, setup.n_haps * tile_n);
+                let mut scratch = vec![0f32; sc.n_samples];
+                let mut mask = vec![false; sc.n_samples];
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                plain.bcf_rows(&mut a, &mut scratch, &mut mask, &ap, tile_n, gs, 0..tile_n);
+                with.bcf_rows(&mut b, &mut scratch, &mut mask, &ap, tile_n, gs, 0..tile_n);
+                let (mut pa, mut pb) = (0usize, 0usize);
+                let ns = sc.n_samples;
+                while pa < a.len() {
+                    let (lsa, lia, na) = rec(&a, pa);
+                    let (lsb, lib, nb) = rec(&b, pb);
+                    assert_eq!(lsa, lsb);
+                    let (sa, sb) = (&a[pa + 8..pa + 8 + lsa], &b[pb + 8..pb + 8 + lsb]);
+                    let (ia, ib) = (&a[pa + 8 + lsa..na], &b[pb + 8 + lsb..nb]);
+                    let nfa = sa[23];
+                    if nfa == 1 {
+                        assert_eq!(&a[pa..na], &b[pb..nb]);
+                    } else {
+                        assert_eq!(sb[23], nfa + 1);
+                        assert_eq!(sa[..23], sb[..23]);
+                        assert_eq!(sa[24..], sb[24..]);
+                        assert_eq!(lib, lia + 3 + 12 * ns);
+                        assert_eq!(ia, &ib[..lia]);
+                        let g = &ib[lia..];
+                        assert_eq!(g[..3], [0x11, super::super::bcf_encode::FMT_GP_IDX, 0x35]);
+                        let ds_off = 3 + 2 * ns + 3; // the GT block, then DS's key + descriptor
+                        for s in 0..ns {
+                            let v: Vec<f64> = (0..3).map(|k| f32_at(g, 3 + 12 * s + 4 * k) as f64).collect();
+                            assert!((v.iter().sum::<f64>() - 1.0).abs() < 3e-7, "{v:?}");
+                            let ds = f32_at(ia, ds_off + 4 * s) as f64;
+                            assert!((v[1] + 2.0 * v[2] - ds).abs() < 3e-7, "{v:?} ds {ds}");
+                            n_gp += 1;
+                        }
+                    }
+                    pa = na;
+                    pb = nb;
+                }
+                assert_eq!(pb, b.len());
+            }
+        }
+        assert!(n_gp > 5_000, "{n_gp}");
     }
 
     #[test]

@@ -60,9 +60,12 @@ pub fn file_chromosomes(files: &[PathBuf]) -> std::io::Result<Vec<(crate::srp::S
 /// One chromosome of the panel: its name, and how to load it.
 enum Source<'a> { View(&'a MultiChrSrpReader), File(PathBuf) }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     panels: Panels, input: Input, maps: Maps, params: &LcwgsParams, threads: usize,
     vcf_path: &Path, tsv_path: &Path,
+    // `--header-line` lines for the VCF header.
+    extra_header: &[String],
 ) -> std::io::Result<()> {
     // The panel's chromosomes in its order, and the header's ##contig lines (each ID once).
     let multi = match &panels { Panels::Multi(p) => Some(MultiChrSrpReader::open(p)?), Panels::Files(_) => None };
@@ -136,7 +139,7 @@ pub fn run(
             Err(e) => return Err(std::io::Error::new(e.kind(), format!("chromosome {chr}: {e}"))),
         };
         if writers.is_none() {
-            writers = Some((LcwgsVcfWriter::create(vcf_path, &out.sample_ids, &contig_lines)?,
+            writers = Some((LcwgsVcfWriter::create(vcf_path, &out.sample_ids, &contig_lines, extra_header)?,
                 DoseTsvWriter::create(tsv_path, &out.sample_ids)?, out.sample_ids.clone()));
         }
         let (v, d, ids) = writers.as_mut().expect("writers created above");

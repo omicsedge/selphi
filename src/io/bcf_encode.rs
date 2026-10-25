@@ -21,6 +21,8 @@ pub const FMT_GT_IDX: u8 = 6;
 pub const FMT_DS_IDX: u8 = 7;
 pub const FMT_AP1_IDX: u8 = 8;
 pub const FMT_AP2_IDX: u8 = 9;
+/// FORMAT/GP (`--gp`); its header line is written only when GP is.
+pub const FMT_GP_IDX: u8 = 10;
 
 /// BCF2.2 file magic (required by modern bcftools/htslib).
 pub const BCF_MAGIC: &[u8; 5] = b"BCF\x02\x02";
@@ -40,6 +42,8 @@ const TY_CHAR: u8 = 7;
 const QUAL_MISSING: u32 = 0x7F800001;
 
 /// Write BCF header: magic + VCF header text (with IDX= tags) + null terminator.
+/// `extra_lines` (`--header-line`) follow `##source`; `gp` declares FORMAT/GP.
+#[allow(clippy::too_many_arguments)]
 pub fn write_bcf_header(
     buf: &mut Vec<u8>,
     _n_samples: usize,
@@ -47,12 +51,15 @@ pub fn write_bcf_header(
     contig_field: &str,
     version: &str,
     no_ap: bool,
+    gp: bool,
+    extra_lines: &[String],
 ) {
     let mut header_text = Vec::with_capacity(4096);
 
     use std::io::Write;
     writeln!(header_text, "##fileformat=VCFv4.2").unwrap();
     writeln!(header_text, "##source=Selphi_v{version} SelfDecode™").unwrap();
+    crate::io::vcf_fmt::write_extra_header_lines(&mut header_text, extra_lines).unwrap();
     writeln!(header_text, "##FILTER=<ID=PASS,Description=\"All filters passed\",IDX={}>", FILTER_PASS_IDX).unwrap();
     writeln!(header_text, "##INFO=<ID=IMP,Number=0,Type=Flag,Description=\"Imputed marker\",IDX={}>", INFO_IMP_IDX).unwrap();
     writeln!(header_text, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\",IDX={}>", INFO_AF_IDX).unwrap();
@@ -64,6 +71,10 @@ pub fn write_bcf_header(
     if !no_ap {
         writeln!(header_text, "##FORMAT=<ID=AP1,Number=A,Type=Float,Description=\"estimated ALT dose on first haplotype\",IDX={}>", FMT_AP1_IDX).unwrap();
         writeln!(header_text, "##FORMAT=<ID=AP2,Number=A,Type=Float,Description=\"estimated ALT dose on second haplotype\",IDX={}>", FMT_AP2_IDX).unwrap();
+    }
+    if gp {
+        writeln!(header_text, "##FORMAT=<ID=GP,Number=G,Type=Float,Description=\"{}\",IDX={}>",
+            crate::io::vcf_fmt::GP_DESCRIPTION, FMT_GP_IDX).unwrap();
     }
     writeln!(header_text, "{}", contig_field).unwrap();
     write!(header_text, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT").unwrap();
@@ -295,6 +306,8 @@ pub fn encode_imputed_record(
     n_samples: usize,
     n_haps: usize,
     no_ap: bool,
+    // FORMAT/GP after AP1/AP2 (`--gp`).
+    gp: bool,
     ds_scratch: &mut [f32], // reusable per-sample dosage buffer (len >= n_samples)
     // R4b: per-sample hard-call override at a re-routed chip site. `None` →
     // pre-R4b behavior (byte-identical when refine is off).
@@ -303,7 +316,7 @@ pub fn encode_imputed_record(
     // with the model's dosage because some sample's call was missing or untrusted.
     imp: bool,
 ) {
-    let n_fmt: u8 = if no_ap { 2 } else { 4 }; // GT+DS or GT+DS+AP1+AP2
+    let n_fmt: u8 = (if no_ap { 2 } else { 4 }) + gp as u8; // GT+DS or GT+DS+AP1+AP2, [+GP]
     let n_info: u16 = if imp { 5 } else { 4 }; // AF, AC, AN, DR2[, IMP]
 
     // Hardcall ALT count + dosage-R² via the shared two-pass helper (the same
@@ -344,7 +357,22 @@ pub fn encode_imputed_record(
     if !no_ap {
         emit_ap_imputed(buf, alt_probs, tile_n, v, n_samples, hc);
     }
+    if gp {
+        emit_gp(buf, (0..n_samples).map(|s| r4b_ap(alt_probs, tile_n, v, s, hc)));
+    }
     finalize_record(buf, shared_start, indiv_start);
+}
+
+/// Emit the FORMAT/GP field (`--gp`): three float32 per sample
+/// ([`crate::io::vcf_fmt::gp_f32`] of the sample's emitted `(ap1, ap2)`). Shared
+/// by the full encoder and the batched merger, so both store the same bytes.
+#[inline]
+pub(crate) fn emit_gp(buf: &mut Vec<u8>, aps: impl Iterator<Item = (f32, f32)>) {
+    encode_typed_int8(buf, FMT_GP_IDX as i32);
+    buf.push(0x30 | TY_FLOAT); // n=3, type=float
+    for (ap1, ap2) in aps {
+        for g in crate::io::vcf_fmt::gp_f32(ap1, ap2) { buf.extend_from_slice(&g.to_le_bytes()); }
+    }
 }
 
 /// Partial encoder for batched mode: writes BCF record WITHOUT INFO stats

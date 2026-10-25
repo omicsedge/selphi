@@ -186,6 +186,7 @@ fn setup_output_writers(
     max_variants: usize,
 ) -> (OutputCtx, OutputWriters) {
     let no_ap = args.no_ap;
+    let (gp, extra_header) = (args.gp, args.header_line.as_slice());
 
     if args.vcf && args.bcf {
         eprintln!("Error: --vcf and --bcf are mutually exclusive (both use the same output channel)");
@@ -244,11 +245,11 @@ fn setup_output_writers(
     let (vcf_tx, vcf_writer, vcf_bgzip) = if (formats.vcf || formats.bcf) && !skip_main_writer {
         if formats.bcf {
             selphi::io::pipeline::setup_bcf_writer(
-                n_samples, sample_names, contig_field, version, &out_file, no_ap,
+                n_samples, sample_names, contig_field, version, &out_file, no_ap, gp, extra_header,
             ).expect("Failed to setup BCF writer")
         } else {
             selphi::io::pipeline::setup_vcf_writer(
-                n_samples, sample_names, contig_field, version, &out_file, no_ap,
+                n_samples, sample_names, contig_field, version, &out_file, no_ap, gp, extra_header,
             ).expect("Failed to setup VCF writer")
         }
     } else {
@@ -274,14 +275,14 @@ fn setup_output_writers(
     if batch_active.bcf {
         batch.bcf = selphi::io::bcf_batch::setup_batch_writers(
             n_haps_total, target_batch_size_haps, &batch_tmp_dir,
-            sample_names, contig_field, version, no_ap,
+            sample_names, contig_field, version, no_ap, extra_header,
         ).expect("Failed to setup batch writers");
         selphi_info!("  batched: {} batch BCF writers active (batch_size={} haps)", batch.bcf.len(), target_batch_size_haps);
     }
     if batch_active.vcf {
         batch.vcf = selphi::io::vcf_batch::setup_vcf_batch_writers(
             n_haps_total, target_batch_size_haps, &batch_tmp_dir,
-            sample_names, contig_field, version, no_ap,
+            sample_names, contig_field, version, no_ap, extra_header,
         ).expect("Failed to setup VCF batch writers");
         selphi_info!("  batched: {} batch VCF.gz writers active (batch_size={} haps)", batch.vcf.len(), target_batch_size_haps);
     }
@@ -675,7 +676,7 @@ fn finalize_batched_outputs(
     parquet_batch_writers: &mut Vec<selphi::io::parquet_batch::ParquetBatchWriter>,
     out_file: &Path, out_path: &Path,
     sample_names: &[String], contig_field: &str,
-    version: &str, no_ap: bool,
+    version: &str, no_ap: bool, gp: bool, extra_header: &[String],
 ) {
     // BCF — channel-based per-batch writers, native sample-merger.
     if !batch_writers.is_empty() {
@@ -685,7 +686,7 @@ fn finalize_batched_outputs(
         selphi_info!("  Merging {} batch BCFs → {} ...", batch_paths.len(), out_file.display());
         let t = Instant::now();
         selphi::io::bcf_merge::merge_batch_bcfs(
-            &batch_paths, out_file, sample_names, contig_field, version, no_ap,
+            &batch_paths, out_file, sample_names, contig_field, version, no_ap, gp, extra_header,
         ).expect("Batch BCF merge failed");
         selphi_info!("  Merged in {:.1}s", t.elapsed().as_secs_f64());
         for p in &batch_paths { let _ = std::fs::remove_file(p); }
@@ -698,7 +699,7 @@ fn finalize_batched_outputs(
         selphi_info!("  Merging {} batch VCFs → {} ...", batch_paths.len(), out_file.display());
         let t = Instant::now();
         selphi::io::vcf_merge::merge_batch_vcfs(
-            &batch_paths, out_file, sample_names, contig_field, version, no_ap,
+            &batch_paths, out_file, sample_names, contig_field, version, no_ap, gp, extra_header,
         ).expect("Batch VCF merge failed");
         selphi_info!("  Merged in {:.1}s", t.elapsed().as_secs_f64());
         for p in &batch_paths { let _ = std::fs::remove_file(p); }
@@ -1267,7 +1268,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
             write_phased_vcf(
                 &pr.phased_alleles, &target_markers, &target_idx, &wgs_idx,
                 &sample_names, &srp, n_chip, n_haps, &allele_transforms, &out_path,
-                passthrough.as_ref(), pr.phase_quality.as_deref(),
+                passthrough.as_ref(), pr.phase_quality.as_deref(), &args.header_line,
             ).expect("Failed to write phased VCF");
             selphi_step!("Phase-only VCF: {}", out_path.display());
             selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB",
@@ -1785,6 +1786,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
                 n_samples,
                 chip_genotypes: &targ_bm,
                 no_ap,
+                gp: args.gp,
                 preloaded_chunks: preloaded,
                 preloaded_stripes,
                 site_conf: target_site_conf.as_deref(),
@@ -1839,7 +1841,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
         &mut batch_writers, &mut vcf_batch_writers,
         &mut sd_batch_writers, &mut pgen_batch_writers, &mut parquet_batch_writers,
         &out_file, &out_path,
-        &sample_names, &srp.metadata.contig_field, version, no_ap,
+        &sample_names, &srp.metadata.contig_field, version, no_ap, args.gp, &args.header_line,
     );
 
     // Capture output dimensions before srp is dropped (for the Output summary).

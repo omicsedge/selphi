@@ -316,16 +316,17 @@ fn tsv_row(out: &LcwgsOutput, srp: &SrpReader, v: usize, line: &mut Vec<u8>) -> 
     Ok(())
 }
 
-/// Write the lcWGS imputation result as a bgzipped VCF plus its `.tbi`.
-pub fn write_lcwgs_vcf(out: &LcwgsOutput, srp: &SrpReader, output_path: &std::path::Path) -> std::io::Result<()> {
-    write_lcwgs_vcf_budget(out, srp, output_path, WRITER_BUF - PAR_BUFWRITER)
+/// Write the lcWGS imputation result as a bgzipped VCF plus its `.tbi`
+/// (`extra_header`: the `--header-line` lines, written after `##source`).
+pub fn write_lcwgs_vcf(out: &LcwgsOutput, srp: &SrpReader, output_path: &std::path::Path, extra_header: &[String]) -> std::io::Result<()> {
+    write_lcwgs_vcf_budget(out, srp, output_path, extra_header, WRITER_BUF - PAR_BUFWRITER)
 }
 
 /// [`write_lcwgs_vcf`] with an explicit formatting-pool budget (tests force
 /// tiny blocks and serial rows; the bytes do not depend on it).
-fn write_lcwgs_vcf_budget(out: &LcwgsOutput, srp: &SrpReader, output_path: &std::path::Path, pool_budget: usize) -> std::io::Result<()> {
+fn write_lcwgs_vcf_budget(out: &LcwgsOutput, srp: &SrpReader, output_path: &std::path::Path, extra_header: &[String], pool_budget: usize) -> std::io::Result<()> {
     let lines = contig_lines_for(srp, out)?;
-    let mut w = LcwgsVcfWriter::create_budget(output_path, &out.sample_ids, &lines, pool_budget)?;
+    let mut w = LcwgsVcfWriter::create_budget(output_path, &out.sample_ids, &lines, extra_header, pool_budget)?;
     w.append(out, srp)?;
     w.finish()
 }
@@ -351,16 +352,18 @@ pub struct LcwgsVcfWriter {
 }
 
 impl LcwgsVcfWriter {
-    /// Create the file and write its header (`contig_lines`: every chromosome it will hold).
-    pub fn create(path: &std::path::Path, sample_ids: &[String], contig_lines: &str) -> std::io::Result<Self> {
-        Self::create_budget(path, sample_ids, contig_lines, WRITER_BUF - PAR_BUFWRITER)
+    /// Create the file and write its header (`contig_lines`: every chromosome it
+    /// will hold; `extra_header`: the `--header-line` lines, after `##source`).
+    pub fn create(path: &std::path::Path, sample_ids: &[String], contig_lines: &str, extra_header: &[String]) -> std::io::Result<Self> {
+        Self::create_budget(path, sample_ids, contig_lines, extra_header, WRITER_BUF - PAR_BUFWRITER)
     }
 
-    fn create_budget(path: &std::path::Path, sample_ids: &[String], contig_lines: &str, pool_budget: usize) -> std::io::Result<Self> {
+    fn create_budget(path: &std::path::Path, sample_ids: &[String], contig_lines: &str, extra_header: &[String], pool_budget: usize) -> std::io::Result<Self> {
         let mut w = bgzf_writer(path, PAR_BUFWRITER)?;
         let contig_names = crate::io::bcf_encode::contig_names_from_header_lines(contig_lines);
         writeln!(w, "##fileformat=VCFv4.2")?;
         writeln!(w, "##source=Selphi_v{}_lcWGS SelfDecode\u{2122}", env!("CARGO_PKG_VERSION"))?;
+        crate::io::vcf_fmt::write_extra_header_lines(&mut w, extra_header)?;
         writeln!(w, "##FILTER=<ID=PASS,Description=\"All filters passed\">")?;
         writeln!(w, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT allele frequency\">")?;
         writeln!(w, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">")?;
@@ -691,7 +694,7 @@ mod tests {
             for budget in [1usize, 300, 3_000, 40_000, 1 << 20, WRITER_BUF - PAR_BUFWRITER] {
                 let got_vcf = dir.path().join(format!("got{n_samples}_{budget}.vcf.gz"));
                 let got_tsv = dir.path().join(format!("got{n_samples}_{budget}.tsv.gz"));
-                write_lcwgs_vcf_budget(&out, &srp, &got_vcf, budget).unwrap();
+                write_lcwgs_vcf_budget(&out, &srp, &got_vcf, &[], budget).unwrap();
                 write_dose_tsv_budget(&out, &srp, &got_tsv, budget).unwrap();
                 assert_eq!(gunzip(&got_vcf), gunzip(&want_vcf), "VCF n_samples={n_samples} budget={budget}");
                 assert_eq!(gunzip(&got_tsv), gunzip(&want_tsv), "TSV n_samples={n_samples} budget={budget}");
