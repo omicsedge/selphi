@@ -858,8 +858,8 @@ mod tests {
                     "allele mismatch at variant {v}, hap {h}");
             }
         }
-        assert_eq!(reader.variants[0].pos, 1000);
-        assert_eq!(reader.variants[n_var - 1].pos, 1000 + (n_var as i64 - 1) * 10);
+        assert_eq!(reader.variants.pos(0), 1000);
+        assert_eq!(reader.variants.pos(n_var - 1), 1000 + (n_var as i64 - 1) * 10);
     }
 
     /// Build a tiny single-chr panel on `chrom` whose REF alleles have the given
@@ -977,7 +977,7 @@ mod tests {
         let reader = SrpReader::open(&srp_path, 0).unwrap();
         assert_eq!(reader.original_ids.len(), n_var, "original_ids length must equal n_variants");
         for v in 0..n_var {
-            assert_eq!(reader.original_ids[v], ids[v], "original_id mismatch at variant {v}");
+            assert_eq!(&reader.original_ids[v], ids[v], "original_id mismatch at variant {v}");
         }
     }
 }

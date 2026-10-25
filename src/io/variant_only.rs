@@ -185,13 +185,14 @@ pub fn reference_sites(
     // A position the panel holds two records for is left to imputation: a caller constrained to
     // one allele pair there (calling at a site list) never reports the other ALT, so its absence
     // is no evidence of reference.
-    let shared_pos = |i: usize| (i > 0 && srp.variants[i - 1].pos == srp.variants[i].pos)
-        || (i + 1 < srp.variants.len() && srp.variants[i + 1].pos == srp.variants[i].pos);
+    let panel_pos = srp.variants.positions();
+    let shared_pos = |i: usize| (i > 0 && panel_pos[i - 1] == panel_pos[i])
+        || (i + 1 < panel_pos.len() && panel_pos[i + 1] == panel_pos[i]);
     // Indels are read as reference only when the input calls indels: an absent indel in a file
     // of SNPs alone says nothing (a SNP-only file on chromosome 22 lost 2,772 indel ALTs that way).
     let calls_indels = here.iter().filter(|m| m.ref_allele.len() != m.alt_allele.len()).count() * 100 >= here.len();
-    (0..srp.variants.len()).filter(|&i| {
-        let pos = srp.variants[i].pos;
+    (0..panel_pos.len()).filter(|&i| {
+        let pos = panel_pos[i];
         if !inside(&regions, pos, pos) || shared_pos(i) { return false; }
         let (ref_len, alt_len) = crate::io::pipeline::parse_variant_parts(srp, i)
             .map_or((1, 1), |p| (p.3.len().max(1), p.4.len().max(1)));
@@ -596,8 +597,9 @@ impl FillPlan {
 fn ref_bases_agree(srp: &SrpReader, sample: &[(i64, u8)]) -> bool {
     let (mut checked, mut differ) = (0usize, 0usize);
     for &(pos, base) in sample {
-        let i = srp.variants.partition_point(|v| v.pos < pos);
-        if i >= srp.variants.len() || srp.variants[i].pos != pos { continue; }
+        let panel_pos = srp.variants.positions();
+        let i = panel_pos.partition_point(|&p| p < pos);
+        if i >= panel_pos.len() || panel_pos[i] != pos { continue; }
         let Some(p) = crate::io::pipeline::parse_variant_parts(srp, i) else { continue };
         let Some(&b) = p.3.as_bytes().first() else { continue };
         checked += 1;

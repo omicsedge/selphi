@@ -3,7 +3,7 @@
 use std::fs::File;
 use std::io::{self, Read as _, Seek as _, Cursor};
 use std::path::Path;
-use super::Variant;
+use super::index::{StrColumn, VariantIndex};
 
 /// Most bytes a header, sample-ID or contig section may decompress to (1 GiB).
 pub const MAX_SECTION_BYTES: usize = 1 << 30;
@@ -57,11 +57,14 @@ pub fn decode_zstd_capped(compressed: &[u8], cap: usize, what: &str) -> io::Resu
     Ok(out)
 }
 
-/// Parse binary variant records: [8B pos][1B chr_len][1B ref_len][1B alt_len][chr][ref][alt] per variant.
-pub fn parse_variants_bin(data: &[u8], n: usize) -> std::io::Result<Vec<Variant>> {
+/// Parse binary variant records: [8B pos][1B chr_len][1B ref_len][1B alt_len][chr][ref][alt] per variant,
+/// into the compact [`VariantIndex`]. A field that is not UTF-8 reads as "", as it always did.
+pub fn parse_variants_bin(data: &[u8], n: usize) -> std::io::Result<VariantIndex> {
     let trunc = || std::io::Error::new(std::io::ErrorKind::InvalidData,
         "truncated/corrupt variants_bin section (fewer bytes than n_variants requires)");
-    let mut out = Vec::with_capacity(n);
+    // REF + ALT bytes are below the section's size; the 11-byte record heads are not alleles.
+    let allele_bytes = data.len().saturating_sub(n.saturating_mul(11));
+    let mut out = VariantIndex::with_capacity(n.min(data.len() / 11 + 1), allele_bytes);
     // A section opening with LONG_ALLELE_MARKER uses the escaped lengths (see
     // push_variant_vbin); one without it is the original all-u8 layout.
     let long = data.len() >= 8 && data[..8] == LONG_ALLELE_MARKER;
@@ -83,12 +86,27 @@ pub fn parse_variants_bin(data: &[u8], n: usize) -> std::io::Result<Vec<Variant>
         // Bounds-check the variable-length fields (a mid-record truncation would
         // otherwise panic on the slice) and never silently return fewer than n.
         if off + cl + rl + al > data.len() { return Err(trunc()); }
-        let chr = std::str::from_utf8(&data[off..off+cl]).unwrap_or("").to_string(); off += cl;
-        let ref_allele = std::str::from_utf8(&data[off..off+rl]).unwrap_or("").to_string(); off += rl;
-        let alt_allele = std::str::from_utf8(&data[off..off+al]).unwrap_or("").to_string(); off += al;
-        out.push(Variant { chr, pos, ref_allele, alt_allele });
+        let chr = std::str::from_utf8(&data[off..off+cl]).unwrap_or(""); off += cl;
+        let ref_allele = std::str::from_utf8(&data[off..off+rl]).unwrap_or(""); off += rl;
+        let alt_allele = std::str::from_utf8(&data[off..off+al]).unwrap_or(""); off += al;
+        out.push(chr, pos, ref_allele, alt_allele);
     }
+    out.shrink_to_fit();
     Ok(out)
+}
+
+/// Decompress a newline-delimited section into a [`StrColumn`]: the same entries
+/// [`decode_strings`] returns (invalid UTF-8 replaced, empty entries dropped when
+/// `filter_empty`), held in the decompressed buffer itself.
+pub fn decode_str_column(compressed: &[u8], filter_empty: bool, cap: usize, what: &str) -> std::io::Result<StrColumn> {
+    let raw = decode_zstd_capped(compressed, cap, what).map_err(|e| std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("decode_strings: zstd decompress failed (corrupt SRP section): {}", e)))?;
+    let text = match String::from_utf8(raw) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    };
+    Ok(StrColumn::split_lines(text, filter_empty))
 }
 
 /// Decompress and split newline-delimited strings. Propagates zstd errors
@@ -226,7 +244,7 @@ mod tests {
         finish_vbin(&mut vbin, recs.len());
         let v = parse_variants_bin(&vbin, recs.len()).unwrap();
         for (got, want) in v.iter().zip(&recs) {
-            assert_eq!((got.pos, got.chr.as_str(), got.ref_allele.as_str(), got.alt_allele.as_str()), *want);
+            assert_eq!((got.pos, got.chr, got.ref_allele, got.alt_allele), *want);
         }
         let mut short = Vec::new();
         push_variant_vbin(&mut short, 10, "22", "G", "GT").unwrap();

@@ -87,14 +87,12 @@ pub fn run_lcwgs(
     }
     // --- 1. Parse target VCF with PL ---
     let hash_alleles = !srp.ids.is_empty() && {
-        let first_ref = &srp.variants[0].ref_allele;
+        let first_ref = srp.variants.ref_allele(0);
         !srp.ids[0].contains(first_ref)
     };
-    let positions: Vec<i64> = srp.variants.iter().map(|v| v.pos).collect();
-    let keep = BlockSites { contig: srp.chromosome(), positions: &positions };
+    let keep = BlockSites { contig: srp.chromosome(), positions: srp.variants.positions() };
     let PlVcfResult { gl3: gl3_input, markers, sample_ids, haploid_samples: pl_haploid, blocks } =
         parse_pl_vcf(target_vcf, hash_alleles, Some(&keep))?;
-    drop(positions);
     // A single sample's records were parsed on many workers.
     if sample_ids.len() == 1 { crate::common::mem::release_freed_memory(); }
     memtrace("after parse_pl_vcf (+gl3_input)");
@@ -193,8 +191,8 @@ fn pad_unlisted_snps(srp: &SrpReader, wgs_idx: Vec<usize>, target_idx: Vec<usize
     let mut order: Vec<usize> = (0..blocks.start.len()).collect();
     order.sort_by_key(|&b| blocks.start[b]);
     let block_span = match (order.first(), order.iter().map(|&b| blocks.end[b]).max()) {
-        (Some(&b0), Some(end)) => Some((srp.variants.partition_point(|v| v.pos < blocks.start[b0]),
-            srp.variants.partition_point(|v| v.pos <= end).saturating_sub(1))),
+        (Some(&b0), Some(end)) => Some((srp.variants.positions().partition_point(|&p| p < blocks.start[b0]),
+            srp.variants.positions().partition_point(|&p| p <= end).saturating_sub(1))),
         _ => None,
     };
     let listed_span = wgs_idx.iter().min().zip(wgs_idx.iter().max()).map(|(&a, &b)| (a, b));
@@ -206,7 +204,7 @@ fn pad_unlisted_snps(srp: &SrpReader, wgs_idx: Vec<usize>, target_idx: Vec<usize
     let listed: std::collections::HashSet<usize> = wgs_idx.iter().copied().collect();
     // Literal alleles: a hashed panel stores hashes in `variants`.
     let is_snp = |i: usize| crate::io::pipeline::parse_variant_parts(srp, i)
-        .map_or_else(|| srp.variants[i].ref_allele.len() == 1 && srp.variants[i].alt_allele.len() == 1,
+        .map_or_else(|| srp.variants.ref_allele(i).len() == 1 && srp.variants.alt_allele(i).len() == 1,
             |p| p.3.len() == 1 && p.4.len() == 1);
     let added: Vec<usize> = (lo..=hi.min(srp.variants.len().saturating_sub(1))).filter(|&i| !listed.contains(&i) && is_snp(i)).collect();
     if added.is_empty() && order.is_empty() { let n = none(&wgs_idx); return (wgs_idx, target_idx, n); }
@@ -222,7 +220,7 @@ fn pad_unlisted_snps(srp: &SrpReader, wgs_idx: Vec<usize>, target_idx: Vec<usize
     let mut active: Vec<usize> = Vec::new();
     let mut next = 0usize;
     for &(i, _) in &rows {
-        let pos = srp.variants[i].pos;
+        let pos = srp.variants.pos(i);
         while next < order.len() && blocks.start[order[next]] <= pos { active.push(order[next]); next += 1; }
         active.retain(|&b| blocks.end[b] >= pos);
         if active.is_empty() { cover.push(None); continue; }
@@ -352,7 +350,7 @@ fn impute_from_gl3(
 fn site_cm(srp: &SrpReader, wgs_idx: &[usize], map_path: &str) -> std::io::Result<Vec<f64>> {
     let (map_bp, map_cm) = genmap::load_genetic_map_for(std::path::Path::new(map_path), Some(srp.chromosome()))?;
     Ok(wgs_idx.iter().map(|&wi| {
-        genmap::interpolate_cm_mean_rate(&map_bp, &map_cm, srp.variants[wi].pos)
+        genmap::interpolate_cm_mean_rate(&map_bp, &map_cm, srp.variants.pos(wi))
     }).collect())
 }
 
@@ -455,13 +453,13 @@ fn haploid_chrx(
 ) -> Option<HaploidCells> {
     if !crate::contig::is_chrx(srp.chromosome()) || wgs_idx.is_empty() { return None; }
     let build = params.build.unwrap_or_else(|| {
-        let max_pos = srp.variants.iter().map(|v| v.pos).max().unwrap_or(0);
+        let max_pos = srp.variants.positions().iter().copied().max().unwrap_or(0);
         let b = crate::contig::infer_build_from_chrx_maxpos(max_pos);
         crate::selphi_info!("  chrX PAR: inferred build {:?} from chrX max pos {} (use --build to override)", b, max_pos);
         b
     });
     let non_par: Vec<bool> = wgs_idx.iter()
-        .map(|&wi| !(params.chrx_par && crate::contig::in_chrx_par(srp.variants[wi].pos, build))).collect();
+        .map(|&wi| !(params.chrx_par && crate::contig::in_chrx_par(srp.variants.pos(wi), build))).collect();
     let n_v = wgs_idx.len();
     let called = |s: usize| pl_haploid.get(s).copied().unwrap_or(false);
     let mut haploid: Vec<bool> = match &params.haploids {
@@ -588,8 +586,8 @@ pub fn run_lcwgs_bam(
         Some((c, s, e)) => {
             let want = strip_chr(c);
             (0..srp.variants.len()).filter(|&i| {
-                let v = &srp.variants[i];
-                strip_chr(&v.chr) == want && v.pos >= s && v.pos <= e
+                let v = srp.variants.get(i);
+                strip_chr(v.chr) == want && v.pos >= s && v.pos <= e
             }).collect()
         }
         None => (0..srp.variants.len()).collect(),
@@ -598,15 +596,14 @@ pub fn run_lcwgs_bam(
     if n_shared == 0 {
         return Err(std::io::Error::other("No panel variants in the requested region"));
     }
-    let chrom = srp.variants[wgs_idx[0]].chr.clone();
+    let chrom = srp.variants.chr(wgs_idx[0]).to_string();
 
     // Site arrays for the pileup (ascending by pos; SNP = single-base ref+alt).
-    let pos: Vec<i64> = wgs_idx.iter().map(|&wi| srp.variants[wi].pos).collect();
-    let ref_base: Vec<u8> = wgs_idx.iter().map(|&wi| srp.variants[wi].ref_allele.as_bytes().first().copied().unwrap_or(b'N')).collect();
-    let alt_base: Vec<u8> = wgs_idx.iter().map(|&wi| srp.variants[wi].alt_allele.as_bytes().first().copied().unwrap_or(b'N')).collect();
+    let pos: Vec<i64> = wgs_idx.iter().map(|&wi| srp.variants.pos(wi)).collect();
+    let ref_base: Vec<u8> = wgs_idx.iter().map(|&wi| srp.variants.ref_allele(wi).as_bytes().first().copied().unwrap_or(b'N')).collect();
+    let alt_base: Vec<u8> = wgs_idx.iter().map(|&wi| srp.variants.alt_allele(wi).as_bytes().first().copied().unwrap_or(b'N')).collect();
     let is_snp: Vec<bool> = wgs_idx.iter().map(|&wi| {
-        let v = &srp.variants[wi];
-        v.ref_allele.len() == 1 && v.alt_allele.len() == 1
+        srp.variants.ref_allele(wi).len() == 1 && srp.variants.alt_allele(wi).len() == 1
     }).collect();
     let n_snp = is_snp.iter().filter(|&&b| b).count();
     let n_indel = n_shared - n_snp;
@@ -653,7 +650,7 @@ pub fn run_lcwgs_bam(
                 let inputs: Vec<super::indel_realign::IndelInput> = (0..n_shared)
                     .filter(|&i| !is_snp[i])
                     .map(|i| {
-                        let v = &srp.variants[wgs_idx[i]];
+                        let v = srp.variants.get(wgs_idx[i]);
                         super::indel_realign::IndelInput {
                             var_idx: i,
                             pos: pos[i],
@@ -1020,7 +1017,7 @@ fn run_chunked_gibbs(
                     let ac = chunk_bm.popcount_row(lv, n_ref) as usize;
                     if (1..=64).contains(&ac) {
                         let wi = chunk_wgs[lv];
-                        let var = &srp.variants[wi];
+                        let var = srp.variants.get(wi);
                         let carr: String = (0..n_ref as u32)
                             .filter(|&h| chunk_bm.get(lv, h as usize))
                             .map(|x| x.to_string()).collect::<Vec<_>>().join(",");
@@ -1047,7 +1044,7 @@ fn run_chunked_gibbs(
                 for v in core_start..core_end {
                     let lv = v - buf_start;
                     let wi = chunk_wgs[lv];
-                    let var = &srp.variants[wi];
+                    let var = srp.variants.get(wi);
                     if !targets.contains(&{ var.pos }) { continue; }
                     let ac = chunk_bm.popcount_row(lv, n_ref) as f32;
                     let af = ac / n_ref as f32;

@@ -6,14 +6,17 @@ use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
-use super::{CscChunk, Variant, SrpMetadata, parse_raw_chunk};
+use super::{CscChunk, SrpMetadata, StrColumn, VariantIndex, parse_raw_chunk};
 
 pub struct SrpReader {
     pub metadata: SrpMetadata,
-    pub variants: Vec<Variant>,
+    /// Per-variant chromosome, position, REF and ALT (compact columns).
+    pub variants: VariantIndex,
     pub sample_ids: Vec<String>,
-    pub ids: Vec<String>,
-    pub original_ids: Vec<String>,
+    /// Per-variant synthetic `chrom-pos-ref-alt` IDs (empty entries dropped, as read).
+    pub ids: StrColumn,
+    /// Per-variant original IDs ("" where the panel had none).
+    pub original_ids: StrColumn,
     pub tiled: Option<super::tiled::TiledSrpReader>,
     mmap: Option<memmap2::Mmap>,
     chunk_index: Vec<(u64, u32, u32)>,
@@ -58,7 +61,7 @@ impl SrpReader {
 
         let mut buf4 = [0u8; 4];
         let fpath = std::path::Path::new(&filepath);
-        use super::helpers::{read_section, decode_zstd_capped, decode_strings, MAX_SECTION_BYTES, MAX_INDEX_BYTES};
+        use super::helpers::{read_section, decode_zstd_capped, decode_strings, decode_str_column, MAX_SECTION_BYTES, MAX_INDEX_BYTES};
         // Header
         let hdr_comp = read_section(&mut f, fpath, "header")?;
         let hdr_raw = decode_zstd_capped(&hdr_comp, MAX_SECTION_BYTES, "header")?;
@@ -70,15 +73,16 @@ impl SrpReader {
         let vcomp = read_section(&mut f, fpath, "variant index")?;
         let vraw = decode_zstd_capped(&vcomp, MAX_INDEX_BYTES, "variant index")?;
         let variants = super::helpers::parse_variants_bin(&vraw, metadata.n_variants)?;
+        drop((vcomp, vraw));
 
         // Sample IDs, IDs, Original IDs
         let sample_ids = decode_strings(&read_section(&mut f, fpath, "sample IDs")?, false, MAX_SECTION_BYTES, "sample IDs")?;
-        let ids = decode_strings(&read_section(&mut f, fpath, "variant IDs")?, true, MAX_INDEX_BYTES, "variant IDs")?;
+        let ids = decode_str_column(&read_section(&mut f, fpath, "variant IDs")?, true, MAX_INDEX_BYTES, "variant IDs")?;
         // original_IDs are per-variant with "" for variants lacking an rsID;
         // must NOT filter empties or the length stops matching n_variants and
         // every rsID is lost to the synthetic-ID fallback below. Downstream
         // writers already fall back to the synthetic ID per-variant when "".
-        let orig = decode_strings(&read_section(&mut f, fpath, "original IDs")?, false, MAX_INDEX_BYTES, "original IDs")?;
+        let orig = decode_str_column(&read_section(&mut f, fpath, "original IDs")?, false, MAX_INDEX_BYTES, "original IDs")?;
         let original_ids = if orig.len() == metadata.n_variants { orig } else { ids.clone() };
 
         // Contig field (skip)
@@ -221,7 +225,8 @@ impl SrpReader {
                 chromosome: String::new(), n_variants: n, n_haps: 0, n_chunks: 0, chunk_size: 1024,
                 min_position: 0, max_position: 0, chunk_cv: 0.0, contig_field: String::new(),
             },
-            variants: Vec::new(), sample_ids: Vec::new(), ids, original_ids,
+            variants: VariantIndex::new(), sample_ids: Vec::new(),
+            ids: ids.iter().collect(), original_ids: original_ids.iter().collect(),
             tiled: None, mmap: None, chunk_index: Vec::new(),
         }
     }

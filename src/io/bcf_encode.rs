@@ -563,7 +563,7 @@ pub struct BcfVariantInfo {
 /// `contig_names` is the header's `##contig` ID list in header order; a record
 /// whose chromosome is not in it gets rid 0 (and a one-contig header always
 /// yields 0, so single-chromosome output is unchanged).
-pub fn parse_variant_infos(ids: &[String], original_ids: &[String], start: usize, end: usize, contig_names: &[String]) -> Vec<BcfVariantInfo> {
+pub fn parse_variant_infos(ids: &crate::srp::StrColumn, original_ids: &crate::srp::StrColumn, start: usize, end: usize, contig_names: &[String]) -> Vec<BcfVariantInfo> {
     let rid_of = |chrom: &str| -> i32 {
         if contig_names.len() <= 1 { return 0; }
         contig_names.iter().position(|c| c == chrom)

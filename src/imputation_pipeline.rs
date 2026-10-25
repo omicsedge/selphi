@@ -1049,7 +1049,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         .expect("Failed to load SRP reference panel"));
     let n_ref_variants = srp.n_variants();
     let n_ref = srp.n_haps();
-    let ref_positions: Vec<i64> = srp.variants.iter().map(|v| v.pos).collect();
+    let ref_positions: &[i64] = srp.variants.positions();
     selphi_step!("Loaded SRP: {} variants, {} haplotypes", n_ref_variants, n_ref);
 
     // Refuse chrY/chrMT: the Li-Stephens recombination model does not apply to a
@@ -1159,7 +1159,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
         let (map_bp_raw, map_cm_raw) = genmap::load_genetic_map_for(Path::new(map_path), Some(srp.chromosome()))
             .unwrap_or_else(|e| { selphi_error!("Cannot read genetic map {}: {}", map_path, e); std::process::exit(1); });
         selphi_debug!("Interpolating untyped sites in genetic distance (cM); SELPHI_INTERP_RANK=1 for variant rank");
-        Some(genmap::cumulative_cm_floored(&map_bp_raw, &map_cm_raw, &ref_positions))
+        Some(genmap::cumulative_cm_floored(&map_bp_raw, &map_cm_raw, ref_positions))
     } else { None };
 
     // 6b. Phase (in-memory fusion — no VCF round-trip)
@@ -1261,7 +1261,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
         let mut pr = run_phasing(&PhasingInputs {
             args, srp: &srp, map_path,
             targ_alleles: &targ_alleles, raw_chip_cm: &raw_chip_cm, chip_bps: &chip_bps,
-            ref_positions: &ref_positions, wgs_idx: &wgs_idx,
+            ref_positions, wgs_idx: &wgs_idx,
             n_chip, n_samples, n_ref, ped_locked: ped_locked.as_deref(), seed: args.seed,
             n_members: intra_chain, replicas: replica_plan.k, filled: &filled_mask,
         });
@@ -1307,7 +1307,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
                 run_phasing(&PhasingInputs {
                     args, srp: &srp, map_path,
                     targ_alleles: unph, raw_chip_cm: &raw_chip_cm, chip_bps: &chip_bps,
-                    ref_positions: &ref_positions, wgs_idx: &wgs_idx,
+                    ref_positions, wgs_idx: &wgs_idx,
                     n_chip, n_samples, n_ref, ped_locked: ped_locked.as_deref(), seed: m_seed,
                     n_members: 1, replicas: 1, filled: &filled_mask,
                 }).phased_alleles

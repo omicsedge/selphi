@@ -93,7 +93,7 @@ struct LadderHit { rj: usize, transform: u8, kind: ReconKind }
 /// target alleles (needed to reverse-complement; the panel side may be hashed and
 /// thus not RC-able, so the target is RC'd then re-keyed).
 fn reconcile_ladder(
-    variants: &[crate::srp::Variant], ri: usize, tpos: i64,
+    variants: &crate::srp::VariantIndex, ri: usize, tpos: i64,
     tgt_ref_key: &str, tgt_alt_key: &str,
     tgt_ref_lit: &str, tgt_alt_lit: &str,
     hash_alleles: bool, mode: AlleleMatch,
@@ -110,8 +110,8 @@ fn reconcile_ladder(
     // Rung 1 — REF/ALT swap (same strand): panel.ref==key(alt) && panel.alt==key(ref).
     if matches!(mode, AlleleMatch::Swap | AlleleMatch::Full) {
         let mut rj = ri;
-        while rj < variants.len() && variants[rj].pos == tpos {
-            if variants[rj].ref_allele == tgt_alt_key && variants[rj].alt_allele == tgt_ref_key {
+        while rj < variants.len() && variants.pos(rj) == tpos {
+            if variants.ref_allele(rj) == tgt_alt_key && variants.alt_allele(rj) == tgt_ref_key {
                 return Some(LadderHit { rj, transform: 1, kind: ReconKind::Swap });
             }
             rj += 1;
@@ -122,13 +122,13 @@ fn reconcile_ladder(
         && let (Some(rc_r), Some(rc_a)) = (rc_snp_base(tgt_ref_lit), rc_snp_base(tgt_alt_lit)) {
             let (rk, ak) = (key(&rc_r), key(&rc_a));
             let mut rj = ri;
-            while rj < variants.len() && variants[rj].pos == tpos {
+            while rj < variants.len() && variants.pos(rj) == tpos {
                 // RC same order → REF/ALT roles preserved → no GT flip.
-                if variants[rj].ref_allele == rk && variants[rj].alt_allele == ak {
+                if variants.ref_allele(rj) == rk && variants.alt_allele(rj) == ak {
                     return Some(LadderHit { rj, transform: 0, kind: ReconKind::Strand });
                 }
                 // RC + swap → GT flip.
-                if variants[rj].ref_allele == ak && variants[rj].alt_allele == rk {
+                if variants.ref_allele(rj) == ak && variants.alt_allele(rj) == rk {
                     return Some(LadderHit { rj, transform: 1, kind: ReconKind::Strand });
                 }
                 rj += 1;
@@ -824,7 +824,7 @@ pub fn read_target_vcf(
     path: &str, srp: &SrpReader,
 ) -> std::io::Result<(Vec<String>, Vec<TargetMarker>, Vec<Vec<[u8; 2]>>, bool)> {
     let hash_alleles = !srp.ids.is_empty() && {
-        let first_ref = &srp.variants[0].ref_allele;
+        let first_ref = srp.variants.ref_allele(0);
         !srp.ids[0].contains(first_ref)
     };
 
@@ -1763,7 +1763,7 @@ pub fn intersect_variants(
     let hash_alleles = mode != AlleleMatch::None
         && !srp.ids.is_empty()
         && !srp.variants.is_empty()
-        && !srp.ids[0].contains(&srp.variants[0].ref_allele);
+        && !srp.ids[0].contains(srp.variants.ref_allele(0));
 
     // Sort target indices by position for merge-join
     let mut tgt_order: Vec<usize> = (0..targets.len())
@@ -1781,23 +1781,26 @@ pub fn intersect_variants(
     let mut n_swap = 0usize;
     let mut n_strand = 0usize;
     let mut dups = DuplicateGuard::default();
+    let panel = &srp.variants;
+    let panel_pos = panel.positions();
 
     for &ti in &tgt_order {
         let tpos = targets[ti].pos;
         // Advance ref pointer to first variant at or beyond target pos
-        while ri < srp.variants.len() && srp.variants[ri].pos < tpos { ri += 1; }
+        while ri < panel_pos.len() && panel_pos[ri] < tpos { ri += 1; }
         // Check all ref variants at this position.
         // Match ref+alt as a coherent pair: either both via hash (new SRP format)
         // or both via plain alleles (old/compat format). Mixing (e.g. ref via hash,
         // alt via plain) is rejected to avoid ambiguous cross-format matches.
         let mut matched = false;
         let mut rj = ri;
-        while rj < srp.variants.len() && srp.variants[rj].pos == tpos {
-            let hash_match = srp.variants[rj].ref_allele == targets[ti].ref_hash
-                && srp.variants[rj].alt_allele == targets[ti].alt_hash;
+        while rj < panel_pos.len() && panel_pos[rj] == tpos {
+            let (p_ref, p_alt) = (panel.ref_allele(rj), panel.alt_allele(rj));
+            let hash_match = p_ref == targets[ti].ref_hash
+                && p_alt == targets[ti].alt_hash;
             let plain_match = !hash_match
-                && srp.variants[rj].ref_allele == targets[ti].ref_allele
-                && srp.variants[rj].alt_allele == targets[ti].alt_allele;
+                && p_ref == targets[ti].ref_allele
+                && p_alt == targets[ti].alt_allele;
             if hash_match || plain_match {
                 matched = true;
                 if dups.first(tpos, rj) {
@@ -1813,7 +1816,7 @@ pub fn intersect_variants(
         // Opt-in fallback: only when the exact match failed.
         if !matched && mode != AlleleMatch::None
             && let Some(hit) = reconcile_ladder(
-                &srp.variants, ri, tpos,
+                panel, ri, tpos,
                 &targets[ti].ref_hash, &targets[ti].alt_hash,
                 &targets[ti].ref_allele, &targets[ti].alt_allele,
                 hash_alleles, mode,
@@ -1952,8 +1955,8 @@ fn strip_chr_prefix(s: &str) -> &str {
 /// Same logic as `intersect_variants` but works with raw variant/ID slices.
 pub fn intersect_variants_for_chr(
     ref_chromosome: &str,
-    ref_variants: &[crate::srp::Variant],
-    ref_ids: &[String],
+    ref_variants: &crate::srp::VariantIndex,
+    ref_ids: &crate::srp::StrColumn,
     targets: &[TargetMarker],
     mode: AlleleMatch,
 ) -> (Vec<usize>, Vec<usize>, Vec<u8>) {
@@ -1963,7 +1966,7 @@ pub fn intersect_variants_for_chr(
     let ref_chrom = strip_chr(ref_chromosome);
 
     let hash_alleles = !ref_ids.is_empty() && {
-        let first_ref = &ref_variants[0].ref_allele;
+        let first_ref = ref_variants.ref_allele(0);
         !ref_ids[0].contains(first_ref)
     };
 
@@ -1994,14 +1997,15 @@ pub fn intersect_variants_for_chr(
     let mut n_strand = 0usize;
     let mut dups = DuplicateGuard::default();
 
+    let ref_pos = ref_variants.positions();
     for &ti in &tgt_order {
         let tpos = targets_ref[ti].pos;
-        while ri < ref_variants.len() && ref_variants[ri].pos < tpos { ri += 1; }
+        while ri < ref_pos.len() && ref_pos[ri] < tpos { ri += 1; }
         let mut matched = false;
         let mut rj = ri;
-        while rj < ref_variants.len() && ref_variants[rj].pos == tpos {
-            if ref_variants[rj].ref_allele == targets_ref[ti].ref_hash
-                && ref_variants[rj].alt_allele == targets_ref[ti].alt_hash {
+        while rj < ref_pos.len() && ref_pos[rj] == tpos {
+            if ref_variants.ref_allele(rj) == targets_ref[ti].ref_hash
+                && ref_variants.alt_allele(rj) == targets_ref[ti].alt_hash {
                 matched = true;
                 if dups.first(tpos, rj) {
                     wgs_idx.push(rj);
@@ -2050,14 +2054,17 @@ pub fn intersect_variants_for_chr(
 #[cfg(test)]
 mod allele_match_tests {
     use super::*;
-    use crate::srp::Variant;
+    use crate::srp::VariantIndex;
 
-    fn v(pos: i64, r: &str, a: &str) -> Variant {
-        Variant { chr: "22".into(), pos, ref_allele: r.into(), alt_allele: a.into() }
+    /// A panel of one variant on chromosome 22.
+    fn v(pos: i64, r: &str, a: &str) -> VariantIndex {
+        let mut ix = VariantIndex::new();
+        ix.push("22", pos, r, a);
+        ix
     }
     // Run the ladder against a single panel variant A/G at pos 100 (plain panel).
     fn ladder(tref: &str, talt: &str, mode: AlleleMatch) -> Option<(usize, u8, bool)> {
-        let panel = [v(100, "A", "G")];
+        let panel = v(100, "A", "G");
         reconcile_ladder(&panel, 0, 100, tref, talt, tref, talt, false, mode)
             .map(|h| (h.rj, h.transform, h.kind == ReconKind::Strand))
     }
@@ -2106,7 +2113,7 @@ mod allele_match_tests {
     #[test]
     fn palindrome_is_skipped() {
         // Panel A/T (palindrome). A swapped target T/A is strand-ambiguous → skip.
-        let panel = [v(100, "A", "T")];
+        let panel = v(100, "A", "T");
         let hit = reconcile_ladder(&panel, 0, 100, "T", "A", "T", "A", false, AlleleMatch::Full);
         assert!(hit.is_none());
     }
@@ -2115,10 +2122,10 @@ mod allele_match_tests {
     fn indel_mirror_is_not_a_swap() {
         // Panel deletion AT>A; a target insertion A>AT at the same position is another
         // variant, not the deletion with its labels swapped.
-        let panel = [v(100, "AT", "A")];
+        let panel = v(100, "AT", "A");
         assert!(reconcile_ladder(&panel, 0, 100, "A", "AT", "A", "AT", false, AlleleMatch::Full).is_none());
         // An equal-length substitution still swaps.
-        let panel = [v(100, "AC", "GT")];
+        let panel = v(100, "AC", "GT");
         assert!(reconcile_ladder(&panel, 0, 100, "GT", "AC", "GT", "AC", false, AlleleMatch::Swap).is_some());
     }
 

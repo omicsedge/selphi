@@ -60,10 +60,10 @@ fn cohort_from_srp(input_path: &str) -> Cohort {
         }
     }
     let markers: Vec<TargetMarker> = srp.variants.iter().enumerate().map(|(i, vv)| TargetMarker {
-        chrom: vv.chr.clone(), pos: vv.pos,
-        ref_allele: vv.ref_allele.clone(), alt_allele: vv.alt_allele.clone(),
+        chrom: vv.chr.to_string(), pos: vv.pos,
+        ref_allele: vv.ref_allele.to_string(), alt_allele: vv.alt_allele.to_string(),
         ref_hash: String::new(), alt_hash: String::new(),
-        id: srp.original_ids.get(i).cloned().unwrap_or_default(), unphased_het: false,
+        id: srp.original_ids.get(i).map(str::to_string).unwrap_or_default(), unphased_het: false,
     }).collect();
     let sample_names = if srp.sample_ids.len() == n_samples {
         srp.sample_ids.clone()

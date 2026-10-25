@@ -234,7 +234,7 @@ pub fn write_bref3_from_srp(source_path: &Path, output_path: &Path) -> io::Resul
 
         // Unpack each variant row from the chunk.
         for (local_i, gi) in wgs_idx.iter().enumerate() {
-            let v = &reader.variants[*gi];
+            let v = reader.variants.get(*gi);
             let mut alleles = vec![0u8; n_haps];
             let row = bm.row(local_i);
             for h in 0..n_haps {
@@ -256,9 +256,9 @@ pub fn write_bref3_from_srp(source_path: &Path, output_path: &Path) -> io::Resul
                 pos: v.pos as i32,
                 // Preserve the original variant ID (rsID) carried in the SRP's
                 // original_IDs section; "." / empty becomes a no-ID record.
-                id: reader.original_ids.get(*gi).cloned().unwrap_or_default(),
-                ref_allele: v.ref_allele.clone(),
-                alt_allele: v.alt_allele.clone(),
+                id: reader.original_ids.get(*gi).map(str::to_string).unwrap_or_default(),
+                ref_allele: v.ref_allele.to_string(),
+                alt_allele: v.alt_allele.to_string(),
                 alleles,
                 major_allele,
                 minor_count,

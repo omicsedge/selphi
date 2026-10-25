@@ -13,8 +13,8 @@ use serde_json::Value as JsonValue;
 
 use super::{
     GlobalSrpMetadata, ChrDirectoryEntry,
-    SrpMetadata, Variant,
-    helpers::{read_section, decode_zstd_capped, decode_strings, MAX_SECTION_BYTES, MAX_INDEX_BYTES},
+    SrpMetadata, StrColumn, VariantIndex,
+    helpers::{read_section, decode_zstd_capped, decode_str_column, MAX_SECTION_BYTES, MAX_INDEX_BYTES},
     tiled::{TiledSrpReader, TileEntryPub},
 };
 
@@ -28,10 +28,10 @@ use super::{
 /// can operate on it without modification.
 pub struct ChrSrpView {
     pub metadata: SrpMetadata,
-    pub variants: Vec<Variant>,
+    pub variants: VariantIndex,
     pub sample_ids: Vec<String>,
-    pub ids: Vec<String>,
-    pub original_ids: Vec<String>,
+    pub ids: StrColumn,
+    pub original_ids: StrColumn,
     pub tiled: Option<TiledSrpReader>,
 }
 
@@ -202,14 +202,15 @@ impl MultiChrSrpReader {
         let vcomp = read_section(&mut f, &self.path, "variant index")?;
         let vraw = decode_zstd_capped(&vcomp, MAX_INDEX_BYTES, "variant index")?;
         let variants = super::helpers::parse_variants_bin(&vraw, entry.n_variants as usize)?;
+        drop((vcomp, vraw));
 
         // IDs
-        let ids = decode_strings(&read_section(&mut f, &self.path, "variant IDs")?, true, MAX_INDEX_BYTES, "variant IDs")?;
+        let ids = decode_str_column(&read_section(&mut f, &self.path, "variant IDs")?, true, MAX_INDEX_BYTES, "variant IDs")?;
 
         // Original IDs — must NOT filter empties (per-variant, "" for no-rsID),
         // else the length stops matching n_variants and every rsID is lost to
         // the synthetic-ID fallback below (matches the single-chr reader fix).
-        let orig = decode_strings(&read_section(&mut f, &self.path, "original IDs")?, false, MAX_INDEX_BYTES, "original IDs")?;
+        let orig = decode_str_column(&read_section(&mut f, &self.path, "original IDs")?, false, MAX_INDEX_BYTES, "original IDs")?;
         let original_ids = if orig.len() == entry.n_variants as usize { orig } else { ids.clone() };
 
         // Tile index

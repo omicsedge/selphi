@@ -417,7 +417,7 @@ pub fn for_chromosome(
         None => crate::io::pipeline::parse_variant_parts(srp, 0).map(|p| p.0.to_string())
             .unwrap_or_else(|| srp.chromosome().to_string()),
     };
-    Ok(Some(Passthrough::new(&contig, recs, |i| srp.variants[i].pos, srp.variants.len())))
+    Ok(Some(Passthrough::new(&contig, recs, |i| srp.variants.pos(i), srp.variants.len())))
 }
 
 /// One log line: how many records were carried and how many only reach VCF/BCF.

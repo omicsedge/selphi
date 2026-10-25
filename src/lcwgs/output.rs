@@ -64,7 +64,7 @@ fn push_u64(buf: &mut Vec<u8>, mut n: u64) {
 fn identity<'a>(srp: &'a SrpReader, out: &LcwgsOutput, r: usize) -> std::io::Result<(&'a str, &'a str, &'a str, &'a str, &'a str)> {
     let wi = out.panel_idx[r];
     crate::io::pipeline::parse_variant_parts(srp, wi).ok_or_else(|| std::io::Error::new(
-        std::io::ErrorKind::InvalidData, format!("malformed panel variant ID '{}'", srp.ids[wi])))
+        std::io::ErrorKind::InvalidData, format!("malformed panel variant ID '{}'", &srp.ids[wi])))
 }
 
 /// Writer-side memory of the serial writers: their `BufWriter`. The parallel
@@ -265,7 +265,7 @@ fn vcf_row<'a>(
         cc.ref_id = crate::srp::csi::tbi_ref_id(contig_names, chrom.as_bytes());
     }
     let pos_1: i64 = pos.parse().map_err(|_| std::io::Error::new(
-        std::io::ErrorKind::InvalidData, format!("malformed position in panel variant ID '{}'", srp.ids[out.panel_idx[v]])))?;
+        std::io::ErrorKind::InvalidData, format!("malformed position in panel variant ID '{}'", &srp.ids[out.panel_idx[v]])))?;
     let meta = crate::srp::csi::TbiRec { pos: pos_1 - 1, rlen: r.len().max(1) as u32, ref_id: cc.ref_id };
 
     // INFO AF = mean dosage / 2 across samples
@@ -531,7 +531,7 @@ mod tests {
                 ref_id = crate::srp::csi::tbi_ref_id(&contig_names, chrom.as_bytes());
             }
             let pos_1: i64 = pos.parse().map_err(|_| std::io::Error::new(
-                std::io::ErrorKind::InvalidData, format!("malformed position in panel variant ID '{}'", srp.ids[out.panel_idx[v]])))?;
+                std::io::ErrorKind::InvalidData, format!("malformed position in panel variant ID '{}'", &srp.ids[out.panel_idx[v]])))?;
             record_meta.push(crate::srp::csi::TbiRec { pos: pos_1 - 1, rlen: r.len().max(1) as u32, ref_id });
             let row = &out.dosage[v * n_samples..(v + 1) * n_samples];
             let ds_sum: f64 = row.iter().map(|&d| d as f64).sum();

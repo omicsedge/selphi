@@ -69,7 +69,7 @@ pub fn run_pipeline(
 
     // --- 1. Parse the target VCF/BCF (PL → gl3), matching run_lcwgs's setup. ---
     let hash_alleles = !srp.ids.is_empty() && {
-        let first_ref = &srp.variants[0].ref_allele;
+        let first_ref = srp.variants.ref_allele(0);
         !srp.ids[0].contains(first_ref)
     };
     let PlVcfResult { gl3: gl3_input, markers, sample_ids, .. } =
@@ -110,7 +110,7 @@ pub fn run_pipeline(
         crate::genmap::load_genetic_map_for(std::path::Path::new(map_path), Some(srp.chromosome()))?;
     let cm: Vec<f64> = wgs_idx
         .iter()
-        .map(|&wi| crate::genmap::interpolate_cm_mean_rate(&map_bp, &map_cm, srp.variants[wi].pos))
+        .map(|&wi| crate::genmap::interpolate_cm_mean_rate(&map_bp, &map_cm, srp.variants.pos(wi)))
         .collect();
 
     // Build the reference VariantMap: cref/calt by popcount over the ref bitmatrix
@@ -120,12 +120,12 @@ pub fn run_pipeline(
     for s in 0..n_shared {
         let calt = ref_bm.popcount_row(s, n_ref_haps);
         let cref = n_ref_haps as u32 - calt;
-        let v = &srp.variants[wgs_idx[s]];
+        let v = srp.variants.get(wgs_idx[s]);
         vmap.vars.push(Variant {
             bp: v.pos,
             id: format!("{}:{}", v.chr, v.pos),
-            ref_a: v.ref_allele.clone(),
-            alt_a: v.alt_allele.clone(),
+            ref_a: v.ref_allele.to_string(),
+            alt_a: v.alt_allele.to_string(),
             vtype: 0,
             idx: s as i32,
             cref,

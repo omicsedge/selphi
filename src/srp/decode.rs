@@ -411,7 +411,7 @@ fn decode_srp(source: &Path, output: &Path, fmt: OutFmt, threads: usize, extra_h
     let contigs: Vec<Contig> = vec![(chrom, grch38_len(reader.chromosome()))];
 
     // Bind the immutable, Sync parts up front so the rayon closure captures only
-    // `&Vec` (Sync) — never the whole reader (whose tiled cache may not be Sync).
+    // `&VariantIndex` / `&StrColumn` (Sync) — never the whole reader (whose tiled cache may not be Sync).
     let sample_ids = reader.sample_ids.clone();
     let variants = &reader.variants;
     let ids = &reader.ids;
@@ -427,18 +427,18 @@ fn decode_srp(source: &Path, output: &Path, fmt: OutFmt, threads: usize, extra_h
             .into_par_iter()
             .map(|local| {
                 let gi = base + local;
-                let v = &variants[gi];
+                let v = variants.get(gi);
                 let mut alleles = vec![0u8; n_haps];
                 for (h, slot) in alleles.iter_mut().enumerate() {
                     if bm.get(local, h) { *slot = 1; }
                 }
-                let id = ids.get(gi).filter(|s| !s.is_empty()).cloned().unwrap_or_else(|| ".".to_string());
+                let id = ids.get(gi).filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| ".".to_string());
                 SiteRec {
                     chrom_idx: 0,
                     pos: v.pos,
                     id,
-                    ref_allele: v.ref_allele.clone(),
-                    alt_alleles: vec![v.alt_allele.clone()],
+                    ref_allele: v.ref_allele.to_string(),
+                    alt_alleles: vec![v.alt_allele.to_string()],
                     alleles,
                 }
             })

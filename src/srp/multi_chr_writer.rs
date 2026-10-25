@@ -388,7 +388,7 @@ pub fn merge_samples_single_chr(
     srp_paths: &[std::path::PathBuf],
     output_path: &Path,
 ) -> io::Result<()> {
-    use super::{SrpReader, Variant};
+    use super::{SrpReader, VariantRef};
     use std::collections::{BTreeMap, HashSet};
 
     if srp_paths.is_empty() {
@@ -455,16 +455,15 @@ pub fn merge_samples_single_chr(
     //    first-encountered order would interleave two readers' positions and break
     //    the position-sorted invariant that downstream relies on (the intersect
     //    forward-only cursor in target_io, and consecutive-site cM deltas in genmap).
-    let mut uniq: BTreeMap<(i64, String, String), Variant> = BTreeMap::new();
+    let mut uniq: BTreeMap<(i64, &str, &str), VariantRef<'_>> = BTreeMap::new();
     for r in &readers {
-        for v in &r.variants {
-            uniq.entry((v.pos, v.ref_allele.clone(), v.alt_allele.clone()))
-                .or_insert_with(|| v.clone());
+        for v in r.variants.iter() {
+            uniq.entry((v.pos, v.ref_allele, v.alt_allele)).or_insert(v);
         }
     }
     let n_variants = uniq.len();
-    let mut var_map: BTreeMap<(i64, String, String), usize> = BTreeMap::new();
-    let mut merged_variants: Vec<Variant> = Vec::with_capacity(n_variants);
+    let mut var_map: BTreeMap<(i64, &str, &str), usize> = BTreeMap::new();
+    let mut merged_variants: Vec<VariantRef<'_>> = Vec::with_capacity(n_variants);
     for (i, (key, var)) in uniq.into_iter().enumerate() {
         var_map.insert(key, i);
         merged_variants.push(var);
@@ -473,10 +472,7 @@ pub fn merge_samples_single_chr(
 
     // 4. For each reader, build mapping: reader_var_idx → merged_var_idx
     let reader_var_maps: Vec<Vec<usize>> = readers.iter().map(|r| {
-        r.variants.iter().map(|v| {
-            let key = (v.pos, v.ref_allele.clone(), v.alt_allele.clone());
-            var_map[&key]
-        }).collect()
+        r.variants.iter().map(|v| var_map[&(v.pos, v.ref_allele, v.alt_allele)]).collect()
     }).collect();
 
     // 5. Build tiles: iterate stripes, read from each reader, scatter into merged tile columns
@@ -501,7 +497,7 @@ pub fn merge_samples_single_chr(
         // ID is written to BOTH the synthetic and original ID streams.
         let id = format!("{}-{}-{}-{}", v.chr, v.pos, v.ref_allele, v.alt_allele);
         super::writer::push_variant_index(&mut vbin, &mut ids_buf, &mut orig_buf, i == 0,
-            &v.chr, v.pos, &v.ref_allele, &v.alt_allele, &id)?;
+            v.chr, v.pos, v.ref_allele, v.alt_allele, &id)?;
     }
     let long = super::helpers::vbin_has_long(&vbin, n_variants);
 
@@ -914,7 +910,7 @@ pub fn merge_single_chr_srps(
         let mut ids_buf = Vec::with_capacity(n_variants * 30);
         let mut orig_buf = Vec::with_capacity(n_variants * 20);
         for (i, v) in reader.variants.iter().enumerate() {
-            super::helpers::push_variant_vbin(&mut vbin, v.pos, &v.chr, &v.ref_allele, &v.alt_allele)?;
+            super::helpers::push_variant_vbin(&mut vbin, v.pos, v.chr, v.ref_allele, v.alt_allele)?;
             if i > 0 { ids_buf.push(b'\n'); orig_buf.push(b'\n'); }
             ids_buf.extend_from_slice(reader.ids[i].as_bytes());
             if i < reader.original_ids.len() {

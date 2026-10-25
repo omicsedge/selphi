@@ -239,7 +239,7 @@ fn prepare_chr_target(
     let n_chip = wgs_idx.len();
     if n_chip == 0 { return None; }
     let targ_alleles = extract_target_alleles(target_genotypes, &target_idx, n_chip, n_haps, &transforms, miss_val);
-    let chip_bps: Vec<i64> = wgs_idx.iter().map(|&wi| srp.variants[wi].pos).collect();
+    let chip_bps: Vec<i64> = wgs_idx.iter().map(|&wi| srp.variants.pos(wi)).collect();
     let nocall = build_nocall_conf(target_genotypes, &target_idx, n_chip, n_haps / 2);
     Some((wgs_idx, target_idx, targ_alleles, chip_bps, n_chip, nocall, transforms, (matched_idx, uncalled, filled)))
 }
@@ -424,7 +424,7 @@ fn phase_chr(
     ).cloned().unwrap_or_else(|| {
         multi_map.get(chr_name).cloned().unwrap_or_default()
     });
-    let ref_bp: Vec<i64> = srp.variants.iter().map(|v| v.pos).collect();
+    let ref_bp: &[i64] = srp.variants.positions();
 
     // Extract bitmatrix for phasing
     let ref_bm = srp.extract_ref_alleles_bitmatrix(wgs_idx);
@@ -477,7 +477,7 @@ e.g. a male chrX): phasing on all {} called sites", scaffold.indices.len());
     let dp = selphi::diploid::diploid_phase_bm_prefiltered(
         &targ_alleles, common_ref_bm, &common_chip_indices,
         selphi::diploid::phase_rare::RareRef::Full(&ref_bm),
-        raw_chip_cm, chip_bps, &ref_bp, &map_bp_raw, &map_cm_raw,
+        raw_chip_cm, chip_bps, ref_bp, &map_bp_raw, &map_cm_raw,
         n_chip, n_samples, n_ref,
         config.seed, config.threads, config.max_cond_haps, n_members,
         ped_locked, replicas,
@@ -895,14 +895,14 @@ pub fn run_multi_chr(
             needs_phasing, chr_name, &mut targ_alleles,
             &sample_names, &target_idx, chr_genotypes,
             n_chip, n_samples, n_haps, &chip_bps,
-            srp.variants.iter().map(|v| v.pos).max().unwrap_or(0),
+            srp.variants.positions().iter().copied().max().unwrap_or(0),
             &filled_mask, &split_mask,
         );
         let par_conf = crate::prephase::par_collapsed_conf();
         let par_calls = if par_conf < 1.0 {
             crate::prephase::collapsed_par_calls(
                 config.chrx_par, config.build, chr_name, &target_idx, chr_genotypes,
-                n_chip, n_samples, &chip_bps, srp.variants.iter().map(|v| v.pos).max().unwrap_or(0), &filled_mask, &split_mask)
+                n_chip, n_samples, &chip_bps, srp.variants.positions().iter().copied().max().unwrap_or(0), &filled_mask, &split_mask)
         } else { Vec::new() };
         let nocall = if haploid_resets.is_empty() && par_calls.is_empty() { nocall } else {
             let (mut site, mut ps) = match nocall { Some((a, b)) => (Some(a), Some(b)), None => (None, None) };
@@ -981,8 +981,7 @@ pub fn run_multi_chr(
             let (map_bp, map_cm) = multi_map.get(key).or_else(|| multi_map.get(chr_name))
                 .map(|(bp, cm)| (bp.as_slice(), cm.as_slice()))
                 .unwrap_or((&[], &[]));
-            let ref_bp: Vec<i64> = srp.variants.iter().map(|v| v.pos).collect();
-            Some(genmap::cumulative_cm_floored(map_bp, map_cm, &ref_bp))
+            Some(genmap::cumulative_cm_floored(map_bp, map_cm, srp.variants.positions()))
         } else { None };
 
         // Auto-calibrate parameters — shared verbatim with the single-chr

@@ -568,8 +568,8 @@ fn panel_sites_in_span(refpanel: &str, s: &Sniff) -> Option<u64> {
     } else { selphi::srp::SrpReader::open(refpanel, 0).ok()? };
     if strip(srp.chromosome()) != strip(chrom) { return None; }
     let (lo, hi) = (s.dens_min as i64, s.dens_max as i64);
-    let a = srp.variants.partition_point(|v| v.pos < lo);
-    let b = srp.variants.partition_point(|v| v.pos <= hi);
+    let a = srp.variants.positions().partition_point(|&p| p < lo);
+    let b = srp.variants.positions().partition_point(|&p| p <= hi);
     Some((b - a) as u64)
 }
 

@@ -18,6 +18,7 @@
 
 mod reader;
 pub mod helpers;
+pub mod index;
 pub mod writer;
 pub mod bref3;
 pub mod bref3_writer;
@@ -30,6 +31,7 @@ pub mod multi_chr_reader;
 pub mod multi_chr_writer;
 pub use reader::SrpReader;
 pub use multi_chr_reader::{MultiChrSrpReader, ChrSrpView};
+pub use index::{StrColumn, VariantIndex, VariantRef};
 
 use std::io::Cursor;
 use serde_json::Value as JsonValue;
@@ -251,19 +253,6 @@ impl SparseTile {
         let hi = self.indptr[col + 1] as usize;
         (lo, hi)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Variant struct
-// ---------------------------------------------------------------------------
-
-/// A variant in the reference panel.
-#[derive(Debug, Clone)]
-pub struct Variant {
-    pub chr: String,
-    pub pos: i64,
-    pub ref_allele: String,
-    pub alt_allele: String,
 }
 
 // ---------------------------------------------------------------------------
