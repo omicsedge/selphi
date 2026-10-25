@@ -446,6 +446,8 @@ fn merge_one_record(
                     let x = if key == FMT_AP1_IDX { unit_prob(a1) }
                         else if key == FMT_AP2_IDX { unit_prob(a2) }
                         else if n_fmt == 4 { unit_prob(a1) + unit_prob(a2) }
+                        // Intermediates without AP1/AP2 (n_fmt 2) are not produced by the CLI; their
+                        // DS can only be clamped as a whole (not per haplotype as unbatched does).
                         else if raw > 2.0 { 2.0 } else if raw < 0.0 { 0.0 } else { raw };
                     out.extend_from_slice(&x.to_le_bytes());
                 }

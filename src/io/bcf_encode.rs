@@ -628,7 +628,20 @@ pub fn contig_lines_with_idx(contig_field: &str) -> String {
     let mut k = 0usize;
     contig_field.lines().map(|l| {
         let Some(body) = l.strip_prefix("##contig=<").and_then(|b| b.strip_suffix('>')) else { return l.to_string() };
-        let kept: Vec<&str> = body.split(',').filter(|f| !(f.starts_with("IDX=") && f[4..].bytes().all(|c| c.is_ascii_digit()) && f.len() > 4)).collect();
+        // Split at top-level commas only: a quoted value (Description="a,IDX=7,b") is one field.
+        let mut fields: Vec<&str> = Vec::new();
+        let (mut start, mut quoted, mut escaped) = (0usize, false, false);
+        for (i, c) in body.char_indices() {
+            if escaped { escaped = false; continue; }
+            match c {
+                '\\' if quoted => escaped = true,
+                '"' => quoted = !quoted,
+                ',' if !quoted => { fields.push(&body[start..i]); start = i + 1; }
+                _ => {}
+            }
+        }
+        fields.push(&body[start..]);
+        let kept: Vec<&str> = fields.into_iter().filter(|f| !(f.len() > 4 && f.starts_with("IDX=") && f[4..].bytes().all(|c| c.is_ascii_digit()))).collect();
         let line = format!("##contig=<{},IDX={}>", kept.join(","), k);
         k += 1;
         line
@@ -667,5 +680,10 @@ mod contig_idx_tests {
                    "##contig=<ID=21,IDX=0>\n##contig=<ID=22,IDX=1>");
         // a field merely starting with IDX that is not IDX=<digits> is kept
         assert_eq!(contig_lines_with_idx("##contig=<ID=X,IDXNOTE=a>"), "##contig=<ID=X,IDXNOTE=a,IDX=0>");
+        // IDX inside a quoted value is not a field
+        assert_eq!(contig_lines_with_idx("##contig=<ID=1,Description=\"a,IDX=7,b\">"),
+                   "##contig=<ID=1,Description=\"a,IDX=7,b\",IDX=0>");
+        assert_eq!(contig_lines_with_idx("##contig=<ID=1,Description=\"q\\\",IDX=7\",IDX=3>"),
+                   "##contig=<ID=1,Description=\"q\\\",IDX=7\",IDX=0>");
     }
 }
