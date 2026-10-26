@@ -410,23 +410,31 @@ fn trans_hap_accumulate_legacy(
 /// Bytes of forward states at missing loci one segment HMM may keep: the
 /// forward keeps all of a window's when they fit (SHAPEIT5 keeps them whatever
 /// the size — on dense input as much memory again as the per-segment store);
-/// otherwise each replay keeps as many as fit (`replay_slots`), and a segment
-/// with more missing loci is replayed again for each further batch.
+/// otherwise each replay keeps as many as fit (`replay_split`), and a segment
+/// with more missing loci is replayed again for each further batch, from the
+/// nearest forward state checkpointed inside the segment ([`ReplayCkpts`]).
 const MIS_REPLAY_BYTES: usize = 8 << 20;
 
 /// Upper bound on the bytes a segment HMM holds for the IMPUTE of a window with
 /// `n_mis` missing loci and `k` conditioning haplotypes: the window-wide store
-/// when it fits in [`MIS_REPLAY_BYTES`], otherwise one replay's states plus the
-/// backward state set aside during a replay.
+/// when it fits in [`MIS_REPLAY_BYTES`], otherwise one replay's states and the
+/// segment's checkpoints (in the same buffer), plus the backward state set
+/// aside during a replay.
 pub(crate) fn missing_store_bound(n_mis: usize, k: usize) -> usize {
     if n_mis == 0 { return 0; }
     // Any conditioning-set size up to `k`: the window store is taken only when it
-    // fits in MIS_REPLAY_BYTES, and a replay keeps at most as many states as fit
-    // there (at least 16, or the debug cap) — never more than the window has.
+    // fits in MIS_REPLAY_BYTES; a replay's slots plus the checkpoints' vectors
+    // fit there too (or are 16 states when fewer fit, or twice the debug cap),
+    // and the checkpoints' records are at most MAX_REPLAY_CKPTS.
     let per = k * HAP_NUMBER * 4 + HAP_NUMBER * 4;
+    let spare = (k * HAP_NUMBER + k) * 4;
+    if n_mis * per <= MIS_REPLAY_BYTES { return n_mis * per + spare; }
+    // A smaller conditioning set may still take the window store (up to the
+    // budget), hence the max with MIS_REPLAY_BYTES in every case.
     let cap = replay_cap_knob();
-    let replay = if cap > 0 { cap * per } else { (16 * per).max(MIS_REPLAY_BYTES) };
-    (n_mis * per).min(replay.max(MIS_REPLAY_BYTES)) + (k * HAP_NUMBER + k) * 4
+    let states = if cap > 0 { 2 * cap * per } else { 16 * per };
+    let ckpts = if cap > 0 { cap } else { MAX_REPLAY_CKPTS };
+    MIS_REPLAY_BYTES.max(states) + ckpts * CKPT_META_BYTES + spare
 }
 
 /// `SELPHI_DIPLOID_MIS_REPLAY_CAP` (0 = unset), read once.
@@ -445,13 +453,142 @@ pub(super) fn grow_exact<T: Clone>(v: &mut Vec<T>, len: usize, fill: T) {
     }
 }
 
-/// Missing loci whose forward states one replay keeps: as many states
-/// (`n_states` floats plus the `HAP_NUMBER` per-config sums) as fit in
-/// [`MIS_REPLAY_BYTES`], at least 16.
-pub(super) fn replay_slots(n_states: usize, bytes_per_float: usize) -> usize {
+/// Bytes a checkpoint holds besides its state vector: its [`Ckpt`] record (f64
+/// sums at most), its free-list entry and its entry in a replay's plan.
+const CKPT_META_BYTES: usize = std::mem::size_of::<Ckpt<f64>>() + 2 * std::mem::size_of::<usize>();
+
+/// Most checkpoints one segment keeps (only small conditioning sets, whose
+/// states are cheap, would afford more).
+const MAX_REPLAY_CKPTS: usize = 1024;
+
+/// How a segment with `m` missing loci is replayed: `(slots, checkpoints)` —
+/// the forward states one replay keeps (`n_states` floats plus the `HAP_NUMBER`
+/// per-config sums each), and the forward states the segment may keep in
+/// between (`ReplayCkpts`, their vectors after the slots in the same buffer).
+/// One replay keeps as many states as fit in [`MIS_REPLAY_BYTES`], at least 16
+/// (`t`), and each replay restarts at the segment's start, as before, while the
+/// segment has at most 2.5 t missing loci (up to 3 replays). A longer segment
+/// splits the same budget in half, so each later replay restarts near its loci
+/// instead, where restarting at the start made the backward quadratic in the
+/// segment's length (a chrX male: one segment per window, hundreds of no-calls:
+/// 3.5x the phasing time). Simulated with evenly spaced missing loci, the
+/// replays walk the segment ~1.8-2.2 times above 2.5 t (one replay per chunk
+/// from the start: (chunks + 1) / 2 times), and 2.5 t is where the two meet;
+/// uneven spacing moves both. `SELPHI_DIPLOID_MIS_REPLAY_CAP=c` keeps `c` of
+/// each (a cap of 1 or 2 can stay quadratic).
+pub(super) fn replay_split(n_states: usize, bytes_per_float: usize, m: usize) -> (usize, usize) {
     let cap = replay_cap_knob();
-    if cap > 0 { return cap; }
-    (MIS_REPLAY_BYTES / ((n_states + HAP_NUMBER) * bytes_per_float)).max(16)
+    if cap > 0 { return (cap, if m > cap { cap } else { 0 }); }
+    let t = MIS_REPLAY_BYTES / ((n_states + HAP_NUMBER) * bytes_per_float);
+    if 2 * m <= 5 * t.max(16) { return (t.max(16), 0); }
+    if t < 16 { return (8, 8); }
+    (t / 2, (t - t / 2).min(MAX_REPLAY_CKPTS))
+}
+
+/// A forward state kept inside a segment: the state right after the forward's
+/// update at the segment's missing locus with ordinal `ord` (locus `vi`), whose
+/// vector is state `slot` of the buffer the replay slots come first in.
+#[derive(Clone, Copy)]
+pub(super) struct Ckpt<T> {
+    pub ord: usize,
+    pub vi: usize,
+    slot: usize,
+    pub sum_h: [T; HAP_NUMBER],
+    pub sum_t: T,
+    pub prev_abs: usize,
+    pub abs_ambiguous: usize,
+}
+
+/// Forward states the backward keeps inside the current segment so a replay
+/// starts from the nearest one before the missing loci it needs rather than
+/// from the segment's start. Inside a segment the forward's RUN kernels read
+/// only the state vector, its per-config and total sums and the cursor, so a
+/// replay resumed from a checkpoint computes the same bits as one from the
+/// start. Chunks of missing loci are taken from the highest ordinal down, `s`
+/// at a time, so the chunk after one starting at ordinal `lo` starts at
+/// `lo - s`: a replay that walks past later chunks' starts keeps the state just
+/// before each (all of them when they fit, else evenly spaced ones), and drops
+/// those its own chunk has passed. The vectors live in the replay's state
+/// buffer after its `s` slots; this keeps their records.
+pub(super) struct ReplayCkpts<T> {
+    live: Vec<Ckpt<T>>,
+    free: Vec<usize>,
+    plan: Vec<usize>,
+}
+
+impl<T: Copy> ReplayCkpts<T> {
+    pub(super) fn new() -> Self {
+        Self { live: Vec::new(), free: Vec::new(), plan: Vec::new() }
+    }
+
+    /// A new segment: `cap` checkpoints, at states `first..first + cap` of the
+    /// buffer, none kept.
+    pub(super) fn reset(&mut self, cap: usize, first: usize) {
+        self.live.clear();
+        self.free.clear();
+        if cap == 0 { return; }
+        if self.live.capacity() < cap { self.live.reserve_exact(cap); }
+        if self.free.capacity() < cap { self.free.reserve_exact(cap); }
+        self.free.extend((first..first + cap).rev());
+    }
+
+    /// Drops the checkpoints at ordinals `lo` and above (no later replay starts
+    /// there) and returns the last one below `lo`, the replay's start.
+    pub(super) fn start_below(&mut self, lo: usize) -> Option<Ckpt<T>> {
+        while let Some(c) = self.live.last() {
+            if c.ord < lo { break; }
+            self.free.push(c.slot);
+            self.live.pop();
+        }
+        self.live.last().copied()
+    }
+
+    /// The buffer state a checkpoint's vector is in.
+    pub(super) fn slot(c: &Ckpt<T>) -> usize { c.slot }
+
+    /// The ordinals a replay from after ordinal `q` (`None`: the segment's
+    /// start) to the chunk starting at `lo` keeps a state at, ascending: the
+    /// ordinal just before each later chunk's start `lo - i * s` past `q`; all
+    /// of them when the free checkpoints hold them, else as many as are free,
+    /// evenly spaced and always the next chunk's.
+    pub(super) fn plan_into(&self, q: Option<usize>, lo: usize, s: usize, plan: &mut Vec<usize>) {
+        plan.clear();
+        let free = self.free.len();
+        if free == 0 || lo == 0 { return; }
+        assert!(s > 0, "a replay keeps at least one missing locus");
+        // Candidates i = 1..=k (ordinal lo - i*s - 1, nearest first): lo > i*s,
+        // and past q: i*s < lo - 1 - q.
+        let k = match q {
+            None => (lo - 1) / s,
+            Some(q) if lo >= q + 2 => (lo - 2 - q) / s,
+            Some(_) => 0,
+        };
+        if k <= free {
+            plan.extend((1..=k).rev().map(|i| lo - i * s - 1));
+        } else {
+            // As many as are free, evenly spaced: candidate (t * k + free / 2) / free
+            // (0-based), t < free — the next chunk's always.
+            let mut last = usize::MAX;
+            for t in (0..free).rev() {
+                let idx = ((t * k + free / 2) / free).min(k - 1);
+                if idx != last { plan.push(lo - (idx + 1) * s - 1); last = idx; }
+            }
+        }
+    }
+
+    /// The plan buffer, lent to a replay (`plan_into`) and handed back.
+    pub(super) fn take_plan(&mut self) -> Vec<usize> { std::mem::take(&mut self.plan) }
+    pub(super) fn put_plan(&mut self, plan: Vec<usize>) { self.plan = plan; }
+
+    /// Records the forward state after missing ordinal `ord` (locus `vi`) and
+    /// returns the buffer state its vector goes in.
+    pub(super) fn save(&mut self, ord: usize, vi: usize, sum_h: [T; HAP_NUMBER], sum_t: T,
+                       prev_abs: usize, abs_ambiguous: usize) -> usize {
+        let slot = self.free.pop().expect("a planned checkpoint has a free slot");
+        debug_assert!(self.live.last().is_none_or(|c| c.ord < ord));
+        self.live.push(Ckpt { ord, vi, slot, sum_h, sum_t, prev_abs, abs_ambiguous });
+        slot
+    }
 }
 
 /// Read-only inputs of one window's forward pass, shared by the pass and its
@@ -506,14 +643,22 @@ pub struct SegmentHmm {
     /// Forward states at missing loci (SHAPEIT5's AlphaMissing),
     /// `n_cond * HAP_NUMBER` each, and their per-config sums: every missing
     /// locus of the window when they fit in [`MIS_REPLAY_BYTES`] (`mis_stored`,
-    /// kept by the forward), otherwise those of one segment at a time,
-    /// recomputed by `replay_missing`.
+    /// kept by the forward), otherwise those of one replay of one segment
+    /// (`replay_missing`), followed by the vectors of the segment's checkpoints.
     mis_alpha: Vec<f32>,
     mis_alpha_sum: Vec<[f32; HAP_NUMBER]>,
     mis_stored: bool,
+    /// Forward states kept inside the segment the backward is in, for its replays.
+    ckpts: ReplayCkpts<f32>,
     /// Tests: replay even when the window's states would fit.
     #[cfg(test)]
     force_replay: bool,
+    /// Tests: `(slots, checkpoints)` for every segment instead of `replay_split`'s.
+    #[cfg(test)]
+    split_override: Option<(usize, usize)>,
+    /// Tests: loci the replays have walked.
+    #[cfg(test)]
+    replay_steps: usize,
     /// The backward's state while a replay runs.
     spare_prob: AlignedF32,
     spare_sum_k: Vec<f32>,
@@ -547,8 +692,13 @@ impl SegmentHmm {
             mis_alpha: Vec::new(),
             mis_alpha_sum: Vec::new(),
             mis_stored: false,
+            ckpts: ReplayCkpts::new(),
             #[cfg(test)]
             force_replay: false,
+            #[cfg(test)]
+            split_override: None,
+            #[cfg(test)]
+            replay_steps: 0,
             spare_prob: AlignedF32::new(0),
             spare_sum_k: Vec::new(),
             #[cfg(test)]
@@ -1660,17 +1810,27 @@ impl SegmentHmm {
         }
     }
 
+    /// `(slots, checkpoints)` for a segment with `m` missing loci ([`replay_split`]).
+    fn segment_split(&self, m: usize) -> (usize, usize) {
+        #[cfg(test)]
+        if let Some(sc) = self.split_override { return sc; }
+        replay_split(self.n_cond * HAP_NUMBER, 4, m)
+    }
+
     /// The forward state at missing loci of segment `seg`, for the backward's
-    /// IMPUTE: re-runs the forward over the segment from its starting state (the
-    /// stored end of the previous segment, or the zeroed window head) up to locus
-    /// `upto`, keeping the states at the segment's missing loci with ordinals
-    /// `lo..=hi` (counted from the segment's start) in `mis_alpha`. Same kernels
-    /// from the same state, hence the same bits the forward had there — SHAPEIT5
-    /// stores every missing locus's state for the whole window instead, as much
-    /// memory again as the per-segment store on dense input. The backward's own
-    /// state is set aside meanwhile and put back.
+    /// IMPUTE: re-runs the forward over the segment up to locus `upto`, keeping
+    /// the states at the segment's missing loci with ordinals `lo..=hi` (counted
+    /// from the segment's start) in `mis_alpha`, from the last checkpoint before
+    /// `lo` ([`ReplayCkpts`]) or else the segment's starting state (the stored end
+    /// of the previous segment, or the zeroed window head), and checkpointing on
+    /// the way for the replays of the segment's later chunks of `s` loci. Same
+    /// kernels from the same state, hence the same bits the forward had there —
+    /// SHAPEIT5 stores every missing locus's state for the whole window instead,
+    /// as much memory again as the per-segment store on dense input. The
+    /// backward's own state is set aside meanwhile and put back.
+    #[allow(clippy::too_many_arguments)]
     fn replay_missing(&mut self, f: &FwdIn<'_>, seg_first: usize, seg: usize, upto: usize,
-                      lo: usize, hi: usize) {
+                      lo: usize, hi: usize, s: usize) {
         let graph = f.graph;
         let n = self.n_cond * HAP_NUMBER;
         std::mem::swap(&mut self.prob, &mut self.spare_prob);
@@ -1680,25 +1840,37 @@ impl SegmentHmm {
         self.prob_sum_k.resize(self.n_cond, 0.0);
         let rel = seg - seg_first;
         let start = graph.segment_start(seg);
-        let mut cur = if rel == 0 {
+        let from = self.ckpts.start_below(lo);
+        let mut plan = self.ckpts.take_plan();
+        self.ckpts.plan_into(from.map(|c| c.ord), lo, s, &mut plan);
+        let (mut cur, first, mut ord) = if let Some(c) = from {
+            // Inside the segment: the RUN kernels read only these.
+            let a = ReplayCkpts::slot(&c) * n;
+            self.prob[..n].copy_from_slice(&self.mis_alpha[a..a + n]);
+            self.prob_sum_h = c.sum_h;
+            self.prob_sum_t = c.sum_t;
+            (FwdCursor { prev_abs_locus: c.prev_abs, abs_ambiguous: c.abs_ambiguous }, c.vi + 1, c.ord + 1)
+        } else if rel == 0 {
             self.prob.fill(0.0);
             self.prob_sum_k.fill(0.0);
             self.prob_sum_h = [0.0; HAP_NUMBER];
             self.prob_sum_t = 0.0;
-            FwdCursor { prev_abs_locus: start, abs_ambiguous: self.seg_amb0[0] }
+            (FwdCursor { prev_abs_locus: start, abs_ambiguous: self.seg_amb0[0] }, start, 0)
         } else {
             self.prob[..n].copy_from_slice(&self.alpha_store[rel - 1]);
             self.prob_sum_h = self.alpha_sum_store[rel - 1];
             self.prob_sum_t = self.alpha_sum_sum_store[rel - 1];
             self.sum_k();
-            FwdCursor { prev_abs_locus: self.alpha_locus[rel - 1], abs_ambiguous: self.seg_amb0[rel] }
+            (FwdCursor { prev_abs_locus: self.alpha_locus[rel - 1], abs_ambiguous: self.seg_amb0[rel] }, start, 0)
         };
         let n_keep = hi + 1 - lo;
         grow_exact(&mut self.mis_alpha, n_keep * n, 0.0);
         grow_exact(&mut self.mis_alpha_sum, n_keep, [0.0; HAP_NUMBER]);
-        let mut ord = 0usize;
-        for vi in start..=upto {
+        let mut next_ck = 0usize;
+        for vi in first..=upto {
             self.forward_locus(f, vi, rel == 0, vi == start, &mut cur, false);
+            #[cfg(test)]
+            { self.replay_steps += 1; }
             if var_is_mis(vi % 2, graph.variants[vi / 2]) {
                 if ord >= lo && ord <= hi {
                     let slot = ord - lo;
@@ -1706,10 +1878,17 @@ impl SegmentHmm {
                     self.mis_alpha_sum[slot] = self.prob_sum_h;
                     #[cfg(test)]
                     self.replay_trace.push((vi, self.prob[..n].iter().map(|x| x.to_bits()).collect()));
+                } else if plan.get(next_ck) == Some(&ord) {
+                    let a = self.ckpts.save(ord, vi, self.prob_sum_h, self.prob_sum_t,
+                        cur.prev_abs_locus, cur.abs_ambiguous) * n;
+                    self.mis_alpha[a..a + n].copy_from_slice(&self.prob[..n]);
+                    next_ck += 1;
                 }
                 ord += 1;
             }
         }
+        debug_assert_eq!(next_ck, plan.len());
+        self.ckpts.put_plan(plan);
         std::mem::swap(&mut self.prob, &mut self.spare_prob);
         std::mem::swap(&mut self.prob_sum_k, &mut self.spare_sum_k);
         self.prob_sum_h = bwd_sum_h;
@@ -1785,11 +1964,11 @@ impl SegmentHmm {
             dispatch_first: rare_dispatch_position_first(),
         };
         // Missing loci of the current segment: the ordinal (from the segment's
-        // start) of the next one going right to left, and the lowest ordinal
-        // whose forward state the replay buffer holds.
-        let (mut seg_mis_next, mut replay_lo) = (0usize, 0usize);
+        // start) of the next one going right to left, the lowest ordinal whose
+        // forward state the replay buffer holds, and how many one replay keeps.
+        let (mut seg_mis_next, mut replay_lo, mut seg_slots) = (0usize, 0usize, 0usize);
         #[cfg(test)]
-        self.replay_trace.clear();
+        { self.replay_trace.clear(); self.replay_steps = 0; }
         let _abs_locus = locus_last;
         let mut abs_ambiguous = abs_ambiguous_end;
         let mut prev_abs_locus = locus_last;
@@ -1815,6 +1994,11 @@ impl SegmentHmm {
                 let s0 = graph.segment_start(curr_seg);
                 seg_mis_next = graph.missing_in(s0, vi);
                 replay_lo = seg_mis_next;
+                let (slots, ckpts) = self.segment_split(seg_mis_next);
+                seg_slots = slots;
+                // Checkpoint vectors go after the slots in the replay buffer.
+                self.ckpts.reset(ckpts, slots);
+                if ckpts > 0 { grow_exact(&mut self.mis_alpha, (slots + ckpts) * n_cond * HAP_NUMBER, 0.0); }
             }
 
             let (nt, yt) = if first_locus {
@@ -1865,8 +2049,8 @@ impl SegmentHmm {
                     seg_mis_next -= 1;
                     let j = seg_mis_next;
                     if j < replay_lo {
-                        replay_lo = j + 1 - (j + 1).min(replay_slots(n_cond * HAP_NUMBER, 4));
-                        self.replay_missing(&f, seg_first, curr_seg, vi, replay_lo, j);
+                        replay_lo = j + 1 - (j + 1).min(seg_slots);
+                        self.replay_missing(&f, seg_first, curr_seg, vi, replay_lo, j, seg_slots);
                     }
                     j - replay_lo
                 };
@@ -2492,7 +2676,10 @@ mod seg_kernel_tests {
 
     /// The backward's per-segment replays reproduce the forward's state at every
     /// missing locus bit for bit, each locus exactly once, also on segments with
-    /// more missing loci than one replay keeps (`replay_slots`; 16 with k = 8192).
+    /// more missing loci than one replay keeps (`replay_split`; with k = 8192 one
+    /// replay keeps 31 states, a segment with more than 77 missing loci gets 15
+    /// slots and 16 checkpoints), and under forced splits that replay from
+    /// checkpoints several levels deep.
     #[test]
     fn replayed_missing_states_equal_the_forward() {
         let mut rng = TestRng::new(77);
@@ -2528,6 +2715,20 @@ mod seg_kernel_tests {
             got.sort_by_key(|x| x.0);
             assert_eq!(got.len(), want.len(), "case {case}: every missing locus replayed once");
             assert!(got == want, "case {case}: replayed state differs from the forward");
+            // Forced splits: one slot without checkpoints (a replay per locus from
+            // the segment's start) and small budgets that nest checkpoints.
+            for split in [(1usize, 0usize), (1, 3), (2, 2), (3, 1), (2, 7)] {
+                hmm.split_override = Some(split);
+                hmm.resize_for(k);
+                hmm.forward_rare_direct(&graph, &cond_bm, kw, l0, &params.trans, s, e, &params.rare_allele, &params);
+                let (_, m_split) = hmm.backward_rare_direct(&graph, &cond_bm, kw, l0, &params.trans, s, e, &params.rare_allele, &params);
+                let mut got = hmm.replay_trace.clone();
+                got.sort_by_key(|x| x.0);
+                assert!(got == want, "case {case} split {split:?}: replayed state differs from the forward");
+                assert_eq!(m_split.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                           m_replay.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), "case {case} split {split:?}");
+            }
+            hmm.split_override = None;
             // The window-wide store (when it fits) imputes the same bits.
             hmm.force_replay = false;
             hmm.resize_for(k);
@@ -2539,10 +2740,103 @@ mod seg_kernel_tests {
             n_loci += want.len();
             n_long += (s..=e).filter(|&g| {
                 let a = graph.segment_start(g);
-                graph.missing_in(a, a + graph.lengths[g] as usize - 1) > replay_slots(k * HAP_NUMBER, 4)
+                let m = graph.missing_in(a, a + graph.lengths[g] as usize - 1);
+                replay_split(k * HAP_NUMBER, 4, m).1 > 0
             }).count();
         }
         assert!(n_loci > 500 && n_long > 0 && n_stored > 0, "{n_loci} loci, {n_long} long segments, {n_stored} stored");
+    }
+
+    /// Long segments with many missing loci (a chrX male: no het, one segment
+    /// per window) are replayed in about linear time from checkpoints, where
+    /// restarting every chunk at the segment's start walked them once per chunk;
+    /// the replayed states, the imputed probabilities and the transitions are the
+    /// same bits either way, in f32 and in the f64 twin (raw f64 states and
+    /// sums), with hets inside the segments (the ambiguous cursor), rare-hom
+    /// skips (a cursor left standing) and a window that starts past segment 0.
+    #[test]
+    fn checkpointed_replays_are_exact_and_linear() {
+        use super::super::hmm_segment_f64::SegmentHmmF64;
+        for (case, (n_var, p_het)) in [(3000usize, 0.0f64), (4000, 0.0015)].into_iter().enumerate() {
+            let mut rng = TestRng::new(4242 + case as u64);
+            let mut geno = vec![0u8; n_var * 2];
+            for v in 0..n_var {
+                let a = rng.chance(0.3) as u8;
+                geno[2 * v] = a; geno[2 * v + 1] = a;
+                if rng.chance(p_het) { geno[2 * v] = 0; geno[2 * v + 1] = 1; }
+                else if rng.chance(0.15) { geno[2 * v] = 128; geno[2 * v + 1] = 128; }
+            }
+            let graph = build_graph(0, &geno, n_var, None);
+            let cm: Vec<f64> = (0..n_var).map(|i| i as f64 * 0.002).collect();
+            let mut params = super::super::params::HmmParams::new(&cm, 1000, 15000.0);
+            // Rare-hom skips: the target carries the major allele at some hom loci.
+            let mut n_skip = 0usize;
+            for v in 0..n_var {
+                if geno[2 * v] < 2 && geno[2 * v] == geno[2 * v + 1] && rng.chance(0.05) {
+                    params.rare_allele[v] = 1 - geno[2 * v] as i8;
+                    n_skip += 1;
+                }
+            }
+            assert!(n_skip > 50);
+            if case == 0 { assert_eq!(graph.n_segments, 1); } else { assert!(graph.n_segments >= 3, "{}", graph.n_segments); }
+            let (s, e) = (graph.n_segments.min(2) - 1, graph.n_segments - 1);
+            let l0 = graph.segment_start(s);
+            let l1 = graph.segment_start(e) + graph.lengths[e] as usize - 1;
+            let walk = l1 + 1 - l0;
+            let m_max = (s..=e).map(|g| {
+                let a = graph.segment_start(g);
+                graph.missing_in(a, a + graph.lengths[g] as usize - 1)
+            }).max().unwrap();
+            assert!(m_max > 100, "{m_max}");
+            let k = 40usize;
+            let kw = k.div_ceil(64);
+            let cond_bm: Vec<u64> = (0..(n_var - l0) * kw).map(|_| rng.next() & ((1u64 << k) - 1)).collect();
+            let mut hmm = SegmentHmm::new(k);
+            hmm.force_replay = true;
+            let run = |hmm: &mut SegmentHmm, split: (usize, usize)| {
+                hmm.split_override = Some(split);
+                hmm.resize_for(k);
+                hmm.forward_rare_direct(&graph, &cond_bm, kw, l0, &params.trans, s, e, &params.rare_allele, &params);
+                assert!(!hmm.has_underflow());
+                let want = hmm.fwd_trace.clone();
+                let (t, m) = hmm.backward_rare_direct(&graph, &cond_bm, kw, l0, &params.trans, s, e, &params.rare_allele, &params);
+                let mut got = hmm.replay_trace.clone();
+                got.sort_by_key(|x| x.0);
+                assert!(got == want, "case {case} split {split:?}: replayed state differs from the forward");
+                (m.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), t.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                 hmm.replay_steps)
+            };
+            let (m_flat, t_flat, steps_flat) = run(&mut hmm, (8, 0));
+            let (m_ck, t_ck, steps_ck) = run(&mut hmm, (8, 8));
+            let (m_one, t_one, _) = run(&mut hmm, (n_var, 0));
+            let (m_deep, t_deep, _) = run(&mut hmm, (2, 3));
+            assert!(m_flat == m_ck && m_flat == m_one && m_flat == m_deep, "case {case}: imputed probabilities");
+            assert!(t_flat == t_ck && t_flat == t_one && t_flat == t_deep, "case {case}: transitions");
+            assert!(steps_flat > 5 * walk, "case {case}: {steps_flat}");
+            assert!(steps_ck < 3 * walk, "case {case}: checkpointed replays walked {steps_ck} loci for {walk}");
+
+            let haps: Vec<usize> = (0..k).collect();
+            let bit = |v: usize, h: usize| (cond_bm[(v - l0) * kw + h / 64] >> (h % 64)) & 1 == 1;
+            let mut h64 = SegmentHmmF64::new(k);
+            let mut run64 = |split: (usize, usize)| {
+                h64.split_override = Some(split);
+                h64.forward_rare(&graph, &haps, &bit, &params.trans, s, e, &params.rare_allele, &params);
+                let want = h64.fwd_trace.clone();
+                let (t, m) = h64.backward_rare(&graph, &haps, &bit, &params.trans, s, e, &params.rare_allele, &params);
+                let mut got = h64.replay_trace.clone();
+                got.sort_by_key(|x| x.0);
+                assert!(got == want, "case {case} f64 split {split:?}: replayed state differs from the forward");
+                (m.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), t.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                 h64.replay_steps)
+            };
+            let (f_one, ft_one, _) = run64((n_var, 0));
+            let (f_flat, ft_flat, f_steps_flat) = run64((8, 0));
+            let (f_ck, ft_ck, f_steps_ck) = run64((8, 8));
+            let (f_deep, ft_deep, _) = run64((2, 3));
+            assert!(f_one == f_flat && f_one == f_ck && f_one == f_deep, "case {case}: f64 imputed probabilities");
+            assert!(ft_one == ft_flat && ft_one == ft_ck && ft_one == ft_deep, "case {case}: f64 transitions");
+            assert!(f_steps_flat > 5 * walk && f_steps_ck < 3 * walk, "case {case}: {f_steps_flat} {f_steps_ck}");
+        }
     }
 
     /// A one-segment window still imputes its missing loci (its transition block

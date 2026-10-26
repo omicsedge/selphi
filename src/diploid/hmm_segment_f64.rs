@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use super::params::{HAP_NUMBER, ED, EE};
 use super::genotype_graph::*;
 use super::alpha_diag;
-use super::hmm_segment::{rare_dispatch_position_first, rare_dispatch_diag,
+use super::hmm_segment::{rare_dispatch_position_first, rare_dispatch_diag, ReplayCkpts,
     DIAG_SKIP_WINDOW_HEAD, DIAG_SKIP_SEG_HEAD};
 
 const MISMATCH: f64 = (ED / EE) as f64;
@@ -102,13 +102,27 @@ pub struct SegmentHmmF64 {
     alpha_locus_seg_end: Vec<usize>,
     /// Per segment of the window: index of its first ambiguous site.
     seg_amb0: Vec<usize>,
-    /// Forward states at missing loci of one segment; see the f32 twin.
+    /// Forward states at missing loci of one replay, then the checkpoints' vectors; see the f32 twin.
     mis_alpha: Vec<f64>,
     mis_alpha_sum: Vec<[f64; HAP_NUMBER]>,
+    /// Forward states kept inside the backward's segment; see the f32 twin.
+    ckpts: ReplayCkpts<f64>,
     spare_prob: Vec<f64>,
     spare_sum_k: Vec<f64>,
     h_probs: [f64; HAP_NUMBER * HAP_NUMBER],
     sum_h_probs: f64,
+    /// Tests: `(slots, checkpoints)` for every segment; see the f32 twin.
+    #[cfg(test)]
+    pub(super) split_override: Option<(usize, usize)>,
+    /// Tests: loci the replays have walked.
+    #[cfg(test)]
+    pub(super) replay_steps: usize,
+    /// Tests: (locus, state bits, sum bits) at each missing locus, from the
+    /// forward and from the replays.
+    #[cfg(test)]
+    pub(super) fwd_trace: Vec<(usize, Vec<u64>, Vec<u64>)>,
+    #[cfg(test)]
+    pub(super) replay_trace: Vec<(usize, Vec<u64>, Vec<u64>)>,
 }
 
 /// Read-only inputs of one window's f64 forward; see the f32 twin's `FwdIn`.
@@ -142,11 +156,27 @@ impl SegmentHmmF64 {
             seg_amb0: Vec::new(),
             mis_alpha: Vec::new(),
             mis_alpha_sum: Vec::new(),
+            ckpts: ReplayCkpts::new(),
             spare_prob: Vec::new(),
             spare_sum_k: Vec::new(),
             h_probs: [0.0; HAP_NUMBER * HAP_NUMBER],
             sum_h_probs: 0.0,
+            #[cfg(test)]
+            split_override: None,
+            #[cfg(test)]
+            replay_steps: 0,
+            #[cfg(test)]
+            fwd_trace: Vec::new(),
+            #[cfg(test)]
+            replay_trace: Vec::new(),
         }
+    }
+
+    /// `(slots, checkpoints)` for a segment with `m` missing loci; see the f32 twin.
+    fn segment_split(&self, m: usize) -> (usize, usize) {
+        #[cfg(test)]
+        if let Some(sc) = self.split_override { return sc; }
+        super::hmm_segment::replay_split(self.n_cond * HAP_NUMBER, 8, m)
     }
 
     /// SHAPEIT5's IMPUTE at a missing locus in replay slot `m`; see the f32 twin.
@@ -494,12 +524,19 @@ impl SegmentHmmF64 {
         let f = FwdIn64 { graph, trans, rare_allele, hmm_params, dispatch_first: rare_dispatch_position_first() };
         let mut cur = Cursor64 { prev_abs: abs_locus, abs_ambiguous };
         let dispatch_diag = rare_dispatch_diag();
+        #[cfg(test)]
+        self.fwd_trace.clear();
         for seg in seg_first..=seg_last {
             self.seg_amb0.push(cur.abs_ambiguous);
             for vrel in 0..graph.lengths[seg] as usize {
                 let vi = abs_locus;
                 for (k, &h) in cond_haps.iter().enumerate() { ca[k] = haplotypes(vi, h); }
                 self.forward_locus(&f, &ca, vi, seg == seg_first, vrel == 0, &mut cur, dispatch_diag);
+                #[cfg(test)]
+                if var_is_mis(vi % 2, graph.variants[vi / 2]) {
+                    self.fwd_trace.push((vi, self.prob.iter().map(|x| x.to_bits()).collect(),
+                        self.prob_sum_h.iter().map(|x| x.to_bits()).collect()));
+                }
                 abs_locus += 1;
             }
             self.sum_k();
@@ -575,12 +612,13 @@ impl SegmentHmmF64 {
     }
 
     /// The forward states at missing loci `lo..=hi` (ordinals from the start) of
-    /// segment `seg`, replayed up to locus `upto`; see the f32 twin. The f64
-    /// forward starts from a fresh state vector (zeros), which is where a replay
-    /// of the window's first segment starts too.
+    /// segment `seg`, replayed up to locus `upto` from the last checkpoint before
+    /// `lo` or the segment's start, checkpointing for the later chunks of `s`
+    /// loci; see the f32 twin. The f64 forward starts from a fresh state vector
+    /// (zeros), which is where a replay of the window's first segment starts too.
     #[allow(clippy::too_many_arguments)]
     fn replay_missing<F>(&mut self, f: &FwdIn64<'_>, cond_haps: &[usize], haplotypes: &F,
-                         seg_first: usize, seg: usize, upto: usize, lo: usize, hi: usize)
+                         seg_first: usize, seg: usize, upto: usize, lo: usize, hi: usize, s: usize)
     where F: Fn(usize, usize) -> bool {
         let graph = f.graph;
         let n = self.n_cond * HAP_NUMBER;
@@ -591,36 +629,57 @@ impl SegmentHmmF64 {
         self.prob_sum_k.resize(self.n_cond, 0.0);
         let rel = seg - seg_first;
         let start = graph.segment_start(seg);
-        let mut cur = if rel == 0 {
+        let from = self.ckpts.start_below(lo);
+        let mut plan = self.ckpts.take_plan();
+        self.ckpts.plan_into(from.map(|c| c.ord), lo, s, &mut plan);
+        let (mut cur, first, mut ord) = if let Some(c) = from {
+            let a = ReplayCkpts::slot(&c) * n;
+            self.prob[..n].copy_from_slice(&self.mis_alpha[a..a + n]);
+            self.prob_sum_h = c.sum_h;
+            self.prob_sum_t = c.sum_t;
+            (Cursor64 { prev_abs: c.prev_abs, abs_ambiguous: c.abs_ambiguous }, c.vi + 1, c.ord + 1)
+        } else if rel == 0 {
             self.prob.fill(0.0);
             self.prob_sum_k.fill(0.0);
             self.prob_sum_h = [0.0; HAP_NUMBER];
             self.prob_sum_t = 0.0;
-            Cursor64 { prev_abs: start, abs_ambiguous: self.seg_amb0[0] }
+            (Cursor64 { prev_abs: start, abs_ambiguous: self.seg_amb0[0] }, start, 0)
         } else {
             self.prob.copy_from_slice(&self.alpha_store[rel - 1]);
             self.prob_sum_h = self.alpha_sum_store[rel - 1];
             self.prob_sum_t = self.alpha_sum_sum_store[rel - 1];
             self.sum_k();
-            Cursor64 { prev_abs: self.alpha_locus[rel - 1], abs_ambiguous: self.seg_amb0[rel] }
+            (Cursor64 { prev_abs: self.alpha_locus[rel - 1], abs_ambiguous: self.seg_amb0[rel] }, start, 0)
         };
         let n_keep = hi + 1 - lo;
         super::hmm_segment::grow_exact(&mut self.mis_alpha, n_keep * n, 0.0);
         super::hmm_segment::grow_exact(&mut self.mis_alpha_sum, n_keep, [0.0; HAP_NUMBER]);
         let mut ca = vec![false; self.n_cond];
-        let mut ord = 0usize;
-        for vi in start..=upto {
+        let mut next_ck = 0usize;
+        for vi in first..=upto {
             for (k, &h) in cond_haps.iter().enumerate() { ca[k] = haplotypes(vi, h); }
             self.forward_locus(f, &ca, vi, rel == 0, vi == start, &mut cur, false);
+            #[cfg(test)]
+            { self.replay_steps += 1; }
             if var_is_mis(vi % 2, graph.variants[vi / 2]) {
                 if ord >= lo && ord <= hi {
                     let slot = ord - lo;
                     self.mis_alpha[slot * n..(slot + 1) * n].copy_from_slice(&self.prob[..n]);
                     self.mis_alpha_sum[slot] = self.prob_sum_h;
+                    #[cfg(test)]
+                    self.replay_trace.push((vi, self.prob[..n].iter().map(|x| x.to_bits()).collect(),
+                        self.prob_sum_h.iter().map(|x| x.to_bits()).collect()));
+                } else if plan.get(next_ck) == Some(&ord) {
+                    let a = self.ckpts.save(ord, vi, self.prob_sum_h, self.prob_sum_t,
+                        cur.prev_abs, cur.abs_ambiguous) * n;
+                    self.mis_alpha[a..a + n].copy_from_slice(&self.prob[..n]);
+                    next_ck += 1;
                 }
                 ord += 1;
             }
         }
+        debug_assert_eq!(next_ck, plan.len());
+        self.ckpts.put_plan(plan);
         std::mem::swap(&mut self.prob, &mut self.spare_prob);
         std::mem::swap(&mut self.prob_sum_k, &mut self.spare_sum_k);
         self.prob_sum_h = bwd_sum_h;
@@ -650,7 +709,9 @@ impl SegmentHmmF64 {
         let mut mis_w = graph.missing_in(graph.segment_start(seg_first), locus_last);
         let mut missing_probs = vec![f32::NAN; mis_w * HAP_NUMBER];
         let f = FwdIn64 { graph, trans, rare_allele, hmm_params, dispatch_first: rare_dispatch_position_first() };
-        let (mut seg_mis_next, mut replay_lo) = (0usize, 0usize);
+        let (mut seg_mis_next, mut replay_lo, mut seg_slots) = (0usize, 0usize, 0usize);
+        #[cfg(test)]
+        { self.replay_steps = 0; self.replay_trace.clear(); }
         let _abs_locus = locus_last;
         let mut abs_ambiguous = 0usize;
         for s in 0..=seg_last {
@@ -682,6 +743,13 @@ impl SegmentHmmF64 {
             if mis_w > 0 && is_first_in_seg {
                 seg_mis_next = graph.missing_in(graph.segment_start(curr_seg), vi);
                 replay_lo = seg_mis_next;
+                let (slots, ckpts) = self.segment_split(seg_mis_next);
+                seg_slots = slots;
+                // Checkpoint vectors go after the slots in the replay buffer.
+                self.ckpts.reset(ckpts, slots);
+                if ckpts > 0 {
+                    super::hmm_segment::grow_exact(&mut self.mis_alpha, (slots + ckpts) * n_cond * HAP_NUMBER, 0.0);
+                }
             }
 
             for (k, &h) in cond_haps.iter().enumerate() { ca[k] = haplotypes(vi, h); }
@@ -730,8 +798,8 @@ impl SegmentHmmF64 {
                 seg_mis_next -= 1;
                 let j = seg_mis_next;
                 if j < replay_lo {
-                    replay_lo = j + 1 - (j + 1).min(super::hmm_segment::replay_slots(n_cond * HAP_NUMBER, 8));
-                    self.replay_missing(&f, cond_haps, haplotypes, seg_first, curr_seg, vi, replay_lo, j);
+                    replay_lo = j + 1 - (j + 1).min(seg_slots);
+                    self.replay_missing(&f, cond_haps, haplotypes, seg_first, curr_seg, vi, replay_lo, j, seg_slots);
                 }
                 self.impute_missing(j - replay_lo, &ca,
                     &mut missing_probs[mis_w * HAP_NUMBER..(mis_w + 1) * HAP_NUMBER]);
