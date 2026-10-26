@@ -172,6 +172,225 @@ pub struct GibbsOutput {
     /// PRESENT-but-not-copied (→ HMM-emission bottleneck, rewrite won't help).
     /// Empty in normal runs.
     pub cond_final: Vec<Vec<u32>>,
+    /// Impute-only ("passenger") sites ([`ChunkPassengers`]): dosage and genotype
+    /// posteriors, laid out as `dosage`/`gp` over the passengers. Empty without them.
+    pub pass_dosage: Vec<f32>,
+    pub pass_gp: Vec<f32>,
+}
+
+/// Panel sites imputed from a chunk's chain without entering it
+/// (`LCWGS_BAM_INDELS=impute`): their rows are the hidden tail of the chunk's
+/// bitmatrix (row `ref_bm.n_sites + p`, see `HaplotypeBitmatrix::with_hidden_tail`),
+/// and nothing of the chain reads them: not the selection, the rare carriers,
+/// the forward-backward that samples alleles, nor the phaser. In the main
+/// iterations each haplotype runs one more forward-backward over its main pass's
+/// axis plus the passengers its conditioning set is polymorphic at
+/// ([`passenger_axis`]): flat emission there (the same in every state, so it moves
+/// no posterior), and each gap the passengers split keeps the main pass's switch
+/// probability exactly. A passenger's dose is that pass's posterior; its own reads,
+/// when given, are folded into its averaged genotype posterior by the pipeline.
+pub(crate) struct ChunkPassengers<'a> {
+    /// Chunk-local insertion point: passenger `p` lies after active site
+    /// `ins[p] - 1` and before active site `ins[p]` (non-decreasing).
+    pub ins: Vec<usize>,
+    /// Genetic position of each passenger.
+    pub cm: &'a [f64],
+}
+
+/// Panel-side facts of a chunk's passengers, built once per chain.
+struct PassengerModel {
+    /// Common (panel MAF >= rare_maf): always polymorphic.
+    is_common: Vec<bool>,
+    /// Rare: the haplotypes carrying the minor allele (polymorphic for a
+    /// conditioning set holding one of them); empty for common sites.
+    carriers: Vec<Vec<u32>>,
+    /// Rare: the major allele as an ALT flag (every state's allele when monomorphic).
+    mono_alt: Vec<bool>,
+    /// Band-mode recombination multiplier of each ACTIVE site (`None` off band mode),
+    /// the rule of the main forward-backward.
+    active_rmult: Option<Vec<f32>>,
+}
+
+impl PassengerModel {
+    fn build(ref_bm: &HaplotypeBitmatrix, n_pass: usize, params: &LcwgsParams) -> Self {
+        let n_ref = ref_bm.n_haps;
+        let n_var = ref_bm.n_sites;
+        assert!(ref_bm.n_rows() >= n_var + n_pass, "passenger rows missing from the chunk bitmatrix");
+        let thr = params.rare_maf as f64;
+        let maf = |row: usize| {
+            let ac = ref_bm.popcount_row(row, n_ref) as f64;
+            (ac, ac.min(n_ref as f64 - ac) / n_ref as f64)
+        };
+        let (mut is_common, mut carriers, mut mono_alt) = (vec![false; n_pass], vec![Vec::new(); n_pass], vec![false; n_pass]);
+        for p in 0..n_pass {
+            let row = n_var + p;
+            let (ac, m) = maf(row);
+            if m >= thr { is_common[p] = true; continue; }
+            let alt_is_minor = ac <= (n_ref as f64 - ac);
+            mono_alt[p] = !alt_is_minor;
+            for_each_hap_with_allele(ref_bm.row(row), n_ref, alt_is_minor, |h| carriers[p].push(h));
+        }
+        let active_rmult = crate::lcwgs::hmm::recomb_band_mult(n_ref, params.ne)
+            .map(|r| (0..n_var).map(|v| if maf(v).1 >= thr { 1.0f32 } else { r }).collect());
+        PassengerModel { is_common, carriers, mono_alt, active_rmult }
+    }
+}
+
+/// The passengers' forward-backward axis for one haplotype: the main pass's axis
+/// (`axis`, `None` = every active site) merged with `subset` (passenger indices,
+/// ascending) by position. Returns the absolute bitmatrix rows, cM, per-site
+/// likelihoods (active sites: the main pass's, from `hl_active`; passengers: flat),
+/// the boundary entries for `recomb_mult`, and each passenger's axis slot.
+///
+/// Boundaries between two active sites carry the main pass's rate multiplier
+/// (`active_rmult`, `None` = 1), so they are the main pass's own. A gap between
+/// active sites `a` and `b` that holds passengers is the main pass's single
+/// boundary of probability `P` (`switch_prob` of the gap's cM rate and `b`'s
+/// multiplier): its sub-boundaries carry explicit probabilities
+/// `1 - (1 - P)^f` with `f` their share of the gap's cM (a zero-cM gap puts `P` on
+/// its last sub-boundary), which compose to exactly `P` and add no `MIN_SWITCH`
+/// floor of their own; so a passenger's posterior does not depend on which other
+/// passengers share its gap. Before the first and after the last active site the
+/// sub-boundaries carry the unclamped `1 - exp(-rate)` of their cM step.
+#[allow(clippy::type_complexity)]
+fn passenger_axis(
+    axis: Option<&[usize]>, n_var: usize, cm: &[f64], pass: &ChunkPassengers<'_>, subset: &[usize], row0: usize,
+    hl_active: &dyn Fn(usize) -> [f32; 2], active_rmult: Option<&[f32]>, scale: f64,
+) -> (Vec<usize>, Vec<f64>, Vec<f32>, Vec<f32>, Vec<usize>) {
+    let n_active = axis.map_or(n_var, <[usize]>::len);
+    let active_at = |i: usize| axis.map_or(i, |a| a[i]);
+    let n_axis = n_active + subset.len();
+    let (mut rows, mut acm, mut hl) = (Vec::with_capacity(n_axis), Vec::with_capacity(n_axis), Vec::with_capacity(2 * n_axis));
+    let mut slot = Vec::with_capacity(subset.len());
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n_active || j < subset.len() {
+        if j < subset.len() && (i >= n_active || pass.ins[subset[j]] <= active_at(i)) {
+            let p = subset[j];
+            slot.push(rows.len());
+            rows.push(row0 + p);
+            acm.push(pass.cm[p]);
+            hl.extend_from_slice(&[0.5f32, 0.5]);
+            j += 1;
+        } else {
+            let v = active_at(i);
+            rows.push(v);
+            acm.push(cm[v]);
+            hl.extend_from_slice(&hl_active(v));
+            i += 1;
+        }
+    }
+    let am = |row: usize| active_rmult.map_or(1.0f32, |a| a[row]);
+    let step = |k: usize| (acm[k] - acm[k - 1]).max(0.0);
+    let mut rm = vec![1.0f32; rows.len()];
+    // Active entries keep their multiplier; a passenger-adjacent boundary gets an
+    // explicit probability (sign-negative entry, see `hmm::precompute_prec`).
+    let mut k = 0usize;
+    let mut prev_active: Option<usize> = None;
+    while k < rows.len() {
+        if rows[k] < row0 {
+            rm[k] = am(rows[k]);
+            prev_active = Some(k);
+            k += 1;
+            continue;
+        }
+        // A run of passengers k..e, then the next active entry e (if any).
+        let mut e = k;
+        while e < rows.len() && rows[e] >= row0 { e += 1; }
+        let next_active = (e < rows.len()).then_some(e);
+        // Boundaries entering entries k..=e (e itself only when it exists); the one
+        // entering k (from k - 1) exists only when k > 0.
+        let last = next_active.unwrap_or(e - 1);
+        match (prev_active, next_active) {
+            (Some(a), Some(b)) => {
+                let d_gap = (acm[b] - acm[a]).max(0.0);
+                let p_gap = crate::lcwgs::hmm::switch_prob(d_gap * scale * am(rows[b]) as f64) as f64;
+                let log_stay = (-p_gap).ln_1p();
+                for t in k..=b {
+                    let f = if d_gap > 0.0 { step(t) / d_gap } else if t == b { 1.0 } else { 0.0 };
+                    rm[t] = -((-(f * log_stay).exp_m1()) as f32);
+                }
+            }
+            _ => {
+                let m = next_active.map_or(1.0, |b| am(rows[b])) as f64;
+                for t in k.max(1)..=last {
+                    rm[t] = -((-(-(step(t) * scale * m)).exp_m1()) as f32);
+                }
+            }
+        }
+        if let Some(b) = next_active { prev_active = Some(b); }
+        k = last + 1;
+    }
+    (rows, acm, hl, rm, slot)
+}
+
+/// The ALT probability of every passenger on haplotype `h` under the conditioning
+/// set `cond`, from one forward-backward over [`passenger_axis`] with the
+/// passengers `cond` is polymorphic at (monomorphic ones take the closed form).
+/// Active sites carry the main pass's emission (`partner_at` = the partner allele
+/// that pass conditioned on) and, when the main pass used band-mode recombination,
+/// its multipliers (`band`). No allele is sampled. `main_pack`: the main pass's
+/// packed conditioning bits over `axis` (see `hmm::pack_cond_rows`), whose rows are
+/// reused instead of gathered again.
+#[allow(clippy::too_many_arguments)]
+fn passenger_dose<F: Fn(usize) -> usize>(
+    h: usize, partner_at: F, cond: &[u32],
+    gl3: &[f32], n_samples: usize, ref_bm: &HaplotypeBitmatrix, cm: &[f64], params: &LcwgsParams,
+    axis: Option<&[usize]>, band: bool, pass: &ChunkPassengers<'_>, model: &PassengerModel, two_pass: bool,
+    main_pack: Option<&[u64]>,
+) -> Vec<f32> {
+    let n_pass = pass.ins.len();
+    if cond.is_empty() { return vec![0.5; n_pass]; }
+    let n_var = cm.len();
+    let row0 = ref_bm.n_sites;
+    let (ee, ed) = (1.0f32 - params.epsilon, params.epsilon);
+    let mut dose = vec![0.0f32; n_pass];
+    let mut poly: Vec<usize> = Vec::new();
+    super::membership::with_membership(ref_bm.n_haps, |in_cond| {
+        for &c in cond { in_cond.insert(c as usize); }
+        for p in 0..n_pass {
+            if model.is_common[p] || model.carriers[p].iter().any(|&c| in_cond.contains(c as usize)) {
+                poly.push(p);
+            } else {
+                let m = model.mono_alt[p];
+                dose[p] = crate::lcwgs::hmm::finalize_site(false, if m { 0.0 } else { 1.0 }, if m { 1.0 } else { 0.0 },
+                    0.0, 0.0, 0.5, 0.5, ee, ed);
+            }
+        }
+    });
+    if poly.is_empty() { return dose; }
+    let hl_active = |v: usize| {
+        let g = (v * n_samples + h / 2) * 3 + partner_at(v);
+        conditional_hl(gl3[g], gl3[g + 1], params.min_gl)
+    };
+    let scale = crate::lcwgs::hmm::recomb_scale(params.ne, cond.len(), ref_bm.n_haps);
+    let (rows, acm, hl, rm, slot) = passenger_axis(axis, n_var, cm, pass, &poly, row0, &hl_active,
+        model.active_rmult.as_deref().filter(|_| band), scale);
+    // The merged axis's packed bits: the main pass's rows as they are, the
+    // passengers' gathered (the same words the kernel would pack itself).
+    let n_active = axis.map_or(n_var, <[usize]>::len);
+    let w64 = cond.len().div_ceil(64);
+    let prepack: Option<Vec<u64>> = main_pack.filter(|mp| mp.len() == n_active * w64).map(|mp| {
+        let prow: Vec<usize> = poly.iter().map(|&p| row0 + p).collect();
+        let mut pp = Vec::new();
+        super::hmm::pack_cond_rows_with_parallelism(ref_bm, cond, Some(&prow), prow.len(), None, &mut pp, false);
+        let mut out = Vec::with_capacity(rows.len() * w64);
+        let (mut ia, mut ip) = (0usize, 0usize);
+        for &r in &rows {
+            if r < row0 { out.extend_from_slice(&mp[ia * w64..(ia + 1) * w64]); ia += 1; }
+            else { out.extend_from_slice(&pp[ip * w64..(ip + 1) * w64]); ip += 1; }
+        }
+        out
+    });
+    let d = run_forward_backward_with(&hl, cond, ref_bm, &acm, params, Some(&rm), Some(&rows), prepack.as_deref(), two_pass).dosage;
+    for (k, &p) in poly.iter().enumerate() { dose[p] = d[slot[k]]; }
+    dose
+}
+
+/// One iteration's genotype posteriors at a passenger from its two haplotypes'
+/// ALT probabilities (independent haplotypes, as the chain's GP).
+#[inline]
+fn passenger_genotype(a0: f64, a1: f64) -> [f32; 3] {
+    [((1.0 - a0) * (1.0 - a1)) as f32, (a0 * (1.0 - a1) + (1.0 - a0) * a1) as f32, (a0 * a1) as f32]
 }
 
 /// The exact normalization/clamping formerly repeated in every hap sweep.
@@ -533,7 +752,7 @@ pub fn run_gibbs(
     k_max_override: Option<usize>,
     precomputed_cond: Option<&Vec<Vec<u32>>>,
 ) -> GibbsOutput {
-    run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, SampleExecution::Unbudgeted, None)
+    run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, SampleExecution::Unbudgeted, None, None)
 }
 
 /// The selection's panel side built ahead of a chunk's Gibbs runs (see
@@ -551,6 +770,7 @@ fn run_gibbs_with_memory(
     precomputed_cond: Option<&Vec<Vec<u32>>>,
     execution: SampleExecution<'_>,
     panel: Option<&PanelSide>,
+    passengers: Option<&ChunkPassengers<'_>>,
 ) -> GibbsOutput {
     let memory = execution.permits();
     let n_var = cm.len();
@@ -622,6 +842,11 @@ fn run_gibbs_with_memory(
         // A single admitted sample decodes the panel half of its sweeps on
         // idle workers (same selection).
         f.set_segmented(memory.is_some());
+        // A hash/hybrid base keeps its priority order only when the k_max cap of
+        // the rare-carrier augmentation can truncate it; else it packs faster
+        // ascending (the same set; index/g2/fwd orders are unaffected).
+        let kpbwt_eff = params.kpbwt.min(ref_bm.n_haps.saturating_sub(1));
+        f.set_keep_priority_order(cfg.rare_carrier && cfg.k_max.is_some_and(|k| kpbwt_eff > k));
         Some(f)
     } else {
         None
@@ -666,6 +891,23 @@ fn run_gibbs_with_memory(
         }).collect()
     } else { Vec::new() };
     setup_lap(&mut setup_clock, &mut setup_log, "rare-carriers");
+
+    // Impute-only passengers (`LCWGS_BAM_INDELS=impute`): read by the extra
+    // forward-backward below and nowhere else. `LCWGS_PASSENGER_EVERY` = N runs it
+    // on every Nth main iteration (default 1 = every one) and averages those.
+    let pass = passengers.filter(|p| !p.ins.is_empty());
+    let n_pass = pass.map_or(0, |p| p.ins.len());
+    // The scaffold pass has its own emission and transition model (common sites only).
+    assert!(pass.is_none() || !cfg.use_scaffold, "impute-only passengers are not available with LCWGS_SCAFFOLD");
+    if let Some(p) = pass {
+        assert_eq!(p.cm.len(), n_pass);
+        assert!(p.ins.windows(2).all(|w| w[0] <= w[1]) && p.ins.last().is_none_or(|&x| x <= n_var));
+    }
+    let pass_model = pass.map(|_| PassengerModel::build(ref_bm, n_pass, params));
+    let pass_every = crate::config::usize_opt("LCWGS_PASSENGER_EVERY").filter(|&n| n >= 1).unwrap_or(1);
+    let mut acc_pass_dosage = vec![0.0f64; n_pass * n_samples];
+    let mut acc_pass_gp = vec![0.0f32; n_pass * n_samples * 3];
+    let mut n_pass_acc = 0usize;
 
     // Gated phase-timing breakdown (LCWGS_TIMING). Zero overhead when unset.
     let timing = cfg.timing;
@@ -844,6 +1086,9 @@ fn run_gibbs_with_memory(
         // does not amplify burn-in noise (cf. the always-on sequential-diploid scan,
         // e54436b). Burn-in (Jacobi): both haps condition on the snapshot partner.
         let gs = cfg.gs_main && (is_main || cfg.burnin_diploid);
+        // Passenger pass this iteration (main iterations only, every Nth).
+        let pass_now = pass.is_some() && is_main && (it - n_burnin).is_multiple_of(pass_every);
+        let pass_sites = if pass_now { n_pass } else { 0 };
         // FAITHFUL GLIMPSE2 phasing HMM: every re-phase iteration, re-phase each
         // sample's H0/H1 via the ported phasing_hmm (8-founder diplotype SAMPLE_DIP).
         // Genotype-preserving (re-phases hets); feeds the next iteration's selection
@@ -918,27 +1163,42 @@ fn run_gibbs_with_memory(
                         ref_bm, c, ps, n, if b > 0 { Some(base) } else { None }, hp, parallel_rows);
                     true
                 };
+                // The passengers' pass reads this haplotype's main-pass axis and
+                // partner allele, and writes nothing the chain reads.
+                let pass_fb = |h: usize, partner: &dyn Fn(usize) -> usize, c: &[u32], sp: Option<&PolySplit>, mp: Option<&[u64]>| {
+                    // Band-mode multipliers entered this haplotype's main pass on the
+                    // poly-skip axis and on the full axis when it carried them.
+                    let band = sp.is_some() || full_axis_rmult.is_some();
+                    pass_now.then(|| passenger_dose(h, partner, c, gl3, n_samples, ref_bm, cm, params,
+                        sp.map(|x| x.poly.as_slice()), band, pass.unwrap(), pass_model.as_ref().unwrap(), two_pass, mp))
+                };
                 let fb0 = |hp: &mut Vec<u64>| {
                     let packed = pack_for(c0, split0, &base, hp);
-                    run_one_hap(
+                    let (d, smp) = run_one_hap(
                         h0i, it, seed,
                         |v| prev_alleles[v * n_target_haps + h1i] as usize,
                         c0, gl3, n_samples, ref_bm, cm, params,
                         use_scaffold, &common_idx, n_var,
                         split0.map(|x| (x, ic_all, ps_mono_alt.as_slice())),
                         full_axis_rmult.as_deref(),
-                        if packed { Some(hp.as_slice()) } else { None }, two_pass)
+                        if packed { Some(hp.as_slice()) } else { None }, two_pass);
+                    let pd = pass_fb(h0i, &|v| prev_alleles[v * n_target_haps + h1i] as usize, c0, split0,
+                        packed.then_some(hp.as_slice()));
+                    (d, smp, pd)
                 };
                 let fb1 = |fresh: Option<&[u8]>, hp: &mut Vec<u64>| {
                     let packed = pack_for(c1, split1, &base, hp);
-                    run_one_hap(
+                    let (d, smp) = run_one_hap(
                         h1i, it, seed,
                         |v| fresh.map_or(prev_alleles[v * n_target_haps + h0i], |a| a[v]) as usize,
                         c1, gl3, n_samples, ref_bm, cm, params,
                         use_scaffold, &common_idx, n_var,
                         split1.map(|x| (x, ic_all, ps_mono_alt.as_slice())),
                         full_axis_rmult.as_deref(),
-                        if packed { Some(hp.as_slice()) } else { None }, two_pass)
+                        if packed { Some(hp.as_slice()) } else { None }, two_pass);
+                    let pd = pass_fb(h1i, &|v| fresh.map_or(prev_alleles[v * n_target_haps + h0i], |a| a[v]) as usize, c1, split1,
+                        packed.then_some(hp.as_slice()));
+                    (d, smp, pd)
                 };
                 let extra = if !is_main && !gs && rayon::current_num_threads() > 1 {
                     memory.and_then(|m| m.try_parallel_fb(super::memory::fb_bytes(n_var, c1.len())
@@ -960,8 +1220,8 @@ fn run_gibbs_with_memory(
             };
             // Only the admitted path waits for phaser memory. Whole-sample
             // tasks keep the shared prefix, but release the full FB pack here.
-            let (((d0, mut samp0), (d1, mut samp1)), retained_base) = match memory {
-                Some(m) => m.run(super::memory::fb_bytes(n_var, c0.len().max(c1.len()))
+            let (((d0, mut samp0, pd0), (d1, mut samp1, pd1)), retained_base) = match memory {
+                Some(m) => m.run(super::memory::fb_bytes(n_var + pass_sites, c0.len().max(c1.len()))
                     + two_pass_bytes(c0.len().max(c1.len())), fb),
                 None => fb(),
             };
@@ -1048,7 +1308,7 @@ fn run_gibbs_with_memory(
                         None => phase(),
                     }
             }
-            [(h0i, d0, samp0), (h1i, d1, samp1)]
+            [(h0i, d0, samp0, pd0), (h1i, d1, samp1, pd1)]
         };
         let per_sample: Vec<_> = if memory.is_some() {
             super::memory::map_samples(n_samples, rayon::current_num_threads(), sample_task)
@@ -1059,7 +1319,7 @@ fn run_gibbs_with_memory(
                 result
             }).collect()
         };
-        let results: Vec<(usize, Vec<f32>, Vec<u8>)> = per_sample.into_iter().flatten().collect();
+        let results: Vec<(usize, Vec<f32>, Vec<u8>, Option<Vec<f32>>)> = per_sample.into_iter().flatten().collect();
         if let Some(t) = t0 { t_hmm += t.elapsed().as_secs_f64(); }
         if timing { t_phase += PHASE_NS.swap(0, AtomicOrdering::Relaxed) as f64 / 1e9; }
 
@@ -1068,9 +1328,11 @@ fn run_gibbs_with_memory(
         let t0 = if timing { Some(std::time::Instant::now()) } else { None };
         let mut hap_dose: Vec<Option<Vec<f32>>> = (0..n_target_haps).map(|_| None).collect();
         let mut sampled_by_hap: Vec<Option<Vec<u8>>> = (0..n_target_haps).map(|_| None).collect();
-        for (h, dose, sampled) in results {
+        let mut pass_by_hap: Vec<Option<Vec<f32>>> = (0..n_target_haps).map(|_| None).collect();
+        for (h, dose, sampled, pd) in results {
             hap_dose[h] = Some(dose);
             sampled_by_hap[h] = Some(sampled);
+            pass_by_hap[h] = pd;
         }
         // Site-major write-back in parallel over sites: each row of `hap_alleles`
         // (one site, n_target_haps bytes) is written contiguously instead of the
@@ -1210,6 +1472,21 @@ fn run_gibbs_with_memory(
                 });
             n_acc += 1;
         }
+        if pass_now {
+            for s in 0..n_samples {
+                let (q0, q1) = (pass_by_hap[2 * s].as_ref().unwrap(), pass_by_hap[2 * s + 1].as_ref().unwrap());
+                for p in 0..n_pass {
+                    let i = p * n_samples + s;
+                    let (a0, a1) = (q0[p] as f64, q1[p] as f64);
+                    let g = passenger_genotype(a0, a1);
+                    acc_pass_gp[3 * i] += g[0];
+                    acc_pass_gp[3 * i + 1] += g[1];
+                    acc_pass_gp[3 * i + 2] += g[2];
+                    acc_pass_dosage[i] += a0 + a1;
+                }
+            }
+            n_pass_acc += 1;
+        }
         if let Some(t) = t0 { t_wb += t.elapsed().as_secs_f64(); }
     }
 
@@ -1237,8 +1514,11 @@ fn run_gibbs_with_memory(
 
     // Diagnostic: expose the final base conditioning set (cond_cache = last refresh).
     let cond_final = if cfg.cond_dump { cond_cache } else { Vec::new() };
+    let inv_p = if n_pass_acc > 0 { 1.0 / n_pass_acc as f64 } else { 1.0 };
+    let pass_dosage: Vec<f32> = acc_pass_dosage.iter().map(|&d| (d * inv_p) as f32).collect();
+    let pass_gp: Vec<f32> = acc_pass_gp.iter().map(|&g| (g as f64 * inv_p) as f32).collect();
 
-    GibbsOutput { dosage, gp, cond_final }
+    GibbsOutput { dosage, gp, cond_final, pass_dosage, pass_gp }
 }
 
 /// Write re-phased per-sample haplotypes back into the site-major
@@ -1294,9 +1574,10 @@ pub(crate) fn run_gibbs_ensemble_with_memory(
     precomputed_cond: Option<&Vec<Vec<u32>>>,
     execution: SampleExecution<'_>,
     panel: Option<&PanelSide>,
+    passengers: Option<&ChunkPassengers<'_>>,
 ) -> GibbsOutput {
     let n_restarts = crate::config::usize_or("LCWGS_GIBBS_RESTARTS", 1).max(1);
-    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, execution, panel)
+    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, execution, panel, passengers)
 }
 
 /// Inner ensemble with an explicit restart count (the env-read entry point
@@ -1314,7 +1595,7 @@ pub(crate) fn run_gibbs_ensemble_n(
     precomputed_cond: Option<&Vec<Vec<u32>>>,
     n_restarts: usize,
 ) -> GibbsOutput {
-    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, SampleExecution::Unbudgeted, None)
+    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, SampleExecution::Unbudgeted, None, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1329,30 +1610,38 @@ fn run_gibbs_ensemble_inner(
     n_restarts: usize,
     execution: SampleExecution<'_>,
     panel: Option<&PanelSide>,
+    passengers: Option<&ChunkPassengers<'_>>,
 ) -> GibbsOutput {
     let n_restarts = n_restarts.max(1);
     if n_restarts == 1 {
-        return run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, execution, panel);
+        return run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, execution, panel, passengers);
     }
     let base = params.seed_or_default();
     let mut acc_d: Vec<f64> = Vec::new();
     let mut acc_g: Vec<f64> = Vec::new();
+    let (mut acc_pd, mut acc_pg): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
     for i in 0..n_restarts {
         let mut p = params.clone();
         p.seed = base.wrapping_add(i as u64);
-        let out = run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, &p, k_max_override, precomputed_cond, execution, panel);
+        let out = run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, &p, k_max_override, precomputed_cond, execution, panel, passengers);
         if acc_d.is_empty() {
             acc_d = vec![0.0f64; out.dosage.len()];
             acc_g = vec![0.0f64; out.gp.len()];
+            acc_pd = vec![0.0f64; out.pass_dosage.len()];
+            acc_pg = vec![0.0f64; out.pass_gp.len()];
         }
         for (a, &d) in acc_d.iter_mut().zip(out.dosage.iter()) { *a += d as f64; }
         for (a, &g) in acc_g.iter_mut().zip(out.gp.iter()) { *a += g as f64; }
+        for (a, &d) in acc_pd.iter_mut().zip(out.pass_dosage.iter()) { *a += d as f64; }
+        for (a, &g) in acc_pg.iter_mut().zip(out.pass_gp.iter()) { *a += g as f64; }
     }
     let inv = 1.0 / n_restarts as f64;
     GibbsOutput {
         dosage: acc_d.iter().map(|&d| (d * inv) as f32).collect(),
         gp: acc_g.iter().map(|&g| (g * inv) as f32).collect(),
         cond_final: Vec::new(),
+        pass_dosage: acc_pd.iter().map(|&d| (d * inv) as f32).collect(),
+        pass_gp: acc_pg.iter().map(|&g| (g * inv) as f32).collect(),
     }
 }
 
@@ -1874,6 +2163,179 @@ mod tests {
                     let got = phaser_split_from(&poly_split(&cond, &ic, &sr, n_sites), &h0, &h1);
                     assert_eq!(got, want, "n_haps={n_haps} k={k}");
                 }
+            }
+        }
+    }
+
+    /// A random chunk with `n_pass` passenger rows: the full panel (active rows,
+    /// then passenger rows), active cM, passenger insertion points and cM, GLs.
+    /// `common_active`: active rows all common (a long poly axis), else the
+    /// typed-panel site classes; `plateau`: every active site at one cM.
+    #[allow(clippy::type_complexity)]
+    fn passenger_fixture(rng: &mut crate::lcwgs::hmm::reference_pack::Xs, n_var: usize, n_haps: usize, n_samples: usize, n_pass: usize,
+        common_active: bool, plateau: bool) -> (HaplotypeBitmatrix, Vec<f64>, Vec<usize>, Vec<f64>, Vec<f32>) {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        let full = if common_active {
+            let a = rp::random_panel(rng, n_var, n_haps, 30);
+            let p = rp::random_typed_panel(rng, n_pass, n_haps);
+            let mut bits = Vec::new();
+            for v in 0..n_var { bits.extend_from_slice(a.row(v)); }
+            for v in 0..n_pass { bits.extend_from_slice(p.row(v)); }
+            HaplotypeBitmatrix::from_raw(bits, n_var + n_pass, n_haps)
+        } else {
+            rp::random_typed_panel(rng, n_var + n_pass, n_haps)
+        };
+        let mut cm = Vec::with_capacity(n_var);
+        let mut x = 0.0f64;
+        for _ in 0..n_var {
+            if !plateau { x += [0.0, 0.0004, 0.003, 0.02][rng.below(4) as usize]; }
+            cm.push(x);
+        }
+        let mut ins: Vec<usize> = (0..n_pass).map(|_| rng.below(n_var as u64 + 1) as usize).collect();
+        ins.sort_unstable();
+        // A passenger's position lies between its neighbours (at one of them or inside).
+        let mut pcm: Vec<f64> = ins.iter().map(|&i| {
+            let lo = if i == 0 { cm[0] - 0.01 } else { cm[i - 1] };
+            let hi = if i == n_var { cm[n_var - 1] + 0.01 } else { cm[i] };
+            lo + (hi - lo) * rng.below(3) as f64 / 2.0
+        }).collect();
+        // Positions ascend, as a panel's do.
+        for p in 1..n_pass { if ins[p] == ins[p - 1] { pcm[p] = pcm[p].max(pcm[p - 1]); } }
+        let gl3: Vec<f32> = (0..n_var * n_samples).flat_map(|_| match rng.below(4) {
+            0 => [1.0f32 / 3.0; 3],
+            1 => [0.9, 0.09, 0.01],
+            2 => [0.05, 0.9, 0.05],
+            _ => [0.01, 0.19, 0.8],
+        }).collect();
+        (full, cm, ins, pcm, gl3)
+    }
+
+    /// Impute-only passengers move no output of the chain: SNP dosage and GP are
+    /// bit-identical to the same chain run without them (unbudgeted and admitted
+    /// executions, one and several samples, rare passengers on a 5,000-haplotype
+    /// panel, and a poly axis long enough for the two-pass kernel), and the
+    /// passengers get valid doses and GP triples.
+    #[test]
+    fn passengers_leave_active_outputs_bit_identical() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        // The long-axis admitted configuration runs two-pass block tasks.
+        let _serial = crate::lcwgs::hmm::two_pass::TASK_BLOCKS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rng = rp::Xs(0x3C6E_F372_A54F_F53A);
+        let configs: &[(usize, usize, usize, usize, bool)] = &[
+            (260, 180, 1, 45, false), (220, 130, 3, 70, false), (300, 600, 2, 1, false), (150, 90, 1, 150, false),
+            (700, 5000, 1, 300, false), (4600, 300, 1, 200, true),
+        ];
+        for &(n_var, n_haps, n_samples, n_pass, common) in configs {
+            let (full, cm, ins, pcm, gl3) = passenger_fixture(&mut rng, n_var, n_haps, n_samples, n_pass, common, false);
+            let active = HaplotypeBitmatrix::from_subset(&full, &(0..n_var).collect::<Vec<_>>());
+            let hidden = HaplotypeBitmatrix::from_subset(&full, &(0..n_var + n_pass).collect::<Vec<_>>()).with_hidden_tail(n_var);
+            let params = LcwgsParams { n_iterations: 6, n_main_iterations: 4, kpbwt: 40, pbwt_modulo_cm: 0.004, ..Default::default() };
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            for admitted in [false, true] {
+                let budget = super::super::memory::MemoryBudget::new(256 * 1024 * 1024, 1024);
+                let exec = || if admitted && n_samples == 1 { SampleExecution::Admitted(&budget) } else { SampleExecution::Unbudgeted };
+                let base = run_gibbs_with_memory(&gl3, &active, &cm, n_samples, &params, None, None, exec(), None, None);
+                assert!(base.pass_dosage.is_empty() && base.pass_gp.is_empty());
+                let pass = ChunkPassengers { ins: ins.clone(), cm: &pcm };
+                let out = run_gibbs_with_memory(&gl3, &hidden, &cm, n_samples, &params, None, None, exec(), None, Some(&pass));
+                assert_eq!(bits(&out.dosage), bits(&base.dosage), "dosage n_var={n_var} samples={n_samples} admitted={admitted}");
+                assert_eq!(bits(&out.gp), bits(&base.gp), "gp n_var={n_var} samples={n_samples} admitted={admitted}");
+                assert_eq!(out.pass_dosage.len(), n_pass * n_samples);
+                assert_eq!(out.pass_gp.len(), n_pass * n_samples * 3);
+                for i in 0..n_pass * n_samples {
+                    let g = &out.pass_gp[3 * i..3 * i + 3];
+                    assert!((g.iter().sum::<f32>() - 1.0).abs() < 1e-4, "passenger GP sums to {}", g.iter().sum::<f32>());
+                    assert!((out.pass_dosage[i] - (g[1] + 2.0 * g[2])).abs() < 1e-4);
+                    assert!((0.0..=2.0).contains(&out.pass_dosage[i]));
+                }
+            }
+        }
+    }
+
+    /// A passenger's dose is the copying posterior at its position under the
+    /// haplotype's main pass: the forward-backward over that pass's axis merged
+    /// with EVERY passenger gives (i) the main pass's posteriors at the axis sites
+    /// (flat sites and exactly factored gaps move nothing) and (ii) `passenger_dose`
+    /// at the passengers, though that pass carries only the polymorphic ones
+    /// (monomorphic ones take the closed form). Rare passengers on a 5,000-haplotype
+    /// panel, a zero-cM plateau, and band-mode multipliers on and off.
+    #[test]
+    fn passenger_dose_is_the_main_pass_posterior() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        let mut rng = rp::Xs(0xA54F_F53A_5F1D_36F1);
+        let configs: &[(usize, usize, usize, bool)] = &[(300, 160, 60, false), (180, 900, 40, false), (120, 64, 120, false),
+            (400, 5000, 150, false), (200, 300, 80, true), (250, 5000, 100, true)];
+        for &(n_var, n_haps, n_pass, plateau) in configs {
+            let (full, cm, ins, pcm, gl3) = passenger_fixture(&mut rng, n_var, n_haps, 1, n_pass, false, plateau);
+            let bm = HaplotypeBitmatrix::from_subset(&full, &(0..n_var + n_pass).collect::<Vec<_>>()).with_hidden_tail(n_var);
+            let params = LcwgsParams::default();
+            let model = PassengerModel::build(&bm, n_pass, &params);
+            assert!(model.carriers.iter().any(|c| !c.is_empty()) || n_haps < 1000, "no rare passenger exercised");
+            let pass = ChunkPassengers { ins: ins.clone(), cm: &pcm };
+            let (ic, sr, _) = build_poly_skip_structures(&bm, params.rare_maf, n_var);
+            let partner: Vec<usize> = (0..n_var).map(|_| rng.below(2) as usize).collect();
+            let hl_at = |v: usize| { let g = v * 3 + partner[v]; conditional_hl(gl3[g], gl3[g + 1], params.min_gl) };
+            let all: Vec<usize> = (0..n_pass).collect();
+            for band in [true, false] {
+                let rmult = model.active_rmult.as_deref().filter(|_| band);
+                for _ in 0..5 {
+                    let k = 1 + rng.below(n_haps as u64 / 2) as usize;
+                    let mut cond: Vec<u32> = (0..n_haps as u32).collect();
+                    for i in (1..cond.len()).rev() { cond.swap(i, rng.below(i as u64 + 1) as usize); }
+                    cond.truncate(k);
+                    let split = poly_split(&cond, &ic, &sr, n_var);
+                    if split.poly.is_empty() { continue; }
+                    let got = passenger_dose(0, |v| partner[v], &cond, &gl3, 1, &bm, &cm, &params, Some(&split.poly), band, &pass, &model, false, None);
+                    // Reusing the main pass's pack gives the same bits.
+                    let mut mp = Vec::new();
+                    crate::lcwgs::hmm::pack_cond_rows(&bm, &cond, Some(&split.poly), split.poly.len(), None, &mut mp);
+                    let got_packed = passenger_dose(0, |v| partner[v], &cond, &gl3, 1, &bm, &cm, &params, Some(&split.poly), band, &pass, &model, false, Some(&mp));
+                    assert_eq!(got.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), got_packed.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+                    // Main pass over the poly axis.
+                    let hl_main: Vec<f32> = split.poly.iter().flat_map(|&v| hl_at(v)).collect();
+                    let cm_main: Vec<f64> = split.poly.iter().map(|&v| cm[v]).collect();
+                    let rm_main: Option<Vec<f32>> = rmult.map(|a| split.poly.iter().map(|&v| a[v]).collect());
+                    let main = run_forward_backward_with(&hl_main, &cond, &bm, &cm_main, &params, rm_main.as_deref(), Some(&split.poly), None, false).dosage;
+                    // Reference: every passenger on the axis.
+                    let scale = crate::lcwgs::hmm::recomb_scale(params.ne, cond.len(), n_haps);
+                    let (rows, acm, hl, rm, _) = passenger_axis(Some(&split.poly), n_var, &cm, &pass, &all, n_var, &hl_at, rmult, scale);
+                    let reference = run_forward_backward_with(&hl, &cond, &bm, &acm, &params, Some(&rm), Some(&rows), None, false).dosage;
+                    let mut seen_active = 0;
+                    for (i, &r) in rows.iter().enumerate() {
+                        if r < n_var {
+                            assert!((reference[i] - main[seen_active]).abs() < 1e-5, "axis site {r}: {} vs {} (band {band}, plateau {plateau})", reference[i], main[seen_active]);
+                            seen_active += 1;
+                        } else {
+                            assert!((reference[i] - got[r - n_var]).abs() < 1e-5, "passenger {}: {} vs {} (band {band}, plateau {plateau})", r - n_var, reference[i], got[r - n_var]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The factored gap boundaries compose to the main pass's switch probability:
+    /// for every gap between two axis sites, the product of its sub-boundaries'
+    /// stay probabilities equals one minus the main pass's boundary probability.
+    #[test]
+    fn passenger_gaps_compose_to_the_main_boundary() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        let mut rng = rp::Xs(0x9B05_688C_1F83_D9AB);
+        for plateau in [false, true] {
+            let (_, cm, ins, pcm, _) = passenger_fixture(&mut rng, 200, 100, 1, 150, false, plateau);
+            let pass = ChunkPassengers { ins, cm: &pcm };
+            let all: Vec<usize> = (0..150).collect();
+            let axis: Vec<usize> = (0..200).filter(|v| v % 3 != 1).collect();
+            let rmult: Vec<f32> = (0..200).map(|v| if v % 5 == 0 { 7.5 } else { 1.0 }).collect();
+            let scale = 0.04;
+            let (rows, acm, _, rm, _) = passenger_axis(Some(&axis), 200, &cm, &pass, &all, 200, &|_| [0.5, 0.5], Some(&rmult), scale);
+            let actives: Vec<usize> = (0..rows.len()).filter(|&k| rows[k] < 200).collect();
+            for w in actives.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                let want = crate::lcwgs::hmm::switch_prob((acm[b] - acm[a]).max(0.0) * scale * rmult[rows[b]] as f64) as f64;
+                if b == a + 1 { assert_eq!(rm[b], rmult[rows[b]]); continue; }
+                let stay: f64 = (a + 1..=b).map(|t| { assert!(rm[t].is_sign_negative()); 1.0 + rm[t] as f64 }).product();
+                assert!(((1.0 - stay) - want).abs() <= want * 1e-5, "gap {a}..{b}: {} vs {want}", 1.0 - stay);
             }
         }
     }

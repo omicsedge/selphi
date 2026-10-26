@@ -159,7 +159,44 @@ pub fn run_lcwgs(
     memtrace("after gl3_shared relayout (gl3_input dropped)");
 
     // --- 5. cM map + chunked Gibbs imputation (shared with the BAM path) ---
-    impute_from_gl3(srp, &wgs_idx, gl3_shared, n_samples, sample_ids, &pl_haploid, map_path, params, None)
+    impute_from_gl3(srp, &wgs_idx, gl3_shared, n_samples, sample_ids, &pl_haploid, map_path, params, None, None)
+}
+
+/// Panel sites imputed without entering the chain (`LCWGS_BAM_INDELS=impute`, the
+/// `--bam` path's indels): see [`super::iterate::ChunkPassengers`].
+pub(crate) struct Passengers {
+    /// Panel variant index of each passenger (ascending).
+    idx: Vec<usize>,
+    /// Insertion point among the run's active sites: passenger `p` lies after
+    /// active site `ins[p] - 1` and before active site `ins[p]`.
+    ins: Vec<usize>,
+    /// Their own genotype likelihoods (`[(p * n_samples + s) * 3 + g]`), or flat.
+    gl3: Option<Vec<f32>>,
+}
+
+impl Passengers {
+    fn new(active: &[usize], idx: Vec<usize>, gl3: Option<Vec<f32>>) -> Self {
+        assert!(idx.windows(2).all(|w| w[0] < w[1]), "passenger panel indices must ascend");
+        let ins = idx.iter().map(|&i| active.partition_point(|&w| w < i)).collect();
+        Passengers { idx, ins, gl3 }
+    }
+
+    /// The passengers of the chunk whose core is `core` (active-site indices):
+    /// those whose left active neighbour lies in the core, the ones before the
+    /// first active site with the chunk that holds it. Cores partition the active
+    /// sites, so these partition the passengers.
+    fn of_core(&self, core: &std::ops::Range<usize>) -> std::ops::Range<usize> {
+        let left = |x: &usize| x.saturating_sub(1);
+        self.ins.partition_point(|x| left(x) < core.start)..self.ins.partition_point(|x| left(x) < core.end)
+    }
+}
+
+/// A chunk's reference bitmatrix: the active sites' rows, then (hidden from
+/// `n_sites`) its passengers' rows.
+fn chunk_bitmatrix(srp: &SrpReader, chunk_wgs: &[usize], pass_wgs: &[usize]) -> crate::common::HaplotypeBitmatrix {
+    if pass_wgs.is_empty() { return srp.extract_ref_alleles_bitmatrix(chunk_wgs); }
+    let rows: Vec<usize> = chunk_wgs.iter().chain(pass_wgs).copied().collect();
+    srp.extract_ref_alleles_bitmatrix(&rows).with_hidden_tail(chunk_wgs.len())
 }
 
 /// A chromosome with nothing to impute from: no input record matches the panel, or no site
@@ -256,13 +293,15 @@ fn impute_from_gl3(
     map_path: &str,
     params: &LcwgsParams,
     prepared: Option<Prepared>,
+    passengers: Option<Passengers>,
 ) -> std::io::Result<LcwgsOutput> {
     let n_shared = wgs_idx.len();
     // The coverage proxy of the SPLIT gate and the adaptive GL floor, read from the
     // likelihoods as given: a man's product-form chrX rows look more confident than
     // his reads are, which would switch the split off on his chrX alone.
     let mean_conf = gl_mean_conf(&gl3_shared, n_samples, n_shared);
-    let haploid = haploid_chrx(&mut gl3_shared, srp, wgs_idx, n_samples, &sample_ids, pl_haploid, params);
+    let pass_idx: &[usize] = passengers.as_ref().map_or(&[], |p| p.idx.as_slice());
+    let haploid = haploid_chrx(&mut gl3_shared, srp, wgs_idx, n_samples, &sample_ids, pl_haploid, params, pass_idx);
     // Nothing but flat likelihoods (a GT-only, GP or DS file forced onto this engine, a BAM with
     // no read on this chromosome) would be imputed from the panel alone.
     if !gl3_shared.chunks_exact(3).any(|g| g[0] != g[1] || g[1] != g[2]) {
@@ -336,12 +375,90 @@ fn impute_from_gl3(
             crate::selphi_info!("  adaptive min_gl: kept {} (mean_conf={:.3} < {:.2}, low coverage)", eff.min_gl, mean_conf, thr);
         }
     }
+    // Panel-order-independent conditioning cap (LCWGS_QUAL_TRUNC=hash|hybrid): its
+    // panel priority, keyed by the panel's sample IDs, built once for the run.
+    if params.cap.is_none()
+        && let Some(plan) = super::faithful_select::cap_plan_from_env(&srp.sample_ids, srp.metadata.n_haps) {
+        eff.cap = Some(plan);
+        modified = true;
+    }
     let params: &LcwgsParams = if modified { &eff } else { params };
 
-    let (dosage, mut gp) = run_chunked_gibbs(&gl3_shared, srp, wgs_idx, &cm, n_samples, n_shared, params, mean_conf,
-        prepared_chunks.as_deref());
-    if let Some(cells) = &haploid { haploid_gp(cells, &dosage, &mut gp, n_samples); }
-    Ok(LcwgsOutput { dosage, gp, n_variants: n_shared, sample_ids, panel_idx: wgs_idx.to_vec() })
+    let pass_cm = match &passengers { Some(p) => site_cm(srp, &p.idx, map_path)?, None => Vec::new() };
+    let (dosage, mut gp, mut pass_dosage, mut pass_gp) = run_chunked_gibbs(&gl3_shared, srp, wgs_idx, &cm, n_samples, n_shared, params, mean_conf,
+        prepared_chunks.as_deref(), passengers.as_ref().map(|p| (p, pass_cm.as_slice())));
+    if let Some(gl) = passengers.as_ref().and_then(|p| p.gl3.as_deref()) {
+        let cells = haploid.as_ref().map(|c| (c.sample.as_slice(), c.pass_site.as_slice()));
+        fold_passenger_reads(&mut pass_gp, &mut pass_dosage, gl, n_samples, cells);
+    }
+    if let Some(cells) = &haploid {
+        haploid_gp(&cells.sample, &cells.site, &dosage, &mut gp, n_samples);
+        haploid_gp(&cells.sample, &cells.pass_site, &pass_dosage, &mut pass_gp, n_samples);
+    }
+    match passengers {
+        None => Ok(LcwgsOutput { dosage, gp, n_variants: n_shared, sample_ids, panel_idx: wgs_idx.to_vec() }),
+        Some(p) => {
+            let (dosage, gp, panel_idx) = merge_rows(wgs_idx, dosage, gp, &p.idx, pass_dosage, pass_gp, n_samples);
+            Ok(LcwgsOutput { dosage, gp, n_variants: panel_idx.len(), sample_ids, panel_idx })
+        }
+    }
+}
+
+/// The passengers' own read likelihoods folded into their genotype posteriors once
+/// the chain's copying prior is averaged (over main iterations, restarts and the
+/// split's deep pass): `GP ∝ prior · GL`, `DS = GP1 + 2 GP2`. A haploid cell
+/// (`haploid` = (sample, passenger) flags of the chrX non-PAR males) folds its
+/// one allele instead: prior `p = DS / 2`, `P(ALT) ∝ p · GL2` against
+/// `(1 - p) · GL0`, `GP = (1 - P, 0, P)`, `DS = 2P` (the haploid convention of
+/// `haploid_gp`). A likelihood that rules out every prior genotype leaves the prior.
+fn fold_passenger_reads(gp: &mut [f32], dosage: &mut [f32], gl3: &[f32], n_samples: usize, haploid: Option<(&[bool], &[bool])>) {
+    for (i, (g, l)) in gp.chunks_exact_mut(3).zip(gl3.chunks_exact(3)).enumerate() {
+        let one = haploid.is_some_and(|(sample, site)| sample[i % n_samples] && site[i / n_samples]);
+        if one {
+            let p = (dosage[i] as f64 * 0.5).clamp(0.0, 1.0);
+            let (a, r) = (p * l[2] as f64, (1.0 - p) * l[0] as f64);
+            let z = a + r;
+            if z > 0.0 && z.is_finite() {
+                let q = a / z;
+                g[0] = (1.0 - q) as f32;
+                g[1] = 0.0;
+                g[2] = q as f32;
+                dosage[i] = (2.0 * q) as f32;
+            }
+            continue;
+        }
+        let post = [g[0] as f64 * l[0] as f64, g[1] as f64 * l[1] as f64, g[2] as f64 * l[2] as f64];
+        let z = post[0] + post[1] + post[2];
+        if z > 0.0 && z.is_finite() {
+            for k in 0..3 { g[k] = (post[k] / z) as f32; }
+            dosage[i] = ((post[1] + 2.0 * post[2]) / z) as f32;
+        }
+    }
+}
+
+/// Interleave the passengers' rows with the active rows in panel order.
+#[allow(clippy::too_many_arguments)]
+fn merge_rows(
+    active: &[usize], dosage: Vec<f32>, gp: Vec<f32>,
+    pass: &[usize], pass_dosage: Vec<f32>, pass_gp: Vec<f32>, n_samples: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<usize>) {
+    let n = active.len() + pass.len();
+    let (mut d, mut g, mut idx) = (Vec::with_capacity(n * n_samples), Vec::with_capacity(n * n_samples * 3), Vec::with_capacity(n));
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < active.len() || j < pass.len() {
+        if j < pass.len() && (i >= active.len() || pass[j] < active[i]) {
+            idx.push(pass[j]);
+            d.extend_from_slice(&pass_dosage[j * n_samples..(j + 1) * n_samples]);
+            g.extend_from_slice(&pass_gp[j * n_samples * 3..(j + 1) * n_samples * 3]);
+            j += 1;
+        } else {
+            idx.push(active[i]);
+            d.extend_from_slice(&dosage[i * n_samples..(i + 1) * n_samples]);
+            g.extend_from_slice(&gp[i * n_samples * 3..(i + 1) * n_samples * 3]);
+            i += 1;
+        }
+    }
+    (d, g, idx)
 }
 
 /// Genetic position of every shared site. Beyond the map's ends: the
@@ -373,14 +490,13 @@ struct Prepared {
 /// start first: as many of the largest chunks as fit nine tenths of the state
 /// allowance the scheduler will grant (estimated before the pileup, with the
 /// likelihoods and a pileup allowance counted as shared).
-fn prepare_chunks(srp: &SrpReader, wgs_idx: &[usize], map_path: &str, params: &LcwgsParams) -> std::io::Result<Prepared> {
+fn prepare_chunks(srp: &SrpReader, wgs_idx: &[usize], map_path: &str, params: &LcwgsParams, pass: Option<&Passengers>) -> std::io::Result<Prepared> {
     use rayon::prelude::*;
     let cm = site_cm(srp, wgs_idx, map_path)?;
     let n_shared = wgs_idx.len();
     let n_ref = srp.metadata.n_haps;
-    let (core_cm, buffer_cm) = (params.chunk_core_cm(), params.chunk_buffer_cm());
-    let n_chunks = if n_shared == 0 { 0 } else { (((cm[n_shared - 1] - cm[0]) / core_cm).ceil() as usize).max(1) };
-    let ranges: Vec<_> = (0..n_chunks).map(|c| super::chunk_ranges::chunk_ranges(&cm, c, n_chunks, core_cm, buffer_cm)).collect();
+    let ranges = plan_chunks(&cm, params, n_ref, false);
+    let n_chunks = ranges.len();
     let threads = rayon::current_num_threads().max(1);
     let shared = (rss_gb() * 1_073_741_824.0) as usize
         + threads * (super::hmm::CACHE_BYTES_PER_WORKER + super::membership::CACHE_BYTES_PER_WORKER)
@@ -390,7 +506,8 @@ fn prepare_chunks(srp: &SrpReader, wgs_idx: &[usize], map_path: &str, params: &L
     let limit = crate::config::f64_opt("LCWGS_MEM_BUDGET_GB").map(|gb| (gb * 1e9) as usize)
         .unwrap_or_else(|| baseline_memory_budget(n_shared, n_ref, 1, n_chunks, threads, shared, host_allowance));
     let allowance = limit.saturating_sub(shared) / 2 * 9 / 10;
-    let costs: Vec<usize> = ranges.iter().map(|r| r.as_ref().map_or(0, |(_, b)| chunk_state_bytes(b.len(), n_ref, 1))).collect();
+    let n_pass = |core: &std::ops::Range<usize>| pass.map_or(0, |p| p.of_core(core).len());
+    let costs: Vec<usize> = ranges.iter().map(|r| r.as_ref().map_or(0, |(c, b)| chunk_state_bytes(b.len() + n_pass(c), n_ref, 1))).collect();
     let mut order: Vec<usize> = (0..n_chunks).filter(|&c| ranges[c].is_some()).collect();
     order.sort_by_key(|&c| std::cmp::Reverse(costs[c]));
     let (mut used, mut picked) = (0usize, Vec::new());
@@ -401,14 +518,41 @@ fn prepare_chunks(srp: &SrpReader, wgs_idx: &[usize], map_path: &str, params: &L
     }
     let selector = !crate::config::present("LCWGS_NO_FAITHFUL_SELECT") && !crate::config::present("LCWGS_CHRWIDE_PBWT");
     let built: Vec<(usize, ChunkPrep)> = picked.par_iter().map(|&c| {
-        let (_, buffer) = ranges[c].clone().unwrap();
-        let bm = srp.extract_ref_alleles_bitmatrix(&wgs_idx[buffer.clone()]);
+        let (core, buffer) = ranges[c].clone().unwrap();
+        let pass_wgs: &[usize] = pass.map_or(&[], |p| &p.idx[p.of_core(&core)]);
+        let bm = chunk_bitmatrix(srp, &wgs_idx[buffer.clone()], pass_wgs);
         let panel = selector.then(|| std::sync::Arc::new(super::faithful_select::FaithfulPanel::build(&bm, &cm[buffer], params)));
         (c, ChunkPrep { bm, panel })
     }).collect();
     let chunks: Vec<_> = (0..n_chunks).map(|_| std::sync::Mutex::new(None)).collect();
     for (c, prep) in built { *chunks[c].lock().unwrap() = Some(prep); }
     Ok(Prepared { cm, chunks })
+}
+
+/// The run's chunks (see `chunk_ranges::chunk_plan`): the cM chunks, those over
+/// the `LCWGS_CHUNK_MAX_PANEL_GB` site cap cut into smaller ones.
+fn plan_chunks(cm: &[f64], params: &LcwgsParams, n_ref: usize, log: bool) -> Vec<Option<(std::ops::Range<usize>, std::ops::Range<usize>)>> {
+    let cap = chunk_max_sites(n_ref);
+    let plan = super::chunk_ranges::chunk_plan(cm, params.chunk_core_cm(), params.chunk_buffer_cm(), cap);
+    if let Some(cap) = cap.filter(|_| log) {
+        let base = super::chunk_ranges::chunk_plan(cm, params.chunk_core_cm(), params.chunk_buffer_cm(), None);
+        if plan.len() != base.len() || plan != base {
+            let largest = base.iter().flatten().map(|(_, b)| b.len()).max().unwrap_or(0);
+            crate::selphi_info!("  chunk site cap (LCWGS_CHUNK_MAX_PANEL_GB): {} sites a chunk; {} cM chunks -> {} (largest cM chunk {} sites)",
+                cap, base.len(), plan.len(), largest);
+        }
+    }
+    plan
+}
+
+/// `LCWGS_CHUNK_MAX_PANEL_GB` (unset = no cap): the most panel rows a chunk may
+/// hold, in GB of its two bit copies (`2 * sites * ceil(n_ref / 64) * 8` bytes),
+/// as a site count. Byte-based so it scales with the panel: 2 GB is ~105,800
+/// sites on 75,552 haplotypes, ~1.3 M on 6,332.
+fn chunk_max_sites(n_ref: usize) -> Option<usize> {
+    let gb = crate::config::f64_opt("LCWGS_CHUNK_MAX_PANEL_GB").filter(|g| g.is_finite() && *g > 0.0)?;
+    let per_site = (2 * n_ref.div_ceil(64) * 8).max(1) as f64;
+    Some(((gb * 1e9) / per_site).floor().max(1.0) as usize)
 }
 
 /// Memory the pileup may still hold when the chunks start.
@@ -425,7 +569,7 @@ const SEX_TEST_BLOCKS: usize = 5;
 const SEX_LLR_MARGIN: f64 = 10.0;
 
 /// The `(sample, site)` cells modelled as haploid: chrX males outside the PARs.
-struct HaploidCells { sample: Vec<bool>, site: Vec<bool> }
+struct HaploidCells { sample: Vec<bool>, site: Vec<bool>, pass_site: Vec<bool> }
 
 /// chrX males are haploid outside the pseudo-autosomal regions. The Gibbs sampler
 /// is diploid and draws each haplotype from `(GL[ca], GL[ca+1])` given its
@@ -447,9 +591,10 @@ struct HaploidCells { sample: Vec<bool>, site: Vec<bool> }
 /// `(1-p)^2 GL0 + 2p(1-p) GL1 + p^2 GL2`; the summed log ratio must favour haploid
 /// by more than `SEX_LLR_MARGIN`. A site seen in one read is neutral; reads of both
 /// alleles at common sites decide it (a man shows them only through read errors).
+#[allow(clippy::too_many_arguments)]
 fn haploid_chrx(
     gl3: &mut [f32], srp: &SrpReader, wgs_idx: &[usize], n_samples: usize,
-    sample_ids: &[String], pl_haploid: &[bool], params: &LcwgsParams,
+    sample_ids: &[String], pl_haploid: &[bool], params: &LcwgsParams, pass_idx: &[usize],
 ) -> Option<HaploidCells> {
     if !crate::contig::is_chrx(srp.chromosome()) || wgs_idx.is_empty() { return None; }
     let build = params.build.unwrap_or_else(|| {
@@ -524,14 +669,16 @@ fn haploid_chrx(
     }
     crate::selphi_info!("  chrX: {} haploid sample(s) ({} called haploid in the input, {} from {}): one allele outside the PARs",
         n_hap, n_called, n_hap - n_called, if params.haploids.is_some() { "--haploids" } else { "the likelihood-ratio test" });
-    Some(HaploidCells { sample: haploid, site: non_par })
+    let pass_site = pass_idx.iter()
+        .map(|&wi| !(params.chrx_par && crate::contig::in_chrx_par(srp.variants.pos(wi), build))).collect();
+    Some(HaploidCells { sample: haploid, site: non_par, pass_site })
 }
 
 /// Haploid genotype posteriors for the cells of [`haploid_chrx`]: the two
 /// haplotypes are draws of one allele, so `p = DS/2` and GP = `(1-p, 0, p)`.
-fn haploid_gp(cells: &HaploidCells, dosage: &[f32], gp: &mut [f32], n_samples: usize) {
-    for (v, _) in cells.site.iter().enumerate().filter(|&(_, &np)| np) {
-        for s in (0..n_samples).filter(|&s| cells.sample[s]) {
+fn haploid_gp(sample: &[bool], site: &[bool], dosage: &[f32], gp: &mut [f32], n_samples: usize) {
+    for (v, _) in site.iter().enumerate().filter(|&(_, &np)| np) {
+        for s in (0..n_samples).filter(|&s| sample[s]) {
             let i = v * n_samples + s;
             let p = (dosage[i] * 0.5).clamp(0.0, 1.0);
             gp[3 * i] = 1.0 - p;
@@ -620,10 +767,26 @@ pub fn run_lcwgs_bam(
     // keep the old flat-from-scaffold behaviour (LCWGS_BAM_KEEP_INDELS).
     let enable_indel = crate::config::present("LCWGS_INDEL_REALIGN");
     let keep_indels = crate::config::present("LCWGS_BAM_KEEP_INDELS");
-    let (wgs_idx, pos, ref_base, alt_base, is_snp, n_shared) = if n_indel > 0 && !(enable_indel && reference.is_some()) && !keep_indels {
+    // Impute-only indels (LCWGS_BAM_INDELS=impute): the SNPs run exactly as the
+    // default (indels dropped) and the indels ride along as passengers that the
+    // chain never reads (see `iterate::ChunkPassengers`), scored from their own
+    // reads when realignment is on, so no SNP output can move.
+    let impute_indels = n_indel > 0 && bam_indels_impute();
+    if impute_indels && crate::config::present("LCWGS_SCAFFOLD") {
+        return Err(crate::Fatal::error(2, "LCWGS_BAM_INDELS=impute is not available with LCWGS_SCAFFOLD (the scaffold pass has its own model)".to_string()).into());
+    }
+    let pass_idx: Vec<usize> = if impute_indels { (0..n_shared).filter(|&i| !is_snp[i]).map(|i| wgs_idx[i]).collect() } else { Vec::new() };
+    if impute_indels {
+        selphi_info!("  lcWGS-BAM: {} indel panel sites imputed only (LCWGS_BAM_INDELS=impute): out of selection, sampling and phasing; {}",
+            n_indel, if enable_indel && reference.is_some() { "their own reads scored by realignment fold into their own genotypes" }
+                else { "dose from the chain's copying posterior (flat reads)" });
+    }
+    let (wgs_idx, pos, ref_base, alt_base, is_snp, n_shared) = if n_indel > 0 && (impute_indels || !(keep_indels || (enable_indel && reference.is_some()))) {
         let keep: Vec<usize> = (0..n_shared).filter(|&i| is_snp[i]).collect();
-        selphi_info!("  lcWGS-BAM: {} indel panel sites excluded from the target set (no read evidence; as the PL path). LCWGS_BAM_KEEP_INDELS=1 keeps them flat, LCWGS_INDEL_REALIGN=1 + --reference scores them",
-            n_indel);
+        if !impute_indels {
+            selphi_info!("  lcWGS-BAM: {} indel panel sites excluded from the target set (no read evidence; as the PL path). LCWGS_BAM_KEEP_INDELS=1 keeps them flat, LCWGS_INDEL_REALIGN=1 + --reference scores them, LCWGS_BAM_INDELS=impute imputes them without letting them touch the SNPs",
+                n_indel);
+        }
         (
             keep.iter().map(|&i| wgs_idx[i]).collect::<Vec<usize>>(),
             keep.iter().map(|&i| pos[i]).collect::<Vec<i64>>(),
@@ -678,21 +841,58 @@ pub fn run_lcwgs_bam(
     let pp = super::bam_pileup::PileupParams::default();
     let region_bounds = region.map(|(_, s, e)| (s, e));
     let pileup = || super::bam_pileup::pileup_bams(bam_paths, &chrom, &pos, &ref_base, &alt_base, &is_snp, region_bounds, reference, indel_model.as_ref(), pp);
+    // Impute-only indels scored from their own reads: a pileup of their own, so
+    // the SNP pileup is the default's exactly.
+    let pass_pileup = || -> std::io::Result<Option<super::bam_pileup::BamGl>> {
+        let Some(refp) = reference.filter(|_| impute_indels && enable_indel) else { return Ok(None) };
+        let ppos: Vec<i64> = pass_idx.iter().map(|&wi| srp.variants.pos(wi)).collect();
+        let pref: Vec<u8> = pass_idx.iter().map(|&wi| srp.variants.ref_allele(wi).as_bytes().first().copied().unwrap_or(b'N')).collect();
+        let palt: Vec<u8> = pass_idx.iter().map(|&wi| srp.variants.alt_allele(wi).as_bytes().first().copied().unwrap_or(b'N')).collect();
+        let inputs: Vec<super::indel_realign::IndelInput> = pass_idx.iter().enumerate().map(|(p, &wi)| {
+            let v = srp.variants.get(wi);
+            super::indel_realign::IndelInput { var_idx: p, pos: ppos[p], ref_allele: v.ref_allele.as_bytes().to_vec(), alt_allele: v.alt_allele.as_bytes().to_vec() }
+        }).collect();
+        let model = super::indel_realign::IndelModel::build(refp, &chrom, &inputs)?;
+        selphi_info!("  lcWGS-BAM: indel realignment for {} impute-only indel sites (own reads only)", model.n_sites());
+        super::bam_pileup::pileup_bams(bam_paths, &chrom, &ppos, &pref, &palt, &vec![false; pass_idx.len()], region_bounds, reference, Some(&model), pp).map(Some)
+    };
+    let pileup_all = || -> std::io::Result<(super::bam_pileup::BamGl, Option<super::bam_pileup::BamGl>)> { Ok((pileup()?, pass_pileup()?)) };
+    let pass_ref = (!pass_idx.is_empty()).then(|| Passengers::new(&wgs_idx, pass_idx.clone(), None));
     // A single sample's chunks start together once its reads are piled up:
     // build their panel side meanwhile.
     let ahead = bam_paths.len() == 1 && rayon::current_num_threads() > 1 && !crate::config::present("LCWGS_RAW_GL");
-    let (bamgl, prepared) = if ahead {
-        let (gl, prep) = rayon::join(pileup, || prepare_chunks(srp, &wgs_idx, map_path, params));
+    let ((bamgl, pass_gl), prepared) = if ahead {
+        let (gl, prep) = rayon::join(pileup_all, || prepare_chunks(srp, &wgs_idx, map_path, params, pass_ref.as_ref()));
         // The pileup's and the builds' scratch was freed on many workers: hand
         // its pages back before the chunks allocate.
         crate::common::mem::release_freed_memory();
         (gl?, Some(prep?))
     } else {
-        (pileup()?, None)
+        (pileup_all()?, None)
     };
     let n_samples = bamgl.sample_ids.len();
+    let passengers = pass_ref.map(|mut p| {
+        if let Some(g) = pass_gl {
+            assert_eq!(g.sample_ids, bamgl.sample_ids, "indel pileup sample order");
+            p.gl3 = Some(g.gl3);
+        }
+        p
+    });
     // bamgl.gl3 is already in panel-shared order → shared imputation tail.
-    impute_from_gl3(srp, &wgs_idx, bamgl.gl3, n_samples, bamgl.sample_ids, &[], map_path, params, prepared)
+    impute_from_gl3(srp, &wgs_idx, bamgl.gl3, n_samples, bamgl.sample_ids, &[], map_path, params, prepared, passengers)
+}
+
+/// `LCWGS_BAM_INDELS=impute`: the `--bam` path's indel panel sites are imputed
+/// only (see `run_lcwgs_bam`). Any other value is the default (said once).
+fn bam_indels_impute() -> bool {
+    match crate::config::raw("LCWGS_BAM_INDELS").map(|v| v.trim().to_ascii_lowercase()) {
+        None => false,
+        Some(v) if v == "impute" => true,
+        Some(v) => {
+            selphi_info!("  LCWGS_BAM_INDELS='{}' not recognised (only 'impute'); indels handled as by default", v);
+            false
+        }
+    }
 }
 
 /// Resolve the two-depth common/rare split for this run (see `process_chunk`).
@@ -836,7 +1036,8 @@ fn baseline_memory_budget(
 /// a buffer region on each side (computed but discarded — absorbs edge
 /// effects, like GLIMPSE2's ligation buffers).
 ///
-/// Returns (dosage, gp) per (variant, sample) in shared-panel order.
+/// Returns (dosage, gp) per (variant, sample) in shared-panel order, then the
+/// same for the impute-only passengers (`(set, their cM)`; empty without them).
 /// `gp` is 3 genotype posteriors per variant×sample.
 #[allow(clippy::too_many_arguments)]
 fn run_chunked_gibbs(
@@ -849,18 +1050,23 @@ fn run_chunked_gibbs(
     params: &LcwgsParams,
     mean_conf: f32,
     prepared: Option<&[std::sync::Mutex<Option<ChunkPrep>>]>,
-) -> (Vec<f32>, Vec<f32>) {
+    passengers: Option<(&Passengers, &[f64])>,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     // GLIMPSE2-style: ~core_cm core + buffer_cm each side. Defaults chosen to
     // match GLIMPSE2_chunk's typical ~few-cM cores. cM span of chr22 ≈ 50.
     let core_cm = params.chunk_core_cm();
     let buffer_cm = params.chunk_buffer_cm();
     let mut dosage = vec![0.0f32; n_shared * n_samples];
     let mut gp = vec![0.0f32; n_shared * n_samples * 3];
-    if n_shared == 0 { return (dosage, gp); }
+    let n_pass = passengers.map_or(0, |(p, _)| p.idx.len());
+    let mut pass_dosage = vec![0.0f32; n_pass * n_samples];
+    let mut pass_gp = vec![0.0f32; n_pass * n_samples * 3];
+    if n_shared == 0 { return (dosage, gp, pass_dosage, pass_gp); }
 
     // Build chunk core boundaries by cM
     let total_cm = cm[n_shared - 1] - cm[0];
-    let n_chunks = ((total_cm / core_cm).ceil() as usize).max(1);
+    let plan = plan_chunks(cm, params, srp.metadata.n_haps, true);
+    let n_chunks = plan.len();
     crate::selphi_step!(
         "chunked Gibbs: {:.1} cM span → {} chunks (core {:.1} cM + {:.1} cM buffer each side)",
         total_cm, n_chunks, core_cm, buffer_cm);
@@ -948,12 +1154,17 @@ fn run_chunked_gibbs(
     // par_iter inside run_gibbs is degenerate → most cores idle). Chunks are fully
     // independent (disjoint core output; run_gibbs is deterministic, keyed only by
     // chunk-local indices) so parallel chunks are BIT-IDENTICAL to sequential.
-    let process_chunk = |c: usize| -> Option<(usize, usize, usize, super::iterate::GibbsOutput)> {
-        let (core, buffer) = super::chunk_ranges::chunk_ranges(
-            cm, c, n_chunks, core_cm, buffer_cm,
-        )?;
+    let process_chunk = |c: usize| -> Option<(usize, usize, usize, std::ops::Range<usize>, super::iterate::GibbsOutput)> {
+        let (core, buffer) = plan[c].clone()?;
         let (core_start, core_end) = (core.start, core.end);
         let (buf_start, buf_end) = (buffer.start, buffer.end);
+        // This chunk's impute-only passengers (none without them).
+        let prange = passengers.map_or(0..0, |(p, _)| p.of_core(&core));
+        let chunk_pass = passengers.filter(|_| !prange.is_empty()).map(|(p, pcm)| super::iterate::ChunkPassengers {
+            ins: p.ins[prange.clone()].iter().map(|&i| i - buf_start).collect(),
+            cm: &pcm[prange.clone()],
+        });
+        let pass_wgs: &[usize] = passengers.map_or(&[], |(p, _)| &p.idx[prange.clone()]);
 
         let chunk_n = buf_end - buf_start;
         // Slice gl3 + cm for the buffer window
@@ -967,16 +1178,27 @@ fn run_chunked_gibbs(
         let prep = prepared.and_then(|p| p.get(c)).and_then(|m| m.lock().unwrap().take());
         let (chunk_bm, panel) = match prep {
             Some(ChunkPrep { bm, panel }) => (bm, panel),
-            None => (srp.extract_ref_alleles_bitmatrix(chunk_wgs), None),
+            None => (chunk_bitmatrix(srp, chunk_wgs, pass_wgs), None),
         };
+        assert_eq!((chunk_bm.n_sites, chunk_bm.n_rows()), (chunk_n, chunk_n + pass_wgs.len()), "chunk {c} bitmatrix rows");
 
-        let mut out = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, None, chrwide_cond.as_ref(), execution, panel.as_ref());
+        let mut out = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, None, chrwide_cond.as_ref(), execution, panel.as_ref(), chunk_pass.as_ref());
         // Two-depth split: run the deep pass and overlay its dose/GP onto the band
         // sites (panel MAF ∈ [lo,hi)), routing by PANEL allele frequency only (known
         // a-priori; no truth). Byte-identical when `split_band` is None.
         if let Some((lo, hi, deep_k)) = split_band {
-            let out_deep = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, Some(deep_k), chrwide_cond.as_ref(), execution, panel.as_ref());
+            let out_deep = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, Some(deep_k), chrwide_cond.as_ref(), execution, panel.as_ref(), chunk_pass.as_ref());
             let n_ref = chunk_bm.n_haps;
+            // Passengers routed by the same panel-MAF band.
+            for p in 0..pass_wgs.len() {
+                let ac = chunk_bm.popcount_row(chunk_bm.n_sites + p, n_ref) as f64;
+                let maf = ac.min(n_ref as f64 - ac) / n_ref as f64;
+                if lo <= maf && maf < hi {
+                    let i = p * n_samples..(p + 1) * n_samples;
+                    out.pass_dosage[i.clone()].copy_from_slice(&out_deep.pass_dosage[i.clone()]);
+                    out.pass_gp[i.start * 3..i.end * 3].copy_from_slice(&out_deep.pass_gp[i.start * 3..i.end * 3]);
+                }
+            }
             for lv in 0..chunk_bm.n_sites {
                 let ac = chunk_bm.popcount_row(lv, n_ref) as f64;
                 let maf = ac.min(n_ref as f64 - ac) / n_ref as f64;
@@ -1072,21 +1294,25 @@ fn run_chunked_gibbs(
         }
 
         let _ = chunk_n;
-        Some((core_start, core_end, buf_start, out))
+        Some((core_start, core_end, buf_start, prange, out))
     };
 
-    let merge_chunk = |_c: usize, result: Option<(usize, usize, usize, super::iterate::GibbsOutput)>| {
-        if let Some((core_start, core_end, buf_start, out)) = result {
+    let merge_chunk = |_c: usize, result: Option<(usize, usize, usize, std::ops::Range<usize>, super::iterate::GibbsOutput)>| {
+        if let Some((core_start, core_end, buf_start, prange, out)) = result {
             let dst = core_start * n_samples .. core_end * n_samples;
             let src = (core_start - buf_start) * n_samples .. (core_end - buf_start) * n_samples;
             dosage[dst.clone()].copy_from_slice(&out.dosage[src.clone()]);
             gp[dst.start * 3 .. dst.end * 3].copy_from_slice(&out.gp[src.start * 3 .. src.end * 3]);
+            if !prange.is_empty() {
+                let dst = prange.start * n_samples..prange.end * n_samples;
+                pass_dosage[dst.clone()].copy_from_slice(&out.pass_dosage);
+                pass_gp[dst.start * 3..dst.end * 3].copy_from_slice(&out.pass_gp);
+            }
         }
     };
     let n_ref = srp.metadata.n_haps;
-    let chunk_sites: Vec<_> = (0..n_chunks).map(|c| {
-        super::chunk_ranges::chunk_ranges(cm, c, n_chunks, core_cm, buffer_cm)
-            .map_or(0, |(_, buffer)| buffer.len())
+    let chunk_sites: Vec<_> = plan.iter().map(|r| {
+        r.as_ref().map_or(0, |(core, buffer)| buffer.len() + passengers.map_or(0, |(p, _)| p.of_core(core).len()))
     }).collect();
     if let Some(memory) = &memory {
         let costs: Vec<_> = chunk_sites.iter().map(|&sites| chunk_state_bytes(sites, n_ref, n_samples)).collect();
@@ -1112,7 +1338,7 @@ fn run_chunked_gibbs(
             samples, collections);
     }
 
-    (dosage, gp)
+    (dosage, gp, pass_dosage, pass_gp)
 }
 
 /// Tiny static-input smoke test: 1 sample, 4 ref haps, 4 variants, flat
@@ -1185,7 +1411,7 @@ mod tests {
             let costs: Vec<_> = inputs.iter().map(|(_, cm, _)| chunk_state_bytes(cm.len(), 40, ns)).collect();
             let process = |c: usize, execution: SampleExecution<'_>| {
                 let (bm, cm, gl) = &inputs[c];
-                let out = super::super::iterate::run_gibbs_ensemble_with_memory(gl, bm, cm, ns, &params, None, None, execution, None);
+                let out = super::super::iterate::run_gibbs_ensemble_with_memory(gl, bm, cm, ns, &params, None, None, execution, None, None);
                 (out.dosage.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                  out.gp.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
             };
@@ -1220,6 +1446,95 @@ mod tests {
     }
 
     use crate::common::HaplotypeBitmatrix;
+
+    /// Passengers are partitioned over the chunks (each to the chunk whose core
+    /// holds its left active neighbour), and each one's chunk-local insertion
+    /// point lies inside that chunk's buffer.
+    #[test]
+    fn passengers_partition_over_chunks() {
+        use crate::lcwgs::hmm::reference_pack::Xs;
+        let mut rng = Xs(0xBB67_AE85_3C6E_F372);
+        for _ in 0..200 {
+            let n = 1 + rng.below(400) as usize;
+            let mut x = 0.0f64;
+            let cm: Vec<f64> = (0..n).map(|_| { x += rng.below(4) as f64 * 0.3; x }).collect();
+            let active: Vec<usize> = (0..n).map(|i| 3 * i + 1).collect();
+            let mut pidx: Vec<usize> = (0..3 * n + 2).filter(|i| i % 3 != 1 && rng.below(3) == 0).collect();
+            pidx.dedup();
+            let p = Passengers::new(&active, pidx.clone(), None);
+            for (k, &i) in pidx.iter().enumerate() {
+                assert!(p.ins[k] == active.len() || active[p.ins[k]] > i);
+                assert!(p.ins[k] == 0 || active[p.ins[k] - 1] < i);
+            }
+            for (core_cm, buffer_cm) in [(1.0, 0.0), (2.0, 0.5), (50.0, 0.5), (0.3, 1.0)] {
+                let n_chunks = (((cm[n - 1] - cm[0]) / core_cm).ceil() as usize).max(1);
+                let mut owner = vec![0usize; pidx.len()];
+                for c in 0..n_chunks {
+                    let Some((core, buffer)) = super::super::chunk_ranges::chunk_ranges(&cm, c, n_chunks, core_cm, buffer_cm) else { continue };
+                    for q in p.of_core(&core) {
+                        owner[q] += 1;
+                        assert!(p.ins[q] >= buffer.start && p.ins[q] - buffer.start <= buffer.len(), "insertion outside the buffer");
+                    }
+                }
+                assert!(owner.iter().all(|&o| o == 1), "every passenger in exactly one chunk");
+            }
+        }
+    }
+
+    /// Passenger rows interleave with the active rows in ascending panel order,
+    /// each row carrying its own dosage and GP.
+    #[test]
+    fn merge_rows_interleaves_in_panel_order() {
+        let ns = 2;
+        let active = vec![1usize, 4, 5, 9];
+        let pass = vec![0usize, 2, 3, 10];
+        let d = |rows: &[usize]| rows.iter().flat_map(|&r| (0..ns).map(move |s| (r * 10 + s) as f32)).collect::<Vec<_>>();
+        let g = |rows: &[usize]| rows.iter().flat_map(|&r| (0..ns * 3).map(move |k| (r * 100 + k) as f32)).collect::<Vec<_>>();
+        let (dd, gg, idx) = merge_rows(&active, d(&active), g(&active), &pass, d(&pass), g(&pass), ns);
+        assert_eq!(idx, vec![0, 1, 2, 3, 4, 5, 9, 10]);
+        assert_eq!(dd, d(&idx));
+        assert_eq!(gg, g(&idx));
+    }
+
+    /// Own-read likelihoods fold into the averaged prior: a flat likelihood
+    /// leaves it, an informative one moves it (and averaging opposite
+    /// homozygous priors before the fold lets the reads decide), one that rules
+    /// out every prior genotype leaves the prior.
+    #[test]
+    fn passenger_reads_fold_into_the_averaged_prior() {
+        let mut gp = vec![0.25f32, 0.5, 0.25, 0.5, 0.0, 0.5, 1.0, 0.0, 0.0];
+        let mut ds = vec![1.0f32, 1.0, 0.0];
+        let gl = [0.2f32, 0.2, 0.2, 0.01, 0.1, 0.99, 0.0, 0.5, 0.5];
+        fold_passenger_reads(&mut gp, &mut ds, &gl, 1, None);
+        assert!((gp[0] - 0.25).abs() < 1e-7 && (gp[1] - 0.5).abs() < 1e-7 && (ds[0] - 1.0).abs() < 1e-6);
+        assert!(ds[1] > 1.97 && gp[5] > 0.985, "reads at the averaged prior: ds {}", ds[1]);
+        assert_eq!((&gp[6..9], ds[2]), (&[1.0f32, 0.0, 0.0][..], 0.0));
+        // Haploid cells (one sample, passengers 0 and 1 non-PAR): one allele,
+        // its prior DS/2 folded once with (GL0, GL2). Equal all-REF/all-ALT
+        // priors (DS 1) with reads 0.01 : 0.99 give P(ALT) = 0.99, not ~1; a
+        // heterozygous-looking prior (DS 1 from [0, 1, 0]) moves with the reads.
+        let mut gp = vec![0.5f32, 0.0, 0.5, 0.0, 1.0, 0.0, 0.5, 0.0, 0.5];
+        let mut ds = vec![1.0f32, 1.0, 1.0];
+        let gl = [0.01f32, 0.3, 0.99, 0.01, 0.3, 0.99, 0.01, 0.3, 0.99];
+        fold_passenger_reads(&mut gp, &mut ds, &gl, 1, Some((&[true], &[true, true, false])));
+        for i in 0..2 {
+            assert!((gp[3 * i + 2] - 0.99).abs() < 1e-6 && gp[3 * i + 1] == 0.0 && (ds[i] - 1.98).abs() < 1e-5, "haploid {i}: {:?} {}", &gp[3 * i..3 * i + 3], ds[i]);
+        }
+        // The PAR passenger (site flag false) folds diploid.
+        assert!(gp[8] > 0.98 && (ds[2] - 2.0 * gp[8] - gp[7]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hidden_tail_rows_stay_out_of_n_sites() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        let mut rng = rp::Xs(0x510E_527F_9B05_688C);
+        let full = rp::random_typed_panel(&mut rng, 30, 130);
+        let all: Vec<usize> = (0..30).collect();
+        let hidden = HaplotypeBitmatrix::from_subset(&full, &all).with_hidden_tail(21);
+        assert_eq!((hidden.n_sites, hidden.n_rows(), hidden.n_haps), (21, 30, 130));
+        for v in 0..30 { assert_eq!(hidden.row(v), full.row(v)); }
+        assert_eq!(full.n_rows(), 30);
+    }
 
     #[test]
     fn run_lcwgs_with_in_memory_inputs_smoke() {

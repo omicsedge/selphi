@@ -122,6 +122,11 @@ pub struct LcwgsParams {
     pub chrx_par: bool,
     /// chrX PAR coordinates' build (`--build`); `None` = inferred from the panel.
     pub build: Option<crate::contig::Build>,
+    /// Panel-order-independent conditioning cap (`LCWGS_QUAL_TRUNC=hash|hybrid`),
+    /// with the panel priority keyed by sample ID; built once per run from the
+    /// panel (`pipeline::impute_from_gl3`). `None` = the selector reads
+    /// `LCWGS_QUAL_TRUNC` (index order by default, byte-identical).
+    pub cap: Option<faithful_select::CapPlan>,
 }
 
 impl LcwgsParams {
@@ -206,6 +211,7 @@ impl Default for LcwgsParams {
             haploids: None,
             chrx_par: true,
             build: None,
+            cap: None,
         }
     }
 }

@@ -554,7 +554,7 @@ fn adapt_emit_pow() -> Option<f32> {
 /// were already K-independent under the old adaptive rule, so this only changes the
 /// panel-matched regime — for the better, on real data.) `LCWGS_KINDEP_RECOMB=1`
 /// also forces K-indep (now redundant); `LCWGS_KDEP_RECOMB=1` restores the old K-dep.
-fn recomb_scale(ne: f32, k: usize, n_ref: usize) -> f64 {
+pub(crate) fn recomb_scale(ne: f32, k: usize, n_ref: usize) -> f64 {
     use std::sync::OnceLock;
     // 0 = K-independent (default), 1 = force K-independent, 2 = force K-dependent.
     static MODE: OnceLock<u8> = OnceLock::new();
@@ -658,14 +658,18 @@ const MIN_SWITCH: f64 = 1e-7;
 /// Switch probability `1 - exp(-rate)` for a non-negative rate, clamped to
 /// `[MIN_SWITCH, 1 - MIN_SWITCH]`.
 #[inline]
-fn switch_prob(rate: f64) -> f32 {
+pub(crate) fn switch_prob(rate: f64) -> f32 {
     (-(-rate).exp_m1()).clamp(MIN_SWITCH, 1.0 - MIN_SWITCH) as f32
 }
 
 /// Precompute the per-boundary recombination probability `p_rec[v]` (transition
 /// from site `v-1` to `v`) into `out`; `out[0]` is left 0 (unused). `scale` is
 /// [`recomb_scale`]; `recomb_mult` an optional per-site rate multiplier folded
-/// inside the exp. Shared verbatim by the scalar and SIMD paths.
+/// inside the exp. A SIGN-NEGATIVE entry instead carries that boundary's switch
+/// probability itself (`-m`, unclamped): only the impute-only passengers' pass
+/// writes one (`iterate::passenger_dose`, which factors a gap's probability over
+/// the boundaries it inserts); every other caller's multipliers are positive.
+/// Shared verbatim by the scalar and SIMD paths.
 #[inline]
 fn precompute_prec(cm: &[f64], n_var: usize, scale: f64, recomb_mult: Option<&[f32]>, out: &mut Vec<f32>) {
     out.clear();
@@ -673,7 +677,7 @@ fn precompute_prec(cm: &[f64], n_var: usize, scale: f64, recomb_mult: Option<&[f
     for v in 1..n_var {
         let d = (cm[v] - cm[v - 1]).max(0.0);
         let m = recomb_mult.map_or(1.0, |rm| rm[v] as f64);
-        out[v] = switch_prob(d * scale * m);
+        out[v] = if m.is_sign_negative() { (-m) as f32 } else { switch_prob(d * scale * m) };
     }
 }
 

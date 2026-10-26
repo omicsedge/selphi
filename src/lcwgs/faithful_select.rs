@@ -110,6 +110,15 @@ pub struct FaithfulSelector {
     h1: Vec<Vec<bool>>,
     /// Whether the INIT-stage selection has already run (first call == INIT).
     init_done: bool,
+    /// Cap order of the PBWT union ([`Self::flatten_pbwt`]), with the panel
+    /// priority and rank share of the order-independent caps.
+    cap: CapOrder,
+    priority: Option<std::sync::Arc<[u32]>>,
+    rank_frac: f64,
+    /// Emit a hash/hybrid set in priority order (a later prefix cap can
+    /// truncate the base) rather than ascending (packs faster: the gather
+    /// plan groups ascending states that share a panel word).
+    keep_priority_order: bool,
     /// Decode the panel half of each sweep on worker tasks (see
     /// [`SegmentPlan`]); the plan is recorded by the first sweep.
     segmented: bool,
@@ -139,6 +148,137 @@ fn index_union(layers: &[Vec<i32>], n_ref: usize, cap: usize) -> Vec<u32> {
         for layer in layers { for &h in layer { seen.insert(h as usize); } }
         seen.indices().take(if cap == 0 { usize::MAX } else { cap }).map(|h| h as u32).collect()
     })
+}
+
+/// How a panel-order-independent cap (`LCWGS_QUAL_TRUNC=hash|hybrid`) ranks the
+/// panel: `priority` lists every panel haplotype once, best first, in an order
+/// keyed by the panel SAMPLE ID and the haplotype's number within its sample
+/// ([`hap_priority`]), never by its index. Built once per run from the panel's
+/// sample IDs (`pipeline::impute_from_gl3`) and carried in [`LcwgsParams::cap`].
+#[derive(Clone, Debug)]
+pub struct CapPlan {
+    pub order: CapOrder,
+    pub priority: std::sync::Arc<[u32]>,
+    /// `hybrid`: the share of the cap filled in GLIMPSE2 rank order before the
+    /// hashed fill (`LCWGS_HYBRID_RANK_FRAC`, clamped to [0, 1]).
+    pub rank_frac: f64,
+}
+
+/// FNV-1a of `bytes` from `h`.
+fn fnv1a(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes { h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01B3); }
+    h
+}
+
+/// SplitMix64 finaliser.
+fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Default `LCWGS_CAP_HASH_SEED`.
+pub const CAP_HASH_SEED: u64 = 0x5E1F_2026_1026_CA9E;
+
+/// The deterministic key of one panel haplotype: its sample ID and its number
+/// within that sample (0/1), never its panel index.
+fn hap_key(seed: u64, sample_id: &str, hap_number: u64) -> u64 {
+    let h = fnv1a(0xCBF2_9CE4_8422_2325 ^ seed, sample_id.as_bytes());
+    splitmix64(h ^ splitmix64(hap_number.wrapping_add(seed.rotate_left(17))))
+}
+
+/// Every panel haplotype once, ordered by [`hap_key`] (ties, i.e. duplicate sample
+/// IDs or a 64-bit collision, by index). Haplotype `h` is haplotype `h % 2` of
+/// sample `h / 2` when the panel carries two per sample ID, haplotype 0 of sample
+/// `h` when it carries one; any other shape has no per-haplotype ID to key on and
+/// falls back to the decimal index as the ID (said once).
+pub fn hap_priority(sample_ids: &[String], n_haps: usize, seed: u64) -> Vec<u32> {
+    let keyed: Vec<(u64, u32)> = if n_haps == 2 * sample_ids.len() {
+        (0..n_haps).map(|h| (hap_key(seed, &sample_ids[h / 2], (h % 2) as u64), h as u32)).collect()
+    } else if n_haps == sample_ids.len() {
+        (0..n_haps).map(|h| (hap_key(seed, &sample_ids[h], 0), h as u32)).collect()
+    } else {
+        crate::selphi_info!("  conditioning cap: {} panel haplotypes for {} sample IDs; the hashed order is keyed by haplotype index",
+            n_haps, sample_ids.len());
+        (0..n_haps).map(|h| (hap_key(seed, &h.to_string(), 0), h as u32)).collect()
+    };
+    let mut keyed = keyed;
+    keyed.sort_unstable();
+    keyed.into_iter().map(|(_, h)| h).collect()
+}
+
+/// A panel-order-independent cap of one sample's PBWT layer union at `cap`
+/// haplotypes (`0` = no cap):
+/// - [`CapOrder::Hash`]: the `cap` union members that come first in `priority`;
+/// - [`CapOrder::Hybrid`]: `round(rank_frac * cap)` in GLIMPSE2 rank order
+///   (layers ascending, reverse within a layer, as `g2`), then the rest of the
+///   union by `priority`.
+///
+/// With `keep_priority` the result is in that order (rank part first), also
+/// when the whole union fits, so a later cap that keeps a prefix (the
+/// `LCWGS_KMAX` cap after rare-carrier augmentation, when it is below kpbwt)
+/// keeps the same priority. Without it the same set is returned ascending (the
+/// gather plan packs ascending states per panel word), and a union that fits is
+/// exactly what [`index_union`] returns.
+fn priority_union(
+    layers: &[Vec<i32>], n_ref: usize, cap: usize, order: CapOrder, priority: &[u32], rank_frac: f64,
+    keep_priority: bool,
+) -> Vec<u32> {
+    let words = n_ref.div_ceil(64);
+    let mut union = vec![0u64; words];
+    let mut n_union = 0usize;
+    for layer in layers {
+        for &x in layer {
+            let h = x as usize;
+            let (w, b) = (h / 64, 1u64 << (h % 64));
+            if union[w] & b == 0 { union[w] |= b; n_union += 1; }
+        }
+    }
+    let ascending = |union: &[u64]| -> Vec<u32> {
+        union.iter().enumerate().flat_map(|(i, &word)| {
+            let mut rest = word;
+            std::iter::from_fn(move || {
+                if rest == 0 { return None; }
+                let bit = rest.trailing_zeros() as usize;
+                rest &= rest - 1;
+                Some((i * 64 + bit) as u32)
+            })
+        }).collect()
+    };
+    let fits = cap == 0 || n_union <= cap;
+    if fits && !keep_priority { return ascending(&union); }
+    let take = if fits { n_union } else { cap };
+    let mut taken = vec![0u64; words];
+    let mut out: Vec<u32> = Vec::with_capacity(take);
+    if order == CapOrder::Hybrid {
+        let share = if cap == 0 { n_union } else { cap };
+        let n_rank = ((rank_frac.clamp(0.0, 1.0) * share as f64).round() as usize).min(take);
+        if n_rank > 0 {
+            'outer: for layer in layers {
+                for &x in layer.iter().rev() {
+                    let h = x as usize;
+                    let (w, b) = (h / 64, 1u64 << (h % 64));
+                    if taken[w] & b == 0 {
+                        taken[w] |= b;
+                        out.push(h as u32);
+                        if out.len() >= n_rank { break 'outer; }
+                    }
+                }
+            }
+        }
+    }
+    for &h in priority {
+        if out.len() >= take { break; }
+        let h = h as usize;
+        let (w, b) = (h / 64, 1u64 << (h % 64));
+        if union[w] & b != 0 && taken[w] & b == 0 {
+            taken[w] |= b;
+            out.push(h as u32);
+        }
+    }
+    if !keep_priority { out.sort_unstable(); }
+    out
 }
 
 impl FaithfulSelector {
@@ -243,6 +383,26 @@ impl FaithfulSelector {
         let seed32 = seed as u32;
         let shared_rng = Mt19937Rng::new(seed32);
 
+        // Cap order: the run's plan (an order-independent cap with the panel
+        // priority built from the sample IDs), else LCWGS_QUAL_TRUNC. A hash or
+        // hybrid order without a plan (no panel sample IDs reached this chunk)
+        // keys the priority by haplotype index.
+        let (cap, priority, rank_frac) = match &params.cap {
+            Some(plan) => (plan.order, Some(plan.priority.clone()), plan.rank_frac),
+            None => {
+                let order = qual_trunc();
+                let priority = matches!(order, CapOrder::Hash | CapOrder::Hybrid).then(|| {
+                    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        crate::selphi_info!("  conditioning cap {:?} without the panel's sample IDs: the hashed order is keyed by haplotype index", order);
+                    }
+                    let ids: Vec<String> = (0..n_ref).map(|h| h.to_string()).collect();
+                    std::sync::Arc::<[u32]>::from(hap_priority(&ids, n_ref, cap_hash_seed()))
+                });
+                (order, priority, hybrid_rank_frac())
+            }
+        };
+
         FaithfulSelector {
             panel,
             tar,
@@ -256,6 +416,10 @@ impl FaithfulSelector {
             h0: vec![vec![false; n_var]; n_samples],
             h1: vec![vec![false; n_var]; n_samples],
             init_done: false,
+            cap,
+            priority,
+            rank_frac,
+            keep_priority_order: true,
             segmented: false,
             plan: None,
             #[cfg(test)]
@@ -266,6 +430,12 @@ impl FaithfulSelector {
     /// Split each later selection sweep between panel-decode tasks and the
     /// calling thread (same selection).
     pub fn set_segmented(&mut self, on: bool) { self.segmented = on; }
+
+    /// Whether a `hash`/`hybrid` set keeps its priority order (needed when the
+    /// base can be truncated after selection: kpbwt above the `LCWGS_KMAX` cap
+    /// of the rare-carrier augmentation, even when the union fits kpbwt) or is
+    /// emitted ascending, the same set (default: priority order).
+    pub fn set_keep_priority_order(&mut self, on: bool) { self.keep_priority_order = on; }
 
     /// Refresh the per-sample H0/H1 hard calls from the hybrid's current sampled
     /// `hap_alleles` (layout `hap_alleles[v*n_target_haps + h]`, h0=2s, h1=2s+1).
@@ -371,8 +541,12 @@ impl FaithfulSelector {
     ///            ascending, REVERSE within a layer (most recently stored storage
     ///            site first), stop the instant the union reaches kpbwt, then
     ///            emit the membership index-sorted (G2 keeps a std::set).
+    /// - `hash` → the kpbwt union members first in a panel order keyed by
+    ///   sample ID + haplotype number (independent of panel order).
+    /// - `hybrid` → `LCWGS_HYBRID_RANK_FRAC` of kpbwt in `g2` order, the rest
+    ///   as `hash` (see [`priority_union`]).
     fn flatten_pbwt(&self) -> Vec<Vec<u32>> {
-        let mode = qual_trunc();
+        let mode = self.cap;
         let diag = sel_diag();
         let mut cond = vec![Vec::new(); 2 * self.n_samples];
         let (mut d_union, mut d_sat, mut d_maxidx, mut d_layers) = (0usize, 0usize, 0usize, 0usize);
@@ -418,6 +592,10 @@ impl FaithfulSelector {
                     // quality-blind: keeps the LOWEST haplotype indices.
                     index_union(&self.tar.pbwt_states[s], self.panel.ref_hs.n_ref_haps, self.kpbwt)
                 }
+                CapOrder::Hash | CapOrder::Hybrid => priority_union(
+                    &self.tar.pbwt_states[s], self.panel.ref_hs.n_ref_haps, self.kpbwt, mode,
+                    self.priority.as_deref().expect("hash/hybrid cap without a priority"), self.rank_frac,
+                    self.keep_priority_order),
             };
             if diag {
                 // Pre-cap union size and saturation, so a cap-order claim can be
@@ -448,30 +626,63 @@ impl FaithfulSelector {
 
 /// Cap order for the per-sample conditioning union (see [`FaithfulSelector::flatten_pbwt`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CapOrder {
+pub enum CapOrder {
     /// Shipped default: index-sorted truncate (quality-blind).
     Index,
     /// `LCWGS_QUAL_TRUNC=1`: rank layer first, forward within a layer.
     Forward,
     /// `LCWGS_QUAL_TRUNC=g2`: GLIMPSE2 compactSelection order (layers ascending, reverse within).
     G2,
+    /// `LCWGS_QUAL_TRUNC=hash`: union members by a panel order keyed by sample ID.
+    Hash,
+    /// `LCWGS_QUAL_TRUNC=hybrid`: a share in `G2` order, the rest as `Hash`.
+    Hybrid,
 }
 
 /// `LCWGS_QUAL_TRUNC` → how the per-sample conditioning union is capped at kpbwt:
 /// unset/empty/`0`/`false`/`no`/`off` = by haplotype index (shipped, byte-identical),
 /// `1`/`true`/`yes`/`on`/`fwd` = best rank layer first (forward within a layer),
-/// `g2` = GLIMPSE2's exact order. Case-insensitive. Cached once.
-fn qual_trunc() -> CapOrder {
+/// `g2` = GLIMPSE2's exact order, `hash` = by a panel order keyed by sample ID +
+/// haplotype number, `hybrid` = `LCWGS_HYBRID_RANK_FRAC` in `g2` order then `hash`.
+/// Case-insensitive. Cached once.
+pub(crate) fn qual_trunc() -> CapOrder {
     use std::sync::OnceLock;
     static V: OnceLock<CapOrder> = OnceLock::new();
     *V.get_or_init(|| match crate::config::raw("LCWGS_QUAL_TRUNC").map(|v| v.trim().to_ascii_lowercase()) {
         Some(v) if v == "g2" => CapOrder::G2,
+        Some(v) if v == "hash" => CapOrder::Hash,
+        Some(v) if v == "hybrid" => CapOrder::Hybrid,
         // Old configs exported the bool as "1"/"true"; "false"/"0"/"no"/"off" and
         // an empty value stay OFF (index order) so a `--config` written before
         // this knob became a value cannot switch the experiment on by accident.
         Some(v) if matches!(v.as_str(), "1" | "true" | "yes" | "on" | "y" | "fwd" | "forward") => CapOrder::Forward,
         _ => CapOrder::Index,
     })
+}
+
+/// `LCWGS_HYBRID_RANK_FRAC` (default 0.5, clamped to [0, 1]; a non-number or NaN
+/// is the default): the share of kpbwt the `hybrid` cap fills in `g2` rank order.
+pub(crate) fn hybrid_rank_frac() -> f64 {
+    crate::config::f64_opt("LCWGS_HYBRID_RANK_FRAC").filter(|f| !f.is_nan()).unwrap_or(0.5).clamp(0.0, 1.0)
+}
+
+/// `LCWGS_CAP_HASH_SEED` (default [`CAP_HASH_SEED`]): keys the `hash`/`hybrid`
+/// panel order, so the subset lottery can be measured apart from `LCWGS_SEED`.
+pub(crate) fn cap_hash_seed() -> u64 {
+    crate::config::raw("LCWGS_CAP_HASH_SEED").and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(CAP_HASH_SEED)
+}
+
+/// The run's order-independent cap plan when `LCWGS_QUAL_TRUNC` asks for one
+/// (`hash`/`hybrid`), with the priority keyed by the panel's sample IDs. `None`
+/// for every other order (the selector then reads `LCWGS_QUAL_TRUNC` itself).
+pub(crate) fn cap_plan_from_env(sample_ids: &[String], n_haps: usize) -> Option<CapPlan> {
+    let order = qual_trunc();
+    if !matches!(order, CapOrder::Hash | CapOrder::Hybrid) { return None; }
+    let seed = cap_hash_seed();
+    let rank_frac = hybrid_rank_frac();
+    crate::selphi_info!("  conditioning cap: {:?} order keyed by panel sample ID (seed {}{})", order, seed,
+        if order == CapOrder::Hybrid { format!(", {:.2} of kpbwt in GLIMPSE2 rank order first", rank_frac) } else { String::new() });
+    Some(CapPlan { order, priority: hap_priority(sample_ids, n_haps, seed).into(), rank_frac })
 }
 
 /// `LCWGS_SEL_DIAG=1` → print, per selection call, the pre-cap union size and how
@@ -564,6 +775,192 @@ mod tests {
                     expected.dedup();
                     if cap > 0 { expected.truncate(cap); }
                     assert_eq!(index_union(&layers, n, cap), expected);
+                }
+            }
+        }
+    }
+
+    /// GLIMPSE2 order reference (the `g2` arm of `flatten_pbwt`), insertion order.
+    fn g2_order(layers: &[Vec<i32>], cap: usize) -> Vec<u32> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        'outer: for layer in layers {
+            for &x in layer.iter().rev() {
+                if seen.insert(x as u32) { out.push(x as u32); }
+                if cap > 0 && out.len() >= cap { break 'outer; }
+            }
+        }
+        out
+    }
+
+    fn random_layers(rng: &mut crate::lcwgs::hmm::reference_pack::Xs, n_haps: usize) -> Vec<Vec<i32>> {
+        (0..1 + rng.below(16)).map(|_| (0..rng.below(300)).map(|_| rng.below(n_haps as u64) as i32).collect()).collect()
+    }
+
+    /// The hash and hybrid caps select the same (sample ID, haplotype number) set
+    /// whatever the panel's sample order: permute the samples (both haplotypes
+    /// move together), map the PBWT layers through the permutation, rebuild the
+    /// priority from the permuted IDs, and the selection maps back exactly.
+    #[test]
+    fn hash_and_hybrid_caps_are_panel_order_independent() {
+        use crate::lcwgs::hmm::reference_pack::Xs;
+        let mut rng = Xs(0x9B05_688C_2B3E_6C1F);
+        for &n_samples in &[3usize, 40, 517, 2398] {
+            let n_haps = 2 * n_samples;
+            let ids: Vec<String> = (0..n_samples).map(|s| format!("S{}_{}", s, rng.below(1 << 20))).collect();
+            // Fisher-Yates permutation of samples: new position of sample s.
+            let mut perm: Vec<usize> = (0..n_samples).collect();
+            for i in (1..n_samples).rev() { perm.swap(i, rng.below(i as u64 + 1) as usize); }
+            let mut ids_p = vec![String::new(); n_samples];
+            for s in 0..n_samples { ids_p[perm[s]] = ids[s].clone(); }
+            let map_hap = |h: u32| (2 * perm[h as usize / 2] + h as usize % 2) as u32;
+            for seed in [CAP_HASH_SEED, 7] {
+                let pri = hap_priority(&ids, n_haps, seed);
+                let pri_p = hap_priority(&ids_p, n_haps, seed);
+                // The priority itself is the same sequence of (sample ID, hap number).
+                assert_eq!(pri.iter().map(|&h| map_hap(h)).collect::<Vec<_>>(), pri_p);
+                for _ in 0..30 {
+                    let layers = random_layers(&mut rng, n_haps);
+                    let layers_p: Vec<Vec<i32>> = layers.iter().map(|l| l.iter().map(|&h| map_hap(h as u32) as i32).collect()).collect();
+                    for order in [CapOrder::Hash, CapOrder::Hybrid] {
+                        for cap in [0, 1, 7, 64, n_haps / 3, n_haps] {
+                            for frac in [0.0, 0.25, 0.5, 1.0] {
+                                let as_ids = |sel: &[u32], ids: &[String]| -> Vec<(String, u32)> {
+                                    sel.iter().map(|&h| (ids[h as usize / 2].clone(), h % 2)).collect()
+                                };
+                                // Same set either way; in priority order, the same sequence.
+                                let got = priority_union(&layers, n_haps, cap, order, &pri, frac, true);
+                                let got_p = priority_union(&layers_p, n_haps, cap, order, &pri_p, frac, true);
+                                assert_eq!(as_ids(&got, &ids), as_ids(&got_p, &ids_p), "order {order:?} cap {cap} frac {frac}");
+                                let mut a = as_ids(&priority_union(&layers, n_haps, cap, order, &pri, frac, false), &ids);
+                                let mut b = as_ids(&priority_union(&layers_p, n_haps, cap, order, &pri_p, frac, false), &ids_p);
+                                a.sort();
+                                b.sort();
+                                assert_eq!(a, b, "ascending: order {order:?} cap {cap} frac {frac}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Shape of the hash/hybrid caps: min(K, |union|) distinct members of the
+    /// union. In priority order: hash = the union members first in the
+    /// priority; hybrid = the `g2` prefix of round(f*K) (f*|union| uncapped),
+    /// then the priority over the rest; f = 1 is the `g2` set and f = 0 the hash
+    /// selection; a union that fits comes back whole, still in that order (so a
+    /// later prefix cap keeps the priority). Ascending: the same set sorted, and
+    /// a union that fits is the index cap's output.
+    #[test]
+    fn hash_and_hybrid_cap_shapes() {
+        use crate::lcwgs::hmm::reference_pack::Xs;
+        let mut rng = Xs(0x1F83_D9AB_5BE0_CD19);
+        for &n_haps in &[2usize, 63, 64, 65, 600, 4796] {
+            let ids: Vec<String> = (0..n_haps / 2).map(|s| format!("HG{s:05}")).collect();
+            let pri = hap_priority(&ids, n_haps, CAP_HASH_SEED);
+            let mut sorted = pri.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..n_haps as u32).collect::<Vec<_>>(), "priority is a permutation");
+            for _ in 0..40 {
+                let layers = random_layers(&mut rng, n_haps);
+                let mut union: Vec<u32> = layers.iter().flatten().map(|&h| h as u32).collect();
+                union.sort_unstable();
+                union.dedup();
+                for cap in [0, 1, 5, 17, 300, n_haps] {
+                    let fits = cap == 0 || union.len() <= cap;
+                    let take = if fits { union.len() } else { cap };
+                    for frac in [0.0, 0.3, 0.5, 1.0] {
+                        let h = priority_union(&layers, n_haps, cap, CapOrder::Hash, &pri, frac, true);
+                        let y = priority_union(&layers, n_haps, cap, CapOrder::Hybrid, &pri, frac, true);
+                        for (sel, order) in [(&h, CapOrder::Hash), (&y, CapOrder::Hybrid)] {
+                            assert_eq!(sel.len(), take);
+                            let mut s = sel.to_vec();
+                            s.sort_unstable();
+                            s.dedup();
+                            assert_eq!(s.len(), sel.len(), "duplicates");
+                            assert!(s.iter().all(|x| union.binary_search(x).is_ok()), "outside the union");
+                            let asc = priority_union(&layers, n_haps, cap, order, &pri, frac, false);
+                            assert_eq!(asc, s, "ascending is the same set sorted");
+                            if fits { assert_eq!(asc, index_union(&layers, n_haps, cap)); }
+                        }
+                        // Hash: the first `take` union members in priority order.
+                        let want_h: Vec<u32> = pri.iter().copied().filter(|x| union.binary_search(x).is_ok()).take(take).collect();
+                        assert_eq!(h, want_h);
+                        // Hybrid: g2 prefix, then priority over the rest.
+                        let share = if cap == 0 { union.len() } else { cap };
+                        let n_rank = ((frac * share as f64).round() as usize).min(take);
+                        let g2 = if n_rank == 0 { Vec::new() } else { g2_order(&layers, n_rank) };
+                        assert_eq!(&y[..g2.len()], &g2[..]);
+                        let rest: Vec<u32> = pri.iter().copied()
+                            .filter(|x| union.binary_search(x).is_ok() && !g2.contains(x)).take(take - g2.len()).collect();
+                        assert_eq!(&y[g2.len()..], &rest[..]);
+                        if frac == 1.0 && !fits {
+                            let mut a = y.clone(); a.sort_unstable();
+                            let mut b = g2_order(&layers, cap); b.sort_unstable();
+                            assert_eq!(a, b, "hybrid f=1 is the g2 set");
+                        }
+                        if frac == 0.0 { assert_eq!(y, h, "hybrid f=0 is the hash selection"); }
+                        // A later prefix cap (LCWGS_KMAX below kpbwt) keeps the hash priority.
+                        for kmax in [1usize, 4, 16] {
+                            if kmax < take {
+                                assert_eq!(&h[..kmax], &priority_union(&layers, n_haps, kmax, CapOrder::Hash, &pri, frac, true)[..]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The priority depends on the IDs and the seed only, and a panel with one ID
+    /// per haplotype (or an ID count that fits neither shape) still gets one.
+    #[test]
+    fn hap_priority_keys_and_shapes() {
+        let ids: Vec<String> = (0..50).map(|s| format!("NA{s}")).collect();
+        assert_eq!(hap_priority(&ids, 100, 1), hap_priority(&ids, 100, 1));
+        assert_ne!(hap_priority(&ids, 100, 1), hap_priority(&ids, 100, 2));
+        for n in [50usize, 77] {
+            let mut p = hap_priority(&ids, n, 1);
+            p.sort_unstable();
+            assert_eq!(p, (0..n as u32).collect::<Vec<_>>());
+        }
+        // Not index order: the two halves of the panel interleave in the priority.
+        let p = hap_priority(&ids, 100, CAP_HASH_SEED);
+        assert!(p[..50].iter().any(|&h| h >= 50) && p[..50].iter().any(|&h| h < 50));
+    }
+
+    /// A selector driven with a hash/hybrid plan returns per-sample sets of at
+    /// most kpbwt valid haplotypes shared by both haplotypes of the sample, and
+    /// the hash plan keeps more than the low-index block the index cap keeps.
+    #[test]
+    fn selector_with_cap_plan() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        let mut rng = rp::Xs(0x6A09_E667_BB67_AE85);
+        let (n_var, n_haps, n_samples) = (700usize, 1200usize, 2usize);
+        let bm = rp::random_typed_panel(&mut rng, n_var, n_haps);
+        let cm: Vec<f64> = (0..n_var).map(|v| v as f64 * 0.002).collect();
+        let gl3: Vec<f32> = (0..n_var * n_samples).flat_map(|_| match rng.below(3) {
+            0 => [1.0 / 3.0; 3],
+            1 => [0.9, 0.09, 0.01],
+            _ => [0.05, 0.9, 0.05],
+        }).collect();
+        let ids: Vec<String> = (0..n_haps / 2).map(|s| format!("s{s}")).collect();
+        let pri: std::sync::Arc<[u32]> = hap_priority(&ids, n_haps, CAP_HASH_SEED).into();
+        for order in [CapOrder::Hash, CapOrder::Hybrid] {
+            let params = LcwgsParams { kpbwt: 150, pbwt_modulo_cm: 0.002,
+                cap: Some(CapPlan { order, priority: pri.clone(), rank_frac: 0.5 }), ..Default::default() };
+            let mut sel = FaithfulSelector::build(&bm, &cm, &gl3, n_samples, &params, 11);
+            for it in 0..4 {
+                let haps: Vec<u8> = (0..n_var * 2 * n_samples).map(|_| (rng.below(4) == 0) as u8).collect();
+                let cond = sel.select(&haps);
+                for s in 0..n_samples {
+                    assert_eq!(cond[2 * s], cond[2 * s + 1]);
+                    assert!(!cond[2 * s].is_empty() && cond[2 * s].len() <= 150);
+                    assert!(cond[2 * s].iter().all(|&h| (h as usize) < n_haps));
+                    if it > 0 && order == CapOrder::Hash {
+                        assert!(cond[2 * s].iter().any(|&h| h >= 600), "hash cap kept only low indices");
+                    }
                 }
             }
         }
