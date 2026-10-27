@@ -982,6 +982,38 @@ fn resolve_split(mean_conf: f32, params: &LcwgsParams) -> Option<(f64, f64, usiz
     }
 }
 
+/// `LCWGS_SPLIT_KPBWT=N` (N >= 1): the SPLIT deep pass selects its conditioning base at
+/// depth `N` instead of the run's `kpbwt`; everything else in the pass (seed, schedule,
+/// cap order, `LCWGS_SPLIT_KMAX`, the panel side, which depends on the panel, map and
+/// `rare_maf` alone) is the run's. `None` when unset, unparsable or equal to the run's
+/// depth, so the deep pass is then the old one exactly. Refused (said, then `None`) for
+/// `0` (a zero depth selects nothing: no uncapped selection exists) and with
+/// `LCWGS_CHRWIDE_PBWT` (its conditioning is selected once, at the run's depth, and
+/// supplied to both passes). With `LCWGS_SPLIT_KPBWT=2000 LCWGS_SPLIT_KMAX=3000` the deep
+/// pass is the computation of a whole `LCWGS_KPBWT=2000` run's single pass; with
+/// `LCWGS_SPLIT_MAF` the band below it takes that pass's doses.
+fn split_kpbwt_params(params: &LcwgsParams) -> Option<LcwgsParams> {
+    let k = crate::config::usize_opt("LCWGS_SPLIT_KPBWT")?;
+    if k == 0 {
+        crate::selphi_info!("  LCWGS_SPLIT_KPBWT=0 is not a depth (the selection would be empty): ignored, the deep pass keeps kpbwt {}", params.kpbwt);
+        return None;
+    }
+    if k != params.kpbwt && crate::config::present("LCWGS_CHRWIDE_PBWT") {
+        crate::selphi_info!("  LCWGS_SPLIT_KPBWT has no effect with LCWGS_CHRWIDE_PBWT (one selection at kpbwt {} serves both passes): ignored", params.kpbwt);
+        return None;
+    }
+    let deep = deep_pass_params(params, Some(k))?;
+    crate::selphi_info!("  lcWGS SPLIT deep pass: conditioning depth kpbwt {} instead of {} (LCWGS_SPLIT_KPBWT)", deep.kpbwt, params.kpbwt);
+    Some(deep)
+}
+
+/// [`split_kpbwt_params`] without the environment: `params` at depth `k`, or `None`
+/// when `k` is unset, zero or the run's own depth.
+fn deep_pass_params(params: &LcwgsParams, k: Option<usize>) -> Option<LcwgsParams> {
+    let k = k.filter(|&k| k != params.kpbwt && k > 0)?;
+    Some(LcwgsParams { kpbwt: k, ..params.clone() })
+}
+
 /// Resident chunk state, selection structures, accumulators and completed
 /// sample results. GLs, map coordinates and panel indices are borrowed. The
 /// single-sample path also keeps the selection's segment plan and decoded
@@ -1121,6 +1153,8 @@ fn run_chunked_gibbs(
     // beat GLIMPSE2 on every MAF bin; small/panel-matched panels + high coverage
     // skip it (single pass, byte-identical). Cost when on: ~2× the per-chunk Gibbs.
     let split_band: Option<(f64, f64, usize)> = resolve_split(mean_conf, params);
+    // The deep pass's own conditioning depth (LCWGS_SPLIT_KPBWT; unset = the run's).
+    let deep_params: Option<LcwgsParams> = split_band.and_then(|_| split_kpbwt_params(params));
 
     // Chromosome-wide conditioning selection (LCWGS_CHRWIDE_PBWT, default OFF):
     // select the conditioning set ONCE over the WHOLE chromosome's common-site
@@ -1227,7 +1261,8 @@ fn run_chunked_gibbs(
         // sites (panel MAF ∈ [lo,hi)), routing by PANEL allele frequency only (known
         // a-priori; no truth). Byte-identical when `split_band` is None.
         if let Some((lo, hi, deep_k)) = split_band {
-            let out_deep = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, Some(deep_k), chrwide_cond.as_ref(), execution, panel.as_ref(), chunk_pass.as_ref());
+            let deep = deep_params.as_ref().unwrap_or(params);
+            let out_deep = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, deep, Some(deep_k), chrwide_cond.as_ref(), execution, panel.as_ref(), chunk_pass.as_ref());
             let n_ref = chunk_bm.n_haps;
             // Passengers routed by the same panel-MAF band.
             for p in 0..pass_wgs.len() {
@@ -1360,7 +1395,8 @@ fn run_chunked_gibbs(
     } else {
         let cap = |k: usize| if k == 0 { n_ref } else { k.min(n_ref) };
         let mut k = if crate::config::present("LCWGS_NO_RARE_CARRIER") {
-            cap(params.kpbwt).max(1000.min(n_ref))
+            // The deep pass's own depth (LCWGS_SPLIT_KPBWT) bounds its sets too.
+            cap(params.kpbwt).max(deep_params.as_ref().map_or(0, |d| cap(d.kpbwt))).max(1000.min(n_ref))
         } else {
             cap(crate::config::usize_opt("LCWGS_KMAX").unwrap_or(3000))
         };
@@ -1386,6 +1422,26 @@ fn run_chunked_gibbs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_pass_depth() {
+        // LCWGS_SPLIT_KPBWT unset, zero or equal to the run's depth: no separate deep-pass
+        // parameters (the deep pass is the old one); another depth changes kpbwt only.
+        use super::super::faithful_select::{CapOrder, CapPlan};
+        let run = LcwgsParams { kpbwt: 4986, cap: Some(CapPlan::rank_only(CapOrder::G2)), ..Default::default() };
+        assert!(deep_pass_params(&run, None).is_none());
+        assert!(deep_pass_params(&run, Some(4986)).is_none());
+        // Zero is no depth (the selector would select nothing): refused.
+        assert!(deep_pass_params(&run, Some(0)).is_none());
+        for k in [1usize, 2000, 6000] {
+            let d = deep_pass_params(&run, Some(k)).expect("another depth");
+            assert_eq!(d.kpbwt, k);
+            assert_eq!(d.cap.as_ref().map(|c| c.order), Some(CapOrder::G2));
+            assert_eq!((d.seed_or_default(), d.ne, d.epsilon, d.rare_maf), (run.seed_or_default(), run.ne, run.epsilon, run.rare_maf));
+            assert_eq!((d.pbwt_depth, d.pbwt_modulo_cm, d.chunk_core_cm(), d.chunk_buffer_cm()),
+                (run.pbwt_depth, run.pbwt_modulo_cm, run.chunk_core_cm(), run.chunk_buffer_cm()));
+        }
+    }
 
     /// The panel-size gate: 1000 Genomes-size panels keep their parameters (the
     /// default path is unchanged); a biobank-size panel gets the GLIMPSE2 rank order
