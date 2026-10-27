@@ -5,7 +5,8 @@
 //! selection base (the PBWT layer union capped at `kpbwt`) followed by the panel
 //! carriers of the rare sites the haplotype is currently sampled to carry, and
 //! the whole list is cut at `k_max` (`LCWGS_KMAX`, 3000; the SPLIT deep pass
-//! uses `LCWGS_SPLIT_KMAX`, 5000). The cut keeps the first `k_max` distinct IDs
+//! uses `LCWGS_SPLIT_KMAX`, 5000, or 3000 on a biobank-size panel, see
+//! `super::big_panel`). The cut keeps the first `k_max` distinct IDs
 //! of `base ++ carriers`. When `kpbwt` exceeds `k_max` (the adaptive depth is
 //! 4,986 on the 75,552-haplotype v3 panel) the base alone fills the cut, so:
 //! - no rare carrier enters the main pass, and
@@ -38,8 +39,9 @@
 //! `kpbwt`, or the longest supplied conditioning list, at most the panel): with the default
 //! depth 2000 and `k_max` 3000 (every panel below 30,311 haplotypes) the output
 //! is unchanged for any `N <= 1000`. The SPLIT deep pass gets the same rule at
-//! its own `k_max`: with 5000 > 4,986 the priority cut does nothing there, a
-//! reserve above 14 does.
+//! its own depth and `k_max`: on a biobank-size panel by default depth 2000 /
+//! `k_max` 3000, so there the priority cut does nothing and a reserve above 1000
+//! does (with `LCWGS_BIG_PANEL=order`, depth 4,986 / `k_max` 5000: a reserve above 14).
 
 use super::membership::with_membership;
 

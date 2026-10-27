@@ -336,7 +336,7 @@ fn impute_from_gl3(
     }
 
     let mut eff = params.clone();
-    let mut modified = apply_conditioning(&mut eff, srp.metadata.n_haps, super::big_panel::Explicit::from_env());
+    let (mut modified, big_split) = apply_conditioning(&mut eff, srp.metadata.n_haps, super::big_panel::Explicit::from_env());
     // Coverage-adaptive GL floor (LCWGS_ADAPT_MIN_GL, default OFF; honoured only when
     // LCWGS_MIN_GL is unset). At HIGH coverage the reads manufacture confident
     // false-HET GLs at rare hom-ref sites that the default 1e-10 floor can't catch
@@ -366,7 +366,7 @@ fn impute_from_gl3(
 
     let pass_cm = match &passengers { Some(p) => site_cm(srp, &p.idx, map_path)?, None => Vec::new() };
     let (dosage, mut gp, mut pass_dosage, mut pass_gp) = run_chunked_gibbs(&gl3_shared, srp, wgs_idx, &cm, n_samples, n_shared, params, mean_conf,
-        prepared_chunks.as_deref(), passengers.as_ref().map(|p| (p, pass_cm.as_slice())));
+        big_split, prepared_chunks.as_deref(), passengers.as_ref().map(|p| (p, pass_cm.as_slice())));
     if let Some(gl) = passengers.as_ref().and_then(|p| p.gl3.as_deref()) {
         let cells = haploid.as_ref().map(|c| (c.sample.as_slice(), c.pass_site.as_slice()));
         fold_passenger_reads(&mut pass_gp, &mut pass_dosage, gl, n_samples, cells);
@@ -384,8 +384,9 @@ fn impute_from_gl3(
     }
 }
 
-/// Conditioning depth and cap order by panel size (see `super::big_panel`); true
-/// when `eff` changed. Depth: when `LCWGS_KPBWT` is unset, the adaptive
+/// Conditioning depth and cap order by panel size (see `super::big_panel`): whether
+/// `eff` changed, and the biobank-size SPLIT parameters (`None` below the boundary or
+/// with `LCWGS_BIG_PANEL=0|order`). Depth: when `LCWGS_KPBWT` is unset, the adaptive
 /// `round(0.066 n_ref)` clamped to [2000, 5000] and below the panel size (= 2000 on
 /// panels of 2,001 haplotypes up to `BIG_PANEL_MIN_HAPS`). Order: on a biobank-size
 /// panel, unless `LCWGS_QUAL_TRUNC` is set (non-empty), the caller supplied a cap
@@ -393,7 +394,8 @@ fn impute_from_gl3(
 /// order instead of haplotype-index order (the index order keeps only the block the
 /// panel lists first: on v3 the UK Biobank haplotypes), said loudly. Panels below
 /// the boundary are unchanged.
-fn apply_conditioning(eff: &mut LcwgsParams, n_ref: usize, explicit: super::big_panel::Explicit) -> bool {
+fn apply_conditioning(eff: &mut LcwgsParams, n_ref: usize, explicit: super::big_panel::Explicit)
+    -> (bool, Option<super::big_panel::BigSplit>) {
     use super::big_panel;
     let explicit = big_panel::Explicit { order: explicit.order || eff.cap.is_some(), ..explicit };
     let plan = big_panel::resolve(n_ref, explicit);
@@ -410,7 +412,7 @@ fn apply_conditioning(eff: &mut LcwgsParams, n_ref: usize, explicit: super::big_
             "lcWGS big panel ({} haplotypes >= {}): conditioning capped in GLIMPSE2 rank order (g2) instead of haplotype-index order, at kpbwt {}; LCWGS_BIG_PANEL=0 restores the index order",
             n_ref, big_panel::BIG_PANEL_MIN_HAPS, eff.kpbwt)));
     }
-    modified
+    (modified, plan.split)
 }
 
 /// The passengers' own read likelihoods folded into their genotype posteriors once
@@ -935,9 +937,55 @@ fn resolve_bam_indels(value: Option<&str>, keep_legacy: bool, realign_with_refer
     }
 }
 
+/// The run's two-depth common/rare SPLIT (see `process_chunk`): sites of panel MAF in
+/// `[lo, hi)` take the genotypes of a deep pass at `k_max` `deep_k` whose conditioning
+/// depth is `deep_kpbwt` (`None`: the run's).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SplitPlan {
+    lo: f64,
+    hi: f64,
+    deep_k: usize,
+    deep_kpbwt: Option<usize>,
+}
+
+/// The SPLIT knobs as set (raw values; `None` = unset), read once per run.
+#[derive(Clone, Debug, Default)]
+struct SplitKnobs {
+    /// `LCWGS_NO_SPLIT` is set.
+    off: bool,
+    /// `LCWGS_SPLIT_MAF`: the manual band.
+    maf: Option<String>,
+    /// `LCWGS_SPLIT_BAND`: the auto band.
+    band: Option<String>,
+    /// `LCWGS_SPLIT_KMAX`.
+    kmax: Option<String>,
+    /// `LCWGS_SPLIT_KPBWT`.
+    kpbwt: Option<String>,
+    /// `LCWGS_SPLIT_GL_THR`.
+    gl_thr: Option<String>,
+    /// `LCWGS_CHRWIDE_PBWT` is set (one selection at the run's depth serves both passes).
+    chrwide: bool,
+}
+
+impl SplitKnobs {
+    fn from_env() -> Self {
+        use crate::config::{present, raw};
+        SplitKnobs {
+            off: present("LCWGS_NO_SPLIT"),
+            maf: raw("LCWGS_SPLIT_MAF"),
+            band: raw("LCWGS_SPLIT_BAND"),
+            kmax: raw("LCWGS_SPLIT_KMAX"),
+            kpbwt: raw("LCWGS_SPLIT_KPBWT"),
+            gl_thr: raw("LCWGS_SPLIT_GL_THR"),
+            chrwide: present("LCWGS_CHRWIDE_PBWT"),
+        }
+    }
+}
+
 /// Resolve the two-depth common/rare split for this run (see `process_chunk`).
-/// Priority: `LCWGS_NO_SPLIT` → off; explicit `LCWGS_SPLIT_MAF="lo,hi"` → manual;
-/// otherwise AUTO (default). AUTO engages iff BOTH hold:
+/// Priority: `LCWGS_NO_SPLIT` → off; explicit `LCWGS_SPLIT_MAF="lo,hi"` → manual
+/// (deep `k_max` `LCWGS_SPLIT_KMAX`, else 5000; deep depth `LCWGS_SPLIT_KPBWT`, else
+/// the run's; no big-panel part); otherwise AUTO (default). AUTO engages iff BOTH hold:
 ///   (1) BIG PANEL — the adaptive `kpbwt` exceeds the default conditioning cap
 ///       (3000), so the deep pass actually lets through IBD haps the default
 ///       truncates (the lever that feeds the 5-10% band). On small / panel-matched
@@ -948,67 +996,85 @@ fn resolve_bam_indels(value: Option<&str>, keep_legacy: bool, realign_with_refer
 ///       at ≥4× (informative reads carry the signal), so high-coverage runs skip
 ///       the 2nd pass. De-noised 3-sample validation: 1× dominates all bins, 2×
 ///       wins 6/7+overall, 4× tie (not engaged).
-/// Band defaults to [0.05,0.10) (`LCWGS_SPLIT_BAND`); deep cap 5000 (`LCWGS_SPLIT_KMAX`).
-fn resolve_split(mean_conf: f32, params: &LcwgsParams) -> Option<(f64, f64, usize)> {
-    if crate::config::present("LCWGS_NO_SPLIT") { return None; }
-    let deep_k = crate::config::raw("LCWGS_SPLIT_KMAX").and_then(|x| x.parse().ok()).unwrap_or(5000usize);
+/// AUTO band [0.05,0.10) (`LCWGS_SPLIT_BAND`), deep cap 5000 (`LCWGS_SPLIT_KMAX`),
+/// deep depth the run's (`LCWGS_SPLIT_KPBWT`). On a biobank-size panel (`big`, see
+/// `super::big_panel::BIG_PANEL_SPLIT`) each of the three that is unset takes the
+/// big-panel value instead: [0.005,0.10), 3000, 2000. Not with `LCWGS_CHRWIDE_PBWT`,
+/// whose one selection at the run's depth serves both passes: the old split there.
+fn resolve_split(mean_conf: f32, params: &LcwgsParams, big: Option<super::big_panel::BigSplit>) -> Option<SplitPlan> {
+    split_plan(mean_conf, params.kpbwt, big, &SplitKnobs::from_env())
+}
+
+/// [`resolve_split`] on given knob values (`kpbwt` = the run's depth).
+fn split_plan(mean_conf: f32, kpbwt: usize, big: Option<super::big_panel::BigSplit>, knobs: &SplitKnobs) -> Option<SplitPlan> {
+    if knobs.off { return None; }
     let parse_band = |s: &str| -> Option<(f64, f64)> {
         let p: Vec<f64> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
         if p.len() == 2 && p[0] < p[1] { Some((p[0], p[1])) } else { None }
     };
-    // Manual override.
-    if let Some(s) = crate::config::raw("LCWGS_SPLIT_MAF") {
-        return parse_band(&s).map(|(lo, hi)| {
+    let kmax_set: Option<usize> = knobs.kmax.as_deref().and_then(|x| x.parse().ok());
+    // LCWGS_SPLIT_KPBWT (unset or unparsable: None). Refused (said, then None): 0, which
+    // selects nothing, and with LCWGS_CHRWIDE_PBWT any depth but the run's.
+    let kpbwt_set = || -> Option<usize> {
+        let k: usize = knobs.kpbwt.as_deref()?.parse().ok()?;
+        if k == 0 {
+            crate::selphi_info!("  LCWGS_SPLIT_KPBWT=0 is not a depth (the selection would be empty): ignored");
+            return None;
+        }
+        if k != kpbwt && knobs.chrwide {
+            crate::selphi_info!("  LCWGS_SPLIT_KPBWT has no effect with LCWGS_CHRWIDE_PBWT (one selection at kpbwt {} serves both passes): ignored", kpbwt);
+            return None;
+        }
+        Some(k)
+    };
+    // Manual override, with its own defaults.
+    if let Some(s) = &knobs.maf {
+        return parse_band(s).map(|(lo, hi)| {
+            let deep_k = kmax_set.unwrap_or(5000);
             crate::selphi_info!("  lcWGS SPLIT (manual): MAF∈[{},{}) → deep pass (k_max={})", lo, hi, deep_k);
-            (lo, hi, deep_k)
+            SplitPlan { lo, hi, deep_k, deep_kpbwt: kpbwt_set() }
         });
     }
     // AUTO. (1) big-panel gate: the deep cap must exceed the default cap to differ.
     let default_kmax = 3000usize;
-    if params.kpbwt <= default_kmax { return None; }
+    if kpbwt <= default_kmax { return None; }
     // (2) soft-GL (coverage) gate.
-    let thr: f32 = crate::config::raw("LCWGS_SPLIT_GL_THR").and_then(|x| x.parse().ok()).unwrap_or(0.84);
-    let (lo, hi) = crate::config::raw("LCWGS_SPLIT_BAND").and_then(|s| parse_band(&s)).unwrap_or((0.05, 0.10));
-    if mean_conf < thr {
-        crate::selphi_info!(
-            "  lcWGS SPLIT (auto-ON): big panel (kpbwt={}) + soft GL (mean_conf={:.3} < {:.2}) → deep pass MAF∈[{},{}) k_max={}",
-            params.kpbwt, mean_conf, thr, lo, hi, deep_k);
-        Some((lo, hi, deep_k))
-    } else {
+    let thr: f32 = knobs.gl_thr.as_deref().and_then(|x| x.parse().ok()).unwrap_or(0.84);
+    // `<` is the gate (a NaN threshold or mean_conf leaves the split off, as before).
+    let soft = mean_conf < thr;
+    if !soft {
         crate::selphi_info!(
             "  lcWGS SPLIT (auto-OFF): high coverage (mean_conf={:.3} ≥ {:.2}) — split is neutral, single pass",
             mean_conf, thr);
-        None
-    }
-}
-
-/// `LCWGS_SPLIT_KPBWT=N` (N >= 1): the SPLIT deep pass selects its conditioning base at
-/// depth `N` instead of the run's `kpbwt`; everything else in the pass (seed, schedule,
-/// cap order, `LCWGS_SPLIT_KMAX`, the panel side, which depends on the panel, map and
-/// `rare_maf` alone) is the run's. `None` when unset, unparsable or equal to the run's
-/// depth, so the deep pass is then the old one exactly. Refused (said, then `None`) for
-/// `0` (a zero depth selects nothing: no uncapped selection exists) and with
-/// `LCWGS_CHRWIDE_PBWT` (its conditioning is selected once, at the run's depth, and
-/// supplied to both passes). With `LCWGS_SPLIT_KPBWT=2000 LCWGS_SPLIT_KMAX=3000` the deep
-/// pass is the computation of a whole `LCWGS_KPBWT=2000` run's single pass; with
-/// `LCWGS_SPLIT_MAF` the band below it takes that pass's doses.
-fn split_kpbwt_params(params: &LcwgsParams) -> Option<LcwgsParams> {
-    let k = crate::config::usize_opt("LCWGS_SPLIT_KPBWT")?;
-    if k == 0 {
-        crate::selphi_info!("  LCWGS_SPLIT_KPBWT=0 is not a depth (the selection would be empty): ignored, the deep pass keeps kpbwt {}", params.kpbwt);
         return None;
     }
-    if k != params.kpbwt && crate::config::present("LCWGS_CHRWIDE_PBWT") {
-        crate::selphi_info!("  LCWGS_SPLIT_KPBWT has no effect with LCWGS_CHRWIDE_PBWT (one selection at kpbwt {} serves both passes): ignored", params.kpbwt);
-        return None;
+    let big = big.filter(|_| {
+        if knobs.chrwide {
+            crate::selphi_info!("  lcWGS SPLIT: LCWGS_CHRWIDE_PBWT selects one set at kpbwt {} for both passes, so the biobank-size deep pass (its own depth) does not apply: the old split", kpbwt);
+        }
+        !knobs.chrwide
+    });
+    let (lo, hi) = knobs.band.as_deref().and_then(parse_band).or(big.map(|b| b.band)).unwrap_or((0.05, 0.10));
+    let deep_k = kmax_set.or(big.map(|b| b.kmax)).unwrap_or(5000);
+    let deep_kpbwt = kpbwt_set().or(big.map(|b| b.kpbwt));
+    crate::selphi_info!(
+        "  lcWGS SPLIT (auto-ON): big panel (kpbwt={}) + soft GL (mean_conf={:.3} < {:.2}) → deep pass MAF∈[{},{}) k_max={}",
+        kpbwt, mean_conf, thr, lo, hi, deep_k);
+    if big.is_some() {
+        crate::selphi_step!("{}", crate::log::yellow(&format!(
+            "lcWGS big panel SPLIT: panel MAF [{},{}) imputed by a deep pass at kpbwt {} / k_max {} (LCWGS_SPLIT_BAND / LCWGS_SPLIT_KPBWT / LCWGS_SPLIT_KMAX set each part); LCWGS_BIG_PANEL=order restores the old split defaults (5-10%, k_max 5000, the run's depth)",
+            lo, hi, deep_kpbwt.filter(|&k| k > 0).unwrap_or(kpbwt), deep_k)));
     }
-    let deep = deep_pass_params(params, Some(k))?;
-    crate::selphi_info!("  lcWGS SPLIT deep pass: conditioning depth kpbwt {} instead of {} (LCWGS_SPLIT_KPBWT)", deep.kpbwt, params.kpbwt);
-    Some(deep)
+    Some(SplitPlan { lo, hi, deep_k, deep_kpbwt })
 }
 
-/// [`split_kpbwt_params`] without the environment: `params` at depth `k`, or `None`
-/// when `k` is unset, zero or the run's own depth.
+/// The SPLIT deep pass's parameters at its own depth `k` (`LCWGS_SPLIT_KPBWT`, or the
+/// biobank-size panel's 2000): `params` with `kpbwt` replaced, or `None` when `k` is
+/// unset, zero or the run's own depth (the deep pass then gets the run's `params`, at
+/// the band and `k_max` of its `SplitPlan`).
+/// Everything else in the pass is the run's (seed, schedule, cap order, the panel
+/// side, which depends on the panel, map and `rare_maf` alone), so depth 2000 under
+/// `k_max` 3000 is the computation of a whole `LCWGS_KPBWT=2000` run's single pass.
 fn deep_pass_params(params: &LcwgsParams, k: Option<usize>) -> Option<LcwgsParams> {
     let k = k.filter(|&k| k != params.kpbwt && k > 0)?;
     Some(LcwgsParams { kpbwt: k, ..params.clone() })
@@ -1121,6 +1187,7 @@ fn run_chunked_gibbs(
     n_shared: usize,
     params: &LcwgsParams,
     mean_conf: f32,
+    big_split: Option<super::big_panel::BigSplit>,
     prepared: Option<&[std::sync::Mutex<Option<ChunkPrep>>]>,
     passengers: Option<(&Passengers, &[f64])>,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -1149,12 +1216,18 @@ fn run_chunked_gibbs(
     // starving the mid-frequency (5-10%) sites of the mid-ranked IBD haps they
     // need. When engaged, each chunk is ALSO imputed at a deep cap and sites whose
     // PANEL MAF ∈ [lo,hi) take the deep dose; all others keep the default. AUTO
-    // engages only on a BIG panel at LOW coverage (≤~2×) — where it makes Selphi
-    // beat GLIMPSE2 on every MAF bin; small/panel-matched panels + high coverage
-    // skip it (single pass, byte-identical). Cost when on: ~2× the per-chunk Gibbs.
-    let split_band: Option<(f64, f64, usize)> = resolve_split(mean_conf, params);
-    // The deep pass's own conditioning depth (LCWGS_SPLIT_KPBWT; unset = the run's).
-    let deep_params: Option<LcwgsParams> = split_band.and_then(|_| split_kpbwt_params(params));
+    // engages only when kpbwt > 3000 at LOW coverage (mean_conf < 0.84); small panels
+    // and high coverage skip it (single pass, byte-identical). On a biobank-size panel
+    // the deep pass is the depth-2000 / k_max-3000 pass on panel MAF 0.5-10%
+    // (`super::big_panel::BIG_PANEL_SPLIT`). Cost when on: a second Gibbs per chunk.
+    let split_plan_run: Option<SplitPlan> = resolve_split(mean_conf, params, big_split);
+    let split_band: Option<(f64, f64, usize)> = split_plan_run.map(|p| (p.lo, p.hi, p.deep_k));
+    // The deep pass's own conditioning depth (LCWGS_SPLIT_KPBWT, else the biobank-size
+    // panel's 2000; neither = the run's).
+    let deep_params: Option<LcwgsParams> = split_plan_run.and_then(|p| deep_pass_params(params, p.deep_kpbwt));
+    if let Some(deep) = &deep_params {
+        crate::selphi_info!("  lcWGS SPLIT deep pass: conditioning depth kpbwt {} instead of {}", deep.kpbwt, params.kpbwt);
+    }
 
     // Chromosome-wide conditioning selection (LCWGS_CHRWIDE_PBWT, default OFF):
     // select the conditioning set ONCE over the WHOLE chromosome's common-site
@@ -1395,7 +1468,7 @@ fn run_chunked_gibbs(
     } else {
         let cap = |k: usize| if k == 0 { n_ref } else { k.min(n_ref) };
         let mut k = if crate::config::present("LCWGS_NO_RARE_CARRIER") {
-            // The deep pass's own depth (LCWGS_SPLIT_KPBWT) bounds its sets too.
+            // The deep pass's own depth (LCWGS_SPLIT_KPBWT or the big-panel 2000) bounds its sets too.
             cap(params.kpbwt).max(deep_params.as_ref().map_or(0, |d| cap(d.kpbwt))).max(1000.min(n_ref))
         } else {
             cap(crate::config::usize_opt("LCWGS_KMAX").unwrap_or(3000))
@@ -1447,45 +1520,128 @@ mod tests {
     /// default path is unchanged); a biobank-size panel gets the GLIMPSE2 rank order
     /// at the adaptive depth; an explicit LCWGS_KPBWT keeps its depth, an explicit
     /// LCWGS_QUAL_TRUNC or a supplied cap plan keeps its order; `LCWGS_BIG_PANEL=0`
-    /// restores the index order.
+    /// restores the index order. The biobank-size SPLIT parameters come with the
+    /// panel size, whatever the order (`order` and `0` drop them).
     #[test]
     fn conditioning_by_panel_size() {
-        use super::super::big_panel::{Explicit, BIG_PANEL_MIN_HAPS};
+        use super::super::big_panel::{Explicit, BIG_PANEL_MIN_HAPS, BIG_PANEL_SPLIT};
         use super::super::faithful_select::{CapOrder, CapPlan, hap_priority};
         let none = Explicit::default();
         let base = || LcwgsParams { kpbwt: 2000, ..Default::default() };
         for n in [1500, 4478, 4796, 6332, BIG_PANEL_MIN_HAPS - 1] {
             let mut eff = base();
-            let changed = apply_conditioning(&mut eff, n, none);
+            let (changed, split) = apply_conditioning(&mut eff, n, none);
             assert_eq!(changed, n == 1500, "{n}"); // a 1,500-hap panel caps below its size, as before
+            assert_eq!(split, None, "{n}");
             assert!(eff.cap.is_none(), "{n}");
             assert_eq!(eff.kpbwt, if n == 1500 { 1499 } else { 2000 });
         }
         for (n, k) in [(BIG_PANEL_MIN_HAPS, 2001), (75_552, 4986), (171_054, 5000)] {
             let mut eff = base();
-            assert!(apply_conditioning(&mut eff, n, none), "{n}");
+            assert_eq!(apply_conditioning(&mut eff, n, none), (true, Some(BIG_PANEL_SPLIT)), "{n}");
             assert_eq!(eff.kpbwt, k);
             assert_eq!(eff.cap.as_ref().map(|c| c.order), Some(CapOrder::G2));
         }
         let mut eff = base();
-        assert!(apply_conditioning(&mut eff, 75_552, Explicit { gate_off: true, ..none }));
+        assert_eq!(apply_conditioning(&mut eff, 75_552, Explicit { gate_off: true, ..none }), (true, None));
         assert_eq!((eff.kpbwt, eff.cap.is_none()), (4986, true));
         // LCWGS_KPBWT=2000 (already parsed into kpbwt): kept, order g2.
         let mut eff = base();
-        assert!(apply_conditioning(&mut eff, 75_552, Explicit { kpbwt: true, ..none }));
+        assert_eq!(apply_conditioning(&mut eff, 75_552, Explicit { kpbwt: true, ..none }), (true, Some(BIG_PANEL_SPLIT)));
         assert_eq!(eff.kpbwt, 2000);
         assert_eq!(eff.cap.as_ref().map(|c| c.order), Some(CapOrder::G2));
         // LCWGS_QUAL_TRUNC set: the selector reads it; the depth is adaptive as before.
         let mut eff = base();
-        assert!(apply_conditioning(&mut eff, 75_552, Explicit { order: true, ..none }));
+        assert_eq!(apply_conditioning(&mut eff, 75_552, Explicit { order: true, ..none }), (true, Some(BIG_PANEL_SPLIT)));
         assert_eq!((eff.kpbwt, eff.cap.is_none()), (4986, true));
         // A cap plan the caller supplied is kept.
         let ids: Vec<String> = (0..10).map(|s| format!("s{s}")).collect();
         let supplied = CapPlan { order: CapOrder::Hash, priority: hap_priority(&ids, 20, 7).into(), rank_frac: 0.5 };
         let mut eff = LcwgsParams { kpbwt: 2000, cap: Some(supplied.clone()), ..Default::default() };
-        apply_conditioning(&mut eff, 75_552, none);
+        assert_eq!(apply_conditioning(&mut eff, 75_552, none).1, Some(BIG_PANEL_SPLIT));
         let kept = eff.cap.as_ref().unwrap();
         assert_eq!((kept.order, &kept.priority[..]), (CapOrder::Hash, &supplied.priority[..]));
+        // LCWGS_BIG_PANEL=order: the rank order, the old split.
+        let mut eff = base();
+        assert_eq!(apply_conditioning(&mut eff, 75_552, Explicit { split_off: true, ..none }), (true, None));
+        assert_eq!((eff.kpbwt, eff.cap.as_ref().map(|c| c.order)), (4986, Some(CapOrder::G2)));
+    }
+
+    /// The SPLIT plan. Off the biobank-size panels (and with `LCWGS_BIG_PANEL=0|order`)
+    /// every knob combination resolves as before this change; on one, the auto split's
+    /// unset parts take the big-panel values (0.5-10%, k_max 3000, depth 2000), each
+    /// explicit knob wins for its part, the manual band keeps its own defaults, and the
+    /// gates (depth > 3000, soft likelihoods, LCWGS_NO_SPLIT) are unchanged.
+    #[test]
+    fn split_plan_by_panel_size() {
+        use super::super::big_panel::BIG_PANEL_SPLIT;
+        let big = Some(BIG_PANEL_SPLIT);
+        let k = |kv: &[(&str, &str)]| {
+            let mut kn = SplitKnobs::default();
+            for &(key, v) in kv {
+                let v = Some(v.to_string());
+                match key {
+                    "off" => kn.off = true,
+                    "maf" => kn.maf = v,
+                    "band" => kn.band = v,
+                    "kmax" => kn.kmax = v,
+                    "kpbwt" => kn.kpbwt = v,
+                    "thr" => kn.gl_thr = v,
+                    "chrwide" => kn.chrwide = true,
+                    _ => unreachable!(),
+                }
+            }
+            kn
+        };
+        let plan = |lo, hi, deep_k, deep_kpbwt| Some(SplitPlan { lo, hi, deep_k, deep_kpbwt });
+        let none = k(&[]);
+        // Small panels (big = None): the old resolution.
+        assert_eq!(split_plan(0.53, 2000, None, &none), None); // depth <= 3000: never auto
+        assert_eq!(split_plan(0.53, 4986, None, &none), plan(0.05, 0.10, 5000, None));
+        assert_eq!(split_plan(0.90, 4986, None, &none), None); // confident likelihoods
+        assert_eq!(split_plan(0.53, 3500, None, &k(&[("kpbwt", "2000"), ("kmax", "3000")])), plan(0.05, 0.10, 3000, Some(2000)));
+        assert_eq!(split_plan(0.53, 2000, None, &k(&[("maf", "0,0.1")])), plan(0.0, 0.1, 5000, None));
+        // The default on a biobank-size panel at soft coverage: the depth-2000 pass on 0.5-10%.
+        assert_eq!(split_plan(0.53, 4986, big, &none), plan(0.005, 0.10, 3000, Some(2000)));
+        // = the opt-in command the composites were measured with.
+        assert_eq!(split_plan(0.53, 4986, None, &k(&[("maf", "0.005,0.1"), ("kmax", "3000"), ("kpbwt", "2000")])),
+            split_plan(0.53, 4986, big, &none));
+        // The gates are unchanged.
+        assert_eq!(split_plan(0.84, 4986, big, &none), None);
+        assert_eq!(split_plan(0.53, 3000, big, &none), None); // e.g. LCWGS_KPBWT=2000 or 3000: single pass
+        assert_eq!(split_plan(0.53, 4986, big, &k(&[("off", "")])), None);
+        assert_eq!(split_plan(0.85, 4986, big, &k(&[("thr", "0.9")])), plan(0.005, 0.10, 3000, Some(2000)));
+        // A NaN threshold or coverage proxy leaves the split off, as before (`<` is the gate).
+        for b in [None, big] {
+            assert_eq!(split_plan(0.53, 4986, b, &k(&[("thr", "NaN")])), None);
+            assert_eq!(split_plan(f32::NAN, 4986, b, &none), None);
+        }
+        // Each explicit part wins for its part.
+        assert_eq!(split_plan(0.53, 4986, big, &k(&[("band", "0.05,0.10")])), plan(0.05, 0.10, 3000, Some(2000)));
+        assert_eq!(split_plan(0.53, 4986, big, &k(&[("kmax", "5000")])), plan(0.005, 0.10, 5000, Some(2000)));
+        assert_eq!(split_plan(0.53, 4986, big, &k(&[("kpbwt", "4986")])), plan(0.005, 0.10, 3000, Some(4986)));
+        // Unparsable, empty or refused values count as unset.
+        for bad in [("kpbwt", "0"), ("kpbwt", ""), ("kpbwt", "x"), ("kmax", ""), ("band", ""), ("band", "0.1,0.05")] {
+            assert_eq!(split_plan(0.53, 4986, big, &k(&[bad])), plan(0.005, 0.10, 3000, Some(2000)), "{bad:?}");
+        }
+        // The manual band keeps its own defaults on every panel (every measured opt-in arm reproduces).
+        assert_eq!(split_plan(0.53, 4986, big, &k(&[("maf", "0,0.1"), ("kmax", "6000")])), plan(0.0, 0.1, 6000, None));
+        assert_eq!(split_plan(0.90, 4986, big, &k(&[("maf", "0.05,0.1")])), plan(0.05, 0.1, 5000, None));
+        assert_eq!(split_plan(0.53, 4986, big, &k(&[("maf", "")])), None); // an invalid manual band is no split, as before
+        // LCWGS_CHRWIDE_PBWT: one selection at the run's depth serves both passes, so the old split.
+        assert_eq!(split_plan(0.53, 4986, big, &k(&[("chrwide", "")])), plan(0.05, 0.10, 5000, None));
+        assert_eq!(split_plan(0.53, 4986, big, &k(&[("chrwide", ""), ("kpbwt", "2000")])), plan(0.05, 0.10, 5000, None));
+        // The deep pass at the big-panel depth is a whole LCWGS_KPBWT=2000 run's parameters
+        // (the run's g2 plan, seed and schedule; only the depth differs).
+        use super::super::faithful_select::{CapOrder, CapPlan};
+        let run = LcwgsParams { kpbwt: 4986, cap: Some(CapPlan::rank_only(CapOrder::G2)), ..Default::default() };
+        let p = split_plan(0.53, run.kpbwt, big, &none).unwrap();
+        let d = deep_pass_params(&run, p.deep_kpbwt).expect("its own depth");
+        assert_eq!(d.kpbwt, 2000);
+        assert_eq!(d.cap.as_ref().map(|c| c.order), Some(CapOrder::G2));
+        assert_eq!((d.seed_or_default(), d.ne, d.epsilon, d.rare_maf, d.pbwt_depth, d.pbwt_modulo_cm),
+            (run.seed_or_default(), run.ne, run.epsilon, run.rare_maf, run.pbwt_depth, run.pbwt_modulo_cm));
+        assert_eq!(p.deep_k, 3000); // = LCWGS_KMAX's default, the k_max of a standalone run
     }
 
     /// `--bam` indel handling: impute-only by default, the legacy knobs keep their
