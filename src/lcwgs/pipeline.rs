@@ -335,28 +335,8 @@ fn impute_from_gl3(
         return Ok(LcwgsOutput { dosage: raw, gp, n_variants: n_shared, sample_ids, panel_idx: wgs_idx.to_vec() });
     }
 
-    // Adaptive conditioning depth (chip/WGS auto-max-candidates concept): on a big
-    // diverse panel a fixed kpbwt=2000 under-selects, so the true RARE carrier is
-    // often not in the conditioning set (the one bin GLIMPSE2 still kept). Scale
-    // kpbwt with panel size, clamped: big panels deepen (rare-bin gap closes, e.g.
-    // 75552-hap panel → ~5000: rare 0.9971→0.9989, ties GLIMPSE2, +10s/+0.24GB),
-    // small/matched panels stay 2000 (r12 unchanged). Past ~5000 the common bins
-    // regress (rare↔common tradeoff), hence the cap. Skip when kpbwt is set explicitly.
     let mut eff = params.clone();
-    let mut modified = false;
-    if !crate::config::present("LCWGS_KPBWT") {
-        let n_ref = srp.metadata.n_haps;
-        // Capped below n_ref as well as at 5000: a depth at or above the panel size
-        // makes the sparse-PBWT allocation short-circuit (see faithful_select.rs).
-        let adaptive = ((n_ref as f64 * 0.066).round() as usize)
-            .clamp(2000, 5000)
-            .min(n_ref.saturating_sub(1).max(1));
-        if adaptive != eff.kpbwt {
-            crate::selphi_info!("  adaptive K: kpbwt {} → {} (n_ref={})", eff.kpbwt, adaptive, n_ref);
-            eff.kpbwt = adaptive;
-            modified = true;
-        }
-    }
+    let mut modified = apply_conditioning(&mut eff, srp.metadata.n_haps, super::big_panel::Explicit::from_env());
     // Coverage-adaptive GL floor (LCWGS_ADAPT_MIN_GL, default OFF; honoured only when
     // LCWGS_MIN_GL is unset). At HIGH coverage the reads manufacture confident
     // false-HET GLs at rare hom-ref sites that the default 1e-10 floor can't catch
@@ -377,7 +357,7 @@ fn impute_from_gl3(
     }
     // Panel-order-independent conditioning cap (LCWGS_QUAL_TRUNC=hash|hybrid): its
     // panel priority, keyed by the panel's sample IDs, built once for the run.
-    if params.cap.is_none()
+    if eff.cap.is_none()
         && let Some(plan) = super::faithful_select::cap_plan_from_env(&srp.sample_ids, srp.metadata.n_haps) {
         eff.cap = Some(plan);
         modified = true;
@@ -402,6 +382,35 @@ fn impute_from_gl3(
             Ok(LcwgsOutput { dosage, gp, n_variants: panel_idx.len(), sample_ids, panel_idx })
         }
     }
+}
+
+/// Conditioning depth and cap order by panel size (see `super::big_panel`); true
+/// when `eff` changed. Depth: when `LCWGS_KPBWT` is unset, the adaptive
+/// `round(0.066 n_ref)` clamped to [2000, 5000] and below the panel size (= 2000 on
+/// panels of 2,001 haplotypes up to `BIG_PANEL_MIN_HAPS`). Order: on a biobank-size
+/// panel, unless `LCWGS_QUAL_TRUNC` is set (non-empty), the caller supplied a cap
+/// plan or `LCWGS_BIG_PANEL=0`, GLIMPSE2's rank
+/// order instead of haplotype-index order (the index order keeps only the block the
+/// panel lists first: on v3 the UK Biobank haplotypes), said loudly. Panels below
+/// the boundary are unchanged.
+fn apply_conditioning(eff: &mut LcwgsParams, n_ref: usize, explicit: super::big_panel::Explicit) -> bool {
+    use super::big_panel;
+    let explicit = big_panel::Explicit { order: explicit.order || eff.cap.is_some(), ..explicit };
+    let plan = big_panel::resolve(n_ref, explicit);
+    let mut modified = false;
+    if let Some(adaptive) = plan.kpbwt && adaptive != eff.kpbwt {
+        crate::selphi_info!("  adaptive K: kpbwt {} → {} (n_ref={})", eff.kpbwt, adaptive, n_ref);
+        eff.kpbwt = adaptive;
+        modified = true;
+    }
+    if let Some(order) = plan.order {
+        eff.cap = Some(super::faithful_select::CapPlan::rank_only(order));
+        modified = true;
+        crate::selphi_step!("{}", crate::log::yellow(&format!(
+            "lcWGS big panel ({} haplotypes >= {}): conditioning capped in GLIMPSE2 rank order (g2) instead of haplotype-index order, at kpbwt {}; LCWGS_BIG_PANEL=0 restores the index order",
+            n_ref, big_panel::BIG_PANEL_MIN_HAPS, eff.kpbwt)));
+    }
+    modified
 }
 
 /// The passengers' own read likelihoods folded into their genotype posteriors once
@@ -758,34 +767,36 @@ pub fn run_lcwgs_bam(
     selphi_info!("  lcWGS-BAM: {} BAM(s), chrom {}, {} panel sites ({} SNPs, {} indels)",
         bam_paths.len(), chrom, n_shared, n_snp, n_indel);
 
-    // Non-SNP panel sites carry NO read evidence on the default path (their GL is
-    // the flat prior), yet as members of the target set they still enter PBWT
-    // selection and the Gibbs sweeps. The PL-VCF path never sees them (a caller
-    // emits no PL record there) and measurably imputes SNPs better for it
-    // (chr22, 6 GIAB samples: +0.04 pp non-ref concordance). Match it: drop them
-    // unless indel realignment will score them from reads, or the caller asks to
-    // keep the old flat-from-scaffold behaviour (LCWGS_BAM_KEEP_INDELS).
+    // Non-SNP panel sites carry no read evidence unless LCWGS_INDEL_REALIGN scores
+    // them (miscalibrated at this depth: read-scored indels in the chain cost the
+    // SNPs 2.2 pp non-reference concordance on six capture libraries). DEFAULT:
+    // they are IMPUTED ONLY: the SNPs run exactly as without them and the indels
+    // ride along as passengers the chain never reads (see
+    // `iterate::ChunkPassengers`), so no SNP row can move (measured: SNP rows
+    // byte-identical on 12 of 12 samples, 1000 Genomes capture rig and v3), and
+    // each indel gets its copying posterior. On the 1000 Genomes capture rig (six
+    // GIAB libraries, three seeds) they score above GLIMPSE2's indels in every MAF
+    // bin and tie indels kept flat in the chain (LCWGS_BAM_INDELS=keep, which did
+    // not cost the SNPs either: +0.005 pp over 18 pairs). LCWGS_BAM_INDELS=drop
+    // leaves them out (no indel rows, the PL path's behaviour).
     let enable_indel = crate::config::present("LCWGS_INDEL_REALIGN");
-    let keep_indels = crate::config::present("LCWGS_BAM_KEEP_INDELS");
-    // Impute-only indels (LCWGS_BAM_INDELS=impute): the SNPs run exactly as the
-    // default (indels dropped) and the indels ride along as passengers that the
-    // chain never reads (see `iterate::ChunkPassengers`), scored from their own
-    // reads when realignment is on, so no SNP output can move.
-    let impute_indels = n_indel > 0 && bam_indels_impute();
-    if impute_indels && crate::config::present("LCWGS_SCAFFOLD") {
-        return Err(crate::Fatal::error(2, "LCWGS_BAM_INDELS=impute is not available with LCWGS_SCAFFOLD (the scaffold pass has its own model)".to_string()).into());
-    }
+    let indel_mode = if n_indel == 0 { BamIndels::Drop } else {
+        resolve_bam_indels(crate::config::raw("LCWGS_BAM_INDELS").as_deref(), crate::config::present("LCWGS_BAM_KEEP_INDELS"),
+            enable_indel && reference.is_some(), crate::config::present("LCWGS_SCAFFOLD"))
+            .map_err(|msg| -> std::io::Error { crate::Fatal::error(2, msg).into() })?
+    };
+    let impute_indels = indel_mode == BamIndels::Impute;
     let pass_idx: Vec<usize> = if impute_indels { (0..n_shared).filter(|&i| !is_snp[i]).map(|i| wgs_idx[i]).collect() } else { Vec::new() };
     if impute_indels {
-        selphi_info!("  lcWGS-BAM: {} indel panel sites imputed only (LCWGS_BAM_INDELS=impute): out of selection, sampling and phasing; {}",
+        selphi_info!("  lcWGS-BAM: {} indel panel sites imputed only: out of selection, sampling and phasing (the SNPs run as without them); {}. LCWGS_BAM_INDELS=drop leaves them out",
             n_indel, if enable_indel && reference.is_some() { "their own reads scored by realignment fold into their own genotypes" }
                 else { "dose from the chain's copying posterior (flat reads)" });
     }
-    let (wgs_idx, pos, ref_base, alt_base, is_snp, n_shared) = if n_indel > 0 && (impute_indels || !(keep_indels || (enable_indel && reference.is_some()))) {
+    let (wgs_idx, pos, ref_base, alt_base, is_snp, n_shared) = if n_indel > 0 && indel_mode != BamIndels::Chain {
         let keep: Vec<usize> = (0..n_shared).filter(|&i| is_snp[i]).collect();
-        if !impute_indels {
-            selphi_info!("  lcWGS-BAM: {} indel panel sites excluded from the target set (no read evidence; as the PL path). LCWGS_BAM_KEEP_INDELS=1 keeps them flat, LCWGS_INDEL_REALIGN=1 + --reference scores them, LCWGS_BAM_INDELS=impute imputes them without letting them touch the SNPs",
-                n_indel);
+        if indel_mode == BamIndels::Drop {
+            selphi_info!("  lcWGS-BAM: {} indel panel sites excluded from the target set ({}): no indel rows in the output",
+                n_indel, if crate::config::present("LCWGS_SCAFFOLD") { "LCWGS_SCAFFOLD: the impute-only default needs the full-axis model" } else { "LCWGS_BAM_INDELS=drop" });
         }
         (
             keep.iter().map(|&i| wgs_idx[i]).collect::<Vec<usize>>(),
@@ -882,15 +893,43 @@ pub fn run_lcwgs_bam(
     impute_from_gl3(srp, &wgs_idx, bamgl.gl3, n_samples, bamgl.sample_ids, &[], map_path, params, prepared, passengers)
 }
 
-/// `LCWGS_BAM_INDELS=impute`: the `--bam` path's indel panel sites are imputed
-/// only (see `run_lcwgs_bam`). Any other value is the default (said once).
-fn bam_indels_impute() -> bool {
-    match crate::config::raw("LCWGS_BAM_INDELS").map(|v| v.trim().to_ascii_lowercase()) {
-        None => false,
-        Some(v) if v == "impute" => true,
-        Some(v) => {
-            selphi_info!("  LCWGS_BAM_INDELS='{}' not recognised (only 'impute'); indels handled as by default", v);
-            false
+/// How the `--bam` path treats the panel's indel sites.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BamIndels {
+    /// Out of the target set: no indel rows (`LCWGS_BAM_INDELS=drop`).
+    Drop,
+    /// In the chain like the SNPs: flat likelihoods, or scored from reads with
+    /// `LCWGS_INDEL_REALIGN=1` + `--reference` (`LCWGS_BAM_INDELS=keep`, or the
+    /// legacy `LCWGS_BAM_KEEP_INDELS` / `LCWGS_INDEL_REALIGN` alone).
+    Chain,
+    /// Imputed only (default): passengers the chain never reads.
+    Impute,
+}
+
+/// The `--bam` indel handling from `LCWGS_BAM_INDELS`: `impute` | `drop` | `keep`,
+/// case-insensitive, `1`/`true`/`yes`/`on`/`y` = impute. Unset or empty (a dumped
+/// `--config` round-trips an empty value as unset): the legacy knobs keep their
+/// meaning (an indel in the chain when `LCWGS_BAM_KEEP_INDELS` is set, or
+/// `LCWGS_INDEL_REALIGN` with a reference), else impute-only, except under
+/// `LCWGS_SCAFFOLD` (its own model has no passengers), which drops them. The off
+/// spellings `0`/`false`/`no`/`off`/`n` keep the meaning they had before impute
+/// became the default, "not impute": the legacy knobs, else dropped. An explicit
+/// impute with the scaffold is an error; any other value is said and treated as
+/// unset.
+fn resolve_bam_indels(value: Option<&str>, keep_legacy: bool, realign_with_reference: bool, scaffold: bool) -> Result<BamIndels, String> {
+    let legacy = keep_legacy || realign_with_reference;
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("impute" | "1" | "true" | "yes" | "on" | "y") if scaffold =>
+            Err("LCWGS_BAM_INDELS=impute is not available with LCWGS_SCAFFOLD (the scaffold pass has its own model)".to_string()),
+        Some("impute" | "1" | "true" | "yes" | "on" | "y") => Ok(BamIndels::Impute),
+        Some("drop") => Ok(BamIndels::Drop),
+        Some("keep") => Ok(BamIndels::Chain),
+        Some("0" | "false" | "no" | "off" | "n") => Ok(if legacy { BamIndels::Chain } else { BamIndels::Drop }),
+        other => {
+            if let Some(v) = other.filter(|v| !v.is_empty()) {
+                selphi_info!("  LCWGS_BAM_INDELS='{}' not recognised (impute | drop | keep): treated as unset", v);
+            }
+            Ok(if legacy { BamIndels::Chain } else if scaffold { BamIndels::Drop } else { BamIndels::Impute })
         }
     }
 }
@@ -1346,6 +1385,87 @@ fn run_chunked_gibbs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The panel-size gate: 1000 Genomes-size panels keep their parameters (the
+    /// default path is unchanged); a biobank-size panel gets the GLIMPSE2 rank order
+    /// at the adaptive depth; an explicit LCWGS_KPBWT keeps its depth, an explicit
+    /// LCWGS_QUAL_TRUNC or a supplied cap plan keeps its order; `LCWGS_BIG_PANEL=0`
+    /// restores the index order.
+    #[test]
+    fn conditioning_by_panel_size() {
+        use super::super::big_panel::{Explicit, BIG_PANEL_MIN_HAPS};
+        use super::super::faithful_select::{CapOrder, CapPlan, hap_priority};
+        let none = Explicit::default();
+        let base = || LcwgsParams { kpbwt: 2000, ..Default::default() };
+        for n in [1500, 4478, 4796, 6332, BIG_PANEL_MIN_HAPS - 1] {
+            let mut eff = base();
+            let changed = apply_conditioning(&mut eff, n, none);
+            assert_eq!(changed, n == 1500, "{n}"); // a 1,500-hap panel caps below its size, as before
+            assert!(eff.cap.is_none(), "{n}");
+            assert_eq!(eff.kpbwt, if n == 1500 { 1499 } else { 2000 });
+        }
+        for (n, k) in [(BIG_PANEL_MIN_HAPS, 2001), (75_552, 4986), (171_054, 5000)] {
+            let mut eff = base();
+            assert!(apply_conditioning(&mut eff, n, none), "{n}");
+            assert_eq!(eff.kpbwt, k);
+            assert_eq!(eff.cap.as_ref().map(|c| c.order), Some(CapOrder::G2));
+        }
+        let mut eff = base();
+        assert!(apply_conditioning(&mut eff, 75_552, Explicit { gate_off: true, ..none }));
+        assert_eq!((eff.kpbwt, eff.cap.is_none()), (4986, true));
+        // LCWGS_KPBWT=2000 (already parsed into kpbwt): kept, order g2.
+        let mut eff = base();
+        assert!(apply_conditioning(&mut eff, 75_552, Explicit { kpbwt: true, ..none }));
+        assert_eq!(eff.kpbwt, 2000);
+        assert_eq!(eff.cap.as_ref().map(|c| c.order), Some(CapOrder::G2));
+        // LCWGS_QUAL_TRUNC set: the selector reads it; the depth is adaptive as before.
+        let mut eff = base();
+        assert!(apply_conditioning(&mut eff, 75_552, Explicit { order: true, ..none }));
+        assert_eq!((eff.kpbwt, eff.cap.is_none()), (4986, true));
+        // A cap plan the caller supplied is kept.
+        let ids: Vec<String> = (0..10).map(|s| format!("s{s}")).collect();
+        let supplied = CapPlan { order: CapOrder::Hash, priority: hap_priority(&ids, 20, 7).into(), rank_frac: 0.5 };
+        let mut eff = LcwgsParams { kpbwt: 2000, cap: Some(supplied.clone()), ..Default::default() };
+        apply_conditioning(&mut eff, 75_552, none);
+        let kept = eff.cap.as_ref().unwrap();
+        assert_eq!((kept.order, &kept.priority[..]), (CapOrder::Hash, &supplied.priority[..]));
+    }
+
+    /// `--bam` indel handling: impute-only by default, the legacy knobs keep their
+    /// meaning, an explicit value wins, the scaffold drops them unless impute is
+    /// asked for explicitly (then it is an error).
+    #[test]
+    fn bam_indel_modes() {
+        use BamIndels::*;
+        let r = |v: Option<&str>, keep: bool, realign: bool, scaffold: bool| resolve_bam_indels(v, keep, realign, scaffold);
+        assert_eq!(r(None, false, false, false), Ok(Impute));
+        assert_eq!(r(None, true, false, false), Ok(Chain));
+        assert_eq!(r(None, false, true, false), Ok(Chain));
+        assert_eq!(r(None, false, false, true), Ok(Drop));
+        assert_eq!(r(None, true, false, true), Ok(Chain));
+        for (v, want) in [("impute", Impute), ("IMPUTE ", Impute), ("drop", Drop), ("keep", Chain)] {
+            assert_eq!(r(Some(v), true, true, false), Ok(want), "{v}");
+            assert_eq!(r(Some(v), false, false, false), Ok(want), "{v}");
+        }
+        assert!(r(Some("impute"), false, false, true).is_err());
+        assert_eq!(r(Some("drop"), false, false, true), Ok(Drop));
+        // On spellings = impute; off spellings = "not impute", as before impute became
+        // the default (legacy knobs, else drop); empty = unset (config round trip).
+        for v in ["1", "true", "yes", "on"] { assert_eq!(r(Some(v), true, false, false), Ok(Impute), "{v}"); }
+        for v in ["0", "false", "no", "off"] {
+            assert_eq!(r(Some(v), false, false, false), Ok(Drop), "{v}");
+            assert_eq!(r(Some(v), true, false, false), Ok(Chain), "{v}");
+            assert_eq!(r(Some(v), false, true, true), Ok(Chain), "{v}");
+            assert_eq!(r(Some(v), false, false, true), Ok(Drop), "{v}");
+        }
+        assert_eq!(r(Some(""), false, false, false), Ok(Impute));
+        assert_eq!(r(Some(" "), true, false, false), Ok(Chain));
+        assert_eq!(r(Some(""), false, false, true), Ok(Drop));
+        // Not recognised: treated as unset.
+        assert_eq!(r(Some("maybe"), false, false, false), Ok(Impute));
+        assert_eq!(r(Some("maybe"), true, false, false), Ok(Chain));
+        assert_eq!(r(Some("maybe"), false, false, true), Ok(Drop));
+    }
 
     #[test]
     fn wave_budget_counts_sample_tasks_and_buffered_sites() {

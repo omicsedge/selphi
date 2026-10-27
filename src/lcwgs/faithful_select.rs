@@ -164,6 +164,16 @@ pub struct CapPlan {
     pub rank_frac: f64,
 }
 
+impl CapPlan {
+    /// A cap order that reads no panel priority (index, `fwd` or `g2`), chosen for
+    /// the run instead of read from `LCWGS_QUAL_TRUNC` (the big-panel default,
+    /// `super::big_panel`).
+    pub fn rank_only(order: CapOrder) -> Self {
+        assert!(!matches!(order, CapOrder::Hash | CapOrder::Hybrid), "a {order:?} cap needs the panel priority");
+        CapPlan { order, priority: std::sync::Arc::from(Vec::<u32>::new()), rank_frac: 0.0 }
+    }
+}
+
 /// FNV-1a of `bytes` from `h`.
 fn fnv1a(mut h: u64, bytes: &[u8]) -> u64 {
     for &b in bytes { h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01B3); }
@@ -965,6 +975,46 @@ mod tests {
             }
         }
     }
+
+    /// The big-panel default (a `g2` plan chosen for the run, no priority, see
+    /// `big_panel`) selects exactly what `LCWGS_QUAL_TRUNC=g2` selects: GLIMPSE2's
+    /// rank order, the membership emitted ascending.
+    #[test]
+    fn rank_only_g2_plan_is_the_g2_order() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        let mut rng = rp::Xs(0x3C6E_F372_FE94_F82B);
+        let (n_var, n_haps, n_samples) = (700usize, 1200usize, 2usize);
+        let bm = rp::random_typed_panel(&mut rng, n_var, n_haps);
+        let cm: Vec<f64> = (0..n_var).map(|v| v as f64 * 0.002).collect();
+        let gl3: Vec<f32> = (0..n_var * n_samples).flat_map(|_| match rng.below(3) {
+            0 => [1.0 / 3.0; 3],
+            1 => [0.9, 0.09, 0.01],
+            _ => [0.05, 0.9, 0.05],
+        }).collect();
+        let params = LcwgsParams { kpbwt: 150, pbwt_modulo_cm: 0.002,
+            cap: Some(CapPlan::rank_only(CapOrder::G2)), ..Default::default() };
+        let mut sel = FaithfulSelector::build(&bm, &cm, &gl3, n_samples, &params, 11);
+        assert_eq!(sel.cap, CapOrder::G2);
+        let mut capped = 0;
+        for it in 0..4 {
+            let haps: Vec<u8> = (0..n_var * 2 * n_samples).map(|_| (rng.below(4) == 0) as u8).collect();
+            let cond = sel.select(&haps);
+            if it == 0 { continue; } // INIT stage: no PBWT layers yet
+            for s in 0..n_samples {
+                let mut want = g2_order(&sel.tar.pbwt_states[s], 150);
+                want.sort_unstable();
+                assert_eq!(cond[2 * s], want, "iteration {it} sample {s}");
+                assert_eq!(cond[2 * s + 1], want);
+                let union: std::collections::HashSet<i32> = sel.tar.pbwt_states[s].iter().flatten().copied().collect();
+                if union.len() > 150 { capped += 1; }
+            }
+        }
+        assert!(capped > 0, "the cap never bit: the order was not exercised");
+    }
+
+    #[test]
+    #[should_panic(expected = "needs the panel priority")]
+    fn rank_only_refuses_a_priority_order() { let _ = CapPlan::rank_only(CapOrder::Hash); }
 
     #[test]
     fn prob_to_phred_endpoints() {
