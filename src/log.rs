@@ -228,9 +228,10 @@ pub fn available_ram_mb() -> Option<f64> {
 /// Room left under this process's cgroup memory limits, in MB: the least, over
 /// its cgroup and every ancestor that sets a limit, of the limit minus that
 /// group's usage (`memory.max` - `memory.current` on cgroup v2,
-/// `memory.limit_in_bytes` - `memory.usage_in_bytes` on v1), not counting the
-/// group's inactive file cache, which the kernel reclaims before it fails an
-/// allocation. A container's limit can sit far below the host's `MemAvailable`.
+/// `memory.limit_in_bytes` - `memory.usage_in_bytes` on v1), not counting this
+/// process's own group's inactive file cache, which the kernel reclaims before it
+/// fails an allocation (an ancestor's own figure is not used: it can hold a
+/// sibling's cache that `memory.min` protects from reclaim). A container's limit can sit far below the host's `MemAvailable`.
 /// The cache matters: a prod imputation task downloads its panel (7.5 GB for
 /// chr2) into a 6 GiB container, so the usage alone reads as a full container.
 /// `None` when no group on the path sets a limit (or the files cannot be read).
@@ -250,26 +251,27 @@ pub fn cgroup_headroom_mb() -> Option<f64> {
                          "total_inactive_file", path));
         }
     }
-    let room = |dir: &str, lim: &str, cur: &str, key: &str| -> Option<f64> {
+    // `cache`: this process's group's inactive file cache, part of every ancestor's usage too
+    let room = |dir: &str, lim: &str, cur: &str, cache: f64| -> Option<f64> {
         let (l, u) = (read(&format!("{dir}/{lim}"))?, read(&format!("{dir}/{cur}"))?);
         // v1 reports "no limit" as a huge page-aligned number
         if l >= (1u64 << 60) as f64 { return None; }
-        let cache = std::fs::read_to_string(format!("{dir}/memory.stat")).ok()
-            .map_or(0.0, |s| stat_value(&s, key)).min(u);
-        Some(((l - (u - cache)) / 1048576.0).max(0.0))
+        Some(((l - (u - cache.min(u))) / 1048576.0).max(0.0))
     };
     let mut best: Option<f64> = None;
     for (mount, lim, cur, key, path) in probes {
         // the group and each ancestor, up to the mount root
         let mut p = path.trim_end_matches('/').to_string();
+        let cache = std::fs::read_to_string(format!("{mount}{p}/memory.stat")).ok()
+            .map_or(0.0, |s| stat_value(&s, key));
         loop {
-            if let Some(r) = room(&format!("{mount}{p}"), lim, cur, key) {
+            if let Some(r) = room(&format!("{mount}{p}"), lim, cur, cache) {
                 best = Some(best.map_or(r, |b: f64| b.min(r)));
             }
             match p.rfind('/') { Some(k) => p.truncate(k), None => break }
             if p.is_empty() {
                 // the mount root itself
-                if let Some(r) = room(&mount, lim, cur, key) {
+                if let Some(r) = room(&mount, lim, cur, cache) {
                     best = Some(best.map_or(r, |b: f64| b.min(r)));
                 }
                 break;
