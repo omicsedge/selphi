@@ -420,6 +420,22 @@ pub struct Args {
     #[arg(long = "header-line", value_name = "TEXT", value_parser = selphi::io::vcf_fmt::parse_header_line)]
     pub header_line: Vec<String>,
 
+    /// Write in each ##contig line of the VCF/BCF result the length the INPUT's
+    /// header declares for that contig: a single-chromosome panel's line
+    /// ##contig=<ID=22> becomes ##contig=<ID=22,length=50818468> when the input
+    /// (VCF, VCF.gz or BCF) has ##contig=<ID=22,...,length=50818468,...>. The
+    /// contig keeps the name it is written with today; an input contig named chr22
+    /// gives 22 its length and the other way round; a length the panel declares is
+    /// replaced by the input's. A contig the input declares without a length (or
+    /// does not declare), or with one below the panel's last position (checked by
+    /// single-chromosome runs), is written as without the flag. Covers imputation, its
+    /// --sample-batch-size merges, --phase-only, whole-genome runs, lcWGS from a
+    /// PL VCF/BCF and --phase-panel from a VCF; a BAM/CRAM, SRP or BREF3 input has
+    /// no VCF header, so its run is written as without the flag. The .tbi/.csi
+    /// Selphi writes are built on the file as written.
+    #[arg(long)]
+    pub contig_length_from_input: bool,
+
     /// Leave out the target records that match no reference-panel site. By
     /// default they are written to the output at their position with their input
     /// genotypes (QUAL/FILTER/INFO '.'), neither phased nor imputed.

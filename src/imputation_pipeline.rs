@@ -1051,6 +1051,15 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
     let n_ref = srp.n_haps();
     let ref_positions: &[i64] = srp.variants.positions();
     selphi_step!("Loaded SRP: {} variants, {} haplotypes", n_ref_variants, n_ref);
+    // `--contig-length-from-input`: the result's ##contig line with the input's length
+    // (the panel's line unchanged without the flag, or when the input declares none, or a
+    // length below the panel's last position).
+    let contig_field = selphi::io::contig_length::InputContigLengths::for_run(args.contig_length_from_input, target_path)
+        .apply_logged(&srp.metadata.contig_field, |id| {
+            selphi::io::contig_length::same_contig(id, srp.chromosome())
+                .then(|| ref_positions.last().map(|&p| p.max(0) as u64)).flatten()
+        })
+        .into_owned();
 
     // Refuse chrY/chrMT: the Li-Stephens recombination model does not apply to a
     // non-recombining / haploid / homoplasmic contig (panels omit them too).
@@ -1270,8 +1279,8 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
             let out_path = selphi::common::utils::out_path(Path::new(output_path), "vcf.gz");
             write_phased_vcf(
                 &pr.phased_alleles, &target_markers, &target_idx, &wgs_idx,
-                &sample_names, &srp, n_chip, n_haps, &allele_transforms, &out_path,
-                passthrough.as_ref(), pr.phase_quality.as_deref(), &args.header_line,
+                &sample_names, n_chip, n_haps, &allele_transforms, &out_path,
+                passthrough.as_ref(), pr.phase_quality.as_deref(), &args.header_line, &contig_field,
             ).expect("Failed to write phased VCF");
             selphi_step!("Phase-only VCF: {}", out_path.display());
             selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB",
@@ -1401,7 +1410,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
     let out_path = PathBuf::from(output_path);
     let no_ap = args.no_ap;
     let (octx, writers) = setup_output_writers(
-        args, n_samples, &sample_names, &srp.metadata.contig_field, version, &out_path,
+        args, n_samples, &sample_names, &contig_field, version, &out_path,
         srp.n_variants() + passthrough.as_ref().map_or(0, |p| p.len()),
     );
     let OutputCtx { formats, out_file, target_batch_size_haps, skip_main_writer, batch_active } = octx;
@@ -1845,7 +1854,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
         &mut batch_writers, &mut vcf_batch_writers,
         &mut sd_batch_writers, &mut pgen_batch_writers, &mut parquet_batch_writers,
         &out_file, &out_path,
-        &sample_names, &srp.metadata.contig_field, version, no_ap, args.gp, &args.header_line,
+        &sample_names, &contig_field, version, no_ap, args.gp, &args.header_line,
     );
 
     // Capture output dimensions before srp is dropped (for the Output summary).
