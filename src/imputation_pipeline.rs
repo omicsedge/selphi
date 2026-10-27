@@ -358,6 +358,25 @@ struct PhasingResult {
     phase_quality: Option<Vec<u8>>,
 }
 
+/// The panel's alleles at the chip sites. With `then_interpolate` (the output stage
+/// reads the panel again) the run follows `srp::retain::plan`: when the panel's tiles
+/// do not fit the page cache next to the run, the head-most spans the extraction read
+/// stay held for the interpolation and the pages it is done with leave the cache.
+fn extract_chip_bitmatrix(srp: &SrpReader, wgs_idx: &[usize], then_interpolate: bool) -> selphi::common::HaplotypeBitmatrix {
+    let Some(tiled) = srp.tiled.as_ref().filter(|_| then_interpolate) else {
+        return srp.extract_ref_alleles_bitmatrix(wgs_idx);
+    };
+    let bitmatrix_bytes = (wgs_idx.len() * srp.n_haps().div_ceil(64) * 8) as u64;
+    let plan = selphi::srp::retain::plan(tiled.tile_bytes(), bitmatrix_bytes);
+    selphi::srp::retain::set_limited(plan.limited.then(|| tiled.file_path()), plan.drop_cache);
+    if !plan.limited && plan.hold == 0 { return srp.extract_ref_alleles_bitmatrix(wgs_idx); }
+    let bm = srp.extract_ref_alleles_bitmatrix_retaining(wgs_idx, plan);
+    selphi_step!("Panel tiles ({:.0} MB) larger than the page cache can keep here: {:.0} MB held in RAM for the interpolation{}",
+        tiled.tile_bytes() as f64 / 1e6, selphi::srp::retain::held_bytes() as f64 / 1e6,
+        if plan.limited { ", windows prefetch during the HMM" } else { "" });
+    bm
+}
+
 /// Run the diploid phasing engine. Extracts the full reference bitmatrix
 /// (shared with downstream imputation) and phases on the common-MAF scaffold.
 fn run_phasing(inp: &PhasingInputs) -> PhasingResult {
@@ -390,7 +409,8 @@ fn run_phasing(inp: &PhasingInputs) -> PhasingResult {
         } else { true }
     };
     let mut ref_bm_full = if want_full {
-        let bm = srp.extract_ref_alleles_bitmatrix(wgs_idx);
+        // The interpolation reads the panel again (not on the phase-only path).
+        let bm = extract_chip_bitmatrix(srp, wgs_idx, !args.phase_only);
         selphi_step!("Ref bitmatrix extracted ({} target sites × {} haps, {:.1} MB)",
             n_chip, n_ref, (bm.n_words() * n_chip * 8) as f64 / 1e6);
         Some(bm)
@@ -1360,7 +1380,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
     // ref_bm_full was extracted for phasing, reuse for imputation. For pre-phased
     // input (no phasing ran), extract now.
     let ref_bm_imp = ref_bm_from_phasing.unwrap_or_else(|| {
-        let bm = srp.extract_ref_alleles_bitmatrix(&wgs_idx);
+        let bm = extract_chip_bitmatrix(&srp, &wgs_idx, true);
         selphi_step!("Ref bitmatrix extracted ({} target sites × {} haps, {:.1} MB)",
             n_chip, n_ref, (bm.n_words() * n_chip * 8) as f64 / 1e6);
         bm
@@ -1515,6 +1535,9 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
     // The output's interpolation coordinate per chip site (ImputeWindowInputs::interp_x).
     let interp_x: Vec<f64> = wgs_idx.iter()
         .map(|&wi| interp_cum_cm.as_ref().map_or(wi as f64, |c| c[wi])).collect();
+    // RSS a window's HMM grew by per chip site, at most, over the windows so far (net of
+    // panel spans prefetched meanwhile): the next windows' prefetch sizes against it.
+    let mut window_growth_per_var: Option<f64> = None;
     for (wi, window) in windows.iter().enumerate() {
         let t0_win = Instant::now();
         let cpu0_win = selphi::log::cpu_time_secs();
@@ -1543,7 +1566,44 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
         let mut chunk_preload_handle: Option<std::thread::JoinHandle<Vec<Option<selphi::srp::CscChunk>>>> = None;
         let mut stripe_preload_handle: Option<std::thread::JoinHandle<Option<selphi::srp::tiled::PreloadedStripes>>> = None;
 
-        if srp.is_tiled() {
+        // On a cache-limited run a companion thread runs through the HMM
+        // (`srp::retain::window_io`): it prefetches the window's stripes into held
+        // spans as far as `window_prefetch_limit` allows (the interpolation's reads
+        // take them from there; the disk is otherwise idle here), measures the
+        // window's working set for the next windows' limits, and releases spans if the
+        // room runs short. Not under sample batching (its output reads each window once
+        // per sample batch, during the HMM).
+        let window_io_on = srp.is_tiled() && !batched_any_active && selphi::srp::retain::limited();
+        let mut window_io: Option<(Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<selphi::srp::retain::WindowIo>, usize)> = None;
+        let net_win_start = selphi::log::rss_mb() - selphi::srp::retain::held_bytes() as f64 / 1048576.0;
+        let growth = match window_growth_per_var {
+            Some(g) => selphi::srp::retain::Growth::Measured(g * n_var_w as f64),
+            None if needs_phasing => selphi::srp::retain::Growth::PeakSoFar,
+            None => selphi::srp::retain::Growth::Unknown,
+        };
+        if window_io_on && let selphi::srp::retain::Growth::Measured(g) = growth {
+            // Spans held for later windows give way to this window's expected growth.
+            selphi::srp::retain::trim_to_room(g + selphi::srp::retain::ROOM_FLOOR_MB);
+        }
+        let prefetch_limit = if window_io_on { selphi::srp::retain::window_prefetch_limit(growth) } else { 0 };
+        if window_io_on {
+            let tiled = srp.tiled.as_ref().unwrap();
+            let tiled_path = std::path::Path::new(&args.refpanel).to_path_buf();
+            let own_start = if window.own_chip_start == 0 { 0 } else { wgs_idx[window.own_chip_start] };
+            // From the window's first stripe on, past its end too (the next windows
+            // find what they need held), as far as the limit allows.
+            let (start, end) = (tiled.stripe_offset(own_start / 1024), tiled.stripe_offset(tiled.n_tile_rows));
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop = Arc::clone(&cancel);
+            let handle = std::thread::spawn(move || {
+                let file = std::fs::File::open(&tiled_path).ok();
+                selphi::srp::retain::window_io(file.as_ref(), start, end, prefetch_limit, &stop,
+                    &selphi::srp::retain::mem_probe)
+            });
+            window_io = Some((cancel, handle, prefetch_limit));
+        }
+        if srp.is_tiled() && prefetch_limit == 0 {
+            // (A prefetch replaces this preload.)
             // Preload compressed stripe data during HMM (1 thread, sequential I/O)
             // Enabled for ALL output formats (unified interpolation path benefits from preloading)
             let tiled_path = std::path::Path::new(&args.refpanel).to_path_buf();
@@ -1561,7 +1621,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
                 let n_load = (500 * 1024 * 1024 / stripe_comp.max(1)).max(10).min(n_stripes);
                 tiled.preload_stripes(first_stripe, n_load).ok()
             }));
-        } else {
+        } else if !srp.is_tiled() {
             let srp_clone = Arc::clone(&srp);
             let own_start = if window.own_chip_start == 0 { 0 } else { wgs_idx[window.own_chip_start] };
             let own_end = if window.own_chip_end >= wgs_idx.len() { srp.n_variants() } else { wgs_idx[window.own_chip_end] };
@@ -1765,6 +1825,24 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
         let preloaded = chunk_preload_handle.take().map(|h| h.join().expect("chunk preload panicked"));
         let preloaded_stripes = stripe_preload_handle.take()
             .and_then(|h| h.join().expect("stripe preload panicked"));
+        let mut prefetch_note = String::new();
+        if let Some((cancel, handle, limit)) = window_io.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            handle.thread().unpark();
+            let io = handle.join().expect("window I/O thread panicked");
+            // This window's working set (HMM, net of held spans), per chip site.
+            if n_var_w > 0 {
+                let grown = (io.peak_net_mb - net_win_start).max(0.0) / n_var_w as f64;
+                window_growth_per_var = Some(window_growth_per_var.map_or(grown, |g| g.max(grown)));
+            }
+            // The interpolation's buffers come before held spans.
+            let released = io.released + selphi::srp::retain::trim_to_room(selphi::srp::retain::ROOM_FLOOR_MB);
+            if limit > 0 || released > 0 {
+                prefetch_note = format!(", panel prefetch {:.0} MB ({:.0} MB held, limit {:.0} MB{})",
+                    io.read as f64 / 1e6, selphi::srp::retain::held_bytes() as f64 / 1e6, limit as f64 / 1e6,
+                    if released > 0 { format!(", {:.0} MB released for room", released as f64 / 1e6) } else { String::new() });
+            }
+        }
         let cpu_preload = selphi::log::cpu_time_secs();
 
         
@@ -1835,10 +1913,14 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
                 interp_secs, pct(cpu_interp_d, interp_secs),
                 cpu_pct);
         }
-        selphi_info!("    Window {}/{}: PBWT={:.1}s interp={:.1}s ({} vars)",
-            wi_log, n_win, pbwt_secs, interp_secs, n_var_w);
+        selphi_info!("    Window {}/{}: PBWT={:.1}s interp={:.1}s ({} vars{})",
+            wi_log, n_win, pbwt_secs, interp_secs, n_var_w, prefetch_note);
 
     }
+    // Whatever the extraction left held that no read took (the panel is read in full
+    // by now): released.
+    selphi::srp::retain::release_all();
+    selphi::srp::retain::set_limited(None, false);
 
     // Finalize per-format per-batch writers + merge into bit-identical output.
     finalize_batched_outputs(

@@ -1797,8 +1797,16 @@ pub fn write_window_multiformat(
         // Decompressed stripes a group may span (at least one tile's worth).
         let group_stripes = (GROUP_BYTES / bytes_per_stripe.max(1)).max(8);
 
+        // While panel spans are held (`srp::retain`), a compressed read's buffer is
+        // reserved before it is allocated: far spans give way if the room is short.
+        let reserve_read = |bytes: usize| if crate::srp::retain::held_bytes() > 0 {
+            crate::srp::retain::trim_to_room(crate::srp::retain::ROOM_FLOOR_MB + bytes as f64 / 1048576.0);
+        };
         let mut stripe_loaded: Option<crate::srp::tiled::PreloadedStripes> = preloaded_stripes;
         let mut next_io_handle: Option<std::thread::JoinHandle<std::io::Result<crate::srp::tiled::PreloadedStripes>>> = None;
+        // Bytes of the background read in flight: its buffer's pages are touched later,
+        // so the room the group reservations see does not account for them yet.
+        let mut pending_read = 0usize;
         // Compressed-read buffers are allocated on this thread and recycled: a
         // buffer the background reader allocated and this thread freed lingered
         // in the allocator (`TiledSrpReader::preload_stripes_into`). A spent
@@ -1825,6 +1833,7 @@ pub fn write_window_multiformat(
                 l.contains_stripe(b_first_stripe) && l.contains_stripe(b_last_stripe));
             if !loaded_ok {
                 if let Some(handle) = next_io_handle.take() {
+                    pending_read = 0;
                     match handle.join().expect("stripe I/O panicked") {
                         Ok(loaded) if loaded.contains_stripe(b_first_stripe) && loaded.contains_stripe(b_last_stripe) => {
                             if let Some(old) = stripe_loaded.replace(loaded) { spare_buf = Some(old.buf); }
@@ -1832,6 +1841,7 @@ pub fn write_window_multiformat(
                         _ => {
                             if let Some(old) = stripe_loaded.take() { spare_buf = Some(old.buf); }
                             let n = preload_n(b_first_stripe, b_n_stripes);
+                            reserve_read(tiled.stripes_read_len(b_first_stripe, n));
                             let buf = take_buf(&mut spare_buf, tiled.stripes_read_len(b_first_stripe, n));
                             stripe_loaded = Some(tiled.preload_stripes_into(b_first_stripe, n, buf)?);
                         }
@@ -1839,12 +1849,20 @@ pub fn write_window_multiformat(
                 } else {
                     if let Some(old) = stripe_loaded.take() { spare_buf = Some(old.buf); }
                     let n = preload_n(b_first_stripe, b_n_stripes);
+                    reserve_read(tiled.stripes_read_len(b_first_stripe, n));
                     let buf = take_buf(&mut spare_buf, tiled.stripes_read_len(b_first_stripe, n));
                     stripe_loaded = Some(tiled.preload_stripes_into(b_first_stripe, n, buf)?);
                 }
             }
             let loaded = stripe_loaded.as_ref().unwrap();
             t_io += tp.elapsed().as_secs_f64();
+            // Nothing before this batch is read again: tile spans held for these reads
+            // (`srp::retain`) are released, and a cache-limited run drops those pages.
+            crate::srp::retain::consumed_before(tiled.file_path(), tiled.stripe_offset(b_first_stripe));
+            // Spans still held for later reads give way when the room runs short.
+            if crate::srp::retain::held_bytes() > 0 {
+                crate::srp::retain::trim_to_room(crate::srp::retain::ROOM_FLOOR_MB);
+            }
 
             // Background I/O for next batch
             if bi + 1 < batches.len() {
@@ -1856,6 +1874,8 @@ pub fn write_window_multiformat(
                     let n_h = tiled.n_haps();
                     let n_load = preload_n(next_fs, next_ns);
                     let fs = next_fs;
+                    reserve_read(tiled.stripes_read_len(fs, n_load));
+                    pending_read = tiled.stripes_read_len(fs, n_load);
                     let buf = take_buf(&mut spare_buf, tiled.stripes_read_len(fs, n_load));
                     next_io_handle = Some(std::thread::spawn(move || {
                         let t = crate::srp::tiled::TiledSrpReader::open(&tiled_path, n_v, n_h)?;
@@ -1894,6 +1914,23 @@ pub fn write_window_multiformat(
                 }
                 let group = &batch_descs[g0..g1];
                 let g_last_stripe = desc_stripes(&group[group.len() - 1]).1;
+                if crate::srp::retain::held_bytes() > 0 {
+                    // Panel spans held for later reads (`srp::retain`) give way to this
+                    // group's allocations: its arena growth, formatted output and an
+                    // upper bound on what the stripes it decodes take.
+                    let new_from = (dec_lo + stripe_tiles.len()).max(g_first_stripe);
+                    let (decode, largest, largest_comp) = if new_from <= g_last_stripe {
+                        loaded.decoded_bound(new_from, g_last_stripe)
+                    } else { (0, 0, 0) };
+                    // Each decoding worker also keeps a reused buffer, which may grow
+                    // (old and new capacity both live while it moves), may hold a second
+                    // raw copy while a tile too big for it is decoded the slow way, and
+                    // a decoder context (under 1 MiB).
+                    let buffer = crate::srp::tiled::PreloadedStripes::decoder_buffer_bound(largest_comp, largest);
+                    let scratch = rayon::current_num_threads() * (2 * buffer + largest + (1 << 20));
+                    let need = floats.saturating_sub(arena.len()) * 4 + text + decode + scratch + pending_read;
+                    crate::srp::retain::trim_to_room(crate::srp::retain::ROOM_FLOOR_MB + need as f64 / 1048576.0);
+                }
                 if arena.len() < floats { arena.resize(floats, 0.0); }
 
                 // 0. Stripes for this group: retire those behind it, decompress the
@@ -1909,6 +1946,7 @@ pub fn write_window_multiformat(
                         .into_par_iter()
                         .map(|t| loaded.decompress_tile(t / n_tile_cols, t % n_tile_cols))
                         .collect();
+
                     let mut it = flat.into_iter();
                     for _ in new_from..=g_last_stripe {
                         stripe_tiles.push(it.by_ref().take(n_tile_cols).collect());
