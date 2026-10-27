@@ -317,15 +317,24 @@ fn tsv_row(out: &LcwgsOutput, srp: &SrpReader, v: usize, line: &mut Vec<u8>) -> 
 }
 
 /// Write the lcWGS imputation result as a bgzipped VCF plus its `.tbi`
-/// (`extra_header`: the `--header-line` lines, written after `##source`).
-pub fn write_lcwgs_vcf(out: &LcwgsOutput, srp: &SrpReader, output_path: &std::path::Path, extra_header: &[String]) -> std::io::Result<()> {
-    write_lcwgs_vcf_budget(out, srp, output_path, extra_header, WRITER_BUF - PAR_BUFWRITER)
+/// (`extra_header`: the `--header-line` lines, written after `##source`;
+/// `contig_lengths`: the input header's lengths under `--contig-length-from-input`).
+pub fn write_lcwgs_vcf(
+    out: &LcwgsOutput, srp: &SrpReader, output_path: &std::path::Path, extra_header: &[String],
+    contig_lengths: &crate::io::contig_length::InputContigLengths,
+) -> std::io::Result<()> {
+    write_lcwgs_vcf_budget(out, srp, output_path, extra_header, contig_lengths, WRITER_BUF - PAR_BUFWRITER)
 }
 
 /// [`write_lcwgs_vcf`] with an explicit formatting-pool budget (tests force
 /// tiny blocks and serial rows; the bytes do not depend on it).
-fn write_lcwgs_vcf_budget(out: &LcwgsOutput, srp: &SrpReader, output_path: &std::path::Path, extra_header: &[String], pool_budget: usize) -> std::io::Result<()> {
-    let lines = contig_lines_for(srp, out)?;
+fn write_lcwgs_vcf_budget(
+    out: &LcwgsOutput, srp: &SrpReader, output_path: &std::path::Path, extra_header: &[String],
+    contig_lengths: &crate::io::contig_length::InputContigLengths, pool_budget: usize,
+) -> std::io::Result<()> {
+    let last = srp.variants.positions().last().map(|&p| p.max(0) as u64);
+    let own = |id: &str| crate::io::contig_length::same_contig(id, srp.chromosome()).then_some(last).flatten();
+    let lines = contig_lengths.apply_logged(&contig_lines_for(srp, out)?, own).into_owned();
     let mut w = LcwgsVcfWriter::create_budget(output_path, &out.sample_ids, &lines, extra_header, pool_budget)?;
     w.append(out, srp)?;
     w.finish()
@@ -694,7 +703,7 @@ mod tests {
             for budget in [1usize, 300, 3_000, 40_000, 1 << 20, WRITER_BUF - PAR_BUFWRITER] {
                 let got_vcf = dir.path().join(format!("got{n_samples}_{budget}.vcf.gz"));
                 let got_tsv = dir.path().join(format!("got{n_samples}_{budget}.tsv.gz"));
-                write_lcwgs_vcf_budget(&out, &srp, &got_vcf, &[], budget).unwrap();
+                write_lcwgs_vcf_budget(&out, &srp, &got_vcf, &[], &crate::io::contig_length::InputContigLengths::none(), budget).unwrap();
                 write_dose_tsv_budget(&out, &srp, &got_tsv, budget).unwrap();
                 assert_eq!(gunzip(&got_vcf), gunzip(&want_vcf), "VCF n_samples={n_samples} budget={budget}");
                 assert_eq!(gunzip(&got_tsv), gunzip(&want_tsv), "TSV n_samples={n_samples} budget={budget}");

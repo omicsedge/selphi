@@ -216,6 +216,16 @@ impl SrpReader {
         tiled.extract_bitmatrix(self.metadata.n_haps, wgs_idx)
     }
 
+    /// `extract_ref_alleles_bitmatrix` under a `srp::retain::Plan`: the head-most tile
+    /// spans it read held in RAM for the interpolation's reads (`plan.hold` bytes), and
+    /// on a cache-limited run the page cache left with the next `plan.keep_cached`.
+    pub fn extract_ref_alleles_bitmatrix_retaining(&self, wgs_idx: &[usize], plan: super::retain::Plan)
+        -> crate::common::HaplotypeBitmatrix {
+        let tiled = self.tiled.as_ref()
+            .expect("Tiled backend required. Regenerate: selphi --prepare-reference-from panel.bcf --out panel");
+        tiled.extract_bitmatrix_retaining(self.metadata.n_haps, wgs_idx, plan.hold, plan.keep_cached)
+    }
+
     /// A panel of variant IDs only (no genotypes), for output-formatting tests.
     #[cfg(test)]
     pub(crate) fn with_ids_for_tests(ids: Vec<String>, original_ids: Vec<String>) -> Self {

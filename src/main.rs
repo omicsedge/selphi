@@ -274,6 +274,14 @@ fn main() {
         if args.gp {
             selphi_info!("  Note: --gp has no effect on the lcWGS engine, whose VCF always carries its own GP");
         }
+        // `--contig-length-from-input`: lengths from a PL VCF/BCF's header; aligned reads have none.
+        let contig_lengths = if bam_mode && args.contig_length_from_input {
+            selphi_info!("  WARNING: --contig-length-from-input: aligned reads (BAM/CRAM) have no VCF header; \
+                contig lines written as without the flag");
+            selphi::io::contig_length::InputContigLengths::none()
+        } else {
+            selphi::io::contig_length::InputContigLengths::for_run(args.contig_length_from_input, input)
+        };
 
         let start = std::time::Instant::now();
 
@@ -334,7 +342,7 @@ fn main() {
                 Some(f) => selphi::lcwgs::multi::Panels::Files(f.clone()),
                 None => selphi::lcwgs::multi::Panels::Multi(refpanel.to_string()),
             };
-            selphi::lcwgs::multi::run(panels, inp, maps, &params, args.threads, &vcf_path, &tsv_path, &args.header_line)
+            selphi::lcwgs::multi::run(panels, inp, maps, &params, args.threads, &vcf_path, &tsv_path, &args.header_line, &contig_lengths)
                 .unwrap_or_else(|e| exit_on_io(&e, || eprintln!("lcWGS pipeline failed: {}", e)));
             selphi_step!("wrote imputed VCF: {}", vcf_path.display());
             selphi_step!("wrote dosage TSV: {}", tsv_path.display());
@@ -405,7 +413,7 @@ fn main() {
                 "  ls-exact done: {} variants × {} samples in {:.1}s",
                 result.n_variants, result.sample_ids.len(), start.elapsed().as_secs_f32(),
             );
-            if let Err(e) = selphi::lcwgs::output::write_lcwgs_vcf(&result, &srp, &vcf_path, &args.header_line) {
+            if let Err(e) = selphi::lcwgs::output::write_lcwgs_vcf(&result, &srp, &vcf_path, &args.header_line, &contig_lengths) {
                 eprintln!("Failed to write {}: {}", vcf_path.display(), e);
                 std::process::exit(1);
             }
@@ -425,7 +433,7 @@ fn main() {
             result.n_variants, n_out, if n_out == 1 { "" } else { "s" });
 
         // Write imputed VCF.gz with GT:DS:GP.
-        if let Err(e) = selphi::lcwgs::output::write_lcwgs_vcf(&result, &srp, &vcf_path, &args.header_line) {
+        if let Err(e) = selphi::lcwgs::output::write_lcwgs_vcf(&result, &srp, &vcf_path, &args.header_line, &contig_lengths) {
             eprintln!("Failed to write {}: {}", vcf_path.display(), e);
             std::process::exit(1);
         }

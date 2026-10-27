@@ -974,7 +974,6 @@ pub fn write_phased_vcf(
     target_idx: &[usize],        // chip → target marker index
     wgs_idx: &[usize],           // chip → WGS variant index (orders passthrough records)
     sample_names: &[String],
-    srp: &SrpReader,
     n_chip: usize,
     n_haps: usize,
     transforms: &[u8],           // chip → allele-match transform (1 = REF/ALT-swapped)
@@ -986,6 +985,9 @@ pub fn write_phased_vcf(
     pq: Option<&[u8]>,
     // `--header-line` lines, written after ##source.
     extra_header: &[String],
+    // The ##contig line(s): the panel's (`srp.metadata.contig_field`), with the input's
+    // length under `--contig-length-from-input`.
+    contig_field: &str,
 ) -> std::io::Result<()> {
     use std::io::{Write, BufWriter};
 
@@ -997,7 +999,7 @@ pub fn write_phased_vcf(
         .build_from_writer(file);
     let mut w = BufWriter::with_capacity(4 << 20, bgzf);
 
-    write_gt_vcf_header(&mut w, "", Some(srp.metadata.contig_field.as_str()), sample_names, pq.is_some(), extra_header)?;
+    write_gt_vcf_header(&mut w, "", Some(contig_field), sample_names, pq.is_some(), extra_header)?;
 
     let mut line_buf = String::with_capacity(n_samples * 6);
     // Passthrough records go before the first panel variant past their position.
@@ -1065,6 +1067,8 @@ pub fn write_panel_vcf(
     n_haps: usize,
     output_path: &Path,
     extra_header: &[String],
+    // `--contig-length-from-input`: the input header's contig lengths (none when off).
+    contig_lengths: &crate::io::contig_length::InputContigLengths,
 ) -> std::io::Result<()> {
     use std::io::{Write, BufWriter};
     let n_samples = n_haps / 2;
@@ -1075,7 +1079,7 @@ pub fn write_panel_vcf(
         .build_from_writer(file);
     let mut w = BufWriter::with_capacity(4 << 20, bgzf);
 
-    let contig = markers.first().map(|m0| format!("##contig=<ID={}>", m0.chrom));
+    let contig = markers.first().map(|m0| contig_lengths.apply_logged(&format!("##contig=<ID={}>", m0.chrom), |_| None).into_owned());
     write_gt_vcf_header(&mut w, " (panel-phasing)", contig.as_deref(), sample_names, false, extra_header)?;
 
     let mut line_buf = String::with_capacity(n_samples * 4);
@@ -2278,9 +2282,11 @@ pub struct PanelVcfWriter {
 }
 
 impl PanelVcfWriter {
-    /// Create the writer and emit the header (contig taken from `chrom`).
+    /// Create the writer and emit the header (contig taken from `chrom`, with the input's
+    /// length from `contig_lengths` under `--contig-length-from-input`).
     pub fn create(
         output_path: &Path, sample_names: &[String], chrom: &str, n_haps: usize, extra_header: &[String],
+        contig_lengths: &crate::io::contig_length::InputContigLengths,
     ) -> std::io::Result<Self> {
         use std::io::BufWriter;
         let file = std::fs::File::create(output_path)?;
@@ -2289,6 +2295,7 @@ impl PanelVcfWriter {
             .build_from_writer(file);
         let mut w = BufWriter::with_capacity(4 << 20, bgzf);
         let contig = format!("##contig=<ID={}>", chrom);
+        let contig = contig_lengths.apply_logged(&contig, |_| None);
         write_gt_vcf_header(&mut w, " (panel-phasing)", Some(&contig), sample_names, false, extra_header)?;
         Ok(Self { w, n_samples: n_haps / 2, n_haps, line_buf: String::with_capacity(n_haps * 2), path: output_path.to_path_buf() })
     }
