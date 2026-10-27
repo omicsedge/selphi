@@ -23,23 +23,57 @@ fn mix(mut x: u64) -> u64 {
 pub fn allele_classes(ref_bm: &HaplotypeBitmatrix, chip_start: usize, n_chip: usize, n_haps: usize) -> Vec<u32> {
     use rayon::prelude::*;
     const BLOCK: usize = 1024; // haplotypes per task, a multiple of 64
+    // Fingerprint: per 64-site block, each haplotype's word of those sites (site
+    // v at bit v % 64), mixed into its running value. The words come from 64x64
+    // bit transposes of the rows, 64 haplotypes at a time.
     let blocks: Vec<Vec<u64>> = (0..n_haps.div_ceil(BLOCK)).into_par_iter().map(|b| {
         let (h0, h1) = (b * BLOCK, ((b + 1) * BLOCK).min(n_haps));
-        let (mut fp, mut word) = (vec![0u64; h1 - h0], vec![0u64; h1 - h0]);
-        for v in 0..n_chip {
-            let row = ref_bm.row(chip_start + v);
-            let sh = v % 64;
-            for h in h0..h1 { word[h - h0] |= ((row[h / 64] >> (h % 64)) & 1) << sh; }
-            if sh == 63 {
-                for i in 0..h1 - h0 { fp[i] = mix(fp[i] ^ word[i]); word[i] = 0; }
+        let w0 = h0 / 64;
+        let nwb = (h1 - h0).div_ceil(64);
+        let mut fp = vec![0u64; nwb * 64];
+        let mut t = [0u64; 64];
+        for v0 in (0..n_chip).step_by(64) {
+            let nv = (n_chip - v0).min(64);
+            for wi in 0..nwb {
+                for (i, x) in t.iter_mut().enumerate() {
+                    *x = if i < nv { ref_bm.row(chip_start + v0 + i)[w0 + wi] } else { 0 };
+                }
+                crate::common::bitmatrix::transpose64(&mut t);
+                for (f, &x) in fp[wi * 64..wi * 64 + 64].iter_mut().zip(t.iter()) { *f = mix(*f ^ x); }
             }
         }
-        if n_chip % 64 != 0 {
-            for i in 0..h1 - h0 { fp[i] = mix(fp[i] ^ word[i]); }
-        }
+        fp.truncate(h1 - h0);
         fp
     }).collect();
     let fp: Vec<u64> = blocks.concat();
+    let same = |a: usize, b: usize| (0..n_chip).all(|v| {
+        let r = ref_bm.row(chip_start + v);
+        (r[a / 64] >> (a % 64)) & 1 == (r[b / 64] >> (b % 64)) & 1
+    });
+    let mut reps: HashMap<u64, Vec<u32>> = HashMap::with_capacity(n_haps);
+    let mut class = vec![0u32; n_haps];
+    for h in 0..n_haps {
+        let bucket = reps.entry(fp[h]).or_default();
+        match bucket.iter().find(|&&r| same(r as usize, h)) {
+            Some(&r) => class[h] = r,
+            None => { bucket.push(h as u32); class[h] = h as u32; }
+        }
+    }
+    class
+}
+
+/// `allele_classes` before the transposed fingerprint (test oracle).
+#[cfg(test)]
+fn legacy_allele_classes(ref_bm: &HaplotypeBitmatrix, chip_start: usize, n_chip: usize, n_haps: usize) -> Vec<u32> {
+    let mut fp = vec![0u64; n_haps];
+    let mut word = vec![0u64; n_haps];
+    for v in 0..n_chip {
+        let row = ref_bm.row(chip_start + v);
+        let sh = v % 64;
+        for h in 0..n_haps { word[h] |= ((row[h / 64] >> (h % 64)) & 1) << sh; }
+        if sh == 63 { for i in 0..n_haps { fp[i] = mix(fp[i] ^ word[i]); word[i] = 0; } }
+    }
+    if n_chip % 64 != 0 { for i in 0..n_haps { fp[i] = mix(fp[i] ^ word[i]); } }
     let same = |a: usize, b: usize| (0..n_chip).all(|v| {
         let r = ref_bm.row(chip_start + v);
         (r[a / 64] >> (a % 64)) & 1 == (r[b / 64] >> (b % 64)) & 1
@@ -321,6 +355,26 @@ mod tests {
         assert_eq!(representatives, vec![0, 1, 2, 2]);
         assert_eq!(sizes, vec![1, 1, 2, 1]);
         assert_eq!(members, vec![Some(vec![0]), Some(vec![1]), Some(vec![2, 3]), None]);
+    }
+
+    #[test]
+    fn transposed_classes_match_the_bitwise_ones() {
+        let mut x: u64 = 0x1234_5678_9ABC_DEF1;
+        let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        for case in 0..40 {
+            let n_haps = [1usize, 63, 64, 65, 1023, 1024, 1025, 2100][case % 8];
+            let n_sites = [1usize, 63, 64, 65, 130, 200][case % 6] + 3;
+            let chip_start = case % 3;
+            let n_chip = n_sites - chip_start - (case % 2);
+            let founders: Vec<Vec<bool>> = (0..9).map(|_| (0..n_sites).map(|_| next() % 3 == 0).collect()).collect();
+            let of: Vec<usize> = (0..n_haps).map(|_| (next() % 9) as usize).collect();
+            let flip: Vec<(usize, usize)> = (0..n_haps / 7).map(|_| ((next() as usize) % n_haps, (next() as usize) % n_sites)).collect();
+            let bm = HaplotypeBitmatrix::from_panel(n_sites, n_haps,
+                &|v, h| founders[of[h]][v] ^ flip.contains(&(h, v)), &vec![true; n_sites]);
+            assert_eq!(allele_classes(&bm, chip_start, n_chip, n_haps),
+                       legacy_allele_classes(&bm, chip_start, n_chip, n_haps), "case {case}");
+            assert_eq!(allele_classes(&bm, chip_start, 0, n_haps), legacy_allele_classes(&bm, chip_start, 0, n_haps));
+        }
     }
 
     #[test]

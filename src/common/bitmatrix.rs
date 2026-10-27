@@ -261,3 +261,38 @@ impl HaplotypeBitmatrix {
     #[inline(always)]
     pub fn bits_ptr(&self) -> *const u64 { self.bits.as_ptr() }
 }
+
+/// In-place 64x64 bit transpose: afterwards bit `c` of `a[r]` is bit `r` of the
+/// original `a[c]` (rows of a 64-site x 64-haplotype block become, per haplotype,
+/// one word of its 64 sites, the first site in the least significant bit).
+pub fn transpose64(a: &mut [u64; 64]) {
+    let mut j = 32usize;
+    let mut m: u64 = 0x0000_0000_FFFF_FFFF;
+    while j != 0 {
+        let mut k = 0usize;
+        while k < 64 {
+            // swap the high j bits of a[k] with the low j bits of a[k + j]
+            let t = ((a[k] >> j) ^ a[k + j]) & m;
+            a[k] ^= t << j;
+            a[k + j] ^= t;
+            k = (k + j + 1) & !j;
+        }
+        j >>= 1;
+        m ^= m << j;
+    }
+}
+
+#[cfg(test)]
+mod transpose_tests {
+    #[test]
+    fn transpose64_matches_naive() {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..50 {
+            let mut a = [0u64; 64];
+            for x in a.iter_mut() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; *x = s; }
+            let orig = a;
+            super::transpose64(&mut a);
+            for r in 0..64 { for c in 0..64 { assert_eq!((a[r] >> c) & 1, (orig[c] >> r) & 1); } }
+        }
+    }
+}

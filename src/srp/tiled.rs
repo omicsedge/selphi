@@ -222,15 +222,110 @@ impl PreloadedStripes {
         stripe >= self.first_stripe && stripe < self.first_stripe + self.n_stripes
     }
 
+    /// Decode one tile and call `f` with it read in place (no `SparseTile`): the
+    /// decoded bytes, checked as `SparseTile::from_bytes` checks them (same
+    /// panics), viewed as words, with `TILE_PAD` zero bytes after the row indices.
+    /// Within a decoder scope the thread's reused buffer holds it; otherwise, or
+    /// when that buffer does not fit or the tile is LZ4 or not aligned, an owned
+    /// buffer does.
+    pub fn with_tile<R>(&self, stripe: usize, band: usize, f: impl FnOnce(&TileView<'_>) -> R) -> R {
+        let local = (stripe - self.first_stripe) * self.n_tile_cols + band;
+        let (off, len) = self.offsets[local];
+        let compressed = &self.buf[off..off + len];
+        let zstd = compressed.len() >= 4 && compressed[0] == 0x28 && compressed[1] == 0xB5 && compressed[2] == 0x2F && compressed[3] == 0xFD;
+        let mut f = Some(f);
+        let cached = zstd && decoder_cache_enabled();
+        if cached {
+            let done = ZSTD_TILE_DECODER.with(|cell| {
+                // `f` does no decoding of its own, so this borrow is not re-entered.
+                let mut cell = cell.borrow_mut();
+                if cell.is_none() {
+                    *cell = Some(ZstdTileDecoder { dec: zstd::bulk::Decompressor::new().ok()?, buf: Vec::new() });
+                }
+                let d = cell.as_mut().unwrap();
+                d.buf.clear();
+                let want = (compressed.len() * 8).max(1 << 20);
+                if d.buf.capacity() < want { d.buf.reserve(want); }
+                d.dec.decompress_to_buffer(compressed, &mut d.buf).ok()?;
+                let raw_len = d.buf.len();
+                d.buf.resize(raw_len + TILE_PAD, 0);
+                let view = TileView::parse(&d.buf, raw_len)?;
+                Some((f.take().unwrap())(&view))
+            });
+            if let Some(r) = done { return r; }
+        }
+        let raw = if zstd {
+            let raw = zstd::decode_all(std::io::Cursor::new(compressed)).unwrap_or_else(|e|
+                panic!("zstd decompress failed at stripe={} band={} (comp_len={}): {}", stripe, band, len, e));
+            if cached { zstd_tile_grow(raw.len()); }
+            raw
+        } else {
+            lz4_flex::decompress_size_prepended(compressed).unwrap_or_else(|e|
+                panic!("LZ4 decompress failed at stripe={} band={} (comp_len={}): {}", stripe, band, len, e))
+        };
+        // An owned, word-aligned copy (a Vec<u64>'s bytes) with the padding.
+        let raw_len = raw.len();
+        let mut words = vec![0u64; (raw_len + TILE_PAD).div_ceil(8)];
+        // SAFETY: `words` holds at least raw_len + TILE_PAD bytes.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * 8) };
+        bytes[..raw_len].copy_from_slice(&raw);
+        match TileView::parse(bytes, raw_len) {
+            Some(view) => (f.take().unwrap())(&view),
+            None => {
+                // Big-endian host: the tile as decoded today, re-serialised
+                // little-endian is what TileView reads, so read SparseTile instead.
+                let t = super::SparseTile::from_bytes(&raw);
+                let mut ix: Vec<u16> = t.indices.clone();
+                ix.resize(t.indices.len() + TILE_PAD / 2, 0);
+                let view = TileView { n_rows: t.n_rows, n_cols: t.n_cols as usize, nnz: t.indices.len(),
+                    indptr: &t.indptr, indices: &ix };
+                (f.take().unwrap())(&view)
+            }
+        }
+    }
+}
+
+/// Zero bytes `PreloadedStripes::with_tile` puts after a tile's row indices, so
+/// a 32-row window loaded at any column start stays inside the buffer.
+pub const TILE_PAD: usize = 64;
+
+/// A decoded tile read in place (see `PreloadedStripes::with_tile`).
+pub struct TileView<'a> {
+    pub n_rows: u16,
+    pub n_cols: usize,
+    pub nnz: usize,
+    /// Column pointers (`n_cols + 1`).
+    pub indptr: &'a [u32],
+    /// Row indices (`nnz`), then at least `TILE_PAD / 2` zeros.
+    pub indices: &'a [u16],
+}
+
+impl<'a> TileView<'a> {
+    /// The tile serialised in `buf[..raw_len]` (`TILE_PAD` more bytes readable),
+    /// checked as `SparseTile::from_bytes` checks it. `None` if the host or the
+    /// buffer cannot be read as little-endian words in place.
+    fn parse(buf: &'a [u8], raw_len: usize) -> Option<Self> {
+        let data = &buf[..raw_len];
+        let (n_rows, n_cols, nnz, indptr_end) = super::tile_layout(data);
+        let indptr = super::cast_le::<u32>(&data[8..indptr_end])?;
+        let padded_end = (indptr_end + nnz * 2 + TILE_PAD).min(buf.len()) & !1;
+        let indices = super::cast_le::<u16>(&buf[indptr_end..padded_end])?;
+        if indices.len() < nnz + TILE_PAD / 2 { return None; }
+        super::check_tile(n_rows, nnz, indptr, &indices[..nnz]);
+        Some(TileView { n_rows, n_cols, nnz, indptr, indices })
+    }
 }
 
 // ============================================================================
 // Reader: file-based tiled SRP reader (sequential I/O, no mmap)
 // ============================================================================
 
-/// `extract_bitmatrix`: stripes with at most this many distinct wanted rows are
-/// read by binary search per column instead of a pass over every nonzero.
-const EXTRACT_SEARCH_MAX_ROWS: usize = 2;
+/// `extract_bitmatrix`: stripes with at most this many distinct wanted rows
+/// compare each column's rows with every wanted row (one 32-row window per
+/// column, `scan_compare`); stripes with more read every nonzero once against a
+/// table of the wanted rows (`scan_table`). Measured on the 75,552-haplotype
+/// panel's tiles: ~8 us per wanted row per tile against ~80 us for the pass.
+const EXTRACT_COMPARE_MAX_ROWS: usize = 8;
 
 /// `extract_bitmatrix`: at most this many compressed bytes per read. Tiny under
 /// test, so the tests' small panels are read in many chunks.
@@ -526,61 +621,205 @@ impl TiledSrpReader {
                 // same word; write through the raw base pointer instead of materializing
                 // a full-length &mut per worker (overlapping &mut = aliasing UB).
                 let base = bits_ptr as *mut u64;
-                // Per stripe: which of its TILE_ROWS rows are wanted (a bitmap tested per
-                // nonzero: one shift and AND, where a HashMap lookup per nonzero cost a
-                // SipHash for every ALT allele in the panel, nearly all misses at array
-                // density), the chip index of each wanted row, and any further chip indices
-                // that map to the same row (duplicate sites; rare). `|=` is
-                // order-independent and idempotent, so the output is bit-identical.
-                let mut want = [0u64; TILE_ROWS / 64];
-                let mut first = [u32::MAX; TILE_ROWS];
-                let mut extra: Vec<(usize, usize)> = Vec::new();
-                for &(ci, cr) in sites.iter() {
-                    want[cr / 64] |= 1u64 << (cr % 64);
-                    if first[cr] == u32::MAX { first[cr] = ci as u32; } else { extra.push((cr, ci)); }
-                }
-                // With few wanted rows, binary-search each in every column's
-                // sorted rows; with more, one pass over the column's nonzeros
-                // (measured on the 75,552-haplotype panel's tiles: search wins at
-                // 1-2 rows a stripe, ties at 3, loses from 10). Same bits set.
+                // Per stripe: its distinct wanted rows (ascending) and, per row, every
+                // chip index that maps to it (duplicate sites; rare). The scan yields,
+                // per wanted row and 64-haplotype word of a tile, the haplotypes carrying
+                // it; `|=` into each of the row's chip rows sets exactly the bits the
+                // per-nonzero scan set (order-independent, idempotent).
                 let mut rows: Vec<u16> = sites.iter().map(|&(_, cr)| cr as u16).collect();
                 rows.sort_unstable();
                 rows.dedup();
-                let search = rows.len() <= EXTRACT_SEARCH_MAX_ROWS;
+                let mut chips: Vec<Vec<usize>> = vec![Vec::new(); rows.len()];
+                for &(ci, cr) in sites.iter() {
+                    let k = rows.binary_search(&(cr as u16)).unwrap();
+                    chips[k].push(ci);
+                }
                 for band in 0..n_tc {
-                    let tile = loaded.decompress_tile(*stripe, band);
                     let cb = band * TILE_COLS;
-                    for col in 0..tile.n_cols as usize {
-                        let gh = cb + col;
-                        if gh >= n_haps { break; }
-                        let wi = gh / 64;
-                        let bit = 1u64 << (gh % 64);
-                        let (lo, hi) = tile.col_range(col);
-                        let set = |lr: usize| {
-                            unsafe { let p = base.add(first[lr] as usize * n_words + wi); *p |= bit; }
-                            for &(r, ci) in &extra {
-                                if r == lr { unsafe { let p = base.add(ci * n_words + wi); *p |= bit; } }
+                    loaded.with_tile(*stripe, band, |tile| {
+                        // Columns past the panel's last haplotype are not read.
+                        let n_cols = tile.n_cols.min(n_haps.saturating_sub(cb));
+                        let mut emit = |k: usize, w: usize, bits: u64| {
+                            let wi = cb / 64 + w;
+                            for &ci in &chips[k] {
+                                unsafe { let p = base.add(ci * n_words + wi); *p |= bits; }
                             }
                         };
-                        if search {
-                            let col_rows = &tile.indices[lo..hi];
-                            for &r in &rows {
-                                if col_rows.binary_search(&r).is_ok() { set(r as usize); }
-                            }
+                        if tile.n_rows as usize > TILE_ROWS {
+                            // Not a tile any writer makes (rows past the stripe pass the
+                            // checks only here): read exactly as before, panics included.
+                            scan_oversized(tile, n_cols, &rows, &mut emit);
+                        } else if rows.len() <= EXTRACT_COMPARE_MAX_ROWS {
+                            scan_compare(tile, n_cols, &rows, &mut emit);
                         } else {
-                            for k in lo..hi {
-                                let lr = tile.indices[k] as usize;
-                                if (want[lr / 64] >> (lr % 64)) & 1 == 0 { continue; }
-                                set(lr);
-                            }
+                            scan_table(tile, n_cols, &rows, &mut emit);
                         }
-                    }
+                    });
                 }
             });
             drop(loaded);
         }
         });
         crate::common::HaplotypeBitmatrix::from_raw(bits, n_chip, n_haps)
+    }
+}
+
+/// For every wanted row `rows[k]` (at most 64, ascending) and 64-column word `w`
+/// of the first `n_cols` columns of `tile`: `emit(k, w, bits)` with bit `c` set
+/// when column `64 w + c` holds the row (only non-zero `bits` are emitted). Each
+/// column's rows are read as one 32-entry window (the view's padding keeps it in
+/// bounds; lanes past the column are masked) compared with every wanted row.
+fn scan_compare(tile: &TileView<'_>, n_cols: usize, rows: &[u16], emit: &mut impl FnMut(usize, usize, u64)) {
+    debug_assert!(!rows.is_empty() && rows.len() <= 64 && n_cols <= tile.n_cols);
+    // `SELPHI_FORCE_SCALAR=1` keeps every SIMD kernel scalar (parity checks).
+    static SCALAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *SCALAR.get_or_init(|| crate::config::is_one("SELPHI_FORCE_SCALAR")) {
+        return scan_compare_scalar(tile, n_cols, rows, emit);
+    }
+    let k = rows.len();
+    let mut acc = [0u64; 64];
+    let acc = &mut acc[..k];
+    let ip = tile.indptr;
+    let idx = tile.indices;
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    // SAFETY: every window starts at lo <= nnz and idx holds nnz + TILE_PAD/2 >= nnz + 32 entries.
+    unsafe {
+        use std::arch::x86_64::*;
+        let mut bc = [_mm256_setzero_si256(); 64];
+        for (j, &r) in rows.iter().enumerate() { bc[j] = _mm256_set1_epi16(r as i16); }
+        let p = idx.as_ptr();
+        for col in 0..n_cols {
+            let lo = *ip.get_unchecked(col) as usize;
+            let n = *ip.get_unchecked(col + 1) as usize - lo;
+            let sh = col & 63;
+            if n <= 32 {
+                let v0 = _mm256_loadu_si256(p.add(lo) as *const __m256i);
+                let v1 = _mm256_loadu_si256(p.add(lo + 16) as *const __m256i);
+                let lm: u64 = if n == 32 { !0 } else { (1u64 << (2 * n)) - 1 };
+                for j in 0..k {
+                    let b = *bc.get_unchecked(j);
+                    let m0 = _mm256_movemask_epi8(_mm256_cmpeq_epi16(v0, b)) as u32 as u64;
+                    let m1 = _mm256_movemask_epi8(_mm256_cmpeq_epi16(v1, b)) as u32 as u64;
+                    *acc.get_unchecked_mut(j) |= ((((m1 << 32) | m0) & lm != 0) as u64) << sh;
+                }
+            } else {
+                let s = &idx[lo..lo + n];
+                for j in 0..k { acc[j] |= (s.contains(&rows[j]) as u64) << sh; }
+            }
+            if sh == 63 || col + 1 == n_cols {
+                for j in 0..k { if acc[j] != 0 { emit(j, col >> 6, acc[j]); acc[j] = 0; } }
+            }
+        }
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: as above (NEON is part of the aarch64 baseline).
+    unsafe {
+        use std::arch::aarch64::*;
+        let lane: [u16; 32] = std::array::from_fn(|i| i as u16);
+        let l0 = vld1q_u16(lane.as_ptr());
+        let l1 = vld1q_u16(lane.as_ptr().add(8));
+        let l2 = vld1q_u16(lane.as_ptr().add(16));
+        let l3 = vld1q_u16(lane.as_ptr().add(24));
+        let p = idx.as_ptr();
+        for col in 0..n_cols {
+            let lo = *ip.get_unchecked(col) as usize;
+            let n = *ip.get_unchecked(col + 1) as usize - lo;
+            let sh = col & 63;
+            if n <= 32 {
+                let nv = vdupq_n_u16(n as u16);
+                let m0 = vcltq_u16(l0, nv);
+                let m1 = vcltq_u16(l1, nv);
+                let m2 = vcltq_u16(l2, nv);
+                let m3 = vcltq_u16(l3, nv);
+                let v0 = vld1q_u16(p.add(lo));
+                let v1 = vld1q_u16(p.add(lo + 8));
+                let v2 = vld1q_u16(p.add(lo + 16));
+                let v3 = vld1q_u16(p.add(lo + 24));
+                for j in 0..k {
+                    let b = vdupq_n_u16(*rows.get_unchecked(j));
+                    let e = vorrq_u16(
+                        vorrq_u16(vandq_u16(vceqq_u16(v0, b), m0), vandq_u16(vceqq_u16(v1, b), m1)),
+                        vorrq_u16(vandq_u16(vceqq_u16(v2, b), m2), vandq_u16(vceqq_u16(v3, b), m3)));
+                    *acc.get_unchecked_mut(j) |= ((vmaxvq_u16(e) != 0) as u64) << sh;
+                }
+            } else {
+                let s = &idx[lo..lo + n];
+                for j in 0..k { acc[j] |= (s.contains(&rows[j]) as u64) << sh; }
+            }
+            if sh == 63 || col + 1 == n_cols {
+                for j in 0..k { if acc[j] != 0 { emit(j, col >> 6, acc[j]); acc[j] = 0; } }
+            }
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    scan_compare_scalar(tile, n_cols, rows, emit)
+}
+
+/// Portable `scan_compare` (also its test oracle and the `SELPHI_FORCE_SCALAR` path).
+fn scan_compare_scalar(tile: &TileView<'_>, n_cols: usize, rows: &[u16], emit: &mut impl FnMut(usize, usize, u64)) {
+    let k = rows.len();
+    let mut acc = [0u64; 64];
+    for col in 0..n_cols {
+        let (lo, hi) = (tile.indptr[col] as usize, tile.indptr[col + 1] as usize);
+        let s = &tile.indices[lo..hi];
+        let sh = col & 63;
+        for j in 0..k { acc[j] |= (s.contains(&rows[j]) as u64) << sh; }
+        if sh == 63 || col + 1 == n_cols {
+            for j in 0..k { if acc[j] != 0 { emit(j, col >> 6, acc[j]); acc[j] = 0; } }
+        }
+    }
+}
+
+/// The scan `extract_bitmatrix` ran before `scan_compare` / `scan_table`, for a
+/// tile declaring more than TILE_ROWS rows: binary search per column for at most
+/// two wanted rows, else a pass over every nonzero tested against a TILE_ROWS-bit
+/// table (which panics on a row past it, as it always did).
+fn scan_oversized(tile: &TileView<'_>, n_cols: usize, rows: &[u16], emit: &mut impl FnMut(usize, usize, u64)) {
+    let mut want = [0u64; TILE_ROWS / 64];
+    for &r in rows { want[r as usize / 64] |= 1u64 << (r % 64); }
+    let search = rows.len() <= 2;
+    for col in 0..n_cols {
+        let (lo, hi) = (tile.indptr[col] as usize, tile.indptr[col + 1] as usize);
+        let bit = 1u64 << (col % 64);
+        if search {
+            let col_rows = &tile.indices[lo..hi];
+            for (k, r) in rows.iter().enumerate() {
+                if col_rows.binary_search(r).is_ok() { emit(k, col / 64, bit); }
+            }
+        } else {
+            for kk in lo..hi {
+                let lr = tile.indices[kk] as usize;
+                if (want[lr / 64] >> (lr % 64)) & 1 == 0 { continue; }
+                emit(rows.binary_search(&(lr as u16)).unwrap(), col / 64, bit);
+            }
+        }
+    }
+}
+
+/// `scan_compare` for any number of wanted rows: one pass over every nonzero,
+/// looking each row up in a table of the wanted rows' slots.
+fn scan_table(tile: &TileView<'_>, n_cols: usize, rows: &[u16], emit: &mut impl FnMut(usize, usize, u64)) {
+    let k = rows.len();
+    let mut slot = [u16::MAX; TILE_ROWS];
+    for (j, &r) in rows.iter().enumerate() { slot[r as usize] = j as u16; }
+    let mut acc = vec![0u64; k];
+    let mut touched: Vec<u16> = Vec::with_capacity(k);
+    for col in 0..n_cols {
+        let (lo, hi) = (tile.indptr[col] as usize, tile.indptr[col + 1] as usize);
+        let bit = 1u64 << (col & 63);
+        // Rows are < n_rows <= TILE_ROWS (checked when the tile was read).
+        for &r in &tile.indices[lo..hi] {
+            let j = slot[r as usize];
+            if j == u16::MAX { continue; }
+            if acc[j as usize] == 0 { touched.push(j); }
+            acc[j as usize] |= bit;
+        }
+        if col & 63 == 63 || col + 1 == n_cols {
+            for &j in &touched { emit(j as usize, col >> 6, acc[j as usize]); acc[j as usize] = 0; }
+            touched.clear();
+        }
     }
 }
 
@@ -967,7 +1206,7 @@ mod tests {
             let (t, _) = panel(dir.path(), &mut r, n_variants, n_haps, per_mille, 0);
             // Wanted rows per stripe from one (binary search) to many (scan),
             // with duplicate sites; sorted as the callers pass them, or not.
-            for per_stripe in [1usize, 2, 3, 7, 40] {
+            for per_stripe in [1usize, 2, 3, 7, 8, 9, 12, 40] {
                 let mut idx = Vec::new();
                 for s in 0..t.n_tile_rows {
                     let rows = TILE_ROWS.min(n_variants - s * TILE_ROWS);
@@ -982,6 +1221,71 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A tile read in place equals the decoded SparseTile, through the reused
+    /// decoder, the slow path (buffer too small), LZ4 tiles and no scope at all;
+    /// and the three scans set the same bits as a scan of the SparseTile, on
+    /// columns shorter and longer than the 32-row window.
+    #[test]
+    fn tile_view_and_scans_match_the_sparse_tile() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = Xs(0x7E57);
+        for (scoped, (n_variants, n_haps, per_mille)) in [(true, (1024, 4096, 1000)), (true, (3000, 300, 40)),
+                (false, (2100, 4096 + 900, 120)), (true, (777, 9000, 2)), (false, (1024, 700, 45))] {
+            let _here = scoped.then(TileDecoderScope::this_thread);
+            let (t, tiles) = panel(dir.path(), &mut r, n_variants, n_haps, per_mille, 3);
+            let loaded = t.preload_stripes(0, t.n_tile_rows).unwrap();
+            for st in 0..t.n_tile_rows {
+                for b in 0..t.n_tile_cols {
+                    let want = &tiles[st * t.n_tile_cols + b];
+                    loaded.with_tile(st, b, |v| {
+                        assert_eq!((v.n_rows, v.n_cols, v.nnz), (want.n_rows, want.n_cols as usize, want.indices.len()));
+                        assert_eq!(v.indptr, &want.indptr[..]);
+                        assert_eq!(&v.indices[..v.nnz], &want.indices[..]);
+                        assert!(v.indices[v.nnz..].len() >= TILE_PAD / 2 && v.indices[v.nnz..].iter().all(|&x| x == 0));
+                        for n_rows_wanted in [1usize, 2, 5, 8, 33, 64] {
+                            let mut rows: Vec<u16> = (0..n_rows_wanted).map(|_| r.below(want.n_rows as u64) as u16).collect();
+                            rows.sort_unstable();
+                            rows.dedup();
+                            let n_cols = v.n_cols.saturating_sub(r.below(3) as usize * 37);
+                            let mut expect = vec![0u64; rows.len() * 64];
+                            for col in 0..n_cols {
+                                let (lo, hi) = want.col_range(col);
+                                for (k, &row) in rows.iter().enumerate() {
+                                    if want.indices[lo..hi].binary_search(&row).is_ok() { expect[k * 64 + col / 64] |= 1 << (col % 64); }
+                                }
+                            }
+                            let run = |f: &dyn Fn(&mut dyn FnMut(usize, usize, u64))| {
+                                let mut got = vec![0u64; rows.len() * 64];
+                                f(&mut |k, w, bits| { assert!(bits != 0); got[k * 64 + w] |= bits; });
+                                got
+                            };
+                            if rows.len() <= 64 {
+                                assert_eq!(run(&|e| scan_compare(v, n_cols, &rows, &mut |k, w, b| e(k, w, b))), expect);
+                                assert_eq!(run(&|e| scan_compare_scalar(v, n_cols, &rows, &mut |k, w, b| e(k, w, b))), expect);
+                            }
+                            assert_eq!(run(&|e| scan_table(v, n_cols, &rows, &mut |k, w, b| e(k, w, b))), expect);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    /// A corrupt tile read in place stops with from_bytes' message.
+    #[test]
+    #[should_panic(expected = "rows not ascending within a column (corrupt tile)")]
+    fn tile_view_rejects_what_from_bytes_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt2.tiles");
+        let comp = zstd::encode_all(std::io::Cursor::new(&tile_bytes(1024, vec![0, 2, 2, 5], vec![7, 9, 3, 8, 4])), 3).unwrap();
+        std::fs::write(&path, &comp).unwrap();
+        let entries = vec![TileEntryPub { offset: 0, comp_size: comp.len() as u32 }];
+        let t = TiledSrpReader::from_entries(path, 1024, 3, entries, 1, 1);
+        let loaded = t.preload_stripes(0, 1).unwrap();
+        let _s = TileDecoderScope::this_thread();
+        loaded.with_tile(0, 0, |_| ());
     }
 
     #[test]

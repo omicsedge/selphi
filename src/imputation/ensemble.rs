@@ -374,6 +374,17 @@ pub fn fold_window(
     ctx: &FoldContext,
     params: &WindowHmmParams,
 ) {
+    fold_window_shared(all_weights, members, ctx, params, None);
+}
+
+/// `fold_window` with the window's allele classes shared with member 0's call.
+fn fold_window_shared(
+    all_weights: &mut [Vec<(usize, CsrWeights)>],
+    members: &mut [Member],
+    ctx: &FoldContext,
+    params: &WindowHmmParams,
+    classes: Option<&super::window_process::WindowClasses>,
+) {
     if members.is_empty() { return; }
     let n_haps = params.n_haps;
     let mut params_m = params.clone();
@@ -382,8 +393,9 @@ pub fn fold_window(
     let mut count = 1usize;
     for sc in members.iter_mut() {
         let Member { targ_bm, candidates, final_ne_per_site, carry, n_blocks, site_conf_per_sample } = sc;
-        let inputs_m = member_inputs(targ_bm, final_ne_per_site.as_deref(),
+        let mut inputs_m = member_inputs(targ_bm, final_ne_per_site.as_deref(),
             site_conf_per_sample.as_deref(), *n_blocks, ctx);
+        inputs_m.allele_classes = classes;
         params_m.n_haps = n_haps * *n_blocks;
         let cand = candidates.as_ref();
         let targ_k: &HaplotypeBitmatrix = targ_bm;
@@ -417,8 +429,12 @@ pub fn impute_with_members(
     members: &mut [Member],
     ctx: &FoldContext,
 ) -> super::window_process::WindowHmmOutput {
-    let mut out = impute_window(inputs, params, precomputed_candidates, carry, None);
-    fold_window(&mut out.all_weights, members, ctx, params);
+    // Every member's call reads the same window of the same panel: its allele
+    // classes are computed once.
+    let classes = super::window_process::WindowClasses::default();
+    let inputs0 = ImputeWindowInputs { allele_classes: Some(&classes), ..*inputs };
+    let mut out = impute_window(&inputs0, params, precomputed_candidates, carry, None);
+    fold_window_shared(&mut out.all_weights, members, ctx, params, Some(&classes));
     out
 }
 
@@ -441,6 +457,7 @@ fn member_inputs<'a>(targ_bm: &'a HaplotypeBitmatrix, ne: Option<&'a [f64]>,
         keep_rows: ctx.keep_rows,
         hmm_skip: ctx.hmm_skip,
         cand_ancestry: ctx.cand_ancestry,
+        allele_classes: None,
     }
 }
 

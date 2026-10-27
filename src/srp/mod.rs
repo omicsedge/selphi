@@ -176,74 +176,23 @@ impl SparseTile {
 
     /// Deserialize tile from bytes.
     pub fn from_bytes(data: &[u8]) -> Self {
-        // Explicit bounds checks so a corrupt tile produces a clear panic
-        // message (instead of a generic slice-OOB) — the function returns
-        // SparseTile (not Result) by interface, so we abort with context.
-        assert!(data.len() >= 8,
-            "SparseTile::from_bytes: tile header truncated ({} < 8 bytes)", data.len());
-        let n_rows = u16::from_le_bytes(data[0..2].try_into().unwrap());
-        let n_cols = u16::from_le_bytes(data[2..4].try_into().unwrap());
-        let nnz = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+        let (n_rows, n_cols, nnz, indptr_end) = tile_layout(data);
         let indptr_start = 8;
-        let indptr_end = indptr_start + (n_cols as usize + 1) * 4;
         let indices_end = indptr_end + nnz * 2;
-        assert!(indices_end <= data.len(),
-            "SparseTile::from_bytes: tile body truncated (need {} bytes, have {}; n_rows={} n_cols={} nnz={})",
-            indices_end, data.len(), n_rows, n_cols, nnz);
-        let mut indptr = vec![0u32; n_cols as usize + 1];
-        for (d, b) in indptr.iter_mut().zip(data[indptr_start..indptr_end].chunks_exact(4)) {
-            *d = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-        }
-        // Validate the CSC column pointers before they index `indices`:
-        // `col_range` returns `(indptr[col], indptr[col+1])` and consumers slice
-        // `indices[lo..hi]`, so a non-monotone or out-of-range indptr would
-        // slice-OOB. Require indptr[0]==0, non-decreasing, and last == nnz.
-        assert!(indptr.first().copied() == Some(0),
-            "SparseTile::from_bytes: indptr[0] must be 0 (corrupt tile)");
-        assert!(indptr.windows(2).all(|w| w[0] <= w[1]),
-            "SparseTile::from_bytes: indptr must be non-decreasing (corrupt tile)");
-        assert!(indptr.last().copied() == Some(nnz as u32),
-            "SparseTile::from_bytes: indptr last ({:?}) must equal nnz ({}) (corrupt tile)",
-            indptr.last(), nnz);
-        // Rows must lie inside the tile and ascend within each column, as the
-        // writer emits them: row lookups (`want[row / 64]`, the binary search in
-        // `extract_bitmatrix`) rely on both. A corrupt tile used to pass here and
-        // either panic later on an index or be read silently; now it stops here.
-        // "Ascending within each column" is checked as "every descent between
-        // neighbouring rows falls on a column boundary": descents and the largest
-        // row are taken during the byte-to-u16 conversion, then each column
-        // boundary is compared once. Measured on the 75,552-haplotype panel's
-        // tiles: ~11 us per tile on top of the ~14 us conversion, against ~90 us
-        // to decompress the tile.
-        let raw = &data[indptr_end..indices_end];
-        let mut indices = vec![0u16; nnz];
-        if nnz > 0 {
-            let (mut descents, mut max_row) = (0u32, 0u16);
-            let mut prev = u16::from_le_bytes([raw[0], raw[1]]);
-            indices[0] = prev;
-            max_row = max_row.max(prev);
-            for (d, b) in indices[1..].iter_mut().zip(raw[2..].chunks_exact(2)) {
-                let v = u16::from_le_bytes([b[0], b[1]]);
-                *d = v;
-                descents += (prev > v) as u32;
-                max_row = max_row.max(v);
-                prev = v;
-            }
-            assert!(max_row < n_rows,
-                "SparseTile::from_bytes: row index {} >= n_rows {} (corrupt tile)", max_row, n_rows);
-            // Descents at the start of each non-empty column (a boundary shared by
-            // empty columns counted once; indptr is validated above).
-            let mut at_boundaries = 0u32;
-            for w in indptr.windows(2) {
-                let b = w[1] as usize;
-                if w[0] != w[1] && b < nnz {
-                    at_boundaries += (indices[b - 1] > indices[b]) as u32;
-                }
-            }
-            assert!(descents == at_boundaries,
-                "SparseTile::from_bytes: rows not ascending within a column (corrupt tile)");
-        }
-        SparseTile { indptr, indices, n_rows, n_cols }
+        let ip_bytes = &data[indptr_start..indptr_end];
+        let ix_bytes = &data[indptr_end..indices_end];
+        // Little-endian words copied as they are (one memcpy each, no zero fill),
+        // or converted one by one where the bytes are not aligned / not native.
+        let indptr: Vec<u32> = match cast_le::<u32>(ip_bytes) {
+            Some(w) => w.to_vec(),
+            None => ip_bytes.chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
+        };
+        let indices: Vec<u16> = match cast_le::<u16>(ix_bytes) {
+            Some(w) => w.to_vec(),
+            None => ix_bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect(),
+        };
+        check_tile(n_rows, nnz, &indptr, &indices);
+        SparseTile { indptr, indices, n_rows, n_cols: n_cols as u16 }
     }
 
     /// Get row indices for a column within this tile.
@@ -253,6 +202,81 @@ impl SparseTile {
         let hi = self.indptr[col + 1] as usize;
         (lo, hi)
     }
+}
+
+/// Header of a serialized tile: `(n_rows, n_cols, nnz, end of indptr)`, with the
+/// body length checked (the panics `SparseTile::from_bytes` has always given).
+pub(crate) fn tile_layout(data: &[u8]) -> (u16, usize, usize, usize) {
+    // Explicit bounds checks so a corrupt tile produces a clear panic
+    // message (instead of a generic slice-OOB) — decoding returns a tile
+    // (not Result) by interface, so we abort with context.
+    assert!(data.len() >= 8,
+        "SparseTile::from_bytes: tile header truncated ({} < 8 bytes)", data.len());
+    let n_rows = u16::from_le_bytes(data[0..2].try_into().unwrap());
+    let n_cols = u16::from_le_bytes(data[2..4].try_into().unwrap());
+    let nnz = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+    let indptr_end = 8 + (n_cols as usize + 1) * 4;
+    let indices_end = indptr_end + nnz * 2;
+    assert!(indices_end <= data.len(),
+        "SparseTile::from_bytes: tile body truncated (need {} bytes, have {}; n_rows={} n_cols={} nnz={})",
+        indices_end, data.len(), n_rows, n_cols, nnz);
+    (n_rows, n_cols as usize, nnz, indptr_end)
+}
+
+/// `bytes` as little-endian `T` words in place, when the host is little-endian
+/// and the bytes are aligned for `T`.
+#[inline]
+pub(crate) fn cast_le<T: LeWord>(bytes: &[u8]) -> Option<&[T]> {
+    if !cfg!(target_endian = "little") || bytes.len() % std::mem::size_of::<T>() != 0
+        || (bytes.as_ptr() as usize) % std::mem::align_of::<T>() != 0 { return None; }
+    // SAFETY: aligned, whole words, and every bit pattern is a valid u16/u32.
+    Some(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, bytes.len() / std::mem::size_of::<T>()) })
+}
+
+/// Plain integer words a tile is made of.
+pub(crate) trait LeWord: Copy {}
+impl LeWord for u16 {}
+impl LeWord for u32 {}
+
+/// The checks every decoded tile passes before it is read (panicking with the
+/// messages `SparseTile::from_bytes` has always given).
+///
+/// CSC column pointers first: `col_range` returns `(indptr[col], indptr[col+1])`
+/// and consumers slice `indices[lo..hi]`, so a non-monotone or out-of-range indptr
+/// would slice out of bounds: require indptr[0] == 0, non-decreasing, last == nnz.
+/// Then rows must lie inside the tile and ascend within each column, as the writer
+/// emits them: row lookups (`want[row / 64]`, the binary search in extraction)
+/// rely on both. A corrupt tile used to pass here and either panic later on an
+/// index or be read silently; now it stops here. "Ascending within each column"
+/// is checked as "every descent between neighbouring rows falls on a column
+/// boundary": the descents and the largest row over the whole array (loops the
+/// compiler vectorises), then each column boundary once.
+pub(crate) fn check_tile(n_rows: u16, nnz: usize, indptr: &[u32], indices: &[u16]) {
+    assert!(indptr.first().copied() == Some(0),
+        "SparseTile::from_bytes: indptr[0] must be 0 (corrupt tile)");
+    let descending = indptr.iter().zip(&indptr[1..]).fold(false, |d, (&a, &b)| d | (a > b));
+    assert!(!descending,
+        "SparseTile::from_bytes: indptr must be non-decreasing (corrupt tile)");
+    assert!(indptr.last().copied() == Some(nnz as u32),
+        "SparseTile::from_bytes: indptr last ({:?}) must equal nnz ({}) (corrupt tile)",
+        indptr.last(), nnz);
+    if nnz == 0 { return; }
+    let indices = &indices[..nnz];
+    let max_row = indices.iter().copied().max().unwrap_or(0);
+    assert!(max_row < n_rows,
+        "SparseTile::from_bytes: row index {} >= n_rows {} (corrupt tile)", max_row, n_rows);
+    let descents: u32 = indices.iter().zip(&indices[1..]).map(|(&a, &b)| (a > b) as u32).sum();
+    // Descents at the start of each non-empty column (a boundary shared by
+    // empty columns counted once; indptr is validated above).
+    let mut at_boundaries = 0u32;
+    for w in indptr.windows(2) {
+        let b = w[1] as usize;
+        if w[0] != w[1] && b < nnz {
+            at_boundaries += (indices[b - 1] > indices[b]) as u32;
+        }
+    }
+    assert!(descents == at_boundaries,
+        "SparseTile::from_bytes: rows not ascending within a column (corrupt tile)");
 }
 
 // ---------------------------------------------------------------------------

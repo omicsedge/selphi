@@ -1641,6 +1641,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
             keep_rows: keep_rows.as_deref(),
             hmm_skip: skip_w.as_deref(),
             cand_ancestry,
+            allele_classes: None,
         };
         // Streaming callback for batched mode: each batch's CSRs are written
         // immediately to the corresponding batch writer(s) (BCF, VCF, SD,

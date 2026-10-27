@@ -225,6 +225,55 @@ pub fn available_ram_mb() -> Option<f64> {
     None
 }
 
+/// Room left under this process's cgroup memory limits, in MB: the least, over
+/// its cgroup and every ancestor that sets a limit, of the limit minus that
+/// group's usage (`memory.max` - `memory.current` on cgroup v2,
+/// `memory.limit_in_bytes` - `memory.usage_in_bytes` on v1). A container's limit
+/// can sit far below the host's `MemAvailable`. `None` when no group on the path
+/// sets a limit (or the files cannot be read).
+pub fn cgroup_headroom_mb() -> Option<f64> {
+    let read = |p: &str| std::fs::read_to_string(p).ok().and_then(|s| s.trim().parse::<f64>().ok());
+    let groups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    // (mount dir, limit file, usage file, group path) per hierarchy that holds memory
+    let mut probes: Vec<(String, &str, &str, String)> = Vec::new();
+    for line in groups.lines() {
+        let mut f = line.splitn(3, ':');
+        let (_, ctl, path) = (f.next()?, f.next()?, f.next()?.trim().to_string());
+        if ctl.is_empty() {
+            probes.push(("/sys/fs/cgroup".into(), "memory.max", "memory.current", path));
+        } else if ctl.split(',').any(|c| c == "memory") {
+            probes.push(("/sys/fs/cgroup/memory".into(), "memory.limit_in_bytes", "memory.usage_in_bytes", path));
+        }
+    }
+    let mut best: Option<f64> = None;
+    for (mount, lim, cur, path) in probes {
+        // the group and each ancestor, up to the mount root
+        let mut p = path.trim_end_matches('/').to_string();
+        loop {
+            let dir = format!("{mount}{p}");
+            if let (Some(l), Some(u)) = (read(&format!("{dir}/{lim}")), read(&format!("{dir}/{cur}"))) {
+                // v1 reports "no limit" as a huge page-aligned number
+                if l < (1u64 << 60) as f64 {
+                    let room = ((l - u) / 1048576.0).max(0.0);
+                    best = Some(best.map_or(room, |b: f64| b.min(room)));
+                }
+            }
+            match p.rfind('/') { Some(k) => p.truncate(k), None => break }
+            if p.is_empty() {
+                // the mount root itself
+                if let (Some(l), Some(u)) = (read(&format!("{mount}/{lim}")), read(&format!("{mount}/{cur}"))) {
+                    if l < (1u64 << 60) as f64 {
+                        let room = ((l - u) / 1048576.0).max(0.0);
+                        best = Some(best.map_or(room, |b: f64| b.min(room)));
+                    }
+                }
+                break;
+            }
+        }
+    }
+    best
+}
+
 /// Total system RAM in MB. Works on Linux (/proc/meminfo) and macOS (sysctl).
 pub fn system_ram_mb() -> f64 {
     // Linux

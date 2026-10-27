@@ -11,6 +11,7 @@ pub mod detmath;
 pub mod cpp_rng;
 pub mod genotype_graph;
 pub mod pbwt_neighbor;
+pub(crate) mod pbwt_fm;
 pub mod ibd2_tracks;
 pub mod alpha_diag;
 pub mod hmm_segment;

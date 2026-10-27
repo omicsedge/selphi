@@ -41,6 +41,11 @@ pub struct PbwtNeighborIndex {
     // Chunking for multi-threaded PBWT
     pub chunk_assignments: Vec<i32>,  // per-site: which chunk
     pub chunk_starts: Vec<usize>,     // per-chunk: buffer start site
+    /// The panel-only sort for the few-target sweep (`super::pbwt_fm`), built on
+    /// the first sweep that wants it and reused by every later one.
+    fm: Option<Box<super::pbwt_fm::FmIndex>>,
+    /// Whether the few-target sweep was considered yet.
+    fm_decided: bool,
 }
 
 /// Divergence value held in a chunk sweep's `c`/`d` arrays.
@@ -79,6 +84,19 @@ pub(crate) fn div_offset(buffer_start: usize) -> usize { buffer_start.saturating
 #[inline]
 pub(crate) fn div_fits_u16(buffer_start: usize, chunk_end: usize) -> bool {
     chunk_end - div_offset(buffer_start) <= u16::MAX as usize
+}
+
+/// `SELPHI_PHASE_FM`: the few-target neighbour sweep (`super::pbwt_fm`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FmMode { Auto, Off, On, Verify }
+
+fn fm_mode() -> FmMode {
+    match crate::config::raw("SELPHI_PHASE_FM").as_deref() {
+        Some("0") => FmMode::Off,
+        Some("1") => FmMode::On,
+        Some("verify") => FmMode::Verify,
+        _ => FmMode::Auto,
+    }
 }
 
 /// Position of each target haplotype after a split, written by
@@ -176,7 +194,7 @@ unsafe fn split_scalar_from<D: SweepDiv, const TRACK: bool>(
 /// AVX-512F available and not overridden by `SELPHI_FORCE_SCALAR=1` /
 /// `SELPHI_FORCE_AVX2=1`. Read once.
 #[cfg(target_arch = "x86_64")]
-fn split_use_avx512() -> bool {
+pub(crate) fn split_use_avx512() -> bool {
     use std::sync::OnceLock;
     static USE: OnceLock<bool> = OnceLock::new();
     *USE.get_or_init(|| {
@@ -193,7 +211,7 @@ fn split_use_avx512() -> bool {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 #[inline]
-fn seg_max_scan(x: std::arch::x86_64::__m512i, heads: u16) -> std::arch::x86_64::__m512i {
+pub(crate) fn seg_max_scan(x: std::arch::x86_64::__m512i, heads: u16) -> std::arch::x86_64::__m512i {
     use std::arch::x86_64::*;
     let zero = _mm512_setzero_si512();
     let mut vv = x;
@@ -211,7 +229,7 @@ fn seg_max_scan(x: std::arch::x86_64::__m512i, heads: u16) -> std::arch::x86_64:
 /// continue the running maximum carried in from the previous block.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn lead_lanes(heads: u16) -> u16 {
+pub(crate) fn lead_lanes(heads: u16) -> u16 {
     if heads == 0 { u16::MAX } else { (heads & heads.wrapping_neg()) - 1 }
 }
 
@@ -731,6 +749,8 @@ impl PbwtNeighborIndex {
             site_selection: vec![false; n_sites],
             chunk_assignments,
             chunk_starts,
+            fm: None,
+            fm_decided: false,
         }
     }
 
@@ -773,14 +793,127 @@ impl PbwtNeighborIndex {
     /// Chunks run in parallel, each over its own buffer + owned sites, and write
     /// disjoint `(slot, target hap, group)` cells of `data` directly in the
     /// layout the readers use. A single chunk runs on the calling thread.
+    ///
+    /// With few targets on a large panel the panel is sorted once
+    /// (`super::pbwt_fm`, kept for the next calls) and each sweep only places the
+    /// targets in it; it writes the same cells. That requires the panel bits
+    /// (`[n_haps, n_sweep)`) of `bm` never to change between calls, which holds in
+    /// phase_common (only target bits are rewritten). `SELPHI_PHASE_FM` = `0` off,
+    /// `1` on whenever it applies (no cost or memory gate), `verify` = on and the
+    /// full sweep too, asserting the same cells.
     pub fn pbwt_sweep_direct(&mut self, n_sites: usize,
                               ibd2: &super::ibd2_tracks::Ibd2Tracks,
                               bm: &HaplotypeBitmatrix) {
-        self.sweep_impl(n_sites, ibd2, bm, false);
+        let mode = fm_mode();
+        if !self.fm_decided {
+            self.fm_decided = true;
+            if mode != FmMode::Off {
+                self.fm = self.build_fm(n_sites, bm, mode).map(Box::new);
+            }
+        }
+        let fm = match self.fm.take() {
+            Some(fm) if n_sites == self.site_eval.len()
+                && fm.built_for(bm, &self.site_eval, &self.chunk_assignments, &self.chunk_starts) => fm,
+            other => {
+                self.fm = other;
+                self.sweep_impl(n_sites, ibd2, bm, false);
+                return;
+            }
+        };
+        {
+            let data_atoms: &[std::sync::atomic::AtomicI32] = unsafe {
+                std::slice::from_raw_parts(self.data.as_ptr() as *const std::sync::atomic::AtomicI32, self.data.len())
+            };
+            let inp = super::pbwt_fm::SweepInputs {
+                site_selection: &self.site_selection,
+                site_grouping: &self.site_grouping,
+                chunk_assignments: &self.chunk_assignments,
+                n_groups: self.n_groups,
+                depth: self.depth,
+                ibd2,
+                data: data_atoms,
+            };
+            fm.sweep(bm, &inp);
+        }
+        if crate::log::is_debug() {
+            crate::selphi_debug!("  [diploid] few-target sweep: {} panel haplotypes located",
+                super::pbwt_fm::DIAG_LOCATES.swap(0, std::sync::atomic::Ordering::Relaxed));
+        }
+        if mode == FmMode::Verify {
+            let fm_data = self.data.clone();
+            self.data.fill(-1);
+            self.sweep_impl(n_sites, ibd2, bm, false);
+            assert!(fm_data == self.data, "SELPHI_PHASE_FM=verify: few-target sweep differs from the full sweep");
+        }
+        self.fm = Some(fm);
+    }
+
+    /// The few-target index when it pays: few targets against a large panel
+    /// (cost model below), and the index within a memory budget. `None` keeps the
+    /// full sweep.
+    fn build_fm(&self, n_sites: usize, bm: &HaplotypeBitmatrix, mode: FmMode) -> Option<super::pbwt_fm::FmIndex> {
+        let n_target = self.n_haps;
+        let n_panel = self.n_sweep.checked_sub(n_target)?;
+        if n_panel == 0 || n_target == 0 || n_sites == 0 || n_sites != self.site_eval.len() { return None; }
+        // i32 divergence labels are the site indices themselves: past i32::MAX they
+        // wrap and no longer order mismatches by recency (never at real sizes).
+        if n_sites > i32::MAX as usize || self.n_sweep > i32::MAX as usize { return None; }
+        if bm.n_haps < self.n_sweep || bm.n_sites < n_sites { return None; }
+        let ranges = super::pbwt_fm::chunk_ranges(&self.chunk_assignments, &self.chunk_starts, n_sites);
+        let cols: Vec<usize> = ranges.iter()
+            .map(|&(_, s, e)| (s..=e).filter(|&l| self.site_eval[l]).count()).collect();
+        let n_cols: usize = cols.iter().sum();
+        // Panel orders are kept every `every` sites, as densely as the budget below
+        // allows (a located haplotype walks back every/2 sites on average). Work
+        // per sweep, in units of one entry of a split: the full sweep splits
+        // n_sweep entries per column; the index walks about every/2 splits back per
+        // neighbour located (~20 units each), for about 2*depth + n_target entries
+        // per target per selection site (one per group).
+        let every = 32usize;
+        let fm_work = 20.0 * self.n_groups as f64 * n_target as f64
+            * (2 * self.depth + n_target) as f64 * (every / 2) as f64;
+        let full_work = n_cols as f64 * self.n_sweep as f64;
+        if mode == FmMode::Auto && fm_work * 4.0 > full_work { return None; }
+        // Three quarters of what is available (MemAvailable, and the room under a
+        // container's cgroup limit when that is less) above a 512 MB reserve (2 GB if
+        // unknown), or SELPHI_PHASE_FM_MB; the index lives only through
+        // phase_common's iterations.
+        let budget = match crate::config::usize_opt("SELPHI_PHASE_FM_MB") {
+            Some(mb) => mb << 20,
+            None => {
+                let avail = match (crate::log::available_ram_mb(), crate::log::cgroup_headroom_mb()) {
+                    (Some(a), Some(c)) => Some(a.min(c)),
+                    (a, c) => a.or(c),
+                };
+                avail.map(|mb| ((mb - 512.0).max(0.0) * 0.75 * 1048576.0) as usize).unwrap_or(2usize << 30)
+            }
+        };
+        // Densest kept orders first; at each density, the chunks' transposed
+        // alleles kept with the index if they fit, else transposed per sweep
+        // (the largest chunk's as scratch, once per worker).
+        let (keep_bytes, scratch_one) = super::pbwt_fm::allele_bytes(&cols, bm.n_words());
+        // Chunks sweep in parallel, each worker with its own scratch.
+        let scratch_bytes = scratch_one * rayon::current_num_threads().min(ranges.len()).max(1);
+        let mut choice = None;
+        let mut ev = every;
+        while ev <= 512 {
+            let idx = super::pbwt_fm::index_bytes(&cols, n_panel, ev);
+            if mode != FmMode::Auto || idx + keep_bytes <= budget { choice = Some((ev, true)); break; }
+            if idx + scratch_bytes <= budget { choice = Some((ev, false)); break; }
+            ev *= 2;
+        }
+        let (ev, keep) = choice?;
+        let t0 = std::time::Instant::now();
+        let fm = super::pbwt_fm::FmIndex::build(bm, n_target, n_panel, &ranges, &self.site_eval, ev, keep,
+            (&self.chunk_assignments, &self.chunk_starts));
+        crate::selphi_debug!("  [diploid] few-target sweep: panel sorted once, {} columns in {} chunks, order every {}, alleles {} -> {:.0} MB in {:.0} ms",
+            n_cols, ranges.len(), ev, if keep { "kept" } else { "per sweep" }, fm.bytes as f64 / 1048576.0,
+            t0.elapsed().as_secs_f64() * 1e3);
+        Some(fm)
     }
 
     /// `force_i32` (tests only) keeps i32 divergence labels in every chunk.
-    fn sweep_impl(&mut self, n_sites: usize, ibd2: &super::ibd2_tracks::Ibd2Tracks,
+    pub(crate) fn sweep_impl(&mut self, n_sites: usize, ibd2: &super::ibd2_tracks::Ibd2Tracks,
                   bm: &HaplotypeBitmatrix, force_i32: bool) {
         let max_chunk = self.chunk_assignments.iter().max().copied().unwrap_or(-1);
         let n_chunks = (max_chunk + 1) as usize;

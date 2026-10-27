@@ -1173,6 +1173,7 @@ pub fn run_multi_chr(
                 keep_rows: keep_rows.as_deref(),
                 hmm_skip: skip_w.as_deref(),
                 cand_ancestry: None,
+                allele_classes: None,
             };
             let all_weights = selphi::imputation::ensemble::impute_with_members(
                 &inputs, &hmm_params, precomputed_candidates.as_ref(),

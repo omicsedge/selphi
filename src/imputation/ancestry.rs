@@ -293,7 +293,7 @@ pub fn smooth_local_ancestry(la: &mut LocalAncestry, radius: usize) {
 /// Native PBWT-based local ancestry inference.
 ///
 /// For each target hap `t` and each PBWT coded step `s`, the step-group
-/// `step_groups[s][hap_group[s][n_ref + t]]` contains all panel haps that
+/// `coded.for_each_member(s, n_ref + t, ..)` visits all panel haps that
 /// share the target's chip-bit prefix across step `s`'s genomic window.
 /// The empirical super-pop frequency in that group (weighted uniformly
 /// over panel members, unknown-labelled haps dropped) is the target's
@@ -314,7 +314,7 @@ pub fn infer_local_ancestry(
     panel_hap_pop: &[u8],
 ) -> LocalAncestry {
     use rayon::prelude::*;
-    let n_steps = coded.step_groups.len();
+    let n_steps = coded.n_steps();
     let step_starts = coded.starts.clone();
 
     if n_steps == 0 {
@@ -357,10 +357,9 @@ pub fn infer_local_ancestry(
         .flat_map(|t| {
             let mut per_hap = vec![0.0f32; n_steps * N_POPS];
             for s in 0..n_steps {
-                let gid = coded.hap_group[s][n_ref + t] as usize;
                 let mut counts = [0.0f32; N_POPS];
                 let mut seen = 0u32;
-                for &h in &coded.step_groups[s][gid] {
+                coded.for_each_member(s, n_ref + t, |h| {
                     if (h as usize) < n_ref {
                         let pop = panel_hap_pop[h as usize];
                         if pop != POP_UNKNOWN && (pop as usize) < N_POPS {
@@ -368,7 +367,7 @@ pub fn infer_local_ancestry(
                             seen += 1;
                         }
                     }
-                }
+                });
                 if seen == 0 {
                     // No labelled panel haps in this group — uniform prior
                     // so the downstream ancestry multiplier is neutral.

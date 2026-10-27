@@ -73,6 +73,25 @@ pub struct CandidateAncestry<'a> {
     pub smooth: usize,
 }
 
+/// A window's `hap_dedup::allele_classes`, computed by the first `impute_window` of
+/// the window that needs them and reused by the others (member 0 and the folded
+/// members share the window's panel rows). Keyed by the panel matrix, the window
+/// and `n_ref`; a call with another key computes its own.
+#[derive(Default)]
+pub struct WindowClasses(std::sync::OnceLock<((usize, usize, usize, usize, usize), Vec<u32>)>);
+
+impl WindowClasses {
+    /// The classes of `ref_bm`'s rows `[chip_start, chip_start + n_var_w)` over its
+    /// first `n_ref` haplotypes, computed on first use; `None` if this cache
+    /// already holds another window's.
+    fn get(&self, ref_bm: &HaplotypeBitmatrix, chip_start: usize, n_var_w: usize, n_ref: usize) -> Option<&[u32]> {
+        let key = (ref_bm.bits_ptr() as usize, ref_bm.n_sites, chip_start, n_var_w, n_ref);
+        let (k, c) = self.0.get_or_init(|| (key, super::hap_dedup::allele_classes(ref_bm, chip_start, n_var_w, n_ref)));
+        (*k == key).then_some(c.as_slice())
+    }
+}
+
+#[derive(Clone, Copy)]
 pub struct ImputeWindowInputs<'a> {
     pub ref_bm: &'a HaplotypeBitmatrix,
     pub targ_alleles: &'a HaplotypeBitmatrix, // (n_chip sites × n_haps) full target, bit-packed
@@ -107,6 +126,9 @@ pub struct ImputeWindowInputs<'a> {
     /// Ancestry prior on the candidate ranking; None: match count only. Ignored when the
     /// candidates were precomputed for the chromosome (`--precompute-candidates`).
     pub cand_ancestry: Option<CandidateAncestry<'a>>,
+    /// The window's allele classes, shared by the calls of one window; None: this
+    /// call computes them.
+    pub allele_classes: Option<&'a WindowClasses>,
 }
 
 /// Per-stage CPU microseconds inside the per-target map, summed over all worker
@@ -249,7 +271,7 @@ pub fn impute_window(
         ne_w.as_deref(), conf_w.as_deref(), ns, &coded,
         precomputed_candidates, anc_ctx.as_ref(),
         carry, inputs.chip_start, n_var_w, inputs.keep_rows,
-        inputs.hmm_skip,
+        inputs.hmm_skip, inputs.allele_classes,
         on_batch_done,
     );
     crate::selphi_debug!("  [MEM] impute_window: HMM done: rss={:.0} MB", crate::log::rss_mb());
@@ -1059,6 +1081,8 @@ pub fn process_window_hmm(
     keep_rows: Option<&[bool]>,
     // Window rows every target leaves out of its PBWT and HMM (ImputeWindowInputs::hmm_skip).
     hmm_skip: Option<&[bool]>,
+    // The window's allele classes shared across calls (ImputeWindowInputs::allele_classes).
+    shared_classes: Option<&WindowClasses>,
     mut on_batch_done: Option<BatchDoneCb<'_>>,
 ) -> WindowHmmOutput {
     let n_ref = params.n_ref;
@@ -1118,7 +1142,11 @@ pub fn process_window_hmm(
 
     // Every reference haplotype's exact allele class over this window, for the HMM dedup:
     // window-only, so computed once here rather than by every target.
-    let classes = super::hap_dedup::allele_classes(ref_bm, chip_start, n_var_w, n_ref);
+    let own_classes;
+    let classes: &[u32] = match shared_classes.and_then(|c| c.get(ref_bm, chip_start, n_var_w, n_ref)) {
+        Some(c) => c,
+        None => { own_classes = super::hap_dedup::allele_classes(ref_bm, chip_start, n_var_w, n_ref); &own_classes }
+    };
     let adapt = if params.adapt_floor { perr_adapt() } else { None };
     // (haplotypes measured, raised, sum of their unmatched mass, sum of their floors)
     let mut adapt_stats = (0usize, 0usize, 0.0f64, 0.0f64);
@@ -1177,7 +1205,7 @@ pub fn process_window_hmm(
             let (prep, breaks) = match called {
                 None => (super::hmm::prepare_weights(
                     csc, cm_w, n_ref, est_ne,
-                    Some(super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start, classes: Some(&classes) }),
+                    Some(super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start, classes: Some(classes) }),
                     n_var_w, ne_w, prior,
                 ), breaks_w.clone()),
                 Some(sites) => {
@@ -1185,7 +1213,7 @@ pub fn process_window_hmm(
                     let ne_s: Option<Vec<f64>> = ne_w.map(|ne| sites.iter().map(|&v| ne[v]).collect());
                     let n = sites.len();
                     let src = (!nocall_dedup_off()).then_some(
-                        super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start, classes: Some(&classes) });
+                        super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start, classes: Some(classes) });
                     (super::hmm::prepare_weights(csc, &cm_s, n_ref, est_ne, src, n, ne_s.as_deref(), prior),
                      vec![(0usize, n)])
                 }

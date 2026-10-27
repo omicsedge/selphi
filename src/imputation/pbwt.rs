@@ -44,11 +44,132 @@ impl CscMatchMatrix {
 /// PBWT prefix-sort update.
 ///
 /// Splits haplotypes by allele at position k: 0-alleles first, 1-alleles second.
-/// Updates a[], d[], a_inv[] in place.
+/// Updates a[] and d[] in place, and a_inv[] for the haplotypes `>= track_from`
+/// (the targets: every reader of a_inv asks for a target's position, so the
+/// panel entries' inverse is not kept). The hot inner loop — called once per
+/// variant per target.
+///
+/// Branch-free (every entry is written to both buckets and only its own cursor
+/// advances; the stray write is overwritten by the next entry of that bucket or
+/// by the bucket-1 copy at the end, and the bucket-0 cursor never passes the read
+/// position), with AVX-512 compress-store blocks where available (the
+/// `diploid::pbwt_neighbor` split: segmented max-scan of the divergences). Each
+/// bucket receives exactly the entries and divergences of the branchy loop, in the
+/// same order, and each tracked a_inv entry is its haplotype's final position.
+/// `SELPHI_FORCE_SCALAR=1` / `SELPHI_FORCE_AVX2=1` keep the scalar loop.
 #[inline]
-/// PBWT sort update: partition haplotypes by allele (0 first, then 1).
-/// This is the hot inner loop — called once per variant per target.
+#[allow(clippy::too_many_arguments)]
 fn pbwt_forwards_ad(
+    a: &mut [i32], a_inv: &mut [i32], d: &mut [i32],
+    y: &[u8], b: &mut [i32], e: &mut [i32], m: usize, k: usize, track_from: usize,
+) {
+    assert!(a.len() >= m && a_inv.len() >= m && d.len() > m && y.len() >= m && b.len() >= m && e.len() >= m);
+    // Haplotype ids are i32: the AVX-512 tracking compares them unsigned and
+    // writes a_inv through them unchecked, so every id must be a valid index.
+    assert!(m <= i32::MAX as usize, "PBWT of {m} haplotypes exceeds the i32 haplotype ids");
+    let sentinel = k as i32 + 2;
+    #[allow(unused_mut)]
+    let (mut i0, mut u, mut v, mut p, mut q) = (0usize, 0usize, 0usize, k as i32 + 1, k as i32 + 1);
+    #[cfg(target_arch = "x86_64")]
+    if crate::diploid::pbwt_neighbor::split_use_avx512() {
+        // SAFETY: lengths asserted above.
+        (i0, u, v, p, q) = unsafe {
+            forwards_ad_avx512(a.as_mut_ptr(), a_inv.as_mut_ptr(), d.as_mut_ptr(), y.as_ptr(),
+                b.as_mut_ptr(), e.as_mut_ptr(), m, p, q, track_from)
+        };
+    }
+    for i in i0..m {
+        let di = d[i];
+        if di > p { p = di; }
+        if di > q { q = di; }
+        let ai = a[i];
+        let one = (y[i] != 0) as usize;
+        // A tracked entry in bucket 1 records its bucket-1 index, flagged.
+        if ai as usize >= track_from { a_inv[ai as usize] = if one == 0 { u as i32 } else { TRACK_ONE | v as i32 }; }
+        a[u] = ai;
+        d[u] = p;
+        b[v] = ai;
+        e[v] = q;
+        // The bucket an entry joins restarts its own running maximum.
+        p = if one == 0 { 0 } else { p };
+        q = if one == 0 { q } else { 0 };
+        u += one ^ 1;
+        v += one;
+    }
+    debug_assert_eq!(u + v, m, "PBWT partition invariant violated: u={} v={} m={}", u, v, m);
+    a[u..u + v].copy_from_slice(&b[..v]);
+    d[u..u + v].copy_from_slice(&e[..v]);
+    for x in a_inv[track_from.min(m)..m].iter_mut() {
+        if *x & TRACK_ONE != 0 { *x = (*x & !TRACK_ONE) + u as i32; }
+    }
+    d[0] = sentinel;
+    d[m] = sentinel;
+}
+
+/// Flag of a tracked bucket-1 position until the bucket-0 size is known.
+const TRACK_ONE: i32 = i32::MIN;
+
+/// AVX-512 blocks of [`pbwt_forwards_ad`]: whole 16-entry blocks, returning
+/// (next entry, bucket sizes, running maxima) for the scalar tail. Same
+/// partition and divergence scan as `pbwt_neighbor::split_avx512_blocks` (wide
+/// labels), with the allele read from the byte row `y` (non-zero = bucket 1),
+/// and the tracked entries' positions recorded as the scalar loop does.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn forwards_ad_avx512(a: *mut i32, a_inv: *mut i32, d: *mut i32, y: *const u8, b: *mut i32, e: *mut i32,
+                             m: usize, p0: i32, q0: i32, track_from: usize) -> (usize, usize, usize, i32, i32) { unsafe {
+    use std::arch::x86_64::*;
+    use crate::diploid::pbwt_neighbor::{seg_max_scan, lead_lanes};
+    let trk = _mm512_set1_epi32(track_from.min(i32::MAX as usize) as i32);
+    let (mut u, mut v, mut p, mut q, mut h) = (0usize, 0usize, p0, q0, 0usize);
+    while h + 16 <= m {
+        let av = _mm512_loadu_si512(a.add(h) as *const _);
+        let dv = _mm512_loadu_si512(d.add(h) as *const _);
+        let yv = _mm512_cvtepu8_epi32(_mm_loadu_si128(y.add(h) as *const __m128i));
+        let m1: u16 = _mm512_test_epi32_mask(yv, yv);
+        let m0: u16 = !m1;
+        let tm: u16 = _mm512_cmpge_epu32_mask(av, trk);
+        if tm != 0 {
+            let mut lanes = [0i32; 16];
+            _mm512_storeu_si512(lanes.as_mut_ptr() as *mut _, av);
+            let mut t = tm;
+            while t != 0 {
+                let i = t.trailing_zeros();
+                t &= t - 1;
+                let below: u16 = ((1u32 << i) - 1) as u16;
+                let hap = lanes[i as usize] as usize;
+                *a_inv.add(hap) = if (m1 >> i) & 1 == 0 {
+                    (u + (m0 & below).count_ones() as usize) as i32
+                } else {
+                    TRACK_ONE | (v + (m1 & below).count_ones() as usize) as i32
+                };
+            }
+        }
+        let heads_p = m0 << 1; // bucket-0 entries restart p after themselves
+        let heads_q = m1 << 1;
+        let sp = seg_max_scan(dv, heads_p);
+        let sq = seg_max_scan(dv, heads_q);
+        let pv = _mm512_mask_max_epi32(sp, lead_lanes(heads_p), sp, _mm512_set1_epi32(p));
+        let qv = _mm512_mask_max_epi32(sq, lead_lanes(heads_q), sq, _mm512_set1_epi32(q));
+        _mm512_storeu_si512(a.add(u) as *mut _, _mm512_maskz_compress_epi32(m0, av));
+        _mm512_storeu_si512(b.add(v) as *mut _, _mm512_maskz_compress_epi32(m1, av));
+        _mm512_storeu_si512(d.add(u) as *mut _, _mm512_maskz_compress_epi32(m0, pv));
+        _mm512_storeu_si512(e.add(v) as *mut _, _mm512_maskz_compress_epi32(m1, qv));
+        let sp15 = _mm_extract_epi32::<3>(_mm512_extracti32x4_epi32::<3>(sp));
+        let sq15 = _mm_extract_epi32::<3>(_mm512_extracti32x4_epi32::<3>(sq));
+        p = if m0 & 0x8000 != 0 { 0 } else if heads_p == 0 { p.max(sp15) } else { sp15 };
+        q = if m1 & 0x8000 != 0 { 0 } else if heads_q == 0 { q.max(sq15) } else { sq15 };
+        u += m0.count_ones() as usize;
+        v += m1.count_ones() as usize;
+        h += 16;
+    }
+    (h, u, v, p, q)
+}}
+
+/// The branchy update `pbwt_forwards_ad` replaced (test oracle).
+#[cfg(test)]
+fn legacy_forwards_ad(
     a: &mut [i32], a_inv: &mut [i32], d: &mut [i32],
     y: &[u8], b: &mut [i32], e: &mut [i32], m: usize, k: usize,
 ) {
@@ -57,37 +178,7 @@ fn pbwt_forwards_ad(
     let mut p = k as i32 + 1;
     let mut q = k as i32 + 1;
     let sentinel = k as i32 + 2;
-
-    // Unrolled: process 4 elements at a time for better ILP
-    let m4 = m & !3;
-    let mut i = 0;
-    while i < m4 {
-        // Process 4 elements — compiler can schedule independent ops
-        macro_rules! step {
-            ($idx:expr) => {
-                let di = d[$idx];
-                if di > p { p = di; }
-                if di > q { q = di; }
-                let ai = a[$idx];
-                if y[$idx] == 0 {
-                    a_inv[ai as usize] = u as i32;
-                    a[u] = ai;
-                    d[u] = p;
-                    u += 1;
-                    p = 0;
-                } else {
-                    b[v] = ai;
-                    e[v] = q;
-                    v += 1;
-                    q = 0;
-                }
-            };
-        }
-        step!(i); step!(i+1); step!(i+2); step!(i+3);
-        i += 4;
-    }
-    // Remainder
-    while i < m {
+    for i in 0..m {
         let di = d[i];
         if di > p { p = di; }
         if di > q { q = di; }
@@ -103,19 +194,53 @@ fn pbwt_forwards_ad(
             v += 1;
             q = 0;
         }
-        i += 1;
     }
-    // Merge b into a (after u)
-    debug_assert_eq!(u + v, m, "PBWT partition invariant violated: u={} v={} m={}", u, v, m);
-    unsafe {
-        std::ptr::copy_nonoverlapping(b.as_ptr(), a.as_mut_ptr().add(u), v);
-        std::ptr::copy_nonoverlapping(e.as_ptr(), d.as_mut_ptr().add(u), v);
-    }
-    for i in 0..v {
-        a_inv[b[i] as usize] = (u + i) as i32;
-    }
+    a[u..u + v].copy_from_slice(&b[..v]);
+    d[u..u + v].copy_from_slice(&e[..v]);
+    for i in 0..v { a_inv[b[i] as usize] = (u + i) as i32; }
     d[0] = sentinel;
     d[m] = sentinel;
+}
+
+#[cfg(test)]
+mod forwards_ad_tests {
+    use super::*;
+    /// The branch-free / AVX-512 update leaves a and d exactly as the branchy
+    /// one and a_inv at every tracked haplotype, over many sites of random alleles
+    /// (non-0/1 bytes included), sizes around the 16-lane blocks, long runs, and
+    /// tracking all, none, half or only the last haplotype.
+    #[test]
+    fn forwards_ad_matches_the_branchy_update() {
+        let mut s = 0x0123_4567_89AB_CDEFu64;
+        let mut rnd = move || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        for &m in &[1usize, 2, 15, 16, 17, 31, 32, 33, 100, 257, 1000, 4099] {
+            let mut st1 = (vec![0i32; m], vec![0i32; m], vec![0i32; m + 1]);
+            for i in 0..m { st1.0[i] = i as i32; st1.1[i] = i as i32; }
+            st1.2[0] = 1; st1.2[m] = 1;
+            let mut st2 = st1.clone();
+            let (mut b1, mut e1, mut b2, mut e2) = (vec![0i32; m], vec![0i32; m], vec![0i32; m], vec![0i32; m]);
+            let mut y = vec![0u8; m];
+            for k in 0..60 {
+                let mode = rnd() % 4;
+                for (i, x) in y.iter_mut().enumerate() {
+                    *x = match mode {
+                        0 => (rnd() % 2) as u8,
+                        1 => ((i / 7) % 2) as u8,
+                        2 => if rnd() % 50 == 0 { 2 + (rnd() % 3) as u8 } else { (rnd() % 2) as u8 },
+                        _ => (rnd() % 10 == 0) as u8,
+                    };
+                }
+                let track_from = [0usize, m.saturating_sub(1), m / 2, m][(k % 4) as usize];
+                legacy_forwards_ad(&mut st1.0, &mut st1.1, &mut st1.2, &y, &mut b1, &mut e1, m, k);
+                pbwt_forwards_ad(&mut st2.0, &mut st2.1, &mut st2.2, &y, &mut b2, &mut e2, m, k, track_from);
+                assert_eq!((&st1.0, &st1.2), (&st2.0, &st2.2), "m {m} site {k}");
+                assert_eq!(&st1.1[track_from..], &st2.1[track_from..], "a_inv m {m} site {k} from {track_from}");
+                // untracked entries are not kept: re-sync them so every later site
+                // starts from the full inverse, as the oracle does
+                st2.1[..track_from].copy_from_slice(&st1.1[..track_from]);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -399,7 +524,7 @@ pub fn pbwt_forward_filtered<F: MatchFilter>(
             Some(now)
         } else { None };
 
-        pbwt_forwards_ad(&mut ws.a, &mut ws.a_inv, &mut ws.d, &ws.y, &mut ws.b, &mut ws.e, m, var);
+        pbwt_forwards_ad(&mut ws.a, &mut ws.a_inv, &mut ws.d, &ws.y, &mut ws.b, &mut ws.e, m, var, n_ref);
 
         if var < n_var - 1 {
             let r = rows.row(var + 1);
@@ -821,7 +946,7 @@ pub(crate) fn pbwt_forward_shared_impl(
             Some(now)
         } else { None };
 
-        pbwt_forwards_ad(&mut ws.a, &mut ws.a_inv, &mut ws.d, &ws.y, &mut ws.b, &mut ws.e, m, var);
+        pbwt_forwards_ad(&mut ws.a, &mut ws.a_inv, &mut ws.d, &ws.y, &mut ws.b, &mut ws.e, m, var, n_ref);
 
         if var < n_var - 1 {
             let r = rows.row(var + 1);
@@ -1190,7 +1315,7 @@ mod tests {
 
         // var 0: alleles = [0, 1, 0, 1]
         let y = vec![0u8, 1, 0, 1];
-        pbwt_forwards_ad(&mut a, &mut a_inv, &mut d, &y, &mut b, &mut e, m, 0);
+        pbwt_forwards_ad(&mut a, &mut a_inv, &mut d, &y, &mut b, &mut e, m, 0, 0);
         // After sort: 0-alleles first (h0, h2), then 1-alleles (h1, h3)
         assert_eq!(a[0], 0);
         assert_eq!(a[1], 2);
@@ -1336,19 +1461,102 @@ mod tests {
 
 use std::collections::HashMap;
 
-/// Coded step partitioning: groups haplotypes by allele sequence at regular cM intervals.
+/// Coded step partitioning: haplotypes grouped by allele sequence at regular cM
+/// intervals. Every reader asks only for the group of a TARGET haplotype and its
+/// reference members, so only those are kept: per step, the distinct groups the
+/// targets fall in. Groups are exactly those of the full partition (see
+/// `build_coded_steps_bm`); members are listed in ascending haplotype order.
 pub struct CodedSteps {
     /// Step boundaries: step i covers chip variants [starts[i], starts[i+1])
     pub starts: Vec<usize>,
-    /// Per-step: group_id → list of haplotype indices (absolute in merged panel)
-    pub step_groups: Vec<Vec<Vec<u32>>>,
-    /// Per-step: haplotype → group_id mapping
-    pub hap_group: Vec<Vec<u32>>,
+    /// Reference haplotypes are `[0, n_ref)`, targets `n_ref + t`.
+    n_ref: usize,
+    /// Per step, per target `t`: its group in `groups[step]`.
+    target_group: Vec<Vec<u32>>,
+    /// Per step: the reference members of each distinct target group.
+    groups: Vec<Vec<GroupMembers>>,
 }
 
+/// Reference members of one group: a sorted list, or a bitmask over the
+/// reference haplotypes when that is smaller.
+pub enum GroupMembers {
+    List(Vec<u32>),
+    Mask(Vec<u64>),
+}
+
+impl GroupMembers {
+    /// The members of a mask over `n_words` reference words, stored in whichever
+    /// form is smaller.
+    fn from_mask(mask: Vec<u64>) -> Self {
+        let n: usize = mask.iter().map(|w| w.count_ones() as usize).sum();
+        if n * 4 > mask.len() * 8 { return GroupMembers::Mask(mask); }
+        let mut list = Vec::with_capacity(n);
+        for (w, &x) in mask.iter().enumerate() {
+            let mut x = x;
+            while x != 0 { list.push((w * 64 + x.trailing_zeros() as usize) as u32); x &= x - 1; }
+        }
+        GroupMembers::List(list)
+    }
+
+    /// A sorted member list over `ref_words` reference words, stored in
+    /// whichever form is smaller.
+    fn from_list(list: Vec<u32>, ref_words: usize) -> Self {
+        if list.len() * 4 <= ref_words * 8 { return GroupMembers::List(list); }
+        let mut mask = vec![0u64; ref_words];
+        for &h in &list { mask[h as usize / 64] |= 1u64 << (h % 64); }
+        GroupMembers::Mask(mask)
+    }
+
+    /// Calls `f` with every member, ascending.
+    #[inline]
+    pub fn for_each(&self, mut f: impl FnMut(u32)) {
+        match self {
+            GroupMembers::List(v) => for &h in v { f(h) },
+            GroupMembers::Mask(m) => for (w, &x) in m.iter().enumerate() {
+                let mut x = x;
+                while x != 0 { f((w * 64 + x.trailing_zeros() as usize) as u32); x &= x - 1; }
+            },
+        }
+    }
+}
+
+impl CodedSteps {
+    /// Number of steps.
+    #[inline]
+    pub fn n_steps(&self) -> usize { self.groups.len() }
+
+    /// The group of target haplotype `target_hap` (absolute: `n_ref + t`) at step `s`.
+    #[inline]
+    pub fn target_members(&self, s: usize, target_hap: usize) -> &GroupMembers {
+        debug_assert!(target_hap >= self.n_ref, "coded steps keep target groups only");
+        &self.groups[s][self.target_group[s][target_hap - self.n_ref] as usize]
+    }
+
+    /// Calls `f` with every reference haplotype that shares target `target_hap`'s
+    /// group at step `s`, ascending.
+    #[inline]
+    pub fn for_each_member(&self, s: usize, target_hap: usize, f: impl FnMut(u32)) {
+        self.target_members(s, target_hap).for_each(f)
+    }
+}
+
+/// At most this many distinct target groups in a step of <= 40 sites have their
+/// members found by word-wide masks; more fall back to coding every haplotype.
+const CODED_MASK_MAX_GROUPS: usize = 16;
+
 /// Build coded steps directly from bitmatrix (ref) + target array (no alleles_w needed).
-/// Ref alleles read 64-at-a-time from bitmatrix words. Target from dense array.
-/// Saves ~2GB allocation for TOPMed-scale panels.
+///
+/// A haplotype's code over a step is its alleles read as a binary number (first
+/// site most significant) for steps of at most 40 sites, else an FNV-1a hash of
+/// them; haplotypes with equal codes form a group. Only the targets' groups are
+/// kept. In a short step equal codes mean equal alleles (the code is injective on
+/// 0/1 alleles), so a target code's reference members are the haplotypes whose
+/// alleles spell that code, found 64 at a time by AND-ing each site's row or its
+/// complement (no reference haplotype spells a code of a non-0/1 target allele).
+/// Long steps, and short steps with many distinct target codes, code every
+/// reference haplotype as before and keep those equal to a target code (hash
+/// collisions included).
+#[allow(clippy::too_many_arguments)]
 pub fn build_coded_steps_bm(
     bm: &crate::common::HaplotypeBitmatrix,
     chip_start: usize,
@@ -1359,11 +1567,396 @@ pub fn build_coded_steps_bm(
     chip_cm: &[f64],
     step_cm: f64,
 ) -> CodedSteps {
+    let mut starts = Vec::new();
+    if n_var == 0 || chip_cm.is_empty() {
+        return CodedSteps { starts: vec![0], n_ref, target_group: vec![], groups: vec![] };
+    }
+
+    let mut next_pos = chip_cm[0] + step_cm / 2.0;
+    starts.push(0);
+    for i in 1..n_var {
+        if chip_cm[i] >= next_pos {
+            starts.push(i);
+            next_pos = chip_cm[i] + step_cm;
+        }
+    }
+    starts.push(n_var);
+
+    let n_steps = starts.len() - 1;
+    let n_words = bm.n_words();
+    let ref_words = n_ref.div_ceil(64);
+    let tail = if n_ref % 64 == 0 { !0u64 } else { (1u64 << (n_ref % 64)) - 1 };
+
+    // Parallel: each step is independent (encode + group)
+    let results: Vec<(Vec<u32>, Vec<GroupMembers>)> = (0..n_steps).into_par_iter().map(|s| {
+        let var_start = starts[s];
+        let var_end = starts[s + 1];
+        let step_len = var_end - var_start;
+        let short = step_len <= 40;
+
+        // The targets' codes, as every haplotype's code was computed (each site's
+        // panel row is read first, as the full coding read it).
+        let mut tcodes = vec![if short { 0u64 } else { 0xcbf29ce484222325 }; n_haps];
+        for var in var_start..var_end {
+            let _ = bm.row(chip_start + var);
+            let trow = &targ[var * n_haps..(var + 1) * n_haps];
+            if short {
+                for t in 0..n_haps { tcodes[t] = tcodes[t] * 2 + trow[t] as u64; }
+            } else {
+                for t in 0..n_haps {
+                    tcodes[t] ^= trow[t] as u64;
+                    tcodes[t] = tcodes[t].wrapping_mul(0x100000001b3);
+                }
+            }
+        }
+        // Distinct target codes, in order of first appearance.
+        let mut uniq: Vec<u64> = Vec::new();
+        let mut tg = vec![0u32; n_haps];
+        if n_haps <= 32 {
+            for t in 0..n_haps {
+                tg[t] = match uniq.iter().position(|&c| c == tcodes[t]) {
+                    Some(g) => g as u32,
+                    None => { uniq.push(tcodes[t]); (uniq.len() - 1) as u32 }
+                };
+            }
+        } else {
+            let mut seen: HashMap<u64, u32> = HashMap::new();
+            for t in 0..n_haps {
+                tg[t] = *seen.entry(tcodes[t]).or_insert_with(|| { uniq.push(tcodes[t]); (uniq.len() - 1) as u32 });
+            }
+        }
+
+        let members: Vec<GroupMembers> = if short && uniq.len() <= CODED_MASK_MAX_GROUPS {
+            uniq.iter().map(|&code| {
+                let mut mask = vec![0u64; ref_words];
+                if code >> step_len == 0 {
+                    mask.fill(!0u64);
+                    for (i, var) in (var_start..var_end).enumerate() {
+                        // Haplotypes past the matrix's words were never coded: code 0,
+                        // i.e. all-0 alleles here.
+                        let row = bm.row(chip_start + var);
+                        let have = row.len().min(ref_words);
+                        if (code >> (step_len - 1 - i)) & 1 == 1 {
+                            for (m, &r) in mask[..have].iter_mut().zip(row) { *m &= r; }
+                            for m in mask[have..].iter_mut() { *m = 0; }
+                        } else {
+                            for (m, &r) in mask[..have].iter_mut().zip(row) { *m &= !r; }
+                        }
+                    }
+                    if let Some(l) = mask.last_mut() { *l &= tail; }
+                }
+                GroupMembers::from_mask(mask)
+            }).collect()
+        } else {
+            let mut codes = vec![0u64; n_ref];
+            if short {
+                for var in var_start..var_end {
+                    let ci = chip_start + var;
+                    let row = bm.row(ci);
+                    for w in 0..n_words {
+                        let word = row[w];
+                        let base = w * 64;
+                        let end = (base + 64).min(n_ref);
+                        if base >= n_ref { break; }
+                        for bit in 0..(end - base) {
+                            codes[base + bit] = codes[base + bit] * 2 + ((word >> bit) & 1);
+                        }
+                    }
+                }
+            } else {
+                for h in 0..n_ref { codes[h] = 0xcbf29ce484222325; }
+                for var in var_start..var_end {
+                    let ci = chip_start + var;
+                    let row = bm.row(ci);
+                    for w in 0..n_words {
+                        let word = row[w];
+                        let base = w * 64;
+                        let end = (base + 64).min(n_ref);
+                        if base >= n_ref { break; }
+                        for bit in 0..(end - base) {
+                            codes[base + bit] ^= (word >> bit) & 1;
+                            codes[base + bit] = codes[base + bit].wrapping_mul(0x100000001b3);
+                        }
+                    }
+                }
+            }
+            // Members listed as found (ascending); a list larger than a mask is
+            // stored as one. Memory stays linear in the haplotypes.
+            let mut lists: Vec<Vec<u32>> = vec![Vec::new(); uniq.len()];
+            if uniq.len() <= 8 {
+                for h in 0..n_ref {
+                    if let Some(g) = uniq.iter().position(|&c| c == codes[h]) { lists[g].push(h as u32); }
+                }
+            } else {
+                let mut sorted: Vec<(u64, u32)> = uniq.iter().enumerate().map(|(g, &c)| (c, g as u32)).collect();
+                sorted.sort_unstable();
+                for h in 0..n_ref {
+                    if let Ok(i) = sorted.binary_search_by(|e| e.0.cmp(&codes[h])) {
+                        lists[sorted[i].1 as usize].push(h as u32);
+                    }
+                }
+            }
+            lists.into_iter().map(|l| GroupMembers::from_list(l, ref_words)).collect()
+        };
+        (tg, members)
+    }).collect();
+
+    let (target_group, groups): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+    CodedSteps { starts, n_ref, target_group, groups }
+}
+
+/// Select candidate reference haplotypes for a target using CodedSteps partitions.
+///
+/// Iterates ALL steps, collecting ref haps that share a partition with the target
+/// at ANY step. This captures the full mosaic structure — ref haps that are
+/// IBS-similar at different positions along the chromosome.
+pub fn select_candidates(
+    coded: &CodedSteps,
+    target_hap: usize,     // absolute index in merged panel
+    n_ref: usize,          // number of reference haplotypes (hap < n_ref = ref)
+    max_candidates: usize, // cap (default 2000)
+) -> Vec<u32> {
+    select_candidates_weighted(coded, target_hap, n_ref, max_candidates, None, 0)
+}
+
+/// `select_candidates` for a target with NO-CALLS at `miss` (bitset over the window's
+/// sites). A no-call carries no allele, so in a step that holds one the target's code
+/// is unknown and the coded groups cannot be used: its partners there are the panel
+/// haplotypes that agree with it at that step's CALLED sites, read from the bitmatrix
+/// 64 haplotypes at a time (a step with no called site contributes nothing). Steps
+/// without a no-call use the groups exactly as `select_candidates`. This is what a
+/// single-sample run gets for free, where a site no sample calls is dropped before
+/// the steps are coded; in a cohort the site stays (other samples call it) and the
+/// allele the phasing filled in would otherwise decide the target's partners.
+#[allow(clippy::too_many_arguments)]
+pub fn select_candidates_nocall(
+    coded: &CodedSteps,
+    target_hap: usize,
+    n_ref: usize,
+    max_candidates: usize,
+    miss: &[u64],
+    bm: &crate::common::HaplotypeBitmatrix,
+    chip_start: usize,
+    targ: &[u8],     // (n_var, n_haps) row-major window alleles
+    n_haps: usize,
+    tgt: usize,      // target column in `targ`
+) -> Vec<u32> {
+    let n_steps = coded.n_steps();
+    if n_steps == 0 { return Vec::new(); }
+    let n_words = n_ref.div_ceil(64);
+    let tail = if n_ref % 64 == 0 { !0u64 } else { (1u64 << (n_ref % 64)) - 1 };
+    let mut mask = vec![0u64; n_words];
+    // Per step: the partner list (borrowed group, or computed from the called sites).
+    let mut computed: Vec<Option<Vec<u32>>> = vec![None; n_steps];
+    let mut empty = vec![false; n_steps];
+    for s in 0..n_steps {
+        let (a, b) = (coded.starts[s], coded.starts[s + 1]);
+        if !(a..b).any(|v| (miss[v / 64] >> (v % 64)) & 1 == 1) { continue; }
+        mask.fill(!0u64);
+        if let Some(l) = mask.last_mut() { *l = tail; }
+        let mut any_called = false;
+        for v in a..b {
+            if (miss[v / 64] >> (v % 64)) & 1 == 1 { continue; }
+            any_called = true;
+            let row = bm.row(chip_start + v);
+            if targ[v * n_haps + tgt] == 1 {
+                for w in 0..n_words { mask[w] &= row[w]; }
+            } else {
+                for w in 0..n_words { mask[w] &= !row[w]; }
+            }
+            if let Some(l) = mask.last_mut() { *l &= tail; }
+        }
+        if !any_called { empty[s] = true; continue; }
+        let mut list = Vec::new();
+        for (w, &word) in mask.iter().enumerate() {
+            let mut x = word;
+            while x != 0 { list.push((w * 64 + x.trailing_zeros() as usize) as u32); x &= x - 1; }
+        }
+        computed[s] = Some(list);
+    }
+    // Every partner of the target at step `s`, ascending.
+    let for_members = |s: usize, f: &mut dyn FnMut(u32)| {
+        if empty[s] { return; }
+        match &computed[s] {
+            Some(l) => for &h in l { f(h) },
+            None => coded.for_each_member(s, target_hap, f),
+        }
+    };
+    thread_local! {
+        static TL_SEEN2: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let mut seen = TL_SEEN2.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    if seen.len() < n_ref { seen.resize(n_ref, false); }
+    let mut candidates = Vec::new();
+    for s in 0..n_steps {
+        for_members(s, &mut |h| {
+            if (h as usize) < n_ref && !seen[h as usize] { seen[h as usize] = true; candidates.push(h); }
+        });
+    }
+    for &h in &candidates { seen[h as usize] = false; }
+    TL_SEEN2.with(|c| { *c.borrow_mut() = seen; });
+    if candidates.len() > max_candidates {
+        let mut scores = vec![0u32; n_ref];
+        for s in 0..n_steps {
+            for_members(s, &mut |h| { if (h as usize) < n_ref { scores[h as usize] += 1; } });
+        }
+        candidates.sort_unstable_by(|&a, &b| scores[b as usize].cmp(&scores[a as usize]));
+        candidates.truncate(max_candidates);
+    }
+    candidates.sort_unstable();
+    candidates
+}
+
+/// Variant with ancestry-aware rescoring.
+///
+/// When `ancestry` is `Some`, every raw PBWT match hit is counted as
+/// `ancestry.score(tgt_local, h)` instead of 1. Candidates are then sorted
+/// by the re-weighted count. When the number of candidates fits inside
+/// `max_candidates`, ancestry still affects the returned sort order so the
+/// top-K slice used downstream is ancestry-biased.
+///
+/// `tgt_local` is the target's haplotype index in the ancestry table
+/// (0..n_target_haps), distinct from `target_hap` which is absolute in the
+/// PBWT coded steps.
+#[allow(clippy::too_many_arguments)]
+pub fn select_candidates_weighted(
+    coded: &CodedSteps,
+    target_hap: usize,
+    n_ref: usize,
+    max_candidates: usize,
+    ancestry: Option<&crate::imputation::ancestry::AncestryContext<'_>>,
+    tgt_local: usize,
+) -> Vec<u32> {
+    let n_steps = coded.n_steps();
+    if n_steps == 0 {
+        return Vec::new();
+    }
+
+    // `seen` is an n_ref-wide mask (171k entries on TOPMed) that used to be
+    // allocated and zeroed per target. Thread-local, reset only where touched.
+    thread_local! {
+        static TL_SEEN: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let mut seen = TL_SEEN.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    if seen.len() < n_ref { seen.resize(n_ref, false); }
+    let mut candidates = Vec::new();
+
+    for s in 0..n_steps {
+        coded.for_each_member(s, target_hap, |h| {
+            if (h as usize) < n_ref && !seen[h as usize] {
+                seen[h as usize] = true;
+                candidates.push(h);
+            }
+        });
+    }
+    for &h in &candidates { seen[h as usize] = false; }
+    TL_SEEN.with(|c| { *c.borrow_mut() = seen; });
+
+    // Ancestry rescoring: rank by (raw match count) × (ancestry multiplier).
+    // Three regimes:
+    //   - None: raw integer counts, no rescoring, no sort unless truncating
+    //   - Some, no local: global target-ancestry vector (same for every step)
+    //   - Some, with local: per-step target-ancestry vector (local ancestry)
+    let need_sort = ancestry.is_some() || candidates.len() > max_candidates;
+    if need_sort {
+        let mut scores = vec![0.0f32; n_ref];
+        let use_local = ancestry.map(|a| a.local.is_some()).unwrap_or(false);
+        for s in 0..n_steps {
+            coded.for_each_member(s, target_hap, |h| {
+                if (h as usize) < n_ref {
+                    let w = match ancestry {
+                        None => 1.0,
+                        Some(a) if use_local => a.score_local(tgt_local, h, s),
+                        Some(a) => a.score(tgt_local, h),
+                    };
+                    scores[h as usize] += w;
+                }
+            });
+        }
+        candidates.sort_unstable_by(|&a, &b| {
+            scores[b as usize]
+                .partial_cmp(&scores[a as usize])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if candidates.len() > max_candidates {
+            candidates.truncate(max_candidates);
+        }
+    }
+
+    candidates.sort_unstable();
+    candidates
+}
+
+
+
+
+
+
+#[cfg(test)]
+mod sparse_scan_tests {
+    use super::*;
+    /// The sparse majority-allele scan must reproduce the full walk exactly, on panels with
+    /// rare, common and majority-ALT sites, with and without candidate masks.
+    #[test]
+    fn sparse_scan_is_byte_identical_to_the_walk() {
+        let mut seed: u64 = 0x9E3779B97F4A7C15;
+        let mut rnd = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        for trial in 0..12 {
+            let n_ref = 300 + 37 * trial; let n_tgt = 9; let m = n_ref + n_tgt; let n_var = 220;
+            // site frequencies spanning rare -> majority-ALT
+            let mut alleles = vec![0u8; n_var * m];
+            let mut base: Vec<u8> = (0..m).map(|_| (rnd() % 2) as u8).collect();
+            for v in 0..n_var {
+                let f = [2u64, 5, 30, 50, 80, 97][(rnd() % 6) as usize];
+                for h in 0..m {
+                    if rnd() % 100 < 8 { base[h] = (rnd() % 100 < f) as u8; } // haplotype blocks with recombination
+                    alleles[v * m + h] = if rnd() % 100 < 3 { 1 - base[h] } else { base[h] };
+                }
+            }
+            let words = n_ref.div_ceil(64);
+            let mask: Vec<u64> = (0..words).map(|_| rnd()).collect();
+            let targets: Vec<SharedTarget> = (0..n_tgt).map(|t| SharedTarget {
+                target_abs: (n_ref + t) as i32, keep: if t % 2 == 0 { None } else { Some(&mask[..]) }, miss: None }).collect();
+            for &min_l in &[3usize, 6] {
+                let mut ws1 = PbwtWorkspace::new(m, n_ref); let mut ws2 = PbwtWorkspace::new(m, n_ref);
+                let mut r1 = DenseRows { alleles: &alleles, m }; let mut r2 = DenseRows { alleles: &alleles, m };
+                let mut h1 = Vec::new(); let mut h2 = Vec::new();
+                let a = pbwt_forward_shared_impl(&mut ws1, &mut r1, n_var, m, n_ref, min_l, 5, &targets, &mut h1, false);
+                let b = pbwt_forward_shared_impl(&mut ws2, &mut r2, n_var, m, n_ref, min_l, 5, &targets, &mut h2, true);
+                for t in 0..n_tgt {
+                    assert_eq!(a[t].haps, b[t].haps, "haps differ trial {trial} min_l {min_l} target {t}");
+                    assert_eq!(a[t].lens, b[t].lens, "lens differ trial {trial} min_l {min_l} target {t}");
+                    assert_eq!(a[t].counts, b[t].counts, "counts differ trial {trial} min_l {min_l} target {t}");
+                    assert_eq!(h1[t], h2[t], "ht differ trial {trial} min_l {min_l} target {t}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod coded_steps_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// The full partition (every haplotype's group), as built before only the
+    /// targets' groups were kept: the oracle.
+    #[allow(clippy::too_many_arguments)]
+fn legacy_build(
+    bm: &crate::common::HaplotypeBitmatrix,
+    chip_start: usize,
+    n_var: usize,
+    n_ref: usize,
+    targ: &[u8],       // (n_var, n_haps) row-major
+    n_haps: usize,
+    chip_cm: &[f64],
+    step_cm: f64,
+) -> (Vec<usize>, Vec<Vec<Vec<u32>>>, Vec<Vec<u32>>) {
     let m = n_ref + n_haps;
 
     let mut starts = Vec::new();
     if n_var == 0 || chip_cm.is_empty() {
-        return CodedSteps { starts: vec![0], step_groups: vec![], hap_group: vec![] };
+        return (vec![0], vec![], vec![]);
     }
 
     let mut next_pos = chip_cm[0] + step_cm / 2.0;
@@ -1446,234 +2039,89 @@ pub fn build_coded_steps_bm(
     }).collect();
 
     let (step_groups, hap_group): (Vec<_>, Vec<_>) = results.into_iter().unzip();
-    CodedSteps { starts, step_groups, hap_group }
-}
-
-/// Select candidate reference haplotypes for a target using CodedSteps partitions.
-///
-/// Iterates ALL steps, collecting ref haps that share a partition with the target
-/// at ANY step. This captures the full mosaic structure — ref haps that are
-/// IBS-similar at different positions along the chromosome.
-pub fn select_candidates(
-    coded: &CodedSteps,
-    target_hap: usize,     // absolute index in merged panel
-    n_ref: usize,          // number of reference haplotypes (hap < n_ref = ref)
-    max_candidates: usize, // cap (default 2000)
-) -> Vec<u32> {
-    select_candidates_weighted(coded, target_hap, n_ref, max_candidates, None, 0)
-}
-
-/// `select_candidates` for a target with NO-CALLS at `miss` (bitset over the window's
-/// sites). A no-call carries no allele, so in a step that holds one the target's code
-/// is unknown and the coded groups cannot be used: its partners there are the panel
-/// haplotypes that agree with it at that step's CALLED sites, read from the bitmatrix
-/// 64 haplotypes at a time (a step with no called site contributes nothing). Steps
-/// without a no-call use the groups exactly as `select_candidates`. This is what a
-/// single-sample run gets for free, where a site no sample calls is dropped before
-/// the steps are coded; in a cohort the site stays (other samples call it) and the
-/// allele the phasing filled in would otherwise decide the target's partners.
-#[allow(clippy::too_many_arguments)]
-pub fn select_candidates_nocall(
-    coded: &CodedSteps,
-    target_hap: usize,
-    n_ref: usize,
-    max_candidates: usize,
-    miss: &[u64],
-    bm: &crate::common::HaplotypeBitmatrix,
-    chip_start: usize,
-    targ: &[u8],     // (n_var, n_haps) row-major window alleles
-    n_haps: usize,
-    tgt: usize,      // target column in `targ`
-) -> Vec<u32> {
-    let n_steps = coded.step_groups.len();
-    if n_steps == 0 { return Vec::new(); }
-    let n_words = n_ref.div_ceil(64);
-    let tail = if n_ref % 64 == 0 { !0u64 } else { (1u64 << (n_ref % 64)) - 1 };
-    let mut mask = vec![0u64; n_words];
-    // Per step: the partner list (borrowed group, or computed from the called sites).
-    let mut computed: Vec<Option<Vec<u32>>> = vec![None; n_steps];
-    let mut empty = vec![false; n_steps];
-    for s in 0..n_steps {
-        let (a, b) = (coded.starts[s], coded.starts[s + 1]);
-        if !(a..b).any(|v| (miss[v / 64] >> (v % 64)) & 1 == 1) { continue; }
-        mask.fill(!0u64);
-        if let Some(l) = mask.last_mut() { *l = tail; }
-        let mut any_called = false;
-        for v in a..b {
-            if (miss[v / 64] >> (v % 64)) & 1 == 1 { continue; }
-            any_called = true;
-            let row = bm.row(chip_start + v);
-            if targ[v * n_haps + tgt] == 1 {
-                for w in 0..n_words { mask[w] &= row[w]; }
-            } else {
-                for w in 0..n_words { mask[w] &= !row[w]; }
-            }
-            if let Some(l) = mask.last_mut() { *l &= tail; }
-        }
-        if !any_called { empty[s] = true; continue; }
-        let mut list = Vec::new();
-        for (w, &word) in mask.iter().enumerate() {
-            let mut x = word;
-            while x != 0 { list.push((w * 64 + x.trailing_zeros() as usize) as u32); x &= x - 1; }
-        }
-        computed[s] = Some(list);
-    }
-    let members = |s: usize| -> &[u32] {
-        if empty[s] { return &[]; }
-        match &computed[s] {
-            Some(l) => l,
-            None => &coded.step_groups[s][coded.hap_group[s][target_hap] as usize],
-        }
-    };
-    thread_local! {
-        static TL_SEEN2: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
-    }
-    let mut seen = TL_SEEN2.with(|c| std::mem::take(&mut *c.borrow_mut()));
-    if seen.len() < n_ref { seen.resize(n_ref, false); }
-    let mut candidates = Vec::new();
-    for s in 0..n_steps {
-        for &h in members(s) {
-            if (h as usize) < n_ref && !seen[h as usize] { seen[h as usize] = true; candidates.push(h); }
-        }
-    }
-    for &h in &candidates { seen[h as usize] = false; }
-    TL_SEEN2.with(|c| { *c.borrow_mut() = seen; });
-    if candidates.len() > max_candidates {
-        let mut scores = vec![0u32; n_ref];
-        for s in 0..n_steps {
-            for &h in members(s) { if (h as usize) < n_ref { scores[h as usize] += 1; } }
-        }
-        candidates.sort_unstable_by(|&a, &b| scores[b as usize].cmp(&scores[a as usize]));
-        candidates.truncate(max_candidates);
-    }
-    candidates.sort_unstable();
-    candidates
-}
-
-/// Variant with ancestry-aware rescoring.
-///
-/// When `ancestry` is `Some`, every raw PBWT match hit is counted as
-/// `ancestry.score(tgt_local, h)` instead of 1. Candidates are then sorted
-/// by the re-weighted count. When the number of candidates fits inside
-/// `max_candidates`, ancestry still affects the returned sort order so the
-/// top-K slice used downstream is ancestry-biased.
-///
-/// `tgt_local` is the target's haplotype index in the ancestry table
-/// (0..n_target_haps), distinct from `target_hap` which is absolute in the
-/// PBWT coded steps.
-#[allow(clippy::too_many_arguments)]
-pub fn select_candidates_weighted(
-    coded: &CodedSteps,
-    target_hap: usize,
-    n_ref: usize,
-    max_candidates: usize,
-    ancestry: Option<&crate::imputation::ancestry::AncestryContext<'_>>,
-    tgt_local: usize,
-) -> Vec<u32> {
-    let n_steps = coded.step_groups.len();
-    if n_steps == 0 {
-        return Vec::new();
-    }
-
-    // `seen` is an n_ref-wide mask (171k entries on TOPMed) that used to be
-    // allocated and zeroed per target. Thread-local, reset only where touched.
-    thread_local! {
-        static TL_SEEN: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
-    }
-    let mut seen = TL_SEEN.with(|c| std::mem::take(&mut *c.borrow_mut()));
-    if seen.len() < n_ref { seen.resize(n_ref, false); }
-    let mut candidates = Vec::new();
-
-    for s in 0..n_steps {
-        let group_id = coded.hap_group[s][target_hap] as usize;
-        for &h in &coded.step_groups[s][group_id] {
-            if (h as usize) < n_ref && !seen[h as usize] {
-                seen[h as usize] = true;
-                candidates.push(h);
-            }
-        }
-    }
-    for &h in &candidates { seen[h as usize] = false; }
-    TL_SEEN.with(|c| { *c.borrow_mut() = seen; });
-
-    // Ancestry rescoring: rank by (raw match count) × (ancestry multiplier).
-    // Three regimes:
-    //   - None: raw integer counts, no rescoring, no sort unless truncating
-    //   - Some, no local: global target-ancestry vector (same for every step)
-    //   - Some, with local: per-step target-ancestry vector (local ancestry)
-    let need_sort = ancestry.is_some() || candidates.len() > max_candidates;
-    if need_sort {
-        let mut scores = vec![0.0f32; n_ref];
-        let use_local = ancestry.map(|a| a.local.is_some()).unwrap_or(false);
-        for s in 0..n_steps {
-            let gid = coded.hap_group[s][target_hap] as usize;
-            for &h in &coded.step_groups[s][gid] {
-                if (h as usize) < n_ref {
-                    let w = match ancestry {
-                        None => 1.0,
-                        Some(a) if use_local => a.score_local(tgt_local, h, s),
-                        Some(a) => a.score(tgt_local, h),
-                    };
-                    scores[h as usize] += w;
-                }
-            }
-        }
-        candidates.sort_unstable_by(|&a, &b| {
-            scores[b as usize]
-                .partial_cmp(&scores[a as usize])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        if candidates.len() > max_candidates {
-            candidates.truncate(max_candidates);
-        }
-    }
-
-    candidates.sort_unstable();
-    candidates
+    (starts, step_groups, hap_group)
 }
 
 
-
-
-
-
-#[cfg(test)]
-mod sparse_scan_tests {
-    use super::*;
-    /// The sparse majority-allele scan must reproduce the full walk exactly, on panels with
-    /// rare, common and majority-ALT sites, with and without candidate masks.
+    /// Every target's group members (reference haplotypes, ascending) equal the
+    /// full partition's, on short and long (> 40-site, hashed) steps, few and many
+    /// distinct target codes, non-0/1 target values and panels that are not a
+    /// multiple of 64 wide; and the candidate selections built on them match.
     #[test]
-    fn sparse_scan_is_byte_identical_to_the_walk() {
-        let mut seed: u64 = 0x9E3779B97F4A7C15;
-        let mut rnd = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
-        for trial in 0..12 {
-            let n_ref = 300 + 37 * trial; let n_tgt = 9; let m = n_ref + n_tgt; let n_var = 220;
-            // site frequencies spanning rare -> majority-ALT
-            let mut alleles = vec![0u8; n_var * m];
-            let mut base: Vec<u8> = (0..m).map(|_| (rnd() % 2) as u8).collect();
-            for v in 0..n_var {
-                let f = [2u64, 5, 30, 50, 80, 97][(rnd() % 6) as usize];
-                for h in 0..m {
-                    if rnd() % 100 < 8 { base[h] = (rnd() % 100 < f) as u8; } // haplotype blocks with recombination
-                    alleles[v * m + h] = if rnd() % 100 < 3 { 1 - base[h] } else { base[h] };
+    fn target_groups_match_the_full_partition() {
+        let mut seed = 0x51u64;
+        let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        for trial in 0..24 {
+            let n_ref = [100usize, 128, 129, 300, 640, 1001][trial % 6];
+            let n_haps = [2usize, 10, 40, 6][trial % 4];
+            let n_var = 60 + (rnd() % 200) as usize;
+            // haplotype blocks: few founders so groups are large and targets share them
+            let n_f = 4 + (rnd() % 4) as usize;
+            let founders: Vec<Vec<u8>> = (0..n_f).map(|_| (0..n_var).map(|_| (rnd() % 2) as u8).collect()).collect();
+            let pick = |r: u64| (r as usize) % n_f;
+            let mut ref_alleles = vec![0u8; n_var * n_ref];
+            for h in 0..n_ref {
+                let mut f = pick(rnd());
+                for v in 0..n_var {
+                    if rnd() % 50 == 0 { f = pick(rnd()); }
+                    ref_alleles[v * n_ref + h] = founders[f][v] ^ (rnd() % 200 == 0) as u8;
                 }
             }
-            let words = n_ref.div_ceil(64);
-            let mask: Vec<u64> = (0..words).map(|_| rnd()).collect();
-            let targets: Vec<SharedTarget> = (0..n_tgt).map(|t| SharedTarget {
-                target_abs: (n_ref + t) as i32, keep: if t % 2 == 0 { None } else { Some(&mask[..]) }, miss: None }).collect();
-            for &min_l in &[3usize, 6] {
-                let mut ws1 = PbwtWorkspace::new(m, n_ref); let mut ws2 = PbwtWorkspace::new(m, n_ref);
-                let mut r1 = DenseRows { alleles: &alleles, m }; let mut r2 = DenseRows { alleles: &alleles, m };
-                let mut h1 = Vec::new(); let mut h2 = Vec::new();
-                let a = pbwt_forward_shared_impl(&mut ws1, &mut r1, n_var, m, n_ref, min_l, 5, &targets, &mut h1, false);
-                let b = pbwt_forward_shared_impl(&mut ws2, &mut r2, n_var, m, n_ref, min_l, 5, &targets, &mut h2, true);
-                for t in 0..n_tgt {
-                    assert_eq!(a[t].haps, b[t].haps, "haps differ trial {trial} min_l {min_l} target {t}");
-                    assert_eq!(a[t].lens, b[t].lens, "lens differ trial {trial} min_l {min_l} target {t}");
-                    assert_eq!(a[t].counts, b[t].counts, "counts differ trial {trial} min_l {min_l} target {t}");
-                    assert_eq!(h1[t], h2[t], "ht differ trial {trial} min_l {min_l} target {t}");
+            // bitmatrix wider than n_ref, or (an odd shape the coding tolerates)
+            // narrower: haplotypes past its words are never coded
+            let bm_cols = if trial % 3 == 0 { n_ref + 70 } else if trial % 7 == 6 && n_ref > 64 { n_ref - 64 } else { n_ref };
+            let bm = crate::common::HaplotypeBitmatrix::from_panel(n_var, bm_cols,
+                &|site, hap| hap < n_ref && ref_alleles[site * n_ref + hap] != 0, &vec![true; n_var]);
+            let mut targ = vec![0u8; n_var * n_haps];
+            for t in 0..n_haps {
+                let src = (rnd() as usize) % n_ref;
+                for v in 0..n_var {
+                    let mut a = ref_alleles[v * n_ref + src] ^ (rnd() % 100 == 0) as u8;
+                    if trial % 5 == 4 && rnd() % 97 == 0 { a = 2; } // a non-0/1 value
+                    targ[v * n_haps + t] = a;
                 }
+            }
+            // short steps (dense cM) or long ones (> 40 sites per step)
+            let cm_step = if trial % 2 == 0 { 0.004 } else { 0.0005 };
+            let chip_cm: Vec<f64> = (0..n_var).map(|i| i as f64 * cm_step).collect();
+            for &chip_start in &[0usize] {
+                let new = build_coded_steps_bm(&bm, chip_start, n_var, n_ref, &targ, n_haps, &chip_cm, 0.05);
+                let (starts, groups, hg) = legacy_build(&bm, chip_start, n_var, n_ref, &targ, n_haps, &chip_cm, 0.05);
+                assert_eq!(new.starts, starts);
+                assert_eq!(new.n_steps(), groups.len());
+                for s in 0..new.n_steps() {
+                    for t in 0..n_haps {
+                        let want: Vec<u32> = groups[s][hg[s][n_ref + t] as usize].iter().copied()
+                            .filter(|&h| (h as usize) < n_ref).collect();
+                        let mut got = Vec::new();
+                        new.for_each_member(s, n_ref + t, |h| got.push(h));
+                        assert_eq!(got, want, "trial {trial} step {s} target {t}");
+                    }
+                }
+                for t in 0..n_haps {
+                    for mc in [5usize, 50, 100_000] {
+                        let a = select_candidates(&new, n_ref + t, n_ref, mc);
+                        // the oracle's selection, written out as before
+                        let mut seen = vec![false; n_ref];
+                        let mut cand: Vec<u32> = Vec::new();
+                        for s in 0..groups.len() {
+                            for &h in &groups[s][hg[s][n_ref + t] as usize] {
+                                if (h as usize) < n_ref && !seen[h as usize] { seen[h as usize] = true; cand.push(h); }
+                            }
+                        }
+                        if cand.len() > mc {
+                            let mut scores = vec![0.0f32; n_ref];
+                            for s in 0..groups.len() {
+                                for &h in &groups[s][hg[s][n_ref + t] as usize] { if (h as usize) < n_ref { scores[h as usize] += 1.0; } }
+                            }
+                            cand.sort_unstable_by(|&x, &y| scores[y as usize].partial_cmp(&scores[x as usize]).unwrap_or(std::cmp::Ordering::Equal));
+                            cand.truncate(mc);
+                        }
+                        cand.sort_unstable();
+                        assert_eq!(a, cand, "trial {trial} target {t} mc {mc}");
+                    }
+                }
+                let _ = HashMap::<u64, u32>::new();
             }
         }
     }
