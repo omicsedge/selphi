@@ -68,6 +68,20 @@ impl HaplotypeBitmatrix {
     #[inline(always)]
     pub fn n_words(&self) -> usize { self.n_words }
 
+    /// Keep rows `n_visible..` stored but outside `n_sites`: everything that walks
+    /// `0..n_sites` sees the first `n_visible` rows only, while `row`/`get` still
+    /// reach the hidden tail by absolute row (the lcWGS impute-only indel rows).
+    pub fn with_hidden_tail(mut self, n_visible: usize) -> Self {
+        assert!(n_visible <= self.n_sites, "hidden tail: {} visible of {} rows", n_visible, self.n_sites);
+        self.n_sites = n_visible;
+        self
+    }
+
+    /// Stored rows, hidden tail included.
+    pub fn n_rows(&self) -> usize {
+        if self.n_words == 0 { self.n_sites } else { self.bits.len() / self.n_words }
+    }
+
     /// Build from raw Vec<u64> parts (for SRP extraction).
     pub fn from_raw(bits: Vec<u64>, n_sites: usize, n_haps: usize) -> Self {
         let n_words = n_haps.div_ceil(64);

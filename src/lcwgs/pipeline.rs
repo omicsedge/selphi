@@ -159,7 +159,44 @@ pub fn run_lcwgs(
     memtrace("after gl3_shared relayout (gl3_input dropped)");
 
     // --- 5. cM map + chunked Gibbs imputation (shared with the BAM path) ---
-    impute_from_gl3(srp, &wgs_idx, gl3_shared, n_samples, sample_ids, &pl_haploid, map_path, params, None)
+    impute_from_gl3(srp, &wgs_idx, gl3_shared, n_samples, sample_ids, &pl_haploid, map_path, params, None, None)
+}
+
+/// Panel sites imputed without entering the chain (`LCWGS_BAM_INDELS=impute`, the
+/// `--bam` path's indels): see [`super::iterate::ChunkPassengers`].
+pub(crate) struct Passengers {
+    /// Panel variant index of each passenger (ascending).
+    idx: Vec<usize>,
+    /// Insertion point among the run's active sites: passenger `p` lies after
+    /// active site `ins[p] - 1` and before active site `ins[p]`.
+    ins: Vec<usize>,
+    /// Their own genotype likelihoods (`[(p * n_samples + s) * 3 + g]`), or flat.
+    gl3: Option<Vec<f32>>,
+}
+
+impl Passengers {
+    fn new(active: &[usize], idx: Vec<usize>, gl3: Option<Vec<f32>>) -> Self {
+        assert!(idx.windows(2).all(|w| w[0] < w[1]), "passenger panel indices must ascend");
+        let ins = idx.iter().map(|&i| active.partition_point(|&w| w < i)).collect();
+        Passengers { idx, ins, gl3 }
+    }
+
+    /// The passengers of the chunk whose core is `core` (active-site indices):
+    /// those whose left active neighbour lies in the core, the ones before the
+    /// first active site with the chunk that holds it. Cores partition the active
+    /// sites, so these partition the passengers.
+    fn of_core(&self, core: &std::ops::Range<usize>) -> std::ops::Range<usize> {
+        let left = |x: &usize| x.saturating_sub(1);
+        self.ins.partition_point(|x| left(x) < core.start)..self.ins.partition_point(|x| left(x) < core.end)
+    }
+}
+
+/// A chunk's reference bitmatrix: the active sites' rows, then (hidden from
+/// `n_sites`) its passengers' rows.
+fn chunk_bitmatrix(srp: &SrpReader, chunk_wgs: &[usize], pass_wgs: &[usize]) -> crate::common::HaplotypeBitmatrix {
+    if pass_wgs.is_empty() { return srp.extract_ref_alleles_bitmatrix(chunk_wgs); }
+    let rows: Vec<usize> = chunk_wgs.iter().chain(pass_wgs).copied().collect();
+    srp.extract_ref_alleles_bitmatrix(&rows).with_hidden_tail(chunk_wgs.len())
 }
 
 /// A chromosome with nothing to impute from: no input record matches the panel, or no site
@@ -256,13 +293,15 @@ fn impute_from_gl3(
     map_path: &str,
     params: &LcwgsParams,
     prepared: Option<Prepared>,
+    passengers: Option<Passengers>,
 ) -> std::io::Result<LcwgsOutput> {
     let n_shared = wgs_idx.len();
     // The coverage proxy of the SPLIT gate and the adaptive GL floor, read from the
     // likelihoods as given: a man's product-form chrX rows look more confident than
     // his reads are, which would switch the split off on his chrX alone.
     let mean_conf = gl_mean_conf(&gl3_shared, n_samples, n_shared);
-    let haploid = haploid_chrx(&mut gl3_shared, srp, wgs_idx, n_samples, &sample_ids, pl_haploid, params);
+    let pass_idx: &[usize] = passengers.as_ref().map_or(&[], |p| p.idx.as_slice());
+    let haploid = haploid_chrx(&mut gl3_shared, srp, wgs_idx, n_samples, &sample_ids, pl_haploid, params, pass_idx);
     // Nothing but flat likelihoods (a GT-only, GP or DS file forced onto this engine, a BAM with
     // no read on this chromosome) would be imputed from the panel alone.
     if !gl3_shared.chunks_exact(3).any(|g| g[0] != g[1] || g[1] != g[2]) {
@@ -296,28 +335,8 @@ fn impute_from_gl3(
         return Ok(LcwgsOutput { dosage: raw, gp, n_variants: n_shared, sample_ids, panel_idx: wgs_idx.to_vec() });
     }
 
-    // Adaptive conditioning depth (chip/WGS auto-max-candidates concept): on a big
-    // diverse panel a fixed kpbwt=2000 under-selects, so the true RARE carrier is
-    // often not in the conditioning set (the one bin GLIMPSE2 still kept). Scale
-    // kpbwt with panel size, clamped: big panels deepen (rare-bin gap closes, e.g.
-    // 75552-hap panel → ~5000: rare 0.9971→0.9989, ties GLIMPSE2, +10s/+0.24GB),
-    // small/matched panels stay 2000 (r12 unchanged). Past ~5000 the common bins
-    // regress (rare↔common tradeoff), hence the cap. Skip when kpbwt is set explicitly.
     let mut eff = params.clone();
-    let mut modified = false;
-    if !crate::config::present("LCWGS_KPBWT") {
-        let n_ref = srp.metadata.n_haps;
-        // Capped below n_ref as well as at 5000: a depth at or above the panel size
-        // makes the sparse-PBWT allocation short-circuit (see faithful_select.rs).
-        let adaptive = ((n_ref as f64 * 0.066).round() as usize)
-            .clamp(2000, 5000)
-            .min(n_ref.saturating_sub(1).max(1));
-        if adaptive != eff.kpbwt {
-            crate::selphi_info!("  adaptive K: kpbwt {} → {} (n_ref={})", eff.kpbwt, adaptive, n_ref);
-            eff.kpbwt = adaptive;
-            modified = true;
-        }
-    }
+    let (mut modified, big_split) = apply_conditioning(&mut eff, srp.metadata.n_haps, super::big_panel::Explicit::from_env());
     // Coverage-adaptive GL floor (LCWGS_ADAPT_MIN_GL, default OFF; honoured only when
     // LCWGS_MIN_GL is unset). At HIGH coverage the reads manufacture confident
     // false-HET GLs at rare hom-ref sites that the default 1e-10 floor can't catch
@@ -336,12 +355,121 @@ fn impute_from_gl3(
             crate::selphi_info!("  adaptive min_gl: kept {} (mean_conf={:.3} < {:.2}, low coverage)", eff.min_gl, mean_conf, thr);
         }
     }
+    // Panel-order-independent conditioning cap (LCWGS_QUAL_TRUNC=hash|hybrid): its
+    // panel priority, keyed by the panel's sample IDs, built once for the run.
+    if eff.cap.is_none()
+        && let Some(plan) = super::faithful_select::cap_plan_from_env(&srp.sample_ids, srp.metadata.n_haps) {
+        eff.cap = Some(plan);
+        modified = true;
+    }
     let params: &LcwgsParams = if modified { &eff } else { params };
 
-    let (dosage, mut gp) = run_chunked_gibbs(&gl3_shared, srp, wgs_idx, &cm, n_samples, n_shared, params, mean_conf,
-        prepared_chunks.as_deref());
-    if let Some(cells) = &haploid { haploid_gp(cells, &dosage, &mut gp, n_samples); }
-    Ok(LcwgsOutput { dosage, gp, n_variants: n_shared, sample_ids, panel_idx: wgs_idx.to_vec() })
+    let pass_cm = match &passengers { Some(p) => site_cm(srp, &p.idx, map_path)?, None => Vec::new() };
+    let (dosage, mut gp, mut pass_dosage, mut pass_gp) = run_chunked_gibbs(&gl3_shared, srp, wgs_idx, &cm, n_samples, n_shared, params, mean_conf,
+        big_split, prepared_chunks.as_deref(), passengers.as_ref().map(|p| (p, pass_cm.as_slice())));
+    if let Some(gl) = passengers.as_ref().and_then(|p| p.gl3.as_deref()) {
+        let cells = haploid.as_ref().map(|c| (c.sample.as_slice(), c.pass_site.as_slice()));
+        fold_passenger_reads(&mut pass_gp, &mut pass_dosage, gl, n_samples, cells);
+    }
+    if let Some(cells) = &haploid {
+        haploid_gp(&cells.sample, &cells.site, &dosage, &mut gp, n_samples);
+        haploid_gp(&cells.sample, &cells.pass_site, &pass_dosage, &mut pass_gp, n_samples);
+    }
+    match passengers {
+        None => Ok(LcwgsOutput { dosage, gp, n_variants: n_shared, sample_ids, panel_idx: wgs_idx.to_vec() }),
+        Some(p) => {
+            let (dosage, gp, panel_idx) = merge_rows(wgs_idx, dosage, gp, &p.idx, pass_dosage, pass_gp, n_samples);
+            Ok(LcwgsOutput { dosage, gp, n_variants: panel_idx.len(), sample_ids, panel_idx })
+        }
+    }
+}
+
+/// Conditioning depth and cap order by panel size (see `super::big_panel`): whether
+/// `eff` changed, and the biobank-size SPLIT parameters (`None` below the boundary or
+/// with `LCWGS_BIG_PANEL=0|order`). Depth: when `LCWGS_KPBWT` is unset, the adaptive
+/// `round(0.066 n_ref)` clamped to [2000, 5000] and below the panel size (= 2000 on
+/// panels of 2,001 haplotypes up to `BIG_PANEL_MIN_HAPS`). Order: on a biobank-size
+/// panel, unless `LCWGS_QUAL_TRUNC` is set (non-empty), the caller supplied a cap
+/// plan or `LCWGS_BIG_PANEL=0`, GLIMPSE2's rank
+/// order instead of haplotype-index order (the index order keeps only the block the
+/// panel lists first: on v3 the UK Biobank haplotypes), said loudly. Panels below
+/// the boundary are unchanged.
+fn apply_conditioning(eff: &mut LcwgsParams, n_ref: usize, explicit: super::big_panel::Explicit)
+    -> (bool, Option<super::big_panel::BigSplit>) {
+    use super::big_panel;
+    let explicit = big_panel::Explicit { order: explicit.order || eff.cap.is_some(), ..explicit };
+    let plan = big_panel::resolve(n_ref, explicit);
+    let mut modified = false;
+    if let Some(adaptive) = plan.kpbwt && adaptive != eff.kpbwt {
+        crate::selphi_info!("  adaptive K: kpbwt {} → {} (n_ref={})", eff.kpbwt, adaptive, n_ref);
+        eff.kpbwt = adaptive;
+        modified = true;
+    }
+    if let Some(order) = plan.order {
+        eff.cap = Some(super::faithful_select::CapPlan::rank_only(order));
+        modified = true;
+        crate::selphi_step!("{}", crate::log::yellow(&format!(
+            "lcWGS big panel ({} haplotypes >= {}): conditioning capped in GLIMPSE2 rank order (g2) instead of haplotype-index order, at kpbwt {}; LCWGS_BIG_PANEL=0 restores the index order",
+            n_ref, big_panel::BIG_PANEL_MIN_HAPS, eff.kpbwt)));
+    }
+    (modified, plan.split)
+}
+
+/// The passengers' own read likelihoods folded into their genotype posteriors once
+/// the chain's copying prior is averaged (over main iterations, restarts and the
+/// split's deep pass): `GP ∝ prior · GL`, `DS = GP1 + 2 GP2`. A haploid cell
+/// (`haploid` = (sample, passenger) flags of the chrX non-PAR males) folds its
+/// one allele instead: prior `p = DS / 2`, `P(ALT) ∝ p · GL2` against
+/// `(1 - p) · GL0`, `GP = (1 - P, 0, P)`, `DS = 2P` (the haploid convention of
+/// `haploid_gp`). A likelihood that rules out every prior genotype leaves the prior.
+fn fold_passenger_reads(gp: &mut [f32], dosage: &mut [f32], gl3: &[f32], n_samples: usize, haploid: Option<(&[bool], &[bool])>) {
+    for (i, (g, l)) in gp.chunks_exact_mut(3).zip(gl3.chunks_exact(3)).enumerate() {
+        let one = haploid.is_some_and(|(sample, site)| sample[i % n_samples] && site[i / n_samples]);
+        if one {
+            let p = (dosage[i] as f64 * 0.5).clamp(0.0, 1.0);
+            let (a, r) = (p * l[2] as f64, (1.0 - p) * l[0] as f64);
+            let z = a + r;
+            if z > 0.0 && z.is_finite() {
+                let q = a / z;
+                g[0] = (1.0 - q) as f32;
+                g[1] = 0.0;
+                g[2] = q as f32;
+                dosage[i] = (2.0 * q) as f32;
+            }
+            continue;
+        }
+        let post = [g[0] as f64 * l[0] as f64, g[1] as f64 * l[1] as f64, g[2] as f64 * l[2] as f64];
+        let z = post[0] + post[1] + post[2];
+        if z > 0.0 && z.is_finite() {
+            for k in 0..3 { g[k] = (post[k] / z) as f32; }
+            dosage[i] = ((post[1] + 2.0 * post[2]) / z) as f32;
+        }
+    }
+}
+
+/// Interleave the passengers' rows with the active rows in panel order.
+#[allow(clippy::too_many_arguments)]
+fn merge_rows(
+    active: &[usize], dosage: Vec<f32>, gp: Vec<f32>,
+    pass: &[usize], pass_dosage: Vec<f32>, pass_gp: Vec<f32>, n_samples: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<usize>) {
+    let n = active.len() + pass.len();
+    let (mut d, mut g, mut idx) = (Vec::with_capacity(n * n_samples), Vec::with_capacity(n * n_samples * 3), Vec::with_capacity(n));
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < active.len() || j < pass.len() {
+        if j < pass.len() && (i >= active.len() || pass[j] < active[i]) {
+            idx.push(pass[j]);
+            d.extend_from_slice(&pass_dosage[j * n_samples..(j + 1) * n_samples]);
+            g.extend_from_slice(&pass_gp[j * n_samples * 3..(j + 1) * n_samples * 3]);
+            j += 1;
+        } else {
+            idx.push(active[i]);
+            d.extend_from_slice(&dosage[i * n_samples..(i + 1) * n_samples]);
+            g.extend_from_slice(&gp[i * n_samples * 3..(i + 1) * n_samples * 3]);
+            i += 1;
+        }
+    }
+    (d, g, idx)
 }
 
 /// Genetic position of every shared site. Beyond the map's ends: the
@@ -373,14 +501,13 @@ struct Prepared {
 /// start first: as many of the largest chunks as fit nine tenths of the state
 /// allowance the scheduler will grant (estimated before the pileup, with the
 /// likelihoods and a pileup allowance counted as shared).
-fn prepare_chunks(srp: &SrpReader, wgs_idx: &[usize], map_path: &str, params: &LcwgsParams) -> std::io::Result<Prepared> {
+fn prepare_chunks(srp: &SrpReader, wgs_idx: &[usize], map_path: &str, params: &LcwgsParams, pass: Option<&Passengers>) -> std::io::Result<Prepared> {
     use rayon::prelude::*;
     let cm = site_cm(srp, wgs_idx, map_path)?;
     let n_shared = wgs_idx.len();
     let n_ref = srp.metadata.n_haps;
-    let (core_cm, buffer_cm) = (params.chunk_core_cm(), params.chunk_buffer_cm());
-    let n_chunks = if n_shared == 0 { 0 } else { (((cm[n_shared - 1] - cm[0]) / core_cm).ceil() as usize).max(1) };
-    let ranges: Vec<_> = (0..n_chunks).map(|c| super::chunk_ranges::chunk_ranges(&cm, c, n_chunks, core_cm, buffer_cm)).collect();
+    let ranges = plan_chunks(&cm, params, n_ref, false);
+    let n_chunks = ranges.len();
     let threads = rayon::current_num_threads().max(1);
     let shared = (rss_gb() * 1_073_741_824.0) as usize
         + threads * (super::hmm::CACHE_BYTES_PER_WORKER + super::membership::CACHE_BYTES_PER_WORKER)
@@ -390,7 +517,8 @@ fn prepare_chunks(srp: &SrpReader, wgs_idx: &[usize], map_path: &str, params: &L
     let limit = crate::config::f64_opt("LCWGS_MEM_BUDGET_GB").map(|gb| (gb * 1e9) as usize)
         .unwrap_or_else(|| baseline_memory_budget(n_shared, n_ref, 1, n_chunks, threads, shared, host_allowance));
     let allowance = limit.saturating_sub(shared) / 2 * 9 / 10;
-    let costs: Vec<usize> = ranges.iter().map(|r| r.as_ref().map_or(0, |(_, b)| chunk_state_bytes(b.len(), n_ref, 1))).collect();
+    let n_pass = |core: &std::ops::Range<usize>| pass.map_or(0, |p| p.of_core(core).len());
+    let costs: Vec<usize> = ranges.iter().map(|r| r.as_ref().map_or(0, |(c, b)| chunk_state_bytes(b.len() + n_pass(c), n_ref, 1))).collect();
     let mut order: Vec<usize> = (0..n_chunks).filter(|&c| ranges[c].is_some()).collect();
     order.sort_by_key(|&c| std::cmp::Reverse(costs[c]));
     let (mut used, mut picked) = (0usize, Vec::new());
@@ -401,14 +529,41 @@ fn prepare_chunks(srp: &SrpReader, wgs_idx: &[usize], map_path: &str, params: &L
     }
     let selector = !crate::config::present("LCWGS_NO_FAITHFUL_SELECT") && !crate::config::present("LCWGS_CHRWIDE_PBWT");
     let built: Vec<(usize, ChunkPrep)> = picked.par_iter().map(|&c| {
-        let (_, buffer) = ranges[c].clone().unwrap();
-        let bm = srp.extract_ref_alleles_bitmatrix(&wgs_idx[buffer.clone()]);
+        let (core, buffer) = ranges[c].clone().unwrap();
+        let pass_wgs: &[usize] = pass.map_or(&[], |p| &p.idx[p.of_core(&core)]);
+        let bm = chunk_bitmatrix(srp, &wgs_idx[buffer.clone()], pass_wgs);
         let panel = selector.then(|| std::sync::Arc::new(super::faithful_select::FaithfulPanel::build(&bm, &cm[buffer], params)));
         (c, ChunkPrep { bm, panel })
     }).collect();
     let chunks: Vec<_> = (0..n_chunks).map(|_| std::sync::Mutex::new(None)).collect();
     for (c, prep) in built { *chunks[c].lock().unwrap() = Some(prep); }
     Ok(Prepared { cm, chunks })
+}
+
+/// The run's chunks (see `chunk_ranges::chunk_plan`): the cM chunks, those over
+/// the `LCWGS_CHUNK_MAX_PANEL_GB` site cap cut into smaller ones.
+fn plan_chunks(cm: &[f64], params: &LcwgsParams, n_ref: usize, log: bool) -> Vec<Option<(std::ops::Range<usize>, std::ops::Range<usize>)>> {
+    let cap = chunk_max_sites(n_ref);
+    let plan = super::chunk_ranges::chunk_plan(cm, params.chunk_core_cm(), params.chunk_buffer_cm(), cap);
+    if let Some(cap) = cap.filter(|_| log) {
+        let base = super::chunk_ranges::chunk_plan(cm, params.chunk_core_cm(), params.chunk_buffer_cm(), None);
+        if plan.len() != base.len() || plan != base {
+            let largest = base.iter().flatten().map(|(_, b)| b.len()).max().unwrap_or(0);
+            crate::selphi_info!("  chunk site cap (LCWGS_CHUNK_MAX_PANEL_GB): {} sites a chunk; {} cM chunks -> {} (largest cM chunk {} sites)",
+                cap, base.len(), plan.len(), largest);
+        }
+    }
+    plan
+}
+
+/// `LCWGS_CHUNK_MAX_PANEL_GB` (unset = no cap): the most panel rows a chunk may
+/// hold, in GB of its two bit copies (`2 * sites * ceil(n_ref / 64) * 8` bytes),
+/// as a site count. Byte-based so it scales with the panel: 2 GB is ~105,800
+/// sites on 75,552 haplotypes, ~1.3 M on 6,332.
+fn chunk_max_sites(n_ref: usize) -> Option<usize> {
+    let gb = crate::config::f64_opt("LCWGS_CHUNK_MAX_PANEL_GB").filter(|g| g.is_finite() && *g > 0.0)?;
+    let per_site = (2 * n_ref.div_ceil(64) * 8).max(1) as f64;
+    Some(((gb * 1e9) / per_site).floor().max(1.0) as usize)
 }
 
 /// Memory the pileup may still hold when the chunks start.
@@ -425,7 +580,7 @@ const SEX_TEST_BLOCKS: usize = 5;
 const SEX_LLR_MARGIN: f64 = 10.0;
 
 /// The `(sample, site)` cells modelled as haploid: chrX males outside the PARs.
-struct HaploidCells { sample: Vec<bool>, site: Vec<bool> }
+struct HaploidCells { sample: Vec<bool>, site: Vec<bool>, pass_site: Vec<bool> }
 
 /// chrX males are haploid outside the pseudo-autosomal regions. The Gibbs sampler
 /// is diploid and draws each haplotype from `(GL[ca], GL[ca+1])` given its
@@ -447,9 +602,10 @@ struct HaploidCells { sample: Vec<bool>, site: Vec<bool> }
 /// `(1-p)^2 GL0 + 2p(1-p) GL1 + p^2 GL2`; the summed log ratio must favour haploid
 /// by more than `SEX_LLR_MARGIN`. A site seen in one read is neutral; reads of both
 /// alleles at common sites decide it (a man shows them only through read errors).
+#[allow(clippy::too_many_arguments)]
 fn haploid_chrx(
     gl3: &mut [f32], srp: &SrpReader, wgs_idx: &[usize], n_samples: usize,
-    sample_ids: &[String], pl_haploid: &[bool], params: &LcwgsParams,
+    sample_ids: &[String], pl_haploid: &[bool], params: &LcwgsParams, pass_idx: &[usize],
 ) -> Option<HaploidCells> {
     if !crate::contig::is_chrx(srp.chromosome()) || wgs_idx.is_empty() { return None; }
     let build = params.build.unwrap_or_else(|| {
@@ -524,14 +680,16 @@ fn haploid_chrx(
     }
     crate::selphi_info!("  chrX: {} haploid sample(s) ({} called haploid in the input, {} from {}): one allele outside the PARs",
         n_hap, n_called, n_hap - n_called, if params.haploids.is_some() { "--haploids" } else { "the likelihood-ratio test" });
-    Some(HaploidCells { sample: haploid, site: non_par })
+    let pass_site = pass_idx.iter()
+        .map(|&wi| !(params.chrx_par && crate::contig::in_chrx_par(srp.variants.pos(wi), build))).collect();
+    Some(HaploidCells { sample: haploid, site: non_par, pass_site })
 }
 
 /// Haploid genotype posteriors for the cells of [`haploid_chrx`]: the two
 /// haplotypes are draws of one allele, so `p = DS/2` and GP = `(1-p, 0, p)`.
-fn haploid_gp(cells: &HaploidCells, dosage: &[f32], gp: &mut [f32], n_samples: usize) {
-    for (v, _) in cells.site.iter().enumerate().filter(|&(_, &np)| np) {
-        for s in (0..n_samples).filter(|&s| cells.sample[s]) {
+fn haploid_gp(sample: &[bool], site: &[bool], dosage: &[f32], gp: &mut [f32], n_samples: usize) {
+    for (v, _) in site.iter().enumerate().filter(|&(_, &np)| np) {
+        for s in (0..n_samples).filter(|&s| sample[s]) {
             let i = v * n_samples + s;
             let p = (dosage[i] * 0.5).clamp(0.0, 1.0);
             gp[3 * i] = 1.0 - p;
@@ -611,19 +769,38 @@ pub fn run_lcwgs_bam(
     selphi_info!("  lcWGS-BAM: {} BAM(s), chrom {}, {} panel sites ({} SNPs, {} indels)",
         bam_paths.len(), chrom, n_shared, n_snp, n_indel);
 
-    // Non-SNP panel sites carry NO read evidence on the default path (their GL is
-    // the flat prior), yet as members of the target set they still enter PBWT
-    // selection and the Gibbs sweeps. The PL-VCF path never sees them (a caller
-    // emits no PL record there) and measurably imputes SNPs better for it
-    // (chr22, 6 GIAB samples: +0.04 pp non-ref concordance). Match it: drop them
-    // unless indel realignment will score them from reads, or the caller asks to
-    // keep the old flat-from-scaffold behaviour (LCWGS_BAM_KEEP_INDELS).
+    // Non-SNP panel sites carry no read evidence unless LCWGS_INDEL_REALIGN scores
+    // them (miscalibrated at this depth: read-scored indels in the chain cost the
+    // SNPs 2.2 pp non-reference concordance on six capture libraries). DEFAULT:
+    // they are IMPUTED ONLY: the SNPs run exactly as without them and the indels
+    // ride along as passengers the chain never reads (see
+    // `iterate::ChunkPassengers`), so no SNP row can move (measured: SNP rows
+    // byte-identical on 12 of 12 samples, 1000 Genomes capture rig and v3), and
+    // each indel gets its copying posterior. On the 1000 Genomes capture rig (six
+    // GIAB libraries, three seeds) they score above GLIMPSE2's indels (+0.361 pp,
+    // 16/18; every MAF bin above by point estimate, the >= 5% and < 0.5% CIs span
+    // 0) and tie indels kept flat in the chain (LCWGS_BAM_INDELS=keep, which did
+    // not cost the SNPs either: +0.005 pp over 18 pairs). LCWGS_BAM_INDELS=drop
+    // leaves them out (no indel rows, the PL path's behaviour).
     let enable_indel = crate::config::present("LCWGS_INDEL_REALIGN");
-    let keep_indels = crate::config::present("LCWGS_BAM_KEEP_INDELS");
-    let (wgs_idx, pos, ref_base, alt_base, is_snp, n_shared) = if n_indel > 0 && !(enable_indel && reference.is_some()) && !keep_indels {
+    let indel_mode = if n_indel == 0 { BamIndels::Drop } else {
+        resolve_bam_indels(crate::config::raw("LCWGS_BAM_INDELS").as_deref(), crate::config::present("LCWGS_BAM_KEEP_INDELS"),
+            enable_indel && reference.is_some(), crate::config::present("LCWGS_SCAFFOLD"))
+            .map_err(|msg| -> std::io::Error { crate::Fatal::error(2, msg).into() })?
+    };
+    let impute_indels = indel_mode == BamIndels::Impute;
+    let pass_idx: Vec<usize> = if impute_indels { (0..n_shared).filter(|&i| !is_snp[i]).map(|i| wgs_idx[i]).collect() } else { Vec::new() };
+    if impute_indels {
+        selphi_info!("  lcWGS-BAM: {} indel panel sites imputed only: out of selection, sampling and phasing (the SNPs run as without them); {}. LCWGS_BAM_INDELS=drop leaves them out",
+            n_indel, if enable_indel && reference.is_some() { "their own reads scored by realignment fold into their own genotypes" }
+                else { "dose from the chain's copying posterior (flat reads)" });
+    }
+    let (wgs_idx, pos, ref_base, alt_base, is_snp, n_shared) = if n_indel > 0 && indel_mode != BamIndels::Chain {
         let keep: Vec<usize> = (0..n_shared).filter(|&i| is_snp[i]).collect();
-        selphi_info!("  lcWGS-BAM: {} indel panel sites excluded from the target set (no read evidence; as the PL path). LCWGS_BAM_KEEP_INDELS=1 keeps them flat, LCWGS_INDEL_REALIGN=1 + --reference scores them",
-            n_indel);
+        if indel_mode == BamIndels::Drop {
+            selphi_info!("  lcWGS-BAM: {} indel panel sites excluded from the target set ({}): no indel rows in the output",
+                n_indel, if crate::config::present("LCWGS_SCAFFOLD") { "LCWGS_SCAFFOLD: the impute-only default needs the full-axis model" } else { "LCWGS_BAM_INDELS=drop" });
+        }
         (
             keep.iter().map(|&i| wgs_idx[i]).collect::<Vec<usize>>(),
             keep.iter().map(|&i| pos[i]).collect::<Vec<i64>>(),
@@ -678,26 +855,137 @@ pub fn run_lcwgs_bam(
     let pp = super::bam_pileup::PileupParams::default();
     let region_bounds = region.map(|(_, s, e)| (s, e));
     let pileup = || super::bam_pileup::pileup_bams(bam_paths, &chrom, &pos, &ref_base, &alt_base, &is_snp, region_bounds, reference, indel_model.as_ref(), pp);
+    // Impute-only indels scored from their own reads: a pileup of their own, so
+    // the SNP pileup is the default's exactly.
+    let pass_pileup = || -> std::io::Result<Option<super::bam_pileup::BamGl>> {
+        let Some(refp) = reference.filter(|_| impute_indels && enable_indel) else { return Ok(None) };
+        let ppos: Vec<i64> = pass_idx.iter().map(|&wi| srp.variants.pos(wi)).collect();
+        let pref: Vec<u8> = pass_idx.iter().map(|&wi| srp.variants.ref_allele(wi).as_bytes().first().copied().unwrap_or(b'N')).collect();
+        let palt: Vec<u8> = pass_idx.iter().map(|&wi| srp.variants.alt_allele(wi).as_bytes().first().copied().unwrap_or(b'N')).collect();
+        let inputs: Vec<super::indel_realign::IndelInput> = pass_idx.iter().enumerate().map(|(p, &wi)| {
+            let v = srp.variants.get(wi);
+            super::indel_realign::IndelInput { var_idx: p, pos: ppos[p], ref_allele: v.ref_allele.as_bytes().to_vec(), alt_allele: v.alt_allele.as_bytes().to_vec() }
+        }).collect();
+        let model = super::indel_realign::IndelModel::build(refp, &chrom, &inputs)?;
+        selphi_info!("  lcWGS-BAM: indel realignment for {} impute-only indel sites (own reads only)", model.n_sites());
+        super::bam_pileup::pileup_bams(bam_paths, &chrom, &ppos, &pref, &palt, &vec![false; pass_idx.len()], region_bounds, reference, Some(&model), pp).map(Some)
+    };
+    let pileup_all = || -> std::io::Result<(super::bam_pileup::BamGl, Option<super::bam_pileup::BamGl>)> { Ok((pileup()?, pass_pileup()?)) };
+    let pass_ref = (!pass_idx.is_empty()).then(|| Passengers::new(&wgs_idx, pass_idx.clone(), None));
     // A single sample's chunks start together once its reads are piled up:
     // build their panel side meanwhile.
     let ahead = bam_paths.len() == 1 && rayon::current_num_threads() > 1 && !crate::config::present("LCWGS_RAW_GL");
-    let (bamgl, prepared) = if ahead {
-        let (gl, prep) = rayon::join(pileup, || prepare_chunks(srp, &wgs_idx, map_path, params));
+    let ((bamgl, pass_gl), prepared) = if ahead {
+        let (gl, prep) = rayon::join(pileup_all, || prepare_chunks(srp, &wgs_idx, map_path, params, pass_ref.as_ref()));
         // The pileup's and the builds' scratch was freed on many workers: hand
         // its pages back before the chunks allocate.
         crate::common::mem::release_freed_memory();
         (gl?, Some(prep?))
     } else {
-        (pileup()?, None)
+        (pileup_all()?, None)
     };
     let n_samples = bamgl.sample_ids.len();
+    let passengers = pass_ref.map(|mut p| {
+        if let Some(g) = pass_gl {
+            assert_eq!(g.sample_ids, bamgl.sample_ids, "indel pileup sample order");
+            p.gl3 = Some(g.gl3);
+        }
+        p
+    });
     // bamgl.gl3 is already in panel-shared order → shared imputation tail.
-    impute_from_gl3(srp, &wgs_idx, bamgl.gl3, n_samples, bamgl.sample_ids, &[], map_path, params, prepared)
+    impute_from_gl3(srp, &wgs_idx, bamgl.gl3, n_samples, bamgl.sample_ids, &[], map_path, params, prepared, passengers)
+}
+
+/// How the `--bam` path treats the panel's indel sites.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BamIndels {
+    /// Out of the target set: no indel rows (`LCWGS_BAM_INDELS=drop`).
+    Drop,
+    /// In the chain like the SNPs: flat likelihoods, or scored from reads with
+    /// `LCWGS_INDEL_REALIGN=1` + `--reference` (`LCWGS_BAM_INDELS=keep`, or the
+    /// legacy `LCWGS_BAM_KEEP_INDELS` / `LCWGS_INDEL_REALIGN` alone).
+    Chain,
+    /// Imputed only (default): passengers the chain never reads.
+    Impute,
+}
+
+/// The `--bam` indel handling from `LCWGS_BAM_INDELS`: `impute` | `drop` | `keep`,
+/// case-insensitive, `1`/`true`/`yes`/`on`/`y` = impute. Unset or empty (a dumped
+/// `--config` round-trips an empty value as unset): the legacy knobs keep their
+/// meaning (an indel in the chain when `LCWGS_BAM_KEEP_INDELS` is set, or
+/// `LCWGS_INDEL_REALIGN` with a reference), else impute-only, except under
+/// `LCWGS_SCAFFOLD` (its own model has no passengers), which drops them. The off
+/// spellings `0`/`false`/`no`/`off`/`n` keep the meaning they had before impute
+/// became the default, "not impute": the legacy knobs, else dropped. An explicit
+/// impute with the scaffold is an error; any other value is said and treated as
+/// unset.
+fn resolve_bam_indels(value: Option<&str>, keep_legacy: bool, realign_with_reference: bool, scaffold: bool) -> Result<BamIndels, String> {
+    let legacy = keep_legacy || realign_with_reference;
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("impute" | "1" | "true" | "yes" | "on" | "y") if scaffold =>
+            Err("LCWGS_BAM_INDELS=impute is not available with LCWGS_SCAFFOLD (the scaffold pass has its own model)".to_string()),
+        Some("impute" | "1" | "true" | "yes" | "on" | "y") => Ok(BamIndels::Impute),
+        Some("drop") => Ok(BamIndels::Drop),
+        Some("keep") => Ok(BamIndels::Chain),
+        Some("0" | "false" | "no" | "off" | "n") => Ok(if legacy { BamIndels::Chain } else { BamIndels::Drop }),
+        other => {
+            if let Some(v) = other.filter(|v| !v.is_empty()) {
+                selphi_info!("  LCWGS_BAM_INDELS='{}' not recognised (impute | drop | keep): treated as unset", v);
+            }
+            Ok(if legacy { BamIndels::Chain } else if scaffold { BamIndels::Drop } else { BamIndels::Impute })
+        }
+    }
+}
+
+/// The run's two-depth common/rare SPLIT (see `process_chunk`): sites of panel MAF in
+/// `[lo, hi)` take the genotypes of a deep pass at `k_max` `deep_k` whose conditioning
+/// depth is `deep_kpbwt` (`None`: the run's).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SplitPlan {
+    lo: f64,
+    hi: f64,
+    deep_k: usize,
+    deep_kpbwt: Option<usize>,
+}
+
+/// The SPLIT knobs as set (raw values; `None` = unset), read once per run.
+#[derive(Clone, Debug, Default)]
+struct SplitKnobs {
+    /// `LCWGS_NO_SPLIT` is set.
+    off: bool,
+    /// `LCWGS_SPLIT_MAF`: the manual band.
+    maf: Option<String>,
+    /// `LCWGS_SPLIT_BAND`: the auto band.
+    band: Option<String>,
+    /// `LCWGS_SPLIT_KMAX`.
+    kmax: Option<String>,
+    /// `LCWGS_SPLIT_KPBWT`.
+    kpbwt: Option<String>,
+    /// `LCWGS_SPLIT_GL_THR`.
+    gl_thr: Option<String>,
+    /// `LCWGS_CHRWIDE_PBWT` is set (one selection at the run's depth serves both passes).
+    chrwide: bool,
+}
+
+impl SplitKnobs {
+    fn from_env() -> Self {
+        use crate::config::{present, raw};
+        SplitKnobs {
+            off: present("LCWGS_NO_SPLIT"),
+            maf: raw("LCWGS_SPLIT_MAF"),
+            band: raw("LCWGS_SPLIT_BAND"),
+            kmax: raw("LCWGS_SPLIT_KMAX"),
+            kpbwt: raw("LCWGS_SPLIT_KPBWT"),
+            gl_thr: raw("LCWGS_SPLIT_GL_THR"),
+            chrwide: present("LCWGS_CHRWIDE_PBWT"),
+        }
+    }
 }
 
 /// Resolve the two-depth common/rare split for this run (see `process_chunk`).
-/// Priority: `LCWGS_NO_SPLIT` → off; explicit `LCWGS_SPLIT_MAF="lo,hi"` → manual;
-/// otherwise AUTO (default). AUTO engages iff BOTH hold:
+/// Priority: `LCWGS_NO_SPLIT` → off; explicit `LCWGS_SPLIT_MAF="lo,hi"` → manual
+/// (deep `k_max` `LCWGS_SPLIT_KMAX`, else 5000; deep depth `LCWGS_SPLIT_KPBWT`, else
+/// the run's; no big-panel part); otherwise AUTO (default). AUTO engages iff BOTH hold:
 ///   (1) BIG PANEL — the adaptive `kpbwt` exceeds the default conditioning cap
 ///       (3000), so the deep pass actually lets through IBD haps the default
 ///       truncates (the lever that feeds the 5-10% band). On small / panel-matched
@@ -708,38 +996,88 @@ pub fn run_lcwgs_bam(
 ///       at ≥4× (informative reads carry the signal), so high-coverage runs skip
 ///       the 2nd pass. De-noised 3-sample validation: 1× dominates all bins, 2×
 ///       wins 6/7+overall, 4× tie (not engaged).
-/// Band defaults to [0.05,0.10) (`LCWGS_SPLIT_BAND`); deep cap 5000 (`LCWGS_SPLIT_KMAX`).
-fn resolve_split(mean_conf: f32, params: &LcwgsParams) -> Option<(f64, f64, usize)> {
-    if crate::config::present("LCWGS_NO_SPLIT") { return None; }
-    let deep_k = crate::config::raw("LCWGS_SPLIT_KMAX").and_then(|x| x.parse().ok()).unwrap_or(5000usize);
+/// AUTO band [0.05,0.10) (`LCWGS_SPLIT_BAND`), deep cap 5000 (`LCWGS_SPLIT_KMAX`),
+/// deep depth the run's (`LCWGS_SPLIT_KPBWT`). On a biobank-size panel (`big`, see
+/// `super::big_panel::BIG_PANEL_SPLIT`) each of the three that is unset takes the
+/// big-panel value instead: [0.005,0.10), 3000, 2000. Not with `LCWGS_CHRWIDE_PBWT`,
+/// whose one selection at the run's depth serves both passes: the old split there.
+fn resolve_split(mean_conf: f32, params: &LcwgsParams, big: Option<super::big_panel::BigSplit>) -> Option<SplitPlan> {
+    split_plan(mean_conf, params.kpbwt, big, &SplitKnobs::from_env())
+}
+
+/// [`resolve_split`] on given knob values (`kpbwt` = the run's depth).
+fn split_plan(mean_conf: f32, kpbwt: usize, big: Option<super::big_panel::BigSplit>, knobs: &SplitKnobs) -> Option<SplitPlan> {
+    if knobs.off { return None; }
     let parse_band = |s: &str| -> Option<(f64, f64)> {
         let p: Vec<f64> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
         if p.len() == 2 && p[0] < p[1] { Some((p[0], p[1])) } else { None }
     };
-    // Manual override.
-    if let Some(s) = crate::config::raw("LCWGS_SPLIT_MAF") {
-        return parse_band(&s).map(|(lo, hi)| {
+    let kmax_set: Option<usize> = knobs.kmax.as_deref().and_then(|x| x.parse().ok());
+    // LCWGS_SPLIT_KPBWT (unset or unparsable: None). Refused (said, then None): 0, which
+    // selects nothing, and with LCWGS_CHRWIDE_PBWT any depth but the run's.
+    let kpbwt_set = || -> Option<usize> {
+        let k: usize = knobs.kpbwt.as_deref()?.parse().ok()?;
+        if k == 0 {
+            crate::selphi_info!("  LCWGS_SPLIT_KPBWT=0 is not a depth (the selection would be empty): ignored");
+            return None;
+        }
+        if k != kpbwt && knobs.chrwide {
+            crate::selphi_info!("  LCWGS_SPLIT_KPBWT has no effect with LCWGS_CHRWIDE_PBWT (one selection at kpbwt {} serves both passes): ignored", kpbwt);
+            return None;
+        }
+        Some(k)
+    };
+    // Manual override, with its own defaults.
+    if let Some(s) = &knobs.maf {
+        return parse_band(s).map(|(lo, hi)| {
+            let deep_k = kmax_set.unwrap_or(5000);
             crate::selphi_info!("  lcWGS SPLIT (manual): MAF∈[{},{}) → deep pass (k_max={})", lo, hi, deep_k);
-            (lo, hi, deep_k)
+            SplitPlan { lo, hi, deep_k, deep_kpbwt: kpbwt_set() }
         });
     }
     // AUTO. (1) big-panel gate: the deep cap must exceed the default cap to differ.
     let default_kmax = 3000usize;
-    if params.kpbwt <= default_kmax { return None; }
+    if kpbwt <= default_kmax { return None; }
     // (2) soft-GL (coverage) gate.
-    let thr: f32 = crate::config::raw("LCWGS_SPLIT_GL_THR").and_then(|x| x.parse().ok()).unwrap_or(0.84);
-    let (lo, hi) = crate::config::raw("LCWGS_SPLIT_BAND").and_then(|s| parse_band(&s)).unwrap_or((0.05, 0.10));
-    if mean_conf < thr {
-        crate::selphi_info!(
-            "  lcWGS SPLIT (auto-ON): big panel (kpbwt={}) + soft GL (mean_conf={:.3} < {:.2}) → deep pass MAF∈[{},{}) k_max={}",
-            params.kpbwt, mean_conf, thr, lo, hi, deep_k);
-        Some((lo, hi, deep_k))
-    } else {
+    let thr: f32 = knobs.gl_thr.as_deref().and_then(|x| x.parse().ok()).unwrap_or(0.84);
+    // `<` is the gate (a NaN threshold or mean_conf leaves the split off, as before).
+    let soft = mean_conf < thr;
+    if !soft {
         crate::selphi_info!(
             "  lcWGS SPLIT (auto-OFF): high coverage (mean_conf={:.3} ≥ {:.2}) — split is neutral, single pass",
             mean_conf, thr);
-        None
+        return None;
     }
+    let big = big.filter(|_| {
+        if knobs.chrwide {
+            crate::selphi_info!("  lcWGS SPLIT: LCWGS_CHRWIDE_PBWT selects one set at kpbwt {} for both passes, so the biobank-size deep pass (its own depth) does not apply: the old split", kpbwt);
+        }
+        !knobs.chrwide
+    });
+    let (lo, hi) = knobs.band.as_deref().and_then(parse_band).or(big.map(|b| b.band)).unwrap_or((0.05, 0.10));
+    let deep_k = kmax_set.or(big.map(|b| b.kmax)).unwrap_or(5000);
+    let deep_kpbwt = kpbwt_set().or(big.map(|b| b.kpbwt));
+    crate::selphi_info!(
+        "  lcWGS SPLIT (auto-ON): big panel (kpbwt={}) + soft GL (mean_conf={:.3} < {:.2}) → deep pass MAF∈[{},{}) k_max={}",
+        kpbwt, mean_conf, thr, lo, hi, deep_k);
+    if big.is_some() {
+        crate::selphi_step!("{}", crate::log::yellow(&format!(
+            "lcWGS big panel SPLIT: panel MAF [{},{}) imputed by a deep pass at kpbwt {} / k_max {} (LCWGS_SPLIT_BAND / LCWGS_SPLIT_KPBWT / LCWGS_SPLIT_KMAX set each part); LCWGS_BIG_PANEL=order restores the old split defaults (5-10%, k_max 5000, the run's depth)",
+            lo, hi, deep_kpbwt.filter(|&k| k > 0).unwrap_or(kpbwt), deep_k)));
+    }
+    Some(SplitPlan { lo, hi, deep_k, deep_kpbwt })
+}
+
+/// The SPLIT deep pass's parameters at its own depth `k` (`LCWGS_SPLIT_KPBWT`, or the
+/// biobank-size panel's 2000): `params` with `kpbwt` replaced, or `None` when `k` is
+/// unset, zero or the run's own depth (the deep pass then gets the run's `params`, at
+/// the band and `k_max` of its `SplitPlan`).
+/// Everything else in the pass is the run's (seed, schedule, cap order, the panel
+/// side, which depends on the panel, map and `rare_maf` alone), so depth 2000 under
+/// `k_max` 3000 is the computation of a whole `LCWGS_KPBWT=2000` run's single pass.
+fn deep_pass_params(params: &LcwgsParams, k: Option<usize>) -> Option<LcwgsParams> {
+    let k = k.filter(|&k| k != params.kpbwt && k > 0)?;
+    Some(LcwgsParams { kpbwt: k, ..params.clone() })
 }
 
 /// Resident chunk state, selection structures, accumulators and completed
@@ -836,7 +1174,8 @@ fn baseline_memory_budget(
 /// a buffer region on each side (computed but discarded — absorbs edge
 /// effects, like GLIMPSE2's ligation buffers).
 ///
-/// Returns (dosage, gp) per (variant, sample) in shared-panel order.
+/// Returns (dosage, gp) per (variant, sample) in shared-panel order, then the
+/// same for the impute-only passengers (`(set, their cM)`; empty without them).
 /// `gp` is 3 genotype posteriors per variant×sample.
 #[allow(clippy::too_many_arguments)]
 fn run_chunked_gibbs(
@@ -848,19 +1187,25 @@ fn run_chunked_gibbs(
     n_shared: usize,
     params: &LcwgsParams,
     mean_conf: f32,
+    big_split: Option<super::big_panel::BigSplit>,
     prepared: Option<&[std::sync::Mutex<Option<ChunkPrep>>]>,
-) -> (Vec<f32>, Vec<f32>) {
+    passengers: Option<(&Passengers, &[f64])>,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     // GLIMPSE2-style: ~core_cm core + buffer_cm each side. Defaults chosen to
     // match GLIMPSE2_chunk's typical ~few-cM cores. cM span of chr22 ≈ 50.
     let core_cm = params.chunk_core_cm();
     let buffer_cm = params.chunk_buffer_cm();
     let mut dosage = vec![0.0f32; n_shared * n_samples];
     let mut gp = vec![0.0f32; n_shared * n_samples * 3];
-    if n_shared == 0 { return (dosage, gp); }
+    let n_pass = passengers.map_or(0, |(p, _)| p.idx.len());
+    let mut pass_dosage = vec![0.0f32; n_pass * n_samples];
+    let mut pass_gp = vec![0.0f32; n_pass * n_samples * 3];
+    if n_shared == 0 { return (dosage, gp, pass_dosage, pass_gp); }
 
     // Build chunk core boundaries by cM
     let total_cm = cm[n_shared - 1] - cm[0];
-    let n_chunks = ((total_cm / core_cm).ceil() as usize).max(1);
+    let plan = plan_chunks(cm, params, srp.metadata.n_haps, true);
+    let n_chunks = plan.len();
     crate::selphi_step!(
         "chunked Gibbs: {:.1} cM span → {} chunks (core {:.1} cM + {:.1} cM buffer each side)",
         total_cm, n_chunks, core_cm, buffer_cm);
@@ -871,10 +1216,18 @@ fn run_chunked_gibbs(
     // starving the mid-frequency (5-10%) sites of the mid-ranked IBD haps they
     // need. When engaged, each chunk is ALSO imputed at a deep cap and sites whose
     // PANEL MAF ∈ [lo,hi) take the deep dose; all others keep the default. AUTO
-    // engages only on a BIG panel at LOW coverage (≤~2×) — where it makes Selphi
-    // beat GLIMPSE2 on every MAF bin; small/panel-matched panels + high coverage
-    // skip it (single pass, byte-identical). Cost when on: ~2× the per-chunk Gibbs.
-    let split_band: Option<(f64, f64, usize)> = resolve_split(mean_conf, params);
+    // engages only when kpbwt > 3000 at LOW coverage (mean_conf < 0.84); small panels
+    // and high coverage skip it (single pass, byte-identical). On a biobank-size panel
+    // the deep pass is the depth-2000 / k_max-3000 pass on panel MAF 0.5-10%
+    // (`super::big_panel::BIG_PANEL_SPLIT`). Cost when on: a second Gibbs per chunk.
+    let split_plan_run: Option<SplitPlan> = resolve_split(mean_conf, params, big_split);
+    let split_band: Option<(f64, f64, usize)> = split_plan_run.map(|p| (p.lo, p.hi, p.deep_k));
+    // The deep pass's own conditioning depth (LCWGS_SPLIT_KPBWT, else the biobank-size
+    // panel's 2000; neither = the run's).
+    let deep_params: Option<LcwgsParams> = split_plan_run.and_then(|p| deep_pass_params(params, p.deep_kpbwt));
+    if let Some(deep) = &deep_params {
+        crate::selphi_info!("  lcWGS SPLIT deep pass: conditioning depth kpbwt {} instead of {}", deep.kpbwt, params.kpbwt);
+    }
 
     // Chromosome-wide conditioning selection (LCWGS_CHRWIDE_PBWT, default OFF):
     // select the conditioning set ONCE over the WHOLE chromosome's common-site
@@ -948,12 +1301,17 @@ fn run_chunked_gibbs(
     // par_iter inside run_gibbs is degenerate → most cores idle). Chunks are fully
     // independent (disjoint core output; run_gibbs is deterministic, keyed only by
     // chunk-local indices) so parallel chunks are BIT-IDENTICAL to sequential.
-    let process_chunk = |c: usize| -> Option<(usize, usize, usize, super::iterate::GibbsOutput)> {
-        let (core, buffer) = super::chunk_ranges::chunk_ranges(
-            cm, c, n_chunks, core_cm, buffer_cm,
-        )?;
+    let process_chunk = |c: usize| -> Option<(usize, usize, usize, std::ops::Range<usize>, super::iterate::GibbsOutput)> {
+        let (core, buffer) = plan[c].clone()?;
         let (core_start, core_end) = (core.start, core.end);
         let (buf_start, buf_end) = (buffer.start, buffer.end);
+        // This chunk's impute-only passengers (none without them).
+        let prange = passengers.map_or(0..0, |(p, _)| p.of_core(&core));
+        let chunk_pass = passengers.filter(|_| !prange.is_empty()).map(|(p, pcm)| super::iterate::ChunkPassengers {
+            ins: p.ins[prange.clone()].iter().map(|&i| i - buf_start).collect(),
+            cm: &pcm[prange.clone()],
+        });
+        let pass_wgs: &[usize] = passengers.map_or(&[], |(p, _)| &p.idx[prange.clone()]);
 
         let chunk_n = buf_end - buf_start;
         // Slice gl3 + cm for the buffer window
@@ -967,16 +1325,28 @@ fn run_chunked_gibbs(
         let prep = prepared.and_then(|p| p.get(c)).and_then(|m| m.lock().unwrap().take());
         let (chunk_bm, panel) = match prep {
             Some(ChunkPrep { bm, panel }) => (bm, panel),
-            None => (srp.extract_ref_alleles_bitmatrix(chunk_wgs), None),
+            None => (chunk_bitmatrix(srp, chunk_wgs, pass_wgs), None),
         };
+        assert_eq!((chunk_bm.n_sites, chunk_bm.n_rows()), (chunk_n, chunk_n + pass_wgs.len()), "chunk {c} bitmatrix rows");
 
-        let mut out = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, None, chrwide_cond.as_ref(), execution, panel.as_ref());
+        let mut out = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, None, chrwide_cond.as_ref(), execution, panel.as_ref(), chunk_pass.as_ref());
         // Two-depth split: run the deep pass and overlay its dose/GP onto the band
         // sites (panel MAF ∈ [lo,hi)), routing by PANEL allele frequency only (known
         // a-priori; no truth). Byte-identical when `split_band` is None.
         if let Some((lo, hi, deep_k)) = split_band {
-            let out_deep = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, Some(deep_k), chrwide_cond.as_ref(), execution, panel.as_ref());
+            let deep = deep_params.as_ref().unwrap_or(params);
+            let out_deep = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, deep, Some(deep_k), chrwide_cond.as_ref(), execution, panel.as_ref(), chunk_pass.as_ref());
             let n_ref = chunk_bm.n_haps;
+            // Passengers routed by the same panel-MAF band.
+            for p in 0..pass_wgs.len() {
+                let ac = chunk_bm.popcount_row(chunk_bm.n_sites + p, n_ref) as f64;
+                let maf = ac.min(n_ref as f64 - ac) / n_ref as f64;
+                if lo <= maf && maf < hi {
+                    let i = p * n_samples..(p + 1) * n_samples;
+                    out.pass_dosage[i.clone()].copy_from_slice(&out_deep.pass_dosage[i.clone()]);
+                    out.pass_gp[i.start * 3..i.end * 3].copy_from_slice(&out_deep.pass_gp[i.start * 3..i.end * 3]);
+                }
+            }
             for lv in 0..chunk_bm.n_sites {
                 let ac = chunk_bm.popcount_row(lv, n_ref) as f64;
                 let maf = ac.min(n_ref as f64 - ac) / n_ref as f64;
@@ -1072,21 +1442,25 @@ fn run_chunked_gibbs(
         }
 
         let _ = chunk_n;
-        Some((core_start, core_end, buf_start, out))
+        Some((core_start, core_end, buf_start, prange, out))
     };
 
-    let merge_chunk = |_c: usize, result: Option<(usize, usize, usize, super::iterate::GibbsOutput)>| {
-        if let Some((core_start, core_end, buf_start, out)) = result {
+    let merge_chunk = |_c: usize, result: Option<(usize, usize, usize, std::ops::Range<usize>, super::iterate::GibbsOutput)>| {
+        if let Some((core_start, core_end, buf_start, prange, out)) = result {
             let dst = core_start * n_samples .. core_end * n_samples;
             let src = (core_start - buf_start) * n_samples .. (core_end - buf_start) * n_samples;
             dosage[dst.clone()].copy_from_slice(&out.dosage[src.clone()]);
             gp[dst.start * 3 .. dst.end * 3].copy_from_slice(&out.gp[src.start * 3 .. src.end * 3]);
+            if !prange.is_empty() {
+                let dst = prange.start * n_samples..prange.end * n_samples;
+                pass_dosage[dst.clone()].copy_from_slice(&out.pass_dosage);
+                pass_gp[dst.start * 3..dst.end * 3].copy_from_slice(&out.pass_gp);
+            }
         }
     };
     let n_ref = srp.metadata.n_haps;
-    let chunk_sites: Vec<_> = (0..n_chunks).map(|c| {
-        super::chunk_ranges::chunk_ranges(cm, c, n_chunks, core_cm, buffer_cm)
-            .map_or(0, |(_, buffer)| buffer.len())
+    let chunk_sites: Vec<_> = plan.iter().map(|r| {
+        r.as_ref().map_or(0, |(core, buffer)| buffer.len() + passengers.map_or(0, |(p, _)| p.of_core(core).len()))
     }).collect();
     if let Some(memory) = &memory {
         let costs: Vec<_> = chunk_sites.iter().map(|&sites| chunk_state_bytes(sites, n_ref, n_samples)).collect();
@@ -1094,7 +1468,8 @@ fn run_chunked_gibbs(
     } else {
         let cap = |k: usize| if k == 0 { n_ref } else { k.min(n_ref) };
         let mut k = if crate::config::present("LCWGS_NO_RARE_CARRIER") {
-            cap(params.kpbwt).max(1000.min(n_ref))
+            // The deep pass's own depth (LCWGS_SPLIT_KPBWT or the big-panel 2000) bounds its sets too.
+            cap(params.kpbwt).max(deep_params.as_ref().map_or(0, |d| cap(d.kpbwt))).max(1000.min(n_ref))
         } else {
             cap(crate::config::usize_opt("LCWGS_KMAX").unwrap_or(3000))
         };
@@ -1112,7 +1487,7 @@ fn run_chunked_gibbs(
             samples, collections);
     }
 
-    (dosage, gp)
+    (dosage, gp, pass_dosage, pass_gp)
 }
 
 /// Tiny static-input smoke test: 1 sample, 4 ref haps, 4 variants, flat
@@ -1120,6 +1495,190 @@ fn run_chunked_gibbs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_pass_depth() {
+        // LCWGS_SPLIT_KPBWT unset, zero or equal to the run's depth: no separate deep-pass
+        // parameters (the deep pass is the old one); another depth changes kpbwt only.
+        use super::super::faithful_select::{CapOrder, CapPlan};
+        let run = LcwgsParams { kpbwt: 4986, cap: Some(CapPlan::rank_only(CapOrder::G2)), ..Default::default() };
+        assert!(deep_pass_params(&run, None).is_none());
+        assert!(deep_pass_params(&run, Some(4986)).is_none());
+        // Zero is no depth (the selector would select nothing): refused.
+        assert!(deep_pass_params(&run, Some(0)).is_none());
+        for k in [1usize, 2000, 6000] {
+            let d = deep_pass_params(&run, Some(k)).expect("another depth");
+            assert_eq!(d.kpbwt, k);
+            assert_eq!(d.cap.as_ref().map(|c| c.order), Some(CapOrder::G2));
+            assert_eq!((d.seed_or_default(), d.ne, d.epsilon, d.rare_maf), (run.seed_or_default(), run.ne, run.epsilon, run.rare_maf));
+            assert_eq!((d.pbwt_depth, d.pbwt_modulo_cm, d.chunk_core_cm(), d.chunk_buffer_cm()),
+                (run.pbwt_depth, run.pbwt_modulo_cm, run.chunk_core_cm(), run.chunk_buffer_cm()));
+        }
+    }
+
+    /// The panel-size gate: 1000 Genomes-size panels keep their parameters (the
+    /// default path is unchanged); a biobank-size panel gets the GLIMPSE2 rank order
+    /// at the adaptive depth; an explicit LCWGS_KPBWT keeps its depth, an explicit
+    /// LCWGS_QUAL_TRUNC or a supplied cap plan keeps its order; `LCWGS_BIG_PANEL=0`
+    /// restores the index order. The biobank-size SPLIT parameters come with the
+    /// panel size, whatever the order (`order` and `0` drop them).
+    #[test]
+    fn conditioning_by_panel_size() {
+        use super::super::big_panel::{Explicit, BIG_PANEL_MIN_HAPS, BIG_PANEL_SPLIT};
+        use super::super::faithful_select::{CapOrder, CapPlan, hap_priority};
+        let none = Explicit::default();
+        let base = || LcwgsParams { kpbwt: 2000, ..Default::default() };
+        for n in [1500, 4478, 4796, 6332, BIG_PANEL_MIN_HAPS - 1] {
+            let mut eff = base();
+            let (changed, split) = apply_conditioning(&mut eff, n, none);
+            assert_eq!(changed, n == 1500, "{n}"); // a 1,500-hap panel caps below its size, as before
+            assert_eq!(split, None, "{n}");
+            assert!(eff.cap.is_none(), "{n}");
+            assert_eq!(eff.kpbwt, if n == 1500 { 1499 } else { 2000 });
+        }
+        for (n, k) in [(BIG_PANEL_MIN_HAPS, 2001), (75_552, 4986), (171_054, 5000)] {
+            let mut eff = base();
+            assert_eq!(apply_conditioning(&mut eff, n, none), (true, Some(BIG_PANEL_SPLIT)), "{n}");
+            assert_eq!(eff.kpbwt, k);
+            assert_eq!(eff.cap.as_ref().map(|c| c.order), Some(CapOrder::G2));
+        }
+        let mut eff = base();
+        assert_eq!(apply_conditioning(&mut eff, 75_552, Explicit { gate_off: true, ..none }), (true, None));
+        assert_eq!((eff.kpbwt, eff.cap.is_none()), (4986, true));
+        // LCWGS_KPBWT=2000 (already parsed into kpbwt): kept, order g2.
+        let mut eff = base();
+        assert_eq!(apply_conditioning(&mut eff, 75_552, Explicit { kpbwt: true, ..none }), (true, Some(BIG_PANEL_SPLIT)));
+        assert_eq!(eff.kpbwt, 2000);
+        assert_eq!(eff.cap.as_ref().map(|c| c.order), Some(CapOrder::G2));
+        // LCWGS_QUAL_TRUNC set: the selector reads it; the depth is adaptive as before.
+        let mut eff = base();
+        assert_eq!(apply_conditioning(&mut eff, 75_552, Explicit { order: true, ..none }), (true, Some(BIG_PANEL_SPLIT)));
+        assert_eq!((eff.kpbwt, eff.cap.is_none()), (4986, true));
+        // A cap plan the caller supplied is kept.
+        let ids: Vec<String> = (0..10).map(|s| format!("s{s}")).collect();
+        let supplied = CapPlan { order: CapOrder::Hash, priority: hap_priority(&ids, 20, 7).into(), rank_frac: 0.5 };
+        let mut eff = LcwgsParams { kpbwt: 2000, cap: Some(supplied.clone()), ..Default::default() };
+        assert_eq!(apply_conditioning(&mut eff, 75_552, none).1, Some(BIG_PANEL_SPLIT));
+        let kept = eff.cap.as_ref().unwrap();
+        assert_eq!((kept.order, &kept.priority[..]), (CapOrder::Hash, &supplied.priority[..]));
+        // LCWGS_BIG_PANEL=order: the rank order, the old split.
+        let mut eff = base();
+        assert_eq!(apply_conditioning(&mut eff, 75_552, Explicit { split_off: true, ..none }), (true, None));
+        assert_eq!((eff.kpbwt, eff.cap.as_ref().map(|c| c.order)), (4986, Some(CapOrder::G2)));
+    }
+
+    /// The SPLIT plan. Off the biobank-size panels (and with `LCWGS_BIG_PANEL=0|order`)
+    /// every knob combination resolves as before this change; on one, the auto split's
+    /// unset parts take the big-panel values (0.5-10%, k_max 3000, depth 2000), each
+    /// explicit knob wins for its part, the manual band keeps its own defaults, and the
+    /// gates (depth > 3000, soft likelihoods, LCWGS_NO_SPLIT) are unchanged.
+    #[test]
+    fn split_plan_by_panel_size() {
+        use super::super::big_panel::BIG_PANEL_SPLIT;
+        let big = Some(BIG_PANEL_SPLIT);
+        let k = |kv: &[(&str, &str)]| {
+            let mut kn = SplitKnobs::default();
+            for &(key, v) in kv {
+                let v = Some(v.to_string());
+                match key {
+                    "off" => kn.off = true,
+                    "maf" => kn.maf = v,
+                    "band" => kn.band = v,
+                    "kmax" => kn.kmax = v,
+                    "kpbwt" => kn.kpbwt = v,
+                    "thr" => kn.gl_thr = v,
+                    "chrwide" => kn.chrwide = true,
+                    _ => unreachable!(),
+                }
+            }
+            kn
+        };
+        let plan = |lo, hi, deep_k, deep_kpbwt| Some(SplitPlan { lo, hi, deep_k, deep_kpbwt });
+        let none = k(&[]);
+        // Small panels (big = None): the old resolution.
+        assert_eq!(split_plan(0.53, 2000, None, &none), None); // depth <= 3000: never auto
+        assert_eq!(split_plan(0.53, 4986, None, &none), plan(0.05, 0.10, 5000, None));
+        assert_eq!(split_plan(0.90, 4986, None, &none), None); // confident likelihoods
+        assert_eq!(split_plan(0.53, 3500, None, &k(&[("kpbwt", "2000"), ("kmax", "3000")])), plan(0.05, 0.10, 3000, Some(2000)));
+        assert_eq!(split_plan(0.53, 2000, None, &k(&[("maf", "0,0.1")])), plan(0.0, 0.1, 5000, None));
+        // The default on a biobank-size panel at soft coverage: the depth-2000 pass on 0.5-10%.
+        assert_eq!(split_plan(0.53, 4986, big, &none), plan(0.005, 0.10, 3000, Some(2000)));
+        // = the opt-in command the composites were measured with.
+        assert_eq!(split_plan(0.53, 4986, None, &k(&[("maf", "0.005,0.1"), ("kmax", "3000"), ("kpbwt", "2000")])),
+            split_plan(0.53, 4986, big, &none));
+        // The gates are unchanged.
+        assert_eq!(split_plan(0.84, 4986, big, &none), None);
+        assert_eq!(split_plan(0.53, 3000, big, &none), None); // e.g. LCWGS_KPBWT=2000 or 3000: single pass
+        assert_eq!(split_plan(0.53, 4986, big, &k(&[("off", "")])), None);
+        assert_eq!(split_plan(0.85, 4986, big, &k(&[("thr", "0.9")])), plan(0.005, 0.10, 3000, Some(2000)));
+        // A NaN threshold or coverage proxy leaves the split off, as before (`<` is the gate).
+        for b in [None, big] {
+            assert_eq!(split_plan(0.53, 4986, b, &k(&[("thr", "NaN")])), None);
+            assert_eq!(split_plan(f32::NAN, 4986, b, &none), None);
+        }
+        // Each explicit part wins for its part.
+        assert_eq!(split_plan(0.53, 4986, big, &k(&[("band", "0.05,0.10")])), plan(0.05, 0.10, 3000, Some(2000)));
+        assert_eq!(split_plan(0.53, 4986, big, &k(&[("kmax", "5000")])), plan(0.005, 0.10, 5000, Some(2000)));
+        assert_eq!(split_plan(0.53, 4986, big, &k(&[("kpbwt", "4986")])), plan(0.005, 0.10, 3000, Some(4986)));
+        // Unparsable, empty or refused values count as unset.
+        for bad in [("kpbwt", "0"), ("kpbwt", ""), ("kpbwt", "x"), ("kmax", ""), ("band", ""), ("band", "0.1,0.05")] {
+            assert_eq!(split_plan(0.53, 4986, big, &k(&[bad])), plan(0.005, 0.10, 3000, Some(2000)), "{bad:?}");
+        }
+        // The manual band keeps its own defaults on every panel (every measured opt-in arm reproduces).
+        assert_eq!(split_plan(0.53, 4986, big, &k(&[("maf", "0,0.1"), ("kmax", "6000")])), plan(0.0, 0.1, 6000, None));
+        assert_eq!(split_plan(0.90, 4986, big, &k(&[("maf", "0.05,0.1")])), plan(0.05, 0.1, 5000, None));
+        assert_eq!(split_plan(0.53, 4986, big, &k(&[("maf", "")])), None); // an invalid manual band is no split, as before
+        // LCWGS_CHRWIDE_PBWT: one selection at the run's depth serves both passes, so the old split.
+        assert_eq!(split_plan(0.53, 4986, big, &k(&[("chrwide", "")])), plan(0.05, 0.10, 5000, None));
+        assert_eq!(split_plan(0.53, 4986, big, &k(&[("chrwide", ""), ("kpbwt", "2000")])), plan(0.05, 0.10, 5000, None));
+        // The deep pass at the big-panel depth is a whole LCWGS_KPBWT=2000 run's parameters
+        // (the run's g2 plan, seed and schedule; only the depth differs).
+        use super::super::faithful_select::{CapOrder, CapPlan};
+        let run = LcwgsParams { kpbwt: 4986, cap: Some(CapPlan::rank_only(CapOrder::G2)), ..Default::default() };
+        let p = split_plan(0.53, run.kpbwt, big, &none).unwrap();
+        let d = deep_pass_params(&run, p.deep_kpbwt).expect("its own depth");
+        assert_eq!(d.kpbwt, 2000);
+        assert_eq!(d.cap.as_ref().map(|c| c.order), Some(CapOrder::G2));
+        assert_eq!((d.seed_or_default(), d.ne, d.epsilon, d.rare_maf, d.pbwt_depth, d.pbwt_modulo_cm),
+            (run.seed_or_default(), run.ne, run.epsilon, run.rare_maf, run.pbwt_depth, run.pbwt_modulo_cm));
+        assert_eq!(p.deep_k, 3000); // = LCWGS_KMAX's default, the k_max of a standalone run
+    }
+
+    /// `--bam` indel handling: impute-only by default, the legacy knobs keep their
+    /// meaning, an explicit value wins, the scaffold drops them unless impute is
+    /// asked for explicitly (then it is an error).
+    #[test]
+    fn bam_indel_modes() {
+        use BamIndels::*;
+        let r = |v: Option<&str>, keep: bool, realign: bool, scaffold: bool| resolve_bam_indels(v, keep, realign, scaffold);
+        assert_eq!(r(None, false, false, false), Ok(Impute));
+        assert_eq!(r(None, true, false, false), Ok(Chain));
+        assert_eq!(r(None, false, true, false), Ok(Chain));
+        assert_eq!(r(None, false, false, true), Ok(Drop));
+        assert_eq!(r(None, true, false, true), Ok(Chain));
+        for (v, want) in [("impute", Impute), ("IMPUTE ", Impute), ("drop", Drop), ("keep", Chain)] {
+            assert_eq!(r(Some(v), true, true, false), Ok(want), "{v}");
+            assert_eq!(r(Some(v), false, false, false), Ok(want), "{v}");
+        }
+        assert!(r(Some("impute"), false, false, true).is_err());
+        assert_eq!(r(Some("drop"), false, false, true), Ok(Drop));
+        // On spellings = impute; off spellings = "not impute", as before impute became
+        // the default (legacy knobs, else drop); empty = unset (config round trip).
+        for v in ["1", "true", "yes", "on"] { assert_eq!(r(Some(v), true, false, false), Ok(Impute), "{v}"); }
+        for v in ["0", "false", "no", "off"] {
+            assert_eq!(r(Some(v), false, false, false), Ok(Drop), "{v}");
+            assert_eq!(r(Some(v), true, false, false), Ok(Chain), "{v}");
+            assert_eq!(r(Some(v), false, true, true), Ok(Chain), "{v}");
+            assert_eq!(r(Some(v), false, false, true), Ok(Drop), "{v}");
+        }
+        assert_eq!(r(Some(""), false, false, false), Ok(Impute));
+        assert_eq!(r(Some(" "), true, false, false), Ok(Chain));
+        assert_eq!(r(Some(""), false, false, true), Ok(Drop));
+        // Not recognised: treated as unset.
+        assert_eq!(r(Some("maybe"), false, false, false), Ok(Impute));
+        assert_eq!(r(Some("maybe"), true, false, false), Ok(Chain));
+        assert_eq!(r(Some("maybe"), false, false, true), Ok(Drop));
+    }
 
     #[test]
     fn wave_budget_counts_sample_tasks_and_buffered_sites() {
@@ -1185,7 +1744,7 @@ mod tests {
             let costs: Vec<_> = inputs.iter().map(|(_, cm, _)| chunk_state_bytes(cm.len(), 40, ns)).collect();
             let process = |c: usize, execution: SampleExecution<'_>| {
                 let (bm, cm, gl) = &inputs[c];
-                let out = super::super::iterate::run_gibbs_ensemble_with_memory(gl, bm, cm, ns, &params, None, None, execution, None);
+                let out = super::super::iterate::run_gibbs_ensemble_with_memory(gl, bm, cm, ns, &params, None, None, execution, None, None);
                 (out.dosage.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                  out.gp.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
             };
@@ -1220,6 +1779,95 @@ mod tests {
     }
 
     use crate::common::HaplotypeBitmatrix;
+
+    /// Passengers are partitioned over the chunks (each to the chunk whose core
+    /// holds its left active neighbour), and each one's chunk-local insertion
+    /// point lies inside that chunk's buffer.
+    #[test]
+    fn passengers_partition_over_chunks() {
+        use crate::lcwgs::hmm::reference_pack::Xs;
+        let mut rng = Xs(0xBB67_AE85_3C6E_F372);
+        for _ in 0..200 {
+            let n = 1 + rng.below(400) as usize;
+            let mut x = 0.0f64;
+            let cm: Vec<f64> = (0..n).map(|_| { x += rng.below(4) as f64 * 0.3; x }).collect();
+            let active: Vec<usize> = (0..n).map(|i| 3 * i + 1).collect();
+            let mut pidx: Vec<usize> = (0..3 * n + 2).filter(|i| i % 3 != 1 && rng.below(3) == 0).collect();
+            pidx.dedup();
+            let p = Passengers::new(&active, pidx.clone(), None);
+            for (k, &i) in pidx.iter().enumerate() {
+                assert!(p.ins[k] == active.len() || active[p.ins[k]] > i);
+                assert!(p.ins[k] == 0 || active[p.ins[k] - 1] < i);
+            }
+            for (core_cm, buffer_cm) in [(1.0, 0.0), (2.0, 0.5), (50.0, 0.5), (0.3, 1.0)] {
+                let n_chunks = (((cm[n - 1] - cm[0]) / core_cm).ceil() as usize).max(1);
+                let mut owner = vec![0usize; pidx.len()];
+                for c in 0..n_chunks {
+                    let Some((core, buffer)) = super::super::chunk_ranges::chunk_ranges(&cm, c, n_chunks, core_cm, buffer_cm) else { continue };
+                    for q in p.of_core(&core) {
+                        owner[q] += 1;
+                        assert!(p.ins[q] >= buffer.start && p.ins[q] - buffer.start <= buffer.len(), "insertion outside the buffer");
+                    }
+                }
+                assert!(owner.iter().all(|&o| o == 1), "every passenger in exactly one chunk");
+            }
+        }
+    }
+
+    /// Passenger rows interleave with the active rows in ascending panel order,
+    /// each row carrying its own dosage and GP.
+    #[test]
+    fn merge_rows_interleaves_in_panel_order() {
+        let ns = 2;
+        let active = vec![1usize, 4, 5, 9];
+        let pass = vec![0usize, 2, 3, 10];
+        let d = |rows: &[usize]| rows.iter().flat_map(|&r| (0..ns).map(move |s| (r * 10 + s) as f32)).collect::<Vec<_>>();
+        let g = |rows: &[usize]| rows.iter().flat_map(|&r| (0..ns * 3).map(move |k| (r * 100 + k) as f32)).collect::<Vec<_>>();
+        let (dd, gg, idx) = merge_rows(&active, d(&active), g(&active), &pass, d(&pass), g(&pass), ns);
+        assert_eq!(idx, vec![0, 1, 2, 3, 4, 5, 9, 10]);
+        assert_eq!(dd, d(&idx));
+        assert_eq!(gg, g(&idx));
+    }
+
+    /// Own-read likelihoods fold into the averaged prior: a flat likelihood
+    /// leaves it, an informative one moves it (and averaging opposite
+    /// homozygous priors before the fold lets the reads decide), one that rules
+    /// out every prior genotype leaves the prior.
+    #[test]
+    fn passenger_reads_fold_into_the_averaged_prior() {
+        let mut gp = vec![0.25f32, 0.5, 0.25, 0.5, 0.0, 0.5, 1.0, 0.0, 0.0];
+        let mut ds = vec![1.0f32, 1.0, 0.0];
+        let gl = [0.2f32, 0.2, 0.2, 0.01, 0.1, 0.99, 0.0, 0.5, 0.5];
+        fold_passenger_reads(&mut gp, &mut ds, &gl, 1, None);
+        assert!((gp[0] - 0.25).abs() < 1e-7 && (gp[1] - 0.5).abs() < 1e-7 && (ds[0] - 1.0).abs() < 1e-6);
+        assert!(ds[1] > 1.97 && gp[5] > 0.985, "reads at the averaged prior: ds {}", ds[1]);
+        assert_eq!((&gp[6..9], ds[2]), (&[1.0f32, 0.0, 0.0][..], 0.0));
+        // Haploid cells (one sample, passengers 0 and 1 non-PAR): one allele,
+        // its prior DS/2 folded once with (GL0, GL2). Equal all-REF/all-ALT
+        // priors (DS 1) with reads 0.01 : 0.99 give P(ALT) = 0.99, not ~1; a
+        // heterozygous-looking prior (DS 1 from [0, 1, 0]) moves with the reads.
+        let mut gp = vec![0.5f32, 0.0, 0.5, 0.0, 1.0, 0.0, 0.5, 0.0, 0.5];
+        let mut ds = vec![1.0f32, 1.0, 1.0];
+        let gl = [0.01f32, 0.3, 0.99, 0.01, 0.3, 0.99, 0.01, 0.3, 0.99];
+        fold_passenger_reads(&mut gp, &mut ds, &gl, 1, Some((&[true], &[true, true, false])));
+        for i in 0..2 {
+            assert!((gp[3 * i + 2] - 0.99).abs() < 1e-6 && gp[3 * i + 1] == 0.0 && (ds[i] - 1.98).abs() < 1e-5, "haploid {i}: {:?} {}", &gp[3 * i..3 * i + 3], ds[i]);
+        }
+        // The PAR passenger (site flag false) folds diploid.
+        assert!(gp[8] > 0.98 && (ds[2] - 2.0 * gp[8] - gp[7]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hidden_tail_rows_stay_out_of_n_sites() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        let mut rng = rp::Xs(0x510E_527F_9B05_688C);
+        let full = rp::random_typed_panel(&mut rng, 30, 130);
+        let all: Vec<usize> = (0..30).collect();
+        let hidden = HaplotypeBitmatrix::from_subset(&full, &all).with_hidden_tail(21);
+        assert_eq!((hidden.n_sites, hidden.n_rows(), hidden.n_haps), (21, 30, 130));
+        for v in 0..30 { assert_eq!(hidden.row(v), full.row(v)); }
+        assert_eq!(full.n_rows(), 30);
+    }
 
     #[test]
     fn run_lcwgs_with_in_memory_inputs_smoke() {

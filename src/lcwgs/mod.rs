@@ -56,12 +56,14 @@ pub mod pl_reader;
 pub mod hmm;
 pub mod pbwt_select;
 pub mod faithful_select;
+pub mod big_panel;
 pub mod bam_pileup;
 pub mod baq;
 pub mod errmod;
 pub mod indel_realign;
 pub mod iterate;
 mod membership;
+mod kmax_cut;
 mod memory;
 pub mod dmm;
 pub mod pipeline;
@@ -122,6 +124,13 @@ pub struct LcwgsParams {
     pub chrx_par: bool,
     /// chrX PAR coordinates' build (`--build`); `None` = inferred from the panel.
     pub build: Option<crate::contig::Build>,
+    /// The run's conditioning cap order, set once per run in
+    /// `pipeline::impute_from_gl3`: a panel-order-independent cap
+    /// (`LCWGS_QUAL_TRUNC=hash|hybrid`, with the panel priority keyed by sample ID)
+    /// or, on a biobank-size panel with `LCWGS_QUAL_TRUNC` unset, the GLIMPSE2 rank
+    /// order (`big_panel`). `None` = the selector reads `LCWGS_QUAL_TRUNC` (index
+    /// order by default).
+    pub cap: Option<faithful_select::CapPlan>,
 }
 
 impl LcwgsParams {
@@ -206,6 +215,7 @@ impl Default for LcwgsParams {
             haploids: None,
             chrx_par: true,
             build: None,
+            cap: None,
         }
     }
 }

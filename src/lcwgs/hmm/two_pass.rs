@@ -462,6 +462,11 @@ struct Shared<'a> {
 #[cfg(test)]
 static TASK_BLOCKS: AtomicUsize = AtomicUsize::new(0);
 
+/// Held by every test whose forward-backward calls can run block tasks, so
+/// `two_pass_dosages_match_sequential_kernel` counts only its own.
+#[cfg(test)]
+pub(crate) static TASK_BLOCKS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Block tasks waiting to start above which the backward pass processes the
 /// blocks the forward pass has passed itself (no worker is taking tasks).
 const SPAWN_BACKLOG: usize = 2;
@@ -831,6 +836,7 @@ mod tests {
     /// block layout, conditioning width, compacted axis and caller pack.
     #[test]
     fn two_pass_dosages_match_sequential_kernel() {
+        let _serial = TASK_BLOCKS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut rng = rp::Xs(0x9E37_79B9_7F4A_7C15);
         let params = LcwgsParams::default();
         let pools: Vec<_> = [1usize, 2, 4, 8].iter()
