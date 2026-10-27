@@ -12,14 +12,18 @@
 //! A biobank-size panel therefore caps the union in GLIMPSE2's rank order (`g2`, the
 //! PBWT rank layers ascending) instead, at the same depth (`LCWGS_KPBWT`, else the
 //! adaptive `round(0.066 n_ref)`, 4,986 on v3) and with the same two-depth split.
-//! On v3 (six GIAB capture libraries, chr22) every sample is at or above the index
-//! order in every MAF bin within seed noise (non-reference concordance 97.80 -> 98.59%;
+//! On v3 (six GIAB capture libraries, chr22) no sample is below the index order in
+//! any MAF bin beyond seed noise (non-reference concordance 97.81 -> 98.59%;
 //! three seeds on the European samples: smallest seed mean -0.079 pp, HG003 0.5-5%,
 //! sign flipping by seed): 0.5-5% +1.10 pp, < 0.5% +10.9 pp. The faster `LCWGS_KPBWT=2000` on top of it is the configuration
-//! measured best against GLIMPSE2 (above it in every pooled MAF bin over three
-//! seeds, about half this default's CPU), but it lowers the common SNPs of two European
-//! samples below the index order, so it is not the default. `LCWGS_QUAL_TRUNC` set
-//! explicitly wins; `LCWGS_BIG_PANEL=0` restores the index order on every panel.
+//! measured best against GLIMPSE2 (above it overall over three seeds, +0.16 pp,
+//! 17 of 18 pairs higher and one tied, and in every pooled MAF bin by point estimate, though the 0.5-5%
+//! interval spans zero; about half this default's CPU), but it lowers the common SNPs
+//! of two European samples below the index order, so it is not the default. At the
+//! adaptive depth the main pass's `LCWGS_KMAX` cut keeps no rare carrier and, the
+//! `g2` set being emitted index-sorted, its lowest indices (`super::kmax_cut` has the
+//! opt-in alternatives). `LCWGS_QUAL_TRUNC` set explicitly wins; `LCWGS_BIG_PANEL=0`
+//! restores the index order on every panel.
 
 use super::faithful_select::CapOrder;
 

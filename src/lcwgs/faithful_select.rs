@@ -119,6 +119,10 @@ pub struct FaithfulSelector {
     /// truncate the base) rather than ascending (packs faster: the gather
     /// plan groups ascending states that share a panel word).
     keep_priority_order: bool,
+    /// Emit a `g2` set in its fill order (rank layers ascending, reverse within
+    /// a layer) instead of index-sorted: `LCWGS_KMAX_CUT=priority` when the
+    /// `k_max` cut can truncate the base (see `super::kmax_cut`). Default off.
+    g2_fill_order: bool,
     /// Decode the panel half of each sweep on worker tasks (see
     /// [`SegmentPlan`]); the plan is recorded by the first sweep.
     segmented: bool,
@@ -430,6 +434,7 @@ impl FaithfulSelector {
             priority,
             rank_frac,
             keep_priority_order: true,
+            g2_fill_order: false,
             segmented: false,
             plan: None,
             #[cfg(test)]
@@ -446,6 +451,11 @@ impl FaithfulSelector {
     /// of the rare-carrier augmentation, even when the union fits kpbwt) or is
     /// emitted ascending, the same set (default: priority order).
     pub fn set_keep_priority_order(&mut self, on: bool) { self.keep_priority_order = on; }
+
+    /// Whether a `g2` set is emitted in its fill order (the order GLIMPSE2 fills
+    /// its set, best rank first) rather than index-sorted, the same set (default:
+    /// index-sorted, as GLIMPSE2's `std::set`).
+    pub fn set_g2_fill_order(&mut self, on: bool) { self.g2_fill_order = on; }
 
     /// Refresh the per-sample H0/H1 hard calls from the hybrid's current sampled
     /// `hap_alleles` (layout `hap_alleles[v*n_target_haps + h]`, h0=2s, h1=2s+1).
@@ -583,6 +593,22 @@ impl FaithfulSelector {
                     }
                     u
                 }
+                CapOrder::G2 if self.g2_fill_order => {
+                    // The same set in fill order (first insertion), so a later
+                    // k_max cut keeps the best-ranked members (LCWGS_KMAX_CUT=priority).
+                    super::membership::with_membership(self.panel.ref_hs.n_ref_haps, |seen| {
+                        let mut out: Vec<u32> = Vec::new();
+                        'outer: for layer in &self.tar.pbwt_states[s] {
+                            for &x in layer.iter().rev() {
+                                if seen.insert(x as usize) {
+                                    out.push(x as u32);
+                                    if self.kpbwt > 0 && out.len() >= self.kpbwt { break 'outer; }
+                                }
+                            }
+                        }
+                        out
+                    })
+                }
                 CapOrder::G2 => {
                     // GLIMPSE2 order: layers ascending, entries in REVERSE push order,
                     // insert into the set until it holds kpbwt, output sorted.
@@ -698,7 +724,7 @@ pub(crate) fn cap_plan_from_env(sample_ids: &[String], n_haps: usize) -> Option<
 /// `LCWGS_SEL_DIAG=1` → print, per selection call, the pre-cap union size and how
 /// many samples the kpbwt cap actually bit (the number that decides whether the
 /// cap ORDER can matter at all). Cached once.
-fn sel_diag() -> bool {
+pub(crate) fn sel_diag() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| crate::config::present("LCWGS_SEL_DIAG"))
@@ -1010,6 +1036,45 @@ mod tests {
             }
         }
         assert!(capped > 0, "the cap never bit: the order was not exercised");
+    }
+
+    /// `LCWGS_KMAX_CUT=priority` asks the selector for the `g2` set in fill order:
+    /// exactly GLIMPSE2's fill sequence, and the same set as the index-sorted default.
+    #[test]
+    fn g2_fill_order_is_the_same_set_best_rank_first() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        let mut rng = rp::Xs(0x2545_F491_4F6C_DD1D);
+        let (n_var, n_haps, n_samples) = (700usize, 1200usize, 2usize);
+        let bm = rp::random_typed_panel(&mut rng, n_var, n_haps);
+        let cm: Vec<f64> = (0..n_var).map(|v| v as f64 * 0.002).collect();
+        let gl3: Vec<f32> = (0..n_var * n_samples).flat_map(|_| match rng.below(3) {
+            0 => [1.0 / 3.0; 3],
+            1 => [0.9, 0.09, 0.01],
+            _ => [0.05, 0.9, 0.05],
+        }).collect();
+        let params = LcwgsParams { kpbwt: 150, pbwt_modulo_cm: 0.002,
+            cap: Some(CapPlan::rank_only(CapOrder::G2)), ..Default::default() };
+        let mut sorted_sel = FaithfulSelector::build(&bm, &cm, &gl3, n_samples, &params, 11);
+        let mut fill_sel = FaithfulSelector::build(&bm, &cm, &gl3, n_samples, &params, 11);
+        fill_sel.set_g2_fill_order(true);
+        let (mut capped, mut unsorted) = (0, 0);
+        for it in 0..4 {
+            let haps: Vec<u8> = (0..n_var * 2 * n_samples).map(|_| (rng.below(4) == 0) as u8).collect();
+            let (a, b) = (sorted_sel.select(&haps), fill_sel.select(&haps));
+            if it == 0 { assert_eq!(a, b); continue; } // INIT stage: an ascending set either way
+            for s in 0..n_samples {
+                let want = g2_order(&fill_sel.tar.pbwt_states[s], 150);
+                assert_eq!(b[2 * s], want, "iteration {it} sample {s}");
+                assert_eq!(b[2 * s + 1], want);
+                let mut sorted = want.clone();
+                sorted.sort_unstable();
+                assert_eq!(a[2 * s], sorted);
+                if want != sorted { unsorted += 1; }
+                let union: std::collections::HashSet<i32> = fill_sel.tar.pbwt_states[s].iter().flatten().copied().collect();
+                if union.len() > 150 { capped += 1; }
+            }
+        }
+        assert!(capped > 0 && unsorted > 0, "the fill order was not exercised");
     }
 
     #[test]

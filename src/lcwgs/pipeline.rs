@@ -775,8 +775,9 @@ pub fn run_lcwgs_bam(
     // `iterate::ChunkPassengers`), so no SNP row can move (measured: SNP rows
     // byte-identical on 12 of 12 samples, 1000 Genomes capture rig and v3), and
     // each indel gets its copying posterior. On the 1000 Genomes capture rig (six
-    // GIAB libraries, three seeds) they score above GLIMPSE2's indels in every MAF
-    // bin and tie indels kept flat in the chain (LCWGS_BAM_INDELS=keep, which did
+    // GIAB libraries, three seeds) they score above GLIMPSE2's indels (+0.361 pp,
+    // 16/18; every MAF bin above by point estimate, the >= 5% and < 0.5% CIs span
+    // 0) and tie indels kept flat in the chain (LCWGS_BAM_INDELS=keep, which did
     // not cost the SNPs either: +0.005 pp over 18 pairs). LCWGS_BAM_INDELS=drop
     // leaves them out (no indel rows, the PL path's behaviour).
     let enable_indel = crate::config::present("LCWGS_INDEL_REALIGN");

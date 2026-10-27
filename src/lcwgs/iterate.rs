@@ -565,6 +565,9 @@ struct GibbsConfig {
     /// Conditioning-set size ceiling after augmentation (`LCWGS_KMAX`, default
     /// 3000; `LCWGS_KMAX=0` disables the cap).
     k_max: Option<usize>,
+    /// How the augmented set is cut at `k_max` (`LCWGS_KMAX_CUT`,
+    /// `LCWGS_CARRIER_RESERVE`; default = the old prefix cut, see `super::kmax_cut`).
+    kmax_cut: super::kmax_cut::KmaxCut,
     /// Max panel minor-allele count for a site to be treated as "rare" for
     /// carrier augmentation (`LCWGS_RARE_CARRIER_MAX`, default 64).
     rare_carrier_max: usize,
@@ -708,6 +711,7 @@ impl GibbsConfig {
                 Some(k) => Some(k),
                 None => Some(3000), // default ceiling
             },
+            kmax_cut: super::kmax_cut::KmaxCut::from_env(),
             rare_carrier_max: envu("LCWGS_RARE_CARRIER_MAX").unwrap_or(64),
             timing: crate::config::present("LCWGS_TIMING"),
             cond_dump: crate::config::present("LCWGS_COND_DUMP"),
@@ -755,6 +759,15 @@ pub fn run_gibbs(
     run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, SampleExecution::Unbudgeted, None, None)
 }
 
+// Test seam: the k_max cut a test thread's Gibbs runs use instead of the env.
+#[cfg(test)]
+thread_local! {
+    static KMAX_CUT_TEST: std::cell::Cell<Option<super::kmax_cut::KmaxCut>> = const { std::cell::Cell::new(None) };
+    /// Each iteration's (selection base, augmented set) per haplotype, while KMAX_CUT_TEST is set.
+    #[allow(clippy::type_complexity)]
+    static KMAX_CUT_TEST_SETS: std::cell::RefCell<Vec<(Vec<Vec<u32>>, Vec<Vec<u32>>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// The selection's panel side built ahead of a chunk's Gibbs runs (see
 /// [`super::faithful_select::FaithfulPanel`]).
 pub(crate) type PanelSide = std::sync::Arc<super::faithful_select::FaithfulPanel>;
@@ -779,6 +792,8 @@ fn run_gibbs_with_memory(
     assert_eq!(ref_bm.n_sites, n_var);
 
     let mut cfg = GibbsConfig::from_env();
+    #[cfg(test)]
+    if let Some(cut) = KMAX_CUT_TEST.with(|c| c.get()) { cfg.kmax_cut = cut; }
     // Conditioning-cap override for the two-depth common/rare split (the deep pass
     // in `super::pipeline::run_chunked_gibbs` passes `Some(deep_k)` so the full IBD
     // base survives — feeds the 5-10% band; `Some(0)` = uncapped). `None` = use the
@@ -846,7 +861,12 @@ fn run_gibbs_with_memory(
         // the rare-carrier augmentation can truncate it; else it packs faster
         // ascending (the same set; index/g2/fwd orders are unaffected).
         let kpbwt_eff = params.kpbwt.min(ref_bm.n_haps.saturating_sub(1));
-        f.set_keep_priority_order(cfg.rare_carrier && cfg.k_max.is_some_and(|k| kpbwt_eff > k));
+        // LCWGS_KMAX_CUT / LCWGS_CARRIER_RESERVE: a base the cut can truncate
+        // is emitted in priority order (g2 included), see `super::kmax_cut`.
+        let bound = super::kmax_cut::base_bound(params.kpbwt, ref_bm.n_haps, None);
+        let new_cut = cfg.rare_carrier && cfg.kmax_cut.applies(bound, cfg.k_max);
+        f.set_keep_priority_order(new_cut || (cfg.rare_carrier && cfg.k_max.is_some_and(|k| kpbwt_eff > k)));
+        f.set_g2_fill_order(new_cut && cfg.kmax_cut.priority);
         Some(f)
     } else {
         None
@@ -859,6 +879,13 @@ fn run_gibbs_with_memory(
     // can lock onto the true carrier copy (+~0.0007 OVERALL; default ON).
     let rare_carrier = cfg.rare_carrier;
     let k_max = cfg.k_max;
+    // The opt-in k_max cut (`super::kmax_cut`): `Some((cut, k_max))` only where
+    // it differs from the old prefix cut, else the old cut runs unchanged.
+    // Supplied conditioning (chromosome-wide) is bounded by its own lists, not kpbwt.
+    let base_bound = super::kmax_cut::base_bound(params.kpbwt, ref_bm.n_haps, precomputed_cond.map(|c| c.as_slice()));
+    let kmax_cut = (rare_carrier && cfg.kmax_cut.applies(base_bound, k_max))
+        .then(|| (cfg.kmax_cut, k_max.expect("applies() implies a cap")));
+    super::kmax_cut::say_once(cfg.kmax_cut, base_bound, ref_bm.n_haps, k_max, kmax_cut.is_some());
     // Rare sites (low panel MINOR-allele count) + their MINOR-allele carriers.
     // A site is rare when its minor allele = min(ac, n_ref-ac) is carried by
     // 1..=max_carr panel haps, and the augmented carriers must be the haps that
@@ -1040,7 +1067,24 @@ fn run_gibbs_with_memory(
         // 1b. Rare-carrier augmentation (sampled-state reinforcement): add a rare
         //     site's panel carriers to each target hap currently sampled ALT there.
         let t0 = if timing { Some(std::time::Instant::now()) } else { None };
-        let cond_storage: Option<Vec<Vec<u32>>> = if rare_carrier {
+        let cond_storage: Option<Vec<Vec<u32>>> = if let Some((cut, k)) = kmax_cut {
+            // Per sample (both haplotypes keep the same base head, see
+            // `KmaxCut::cut_sample`), in parallel; same carrier order as below.
+            assert_eq!(base_cond.len(), n_target_haps);
+            let (alleles, sites): (&[u8], &[(usize, u8, Vec<u32>)]) = (&hap_alleles, &rare_sites);
+            let pairs: Vec<(Vec<u32>, Vec<u32>)> = (0..n_samples).into_par_iter().map(|s| {
+                let carriers = |i: usize| {
+                    let h = 2 * s + i;
+                    sites.iter()
+                        .filter(move |(v, minor, _)| alleles[v * n_target_haps + h] == *minor)
+                        .flat_map(|(_, _, carriers)| carriers.iter().copied())
+                };
+                cut.cut_sample(&base_cond[2 * s], &base_cond[2 * s + 1], carriers, ref_bm.n_haps, k)
+            }).collect();
+            let mut aug = Vec::with_capacity(n_target_haps);
+            for (a, b) in pairs { aug.push(a); aug.push(b); }
+            Some(aug)
+        } else if rare_carrier {
             // Per target hap, in parallel: each hap's list depends only on its own
             // sampled alleles, and the carriers are appended in `rare_sites` order,
             // so the result is byte-identical to the former serial site-major loop
@@ -1058,6 +1102,13 @@ fn run_gibbs_with_memory(
         } else { None };
         let cond_per_hap: &Vec<Vec<u32>> = cond_storage.as_ref().unwrap_or(base_cond);
         if let Some(t) = t0 { t_aug += t.elapsed().as_secs_f64(); }
+        if rare_carrier && super::faithful_select::sel_diag() {
+            super::kmax_cut::aug_diag(base_cond, cond_per_hap, ref_bm.n_haps, k_max, cfg.kmax_cut, kmax_cut.is_some());
+        }
+        #[cfg(test)]
+        if KMAX_CUT_TEST.with(|c| c.get()).is_some() {
+            KMAX_CUT_TEST_SETS.with(|c| c.borrow_mut().push((base_cond.clone(), cond_per_hap.clone())));
+        }
         if timing {
             max_k = max_k.max(cond_per_hap.iter().map(|c| c.len()).max().unwrap_or(0));
         }
@@ -2094,6 +2145,110 @@ mod tests {
         params.kpbwt = 3;
         params.pbwt_modulo_cm = 0.001;
         (gl3, bm, cm, n_samples, params)
+    }
+
+    /// The k_max cut knobs in the sampler (`super::kmax_cut`): unset and the
+    /// 1000 Genomes-size case (a base never longer than the room left) are the
+    /// old output bit for bit; where the cut applies it changes the sets, and the
+    /// run stays deterministic and in range.
+    #[test]
+    fn kmax_cut_knobs_in_the_sampler() {
+        use super::super::kmax_cut::KmaxCut;
+        use crate::lcwgs::hmm::reference_pack as rp;
+        let mut rng = rp::Xs(0x6A09_E667_F3BC_C908);
+        let (n_var, n_haps, n_samples) = (700usize, 1200usize, 2usize);
+        let bm = rp::random_typed_panel(&mut rng, n_var, n_haps);
+        let cm: Vec<f64> = (0..n_var).map(|v| v as f64 * 0.002).collect();
+        let gl3: Vec<f32> = (0..n_var * n_samples).flat_map(|_| match rng.below(3) {
+            0 => [1.0 / 3.0; 3],
+            1 => [0.9, 0.09, 0.01],
+            _ => [0.05, 0.9, 0.05],
+        }).collect();
+        // The big-panel order (g2), whose base is emitted index-sorted by default.
+        let params = LcwgsParams { kpbwt: 150, pbwt_modulo_cm: 0.002, n_iterations: 6, n_main_iterations: 3,
+            cap: Some(super::super::faithful_select::CapPlan::rank_only(super::super::faithful_select::CapOrder::G2)),
+            ..Default::default() };
+        type Sets = Vec<(Vec<Vec<u32>>, Vec<Vec<u32>>)>;
+        let run_with = |cut: Option<KmaxCut>, k: usize, p: &LcwgsParams, supplied: Option<&Vec<Vec<u32>>>| -> (GibbsOutput, Sets) {
+            KMAX_CUT_TEST.with(|c| c.set(cut));
+            KMAX_CUT_TEST_SETS.with(|c| c.borrow_mut().clear());
+            let out = run_gibbs(&gl3, &bm, &cm, n_samples, p, Some(k), supplied);
+            KMAX_CUT_TEST.with(|c| c.set(None));
+            (out, KMAX_CUT_TEST_SETS.with(|c| std::mem::take(&mut *c.borrow_mut())))
+        };
+        let run = |cut: Option<KmaxCut>, k: usize| run_with(cut, k, &params, None);
+        let bits = |o: &GibbsOutput| -> (Vec<u32>, Vec<u32>) {
+            (o.dosage.iter().map(|d| d.to_bits()).collect(), o.gp.iter().map(|g| g.to_bits()).collect())
+        };
+        let same = |a: &GibbsOutput, b: &GibbsOutput| bits(a) == bits(b);
+        let outside = |base: &[u32], set: &[u32]| set.iter().filter(|h| !base.contains(h)).count();
+        // kpbwt 150 above k_max 100: the base fills the cut.
+        let (old, old_sets) = run(Some(KmaxCut::default()), 100);
+        if crate::config::raw("LCWGS_KMAX_CUT").is_none() && crate::config::raw("LCWGS_CARRIER_RESERVE").is_none() {
+            assert!(same(&old, &run(None, 100).0));
+        }
+        let (priority, pri_sets) = run(Some(KmaxCut { priority: true, reserve: 0 }), 100);
+        let (reserve, res_sets) = run(Some(KmaxCut { priority: true, reserve: 30 }), 100);
+        let (reserve_only, ro_sets) = run(Some(KmaxCut { priority: false, reserve: 30 }), 100);
+        assert!(!same(&priority, &old), "the priority cut changed nothing");
+        assert!(!same(&reserve, &priority), "the reserve changed nothing");
+        assert!(!same(&reserve_only, &old), "the reserve alone changed nothing");
+        assert!(same(&reserve, &run(Some(KmaxCut { priority: true, reserve: 30 }), 100).0), "not deterministic");
+        for out in [&priority, &reserve, &reserve_only] {
+            assert!(out.dosage.iter().all(|d| (0.0..=2.0).contains(d)));
+        }
+        // The sets themselves, iterations after INIT (iteration 0 is an ascending set).
+        let (mut cut_bit, mut admitted) = (0, 0);
+        for (it, ((ob, oc), (pb, pc))) in old_sets.iter().zip(&pri_sets).enumerate().skip(1) {
+            for h in 0..2 * n_samples {
+                // Old: the base comes index-sorted and the cut keeps its 100 lowest IDs.
+                let (no, np) = (ob[h].len().min(100), pb[h].len().min(100));
+                assert!(ob[h].windows(2).all(|w| w[0] < w[1]));
+                assert_eq!(oc[h][..no], ob[h][..no], "old cut, iteration {it}");
+                // Priority: the base comes in g2 fill order, the cut keeps its first 100, ascending.
+                let mut top = pb[h][..np].to_vec();
+                top.sort_unstable();
+                assert_eq!(pc[h][..np], top[..], "priority cut, iteration {it}");
+                if pb[h].len() > 100 && pb[h][..100].windows(2).any(|w| w[0] > w[1]) { cut_bit += 1; }
+            }
+        }
+        assert!(cut_bit > 0, "the fill order never mattered");
+        for (it, (rb, rc)) in res_sets.iter().chain(&ro_sets).enumerate() {
+            for h in 0..2 * n_samples {
+                assert!(rc[h].len() <= 100, "iteration {it}");
+                let a = outside(&rb[h], &rc[h]);
+                assert!(a <= 100, "iteration {it}");
+                admitted += a;
+            }
+            for s in 0..n_samples {
+                // Both haplotypes of a sample keep the same head (>= k_max - reserve IDs).
+                let shared = rc[2 * s].iter().zip(&rc[2 * s + 1]).take_while(|(x, y)| x == y).count();
+                assert!(shared >= 70.min(rb[2 * s].len()), "iteration {it} sample {s}: shared prefix {shared}");
+            }
+        }
+        assert!(admitted > 0, "the reserve admitted no carrier");
+        assert!(old_sets.iter().all(|(b, c)| (0..2 * n_samples).all(|h| b[h].len() < 100 || outside(&b[h], &c[h]) == 0)),
+            "the old cut admitted a carrier past a full base");
+        // kpbwt 150 at most k_max 300 - reserve 100: no base is cut, output unchanged.
+        let wide = run(Some(KmaxCut::default()), 300).0;
+        assert!(same(&wide, &run(Some(KmaxCut { priority: true, reserve: 100 }), 300).0));
+        assert!(same(&wide, &run(Some(KmaxCut { priority: false, reserve: 150 }), 300).0));
+        // Supplied (chromosome-wide) conditioning longer than kpbwt: the bound is the
+        // supplied lists', so the reserve still acts (kpbwt 50 alone would say no).
+        let mut rng = rp::Xs(0x510E_527F_ADE6_82D1);
+        let supplied: Vec<Vec<u32>> = (0..n_samples).flat_map(|_| {
+            let mut v: Vec<u32> = (0..n_haps as u32).collect();
+            for i in (1..v.len()).rev() { v.swap(i, rng.below((i + 1) as u64) as usize); }
+            v.truncate(150);
+            v.sort_unstable();
+            [v.clone(), v]
+        }).collect();
+        let small = LcwgsParams { kpbwt: 50, ..params.clone() };
+        let (_, s_old) = run_with(Some(KmaxCut::default()), 100, &small, Some(&supplied));
+        let (_, s_res) = run_with(Some(KmaxCut { priority: false, reserve: 30 }), 100, &small, Some(&supplied));
+        let adm = |sets: &Sets| -> usize { sets.iter().map(|(b, c)| (0..2 * n_samples).map(|h| outside(&b[h], &c[h])).sum::<usize>()).sum() };
+        assert_eq!(adm(&s_old), 0);
+        assert!(adm(&s_res) > 0, "supplied conditioning bypassed the reserve");
     }
 
     /// n_restarts = 1 is byte/bit-identical to a direct run_gibbs call, and
