@@ -57,6 +57,8 @@ pub struct PreloadedStripes {
     pub n_stripes: usize,
     pub n_tile_cols: usize,
     pub n_variants: usize,
+    /// Identity of the file read, taken before reading (`retain::put`).
+    pub(crate) key: Option<super::retain::FileKey>,
 }
 
 /// Per-thread zstd decompression context and output buffer, reused across
@@ -216,6 +218,25 @@ impl PreloadedStripes {
         SparseTile::from_bytes(&raw)
     }
 
+    /// For budgeting the decode of stripes `first..=last` before it runs: upper bounds
+    /// (`decoded_bound`) on what their tiles decode to, in total and for the largest
+    /// one, and the largest compressed tile.
+    pub fn decoded_bound(&self, first: usize, last: usize) -> (usize, usize, usize) {
+        (first..=last).flat_map(|s| (0..self.n_tile_cols).map(move |b| (s, b)))
+            .map(|(s, b)| {
+                let (off, len) = self.offsets[(s - self.first_stripe) * self.n_tile_cols + b];
+                (decoded_bound(&self.buf[off..off + len]), len)
+            })
+            .fold((0, 0, 0), |(t, m, c), (x, l)| (t + x, m.max(x), c.max(l)))
+    }
+
+    /// The capacity a worker's reused decode buffer may reach decoding a tile of
+    /// `comp` compressed bytes that decodes to at most `bound` (`zstd_tile_fast`'s
+    /// first guess, else the slow path's regrowth, kept up to `ZSTD_KEEP_BUF`).
+    pub fn decoder_buffer_bound(comp: usize, bound: usize) -> usize {
+        (comp * 8).max(1 << 20).max((bound + bound / 4).min(ZSTD_KEEP_BUF))
+    }
+
     /// Check if a stripe is within this preloaded range.
     #[inline]
     pub fn contains_stripe(&self, stripe: usize) -> bool {
@@ -285,6 +306,65 @@ impl PreloadedStripes {
     }
 }
 
+/// An upper bound on the bytes the compressed tile `c` decodes to, from its headers
+/// alone. LZ4 (`lz4_flex` size-prepended): the stored size. zstd: over every frame,
+/// the sum over its blocks of a raw or RLE block's size and, for a compressed block,
+/// the largest a block may decode to (the window size, at most 128 KiB). Anything
+/// unreadable: the largest tile a writer makes (`TILE_ROWS` x `TILE_COLS` two-byte row
+/// indices plus the column pointers).
+pub fn decoded_bound(c: &[u8]) -> usize {
+    const MAX_TILE: usize = 8 + 4 * (TILE_COLS + 1) + 2 * TILE_ROWS * TILE_COLS;
+    const ZSTD: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+    if c.len() < 4 || c[..4] != ZSTD {
+        return if c.len() >= 4 { u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize } else { MAX_TILE };
+    }
+    // Every frame in turn (a decoder reads concatenated frames): zstd frames, and
+    // skippable frames (magic 0x184D2A5?, a 4-byte size), which decode to nothing.
+    let zstd = || -> Option<usize> {
+        let (mut at, mut total) = (0usize, 0usize);
+        while at < c.len() {
+            let magic = u32::from_le_bytes(c.get(at..at + 4)?.try_into().ok()?);
+            if magic & 0xFFFF_FFF0 == 0x184D_2A50 {
+                let n = u32::from_le_bytes(c.get(at + 4..at + 8)?.try_into().ok()?) as usize;
+                at = at.checked_add(8 + n)?;
+                continue;
+            }
+            if magic != 0xFD2F_B528 { return None; }
+            let fhd = *c.get(at + 4)?;
+            let (fcs_flag, single, checksum, did_flag) = (fhd >> 6, (fhd >> 5) & 1 == 1, (fhd >> 2) & 1 == 1, fhd & 3);
+            at += 5;
+            let window = if single { None } else {
+                let wd = *c.get(at)?;
+                at += 1;
+                let base = 1u64 << (10 + (wd >> 3));
+                Some(base + (base / 8) * (wd & 7) as u64)
+            };
+            at += [0, 1, 2, 4][did_flag as usize];
+            at += match (fcs_flag, single) { (0, false) => 0, (0, true) => 1, (1, _) => 2, (2, _) => 4, _ => 8 };
+            // Blocks: a raw or RLE block's own size; a compressed one at most the block
+            // maximum (the window size, at most 128 KiB). (A content-size field, when
+            // present, is not trusted over the blocks.)
+            let block_max = window.map_or(128 << 10, |w| w.min(128 << 10)) as usize;
+            loop {
+                let h = c.get(at..at + 3)?;
+                let h = h[0] as u32 | (h[1] as u32) << 8 | (h[2] as u32) << 16;
+                let (last, kind, size) = (h & 1 == 1, (h >> 1) & 3, (h >> 3) as usize);
+                at += 3;
+                match kind {
+                    0 => { total = total.checked_add(size)?; at = at.checked_add(size)?; }
+                    1 => { total = total.checked_add(size)?; at += 1; }
+                    2 => { total = total.checked_add(block_max)?; at = at.checked_add(size)?; }
+                    _ => return None,
+                }
+                if last { break; }
+            }
+            if checksum { at += 4; }
+        }
+        Some(total)
+    };
+    zstd().unwrap_or(MAX_TILE)
+}
+
 /// Zero bytes `PreloadedStripes::with_tile` puts after a tile's row indices, so
 /// a 32-row window loaded at any column start stays inside the buffer.
 pub const TILE_PAD: usize = 64;
@@ -342,10 +422,11 @@ struct ExtractReads {
     reads: Vec<std::ops::Range<usize>>,
     /// Compressed bytes of each read.
     bytes: Vec<usize>,
-    /// Read `k + 1` while read `k` is decoded.
+    /// Reads `k` and `k + 1` fit `bound` together (either may be read while the
+    /// other is decoded; `extract_bitmatrix` checks the pair it visits in turn).
+    #[cfg_attr(not(test), allow(dead_code))]
     prefetch: Vec<bool>,
     /// Compressed bytes the previous scheme held at its largest read.
-    #[cfg_attr(not(test), allow(dead_code))]
     bound: usize,
 }
 
@@ -483,6 +564,24 @@ impl TiledSrpReader {
             .sum()
     }
 
+    /// Compressed bytes of every tile.
+    pub fn tile_bytes(&self) -> u64 {
+        self.tile_index.iter().map(|e| e.comp_size as u64).sum()
+    }
+
+    /// File offset of stripe `stripe`'s first tile (the file length past the last stripe).
+    pub fn stripe_offset(&self, stripe: usize) -> u64 {
+        match self.tile_index.get(stripe * self.n_tile_cols) {
+            Some(e) => e.offset,
+            None => self.tile_index.last().map_or(0, |e| e.offset + e.comp_size as u64),
+        }
+    }
+
+    /// The panel file's identity, for `retain`.
+    pub fn file_key(&self) -> Option<super::retain::FileKey> {
+        super::retain::FileKey::of_path(&self.file_path)
+    }
+
     /// Bytes `preload_stripes(first_stripe, n_stripes)` reads.
     pub fn stripes_read_len(&self, first_stripe: usize, n_stripes: usize) -> usize {
         let first_tile = first_stripe * self.n_tile_cols;
@@ -507,9 +606,6 @@ impl TiledSrpReader {
         let read_start = self.tile_index[first_tile].offset;
         let read_len = self.stripes_read_len(first_stripe, n_stripes);
 
-        // One sequential read from disk; a large one in up to four contiguous
-        // parts read concurrently (from the page cache a single reader copies
-        // ~2 GB/s, four ~7 GB/s on the 75,552-haplotype panel). Same bytes.
         let file = std::fs::File::open(&self.file_path)?;
         if buf.capacity() < read_len {
             buf = vec![0u8; read_len];
@@ -517,31 +613,12 @@ impl TiledSrpReader {
             buf.clear();
             buf.resize(read_len, 0);
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::FileExt;
-            const PART: usize = 32 << 20;
-            let k = (read_len / PART).min(4);
-            if k >= 2 {
-                let chunk = read_len.div_ceil(k);
-                std::thread::scope(|sc| -> io::Result<()> {
-                    let parts: Vec<_> = buf.chunks_mut(chunk).enumerate().map(|(i, part)| {
-                        let file = &file;
-                        sc.spawn(move || file.read_exact_at(part, read_start + (i * chunk) as u64))
-                    }).collect();
-                    for h in parts { h.join().expect("stripe read thread panicked")?; }
-                    Ok(())
-                })?;
-            } else {
-                file.read_exact_at(&mut buf, read_start)?;
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            use std::io::{Seek, SeekFrom, Read};
-            let mut file = file;
-            file.seek(SeekFrom::Start(read_start))?;
-            file.read_exact(&mut buf)?;
+        // Spans held in RAM for these reads (`retain`) are copied from there; only the
+        // rest is read from the file. Same bytes.
+        let key = super::retain::FileKey::of(&file);
+        let holes = if super::retain::held_bytes() > 0 { super::retain::fill(key, read_start, &mut buf) } else { vec![0..read_len] };
+        for h in holes {
+            read_file_at(&file, &mut buf[h.clone()], read_start + h.start as u64)?;
         }
 
         // Build offset table: map (local_stripe, band) → (offset_in_buf, comp_size)
@@ -563,6 +640,7 @@ impl TiledSrpReader {
             n_stripes,
             n_tile_cols: self.n_tile_cols,
             n_variants: self.n_variants,
+            key,
         })
     }
 
@@ -572,6 +650,16 @@ impl TiledSrpReader {
     /// `ChrSrpView::extract_ref_alleles_bitmatrix` (each resolves its own tiled
     /// backend and supplies `n_haps` from its metadata).
     pub fn extract_bitmatrix(&self, n_haps: usize, wgs_idx: &[usize]) -> crate::common::HaplotypeBitmatrix {
+        self.extract_bitmatrix_retaining(n_haps, wgs_idx, 0, u64::MAX)
+    }
+
+    /// `extract_bitmatrix`, leaving the head-most spans it read — up to
+    /// `retain_bytes` of them — held in `retain` for the interpolation's reads. On a
+    /// cache-limited run (`retain::limited`) the held spans and every read past the
+    /// next `keep_cached` bytes (head first) are dropped from the page cache once
+    /// decoded: the cache then keeps the reads the interpolation makes first.
+    pub fn extract_bitmatrix_retaining(&self, n_haps: usize, wgs_idx: &[usize], retain_bytes: usize,
+                                       keep_cached: u64) -> crate::common::HaplotypeBitmatrix {
         use super::{TILE_ROWS, TILE_COLS};
         use std::collections::HashMap;
 
@@ -602,17 +690,32 @@ impl TiledSrpReader {
             (fs, stripes[r.end - 1] - fs + 1, Vec::with_capacity(plan.bytes[k]))
         };
 
+        // Visit order (`extract_tail_first`), and the reads left held for the
+        // interpolation: the head-most ones within `retain_bytes`.
+        let n_reads = plan.reads.len();
+        let order: Vec<usize> = if extract_tail_first() { (0..n_reads).rev().collect() } else { (0..n_reads).collect() };
+        let n_keep = if retain_bytes == 0 { 0 } else {
+            plan.bytes.iter().scan(0usize, |acc, &b| { *acc += b; Some(*acc) })
+                .take_while(|&acc| acc <= retain_bytes).count()
+        };
+        // The file held spans and page-cache drops refer to (open while used).
+        let pin = if n_keep > 0 || super::retain::limited() { std::fs::File::open(&self.file_path).ok() } else { None };
+        // Compressed bytes of the reads before read k (head first), for `keep_cached`.
+        let before: Vec<u64> = std::iter::once(0u64)
+            .chain(plan.bytes.iter().scan(0u64, |a, &b| { *a += b as u64; Some(*a) })).collect();
+        let held_end = before[n_keep];
+
         std::thread::scope(|sc| {
         let mut next: Option<std::thread::ScopedJoinHandle<'_, io::Result<PreloadedStripes>>> = None;
-        for (k, r) in plan.reads.iter().enumerate() {
-            let batch = &sorted[r.clone()];
+        for (i, &k) in order.iter().enumerate() {
+            let batch = &sorted[plan.reads[k].clone()];
             let loaded = match next.take() {
                 Some(h) => h.join().expect("stripe read thread panicked"),
                 None => { let (fs, n, buf) = read_args(k); self.preload_stripes_into(fs, n, buf) }
             }.expect("preload failed");
             // Read the next while this one is decoded, when both fit together.
-            if plan.prefetch[k] {
-                let (fs, n, buf) = read_args(k + 1);
+            if let Some(&k2) = order.get(i + 1) && plan.bytes[k] + plan.bytes[k2] <= plan.bound {
+                let (fs, n, buf) = read_args(k2);
                 next = Some(sc.spawn(move || self.preload_stripes_into(fs, n, buf)));
             }
 
@@ -657,11 +760,68 @@ impl TiledSrpReader {
                     });
                 }
             });
-            drop(loaded);
+            // Held: in RAM now. Past the cache window: the cache cannot keep it until
+            // the interpolation reads it. Either way its page-cache copy only crowds
+            // out the reads after the held ones (a no-op unless the run is limited).
+            let offset = self.tile_index[loaded.first_stripe * n_tc].offset;
+            let held = k < n_keep;
+            if let Some(f) = &pin {
+                if held || before[k + 1] > held_end.saturating_add(keep_cached) {
+                    super::retain::drop_cached(f, offset, offset + plan.bytes[k] as u64);
+                }
+                // (Copied into an anonymous mapping: any thread may release it.)
+                if held && let Some(key) = loaded.key && let Some(d) = super::retain::SpanData::copy_of(&loaded.buf) {
+                    super::retain::put(f, key, offset, d);
+                }
+            }
         }
         });
         crate::common::HaplotypeBitmatrix::from_raw(bits, n_chip, n_haps)
     }
+}
+
+/// Read `buf.len()` bytes of `file` from `offset`: one sequential read, a large one
+/// in up to four contiguous parts read concurrently (from the page cache a single
+/// reader copies ~2 GB/s, four ~7 GB/s on the 75,552-haplotype panel). Same bytes.
+pub(crate) fn read_file_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        const PART: usize = 32 << 20;
+        let read_len = buf.len();
+        let k = (read_len / PART).min(4);
+        if k >= 2 {
+            let chunk = read_len.div_ceil(k);
+            std::thread::scope(|sc| -> io::Result<()> {
+                let parts: Vec<_> = buf.chunks_mut(chunk).enumerate().map(|(i, part)| {
+                    sc.spawn(move || file.read_exact_at(part, offset + (i * chunk) as u64))
+                }).collect();
+                for h in parts { h.join().expect("stripe read thread panicked")?; }
+                Ok(())
+            })
+        } else {
+            file.read_exact_at(buf, offset)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::{Seek, SeekFrom, Read};
+        let mut file = file;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(buf)
+    }
+}
+
+/// `extract_bitmatrix` visits its reads from the file's tail to its head. A panel
+/// just downloaded into a container too small to cache it leaves its TAIL in the
+/// page cache (the download evicted the head), and reading head first evicted that
+/// tail before reaching it: one user x the 75,552-haplotype chr2 panel in a 6 GiB
+/// cgroup read all 7.07 GB of its spans from disk. Ending at the head also leaves
+/// the head, where the interpolation starts, as the most recently read part.
+/// `SELPHI_EXTRACT_ORDER=head` reads head first, as before. The bitmatrix is the same
+/// either way (each stripe sets its own rows).
+fn extract_tail_first() -> bool {
+    crate::config::raw("SELPHI_EXTRACT_ORDER").as_deref() != Some("head")
 }
 
 /// For every wanted row `rows[k]` (at most 64, ascending) and 64-column word `w`
@@ -1223,7 +1383,108 @@ mod tests {
         }
     }
 
-    /// A tile read in place equals the decoded SparseTile, through the reused
+    /// An all-ones 1024 x 4096 tile, serialised (8 MB).
+    fn tiles_bytes_dense() -> Vec<u8> {
+        let mut r = Xs(1);
+        random_tile(&mut r, TILE_ROWS, TILE_COLS, 1000).to_bytes()
+    }
+
+    /// `decoded_bound` is at least what every tile decodes to (zstd at several
+    /// densities, all-ones and empty tiles, LZ4), and close to it for typical tiles.
+    #[test]
+    fn decoded_bound_covers_every_tile() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = Xs(0xB0B0);
+        for (n_variants, n_haps, per_mille) in [(1024, 4096, 1000), (1024, 4096, 500), (3000, 300, 40),
+                                                (2100, 4096 + 900, 120), (777, 9000, 2), (1024, 64, 0)] {
+            let (t, tiles) = panel(dir.path(), &mut r, n_variants, n_haps, per_mille, 3);
+            let loaded = t.preload_stripes(0, t.n_tile_rows).unwrap();
+            for st in 0..t.n_tile_rows {
+                for b in 0..t.n_tile_cols {
+                    let raw = tiles[st * t.n_tile_cols + b].to_bytes().len();
+                    let bound = loaded.decoded_bound(st, st).0 - (0..b).chain(b + 1..t.n_tile_cols)
+                        .map(|bb| { let (o, l) = loaded.offsets[st * t.n_tile_cols + bb]; decoded_bound(&loaded.buf[o..o + l]) }).sum::<usize>();
+                    assert!(bound >= raw, "stripe {st} band {b}: bound {bound} < {raw}");
+                    assert!(bound <= raw + (128 << 10) * (raw.div_ceil(128 << 10) + 1), "stripe {st} band {b}: bound {bound} for {raw}");
+                }
+            }
+        }
+        // Concatenated frames (an empty one first, a skippable one, two halves): the
+        // bound covers them all.
+        let big = tiles_bytes_dense();
+        let (a, b) = big.split_at(big.len() / 2);
+        let mut cat = zstd::encode_all(std::io::Cursor::new(&[][..]), 3).unwrap();
+        cat.extend_from_slice(&[0x50, 0x2A, 0x4D, 0x18, 3, 0, 0, 0, 1, 2, 3]);
+        cat.extend(zstd::encode_all(std::io::Cursor::new(a), 3).unwrap());
+        cat.extend(zstd::encode_all(std::io::Cursor::new(b), 3).unwrap());
+        assert_eq!(zstd::decode_all(std::io::Cursor::new(&cat)).unwrap(), big);
+        assert!(decoded_bound(&cat) >= big.len(), "{} < {}", decoded_bound(&cat), big.len());
+        assert_eq!(decoded_bound(&[]), 8 + 4 * (TILE_COLS + 1) + 2 * TILE_ROWS * TILE_COLS);
+        // A worker's reused buffer: the fast path's first guess (8x the compressed size,
+        // 1 MiB at least) or the slow path's regrowth, whichever is larger.
+        assert_eq!(PreloadedStripes::decoder_buffer_bound(100, 50), 1 << 20);
+        assert_eq!(PreloadedStripes::decoder_buffer_bound(8 << 20, 8 << 20), 64 << 20);
+        assert_eq!(PreloadedStripes::decoder_buffer_bound(100_000, 4 << 20), 5 << 20);
+        assert_eq!(PreloadedStripes::decoder_buffer_bound(100_000, 64 << 20), ZSTD_KEEP_BUF);
+        assert_eq!(decoded_bound(&[0x28, 0xB5, 0x2F, 0xFD, 0x00]), 8 + 4 * (TILE_COLS + 1) + 2 * TILE_ROWS * TILE_COLS);
+    }
+
+    /// The extraction with retention gives the same bitmatrix, leaves exactly its
+    /// head-most reads within the budget held (each the file's bytes), and every
+    /// later read — wholly, partly or not covered by them — returns the file's bytes;
+    /// the interpolation's release drops only the spans behind its read.
+    #[test]
+    fn retained_extraction_reads_serve_later_reads_with_the_files_bytes() {
+        let _g = super::super::retain::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use super::super::retain;
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = Xs(0x4E7A1);
+        for (n_variants, n_haps, per_mille) in [(40 * TILE_ROWS + 77, 300, 30), (12 * TILE_ROWS, 4096 + 100, 8)] {
+            let (t, _) = panel(dir.path(), &mut r, n_variants, n_haps, per_mille, 3);
+            let file = std::fs::read(t.file_path()).unwrap();
+            // Sites in about half the stripes, so the reads leave gaps between them.
+            let mut idx = Vec::new();
+            for s in 0..t.n_tile_rows {
+                if r.below(2) == 0 { continue; }
+                let rows = TILE_ROWS.min(n_variants - s * TILE_ROWS);
+                for _ in 0..1 + r.below(4) { idx.push(s * TILE_ROWS + r.below(rows as u64) as usize); }
+            }
+            retain::release_all();
+            let plain = t.extract_bitmatrix(n_haps, &idx);
+            assert_eq!(retain::held_bytes(), 0);
+            for (n, budget) in [0usize, 1, 100 << 10, usize::MAX].into_iter().enumerate() {
+                retain::release_all();
+                // A cache-limited run also drops pages from the page cache (advice only).
+                retain::set_limited((n % 2 == 1).then(|| t.file_path()), true);
+                let got = t.extract_bitmatrix_retaining(n_haps, &idx, budget, if n < 2 { u64::MAX } else { 0 });
+                for ci in 0..idx.len() {
+                    for h in 0..n_haps { assert_eq!(got.get(ci, h), plain.get(ci, h)); }
+                }
+                let held = retain::held_spans();
+                assert!(retain::held_bytes() <= budget);
+                if budget == usize::MAX { assert!(held.len() > 1, "every read held"); }
+                // The held spans are the reads nearest the head, in order.
+                for (i, sp) in held.iter().enumerate() {
+                    if i > 0 { assert!(sp.start >= held[i - 1].end); }
+                }
+                if let Some(first) = held.first() { assert_eq!(first.start, t.stripe_offset(idx.iter().min().unwrap() / TILE_ROWS)); }
+                for (n, (fs, k)) in [(0usize, t.n_tile_rows), (3, 5), (1, 1), (t.n_tile_rows - 2, 2), (5, 9)].into_iter().enumerate() {
+                    let k = k.min(t.n_tile_rows - fs);
+                    let loaded = t.preload_stripes_into(fs, k, if n % 2 == 0 { Vec::new() } else { vec![7u8; 3] }).unwrap();
+                    let lo = t.stripe_offset(fs) as usize;
+                    assert_eq!(&loaded.buf[..], &file[lo..lo + t.stripes_read_len(fs, k)]);
+                }
+                // Releasing before stripe 4's offset keeps every span that reaches past it.
+                let cut = t.stripe_offset(4);
+                retain::consumed_before(t.file_path(), cut);
+                assert_eq!(retain::held_spans(), held.iter().filter(|sp| sp.end > cut).cloned().collect::<Vec<_>>());
+            }
+            retain::release_all();
+            retain::set_limited(None, false);
+        }
+    }
+
+    /// A tile read in place equals the decoded SparseTile, through the reused    /// A tile read in place equals the decoded SparseTile, through the reused
     /// decoder, the slow path (buffer too small), LZ4 tiles and no scope at all;
     /// and the three scans set the same bits as a scan of the SparseTile, on
     /// columns shorter and longer than the 32-row window.

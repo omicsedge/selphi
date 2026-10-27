@@ -27,6 +27,7 @@ pub mod bcf_reader;
 pub(crate) mod bcf_types;
 pub mod csi;
 pub mod tiled;
+pub mod retain;
 pub mod multi_chr_reader;
 pub mod multi_chr_writer;
 pub use reader::SrpReader;
