@@ -41,6 +41,8 @@ pub struct MultiChrImputeConfig {
     pub gp: bool,
     /// `--header-line`: lines added to the output header after ##source.
     pub header_lines: Vec<String>,
+    /// `--contig-length-from-input`: the ##contig lines carry the input header's lengths.
+    pub contig_length_from_input: bool,
     /// How a phased input's own phase is used (`--keep-input-phase`, `--trust-input-phase`,
     /// `--force-phasing`, or the gated default); see `imputation::input_phase`.
     pub input_phase: selphi::imputation::input_phase::InputPhase,
@@ -121,6 +123,7 @@ impl MultiChrImputeConfig {
             no_ap: args.no_ap,
             gp: args.gp,
             header_lines: args.header_line.clone(),
+            contig_length_from_input: args.contig_length_from_input,
             input_phase: args.input_phase(),
             max_cond_haps: args.max_cond_haps,
             fl_fwd: args.fl_fwd,
@@ -734,6 +737,10 @@ pub fn run_multi_chr(
             contig_fields.push_str(&lines.get(k).cloned().unwrap_or_else(|| format!("##contig=<ID={spelling}>")));
         }
     }
+    // `--contig-length-from-input`: every line (the panel's and the absent contigs') with the
+    // input's length; names, and so BCF rids and index ids, unchanged.
+    let contig_fields = selphi::io::contig_length::InputContigLengths::for_run(config.contig_length_from_input, input_path)
+        .apply_logged(&contig_fields, |_| None).into_owned();
     let all_contig_fields = &contig_fields;
     let (vcf_tx, vcf_writer, vcf_bgzip) = if formats.vcf || formats.bcf {
         if formats.bcf {

@@ -66,6 +66,8 @@ pub fn run(
     vcf_path: &Path, tsv_path: &Path,
     // `--header-line` lines for the VCF header.
     extra_header: &[String],
+    // `--contig-length-from-input`: the input header's contig lengths (none when off).
+    contig_lengths: &crate::io::contig_length::InputContigLengths,
 ) -> std::io::Result<()> {
     // The panel's chromosomes in its order, and the header's ##contig lines (each ID once).
     let multi = match &panels { Panels::Multi(p) => Some(MultiChrSrpReader::open(p)?), Panels::Files(_) => None };
@@ -94,6 +96,7 @@ pub fn run(
         if !declared.iter().any(|d| bare(d) == bare(c)) { contig_lines.push(format!("##contig=<ID={c}>")); }
     }
     let contig_lines = crate::io::bcf_encode::dedup_contig_lines(&contig_lines.join("\n"));
+    let contig_lines = contig_lengths.apply_logged(&contig_lines, |_| None).into_owned();
 
     // The chromosomes the input covers; the others are left out without a run.
     let covered = match &input {
