@@ -530,6 +530,50 @@ fn write_tbi_linear(out: &mut Vec<u8>, lin: Option<&Vec<u64>>) {
     }
 }
 
+/// Record a record's start `vpos` in the linear index of EVERY 16 kb window its span
+/// `[pos, pos + rlen)` (0-based, half open) overlaps, as htslib's `insert_to_l` does. A
+/// region query starts reading at the linear entry of its first window (TBI), or at the
+/// `loffset` of the bin there (CSI, taken from this index); entered under its start window
+/// alone, a deletion that starts in an earlier window and reaches into the region lay before
+/// that entry, and tabix/bcftools skipped it (chr2:188760069-188760070 of one prod output:
+/// five deletions at 188760045 missing).
+#[inline]
+fn linear_insert(lin: &mut Vec<u64>, pos: i64, rlen: i64, vpos: u64) {
+    let pos = pos.max(0);
+    let first = (pos >> DEFAULT_MIN_SHIFT) as usize;
+    let last = ((pos + rlen.max(1) - 1) >> DEFAULT_MIN_SHIFT) as usize;
+    if last >= lin.len() { lin.resize(last + 1, 0); }
+    for slot in &mut lin[first..=last] {
+        if *slot == 0 || vpos < *slot { *slot = vpos; }
+    }
+}
+
+/// The first 16 kb window a bin of a `depth`-level index covers (htslib `hts_bin_bot`).
+#[inline]
+fn bin_first_window(bin: u32, depth: i32) -> usize {
+    let mut level = 0u64;
+    let mut b = bin as u64;
+    while b > 0 { b = (b - 1) >> 3; level += 1; }
+    let first_of_level = ((1u64 << (3 * level)) - 1) / 7;
+    ((bin as u64 - first_of_level) << (3 * (depth as u64 - level))) as usize
+}
+
+/// A CSI bin's `loffset` for each window, as htslib's `update_loff` derives it: the entry of
+/// the bin's first window in the linear index ([`linear_insert`]), so no record overlapping
+/// that window starts before it. Windows before the first record take that record's offset,
+/// as in htslib; a later empty window takes the previous window's entry where htslib takes
+/// the next one's: an earlier offset, so a query reads a little more and skips nothing (no
+/// record overlaps an empty window).
+fn csi_loffsets(lin: &[u64]) -> Vec<u64> {
+    let mut filled = lin.to_vec();
+    let first = filled.iter().copied().find(|&v| v != 0).unwrap_or(0);
+    let mut prev = first;
+    for v in filled.iter_mut() {
+        if *v == 0 { *v = prev; } else { prev = *v; }
+    }
+    filled
+}
+
 /// Build a CSI index for a BCF file by scanning all records.
 /// Writes the .csi file next to the BCF.
 pub fn build_csi_index(bcf_path: &Path) -> io::Result<()> {
@@ -573,15 +617,15 @@ pub fn build_csi_index_data(bcf_path: &Path) -> io::Result<Vec<u8>> {
     let hdr_text = String::from_utf8_lossy(&hdr);
     let n_contigs = hdr_text.lines().filter(|l| l.starts_with("##contig=")).count();
 
-    // Scan records, build bin data per (ref_id, bin_id)
-    // BinData: loffset (first vpos), chunks Vec<(beg, end)>, n_mapped
+    // Scan records, build bin data per (ref_id, bin_id): chunks Vec<(beg, end)>; the
+    // loffsets come from the per-reference linear index (`csi_loffsets`).
     struct BinData {
-        loffset: u64,
         chunks: Vec<(u64, u64)>,
     }
 
     let mut ref_bins: BTreeMap<i32, BTreeMap<u32, BinData>> = BTreeMap::new();
     let mut ref_n_mapped: BTreeMap<i32, u64> = BTreeMap::new();
+    let mut ref_linear: BTreeMap<i32, Vec<u64>> = BTreeMap::new();
     let mut sb = Vec::with_capacity(512);
     let mut skip_buf = [0u8; 65536];
 
@@ -630,7 +674,6 @@ pub fn build_csi_index_data(bcf_path: &Path) -> io::Result<Vec<u8>> {
 
         let bins = ref_bins.entry(chrom_id).or_default();
         let bin = bins.entry(bin_id).or_insert_with(|| BinData {
-            loffset: vpos,
             chunks: vec![(vpos, vpos_end)],
         });
 
@@ -644,6 +687,7 @@ pub fn build_csi_index_data(bcf_path: &Path) -> io::Result<Vec<u8>> {
         }
 
         *ref_n_mapped.entry(chrom_id).or_insert(0) += 1;
+        linear_insert(ref_linear.entry(chrom_id).or_default(), pos, rlen, vpos);
     }
 
     // Write CSI file
@@ -659,8 +703,10 @@ pub fn build_csi_index_data(bcf_path: &Path) -> io::Result<Vec<u8>> {
             let n_mapped = ref_n_mapped.get(&ref_id).copied().unwrap_or(0);
             // n_bin = real bins + 1 pseudo-bin
             out.extend_from_slice(&(bins.len() as i32 + 1).to_le_bytes());
+            let loffs = csi_loffsets(ref_linear.get(&ref_id).map(Vec::as_slice).unwrap_or(&[]));
             for (&bin_id, bin_data) in bins {
-                write_csi_bin(&mut out, bin_id, bin_data.loffset, &bin_data.chunks);
+                let loffset = loffs.get(bin_first_window(bin_id, depth)).copied().unwrap_or(0);
+                write_csi_bin(&mut out, bin_id, loffset, &bin_data.chunks);
             }
             write_csi_pseudo_bin(&mut out, depth, n_mapped);
         } else {
@@ -813,15 +859,8 @@ pub fn build_tbi_index_data(vcf_gz_path: &Path) -> io::Result<Vec<u8>> {
 
         *ref_n_mapped.entry(ref_id).or_insert(0) += 1;
 
-        // Linear index: track minimum vpos for each 16Kb window
-        let lin_idx = (pos >> DEFAULT_MIN_SHIFT) as usize;
-        let lin = ref_linear.entry(ref_id).or_default();
-        if lin_idx >= lin.len() {
-            lin.resize(lin_idx + 1, 0);
-        }
-        if lin[lin_idx] == 0 || vpos < lin[lin_idx] {
-            lin[lin_idx] = vpos;
-        }
+        // Linear index: the minimum vpos of the records overlapping each 16 kb window
+        linear_insert(ref_linear.entry(ref_id).or_default(), pos, rlen, vpos);
     }
 
     // Write TBI file
@@ -896,10 +935,7 @@ impl TbiAccum {
             else { chunks.push((vpos, vpos_end)); }
         }
         *self.ref_n_mapped.entry(ref_id).or_insert(0) += 1;
-        let lin_idx = (pos >> DEFAULT_MIN_SHIFT) as usize;
-        let lin = self.ref_linear.entry(ref_id).or_default();
-        if lin_idx >= lin.len() { lin.resize(lin_idx + 1, 0); }
-        if lin[lin_idx] == 0 || vpos < lin[lin_idx] { lin[lin_idx] = vpos; }
+        linear_insert(self.ref_linear.entry(ref_id).or_default(), pos, rlen, vpos);
     }
 
     fn write(&self, contig_names: &[String], tbi_path: &Path) -> io::Result<()> {
@@ -1319,6 +1355,83 @@ mod tests {
         assert_eq!(got, exp);
     }
 
+    #[test]
+    fn linear_entries_cover_every_window_of_a_records_span() {
+        let mut lin = Vec::new();
+        linear_insert(&mut lin, 100, 1, 7);                 // window 0
+        linear_insert(&mut lin, 16_380, 30, 9);             // 16,380..16,410: windows 0 and 1
+        linear_insert(&mut lin, 16_384 * 3 + 5, 1, 11);     // window 3 only
+        assert_eq!(lin, vec![7, 9, 0, 11]);
+        linear_insert(&mut lin, 16_383, 1, 12);             // ends at 16,384 (exclusive): window 0 only
+        assert_eq!(lin, vec![7, 9, 0, 11]);
+        assert_eq!(csi_loffsets(&[0, 0, 5, 0, 8, 0]), vec![5, 5, 5, 5, 8, 8]);
+        // htslib hts_bin_bot: depth 6 (CSI) leaves from 37,449, depth 5 (TBI) from 4,681
+        assert_eq!(bin_first_window(37_449, 6), 0);
+        assert_eq!(bin_first_window(37_450, 6), 1);
+        assert_eq!(bin_first_window(4_681 + 2, 6), 16);     // level-5 bin 2: windows 16..23
+        assert_eq!(bin_first_window(585 + 1, 5), 8);        // TBI level-4 bin 1: windows 8..15
+        assert_eq!(bin_first_window(0, 6), 0);
+        assert_eq!(bin_first_window(1, 6), 0);
+        assert_eq!(bin_first_window(2, 6), 1 << 15);
+    }
+
+    /// A 30-bp deletion at 16,371 (1-based) reaches into window 1 (from 16,385). A region
+    /// query that starts there reads from the linear entry of window 1 (TBI) or the
+    /// loffset of window 1's leaf bin (CSI): both must be the deletion's offset, not the
+    /// next record's, or tabix / bcftools view -r miss it.
+    #[test]
+    fn a_record_reaching_into_a_later_window_is_found_from_that_window() {
+        let dir = tempfile::tempdir().unwrap();
+        // VCF.gz, one BGZF block: virtual offsets are byte offsets
+        let header = "##fileformat=VCFv4.2\n##contig=<ID=22>\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n";
+        let snp1 = "22\t101\t.\tA\tG\t.\tPASS\t.\n";
+        let del = format!("22\t16371\t.\t{}\tA\t.\tPASS\t.\n", "A".repeat(30));
+        let snp2 = "22\t20001\t.\tA\tG\t.\tPASS\t.\n";
+        let vcf = dir.path().join("t.vcf.gz");
+        {
+            let mut w = noodles_bgzf::io::Writer::new(std::fs::File::create(&vcf).unwrap());
+            w.write_all(format!("{header}{snp1}{del}{snp2}").as_bytes()).unwrap();
+            w.try_finish().unwrap();
+        }
+        let del_off = (header.len() + snp1.len()) as u64;
+        let tbi = parse_tbi_data(&build_tbi_index_data(&vcf).unwrap()).unwrap();
+        assert_eq!(tbi.linear[0][1], del_off);
+        assert_eq!(u64::from(tbi_seek(&tbi, 0, 16_390)), del_off);
+
+        // BCF with the same three records (no samples; rlen is what the index reads)
+        let text = "##fileformat=VCFv4.2\n##FILTER=<ID=PASS,Description=\"All filters passed\",IDX=0>\n\
+            ##contig=<ID=22,IDX=0>\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\0";
+        let mut out: Vec<u8> = b"BCF\x02\x02".to_vec();
+        out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        out.extend_from_slice(text.as_bytes());
+        let mut offs = Vec::new();
+        for (pos, rlen) in [(100i32, 1i32), (16_370, 30), (20_000, 1)] {
+            offs.push(out.len() as u64);
+            let mut shared = Vec::new();
+            shared.extend_from_slice(&0i32.to_le_bytes());
+            shared.extend_from_slice(&pos.to_le_bytes());
+            shared.extend_from_slice(&rlen.to_le_bytes());
+            shared.extend_from_slice(&f32::from_bits(0x7F80_0001).to_le_bytes());
+            shared.extend_from_slice(&(2u32 << 16).to_le_bytes());
+            shared.extend_from_slice(&0u32.to_le_bytes());
+            shared.extend_from_slice(&[0x17, b'.', 0x17, b'A', 0x17, b'G', 0x11, 0x00]);
+            out.extend_from_slice(&(shared.len() as u32).to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&shared);
+        }
+        let bcf = dir.path().join("t.bcf");
+        {
+            let mut w = noodles_bgzf::io::Writer::new(std::fs::File::create(&bcf).unwrap());
+            w.write_all(&out).unwrap();
+            w.try_finish().unwrap();
+        }
+        build_csi_index(&bcf).unwrap();
+        let csi = parse_csi_all_contigs(&dir.path().join("t.bcf.csi")).unwrap();
+        // window 1's leaf bin: checkpoint keyed by the window's end, at the deletion
+        let cp = csi[0].checkpoints.iter().find(|&&(p, _)| p == 2 * 16_384).unwrap();
+        assert_eq!(u64::from(cp.1), offs[1]);
+    }
+
     /// A parent bin that starts where a leaf starts but whose first record lies
     /// 32 kb later (a window-straddling indel) must not become the seek target
     /// for that position: HGDP chr22 lost 1,041 records to exactly this.
@@ -1409,10 +1522,7 @@ mod tests {
                 else { bin.chunks.push((vpos, vpos_end)); }
             }
             *ref_n_mapped.entry(ref_id).or_insert(0) += 1;
-            let lin_idx = (pos >> DEFAULT_MIN_SHIFT) as usize;
-            let lin = ref_linear.entry(ref_id).or_default();
-            if lin_idx >= lin.len() { lin.resize(lin_idx + 1, 0); }
-            if lin[lin_idx] == 0 || vpos < lin[lin_idx] { lin[lin_idx] = vpos; }
+            linear_insert(ref_linear.entry(ref_id).or_default(), pos, rlen, vpos);
         }
 
         // Write TBI
