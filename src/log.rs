@@ -228,50 +228,63 @@ pub fn available_ram_mb() -> Option<f64> {
 /// Room left under this process's cgroup memory limits, in MB: the least, over
 /// its cgroup and every ancestor that sets a limit, of the limit minus that
 /// group's usage (`memory.max` - `memory.current` on cgroup v2,
-/// `memory.limit_in_bytes` - `memory.usage_in_bytes` on v1). A container's limit
-/// can sit far below the host's `MemAvailable`. `None` when no group on the path
-/// sets a limit (or the files cannot be read).
+/// `memory.limit_in_bytes` - `memory.usage_in_bytes` on v1), not counting the
+/// group's inactive file cache, which the kernel reclaims before it fails an
+/// allocation. A container's limit can sit far below the host's `MemAvailable`.
+/// The cache matters: a prod imputation task downloads its panel (7.5 GB for
+/// chr2) into a 6 GiB container, so the usage alone reads as a full container.
+/// `None` when no group on the path sets a limit (or the files cannot be read).
 pub fn cgroup_headroom_mb() -> Option<f64> {
     let read = |p: &str| std::fs::read_to_string(p).ok().and_then(|s| s.trim().parse::<f64>().ok());
     let groups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    // (mount dir, limit file, usage file, group path) per hierarchy that holds memory
-    let mut probes: Vec<(String, &str, &str, String)> = Vec::new();
+    // (mount dir, limit file, usage file, inactive-cache key in memory.stat, group path)
+    // per hierarchy that holds memory
+    let mut probes: Vec<(String, &str, &str, &str, String)> = Vec::new();
     for line in groups.lines() {
         let mut f = line.splitn(3, ':');
         let (_, ctl, path) = (f.next()?, f.next()?, f.next()?.trim().to_string());
         if ctl.is_empty() {
-            probes.push(("/sys/fs/cgroup".into(), "memory.max", "memory.current", path));
+            probes.push(("/sys/fs/cgroup".into(), "memory.max", "memory.current", "inactive_file", path));
         } else if ctl.split(',').any(|c| c == "memory") {
-            probes.push(("/sys/fs/cgroup/memory".into(), "memory.limit_in_bytes", "memory.usage_in_bytes", path));
+            probes.push(("/sys/fs/cgroup/memory".into(), "memory.limit_in_bytes", "memory.usage_in_bytes",
+                         "total_inactive_file", path));
         }
     }
+    let room = |dir: &str, lim: &str, cur: &str, key: &str| -> Option<f64> {
+        let (l, u) = (read(&format!("{dir}/{lim}"))?, read(&format!("{dir}/{cur}"))?);
+        // v1 reports "no limit" as a huge page-aligned number
+        if l >= (1u64 << 60) as f64 { return None; }
+        let cache = std::fs::read_to_string(format!("{dir}/memory.stat")).ok()
+            .map_or(0.0, |s| stat_value(&s, key)).min(u);
+        Some(((l - (u - cache)) / 1048576.0).max(0.0))
+    };
     let mut best: Option<f64> = None;
-    for (mount, lim, cur, path) in probes {
+    for (mount, lim, cur, key, path) in probes {
         // the group and each ancestor, up to the mount root
         let mut p = path.trim_end_matches('/').to_string();
         loop {
-            let dir = format!("{mount}{p}");
-            if let (Some(l), Some(u)) = (read(&format!("{dir}/{lim}")), read(&format!("{dir}/{cur}"))) {
-                // v1 reports "no limit" as a huge page-aligned number
-                if l < (1u64 << 60) as f64 {
-                    let room = ((l - u) / 1048576.0).max(0.0);
-                    best = Some(best.map_or(room, |b: f64| b.min(room)));
-                }
+            if let Some(r) = room(&format!("{mount}{p}"), lim, cur, key) {
+                best = Some(best.map_or(r, |b: f64| b.min(r)));
             }
             match p.rfind('/') { Some(k) => p.truncate(k), None => break }
             if p.is_empty() {
                 // the mount root itself
-                if let (Some(l), Some(u)) = (read(&format!("{mount}/{lim}")), read(&format!("{mount}/{cur}"))) {
-                    if l < (1u64 << 60) as f64 {
-                        let room = ((l - u) / 1048576.0).max(0.0);
-                        best = Some(best.map_or(room, |b: f64| b.min(room)));
-                    }
+                if let Some(r) = room(&mount, lim, cur, key) {
+                    best = Some(best.map_or(r, |b: f64| b.min(r)));
                 }
                 break;
             }
         }
     }
     best
+}
+
+/// The value of `key` in a cgroup `memory.stat` file (`key value` lines), 0 when absent.
+fn stat_value(stat: &str, key: &str) -> f64 {
+    stat.lines()
+        .find_map(|l| l.strip_prefix(key).and_then(|v| v.strip_prefix(' ')))
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(0.0)
 }
 
 /// Total system RAM in MB. Works on Linux (/proc/meminfo) and macOS (sysctl).
@@ -550,4 +563,20 @@ macro_rules! selphi_error {
     ($($arg:tt)*) => {
         $crate::log::write_log(&$crate::log::red(&format!("ERROR: {}", format!($($arg)*))))
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stat_value;
+
+    #[test]
+    fn stat_value_reads_the_exact_key() {
+        // v2 lists active_file before inactive_file, v1 total_inactive_file after inactive_file
+        let v2 = "anon 1048576\nfile 7340032\nactive_file 2097152\ninactive_file 5242880\n";
+        assert_eq!(stat_value(v2, "inactive_file"), 5242880.0);
+        let v1 = "cache 9\ninactive_file 4\ntotal_inactive_file 6\n";
+        assert_eq!(stat_value(v1, "total_inactive_file"), 6.0);
+        assert_eq!(stat_value(v1, "inactive_file"), 4.0);
+        assert_eq!(stat_value("anon 3\n", "inactive_file"), 0.0);
+    }
 }
