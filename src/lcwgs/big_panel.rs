@@ -12,10 +12,10 @@
 //! A biobank-size panel therefore caps the union in GLIMPSE2's rank order (`g2`, the
 //! PBWT rank layers ascending) instead, at the same depth (`LCWGS_KPBWT`, else the
 //! adaptive `round(0.066 n_ref)`, 4,986 on v3) and with the same two-depth split.
-//! On v3 (six GIAB capture libraries, chr22, one seed) every sample is up overall
-//! (non-reference concordance 97.80 -> 98.59%) and in every MAF bin but one cell
-//! (HG003 at 0.5-5%, -0.047 pp, about one genotype): 0.5-5% +1.11 pp, < 0.5%
-//! +10.9 pp. The faster `LCWGS_KPBWT=2000` on top of it is the configuration
+//! On v3 (six GIAB capture libraries, chr22) every sample is at or above the index
+//! order in every MAF bin within seed noise (non-reference concordance 97.80 -> 98.59%;
+//! three seeds on the European samples: smallest seed mean -0.079 pp, HG003 0.5-5%,
+//! sign flipping by seed): 0.5-5% +1.10 pp, < 0.5% +10.9 pp. The faster `LCWGS_KPBWT=2000` on top of it is the configuration
 //! measured best against GLIMPSE2 (above it in every pooled MAF bin over three
 //! seeds, about half this default's CPU), but it lowers the common SNPs of two European
 //! samples below the index order, so it is not the default. `LCWGS_QUAL_TRUNC` set
