@@ -34,8 +34,8 @@
 //! heterozygote precision -0.011 [-0.028, +0.006]; against GLIMPSE2 +0.318
 //! [+0.209, +0.428] (18 of 18), 0.5-5% +0.136 [-0.245, +0.517]. The band edges were
 //! chosen on those six samples. Indels -0.028 [-0.100, +0.045] against the rank order
-//! alone (0.5-5% -0.579 [-1.441, +0.283], 3 of 15 non-tied pairs higher). It costs
-//! less than the deep pass it replaces (chr22, 4 threads, measured alone: 2,796
+//! alone (0.5-5% -0.579 [-1.441, +0.283], 3 of 15 non-tied pairs higher). Whole runs
+//! cost less than with the old deep pass (chr22, 4 threads, measured alone: 2,796
 //! against 3,031 CPU-s, peak 9.08 against 9.55 GiB). `LCWGS_SPLIT_BAND`,
 //! `LCWGS_SPLIT_KMAX` and `LCWGS_SPLIT_KPBWT` each override their part;
 //! `LCWGS_SPLIT_MAF` (manual band) keeps its own defaults (`k_max` 5000, the run's depth).
