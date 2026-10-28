@@ -234,16 +234,16 @@ impl MemoryBudget {
         let mut used = self.usage.lock().unwrap();
         used.waiting += 1;
         // Lenient only: work that cannot fit beside the live chunks even alone waits for the other
-        // work to finish, and later requests wait behind it so that it is not starved. Whether it is
-        // such work is decided again at every wake-up: the live state changes meanwhile (a chunk ends,
-        // a panel built ahead is reserved), and a request decided once could wait for room that
-        // never comes.
-        let mut counted_alone = false;
+        // work to finish, and later requests wait behind it so that it is not starved. A request
+        // that fitted when it arrived becomes such work at a later wake-up when the live state
+        // grew meanwhile (a chunk admitted, a panel built ahead reserved): it could otherwise wait
+        // for room that never comes. Once alone it stays alone until admitted, keeping its
+        // precedence over later requests.
+        let mut alone = false;
         loop {
-            let alone = !self.strict && bytes > self.limit.saturating_sub(used.fixed);
-            if alone != counted_alone {
-                if alone { used.alone_waiting += 1; } else { used.alone_waiting -= 1; }
-                counted_alone = alone;
+            if !alone && !self.strict && bytes > self.limit.saturating_sub(used.fixed) {
+                used.alone_waiting += 1;
+                alone = true;
             }
             if alone {
                 if used.work == 0 {
@@ -489,7 +489,8 @@ mod tests {
     }
 
     /// Work waiting beside other work becomes work that runs alone when a later
-    /// reservation leaves it no room beside the live chunks (it waited forever).
+    /// reservation leaves it no room beside the live chunks (it waited forever);
+    /// work that waits alone keeps its precedence when a chunk ends meanwhile.
     #[test]
     fn waiting_work_turns_alone_after_a_reservation() {
         let b = MemoryBudget::new(1000, 0).lenient();
@@ -508,6 +509,22 @@ mod tests {
             drop(r);
         });
         drop(a);
+        {
+            let used = b.usage.lock().unwrap();
+            assert_eq!((used.fixed, used.work, used.waiting, used.alone_waiting), (0, 0, 0, 0));
+        }
+        // Alone stays alone: a chunk ending while it waits does not let later work overtake it.
+        let big = b.try_chunk_for(0, 500).unwrap();
+        let x = b.try_work(400).unwrap();
+        std::thread::scope(|s| {
+            let b = &b;
+            let h = s.spawn(move || { let _w = b.work(600); });
+            while b.usage.lock().unwrap().alone_waiting == 0 { std::thread::yield_now(); }
+            drop(big);
+            assert!(b.try_permit(200).is_none(), "a waiting alone request goes first");
+            drop(x);
+            h.join().unwrap();
+        });
         let used = b.usage.lock().unwrap();
         assert_eq!((used.fixed, used.work, used.waiting, used.alone_waiting), (0, 0, 0, 0));
     }
