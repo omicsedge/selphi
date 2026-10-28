@@ -37,7 +37,7 @@ use crate::sparse_ls::haplotype_set::{GenotypeView, HubMember, SegmentPlan, Targ
 #[cfg(doc)]
 use crate::sparse_ls::haplotype_set::SweepHub;
 use crate::lcwgs::ls_params::LsParams;
-use crate::sparse_ls::ref_haplotype_set::RefHaplotypeSet;
+use crate::sparse_ls::ref_haplotype_set::{for_each_hap_with_allele, popcount_bits, PanelRows, RefHaplotypeSet};
 use crate::sparse_ls::rng::Mt19937Rng;
 use crate::sparse_ls::unphred;
 use crate::sparse_ls::variant::{Variant, VariantMap};
@@ -76,16 +76,37 @@ impl FaithfulPanel {
         Self::build_with(ref_bm, cm, params, Some(SegmentPlan::with_segment_commons(n)))
     }
 
-    fn build_with(ref_bm: &HaplotypeBitmatrix, cm: &[f64], params: &LcwgsParams, mut plan: Option<SegmentPlan>) -> Self {
-        let n_var = cm.len();
-        let n_ref = ref_bm.n_haps;
+    fn build_with(ref_bm: &HaplotypeBitmatrix, cm: &[f64], params: &LcwgsParams, plan: Option<SegmentPlan>) -> Self {
+        assert_eq!(ref_bm.n_sites, cm.len());
+        Self::build_from_rows(&mut &*ref_bm, ref_bm.n_haps, cm, params, plan)
+    }
 
-        // --- VariantMap (only cref/calt/cm/lq are read by selection). ---
+    /// [`Self::build_segmented`] from the chunk's panel rows read in site order
+    /// (two passes: every row, then the common rows), so that a chunk's
+    /// panel side can be built without its bitmatrix (see `pipeline::PanelAhead`).
+    pub fn build_segmented_rows<P: PanelRows>(rows: &mut P, n_ref: usize, cm: &[f64], params: &LcwgsParams) -> Self {
+        Self::build_from_rows(rows, n_ref, cm, params, Some(SegmentPlan::new()))
+    }
+
+    fn build_from_rows<P: PanelRows>(rows: &mut P, n_ref: usize, cm: &[f64], params: &LcwgsParams, mut plan: Option<SegmentPlan>) -> Self {
+        let n_var = cm.len();
+        // sparse_maf default 0.001 (== LcwgsParams.rare_maf default) drives the
+        // common/rare split exactly as GLIMPSE2 does.
+        let mut ref_hs = RefHaplotypeSet::new();
+        ref_hs.sparse_maf = params.rare_maf as f64;
+
+        // --- VariantMap (only cref/calt/cm/lq are read by selection), and the
+        // rare sites' minor-allele carriers (ShapRef), in one pass over the rows. ---
         let mut vmap = VariantMap::new();
         vmap.vars.reserve(n_var);
+        let mut shap_ref: Vec<Vec<i32>> = vec![Vec::new(); n_ref];
         for v in 0..n_var {
-            let calt = ref_bm.popcount_row(v, n_ref);
+            let row = rows.row(v);
+            let calt = popcount_bits(row, n_ref);
             let cref = n_ref as u32 - calt;
+            if !ref_hs.is_common_site(cref, calt) {
+                for_each_hap_with_allele(row, n_ref, calt <= cref, |h| shap_ref[h as usize].push(v as i32));
+            }
             vmap.vars.push(Variant {
                 bp: v as i64,         // placeholder (selection doesn't read bp)
                 id: String::new(),    // placeholder
@@ -100,22 +121,26 @@ impl FaithfulPanel {
             });
         }
 
-        // --- RefHaplotypeSet + compressed sparse PBWT (built once). ---
-        // sparse_maf default 0.001 (== LcwgsParams.rare_maf default) drives the
-        // common/rare split exactly as GLIMPSE2 does.
-        let mut ref_hs = RefHaplotypeSet::new();
-        ref_hs.sparse_maf = params.rare_maf as f64;
-        ref_hs.build_from_panel(ref_bm, &vmap);
-        let recorded = match plan.as_mut() {
-            Some(plan) => ref_hs.build_sparse_pbwt_recording(&vmap, ref_bm, plan),
-            None => { ref_hs.build_sparse_pbwt(&vmap, ref_bm); false }
-        };
+        // --- RefHaplotypeSet + compressed sparse PBWT (built once; a second
+        // pass reads the common rows). ---
+        ref_hs.build_from_counts(n_ref, &vmap, shap_ref);
+        let recorded = ref_hs.build_sparse_pbwt_rows(&vmap, rows, plan.as_mut());
         FaithfulPanel { ref_hs, vmap, plan: plan.filter(|_| recorded) }
     }
 
     /// Whether the selection sweeps of this panel's selectors decode in
     /// segments with the shared plan (several segments).
     pub fn has_parallel_plan(&self) -> bool { self.plan.as_ref().is_some_and(|p| p.is_parallel()) }
+
+    /// Heap bytes held (vector capacities; for memory traces and estimates).
+    pub fn heap_bytes(&self) -> usize {
+        let lists = |v: &[Vec<i32>]| v.iter().map(|x| 24 + x.capacity() * 4).sum::<usize>();
+        let h = &self.ref_hs;
+        self.vmap.vars.capacity() * std::mem::size_of::<Variant>()
+            + h.flag_common.capacity() + h.major_alleles.capacity() + h.common2tot.capacity() * 4
+            + lists(&h.shap_ref) + lists(&h.svar_ref) + lists(&h.a_small_idx) + h.ypacked.capacity()
+            + self.plan.as_ref().map_or(0, |p| p.heap_bytes())
+    }
 }
 
 /// Persistent state for faithful selection across the Gibbs iterations of one
@@ -889,6 +914,52 @@ mod tests {
                 assert!(built.same_as(recorded), "n_var={n_var} n_haps={n_haps} seg={seg}");
                 assert!(got.plan.is_none(), "a selector with the panel's plan records none");
                 assert_eq!(panel.has_parallel_plan(), built.is_parallel());
+            }
+        }
+    }
+
+    /// The panel side built from rows read in blocks (as the next chunk's is
+    /// built ahead from the SRP, two passes over the sites) is the one built
+    /// from the chunk's bitmatrix: same variant map, compressed PBWT, small
+    /// lists and segment plan.
+    #[test]
+    fn panel_from_streamed_rows_is_the_bitmatrix_panel() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        /// Rows served from copies of `block`-site slices, re-made whenever a
+        /// site leaves the held block (as `SrpBlockRows` re-extracts).
+        struct Blocks<'a> { bm: &'a HaplotypeBitmatrix, block: usize, start: usize, held: Vec<u64>, n: usize, made: usize }
+        impl PanelRows for Blocks<'_> {
+            fn row(&mut self, site: usize) -> &[u64] {
+                let w = self.bm.n_words();
+                if !(site >= self.start && site - self.start < self.n) {
+                    self.start = site;
+                    self.n = self.block.min(self.bm.n_sites - site);
+                    self.held = (site..site + self.n).flat_map(|v| self.bm.row(v).to_vec()).collect();
+                    self.made += 1;
+                }
+                &self.held[(site - self.start) * w..(site - self.start + 1) * w]
+            }
+        }
+        let mut rng = rp::Xs(0xA409_3822_299F_31D0);
+        for &(n_var, n_haps, block) in &[(1200usize, 2100usize, 7usize), (500, 70_000, 64), (900, 64, 1000)] {
+            let bm = rp::random_typed_panel(&mut rng, n_var, n_haps);
+            let cm: Vec<f64> = (0..n_var).map(|v| v as f64 * 0.0013).collect();
+            let params = LcwgsParams::default();
+            let want = FaithfulPanel::build_segmented(&bm, &cm, &params);
+            let mut rows = Blocks { bm: &bm, block, start: 0, held: Vec::new(), n: 0, made: 0 };
+            let got = FaithfulPanel::build_segmented_rows(&mut rows, n_haps, &cm, &params);
+            if block < n_var { assert!(rows.made >= 2, "two passes over the sites"); }
+            assert!(got.ref_hs.ypacked == want.ref_hs.ypacked, "ypacked n_var={n_var} n_haps={n_haps}");
+            assert_eq!(got.ref_hs.a_small_idx, want.ref_hs.a_small_idx);
+            assert_eq!(got.ref_hs.shap_ref, want.ref_hs.shap_ref);
+            assert_eq!(got.ref_hs.svar_ref, want.ref_hs.svar_ref);
+            assert_eq!((&got.ref_hs.flag_common, &got.ref_hs.major_alleles, &got.ref_hs.common2tot),
+                (&want.ref_hs.flag_common, &want.ref_hs.major_alleles, &want.ref_hs.common2tot));
+            assert!(got.vmap.vars.iter().zip(&want.vmap.vars).all(|(a, b)| (a.cref, a.calt, a.cm) == (b.cref, b.calt, b.cm)));
+            match (&got.plan, &want.plan) {
+                (Some(a), Some(b)) => assert!(a.same_as(b)),
+                (None, None) => {}
+                _ => panic!("plan presence differs"),
             }
         }
     }

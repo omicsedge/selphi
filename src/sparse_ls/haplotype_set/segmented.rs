@@ -106,6 +106,11 @@ impl SegmentPlan {
     /// Whether the plan splits the sweep at all.
     pub fn is_parallel(&self) -> bool { self.starts.len() > 1 }
 
+    /// Heap bytes the plan holds (its boundary arrays).
+    pub fn heap_bytes(&self) -> usize {
+        self.starts.iter().map(|st| std::mem::size_of::<SegmentStart>() + st.a16.capacity() * 2 + st.a32.capacity() * 4).sum()
+    }
+
     /// Same boundaries, states and segment maxima.
     #[cfg(test)]
     pub(crate) fn same_as(&self, other: &SegmentPlan) -> bool {

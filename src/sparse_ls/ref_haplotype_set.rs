@@ -176,6 +176,28 @@ pub(crate) fn for_each_hap_with_allele(row: &[u64], n_haps: usize, allele: bool,
     }
 }
 
+/// Panel rows as the builds read them: one row (`ceil(n_haps / 64)` words,
+/// bit `h` = haplotype `h`'s allele) per site, requested in increasing site
+/// order within each pass over the sites.
+pub trait PanelRows {
+    fn row(&mut self, site: usize) -> &[u64];
+}
+
+impl PanelRows for &HaplotypeBitmatrix {
+    #[inline]
+    fn row(&mut self, site: usize) -> &[u64] { HaplotypeBitmatrix::row(self, site) }
+}
+
+/// ALT alleles among the first `n_haps` bits of a row (as `popcount_row`).
+#[inline]
+pub fn popcount_bits(row: &[u64], n_haps: usize) -> u32 {
+    let full = n_haps / 64;
+    let mut count: u32 = row[..full].iter().map(|w| w.count_ones()).sum();
+    let rem = n_haps % 64;
+    if rem > 0 { count += (row[full] & ((1u64 << rem) - 1)).count_ones(); }
+    count
+}
+
 // ---------------------------------------------------------------------------
 // ref_haplotype_set
 // ---------------------------------------------------------------------------
@@ -273,18 +295,77 @@ impl RefHaplotypeSet {
     // scan pass builds the kept-variant list before the matrices are filled.
     // -----------------------------------------------------------------------
     pub fn build_from_panel(&mut self, panel: &HaplotypeBitmatrix, vmap: &VariantMap) {
-        let n_sites = vmap.len();
         assert_eq!(
-            n_sites, panel.n_sites,
+            vmap.len(), panel.n_sites,
             "panel/vmap site count mismatch: vmap={} panel={}",
-            n_sites, panel.n_sites
+            vmap.len(), panel.n_sites
         );
-        self.n_ref_haps = panel.n_haps;
+        self.build_from_rows(panel.n_haps, &mut &*panel, vmap);
+    }
+
+    /// [`Self::build_from_panel`] from panel rows read in site order (`rows`
+    /// holds `vmap.len()` sites of `n_haps` haplotypes).
+    pub fn build_from_rows<P: PanelRows>(&mut self, n_haps: usize, rows: &mut P, vmap: &VariantMap) {
+        self.n_ref_haps = n_haps;
+        self.classify(vmap);
+
+        // ---- allocate HvarRef + ShapRef ----
+        self.allocate();
+
+        // ---- PASS 2: fill ShapRef (rare minor carriers).
+        // HvarRef for common sites would also be filled here; we skip that — common
+        // alleles are read on demand from `ref_bm` via `common2tot` (the redundant
+        // common-site bitmatrix is not stored). `common2tot` is already populated
+        // in PASS 1, so nothing else changes.
+
+        for i_site in 0..vmap.len() {
+            if !self.flag_common[i_site] {
+                // rare: if (a != major) ShapRef[hap].push(i_site) — a word-level
+                // scan for allele `!major`, ascending hap (same pushes, same order).
+                let major = self.major_alleles[i_site];
+                let shap_ref = &mut self.shap_ref;
+                for_each_hap_with_allele(rows.row(i_site), self.n_ref_haps, !major, |hap| {
+                    shap_ref[hap as usize].push(i_site as i32);
+                });
+            }
+        }
+        // ShapRef[hap] is naturally ascending in i_site (we iterate sites in
+        // order), maintaining the invariant that ShapRef is per-hap sorted.
+    }
+
+    /// [`Self::build_from_rows`] with ShapRef given: the rare sites' minor-allele
+    /// carriers per haplotype, ascending (what PASS 2 pushes), listed by a caller
+    /// that reads every row once anyway ([`Self::is_common_site`] classifies).
+    pub fn build_from_counts(&mut self, n_haps: usize, vmap: &VariantMap, shap_ref: Vec<Vec<i32>>) {
+        assert_eq!(shap_ref.len(), n_haps);
+        self.n_ref_haps = n_haps;
+        self.classify(vmap);
+        self.shap_ref = shap_ref;
+    }
+
+    /// Whether a site with `cref` / `calt` panel alleles is common (PASS 1's rule).
+    #[inline]
+    pub fn is_common_site(&self, cref: u32, calt: u32) -> bool {
+        let (cref, calt) = (cref as f64, calt as f64);
+        // MAF = min(cref/(cref+calt), calt/(cref+calt))
+        // GLIMPSE2 does this in FLOAT (cref*1.0f/...) — we use f64; the only
+        // place this matters is a value sitting *exactly* on the sparse_maf
+        // boundary. See UNKNOWN #3.
+        let tot = cref + calt;
+        let maf = if tot > 0.0 {
+            (cref / tot).min(calt / tot)
+        } else {
+            0.0
+        };
+        maf >= self.sparse_maf.max(0.0) // note the `>=`
+    }
+
+    /// PASS 1: classify every site.
+    fn classify(&mut self, vmap: &VariantMap) {
+        let n_sites = vmap.len();
         self.sparse_maf = self
             .sparse_maf
             .max(0.0); // keep whatever was set; default 0.001 from new()
-
-        // ---- PASS 1: classify ----
         self.n_tot_sites = 0;
         self.n_com_sites = 0;
         self.n_rar_sites = 0;
@@ -295,19 +376,7 @@ impl RefHaplotypeSet {
 
         for k in 0..n_sites {
             let v = &vmap.vars[k];
-            let cref = v.cref as f64;
-            let calt = v.calt as f64;
-            // MAF = min(cref/(cref+calt), calt/(cref+calt))
-            // GLIMPSE2 does this in FLOAT (cref*1.0f/...) — we use f64; the only
-            // place this matters is a value sitting *exactly* on the sparse_maf
-            // boundary. See UNKNOWN #3.
-            let tot = cref + calt;
-            let maf = if tot > 0.0 {
-                (cref / tot).min(calt / tot)
-            } else {
-                0.0
-            };
-            let is_common = maf >= self.sparse_maf; // note the `>=`
+            let is_common = self.is_common_site(v.cref, v.calt);
             self.flag_common.push(is_common);
             self.major_alleles.push(v.calt > v.cref);
             if is_common {
@@ -328,29 +397,6 @@ impl RefHaplotypeSet {
                 self.n_com_sites_hq += 1;
             }
         }
-
-        // ---- allocate HvarRef + ShapRef ----
-        self.allocate();
-
-        // ---- PASS 2: fill ShapRef (rare minor carriers).
-        // HvarRef for common sites would also be filled here; we skip that — common
-        // alleles are read on demand from `ref_bm` via `common2tot` (the redundant
-        // common-site bitmatrix is not stored). `common2tot` is already populated
-        // in PASS 1, so nothing else changes.
-        debug_assert!(self.n_ref_haps <= panel.n_words() * 64);
-        for i_site in 0..n_sites {
-            if !self.flag_common[i_site] {
-                // rare: if (a != major) ShapRef[hap].push(i_site) — a word-level
-                // scan for allele `!major`, ascending hap (same pushes, same order).
-                let major = self.major_alleles[i_site];
-                let shap_ref = &mut self.shap_ref;
-                for_each_hap_with_allele(panel.row(i_site), self.n_ref_haps, !major, |hap| {
-                    shap_ref[hap as usize].push(i_site as i32);
-                });
-            }
-        }
-        // ShapRef[hap] is naturally ascending in i_site (we iterate sites in
-        // order), maintaining the invariant that ShapRef is per-hap sorted.
     }
 
     // -----------------------------------------------------------------------
@@ -362,7 +408,7 @@ impl RefHaplotypeSet {
     ///
     /// Requires `build_from_panel` (or an equivalent reader) to have run first.
     pub fn build_sparse_pbwt(&mut self, vmap: &VariantMap, ref_bm: &HaplotypeBitmatrix) {
-        self.build_sparse_pbwt_impl(vmap, ref_bm, None);
+        self.build_sparse_pbwt_impl(vmap, &mut &*ref_bm, None);
     }
 
     /// [`Self::build_sparse_pbwt`], also recording the selection sweep's
@@ -374,16 +420,27 @@ impl RefHaplotypeSet {
     /// low-quality: the build does not advance `last_k` over such a site and
     /// the sweep does.
     pub fn build_sparse_pbwt_recording(&mut self, vmap: &VariantMap, ref_bm: &HaplotypeBitmatrix, plan: &mut SegmentPlan) -> bool {
+        self.build_sparse_pbwt_rows(vmap, &mut &*ref_bm, Some(plan))
+    }
+
+    /// [`Self::build_sparse_pbwt`] (recording `plan` as
+    /// [`Self::build_sparse_pbwt_recording`] does, when given) from panel rows
+    /// read in site order; only the common sites' rows are read.
+    pub fn build_sparse_pbwt_rows<P: PanelRows>(&mut self, vmap: &VariantMap, rows: &mut P, plan: Option<&mut SegmentPlan>) -> bool {
+        let Some(plan) = plan else {
+            self.build_sparse_pbwt_impl(vmap, rows, None);
+            return false;
+        };
         if vmap.vars.iter().any(|v| v.lq) {
-            self.build_sparse_pbwt_impl(vmap, ref_bm, None);
+            self.build_sparse_pbwt_impl(vmap, rows, None);
             return false;
         }
-        self.build_sparse_pbwt_impl(vmap, ref_bm, Some(&mut *plan));
+        self.build_sparse_pbwt_impl(vmap, rows, Some(&mut *plan));
         plan.finish(&*self, vmap);
         true
     }
 
-    fn build_sparse_pbwt_impl(&mut self, vmap: &VariantMap, ref_bm: &HaplotypeBitmatrix, mut plan: Option<&mut SegmentPlan>) {
+    fn build_sparse_pbwt_impl<P: PanelRows>(&mut self, vmap: &VariantMap, rows: &mut P, mut plan: Option<&mut SegmentPlan>) {
         // if (SvarRef.empty()) build the transpose ShapRef -> SvarRef
         if self.svar_ref.is_empty() {
             self.svar_ref = vec![Vec::new(); self.n_tot_sites];
@@ -405,7 +462,7 @@ impl RefHaplotypeSet {
         // `init_small_rare`, for the rare run's carriers: their positions are
         // found there by one scan of the array (`carrier`), instead of
         // inverting the whole array at every common site.
-        let mut carrier = vec![false; self.n_ref_haps];
+        let mut carrier = vec![0u64; self.n_ref_haps.div_ceil(64)];
         // Allele of the full array's haplotypes in array order, 64 per word.
         let mut z_words: Vec<u64> = Vec::with_capacity(self.n_ref_haps / 64 + 1);
 
@@ -455,7 +512,7 @@ impl RefHaplotypeSet {
                 // ref_rac_l = M.vec_pos[k]->cref  (count of REF alleles)
                 let ref_rac_l = vmap.vars[k].cref as i32;
                 // update_full_pbwt_ay(ref_rac_l, l_all, pbwt_ref_idx)
-                self.update_full_pbwt_ay(ref_rac_l, l_all, ref_bm, &mut z_words);
+                self.update_full_pbwt_ay(ref_rac_l, l_all, rows, &mut z_words);
                 l_hq += 1; // ++l_hq
                 l_all += 1; // ++l_all
             } else {
@@ -517,11 +574,11 @@ impl RefHaplotypeSet {
     /// `occ = {&u, &v}` with `u=0` (the 0/REF bucket start) and `v=ref_rac_l`
     /// (the 1/ALT bucket start). Runs of equal allele are scattered into
     /// `pbwt_array_B` at the running bucket offset and pack3-appended.
-    fn update_full_pbwt_ay(
+    fn update_full_pbwt_ay<P: PanelRows>(
         &mut self,
         ref_rac_l: i32,
         l: i32,
-        ref_bm: &HaplotypeBitmatrix,
+        rows: &mut P,
         z_words: &mut Vec<u64>,
     ) {
         let n = self.n_ref_haps;
@@ -530,7 +587,7 @@ impl RefHaplotypeSet {
         // `ref_bm` holds the identical bits a materialized HvarRef would (HvarRef
         // would be populated from this same panel; only the bit-packing layout
         // differs, never the value).
-        let row = ref_bm.row(self.common2tot[lrow] as usize);
+        let row = rows.row(self.common2tot[lrow] as usize);
         // z = HvarRef.get(l, pbwt_array_A[m]) for every m, gathered without a
         // branch into words (bit m%64 of word m/64); the runs of equal z are then
         // found word by word, the same runs as the per-haplotype scan.
@@ -671,7 +728,7 @@ impl RefHaplotypeSet {
         vmap: &VariantMap,
         k: usize,
         l: usize,
-        carrier: &mut [bool],
+        carrier: &mut [u64],
         ref_small_hap: &mut Vec<bool>,
         map_big_small: &mut [i32],
     ) {
@@ -719,14 +776,15 @@ impl RefHaplotypeSet {
         // ascending, i.e. the map already in key order.
         let mut pairs: Vec<(i32, i32)> = Vec::with_capacity(rare_ref_haps.len());
         if !rare_ref_haps.is_empty() {
-            for &h in &rare_ref_haps { carrier[h as usize] = true; }
+            // A bit per haplotype (L1-resident on a biobank-size panel).
+            for &h in &rare_ref_haps { carrier[h as usize >> 6] |= 1u64 << (h & 63); }
             for (pos, &h) in self.pbwt_array_a.iter().enumerate() {
-                if carrier[h as usize] {
+                if carrier[h as usize >> 6] >> (h & 63) & 1 != 0 {
                     pairs.push((pos as i32, h));
                     if pairs.len() == rare_ref_haps.len() { break; }
                 }
             }
-            for &h in &rare_ref_haps { carrier[h as usize] = false; }
+            for &h in &rare_ref_haps { carrier[h as usize >> 6] = 0; }
         }
         debug_assert_eq!(pairs.len(), rare_ref_haps.len());
 
