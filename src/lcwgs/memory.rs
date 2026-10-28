@@ -123,6 +123,14 @@ impl MemoryBudget {
 
     pub fn work_limit(&self) -> usize { self.limit - self.fixed_limit }
 
+    /// Whether a chunk of `bytes` state can be admitted at all: always under the
+    /// default (lenient) allowance, where an oversized chunk runs alone; under an
+    /// explicit budget only within the chunk half of it ([`Self::try_chunk`]
+    /// refuses the rest).
+    pub fn admits_chunk(&self, bytes: usize) -> bool {
+        !self.strict || bytes <= self.fixed_limit - self.shared
+    }
+
     fn note_oversized(&self, what: &str, bytes: usize) {
         if !self.oversized.swap(true, std::sync::atomic::Ordering::Relaxed) {
             crate::selphi_info!("  lcWGS: one {} needs {:.2} GB, above its share of the allowance; it runs alone",
@@ -404,6 +412,16 @@ mod tests {
         drop(chunks);
         assert_eq!(b.usage.lock().unwrap().fixed, 0);
         assert!(b.usage.lock().unwrap().peak <= 1000);
+    }
+
+    #[test]
+    fn admits_chunk_matches_try_chunk_admission() {
+        let strict = MemoryBudget::new(1000, 100);
+        assert!(strict.admits_chunk(450) && !strict.admits_chunk(451));
+        assert!(strict.try_chunk(450).is_some());
+        let lenient = MemoryBudget::new(1000, 100).lenient();
+        assert!(lenient.admits_chunk(451) && lenient.admits_chunk(10_000));
+        assert!(lenient.try_chunk(10_000).is_some());
     }
 
     #[test]

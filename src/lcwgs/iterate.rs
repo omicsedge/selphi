@@ -756,12 +756,14 @@ pub fn run_gibbs(
     k_max_override: Option<usize>,
     precomputed_cond: Option<&Vec<Vec<u32>>>,
 ) -> GibbsOutput {
-    run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, SampleExecution::Unbudgeted, None, None)
+    run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, SampleExecution::Unbudgeted, None, None, None)
 }
 
 // Test seam: the k_max cut a test thread's Gibbs runs use instead of the env.
 #[cfg(test)]
 thread_local! {
+    /// `LCWGS_SELECT_EVERY` of a test thread's Gibbs runs.
+    static SELECT_EVERY_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static KMAX_CUT_TEST: std::cell::Cell<Option<super::kmax_cut::KmaxCut>> = const { std::cell::Cell::new(None) };
     /// Each iteration's (selection base, augmented set) per haplotype, while KMAX_CUT_TEST is set.
     #[allow(clippy::type_complexity)]
@@ -784,6 +786,7 @@ fn run_gibbs_with_memory(
     execution: SampleExecution<'_>,
     panel: Option<&PanelSide>,
     passengers: Option<&ChunkPassengers<'_>>,
+    hub: Option<crate::sparse_ls::haplotype_set::HubMember>,
 ) -> GibbsOutput {
     let memory = execution.permits();
     let n_var = cm.len();
@@ -867,8 +870,13 @@ fn run_gibbs_with_memory(
         let new_cut = cfg.rare_carrier && cfg.kmax_cut.applies(bound, cfg.k_max);
         f.set_keep_priority_order(new_cut || (cfg.rare_carrier && cfg.k_max.is_some_and(|k| kpbwt_eff > k)));
         f.set_g2_fill_order(new_cut && cfg.kmax_cut.priority);
+        // The other pass of a SPLIT chunk sweeping the same panel at the same
+        // time (see `SweepHub`): each segment is decoded once for both.
+        if let Some(member) = hub { f.set_hub(member); }
         Some(f)
     } else {
+        // No faithful selector: this chain never sweeps (leaves the hub on drop).
+        drop(hub);
         None
     };
     setup_lap(&mut setup_clock, &mut setup_log, "select-build");
@@ -1035,6 +1043,13 @@ fn run_gibbs_with_memory(
     // hets, and the largest segment+flat-het scratch in bytes.
     let phase_shape: [AtomicU64; 5] = Default::default();
 
+    // Faithful selection cadence (opt-in `LCWGS_SELECT_EVERY`, default 1 = every
+    // iteration): every burn-in iteration, then every r-th main iteration.
+    let select_every = select_every();
+    #[cfg(test)]
+    let select_every = SELECT_EVERY_TEST.with(|c| c.get()).unwrap_or(select_every);
+    let select_due = |it: usize| selection_due(it, n_burnin, select_every);
+    let last_select = (0..params.n_iterations).rev().find(|&it| select_due(it));
     for it in 0..params.n_iterations {
         // 1. Sparse PBWT selection from the current sampled hap alleles.
         let recompute = it == 0 || it == n_burnin || it % refresh == 0;
@@ -1051,8 +1066,11 @@ fn run_gibbs_with_memory(
                 // FAITHFUL GLIMPSE2 selection: re-run EVERY iteration (GLIMPSE2
                 // re-selects per iteration), feeding it the hybrid's current
                 // sampled haps. Produces the SAME Vec<Vec<u32>> shape (per target
-                // hap) the downstream rare-carrier aug + HMM consume.
-                cond_cache = fsel.select(&hap_alleles);
+                // hap) the downstream rare-carrier aug + HMM consume. Opt-in
+                // `LCWGS_SELECT_EVERY=r`: in the main iterations only every r-th
+                // re-selects (the others keep the last set).
+                if select_due(it) { cond_cache = fsel.select(&hap_alleles); }
+                if Some(it) == last_select { fsel.leave_hub(); }
             } else if recompute {
                 cond_cache = select_conditioning_haps(
                     &hap_alleles, ref_bm, cm,
@@ -1626,9 +1644,28 @@ pub(crate) fn run_gibbs_ensemble_with_memory(
     execution: SampleExecution<'_>,
     panel: Option<&PanelSide>,
     passengers: Option<&ChunkPassengers<'_>>,
+    hub: Option<crate::sparse_ls::haplotype_set::HubMember>,
 ) -> GibbsOutput {
-    let n_restarts = crate::config::usize_or("LCWGS_GIBBS_RESTARTS", 1).max(1);
-    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, execution, panel, passengers)
+    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, gibbs_restarts(), execution, panel, passengers, hub)
+}
+
+/// Restarts of the Gibbs chain (`LCWGS_GIBBS_RESTARTS`, default 1).
+pub(crate) fn gibbs_restarts() -> usize {
+    crate::config::usize_or("LCWGS_GIBBS_RESTARTS", 1).max(1)
+}
+
+/// Whether iteration `it` re-runs the faithful selection: every burn-in
+/// iteration (the first is INIT), then every `every`-th main iteration.
+pub(crate) fn selection_due(it: usize, n_burnin: usize, every: usize) -> bool {
+    it < n_burnin || (it - n_burnin).is_multiple_of(every.max(1))
+}
+
+/// `LCWGS_SELECT_EVERY` (opt-in; unset, unparsable or 0 = 1, every iteration):
+/// the faithful selection re-runs at every burn-in iteration and at every r-th
+/// main iteration; the iterations between keep the last selected set (the
+/// rare-carrier augmentation still follows the current haplotypes).
+pub(crate) fn select_every() -> usize {
+    crate::config::usize_opt("LCWGS_SELECT_EVERY").filter(|&r| r >= 1).unwrap_or(1)
 }
 
 /// Inner ensemble with an explicit restart count (the env-read entry point
@@ -1646,7 +1683,7 @@ pub(crate) fn run_gibbs_ensemble_n(
     precomputed_cond: Option<&Vec<Vec<u32>>>,
     n_restarts: usize,
 ) -> GibbsOutput {
-    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, SampleExecution::Unbudgeted, None, None)
+    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, SampleExecution::Unbudgeted, None, None, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1662,11 +1699,14 @@ fn run_gibbs_ensemble_inner(
     execution: SampleExecution<'_>,
     panel: Option<&PanelSide>,
     passengers: Option<&ChunkPassengers<'_>>,
+    hub: Option<crate::sparse_ls::haplotype_set::HubMember>,
 ) -> GibbsOutput {
     let n_restarts = n_restarts.max(1);
     if n_restarts == 1 {
-        return run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, execution, panel, passengers);
+        return run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, execution, panel, passengers, hub);
     }
+    // Sequential restarts do not sweep with another chain.
+    drop(hub);
     let base = params.seed_or_default();
     let mut acc_d: Vec<f64> = Vec::new();
     let mut acc_g: Vec<f64> = Vec::new();
@@ -1674,7 +1714,7 @@ fn run_gibbs_ensemble_inner(
     for i in 0..n_restarts {
         let mut p = params.clone();
         p.seed = base.wrapping_add(i as u64);
-        let out = run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, &p, k_max_override, precomputed_cond, execution, panel, passengers);
+        let out = run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, &p, k_max_override, precomputed_cond, execution, panel, passengers, None);
         if acc_d.is_empty() {
             acc_d = vec![0.0f64; out.dosage.len()];
             acc_g = vec![0.0f64; out.gp.len()];
@@ -2365,6 +2405,99 @@ mod tests {
         (full, cm, ins, pcm, gl3)
     }
 
+    /// The two passes of a SPLIT chunk run at the same time, their selection
+    /// sweeps decoded once for both through a sweep hub (with the panel's shared
+    /// plan), give bit-identical outputs to the same passes run one after the
+    /// other: different depths, k_max and schedules (the shorter chain leaves
+    /// the hub; the other sweeps alone), with and without passengers.
+    #[test]
+    fn split_passes_through_a_sweep_hub_match_serial_passes() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        use crate::sparse_ls::haplotype_set::SweepHub;
+        let _serial = crate::lcwgs::hmm::two_pass::TASK_BLOCKS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rng = rp::Xs(0x5BE0_CD19_137E_2179);
+        for &(n_var, n_haps, n_pass, seg) in &[(900usize, 1600usize, 0usize, 4usize), (700, 2200, 60, 9), (1200, 900, 25, 128)] {
+            let (full, cm, ins, pcm, gl3) = passenger_fixture(&mut rng, n_var, n_haps, 1, n_pass, false, false);
+            let bm = HaplotypeBitmatrix::from_subset(&full, &(0..n_var + n_pass).collect::<Vec<_>>()).with_hidden_tail(n_var);
+            let panel: PanelSide = std::sync::Arc::new(super::super::faithful_select::FaithfulPanel::build_segmented_commons(
+                &bm, &cm, &LcwgsParams::default(), seg));
+            let main = LcwgsParams { n_iterations: 6, n_main_iterations: 4, kpbwt: 60, pbwt_modulo_cm: 0.004, ..Default::default() };
+            let deep = LcwgsParams { n_iterations: 5, n_main_iterations: 3, kpbwt: 30, ..main.clone() };
+            let pass = ChunkPassengers { ins: ins.clone(), cm: &pcm };
+            let pass = (n_pass > 0).then_some(&pass);
+            let budget = super::super::memory::MemoryBudget::new(512 * 1024 * 1024, 1024);
+            let exec = SampleExecution::Admitted(&budget);
+            let run = |p: &LcwgsParams, k: Option<usize>, hub| run_gibbs_with_memory(&gl3, &bm, &cm, 1, p, k, None, exec, Some(&panel), pass, hub);
+            let serial = (run(&main, None, None), run(&deep, Some(80), None));
+            let together = std::thread::scope(|scope| {
+                let mut members = SweepHub::members(2).into_iter();
+                let (a, b) = (members.next(), members.next());
+                let d = scope.spawn(|| run(&deep, Some(80), b));
+                let m = run(&main, None, a);
+                (m, d.join().unwrap())
+            });
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            for (name, x, y) in [("main", &serial.0, &together.0), ("deep", &serial.1, &together.1)] {
+                assert_eq!(bits(&x.dosage), bits(&y.dosage), "{name} dosage n_var={n_var} seg={seg}");
+                assert_eq!(bits(&x.gp), bits(&y.gp), "{name} gp n_var={n_var} seg={seg}");
+                assert_eq!(bits(&x.pass_dosage), bits(&y.pass_dosage), "{name} passenger dosage n_var={n_var}");
+                assert_eq!(bits(&x.pass_gp), bits(&y.pass_gp), "{name} passenger gp n_var={n_var}");
+            }
+            assert_ne!(bits(&serial.0.dosage), bits(&serial.1.dosage), "the two passes differ");
+            // The panel's plan reproduces a chain that records its own.
+            let own = run_gibbs_with_memory(&gl3, &bm, &cm, 1, &main, None, None, exec, None, pass, None);
+            assert_eq!(bits(&own.dosage), bits(&serial.0.dosage), "own plan n_var={n_var}");
+            assert_eq!(bits(&own.gp), bits(&serial.0.gp), "own plan n_var={n_var}");
+        }
+    }
+
+    /// `LCWGS_SELECT_EVERY`: r = 1 is the default schedule exactly; r = 2
+    /// re-selects only on every other main iteration (another output), and two
+    /// such chains sweeping through a hub still match the same chains run one
+    /// after the other.
+    #[test]
+    fn select_every_schedule() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        use crate::sparse_ls::haplotype_set::SweepHub;
+        assert!((0..5).all(|it| selection_due(it, 5, 3)));
+        assert_eq!((5..12).filter(|&it| selection_due(it, 5, 3)).collect::<Vec<_>>(), vec![5, 8, 11]);
+        assert!((0..30).all(|it| selection_due(it, 5, 1) && selection_due(it, 5, 0)));
+        assert!(selection_due(0, 0, 4) && !selection_due(1, 0, 4) && selection_due(4, 0, 4));
+        let _serial = crate::lcwgs::hmm::two_pass::TASK_BLOCKS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rng = rp::Xs(0x6A09_E667_BB67_AE85);
+        let (full, cm, _, _, gl3) = passenger_fixture(&mut rng, 900, 1700, 1, 0, false, false);
+        let bm = HaplotypeBitmatrix::from_subset(&full, &(0..900).collect::<Vec<_>>());
+        let panel: PanelSide = std::sync::Arc::new(super::super::faithful_select::FaithfulPanel::build_segmented_commons(
+            &bm, &cm, &LcwgsParams::default(), 5));
+        let main = LcwgsParams { n_iterations: 8, n_main_iterations: 5, kpbwt: 60, pbwt_modulo_cm: 0.004, ..Default::default() };
+        let deep = LcwgsParams { kpbwt: 30, ..main.clone() };
+        let budget = super::super::memory::MemoryBudget::new(512 * 1024 * 1024, 1024);
+        let exec = SampleExecution::Admitted(&budget);
+        let run = |p: &LcwgsParams, every: Option<usize>, hub| {
+            SELECT_EVERY_TEST.with(|c| c.set(every));
+            let out = run_gibbs_with_memory(&gl3, &bm, &cm, 1, p, None, None, exec, Some(&panel), None, hub);
+            SELECT_EVERY_TEST.with(|c| c.set(None));
+            out
+        };
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let default = run(&main, None, None);
+        assert_eq!(bits(&run(&main, Some(1), None).dosage), bits(&default.dosage));
+        let every2 = run(&main, Some(2), None);
+        assert_ne!(bits(&every2.dosage), bits(&default.dosage), "r = 2 changes the chain");
+        let deep2 = run(&deep, Some(2), None);
+        let together = std::thread::scope(|scope| {
+            let mut members = SweepHub::members(2).into_iter();
+            let (a, b) = (members.next(), members.next());
+            let d = scope.spawn(|| run(&deep, Some(2), b));
+            let m = run(&main, Some(2), a);
+            (m, d.join().unwrap())
+        });
+        assert_eq!(bits(&together.0.dosage), bits(&every2.dosage));
+        assert_eq!(bits(&together.0.gp), bits(&every2.gp));
+        assert_eq!(bits(&together.1.dosage), bits(&deep2.dosage));
+        assert_eq!(bits(&together.1.gp), bits(&deep2.gp));
+    }
+
     /// Impute-only passengers move no output of the chain: SNP dosage and GP are
     /// bit-identical to the same chain run without them (unbudgeted and admitted
     /// executions, one and several samples, rare passengers on a 5,000-haplotype
@@ -2389,10 +2522,10 @@ mod tests {
             for admitted in [false, true] {
                 let budget = super::super::memory::MemoryBudget::new(256 * 1024 * 1024, 1024);
                 let exec = || if admitted && n_samples == 1 { SampleExecution::Admitted(&budget) } else { SampleExecution::Unbudgeted };
-                let base = run_gibbs_with_memory(&gl3, &active, &cm, n_samples, &params, None, None, exec(), None, None);
+                let base = run_gibbs_with_memory(&gl3, &active, &cm, n_samples, &params, None, None, exec(), None, None, None);
                 assert!(base.pass_dosage.is_empty() && base.pass_gp.is_empty());
                 let pass = ChunkPassengers { ins: ins.clone(), cm: &pcm };
-                let out = run_gibbs_with_memory(&gl3, &hidden, &cm, n_samples, &params, None, None, exec(), None, Some(&pass));
+                let out = run_gibbs_with_memory(&gl3, &hidden, &cm, n_samples, &params, None, None, exec(), None, Some(&pass), None);
                 assert_eq!(bits(&out.dosage), bits(&base.dosage), "dosage n_var={n_var} samples={n_samples} admitted={admitted}");
                 assert_eq!(bits(&out.gp), bits(&base.gp), "gp n_var={n_var} samples={n_samples} admitted={admitted}");
                 assert_eq!(out.pass_dosage.len(), n_pass * n_samples);
