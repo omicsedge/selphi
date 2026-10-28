@@ -81,7 +81,11 @@ pub(crate) fn resident_bytes() -> Option<usize> {
 }
 
 #[derive(Default)]
-struct Usage { fixed: usize, work: usize, work_jobs: usize, waiting: usize, alone_waiting: usize, peak: usize }
+struct Usage {
+    fixed: usize, work: usize, work_jobs: usize, waiting: usize, alone_waiting: usize, peak: usize,
+    /// Reservations held for a chunk not yet admitted (chunk, bytes), part of `fixed`.
+    reserved: Vec<(usize, usize)>,
+}
 
 pub(crate) struct MemoryBudget {
     limit: usize,
@@ -100,7 +104,7 @@ pub(crate) struct MemoryBudget {
     parallel_fb_grants: std::sync::atomic::AtomicUsize,
 }
 
-pub(crate) struct Permit<'a> { budget: &'a MemoryBudget, bytes: usize, fixed: bool }
+pub(crate) struct Permit<'a> { budget: &'a MemoryBudget, bytes: usize, fixed: bool, reserved_for: Option<usize> }
 
 impl MemoryBudget {
     pub fn new(limit: usize, shared: usize) -> Self {
@@ -123,6 +127,14 @@ impl MemoryBudget {
 
     pub fn work_limit(&self) -> usize { self.limit - self.fixed_limit }
 
+    /// Whether a chunk of `bytes` state can be admitted at all: always under the
+    /// default (lenient) allowance, where an oversized chunk runs alone; under an
+    /// explicit budget only within the chunk half of it ([`Self::try_chunk`]
+    /// refuses the rest).
+    pub fn admits_chunk(&self, bytes: usize) -> bool {
+        !self.strict || bytes <= self.fixed_limit - self.shared
+    }
+
     fn note_oversized(&self, what: &str, bytes: usize) {
         if !self.oversized.swap(true, std::sync::atomic::Ordering::Relaxed) {
             crate::selphi_info!("  lcWGS: one {} needs {:.2} GB, above its share of the allowance; it runs alone",
@@ -130,19 +142,41 @@ impl MemoryBudget {
         }
     }
 
+    /// Charge `bytes` of state held for chunk `chunk` before it starts (its panel
+    /// side built ahead, see `pipeline::PanelAhead`) until the permit drops:
+    /// never waits or refuses (the caller checked the memory itself). Other
+    /// chunks' admission counts it; `chunk`'s own does not
+    /// ([`Self::try_chunk_for`]), which it would otherwise wait for forever.
+    pub fn reserve(&self, chunk: usize, bytes: usize) -> Permit<'_> {
+        let mut used = self.usage.lock().unwrap();
+        used.fixed += bytes;
+        used.reserved.push((chunk, bytes));
+        used.peak = used.peak.max(used.fixed + used.work);
+        self.changed.notify_all();
+        Permit { budget: self, bytes, fixed: true, reserved_for: Some(chunk) }
+    }
+
+    #[cfg(test)]
     pub fn try_chunk(&self, bytes: usize) -> Option<Permit<'_>> {
+        self.try_chunk_for(usize::MAX, bytes)
+    }
+
+    /// Admit chunk `chunk`'s state, not counting what is reserved for it.
+    pub fn try_chunk_for(&self, chunk: usize, bytes: usize) -> Option<Permit<'_>> {
         let oversized = bytes > self.fixed_limit - self.shared;
         assert!(!oversized || !self.strict,
             "one lcWGS chunk exceeds the state allowance; increase LCWGS_MEM_BUDGET_GB");
         let mut used = self.usage.lock().unwrap();
+        let own: usize = used.reserved.iter().filter(|&&(c, _)| c == chunk).map(|&(_, b)| b).sum();
+        let fixed = used.fixed - own;
         if oversized {
-            if used.fixed != self.shared || used.work != 0 { return None; }
+            if fixed != self.shared || used.work != 0 { return None; }
             self.note_oversized("chunk", bytes);
-        } else if used.fixed + bytes > self.fixed_limit
-            || bytes > self.limit.saturating_sub(used.fixed + used.work) { return None; }
+        } else if fixed + bytes > self.fixed_limit
+            || bytes > self.limit.saturating_sub(fixed + used.work) { return None; }
         used.fixed += bytes;
         used.peak = used.peak.max(used.fixed + used.work);
-        Some(Permit { budget: self, bytes, fixed: true })
+        Some(Permit { budget: self, bytes, fixed: true, reserved_for: None })
     }
 
     #[cfg(test)]
@@ -160,7 +194,7 @@ impl MemoryBudget {
         used.work += bytes;
         used.work_jobs += 1;
         used.peak = used.peak.max(used.fixed + used.work);
-        Permit { budget: self, bytes, fixed: false }
+        Permit { budget: self, bytes, fixed: false, reserved_for: None }
     }
 
     /// Prefer whole sample jobs when they already fill the pool. A nested join
@@ -200,25 +234,51 @@ impl MemoryBudget {
         let mut used = self.usage.lock().unwrap();
         used.waiting += 1;
         // Lenient only: work that cannot fit beside the live chunks even alone waits for the other
-        // work to finish, and later requests wait behind it so that it is not starved.
-        let alone = !self.strict && bytes > self.limit.saturating_sub(used.fixed);
-        if alone {
-            used.alone_waiting += 1;
-            while used.work != 0 { used = self.changed.wait(used).unwrap(); }
-            used.alone_waiting -= 1;
-            used.waiting -= 1;
-            self.note_oversized("task", bytes);
-            return self.charge_work(&mut used, bytes);
-        }
-        while used.alone_waiting != 0 || bytes > self.limit.saturating_sub(used.fixed + used.work) {
+        // work to finish, and later requests wait behind it so that it is not starved. A request
+        // that fitted when it arrived becomes such work at a later wake-up when the live state
+        // grew meanwhile (a chunk admitted, a panel built ahead reserved): it could otherwise wait
+        // for room that never comes. Once alone it stays alone until admitted, keeping its
+        // precedence over later requests.
+        let mut alone = false;
+        loop {
+            if !alone && !self.strict && bytes > self.limit.saturating_sub(used.fixed) {
+                used.alone_waiting += 1;
+                alone = true;
+            }
+            if alone {
+                if used.work == 0 {
+                    used.alone_waiting -= 1;
+                    used.waiting -= 1;
+                    self.note_oversized("task", bytes);
+                    return self.charge_work(&mut used, bytes);
+                }
+            } else if used.alone_waiting == 0 && bytes <= self.limit.saturating_sub(used.fixed + used.work) {
+                used.waiting -= 1;
+                return self.admit_work(&mut used, bytes).unwrap();
+            }
             used = self.changed.wait(used).unwrap();
         }
-        used.waiting -= 1;
-        self.admit_work(&mut used, bytes).unwrap()
     }
 
     pub fn run<R: Send>(&self, bytes: usize, f: impl FnOnce() -> R + Send) -> R {
-        let _permit = self.work(bytes);
+        let permit = self.work(bytes);
+        self.run_with(permit, f)
+    }
+
+    /// The permit [`Self::run`] would wait for, when it can be granted at once
+    /// without overtaking a waiting request; `None` otherwise.
+    pub fn try_permit(&self, bytes: usize) -> Option<Permit<'_>> {
+        assert!(rayon::current_thread_index().is_none(), "memory admission must run outside Rayon");
+        assert!(!self.strict || bytes <= self.work_limit(),
+            "one lcWGS sample exceeds the work allowance; increase LCWGS_MEM_BUDGET_GB");
+        let mut used = self.usage.lock().unwrap();
+        if used.waiting != 0 || used.alone_waiting != 0 { return None; }
+        self.admit_work(&mut used, bytes)
+    }
+
+    /// Run `f` under a permit granted by [`Self::try_permit`] (as [`Self::run`] does).
+    pub fn run_with<R: Send>(&self, permit: Permit<'_>, f: impl FnOnce() -> R + Send) -> R {
+        let _permit = permit;
         rayon::join(|| { let out = f(); collect_local(); out }, || ()).0
     }
 }
@@ -226,6 +286,10 @@ impl MemoryBudget {
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
         let mut used = self.budget.usage.lock().unwrap();
+        if let Some(c) = self.reserved_for {
+            let i = used.reserved.iter().position(|&r| r == (c, self.bytes)).expect("a held reservation");
+            used.reserved.swap_remove(i);
+        }
         if self.fixed { used.fixed -= self.bytes; } else {
             used.work -= self.bytes;
             used.work_jobs -= 1;
@@ -279,7 +343,7 @@ pub(crate) fn run_chunks<T: Send>(
             let mut i = 0;
             while live < max_live.max(1) && i < pending.len() {
                 let c = pending[i];
-                if let Some(permit) = budget.try_chunk(costs[c]) {
+                if let Some(permit) = budget.try_chunk_for(c, costs[c]) {
                     pending.remove(i);
                     live += 1;
                     let (tx, process) = (tx.clone(), &process);
@@ -404,6 +468,90 @@ mod tests {
         drop(chunks);
         assert_eq!(b.usage.lock().unwrap().fixed, 0);
         assert!(b.usage.lock().unwrap().peak <= 1000);
+    }
+
+    #[test]
+    fn reservation_counts_for_other_chunks_not_its_own() {
+        let b = MemoryBudget::new(1000, 100);
+        let r = b.reserve(7, 300);
+        assert!(b.try_chunk_for(3, 201).is_none(), "another chunk sees the reservation");
+        let own = b.try_chunk_for(7, 400).expect("its own chunk does not wait for it");
+        drop(own);
+        // An oversized chunk runs alone: its own reservation does not count as company.
+        let lenient = MemoryBudget::new(1000, 100).lenient();
+        let r2 = lenient.reserve(5, 50);
+        assert!(lenient.try_chunk_for(4, 600).is_none());
+        let big = lenient.try_chunk_for(5, 600).expect("alone but for its own reservation");
+        drop((big, r2, r));
+        assert_eq!(b.usage.lock().unwrap().fixed, 100);
+        assert!(b.usage.lock().unwrap().reserved.is_empty());
+        assert_eq!(lenient.usage.lock().unwrap().fixed, 100);
+    }
+
+    /// Work waiting beside other work becomes work that runs alone when a later
+    /// reservation leaves it no room beside the live chunks (it waited forever);
+    /// work that waits alone keeps its precedence when a chunk ends meanwhile.
+    #[test]
+    fn waiting_work_turns_alone_after_a_reservation() {
+        let b = MemoryBudget::new(1000, 0).lenient();
+        let a = b.try_chunk_for(0, 400).unwrap();
+        let c = b.try_chunk_for(2, 50).unwrap();
+        let x = b.try_work(200).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            let b = &b;
+            s.spawn(move || { let _w = b.work(540); tx.send(()).unwrap(); });
+            while b.usage.lock().unwrap().waiting == 0 { std::thread::yield_now(); }
+            let r = b.reserve(1, 100);
+            drop(c);
+            drop(x);
+            rx.recv_timeout(std::time::Duration::from_secs(20)).expect("the waiting work was admitted");
+            drop(r);
+        });
+        drop(a);
+        {
+            let used = b.usage.lock().unwrap();
+            assert_eq!((used.fixed, used.work, used.waiting, used.alone_waiting), (0, 0, 0, 0));
+        }
+        // Alone stays alone: a chunk ending while it waits does not let later work overtake it.
+        let big = b.try_chunk_for(0, 500).unwrap();
+        let x = b.try_work(400).unwrap();
+        std::thread::scope(|s| {
+            let b = &b;
+            let h = s.spawn(move || { let _w = b.work(600); });
+            while b.usage.lock().unwrap().alone_waiting == 0 { std::thread::yield_now(); }
+            drop(big);
+            assert!(b.try_permit(200).is_none(), "a waiting alone request goes first");
+            drop(x);
+            h.join().unwrap();
+        });
+        let used = b.usage.lock().unwrap();
+        assert_eq!((used.fixed, used.work, used.waiting, used.alone_waiting), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn try_permit_never_waits_nor_overtakes() {
+        let b = MemoryBudget::new(1000, 0);
+        let p = b.try_permit(450).expect("fits");
+        let q = b.try_permit(450).expect("fits");
+        assert!(b.try_permit(101).is_none(), "does not fit");
+        assert_eq!(b.run_with(b.try_permit(100).unwrap(), || 7), 7);
+        drop(q);
+        b.usage.lock().unwrap().waiting = 1;
+        assert!(b.try_permit(1).is_none(), "a waiting request goes first");
+        b.usage.lock().unwrap().waiting = 0;
+        drop(p);
+        assert_eq!(b.usage.lock().unwrap().work, 0);
+    }
+
+    #[test]
+    fn admits_chunk_matches_try_chunk_admission() {
+        let strict = MemoryBudget::new(1000, 100);
+        assert!(strict.admits_chunk(450) && !strict.admits_chunk(451));
+        assert!(strict.try_chunk(450).is_some());
+        let lenient = MemoryBudget::new(1000, 100).lenient();
+        assert!(lenient.admits_chunk(451) && lenient.admits_chunk(10_000));
+        assert!(lenient.try_chunk(10_000).is_some());
     }
 
     #[test]

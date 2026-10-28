@@ -41,7 +41,7 @@ use crate::sparse_ls::bitmatrix::BitMatrix;
 use crate::sparse_ls::variant::VariantMap;
 
 mod segmented;
-pub use segmented::SegmentPlan;
+pub use segmented::{HubMember, SegmentPlan, SweepHub};
 
 // ---------------------------------------------------------------------------
 // RNG injection
@@ -123,6 +123,60 @@ impl Rng for SimpleRng {
         }
         out
     }
+}
+
+// ---------------------------------------------------------------------------
+// Splice helpers: the big prefix array without a rare run's small positions.
+// ---------------------------------------------------------------------------
+
+/// A prefix array as the harvest reads it: a slice, or an array of a decoded
+/// segment whose entries are traced back to a kept array (`segmented`).
+pub(crate) trait HapArray {
+    fn len(&self) -> usize;
+    fn at(&self, i: usize) -> i32;
+}
+
+impl<T: Copy + Into<i32>> HapArray for [T] {
+    #[inline]
+    fn len(&self) -> usize { <[T]>::len(self) }
+    #[inline]
+    fn at(&self, i: usize) -> i32 { self[i].into() }
+}
+
+/// `src` without its entries at `positions` (strictly ascending, as every
+/// `A_small_idx` list is: sorted full-PBWT positions of distinct haplotypes),
+/// in order, into the front of `dst`; returns the count written. The same
+/// array as testing every entry against a mask, in one copy per gap.
+#[inline]
+pub(crate) fn copy_without<T: Copy>(src: &[T], positions: &[i32], dst: &mut [T]) -> usize {
+    debug_assert!(positions.windows(2).all(|w| w[0] < w[1]), "positions not strictly ascending");
+    let (mut n, mut from) = (0usize, 0usize);
+    for &p in positions {
+        let p = p as usize;
+        dst[n..n + (p - from)].copy_from_slice(&src[from..p]);
+        n += p - from;
+        from = p + 1;
+    }
+    let tail = src.len() - from;
+    dst[n..n + tail].copy_from_slice(&src[from..]);
+    n + tail
+}
+
+/// [`copy_without`] in place: `a` without its entries at `positions`, moved
+/// to its front; returns the count kept.
+#[inline]
+pub(crate) fn remove_positions<T: Copy>(a: &mut [T], positions: &[i32]) -> usize {
+    debug_assert!(positions.windows(2).all(|w| w[0] < w[1]), "positions not strictly ascending");
+    let (mut n, mut from) = (0usize, 0usize);
+    for &p in positions {
+        let p = p as usize;
+        a.copy_within(from..p, n);
+        n += p - from;
+        from = p + 1;
+    }
+    let tail = a.len() - from;
+    a.copy_within(from.., n);
+    n + tail
 }
 
 // ---------------------------------------------------------------------------
@@ -1234,21 +1288,10 @@ impl TargetHaplotypeSet {
             self.g_k[htr] = g_dash;
         }
 
-        // Splice the small PPA back into the big PPA.
-        // map_big_small[h] = true unless h is one of the small positions.
-        let mut map_big_small = vec![true; n_ref as usize];
-        for &s in &small_idx_list {
-            map_big_small[s as usize] = false;
-        }
-        // Compact the big array, leaving a hole of `a_small_idx_size` slots
-        // starting at the first small position, then drop the small PPA in.
-        let mut n_zeros = small_idx_list[0] as usize;
-        for htr in (n_zeros + 1)..(n_ref as usize) {
-            if map_big_small[htr] {
-                self.pbwt_array_a[n_zeros] = self.pbwt_array_a[htr];
-                n_zeros += 1;
-            }
-        }
+        // Splice the small PPA back into the big PPA: compact the big array
+        // without the small positions, then drop the small PPA in.
+        let mut n_zeros = remove_positions(&mut self.pbwt_array_a, &small_idx_list);
+        debug_assert_eq!(n_zeros, n_ref as usize - a_small_idx_size);
         for htr in 0..self.pbwt_small_a.len() {
             self.pbwt_array_a[n_zeros] = self.pbwt_small_a[htr];
             n_zeros += 1;
@@ -1343,14 +1386,14 @@ impl TargetHaplotypeSet {
         // `select_k_from` takes the array by reference; the field is moved out
         // for the call (the two arrays have the same length).
         let arr = std::mem::take(if use_b { &mut self.pbwt_array_b } else { &mut self.pbwt_array_a });
-        self.select_k_from(&arr, k, htr, ref_rac_l, k0, a);
+        self.select_k_from(arr.as_slice(), k, htr, ref_rac_l, k0, a);
         *(if use_b { &mut self.pbwt_array_b } else { &mut self.pbwt_array_a }) = arr;
     }
 
     /// `select_k` harvesting from the prefix array `pbwt_array` (`n_ref` long).
-    fn select_k_from<T: Copy + Into<i32>>(
+    fn select_k_from<A: HapArray + ?Sized>(
         &mut self,
-        pbwt_array: &[T],
+        pbwt_array: &A,
         k: i32,
         htr: usize,
         ref_rac_l: i32,
@@ -1392,7 +1435,7 @@ impl TargetHaplotypeSet {
             if od < nh_down {
                 let idx = pbwt_idx + od;
                 if idx < n_ref && ((idx >= ref_rac_l) == a_bool) {
-                    self.pbwt_states[sample][o as usize].push(pbwt_array[idx as usize].into());
+                    self.pbwt_states[sample][o as usize].push(pbwt_array.at(idx as usize));
                     od += 1;
                 }
             }
@@ -1400,7 +1443,7 @@ impl TargetHaplotypeSet {
             if ou < nh_up {
                 let idx = pbwt_idx - (ou + 1);
                 if idx >= 0 && ((idx >= ref_rac_l) == a_bool) {
-                    self.pbwt_states[sample][o as usize].push(pbwt_array[idx as usize].into());
+                    self.pbwt_states[sample][o as usize].push(pbwt_array.at(idx as usize));
                     ou += 1;
                 }
             }

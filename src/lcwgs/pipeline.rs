@@ -497,6 +497,167 @@ struct Prepared {
     chunks: Vec<std::sync::Mutex<Option<ChunkPrep>>>,
 }
 
+/// A chunk's panel rows read from the SRP in blocks of consecutive sites (each
+/// pass of the panel-side build reads its sites in order): the panel side of a
+/// chunk without its bitmatrix.
+struct SrpBlockRows<'a> {
+    srp: &'a SrpReader,
+    wgs: &'a [usize],
+    block: usize,
+    start: usize,
+    bm: Option<crate::common::HaplotypeBitmatrix>,
+}
+
+impl crate::sparse_ls::ref_haplotype_set::PanelRows for SrpBlockRows<'_> {
+    fn row(&mut self, site: usize) -> &[u64] {
+        let held = self.bm.as_ref().is_some_and(|bm| site >= self.start && site - self.start < bm.n_sites);
+        if !held {
+            self.start = site;
+            self.bm = None;
+            self.bm = Some(self.srp.extract_ref_alleles_bitmatrix(&self.wgs[site..(site + self.block).min(self.wgs.len())]));
+        }
+        self.bm.as_ref().unwrap().row(site - self.start)
+    }
+}
+
+/// Sites per block of [`SrpBlockRows`] (~77 MB of rows on 75,552 haplotypes).
+const AHEAD_BLOCK_SITES: usize = 8192;
+
+/// The single-sample path builds the next chunk's selection panel while the
+/// current chunk runs, from the SRP in blocks (`SrpBlockRows`, not a second
+/// bitmatrix), in the priority order `memory::run_chunks` starts chunks: the
+/// panel build is serial and the chunk's chains wait for it. The panel is the
+/// one the chunk would build from its bitmatrix (same rows, same code). At most
+/// one panel built ahead exists at a time (building or not yet taken), charged
+/// to the chunk scheduler's allowance until its chunk takes it. It is
+/// built on a one-thread pool of its own (the extraction's Rayon work and
+/// cache release stay off the chains' pool), and only when the memory left
+/// (MemAvailable, or the room under the cgroup limit) holds what the starting
+/// chunk will still allocate (its bitmatrix and chain state, estimated), twice
+/// the panel side's estimate and 1 GiB; never under an explicit
+/// `LCWGS_MEM_BUDGET_GB`; `LCWGS_NO_PANEL_AHEAD=1` = off. A heuristic, not a
+/// bound: chunks admitted later allocate after the check.
+/// A failed build ahead is said and the chunk builds its own.
+struct PanelAhead<'a> {
+    order: Vec<usize>,
+    /// Per chunk; whether a build ahead is in flight.
+    state: std::sync::Mutex<(Vec<AheadSlot<'a>>, bool)>,
+    ready: std::sync::Condvar,
+    pool: rayon::ThreadPool,
+    /// The chunk scheduler's allowance, charged with a panel built ahead until
+    /// its chunk takes it.
+    budget: &'a super::memory::MemoryBudget,
+    srp: &'a SrpReader,
+    wgs_idx: &'a [usize],
+    cm: &'a [f64],
+    plan: &'a [Option<(std::ops::Range<usize>, std::ops::Range<usize>)>],
+    /// Resident sites (active + passengers) per chunk.
+    sites: &'a [usize],
+    params: &'a LcwgsParams,
+}
+
+enum AheadSlot<'a> { Empty, Building, Ready(super::iterate::PanelSide, super::memory::Permit<'a>), Taken }
+
+/// A chunk's panel side when the chunk starts: built ahead, being built ahead,
+/// or for the chunk to build (nobody will build it ahead any more).
+enum AheadStart { Built(super::iterate::PanelSide), InFlight, Mine }
+
+/// A claimed build ahead: puts the slot back to `Empty` (waking a chunk waiting
+/// for it, which then builds its own) unless the panel was published.
+struct AheadClaim<'p, 'a> { ahead: &'p PanelAhead<'a>, c: usize, published: bool, charge: Option<super::memory::Permit<'a>> }
+
+impl Drop for AheadClaim<'_, '_> {
+    fn drop(&mut self) {
+        if self.published { return; }
+        let mut st = self.ahead.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.0[self.c] = AheadSlot::Empty;
+        st.1 = false;
+        self.ahead.ready.notify_all();
+    }
+}
+
+impl<'a> PanelAhead<'a> {
+    /// Chunk `c` starts.
+    fn start(&self, c: usize) -> AheadStart {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match std::mem::replace(&mut st.0[c], AheadSlot::Taken) {
+            AheadSlot::Ready(panel, _charge) => AheadStart::Built(panel),
+            AheadSlot::Building => { st.0[c] = AheadSlot::Building; AheadStart::InFlight }
+            AheadSlot::Empty | AheadSlot::Taken => AheadStart::Mine,
+        }
+    }
+
+    /// The panel side being built ahead for chunk `c` (`AheadStart::InFlight`),
+    /// once built; `None` if that build failed (the chunk then builds it).
+    fn wait(&self, c: usize) -> Option<super::iterate::PanelSide> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            match std::mem::replace(&mut st.0[c], AheadSlot::Taken) {
+                AheadSlot::Ready(panel, _charge) => return Some(panel),
+                AheadSlot::Building => {
+                    st.0[c] = AheadSlot::Building;
+                    st = self.ready.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+                AheadSlot::Empty | AheadSlot::Taken => return None,
+            }
+        }
+    }
+
+    /// Claim the next chunk to build ahead as chunk `starting` starts: the first
+    /// not started in priority order, when no panel built ahead is outstanding
+    /// and the memory allows (see [`PanelAhead`]).
+    fn claim_next(&self, starting: usize) -> Option<AheadClaim<'_, 'a>> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.1 || st.0.iter().any(|s| matches!(s, AheadSlot::Ready(..))) { return None; }
+        let c = *self.order.iter().find(|&&c| matches!(st.0[c], AheadSlot::Empty))?;
+        let n_ref = self.srp.metadata.n_haps;
+        let panel_sites = self.plan[c].as_ref().map_or(0, |(_, b)| b.len());
+        let starting_bytes = self.sites[starting] * n_ref.div_ceil(64) * 8 + (3usize << 29);
+        let need = (starting_bytes + 2 * panel_side_bytes(panel_sites, n_ref)) as f64 / 1048576.0 + 1024.0;
+        let room = [crate::log::available_ram_mb(), crate::log::cgroup_headroom_mb()].into_iter().flatten().fold(f64::INFINITY, f64::min);
+        if !(room.is_finite() && room >= need) { return None; }
+        st.0[c] = AheadSlot::Building;
+        st.1 = true;
+        let charge = Some(self.budget.reserve(c, panel_side_bytes(panel_sites, n_ref)));
+        Some(AheadClaim { ahead: self, c, published: false, charge })
+    }
+
+    /// Build the claimed chunk's panel side on the pool and publish it. A panic
+    /// in the build is said, not propagated: the claim's drop hands the chunk
+    /// back to be built where it starts.
+    fn build(&self, mut claim: AheadClaim<'_, 'a>) {
+        let c = claim.c;
+        let t0 = std::time::Instant::now();
+        let (_, buffer) = self.plan[c].clone().expect("a chunk with sites");
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.pool.install(|| {
+            let mut rows = SrpBlockRows { srp: self.srp, wgs: &self.wgs_idx[buffer.clone()], block: AHEAD_BLOCK_SITES, start: 0, bm: None };
+            super::faithful_select::FaithfulPanel::build_segmented_rows(&mut rows, self.srp.metadata.n_haps, &self.cm[buffer.clone()], self.params)
+        })));
+        let panel = match built {
+            Ok(panel) => std::sync::Arc::new(panel),
+            Err(e) => {
+                let msg = e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_default();
+                crate::selphi_info!("  lcWGS: building chunk {c}'s selection panel ahead failed ({msg}); the chunk builds its own");
+                return;
+            }
+        };
+        memtrace(&format!("chunk {c}: selection panel built ahead in {:.1} s ({:.2} GB)", t0.elapsed().as_secs_f64(), panel.heap_bytes() as f64 / 1e9));
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.0[c] = AheadSlot::Ready(panel, claim.charge.take().expect("a claim's charge"));
+        st.1 = false;
+        claim.published = true;
+        self.ready.notify_all();
+    }
+}
+
+/// Estimated bytes of a chunk's selection panel side (`FaithfulPanel` with its
+/// segment plan) for `sites` sites over `n_ref` haplotypes: per-site variant
+/// map and site flags, the compressed PBWT stream and small-array lists, and
+/// the plan's boundary arrays (one per 128 common sites, ~1/6 of the sites).
+fn panel_side_bytes(sites: usize, n_ref: usize) -> usize {
+    sites * 512 + (sites / 768 + 1) * n_ref * 4
+}
+
 /// Build, in parallel, the panel side of the chunks a single sample's run will
 /// start first: as many of the largest chunks as fit nine tenths of the state
 /// allowance the scheduler will grant (estimated before the pileup, with the
@@ -532,7 +693,8 @@ fn prepare_chunks(srp: &SrpReader, wgs_idx: &[usize], map_path: &str, params: &L
         let (core, buffer) = ranges[c].clone().unwrap();
         let pass_wgs: &[usize] = pass.map_or(&[], |p| &p.idx[p.of_core(&core)]);
         let bm = chunk_bitmatrix(srp, &wgs_idx[buffer.clone()], pass_wgs);
-        let panel = selector.then(|| std::sync::Arc::new(super::faithful_select::FaithfulPanel::build(&bm, &cm[buffer], params)));
+        // One sample: its selectors decode in segments (plan recorded in the build).
+        let panel = selector.then(|| std::sync::Arc::new(super::faithful_select::FaithfulPanel::build_segmented(&bm, &cm[buffer], params)));
         (c, ChunkPrep { bm, panel })
     }).collect();
     let chunks: Vec<_> = (0..n_chunks).map(|_| std::sync::Mutex::new(None)).collect();
@@ -1076,8 +1238,77 @@ fn split_plan(mean_conf: f32, kpbwt: usize, big: Option<super::big_panel::BigSpl
 /// side, which depends on the panel, map and `rare_maf` alone), so depth 2000 under
 /// `k_max` 3000 is the computation of a whole `LCWGS_KPBWT=2000` run's single pass.
 fn deep_pass_params(params: &LcwgsParams, k: Option<usize>) -> Option<LcwgsParams> {
-    let k = k.filter(|&k| k != params.kpbwt && k > 0)?;
-    Some(LcwgsParams { kpbwt: k, ..params.clone() })
+    deep_pass_params_with(params, k, split_iters())
+}
+
+/// [`deep_pass_params`] with the deep pass's own schedule `iters` = (iterations,
+/// main iterations) (`LCWGS_SPLIT_ITERS`; `None` = the run's).
+fn deep_pass_params_with(params: &LcwgsParams, k: Option<usize>, iters: Option<(usize, usize)>) -> Option<LcwgsParams> {
+    let k = k.filter(|&k| k != params.kpbwt && k > 0);
+    let iters = iters.filter(|&it| it != (params.n_iterations, params.n_main_iterations));
+    if k.is_none() && iters.is_none() { return None; }
+    let (n_iterations, n_main_iterations) = iters.unwrap_or((params.n_iterations, params.n_main_iterations));
+    Some(LcwgsParams { kpbwt: k.unwrap_or(params.kpbwt), n_iterations, n_main_iterations, ..params.clone() })
+}
+
+/// `LCWGS_SPLIT_ITERS=N,M` (opt-in): the SPLIT deep pass runs N Gibbs iterations,
+/// the last M of them main (accumulated) ones, instead of the run's schedule
+/// (`LCWGS_N_ITER` / `LCWGS_N_MAIN`, 30 / 25). Needs 1 <= M <= N; anything else is
+/// ignored (said once).
+fn split_iters() -> Option<(usize, usize)> {
+    let raw = crate::config::raw("LCWGS_SPLIT_ITERS")?;
+    let parsed = parse_split_iters(&raw);
+    if parsed.is_none() {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::selphi_info!("  LCWGS_SPLIT_ITERS={raw:?} is not 'iterations,main iterations' with 1 <= main <= iterations: ignored");
+        }
+    }
+    parsed
+}
+
+/// `N,M` with `1 <= M <= N`, else `None`.
+fn parse_split_iters(raw: &str) -> Option<(usize, usize)> {
+    let v: Vec<Option<usize>> = raw.split(',').map(|x| x.trim().parse().ok()).collect();
+    match v.as_slice() {
+        &[Some(n), Some(m)] if m >= 1 && m <= n => Some((n, m)),
+        _ => None,
+    }
+}
+
+/// Which pass a site (or passenger) of a SPLIT chunk takes its genotype from,
+/// by its panel MAF: the deep pass inside the band `[lo, hi)`, the mean of both
+/// below `blend_below` outside the band (opt-in), else the main pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitSource { Main, Deep, Mean }
+
+fn split_source(maf: f64, lo: f64, hi: f64, blend_below: Option<f64>) -> SplitSource {
+    if lo <= maf && maf < hi { SplitSource::Deep }
+    else if blend_below.is_some_and(|x| maf < x) { SplitSource::Mean }
+    else { SplitSource::Main }
+}
+
+/// `LCWGS_SPLIT_BLEND_BELOW=x` (opt-in): when the SPLIT runs, sites (and
+/// impute-only passengers) whose panel MAF is below `x` and outside the deep
+/// band take the mean of the two passes' genotype posteriors and dosages
+/// instead of the main pass's. Unset, unparsable or not in (0, 0.5]: off.
+fn split_blend_below() -> Option<f64> {
+    crate::config::f64_opt("LCWGS_SPLIT_BLEND_BELOW").filter(|x| x.is_finite() && *x > 0.0 && *x <= 0.5)
+}
+
+/// Whether the two SPLIT passes of a chunk run at the same time (default; the
+/// single-sample path, one Gibbs chain per pass, the faithful selection):
+/// they share the chunk's bitmatrix and selection panel and decode each
+/// selection sweep's panel half once for both (`SweepHub`). Same output as
+/// running them one after the other, which `LCWGS_SPLIT_SERIAL=1` does.
+fn split_concurrent(single_sample: bool, selector: bool) -> bool {
+    single_sample && selector && super::iterate::gibbs_restarts() == 1 && !crate::config::present("LCWGS_SPLIT_SERIAL")
+}
+
+/// Mean of two passes' (dosage, 3 GP) rows for one site, in place on `a`.
+fn blend_rows(a_dose: &mut [f32], a_gp: &mut [f32], b_dose: &[f32], b_gp: &[f32]) {
+    for (x, &y) in a_dose.iter_mut().zip(b_dose) { *x = 0.5 * (*x + y); }
+    for (x, &y) in a_gp.iter_mut().zip(b_gp) { *x = 0.5 * (*x + y); }
 }
 
 /// Resident chunk state, selection structures, accumulators and completed
@@ -1085,9 +1316,18 @@ fn deep_pass_params(params: &LcwgsParams, k: Option<usize>) -> Option<LcwgsParam
 /// single-sample path also keeps the selection's segment plan and decoded
 /// segments.
 fn chunk_state_bytes(sites: usize, n_ref: usize, samples: usize) -> usize {
+    chunk_state_bytes_chains(sites, n_ref, samples, 1)
+}
+
+/// [`chunk_state_bytes`] for `chains` Gibbs chains live at once on the chunk (the
+/// two passes of a concurrent SPLIT, [`split_concurrent`]): each further chain
+/// holds its own per-site state; the bitmatrix, the selection panel, its segment
+/// plan and the decoded segments are shared.
+fn chunk_state_bytes_chains(sites: usize, n_ref: usize, samples: usize, chains: usize) -> usize {
     let panel = n_ref.div_ceil(64) * 8;
-    sites.saturating_mul(panel * 2 + 256 + samples * 128)
-        .saturating_add(n_ref * 128)
+    let chain = sites.saturating_mul(256 + samples * 128).saturating_add(n_ref * 128);
+    sites.saturating_mul(panel * 2)
+        .saturating_add(chain.saturating_mul(chains.max(1)))
         .saturating_add(if samples <= 1 { crate::sparse_ls::haplotype_set::SegmentPlan::bytes(sites, n_ref) } else { 0 })
 }
 
@@ -1296,6 +1536,46 @@ fn run_chunked_gibbs(
         }
     };
 
+    // The faithful selection (default) and whether its selectors decode their
+    // sweeps in segments (the admitted single-sample path, see `run_gibbs`).
+    let selector = !crate::config::present("LCWGS_NO_FAITHFUL_SELECT") && chrwide_cond.is_none();
+    let single_sample = memory.is_some();
+    let concurrent = split_band.is_some() && split_concurrent(single_sample, selector);
+    if concurrent {
+        crate::selphi_info!("  lcWGS SPLIT: the two passes of a chunk run at the same time, sharing its panel side and each selection sweep's panel decode (LCWGS_SPLIT_SERIAL=1: one after the other, same output)");
+    }
+    // Resident sites per chunk (active + its passengers), and whether its two SPLIT
+    // passes may run at the same time: charged as two chains, which an explicit
+    // budget must admit (else that chunk runs them one after the other).
+    let n_ref = srp.metadata.n_haps;
+    let chunk_sites: Vec<_> = plan.iter().map(|r| {
+        r.as_ref().map_or(0, |(core, buffer)| buffer.len() + passengers.map_or(0, |(p, _)| p.of_core(core).len()))
+    }).collect();
+    let chunk_concurrent: Vec<bool> = chunk_sites.iter().map(|&sites| concurrent
+        && memory.as_ref().is_some_and(|m| m.admits_chunk(chunk_state_bytes_chains(sites, n_ref, n_samples, 2)))).collect();
+    let blend_below = split_blend_below().filter(|_| split_band.is_some());
+    if let Some(x) = blend_below {
+        crate::selphi_info!("  lcWGS SPLIT: panel MAF < {} outside the deep band takes the mean of both passes (LCWGS_SPLIT_BLEND_BELOW)", x);
+    }
+    // The admitted path's chunk costs, and the start order `run_chunks` follows.
+    let costs: Vec<usize> = chunk_sites.iter().zip(&chunk_concurrent)
+        .map(|(&sites, &two)| chunk_state_bytes_chains(sites, n_ref, n_samples, if two { 2 } else { 1 })).collect();
+    let pool = (single_sample && selector && explicit_budget.is_none() && plan.iter().flatten().count() > 1
+        && !crate::config::present("LCWGS_NO_PANEL_AHEAD"))
+        .then(|| rayon::ThreadPoolBuilder::new().num_threads(1).stack_size(16 << 20).thread_name(|_| "panel-ahead".into()).build().ok())
+        .flatten();
+    let ahead: Option<PanelAhead> = pool.zip(memory.as_ref()).map(|(pool, budget)| {
+        let mut order: Vec<usize> = (0..n_chunks).filter(|&c| plan[c].is_some()).collect();
+        order.sort_by_key(|&c| std::cmp::Reverse(costs[c]));
+        // A chunk prepared during the pileup has its panel side already.
+        let slots = (0..n_chunks).map(|c| {
+            let prepared_panel = prepared.and_then(|p| p.get(c)).is_some_and(|m| m.lock().unwrap().as_ref().is_some_and(|p| p.panel.is_some()));
+            if prepared_panel || plan[c].is_none() { AheadSlot::Taken } else { AheadSlot::Empty }
+        }).collect();
+        PanelAhead { order, state: std::sync::Mutex::new((slots, false)), ready: std::sync::Condvar::new(), pool, budget,
+            srp, wgs_idx, cm, plan: &plan, sites: &chunk_sites, params }
+    });
+
     // Per-chunk work as a closure so chunks can run in PARALLEL when the sample
     // count is too small to fill the cores (single/few-sample: the sample/hap
     // par_iter inside run_gibbs is degenerate → most cores idle). Chunks are fully
@@ -1303,146 +1583,204 @@ fn run_chunked_gibbs(
     // chunk-local indices) so parallel chunks are BIT-IDENTICAL to sequential.
     let process_chunk = |c: usize| -> Option<(usize, usize, usize, std::ops::Range<usize>, super::iterate::GibbsOutput)> {
         let (core, buffer) = plan[c].clone()?;
-        let (core_start, core_end) = (core.start, core.end);
-        let (buf_start, buf_end) = (buffer.start, buffer.end);
-        // This chunk's impute-only passengers (none without them).
-        let prange = passengers.map_or(0..0, |(p, _)| p.of_core(&core));
-        let chunk_pass = passengers.filter(|_| !prange.is_empty()).map(|(p, pcm)| super::iterate::ChunkPassengers {
-            ins: p.ins[prange.clone()].iter().map(|&i| i - buf_start).collect(),
-            cm: &pcm[prange.clone()],
-        });
-        let pass_wgs: &[usize] = passengers.map_or(&[], |(p, _)| &p.idx[prange.clone()]);
-
-        let chunk_n = buf_end - buf_start;
-        // Slice gl3 + cm for the buffer window
-        let chunk_gl3 = &gl3_shared[buf_start * n_samples * 3 .. buf_end * n_samples * 3];
-        let chunk_cm = &cm[buf_start..buf_end];
-        // Extract the chunk's reference bitmatrix DIRECTLY from the SRP for the
-        // buffer window's panel variants. This is the same path the standalone
-        // pipeline uses, and keeps peak memory at K × chunk_size (the full-
-        // chromosome ref bitmatrix is never materialized).
-        let chunk_wgs = &wgs_idx[buf_start..buf_end];
-        let prep = prepared.and_then(|p| p.get(c)).and_then(|m| m.lock().unwrap().take());
-        let (chunk_bm, panel) = match prep {
-            Some(ChunkPrep { bm, panel }) => (bm, panel),
-            None => (chunk_bitmatrix(srp, chunk_wgs, pass_wgs), None),
-        };
-        assert_eq!((chunk_bm.n_sites, chunk_bm.n_rows()), (chunk_n, chunk_n + pass_wgs.len()), "chunk {c} bitmatrix rows");
-
-        let mut out = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, None, chrwide_cond.as_ref(), execution, panel.as_ref(), chunk_pass.as_ref());
-        // Two-depth split: run the deep pass and overlay its dose/GP onto the band
-        // sites (panel MAF ∈ [lo,hi)), routing by PANEL allele frequency only (known
-        // a-priori; no truth). Byte-identical when `split_band` is None.
-        if let Some((lo, hi, deep_k)) = split_band {
-            let deep = deep_params.as_ref().unwrap_or(params);
-            let out_deep = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, deep, Some(deep_k), chrwide_cond.as_ref(), execution, panel.as_ref(), chunk_pass.as_ref());
-            let n_ref = chunk_bm.n_haps;
-            // Passengers routed by the same panel-MAF band.
-            for p in 0..pass_wgs.len() {
-                let ac = chunk_bm.popcount_row(chunk_bm.n_sites + p, n_ref) as f64;
-                let maf = ac.min(n_ref as f64 - ac) / n_ref as f64;
-                if lo <= maf && maf < hi {
-                    let i = p * n_samples..(p + 1) * n_samples;
-                    out.pass_dosage[i.clone()].copy_from_slice(&out_deep.pass_dosage[i.clone()]);
-                    out.pass_gp[i.start * 3..i.end * 3].copy_from_slice(&out_deep.pass_gp[i.start * 3..i.end * 3]);
-                }
+        std::thread::scope(|ahead_scope| {
+            // The next chunk's panel side is built while this one runs, from now:
+            // this chunk's extraction and its own panel build leave cores idle.
+            let own = ahead.as_ref().map(|a| a.start(c));
+            if let Some(claim) = ahead.as_ref().and_then(|a| a.claim_next(c)) {
+                let a = ahead.as_ref().unwrap();
+                // A failed spawn drops the claim (the slot goes back to Empty).
+                let _ = std::thread::Builder::new().name("panel-ahead".into()).spawn_scoped(ahead_scope, move || a.build(claim));
             }
-            for lv in 0..chunk_bm.n_sites {
-                let ac = chunk_bm.popcount_row(lv, n_ref) as f64;
-                let maf = ac.min(n_ref as f64 - ac) / n_ref as f64;
-                if lo <= maf && maf < hi {
-                    for s in 0..n_samples {
-                        out.dosage[lv * n_samples + s] = out_deep.dosage[lv * n_samples + s];
-                        let g = (lv * n_samples + s) * 3;
-                        out.gp[g] = out_deep.gp[g];
-                        out.gp[g + 1] = out_deep.gp[g + 1];
-                        out.gp[g + 2] = out_deep.gp[g + 2];
+
+            let (core_start, core_end) = (core.start, core.end);
+            let (buf_start, buf_end) = (buffer.start, buffer.end);
+            // This chunk's impute-only passengers (none without them).
+            let prange = passengers.map_or(0..0, |(p, _)| p.of_core(&core));
+            let chunk_pass = passengers.filter(|_| !prange.is_empty()).map(|(p, pcm)| super::iterate::ChunkPassengers {
+                ins: p.ins[prange.clone()].iter().map(|&i| i - buf_start).collect(),
+                cm: &pcm[prange.clone()],
+            });
+            let pass_wgs: &[usize] = passengers.map_or(&[], |(p, _)| &p.idx[prange.clone()]);
+
+            let chunk_n = buf_end - buf_start;
+            // Slice gl3 + cm for the buffer window
+            let chunk_gl3 = &gl3_shared[buf_start * n_samples * 3 .. buf_end * n_samples * 3];
+            let chunk_cm = &cm[buf_start..buf_end];
+            // Extract the chunk's reference bitmatrix DIRECTLY from the SRP for the
+            // buffer window's panel variants. This is the same path the standalone
+            // pipeline uses, and keeps peak memory at K × chunk_size (the full-
+            // chromosome ref bitmatrix is never materialized).
+            let chunk_wgs = &wgs_idx[buf_start..buf_end];
+            let prep = prepared.and_then(|p| p.get(c)).and_then(|m| m.lock().unwrap().take());
+            let (chunk_bm, panel) = match prep {
+                Some(ChunkPrep { bm, panel }) => (bm, panel),
+                None => (chunk_bitmatrix(srp, chunk_wgs, pass_wgs), None),
+            };
+            assert_eq!((chunk_bm.n_sites, chunk_bm.n_rows()), (chunk_n, chunk_n + pass_wgs.len()), "chunk {c} bitmatrix rows");
+            // The selection's panel side, built once for every Gibbs run of the chunk
+            // (both SPLIT passes, every restart): a function of the panel, the map
+            // and `rare_maf` alone. A single sample's selectors decode their sweeps
+            // in segments: its plan is recorded during the build.
+            // Built ahead while an earlier chunk ran (`PanelAhead`), else here.
+            let panel = panel.or_else(|| match (ahead.as_ref(), own) {
+                (_, Some(AheadStart::Built(p))) => Some(p),
+                (Some(a), Some(AheadStart::InFlight)) => a.wait(c),
+                _ => None,
+            });
+            let panel = panel.or_else(|| selector.then(|| std::sync::Arc::new(if single_sample {
+                super::faithful_select::FaithfulPanel::build_segmented(&chunk_bm, chunk_cm, params)
+            } else {
+                super::faithful_select::FaithfulPanel::build(&chunk_bm, chunk_cm, params)
+            })));
+            // Two-depth split: run the deep pass and overlay its dose/GP onto the band
+            // sites (panel MAF ∈ [lo,hi)), routing by PANEL allele frequency only (known
+            // a-priori; no truth). Byte-identical when `split_band` is None. The two
+            // passes run at the same time when `concurrent` (each selection sweep's
+            // panel half decoded once for both), else one after the other: the same
+            // output either way.
+            let deep = deep_params.as_ref().unwrap_or(params);
+            let concurrent = chunk_concurrent[c] && split_band.is_some() && panel.as_ref().is_some_and(|p| p.has_parallel_plan());
+            let (mut out, out_deep) = if let (true, Some((_, _, deep_k))) = (concurrent, split_band) {
+                let mut members = crate::sparse_ls::haplotype_set::SweepHub::members(2).into_iter();
+                let (main_member, deep_member) = (members.next(), members.next());
+                let (pnl, cp) = (panel.as_ref(), chunk_pass.as_ref());
+                let bm = &chunk_bm;
+                std::thread::scope(|scope| {
+                    let deep_run = scope.spawn(move || super::iterate::run_gibbs_ensemble_with_memory(
+                        chunk_gl3, bm, chunk_cm, n_samples, deep, Some(deep_k), None, execution, pnl, cp, deep_member));
+                    let out = super::iterate::run_gibbs_ensemble_with_memory(
+                        chunk_gl3, bm, chunk_cm, n_samples, params, None, None, execution, pnl, cp, main_member);
+                    (out, Some(deep_run.join().unwrap_or_else(|e| std::panic::resume_unwind(e))))
+                })
+            } else {
+                let out = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, None, chrwide_cond.as_ref(), execution, panel.as_ref(), chunk_pass.as_ref(), None);
+                let out_deep = split_band.map(|(_, _, deep_k)| super::iterate::run_gibbs_ensemble_with_memory(
+                    chunk_gl3, &chunk_bm, chunk_cm, n_samples, deep, Some(deep_k), chrwide_cond.as_ref(), execution, panel.as_ref(), chunk_pass.as_ref(), None));
+                (out, out_deep)
+            };
+            drop(panel);
+            if let (Some((lo, hi, _)), Some(out_deep)) = (split_band, out_deep) {
+                let n_ref = chunk_bm.n_haps;
+                // Passengers routed by the same panel-MAF band (and the opt-in
+                // LCWGS_SPLIT_BLEND_BELOW mean below it).
+                for p in 0..pass_wgs.len() {
+                    let ac = chunk_bm.popcount_row(chunk_bm.n_sites + p, n_ref) as f64;
+                    let maf = ac.min(n_ref as f64 - ac) / n_ref as f64;
+                    let i = p * n_samples..(p + 1) * n_samples;
+                    match split_source(maf, lo, hi, blend_below) {
+                        SplitSource::Deep => {
+                            out.pass_dosage[i.clone()].copy_from_slice(&out_deep.pass_dosage[i.clone()]);
+                            out.pass_gp[i.start * 3..i.end * 3].copy_from_slice(&out_deep.pass_gp[i.start * 3..i.end * 3]);
+                        }
+                        SplitSource::Mean => blend_rows(&mut out.pass_dosage[i.clone()], &mut out.pass_gp[i.start * 3..i.end * 3],
+                            &out_deep.pass_dosage[i.clone()], &out_deep.pass_gp[i.start * 3..i.end * 3]),
+                        SplitSource::Main => {}
+                    }
+                }
+                for lv in 0..chunk_bm.n_sites {
+                    let ac = chunk_bm.popcount_row(lv, n_ref) as f64;
+                    let maf = ac.min(n_ref as f64 - ac) / n_ref as f64;
+                    match split_source(maf, lo, hi, blend_below) {
+                        SplitSource::Deep => for s in 0..n_samples {
+                            out.dosage[lv * n_samples + s] = out_deep.dosage[lv * n_samples + s];
+                            let g = (lv * n_samples + s) * 3;
+                            out.gp[g] = out_deep.gp[g];
+                            out.gp[g + 1] = out_deep.gp[g + 1];
+                            out.gp[g + 2] = out_deep.gp[g + 2];
+                        },
+                        SplitSource::Mean => {
+                            let i = lv * n_samples..(lv + 1) * n_samples;
+                            blend_rows(&mut out.dosage[i.clone()], &mut out.gp[i.start * 3..i.end * 3],
+                                &out_deep.dosage[i.clone()], &out_deep.gp[i.start * 3..i.end * 3]);
+                        }
+                        SplitSource::Main => {}
                     }
                 }
             }
-        }
-        memtrace(&format!("chunk {c}/{n_chunks} done (chunk_n={chunk_n})"));
+            memtrace(&format!("chunk {c}/{n_chunks} done (chunk_n={chunk_n})"));
 
-        // PHASE-0 diagnostic dump (LCWGS_COND_DUMP=<dir>): per chunk, write the
-        // final base conditioning set per target hap + the panel carrier list of
-        // each CORE rare variant. A Python harness cross-checks, for the
-        // confident-wrong zero-read carriers, whether the true carrier is ABSENT
-        // from selection (→ build persistent per-locus PBWT) or PRESENT (→ HMM
-        // bottleneck, rewrite won't help). No effect on normal runs.
-        if let Some(dir) = crate::config::raw("LCWGS_COND_DUMP") {
-            use std::io::Write;
-            let _ = std::fs::create_dir_all(&dir);
-            let n_ref = chunk_bm.n_haps;
-            // conditioning sets per target hap
-            if let Ok(mut f) = std::fs::File::create(format!("{dir}/c{c}_cond.tsv")) {
-                for (h, cond) in out.cond_final.iter().enumerate() {
-                    let csv: String = cond.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
-                    let _ = writeln!(f, "{h}\t{csv}");
+            // PHASE-0 diagnostic dump (LCWGS_COND_DUMP=<dir>): per chunk, write the
+            // final base conditioning set per target hap + the panel carrier list of
+            // each CORE rare variant. A Python harness cross-checks, for the
+            // confident-wrong zero-read carriers, whether the true carrier is ABSENT
+            // from selection (→ build persistent per-locus PBWT) or PRESENT (→ HMM
+            // bottleneck, rewrite won't help). No effect on normal runs.
+            if let Some(dir) = crate::config::raw("LCWGS_COND_DUMP") {
+                use std::io::Write;
+                let _ = std::fs::create_dir_all(&dir);
+                let n_ref = chunk_bm.n_haps;
+                // conditioning sets per target hap
+                if let Ok(mut f) = std::fs::File::create(format!("{dir}/c{c}_cond.tsv")) {
+                    for (h, cond) in out.cond_final.iter().enumerate() {
+                        let csv: String = cond.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+                        let _ = writeln!(f, "{h}\t{csv}");
+                    }
+                }
+                // carriers of each CORE rare variant (panel ALT count 1..=64)
+                if let Ok(mut f) = std::fs::File::create(format!("{dir}/c{c}_rare.tsv")) {
+                    for v in core_start..core_end {
+                        let lv = v - buf_start;
+                        let ac = chunk_bm.popcount_row(lv, n_ref) as usize;
+                        if (1..=64).contains(&ac) {
+                            let wi = chunk_wgs[lv];
+                            let var = srp.variants.get(wi);
+                            let carr: String = (0..n_ref as u32)
+                                .filter(|&h| chunk_bm.get(lv, h as usize))
+                                .map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+                            let _ = writeln!(f, "{}:{}:{}:{}\t{}",
+                                var.chr, var.pos, var.ref_allele, var.alt_allele, carr);
+                        }
+                    }
                 }
             }
-            // carriers of each CORE rare variant (panel ALT count 1..=64)
-            if let Ok(mut f) = std::fs::File::create(format!("{dir}/c{c}_rare.tsv")) {
-                for v in core_start..core_end {
-                    let lv = v - buf_start;
-                    let ac = chunk_bm.popcount_row(lv, n_ref) as usize;
-                    if (1..=64).contains(&ac) {
+
+            // WHITE-BOX TRACE (LCWGS_TRACE_POS=pos1,pos2,... + LCWGS_COND_DUMP set so
+            // cond_final is populated; optional LCWGS_TRACE_SAMPLE=idx, default 0): at the
+            // listed genomic positions, for the traced sample's two haps, report the panel
+            // AF, the imputed dose, and the FRACTION of that hap's (chunk-wide) conditioning
+            // set that carries ALT at the site. If carrier-frac ≈ panel AF but dose≈0 →
+            // present-but-not-copied (FB/copying issue); if carrier-frac << AF → the global
+            // selection under-picks local carriers (per-locus selection is the lever).
+            if let Some(poss) = crate::config::raw("LCWGS_TRACE_POS") {
+                let targets: Vec<i64> = poss.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                let strace: usize = crate::config::raw("LCWGS_TRACE_SAMPLE")
+                    .and_then(|x| x.parse().ok()).unwrap_or(0);
+                let n_ref = chunk_bm.n_haps;
+                if !out.cond_final.is_empty() {
+                    for v in core_start..core_end {
+                        let lv = v - buf_start;
                         let wi = chunk_wgs[lv];
                         let var = srp.variants.get(wi);
-                        let carr: String = (0..n_ref as u32)
-                            .filter(|&h| chunk_bm.get(lv, h as usize))
-                            .map(|x| x.to_string()).collect::<Vec<_>>().join(",");
-                        let _ = writeln!(f, "{}:{}:{}:{}\t{}",
-                            var.chr, var.pos, var.ref_allele, var.alt_allele, carr);
+                        if !targets.contains(&{ var.pos }) { continue; }
+                        let ac = chunk_bm.popcount_row(lv, n_ref) as f32;
+                        let af = ac / n_ref as f32;
+                        let dose = out.dosage[lv * n_samples + strace];
+                        for h in [2 * strace, 2 * strace + 1] {
+                            let cond = &out.cond_final[h];
+                            let ncar = cond.iter().filter(|&&r| chunk_bm.get(lv, r as usize)).count();
+                            let frac = if cond.is_empty() { 0.0 } else { ncar as f32 / cond.len() as f32 };
+                            eprintln!(
+                                "TRACE pos={} af={:.3} dose={:.3} hap{} K={} alt_carriers={} ({:.1}% vs panel {:.1}%)",
+                                var.pos, af, dose, h, cond.len(), ncar, 100.0 * frac, 100.0 * af);
+                        }
                     }
                 }
             }
-        }
 
-        // WHITE-BOX TRACE (LCWGS_TRACE_POS=pos1,pos2,... + LCWGS_COND_DUMP set so
-        // cond_final is populated; optional LCWGS_TRACE_SAMPLE=idx, default 0): at the
-        // listed genomic positions, for the traced sample's two haps, report the panel
-        // AF, the imputed dose, and the FRACTION of that hap's (chunk-wide) conditioning
-        // set that carries ALT at the site. If carrier-frac ≈ panel AF but dose≈0 →
-        // present-but-not-copied (FB/copying issue); if carrier-frac << AF → the global
-        // selection under-picks local carriers (per-locus selection is the lever).
-        if let Some(poss) = crate::config::raw("LCWGS_TRACE_POS") {
-            let targets: Vec<i64> = poss.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-            let strace: usize = crate::config::raw("LCWGS_TRACE_SAMPLE")
-                .and_then(|x| x.parse().ok()).unwrap_or(0);
-            let n_ref = chunk_bm.n_haps;
-            if !out.cond_final.is_empty() {
-                for v in core_start..core_end {
-                    let lv = v - buf_start;
-                    let wi = chunk_wgs[lv];
-                    let var = srp.variants.get(wi);
-                    if !targets.contains(&{ var.pos }) { continue; }
-                    let ac = chunk_bm.popcount_row(lv, n_ref) as f32;
-                    let af = ac / n_ref as f32;
-                    let dose = out.dosage[lv * n_samples + strace];
-                    for h in [2 * strace, 2 * strace + 1] {
-                        let cond = &out.cond_final[h];
-                        let ncar = cond.iter().filter(|&&r| chunk_bm.get(lv, r as usize)).count();
-                        let frac = if cond.is_empty() { 0.0 } else { ncar as f32 / cond.len() as f32 };
-                        eprintln!(
-                            "TRACE pos={} af={:.3} dose={:.3} hap{} K={} alt_carriers={} ({:.1}% vs panel {:.1}%)",
-                            var.pos, af, dose, h, cond.len(), ncar, 100.0 * frac, 100.0 * af);
-                    }
-                }
+            if crate::config::present("LCWGS_CHUNK_DIAG") {
+                let gl3_sum: f64 = chunk_gl3.iter().map(|&x| x as f64).sum();
+                let dose_mean: f64 = out.dosage.iter().map(|&d| d as f64).sum::<f64>() / out.dosage.len().max(1) as f64;
+                let bm_ones: u64 = (0..chunk_bm.n_sites).map(|si| chunk_bm.popcount_row(si, chunk_bm.n_haps) as u64).sum();
+                crate::selphi_info!(
+                    "  [chunk {}] cm=[{:.3},{:.3}] n_var={} gl3_sum={:.1} bm_ones_total={} dose_mean={:.4}",
+                    c, chunk_cm[0], chunk_cm[chunk_cm.len()-1], chunk_n,
+                    gl3_sum, bm_ones, dose_mean);
             }
-        }
 
-        if crate::config::present("LCWGS_CHUNK_DIAG") {
-            let gl3_sum: f64 = chunk_gl3.iter().map(|&x| x as f64).sum();
-            let dose_mean: f64 = out.dosage.iter().map(|&d| d as f64).sum::<f64>() / out.dosage.len().max(1) as f64;
-            let bm_ones: u64 = (0..chunk_bm.n_sites).map(|si| chunk_bm.popcount_row(si, chunk_bm.n_haps) as u64).sum();
-            crate::selphi_info!(
-                "  [chunk {}] cm=[{:.3},{:.3}] n_var={} gl3_sum={:.1} bm_ones_total={} dose_mean={:.4}",
-                c, chunk_cm[0], chunk_cm[chunk_cm.len()-1], chunk_n,
-                gl3_sum, bm_ones, dose_mean);
-        }
-
-        let _ = chunk_n;
-        Some((core_start, core_end, buf_start, prange, out))
+            let _ = chunk_n;
+            Some((core_start, core_end, buf_start, prange, out))
+        })
     };
 
     let merge_chunk = |_c: usize, result: Option<(usize, usize, usize, std::ops::Range<usize>, super::iterate::GibbsOutput)>| {
@@ -1458,12 +1796,7 @@ fn run_chunked_gibbs(
             }
         }
     };
-    let n_ref = srp.metadata.n_haps;
-    let chunk_sites: Vec<_> = plan.iter().map(|r| {
-        r.as_ref().map_or(0, |(core, buffer)| buffer.len() + passengers.map_or(0, |(p, _)| p.of_core(core).len()))
-    }).collect();
     if let Some(memory) = &memory {
-        let costs: Vec<_> = chunk_sites.iter().map(|&sites| chunk_state_bytes(sites, n_ref, n_samples)).collect();
         super::memory::run_chunks(&costs, memory, threads, process_chunk, merge_chunk);
     } else {
         let cap = |k: usize| if k == 0 { n_ref } else { k.min(n_ref) };
@@ -1513,6 +1846,63 @@ mod tests {
             assert_eq!((d.seed_or_default(), d.ne, d.epsilon, d.rare_maf), (run.seed_or_default(), run.ne, run.epsilon, run.rare_maf));
             assert_eq!((d.pbwt_depth, d.pbwt_modulo_cm, d.chunk_core_cm(), d.chunk_buffer_cm()),
                 (run.pbwt_depth, run.pbwt_modulo_cm, run.chunk_core_cm(), run.chunk_buffer_cm()));
+        }
+    }
+
+    /// `LCWGS_SPLIT_ITERS`: a deep-pass schedule of its own changes only the
+    /// schedule (with or without its own depth); the run's own schedule is no
+    /// override.
+    #[test]
+    fn deep_pass_schedule() {
+        let run = LcwgsParams { kpbwt: 4986, n_iterations: 30, n_main_iterations: 25, ..Default::default() };
+        assert!(deep_pass_params_with(&run, None, None).is_none());
+        assert!(deep_pass_params_with(&run, None, Some((30, 25))).is_none());
+        assert!(deep_pass_params_with(&run, Some(4986), Some((30, 25))).is_none());
+        let d = deep_pass_params_with(&run, None, Some((20, 15))).expect("a schedule of its own");
+        assert_eq!((d.kpbwt, d.n_iterations, d.n_main_iterations), (4986, 20, 15));
+        let d = deep_pass_params_with(&run, Some(2000), Some((20, 15))).expect("both");
+        assert_eq!((d.kpbwt, d.n_iterations, d.n_main_iterations), (2000, 20, 15));
+        let d = deep_pass_params_with(&run, Some(2000), None).expect("depth only");
+        assert_eq!((d.kpbwt, d.n_iterations, d.n_main_iterations), (2000, 30, 25));
+        assert_eq!((d.seed_or_default(), d.ne, d.rare_maf), (run.seed_or_default(), run.ne, run.rare_maf));
+    }
+
+    /// `LCWGS_SPLIT_ITERS` parsing and the per-site source of a SPLIT chunk: the
+    /// band is the deep pass's whatever the blend; the blend only below its MAF.
+    #[test]
+    fn split_iters_and_site_source() {
+        assert_eq!(parse_split_iters("20,15"), Some((20, 15)));
+        assert_eq!(parse_split_iters(" 30 , 25 "), Some((30, 25)));
+        assert_eq!(parse_split_iters("5,5"), Some((5, 5)));
+        for bad in ["", "20", "15,20", "20,0", "20,15,1", "a,b", "20,x", "-1,1", "20,garbage,15", "20,,15", "20,15,", ",20,15"] {
+            assert_eq!(parse_split_iters(bad), None, "{bad:?}");
+        }
+        let (lo, hi) = (0.005, 0.1);
+        for blend in [None, Some(0.005), Some(0.05)] {
+            assert_eq!(split_source(0.005, lo, hi, blend), SplitSource::Deep);
+            assert_eq!(split_source(0.0999, lo, hi, blend), SplitSource::Deep);
+            assert_eq!(split_source(0.1, lo, hi, blend), SplitSource::Main);
+            assert_eq!(split_source(0.3, lo, hi, blend), SplitSource::Main);
+            let below = if blend.is_some() { SplitSource::Mean } else { SplitSource::Main };
+            assert_eq!(split_source(0.0, lo, hi, blend), below);
+            assert_eq!(split_source(0.0049, lo, hi, blend), below);
+        }
+        assert_eq!(split_source(0.002, lo, hi, Some(0.001)), SplitSource::Main);
+    }
+
+    /// The opt-in blend is the mean of the two passes; a concurrent SPLIT charges
+    /// the second chain's state and nothing else changes for one chain.
+    #[test]
+    fn split_blend_and_chain_charge() {
+        let (mut d, mut g) = (vec![0.2f32, 1.8], vec![0.8f32, 0.2, 0.0, 0.0, 0.2, 0.8]);
+        blend_rows(&mut d, &mut g, &[0.6, 1.0], &[0.4, 0.6, 0.0, 0.0, 1.0, 0.0]);
+        assert_eq!(d, vec![0.4, 1.4]);
+        assert_eq!(g, vec![0.6, 0.4, 0.0, 0.0, 0.6, 0.4]);
+        for (sites, n_ref, samples) in [(1000usize, 4796usize, 1usize), (832_681, 75_552, 1), (500, 40, 6)] {
+            let one = chunk_state_bytes(sites, n_ref, samples);
+            assert_eq!(chunk_state_bytes_chains(sites, n_ref, samples, 1), one);
+            let two = chunk_state_bytes_chains(sites, n_ref, samples, 2);
+            assert_eq!(two - one, sites * (256 + samples * 128) + n_ref * 128);
         }
     }
 
@@ -1744,7 +2134,7 @@ mod tests {
             let costs: Vec<_> = inputs.iter().map(|(_, cm, _)| chunk_state_bytes(cm.len(), 40, ns)).collect();
             let process = |c: usize, execution: SampleExecution<'_>| {
                 let (bm, cm, gl) = &inputs[c];
-                let out = super::super::iterate::run_gibbs_ensemble_with_memory(gl, bm, cm, ns, &params, None, None, execution, None, None);
+                let out = super::super::iterate::run_gibbs_ensemble_with_memory(gl, bm, cm, ns, &params, None, None, execution, None, None, None);
                 (out.dosage.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                  out.gp.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
             };

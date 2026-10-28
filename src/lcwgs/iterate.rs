@@ -51,6 +51,17 @@ struct SampleScratch {
 #[derive(Default)]
 struct HapScratch { hl: Vec<f32>, cm: Vec<f64>, rmult: Vec<f32> }
 
+/// Where a haplotype's forward-backward reads its conditioning pack from.
+#[derive(Clone, Copy)]
+enum Packed {
+    /// No pack (the kernel reads the panel).
+    No,
+    /// Its own pack, assembled in the task's buffer.
+    Own,
+    /// The sample's shared prefix: the haplotype's whole set over the shared axis.
+    Base,
+}
+
 /// Time spent in the fused per-sample re-phasing, SUMMED over threads
 /// (`LCWGS_TIMING` only) — the phase now runs inside the parallel per-sample
 /// task, so it has no separate wall-clock share of its own; `hmm` is that
@@ -756,12 +767,14 @@ pub fn run_gibbs(
     k_max_override: Option<usize>,
     precomputed_cond: Option<&Vec<Vec<u32>>>,
 ) -> GibbsOutput {
-    run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, SampleExecution::Unbudgeted, None, None)
+    run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, SampleExecution::Unbudgeted, None, None, None)
 }
 
 // Test seam: the k_max cut a test thread's Gibbs runs use instead of the env.
 #[cfg(test)]
 thread_local! {
+    /// `LCWGS_SELECT_EVERY` of a test thread's Gibbs runs.
+    static SELECT_EVERY_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static KMAX_CUT_TEST: std::cell::Cell<Option<super::kmax_cut::KmaxCut>> = const { std::cell::Cell::new(None) };
     /// Each iteration's (selection base, augmented set) per haplotype, while KMAX_CUT_TEST is set.
     #[allow(clippy::type_complexity)]
@@ -784,6 +797,7 @@ fn run_gibbs_with_memory(
     execution: SampleExecution<'_>,
     panel: Option<&PanelSide>,
     passengers: Option<&ChunkPassengers<'_>>,
+    hub: Option<crate::sparse_ls::haplotype_set::HubMember>,
 ) -> GibbsOutput {
     let memory = execution.permits();
     let n_var = cm.len();
@@ -867,8 +881,13 @@ fn run_gibbs_with_memory(
         let new_cut = cfg.rare_carrier && cfg.kmax_cut.applies(bound, cfg.k_max);
         f.set_keep_priority_order(new_cut || (cfg.rare_carrier && cfg.k_max.is_some_and(|k| kpbwt_eff > k)));
         f.set_g2_fill_order(new_cut && cfg.kmax_cut.priority);
+        // The other pass of a SPLIT chunk sweeping the same panel at the same
+        // time (see `SweepHub`): each segment is decoded once for both.
+        if let Some(member) = hub { f.set_hub(member); }
         Some(f)
     } else {
+        // No faithful selector: this chain never sweeps (leaves the hub on drop).
+        drop(hub);
         None
     };
     setup_lap(&mut setup_clock, &mut setup_log, "select-build");
@@ -1035,6 +1054,13 @@ fn run_gibbs_with_memory(
     // hets, and the largest segment+flat-het scratch in bytes.
     let phase_shape: [AtomicU64; 5] = Default::default();
 
+    // Faithful selection cadence (opt-in `LCWGS_SELECT_EVERY`, default 1 = every
+    // iteration): every burn-in iteration, then every r-th main iteration.
+    let select_every = select_every();
+    #[cfg(test)]
+    let select_every = SELECT_EVERY_TEST.with(|c| c.get()).unwrap_or(select_every);
+    let select_due = |it: usize| selection_due(it, n_burnin, select_every);
+    let last_select = (0..params.n_iterations).rev().find(|&it| select_due(it));
     for it in 0..params.n_iterations {
         // 1. Sparse PBWT selection from the current sampled hap alleles.
         let recompute = it == 0 || it == n_burnin || it % refresh == 0;
@@ -1051,8 +1077,11 @@ fn run_gibbs_with_memory(
                 // FAITHFUL GLIMPSE2 selection: re-run EVERY iteration (GLIMPSE2
                 // re-selects per iteration), feeding it the hybrid's current
                 // sampled haps. Produces the SAME Vec<Vec<u32>> shape (per target
-                // hap) the downstream rare-carrier aug + HMM consume.
-                cond_cache = fsel.select(&hap_alleles);
+                // hap) the downstream rare-carrier aug + HMM consume. Opt-in
+                // `LCWGS_SELECT_EVERY=r`: in the main iterations only every r-th
+                // re-selects (the others keep the last set).
+                if select_due(it) { cond_cache = fsel.select(&hap_alleles); }
+                if Some(it) == last_select { fsel.leave_hub(); }
             } else if recompute {
                 cond_cache = select_conditioning_haps(
                     &hap_alleles, ref_bm, cm,
@@ -1203,16 +1232,20 @@ fn run_gibbs_with_memory(
                 // Pack one hap's full conditioning set over its FB axis (prefix
                 // copied from `base`, tail gathered). Returns false when nothing
                 // is to be packed (no sharing, or an empty poly axis).
-                let pack_for = |c: &[u32], sp: Option<&PolySplit>, base: &BasePack, hp: &mut Vec<u64>| -> bool {
-                    if !share { return false; }
+                // `Base` when the haplotype's whole set is the shared prefix over
+                // the shared axis (both haplotypes of the sample condition on the
+                // same set: `base` holds exactly the words of its pack).
+                let pack_for = |c: &[u32], sp: Option<&PolySplit>, base: &BasePack, hp: &mut Vec<u64>| -> Packed {
+                    if !share { return Packed::No; }
                     let (ps, n) = match sp {
                         Some(x) => (Some(x.poly.as_slice()), x.poly.len()),
                         None => (None, n_var),
                     };
-                    if n == 0 { return false; }
+                    if n == 0 { return Packed::No; }
+                    if b > 0 && b == c.len() && base.words.len() == n * base.wb { return Packed::Base; }
                     super::hmm::pack_cond_rows_with_parallelism(
                         ref_bm, c, ps, n, if b > 0 { Some(base) } else { None }, hp, parallel_rows);
-                    true
+                    Packed::Own
                 };
                 // The passengers' pass reads this haplotype's main-pass axis and
                 // partner allele, and writes nothing the chain reads.
@@ -1224,7 +1257,9 @@ fn run_gibbs_with_memory(
                         sp.map(|x| x.poly.as_slice()), band, pass.unwrap(), pass_model.as_ref().unwrap(), two_pass, mp))
                 };
                 let fb0 = |hp: &mut Vec<u64>| {
-                    let packed = pack_for(c0, split0, &base, hp);
+                    let pack = match pack_for(c0, split0, &base, hp) {
+                        Packed::No => None, Packed::Own => Some(hp.as_slice()), Packed::Base => Some(base.words.as_slice()),
+                    };
                     let (d, smp) = run_one_hap(
                         h0i, it, seed,
                         |v| prev_alleles[v * n_target_haps + h1i] as usize,
@@ -1232,13 +1267,14 @@ fn run_gibbs_with_memory(
                         use_scaffold, &common_idx, n_var,
                         split0.map(|x| (x, ic_all, ps_mono_alt.as_slice())),
                         full_axis_rmult.as_deref(),
-                        if packed { Some(hp.as_slice()) } else { None }, two_pass);
-                    let pd = pass_fb(h0i, &|v| prev_alleles[v * n_target_haps + h1i] as usize, c0, split0,
-                        packed.then_some(hp.as_slice()));
+                        pack, two_pass);
+                    let pd = pass_fb(h0i, &|v| prev_alleles[v * n_target_haps + h1i] as usize, c0, split0, pack);
                     (d, smp, pd)
                 };
                 let fb1 = |fresh: Option<&[u8]>, hp: &mut Vec<u64>| {
-                    let packed = pack_for(c1, split1, &base, hp);
+                    let pack = match pack_for(c1, split1, &base, hp) {
+                        Packed::No => None, Packed::Own => Some(hp.as_slice()), Packed::Base => Some(base.words.as_slice()),
+                    };
                     let (d, smp) = run_one_hap(
                         h1i, it, seed,
                         |v| fresh.map_or(prev_alleles[v * n_target_haps + h0i], |a| a[v]) as usize,
@@ -1246,9 +1282,8 @@ fn run_gibbs_with_memory(
                         use_scaffold, &common_idx, n_var,
                         split1.map(|x| (x, ic_all, ps_mono_alt.as_slice())),
                         full_axis_rmult.as_deref(),
-                        if packed { Some(hp.as_slice()) } else { None }, two_pass);
-                    let pd = pass_fb(h1i, &|v| fresh.map_or(prev_alleles[v * n_target_haps + h0i], |a| a[v]) as usize, c1, split1,
-                        packed.then_some(hp.as_slice()));
+                        pack, two_pass);
+                    let pd = pass_fb(h1i, &|v| fresh.map_or(prev_alleles[v * n_target_haps + h0i], |a| a[v]) as usize, c1, split1, pack);
                     (d, smp, pd)
                 };
                 let extra = if !is_main && !gs && rayon::current_num_threads() > 1 {
@@ -1267,11 +1302,14 @@ fn run_gibbs_with_memory(
                     let second = fb1(gs.then_some(first.1.as_slice()), &mut hp);
                     (first, second)
                 };
-                (results, if memory.is_none() { Some(base) } else { None })
+                // The shared prefix is kept for the phaser (also on the admitted
+                // path, where its permit charges a complete pack it then need
+                // not build).
+                (results, Some(base))
             };
             // Only the admitted path waits for phaser memory. Whole-sample
             // tasks keep the shared prefix, but release the full FB pack here.
-            let (((d0, mut samp0, pd0), (d1, mut samp1, pd1)), retained_base) = match memory {
+            let (((d0, mut samp0, pd0), (d1, mut samp1, pd1)), mut retained_base) = match memory {
                 Some(m) => m.run(super::memory::fb_bytes(n_var + pass_sites, c0.len().max(c1.len()))
                     + two_pass_bytes(c0.len().max(c1.len())), fb),
                 None => fb(),
@@ -1327,16 +1365,25 @@ fn run_gibbs_with_memory(
                         super::memory::phase_bytes(n_var, cond_haps.len(), snapshots)
                             + super::memory::two_pass_phase_bytes(poly_ref.len(), cond_haps.len())
                     });
-                    let mut phase = || {
+                    let mut phase = |retained: Option<&BasePack>| {
                         let mut base = BasePack::new();
-                        let phase_base = if let Some(m) = memory {
-                            // A complete pack is charged alongside snapshots.
-                            let sites: Vec<usize> = poly_ref.iter().map(|&v| v as usize).collect();
-                            base.build_rows(ref_bm, cond_haps, &sites, n_var, m.parallel_rows());
-                            (!cond_haps.is_empty()).then_some(&base)
-                        } else {
-                            retained_base.as_ref().filter(|bp| bp.b > 0
-                                && cond_haps.len() >= bp.b && cond_haps[..bp.b] == c0[..bp.b])
+                        // The forward-backward's shared prefix when it is the
+                        // phaser's (the phaser gathers the rest; the same bits).
+                        // On the admitted path only when it holds most of the
+                        // states: the phaser gathers the tail at every pass,
+                        // a complete pack only once.
+                        let retained = retained.filter(|bp| bp.b > 0
+                            && cond_haps.len() >= bp.b && cond_haps[..bp.b] == c0[..bp.b]
+                            && (memory.is_none() || 2 * bp.b > cond_haps.len()));
+                        let phase_base = match (retained, memory) {
+                            (Some(bp), _) => Some(bp),
+                            (None, Some(m)) => {
+                                // A complete pack is charged alongside snapshots.
+                                let sites: Vec<usize> = poly_ref.iter().map(|&v| v as usize).collect();
+                                base.build_rows(ref_bm, cond_haps, &sites, n_var, m.parallel_rows());
+                                (!cond_haps.is_empty()).then_some(&base)
+                            }
+                            (None, None) => None,
                         };
                         let mut hmm = crate::lcwgs::phasing_hmm::PhasingHmm::new(&g2p);
                         hmm.set_two_pass(two_pass);
@@ -1355,8 +1402,19 @@ fn run_gibbs_with_memory(
                         }
                     };
                     match memory {
-                        Some(m) => m.run(phase_bytes.unwrap(), phase),
-                        None => phase(),
+                        Some(m) => {
+                            let bytes = phase_bytes.unwrap();
+                            match m.try_permit(bytes) {
+                                Some(permit) => m.run_with(permit, || phase(retained_base.as_ref())),
+                                None => {
+                                    // The phaser waits for memory: the retained prefix
+                                    // is not held outside a permit meanwhile.
+                                    drop(retained_base.take());
+                                    m.run(bytes, || phase(None))
+                                }
+                            }
+                        }
+                        None => phase(retained_base.as_ref()),
                     }
             }
             [(h0i, d0, samp0, pd0), (h1i, d1, samp1, pd1)]
@@ -1626,9 +1684,28 @@ pub(crate) fn run_gibbs_ensemble_with_memory(
     execution: SampleExecution<'_>,
     panel: Option<&PanelSide>,
     passengers: Option<&ChunkPassengers<'_>>,
+    hub: Option<crate::sparse_ls::haplotype_set::HubMember>,
 ) -> GibbsOutput {
-    let n_restarts = crate::config::usize_or("LCWGS_GIBBS_RESTARTS", 1).max(1);
-    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, execution, panel, passengers)
+    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, gibbs_restarts(), execution, panel, passengers, hub)
+}
+
+/// Restarts of the Gibbs chain (`LCWGS_GIBBS_RESTARTS`, default 1).
+pub(crate) fn gibbs_restarts() -> usize {
+    crate::config::usize_or("LCWGS_GIBBS_RESTARTS", 1).max(1)
+}
+
+/// Whether iteration `it` re-runs the faithful selection: every burn-in
+/// iteration (the first is INIT), then every `every`-th main iteration.
+pub(crate) fn selection_due(it: usize, n_burnin: usize, every: usize) -> bool {
+    it < n_burnin || (it - n_burnin).is_multiple_of(every.max(1))
+}
+
+/// `LCWGS_SELECT_EVERY` (opt-in; unset, unparsable or 0 = 1, every iteration):
+/// the faithful selection re-runs at every burn-in iteration and at every r-th
+/// main iteration; the iterations between keep the last selected set (the
+/// rare-carrier augmentation still follows the current haplotypes).
+pub(crate) fn select_every() -> usize {
+    crate::config::usize_opt("LCWGS_SELECT_EVERY").filter(|&r| r >= 1).unwrap_or(1)
 }
 
 /// Inner ensemble with an explicit restart count (the env-read entry point
@@ -1646,7 +1723,7 @@ pub(crate) fn run_gibbs_ensemble_n(
     precomputed_cond: Option<&Vec<Vec<u32>>>,
     n_restarts: usize,
 ) -> GibbsOutput {
-    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, SampleExecution::Unbudgeted, None, None)
+    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, SampleExecution::Unbudgeted, None, None, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1662,11 +1739,14 @@ fn run_gibbs_ensemble_inner(
     execution: SampleExecution<'_>,
     panel: Option<&PanelSide>,
     passengers: Option<&ChunkPassengers<'_>>,
+    hub: Option<crate::sparse_ls::haplotype_set::HubMember>,
 ) -> GibbsOutput {
     let n_restarts = n_restarts.max(1);
     if n_restarts == 1 {
-        return run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, execution, panel, passengers);
+        return run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, execution, panel, passengers, hub);
     }
+    // Sequential restarts do not sweep with another chain.
+    drop(hub);
     let base = params.seed_or_default();
     let mut acc_d: Vec<f64> = Vec::new();
     let mut acc_g: Vec<f64> = Vec::new();
@@ -1674,7 +1754,7 @@ fn run_gibbs_ensemble_inner(
     for i in 0..n_restarts {
         let mut p = params.clone();
         p.seed = base.wrapping_add(i as u64);
-        let out = run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, &p, k_max_override, precomputed_cond, execution, panel, passengers);
+        let out = run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, &p, k_max_override, precomputed_cond, execution, panel, passengers, None);
         if acc_d.is_empty() {
             acc_d = vec![0.0f64; out.dosage.len()];
             acc_g = vec![0.0f64; out.gp.len()];
@@ -2365,6 +2445,99 @@ mod tests {
         (full, cm, ins, pcm, gl3)
     }
 
+    /// The two passes of a SPLIT chunk run at the same time, their selection
+    /// sweeps decoded once for both through a sweep hub (with the panel's shared
+    /// plan), give bit-identical outputs to the same passes run one after the
+    /// other: different depths, k_max and schedules (the shorter chain leaves
+    /// the hub; the other sweeps alone), with and without passengers.
+    #[test]
+    fn split_passes_through_a_sweep_hub_match_serial_passes() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        use crate::sparse_ls::haplotype_set::SweepHub;
+        let _serial = crate::lcwgs::hmm::two_pass::TASK_BLOCKS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rng = rp::Xs(0x5BE0_CD19_137E_2179);
+        for &(n_var, n_haps, n_pass, seg) in &[(900usize, 1600usize, 0usize, 4usize), (700, 2200, 60, 9), (1200, 900, 25, 128)] {
+            let (full, cm, ins, pcm, gl3) = passenger_fixture(&mut rng, n_var, n_haps, 1, n_pass, false, false);
+            let bm = HaplotypeBitmatrix::from_subset(&full, &(0..n_var + n_pass).collect::<Vec<_>>()).with_hidden_tail(n_var);
+            let panel: PanelSide = std::sync::Arc::new(super::super::faithful_select::FaithfulPanel::build_segmented_commons(
+                &bm, &cm, &LcwgsParams::default(), seg));
+            let main = LcwgsParams { n_iterations: 6, n_main_iterations: 4, kpbwt: 60, pbwt_modulo_cm: 0.004, ..Default::default() };
+            let deep = LcwgsParams { n_iterations: 5, n_main_iterations: 3, kpbwt: 30, ..main.clone() };
+            let pass = ChunkPassengers { ins: ins.clone(), cm: &pcm };
+            let pass = (n_pass > 0).then_some(&pass);
+            let budget = super::super::memory::MemoryBudget::new(512 * 1024 * 1024, 1024);
+            let exec = SampleExecution::Admitted(&budget);
+            let run = |p: &LcwgsParams, k: Option<usize>, hub| run_gibbs_with_memory(&gl3, &bm, &cm, 1, p, k, None, exec, Some(&panel), pass, hub);
+            let serial = (run(&main, None, None), run(&deep, Some(80), None));
+            let together = std::thread::scope(|scope| {
+                let mut members = SweepHub::members(2).into_iter();
+                let (a, b) = (members.next(), members.next());
+                let d = scope.spawn(|| run(&deep, Some(80), b));
+                let m = run(&main, None, a);
+                (m, d.join().unwrap())
+            });
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            for (name, x, y) in [("main", &serial.0, &together.0), ("deep", &serial.1, &together.1)] {
+                assert_eq!(bits(&x.dosage), bits(&y.dosage), "{name} dosage n_var={n_var} seg={seg}");
+                assert_eq!(bits(&x.gp), bits(&y.gp), "{name} gp n_var={n_var} seg={seg}");
+                assert_eq!(bits(&x.pass_dosage), bits(&y.pass_dosage), "{name} passenger dosage n_var={n_var}");
+                assert_eq!(bits(&x.pass_gp), bits(&y.pass_gp), "{name} passenger gp n_var={n_var}");
+            }
+            assert_ne!(bits(&serial.0.dosage), bits(&serial.1.dosage), "the two passes differ");
+            // The panel's plan reproduces a chain that records its own.
+            let own = run_gibbs_with_memory(&gl3, &bm, &cm, 1, &main, None, None, exec, None, pass, None);
+            assert_eq!(bits(&own.dosage), bits(&serial.0.dosage), "own plan n_var={n_var}");
+            assert_eq!(bits(&own.gp), bits(&serial.0.gp), "own plan n_var={n_var}");
+        }
+    }
+
+    /// `LCWGS_SELECT_EVERY`: r = 1 is the default schedule exactly; r = 2
+    /// re-selects only on every other main iteration (another output), and two
+    /// such chains sweeping through a hub still match the same chains run one
+    /// after the other.
+    #[test]
+    fn select_every_schedule() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        use crate::sparse_ls::haplotype_set::SweepHub;
+        assert!((0..5).all(|it| selection_due(it, 5, 3)));
+        assert_eq!((5..12).filter(|&it| selection_due(it, 5, 3)).collect::<Vec<_>>(), vec![5, 8, 11]);
+        assert!((0..30).all(|it| selection_due(it, 5, 1) && selection_due(it, 5, 0)));
+        assert!(selection_due(0, 0, 4) && !selection_due(1, 0, 4) && selection_due(4, 0, 4));
+        let _serial = crate::lcwgs::hmm::two_pass::TASK_BLOCKS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rng = rp::Xs(0x6A09_E667_BB67_AE85);
+        let (full, cm, _, _, gl3) = passenger_fixture(&mut rng, 900, 1700, 1, 0, false, false);
+        let bm = HaplotypeBitmatrix::from_subset(&full, &(0..900).collect::<Vec<_>>());
+        let panel: PanelSide = std::sync::Arc::new(super::super::faithful_select::FaithfulPanel::build_segmented_commons(
+            &bm, &cm, &LcwgsParams::default(), 5));
+        let main = LcwgsParams { n_iterations: 8, n_main_iterations: 5, kpbwt: 60, pbwt_modulo_cm: 0.004, ..Default::default() };
+        let deep = LcwgsParams { kpbwt: 30, ..main.clone() };
+        let budget = super::super::memory::MemoryBudget::new(512 * 1024 * 1024, 1024);
+        let exec = SampleExecution::Admitted(&budget);
+        let run = |p: &LcwgsParams, every: Option<usize>, hub| {
+            SELECT_EVERY_TEST.with(|c| c.set(every));
+            let out = run_gibbs_with_memory(&gl3, &bm, &cm, 1, p, None, None, exec, Some(&panel), None, hub);
+            SELECT_EVERY_TEST.with(|c| c.set(None));
+            out
+        };
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let default = run(&main, None, None);
+        assert_eq!(bits(&run(&main, Some(1), None).dosage), bits(&default.dosage));
+        let every2 = run(&main, Some(2), None);
+        assert_ne!(bits(&every2.dosage), bits(&default.dosage), "r = 2 changes the chain");
+        let deep2 = run(&deep, Some(2), None);
+        let together = std::thread::scope(|scope| {
+            let mut members = SweepHub::members(2).into_iter();
+            let (a, b) = (members.next(), members.next());
+            let d = scope.spawn(|| run(&deep, Some(2), b));
+            let m = run(&main, Some(2), a);
+            (m, d.join().unwrap())
+        });
+        assert_eq!(bits(&together.0.dosage), bits(&every2.dosage));
+        assert_eq!(bits(&together.0.gp), bits(&every2.gp));
+        assert_eq!(bits(&together.1.dosage), bits(&deep2.dosage));
+        assert_eq!(bits(&together.1.gp), bits(&deep2.gp));
+    }
+
     /// Impute-only passengers move no output of the chain: SNP dosage and GP are
     /// bit-identical to the same chain run without them (unbudgeted and admitted
     /// executions, one and several samples, rare passengers on a 5,000-haplotype
@@ -2389,10 +2562,10 @@ mod tests {
             for admitted in [false, true] {
                 let budget = super::super::memory::MemoryBudget::new(256 * 1024 * 1024, 1024);
                 let exec = || if admitted && n_samples == 1 { SampleExecution::Admitted(&budget) } else { SampleExecution::Unbudgeted };
-                let base = run_gibbs_with_memory(&gl3, &active, &cm, n_samples, &params, None, None, exec(), None, None);
+                let base = run_gibbs_with_memory(&gl3, &active, &cm, n_samples, &params, None, None, exec(), None, None, None);
                 assert!(base.pass_dosage.is_empty() && base.pass_gp.is_empty());
                 let pass = ChunkPassengers { ins: ins.clone(), cm: &pcm };
-                let out = run_gibbs_with_memory(&gl3, &hidden, &cm, n_samples, &params, None, None, exec(), None, Some(&pass));
+                let out = run_gibbs_with_memory(&gl3, &hidden, &cm, n_samples, &params, None, None, exec(), None, Some(&pass), None);
                 assert_eq!(bits(&out.dosage), bits(&base.dosage), "dosage n_var={n_var} samples={n_samples} admitted={admitted}");
                 assert_eq!(bits(&out.gp), bits(&base.gp), "gp n_var={n_var} samples={n_samples} admitted={admitted}");
                 assert_eq!(out.pass_dosage.len(), n_pass * n_samples);
