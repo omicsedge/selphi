@@ -30,6 +30,8 @@ const LOOKAHEAD: usize = 3;
 const DECODERS: usize = 3;
 /// Runs of a full column up to this length are copied as one fixed-size block.
 const SHORT_RUN: usize = 16;
+/// A decoded segment keeps every this-many-th column output in full (see [`Node`]).
+const CHECKPOINT_EVERY: usize = 8;
 
 /// The panel-side state of the sequential sweep on entering site `k`.
 struct SegmentStart {
@@ -87,13 +89,18 @@ impl SegmentPlan {
     }
 
     /// Bytes a plan and its decoded segments in flight hold for a chunk of
-    /// `sites` sites over `n_ref` haplotypes (at most one boundary array per
-    /// `SEGMENT_COMMONS` sites; each segment at most two arrays per site).
+    /// `sites` sites over `n_ref` haplotypes, for segments of `SEGMENT_COMMONS`
+    /// common columns. An estimate, not a bound: a segment ends only at a quiet
+    /// boundary (two consecutive common sites), so it can hold more columns, and
+    /// its spliced small arrays (`tails`) are charged at a nominal 1,024
+    /// entries per column.
     pub fn bytes(sites: usize, n_ref: usize) -> usize {
         let in_flight = LOOKAHEAD + 1;
-        let arrays = sites / SEGMENT_COMMONS + 1 + in_flight * 2 * SEGMENT_COMMONS;
+        // Boundary arrays, and per decoded segment its kept arrays and the two
+        // arrays its decoder carries (see `Node`).
+        let arrays = sites / SEGMENT_COMMONS + 1 + in_flight * (SEGMENT_COMMONS.div_ceil(CHECKPOINT_EVERY) + 2);
         let id = if narrow(n_ref) { 2 } else { 4 };
-        arrays * n_ref * id + in_flight * SEGMENT_COMMONS * (n_ref / 8 + 64)
+        arrays * n_ref * id + in_flight * SEGMENT_COMMONS * (words(n_ref) * 12 + 64 + 1024 * 4)
     }
 
     /// Whether the plan splits the sweep at all.
@@ -163,32 +170,143 @@ impl Default for SegmentPlan {
 
 /// What a decoded segment holds for each site of its range, in site order.
 enum Item {
-    /// The big array after the splice that precedes a common column.
+    /// The big array after the splice that precedes a common column (a node).
     Spliced(usize),
-    /// A common column: its output big array and its occurrence bits.
+    /// A common column: its output big array (a node) and its occurrence bits.
     Common { a: usize, col: usize },
     /// A rare column: the small occurrence vector `V` (`len` entries).
     Rare { v: usize, len: usize },
 }
 
+/// How a big array of a decoded segment is obtained. The decoder holds every
+/// array in turn (the sweep's state), but keeps in full only the segment's
+/// boundary array and every `CHECKPOINT_EVERY`-th column output: the target
+/// half reads a few entries of a few arrays (its harvest windows), and an
+/// entry of any other array is traced back through the columns' occurrence
+/// bits and the splices to the nearest kept array. The entries are the same.
+#[derive(Clone, Copy)]
+enum Node {
+    /// The segment's boundary array (the plan's).
+    Boundary,
+    /// A kept array: slot in `big`.
+    Kept(usize),
+    /// A common column's output: the stable split of `parent` by the column's
+    /// symbols (`cref` zeros first).
+    Column { parent: u32, col: u32, cref: u32 },
+    /// init_common's splice of `parent`: its entries outside the small
+    /// positions `A_small_idx[l_hq]`, then the evolved small array (`tails`
+    /// from `tail`, one entry per small position).
+    Splice { parent: u32, l_hq: u32, tail: u32 },
+}
+
 /// One decoded segment.
 struct Decoded<H> {
-    /// Big arrays, `n_ref` entries each.
+    /// Kept big arrays, `n_ref` entries each.
     big: Vec<H>,
+    nodes: Vec<Node>,
+    /// The small arrays spliced back, as haplotype ids.
+    tails: Vec<i32>,
     /// Per common column: `words` occurrence words (bit i = symbol of input
     /// position i is 1) and the ones before each word.
     bits: Vec<u64>,
     ones: Vec<u32>,
     small_v: Vec<i32>,
     items: Vec<Item>,
-    /// Decoder scratch: the rare-run sub-array.
+    /// Decoder scratch: the current and next big array, the rare-run sub-array.
+    cur: Vec<H>,
+    next: Vec<H>,
     small_a: Vec<i32>,
     small_b: Vec<i32>,
 }
 
-impl<H: Hap> Decoded<H> {
+/// A big array of a decoded segment, read entry by entry (see [`Node`]).
+struct SegArray<'a, H, R> {
+    seg: &'a Decoded<H>,
+    rhs: &'a R,
+    boundary: &'a [H],
+    node: usize,
+    n_ref: usize,
+}
+
+impl<H: Hap, R: RefHapSet> HapArray for SegArray<'_, H, R> {
     #[inline]
-    fn big(&self, at: usize, n_ref: usize) -> &[H] { &self.big[at * n_ref..(at + 1) * n_ref] }
+    fn len(&self) -> usize { self.n_ref }
+
+    fn at(&self, i: usize) -> i32 {
+        let seg = self.seg;
+        let nw = words(self.n_ref);
+        let (mut node, mut p) = (self.node, i);
+        loop {
+            match seg.nodes[node] {
+                Node::Boundary => return self.boundary[p].into(),
+                Node::Kept(slot) => return seg.big[slot * self.n_ref + p].into(),
+                Node::Column { parent, col, cref } => {
+                    let c = col as usize;
+                    let (bits, ones) = (&seg.bits[c * nw..(c + 1) * nw], &seg.ones[c * nw..(c + 1) * nw]);
+                    p = if p < cref as usize { select_zero(bits, ones, p) } else { select_one(bits, ones, p - cref as usize) };
+                    node = parent as usize;
+                }
+                Node::Splice { parent, l_hq, tail } => {
+                    let small = self.rhs.a_small_idx(l_hq as usize);
+                    let kept = self.n_ref - small.len();
+                    if p >= kept { return seg.tails[tail as usize + p - kept]; }
+                    p = nth_outside(small, p);
+                    node = parent as usize;
+                }
+            }
+        }
+    }
+}
+
+/// Position of the `r`-th (0-based) set bit of `x`.
+#[inline]
+fn select64(x: u64, r: usize) -> usize {
+    let (mut x, mut r, mut base) = (x, r as u32, 0usize);
+    loop {
+        let c = (x & 0xFF).count_ones();
+        if r < c { break; }
+        r -= c;
+        x >>= 8;
+        base += 8;
+    }
+    let mut b = x & 0xFF;
+    for _ in 0..r { b &= b - 1; }
+    base + b.trailing_zeros() as usize
+}
+
+/// Input position of the `r`-th symbol-1 entry of a column (its bits and the
+/// ones before each word).
+#[inline]
+fn select_one(bits: &[u64], ones: &[u32], r: usize) -> usize {
+    let w = ones.partition_point(|&o| o as usize <= r) - 1;
+    w * 64 + select64(bits[w], r - ones[w] as usize)
+}
+
+/// Input position of the `r`-th symbol-0 entry (padding past `n_ref` comes
+/// after every real entry, so a valid rank never lands there).
+#[inline]
+fn select_zero(bits: &[u64], ones: &[u32], r: usize) -> usize {
+    // Zeros before word w: 64 w - ones[w], non-decreasing in w.
+    let w = partition_point_by(ones.len(), |w| w * 64 - ones[w] as usize <= r) - 1;
+    w * 64 + select64(!bits[w], r - (w * 64 - ones[w] as usize))
+}
+
+/// The first index in `0..n` where `pred` is false (`pred` true, then false).
+#[inline]
+fn partition_point_by(n: usize, pred: impl Fn(usize) -> bool) -> usize {
+    let (mut lo, mut hi) = (0usize, n);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if pred(mid) { lo = mid + 1; } else { hi = mid; }
+    }
+    lo
+}
+
+/// The `q`-th (0-based) position outside `small` (strictly ascending): `q` plus
+/// the number of small positions before it (`small[j] - j` does not decrease).
+#[inline]
+fn nth_outside(small: &[i32], q: usize) -> usize {
+    q + partition_point_by(small.len(), |j| small[j] as usize - j <= q)
 }
 
 /// Occurrence words per common column.
@@ -218,8 +336,8 @@ fn set_bits(bits: &mut [u64], lo: usize, hi: usize) {
 
 impl<H> Decoded<H> {
     fn new() -> Self {
-        Decoded { big: Vec::new(), bits: Vec::new(), ones: Vec::new(), small_v: Vec::new(), items: Vec::new(),
-            small_a: Vec::new(), small_b: Vec::new() }
+        Decoded { big: Vec::new(), nodes: Vec::new(), tails: Vec::new(), bits: Vec::new(), ones: Vec::new(),
+            small_v: Vec::new(), items: Vec::new(), cur: Vec::new(), next: Vec::new(), small_a: Vec::new(), small_b: Vec::new() }
     }
 
     /// Storage for the plan's largest segment, so that decoder threads write
@@ -227,11 +345,15 @@ impl<H> Decoded<H> {
     fn for_plan(plan: &SegmentPlan, n_ref: usize) -> Self {
         let nw = words(n_ref);
         Decoded {
-            big: Vec::with_capacity(plan.max_big * n_ref),
+            big: Vec::with_capacity(plan.max_commons.div_ceil(CHECKPOINT_EVERY) * n_ref),
+            nodes: Vec::with_capacity(plan.max_big + 1),
+            tails: Vec::new(),
             bits: Vec::with_capacity(plan.max_commons * nw),
             ones: Vec::with_capacity(plan.max_commons * nw),
             small_v: Vec::with_capacity(plan.max_small_v),
-            items: Vec::with_capacity(plan.max_sites),
+            items: Vec::with_capacity(plan.max_sites + plan.max_big),
+            cur: Vec::with_capacity(n_ref),
+            next: Vec::with_capacity(n_ref),
             small_a: Vec::with_capacity(n_ref),
             small_b: Vec::with_capacity(n_ref),
         }
@@ -239,7 +361,9 @@ impl<H> Decoded<H> {
 }
 
 /// Decode segment `s` into `out` (whose storage is reused): the panel half of
-/// the sweep from its boundary state.
+/// the sweep from its boundary state. The decoder carries the big array
+/// itself (two scratch arrays) and keeps the arrays the target half may read
+/// as [`Node`]s.
 fn decode<R: RefHapSet, H: Hap>(rhs: &R, m: &VariantMap, plan: &SegmentPlan, p3decode: &[i32; 128], s: usize, out: &mut Decoded<H>) {
     let st = &plan.starts[s];
     let n_ref = rhs.n_ref_haps();
@@ -247,17 +371,24 @@ fn decode<R: RefHapSet, H: Hap>(rhs: &R, m: &VariantMap, plan: &SegmentPlan, p3d
     let end = plan.starts.get(s + 1).map_or(n_tot, |x| x.k);
     let y = rhs.ypacked();
     let nw = words(n_ref);
-    // Every big array is written in full before it is read.
-    if out.big.len() < st.n_big * n_ref { out.big.resize(st.n_big * n_ref, H::default()); }
-    let entry = H::boundary(st);
+    out.big.clear();
+    out.nodes.clear();
+    out.tails.clear();
     out.bits.clear();
     out.ones.clear();
     out.small_v.clear();
     out.items.clear();
+    out.nodes.push(Node::Boundary);
+    let mut cur = std::mem::take(&mut out.cur);
+    let mut next = std::mem::take(&mut out.next);
+    cur.clear();
+    cur.extend_from_slice(H::boundary(st));
+    next.resize(n_ref, H::default());
+    let mut node = 0u32; // the node `cur` is
     let mut py = st.py;
     let mut l_hq = st.l_hq;
     let mut last_k = st.k as i64 - 1;
-    let mut nb = 0usize; // big arrays written
+    let mut columns = 0usize;
     let mut small_a = std::mem::take(&mut out.small_a);
     let mut small_b = std::mem::take(&mut out.small_b);
     small_a.clear();
@@ -270,14 +401,15 @@ fn decode<R: RefHapSet, H: Hap>(rhs: &R, m: &VariantMap, plan: &SegmentPlan, p3d
             if !small_idx.is_empty() && !prev_common {
                 // init_common's splice: the big array without the small
                 // positions, then the evolved small array.
-                let (done, rest) = out.big.split_at_mut(nb * n_ref);
-                let src: &[H] = if nb == 0 { entry } else { &done[(nb - 1) * n_ref..] };
-                let dst = &mut rest[..n_ref];
-                let mut n = copy_without(&src[..n_ref], small_idx, dst);
-                for &x in &small_a { dst[n] = H::of(x); n += 1; }
+                let mut n = copy_without(&cur, small_idx, &mut next);
+                for &x in &small_a { next[n] = H::of(x); n += 1; }
                 debug_assert_eq!(n, n_ref);
-                out.items.push(Item::Spliced(nb));
-                nb += 1;
+                out.nodes.push(Node::Splice { parent: node, l_hq: u32::try_from(l_hq).expect("site index fits u32"),
+                    tail: u32::try_from(out.tails.len()).expect("a segment's spliced small arrays fit u32 offsets") });
+                out.tails.extend_from_slice(&small_a);
+                node = (out.nodes.len() - 1) as u32;
+                out.items.push(Item::Spliced(node as usize));
+                std::mem::swap(&mut cur, &mut next);
             }
             // read_full_pbwt_av: stable split of the input array by symbol.
             let ref_rac_l = m.vars[k].cref as i32;
@@ -285,9 +417,7 @@ fn decode<R: RefHapSet, H: Hap>(rhs: &R, m: &VariantMap, plan: &SegmentPlan, p3d
             out.bits.resize(out.bits.len() + nw, 0);
             out.ones.resize(out.ones.len() + nw, 0);
             let bits = &mut out.bits[col * nw..(col + 1) * nw];
-            let (done, rest) = out.big.split_at_mut(nb * n_ref);
-            let src: &[H] = if nb == 0 { entry } else { &done[(nb - 1) * n_ref..] };
-            let dst = &mut rest[..n_ref];
+            let (src, dst) = (&cur[..n_ref], &mut next[..n_ref]);
             let (mut u, mut v, mut mm0) = (0i32, ref_rac_l, 0usize);
             let zero_end = ref_rac_l as usize;
             while mm0 < n_ref {
@@ -319,16 +449,23 @@ fn decode<R: RefHapSet, H: Hap>(rhs: &R, m: &VariantMap, plan: &SegmentPlan, p3d
             let ones = &mut out.ones[col * nw..(col + 1) * nw];
             let mut acc = 0u32;
             for w in 0..nw { ones[w] = acc; acc += bits[w].count_ones(); }
-            out.items.push(Item::Common { a: nb, col });
-            nb += 1;
+            columns += 1;
+            if columns.is_multiple_of(CHECKPOINT_EVERY) {
+                out.nodes.push(Node::Kept(out.big.len() / n_ref));
+                out.big.extend_from_slice(&next);
+            } else {
+                out.nodes.push(Node::Column { parent: node, col: u32::try_from(col).expect("column fits u32"), cref: ref_rac_l as u32 });
+            }
+            node = (out.nodes.len() - 1) as u32;
+            out.items.push(Item::Common { a: node as usize, col });
+            std::mem::swap(&mut cur, &mut next);
             l_hq += 1;
         } else {
             let small_idx = rhs.a_small_idx(l_hq);
             if last_k < 0 || rhs.flag_common(last_k as usize) {
                 // init_rare: the small array is the big array at the small positions.
-                let a: &[H] = if nb == 0 { entry } else { &out.big[(nb - 1) * n_ref..nb * n_ref] };
                 small_a.clear();
-                small_a.extend(small_idx.iter().map(|&x| a[x as usize].into()));
+                small_a.extend(small_idx.iter().map(|&x| cur[x as usize].into()));
                 small_b.clear();
                 small_b.resize(small_a.len(), 0);
             }
@@ -367,8 +504,8 @@ fn decode<R: RefHapSet, H: Hap>(rhs: &R, m: &VariantMap, plan: &SegmentPlan, p3d
         }
         last_k = k as i64;
     }
-    debug_assert_eq!(nb, st.n_big);
-    (out.small_a, out.small_b) = (small_a, small_b);
+    debug_assert_eq!(out.nodes.len(), st.n_big + 1);
+    (out.small_a, out.small_b, out.cur, out.next) = (small_a, small_b, cur, next);
 }
 
 /// One sweep's decode stream: the plan's segments, each decoded once and read
@@ -726,12 +863,11 @@ impl TargetHaplotypeSet {
                 let start = &plan.starts[s];
                 let end = plan.starts.get(s + 1).map_or(n_tot, |x| x.k);
                 let mut items = seg.items.iter();
-                // Input big array of the next column (None = the boundary array).
-                let mut input: Option<usize> = None;
+                // Input big array of the next column (node 0 = the boundary array).
+                let mut input = 0usize;
                 let boundary: &[H] = H::boundary(start);
-                let big_of = |at: Option<usize>| -> &[H] {
-                    match at { None => boundary, Some(i) => seg.big(i, n_ref) }
-                };
+                let seg_ref: &Decoded<H> = &seg;
+                let big_of = |node: usize| SegArray { seg: seg_ref, rhs, boundary, node, n_ref };
                 for k in start.k..end {
                     if m.vars[k].lq {
                         l_all += rhs.flag_common(k) as usize;
@@ -741,9 +877,9 @@ impl TargetHaplotypeSet {
                     if rhs.flag_common(k) {
                         let prev_was_common = last_k >= 0 && rhs.flag_common(last_k as usize);
                         if !rhs.a_small_idx(l_hq).is_empty() && !prev_was_common {
-                            self.init_common_target(rhs, k, l_hq, prev_ref_rac_l_com, big_of(input));
+                            self.init_common_target(rhs, k, l_hq, prev_ref_rac_l_com, &big_of(input));
                             match items.next() {
-                                Some(Item::Spliced(i)) => input = Some(*i),
+                                Some(Item::Spliced(i)) => input = *i,
                                 _ => unreachable!("segment decode out of step"),
                             }
                         }
@@ -755,8 +891,8 @@ impl TargetHaplotypeSet {
                         let bits = &seg.bits[col * nw..(col + 1) * nw];
                         let ones = &seg.ones[col * nw..(col + 1) * nw];
                         self.select_common_target(rhs, k, l_hq, l_all, ref_rac_l_com, prev_ref_rac_l_com,
-                            bits, ones, big_of(input), seg.big(out_a, n_ref));
-                        input = Some(out_a);
+                            bits, ones, &big_of(input), &big_of(out_a));
+                        input = out_a;
                         prev_ref_rac_l_com = ref_rac_l_com;
                         l_all += 1;
                         l_hq += 1;
@@ -788,7 +924,7 @@ impl TargetHaplotypeSet {
     /// The target half of `init_common`: remap every target hap from the small
     /// back into the big array space, harvesting from `a` (the big array
     /// before the splice) where a small match ended.
-    fn init_common_target<R: RefHapSet, H: Hap>(&mut self, rhs: &R, k: usize, l: usize, prev_ref_rac_l_com: i32, a: &[H]) {
+    fn init_common_target<R: RefHapSet, A: HapArray + ?Sized>(&mut self, rhs: &R, k: usize, l: usize, prev_ref_rac_l_com: i32, a: &A) {
         let small_idx_list = rhs.a_small_idx(l);
         let a_small_idx_size = small_idx_list.len();
         let n_ref = rhs.n_ref_haps() as i32;
@@ -897,9 +1033,9 @@ impl TargetHaplotypeSet {
     /// The target half of `select_common_pd_fg`, reading V from the column's
     /// occurrence bits and harvesting from its input (`b`) or output (`a`) array.
     #[allow(clippy::too_many_arguments)]
-    fn select_common_target<R: RefHapSet, H: Hap>(
+    fn select_common_target<R: RefHapSet, A: HapArray + ?Sized>(
         &mut self, rhs: &R, k: usize, l_hq: usize, l_all: usize, ref_rac_l: i32, prev_ref_rac_l: i32,
-        bits: &[u64], ones: &[u32], b: &[H], a: &[H],
+        bits: &[u64], ones: &[u32], b: &A, a: &A,
     ) {
         let n_ref = rhs.n_ref_haps() as i32;
         for htr in 0..self.n_tar_haps {
@@ -1002,5 +1138,50 @@ impl TargetHaplotypeSet {
         self.pbwt_small_index[htr2] = small_idx2;
         self.f_k_small[htr2] = f_dash2;
         self.g_k_small[htr2] = g_dash2;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The trace-back primitives against direct scans: the r-th one / zero of a
+    /// column (words, ones before each word, padding past `n`), the q-th position
+    /// outside a strictly ascending set, and the r-th set bit of a word.
+    #[test]
+    fn select_and_gap_position_match_scans() {
+        use crate::lcwgs::hmm::reference_pack::Xs;
+        let mut rng = Xs(0x9E37_79B9_7F4A_7C15);
+        for x in [1u64, u64::MAX, 0x8000_0000_0000_0001, 0xF0F0_0000_0000_FF00] {
+            let set: Vec<usize> = (0..64).filter(|&b| x >> b & 1 == 1).collect();
+            for (r, &b) in set.iter().enumerate() { assert_eq!(select64(x, r), b); }
+        }
+        for n in [1usize, 63, 64, 65, 200, 4096, 75_552] {
+            for density in [0u64, 1, 2, 3] {
+                let nw = words(n);
+                let mut bits = vec![0u64; nw];
+                for i in 0..n { if rng.below(4) < density { bits[i / 64] |= 1 << (i % 64); } }
+                let mut ones = vec![0u32; nw];
+                let mut acc = 0;
+                for w in 0..nw { ones[w] = acc; acc += bits[w].count_ones(); }
+                let (mut r1, mut r0) = (0usize, 0usize);
+                for i in 0..n {
+                    if bits[i / 64] >> (i % 64) & 1 == 1 {
+                        assert_eq!(select_one(&bits, &ones, r1), i, "one n={n}");
+                        r1 += 1;
+                    } else {
+                        assert_eq!(select_zero(&bits, &ones, r0), i, "zero n={n}");
+                        r0 += 1;
+                    }
+                    assert_eq!(occ(&bits, &ones, i as i32) as usize, r1 - (bits[i / 64] >> (i % 64) & 1) as usize);
+                }
+            }
+        }
+        for _ in 0..500 {
+            let n = 1 + rng.below(500) as usize;
+            let small: Vec<i32> = (0..n as i32).filter(|_| rng.below(3) == 0).collect();
+            let outside: Vec<usize> = (0..n).filter(|i| !small.contains(&(*i as i32))).collect();
+            for (q, &p) in outside.iter().enumerate() { assert_eq!(nth_outside(&small, q), p); }
+        }
     }
 }

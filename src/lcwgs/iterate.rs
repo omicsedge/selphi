@@ -51,6 +51,17 @@ struct SampleScratch {
 #[derive(Default)]
 struct HapScratch { hl: Vec<f32>, cm: Vec<f64>, rmult: Vec<f32> }
 
+/// Where a haplotype's forward-backward reads its conditioning pack from.
+#[derive(Clone, Copy)]
+enum Packed {
+    /// No pack (the kernel reads the panel).
+    No,
+    /// Its own pack, assembled in the task's buffer.
+    Own,
+    /// The sample's shared prefix: the haplotype's whole set over the shared axis.
+    Base,
+}
+
 /// Time spent in the fused per-sample re-phasing, SUMMED over threads
 /// (`LCWGS_TIMING` only) — the phase now runs inside the parallel per-sample
 /// task, so it has no separate wall-clock share of its own; `hmm` is that
@@ -1221,16 +1232,20 @@ fn run_gibbs_with_memory(
                 // Pack one hap's full conditioning set over its FB axis (prefix
                 // copied from `base`, tail gathered). Returns false when nothing
                 // is to be packed (no sharing, or an empty poly axis).
-                let pack_for = |c: &[u32], sp: Option<&PolySplit>, base: &BasePack, hp: &mut Vec<u64>| -> bool {
-                    if !share { return false; }
+                // `Base` when the haplotype's whole set is the shared prefix over
+                // the shared axis (both haplotypes of the sample condition on the
+                // same set: `base` holds exactly the words of its pack).
+                let pack_for = |c: &[u32], sp: Option<&PolySplit>, base: &BasePack, hp: &mut Vec<u64>| -> Packed {
+                    if !share { return Packed::No; }
                     let (ps, n) = match sp {
                         Some(x) => (Some(x.poly.as_slice()), x.poly.len()),
                         None => (None, n_var),
                     };
-                    if n == 0 { return false; }
+                    if n == 0 { return Packed::No; }
+                    if b > 0 && b == c.len() && base.words.len() == n * base.wb { return Packed::Base; }
                     super::hmm::pack_cond_rows_with_parallelism(
                         ref_bm, c, ps, n, if b > 0 { Some(base) } else { None }, hp, parallel_rows);
-                    true
+                    Packed::Own
                 };
                 // The passengers' pass reads this haplotype's main-pass axis and
                 // partner allele, and writes nothing the chain reads.
@@ -1242,7 +1257,9 @@ fn run_gibbs_with_memory(
                         sp.map(|x| x.poly.as_slice()), band, pass.unwrap(), pass_model.as_ref().unwrap(), two_pass, mp))
                 };
                 let fb0 = |hp: &mut Vec<u64>| {
-                    let packed = pack_for(c0, split0, &base, hp);
+                    let pack = match pack_for(c0, split0, &base, hp) {
+                        Packed::No => None, Packed::Own => Some(hp.as_slice()), Packed::Base => Some(base.words.as_slice()),
+                    };
                     let (d, smp) = run_one_hap(
                         h0i, it, seed,
                         |v| prev_alleles[v * n_target_haps + h1i] as usize,
@@ -1250,13 +1267,14 @@ fn run_gibbs_with_memory(
                         use_scaffold, &common_idx, n_var,
                         split0.map(|x| (x, ic_all, ps_mono_alt.as_slice())),
                         full_axis_rmult.as_deref(),
-                        if packed { Some(hp.as_slice()) } else { None }, two_pass);
-                    let pd = pass_fb(h0i, &|v| prev_alleles[v * n_target_haps + h1i] as usize, c0, split0,
-                        packed.then_some(hp.as_slice()));
+                        pack, two_pass);
+                    let pd = pass_fb(h0i, &|v| prev_alleles[v * n_target_haps + h1i] as usize, c0, split0, pack);
                     (d, smp, pd)
                 };
                 let fb1 = |fresh: Option<&[u8]>, hp: &mut Vec<u64>| {
-                    let packed = pack_for(c1, split1, &base, hp);
+                    let pack = match pack_for(c1, split1, &base, hp) {
+                        Packed::No => None, Packed::Own => Some(hp.as_slice()), Packed::Base => Some(base.words.as_slice()),
+                    };
                     let (d, smp) = run_one_hap(
                         h1i, it, seed,
                         |v| fresh.map_or(prev_alleles[v * n_target_haps + h0i], |a| a[v]) as usize,
@@ -1264,9 +1282,8 @@ fn run_gibbs_with_memory(
                         use_scaffold, &common_idx, n_var,
                         split1.map(|x| (x, ic_all, ps_mono_alt.as_slice())),
                         full_axis_rmult.as_deref(),
-                        if packed { Some(hp.as_slice()) } else { None }, two_pass);
-                    let pd = pass_fb(h1i, &|v| fresh.map_or(prev_alleles[v * n_target_haps + h0i], |a| a[v]) as usize, c1, split1,
-                        packed.then_some(hp.as_slice()));
+                        pack, two_pass);
+                    let pd = pass_fb(h1i, &|v| fresh.map_or(prev_alleles[v * n_target_haps + h0i], |a| a[v]) as usize, c1, split1, pack);
                     (d, smp, pd)
                 };
                 let extra = if !is_main && !gs && rayon::current_num_threads() > 1 {
@@ -1285,11 +1302,14 @@ fn run_gibbs_with_memory(
                     let second = fb1(gs.then_some(first.1.as_slice()), &mut hp);
                     (first, second)
                 };
-                (results, if memory.is_none() { Some(base) } else { None })
+                // The shared prefix is kept for the phaser (also on the admitted
+                // path, where its permit charges a complete pack it then need
+                // not build).
+                (results, Some(base))
             };
             // Only the admitted path waits for phaser memory. Whole-sample
             // tasks keep the shared prefix, but release the full FB pack here.
-            let (((d0, mut samp0, pd0), (d1, mut samp1, pd1)), retained_base) = match memory {
+            let (((d0, mut samp0, pd0), (d1, mut samp1, pd1)), mut retained_base) = match memory {
                 Some(m) => m.run(super::memory::fb_bytes(n_var + pass_sites, c0.len().max(c1.len()))
                     + two_pass_bytes(c0.len().max(c1.len())), fb),
                 None => fb(),
@@ -1345,16 +1365,25 @@ fn run_gibbs_with_memory(
                         super::memory::phase_bytes(n_var, cond_haps.len(), snapshots)
                             + super::memory::two_pass_phase_bytes(poly_ref.len(), cond_haps.len())
                     });
-                    let mut phase = || {
+                    let mut phase = |retained: Option<&BasePack>| {
                         let mut base = BasePack::new();
-                        let phase_base = if let Some(m) = memory {
-                            // A complete pack is charged alongside snapshots.
-                            let sites: Vec<usize> = poly_ref.iter().map(|&v| v as usize).collect();
-                            base.build_rows(ref_bm, cond_haps, &sites, n_var, m.parallel_rows());
-                            (!cond_haps.is_empty()).then_some(&base)
-                        } else {
-                            retained_base.as_ref().filter(|bp| bp.b > 0
-                                && cond_haps.len() >= bp.b && cond_haps[..bp.b] == c0[..bp.b])
+                        // The forward-backward's shared prefix when it is the
+                        // phaser's (the phaser gathers the rest; the same bits).
+                        // On the admitted path only when it holds most of the
+                        // states: the phaser gathers the tail at every pass,
+                        // a complete pack only once.
+                        let retained = retained.filter(|bp| bp.b > 0
+                            && cond_haps.len() >= bp.b && cond_haps[..bp.b] == c0[..bp.b]
+                            && (memory.is_none() || 2 * bp.b > cond_haps.len()));
+                        let phase_base = match (retained, memory) {
+                            (Some(bp), _) => Some(bp),
+                            (None, Some(m)) => {
+                                // A complete pack is charged alongside snapshots.
+                                let sites: Vec<usize> = poly_ref.iter().map(|&v| v as usize).collect();
+                                base.build_rows(ref_bm, cond_haps, &sites, n_var, m.parallel_rows());
+                                (!cond_haps.is_empty()).then_some(&base)
+                            }
+                            (None, None) => None,
                         };
                         let mut hmm = crate::lcwgs::phasing_hmm::PhasingHmm::new(&g2p);
                         hmm.set_two_pass(two_pass);
@@ -1373,8 +1402,19 @@ fn run_gibbs_with_memory(
                         }
                     };
                     match memory {
-                        Some(m) => m.run(phase_bytes.unwrap(), phase),
-                        None => phase(),
+                        Some(m) => {
+                            let bytes = phase_bytes.unwrap();
+                            match m.try_permit(bytes) {
+                                Some(permit) => m.run_with(permit, || phase(retained_base.as_ref())),
+                                None => {
+                                    // The phaser waits for memory: the retained prefix
+                                    // is not held outside a permit meanwhile.
+                                    drop(retained_base.take());
+                                    m.run(bytes, || phase(None))
+                                }
+                            }
+                        }
+                        None => phase(retained_base.as_ref()),
                     }
             }
             [(h0i, d0, samp0, pd0), (h1i, d1, samp1, pd1)]

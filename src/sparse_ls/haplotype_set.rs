@@ -129,6 +129,20 @@ impl Rng for SimpleRng {
 // Splice helpers: the big prefix array without a rare run's small positions.
 // ---------------------------------------------------------------------------
 
+/// A prefix array as the harvest reads it: a slice, or an array of a decoded
+/// segment whose entries are traced back to a kept array (`segmented`).
+pub(crate) trait HapArray {
+    fn len(&self) -> usize;
+    fn at(&self, i: usize) -> i32;
+}
+
+impl<T: Copy + Into<i32>> HapArray for [T] {
+    #[inline]
+    fn len(&self) -> usize { <[T]>::len(self) }
+    #[inline]
+    fn at(&self, i: usize) -> i32 { self[i].into() }
+}
+
 /// `src` without its entries at `positions` (strictly ascending, as every
 /// `A_small_idx` list is: sorted full-PBWT positions of distinct haplotypes),
 /// in order, into the front of `dst`; returns the count written. The same
@@ -1372,14 +1386,14 @@ impl TargetHaplotypeSet {
         // `select_k_from` takes the array by reference; the field is moved out
         // for the call (the two arrays have the same length).
         let arr = std::mem::take(if use_b { &mut self.pbwt_array_b } else { &mut self.pbwt_array_a });
-        self.select_k_from(&arr, k, htr, ref_rac_l, k0, a);
+        self.select_k_from(arr.as_slice(), k, htr, ref_rac_l, k0, a);
         *(if use_b { &mut self.pbwt_array_b } else { &mut self.pbwt_array_a }) = arr;
     }
 
     /// `select_k` harvesting from the prefix array `pbwt_array` (`n_ref` long).
-    fn select_k_from<T: Copy + Into<i32>>(
+    fn select_k_from<A: HapArray + ?Sized>(
         &mut self,
-        pbwt_array: &[T],
+        pbwt_array: &A,
         k: i32,
         htr: usize,
         ref_rac_l: i32,
@@ -1421,7 +1435,7 @@ impl TargetHaplotypeSet {
             if od < nh_down {
                 let idx = pbwt_idx + od;
                 if idx < n_ref && ((idx >= ref_rac_l) == a_bool) {
-                    self.pbwt_states[sample][o as usize].push(pbwt_array[idx as usize].into());
+                    self.pbwt_states[sample][o as usize].push(pbwt_array.at(idx as usize));
                     od += 1;
                 }
             }
@@ -1429,7 +1443,7 @@ impl TargetHaplotypeSet {
             if ou < nh_up {
                 let idx = pbwt_idx - (ou + 1);
                 if idx >= 0 && ((idx >= ref_rac_l) == a_bool) {
-                    self.pbwt_states[sample][o as usize].push(pbwt_array[idx as usize].into());
+                    self.pbwt_states[sample][o as usize].push(pbwt_array.at(idx as usize));
                     ou += 1;
                 }
             }

@@ -226,7 +226,24 @@ impl MemoryBudget {
     }
 
     pub fn run<R: Send>(&self, bytes: usize, f: impl FnOnce() -> R + Send) -> R {
-        let _permit = self.work(bytes);
+        let permit = self.work(bytes);
+        self.run_with(permit, f)
+    }
+
+    /// The permit [`Self::run`] would wait for, when it can be granted at once
+    /// without overtaking a waiting request; `None` otherwise.
+    pub fn try_permit(&self, bytes: usize) -> Option<Permit<'_>> {
+        assert!(rayon::current_thread_index().is_none(), "memory admission must run outside Rayon");
+        assert!(!self.strict || bytes <= self.work_limit(),
+            "one lcWGS sample exceeds the work allowance; increase LCWGS_MEM_BUDGET_GB");
+        let mut used = self.usage.lock().unwrap();
+        if used.waiting != 0 || used.alone_waiting != 0 { return None; }
+        self.admit_work(&mut used, bytes)
+    }
+
+    /// Run `f` under a permit granted by [`Self::try_permit`] (as [`Self::run`] does).
+    pub fn run_with<R: Send>(&self, permit: Permit<'_>, f: impl FnOnce() -> R + Send) -> R {
+        let _permit = permit;
         rayon::join(|| { let out = f(); collect_local(); out }, || ()).0
     }
 }
@@ -412,6 +429,21 @@ mod tests {
         drop(chunks);
         assert_eq!(b.usage.lock().unwrap().fixed, 0);
         assert!(b.usage.lock().unwrap().peak <= 1000);
+    }
+
+    #[test]
+    fn try_permit_never_waits_nor_overtakes() {
+        let b = MemoryBudget::new(1000, 0);
+        let p = b.try_permit(450).expect("fits");
+        let q = b.try_permit(450).expect("fits");
+        assert!(b.try_permit(101).is_none(), "does not fit");
+        assert_eq!(b.run_with(b.try_permit(100).unwrap(), || 7), 7);
+        drop(q);
+        b.usage.lock().unwrap().waiting = 1;
+        assert!(b.try_permit(1).is_none(), "a waiting request goes first");
+        b.usage.lock().unwrap().waiting = 0;
+        drop(p);
+        assert_eq!(b.usage.lock().unwrap().work, 0);
     }
 
     #[test]
