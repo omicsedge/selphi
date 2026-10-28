@@ -152,6 +152,7 @@ impl MemoryBudget {
         used.fixed += bytes;
         used.reserved.push((chunk, bytes));
         used.peak = used.peak.max(used.fixed + used.work);
+        self.changed.notify_all();
         Permit { budget: self, bytes, fixed: true, reserved_for: Some(chunk) }
     }
 
@@ -233,21 +234,30 @@ impl MemoryBudget {
         let mut used = self.usage.lock().unwrap();
         used.waiting += 1;
         // Lenient only: work that cannot fit beside the live chunks even alone waits for the other
-        // work to finish, and later requests wait behind it so that it is not starved.
-        let alone = !self.strict && bytes > self.limit.saturating_sub(used.fixed);
-        if alone {
-            used.alone_waiting += 1;
-            while used.work != 0 { used = self.changed.wait(used).unwrap(); }
-            used.alone_waiting -= 1;
-            used.waiting -= 1;
-            self.note_oversized("task", bytes);
-            return self.charge_work(&mut used, bytes);
-        }
-        while used.alone_waiting != 0 || bytes > self.limit.saturating_sub(used.fixed + used.work) {
+        // work to finish, and later requests wait behind it so that it is not starved. Whether it is
+        // such work is decided again at every wake-up: the live state changes meanwhile (a chunk ends,
+        // a panel built ahead is reserved), and a request decided once could wait for room that
+        // never comes.
+        let mut counted_alone = false;
+        loop {
+            let alone = !self.strict && bytes > self.limit.saturating_sub(used.fixed);
+            if alone != counted_alone {
+                if alone { used.alone_waiting += 1; } else { used.alone_waiting -= 1; }
+                counted_alone = alone;
+            }
+            if alone {
+                if used.work == 0 {
+                    used.alone_waiting -= 1;
+                    used.waiting -= 1;
+                    self.note_oversized("task", bytes);
+                    return self.charge_work(&mut used, bytes);
+                }
+            } else if used.alone_waiting == 0 && bytes <= self.limit.saturating_sub(used.fixed + used.work) {
+                used.waiting -= 1;
+                return self.admit_work(&mut used, bytes).unwrap();
+            }
             used = self.changed.wait(used).unwrap();
         }
-        used.waiting -= 1;
-        self.admit_work(&mut used, bytes).unwrap()
     }
 
     pub fn run<R: Send>(&self, bytes: usize, f: impl FnOnce() -> R + Send) -> R {
@@ -476,6 +486,30 @@ mod tests {
         assert_eq!(b.usage.lock().unwrap().fixed, 100);
         assert!(b.usage.lock().unwrap().reserved.is_empty());
         assert_eq!(lenient.usage.lock().unwrap().fixed, 100);
+    }
+
+    /// Work waiting beside other work becomes work that runs alone when a later
+    /// reservation leaves it no room beside the live chunks (it waited forever).
+    #[test]
+    fn waiting_work_turns_alone_after_a_reservation() {
+        let b = MemoryBudget::new(1000, 0).lenient();
+        let a = b.try_chunk_for(0, 400).unwrap();
+        let c = b.try_chunk_for(2, 50).unwrap();
+        let x = b.try_work(200).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            let b = &b;
+            s.spawn(move || { let _w = b.work(540); tx.send(()).unwrap(); });
+            while b.usage.lock().unwrap().waiting == 0 { std::thread::yield_now(); }
+            let r = b.reserve(1, 100);
+            drop(c);
+            drop(x);
+            rx.recv_timeout(std::time::Duration::from_secs(20)).expect("the waiting work was admitted");
+            drop(r);
+        });
+        drop(a);
+        let used = b.usage.lock().unwrap();
+        assert_eq!((used.fixed, used.work, used.waiting, used.alone_waiting), (0, 0, 0, 0));
     }
 
     #[test]
