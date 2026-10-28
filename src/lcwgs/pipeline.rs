@@ -528,20 +528,25 @@ const AHEAD_BLOCK_SITES: usize = 8192;
 /// bitmatrix), in the priority order `memory::run_chunks` starts chunks: the
 /// panel build is serial and the chunk's chains wait for it. The panel is the
 /// one the chunk would build from its bitmatrix (same rows, same code). At most
-/// one panel built ahead exists at a time (building or not yet taken). It is
+/// one panel built ahead exists at a time (building or not yet taken), charged
+/// to the chunk scheduler's allowance until its chunk takes it. It is
 /// built on a one-thread pool of its own (the extraction's Rayon work and
 /// cache release stay off the chains' pool), and only when the memory left
 /// (MemAvailable, or the room under the cgroup limit) holds what the starting
 /// chunk will still allocate (its bitmatrix and chain state, estimated), twice
 /// the panel side's estimate and 1 GiB; never under an explicit
-/// `LCWGS_MEM_BUDGET_GB` (not charged to it); `LCWGS_NO_PANEL_AHEAD=1` = off.
+/// `LCWGS_MEM_BUDGET_GB`; `LCWGS_NO_PANEL_AHEAD=1` = off. A heuristic, not a
+/// bound: chunks admitted later allocate after the check.
 /// A failed build ahead is said and the chunk builds its own.
 struct PanelAhead<'a> {
     order: Vec<usize>,
     /// Per chunk; whether a build ahead is in flight.
-    state: std::sync::Mutex<(Vec<AheadSlot>, bool)>,
+    state: std::sync::Mutex<(Vec<AheadSlot<'a>>, bool)>,
     ready: std::sync::Condvar,
     pool: rayon::ThreadPool,
+    /// The chunk scheduler's allowance, charged with a panel built ahead until
+    /// its chunk takes it.
+    budget: &'a super::memory::MemoryBudget,
     srp: &'a SrpReader,
     wgs_idx: &'a [usize],
     cm: &'a [f64],
@@ -551,7 +556,7 @@ struct PanelAhead<'a> {
     params: &'a LcwgsParams,
 }
 
-enum AheadSlot { Empty, Building, Ready(super::iterate::PanelSide), Taken }
+enum AheadSlot<'a> { Empty, Building, Ready(super::iterate::PanelSide, super::memory::Permit<'a>), Taken }
 
 /// A chunk's panel side when the chunk starts: built ahead, being built ahead,
 /// or for the chunk to build (nobody will build it ahead any more).
@@ -559,7 +564,7 @@ enum AheadStart { Built(super::iterate::PanelSide), InFlight, Mine }
 
 /// A claimed build ahead: puts the slot back to `Empty` (waking a chunk waiting
 /// for it, which then builds its own) unless the panel was published.
-struct AheadClaim<'p, 'a> { ahead: &'p PanelAhead<'a>, c: usize, published: bool }
+struct AheadClaim<'p, 'a> { ahead: &'p PanelAhead<'a>, c: usize, published: bool, charge: Option<super::memory::Permit<'a>> }
 
 impl Drop for AheadClaim<'_, '_> {
     fn drop(&mut self) {
@@ -576,7 +581,7 @@ impl<'a> PanelAhead<'a> {
     fn start(&self, c: usize) -> AheadStart {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match std::mem::replace(&mut st.0[c], AheadSlot::Taken) {
-            AheadSlot::Ready(panel) => AheadStart::Built(panel),
+            AheadSlot::Ready(panel, _charge) => AheadStart::Built(panel),
             AheadSlot::Building => { st.0[c] = AheadSlot::Building; AheadStart::InFlight }
             AheadSlot::Empty | AheadSlot::Taken => AheadStart::Mine,
         }
@@ -588,7 +593,7 @@ impl<'a> PanelAhead<'a> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             match std::mem::replace(&mut st.0[c], AheadSlot::Taken) {
-                AheadSlot::Ready(panel) => return Some(panel),
+                AheadSlot::Ready(panel, _charge) => return Some(panel),
                 AheadSlot::Building => {
                     st.0[c] = AheadSlot::Building;
                     st = self.ready.wait(st).unwrap_or_else(|e| e.into_inner());
@@ -603,7 +608,7 @@ impl<'a> PanelAhead<'a> {
     /// and the memory allows (see [`PanelAhead`]).
     fn claim_next(&self, starting: usize) -> Option<AheadClaim<'_, 'a>> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if st.1 || st.0.iter().any(|s| matches!(s, AheadSlot::Ready(_))) { return None; }
+        if st.1 || st.0.iter().any(|s| matches!(s, AheadSlot::Ready(..))) { return None; }
         let c = *self.order.iter().find(|&&c| matches!(st.0[c], AheadSlot::Empty))?;
         let n_ref = self.srp.metadata.n_haps;
         let panel_sites = self.plan[c].as_ref().map_or(0, |(_, b)| b.len());
@@ -613,7 +618,8 @@ impl<'a> PanelAhead<'a> {
         if !(room.is_finite() && room >= need) { return None; }
         st.0[c] = AheadSlot::Building;
         st.1 = true;
-        Some(AheadClaim { ahead: self, c, published: false })
+        let charge = Some(self.budget.reserve(c, panel_side_bytes(panel_sites, n_ref)));
+        Some(AheadClaim { ahead: self, c, published: false, charge })
     }
 
     /// Build the claimed chunk's panel side on the pool and publish it. A panic
@@ -637,7 +643,7 @@ impl<'a> PanelAhead<'a> {
         };
         memtrace(&format!("chunk {c}: selection panel built ahead in {:.1} s ({:.2} GB)", t0.elapsed().as_secs_f64(), panel.heap_bytes() as f64 / 1e9));
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.0[c] = AheadSlot::Ready(panel);
+        st.0[c] = AheadSlot::Ready(panel, claim.charge.take().expect("a claim's charge"));
         st.1 = false;
         claim.published = true;
         self.ready.notify_all();
@@ -1558,7 +1564,7 @@ fn run_chunked_gibbs(
         && !crate::config::present("LCWGS_NO_PANEL_AHEAD"))
         .then(|| rayon::ThreadPoolBuilder::new().num_threads(1).stack_size(16 << 20).thread_name(|_| "panel-ahead".into()).build().ok())
         .flatten();
-    let ahead: Option<PanelAhead> = pool.map(|pool| {
+    let ahead: Option<PanelAhead> = pool.zip(memory.as_ref()).map(|(pool, budget)| {
         let mut order: Vec<usize> = (0..n_chunks).filter(|&c| plan[c].is_some()).collect();
         order.sort_by_key(|&c| std::cmp::Reverse(costs[c]));
         // A chunk prepared during the pileup has its panel side already.
@@ -1566,7 +1572,7 @@ fn run_chunked_gibbs(
             let prepared_panel = prepared.and_then(|p| p.get(c)).is_some_and(|m| m.lock().unwrap().as_ref().is_some_and(|p| p.panel.is_some()));
             if prepared_panel || plan[c].is_none() { AheadSlot::Taken } else { AheadSlot::Empty }
         }).collect();
-        PanelAhead { order, state: std::sync::Mutex::new((slots, false)), ready: std::sync::Condvar::new(), pool,
+        PanelAhead { order, state: std::sync::Mutex::new((slots, false)), ready: std::sync::Condvar::new(), pool, budget,
             srp, wgs_idx, cm, plan: &plan, sites: &chunk_sites, params }
     });
 

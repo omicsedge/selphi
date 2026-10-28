@@ -81,7 +81,11 @@ pub(crate) fn resident_bytes() -> Option<usize> {
 }
 
 #[derive(Default)]
-struct Usage { fixed: usize, work: usize, work_jobs: usize, waiting: usize, alone_waiting: usize, peak: usize }
+struct Usage {
+    fixed: usize, work: usize, work_jobs: usize, waiting: usize, alone_waiting: usize, peak: usize,
+    /// Reservations held for a chunk not yet admitted (chunk, bytes), part of `fixed`.
+    reserved: Vec<(usize, usize)>,
+}
 
 pub(crate) struct MemoryBudget {
     limit: usize,
@@ -100,7 +104,7 @@ pub(crate) struct MemoryBudget {
     parallel_fb_grants: std::sync::atomic::AtomicUsize,
 }
 
-pub(crate) struct Permit<'a> { budget: &'a MemoryBudget, bytes: usize, fixed: bool }
+pub(crate) struct Permit<'a> { budget: &'a MemoryBudget, bytes: usize, fixed: bool, reserved_for: Option<usize> }
 
 impl MemoryBudget {
     pub fn new(limit: usize, shared: usize) -> Self {
@@ -138,19 +142,40 @@ impl MemoryBudget {
         }
     }
 
+    /// Charge `bytes` of state held for chunk `chunk` before it starts (its panel
+    /// side built ahead, see `pipeline::PanelAhead`) until the permit drops:
+    /// never waits or refuses (the caller checked the memory itself). Other
+    /// chunks' admission counts it; `chunk`'s own does not
+    /// ([`Self::try_chunk_for`]), which it would otherwise wait for forever.
+    pub fn reserve(&self, chunk: usize, bytes: usize) -> Permit<'_> {
+        let mut used = self.usage.lock().unwrap();
+        used.fixed += bytes;
+        used.reserved.push((chunk, bytes));
+        used.peak = used.peak.max(used.fixed + used.work);
+        Permit { budget: self, bytes, fixed: true, reserved_for: Some(chunk) }
+    }
+
+    #[cfg(test)]
     pub fn try_chunk(&self, bytes: usize) -> Option<Permit<'_>> {
+        self.try_chunk_for(usize::MAX, bytes)
+    }
+
+    /// Admit chunk `chunk`'s state, not counting what is reserved for it.
+    pub fn try_chunk_for(&self, chunk: usize, bytes: usize) -> Option<Permit<'_>> {
         let oversized = bytes > self.fixed_limit - self.shared;
         assert!(!oversized || !self.strict,
             "one lcWGS chunk exceeds the state allowance; increase LCWGS_MEM_BUDGET_GB");
         let mut used = self.usage.lock().unwrap();
+        let own: usize = used.reserved.iter().filter(|&&(c, _)| c == chunk).map(|&(_, b)| b).sum();
+        let fixed = used.fixed - own;
         if oversized {
-            if used.fixed != self.shared || used.work != 0 { return None; }
+            if fixed != self.shared || used.work != 0 { return None; }
             self.note_oversized("chunk", bytes);
-        } else if used.fixed + bytes > self.fixed_limit
-            || bytes > self.limit.saturating_sub(used.fixed + used.work) { return None; }
+        } else if fixed + bytes > self.fixed_limit
+            || bytes > self.limit.saturating_sub(fixed + used.work) { return None; }
         used.fixed += bytes;
         used.peak = used.peak.max(used.fixed + used.work);
-        Some(Permit { budget: self, bytes, fixed: true })
+        Some(Permit { budget: self, bytes, fixed: true, reserved_for: None })
     }
 
     #[cfg(test)]
@@ -168,7 +193,7 @@ impl MemoryBudget {
         used.work += bytes;
         used.work_jobs += 1;
         used.peak = used.peak.max(used.fixed + used.work);
-        Permit { budget: self, bytes, fixed: false }
+        Permit { budget: self, bytes, fixed: false, reserved_for: None }
     }
 
     /// Prefer whole sample jobs when they already fill the pool. A nested join
@@ -251,6 +276,10 @@ impl MemoryBudget {
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
         let mut used = self.budget.usage.lock().unwrap();
+        if let Some(c) = self.reserved_for {
+            let i = used.reserved.iter().position(|&r| r == (c, self.bytes)).expect("a held reservation");
+            used.reserved.swap_remove(i);
+        }
         if self.fixed { used.fixed -= self.bytes; } else {
             used.work -= self.bytes;
             used.work_jobs -= 1;
@@ -304,7 +333,7 @@ pub(crate) fn run_chunks<T: Send>(
             let mut i = 0;
             while live < max_live.max(1) && i < pending.len() {
                 let c = pending[i];
-                if let Some(permit) = budget.try_chunk(costs[c]) {
+                if let Some(permit) = budget.try_chunk_for(c, costs[c]) {
                     pending.remove(i);
                     live += 1;
                     let (tx, process) = (tx.clone(), &process);
@@ -429,6 +458,24 @@ mod tests {
         drop(chunks);
         assert_eq!(b.usage.lock().unwrap().fixed, 0);
         assert!(b.usage.lock().unwrap().peak <= 1000);
+    }
+
+    #[test]
+    fn reservation_counts_for_other_chunks_not_its_own() {
+        let b = MemoryBudget::new(1000, 100);
+        let r = b.reserve(7, 300);
+        assert!(b.try_chunk_for(3, 201).is_none(), "another chunk sees the reservation");
+        let own = b.try_chunk_for(7, 400).expect("its own chunk does not wait for it");
+        drop(own);
+        // An oversized chunk runs alone: its own reservation does not count as company.
+        let lenient = MemoryBudget::new(1000, 100).lenient();
+        let r2 = lenient.reserve(5, 50);
+        assert!(lenient.try_chunk_for(4, 600).is_none());
+        let big = lenient.try_chunk_for(5, 600).expect("alone but for its own reservation");
+        drop((big, r2, r));
+        assert_eq!(b.usage.lock().unwrap().fixed, 100);
+        assert!(b.usage.lock().unwrap().reserved.is_empty());
+        assert_eq!(lenient.usage.lock().unwrap().fixed, 100);
     }
 
     #[test]
