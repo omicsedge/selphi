@@ -332,16 +332,34 @@ fn ref_call_quality_ok(f: &RefCallFields) -> Option<bool> {
     Some(match (q, f.dp) { (Some(q), _) => q >= 20.0, (None, Some(dp)) => dp >= 10.0, (None, None) => true })
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum SpanKind { Variant, NoAlt, Block, Structural }
+/// The last base a record spans: its INFO/END, else `POS + |SVLEN|`, else the end of its REF
+/// (at least POS). The gVCF scan and `--calls` read a record's extent by this one rule.
+#[inline]
+pub(crate) fn record_stop(pos: i64, ref_len: i64, end: Option<i64>, svlen: Option<i64>) -> i64 {
+    end.or(svlen.map(|l| pos + l.abs())).unwrap_or(pos + ref_len.max(1) - 1).max(pos)
+}
 
-fn span_kind(alts: &[&str]) -> SpanKind {
+/// What a record's ALT column makes of it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum SpanKind {
+    /// At least one sequence ALT.
+    Variant,
+    /// No ALT (`.`): a reference or no-call record.
+    NoAlt,
+    /// Only gVCF reference placeholders (`<NON_REF>`, `<*>`, `<X>`): a reference block.
+    Block,
+    /// A spanning deletion's `*` alone, a symbolic SV, a breakend: no marker covers its span.
+    Structural,
+}
+
+/// The [`SpanKind`] of a record from its ALT alleles.
+pub(crate) fn span_kind<'a, I>(alts: I) -> SpanKind where I: IntoIterator<Item = &'a str>, I::IntoIter: Clone {
     use crate::io::target_io::is_ref_symbolic;
-    if alts.is_empty() || alts.iter().all(|a| *a == "." || a.is_empty()) { SpanKind::NoAlt }
-    else if alts.iter().all(|a| is_ref_symbolic(a)) { SpanKind::Block }
-    // A spanning deletion's `*` alone, a symbolic SV, a breakend: no marker covers their span.
-    else if alts.iter().all(|a| *a == "*" || is_ref_symbolic(a))
-        || alts.iter().any(|a| (a.starts_with('<') && !is_ref_symbolic(a)) || a.contains('[') || a.contains(']')) { SpanKind::Structural }
+    let alts = alts.into_iter();
+    if alts.clone().all(|a| a == "." || a.is_empty()) { SpanKind::NoAlt }
+    else if alts.clone().all(is_ref_symbolic) { SpanKind::Block }
+    else if alts.clone().all(|a| a == "*" || is_ref_symbolic(a))
+        || alts.clone().any(|a| (a.starts_with('<') && !is_ref_symbolic(a)) || a.contains('[') || a.contains(']')) { SpanKind::Structural }
     else { SpanKind::Variant }
 }
 
@@ -368,7 +386,7 @@ pub fn scan_ref_spans(path: &str, n_samples: usize, contig: Option<&str>) -> std
                     kind: SpanKind, f: Option<RefCallFields>| {
         let c = by.entry(strip_chr(chrom).to_string()).or_insert_with(|| Contig { lo: i64::MAX, ..Default::default() });
         c.n += 1; c.lo = c.lo.min(pos); c.hi = c.hi.max(pos);
-        let stop = end.or(svlen.map(|l| pos + l.abs())).unwrap_or(pos + ref_len.max(1) - 1).max(pos);
+        let stop = record_stop(pos, ref_len, end, svlen);
         // An ALT `.` record with an END is a block (bcftools call --gvcf writes them so).
         let kind = if kind == SpanKind::NoAlt && end.is_some_and(|e| e >= pos) { SpanKind::Block } else { kind };
         if kind == SpanKind::Block { c.blocks = true; }
@@ -399,7 +417,7 @@ pub fn scan_ref_spans(path: &str, n_samples: usize, contig: Option<&str>) -> std
             && let Ok(header) = reader.read_header() {
             for rec in reader.record_bufs(&header).flatten() {
                 let alts: Vec<&str> = rec.alternate_bases().as_ref().iter().map(String::as_str).collect();
-                let kind = span_kind(&alts);
+                let kind = span_kind(alts.iter().copied());
                 let Some(pos) = rec.variant_start().map(|p| usize::from(p) as i64) else { continue };
                 if !wanted(rec.reference_sequence_name()) {
                     // An ALT `.` 0/0 record without an END (a block has one) on another contig.
@@ -464,7 +482,7 @@ pub fn scan_ref_spans(path: &str, n_samples: usize, contig: Option<&str>) -> std
             let Ok(pos) = f[1].parse::<i64>() else { continue };
             let ref_base = f[3].as_bytes().first().copied().unwrap_or(b'N').to_ascii_uppercase();
             let alts: Vec<&str> = f[4].split(',').collect();
-            let kind = span_kind(&alts);
+            let kind = span_kind(alts.iter().copied());
             if kind == SpanKind::Variant { take(f[0], pos, ref_base, f[3].len() as i64, None, None, kind, None); continue; }
             let info = f.get(7).copied().unwrap_or(".");
             let info_int = |k: &str| info.split(';').find_map(|kv| kv.strip_prefix(k).and_then(|v| v.strip_prefix('=')))

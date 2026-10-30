@@ -45,6 +45,9 @@ pub struct BamGl {
     pub gl3: Vec<f32>,
     /// Sample IDs (from each BAM's `@RG SM`, else the file stem).
     pub sample_ids: Vec<String>,
+    /// With `depth_at`: the [`DepthCounter`] read depth at each of its positions,
+    /// `depth[i * n_samples + s]`.
+    pub depth: Option<Vec<u16>>,
 }
 
 /// Read-filtering thresholds, deliberately stricter than the references.
@@ -206,6 +209,25 @@ fn read_group_sample_id(header: &Header, path: &str) -> String {
         })
 }
 
+/// The sample names an alignment file's read groups give (each distinct `@RG SM` once, in header
+/// order; empty when none has one), and the name a run gives the file's sample
+/// ([`read_group_sample_id`]: the first SM, else the file stem).
+pub fn read_group_samples(path: &str) -> io::Result<(Vec<String>, String)> {
+    let header = if path.to_ascii_lowercase().ends_with(".cram") {
+        cram::io::reader::Builder::default().build_from_path(path)?.read_header()?
+    } else {
+        bam::io::reader::Builder.build_from_path(path)?.read_header()?
+    };
+    let mut names: Vec<String> = Vec::new();
+    for rg in header.read_groups().values() {
+        if let Some(v) = rg.other_fields().get(b"SM") {
+            let v = String::from_utf8_lossy(v).into_owned();
+            if !names.contains(&v) { names.push(v); }
+        }
+    }
+    Ok((names, read_group_sample_id(&header, path)))
+}
+
 /// 1-based inclusive `[rs, re]` → a noodles `Region` on `name`, for an indexed
 /// BAM/CRAM query. Shared by the BAM and CRAM region paths.
 /// A region end at most the contig's length: `--region chr22` asks for 1..i64::MAX, which no
@@ -285,6 +307,8 @@ pub fn load_reference_window(reference: &str, chrom: &str, region: Option<(i64, 
 /// `(pos_1based, ref_base, alt_base)` ascending by pos, with `is_snp` marking
 /// biallelic SNPs (non-SNP sites are left flat). Returns `gl3` over ALL sites
 /// (flat where no reads / not a SNP) in the given order, plus sample IDs.
+/// `depth_at` (ascending positions, any sites) also counts each sample's
+/// [`DepthCounter`] read depth there, in the same pass over the reads.
 #[allow(clippy::too_many_arguments)]
 pub fn pileup_bams(
     bam_paths: &[String],
@@ -297,6 +321,7 @@ pub fn pileup_bams(
     reference: Option<&str>,
     indel_model: Option<&IndelModel>,
     params: PileupParams,
+    depth_at: Option<&[i64]>,
 ) -> io::Result<BamGl> {
     let n_var = pos.len();
     let n_samples = bam_paths.len();
@@ -337,15 +362,19 @@ pub fn pileup_bams(
     // A single sample has the workers to itself: its BGZF blocks inflate on
     // decoder threads and its BAQ realignments run in parallel batches.
     let within = n_samples == 1 && rayon::current_num_threads() > 1;
-    let per_sample: Vec<io::Result<(String, Vec<f32>, PileupReport)>> = bam_paths
+    let per_sample: Vec<io::Result<(String, Vec<f32>, PileupReport, Option<Vec<u16>>)>> = bam_paths
         .par_iter()
-        .map(|path| pileup_one(path, chrom, &sites, region, reference, indel_model, &params, &lut, em.as_ref(), baq_ctx.as_ref(), within))
+        .map(|path| pileup_one(path, chrom, &sites, region, reference, indel_model, &params, &lut, em.as_ref(), baq_ctx.as_ref(), within, depth_at))
         .collect();
 
     let mut sample_ids = Vec::with_capacity(n_samples);
     let mut blocks: Vec<Vec<f32>> = Vec::with_capacity(n_samples);
-    for r in per_sample {
-        let (id, blk, rep) = r?;
+    let mut depth = depth_at.map(|d| vec![0u16; d.len() * n_samples]);
+    for (s, r) in per_sample.into_iter().enumerate() {
+        let (id, blk, rep, dc) = r?;
+        if let (Some(all), Some(dc)) = (depth.as_mut(), dc) {
+            for (i, c) in dc.into_iter().enumerate() { all[i * n_samples + s] = c; }
+        }
         if baq_ctx.is_some() {
             crate::selphi_step!("lcWGS-BAM: {}: {} reads, {} triggering sites, {} realigned ({:.1}%), {} BAQ no-ops",
                 id, rep.n_reads, rep.n_trigger_sites, rep.n_realigned,
@@ -365,7 +394,7 @@ pub fn pileup_bams(
             gl3[dst + 2] = blk[v * 3 + 2];
         }
     }
-    Ok(BamGl { gl3, sample_ids })
+    Ok(BamGl { gl3, sample_ids, depth })
 }
 
 /// The panel sites being piled up.
@@ -438,9 +467,10 @@ fn pileup_one(
     em: Option<&crate::lcwgs::errmod::ErrMod>,
     baq: Option<&BaqCtx>,
     within: bool,
-) -> io::Result<(String, Vec<f32>, PileupReport)> {
+    depth_at: Option<&[i64]>,
+) -> io::Result<(String, Vec<f32>, PileupReport, Option<Vec<u16>>)> {
     if path.to_ascii_lowercase().ends_with(".cram") {
-        return pileup_one_cram(path, chrom, sites, region, reference, indel_model, params, lut, em, baq, within);
+        return pileup_one_cram(path, chrom, sites, region, reference, indel_model, params, lut, em, baq, within, depth_at);
     }
     let mut reader = bam::io::reader::Builder.build_from_path(path)?;
     let header = reader.read_header()?;
@@ -449,7 +479,7 @@ fn pileup_one(
     // Map chrom name → reference id in this BAM (chr-prefix tolerant).
     let Some((target_rid, contig_name)) = resolve_contig(&header, chrom) else {
         // Contig absent → every site flat.
-        return Ok((sample_id, vec![1.0f32 / 3.0; sites.pos.len() * 3], PileupReport::default()));
+        return Ok((sample_id, vec![1.0f32 / 3.0; sites.pos.len() * 3], PileupReport::default(), depth_at.map(|d| vec![0; d.len()])));
     };
     // Region mode with a .bai index → fetch only the region's reads (avoids
     // reading the whole file). Without a region, a BAM whose index puts most of its
@@ -531,8 +561,8 @@ fn pileup_one(
         Ok(())
     };
 
-    let (gl, rep) = pileup_core(&mut source, sites, params, lut, em, indel_model, baq, within)?;
-    Ok((sample_id, gl, rep))
+    let (gl, rep, depth) = pileup_core(&mut source, sites, params, lut, em, indel_model, baq, within, depth_at)?;
+    Ok((sample_id, gl, rep, depth))
 }
 
 /// Whether `target_rid`'s reads take under half of the BAM: by the `.bai`'s per-reference mapped
@@ -576,7 +606,8 @@ fn pileup_one_cram(
     em: Option<&crate::lcwgs::errmod::ErrMod>,
     baq: Option<&BaqCtx>,
     within: bool,
-) -> io::Result<(String, Vec<f32>, PileupReport)> {
+    depth_at: Option<&[i64]>,
+) -> io::Result<(String, Vec<f32>, PileupReport, Option<Vec<u16>>)> {
     let ref_path = reference.ok_or_else(|| io::Error::new(
         io::ErrorKind::InvalidInput,
         format!("CRAM input ({path}) requires --reference <fasta> (with .fai) to decode read bases"),
@@ -593,7 +624,7 @@ fn pileup_one_cram(
     let (_, header) = open()?;
     let sample_id = read_group_sample_id(&header, path);
     let Some((target_rid, contig_name)) = resolve_contig(&header, chrom) else {
-        return Ok((sample_id, vec![1.0f32 / 3.0; sites.pos.len() * 3], PileupReport::default()));
+        return Ok((sample_id, vec![1.0f32 / 3.0; sites.pos.len() * 3], PileupReport::default(), depth_at.map(|d| vec![0; d.len()])));
     };
     // Region mode with a .crai index → decode only the region. Without a region, a CRAM whose
     // index puts most of its containers on other chromosomes is read for this chromosome alone
@@ -677,12 +708,14 @@ fn pileup_one_cram(
         Ok(())
     };
 
-    let (gl, rep) = pileup_core(&mut source, sites, params, lut, em, indel_model, baq, within)?;
-    Ok((sample_id, gl, rep))
+    let (gl, rep, depth) = pileup_core(&mut source, sites, params, lut, em, indel_model, baq, within, depth_at)?;
+    Ok((sample_id, gl, rep, depth))
 }
 
 /// Format-agnostic pileup of one sample: read filtering, the optional BAQ
-/// statistics pass, then the GL-accumulating pass, then GL finalisation.
+/// statistics pass, then the GL-accumulating pass, then GL finalisation. With
+/// `depth_at`, the GL pass also counts every read it is shown, before its own
+/// filters, into a [`DepthCounter`] (returned as the third value).
 #[allow(clippy::too_many_arguments)]
 fn pileup_core(
     source: &mut RecordSource,
@@ -693,7 +726,8 @@ fn pileup_core(
     indel_model: Option<&IndelModel>,
     baq: Option<&BaqCtx>,
     within: bool,
-) -> io::Result<(Vec<f32>, PileupReport)> {
+    depth_at: Option<&[i64]>,
+) -> io::Result<(Vec<f32>, PileupReport, Option<Vec<u16>>)> {
     let n_var = sites.pos.len();
     let mut report = PileupReport::default();
     let excl = if params.keep_supplementary { FLAG_EXCLUDE & !0x800 } else { FLAG_EXCLUDE };
@@ -742,11 +776,14 @@ fn pileup_core(
         report: &mut report,
         pending: Vec::new(),
     };
+    // The read depth is counted in this pass only, so each read once.
+    let mut counter = depth_at.map(DepthCounter::new);
     if within && baq.is_some() && !params.overlap_htslib {
         // Realign each batch's selected reads in parallel (a pure function of the
         // read and the reference), then pile the batch up in arrival order.
         let mut batch: Vec<OwnedRead> = Vec::with_capacity(BAQ_BATCH);
         source(&mut |r: &ReadView| {
+            if let Some(c) = counter.as_mut() { c.add(r); }
             if !accept(r) { return; }
             batch.push(OwnedRead::from_view(r));
             if batch.len() == BAQ_BATCH {
@@ -756,7 +793,10 @@ fn pileup_core(
         })?;
         st.on_batch(&batch);
     } else {
-        source(&mut |r: &ReadView| { if accept(r) { st.on_read(r); } })?;
+        source(&mut |r: &ReadView| {
+            if let Some(c) = counter.as_mut() { c.add(r); }
+            if accept(r) { st.on_read(r); }
+        })?;
     }
     st.finish();
     let PassState { mut bases, ll, depth, .. } = st;
@@ -779,7 +819,7 @@ fn pileup_core(
         }
         w.flush()?;
     }
-    Ok((gl, report))
+    Ok((gl, report, counter.map(DepthCounter::into_counts)))
 }
 
 /// Mutable state of the GL-accumulating pass.
@@ -1270,6 +1310,73 @@ fn query_index_at(start: i64, cigar: &[(Kind, usize)], target: i64) -> Option<us
     None
 }
 
+/// Read depth at fixed positions as `samtools depth -a -Q 20 -q 20` (1.22) counts it (the
+/// depth `--calls` decides by): reads without flag 0x4/0x100/0x200/0x400, MAPQ >= 20
+/// (255, "unavailable", passes), each counted at every position where it has an
+/// aligned base (M/=/X) of RAW base quality >= 20, any base letter (N included); a read
+/// with a sequence but no stored qualities (QUAL `*`: 0xff bytes, or an empty slice)
+/// counts every aligned base, and a read without a sequence (SEQ `*`) counts nothing
+/// (samtools 1.22 counts such a read once when it carries an auxiliary tag: a defect,
+/// not followed). Deletions and skips count nothing, overlapping mates count twice,
+/// supplementary reads and improper pairs count, and the count saturates at
+/// `u16::MAX`. The thresholds are fixed, not the pileup's tunable filters, so an A/B
+/// of those never moves which sites count as covered.
+pub(crate) struct DepthCounter<'a> {
+    /// Ascending (repeats allowed: one panel row per allele).
+    pos: &'a [i64],
+    /// First position at or after the last read's start (reads arrive sorted).
+    cursor: usize,
+    count: Vec<u16>,
+}
+
+impl<'a> DepthCounter<'a> {
+    const EXCLUDE: u16 = 0x4 | 0x100 | 0x200 | 0x400;
+    const MIN_MAPQ: u8 = 20;
+    const MIN_BQ: u8 = 20;
+
+    pub(crate) fn new(pos: &'a [i64]) -> Self {
+        debug_assert!(pos.windows(2).all(|w| w[0] <= w[1]), "depth positions must ascend");
+        DepthCounter { pos, cursor: 0, count: vec![0; pos.len()] }
+    }
+
+    /// Count one read (reads must come in alignment-start order).
+    #[inline]
+    fn add(&mut self, r: &ReadView) {
+        let n = self.pos.len();
+        debug_assert!(self.cursor == 0 || self.cursor >= n || self.pos[self.cursor - 1] < r.start,
+            "reads must arrive in alignment-start order");
+        while self.cursor < n && self.pos[self.cursor] < r.start { self.cursor += 1; }
+        if r.flags & Self::EXCLUDE != 0 || r.mapq < Self::MIN_MAPQ || r.seq.is_empty() { return; }
+        let mut k = self.cursor;
+        let (mut refcur, mut q) = (r.start, 0usize);
+        for &(kind, len) in r.cigar {
+            if k >= n { break; }
+            match kind {
+                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                    let end = refcur + len as i64;
+                    while k < n && self.pos[k] < end {
+                        let qi = q + (self.pos[k] - refcur) as usize;
+                        if r.qual.is_empty() || r.qual.get(qi).is_some_and(|&b| b >= Self::MIN_BQ) {
+                            self.count[k] = self.count[k].saturating_add(1);
+                        }
+                        k += 1;
+                    }
+                    refcur = end;
+                    q += len;
+                }
+                Kind::Deletion | Kind::Skip => {
+                    refcur += len as i64;
+                    while k < n && self.pos[k] < refcur { k += 1; }
+                }
+                Kind::Insertion | Kind::SoftClip => q += len,
+                Kind::HardClip | Kind::Pad => {}
+            }
+        }
+    }
+
+    fn into_counts(self) -> Vec<u16> { self.count }
+}
+
 /// Visit every panel site a read's alignment covers, in ascending order — bases
 /// under M/=/X ops and positions spanned by D/N ops (a deleted base is still a
 /// member of the pileup column). `indel_after` is htslib's `p->indel`: the
@@ -1733,7 +1840,7 @@ mod tests {
                     }
                     Ok(())
                 };
-                let (gl, rep) = pileup_core(&mut source, &sites, &params, &lut, use_em.then_some(&em), None, Some(&baq_ctx), within).unwrap();
+                let (gl, rep, _) = pileup_core(&mut source, &sites, &params, &lut, use_em.then_some(&em), None, Some(&baq_ctx), within, None).unwrap();
                 (gl.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), rep.n_reads, rep.n_realigned, rep.n_baq_noop, rep.n_trigger_sites)
             });
             let want = run(false);
@@ -1804,6 +1911,136 @@ mod tests {
         let mut seen = Vec::new();
         for_each_covered_site(100, 200, &cigar, &pos, |v, ia| seen.push((pos[v], ia)));
         assert_eq!(seen, vec![(105, 0), (109, 2), (114, -3), (116, 0), (121, 0)]);
+    }
+
+    fn view<'a>(start: i64, flags: u16, mapq: u8, cigar: &'a [(Kind, usize)], qual: &'a [u8]) -> ReadView<'a> {
+        const SEQ: &[u8] = &[b'A'; 64];
+        let len: usize = cigar.iter().filter(|(k, _)| matches!(k, Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch
+            | Kind::Insertion | Kind::SoftClip)).map(|(_, l)| l).sum();
+        ReadView { start, flags, mapq, cigar, seq: &SEQ[..len], qual, qhash: 0, name: &[], mpos: -1, isize: 0, mate_other_tid: false }
+    }
+
+    /// The `--calls` depth at every site of the panel `SELPHI_DEPTH_ORACLE_SRP` (in
+    /// `SELPHI_DEPTH_ORACLE_REGION` when set) counted by the real pileup on
+    /// `SELPHI_DEPTH_ORACLE_BAM` (BAQ on with `SELPHI_DEPTH_ORACLE_FASTA`) equals
+    /// `samtools depth -a -Q 20 -q 20` (`SELPHI_DEPTH_ORACLE_NPY`, one uint16 per position).
+    /// Run with `cargo test --release depth_parity -- --ignored --nocapture`; skipped when unset.
+    #[test]
+    #[ignore]
+    fn depth_parity_with_samtools_depth() {
+        use crate::config::raw;
+        let (Some(bam_path), Some(npy), Some(srp_path)) = (raw("SELPHI_DEPTH_ORACLE_BAM"), raw("SELPHI_DEPTH_ORACLE_NPY"), raw("SELPHI_DEPTH_ORACLE_SRP")) else {
+            eprintln!("oracle env not set; skipping");
+            return;
+        };
+        let fasta = raw("SELPHI_DEPTH_ORACLE_FASTA");
+        let region = raw("SELPHI_DEPTH_ORACLE_REGION").map(|r| {
+            let (a, b) = r.split_once('-').unwrap();
+            (a.parse::<i64>().unwrap(), b.parse::<i64>().unwrap())
+        });
+        // The oracle: a .npy of uint16, position p at index p - 1.
+        let bytes = std::fs::read(&npy).unwrap();
+        assert_eq!(&bytes[..6], b"\x93NUMPY");
+        let hlen = if bytes[6] == 1 { u16::from_le_bytes([bytes[8], bytes[9]]) as usize + 10 } else { u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize + 12 };
+        assert!(String::from_utf8_lossy(&bytes[..hlen]).contains("<u2"), "the oracle must be uint16");
+        let oracle: Vec<u16> = bytes[hlen..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let srp = crate::srp::SrpReader::open(&srp_path, 0).unwrap();
+        let idx: Vec<usize> = (0..srp.variants.len())
+            .filter(|&i| region.is_none_or(|(s, e)| (s..=e).contains(&srp.variants.pos(i)))).collect();
+        let pos: Vec<i64> = idx.iter().map(|&i| srp.variants.pos(i)).collect();
+        let first = |s: &str| s.as_bytes().first().copied().unwrap_or(b'N');
+        let ref_base: Vec<u8> = idx.iter().map(|&i| first(srp.variants.ref_allele(i))).collect();
+        let alt_base: Vec<u8> = idx.iter().map(|&i| first(srp.variants.alt_allele(i))).collect();
+        let is_snp: Vec<bool> = idx.iter().map(|&i| srp.variants.ref_allele(i).len() == 1 && srp.variants.alt_allele(i).len() == 1).collect();
+        let chrom = srp.variants.chr(idx[0]).to_string();
+        let gl = pileup_bams(&[bam_path.clone()], &chrom, &pos, &ref_base, &alt_base, &is_snp, region, fasta.as_deref(), None,
+            PileupParams::default(), Some(&pos)).unwrap();
+        let depth = gl.depth.unwrap();
+        let mut n_diff = 0usize;
+        let mut n_pos = 0usize;
+        for (i, &p) in pos.iter().enumerate() {
+            if i > 0 && pos[i - 1] == p { assert_eq!(depth[i], depth[i - 1]); continue; }
+            n_pos += 1;
+            let want = oracle[(p - 1) as usize];
+            if depth[i] != want {
+                n_diff += 1;
+                if n_diff <= 20 { eprintln!("DIFF {chrom}:{p}: here {}, samtools {want}", depth[i]); }
+            }
+        }
+        eprintln!("depth parity {bam_path}: {} sites at {n_pos} positions{}; differences {n_diff}",
+            pos.len(), region.map_or(String::new(), |(s, e)| format!(" in {s}-{e}")));
+        assert_eq!(n_diff, 0);
+    }
+
+    #[test]
+    fn depth_counter_walks_the_cigar_and_counts_raw_q20_bases() {
+        // 2S 3M 1I 2M 2D 1N 3M from 100: query 0-1 clipped, ref 100-102 = query 2-4,
+        // insertion query 5, ref 103-104 = query 6-7, 105-106 deleted, 107 skipped, 108-110 = query 8-10.
+        let cigar = [(Kind::SoftClip, 2), (Kind::Match, 3), (Kind::Insertion, 1), (Kind::Match, 2),
+            (Kind::Deletion, 2), (Kind::Skip, 1), (Kind::SequenceMatch, 3), (Kind::HardClip, 5)];
+        let mut qual = [30u8; 11];
+        qual[3] = 19; // ref 101
+        qual[6] = 20; // ref 103
+        let pos = [99, 100, 101, 101, 103, 104, 105, 107, 108, 110, 111];
+        let mut c = DepthCounter::new(&pos);
+        c.add(&view(100, 0, 20, &cigar, &qual));
+        assert_eq!(c.into_counts(), vec![0, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0]);
+    }
+
+    #[test]
+    fn depth_counter_filters_flags_and_mapq_only() {
+        let cigar = [(Kind::Match, 4)];
+        let qual = [40u8; 4];
+        let pos = [10, 12];
+        let mut c = DepthCounter::new(&pos);
+        for flags in [0x4, 0x100, 0x200, 0x400] { c.add(&view(10, flags, 60, &cigar, &qual)); }
+        c.add(&view(10, 0, 19, &cigar, &qual));
+        // Supplementary, an improper pair (paired, not proper), MAPQ 20 and 255: counted.
+        c.add(&view(10, 0x800, 60, &cigar, &qual));
+        c.add(&view(10, 0x1, 60, &cigar, &qual));
+        c.add(&view(10, 0, 20, &cigar, &qual));
+        c.add(&view(10, 0, 255, &cigar, &qual));
+        // A read without qualities counts every aligned base: an empty slice, or BAM's 0xff bytes.
+        c.add(&view(11, 0, 60, &cigar, &[]));
+        c.add(&view(11, 0, 60, &cigar, &[0xff; 4]));
+        // A read without a sequence (SEQ `*`) counts nothing, qualities or not.
+        c.add(&ReadView { seq: &[], ..view(11, 0, 60, &cigar, &[]) });
+        c.add(&ReadView { seq: &[], ..view(11, 0, 60, &cigar, &qual) });
+        assert_eq!(c.into_counts(), vec![4, 6]);
+    }
+
+    #[test]
+    fn depth_counter_counts_n_bases_and_skips_the_filtered_reads_cursor_safely() {
+        // Any base letter counts (the counter never reads the bases); a filtered read still
+        // moves the cursor, and a later read starting at the same position is counted.
+        let cigar = [(Kind::Match, 3)];
+        let qual = [30u8; 3];
+        let pos = [10, 11, 12, 13];
+        let mut c = DepthCounter::new(&pos);
+        c.add(&ReadView { seq: b"NNN", ..view(10, 0, 60, &cigar, &qual) });
+        c.add(&view(11, 0x400, 60, &cigar, &qual));
+        c.add(&view(11, 0, 60, &cigar, &qual));
+        assert_eq!(c.into_counts(), vec![1, 2, 2, 1]);
+    }
+
+    #[test]
+    fn depth_counter_counts_overlapping_mates_twice_and_keeps_its_cursor() {
+        let cigar = [(Kind::Match, 5)];
+        let qual = [30u8; 5];
+        let pos = [5, 7, 7, 9, 12];
+        let mut c = DepthCounter::new(&pos);
+        // Mates over 7-9, two reads at one start, then a read past the first sites.
+        c.add(&view(5, 0x1 | 0x2 | 0x40, 60, &cigar, &qual));
+        c.add(&view(7, 0x1 | 0x2 | 0x80, 60, &cigar, &qual));
+        c.add(&view(7, 0, 60, &cigar, &qual));
+        c.add(&view(9, 0, 60, &cigar, &qual));
+        assert_eq!(c.cursor, 3);
+        assert_eq!(c.into_counts(), vec![1, 3, 3, 4, 1]);
+        // Saturation.
+        let mut c = DepthCounter::new(&pos[..1]);
+        c.count[0] = u16::MAX;
+        c.add(&view(5, 0, 60, &cigar, &qual));
+        assert_eq!(c.into_counts(), vec![u16::MAX]);
     }
 }
 

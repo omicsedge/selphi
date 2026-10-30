@@ -57,8 +57,88 @@ pub fn file_chromosomes(files: &[PathBuf]) -> std::io::Result<Vec<(crate::srp::S
     Ok(out)
 }
 
-/// One chromosome of the panel: its name, and how to load it.
-enum Source<'a> { View(&'a MultiChrSrpReader), File(PathBuf) }
+/// The panel's chromosomes in its order, each with how to load it and where its map is: opened
+/// once per run (the multi-chromosome lcWGS runs and `--calls` share it).
+pub struct PanelSet<'a> {
+    multi: Option<MultiChrSrpReader>,
+    /// Each chromosome's name, with its file when the panel is a directory's SRPs (else a view of
+    /// `multi`).
+    chromosomes: Vec<(String, Option<PathBuf>)>,
+    /// One `##contig` line per chromosome (each ID once), as the panel declares them.
+    contig_lines: String,
+    maps: Maps<'a>,
+}
+
+impl<'a> PanelSet<'a> {
+    pub fn open(panels: Panels, maps: Maps<'a>) -> std::io::Result<Self> {
+        // The panel's chromosomes in its order, and the header's ##contig lines (each ID once).
+        let mut chromosomes: Vec<(String, Option<PathBuf>)> = Vec::new();
+        let mut contig_lines: Vec<String> = Vec::new();
+        let multi = match &panels {
+            Panels::Multi(p) => {
+                let reader = MultiChrSrpReader::open(p)?;
+                for c in reader.chromosomes() { chromosomes.push((c.to_string(), None)); }
+                let lines = crate::io::bcf_encode::dedup_contig_lines(&reader.global_meta.contig_fields);
+                contig_lines.extend(lines.lines().filter(|l| !l.trim().is_empty()).map(str::to_string));
+                Some(reader)
+            }
+            Panels::Files(files) => {
+                for (meta, f) in file_chromosomes(files)? {
+                    let own = meta.contig_field.lines().find(|l| crate::io::bcf_encode::contig_names_from_header_lines(l)
+                        .first().is_some_and(|id| bare(id) == bare(&meta.chromosome))).map(str::to_string);
+                    // Without the IDX= of the file it came from, as the panel merge writes it.
+                    contig_lines.push(own.map(|l| crate::srp::multi_chr_writer::strip_idx_from_contig(&l).to_string())
+                        .unwrap_or_else(|| format!("##contig=<ID={}>", meta.chromosome)));
+                    chromosomes.push((meta.chromosome.clone(), Some(f)));
+                }
+                None
+            }
+        };
+        let declared = crate::io::bcf_encode::contig_names_from_header_lines(&contig_lines.join("\n"));
+        for (c, _) in &chromosomes {
+            if !declared.iter().any(|d| bare(d) == bare(c)) { contig_lines.push(format!("##contig=<ID={c}>")); }
+        }
+        let contig_lines = crate::io::bcf_encode::dedup_contig_lines(&contig_lines.join("\n"));
+        Ok(PanelSet { multi, chromosomes, contig_lines, maps })
+    }
+
+    /// The chromosomes, in the panel's order.
+    pub fn chromosomes(&self) -> impl Iterator<Item = &str> { self.chromosomes.iter().map(|(c, _)| c.as_str()) }
+
+    /// The `##contig` lines of every chromosome.
+    pub fn contig_lines(&self) -> &str { &self.contig_lines }
+
+    /// The panel chromosome a contig name means (the same name, or one that differs from it by a
+    /// `chr` prefix). `Err` when two do.
+    pub fn find(&self, contig: &str) -> Result<Option<&str>, String> {
+        let mut hits = self.chromosomes.iter().filter(|(c, _)| crate::io::contig_length::same_contig(c, contig));
+        match (hits.next(), hits.next()) {
+            (Some((c, _)), None) => Ok(Some(c)),
+            (None, _) => Ok(None),
+            (Some((a, _)), Some((b, _))) => Err(format!("contig {contig} matches two panel chromosomes, {a} and {b}")),
+        }
+    }
+
+    /// The genetic map of chromosome `chr` (one map file holds them all, or a directory's file).
+    pub fn map(&self, chr: &str) -> std::io::Result<String> {
+        match &self.maps {
+            Maps::File(f) => Ok(f.to_string()),
+            Maps::Dir(d) => crate::genmap::find_map_in_dir(d, crate::io::contig_length::bare(chr))
+                .map(|p| p.to_string_lossy().into_owned())
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound,
+                    format!("no genetic map for chromosome {chr} in {} (the input covers it)", d.display()))),
+        }
+    }
+
+    /// Load chromosome `chr` (a name [`Self::chromosomes`] gives).
+    pub fn load(&self, chr: &str) -> std::io::Result<SrpReader> {
+        match (self.chromosomes.iter().find(|(c, _)| c == chr), &self.multi) {
+            (Some((_, Some(f))), _) => SrpReader::open(f, 0),
+            (Some((_, None)), Some(reader)) => Ok(reader.load_chr_view(chr)?.into_srp_reader()),
+            _ => Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("the panel has no chromosome {chr}"))),
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -69,34 +149,9 @@ pub fn run(
     // `--contig-length-from-input`: the input header's contig lengths (none when off).
     contig_lengths: &crate::io::contig_length::InputContigLengths,
 ) -> std::io::Result<()> {
-    // The panel's chromosomes in its order, and the header's ##contig lines (each ID once).
-    let multi = match &panels { Panels::Multi(p) => Some(MultiChrSrpReader::open(p)?), Panels::Files(_) => None };
-    let mut chromosomes: Vec<(String, Source)> = Vec::new();
-    let mut contig_lines: Vec<String> = Vec::new();
-    match (&panels, &multi) {
-        (Panels::Multi(_), Some(reader)) => {
-            for c in reader.chromosomes() { chromosomes.push((c.to_string(), Source::View(reader))); }
-            let lines = crate::io::bcf_encode::dedup_contig_lines(&reader.global_meta.contig_fields);
-            contig_lines.extend(lines.lines().filter(|l| !l.trim().is_empty()).map(str::to_string));
-        }
-        (Panels::Files(files), _) => {
-            for (meta, f) in file_chromosomes(files)? {
-                let own = meta.contig_field.lines().find(|l| crate::io::bcf_encode::contig_names_from_header_lines(l)
-                    .first().is_some_and(|id| bare(id) == bare(&meta.chromosome))).map(str::to_string);
-                // Without the IDX= of the file it came from, as the panel merge writes it.
-                contig_lines.push(own.map(|l| crate::srp::multi_chr_writer::strip_idx_from_contig(&l).to_string())
-                    .unwrap_or_else(|| format!("##contig=<ID={}>", meta.chromosome)));
-                chromosomes.push((meta.chromosome.clone(), Source::File(f)));
-            }
-        }
-        _ => unreachable!("a multi-chromosome panel is opened above"),
-    }
-    let declared = crate::io::bcf_encode::contig_names_from_header_lines(&contig_lines.join("\n"));
-    for (c, _) in &chromosomes {
-        if !declared.iter().any(|d| bare(d) == bare(c)) { contig_lines.push(format!("##contig=<ID={c}>")); }
-    }
-    let contig_lines = crate::io::bcf_encode::dedup_contig_lines(&contig_lines.join("\n"));
-    let contig_lines = contig_lengths.apply_logged(&contig_lines, |_| None).into_owned();
+    let set = PanelSet::open(panels, maps)?;
+    let contig_lines = contig_lengths.apply_logged(set.contig_lines(), |_| None).into_owned();
+    let chromosomes: Vec<&str> = set.chromosomes().collect();
 
     // The chromosomes the input covers; the others are left out without a run.
     let covered = match &input {
@@ -104,28 +159,19 @@ pub fn run(
         Input::Bam { paths, .. } => super::bam_pileup::covered_contigs(paths)?,
     };
     crate::selphi_step!("lcWGS on a multi-chromosome panel: {} chromosome(s), {} covered by the input, one run each",
-        chromosomes.len(), chromosomes.iter().filter(|(c, _)| covered.contains(bare(c))).count());
+        chromosomes.len(), chromosomes.iter().filter(|c| covered.contains(bare(c))).count());
     let mut writers: Option<(LcwgsVcfWriter, DoseTsvWriter, Vec<String>)> = None;
     let (mut done, mut skipped): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
-    for (chr, source) in &chromosomes {
+    for &chr in &chromosomes {
         if !covered.contains(bare(chr)) { continue; }
         if crate::contig::nonrecomb_refusal(chr).is_some() {
             skipped.push(format!("{chr} (non-recombining)"));
             continue;
         }
         // A covered chromosome needs its map, as the genotype path requires.
-        let map = match &maps {
-            Maps::File(f) => f.to_string(),
-            Maps::Dir(d) => crate::genmap::find_map_in_dir(d, bare(chr))
-                .map(|p| p.to_string_lossy().into_owned())
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound,
-                    format!("no genetic map for chromosome {chr} in {} (the input covers it)", d.display())))?,
-        };
+        let map = set.map(chr)?;
         crate::selphi_step!("lcWGS chromosome {}", chr);
-        let srp = match source {
-            Source::View(reader) => reader.load_chr_view(chr)?.into_srp_reader(),
-            Source::File(f) => SrpReader::open(f, 0)?,
-        };
+        let srp = set.load(chr)?;
         let res = match &input {
             Input::Pl(p) => super::pipeline::run_lcwgs(p, &srp, &map, params, threads),
             Input::Bam { paths, reference } => super::pipeline::run_lcwgs_bam(paths, &srp, &map, params, None, *reference, threads),
@@ -151,7 +197,7 @@ pub fn run(
         }
         v.append(&out, &srp)?;
         d.append(&out, &srp)?;
-        done.push(chr.clone());
+        done.push(chr.to_string());
         drop(out);
         drop(srp);
         crate::common::mem::release_freed_memory();

@@ -10,11 +10,11 @@
 //! The FORMAT field tells us whether to recompute chip-style INFO (AF/AC/AN)
 //! or imputed-style INFO (AF/AC/AN/DR2/IMP).
 
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
-use noodles_bgzf::io::{Reader as BgzfReader, multithreaded_writer};
+use noodles_bgzf::io::Reader as BgzfReader;
 use crate::io::vcf_fmt::{write_f4, write_u32};
 
 /// Merge N per-batch VCF.gz files into a single merged VCF.gz at `output_path`.
@@ -36,15 +36,8 @@ pub fn merge_batch_vcfs(
         return Err(std::io::Error::other("no batch files to merge"));
     }
 
-    // Compression workers do not change the bytes (fixed-size blocks deflated
-    // independently); the file buffer saves noodles' per-frame small writes;
-    // the tap reports block sizes so the .tbi is built as the file is written.
-    let out_file = BufWriter::with_capacity(1 << 20, std::fs::File::create(output_path)?);
-    let (block_tx, block_rx) = std::sync::mpsc::channel();
-    let mut writer = multithreaded_writer::Builder::default()
-        .set_worker_count(std::num::NonZeroUsize::new(rayon::current_num_threads().max(1)).unwrap())
-        .build_from_writer(crate::srp::csi::BgzfBlockTap::new(out_file, block_tx));
-    let mut index = crate::srp::csi::TbiStreamIndexer::new(block_rx);
+    // The tap reports block sizes so the .tbi is built as the file is written.
+    let (mut writer, mut index) = crate::srp::csi::tapped_bgzf_writer(output_path, rayon::current_num_threads())?;
 
     // Open batch readers and skip headers. We need each batch's per-sample
     // count to size the line-merge buffer.

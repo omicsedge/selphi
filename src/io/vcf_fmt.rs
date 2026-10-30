@@ -117,26 +117,27 @@ fn structured_fields(v: &str) -> Result<Vec<(&str, &str)>, String> {
     }
 }
 
+/// The text htslib compares two header lines by: `##key=<ID=id>` for a structured line with an
+/// ID, the whole line otherwise.
+pub(crate) fn header_line_identity(l: &str) -> String {
+    if let Some((key, value)) = l.get(2..).and_then(|b| b.split_once('='))
+        && value.starts_with('<')
+        && let Ok(fields) = structured_fields(value)
+        && let Some((_, id)) = fields.iter().find(|(k, _)| *k == "ID")
+    {
+        return format!("##{key}=<ID={id}>");
+    }
+    l.to_string()
+}
+
 /// Check the `--header-line` values together (each was checked alone by
 /// [`parse_header_line`]): htslib keeps the first of two equal `##key=value`
 /// lines, and of two structured lines with the same key and `ID`, and drops the
 /// other without a word, so a value given twice is refused instead.
 pub fn check_header_lines(lines: &[String]) -> Result<(), String> {
-    // The text htslib compares: `##key=<ID=id>` for a structured line with an ID,
-    // the whole line otherwise.
-    let identity = |l: &str| -> String {
-        if let Some((key, value)) = l.get(2..).and_then(|b| b.split_once('='))
-            && value.starts_with('<')
-            && let Ok(fields) = structured_fields(value)
-            && let Some((_, id)) = fields.iter().find(|(k, _)| *k == "ID")
-        {
-            return format!("##{key}=<ID={id}>");
-        }
-        l.to_string()
-    };
     let mut seen: Vec<(String, &str)> = Vec::with_capacity(lines.len());
     for l in lines {
-        let id = identity(l);
+        let id = header_line_identity(l);
         if let Some((_, first)) = seen.iter().find(|(s, _)| *s == id) {
             return Err(if *first == l.as_str() {
                 format!("\"{l}\" is given twice")

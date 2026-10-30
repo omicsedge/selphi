@@ -41,16 +41,9 @@ pub fn load_genetic_map_raw(map_path: &Path) -> std::io::Result<(Vec<i64>, Vec<f
 /// per-sample R2 and 1.3% of variants silently missing from the output.
 pub fn load_genetic_map_for(map_path: &Path, contig: Option<&str>) -> std::io::Result<(Vec<i64>, Vec<f64>)> {
     let spec = map_path.to_string_lossy();
-    let mut files: Vec<std::path::PathBuf> = spec.split(',').map(str::trim).filter(|p| !p.is_empty())
-        .map(std::path::PathBuf::from).collect();
-    // One chrX map given alone: join the PAR1/PAR2 files that sit next to it.
-    if files.len() == 1 {
-        let pars = chrx_par_siblings(&files[0]);
-        if !pars.is_empty() {
-            crate::selphi_info!("  genetic map: {} joined with {} PAR map file(s) beside it",
-                files[0].display(), pars.len());
-            files.extend(pars);
-        }
+    let (files, n_given) = map_files(map_path);
+    if n_given == 1 && files.len() > 1 {
+        crate::selphi_info!("  genetic map: {} joined with {} PAR map file(s) beside it", files[0].display(), files.len() - 1);
     }
     if files.len() > 1 {
         let parts: Vec<(Vec<i64>, Vec<f64>)> = files.iter()
@@ -59,6 +52,23 @@ pub fn load_genetic_map_for(map_path: &Path, contig: Option<&str>) -> std::io::R
             format!("{}: {}", spec, e)));
     }
     load_one_map(map_path, contig)
+}
+
+/// The files a map specification reads, exactly as [`load_genetic_map_for`] opens them (`a,b,c`:
+/// each trimmed; one chrX map alone: trimmed, with the PAR maps beside it, [`chrx_par_siblings`];
+/// any other specification naming one file or none: as given), and how many it names.
+pub fn map_files(spec: &Path) -> (Vec<std::path::PathBuf>, usize) {
+    let text = spec.to_string_lossy();
+    let mut files: Vec<std::path::PathBuf> = text.split(',').map(str::trim).filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from).collect();
+    let n = files.len();
+    if n == 0 { return (vec![spec.to_path_buf()], 0); }
+    if n == 1 {
+        let pars = chrx_par_siblings(&files[0]);
+        if pars.is_empty() { return (vec![spec.to_path_buf()], 1); }
+        files.extend(pars);
+    }
+    (files, n)
 }
 
 /// The PAR maps that ship beside a chrX map: for `.../plink.chrX.GRCh38.map`, the existing
