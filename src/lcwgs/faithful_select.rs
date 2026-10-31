@@ -842,7 +842,9 @@ mod tests {
         use crate::lcwgs::hmm::reference_pack as rp;
         let mut rng = rp::Xs(0x6A09_E667_F3BC_C908);
         let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
-        for &(n_var, n_haps, n_samples) in &[(1800usize, 3000usize, 1usize), (900, 2500, 3), (600, 1200, 1), (260, 70_000, 1)] {
+        // Small panels keep every decoded column; 40,000 (16-bit ids) and
+        // 70,000 (32-bit) haplotypes trace entries back to kept columns.
+        for &(n_var, n_haps, n_samples) in &[(1800usize, 3000usize, 1usize), (900, 2500, 3), (600, 1200, 1), (260, 40_000, 1), (260, 70_000, 1)] {
             let bm = rp::random_typed_panel(&mut rng, n_var, n_haps);
             let cm: Vec<f64> = (0..n_var).map(|v| v as f64 * 0.0011).collect();
             let gl3: Vec<f32> = (0..n_var * n_samples).flat_map(|_| match rng.below(3) {
@@ -852,7 +854,7 @@ mod tests {
             }).collect();
             let mut params = LcwgsParams::default();
             params.kpbwt = 300;
-            let segs: &[Option<usize>] = if n_haps > 65_536 { &[Some(9)] } else { &[None, Some(1), Some(7), Some(64)] };
+            let segs: &[Option<usize>] = if n_haps > 30_000 { &[Some(9)] } else { &[None, Some(1), Some(7), Some(64)] };
             for &seg in segs {
                 let make = |segmented: bool| {
                     let mut f = FaithfulSelector::build(&bm, &cm, &gl3, n_samples, &params, 99);

@@ -59,7 +59,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::LcwgsParams;
 use crate::common::HaplotypeBitmatrix;
-use crate::common::bit_gather::{GatherWord, build_gather_plan, gather_row};
+use crate::common::bit_gather::{GatherPlan, gather_row};
 
 pub(crate) mod two_pass;
 
@@ -114,10 +114,12 @@ pub(crate) const CACHE_BYTES_PER_WORKER: usize = 8 * CACHE_BUFFER_BYTES;
 struct TrimCaches;
 impl Drop for TrimCaches {
     fn drop(&mut self) {
+        // A chain pool's worker keeps nothing (see `memory::is_chain_worker`).
+        let keep = if super::memory::is_chain_worker() { 0 } else { CACHE_BUFFER_BYTES };
         for key in [&TL_ALPHA, &TL_BETA, &TL_ALPHA_SUM, &TL_EMIT, &TL_PREC, &TL_BLK, &TL_FCOL] {
-            key.with(|c| super::membership::trim_vec(&mut c.borrow_mut(), CACHE_BUFFER_BYTES));
+            key.with(|c| super::membership::trim_vec(&mut c.borrow_mut(), keep));
         }
-        TL_CONDBITS.with(|c| super::membership::trim_vec(&mut c.borrow_mut(), CACHE_BUFFER_BYTES));
+        TL_CONDBITS.with(|c| super::membership::trim_vec(&mut c.borrow_mut(), keep));
     }
 }
 
@@ -153,14 +155,14 @@ pub struct BasePack {
     /// Absolute site → row (`u32::MAX` = site not packed).
     pub row_of_abs: Vec<u32>,
     /// Gather plan of the base states (scratch reused across builds).
-    plan: Vec<GatherWord>,
+    plan: GatherPlan,
 }
 impl Default for BasePack {
     fn default() -> Self { Self::new() }
 }
 impl BasePack {
     pub const fn new() -> Self {
-        BasePack { words: Vec::new(), b: 0, wb: 0, row_of_abs: Vec::new(), plan: Vec::new() }
+        BasePack { words: Vec::new(), b: 0, wb: 0, row_of_abs: Vec::new(), plan: GatherPlan::new() }
     }
     /// Replace the prefix storage with FB0's complete pack, recycling the old
     /// storage for FB1. Its first `b` states remain a valid shared prefix, even
@@ -176,6 +178,17 @@ impl BasePack {
         } else {
             for (a, r) in self.row_of_abs.iter_mut().enumerate() { *r = a as u32; }
         }
+    }
+    /// A haplotype's complete pack ([`pack_cond_rows`] of its `k` states over
+    /// `sites`, every site when `None`) as the pack of all `k` states.
+    pub(crate) fn complete(words: Vec<u64>, k: usize, sites: Option<&[usize]>, n_sites_total: usize) -> Self {
+        let mut row_of_abs = vec![u32::MAX; n_sites_total];
+        match sites {
+            Some(sites) => for (r, &a) in sites.iter().enumerate() { row_of_abs[a] = r as u32; },
+            None => for (a, r) in row_of_abs.iter_mut().enumerate() { *r = a as u32; },
+        }
+        debug_assert_eq!(words.len(), sites.map_or(n_sites_total, <[usize]>::len) * k.div_ceil(64));
+        BasePack { words, b: k, wb: k.div_ceil(64), row_of_abs, plan: GatherPlan::new() }
     }
     /// Pack the alleles of `base` (the shared conditioning prefix) at the
     /// absolute sites `sites_abs` (ascending). `n_sites_total` sizes the
@@ -200,7 +213,7 @@ impl BasePack {
         self.words.clear();
         self.words.reserve_exact(total);
         if self.b > 0 {
-            build_gather_plan(base, &mut self.plan);
+            self.plan.build(base, ref_bm.n_haps);
             let plan = &self.plan;
             let wb = self.wb;
             let pack = |(r, dst): (usize, &mut [std::mem::MaybeUninit<u64>])| {
@@ -226,7 +239,7 @@ impl BasePack {
 /// of its (possibly compacted) axis: `out[v * w64 + w]`, `w64 = ceil(K/64)`,
 /// bit `k` of row `v` = `ref_bm.get(site(v), cond[k])` with `site(v) =
 /// poly_sites[v]` (or `v`). Word-at-a-time gather through a per-panel-word
-/// extract plan ([`build_gather_plan`], [`gather_row`]).
+/// extract plan ([`GatherPlan`], [`gather_row`]).
 ///
 /// With `base = Some(bp)`, `cond[..bp.b]` MUST equal the base states `bp` was
 /// built from (the caller's shared prefix): rows whose site is in the base pack
@@ -258,16 +271,16 @@ pub(crate) fn pack_cond_rows_with_parallelism(
     out.reserve_exact(total);
     let base = base.filter(|bp| bp.b > 0 && bp.b <= k);
     if w64 > 0 {
-        let mut tail_plan: Vec<GatherWord> = Vec::new();
-        if let Some(bp) = base { build_gather_plan(&cond[bp.b..], &mut tail_plan); }
+        let mut tail_plan = GatherPlan::new();
+        if let Some(bp) = base { tail_plan.build(&cond[bp.b..], ref_bm.n_haps); }
         // Plans are immutable before any row task starts. Missing rows gather
         // the whole set; present rows copy the prefix in its original state order.
         let missing = base.is_none_or(|bp| (0..n_var).any(|v| {
             let a = poly_sites.map_or(v, |ps| ps[v]);
             bp.row_of_abs.get(a).copied().unwrap_or(u32::MAX) == u32::MAX
         }));
-        let mut full_plan = Vec::new();
-        if missing { build_gather_plan(cond, &mut full_plan); }
+        let mut full_plan = GatherPlan::new();
+        if missing { full_plan.build(cond, ref_bm.n_haps); }
         let pack = |(v, row): (usize, &mut [std::mem::MaybeUninit<u64>])| {
             let a = poly_sites.map_or(v, |ps| ps[v]);
             let rp = ref_bm.row(a).as_ptr();

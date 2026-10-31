@@ -62,6 +62,13 @@ enum Packed {
     Base,
 }
 
+impl Packed {
+    /// The words the forward-backward reads: the haplotype's own pack or the shared prefix.
+    fn words<'a>(self, own: &'a [u64], base: &'a BasePack) -> Option<&'a [u64]> {
+        match self { Packed::No => None, Packed::Own => Some(own), Packed::Base => Some(base.words.as_slice()) }
+    }
+}
+
 /// Time spent in the fused per-sample re-phasing, SUMMED over threads
 /// (`LCWGS_TIMING` only) — the phase now runs inside the parallel per-sample
 /// task, so it has no separate wall-clock share of its own; `hmm` is that
@@ -1169,6 +1176,8 @@ fn run_gibbs_with_memory(
         // Passenger pass this iteration (main iterations only, every Nth).
         let pass_now = pass.is_some() && is_main && (it - n_burnin).is_multiple_of(pass_every);
         let pass_sites = if pass_now { n_pass } else { 0 };
+        // A single sample's passenger forward-backward runs beside its haplotype's own.
+        let pass_beside = pass_now && memory.is_some();
         // FAITHFUL GLIMPSE2 phasing HMM: every re-phase iteration, re-phase each
         // sample's H0/H1 via the ported phasing_hmm (8-founder diplotype SAMPLE_DIP).
         // Genotype-preserving (re-phases hets); feeds the next iteration's selection
@@ -1256,62 +1265,82 @@ fn run_gibbs_with_memory(
                     pass_now.then(|| passenger_dose(h, partner, c, gl3, n_samples, ref_bm, cm, params,
                         sp.map(|x| x.poly.as_slice()), band, pass.unwrap(), pass_model.as_ref().unwrap(), two_pass, mp))
                 };
-                let fb0 = |hp: &mut Vec<u64>| {
-                    let pack = match pack_for(c0, split0, &base, hp) {
-                        Packed::No => None, Packed::Own => Some(hp.as_slice()), Packed::Base => Some(base.words.as_slice()),
-                    };
-                    let (d, smp) = run_one_hap(
+                // A haplotype's passenger pass reads what its own pass reads, not
+                // its result: a single sample runs the two side by side.
+                let beside = |main: &(dyn Fn() -> (Vec<f32>, Vec<u8>) + Sync), pass: &(dyn Fn() -> Option<Vec<f32>> + Sync)| {
+                    let ((d, smp), pd) = if pass_beside { rayon::join(main, pass) } else { (main(), pass()) };
+                    (d, smp, pd)
+                };
+                let fb0 = |pack: Option<&[u64]>| beside(
+                    &|| run_one_hap(
                         h0i, it, seed,
                         |v| prev_alleles[v * n_target_haps + h1i] as usize,
                         c0, gl3, n_samples, ref_bm, cm, params,
                         use_scaffold, &common_idx, n_var,
                         split0.map(|x| (x, ic_all, ps_mono_alt.as_slice())),
                         full_axis_rmult.as_deref(),
-                        pack, two_pass);
-                    let pd = pass_fb(h0i, &|v| prev_alleles[v * n_target_haps + h1i] as usize, c0, split0, pack);
-                    (d, smp, pd)
-                };
-                let fb1 = |fresh: Option<&[u8]>, hp: &mut Vec<u64>| {
-                    let pack = match pack_for(c1, split1, &base, hp) {
-                        Packed::No => None, Packed::Own => Some(hp.as_slice()), Packed::Base => Some(base.words.as_slice()),
-                    };
-                    let (d, smp) = run_one_hap(
+                        pack, two_pass),
+                    &|| pass_fb(h0i, &|v| prev_alleles[v * n_target_haps + h1i] as usize, c0, split0, pack));
+                let fb1 = |fresh: Option<&[u8]>, pack: Option<&[u64]>| beside(
+                    &|| run_one_hap(
                         h1i, it, seed,
                         |v| fresh.map_or(prev_alleles[v * n_target_haps + h0i], |a| a[v]) as usize,
                         c1, gl3, n_samples, ref_bm, cm, params,
                         use_scaffold, &common_idx, n_var,
                         split1.map(|x| (x, ic_all, ps_mono_alt.as_slice())),
                         full_axis_rmult.as_deref(),
-                        pack, two_pass);
-                    let pd = pass_fb(h1i, &|v| fresh.map_or(prev_alleles[v * n_target_haps + h0i], |a| a[v]) as usize, c1, split1, pack);
-                    (d, smp, pd)
-                };
+                        pack, two_pass),
+                    &|| pass_fb(h1i, &|v| fresh.map_or(prev_alleles[v * n_target_haps + h0i], |a| a[v]) as usize, c1, split1, pack));
                 let extra = if !is_main && !gs && rayon::current_num_threads() > 1 {
                     memory.and_then(|m| m.try_parallel_fb(super::memory::fb_bytes(n_var, c1.len())
                         + two_pass_bytes(c1.len())))
                 } else { None };
-                let results = if let Some(_permit) = extra {
-                    rayon::join(|| fb0(&mut Vec::new()), || {
-                        let out = fb1(None, &mut Vec::new());
+                let (mut hp0, mut hp1) = (Vec::new(), Vec::new());
+                let (results, p0) = if let Some(_permit) = extra {
+                    let ((first, p0), second) = rayon::join(|| {
+                        let p0 = pack_for(c0, split0, &base, &mut hp0);
+                        (fb0(p0.words(&hp0, &base)), p0)
+                    }, || {
+                        let p1 = pack_for(c1, split1, &base, &mut hp1);
+                        let out = fb1(None, p1.words(&hp1, &base));
                         super::memory::collect_local();
                         out
-                    })
+                    });
+                    ((first, second), p0)
+                } else if two_pass {
+                    // The second haplotype's pack depends only on its set: a
+                    // single sample builds it while the first one runs.
+                    let ((p0, first), p1) = rayon::join(|| {
+                        let p0 = pack_for(c0, split0, &base, &mut hp0);
+                        (p0, fb0(p0.words(&hp0, &base)))
+                    }, || pack_for(c1, split1, &base, &mut hp1));
+                    let second = fb1(gs.then_some(first.1.as_slice()), p1.words(&hp1, &base));
+                    ((first, second), p0)
                 } else {
-                    let mut hp = Vec::new();
-                    let first = fb0(&mut hp);
-                    let second = fb1(gs.then_some(first.1.as_slice()), &mut hp);
-                    (first, second)
+                    let p0 = pack_for(c0, split0, &base, &mut hp0);
+                    let first = fb0(p0.words(&hp0, &base));
+                    let p1 = pack_for(c1, split1, &base, &mut hp0);
+                    let second = fb1(gs.then_some(first.1.as_slice()), p1.words(&hp0, &base));
+                    ((first, second), p0)
                 };
-                // The shared prefix is kept for the phaser (also on the admitted
-                // path, where its permit charges a complete pack it then need
-                // not build).
-                (results, Some(base))
+                // Kept for the phaser: a single sample's first haplotype's
+                // complete pack (its set and axis are the phaser's, so no site is
+                // gathered again; under LCWGS_LS_RICH_COND the phaser gathers
+                // the states and sites it adds), else the shared prefix (also on
+                // the admitted path, where its permit charges a complete pack it
+                // then need not build).
+                let keep = match p0 {
+                    Packed::Own if two_pass => BasePack::complete(hp0, c0.len(), split0.map(|x| x.poly.as_slice()), n_var),
+                    _ => base,
+                };
+                (results, Some(keep))
             };
             // Only the admitted path waits for phaser memory. Whole-sample
             // tasks keep the shared prefix, but release the full FB pack here.
             let (((d0, mut samp0, pd0), (d1, mut samp1, pd1)), mut retained_base) = match memory {
                 Some(m) => m.run(super::memory::fb_bytes(n_var + pass_sites, c0.len().max(c1.len()))
-                    + two_pass_bytes(c0.len().max(c1.len())), fb),
+                    + two_pass_bytes(c0.len().max(c1.len()))
+                    + if pass_beside { super::hmm::two_pass::extra_bytes(n_var + pass_sites, c0.len().max(c1.len())) } else { 0 }, fb),
                 None => fb(),
             };
             if fuse_phase {
@@ -1597,6 +1626,7 @@ fn run_gibbs_with_memory(
             n_pass_acc += 1;
         }
         if let Some(t) = t0 { t_wb += t.elapsed().as_secs_f64(); }
+        if memory.is_some() { super::memory::collect_chain_pool(); }
     }
 
     if timing {
@@ -2542,7 +2572,9 @@ mod tests {
     /// bit-identical to the same chain run without them (unbudgeted and admitted
     /// executions, one and several samples, rare passengers on a 5,000-haplotype
     /// panel, and a poly axis long enough for the two-pass kernel), and the
-    /// passengers get valid doses and GP triples.
+    /// passengers get valid doses and GP triples, the same bits whether a single
+    /// sample's passenger pass runs beside its haplotype's own (admitted) or
+    /// after it (unbudgeted).
     #[test]
     fn passengers_leave_active_outputs_bit_identical() {
         use crate::lcwgs::hmm::reference_pack as rp;
@@ -2559,6 +2591,7 @@ mod tests {
             let hidden = HaplotypeBitmatrix::from_subset(&full, &(0..n_var + n_pass).collect::<Vec<_>>()).with_hidden_tail(n_var);
             let params = LcwgsParams { n_iterations: 6, n_main_iterations: 4, kpbwt: 40, pbwt_modulo_cm: 0.004, ..Default::default() };
             let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            let mut serial_pass = None;
             for admitted in [false, true] {
                 let budget = super::super::memory::MemoryBudget::new(256 * 1024 * 1024, 1024);
                 let exec = || if admitted && n_samples == 1 { SampleExecution::Admitted(&budget) } else { SampleExecution::Unbudgeted };
@@ -2575,6 +2608,11 @@ mod tests {
                     assert!((g.iter().sum::<f32>() - 1.0).abs() < 1e-4, "passenger GP sums to {}", g.iter().sum::<f32>());
                     assert!((out.pass_dosage[i] - (g[1] + 2.0 * g[2])).abs() < 1e-4);
                     assert!((0.0..=2.0).contains(&out.pass_dosage[i]));
+                }
+                let pass_bits = (bits(&out.pass_dosage), bits(&out.pass_gp));
+                match &serial_pass {
+                    None => serial_pass = Some(pass_bits),
+                    Some(serial) => assert_eq!(&pass_bits, serial, "passengers n_var={n_var} samples={n_samples} admitted={admitted}"),
                 }
             }
         }

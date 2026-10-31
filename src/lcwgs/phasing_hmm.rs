@@ -220,11 +220,11 @@ pub struct PhasingHmm {
     /// Gather plans of the CURRENT `rephase` call's conditioning set, built at
     /// its head (SIMD paths only): `plan_full` over `cond_haps`, `plan_tail`
     /// over `cond_haps[b..]` when a usable base pack is set. `pack_condbits`
-    /// packs a site through them (see `crate::common::bit_gather::build_gather_plan`).
+    /// packs a site through them (see `crate::common::bit_gather::GatherPlan`).
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    plan_full: Vec<crate::common::bit_gather::GatherWord>,
+    plan_full: crate::common::bit_gather::GatherPlan,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    plan_tail: Vec<crate::common::bit_gather::GatherWord>,
+    plan_tail: crate::common::bit_gather::GatherPlan,
     /// Run the backward and forward passes of `rephase` as two concurrent
     /// Rayon tasks (see [`Self::two_pass_states`]). Off by default.
     two_pass: bool,
@@ -316,7 +316,7 @@ macro_rules! phasing_kernel_avx512 {
     (
         $(#[$attr:meta])*
         trans fn $name:ident(&mut $self:ident $(, $arg:ident : $aty:ty)*);
-        ctx { $pp:ident $k:ident $base:ident $p:ident $scale:ident $nt_s:ident $tfreq:ident $nts:ident $sumv:ident $kpair:ident }
+        ctx { $pp:ident $k:ident $base:ident $p:ident $scale:ident $nt_s:ident $tfreq:ident $nts:ident $sumv:ident $kpair:ident $mx:ident }
         setup { $($setup:tt)* }
         stay  { $($stay:tt)* }
         sel   { $($sel:tt)* }
@@ -335,6 +335,10 @@ macro_rules! phasing_kernel_avx512 {
             let $kpair = $self.n_states & !1usize;
             let $pp = $self.prob.as_mut_ptr();
             let mut $sumv = _mm512_setzero_ps();
+            // The allele masks of the next pairs (see `pair_mask`); unused by
+            // the kernels without an allele-dependent factor.
+            #[allow(unused_mut, unused_variables)]
+            let mut $mx = 0u64;
             let mut $k = 0;
             while $k < $kpair {
                 let $base = $k * HAP_NUMBER;
@@ -353,7 +357,7 @@ macro_rules! phasing_kernel_avx512 {
     (
         $(#[$attr:meta])*
         init fn $name:ident(&mut $self:ident $(, $arg:ident : $aty:ty)*);
-        ctx { $pp:ident $k:ident $sumv:ident $kpair:ident }
+        ctx { $pp:ident $k:ident $sumv:ident $kpair:ident $mx:ident }
         setup { $($setup:tt)* }
         body  { $($body:tt)* }
         tail  { $($tail:tt)* }
@@ -367,6 +371,7 @@ macro_rules! phasing_kernel_avx512 {
             let $kpair = $self.n_states & !1usize;
             let $pp = $self.prob.as_mut_ptr();
             let mut $sumv = _mm512_setzero_ps();
+            let mut $mx = 0u64;
             let mut $k = 0;
             while $k < $kpair {
                 $($body)*
@@ -449,8 +454,8 @@ impl PhasingHmm {
             condbits: Vec::new(),
             condrow: std::ptr::null(),
             base_pack: std::ptr::null(),
-            plan_full: Vec::new(),
-            plan_tail: Vec::new(),
+            plan_full: crate::common::bit_gather::GatherPlan::new(),
+            plan_tail: crate::common::bit_gather::GatherPlan::new(),
             two_pass: false,
             release_above: None,
             #[cfg(test)]
@@ -625,15 +630,14 @@ impl PhasingHmm {
     /// `plan_full` over all of `cond_haps`, `plan_tail` over the states after
     /// the base prefix when the base pack is usable. O(K) once per `rephase`.
     #[cfg(target_arch = "x86_64")]
-    fn build_condbit_plans(&mut self, cond_haps: &[u32]) {
-        use crate::common::bit_gather::build_gather_plan;
-        build_gather_plan(cond_haps, &mut self.plan_full);
-        self.plan_tail.clear();
+    fn build_condbit_plans(&mut self, cond_haps: &[u32], n_ref: usize) {
+        self.plan_full.build(cond_haps, n_ref);
+        self.plan_tail.build(&[], n_ref);
         if !self.base_pack.is_null() {
             // SAFETY: set by `rephase` from a reference that outlives the call.
             let bp = unsafe { &*self.base_pack };
             if bp.b > 0 && bp.b <= cond_haps.len() {
-                build_gather_plan(&cond_haps[bp.b..], &mut self.plan_tail);
+                self.plan_tail.build(&cond_haps[bp.b..], n_ref);
             }
         }
     }
@@ -1357,6 +1361,42 @@ impl PhasingHmm {
         let fact2 = nt / fwd.sum_t;
         let f2v = _mm256_set1_ps(fact2);
         let probp = fwd.prob;
+        let mut f1v = [_mm256_setzero_ps(); HAP_NUMBER];
+        for (h1, f) in f1v.iter_mut().enumerate() {
+            *f = _mm256_set1_ps((fwd.sum_h[h1] / fwd.sum_t) * yt / n_states as f32);
+        }
+        // One accumulator per h1, each summed over k in order: the eight
+        // dependency chains run side by side (one pass over both blocks).
+        let mut sumv = [_mm256_setzero_ps(); HAP_NUMBER];
+        for k in 0..n_states {
+            let base = k * HAP_NUMBER;
+            let ppv = _mm256_loadu_ps(bwd.add(base));
+            for h1 in 0..HAP_NUMBER {
+                // prob0 = prob[base+h1]*fact2 + fact1 (scalar, broadcast).
+                let p0v = _mm256_fmadd_ps(_mm256_set1_ps(*probp.add(base + h1)), f2v, f1v[h1]);
+                sumv[h1] = _mm256_fmadd_ps(p0v, ppv, sumv[h1]); // sum += prob0 * phasingProb
+            }
+        }
+        let mut hprobs = [0.0f32; HAP_NUMBER * HAP_NUMBER];
+        let mut sum_hprobs = 0.0f32;
+        for (h1, s) in sumv.iter().enumerate() {
+            _mm256_storeu_ps(hprobs.as_mut_ptr().add(h1 * HAP_NUMBER), *s);
+            sum_hprobs += Self::hsum256(*s);
+        }
+        (hprobs, sum_hprobs)
+    }}
+
+    /// [`Self::trans_hap_avx2_raw`] one h1 at a time (the form it replaced),
+    /// kept as its reference.
+    #[cfg(all(test, target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn trans_hap_avx2_reference(
+        n_states: usize, yt: f32, nt: f32, fwd: &TransInput, bwd: *const f32,
+    ) -> ([f32; HAP_NUMBER * HAP_NUMBER], f32) { unsafe {
+        use core::arch::x86_64::*;
+        let fact2 = nt / fwd.sum_t;
+        let f2v = _mm256_set1_ps(fact2);
+        let probp = fwd.prob;
         let mut hprobs = [0.0f32; HAP_NUMBER * HAP_NUMBER];
         let mut sum_hprobs = 0.0f32;
         for h1 in 0..HAP_NUMBER {
@@ -1365,11 +1405,10 @@ impl PhasingHmm {
             let mut sumv = _mm256_setzero_ps();
             for k in 0..n_states {
                 let base = k * HAP_NUMBER;
-                // prob0 = prob[base+h1]*fact2 + fact1 (scalar, broadcast).
                 let prob0 = *probp.add(base + h1);
                 let p0v = _mm256_fmadd_ps(_mm256_set1_ps(prob0), f2v, f1v);
                 let ppv = _mm256_loadu_ps(bwd.add(base));
-                sumv = _mm256_fmadd_ps(p0v, ppv, sumv); // sum += prob0 * phasingProb
+                sumv = _mm256_fmadd_ps(p0v, ppv, sumv);
             }
             let j = h1 * HAP_NUMBER;
             _mm256_storeu_ps(hprobs.as_mut_ptr().add(j), sumv);
@@ -1402,38 +1441,33 @@ impl PhasingHmm {
         self.store_sum256(s8);
     }}
 
-    /// Build the 16-lane emission vector `[emit_for_k | emit_for_{k+1}]` for a
-    /// het site: each 8-lane half is emit0/emit1 selected by that state's allele.
+    /// The 16-lane allele mask of states `k`, `k + 1` (lanes 0..8 set when
+    /// state `k` carries the ALT allele, lanes 8..16 for `k + 1`) — the blend
+    /// mask of the het emission and, inverted for an ALT site, of the hom
+    /// mismatch. At every multiple of 8 one byte of the current row expands
+    /// into the masks of the next four pairs ([`PAIR_MASKS`]); `mx` carries
+    /// them. Pairs are visited in order from `k = 0`.
     #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512dq")]
-    unsafe fn emit_pair512(
-        &self,
-        k: usize,
-        e0: core::arch::x86_64::__m512,
-        e1: core::arch::x86_64::__m512,
-    ) -> core::arch::x86_64::__m512 { unsafe {
-        use core::arch::x86_64::*;
-        // low half (k) uses bit 0..8 of mask, high half (k+1) uses bit 8..16.
-        let bits = (*self.condrow.add(k / 64) >> (k % 64)) & 0b11;
-        let m: u16 = match bits {
-            0b00 => 0x0000,
-            0b01 => 0x00FF, // k alt
-            0b10 => 0xFF00, // k+1 alt
-            _ => 0xFFFF,
-        };
-        _mm512_mask_blend_ps(m, e0, e1)
+    #[inline(always)]
+    unsafe fn pair_mask(&self, k: usize, mx: &mut u64) -> u16 { unsafe {
+        if k % 8 == 0 {
+            *mx = PAIR_MASKS[((*self.condrow.add(k / 64) >> (k % 64)) & 0xFF) as usize];
+        }
+        let m = *mx as u16;
+        *mx >>= 16;
+        m
     }}
 
     phasing_kernel_avx512! {
         /// INIT_PEAK_HET AVX-512 (two k per __m512).
         init fn init_peak_het_avx512(&mut self, curr_het: usize);
-        ctx { pp k sumv kpair }
+        ctx { pp k sumv kpair mx }
         setup {
             let e0 = Self::dup8_to_512(self.emit0[curr_het].as_ptr());
             let e1 = Self::dup8_to_512(self.emit1[curr_het].as_ptr());
         }
         body {
-            let ev = self.emit_pair512(k, e0, e1);
+            let ev = _mm512_mask_blend_ps(self.pair_mask(k, &mut mx), e0, e1);
             _mm512_storeu_ps(pp.add(k * HAP_NUMBER), ev);
             sumv = _mm512_add_ps(sumv, ev);
         }
@@ -1445,13 +1479,14 @@ impl PhasingHmm {
     phasing_kernel_avx512! {
         /// INIT_PEAK_HOM AVX-512.
         init fn init_peak_hom_avx512(&mut self, ag: bool, mism: f32);
-        ctx { pp k sumv kpair }
+        ctx { pp k sumv kpair mx }
         setup {
             let one = _mm512_set1_ps(1.0);
             let mv = _mm512_set1_ps(mism);
+            let flip = if ag { u16::MAX } else { 0 };
         }
         body {
-            let m = self.hom_mask_pair(k, ag);
+            let m = self.pair_mask(k, &mut mx) ^ flip;
             let v = _mm512_mask_blend_ps(m, one, mv);
             _mm512_storeu_ps(pp.add(k * HAP_NUMBER), v);
             sumv = _mm512_add_ps(sumv, v);
@@ -1464,7 +1499,7 @@ impl PhasingHmm {
     phasing_kernel_avx512! {
         /// RUN_PEAK_HET AVX-512.
         trans fn run_peak_het_avx512(&mut self, curr_het: usize);
-        ctx { pp k base p scale nt_s tfreq nts sumv kpair }
+        ctx { pp k base p scale nt_s tfreq nts sumv kpair mx }
         setup {
             let e0 = Self::dup8_to_512(self.emit0[curr_het].as_ptr());
             let e1 = Self::dup8_to_512(self.emit1[curr_het].as_ptr());
@@ -1474,7 +1509,7 @@ impl PhasingHmm {
             let t = _mm512_fmadd_ps(pv, nts, tfreq);
         }
         sel {
-            let ev = self.emit_pair512(k, e0, e1);
+            let ev = _mm512_mask_blend_ps(self.pair_mask(k, &mut mx), e0, e1);
             let p = _mm512_mul_ps(t, ev);
         }
         tail {
@@ -1485,17 +1520,18 @@ impl PhasingHmm {
     phasing_kernel_avx512! {
         /// RUN_PEAK_HOM AVX-512.
         trans fn run_peak_hom_avx512(&mut self, ag: bool, mism: f32);
-        ctx { pp k base p scale nt_s tfreq nts sumv kpair }
+        ctx { pp k base p scale nt_s tfreq nts sumv kpair mx }
         setup {
             let mv = _mm512_set1_ps(mism);
             let one = _mm512_set1_ps(1.0);
+            let flip = if ag { u16::MAX } else { 0 };
         }
         stay {
             let pv = _mm512_loadu_ps(pp.add(base));
             let t = _mm512_fmadd_ps(pv, nts, tfreq);
         }
         sel {
-            let m = self.hom_mask_pair(k, ag);
+            let m = self.pair_mask(k, &mut mx) ^ flip;
             let ml = _mm512_mask_blend_ps(m, one, mv);
             let p = _mm512_mul_ps(t, ml);
         }
@@ -1507,7 +1543,7 @@ impl PhasingHmm {
     phasing_kernel_avx512! {
         /// RUN_FLAT_HET AVX-512.
         trans fn run_flat_het_avx512(&mut self);
-        ctx { pp k base p scale nt_s tfreq nts sumv kpair }
+        ctx { pp k base p scale nt_s tfreq nts sumv kpair mx }
         setup {}
         stay {
             let pv = _mm512_loadu_ps(pp.add(base));
@@ -1522,7 +1558,7 @@ impl PhasingHmm {
     phasing_kernel_avx512! {
         /// COLLAPSE_PEAK_HET AVX-512.
         trans fn collapse_peak_het_avx512(&mut self, curr_het: usize);
-        ctx { pp k base p scale nt_s tfreq nts sumv kpair }
+        ctx { pp k base p scale nt_s tfreq nts sumv kpair mx }
         setup {
             let e0 = Self::dup8_to_512(self.emit0[curr_het].as_ptr());
             let e1 = Self::dup8_to_512(self.emit1[curr_het].as_ptr());
@@ -1533,7 +1569,7 @@ impl PhasingHmm {
             let t = _mm512_fmadd_ps(pskv, nts, tfreq);
         }
         sel {
-            let ev = self.emit_pair512(k, e0, e1);
+            let ev = _mm512_mask_blend_ps(self.pair_mask(k, &mut mx), e0, e1);
             let p = _mm512_mul_ps(t, ev);
         }
         tail {
@@ -1544,17 +1580,18 @@ impl PhasingHmm {
     phasing_kernel_avx512! {
         /// COLLAPSE_PEAK_HOM AVX-512.
         trans fn collapse_peak_hom_avx512(&mut self, ag: bool, mism: f32);
-        ctx { pp k base p scale nt_s tfreq nts sumv kpair }
+        ctx { pp k base p scale nt_s tfreq nts sumv kpair mx }
         setup {
             let mv = _mm512_set1_ps(mism);
             let one = _mm512_set1_ps(1.0);
+            let flip = if ag { u16::MAX } else { 0 };
         }
         stay {
             let pskv = self.psk_pair512(k);
             let t = _mm512_fmadd_ps(pskv, nts, tfreq);
         }
         sel {
-            let m = self.hom_mask_pair(k, ag);
+            let m = self.pair_mask(k, &mut mx) ^ flip;
             let ml = _mm512_mask_blend_ps(m, one, mv);
             let p = _mm512_mul_ps(t, ml);
         }
@@ -1566,7 +1603,7 @@ impl PhasingHmm {
     phasing_kernel_avx512! {
         /// COLLAPSE_FLAT_HET AVX-512.
         trans fn collapse_flat_het_avx512(&mut self);
-        ctx { pp k base p scale nt_s tfreq nts sumv kpair }
+        ctx { pp k base p scale nt_s tfreq nts sumv kpair mx }
         setup {}
         stay {
             let pskv = self.psk_pair512(k);
@@ -1578,9 +1615,9 @@ impl PhasingHmm {
         }
     }
 
-    /// 16-lane mask for the hom mismatch (`ag != allele`) over states k, k+1.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f")]
+    /// 16-lane mask for the hom mismatch (`ag != allele`) over states k, k+1:
+    /// the per-pair form [`Self::pair_mask`] replaced, kept as its reference.
+    #[cfg(all(test, target_arch = "x86_64"))]
     unsafe fn hom_mask_pair(&self, k: usize, ag: bool) -> u16 { unsafe {
         let bits = (*self.condrow.add(k / 64) >> (k % 64)) & 0b11;
         let a0 = (bits & 1) != 0;
@@ -2492,7 +2529,7 @@ impl PhasingHmm {
         self.allocate_snapshots();
         #[cfg(target_arch = "x86_64")]
         if self.simd != SimdMode::Scalar {
-            self.build_condbit_plans(cond_haps);
+            self.build_condbit_plans(cond_haps, ref_bm.n_haps);
         }
         self.prepare_transitions(cm);
         #[cfg(test)]
@@ -2613,6 +2650,24 @@ impl PhasingHmm {
         }
     }
 }
+
+/// `PAIR_MASKS[b]`: byte `i` is 0xFF when bit `i` of `b` is set — eight
+/// conditioning states' allele bits as the four 16-bit two-state lane masks of
+/// the AVX-512 kernels (see `PhasingHmm::pair_mask`).
+#[cfg(target_arch = "x86_64")]
+const PAIR_MASKS: [u64; 256] = {
+    let mut t = [0u64; 256];
+    let mut b = 0;
+    while b < 256 {
+        let mut i = 0;
+        while i < 8 {
+            if (b >> i) & 1 != 0 { t[b] |= 0xFF << (8 * i); }
+            i += 1;
+        }
+        b += 1;
+    }
+    t
+};
 
 /// Phaser calls with fewer typed sites run their passes one after the other.
 const TWO_PASS_MIN_SITES: usize = 2048;
@@ -2971,6 +3026,56 @@ mod tests {
     }
 
     /// EMIT0/EMIT1 must match the literal emission table.
+    /// The per-row pair masks of the AVX-512 kernels are the per-pair masks
+    /// they replaced (het emission and hom mismatch, both alleles).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pair_masks_match_per_pair_masks() {
+        use crate::lcwgs::hmm::reference_pack as rp;
+        let mut rng = rp::Xs(0x9E37_79B9_7F4A_7C15);
+        for k_states in [2usize, 7, 8, 9, 63, 64, 65, 130, 3000] {
+            let row: Vec<u64> = (0..k_states.div_ceil(64)).map(|_| rng.next()).collect();
+            let mut hmm = PhasingHmm::new(&LsParams::default());
+            hmm.condrow = row.as_ptr();
+            let mut mx = 0u64;
+            for k in (0..k_states & !1).step_by(2) {
+                let m = unsafe { hmm.pair_mask(k, &mut mx) };
+                let bit = |j: usize| (row[j / 64] >> (j % 64)) & 1 != 0;
+                let alt = u16::from(bit(k)) * 0x00FF | u16::from(bit(k + 1)) * 0xFF00;
+                assert_eq!(m, alt, "k_states={k_states} k={k}");
+                unsafe {
+                    assert_eq!(m, hmm.hom_mask_pair(k, false), "k_states={k_states} k={k}");
+                    assert_eq!(m ^ u16::MAX, hmm.hom_mask_pair(k, true), "k_states={k_states} k={k}");
+                }
+            }
+        }
+    }
+
+    /// TRANS_HAP with its eight accumulators side by side equals the form
+    /// that ran one h1 at a time, bit for bit.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn trans_hap_interleaved_matches_reference() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) { return; }
+        use crate::lcwgs::hmm::reference_pack as rp;
+        let mut rng = rp::Xs(0x2545_F491_4F6C_DD1D);
+        let mut f = || (rng.below(1 << 24) as f32 + 1.0) / (1u64 << 24) as f32;
+        for n_states in [1usize, 2, 7, 64, 1001, 3000] {
+            let prob: Vec<f32> = (0..n_states * HAP_NUMBER).map(|_| f() * 1e-3).collect();
+            let bwd: Vec<f32> = (0..n_states * HAP_NUMBER).map(|_| f() * 1e-2).collect();
+            let mut sum_h = [0.0f32; HAP_NUMBER];
+            for (i, &p) in prob.iter().enumerate() { sum_h[i % HAP_NUMBER] += p; }
+            let sum_t: f32 = sum_h.iter().sum();
+            let fwd = TransInput { prob: prob.as_ptr(), sum_h, sum_t };
+            let (yt, nt) = (f() * 0.1, 0.9);
+            let got = unsafe { PhasingHmm::trans_hap_avx2_raw(n_states, yt, nt, &fwd, bwd.as_ptr()) };
+            let want = unsafe { PhasingHmm::trans_hap_avx2_reference(n_states, yt, nt, &fwd, bwd.as_ptr()) };
+            let bits = |h: &[f32]| h.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&got.0), bits(&want.0), "n_states={n_states}");
+            assert_eq!(got.1.to_bits(), want.1.to_bits(), "n_states={n_states}");
+        }
+    }
+
     #[test]
     fn emit_tables_literal() {
         let p = LsParams { err_phase: 0.25, ..Default::default() };
@@ -3110,7 +3215,7 @@ mod tests {
                     a.curr_missing_locus = rng.below(n_miss as u64) as i32;
                     a.curr_abs_locus = rng.below(n_sites as u64) as i32;
                     a.simd = SimdMode::Avx2;
-                    a.build_condbit_plans(&cond);
+                    a.build_condbit_plans(&cond, bm.n_haps);
                     let mut s = PhasingHmm::new(&params);
                     s.n_states = k; s.n_miss = n_miss;
                     s.prob = a.prob.clone(); s.impute_prob = a.impute_prob.clone();
@@ -3155,7 +3260,7 @@ mod tests {
                         h.base_pack = if b.is_some() { &base as *const _ } else { std::ptr::null() };
                         h.condbits = vec![0xA5A5_A5A5_A5A5_A5A5u64; k.div_ceil(64) + 2];
                     }
-                    new.build_condbit_plans(&c);
+                    new.build_condbit_plans(&c, bm.n_haps);
                     let w64 = k.div_ceil(64);
                     for abs in 0..n_sites {
                         new.curr_abs_locus = abs as i32;

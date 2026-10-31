@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::cpp_rng::CppRng;
-use crate::common::bit_gather::{build_gather_plan, gather_row};
+use crate::common::bit_gather::{build_gather_plan, gather_words};
 
 use super::params::*;
 use super::genotype_graph::*;
@@ -430,7 +430,7 @@ impl WindowHmmCtx<'_> {
             // SAFETY: every plan word is below `bm_nw` (asserted), so within row `w_l0 + vi_rel`;
             // the row's `k_words` words are written within `cond_bm` (sized above).
             let n = unsafe {
-                gather_row(hap_bm_hmm_ref.bits_ptr().add((w_l0 + vi_rel) * bm_nw), &plan,
+                gather_words(hap_bm_hmm_ref.bits_ptr().add((w_l0 + vi_rel) * bm_nw), &plan,
                     cond_bm.as_mut_ptr().add(vi_rel * k_words), 0, 0, 0)
             };
             debug_assert_eq!(n, k_words);

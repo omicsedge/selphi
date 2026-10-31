@@ -30,8 +30,29 @@ const LOOKAHEAD: usize = 3;
 const DECODERS: usize = 3;
 /// Runs of a full column up to this length are copied as one fixed-size block.
 const SHORT_RUN: usize = 16;
-/// A decoded segment keeps every this-many-th column output in full (see [`Node`]).
+/// A decoded segment keeps every this-many-th column output in full (see
+/// [`Node`]) when a column is larger than [`KEEP_ALL_BYTES`].
 const CHECKPOINT_EVERY: usize = 8;
+/// Columns up to this size are all kept when the longest segment has at most
+/// [`KEEP_ALL_COLUMNS`] of them: the copy is cheap, and the target half then
+/// reads every entry directly instead of tracing it back.
+const KEEP_ALL_BYTES: usize = 64 * 1024;
+/// A segment ends only where a common site follows a common site, so it can
+/// run past its `SEGMENT_COMMONS` target (135-144 columns measured on 1000
+/// Genomes chunks); [`SegmentPlan::bytes`] charges this many kept columns.
+const KEEP_ALL_COLUMNS: usize = 2 * SEGMENT_COMMONS;
+
+/// Whether a panel's columns are small enough to keep them all.
+fn small_columns(n_ref: usize) -> bool { n_ref * if narrow(n_ref) { 2 } else { 4 } <= KEEP_ALL_BYTES }
+
+/// The column outputs a decoded segment keeps in full: every one for a
+/// panel with small columns whose longest segment (`max_commons` columns) is
+/// within the charged [`KEEP_ALL_COLUMNS`], else every [`CHECKPOINT_EVERY`]-th
+/// (a biobank panel's column is hundreds of KB, and copying it made the decode
+/// memory-bound).
+fn checkpoint_every(n_ref: usize, max_commons: usize) -> usize {
+    if small_columns(n_ref) && max_commons <= KEEP_ALL_COLUMNS { 1 } else { CHECKPOINT_EVERY }
+}
 
 /// The panel-side state of the sequential sweep on entering site `k`.
 struct SegmentStart {
@@ -98,7 +119,8 @@ impl SegmentPlan {
         let in_flight = LOOKAHEAD + 1;
         // Boundary arrays, and per decoded segment its kept arrays and the two
         // arrays its decoder carries (see `Node`).
-        let arrays = sites / SEGMENT_COMMONS + 1 + in_flight * (SEGMENT_COMMONS.div_ceil(CHECKPOINT_EVERY) + 2);
+        let kept = if small_columns(n_ref) { KEEP_ALL_COLUMNS } else { SEGMENT_COMMONS.div_ceil(CHECKPOINT_EVERY) };
+        let arrays = sites / SEGMENT_COMMONS + 1 + in_flight * (kept + 2);
         let id = if narrow(n_ref) { 2 } else { 4 };
         arrays * n_ref * id + in_flight * SEGMENT_COMMONS * (words(n_ref) * 12 + 64 + 1024 * 4)
     }
@@ -185,7 +207,7 @@ enum Item {
 
 /// How a big array of a decoded segment is obtained. The decoder holds every
 /// array in turn (the sweep's state), but keeps in full only the segment's
-/// boundary array and every `CHECKPOINT_EVERY`-th column output: the target
+/// boundary array and every [`checkpoint_every`]-th column output: the target
 /// half reads a few entries of a few arrays (its harvest windows), and an
 /// entry of any other array is traced back through the columns' occurrence
 /// bits and the splices to the nearest kept array. The entries are the same.
@@ -350,7 +372,7 @@ impl<H> Decoded<H> {
     fn for_plan(plan: &SegmentPlan, n_ref: usize) -> Self {
         let nw = words(n_ref);
         Decoded {
-            big: Vec::with_capacity(plan.max_commons.div_ceil(CHECKPOINT_EVERY) * n_ref),
+            big: Vec::with_capacity(plan.max_commons.div_ceil(checkpoint_every(n_ref, plan.max_commons)) * n_ref),
             nodes: Vec::with_capacity(plan.max_big + 1),
             tails: Vec::new(),
             bits: Vec::with_capacity(plan.max_commons * nw),
@@ -376,6 +398,7 @@ fn decode<R: RefHapSet, H: Hap>(rhs: &R, m: &VariantMap, plan: &SegmentPlan, p3d
     let end = plan.starts.get(s + 1).map_or(n_tot, |x| x.k);
     let y = rhs.ypacked();
     let nw = words(n_ref);
+    let every = checkpoint_every(n_ref, plan.max_commons);
     out.big.clear();
     out.nodes.clear();
     out.tails.clear();
@@ -455,7 +478,7 @@ fn decode<R: RefHapSet, H: Hap>(rhs: &R, m: &VariantMap, plan: &SegmentPlan, p3d
             let mut acc = 0u32;
             for w in 0..nw { ones[w] = acc; acc += bits[w].count_ones(); }
             columns += 1;
-            if columns.is_multiple_of(CHECKPOINT_EVERY) {
+            if columns.is_multiple_of(every) {
                 out.nodes.push(Node::Kept(out.big.len() / n_ref));
                 out.big.extend_from_slice(&next);
             } else {
