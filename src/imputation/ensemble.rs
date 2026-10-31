@@ -234,9 +234,9 @@ fn blend_row(l: &CsrWeights, lr: usize, r: &CsrWeights, rr: usize, t: f32, out: 
 /// intermediate matrix. The aligned fold reads each row from the member's own haplotype
 /// or from its partner, so a swapped member costs nothing beyond the sum itself. Rows are
 /// read into two reused scratch buffers (it used to collect a fresh Vec per row). The sum is
-/// merged into room for both operands and copied out at its exact size: every haplotype's
-/// sum is held until the window is written, and the room (as the result, before) was held,
-/// mostly unused, as long.
+/// merged into room for both operands and copied out at its size unless that room is nearly
+/// full (`exact_size`): every haplotype's sum is held until the window is written, and the
+/// room (as the result, before) was held, mostly unused, as long.
 fn sum_rows_into<'b>(a: &CsrWeights, src: impl Fn(usize) -> AddRow<'b>) -> CsrWeights {
     let n_rows = a.n_rows;
     let n_cols = a.n_cols;
@@ -267,10 +267,10 @@ fn sum_rows_into<'b>(a: &CsrWeights, src: impl Fn(usize) -> AddRow<'b>) -> CsrWe
     CsrWeights { indptr, indices: exact_size(indices), data: exact_size(data), n_rows, n_cols }
 }
 
-/// `v` at its exact size: a copy, unless its room is already exactly filled (a sum whose
-/// operands share no column).
+/// `v` within an eighth of its size: kept when its room is that full (operands sharing few
+/// columns), else copied out at its exact size.
 fn exact_size<T: Copy>(v: Vec<T>) -> Vec<T> {
-    if v.len() == v.capacity() { v } else { v.as_slice().to_vec() }
+    if v.len() >= v.capacity() - v.capacity() / 8 { v } else { v.as_slice().to_vec() }
 }
 
 /// Everything a member's window re-run needs that is shared with member 0.

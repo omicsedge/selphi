@@ -745,7 +745,8 @@ fn share_batch_for_budget(avail_mb: f64, per_target_mb: f64, threads: usize) -> 
 fn guided_groups<R: Send>(targets: &[usize], share: usize, threads: usize,
                           f: impl Fn(&[usize]) -> Vec<R> + Sync) -> Vec<R> {
     let threads = threads.max(1);
-    let full = targets.len() / (threads * share) * threads * share;
+    let round = threads.saturating_mul(share);
+    let full = targets.len() / round * round;
     let rem = targets.len() - full;
     let tail = rem.div_ceil(rem.div_ceil(threads).clamp(share.min(4), share).max(1));
     let mut bounds: Vec<std::ops::Range<usize>> = (0..full).step_by(share).map(|s| s..s + share).collect();
