@@ -832,7 +832,7 @@ fn scan_site_sparse<F: MatchFilter>(
 /// -0.00015 (consumer arrays) and -0.0008 (GIAB chr21) -- so the cap is applied
 /// automatically only from `AUTO_CAP_MIN_HAPS` haplotypes up, and smaller panels keep the
 /// full walk (byte-identical to before). An explicit value always wins; `0` disables it.
-pub(crate) const AUTO_CAP_MIN_HAPS: usize = 100_000;
+pub const AUTO_CAP_MIN_HAPS: usize = 100_000;
 pub(crate) const AUTO_CAP_K: usize = 200;
 
 #[inline]

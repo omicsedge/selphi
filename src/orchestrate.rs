@@ -48,8 +48,8 @@ pub struct MultiChrImputeConfig {
     pub input_phase: selphi::imputation::input_phase::InputPhase,
     /// `--max-cond-haps`: cap on conditioning haps for diploid phasing (0 = unlimited).
     pub max_cond_haps: usize,
-    /// User-set PBWT flank sizes (`--fl-fwd`/`--fl-bwd`). `None` = auto-derive from
-    /// log2(n_ref), byte-identical to the single-chr default (auto_calibrate_pbwt_params).
+    /// User-set PBWT flank sizes (`--fl-fwd`/`--fl-bwd`). `None` = the panel-size default,
+    /// shared with the single-chr pipeline (auto_calibrate_pbwt_params).
     pub fl_fwd: Option<usize>,
     pub fl_bwd: Option<usize>,
     /// `--precompute-candidates`: chromosome-wide PBWT candidate precompute (opt-in).
@@ -995,10 +995,12 @@ pub fn run_multi_chr(
         // pipeline so the two impute paths cannot drift in match_length / fl_fwd
         // / fl_bwd / est_ne. Honors the same `--match-length`/`--fl-fwd`/
         // `--fl-bwd`/`--est-ne` overrides.
-        let crate::imputation_pipeline::PbwtParams { match_length, fl_fwd, fl_bwd, est_ne } =
+        let crate::imputation_pipeline::PbwtParams { match_length, fl_fwd, fl_bwd, est_ne, kept_matches } =
             crate::imputation_pipeline::auto_calibrate_pbwt_params(
                 config.match_length, config.fl_fwd, config.fl_bwd, config.est_ne, n_ref, n_chip,
             );
+        selphi_debug!("  Match length: {}, fl_fwd: {}, fl_bwd: {}, Ne: {}, kept matches: {}",
+            match_length, fl_fwd, fl_bwd, est_ne, kept_matches);
 
         // Compute imputation windows
         let windows = compute_imputation_windows(&chip_cm, config.window_cm, config.overlap_cm,
@@ -1131,7 +1133,7 @@ pub fn run_multi_chr(
             let hmm_params = selphi::imputation::window_process::WindowHmmParams {
                 n_ref, n_haps, match_length, fl_fwd, fl_bwd,
                 est_ne: est_ne as f64, p_err: config.p_err, adapt_floor: !config.p_err_fixed,
-                max_candidates: effective_mc,
+                max_candidates: effective_mc, kept_matches,
                 compute_posterior: wi + 1 < windows.len(),
                 target_batch_size: config.target_batch_size,
             };

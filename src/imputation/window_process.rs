@@ -31,6 +31,8 @@ pub struct WindowHmmParams {
     /// Adapt the emission floor per haplotype (`PerrAdapt`); false when `--p-err` was given.
     pub adapt_floor: bool,
     pub max_candidates: usize,
+    /// Haplotypes kept per site from the scored PBWT matches (`match_processing::process_matches`).
+    pub kept_matches: usize,
     /// Whether the HMM should compute `hap_posterior` for cross-window passthrough.
     /// Set to false on the final window — the posterior is an `n_ref`-sized f64
     /// vector per target that would never be read, saving ~13 GB at biobank scale.
@@ -1274,7 +1276,7 @@ pub fn process_window_hmm(
             // floor's second run below starts from it.
             let (prep, breaks) = match called {
                 None => (super::hmm::prepare_weights(
-                    csc, cm_w, n_ref, est_ne,
+                    csc, cm_w, n_ref, est_ne, params.kept_matches,
                     Some(super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start, classes: Some(classes) }),
                     n_var_w, ne_w, prior,
                 ), breaks_w.clone()),
@@ -1284,7 +1286,7 @@ pub fn process_window_hmm(
                     let n = sites.len();
                     let src = (!nocall_dedup_off()).then_some(
                         super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start, classes: Some(classes) });
-                    (super::hmm::prepare_weights(csc, &cm_s, n_ref, est_ne, src, n, ne_s.as_deref(), prior),
+                    (super::hmm::prepare_weights(csc, &cm_s, n_ref, est_ne, params.kept_matches, src, n, ne_s.as_deref(), prior),
                      vec![(0usize, n)])
                 }
             };

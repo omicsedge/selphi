@@ -1475,7 +1475,9 @@ pub struct HmmPrep<'a> {
     debug_line: Option<String>,
 }
 
-/// `prepare_weights` then `run_weights`: the HMM imputation weights of one target haplotype.
+/// `prepare_weights` then `run_weights`: the HMM imputation weights of one target haplotype, with the
+/// default `match_processing::KEPT_MATCHES` per site (the pipelines resolve it per panel and call
+/// `prepare_weights` themselves).
 #[allow(clippy::too_many_arguments)]
 pub fn calculate_weights(
     match_matrix: &CscMatchMatrix,
@@ -1499,7 +1501,7 @@ pub fn calculate_weights(
     // Measure `unmatched_posterior_mean` into the result (the adaptive emission's estimate).
     measure_unmatched: bool,
 ) -> HmmResult {
-    let prep = prepare_weights(match_matrix, distances_cm, n_ref_haps, est_ne, ref_alleles, n_chip,
+    let prep = prepare_weights(match_matrix, distances_cm, n_ref_haps, est_ne, match_processing::KEPT_MATCHES, ref_alleles, n_chip,
                                ne_per_site, hap_prior);
     run_weights(&prep, output_breaks, min_perr, site_emission_ratios, c, compute_posterior, measure_unmatched, None)
 }
@@ -1511,13 +1513,14 @@ pub fn prepare_weights<'a>(
     distances_cm: &[f64],
     n_ref_haps: usize,
     est_ne: f64,
+    kept_matches: usize,
     ref_alleles: Option<RefAlleleSource<'_>>,
     n_chip: usize,
     ne_per_site: Option<&[f64]>,
     hap_prior: Option<&'a [(i64, f64)]>,
 ) -> HmmPrep<'a> {
     // 1. Process matches: CSC → scored top-K → freq filter → range expansion
-    let expanded = match_processing::process_matches(match_matrix, 50);
+    let expanded = match_processing::process_matches(match_matrix, kept_matches);
     let _exp_total: usize = expanded.iter().map(|v| v.len()).sum();
 
     // 2. Filter by frequency (keep haps above 10th percentile)
