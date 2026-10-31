@@ -112,9 +112,9 @@ pub struct LcwgsParams {
     /// coverage-scales it (see `pipeline::impute_from_gl3`).
     pub min_gl: f32,
     /// RNG seed for Gibbs initialization (GLIMPSE2 default 15052011). A single
-    /// deterministic chain uses this value; `run_gibbs_ensemble` varies it
-    /// (seed, seed+1, …) across independent restarts whose dosages are averaged
-    /// (LCWGS_GIBBS_RESTARTS), marginalising chain stochasticity like the
+    /// deterministic chain uses this value; with several chains (`LCWGS_GIBBS_RESTARTS`,
+    /// or the small-panel profile's two) chain `i` runs at `iterate::chain_seed`
+    /// and their dosages are averaged, marginalising chain stochasticity like the
     /// genotype path's `--phase-ensemble`.
     pub seed: u64,
     /// chrX: sample names to model as haploid outside the PARs (`--haploids`);
@@ -131,6 +131,11 @@ pub struct LcwgsParams {
     /// order (`big_panel`). `None` = the selector reads `LCWGS_QUAL_TRUNC` (index
     /// order by default).
     pub cap: Option<faithful_select::CapPlan>,
+    /// The small-panel profile (`big_panel`), set once per run in
+    /// `pipeline::impute_from_gl3` on a panel below `big_panel::BIG_PANEL_MIN_HAPS`:
+    /// no rare-carrier augmentation and two Gibbs chains (the rank-order cap and the
+    /// 20/15 schedule are set in `cap` and the iteration counts).
+    pub small_profile: bool,
 }
 
 impl LcwgsParams {
@@ -216,6 +221,7 @@ impl Default for LcwgsParams {
             chrx_par: true,
             build: None,
             cap: None,
+            small_profile: false,
         }
     }
 }

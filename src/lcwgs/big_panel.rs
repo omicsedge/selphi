@@ -43,6 +43,28 @@
 //! `LCWGS_QUAL_TRUNC` set explicitly wins for the order. `LCWGS_BIG_PANEL=order`
 //! keeps the rank order and restores the old SPLIT (5-10%, `k_max` 5000, the run's
 //! depth); `LCWGS_BIG_PANEL=0` restores the index order and the old SPLIT on every panel.
+//!
+//! A panel below the boundary (1000 Genomes size) takes the small-panel profile
+//! instead ([`Conditioning::small`], `LcwgsParams::small_profile`): the rank-order
+//! cap at depth 2000, no rare-carrier augmentation, and two Gibbs chains of 20
+//! iterations (15 main; seeds 1000 apart, dosages averaged) in place of one of 30
+//! (25 main). The index order's base there is the first 1,000 samples of the panel
+//! (on the 6,332-haplotype panel no TSI, GBR, FIN, CDX, GIH or LWK haplotype), and
+//! the augmentation, which adds a rare site's panel carriers to a haplotype that
+//! sampled its minor allele, was what reached carriers outside it; keyed on the
+//! sampled allele it feeds back on itself and leaves a chain's dose all-or-nothing
+//! (confident false calls and confident misses). With the rank order it is not
+//! needed, and the second chain takes the chain-to-chain variance that is a large
+//! part of the 0.5x loss. Measured at true 0.5-4x (chr22, HG002-HG004 at 20-30 and
+//! 35-45 Mb, HG005-HG007 at 20-30 Mb, 6,332-haplotype panel, three seeds, paired;
+//! 1-Mb block bootstrap): per-sample R² +0.00046 [+0.00028, +0.00065] (84 of 108
+//! sample-seed pairs), panel MAF < 0.5% +0.0048 [+0.0024, +0.0076] (33 of 36),
+//! 0.5-1% +0.0040 [+0.0022, +0.0061]; ~2.3x (4,478-haplotype panel, six GIAB
+//! genomes) non-reference-truth R² +0.00054 (13 of 18), every MAF bin up; CPU -23%.
+//! `LCWGS_SMALL_PANEL=old`, an explicit `LCWGS_QUAL_TRUNC` (or a supplied cap plan)
+//! and `LCWGS_BIG_PANEL=0` keep the previous conditioning (index order, the
+//! augmentation, one chain of 30); `LCWGS_N_ITER`, `LCWGS_N_MAIN` and
+//! `LCWGS_GIBBS_RESTARTS` override their part.
 
 use super::faithful_select::CapOrder;
 
@@ -55,6 +77,9 @@ pub const BIG_PANEL_MIN_HAPS: usize = 30_311;
 
 /// The cap order a biobank-size panel gets when `LCWGS_QUAL_TRUNC` is unset.
 pub const BIG_PANEL_ORDER: CapOrder = CapOrder::G2;
+
+/// The cap order of the small-panel profile (a panel below the boundary).
+pub const SMALL_PANEL_ORDER: CapOrder = CapOrder::G2;
 
 /// The SPLIT deep pass of a biobank-size panel, when the coverage gate engages the
 /// split (each part yields to its own knob, `pipeline::split_plan`).
@@ -86,6 +111,8 @@ pub struct Explicit {
     pub gate_off: bool,
     /// `LCWGS_BIG_PANEL=order`: the big-panel cap order, with the old SPLIT.
     pub split_off: bool,
+    /// `LCWGS_SMALL_PANEL=old`: a panel below the boundary keeps the previous conditioning.
+    pub small_off: bool,
 }
 
 impl Explicit {
@@ -97,6 +124,7 @@ impl Explicit {
             gate_off: crate::config::raw("LCWGS_BIG_PANEL")
                 .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no" | "n")),
             split_off: crate::config::raw("LCWGS_BIG_PANEL").is_some_and(|v| v.trim().eq_ignore_ascii_case("order")),
+            small_off: crate::config::raw("LCWGS_SMALL_PANEL").is_some_and(|v| v.trim().eq_ignore_ascii_case("old")),
         }
     }
 }
@@ -113,6 +141,9 @@ pub struct Conditioning {
     /// The SPLIT deep pass's parameters when the split engages (`None`: the old
     /// SPLIT, band 5-10%, `k_max` 5000, the run's depth). Independent of the order.
     pub split: Option<BigSplit>,
+    /// The small-panel profile: [`SMALL_PANEL_ORDER`], no rare-carrier
+    /// augmentation, two Gibbs chains of 20 iterations (see the module doc).
+    pub small: bool,
 }
 
 /// The adaptive depth: `round(0.066 n_ref)` clamped to [2000, 5000] and below the
@@ -127,10 +158,15 @@ pub fn is_big(n_ref: usize) -> bool { n_ref >= BIG_PANEL_MIN_HAPS }
 
 /// The run's conditioning for a panel of `n_ref` haplotypes.
 pub fn resolve(n_ref: usize, explicit: Explicit) -> Conditioning {
+    let big = is_big(n_ref);
+    // The panel's own cap order, unless one is given or `LCWGS_BIG_PANEL=0`.
+    let own_order = !explicit.order && !explicit.gate_off;
+    let small = !big && own_order && !explicit.small_off;
     Conditioning {
         kpbwt: (!explicit.kpbwt).then(|| adaptive_kpbwt(n_ref)),
-        order: (is_big(n_ref) && !explicit.gate_off && !explicit.order).then_some(BIG_PANEL_ORDER),
-        split: (is_big(n_ref) && !explicit.gate_off && !explicit.split_off).then_some(BIG_PANEL_SPLIT),
+        order: if big { own_order.then_some(BIG_PANEL_ORDER) } else { small.then_some(SMALL_PANEL_ORDER) },
+        split: (big && !explicit.gate_off && !explicit.split_off).then_some(BIG_PANEL_SPLIT),
+        small,
     }
 }
 
@@ -138,7 +174,7 @@ pub fn resolve(n_ref: usize, explicit: Explicit) -> Conditioning {
 mod tests {
     use super::*;
 
-    const NONE: Explicit = Explicit { kpbwt: false, order: false, gate_off: false, split_off: false };
+    const NONE: Explicit = Explicit { kpbwt: false, order: false, gate_off: false, split_off: false, small_off: false };
     const SPLIT: Option<BigSplit> = Some(BIG_PANEL_SPLIT);
 
     #[test]
@@ -157,30 +193,37 @@ mod tests {
     }
 
     #[test]
-    fn small_panels_keep_their_conditioning() {
-        // 1000 Genomes-size panels: depth 2000, the selector's own order (index by default).
+    fn small_panels_take_the_small_panel_profile() {
+        // 1000 Genomes-size panels: depth 2000, the profile with its rank order; an explicit
+        // order, LCWGS_BIG_PANEL=0 or LCWGS_SMALL_PANEL=old keep the selector's own order.
+        let small = Conditioning { kpbwt: Some(2000), order: Some(SMALL_PANEL_ORDER), split: None, small: true };
+        let old = Conditioning { order: None, small: false, ..small };
         for n in [4478, 4796, 6332, BIG_PANEL_MIN_HAPS - 1] {
-            assert_eq!(resolve(n, NONE), Conditioning { kpbwt: Some(2000), order: None, split: None }, "{n}");
-            assert_eq!(resolve(n, Explicit { kpbwt: true, ..NONE }), Conditioning { kpbwt: None, order: None, split: None });
-            assert_eq!(resolve(n, Explicit { order: true, ..NONE }), Conditioning { kpbwt: Some(2000), order: None, split: None });
-            assert_eq!(resolve(n, Explicit { split_off: true, ..NONE }).split, None);
+            assert_eq!(resolve(n, NONE), small, "{n}");
+            assert_eq!(resolve(n, Explicit { kpbwt: true, ..NONE }), Conditioning { kpbwt: None, ..small });
+            assert_eq!(resolve(n, Explicit { split_off: true, ..NONE }), small);
+            for off in [Explicit { order: true, ..NONE }, Explicit { gate_off: true, ..NONE }, Explicit { small_off: true, ..NONE }] {
+                assert_eq!(resolve(n, off), old, "{n}");
+            }
         }
+        // LCWGS_SMALL_PANEL=old leaves a biobank-size panel alone.
+        assert_eq!(resolve(75_552, Explicit { small_off: true, ..NONE }), resolve(75_552, NONE));
     }
 
     #[test]
     fn big_panels_get_rank_order_at_the_adaptive_depth() {
-        assert_eq!(resolve(BIG_PANEL_MIN_HAPS, NONE), Conditioning { kpbwt: Some(2001), order: Some(CapOrder::G2), split: SPLIT });
-        assert_eq!(resolve(75_552, NONE), Conditioning { kpbwt: Some(4986), order: Some(CapOrder::G2), split: SPLIT });
-        assert_eq!(resolve(171_054, NONE), Conditioning { kpbwt: Some(5000), order: Some(CapOrder::G2), split: SPLIT });
+        assert_eq!(resolve(BIG_PANEL_MIN_HAPS, NONE), Conditioning { kpbwt: Some(2001), order: Some(CapOrder::G2), split: SPLIT, small: false });
+        assert_eq!(resolve(75_552, NONE), Conditioning { kpbwt: Some(4986), order: Some(CapOrder::G2), split: SPLIT, small: false });
+        assert_eq!(resolve(171_054, NONE), Conditioning { kpbwt: Some(5000), order: Some(CapOrder::G2), split: SPLIT, small: false });
     }
 
     #[test]
     fn explicit_knobs_win_part_by_part() {
         let n = 75_552;
-        assert_eq!(resolve(n, Explicit { kpbwt: true, ..NONE }), Conditioning { kpbwt: None, order: Some(CapOrder::G2), split: SPLIT });
+        assert_eq!(resolve(n, Explicit { kpbwt: true, ..NONE }), Conditioning { kpbwt: None, order: Some(CapOrder::G2), split: SPLIT, small: false });
         // An explicit order (or a supplied plan) takes the order only: the split is the panel's.
-        assert_eq!(resolve(n, Explicit { order: true, ..NONE }), Conditioning { kpbwt: Some(4986), order: None, split: SPLIT });
-        assert_eq!(resolve(n, Explicit { kpbwt: true, order: true, ..NONE }), Conditioning { kpbwt: None, order: None, split: SPLIT });
+        assert_eq!(resolve(n, Explicit { order: true, ..NONE }), Conditioning { kpbwt: Some(4986), order: None, split: SPLIT, small: false });
+        assert_eq!(resolve(n, Explicit { kpbwt: true, order: true, ..NONE }), Conditioning { kpbwt: None, order: None, split: SPLIT, small: false });
     }
 
     #[test]
@@ -189,14 +232,14 @@ mod tests {
         assert_eq!(BIG_PANEL_SPLIT, BigSplit { band: (0.005, 0.10), kmax: 3000, kpbwt: 2000 });
         // `order` keeps the rank order and the old split; 0/off restores both.
         assert_eq!(resolve(75_552, Explicit { split_off: true, ..NONE }),
-            Conditioning { kpbwt: Some(4986), order: Some(CapOrder::G2), split: None });
+            Conditioning { kpbwt: Some(4986), order: Some(CapOrder::G2), split: None, small: false });
         assert_eq!(resolve(75_552, Explicit { gate_off: true, split_off: true, ..NONE }),
-            Conditioning { kpbwt: Some(4986), order: None, split: None });
+            Conditioning { kpbwt: Some(4986), order: None, split: None, small: false });
     }
 
     #[test]
     fn gate_off_restores_the_index_order() {
-        assert_eq!(resolve(75_552, Explicit { gate_off: true, ..NONE }), Conditioning { kpbwt: Some(4986), order: None, split: None });
-        assert_eq!(resolve(75_552, Explicit { gate_off: true, kpbwt: true, ..NONE }), Conditioning { kpbwt: None, order: None, split: None });
+        assert_eq!(resolve(75_552, Explicit { gate_off: true, ..NONE }), Conditioning { kpbwt: Some(4986), order: None, split: None, small: false });
+        assert_eq!(resolve(75_552, Explicit { gate_off: true, kpbwt: true, ..NONE }), Conditioning { kpbwt: None, order: None, split: None, small: false });
     }
 }

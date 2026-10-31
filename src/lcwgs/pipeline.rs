@@ -388,12 +388,14 @@ fn impute_from_gl3(
 /// `eff` changed, and the biobank-size SPLIT parameters (`None` below the boundary or
 /// with `LCWGS_BIG_PANEL=0|order`). Depth: when `LCWGS_KPBWT` is unset, the adaptive
 /// `round(0.066 n_ref)` clamped to [2000, 5000] and below the panel size (= 2000 on
-/// panels of 2,001 haplotypes up to `BIG_PANEL_MIN_HAPS`). Order: on a biobank-size
-/// panel, unless `LCWGS_QUAL_TRUNC` is set (non-empty), the caller supplied a cap
-/// plan or `LCWGS_BIG_PANEL=0`, GLIMPSE2's rank
-/// order instead of haplotype-index order (the index order keeps only the block the
-/// panel lists first: on v3 the UK Biobank haplotypes), said loudly. Panels below
-/// the boundary are unchanged.
+/// panels of 2,001 haplotypes up to `BIG_PANEL_MIN_HAPS`). Order: unless
+/// `LCWGS_QUAL_TRUNC` is set (non-empty), the caller supplied a cap plan or
+/// `LCWGS_BIG_PANEL=0`, GLIMPSE2's rank order instead of haplotype-index order (the
+/// index order keeps only the block the panel lists first: on v3 the UK Biobank
+/// haplotypes), said loudly; below the boundary as part of the small-panel profile
+/// (also no rare-carrier augmentation, two chains of 20 iterations, 15 main; each of
+/// `LCWGS_N_ITER`, `LCWGS_N_MAIN` and `LCWGS_GIBBS_RESTARTS` set wins), which
+/// `LCWGS_SMALL_PANEL=old` turns off.
 fn apply_conditioning(eff: &mut LcwgsParams, n_ref: usize, explicit: super::big_panel::Explicit)
     -> (bool, Option<super::big_panel::BigSplit>) {
     use super::big_panel;
@@ -408,6 +410,15 @@ fn apply_conditioning(eff: &mut LcwgsParams, n_ref: usize, explicit: super::big_
     if let Some(order) = plan.order {
         eff.cap = Some(super::faithful_select::CapPlan::rank_only(order));
         modified = true;
+    }
+    if plan.small {
+        eff.small_profile = true;
+        if !crate::config::present("LCWGS_N_ITER") { eff.n_iterations = 20; }
+        if !crate::config::present("LCWGS_N_MAIN") { eff.n_main_iterations = 15; }
+        crate::selphi_step!("{}", crate::log::yellow(&format!(
+            "lcWGS panel of {} haplotypes (< {}): conditioning capped in GLIMPSE2 rank order (g2) at kpbwt {}, no rare-carrier augmentation, {} Gibbs chain(s) of {} iterations ({} main) averaged; LCWGS_SMALL_PANEL=old restores the previous conditioning",
+            n_ref, big_panel::BIG_PANEL_MIN_HAPS, eff.kpbwt, super::iterate::gibbs_chains(eff), eff.n_iterations, eff.n_main_iterations)));
+    } else if plan.order.is_some() {
         crate::selphi_step!("{}", crate::log::yellow(&format!(
             "lcWGS big panel ({} haplotypes >= {}): conditioning capped in GLIMPSE2 rank order (g2) instead of haplotype-index order, at kpbwt {}; LCWGS_BIG_PANEL=0 restores the index order",
             n_ref, big_panel::BIG_PANEL_MIN_HAPS, eff.kpbwt)));
@@ -1301,8 +1312,8 @@ fn split_blend_below() -> Option<f64> {
 /// they share the chunk's bitmatrix and selection panel and decode each
 /// selection sweep's panel half once for both (`SweepHub`). Same output as
 /// running them one after the other, which `LCWGS_SPLIT_SERIAL=1` does.
-fn split_concurrent(single_sample: bool, selector: bool) -> bool {
-    single_sample && selector && super::iterate::gibbs_restarts() == 1 && !crate::config::present("LCWGS_SPLIT_SERIAL")
+fn split_concurrent(single_sample: bool, selector: bool, chains: usize) -> bool {
+    single_sample && selector && chains == 1 && !crate::config::present("LCWGS_SPLIT_SERIAL")
 }
 
 /// Mean of two passes' (dosage, 3 GP) rows for one site, in place on `a`.
@@ -1540,7 +1551,8 @@ fn run_chunked_gibbs(
     // sweeps in segments (the admitted single-sample path, see `run_gibbs`).
     let selector = !crate::config::present("LCWGS_NO_FAITHFUL_SELECT") && chrwide_cond.is_none();
     let single_sample = memory.is_some();
-    let concurrent = split_band.is_some() && split_concurrent(single_sample, selector);
+    let n_chains = super::iterate::gibbs_chains(params);
+    let concurrent = split_band.is_some() && split_concurrent(single_sample, selector, n_chains);
     if concurrent {
         crate::selphi_info!("  lcWGS SPLIT: the two passes of a chunk run at the same time, sharing its panel side and each selection sweep's panel decode (LCWGS_SPLIT_SERIAL=1: one after the other, same output)");
     }
@@ -1553,13 +1565,20 @@ fn run_chunked_gibbs(
     }).collect();
     let chunk_concurrent: Vec<bool> = chunk_sites.iter().map(|&sites| concurrent
         && memory.as_ref().is_some_and(|m| m.admits_chunk(chunk_state_bytes_chains(sites, n_ref, n_samples, 2)))).collect();
+    // A single sample's Gibbs chains (two under the small-panel profile) run at the
+    // same time, likewise charged as that many chains (else one after the other):
+    // one sample leaves workers idle, and two chains one after the other would
+    // double its wall time. Same output either way (`iterate::run_gibbs_ensemble_inner`).
+    let chains_together: Vec<bool> = chunk_sites.iter().map(|&sites| n_chains > 1
+        && memory.as_ref().is_some_and(|m| m.admits_chunk(chunk_state_bytes_chains(sites, n_ref, n_samples, n_chains)))).collect();
     let blend_below = split_blend_below().filter(|_| split_band.is_some());
     if let Some(x) = blend_below {
         crate::selphi_info!("  lcWGS SPLIT: panel MAF < {} outside the deep band takes the mean of both passes (LCWGS_SPLIT_BLEND_BELOW)", x);
     }
     // The admitted path's chunk costs, and the start order `run_chunks` follows.
-    let costs: Vec<usize> = chunk_sites.iter().zip(&chunk_concurrent)
-        .map(|(&sites, &two)| chunk_state_bytes_chains(sites, n_ref, n_samples, if two { 2 } else { 1 })).collect();
+    let costs: Vec<usize> = chunk_sites.iter().zip(chunk_concurrent.iter().zip(&chains_together))
+        .map(|(&sites, (&two, &chains))| chunk_state_bytes_chains(sites, n_ref, n_samples,
+            if two { 2 } else if chains { n_chains } else { 1 })).collect();
     let pool = (single_sample && selector && explicit_budget.is_none() && plan.iter().flatten().count() > 1
         && !crate::config::present("LCWGS_NO_PANEL_AHEAD"))
         .then(|| rayon::ThreadPoolBuilder::new().num_threads(1).stack_size(16 << 20).thread_name(|_| "panel-ahead".into()).build().ok())
@@ -1648,15 +1667,17 @@ fn run_chunked_gibbs(
                 let bm = &chunk_bm;
                 std::thread::scope(|scope| {
                     let deep_run = scope.spawn(move || super::iterate::run_gibbs_ensemble_with_memory(
-                        chunk_gl3, bm, chunk_cm, n_samples, deep, Some(deep_k), None, execution, pnl, cp, deep_member));
+                        chunk_gl3, bm, chunk_cm, n_samples, deep, Some(deep_k), None, execution, pnl, cp, deep_member, false));
                     let out = super::iterate::run_gibbs_ensemble_with_memory(
-                        chunk_gl3, bm, chunk_cm, n_samples, params, None, None, execution, pnl, cp, main_member);
+                        chunk_gl3, bm, chunk_cm, n_samples, params, None, None, execution, pnl, cp, main_member, false);
                     (out, Some(deep_run.join().unwrap_or_else(|e| std::panic::resume_unwind(e))))
                 })
             } else {
-                let out = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, None, chrwide_cond.as_ref(), execution, panel.as_ref(), chunk_pass.as_ref(), None);
+                let together = chains_together[c];
+                let out = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, None,
+                    chrwide_cond.as_ref(), execution, panel.as_ref(), chunk_pass.as_ref(), None, together);
                 let out_deep = split_band.map(|(_, _, deep_k)| super::iterate::run_gibbs_ensemble_with_memory(
-                    chunk_gl3, &chunk_bm, chunk_cm, n_samples, deep, Some(deep_k), chrwide_cond.as_ref(), execution, panel.as_ref(), chunk_pass.as_ref(), None));
+                    chunk_gl3, &chunk_bm, chunk_cm, n_samples, deep, Some(deep_k), chrwide_cond.as_ref(), execution, panel.as_ref(), chunk_pass.as_ref(), None, together));
                 (out, out_deep)
             };
             drop(panel);
@@ -1800,7 +1821,7 @@ fn run_chunked_gibbs(
         super::memory::run_chunks(&costs, memory, threads, process_chunk, merge_chunk);
     } else {
         let cap = |k: usize| if k == 0 { n_ref } else { k.min(n_ref) };
-        let mut k = if crate::config::present("LCWGS_NO_RARE_CARRIER") {
+        let mut k = if !super::iterate::rare_carrier(params) {
             // The deep pass's own depth (LCWGS_SPLIT_KPBWT or the big-panel 2000) bounds its sets too.
             cap(params.kpbwt).max(deep_params.as_ref().map_or(0, |d| cap(d.kpbwt))).max(1000.min(n_ref))
         } else {
@@ -1906,8 +1927,10 @@ mod tests {
         }
     }
 
-    /// The panel-size gate: 1000 Genomes-size panels keep their parameters (the
-    /// default path is unchanged); a biobank-size panel gets the GLIMPSE2 rank order
+    /// The panel-size gate: 1000 Genomes-size panels take the small-panel profile
+    /// (rank order, no rare-carrier augmentation, two chains of 20/15), and keep their
+    /// previous parameters with `LCWGS_SMALL_PANEL=old`, an explicit LCWGS_QUAL_TRUNC
+    /// or `LCWGS_BIG_PANEL=0`; a biobank-size panel gets the GLIMPSE2 rank order
     /// at the adaptive depth; an explicit LCWGS_KPBWT keeps its depth, an explicit
     /// LCWGS_QUAL_TRUNC or a supplied cap plan keeps its order; `LCWGS_BIG_PANEL=0`
     /// restores the index order. The biobank-size SPLIT parameters come with the
@@ -1916,21 +1939,41 @@ mod tests {
     fn conditioning_by_panel_size() {
         use super::super::big_panel::{Explicit, BIG_PANEL_MIN_HAPS, BIG_PANEL_SPLIT};
         use super::super::faithful_select::{CapOrder, CapPlan, hap_priority};
+        use super::super::iterate::{chain_seed, gibbs_chains, rare_carrier};
         let none = Explicit::default();
         let base = || LcwgsParams { kpbwt: 2000, ..Default::default() };
+        let env = |k: &str| crate::config::present(k);
         for n in [1500, 4478, 4796, 6332, BIG_PANEL_MIN_HAPS - 1] {
             let mut eff = base();
             let (changed, split) = apply_conditioning(&mut eff, n, none);
-            assert_eq!(changed, n == 1500, "{n}"); // a 1,500-hap panel caps below its size, as before
+            assert!(changed, "{n}");
             assert_eq!(split, None, "{n}");
-            assert!(eff.cap.is_none(), "{n}");
+            assert_eq!(eff.cap.as_ref().map(|c| c.order), Some(CapOrder::G2), "{n}");
             assert_eq!(eff.kpbwt, if n == 1500 { 1499 } else { 2000 });
+            assert!(eff.small_profile && !rare_carrier(&eff), "{n}");
+            if !env("LCWGS_N_ITER") { assert_eq!(eff.n_iterations, 20); }
+            if !env("LCWGS_N_MAIN") { assert_eq!(eff.n_main_iterations, 15); }
+            if !env("LCWGS_GIBBS_RESTARTS") { assert_eq!(gibbs_chains(&eff), 2); }
+            assert_eq!((chain_seed(&eff, 0), chain_seed(&eff, 1)), (eff.seed, eff.seed + 1000));
+            // LCWGS_SMALL_PANEL=old, an explicit order, LCWGS_BIG_PANEL=0: as before the profile.
+            for off in [Explicit { small_off: true, ..none }, Explicit { order: true, ..none }, Explicit { gate_off: true, ..none }] {
+                let mut eff = base();
+                let (changed, split) = apply_conditioning(&mut eff, n, off);
+                assert_eq!((changed, split), (n == 1500, None), "{n}"); // a 1,500-hap panel caps below its size, as before
+                assert!(eff.cap.is_none() && !eff.small_profile, "{n}");
+                assert_eq!((eff.n_iterations, eff.n_main_iterations), (base().n_iterations, base().n_main_iterations));
+                assert_eq!(rare_carrier(&eff), !env("LCWGS_NO_RARE_CARRIER"));
+                if !env("LCWGS_GIBBS_RESTARTS") { assert_eq!(gibbs_chains(&eff), 1); }
+                assert_eq!(chain_seed(&eff, 1), eff.seed + 1);
+            }
         }
         for (n, k) in [(BIG_PANEL_MIN_HAPS, 2001), (75_552, 4986), (171_054, 5000)] {
             let mut eff = base();
             assert_eq!(apply_conditioning(&mut eff, n, none), (true, Some(BIG_PANEL_SPLIT)), "{n}");
             assert_eq!(eff.kpbwt, k);
             assert_eq!(eff.cap.as_ref().map(|c| c.order), Some(CapOrder::G2));
+            assert!(!eff.small_profile);
+            assert_eq!((eff.n_iterations, eff.n_main_iterations), (base().n_iterations, base().n_main_iterations));
         }
         let mut eff = base();
         assert_eq!(apply_conditioning(&mut eff, 75_552, Explicit { gate_off: true, ..none }), (true, None));
@@ -2134,7 +2177,7 @@ mod tests {
             let costs: Vec<_> = inputs.iter().map(|(_, cm, _)| chunk_state_bytes(cm.len(), 40, ns)).collect();
             let process = |c: usize, execution: SampleExecution<'_>| {
                 let (bm, cm, gl) = &inputs[c];
-                let out = super::super::iterate::run_gibbs_ensemble_with_memory(gl, bm, cm, ns, &params, None, None, execution, None, None, None);
+                let out = super::super::iterate::run_gibbs_ensemble_with_memory(gl, bm, cm, ns, &params, None, None, execution, None, None, None, false);
                 (out.dosage.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                  out.gp.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
             };
