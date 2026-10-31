@@ -42,7 +42,7 @@ fn main() {
         if inputs.is_empty() { return None; }
         IndelModel::build(refp, chrom, &inputs).ok()
     });
-    let r = pileup_bams(&[bam.clone()], chrom, &pos, &rb, &ab, &snp, region, reference.as_deref(), indel_model.as_ref(), PileupParams::default()).unwrap();
+    let r = pileup_bams(&[bam.clone()], chrom, &pos, &rb, &ab, &snp, region, reference.as_deref(), indel_model.as_ref(), PileupParams::default(), None).unwrap();
     for i in 0..pos.len() {
         let (g0, g1, g2) = (r.gl3[i * 3], r.gl3[i * 3 + 1], r.gl3[i * 3 + 2]);
         let mx = g0.max(g1).max(g2);

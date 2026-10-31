@@ -536,6 +536,19 @@ fn adapt_emit_pow() -> Option<f32> {
     })
 }
 
+/// A site's per-hap likelihood as the forward-backward reads it (softened under
+/// `LCWGS_ADAPT_EMIT`, else as given).
+#[inline]
+pub(crate) fn emission_hl(h0: f32, h1: f32) -> [f32; 2] {
+    match adapt_emit_pow() {
+        Some(pow) => {
+            let w = (h0 - h1).abs().powf(pow); // 0 (flat) .. 1 (sharp)
+            [0.5 + (h0 - 0.5) * w, 0.5 + (h1 - 0.5) * w]
+        }
+        None => [h0, h1],
+    }
+}
+
 /// Li-Stephens transition rate scale (cM⁻¹). DEFAULT = GLIMPSE2's K-INDEPENDENT
 /// form `0.04·Ne/max(n_ref, Ne)` (conditioning_set.cpp:34) — with the default
 /// Ne=100000 ≥ n_ref this is ≈0.04 cM⁻¹, a sticky copy (a carrier, once copied at
@@ -792,14 +805,10 @@ pub(crate) fn run_forward_backward_with(
     // low-confidence sites BEFORE dispatch, so every SIMD path + the backward
     // HL fold-in see the same softened reads. No-op (byte-identical) when unset.
     let hl_soft_buf;
-    let hl: &[f32] = if let Some(pow) = adapt_emit_pow() {
+    let hl: &[f32] = if adapt_emit_pow().is_some() {
         let mut b = vec![0.0f32; hl.len()];
         for v in 0..n_var {
-            let h0 = hl[2 * v];
-            let h1 = hl[2 * v + 1];
-            let w = (h0 - h1).abs().powf(pow); // 0 (flat) .. 1 (sharp)
-            b[2 * v] = 0.5 + (h0 - 0.5) * w;
-            b[2 * v + 1] = 0.5 + (h1 - 0.5) * w;
+            b[2 * v..2 * v + 2].copy_from_slice(&emission_hl(hl[2 * v], hl[2 * v + 1]));
         }
         hl_soft_buf = b;
         &hl_soft_buf

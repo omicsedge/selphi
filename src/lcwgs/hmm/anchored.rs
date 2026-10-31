@@ -81,6 +81,21 @@ fn factor_scratch(k: usize) -> (*mut f32, *mut f32) {
     })
 }
 
+/// Several entries at one anchor: the running product after each entry past the
+/// first, renormalised to a maximum of 1 over the states and floored as one table is
+/// (it stays >= floor^2 >= 1e-36 before the rescale: no f32 underflow or overflow).
+#[inline]
+unsafe fn renormalise(g: *mut f32, k: usize, floor: f32) { unsafe {
+    let g = std::slice::from_raw_parts_mut(g, k);
+    let mx = g.iter().copied().fold(0.0f32, f32::max);
+    if mx > 0.0 {
+        let inv = 1.0 / mx;
+        for x in g.iter_mut() { *x = (*x * inv).max(floor); }
+    } else {
+        g.fill(1.0);
+    }
+}}
+
 /// The posterior masses `post[j] = acol[j] * (beta[j] * fact2 + fact1)` of a backward
 /// step (`fact2 = None`: `acol[j] * fact1`, the initialisation).
 #[inline(always)]
@@ -109,6 +124,7 @@ unsafe fn factor_scalar(c: &Ctx, p: &Plan, r: std::ops::Range<usize>, g: *mut f3
             if i == 0 { *g.add(j) = x; } else { *g.add(j) *= x; }
             if !h.is_null() { *h.add(code) += *post.add(j); }
         }
+        if i > 0 { renormalise(g, c.k, p.floor); }
     }
 }}
 
@@ -252,6 +268,7 @@ unsafe fn factor_avx512(c: &Ctx, p: &Plan, r: std::ops::Range<usize>, g: *mut f3
             if !h.is_null() { *h.add(code) += *post.add(j); }
             j += 1;
         }
+        if i > 0 { renormalise(g, c.k, p.floor); }
     }
 }}
 
@@ -450,6 +467,7 @@ unsafe fn factor_avx2(c: &Ctx, p: &Plan, r: std::ops::Range<usize>, g: *mut f32,
             if !h.is_null() { *h.add(code) += *post.add(j); }
             j += 1;
         }
+        if i > 0 { renormalise(g, c.k, p.floor); }
     }
 }}
 
@@ -666,6 +684,7 @@ unsafe fn factor_neon(c: &Ctx, p: &Plan, r: std::ops::Range<usize>, g: *mut f32,
             if !h.is_null() { *h.add(code) += *post.add(j); }
             j += 1;
         }
+        if i > 0 { renormalise(g, c.k, p.floor); }
     }
 }}
 
@@ -820,6 +839,21 @@ unsafe fn step_neon<const POST: bool>(
 // The drivers
 // --------------------------------------------------------------------------
 
+/// The forward base case at site 0 into `out` (`2k` floats, the second half
+/// scratch), with the anchors at site 0 when the plan has any: the base case is the
+/// forward column from any finite column at full recombination (`pr = 1`), so the
+/// anchored one is `column_anchor` from the plain base case at `pr = 1`. Returns its sum.
+pub(super) unsafe fn first_column<A: Kernels>(c: &Ctx, e0: f32, e1: f32, out: *mut f32, plan: Option<&Plan>) -> f32 { unsafe {
+    let s = A::first(c, e0, e1, out);
+    let Some(p) = plan else { return s };
+    let r = Ascend::new(&p.at, 0).at(0);
+    if r.is_empty() { return s; }
+    let tmp = out.add(c.k);
+    let s = A::column_anchor(c, out, tmp, 0, e0, e1, 1.0, 1.0, p, r);
+    std::ptr::copy_nonoverlapping(tmp, out, c.k);
+    s
+}}
+
 /// The anchored forward-backward on the host's path (runtime feature detection),
 /// as two passes when `split`, else sequentially: the same dosages and posterior
 /// masses either way.
@@ -893,7 +927,7 @@ pub(super) unsafe fn run_seq<A: Kernels>(
     let (chkp, fp, bp, blkp) = (chk.as_mut_ptr(), fcol.as_mut_ptr(), beta.as_mut_ptr(), blk.as_mut_ptr());
 
     // Forward: every column sum, a checkpoint every `stride` columns.
-    asum[0] = A::first(&c, emit[0], emit[1], fp);
+    asum[0] = first_column::<A>(&c, emit[0], emit[1], fp, Some(plan));
     std::ptr::copy_nonoverlapping(fp, chkp, k);
     let (mut prev, mut curr) = (fp, fp.add(k));
     let mut up = Ascend::new(&plan.at, 1);

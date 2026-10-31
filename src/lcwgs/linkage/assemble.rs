@@ -56,6 +56,25 @@ impl SampleLinkage {
             + (self.obs.len() + self.kept.len()) * 2 + self.kept_alleles.len()
     }
 
+    /// The fragments with an observation in the pileup sites `range`, and their
+    /// observations there (what a chunk's view of this sample holds at most).
+    pub fn counts_in(&self, range: std::ops::Range<usize>) -> (usize, usize) {
+        let (lo, hi) = (range.start as u32, range.end as u32);
+        let first_site = |f: usize| self.site[self.frag_off[f] as usize];
+        // Fragments are sorted by first site and span at most `max_span` sites.
+        let from = lo.saturating_sub(self.max_span);
+        let (mut a, mut b) = (0, self.n_frag());
+        while a < b { let m = (a + b) / 2; if first_site(m) < from { a = m + 1 } else { b = m } }
+        let (mut frags, mut obs) = (0, 0);
+        for f in a..self.n_frag() {
+            let s = &self.site[self.frag_off[f] as usize..self.frag_off[f + 1] as usize];
+            if s[0] >= hi { break; }
+            let k = s.iter().filter(|&&v| (lo..hi).contains(&v)).count();
+            if k > 0 { frags += 1; obs += k; }
+        }
+        (frags, obs)
+    }
+
     /// The errmod bases of `site` and its REF / ALT bases (`None` when it holds no
     /// observation).
     pub fn kept_at(&self, site: u32) -> Option<(&[u16], usize, usize)> {
@@ -240,6 +259,7 @@ mod tests {
         assert_eq!(out.site, vec![3, 4, 5]);
         assert_eq!(out.obs, vec![packed(30, 0, 2) | ALT_BIT, packed(45, 0, 0), packed(33, 1, 2) | ALT_BIT]);
         assert_eq!(out.max_span, 2);
+        assert_eq!((out.counts_in(0..4), out.counts_in(4..6), out.counts_in(6..9)), ((1, 1), (1, 2), (0, 0)));
         assert_eq!(out.kept_site, vec![3, 4, 5]);
         assert_eq!(out.kept_at(4), Some((bases[4].as_slice(), 0, 2)));
         assert_eq!(out.kept_at(1), None);

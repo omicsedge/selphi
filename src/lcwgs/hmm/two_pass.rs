@@ -678,7 +678,7 @@ impl Shared<'_> {
         let k = c.k;
         let n_var = self.n_var;
         let stride = self.stride;
-        let s0 = A::first(c, *self.emit, *self.emit.add(1), fcol);
+        let s0 = super::anchored::first_column::<A>(c, *self.emit, *self.emit.add(1), fcol, self.plan);
         *self.asum = s0;
         std::ptr::copy_nonoverlapping(fcol, self.chk, k);
         if stride == 1 || n_var == 1 {

@@ -212,16 +212,12 @@ pub(crate) struct ChunkPassengers<'a> {
 }
 
 /// A chunk's read-pair linkage (see [`super::linkage`]): each sample's fragments
-/// over the chunk (`None`: the sample is not linked), the likelihoods its
-/// forward-backward reads (`gl3`'s layout, with the likelihood of the bases left at
-/// every site linked bases were taken from), and which halves run: the
-/// forward-backward's anchors (with that likelihood and the joint draws) and the
-/// phaser's potentials.
+/// over the chunk (`None`: the sample is not linked) and the likelihoods a linked
+/// sample's forward-backward reads (`gl3`'s layout, with the likelihood of the bases
+/// left at every site linked bases were taken from).
 pub(crate) struct ChunkLinkage<'a> {
     pub samples: &'a [Option<super::linkage::view::ChunkLinks>],
     pub gl_fb: &'a [f32],
-    pub fb: bool,
-    pub phase: bool,
 }
 
 /// Panel-side facts of a chunk's passengers, built once per chain.
@@ -609,7 +605,16 @@ fn run_one_hap<F: Fn(usize) -> usize>(
     // The sites a fragment links are drawn jointly from its anchor's posterior.
     if let Some(axis) = drawn_on {
         let mut fixed = Vec::new();
-        let (drawn, left) = plan.draw(&hist, |r| axis.map_or(r, |a| a[r]), super::linkage::plan::draw_key(seed, it, h), &mut sampled, &mut fixed);
+        let eps = params.epsilon as f64;
+        let miscopy = |v: usize, a: u8| {
+            let [h0, h1] = hl_at(v);
+            let hl = crate::lcwgs::hmm::emission_hl(h0, h1);
+            let (same, other) = (hl[a as usize] as f64, hl[1 - a as usize] as f64);
+            let flip = eps * other;
+            let d = (1.0 - eps) * same + flip;
+            if d > 0.0 { flip / d } else { 0.0 }
+        };
+        let (drawn, left) = plan.draw(&hist, |r| axis.map_or(r, |a| a[r]), miscopy, super::linkage::plan::draw_key(seed, it, h), &mut sampled, &mut fixed);
         super::linkage::count_draws(plan.len(), drawn, left);
     }
     (dose, sampled)
@@ -1286,12 +1291,12 @@ fn run_gibbs_with_memory(
             let mut scratch = SampleScratch::default();
             let SampleScratch { split0: buf0, split1: buf1, h0, h1, ps, ms, cond_union } = &mut scratch;
             let (h0i, h1i) = (2 * s, 2 * s + 1);
-            // This sample's fragments: the forward-backward half reads the likelihood of
-            // the bases they leave and anchors them; the phaser half takes potentials.
+            // This sample's fragments: its forward-backward reads the likelihood of the
+            // bases they leave and anchors them; its phaser takes their potentials.
             let linked = link.and_then(|l| l.samples[s].as_ref().map(|x| (l, x)));
-            let fb_link = linked.filter(|(l, _)| l.fb).map(|(_, x)| x);
-            let gl_fb: &[f32] = if fb_link.is_some() { link.unwrap().gl_fb } else { gl3 };
-            let phase_link = linked.filter(|(l, _)| l.phase).map(|(_, x)| (x, params.min_gl));
+            let fb_link = linked.map(|(_, x)| x);
+            let gl_fb: &[f32] = linked.map_or(gl3, |(l, _)| l.gl_fb);
+            let phase_link = fb_link.map(|x| (x, params.min_gl));
             let (c0, c1): (&[u32], &[u32]) = (&cond_per_hap[h0i], &cond_per_hap[h1i]);
             // Packing applies to the (compacted or full-axis) FB only: the scaffold
             // FB and the no-conditioning shortcut read the panel directly.

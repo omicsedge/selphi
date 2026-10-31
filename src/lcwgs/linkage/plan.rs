@@ -24,6 +24,9 @@ pub(crate) struct Plan {
     /// CSR: an entry's table, `2^m` values padded to at least [`MIN_TABLE`].
     pub tab_off: Vec<u32>,
     pub tab: Vec<f32>,
+    /// The likelihood floor of a table, and of the product of an anchor's tables
+    /// (renormalised to a maximum of 1 over the states before it is floored).
+    pub floor: f32,
 }
 
 /// Tables are padded to 16 floats, so a 16-lane permute reads in bounds.
@@ -56,7 +59,9 @@ impl Plan {
     /// its anchor is its last site on the axis (a fragment with none is a constant).
     pub fn build(&mut self, links: &ChunkLinks, partner: impl Fn(usize) -> usize, place: impl Fn(usize) -> Site, floor: f32) {
         self.clear();
-        let floor = floor.max(1e-30);
+        // Products of two floored tables stay normal f32 (see the anchored factor pass).
+        let floor = floor.max(1e-18);
+        self.floor = floor;
         // Each fragment's sites on the axis (CSR), the log2 terms of its off-axis sites
         // and of its partner branch, keyed by its anchor.
         let (mut on, mut on_off) = (Vec::<(u32, [f32; 2])>::new(), vec![0u32]);
@@ -135,8 +140,11 @@ impl Plan {
     /// sites already drawn, keyed by `key` and the entry. `site(r)` = the chunk site
     /// of axis row `r`; `sampled` (chunk sites) holds the per-site draws, which a
     /// site keeps when no consistent code carries mass (counted in the return value:
-    /// `(entries drawn, entries left to their per-site draws)`).
-    pub fn draw(&self, hist: &[f32], site: impl Fn(usize) -> usize, key: u64, sampled: &mut [u8], fixed: &mut Vec<u8>) -> (usize, usize) {
+    /// `(entries drawn, entries left to their per-site draws)`). A drawn code is the
+    /// copied haplotype's alleles; the sample's allele at site `v` differs from the
+    /// copied `a` with probability `miscopy(v, a)` (the copying error).
+    pub fn draw(&self, hist: &[f32], site: impl Fn(usize) -> usize, miscopy: impl Fn(usize, u8) -> f64, key: u64,
+        sampled: &mut [u8], fixed: &mut Vec<u8>) -> (usize, usize) {
         fixed.clear();
         fixed.resize(sampled.len(), 0);
         let (mut drawn, mut left) = (0usize, 0usize);
@@ -166,7 +174,10 @@ impl Plan {
             for (t, &r) in rows.iter().enumerate() {
                 let v = site(r as usize);
                 let a = ((code >> t) & 1) as u8;
-                sampled[v] = a;
+                if fixed[v] == 0 {
+                    let flip = unit(key ^ (v as u64 + 1).wrapping_mul(0xA24B_AED4_963E_E407)) < miscopy(v, a);
+                    sampled[v] = a ^ flip as u8;
+                }
                 fixed[v] = 1 + a;
             }
             drawn += 1;
@@ -276,13 +287,13 @@ mod tests {
         let mut fixed = Vec::new();
         for key in 0..50u64 {
             let mut sampled = vec![0u8, 1, 0];
-            assert_eq!(p.draw(&hist, |r| r, key, &mut sampled, &mut fixed), (2, 0));
+            assert_eq!(p.draw(&hist, |r| r, |_, _| 0.0, key, &mut sampled, &mut fixed), (2, 0));
             assert_eq!(sampled, vec![1, 0, 1]);
         }
         // No mass consistent with entry 0's draw: entry 1 keeps the per-site draws.
         hist[MIN_TABLE + 0b10] = 0.0;
         let mut sampled = vec![0u8, 1, 0];
-        assert_eq!(p.draw(&hist, |r| r, 7, &mut sampled, &mut fixed), (1, 1));
+        assert_eq!(p.draw(&hist, |r| r, |_, _| 0.0, 7, &mut sampled, &mut fixed), (1, 1));
         assert_eq!(sampled, vec![1, 0, 0]);
     }
 }

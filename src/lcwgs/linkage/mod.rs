@@ -25,6 +25,15 @@
 //! common alleles of its molecule enter one factor ([`view::Linkable`]); a rare site
 //! monomorphic in a pass's conditioning set enters that pass as the allele every
 //! state carries ([`plan::Site`]).
+//!
+//! Known approximations: entries sharing an anchor are drawn one after the other, each
+//! from its own posterior mass by code given the sites already drawn (not from their
+//! joint mass over the shared state); the phaser's potentials do not reach a linked
+//! heterozygote that its conditioning set leaves monomorphic (placed as before).
+//!
+//! Opt-in (`LCWGS_LINKAGE`): on the held-out sets it raised overall R2 at 0.5-2x but
+//! did not pass the acceptance margins on ultra-rare and 0.5-1% sites or capture
+//! libraries (2026-10-31).
 
 pub(crate) mod assemble;
 pub(crate) mod phase;
@@ -51,26 +60,17 @@ pub struct LinkConfig {
     /// linked (`LCWGS_LINK_MAX_DEPTH`, default 3: at true 4x the held-out sets gained
     /// nothing overall).
     pub max_depth: usize,
-    /// The forward-backward half: anchors, the rest likelihood and joint draws.
-    pub fb: bool,
-    /// The phaser half: diplotype potentials.
-    pub phase: bool,
 }
 
 impl LinkConfig {
-    /// The run's setting from `LCWGS_LINKAGE` (`1`: both halves; `fb` / `phase`: one),
-    /// `None` when unset, empty or off. `rare_maf` bounds the site floor from below.
+    /// The run's setting from `LCWGS_LINKAGE` (opt-in), `None` when unset, empty or
+    /// off. `rare_maf` bounds the site floor from below.
     pub fn from_env(rare_maf: f32) -> Option<Self> {
         let mode = crate::config::raw("LCWGS_LINKAGE")?.trim().to_ascii_lowercase();
-        let (fb, phase) = match mode.as_str() {
-            "" | "0" | "off" | "false" | "no" | "n" => return None,
-            "fb" => (true, false),
-            "phase" => (false, true),
-            _ => (true, true),
-        };
+        if matches!(mode.as_str(), "" | "0" | "off" | "false" | "no" | "n") { return None; }
         let min_maf = crate::config::f32_or("LCWGS_LINK_MIN_MAF", 0.01).max(rare_maf);
         let max_depth = crate::config::usize_or("LCWGS_LINK_MAX_DEPTH", 3);
-        Some(LinkConfig { min_maf, max_depth, fb, phase })
+        Some(LinkConfig { min_maf, max_depth })
     }
 }
 

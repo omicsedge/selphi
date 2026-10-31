@@ -169,6 +169,10 @@ pub(crate) struct Links {
     samples: Vec<Option<super::linkage::SampleLinkage>>,
 }
 
+/// A plan's bound per fragment: one entry with a table of 2^8 values and their
+/// posterior masses (f32), its rows and offsets.
+const PLAN_BYTES_PER_FRAGMENT: usize = 2 * 4 * 256 + 4 * super::linkage::MAX_SITES + 16;
+
 /// Whether this run links read pairs: asked for (`LCWGS_LINKAGE`), and neither with
 /// the scaffold forward-backward or the heuristic phaser, nor on a biobank-size
 /// panel (whose SPLIT passes were not measured with it).
@@ -182,8 +186,7 @@ fn link_config(n_ref: usize, params: &LcwgsParams) -> Option<super::linkage::Lin
         crate::selphi_info!("  lcWGS read-pair linkage: off ({why})");
         return None;
     }
-    crate::selphi_info!("  lcWGS read-pair linkage: {} at sites of panel MAF >= {}, the first {} bases of a site, samples of median depth <= {}",
-        match (cfg.fb, cfg.phase) { (true, true) => "forward-backward and phaser", (true, false) => "forward-backward only", _ => "phaser only" },
+    crate::selphi_info!("  lcWGS read-pair linkage: forward-backward and phaser at sites of panel MAF >= {} (minor-allele bases below), the first {} bases of a site, samples of median depth <= {}",
         cfg.min_maf, super::linkage::MAX_SLOTS, cfg.max_depth);
     Some(cfg)
 }
@@ -1640,25 +1643,32 @@ fn run_chunked_gibbs(
     let chunk_sites: Vec<_> = plan.iter().map(|r| {
         r.as_ref().map_or(0, |(core, buffer)| buffer.len() + passengers.map_or(0, |(p, _)| p.of_core(core).len()))
     }).collect();
-    // A linked chunk also holds the likelihoods its forward-backward reads (one copy of
-    // its rows); its fragments' view is a few bytes per read pair.
-    let link_bytes = |sites: usize| if links.is_some() { sites * n_samples * 12 } else { 0 };
-    let chunk_concurrent: Vec<bool> = chunk_sites.iter().map(|&sites| concurrent
-        && memory.as_ref().is_some_and(|m| m.admits_chunk(chunk_state_bytes_chains(sites, n_ref, n_samples, 2) + link_bytes(sites)))).collect();
+    // A linked chunk also holds the likelihoods its forward-backward reads (12 B a site
+    // and sample) and each sample's view of its fragments (12 B an observation, 4 B a
+    // fragment); each running sample task holds one haplotype's plan, bounded by one
+    // entry per fragment at the largest table (2^8 values and their posterior masses).
+    let link_cost: Vec<(usize, usize)> = plan.iter().map(|r| match (r, links) {
+        (Some((_, buffer)), Some(l)) => l.samples.iter().flatten().map(|x| x.counts_in(buffer.clone()))
+            .fold((buffer.len() * n_samples * 12, 0), |(view, task), (frags, obs)| (view + obs * 12 + frags * 4, task.max(frags * PLAN_BYTES_PER_FRAGMENT))),
+        _ => (0, 0),
+    }).collect();
+    let link_bytes = |c: usize, chains: usize| link_cost[c].0 + chains * link_cost[c].1;
+    let chunk_concurrent: Vec<bool> = chunk_sites.iter().enumerate().map(|(c, &sites)| concurrent
+        && memory.as_ref().is_some_and(|m| m.admits_chunk(chunk_state_bytes_chains(sites, n_ref, n_samples, 2) + link_bytes(c, 2)))).collect();
     // A single sample's Gibbs chains (two under the small-panel profile) run at the
     // same time, up to one per worker, charged as that many chains (else one after
     // the other): one sample leaves workers idle, and two chains one after the other
     // would double its wall time. Same output either way (`iterate::run_gibbs_ensemble_inner`).
     let together = n_chains.min(threads);
-    let chains_together: Vec<usize> = chunk_sites.iter().map(|&sites| if together > 1
-        && memory.as_ref().is_some_and(|m| m.admits_chunk(chunk_state_bytes_chains(sites, n_ref, n_samples, together) + link_bytes(sites))) { together } else { 1 }).collect();
+    let chains_together: Vec<usize> = chunk_sites.iter().enumerate().map(|(c, &sites)| if together > 1
+        && memory.as_ref().is_some_and(|m| m.admits_chunk(chunk_state_bytes_chains(sites, n_ref, n_samples, together) + link_bytes(c, together))) { together } else { 1 }).collect();
     let blend_below = split_blend_below().filter(|_| split_band.is_some());
     if let Some(x) = blend_below {
         crate::selphi_info!("  lcWGS SPLIT: panel MAF < {} outside the deep band takes the mean of both passes (LCWGS_SPLIT_BLEND_BELOW)", x);
     }
     // The admitted path's chunk costs, and the start order `run_chunks` follows.
-    let costs: Vec<usize> = chunk_sites.iter().zip(chunk_concurrent.iter().zip(&chains_together))
-        .map(|(&sites, (&two, &chains))| chunk_state_bytes_chains(sites, n_ref, n_samples, if two { 2 } else { chains }) + link_bytes(sites)).collect();
+    let costs: Vec<usize> = chunk_sites.iter().zip(chunk_concurrent.iter().zip(&chains_together)).enumerate()
+        .map(|(i, (&sites, (&two, &chains)))| { let c = if two { 2 } else { chains }; chunk_state_bytes_chains(sites, n_ref, n_samples, c) + link_bytes(i, c) }).collect();
     let pool = (single_sample && selector && explicit_budget.is_none() && plan.iter().flatten().count() > 1
         && !crate::config::present("LCWGS_NO_PANEL_AHEAD"))
         .then(|| rayon::ThreadPoolBuilder::new().num_threads(1).stack_size(16 << 20).thread_name(|_| "panel-ahead".into()).build().ok())
@@ -1737,19 +1747,15 @@ fn run_chunked_gibbs(
             // left out at their sites.
             let chunk_views = links.map(|l| {
                 let linkable = super::linkage::view::linkable_sites(&chunk_bm, l.cfg.min_maf);
-                let mut gl_fb = l.cfg.fb.then(|| chunk_gl3.to_vec());
+                let mut gl_fb = chunk_gl3.to_vec();
                 let views: Vec<Option<super::linkage::view::ChunkLinks>> = l.samples.iter().enumerate().map(|(s, link)| link.as_ref().map(|link| {
                     let (view, rest) = super::linkage::view::build(link, buf_start..buf_end, &linkable, errmod.as_ref().unwrap(), params.epsilon);
-                    if let Some(g) = gl_fb.as_mut() {
-                        for (v, gl) in rest { let b = (v as usize * n_samples + s) * 3; g[b..b + 3].copy_from_slice(&gl); }
-                    }
+                    for (v, gl) in rest { let b = (v as usize * n_samples + s) * 3; gl_fb[b..b + 3].copy_from_slice(&gl); }
                     view
                 })).collect();
                 (views, gl_fb)
             });
-            let chunk_link = chunk_views.as_ref().map(|(views, gl_fb)| super::iterate::ChunkLinkage {
-                samples: views, gl_fb: gl_fb.as_deref().unwrap_or(chunk_gl3), fb: links.unwrap().cfg.fb, phase: links.unwrap().cfg.phase,
-            });
+            let chunk_link = chunk_views.as_ref().map(|(views, gl_fb)| super::iterate::ChunkLinkage { samples: views, gl_fb });
             let link = chunk_link.as_ref();
             // Two-depth split: run the deep pass and overlay its dose/GP onto the band
             // sites (panel MAF ∈ [lo,hi)), routing by PANEL allele frequency only (known
@@ -1928,7 +1934,10 @@ fn run_chunked_gibbs(
         };
         if let Some((_, _, deep_k)) = split_band { k = k.max(cap(deep_k)); }
         if crate::config::present("LCWGS_LS_RICH_COND") { k = k.saturating_mul(2).min(n_ref); }
-        let costs: Vec<_> = chunk_sites.iter().map(|&sites| estimate_chunk_memory(sites, n_ref, n_samples, k)).collect();
+        let costs: Vec<_> = chunk_sites.iter().zip(&link_cost).map(|(&sites, &(view, task))| {
+            let m = estimate_chunk_memory(sites, n_ref, n_samples, k);
+            ChunkMemory { fixed: m.fixed + view as f64, task: m.task + task as f64 }
+        }).collect();
         // Keep the original wave admission/order by default. Its task estimate
         // is deliberately larger than observed RSS; applying the reclamation
         // target to that estimate would needlessly remove runnable chunks.
