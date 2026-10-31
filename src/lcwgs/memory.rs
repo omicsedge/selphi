@@ -337,15 +337,27 @@ pub(crate) fn in_chunk_pool<R: Send>(pool: Option<Arc<rayon::ThreadPool>>, f: im
 
 /// Have every worker of this thread's chunk pool return the pages of blocks
 /// other threads freed (results and packs cross threads); an idle worker
-/// would hold them until it next allocates. Nothing outside a chunk pool.
+/// would hold them until it next allocates. Each worker collects when it next
+/// looks for work: a chain's coordinator waits on its worker (for its sample
+/// thread, the other SPLIT chain, a panel built ahead), so a blocking
+/// broadcast could wait for it forever. Nothing outside a chunk pool.
 pub(crate) fn collect_chunk_pool() {
-    if CHUNK_POOL.with(|p| p.borrow().is_some()) { crate::common::mem::release_freed_memory(); }
+    if CHUNK_POOL.with(|p| p.borrow().is_some()) {
+        rayon::spawn_broadcast(|_| collect_local());
+        collect_local();
+    }
 }
 
-/// A chunk's own pool of `threads` workers (see [`run_chunks`]); `None` when it
-/// cannot be built (the chunk then runs in the global pool, as before).
+/// Workers of a chunk pool that coordinate rather than compute: a chunk's
+/// chains (two in a concurrent SPLIT) run their Gibbs loops on its workers and
+/// wait there while their sample threads work.
+const CHAIN_WORKERS: usize = 2;
+
+/// A chunk's own pool: `threads` compute workers and its chains' coordinators
+/// (see [`run_chunks`]); `None` when it cannot be built (the chunk then runs in
+/// the global pool, as before).
 fn new_chunk_pool(threads: usize) -> Option<Arc<rayon::ThreadPool>> {
-    rayon::ThreadPoolBuilder::new().num_threads(threads).stack_size(16 << 20)
+    rayon::ThreadPoolBuilder::new().num_threads(threads + CHAIN_WORKERS).stack_size(16 << 20)
         .thread_name(|i| format!("lcwgs-chunk-{i}")).build().ok().map(Arc::new)
 }
 
@@ -382,8 +394,8 @@ pub(crate) fn map_samples<T: Send>(
 /// Admit fitting chunks as soon as a completed core has been merged. A permit
 /// includes the returned result until the coordinator finishes that merge.
 ///
-/// Each live chunk runs in a pool of its own (`threads` workers; idle ones
-/// sleep). In one shared pool a worker waiting inside a join takes any queued
+/// Each live chunk runs in a pool of its own (`threads` compute workers plus
+/// its chains' coordinators; idle ones sleep). In one shared pool a worker waiting inside a join takes any queued
 /// job, so a chunk's serial chain stalled behind another chunk's whole
 /// forward-backward or phasing call, and its own calls queued behind busy
 /// workers. Which thread runs a job does not change any result.
@@ -638,6 +650,44 @@ mod tests {
         }));
         assert!(err.is_err());
         assert!(!ran.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// Two chains of one chunk (the coordinator and a thread it spawns, as a
+    /// concurrent SPLIT) work in the chunk's pool, wait for each other on its
+    /// workers and collect after every round: the collection must not wait
+    /// for a worker that is waiting for the other chain.
+    #[test]
+    fn chunk_pool_chains_meet_and_collect_without_deadlock() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let budget = MemoryBudget::new(1 << 30, 0);
+            let mut seen = Vec::new();
+            run_chunks(&[1, 1], &budget, 2, 2, |c| {
+                let pool = chunk_pool().expect("a chunk runs in its own pool");
+                let meet = std::sync::Barrier::new(2);
+                let chain = |id: usize| -> usize {
+                    let mut sum = 0;
+                    for round in 0..20 {
+                        meet.wait();
+                        sum += map_samples(1, 1, |_| {
+                            use rayon::prelude::*;
+                            (0..64usize).into_par_iter().map(|i| i * round).sum::<usize>()
+                        })[0];
+                        collect_chunk_pool();
+                    }
+                    sum + id
+                };
+                let (a, b) = std::thread::scope(|scope| {
+                    let other = scope.spawn(|| in_chunk_pool(Some(pool.clone()), || chain(1)));
+                    (chain(0), other.join().unwrap())
+                });
+                assert!(rayon::current_thread_index().is_some(), "the coordinator works on a pool worker");
+                (c, a + b)
+            }, |c, (cc, v)| { assert_eq!(c, cc); seen.push(v); });
+            tx.send(seen).unwrap();
+        });
+        let seen = rx.recv_timeout(std::time::Duration::from_secs(120)).expect("chains met and collected (no deadlock)");
+        assert_eq!(seen.len(), 2);
     }
 
     #[test]
