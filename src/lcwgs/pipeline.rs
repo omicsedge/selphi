@@ -1646,10 +1646,10 @@ fn run_chunked_gibbs(
                 let (main_member, deep_member) = (members.next(), members.next());
                 let (pnl, cp) = (panel.as_ref(), chunk_pass.as_ref());
                 let bm = &chunk_bm;
-                // The deep chain works in this chunk's pool too.
-                let pool = super::memory::chunk_pool();
+                // The deep chain works in a pool of its own (see `memory::run_chunks`).
+                let pool = super::memory::new_chain_pool(threads);
                 std::thread::scope(|scope| {
-                    let deep_run = scope.spawn(move || super::memory::in_chunk_pool(pool, || super::iterate::run_gibbs_ensemble_with_memory(
+                    let deep_run = scope.spawn(move || super::memory::in_chain_pool(pool, || super::iterate::run_gibbs_ensemble_with_memory(
                         chunk_gl3, bm, chunk_cm, n_samples, deep, Some(deep_k), None, execution, pnl, cp, deep_member)));
                     let out = super::iterate::run_gibbs_ensemble_with_memory(
                         chunk_gl3, bm, chunk_cm, n_samples, params, None, None, execution, pnl, cp, main_member);

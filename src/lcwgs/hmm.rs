@@ -110,6 +110,15 @@ pub(crate) fn with_serial_packing<T>(f: impl FnOnce() -> T) -> T {
 pub(crate) const CACHE_BUFFER_BYTES: usize = 1024 * 1024;
 pub(crate) const CACHE_BYTES_PER_WORKER: usize = 8 * CACHE_BUFFER_BYTES;
 
+/// Release this worker's kernel scratch (see [`super::memory::collect_chain_pool`]).
+/// A buffer in use (borrowed by a call this worker is waiting inside) is left.
+pub(crate) fn release_worker_scratch() {
+    for key in [&TL_ALPHA, &TL_BETA, &TL_ALPHA_SUM, &TL_EMIT, &TL_PREC, &TL_BLK, &TL_FCOL] {
+        key.with(|c| if let Ok(mut v) = c.try_borrow_mut() { *v = Vec::new(); });
+    }
+    TL_CONDBITS.with(|c| if let Ok(mut v) = c.try_borrow_mut() { *v = Vec::new(); });
+}
+
 struct TrimCaches;
 impl Drop for TrimCaches {
     fn drop(&mut self) {
@@ -465,7 +474,9 @@ unsafe fn gather_row_bytes(rp: *const u64, plan: &GatherPlan, out: *mut u64, mut
     let half = |off: usize| {
         let valid = nb.saturating_sub(off).min(64);
         let m: u64 = if valid == 64 { u64::MAX } else { (1u64 << valid) - 1 };
-        _mm512_maskz_loadu_epi8(m, bytes.add(off).cast())
+        // Masked off past the row (no byte there is read): the address may lie
+        // past the allocation, so it is formed with wrapping arithmetic.
+        _mm512_maskz_loadu_epi8(m, bytes.wrapping_add(off).cast())
     };
     let mut win = [(_mm512_setzero_si512(), _mm512_setzero_si512()); BYTE_WINDOWS];
     for (w, slot) in win.iter_mut().enumerate().take(n_win) { *slot = (half(128 * w), half(128 * w + 64)); }

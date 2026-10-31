@@ -1325,9 +1325,10 @@ fn run_gibbs_with_memory(
                 };
                 // Kept for the phaser: a single sample's first haplotype's
                 // complete pack (its set and axis are the phaser's, so no site is
-                // gathered again), else the shared prefix (also on the admitted
-                // path, where its permit charges a complete pack it then need
-                // not build).
+                // gathered again; under LCWGS_LS_RICH_COND the phaser gathers
+                // the states and sites it adds), else the shared prefix (also on
+                // the admitted path, where its permit charges a complete pack it
+                // then need not build).
                 let keep = match p0 {
                     Packed::Own if two_pass => BasePack::complete(hp0, c0.len(), split0.map(|x| x.poly.as_slice()), n_var),
                     _ => base,
@@ -1625,7 +1626,7 @@ fn run_gibbs_with_memory(
             n_pass_acc += 1;
         }
         if let Some(t) = t0 { t_wb += t.elapsed().as_secs_f64(); }
-        if memory.is_some() { super::memory::collect_chunk_pool(); }
+        if memory.is_some() { super::memory::collect_chain_pool(); }
     }
 
     if timing {
@@ -2571,7 +2572,9 @@ mod tests {
     /// bit-identical to the same chain run without them (unbudgeted and admitted
     /// executions, one and several samples, rare passengers on a 5,000-haplotype
     /// panel, and a poly axis long enough for the two-pass kernel), and the
-    /// passengers get valid doses and GP triples.
+    /// passengers get valid doses and GP triples, the same bits whether a single
+    /// sample's passenger pass runs beside its haplotype's own (admitted) or
+    /// after it (unbudgeted).
     #[test]
     fn passengers_leave_active_outputs_bit_identical() {
         use crate::lcwgs::hmm::reference_pack as rp;
@@ -2588,6 +2591,7 @@ mod tests {
             let hidden = HaplotypeBitmatrix::from_subset(&full, &(0..n_var + n_pass).collect::<Vec<_>>()).with_hidden_tail(n_var);
             let params = LcwgsParams { n_iterations: 6, n_main_iterations: 4, kpbwt: 40, pbwt_modulo_cm: 0.004, ..Default::default() };
             let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            let mut serial_pass = None;
             for admitted in [false, true] {
                 let budget = super::super::memory::MemoryBudget::new(256 * 1024 * 1024, 1024);
                 let exec = || if admitted && n_samples == 1 { SampleExecution::Admitted(&budget) } else { SampleExecution::Unbudgeted };
@@ -2604,6 +2608,11 @@ mod tests {
                     assert!((g.iter().sum::<f32>() - 1.0).abs() < 1e-4, "passenger GP sums to {}", g.iter().sum::<f32>());
                     assert!((out.pass_dosage[i] - (g[1] + 2.0 * g[2])).abs() < 1e-4);
                     assert!((0.0..=2.0).contains(&out.pass_dosage[i]));
+                }
+                let pass_bits = (bits(&out.pass_dosage), bits(&out.pass_gp));
+                match &serial_pass {
+                    None => serial_pass = Some(pass_bits),
+                    Some(serial) => assert_eq!(&pass_bits, serial, "passengers n_var={n_var} samples={n_samples} admitted={admitted}"),
                 }
             }
         }

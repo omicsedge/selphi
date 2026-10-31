@@ -277,12 +277,12 @@ impl MemoryBudget {
     }
 
     /// Run `f` under a permit granted by [`Self::try_permit`] (as [`Self::run`] does),
-    /// on this thread's chunk pool when it has one (see [`run_chunks`]).
+    /// on this thread's chain pool when it has one (see [`run_chunks`]).
     pub fn run_with<R: Send>(&self, permit: Permit<'_>, f: impl FnOnce() -> R + Send) -> R {
         let _permit = permit;
         let job = || { let out = f(); collect_local(); out };
-        match chunk_pool() {
-            Some(pool) => in_chunk_pool(Some(pool), job),
+        match chain_pool() {
+            Some(pool) => in_chain_pool(Some(pool), job),
             None => rayon::join(job, || ()).0,
         }
     }
@@ -304,61 +304,58 @@ impl Drop for Permit<'_> {
 }
 
 thread_local! {
-    /// The pool of the chunk this thread works for (see [`run_chunks`]).
-    static CHUNK_POOL: std::cell::RefCell<Option<Arc<rayon::ThreadPool>>> = const { std::cell::RefCell::new(None) };
+    /// The pool of the Gibbs chain this thread works for (see [`run_chunks`]).
+    static CHAIN_POOL: std::cell::RefCell<Option<Arc<rayon::ThreadPool>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// This thread's chunk pool (see [`run_chunks`]): the native threads a chunk
+/// This thread's chain pool (see [`run_chunks`]): the native threads a chain
 /// spawns take it along, so that their parallel work stays in it.
-pub(crate) fn chunk_pool() -> Option<Arc<rayon::ThreadPool>> {
-    CHUNK_POOL.with(|p| p.borrow().clone())
+pub(crate) fn chain_pool() -> Option<Arc<rayon::ThreadPool>> {
+    CHAIN_POOL.with(|p| p.borrow().clone())
 }
 
-/// Run `f` here with `pool` as this thread's chunk pool (restored after, also on unwinding).
-pub(crate) fn with_chunk_pool<R>(pool: Option<Arc<rayon::ThreadPool>>, f: impl FnOnce() -> R) -> R {
+/// Run `f` here with `pool` as this thread's chain pool (restored after, also on unwinding).
+pub(crate) fn with_chain_pool<R>(pool: Option<Arc<rayon::ThreadPool>>, f: impl FnOnce() -> R) -> R {
     struct Restore(Option<Arc<rayon::ThreadPool>>);
     impl Drop for Restore {
-        fn drop(&mut self) { CHUNK_POOL.with(|p| *p.borrow_mut() = self.0.take()); }
+        fn drop(&mut self) { CHAIN_POOL.with(|p| *p.borrow_mut() = self.0.take()); }
     }
-    let _restore = Restore(CHUNK_POOL.with(|p| std::mem::replace(&mut *p.borrow_mut(), pool)));
+    let _restore = Restore(CHAIN_POOL.with(|p| std::mem::replace(&mut *p.borrow_mut(), pool)));
     f()
 }
 
-/// Run `f` on a worker of `pool`, which is its chunk pool there; `None` runs it here.
-pub(crate) fn in_chunk_pool<R: Send>(pool: Option<Arc<rayon::ThreadPool>>, f: impl FnOnce() -> R + Send) -> R {
+/// Run `f` on a worker of `pool`, which is its chain pool there; `None` runs it here.
+pub(crate) fn in_chain_pool<R: Send>(pool: Option<Arc<rayon::ThreadPool>>, f: impl FnOnce() -> R + Send) -> R {
     match pool {
         Some(pool) => {
             let own = pool.clone();
-            pool.install(move || with_chunk_pool(Some(own), f))
+            pool.install(move || with_chain_pool(Some(own), f))
         }
         None => f(),
     }
 }
 
-/// Have every worker of this thread's chunk pool return the pages of blocks
-/// other threads freed (results and packs cross threads); an idle worker
-/// would hold them until it next allocates. Each worker collects when it next
-/// looks for work: a chain's coordinator waits on its worker (for its sample
-/// thread, the other SPLIT chain, a panel built ahead), so a blocking
-/// broadcast could wait for it forever. Nothing outside a chunk pool.
-pub(crate) fn collect_chunk_pool() {
-    if CHUNK_POOL.with(|p| p.borrow().is_some()) {
-        rayon::spawn_broadcast(|_| collect_local());
-        collect_local();
+/// Have every worker of this thread's chain pool release its kernel scratch
+/// and return the pages of blocks other threads freed (results and packs cross
+/// threads): an idle worker would hold them until it next allocates, and the
+/// pool's workers take turns at the forward-backwards. Each worker does it when
+/// it next looks for work (the chain's coordinator waits on its worker, so a
+/// blocking broadcast could wait for it forever). Nothing outside a chain pool.
+pub(crate) fn collect_chain_pool() {
+    if CHAIN_POOL.with(|p| p.borrow().is_some()) {
+        let collect = || { super::hmm::release_worker_scratch(); collect_local(); };
+        rayon::spawn_broadcast(move |_| collect());
+        collect();
     }
 }
 
-/// Workers of a chunk pool that coordinate rather than compute: a chunk's
-/// chains (two in a concurrent SPLIT) run their Gibbs loops on its workers and
-/// wait there while their sample threads work.
-const CHAIN_WORKERS: usize = 2;
-
-/// A chunk's own pool: `threads` compute workers and its chains' coordinators
-/// (see [`run_chunks`]); `None` when it cannot be built (the chunk then runs in
-/// the global pool, as before).
-fn new_chunk_pool(threads: usize) -> Option<Arc<rayon::ThreadPool>> {
-    rayon::ThreadPoolBuilder::new().num_threads(threads + CHAIN_WORKERS).stack_size(16 << 20)
-        .thread_name(|i| format!("lcwgs-chunk-{i}")).build().ok().map(Arc::new)
+/// A Gibbs chain's own pool (see [`run_chunks`]): `threads` compute workers
+/// and one for the chain's coordinator, which runs its loop there and waits
+/// on it while its sample threads work. `None` when it cannot be built (the
+/// chain then runs in the global pool, as before).
+pub(crate) fn new_chain_pool(threads: usize) -> Option<Arc<rayon::ThreadPool>> {
+    rayon::ThreadPoolBuilder::new().num_threads(threads + 1).stack_size(16 << 20)
+        .thread_name(|i| format!("lcwgs-chain-{i}")).build().ok().map(Arc::new)
 }
 
 /// Return pages on the allocating worker before its allowance can be reused.
@@ -375,11 +372,11 @@ pub(crate) fn map_samples<T: Send>(
     use std::sync::atomic::{AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);
     let output = Mutex::new((0..n).map(|_| None).collect::<Vec<_>>());
-    let pool = chunk_pool();
+    let pool = chain_pool();
     std::thread::scope(|scope| {
         for _ in 0..n.min(workers.max(1)) {
             let (f, next, output, pool) = (&f, &next, &output, pool.clone());
-            scope.spawn(move || with_chunk_pool(pool, || loop {
+            scope.spawn(move || with_chain_pool(pool, || loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= n { break; }
                 let value = f(i);
@@ -394,11 +391,14 @@ pub(crate) fn map_samples<T: Send>(
 /// Admit fitting chunks as soon as a completed core has been merged. A permit
 /// includes the returned result until the coordinator finishes that merge.
 ///
-/// Each live chunk runs in a pool of its own (`threads` compute workers plus
-/// its chains' coordinators; idle ones sleep). In one shared pool a worker waiting inside a join takes any queued
-/// job, so a chunk's serial chain stalled behind another chunk's whole
-/// forward-backward or phasing call, and its own calls queued behind busy
-/// workers. Which thread runs a job does not change any result.
+/// Each Gibbs chain (a chunk's, and the deep pass of a concurrent SPLIT, see
+/// `pipeline::run_chunked_gibbs`) runs in a pool of its own ([`new_chain_pool`];
+/// idle workers sleep). In one shared pool a worker waiting inside a join takes
+/// any queued job, so a chain stalled behind another chunk's whole
+/// forward-backward or phasing call, its own calls queued behind busy workers,
+/// and a chain's coordinator, waiting in a join, could run the other SPLIT
+/// chain on its stack and wait for it there at their next selection sweep.
+/// Which thread runs a job does not change any result.
 pub(crate) fn run_chunks<T: Send>(
     costs: &[usize], budget: &MemoryBudget, max_live: usize, threads: usize,
     process: impl Fn(usize) -> T + Sync, mut merge: impl FnMut(usize, T),
@@ -418,8 +418,8 @@ pub(crate) fn run_chunks<T: Send>(
                     live += 1;
                     let (tx, process) = (tx.clone(), &process);
                     scope.spawn(move || {
-                        let pool = new_chunk_pool(threads);
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| in_chunk_pool(pool, || process(c))));
+                        let pool = new_chain_pool(threads);
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| in_chain_pool(pool, || process(c))));
                         collect_local();
                         let _ = tx.send((c, result, permit));
                     });
@@ -652,42 +652,50 @@ mod tests {
         assert!(!ran.load(std::sync::atomic::Ordering::Relaxed));
     }
 
-    /// Two chains of one chunk (the coordinator and a thread it spawns, as a
-    /// concurrent SPLIT) work in the chunk's pool, wait for each other on its
-    /// workers and collect after every round: the collection must not wait
-    /// for a worker that is waiting for the other chain.
+    /// The two Gibbs chains of a concurrent SPLIT (a chunk's coordinator and a
+    /// thread it spawns) each work in a pool of their own, meet at every round
+    /// (as at each selection sweep) and collect after it. In one shared pool the
+    /// first chain's coordinator, waiting inside a join, could take the second
+    /// chain's queued job, run it on its own stack and wait for it there at the
+    /// rendezvous; and a blocking collection waited for a worker that waited for
+    /// the other chain. Eight chunks, each with fresh pools.
     #[test]
-    fn chunk_pool_chains_meet_and_collect_without_deadlock() {
+    fn chain_pools_meet_and_collect_without_deadlock() {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let budget = MemoryBudget::new(1 << 30, 0);
             let mut seen = Vec::new();
-            run_chunks(&[1, 1], &budget, 2, 2, |c| {
-                let pool = chunk_pool().expect("a chunk runs in its own pool");
+            run_chunks(&[1; 8], &budget, 2, 1, |c| {
+                assert!(chain_pool().is_some(), "a chunk's chain runs in its own pool");
                 let meet = std::sync::Barrier::new(2);
                 let chain = |id: usize| -> usize {
+                    use rayon::prelude::*;
                     let mut sum = 0;
                     for round in 0..20 {
+                        // A join the coordinator waits in while the other chain is queued
+                        // (its first round outlasts spawning the other chain's thread).
+                        sum += (0..64usize).into_par_iter().map(|i| {
+                            if round == 0 { std::thread::sleep(std::time::Duration::from_micros(200)); }
+                            i * round
+                        }).sum::<usize>();
                         meet.wait();
-                        sum += map_samples(1, 1, |_| {
-                            use rayon::prelude::*;
-                            (0..64usize).into_par_iter().map(|i| i * round).sum::<usize>()
-                        })[0];
-                        collect_chunk_pool();
+                        sum += map_samples(1, 1, |_| in_chain_pool(chain_pool(), || {
+                            (0..64usize).into_par_iter().map(|i| i + id).sum::<usize>()
+                        }))[0];
+                        collect_chain_pool();
                     }
-                    sum + id
+                    sum
                 };
                 let (a, b) = std::thread::scope(|scope| {
-                    let other = scope.spawn(|| in_chunk_pool(Some(pool.clone()), || chain(1)));
+                    let other = scope.spawn(|| in_chain_pool(new_chain_pool(1), || chain(1)));
                     (chain(0), other.join().unwrap())
                 });
-                assert!(rayon::current_thread_index().is_some(), "the coordinator works on a pool worker");
                 (c, a + b)
             }, |c, (cc, v)| { assert_eq!(c, cc); seen.push(v); });
             tx.send(seen).unwrap();
         });
         let seen = rx.recv_timeout(std::time::Duration::from_secs(120)).expect("chains met and collected (no deadlock)");
-        assert_eq!(seen.len(), 2);
+        assert_eq!(seen.len(), 8);
     }
 
     #[test]
