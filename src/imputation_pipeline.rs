@@ -156,7 +156,7 @@ struct OutputWriters {
     parquet: Option<(parquet::arrow::ArrowWriter<std::fs::File>, std::sync::Arc<arrow::datatypes::Schema>)>,
     pgen: Option<(selphi::io::pgen_output::PgenWriter, std::io::BufWriter<std::fs::File>)>,
     selfdecode: Option<selphi::io::selfdecode_output::SelfdecodeWriter>,
-    vcf_tx: selphi::io::pipeline::VcfSender,
+    vcf_tx: selphi::io::pipeline::OutputSender,
     vcf_writer: selphi::io::pipeline::VcfWriterHandle,
     vcf_bgzip: selphi::io::pipeline::VcfBgzipProc,
     batch: BatchWriters,
@@ -253,7 +253,7 @@ fn setup_output_writers(
             ).expect("Failed to setup VCF writer")
         }
     } else {
-        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        let (tx, _rx) = selphi::io::pipeline::output_queue(1);
         let handle = std::thread::spawn(|| Ok(()));
         (tx, handle, ())
     };
