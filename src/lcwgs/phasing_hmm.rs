@@ -220,11 +220,11 @@ pub struct PhasingHmm {
     /// Gather plans of the CURRENT `rephase` call's conditioning set, built at
     /// its head (SIMD paths only): `plan_full` over `cond_haps`, `plan_tail`
     /// over `cond_haps[b..]` when a usable base pack is set. `pack_condbits`
-    /// packs a site through them (see `crate::lcwgs::hmm::build_gather_plan`).
+    /// packs a site through them (see `crate::lcwgs::hmm::GatherPlan`).
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    plan_full: Vec<crate::lcwgs::hmm::GatherWord>,
+    plan_full: crate::lcwgs::hmm::GatherPlan,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    plan_tail: Vec<crate::lcwgs::hmm::GatherWord>,
+    plan_tail: crate::lcwgs::hmm::GatherPlan,
     /// Run the backward and forward passes of `rephase` as two concurrent
     /// Rayon tasks (see [`Self::two_pass_states`]). Off by default.
     two_pass: bool,
@@ -454,8 +454,8 @@ impl PhasingHmm {
             condbits: Vec::new(),
             condrow: std::ptr::null(),
             base_pack: std::ptr::null(),
-            plan_full: Vec::new(),
-            plan_tail: Vec::new(),
+            plan_full: crate::lcwgs::hmm::GatherPlan::new(),
+            plan_tail: crate::lcwgs::hmm::GatherPlan::new(),
             two_pass: false,
             release_above: None,
             #[cfg(test)]
@@ -630,15 +630,14 @@ impl PhasingHmm {
     /// `plan_full` over all of `cond_haps`, `plan_tail` over the states after
     /// the base prefix when the base pack is usable. O(K) once per `rephase`.
     #[cfg(target_arch = "x86_64")]
-    fn build_condbit_plans(&mut self, cond_haps: &[u32]) {
-        use crate::lcwgs::hmm::build_gather_plan;
-        build_gather_plan(cond_haps, &mut self.plan_full);
-        self.plan_tail.clear();
+    fn build_condbit_plans(&mut self, cond_haps: &[u32], n_ref: usize) {
+        self.plan_full.build(cond_haps, n_ref);
+        self.plan_tail.build(&[], n_ref);
         if !self.base_pack.is_null() {
             // SAFETY: set by `rephase` from a reference that outlives the call.
             let bp = unsafe { &*self.base_pack };
             if bp.b > 0 && bp.b <= cond_haps.len() {
-                build_gather_plan(&cond_haps[bp.b..], &mut self.plan_tail);
+                self.plan_tail.build(&cond_haps[bp.b..], n_ref);
             }
         }
     }
@@ -2530,7 +2529,7 @@ impl PhasingHmm {
         self.allocate_snapshots();
         #[cfg(target_arch = "x86_64")]
         if self.simd != SimdMode::Scalar {
-            self.build_condbit_plans(cond_haps);
+            self.build_condbit_plans(cond_haps, ref_bm.n_haps);
         }
         self.prepare_transitions(cm);
         #[cfg(test)]
@@ -3216,7 +3215,7 @@ mod tests {
                     a.curr_missing_locus = rng.below(n_miss as u64) as i32;
                     a.curr_abs_locus = rng.below(n_sites as u64) as i32;
                     a.simd = SimdMode::Avx2;
-                    a.build_condbit_plans(&cond);
+                    a.build_condbit_plans(&cond, bm.n_haps);
                     let mut s = PhasingHmm::new(&params);
                     s.n_states = k; s.n_miss = n_miss;
                     s.prob = a.prob.clone(); s.impute_prob = a.impute_prob.clone();
@@ -3261,7 +3260,7 @@ mod tests {
                         h.base_pack = if b.is_some() { &base as *const _ } else { std::ptr::null() };
                         h.condbits = vec![0xA5A5_A5A5_A5A5_A5A5u64; k.div_ceil(64) + 2];
                     }
-                    new.build_condbit_plans(&c);
+                    new.build_condbit_plans(&c, bm.n_haps);
                     let w64 = k.div_ceil(64);
                     for abs in 0..n_sites {
                         new.curr_abs_locus = abs as i32;

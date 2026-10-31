@@ -152,14 +152,14 @@ pub struct BasePack {
     /// Absolute site → row (`u32::MAX` = site not packed).
     pub row_of_abs: Vec<u32>,
     /// Gather plan of the base states (scratch reused across builds).
-    plan: Vec<GatherWord>,
+    plan: GatherPlan,
 }
 impl Default for BasePack {
     fn default() -> Self { Self::new() }
 }
 impl BasePack {
     pub const fn new() -> Self {
-        BasePack { words: Vec::new(), b: 0, wb: 0, row_of_abs: Vec::new(), plan: Vec::new() }
+        BasePack { words: Vec::new(), b: 0, wb: 0, row_of_abs: Vec::new(), plan: GatherPlan::new() }
     }
     /// Replace the prefix storage with FB0's complete pack, recycling the old
     /// storage for FB1. Its first `b` states remain a valid shared prefix, even
@@ -185,7 +185,7 @@ impl BasePack {
             None => for (a, r) in row_of_abs.iter_mut().enumerate() { *r = a as u32; },
         }
         debug_assert_eq!(words.len(), sites.map_or(n_sites_total, <[usize]>::len) * k.div_ceil(64));
-        BasePack { words, b: k, wb: k.div_ceil(64), row_of_abs, plan: Vec::new() }
+        BasePack { words, b: k, wb: k.div_ceil(64), row_of_abs, plan: GatherPlan::new() }
     }
     /// Pack the alleles of `base` (the shared conditioning prefix) at the
     /// absolute sites `sites_abs` (ascending). `n_sites_total` sizes the
@@ -210,7 +210,7 @@ impl BasePack {
         self.words.clear();
         self.words.reserve_exact(total);
         if self.b > 0 {
-            build_gather_plan(base, &mut self.plan);
+            self.plan.build(base, ref_bm.n_haps);
             let plan = &self.plan;
             let wb = self.wb;
             let pack = |(r, dst): (usize, &mut [std::mem::MaybeUninit<u64>])| {
@@ -272,6 +272,102 @@ pub(crate) fn build_gather_plan(ids: &[u32], plan: &mut Vec<GatherWord>) {
     }
     plan.push(cur);
 }
+
+/// Panel rows of at most this many 128-byte windows can gather by byte permutes.
+const BYTE_WINDOWS: usize = 8;
+/// Groups of fewer states are sparse: a run of at least [`SPARSE_RUN`] of
+/// them gathers by byte permutes (a 64-state block costs about as much as
+/// five single-state extracts on an eight-window row).
+const SPARSE_GROUP: u32 = 8;
+const SPARSE_RUN: usize = 6;
+
+/// Up to 64 consecutive states gathered with byte permutes (AVX-512 VBMI):
+/// state `i`'s allele is bit `bit[i]` of row byte `128 * w + idx[i]`, where
+/// `w` is the window whose `win` mask holds `i`. Lanes past `cnt` are zero.
+#[derive(Clone)]
+struct ByteBlock {
+    idx: [u8; 64],
+    bit: [u8; 64],
+    win: [u64; BYTE_WINDOWS],
+    cnt: u32,
+}
+
+/// One step of a plan that has byte blocks.
+#[derive(Clone, Copy)]
+enum GatherStep { Word(GatherWord), Block(u32) }
+
+/// How a list of conditioning states (panel haplotype ids, in state order) is
+/// gathered from a panel row, bits appended in state order (see
+/// [`gather_row`]): the groups of [`build_gather_plan`], and, where the CPU has
+/// AVX-512 VBMI and the row is at most eight 128-byte windows, runs of sparse
+/// groups (the rare-carrier tail: about one state per panel word) as 64-state
+/// byte-permute blocks, ~12x fewer instructions than one extract per state. The
+/// bits are the per-state gather's either way.
+#[derive(Clone, Default)]
+pub(crate) struct GatherPlan {
+    words: Vec<GatherWord>,
+    /// Empty unless the plan has byte blocks; then the plan in order.
+    steps: Vec<GatherStep>,
+    blocks: Vec<ByteBlock>,
+    /// Bytes of a panel row (`n_ref` rounded up to whole words).
+    row_bytes: usize,
+}
+
+impl GatherPlan {
+    pub(crate) const fn new() -> Self { GatherPlan { words: Vec::new(), steps: Vec::new(), blocks: Vec::new(), row_bytes: 0 } }
+
+    /// The plan of `ids` for rows of an `n_ref`-haplotype panel.
+    pub(crate) fn build(&mut self, ids: &[u32], n_ref: usize) {
+        build_gather_plan(ids, &mut self.words);
+        self.steps.clear();
+        self.blocks.clear();
+        self.row_bytes = n_ref.div_ceil(64) * 8;
+        if !use_byte_blocks() || self.row_bytes > 128 * BYTE_WINDOWS { return; }
+        let (mut i, mut state) = (0usize, 0usize);
+        while i < self.words.len() {
+            let mut j = i;
+            while j < self.words.len() && self.words[j].cnt < SPARSE_GROUP { j += 1; }
+            if j - i >= SPARSE_RUN {
+                let states: usize = self.words[i..j].iter().map(|g| g.cnt as usize).sum();
+                for chunk in ids[state..state + states].chunks(64) {
+                    let mut b = ByteBlock { idx: [0; 64], bit: [0; 64], win: [0; BYTE_WINDOWS], cnt: chunk.len() as u32 };
+                    for (l, &h) in chunk.iter().enumerate() {
+                        let byte = (h >> 3) as usize;
+                        b.idx[l] = (byte & 127) as u8;
+                        b.bit[l] = 1 << (h & 7);
+                        b.win[byte >> 7] |= 1 << l;
+                    }
+                    self.steps.push(GatherStep::Block(self.blocks.len() as u32));
+                    self.blocks.push(b);
+                }
+                state += states;
+                i = j;
+            } else {
+                let end = j.max(i + 1);
+                for g in &self.words[i..end] {
+                    self.steps.push(GatherStep::Word(*g));
+                    state += g.cnt as usize;
+                }
+                i = end;
+            }
+        }
+        if self.blocks.is_empty() { self.steps.clear(); }
+    }
+}
+
+/// Whether plans may use byte-permute blocks: AVX-512 VBMI/BW with a fast
+/// `PEXT` for the dense groups, and no forced narrower path. Cached.
+#[cfg(target_arch = "x86_64")]
+fn use_byte_blocks() -> bool {
+    use std::sync::OnceLock;
+    static USE: OnceLock<bool> = OnceLock::new();
+    *USE.get_or_init(|| use_pext() && !crate::config::is_one("SELPHI_FORCE_AVX2")
+        && is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw")
+        && is_x86_feature_detected!("avx512vbmi"))
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn use_byte_blocks() -> bool { false }
 
 /// Portable parallel bit extract (`_pext_u64` semantics): the bits of `x` at
 /// the set positions of `m`, packed to the low end in ascending position
@@ -355,10 +451,61 @@ unsafe fn gather_row_bmi2(rp: *const u64, plan: &[GatherWord], out: *mut u64, wi
     gather_row_with(rp, plan, out, widx, acc, pos, |x, m| core::arch::x86_64::_pext_u64(x, m))
 }}
 
-/// [`gather_row_with`] using the portable [`pext_sw`].
+/// [`gather_row_with`] over a plan with byte blocks: `PEXT` for the groups,
+/// and for each block the state bytes picked from the row's 128-byte windows
+/// (`vpermi2b`, the windows past the row's end read as zero) and their bits
+/// tested (`vptestmb`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,bmi2")]
+unsafe fn gather_row_bytes(rp: *const u64, plan: &GatherPlan, out: *mut u64, mut widx: usize, mut acc: u64, mut pos: u32) -> usize { unsafe {
+    use core::arch::x86_64::*;
+    let bytes = rp.cast::<u8>();
+    let nb = plan.row_bytes;
+    let n_win = nb.div_ceil(128);
+    let half = |off: usize| {
+        let valid = nb.saturating_sub(off).min(64);
+        let m: u64 = if valid == 64 { u64::MAX } else { (1u64 << valid) - 1 };
+        _mm512_maskz_loadu_epi8(m, bytes.add(off).cast())
+    };
+    let mut win = [(_mm512_setzero_si512(), _mm512_setzero_si512()); BYTE_WINDOWS];
+    for (w, slot) in win.iter_mut().enumerate().take(n_win) { *slot = (half(128 * w), half(128 * w + 64)); }
+    for step in &plan.steps {
+        let (x, cnt) = match *step {
+            GatherStep::Word(g) => (_pext_u64(*rp.add(g.w as usize), g.mask), g.cnt),
+            GatherStep::Block(b) => {
+                let blk = &plan.blocks[b as usize];
+                let idx = _mm512_loadu_si512(blk.idx.as_ptr().cast());
+                let mut v = _mm512_setzero_si512();
+                for (w, &(lo, hi)) in win.iter().enumerate().take(n_win) {
+                    if blk.win[w] != 0 {
+                        v = _mm512_mask_mov_epi8(v, blk.win[w], _mm512_permutex2var_epi8(lo, idx, hi));
+                    }
+                }
+                (_mm512_test_epi8_mask(v, _mm512_loadu_si512(blk.bit.as_ptr().cast())), blk.cnt)
+            }
+        };
+        acc |= x << pos;
+        let np = pos + cnt;
+        if np >= 64 {
+            out.add(widx).write(acc);
+            widx += 1;
+            acc = (x >> 1) >> (63 - pos);
+            pos = np - 64;
+        } else {
+            pos = np;
+        }
+    }
+    if pos > 0 {
+        out.add(widx).write(acc);
+        widx += 1;
+    }
+    widx
+}}
+
+/// [`gather_row_with`] using the portable [`pext_sw`] (the plan's groups).
 #[inline]
-pub(crate) unsafe fn gather_row_portable(rp: *const u64, plan: &[GatherWord], out: *mut u64, widx: usize, acc: u64, pos: u32) -> usize { unsafe {
-    gather_row_with(rp, plan, out, widx, acc, pos, pext_sw)
+pub(crate) unsafe fn gather_row_portable(rp: *const u64, plan: &GatherPlan, out: *mut u64, widx: usize, acc: u64, pos: u32) -> usize { unsafe {
+    gather_row_with(rp, &plan.words, out, widx, acc, pos, pext_sw)
 }}
 
 /// Append the plan's bits of panel row `rp` to the packed row at `out` (see
@@ -369,10 +516,16 @@ pub(crate) unsafe fn gather_row_portable(rp: *const u64, plan: &[GatherWord], ou
 /// Every plan word must be readable at `rp`, and `out` must be writable for
 /// the words written (`widx + ceil((pos + Σcnt) / 64)` in total).
 #[inline]
-pub(crate) unsafe fn gather_row(rp: *const u64, plan: &[GatherWord], out: *mut u64, widx: usize, acc: u64, pos: u32) -> usize { unsafe {
+pub(crate) unsafe fn gather_row(rp: *const u64, plan: &GatherPlan, out: *mut u64, widx: usize, acc: u64, pos: u32) -> usize { unsafe {
     #[cfg(target_arch = "x86_64")]
-    if use_pext() {
-        return gather_row_bmi2(rp, plan, out, widx, acc, pos);
+    {
+        // Byte blocks exist only where `use_byte_blocks` holds.
+        if !plan.steps.is_empty() {
+            return gather_row_bytes(rp, plan, out, widx, acc, pos);
+        }
+        if use_pext() {
+            return gather_row_bmi2(rp, &plan.words, out, widx, acc, pos);
+        }
     }
     gather_row_portable(rp, plan, out, widx, acc, pos)
 }}
@@ -413,16 +566,16 @@ pub(crate) fn pack_cond_rows_with_parallelism(
     out.reserve_exact(total);
     let base = base.filter(|bp| bp.b > 0 && bp.b <= k);
     if w64 > 0 {
-        let mut tail_plan: Vec<GatherWord> = Vec::new();
-        if let Some(bp) = base { build_gather_plan(&cond[bp.b..], &mut tail_plan); }
+        let mut tail_plan = GatherPlan::new();
+        if let Some(bp) = base { tail_plan.build(&cond[bp.b..], ref_bm.n_haps); }
         // Plans are immutable before any row task starts. Missing rows gather
         // the whole set; present rows copy the prefix in its original state order.
         let missing = base.is_none_or(|bp| (0..n_var).any(|v| {
             let a = poly_sites.map_or(v, |ps| ps[v]);
             bp.row_of_abs.get(a).copied().unwrap_or(u32::MAX) == u32::MAX
         }));
-        let mut full_plan = Vec::new();
-        if missing { build_gather_plan(cond, &mut full_plan); }
+        let mut full_plan = GatherPlan::new();
+        if missing { full_plan.build(cond, ref_bm.n_haps); }
         let pack = |(v, row): (usize, &mut [std::mem::MaybeUninit<u64>])| {
             let a = poly_sites.map_or(v, |ps| ps[v]);
             let rp = ref_bm.row(a).as_ptr();
@@ -2469,8 +2622,8 @@ mod tests {
                 let m = match rng.below(3) { 0 => rng.next(), 1 => u64::MAX, _ => 1u64 << rng.below(64) };
                 for b in 0..64u32 { if (m >> b) & 1 == 1 { ids.push(w * 64 + b); } }
             }
-            let mut plan = Vec::new();
-            build_gather_plan(&ids, &mut plan);
+            let mut plan = GatherPlan::new();
+            plan.build(&ids, 512);
             let pos = if trial % 4 == 0 { 0 } else { rng.below(64) as u32 };
             let pre = if pos == 0 { 0 } else { rng.next() & (u64::MAX >> (64 - pos)) };
             let n_out = (pos as usize + ids.len()).div_ceil(64);
@@ -2492,6 +2645,53 @@ mod tests {
                 assert_eq!(out[n_out], 0x5555_5555_5555_5555, "wrote past the row");
             }
         }
+    }
+
+    /// Plans with byte-permute blocks append the per-state bits for rows of
+    /// every window count (and past eight windows, where the plan keeps its
+    /// groups), at every pending offset, whatever lies past the row.
+    #[test]
+    fn byte_block_plans_match_bitwise_reference() {
+        let mut rng = reference_pack::Xs(0x2F2D_4C1B_8E3A_9D07);
+        let mut blocks_seen = false;
+        for n_ref in [65usize, 512, 700, 1023, 1024, 1025, 4478, 4796, 6332, 8191, 8192, 8193, 20_000] {
+            let words = n_ref.div_ceil(64);
+            // The row, then words of another row that must not leak in.
+            let mut mem: Vec<u64> = (0..words + 16).map(|_| rng.next()).collect();
+            if n_ref % 64 != 0 { mem[words - 1] &= u64::MAX >> (64 - n_ref % 64); }
+            for trial in 0..60 {
+                let mut ids: Vec<u32> = (0..n_ref as u32).filter(|_| rng.below(100) < [0, 5, 45, 90][trial % 4]).collect();
+                for _ in 0..rng.below(1500) {
+                    let start = rng.below(n_ref as u64) as u32;
+                    for h in start..(start + 1 + rng.below(3) as u32).min(n_ref as u32) { ids.push(h); }
+                }
+                if trial % 5 == 0 { ids.reverse(); }
+                let mut plan = GatherPlan::new();
+                plan.build(&ids, n_ref);
+                blocks_seen |= !plan.blocks.is_empty();
+                assert!(plan.blocks.is_empty() || n_ref.div_ceil(64) * 8 <= 128 * BYTE_WINDOWS);
+                let pos = if trial % 3 == 0 { 0 } else { rng.below(64) as u32 };
+                let pre = if pos == 0 { 0 } else { rng.next() & (u64::MAX >> (64 - pos)) };
+                let n_out = (pos as usize + ids.len()).div_ceil(64);
+                let mut want = vec![0u64; n_out.max(1)];
+                want[0] = pre;
+                for (j, &h) in ids.iter().enumerate() {
+                    let o = pos as usize + j;
+                    want[o / 64] |= ((mem[(h / 64) as usize] >> (h % 64)) & 1) << (o % 64);
+                }
+                for portable in [false, true] {
+                    let mut out = vec![0x5555_5555_5555_5555u64; n_out + 1];
+                    let n = unsafe {
+                        if portable { gather_row_portable(mem.as_ptr(), &plan, out.as_mut_ptr(), 0, pre, pos) }
+                        else { gather_row(mem.as_ptr(), &plan, out.as_mut_ptr(), 0, pre, pos) }
+                    };
+                    assert_eq!(n, n_out, "n_ref={n_ref} trial={trial}");
+                    assert_eq!(out[..n_out], want[..n_out], "n_ref={n_ref} trial={trial} portable={portable}");
+                    assert_eq!(out[n_out], 0x5555_5555_5555_5555, "wrote past the row");
+                }
+            }
+        }
+        assert_eq!(blocks_seen, use_byte_blocks(), "byte blocks used where the CPU has them");
     }
 
     /// The shared-prefix assembly must reproduce the direct pack bit for bit,
