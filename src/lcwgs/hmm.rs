@@ -176,6 +176,17 @@ impl BasePack {
             for (a, r) in self.row_of_abs.iter_mut().enumerate() { *r = a as u32; }
         }
     }
+    /// A haplotype's complete pack ([`pack_cond_rows`] of its `k` states over
+    /// `sites`, every site when `None`) as the pack of all `k` states.
+    pub(crate) fn complete(words: Vec<u64>, k: usize, sites: Option<&[usize]>, n_sites_total: usize) -> Self {
+        let mut row_of_abs = vec![u32::MAX; n_sites_total];
+        match sites {
+            Some(sites) => for (r, &a) in sites.iter().enumerate() { row_of_abs[a] = r as u32; },
+            None => for (a, r) in row_of_abs.iter_mut().enumerate() { *r = a as u32; },
+        }
+        debug_assert_eq!(words.len(), sites.map_or(n_sites_total, <[usize]>::len) * k.div_ceil(64));
+        BasePack { words, b: k, wb: k.div_ceil(64), row_of_abs, plan: Vec::new() }
+    }
     /// Pack the alleles of `base` (the shared conditioning prefix) at the
     /// absolute sites `sites_abs` (ascending). `n_sites_total` sizes the
     /// site → row map. Counted in the pack profile like the per-haplotype pack.

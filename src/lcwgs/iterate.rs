@@ -62,6 +62,13 @@ enum Packed {
     Base,
 }
 
+impl Packed {
+    /// The words the forward-backward reads: the haplotype's own pack or the shared prefix.
+    fn words<'a>(self, own: &'a [u64], base: &'a BasePack) -> Option<&'a [u64]> {
+        match self { Packed::No => None, Packed::Own => Some(own), Packed::Base => Some(base.words.as_slice()) }
+    }
+}
+
 /// Time spent in the fused per-sample re-phasing, SUMMED over threads
 /// (`LCWGS_TIMING` only) — the phase now runs inside the parallel per-sample
 /// task, so it has no separate wall-clock share of its own; `hmm` is that
@@ -1256,10 +1263,7 @@ fn run_gibbs_with_memory(
                     pass_now.then(|| passenger_dose(h, partner, c, gl3, n_samples, ref_bm, cm, params,
                         sp.map(|x| x.poly.as_slice()), band, pass.unwrap(), pass_model.as_ref().unwrap(), two_pass, mp))
                 };
-                let fb0 = |hp: &mut Vec<u64>| {
-                    let pack = match pack_for(c0, split0, &base, hp) {
-                        Packed::No => None, Packed::Own => Some(hp.as_slice()), Packed::Base => Some(base.words.as_slice()),
-                    };
+                let fb0 = |pack: Option<&[u64]>| {
                     let (d, smp) = run_one_hap(
                         h0i, it, seed,
                         |v| prev_alleles[v * n_target_haps + h1i] as usize,
@@ -1271,10 +1275,7 @@ fn run_gibbs_with_memory(
                     let pd = pass_fb(h0i, &|v| prev_alleles[v * n_target_haps + h1i] as usize, c0, split0, pack);
                     (d, smp, pd)
                 };
-                let fb1 = |fresh: Option<&[u8]>, hp: &mut Vec<u64>| {
-                    let pack = match pack_for(c1, split1, &base, hp) {
-                        Packed::No => None, Packed::Own => Some(hp.as_slice()), Packed::Base => Some(base.words.as_slice()),
-                    };
+                let fb1 = |fresh: Option<&[u8]>, pack: Option<&[u64]>| {
                     let (d, smp) = run_one_hap(
                         h1i, it, seed,
                         |v| fresh.map_or(prev_alleles[v * n_target_haps + h0i], |a| a[v]) as usize,
@@ -1290,22 +1291,44 @@ fn run_gibbs_with_memory(
                     memory.and_then(|m| m.try_parallel_fb(super::memory::fb_bytes(n_var, c1.len())
                         + two_pass_bytes(c1.len())))
                 } else { None };
-                let results = if let Some(_permit) = extra {
-                    rayon::join(|| fb0(&mut Vec::new()), || {
-                        let out = fb1(None, &mut Vec::new());
+                let (mut hp0, mut hp1) = (Vec::new(), Vec::new());
+                let (results, p0) = if let Some(_permit) = extra {
+                    let ((first, p0), second) = rayon::join(|| {
+                        let p0 = pack_for(c0, split0, &base, &mut hp0);
+                        (fb0(p0.words(&hp0, &base)), p0)
+                    }, || {
+                        let p1 = pack_for(c1, split1, &base, &mut hp1);
+                        let out = fb1(None, p1.words(&hp1, &base));
                         super::memory::collect_local();
                         out
-                    })
+                    });
+                    ((first, second), p0)
+                } else if two_pass {
+                    // The second haplotype's pack depends only on its set: a
+                    // single sample builds it while the first one runs.
+                    let ((p0, first), p1) = rayon::join(|| {
+                        let p0 = pack_for(c0, split0, &base, &mut hp0);
+                        (p0, fb0(p0.words(&hp0, &base)))
+                    }, || pack_for(c1, split1, &base, &mut hp1));
+                    let second = fb1(gs.then_some(first.1.as_slice()), p1.words(&hp1, &base));
+                    ((first, second), p0)
                 } else {
-                    let mut hp = Vec::new();
-                    let first = fb0(&mut hp);
-                    let second = fb1(gs.then_some(first.1.as_slice()), &mut hp);
-                    (first, second)
+                    let p0 = pack_for(c0, split0, &base, &mut hp0);
+                    let first = fb0(p0.words(&hp0, &base));
+                    let p1 = pack_for(c1, split1, &base, &mut hp0);
+                    let second = fb1(gs.then_some(first.1.as_slice()), p1.words(&hp0, &base));
+                    ((first, second), p0)
                 };
-                // The shared prefix is kept for the phaser (also on the admitted
+                // Kept for the phaser: a single sample's first haplotype's
+                // complete pack (its set and axis are the phaser's, so no site is
+                // gathered again), else the shared prefix (also on the admitted
                 // path, where its permit charges a complete pack it then need
                 // not build).
-                (results, Some(base))
+                let keep = match p0 {
+                    Packed::Own if two_pass => BasePack::complete(hp0, c0.len(), split0.map(|x| x.poly.as_slice()), n_var),
+                    _ => base,
+                };
+                (results, Some(keep))
             };
             // Only the admitted path waits for phaser memory. Whole-sample
             // tasks keep the shared prefix, but release the full FB pack here.
