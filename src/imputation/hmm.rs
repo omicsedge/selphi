@@ -499,6 +499,95 @@ struct LsHmmModel<'a> {
     site_perr: Option<&'a [f64]>,
 }
 
+/// How far a vectorised row sum ([`sum_any_order`]) is known to agree with the serial one.
+#[derive(Clone, Copy, PartialEq)]
+enum SumKind {
+    /// Equal to the serial sum: no order of the additions can change it.
+    Exact,
+    /// Every value non-negative and finite: within the two sums' error bound of it.
+    NonNeg,
+    /// A negative, infinite or NaN value: no bound.
+    Other,
+}
+
+/// `row`'s f64 sum in index order, `s += v as f64` from 0: what the HMM scales its rows by.
+#[inline]
+fn serial_sum(row: &[f32]) -> f64 {
+    let mut s = 0.0f64;
+    for &v in row { s += v as f64; }
+    s
+}
+
+/// [`serial_sum`], from a vectorised sum when no order of the additions can change it,
+/// else serially. The serial sum is a chain of dependent f64 adds, one per state: in the
+/// forward and backward passes it took most of their time.
+#[inline]
+fn row_sum_f64(row: &[f32]) -> f64 {
+    match sum_any_order(row) {
+        (s, SumKind::Exact) => s,
+        _ => serial_sum(row),
+    }
+}
+
+/// A vectorised f64 sum of `row` and how it relates to [`serial_sum`]. A non-negative finite
+/// f32 is a whole multiple of `q`, the last mantissa bit of the smallest non-zero value, so
+/// every partial sum, in any order, is a whole multiple of `q` no larger than the total;
+/// below 2^53 q each is exact, and every order of the additions gives the exact total.
+/// `s < 2^52 q` proves the total is below 2^53 q (were it not, `s`, within a factor
+/// 1 + n·2^-53 of it, would not be either). On 1000 Genomes ~98% of the forward and backward
+/// rows pass.
+#[inline]
+fn sum_any_order(row: &[f32]) -> (f64, SumKind) {
+    const L: usize = 8;
+    let mut acc = [0.0f64; L];
+    // Smallest non-zero bit pattern minus one (u32::MAX when all are zero), largest pattern.
+    let (mut lo, mut hi) = (u32::MAX, 0u32);
+    let mut chunks = row.chunks_exact(L);
+    for c in &mut chunks {
+        for k in 0..L {
+            let b = c[k].to_bits();
+            acc[k] += c[k] as f64;
+            lo = lo.min(b.wrapping_sub(1));
+            hi = hi.max(b);
+        }
+    }
+    let mut tail = 0.0f64;
+    for &v in chunks.remainder() {
+        let b = v.to_bits();
+        tail += v as f64;
+        lo = lo.min(b.wrapping_sub(1));
+        hi = hi.max(b);
+    }
+    let s = ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7])) + tail;
+    // Bit patterns of the non-negative finite f32 are those below +inf's.
+    if hi >= 0x7F80_0000 { return (s, SumKind::Other); }
+    if lo == u32::MAX { return (s, SumKind::Exact); }
+    // q = 2^(e - 150) for the smallest value's biased exponent e (1 for a subnormal).
+    let e = (((lo + 1) >> 23) & 0xFF).max(1) as u64;
+    let bound = f64::from_bits((e + 925) << 52); // 2^52 q = 2^(e - 98)
+    (s, if s < bound { SumKind::Exact } else { SumKind::NonNeg })
+}
+
+/// What `emit_row` scales a row by: `(1.0 / s) as f32` of its [`serial_sum`] `s`, or None
+/// when `s == 0`. Taken from the vectorised sum when it is exact, or when every f64 within
+/// the error bound of the two sums (each within (n-1)·2^-53 of the exact total for
+/// non-negative values; 2^-50·n·s covers both with room for the bounds' own rounding) gives
+/// the same f32: `x -> (1.0 / x) as f32` is monotone, so the serial sum's lands there too.
+#[inline]
+fn row_inv_sum(w: &[f32]) -> Option<f32> {
+    let s = match sum_any_order(w) {
+        (s, SumKind::Exact) => s,
+        (s, SumKind::NonNeg) => {
+            let d = s * w.len() as f64 * f64::from_bits((1023 - 50) << 52);
+            let (a, b) = ((1.0 / (s + d)) as f32, (1.0 / (s - d)) as f32);
+            if a == b { return Some(a); }
+            serial_sum(w)
+        }
+        (_, SumKind::Other) => serial_sum(w),
+    };
+    (s != 0.0).then(|| (1.0 / s) as f32)
+}
+
 /// Forward pass of the Li-Stephens HMM.
 ///
 /// Returns (fwd, last_alpha, last_sum) where fwd is (n_rows, n_states) row-major.
@@ -520,8 +609,7 @@ fn forward_row(
     forward_step(model, chip_idx, prev, cur, last_sum);
 
     // Row sum (f64 accumulation for stability)
-    let mut row_sum = 0.0f64;
-    for &v in cur.iter() { row_sum += v as f64; }
+    let row_sum = row_sum_f64(cur);
 
     // State pruning for large panels
     let pruned_sum = prune_row(cur, row_sum, prune_threshold, model.group_mass.map(|gm| gm.sizes));
@@ -874,12 +962,11 @@ fn emit_row(
     threshold: f32,
     indices: &mut Vec<i32>,
     data: &mut Vec<f32>,
-    // `w`'s sum when the caller computed it while building the row (`combine_row_sum`).
-    known_sum: Option<f64>,
 ) {
-    let mut row_sum: f64 = known_sum.unwrap_or_else(|| w.iter().map(|&v| v as f64).sum());
+    // The row is scaled by (1 / its f64 sum) as f32, the sum taken in index order.
+    let mut inv = row_inv_sum(w);
 
-    if row_sum == 0.0 {
+    if inv.is_none() {
         let chip_idx = start + row;
         if chip_idx > 0 && chip_idx <= n_matches.len() {
             let ci = (chip_idx - 1).min(n_matches.len() - 1);
@@ -898,11 +985,10 @@ fn emit_row(
                 }
             }
         }
-        row_sum = w.iter().map(|&v| v as f64).sum();
+        inv = row_inv_sum(w);
     }
 
-    if row_sum == 0.0 { row_sum = 1.0; }
-    let inv_sum = (1.0 / row_sum) as f32;
+    let inv_sum = inv.unwrap_or(1.0);
 
     let mut push = |j: usize, v: f32| {
         let hap_id = state_to_hap[j];
@@ -980,41 +1066,6 @@ fn combine_row(fwd: &[f32], bwd: &[f32], out: &mut [f32], inverse_sizes: Option<
     } else {
         for j in 0..out.len() { out[j] = fwd[j] * bwd[j]; }
     }
-}
-
-/// `combine_row` that also returns the combined row's f64 sum, accumulated in index order
-/// exactly as `emit_row` would accumulate it.
-#[inline]
-fn combine_row_sum(fwd: &[f32], bwd: &[f32], out: &mut [f32], inverse_sizes: Option<&[f32]>) -> f64 {
-    let mut s = 0.0f64;
-    if let Some(inv) = inverse_sizes {
-        for j in 0..out.len() { out[j] = fwd[j] * bwd[j] * inv[j]; s += out[j] as f64; }
-    } else {
-        for j in 0..out.len() { out[j] = fwd[j] * bwd[j]; s += out[j] as f64; }
-    }
-    s
-}
-
-/// `combine_row_sum` that also returns `bwd`'s own f64 sum: the backward row sum and the
-/// combined row sum are two independent serial chains, each kept in index order, run in
-/// one loop so the core overlaps their latencies (they were two passes of their own).
-#[inline]
-fn combine_row_sums(fwd: &[f32], bwd: &[f32], out: &mut [f32], inverse_sizes: Option<&[f32]>) -> (f64, f64) {
-    let (mut sb, mut sw) = (0.0f64, 0.0f64);
-    if let Some(inv) = inverse_sizes {
-        for j in 0..out.len() {
-            sb += bwd[j] as f64;
-            out[j] = fwd[j] * bwd[j] * inv[j];
-            sw += out[j] as f64;
-        }
-    } else {
-        for j in 0..out.len() {
-            sb += bwd[j] as f64;
-            out[j] = fwd[j] * bwd[j];
-            sw += out[j] as f64;
-        }
-    }
-    (sb, sw)
 }
 
 /// Streaming backward pass + online combination with the forward matrix.
@@ -1129,18 +1180,16 @@ fn streaming_backward_combine(
                     combine_row(frow, &next_bwd, &mut w_row, inverse_sizes);
                     held.push((row, w_row.clone()));
                 } else {
-                    let w_sum = combine_row_sum(frow, &next_bwd, &mut w_row, inverse_sizes);
+                    combine_row(frow, &next_bwd, &mut w_row, inverse_sizes);
                     s_rows.push((row, s_idx.len()));
                     emit_row(&mut w_row, row, start, dense_matches, n_matches, n_haps,
-                             state_to_hap, group_members, mass_sizes, csr_threshold, &mut s_idx, &mut s_dat,
-                             Some(w_sum));
+                             state_to_hap, group_members, mass_sizes, csr_threshold, &mut s_idx, &mut s_dat);
                 }
                 continue;
             }
 
             let chip_idx = start + row;
-            // Without pruning the backward row's sum is not needed before the row is
-            // combined, so it is accumulated in the combine pass (`combine_row_sums`).
+            // Without pruning the backward row's sum is not needed before the row is combined.
             let mut bwd_sum_pending = false;
             if chip_idx >= r_precomb.len() {
                 cur_bwd.copy_from_slice(&next_bwd);
@@ -1182,9 +1231,7 @@ fn streaming_backward_combine(
 
                 if prune_threshold > 0.0 || diag {
                     // Row sum (f64 for stability)
-                    let mut row_sum = 0.0f64;
-                    for j in 0..n_states { row_sum += cur_bwd[j] as f64; }
-                    last_sum = row_sum;
+                    last_sum = row_sum_f64(&cur_bwd);
 
                     prune_row(&mut cur_bwd, last_sum, prune_threshold, mass_sizes);
                     if diag {
@@ -1196,30 +1243,17 @@ fn streaming_backward_combine(
                 }
             }
 
+            if bwd_sum_pending { last_sum = row_sum_f64(&cur_bwd); }
             if skip(row) {
-                // The backward row's own sum, in the order `combine_row_sums` keeps it.
-                if bwd_sum_pending { last_sum = cur_bwd.iter().map(|&v| v as f64).sum(); }
                 s_rows.push((row, s_idx.len()));
             } else if fix.holds(row) {
-                if bwd_sum_pending {
-                    let (sb, _) = combine_row_sums(frow, &cur_bwd, &mut w_row, inverse_sizes);
-                    last_sum = sb;
-                } else {
-                    combine_row(frow, &cur_bwd, &mut w_row, inverse_sizes);
-                }
+                combine_row(frow, &cur_bwd, &mut w_row, inverse_sizes);
                 held.push((row, w_row.clone()));
             } else {
-                let w_sum = if bwd_sum_pending {
-                    let (sb, sw) = combine_row_sums(frow, &cur_bwd, &mut w_row, inverse_sizes);
-                    last_sum = sb;
-                    sw
-                } else {
-                    combine_row_sum(frow, &cur_bwd, &mut w_row, inverse_sizes)
-                };
+                combine_row(frow, &cur_bwd, &mut w_row, inverse_sizes);
                 s_rows.push((row, s_idx.len()));
                 emit_row(&mut w_row, row, start, dense_matches, n_matches, n_haps,
-                         state_to_hap, group_members, mass_sizes, csr_threshold, &mut s_idx, &mut s_dat,
-                         Some(w_sum));
+                         state_to_hap, group_members, mass_sizes, csr_threshold, &mut s_idx, &mut s_dat);
             }
 
             std::mem::swap(&mut cur_bwd, &mut next_bwd);
@@ -1262,7 +1296,7 @@ fn streaming_backward_combine(
     for (row, raw) in held.iter_mut() {
         h_rows.push((*row, h_idx.len()));
         emit_row(raw, *row, start, dense_matches, n_matches, n_haps,
-                 state_to_hap, group_members, mass_sizes, csr_threshold, &mut h_idx, &mut h_dat, None);
+                 state_to_hap, group_members, mass_sizes, csr_threshold, &mut h_idx, &mut h_dat);
     }
 
     // Assemble the ascending CSR. Streamed rows are in descending order, so walk
@@ -1929,6 +1963,39 @@ pub fn run_weights(
 mod tests {
     use super::*;
 
+    /// `row_sum_f64` is `serial_sum` and `row_inv_sum` is `(1 / serial_sum) as f32` (None at 0)
+    /// on rows of every dynamic range: HMM-like rows, wide ranges that defeat the exact test,
+    /// subnormals, zeros, and rows with a negative, infinite or NaN value.
+    #[test]
+    fn fast_row_sums_equal_the_serial_sum() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        for trial in 0..20_000usize {
+            let n = [0usize, 1, 3, 7, 8, 9, 31, 64, 200, 1500][trial % 10];
+            let span = [4i32, 20, 30, 40, 80, 140][(next() % 6) as usize];
+            let mut row: Vec<f32> = (0..n).map(|_| {
+                if next() % 5 == 0 { return 0.0; }
+                let m = (next() % (1 << 24)) as f32 / (1u32 << 24) as f32 + 0.5;
+                m * 2f32.powi(-((next() % span as u64) as i32))
+            }).collect();
+            match trial % 50 {
+                0 if n > 0 => row[(next() % n as u64) as usize] = f32::from_bits(1 + (next() % 1000) as u32),
+                1 if n > 0 => row[(next() % n as u64) as usize] = -0.0,
+                2 if n > 0 => row[(next() % n as u64) as usize] = -1e-3,
+                3 if n > 0 => row[(next() % n as u64) as usize] = f32::INFINITY,
+                4 if n > 0 => row[(next() % n as u64) as usize] = f32::NAN,
+                _ => {}
+            }
+            let s = serial_sum(&row);
+            let fast = row_sum_f64(&row);
+            assert!(fast.to_bits() == s.to_bits() || (fast.is_nan() && s.is_nan()), "trial {trial}: {fast} vs {s}");
+            let want = (s != 0.0).then(|| (1.0 / s) as f32);
+            let got = row_inv_sum(&row);
+            assert!(got.map(f32::to_bits) == want.map(f32::to_bits)
+                || (got.is_some_and(f32::is_nan) && want.is_some_and(f32::is_nan)), "trial {trial}: {got:?} vs {want:?}");
+        }
+    }
+
     fn dense_row(csr: &CsrWeights, row: usize) -> Vec<f32> {
         let mut values = vec![0.0; csr.n_cols];
         for k in csr.indptr[row] as usize..csr.indptr[row + 1] as usize {
@@ -2088,9 +2155,9 @@ mod tests {
         for (mut plain, mut grouped) in [([0.0; 3], [0.0; 2]), ([0.2, 0.2, 0.6], [0.4, 0.6])] {
             let (mut ia, mut da, mut ib, mut db) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             emit_row(&mut plain, 1, 0, &[vec![0, 1, 2]], &[3], &[3.0], &[0, 1, 2],
-                     None, None, 0.25, &mut ia, &mut da, None);
+                     None, None, 0.25, &mut ia, &mut da);
             emit_row(&mut grouped, 1, 0, &[vec![0, 1]], &[2], &[3.0], &[0, 2],
-                     Some(&members), Some(&[2.0, 1.0]), 0.25, &mut ib, &mut db, None);
+                     Some(&members), Some(&[2.0, 1.0]), 0.25, &mut ib, &mut db);
             assert_eq!(ia, ib);
             assert_eq!(da, db);
         }
