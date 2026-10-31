@@ -24,7 +24,7 @@ use crate::srp::SrpReader;
 /// allocation. `v * 10^N` is exact in f64 for N ≤ 4 (an f32 mantissa is 24
 /// bits, 10^4 needs 14), so rounding it is rounding the exact value.
 #[inline]
-fn push_fixed(buf: &mut Vec<u8>, v: f32, decimals: u32) {
+pub(crate) fn push_fixed(buf: &mut Vec<u8>, v: f32, decimals: u32) {
     if !v.is_finite() {
         let _ = write!(buf, "{:.*}", decimals as usize, v);
         return;
@@ -90,7 +90,7 @@ fn bgzf_writer(path: &std::path::Path, buf_capacity: usize) -> std::io::Result<B
 
 /// Hard call = argmax genotype (ties to 0/0, then 1/1); conf = its posterior.
 #[inline]
-fn call(g0: f32, g1: f32, g2: f32) -> (&'static [u8], f32) {
+pub(crate) fn call(g0: f32, g1: f32, g2: f32) -> (&'static [u8], f32) {
     if g0 >= g1 && g0 >= g2 {
         (b"0/0", g0)
     } else if g2 >= g0 && g2 >= g1 {

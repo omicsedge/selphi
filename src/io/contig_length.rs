@@ -259,7 +259,7 @@ pub fn same_contig(a: &str, b: &str) -> bool { bare(a) == bare(b) }
 
 /// A contig name without a leading `chr` (case-insensitive; a name that is only `chr`
 /// is kept).
-fn bare(c: &str) -> &str {
+pub fn bare(c: &str) -> &str {
     match c.get(..3) {
         Some(p) if c.len() > 3 && p.eq_ignore_ascii_case("chr") => &c[3..],
         _ => c,

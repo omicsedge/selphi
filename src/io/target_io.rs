@@ -200,6 +200,16 @@ impl VcfLines {
         Ok(VcfLines { reader, buf: Vec::with_capacity(piece), start: 0, eof: false, done: false, piece })
     }
 
+    /// The lines of a BGZF file from the virtual position `at` (an index's offset of a line start)
+    /// to its end.
+    pub(crate) fn open_at(path: &str, at: noodles_bgzf::VirtualPosition) -> std::io::Result<Self> {
+        let file = std::fs::File::open(path)
+            .map_err(|e| crate::Fatal::error(1, format!("Cannot open {}: {}", path, e)))?;
+        let mut bgzf = noodles_bgzf::io::Reader::new(std::io::BufReader::new(file));
+        bgzf.seek(at)?;
+        Ok(VcfLines { reader: Box::new(bgzf), buf: Vec::with_capacity(LINE_PIECE), start: 0, eof: false, done: false, piece: LINE_PIECE })
+    }
+
     /// Whether the stream is a BGZF-wrapped binary BCF (magic `BCF\2\2`), read through this
     /// reader so a FIFO or stdin loses nothing to the probe.
     pub(crate) fn is_bcf(&mut self) -> std::io::Result<bool> {
@@ -1159,7 +1169,7 @@ fn sample_confidence(
 
 /// Index of `name` in a colon-separated FORMAT spec (`b"GT:GQ:DP"` → 1 for GQ).
 #[inline]
-fn format_field_index(format_bytes: &[u8], name: &[u8]) -> Option<usize> {
+pub(crate) fn format_field_index(format_bytes: &[u8], name: &[u8]) -> Option<usize> {
     let mut idx = 0usize;
     let mut start = 0usize;
     for (i, &b) in format_bytes.iter().enumerate() {
@@ -1174,7 +1184,7 @@ fn format_field_index(format_bytes: &[u8], name: &[u8]) -> Option<usize> {
 
 /// Extract the n-th colon-separated subfield from a per-sample byte slice.
 #[inline]
-fn nth_subfield(field: &[u8], n: usize) -> Option<&[u8]> {
+pub(crate) fn nth_subfield(field: &[u8], n: usize) -> Option<&[u8]> {
     let mut idx = 0usize;
     let mut start = 0usize;
     for (i, &b) in field.iter().enumerate() {

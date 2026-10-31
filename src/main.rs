@@ -198,6 +198,33 @@ fn main() {
     }
 
 
+    // --- `--calls`: refused with what it cannot combine with, before any work ---
+    if args.calls.is_some() {
+        let other_mode = args.phase_panel || args.evaluate.is_some() || args.index.is_some() || args.index_stats.is_some()
+            || args.self_test || args.merge_srps.is_some() || args.merge_srps_dir.is_some() || args.prepare_reference_from.is_some();
+        let mut bad: Vec<&str> = Vec::new();
+        for (on, flag) in [(other_mode, "a top-level mode other than imputation"), (args.phase_only, "--phase-only"),
+            (args.ls_exact, "--ls-exact"), (args.bcf, "--bcf"), (args.parquet, "--parquet"), (args.pgen, "--pgen"),
+            (args.selfdecode, "--selfdecode"), (args.all_formats, "--all-formats"),
+            (args.contig_length_from_input, "--contig-length-from-input (the header is the caller's)"),
+            (args.input_filter.is_some(), "--input-filter (the merge reads FILTER by its own rule)")] {
+            if on { bad.push(flag); }
+        }
+        if !bad.is_empty() {
+            eprintln!("ERROR: --calls cannot be combined with {}", bad.join(", "));
+            std::process::exit(2);
+        }
+        let reads_input = args.input.as_deref().is_some_and(|p| { let p = p.to_ascii_lowercase(); p.ends_with(".bam") || p.ends_with(".cram") });
+        if !args.lcwgs || !(args.bam.is_some() || args.bam_list.is_some() || reads_input) {
+            eprintln!("ERROR: --calls needs the sample's reads (--bam, or --input reads.bam|reads.cram): it runs the lcWGS engine on them");
+            std::process::exit(2);
+        }
+        if args.reference.is_none() {
+            eprintln!("ERROR: --calls needs --reference (the FASTA the calls and reads are aligned to): alleles are normalised against it");
+            std::process::exit(2);
+        }
+    }
+
     // --- De-novo panel phasing mode ---
     if args.phase_panel {
         let input = args.input.as_deref()
@@ -226,6 +253,10 @@ fn main() {
             Vec::new()
         };
         let bam_mode = !bam_paths.is_empty();
+        if args.calls.is_some() && !bam_mode {
+            eprintln!("ERROR: --calls needs the sample's reads: --bam, --bam-list or --input names no BAM/CRAM");
+            std::process::exit(2);
+        }
         let input = if bam_mode {
             args.bam.as_deref().or(args.bam_list.as_deref()).or(args.input.as_deref()).unwrap_or("")
         } else {
@@ -257,11 +288,54 @@ fn main() {
         let out_stem = output.strip_suffix(".vcf.gz").or_else(|| output.strip_suffix(".bcf")).unwrap_or(output);
         let vcf_path = PathBuf::from(format!("{out_stem}.vcf.gz"));
         let tsv_path = PathBuf::from(format!("{out_stem}.dose.tsv.gz"));
+        let log_path = selphi::common::utils::out_path(std::path::Path::new(output), "log");
         let mut inputs: Vec<&str> = bam_paths.iter().map(String::as_str).collect();
         inputs.push(input);
-        selphi::common::utils::refuse_overwrite(&inputs, &[vcf_path.clone(), tsv_path.clone()]).unwrap_or_else(|f| exit_with(&f));
+        let calls_inputs: Vec<String> = match args.calls.as_deref() {
+            Some(calls) => {
+                let mut v = selphi::lcwgs::calls_merge::inputs(calls, &bam_paths[0], args.reference.as_deref().unwrap_or(""), map)
+                    .unwrap_or_else(|e| { eprintln!("ERROR: --calls: cannot list the genetic maps {map}: {e}"); std::process::exit(2); });
+                v.push(refpanel.to_string());
+                v.extend(panel_files.iter().flatten().map(|f| f.to_string_lossy().into_owned()));
+                v
+            }
+            None => Vec::new(),
+        };
+        inputs.extend(calls_inputs.iter().map(String::as_str));
+        let outputs = match args.calls {
+            // The merged VCF, its index, their temporary names, and the log (opened below).
+            Some(_) => { let mut o = selphi::lcwgs::calls_merge::outputs(&vcf_path); o.push(log_path.clone()); o }
+            None => vec![vcf_path.clone(), tsv_path.clone()],
+        };
+        selphi::common::utils::refuse_overwrite(&inputs, &outputs).unwrap_or_else(|f| exit_with(&f));
+        let haploids: Option<Vec<String>> = args.haploids.as_deref().map(|h| {
+            let names = std::fs::read_to_string(h).unwrap_or_else(|e| {
+                selphi_error!("Cannot read --haploids {}: {}", h, e); std::process::exit(1);
+            });
+            names.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(String::from).collect()
+        });
+        // --calls: the calls file, the reads' sample and --haploids checked before any output is
+        // opened (the log included); the --haploids list the engine matches against the reads.
+        let calls_policy = args.calls.as_ref().map(|_| selphi::lcwgs::calls_merge::CallsPolicy {
+            depth: args.calls_depth.unwrap_or(selphi::lcwgs::calls_merge::CallsPolicy::DEFAULT_DEPTH),
+            min_gq: args.calls_min_gq.unwrap_or(0) as i64,
+            gq_all: args.calls_gq_scope == Some(crate::cli::GqScope::All),
+            gvcf: args.calls_gvcf,
+            window: selphi::lcwgs::calls_merge::CallsPolicy::window_from_env()
+                .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(2); }),
+        });
+        let calls_args = args.calls.as_deref().zip(calls_policy).map(|(calls, policy)| selphi::lcwgs::calls_merge::CallsArgs {
+            calls, policy, bams: &bam_paths, reference: args.reference.as_deref().unwrap_or(""), threads: args.threads,
+            out: &vcf_path, extra_header: &args.header_line, panel: refpanel, map,
+        });
+        let (calls_prep, haploids) = match calls_args.as_ref() {
+            Some(ca) => {
+                let (prep, h) = selphi::lcwgs::calls_merge::prepare(ca, haploids.as_deref()).unwrap_or_else(|f| exit_with(&f));
+                (Some(prep), h)
+            }
+            None => (None, haploids),
+        };
 
-        let log_path = selphi::common::utils::out_path(std::path::Path::new(output), "log");
         selphi::log::init(&log_path, args.debug);
         selphi::log::print_banner(env!("CARGO_PKG_VERSION"));
         selphi_info!("  mode:     lcwgs");
@@ -290,12 +364,6 @@ fn main() {
             std::process::exit(2);
         }
         // Run lcWGS pipeline (BAM-native GL pileup, or pre-computed PL VCF)
-        let haploids = args.haploids.as_deref().map(|h| {
-            let names = std::fs::read_to_string(h).unwrap_or_else(|e| {
-                selphi_error!("Cannot read --haploids {}: {}", h, e); std::process::exit(1);
-            });
-            names.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(String::from).collect()
-        });
         let params = selphi::lcwgs::LcwgsParams {
             haploids,
             chrx_par: !args.chrx_no_par,
@@ -342,6 +410,14 @@ fn main() {
                 Some(f) => selphi::lcwgs::multi::Panels::Files(f.clone()),
                 None => selphi::lcwgs::multi::Panels::Multi(refpanel.to_string()),
             };
+            if let (Some(ca), Some(prep)) = (calls_args.as_ref(), calls_prep) {
+                let set = selphi::lcwgs::multi::PanelSet::open(panels, maps)
+                    .unwrap_or_else(|e| exit_on_io(&e, || eprintln!("Error: the panel: {}", e)));
+                selphi::lcwgs::calls_merge::run_multi(ca, prep, &params, &set)
+                    .unwrap_or_else(|e| exit_on_io(&e, || eprintln!("--calls failed: {}", e)));
+                selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB", start.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
+                return;
+            }
             selphi::lcwgs::multi::run(panels, inp, maps, &params, args.threads, &vcf_path, &tsv_path, &args.header_line, &contig_lengths)
                 .unwrap_or_else(|e| exit_on_io(&e, || eprintln!("lcWGS pipeline failed: {}", e)));
             selphi_step!("wrote imputed VCF: {}", vcf_path.display());
@@ -352,7 +428,7 @@ fn main() {
         // A --region on a multi-chromosome panel runs that chromosome's view, with its map.
         let region_map: Option<String> = (multi_panel && args.map_path.is_none()).then(|| {
             let chr = bam_region.as_ref().map(|r| r.0.clone()).unwrap_or_default();
-            selphi::genmap::find_map_in_dir(Path::new(map), chr.strip_prefix("chr").unwrap_or(&chr))
+            selphi::genmap::find_map_in_dir(Path::new(map), selphi::io::contig_length::bare(&chr))
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|| { eprintln!("Error: no map for {} in {}", chr, map); std::process::exit(1); })
         });
@@ -364,7 +440,12 @@ fn main() {
             let bare = |c: &str| c.strip_prefix("chr").unwrap_or(c).to_string();
             let listed = selphi::lcwgs::multi::file_chromosomes(files)
                 .unwrap_or_else(|e| { eprintln!("Error: --refpanel-dir: {}", e); std::process::exit(1); });
+            if args.calls.is_some() && listed.iter().filter(|(m, _)| selphi::io::contig_length::same_contig(&m.chromosome, &chr)).count() > 1 {
+                selphi_error!("--calls: --region names {}, which several panels in --refpanel-dir hold", chr);
+                std::process::exit(2);
+            }
             let f = listed.iter().find(|(m, _)| bare(&m.chromosome) == bare(&chr)).map(|(_, f)| f.clone())
+                .or_else(|| args.calls.as_ref().and(listed.iter().find(|(m, _)| selphi::io::contig_length::same_contig(&m.chromosome, &chr)).map(|(_, f)| f.clone())))
                 .unwrap_or_else(|| { eprintln!("Error: --region names {}, which no panel in --refpanel-dir holds", chr); std::process::exit(1); });
             selphi::srp::SrpReader::open(f, 0)
                 .unwrap_or_else(|e| { eprintln!("Failed to open SRP: {}", e); std::process::exit(1); })
@@ -372,9 +453,19 @@ fn main() {
             let chr = bam_region.as_ref().map(|r| r.0.clone()).unwrap_or_default();
             let reader = selphi::srp::multi_chr_reader::MultiChrSrpReader::open(refpanel)
                 .unwrap_or_else(|e| { eprintln!("Failed to open SRP: {}", e); std::process::exit(1); });
-            let name = reader.chromosomes().into_iter().find(|c| c.strip_prefix("chr").unwrap_or(c) == chr.strip_prefix("chr").unwrap_or(&chr))
-                .map(str::to_string)
-                .unwrap_or_else(|| { eprintln!("Error: --region names {}, which the panel lacks", chr); std::process::exit(1); });
+            let name = if args.calls.is_some() {
+                // --calls resolves every contig name one way (contig_length::same_contig): exactly one match.
+                let hits: Vec<&str> = reader.chromosomes().into_iter().filter(|c| selphi::io::contig_length::same_contig(c, &chr)).collect();
+                match hits.as_slice() {
+                    [one] => one.to_string(),
+                    [] => { selphi_error!("--region names {}, which the panel lacks", chr); std::process::exit(2); }
+                    _ => { selphi_error!("--calls: --region names {}, which matches several panel chromosomes ({})", chr, hits.join(", ")); std::process::exit(2); }
+                }
+            } else {
+                reader.chromosomes().into_iter().find(|c| c.strip_prefix("chr").unwrap_or(c) == chr.strip_prefix("chr").unwrap_or(&chr))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| { eprintln!("Error: --region names {}, which the panel lacks", chr); std::process::exit(1); })
+            };
             reader.load_chr_view(&name).map(|v| v.into_srp_reader())
                 .unwrap_or_else(|e| { eprintln!("Failed to open SRP: {}", e); std::process::exit(1); })
         } else {
@@ -382,6 +473,14 @@ fn main() {
                 .unwrap_or_else(|e| { eprintln!("Failed to open SRP: {}", e); std::process::exit(1); })
         };
         selphi_step!("SRP loaded: {} variants, {} haps", srp.metadata.n_variants, srp.metadata.n_haps);
+
+        if let (Some(ca), Some(prep)) = (calls_args.as_ref(), calls_prep) {
+            let reg = bam_region.as_ref().map(|(c, s, e)| (c.as_str(), *s, *e));
+            selphi::lcwgs::calls_merge::run_single(ca, prep, &params, &srp, map, reg)
+                .unwrap_or_else(|e| exit_on_io(&e, || eprintln!("--calls failed: {}", e)));
+            selphi_info!("\nTotal: {:.0}s | Peak memory: {:.0} MB", start.elapsed().as_secs_f64(), selphi::log::peak_mem_mb());
+            return;
+        }
 
         // reference-faithful engine (--ls-exact): a faithful reimplementation of GLIMPSE2's
         // phase/ Gibbs caller. PL-VCF input only (BAM-native GL not yet wired for

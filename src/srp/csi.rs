@@ -393,6 +393,15 @@ pub fn tbi_seek(index: &TbiIndex, contig_idx: usize, pos_0based: i64) -> Virtual
     VirtualPosition::from(0)
 }
 
+/// The virtual position of the first record of the contig the index names `name` (its own contig
+/// names, exactly): the first non-zero linear-index entry, never the file start that [`tbi_seek`]
+/// falls back to while the contig's first windows are empty. `None` for a contig the index lacks
+/// or holds no record of.
+pub fn tbi_contig_start(index: &TbiIndex, name: &str) -> Option<VirtualPosition> {
+    let i = index.contig_names.iter().position(|c| c == name)?;
+    index.linear.get(i)?.iter().find(|&&v| v != 0).map(|&v| VirtualPosition::from(v))
+}
+
 // ---------------------------------------------------------------------------
 // CSI index writer: build index by scanning a BCF file
 // ---------------------------------------------------------------------------
@@ -1105,6 +1114,24 @@ impl<W: io::Write> io::Write for BgzfBlockTap<W> {
         Ok(n)
     }
     fn flush(&mut self) -> io::Result<()> { self.inner.flush() }
+}
+
+/// A BGZF file writer whose blocks are reported, as they are written, to the
+/// [`TbiStreamIndexer`] returned with it.
+pub type TappedBgzfWriter = noodles_bgzf::io::multithreaded_writer::MultithreadedWriter<BgzfBlockTap<io::BufWriter<std::fs::File>>>;
+
+/// Create `path` as a BGZF file compressed by `workers` threads (the bytes do not depend on
+/// them: fixed-size blocks deflated independently) behind a 1 MiB file buffer, and the indexer
+/// that builds its `.tbi` while it is written. Per data line: `index.push_meta`, then
+/// `index.observe` with its UNCOMPRESSED bytes and `writer.write_all`; `index.process()` now
+/// and then. At the end `writer.finish()?.into_inner()` (flushed), then `index.finish`.
+pub fn tapped_bgzf_writer(path: &Path, workers: usize) -> io::Result<(TappedBgzfWriter, TbiStreamIndexer)> {
+    let file = io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
+    let (block_tx, block_rx) = std::sync::mpsc::channel();
+    let writer = noodles_bgzf::io::multithreaded_writer::Builder::default()
+        .set_worker_count(std::num::NonZeroUsize::new(workers.max(1)).unwrap())
+        .build_from_writer(BgzfBlockTap::new(file, block_tx));
+    Ok((writer, TbiStreamIndexer::new(block_rx)))
 }
 
 /// Builds the `.tbi` of a VCF.gz while it is written, giving exactly the index

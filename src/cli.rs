@@ -26,6 +26,10 @@ pub enum Engine {
     Refine,
 }
 
+/// `--calls-gq-scope`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
+pub enum GqScope { Snp, All }
+
 #[derive(Parser, Debug)]
 #[command(name = "selphi", about = "PBWT-based genotype imputation")]
 pub struct Args {
@@ -51,6 +55,40 @@ pub struct Args {
     /// Required for .cram input, to decode the read bases.
     #[arg(long, alias = "fasta")]
     pub reference: Option<String>,
+
+    /// lcWGS from reads (--bam, one sample; --reference required): the sample's variant
+    /// caller VCF (text, plain or bgzipped). Writes <out>.vcf.gz + .tbi: the caller's file
+    /// with Selphi's genotypes where the caller is not trusted, at reference-panel alleles
+    /// where the caller has no variant call and the q20 read depth is below --calls-depth
+    /// (and, with --calls-min-gq, at its low-GQ variant calls), each written only where it
+    /// differs from the caller and named in FORMAT provenance fields (SRC, CST, CAC, ...).
+    /// The caller's header and records are kept as read; no dosage TSV is written.
+    #[arg(long, value_name = "VCF")]
+    pub calls: Option<String>,
+
+    /// --calls: the file is a gVCF, so a position no record or block covers is a no-call
+    /// (without it, absence means reference).
+    #[arg(long, requires = "calls")]
+    pub calls_gvcf: bool,
+
+    /// --calls: a panel allele where the caller has no variant call (nothing, a 0/0, a
+    /// no-call, a filtered call) goes to Selphi when the q20 read depth there is below this
+    /// (default 20).
+    #[arg(long, value_name = "T", requires = "calls", value_parser = clap::value_parser!(u32).range(0..=65535))]
+    pub calls_depth: Option<u32>,
+
+    /// --calls: a PASS variant call whose FORMAT/GQ is below this goes to Selphi, at any
+    /// depth (default 0 = never; a call without GQ never). Measured on 30x DeepVariant
+    /// chr22 (README): 15 with --calls-gq-scope all gains 22-46 SNPs over the default on
+    /// eight sets, but at depth 15-19 its indels fell below the default's beyond the seed
+    /// tolerance on four of seven, so it is not the default.
+    #[arg(long, value_name = "G", requires = "calls")]
+    pub calls_min_gq: Option<u32>,
+
+    /// --calls: which variant calls --calls-min-gq applies to: snp (records whose every
+    /// allele is an SNP; default) or all.
+    #[arg(long, value_enum, requires = "calls")]
+    pub calls_gq_scope: Option<GqScope>,
 
     /// Path to genetic map (PLINK format)
     #[arg(long = "map")]

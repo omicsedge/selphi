@@ -22,5 +22,6 @@ pub mod target_io;
 pub mod passthrough;
 pub mod contig_length;
 pub mod variant_only;
+pub mod allele_norm;
 
 pub mod indexing;

@@ -887,8 +887,56 @@ pub fn run_lcwgs_bam(
     params: &LcwgsParams,
     region: Option<(&str, i64, i64)>,
     reference: Option<&str>,
-    _n_threads: usize,
+    n_threads: usize,
 ) -> std::io::Result<LcwgsOutput> {
+    run_lcwgs_bam_inner(bam_paths, srp, map_path, params, region, reference, n_threads, false).map(|(out, _)| out)
+}
+
+/// The q20 read depth ([`super::bam_pileup::DepthCounter`]) at every panel site of a
+/// [`run_lcwgs_bam_with_depth`] run, counted in the pileup's own pass over the reads.
+pub struct ReadDepth {
+    /// Panel variant index of `count`'s first site (the run's sites are a contiguous run of them).
+    first: usize,
+    n_samples: usize,
+    /// `count[(panel index - first) * n_samples + s]`.
+    count: Vec<u16>,
+}
+
+impl ReadDepth {
+    /// The depths `count` of `n_samples` samples at the panel variants from `first` on.
+    pub fn new(first: usize, n_samples: usize, count: Vec<u16>) -> Self { ReadDepth { first, n_samples, count } }
+
+    /// The depth of sample `s` at panel variant `panel_index`.
+    #[inline]
+    pub fn get(&self, panel_index: usize, s: usize) -> u16 { self.count[(panel_index - self.first) * self.n_samples + s] }
+}
+
+/// [`run_lcwgs_bam`] that also returns the read depth at every panel site of the run
+/// (`--calls`); the imputation and its output are the plain run's.
+pub fn run_lcwgs_bam_with_depth(
+    bam_paths: &[String],
+    srp: &SrpReader,
+    map_path: &str,
+    params: &LcwgsParams,
+    region: Option<(&str, i64, i64)>,
+    reference: Option<&str>,
+    n_threads: usize,
+) -> std::io::Result<(LcwgsOutput, ReadDepth)> {
+    let (out, depth) = run_lcwgs_bam_inner(bam_paths, srp, map_path, params, region, reference, n_threads, true)?;
+    Ok((out, depth.expect("the depth is counted when asked for")))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_lcwgs_bam_inner(
+    bam_paths: &[String],
+    srp: &SrpReader,
+    map_path: &str,
+    params: &LcwgsParams,
+    region: Option<(&str, i64, i64)>,
+    reference: Option<&str>,
+    _n_threads: usize,
+    count_depth: bool,
+) -> std::io::Result<(LcwgsOutput, Option<ReadDepth>)> {
     if let Some(msg) = crate::contig::nonrecomb_refusal(srp.chromosome()) {
         return Err(crate::Fatal::error(2, msg).into());
     }
@@ -917,6 +965,13 @@ pub fn run_lcwgs_bam(
         return Err(std::io::Error::other("No panel variants in the requested region"));
     }
     let chrom = srp.variants.chr(wgs_idx[0]).to_string();
+    // The depth is counted at every site of the run, SNPs and indels: a borrowed run of the
+    // panel's positions (one chromosome's sites, the region's a contiguous part of them).
+    let depth_span = count_depth.then(|| wgs_idx[0]..wgs_idx[n_shared - 1] + 1);
+    if depth_span.as_ref().is_some_and(|r| r.len() != n_shared) {
+        return Err(std::io::Error::other("the run's panel sites are not one contiguous run of the panel (unsorted panel?)"));
+    }
+    let depth_at: Option<&[i64]> = depth_span.clone().map(|r| &srp.variants.positions()[r]);
 
     // Site arrays for the pileup (ascending by pos; SNP = single-base ref+alt).
     let pos: Vec<i64> = wgs_idx.iter().map(|&wi| srp.variants.pos(wi)).collect();
@@ -1016,7 +1071,7 @@ pub fn run_lcwgs_bam(
 
     let pp = super::bam_pileup::PileupParams::default();
     let region_bounds = region.map(|(_, s, e)| (s, e));
-    let pileup = || super::bam_pileup::pileup_bams(bam_paths, &chrom, &pos, &ref_base, &alt_base, &is_snp, region_bounds, reference, indel_model.as_ref(), pp);
+    let pileup = || super::bam_pileup::pileup_bams(bam_paths, &chrom, &pos, &ref_base, &alt_base, &is_snp, region_bounds, reference, indel_model.as_ref(), pp, depth_at);
     // Impute-only indels scored from their own reads: a pileup of their own, so
     // the SNP pileup is the default's exactly.
     let pass_pileup = || -> std::io::Result<Option<super::bam_pileup::BamGl>> {
@@ -1030,7 +1085,7 @@ pub fn run_lcwgs_bam(
         }).collect();
         let model = super::indel_realign::IndelModel::build(refp, &chrom, &inputs)?;
         selphi_info!("  lcWGS-BAM: indel realignment for {} impute-only indel sites (own reads only)", model.n_sites());
-        super::bam_pileup::pileup_bams(bam_paths, &chrom, &ppos, &pref, &palt, &vec![false; pass_idx.len()], region_bounds, reference, Some(&model), pp).map(Some)
+        super::bam_pileup::pileup_bams(bam_paths, &chrom, &ppos, &pref, &palt, &vec![false; pass_idx.len()], region_bounds, reference, Some(&model), pp, None).map(Some)
     };
     let pileup_all = || -> std::io::Result<(super::bam_pileup::BamGl, Option<super::bam_pileup::BamGl>)> { Ok((pileup()?, pass_pileup()?)) };
     let pass_ref = (!pass_idx.is_empty()).then(|| Passengers::new(&wgs_idx, pass_idx.clone(), None));
@@ -1054,8 +1109,10 @@ pub fn run_lcwgs_bam(
         }
         p
     });
+    let depth = depth_span.zip(bamgl.depth).map(|(r, count)| ReadDepth::new(r.start, n_samples, count));
     // bamgl.gl3 is already in panel-shared order → shared imputation tail.
-    impute_from_gl3(srp, &wgs_idx, bamgl.gl3, n_samples, bamgl.sample_ids, &[], map_path, params, prepared, passengers)
+    let out = impute_from_gl3(srp, &wgs_idx, bamgl.gl3, n_samples, bamgl.sample_ids, &[], map_path, params, prepared, passengers)?;
+    Ok((out, depth))
 }
 
 /// How the `--bam` path treats the panel's indel sites.
