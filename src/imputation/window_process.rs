@@ -722,6 +722,36 @@ fn share_batch_for_budget(avail_mb: f64, per_target_mb: f64, threads: usize) -> 
     if b < MIN_WORTH { 1 } else { b.min(MAX_B) }
 }
 
+/// `f` over groups of `targets` taken in order by `threads` workers, the results in target
+/// order. Groups are `share` targets while many rounds are left, then ever smaller (down to
+/// four) as the targets run out, so the last round is short groups: with equal groups work-
+/// stolen over the pool (101 of 16 for 1000 Genomes' 1,602 haplotypes, 6.3 rounds) the
+/// pool waited out most of a group in the last round, twice per window. Results do not
+/// depend on the grouping (every group size gives the same matches).
+fn guided_groups<R: Send>(targets: &[usize], share: usize, threads: usize,
+                          f: impl Fn(&[usize]) -> Vec<R> + Sync) -> Vec<R> {
+    let mut bounds = Vec::new();
+    let mut start = 0;
+    while start < targets.len() {
+        let rem = targets.len() - start;
+        let size = rem.div_ceil(threads.max(1)).clamp(share.min(4), share).min(rem);
+        bounds.push(start..start + size);
+        start += size;
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Vec<R>>> = bounds.iter().map(|_| std::sync::Mutex::new(Vec::new())).collect();
+    rayon::scope(|s| {
+        for _ in 0..threads.clamp(1, bounds.len().max(1)) {
+            s.spawn(|_| loop {
+                let g = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(r) = bounds.get(g) else { break };
+                *slots[g].lock().unwrap() = f(&targets[r.clone()]);
+            });
+        }
+    });
+    slots.into_iter().flat_map(|m| m.into_inner().unwrap()).collect()
+}
+
 /// Resolve the share group for this window: explicit knob if set, else auto.
 fn resolve_share(n_var_w: usize, fl_fwd: usize, n_ref: usize, n_batch: usize, max_candidates: usize) -> usize {
     let knob = share_batch();
@@ -1401,8 +1431,8 @@ pub fn process_window_hmm(
                 // join a shared sort; it runs per target (same result as unshared).
                 let (own, shared): (Vec<usize>, Vec<usize>) = (batch_start..batch_end)
                     .partition(|&t| ctx.skip && miss[t].is_some());
-                let mut out: Vec<(usize, HmmResult)> =
-                    shared.par_chunks(share).flat_map(|c| shared_chunk(c)).map(&hand).collect();
+                let mut out: Vec<(usize, HmmResult)> = guided_groups(&shared, share, hmm_pool_width(),
+                    |c| shared_chunk(c).into_iter().map(&hand).collect());
                 if !own.is_empty() {
                     out.extend(own.into_par_iter().map(&per_target).map(&hand).collect::<Vec<_>>());
                     out.sort_unstable_by_key(|&(t, _)| t);
@@ -1485,6 +1515,29 @@ pub fn process_window_hmm(
 #[cfg(test)]
 mod share_tests {
     use super::share_batch_for_budget;
+
+    /// Every target is handed to exactly one group, in order; groups hold at most `share`
+    /// and shrink only towards the end.
+    #[test]
+    fn guided_groups_cover_the_targets_in_order() {
+        for n in [0usize, 1, 2, 3, 15, 16, 17, 100, 1602] {
+            for share in [1usize, 2, 4, 16] {
+                for threads in [1usize, 3, 16] {
+                    let targets: Vec<usize> = (0..n).map(|t| 3 * t + 1).collect();
+                    let sizes = std::sync::Mutex::new(Vec::new());
+                    let got = super::guided_groups(&targets, share, threads, |c| {
+                        sizes.lock().unwrap().push((c[0], c.len()));
+                        c.to_vec()
+                    });
+                    assert_eq!(got, targets, "n {n} share {share} threads {threads}");
+                    let mut sizes = sizes.into_inner().unwrap();
+                    sizes.sort_unstable();
+                    assert!(sizes.iter().all(|&(_, len)| len <= share.max(1)));
+                    assert!(sizes.windows(2).all(|w| w[1].1 <= w[0].1), "sizes grow: {sizes:?}");
+                }
+            }
+        }
+    }
 
     /// MESA 100 x TOPMed shape: 11,980 sites x fl_fwd 149 + 171,054 haps = ~15.0 MB
     /// per in-flight target, 16 threads.
