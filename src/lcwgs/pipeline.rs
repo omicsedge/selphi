@@ -169,9 +169,11 @@ pub(crate) struct Links {
     samples: Vec<Option<super::linkage::SampleLinkage>>,
 }
 
-/// A plan's bound per fragment: one entry with a table of 2^8 values and their
-/// posterior masses (f32), its rows and offsets.
-const PLAN_BYTES_PER_FRAGMENT: usize = 2 * 4 * 256 + 4 * super::linkage::MAX_SITES + 16;
+/// An upper bound on a plan's contents from its fragments' observations: an entry of
+/// `u` sites (<= the sum of its fragments' sites) holds a table and its posterior
+/// masses of max(16, 2^u) <= 32u f32 each (u <= 8) and u rows, so <= 260 B per
+/// observation, and 12 B of offsets per entry (<= one per fragment).
+fn plan_bytes(frags: usize, obs: usize) -> usize { 260 * obs + 12 * frags }
 
 /// Whether this run links read pairs: asked for (`LCWGS_LINKAGE`), and neither with
 /// the scaffold forward-backward or the heuristic phaser, nor on a biobank-size
@@ -1645,11 +1647,10 @@ fn run_chunked_gibbs(
     }).collect();
     // A linked chunk also holds the likelihoods its forward-backward reads (12 B a site
     // and sample) and each sample's view of its fragments (12 B an observation, 4 B a
-    // fragment); each running sample task holds one haplotype's plan, bounded by one
-    // entry per fragment at the largest table (2^8 values and their posterior masses).
+    // fragment); each running sample task holds one haplotype's plan ([`plan_bytes`]).
     let link_cost: Vec<(usize, usize)> = plan.iter().map(|r| match (r, links) {
         (Some((_, buffer)), Some(l)) => l.samples.iter().flatten().map(|x| x.counts_in(buffer.clone()))
-            .fold((buffer.len() * n_samples * 12, 0), |(view, task), (frags, obs)| (view + obs * 12 + frags * 4, task.max(frags * PLAN_BYTES_PER_FRAGMENT))),
+            .fold((buffer.len() * n_samples * 12, 0), |(view, task), (frags, obs)| (view + obs * 12 + frags * 4, task.max(plan_bytes(frags, obs)))),
         _ => (0, 0),
     }).collect();
     let link_bytes = |c: usize, chains: usize| link_cost[c].0 + chains * link_cost[c].1;
