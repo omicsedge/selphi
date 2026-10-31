@@ -737,12 +737,13 @@ type BufFile = BufWriter<std::fs::File>;
 /// do not depend on this count (checked by `csi::tests::bgzf_bytes_do_not_depend_on_worker_count`);
 /// `4.min(n_samples)` limits a single-sample run to one compression thread
 /// and a 100-sample BCF to four, making deflate the output-stage bottleneck.
-/// Four per pool thread: the writer keeps one 64 KB block in flight per worker, and a
-/// block's round trip (hand-off, deflate, in-order write) waits on thread wake-ups, so with
-/// one per core the stream ran ~1 GB/s with the deflaters mostly asleep (8 GB of VCF text,
-/// 16 workers: 4.2-9.8 s; 64: 3.6-4.8 s, the same CPU).
+/// Four per pool thread, at most 64 (one with a single thread): the writer keeps one 64 KB
+/// block in flight per worker, and a block's round trip (hand-off, deflate, in-order write)
+/// waits on thread wake-ups, so with one per core the stream ran ~1 GB/s with the deflaters
+/// mostly asleep (8 GB of VCF text, 16 workers: 4.2-9.8 s; 64: 3.6-4.8 s, the same CPU).
 fn bgzf_worker_count() -> std::num::NonZeroUsize {
-    std::num::NonZeroUsize::new(4 * rayon::current_num_threads().max(1)).unwrap()
+    let threads = rayon::current_num_threads().max(1);
+    std::num::NonZeroUsize::new(if threads == 1 { 1 } else { (4 * threads).min(64) }).unwrap()
 }
 
 /// Create the output file, the native multithreaded BGZF writer over `wrap(file)`
