@@ -862,9 +862,9 @@ fn full_panel_csc_over(
                 ws, rows_dyn, nv, m, nr, ml, ff, tgt_abs, &pbwt::OnlyCands(k), miss),
         }
     });
-    let bwd = pbwt::backward_filter_single(&fwd, nv, ctx.n_ref, ctx.fl_fwd, ctx.fl_bwd);
+    let bwd = pbwt::backward_filter_single(&fwd, nv, ctx.n_ref, ctx.fl_bwd);
     // Over the called sites when `called` is Some (see `expand_weights`).
-    let csc = pbwt::build_csc_matrix(&bwd, ctx.n_ref, nv, ctx.fl_bwd);
+    let csc = pbwt::build_csc_matrix(bwd, ctx.n_ref, nv);
     (csc, rows.buf)
 }
 
@@ -923,9 +923,9 @@ fn reduced_csc_over(
             ws, rows_dyn, nv, m_red, n_cand, ml, ctx.fl_fwd, n_cand as i32, miss,
         )
     });
-    let bwd = pbwt::backward_filter_single(&fwd, nv, n_cand, ctx.fl_fwd, ctx.fl_bwd);
+    let bwd = pbwt::backward_filter_single(&fwd, nv, n_cand, ctx.fl_bwd);
     // Over the called sites when `called` is Some (see `expand_weights`).
-    let mut csc = pbwt::build_csc_matrix(&bwd, n_cand, nv, ctx.fl_bwd);
+    let mut csc = pbwt::build_csc_matrix(bwd, n_cand, nv);
     // CSC indices are positions in the candidate list — remap to absolute haplotype IDs.
     for idx in &mut csc.indices {
         debug_assert!((*idx as usize) < candidates.len(),
@@ -1356,9 +1356,11 @@ pub fn process_window_hmm(
             });
             give_row_buf(rows.into_buf());
 
-            let cscs: Vec<pbwt::CscMatchMatrix> = fwds.iter().map(|fwd| {
-                let bwd = pbwt::backward_filter_single(fwd, n_var_w, n_ref, fl_fwd, fl_bwd);
-                pbwt::build_csc_matrix(&bwd, n_ref, n_var_w, fl_bwd)
+            // Each target's forward lists are freed once its CSC is built, not held through
+            // the group's HMMs.
+            let cscs: Vec<pbwt::CscMatchMatrix> = fwds.into_iter().map(|fwd| {
+                let bwd = pbwt::backward_filter_single(&fwd, n_var_w, n_ref, fl_bwd);
+                pbwt::build_csc_matrix(bwd, n_ref, n_var_w)
             }).collect();
             STAGE_PBWT_US.fetch_add(t_pbwt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 
