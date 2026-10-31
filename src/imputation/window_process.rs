@@ -378,16 +378,27 @@ fn perr_adapt() -> Option<PerrAdapt> {
     })
 }
 
-/// Record the floor a haplotype was measured to in its first window (`PerrAdapt`).
-fn carry_update(c: &mut HapCarry, r: &super::hmm::HmmResult, base: f64, adapt: bool,
-                stats: &mut (usize, usize, f64, f64)) {
-    if let (true, None, Some(u)) = (adapt, c.p_err, r.unmatched) {
+/// Carry a haplotype's window result to its next window: the floor it was measured to in
+/// its first window (`PerrAdapt`), returned as (unmatched mass, floor) for the run's summary,
+/// and its forward posterior as the next prior.
+fn carry_update(c: &mut HapCarry, r: &mut super::hmm::HmmResult, adapt: bool) -> Option<(f64, f64)> {
+    let measured = if let (true, None, Some(u)) = (adapt, c.p_err, r.unmatched) {
         c.p_err = Some(r.perr_floor);
-        stats.0 += 1;
-        stats.1 += (r.perr_floor > base) as usize;
-        stats.2 += u;
-        stats.3 += r.perr_floor;
+        Some((u, r.perr_floor))
+    } else { None };
+    // An empty posterior (`uniform_weights`) says nothing about the next window.
+    if let Some(post) = r.hap_posterior.take() {
+        c.prior = (!post.is_empty()).then_some(post);
     }
+    measured
+}
+
+/// A target haplotype's window outcome once its carry is updated: its weights (None once a
+/// sink took them) and what `carry_update` measured.
+struct Done {
+    tgt: usize,
+    weights: Option<Vec<(usize, super::hmm::CsrWeights)>>,
+    measured: Option<(f64, f64)>,
 }
 
 /// `SELPHI_NOCALL_FOLLOW=1` restores following the longest match through a no-call
@@ -723,25 +734,32 @@ fn share_batch_for_budget(avail_mb: f64, per_target_mb: f64, threads: usize) -> 
 }
 
 /// `f` over groups of `targets` taken in order by `threads` workers, the results in target
-/// order. Groups are `share` targets while many rounds are left, then ever smaller (down to
-/// four) as the targets run out, so the last round is short groups: with equal groups work-
-/// stolen over the pool (101 of 16 for 1000 Genomes' 1,602 haplotypes, 6.3 rounds) the
-/// pool waited out most of a group in the last round, twice per window. Results do not
-/// depend on the grouping (every group size gives the same matches).
+/// order. Groups are `share` targets for every full round of the pool; what is left after the
+/// last full round is split into at most `threads` near-equal groups (of four or more targets
+/// where there are that many), so the final round is short groups: with equal groups work-
+/// stolen over the pool (101 of 16 for 1000
+/// Genomes' 1,602 haplotypes, 6.3 rounds) the pool waited out most of a group in the last
+/// round, twice per window. At most `threads` groups more than equal groups, each repeating
+/// the whole-panel sort for fewer targets. Results do not depend on the grouping (every
+/// group size gives the same matches).
 fn guided_groups<R: Send>(targets: &[usize], share: usize, threads: usize,
                           f: impl Fn(&[usize]) -> Vec<R> + Sync) -> Vec<R> {
-    let mut bounds = Vec::new();
-    let mut start = 0;
-    while start < targets.len() {
-        let rem = targets.len() - start;
-        let size = rem.div_ceil(threads.max(1)).clamp(share.min(4), share).min(rem);
+    let threads = threads.max(1);
+    let full = targets.len() / (threads * share) * threads * share;
+    let rem = targets.len() - full;
+    let tail = rem.div_ceil(rem.div_ceil(threads).clamp(share.min(4), share).max(1));
+    let mut bounds: Vec<std::ops::Range<usize>> = (0..full).step_by(share).map(|s| s..s + share).collect();
+    // The remainder in `tail` near-equal groups, the larger first.
+    let mut start = full;
+    for g in 0..tail {
+        let size = rem / tail + (g < rem % tail) as usize;
         bounds.push(start..start + size);
         start += size;
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
     let slots: Vec<std::sync::Mutex<Vec<R>>> = bounds.iter().map(|_| std::sync::Mutex::new(Vec::new())).collect();
     rayon::scope(|s| {
-        for _ in 0..threads.clamp(1, bounds.len().max(1)) {
+        for _ in 0..threads.min(bounds.len()) {
             s.spawn(|_| loop {
                 let g = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(r) = bounds.get(g) else { break };
@@ -1196,9 +1214,14 @@ pub fn process_window_hmm(
     let adapt = if params.adapt_floor { perr_adapt() } else { None };
     // (haplotypes measured, raised, sum of their unmatched mass, sum of their floors)
     let mut adapt_stats = (0usize, 0usize, 0.0f64, 0.0f64);
+    // Each target's carry, locked only by the task that runs its HMM: its prior and floor are
+    // read there and replaced by this window's as soon as the HMM is done, so a target's old
+    // prior is freed then, not when its batch ends.
+    let carry_cells: Vec<std::sync::Mutex<&mut HapCarry>> = carry.iter_mut().map(std::sync::Mutex::new).collect();
+    // A haplotype's weights go to the sink, if there is one, as soon as they are done.
+    let sink = match &weights_out { WeightsOut::Each(s) => Some(*s), _ => None };
     for batch_start in (0..n_haps).step_by(batch_size) {
         let batch_end = (batch_start + batch_size).min(n_haps);
-        let carry_view: &[HapCarry] = carry;
         let ctx = PbwtCtx {
             ref_bm, chip_start, n_ref, targ_w, n_haps, n_var_w,
             match_length, fl_fwd, fl_bwd, miss: &miss, skip: nocall_skip(),
@@ -1227,13 +1250,13 @@ pub fn process_window_hmm(
         // ones it calls, so the groups are exact for its HMM (possibly fewer merges than its
         // sites alone would allow; the model is the uncompressed one either way).
         // `SELPHI_NOCALL_DEDUP_OFF=1`: no dedup for such a target (the previous behaviour).
-        let finish = |tgt: usize, csc: &pbwt::CscMatchMatrix, called: Option<&[usize]>| -> (usize, HmmResult) {
+        let hmm = |tgt: usize, csc: &pbwt::CscMatchMatrix, called: Option<&[usize]>, carried: &HapCarry| -> HmmResult {
             if is_uniform(csc) {
-                let mut r = uniform_weights(n_ref, n_var_w, carry_view[tgt].p_err.unwrap_or(p_err));
+                let mut r = uniform_weights(n_ref, n_var_w, carried.p_err.unwrap_or(p_err));
                 if let Some(k) = keep_rows { r.weights = r.weights.into_iter().map(|(st, w)| (st, w.keep_rows(k))).collect(); }
-                return (tgt, r);
+                return r;
             }
-            let prior = carry_view[tgt].prior.as_deref();
+            let prior = carried.prior.as_deref();
             // R4 per-hap emission confidence: hap `tgt` belongs to sample tgt/2.
             // Extract that sample's column [var * n_samples + tgt/2] for v in
             // 0..n_var_w as a contiguous per-site vector for calculate_weights.
@@ -1283,7 +1306,7 @@ pub fn process_window_hmm(
             };
             // Adaptive emission: a haplotype's first window measures at the default floor
             // and runs again at the raised one; later windows reuse it.
-            let w = match (carry_view[tgt].p_err, adapt) {
+            let w = match (carried.p_err, adapt) {
                 (Some(floor), _) => run(floor, false),
                 (None, None) => run(p_err, false),
                 (None, Some(a)) => {
@@ -1306,11 +1329,22 @@ pub fn process_window_hmm(
                 }
             };
             STAGE_HMM_US.fetch_add(t_hmm.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-            (tgt, w)
+            w
+        };
+        let finish = |tgt: usize, csc: &pbwt::CscMatchMatrix, called: Option<&[usize]>| -> Done {
+            let mut carried = carry_cells[tgt].lock().unwrap();
+            let mut r = hmm(tgt, csc, called, &carried);
+            let measured = carry_update(&mut carried, &mut r, adapt.is_some());
+            drop(carried);
+            let weights = match sink {
+                Some(s) => { s(tgt, r.weights); None }
+                None => Some(r.weights),
+            };
+            Done { tgt, weights, measured }
         };
 
         // One target, its own PBWT — the default.
-        let per_target = |tgt: usize| -> (usize, HmmResult) {
+        let per_target = |tgt: usize| -> Done {
             let candidates = cands(tgt);
             let n_cand = candidates.len();
             // First three targets only: the PBWT candidate-set size, i.e. the width
@@ -1372,7 +1406,7 @@ pub fn process_window_hmm(
         };
 
         // A group of targets sharing ONE sort. See `pbwt::pbwt_forward_shared`.
-        let shared_chunk = |chunk: &[usize]| -> Vec<(usize, HmmResult)> {
+        let shared_chunk = |chunk: &[usize]| -> Vec<Done> {
             let cand_sets: Vec<Vec<u32>> = chunk.iter().map(|&t| cands(t)).collect();
             // A target with too few candidates keeps the original "scan everything"
             // behaviour; it just does so inside the shared sort.
@@ -1417,25 +1451,18 @@ pub fn process_window_hmm(
         };
 
         let share = resolve_share(n_var_w, fl_fwd, n_ref, batch_end - batch_start, max_candidates);
-        // A haplotype's weights go to the sink, if there is one, as soon as they are done.
-        let sink = match &weights_out { WeightsOut::Each(s) => Some(*s), _ => None };
-        let hand = |(t, mut r): (usize, HmmResult)| -> (usize, HmmResult) {
-            if let Some(s) = sink { s(t, std::mem::take(&mut r.weights)); }
-            (t, r)
-        };
-        let run_batch = || -> Vec<(usize, HmmResult)> {
+        let run_batch = || -> Vec<Done> {
             if share <= 1 {
-                (batch_start..batch_end).into_par_iter().map(&per_target).map(&hand).collect()
+                (batch_start..batch_end).into_par_iter().map(&per_target).collect()
             } else {
                 // A target that skips its no-calls has its own site list, so it cannot
                 // join a shared sort; it runs per target (same result as unshared).
                 let (own, shared): (Vec<usize>, Vec<usize>) = (batch_start..batch_end)
                     .partition(|&t| ctx.skip && miss[t].is_some());
-                let mut out: Vec<(usize, HmmResult)> = guided_groups(&shared, share, hmm_pool_width(),
-                    |c| shared_chunk(c).into_iter().map(&hand).collect());
+                let mut out: Vec<Done> = guided_groups(&shared, share, hmm_pool_width(), &shared_chunk);
                 if !own.is_empty() {
-                    out.extend(own.into_par_iter().map(&per_target).map(&hand).collect::<Vec<_>>());
-                    out.sort_unstable_by_key(|&(t, _)| t);
+                    out.extend(own.into_par_iter().map(&per_target).collect::<Vec<_>>());
+                    out.sort_unstable_by_key(|d| d.tgt);
                 }
                 out
             }
@@ -1445,36 +1472,31 @@ pub fn process_window_hmm(
             None => run_batch(),
         };
 
-        // Sequential update of the carry. If streaming callback present:
-        //   - Stash batch's CSRs into a local Vec, call callback, drop.
-        //   - all_weights stays empty (streaming mode).
-        // Otherwise (default): push to all_weights (the sink took them already).
-        if let WeightsOut::Batches(ref mut cb) = weights_out {
-            let mut batch_weights: Vec<Vec<(usize, super::hmm::CsrWeights)>> = Vec::with_capacity(batch_end - batch_start);
-            for (tgt, r) in batch_results {
-                carry_update(&mut carry[tgt], &r, p_err, adapt.is_some(), &mut adapt_stats);
-                // An empty posterior (`uniform_weights`) says nothing about the next window.
-                if let Some(post) = r.hap_posterior {
-                    carry[tgt].prior = (!post.is_empty()).then_some(post);
-                }
-                batch_weights.push(r.weights);
+        // The carries are updated (each by its own task); the run's floor summary in target
+        // order. With a streaming callback the batch's CSRs go to it, then are dropped, and
+        // all_weights stays empty (as with a sink, which took them already); otherwise they
+        // are pushed to all_weights.
+        for d in &batch_results {
+            if let Some((u, floor)) = d.measured {
+                adapt_stats.0 += 1;
+                adapt_stats.1 += (floor > p_err) as usize;
+                adapt_stats.2 += u;
+                adapt_stats.3 += floor;
             }
+        }
+        if let WeightsOut::Batches(ref mut cb) = weights_out {
+            let batch_weights: Vec<Vec<(usize, super::hmm::CsrWeights)>> = batch_results.into_iter()
+                .map(|d| d.weights.expect("a batch's weights are kept")).collect();
             let batch_refs: Vec<&super::hmm::CsrWeights> = batch_weights.iter()
                 .map(|w| &w[0].1).collect();
             cb(batch_start, batch_end, &batch_refs)
                 .expect("on_batch_done callback failed");
             // batch_weights goes out of scope → CSRs dropped here
-        } else {
-            for (tgt, r) in batch_results {
-                carry_update(&mut carry[tgt], &r, p_err, adapt.is_some(), &mut adapt_stats);
-                // An empty posterior (`uniform_weights`) says nothing about the next window.
-                if let Some(post) = r.hap_posterior {
-                    carry[tgt].prior = (!post.is_empty()).then_some(post);
-                }
-                if sink.is_none() { all_weights.push(r.weights); }
-            }
+        } else if sink.is_none() {
+            all_weights.extend(batch_results.into_iter().map(|d| d.weights.expect("collected weights are kept")));
         }
     }
+    drop(carry_cells);
 
     if adapt_stats.0 > 0 {
         let (n, raised, u, f) = adapt_stats;
