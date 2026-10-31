@@ -360,28 +360,28 @@ fn top_matches_per_site(
     entry_hap: &[u32], n_var: usize, kept_matches: usize,
     missing_source: &[i32],
 ) -> (Vec<i64>, Vec<usize>) {
-    // Passing (variant, entry) pairs, entry-major, then grouped by variant (stably, so each
-    // variant's entries stay in ascending entry order).
-    let mut pairs: Vec<(u32, u32)> = Vec::new();
+    // Each variant's passing entries in ascending entry order: counted, then filled, both
+    // entry-major over each entry's range.
+    let mut offsets = vec![0usize; n_var + 1];
     for i in 0..n_entries {
         let Some((s, e)) = range(i) else { continue };
         let val = normed[i];
-        for (k, &t) in threshold[s..=e].iter().enumerate() {
-            if val >= t { pairs.push(((s + k) as u32, i as u32)); }
+        for (o, &t) in offsets[s + 1..=e + 1].iter_mut().zip(&threshold[s..=e]) {
+            *o += (val >= t) as usize;
         }
     }
-    let mut offsets = vec![0usize; n_var + 1];
-    for &(v, _) in &pairs { offsets[v as usize + 1] += 1; }
     for v in 0..n_var { offsets[v + 1] += offsets[v]; }
-    let mut passing = vec![0u32; pairs.len()];
+    let mut passing = vec![0u32; offsets[n_var]];
     {
         let mut cur = offsets.clone();
-        for &(v, i) in &pairs {
-            passing[cur[v as usize]] = i;
-            cur[v as usize] += 1;
+        for i in 0..n_entries {
+            let Some((s, e)) = range(i) else { continue };
+            let val = normed[i];
+            for (k, &t) in threshold[s..=e].iter().enumerate() {
+                if val >= t { passing[cur[s + k]] = i as u32; cur[s + k] += 1; }
+            }
         }
     }
-    drop(pairs);
 
     // A missing variant reads its source's covering entries against its own threshold.
     let mut sources: Vec<usize> = missing_source.iter().filter(|&&src| src >= 0).map(|&src| src as usize).collect();
