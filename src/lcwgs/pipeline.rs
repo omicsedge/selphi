@@ -1646,9 +1646,11 @@ fn run_chunked_gibbs(
                 let (main_member, deep_member) = (members.next(), members.next());
                 let (pnl, cp) = (panel.as_ref(), chunk_pass.as_ref());
                 let bm = &chunk_bm;
+                // The deep chain works in this chunk's pool too.
+                let pool = super::memory::chunk_pool();
                 std::thread::scope(|scope| {
-                    let deep_run = scope.spawn(move || super::iterate::run_gibbs_ensemble_with_memory(
-                        chunk_gl3, bm, chunk_cm, n_samples, deep, Some(deep_k), None, execution, pnl, cp, deep_member));
+                    let deep_run = scope.spawn(move || super::memory::in_chunk_pool(pool, || super::iterate::run_gibbs_ensemble_with_memory(
+                        chunk_gl3, bm, chunk_cm, n_samples, deep, Some(deep_k), None, execution, pnl, cp, deep_member)));
                     let out = super::iterate::run_gibbs_ensemble_with_memory(
                         chunk_gl3, bm, chunk_cm, n_samples, params, None, None, execution, pnl, cp, main_member);
                     (out, Some(deep_run.join().unwrap_or_else(|e| std::panic::resume_unwind(e))))
@@ -1797,7 +1799,7 @@ fn run_chunked_gibbs(
         }
     };
     if let Some(memory) = &memory {
-        super::memory::run_chunks(&costs, memory, threads, process_chunk, merge_chunk);
+        super::memory::run_chunks(&costs, memory, threads, threads, process_chunk, merge_chunk);
     } else {
         let cap = |k: usize| if k == 0 { n_ref } else { k.min(n_ref) };
         let mut k = if crate::config::present("LCWGS_NO_RARE_CARRIER") {
@@ -2154,7 +2156,7 @@ mod tests {
                 memory.set_parallel_fb(parallel);
                 for live in [1, 16] {
                     let mut got = vec![None; inputs.len()];
-                    super::super::memory::run_chunks(&costs, &memory, live,
+                    super::super::memory::run_chunks(&costs, &memory, live, rayon::current_num_threads(),
                         |c| process(c, SampleExecution::Admitted(&memory)), |c, out| got[c] = Some(out));
                     assert_eq!(got.into_iter().map(Option::unwrap).collect::<Vec<_>>(), serial,
                         "samples={ns} live={live} parallel={parallel}");

@@ -1620,6 +1620,7 @@ fn run_gibbs_with_memory(
             n_pass_acc += 1;
         }
         if let Some(t) = t0 { t_wb += t.elapsed().as_secs_f64(); }
+        if memory.is_some() { super::memory::collect_chunk_pool(); }
     }
 
     if timing {

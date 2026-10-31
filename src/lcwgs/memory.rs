@@ -1,7 +1,7 @@
 //! Byte admission for nested single-sample work and pressure-based reclamation
 //! for whole-sample Rayon waves. Blocking permit waits stay outside Rayon.
 
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Whole samples stay on Rayon when there is enough independent sample work.
@@ -276,10 +276,15 @@ impl MemoryBudget {
         self.admit_work(&mut used, bytes)
     }
 
-    /// Run `f` under a permit granted by [`Self::try_permit`] (as [`Self::run`] does).
+    /// Run `f` under a permit granted by [`Self::try_permit`] (as [`Self::run`] does),
+    /// on this thread's chunk pool when it has one (see [`run_chunks`]).
     pub fn run_with<R: Send>(&self, permit: Permit<'_>, f: impl FnOnce() -> R + Send) -> R {
         let _permit = permit;
-        rayon::join(|| { let out = f(); collect_local(); out }, || ()).0
+        let job = || { let out = f(); collect_local(); out };
+        match chunk_pool() {
+            Some(pool) => in_chunk_pool(Some(pool), job),
+            None => rayon::join(job, || ()).0,
+        }
     }
 }
 
@@ -298,6 +303,52 @@ impl Drop for Permit<'_> {
     }
 }
 
+thread_local! {
+    /// The pool of the chunk this thread works for (see [`run_chunks`]).
+    static CHUNK_POOL: std::cell::RefCell<Option<Arc<rayon::ThreadPool>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// This thread's chunk pool (see [`run_chunks`]): the native threads a chunk
+/// spawns take it along, so that their parallel work stays in it.
+pub(crate) fn chunk_pool() -> Option<Arc<rayon::ThreadPool>> {
+    CHUNK_POOL.with(|p| p.borrow().clone())
+}
+
+/// Run `f` here with `pool` as this thread's chunk pool (restored after, also on unwinding).
+pub(crate) fn with_chunk_pool<R>(pool: Option<Arc<rayon::ThreadPool>>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Arc<rayon::ThreadPool>>);
+    impl Drop for Restore {
+        fn drop(&mut self) { CHUNK_POOL.with(|p| *p.borrow_mut() = self.0.take()); }
+    }
+    let _restore = Restore(CHUNK_POOL.with(|p| std::mem::replace(&mut *p.borrow_mut(), pool)));
+    f()
+}
+
+/// Run `f` on a worker of `pool`, which is its chunk pool there; `None` runs it here.
+pub(crate) fn in_chunk_pool<R: Send>(pool: Option<Arc<rayon::ThreadPool>>, f: impl FnOnce() -> R + Send) -> R {
+    match pool {
+        Some(pool) => {
+            let own = pool.clone();
+            pool.install(move || with_chunk_pool(Some(own), f))
+        }
+        None => f(),
+    }
+}
+
+/// Have every worker of this thread's chunk pool return the pages of blocks
+/// other threads freed (results and packs cross threads); an idle worker
+/// would hold them until it next allocates. Nothing outside a chunk pool.
+pub(crate) fn collect_chunk_pool() {
+    if CHUNK_POOL.with(|p| p.borrow().is_some()) { crate::common::mem::release_freed_memory(); }
+}
+
+/// A chunk's own pool of `threads` workers (see [`run_chunks`]); `None` when it
+/// cannot be built (the chunk then runs in the global pool, as before).
+fn new_chunk_pool(threads: usize) -> Option<Arc<rayon::ThreadPool>> {
+    rayon::ThreadPoolBuilder::new().num_threads(threads).stack_size(16 << 20)
+        .thread_name(|i| format!("lcwgs-chunk-{i}")).build().ok().map(Arc::new)
+}
+
 /// Return pages on the allocating worker before its allowance can be reused.
 pub(crate) fn collect_local() {
     #[cfg(feature = "mimalloc")]
@@ -312,16 +363,17 @@ pub(crate) fn map_samples<T: Send>(
     use std::sync::atomic::{AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);
     let output = Mutex::new((0..n).map(|_| None).collect::<Vec<_>>());
+    let pool = chunk_pool();
     std::thread::scope(|scope| {
         for _ in 0..n.min(workers.max(1)) {
-            let (f, next, output) = (&f, &next, &output);
-            scope.spawn(move || loop {
+            let (f, next, output, pool) = (&f, &next, &output, pool.clone());
+            scope.spawn(move || with_chunk_pool(pool, || loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= n { break; }
                 let value = f(i);
                 output.lock().unwrap()[i] = Some(value);
                 collect_local();
-            });
+            }));
         }
     });
     output.into_inner().unwrap().into_iter().map(Option::unwrap).collect()
@@ -329,8 +381,14 @@ pub(crate) fn map_samples<T: Send>(
 
 /// Admit fitting chunks as soon as a completed core has been merged. A permit
 /// includes the returned result until the coordinator finishes that merge.
+///
+/// Each live chunk runs in a pool of its own (`threads` workers; idle ones
+/// sleep). In one shared pool a worker waiting inside a join takes any queued
+/// job, so a chunk's serial chain stalled behind another chunk's whole
+/// forward-backward or phasing call, and its own calls queued behind busy
+/// workers. Which thread runs a job does not change any result.
 pub(crate) fn run_chunks<T: Send>(
-    costs: &[usize], budget: &MemoryBudget, max_live: usize,
+    costs: &[usize], budget: &MemoryBudget, max_live: usize, threads: usize,
     process: impl Fn(usize) -> T + Sync, mut merge: impl FnMut(usize, T),
 ) {
     use std::sync::mpsc;
@@ -348,7 +406,8 @@ pub(crate) fn run_chunks<T: Send>(
                     live += 1;
                     let (tx, process) = (tx.clone(), &process);
                     scope.spawn(move || {
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process(c)));
+                        let pool = new_chunk_pool(threads);
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| in_chunk_pool(pool, || process(c))));
                         collect_local();
                         let _ = tx.send((c, result, permit));
                     });
@@ -587,7 +646,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let rx = Mutex::new(rx);
         let mut order = Vec::new();
-        run_chunks(&[25, 25, 25], &budget, 2, |i| {
+        run_chunks(&[25, 25, 25], &budget, 2, 2, |i| {
             if i == 0 { rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(10)).unwrap(); }
             if i == 2 { tx.send(()).unwrap(); }
             i
