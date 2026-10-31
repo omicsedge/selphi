@@ -647,21 +647,32 @@ pub(crate) struct SparseSite {
     minority: u8,
     pos: Vec<u32>,
     cmax: Vec<i32>,
+    masks: Vec<u64>,
 }
 
 const SPARSE_CHUNK: usize = 64;
 
 impl SparseSite {
-    pub(crate) fn new() -> Self { Self { minority: 1, pos: Vec::new(), cmax: Vec::new() } }
+    pub(crate) fn new() -> Self { Self { minority: 1, pos: Vec::new(), cmax: Vec::new(), masks: Vec::new() } }
 
-    /// Rebuild for the current site: O(m), shared by all targets of the group.
+    /// Rebuild for the current site: O(m), shared by all targets of the group. The
+    /// alleles are read 64 positions at a time into a bit mask (`masks`, reused), and the
+    /// minority positions taken from its set bits.
     fn build(&mut self, d: &[i32], y: &[u8], m: usize) {
-        let ones = y[..m].iter().filter(|&&v| v != 0).count();
+        self.masks.clear();
+        self.masks.extend(y[..m].chunks(64).map(|c| {
+            c.iter().enumerate().fold(0u64, |w, (j, &v)| w | (((v != 0) as u64) << j))
+        }));
+        let ones: usize = self.masks.iter().map(|w| w.count_ones() as usize).sum();
         self.minority = if ones * 2 <= m { 1 } else { 0 };
-        let mi = self.minority;
         self.pos.clear();
-        for (i, &v) in y[..m].iter().enumerate() {
-            if (v != 0) as u8 == mi { self.pos.push(i as u32); }
+        for (c, &w) in self.masks.iter().enumerate() {
+            let valid = if 64 * (c + 1) <= m { u64::MAX } else { (1u64 << (m - 64 * c)) - 1 };
+            let mut w = if self.minority == 1 { w } else { !w & valid };
+            while w != 0 {
+                self.pos.push((64 * c + w.trailing_zeros() as usize) as u32);
+                w &= w - 1;
+            }
         }
         // chunk maxima over d[0..=m] (scan reads d[1..=m-1])
         let n = m + 1;
