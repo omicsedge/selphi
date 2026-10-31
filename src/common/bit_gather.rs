@@ -72,6 +72,7 @@ enum Blocks {
     /// None: groups only (`SELPHI_FORCE_SCALAR`, the reference path).
     Off,
     /// AVX-512 VBMI byte permutes (`gather_row_bytes`).
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     Permute,
     /// One byte load and bit test per state (AVX2 and NEON hosts).
     Loads,

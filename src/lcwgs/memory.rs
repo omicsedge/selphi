@@ -378,7 +378,7 @@ pub(crate) fn new_chain_pool(threads: usize) -> Option<Arc<ChainPool>> {
     let builder = rayon::ThreadPoolBuilder::new()
         .thread_name(|i| format!("lcwgs-chain-{i}"))
         .start_handler(|_| CHAIN_WORKER.with(|w| w.set(true)));
-    super::threads::global().chain_pool(threads, builder).map(|(pool, _)| Arc::new(ChainPool { pool }))
+    crate::common::threads::global().chain_pool(threads, builder).map(|(pool, _)| Arc::new(ChainPool { pool }))
 }
 
 /// Return pages on the allocating worker before its allowance can be reused.
@@ -409,7 +409,7 @@ pub(crate) fn map_samples<T: Send>(
         let mut started = 0;
         for _ in 0..n.min(workers.max(1)) {
             let (work, pool) = (&work, pool.clone());
-            started += super::threads::global().spawn_scoped(scope, "lcwgs-sample", move || work(pool)).is_ok() as usize;
+            started += crate::common::threads::global().spawn_scoped(scope, "lcwgs-sample", move || work(pool)).is_ok() as usize;
         }
         if started == 0 {
             struct Restore(bool);
@@ -459,7 +459,7 @@ pub(crate) fn run_chunks<'b, T: Send>(
                     // The permit comes back here when the OS starts no coordinator.
                     let held = Arc::new(Mutex::new(Some(permit)));
                     let (run_one, mine) = (&run_one, held.clone());
-                    let started = super::threads::global().spawn_scoped(scope, "lcwgs-chunk", move || {
+                    let started = crate::common::threads::global().spawn_scoped(scope, "lcwgs-chunk", move || {
                         let permit = mine.lock().unwrap().take().expect("the chunk's permit");
                         run_one(c, permit)
                     }).is_ok();
@@ -761,9 +761,9 @@ mod tests {
         let budget = MemoryBudget::new(1 << 30, 0);
         let me = std::thread::current().id();
         let mut got = Vec::new();
-        super::super::threads::refusing(|| run_chunks(&[3, 2, 1], &budget, 3, 2, |c| {
+        crate::common::threads::refusing(|| run_chunks(&[3, 2, 1], &budget, 3, 2, |c| {
             assert!(chain_pool().is_some() || std::thread::current().id() == me);
-            super::super::threads::refusing(|| map_samples(3, 2, |s| budget.run(1 << 10, || c * 10 + s)))
+            crate::common::threads::refusing(|| map_samples(3, 2, |s| budget.run(1 << 10, || c * 10 + s)))
         }, |c, v| got.push((c, v))));
         assert_eq!(got, vec![(0, vec![0, 1, 2]), (1, vec![10, 11, 12]), (2, vec![20, 21, 22])]);
     }

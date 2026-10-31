@@ -1,20 +1,23 @@
-//! The threads lcWGS starts beside the global Rayon pool, counted while they live
-//! against the room the process's thread limits leave.
+//! The threads an lcWGS run starts beside the global Rayon pool, counted while
+//! they live against the room the process's thread limits leave.
 //!
-//! One-sample runs give each Gibbs chain a pool of its own (`memory::run_chunks`),
-//! beside the native threads the run starts anyway: chunk and SPLIT coordinators,
-//! sample threads (`memory::map_samples`), selection decoders and the panel-ahead
-//! builder. Where `RLIMIT_NPROC` (counted over every thread of the user) or the
-//! cgroup's `pids.max` leaves little room, the pools give way: one is granted only
-//! while the threads alive, its own and a reserve for the native threads fit that
-//! room, else its chain runs as it did before the pools. A native thread the OS
-//! still refuses is replaced by the asking thread doing the work itself (decoders
-//! and the panel-ahead builder are skipped), and no pool is granted after that.
-//! Every thread is counted until it has finished its work, so a dropped pool's
-//! workers hold their share until they exit.
+//! One-sample runs give each Gibbs chain a pool of its own (`lcwgs::memory::run_chunks`),
+//! beside the threads the run starts anyway: chunk and SPLIT coordinators, sample
+//! threads (`lcwgs::memory::map_samples`), selection decoders, the panel-ahead
+//! builder, the panel's stripe readers (`srp::tiled`), and the BGZF readers and
+//! writers (their threads held while they live, [`ThreadBudget::hold`]). Where
+//! `RLIMIT_NPROC` (counted over every thread of the user) or the cgroup's
+//! `pids.max` leaves little room, the pools give way: one is granted only while
+//! the threads alive, its own and a reserve for the other threads fit that room,
+//! else its chain runs as it did before the pools; readers and writers take fewer
+//! threads or none. A thread the OS still refuses is replaced by the asking thread
+//! doing the work itself (decoders, the panel-ahead builder and stripe read-ahead
+//! are skipped), and no pool is granted after that. Every thread is counted until
+//! it has finished its work, so a dropped pool's workers hold their share until
+//! they exit, and the chunk stage ends when they have ([`ThreadBudget::wait_pools_exited`]).
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 /// Compute workers the live chain pools hold together, per thread of the run.
 const CHAIN_WORKER_BUDGET: usize = 8;
@@ -39,17 +42,20 @@ pub(crate) struct ThreadBudget {
     grant: Mutex<()>,
     /// A pool was refused (said once in the log).
     noted: AtomicBool,
+    /// Threads of the pools built here that have not exited.
+    pool_threads: Mutex<usize>,
+    pools_exited: Condvar,
 }
 
 static GLOBAL: ThreadBudget = ThreadBudget::new();
 
 #[cfg(test)]
 thread_local! {
-    /// Tests: this thread's native spawns are refused as by the OS.
+    /// Tests: this thread's native spawns are refused as by the OS, and no room is left for holds.
     static REFUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Tests: run `f` with this thread's native spawns refused (budgets untouched).
+/// Tests: run `f` with this thread's native spawns refused and its holds denied (budgets untouched).
 #[cfg(test)]
 pub(crate) fn refusing<R>(f: impl FnOnce() -> R) -> R {
     struct Restore(bool);
@@ -64,19 +70,29 @@ pub(crate) fn refusing<R>(f: impl FnOnce() -> R) -> R {
 pub(crate) fn global() -> &'static ThreadBudget { &GLOBAL }
 
 /// Counts a thread off when its work ends (also on unwinding).
-struct Finished<'a> { budget: &'a ThreadBudget, compute: bool }
+struct Finished<'a> { budget: &'a ThreadBudget, compute: bool, pool: bool }
 
 impl Drop for Finished<'_> {
     fn drop(&mut self) {
         self.budget.live.fetch_sub(1, Ordering::Relaxed);
         if self.compute { self.budget.pool_workers.fetch_sub(1, Ordering::Relaxed); }
+        if self.pool { self.budget.pools_lose(1); }
     }
+}
+
+/// Threads a library starts (a BGZF reader's or writer's), counted while it lives
+/// ([`ThreadBudget::hold`]).
+pub(crate) struct Held { budget: &'static ThreadBudget, n: usize }
+
+impl Drop for Held {
+    fn drop(&mut self) { self.budget.live.fetch_sub(self.n, Ordering::Relaxed); }
 }
 
 impl ThreadBudget {
     pub(crate) const fn new() -> Self {
         ThreadBudget { live: AtomicUsize::new(0), pool_workers: AtomicUsize::new(0), room: OnceLock::new(),
-            refused: AtomicBool::new(false), grant: Mutex::new(()), noted: AtomicBool::new(false) }
+            refused: AtomicBool::new(false), grant: Mutex::new(()), noted: AtomicBool::new(false),
+            pool_threads: Mutex::new(0), pools_exited: Condvar::new() }
     }
 
     /// A budget whose room is `room` threads (tests).
@@ -93,6 +109,46 @@ impl ThreadBudget {
     #[cfg(test)]
     pub(crate) fn live(&self) -> usize { self.live.load(Ordering::Relaxed) }
 
+    /// `n` threads a library is about to start, counted while the guard lives,
+    /// when they fit the room; `None` when they do not (the caller then starts
+    /// fewer or none).
+    pub(crate) fn hold(&'static self, n: usize) -> Option<Held> {
+        #[cfg(test)]
+        if REFUSE.with(std::cell::Cell::get) { return None; }
+        let room = self.room();
+        let mut live = self.live.load(Ordering::Relaxed);
+        loop {
+            if live.saturating_add(n) > room { return None; }
+            match self.live.compare_exchange_weak(live, live + n, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Some(Held { budget: self, n }),
+                Err(now) => live = now,
+            }
+        }
+    }
+
+    /// A library's worker count up to `max` (it starts one thread more) that
+    /// fits the room, and its hold: `max`, else one, else one unheld (as before
+    /// the budget; the caller may avoid the threads altogether).
+    pub(crate) fn hold_workers(&'static self, max: usize) -> (usize, Option<Held>) {
+        let max = max.max(1);
+        if let Some(h) = self.hold(max + 1) { return (max, Some(h)); }
+        (1, self.hold(2))
+    }
+
+    fn pools_lose(&self, n: usize) {
+        let mut left = self.pool_threads.lock().unwrap_or_else(|e| e.into_inner());
+        *left -= n;
+        if *left == 0 { self.pools_exited.notify_all(); }
+    }
+
+    /// Wait until the threads of every pool built here have exited (a dropped
+    /// pool's workers leave on their own time), at most `limit`: the chunk stage
+    /// ends with the threads it started gone.
+    pub(crate) fn wait_pools_exited(&self, limit: std::time::Duration) {
+        let left = self.pool_threads.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self.pools_exited.wait_timeout_while(left, limit, |n| *n > 0);
+    }
+
     /// Start a native thread in `scope`, counted until `f` returns. An error
     /// (the OS refused it) is for the caller to absorb.
     pub(crate) fn spawn_scoped<'scope, 'env, T: Send + 'scope>(
@@ -104,7 +160,7 @@ impl ThreadBudget {
         self.room();
         self.live.fetch_add(1, Ordering::Relaxed);
         let spawned = std::thread::Builder::new().name(name.into()).spawn_scoped(scope, move || {
-            let _done = Finished { budget: self, compute: false };
+            let _done = Finished { budget: self, compute: false, pool: false };
             f()
         });
         if spawned.is_err() {
@@ -161,12 +217,13 @@ impl ThreadBudget {
     fn build(&'static self, builder: rayon::ThreadPoolBuilder, n: usize, compute: usize) -> Option<rayon::ThreadPool> {
         self.live.fetch_add(n, Ordering::Relaxed);
         self.pool_workers.fetch_add(compute, Ordering::Relaxed);
+        *self.pool_threads.lock().unwrap_or_else(|e| e.into_inner()) += n;
         let mut started = 0usize;
         let built = builder.num_threads(n).spawn_handler(|t| {
             let mut b = std::thread::Builder::new();
             if let Some(name) = t.name() { b = b.name(name.to_owned()); }
             if let Some(size) = t.stack_size() { b = b.stack_size(size); }
-            let done = Finished { budget: self, compute: t.index() < compute };
+            let done = Finished { budget: self, compute: t.index() < compute, pool: true };
             b.spawn(move || { let _done = done; t.run() })?;
             started += 1;
             Ok(())
@@ -178,6 +235,7 @@ impl ThreadBudget {
                 let never = n.saturating_sub(started + 1);
                 self.live.fetch_sub(never, Ordering::Relaxed);
                 self.pool_workers.fetch_sub(compute.saturating_sub((started + 1).min(compute)), Ordering::Relaxed);
+                if never > 0 { self.pools_lose(never); }
                 self.refused.store(true, Ordering::Relaxed);
                 None
             }
@@ -330,11 +388,23 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(budget.live() >= 1, "the busy worker still counts after the drop");
         go_tx.send(()).unwrap();
-        let t0 = std::time::Instant::now();
-        while budget.live() != 0 || budget.pool_workers.load(Ordering::Relaxed) != 0 {
-            assert!(t0.elapsed() < std::time::Duration::from_secs(10), "workers counted off as they exit");
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        budget.wait_pools_exited(std::time::Duration::from_secs(10));
+        assert_eq!((budget.live(), budget.pool_workers.load(Ordering::Relaxed)), (0, 0), "workers counted off as they exit");
+    }
+
+    /// A library's threads are held while they fit the room: all of them, else
+    /// one worker's, else none.
+    #[test]
+    fn library_threads_are_held_within_the_room() {
+        let budget: &'static ThreadBudget = Box::leak(Box::new(ThreadBudget::with_room(7)));
+        let (w, a) = budget.hold_workers(4);
+        assert_eq!((w, a.is_some(), budget.live()), (4, true, 5));
+        let (w, b) = budget.hold_workers(4);
+        assert_eq!((w, b.is_some(), budget.live()), (1, true, 7));
+        let (w, c) = budget.hold_workers(4);
+        assert_eq!((w, c.is_none(), budget.live()), (1, true, 7));
+        drop((a, b));
+        assert_eq!(budget.live(), 0);
     }
 
     /// A pool the OS cuts short (a thread refused) is no pool: the threads it

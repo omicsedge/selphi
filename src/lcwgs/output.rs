@@ -80,12 +80,45 @@ const PAR_BUFWRITER: usize = 1 << 20;
 /// writer cuts a block only when its 64 KiB buffer fills (or at the final
 /// flush), so the compressed bytes do not depend on `buf_capacity` or on how
 /// the writes are sized.
-fn bgzf_writer(path: &std::path::Path, buf_capacity: usize) -> std::io::Result<BufWriter<noodles_bgzf::io::multithreaded_writer::MultithreadedWriter<std::fs::File>>> {
-    let file = std::fs::File::create(path)?;
-    let bgzf = noodles_bgzf::io::multithreaded_writer::Builder::default()
-        .set_worker_count(std::num::NonZeroUsize::new(4).unwrap())
-        .build_from_writer(file);
-    Ok(BufWriter::with_capacity(buf_capacity, bgzf))
+fn bgzf_writer(path: &std::path::Path, buf_capacity: usize) -> std::io::Result<BufWriter<BgzfOut>> {
+    Ok(BufWriter::with_capacity(buf_capacity, BgzfOut::create(path, 4)?))
+}
+
+/// A BGZF file deflated by up to `workers` threads (and a writer thread), fewer
+/// when the process's thread limits leave no room for them, and on this thread
+/// when they leave none for two: the same bytes either way (fixed-size blocks,
+/// each deflated alike). Finished when dropped.
+pub(crate) struct BgzfOut {
+    w: BgzfImpl,
+    _threads: Option<crate::common::threads::Held>,
+}
+
+enum BgzfImpl {
+    Threads(noodles_bgzf::io::multithreaded_writer::MultithreadedWriter<std::fs::File>),
+    Here(noodles_bgzf::io::Writer<std::fs::File>),
+}
+
+impl BgzfOut {
+    fn create(path: &std::path::Path, workers: usize) -> std::io::Result<Self> {
+        let file = std::fs::File::create(path)?;
+        let (workers, held) = crate::common::threads::global().hold_workers(workers);
+        let w = match held {
+            Some(_) => BgzfImpl::Threads(noodles_bgzf::io::multithreaded_writer::Builder::default()
+                .set_worker_count(std::num::NonZeroUsize::new(workers).unwrap_or(std::num::NonZeroUsize::MIN))
+                .build_from_writer(file)),
+            None => BgzfImpl::Here(noodles_bgzf::io::Writer::new(file)),
+        };
+        Ok(BgzfOut { w, _threads: held })
+    }
+}
+
+impl Write for BgzfOut {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match &mut self.w { BgzfImpl::Threads(w) => w.write(buf), BgzfImpl::Here(w) => w.write(buf) }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match &mut self.w { BgzfImpl::Threads(w) => w.flush(), BgzfImpl::Here(w) => w.flush() }
+    }
 }
 
 /// Hard call = argmax genotype (ties to 0/0, then 1/1); conf = its posterior.
@@ -350,7 +383,7 @@ pub fn contig_lines_for(srp: &SrpReader, out: &LcwgsOutput) -> std::io::Result<S
 
 /// An lcWGS VCF.gz (GT:DS:GP) written one chromosome's result at a time, then indexed.
 pub struct LcwgsVcfWriter {
-    w: BufWriter<noodles_bgzf::io::multithreaded_writer::MultithreadedWriter<std::fs::File>>,
+    w: BufWriter<BgzfOut>,
     path: std::path::PathBuf,
     contig_names: Vec<String>,
     record_meta: Vec<crate::srp::csi::TbiRec>,
@@ -447,7 +480,7 @@ fn write_dose_tsv_budget(out: &LcwgsOutput, srp: &SrpReader, path: &std::path::P
 
 /// The dosage TSV written one chromosome's result at a time.
 pub struct DoseTsvWriter {
-    w: BufWriter<noodles_bgzf::io::multithreaded_writer::MultithreadedWriter<std::fs::File>>,
+    w: BufWriter<BgzfOut>,
     pool_budget: usize,
 }
 
@@ -481,6 +514,32 @@ impl DoseTsvWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The BGZF bytes written on this thread equal those of the deflater
+    /// threads, for streams ending inside, at and past block boundaries.
+    #[test]
+    fn bgzf_bytes_do_not_depend_on_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let data: Vec<u8> = (0..300_000).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; b"ACGT\t0.123\n"[(x % 11) as usize] }).collect();
+        for len in [0usize, 1, 65_279, 65_280, 65_281, 200_000, 300_000] {
+            let mut files = Vec::new();
+            for (i, threads) in [true, false].into_iter().enumerate() {
+                let path = dir.path().join(format!("{len}_{i}.gz"));
+                let file = std::fs::File::create(&path).unwrap();
+                let w = if threads {
+                    BgzfImpl::Threads(noodles_bgzf::io::multithreaded_writer::Builder::default()
+                        .set_worker_count(std::num::NonZeroUsize::new(4).unwrap()).build_from_writer(file))
+                } else { BgzfImpl::Here(noodles_bgzf::io::Writer::new(file)) };
+                let mut out = BufWriter::with_capacity(1 << 16, BgzfOut { w, _threads: None });
+                for piece in data[..len].chunks(7_777) { out.write_all(piece).unwrap(); }
+                out.flush().unwrap();
+                drop(out);
+                files.push(std::fs::read(&path).unwrap());
+            }
+            assert_eq!(files[0], files[1], "len {len}");
+        }
+    }
 
     /// `push_fixed` reproduces `format!("{:.N}")` byte for byte: exact ties
     /// (dyadic values), values just around them, signs, zero, -0.0, and a sweep.

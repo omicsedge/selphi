@@ -1619,7 +1619,7 @@ fn run_chunked_gibbs(
         .map(|(&sites, &two)| chunk_state_bytes_chains(sites, n_ref, n_samples, if two { 2 } else { 1 })).collect();
     let pool = (single_sample && selector && explicit_budget.is_none() && plan.iter().flatten().count() > 1
         && !crate::config::present("LCWGS_NO_PANEL_AHEAD"))
-        .then(|| super::threads::global().helper_pool(threads, 1,
+        .then(|| crate::common::threads::global().helper_pool(threads, 1,
             rayon::ThreadPoolBuilder::new().stack_size(16 << 20).thread_name(|_| "panel-ahead".into())))
         .flatten();
     let ahead: Option<PanelAhead> = pool.zip(memory.as_ref()).map(|(pool, budget)| {
@@ -1648,7 +1648,7 @@ fn run_chunked_gibbs(
             if let Some(claim) = ahead.as_ref().and_then(|a| a.claim_next(c)) {
                 let a = ahead.as_ref().unwrap();
                 // A failed spawn drops the claim (the slot goes back to Empty).
-                let _ = super::threads::global().spawn_scoped(ahead_scope, "panel-ahead", move || a.build(claim));
+                let _ = crate::common::threads::global().spawn_scoped(ahead_scope, "panel-ahead", move || a.build(claim));
             }
 
             let (core_start, core_end) = (core.start, core.end);
@@ -1708,7 +1708,7 @@ fn run_chunked_gibbs(
                 let pool = super::memory::new_chain_pool(threads);
                 std::thread::scope(|scope| {
                     // When the OS starts no thread for it, the passes run one after the other below.
-                    let deep_run = super::threads::global().spawn_scoped(scope, "lcwgs-split", move || super::memory::in_chain_pool(pool, || super::iterate::run_gibbs_ensemble_with_memory(
+                    let deep_run = crate::common::threads::global().spawn_scoped(scope, "lcwgs-split", move || super::memory::in_chain_pool(pool, || super::iterate::run_gibbs_ensemble_with_memory(
                         chunk_gl3, bm, chunk_cm, n_samples, deep, Some(deep_k), None, execution, pnl, cp, deep_member))).ok()?;
                     let out = super::iterate::run_gibbs_ensemble_with_memory(
                         chunk_gl3, bm, chunk_cm, n_samples, params, None, None, execution, pnl, cp, main_member);
@@ -1881,6 +1881,10 @@ fn run_chunked_gibbs(
         crate::selphi_info!("  lcWGS sample waves: {} completed sample tasks, {} pressure collections",
             samples, collections);
     }
+    // The chunk stage ends with the pool threads it started gone (a dropped pool's
+    // workers leave on their own time), so that the writers find the room they had.
+    drop(ahead);
+    crate::common::threads::global().wait_pools_exited(std::time::Duration::from_secs(10));
 
     (dosage, gp, pass_dosage, pass_gp)
 }

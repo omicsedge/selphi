@@ -12,8 +12,30 @@ use super::record::{Count, Rec, Src};
 /// Uncompressed bytes between two index catch-ups.
 const PROCESS_EVERY: usize = 4 << 20;
 
+/// The merged file's BGZF stream: deflated by up to the run's thread count of threads (and a
+/// writer thread) when the process's thread limits leave room for them, else on this thread (the
+/// same bytes: fixed-size blocks deflated alike; the tap reads the frames either way).
+enum Bgzf {
+    Threads(TappedBgzfWriter, crate::common::threads::Held),
+    Here(noodles_bgzf::io::Writer<crate::srp::csi::BgzfBlockTap<std::io::BufWriter<std::fs::File>>>),
+}
+
+impl Bgzf {
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        match self { Bgzf::Threads(w, _) => w.write_all(bytes), Bgzf::Here(w) => w.write_all(bytes) }
+    }
+
+    /// The finished stream's file buffer (the threads joined first).
+    fn finish(self) -> std::io::Result<std::io::BufWriter<std::fs::File>> {
+        match self {
+            Bgzf::Threads(mut w, _held) => Ok(w.finish()?.into_inner()),
+            Bgzf::Here(w) => Ok(w.finish()?.into_inner()),
+        }
+    }
+}
+
 pub(super) struct OutWriter {
-    w: Option<TappedBgzfWriter>,
+    w: Option<Bgzf>,
     index: Option<TbiStreamIndexer>,
     path: PathBuf,
     tbi: PathBuf,
@@ -75,7 +97,18 @@ impl OutWriter {
         for p in scratch {
             if std::fs::symlink_metadata(p).is_ok() { std::fs::remove_file(p)?; }
         }
-        let (w, index) = crate::srp::csi::tapped_bgzf_writer(&tmp, workers)?;
+        let (w, index) = match crate::common::threads::global().hold_workers(workers) {
+            (n, Some(held)) => {
+                let (w, index) = crate::srp::csi::tapped_bgzf_writer(&tmp, n)?;
+                (Bgzf::Threads(w, held), index)
+            }
+            (_, None) => {
+                let file = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp)?);
+                let (block_tx, block_rx) = std::sync::mpsc::channel();
+                (Bgzf::Here(noodles_bgzf::io::Writer::new(crate::srp::csi::BgzfBlockTap::new(file, block_tx))),
+                    TbiStreamIndexer::new(block_rx))
+            }
+        };
         Ok(OutWriter { w: Some(w), index: Some(index), path: path.to_path_buf(), tbi: with_suffix(path, ".tbi"), tmp, tbi_tmp, prev, tbi_prev,
             names: Vec::new(), ref_id: vec![None; n_contigs], since: 0, lines: 0, buf: Vec::with_capacity(4096), published: false })
     }
@@ -125,8 +158,8 @@ impl OutWriter {
     /// Finish the file, write its index, and give both their names. On any failure no new file
     /// keeps its name, a previous pair is put back as it was, and the temporary files are removed.
     pub(super) fn finish(mut self) -> std::io::Result<()> {
-        let mut w = self.w.take().expect("open");
-        let mut file = w.finish()?.into_inner();
+        let w = self.w.take().expect("open");
+        let mut file = w.finish()?;
         file.flush()?;
         drop(file);
         self.index.take().expect("open").finish(&self.names, &self.tbi_tmp)?;

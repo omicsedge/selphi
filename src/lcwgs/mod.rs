@@ -65,7 +65,6 @@ pub mod iterate;
 mod membership;
 mod kmax_cut;
 mod memory;
-pub(crate) mod threads;
 pub mod dmm;
 pub mod pipeline;
 pub mod output;

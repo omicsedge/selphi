@@ -713,10 +713,11 @@ impl TiledSrpReader {
                 Some(h) => h.join().expect("stripe read thread panicked"),
                 None => { let (fs, n, buf) = read_args(k); self.preload_stripes_into(fs, n, buf) }
             }.expect("preload failed");
-            // Read the next while this one is decoded, when both fit together.
+            // Read the next while this one is decoded, when both fit together (and the
+            // OS starts a thread for it: else it is read when its turn comes).
             if let Some(&k2) = order.get(i + 1) && plan.bytes[k] + plan.bytes[k2] <= plan.bound {
                 let (fs, n, buf) = read_args(k2);
-                next = Some(sc.spawn(move || self.preload_stripes_into(fs, n, buf)));
+                next = crate::common::threads::global().spawn_scoped(sc, "srp-read", move || self.preload_stripes_into(fs, n, buf)).ok();
             }
 
             batch.par_iter().for_each(|(stripe, sites)| {
@@ -792,11 +793,23 @@ pub(crate) fn read_file_at(file: &std::fs::File, buf: &mut [u8], offset: u64) ->
         let k = (read_len / PART).min(4);
         if k >= 2 {
             let chunk = read_len.div_ceil(k);
+            // A part the OS starts no thread for is read here.
+            let parts: Vec<std::sync::Mutex<Option<&mut [u8]>>> = buf.chunks_mut(chunk).map(|p| std::sync::Mutex::new(Some(p))).collect();
             std::thread::scope(|sc| -> io::Result<()> {
-                let parts: Vec<_> = buf.chunks_mut(chunk).enumerate().map(|(i, part)| {
-                    sc.spawn(move || file.read_exact_at(part, offset + (i * chunk) as u64))
+                let budget = crate::common::threads::global();
+                let mut refused = Vec::new();
+                let handles: Vec<_> = parts.iter().enumerate().filter_map(|(i, slot)| {
+                    let at = offset + (i * chunk) as u64;
+                    let h = budget.spawn_scoped(sc, "srp-read", move || {
+                        slot.lock().unwrap().take().map_or(Ok(()), |part| file.read_exact_at(part, at))
+                    }).ok();
+                    if h.is_none() { refused.push(i); }
+                    h
                 }).collect();
-                for h in parts { h.join().expect("stripe read thread panicked")?; }
+                for i in refused {
+                    if let Some(part) = parts[i].lock().unwrap().take() { file.read_exact_at(part, offset + (i * chunk) as u64)?; }
+                }
+                for h in handles { h.join().expect("stripe read thread panicked")?; }
                 Ok(())
             })
         } else {

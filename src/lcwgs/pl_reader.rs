@@ -544,12 +544,16 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool, keep: Option<&Bl
     let is_gz = path.ends_with(".gz");
     let file = std::fs::File::open(path)?;
 
-    // The VCF in pieces cut at line ends (its BGZF blocks inflated on decoder threads), each
-    // parsed as it comes: memory holds one piece, not the decompressed file.
-    let mut reader: Box<dyn Read> = if is_gz {
-        let workers = std::num::NonZero::new(rayon::current_num_threads().clamp(1, 4))
-            .unwrap_or(std::num::NonZero::<usize>::MIN);
+    // The VCF in pieces cut at line ends (its BGZF blocks inflated on decoder threads, when the
+    // process's thread limits leave room for them and a reader thread), each parsed as it
+    // comes: memory holds one piece, not the decompressed file.
+    let workers = rayon::current_num_threads().clamp(1, 4);
+    let held = is_gz.then(|| crate::common::threads::global().hold(workers + 1)).flatten();
+    let mut reader: Box<dyn Read> = if held.is_some() {
+        let workers = std::num::NonZero::new(workers).unwrap_or(std::num::NonZero::<usize>::MIN);
         Box::new(noodles_bgzf::io::MultithreadedReader::with_worker_count(workers, file))
+    } else if is_gz {
+        Box::new(noodles_bgzf::io::Reader::new(file))
     } else {
         Box::new(std::io::BufReader::new(file))
     };

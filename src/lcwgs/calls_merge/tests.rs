@@ -817,3 +817,21 @@ fn nested_blocks_beyond_the_queue_bound_are_frozen_together() {
     let pos: Vec<i64> = body.iter().map(|l| l.split('\t').nth(1).unwrap().parse().unwrap()).collect();
     assert!(pos.windows(2).all(|w| w[0] <= w[1]));
 }
+
+/// The merged file and its index written on this thread (no room for deflater threads) equal the
+/// threaded writer's, byte for byte.
+#[test]
+fn output_bytes_do_not_depend_on_writer_threads() {
+    let f = fx(R, &[(5, "A", "C", 1, 30), (12, "G", "T", 2, 30), (30, "C", "A", 0, 30)]);
+    let mut text = HEADER.to_string();
+    for l in [rec(5, "A", "C", "PASS", "0/1", 40), rec(12, "G", "T", "PASS", "0/1", 5), rec(30, "C", "A", "PASS", "1/1", 50)] {
+        text.push_str(&l);
+        text.push('\n');
+    }
+    let tbi = f.dir.path().join("out.vcf.gz.tbi");
+    let read = || (std::fs::read(f.out_path()).unwrap(), std::fs::read(&tbi).unwrap());
+    f.run_text(pol(), &text).unwrap();
+    let threads = read();
+    crate::common::threads::refusing(|| f.run_text(pol(), &text)).unwrap();
+    assert_eq!(read(), threads);
+}

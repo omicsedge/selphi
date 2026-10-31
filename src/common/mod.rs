@@ -2,6 +2,7 @@
 
 pub mod bitmatrix;
 pub mod bit_gather;
+pub(crate) mod threads;
 pub mod utils;
 
 pub use bitmatrix::HaplotypeBitmatrix;

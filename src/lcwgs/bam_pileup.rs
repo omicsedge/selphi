@@ -541,10 +541,11 @@ fn pileup_one(
             while q.read_record(&mut record)? != 0 {
                 emit(&record, sink);
             }
-        } else if within {
-            // The same decompressed stream, its blocks inflated on decoder threads.
-            let workers = std::num::NonZero::new(rayon::current_num_threads().clamp(1, BGZF_DECODERS))
-                .unwrap_or(std::num::NonZero::<usize>::MIN);
+        } else if within && let workers = rayon::current_num_threads().clamp(1, BGZF_DECODERS)
+            && let Some(_held) = crate::common::threads::global().hold(workers + 1) {
+            // The same decompressed stream, its blocks inflated on decoder threads (a reader
+            // thread and the decoders, when the process's thread limits leave room for them).
+            let workers = std::num::NonZero::new(workers).unwrap_or(std::num::NonZero::<usize>::MIN);
             let inner = noodles_bgzf::io::MultithreadedReader::with_worker_count(workers, std::fs::File::open(path)?);
             let mut reader = bam::io::Reader::from(inner);
             reader.read_header()?;
