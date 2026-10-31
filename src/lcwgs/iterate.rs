@@ -1176,6 +1176,8 @@ fn run_gibbs_with_memory(
         // Passenger pass this iteration (main iterations only, every Nth).
         let pass_now = pass.is_some() && is_main && (it - n_burnin).is_multiple_of(pass_every);
         let pass_sites = if pass_now { n_pass } else { 0 };
+        // A single sample's passenger forward-backward runs beside its haplotype's own.
+        let pass_beside = pass_now && memory.is_some();
         // FAITHFUL GLIMPSE2 phasing HMM: every re-phase iteration, re-phase each
         // sample's H0/H1 via the ported phasing_hmm (8-founder diplotype SAMPLE_DIP).
         // Genotype-preserving (re-phases hets); feeds the next iteration's selection
@@ -1263,30 +1265,32 @@ fn run_gibbs_with_memory(
                     pass_now.then(|| passenger_dose(h, partner, c, gl3, n_samples, ref_bm, cm, params,
                         sp.map(|x| x.poly.as_slice()), band, pass.unwrap(), pass_model.as_ref().unwrap(), two_pass, mp))
                 };
-                let fb0 = |pack: Option<&[u64]>| {
-                    let (d, smp) = run_one_hap(
+                // A haplotype's passenger pass reads what its own pass reads, not
+                // its result: a single sample runs the two side by side.
+                let beside = |main: &(dyn Fn() -> (Vec<f32>, Vec<u8>) + Sync), pass: &(dyn Fn() -> Option<Vec<f32>> + Sync)| {
+                    let ((d, smp), pd) = if pass_beside { rayon::join(main, pass) } else { (main(), pass()) };
+                    (d, smp, pd)
+                };
+                let fb0 = |pack: Option<&[u64]>| beside(
+                    &|| run_one_hap(
                         h0i, it, seed,
                         |v| prev_alleles[v * n_target_haps + h1i] as usize,
                         c0, gl3, n_samples, ref_bm, cm, params,
                         use_scaffold, &common_idx, n_var,
                         split0.map(|x| (x, ic_all, ps_mono_alt.as_slice())),
                         full_axis_rmult.as_deref(),
-                        pack, two_pass);
-                    let pd = pass_fb(h0i, &|v| prev_alleles[v * n_target_haps + h1i] as usize, c0, split0, pack);
-                    (d, smp, pd)
-                };
-                let fb1 = |fresh: Option<&[u8]>, pack: Option<&[u64]>| {
-                    let (d, smp) = run_one_hap(
+                        pack, two_pass),
+                    &|| pass_fb(h0i, &|v| prev_alleles[v * n_target_haps + h1i] as usize, c0, split0, pack));
+                let fb1 = |fresh: Option<&[u8]>, pack: Option<&[u64]>| beside(
+                    &|| run_one_hap(
                         h1i, it, seed,
                         |v| fresh.map_or(prev_alleles[v * n_target_haps + h0i], |a| a[v]) as usize,
                         c1, gl3, n_samples, ref_bm, cm, params,
                         use_scaffold, &common_idx, n_var,
                         split1.map(|x| (x, ic_all, ps_mono_alt.as_slice())),
                         full_axis_rmult.as_deref(),
-                        pack, two_pass);
-                    let pd = pass_fb(h1i, &|v| fresh.map_or(prev_alleles[v * n_target_haps + h0i], |a| a[v]) as usize, c1, split1, pack);
-                    (d, smp, pd)
-                };
+                        pack, two_pass),
+                    &|| pass_fb(h1i, &|v| fresh.map_or(prev_alleles[v * n_target_haps + h0i], |a| a[v]) as usize, c1, split1, pack));
                 let extra = if !is_main && !gs && rayon::current_num_threads() > 1 {
                     memory.and_then(|m| m.try_parallel_fb(super::memory::fb_bytes(n_var, c1.len())
                         + two_pass_bytes(c1.len())))
@@ -1334,7 +1338,8 @@ fn run_gibbs_with_memory(
             // tasks keep the shared prefix, but release the full FB pack here.
             let (((d0, mut samp0, pd0), (d1, mut samp1, pd1)), mut retained_base) = match memory {
                 Some(m) => m.run(super::memory::fb_bytes(n_var + pass_sites, c0.len().max(c1.len()))
-                    + two_pass_bytes(c0.len().max(c1.len())), fb),
+                    + two_pass_bytes(c0.len().max(c1.len()))
+                    + if pass_beside { super::hmm::two_pass::extra_bytes(n_var + pass_sites, c0.len().max(c1.len())) } else { 0 }, fb),
                 None => fb(),
             };
             if fuse_phase {
