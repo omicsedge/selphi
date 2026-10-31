@@ -1021,16 +1021,28 @@ fn emit_row(
     if !hmm_renorm() {
         // One pass: scale, threshold and keep. `w` is scratch the caller rebuilds before
         // its next use, so it is not written back (it used to be scaled and zeroed in
-        // place, then scanned again).
-        if let Some(gs) = group_sizes {
-            for (j, &x) in w.iter().enumerate() {
-                let v = x * inv_sum;
-                if !(v < threshold * gs[j]) && v > 0.0 { push(j, v); }
+        // place, then scanned again). Few states pass (~30 of ~1,500 on 1000 Genomes): a
+        // block of states is tested at a time into a mask, then its passing states pushed
+        // in index order.
+        const BLK: usize = 16;
+        for b in (0..w.len()).step_by(BLK) {
+            let e = (b + BLK).min(w.len());
+            let mut mask = 0u32;
+            if let Some(gs) = group_sizes {
+                for (l, (&x, &g)) in w[b..e].iter().zip(&gs[b..e]).enumerate() {
+                    let v = x * inv_sum;
+                    mask |= ((!(v < threshold * g) && v > 0.0) as u32) << l;
+                }
+            } else {
+                for (l, &x) in w[b..e].iter().enumerate() {
+                    let v = x * inv_sum;
+                    mask |= ((!(v < threshold) && v > 0.0) as u32) << l;
+                }
             }
-        } else {
-            for (j, &x) in w.iter().enumerate() {
-                let v = x * inv_sum;
-                if !(v < threshold) && v > 0.0 { push(j, v); }
+            while mask != 0 {
+                let j = b + mask.trailing_zeros() as usize;
+                push(j, w[j] * inv_sum);
+                mask &= mask - 1;
             }
         }
         return;
