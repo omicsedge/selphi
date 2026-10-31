@@ -45,7 +45,9 @@
 //! depth); `LCWGS_BIG_PANEL=0` restores the index order and the old SPLIT on every panel.
 //!
 //! A panel below the boundary (1000 Genomes size) takes the small-panel profile
-//! instead ([`Conditioning::small`], `LcwgsParams::small_profile`): the rank-order
+//! instead when its likelihoods are soft (the coverage gate of the SPLIT: mean
+//! normalised GL peakedness below `LCWGS_SPLIT_GL_THR`, 0.84; true 2x reads 0.73, 4x
+//! 0.88-0.89) ([`Conditioning::small`], `LcwgsParams::small_profile`): the rank-order
 //! cap at depth 2000, no rare-carrier augmentation, and two Gibbs chains of 20
 //! iterations (15 main; seeds 1000 apart, dosages averaged) in place of one of 30
 //! (25 main). The index order's base there is the first 1,000 samples of the panel
@@ -61,10 +63,13 @@
 //! sample-seed pairs), panel MAF < 0.5% +0.0048 [+0.0024, +0.0076] (33 of 36),
 //! 0.5-1% +0.0040 [+0.0022, +0.0061]; ~2.3x (4,478-haplotype panel, six GIAB
 //! genomes) non-reference-truth R² +0.00054 (13 of 18), every MAF bin up; CPU -23%.
-//! `LCWGS_SMALL_PANEL=old`, an explicit `LCWGS_QUAL_TRUNC` (or a supplied cap plan)
-//! and `LCWGS_BIG_PANEL=0` keep the previous conditioning (index order, the
-//! augmentation, one chain of 30); `LCWGS_N_ITER`, `LCWGS_N_MAIN` and
-//! `LCWGS_GIBBS_RESTARTS` override their part.
+//! Confident likelihoods keep the previous conditioning (index order, the
+//! augmentation, one chain of 30), which measured better there: HG002 likelihood (`PL`)
+//! files at 4x and 10x lost 0.00010 and 0.00003 R² with the profile (10 and 12 more
+//! genotype errors, three seeds each), and true 4x read sets gained only on one of three
+//! sets. `LCWGS_SMALL_PANEL=old`, an explicit `LCWGS_QUAL_TRUNC` (or a supplied cap
+//! plan) and `LCWGS_BIG_PANEL=0` keep the previous conditioning at any coverage;
+//! `LCWGS_N_ITER`, `LCWGS_N_MAIN` and `LCWGS_GIBBS_RESTARTS` override their part.
 
 use super::faithful_select::CapOrder;
 
@@ -156,12 +161,13 @@ pub fn adaptive_kpbwt(n_ref: usize) -> usize {
 /// Whether a panel of `n_ref` haplotypes is conditioned as biobank-size.
 pub fn is_big(n_ref: usize) -> bool { n_ref >= BIG_PANEL_MIN_HAPS }
 
-/// The run's conditioning for a panel of `n_ref` haplotypes.
-pub fn resolve(n_ref: usize, explicit: Explicit) -> Conditioning {
+/// The run's conditioning for a panel of `n_ref` haplotypes; `soft`: the run's
+/// likelihoods are soft (below the coverage gate).
+pub fn resolve(n_ref: usize, explicit: Explicit, soft: bool) -> Conditioning {
     let big = is_big(n_ref);
     // The panel's own cap order, unless one is given or `LCWGS_BIG_PANEL=0`.
     let own_order = !explicit.order && !explicit.gate_off;
-    let small = !big && own_order && !explicit.small_off;
+    let small = !big && own_order && !explicit.small_off && soft;
     Conditioning {
         kpbwt: (!explicit.kpbwt).then(|| adaptive_kpbwt(n_ref)),
         order: if big { own_order.then_some(BIG_PANEL_ORDER) } else { small.then_some(SMALL_PANEL_ORDER) },
@@ -199,31 +205,35 @@ mod tests {
         let small = Conditioning { kpbwt: Some(2000), order: Some(SMALL_PANEL_ORDER), split: None, small: true };
         let old = Conditioning { order: None, small: false, ..small };
         for n in [4478, 4796, 6332, BIG_PANEL_MIN_HAPS - 1] {
-            assert_eq!(resolve(n, NONE), small, "{n}");
-            assert_eq!(resolve(n, Explicit { kpbwt: true, ..NONE }), Conditioning { kpbwt: None, ..small });
-            assert_eq!(resolve(n, Explicit { split_off: true, ..NONE }), small);
+            assert_eq!(resolve(n, NONE, true), small, "{n}");
+            assert_eq!(resolve(n, Explicit { kpbwt: true, ..NONE }, true), Conditioning { kpbwt: None, ..small });
+            assert_eq!(resolve(n, Explicit { split_off: true, ..NONE }, true), small);
             for off in [Explicit { order: true, ..NONE }, Explicit { gate_off: true, ..NONE }, Explicit { small_off: true, ..NONE }] {
-                assert_eq!(resolve(n, off), old, "{n}");
+                assert_eq!(resolve(n, off, true), old, "{n}");
             }
         }
         // LCWGS_SMALL_PANEL=old leaves a biobank-size panel alone.
-        assert_eq!(resolve(75_552, Explicit { small_off: true, ..NONE }), resolve(75_552, NONE));
+        assert_eq!(resolve(75_552, Explicit { small_off: true, ..NONE }, true), resolve(75_552, NONE, true));
+        // Confident likelihoods keep the selector's own order on a small panel; a big panel's
+        // conditioning does not depend on them.
+        assert_eq!(resolve(6332, NONE, false), Conditioning { kpbwt: Some(2000), order: None, split: None, small: false });
+        assert_eq!(resolve(75_552, NONE, false), resolve(75_552, NONE, true));
     }
 
     #[test]
     fn big_panels_get_rank_order_at_the_adaptive_depth() {
-        assert_eq!(resolve(BIG_PANEL_MIN_HAPS, NONE), Conditioning { kpbwt: Some(2001), order: Some(CapOrder::G2), split: SPLIT, small: false });
-        assert_eq!(resolve(75_552, NONE), Conditioning { kpbwt: Some(4986), order: Some(CapOrder::G2), split: SPLIT, small: false });
-        assert_eq!(resolve(171_054, NONE), Conditioning { kpbwt: Some(5000), order: Some(CapOrder::G2), split: SPLIT, small: false });
+        assert_eq!(resolve(BIG_PANEL_MIN_HAPS, NONE, true), Conditioning { kpbwt: Some(2001), order: Some(CapOrder::G2), split: SPLIT, small: false });
+        assert_eq!(resolve(75_552, NONE, true), Conditioning { kpbwt: Some(4986), order: Some(CapOrder::G2), split: SPLIT, small: false });
+        assert_eq!(resolve(171_054, NONE, true), Conditioning { kpbwt: Some(5000), order: Some(CapOrder::G2), split: SPLIT, small: false });
     }
 
     #[test]
     fn explicit_knobs_win_part_by_part() {
         let n = 75_552;
-        assert_eq!(resolve(n, Explicit { kpbwt: true, ..NONE }), Conditioning { kpbwt: None, order: Some(CapOrder::G2), split: SPLIT, small: false });
+        assert_eq!(resolve(n, Explicit { kpbwt: true, ..NONE }, true), Conditioning { kpbwt: None, order: Some(CapOrder::G2), split: SPLIT, small: false });
         // An explicit order (or a supplied plan) takes the order only: the split is the panel's.
-        assert_eq!(resolve(n, Explicit { order: true, ..NONE }), Conditioning { kpbwt: Some(4986), order: None, split: SPLIT, small: false });
-        assert_eq!(resolve(n, Explicit { kpbwt: true, order: true, ..NONE }), Conditioning { kpbwt: None, order: None, split: SPLIT, small: false });
+        assert_eq!(resolve(n, Explicit { order: true, ..NONE }, true), Conditioning { kpbwt: Some(4986), order: None, split: SPLIT, small: false });
+        assert_eq!(resolve(n, Explicit { kpbwt: true, order: true, ..NONE }, true), Conditioning { kpbwt: None, order: None, split: SPLIT, small: false });
     }
 
     #[test]
@@ -231,15 +241,15 @@ mod tests {
         // The deep pass of a whole LCWGS_KPBWT=2000 run: depth 2000 under the default k_max 3000.
         assert_eq!(BIG_PANEL_SPLIT, BigSplit { band: (0.005, 0.10), kmax: 3000, kpbwt: 2000 });
         // `order` keeps the rank order and the old split; 0/off restores both.
-        assert_eq!(resolve(75_552, Explicit { split_off: true, ..NONE }),
+        assert_eq!(resolve(75_552, Explicit { split_off: true, ..NONE }, true),
             Conditioning { kpbwt: Some(4986), order: Some(CapOrder::G2), split: None, small: false });
-        assert_eq!(resolve(75_552, Explicit { gate_off: true, split_off: true, ..NONE }),
+        assert_eq!(resolve(75_552, Explicit { gate_off: true, split_off: true, ..NONE }, true),
             Conditioning { kpbwt: Some(4986), order: None, split: None, small: false });
     }
 
     #[test]
     fn gate_off_restores_the_index_order() {
-        assert_eq!(resolve(75_552, Explicit { gate_off: true, ..NONE }), Conditioning { kpbwt: Some(4986), order: None, split: None, small: false });
-        assert_eq!(resolve(75_552, Explicit { gate_off: true, kpbwt: true, ..NONE }), Conditioning { kpbwt: None, order: None, split: None, small: false });
+        assert_eq!(resolve(75_552, Explicit { gate_off: true, ..NONE }, true), Conditioning { kpbwt: Some(4986), order: None, split: None, small: false });
+        assert_eq!(resolve(75_552, Explicit { gate_off: true, kpbwt: true, ..NONE }, true), Conditioning { kpbwt: None, order: None, split: None, small: false });
     }
 }
