@@ -138,6 +138,14 @@ impl ThreadBudget {
         (1, self.hold(2))
     }
 
+    /// The pool threads' handles that `pick` selects, the rest kept.
+    fn take_handles(&self, pick: impl Fn(&std::thread::JoinHandle<()>) -> bool) -> Vec<(std::thread::JoinHandle<()>, std::sync::Arc<AtomicUsize>)> {
+        let mut handles = self.pool_handles.lock().unwrap_or_else(|e| e.into_inner());
+        let (picked, kept) = std::mem::take(&mut *handles).into_iter().partition(|(h, _)| pick(h));
+        *handles = kept;
+        picked
+    }
+
     fn pools_lose(&self, n: usize) {
         let mut left = self.pool_threads.lock().unwrap_or_else(|e| e.into_inner());
         *left -= n;
@@ -146,20 +154,19 @@ impl ThreadBudget {
 
     /// Wait until the threads of every pool built here have exited (a dropped
     /// pool's workers leave on their own time), at most `limit`: the chunk stage
-    /// ends with the threads it started gone. The threads that have finished
-    /// are joined, and then waited for until the process no longer counts them
-    /// (the kernel releases a thread's slot after the join can return).
+    /// ends with the threads it started gone. Once none is left at work, every
+    /// pool thread is joined (each is past its last count, so it is exiting),
+    /// and then waited for until the process no longer lists it (the kernel
+    /// frees a thread's slot before that, and after the join can return).
     pub(crate) fn wait_pools_exited(&self, limit: std::time::Duration) {
         let t0 = std::time::Instant::now();
         let left = self.pool_threads.lock().unwrap_or_else(|e| e.into_inner());
-        drop(self.pools_exited.wait_timeout_while(left, limit, |n| *n > 0));
-        let finished: Vec<_> = {
-            let mut handles = self.pool_handles.lock().unwrap_or_else(|e| e.into_inner());
-            let (done, running) = std::mem::take(&mut *handles).into_iter().partition(|(h, _)| h.is_finished());
-            *handles = running;
-            done
-        };
-        for (h, tid) in finished {
+        let (left, _) = self.pools_exited.wait_timeout_while(left, limit, |n| *n > 0).unwrap_or_else(|e| e.into_inner());
+        let all = *left == 0;
+        drop(left);
+        // A pool still at work (the wait timed out): only its finished threads are joined.
+        let exiting = self.take_handles(|h| all || h.is_finished());
+        for (h, tid) in exiting {
             let _ = h.join();
             // Gone from /proc once the kernel has released it (its slot freed before that).
             let task = format!("/proc/self/task/{}", tid.load(Ordering::Relaxed));
@@ -235,6 +242,8 @@ impl ThreadBudget {
     /// workers may still finish queued jobs). The threads of a build the OS cut
     /// short are counted off as they exit, the ones never started at once.
     fn build(&'static self, builder: rayon::ThreadPoolBuilder, n: usize, compute: usize) -> Option<rayon::ThreadPool> {
+        // Earlier pools' finished threads give their stacks back (a joined thread's are unmapped).
+        for (h, _) in self.take_handles(std::thread::JoinHandle::is_finished) { let _ = h.join(); }
         self.live.fetch_add(n, Ordering::Relaxed);
         self.pool_workers.fetch_add(compute, Ordering::Relaxed);
         *self.pool_threads.lock().unwrap_or_else(|e| e.into_inner()) += n;
