@@ -199,7 +199,7 @@ pub fn impute_window(
     params: &WindowHmmParams,
     precomputed_candidates: Option<&Vec<Vec<u32>>>,
     carry: &mut [HapCarry],
-    on_batch_done: Option<BatchDoneCb<'_>>,
+    weights_out: WeightsOut<'_>,
 ) -> WindowHmmOutput {
     let n_var_w = inputs.chip_end - inputs.chip_start;
     // targ_alleles is now bit-packed (the full target is held 8× smaller); unpack
@@ -272,7 +272,7 @@ pub fn impute_window(
         precomputed_candidates, anc_ctx.as_ref(),
         carry, inputs.chip_start, n_var_w, inputs.keep_rows,
         inputs.hmm_skip, inputs.allele_classes,
-        on_batch_done,
+        weights_out,
     );
     crate::selphi_debug!("  [MEM] impute_window: HMM done: rss={:.0} MB", crate::log::rss_mb());
     out
@@ -288,6 +288,21 @@ pub type BatchDoneCb<'a> = &'a mut dyn FnMut(
     usize,                               // batch_end (hap index, exclusive)
     &[&super::hmm::CsrWeights],          // weight refs for this batch
 ) -> std::io::Result<()>;
+
+/// Takes one target haplotype's weights (its index, its weights), on the worker that ran
+/// its HMM, as soon as they are done.
+pub type WeightSink<'a> = &'a (dyn Fn(usize, Vec<(usize, super::hmm::CsrWeights)>) + Sync);
+
+/// Where a window call's per-haplotype weights go.
+pub enum WeightsOut<'a> {
+    /// Returned in `WindowHmmOutput::all_weights`.
+    Collect,
+    /// Each batch's to the callback when the batch is done, then dropped.
+    Batches(BatchDoneCb<'a>),
+    /// Each haplotype's to the sink when its HMM is done, from inside the parallel stage:
+    /// no batch waits for its slowest target. Run it as one batch (`target_batch_size` 0).
+    Each(WeightSink<'a>),
+}
 
 // ---------------------------------------------------------------------------
 // Per-target PBWT: the two candidate regimes
@@ -1053,10 +1068,11 @@ fn superset_diag_report(chip_start: usize, chip_end: usize) {
 /// Run PBWT + HMM for all target haplotypes in a single window.
 /// Returns per-haplotype sparse weights and updated priors.
 ///
-/// If `on_batch_done` is provided, each batch's CSRs are passed to the
-/// callback IMMEDIATELY after the batch finishes (then dropped), and the
-/// returned `WindowHmmOutput.all_weights` is empty. This is the streaming
-/// path that bounds memory peak by batch size.
+/// With `WeightsOut::Batches`, each batch's CSRs are passed to the callback
+/// IMMEDIATELY after the batch finishes (then dropped); with `WeightsOut::Each`, each
+/// haplotype's as soon as it is done. Either way the returned
+/// `WindowHmmOutput.all_weights` is empty: the streaming paths that bound the memory
+/// peak by the weights in flight.
 pub fn process_window_hmm(
     params: &WindowHmmParams,
     ref_bm: &HaplotypeBitmatrix,
@@ -1083,7 +1099,7 @@ pub fn process_window_hmm(
     hmm_skip: Option<&[bool]>,
     // The window's allele classes shared across calls (ImputeWindowInputs::allele_classes).
     shared_classes: Option<&WindowClasses>,
-    mut on_batch_done: Option<BatchDoneCb<'_>>,
+    mut weights_out: WeightsOut<'_>,
 ) -> WindowHmmOutput {
     let n_ref = params.n_ref;
     let n_haps = params.n_haps;
@@ -1371,18 +1387,24 @@ pub fn process_window_hmm(
         };
 
         let share = resolve_share(n_var_w, fl_fwd, n_ref, batch_end - batch_start, max_candidates);
+        // A haplotype's weights go to the sink, if there is one, as soon as they are done.
+        let sink = match &weights_out { WeightsOut::Each(s) => Some(*s), _ => None };
+        let hand = |(t, mut r): (usize, HmmResult)| -> (usize, HmmResult) {
+            if let Some(s) = sink { s(t, std::mem::take(&mut r.weights)); }
+            (t, r)
+        };
         let run_batch = || -> Vec<(usize, HmmResult)> {
             if share <= 1 {
-                (batch_start..batch_end).into_par_iter().map(&per_target).collect()
+                (batch_start..batch_end).into_par_iter().map(&per_target).map(&hand).collect()
             } else {
                 // A target that skips its no-calls has its own site list, so it cannot
                 // join a shared sort; it runs per target (same result as unshared).
                 let (own, shared): (Vec<usize>, Vec<usize>) = (batch_start..batch_end)
                     .partition(|&t| ctx.skip && miss[t].is_some());
                 let mut out: Vec<(usize, HmmResult)> =
-                    shared.par_chunks(share).flat_map(|c| shared_chunk(c)).collect();
+                    shared.par_chunks(share).flat_map(|c| shared_chunk(c)).map(&hand).collect();
                 if !own.is_empty() {
-                    out.extend(own.into_par_iter().map(&per_target).collect::<Vec<_>>());
+                    out.extend(own.into_par_iter().map(&per_target).map(&hand).collect::<Vec<_>>());
                     out.sort_unstable_by_key(|&(t, _)| t);
                 }
                 out
@@ -1396,8 +1418,8 @@ pub fn process_window_hmm(
         // Sequential update of the carry. If streaming callback present:
         //   - Stash batch's CSRs into a local Vec, call callback, drop.
         //   - all_weights stays empty (streaming mode).
-        // Otherwise (default): push to all_weights.
-        if let Some(ref mut cb) = on_batch_done {
+        // Otherwise (default): push to all_weights (the sink took them already).
+        if let WeightsOut::Batches(ref mut cb) = weights_out {
             let mut batch_weights: Vec<Vec<(usize, super::hmm::CsrWeights)>> = Vec::with_capacity(batch_end - batch_start);
             for (tgt, r) in batch_results {
                 carry_update(&mut carry[tgt], &r, p_err, adapt.is_some(), &mut adapt_stats);
@@ -1419,7 +1441,7 @@ pub fn process_window_hmm(
                 if let Some(post) = r.hap_posterior {
                     carry[tgt].prior = (!post.is_empty()).then_some(post);
                 }
-                all_weights.push(r.weights);
+                if sink.is_none() { all_weights.push(r.weights); }
             }
         }
     }

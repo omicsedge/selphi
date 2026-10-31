@@ -1797,7 +1797,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
             selphi::imputation::window_process::impute_window(
                 &inputs, &hmm_params, precomputed_candidates.as_ref(),
                 &mut carry,
-                Some(&mut cb),
+                selphi::imputation::window_process::WeightsOut::Batches(&mut cb),
             )
         } else {
             // Member 0 plus the phase-ensemble's extra members (each re-runs this window's

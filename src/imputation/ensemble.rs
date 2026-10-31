@@ -29,14 +29,15 @@
 
 use crate::common::HaplotypeBitmatrix;
 use crate::imputation::hmm::CsrWeights;
-use crate::imputation::window_process::{ImputeWindowInputs, WindowHmmParams, impute_window};
+use crate::imputation::window_process::{ImputeWindowInputs, WindowHmmParams, WeightsOut, impute_window};
 use rayon::prelude::*;
 
-/// Hap-batch size used when re-running a member's window. The member's weights
+/// Hap-batch size used when re-running a stacked member's window (several blocks,
+/// whose adds into one sample must keep block order). The member's weights
 /// are folded into the running sum one batch at a time, so the peak holds the
 /// running sum plus ~this many haps rather than a second full weight-set.
 /// Output is independent of it: per-target HMM weights do not depend on the
-/// batch they were computed in.
+/// batch they were computed in. A one-block member folds each sample as it is done.
 const STREAM_CHUNK: usize = 256;
 
 /// How many phase-ensemble members to average, given the cohort size.
@@ -400,7 +401,6 @@ fn fold_window_shared(
     if members.is_empty() { return; }
     let n_haps = params.n_haps;
     let mut params_m = params.clone();
-    params_m.target_batch_size = STREAM_CHUNK;
     let mut count = 1usize;
     for sc in members.iter_mut() {
         let Member { targ_bm, candidates, final_ne_per_site, carry, n_blocks, site_conf_per_sample } = sc;
@@ -410,6 +410,34 @@ fn fold_window_shared(
         params_m.n_haps = n_haps * *n_blocks;
         let cand = candidates.as_ref();
         let targ_k: &HaplotypeBitmatrix = targ_bm;
+        count += *n_blocks;
+        if *n_blocks == 1 {
+            // Each sample of member 0 takes exactly one add: it is folded as soon as both its
+            // haplotypes are done, on the worker that finished the second, and the member runs
+            // as one batch, so no batch waits for its slowest target.
+            params_m.target_batch_size = 0;
+            let proto = PairFold::new(ctx);
+            let sums: Vec<std::sync::Mutex<&mut [Vec<(usize, CsrWeights)>]>> =
+                all_weights.chunks_mut(2).map(std::sync::Mutex::new).collect();
+            let halves: Vec<std::sync::Mutex<Option<Vec<(usize, CsrWeights)>>>> =
+                (0..sums.len()).map(|_| std::sync::Mutex::new(None)).collect();
+            let sink = |t: usize, w: Vec<(usize, CsrWeights)>| {
+                let s = t / 2;
+                let other = {
+                    let mut half = halves[s].lock().unwrap();
+                    match half.take() {
+                        Some(o) => o,
+                        None => { *half = Some(w); return; }
+                    }
+                };
+                let (w0, w1) = if t % 2 == 0 { (&w, &other) } else { (&other, &w) };
+                proto.clone().add(&mut sums[s].lock().unwrap(), s, s, &w0[0].1, &w1[0].1, targ_k);
+            };
+            let _ = impute_window(&inputs_m, &params_m, cand, carry, WeightsOut::Each(&sink));
+            debug_assert!(halves.iter().all(|h| h.lock().unwrap().is_none()), "a haplotype without its partner");
+            continue;
+        }
+        params_m.target_batch_size = STREAM_CHUNK;
         let mut accumulate = |bstart: usize, bend: usize, refs: &[&CsrWeights]|
          -> std::io::Result<()> {
             // Batches hold whole samples: the batch size is even and starts on a sample.
@@ -437,8 +465,7 @@ fn fold_window_shared(
             });
             Ok(())
         };
-        let _ = impute_window(&inputs_m, &params_m, cand, carry, Some(&mut accumulate));
-        count += *n_blocks;
+        let _ = impute_window(&inputs_m, &params_m, cand, carry, WeightsOut::Batches(&mut accumulate));
     }
     divide(all_weights, count);
 }
@@ -459,7 +486,7 @@ pub fn impute_with_members(
     // classes are computed once.
     let classes = super::window_process::WindowClasses::default();
     let inputs0 = ImputeWindowInputs { allele_classes: Some(&classes), ..*inputs };
-    let mut out = impute_window(&inputs0, params, precomputed_candidates, carry, None);
+    let mut out = impute_window(&inputs0, params, precomputed_candidates, carry, WeightsOut::Collect);
     fold_window_shared(&mut out.all_weights, members, ctx, params, Some(&classes));
     out
 }
@@ -499,6 +526,7 @@ fn divide(all_weights: &mut [Vec<(usize, CsrWeights)>], count: usize) {
 
 /// Adds one member's two haplotype weights of a sample into the running sums, aligned to
 /// member 0's orientation (`swap_rows`, `mixed_rows`), with its scratch reused across samples.
+#[derive(Clone)]
 struct PairFold<'c> {
     ctx: &'c FoldContext<'c>,
     skip_nocalls: bool,
