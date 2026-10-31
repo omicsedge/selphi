@@ -306,7 +306,14 @@ impl Drop for Permit<'_> {
 thread_local! {
     /// The pool of the Gibbs chain this thread works for (see [`run_chunks`]).
     static CHAIN_POOL: std::cell::RefCell<Option<Arc<rayon::ThreadPool>>> = const { std::cell::RefCell::new(None) };
+    /// This thread is a worker of a chain pool ([`new_chain_pool`]).
+    static CHAIN_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// Whether this thread is a worker of a chain pool: such workers keep no
+/// kernel scratch between calls (`hmm::TrimCaches`), since the run's chain
+/// pools hold many more workers than the retained caches are charged for.
+pub(crate) fn is_chain_worker() -> bool { CHAIN_WORKER.with(std::cell::Cell::get) }
 
 /// This thread's chain pool (see [`run_chunks`]): the native threads a chain
 /// spawns take it along, so that their parallel work stays in it.
@@ -335,17 +342,15 @@ pub(crate) fn in_chain_pool<R: Send>(pool: Option<Arc<rayon::ThreadPool>>, f: im
     }
 }
 
-/// Have every worker of this thread's chain pool release its kernel scratch
-/// and return the pages of blocks other threads freed (results and packs cross
-/// threads): an idle worker would hold them until it next allocates, and the
-/// pool's workers take turns at the forward-backwards. Each worker does it when
-/// it next looks for work (the chain's coordinator waits on its worker, so a
-/// blocking broadcast could wait for it forever). Nothing outside a chain pool.
+/// Have every worker of this thread's chain pool return the pages of blocks
+/// other threads freed (results and packs cross threads): an idle worker would
+/// hold them until it next allocates. Each worker does it when it next looks
+/// for work (the chain's coordinator waits on its worker, so a blocking
+/// broadcast could wait for it forever). Nothing outside a chain pool.
 pub(crate) fn collect_chain_pool() {
     if CHAIN_POOL.with(|p| p.borrow().is_some()) {
-        let collect = || { super::hmm::release_worker_scratch(); collect_local(); };
-        rayon::spawn_broadcast(move |_| collect());
-        collect();
+        rayon::spawn_broadcast(|_| collect_local());
+        collect_local();
     }
 }
 
@@ -355,7 +360,9 @@ pub(crate) fn collect_chain_pool() {
 /// chain then runs in the global pool, as before).
 pub(crate) fn new_chain_pool(threads: usize) -> Option<Arc<rayon::ThreadPool>> {
     rayon::ThreadPoolBuilder::new().num_threads(threads + 1).stack_size(16 << 20)
-        .thread_name(|i| format!("lcwgs-chain-{i}")).build().ok().map(Arc::new)
+        .thread_name(|i| format!("lcwgs-chain-{i}"))
+        .start_handler(|_| CHAIN_WORKER.with(|w| w.set(true)))
+        .build().ok().map(Arc::new)
 }
 
 /// Return pages on the allocating worker before its allowance can be reused.

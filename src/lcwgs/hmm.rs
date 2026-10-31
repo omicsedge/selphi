@@ -110,22 +110,15 @@ pub(crate) fn with_serial_packing<T>(f: impl FnOnce() -> T) -> T {
 pub(crate) const CACHE_BUFFER_BYTES: usize = 1024 * 1024;
 pub(crate) const CACHE_BYTES_PER_WORKER: usize = 8 * CACHE_BUFFER_BYTES;
 
-/// Release this worker's kernel scratch (see [`super::memory::collect_chain_pool`]).
-/// A buffer in use (borrowed by a call this worker is waiting inside) is left.
-pub(crate) fn release_worker_scratch() {
-    for key in [&TL_ALPHA, &TL_BETA, &TL_ALPHA_SUM, &TL_EMIT, &TL_PREC, &TL_BLK, &TL_FCOL] {
-        key.with(|c| if let Ok(mut v) = c.try_borrow_mut() { *v = Vec::new(); });
-    }
-    TL_CONDBITS.with(|c| if let Ok(mut v) = c.try_borrow_mut() { *v = Vec::new(); });
-}
-
 struct TrimCaches;
 impl Drop for TrimCaches {
     fn drop(&mut self) {
+        // A chain pool's worker keeps nothing (see `memory::is_chain_worker`).
+        let keep = if super::memory::is_chain_worker() { 0 } else { CACHE_BUFFER_BYTES };
         for key in [&TL_ALPHA, &TL_BETA, &TL_ALPHA_SUM, &TL_EMIT, &TL_PREC, &TL_BLK, &TL_FCOL] {
-            key.with(|c| super::membership::trim_vec(&mut c.borrow_mut(), CACHE_BUFFER_BYTES));
+            key.with(|c| super::membership::trim_vec(&mut c.borrow_mut(), keep));
         }
-        TL_CONDBITS.with(|c| super::membership::trim_vec(&mut c.borrow_mut(), CACHE_BUFFER_BYTES));
+        TL_CONDBITS.with(|c| super::membership::trim_vec(&mut c.borrow_mut(), keep));
     }
 }
 

@@ -2161,7 +2161,8 @@ mod tests {
                     assert_eq!(got.into_iter().map(Option::unwrap).collect::<Vec<_>>(), serial,
                         "samples={ns} live={live} parallel={parallel}");
                 }
-                if parallel && rayon::current_num_threads() > 1 {
+                // Admitted chains run in pools of their own of at least two workers.
+                if parallel {
                     assert!(memory.parallel_fb_grants() > 0);
                     assert!(memory.parallel_fb_grants() <=
                         (params.n_iterations - params.n_main_iterations) * ns * inputs.len() * 2);
