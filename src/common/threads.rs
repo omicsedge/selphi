@@ -45,6 +45,9 @@ pub(crate) struct ThreadBudget {
     /// Threads of the pools built here that have not exited.
     pool_threads: Mutex<usize>,
     pools_exited: Condvar,
+    /// The pool threads' handles and kernel thread ids (set when they start),
+    /// joined by [`Self::wait_pools_exited`].
+    pool_handles: Mutex<Vec<(std::thread::JoinHandle<()>, std::sync::Arc<AtomicUsize>)>>,
 }
 
 static GLOBAL: ThreadBudget = ThreadBudget::new();
@@ -92,7 +95,7 @@ impl ThreadBudget {
     pub(crate) const fn new() -> Self {
         ThreadBudget { live: AtomicUsize::new(0), pool_workers: AtomicUsize::new(0), room: OnceLock::new(),
             refused: AtomicBool::new(false), grant: Mutex::new(()), noted: AtomicBool::new(false),
-            pool_threads: Mutex::new(0), pools_exited: Condvar::new() }
+            pool_threads: Mutex::new(0), pools_exited: Condvar::new(), pool_handles: Mutex::new(Vec::new()) }
     }
 
     /// A budget whose room is `room` threads (tests).
@@ -143,10 +146,27 @@ impl ThreadBudget {
 
     /// Wait until the threads of every pool built here have exited (a dropped
     /// pool's workers leave on their own time), at most `limit`: the chunk stage
-    /// ends with the threads it started gone.
+    /// ends with the threads it started gone. The threads that have finished
+    /// are joined, and then waited for until the process no longer counts them
+    /// (the kernel releases a thread's slot after the join can return).
     pub(crate) fn wait_pools_exited(&self, limit: std::time::Duration) {
+        let t0 = std::time::Instant::now();
         let left = self.pool_threads.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = self.pools_exited.wait_timeout_while(left, limit, |n| *n > 0);
+        drop(self.pools_exited.wait_timeout_while(left, limit, |n| *n > 0));
+        let finished: Vec<_> = {
+            let mut handles = self.pool_handles.lock().unwrap_or_else(|e| e.into_inner());
+            let (done, running) = std::mem::take(&mut *handles).into_iter().partition(|(h, _)| h.is_finished());
+            *handles = running;
+            done
+        };
+        for (h, tid) in finished {
+            let _ = h.join();
+            // Gone from /proc once the kernel has released it (its slot freed before that).
+            let task = format!("/proc/self/task/{}", tid.load(Ordering::Relaxed));
+            while tid.load(Ordering::Relaxed) != 0 && std::path::Path::new(&task).exists() && t0.elapsed() < limit {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
     }
 
     /// Start a native thread in `scope`, counted until `f` returns. An error
@@ -224,7 +244,17 @@ impl ThreadBudget {
             if let Some(name) = t.name() { b = b.name(name.to_owned()); }
             if let Some(size) = t.stack_size() { b = b.stack_size(size); }
             let done = Finished { budget: self, compute: t.index() < compute, pool: true };
-            b.spawn(move || { let _done = done; t.run() })?;
+            let tid = std::sync::Arc::new(AtomicUsize::new(0));
+            let own = tid.clone();
+            let h = b.spawn(move || {
+                let _done = done;
+                #[cfg(target_os = "linux")]
+                own.store(unsafe { libc::gettid() } as usize, Ordering::Relaxed);
+                #[cfg(not(target_os = "linux"))]
+                let _ = own;
+                t.run()
+            })?;
+            self.pool_handles.lock().unwrap_or_else(|e| e.into_inner()).push((h, tid));
             started += 1;
             Ok(())
         }).build();
@@ -390,6 +420,7 @@ mod tests {
         go_tx.send(()).unwrap();
         budget.wait_pools_exited(std::time::Duration::from_secs(10));
         assert_eq!((budget.live(), budget.pool_workers.load(Ordering::Relaxed)), (0, 0), "workers counted off as they exit");
+        assert!(budget.pool_handles.lock().unwrap().is_empty(), "every exited worker joined");
     }
 
     /// A library's threads are held while they fit the room: all of them, else
