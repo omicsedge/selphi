@@ -14,10 +14,11 @@
 //! `bcftools norm -m -any -f FASTA -c w`). A Selphi row is written only where Selphi's genotype
 //! differs from what the caller's file says about that allele. Caller records are replaced whole
 //! or not at all (records that share an allele as one group); overlapping records and rows are
-//! decided together, and a cluster whose result would contradict itself (a row over a kept call,
-//! more than two alleles at a base, anything inside a homozygous Selphi deletion) is written as
-//! the caller wrote it. Every replaced or compared record is named in FORMAT provenance fields.
-//! The caller's header is kept verbatim; blocks are cut into fragments around Selphi rows.
+//! decided together, and a cluster whose result would contradict itself (a non-reference row over
+//! a kept call, more than two alleles at a base, anything inside a homozygous Selphi deletion) is
+//! written as the caller wrote it. Every replaced or compared record is named in FORMAT
+//! provenance fields. The caller's header is kept verbatim; blocks are cut into fragments around
+//! Selphi rows.
 
 mod decide;
 mod header;

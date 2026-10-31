@@ -120,7 +120,8 @@ pub(super) struct Counters {
 /// The coherence rule a cluster's result breaks (section 5.3 of the design).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Rule {
-    /// A written row over a retained caller call or a veto span.
+    /// A written non-reference row over a retained caller call, or a written row over a veto span
+    /// or a called `*`.
     C1,
     /// More than two non-reference alleles at a base or insertion point.
     C2,
@@ -229,8 +230,10 @@ pub(super) struct Decision {
     asserted: Intervals,
     ref_spans: Intervals,
     nocall_spans: Intervals,
-    /// Coherence scratch.
+    /// Coherence scratch: retained calls with an ALT count, and what asserts bases without one
+    /// (veto spans, called `*`).
     calls: Intervals,
+    vetoes: Intervals,
     call_counts: Vec<((i64, i64), u8)>,
     events: Vec<(i64, i32, i32)>,
     written_spans: Intervals,
@@ -643,7 +646,7 @@ impl Decision {
     /// C1-C3 over the cluster's final call set: the first rule it breaks, if any. Retained caller
     /// calls are read as the file writes them (FILTER ignored), as a consumer of the output does.
     fn incoherence(&mut self, rows: &[Row], recs: Recs, spans: &[Span]) -> Option<Rule> {
-        let Decision { written, fate, calls, call_counts, events, written_spans, kept_spans, .. } = self;
+        let Decision { written, fate, calls, vetoes, call_counts, events, written_spans, kept_spans, .. } = self;
         // Retained non-reference calls: (asserted interval, ALT count).
         call_counts.clear();
         for (i, rec) in (0..recs.len()).map(|i| (i, recs.get(i))) {
@@ -658,14 +661,21 @@ impl Decision {
             if rec.n_placeholder > 0 { call_counts.push((span, rec.n_placeholder)); }
             if rec.calls_star { call_counts.push((span, 0)); }
         }
-        // C1: no written row over a retained call or a veto span (a veto asserts its bases and the
-        // point after the last: the insertion point of a point veto, an insertion anchored on the
-        // last base it asserts).
+        // C1: no written non-reference row over a retained call, and no written row over a veto
+        // span or a called `*` (a veto asserts its bases and the point after the last: the
+        // insertion point of a point veto, an insertion anchored on the last base it asserts). A
+        // 0/0 row names no allele, so beside a counted call it contradicts nothing (the caller's
+        // own 0/0 records lie over its deletions too); its REF span still counts in C3.
         calls.clear();
-        for &(iv, _) in call_counts.iter() { calls.push(iv.0, iv.1, 0); }
-        for s in spans.iter().filter(|s| s.says == SpanSays::Veto) { calls.push(2 * s.lo, 2 * s.hi + 1, 0); }
+        vetoes.clear();
+        for &(iv, k) in call_counts.iter() { if k > 0 { calls.push(iv.0, iv.1, 0) } else { vetoes.push(iv.0, iv.1, 0) } }
+        for s in spans.iter().filter(|s| s.says == SpanSays::Veto) { vetoes.push(2 * s.lo, 2 * s.hi + 1, 0); }
         calls.build();
-        if written.iter().any(|w| { let iv = rows[w.row].asserts(); calls.any(iv.0, iv.1) }) { return Some(Rule::C1); }
+        vetoes.build();
+        if written.iter().any(|w| {
+            let iv = rows[w.row].asserts();
+            vetoes.any(iv.0, iv.1) || (rows[w.row].s > 0 && calls.any(iv.0, iv.1))
+        }) { return Some(Rule::C1); }
         // C2: at most two non-reference alleles over any base or insertion point a written
         // non-reference row covers (a sweep: (coordinate, count delta, written-row cover delta)).
         events.clear();

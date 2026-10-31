@@ -257,6 +257,26 @@ fn coherence_reverts_a_cluster_that_would_contradict_itself() {
 }
 
 #[test]
+fn a_reference_row_beside_a_kept_call_is_coherent() {
+    // A caller no-call C>T at 11 makes every panel allele at 11 a no-call: Selphi's 0/0 for the
+    // deletion CGG>C is written, and its REF span covers the point of a kept PASS insertion G>GA
+    // at 12. A 0/0 names no allele: nothing contradicts, and the cluster keeps its indel rows.
+    let nc = rec(11, "C", "T", "RefCall", "./.", 2);
+    let ins = rec(12, "G", "GA", "PASS", "0/1", 30);
+    let f = fx(R, &[(11, "CGG", "C", 0, 5), (11, "C", "T", 0, 5), (13, "GC", "G", 1, 5)]);
+    let (out, c) = f.run(pol(), &[nc.clone(), ins.clone()]);
+    assert_eq!(out, vec![sel(11, "CGG", "C", 0, 5, "nocall", ".", "2", ".", "."), sel(11, "C", "T", 0, 5, "nocall", ".", "2", "11", "0"),
+        ins.clone(), sel(13, "GC", "G", 1, 5, "absent", "0", ".", ".", ".")]);
+    assert_eq!((c.snp_only, c.reverts), (0, 0));
+    // Selphi's 0/1 for that deletion asserts an allele over the insertion's point: C1, resolved
+    // without the indel rows.
+    let f = fx(R, &[(11, "CGG", "C", 1, 5), (11, "C", "T", 0, 5), (13, "GC", "G", 1, 5)]);
+    let (out, c) = f.run(pol(), &[nc, ins.clone()]);
+    assert_eq!(out, vec![sel(11, "C", "T", 0, 5, "nocall", ".", "2", "11", "0"), ins]);
+    assert_eq!((c.snp_only, c.snp_only_indel_rows, c.reverts), (1, 2, 0));
+}
+
+#[test]
 fn star_alleles_structural_spans_and_unresolved_records_veto() {
     let f = fx(R, &[
         (21, "G", "T", 1, 5),  // inside a called `*` (AG at 20 with CG,* 1/2)
