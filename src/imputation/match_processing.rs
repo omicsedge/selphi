@@ -36,6 +36,10 @@ fn mp_freq_weight() -> bool {
     *V.get_or_init(|| crate::config::raw("SELPHI_MP_FREQ_WEIGHT").as_deref() != Some("0"))
 }
 
+/// Matches kept per variant by `process_matches` unless the panel calls for more
+/// (`imputation_pipeline::auto_calibrate_pbwt_params`).
+pub const KEPT_MATCHES: usize = 50;
+
 /// Process a PBWT match matrix into per-site haplotype lists.
 ///
 /// Processes PBWT match matrix into per-site haplotype lists.

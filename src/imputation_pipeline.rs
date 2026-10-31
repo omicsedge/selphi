@@ -35,7 +35,15 @@ pub(crate) struct PbwtParams {
     pub(crate) fl_bwd: usize,
     /// HMM effective population size.
     pub(crate) est_ne: i64,
+    /// Haplotypes kept per site from the scored PBWT matches (`match_processing::process_matches`).
+    pub(crate) kept_matches: usize,
 }
+
+/// From this many haplotypes up to biobank scale (`pbwt::AUTO_CAP_MIN_HAPS`), the copying HMM gets a wider
+/// candidate state: `LARGE_PANEL_FL_FWD` PBWT neighbours per site and `LARGE_PANEL_KEPT_MATCHES` kept matches.
+const LARGE_PANEL_HAPS: usize = 20_000;
+const LARGE_PANEL_FL_FWD: usize = 400;
+const LARGE_PANEL_KEPT_MATCHES: usize = 100;
 
 /// Resolve the PBWT match length, forward / backward candidate caps, and the
 /// HMM effective population size, honouring any explicit CLI overrides and
@@ -96,10 +104,20 @@ pub(crate) fn auto_calibrate_pbwt_params(
         ml.round().clamp(5.0, 10.0) as usize
     });
     let log2_haps = (n_ref as f64).log2();
+    // On the 75,552-haplotype panel the 2600/log2(n_ref) rule (160 neighbours) and 50 kept matches per site
+    // leave out haplotypes that copy the target as well as the kept ones. With 400 and 100 the six consumer
+    // arrays (22 autosomes, per-person R2 vs WGS) rose for every person, SNPs and indels, with internal
+    // phasing (+0.0003 / +0.0004) and with Beagle's phasing (+0.0003 / +0.0006), and the GIAB arrays rose
+    // on chr21 and chr1, for +2-5% CPU and +0.1-0.3 GB on six samples. On 1000 Genomes-size panels (4,802
+    // haplotypes) the same change makes the chain stickier (rare bins up, common down) and no Ne correction
+    // was a uniform win; on biobank panels the per-target HMM is the wall. Both keep the old values.
+    let large = (LARGE_PANEL_HAPS..selphi::imputation::pbwt::AUTO_CAP_MIN_HAPS).contains(&n_ref);
     let fl_fwd = fl_fwd_override.unwrap_or_else(|| {
+        if large { return LARGE_PANEL_FL_FWD; }
         let v = (2600.0 / log2_haps) as usize;
         v.clamp(100, 450)
     });
+    let kept_matches = if large { LARGE_PANEL_KEPT_MATCHES } else { selphi::imputation::match_processing::KEPT_MATCHES };
     let fl_bwd = fl_bwd_override.unwrap_or_else(|| {
         ((fl_fwd as f64 * 2.4 / log2_haps) as usize).max(13)
     });
@@ -124,7 +142,7 @@ pub(crate) fn auto_calibrate_pbwt_params(
     } else {
         est_ne_override
     };
-    PbwtParams { match_length, fl_fwd, fl_bwd, est_ne }
+    PbwtParams { match_length, fl_fwd, fl_bwd, est_ne, kept_matches }
 }
 
 /// Per-format batched-writer activity flags. Mirrors the `formats` struct
@@ -1408,10 +1426,10 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
     selphi_step!("Genetic map loaded + LD correction");
 
     // 7. Auto-calibrate parameters
-    let PbwtParams { match_length, fl_fwd, fl_bwd, est_ne } =
+    let PbwtParams { match_length, fl_fwd, fl_bwd, est_ne, kept_matches } =
         auto_calibrate_pbwt_params(args.match_length, args.fl_fwd, args.fl_bwd, args.est_ne, n_ref, n_chip);
-    selphi_debug!("  Match length: {}, fl_fwd: {}, fl_bwd: {}, Ne: {}",
-        match_length, fl_fwd, fl_bwd, est_ne);
+    selphi_debug!("  Match length: {}, fl_fwd: {}, fl_bwd: {}, Ne: {}, kept matches: {}",
+        match_length, fl_fwd, fl_bwd, est_ne, kept_matches);
 
     // 8. Compute imputation windows
     let windows = compute_imputation_windows(&chip_cm, args.window_cm, args.overlap_cm,
@@ -1687,7 +1705,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
         let t0_hmm = Instant::now();
         let hmm_params = selphi::imputation::window_process::WindowHmmParams {
             n_ref, n_haps, match_length, fl_fwd, fl_bwd,
-            est_ne: est_ne as f64, p_err, adapt_floor: args.p_err.is_none(), max_candidates,
+            est_ne: est_ne as f64, p_err, adapt_floor: args.p_err.is_none(), max_candidates, kept_matches,
             compute_posterior: wi + 1 < windows.len(),
             target_batch_size: target_batch_size_haps,
         };
