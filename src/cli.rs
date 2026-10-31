@@ -78,7 +78,10 @@ pub struct Args {
     pub calls_depth: Option<u32>,
 
     /// --calls: a PASS variant call whose FORMAT/GQ is below this goes to Selphi, at any
-    /// depth (default 0 = never).
+    /// depth (default 0 = never; a call without GQ never). Measured on 30x DeepVariant
+    /// chr22 (README): 15 with --calls-gq-scope all gains 22-46 SNPs over the default on
+    /// eight sets, but at depth 15-19 its indels fell below the default's beyond the seed
+    /// tolerance on four of seven, so it is not the default.
     #[arg(long, value_name = "G", requires = "calls")]
     pub calls_min_gq: Option<u32>,
 
