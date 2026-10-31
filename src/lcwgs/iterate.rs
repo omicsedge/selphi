@@ -1673,7 +1673,7 @@ pub fn run_gibbs_ensemble(
 }
 
 /// [`run_gibbs_ensemble`] with byte admission, the chunk's selection panel,
-/// passengers and sweep hub; `together`: the chains run at the same time
+/// passengers and sweep hub; `together`: how many chains run at the same time
 /// (see [`run_gibbs_ensemble_inner`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_gibbs_ensemble_with_memory(
@@ -1688,7 +1688,7 @@ pub(crate) fn run_gibbs_ensemble_with_memory(
     panel: Option<&PanelSide>,
     passengers: Option<&ChunkPassengers<'_>>,
     hub: Option<crate::sparse_ls::haplotype_set::HubMember>,
-    together: bool,
+    together: usize,
 ) -> GibbsOutput {
     run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, gibbs_chains(params), together,
         execution, panel, passengers, hub)
@@ -1742,16 +1742,16 @@ pub(crate) fn run_gibbs_ensemble_n(
     precomputed_cond: Option<&Vec<Vec<u32>>>,
     n_restarts: usize,
 ) -> GibbsOutput {
-    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, false,
+    run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, 1,
         SampleExecution::Unbudgeted, None, None, None)
 }
 
-/// `n_restarts` chains averaged. `together`: the chains run at the same time,
-/// each on its own thread, sweeping the chunk's panel through one sweep hub (each
-/// selection sweep's panel half decoded once for all when the panel's plan is
-/// segmented); else one after the other. Either way each chain's output is the
-/// same and the outputs are summed in chain order, so the average is the same
-/// bit for bit.
+/// `n_restarts` chains averaged, `together` of them at a time (each on its own
+/// thread, the group sweeping the chunk's panel through one sweep hub: each
+/// selection sweep's panel half is decoded once for the group when the panel's
+/// plan is segmented); `together` = 1: one after the other. Each chain's output
+/// is the same either way and the outputs are summed in chain order as they
+/// complete, so the average is the same bit for bit.
 #[allow(clippy::too_many_arguments)]
 fn run_gibbs_ensemble_inner(
     gl3: &[f32],
@@ -1762,50 +1762,49 @@ fn run_gibbs_ensemble_inner(
     k_max_override: Option<usize>,
     precomputed_cond: Option<&Vec<Vec<u32>>>,
     n_restarts: usize,
-    together: bool,
+    together: usize,
     execution: SampleExecution<'_>,
     panel: Option<&PanelSide>,
     passengers: Option<&ChunkPassengers<'_>>,
     hub: Option<crate::sparse_ls::haplotype_set::HubMember>,
 ) -> GibbsOutput {
+    use crate::sparse_ls::haplotype_set::{HubMember, SweepHub};
     let n_restarts = n_restarts.max(1);
     if n_restarts == 1 {
         return run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, execution, panel, passengers, hub);
     }
     // Several chains sweep with one another only, not with another pass.
     drop(hub);
-    let run = |i: usize, member: Option<crate::sparse_ls::haplotype_set::HubMember>| {
+    let run = |i: usize, member: Option<HubMember>| {
         let p = LcwgsParams { seed: chain_seed(params, i), ..params.clone() };
         run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, &p, k_max_override, precomputed_cond, execution, panel, passengers, member)
     };
-    let outs: Vec<GibbsOutput> = if together {
-        std::thread::scope(|scope| {
-            let mut members = crate::sparse_ls::haplotype_set::SweepHub::members(n_restarts).into_iter();
-            let first = members.next();
-            let run = &run;
-            let rest: Vec<_> = members.enumerate().map(|(j, m)| scope.spawn(move || run(j + 1, Some(m)))).collect();
-            let mut outs = vec![run(0, first)];
-            outs.extend(rest.into_iter().map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))));
-            outs
-        })
-    } else {
-        (0..n_restarts).map(|i| run(i, None)).collect()
-    };
-    let mean = |part: fn(&GibbsOutput) -> &[f32]| -> Vec<f32> {
-        let mut acc = vec![0.0f64; part(&outs[0]).len()];
-        for out in &outs {
-            for (a, &x) in acc.iter_mut().zip(part(out)) { *a += x as f64; }
+    // Dosage, GP, passenger dosage, passenger GP, summed in f64.
+    let mut sum: Vec<Vec<f64>> = Vec::new();
+    let mut add = |out: GibbsOutput| {
+        let parts = [out.dosage, out.gp, out.pass_dosage, out.pass_gp];
+        if sum.is_empty() { sum = parts.iter().map(|p| vec![0.0f64; p.len()]).collect(); }
+        for (acc, part) in sum.iter_mut().zip(&parts) {
+            for (a, &x) in acc.iter_mut().zip(part) { *a += x as f64; }
         }
-        let inv = 1.0 / n_restarts as f64;
-        acc.iter().map(|&a| (a * inv) as f32).collect()
     };
-    GibbsOutput {
-        dosage: mean(|o| &o.dosage),
-        gp: mean(|o| &o.gp),
-        cond_final: Vec::new(),
-        pass_dosage: mean(|o| &o.pass_dosage),
-        pass_gp: mean(|o| &o.pass_gp),
+    let group = together.clamp(1, n_restarts);
+    for first in (0..n_restarts).step_by(group) {
+        let last = (first + group).min(n_restarts);
+        if last - first == 1 { add(run(first, None)); continue; }
+        std::thread::scope(|scope| {
+            let mut members = SweepHub::members(last - first).into_iter();
+            let own = members.next();
+            let run = &run;
+            let rest: Vec<_> = (first + 1..last).zip(members).map(|(i, m)| scope.spawn(move || run(i, Some(m)))).collect();
+            add(run(first, own));
+            for h in rest { add(h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))); }
+        });
     }
+    let inv = 1.0 / n_restarts as f64;
+    let [dosage, gp, pass_dosage, pass_gp]: [Vec<f32>; 4] = sum.into_iter()
+        .map(|acc| acc.into_iter().map(|a| (a * inv) as f32).collect()).collect::<Vec<_>>().try_into().expect("four summed parts");
+    GibbsOutput { dosage, gp, cond_final: Vec::new(), pass_dosage, pass_gp }
 }
 
 /// Build the per-individual polymorphic/monomorphic split inputs for the phasing
@@ -2523,42 +2522,48 @@ mod tests {
         }
     }
 
-    /// A single sample's Gibbs chains run at the same time (each on its own thread,
+    /// A single sample's Gibbs chains run together (each on its own thread, a group
     /// sweeping the chunk's panel through one hub) average to the same bits as the
     /// same chains run one after the other, and that average is the chain-order mean
-    /// of the chains run alone at their seeds: two and three chains, the chunk's
-    /// segmented panel and each chain's own, with and without passengers, with and
-    /// without the small-panel profile (its seeds and no rare-carrier augmentation).
+    /// of the chains run alone at their seeds: two and three chains in groups of two
+    /// and three, the chunk's segmented panel and each chain's own, with and without
+    /// passengers, the small-panel profile (rank-order cap, its seeds, no rare-carrier
+    /// augmentation) and the old conditioning, a poly axis long enough for the
+    /// two-pass kernels, and an allowance so small that every task runs alone.
     #[test]
     fn chains_together_match_chains_one_after_the_other() {
         use crate::lcwgs::hmm::reference_pack as rp;
+        use super::super::faithful_select::{CapOrder, CapPlan};
         let _serial = crate::lcwgs::hmm::two_pass::TASK_BLOCKS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut rng = rp::Xs(0x510E_527F_ADE6_82D1);
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-        for &(n_var, n_haps, n_pass, seg) in &[(900usize, 1600usize, 0usize, 4usize), (700, 2200, 60, 9)] {
-            let (full, cm, ins, pcm, gl3) = passenger_fixture(&mut rng, n_var, n_haps, 1, n_pass, false, false);
+        let configs: &[(usize, usize, usize, usize, bool)] = &[(900, 1600, 0, 4, false), (700, 2200, 60, 9, false), (4600, 300, 40, 6, true)];
+        for &(n_var, n_haps, n_pass, seg, common) in configs {
+            let (full, cm, ins, pcm, gl3) = passenger_fixture(&mut rng, n_var, n_haps, 1, n_pass, common, false);
             let bm = HaplotypeBitmatrix::from_subset(&full, &(0..n_var + n_pass).collect::<Vec<_>>()).with_hidden_tail(n_var);
             let panel: PanelSide = std::sync::Arc::new(super::super::faithful_select::FaithfulPanel::build_segmented_commons(
                 &bm, &cm, &LcwgsParams::default(), seg));
             let pass = ChunkPassengers { ins: ins.clone(), cm: &pcm };
             let pass = (n_pass > 0).then_some(&pass);
-            let budget = super::super::memory::MemoryBudget::new(512 * 1024 * 1024, 1024);
-            let exec = SampleExecution::Admitted(&budget);
-            for small_profile in [false, true] {
-                let params = LcwgsParams { n_iterations: 6, n_main_iterations: 4, kpbwt: 60, pbwt_modulo_cm: 0.004, small_profile, ..Default::default() };
-                for (n, pnl) in [(2, Some(&panel)), (3, Some(&panel)), (2, None)] {
+            for (budget, small_profile) in [(512 << 20, true), (512 << 20, false), (1 << 20, true)] {
+                let budget = super::super::memory::MemoryBudget::new(budget, 1024).lenient();
+                let exec = SampleExecution::Admitted(&budget);
+                let params = LcwgsParams { n_iterations: 6, n_main_iterations: 4, kpbwt: 60, pbwt_modulo_cm: 0.004, small_profile,
+                    cap: small_profile.then(|| CapPlan::rank_only(CapOrder::G2)), ..Default::default() };
+                for (n, group, pnl) in [(2, 2, Some(&panel)), (3, 2, Some(&panel)), (3, 3, Some(&panel)), (2, 2, None)] {
                     let run = |together| run_gibbs_ensemble_inner(&gl3, &bm, &cm, 1, &params, None, None, n, together, exec, pnl, pass, None);
-                    let (serial, together) = (run(false), run(true));
+                    let (serial, together) = (run(1), run(group));
+                    let what = format!("n_var={n_var} chains={n} group={group} small={small_profile} panel={} budget={}", pnl.is_some(), budget.work_limit());
                     for (name, x, y) in [("dosage", &serial.dosage, &together.dosage), ("gp", &serial.gp, &together.gp),
                         ("passenger dosage", &serial.pass_dosage, &together.pass_dosage), ("passenger gp", &serial.pass_gp, &together.pass_gp)] {
-                        assert_eq!(bits(x), bits(y), "{name} n_var={n_var} chains={n} small={small_profile} panel={}", pnl.is_some());
+                        assert_eq!(bits(x), bits(y), "{name} {what}");
                     }
                     let alone: Vec<_> = (0..n).map(|i| run_gibbs_with_memory(&gl3, &bm, &cm, 1,
                         &LcwgsParams { seed: chain_seed(&params, i), ..params.clone() }, None, None, exec, pnl, pass, None)).collect();
                     let mean: Vec<f32> = (0..serial.dosage.len())
                         .map(|j| (alone.iter().fold(0.0f64, |a, o| a + o.dosage[j] as f64) / n as f64) as f32).collect();
-                    assert_eq!(bits(&mean), bits(&together.dosage), "chain mean n_var={n_var} chains={n} small={small_profile}");
-                    assert_ne!(bits(&alone[0].dosage), bits(&alone[1].dosage), "the chains differ");
+                    assert_eq!(bits(&mean), bits(&together.dosage), "chain mean {what}");
+                    assert_ne!(bits(&alone[0].dosage), bits(&alone[1].dosage), "the chains differ {what}");
                 }
             }
         }
