@@ -33,21 +33,25 @@ const SHORT_RUN: usize = 16;
 /// A decoded segment keeps every this-many-th column output in full (see
 /// [`Node`]) when a column is larger than [`KEEP_ALL_BYTES`].
 const CHECKPOINT_EVERY: usize = 8;
-/// Columns up to this size are all kept when a segment's columns take at
-/// most [`KEEP_ALL_SEGMENT_BYTES`]: the copy is cheap, and the target half then
+/// Columns up to this size are all kept when the longest segment has at most
+/// [`KEEP_ALL_COLUMNS`] of them: the copy is cheap, and the target half then
 /// reads every entry directly instead of tracing it back.
 const KEEP_ALL_BYTES: usize = 64 * 1024;
-const KEEP_ALL_SEGMENT_BYTES: usize = 8 << 20;
+/// A segment ends only where a common site follows a common site, so it can
+/// run past its `SEGMENT_COMMONS` target (135-144 columns measured on 1000
+/// Genomes chunks); [`SegmentPlan::bytes`] charges this many kept columns.
+const KEEP_ALL_COLUMNS: usize = 2 * SEGMENT_COMMONS;
+
+/// Whether a panel's columns are small enough to keep them all.
+fn small_columns(n_ref: usize) -> bool { n_ref * if narrow(n_ref) { 2 } else { 4 } <= KEEP_ALL_BYTES }
 
 /// The column outputs a decoded segment keeps in full: every one for a
-/// panel whose columns are small, while the longest of `max_commons` columns
-/// stays within [`KEEP_ALL_SEGMENT_BYTES`] (common sites that alternate with
-/// rare ones leave no segment boundary), else every [`CHECKPOINT_EVERY`]-th (a
-/// biobank panel's column is hundreds of KB, and copying it made the decode
+/// panel with small columns whose longest segment (`max_commons` columns) is
+/// within the charged [`KEEP_ALL_COLUMNS`], else every [`CHECKPOINT_EVERY`]-th
+/// (a biobank panel's column is hundreds of KB, and copying it made the decode
 /// memory-bound).
 fn checkpoint_every(n_ref: usize, max_commons: usize) -> usize {
-    let column = n_ref * if narrow(n_ref) { 2 } else { 4 };
-    if column <= KEEP_ALL_BYTES && max_commons.saturating_mul(column) <= KEEP_ALL_SEGMENT_BYTES { 1 } else { CHECKPOINT_EVERY }
+    if small_columns(n_ref) && max_commons <= KEEP_ALL_COLUMNS { 1 } else { CHECKPOINT_EVERY }
 }
 
 /// The panel-side state of the sequential sweep on entering site `k`.
@@ -115,7 +119,8 @@ impl SegmentPlan {
         let in_flight = LOOKAHEAD + 1;
         // Boundary arrays, and per decoded segment its kept arrays and the two
         // arrays its decoder carries (see `Node`).
-        let arrays = sites / SEGMENT_COMMONS + 1 + in_flight * (SEGMENT_COMMONS.div_ceil(checkpoint_every(n_ref, SEGMENT_COMMONS)) + 2);
+        let kept = if small_columns(n_ref) { KEEP_ALL_COLUMNS } else { SEGMENT_COMMONS.div_ceil(CHECKPOINT_EVERY) };
+        let arrays = sites / SEGMENT_COMMONS + 1 + in_flight * (kept + 2);
         let id = if narrow(n_ref) { 2 } else { 4 };
         arrays * n_ref * id + in_flight * SEGMENT_COMMONS * (words(n_ref) * 12 + 64 + 1024 * 4)
     }

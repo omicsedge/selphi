@@ -61,7 +61,8 @@ pub(crate) fn with_membership<R>(n: usize, f: impl FnOnce(&mut Membership) -> R)
         let mut bits = std::mem::take(&mut *scratch.borrow_mut());
         bits.reset(n);
         let result = f(&mut bits);
-        trim_vec(&mut bits.words, CACHE_BYTES_PER_WORKER);
+        // A chain pool's worker keeps nothing (see `memory::is_chain_worker`).
+        trim_vec(&mut bits.words, if super::memory::is_chain_worker() { 0 } else { CACHE_BYTES_PER_WORKER });
         *scratch.borrow_mut() = bits;
         result
     })

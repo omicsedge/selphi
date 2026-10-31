@@ -311,8 +311,9 @@ thread_local! {
 }
 
 /// Whether this thread is a worker of a chain pool: such workers keep no
-/// kernel scratch between calls (`hmm::TrimCaches`), since the run's chain
-/// pools hold many more workers than the retained caches are charged for.
+/// scratch between calls (`hmm::TrimCaches`, `membership::with_membership`),
+/// since the run's chain pools hold many more workers than the retained caches
+/// are charged for.
 pub(crate) fn is_chain_worker() -> bool { CHAIN_WORKER.with(std::cell::Cell::get) }
 
 /// This thread's chain pool (see [`run_chunks`]): the native threads a chain
@@ -356,10 +357,12 @@ pub(crate) fn collect_chain_pool() {
 
 /// A Gibbs chain's own pool (see [`run_chunks`]): `threads` compute workers
 /// and one for the chain's coordinator, which runs its loop there and waits
-/// on it while its sample threads work. `None` when it cannot be built (the
-/// chain then runs in the global pool, as before).
+/// on it while its sample threads work. Default stacks (the coordinator ran on
+/// a native thread's before; the global pool's 16 MB serve CRAM decoding):
+/// a run's chain pools reserve 2 MB of address space per worker. `None` when
+/// the pool cannot be built (the chain then runs in the global pool, as before).
 pub(crate) fn new_chain_pool(threads: usize) -> Option<Arc<rayon::ThreadPool>> {
-    rayon::ThreadPoolBuilder::new().num_threads(threads + 1).stack_size(16 << 20)
+    rayon::ThreadPoolBuilder::new().num_threads(threads + 1)
         .thread_name(|i| format!("lcwgs-chain-{i}"))
         .start_handler(|_| CHAIN_WORKER.with(|w| w.set(true)))
         .build().ok().map(Arc::new)
