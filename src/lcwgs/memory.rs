@@ -228,7 +228,7 @@ impl MemoryBudget {
     }
 
     fn work(&self, bytes: usize) -> Permit<'_> {
-        assert!(rayon::current_thread_index().is_none(), "memory admission must run outside Rayon");
+        assert!(admission_thread(), "memory admission must run outside Rayon");
         assert!(!self.strict || bytes <= self.work_limit(),
             "one lcWGS sample exceeds the work allowance; increase LCWGS_MEM_BUDGET_GB");
         let mut used = self.usage.lock().unwrap();
@@ -268,7 +268,7 @@ impl MemoryBudget {
     /// The permit [`Self::run`] would wait for, when it can be granted at once
     /// without overtaking a waiting request; `None` otherwise.
     pub fn try_permit(&self, bytes: usize) -> Option<Permit<'_>> {
-        assert!(rayon::current_thread_index().is_none(), "memory admission must run outside Rayon");
+        assert!(admission_thread(), "memory admission must run outside Rayon");
         assert!(!self.strict || bytes <= self.work_limit(),
             "one lcWGS sample exceeds the work allowance; increase LCWGS_MEM_BUDGET_GB");
         let mut used = self.usage.lock().unwrap();
@@ -303,7 +303,15 @@ impl Drop for Permit<'_> {
     }
 }
 
+/// Whether this thread may wait for memory: not a Rayon worker, unless it
+/// stands in for a sample thread the OS refused ([`map_samples`]).
+fn admission_thread() -> bool {
+    rayon::current_thread_index().is_none() || STANDS_IN.with(std::cell::Cell::get)
+}
+
 thread_local! {
+    /// This thread runs the samples of a [`map_samples`] that got no native thread.
+    static STANDS_IN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The pool of the Gibbs chain this thread works for (see [`run_chunks`]).
     static CHAIN_POOL: std::cell::RefCell<Option<Arc<ChainPool>>> = const { std::cell::RefCell::new(None) };
     /// This thread is a worker of a chain pool ([`new_chain_pool`]).
@@ -355,55 +363,22 @@ pub(crate) fn collect_chain_pool() {
     }
 }
 
-/// Compute workers the live chain pools hold together, per thread of the run.
-const CHAIN_WORKER_BUDGET: usize = 8;
-/// Compute workers a chain gets at least (its two concurrent passes and a
-/// block task), budget or not.
-const CHAIN_MIN_WORKERS: usize = 3;
-/// Compute workers held by the live chain pools.
-static CHAIN_WORKERS: AtomicUsize = AtomicUsize::new(0);
+/// A Gibbs chain's own pool (see [`run_chunks`]).
+pub(crate) struct ChainPool { pool: rayon::ThreadPool }
 
-/// A Gibbs chain's own pool (see [`run_chunks`]) and the compute workers it
-/// holds of the run's budget.
-pub(crate) struct ChainPool { pool: rayon::ThreadPool, workers: usize }
-
-impl Drop for ChainPool {
-    fn drop(&mut self) { CHAIN_WORKERS.fetch_sub(self.workers, Ordering::Relaxed); }
-}
-
-/// The compute workers of a new chain pool when the live ones hold `live`:
-/// the run's `threads` while the budget allows (the first chains, which are
-/// the largest chunks), then what is left of it, and at least
-/// [`CHAIN_MIN_WORKERS`] (or `threads`, when fewer).
-fn chain_share(threads: usize, live: usize) -> usize {
-    threads.min((CHAIN_WORKER_BUDGET * threads).saturating_sub(live)).max(CHAIN_MIN_WORKERS.min(threads))
-}
-
-/// A Gibbs chain's own pool: its share of compute workers ([`chain_share`]:
-/// the live pools together hold at most eight per thread of the run, beyond
-/// which each further chain gets three) and one for the chain's coordinator,
-/// which runs its loop there and waits on it while its sample threads work.
-/// Default stacks (the coordinator ran on a native thread's before; the global
-/// pool's 16 MB serve CRAM decoding). `None` when the pool cannot be built (the
-/// chain then runs in the global pool, as before).
+/// A Gibbs chain's own pool: its share of compute workers (the live pools
+/// together hold at most eight per thread of the run, beyond which each further
+/// chain gets three; see `threads::ThreadBudget::chain_pool`) and one for the
+/// chain's coordinator, which runs its loop there and waits on it while its
+/// sample threads work. Default stacks (the coordinator ran on a native thread's
+/// before; the global pool's 16 MB serve CRAM decoding). `None` when the
+/// process's thread limits leave no room for it or a thread is refused (the
+/// chain then runs where it was asked for, as before the pools).
 pub(crate) fn new_chain_pool(threads: usize) -> Option<Arc<ChainPool>> {
-    let threads = threads.max(1);
-    let mut live = CHAIN_WORKERS.load(Ordering::Relaxed);
-    let workers = loop {
-        let w = chain_share(threads, live);
-        match CHAIN_WORKERS.compare_exchange_weak(live, live + w, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break w,
-            Err(now) => live = now,
-        }
-    };
-    let built = rayon::ThreadPoolBuilder::new().num_threads(workers + 1)
+    let builder = rayon::ThreadPoolBuilder::new()
         .thread_name(|i| format!("lcwgs-chain-{i}"))
-        .start_handler(|_| CHAIN_WORKER.with(|w| w.set(true)))
-        .build();
-    match built {
-        Ok(pool) => Some(Arc::new(ChainPool { pool, workers })),
-        Err(_) => { CHAIN_WORKERS.fetch_sub(workers, Ordering::Relaxed); None }
-    }
+        .start_handler(|_| CHAIN_WORKER.with(|w| w.set(true)));
+    super::threads::global().chain_pool(threads, builder).map(|(pool, _)| Arc::new(ChainPool { pool }))
 }
 
 /// Return pages on the allocating worker before its allowance can be reused.
@@ -413,7 +388,9 @@ pub(crate) fn collect_local() {
 }
 
 /// Bounded native coordinators keep permit waits off the compute pool. The
-/// result order is the input order even when tasks finish out of order.
+/// result order is the input order even when tasks finish out of order. When
+/// the OS starts none of them, this thread does the samples itself (a chain's
+/// coordinator, whose pool has a thread of its own for it, or a native thread).
 pub(crate) fn map_samples<T: Send>(
     n: usize, workers: usize, f: impl Fn(usize) -> T + Sync,
 ) -> Vec<T> {
@@ -421,16 +398,26 @@ pub(crate) fn map_samples<T: Send>(
     let next = AtomicUsize::new(0);
     let output = Mutex::new((0..n).map(|_| None).collect::<Vec<_>>());
     let pool = chain_pool();
+    let work = |pool: Option<Arc<ChainPool>>| with_chain_pool(pool, || loop {
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        if i >= n { break; }
+        let value = f(i);
+        output.lock().unwrap()[i] = Some(value);
+        collect_local();
+    });
     std::thread::scope(|scope| {
+        let mut started = 0;
         for _ in 0..n.min(workers.max(1)) {
-            let (f, next, output, pool) = (&f, &next, &output, pool.clone());
-            scope.spawn(move || with_chain_pool(pool, || loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= n { break; }
-                let value = f(i);
-                output.lock().unwrap()[i] = Some(value);
-                collect_local();
-            }));
+            let (work, pool) = (&work, pool.clone());
+            started += super::threads::global().spawn_scoped(scope, "lcwgs-sample", move || work(pool)).is_ok() as usize;
+        }
+        if started == 0 {
+            struct Restore(bool);
+            impl Drop for Restore {
+                fn drop(&mut self) { STANDS_IN.with(|s| s.set(self.0)); }
+            }
+            let _restore = Restore(STANDS_IN.with(|s| s.replace(true)));
+            work(pool);
         }
     });
     output.into_inner().unwrap().into_iter().map(Option::unwrap).collect()
@@ -447,13 +434,20 @@ pub(crate) fn map_samples<T: Send>(
 /// and a chain's coordinator, waiting in a join, could run the other SPLIT
 /// chain on its stack and wait for it there at their next selection sweep.
 /// Which thread runs a job does not change any result.
-pub(crate) fn run_chunks<T: Send>(
-    costs: &[usize], budget: &MemoryBudget, max_live: usize, threads: usize,
+pub(crate) fn run_chunks<'b, T: Send>(
+    costs: &[usize], budget: &'b MemoryBudget, max_live: usize, threads: usize,
     process: impl Fn(usize) -> T + Sync, mut merge: impl FnMut(usize, T),
 ) {
     use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel();
+    // A chunk's chain, run by its coordinator thread (or by this one).
+    let run_one = |c: usize, permit: Permit<'b>| {
+        let pool = new_chain_pool(threads);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| in_chain_pool(pool, || process(c))));
+        collect_local();
+        let _ = tx.send((c, result, permit));
+    };
     std::thread::scope(|scope| {
-        let (tx, rx) = mpsc::channel();
         let mut pending: Vec<_> = (0..costs.len()).collect();
         pending.sort_by_key(|&i| std::cmp::Reverse(costs[i]));
         let mut live = 0;
@@ -462,15 +456,27 @@ pub(crate) fn run_chunks<T: Send>(
             while live < max_live.max(1) && i < pending.len() {
                 let c = pending[i];
                 if let Some(permit) = budget.try_chunk_for(c, costs[c]) {
-                    pending.remove(i);
-                    live += 1;
-                    let (tx, process) = (tx.clone(), &process);
-                    scope.spawn(move || {
-                        let pool = new_chain_pool(threads);
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| in_chain_pool(pool, || process(c))));
-                        collect_local();
-                        let _ = tx.send((c, result, permit));
-                    });
+                    // The permit comes back here when the OS starts no coordinator.
+                    let held = Arc::new(Mutex::new(Some(permit)));
+                    let (run_one, mine) = (&run_one, held.clone());
+                    let started = super::threads::global().spawn_scoped(scope, "lcwgs-chunk", move || {
+                        let permit = mine.lock().unwrap().take().expect("the chunk's permit");
+                        run_one(c, permit)
+                    }).is_ok();
+                    if started {
+                        pending.remove(i);
+                        live += 1;
+                    } else if live == 0 {
+                        // Refused with nothing live: this thread runs the chunk.
+                        let permit = held.lock().unwrap().take().expect("a refused closure never runs");
+                        pending.remove(i);
+                        live += 1;
+                        run_one(c, permit);
+                    } else {
+                        // Refused: wait for a live chunk before asking again.
+                        drop(held);
+                        break;
+                    }
                 } else { i += 1; }
             }
             assert!(live > 0, "no lcWGS chunk fits its memory allowance");
@@ -746,21 +752,20 @@ mod tests {
         assert_eq!(seen.len(), 8);
     }
 
-    /// The first chains get the run's thread count, later ones what is left of
-    /// eight per thread, and every chain at least three compute workers (or
-    /// the run's thread count, when fewer).
+    /// When the OS starts no chunk coordinator and no sample thread, the
+    /// asking threads do the work: the chunks on this thread one at a time, a
+    /// chain's samples on its coordinator (a chain-pool worker, which may then
+    /// wait for memory), with the same results.
     #[test]
-    fn chain_pools_share_a_bounded_worker_budget() {
-        assert_eq!(chain_share(16, 0), 16);
-        assert_eq!(chain_share(16, 112), 16);
-        assert_eq!(chain_share(16, 118), 10);
-        assert_eq!(chain_share(16, 128), 3);
-        assert_eq!(chain_share(16, 500), 3);
-        assert_eq!(chain_share(2, 16), 2);
-        assert_eq!(chain_share(1, 0), 1);
-        assert_eq!(chain_share(1, 7), 1);
-        let pool = new_chain_pool(2).expect("a pool");
-        assert!(pool.pool.current_num_threads() >= 2, "a compute worker beside the coordinator");
+    fn refused_coordinators_and_sample_threads_run_on_the_asking_thread() {
+        let budget = MemoryBudget::new(1 << 30, 0);
+        let me = std::thread::current().id();
+        let mut got = Vec::new();
+        super::super::threads::refusing(|| run_chunks(&[3, 2, 1], &budget, 3, 2, |c| {
+            assert!(chain_pool().is_some() || std::thread::current().id() == me);
+            super::super::threads::refusing(|| map_samples(3, 2, |s| budget.run(1 << 10, || c * 10 + s)))
+        }, |c, v| got.push((c, v))));
+        assert_eq!(got, vec![(0, vec![0, 1, 2]), (1, vec![10, 11, 12]), (2, vec![20, 21, 22])]);
     }
 
     #[test]

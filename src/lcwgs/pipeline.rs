@@ -1619,7 +1619,8 @@ fn run_chunked_gibbs(
         .map(|(&sites, &two)| chunk_state_bytes_chains(sites, n_ref, n_samples, if two { 2 } else { 1 })).collect();
     let pool = (single_sample && selector && explicit_budget.is_none() && plan.iter().flatten().count() > 1
         && !crate::config::present("LCWGS_NO_PANEL_AHEAD"))
-        .then(|| rayon::ThreadPoolBuilder::new().num_threads(1).stack_size(16 << 20).thread_name(|_| "panel-ahead".into()).build().ok())
+        .then(|| super::threads::global().helper_pool(threads, 1,
+            rayon::ThreadPoolBuilder::new().stack_size(16 << 20).thread_name(|_| "panel-ahead".into())))
         .flatten();
     let ahead: Option<PanelAhead> = pool.zip(memory.as_ref()).map(|(pool, budget)| {
         let mut order: Vec<usize> = (0..n_chunks).filter(|&c| plan[c].is_some()).collect();
@@ -1647,7 +1648,7 @@ fn run_chunked_gibbs(
             if let Some(claim) = ahead.as_ref().and_then(|a| a.claim_next(c)) {
                 let a = ahead.as_ref().unwrap();
                 // A failed spawn drops the claim (the slot goes back to Empty).
-                let _ = std::thread::Builder::new().name("panel-ahead".into()).spawn_scoped(ahead_scope, move || a.build(claim));
+                let _ = super::threads::global().spawn_scoped(ahead_scope, "panel-ahead", move || a.build(claim));
             }
 
             let (core_start, core_end) = (core.start, core.end);
@@ -1698,7 +1699,7 @@ fn run_chunked_gibbs(
             // output either way.
             let deep = deep_params.as_ref().unwrap_or(params);
             let concurrent = chunk_concurrent[c] && split_band.is_some() && panel.as_ref().is_some_and(|p| p.has_parallel_plan());
-            let (mut out, out_deep) = if let (true, Some((_, _, deep_k))) = (concurrent, split_band) {
+            let together = if let (true, Some((_, _, deep_k))) = (concurrent, split_band) {
                 let mut members = crate::sparse_ls::haplotype_set::SweepHub::members(2).into_iter();
                 let (main_member, deep_member) = (members.next(), members.next());
                 let (pnl, cp) = (panel.as_ref(), chunk_pass.as_ref());
@@ -1706,18 +1707,20 @@ fn run_chunked_gibbs(
                 // The deep chain works in a pool of its own (see `memory::run_chunks`).
                 let pool = super::memory::new_chain_pool(threads);
                 std::thread::scope(|scope| {
-                    let deep_run = scope.spawn(move || super::memory::in_chain_pool(pool, || super::iterate::run_gibbs_ensemble_with_memory(
-                        chunk_gl3, bm, chunk_cm, n_samples, deep, Some(deep_k), None, execution, pnl, cp, deep_member)));
+                    // When the OS starts no thread for it, the passes run one after the other below.
+                    let deep_run = super::threads::global().spawn_scoped(scope, "lcwgs-split", move || super::memory::in_chain_pool(pool, || super::iterate::run_gibbs_ensemble_with_memory(
+                        chunk_gl3, bm, chunk_cm, n_samples, deep, Some(deep_k), None, execution, pnl, cp, deep_member))).ok()?;
                     let out = super::iterate::run_gibbs_ensemble_with_memory(
                         chunk_gl3, bm, chunk_cm, n_samples, params, None, None, execution, pnl, cp, main_member);
-                    (out, Some(deep_run.join().unwrap_or_else(|e| std::panic::resume_unwind(e))))
+                    Some((out, Some(deep_run.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))))
                 })
-            } else {
+            } else { None };
+            let (mut out, out_deep) = together.unwrap_or_else(|| {
                 let out = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, None, chrwide_cond.as_ref(), execution, panel.as_ref(), chunk_pass.as_ref(), None);
                 let out_deep = split_band.map(|(_, _, deep_k)| super::iterate::run_gibbs_ensemble_with_memory(
                     chunk_gl3, &chunk_bm, chunk_cm, n_samples, deep, Some(deep_k), chrwide_cond.as_ref(), execution, panel.as_ref(), chunk_pass.as_ref(), None));
                 (out, out_deep)
-            };
+            });
             drop(panel);
             if let (Some((lo, hi, _)), Some(out_deep)) = (split_band, out_deep) {
                 let n_ref = chunk_bm.n_haps;

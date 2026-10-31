@@ -875,9 +875,10 @@ impl TargetHaplotypeSet {
             // consumers) waiting for it: dropped before the scope joins them.
             let guard = FailOnUnwind(session);
             if me == 0 {
+                // A decoder the OS does not start is not needed: the consumers decode what nobody claimed.
                 for _ in 0..DECODERS.min(n_seg.saturating_sub(1)) {
                     let p3 = &p3;
-                    scope.spawn(move || session.run_decoder(rhs, m, plan, p3));
+                    let _ = crate::lcwgs::threads::global().spawn_scoped(scope, "lcwgs-decode", move || session.run_decoder(rhs, m, plan, p3));
                 }
             }
 
