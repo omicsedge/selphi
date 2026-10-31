@@ -749,11 +749,11 @@ pub fn run_multi_chr(
             ).expect("Failed to setup BCF writer")
         } else {
             selphi::io::pipeline::setup_vcf_writer(
-                n_samples, &sample_names, all_contig_fields, version, &out_file, config.no_ap, config.gp, &config.header_lines,
+                &sample_names, all_contig_fields, version, &out_file, config.no_ap, config.gp, &config.header_lines,
             ).expect("Failed to setup VCF writer")
         }
     } else {
-        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        let (tx, _rx) = selphi::io::pipeline::output_queue(1);
         let handle = std::thread::spawn(|| Ok(()));
         (tx, handle, ())
     };

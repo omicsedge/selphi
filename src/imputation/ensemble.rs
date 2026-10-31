@@ -29,13 +29,15 @@
 
 use crate::common::HaplotypeBitmatrix;
 use crate::imputation::hmm::CsrWeights;
-use crate::imputation::window_process::{ImputeWindowInputs, WindowHmmParams, impute_window};
+use crate::imputation::window_process::{ImputeWindowInputs, WindowHmmParams, WeightsOut, impute_window};
+use rayon::prelude::*;
 
-/// Hap-batch size used when re-running a member's window. The member's weights
+/// Hap-batch size used when re-running a stacked member's window (several blocks,
+/// whose adds into one sample must keep block order). The member's weights
 /// are folded into the running sum one batch at a time, so the peak holds the
 /// running sum plus ~this many haps rather than a second full weight-set.
 /// Output is independent of it: per-target HMM weights do not depend on the
-/// batch they were computed in.
+/// batch they were computed in. A one-block member folds each sample as it is done.
 const STREAM_CHUNK: usize = 256;
 
 /// How many phase-ensemble members to average, given the cohort size.
@@ -231,7 +233,10 @@ fn blend_row(l: &CsrWeights, lr: usize, r: &CsrWeights, rr: usize, t: f32, out: 
 /// `sum_csr_into` with row `r` of the addend taken from `src(r)`: one merge pass, no
 /// intermediate matrix. The aligned fold reads each row from the member's own haplotype
 /// or from its partner, so a swapped member costs nothing beyond the sum itself. Rows are
-/// read into two reused scratch buffers (it used to collect a fresh Vec per row).
+/// read into two reused scratch buffers (it used to collect a fresh Vec per row). The sum is
+/// merged into room for both operands and copied out at its size unless that room is nearly
+/// full (`exact_size`): every haplotype's sum is held until the window is written, and the
+/// room (as the result, before) was held, mostly unused, as long.
 fn sum_rows_into<'b>(a: &CsrWeights, src: impl Fn(usize) -> AddRow<'b>) -> CsrWeights {
     let n_rows = a.n_rows;
     let n_cols = a.n_cols;
@@ -259,7 +264,13 @@ fn sum_rows_into<'b>(a: &CsrWeights, src: impl Fn(usize) -> AddRow<'b>) -> CsrWe
         for &(c, v) in &ib[k..] { indices.push(c); data.push(v); }
         indptr.push(indices.len() as i32);
     }
-    CsrWeights { indptr, indices, data, n_rows, n_cols }
+    CsrWeights { indptr, indices: exact_size(indices), data: exact_size(data), n_rows, n_cols }
+}
+
+/// `v` within an eighth of its size: kept when its room is that full (operands sharing few
+/// columns), else copied out at its exact size.
+fn exact_size<T: Copy>(v: Vec<T>) -> Vec<T> {
+    if v.len() >= v.capacity() - v.capacity() / 8 { v } else { v.as_slice().to_vec() }
 }
 
 /// Everything a member's window re-run needs that is shared with member 0.
@@ -388,9 +399,8 @@ fn fold_window_shared(
     if members.is_empty() { return; }
     let n_haps = params.n_haps;
     let mut params_m = params.clone();
-    params_m.target_batch_size = STREAM_CHUNK;
-    let mut fold = PairFold::new(ctx);
     let mut count = 1usize;
+    let fold = PairFold::new(ctx);
     for sc in members.iter_mut() {
         let Member { targ_bm, candidates, final_ne_per_site, carry, n_blocks, site_conf_per_sample } = sc;
         let mut inputs_m = member_inputs(targ_bm, final_ne_per_site.as_deref(),
@@ -399,20 +409,55 @@ fn fold_window_shared(
         params_m.n_haps = n_haps * *n_blocks;
         let cand = candidates.as_ref();
         let targ_k: &HaplotypeBitmatrix = targ_bm;
+        count += *n_blocks;
+        // Member 0's running sums, one lock per sample: a task folds a sample under its lock.
+        let sums: Vec<std::sync::Mutex<&mut [Vec<(usize, CsrWeights)>]>> =
+            all_weights.chunks_mut(2).map(std::sync::Mutex::new).collect();
+        if *n_blocks == 1 {
+            // Each sample of member 0 takes exactly one add: it is folded as soon as both its
+            // haplotypes are done, on the worker that finished the second, and the member runs
+            // as one batch, so no batch waits for its slowest target.
+            params_m.target_batch_size = 0;
+            let halves: Vec<std::sync::Mutex<Option<Vec<(usize, CsrWeights)>>>> =
+                (0..sums.len()).map(|_| std::sync::Mutex::new(None)).collect();
+            let sink = |t: usize, w: Vec<(usize, CsrWeights)>| {
+                let s = t / 2;
+                let other = {
+                    let mut half = halves[s].lock().unwrap();
+                    match half.take() {
+                        Some(o) => o,
+                        None => { *half = Some(w); return; }
+                    }
+                };
+                let (w0, w1) = if t % 2 == 0 { (&w, &other) } else { (&other, &w) };
+                fold.add(&mut sums[s].lock().unwrap(), s, s, &w0[0].1, &w1[0].1, targ_k);
+            };
+            let _ = impute_window(&inputs_m, &params_m, cand, carry, WeightsOut::Each(&sink));
+            debug_assert!(halves.iter().all(|h| h.lock().unwrap().is_none()), "a haplotype without its partner");
+            continue;
+        }
+        params_m.target_batch_size = STREAM_CHUNK;
         let mut accumulate = |bstart: usize, bend: usize, refs: &[&CsrWeights]|
          -> std::io::Result<()> {
             // Batches hold whole samples: the batch size is even and starts on a sample.
             // Haplotype `hk` of a stacked member is block `hk / n_haps`'s copy of `hk % n_haps`;
             // batches arrive in order, so each haplotype's blocks are added in block order.
+            // Samples are folded in parallel; a sample with several blocks in the batch has
+            // them added in that order by one task (the stable sort keeps them in order).
             debug_assert!(bstart % 2 == 0 && (bend - bstart) % 2 == 0);
-            for j in (0..bend - bstart).step_by(2) {
-                let hk = bstart + j;
-                fold.add(all_weights, hk % n_haps, hk / 2, refs[j], refs[j + 1], targ_k);
-            }
+            let mut pairs: Vec<(usize, usize)> = (0..bend - bstart).step_by(2)
+                .map(|j| (((bstart + j) % n_haps) / 2, j)).collect();
+            pairs.sort_by_key(|&(s, _)| s);
+            pairs.chunk_by(|x, y| x.0 == y.0).collect::<Vec<_>>().into_par_iter().for_each(|grp| {
+                let s = grp[0].0;
+                let mut sum = sums[s].lock().unwrap();
+                for &(_, j) in grp {
+                    fold.add(&mut sum, s, (bstart + j) / 2, refs[j], refs[j + 1], targ_k);
+                }
+            });
             Ok(())
         };
-        let _ = impute_window(&inputs_m, &params_m, cand, carry, Some(&mut accumulate));
-        count += *n_blocks;
+        let _ = impute_window(&inputs_m, &params_m, cand, carry, WeightsOut::Batches(&mut accumulate));
     }
     divide(all_weights, count);
 }
@@ -433,7 +478,7 @@ pub fn impute_with_members(
     // classes are computed once.
     let classes = super::window_process::WindowClasses::default();
     let inputs0 = ImputeWindowInputs { allele_classes: Some(&classes), ..*inputs };
-    let mut out = impute_window(&inputs0, params, precomputed_candidates, carry, None);
+    let mut out = impute_window(&inputs0, params, precomputed_candidates, carry, WeightsOut::Collect);
     fold_window_shared(&mut out.all_weights, members, ctx, params, Some(&classes));
     out
 }
@@ -471,14 +516,19 @@ fn divide(all_weights: &mut [Vec<(usize, CsrWeights)>], count: usize) {
     }
 }
 
+thread_local! {
+    /// `PairFold::add`'s `swap_rows` scratch, reused across the samples a thread folds.
+    static FOLD_SCRATCH: std::cell::RefCell<(Vec<(u32, bool)>, Vec<bool>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
 /// Adds one member's two haplotype weights of a sample into the running sums, aligned to
-/// member 0's orientation (`swap_rows`, `mixed_rows`), with its scratch reused across samples.
+/// member 0's orientation (`swap_rows`, `mixed_rows`). Shared by the tasks that fold; each
+/// thread's scratch is reused across the samples it folds.
 struct PairFold<'c> {
     ctx: &'c FoldContext<'c>,
     skip_nocalls: bool,
     x_full: &'c [f64],
-    marks: Vec<(u32, bool)>,
-    swap: Vec<bool>,
     /// `mixed_rows` on (default); `SELPHI_NOCALL_BLEND_ALIGN_OFF=1` takes every row from one
     /// haplotype by its own orientation (A/B).
     blend_align: bool,
@@ -491,23 +541,30 @@ impl<'c> PairFold<'c> {
             blend_align: !crate::config::is_one("SELPHI_NOCALL_BLEND_ALIGN_OFF"),
             skip_nocalls: crate::imputation::window_process::nocall_skip_active(),
             x_full: ctx.interp_x.unwrap_or(ctx.chip_cm),
-            marks: Vec::new(),
-            swap: Vec::new(),
         }
     }
 
-    /// Haplotypes `h` (even) and `h + 1` of member 0, from sample `sk` of the member whose
-    /// scaffold is `targ_k` (`sk = h / 2` unless the member is stacked).
-    fn add(&mut self, all_weights: &mut [Vec<(usize, CsrWeights)>], h: usize, sk: usize,
+    /// Member 0's sample `s` (`pair`: its two haplotypes' running sums), from sample `sk` of
+    /// the member whose scaffold is `targ_k` (`sk = s` unless the member is stacked).
+    fn add(&self, pair: &mut [Vec<(usize, CsrWeights)>], s: usize, sk: usize,
            own0: &CsrWeights, own1: &CsrWeights, targ_k: &HaplotypeBitmatrix) {
+        FOLD_SCRATCH.with(|cell| {
+            let (marks, swap) = &mut *cell.borrow_mut();
+            self.add_with(pair, s, sk, own0, own1, targ_k, marks, swap);
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_with(&self, pair: &mut [Vec<(usize, CsrWeights)>], s: usize, sk: usize,
+                own0: &CsrWeights, own1: &CsrWeights, targ_k: &HaplotypeBitmatrix,
+                marks: &mut Vec<(u32, bool)>, swap: &mut Vec<bool>) {
         let ctx = self.ctx;
-        let s = h / 2;
         let skip_nocalls = self.skip_nocalls;
         let nocall = |r: usize| skip_nocalls && (ctx.site_conf_per_sample
             .is_some_and(|c| c[(ctx.chip_start + r) * ctx.n_samples + s] == 0.0)
             || ctx.hmm_skip.is_some_and(|k| k[r]));
-        if swap_rows(ctx.targ_bm0, s, targ_k, sk, ctx.chip_start, own0.n_rows, &nocall, &mut self.marks, &mut self.swap) {
-            let sw = &self.swap;
+        if swap_rows(ctx.targ_bm0, s, targ_k, sk, ctx.chip_start, own0.n_rows, &nocall, marks, swap) {
+            let sw = &*swap;
             let mixed = if self.blend_align {
                 mixed_rows(own0, own1, sw, &nocall, self.x_full, ctx.chip_start)
             } else { Vec::new() };
@@ -517,14 +574,14 @@ impl<'c> PairFold<'c> {
                     AddRow::Blend(side(l), l, side(rr), rr, t)
                 } else if sw[r] == first { AddRow::Csr(own1) } else { AddRow::Csr(own0) }
             };
-            let csr = &mut all_weights[h][0].1;
+            let csr = &mut pair[0][0].1;
             *csr = sum_rows_into(csr, |r| pick(r, true));
-            let csr = &mut all_weights[h + 1][0].1;
+            let csr = &mut pair[1][0].1;
             *csr = sum_rows_into(csr, |r| pick(r, false));
         } else {
-            let csr = &mut all_weights[h][0].1;
+            let csr = &mut pair[0][0].1;
             *csr = sum_csr_into(csr, own0);
-            let csr = &mut all_weights[h + 1][0].1;
+            let csr = &mut pair[1][0].1;
             *csr = sum_csr_into(csr, own1);
         }
     }

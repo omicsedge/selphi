@@ -667,6 +667,66 @@ pub type VcfSender = std::sync::mpsc::SyncSender<Vec<u8>>;
 pub type VcfWriterHandle = std::thread::JoinHandle<std::io::Result<()>>;
 pub type VcfBgzipProc = (); // No external process — native bgzf
 
+/// The main output writer's queue: buffers in write order, a send held back while the
+/// buffers queued ahead of it hold `cap` bytes (a buffer is always let into an empty queue,
+/// whatever its size). It bounds bytes, not messages, so it holds at most `cap` (or one
+/// buffer) whatever a producer sends: a tile group's lines, one very long line, a whole
+/// contig of records absent from the panel.
+pub struct OutputSender {
+    tx: std::sync::mpsc::Sender<Vec<u8>>,
+    room: Arc<QueueRoom>,
+}
+
+/// The writer thread's end of the queue (`OutputSender`).
+pub struct OutputReceiver {
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    room: Arc<QueueRoom>,
+}
+
+/// Bytes queued, and whether the receiver is gone (a send then fails instead of waiting).
+struct QueueRoom {
+    state: std::sync::Mutex<(usize, bool)>,
+    freed: std::sync::Condvar,
+    cap: usize,
+}
+
+/// A queue of at most `cap` bytes (`OutputSender`).
+pub fn output_queue(cap: usize) -> (OutputSender, OutputReceiver) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let room = Arc::new(QueueRoom { state: std::sync::Mutex::new((0, false)), freed: std::sync::Condvar::new(), cap });
+    (OutputSender { tx, room: Arc::clone(&room) }, OutputReceiver { rx, room })
+}
+
+impl OutputSender {
+    pub fn send(&self, buf: Vec<u8>) -> Result<(), std::sync::mpsc::SendError<Vec<u8>>> {
+        let n = buf.len();
+        let mut st = self.room.state.lock().unwrap();
+        while st.0 > 0 && st.0.saturating_add(n) > self.room.cap && !st.1 {
+            st = self.room.freed.wait(st).unwrap();
+        }
+        st.0 += n;
+        drop(st);
+        self.tx.send(buf)
+    }
+}
+
+impl OutputReceiver {
+    /// The next buffer, until every sender is gone; `written` takes its bytes off the queue.
+    fn recv(&self) -> Option<Vec<u8>> { self.rx.recv().ok() }
+
+    fn written(&self, n: usize) {
+        self.room.state.lock().unwrap().0 -= n;
+        self.room.freed.notify_all();
+    }
+}
+
+impl Drop for OutputReceiver {
+    fn drop(&mut self) {
+        self.room.state.lock().unwrap().1 = true;
+        self.room.freed.notify_all();
+    }
+}
+
 /// Output file under noodles' writer thread: buffered, because noodles issues
 /// about fourteen small `write_all`s per BGZF frame (header fields, data,
 /// trailer fields), each of which was a syscall on the bare `File`.
@@ -677,30 +737,34 @@ type BufFile = BufWriter<std::fs::File>;
 /// do not depend on this count (checked by `csi::tests::bgzf_bytes_do_not_depend_on_worker_count`);
 /// `4.min(n_samples)` limits a single-sample run to one compression thread
 /// and a 100-sample BCF to four, making deflate the output-stage bottleneck.
+/// Four per pool thread, at most 64 (one with a single thread): the writer keeps one 64 KB
+/// block in flight per worker, and a block's round trip (hand-off, deflate, in-order write)
+/// waits on thread wake-ups, so with one per core the stream ran ~1 GB/s with the deflaters
+/// mostly asleep (8 GB of VCF text, 16 workers: 4.2-9.8 s; 64: 3.6-4.8 s, the same CPU).
 fn bgzf_worker_count() -> std::num::NonZeroUsize {
-    std::num::NonZeroUsize::new(rayon::current_num_threads().max(1)).unwrap()
+    let threads = rayon::current_num_threads().max(1);
+    std::num::NonZeroUsize::new(if threads == 1 { 1 } else { (4 * threads).min(64) }).unwrap()
 }
 
 /// Create the output file, the native multithreaded BGZF writer over `wrap(file)`
-/// and the adaptive-depth sync channel shared by the VCF and BCF writers. The
+/// and the queue shared by the VCF and BCF writers. The
 /// caller spawns the writer thread (which differs: streamed TBI vs. CSI drain)
 /// and sends the format-specific header.
 #[inline]
 fn build_bgzf_channel<W: Write + Send + 'static>(
     path: &Path,
-    n_samples: usize,
     wrap: impl FnOnce(BufFile) -> W,
-) -> std::io::Result<(noodles_bgzf::io::multithreaded_writer::MultithreadedWriter<W>, VcfSender, std::sync::mpsc::Receiver<Vec<u8>>)> {
+) -> std::io::Result<(noodles_bgzf::io::multithreaded_writer::MultithreadedWriter<W>, OutputSender, OutputReceiver)> {
     let out_file = BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
     let bgzf_writer = noodles_bgzf::io::multithreaded_writer::Builder::default()
         .set_worker_count(bgzf_worker_count())
         .build_from_writer(wrap(out_file));
 
-    // Channel buffer sized adaptively: at biobank scale each VCF tile is ~300 MB
-    // of text (5000 samples × 4096 variants). 64 tiles in flight = 19 GB waste.
-    // 4 is enough to keep the writer fed without starving compute.
-    let channel_depth = if n_samples >= 1000 { 4 } else { 16 };
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(channel_depth);
+    // The queue holds a whole tile group's output (`GROUP_BYTES`) plus a margin, so writing
+    // a group does not wait for its compression: the deflaters compress it while the next
+    // group is interpolated and formatted, instead of the two taking turns. (It held 16
+    // messages, 4 under 1,000+ samples, of up to `ChannelOut::MSG_BYTES` = 4 MB each.)
+    let (tx, rx) = output_queue(GROUP_BYTES + 16 * ChannelOut::MSG_BYTES);
     Ok((bgzf_writer, tx, rx))
 }
 
@@ -758,7 +822,6 @@ impl VcfMetaScan {
 /// Setup the VCF writer: native noodles-bgzf (no external bgzip dependency).
 /// Returns (sender, writer_handle, ()) to be shared across windows.
 pub fn setup_vcf_writer(
-    n_samples: usize,
     sample_names: &[String],
     contig_field: &str,
     version: &str,
@@ -766,11 +829,11 @@ pub fn setup_vcf_writer(
     no_ap: bool,
     gp: bool,
     extra_header: &[String],
-) -> std::io::Result<(VcfSender, VcfWriterHandle, VcfBgzipProc)> {
+) -> std::io::Result<(OutputSender, VcfWriterHandle, VcfBgzipProc)> {
     let vcf_path = crate::common::utils::out_path(output_path, "vcf.gz");
 
     let (block_tx, block_rx) = std::sync::mpsc::channel();
-    let (mut bgzf_writer, tx, rx) = build_bgzf_channel(&vcf_path, n_samples,
+    let (mut bgzf_writer, tx, rx) = build_bgzf_channel(&vcf_path,
         |f| crate::srp::csi::BgzfBlockTap::new(f, block_tx))?;
 
     let tbi_path = { let mut p = vcf_path.as_os_str().to_owned(); p.push(".tbi"); std::path::PathBuf::from(p) };
@@ -782,10 +845,11 @@ pub fn setup_vcf_writer(
         // after the last byte (and the per-record metadata held until then).
         let mut index = crate::srp::csi::TbiStreamIndexer::new(block_rx);
         let mut meta = VcfMetaScan::new();
-        for buf in rx {
+        while let Some(buf) = rx.recv() {
             meta.scan(&buf, |rec| index.push_meta(rec));
             index.observe(&buf);
             bgzf_writer.write_all(&buf)?;
+            rx.written(buf.len());
             index.process();
         }
         // Finish explicitly so a failure on the last blocks or the EOF marker is
@@ -807,7 +871,7 @@ pub fn setup_vcf_writer(
 
 /// Finalize the VCF writer: close channel, flush bgzf.
 pub fn finish_vcf_writer(
-    tx: VcfSender,
+    tx: OutputSender,
     writer_handle: VcfWriterHandle,
     _bgzip: VcfBgzipProc,
 ) -> std::io::Result<()> {
@@ -878,16 +942,17 @@ pub fn setup_bcf_writer(
     no_ap: bool,
     gp: bool,
     extra_header: &[String],
-) -> std::io::Result<(VcfSender, VcfWriterHandle, VcfBgzipProc)> {
+) -> std::io::Result<(OutputSender, VcfWriterHandle, VcfBgzipProc)> {
     let bcf_path = crate::common::utils::out_path(output_path, "bcf");
 
-    let (mut bgzf_writer, tx, rx) = build_bgzf_channel(&bcf_path, n_samples, |f| f)?;
+    let (mut bgzf_writer, tx, rx) = build_bgzf_channel(&bcf_path, |f| f)?;
 
     let bcf_path_clone = bcf_path.clone();
 
     let writer_handle = std::thread::spawn(move || -> std::io::Result<()> {
-        for buf in rx {
+        while let Some(buf) = rx.recv() {
             bgzf_writer.write_all(&buf)?;
+            rx.written(buf.len());
         }
         // Finish explicitly: Drop would swallow an error on the last blocks.
         let mut file = bgzf_writer.finish()?;
@@ -1039,7 +1104,7 @@ pub struct WindowWriters<'a> {
     pub parquet: Option<(&'a mut parquet::arrow::ArrowWriter<std::fs::File>, &'a Arc<arrow::datatypes::Schema>)>,
     pub pgen: Option<(&'a mut super::pgen_output::PgenWriter, &'a mut BufWriter<std::fs::File>)>,
     pub selfdecode: Option<&'a mut super::selfdecode_output::SelfdecodeWriter>,
-    pub vcf_tx: &'a std::sync::mpsc::SyncSender<Vec<u8>>,
+    pub vcf_tx: &'a OutputSender,
 }
 
 // ---------------------------------------------------------------------------
@@ -1264,7 +1329,7 @@ fn dr2_chunks(setup: &WindowSetup, tile_n: usize, global_start: usize) -> usize 
 /// lines of the packed message are exactly the lines of its parts. A buffer not
 /// ending in `\n` closes its message.
 struct ChannelOut<'a> {
-    tx: &'a std::sync::mpsc::SyncSender<Vec<u8>>,
+    tx: &'a OutputSender,
     pending: Vec<u8>,
     /// Text output (VCF): apply the line rule above.
     lines: bool,
@@ -1273,7 +1338,7 @@ struct ChannelOut<'a> {
 impl<'a> ChannelOut<'a> {
     const MSG_BYTES: usize = 4 << 20;
 
-    fn new(tx: &'a std::sync::mpsc::SyncSender<Vec<u8>>, lines: bool) -> Self {
+    fn new(tx: &'a OutputSender, lines: bool) -> Self {
         Self { tx, pending: Vec::new(), lines }
     }
 
@@ -3432,18 +3497,42 @@ mod encode_equivalence_tests {
                 bufs.push(b);
             }
             for lines_mode in [true, false] {
-                let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(100_000);
+                let (tx, rx) = output_queue(usize::MAX);
                 let mut out = ChannelOut::new(&tx, lines_mode);
                 for b in &bufs { out.push(b.clone()); }
                 out.flush();
                 drop(out);
                 drop(tx);
-                let msgs: Vec<Vec<u8>> = rx.iter().collect();
+                let msgs: Vec<Vec<u8>> = std::iter::from_fn(|| rx.recv()).collect();
                 assert_eq!(msgs.concat(), bufs.concat(), "case {case}");
                 assert!(msgs.iter().all(|m| !m.is_empty()));
                 if lines_mode { assert_eq!(lines(&msgs), lines(&bufs), "case {case}"); }
             }
         }
+    }
+
+    /// The output queue holds back a send while the bytes queued ahead of it reach its cap
+    /// (an empty queue takes any buffer), lets it through as the writer reports bytes
+    /// written, and fails a send instead of waiting once the writer is gone.
+    #[test]
+    fn output_queue_bounds_its_bytes() {
+        let (tx, rx) = output_queue(10);
+        tx.send(vec![0; 25]).unwrap(); // empty queue: admitted, though over the cap
+        let sent = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| { tx.send(vec![1; 4]).unwrap(); sent.store(true, std::sync::atomic::Ordering::SeqCst); });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!sent.load(std::sync::atomic::Ordering::SeqCst), "sent past a full queue");
+            let b = rx.recv().unwrap();
+            assert_eq!(b.len(), 25);
+            rx.written(b.len());
+        });
+        assert!(sent.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(rx.recv().unwrap(), vec![1; 4]);
+        rx.written(4);
+        tx.send(vec![2; 9]).unwrap();
+        drop(rx);
+        assert!(tx.send(vec![3; 30]).is_err(), "a send to a gone writer must fail, not wait");
     }
 
     fn random_tile(r: &mut Xs, n_rows: usize, n_cols: usize, density: u64) -> crate::srp::SparseTile {

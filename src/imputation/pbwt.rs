@@ -247,14 +247,32 @@ mod forwards_ad_tests {
 // Forward pass: match finding
 // ---------------------------------------------------------------------------
 
-/// Per-target result from the forward pass.
-pub struct FwdResult {
-    /// (n_var, fl_fwd) — matched reference haplotype IDs
+/// Every site's kept matches, longest first, packed: site `v`'s are entries
+/// `offsets[v]..offsets[v + 1]` of `haps` (reference haplotype IDs) and `lens` (lengths).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SiteLists {
+    /// (n_var + 1,) — start of each site's matches
+    pub offsets: Vec<usize>,
     pub haps: Vec<i32>,
-    /// (n_var, fl_fwd) — match lengths
     pub lens: Vec<i32>,
-    /// (n_var,) — number of matches stored at each variant
-    pub counts: Vec<i32>,
+}
+
+impl SiteLists {
+    /// Site `v`'s matches (haplotypes, lengths), longest first.
+    #[inline]
+    pub fn site(&self, v: usize) -> (&[i32], &[i32]) {
+        let (a, b) = (self.offsets[v], self.offsets[v + 1]);
+        (&self.haps[a..b], &self.lens[a..b])
+    }
+}
+
+/// Per-target result from the forward pass: every site's top `fl_fwd` matches, held as the
+/// pass kept them (`backward_filter_single` reads them there; `site_lists` packs a copy).
+pub struct FwdResult(MatchLists);
+
+impl FwdResult {
+    /// Every site's matches packed longest first.
+    pub fn site_lists(&self) -> SiteLists { self.0.clone().into_site_lists() }
 }
 
 /// Pre-allocated workspace for PBWT forward pass (avoids repeated allocation).
@@ -635,21 +653,32 @@ pub(crate) struct SparseSite {
     minority: u8,
     pos: Vec<u32>,
     cmax: Vec<i32>,
+    masks: Vec<u64>,
 }
 
 const SPARSE_CHUNK: usize = 64;
 
 impl SparseSite {
-    pub(crate) fn new() -> Self { Self { minority: 1, pos: Vec::new(), cmax: Vec::new() } }
+    pub(crate) fn new() -> Self { Self { minority: 1, pos: Vec::new(), cmax: Vec::new(), masks: Vec::new() } }
 
-    /// Rebuild for the current site: O(m), shared by all targets of the group.
+    /// Rebuild for the current site: O(m), shared by all targets of the group. The
+    /// alleles are read 64 positions at a time into a bit mask (`masks`, reused), and the
+    /// minority positions taken from its set bits.
     fn build(&mut self, d: &[i32], y: &[u8], m: usize) {
-        let ones = y[..m].iter().filter(|&&v| v != 0).count();
+        self.masks.clear();
+        self.masks.extend(y[..m].chunks(64).map(|c| {
+            c.iter().enumerate().fold(0u64, |w, (j, &v)| w | (((v != 0) as u64) << j))
+        }));
+        let ones: usize = self.masks.iter().map(|w| w.count_ones() as usize).sum();
         self.minority = if ones * 2 <= m { 1 } else { 0 };
-        let mi = self.minority;
         self.pos.clear();
-        for (i, &v) in y[..m].iter().enumerate() {
-            if (v != 0) as u8 == mi { self.pos.push(i as u32); }
+        for (c, &w) in self.masks.iter().enumerate() {
+            let valid = if 64 * (c + 1) <= m { u64::MAX } else { (1u64 << (m - 64 * c)) - 1 };
+            let mut w = if self.minority == 1 { w } else { !w & valid };
+            while w != 0 {
+                self.pos.push((64 * c + w.trailing_zeros() as usize) as u32);
+                w &= w - 1;
+            }
         }
         // chunk maxima over d[0..=m] (scan reads d[1..=m-1])
         let n = m + 1;
@@ -1016,15 +1045,28 @@ pub fn pbwt_forward_single(
 /// the same in every case.
 ///
 /// Lists are STORED shortest first in a ring of `fl` slots (`heads[var]` = the shortest), so
-/// appending a batch and dropping the shortest of a full list are both cheap. `into_fwd` /
-/// `into_bwd` write them out longest first.
+/// appending a batch and dropping the shortest of a full list are both cheap. `into_fwd` keeps
+/// them so (the backward filter reads each list shortest first); `into_bwd` packs them
+/// longest first.
+///
+/// A list's slots are a block of an arena sized to what it holds (`reserve`): the smallest
+/// size class (8, 16, 32, ... up to `fl`) that fits, moved to the next class as it grows,
+/// released blocks reused by the lists that grow after them. A list holds fewer than `fl`
+/// matches until it is full, and only a full list's ring turns, so a block below `fl` slots
+/// always starts at its shortest match. (Lists of `fl` slots each, as before, held the
+/// shared PBWT's in-flight targets at ~25 MB apiece on 1000 Genomes chr1, ~22% of it used.)
 #[derive(Clone)]
 pub(crate) struct MatchLists {
     fl: usize,
+    /// List blocks: site `v`'s list lives in slots `off[v]..off[v] + cap[v]`.
     haps: Vec<i32>,
     lens: Vec<i32>,
+    off: Vec<usize>,
+    cap: Vec<usize>,
     counts: Vec<i32>,
     heads: Vec<u32>,
+    /// Released blocks by size class.
+    free: Vec<Vec<usize>>,
     /// Insertions since the last `flush`.
     pending: Vec<Pending>,
     /// Duplicate-haplotype check for a batch: `seen[h] == stamp` once `h` is in it.
@@ -1032,15 +1074,57 @@ pub(crate) struct MatchLists {
     stamp: u32,
 }
 
+/// Slots of the smallest list block.
+const MIN_LIST_BLOCK: usize = 8;
+
 /// One deferred insertion: `total` is the haplotype's running total right after it.
 #[derive(Clone, Copy)]
 struct Pending { bucket: u32, length: i32, total: i64, seq: u32, hap: i32 }
 
 impl MatchLists {
     pub(crate) fn new(n_var: usize, fl: usize) -> Self {
-        Self { fl, haps: vec![0i32; n_var * fl], lens: vec![0i32; n_var * fl],
+        let n_classes = Self::class_for(fl, fl).0 + 1;
+        Self { fl, haps: Vec::new(), lens: Vec::new(),
+               off: vec![0; n_var], cap: vec![0; n_var],
                counts: vec![0i32; n_var], heads: vec![0u32; n_var],
+               free: vec![Vec::new(); n_classes],
                pending: Vec::new(), seen: Vec::new(), stamp: 0 }
+    }
+
+    /// The size class that holds `need` slots: (class index, block size).
+    #[inline]
+    fn class_for(need: usize, fl: usize) -> (usize, usize) {
+        let (mut k, mut size) = (0usize, MIN_LIST_BLOCK);
+        while size < need && size < fl { size *= 2; k += 1; }
+        (k, size.min(fl))
+    }
+
+    /// Make site `var`'s block hold at least `need` (<= `fl`) matches.
+    #[inline]
+    fn reserve(&mut self, var: usize, need: usize) {
+        if need > self.cap[var] { self.grow(var, need); }
+    }
+
+    /// Move site `var`'s list to a block of the class that holds `need` matches.
+    fn grow(&mut self, var: usize, need: usize) {
+        let (k, size) = Self::class_for(need, self.fl);
+        let to = match self.free[k].pop() {
+            Some(o) => o,
+            None => {
+                let o = self.haps.len();
+                self.haps.resize(o + size, 0);
+                self.lens.resize(o + size, 0);
+                o
+            }
+        };
+        let (from, n, cap) = (self.off[var], self.counts[var] as usize, self.cap[var]);
+        // Below `fl` slots the ring has not turned: the list is the block's first `n` slots.
+        debug_assert!(n == 0 || self.heads[var] == 0);
+        self.haps.copy_within(from..from + n, to);
+        self.lens.copy_within(from..from + n, to);
+        if cap > 0 { self.free[Self::class_for(cap, self.fl).0].push(from); }
+        self.off[var] = to;
+        self.cap[var] = size;
     }
 
     /// Insert a match at site `var` (applied by the next `flush`).
@@ -1088,7 +1172,7 @@ impl MatchLists {
         while a < pend.len() {
             let var = pend[a].bucket as usize;
             let n = self.counts[var] as usize;
-            if n > 0 && self.lens[self.slot(var * self.fl, self.heads[var] as usize, n - 1)] >= pend[a].length {
+            if n > 0 && self.lens[self.slot(self.off[var], self.heads[var] as usize, n - 1)] >= pend[a].length {
                 return false;
             }
             a += pend[a..].iter().take_while(|p| p.bucket as usize == var).count();
@@ -1101,7 +1185,8 @@ impl MatchLists {
     fn append_sorted(&mut self, grp: &[Pending]) {
         let fl = self.fl;
         let var = grp[0].bucket as usize;
-        let base = var * fl;
+        self.reserve(var, (self.counts[var] as usize + grp.len()).min(fl));
+        let base = self.off[var];
         let (mut head, mut n) = (self.heads[var] as usize, self.counts[var] as usize);
         let mut grp = grp;
         if n + grp.len() > fl {
@@ -1139,7 +1224,8 @@ impl MatchLists {
         ht[ref_hap as usize] += length as i64;
         let fl = self.fl;
         let n = self.counts[var] as usize;
-        let base = var * fl;
+        if n < fl { self.reserve(var, n + 1); }
+        let base = self.off[var];
         let head = self.heads[var] as usize;
 
         if n >= fl && length < self.lens[self.slot(base, head, 0)] {
@@ -1185,51 +1271,49 @@ impl MatchLists {
         self.counts[var] = n_after as i32;
     }
 
-    /// Every site's list longest first at the start of its `fl` slots, the rest zero.
-    fn into_longest_first(mut self) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+    /// Every site's list longest first, packed.
+    fn into_site_lists(self) -> SiteLists {
         debug_assert!(self.pending.is_empty(), "MatchLists read before flush");
-        let fl = self.fl;
-        let (mut th, mut tl) = (vec![0i32; fl], vec![0i32; fl]);
+        let total: usize = self.counts.iter().map(|&c| c as usize).sum();
+        let mut offsets = Vec::with_capacity(self.counts.len() + 1);
+        let (mut haps, mut lens) = (Vec::with_capacity(total), Vec::with_capacity(total));
+        offsets.push(0);
         for var in 0..self.counts.len() {
-            let n = self.counts[var] as usize;
-            let (base, head) = (var * fl, self.heads[var] as usize);
-            for j in 0..n {
-                let k = self.slot(base, head, n - 1 - j);
-                th[j] = self.haps[k];
-                tl[j] = self.lens[k];
+            for (h, l) in self.shortest_first(var).rev() {
+                haps.push(h);
+                lens.push(l);
             }
-            self.haps[base..base + n].copy_from_slice(&th[..n]);
-            self.lens[base..base + n].copy_from_slice(&tl[..n]);
-            self.haps[base + n..base + fl].fill(0);
-            self.lens[base + n..base + fl].fill(0);
+            offsets.push(haps.len());
         }
-        (self.haps, self.lens, self.counts)
+        SiteLists { offsets, haps, lens }
     }
 
-    pub(crate) fn into_fwd(self) -> FwdResult {
-        let (haps, lens, counts) = self.into_longest_first();
-        FwdResult { haps, lens, counts }
+    /// Site `var`'s matches (haplotype, length), shortest first.
+    fn shortest_first(&self, var: usize) -> impl DoubleEndedIterator<Item = (i32, i32)> + '_ {
+        let (base, head) = (self.off[var], self.heads[var] as usize);
+        (0..self.counts[var] as usize).map(move |a| {
+            let k = self.slot(base, head, a);
+            (self.haps[k], self.lens[k])
+        })
     }
 
-    fn into_bwd(self) -> BwdResult {
-        let (haps, lens, counts) = self.into_longest_first();
-        BwdResult { haps, lens, counts }
+    /// The lists as the forward result; the insertion scratch (batch, duplicate check, free
+    /// blocks) is released.
+    pub(crate) fn into_fwd(mut self) -> FwdResult {
+        debug_assert!(self.pending.is_empty(), "MatchLists read before flush");
+        (self.pending, self.seen, self.free) = Default::default();
+        FwdResult(self)
     }
+
+    fn into_bwd(self) -> BwdResult { self.into_site_lists() }
 }
 
 // ---------------------------------------------------------------------------
 // Backward pass: re-ranking
 // ---------------------------------------------------------------------------
 
-/// Per-target result from the backward pass.
-pub struct BwdResult {
-    /// (n_var, fl_bwd) — matched reference haplotype IDs
-    pub haps: Vec<i32>,
-    /// (n_var, fl_bwd) — match lengths
-    pub lens: Vec<i32>,
-    /// (n_var,) — number of matches stored at each variant
-    pub counts: Vec<i32>,
-}
+/// Per-target result from the backward pass: every site's top `fl_bwd` matches.
+pub type BwdResult = SiteLists;
 
 /// Backward pass filtering for a single target.
 /// Re-ranks matches from last variant to first, keeping top fl_bwd per variant.
@@ -1237,18 +1321,15 @@ pub fn backward_filter_single(
     fwd: &FwdResult,
     n_var: usize,
     n_ref: usize,
-    fl_fwd: usize,
     fl_bwd: usize,
 ) -> BwdResult {
     let mut lists = MatchLists::new(n_var, fl_bwd);
     let mut ht = vec![0i64; n_ref];
 
     for var in (0..n_var).rev() {
-        let n = fwd.counts[var] as usize;
-        let fwd_base = var * fl_fwd;
-        // Process in reverse order (j from n-1 to 0) for correct match merging
-        for j in (0..n).rev() {
-            lists.insert(&mut ht, var, fwd.haps[fwd_base + j], fwd.lens[fwd_base + j]);
+        // Shortest first (the longest-first list in reverse) for correct match merging
+        for (hap, len) in fwd.0.shortest_first(var) {
+            lists.insert(&mut ht, var, hap, len);
         }
         lists.flush(&mut ht);
     }
@@ -1260,38 +1341,14 @@ pub fn backward_filter_single(
 // CSC construction
 // ---------------------------------------------------------------------------
 
-/// Build a CSC match matrix from backward pass results.
-pub fn build_csc_matrix(bwd: &BwdResult, n_ref: usize, n_var: usize, fl_bwd: usize) -> CscMatchMatrix {
-    // Count total nnz
-    let nnz: usize = bwd.counts.iter().map(|&c| c as usize).sum();
-    if nnz == 0 {
-        return CscMatchMatrix::empty(n_ref, n_var);
-    }
-
-    let mut indptr = Vec::with_capacity(n_var + 1);
-    let mut indices = Vec::with_capacity(nnz);
-    let mut data = Vec::with_capacity(nnz);
-
-    let mut idx = 0i32;
-    for v in 0..n_var {
-        indptr.push(idx);
-        let n = bwd.counts[v] as usize;
-        let base = v * fl_bwd;
-        for j in 0..n {
-            indices.push(bwd.haps[base + j]);
-            data.push(bwd.lens[base + j]);
-            idx += 1;
-        }
-    }
-    indptr.push(idx);
-
-    CscMatchMatrix {
-        indptr,
-        indices,
-        data,
-        n_rows: n_ref,
-        n_cols: n_var,
-    }
+/// The CSC match matrix of the backward pass's lists: column `v` holds site `v`'s matches,
+/// longest first (the packed lists are that layout already).
+pub fn build_csc_matrix(bwd: BwdResult, n_ref: usize, n_var: usize) -> CscMatchMatrix {
+    debug_assert_eq!(bwd.offsets.len(), n_var + 1);
+    let SiteLists { offsets, haps, lens } = bwd;
+    let indptr = offsets.iter()
+        .map(|&o| i32::try_from(o).expect("a CSC match matrix holds at most i32::MAX matches")).collect();
+    CscMatchMatrix { indptr, indices: haps, data: lens, n_rows: n_ref, n_cols: n_var }
 }
 
 #[cfg(test)]
@@ -1336,10 +1393,10 @@ mod tests {
         lists.flush(&mut ht);
         let r = lists.into_fwd();
 
-        assert_eq!(r.counts[0], 3);
         // Top 3 by length: 20, 15, 10
-        assert_eq!(&r.lens[..3], &[20, 15, 10]);
-        assert_eq!(&r.haps[..3], &[3, 1, 5]);
+        let r = r.site_lists();
+        assert_eq!(r.site(0), (&[3, 1, 5][..], &[20, 15, 10][..]));
+        assert_eq!(r.site(1), (&[][..], &[][..]));
     }
 
     /// The longest-first array insert that `MatchLists::insert` replaced, verbatim: the
@@ -1398,9 +1455,12 @@ mod tests {
             }
             a.flush(&mut ht_a);
             assert_eq!(ht_a, b.3, "totals diverged at site {site}");
-            let r = a.clone().into_fwd();
-            assert_eq!((&r.haps, &r.lens, &r.counts), (&b.0, &b.1, &b.2),
-                       "realistic {realistic} fl {fl} diverged at site {site}");
+            let r = a.clone().into_fwd().site_lists();
+            for v in 0..n_var {
+                let n = b.2[v] as usize;
+                assert_eq!(r.site(v), (&b.0[v * fl..v * fl + n], &b.1[v * fl..v * fl + n]),
+                           "realistic {realistic} fl {fl} diverged at site {site} list {v}");
+            }
         }
     }
 
@@ -1447,10 +1507,9 @@ mod tests {
         );
 
         // Non-vacuous: the synthetic panel actually produces matches.
-        assert!(r_single.counts.iter().sum::<i32>() > 0, "test input produced no matches");
-        assert_eq!(r_single.counts, r_ws.counts);
-        assert_eq!(r_single.haps, r_ws.haps);
-        assert_eq!(r_single.lens, r_ws.lens);
+        let (r_single, r_ws) = (r_single.site_lists(), r_ws.site_lists());
+        assert!(!r_single.haps.is_empty(), "test input produced no matches");
+        assert_eq!(r_single, r_ws);
     }
 
 }
@@ -1924,9 +1983,10 @@ mod sparse_scan_tests {
                 let a = pbwt_forward_shared_impl(&mut ws1, &mut r1, n_var, m, n_ref, min_l, 5, &targets, &mut h1, false);
                 let b = pbwt_forward_shared_impl(&mut ws2, &mut r2, n_var, m, n_ref, min_l, 5, &targets, &mut h2, true);
                 for t in 0..n_tgt {
-                    assert_eq!(a[t].haps, b[t].haps, "haps differ trial {trial} min_l {min_l} target {t}");
-                    assert_eq!(a[t].lens, b[t].lens, "lens differ trial {trial} min_l {min_l} target {t}");
-                    assert_eq!(a[t].counts, b[t].counts, "counts differ trial {trial} min_l {min_l} target {t}");
+                    let (a, b) = (a[t].site_lists(), b[t].site_lists());
+                    assert_eq!(a.haps, b.haps, "haps differ trial {trial} min_l {min_l} target {t}");
+                    assert_eq!(a.lens, b.lens, "lens differ trial {trial} min_l {min_l} target {t}");
+                    assert_eq!(a.offsets, b.offsets, "counts differ trial {trial} min_l {min_l} target {t}");
                     assert_eq!(h1[t], h2[t], "ht differ trial {trial} min_l {min_l} target {t}");
                 }
             }

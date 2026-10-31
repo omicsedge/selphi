@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::cpp_rng::CppRng;
+use crate::common::bit_gather::{build_gather_plan, gather_row};
 
 use super::params::*;
 use super::genotype_graph::*;
@@ -256,14 +257,9 @@ impl CondCtx<'_> {
         let mut cond_set = if self.single_window {
             self.pbwt_idx.get_conditioning_union(h0, h1)
         } else {
+            // Both haplotypes' neighbours; the sort and dedup below make the set.
             let mut cs = self.pbwt_idx.get_conditioning_set_by_loci(h0, w_l0, w_l1);
-            // Membership via a HashSet (O(1)) instead of linear cs.contains (O(n)) —
-            // O(n²)→O(n) on the merge. `cs` push order is preserved (load-bearing for
-            // the downstream bitmatrix layout), so the result is byte-identical.
-            let mut cs_seen: std::collections::HashSet<_> = cs.iter().copied().collect();
-            for c in self.pbwt_idx.get_conditioning_set_by_loci(h1, w_l0, w_l1) {
-                if cs_seen.insert(c) { cs.push(c); }
-            }
+            cs.extend(self.pbwt_idx.get_conditioning_set_by_loci(h1, w_l0, w_l1));
             cs
         };
         let query_ind = h0 / 2;
@@ -423,32 +419,21 @@ impl WindowHmmCtx<'_> {
         let needed = n_var_window * k_words;
         cond_bm.clear();
         cond_bm.resize(needed, 0u64);
-        // Pre-compute word index and shift for each conditioning hap
-        let cond_words: Vec<usize> = cond_set.iter().map(|&h| h / 64).collect();
-        let cond_shifts: Vec<u32> = cond_set.iter().map(|&h| (h % 64) as u32).collect();
-        unsafe {
-            let bm_bits = hap_bm_hmm_ref.bits_ptr();
-            let bm_nw = hap_bm_hmm_ref.n_words();
-            let cm_ptr = cond_bm.as_mut_ptr();
-            let cw_ptr = cond_words.as_ptr();
-            let cs_ptr = cond_shifts.as_ptr();
-            // Batch word construction: accumulate 64 bits in register, single store
-            for vi_rel in 0..n_var_window {
-                let vi = w_l0 + vi_rel;
-                let src_base = vi * bm_nw;
-                let dst_base = vi_rel * k_words;
-                for w in 0..k_words {
-                    let ki_start = w * 64;
-                    let ki_end = (ki_start + 64).min(k);
-                    let mut word = 0u64;
-                    for ki in ki_start..ki_end {
-                        let bit = (*bm_bits.add(src_base + *cw_ptr.add(ki))
-                            >> *cs_ptr.add(ki)) & 1;
-                        word |= bit << (ki - ki_start);
-                    }
-                    *cm_ptr.add(dst_base + w) = word;
-                }
-            }
+        // One bit extract per run of conditioning haplotypes sharing a word of the row
+        // (the set is sorted), not one shift and mask per haplotype.
+        let ids: Vec<u32> = cond_set.iter().map(|&h| h as u32).collect();
+        let mut plan = Vec::new();
+        build_gather_plan(&ids, &mut plan);
+        let bm_nw = hap_bm_hmm_ref.n_words();
+        assert!(cond_set.iter().all(|&h| h / 64 < bm_nw), "conditioning haplotype outside the bitmatrix");
+        for vi_rel in 0..n_var_window {
+            // SAFETY: every plan word is below `bm_nw` (asserted), so within row `w_l0 + vi_rel`;
+            // the row's `k_words` words are written within `cond_bm` (sized above).
+            let n = unsafe {
+                gather_row(hap_bm_hmm_ref.bits_ptr().add((w_l0 + vi_rel) * bm_nw), &plan,
+                    cond_bm.as_mut_ptr().add(vi_rel * k_words), 0, 0, 0)
+            };
+            debug_assert_eq!(n, k_words);
         }
         let locus_offset = w_l0;
 

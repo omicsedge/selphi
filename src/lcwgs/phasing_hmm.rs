@@ -220,11 +220,11 @@ pub struct PhasingHmm {
     /// Gather plans of the CURRENT `rephase` call's conditioning set, built at
     /// its head (SIMD paths only): `plan_full` over `cond_haps`, `plan_tail`
     /// over `cond_haps[b..]` when a usable base pack is set. `pack_condbits`
-    /// packs a site through them (see `crate::lcwgs::hmm::build_gather_plan`).
+    /// packs a site through them (see `crate::common::bit_gather::build_gather_plan`).
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    plan_full: Vec<crate::lcwgs::hmm::GatherWord>,
+    plan_full: Vec<crate::common::bit_gather::GatherWord>,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    plan_tail: Vec<crate::lcwgs::hmm::GatherWord>,
+    plan_tail: Vec<crate::common::bit_gather::GatherWord>,
     /// Run the backward and forward passes of `rephase` as two concurrent
     /// Rayon tasks (see [`Self::two_pass_states`]). Off by default.
     two_pass: bool,
@@ -539,7 +539,7 @@ impl PhasingHmm {
     #[cfg(target_arch = "x86_64")]
     #[inline]
     fn pack_condbits(&mut self, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32]) {
-        use crate::lcwgs::hmm::gather_row;
+        use crate::common::bit_gather::gather_row;
         let nstates = self.n_states;
         debug_assert_eq!(cond_haps.len(), nstates);
         let w64 = nstates.div_ceil(64);
@@ -626,7 +626,7 @@ impl PhasingHmm {
     /// the base prefix when the base pack is usable. O(K) once per `rephase`.
     #[cfg(target_arch = "x86_64")]
     fn build_condbit_plans(&mut self, cond_haps: &[u32]) {
-        use crate::lcwgs::hmm::build_gather_plan;
+        use crate::common::bit_gather::build_gather_plan;
         build_gather_plan(cond_haps, &mut self.plan_full);
         self.plan_tail.clear();
         if !self.base_pack.is_null() {

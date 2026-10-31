@@ -156,7 +156,7 @@ struct OutputWriters {
     parquet: Option<(parquet::arrow::ArrowWriter<std::fs::File>, std::sync::Arc<arrow::datatypes::Schema>)>,
     pgen: Option<(selphi::io::pgen_output::PgenWriter, std::io::BufWriter<std::fs::File>)>,
     selfdecode: Option<selphi::io::selfdecode_output::SelfdecodeWriter>,
-    vcf_tx: selphi::io::pipeline::VcfSender,
+    vcf_tx: selphi::io::pipeline::OutputSender,
     vcf_writer: selphi::io::pipeline::VcfWriterHandle,
     vcf_bgzip: selphi::io::pipeline::VcfBgzipProc,
     batch: BatchWriters,
@@ -249,11 +249,11 @@ fn setup_output_writers(
             ).expect("Failed to setup BCF writer")
         } else {
             selphi::io::pipeline::setup_vcf_writer(
-                n_samples, sample_names, contig_field, version, &out_file, no_ap, gp, extra_header,
+                sample_names, contig_field, version, &out_file, no_ap, gp, extra_header,
             ).expect("Failed to setup VCF writer")
         }
     } else {
-        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        let (tx, _rx) = selphi::io::pipeline::output_queue(1);
         let handle = std::thread::spawn(|| Ok(()));
         (tx, handle, ())
     };
@@ -1797,7 +1797,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
             selphi::imputation::window_process::impute_window(
                 &inputs, &hmm_params, precomputed_candidates.as_ref(),
                 &mut carry,
-                Some(&mut cb),
+                selphi::imputation::window_process::WeightsOut::Batches(&mut cb),
             )
         } else {
             // Member 0 plus the phase-ensemble's extra members (each re-runs this window's
@@ -1824,7 +1824,10 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
             )
         };
         let all_weights = hmm_output.all_weights;
-        selphi_debug!("  [MEM] win{} after HMM (member 0): rss={:.0} MB peak={:.0} MB", wi + 1, selphi::log::rss_mb(), selphi::log::peak_mem_mb());
+        selphi_debug!("  [MEM] win{} after HMM (member 0): rss={:.0} MB peak={:.0} MB, weights {:.0} MB ({:.0} MB allocated)",
+            wi + 1, selphi::log::rss_mb(), selphi::log::peak_mem_mb(),
+            all_weights.iter().flatten().map(|(_, w)| 4 * (w.indptr.len() + w.indices.len() + w.data.len())).sum::<usize>() as f64 / 1048576.0,
+            all_weights.iter().flatten().map(|(_, w)| 4 * (w.indptr.capacity() + w.indices.capacity() + w.data.capacity())).sum::<usize>() as f64 / 1048576.0);
 
         let hmm_secs = t0_hmm.elapsed().as_secs_f64();
         let cpu_hmm = selphi::log::cpu_time_secs();

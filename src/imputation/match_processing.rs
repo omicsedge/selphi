@@ -66,13 +66,16 @@ pub fn process_matches(csc: &CscMatchMatrix, kept_matches: usize) -> Vec<Vec<i64
         stops.push(e);
     }
 
-    // 3. Build inverted index: for each variant, which entries cover it
-    let (inv_indptr, inv_indices) = build_inverted_index(&starts, &stops, n_var);
+    // 3. Entries covering each variant. The steps below walk each entry's own range
+    // (`entry_range`) instead of an inverted index (every variant's covering entries):
+    // ~450 entries cover a site on 1000 Genomes, of which ~26 pass its threshold.
+    let range = |i: usize| entry_range(&starts, &stops, i, n_var);
+    let cover = coverage_counts(n_entries, range, n_var);
 
     // 4. Handle missing variants (variants with no PBWT matches)
     let mut missing_source = vec![-1i32; n_var];
     let missing: Vec<usize> = (0..n_var)
-        .filter(|&v| inv_indptr[v + 1] == inv_indptr[v])
+        .filter(|&v| cover[v] == 0)
         .collect();
 
     let added_freq = vec![0i32; n_ref];
@@ -109,9 +112,7 @@ pub fn process_matches(csc: &CscMatchMatrix, kept_matches: usize) -> Vec<Vec<i64
     let normed = compute_normed_scores(&csr_data, &csr_indptr, n_ref, &added_freq);
 
     // 6. Compute per-variant metrics and thresholds
-    let (avg_len, sd_normed, max_normed) = compute_var_metrics(
-        &inv_indptr, &inv_indices, &csr_data, &normed, n_var,
-    );
+    let (avg_len, sd_normed, max_normed) = var_metrics(n_entries, range, &cover, &csr_data, &normed, n_var);
     let data_min = csr_data.iter().copied().min().unwrap_or(0) as f64;
     let std_length = get_std(&avg_len, data_min, n_var as f64);
     let threshold: Vec<f64> = (0..n_var)
@@ -120,7 +121,7 @@ pub fn process_matches(csc: &CscMatchMatrix, kept_matches: usize) -> Vec<Vec<i64
 
     // 7. Top-K selection per variant
     let (top_matches, n_per_site) = top_matches_per_site(
-        &inv_indptr, &inv_indices, &normed, &threshold,
+        n_entries, range, &normed, &threshold,
         &entry_haps(&csr_indptr, n_entries), n_var, kept_matches, &missing_source,
     );
     // 8. Frequency filter: keep haps appearing > SELPHI_MP_MIN_COUNT times
@@ -206,42 +207,22 @@ fn csc_to_csr(csc: &CscMatchMatrix) -> (Vec<i64>, Vec<i32>, Vec<i32>) {
     (indptr, indices, data)
 }
 
-/// Build inverted index: for each variant, which match entries cover it (in entry order).
-fn build_inverted_index(starts: &[i32], stops: &[i32], n_var: usize) -> (Vec<i64>, Vec<i32>) {
-    let n_entries = starts.len();
-    let range = |i: usize| {
-        let s = starts[i] as usize;
-        let e = (stops[i] as usize).min(n_var - 1);
-        (s <= e).then_some((s, e))
-    };
+/// The variants entry `i` covers, `start..=min(stop, n_var - 1)`, if any.
+#[inline]
+fn entry_range(starts: &[i32], stops: &[i32], i: usize, n_var: usize) -> Option<(usize, usize)> {
+    let s = starts[i] as usize;
+    let e = (stops[i] as usize).min(n_var - 1);
+    (s <= e).then_some((s, e))
+}
 
-    // Entries per variant from a difference array: one step per entry instead of one per
-    // covered variant (the fill below is the only walk over the covered ranges).
+/// Number of entries covering each variant, from a difference array.
+fn coverage_counts(n_entries: usize, range: impl Fn(usize) -> Option<(usize, usize)>, n_var: usize) -> Vec<u32> {
     let mut diff = vec![0i64; n_var + 1];
     for i in 0..n_entries {
         if let Some((s, e)) = range(i) { diff[s] += 1; diff[e + 1] -= 1; }
     }
-    let mut indptr = vec![0i64; n_var + 1];
     let mut run = 0i64;
-    for v in 0..n_var {
-        run += diff[v];
-        indptr[v + 1] = indptr[v] + run;
-    }
-
-    // Fill indices: entry order within each variant.
-    let total = indptr[n_var] as usize;
-    let mut indices = vec![0i32; total];
-    let mut cur: Vec<i64> = indptr[..n_var].to_vec();
-    for i in 0..n_entries {
-        if let Some((s, e)) = range(i) {
-            for v in s..=e {
-                indices[cur[v] as usize] = i as i32;
-                cur[v] += 1;
-            }
-        }
-    }
-
-    (indptr, indices)
+    diff[..n_var].iter().map(|&d| { run += d; run as u32 }).collect()
 }
 
 /// Compute normalized scores (frequency-weighted match lengths).
@@ -292,44 +273,51 @@ fn compute_normed_scores(
     normed
 }
 
-/// Compute per-variant metrics.
-fn compute_var_metrics(
-    inv_indptr: &[i64], inv_indices: &[i32],
+/// Per-variant metrics over the entries covering each variant: mean match length, and the
+/// standard deviation and maximum of the normalized scores. Every sum runs over a variant's
+/// entries in ascending entry order — the order an inverted index lists them in, so the
+/// f64 results are the same — but each entry adds itself to its own range of variants, a
+/// contiguous walk, instead of each variant gathering its scattered entries.
+fn var_metrics(
+    n_entries: usize, range: impl Fn(usize) -> Option<(usize, usize)>, cover: &[u32],
     match_data: &[i32], normed: &[f64], n_var: usize,
 ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let mut avg_len = vec![0.0f64; n_var];
-    let mut sd_normed = vec![0.0f64; n_var];
-    let mut max_normed = vec![0.0f64; n_var];
-
-    for v in 0..n_var {
-        let s = inv_indptr[v] as usize;
-        let e = inv_indptr[v + 1] as usize;
-        let n = e - s;
-        if n == 0 { continue; }
-
-        let mut total_len = 0.0f64;
-        let mut total_n = 0.0f64;
-        let mut mx = f64::NEG_INFINITY;
-
-        for i in s..e {
-            let idx = inv_indices[i] as usize;
-            total_len += match_data[idx] as f64;
-            let val = normed[idx];
-            total_n += val;
-            if val > mx { mx = val; }
+    let mut total_len = vec![0.0f64; n_var];
+    let mut total_n = vec![0.0f64; n_var];
+    let mut mx = vec![f64::NEG_INFINITY; n_var];
+    for i in 0..n_entries {
+        let Some((s, e)) = range(i) else { continue };
+        let (len, val) = (match_data[i] as f64, normed[i]);
+        for ((tl, tn), m) in total_len[s..=e].iter_mut().zip(&mut total_n[s..=e]).zip(&mut mx[s..=e]) {
+            *tl += len;
+            *tn += val;
+            if val > *m { *m = val; }
         }
-
-        avg_len[v] = total_len / n as f64;
-        max_normed[v] = mx;
-        let mean_n = total_n / n as f64;
-
-        let mut var_n = 0.0f64;
-        for i in s..e {
-            let d = normed[inv_indices[i] as usize] - mean_n;
-            var_n += d * d;
-        }
-        sd_normed[v] = (var_n / n as f64).sqrt();
     }
+
+    let mut avg_len = vec![0.0f64; n_var];
+    let mut max_normed = vec![0.0f64; n_var];
+    let mut mean_n = vec![0.0f64; n_var];
+    for v in 0..n_var {
+        let n = cover[v];
+        if n == 0 { continue; }
+        avg_len[v] = total_len[v] / n as f64;
+        max_normed[v] = mx[v];
+        mean_n[v] = total_n[v] / n as f64;
+    }
+    let mut var_n = total_len;
+    var_n.fill(0.0);
+    for i in 0..n_entries {
+        let Some((s, e)) = range(i) else { continue };
+        let val = normed[i];
+        for (vr, &mu) in var_n[s..=e].iter_mut().zip(&mean_n[s..=e]) {
+            let d = val - mu;
+            *vr += d * d;
+        }
+    }
+    let sd_normed: Vec<f64> = (0..n_var)
+        .map(|v| if cover[v] == 0 { 0.0 } else { (var_n[v] / cover[v] as f64).sqrt() })
+        .collect();
 
     (avg_len, sd_normed, max_normed)
 }
@@ -356,40 +344,80 @@ fn entry_haps(csr_indptr: &[i64], n_entries: usize) -> Vec<u32> {
     hap
 }
 
-/// Top-K match selection per variant.
+/// Top-K match selection per variant: the entries covering the variant (or, at a missing
+/// variant, its source) whose score reaches the variant's threshold, the K best by score.
+///
+/// The step-8 count, the step-8 filter and the step-9 expansion read only WHICH entries a
+/// variant selects (the expansion lists each site's haplotypes sorted and deduplicated, and
+/// it returns the lists unexpanded only when they are all empty), so a variant with at most
+/// K passing entries takes them all in entry order, unsorted. With more, they are sorted
+/// exactly as before — entry order, then an unstable sort by score — so ties at the K-th
+/// place resolve the same way.
 #[allow(clippy::too_many_arguments)]
 fn top_matches_per_site(
-    inv_indptr: &[i64], inv_indices: &[i32],
+    n_entries: usize, range: impl Fn(usize) -> Option<(usize, usize)>,
     normed: &[f64], threshold: &[f64],
     entry_hap: &[u32], n_var: usize, kept_matches: usize,
     missing_source: &[i32],
 ) -> (Vec<i64>, Vec<usize>) {
+    // Each variant's passing entries in ascending entry order: counted, then filled, both
+    // entry-major over each entry's range.
+    let mut offsets = vec![0usize; n_var + 1];
+    for i in 0..n_entries {
+        let Some((s, e)) = range(i) else { continue };
+        let val = normed[i];
+        for (o, &t) in offsets[s + 1..=e + 1].iter_mut().zip(&threshold[s..=e]) {
+            *o += (val >= t) as usize;
+        }
+    }
+    for v in 0..n_var { offsets[v + 1] += offsets[v]; }
+    let mut passing = vec![0u32; offsets[n_var]];
+    {
+        let mut cur = offsets.clone();
+        for i in 0..n_entries {
+            let Some((s, e)) = range(i) else { continue };
+            let val = normed[i];
+            for (k, &t) in threshold[s..=e].iter().enumerate() {
+                if val >= t { passing[cur[s + k]] = i as u32; cur[s + k] += 1; }
+            }
+        }
+    }
+
+    // A missing variant reads its source's covering entries against its own threshold.
+    let mut sources: Vec<usize> = missing_source.iter().filter(|&&src| src >= 0).map(|&src| src as usize).collect();
+    sources.sort_unstable();
+    sources.dedup();
+    let source_entries: Vec<Vec<u32>> = if sources.is_empty() { Vec::new() } else {
+        let mut lists = vec![Vec::new(); sources.len()];
+        for i in 0..n_entries {
+            let Some((s, e)) = range(i) else { continue };
+            for k in sources.partition_point(|&src| src < s)..sources.partition_point(|&src| src <= e) {
+                lists[k].push(i as u32);
+            }
+        }
+        lists
+    };
+
     let mut result = vec![0i64; n_var * kept_matches];
     let mut n_matches = vec![0usize; n_var];
     // (entry_idx, score), reused across variants
     let mut above: Vec<(i32, f64)> = Vec::new();
 
     for v in 0..n_var {
-        let src = if missing_source[v] >= 0 { missing_source[v] as usize } else { v };
-        let s = inv_indptr[src] as usize;
-        let e = inv_indptr[src + 1] as usize;
-        if s == e { continue; }
-
         let thresh = threshold[v];
-
-        // Collect above-threshold entries
         above.clear();
-        for i in s..e {
-            let idx = inv_indices[i] as usize;
-            if normed[idx] >= thresh {
-                above.push((inv_indices[i], normed[idx]));
-            }
+        if missing_source[v] >= 0 {
+            let k = sources.binary_search(&(missing_source[v] as usize)).expect("a missing variant's source is listed");
+            above.extend(source_entries[k].iter().map(|&i| (i as i32, normed[i as usize])).filter(|&(_, x)| x >= thresh));
+        } else {
+            above.extend(passing[offsets[v]..offsets[v + 1]].iter().map(|&i| (i as i32, normed[i as usize])));
         }
         if above.is_empty() { continue; }
 
-        // Sort by score descending
-        above.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
+        if above.len() > kept_matches {
+            // Sort by score descending
+            above.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
         let n_take = above.len().min(kept_matches);
         for i in 0..n_take {
             result[v * kept_matches + i] = entry_hap[above[i].0 as usize] as i64;
@@ -495,7 +523,7 @@ mod reference {
     //! Reference implementation of `process_matches` (inverted-index counts by a
     //! walk over each covered range, a binary search per selected entry, and the two sorts of
     //! the expansion), verbatim: the current one must reproduce it exactly.
-    use super::{csc_to_csr, compute_normed_scores, compute_var_metrics, get_std, expand_match_range, mp_min_count};
+    use super::{csc_to_csr, compute_normed_scores, get_std, expand_match_range, mp_min_count};
     use crate::imputation::pbwt::CscMatchMatrix;
 
     /// Process a PBWT match matrix into per-site haplotype lists.
@@ -689,6 +717,48 @@ mod reference {
         }
 
         result
+    }
+
+    /// Compute per-variant metrics.
+    fn compute_var_metrics(
+        inv_indptr: &[i64], inv_indices: &[i32],
+        match_data: &[i32], normed: &[f64], n_var: usize,
+    ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let mut avg_len = vec![0.0f64; n_var];
+        let mut sd_normed = vec![0.0f64; n_var];
+        let mut max_normed = vec![0.0f64; n_var];
+
+        for v in 0..n_var {
+            let s = inv_indptr[v] as usize;
+            let e = inv_indptr[v + 1] as usize;
+            let n = e - s;
+            if n == 0 { continue; }
+
+            let mut total_len = 0.0f64;
+            let mut total_n = 0.0f64;
+            let mut mx = f64::NEG_INFINITY;
+
+            for i in s..e {
+                let idx = inv_indices[i] as usize;
+                total_len += match_data[idx] as f64;
+                let val = normed[idx];
+                total_n += val;
+                if val > mx { mx = val; }
+            }
+
+            avg_len[v] = total_len / n as f64;
+            max_normed[v] = mx;
+            let mean_n = total_n / n as f64;
+
+            let mut var_n = 0.0f64;
+            for i in s..e {
+                let d = normed[inv_indices[i] as usize] - mean_n;
+                var_n += d * d;
+            }
+            sd_normed[v] = (var_n / n as f64).sqrt();
+        }
+
+        (avg_len, sd_normed, max_normed)
     }
 
     /// Build inverted index: for each variant, which match entries cover it.
