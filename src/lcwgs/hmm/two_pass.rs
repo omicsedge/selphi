@@ -35,18 +35,18 @@ pub(crate) const MIN_SITES: usize = 4096;
 pub(super) struct Ctx<'a> {
     /// Bit-packed conditioning alleles (`n_var x w64` words); null when the
     /// path reads the panel directly.
-    cbp: *const u64,
-    w64: usize,
-    k: usize,
-    inv_k: f32,
-    ref_bm: &'a HaplotypeBitmatrix,
-    cond: &'a [u32],
-    poly: Option<&'a [usize]>,
+    pub(super) cbp: *const u64,
+    pub(super) w64: usize,
+    pub(super) k: usize,
+    pub(super) inv_k: f32,
+    pub(super) ref_bm: &'a HaplotypeBitmatrix,
+    pub(super) cond: &'a [u32],
+    pub(super) poly: Option<&'a [usize]>,
 }
 
 impl Ctx<'_> {
     #[inline(always)]
-    fn site(&self, v: usize) -> usize { self.poly.map_or(v, |ps| ps[v]) }
+    pub(super) fn site(&self, v: usize) -> usize { self.poly.map_or(v, |ps| ps[v]) }
 }
 
 /// The per-site steps of one forward-backward path, each the operation
@@ -67,7 +67,25 @@ pub(super) trait Kernels {
     /// One backward step at site `v`; returns `(beta_sum, prob_hid_0, prob_hid_1)`.
     #[allow(clippy::too_many_arguments)]
     unsafe fn step<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0: f32, e1: f32, fact1: f32, fact2: f32) -> (f32, f32, f32);
+    /// [`Self::column`] at a read-pair anchor site: times the factor of the plan's
+    /// entries `r` (see [`super::anchored`]).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn column_anchor(c: &Ctx, prev: *const f32, curr: *mut f32, v: usize, e0: f32, e1: f32, pr: f32, asum_prev: f32,
+        p: &Plan, r: Range<usize>) -> f32;
+    /// [`Self::init`] at an anchor site; with `POST`, each entry's posterior mass by
+    /// code is added into `hist` (when not null).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn init_anchor<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0: f32, e1: f32,
+        p: &Plan, r: Range<usize>, hist: *mut f32) -> (f32, f32, f32);
+    /// [`Self::step`] at an anchor site (see [`Self::init_anchor`]).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn step_anchor<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0: f32, e1: f32, fact1: f32, fact2: f32,
+        p: &Plan, r: Range<usize>, hist: *mut f32) -> (f32, f32, f32);
 }
+
+/// A read-pair plan's entries at one site.
+type Range<T> = std::ops::Range<T>;
+use crate::lcwgs::linkage::plan::Plan;
 
 // --------------------------------------------------------------------------
 // AVX-512 (the loop bodies of `run_fb_avx512`)
@@ -90,6 +108,18 @@ impl Kernels for Avx512 {
     }
     unsafe fn step<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0: f32, e1: f32, fact1: f32, fact2: f32) -> (f32, f32, f32) {
         unsafe { step_avx512::<POST>(c.cbp, v * c.w64, acol, bp, e0, e1, fact1, fact2, c.k) }
+    }
+    unsafe fn column_anchor(c: &Ctx, prev: *const f32, curr: *mut f32, v: usize, e0: f32, e1: f32, pr: f32, asum_prev: f32,
+        p: &Plan, r: Range<usize>) -> f32 {
+        unsafe { super::anchored::column_avx512(c, prev, curr, v, e0, e1, pr, asum_prev, p, r) }
+    }
+    unsafe fn init_anchor<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0: f32, e1: f32,
+        p: &Plan, r: Range<usize>, hist: *mut f32) -> (f32, f32, f32) {
+        unsafe { super::anchored::init_avx512::<POST>(c, acol, bp, v, e0, e1, p, r, hist) }
+    }
+    unsafe fn step_anchor<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0: f32, e1: f32, fact1: f32, fact2: f32,
+        p: &Plan, r: Range<usize>, hist: *mut f32) -> (f32, f32, f32) {
+        unsafe { super::anchored::step_avx512::<POST>(c, acol, bp, v, e0, e1, fact1, fact2, p, r, hist) }
     }
 }
 
@@ -231,6 +261,18 @@ impl Kernels for Avx2 {
     }
     unsafe fn step<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0: f32, e1: f32, fact1: f32, fact2: f32) -> (f32, f32, f32) {
         unsafe { step_avx2::<POST>(c.cbp, v * c.w64, acol, bp, e0, e1, fact1, fact2, c.k) }
+    }
+    unsafe fn column_anchor(c: &Ctx, prev: *const f32, curr: *mut f32, v: usize, e0: f32, e1: f32, pr: f32, asum_prev: f32,
+        p: &Plan, r: Range<usize>) -> f32 {
+        unsafe { super::anchored::column_avx2(c, prev, curr, v, e0, e1, pr, asum_prev, p, r) }
+    }
+    unsafe fn init_anchor<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0: f32, e1: f32,
+        p: &Plan, r: Range<usize>, hist: *mut f32) -> (f32, f32, f32) {
+        unsafe { super::anchored::init_avx2::<POST>(c, acol, bp, v, e0, e1, p, r, hist) }
+    }
+    unsafe fn step_anchor<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0: f32, e1: f32, fact1: f32, fact2: f32,
+        p: &Plan, r: Range<usize>, hist: *mut f32) -> (f32, f32, f32) {
+        unsafe { super::anchored::step_avx2::<POST>(c, acol, bp, v, e0, e1, fact1, fact2, p, r, hist) }
     }
 }
 
@@ -417,6 +459,18 @@ impl Kernels for Scalar {
         }
         (new_beta_sum, prob_hid_0, prob_hid_1)
     }}
+    unsafe fn column_anchor(c: &Ctx, prev: *const f32, curr: *mut f32, v: usize, e0: f32, e1: f32, pr: f32, asum_prev: f32,
+        p: &Plan, r: Range<usize>) -> f32 {
+        unsafe { super::anchored::column_scalar(c, prev, curr, v, e0, e1, pr, asum_prev, p, r) }
+    }
+    unsafe fn init_anchor<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0: f32, e1: f32,
+        p: &Plan, r: Range<usize>, hist: *mut f32) -> (f32, f32, f32) {
+        unsafe { super::anchored::init_scalar::<POST>(c, acol, bp, v, e0, e1, p, r, hist) }
+    }
+    unsafe fn step_anchor<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0: f32, e1: f32, fact1: f32, fact2: f32,
+        p: &Plan, r: Range<usize>, hist: *mut f32) -> (f32, f32, f32) {
+        unsafe { super::anchored::step_scalar::<POST>(c, acol, bp, v, e0, e1, fact1, fact2, p, r, hist) }
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -457,6 +511,11 @@ struct Shared<'a> {
     loo: bool,
     ee: f32,
     ed: f32,
+    /// Read-pair anchors (see [`super::anchored`]): their entries' ascending sites,
+    /// the plan, and its posterior accumulator (null: none). Each anchor site lies
+    /// in one block, whose processing alone writes its entries' accumulator.
+    plan: Option<&'a Plan>,
+    hist: *mut f32,
 }
 
 #[cfg(test)]
@@ -477,7 +536,8 @@ const TASK_SCRATCH: usize = 3;
 
 // SAFETY: F writes `chk`/`asum` before the Release store of `fwd_done` that
 // readers Acquire; slots are written before their `ready` Release store;
-// `dosage` rows of a block are written only by the pass that claimed it.
+// `dosage` rows and `hist` entries of a block are written only by the pass that
+// claimed it.
 unsafe impl Sync for Shared<'_> {}
 
 impl Shared<'_> {
@@ -554,21 +614,32 @@ impl Shared<'_> {
         let (lo, hi) = self.bounds(b);
         let last = self.n_var - 1;
         std::ptr::copy_nonoverlapping(self.chk.add(b * k), blk, k);
+        let at: &[u32] = self.plan.map_or(&[], |p| &p.at);
+        let mut up = super::anchored::Ascend::new(at, lo + 1);
         for i in 1..(hi - lo) {
             let v = lo + i;
-            A::column(c, blk.add((i - 1) * k), blk.add(i * k), v,
-                *self.emit.add(2 * v), *self.emit.add(2 * v + 1), *self.p_rec.add(v), *self.asum.add(v - 1));
+            let (e0, e1, pr, asum) = (*self.emit.add(2 * v), *self.emit.add(2 * v + 1), *self.p_rec.add(v), *self.asum.add(v - 1));
+            let r = up.at(v);
+            if r.is_empty() {
+                A::column(c, blk.add((i - 1) * k), blk.add(i * k), v, e0, e1, pr, asum);
+            } else {
+                A::column_anchor(c, blk.add((i - 1) * k), blk.add(i * k), v, e0, e1, pr, asum, self.plan.unwrap(), r);
+            }
         }
+        let mut down = super::anchored::Descend::new(at, hi - 1);
         for v in (lo..hi).rev() {
             let acol = blk.add((v - lo) * k);
             let (e0, e1) = (*self.emit.add(2 * v), *self.emit.add(2 * v + 1));
+            let r = down.at(v);
             let (bs, p0, p1) = if v == last {
-                A::init::<true>(c, acol, bp, v, e0, e1)
+                if r.is_empty() { A::init::<true>(c, acol, bp, v, e0, e1) }
+                else { A::init_anchor::<true>(c, acol, bp, v, e0, e1, self.plan.unwrap(), r, self.hist) }
             } else {
                 let pr = *self.p_rec.add(v + 1);
                 let fact1 = pr * c.inv_k;
                 let fact2 = (1.0 - pr) / beta_sum.max(f32::MIN_POSITIVE);
-                A::step::<true>(c, acol, bp, v, e0, e1, fact1, fact2)
+                if r.is_empty() { A::step::<true>(c, acol, bp, v, e0, e1, fact1, fact2) }
+                else { A::step_anchor::<true>(c, acol, bp, v, e0, e1, fact1, fact2, self.plan.unwrap(), r, self.hist) }
             };
             *beta_sum = bs;
             *self.dosage.add(v) = finalize_site(
@@ -581,15 +652,21 @@ impl Shared<'_> {
         let c = &self.ctx;
         let (lo, hi) = self.bounds(b);
         let last = self.n_var - 1;
+        let at: &[u32] = self.plan.map_or(&[], |p| &p.at);
+        let mut down = super::anchored::Descend::new(at, hi - 1);
+        let null = std::ptr::null_mut();
         for v in (lo..hi).rev() {
             let (e0, e1) = (*self.emit.add(2 * v), *self.emit.add(2 * v + 1));
+            let r = down.at(v);
             let (bs, _, _) = if v == last {
-                A::init::<false>(c, std::ptr::null(), bp, v, e0, e1)
+                if r.is_empty() { A::init::<false>(c, std::ptr::null(), bp, v, e0, e1) }
+                else { A::init_anchor::<false>(c, std::ptr::null(), bp, v, e0, e1, self.plan.unwrap(), r, null) }
             } else {
                 let pr = *self.p_rec.add(v + 1);
                 let fact1 = pr * c.inv_k;
                 let fact2 = (1.0 - pr) / beta_sum.max(f32::MIN_POSITIVE);
-                A::step::<false>(c, std::ptr::null(), bp, v, e0, e1, fact1, fact2)
+                if r.is_empty() { A::step::<false>(c, std::ptr::null(), bp, v, e0, e1, fact1, fact2) }
+                else { A::step_anchor::<false>(c, std::ptr::null(), bp, v, e0, e1, fact1, fact2, self.plan.unwrap(), r, null) }
             };
             *beta_sum = bs;
         }
@@ -611,9 +688,12 @@ impl Shared<'_> {
             self.arrive::<A>(0, scope);
         }
         let (mut prev, mut curr) = (fcol, fcol.add(k));
+        let mut up = super::anchored::Ascend::new(self.plan.map_or(&[], |p| &p.at), 1);
         for v in 1..n_var {
-            let s = A::column(c, prev, curr, v,
-                *self.emit.add(2 * v), *self.emit.add(2 * v + 1), *self.p_rec.add(v), *self.asum.add(v - 1));
+            let (e0, e1, pr, asum) = (*self.emit.add(2 * v), *self.emit.add(2 * v + 1), *self.p_rec.add(v), *self.asum.add(v - 1));
+            let r = up.at(v);
+            let s = if r.is_empty() { A::column(c, prev, curr, v, e0, e1, pr, asum) }
+                else { A::column_anchor(c, prev, curr, v, e0, e1, pr, asum, self.plan.unwrap(), r) };
             *self.asum.add(v) = s;
             if v % stride == 0 {
                 std::ptr::copy_nonoverlapping(curr, self.chk.add((v / stride) * k), k);
@@ -686,16 +766,16 @@ impl Shared<'_> {
 /// Take a kernel scratch buffer out of its thread-local cache for the call:
 /// while this worker waits for the other pass it may run another job that
 /// uses the same cache.
-fn take_tl(cell: &'static std::thread::LocalKey<RefCell<Vec<f32>>>) -> Vec<f32> {
+pub(super) fn take_tl(cell: &'static std::thread::LocalKey<RefCell<Vec<f32>>>) -> Vec<f32> {
     cell.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
-fn put_tl(cell: &'static std::thread::LocalKey<RefCell<Vec<f32>>>, v: Vec<f32>) {
+pub(super) fn put_tl(cell: &'static std::thread::LocalKey<RefCell<Vec<f32>>>, v: Vec<f32>) {
     cell.with(|c| *c.borrow_mut() = v);
 }
 
 /// Uninitialised scratch of `n` floats (every element read is written first).
-fn sized(mut v: Vec<f32>, n: usize) -> Vec<f32> {
+pub(super) fn sized(mut v: Vec<f32>, n: usize) -> Vec<f32> {
     v.clear();
     v.reserve_exact(n);
     // SAFETY: f32 is Copy with no invalid bit patterns; the passes write every
@@ -716,6 +796,8 @@ pub(super) unsafe fn run<A: Kernels>(
     recomb_mult: Option<&[f32]>,
     poly_sites: Option<&[usize]>,
     prepack: Option<&[u64]>,
+    plan: Option<&Plan>,
+    hist: *mut f32,
 ) -> HmmOutput { unsafe {
     let n_var = cm.len();
     let k = cond_haps.len();
@@ -775,6 +857,8 @@ pub(super) unsafe fn run<A: Kernels>(
         scratch: Mutex::new((0..TASK_SCRATCH).map(|_| (sized(Vec::new(), k), sized(Vec::new(), stride * k))).collect()),
         loo: lcwgs_loo(),
         ee, ed,
+        plan,
+        hist,
     };
     {
         let (fp, bp, blkp) = (fcol.as_mut_ptr() as usize, beta.as_mut_ptr() as usize, blk.as_mut_ptr() as usize);
@@ -822,12 +906,12 @@ mod tests {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                if use_avx512_lcwgs() { return run::<Avx512>(hl, cond, bm, cm, params, rmult, poly, prepack).dosage; }
-                if use_avx2_lcwgs() { return run::<Avx2>(hl, cond, bm, cm, params, rmult, poly, prepack).dosage; }
+                if use_avx512_lcwgs() { return run::<Avx512>(hl, cond, bm, cm, params, rmult, poly, prepack, None, std::ptr::null_mut()).dosage; }
+                if use_avx2_lcwgs() { return run::<Avx2>(hl, cond, bm, cm, params, rmult, poly, prepack, None, std::ptr::null_mut()).dosage; }
             }
             #[cfg(target_arch = "aarch64")]
             if use_neon_lcwgs() { return run_forward_backward(hl, cond, bm, cm, params, rmult, poly, prepack).dosage; }
-            run::<Scalar>(hl, cond, bm, cm, params, rmult, poly, prepack).dosage
+            run::<Scalar>(hl, cond, bm, cm, params, rmult, poly, prepack, None, std::ptr::null_mut()).dosage
         }
     }
 

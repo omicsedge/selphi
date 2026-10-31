@@ -211,6 +211,19 @@ pub(crate) struct ChunkPassengers<'a> {
     pub cm: &'a [f64],
 }
 
+/// A chunk's read-pair linkage (see [`super::linkage`]): each sample's fragments
+/// over the chunk (`None`: the sample is not linked), the likelihoods its
+/// forward-backward reads (`gl3`'s layout, with the likelihood of the bases left at
+/// every site linked bases were taken from), and which halves run: the
+/// forward-backward's anchors (with that likelihood and the joint draws) and the
+/// phaser's potentials.
+pub(crate) struct ChunkLinkage<'a> {
+    pub samples: &'a [Option<super::linkage::view::ChunkLinks>],
+    pub gl_fb: &'a [f32],
+    pub fb: bool,
+    pub phase: bool,
+}
+
 /// Panel-side facts of a chunk's passengers, built once per chain.
 struct PassengerModel {
     /// Common (panel MAF >= rare_maf): always polymorphic.
@@ -350,7 +363,7 @@ fn passenger_dose<F: Fn(usize) -> usize>(
     h: usize, partner_at: F, cond: &[u32],
     gl3: &[f32], n_samples: usize, ref_bm: &HaplotypeBitmatrix, cm: &[f64], params: &LcwgsParams,
     axis: Option<&[usize]>, band: bool, pass: &ChunkPassengers<'_>, model: &PassengerModel, two_pass: bool,
-    main_pack: Option<&[u64]>,
+    main_pack: Option<&[u64]>, link: Option<&super::linkage::view::ChunkLinks>,
 ) -> Vec<f32> {
     let n_pass = pass.ins.len();
     if cond.is_empty() { return vec![0.5; n_pass]; }
@@ -395,7 +408,16 @@ fn passenger_dose<F: Fn(usize) -> usize>(
         }
         out
     });
-    let d = run_forward_backward_with(&hl, cond, ref_bm, &acm, params, Some(&rm), Some(&rows), prepack.as_deref(), two_pass).dosage;
+    // The main pass's anchors on the merged axis: the i-th active site sits at slot
+    // `active[i]`.
+    let mut plan = super::linkage::plan::Plan::default();
+    if let Some(l) = link {
+        let active: Vec<u32> = rows.iter().enumerate().filter(|&(_, &r)| r < row0).map(|(i, _)| i as u32).collect();
+        let index = |v: usize| axis.map_or(v, |a| a.binary_search(&v).expect("a linked site is on the axis"));
+        plan.build(l, &partner_at, |v| active[index(v)] as usize, params.min_gl);
+    }
+    let linked = link.map(|_| crate::lcwgs::hmm::Linked { plan: &plan, hist: None });
+    let d = run_forward_backward_with(&hl, cond, ref_bm, &acm, params, Some(&rm), Some(&rows), prepack.as_deref(), two_pass, linked).dosage;
     for (k, &p) in poly.iter().enumerate() { dose[p] = d[slot[k]]; }
     dose
 }
@@ -457,11 +479,19 @@ fn run_one_hap<F: Fn(usize) -> usize>(
     // Offer the forward-backward's second pass to another worker (identical
     // dosages; see `hmm::two_pass`).
     two_pass: bool,
+    // The sample's read-pair fragments: anchors in the forward-backward and joint
+    // draws of the sites they link (`gl3` is then the likelihood of the bases left).
+    link: Option<&super::linkage::view::ChunkLinks>,
 ) -> (Vec<f32>, Vec<u8>) {
     let hl_at = |v: usize| {
         let g = (v * n_samples + h / 2) * 3 + partner_at(v);
         conditional_hl(gl3[g], gl3[g + 1], params.min_gl)
     };
+    // The anchors of this pass on its axis, and the accumulator of their posterior
+    // mass by code; `drawn_on`: the axis, once the pass has anchors.
+    let mut plan = super::linkage::plan::Plan::default();
+    let mut hist: Vec<f32> = Vec::new();
+    let mut drawn_on: Option<Option<&[usize]>> = None;
     let dose = {
         let mut scratch = HapScratch::default();
         let HapScratch { hl, cm: cm_poly, rmult } = &mut scratch;
@@ -512,9 +542,16 @@ fn run_one_hap<F: Fn(usize) -> usize>(
             }
             let mut dose = vec![0.0f32; n_var];
             if !poly_sites.is_empty() {
+                let linked = match link {
+                    Some(l) => {
+                        drawn_on = Some(Some(poly_sites));
+                        Some(anchor_plan(l, &partner_at, Some(poly_sites), params.min_gl, &mut plan, &mut hist))
+                    }
+                    None => None,
+                };
                 let dp = run_forward_backward_with(
                     hl, cond, ref_bm, cm_poly, params,
-                    band_r.map(|_| rmult.as_slice()), Some(poly_sites), prepack, two_pass,
+                    band_r.map(|_| rmult.as_slice()), Some(poly_sites), prepack, two_pass, linked,
                 ).dosage;
                 for (i, &v) in poly_sites.iter().enumerate() { dose[v] = dp[i]; }
             }
@@ -542,7 +579,14 @@ fn run_one_hap<F: Fn(usize) -> usize>(
             // precomputed once by the caller; `None` for the default `max`/`nref` modes
             // ⇒ uniform rate ⇒ byte-identical to the pre-band full-axis path.
             hl.extend((0..n_var).flat_map(hl_at));
-            run_forward_backward_with(hl, cond, ref_bm, cm, params, full_axis_rmult, None, prepack, two_pass).dosage
+            let linked = match link {
+                Some(l) => {
+                    drawn_on = Some(None);
+                    Some(anchor_plan(l, &partner_at, None, params.min_gl, &mut plan, &mut hist))
+                }
+                None => None,
+            };
+            run_forward_backward_with(hl, cond, ref_bm, cm, params, full_axis_rmult, None, prepack, two_pass, linked).dosage
         }
     };
     // Sample a fresh allele per site from the posterior dose (deterministic
@@ -559,7 +603,25 @@ fn run_one_hap<F: Fn(usize) -> usize>(
         let u = (x >> 40) as f32 / (1u64 << 24) as f32; // uniform [0,1)
         sampled[v] = if u < dose[v] { 1 } else { 0 };
     }
+    // The sites a fragment links are drawn jointly from its anchor's posterior.
+    if let Some(axis) = drawn_on {
+        let mut fixed = Vec::new();
+        let (drawn, left) = plan.draw(&hist, |r| axis.map_or(r, |a| a[r]), super::linkage::plan::draw_key(seed, it, h), &mut sampled, &mut fixed);
+        super::linkage::count_draws(plan.len(), drawn, left);
+    }
     (dose, sampled)
+}
+
+/// Build `plan` from a sample's fragments for a pass on `axis` (`None`: the full
+/// axis) against the partner's alleles, with its posterior accumulator `hist` zeroed.
+fn anchor_plan<'a>(
+    link: &super::linkage::view::ChunkLinks, partner_at: &impl Fn(usize) -> usize, axis: Option<&[usize]>, floor: f32,
+    plan: &'a mut super::linkage::plan::Plan, hist: &'a mut Vec<f32>,
+) -> crate::lcwgs::hmm::Linked<'a> {
+    plan.build(link, partner_at, |v| axis.map_or(v, |a| a.binary_search(&v).expect("a linked site is on the axis")), floor);
+    hist.clear();
+    hist.resize(plan.hist_len(), 0.0);
+    crate::lcwgs::hmm::Linked { plan, hist: Some(hist) }
 }
 
 /// Tunable knobs + diagnostics for the Gibbs loop, parsed once from the
@@ -770,7 +832,7 @@ pub fn run_gibbs(
     k_max_override: Option<usize>,
     precomputed_cond: Option<&Vec<Vec<u32>>>,
 ) -> GibbsOutput {
-    run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, SampleExecution::Unbudgeted, None, None, None)
+    run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, SampleExecution::Unbudgeted, None, None, None, None)
 }
 
 // Test seam: the k_max cut a test thread's Gibbs runs use instead of the env.
@@ -801,6 +863,7 @@ fn run_gibbs_with_memory(
     panel: Option<&PanelSide>,
     passengers: Option<&ChunkPassengers<'_>>,
     hub: Option<crate::sparse_ls::haplotype_set::HubMember>,
+    link: Option<&ChunkLinkage<'_>>,
 ) -> GibbsOutput {
     let memory = execution.permits();
     let n_var = cm.len();
@@ -1209,6 +1272,12 @@ fn run_gibbs_with_memory(
             let mut scratch = SampleScratch::default();
             let SampleScratch { split0: buf0, split1: buf1, h0, h1, ps, ms, cond_union } = &mut scratch;
             let (h0i, h1i) = (2 * s, 2 * s + 1);
+            // This sample's fragments: the forward-backward half reads the likelihood of
+            // the bases they leave and anchors them; the phaser half takes potentials.
+            let linked = link.and_then(|l| l.samples[s].as_ref().map(|x| (l, x)));
+            let fb_link = linked.filter(|(l, _)| l.fb).map(|(_, x)| x);
+            let gl_fb: &[f32] = if fb_link.is_some() { link.unwrap().gl_fb } else { gl3 };
+            let phase_link = linked.filter(|(l, _)| l.phase).map(|(_, x)| (x, params.min_gl));
             let (c0, c1): (&[u32], &[u32]) = (&cond_per_hap[h0i], &cond_per_hap[h1i]);
             // Packing applies to the (compacted or full-axis) FB only: the scaffold
             // FB and the no-conditioning shortcut read the panel directly.
@@ -1256,8 +1325,8 @@ fn run_gibbs_with_memory(
                     // Band-mode multipliers entered this haplotype's main pass on the
                     // poly-skip axis and on the full axis when it carried them.
                     let band = sp.is_some() || full_axis_rmult.is_some();
-                    pass_now.then(|| passenger_dose(h, partner, c, gl3, n_samples, ref_bm, cm, params,
-                        sp.map(|x| x.poly.as_slice()), band, pass.unwrap(), pass_model.as_ref().unwrap(), two_pass, mp))
+                    pass_now.then(|| passenger_dose(h, partner, c, gl_fb, n_samples, ref_bm, cm, params,
+                        sp.map(|x| x.poly.as_slice()), band, pass.unwrap(), pass_model.as_ref().unwrap(), two_pass, mp, fb_link))
                 };
                 let fb0 = |hp: &mut Vec<u64>| {
                     let pack = match pack_for(c0, split0, &base, hp) {
@@ -1266,11 +1335,11 @@ fn run_gibbs_with_memory(
                     let (d, smp) = run_one_hap(
                         h0i, it, seed,
                         |v| prev_alleles[v * n_target_haps + h1i] as usize,
-                        c0, gl3, n_samples, ref_bm, cm, params,
+                        c0, gl_fb, n_samples, ref_bm, cm, params,
                         use_scaffold, &common_idx, n_var,
                         split0.map(|x| (x, ic_all, ps_mono_alt.as_slice())),
                         full_axis_rmult.as_deref(),
-                        pack, two_pass);
+                        pack, two_pass, fb_link);
                     let pd = pass_fb(h0i, &|v| prev_alleles[v * n_target_haps + h1i] as usize, c0, split0, pack);
                     (d, smp, pd)
                 };
@@ -1281,11 +1350,11 @@ fn run_gibbs_with_memory(
                     let (d, smp) = run_one_hap(
                         h1i, it, seed,
                         |v| fresh.map_or(prev_alleles[v * n_target_haps + h0i], |a| a[v]) as usize,
-                        c1, gl3, n_samples, ref_bm, cm, params,
+                        c1, gl_fb, n_samples, ref_bm, cm, params,
                         use_scaffold, &common_idx, n_var,
                         split1.map(|x| (x, ic_all, ps_mono_alt.as_slice())),
                         full_axis_rmult.as_deref(),
-                        pack, two_pass);
+                        pack, two_pass, fb_link);
                     let pd = pass_fb(h1i, &|v| fresh.map_or(prev_alleles[v * n_target_haps + h0i], |a| a[v]) as usize, c1, split1, pack);
                     (d, smp, pd)
                 };
@@ -1392,7 +1461,7 @@ fn run_gibbs_with_memory(
                         hmm.set_two_pass(two_pass);
                         hmm.set_release_above(execution.release_above());
                         hmm.rephase(h0, h1, flat, cond_haps, ref_bm, cm, &g2p,
-                                    poly_ref, mono_ref, &lq, &mut rng_u01, phase_base);
+                                    poly_ref, mono_ref, &lq, &mut rng_u01, phase_base, phase_link);
                         for v in 0..n_var { samp0[v] = h0[v] as u8; samp1[v] = h1[v] as u8; }
                         if let Some(t) = tp {
                             PHASE_NS.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
@@ -1690,9 +1759,10 @@ pub(crate) fn run_gibbs_ensemble_with_memory(
     passengers: Option<&ChunkPassengers<'_>>,
     hub: Option<crate::sparse_ls::haplotype_set::HubMember>,
     together: usize,
+    link: Option<&ChunkLinkage<'_>>,
 ) -> GibbsOutput {
     run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, gibbs_chains(params), together,
-        execution, panel, passengers, hub)
+        execution, panel, passengers, hub, link)
 }
 
 /// The run's Gibbs chains: `LCWGS_GIBBS_RESTARTS` when set, else two under the
@@ -1744,7 +1814,7 @@ pub(crate) fn run_gibbs_ensemble_n(
     n_restarts: usize,
 ) -> GibbsOutput {
     run_gibbs_ensemble_inner(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, n_restarts, 1,
-        SampleExecution::Unbudgeted, None, None, None)
+        SampleExecution::Unbudgeted, None, None, None, None)
 }
 
 /// `n_restarts` chains averaged, `together` of them at a time (each on its own
@@ -1768,17 +1838,18 @@ fn run_gibbs_ensemble_inner(
     panel: Option<&PanelSide>,
     passengers: Option<&ChunkPassengers<'_>>,
     hub: Option<crate::sparse_ls::haplotype_set::HubMember>,
+    link: Option<&ChunkLinkage<'_>>,
 ) -> GibbsOutput {
     use crate::sparse_ls::haplotype_set::{HubMember, SweepHub};
     let n_restarts = n_restarts.max(1);
     if n_restarts == 1 {
-        return run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, execution, panel, passengers, hub);
+        return run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, params, k_max_override, precomputed_cond, execution, panel, passengers, hub, link);
     }
     // Several chains sweep with one another only, not with another pass.
     drop(hub);
     let run = |i: usize, member: Option<HubMember>| {
         let p = LcwgsParams { seed: chain_seed(params, i), ..params.clone() };
-        run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, &p, k_max_override, precomputed_cond, execution, panel, passengers, member)
+        run_gibbs_with_memory(gl3, ref_bm, cm, n_samples, &p, k_max_override, precomputed_cond, execution, panel, passengers, member, link)
     };
     // Dosage, GP, passenger dosage, passenger GP, summed in f64.
     let mut sum: Vec<Vec<f64>> = Vec::new();
@@ -2013,7 +2084,7 @@ mod tests {
                             let old = run_one_hap_reference(2 * s, s, 4, 123, |v| partner[v], &cond,
                                 &gl3, &bm, &cm, &params, mode == 2, &common, n, ns, poly, None, None);
                             let new = run_one_hap(2 * s, 4, 123, |v| partner[v], &cond,
-                                &gl3, ns, &bm, &cm, &params, mode == 2, &common, n, poly, None, None, false);
+                                &gl3, ns, &bm, &cm, &params, mode == 2, &common, n, poly, None, None, false, None);
                             assert_eq!(new.0.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                                 old.0.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                                 "n={n} k={k} sample={s} mode={mode} floor={mg}");
@@ -2499,7 +2570,7 @@ mod tests {
             let pass = (n_pass > 0).then_some(&pass);
             let budget = super::super::memory::MemoryBudget::new(512 * 1024 * 1024, 1024);
             let exec = SampleExecution::Admitted(&budget);
-            let run = |p: &LcwgsParams, k: Option<usize>, hub| run_gibbs_with_memory(&gl3, &bm, &cm, 1, p, k, None, exec, Some(&panel), pass, hub);
+            let run = |p: &LcwgsParams, k: Option<usize>, hub| run_gibbs_with_memory(&gl3, &bm, &cm, 1, p, k, None, exec, Some(&panel), pass, hub, None);
             let serial = (run(&main, None, None), run(&deep, Some(80), None));
             let together = std::thread::scope(|scope| {
                 let mut members = SweepHub::members(2).into_iter();
@@ -2517,7 +2588,7 @@ mod tests {
             }
             assert_ne!(bits(&serial.0.dosage), bits(&serial.1.dosage), "the two passes differ");
             // The panel's plan reproduces a chain that records its own.
-            let own = run_gibbs_with_memory(&gl3, &bm, &cm, 1, &main, None, None, exec, None, pass, None);
+            let own = run_gibbs_with_memory(&gl3, &bm, &cm, 1, &main, None, None, exec, None, pass, None, None);
             assert_eq!(bits(&own.dosage), bits(&serial.0.dosage), "own plan n_var={n_var}");
             assert_eq!(bits(&own.gp), bits(&serial.0.gp), "own plan n_var={n_var}");
         }
@@ -2552,7 +2623,7 @@ mod tests {
                 let params = LcwgsParams { n_iterations: 6, n_main_iterations: 4, kpbwt: 60, pbwt_modulo_cm: 0.004, small_profile,
                     cap: small_profile.then(|| CapPlan::rank_only(CapOrder::G2)), ..Default::default() };
                 for (n, group, pnl) in [(2, 2, Some(&panel)), (3, 2, Some(&panel)), (3, 3, Some(&panel)), (2, 2, None)] {
-                    let run = |together| run_gibbs_ensemble_inner(&gl3, &bm, &cm, 1, &params, None, None, n, together, exec, pnl, pass, None);
+                    let run = |together| run_gibbs_ensemble_inner(&gl3, &bm, &cm, 1, &params, None, None, n, together, exec, pnl, pass, None, None);
                     let (serial, together) = (run(1), run(group));
                     let what = format!("n_var={n_var} chains={n} group={group} small={small_profile} panel={} budget={}", pnl.is_some(), budget.work_limit());
                     for (name, x, y) in [("dosage", &serial.dosage, &together.dosage), ("gp", &serial.gp, &together.gp),
@@ -2560,7 +2631,7 @@ mod tests {
                         assert_eq!(bits(x), bits(y), "{name} {what}");
                     }
                     let alone: Vec<_> = (0..n).map(|i| run_gibbs_with_memory(&gl3, &bm, &cm, 1,
-                        &LcwgsParams { seed: chain_seed(&params, i), ..params.clone() }, None, None, exec, pnl, pass, None)).collect();
+                        &LcwgsParams { seed: chain_seed(&params, i), ..params.clone() }, None, None, exec, pnl, pass, None, None)).collect();
                     let mean: Vec<f32> = (0..serial.dosage.len())
                         .map(|j| (alone.iter().fold(0.0f64, |a, o| a + o.dosage[j] as f64) / n as f64) as f32).collect();
                     assert_eq!(bits(&mean), bits(&together.dosage), "chain mean {what}");
@@ -2594,7 +2665,7 @@ mod tests {
         let exec = SampleExecution::Admitted(&budget);
         let run = |p: &LcwgsParams, every: Option<usize>, hub| {
             SELECT_EVERY_TEST.with(|c| c.set(every));
-            let out = run_gibbs_with_memory(&gl3, &bm, &cm, 1, p, None, None, exec, Some(&panel), None, hub);
+            let out = run_gibbs_with_memory(&gl3, &bm, &cm, 1, p, None, None, exec, Some(&panel), None, hub, None);
             SELECT_EVERY_TEST.with(|c| c.set(None));
             out
         };
@@ -2641,10 +2712,10 @@ mod tests {
             for admitted in [false, true] {
                 let budget = super::super::memory::MemoryBudget::new(256 * 1024 * 1024, 1024);
                 let exec = || if admitted && n_samples == 1 { SampleExecution::Admitted(&budget) } else { SampleExecution::Unbudgeted };
-                let base = run_gibbs_with_memory(&gl3, &active, &cm, n_samples, &params, None, None, exec(), None, None, None);
+                let base = run_gibbs_with_memory(&gl3, &active, &cm, n_samples, &params, None, None, exec(), None, None, None, None);
                 assert!(base.pass_dosage.is_empty() && base.pass_gp.is_empty());
                 let pass = ChunkPassengers { ins: ins.clone(), cm: &pcm };
-                let out = run_gibbs_with_memory(&gl3, &hidden, &cm, n_samples, &params, None, None, exec(), None, Some(&pass), None);
+                let out = run_gibbs_with_memory(&gl3, &hidden, &cm, n_samples, &params, None, None, exec(), None, Some(&pass), None, None);
                 assert_eq!(bits(&out.dosage), bits(&base.dosage), "dosage n_var={n_var} samples={n_samples} admitted={admitted}");
                 assert_eq!(bits(&out.gp), bits(&base.gp), "gp n_var={n_var} samples={n_samples} admitted={admitted}");
                 assert_eq!(out.pass_dosage.len(), n_pass * n_samples);
@@ -2692,21 +2763,21 @@ mod tests {
                     cond.truncate(k);
                     let split = poly_split(&cond, &ic, &sr, n_var);
                     if split.poly.is_empty() { continue; }
-                    let got = passenger_dose(0, |v| partner[v], &cond, &gl3, 1, &bm, &cm, &params, Some(&split.poly), band, &pass, &model, false, None);
+                    let got = passenger_dose(0, |v| partner[v], &cond, &gl3, 1, &bm, &cm, &params, Some(&split.poly), band, &pass, &model, false, None, None);
                     // Reusing the main pass's pack gives the same bits.
                     let mut mp = Vec::new();
                     crate::lcwgs::hmm::pack_cond_rows(&bm, &cond, Some(&split.poly), split.poly.len(), None, &mut mp);
-                    let got_packed = passenger_dose(0, |v| partner[v], &cond, &gl3, 1, &bm, &cm, &params, Some(&split.poly), band, &pass, &model, false, Some(&mp));
+                    let got_packed = passenger_dose(0, |v| partner[v], &cond, &gl3, 1, &bm, &cm, &params, Some(&split.poly), band, &pass, &model, false, Some(&mp), None);
                     assert_eq!(got.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), got_packed.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
                     // Main pass over the poly axis.
                     let hl_main: Vec<f32> = split.poly.iter().flat_map(|&v| hl_at(v)).collect();
                     let cm_main: Vec<f64> = split.poly.iter().map(|&v| cm[v]).collect();
                     let rm_main: Option<Vec<f32>> = rmult.map(|a| split.poly.iter().map(|&v| a[v]).collect());
-                    let main = run_forward_backward_with(&hl_main, &cond, &bm, &cm_main, &params, rm_main.as_deref(), Some(&split.poly), None, false).dosage;
+                    let main = run_forward_backward_with(&hl_main, &cond, &bm, &cm_main, &params, rm_main.as_deref(), Some(&split.poly), None, false, None).dosage;
                     // Reference: every passenger on the axis.
                     let scale = crate::lcwgs::hmm::recomb_scale(params.ne, cond.len(), n_haps);
                     let (rows, acm, hl, rm, _) = passenger_axis(Some(&split.poly), n_var, &cm, &pass, &all, n_var, &hl_at, rmult, scale);
-                    let reference = run_forward_backward_with(&hl, &cond, &bm, &acm, &params, Some(&rm), Some(&rows), None, false).dosage;
+                    let reference = run_forward_backward_with(&hl, &cond, &bm, &acm, &params, Some(&rm), Some(&rows), None, false, None).dosage;
                     let mut seen_active = 0;
                     for (i, &r) in rows.iter().enumerate() {
                         if r < n_var {

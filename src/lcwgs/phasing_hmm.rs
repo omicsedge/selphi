@@ -1838,6 +1838,8 @@ impl PhasingHmm {
     // ===================================================================
 
     /// forward pass.
+    /// With `store`, each segment boundary's HProbs and their sum are appended there
+    /// (`HP_STRIDE` floats) instead of being drawn from.
     fn forward(
         &mut self,
         ref_bm: &HaplotypeBitmatrix,
@@ -1845,6 +1847,7 @@ impl PhasingHmm {
         cm: &[f64],
         mism: f32,
         rng_u01: &mut impl FnMut() -> f32,
+        mut store: Option<&mut Vec<f32>>,
     ) {
         self.curr_segment_index = 0;
         self.curr_segment_locus = 0;
@@ -1909,8 +1912,13 @@ impl PhasingHmm {
                 debug_assert!(!ret1, "TRANS_HAP numerical failure");
                 // SAFETY: the next segment's snapshot is not read again.
                 unsafe { seg_free.consumed(seg + 1); }
-                let ret2 = self.sample_dip(rng_u01);
-                debug_assert!(!ret2, "SAMPLE_DIP numerical failure");
+                if let Some(hp) = store.as_deref_mut() {
+                    hp.extend_from_slice(&self.hprobs);
+                    hp.push(self.sum_hprobs);
+                } else {
+                    let ret2 = self.sample_dip(rng_u01);
+                    debug_assert!(!ret2, "SAMPLE_DIP numerical failure");
+                }
             }
 
             // PHASE RARE HETS.
@@ -2471,6 +2479,11 @@ impl PhasingHmm {
         // Shared-prefix conditioning pack (see `pack_condbits`); the caller
         // guarantees `cond_haps[..base.b] == base states`. None = gather every site.
         base_pack: Option<&crate::lcwgs::hmm::BasePack>,
+        // The sample's read-pair fragments (chunk sites = the absolute sites here) and
+        // the likelihood floor: their potentials on the diplotypes (see
+        // `crate::lcwgs::linkage::phase`). None, or no fragment reading two typed
+        // heterozygotes, keeps the sequential draws exactly.
+        links: Option<(&crate::lcwgs::linkage::view::ChunkLinks, f32)>,
     ) {
         self.n_states = cond_haps.len();
         self.base_pack = base_pack.map_or(std::ptr::null(), |b| b as *const _);
@@ -2489,6 +2502,8 @@ impl PhasingHmm {
             self.condrow = std::ptr::null();
             return;
         }
+        let potentials = links.and_then(|(l, floor)| crate::lcwgs::linkage::phase::Potentials::build(
+            l, &self.var_typ, &self.var_abs, &self.segments, floor));
         self.allocate_snapshots();
         #[cfg(target_arch = "x86_64")]
         if self.simd != SimdMode::Scalar {
@@ -2508,29 +2523,56 @@ impl PhasingHmm {
             None
         };
 
-        // Seed dip_sampled[0] from the segment-0 backward marginals.
-        self.sum_dprobs = 0.0;
-        let sss0 = self.phasing_prob_sum_sum[0];
-        for d in 0..HAP_NUMBER {
-            self.dprobs[d] = (self.phasing_prob_sum[d] / sss0)
-                * (self.phasing_prob_sum[HAP_NUMBER - d - 1] / sss0);
-            self.sum_dprobs += self.dprobs[d];
-        }
-        self.dip_sampled[0] = rng_sample(&self.dprobs, self.sum_dprobs, rng_u01) as i32;
+        if let Some(pot) = &potentials {
+            // Every boundary's HProbs first, then the diplotypes drawn with the
+            // fragments' potentials (forward-filtering backward-sampling).
+            let hp = match boundaries {
+                Some(hp) => hp,
+                None => {
+                    let mut hp = Vec::with_capacity(self.n_segs.saturating_sub(1) * HP_STRIDE);
+                    self.forward(ref_bm, cond_haps, cm, mism, rng_u01, Some(&mut hp));
+                    hp
+                }
+            };
+            let p0: [f32; HAP_NUMBER] = std::array::from_fn(|d| self.phasing_prob_sum[d]);
+            pot.sample(&p0, &hp, &mut self.dip_sampled, rng_u01);
+            if pot.has_long() {
+                // The current diplotypes, read off h0 at each segment's heterozygotes.
+                let mut cur = vec![0i32; self.n_segs];
+                let (mut seg, mut at) = (0usize, 0i32);
+                for (&typ, &abs) in self.var_typ.iter().zip(&self.var_abs) {
+                    while at >= self.segments[seg] { seg += 1; at = 0; }
+                    if typ >= VAR_PEAK_HET { cur[seg] |= (h0[abs as usize] as i32) << (2 - typ); }
+                    at += 1;
+                }
+                for d in cur.iter_mut() { *d = HAP_NUMBER as i32 - 1 - *d; }
+                if !pot.accept(&self.dip_sampled, &cur, rng_u01()) { self.dip_sampled.copy_from_slice(&cur); }
+            }
+        } else {
+            // Seed dip_sampled[0] from the segment-0 backward marginals.
+            self.sum_dprobs = 0.0;
+            let sss0 = self.phasing_prob_sum_sum[0];
+            for d in 0..HAP_NUMBER {
+                self.dprobs[d] = (self.phasing_prob_sum[d] / sss0)
+                    * (self.phasing_prob_sum[HAP_NUMBER - d - 1] / sss0);
+                self.sum_dprobs += self.dprobs[d];
+            }
+            self.dip_sampled[0] = rng_sample(&self.dprobs, self.sum_dprobs, rng_u01) as i32;
 
-        match boundaries {
-            // The forward pass's draws, in its order: one per segment boundary.
-            Some(hp) => for (seg, b) in hp.chunks_exact(HP_STRIDE).enumerate() {
-                self.curr_segment_index = seg as i32;
-                self.hprobs.copy_from_slice(&b[..HAP_NUMBER * HAP_NUMBER]);
-                self.sum_hprobs = b[HAP_NUMBER * HAP_NUMBER];
-                let ret1 = self.sum_hprobs.is_nan() || self.sum_hprobs.is_infinite() || self.sum_hprobs < F32_TINY;
-                debug_assert!(!ret1, "TRANS_HAP numerical failure");
-                let ret2 = self.sample_dip(rng_u01);
-                debug_assert!(!ret2, "SAMPLE_DIP numerical failure");
-            },
-            // forward (fills dip_sampled[seg+1] + imputeProbOf1s).
-            None => self.forward(ref_bm, cond_haps, cm, mism, rng_u01),
+            match boundaries {
+                // The forward pass's draws, in its order: one per segment boundary.
+                Some(hp) => for (seg, b) in hp.chunks_exact(HP_STRIDE).enumerate() {
+                    self.curr_segment_index = seg as i32;
+                    self.hprobs.copy_from_slice(&b[..HAP_NUMBER * HAP_NUMBER]);
+                    self.sum_hprobs = b[HAP_NUMBER * HAP_NUMBER];
+                    let ret1 = self.sum_hprobs.is_nan() || self.sum_hprobs.is_infinite() || self.sum_hprobs < F32_TINY;
+                    debug_assert!(!ret1, "TRANS_HAP numerical failure");
+                    let ret2 = self.sample_dip(rng_u01);
+                    debug_assert!(!ret2, "SAMPLE_DIP numerical failure");
+                },
+                // forward (fills dip_sampled[seg+1] + imputeProbOf1s).
+                None => self.forward(ref_bm, cond_haps, cm, mism, rng_u01, None),
+            }
         }
         // Relayout uses sampled diplotypes and allele marginals, not K-wide states.
         self.release_snapshots();
@@ -2875,7 +2917,7 @@ mod tests {
                 let mut draws = rp::Xs(4913);
                 let mut count = 0;
                 hmm.rephase(&mut a, &mut b, &flat, &cond, &bm, &cm, &params,
-                    &poly, &[], &lq, &mut || { count += 1; draws.below(1 << 24) as f32 / (1 << 24) as f32 }, None);
+                    &poly, &[], &lq, &mut || { count += 1; draws.below(1 << 24) as f32 / (1 << 24) as f32 }, None, None);
                 let bits = |xs: &[f32]| xs.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
                 (a, b, count, bits(&hmm.phasing_prob), bits(&hmm.impute_prob), bits(&hmm.impute_prob_of_1s))
             };
@@ -2913,7 +2955,7 @@ mod tests {
                     let mut draws = rp::Xs(2347);
                     let mut count = 0;
                     hmm.rephase(&mut a, &mut b, &flat, &cond, &bm, &cm, &params,
-                        &poly, &mono, &lq, &mut || { count += 1; draws.below(1 << 24) as f32 / (1 << 24) as f32 }, pack);
+                        &poly, &mono, &lq, &mut || { count += 1; draws.below(1 << 24) as f32 / (1 << 24) as f32 }, pack, None);
                     let bits = |xs: &[f32]| xs.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
                     (a, b, count, bits(&hmm.phasing_prob), bits(&hmm.impute_prob), bits(&hmm.impute_prob_of_1s))
                 };
@@ -2953,7 +2995,7 @@ mod tests {
                     let mut draws = rp::Xs(77_003);
                     let mut count = 0;
                     hmm.rephase(&mut a, &mut b, &flat, &cond, &bm, &cm, &params,
-                        &poly, &mono, &lq, &mut || { count += 1; draws.below(1 << 24) as f32 / (1 << 24) as f32 }, pack);
+                        &poly, &mono, &lq, &mut || { count += 1; draws.below(1 << 24) as f32 / (1 << 24) as f32 }, pack, None);
                     let bits = |xs: &[f32]| xs.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
                     (a, b, count, bits(&hmm.impute_prob_of_1s), hmm.dip_sampled.clone())
                 });
@@ -3042,7 +3084,7 @@ mod tests {
 
         hmm.rephase(
             &mut h0, &mut h1, &flat, &cond_haps, &bm, &cm, &params,
-            &poly_sites, &mono_sites, &lq, &mut rng, None,
+            &poly_sites, &mono_sites, &lq, &mut rng, None, None,
         );
 
         // Homozygous sites must be untouched (PEAK_HOM never written).
