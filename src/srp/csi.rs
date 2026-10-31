@@ -1811,7 +1811,7 @@ mod tests {
         }
         msgs.push(b"22\t50000000\t.\tA\tC\t.\tPASS\t.\tGT\t0|1\t0|0\t1|1".to_vec());
         let out = dir.path().join("w");
-        let (tx, handle, bg) = crate::io::pipeline::setup_vcf_writer(3, &names, contig, "test", &out, false, false, &[]).unwrap();
+        let (tx, handle, bg) = crate::io::pipeline::setup_vcf_writer(&names, contig, "test", &out, false, false, &[]).unwrap();
         for m in &msgs[1..] { tx.send(m.clone()).unwrap(); }
         crate::io::pipeline::finish_vcf_writer(tx, handle, bg).unwrap();
         let vcf = dir.path().join("w.vcf.gz");

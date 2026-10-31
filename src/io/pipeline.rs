@@ -682,13 +682,12 @@ fn bgzf_worker_count() -> std::num::NonZeroUsize {
 }
 
 /// Create the output file, the native multithreaded BGZF writer over `wrap(file)`
-/// and the adaptive-depth sync channel shared by the VCF and BCF writers. The
+/// and the sync channel shared by the VCF and BCF writers. The
 /// caller spawns the writer thread (which differs: streamed TBI vs. CSI drain)
 /// and sends the format-specific header.
 #[inline]
 fn build_bgzf_channel<W: Write + Send + 'static>(
     path: &Path,
-    n_samples: usize,
     wrap: impl FnOnce(BufFile) -> W,
 ) -> std::io::Result<(noodles_bgzf::io::multithreaded_writer::MultithreadedWriter<W>, VcfSender, std::sync::mpsc::Receiver<Vec<u8>>)> {
     let out_file = BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
@@ -696,10 +695,11 @@ fn build_bgzf_channel<W: Write + Send + 'static>(
         .set_worker_count(bgzf_worker_count())
         .build_from_writer(wrap(out_file));
 
-    // Channel buffer sized adaptively: at biobank scale each VCF tile is ~300 MB
-    // of text (5000 samples × 4096 variants). 64 tiles in flight = 19 GB waste.
-    // 4 is enough to keep the writer fed without starving compute.
-    let channel_depth = if n_samples >= 1000 { 4 } else { 16 };
+    // Messages are `ChannelOut::MSG_BYTES` at most, apart from the rare larger single
+    // buffer. The queue holds a whole tile group's output (`GROUP_BYTES`) plus a margin, so
+    // writing a group does not wait for its compression: the deflaters compress it while the
+    // next group is interpolated and formatted, instead of the two taking turns.
+    let channel_depth = GROUP_BYTES / ChannelOut::MSG_BYTES + 16;
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(channel_depth);
     Ok((bgzf_writer, tx, rx))
 }
@@ -758,7 +758,6 @@ impl VcfMetaScan {
 /// Setup the VCF writer: native noodles-bgzf (no external bgzip dependency).
 /// Returns (sender, writer_handle, ()) to be shared across windows.
 pub fn setup_vcf_writer(
-    n_samples: usize,
     sample_names: &[String],
     contig_field: &str,
     version: &str,
@@ -770,7 +769,7 @@ pub fn setup_vcf_writer(
     let vcf_path = crate::common::utils::out_path(output_path, "vcf.gz");
 
     let (block_tx, block_rx) = std::sync::mpsc::channel();
-    let (mut bgzf_writer, tx, rx) = build_bgzf_channel(&vcf_path, n_samples,
+    let (mut bgzf_writer, tx, rx) = build_bgzf_channel(&vcf_path,
         |f| crate::srp::csi::BgzfBlockTap::new(f, block_tx))?;
 
     let tbi_path = { let mut p = vcf_path.as_os_str().to_owned(); p.push(".tbi"); std::path::PathBuf::from(p) };
@@ -881,7 +880,7 @@ pub fn setup_bcf_writer(
 ) -> std::io::Result<(VcfSender, VcfWriterHandle, VcfBgzipProc)> {
     let bcf_path = crate::common::utils::out_path(output_path, "bcf");
 
-    let (mut bgzf_writer, tx, rx) = build_bgzf_channel(&bcf_path, n_samples, |f| f)?;
+    let (mut bgzf_writer, tx, rx) = build_bgzf_channel(&bcf_path, |f| f)?;
 
     let bcf_path_clone = bcf_path.clone();
 

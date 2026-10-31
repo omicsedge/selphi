@@ -249,7 +249,7 @@ fn setup_output_writers(
             ).expect("Failed to setup BCF writer")
         } else {
             selphi::io::pipeline::setup_vcf_writer(
-                n_samples, sample_names, contig_field, version, &out_file, no_ap, gp, extra_header,
+                sample_names, contig_field, version, &out_file, no_ap, gp, extra_header,
             ).expect("Failed to setup VCF writer")
         }
     } else {
