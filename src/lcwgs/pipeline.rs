@@ -336,8 +336,7 @@ fn impute_from_gl3(
     }
 
     let mut eff = params.clone();
-    let (mut modified, big_split) = apply_conditioning(&mut eff, srp.metadata.n_haps, super::big_panel::Explicit::from_env(),
-        mean_conf < soft_gl_thr());
+    let (mut modified, big_split) = apply_conditioning(&mut eff, srp.metadata.n_haps, super::big_panel::Explicit::from_env(), mean_conf);
     // Coverage-adaptive GL floor (LCWGS_ADAPT_MIN_GL, default OFF; honoured only when
     // LCWGS_MIN_GL is unset). At HIGH coverage the reads manufacture confident
     // false-HET GLs at rare hom-ref sites that the default 1e-10 floor can't catch
@@ -396,12 +395,14 @@ fn impute_from_gl3(
 /// haplotypes), said loudly; below the boundary as part of the small-panel profile
 /// (also no rare-carrier augmentation, two chains of 20 iterations, 15 main; each of
 /// `LCWGS_N_ITER`, `LCWGS_N_MAIN` and `LCWGS_GIBBS_RESTARTS` set wins), which
-/// `LCWGS_SMALL_PANEL=old` turns off, and which needs `soft` likelihoods (below
-/// [`soft_gl_thr`]); with confident ones a panel below the boundary is unchanged.
-fn apply_conditioning(eff: &mut LcwgsParams, n_ref: usize, explicit: super::big_panel::Explicit, soft: bool)
+/// `LCWGS_SMALL_PANEL=old` turns off, and which needs soft likelihoods (the run's
+/// `mean_conf` below [`soft_gl_thr`]); with others a panel below the boundary is unchanged.
+fn apply_conditioning(eff: &mut LcwgsParams, n_ref: usize, explicit: super::big_panel::Explicit, mean_conf: f32)
     -> (bool, Option<super::big_panel::BigSplit>) {
     use super::big_panel;
     let explicit = big_panel::Explicit { order: explicit.order || eff.cap.is_some(), ..explicit };
+    let thr = soft_gl_thr();
+    let soft = mean_conf < thr;
     let plan = big_panel::resolve(n_ref, explicit, soft);
     let mut modified = false;
     if let Some(adaptive) = plan.kpbwt && adaptive != eff.kpbwt {
@@ -422,8 +423,8 @@ fn apply_conditioning(eff: &mut LcwgsParams, n_ref: usize, explicit: super::big_
             "lcWGS panel of {} haplotypes (< {}): conditioning capped in GLIMPSE2 rank order (g2) at kpbwt {}, no rare-carrier augmentation, {} Gibbs chain(s) of {} iterations ({} main) averaged; LCWGS_SMALL_PANEL=old restores the previous conditioning",
             n_ref, big_panel::BIG_PANEL_MIN_HAPS, eff.kpbwt, super::iterate::gibbs_chains(eff), eff.n_iterations, eff.n_main_iterations)));
     } else if !big_panel::is_big(n_ref) && !soft {
-        crate::selphi_info!("  lcWGS panel of {} haplotypes (< {}) with confident likelihoods (coverage gate LCWGS_SPLIT_GL_THR): the small-panel profile does not apply",
-            n_ref, big_panel::BIG_PANEL_MIN_HAPS);
+        crate::selphi_info!("  lcWGS panel of {} haplotypes (< {}): likelihoods not soft (mean_conf {:.3}, LCWGS_SPLIT_GL_THR {}): the small-panel profile does not apply",
+            n_ref, big_panel::BIG_PANEL_MIN_HAPS, mean_conf, thr);
     } else if plan.order.is_some() {
         crate::selphi_step!("{}", crate::log::yellow(&format!(
             "lcWGS big panel ({} haplotypes >= {}): conditioning capped in GLIMPSE2 rank order (g2) instead of haplotype-index order, at kpbwt {}; LCWGS_BIG_PANEL=0 restores the index order",
@@ -878,15 +879,15 @@ fn haploid_gp(sample: &[bool], site: &[bool], dosage: &[f32], gp: &mut [f32], n_
     }
 }
 
-/// Mean over (site, sample) of the largest normalised genotype likelihood: the
-/// coverage proxy (0.5x ≈ 0.69 … 4x ≈ 0.89) the SPLIT gate, the adaptive GL floor
-/// and the small-panel profile read. 1 when no row carries likelihood.
 /// The coverage gate on [`gl_mean_conf`]: likelihoods below it are soft
 /// (`LCWGS_SPLIT_GL_THR`, default 0.84).
 fn soft_gl_thr() -> f32 {
     crate::config::raw("LCWGS_SPLIT_GL_THR").and_then(|x| x.parse().ok()).unwrap_or(0.84)
 }
 
+/// Mean over (site, sample) of the largest normalised genotype likelihood: the
+/// coverage proxy (0.5x ≈ 0.69 … 4x ≈ 0.89) the SPLIT gate, the adaptive GL floor
+/// and the small-panel profile read. 1 when no row carries likelihood.
 fn gl_mean_conf(gl3: &[f32], n_samples: usize, n_var: usize) -> f32 {
     let (mut sum, mut cnt) = (0.0f64, 0usize);
     for row in gl3[..n_var * n_samples * 3].chunks_exact(3) {
@@ -1968,9 +1969,11 @@ mod tests {
         let none = Explicit::default();
         let base = || LcwgsParams { kpbwt: 2000, ..Default::default() };
         let env = |k: &str| crate::config::usize_opt(k).is_some();
+        // A coverage proxy below the gate (LCWGS_SPLIT_GL_THR unset: 0.84; true 2x reads 0.73).
+        const SOFT: f32 = 0.5;
         for n in [1500, 4478, 4796, 6332, BIG_PANEL_MIN_HAPS - 1] {
             let mut eff = base();
-            let (changed, split) = apply_conditioning(&mut eff, n, none, true);
+            let (changed, split) = apply_conditioning(&mut eff, n, none, SOFT);
             assert!(changed, "{n}");
             assert_eq!(split, None, "{n}");
             assert_eq!(eff.cap.as_ref().map(|c| c.order), Some(CapOrder::G2), "{n}");
@@ -1984,10 +1987,10 @@ mod tests {
             assert!(deep_pass_repeats_main(None, &eff));
             assert!(!deep_pass_repeats_main(deep_pass_params(&eff, Some(1000)).as_ref(), &eff));
             // LCWGS_SMALL_PANEL=old, an explicit order, LCWGS_BIG_PANEL=0, confident likelihoods: as before the profile.
-            for (off, soft) in [(Explicit { small_off: true, ..none }, true), (Explicit { order: true, ..none }, true),
-                                (Explicit { gate_off: true, ..none }, true), (none, false)] {
+            for (off, conf) in [(Explicit { small_off: true, ..none }, SOFT), (Explicit { order: true, ..none }, SOFT),
+                                (Explicit { gate_off: true, ..none }, SOFT), (none, 0.95)] {
                 let mut eff = base();
-                let (changed, split) = apply_conditioning(&mut eff, n, off, soft);
+                let (changed, split) = apply_conditioning(&mut eff, n, off, conf);
                 assert_eq!((changed, split), (n == 1500, None), "{n}"); // a 1,500-hap panel caps below its size, as before
                 assert!(eff.cap.is_none() && !eff.small_profile, "{n}");
                 assert_eq!((eff.n_iterations, eff.n_main_iterations), (base().n_iterations, base().n_main_iterations));
@@ -1999,34 +2002,34 @@ mod tests {
         }
         for (n, k) in [(BIG_PANEL_MIN_HAPS, 2001), (75_552, 4986), (171_054, 5000)] {
             let mut eff = base();
-            assert_eq!(apply_conditioning(&mut eff, n, none, true), (true, Some(BIG_PANEL_SPLIT)), "{n}");
+            assert_eq!(apply_conditioning(&mut eff, n, none, SOFT), (true, Some(BIG_PANEL_SPLIT)), "{n}");
             assert_eq!(eff.kpbwt, k);
             assert_eq!(eff.cap.as_ref().map(|c| c.order), Some(CapOrder::G2));
             assert!(!eff.small_profile);
             assert_eq!((eff.n_iterations, eff.n_main_iterations), (base().n_iterations, base().n_main_iterations));
         }
         let mut eff = base();
-        assert_eq!(apply_conditioning(&mut eff, 75_552, Explicit { gate_off: true, ..none }, true), (true, None));
+        assert_eq!(apply_conditioning(&mut eff, 75_552, Explicit { gate_off: true, ..none }, SOFT), (true, None));
         assert_eq!((eff.kpbwt, eff.cap.is_none()), (4986, true));
         // LCWGS_KPBWT=2000 (already parsed into kpbwt): kept, order g2.
         let mut eff = base();
-        assert_eq!(apply_conditioning(&mut eff, 75_552, Explicit { kpbwt: true, ..none }, true), (true, Some(BIG_PANEL_SPLIT)));
+        assert_eq!(apply_conditioning(&mut eff, 75_552, Explicit { kpbwt: true, ..none }, SOFT), (true, Some(BIG_PANEL_SPLIT)));
         assert_eq!(eff.kpbwt, 2000);
         assert_eq!(eff.cap.as_ref().map(|c| c.order), Some(CapOrder::G2));
         // LCWGS_QUAL_TRUNC set: the selector reads it; the depth is adaptive as before.
         let mut eff = base();
-        assert_eq!(apply_conditioning(&mut eff, 75_552, Explicit { order: true, ..none }, true), (true, Some(BIG_PANEL_SPLIT)));
+        assert_eq!(apply_conditioning(&mut eff, 75_552, Explicit { order: true, ..none }, SOFT), (true, Some(BIG_PANEL_SPLIT)));
         assert_eq!((eff.kpbwt, eff.cap.is_none()), (4986, true));
         // A cap plan the caller supplied is kept.
         let ids: Vec<String> = (0..10).map(|s| format!("s{s}")).collect();
         let supplied = CapPlan { order: CapOrder::Hash, priority: hap_priority(&ids, 20, 7).into(), rank_frac: 0.5 };
         let mut eff = LcwgsParams { kpbwt: 2000, cap: Some(supplied.clone()), ..Default::default() };
-        assert_eq!(apply_conditioning(&mut eff, 75_552, none, true).1, Some(BIG_PANEL_SPLIT));
+        assert_eq!(apply_conditioning(&mut eff, 75_552, none, SOFT).1, Some(BIG_PANEL_SPLIT));
         let kept = eff.cap.as_ref().unwrap();
         assert_eq!((kept.order, &kept.priority[..]), (CapOrder::Hash, &supplied.priority[..]));
         // LCWGS_BIG_PANEL=order: the rank order, the old split.
         let mut eff = base();
-        assert_eq!(apply_conditioning(&mut eff, 75_552, Explicit { split_off: true, ..none }, true), (true, None));
+        assert_eq!(apply_conditioning(&mut eff, 75_552, Explicit { split_off: true, ..none }, SOFT), (true, None));
         assert_eq!((eff.kpbwt, eff.cap.as_ref().map(|c| c.order)), (4986, Some(CapOrder::G2)));
     }
 

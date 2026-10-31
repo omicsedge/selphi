@@ -132,9 +132,9 @@ pub struct LcwgsParams {
     /// order by default).
     pub cap: Option<faithful_select::CapPlan>,
     /// The small-panel profile (`big_panel`), set once per run in
-    /// `pipeline::impute_from_gl3` on a panel below `big_panel::BIG_PANEL_MIN_HAPS`:
-    /// no rare-carrier augmentation and two Gibbs chains (the rank-order cap and the
-    /// 20/15 schedule are set in `cap` and the iteration counts).
+    /// `pipeline::impute_from_gl3` on a panel below `big_panel::BIG_PANEL_MIN_HAPS`
+    /// with soft likelihoods: no rare-carrier augmentation and two Gibbs chains (the
+    /// rank-order cap and the 20/15 schedule are set in `cap` and the iteration counts).
     pub small_profile: bool,
 }
 

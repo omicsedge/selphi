@@ -11,8 +11,9 @@
 //! ("burn-in") refine the conditioning set without contributing to the saved
 //! dosages. Averaging over 25 main iterations matters for rare carriers; a
 //! longer burn-in (50/25) was slower and no more accurate on real-depth data.
-//! On a panel below `big_panel::BIG_PANEL_MIN_HAPS` (the small-panel profile)
-//! two chains of 20 (15 main) run instead and their dosages are averaged.
+//! Under the small-panel profile (a panel below `big_panel::BIG_PANEL_MIN_HAPS`
+//! with soft likelihoods) two chains of 20 (15 main) run instead and their
+//! dosages are averaged.
 //!
 //! # Why iterate
 //!

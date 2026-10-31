@@ -4,8 +4,10 @@
 //! shipped cap keeps the union members with the LOWEST haplotype index, and the
 //! union always exceeds the cap, so the set is whatever block the panel lists
 //! first. On the 1000 Genomes-size panels measured (4,796 and 6,332 haplotypes)
-//! that block is a multi-population subset and every other cap measured either ties
-//! it or loses a MAF bin. On the 75,552-haplotype v3 panel it is the UK Biobank block (34,582
+//! that block is a multi-population subset and every other cap measured alone (with
+//! the rare-carrier augmentation) either ties it or loses a MAF bin; the small-panel
+//! profile below changes the cap together with the augmentation and the chain count.
+//! On the 75,552-haplotype v3 panel it is the UK Biobank block (34,582
 //! samples listed first): no sample conditions on anything else, and the Han Chinese
 //! GIAB samples are ~20 pp of non-reference concordance below GLIMPSE2 at MAF < 0.5%.
 //!
@@ -57,18 +59,22 @@
 //! sampled allele it feeds back on itself and leaves a chain's dose all-or-nothing
 //! (confident false calls and confident misses). With the rank order it is not
 //! needed, and the second chain takes the chain-to-chain variance that is a large
-//! part of the 0.5x loss. Measured at true 0.5-4x (chr22, HG002-HG004 at 20-30 and
+//! part of the 0.5x loss. Measured at true 0.5-2x (chr22, HG002-HG004 at 20-30 and
 //! 35-45 Mb, HG005-HG007 at 20-30 Mb, 6,332-haplotype panel, three seeds, paired;
-//! 1-Mb block bootstrap): per-sample R² +0.00046 [+0.00028, +0.00065] (84 of 108
-//! sample-seed pairs), panel MAF < 0.5% +0.0048 [+0.0024, +0.0076] (33 of 36),
-//! 0.5-1% +0.0040 [+0.0022, +0.0061]; ~2.3x (4,478-haplotype panel, six GIAB
-//! genomes) non-reference-truth R² +0.00054 (13 of 18), every MAF bin up; CPU -23%.
+//! 1-Mb block bootstrap): per-sample R² +0.00057 [+0.00034, +0.00081] (65 of 81
+//! sample-seed pairs), panel MAF < 0.5% +0.0052 [+0.0027, +0.0081] (26 of 27),
+//! 0.5-1% +0.0050 [+0.0027, +0.0074]; ~2.3x (4,478-haplotype panel, six GIAB
+//! genomes) non-reference-truth R² +0.00054 (13 of 18), every MAF bin up; six capture
+//! libraries (chr22, three seeds) non-reference concordance +0.018 pp (11 of 18),
+//! heterozygote precision +0.129 (18 of 18), MAF < 0.5% -0.205 (5 of 18: fewer rare
+//! non-reference calls, wrong ones as well as right ones); CPU about a fifth lower.
 //! Confident likelihoods keep the previous conditioning (index order, the
 //! augmentation, one chain of 30), which measured better there: HG002 likelihood (`PL`)
 //! files at 4x and 10x lost 0.00010 and 0.00003 R² with the profile (10 and 12 more
-//! genotype errors, three seeds each), and true 4x read sets gained only on one of three
-//! sets. `LCWGS_SMALL_PANEL=old`, an explicit `LCWGS_QUAL_TRUNC` (or a supplied cap
-//! plan) and `LCWGS_BIG_PANEL=0` keep the previous conditioning at any coverage;
+//! genotype errors, lower in each of three seeds; 30x level), and at true 4x it gained
+//! 0.00031 on one held-out set and 0.00002-0.00003 on the other two (with 2-10% MAF bins
+//! lower on one). `LCWGS_SMALL_PANEL=old`, an explicit `LCWGS_QUAL_TRUNC` (or a supplied
+//! cap plan) and `LCWGS_BIG_PANEL=0` keep the previous conditioning at any coverage;
 //! `LCWGS_N_ITER`, `LCWGS_N_MAIN` and `LCWGS_GIBBS_RESTARTS` override their part.
 
 use super::faithful_select::CapOrder;
