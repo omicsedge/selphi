@@ -184,7 +184,7 @@ fn link_config(n_ref: usize, params: &LcwgsParams) -> Option<super::linkage::Lin
     }
     crate::selphi_info!("  lcWGS read-pair linkage: {} at sites of panel MAF >= {}, the first {} bases of a site, samples of median depth <= {}",
         match (cfg.fb, cfg.phase) { (true, true) => "forward-backward and phaser", (true, false) => "forward-backward only", _ => "phaser only" },
-        cfg.min_maf, cfg.max_depth, cfg.max_depth);
+        cfg.min_maf, super::linkage::MAX_SLOTS, cfg.max_depth);
     Some(cfg)
 }
 
@@ -1077,7 +1077,7 @@ pub fn run_lcwgs_bam(
     let region_bounds = region.map(|(_, s, e)| (s, e));
     let link_cfg = link_config(srp.metadata.n_haps, params);
     let pileup = || super::bam_pileup::pileup_bams(bam_paths, &chrom, &pos, &ref_base, &alt_base, &is_snp, region_bounds, reference,
-        indel_model.as_ref(), pp, link_cfg.map(|c| c.max_depth));
+        indel_model.as_ref(), pp, link_cfg.map(|_| super::linkage::MAX_SLOTS));
     // Impute-only indels scored from their own reads: a pileup of their own, so
     // the SNP pileup is the default's exactly.
     let pass_pileup = || -> std::io::Result<Option<super::bam_pileup::BamGl>> {
@@ -1736,10 +1736,10 @@ fn run_chunked_gibbs(
             // forward-backward reads: the chunk's, with the bases its fragments take
             // left out at their sites.
             let chunk_views = links.map(|l| {
-                let eligible = super::linkage::view::eligible_sites(&chunk_bm, l.cfg.min_maf);
+                let linkable = super::linkage::view::linkable_sites(&chunk_bm, l.cfg.min_maf);
                 let mut gl_fb = l.cfg.fb.then(|| chunk_gl3.to_vec());
                 let views: Vec<Option<super::linkage::view::ChunkLinks>> = l.samples.iter().enumerate().map(|(s, link)| link.as_ref().map(|link| {
-                    let (view, rest) = super::linkage::view::build(link, buf_start..buf_end, &eligible, errmod.as_ref().unwrap(), params.epsilon);
+                    let (view, rest) = super::linkage::view::build(link, buf_start..buf_end, &linkable, errmod.as_ref().unwrap(), params.epsilon);
                     if let Some(g) = gl_fb.as_mut() {
                         for (v, gl) in rest { let b = (v as usize * n_samples + s) * 3; g[b..b + 3].copy_from_slice(&gl); }
                     }

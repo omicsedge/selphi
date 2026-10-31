@@ -185,10 +185,15 @@ pub(super) unsafe fn step_scalar<const POST: bool>(
 // AVX-512
 // --------------------------------------------------------------------------
 
+/// Codes of an entry whose posterior masses are summed per code in registers (one
+/// masked add per code and 16 states); larger entries sum a group's most common code
+/// (its first lane's) in a register and add the other lanes one by one.
+#[cfg(target_arch = "x86_64")]
+const REG_CODES: usize = 8;
+
 /// The factor pass (see [`factor_scalar`]): 16 codes at a time from the pack; a
 /// table of at most 16 values stays in a register (one permute per 16 states),
-/// larger ones are gathered; the masses of a group's most common code (its first
-/// lane's) are summed in a register, the other lanes added one by one.
+/// larger ones are gathered.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512dq")]
 unsafe fn factor_avx512(c: &Ctx, p: &Plan, r: std::ops::Range<usize>, g: *mut f32, post: *const f32, hist: *mut f32) { unsafe {
@@ -198,8 +203,10 @@ unsafe fn factor_avx512(c: &Ctx, p: &Plan, r: std::ops::Range<usize>, g: *mut f3
         let rows = p.rows(e);
         let tab = p.table(e);
         let small = rows.len() <= 4;
+        let n_codes = 1usize << rows.len();
         let tv = _mm512_loadu_ps(tab);
         let h = if hist.is_null() || post.is_null() { std::ptr::null_mut() } else { hist.add(p.tab_off[e] as usize) };
+        let mut acc = [_mm512_setzero_ps(); REG_CODES];
         let mut j = 0;
         while j < kmain {
             let mut code = _mm512_setzero_si512();
@@ -212,22 +219,31 @@ unsafe fn factor_avx512(c: &Ctx, p: &Plan, r: std::ops::Range<usize>, g: *mut f3
             _mm512_storeu_ps(g.add(j), gv);
             if !h.is_null() {
                 let pv = _mm512_loadu_ps(post.add(j));
-                let c0 = _mm_cvtsi128_si32(_mm512_castsi512_si128(code));
-                let same = _mm512_cmpeq_epi32_mask(code, _mm512_set1_epi32(c0));
-                *h.add(c0 as usize) += _mm512_mask_reduce_add_ps(same, pv);
-                if same != 0xFFFF {
-                    let (mut cs, mut ps) = ([0u32; 16], [0.0f32; 16]);
-                    _mm512_storeu_si512(cs.as_mut_ptr() as *mut _, code);
-                    _mm512_storeu_ps(ps.as_mut_ptr(), pv);
-                    let mut rest = !same;
-                    while rest != 0 {
-                        let l = rest.trailing_zeros() as usize;
-                        *h.add(cs[l] as usize) += ps[l];
-                        rest &= rest - 1;
+                if n_codes <= REG_CODES {
+                    for (cc, a) in acc.iter_mut().enumerate().take(n_codes) {
+                        *a = _mm512_mask_add_ps(*a, _mm512_cmpeq_epi32_mask(code, _mm512_set1_epi32(cc as i32)), *a, pv);
+                    }
+                } else {
+                    let c0 = _mm_cvtsi128_si32(_mm512_castsi512_si128(code));
+                    let same = _mm512_cmpeq_epi32_mask(code, _mm512_set1_epi32(c0));
+                    *h.add(c0 as usize) += _mm512_mask_reduce_add_ps(same, pv);
+                    if same != 0xFFFF {
+                        let (mut cs, mut ps) = ([0u32; 16], [0.0f32; 16]);
+                        _mm512_storeu_si512(cs.as_mut_ptr() as *mut _, code);
+                        _mm512_storeu_ps(ps.as_mut_ptr(), pv);
+                        let mut rest = !same;
+                        while rest != 0 {
+                            let l = rest.trailing_zeros() as usize;
+                            *h.add(cs[l] as usize) += ps[l];
+                            rest &= rest - 1;
+                        }
                     }
                 }
             }
             j += 16;
+        }
+        if !h.is_null() && n_codes <= REG_CODES {
+            for (cc, a) in acc.iter().enumerate().take(n_codes) { *h.add(cc) += _mm512_reduce_add_ps(*a); }
         }
         while j < k {
             let code = code_of(c, p, e, j);
@@ -383,8 +399,10 @@ unsafe fn factor_avx2(c: &Ctx, p: &Plan, r: std::ops::Range<usize>, g: *mut f32,
         let rows = p.rows(e);
         let tab = p.table(e);
         let small = rows.len() <= 3;
+        let n_codes = 1usize << rows.len();
         let tv = _mm256_loadu_ps(tab);
         let h = if hist.is_null() || post.is_null() { std::ptr::null_mut() } else { hist.add(p.tab_off[e] as usize) };
+        let mut acc = [_mm256_setzero_ps(); REG_CODES];
         let mut j = 0;
         while j < kmain8 {
             let mut code = _mm256_setzero_si256();
@@ -397,23 +415,33 @@ unsafe fn factor_avx2(c: &Ctx, p: &Plan, r: std::ops::Range<usize>, g: *mut f32,
             _mm256_storeu_ps(g.add(j), gv);
             if !h.is_null() {
                 let pv = _mm256_loadu_ps(post.add(j));
-                let c0 = _mm_cvtsi128_si32(_mm256_castsi256_si128(code));
-                let eq = _mm256_cmpeq_epi32(code, _mm256_set1_epi32(c0));
-                let same = _mm256_movemask_ps(_mm256_castsi256_ps(eq)) as u32;
-                *h.add(c0 as usize) += hsum256(_mm256_and_ps(pv, _mm256_castsi256_ps(eq)));
-                if same != 0xFF {
-                    let (mut cs, mut ps) = ([0u32; 8], [0.0f32; 8]);
-                    _mm256_storeu_si256(cs.as_mut_ptr() as *mut _, code);
-                    _mm256_storeu_ps(ps.as_mut_ptr(), pv);
-                    let mut rest = !same & 0xFF;
-                    while rest != 0 {
-                        let l = rest.trailing_zeros() as usize;
-                        *h.add(cs[l] as usize) += ps[l];
-                        rest &= rest - 1;
+                if n_codes <= REG_CODES {
+                    for (cc, a) in acc.iter_mut().enumerate().take(n_codes) {
+                        let eq = _mm256_castsi256_ps(_mm256_cmpeq_epi32(code, _mm256_set1_epi32(cc as i32)));
+                        *a = _mm256_add_ps(*a, _mm256_and_ps(pv, eq));
+                    }
+                } else {
+                    let c0 = _mm_cvtsi128_si32(_mm256_castsi256_si128(code));
+                    let eq = _mm256_cmpeq_epi32(code, _mm256_set1_epi32(c0));
+                    let same = _mm256_movemask_ps(_mm256_castsi256_ps(eq)) as u32;
+                    *h.add(c0 as usize) += hsum256(_mm256_and_ps(pv, _mm256_castsi256_ps(eq)));
+                    if same != 0xFF {
+                        let (mut cs, mut ps) = ([0u32; 8], [0.0f32; 8]);
+                        _mm256_storeu_si256(cs.as_mut_ptr() as *mut _, code);
+                        _mm256_storeu_ps(ps.as_mut_ptr(), pv);
+                        let mut rest = !same & 0xFF;
+                        while rest != 0 {
+                            let l = rest.trailing_zeros() as usize;
+                            *h.add(cs[l] as usize) += ps[l];
+                            rest &= rest - 1;
+                        }
                     }
                 }
             }
             j += 8;
+        }
+        if !h.is_null() && n_codes <= REG_CODES {
+            for (cc, a) in acc.iter().enumerate().take(n_codes) { *h.add(cc) += hsum256(*a); }
         }
         while j < k {
             let code = code_of(c, p, e, j);

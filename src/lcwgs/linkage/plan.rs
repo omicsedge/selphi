@@ -29,6 +29,12 @@ pub(crate) struct Plan {
 /// Tables are padded to 16 floats, so a 16-lane permute reads in bounds.
 pub(crate) const MIN_TABLE: usize = 16;
 
+/// Where a linked site sits in one forward-backward: at an index of its axis, or off
+/// the axis (monomorphic in the conditioning set), every state carrying `Fixed`'s
+/// allele (0/1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Site { Axis(usize), Fixed(usize) }
+
 impl Plan {
     #[inline] pub fn len(&self) -> usize { self.at.len() }
     #[inline] pub fn is_empty(&self) -> bool { self.at.is_empty() }
@@ -44,52 +50,74 @@ impl Plan {
     }
 
     /// Build the plan of haplotype `h`'s pass from its sample's fragments: `partner(v)`
-    /// = the partner's allele at chunk site `v` (0/1); `axis(v)` = the axis index of
-    /// chunk site `v` (every linked site is on the axis); `floor` = the likelihood floor.
-    pub fn build(&mut self, links: &ChunkLinks, partner: impl Fn(usize) -> usize, axis: impl Fn(usize) -> usize, floor: f32) {
+    /// = the partner's allele at chunk site `v` (0/1); `place(v)` = where chunk site `v`
+    /// sits in this pass ([`Site`]); `floor` = the likelihood floor. A fragment's sites
+    /// off the axis enter its haplotype term as the allele every state carries there;
+    /// its anchor is its last site on the axis (a fragment with none is a constant).
+    pub fn build(&mut self, links: &ChunkLinks, partner: impl Fn(usize) -> usize, place: impl Fn(usize) -> Site, floor: f32) {
         self.clear();
         let floor = floor.max(1e-30);
-        let mut f = 0;
-        let n = links.n_frag();
+        // Each fragment's sites on the axis (CSR), the log2 terms of its off-axis sites
+        // and of its partner branch, keyed by its anchor.
+        let (mut on, mut on_off) = (Vec::<(u32, [f32; 2])>::new(), vec![0u32]);
+        let (mut fixed, mut lp, mut order) = (Vec::<f32>::new(), Vec::<f32>::new(), Vec::<(u32, u32)>::new());
+        for f in 0..links.n_frag() {
+            let (sites, lu) = links.frag(f);
+            let (mut lf, mut lpf) = (0.0f32, 0.0f32);
+            let start = on.len();
+            for (&v, l) in sites.iter().zip(lu) {
+                lpf += l[partner(v as usize)];
+                match place(v as usize) {
+                    Site::Axis(a) => on.push((a as u32, *l)),
+                    Site::Fixed(allele) => lf += l[allele],
+                }
+            }
+            if on.len() == start { continue; }
+            order.push((on.last().unwrap().0, fixed.len() as u32));
+            on_off.push(on.len() as u32);
+            fixed.push(lf);
+            lp.push(lpf);
+        }
+        order.sort_by_key(|x| x.0);
+        let frag = |i: u32| &on[on_off[i as usize] as usize..on_off[i as usize + 1] as usize];
         let mut union: Vec<u32> = Vec::with_capacity(super::MAX_SITES);
         let mut acc: Vec<f32> = Vec::new();
-        while f < n {
+        let mut f = 0;
+        while f < order.len() {
             // Fragments sharing an anchor site, cut into entries of <= MAX_SITES sites.
-            let anchor = *links.frag(f).0.last().unwrap();
+            let anchor = order[f].0;
             let mut g = f;
-            while g < n && *links.frag(g).0.last().unwrap() == anchor { g += 1; }
+            while g < order.len() && order[g].0 == anchor { g += 1; }
             let mut a = f;
             while a < g {
                 union.clear();
-                union.extend_from_slice(links.frag(a).0);
+                union.extend(frag(order[a].1).iter().map(|x| x.0));
                 let mut b = a + 1;
                 while b < g {
-                    let s = links.frag(b).0;
-                    let extra = s.iter().filter(|v| union.binary_search(v).is_err()).count();
+                    let s = frag(order[b].1);
+                    let extra = s.iter().filter(|x| union.binary_search(&x.0).is_err()).count();
                     if union.len() + extra > super::MAX_SITES { break; }
-                    for &v in s { if let Err(k) = union.binary_search(&v) { union.insert(k, v); } }
+                    for x in s { if let Err(k) = union.binary_search(&x.0) { union.insert(k, x.0); } }
                     b += 1;
                 }
-                let m = union.len();
-                let size = 1usize << m;
+                let size = 1usize << union.len();
                 acc.clear();
                 acc.resize(size, 0.0);
-                for fr in a..b {
-                    let (sites, lu) = links.frag(fr);
+                for &(_, i) in &order[a..b] {
+                    let s = frag(i);
                     let mut bits = [0u32; super::MAX_SITES];
-                    for (b, v) in bits.iter_mut().zip(sites) { *b = union.binary_search(v).unwrap() as u32; }
-                    let bits = &bits[..sites.len()];
-                    let lp: f32 = sites.iter().zip(lu).map(|(&v, l)| l[partner(v as usize)]).sum();
+                    for (t, x) in bits.iter_mut().zip(s) { *t = union.binary_search(&x.0).unwrap() as u32; }
+                    let (lf, lpf) = (fixed[i as usize], lp[i as usize]);
                     for (c, slot) in acc.iter_mut().enumerate() {
-                        let lx: f32 = bits.iter().zip(lu).map(|(&t, l)| l[(c >> t) & 1]).sum();
+                        let lx: f32 = lf + bits[..s.len()].iter().zip(s).map(|(&t, x)| x.1[(c >> t) & 1]).sum::<f32>();
                         // log2(½ 2^lx + ½ 2^lp)
-                        let (hi, lo) = if lx >= lp { (lx, lp) } else { (lp, lx) };
+                        let (hi, lo) = if lx >= lpf { (lx, lpf) } else { (lpf, lx) };
                         *slot += hi + (lo - hi).exp2().ln_1p() * std::f32::consts::LOG2_E - 1.0;
                     }
                 }
                 let mx = acc.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                self.at.push(axis(anchor as usize) as u32);
-                self.rows.extend(union.iter().map(|&v| axis(v as usize) as u32));
+                self.at.push(anchor);
+                self.rows.extend_from_slice(&union);
                 self.rows_off.push(self.rows.len() as u32);
                 self.tab.extend(acc.iter().map(|&x| (x - mx).exp2().max(floor)));
                 self.tab.resize(self.tab.len() + MIN_TABLE.saturating_sub(size), 0.0);
@@ -99,7 +127,7 @@ impl Plan {
             f = g;
         }
         debug_assert!(self.at.windows(2).all(|w| w[0] <= w[1]));
-        debug_assert!(self.at.iter().enumerate().all(|(e, &x)| self.rows(e).iter().all(|&r| r <= x) && x > 0));
+        debug_assert!(self.at.iter().enumerate().all(|(e, &x)| self.rows(e).iter().all(|&r| r <= x)));
     }
 
     /// Draw the linked sites jointly, entry by entry in anchor order: each entry's
@@ -189,7 +217,7 @@ mod tests {
         let l = links(&[a, b]);
         let partner = |v: usize| if v == 2 { 1 } else { 0 }; // partner: ALT at 2, REF elsewhere
         let mut p = Plan::default();
-        p.build(&l, partner, |v| v * 10, 1e-10);
+        p.build(&l, partner, |v| Site::Axis(v * 10), 1e-10);
         assert_eq!(p.at, vec![50]);
         assert_eq!(p.rows(0), &[20, 40, 50]);
         // brute force over (x2, x4, x5)
@@ -211,10 +239,19 @@ mod tests {
         // the union overflows 8 sites, so a second entry opens at the same anchor.
         let many: Vec<Vec<(u32, [f32; 2])>> = (0..10).map(|i| vec![(i as u32, [m, x]), (20, [m, x])]).collect();
         let refs: Vec<&[(u32, [f32; 2])]> = many.iter().map(|v| v.as_slice()).collect();
-        p.build(&links(&refs), |_| 0, |v| v, 1e-10);
+        p.build(&links(&refs), |_| 0, Site::Axis, 1e-10);
         assert_eq!(p.at, vec![20, 20]);
         assert_eq!(p.rows(0).len(), 8);
         assert_eq!(p.rows(1), &[7, 8, 9, 20]);
+        // Site 5 off the axis (every state REF there): fragment A's haplotype term takes
+        // the REF term at 5 and its anchor moves to its last site on the axis (2), where
+        // it is alone; B keeps its own anchor at 4.
+        p.build(&l, partner, |v| if v == 5 { Site::Fixed(0) } else { Site::Axis(v) }, 1e-10);
+        assert_eq!(p.at, vec![2, 4]);
+        assert_eq!(p.rows(0), &[2]);
+        let want: Vec<f64> = (0..2usize).map(|x2| 0.5 * u(1, x2) * u(0, 0) + 0.5 * u(1, 1) * u(0, 0)).collect();
+        let mx = want[0].max(want[1]);
+        for c in 0..2 { assert!((p.tab[c] as f64 - want[c] / mx).abs() < 1e-5); }
     }
 
     /// The joint draw follows the posterior mass of consistent codes, honours sites

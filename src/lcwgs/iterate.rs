@@ -363,7 +363,7 @@ fn passenger_dose<F: Fn(usize) -> usize>(
     h: usize, partner_at: F, cond: &[u32],
     gl3: &[f32], n_samples: usize, ref_bm: &HaplotypeBitmatrix, cm: &[f64], params: &LcwgsParams,
     axis: Option<&[usize]>, band: bool, pass: &ChunkPassengers<'_>, model: &PassengerModel, two_pass: bool,
-    main_pack: Option<&[u64]>, link: Option<&super::linkage::view::ChunkLinks>,
+    main_pack: Option<&[u64]>, link: Option<&super::linkage::view::ChunkLinks>, mono_alt: &[bool],
 ) -> Vec<f32> {
     let n_pass = pass.ins.len();
     if cond.is_empty() { return vec![0.5; n_pass]; }
@@ -412,9 +412,12 @@ fn passenger_dose<F: Fn(usize) -> usize>(
     // `active[i]`.
     let mut plan = super::linkage::plan::Plan::default();
     if let Some(l) = link {
+        use super::linkage::plan::Site;
         let active: Vec<u32> = rows.iter().enumerate().filter(|&(_, &r)| r < row0).map(|(i, _)| i as u32).collect();
-        let index = |v: usize| axis.map_or(v, |a| a.binary_search(&v).expect("a linked site is on the axis"));
-        plan.build(l, &partner_at, |v| active[index(v)] as usize, params.min_gl);
+        plan.build(l, &partner_at, |v| match link_site(axis, mono_alt, v) {
+            Site::Axis(i) => Site::Axis(active[i] as usize),
+            fixed => fixed,
+        }, params.min_gl);
     }
     let linked = link.map(|_| crate::lcwgs::hmm::Linked { plan: &plan, hist: None });
     let d = run_forward_backward_with(&hl, cond, ref_bm, &acm, params, Some(&rm), Some(&rows), prepack.as_deref(), two_pass, linked).dosage;
@@ -545,7 +548,7 @@ fn run_one_hap<F: Fn(usize) -> usize>(
                 let linked = match link {
                     Some(l) => {
                         drawn_on = Some(Some(poly_sites));
-                        Some(anchor_plan(l, &partner_at, Some(poly_sites), params.min_gl, &mut plan, &mut hist))
+                        Some(anchor_plan(l, &partner_at, Some(poly_sites), mono_alt, params.min_gl, &mut plan, &mut hist))
                     }
                     None => None,
                 };
@@ -582,7 +585,7 @@ fn run_one_hap<F: Fn(usize) -> usize>(
             let linked = match link {
                 Some(l) => {
                     drawn_on = Some(None);
-                    Some(anchor_plan(l, &partner_at, None, params.min_gl, &mut plan, &mut hist))
+                    Some(anchor_plan(l, &partner_at, None, &[], params.min_gl, &mut plan, &mut hist))
                 }
                 None => None,
             };
@@ -612,13 +615,24 @@ fn run_one_hap<F: Fn(usize) -> usize>(
     (dose, sampled)
 }
 
-/// Build `plan` from a sample's fragments for a pass on `axis` (`None`: the full
-/// axis) against the partner's alleles, with its posterior accumulator `hist` zeroed.
+/// Where chunk site `v` sits in a pass on `axis` (`None`: the full axis): its axis
+/// index, or, off a compacted axis, the allele every conditioning state carries there
+/// (`mono_alt`, see `build_poly_skip_structures`).
+fn link_site(axis: Option<&[usize]>, mono_alt: &[bool], v: usize) -> super::linkage::plan::Site {
+    use super::linkage::plan::Site;
+    match axis {
+        None => Site::Axis(v),
+        Some(a) => a.binary_search(&v).map_or_else(|_| Site::Fixed(mono_alt[v] as usize), Site::Axis),
+    }
+}
+
+/// Build `plan` from a sample's fragments for a pass on `axis` (see [`link_site`])
+/// against the partner's alleles, with its posterior accumulator `hist` zeroed.
 fn anchor_plan<'a>(
-    link: &super::linkage::view::ChunkLinks, partner_at: &impl Fn(usize) -> usize, axis: Option<&[usize]>, floor: f32,
-    plan: &'a mut super::linkage::plan::Plan, hist: &'a mut Vec<f32>,
+    link: &super::linkage::view::ChunkLinks, partner_at: &impl Fn(usize) -> usize, axis: Option<&[usize]>, mono_alt: &[bool],
+    floor: f32, plan: &'a mut super::linkage::plan::Plan, hist: &'a mut Vec<f32>,
 ) -> crate::lcwgs::hmm::Linked<'a> {
-    plan.build(link, partner_at, |v| axis.map_or(v, |a| a.binary_search(&v).expect("a linked site is on the axis")), floor);
+    plan.build(link, partner_at, |v| link_site(axis, mono_alt, v), floor);
     hist.clear();
     hist.resize(plan.hist_len(), 0.0);
     crate::lcwgs::hmm::Linked { plan, hist: Some(hist) }
@@ -1326,7 +1340,8 @@ fn run_gibbs_with_memory(
                     // poly-skip axis and on the full axis when it carried them.
                     let band = sp.is_some() || full_axis_rmult.is_some();
                     pass_now.then(|| passenger_dose(h, partner, c, gl_fb, n_samples, ref_bm, cm, params,
-                        sp.map(|x| x.poly.as_slice()), band, pass.unwrap(), pass_model.as_ref().unwrap(), two_pass, mp, fb_link))
+                        sp.map(|x| x.poly.as_slice()), band, pass.unwrap(), pass_model.as_ref().unwrap(), two_pass, mp, fb_link,
+                        &ps_mono_alt))
                 };
                 let fb0 = |hp: &mut Vec<u64>| {
                     let pack = match pack_for(c0, split0, &base, hp) {
@@ -2763,11 +2778,11 @@ mod tests {
                     cond.truncate(k);
                     let split = poly_split(&cond, &ic, &sr, n_var);
                     if split.poly.is_empty() { continue; }
-                    let got = passenger_dose(0, |v| partner[v], &cond, &gl3, 1, &bm, &cm, &params, Some(&split.poly), band, &pass, &model, false, None, None);
+                    let got = passenger_dose(0, |v| partner[v], &cond, &gl3, 1, &bm, &cm, &params, Some(&split.poly), band, &pass, &model, false, None, None, &[]);
                     // Reusing the main pass's pack gives the same bits.
                     let mut mp = Vec::new();
                     crate::lcwgs::hmm::pack_cond_rows(&bm, &cond, Some(&split.poly), split.poly.len(), None, &mut mp);
-                    let got_packed = passenger_dose(0, |v| partner[v], &cond, &gl3, 1, &bm, &cm, &params, Some(&split.poly), band, &pass, &model, false, Some(&mp), None);
+                    let got_packed = passenger_dose(0, |v| partner[v], &cond, &gl3, 1, &bm, &cm, &params, Some(&split.poly), band, &pass, &model, false, Some(&mp), None, &[]);
                     assert_eq!(got.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), got_packed.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
                     // Main pass over the poly axis.
                     let hl_main: Vec<f32> = split.poly.iter().flat_map(|&v| hl_at(v)).collect();

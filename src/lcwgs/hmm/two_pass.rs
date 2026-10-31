@@ -24,9 +24,11 @@
 //! first has finished (then F processes every block and B finds nothing to do).
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::ops::Range;
 use std::sync::Mutex;
 
 use super::*;
+use crate::lcwgs::linkage::plan::Plan;
 
 /// Fewest compacted sites for which a forward-backward uses two passes.
 pub(crate) const MIN_SITES: usize = 4096;
@@ -82,10 +84,6 @@ pub(super) trait Kernels {
     unsafe fn step_anchor<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0: f32, e1: f32, fact1: f32, fact2: f32,
         p: &Plan, r: Range<usize>, hist: *mut f32) -> (f32, f32, f32);
 }
-
-/// A read-pair plan's entries at one site.
-type Range<T> = std::ops::Range<T>;
-use crate::lcwgs::linkage::plan::Plan;
 
 // --------------------------------------------------------------------------
 // AVX-512 (the loop bodies of `run_fb_avx512`)

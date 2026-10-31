@@ -19,9 +19,12 @@
 //!   forward-filtering backward-sampling ([`phase`]).
 //!
 //! The pileup assigns fragment identities as reads arrive and records the bases each
-//! fragment deposits ([`assemble`]); sites are eligible per chunk (panel MAF at least
-//! [`LinkConfig::min_maf`], which is at least `rare_maf`, so an eligible site is in
-//! every conditioning axis and never monomorphic in it).
+//! fragment deposits ([`assemble`]); per chunk, a fragment links its bases at sites of
+//! panel MAF at least [`LinkConfig::min_maf`] (>= `rare_maf`, so on every conditioning
+//! axis) and its minor-allele bases at rarer sites, so that a rare allele and the
+//! common alleles of its molecule enter one factor ([`view::Linkable`]); a rare site
+//! monomorphic in a pass's conditioning set enters that pass as the allele every
+//! state carries ([`plan::Site`]).
 
 pub(crate) mod assemble;
 pub(crate) mod phase;
@@ -30,8 +33,8 @@ pub mod view;
 
 pub use assemble::SampleLinkage;
 
-/// Linkable entries per site (the first ones pushed, in input order) and the
-/// per-sample median-depth gate: at most 8, which the pileup's record layout holds.
+/// Linkable entries per site: the first ones pushed, in input order (at most 8, which
+/// the pileup's record layout holds).
 pub const MAX_SLOTS: usize = 8;
 
 /// Distinct sites a fragment links at most (its first ones, in site order); an
@@ -41,11 +44,12 @@ pub const MAX_SITES: usize = 8;
 /// Read-pair linkage settings of a run.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LinkConfig {
-    /// A site is linkable when its panel minor-allele frequency is at least this
-    /// (`LCWGS_LINK_MIN_MAF`, never below `rare_maf`).
+    /// Every base of a site of panel minor-allele frequency at least this is linkable
+    /// (`LCWGS_LINK_MIN_MAF`, never below `rare_maf`); below it, the minor allele's.
     pub min_maf: f32,
-    /// Linkable entries per site, and the gate: a sample whose median depth over the
-    /// SNP sites exceeds it is not linked (`LCWGS_LINK_MAX_DEPTH`, 1..=8).
+    /// The gate: a sample whose median depth over the SNP sites exceeds it is not
+    /// linked (`LCWGS_LINK_MAX_DEPTH`, default 3: at true 4x the held-out sets gained
+    /// nothing overall).
     pub max_depth: usize,
     /// The forward-backward half: anchors, the rest likelihood and joint draws.
     pub fb: bool,
@@ -65,7 +69,7 @@ impl LinkConfig {
             _ => (true, true),
         };
         let min_maf = crate::config::f32_or("LCWGS_LINK_MIN_MAF", 0.01).max(rare_maf);
-        let max_depth = crate::config::usize_or("LCWGS_LINK_MAX_DEPTH", MAX_SLOTS).clamp(1, MAX_SLOTS);
+        let max_depth = crate::config::usize_or("LCWGS_LINK_MAX_DEPTH", 3);
         Some(LinkConfig { min_maf, max_depth, fb, phase })
     }
 }
