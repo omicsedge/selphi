@@ -58,6 +58,7 @@ fn canonical_fb(hl: &[f32], cond: &[u32], bm: &HaplotypeBitmatrix, cm: &[f64], p
     let (n_var, k) = (cm.len(), cond.len());
     let inv_k = 1.0f32 / k as f32;
     let (ee, ed) = (1.0f32 - params.epsilon, params.epsilon);
+    let (ee_o, ed_o) = params.output_emission();
     let loo = lcwgs_loo();
     let w64 = k.div_ceil(64);
     let kmain = k & !15usize;
@@ -142,7 +143,7 @@ fn canonical_fb(hl: &[f32], cond: &[u32], bm: &HaplotypeBitmatrix, cm: &[f64], p
             if bit(v, j) { h1 += post; } else { h0 += post; }
         }
         beta_sum = b;
-        dosage[v] = finalize_site(loo, h0, h1, emit[2 * v], emit[2 * v + 1], hl[2 * v], hl[2 * v + 1], ee, ed);
+        dosage[v] = finalize_site(loo, h0, h1, emit[2 * v], emit[2 * v + 1], hl[2 * v], hl[2 * v + 1], ee_o, ed_o);
     }
     (dosage, hist)
 }
@@ -169,7 +170,7 @@ fn simd_fb_matches_canonical_bits() {
     use reference_pack as rp;
     let Some(kernel) = canonical_kernel() else { eprintln!("no canonical FB kernel on this host"); return };
     let mut rng = rp::Xs(0x5EED_CA70_0F1B_2D3C);
-    let params = LcwgsParams::default();
+    for params in [LcwgsParams::default(), LcwgsParams { novel_emission: 1e-6, ..Default::default() }] {
     for n in [1usize, 2, 17, 40, 130] {
         let bm = rp::random_panel(&mut rng, n * 2, 700, 40);
         let poly: Vec<usize> = (0..n).map(|v| v * 2 + (v % 2)).collect();
@@ -181,9 +182,10 @@ fn simd_fb_matches_canonical_bits() {
                 let want = canonical_fb(&hl, &cond, &bm, &cm, &params, ps, None).0;
                 let got = unsafe { kernel(&hl, &cond, &bm, &cm, &params, None, ps, None) };
                 let bits = |d: &[f32]| d.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-                assert_eq!(bits(&got.dosage), bits(&want), "n={n} k={k} poly={}", ps.is_some());
+                assert_eq!(bits(&got.dosage), bits(&want), "n={n} k={k} poly={} novel={}", ps.is_some(), params.novel_emission);
             }
         }
+    }
     }
 }
 
@@ -263,7 +265,7 @@ fn dispatcher_matches_canonical_bits() {
     if lcwgs_loo() { assert_eq!(d[0].to_bits(), 0x3f2c_cccd); }
 
     let mut rng = rp::Xs(0xD15B_A7C4_0A11_CE55);
-    let params = LcwgsParams::default();
+    for params in [LcwgsParams::default(), LcwgsParams { novel_emission: 1e-6, ..Default::default() }] {
     for &(n, n_haps) in &[(40usize, 300usize), (4100, 90)] {
         let bm = rp::random_panel(&mut rng, n * 2, n_haps, 40);
         let poly: Vec<usize> = (0..n).map(|v| v * 2 + (v % 2)).collect();
@@ -275,12 +277,70 @@ fn dispatcher_matches_canonical_bits() {
             for ps in [None, Some(poly.as_slice())] {
                 for pl in [None, Some(&plan)] {
                     check(&hl, &cond, &bm, &cm, &params, ps, pl,
-                          &format!("n={n} k={k} poly={} anchors={}", ps.is_some(), pl.is_some()));
+                          &format!("n={n} k={k} poly={} anchors={} novel={}", ps.is_some(), pl.is_some(), params.novel_emission));
                 }
             }
         }
     }
+    }
     assert!(runs.get() > 0, "the unlinked two-pass path was never dispatched");
+}
+
+/// Every forward-backward path folds a site's dose with [`LcwgsParams::output_emission`]: at a site
+/// every conditioning haplotype leaves REF, against reads that say ALT, the dose is the closed form
+/// `ed·h1 / (ee·h0 + ed·h1)` (the states' mass cancels), about 0.001 with `epsilon` alone and 0.999
+/// with a 1e-6 novel-allele emission. Paths: the canonical reference, AVX-512, AVX2, NEON, two-pass
+/// (each kernel set), anchored, scaffold, and the dispatched one (scalar under SELPHI_FORCE_SCALAR=1).
+#[test]
+fn output_emission_reaches_every_fb_path() {
+    use reference_pack as rp;
+    let _serial = two_pass::TASK_BLOCKS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+    let mut rng = rp::Xs(0x0E7E_4E55_1D0A_17E1);
+    let (n, n_haps, m) = (two_pass::MIN_SITES + 7, 70usize, 2049usize);
+    let mut rows: Vec<u8> = (0..n * n_haps).map(|_| (rng.below(100) < 30) as u8).collect();
+    rows[m * n_haps..(m + 1) * n_haps].fill(0);
+    let bm = HaplotypeBitmatrix::from_byte_slice_all(n, n_haps, &rows, n_haps);
+    let cm: Vec<f64> = (0..n).map(|v| v as f64 * 0.0007).collect();
+    let mut hl: Vec<f32> = (0..n).flat_map(|_| { let a = (1 + rng.below(999)) as f32 / 1000.0; [1.0 - a, a] }).collect();
+    (hl[2 * m], hl[2 * m + 1]) = (1e-9, 1.0 - 1e-9);
+    let cond: Vec<u32> = (0..33).map(|h| (h * 2 + 1) as u32).collect();
+    let common: Vec<usize> = (0..n).filter(|&v| v != m).collect();
+    let plan = random_plan(&mut rng, n);
+    for novel in [0.0f32, 1e-6] {
+        let params = LcwgsParams { novel_emission: novel, ..Default::default() };
+        let (ee, ed) = params.output_emission();
+        let want = ed * hl[2 * m + 1] / (ee * hl[2 * m] + ed * hl[2 * m + 1]);
+        let mut doses: Vec<(&str, f32)> = vec![("canonical", canonical_fb(&hl, &cond, &bm, &cm, &params, None, None).0[m])];
+        pool.install(|| unsafe {
+            let null = std::ptr::null_mut();
+            doses.push(("dispatched", run_forward_backward_with(&hl, &cond, &bm, &cm, &params, None, None, None, false, None).dosage[m]));
+            doses.push(("dispatched two-pass", run_forward_backward_with(&hl, &cond, &bm, &cm, &params, None, None, None, true, None).dosage[m]));
+            doses.push(("anchored", run_forward_backward_with(&hl, &cond, &bm, &cm, &params, None, None, None, false,
+                Some(Linked { plan: &plan, hist: None })).dosage[m]));
+            doses.push(("two-pass scalar", two_pass::run::<two_pass::Scalar>(&hl, &cond, &bm, &cm, &params, None, None, None, None, null).dosage[m]));
+            #[cfg(target_arch = "x86_64")]
+            {
+                if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                    doses.push(("avx2", run_fb_avx2(&hl, &cond, &bm, &cm, &params, None, None, None).dosage[m]));
+                    doses.push(("two-pass avx2", two_pass::run::<two_pass::Avx2>(&hl, &cond, &bm, &cm, &params, None, None, None, None, null).dosage[m]));
+                }
+                if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512dq") {
+                    doses.push(("avx512", run_fb_avx512(&hl, &cond, &bm, &cm, &params, None, None, None).dosage[m]));
+                    doses.push(("two-pass avx512", two_pass::run::<two_pass::Avx512>(&hl, &cond, &bm, &cm, &params, None, None, None, None, null).dosage[m]));
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                doses.push(("neon", neon::run_fb(&hl, &cond, &bm, &cm, &params, None, None, None).dosage[m]));
+                doses.push(("two-pass neon", two_pass::run::<neon::Neon>(&hl, &cond, &bm, &cm, &params, None, None, None, None, null).dosage[m]));
+            }
+        });
+        doses.push(("scaffold", run_forward_backward_scaffold(&hl, &common, &cond, &bm, &cm, &params).dosage[m]));
+        for (path, d) in doses {
+            assert!((d - want).abs() <= 1e-5 * want.max(1e-3), "{path}: dose {d} vs {want} (novel {novel})");
+        }
+    }
 }
 
 /// [`reduce16`] is the order of `_mm512_reduce_add_ps` (values spread over many
