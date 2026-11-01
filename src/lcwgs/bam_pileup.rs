@@ -48,6 +48,8 @@ pub struct BamGl {
     /// With `depth_at`: the [`DepthCounter`] read depth at each of its positions,
     /// `depth[i * n_samples + s]`.
     pub depth: Option<Vec<u16>>,
+    /// Each sample's read-pair fragments (see [`super::linkage`]); empty unless asked for.
+    pub linkage: Vec<super::linkage::SampleLinkage>,
 }
 
 /// Read-filtering thresholds, deliberately stricter than the references.
@@ -322,6 +324,7 @@ pub fn pileup_bams(
     indel_model: Option<&IndelModel>,
     params: PileupParams,
     depth_at: Option<&[i64]>,
+    link_slots: Option<usize>,
 ) -> io::Result<BamGl> {
     let n_var = pos.len();
     let n_samples = bam_paths.len();
@@ -362,19 +365,23 @@ pub fn pileup_bams(
     // A single sample has the workers to itself: its BGZF blocks inflate on
     // decoder threads and its BAQ realignments run in parallel batches.
     let within = n_samples == 1 && rayon::current_num_threads() > 1;
-    let per_sample: Vec<io::Result<(String, Vec<f32>, PileupReport, Option<Vec<u16>>)>> = bam_paths
+    // Fragments need the errmod base lists (the naive and indel models keep none).
+    let link_slots = link_slots.filter(|_| em.is_some());
+    let per_sample: Vec<io::Result<(String, Vec<f32>, PileupReport, Option<Vec<u16>>, Option<super::linkage::SampleLinkage>)>> = bam_paths
         .par_iter()
-        .map(|path| pileup_one(path, chrom, &sites, region, reference, indel_model, &params, &lut, em.as_ref(), baq_ctx.as_ref(), within, depth_at))
+        .map(|path| pileup_one(path, chrom, &sites, region, reference, indel_model, &params, &lut, em.as_ref(), baq_ctx.as_ref(), within, depth_at, link_slots))
         .collect();
 
     let mut sample_ids = Vec::with_capacity(n_samples);
     let mut blocks: Vec<Vec<f32>> = Vec::with_capacity(n_samples);
     let mut depth = depth_at.map(|d| vec![0u16; d.len() * n_samples]);
+    let mut linkage = Vec::new();
     for (s, r) in per_sample.into_iter().enumerate() {
-        let (id, blk, rep, dc) = r?;
+        let (id, blk, rep, dc, link) = r?;
         if let (Some(all), Some(dc)) = (depth.as_mut(), dc) {
             for (i, c) in dc.into_iter().enumerate() { all[i * n_samples + s] = c; }
         }
+        if let Some(l) = link { linkage.push(l); }
         if baq_ctx.is_some() {
             crate::selphi_step!("lcWGS-BAM: {}: {} reads, {} triggering sites, {} realigned ({:.1}%), {} BAQ no-ops",
                 id, rep.n_reads, rep.n_trigger_sites, rep.n_realigned,
@@ -394,7 +401,7 @@ pub fn pileup_bams(
             gl3[dst + 2] = blk[v * 3 + 2];
         }
     }
-    Ok(BamGl { gl3, sample_ids, depth })
+    Ok(BamGl { gl3, sample_ids, depth, linkage })
 }
 
 /// The panel sites being piled up.
@@ -468,9 +475,10 @@ fn pileup_one(
     baq: Option<&BaqCtx>,
     within: bool,
     depth_at: Option<&[i64]>,
-) -> io::Result<(String, Vec<f32>, PileupReport, Option<Vec<u16>>)> {
+    link_slots: Option<usize>,
+) -> io::Result<(String, Vec<f32>, PileupReport, Option<Vec<u16>>, Option<super::linkage::SampleLinkage>)> {
     if path.to_ascii_lowercase().ends_with(".cram") {
-        return pileup_one_cram(path, chrom, sites, region, reference, indel_model, params, lut, em, baq, within, depth_at);
+        return pileup_one_cram(path, chrom, sites, region, reference, indel_model, params, lut, em, baq, within, depth_at, link_slots);
     }
     let mut reader = bam::io::reader::Builder.build_from_path(path)?;
     let header = reader.read_header()?;
@@ -479,7 +487,7 @@ fn pileup_one(
     // Map chrom name → reference id in this BAM (chr-prefix tolerant).
     let Some((target_rid, contig_name)) = resolve_contig(&header, chrom) else {
         // Contig absent → every site flat.
-        return Ok((sample_id, vec![1.0f32 / 3.0; sites.pos.len() * 3], PileupReport::default(), depth_at.map(|d| vec![0; d.len()])));
+        return Ok((sample_id, vec![1.0f32 / 3.0; sites.pos.len() * 3], PileupReport::default(), depth_at.map(|d| vec![0; d.len()]), link_slots.map(|_| Default::default())));
     };
     // Region mode with a .bai index → fetch only the region's reads (avoids
     // reading the whole file). Without a region, a BAM whose index puts most of its
@@ -562,8 +570,8 @@ fn pileup_one(
         Ok(())
     };
 
-    let (gl, rep, depth) = pileup_core(&mut source, sites, params, lut, em, indel_model, baq, within, depth_at)?;
-    Ok((sample_id, gl, rep, depth))
+    let (gl, rep, depth, link) = pileup_core(&mut source, sites, params, lut, em, indel_model, baq, within, depth_at, link_slots)?;
+    Ok((sample_id, gl, rep, depth, link))
 }
 
 /// Whether `target_rid`'s reads take under half of the BAM: by the `.bai`'s per-reference mapped
@@ -608,7 +616,8 @@ fn pileup_one_cram(
     baq: Option<&BaqCtx>,
     within: bool,
     depth_at: Option<&[i64]>,
-) -> io::Result<(String, Vec<f32>, PileupReport, Option<Vec<u16>>)> {
+    link_slots: Option<usize>,
+) -> io::Result<(String, Vec<f32>, PileupReport, Option<Vec<u16>>, Option<super::linkage::SampleLinkage>)> {
     let ref_path = reference.ok_or_else(|| io::Error::new(
         io::ErrorKind::InvalidInput,
         format!("CRAM input ({path}) requires --reference <fasta> (with .fai) to decode read bases"),
@@ -625,7 +634,7 @@ fn pileup_one_cram(
     let (_, header) = open()?;
     let sample_id = read_group_sample_id(&header, path);
     let Some((target_rid, contig_name)) = resolve_contig(&header, chrom) else {
-        return Ok((sample_id, vec![1.0f32 / 3.0; sites.pos.len() * 3], PileupReport::default(), depth_at.map(|d| vec![0; d.len()])));
+        return Ok((sample_id, vec![1.0f32 / 3.0; sites.pos.len() * 3], PileupReport::default(), depth_at.map(|d| vec![0; d.len()]), link_slots.map(|_| Default::default())));
     };
     // Region mode with a .crai index → decode only the region. Without a region, a CRAM whose
     // index puts most of its containers on other chromosomes is read for this chromosome alone
@@ -709,8 +718,8 @@ fn pileup_one_cram(
         Ok(())
     };
 
-    let (gl, rep, depth) = pileup_core(&mut source, sites, params, lut, em, indel_model, baq, within, depth_at)?;
-    Ok((sample_id, gl, rep, depth))
+    let (gl, rep, depth, link) = pileup_core(&mut source, sites, params, lut, em, indel_model, baq, within, depth_at, link_slots)?;
+    Ok((sample_id, gl, rep, depth, link))
 }
 
 /// Format-agnostic pileup of one sample: read filtering, the optional BAQ
@@ -728,7 +737,8 @@ fn pileup_core(
     baq: Option<&BaqCtx>,
     within: bool,
     depth_at: Option<&[i64]>,
-) -> io::Result<(Vec<f32>, PileupReport, Option<Vec<u16>>)> {
+    link_slots: Option<usize>,
+) -> io::Result<(Vec<f32>, PileupReport, Option<Vec<u16>>, Option<super::linkage::SampleLinkage>)> {
     let n_var = sites.pos.len();
     let mut report = PileupReport::default();
     let excl = if params.keep_supplementary { FLAG_EXCLUDE & !0x800 } else { FLAG_EXCLUDE };
@@ -776,6 +786,7 @@ fn pileup_core(
         last_pos: sites.pos[n_var - 1],
         report: &mut report,
         pending: Vec::new(),
+        link: link_slots.filter(|_| use_em).map(super::linkage::assemble::Collector::new),
     };
     // The read depth is counted in this pass only, so each read once.
     let mut counter = depth_at.map(DepthCounter::new);
@@ -800,7 +811,9 @@ fn pileup_core(
         })?;
     }
     st.finish();
-    let PassState { mut bases, ll, depth, .. } = st;
+    let PassState { mut bases, ll, depth, link, .. } = st;
+    // Fragment addresses resolve against the final lists, before errmod sorts them.
+    let link = link.map(|c| c.finish(&bases, &depth, sites.is_snp, sites.ref_base, sites.alt_base));
 
     let gl = match em {
         Some(e) => finalize_gl_errmod(&mut bases, sites.ref_base, sites.alt_base, sites.is_snp, e),
@@ -820,7 +833,7 @@ fn pileup_core(
         }
         w.flush()?;
     }
-    Ok((gl, report, counter.map(DepthCounter::into_counts)))
+    Ok((gl, report, counter.map(DepthCounter::into_counts), link))
 }
 
 /// Mutable state of the GL-accumulating pass.
@@ -844,6 +857,8 @@ struct PassState<'a> {
     report: &'a mut PileupReport,
     /// `overlap_htslib`: paired reads waiting for their mate, in arrival order.
     pending: Vec<PendingRead>,
+    /// Read-pair fragment assembly (errmod path, when linkage is asked for).
+    link: Option<super::linkage::assemble::Collector>,
 }
 
 /// A read held back until its mate arrives or the sweep passes its end
@@ -1097,7 +1112,7 @@ impl PassState<'_> {
             walk_record_em(
                 p.start, self.last_pos, &p.cigar, base_at, qual_at,
                 quals.len(), p.mapq, p.flags & 0x10 != 0,
-                self.sites.pos, self.sites.is_snp, self.params, &mut self.bases, &mut self.depth, p.qhash, &mut self.ov,
+                self.sites.pos, self.sites.is_snp, self.params, &mut self.bases, &mut self.depth, p.qhash, &mut self.ov, self.link.as_mut(),
             );
         } else {
             walk_record(
@@ -1172,7 +1187,7 @@ impl PassState<'_> {
             walk_record_em(
                 r.start, self.last_pos, r.cigar, base_at, qual_at,
                 quals.len(), r.mapq, r.flags & 0x10 != 0,
-                self.sites.pos, self.sites.is_snp, self.params, &mut self.bases, &mut self.depth, r.qhash, &mut self.ov,
+                self.sites.pos, self.sites.is_snp, self.params, &mut self.bases, &mut self.depth, r.qhash, &mut self.ov, self.link.as_mut(),
             );
         } else {
             walk_record(
@@ -1266,7 +1281,7 @@ impl PassState<'_> {
             walk_record_em(
                 r.start, self.last_pos, r.cigar, base_at, qual_at,
                 quals.len(), r.mapq, r.flags & 0x10 != 0,
-                self.sites.pos, self.sites.is_snp, self.params, &mut self.bases, &mut self.depth, r.qhash, &mut self.ov,
+                self.sites.pos, self.sites.is_snp, self.params, &mut self.bases, &mut self.depth, r.qhash, &mut self.ov, self.link.as_mut(),
             );
         } else {
             walk_record(
@@ -1587,6 +1602,7 @@ fn walk_record_em<B: Fn(usize) -> u8, Q: Fn(usize) -> u8>(
     depth: &mut [u32],
     qhash: u64,
     ov: &mut OverlapState,
+    mut link: Option<&mut super::linkage::assemble::Collector>,
 ) {
     let n_var = pos.len();
     let ref_span: i64 = cigar.iter().map(|&(k, l)| match k {
@@ -1595,6 +1611,8 @@ fn walk_record_em<B: Fn(usize) -> u8, Q: Fn(usize) -> u8>(
     }).sum();
     let mut si = pos.partition_point(|&p| p < start);
     if si >= n_var || pos[si] > start + ref_span { return; }
+    // This read's fragment id, taken at its first linkable entry.
+    let mut frag: Option<u32> = None;
     let mq_cap = (mapq as i32).min(60);
     let strand_bit = (is_rev as u16) << 4;
     let mut refcur = start;
@@ -1639,7 +1657,12 @@ fn walk_record_em<B: Fn(usize) -> u8, Q: Fn(usize) -> u8>(
                                     let nq = nq.clamp(4, 63) as u16;
                                     bases[v][idx] = (nq << 5) | keep_bs;
                                 } else {
-                                    ov.first_idx[v] = bases[v].len() as u32;
+                                    let index = bases[v].len();
+                                    if let Some(c) = link.as_deref_mut().filter(|c| c.linkable(index)) {
+                                        let id = *frag.get_or_insert_with(|| c.id(qhash, start));
+                                        c.record(id, v, index);
+                                    }
+                                    ov.first_idx[v] = index as u32;
                                     bases[v].push(((q as u16) << 5) | strand_bit | base4 as u16);
                                     depth[v] += 1;
                                     ov.last_frag[v] = qhash;
@@ -1671,8 +1694,7 @@ fn finalize_gl_errmod(
     is_snp: &[bool],
     em: &crate::lcwgs::errmod::ErrMod,
 ) -> Vec<f32> {
-    finalize_gl_errmod_with_quant(bases, ref_base, alt_base, is_snp, em,
-        crate::config::is_one("LCWGS_NATIVE_PL_QUANT"))
+    finalize_gl_errmod_with_quant(bases, ref_base, alt_base, is_snp, em, native_pl_quant())
 }
 
 fn finalize_gl_errmod_with_quant(
@@ -1692,28 +1714,34 @@ fn finalize_gl_errmod_with_quant(
         let r = ascii_to_base4(ref_base[v]);
         let a = ascii_to_base4(alt_base[v]);
         if r > 3 || a > 3 { return; }
-        let mut q = [0.0f32; 25];
-        em.cal(calls, 5, &mut q);
-        let (mut q0, mut q1, mut q2) = (q[r * 5 + r] as f64, q[r * 5 + a] as f64, q[a * 5 + a] as f64);
-        if quant {
-            let qmin = q0.min(q1).min(q2);
-            q0 = ((q0 - qmin).round()).min(255.0);
-            q1 = ((q1 - qmin).round()).min(255.0);
-            q2 = ((q2 - qmin).round()).min(255.0);
-        }
-        // phred → likelihood (lower phred = more likely); normalise.
-        let l0 = 10f64.powf(-q0 / 10.0);
-        let l1 = 10f64.powf(-q1 / 10.0);
-        let l2 = 10f64.powf(-q2 / 10.0);
-        let s = l0 + l1 + l2;
-        if s > 0.0 {
-            dst[0] = (l0 / s) as f32;
-            dst[1] = (l1 / s) as f32;
-            dst[2] = (l2 / s) as f32;
-        }
+        if let Some(g) = errmod_gl3(em, calls, r, a, quant) { dst.copy_from_slice(&g); }
     });
     out
 }
+
+/// The normalised 3-way GL errmod gives `calls` (sorted in place) for REF/ALT bases
+/// `r`/`a` (0..=3); `None` when every genotype is impossible. `quant`: as
+/// `LCWGS_NATIVE_PL_QUANT`.
+pub(crate) fn errmod_gl3(em: &crate::lcwgs::errmod::ErrMod, calls: &mut [u16], r: usize, a: usize, quant: bool) -> Option<[f32; 3]> {
+    let mut q = [0.0f32; 25];
+    em.cal(calls, 5, &mut q);
+    let (mut q0, mut q1, mut q2) = (q[r * 5 + r] as f64, q[r * 5 + a] as f64, q[a * 5 + a] as f64);
+    if quant {
+        let qmin = q0.min(q1).min(q2);
+        q0 = ((q0 - qmin).round()).min(255.0);
+        q1 = ((q1 - qmin).round()).min(255.0);
+        q2 = ((q2 - qmin).round()).min(255.0);
+    }
+    // phred → likelihood (lower phred = more likely); normalise.
+    let l0 = 10f64.powf(-q0 / 10.0);
+    let l1 = 10f64.powf(-q1 / 10.0);
+    let l2 = 10f64.powf(-q2 / 10.0);
+    let s = l0 + l1 + l2;
+    (s > 0.0).then(|| [(l0 / s) as f32, (l1 / s) as f32, (l2 / s) as f32])
+}
+
+/// Whether the GL keeps `LCWGS_NATIVE_PL_QUANT`'s integer-PL representation.
+pub(crate) fn native_pl_quant() -> bool { crate::config::is_one("LCWGS_NATIVE_PL_QUANT") }
 
 #[cfg(test)]
 fn finalize_gl_errmod_reference(
@@ -1833,7 +1861,7 @@ mod tests {
             let params = PileupParams { min_mapq: 10, min_bq: 13, max_depth: 40, count_orphans: false, naive_gl: !use_em,
                 baq: true, full_baq: !partial, baq_streaming: streaming, keep_supplementary: false, overlap_htslib: false };
             let baq_ctx = BaqCtx { ref_seq: &refseq, ref_off: 0, partial };
-            let run = |within: bool| pool.install(|| {
+            let run = |within: bool, link: Option<usize>| pool.install(|| {
                 let mut source = |sink: &mut dyn FnMut(&ReadView)| -> io::Result<()> {
                     for r in &reads {
                         sink(&ReadView { start: r.start, flags: r.flags, mapq: r.mapq, cigar: &r.cigar, seq: &r.seq,
@@ -1841,12 +1869,20 @@ mod tests {
                     }
                     Ok(())
                 };
-                let (gl, rep, _) = pileup_core(&mut source, &sites, &params, &lut, use_em.then_some(&em), None, Some(&baq_ctx), within, None).unwrap();
-                (gl.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), rep.n_reads, rep.n_realigned, rep.n_baq_noop, rep.n_trigger_sites)
+                let (gl, rep, _, frags) = pileup_core(&mut source, &sites, &params, &lut, use_em.then_some(&em), None, Some(&baq_ctx), within, None, link).unwrap();
+                ((gl.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), rep.n_reads, rep.n_realigned, rep.n_baq_noop, rep.n_trigger_sites), frags)
             });
-            let want = run(false);
+            let (want, none) = run(false, None);
             assert!(want.2 > 0, "fixture must realign reads");
-            assert_eq!(run(true), want, "partial={partial} streaming={streaming} em={use_em}");
+            assert!(none.is_none());
+            assert_eq!(run(true, None), (want.clone(), None), "partial={partial} streaming={streaming} em={use_em}");
+            // Fragment assembly reads the pass, never changes it, and resolves the same
+            // fragments whichever path scored the reads.
+            let (linked, frags) = run(false, Some(8));
+            assert_eq!(linked, want);
+            assert_eq!(frags.is_some(), use_em);
+            if let Some(f) = &frags { assert!(f.n_frag() > 100, "fixture must link fragments"); }
+            assert_eq!(run(true, Some(8)), (want, frags), "partial={partial} streaming={streaming} em={use_em} (linkage)");
         }
     }
 
@@ -1955,7 +1991,7 @@ mod tests {
         let is_snp: Vec<bool> = idx.iter().map(|&i| srp.variants.ref_allele(i).len() == 1 && srp.variants.alt_allele(i).len() == 1).collect();
         let chrom = srp.variants.chr(idx[0]).to_string();
         let gl = pileup_bams(&[bam_path.clone()], &chrom, &pos, &ref_base, &alt_base, &is_snp, region, fasta.as_deref(), None,
-            PileupParams::default(), Some(&pos)).unwrap();
+            PileupParams::default(), Some(&pos), None).unwrap();
         let depth = gl.depth.unwrap();
         let mut n_diff = 0usize;
         let mut n_pos = 0usize;

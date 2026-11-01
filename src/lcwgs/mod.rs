@@ -60,6 +60,7 @@ pub mod big_panel;
 pub mod bam_pileup;
 pub mod baq;
 pub mod errmod;
+pub mod linkage;
 pub mod indel_realign;
 pub mod iterate;
 mod membership;

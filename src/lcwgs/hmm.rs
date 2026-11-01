@@ -62,6 +62,7 @@ use crate::common::HaplotypeBitmatrix;
 use crate::common::bit_gather::{GatherPlan, gather_row};
 
 pub(crate) mod two_pass;
+mod anchored;
 
 // Gated micro-profiling (LCWGS_TIMING): nanoseconds spent building the bit-packed
 // conditioning (`condbits`, the random-gather pack) vs the rest of the HMM
@@ -404,6 +405,19 @@ fn adapt_emit_pow() -> Option<f32> {
     })
 }
 
+/// A site's per-hap likelihood as the forward-backward reads it (softened under
+/// `LCWGS_ADAPT_EMIT`, else as given).
+#[inline]
+pub(crate) fn emission_hl(h0: f32, h1: f32) -> [f32; 2] {
+    match adapt_emit_pow() {
+        Some(pow) => {
+            let w = (h0 - h1).abs().powf(pow); // 0 (flat) .. 1 (sharp)
+            [0.5 + (h0 - 0.5) * w, 0.5 + (h1 - 0.5) * w]
+        }
+        None => [h0, h1],
+    }
+}
+
 /// Li-Stephens transition rate scale (cM⁻¹). DEFAULT = GLIMPSE2's K-INDEPENDENT
 /// form `0.04·Ne/max(n_ref, Ne)` (conditioning_set.cpp:34) — with the default
 /// Ne=100000 ≥ n_ref this is ≈0.04 cM⁻¹, a sticky copy (a carrier, once copied at
@@ -606,7 +620,15 @@ pub fn run_forward_backward(
     poly_sites: Option<&[usize]>,
     prepack: Option<&[u64]>,
 ) -> HmmOutput {
-    run_forward_backward_with(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack, false)
+    run_forward_backward_with(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack, false, None)
+}
+
+/// The read-pair anchors of one forward-backward call (see
+/// [`super::linkage::plan`]) and, when kept, the accumulator of each entry's
+/// posterior mass by code (`plan.hist_len()` floats, zeroed by the caller).
+pub(crate) struct Linked<'a> {
+    pub plan: &'a super::linkage::plan::Plan,
+    pub hist: Option<&'a mut [f32]>,
 }
 
 /// [`run_forward_backward`], optionally as two cooperating passes (see
@@ -638,6 +660,8 @@ pub(crate) fn run_forward_backward_with(
     // themselves; the scalar path always reads the panel directly.
     prepack: Option<&[u64]>,
     two_pass: bool,
+    // Read-pair anchors: `None` (or an empty plan) runs the kernels below unchanged.
+    linked: Option<Linked<'_>>,
 ) -> HmmOutput {
     let _trim = TrimCaches;
     let n_var = cm.len();
@@ -650,14 +674,10 @@ pub(crate) fn run_forward_backward_with(
     // low-confidence sites BEFORE dispatch, so every SIMD path + the backward
     // HL fold-in see the same softened reads. No-op (byte-identical) when unset.
     let hl_soft_buf;
-    let hl: &[f32] = if let Some(pow) = adapt_emit_pow() {
+    let hl: &[f32] = if adapt_emit_pow().is_some() {
         let mut b = vec![0.0f32; hl.len()];
         for v in 0..n_var {
-            let h0 = hl[2 * v];
-            let h1 = hl[2 * v + 1];
-            let w = (h0 - h1).abs().powf(pow); // 0 (flat) .. 1 (sharp)
-            b[2 * v] = 0.5 + (h0 - 0.5) * w;
-            b[2 * v + 1] = 0.5 + (h1 - 0.5) * w;
+            b[2 * v..2 * v + 2].copy_from_slice(&emission_hl(hl[2 * v], hl[2 * v + 1]));
         }
         hl_soft_buf = b;
         &hl_soft_buf
@@ -665,16 +685,26 @@ pub(crate) fn run_forward_backward_with(
         hl
     };
 
+    let split = two_pass && n_var >= two_pass::MIN_SITES && k >= 16 && rayon::current_num_threads() > 1;
+    // Read-pair anchors: the anchored columns of the host's path, one pass or two
+    // (the same dosages either way).
+    if let Some(Linked { plan, hist }) = linked.filter(|l| !l.plan.is_empty()) {
+        let hist = hist.map_or(std::ptr::null_mut(), |h| { debug_assert_eq!(h.len(), plan.hist_len()); h.as_mut_ptr() });
+        // SAFETY: `hist` holds `plan.hist_len()` floats or is null.
+        return unsafe { anchored::run(split, hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack, plan, hist) };
+    }
+
     // Two cooperating passes, each path with its own sequential arithmetic.
     // NEON keeps its sequential kernel.
-    if two_pass && n_var >= two_pass::MIN_SITES && k >= 16 && rayon::current_num_threads() > 1 {
+    if split {
+        let none = std::ptr::null_mut();
         #[cfg(target_arch = "x86_64")]
         {
             if use_avx512_lcwgs() {
-                return unsafe { two_pass::run::<two_pass::Avx512>(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack) };
+                return unsafe { two_pass::run::<two_pass::Avx512>(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack, None, none) };
             }
             if use_avx2_lcwgs() {
-                return unsafe { two_pass::run::<two_pass::Avx2>(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack) };
+                return unsafe { two_pass::run::<two_pass::Avx2>(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack, None, none) };
             }
         }
         #[cfg(target_arch = "aarch64")]
@@ -682,7 +712,7 @@ pub(crate) fn run_forward_backward_with(
         #[cfg(not(target_arch = "aarch64"))]
         let scalar = true;
         if scalar {
-            return unsafe { two_pass::run::<two_pass::Scalar>(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack) };
+            return unsafe { two_pass::run::<two_pass::Scalar>(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack, None, none) };
         }
     }
 

@@ -159,7 +159,38 @@ pub fn run_lcwgs(
     memtrace("after gl3_shared relayout (gl3_input dropped)");
 
     // --- 5. cM map + chunked Gibbs imputation (shared with the BAM path) ---
-    impute_from_gl3(srp, &wgs_idx, gl3_shared, n_samples, sample_ids, &pl_haploid, map_path, params, None, None)
+    impute_from_gl3(srp, &wgs_idx, gl3_shared, n_samples, sample_ids, &pl_haploid, map_path, params, None, None, None)
+}
+
+/// A run's read-pair linkage (BAM/CRAM input, see [`super::linkage`]): its settings
+/// and each sample's fragments over the run's sites (`None`: not linked).
+pub(crate) struct Links {
+    cfg: super::linkage::LinkConfig,
+    samples: Vec<Option<super::linkage::SampleLinkage>>,
+}
+
+/// An upper bound on a plan's contents from its fragments' observations: an entry of
+/// `u` sites (<= the sum of its fragments' sites) holds a table and its posterior
+/// masses of max(16, 2^u) <= 32u f32 each (u <= 8) and u rows, so <= 260 B per
+/// observation, and 12 B of offsets per entry (<= one per fragment).
+fn plan_bytes(frags: usize, obs: usize) -> usize { 260 * obs + 12 * frags }
+
+/// Whether this run links read pairs: asked for (`LCWGS_LINKAGE`), and neither with
+/// the scaffold forward-backward or the heuristic phaser, nor on a biobank-size
+/// panel (whose SPLIT passes were not measured with it).
+fn link_config(n_ref: usize, params: &LcwgsParams) -> Option<super::linkage::LinkConfig> {
+    let cfg = super::linkage::LinkConfig::from_env(params.rare_maf)?;
+    let off = if crate::config::present("LCWGS_SCAFFOLD") { Some("LCWGS_SCAFFOLD") }
+        else if crate::config::present("LCWGS_NO_FOUNDER_PHASE") { Some("LCWGS_NO_FOUNDER_PHASE") }
+        else if super::big_panel::is_big(n_ref) { Some("a biobank-size panel") }
+        else { None };
+    if let Some(why) = off {
+        crate::selphi_info!("  lcWGS read-pair linkage: off ({why})");
+        return None;
+    }
+    crate::selphi_info!("  lcWGS read-pair linkage: forward-backward and phaser at sites of panel MAF >= {} (minor-allele bases below), the first {} bases of a site, samples of median depth <= {}",
+        cfg.min_maf, super::linkage::MAX_SLOTS, cfg.max_depth);
+    Some(cfg)
 }
 
 /// Panel sites imputed without entering the chain (`LCWGS_BAM_INDELS=impute`, the
@@ -294,6 +325,7 @@ fn impute_from_gl3(
     params: &LcwgsParams,
     prepared: Option<Prepared>,
     passengers: Option<Passengers>,
+    links: Option<Links>,
 ) -> std::io::Result<LcwgsOutput> {
     let n_shared = wgs_idx.len();
     // The coverage proxy of the SPLIT gate and the adaptive GL floor, read from the
@@ -302,6 +334,13 @@ fn impute_from_gl3(
     let mean_conf = gl_mean_conf(&gl3_shared, n_samples, n_shared);
     let pass_idx: &[usize] = passengers.as_ref().map_or(&[], |p| p.idx.as_slice());
     let haploid = haploid_chrx(&mut gl3_shared, srp, wgs_idx, n_samples, &sample_ids, pl_haploid, params, pass_idx);
+    // A haploid man's chrX rows are rewritten in product form: his reads are not linked.
+    let links = links.map(|mut l| {
+        if let Some(cells) = &haploid {
+            for (s, link) in l.samples.iter_mut().enumerate() { if cells.sample[s] { *link = None; } }
+        }
+        l
+    });
     // Nothing but flat likelihoods (a GT-only, GP or DS file forced onto this engine, a BAM with
     // no read on this chromosome) would be imputed from the panel alone.
     if !gl3_shared.chunks_exact(3).any(|g| g[0] != g[1] || g[1] != g[2]) {
@@ -366,7 +405,8 @@ fn impute_from_gl3(
 
     let pass_cm = match &passengers { Some(p) => site_cm(srp, &p.idx, map_path)?, None => Vec::new() };
     let (dosage, mut gp, mut pass_dosage, mut pass_gp) = run_chunked_gibbs(&gl3_shared, srp, wgs_idx, &cm, n_samples, n_shared, params, mean_conf,
-        big_split, prepared_chunks.as_deref(), passengers.as_ref().map(|p| (p, pass_cm.as_slice())));
+        big_split, prepared_chunks.as_deref(), passengers.as_ref().map(|p| (p, pass_cm.as_slice())),
+        links.as_ref().filter(|l| l.samples.iter().any(Option::is_some)));
     if let Some(gl) = passengers.as_ref().and_then(|p| p.gl3.as_deref()) {
         let cells = haploid.as_ref().map(|c| (c.sample.as_slice(), c.pass_site.as_slice()));
         fold_passenger_reads(&mut pass_gp, &mut pass_dosage, gl, n_samples, cells);
@@ -1095,7 +1135,9 @@ fn run_lcwgs_bam_inner(
 
     let pp = super::bam_pileup::PileupParams::default();
     let region_bounds = region.map(|(_, s, e)| (s, e));
-    let pileup = || super::bam_pileup::pileup_bams(bam_paths, &chrom, &pos, &ref_base, &alt_base, &is_snp, region_bounds, reference, indel_model.as_ref(), pp, depth_at);
+    let link_cfg = link_config(srp.metadata.n_haps, params);
+    let pileup = || super::bam_pileup::pileup_bams(bam_paths, &chrom, &pos, &ref_base, &alt_base, &is_snp, region_bounds, reference,
+        indel_model.as_ref(), pp, depth_at, link_cfg.map(|_| super::linkage::MAX_SLOTS));
     // Impute-only indels scored from their own reads: a pileup of their own, so
     // the SNP pileup is the default's exactly.
     let pass_pileup = || -> std::io::Result<Option<super::bam_pileup::BamGl>> {
@@ -1109,7 +1151,7 @@ fn run_lcwgs_bam_inner(
         }).collect();
         let model = super::indel_realign::IndelModel::build(refp, &chrom, &inputs)?;
         selphi_info!("  lcWGS-BAM: indel realignment for {} impute-only indel sites (own reads only)", model.n_sites());
-        super::bam_pileup::pileup_bams(bam_paths, &chrom, &ppos, &pref, &palt, &vec![false; pass_idx.len()], region_bounds, reference, Some(&model), pp, None).map(Some)
+        super::bam_pileup::pileup_bams(bam_paths, &chrom, &ppos, &pref, &palt, &vec![false; pass_idx.len()], region_bounds, reference, Some(&model), pp, None, None).map(Some)
     };
     let pileup_all = || -> std::io::Result<(super::bam_pileup::BamGl, Option<super::bam_pileup::BamGl>)> { Ok((pileup()?, pass_pileup()?)) };
     let pass_ref = (!pass_idx.is_empty()).then(|| Passengers::new(&wgs_idx, pass_idx.clone(), None));
@@ -1134,8 +1176,18 @@ fn run_lcwgs_bam_inner(
         p
     });
     let depth = depth_span.zip(bamgl.depth).map(|(r, count)| ReadDepth::new(r.start, n_samples, count));
+    // Read-pair fragments, per sample, unless its median depth is above the gate.
+    let links = link_cfg.filter(|_| bamgl.linkage.len() == n_samples).map(|cfg| Links {
+        cfg,
+        samples: bamgl.linkage.into_iter().zip(&bamgl.sample_ids).map(|(l, id)| {
+            let on = l.median_depth as usize <= cfg.max_depth;
+            crate::selphi_info!("  lcWGS read-pair linkage: {}: {} read pairs over >= 2 SNP sites, median depth {}{}",
+                id, l.n_frag(), l.median_depth, if on { "" } else { ": above the gate, not linked" });
+            on.then_some(l)
+        }).collect(),
+    });
     // bamgl.gl3 is already in panel-shared order → shared imputation tail.
-    let out = impute_from_gl3(srp, &wgs_idx, bamgl.gl3, n_samples, bamgl.sample_ids, &[], map_path, params, prepared, passengers)?;
+    let out = impute_from_gl3(srp, &wgs_idx, bamgl.gl3, n_samples, bamgl.sample_ids, &[], map_path, params, prepared, passengers, links)?;
     Ok((out, depth))
 }
 
@@ -1519,6 +1571,7 @@ fn run_chunked_gibbs(
     big_split: Option<super::big_panel::BigSplit>,
     prepared: Option<&[std::sync::Mutex<Option<ChunkPrep>>]>,
     passengers: Option<(&Passengers, &[f64])>,
+    links: Option<&Links>,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     // GLIMPSE2-style: ~core_cm core + buffer_cm each side. Defaults chosen to
     // match GLIMPSE2_chunk's typical ~few-cM cores. cM span of chr22 ≈ 50.
@@ -1596,6 +1649,9 @@ fn run_chunked_gibbs(
         None
     };
 
+    // The likelihood of the bases a chunk's fragments leave at their sites.
+    let errmod = links.map(|_| super::errmod::ErrMod::new());
+
     let threads = rayon::current_num_threads().max(1);
     let cache_bytes = threads * (super::hmm::CACHE_BYTES_PER_WORKER + super::membership::CACHE_BYTES_PER_WORKER);
     let coordinator_bytes = if n_samples <= 1 {
@@ -1646,22 +1702,31 @@ fn run_chunked_gibbs(
     let chunk_sites: Vec<_> = plan.iter().map(|r| {
         r.as_ref().map_or(0, |(core, buffer)| buffer.len() + passengers.map_or(0, |(p, _)| p.of_core(core).len()))
     }).collect();
-    let chunk_concurrent: Vec<bool> = chunk_sites.iter().map(|&sites| concurrent
-        && memory.as_ref().is_some_and(|m| m.admits_chunk(chunk_state_bytes_chains(sites, n_ref, n_samples, 2)))).collect();
+    // A linked chunk also holds the likelihoods its forward-backward reads (12 B a site
+    // and sample) and each sample's view of its fragments (12 B an observation, 4 B a
+    // fragment); each running sample task holds one haplotype's plan ([`plan_bytes`]).
+    let link_cost: Vec<(usize, usize)> = plan.iter().map(|r| match (r, links) {
+        (Some((_, buffer)), Some(l)) => l.samples.iter().flatten().map(|x| x.counts_in(buffer.clone()))
+            .fold((buffer.len() * n_samples * 12, 0), |(view, task), (frags, obs)| (view + obs * 12 + frags * 4, task.max(plan_bytes(frags, obs)))),
+        _ => (0, 0),
+    }).collect();
+    let link_bytes = |c: usize, chains: usize| link_cost[c].0 + chains * link_cost[c].1;
+    let chunk_concurrent: Vec<bool> = chunk_sites.iter().enumerate().map(|(c, &sites)| concurrent
+        && memory.as_ref().is_some_and(|m| m.admits_chunk(chunk_state_bytes_chains(sites, n_ref, n_samples, 2) + link_bytes(c, 2)))).collect();
     // A single sample's Gibbs chains (two under the small-panel profile) run at the
     // same time, up to one per worker, charged as that many chains (else one after
     // the other): one sample leaves workers idle, and two chains one after the other
     // would double its wall time. Same output either way (`iterate::run_gibbs_ensemble_inner`).
     let together = n_chains.min(threads);
-    let chains_together: Vec<usize> = chunk_sites.iter().map(|&sites| if together > 1
-        && memory.as_ref().is_some_and(|m| m.admits_chunk(chunk_state_bytes_chains(sites, n_ref, n_samples, together))) { together } else { 1 }).collect();
+    let chains_together: Vec<usize> = chunk_sites.iter().enumerate().map(|(c, &sites)| if together > 1
+        && memory.as_ref().is_some_and(|m| m.admits_chunk(chunk_state_bytes_chains(sites, n_ref, n_samples, together) + link_bytes(c, together))) { together } else { 1 }).collect();
     let blend_below = split_blend_below().filter(|_| split_band.is_some());
     if let Some(x) = blend_below {
         crate::selphi_info!("  lcWGS SPLIT: panel MAF < {} outside the deep band takes the mean of both passes (LCWGS_SPLIT_BLEND_BELOW)", x);
     }
     // The admitted path's chunk costs, and the start order `run_chunks` follows.
-    let costs: Vec<usize> = chunk_sites.iter().zip(chunk_concurrent.iter().zip(&chains_together))
-        .map(|(&sites, (&two, &chains))| chunk_state_bytes_chains(sites, n_ref, n_samples, if two { 2 } else { chains })).collect();
+    let costs: Vec<usize> = chunk_sites.iter().zip(chunk_concurrent.iter().zip(&chains_together)).enumerate()
+        .map(|(i, (&sites, (&two, &chains)))| { let c = if two { 2 } else { chains }; chunk_state_bytes_chains(sites, n_ref, n_samples, c) + link_bytes(i, c) }).collect();
     let pool = (single_sample && selector && explicit_budget.is_none() && plan.iter().flatten().count() > 1
         && !crate::config::present("LCWGS_NO_PANEL_AHEAD"))
         .then(|| crate::common::threads::global().helper_pool(threads, 1,
@@ -1736,6 +1801,21 @@ fn run_chunked_gibbs(
             } else {
                 super::faithful_select::FaithfulPanel::build(&chunk_bm, chunk_cm, params)
             })));
+            // Each linked sample's fragments over this chunk, and the likelihoods its
+            // forward-backward reads: the chunk's, with the bases its fragments take
+            // left out at their sites.
+            let chunk_views = links.map(|l| {
+                let linkable = super::linkage::view::linkable_sites(&chunk_bm, l.cfg.min_maf);
+                let mut gl_fb = chunk_gl3.to_vec();
+                let views: Vec<Option<super::linkage::view::ChunkLinks>> = l.samples.iter().enumerate().map(|(s, link)| link.as_ref().map(|link| {
+                    let (view, rest) = super::linkage::view::build(link, buf_start..buf_end, &linkable, errmod.as_ref().unwrap(), params.epsilon);
+                    for (v, gl) in rest { let b = (v as usize * n_samples + s) * 3; gl_fb[b..b + 3].copy_from_slice(&gl); }
+                    view
+                })).collect();
+                (views, gl_fb)
+            });
+            let chunk_link = chunk_views.as_ref().map(|(views, gl_fb)| super::iterate::ChunkLinkage { samples: views, gl_fb });
+            let link = chunk_link.as_ref();
             // Two-depth split: run the deep pass and overlay its dose/GP onto the band
             // sites (panel MAF ∈ [lo,hi)), routing by PANEL allele frequency only (known
             // a-priori; no truth). Byte-identical when `split_band` is None. The two
@@ -1754,18 +1834,18 @@ fn run_chunked_gibbs(
                 std::thread::scope(|scope| {
                     // When the OS starts no thread for it, the passes run one after the other below.
                     let deep_run = crate::common::threads::global().spawn_scoped(scope, "lcwgs-split", move || super::memory::in_chain_pool(pool, || super::iterate::run_gibbs_ensemble_with_memory(
-                        chunk_gl3, bm, chunk_cm, n_samples, deep, Some(deep_k), None, execution, pnl, cp, deep_member, 1, threads))).ok()?;
+                        chunk_gl3, bm, chunk_cm, n_samples, deep, Some(deep_k), None, execution, pnl, cp, deep_member, 1, threads, link))).ok()?;
                     let out = super::iterate::run_gibbs_ensemble_with_memory(
-                        chunk_gl3, bm, chunk_cm, n_samples, params, None, None, execution, pnl, cp, main_member, 1, threads);
+                        chunk_gl3, bm, chunk_cm, n_samples, params, None, None, execution, pnl, cp, main_member, 1, threads, link);
                     Some((out, Some(deep_run.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))))
                 })
             } else { None };
             let (mut out, out_deep) = together.unwrap_or_else(|| {
                 let chains = chains_together[c];
                 let out = super::iterate::run_gibbs_ensemble_with_memory(chunk_gl3, &chunk_bm, chunk_cm, n_samples, params, None,
-                    chrwide_cond.as_ref(), execution, panel.as_ref(), chunk_pass.as_ref(), None, chains, threads);
+                    chrwide_cond.as_ref(), execution, panel.as_ref(), chunk_pass.as_ref(), None, chains, threads, link);
                 let out_deep = split_band.map(|(_, _, deep_k)| super::iterate::run_gibbs_ensemble_with_memory(
-                    chunk_gl3, &chunk_bm, chunk_cm, n_samples, deep, Some(deep_k), chrwide_cond.as_ref(), execution, panel.as_ref(), chunk_pass.as_ref(), None, chains, threads));
+                    chunk_gl3, &chunk_bm, chunk_cm, n_samples, deep, Some(deep_k), chrwide_cond.as_ref(), execution, panel.as_ref(), chunk_pass.as_ref(), None, chains, threads, link));
                 (out, out_deep)
             });
             drop(panel);
@@ -1917,7 +1997,10 @@ fn run_chunked_gibbs(
         };
         if let Some((_, _, deep_k)) = split_band { k = k.max(cap(deep_k)); }
         if crate::config::present("LCWGS_LS_RICH_COND") { k = k.saturating_mul(2).min(n_ref); }
-        let costs: Vec<_> = chunk_sites.iter().map(|&sites| estimate_chunk_memory(sites, n_ref, n_samples, k)).collect();
+        let costs: Vec<_> = chunk_sites.iter().zip(&link_cost).map(|(&sites, &(view, task))| {
+            let m = estimate_chunk_memory(sites, n_ref, n_samples, k);
+            ChunkMemory { fixed: m.fixed + view as f64, task: m.task + task as f64 }
+        }).collect();
         // Keep the original wave admission/order by default. Its task estimate
         // is deliberately larger than observed RSS; applying the reclamation
         // target to that estimate would needlessly remove runnable chunks.
@@ -1927,6 +2010,11 @@ fn run_chunked_gibbs(
         let (samples, collections) = reclaimer.counts();
         crate::selphi_info!("  lcWGS sample waves: {} completed sample tasks, {} pressure collections",
             samples, collections);
+    }
+    if links.is_some() {
+        let [entries, drawn, left, seg, bound, long, acc, rej] = super::linkage::take_stats();
+        crate::selphi_info!("  lcWGS read-pair linkage: {} forward-backward anchor entries ({} drawn jointly, {} left to per-site draws); phaser potentials on {} segments and {} boundaries, {} read pairs over more than two segments (Metropolis-Hastings: {} accepted, {} rejected)",
+            entries, drawn, left, seg, bound, long, acc, rej);
     }
     // The chunk stage ends with the pool threads it started gone (a dropped pool's
     // workers leave on their own time), so that the writers find the room they had.
@@ -2276,7 +2364,7 @@ mod tests {
             let costs: Vec<_> = inputs.iter().map(|(_, cm, _)| chunk_state_bytes(cm.len(), 40, ns)).collect();
             let process = |c: usize, execution: SampleExecution<'_>| {
                 let (bm, cm, gl) = &inputs[c];
-                let out = super::super::iterate::run_gibbs_ensemble_with_memory(gl, bm, cm, ns, &params, None, None, execution, None, None, None, 1, 1);
+                let out = super::super::iterate::run_gibbs_ensemble_with_memory(gl, bm, cm, ns, &params, None, None, execution, None, None, None, 1, 1, None);
                 (out.dosage.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                  out.gp.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
             };
