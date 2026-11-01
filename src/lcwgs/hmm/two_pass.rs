@@ -517,7 +517,7 @@ struct Shared<'a> {
 }
 
 #[cfg(test)]
-static TASK_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+pub(super) static TASK_BLOCKS: AtomicUsize = AtomicUsize::new(0);
 
 /// Held by every test whose forward-backward calls can run block tasks, so
 /// `two_pass_dosages_match_sequential_kernel` counts only its own.
@@ -908,7 +908,7 @@ mod tests {
                 if use_avx2_lcwgs() { return run::<Avx2>(hl, cond, bm, cm, params, rmult, poly, prepack, None, std::ptr::null_mut()).dosage; }
             }
             #[cfg(target_arch = "aarch64")]
-            if use_neon_lcwgs() { return run_forward_backward(hl, cond, bm, cm, params, rmult, poly, prepack).dosage; }
+            if use_neon_lcwgs() { return run::<super::neon::Neon>(hl, cond, bm, cm, params, rmult, poly, prepack, None, std::ptr::null_mut()).dosage; }
             run::<Scalar>(hl, cond, bm, cm, params, rmult, poly, prepack, None, std::ptr::null_mut()).dosage
         }
     }
@@ -919,6 +919,7 @@ mod tests {
     #[test]
     fn two_pass_dosages_match_sequential_kernel() {
         let _serial = TASK_BLOCKS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let start = TASK_BLOCKS.load(Ordering::Relaxed);
         let mut rng = rp::Xs(0x9E37_79B9_7F4A_7C15);
         let params = LcwgsParams::default();
         let pools: Vec<_> = [1usize, 2, 4, 8].iter()
@@ -962,6 +963,6 @@ mod tests {
                 }
             }
         }
-        assert!(TASK_BLOCKS.load(Ordering::Relaxed) > 0, "block tasks were never exercised");
+        assert!(TASK_BLOCKS.load(Ordering::Relaxed) > start, "block tasks were never exercised");
     }
 }

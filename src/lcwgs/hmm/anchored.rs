@@ -85,7 +85,7 @@ fn factor_scratch(k: usize) -> (*mut f32, *mut f32) {
 /// first, renormalised to a maximum of 1 over the states and floored as one table is
 /// (it stays >= floor^2 >= 1e-36 before the rescale: no f32 underflow or overflow).
 #[inline]
-unsafe fn renormalise(g: *mut f32, k: usize, floor: f32) { unsafe {
+pub(super) unsafe fn renormalise(g: *mut f32, k: usize, floor: f32) { unsafe {
     let g = std::slice::from_raw_parts_mut(g, k);
     let mx = g.iter().copied().fold(0.0f32, f32::max);
     if mx > 0.0 {
@@ -104,13 +104,6 @@ unsafe fn masses(k: usize, acol: *const f32, bp: *const f32, fact1: f32, fact2: 
         Some(f2) => for j in 0..k { *post.add(j) = *acol.add(j) * (*bp.add(j) * f2 + fact1); },
         None => for j in 0..k { *post.add(j) = *acol.add(j) * fact1; },
     }
-}}
-
-/// Add each state's mass `post` into `h` at its code.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn add_masses(h: *mut f32, codes: &[u32], post: &[f32]) { unsafe {
-    for (&c, &x) in codes.iter().zip(post) { *h.add(c as usize) += x; }
 }}
 
 /// The factor pass of the portable path (scalar; reads the panel or the pack).
@@ -204,7 +197,7 @@ pub(super) unsafe fn step_scalar<const POST: bool>(
 /// Codes of an entry whose posterior masses are summed per code in registers (one
 /// masked add per code and 16 states); larger entries sum a group's most common code
 /// (its first lane's) in a register and add the other lanes one by one.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const REG_CODES: usize = 8;
 
 /// The factor pass (see [`factor_scalar`]): 16 codes at a time from the pack; a
@@ -602,80 +595,61 @@ pub(super) unsafe fn step_avx2<const POST: bool>(
 }}
 
 // --------------------------------------------------------------------------
-// NEON (the loop bodies of `run_fb_neon`, and their anchored columns)
+// NEON (the AVX-512 anchored columns, each 16-lane vector as four float32x4)
 // --------------------------------------------------------------------------
 
-#[cfg(target_arch = "aarch64")]
-pub(super) struct Neon;
-
-#[cfg(target_arch = "aarch64")]
-impl Kernels for Neon {
-    const PACKED: bool = true;
-    unsafe fn first(c: &Ctx, e0: f32, e1: f32, out: *mut f32) -> f32 { unsafe { first_neon(c, e0, e1, out) } }
-    unsafe fn column(c: &Ctx, prev: *const f32, curr: *mut f32, v: usize, e0: f32, e1: f32, pr: f32, asum_prev: f32) -> f32 {
-        unsafe { fwd_col_neon(prev, curr, v, e0, e1, pr, asum_prev, c.cbp, c.inv_k, c.k, c.k & !3usize, c.w64) }
-    }
-    unsafe fn init<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0: f32, e1: f32) -> (f32, f32, f32) {
-        unsafe { init_neon::<POST>(c, acol, bp, v, e0, e1, std::ptr::null()) }
-    }
-    unsafe fn step<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0: f32, e1: f32, fact1: f32, fact2: f32) -> (f32, f32, f32) {
-        unsafe { step_neon::<POST>(c, acol, bp, v, e0, e1, fact1, fact2, std::ptr::null()) }
-    }
-    unsafe fn column_anchor(c: &Ctx, prev: *const f32, curr: *mut f32, v: usize, e0: f32, e1: f32, pr: f32, asum_prev: f32,
-        p: &Plan, r: std::ops::Range<usize>) -> f32 {
-        unsafe {
-            let (g, _) = factor_scratch(c.k);
-            factor_neon(c, p, r, g, std::ptr::null(), std::ptr::null_mut());
-            column_neon(c, prev, curr, v, e0, e1, pr, asum_prev, g)
-        }
-    }
-    unsafe fn init_anchor<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0: f32, e1: f32,
-        p: &Plan, r: std::ops::Range<usize>, hist: *mut f32) -> (f32, f32, f32) {
-        unsafe {
-            let (g, post) = factor_scratch(c.k);
-            let keep = POST && !hist.is_null();
-            if keep { masses(c.k, acol, bp, c.inv_k, None, post); }
-            factor_neon(c, p, r, g, if keep { post } else { std::ptr::null() }, if keep { hist } else { std::ptr::null_mut() });
-            init_neon::<POST>(c, acol, bp, v, e0, e1, g)
-        }
-    }
-    unsafe fn step_anchor<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0: f32, e1: f32, fact1: f32, fact2: f32,
-        p: &Plan, r: std::ops::Range<usize>, hist: *mut f32) -> (f32, f32, f32) {
-        unsafe {
-            let (g, post) = factor_scratch(c.k);
-            let keep = POST && !hist.is_null();
-            if keep { masses(c.k, acol, bp, fact1, Some(fact2), post); }
-            factor_neon(c, p, r, g, if keep { post } else { std::ptr::null() }, if keep { hist } else { std::ptr::null_mut() });
-            step_neon::<POST>(c, acol, bp, v, e0, e1, fact1, fact2, g)
-        }
-    }
-}
-
-/// The factor pass (see [`factor_avx512`]), 4 states at a time (no gather on NEON:
-/// four table reads).
+/// The factor pass of [`factor_avx512`] on NEON: the same table values and
+/// products, and the same posterior sums by code (16-lane register sums reduced
+/// in `_mm512_reduce_add_ps` order, then lane by lane), so `g` and the masses
+/// equal the AVX-512 path's bit for bit.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn factor_neon(c: &Ctx, p: &Plan, r: std::ops::Range<usize>, g: *mut f32, post: *const f32, hist: *mut f32) { unsafe {
     use core::arch::aarch64::*;
-    let (k, kmain4) = (c.k, c.k & !3usize);
+    let (k, kmain) = (c.k, c.k & !15usize);
+    let zero = vdupq_n_f32(0.0);
     for (i, e) in r.enumerate() {
         let rows = p.rows(e);
         let tab = p.table(e);
+        let n_codes = 1usize << rows.len();
         let h = if hist.is_null() || post.is_null() { std::ptr::null_mut() } else { hist.add(p.tab_off[e] as usize) };
+        let mut acc = [[zero; 4]; REG_CODES];
         let mut j = 0;
-        while j < kmain4 {
-            let mut code = vdupq_n_u32(0);
+        while j < kmain {
+            let mut code = [vdupq_n_u32(0); 4];
             for (t, &row) in rows.iter().enumerate() {
-                code = vorrq_u32(code, vandq_u32(lane_mask4(c.cbp, row as usize * c.w64, j), vdupq_n_u32(1 << t)));
+                for (q, cq) in code.iter_mut().enumerate() {
+                    *cq = vorrq_u32(*cq, vandq_u32(neon::mask4(c.cbp, row as usize * c.w64, j + 4 * q), vdupq_n_u32(1 << t)));
+                }
             }
-            let mut cs = [0u32; 4];
-            vst1q_u32(cs.as_mut_ptr(), code);
-            let gs = [*tab.add(cs[0] as usize), *tab.add(cs[1] as usize), *tab.add(cs[2] as usize), *tab.add(cs[3] as usize)];
-            let gv = vld1q_f32(gs.as_ptr());
-            let gv = if i == 0 { gv } else { vmulq_f32(vld1q_f32(g.add(j)), gv) };
-            vst1q_f32(g.add(j), gv);
-            if !h.is_null() { add_masses(h, &cs, std::slice::from_raw_parts(post.add(j), 4)); }
-            j += 4;
+            let mut cs = [0u32; 16];
+            for (q, &cq) in code.iter().enumerate() { vst1q_u32(cs.as_mut_ptr().add(4 * q), cq); }
+            let gs: [f32; 16] = std::array::from_fn(|l| *tab.add(cs[l] as usize));
+            for q in 0..4 {
+                let gv = vld1q_f32(gs.as_ptr().add(4 * q));
+                let gv = if i == 0 { gv } else { vmulq_f32(vld1q_f32(g.add(j + 4 * q)), gv) };
+                vst1q_f32(g.add(j + 4 * q), gv);
+            }
+            if !h.is_null() {
+                let pv: [float32x4_t; 4] = std::array::from_fn(|q| vld1q_f32(post.add(j + 4 * q)));
+                if n_codes <= REG_CODES {
+                    for (cc, a) in acc.iter_mut().enumerate().take(n_codes) {
+                        for q in 0..4 {
+                            a[q] = vbslq_f32(vceqq_u32(code[q], vdupq_n_u32(cc as u32)), vaddq_f32(a[q], pv[q]), a[q]);
+                        }
+                    }
+                } else {
+                    let c0 = cs[0];
+                    *h.add(c0 as usize) += neon::reduce16(std::array::from_fn(|q| vbslq_f32(vceqq_u32(code[q], vdupq_n_u32(c0)), pv[q], zero)));
+                    for l in 1..16 {
+                        if cs[l] != c0 { *h.add(cs[l] as usize) += *post.add(j + l); }
+                    }
+                }
+            }
+            j += 16;
+        }
+        if !h.is_null() && n_codes <= REG_CODES {
+            for (cc, a) in acc.iter().enumerate().take(n_codes) { *h.add(cc) += neon::reduce16(*a); }
         }
         while j < k {
             let code = code_of(c, p, e, j);
@@ -690,51 +664,34 @@ unsafe fn factor_neon(c: &Ctx, p: &Plan, r: std::ops::Range<usize>, g: *mut f32,
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn first_neon(c: &Ctx, e0s: f32, e1s: f32, out: *mut f32) -> f32 { unsafe {
-    use core::arch::aarch64::*;
-    let (k, kmain4) = (c.k, c.k & !3usize);
-    let e0 = vdupq_n_f32(e0s); let e1 = vdupq_n_f32(e1s);
-    let invkv = vdupq_n_f32(c.inv_k);
-    let mut sumv = vdupq_n_f32(0.0);
-    let mut j = 0;
-    while j < kmain4 {
-        let x = vmulq_f32(vbslq_f32(lane_mask4(c.cbp, 0, j), e1, e0), invkv);
-        vst1q_f32(out.add(j), x);
-        sumv = vaddq_f32(sumv, x);
-        j += 4;
-    }
-    let mut s0 = vaddvq_f32(sumv);
-    while j < k {
-        let x = c.inv_k * if allele(c, 0, j) { e1s } else { e0s };
-        *out.add(j) = x; s0 += x; j += 1;
-    }
-    s0
-}}
-
-/// `fwd_col_neon` times the anchor factors `g`.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn column_neon(
-    c: &Ctx, prev: *const f32, curr: *mut f32, v: usize, e0s: f32, e1s: f32, pr: f32, asum_prev: f32, g: *const f32,
+pub(super) unsafe fn column_neon(
+    c: &Ctx, prev: *const f32, curr: *mut f32, v: usize, e0s: f32, e1s: f32, pr: f32, asum_prev: f32,
+    p: &Plan, r: std::ops::Range<usize>,
 ) -> f32 { unsafe {
     use core::arch::aarch64::*;
-    let (k, kmain4) = (c.k, c.k & !3usize);
+    let (k, kmain) = (c.k, c.k & !15usize);
+    let (g, _) = factor_scratch(k);
+    factor_neon(c, p, r, g, std::ptr::null(), std::ptr::null_mut());
     let fact1 = pr * c.inv_k;
     let fact2 = (1.0 - pr) / asum_prev.max(f32::MIN_POSITIVE);
     let e0 = vdupq_n_f32(e0s); let e1 = vdupq_n_f32(e1s);
     let f1v = vdupq_n_f32(fact1); let f2v = vdupq_n_f32(fact2);
     let base = v * c.w64;
-    let mut sumv = vdupq_n_f32(0.0);
+    let mut sumv = [vdupq_n_f32(0.0); 4];
     let mut j = 0;
-    while j < kmain4 {
-        let tmp = vfmaq_f32(f1v, vld1q_f32(prev.add(j)), f2v);
-        let x = vmulq_f32(vmulq_f32(tmp, vbslq_f32(lane_mask4(c.cbp, base, j), e1, e0)), vld1q_f32(g.add(j)));
-        vst1q_f32(curr.add(j), x);
-        sumv = vaddq_f32(sumv, x);
-        j += 4;
+    while j < kmain {
+        for (q, s) in sumv.iter_mut().enumerate() {
+            let jj = j + 4 * q;
+            let tmp = vfmaq_f32(f1v, vld1q_f32(prev.add(jj)), f2v);
+            let ev = vbslq_f32(neon::mask4(c.cbp, base, jj), e1, e0);
+            let x = vmulq_f32(vmulq_f32(tmp, ev), vld1q_f32(g.add(jj)));
+            vst1q_f32(curr.add(jj), x);
+            *s = vaddq_f32(*s, x);
+        }
+        j += 16;
     }
-    let mut s = vaddvq_f32(sumv);
+    let mut s = neon::reduce16(sumv);
     while j < k {
         let e = if allele(c, v, j) { e1s } else { e0s };
         let x = (*prev.add(j) * fact2 + fact1) * e * *g.add(j);
@@ -743,40 +700,45 @@ unsafe fn column_neon(
     s
 }}
 
-/// The NEON backward initialisation (the loop body of `run_fb_neon`), times the
-/// anchor factors `g` when not null.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn init_neon<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0l: f32, e1l: f32, g: *const f32) -> (f32, f32, f32) { unsafe {
+pub(super) unsafe fn init_neon<const POST: bool>(
+    c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0l: f32, e1l: f32, p: &Plan, r: std::ops::Range<usize>, hist: *mut f32,
+) -> (f32, f32, f32) { unsafe {
     use core::arch::aarch64::*;
-    let (k, kmain4) = (c.k, c.k & !3usize);
-    let zero = vdupq_n_f32(0.0);
+    let (k, kmain) = (c.k, c.k & !15usize);
+    let (g, post) = factor_scratch(k);
+    let keep = POST && !hist.is_null();
+    if keep { masses(k, acol, bp, c.inv_k, None, post); }
+    factor_neon(c, p, r, g, if keep { post } else { std::ptr::null() }, if keep { hist } else { std::ptr::null_mut() });
     let e0 = vdupq_n_f32(e0l); let e1 = vdupq_n_f32(e1l);
     let invkv = vdupq_n_f32(c.inv_k);
     let base = v * c.w64;
-    let (mut bsumv, mut p1v, mut p0v) = (zero, zero, zero);
+    let z = [vdupq_n_f32(0.0); 4];
+    let (mut bs, mut p1, mut p0) = (z, z, z);
     let mut j = 0;
-    while j < kmain4 {
-        let m = lane_mask4(c.cbp, base, j);
-        let mut bv = vmulq_f32(vbslq_f32(m, e1, e0), invkv);
-        if !g.is_null() { bv = vmulq_f32(bv, vld1q_f32(g.add(j))); }
-        vst1q_f32(bp.add(j), bv);
-        bsumv = vaddq_f32(bsumv, bv);
-        if POST {
-            let postv = vmulq_f32(vld1q_f32(acol.add(j)), invkv);
-            p1v = vaddq_f32(p1v, vbslq_f32(m, postv, zero));
-            p0v = vaddq_f32(p0v, vbslq_f32(m, zero, postv));
+    while j < kmain {
+        for q in 0..4 {
+            let jj = j + 4 * q;
+            let m = neon::mask4(c.cbp, base, jj);
+            let bv = vmulq_f32(vmulq_f32(vbslq_f32(m, e1, e0), invkv), vld1q_f32(g.add(jj)));
+            vst1q_f32(bp.add(jj), bv);
+            bs[q] = vaddq_f32(bs[q], bv);
+            if POST {
+                let postv = vmulq_f32(vld1q_f32(acol.add(jj)), invkv);
+                p1[q] = vbslq_f32(m, vaddq_f32(p1[q], postv), p1[q]);
+                p0[q] = vbslq_f32(m, p0[q], vaddq_f32(p0[q], postv));
+            }
         }
-        j += 4;
+        j += 16;
     }
-    let mut beta_sum = vaddvq_f32(bsumv);
-    let mut prob_hid_1 = if POST { vaddvq_f32(p1v) } else { 0.0 };
-    let mut prob_hid_0 = if POST { vaddvq_f32(p0v) } else { 0.0 };
+    let mut beta_sum = neon::reduce16(bs);
+    let mut prob_hid_1 = if POST { neon::reduce16(p1) } else { 0.0 };
+    let mut prob_hid_0 = if POST { neon::reduce16(p0) } else { 0.0 };
     while j < k {
         let a = allele(c, v, j);
-        let mut bb = c.inv_k * if a { e1l } else { e0l };
-        if !g.is_null() { bb *= *g.add(j); }
+        let bb = c.inv_k * if a { e1l } else { e0l } * *g.add(j);
         *bp.add(j) = bb; beta_sum += bb;
         if POST {
             let x = *acol.add(j) * c.inv_k;
@@ -787,39 +749,44 @@ unsafe fn init_neon<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v
     (beta_sum, prob_hid_0, prob_hid_1)
 }}
 
-/// The NEON backward step (the loop body of `run_fb_neon`), times the anchor
-/// factors `g` when not null.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn step_neon<const POST: bool>(
-    c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0s: f32, e1s: f32, fact1: f32, fact2: f32, g: *const f32,
+pub(super) unsafe fn step_neon<const POST: bool>(
+    c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0s: f32, e1s: f32, fact1: f32, fact2: f32,
+    p: &Plan, r: std::ops::Range<usize>, hist: *mut f32,
 ) -> (f32, f32, f32) { unsafe {
     use core::arch::aarch64::*;
-    let (k, kmain4) = (c.k, c.k & !3usize);
-    let zero = vdupq_n_f32(0.0);
+    let (k, kmain) = (c.k, c.k & !15usize);
+    let (g, post) = factor_scratch(k);
+    let keep = POST && !hist.is_null();
+    if keep { masses(k, acol, bp, fact1, Some(fact2), post); }
+    factor_neon(c, p, r, g, if keep { post } else { std::ptr::null() }, if keep { hist } else { std::ptr::null_mut() });
     let e0 = vdupq_n_f32(e0s); let e1 = vdupq_n_f32(e1s);
     let f1v = vdupq_n_f32(fact1); let f2v = vdupq_n_f32(fact2);
     let base = v * c.w64;
-    let (mut bsumv, mut p1v, mut p0v) = (zero, zero, zero);
+    let z = [vdupq_n_f32(0.0); 4];
+    let (mut bs, mut p1, mut p0) = (z, z, z);
     let mut j = 0;
-    while j < kmain4 {
-        let bun = vfmaq_f32(f1v, vld1q_f32(bp.add(j)), f2v);
-        let m = lane_mask4(c.cbp, base, j);
-        if POST {
-            let postv = vmulq_f32(vld1q_f32(acol.add(j)), bun);
-            p1v = vaddq_f32(p1v, vbslq_f32(m, postv, zero));
-            p0v = vaddq_f32(p0v, vbslq_f32(m, zero, postv));
+    while j < kmain {
+        for q in 0..4 {
+            let jj = j + 4 * q;
+            let bun = vfmaq_f32(f1v, vld1q_f32(bp.add(jj)), f2v);
+            let m = neon::mask4(c.cbp, base, jj);
+            if POST {
+                let postv = vmulq_f32(vld1q_f32(acol.add(jj)), bun);
+                p1[q] = vbslq_f32(m, vaddq_f32(p1[q], postv), p1[q]);
+                p0[q] = vbslq_f32(m, p0[q], vaddq_f32(p0[q], postv));
+            }
+            let nb = vmulq_f32(vmulq_f32(bun, vbslq_f32(m, e1, e0)), vld1q_f32(g.add(jj)));
+            vst1q_f32(bp.add(jj), nb);
+            bs[q] = vaddq_f32(bs[q], nb);
         }
-        let mut nb = vmulq_f32(bun, vbslq_f32(m, e1, e0));
-        if !g.is_null() { nb = vmulq_f32(nb, vld1q_f32(g.add(j))); }
-        vst1q_f32(bp.add(j), nb);
-        bsumv = vaddq_f32(bsumv, nb);
-        j += 4;
+        j += 16;
     }
-    let mut new_beta_sum = vaddvq_f32(bsumv);
-    let mut prob_hid_1 = if POST { vaddvq_f32(p1v) } else { 0.0 };
-    let mut prob_hid_0 = if POST { vaddvq_f32(p0v) } else { 0.0 };
+    let mut new_beta_sum = neon::reduce16(bs);
+    let mut prob_hid_1 = if POST { neon::reduce16(p1) } else { 0.0 };
+    let mut prob_hid_0 = if POST { neon::reduce16(p0) } else { 0.0 };
     while j < k {
         let a = allele(c, v, j);
         let bun = *bp.add(j) * fact2 + fact1;
@@ -827,8 +794,7 @@ unsafe fn step_neon<const POST: bool>(
             let x = *acol.add(j) * bun;
             if a { prob_hid_1 += x; } else { prob_hid_0 += x; }
         }
-        let mut nb = bun * if a { e1s } else { e0s };
-        if !g.is_null() { nb *= *g.add(j); }
+        let nb = bun * if a { e1s } else { e0s } * *g.add(j);
         *bp.add(j) = nb; new_beta_sum += nb;
         j += 1;
     }
@@ -881,7 +847,7 @@ pub(super) unsafe fn run(
     }
     #[cfg(target_arch = "aarch64")]
     if use_neon_lcwgs() {
-        return on::<Neon>(split, hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack, plan, hist);
+        return on::<neon::Neon>(split, hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack, plan, hist);
     }
     on::<two_pass::Scalar>(split, hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack, plan, hist)
 }}
@@ -1062,8 +1028,8 @@ mod tests {
             }
             #[cfg(target_arch = "aarch64")]
             if use_neon_lcwgs() {
-                go("neon", &|h| run_seq::<Neon>(hl, cond, bm, cm, params, None, poly, None, plan, h));
-                go("neon-2", &|h| two_pass::run::<Neon>(hl, cond, bm, cm, params, None, poly, None, Some(plan), h));
+                go("neon", &|h| run_seq::<neon::Neon>(hl, cond, bm, cm, params, None, poly, None, plan, h));
+                go("neon-2", &|h| two_pass::run::<neon::Neon>(hl, cond, bm, cm, params, None, poly, None, Some(plan), h));
             }
         }
         out

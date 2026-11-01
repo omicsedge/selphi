@@ -6,9 +6,13 @@
 //! the same tree as `_mm512_reduce_add_ps` ([`reduce16`]), and the same scalar
 //! tail for `k % 16` states. Its dosages are therefore bit-identical to the x86
 //! AVX-512 path (the default on AVX-512 hosts), and the four accumulators per
-//! sum run as independent dependency chains.
+//! sum run as independent dependency chains. [`Neon`] gives the same columns to
+//! the two-pass and anchored drivers.
 use super::*;
+use super::two_pass::{Ctx, Kernels};
+use crate::lcwgs::linkage::plan::Plan;
 use core::arch::aarch64::*;
+use std::ops::Range;
 
 /// Lane masks of four allele bits (all-ones where ALT), by nibble.
 static MASK4: [[u32; 4]; 16] = {
@@ -27,7 +31,7 @@ static MASK4: [[u32; 4]; 16] = {
 
 /// The lane mask of states `j..j + 4` (`j` a multiple of 4) of packed row `base`.
 #[inline(always)]
-unsafe fn mask4(cbp: *const u64, base: usize, j: usize) -> uint32x4_t { unsafe {
+pub(super) unsafe fn mask4(cbp: *const u64, base: usize, j: usize) -> uint32x4_t { unsafe {
     let nib = ((*cbp.add(base + j / 64) >> (j % 64)) & 0xF) as usize;
     vld1q_u32(MASK4[nib].as_ptr())
 }}
@@ -39,6 +43,31 @@ pub(super) unsafe fn reduce16(a: [float32x4_t; 4]) -> f32 { unsafe {
     let s4 = vaddq_f32(vaddq_f32(a[0], a[2]), vaddq_f32(a[1], a[3]));
     let s2 = vadd_f32(vget_low_f32(s4), vget_high_f32(s4));
     vget_lane_f32::<0>(s2) + vget_lane_f32::<1>(s2)
+}}
+
+/// The forward base case at site 0 into `out`; returns its sum.
+#[target_feature(enable = "neon")]
+unsafe fn fwd_first(cbp: *const u64, e0s: f32, e1s: f32, inv_k: f32, k: usize, out: *mut f32) -> f32 { unsafe {
+    let (e0, e1, invkv) = (vdupq_n_f32(e0s), vdupq_n_f32(e1s), vdupq_n_f32(inv_k));
+    let kmain = k & !15usize;
+    let mut sumv = [vdupq_n_f32(0.0); 4];
+    let mut j = 0;
+    while j < kmain {
+        for (q, s) in sumv.iter_mut().enumerate() {
+            let jj = j + 4 * q;
+            let p = vmulq_f32(vbslq_f32(mask4(cbp, 0, jj), e1, e0), invkv);
+            vst1q_f32(out.add(jj), p);
+            *s = vaddq_f32(*s, p);
+        }
+        j += 16;
+    }
+    let mut s0 = reduce16(sumv);
+    while j < k {
+        let a = (*cbp.add(j / 64) >> (j % 64)) & 1 != 0;
+        let p = inv_k * if a { e1s } else { e0s };
+        *out.add(j) = p; s0 += p; j += 1;
+    }
+    s0
 }}
 
 /// One forward column, as [`super::fwd_col_avx512`].
@@ -79,9 +108,10 @@ unsafe fn fwd_col(
 struct BwdSums { beta: f32, hid1: f32, hid0: f32 }
 
 /// The backward initialisation at the last site: beta = emission / K, posterior
-/// = alpha / K, as the `!init_done` branch of [`super::run_fb_avx512`].
+/// = alpha / K, as the `!init_done` branch of [`super::run_fb_avx512`]
+/// (`POST = false`: beta only).
 #[target_feature(enable = "neon")]
-unsafe fn bwd_init(acol: *const f32, bp: *mut f32, base: usize, e0s: f32, e1s: f32,
+unsafe fn bwd_init<const POST: bool>(acol: *const f32, bp: *mut f32, base: usize, e0s: f32, e1s: f32,
                    cbp: *const u64, inv_k: f32, k: usize, kmain: usize) -> BwdSums { unsafe {
     let (e0, e1, invkv) = (vdupq_n_f32(e0s), vdupq_n_f32(e1s), vdupq_n_f32(inv_k));
     let z = [vdupq_n_f32(0.0); 4];
@@ -94,9 +124,11 @@ unsafe fn bwd_init(acol: *const f32, bp: *mut f32, base: usize, e0s: f32, e1s: f
             let bv = vmulq_f32(vbslq_f32(m, e1, e0), invkv);
             vst1q_f32(bp.add(jj), bv);
             bs[q] = vaddq_f32(bs[q], bv);
-            let postv = vmulq_f32(vld1q_f32(acol.add(jj)), invkv);
-            p1[q] = vbslq_f32(m, vaddq_f32(p1[q], postv), p1[q]);
-            p0[q] = vbslq_f32(m, p0[q], vaddq_f32(p0[q], postv));
+            if POST {
+                let postv = vmulq_f32(vld1q_f32(acol.add(jj)), invkv);
+                p1[q] = vbslq_f32(m, vaddq_f32(p1[q], postv), p1[q]);
+                p0[q] = vbslq_f32(m, p0[q], vaddq_f32(p0[q], postv));
+            }
         }
         j += 16;
     }
@@ -105,17 +137,20 @@ unsafe fn bwd_init(acol: *const f32, bp: *mut f32, base: usize, e0s: f32, e1s: f
         let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
         let e = if a { e1s } else { e0s };
         let bb = inv_k * e; *bp.add(j) = bb; out.beta += bb;
-        let post = *acol.add(j) * inv_k;
-        if a { out.hid1 += post; } else { out.hid0 += post; }
+        if POST {
+            let post = *acol.add(j) * inv_k;
+            if a { out.hid1 += post; } else { out.hid0 += post; }
+        }
         j += 1;
     }
     out
 }}
 
-/// One backward step, as the `init_done` branch of [`super::run_fb_avx512`].
+/// One backward step, as the `init_done` branch of [`super::run_fb_avx512`]
+/// (`POST = false`: beta only).
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "neon")]
-unsafe fn bwd_step(acol: *const f32, bp: *mut f32, base: usize, e0s: f32, e1s: f32, fact1: f32, fact2: f32,
+unsafe fn bwd_step<const POST: bool>(acol: *const f32, bp: *mut f32, base: usize, e0s: f32, e1s: f32, fact1: f32, fact2: f32,
                    cbp: *const u64, k: usize, kmain: usize) -> BwdSums { unsafe {
     let (e0, e1) = (vdupq_n_f32(e0s), vdupq_n_f32(e1s));
     let (f1v, f2v) = (vdupq_n_f32(fact1), vdupq_n_f32(fact2));
@@ -126,10 +161,12 @@ unsafe fn bwd_step(acol: *const f32, bp: *mut f32, base: usize, e0s: f32, e1s: f
         for q in 0..4 {
             let jj = j + 4 * q;
             let bun = vfmaq_f32(f1v, vld1q_f32(bp.add(jj)), f2v); // beta*fact2 + fact1
-            let postv = vmulq_f32(vld1q_f32(acol.add(jj)), bun);
             let m = mask4(cbp, base, jj);
-            p1[q] = vbslq_f32(m, vaddq_f32(p1[q], postv), p1[q]);
-            p0[q] = vbslq_f32(m, p0[q], vaddq_f32(p0[q], postv));
+            if POST {
+                let postv = vmulq_f32(vld1q_f32(acol.add(jj)), bun);
+                p1[q] = vbslq_f32(m, vaddq_f32(p1[q], postv), p1[q]);
+                p0[q] = vbslq_f32(m, p0[q], vaddq_f32(p0[q], postv));
+            }
             let nb = vmulq_f32(bun, vbslq_f32(m, e1, e0));
             vst1q_f32(bp.add(jj), nb);
             bs[q] = vaddq_f32(bs[q], nb);
@@ -141,13 +178,49 @@ unsafe fn bwd_step(acol: *const f32, bp: *mut f32, base: usize, e0s: f32, e1s: f
         let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
         let e = if a { e1s } else { e0s };
         let bun = *bp.add(j) * fact2 + fact1;
-        let post = *acol.add(j) * bun;
-        if a { out.hid1 += post; } else { out.hid0 += post; }
+        if POST {
+            let post = *acol.add(j) * bun;
+            if a { out.hid1 += post; } else { out.hid0 += post; }
+        }
         let nb = bun * e; *bp.add(j) = nb; out.beta += nb;
         j += 1;
     }
     out
 }}
+
+/// The NEON path's kernels for the two-pass and anchored drivers: the columns
+/// above, and the anchored columns of [`super::anchored`].
+pub(super) struct Neon;
+
+impl Kernels for Neon {
+    const PACKED: bool = true;
+    unsafe fn first(c: &Ctx, e0: f32, e1: f32, out: *mut f32) -> f32 {
+        unsafe { fwd_first(c.cbp, e0, e1, c.inv_k, c.k, out) }
+    }
+    unsafe fn column(c: &Ctx, prev: *const f32, curr: *mut f32, v: usize, e0: f32, e1: f32, pr: f32, asum_prev: f32) -> f32 {
+        unsafe { fwd_col(prev, curr, v, e0, e1, pr, asum_prev, c.cbp, c.inv_k, c.k, c.k & !15usize, c.w64) }
+    }
+    unsafe fn init<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0: f32, e1: f32) -> (f32, f32, f32) {
+        let s = unsafe { bwd_init::<POST>(acol, bp, v * c.w64, e0, e1, c.cbp, c.inv_k, c.k, c.k & !15usize) };
+        (s.beta, s.hid0, s.hid1)
+    }
+    unsafe fn step<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0: f32, e1: f32, fact1: f32, fact2: f32) -> (f32, f32, f32) {
+        let s = unsafe { bwd_step::<POST>(acol, bp, v * c.w64, e0, e1, fact1, fact2, c.cbp, c.k, c.k & !15usize) };
+        (s.beta, s.hid0, s.hid1)
+    }
+    unsafe fn column_anchor(c: &Ctx, prev: *const f32, curr: *mut f32, v: usize, e0: f32, e1: f32, pr: f32, asum_prev: f32,
+        p: &Plan, r: Range<usize>) -> f32 {
+        unsafe { super::anchored::column_neon(c, prev, curr, v, e0, e1, pr, asum_prev, p, r) }
+    }
+    unsafe fn init_anchor<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0: f32, e1: f32,
+        p: &Plan, r: Range<usize>, hist: *mut f32) -> (f32, f32, f32) {
+        unsafe { super::anchored::init_neon::<POST>(c, acol, bp, v, e0, e1, p, r, hist) }
+    }
+    unsafe fn step_anchor<const POST: bool>(c: &Ctx, acol: *const f32, bp: *mut f32, v: usize, e0: f32, e1: f32, fact1: f32, fact2: f32,
+        p: &Plan, r: Range<usize>, hist: *mut f32) -> (f32, f32, f32) {
+        unsafe { super::anchored::step_neon::<POST>(c, acol, bp, v, e0, e1, fact1, fact2, p, r, hist) }
+    }
+}
 
 /// The NEON [`run_forward_backward`] kernel: [`super::run_fb_avx512`]'s
 /// checkpointed forward and block-recompute backward, column for column.
@@ -213,28 +286,8 @@ pub(super) unsafe fn run_fb(
         let e0l = emit[2 * last]; let e1l = emit[2 * last + 1];
 
         // Base case v = 0 into fcol[0..k].
-        {
-            let (e0, e1, invkv) = (vdupq_n_f32(emit[0]), vdupq_n_f32(emit[1]), vdupq_n_f32(inv_k));
-            let mut sumv = [vdupq_n_f32(0.0); 4];
-            let mut j = 0;
-            while j < kmain {
-                for (q, s) in sumv.iter_mut().enumerate() {
-                    let jj = j + 4 * q;
-                    let p = vmulq_f32(vbslq_f32(mask4(cbp, 0, jj), e1, e0), invkv);
-                    vst1q_f32(fcolp.add(jj), p);
-                    *s = vaddq_f32(*s, p);
-                }
-                j += 16;
-            }
-            let mut s0 = reduce16(sumv);
-            while j < k {
-                let a = (*cbp.add(j / 64) >> (j % 64)) & 1 != 0;
-                let p = inv_k * if a { emit[1] } else { emit[0] };
-                *fcolp.add(j) = p; s0 += p; j += 1;
-            }
-            alpha_sum[0] = s0;
-            std::ptr::copy_nonoverlapping(fcolp, chkp, k);
-        }
+        alpha_sum[0] = fwd_first(cbp, emit[0], emit[1], inv_k, k, fcolp);
+        std::ptr::copy_nonoverlapping(fcolp, chkp, k);
         let (mut prev, mut curr) = (fcolp, fcolp.add(k));
         for v in 1..n_var {
             let s = fwd_col(prev, curr, v, emit[2 * v], emit[2 * v + 1],
@@ -260,7 +313,7 @@ pub(super) unsafe fn run_fb(
             for v in (lo..hi).rev() {
                 let acol = blkp.add((v - lo) * k);
                 if !init_done {
-                    let s = bwd_init(acol, bp, last * w64, e0l, e1l, cbp, inv_k, k, kmain);
+                    let s = bwd_init::<true>(acol, bp, last * w64, e0l, e1l, cbp, inv_k, k, kmain);
                     beta_sum = s.beta;
                     dosage[last] = finalize_site(loo, s.hid0, s.hid1, e0l, e1l, hl[2 * last], hl[2 * last + 1], ee, ed);
                     init_done = true;
@@ -269,7 +322,7 @@ pub(super) unsafe fn run_fb(
                     let fact1 = pr * inv_k;
                     let fact2 = (1.0 - pr) / beta_sum.max(f32::MIN_POSITIVE);
                     let (e0s, e1s) = (emit[2 * v], emit[2 * v + 1]);
-                    let s = bwd_step(acol, bp, v * w64, e0s, e1s, fact1, fact2, cbp, k, kmain);
+                    let s = bwd_step::<true>(acol, bp, v * w64, e0s, e1s, fact1, fact2, cbp, k, kmain);
                     beta_sum = s.beta;
                     dosage[v] = finalize_site(loo, s.hid0, s.hid1, e0s, e1s, hl[2 * v], hl[2 * v + 1], ee, ed);
                 }

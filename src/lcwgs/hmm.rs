@@ -699,7 +699,6 @@ pub(crate) fn run_forward_backward_with(
     }
 
     // Two cooperating passes, each path with its own sequential arithmetic.
-    // NEON keeps its sequential kernel.
     if split {
         let none = std::ptr::null_mut();
         #[cfg(target_arch = "x86_64")]
@@ -712,12 +711,10 @@ pub(crate) fn run_forward_backward_with(
             }
         }
         #[cfg(target_arch = "aarch64")]
-        let scalar = !use_neon_lcwgs();
-        #[cfg(not(target_arch = "aarch64"))]
-        let scalar = true;
-        if scalar {
-            return unsafe { two_pass::run::<two_pass::Scalar>(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack, None, none) };
+        if use_neon_lcwgs() {
+            return unsafe { two_pass::run::<neon::Neon>(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack, None, none) };
         }
+        return unsafe { two_pass::run::<two_pass::Scalar>(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack, None, none) };
     }
 
     // AVX-512 fast path (bit-packed conditioning, vectorized fwd/bwd). Falls
@@ -1523,69 +1520,6 @@ unsafe fn run_fb_avx2(
     if prepack.is_none() { TL_CONDBITS.with(|c| *c.borrow_mut() = owned_pack); }
 
     HmmOutput { dosage }
-}}
-
-// ===========================================================================
-// NEON (aarch64) FB path — 4-wide analogue of `run_fb_avx2`.
-//
-// VALIDATION STATUS: compile-validated on aarch64 (intrinsics type-check via
-// `cargo check --target aarch64-unknown-linux-gnu`), but NOT runtime-validated
-// on ARM hardware. Like the AVX2/AVX-512 paths it is NOT bit-identical to scalar
-// (different f32 reduction width/order); R²-equivalence is expected but not
-// established on ARM. Runtime validation compares SELPHI_FORCE_SCALAR vs NEON
-// on mid+r12 inputs. SELPHI_FORCE_SCALAR=1 selects the scalar fallback.
-// ===========================================================================
-
-/// `uint32x4_t` lane mask of 4 condbits (state offset `j`, within one 64-bit
-/// word — `j` is a multiple of 4 and 4|64) — all-ones lane where the allele is
-/// ALT. The NEON analogue of the AVX2 `lane_mask8`, for `vbslq_f32`.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn lane_mask4(cbp: *const u64, base: usize, j: usize) -> core::arch::aarch64::uint32x4_t { unsafe {
-    use core::arch::aarch64::*;
-    let bits = ((*cbp.add(base + j / 64) >> (j % 64)) & 0xF) as u32;
-    let v = vdupq_n_u32(bits);
-    let sel_arr: [u32; 4] = [1, 2, 4, 8];
-    let sel = vld1q_u32(sel_arr.as_ptr());
-    vceqq_u32(vandq_u32(v, sel), sel) // all-ones lane where bit set
-}}
-
-/// NEON forward column (4-wide analogue of [`fwd_col_avx2`]): `curr ← forward(prev)`
-/// at variant `v`. `kmain4 = k & !3`. Numerically equivalent to scalar (to f32
-/// reduction order). Shared by the NEON FB body's forward + block-recompute.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn fwd_col_neon(
-    prev: *const f32, curr: *mut f32, v: usize,
-    e0s: f32, e1s: f32, pr: f32, asum_prev: f32,
-    cbp: *const u64, inv_k: f32, k: usize, kmain4: usize, w64: usize,
-) -> f32 { unsafe {
-    use core::arch::aarch64::*;
-    let fact1 = pr * inv_k;
-    let fact2 = (1.0 - pr) / asum_prev.max(f32::MIN_POSITIVE);
-    let e0 = vdupq_n_f32(e0s); let e1 = vdupq_n_f32(e1s);
-    let f1v = vdupq_n_f32(fact1); let f2v = vdupq_n_f32(fact2);
-    let base = v * w64;
-    let mut sumv = vdupq_n_f32(0.0);
-    let mut j = 0;
-    while j < kmain4 {
-        let pv = vld1q_f32(prev.add(j));
-        let tmp = vfmaq_f32(f1v, pv, f2v); // f1v + pv*f2v
-        let m = lane_mask4(cbp, base, j);
-        let ev = vbslq_f32(m, e1, e0);
-        let p = vmulq_f32(tmp, ev);
-        vst1q_f32(curr.add(j), p);
-        sumv = vaddq_f32(sumv, p);
-        j += 4;
-    }
-    let mut s = vaddvq_f32(sumv);
-    while j < k {
-        let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
-        let e = if a { e1s } else { e0s };
-        let p = (*prev.add(j) * fact2 + fact1) * e;
-        *curr.add(j) = p; s += p; j += 1;
-    }
-    s
 }}
 
 /// GLIMPSE2-style scaffold HMM: run forward-backward ONLY on the common
