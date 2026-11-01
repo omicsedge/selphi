@@ -224,15 +224,15 @@ fn random_plan(rng: &mut reference_pack::Xs, n: usize) -> Plan {
 
 /// The dispatcher (`run_forward_backward_with`) gives the canonical dosages and
 /// posterior masses bit for bit on the AVX-512 (x86) and NEON (aarch64) paths:
-/// one pass and two (taken from 4096 sites and 16 states: the unlinked calls'
-/// block tasks must run), without and with read-pair anchors, Codex's witness
+/// one pass and two (taken from 4096 sites and 16 states: the unlinked calls
+/// must reach `two_pass::run`), without and with read-pair anchors, Codex's witness
 /// among them.
 #[test]
 fn dispatcher_matches_canonical_bits() {
     use reference_pack as rp;
     let _serial = two_pass::TASK_BLOCKS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !dispatch_is_canonical() { eprintln!("the dispatched FB path is not canonical on this host"); return; }
-    let tasks = std::cell::Cell::new(0usize);
+    let runs = std::cell::Cell::new(0usize);
     let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
     let bits = |d: &[f32]| d.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     let check = |hl: &[f32], cond: &[u32], bm: &HaplotypeBitmatrix, cm: &[f64], params: &LcwgsParams,
@@ -241,9 +241,9 @@ fn dispatcher_matches_canonical_bits() {
         for two in [false, true] {
             let mut hist = vec![0.0f32; want_hist.len()];
             let linked = plan.map(|plan| Linked { plan, hist: Some(hist.as_mut_slice()) });
-            let before = two_pass::TASK_BLOCKS.load(Ordering::Relaxed);
+            let before = two_pass::RUNS.load(Ordering::Relaxed);
             let got = pool.install(|| run_forward_backward_with(hl, cond, bm, cm, params, None, ps, None, two, linked));
-            if plan.is_none() { tasks.set(tasks.get() + two_pass::TASK_BLOCKS.load(Ordering::Relaxed) - before); }
+            if plan.is_none() { runs.set(runs.get() + two_pass::RUNS.load(Ordering::Relaxed) - before); }
             assert_eq!(bits(&got.dosage), bits(&want), "{what} two_pass={two} dosages");
             assert_eq!(bits(&hist), bits(&want_hist), "{what} two_pass={two} masses");
         }
@@ -280,7 +280,7 @@ fn dispatcher_matches_canonical_bits() {
             }
         }
     }
-    assert!(tasks.get() > 0, "the unlinked two-pass path was never dispatched");
+    assert!(runs.get() > 0, "the unlinked two-pass path was never dispatched");
 }
 
 /// [`reduce16`] is the order of `_mm512_reduce_add_ps` (values spread over many

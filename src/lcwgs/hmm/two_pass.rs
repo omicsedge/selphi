@@ -517,7 +517,12 @@ struct Shared<'a> {
 }
 
 #[cfg(test)]
-pub(super) static TASK_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+static TASK_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Calls of [`run`] (whether the dispatcher took two passes; block tasks
+/// depend on scheduling, so they cannot show it).
+#[cfg(test)]
+pub(super) static RUNS: AtomicUsize = AtomicUsize::new(0);
 
 /// Held by every test whose forward-backward calls can run block tasks, so
 /// `two_pass_dosages_match_sequential_kernel` counts only its own.
@@ -797,6 +802,8 @@ pub(super) unsafe fn run<A: Kernels>(
     plan: Option<&Plan>,
     hist: *mut f32,
 ) -> HmmOutput { unsafe {
+    #[cfg(test)]
+    RUNS.fetch_add(1, Ordering::Relaxed);
     let n_var = cm.len();
     let k = cond_haps.len();
     let w64 = k.div_ceil(64);
