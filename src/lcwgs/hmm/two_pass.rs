@@ -809,6 +809,7 @@ pub(super) unsafe fn run<A: Kernels>(
     let w64 = k.div_ceil(64);
     let ee = 1.0f32 - params.epsilon;
     let ed = params.epsilon;
+    let (ee_o, ed_o) = params.output_emission();
 
     let mut owned_pack = Vec::new();
     let cbp = if A::PACKED {
@@ -861,7 +862,7 @@ pub(super) unsafe fn run<A: Kernels>(
         // Scratch of at most TASK_SCRATCH concurrent block tasks, from this thread.
         scratch: Mutex::new((0..TASK_SCRATCH).map(|_| (sized(Vec::new(), k), sized(Vec::new(), stride * k))).collect()),
         loo: lcwgs_loo(),
-        ee, ed,
+        ee: ee_o, ed: ed_o,
         plan,
         hist,
     };

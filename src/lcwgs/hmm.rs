@@ -737,6 +737,7 @@ pub(crate) fn run_forward_backward_with(
     let inv_k = 1.0f32 / (k as f32);
     let ee = 1.0f32 - params.epsilon;
     let ed = params.epsilon;
+    let (ee_o, ed_o) = params.output_emission();
     // GLIMPSE2 divides the forward emission back out of the hidden-state
     // posterior before re-applying the read+error model (imputation_hmm.cpp:
     // `prob_hid /= emit`). Without this, the per-site read is double-counted
@@ -889,7 +890,7 @@ pub(crate) fn run_forward_backward_with(
                     }
                     dosage[last] = finalize_site(
                         loo, prob_hid_0, prob_hid_1, e0, e1,
-                        hl[2 * last], hl[2 * last + 1], ee, ed,
+                        hl[2 * last], hl[2 * last + 1], ee_o, ed_o,
                     );
                     init_done = true;
                 } else {
@@ -915,7 +916,7 @@ pub(crate) fn run_forward_backward_with(
                     beta_sum = new_beta_sum;
                     dosage[v] = finalize_site(
                         loo, prob_hid_0, prob_hid_1, e0_v, e1_v,
-                        hl[2 * v], hl[2 * v + 1], ee, ed,
+                        hl[2 * v], hl[2 * v + 1], ee_o, ed_o,
                     );
                 }
             }
@@ -1104,6 +1105,7 @@ unsafe fn run_fb_avx512(
     let inv_k = 1.0f32 / (k as f32);
     let ee = 1.0f32 - params.epsilon;
     let ed = params.epsilon;
+    let (ee_o, ed_o) = params.output_emission();
     let loo = lcwgs_loo();
     let w64 = k.div_ceil(64);
     let kmain = k & !15usize; // largest multiple of 16 ≤ k
@@ -1252,7 +1254,7 @@ unsafe fn run_fb_avx512(
                     }
                     dosage[last] = finalize_site(
                         loo, prob_hid_0, prob_hid_1, e0l, e1l,
-                        hl[2 * last], hl[2 * last + 1], ee, ed,
+                        hl[2 * last], hl[2 * last + 1], ee_o, ed_o,
                     );
                     init_done = true;
                 } else {
@@ -1295,7 +1297,7 @@ unsafe fn run_fb_avx512(
                     beta_sum = new_beta_sum;
                     dosage[v] = finalize_site(
                         loo, prob_hid_0, prob_hid_1, e0s, e1s,
-                        hl[2 * v], hl[2 * v + 1], ee, ed,
+                        hl[2 * v], hl[2 * v + 1], ee_o, ed_o,
                     );
                 }
             }
@@ -1334,6 +1336,7 @@ unsafe fn run_fb_avx2(
     let inv_k = 1.0f32 / (k as f32);
     let ee = 1.0f32 - params.epsilon;
     let ed = params.epsilon;
+    let (ee_o, ed_o) = params.output_emission();
     let loo = lcwgs_loo();
     let w64 = k.div_ceil(64);
     let kmain8 = k & !7usize; // largest multiple of 8 ≤ k
@@ -1467,7 +1470,7 @@ unsafe fn run_fb_avx2(
                     }
                     dosage[last] = finalize_site(
                         loo, prob_hid_0, prob_hid_1, e0l, e1l,
-                        hl[2 * last], hl[2 * last + 1], ee, ed,
+                        hl[2 * last], hl[2 * last + 1], ee_o, ed_o,
                     );
                     init_done = true;
                 } else {
@@ -1510,7 +1513,7 @@ unsafe fn run_fb_avx2(
                     beta_sum = new_beta_sum;
                     dosage[v] = finalize_site(
                         loo, prob_hid_0, prob_hid_1, e0s, e1s,
-                        hl[2 * v], hl[2 * v + 1], ee, ed,
+                        hl[2 * v], hl[2 * v + 1], ee_o, ed_o,
                     );
                 }
             }
@@ -1555,6 +1558,7 @@ pub fn run_forward_backward_scaffold(
     let inv_k = 1.0f32 / (k as f32);
     let ee = 1.0f32 - params.epsilon;
     let ed = params.epsilon;
+    let (ee_o, ed_o) = params.output_emission();
     let scale = 0.04f64 * (params.ne as f64) / (k as f64);
     // Leave-one-out emission at the imputed site (GLIMPSE2 `prob_hid /= emit`).
     // In the scaffold path only EXACT scaffold sites double-count the read (the
@@ -1709,8 +1713,8 @@ pub fn run_forward_backward_scaffold(
         }
         let h0 = hl[2 * v];
         let h1 = hl[2 * v + 1];
-        let po0 = (prob_hid_0 * ee + prob_hid_1 * ed) * h0;
-        let po1 = (prob_hid_0 * ed + prob_hid_1 * ee) * h1;
+        let po0 = (prob_hid_0 * ee_o + prob_hid_1 * ed_o) * h0;
+        let po1 = (prob_hid_0 * ed_o + prob_hid_1 * ee_o) * h1;
         let s = po0 + po1;
         dosage[v] = if s > f32::MIN_POSITIVE { po1 / s } else { 0.5 };
     }

@@ -241,6 +241,7 @@ pub(super) unsafe fn run_fb(
     let inv_k = 1.0f32 / (k as f32);
     let ee = 1.0f32 - params.epsilon;
     let ed = params.epsilon;
+    let (ee_o, ed_o) = params.output_emission();
     let loo = lcwgs_loo();
     let w64 = k.div_ceil(64);
     let kmain = k & !15usize;
@@ -315,7 +316,7 @@ pub(super) unsafe fn run_fb(
                 if !init_done {
                     let s = bwd_init::<true>(acol, bp, last * w64, e0l, e1l, cbp, inv_k, k, kmain);
                     beta_sum = s.beta;
-                    dosage[last] = finalize_site(loo, s.hid0, s.hid1, e0l, e1l, hl[2 * last], hl[2 * last + 1], ee, ed);
+                    dosage[last] = finalize_site(loo, s.hid0, s.hid1, e0l, e1l, hl[2 * last], hl[2 * last + 1], ee_o, ed_o);
                     init_done = true;
                 } else {
                     let pr = p_rec[v + 1];
@@ -324,7 +325,7 @@ pub(super) unsafe fn run_fb(
                     let (e0s, e1s) = (emit[2 * v], emit[2 * v + 1]);
                     let s = bwd_step::<true>(acol, bp, v * w64, e0s, e1s, fact1, fact2, cbp, k, kmain);
                     beta_sum = s.beta;
-                    dosage[v] = finalize_site(loo, s.hid0, s.hid1, e0s, e1s, hl[2 * v], hl[2 * v + 1], ee, ed);
+                    dosage[v] = finalize_site(loo, s.hid0, s.hid1, e0s, e1s, hl[2 * v], hl[2 * v + 1], ee_o, ed_o);
                 }
             }
         }

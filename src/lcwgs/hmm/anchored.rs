@@ -864,6 +864,7 @@ pub(super) unsafe fn run_seq<A: Kernels>(
     let k = cond_haps.len();
     let w64 = k.div_ceil(64);
     let (ee, ed) = (1.0f32 - params.epsilon, params.epsilon);
+    let (ee_o, ed_o) = params.output_emission();
     let loo = lcwgs_loo();
     let mut owned_pack = Vec::new();
     let cbp = if A::PACKED {
@@ -941,7 +942,7 @@ pub(super) unsafe fn run_seq<A: Kernels>(
                 else { A::step_anchor::<true>(&c, acol, bp, v, e0, e1, fact1, fact2, plan, r, hist) }
             };
             beta_sum = bs;
-            dosage[v] = finalize_site(loo, p0, p1, e0, e1, hl[2 * v], hl[2 * v + 1], ee, ed);
+            dosage[v] = finalize_site(loo, p0, p1, e0, e1, hl[2 * v], hl[2 * v + 1], ee_o, ed_o);
         }
     }
     if let Some(t) = t_fb { PROF_FB_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }

@@ -114,10 +114,11 @@ pub struct LcwgsParams {
     /// over-trust). `0` disables. `LCWGS_MIN_GL` sets it; `LCWGS_ADAPT_MIN_GL`
     /// coverage-scales it (see `pipeline::impute_from_gl3`).
     pub min_gl: f32,
-    /// Emission of an allele no conditioning haplotype carries, at a site the conditioning set
-    /// leaves monomorphic (`LCWGS_NOVEL_EMISSION`; 0 = `epsilon`, as before). With `epsilon`
-    /// (1e-12) against the `min_gl` floor (1e-10) such an allele got at most 1% of a haplotype,
-    /// however sharp its likelihood: a confident rare heterozygote came out hom-ref.
+    /// Emission of an allele the copied haplotypes do not carry, in the posterior dose of a site
+    /// only ([`Self::output_emission`]; with the leave-one-out division that is the posterior of
+    /// this emission at that one site): `LCWGS_NOVEL_EMISSION`, 0 = `epsilon`, as before. With
+    /// `epsilon` (1e-12) against the `min_gl` floor (1e-10) such an allele got at most 1% of a
+    /// haplotype however sharp its likelihood, so a confident rare heterozygote came out hom-ref.
     pub novel_emission: f32,
     /// RNG seed for Gibbs initialization (GLIMPSE2 default 15052011). A single
     /// deterministic chain uses this value; with several chains (`LCWGS_GIBBS_RESTARTS`,
@@ -175,6 +176,13 @@ impl LcwgsParams {
     /// Override with `LCWGS_CHUNK_BUFFER_CM`.
     pub fn chunk_buffer_cm(&self) -> f64 {
         crate::config::f64_or("LCWGS_CHUNK_BUFFER_CM", 0.5)
+    }
+
+    /// `(ee, ed)` the posterior dose of a site is folded with (`hmm::finalize_site`, the mono split):
+    /// the forward-backward keeps `epsilon`, the dose takes `novel_emission` when larger.
+    pub fn output_emission(&self) -> (f32, f32) {
+        let ed = self.epsilon.max(self.novel_emission);
+        (1.0 - ed, ed)
     }
 }
 
