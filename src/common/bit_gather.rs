@@ -2,7 +2,8 @@
 //! where it is fast) per run of the set that shares a 64-bit word of the row, instead of one
 //! shift and mask per haplotype, and for runs of sparse groups byte-permute blocks
 //! ([`GatherPlan`]). Used to pack conditioning states for the HMMs (lcWGS imputation and
-//! phasing: [`GatherPlan`] + [`gather_row`]; diploid phasing: word plans + [`gather_words`]).
+//! phasing: [`GatherPlan`] + [`gather_row`]; diploid phasing: [`GatherPlan::build_words`] +
+//! [`gather_words`]).
 
 /// One step of a gather plan (see [`build_gather_plan`]): `cnt` (1..=64)
 /// consecutive conditioning states whose panel haplotypes all sit in panel-row
@@ -161,6 +162,13 @@ impl GatherPlan {
 
     /// The plan of `ids` for rows of an `n_ref`-haplotype panel.
     pub(crate) fn build(&mut self, ids: &[u32], n_ref: usize) { self.build_for(ids, n_ref, byte_blocks()); }
+
+    /// The plan of `ids` for [`gather_words`]: the groups only, plus the
+    /// [`BitStep`]s on a host without a fast `PEXT`.
+    pub(crate) fn build_words(&mut self, ids: &[u32]) {
+        let kind = if byte_blocks() == Blocks::Bits { Blocks::Bits } else { Blocks::Off };
+        self.build_for(ids, 0, kind);
+    }
 
     fn build_for(&mut self, ids: &[u32], n_ref: usize, kind: Blocks) {
         build_gather_plan(ids, &mut self.words);
@@ -495,19 +503,23 @@ pub(crate) unsafe fn gather_row(rp: *const u64, plan: &GatherPlan, out: *mut u64
     gather_row_portable(rp, plan, out, widx, acc, pos)
 }}
 
-/// Append the bits of a word plan ([`build_gather_plan`]) of panel row `rp` to
-/// the packed row at `out` (see [`gather_row_with`]), with BMI2 `PEXT` when
-/// [`use_pext`] allows, else the portable extract — the same bits either way.
+/// Append the bits of a word plan ([`GatherPlan::build_words`]) of panel row
+/// `rp` to the packed row at `out` (see [`gather_row_with`]), with BMI2 `PEXT`
+/// when [`use_pext`] allows, else its [`BitStep`]s or the portable extract —
+/// the same bits either way.
 ///
 /// # Safety
 /// As [`gather_row`].
 #[inline]
-pub(crate) unsafe fn gather_words(rp: *const u64, plan: &[GatherWord], out: *mut u64, widx: usize, acc: u64, pos: u32) -> usize { unsafe {
+pub(crate) unsafe fn gather_words(rp: *const u64, plan: &GatherPlan, out: *mut u64, widx: usize, acc: u64, pos: u32) -> usize { unsafe {
     #[cfg(target_arch = "x86_64")]
     if use_pext() {
-        return gather_row_bmi2(rp, plan, out, widx, acc, pos);
+        return gather_row_bmi2(rp, &plan.words, out, widx, acc, pos);
     }
-    gather_row_with(rp, plan, out, widx, acc, pos, pext_sw)
+    if !plan.bit_steps.is_empty() {
+        return gather_bits(rp, plan, out, widx, acc, pos);
+    }
+    gather_row_with(rp, &plan.words, out, widx, acc, pos, pext_sw)
 }}
 
 #[cfg(test)]
@@ -568,6 +580,8 @@ mod tests {
             plan.build(&ids, 512);
             let mut bits_plan = GatherPlan::new();
             bits_plan.build_for(&ids, 512, Blocks::Bits);
+            let mut words_plan = GatherPlan::new();
+            words_plan.build_words(&ids);
             let pos = if trial % 4 == 0 { 0 } else { rng.below(64) as u32 };
             let pre = if pos == 0 { 0 } else { rng.next() & (u64::MAX >> (64 - pos)) };
             let n_out = (pos as usize + ids.len()).div_ceil(64);
@@ -583,7 +597,7 @@ mod tests {
                 let n = unsafe {
                     match path {
                         0 => gather_row(row.as_ptr(), &plan, out.as_mut_ptr(), 0, pre, pos),
-                        1 => gather_words(row.as_ptr(), &plan.words, out.as_mut_ptr(), 0, pre, pos),
+                        1 => gather_words(row.as_ptr(), &words_plan, out.as_mut_ptr(), 0, pre, pos),
                         2 => gather_row_portable(row.as_ptr(), &plan, out.as_mut_ptr(), 0, pre, pos),
                         _ => gather_bits(row.as_ptr(), &bits_plan, out.as_mut_ptr(), 0, pre, pos),
                     }
@@ -691,6 +705,11 @@ mod tests {
                 assert_eq!(n, n_out, "n_ref={n_ref} trial={trial}");
                 assert_eq!(out[..n_out], want[..n_out], "n_ref={n_ref} trial={trial}");
                 assert_eq!(out[n_out], 0x5555_5555_5555_5555, "wrote past the row");
+                // The diploid entry point: the same steps unless this CPU has a fast PEXT.
+                let mut out = vec![0x5555_5555_5555_5555u64; n_out + 1];
+                assert_eq!(unsafe { gather_words(mem.as_ptr(), &plan, out.as_mut_ptr(), 0, pre, pos) }, n_out);
+                assert_eq!(out[..n_out], want[..n_out], "gather_words n_ref={n_ref} trial={trial}");
+                assert_eq!(out[n_out], 0x5555_5555_5555_5555, "wrote past the row");
             }
         }
         assert!(bits_seen && groups_seen);
@@ -738,6 +757,50 @@ mod tests {
             let after = time(&|rp, o| unsafe { gather_bits(rp, &new, o, 0, 0, 0) });
             eprintln!("{shape:>12} n_ref={n_ref:>6} K={k}: groups {:>4}, before {before:>6.0} ns/row, after {after:>6.0} ns/row, {:.1}x",
                 old.words.len(), before / after);
+        }
+    }
+
+    /// Timing of a diploid window without a fast `PEXT`: the per-window plan
+    /// build (groups before, bit steps after) and the gather of each row.
+    /// Conditioning sets are index-sorted with both haplotypes of most chosen
+    /// samples: `cargo test --release --lib diploid_window_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn diploid_window_timing() {
+        let mut rng = Xs(0xBB67_AE85_84CA_A73B);
+        for (n_ref, k) in [(75_552usize, 400usize), (75_552, 1000), (75_552, 2000), (5008, 400), (5008, 1000), (5008, 2000)] {
+            let (nw, kw, rows) = (n_ref.div_ceil(64), k.div_ceil(64), 256usize);
+            let mem: Vec<u64> = (0..nw * rows).map(|_| rng.next()).collect();
+            let mut ids: Vec<u32> = Vec::with_capacity(k + 1);
+            while ids.len() < k {
+                let s = rng.below(n_ref as u64 / 2) as u32;
+                ids.push(2 * s);
+                if rng.below(4) != 0 { ids.push(2 * s + 1); }
+            }
+            ids.sort_unstable();
+            ids.dedup();
+            let (mut old, mut new) = (GatherPlan::new(), GatherPlan::new());
+            let reps = 2000;
+            let t = std::time::Instant::now();
+            for _ in 0..reps { old.build_for(std::hint::black_box(&ids), 0, Blocks::Off); }
+            let build_old = t.elapsed().as_nanos() as f64 / reps as f64;
+            let t = std::time::Instant::now();
+            for _ in 0..reps { new.build_for(std::hint::black_box(&ids), 0, Blocks::Bits); }
+            let build_new = t.elapsed().as_nanos() as f64 / reps as f64;
+            let mut out = vec![0u64; rows * kw];
+            let reps = 20_000_000 / (k * rows) + 1;
+            let mut time = |f: &dyn Fn(*const u64, *mut u64) -> usize| {
+                let t = std::time::Instant::now();
+                for _ in 0..reps {
+                    for r in 0..rows { f(mem[r * nw..].as_ptr(), out[r * kw..].as_mut_ptr()); }
+                    std::hint::black_box(&mut out);
+                }
+                t.elapsed().as_nanos() as f64 / (reps * rows) as f64
+            };
+            let before = time(&|rp, o| unsafe { gather_row_with(rp, &old.words, o, 0, 0, 0, pext_sw) });
+            let after = time(&|rp, o| unsafe { gather_bits(rp, &new, o, 0, 0, 0) });
+            eprintln!("diploid n_ref={n_ref:>6} K={:>4}: groups {:>4}, plan build {build_old:>6.0} -> {build_new:>6.0} ns, gather {before:>6.0} -> {after:>6.0} ns/row ({:.1}x), break-even {:.1} rows",
+                ids.len(), old.words.len(), before / after, (build_new - build_old) / (before - after));
         }
     }
 }

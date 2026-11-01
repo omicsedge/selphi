@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::cpp_rng::CppRng;
-use crate::common::bit_gather::{build_gather_plan, gather_words};
+use crate::common::bit_gather::{GatherPlan, gather_words};
 
 use super::params::*;
 use super::genotype_graph::*;
@@ -419,11 +419,11 @@ impl WindowHmmCtx<'_> {
         let needed = n_var_window * k_words;
         cond_bm.clear();
         cond_bm.resize(needed, 0u64);
-        // One bit extract per run of conditioning haplotypes sharing a word of the row
-        // (the set is sorted), not one shift and mask per haplotype.
+        // One bit extract per run of conditioning haplotypes sharing a word of the row (the set
+        // is sorted); without a fast PEXT, bit loads and precomputed extracts (`build_words`).
         let ids: Vec<u32> = cond_set.iter().map(|&h| h as u32).collect();
-        let mut plan = Vec::new();
-        build_gather_plan(&ids, &mut plan);
+        let mut plan = GatherPlan::new();
+        plan.build_words(&ids);
         let bm_nw = hap_bm_hmm_ref.n_words();
         assert!(cond_set.iter().all(|&h| h / 64 < bm_nw), "conditioning haplotype outside the bitmatrix");
         for vi_rel in 0..n_var_window {
