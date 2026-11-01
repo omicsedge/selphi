@@ -17,8 +17,10 @@
 //! decided together, and a cluster whose result would contradict itself (a non-reference row over
 //! a kept call, more than two alleles at a base, anything inside a homozygous Selphi deletion) is
 //! written as the caller wrote it. Every replaced or compared record is named in FORMAT
-//! provenance fields. The caller's header is kept verbatim; blocks are cut into fragments around
-//! Selphi rows.
+//! provenance fields. A non-reference indel row of an allele no caller record names is not handed
+//! where it shares a called locus (the bases a multi-base panel allele replaces, holding a certain
+//! call) without touching the call. The caller's header is kept verbatim; blocks are cut into
+//! fragments around Selphi rows.
 
 mod decide;
 mod header;
@@ -362,8 +364,8 @@ pub fn run_multi(args: &CallsArgs, prep: Prepared, params: &LcwgsParams, set: &P
 fn log_end(sh: &merge::Shared, lines: u64, total_s: f64, merge_s: f64, out: &Path) {
     let c = &sh.counters;
     crate::selphi_step!("--calls: {} panel rows; handed to Selphi {} (no variant call, depth < T) + {} (low-GQ variant calls); \
-        vetoed {} repeat / {} unnormalised panel / {} duplicate panel rows",
-        c.rows, c.handed_h1, c.handed_h2, c.veto_repeat, c.veto_unnormalised, c.veto_duplicate);
+        vetoed {} repeat / {} unnormalised panel / {} duplicate panel rows / {} non-reference indel rows in a called locus",
+        c.rows, c.handed_h1, c.handed_h2, c.veto_repeat, c.veto_unnormalised, c.veto_duplicate, c.veto_locus);
     crate::selphi_step!("--calls: wrote {} Selphi rows ({} non-reference); {} caller records replaced in {} groups; \
         compared and kept: {} both / {} partial / {} overlap",
         c.written, c.written_nonref, c.replaced_records, c.groups_replaced, c.both, c.partial, c.overlap);

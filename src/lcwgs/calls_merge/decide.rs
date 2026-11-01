@@ -1,8 +1,10 @@
 //! The decisions of one cluster (sections 5.2-5.3 of the design): which panel rows are handed to
 //! Selphi, which caller records a Selphi genotype replaces (whole replacement groups or nothing),
-//! which rows are written, and the coherence check of the result. An incoherent cluster is
-//! resolved again without its indel rows (SNP rows carry the reads' evidence, the panel's indel
-//! rows are imputed without it) and written as the caller wrote it only if that is incoherent too.
+//! which rows are written, and the coherence check of the result. A non-reference indel row no
+//! caller record names is not handed inside a panel locus that holds a certain caller call. An
+//! incoherent cluster is resolved again without its indel rows (SNP rows carry the reads'
+//! evidence, the panel's indel rows are imputed without it) and written as the caller wrote it
+//! only if that is incoherent too.
 //!
 //! Every lookup is indexed (keys by position, rows by position, intervals sorted by start with
 //! their running maximum end, groups by root) and the coherence checks are sweeps, so a cluster
@@ -89,6 +91,7 @@ pub(super) struct Counters {
     pub veto_repeat: u64,
     pub veto_unnormalised: u64,
     pub veto_duplicate: u64,
+    pub veto_locus: u64,
     pub written: u64,
     pub written_nonref: u64,
     pub replaced_records: u64,
@@ -230,6 +233,9 @@ pub(super) struct Decision {
     asserted: Intervals,
     ref_spans: Intervals,
     nocall_spans: Intervals,
+    /// The certain calls (affected intervals) and the panel loci that hold one.
+    called: Intervals,
+    loci: Intervals,
     /// Coherence scratch: retained calls with an ALT count, and what asserts bases without one
     /// (veto spans, called `*`).
     calls: Intervals,
@@ -396,6 +402,30 @@ impl Decision {
         self.spanned.build();
         self.ref_spans.build();
         self.nocall_spans.build();
+        // The loci a certain call lies in: the bases a normalised multi-base panel allele replaces,
+        // where they hold such a call. A non-reference indel row no caller record names, there but
+        // off the call itself (C1 checks those), would be a second reading of the locus beside the
+        // caller's, and the panel's indel rows carry no read evidence.
+        self.loci.clear();
+        if (0..rows.len()).any(|ri| rows[ri].s > 0 && !rows[ri].is_snp() && self.keys_of(ri).next().is_none()) {
+            self.called.clear();
+            for i in (0..n).filter(|&i| self.certain[i]) {
+                let rec = recs.get(i);
+                if rec.unresolved.is_some() { let iv = bases(rec.pos, rec.pos + rec.ref_len - 1); self.called.push(iv.0, iv.1, 0); }
+                for k in rec.keys.iter().filter(|k| k.policy.is_some_and(|x| x > 0)) {
+                    let iv = affected(k.pos, rec.ref_allele(k), rec.alt_allele(k));
+                    self.called.push(iv.0, iv.1, 0);
+                }
+            }
+            self.called.build();
+            for w in rows.iter().filter(|w| w.ref_a.len() > 1) {
+                let iv = affected(w.pos, w.ref_a, w.alt_a);
+                if self.called.any(iv.0, iv.1) && self.norm.normalize(w.pos, w.ref_a, w.alt_a, fa, pol.window) == (w.pos, NormStatus::Unchanged) {
+                    self.loci.push(iv.0, iv.1, 0);
+                }
+            }
+        }
+        self.loci.build();
 
         // Which rows are handed.
         self.handed.clear();
@@ -425,6 +455,13 @@ impl Decision {
             if !snp && right_extent(p, self.norm.ref_allele(), self.norm.alt_allele(), fa, pol.window) >= pol.window {
                 c.veto_repeat += 1;
                 continue;
+            }
+            if !snp && w.s > 0 && self.keys_of(ri).next().is_none() {
+                let iv = w.asserts();
+                if self.loci.any(iv.0, iv.1) && !self.called.any(iv.0, iv.1) {
+                    c.veto_locus += 1;
+                    continue;
+                }
             }
             self.handed[ri] = true;
             if h1 { c.handed_h1 += 1 } else { c.handed_h2 += 1 }

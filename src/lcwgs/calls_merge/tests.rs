@@ -277,6 +277,29 @@ fn a_reference_row_beside_a_kept_call_is_coherent() {
 }
 
 #[test]
+fn a_free_nonreference_indel_row_in_a_called_panel_locus_is_not_handed() {
+    // The panel deletion GGATCC>G at 21 replaces bases 22-26, and the caller calls C>T at 25 inside
+    // them: Selphi's GA>G at 22 (base 23), an allele no caller record names, would read that locus
+    // a second time and is not handed; CA>C at 26 (base 27) lies outside it and is written.
+    let snp = rec(25, "C", "T", "PASS", "0/1", 30);
+    let (del22, del26) = (sel(22, "GA", "G", 1, 5, "absent", "0", ".", ".", "."), sel(26, "CA", "C", 1, 5, "absent", "0", ".", ".", "."));
+    let f = fx(R, &[(21, "GGATCC", "G", 0, 5), (22, "GA", "G", 1, 5), (26, "CA", "C", 1, 5)]);
+    let (out, c) = f.run(pol(), std::slice::from_ref(&snp));
+    assert_eq!(out, vec![snp.clone(), del26.clone()]);
+    assert_eq!((c.veto_locus, c.handed_h1, c.snp_only, c.reverts), (1, 2, 0, 0));
+    // A caller no-call of GA>G names it: the row is handed and replaces it, as before.
+    let (out, c) = f.run(pol(), &[rec(22, "GA", "G", "RefCall", "./.", 5), snp.clone()]);
+    assert_eq!(out, vec![sel(22, "GA", "G", 1, 5, "nocall", ".", "5", "22", "0"), snp.clone(), del26.clone()]);
+    assert_eq!(c.veto_locus, 0);
+    // No locus without the call, nor from an unnormalised panel spelling of the call.
+    let (out, c) = f.run(pol(), &[]);
+    assert_eq!((out, c.veto_locus), (vec![del22.clone(), del26.clone()], 0));
+    let f = fx(R, &[(21, "GGATCC", "GGATTC", 0, 5), (22, "GA", "G", 1, 5), (26, "CA", "C", 1, 5)]);
+    let (out, c) = f.run(pol(), std::slice::from_ref(&snp));
+    assert_eq!((out, c.veto_locus, c.veto_unnormalised), (vec![del22, snp, del26], 0, 1));
+}
+
+#[test]
 fn star_alleles_structural_spans_and_unresolved_records_veto() {
     let f = fx(R, &[
         (21, "G", "T", 1, 5),  // inside a called `*` (AG at 20 with CG,* 1/2)
