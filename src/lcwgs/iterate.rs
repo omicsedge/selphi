@@ -564,9 +564,10 @@ fn run_one_hap<F: Fn(usize) -> usize>(
             // Direct-impute the monomorphic sites: all K cond haps carry the major
             // allele `m_alt = ref_bm.get(v, cond[0])`, so finalize_site with the
             // unit-mass posterior (loo=false; the mass + LOO divisor cancel) gives the
-            // exact full-FB dose: ed·h1/(ee·h0+ed·h1) (REF-major) or ee·h1/(ed·h0+ee·h1).
-            let ee = 1.0f32 - params.epsilon;
-            let ed = params.epsilon;
+            // exact full-FB dose: ed·h1/(ee·h0+ed·h1) (REF-major) or ee·h1/(ed·h0+ee·h1),
+            // the allele no conditioning hap carries emitted at `novel_emission` when set.
+            let ed = params.epsilon.max(params.novel_emission);
+            let ee = 1.0f32 - ed;
             for &v in &split.mono {
                 let hl = hl_at(v);
                 let m_alt = mono_alt[v]; // == ref_bm.get(v, cond[0]) at a mono site

@@ -114,6 +114,11 @@ pub struct LcwgsParams {
     /// over-trust). `0` disables. `LCWGS_MIN_GL` sets it; `LCWGS_ADAPT_MIN_GL`
     /// coverage-scales it (see `pipeline::impute_from_gl3`).
     pub min_gl: f32,
+    /// Emission of an allele no conditioning haplotype carries, at a site the conditioning set
+    /// leaves monomorphic (`LCWGS_NOVEL_EMISSION`; 0 = `epsilon`, as before). With `epsilon`
+    /// (1e-12) against the `min_gl` floor (1e-10) such an allele got at most 1% of a haplotype,
+    /// however sharp its likelihood: a confident rare heterozygote came out hom-ref.
+    pub novel_emission: f32,
     /// RNG seed for Gibbs initialization (GLIMPSE2 default 15052011). A single
     /// deterministic chain uses this value; with several chains (`LCWGS_GIBBS_RESTARTS`,
     /// or the small-panel profile's two) chain `i` runs at `iterate::chain_seed`
@@ -216,6 +221,7 @@ impl Default for LcwgsParams {
             // 0.9196→0.9239 (plateaus by 1e-8). Tunable via LCWGS_EPSILON.
             epsilon: envf("LCWGS_EPSILON", 1e-12),
             min_gl: envf("LCWGS_MIN_GL", 1e-10),
+            novel_emission: envf("LCWGS_NOVEL_EMISSION", 0.0),
             // GLIMPSE2's default seed. `LCWGS_SEED` overrides it: the Gibbs chain is
             // deterministic for a fixed seed, so a second seed is the only way to
             // measure how much of a per-sample delta is chain reshuffling.
